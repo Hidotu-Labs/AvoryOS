@@ -103,7 +103,11 @@ struct page *pfn_to_page(unsigned long pfn) {
 unsigned long page_to_pfn(const struct page *page) { return page->pfn; }
 
 phys_addr_t page_to_phys(struct page *page) {
-  return (phys_addr_t)compound_head(page)->pfn << PAGE_SHIFT;
+  /* Use the descriptor's own pfn: upstream page_to_phys() is
+   * page_to_pfn(page) << PAGE_SHIFT and never walks a compound head.  Using
+   * compound_head() here aliased every page of a non-compound high-order
+   * allocation (TTM pool) onto its block head. */
+  return (phys_addr_t)page->pfn << PAGE_SHIFT;
 }
 
 struct page *phys_to_page(phys_addr_t phys) {
@@ -193,6 +197,25 @@ static void page_set_order(struct page *head, unsigned int order) {
     __ClearPageHead(head);
 }
 
+/* Non-compound high-order allocation (no __GFP_COMP): every page of the block
+ * is an independent descriptor.  Upstream leaves the pages unmarked; clear the
+ * compound state explicitly so a stale PG_head/PG_tail from the mem_map reuse
+ * cannot make compound_head() alias pages. */
+static void page_set_order_plain(struct page *head, unsigned int order) {
+  unsigned long count = 1UL << order;
+
+  for (unsigned long i = 0; i < count; i++) {
+    struct page *p = &head[i];
+
+    __ClearPageTail(p);
+    __ClearPageHead(p);
+    p->compound_head = p;
+    p->compound_order = 0;
+    atomic_set(&p->_refcount, 1);
+    atomic_set(&p->_mapcount, -1);
+  }
+}
+
 struct page *alloc_pages(gfp_t gfp_mask, unsigned int order) {
   size_t count;
   uint64_t phys;
@@ -218,7 +241,10 @@ struct page *alloc_pages(gfp_t gfp_mask, unsigned int order) {
   }
 
   head = page;
-  page_set_order(head, order);
+  if (gfp_mask & __GFP_COMP)
+    page_set_order(head, order);
+  else
+    page_set_order_plain(head, order);
   atomic_set(&head->_refcount, 1);
   atomic_set(&head->_mapcount, -1);
   head->mapping = NULL;

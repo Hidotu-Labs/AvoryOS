@@ -145,3 +145,7 @@ drivers/gpu/drm/scheduler/sched_fence.c
 drivers/gpu/drm/scheduler/sched_entity.c
 drivers/gpu/drm/drm_gem_ttm_helper.c
 drivers/gpu/drm/drm_gem_vram_helper.c
+
+# Phase 4 C5: the TTM canary.  bochs is a tiny TTM/VRAM-helper driver in 6.6;
+# QEMU's bochs-display (MMIO, BAR2) and the -vga std I/O-port path both bind.
+drivers/gpu/drm/tiny/bochs.c

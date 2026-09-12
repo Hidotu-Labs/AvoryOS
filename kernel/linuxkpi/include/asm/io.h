@@ -91,6 +91,16 @@ static inline void outb(u8 value, u16 port) { asc_port_write8(port, value); }
 static inline void outw(u16 value, u16 port) { asc_port_write16(port, value); }
 static inline void outl(u32 value, u16 port) { asc_port_write32(port, value); }
 
+/* "Slow" I/O variants: upstream x86 inserts a tiny delay after the access for
+ * ISA devices; the native HAL has no slow_down_io() and the extra delay is
+ * not required by the emulated devices, so these are plain aliases. */
+static inline u8 inb_p(u16 port) { return inb(port); }
+static inline u16 inw_p(u16 port) { return inw(port); }
+static inline u32 inl_p(u16 port) { return inl(port); }
+static inline void outb_p(u8 value, u16 port) { outb(value, port); }
+static inline void outw_p(u16 value, u16 port) { outw(value, port); }
+static inline void outl_p(u32 value, u16 port) { outl(value, port); }
+
 static inline void memcpy_fromio(void *dst, const volatile void __iomem *src,
                                  size_t n) {
   u8 *d = dst;

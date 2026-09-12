@@ -130,6 +130,14 @@ __attribute__((weak)) int devm_aperture_acquire_from_firmware(struct device *dev
   return 0;
 }
 
+/* ── nomodeset policy (drivers/video/aperture.c, not imported) ──────────── */
+
+/* drm_module_*_driver_if_modeset() gates registration on this; AvoryOS always
+ * allows the modeset driver.  Weak so the real aperture.c wins when imported. */
+bool __attribute__((weak)) video_firmware_drivers_only(void) {
+  return false;
+}
+
 /* ── PCI framebuffer aperture (bochs probe, Phase 4 C5) ──────────────────── */
 
 /* The real implementation lives in drm_aperture.c, which is not imported yet;

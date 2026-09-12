@@ -214,6 +214,9 @@ install_apk "font-misc-misc" "main"
 install_apk "xkbcomp" "main"
 install_apk "mesa-dri-gallium" "main"
 install_apk "libdrm" "main"
+# libdrm-tests ships modetest, used as the Phase 4 bochs canary cross-check
+# (AvoryOS kernel tests + bin/test_kpi_bochs are the primary evidence).
+install_apk "libdrm-tests" "main"
 install_apk "mesa-gbm" "main"
 install_apk "mesa-egl" "main"
 install_apk "nettle" "main"

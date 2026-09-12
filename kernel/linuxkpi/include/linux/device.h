@@ -56,6 +56,22 @@ typedef struct pm_message {
   int event;
 } pm_message_t;
 
+/* Power management is not modeled (CONFIG_PM_SLEEP is unset).  The SET_*_PM_OPS
+ * helpers compile callbacks out exactly like upstream's #else arms, and the
+ * struct gives drivers that publish a never-called pm pointer (bochs) a
+ * complete type.  Stock <linux/pm.h> is deliberately not included because it
+ * redefines pm_message_t (same reason as <linux/device/bus.h>). */
+struct dev_pm_ops {
+  int kpi_unused;
+};
+
+#define SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
+#define SET_LATE_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
+#define SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
+#define SET_RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn)
+#define pm_ptr(_ptr) NULL
+#define pm_sleep_ptr(_ptr) NULL
+
 /* Minimal <linux/device/class.h> shape.  devnode() is what drm_sysfs uses to
  * name the /dev/dri/cardN node; uevent is unused so far. */
 struct device_type {
@@ -105,6 +121,7 @@ struct device_driver {
   const struct of_device_id *of_match_table;
   const struct acpi_device_id *acpi_match_table;
   const struct attribute_group **dev_groups;
+  const struct dev_pm_ops *pm;
   int (*probe)(struct device *dev);
   void (*remove)(struct device *dev);
   void (*shutdown)(struct device *dev);

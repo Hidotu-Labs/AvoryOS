@@ -245,10 +245,11 @@ run-tcg: run-x86_64
 # ── LinuxKPI DRM canary (Phase 4+) ──────────────────────────────────────────
 #
 # `make run` plus the emulated devices the LinuxKPI PCI/DRM chunks validate
-# against.  Phase 4 C4 adds `edu` (1234:11e8), a device no native driver
-# claims, so the PCI lifecycle suite has something to bind; C5 adds
-# `bochs-display`.  `make run` is deliberately untouched (the PCI suite logs
-# SKIP there).  Headless evidence capture:
+# against: `edu` (1234:11e8, Phase 4 C4) and `bochs-display` (1234:1111, the
+# TTM canary, Phase 4 C5).  bochs-display is a secondary, non-VGA display, so
+# it coexists with virtio-vga and does not touch the native GOP path.
+# `make run` is deliberately untouched (the PCI suite logs SKIP there).
+# Headless evidence capture:
 #
 #   make run-linuxdrm SERIAL=file:build/logs/p4-c4.log DISPLAY_OPT=-display none
 #
@@ -271,6 +272,7 @@ run-linuxdrm: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		$(QEMU_MEM) \
 		-vga none \
 		-device virtio-vga,xres=1280,yres=800 \
+		-device bochs-display \
 		$(DISPLAY_OPT) \
 		-device edu \
 		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=500000,out.latency=500000 \
@@ -664,6 +666,7 @@ disk.img: userland/proc_bench.elf
 disk.img: userland/test_watchdog.elf
 disk.img: userland/test_kpi_dmabuf.elf
 disk.img: userland/test_kpi_drm.elf
+disk.img: userland/test_kpi_bochs.elf
 disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 
 
@@ -843,6 +846,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/test_kpi_dmabuf.elf bin/test_kpi_dmabuf"; \
 		echo "rm bin/test_kpi_drm"; \
 		echo "write userland/test_kpi_drm.elf bin/test_kpi_drm"; \
+		echo "rm bin/test_kpi_bochs"; \
+		echo "write userland/test_kpi_bochs.elf bin/test_kpi_bochs"; \
 		echo "rm bin/test_child_notify"; \
 		echo "write userland/test_child_notify.elf bin/test_child_notify"; \
 		echo "rm bin/test_pty_master"; \
@@ -1175,6 +1180,7 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field bin/test_tmpfile mode 0100755"; \
 		echo "set_inode_field bin/test_kpi_dmabuf mode 0100755"; \
 		echo "set_inode_field bin/test_kpi_drm mode 0100755"; \
+		echo "set_inode_field bin/test_kpi_bochs mode 0100755"; \
 		echo "set_inode_field bin/test_child_notify mode 0100755"; \
 		echo "set_inode_field bin/test_pty_master mode 0100755"; \
 		echo "set_inode_field bin/test_uaccess_bench mode 0100755"; \
@@ -1492,6 +1498,12 @@ userland/test_kpi_dmabuf.elf: userland/test_kpi_dmabuf.c $(MUSL_LIBC) \
 userland/test_kpi_drm.elf: userland/test_kpi_drm.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
 		userland/test_kpi_drm.c -o userland/test_kpi_drm.elf
+
+# Phase 4 C5 bochs canary: card discovery by DRM version name, dumb-buffer
+# mmap write/read and a full-CRTC atomic enable/disable.
+userland/test_kpi_bochs.elf: userland/test_kpi_bochs.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/test_kpi_bochs.c -o userland/test_kpi_bochs.elf
 
 userland/test_child_notify.elf: userland/test_child_notify.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \

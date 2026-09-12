@@ -6,6 +6,47 @@ needed it, the current workaround, and what a complete implementation needs.
 
 Update this file in the same change that introduces or closes a gap.
 
+## Phase 4 C5 gaps (bochs TTM canary, 2026-09-13)
+
+- **`page_to_phys()` must not walk `compound_head()`** (fixed in
+  `linuxkpi/src/page.c`): TTM's pool allocates high-order blocks **without**
+  `__GFP_COMP` and treats every page independently, but `alloc_pages()` used
+  to mark every order-N allocation compound.  `page_to_phys()` then resolved
+  every page of a split block to the block head's pfn, so `vmap()` aliased all
+  511 pages of a 2 MB block onto one physical page (observed as a 0x1FF000
+  pattern shift through bochs' BAR0).  `page_to_phys()` now returns
+  `page->pfn << PAGE_SHIFT` (upstream semantics) and `alloc_pages()` only
+  builds compound bookkeeping when `__GFP_COMP` is set.  The Phase 2 page
+  test asserts both compound (`__GFP_COMP`) and plain high-order behavior.
+- **bochs is a simple-pipe driver** (`drivers/gpu/drm/tiny/bochs.c`):
+  `drm_simple_kms_plane_atomic_check()` uses `can_position=false`, so the
+  primary plane's destination must cover the **entire CRTC**.  The kernel and
+  userland tests therefore size the modeset dumb buffer to the committed mode
+  and use full-CRTC rectangles; a 64x64 buffer is still used for non-commit
+  GEM loops.
+- **bochs has no vblank engine**: `drm_dev_has_vblank()` is false, so the
+  atomic enable uses `DRM_MODE_ATOMIC_ALLOW_MODESET` only and both tests treat
+  a missing `DRM_EVENT_FLIP_COMPLETE` as an explicit skip rather than a
+  failure (no `WAIT_VBLANK` use).
+- **`inb_p()`/`outb_p()`** (`linuxkpi/include/asm/io.h`): `<video/vga.h>`
+  uses the "slow" ISA I/O variants; the overlay now aliases them to the plain
+  HAL accesses (no `slow_down_io()` delay exists).  Same for `inw_p`/`inl_p`/
+  `outw_p`/`outl_p`.
+- **Minimal power-management types** (`linuxkpi/include/linux/device.h`):
+  bochs publishes `.driver.pm`, so the overlay gained an empty
+  `struct dev_pm_ops`, `SET_SYSTEM/LATE/NOIRQ_SYSTEM/RUNTIME_PM_OPS` (all
+  compile to nothing with `CONFIG_PM_SLEEP` unset) and `device_driver.pm`.
+  Stock `<linux/pm.h>` is not included because it redefines `pm_message_t`
+  (same conflict class as `<linux/device/bus.h>`).
+- **`video_firmware_drivers_only()` is a weak no-op**
+  (`linuxkpi/src/drm_compat.c`): `drm_module_*_driver_if_modeset()` calls it;
+  AvoryOS always allows the modeset driver.  Weak so the imported
+  `drivers/video/aperture.c` wins if it is ever compiled.
+- **modetest cross-check**: Alpine's `libdrm-tests` package (provides
+  `modetest`) is now installed into the Alpine rootfs by
+  `scripts/setup-alpine.sh`; the primary C5 evidence remains the kernel suite
+  plus `bin/test_kpi_bochs` (same fallback P3 used for vkms).
+
 ## Phase 4 gaps (TTM + scheduler + minimal PCI, 2026-09-12)
 
 ### C4 — minimal Linux PCI API

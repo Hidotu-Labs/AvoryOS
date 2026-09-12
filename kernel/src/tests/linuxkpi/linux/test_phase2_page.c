@@ -50,11 +50,15 @@ static bool test_page_roundtrip(void) {
 /* ── order-N allocation, contents, teardown ─────────────────────────────── */
 
 static bool test_page_orders(void) {
+  /* Compound bookkeeping only exists when __GFP_COMP requested it (upstream
+   * semantics; TTM's pool deliberately allocates high-order pages without the
+   * flag and treats every page independently). */
   for (unsigned int order = 0; order <= 6; order++) {
     unsigned long count = 1UL << order;
 
     for (int iter = 0; iter < 32; iter++) {
-      struct page *page = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+      struct page *page =
+          alloc_pages(GFP_KERNEL | __GFP_ZERO | __GFP_COMP, order);
       unsigned char *p;
 
       if (!page)
@@ -64,7 +68,6 @@ static bool test_page_orders(void) {
       if (!p)
         return false;
 
-      /* Compound bookkeeping: head flags, tail links, refcounts. */
       if (order > 0) {
         if (!PageHead(page) || PageTail(page))
           return false;
@@ -89,6 +92,33 @@ static bool test_page_orders(void) {
 
       __free_pages(page, order);
     }
+  }
+
+  /* Without __GFP_COMP every page is independent: no head/tail flags, the
+   * block head resolves to itself, and all pages are addressable. */
+  for (unsigned int order = 1; order <= 4; order++) {
+    unsigned long count = 1UL << order;
+    struct page *page = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+    unsigned char *p;
+
+    if (!page)
+      return false;
+    if (PageHead(page) || PageTail(page) || page->compound_order != 0)
+      return false;
+    for (unsigned long i = 1; i < count; i++) {
+      if (PageHead(&page[i]) || PageTail(&page[i]))
+        return false;
+      if (compound_head(&page[i]) != &page[i])
+        return false;
+    }
+
+    p = page_address(page);
+    p[0] = 0x11;
+    p[(count << PAGE_SHIFT) - 1] = 0x22;
+    if (p[0] != 0x11 || p[(count << PAGE_SHIFT) - 1] != 0x22)
+      return false;
+
+    __free_pages(page, order);
   }
   return true;
 }
