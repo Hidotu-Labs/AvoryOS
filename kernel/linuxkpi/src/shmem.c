@@ -109,6 +109,17 @@ struct folio *shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index,
   return page_folio(page);
 }
 
+/* Stock <linux/shmem_fs.h> also exports the page-returning form; TTM's
+ * shmem-backed ttm_tt uses it.  A folio is order-0 here, so it is the page. */
+struct page *shmem_read_mapping_page_gfp(struct address_space *mapping,
+                                         pgoff_t index, gfp_t gfp) {
+  struct folio *folio = shmem_read_folio_gfp(mapping, index, gfp);
+
+  if (IS_ERR(folio))
+    return ERR_CAST(folio);
+  return &folio->page;
+}
+
 static int shmem_file_release(struct inode *inode, struct file *file) {
   if (file && file->f_mapping) {
     shmem_truncate_pages(file->f_mapping, 0, ULONG_MAX);

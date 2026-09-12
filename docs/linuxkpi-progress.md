@@ -572,7 +572,7 @@ mappings, kthread_worker in `kthread.c`.
 - [x] Handoff: Phase 3 sources + docs committed; `userland/kria-lang/` and
       `userland/quake2/` intentionally left untracked (build artifacts).
 
-## Phase 4 — TTM + drm_sched + minimal Linux PCI + TTM canary (planned, not started)
+## Phase 4 — TTM + drm_sched + minimal Linux PCI + TTM canary (in progress)
 
 Chunk plan: `docs/linuxkpi-phase4-plan.md` (written 2026-09-12 after auditing
 P0–P3 at `45ee1af`).  Chunks: C0 baseline closeout → C1 import/build TTM +
@@ -580,13 +580,49 @@ drm_sched → C2 TTM tests → C3 drm_sched tests → C4 minimal Linux PCI (EDU
 lifecycle test) → C5 bochs canary on `run-linuxdrm` → C6 optional virtio →
 C7 optional amdgpu compile spike.
 
-Open items that C0 must close before any Phase 4 code lands:
+### C0 — baseline closeout (mostly verified 2026-09-12)
 
-- [ ] P1 exit: interactive `make run` desktop boot evidence.
-- [ ] P2 exit: 10-minute soak re-run (`bin/test_kpi_dmabuf 600`, `-smp 4`)
-      after the warm-up-baseline fix; must end `delta=0`.
-- [ ] P3 exit re-check after C0 (`nm` symbol check, `/dev/dri` listing,
-      `bin/test_kpi_drm`).
+- [x] P3 re-check (interactive `make run`, user-run): `/dev/dri` lists
+      `card0`, `card1`, `renderD128`; `bin/test_kpi_drm` →
+      `=== ALL TESTS PASSED ===` (all 15 checks).
+- [x] P1 desktop check (user-run): XFCE, KDE Plasma and the Wayland session
+      all come up; native desktop unaffected.
+- [ ] P2 soak re-run: the first user-run soak (with the desktop active) showed
+      `iterations=149242 errors=0 closes=145551` and `delta=+281` — no leak
+      (free pages went up) but the exactly-once close counter did not match,
+      unlike both earlier runs where `closes == iterations`.  A clean 600 s
+      run on a fresh boot **without starting the desktop** is pending; if it
+      reproduces, investigate the mmap/close path before C2's TTM VM tests.
+- Local symbol re-check (host, headless): imported `drm_*` only, 39
+  `ascentdrm_*` natives, bridge symbols present.
+
+### C1 — import/build TTM + drm_sched (kernel-verified 2026-09-12; userland regression pending)
+
+- [x] `scripts/linux/subset.txt` += `drivers/gpu/drm/ttm`,
+      `drivers/gpu/drm/scheduler`; `scripts/linux/files.txt` += the 6.6
+      `ttm-y`/`gpu-sched-y` sets plus `drm_gem_ttm_helper.c` and
+      `drm_gem_vram_helper.c` (16 imported objects, 107 total).
+- [x] `autoconf.h` += `CONFIG_DRM_TTM`, `CONFIG_DRM_TTM_HELPER`,
+      `CONFIG_DRM_VRAM_HELPER`, `CONFIG_DRM_SCHED`.
+- [x] First-wave gaps fixed (all recorded in `docs/linuxkpi-gaps.md` Phase 4):
+      `page::private` type, `highmem.h → mm.h` include chain, `pfn.h`/
+      `shrinker.h`/`mmap_lock.h`, `swp_entry_t`/`init_mm`/`fault_flag`,
+      `shmem_read_mapping_page_gfp`, `drain_workqueue`, no-op
+      pagefault/migrate state, and the x86 arch stubs (`x86_stubs.c`).
+- [x] Kernel links clean: 91 `ttm_*`/`drm_sched_*`/`drm_gem_*_helper`
+      symbols; `make -C kernel` clean.
+- [x] **Headless boot regression** (QEMU/KVM, `-smp 4`, serial capture
+      `/tmp/opencode/c1-boot.log`): `running 8 initcall(s)` (TTM's added),
+      all initcalls completed, 114 `[  OK  ]` lines, all P0–P3 suites green,
+      `vkms` atomic modeset/vblank still green, no faults, `login:` reached.
+- [ ] Interactive userland regression: `make run` → `/dev/dri`,
+      `bin/test_kpi_drm`, plus the clean C0 soak without the desktop.
+
+Open items that C0 must close before Phase 4 exit:
+
+- [ ] P2 exit: clean 10-minute soak (`bin/test_kpi_dmabuf 600`, `-smp 4`)
+      after the warm-up-baseline fix; must end `delta=0`-class and with
+      `closes == iterations`.
 
 Deviations from the original Phase 4 sketch are recorded in the plan: QEMU
 11.1 has no `mgag200` (bochs is the TTM canary), bochs lives in

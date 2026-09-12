@@ -15,10 +15,28 @@
 #include <linux/errno.h>
 #include <linux/err.h>
 #include <linux/align.h>
+#include <linux/pfn.h>
+#include <linux/shrinker.h>
+#include <linux/mmap_lock.h>
 #include <asm/page.h>
 #include <asm/pgtable.h>
 
 struct task_struct;
+struct sysinfo;
+
+/* Upstream mm.h provides these; imported TTM/DRM code uses them.  There is no
+ * init-on-free poisoning in AvoryOS, so want_init_on_free() is constant. */
+static inline bool want_init_on_free(void) { return false; }
+
+bool set_page_dirty(struct page *page);      /* linuxkpi/src/mm_extra.c */
+void mark_page_accessed(struct page *page);  /* linuxkpi/src/mm_extra.c */
+void si_meminfo(struct sysinfo *val);        /* linuxkpi/src/mm_extra.c */
+
+/* Upstream takes enum fault_flag; struct vm_fault::flags is unsigned int in
+ * both trees, so keep the wider type to avoid implicit-conversion warnings. */
+static inline bool fault_flag_allow_retry_first(unsigned int flags) {
+  return (flags & FAULT_FLAG_ALLOW_RETRY) && (flags & FAULT_FLAG_TRIED);
+}
 
 /* Upstream helper used by page iterators; the mem_map is flat here. */
 #ifndef nth_page

@@ -6,6 +6,50 @@ needed it, the current workaround, and what a complete implementation needs.
 
 Update this file in the same change that introduces or closes a gap.
 
+## Phase 4 gaps (TTM + scheduler bring-up, 2026-09-12)
+
+- **Page cache-mode API is inert** (`linuxkpi/src/x86_stubs.c`): TTM calls
+  `set_pages_wb()`, `set_pages_array_uc()`, `set_pages_array_wc()`,
+  `set_pages_array_wb()`, `cachemode2protval()` and `pgprot_writecombine()`.
+  All RAM is HHDM write-back and AvoryOS has no PAT/MTRR programming, so the
+  cache flips are accepted and ignored; `cachemode2protval()` returns the
+  correct x86 PAT bits (so the pgprot values are well formed) but the kmap
+  paths that consume them are plain HHDM lookups.  `clear_page_orig/rep/erms`
+  are `memset()` over the HHDM (`clear_page()` in stock x86 `page_64.h`
+  references them through the alternatives machinery).
+- **`struct page::private` is `unsigned long`**, matching upstream (it was
+  `void *` through Phase 3).  TTM stores an allocation order and a helper
+  pointer there; only `page.c` wrote the field before, and it now writes 0.
+- **`<linux/highmem.h>` includes `<linux/mm.h>`** again, as upstream does.
+  The Phase 2 overlay had the dependency reversed, which hid `PFN_UP`,
+  `struct shrinker`, `fault_flag_allow_retry_first()` and friends from TUs
+  such as TTM's `ttm_pool.c`.  `mm.h` now also pulls `<linux/pfn.h>`,
+  `<linux/shrinker.h>` and `<linux/mmap_lock.h>` like upstream.
+- **`<linux/mmap_lock.h>` is a no-op overlay**: `mmap_read_lock/unlock`,
+  `mmap_write_*`, trylock and assert variants are inert inlines.  AvoryOS
+  keeps VMA state under native locks and nothing walks a Linux mm; TTM's
+  fault path uses `mmap_read_unlock()` around `dma_resv` waits.
+- **`pagefault_disable/enable()` and `migrate_disable/enable()` are no-ops**
+  (`linuxkpi/include/linux/{uaccess,preempt}.h`): there is no highmem and no
+  page migration, and the stock `<linux/io-mapping.h>` inlines call them.
+- **`drain_workqueue()` equals `flush_workqueue()`**
+  (`linuxkpi/src/workqueue.c`): upstream's "draining" state that blocks new
+  submissions does not exist; the call waits for pending/running work only.
+- **`struct mm_struct` is still a placeholder** but now carries `pgd`,
+  `init_mm` is a zeroed instance, and `swp_entry_t`/`enum fault_flag` are
+  defined in the `mm_types.h` overlay because stock `<linux/pgtable.h>` needs
+  them for its inline helpers.  No imported code walks an mm.
+- **`task_struct::group_leader` is the task itself and `exit_code` stays 0**
+  (`linuxkpi/src/task.c`): there is no shared `signal_struct`, so per-process
+  identity is approximated by per-thread identity.  `drm_sched` uses it only
+  for its per-user submission bookkeeping and compares it against itself;
+  `SIGKILL` now comes from `<uapi/linux/signal.h>` through the `sched.h`
+  overlay.
+- **`shmem_read_mapping_page_gfp()` implemented** in `linuxkpi/src/shmem.c`
+  (page-returning wrapper over the existing folio store); TTM's
+  shmem-backed `ttm_tt` path uses it.  The `shmem_fs.h` overlay now declares
+  it next to the folio form.
+
 ## Deliberate divergences
 
 - **`struct page`** (`linuxkpi/include/linux/mm_types.h`): trimmed layout with

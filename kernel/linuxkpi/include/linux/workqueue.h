@@ -65,6 +65,9 @@ bool schedule_work_on(int cpu, struct work_struct *work);
 
 bool flush_work(struct work_struct *work);
 void flush_workqueue(struct workqueue_struct *wq);
+/* Upstream drain_workqueue() also blocks new submissions; this build has no
+ * workqueue "draining" state, so it is equivalent to flush_workqueue(). */
+void drain_workqueue(struct workqueue_struct *wq);
 bool cancel_work_sync(struct work_struct *work);
 
 /* Upstream returns the work item the current task is running (for

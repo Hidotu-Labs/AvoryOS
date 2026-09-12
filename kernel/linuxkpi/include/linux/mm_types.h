@@ -26,6 +26,8 @@
 #include <asm/pgtable_types.h>
 #include <linux/atomic.h>
 #include <linux/list.h>
+#include <linux/rbtree.h>
+#include <linux/rcupdate.h>
 #include <linux/types.h>
 
 struct address_space;
@@ -35,6 +37,12 @@ struct page;
 struct vma; /* native AvoryOS VMA (kernel/src/mm/vma.h) */
 struct vm_area_struct;
 struct vm_fault;
+
+/* Upstream mm_types.h defines swp_entry_t; <linux/pgtable.h> inlines use it
+ * and pgtable.h includes this header for it. */
+typedef struct {
+  unsigned long val;
+} swp_entry_t;
 
 /* ------------------------------------------------------------------------- */
 /* struct page                                                                */
@@ -57,7 +65,9 @@ struct page {
   };
   struct address_space *mapping; /* Page cache owner, NULL when anonymous    */
   pgoff_t index;         /* Offset in the mapping, in pages                  */
-  void *private;         /* Filesystem/driver private data                   */
+  unsigned long private; /* Filesystem/driver private data (upstream type;   */
+                         /* TTM stores an allocation order and a helper      */
+                         /* pointer here)                                    */
 } __attribute__((aligned(64)));
 
 /* Order-0 folios: a folio is a head page plus the guarantee that its mapping
@@ -124,11 +134,34 @@ struct vm_area_struct {
 };
 
 /* Minimal mm: AvoryOS keeps the real mapping in the native struct vma, but
- * imported headers (asm/pgtable.h pte_accessible) read tlb_flush_pending. */
+ * imported headers read tlb_flush_pending and pgtable.h's pgd_offset()
+ * dereferences ->pgd.  The single instance (init_mm) is defined in
+ * linuxkpi/src/mm_extra.c. */
 struct mm_struct {
   atomic_t tlb_flush_pending;
   atomic_t mm_users;
   atomic_t mm_count;
+  pgd_t *pgd; /* for pgd_offset()/pgd_offset_k() in pgtable.h */
+};
+
+extern struct mm_struct init_mm;
+
+/* Upstream mm_types.h also defines enum fault_flag; <linux/mm.h>'s
+ * fault_flag_allow_retry_first() and the TTM fault path use these values. */
+enum fault_flag {
+  FAULT_FLAG_WRITE = 1 << 0,
+  FAULT_FLAG_MKWRITE = 1 << 1,
+  FAULT_FLAG_ALLOW_RETRY = 1 << 2,
+  FAULT_FLAG_RETRY_NOWAIT = 1 << 3,
+  FAULT_FLAG_KILLABLE = 1 << 4,
+  FAULT_FLAG_TRIED = 1 << 5,
+  FAULT_FLAG_USER = 1 << 6,
+  FAULT_FLAG_REMOTE = 1 << 7,
+  FAULT_FLAG_INSTRUCTION = 1 << 8,
+  FAULT_FLAG_INTERRUPTIBLE = 1 << 9,
+  FAULT_FLAG_UNSHARE = 1 << 10,
+  FAULT_FLAG_ORIG_PTE_VALID = 1 << 11,
+  FAULT_FLAG_VMA_LOCK = 1 << 12,
 };
 
 struct vm_fault {

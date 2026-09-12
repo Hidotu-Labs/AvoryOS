@@ -23,5 +23,9 @@ void *linuxkpi_task_shadow_new(void *thread) {
   tsk->pid = (pid_t)linuxkpi_thread_pid(thread);
   tsk->tgid = (pid_t)linuxkpi_thread_tgid(thread);
   linuxkpi_thread_comm(thread, tsk->comm, sizeof(tsk->comm));
+  /* No shared signal_struct yet: each thread is its own group leader.  The
+   * only consumer is drm_sched's per-user submission tracking, which keys on
+   * group_leader identity and compares it against itself. */
+  tsk->group_leader = tsk;
   return tsk;
 }

@@ -20,6 +20,11 @@ struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags
 struct folio *shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index,
                                    gfp_t gfp);
 
+/* Stock <linux/shmem_fs.h> declares the page-returning form next to the folio
+ * one; TTM's shmem-backed ttm_tt uses it. */
+struct page *shmem_read_mapping_page_gfp(struct address_space *mapping,
+                                         pgoff_t index, gfp_t gfp_mask);
+
 void shmem_truncate_range(struct inode *inode, loff_t start, loff_t end);
 
 #endif /* __AVORY_LINUXKPI_SHMEM_FS_H */

@@ -54,4 +54,9 @@ static inline void cond_resched(void) { }
 
 static inline void preempt_fold_need_resched(void) { }
 
+/* No page migration exists, so migration disable is a no-op (stock io-mapping
+ * inlines pair migrate_disable()/migrate_enable()). */
+static inline void migrate_disable(void) { }
+static inline void migrate_enable(void) { }
+
 #endif /* __AVORY_LINUXKPI_PREEMPT_H */

@@ -65,3 +65,9 @@ drivers/gpu/drm/*.c
 drivers/gpu/drm/vgem
 drivers/gpu/drm/vkms
 drivers/gpu/drm/tiny
+
+# Phase 4: TTM and the GPU scheduler.  Public headers already come with the
+# include/ copy; the private ttm_module.h and scheduler/gpu_scheduler_trace.h
+# live in the source directories, so the whole directories are copied.
+drivers/gpu/drm/ttm
+drivers/gpu/drm/scheduler

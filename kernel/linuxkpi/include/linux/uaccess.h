@@ -131,4 +131,11 @@ static inline int copy_struct_from_user(void *dst, size_t ksize,
 
 #define u64_to_user_ptr(x) ((void __user *)(uintptr_t)(x))
 
+/* No pagefault/migrate disable state exists: all kernel memory is permanently
+ * mapped through the HHDM and there is no highmem or page migration.  Stock
+ * <linux/io-mapping.h> inlines call these; keep them balanced no-ops. */
+static inline void pagefault_disable(void) { }
+static inline void pagefault_enable(void) { }
+static inline bool pagefault_disabled(void) { return false; }
+
 #endif /* __AVORY_LINUXKPI_UACCESS_H */

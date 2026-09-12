@@ -125,6 +125,13 @@ void flush_workqueue(struct workqueue_struct *wq) {
   wait_event(wq->flush_wait, wq->active == 0);
 }
 
+void drain_workqueue(struct workqueue_struct *wq) {
+  /* Conservative equivalent of upstream's drain: wait until nothing is
+   * pending/running.  New work queued after this returns simply runs; it is
+   * not blocked the way upstream's draining state blocks it. */
+  flush_workqueue(wq);
+}
+
 bool cancel_work_sync(struct work_struct *work) {
   struct workqueue_struct *wq = work->wq;
 

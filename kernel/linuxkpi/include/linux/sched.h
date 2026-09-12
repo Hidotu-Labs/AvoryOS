@@ -12,11 +12,13 @@
 #include <linux/capability.h>
 #include <linux/limits.h>
 #include <linux/preempt.h>
+#include <linux/rbtree.h>
 #include <linux/timer.h>
 #include <linux/types.h>
 #include <linux/ktime.h>
 #include <linux/kernel.h>
 #include <asm/vdso/processor.h>
+#include <uapi/linux/signal.h>
 
 #ifndef NUMA_NO_NODE
 #define NUMA_NO_NODE (-1)
@@ -45,6 +47,11 @@ struct task_struct {
   pid_t pid;  /* native tid */
   pid_t tgid; /* native tgid */
   char comm[TASK_COMM_LEN];
+  /* Scheduler (drm_sched) reads these on submission/exit paths.  Because
+   * AvoryOS has no shared signal_struct yet, every thread is its own group
+   * leader and exit_code stays 0 unless a native exit hook sets it. */
+  struct task_struct *group_leader;
+  int exit_code;
 };
 
 #define current ((struct task_struct *)linuxkpi_current_task())

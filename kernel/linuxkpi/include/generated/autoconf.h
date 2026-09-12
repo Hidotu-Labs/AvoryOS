@@ -86,4 +86,12 @@
 /* Allocators used by imported library code. */
 #define CONFIG_GENERIC_ALLOCATOR 1
 
+/* Phase 4: TTM and the GPU scheduler.  DRM_VRAM_HELPER is the 6.6 name for
+ * the VRAM GEM helper (drm_gem_vram_helper.c); bochs selects it together with
+ * TTM and TTM_HELPER.  CONFIG_DRM_BOCHS arrives in C5. */
+#define CONFIG_DRM_TTM 1
+#define CONFIG_DRM_TTM_HELPER 1
+#define CONFIG_DRM_VRAM_HELPER 1
+#define CONFIG_DRM_SCHED 1
+
 #endif /* __AVORY_LINUXKPI_AUTOCONF_H */

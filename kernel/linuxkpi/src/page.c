@@ -222,7 +222,7 @@ struct page *alloc_pages(gfp_t gfp_mask, unsigned int order) {
   atomic_set(&head->_refcount, 1);
   atomic_set(&head->_mapcount, -1);
   head->mapping = NULL;
-  head->private = NULL;
+  head->private = 0;
   head->index = 0;
 
   if (gfp_mask & __GFP_ZERO)
@@ -248,7 +248,7 @@ void __free_pages(struct page *page, unsigned int order) {
     return; /* still referenced */
 
   head->mapping = NULL;
-  head->private = NULL;
+  head->private = 0;
   __ClearPageHead(head);
   head->compound_order = 0;
 
