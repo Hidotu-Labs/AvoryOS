@@ -324,7 +324,7 @@ static bool nvme_map_mmio(uint64_t phys, uint64_t length) {
 static struct pci_device *nvme_pci_for_device(struct device *dev) {
   uint32_t count = pci_get_device_count();
   for (uint32_t i = 0; i < count; i++) {
-    struct pci_device *pci = pci_get_device(i);
+    struct pci_device *pci = asc_pci_get_device(i);
     if (pci && pci->kernel_device == dev)
       return pci;
   }

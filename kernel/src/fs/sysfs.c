@@ -350,7 +350,7 @@ void sysfs_init(void) {
     char pci_addr[20] = "0000:00:01.0"; // fallback
     uint32_t pci_count = pci_get_device_count();
     for (uint32_t i = 0; i < pci_count; i++) {
-      struct pci_device *pd = pci_get_device(i);
+      struct pci_device *pd = asc_pci_get_device(i);
       if (pd && pd->class_code == 0x03) {
         char tmp[4];
         pci_addr[0] = '0';
@@ -421,7 +421,7 @@ void sysfs_init(void) {
     // containers. Giving either a uevent file makes libudev treat it as a
     // device, but neither has a subsystem; Xorg then dereferences a NULL
     // subsystem while walking from card0 to its PCI parent.
-    char gpu_uevent[128],ue_vid[5],ue_did[5];uint32_t uvid=0,udid=0;for(uint32_t ui=0;ui<pci_get_device_count();ui++){struct pci_device *upd=pci_get_device(ui);if(upd&&upd->class_code==0x03){uvid=upd->vendor_id;udid=upd->device_id;break;}}u32_to_hex(uvid,ue_vid,4);u32_to_hex(udid,ue_did,4);strcpy(gpu_uevent,"DRIVER=virtio-pci\nPCI_ID=");strcat(gpu_uevent,ue_vid);strcat(gpu_uevent,":");strcat(gpu_uevent,ue_did);strcat(gpu_uevent,"\nSUBSYSTEM=pci\n");sysfs_mkfile(gpu_dev,"uevent",gpu_uevent);
+    char gpu_uevent[128],ue_vid[5],ue_did[5];uint32_t uvid=0,udid=0;for(uint32_t ui=0;ui<pci_get_device_count();ui++){struct pci_device *upd=asc_pci_get_device(ui);if(upd&&upd->class_code==0x03){uvid=upd->vendor_id;udid=upd->device_id;break;}}u32_to_hex(uvid,ue_vid,4);u32_to_hex(udid,ue_did,4);strcpy(gpu_uevent,"DRIVER=virtio-pci\nPCI_ID=");strcat(gpu_uevent,ue_vid);strcat(gpu_uevent,":");strcat(gpu_uevent,ue_did);strcat(gpu_uevent,"\nSUBSYSTEM=pci\n");sysfs_mkfile(gpu_dev,"uevent",gpu_uevent);
     sysfs_symlink(gpu_dev, "subsystem", "../../../bus/pci");
 
     // Mesa reads vendor/device/class from /sys/dev/char/226:0/device/vendor
@@ -432,7 +432,7 @@ void sysfs_init(void) {
       uint32_t vid = 0x1234, did = 0x1111, cls = 0x030000;
       uint32_t pci_cnt = pci_get_device_count();
       for (uint32_t ii = 0; ii < pci_cnt; ii++) {
-        struct pci_device *gpd = pci_get_device(ii);
+        struct pci_device *gpd = asc_pci_get_device(ii);
         if (gpd && gpd->class_code == 0x03) {
           vid = gpd->vendor_id;
           did = gpd->device_id;
@@ -577,7 +577,7 @@ void sysfs_init(void) {
     char pci_addr2[20] = "0000:00:01.0";
     uint32_t pci_count2 = pci_get_device_count();
     for (uint32_t i = 0; i < pci_count2; i++) {
-      struct pci_device *pd = pci_get_device(i);
+      struct pci_device *pd = asc_pci_get_device(i);
       if (pd && pd->class_code == 0x03) {
         char tmp2[4];
         pci_addr2[0] = '0';

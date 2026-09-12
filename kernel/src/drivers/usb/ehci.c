@@ -535,7 +535,7 @@ void ehci_init(void) {
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " Searching for EHCI controllers...\n");
 
   for (uint32_t i = 0; i < pci_get_device_count(); i++) {
-    struct pci_device *pdev = pci_get_device(i);
+    struct pci_device *pdev = asc_pci_get_device(i);
     if (pdev->class_code == 0x0C && pdev->subclass == 0x03 &&
         pdev->prog_if == 0x20) {
       if (ehci_count >= EHCI_MAX_CONTROLLERS)

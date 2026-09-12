@@ -711,6 +711,84 @@ Open items that C0 must close before Phase 4 exit:
       All Phase 0–4 TTM suites still green in the same boot; the boot-test
       bounded wait is now 30 s (was 10 s) to accommodate the longer suite.
 
+### C4 — minimal Linux PCI API + EDU lifecycle test (verified 2026-09-12)
+
+- [x] Native side (`kernel/src/drivers/pci/`): `bar_size[6]` recorded at
+      enumeration (plus a per-slot memset so re-enumeration cannot keep stale
+      BARs), `pci_config_read8/write8` added, and the three stock-name
+      collisions renamed into the native namespace — `pci_bus_type` →
+      `asc_pci_bus_type`, `pci_get_device` → `asc_pci_get_device`,
+      `pci_find_capability` → `asc_pci_find_capability` — with every native
+      call site updated (plan correction: C4 must do this before the Linux
+      API can be linked).
+- [x] New bridge `kernel/src/linuxkpi/native_pci.c` +
+      `linuxkpi/include/linuxkpi/native_pci.h`: device count/opaque handle,
+      identity+BAR snapshot (`linuxkpi_pci_native_snapshot`), config 8/16/32
+      access, capability lookup, command-register read/update and
+      bus-mastering.
+- [x] New Linux API `kernel/linuxkpi/src/pci.c`: one `struct pci_dev` wrapper
+      per native device (`linuxkpi_pci_scan()`, called from the
+      `kpi/initcalls` thread path before driver initcalls), root bus/device
+      scaffolding (`pci_bus_type` with the minimised overlay `struct
+      bus_type`), BARs decoded into `struct resource`
+      (IO/MEM/64-bit/prefetch), config + PCIe capability accessors, config
+      0x100+ extended-capability walk, `pci_enable_device[_io/_mem]`/
+      `pci_disable_device`/`pci_reenable_device`, `pcim_enable_device` devres
+      action, `pci_set_master`/`pci_clear_master`, the region conflict
+      registry (`__request_region`/`__release_region`/
+      `__devm_request_region`, `request_region`-macro backing) and
+      `pci_request_region(s)`/`pci_release_region(s)`/`pci_select_bars`,
+      `pci_iomap[_range/_wc]`/`pci_iounmap`, device lookup
+      (`pci_get_device`/`pci_get_subsys`/`pci_get_class`/
+      `pci_get_domain_bus_and_slot`/`pci_dev_present`), the direct
+      `__pci_register_driver`/`pci_unregister_driver` probe/remove registry,
+      and basic ROM toggles/map.
+- [x] Overlay/glue changes: minimal `struct bus_type` in the device.h
+      overlay (stock bus.h redefines `pm_message_t`), `pci_iomap`
+      declarations via `<asm-generic/pci_iomap.h>` in the io.h overlay, weak
+      `drm_aperture_remove_conflicting_pci_framebuffers()` stubbed in
+      `drm_compat.c`, and the weak `__devm_request_region` stub removed from
+      `link_stubs.c` (real registry in pci.c).  All recorded in
+      `docs/linuxkpi-gaps.md` (Phase 4 C4 section).
+- [x] Test first: `kernel/src/tests/linuxkpi/linux/test_phase4_pci.c` (wired
+      into `boot_tests.c` after the sched suite).  Without EDU it logs
+      `[SKIP]`; with EDU it covers wrapper identity, BAR0 = 1 MB MMIO,
+      config read, `pci_enable_device` + `pci_set_master` command bits,
+      `pci_request_region` + `pci_iomap` + the EDU identification register,
+      and a test `struct pci_driver` register → probe/drvdata → remove.
+- [x] New top-level `run-linuxdrm` target: `make run` plus `-device edu`
+      (C5 will add `bochs-display`), with `SERIAL`/`DISPLAY_OPT` overridable
+      for headless capture; plain `make run` is untouched.
+- [x] Robustness fix found while re-running the P3 suite: the vkms GEM PMM
+      check is now a 64-iteration warm-up + **two** measured 256-iteration
+      passes.  The first pass may retain one allocator slab/PCP page (the
+      same one-page noise the TTM suite reports as `delta=-1`) and is
+      informational; the warm second pass must be exactly stable, so a real
+      per-iteration leak still fails.
+- [x] **Exit evidence** (user-run `make run-linuxdrm`, `-smp 4`, EDU present;
+      headless re-run writes `build/logs/p4-c4-verify.log`):
+      ```
+      [KERNEL] LinuxKPI: PCI 10 wrapper(s) over 10 native device(s)
+      ...
+      [LINUXKPI] Phase 4 PCI self-test
+      [  OK  ] LinuxKPI: pci EDU wrapper identity
+      [INFO] LinuxKPI: pci EDU class=0x00ff00 revision=0x10
+      [  OK  ] LinuxKPI: pci BAR0 is 1 MB MMIO
+      [  OK  ] LinuxKPI: pci config read (command register)
+      [  OK  ] LinuxKPI: pci pci_enable_device + pci_set_master
+      [  OK  ] LinuxKPI: pci pci_request_region(BAR0)
+      [INFO] LinuxKPI: pci EDU BAR0 id register=0x010000ed
+      [  OK  ] LinuxKPI: pci BAR0 mapping reads the EDU identification register
+      [  OK  ] LinuxKPI: pci test driver probe called
+      [  OK  ] LinuxKPI: pci driver data + binding roundtrip
+      [  OK  ] LinuxKPI: pci test driver remove called on unregister
+      [  OK  ] LinuxKPI: pci suite complete
+      [INFO] LinuxKPI: vkms GEM pass deltas immediate/settled: first 1/1, second 0/0
+      [  OK  ] LinuxKPI: vkms GEM loop 2x256 iterations, distinct live handles, PMM stable (first-pass immediate delta 1)
+      ```
+      All P0–P4 suites green in the same boot (TTM and sched report their
+      usual one-page `delta=-1`); boot reaches the login prompt.
+
 Deviations from the original Phase 4 sketch are recorded in the plan: QEMU
 11.1 has no `mgag200` (bochs is the TTM canary), bochs lives in
 `drivers/gpu/drm/tiny/bochs.c` and is TTM-backed via

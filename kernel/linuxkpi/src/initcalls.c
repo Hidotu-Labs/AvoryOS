@@ -15,12 +15,16 @@
 #include <linuxkpi/log.h>
 
 extern void linuxkpi_run_initcalls_inline(void);
+extern void linuxkpi_pci_scan(void);
 
 static struct completion initcalls_done;
 
 static int linuxkpi_initcalls_thread(void *arg) {
   (void)arg;
 
+  /* Wrap the native PCI devices before any driver initcall can register with
+   * the LinuxKPI PCI bus (Phase 4 C4), so a driver's probe sees them. */
+  linuxkpi_pci_scan();
   linuxkpi_run_initcalls_inline();
   complete(&initcalls_done);
   return 0;
@@ -35,6 +39,7 @@ void linuxkpi_run_initcalls(void) {
   if (IS_ERR(task)) {
     klog_puts("[WARN] LinuxKPI: could not create the initcall thread; "
               "running initcalls inline (blocking may misbehave)\n");
+    linuxkpi_pci_scan();
     linuxkpi_run_initcalls_inline();
     return;
   }

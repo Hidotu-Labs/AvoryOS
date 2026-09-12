@@ -548,7 +548,7 @@ void uhci_init(void) {
   // other devices.  Disable PCI INTx for every USB controller we find.
   uint32_t pci_count = pci_get_device_count();
   for (uint32_t i = 0; i < pci_count; i++) {
-    struct pci_device *dev = pci_get_device(i);
+    struct pci_device *dev = asc_pci_get_device(i);
     if (!dev)
       continue;
 
@@ -591,7 +591,7 @@ void uhci_init(void) {
 
   // Second pass: probe UHCI-specific controllers
   for (uint32_t i = 0; i < pci_count; i++) {
-    struct pci_device *dev = pci_get_device(i);
+    struct pci_device *dev = asc_pci_get_device(i);
     if (!dev)
       continue;
 

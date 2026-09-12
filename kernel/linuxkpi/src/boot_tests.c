@@ -32,6 +32,7 @@ extern void linuxkpi_test_phase3_drm(void);
 extern void linuxkpi_test_phase3_drm_modeset(void);
 extern void linuxkpi_test_phase4_ttm(void);
 extern void linuxkpi_test_phase4_sched(void);
+extern void linuxkpi_test_phase4_pci(void);
 
 static struct completion boot_tests_done;
 
@@ -54,6 +55,7 @@ static int linuxkpi_boot_tests_thread(void *arg) {
   linuxkpi_test_phase3_drm_modeset();
   linuxkpi_test_phase4_ttm();
   linuxkpi_test_phase4_sched();
+  linuxkpi_test_phase4_pci();
 
   complete(&boot_tests_done);
   return 0;

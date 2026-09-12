@@ -108,10 +108,10 @@ static int claimed_index(struct udriver_session *session,
 }
 
 static struct pci_device *pci_for_device(struct device *device) {
-  if (!device || device->bus != pci_bus_type())
+  if (!device || device->bus != asc_pci_bus_type())
     return NULL;
   for (uint32_t i = 0; i < pci_get_device_count(); i++) {
-    struct pci_device *pci = pci_get_device(i);
+    struct pci_device *pci = asc_pci_get_device(i);
     if (pci && pci->kernel_device == device)
       return pci;
   }
@@ -437,10 +437,10 @@ static int get_resource_info(struct udriver_session *session,
 static struct pci_device *claimed_pci(struct udriver_session *session,
                                       const char *name) {
   struct device *dev = claimed_device(session, name, NULL);
-  if (!dev || dev->bus != pci_bus_type())
+  if (!dev || dev->bus != asc_pci_bus_type())
     return NULL;
   for (uint32_t i = 0; i < pci_get_device_count(); i++) {
-    struct pci_device *pci = pci_get_device(i);
+    struct pci_device *pci = asc_pci_get_device(i);
     if (pci && pci->kernel_device == dev)
       return pci;
   }

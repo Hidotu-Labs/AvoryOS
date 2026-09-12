@@ -129,3 +129,18 @@ __attribute__((weak)) int devm_aperture_acquire_from_firmware(struct device *dev
   (void)size;
   return 0;
 }
+
+/* ── PCI framebuffer aperture (bochs probe, Phase 4 C5) ──────────────────── */
+
+/* The real implementation lives in drm_aperture.c, which is not imported yet;
+ * AvoryOS has no framebuffer hand-over registry, so claiming the aperture is
+ * a no-op.  Weak so the imported version overrides it without edits. */
+struct drm_driver;
+struct pci_dev;
+
+__attribute__((weak)) int drm_aperture_remove_conflicting_pci_framebuffers(
+    struct pci_dev *pdev, const struct drm_driver *req_driver) {
+  (void)pdev;
+  (void)req_driver;
+  return 0;
+}

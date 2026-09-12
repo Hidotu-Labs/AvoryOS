@@ -641,7 +641,7 @@ void ohci_init(void) {
 
   uint32_t pci_count = pci_get_device_count();
   for (uint32_t i = 0; i < pci_count; i++) {
-    struct pci_device *dev = pci_get_device(i);
+    struct pci_device *dev = asc_pci_get_device(i);
     if (!dev)
       continue;
     if (dev->class_code == 0x0C && dev->subclass == 0x03 &&

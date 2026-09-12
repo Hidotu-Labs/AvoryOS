@@ -12,7 +12,7 @@ static struct pci_device devices[PCI_MAX_DEVICES];
 static uint32_t device_count = 0;
 static struct bus_type pci_bus = {.name = "pci"};
 
-struct bus_type *pci_bus_type(void) { return &pci_bus; }
+struct bus_type *asc_pci_bus_type(void) { return &pci_bus; }
 
 // PCI Config Space Access
 
@@ -57,6 +57,23 @@ void pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func,
   uint32_t mask = 0xFFFFu << ((offset & 2) * 8);
   val &= ~mask;
   val |= (uint32_t)value << ((offset & 2) * 8);
+  pci_config_write32(bus, slot, func, offset & 0xFFFC, val);
+}
+
+/* Byte config access rides the 32-bit path so PCIe ECAM offsets above 0xFF
+ * keep working (the CF8 path rejects them, ECAM does not). */
+uint8_t pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func,
+                         uint16_t offset) {
+  uint32_t val = pci_config_read32(bus, slot, func, offset & 0xFFFC);
+  return (uint8_t)(val >> ((offset & 3) * 8));
+}
+
+void pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func,
+                       uint16_t offset, uint8_t value) {
+  uint32_t val = pci_config_read32(bus, slot, func, offset & 0xFFFC);
+  uint32_t mask = 0xFFu << ((offset & 3) * 8);
+  val &= ~mask;
+  val |= (uint32_t)value << ((offset & 3) * 8);
   pci_config_write32(bus, slot, func, offset & 0xFFFC, val);
 }
 
@@ -125,6 +142,7 @@ static void pci_check_function(uint8_t bus, uint8_t slot, uint8_t func) {
   uint32_t reg_irq = pci_config_read32(bus, slot, func, 0x3C);
 
   struct pci_device *dev = &devices[device_count];
+  memset(dev, 0, sizeof(*dev)); /* re-enumeration must not keep stale BARs */
   dev->bus = bus;
   dev->slot = slot;
   dev->func = func;
@@ -171,8 +189,11 @@ static void pci_check_function(uint8_t bus, uint8_t slot, uint8_t func) {
       snprintf(name, sizeof(name), "bar%d", i);
       device_add_resource(pci_node, io ? RES_IO : RES_MEM, name, start,
                           size ? start + size - 1 : start);
-      if (wide)
+      dev->bar_size[i] = size;
+      if (wide) {
+        dev->bar_size[i + 1] = 0; /* high dword of a 64-bit BAR */
         i++;
+      }
     }
   }
   device_add_resource(pci_node, RES_IRQ, "irq", dev->irq_line, dev->irq_line);
@@ -266,7 +287,7 @@ void pci_enable_bus_mastering(struct pci_device *dev) {
   pci_set_bus_mastering(dev, true);
 }
 
-uint8_t pci_find_capability(struct pci_device *dev, uint8_t cap_id) {
+uint8_t asc_pci_find_capability(struct pci_device *dev, uint8_t cap_id) {
   uint16_t status = pci_config_read16(dev->bus, dev->slot, dev->func, 0x06);
   if (!(status & (1 << 4)))
     return 0; // Capabilities bit not set
@@ -294,7 +315,7 @@ static uint64_t pci_bar_phys(struct pci_device *dev, uint8_t bir) {
 bool pci_msix_init(struct pci_device *dev, struct pci_msix *msix) {
   if (!dev || !msix) return false;
   memset(msix, 0, sizeof(*msix));
-  uint8_t cap = pci_find_capability(dev, PCI_CAP_ID_MSIX);
+  uint8_t cap = asc_pci_find_capability(dev, PCI_CAP_ID_MSIX);
   if (!cap) return false;
   uint16_t control = pci_config_read16(dev->bus, dev->slot, dev->func, cap + 2);
   uint32_t table_info = pci_config_read32(dev->bus, dev->slot, dev->func, cap + 4);
@@ -363,7 +384,7 @@ bool pci_msi_enable(struct pci_device *dev, struct pci_msi *msi,
                     uint8_t vector, uint8_t destination_apic) {
   if (!dev || !msi || vector < 32)
     return false;
-  uint8_t cap = pci_find_capability(dev, PCI_CAP_ID_MSI);
+  uint8_t cap = asc_pci_find_capability(dev, PCI_CAP_ID_MSI);
   if (!cap)
     return false;
 
@@ -410,7 +431,7 @@ void pci_msi_disable(struct pci_msi *msi) {
 
 uint32_t pci_get_device_count(void) { return device_count; }
 
-struct pci_device *pci_get_device(uint32_t index) {
+struct pci_device *asc_pci_get_device(uint32_t index) {
   if (index >= device_count)
     return NULL;
   return &devices[index];

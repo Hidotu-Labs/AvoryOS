@@ -6,7 +6,69 @@ needed it, the current workaround, and what a complete implementation needs.
 
 Update this file in the same change that introduces or closes a gap.
 
-## Phase 4 gaps (TTM + scheduler bring-up, 2026-09-12)
+## Phase 4 gaps (TTM + scheduler + minimal PCI, 2026-09-12)
+
+### C4 — minimal Linux PCI API
+
+- **Native PCI symbols renamed into the `asc_pci_*` namespace**
+  (`kernel/src/drivers/pci/pci.{c,h}` and all native call sites): stock
+  `<linux/pci.h>` declares the global `pci_bus_type`, plus
+  `pci_get_device(vendor, device, from)` and `pci_find_capability(dev, cap)`,
+  which collided with the native `pci_bus_type()` bus getter, the index-based
+  `pci_get_device(i)` and the native-type `pci_find_capability(dev, cap)` as
+  soon as `linuxkpi/src/pci.c` defined the Linux versions.  They are now
+  `asc_pci_bus_type()`, `asc_pci_get_device(idx)` and
+  `asc_pci_find_capability(dev, cap)`; `pci_find_device()` and
+  `pci_get_device_count()` have no stock counterpart and keep their names.
+- **`struct bus_type` is a minimal overlay type**
+  (`linuxkpi/include/linux/device.h`): only `name` exists.  Upstream's
+  `<linux/device/bus.h>` cannot be included because it redefines
+  `pm_message_t`, which the device.h overlay already provides.  Nothing built
+  today includes bus.h; a future import that does must reconcile the two.
+- **PCI `struct pci_dev` wrappers live for the kernel's lifetime**
+  (`linuxkpi/src/pci.c`): one wrapper per native `pci_device`, built before
+  initcalls by `linuxkpi_pci_scan()` (called from the `kpi/initcalls` thread
+  path) from `linuxkpi/native_pci.h` snapshots.  There is no kobject
+  refcounting, so `pci_dev_get()`/`pci_dev_put()` are no-ops and
+  `pci_get_device()`-style lookups never drop references; `dev.release` is a
+  no-op placeholder.  `pci_get_domain_bus_and_slot()` only matches domain 0.
+- **PCI driver binding is a direct registry** (`linuxkpi/src/pci.c`):
+  `pci_register_driver()` appends to a list and probes every unbound matching
+  wrapper synchronously through the id table (vendor/device/subvendor/
+  subdevice/class/class_mask); `pci_unregister_driver()` calls `.remove`.
+  No generic driver core, no deferred probe, no `pci_add_dynid()`, no
+  OF/ACPI matching; `dev.driver`/`driver.bus` are assigned by hand.
+- **Region requests are a conflict registry** (`linuxkpi/src/pci.c`):
+  `__request_region()`/`__release_region()` check overlap over a
+  singly-linked child list of `struct resource` and allocate/free the child
+  record.  Native port I/O is raw `in`/`out`, so a successful request is
+  bookkeeping only.  Managed (`pcim_enable_device()`) devices register a
+  devres action and release is idempotent.  `ioport_resource` (0..0xFFFF) is
+  defined here; `iomem_resource` still comes from `link_stubs.c`.  The
+  earlier weak `__devm_request_region()` stub in `link_stubs.c` was replaced
+  by the real implementation.
+- **`pci_iomap()` returns raw port addresses for I/O BARs**
+  (`linuxkpi/src/pci.c`): MMIO BARs go through `ioremap()`/`ioremap_wc()`;
+  I/O BARs return `(void __iomem *)start` because there is no ioport_map, and
+  `pci_iounmap()` skips addresses <= 0xFFFF.  The declarations come from
+  `<asm-generic/pci_iomap.h>`, now included by the `<linux/io.h>` overlay
+  (the asm/io.h overlay drops `asm-generic/io.h`, through which upstream
+  reaches them).
+- **PCI MSI/MSI-X is not implemented** (C4 scope): `CONFIG_PCI_MSI` is set so
+  `struct pci_dev` has the MSI fields and `pci_dev_msi_enabled()` compiles,
+  but `pci_alloc_irq_vectors()` and friends have no implementation; EDU's MSI
+  capability is left untouched by the test.  Drivers needing MSI must wait
+  for the Phase 5 interrupt work.
+- **ROM mapping is minimal** (`linuxkpi/src/pci.c`): `pci_enable_rom()`/
+  `pci_disable_rom()` toggle the ROM BAR enable bit, but `pci_map_rom()` only
+  maps a resource decoded at scan time and scan decodes the six standard BARs
+  only, so it reports size 0.  A real implementation needs the BAR
+  save/size/restore sequence.
+- **`drm_aperture_remove_conflicting_pci_framebuffers()` is a weak no-op**
+  (`linuxkpi/src/drm_compat.c`): bochs calls it in probe and AvoryOS has no
+  framebuffer hand-over registry (`drm_aperture.c` is not imported).  Weak so
+  the imported implementation wins later without edits.
+
 
 - **`current` is the `task_struct` shadow everywhere**
   (`linuxkpi/include/asm/current.h`): the overlay used to cast the native

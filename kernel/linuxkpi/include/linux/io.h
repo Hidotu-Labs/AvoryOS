@@ -21,6 +21,11 @@ void __iomem *ioremap_prot(resource_size_t offset, unsigned long size,
                            unsigned long prot);
 void iounmap(volatile void __iomem *addr);
 
+/* pci_iomap()/pci_iounmap() declarations.  Upstream x86 reaches these through
+ * asm-generic/io.h, which the asm/io.h overlay replaces; the implementations
+ * are in linuxkpi/src/pci.c (Phase 4 C4). */
+#include <asm-generic/pci_iomap.h>
+
 /* io-64-nonatomic-lo-hi.h: on 64-bit builds the q accessors exist, so these
  * are direct. */
 #define lo_hi_readq(addr) readq(addr)

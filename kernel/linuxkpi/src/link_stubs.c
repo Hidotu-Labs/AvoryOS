@@ -101,16 +101,8 @@ __attribute__((weak)) int overflowgid = 65534;
 
 struct resource iomem_resource;
 
-__attribute__((weak)) struct resource *__devm_request_region(
-    struct device *dev, struct resource *parent, resource_size_t start,
-    resource_size_t n, const char *name) {
-  (void)dev;
-  (void)parent;
-  (void)start;
-  (void)n;
-  (void)name;
-  return NULL;
-}
+/* __devm_request_region()/__release_region() now live in linuxkpi/src/pci.c
+ * (Phase 4 C4), backed by the real conflict registry. */
 
 /* ── printk ─────────────────────────────────────────────────────────────── */
 

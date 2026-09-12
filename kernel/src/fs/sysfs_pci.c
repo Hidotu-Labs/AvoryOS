@@ -173,7 +173,7 @@ static vfs_node_t *pci_attr(vfs_node_t *parent, const char *name,
 
 static struct pci_device *find_pci_name(const char *name) {
   for (uint32_t i = 0; i < pci_get_device_count(); i++) {
-    struct pci_device *pci = pci_get_device(i);
+    struct pci_device *pci = asc_pci_get_device(i);
     if (pci && pci->kernel_device &&
         strcmp(pci->kernel_device->name, name) == 0)
       return pci;
@@ -286,7 +286,7 @@ static vfs_node_t *driver_dir(struct driver *driver) {
 
 static vfs_node_t *device_dir(struct pci_device *pci) {
   for (uint32_t i = 0; i < pci_get_device_count(); i++) {
-    if (pci_get_device(i) == pci)
+    if (asc_pci_get_device(i) == pci)
       return pci_device_nodes[i];
   }
   return NULL;
@@ -319,7 +319,7 @@ static int driver_store(void *opaque, const char *buf, size_t size) {
   if (!ctx || !size)
     return -1;
   struct driver *driver =
-      dm_find_driver(pci_bus_type(), ctx->driver_name);
+      dm_find_driver(asc_pci_bus_type(), ctx->driver_name);
   if (!driver)
     return -1;
   struct pci_device *pci = find_pci_name(buf);
@@ -380,7 +380,7 @@ static bool add_driver_directory(struct driver *driver, void *unused) {
 }
 
 void sysfs_pci_driver_registered(struct driver *driver) {
-  if (driver && driver->bus == pci_bus_type() && pci_drivers_dir)
+  if (driver && driver->bus == asc_pci_bus_type() && pci_drivers_dir)
     add_driver_directory(driver, NULL);
 }
 
@@ -388,7 +388,7 @@ static struct pci_device *pci_from_device(struct device *device) {
   if (!device)
     return NULL;
   for (uint32_t i = 0; i < pci_get_device_count(); i++) {
-    struct pci_device *pci = pci_get_device(i);
+    struct pci_device *pci = asc_pci_get_device(i);
     if (pci && pci->kernel_device == device)
       return pci;
   }
@@ -444,13 +444,13 @@ void sysfs_pci_init(vfs_node_t *pci_bus_dir, vfs_node_t *devices_root) {
   if (!pci_devices_dir || !pci_drivers_dir || !segment)
     return;
 
-  dm_for_each_driver(pci_bus_type(), add_driver_directory, NULL);
+  dm_for_each_driver(asc_pci_bus_type(), add_driver_directory, NULL);
 
   uint32_t count = pci_get_device_count();
   if (count > PCI_SYSFS_MAX_DEVICES)
     count = PCI_SYSFS_MAX_DEVICES;
   for (uint32_t i = 0; i < count; i++) {
-    struct pci_device *pci = pci_get_device(i);
+    struct pci_device *pci = asc_pci_get_device(i);
     if (!pci || !pci->kernel_device)
       continue;
     const char *bdf = pci->kernel_device->name;

@@ -1189,7 +1189,7 @@ void xhci_init(void) {
   last_dma_phys = 0;
   uint32_t count = pci_get_device_count();
   for (uint32_t i = 0; i < count; i++) {
-    struct pci_device *pci = pci_get_device(i);
+    struct pci_device *pci = asc_pci_get_device(i);
     if (pci && pci->class_code == 0x0C && pci->subclass == 0x03 &&
         pci->prog_if == 0x30) {
       matched_count++;

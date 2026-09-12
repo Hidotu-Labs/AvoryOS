@@ -242,6 +242,45 @@ run: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		$(QEMUFLAGS)
 run-tcg: run-x86_64
 
+# ── LinuxKPI DRM canary (Phase 4+) ──────────────────────────────────────────
+#
+# `make run` plus the emulated devices the LinuxKPI PCI/DRM chunks validate
+# against.  Phase 4 C4 adds `edu` (1234:11e8), a device no native driver
+# claims, so the PCI lifecycle suite has something to bind; C5 adds
+# `bochs-display`.  `make run` is deliberately untouched (the PCI suite logs
+# SKIP there).  Headless evidence capture:
+#
+#   make run-linuxdrm SERIAL=file:build/logs/p4-c4.log DISPLAY_OPT=-display none
+#
+# (override QEMU_MEM=... for smaller machines).
+SERIAL ?= stdio
+DISPLAY_OPT ?= -display gtk,zoom-to-fit=off
+QEMU_MEM ?= -m 4G
+
+.PHONY: run-linuxdrm
+run-linuxdrm: edk2-ovmf $(IMAGE_NAME).iso disk.img
+	qemu-system-$(ARCH) \
+		-M q35,pcspk-audiodev=snd0 \
+		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
+		-cdrom $(IMAGE_NAME).iso \
+		-drive file=disk.img,format=raw,if=none,id=nvme0 \
+		-device nvme,serial=avoryos0,drive=nvme0 \
+		-cpu host -enable-kvm \
+		-smp 4 \
+		-serial $(SERIAL) \
+		$(QEMU_MEM) \
+		-vga none \
+		-device virtio-vga,xres=1280,yres=800 \
+		$(DISPLAY_OPT) \
+		-device edu \
+		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=500000,out.latency=500000 \
+		-device rtl8139,netdev=net0 \
+		-netdev user,id=net0 \
+		-device intel-hda -device hda-duplex,audiodev=snd0 \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0 \
+		-device usb-mouse,bus=xhci.0
+
 # ── VFIO passthrough (Phase 0+) ──────────────────────────────────────────────
 #
 # Boots AvoryOS with a host GPU passed through to QEMU.  The guest sees the

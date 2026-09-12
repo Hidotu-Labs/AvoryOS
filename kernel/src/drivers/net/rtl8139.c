@@ -176,7 +176,7 @@ bool rtl8139_phase1_init(void) {
     release_dma();
     return false;
   }
-  rtl8139_dm_driver.bus = pci_bus_type();
+  rtl8139_dm_driver.bus = asc_pci_bus_type();
   dm_register_driver(&rtl8139_dm_driver);
   sysfs_pci_driver_registered(&rtl8139_dm_driver);
   if (!rtl.pci->kernel_device ||

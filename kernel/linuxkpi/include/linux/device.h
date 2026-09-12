@@ -30,11 +30,18 @@
 
 struct device_node;
 struct class;
-struct bus_type;
 struct attribute_group;
 struct fwnode_handle;
 struct kobj_uevent_env;
 struct dev_pm_ops;
+
+/* Minimal bus_type: the bus shims (platform.c, pci.c) match synchronously and
+ * only need the name.  Upstream's <linux/device/bus.h> is deliberately not
+ * pulled in because it redefines pm_message_t, which this overlay provides
+ * (see below).  Recorded in docs/linuxkpi-gaps.md. */
+struct bus_type {
+  const char *name;
+};
 
 #ifndef NUMA_NO_NODE
 #define NUMA_NO_NODE (-1)

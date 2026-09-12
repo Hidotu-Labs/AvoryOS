@@ -114,7 +114,7 @@ gpu_command(const void *req, uint32_t req_len, void *resp, uint32_t resp_len, ui
 }
 static struct pci_device *find_gpu(void) {
     for (uint32_t i = 0; i < pci_get_device_count(); i++) {
-        struct pci_device *p = pci_get_device(i);
+        struct pci_device *p = asc_pci_get_device(i);
         if (p && p->vendor_id == VIRTIO_GPU_PCI_VENDOR_ID &&
             p->device_id == VIRTIO_GPU_PCI_DEVICE_ID_MODERN)
             return p;

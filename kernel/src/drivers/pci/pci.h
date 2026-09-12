@@ -23,6 +23,10 @@ struct pci_device {
   uint8_t prog_if;
   uint8_t header_type;
   uint32_t bar[6];
+  /* BAR sizes probed once at enumeration (pci_check_function()); the LinuxKPI
+   * PCI bridge exports them so it never re-probes a live BAR.  64-bit BARs
+   * store the size on the low index and 0 on the high index. */
+  uint64_t bar_size[6];
   uint8_t irq_line;
   struct device *kernel_device;
 };
@@ -36,10 +40,18 @@ uint16_t pci_config_read16(uint8_t bus, uint8_t slot, uint8_t func,
                            uint16_t offset);
 void pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func,
                         uint16_t offset, uint16_t value);
+uint8_t pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func,
+                         uint16_t offset);
+void pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func,
+                       uint16_t offset, uint8_t value);
 
 // Initialize PCI and enumerate all devices
 void pci_init(void);
-struct bus_type *pci_bus_type(void);
+/* Renamed from pci_bus_type(): stock <linux/pci.h> declares a global variable
+ * with that name, and the LinuxKPI PCI bridge defines it.  Same for
+ * asc_pci_get_device()/asc_pci_find_capability() below (the Linux names take
+ * different arguments). */
+struct bus_type *asc_pci_bus_type(void);
 
 // Find a device by class/subclass. Returns NULL if not found.
 struct pci_device *pci_find_device(uint8_t class_code, uint8_t subclass);
@@ -54,13 +66,13 @@ void pci_enable_bus_mastering(struct pci_device *dev);
 
 // Find a capability in the PCI configuration space. Returns offset or 0 if not
 // found.
-uint8_t pci_find_capability(struct pci_device *dev, uint8_t cap_id);
+uint8_t asc_pci_find_capability(struct pci_device *dev, uint8_t cap_id);
 
 // Get the number of discovered devices
 uint32_t pci_get_device_count(void);
 
 // Get device by index
-struct pci_device *pci_get_device(uint32_t index);
+struct pci_device *asc_pci_get_device(uint32_t index);
 
 #define PCI_CAP_ID_MSI  0x05
 #define PCI_CAP_ID_MSIX 0x11
