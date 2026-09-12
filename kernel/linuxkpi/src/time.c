@@ -105,12 +105,17 @@ long schedule_timeout_killable(long timeout) {
 }
 
 int wake_up_process(struct task_struct *p) {
-  linuxkpi_wake_thread((void *)p);
+  void *thread = task_struct_to_thread(p);
+
+  if (thread)
+    linuxkpi_wake_thread(thread);
   return 1;
 }
 
 bool signal_pending(struct task_struct *p) {
-  return linuxkpi_thread_has_pending_signal((void *)p);
+  void *thread = task_struct_to_thread(p);
+
+  return thread ? linuxkpi_thread_has_pending_signal(thread) : false;
 }
 
 void msleep(unsigned int msecs) {

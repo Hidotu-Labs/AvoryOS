@@ -610,17 +610,17 @@ struct drm_framebuffer_full {
   uint32_t pitch, bpp;
 };
 
-void drm_init(void);
-vfs_node_t *drm_create_client_node(void);
-bool drm_is_card_node(vfs_node_t *node);
-void drm_register_vfs(void);
-void drm_stats_snapshot(struct drm_stats *out);
+void ascentdrm_init(void);
+vfs_node_t *ascentdrm_create_client_node(void);
+bool ascentdrm_is_card_node(vfs_node_t *node);
+void ascentdrm_register_vfs(void);
+void ascentdrm_stats_snapshot(struct drm_stats *out);
 
-void drm_obj_add_prop(struct drm_mode_object *obj, uint32_t prop_id,
+void ascentdrm_obj_add_prop(struct drm_mode_object *obj, uint32_t prop_id,
                       uint64_t default_val);
-int drm_obj_set_prop(struct drm_mode_object *obj, uint32_t prop_id,
+int ascentdrm_obj_set_prop(struct drm_mode_object *obj, uint32_t prop_id,
                      uint64_t value);
-int drm_obj_get_prop(struct drm_mode_object *obj, uint32_t prop_id,
+int ascentdrm_obj_get_prop(struct drm_mode_object *obj, uint32_t prop_id,
                      uint64_t *out);
 
 enum drm_gem_cache_mode {
@@ -663,22 +663,22 @@ typedef void (*drm_cursor_fn_t)(uint32_t crtc_id,
 typedef void (*drm_get_modes_fn_t)(uint32_t connector_id,
                                   struct drm_mode_modeinfo *modes,
                                   uint32_t *count);
-uint32_t drm_connector_scanout_id(uint32_t connector_id);
-uint32_t drm_crtc_scanout_id(uint32_t crtc_id);
-void drm_ensure_outputs(struct drm_device *dev, uint32_t count);
-void drm_update_output_state(struct drm_device *dev, uint32_t scanout, bool connected);
-void drm_register_cursor_backend(drm_cursor_fn_t cursor);
-void drm_register_scanout_backend(drm_create_dumb_fn_t create_dumb,
+uint32_t ascentdrm_connector_scanout_id(uint32_t connector_id);
+uint32_t ascentdrm_crtc_scanout_id(uint32_t crtc_id);
+void ascentdrm_ensure_outputs(struct drm_device *dev, uint32_t count);
+void ascentdrm_update_output_state(struct drm_device *dev, uint32_t scanout, bool connected);
+void ascentdrm_register_cursor_backend(drm_cursor_fn_t cursor);
+void ascentdrm_register_scanout_backend(drm_create_dumb_fn_t create_dumb,
                                   drm_commit_damage_fn_t commit_damage,
                                   drm_get_modes_fn_t get_modes,
                                   drm_pageflip_fn_t pageflip);
-struct drm_gem_object *drm_gem_object_create(struct drm_device *dev, size_t size);
-void drm_gem_object_free(struct drm_device *dev, struct drm_gem_object *obj);
-void drm_file_send_event(struct drm_file *file, struct drm_event_vblank *ev,
+struct drm_gem_object *ascentdrm_gem_object_create(struct drm_device *dev, size_t size);
+void ascentdrm_gem_object_free(struct drm_device *dev, struct drm_gem_object *obj);
+void ascentdrm_file_send_event(struct drm_file *file, struct drm_event_vblank *ev,
                          struct vfs_node *node);
-uint32_t drm_file_gem_register(struct drm_file *file, struct drm_gem_object *obj);
-struct drm_gem_object *drm_file_gem_lookup(struct drm_file *file, uint32_t handle);
-void drm_file_gem_release(struct drm_file *file, uint32_t handle);
-extern struct drm_device global_drm_dev;
+uint32_t ascentdrm_file_gem_register(struct drm_file *file, struct drm_gem_object *obj);
+struct drm_gem_object *ascentdrm_file_gem_lookup(struct drm_file *file, uint32_t handle);
+void ascentdrm_file_gem_release(struct drm_file *file, uint32_t handle);
+extern struct drm_device global_ascentdrm_dev;
 
 #endif

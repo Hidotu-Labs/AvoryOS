@@ -11,6 +11,7 @@
 #include "lib/string.h"
 #include "mm/heap.h"
 #include "sched/sched.h"
+#include "sched/wait.h"
 #include "smp/cpu.h"
 
 struct linuxkpi_kthread_boot {
@@ -25,6 +26,10 @@ extern void linuxkpi_jiffies_sync(void) __attribute__((weak));
 void *linuxkpi_current_thread(void) { return sched_get_current(); }
 
 void linuxkpi_yield(void) { sched_yield(); }
+
+void linuxkpi_wake_poll_queue(void *native_wq) {
+  wait_queue_wake_all((wait_queue_t *)native_wq);
+}
 
 /* sched_get_current() is only valid once the per-CPU GS base is installed;
  * the IRQ hooks run from the first timer interrupt, which can precede
@@ -197,6 +202,60 @@ bool linuxkpi_thread_has_pending_signal(void *thread) {
   return t ? thread_has_pending_signal(t) : false;
 }
 
+unsigned long linuxkpi_current_tgid(void) {
+  struct thread *t = sched_get_current();
+  return t ? (unsigned long)t->tgid : 0;
+}
+
+unsigned long linuxkpi_thread_tgid(void *thread) {
+  struct thread *t = (struct thread *)thread;
+  return t ? (unsigned long)t->tgid : 0;
+}
+
+unsigned long linuxkpi_thread_pid(void *thread) {
+  struct thread *t = (struct thread *)thread;
+  return t ? (unsigned long)t->tid : 0;
+}
+
+void linuxkpi_thread_comm(void *thread, char *buf, unsigned long size) {
+  struct thread *t = (struct thread *)thread;
+
+  if (!buf || size == 0)
+    return;
+  if (!t) {
+    buf[0] = '\0';
+    return;
+  }
+  __builtin_strncpy(buf, t->comm, size - 1);
+  buf[size - 1] = '\0';
+}
+
+/* The shadow allocator is implemented on the Linux side (task.c), which knows
+ * the struct task_struct layout; weak so this file stays native-only. */
+extern void *linuxkpi_task_shadow_new(void *thread) __attribute__((weak));
+
+static void *task_for_thread_locked(struct thread *t) {
+  if (!t)
+    return 0;
+  if (!t->kpi_task && linuxkpi_task_shadow_new)
+    t->kpi_task = linuxkpi_task_shadow_new(t);
+  return t->kpi_task;
+}
+
+void *linuxkpi_current_task(void) {
+  return task_for_thread_locked(sched_get_current());
+}
+
+void *linuxkpi_task_for_thread(void *thread) {
+  return task_for_thread_locked((struct thread *)thread);
+}
+
+void *linuxkpi_task_thread(void *task) {
+  /* The shadow stores the native thread pointer in its first field
+   * (kernel/linuxkpi/src/task.c); keep this in sync with struct task_struct. */
+  return task ? *(void **)task : 0;
+}
+
 unsigned long long linuxkpi_monotonic_ms(void) { return lapic_timer_get_ms(); }
 
 unsigned long long linuxkpi_monotonic_ns(void) { return lapic_timer_get_ns(); }
@@ -217,4 +276,36 @@ void *linuxkpi_thread_data(void *thread) {
 void *linuxkpi_thread_self_data(void) {
   struct thread *t = sched_get_current();
   return t ? t->kpi_data : NULL;
+}
+
+/* Symbol expected by imported <asm/current.h>/<asm/processor.h>; uniprocessor
+ * emulation, `current` itself is served by linuxkpi_current_thread(). */
+struct linuxkpi_pcpu_hot {
+  void *current_task;
+  unsigned int preempt_count;
+  unsigned int cpu_number;
+  unsigned long top_of_stack;
+  void *hardirq_stack_ptr;
+  unsigned short softirq_pending;
+  _Bool hardirq_stack_inuse;
+  unsigned char pad[64 - 8 - 4 - 4 - 8 - 8 - 2 - 1];
+} __attribute__((aligned(64)));
+
+struct linuxkpi_pcpu_hot pcpu_hot;
+
+void linuxkpi_vma_set_pending(void *linux_vma) {
+  struct thread *t = sched_get_current();
+  if (t)
+    t->kpi_pending_vma = linux_vma;
+}
+
+void *linuxkpi_vma_take_pending(void) {
+  struct thread *t = sched_get_current();
+  void *v;
+
+  if (!t)
+    return NULL;
+  v = t->kpi_pending_vma;
+  t->kpi_pending_vma = NULL;
+  return v;
 }

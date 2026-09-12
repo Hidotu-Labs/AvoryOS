@@ -8,10 +8,13 @@
 #include "fs/vfs.h"
 #include "lib/string.h"
 #include "mm/heap.h"
+#include "mm/pmm.h"
 #include "net/core.h"
 #include "net/ipv4.h"
 #include "net/ipv6.h"
 #include "smp/cpu.h"
+
+#include <linuxkpi/native_sysfs.h>
 
 // GPU device path for netlink uevents
 char sysfs_gpu_devpath[128] = "/devices/pci0000:00/0000:00:01.0/drm/card0";
@@ -681,4 +684,166 @@ void sysfs_init(void) {
   }
 
   klog_puts("[OK] SysFS initialized at /sys\n");
+}
+
+/* ── dynamic class/device/attribute nodes (LinuxKPI device core) ─────────── */
+
+struct sysfs_dyn_attr {
+  void *ctx;
+  int (*show)(void *ctx, char *buf, unsigned int size);
+  int (*store)(void *ctx, const char *buf, unsigned int size);
+};
+
+static uint32_t sysfs_dyn_attr_read(vfs_node_t *node, uint32_t offset,
+                                    uint32_t size, uint8_t *buffer) {
+  struct sysfs_dyn_attr *attr = node ? (struct sysfs_dyn_attr *)node->device : NULL;
+  char *tmp;
+  int len;
+  uint32_t n;
+
+  if (!attr || !attr->show || !size)
+    return 0;
+
+  tmp = kmalloc(PAGE_SIZE);
+  if (!tmp)
+    return 0;
+  len = attr->show(attr->ctx, tmp, PAGE_SIZE);
+  if (len < 0)
+    len = 0;
+  if (offset >= (uint32_t)len) {
+    kfree(tmp);
+    return 0;
+  }
+  n = (uint32_t)len - offset;
+  if (n > size)
+    n = size;
+  memcpy(buffer, tmp + offset, n);
+  kfree(tmp);
+  return n;
+}
+
+static uint32_t sysfs_dyn_attr_write(vfs_node_t *node, uint32_t offset,
+                                     uint32_t size, uint8_t *buffer) {
+  struct sysfs_dyn_attr *attr = node ? (struct sysfs_dyn_attr *)node->device : NULL;
+  char *tmp;
+  int ret;
+
+  (void)offset;
+  if (!attr || !attr->store || !size)
+    return 0;
+
+  tmp = kmalloc((size_t)size + 1);
+  if (!tmp)
+    return 0;
+  memcpy(tmp, buffer, size);
+  tmp[size] = '\0';
+  ret = attr->store(attr->ctx, tmp, size);
+  kfree(tmp);
+  return ret < 0 ? 0 : size;
+}
+
+void *asc_sysfs_class_dir(const char *name) {
+  vfs_node_t *class_root;
+  vfs_node_t *dir;
+
+  if (!name)
+    return NULL;
+  class_root = vfs_resolve_path("/sys/class");
+  if (!class_root)
+    return NULL;
+  dir = sysfs_mkdir(class_root, name);
+  vfs_close(class_root);
+  return dir;
+}
+
+void *asc_sysfs_device_dir(void *class_dir, const char *dev_name) {
+  if (!class_dir || !dev_name || !*dev_name)
+    return NULL;
+  return sysfs_mkdir((vfs_node_t *)class_dir, dev_name);
+}
+
+static void sysfs_remove_children(vfs_node_t *dir) {
+  for (;;) {
+    bool removed = false;
+    uint32_t index = 0;
+    struct dirent *de;
+
+    while ((de = vfs_readdir(dir, index)) != NULL) {
+      if (strcmp(de->name, ".") == 0 || strcmp(de->name, "..") == 0) {
+        index++;
+        continue;
+      }
+      vfs_node_t *child = vfs_finddir(dir, de->name);
+      if (!child) {
+        index++;
+        continue;
+      }
+      if ((child->flags & FS_TYPE_MASK) == FS_DIRECTORY) {
+        sysfs_remove_children(child);
+        vfs_rmdir(dir, de->name);
+      } else {
+        vfs_unlink(dir, de->name);
+      }
+      removed = true;
+      break; /* enumeration shifted; restart from the first entry */
+    }
+    if (!removed)
+      break;
+  }
+}
+
+void asc_sysfs_remove(void *dir, const char *name) {
+  vfs_node_t *d = dir;
+  vfs_node_t *child;
+
+  if (!d || !name)
+    return;
+  child = vfs_finddir(d, (char *)name);
+  if (!child)
+    return;
+  if ((child->flags & FS_TYPE_MASK) == FS_DIRECTORY) {
+    sysfs_remove_children(child);
+    vfs_rmdir(d, (char *)name);
+  } else {
+    vfs_unlink(d, (char *)name);
+  }
+}
+
+int asc_sysfs_attr_file(void *dir, const char *name, unsigned int mode,
+                        void *ctx,
+                        int (*show)(void *ctx, char *buf, unsigned int size),
+                        int (*store)(void *ctx, const char *buf,
+                                     unsigned int size)) {
+  vfs_node_t *d = dir;
+  struct sysfs_dyn_attr *attr;
+  vfs_node_t *file;
+
+  if (!d || !name || !*name)
+    return -22; /* EINVAL */
+  if (vfs_finddir(d, (char *)name))
+    return -17; /* EEXIST */
+
+  attr = kmalloc(sizeof(*attr));
+  file = kmalloc(sizeof(*file));
+  if (!attr || !file) {
+    kfree(attr);
+    kfree(file);
+    return -12; /* ENOMEM */
+  }
+  attr->ctx = ctx;
+  attr->show = show;
+  attr->store = store;
+
+  vfs_node_init(file);
+  strncpy(file->name, name, sizeof(file->name) - 1);
+  file->name[sizeof(file->name) - 1] = '\0';
+  file->flags = FS_FILE | FS_PERSISTENT;
+  file->mask = (uint16_t)mode;
+  file->device = attr;
+  file->read = sysfs_dyn_attr_read;
+  file->write = sysfs_dyn_attr_write;
+
+  ramfs_mount_node(d, file);
+  vfs_dentry_invalidate(d, (char *)name);
+  return 0;
 }

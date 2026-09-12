@@ -34,6 +34,24 @@ static inline void vma_drop_file_ref(struct vma *v) {
     vma_file_unref(v->file_node);
 }
 
+/* Linux vm_area_struct wrapper lifetime.  Native nodes share one wrapper per
+ * original mapping; the bridge calls vm_ops->close() exactly once, when the
+ * last reference drops (kernel/linuxkpi/src/mmap.c). */
+static inline void vma_linux_ref(void *linux_vma) {
+  extern void linuxkpi_vma_ref(void *) __attribute__((weak));
+  if (linux_vma && linuxkpi_vma_ref)
+    linuxkpi_vma_ref(linux_vma);
+}
+
+static inline void vma_drop_linux_ref(struct vma *v) {
+  extern void linuxkpi_vma_unref(void *) __attribute__((weak));
+  if (v && v->linux_vma) {
+    if (linuxkpi_vma_unref)
+      linuxkpi_vma_unref(v->linux_vma);
+    v->linux_vma = NULL;
+  }
+}
+
 // Helper macros
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -146,12 +164,14 @@ static struct vma *delete_node(struct vma *node, uint64_t start,
       struct vma *temp = node->left ? node->left : node->right;
       if (!temp) {
         vma_drop_file_ref(node);
+        vma_drop_linux_ref(node);
         vma_node_free(node);
         node = NULL;
       } else {
         struct vma *unlinked = node;
         node = temp;
         vma_drop_file_ref(unlinked);
+        vma_drop_linux_ref(unlinked);
         vma_node_free(unlinked);
       }
     } else {
@@ -162,6 +182,7 @@ static struct vma *delete_node(struct vma *node, uint64_t start,
       // The deleted node's file reference goes away, while the successor's
       // reference moves into this node with the copied payload below.
       vma_drop_file_ref(node);
+      vma_drop_linux_ref(node);
 
       // Copy the inorder successor's data to this node
       node->start = temp->start;
@@ -173,6 +194,8 @@ static struct vma *delete_node(struct vma *node, uint64_t start,
       node->fd = temp->fd;
       node->file_node = temp->file_node;
       temp->file_node = NULL;
+      node->linux_vma = temp->linux_vma;
+      temp->linux_vma = NULL;
 
       // Delete the inorder successor
       node->right = delete_node(node->right, temp->start, deleted);
@@ -219,6 +242,7 @@ static void vma_destroy_recursive(struct vma *node) {
   vma_destroy_recursive(node->left);
   vma_destroy_recursive(node->right);
   vma_drop_file_ref(node);
+  vma_drop_linux_ref(node);
   vma_node_free(node);
 }
 
@@ -249,6 +273,7 @@ int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
   new_node->fd = fd;
   new_node->file_node = file_node;
   vma_file_ref(file_node);
+  new_node->linux_vma = NULL;
   new_node->height = 1;
   new_node->left = NULL;
   new_node->right = NULL;
@@ -257,6 +282,21 @@ int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
   list->count++;
 
   return 0; // Success
+}
+
+void vma_attach_linux(struct vma_list *list, uint64_t start, void *linux_vma) {
+  struct vma *v;
+
+  if (!linux_vma)
+    return;
+
+  v = vma_find(list, start);
+  if (!v || v->linux_vma == linux_vma)
+    return;
+
+  vma_drop_linux_ref(v);
+  v->linux_vma = linux_vma;
+  vma_linux_ref(linux_vma);
 }
 
 bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
@@ -276,7 +316,9 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
     uint64_t offset = v->offset;
     uint64_t orig_file_size = v->file_size;
     void *vma_file_node = v->file_node;
+    void *vma_linux_vma = v->linux_vma;
     vma_file_ref(vma_file_node);
+    vma_linux_ref(vma_linux_vma);
 
     bool deleted = false;
     list->root = delete_node(list->root, v->start, &deleted);
@@ -295,7 +337,9 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
       uint64_t sub2 = (orig_file_size > rel2) ? MIN(orig_file_size - rel2, len2) : 0;
 
       vma_add(list, v_start, start, prot, flags, fd, offset, vma_file_node, sub1);
+      vma_attach_linux(list, v_start, vma_linux_vma);
       vma_add(list, end, v_end, prot, flags, fd, offset + rel2, vma_file_node, sub2);
+      vma_attach_linux(list, end, vma_linux_vma);
     }
     // Case 3: Unmap from start - shrinking start boundary forward
     else if (start <= v_start && end > v_start && end < v_end) {
@@ -304,6 +348,7 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
       uint64_t sub = (orig_file_size > rel) ? MIN(orig_file_size - rel, len) : 0;
 
       vma_add(list, end, v_end, prot, flags, fd, offset + rel, vma_file_node, sub);
+      vma_attach_linux(list, end, vma_linux_vma);
     }
     // Case 4: Unmap from end - shrinking end boundary backward
     else if (end >= v_end && start > v_start && start < v_end) {
@@ -311,9 +356,19 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
       uint64_t sub = MIN(orig_file_size, len);
 
       vma_add(list, v_start, start, prot, flags, fd, offset, vma_file_node, sub);
+      vma_attach_linux(list, v_start, vma_linux_vma);
     }
 
     vma_file_unref(vma_file_node);
+    /* delete_node() dropped the original node's reference; the re-added split
+     * pieces each took one above, so a wrapper shared by pieces stays alive
+     * until the last piece goes.  A fully-covered node's last reference was
+     * just dropped by delete_node(), closing the wrapper. */
+    if (vma_linux_vma) {
+      extern void linuxkpi_vma_unref(void *) __attribute__((weak));
+      if (linuxkpi_vma_unref)
+        linuxkpi_vma_unref(vma_linux_vma);
+    }
   }
 
   return overall_removed;
@@ -435,6 +490,7 @@ static void clone_recursive(struct vma_list *dst, struct vma *node) {
     return;
   vma_add(dst, node->start, node->end, node->prot, node->flags, node->fd,
           node->offset, node->file_node, node->file_size);
+  vma_attach_linux(dst, node->start, node->linux_vma);
   clone_recursive(dst, node->left);
   clone_recursive(dst, node->right);
 }

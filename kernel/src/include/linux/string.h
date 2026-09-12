@@ -72,17 +72,9 @@ static inline char *strnchr(const char *s, size_t count, int c)
 
 /*
  * strchr — find first occurrence of c in s (including NUL).
- * lib/string.h doesn't expose this; provide it here.
+ * Implemented in lib/string.c; declared in lib/string.h as well.
  */
-static inline char *strchr(const char *s, int c)
-{
-    while (*s) {
-        if (*s == (char)c)
-            return (char *)s;
-        s++;
-    }
-    return c == '\0' ? (char *)s : NULL;
-}
+char *strchr(const char *s, int c);
 
 /*
  * memchr — find first occurrence of c in s[0..n).

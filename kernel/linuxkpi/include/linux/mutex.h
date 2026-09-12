@@ -8,6 +8,8 @@
  * directly (no thundering herd, no lost wakeups).  Implementations:
  * linuxkpi/src/mutex.c. */
 
+#include <linux/atomic.h>
+#include <linux/cleanup.h>
 #include <linux/list.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
@@ -33,5 +35,21 @@ int mutex_trylock(struct mutex *lock);
 void mutex_unlock(struct mutex *lock);
 bool mutex_is_locked(struct mutex *lock);
 void mutex_destroy(struct mutex *lock);
+
+/* Upstream mutex.h provides guard() support via cleanup.h. */
+DEFINE_GUARD(mutex, struct mutex *, mutex_lock(_T), mutex_unlock(_T))
+DEFINE_GUARD_COND(mutex, _try, mutex_trylock(_T))
+DEFINE_GUARD_COND(mutex, _intr, mutex_lock_interruptible(_T) == 0)
+
+/* Decrement and, if the last reference, take the mutex.  Upstream lives in
+ * linux/mutex.h; used by dma-buf. */
+static inline int atomic_dec_and_mutex_lock(atomic_t *cnt,
+                                            struct mutex *lock) {
+  if (atomic_dec_and_test(cnt)) {
+    mutex_lock(lock);
+    return 1;
+  }
+  return 0;
+}
 
 #endif /* __AVORY_LINUXKPI_MUTEX_H */

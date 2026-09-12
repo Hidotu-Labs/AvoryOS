@@ -294,6 +294,16 @@ struct thread {
    * in this struct, not these. */
   void *kpi_data;
 
+  /* LinuxKPI per-thread task_struct shadow (allocated lazily by
+   * linuxkpi_current_task()); `current` in imported code is this pointer. */
+  void *kpi_task;
+
+  /* LinuxKPI mmap bridge: the Linux-facing vm_area_struct produced by the
+   * last device mmap() in this thread.  sys_mmap() consumes it right after
+   * node->mmap() returns and hands it to the newly created native VMA
+   * (kernel/linuxkpi/src/mmap.c). */
+  void *kpi_pending_vma;
+
   /* LinuxKPI hardirq/softirq nesting depth (kernel/src/linuxkpi/native_sched.c,
    * via the native ISR hooks).  Per-thread, not per-CPU: the scheduler can
    * switch to another thread from inside an interrupt handler, and that thread

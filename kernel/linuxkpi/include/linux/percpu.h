@@ -23,6 +23,7 @@
 #define DEFINE_PER_CPU_SHARED_ALIGNED(type, name) type name
 
 #define per_cpu_ptr(ptr, cpu) ((void)(cpu), (typeof(*(ptr)) *)(ptr))
+#define per_cpu(var, cpu) (*(typeof(var) *)((void)(cpu), &(var)))
 #define this_cpu_ptr(ptr) ((typeof(*(ptr)) *)(ptr))
 #define raw_cpu_ptr(ptr) ((typeof(*(ptr)) *)(ptr))
 #define get_cpu_ptr(ptr) ((typeof(*(ptr)) *)(ptr))
@@ -63,7 +64,23 @@
 #define __this_cpu_read(var) this_cpu_read(var)
 #define __this_cpu_write(var, val) this_cpu_write(var, val)
 
+/* <linux/smp.h> defines get_cpu()/put_cpu() as macros; if it was included
+ * first, make sure they do not expand these declarations. */
+#ifdef get_cpu
+#undef get_cpu
+#endif
+#ifdef put_cpu
+#undef put_cpu
+#endif
+
 static inline unsigned int get_cpu(void) { return 0; }
 static inline void put_cpu(void) {}
+
+/* No modules/ksymtab here: exports are no-ops.  Upstream defines these in
+ * <linux/percpu-defs.h>, which this overlay replaces. */
+#ifndef EXPORT_PER_CPU_SYMBOL
+#define EXPORT_PER_CPU_SYMBOL(var)
+#define EXPORT_PER_CPU_SYMBOL_GPL(var)
+#endif
 
 #endif /* __AVORY_LINUXKPI_PERCPU_H */

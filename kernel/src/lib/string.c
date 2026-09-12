@@ -44,6 +44,20 @@ char *strncpy(char *dest, const char *src, size_t n) {
   return dest;
 }
 
+char *strchr(const char *s, int c) {
+  do {
+    if (*s == (char)c)
+      return (char *)s;
+  } while (*s++);
+  return 0;
+}
+
+char *strnchrnul(const char *s, size_t count, int c) {
+  while (count-- && *s && *s != (char)c)
+    s++;
+  return (char *)s;
+}
+
 char *strrchr(const char *s, int c) {
   char *last = 0;
   do {
@@ -271,6 +285,21 @@ int strcasecmp(const char *s1, const char *s2) {
   return (unsigned char)*s1 - (unsigned char)*s2;
 }
 
+int strncasecmp(const char *s1, const char *s2, size_t n) {
+  while (n && *s1 && *s2) {
+    char c1 = tolower_char(*s1);
+    char c2 = tolower_char(*s2);
+    if (c1 != c2)
+      return (unsigned char)c1 - (unsigned char)c2;
+    s1++;
+    s2++;
+    n--;
+  }
+  if (n == 0)
+    return 0;
+  return (unsigned char)*s1 - (unsigned char)*s2;
+}
+
 
 #define EMIT(c)                          \
     do {                                 \
@@ -323,6 +352,79 @@ static int u64_to_buf(uint64_t val, unsigned int base, int uppercase,
     return n;
 }
 
+/* Symbolic errno names for %pe (subset of upstream errname()). */
+static const char *string_errno_name(long err) {
+    switch (err) {
+    case 1:   return "EPERM";
+    case 2:   return "ENOENT";
+    case 3:   return "ESRCH";
+    case 4:   return "EINTR";
+    case 5:   return "EIO";
+    case 6:   return "ENXIO";
+    case 7:   return "E2BIG";
+    case 8:   return "ENOEXEC";
+    case 9:   return "EBADF";
+    case 10:  return "ECHILD";
+    case 11:  return "EAGAIN";
+    case 12:  return "ENOMEM";
+    case 13:  return "EACCES";
+    case 14:  return "EFAULT";
+    case 16:  return "EBUSY";
+    case 17:  return "EEXIST";
+    case 18:  return "EXDEV";
+    case 19:  return "ENODEV";
+    case 20:  return "ENOTDIR";
+    case 21:  return "EISDIR";
+    case 22:  return "EINVAL";
+    case 23:  return "ENFILE";
+    case 24:  return "EMFILE";
+    case 25:  return "ENOTTY";
+    case 27:  return "EFBIG";
+    case 28:  return "ENOSPC";
+    case 29:  return "ESPIPE";
+    case 30:  return "EROFS";
+    case 31:  return "EMLINK";
+    case 32:  return "EPIPE";
+    case 36:  return "ENAMETOOLONG";
+    case 38:  return "ENOSYS";
+    case 39:  return "ENOTEMPTY";
+    case 40:  return "ELOOP";
+    case 42:  return "ENOMSG";
+    case 43:  return "EIDRM";
+    case 61:  return "ENODATA";
+    case 62:  return "ETIME";
+    case 71:  return "EPROTO";
+    case 74:  return "EBADMSG";
+    case 75:  return "EOVERFLOW";
+    case 84:  return "EILSEQ";
+    case 88:  return "ENOTSOCK";
+    case 89:  return "EDESTADDRREQ";
+    case 90:  return "EMSGSIZE";
+    case 92:  return "ENOPROTOOPT";
+    case 93:  return "EPROTONOSUPPORT";
+    case 95:  return "EOPNOTSUPP";
+    case 97:  return "EAFNOSUPPORT";
+    case 98:  return "EADDRINUSE";
+    case 99:  return "EADDRNOTAVAIL";
+    case 100: return "ENETDOWN";
+    case 101: return "ENETUNREACH";
+    case 103: return "ECONNABORTED";
+    case 104: return "ECONNRESET";
+    case 105: return "ENOBUFS";
+    case 106: return "EISCONN";
+    case 107: return "ENOTCONN";
+    case 110: return "ETIMEDOUT";
+    case 111: return "ECONNREFUSED";
+    case 113: return "EHOSTUNREACH";
+    case 114: return "EALREADY";
+    case 115: return "EINPROGRESS";
+    case 116: return "ESTALE";
+    case 122: return "EDQUOT";
+    case 125: return "ECANCELED";
+    default:  return NULL;
+    }
+}
+
 int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
     size_t pos = 0;
 
@@ -351,8 +453,17 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
 
         /* ---- Parse width ---- */
         int width = 0;
-        while (*fmt >= '0' && *fmt <= '9')
-            width = width * 10 + (*fmt++ - '0');
+        if (*fmt == '*') {
+            width = va_arg(ap, int);
+            fmt++;
+            if (width < 0) {
+                left_align = 1;
+                width = -width;
+            }
+        } else {
+            while (*fmt >= '0' && *fmt <= '9')
+                width = width * 10 + (*fmt++ - '0');
+        }
 
         /* ---- Parse precision ---- */
         int prec = -1; /* -1 means "not specified" */
@@ -481,22 +592,148 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
 
         case 'p':
             {
-                uintptr_t val = (uintptr_t)va_arg(ap, void *);
-                char tmp[66];
-                int n = u64_to_buf((uint64_t)val, 16, 0, tmp);
-                /* "0x" prefix + zero-padded to pointer width */
-                int ptr_digits = (int)(sizeof(void *) * 2);
-                int digits = n > ptr_digits ? n : ptr_digits;
-                int total  = digits + 2; /* "0x" */
+                char ext = *fmt;
+                uintptr_t val;
 
-                char full[80];
-                int fi = 0;
-                full[fi++] = '0';
-                full[fi++] = 'x';
-                for (int i = digits - n; i > 0; i--) full[fi++] = '0';
-                for (int i = 0; i < n; i++) full[fi++] = tmp[i];
-                pos = emit_padded(buf, size, pos, full, (size_t)(total > fi ? fi : total),
-                                  width, left_align, ' ');
+                /* Kernel pointer extensions (mirrors lib/vsprintf.c). */
+                if (ext == 'V') {
+                    /* %pV: struct va_format { const char *fmt; va_list *va; } */
+                    struct {
+                        const char *fmt;
+                        va_list *va;
+                    } *vaf = va_arg(ap, void *);
+                    fmt++;
+                    if (vaf && vaf->fmt && vaf->va) {
+                        char vbuf[256];
+                        int vn = vsnprintf(vbuf, sizeof(vbuf), vaf->fmt,
+                                           *vaf->va);
+                        if (vn > 0)
+                            pos = emit_padded(buf, size, pos, vbuf, (size_t)vn,
+                                              width, left_align, ' ');
+                    }
+                    break;
+                }
+
+                if (ext == 'h') {
+                    /* %*ph / %*phN / %phN: space-separated hex bytes. */
+                    static const char hexd[] = "0123456789abcdef";
+                    const unsigned char *data;
+                    char hbuf[160];
+                    int hn = 0;
+                    int count = width;
+
+                    fmt++;
+                    if (*fmt >= '0' && *fmt <= '9') {
+                        count = 0;
+                        while (*fmt >= '0' && *fmt <= '9')
+                            count = count * 10 + (*fmt++ - '0');
+                    }
+                    data = va_arg(ap, const unsigned char *);
+                    if (count < 0)
+                        count = 0;
+                    for (int i = 0; i < count && hn + 3 < (int)sizeof(hbuf);
+                         i++) {
+                        if (i)
+                            hbuf[hn++] = ' ';
+                        hbuf[hn++] = hexd[data[i] >> 4];
+                        hbuf[hn++] = hexd[data[i] & 0xf];
+                    }
+                    pos = emit_padded(buf, size, pos, hbuf, (size_t)hn, width,
+                                      left_align, ' ');
+                    break;
+                }
+
+                if (ext == 'M') {
+                    /* %pM: colon-separated MAC address. */
+                    static const char hexd[] = "0123456789abcdef";
+                    const unsigned char *m = va_arg(ap, const unsigned char *);
+                    char mbuf[18];
+                    int mn = 0;
+
+                    fmt++;
+                    for (int i = 0; i < 6; i++) {
+                        if (i)
+                            mbuf[mn++] = ':';
+                        mbuf[mn++] = hexd[m[i] >> 4];
+                        mbuf[mn++] = hexd[m[i] & 0xf];
+                    }
+                    pos = emit_padded(buf, size, pos, mbuf, (size_t)mn, width,
+                                      left_align, ' ');
+                    break;
+                }
+
+                if (ext == 'a') {
+                    /* %pa: physical address (always full-width hex). */
+                    const uint64_t *pa = va_arg(ap, const uint64_t *);
+                    char tmp[66];
+                    char full[80];
+                    int fi = 0;
+                    int n = u64_to_buf(pa ? *pa : 0, 16, 0, tmp);
+
+                    fmt++;
+                    full[fi++] = '0';
+                    full[fi++] = 'x';
+                    for (int i = 0; i < 16 - n; i++)
+                        full[fi++] = '0';
+                    for (int i = 0; i < n; i++)
+                        full[fi++] = tmp[i];
+                    pos = emit_padded(buf, size, pos, full, (size_t)fi, width,
+                                      left_align, ' ');
+                    break;
+                }
+
+                if (ext == 'e' || ext == 'E') {
+                    /* %pe: ERR_PTR as its symbolic errno, else signed decimal
+                     * (same shape as upstream err_ptr()). */
+                    long err = (long)va_arg(ap, void *);
+                    const char *name = string_errno_name(err < 0 ? -err : err);
+                    char ebuf[32];
+                    int en = 0;
+
+                    fmt++;
+                    if (name) {
+                        while (*name && en < (int)sizeof(ebuf) - 1)
+                            ebuf[en++] = *name++;
+                    } else {
+                        char num[24];
+                        int nn = u64_to_buf(
+                            (uint64_t)(err < 0 ? -err : err), 10, 0, num);
+                        if (err < 0)
+                            ebuf[en++] = '-';
+                        for (int i = 0; i < nn && en < (int)sizeof(ebuf) - 1;
+                             i++)
+                            ebuf[en++] = num[i];
+                    }
+                    pos = emit_padded(buf, size, pos, ebuf, (size_t)en, width,
+                                      left_align, ' ');
+                    break;
+                }
+
+                if (ext == 'S' || ext == 'B' || ext == 'F' || ext == 's' ||
+                    ext == 'K' || ext == 'x') {
+                    /* Symbolic printing needs kallsyms; the address is the
+                     * best available representation. */
+                    fmt++;
+                }
+
+                val = (uintptr_t)va_arg(ap, void *);
+                {
+                    char tmp[66];
+                    int n = u64_to_buf((uint64_t)val, 16, 0, tmp);
+                    /* "0x" prefix + zero-padded to pointer width */
+                    int ptr_digits = (int)(sizeof(void *) * 2);
+                    int digits = n > ptr_digits ? n : ptr_digits;
+                    int total  = digits + 2; /* "0x" */
+
+                    char full[80];
+                    int fi = 0;
+                    full[fi++] = '0';
+                    full[fi++] = 'x';
+                    for (int i = digits - n; i > 0; i--) full[fi++] = '0';
+                    for (int i = 0; i < n; i++) full[fi++] = tmp[i];
+                    pos = emit_padded(buf, size, pos, full, (size_t)(total > fi ? fi : total),
+                                      width, left_align, ' ');
+                }
             }
             break;
 
@@ -519,6 +756,19 @@ int snprintf(char *buf, size_t size, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     int ret = vsnprintf(buf, size, fmt, ap);
+    va_end(ap);
+    return ret;
+}
+
+int vscnprintf(char *buf, size_t size, const char *fmt, va_list args) {
+    int n = vsnprintf(buf, size, fmt, args);
+    return n < (int)size ? n : (int)size - 1;
+}
+
+int scnprintf(char *buf, size_t size, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int ret = vscnprintf(buf, size, fmt, ap);
     va_end(ap);
     return ret;
 }

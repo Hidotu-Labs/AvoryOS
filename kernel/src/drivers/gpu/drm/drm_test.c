@@ -2,9 +2,9 @@
 #include "../../../sched/sched.h"
 #include "drm.h"
 
-extern struct drm_device global_drm_dev;
+extern struct drm_device global_ascentdrm_dev;
 
-void drm_run_phase3_test(void) {
+void ascentdrm_run_phase3_test(void) {
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " Starting DRM Phase 1, 2 & 3 Stress Test\n");
 
   struct vfs_node *node = vfs_resolve_path("/dev/dri/card0");
@@ -44,11 +44,11 @@ void drm_run_phase3_test(void) {
 
   // 3. KMS Stress Test
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " Phase 2: KMS Pipeline Validation\n");
-  spinlock_acquire(&global_drm_dev.lock);
+  spinlock_acquire(&global_ascentdrm_dev.lock);
   int kms_count = 0;
   struct drm_mode_object *mobj;
-  list_for_each_entry(mobj, &global_drm_dev.kms_objects, list) { kms_count++; }
-  spinlock_release(&global_drm_dev.lock);
+  list_for_each_entry(mobj, &global_ascentdrm_dev.kms_objects, list) { kms_count++; }
+  spinlock_release(&global_ascentdrm_dev.lock);
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " KMS Object count: ");
   klog_uint64(kms_count);
   klog_puts("\n");
@@ -86,15 +86,15 @@ void drm_run_phase3_test(void) {
 
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " Phase 4: Hardware FB Bridge Validation\n");
   bool found_hw_fb = false;
-  spinlock_acquire(&global_drm_dev.lock);
+  spinlock_acquire(&global_ascentdrm_dev.lock);
   struct drm_gem_object *obj;
-  list_for_each_entry(obj, &global_drm_dev.gem_objects, list) {
+  list_for_each_entry(obj, &global_ascentdrm_dev.gem_objects, list) {
     if (obj->handle == 0xF0B0) {
       found_hw_fb = true;
       break;
     }
   }
-  spinlock_release(&global_drm_dev.lock);
+  spinlock_release(&global_ascentdrm_dev.lock);
   if (found_hw_fb) {
     klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " Hardware FB GEM found! Bridge is ACTIVE.\n");
   } else {

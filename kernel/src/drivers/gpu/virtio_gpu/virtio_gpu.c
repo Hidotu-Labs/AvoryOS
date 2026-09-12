@@ -880,7 +880,7 @@ static bool handle_async_completion(void *cookie, uint32_t used_len) {
     }
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
     if (send_event)
-        drm_file_send_event(event_file, &ev, event_node);
+        ascentdrm_file_send_event(event_file, &ev, event_node);
     return true;
 }
 
@@ -1052,12 +1052,12 @@ static void gpu_handle_config_event(void) {
         return;
     if (!gpu_phase8_started)
         return;
-    drm_ensure_outputs(&global_drm_dev, gpu.num_scanouts);
+    ascentdrm_ensure_outputs(&global_ascentdrm_dev, gpu.num_scanouts);
     for (uint32_t i = 0; i < gpu.num_scanouts && i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
         bool changed = old_enabled[i] != gpu.scanouts[i].enabled ||
                        old_w[i] != gpu.display_info.pmodes[i].r.width ||
                        old_h[i] != gpu.display_info.pmodes[i].r.height;
-        drm_update_output_state(&global_drm_dev, i, gpu.scanouts[i].enabled);
+        ascentdrm_update_output_state(&global_ascentdrm_dev, i, gpu.scanouts[i].enabled);
         if (old_enabled[i] && !gpu.scanouts[i].enabled && gpu.head_resource[i]) {
             if (disable_scanout(i)) {
                 gpu.head_resource[i] = 0;
@@ -1162,7 +1162,7 @@ static bool async_present_submit(uint32_t head,
     slot->command_count = count;
     slot->completed = 0;
     slot->submitted_ms = lapic_timer_get_ms();
-    slot->has_event = gpu.pending_flip && drm_crtc_scanout_id(gpu.pending_flip_crtc_id) == head;
+    slot->has_event = gpu.pending_flip && ascentdrm_crtc_scanout_id(gpu.pending_flip_crtc_id) == head;
     if (slot->has_event) {
         slot->event_file = gpu.pending_flip_file;
         slot->event_node = gpu.pending_flip_node;
@@ -1276,7 +1276,7 @@ static void virtio_gpu_cursor_update(uint32_t crtc_id,
                                      uint32_t flags) {
     if (!cursor_resource_id)
         return;
-    cursor_active_head = drm_crtc_scanout_id(crtc_id);
+    cursor_active_head = ascentdrm_crtc_scanout_id(crtc_id);
     if (cursor_active_head >= VIRTIO_GPU_MAX_SCANOUTS)
         cursor_active_head = 0;
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_SHAPE, &gpu_cursor_shape_lock);
@@ -1363,7 +1363,7 @@ bool virtio_gpu_phase7_start(void) {
         return false;
     }
     cursor_phase7_started_ms = lapic_timer_get_ms();
-    drm_register_cursor_backend(virtio_gpu_cursor_update);
+    ascentdrm_register_cursor_backend(virtio_gpu_cursor_update);
     klog_puts("[VIRTIO-GPU] Phase 7 hardware cursor active: 64x64 ARGB, fenced uploads, "
               "independent cursorq\n");
     return true;
@@ -1381,9 +1381,9 @@ bool virtio_gpu_phase8_start(void) {
             return false;
     gpu_phase8_started = true;
     gpu_phase8_started_ms = lapic_timer_get_ms();
-    drm_ensure_outputs(&global_drm_dev, gpu.num_scanouts);
+    ascentdrm_ensure_outputs(&global_ascentdrm_dev, gpu.num_scanouts);
     for (uint32_t i = 0; i < gpu.num_scanouts && i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
-        drm_update_output_state(&global_drm_dev, i, gpu.scanouts[i].enabled);
+        ascentdrm_update_output_state(&global_ascentdrm_dev, i, gpu.scanouts[i].enabled);
         char modes[512];
         bool enabled = false;
         virtio_gpu_scanout_summary(i, &enabled, modes, sizeof(modes));
@@ -1480,12 +1480,12 @@ static int virtio_gpu_create_dumb(struct drm_device *dev,
     uint64_t pitch = (uint64_t)width * 4ULL, bytes = pitch * height;
     if (bytes > 0xFFFFFFFFULL)
         return -22;
-    struct drm_gem_object *obj = drm_gem_object_create(dev, (size_t)bytes);
+    struct drm_gem_object *obj = ascentdrm_gem_object_create(dev, (size_t)bytes);
     if (!obj)
         return -12;
     struct virtio_gpu_gem *vg = kmalloc(sizeof(*vg));
     if (!vg) {
-        drm_gem_object_free(dev, obj);
+        ascentdrm_gem_object_free(dev, obj);
         return -12;
     }
     memset(vg, 0, sizeof(*vg));
@@ -1498,7 +1498,7 @@ static int virtio_gpu_create_dumb(struct drm_device *dev,
         if (created)
             unref_resource(vg->resource_id);
         kfree(vg);
-        drm_gem_object_free(dev, obj);
+        ascentdrm_gem_object_free(dev, obj);
         return -5;
     }
     vg->attached = true;
@@ -1571,7 +1571,7 @@ static void virtio_gpu_complete_flip(uint32_t head) {
     uint64_t user_data;
     uint32_t crtc_id, sequence;
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
-    if (!gpu.pending_flip || drm_crtc_scanout_id(gpu.pending_flip_crtc_id) != head) {
+    if (!gpu.pending_flip || ascentdrm_crtc_scanout_id(gpu.pending_flip_crtc_id) != head) {
         LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
         return;
     }
@@ -1594,7 +1594,7 @@ static void virtio_gpu_complete_flip(uint32_t head) {
     ev.tv_usec = (uint32_t)((ms % 1000) * 1000);
     ev.sequence = sequence;
     ev.crtc_id = crtc_id;
-    drm_file_send_event(file, &ev, node);
+    ascentdrm_file_send_event(file, &ev, node);
 }
 static void virtio_gpu_commit_damage(struct drm_device *dev,
                                      const struct drm_clip_rect *clips,
@@ -1728,7 +1728,7 @@ static char *gpu_dec(char *p, uint32_t v) {
 static void virtio_gpu_get_modes(uint32_t connector, struct drm_mode_modeinfo *m, uint32_t *count) {
     if (!count)
         return;
-    uint32_t scanout = drm_connector_scanout_id(connector);
+    uint32_t scanout = ascentdrm_connector_scanout_id(connector);
     if (scanout >= VIRTIO_GPU_MAX_SCANOUTS) {
         *count = 0;
         return;
@@ -1765,7 +1765,7 @@ static void virtio_gpu_get_modes(uint32_t connector, struct drm_mode_modeinfo *m
 bool virtio_gpu_phase4_bind_drm(void) {
     if (!gpu.initialized)
         return false;
-    drm_register_scanout_backend(virtio_gpu_create_dumb,
+    ascentdrm_register_scanout_backend(virtio_gpu_create_dumb,
                                  virtio_gpu_commit_damage,
                                  virtio_gpu_get_modes,
                                  virtio_gpu_queue_flip);
@@ -1783,24 +1783,24 @@ bool virtio_gpu_phase4_stress_test(uint32_t cycles, uint32_t damages) {
     klog_puts("\n");
     for (uint32_t i = 0; i < cycles; i++) {
         struct drm_gem_object *o = NULL;
-        if (virtio_gpu_create_dumb(&global_drm_dev, 64, 64, 32, &o) != 0)
+        if (virtio_gpu_create_dumb(&global_ascentdrm_dev, 64, 64, 32, &o) != 0)
             return false;
         memset(o->virt_addr, (int)(i & 255), 64U * 64U * 4U);
-        drm_gem_object_free(&global_drm_dev, o);
+        ascentdrm_gem_object_free(&global_ascentdrm_dev, o);
     }
     struct drm_gem_object *o = NULL;
-    if (virtio_gpu_create_dumb(&global_drm_dev, 128, 128, 32, &o) != 0)
+    if (virtio_gpu_create_dumb(&global_ascentdrm_dev, 128, 128, 32, &o) != 0)
         return false;
     struct virtio_gpu_gem *vg = (struct virtio_gpu_gem *)o->driver_private;
     for (uint32_t i = 0; i < damages; i++) {
         struct virtio_gpu_rect r = {(i * 7U) % 120U, (i * 11U) % 120U, 8, 8};
         uint64_t off = (uint64_t)r.y * vg->pitch + (uint64_t)r.x * 4ULL;
         if (!present_batch(0, vg->resource_id, &r, off, false, &r)) {
-            drm_gem_object_free(&global_drm_dev, o);
+            ascentdrm_gem_object_free(&global_ascentdrm_dev, o);
             return false;
         }
     }
-    drm_gem_object_free(&global_drm_dev, o);
+    ascentdrm_gem_object_free(&global_ascentdrm_dev, o);
     struct virtq_stats q;
     virtq_get_stats(&gpu.controlq, &q);
     if (gpu.resources_live != baseline || !virtq_is_idle(&gpu.controlq) ||

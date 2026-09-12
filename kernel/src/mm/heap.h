@@ -21,6 +21,10 @@ void *kcalloc(size_t num, size_t size);
 // If 'new_size' is 0, acts as kfree.
 void *krealloc(void *ptr, size_t new_size);
 
+// Usable capacity of an allocation (Linux ksize() semantics).  Returns 0 for
+// pointers the heap does not own.
+size_t heap_ksize(const void *ptr);
+
 // Get heap statistics formatted as a string
 void heap_get_info(char *buf);
 

@@ -27,6 +27,10 @@ void linuxkpi_wake_thread(void *thread);
 /* Yield the calling thread once (native sched_yield()). */
 void linuxkpi_yield(void);
 
+/* Wake every thread parked on a native wait queue (an opaque `wait_queue_t *`)
+ * that the KPI poll bridge attached to a struct wait_queue_head. */
+void linuxkpi_wake_poll_queue(void *native_wq);
+
 /* True when the native scheduler has asked the calling thread to reschedule
  * (sched_wakeup() on this CPU or a reschedule IPI). */
 _Bool linuxkpi_need_resched(void);
@@ -41,6 +45,26 @@ int linuxkpi_softirq_depth(void);
 
 /* True if the thread has a pending signal. */
 _Bool linuxkpi_thread_has_pending_signal(void *thread);
+
+/* The calling thread's thread-group id (== pid for the group leader).  Used
+ * to back Linux's task_tgid() for the DRM master checks. */
+unsigned long linuxkpi_current_tgid(void);
+
+/* Per-thread Linux task_struct shadow.  `linuxkpi_current_task()` lazily
+ * allocates one through the weak linuxkpi_task_shadow_new() hook (defined on
+ * the Linux side, which knows sizeof(struct task_struct)); the kernel always
+ * links that definition, the weak form only exists so native_sched.c stays
+ * native-header-only.
+ *
+ *   struct task_struct *tsk = linuxkpi_current_task();  // current
+ *   void *thread = linuxkpi_task_thread(tsk);           // back to native
+ */
+void *linuxkpi_current_task(void);
+void *linuxkpi_task_for_thread(void *thread);
+void *linuxkpi_task_thread(void *task);
+unsigned long linuxkpi_thread_tgid(void *thread);
+unsigned long linuxkpi_thread_pid(void *thread);
+void linuxkpi_thread_comm(void *thread, char *buf, unsigned long size);
 
 /* Monotonic time since boot. */
 unsigned long long linuxkpi_monotonic_ms(void);
@@ -57,5 +81,10 @@ void linuxkpi_udelay_ns(unsigned long long ns);
  * calling thread's block. */
 void *linuxkpi_thread_data(void *thread);
 void *linuxkpi_thread_self_data(void);
+
+/* mmap bridge: the Linux vm_area_struct produced by the last device mmap in
+ * this thread, consumed by sys_mmap() right after node->mmap() returns. */
+void linuxkpi_vma_set_pending(void *linux_vma);
+void *linuxkpi_vma_take_pending(void);
 
 #endif /* LINUXKPI_NATIVE_SCHED_H */

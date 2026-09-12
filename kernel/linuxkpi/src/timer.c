@@ -116,20 +116,20 @@ static void __hrtimer_enqueue_locked(struct hrtimer *timer) {
   struct list_head *pos = &hrtimer_wheel;
 
   while (pos->next != &hrtimer_wheel) {
-    struct hrtimer *cur = list_entry(pos->next, struct hrtimer, node);
-    if (timer->expires < cur->expires)
+    struct hrtimer *cur = list_entry(pos->next, struct hrtimer, node.node);
+    if (timer->node.expires < cur->node.expires)
       break;
     pos = pos->next;
   }
-  list_add(&timer->node, pos);
+  list_add(&timer->node.node, pos);
 }
 
 void hrtimer_init(struct hrtimer *timer, clockid_t which_clock,
                   enum hrtimer_mode mode) {
   (void)mode;
-  timer->node.next = &timer->node;
-  timer->node.prev = &timer->node;
-  timer->expires = 0;
+  timer->node.node.next = &timer->node.node;
+  timer->node.node.prev = &timer->node.node;
+  timer->node.expires = 0;
   timer->function = NULL;
   timer->queued = 0;
   timer->clock_id = which_clock;
@@ -145,10 +145,10 @@ int hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim, u64 delta_ns,
 
   spin_lock_irqsave(&timer_lock, flags);
   if (timer->queued) {
-    list_del_init(&timer->node);
+    list_del_init(&timer->node.node);
     timer->queued = 0;
   }
-  timer->expires = when;
+  timer->node.expires = when;
   __hrtimer_enqueue_locked(timer);
   timer->queued = 1;
   spin_unlock_irqrestore(&timer_lock, flags);
@@ -168,7 +168,7 @@ int hrtimer_try_to_cancel(struct hrtimer *timer) {
 
   spin_lock_irqsave(&timer_lock, flags);
   if (timer->queued) {
-    list_del_init(&timer->node);
+    list_del_init(&timer->node.node);
     timer->queued = 0;
     ret = 1;
   }
@@ -194,17 +194,17 @@ int hrtimer_active(const struct hrtimer *timer) {
 int hrtimer_is_queued(struct hrtimer *timer) { return timer->queued; }
 
 ktime_t hrtimer_get_expires(const struct hrtimer *timer) {
-  return timer->expires;
+  return timer->node.expires;
 }
 
 void hrtimer_set_expires(struct hrtimer *timer, ktime_t time) {
-  timer->expires = time;
+  timer->node.expires = time;
 }
 
 void hrtimer_set_expires_range_ns(struct hrtimer *timer, ktime_t time,
                                   u64 delta_ns) {
   (void)delta_ns;
-  timer->expires = time;
+  timer->node.expires = time;
 }
 
 u64 hrtimer_forward(struct hrtimer *timer, ktime_t now, ktime_t interval) {
@@ -213,11 +213,11 @@ u64 hrtimer_forward(struct hrtimer *timer, ktime_t now, ktime_t interval) {
   if (interval <= 0)
     return 0;
 
-  if (now + interval >= timer->expires) {
-    ktime_t delta = now - timer->expires;
+  if (now + interval >= timer->node.expires) {
+    ktime_t delta = now - timer->node.expires;
     if (delta >= 0) {
       u64 n = (u64)(delta / interval) + 1;
-      timer->expires += (ktime_t)(n * interval);
+      timer->node.expires += (ktime_t)(n * interval);
       orun = n;
     }
   }
@@ -254,10 +254,10 @@ static int timer_kthread(void *arg) {
     }
     while (!list_empty(&hrtimer_wheel)) {
       struct hrtimer *h =
-          list_first_entry(&hrtimer_wheel, struct hrtimer, node);
-      if (h->expires > now_ns)
+          list_first_entry(&hrtimer_wheel, struct hrtimer, node.node);
+      if (h->node.expires > now_ns)
         break;
-      list_move_tail(&h->node, &expired_hrtimers);
+      list_move_tail(&h->node.node, &expired_hrtimers);
     }
 
     unsigned long wait_ms = 0;
@@ -268,9 +268,9 @@ static int timer_kthread(void *arg) {
     }
     if (!list_empty(&hrtimer_wheel)) {
       struct hrtimer *h =
-          list_first_entry(&hrtimer_wheel, struct hrtimer, node);
-      if (h->expires > now_ns) {
-        u64 delta_ns = (u64)(h->expires - now_ns);
+          list_first_entry(&hrtimer_wheel, struct hrtimer, node.node);
+      if (h->node.expires > now_ns) {
+        u64 delta_ns = (u64)(h->node.expires - now_ns);
         unsigned long ms = (unsigned long)((delta_ns + 999999ULL) / 1000000ULL);
         if (!wait_ms || ms < wait_ms)
           wait_ms = ms;
@@ -293,8 +293,8 @@ static int timer_kthread(void *arg) {
 
     while (!list_empty(&expired_hrtimers)) {
       struct hrtimer *h =
-          list_first_entry(&expired_hrtimers, struct hrtimer, node);
-      list_del_init(&h->node);
+          list_first_entry(&expired_hrtimers, struct hrtimer, node.node);
+      list_del_init(&h->node.node);
       h->queued = 0;
 
       __atomic_store_n(&h->running, 1, __ATOMIC_RELEASE);
@@ -302,12 +302,12 @@ static int timer_kthread(void *arg) {
       __atomic_store_n(&h->running, 0, __ATOMIC_RELEASE);
 
       if (restart == HRTIMER_RESTART) {
-        ktime_t when = h->expires;
+        ktime_t when = h->node.expires;
         if (when <= ktime_get())
           when = ktime_get() + 1000000; /* 1 ms floor */
 
         spin_lock_irqsave(&timer_lock, flags);
-        h->expires = when;
+        h->node.expires = when;
         __hrtimer_enqueue_locked(h);
         h->queued = 1;
         spin_unlock_irqrestore(&timer_lock, flags);

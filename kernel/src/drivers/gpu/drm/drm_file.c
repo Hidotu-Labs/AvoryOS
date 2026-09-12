@@ -10,15 +10,15 @@
 #include "drivers/gpu/virtio_gpu/virtio_gpu.h"
 
 /* ── Forward declarations ────────────────────────────────────────────────── */
-extern struct drm_gem_object *drm_gem_object_create(struct drm_device *dev,
+extern struct drm_gem_object *ascentdrm_gem_object_create(struct drm_device *dev,
                                                     size_t size);
-extern void drm_gem_object_free(struct drm_device *dev,
+extern void ascentdrm_gem_object_free(struct drm_device *dev,
                                 struct drm_gem_object *obj);
 extern int alloc_fd(struct thread *t);
 
 /* ── drm_file lifecycle ──────────────────────────────────────────────────── */
 
-struct drm_file *drm_file_alloc(struct drm_device *dev) {
+struct drm_file *ascentdrm_file_alloc(struct drm_device *dev) {
   struct drm_file *file = kmalloc(sizeof(struct drm_file));
   if (!file)
     return NULL;
@@ -77,7 +77,7 @@ struct drm_file *drm_file_alloc(struct drm_device *dev) {
   return file;
 }
 
-void drm_file_free(struct drm_file *file) {
+void ascentdrm_file_free(struct drm_file *file) {
   if (!file)
     return;
   struct drm_device *dev = file->dev;
@@ -88,7 +88,7 @@ void drm_file_free(struct drm_file *file) {
     if (file->handles[i]) {
       file->handles[i]->refcount--;
       if (file->handles[i]->refcount <= 0)
-        drm_gem_object_free(dev, file->handles[i]);
+        ascentdrm_gem_object_free(dev, file->handles[i]);
       file->handles[i] = NULL;
     }
   }
@@ -121,7 +121,7 @@ void drm_file_free(struct drm_file *file) {
  * Register a global gem object into this client's handle table.
  * Returns the local handle (1-based), or 0 on failure.
  */
-uint32_t drm_file_gem_register(struct drm_file *file,
+uint32_t ascentdrm_file_gem_register(struct drm_file *file,
                                struct drm_gem_object *obj) {
   spinlock_acquire(&file->lock);
 
@@ -167,7 +167,7 @@ uint32_t drm_file_gem_register(struct drm_file *file,
  *  3. Global gem list fallback for any other out-of-range handle
  *     (keeps backward compat with code that uses raw global handles)
  */
-struct drm_gem_object *drm_file_gem_lookup(struct drm_file *file,
+struct drm_gem_object *ascentdrm_file_gem_lookup(struct drm_file *file,
                                            uint32_t handle) {
   /* Fast path: per-client table */
   if (handle > 0 && handle < DRM_MAX_HANDLES_PER_FILE) {
@@ -200,7 +200,7 @@ struct drm_gem_object *drm_file_gem_lookup(struct drm_file *file,
 /*
  * Release a local handle.  Decrements gem refcount; frees if zero.
  */
-void drm_file_gem_release(struct drm_file *file, uint32_t handle) {
+void ascentdrm_file_gem_release(struct drm_file *file, uint32_t handle) {
   if (handle == 0 || handle >= DRM_MAX_HANDLES_PER_FILE)
     return;
   spinlock_acquire(&file->lock);
@@ -210,7 +210,7 @@ void drm_file_gem_release(struct drm_file *file, uint32_t handle) {
     obj->refcount--;
     if (obj->refcount <= 0) {
       spinlock_release(&file->lock);
-      drm_gem_object_free(file->dev, obj);
+      ascentdrm_gem_object_free(file->dev, obj);
       return;
     }
   }
@@ -219,7 +219,7 @@ void drm_file_gem_release(struct drm_file *file, uint32_t handle) {
 
 /* ── Per-client event delivery ───────────────────────────────────────────── */
 
-void drm_file_send_event(struct drm_file *file, struct drm_event_vblank *ev,
+void ascentdrm_file_send_event(struct drm_file *file, struct drm_event_vblank *ev,
                          struct vfs_node *node) {
   struct drm_pending_event *e = kmalloc(sizeof(struct drm_pending_event));
   if (!e)
@@ -289,7 +289,7 @@ static void prime_close(struct vfs_node *node) {
   if (obj) {
     obj->refcount--;
     if (obj->refcount <= 0 && obj->dev)
-      drm_gem_object_free(obj->dev, obj);
+      ascentdrm_gem_object_free(obj->dev, obj);
   }
   klog_puts("[DRM] PRIME fd closed\n");
 }
@@ -298,7 +298,7 @@ static void prime_close(struct vfs_node *node) {
  * drm_prime_export — create an anonymous fd for a gem object.
  * Returns the new fd number, or -1 on failure.
  */
-int drm_prime_export(struct drm_gem_object *obj) {
+int ascentdrm_prime_export(struct drm_gem_object *obj) {
   struct thread *t = sched_get_current();
   if (!t)
     return -1;
@@ -341,7 +341,7 @@ int drm_prime_export(struct drm_gem_object *obj) {
  * drm_prime_import — given a prime fd, return the gem object it wraps.
  * Returns NULL if the fd is not a prime node.
  */
-struct drm_gem_object *drm_prime_import(int prime_fd) {
+struct drm_gem_object *ascentdrm_prime_import(int prime_fd) {
   struct thread *t = sched_get_current();
   if (!t || prime_fd < 0 || prime_fd >= MAX_FDS)
     return NULL;

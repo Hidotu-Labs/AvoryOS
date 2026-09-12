@@ -124,10 +124,17 @@ rm -rf "$DEST"
 mkdir -p "$DEST"
 while IFS= read -r path; do
     case "$path" in ''|\#*) continue ;; esac
-    src="$SRC_DIR/$path"
-    [ -e "$src" ] || die "subset path missing in tree: $path"
-    mkdir -p "$DEST/$(dirname "$path")"
-    cp -a "$src" "$DEST/$path"
+    # Entries may contain shell globs (e.g. drivers/gpu/drm/*.h): copy every
+    # match.  A literal path that does not exist is an error.
+    matched=0
+    for src in "$SRC_DIR"/$path; do
+        [ -e "$src" ] || continue
+        matched=1
+        rel="${src#"$SRC_DIR"/}"
+        mkdir -p "$DEST/$(dirname "$rel")"
+        cp -a "$src" "$DEST/$rel"
+    done
+    [ "$matched" -eq 1 ] || die "subset path missing in tree: $path"
 done < "$SUBSET_FILE"
 
 # ── Generate Makefile.files from scripts/linux/files.txt ─────────────────────
@@ -203,6 +210,20 @@ if [ -f "$DEST/kernel/time/timeconst.bc" ]; then
     echo 1000 | bc -q "$DEST/kernel/time/timeconst.bc" \
         > "$DEST/include/generated/timeconst.h"
     log "generated include/generated/timeconst.h (HZ=1000)"
+fi
+
+# <lib/crc32table.h> is another Kbuild product (the slicing-by-8 tables).
+# Build and run the upstream host generator; -I "$DEST/lib" resolves its
+# "../include/generated/autoconf.h" include against the checked-in generated
+# config linked above.
+if [ -f "$DEST/lib/crc32.c" ] && [ -f "$SRC_DIR/lib/gen_crc32table.c" ]; then
+    tmp_crc="$(mktemp -d)"
+    cc -O2 -I "$DEST/lib" -o "$tmp_crc/gen_crc32table" \
+        "$SRC_DIR/lib/gen_crc32table.c" \
+        || die "failed to build gen_crc32table"
+    "$tmp_crc/gen_crc32table" > "$DEST/lib/crc32table.h"
+    rm -rf "$tmp_crc"
+    log "generated lib/crc32table.h"
 fi
 
 # ── Record the pin ───────────────────────────────────────────────────────────

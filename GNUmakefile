@@ -623,6 +623,8 @@ disk.img: userland/test_pty_master.elf
 disk.img: userland/test_uaccess_bench.elf
 disk.img: userland/proc_bench.elf
 disk.img: userland/test_watchdog.elf
+disk.img: userland/test_kpi_dmabuf.elf
+disk.img: userland/test_kpi_drm.elf
 disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 
 
@@ -798,6 +800,10 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/test_unix_sockets.elf bin/test_unix_sockets"; \
 		echo "rm bin/test_tmpfile"; \
 		echo "write userland/test_tmpfile.elf bin/test_tmpfile"; \
+		echo "rm bin/test_kpi_dmabuf"; \
+		echo "write userland/test_kpi_dmabuf.elf bin/test_kpi_dmabuf"; \
+		echo "rm bin/test_kpi_drm"; \
+		echo "write userland/test_kpi_drm.elf bin/test_kpi_drm"; \
 		echo "rm bin/test_child_notify"; \
 		echo "write userland/test_child_notify.elf bin/test_child_notify"; \
 		echo "rm bin/test_pty_master"; \
@@ -1128,6 +1134,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field bin/test_heap_smp mode 0100755"; \
 		echo "set_inode_field bin/test_dcache mode 0100755"; \
 		echo "set_inode_field bin/test_tmpfile mode 0100755"; \
+		echo "set_inode_field bin/test_kpi_dmabuf mode 0100755"; \
+		echo "set_inode_field bin/test_kpi_drm mode 0100755"; \
 		echo "set_inode_field bin/test_child_notify mode 0100755"; \
 		echo "set_inode_field bin/test_pty_master mode 0100755"; \
 		echo "set_inode_field bin/test_uaccess_bench mode 0100755"; \
@@ -1430,6 +1438,21 @@ userland/test_unix_sockets.elf: userland/test_unix_sockets.c $(MUSL_LIBC)
 userland/test_tmpfile.elf: userland/test_tmpfile.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
 		userland/test_tmpfile.c -o userland/test_tmpfile.elf
+
+# Phase 2 LinuxKPI /dev/kpi_dmabuf test; shares the device ABI header with the
+# kernel side (kernel/linuxkpi/include/uapi/kpi_dmabuf.h).
+userland/test_kpi_dmabuf.elf: userland/test_kpi_dmabuf.c $(MUSL_LIBC) \
+		kernel/linuxkpi/include/uapi/kpi_dmabuf.h
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		-I$(CURDIR)/kernel/linuxkpi/include \
+		userland/test_kpi_dmabuf.c -o userland/test_kpi_dmabuf.elf -lpthread
+
+# Phase 3 LinuxKPI DRM test: vkms dumb-buffer GEM mmap/write, renderD128
+# sanity and a modetest-lite atomic enable/disable.  Uses the musl sysroot's
+# Linux UAPI drm headers.
+userland/test_kpi_drm.elf: userland/test_kpi_drm.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/test_kpi_drm.c -o userland/test_kpi_drm.elf
 
 userland/test_child_notify.elf: userland/test_child_notify.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \

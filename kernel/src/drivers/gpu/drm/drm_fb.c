@@ -16,9 +16,9 @@
 #include "../../../mm/heap.h"
 #include "../../../lib/string.h"
 
-extern struct drm_gem_object *drm_file_gem_lookup(struct drm_file *file,
+extern struct drm_gem_object *ascentdrm_file_gem_lookup(struct drm_file *file,
                                                   uint32_t handle);
-extern void drm_mode_object_init(struct drm_device *dev,
+extern void ascentdrm_mode_object_init(struct drm_device *dev,
                                  struct drm_mode_object *obj, uint32_t type);
 
 /* ── Format descriptor table ─────────────────────────────────────────────── */
@@ -92,7 +92,7 @@ static int drm_fb_validate(struct drm_file *file,
             return -1;
         }
         /* Verify the gem handle exists */
-        if (!drm_file_gem_lookup(file, cmd->handles[p])) {
+        if (!ascentdrm_file_gem_lookup(file, cmd->handles[p])) {
             klog_puts("[DRM] ADDFB2: invalid gem handle for plane ");
             klog_uint64(p);
             klog_puts("\n");
@@ -124,7 +124,7 @@ static int drm_fb_validate(struct drm_file *file,
  * a KMS object, and returns a pointer to the embedded drm_framebuffer for
  * use by the rest of the KMS stack.
  */
-struct drm_framebuffer *drm_framebuffer_create_full(struct drm_file *file,
+struct drm_framebuffer *ascentdrm_framebuffer_create_full(struct drm_file *file,
                                                     struct drm_device *dev,
                                                     struct drm_mode_fb_cmd2 *cmd) {
     const struct drm_format_info *info = drm_format_lookup(cmd->pixel_format);
@@ -158,7 +158,7 @@ struct drm_framebuffer *drm_framebuffer_create_full(struct drm_file *file,
     fb->pitch = fb->base_fb.pitch;
 
     for (int p = 0; p < info->num_planes; p++) {
-        fb->gem_obj[p] = drm_file_gem_lookup(file, cmd->handles[p]);
+        fb->gem_obj[p] = ascentdrm_file_gem_lookup(file, cmd->handles[p]);
         fb->pitches[p] = cmd->pitches[p];
         fb->offsets[p] = cmd->offsets[p];
         if (fb->gem_obj[p])
@@ -167,7 +167,7 @@ struct drm_framebuffer *drm_framebuffer_create_full(struct drm_file *file,
 
     fb->base_fb.gem_obj = fb->gem_obj[0];
 
-    drm_mode_object_init(dev, &fb->base_fb.base, DRM_MODE_OBJECT_FB);
+    ascentdrm_mode_object_init(dev, &fb->base_fb.base, DRM_MODE_OBJECT_FB);
 
     klog_puts("[DRM] ADDFB2: created fb id=");
     klog_uint64(fb->base_fb.base.id);
@@ -190,7 +190,7 @@ struct drm_framebuffer *drm_framebuffer_create_full(struct drm_file *file,
 /*
  * drm_framebuffer_free_full — release a full framebuffer.
  */
-void drm_framebuffer_free_full(struct drm_device *dev,
+void ascentdrm_framebuffer_free_full(struct drm_device *dev,
                                struct drm_framebuffer *fb_base) {
     struct drm_framebuffer_full *fb = (struct drm_framebuffer_full *)fb_base;
 
@@ -212,7 +212,7 @@ void drm_framebuffer_free_full(struct drm_device *dev,
         }
     }
     for (int i = 0; i < release_count; i++)
-        drm_gem_object_free(dev, release[i]);
+        ascentdrm_gem_object_free(dev, release[i]);
     kfree(fb);
 }
 
@@ -222,7 +222,7 @@ void drm_framebuffer_free_full(struct drm_device *dev,
  * Supports both single-plane (legacy compat) and multi-planar paths.
  * Also handles the DRM_MODE_FB_MODIFIERS flag.
  */
-int drm_ioctl_addfb2(struct drm_file *file, struct drm_device *dev, uint64_t arg) {
+int ascentdrm_ioctl_addfb2(struct drm_file *file, struct drm_device *dev, uint64_t arg) {
     struct drm_mode_fb_cmd2 *cmd = (struct drm_mode_fb_cmd2 *)arg;
 
     klog_puts("[DRM] ADDFB2 in width=");
@@ -243,7 +243,7 @@ int drm_ioctl_addfb2(struct drm_file *file, struct drm_device *dev, uint64_t arg
     klog_hex64(cmd->modifier[0]);
     klog_puts("\n");
 
-    struct drm_framebuffer *fb = drm_framebuffer_create_full(file, dev, cmd);
+    struct drm_framebuffer *fb = ascentdrm_framebuffer_create_full(file, dev, cmd);
     if (!fb) {
         klog_puts("[DRM] ADDFB2 failed\n");
         return -22; /* EINVAL */

@@ -19,6 +19,10 @@ typedef s64 ktime_t;
 #define ktime_to_ms(kt) ((s64)(kt) / NSEC_PER_MSEC)
 #define ktime_add(a, b) ((ktime_t)((a) + (b)))
 #define ktime_sub(a, b) ((ktime_t)((a) - (b)))
+#define ktime_sub_ns(kt, ns) ((ktime_t)((kt) - (s64)(ns)))
+#define ktime_add_us(kt, us) ktime_add_ns(kt, (s64)(us) * NSEC_PER_USEC)
+#define ktime_sub_us(kt, us) ktime_sub_ns(kt, (s64)(us) * NSEC_PER_USEC)
+#define ktime_ms_delta(a, b) (((a) - (b)) / (s64)NSEC_PER_MSEC)
 #define ktime_add_ns(kt, ns) ((ktime_t)((kt) + (s64)(ns)))
 #define ktime_add_ms(kt, ms) ktime_add_ns(kt, (s64)(ms) * NSEC_PER_MSEC)
 #define ktime_after(kt1, kt2) ((kt1) > (kt2))
@@ -33,5 +37,19 @@ ktime_t ktime_get_boottime(void);
 u64 ktime_get_boottime_ns(void);
 ktime_t ktime_get_raw(void);
 u64 ktime_get_raw_ns(void);
+
+/* time64 conversions (upstream ktime.h); ns_to_timespec64 is inline in the
+ * imported <linux/time64.h>. */
+static inline struct timespec64 ktime_to_timespec64(const ktime_t kt) {
+  return ns_to_timespec64(kt);
+}
+
+static inline ktime_t timespec64_to_ktime(struct timespec64 ts) {
+  return ktime_set(ts.tv_sec, ts.tv_nsec);
+}
+
+static inline struct timespec64 ktime_to_timespec(const ktime_t kt) {
+  return ktime_to_timespec64(kt);
+}
 
 #endif /* __AVORY_LINUXKPI_KTIME_H */

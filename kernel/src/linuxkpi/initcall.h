@@ -26,9 +26,17 @@ typedef int (*linuxkpi_initcall_fn_t)(void);
 #define LINUXKPI_INITCALL(fn)      __linuxkpi_define_initcall(fn, 6)
 #define LINUXKPI_LATE_INITCALL(fn) __linuxkpi_define_initcall(fn, 7)
 
-/* Run every registered initcall in link order.  Call once, late in boot,
- * after the native services imported drivers may depend on (console, heap,
- * VMM, timers, scheduler, PCI, VFS) are up. */
+/* Walk every registered initcall in link order (levels 0..7).  Exported for
+ * the inline fallback used when the initcall kthread cannot be created; normal
+ * boot reaches this through linuxkpi_run_initcalls(). */
+void linuxkpi_run_initcalls_inline(void);
+
+/* Run every registered initcall in a kernel thread and wait (bounded) for it
+ * to finish.  Call once, late in boot, after the native services imported
+ * drivers may depend on (console, heap, VMM, timers, scheduler, PCI, VFS) are
+ * up.  Linux runs level-6 module_init in kernel_init's thread, and drivers may
+ * sleep during probe; kmain_high_half is the BSP idle context, where the
+ * scheduler resumes the idle thread regardless of its state. */
 void linuxkpi_run_initcalls(void);
 
 #endif /* LINUXKPI_INITCALL_H */

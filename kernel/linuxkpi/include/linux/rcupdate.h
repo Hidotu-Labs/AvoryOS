@@ -26,6 +26,27 @@ void __kpi_rcu_read_unlock(void);
 #define rcu_dereference_raw(p) READ_ONCE(p)
 #define rcu_dereference_check(p, c) ((void)(c), READ_ONCE(p))
 #define rcu_dereference_protected(p, c) ((void)(c), (p))
+/* KCSAN handoff annotation; identity here. */
+#define rcu_pointer_handoff(p) (p)
+
+#define RCU_INITIALIZER(v) (v)
+#define unrcu_pointer(p) ((p))
+#define rcu_replace_pointer(rcu_ptr, ptr, c)                                  \
+  ({                                                                          \
+    typeof(ptr) __oldp = rcu_dereference_protected(rcu_ptr, c);               \
+    rcu_assign_pointer(rcu_ptr, ptr);                                         \
+    __oldp;                                                                   \
+  })
+
+/* RCU-delayed free.  The object's embedded rcu_head is converted back to the
+ * object with the field offset, then a small wrapper queues the kfree. */
+void __kvfree_call_rcu(struct rcu_head *head, __SIZE_TYPE__ offset);
+#define kfree_rcu(ptr, rhf)                                                   \
+  do {                                                                        \
+    typeof(ptr) ___p = (ptr);                                                 \
+    if (___p)                                                                 \
+      __kvfree_call_rcu(&(___p)->rhf, __builtin_offsetof(typeof(*___p), rhf));\
+  } while (0)
 #define rcu_access_pointer(p) READ_ONCE(p)
 #define rcu_assign_pointer(p, v)                                              \
   do {                                                                        \

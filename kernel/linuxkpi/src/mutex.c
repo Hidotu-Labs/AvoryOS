@@ -111,7 +111,7 @@ void mutex_unlock(struct mutex *lock) {
   spin_unlock(&lock->wait_lock);
 
   if (next)
-    linuxkpi_wake_thread((void *)next);
+    linuxkpi_wake_thread(task_struct_to_thread(next));
 }
 
 bool mutex_is_locked(struct mutex *lock) {

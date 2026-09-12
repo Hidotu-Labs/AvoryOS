@@ -1,0 +1,156 @@
+# LinuxKPI gap log
+
+Missing, stubbed, or deliberately divergent Linux APIs, as encountered while
+compiling/running upstream code.  Every entry names the imported file that
+needed it, the current workaround, and what a complete implementation needs.
+
+Update this file in the same change that introduces or closes a gap.
+
+## Deliberate divergences
+
+- **`struct page`** (`linuxkpi/include/linux/mm_types.h`): trimmed layout with
+  an extra `pfn` field; no fields/flags area, no folio embedding.  `PageTail`
+  is an AvoryOS-only flag bit backed by a plain `compound_head` pointer.
+  `linuxkpi/include/linux/page-flags.h` is a compact overlay, not upstream's.
+- **`asm-generic/memory_model.h`** is shadowed with an empty file:
+  `pfn_to_page()`/`page_to_pfn()` are real functions over AvoryOS's sparse
+  mem_map instead of the FLATMEM/SPARSEMEM macros.
+- **`struct page::_refcount` is authoritative** for pages handed to Linux
+  code; the native PMM reference is dropped exactly once when it reaches zero.
+  Native CoW/refcount paths must not touch such pages (documented in page.c).
+- **`struct vm_area_struct`** is a Linux-facing view allocated by the mmap
+  bridge; the native `struct vma` remains the authoritative mapping record.
+
+## Configuration gaps
+
+- `CONFIG_PHYS_ADDR_T_64BIT` / `CONFIG_ARCH_DMA_ADDR_T_64BIT` were missing
+  from `linuxkpi/include/generated/autoconf.h`.  Without them
+  `<linux/types.h>` typedefs `phys_addr_t`/`dma_addr_t` as u32, and GCC
+  compiled `page_to_phys()` with a 32-bit shift that truncated every
+  physical address above 4 GB.  Fixed in Phase 2 (found by the page
+  roundtrip self-test).
+- `CONFIG_DYNAMIC_MEMORY_LAYOUT` added so upstream `__pa()`/`__va()` use
+  `page_offset_base`, which AvoryOS pins to the runtime HHDM offset.
+
+## Phase 3 gaps (DRM core bring-up, 2026-09-12)
+
+- **shmem backing is a shim, not tmpfs** (`linuxkpi/src/shmem.c`):
+  `shmem_file_setup()` returns a bridged kernel file whose address_space is an
+  xarray of zeroed order-0 PMM pages; `shmem_read_folio_gfp()`,
+  `shmem_truncate_range()` and `invalidate_mapping_pages()` operate on that.
+  No swap, no reclaim, no `shmem_read_mapping_page_gfp` page-cache semantics
+  beyond allocate/lookup/free.
+- **`struct folio` is order-0 only** (`linuxkpi/include/linux/mm_types.h`,
+  `page-flags.h`, `pagevec.h`): a folio wraps one page; `folio_batch` is the
+  upstream layout with a no-op unevictable move.
+- **kobject/sysfs is dynamic for class devices** (`linuxkpi/src/kobject.c` +
+  `kernel/src/fs/sysfs.c`): `class_create()` creates `/sys/class/<name>`;
+  `device_add()`/`device_del()` create/remove
+  `/sys/class/<class>/<dev-name>`; `device_add_groups()` materializes
+  `struct device_attribute` files with real show/store (and honours
+  `is_visible`); `class_create_file()` materializes class attributes (DRM's
+  `version`).  Still inert: `sysfs_create_file()` on a non-device kobject
+  (needs `ktype->sysfs_ops`), `bin_attribute`s (EDID), symlink creation and
+  uevent broadcast.  `device_add()` also wires `kobj.parent`/`kobj.name` for
+  device-hierarchy reads.  The per-attribute show/store contexts are not
+  freed on removal.
+- **Dynamic devnode registry is a fixed table** (`linuxkpi/src/native_vfs.c`,
+  `KPI_DEVNODE_REGISTRY_MAX 32`): nested devnodes below /dev are matched by
+  dir/leaf name, enumerated by the owning directory's readdir, and removed by
+  `device_del()`; `device_add()`'s devnode hook registers DRM minors.  No
+  refcounting beyond the metadata node's persistent reference; each open
+  descriptor owns its own per-open node.
+- **Platform bus is synchronous and minimal** (`linuxkpi/src/platform.c`):
+  name-match only, no deferred probe, no OF/ACPI enumeration, no refcounts.
+- **`register_chrdev()` is a successful no-op** (`drm_compat.c`): the native
+  devfs owns /dev nodes; DRM major 226 has no registry.  `file_clone_open()`
+  returns -ENODEV.
+- **`struct task_struct` is a per-thread shadow** (`linuxkpi/src/task.c`) with
+  `kpi_thread` first; `task_tgid()` returns an opaque token built from the
+  native tgid, not a `struct pid`.  Shadows are leaked with their thread until
+  a thread-exit hook exists.
+- **Initcalls run in a kthread with a bounded wait**
+  (`linuxkpi/src/initcalls.c`): the walker itself stays native
+  (`kernel/src/linuxkpi/init.c`), but it is invoked from a `kpi/initcalls`
+  thread like Linux's `kernel_init`, capped at 30 s.  A wedged initcall is
+  reported and boot continues, so a partially initialized driver must still
+  fail safely at use time.
+- **i2c/regulator/component/panel-quirk/aperture stubs** (`drm_compat.c`,
+  `link_stubs.c`): EDID DDC returns -EIO, regulators are absent, component
+  add/del are no-ops, panel orientation quirk is UNKNOWN.  `_printk` now
+  routes imported messages through `vklogf` (512-byte line buffer);
+  `kvasprintf` truncates at 512 bytes.
+- **`ksize()` is real** (`linuxkpi/src/slab.c` → `heap_ksize()` in
+  `kernel/src/mm/heap.c`): slab allocations report their cache object size and
+  big allocations their page-payload capacity, so DRM's
+  `drmm_add_final_kfree()` capacity check can pass.  The exact requested size
+  is still not tracked, only the usable capacity (same contract as upstream).
+- **`__sw_hweight32/64` are hand-written asm**
+  (`kernel/src/arch/x86_64/hweight.asm`): imported x86 `hweight*()` emits a
+  bare `call __sw_hweight*` with an empty clobber list and relies on the
+  upstream register-preserving convention; a C implementation silently
+  corrupts live caller registers.
+- **ww_mutex cannot wound** (`linuxkpi/src/ww_mutex.c`): recursive
+  acquisition with the same acquire context now returns `-EALREADY` (as
+  upstream, which DRM's `modeset_lock()` treats as success) and trylock
+  follows the 0/-EBUSY convention, but multi-lock acquire sequences still
+  cannot back off under contention; they rely on the plain mutex FIFO.
+- **rbtree augmented internals are an excerpt** (`linuxkpi/src/rbtree_aug.c`,
+  verbatim upstream `lib/rbtree.c`): native `kernel/src/lib/rbtree.c` still
+  owns the base `rb_*` API; importing upstream `lib/rbtree.c` requires
+  renaming the native symbols first.
+
+## Phase 2 gaps
+
+- **File/VFS bridge is single-level and shim-shaped** (`linuxkpi/src/file.c` +
+  `kernel/src/linuxkpi/native_vfs.c`).  `struct file` owns a native `vfs_node_t`
+  (`f_asc_node`) and each node's `device` points back at the file.  There is no
+  inode/dentry cache, no mount tree and no fs open/release dispatch beyond the
+  pseudo-fs path dma-buf uses (`alloc_file_pseudo` + dentry `d_release`).
+  `fget()` resolves a descriptor through the native fd table, so only fds
+  installed by `fd_install()` are visible; kernel-internal files without an fd
+  are not findable.  fd-owned nodes are released by the vfs when the descriptor
+  closes; kernel-internal files (shmem backing files, etc.) release their node
+  from `kpi_file_free()` (`asc_vfs_node_release_kernel()`), and
+  `linuxkpi_file_close()` clears `f_asc_node` before `fput()` so the fd path
+  cannot release it twice.  Drivers that expect `fget_raw`/`fdget` to see
+  kernel fds or that keep a `struct file` beyond its node's lifetime need this
+  to grow.
+- **`poll` bridging wakes event-driven consumers** (`linuxkpi_file_poll`):
+  the poll table's qproc records the file's native wait queue in the Linux
+  `wait_queue_head`, and `__kpi_wake_up()` calls `linuxkpi_wake_poll_queue()`
+  so a device's `poll_wait()`/`wake_up()` pair reaches `sys_poll()` waiters.
+  Limits: one native queue is recorded per `wait_queue_head` (the last poller
+  wins if several files poll the same head), and a head can retain a stale
+  queue pointer if its file closes while another file still polls that head.
+  The Phase 3 DRM bridge is the first user; the vkms `PAGE_FLIP_EVENT` path
+  exercises the wake end to end (atomic commit -> `drm_poll()` POLLIN ->
+  `drm_read()`).
+- **`unmap_mapping_range()` is a no-op stub** (`linuxkpi/src/mmap.c`).  It
+  ignores the address_space because the native VMA tree, not the page cache,
+  owns PTE teardown.  TTM's `ttm_bo_vm` will call it when buffers are
+  invalidated; until it walks every process mapping, userspace can keep
+  touching stale BOs after a move.  `struct inode` now carries an `i_mapping`
+  (`alloc_anon_inode()` allocates an address_space), but the mapping walk
+  itself is still unimplemented.
+- **`mmu_notifier` is a type-only overlay**
+  (`linuxkpi/include/linux/mmu_notifier.h`): `CONFIG_MMU_NOTIFIER` is not set
+  in `autoconf.h`, so imported code takes the `#else` arms.  dma-resv.c only
+  includes the header for `struct mmu_notifier_range`; TTM (v6.6) does not use
+  the API.  HMM/userptr-style users will need real register/release hooks.
+- **VM split/remap paths drop the Linux wrapper** (`kernel/src/mm/vma.c`):
+  `vma_mprotect()`, `sys_mremap` and the grows-down path re-add native VMAs
+  with plain `vma_add()`, so only the sys_mmap/teardown/clone paths call
+  `vma_attach_linux()`.  A dma-buf mapping that is mprotected or mremapped can
+  therefore lose its `vm_ops` (close fires via the old wrapper reference while
+  the new VMA has none).  Phase 6/7 (amdgpu VM) must route every re-add through
+  `vma_attach_linux()` to preserve exactly-once close semantics.
+- **Shrinker API is inert** (`linuxkpi/src/shrinker.c`): registration succeeds
+  and the callback is never invoked, so TTM's pool never proactively evicts
+  under memory pressure.  Reclaim currently has no shrinker caller at all; the
+  native PMM does not run the Linux reclaimer.
+- **`vm_ops->fault()` bridge installs PTEs on demand** but only for VMAs created
+  through the Linux mmap bridge; `vmf_insert_page()` uses the native PMM's
+  mapping flags and takes a page reference, while `remap_pfn_range()` does not
+  (pfn mappings stay the exporter's responsibility).  page_mkwrite/COW and
+  `VM_PFNMAP`-style tracking (`vm_normal_page`) are not modeled.

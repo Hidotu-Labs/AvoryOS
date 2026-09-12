@@ -26,6 +26,9 @@ unsigned long usecs_to_jiffies(const unsigned int u);
 unsigned int jiffies_to_msecs(const unsigned long j);
 unsigned int jiffies_to_usecs(const unsigned long j);
 unsigned long nsecs_to_jiffies(u64 n);
+static inline u64 nsecs_to_jiffies64(u64 n) {
+  return (u64)nsecs_to_jiffies(n);
+}
 u64 jiffies_to_nsecs(const unsigned long j);
 
 #define time_after(a, b) ((long)((b) - (a)) < 0)

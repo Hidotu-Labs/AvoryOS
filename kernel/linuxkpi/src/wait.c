@@ -82,6 +82,7 @@ void finish_wait(wait_queue_head_t *q, struct wait_queue_entry *wq_entry) {
 
 int __kpi_wake_up(wait_queue_head_t *q, unsigned int nr, int flags) {
   unsigned long irqflags;
+  void *poll_wq;
   int woken = 0;
 
   /* Wake functions must run under the queue lock.  A waiter that times out or
@@ -90,6 +91,7 @@ int __kpi_wake_up(wait_queue_head_t *q, unsigned int nr, int flags) {
    * still calling into it.  Entries are unlinked before the call so the walk
    * stays valid even for wake functions that leave the entry queued. */
   spin_lock_irqsave(&q->lock, irqflags);
+  poll_wq = q->kpi_poll_wq;
   while (!list_empty(&q->head)) {
     struct wait_queue_entry *wq_entry =
         list_first_entry(&q->head, struct wait_queue_entry, entry);
@@ -101,5 +103,22 @@ int __kpi_wake_up(wait_queue_head_t *q, unsigned int nr, int flags) {
   }
   spin_unlock_irqrestore(&q->lock, irqflags);
 
+  /* Devices that used poll_wait() on this head have sys_poll() waiters parked
+   * on a native wait queue; wake those too (outside the KPI queue lock). */
+  if (poll_wq)
+    linuxkpi_wake_poll_queue(poll_wq);
+
   return woken;
+}
+
+/* Wake a specific task regardless of its wait state.  The native scheduler
+ * only has runnable/sleeping, so `state` is informational. */
+int wake_up_state(struct task_struct *p, unsigned int state) {
+  void *thread = task_struct_to_thread(p);
+
+  (void)state;
+  if (!thread)
+    return 0;
+  linuxkpi_wake_thread(thread);
+  return 1;
 }

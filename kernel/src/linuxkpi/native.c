@@ -23,3 +23,9 @@ unsigned long linuxkpi_irq_flags(void) {
   __asm__ volatile("pushfq; popq %0" : "=r"(flags));
   return flags;
 }
+
+extern const char *kernel_boot_cmdline;
+
+const char *linuxkpi_boot_cmdline(void) {
+  return kernel_boot_cmdline ? kernel_boot_cmdline : "";
+}

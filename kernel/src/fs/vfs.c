@@ -939,7 +939,7 @@ void vfs_node_init(vfs_node_t *node) {
   memset(node, 0, sizeof(vfs_node_t));
   INIT_LIST_HEAD(&node->ep_watchers);
   spinlock_init(&node->ep_lock);
-  radix_tree_init(&node->pages);
+  asc_radix_tree_init(&node->pages);
   spinlock_init(&node->pages_lock);
   spinlock_init(&node->readdir_cursor_lock);
   node->refcount = 1;

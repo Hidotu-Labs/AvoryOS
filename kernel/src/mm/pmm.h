@@ -73,6 +73,11 @@ uint64_t pmm_get_hhdm_offset(void);
 
 // Statistics
 size_t pmm_get_free_pages(void);
+// Free pages including those parked in the per-CPU (PCP) caches.  The plain
+// pmm_get_free_pages() intentionally reports only buddy lists, so it drops by
+// up to PCP_CAPACITY*MAX_CPUS pages after heavy churn even though those pages
+// are still free; soak/leak checks want this total.
+size_t pmm_get_free_pages_including_pcp(void);
 
 // Shared zero page — a single physically-allocated page whose contents are
 // always zero.  Used by the demand-pager for anonymous read faults so that

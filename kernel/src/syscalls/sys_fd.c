@@ -128,7 +128,7 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
 
   if (dev_path) {
     if (strcmp(dev_path, "dri/card0") == 0) {
-      node = drm_create_client_node();
+      node = ascentdrm_create_client_node();
       if (!node)
         return (uint64_t)-12;
     }
@@ -327,9 +327,9 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
       return (uint64_t)-12;
     }
     node_owned = false; // fresh per-open node owns no resolver reference
-  } else if (drm_is_card_node(node)) {
+  } else if (ascentdrm_is_card_node(node)) {
     vfs_node_t *prev = node;
-    node = drm_create_client_node();
+    node = ascentdrm_create_client_node();
     if (!node) {
       if (node_owned) vfs_close(prev);
       return (uint64_t)-12;

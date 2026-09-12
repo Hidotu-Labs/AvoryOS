@@ -22,4 +22,7 @@ int linuxkpi_max_cpus(void);
 /* x86 PAUSE hint, the native equivalent of cpu_relax(). */
 void linuxkpi_cpu_relax(void);
 
+/* Kernel command line from the bootloader (empty string when none). */
+const char *linuxkpi_boot_cmdline(void);
+
 #endif /* LINUXKPI_NATIVE_H */

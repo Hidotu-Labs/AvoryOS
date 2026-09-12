@@ -43,6 +43,11 @@ struct work_struct {
 #define DECLARE_WORK(n, f)                                                    \
   struct work_struct n = {{NULL, NULL}, (f), 0, 0, NULL}
 
+/* On-stack work: the native first-party implementation has no stack-tracking
+ * machinery, so these are the plain macros plus no-op destroy hooks. */
+#define INIT_WORK_ONSTACK(_work, _func) INIT_WORK(_work, _func)
+#define destroy_work_on_stack(work) do { (void)(work); } while (0)
+
 struct workqueue_struct;
 
 extern struct workqueue_struct *system_wq;
@@ -62,6 +67,11 @@ bool flush_work(struct work_struct *work);
 void flush_workqueue(struct workqueue_struct *wq);
 bool cancel_work_sync(struct work_struct *work);
 
+/* Upstream returns the work item the current task is running (for
+ * concurrency-managed pools).  AvoryOS workers are plain kthreads, so this is
+ * always NULL; callers only compare it against a work pointer. */
+static inline struct work_struct *current_work(void) { return NULL; }
+
 struct delayed_work {
   struct work_struct work;
   struct timer_list timer;
@@ -69,12 +79,18 @@ struct delayed_work {
 
 void delayed_work_timer_fn(struct timer_list *t);
 
+static inline struct delayed_work *to_delayed_work(struct work_struct *work) {
+  return container_of(work, struct delayed_work, work);
+}
+
 #define INIT_DELAYED_WORK(_work, _func)                                       \
   do {                                                                        \
     INIT_WORK(&(_work)->work, (_func));                                       \
     timer_setup(&(_work)->timer, delayed_work_timer_fn, 0);                   \
   } while (0)
 #define INIT_DEFERRABLE_WORK(_work, _func) INIT_DELAYED_WORK(_work, _func)
+#define INIT_DELAYED_WORK_ONSTACK(_work, _func) INIT_DELAYED_WORK(_work, _func)
+#define destroy_delayed_work_on_stack(dwork) do { (void)(dwork); } while (0)
 
 bool schedule_delayed_work(struct delayed_work *dwork, unsigned long delay);
 bool queue_delayed_work(struct workqueue_struct *wq,

@@ -27,31 +27,31 @@ static void *radix_test_value(unsigned slot, uint64_t generation) {
   return (void *)(value ? value : 1);
 }
 
-bool radix_tree_phase1_stress_test(uint64_t iterations, uint64_t seed) {
+bool asc_radix_tree_phase1_stress_test(uint64_t iterations, uint64_t seed) {
   struct radix_tree tree;
   void **reference = kcalloc(TEST_KEYS, sizeof(*reference));
   if (!reference)
     return false;
-  radix_tree_init(&tree);
+  asc_radix_tree_init(&tree);
   static const uint64_t boundaries[] = {
       0, 1, 63, 64, 65, 4095, 4096, 4097,
       (1ULL << 30) - 1, 1ULL << 30, UINT64_MAX - 1, UINT64_MAX};
   bool pass = true;
   for (unsigned i = 0; i < sizeof(boundaries) / sizeof(boundaries[0]); i++) {
     void *value = radix_test_value(i, 1);
-    if (radix_tree_insert(&tree, boundaries[i], value) != 0 ||
-        radix_tree_lookup(&tree, boundaries[i]) != value ||
-        radix_tree_insert(&tree, boundaries[i], value) != -17) {
+    if (asc_radix_tree_insert(&tree, boundaries[i], value) != 0 ||
+        asc_radix_tree_lookup(&tree, boundaries[i]) != value ||
+        asc_radix_tree_insert(&tree, boundaries[i], value) != -17) {
       pass = false;
       break;
     }
   }
   for (unsigned i = 0; pass && i < sizeof(boundaries) / sizeof(boundaries[0]); i++) {
-    void *value = radix_tree_lookup(&tree, boundaries[i]);
-    if (!value || radix_tree_delete(&tree, boundaries[i]) != value)
+    void *value = asc_radix_tree_lookup(&tree, boundaries[i]);
+    if (!value || asc_radix_tree_delete(&tree, boundaries[i]) != value)
       pass = false;
   }
-  if (pass && !radix_tree_validate(&tree))
+  if (pass && !asc_radix_tree_validate(&tree))
     pass = false;
 
   uint64_t state = seed ? seed : 0x415343454e54524FULL;
@@ -62,7 +62,7 @@ bool radix_tree_phase1_stress_test(uint64_t iterations, uint64_t seed) {
     unsigned action = (unsigned)((random >> 32) & 3);
     if (action == 0) {
       void *value = radix_test_value(slot, operation + 2);
-      int result = radix_tree_insert(&tree, key, value);
+      int result = asc_radix_tree_insert(&tree, key, value);
       if (reference[slot]) {
         if (result != -17)
           pass = false;
@@ -72,38 +72,38 @@ bool radix_tree_phase1_stress_test(uint64_t iterations, uint64_t seed) {
         reference[slot] = value;
       }
     } else if (action == 1) {
-      if (radix_tree_lookup(&tree, key) != reference[slot])
+      if (asc_radix_tree_lookup(&tree, key) != reference[slot])
         pass = false;
     } else if (action == 2) {
-      void *old = radix_tree_delete(&tree, key);
+      void *old = asc_radix_tree_delete(&tree, key);
       if (old != reference[slot])
         pass = false;
       reference[slot] = NULL;
     } else if (reference[slot]) {
       void *value = radix_test_value(slot, operation + 2);
-      if (radix_tree_replace(&tree, key, value) != reference[slot])
+      if (asc_radix_tree_replace(&tree, key, value) != reference[slot])
         pass = false;
       reference[slot] = value;
-    } else if (radix_tree_replace(&tree, key, (void *)1) != NULL) {
+    } else if (asc_radix_tree_replace(&tree, key, (void *)1) != NULL) {
       pass = false;
     }
-    if ((operation & 0x3fff) == 0 && !radix_tree_validate(&tree))
+    if ((operation & 0x3fff) == 0 && !asc_radix_tree_validate(&tree))
       pass = false;
   }
 
   for (unsigned slot = 0; pass && slot < TEST_KEYS; slot++) {
     uint64_t key = radix_test_key(slot);
-    if (radix_tree_lookup(&tree, key) != reference[slot])
+    if (asc_radix_tree_lookup(&tree, key) != reference[slot])
       pass = false;
     if (reference[slot]) {
-      if (radix_tree_delete(&tree, key) != reference[slot])
+      if (asc_radix_tree_delete(&tree, key) != reference[slot])
         pass = false;
       reference[slot] = NULL;
     }
   }
-  if (!radix_tree_validate(&tree) || tree.root || tree.nodes || tree.entries)
+  if (!asc_radix_tree_validate(&tree) || tree.root || tree.nodes || tree.entries)
     pass = false;
-  radix_tree_destroy(&tree, NULL);
+  asc_radix_tree_destroy(&tree, NULL);
   kfree(reference);
   if (!pass) {
     klog_puts("[RADIX] Phase 1 stress failed, seed=");
@@ -151,7 +151,7 @@ static bool radix_iteration_check(uint64_t index, void *value, void *opaque) {
 
 static bool radix_phase2_fault_test(void) {
   struct radix_fault_context fault;
-  struct radix_tree_allocator allocator = {
+  struct asc_radix_tree_allocator allocator = {
       .alloc = radix_fault_alloc,
       .free = radix_fault_free,
       .context = &fault,
@@ -162,22 +162,22 @@ static bool radix_phase2_fault_test(void) {
     struct radix_tree tree;
     fault.fail_at = 0;
     fault.calls = 0;
-    radix_tree_init_with_allocator(&tree, &allocator);
-    if (radix_tree_insert(&tree, 0, (void *)1))
+    asc_radix_tree_init_with_allocator(&tree, &allocator);
+    if (asc_radix_tree_insert(&tree, 0, (void *)1))
       return false;
     uint64_t nodes = tree.nodes;
     uint64_t entries = tree.entries;
     uint8_t height = tree.height;
     fault.calls = 0;
     fault.fail_at = fail_at;
-    if (radix_tree_insert(&tree, UINT64_MAX, (void *)3) != -12 ||
+    if (asc_radix_tree_insert(&tree, UINT64_MAX, (void *)3) != -12 ||
         tree.nodes != nodes || tree.entries != entries ||
-        tree.height != height || radix_tree_lookup(&tree, 0) != (void *)1 ||
-        radix_tree_lookup(&tree, UINT64_MAX) || !radix_tree_validate(&tree)) {
-      radix_tree_destroy(&tree, NULL);
+        tree.height != height || asc_radix_tree_lookup(&tree, 0) != (void *)1 ||
+        asc_radix_tree_lookup(&tree, UINT64_MAX) || !asc_radix_tree_validate(&tree)) {
+      asc_radix_tree_destroy(&tree, NULL);
       return false;
     }
-    radix_tree_destroy(&tree, NULL);
+    asc_radix_tree_destroy(&tree, NULL);
   }
   return true;
 }
@@ -186,10 +186,10 @@ static bool radix_phase2_iteration_test(void) {
   static const uint64_t keys[] = {
       UINT64_MAX, 4096, 64, 1, 0, 4095, 65, 1024, 999999, 63};
   struct radix_tree tree;
-  radix_tree_init(&tree);
+  asc_radix_tree_init(&tree);
   for (uint32_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-    if (radix_tree_insert(&tree, keys[i], (void *)(uintptr_t)(i + 1))) {
-      radix_tree_destroy(&tree, NULL);
+    if (asc_radix_tree_insert(&tree, keys[i], (void *)(uintptr_t)(i + 1))) {
+      asc_radix_tree_destroy(&tree, NULL);
       return false;
     }
   }
@@ -197,20 +197,20 @@ static bool radix_phase2_iteration_test(void) {
       .first = 0, .last = UINT64_MAX, .valid = true};
   struct radix_iteration_context range = {
       .first = 64, .last = 4096, .valid = true};
-  bool pass = radix_tree_for_each(&tree, radix_iteration_check, &all) &&
+  bool pass = asc_radix_tree_for_each(&tree, radix_iteration_check, &all) &&
               all.valid && all.count == 10 &&
-              radix_tree_for_each_range(&tree, 64, 4096,
+              asc_radix_tree_for_each_range(&tree, 64, 4096,
                                         radix_iteration_check, &range) &&
               range.valid && range.count == 5;
-  radix_tree_destroy(&tree, NULL);
+  asc_radix_tree_destroy(&tree, NULL);
   return pass;
 }
 
-bool radix_tree_phase2_stress_test(void) {
+bool asc_radix_tree_phase2_stress_test(void) {
   if (!radix_phase2_fault_test() || !radix_phase2_iteration_test())
     return false;
   /* Keep the live set bounded: the heap intentionally retains empty slab
    * pages, so a huge sparse set would permanently inflate reported usage. */
-  return radix_tree_phase1_stress_test(1000000,
+  return asc_radix_tree_phase1_stress_test(1000000,
                                        0x5048415345325244ULL);
 }

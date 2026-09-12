@@ -1,4 +1,9 @@
-/* Initcall walker, Phase 0.  See linuxkpi/initcall.h for the mechanism. */
+/* Initcall walker, Phase 0.  See linuxkpi/initcall.h for the mechanism.
+ *
+ * This is the raw walker (linuxkpi_run_initcalls_inline()).  The public
+ * linuxkpi_run_initcalls() entry point lives in linuxkpi/src/initcalls.c and
+ * runs this from a kernel thread, as Linux runs module_init in kernel_init's
+ * thread rather than the BSP idle context. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -9,7 +14,7 @@
 extern linuxkpi_initcall_fn_t __initcall_start[];
 extern linuxkpi_initcall_fn_t __initcall_end[];
 
-void linuxkpi_run_initcalls(void) {
+void linuxkpi_run_initcalls_inline(void) {
   size_t total = (size_t)(__initcall_end - __initcall_start);
 
   if (total == 0) {
@@ -25,6 +30,11 @@ void linuxkpi_run_initcalls(void) {
     linuxkpi_initcall_fn_t fn = __initcall_start[i];
     if (!fn)
       continue;
+    klog_puts("[KERNEL] LinuxKPI: initcall #");
+    klog_uint64(i);
+    klog_puts(" @ ");
+    klog_hex64((uint64_t)(uintptr_t)fn);
+    klog_puts("\n");
     int rc = fn();
     if (rc != 0) {
       failed++;

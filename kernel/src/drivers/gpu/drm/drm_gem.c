@@ -3,7 +3,7 @@
 #include "../../../mm/heap.h"
 #include "../../../lib/string.h"
 
-struct drm_gem_object *drm_gem_object_create(struct drm_device *dev, size_t size) {
+struct drm_gem_object *ascentdrm_gem_object_create(struct drm_device *dev, size_t size) {
     struct drm_gem_object *obj = kmalloc(sizeof(struct drm_gem_object));
     if (!obj) return NULL;
 
@@ -34,7 +34,7 @@ struct drm_gem_object *drm_gem_object_create(struct drm_device *dev, size_t size
     return obj;
 }
 
-void drm_gem_object_free(struct drm_device *dev, struct drm_gem_object *obj) {
+void ascentdrm_gem_object_free(struct drm_device *dev, struct drm_gem_object *obj) {
     if (!obj) return;
     spinlock_acquire(&dev->lock);
     list_del(&obj->list);
@@ -44,7 +44,7 @@ void drm_gem_object_free(struct drm_device *dev, struct drm_gem_object *obj) {
     kfree(obj);
 }
 
-struct drm_gem_object *drm_gem_find_by_handle(struct drm_device *dev, uint32_t handle) {
+struct drm_gem_object *ascentdrm_gem_find_by_handle(struct drm_device *dev, uint32_t handle) {
     spinlock_acquire(&dev->lock);
     struct drm_gem_object *obj;
     list_for_each_entry(obj, &dev->gem_objects, list) {

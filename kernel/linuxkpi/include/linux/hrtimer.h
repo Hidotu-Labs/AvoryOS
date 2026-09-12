@@ -8,6 +8,7 @@
  * finer resolution arrives with a dedicated high-resolution timer source. */
 
 #include <linux/ktime.h>
+#include <linux/timer.h>
 #include <linux/types.h>
 
 enum hrtimer_restart {
@@ -30,9 +31,16 @@ enum hrtimer_mode {
   HRTIMER_MODE_REL_PINNED_SOFT = HRTIMER_MODE_REL_PINNED | HRTIMER_MODE_SOFT,
 };
 
-struct hrtimer {
-  struct list_head node;
+/* Upstream's node is an rbtree node (timerqueue_node).  AvoryOS keeps the
+ * expiry list as a sorted list, but keeps the `node.expires` member path that
+ * callers such as vkms use. */
+struct timerqueue_node {
+  struct list_head node; /* Avory: sorted-list link, not an rb_node */
   ktime_t expires;
+};
+
+struct hrtimer {
+  struct timerqueue_node node;
   enum hrtimer_restart (*function)(struct hrtimer *);
   int queued;
   int clock_id;

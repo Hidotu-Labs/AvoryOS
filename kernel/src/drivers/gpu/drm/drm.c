@@ -8,7 +8,9 @@
 #include "../../../mm/heap.h"
 #include "../../../mm/vmm.h"
 
-struct drm_device global_drm_dev;
+#include <linuxkpi/native_vfs.h>
+
+struct drm_device global_ascentdrm_dev;
 static struct drm_stats drm_perf_stats;
 
 static inline uint64_t drm_read_cycles(void) {
@@ -17,25 +19,25 @@ static inline uint64_t drm_read_cycles(void) {
   return ((uint64_t)hi << 32) | lo;
 }
 
-void drm_stats_snapshot(struct drm_stats *out) {
+void ascentdrm_stats_snapshot(struct drm_stats *out) {
   if (!out)
     return;
-  spinlock_acquire(&global_drm_dev.lock);
+  spinlock_acquire(&global_ascentdrm_dev.lock);
   *out = drm_perf_stats;
-  spinlock_release(&global_drm_dev.lock);
+  spinlock_release(&global_ascentdrm_dev.lock);
 }
 
 /* ── External symbols ────────────────────────────────────────────────────── */
-extern struct drm_gem_object *drm_gem_object_create(struct drm_device *dev,
+extern struct drm_gem_object *ascentdrm_gem_object_create(struct drm_device *dev,
                                                     size_t size);
-extern void drm_gem_object_free(struct drm_device *dev,
+extern void ascentdrm_gem_object_free(struct drm_device *dev,
                                 struct drm_gem_object *obj);
-extern struct drm_gem_object *drm_gem_find_by_handle(struct drm_device *dev,
+extern struct drm_gem_object *ascentdrm_gem_find_by_handle(struct drm_device *dev,
                                                      uint32_t handle);
-extern void drm_kms_init(struct drm_device *dev);
+extern void ascentdrm_kms_init(struct drm_device *dev);
 extern struct drm_framebuffer *
-drm_framebuffer_create(struct drm_device *dev, struct drm_mode_fb_cmd *cmd);
-extern void drm_framebuffer_free(struct drm_device *dev,
+ascentdrm_framebuffer_create(struct drm_device *dev, struct drm_mode_fb_cmd *cmd);
+extern void ascentdrm_framebuffer_free(struct drm_device *dev,
                                  struct drm_framebuffer *fb);
 extern void epoll_notify_event(struct vfs_node *node, uint32_t events);
 
@@ -51,59 +53,59 @@ static void drm_fill_vblank_event(struct drm_event_vblank *ev,
 }
 
 /* drm_prop.c */
-extern int drm_ioctl_obj_getprops(struct drm_device *dev, uint64_t arg);
-extern int drm_ioctl_getproperty(struct drm_device *dev, uint64_t arg);
-extern int drm_ioctl_atomic(struct vfs_node *node, struct drm_file *file,
+extern int ascentdrm_ioctl_obj_getprops(struct drm_device *dev, uint64_t arg);
+extern int ascentdrm_ioctl_getproperty(struct drm_device *dev, uint64_t arg);
+extern int ascentdrm_ioctl_atomic(struct vfs_node *node, struct drm_file *file,
                             struct drm_device *dev, uint64_t arg);
-extern struct drm_prop_blob *drm_blob_create(struct drm_device *dev,
+extern struct drm_prop_blob *ascentdrm_blob_create(struct drm_device *dev,
                                              const void *data, uint32_t length);
-extern struct drm_prop_blob *drm_blob_find(struct drm_device *dev, uint32_t id);
-extern void drm_blob_destroy(struct drm_device *dev, uint32_t id);
+extern struct drm_prop_blob *ascentdrm_blob_find(struct drm_device *dev, uint32_t id);
+extern void ascentdrm_blob_destroy(struct drm_device *dev, uint32_t id);
 
 /* drm_file.c */
-extern struct drm_file *drm_file_alloc(struct drm_device *dev);
-extern void drm_file_free(struct drm_file *file);
-extern uint32_t drm_file_gem_register(struct drm_file *file,
+extern struct drm_file *ascentdrm_file_alloc(struct drm_device *dev);
+extern void ascentdrm_file_free(struct drm_file *file);
+extern uint32_t ascentdrm_file_gem_register(struct drm_file *file,
                                       struct drm_gem_object *obj);
-extern struct drm_gem_object *drm_file_gem_lookup(struct drm_file *file,
+extern struct drm_gem_object *ascentdrm_file_gem_lookup(struct drm_file *file,
                                                   uint32_t handle);
-extern void drm_file_gem_release(struct drm_file *file, uint32_t handle);
-extern void drm_file_send_event(struct drm_file *file,
+extern void ascentdrm_file_gem_release(struct drm_file *file, uint32_t handle);
+extern void ascentdrm_file_send_event(struct drm_file *file,
                                 struct drm_event_vblank *ev,
                                 struct vfs_node *node);
-extern int drm_prime_export(struct drm_gem_object *obj);
-extern struct drm_gem_object *drm_prime_import(int prime_fd);
+extern int ascentdrm_prime_export(struct drm_gem_object *obj);
+extern struct drm_gem_object *ascentdrm_prime_import(int prime_fd);
 
 /* drm_fb.c */
-extern int drm_ioctl_addfb2(struct drm_file *file, struct drm_device *dev,
+extern int ascentdrm_ioctl_addfb2(struct drm_file *file, struct drm_device *dev,
                             uint64_t arg);
 
 /* ── virtio-gpu hook pointers (NULL = use Limine software blit) ──────────── */
-drm_commit_damage_fn_t g_drm_commit_damage_fn = NULL;
+drm_commit_damage_fn_t g_ascent_drm_commit_damage_fn = NULL;
 
-drm_pageflip_fn_t g_drm_pageflip_fn = NULL;
+drm_pageflip_fn_t g_ascent_drm_pageflip_fn = NULL;
 
-drm_cursor_fn_t g_drm_cursor_fn = NULL;
+drm_cursor_fn_t g_ascent_drm_cursor_fn = NULL;
 
-void drm_register_cursor_backend(drm_cursor_fn_t cursor) {
-  g_drm_cursor_fn = cursor;
+void ascentdrm_register_cursor_backend(drm_cursor_fn_t cursor) {
+  g_ascent_drm_cursor_fn = cursor;
 }
 
-drm_create_dumb_fn_t g_drm_create_dumb_fn = NULL;
+drm_create_dumb_fn_t g_ascent_drm_create_dumb_fn = NULL;
 
 typedef void (*drm_set_fb_fn_t)(uint32_t crtc_id, struct drm_framebuffer *fb);
-drm_set_fb_fn_t g_drm_set_fb_fn = NULL;
+drm_set_fb_fn_t g_ascent_drm_set_fb_fn = NULL;
 
-drm_get_modes_fn_t g_drm_get_modes_fn = NULL;
+drm_get_modes_fn_t g_ascent_drm_get_modes_fn = NULL;
 
-void drm_register_scanout_backend(drm_create_dumb_fn_t create_dumb,
+void ascentdrm_register_scanout_backend(drm_create_dumb_fn_t create_dumb,
                                   drm_commit_damage_fn_t commit_damage,
                                   drm_get_modes_fn_t get_modes,
                                   drm_pageflip_fn_t pageflip) {
-  g_drm_create_dumb_fn = create_dumb;
-  g_drm_commit_damage_fn = commit_damage;
-  g_drm_get_modes_fn = get_modes;
-  g_drm_pageflip_fn = pageflip;
+  g_ascent_drm_create_dumb_fn = create_dumb;
+  g_ascent_drm_commit_damage_fn = commit_damage;
+  g_ascent_drm_get_modes_fn = get_modes;
+  g_ascent_drm_pageflip_fn = pageflip;
 }
 
 /* ── Helper: get drm_file from node->device ──────────────────────────────── */
@@ -140,7 +142,7 @@ static void drm_open(struct vfs_node *node) {
 static void drm_close(struct vfs_node *node) {
   struct drm_file *file = node_to_file(node);
   if (file)
-    drm_file_free(file);
+    ascentdrm_file_free(file);
   /* node itself is freed by vfs_close since it's non-persistent */
 }
 
@@ -187,7 +189,7 @@ static void drm_commit_damage(struct drm_device *dev,
                               const struct drm_clip_rect *clips,
                               uint32_t num_clips, uint32_t target_fb_id) {
   /* Native backends still feed the common commit counters. */
-  if (g_drm_commit_damage_fn) {
+  if (g_ascent_drm_commit_damage_fn) {
     if (dev) {
       spinlock_acquire(&dev->lock);
       drm_perf_stats.commits++;
@@ -196,7 +198,7 @@ static void drm_commit_damage(struct drm_device *dev,
       else drm_perf_stats.full_commits++;
       spinlock_release(&dev->lock);
     }
-    g_drm_commit_damage_fn(dev, clips, num_clips, target_fb_id);
+    g_ascent_drm_commit_damage_fn(dev, clips, num_clips, target_fb_id);
     return;
   }
   if (!dev)
@@ -390,7 +392,7 @@ static void drm_commit_damage(struct drm_device *dev,
           }
 
           struct drm_plane *cursor = crtc->cursor;
-          if (!g_drm_cursor_fn && cursor && cursor->fb && cursor->fb->gem_obj &&
+          if (!g_ascent_drm_cursor_fn && cursor && cursor->fb && cursor->fb->gem_obj &&
               cursor->fb->gem_obj->virt_addr && cursor->fb->bpp == 32 &&
               cursor->fb->gem_obj->cache_mode == DRM_GEM_CACHE_WB &&
               crtc->fb->bpp == 32 &&
@@ -485,7 +487,7 @@ static void drm_commit_damage(struct drm_device *dev,
 }
 
 static void drm_sync_cursor_backend(struct drm_device *dev, uint32_t flags) {
-  if (!g_drm_cursor_fn || !dev) return;
+  if (!g_ascent_drm_cursor_fn || !dev) return;
   uint32_t crtc_id=0,width=0,height=0,pitch=0;int32_t x=0,y=0,hot_x=0,hot_y=0;
   struct drm_gem_object *gem=NULL;
   spinlock_acquire(&dev->lock);
@@ -499,7 +501,7 @@ static void drm_sync_cursor_backend(struct drm_device *dev, uint32_t flags) {
     break;
   }
   spinlock_release(&dev->lock);
-  if(crtc_id)g_drm_cursor_fn(crtc_id,gem,width,height,pitch,x,y,hot_x,hot_y,flags);
+  if(crtc_id)g_ascent_drm_cursor_fn(crtc_id,gem,width,height,pitch,x,y,hot_x,hot_y,flags);
 }
 
 static void drm_commit_cursor_damage(struct drm_device *dev,
@@ -507,7 +509,7 @@ static void drm_commit_cursor_damage(struct drm_device *dev,
                                      bool have_old_damage,
                                      const struct drm_clip_rect *new_damage,
                                      bool have_new_damage) {
-  if (g_drm_cursor_fn) return;
+  if (g_ascent_drm_cursor_fn) return;
   struct drm_clip_rect clips[2];
   uint32_t count = 0;
 
@@ -872,13 +874,13 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   /* ── Per-client GEM ──────────────────────────────────────────────── */
   case DRM_IOCTL_GEM_CREATE: {
     struct drm_gem_create *c = (struct drm_gem_create *)arg;
-    struct drm_gem_object *obj = drm_gem_object_create(dev, c->size);
+    struct drm_gem_object *obj = ascentdrm_gem_object_create(dev, c->size);
     if (!obj)
       return -12; /* ENOMEM */
     /* Register in global list AND per-client table */
-    uint32_t local_h = drm_file_gem_register(file, obj);
+    uint32_t local_h = ascentdrm_file_gem_register(file, obj);
     if (!local_h) {
-      drm_gem_object_free(dev, obj);
+      ascentdrm_gem_object_free(dev, obj);
       return -12;
     }
     obj->refcount--; /* transfer creator ownership to the handle */
@@ -894,12 +896,12 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   }
   case DRM_IOCTL_GEM_CLOSE: {
     struct drm_gem_free *f = (struct drm_gem_free *)arg;
-    drm_file_gem_release(file, f->handle);
+    ascentdrm_file_gem_release(file, f->handle);
     return 0;
   }
   case DRM_IOCTL_GEM_FREE: {
     struct drm_gem_free *f = (struct drm_gem_free *)arg;
-    drm_file_gem_release(file, f->handle);
+    ascentdrm_file_gem_release(file, f->handle);
     return 0;
   }
 
@@ -916,12 +918,12 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     klog_debug_hex32(c->flags);
     klog_debug_puts("\n");
 
-    if (g_drm_create_dumb_fn) {
+    if (g_ascent_drm_create_dumb_fn) {
       struct drm_gem_object *obj = NULL;
-      int rc = g_drm_create_dumb_fn(dev, c->width, c->height, c->bpp, &obj);
+      int rc = g_ascent_drm_create_dumb_fn(dev, c->width, c->height, c->bpp, &obj);
       if (rc != 0 || !obj) return rc ? rc : -12;
-      uint32_t local_h = drm_file_gem_register(file, obj);
-      if (!local_h) { drm_gem_object_free(dev, obj); return -12; }
+      uint32_t local_h = ascentdrm_file_gem_register(file, obj);
+      if (!local_h) { ascentdrm_gem_object_free(dev, obj); return -12; }
       obj->refcount--; /* transfer creator ownership to the handle */
       c->pitch = c->width * (c->bpp / 8);
       c->size = obj->size;
@@ -932,12 +934,12 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     /* Dumb/render buffers stay WB. Only the fixed physical scanout is WC. */
     c->pitch = (c->width * (c->bpp / 8) + 63) & ~63;
     c->size = (uint64_t)c->pitch * c->height;
-    struct drm_gem_object *obj = drm_gem_object_create(dev, c->size);
+    struct drm_gem_object *obj = ascentdrm_gem_object_create(dev, c->size);
     if (!obj)
       return -12; /* ENOMEM */
-    uint32_t local_h = drm_file_gem_register(file, obj);
+    uint32_t local_h = ascentdrm_file_gem_register(file, obj);
     if (!local_h) {
-      drm_gem_object_free(dev, obj);
+      ascentdrm_gem_object_free(dev, obj);
       return -12;
     }
     obj->refcount--; /* transfer creator ownership to the handle */
@@ -957,7 +959,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   }
   case DRM_IOCTL_MODE_MAP_DUMB: {
     struct drm_mode_map_dumb *m = (struct drm_mode_map_dumb *)arg;
-    struct drm_gem_object *obj = drm_file_gem_lookup(file, m->handle);
+    struct drm_gem_object *obj = ascentdrm_file_gem_lookup(file, m->handle);
     if (!obj)
       return -2; /* ENOENT */
     m->offset = obj->phys_addr | 0x1000000000000000ULL;
@@ -965,7 +967,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   }
   case DRM_IOCTL_MODE_DESTROY_DUMB: {
     uint32_t handle = *(uint32_t *)arg;
-    drm_file_gem_release(file, handle);
+    ascentdrm_file_gem_release(file, handle);
     return 0;
   }
 
@@ -1041,7 +1043,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     list_for_each_entry(mobj, &dev->kms_objects, list) {
       if (mobj->type == DRM_MODE_OBJECT_PLANE) {
         uint64_t type_val = 999;
-        drm_obj_get_prop(mobj, DRM_PROP_ID_TYPE, &type_val);
+        ascentdrm_obj_get_prop(mobj, DRM_PROP_ID_TYPE, &type_val);
 
         /* The Limine framebuffer bridge has no independent hardware cursor:
          * drm_commit() emulates one by blending it into the scanout buffer.
@@ -1055,7 +1057,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
          *
          * Keep the object for legacy MODE_CURSOR ioctls and for a future DRM
          * backend with a genuinely independent cursor plane. */
-        if ((uint32_t)type_val == DRM_PLANE_TYPE_CURSOR && !g_drm_cursor_fn)
+        if ((uint32_t)type_val == DRM_PLANE_TYPE_CURSOR && !g_ascent_drm_cursor_fn)
           continue;
 
         klog_debug_puts("[DRM] GETPLANERESOURCES found plane index=");
@@ -1121,13 +1123,13 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     struct drm_plane *plane = (struct drm_plane *)mobj;
 
     uint64_t type_val = 0;
-    if (drm_obj_get_prop(&plane->base, DRM_PROP_ID_TYPE, &type_val) != 0)
+    if (ascentdrm_obj_get_prop(&plane->base, DRM_PROP_ID_TYPE, &type_val) != 0)
       type_val = DRM_PLANE_TYPE_OVERLAY;
 
     uint64_t crtc_id = 0;
     uint64_t fb_id = 0;
-    drm_obj_get_prop(&plane->base, DRM_PROP_ID_CRTC_ID, &crtc_id);
-    drm_obj_get_prop(&plane->base, DRM_PROP_ID_FB_ID, &fb_id);
+    ascentdrm_obj_get_prop(&plane->base, DRM_PROP_ID_CRTC_ID, &crtc_id);
+    ascentdrm_obj_get_prop(&plane->base, DRM_PROP_ID_FB_ID, &fb_id);
 
     p->crtc_id = (uint32_t)crtc_id;
     p->fb_id = (uint32_t)fb_id;
@@ -1255,9 +1257,9 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
 
     uint32_t mode_capacity = c->count_modes;
     c->count_modes = 1;
-    if (g_drm_get_modes_fn) {
+    if (g_ascent_drm_get_modes_fn) {
       uint32_t mode_count = c->modes_ptr ? mode_capacity : 0;
-      g_drm_get_modes_fn(c->connector_id,
+      g_ascent_drm_get_modes_fn(c->connector_id,
                          c->modes_ptr ? (struct drm_mode_modeinfo *)c->modes_ptr : NULL,
                          &mode_count);
       c->count_modes = mode_count;
@@ -1321,7 +1323,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     klog_debug_uint64(cmd->depth);
     klog_debug_puts("\n");
     /* Resolve local handle → global gem object */
-    struct drm_gem_object *gem = drm_file_gem_lookup(file, cmd->handle);
+    struct drm_gem_object *gem = ascentdrm_file_gem_lookup(file, cmd->handle);
     if (!gem) {
       klog_debug_puts("[DRM] ADDFB missing GEM handle=");
       klog_debug_uint64(cmd->handle);
@@ -1331,7 +1333,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     /* Temporarily patch handle to global for drm_framebuffer_create */
     uint32_t saved = cmd->handle;
     cmd->handle = gem->handle;
-    struct drm_framebuffer *fb = drm_framebuffer_create(dev, cmd);
+    struct drm_framebuffer *fb = ascentdrm_framebuffer_create(dev, cmd);
     cmd->handle = saved;
     if (!fb) {
       klog_debug_puts("[DRM] ADDFB framebuffer create failed\n");
@@ -1354,12 +1356,12 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       return -1;
     }
     spinlock_release(&dev->lock);
-    drm_framebuffer_free(dev, (struct drm_framebuffer *)mobj);
+    ascentdrm_framebuffer_free(dev, (struct drm_framebuffer *)mobj);
     return 0;
   }
   case DRM_IOCTL_MODE_ADDFB2:
     /* Full multi-planar path — resolves handles via global gem list */
-    return drm_ioctl_addfb2(file, dev, arg);
+    return ascentdrm_ioctl_addfb2(file, dev, arg);
 
   /* ── Legacy modesetting ──────────────────────────────────────────── */
   case DRM_IOCTL_MODE_SETCRTC: {
@@ -1391,8 +1393,8 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     struct drm_crtc *crtc = (struct drm_crtc *)crtc_obj;
     if (fb_obj && fb_obj->type == DRM_MODE_OBJECT_FB) {
       crtc->fb = (struct drm_framebuffer *)fb_obj;
-      if (g_drm_set_fb_fn)
-        g_drm_set_fb_fn(crtc->base.id, crtc->fb);
+      if (g_ascent_drm_set_fb_fn)
+        g_ascent_drm_set_fb_fn(crtc->base.id, crtc->fb);
     }
     spinlock_release(&dev->lock);
     drm_commit_flipped_crtc(dev, crtc_cmd->crtc_id);
@@ -1423,22 +1425,22 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     }
     struct drm_crtc *crtc = (struct drm_crtc *)crtc_obj;
     crtc->fb = (struct drm_framebuffer *)fb_obj;
-    if (g_drm_set_fb_fn)
-      g_drm_set_fb_fn(crtc->base.id, crtc->fb);
+    if (g_ascent_drm_set_fb_fn)
+      g_ascent_drm_set_fb_fn(crtc->base.id, crtc->fb);
     if (flip->flags & DRM_MODE_PAGE_FLIP_EVENT) {
       /* Register flip with virtio hook first so it can record file+user_data */
-      if (g_drm_pageflip_fn)
-        g_drm_pageflip_fn(file, node, flip->crtc_id, flip->fb_id, flip->user_data);
+      if (g_ascent_drm_pageflip_fn)
+        g_ascent_drm_pageflip_fn(file, node, flip->crtc_id, flip->fb_id, flip->user_data);
       spinlock_release(&dev->lock);
       drm_commit_flipped_crtc(dev, flip->crtc_id);
       /* If no virtio hook took ownership, deliver event via legacy path */
-      if (!g_drm_pageflip_fn) {
+      if (!g_ascent_drm_pageflip_fn) {
         struct drm_event_vblank ev = {0};
         ev.base.type = DRM_EVENT_FLIP_COMPLETE;
         ev.base.length = sizeof(ev);
         ev.user_data = flip->user_data;
         drm_fill_vblank_event(&ev, flip->crtc_id);
-        drm_file_send_event(file, &ev, node);
+        ascentdrm_file_send_event(file, &ev, node);
       }
       return 0;
     }
@@ -1449,7 +1451,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
 
   /* ── Atomic modesetting ──────────────────────────────────────────── */
   case DRM_IOCTL_MODE_ATOMIC: {
-    int ret = drm_ioctl_atomic(node, file, dev, arg);
+    int ret = ascentdrm_ioctl_atomic(node, file, dev, arg);
     if (ret == 0 &&
         !(((struct drm_mode_atomic *)arg)->flags & DRM_MODE_ATOMIC_TEST_ONLY)) {
 #if DRM_DEBUG_LOGGING
@@ -1461,9 +1463,9 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     return ret;
   }
   case DRM_IOCTL_MODE_OBJ_GETPROPERTIES:
-    return drm_ioctl_obj_getprops(dev, arg);
+    return ascentdrm_ioctl_obj_getprops(dev, arg);
   case DRM_IOCTL_MODE_GETPROPERTY:
-    return drm_ioctl_getproperty(dev, arg);
+    return ascentdrm_ioctl_getproperty(dev, arg);
   case DRM_IOCTL_MODE_SETPROPERTY:
     return 0; /* stub */
   case DRM_IOCTL_MODE_DIRTYFB:
@@ -1476,7 +1478,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     if (!b->data || !b->length)
       return -14; /* EFAULT */
     struct drm_prop_blob *blob =
-        drm_blob_create(dev, (void *)b->data, b->length);
+        ascentdrm_blob_create(dev, (void *)b->data, b->length);
     if (!blob)
       return -12; /* ENOMEM */
     b->blob_id = blob->id;
@@ -1484,17 +1486,17 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   }
   case DRM_IOCTL_MODE_DESTROYPROPBLOB: {
     struct drm_mode_destroy_blob *b = (struct drm_mode_destroy_blob *)arg;
-    drm_blob_destroy(dev, b->blob_id);
+    ascentdrm_blob_destroy(dev, b->blob_id);
     return 0;
   }
 
   /* ── GEM PRIME / DMA-buf ─────────────────────────────────────────── */
   case DRM_IOCTL_PRIME_HANDLE_TO_FD: {
     struct drm_prime_handle *p = (struct drm_prime_handle *)arg;
-    struct drm_gem_object *obj = drm_file_gem_lookup(file, p->handle);
+    struct drm_gem_object *obj = ascentdrm_file_gem_lookup(file, p->handle);
     if (!obj)
       return -2; /* ENOENT */
-    int prime_fd = drm_prime_export(obj);
+    int prime_fd = ascentdrm_prime_export(obj);
     if (prime_fd < 0)
       return -1; /* generic error for now */
     p->fd = prime_fd;
@@ -1502,10 +1504,10 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   }
   case DRM_IOCTL_PRIME_FD_TO_HANDLE: {
     struct drm_prime_handle *p = (struct drm_prime_handle *)arg;
-    struct drm_gem_object *obj = drm_prime_import(p->fd);
+    struct drm_gem_object *obj = ascentdrm_prime_import(p->fd);
     if (!obj)
       return -2; /* ENOENT */
-    uint32_t local_h = drm_file_gem_register(file, obj);
+    uint32_t local_h = ascentdrm_file_gem_register(file, obj);
     if (!local_h)
       return -12; /* ENOMEM */
     p->handle = local_h;
@@ -1538,7 +1540,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       ev.tv_usec = (uint32_t)vbl->reply.tval_usec;
       ev.sequence = seq;
       ev.crtc_id = 0;
-      drm_file_send_event(file, &ev, node);
+      ascentdrm_file_send_event(file, &ev, node);
     }
     return 0;
   }
@@ -1603,7 +1605,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
           break;
         }
 
-        struct drm_gem_object *gem = drm_file_gem_lookup(file, cur->handle);
+        struct drm_gem_object *gem = ascentdrm_file_gem_lookup(file, cur->handle);
         if (!gem) {
           spinlock_release(&dev->lock);
           klog_debug_puts("[DRM] MODE_CURSOR invalid GEM handle\n");
@@ -1697,7 +1699,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
           break;
         }
 
-        struct drm_gem_object *gem = drm_file_gem_lookup(file, cur->handle);
+        struct drm_gem_object *gem = ascentdrm_file_gem_lookup(file, cur->handle);
         if (!gem) {
           spinlock_release(&dev->lock);
           klog_debug_puts("[DRM] MODE_CURSOR2 invalid GEM handle\n");
@@ -1887,7 +1889,16 @@ static struct dirent *drm_dri_readdir(vfs_node_t *dir, uint32_t index) {
     entry.ino = (226U << 8) | 0U;
     entry.d_type = DT_CHR;
   } else {
-    return NULL;
+    /* Minors registered by the imported DRM core (dri/card1,
+     * dri/renderD128, ...) live in the LinuxKPI dynamic devnode registry. */
+    uint32_t rdev = 0;
+    const char *name = asc_vfs_devnode_name_at("dri", index - 3, &rdev);
+    if (!name)
+      return NULL;
+    strncpy(entry.name, name, sizeof(entry.name) - 1);
+    entry.name[sizeof(entry.name) - 1] = '\0';
+    entry.ino = rdev;
+    entry.d_type = DT_CHR;
   }
 
   return &entry;
@@ -1895,23 +1906,23 @@ static struct dirent *drm_dri_readdir(vfs_node_t *dir, uint32_t index) {
 
 static vfs_node_t *drm_dri_finddir(vfs_node_t *dir, char *name) {
   (void)dir;
-  if (strcmp(name, "card0") != 0)
-    return NULL;
+  if (strcmp(name, "card0") == 0)
+    return &drm_card_metadata_node;
 
-  return &drm_card_metadata_node;
+  return (vfs_node_t *)asc_vfs_devnode_lookup("dri", name);
 }
 
 static vfs_node_t *drm_alloc_client_node(void) {
 
   /* Allocate per-client drm_file */
-  struct drm_file *file = drm_file_alloc(&global_drm_dev);
+  struct drm_file *file = ascentdrm_file_alloc(&global_ascentdrm_dev);
   if (!file)
     return NULL;
 
   /* Allocate a fresh non-persistent clone node */
   vfs_node_t *clone = kmalloc(sizeof(vfs_node_t));
   if (!clone) {
-    drm_file_free(file);
+    ascentdrm_file_free(file);
     return NULL;
   }
   vfs_node_init(clone);
@@ -1931,31 +1942,31 @@ static vfs_node_t *drm_alloc_client_node(void) {
 
   return clone;
 }
-vfs_node_t *drm_create_client_node(void) {
+vfs_node_t *ascentdrm_create_client_node(void) {
   return drm_alloc_client_node();
 }
 
-bool drm_is_card_node(vfs_node_t *node) {
+bool ascentdrm_is_card_node(vfs_node_t *node) {
   return node == &drm_card_metadata_node;
 }
 
 /* ── Init ────────────────────────────────────────────────────────────────── */
 
-void drm_init(void) {
-  memset(&global_drm_dev, 0, sizeof(struct drm_device));
-  global_drm_dev.name = "card0";
-  global_drm_dev.next_gem_handle = 1;
-  global_drm_dev.next_kms_id = 1000;
-  global_drm_dev.next_blob_id = 1;
-  global_drm_dev.next_prime_id = 1;
-  spinlock_init(&global_drm_dev.lock);
-  INIT_LIST_HEAD(&global_drm_dev.gem_objects);
-  INIT_LIST_HEAD(&global_drm_dev.kms_objects);
-  INIT_LIST_HEAD(&global_drm_dev.event_queue);
-  INIT_LIST_HEAD(&global_drm_dev.blob_objects);
-  INIT_LIST_HEAD(&global_drm_dev.file_list);
-  wait_queue_init(&global_drm_dev.event_wq);
-  drm_kms_init(&global_drm_dev);
+void ascentdrm_init(void) {
+  memset(&global_ascentdrm_dev, 0, sizeof(struct drm_device));
+  global_ascentdrm_dev.name = "card0";
+  global_ascentdrm_dev.next_gem_handle = 1;
+  global_ascentdrm_dev.next_kms_id = 1000;
+  global_ascentdrm_dev.next_blob_id = 1;
+  global_ascentdrm_dev.next_prime_id = 1;
+  spinlock_init(&global_ascentdrm_dev.lock);
+  INIT_LIST_HEAD(&global_ascentdrm_dev.gem_objects);
+  INIT_LIST_HEAD(&global_ascentdrm_dev.kms_objects);
+  INIT_LIST_HEAD(&global_ascentdrm_dev.event_queue);
+  INIT_LIST_HEAD(&global_ascentdrm_dev.blob_objects);
+  INIT_LIST_HEAD(&global_ascentdrm_dev.file_list);
+  wait_queue_init(&global_ascentdrm_dev.event_wq);
+  ascentdrm_kms_init(&global_ascentdrm_dev);
 
   /* Bridge hardware framebuffer as a global GEM object */
   void *fb_base = fb_get_base();
@@ -1966,22 +1977,22 @@ void drm_init(void) {
     struct drm_gem_object *fb_obj = kmalloc(sizeof(struct drm_gem_object));
     if (fb_obj) {
       memset(fb_obj, 0, sizeof(struct drm_gem_object));
-      fb_obj->dev = &global_drm_dev;
+      fb_obj->dev = &global_ascentdrm_dev;
       fb_obj->size = fb_size;
       fb_obj->phys_addr = fb_phys;
       fb_obj->virt_addr = fb_base;
       fb_obj->cache_mode = DRM_GEM_CACHE_WC;
       fb_obj->refcount = 1;
       fb_obj->handle = 0xF0B0;
-      spinlock_acquire(&global_drm_dev.lock);
-      list_add_tail(&fb_obj->list, &global_drm_dev.gem_objects);
-      spinlock_release(&global_drm_dev.lock);
+      spinlock_acquire(&global_ascentdrm_dev.lock);
+      list_add_tail(&fb_obj->list, &global_ascentdrm_dev.gem_objects);
+      spinlock_release(&global_ascentdrm_dev.lock);
       klog_puts("[DRM] Bridged HW framebuffer to GEM handle 0xF0B0\n");
     }
   }
 }
 
-void drm_register_vfs(void) {
+void ascentdrm_register_vfs(void) {
   vfs_node_t *dev_dir = vfs_resolve_path("/dev");
   if (!dev_dir)
     return;
@@ -1995,7 +2006,7 @@ void drm_register_vfs(void) {
   drm_card_metadata_node.flags = FS_CHARDEV | FS_PERSISTENT;
   drm_card_metadata_node.mask = 0666;
   drm_card_metadata_node.inode = (226U << 8) | 0U;
-  drm_card_metadata_node.device = &global_drm_dev;
+  drm_card_metadata_node.device = &global_ascentdrm_dev;
   drm_card_metadata_node.open_instance = drm_open_instance;
   drm_card_metadata_node.refcount = 1;
 

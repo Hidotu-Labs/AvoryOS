@@ -159,6 +159,7 @@ override CFLAGS += \
 override CPPFLAGS := \
     -I src \
     -I src/include \
+    -I linuxkpi/include \
     -I limine-protocol/include \
     -isystem freestnd-c-hdrs/include \
     $(CPPFLAGS) \
@@ -194,7 +195,10 @@ ifneq ($(linux-obj-y),)
         -I limine-protocol/include \
         -isystem freestnd-c-hdrs/include \
         -D__KERNEL__ \
+        -DKBUILD_MODNAME='"avoryos"' \
+        -DKBUILD_BASENAME='"avoryos"' \
         -include linux/include/linux/compiler-version.h \
+        -include linux/include/linux/compiler_types.h \
         -include linux/include/linux/kconfig.h \
         $(filter -D%,$(CPPFLAGS)) \
         -MMD \

@@ -137,6 +137,14 @@ __attribute__((used, section(".limine_requests"))) static volatile struct
     limine_module_request module_request = {
         .id = LIMINE_MODULE_REQUEST_ID, .revision = 0};
 
+__attribute__((used, section(".limine_requests"))) static volatile struct
+    limine_executable_cmdline_request executable_cmdline_request = {
+        .id = LIMINE_EXECUTABLE_CMDLINE_REQUEST_ID, .revision = 0};
+
+/* Kernel command line, exposed to the LinuxKPI module-parameter parser via
+ * linuxkpi_boot_cmdline() (kernel/src/linuxkpi/native.c). */
+const char *kernel_boot_cmdline = "";
+
 __attribute__((used, section(".limine_requests_end"))) static volatile uint64_t
     limine_requests_end_marker[2] = LIMINE_REQUESTS_END_MARKER;
 
@@ -224,6 +232,11 @@ void kmain(void) {
 
   if (!LIMINE_BASE_REVISION_SUPPORTED(limine_base_revision)) {
     halt();
+  }
+
+  if (executable_cmdline_request.response &&
+      executable_cmdline_request.response->cmdline) {
+    kernel_boot_cmdline = executable_cmdline_request.response->cmdline;
   }
 
   if (framebuffer_request.response == NULL ||
@@ -556,7 +569,7 @@ mount_success:
 
   block_repopulate_devices();
   fb_register_vfs();
-  drm_init();
+  ascentdrm_init();
   if (virtio_gpu_is_initialized()) {
     if (!virtio_gpu_phase4_bind_drm()) {
       klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
@@ -573,7 +586,7 @@ mount_success:
                   " VirtIO-GPU Phase 8 display management unavailable.\n");
     }
   }
-  drm_register_vfs();
+  ascentdrm_register_vfs();
   fb_detect_drm_backend();
   mouse_register_vfs();
   random_register_vfs();
@@ -591,20 +604,31 @@ mount_success:
   extern void linuxkpi_run_initcalls(void);
   linuxkpi_test_phase0();
 #ifdef LINUXKPI_LINUX_IMPORTED
-  extern void linuxkpi_xarray_init(void);
+  extern void linuxkpi_radix_init(void);
   extern void linuxkpi_time_init(void);
   extern void linuxkpi_workqueue_init(void);
   extern void linuxkpi_rcu_init(void);
   extern void linuxkpi_run_boot_tests(void);
-  linuxkpi_xarray_init();
+  extern void linuxkpi_param_init(void);
+  extern void linuxkpi_page_init(void);
+  extern void linuxkpi_vmalloc_init(void);
+  extern void linuxkpi_irq_work_init(void);
+  linuxkpi_radix_init();
+  linuxkpi_page_init();
+  linuxkpi_vmalloc_init();
+  linuxkpi_irq_work_init();
   linuxkpi_time_init();
   linuxkpi_workqueue_init();
   linuxkpi_rcu_init();
-  /* The Phase 1 suites sleep; run them in a kernel thread instead of the
+  /* Apply kernel command-line module parameters, then run module_init-style
+   * drivers (dma-buf among them) from a kthread, matching Linux kernel_init.
+   * The suites exercise those drivers, so the order matters. */
+  linuxkpi_param_init();
+  linuxkpi_run_initcalls();
+  /* The Phase 1 suites sleep too; they get their own kthread instead of the
    * idle context kmain_high_half runs in. */
   linuxkpi_run_boot_tests();
 #endif
-  linuxkpi_run_initcalls();
 
 mount_fail:
 

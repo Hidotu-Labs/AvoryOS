@@ -57,7 +57,7 @@ static uint32_t procfs_drmstats_read(vfs_node_t *node, uint32_t offset,
   char buf[2048];
   struct drm_stats stats;
   struct virtio_gpu_stats gpu_stats;
-  drm_stats_snapshot(&stats);
+  ascentdrm_stats_snapshot(&stats);
   virtio_gpu_get_stats(&gpu_stats);
 
   uint64_t average_cycles = stats.copy_batches

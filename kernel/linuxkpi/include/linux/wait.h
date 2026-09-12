@@ -30,6 +30,11 @@ typedef struct wait_queue_entry wait_queue_entry_t;
 struct wait_queue_head {
   spinlock_t lock;
   struct list_head head;
+  /* Avory: native poll wait queue bridged to the scheduler.  A device's poll
+   * callback calls poll_wait() with this head; the KPI file bridge records
+   * the native queue here so wake_up() also wakes poll(2)/select(2) waiters
+   * registered by the native sys_poll(). */
+  void *kpi_poll_wq;
 };
 typedef struct wait_queue_head wait_queue_head_t;
 
@@ -42,7 +47,7 @@ typedef struct wait_queue_head wait_queue_head_t;
   struct wait_queue_entry name = ___WAITQUEUE_INITIALIZER(name, tsk)
 
 #define __WAIT_QUEUE_HEAD_INITIALIZER(name)                                   \
-  {{0, 0}, LIST_HEAD_INIT((name).head)}
+  {{0, 0}, LIST_HEAD_INIT((name).head), 0}
 #define DECLARE_WAIT_QUEUE_HEAD(name)                                         \
   wait_queue_head_t name = __WAIT_QUEUE_HEAD_INITIALIZER(name)
 
@@ -50,6 +55,7 @@ typedef struct wait_queue_head wait_queue_head_t;
   do {                                                                        \
     spin_lock_init(&(wq)->lock);                                              \
     INIT_LIST_HEAD(&(wq)->head);                                              \
+    (wq)->kpi_poll_wq = NULL;                                                 \
   } while (0)
 
 int default_wake_function(struct wait_queue_entry *wq_entry, unsigned mode,
@@ -67,6 +73,12 @@ int prepare_to_wait_event(wait_queue_head_t *q,
 void finish_wait(wait_queue_head_t *q, struct wait_queue_entry *wq_entry);
 
 int __kpi_wake_up(wait_queue_head_t *q, unsigned int nr, int flags);
+int wake_up_state(struct task_struct *p, unsigned int state);
+
+/* Wake poll(2)/select(2) waiters blocked on a native wait queue that the KPI
+ * poll bridge attached to a wait_queue_head (see wait_queue_head::kpi_poll_wq).
+ * `native_wq` is an opaque `wait_queue_t *`. */
+void linuxkpi_wake_poll_queue(void *native_wq);
 #define wake_up(q) __kpi_wake_up((q), 0, 0)
 #define wake_up_all(q) __kpi_wake_up((q), 0, 0)
 #define wake_up_interruptible(q) __kpi_wake_up((q), 0, 0)
@@ -74,6 +86,11 @@ int __kpi_wake_up(wait_queue_head_t *q, unsigned int nr, int flags);
 #define wake_up_interruptible_sync(q) __kpi_wake_up((q), 0, 0)
 #define wake_up_locked(q) __kpi_wake_up((q), 0, 0)
 #define wake_up_all_locked(q) __kpi_wake_up((q), 0, 0)
+#define wake_up_locked_poll(q, mode) __kpi_wake_up((q), 0, 0)
+#define wake_up_interruptible_poll(q, mode) __kpi_wake_up((q), 0, 0)
+#define wake_up_poll(q, mode) __kpi_wake_up((q), 0, 0)
+#define wake_up_pollfree(q) __kpi_wake_up((q), 0, 0)
+#define __wake_up_pollfree(q) __kpi_wake_up((q), 0, 0)
 
 /* ── wait_event family (ported macro shapes from upstream) ──────────────── */
 
@@ -125,6 +142,21 @@ int __kpi_wake_up(wait_queue_head_t *q, unsigned int nr, int flags);
 
 #define wait_event_killable(wq_head, condition)                               \
   ___wait_event(wq_head, condition, TASK_KILLABLE, 0, 0, schedule())
+
+/* The _lock_irq variants drop the caller's lock around schedule() and
+ * re-acquire it; AvoryOS notes the lock but does not reorder it because the
+ * native wait path does not sleep with locks held (documented in
+ * docs/linuxkpi-gaps.md).  Kept API-compatible. */
+#define wait_event_lock_irq(wq_head, condition, lock)                          \
+  do {                                                                        \
+    (void)(lock);                                                             \
+    wait_event(wq_head, condition);                                           \
+  } while (0)
+#define wait_event_interruptible_lock_irq(wq_head, condition, lock)            \
+  do {                                                                        \
+    (void)(lock);                                                             \
+    wait_event_interruptible(wq_head, condition);                             \
+  } while (0)
 
 #define __wait_event_timeout(wq_head, condition, timeout)                     \
   ___wait_event(wq_head, ___wait_cond_timeout(condition),                     \

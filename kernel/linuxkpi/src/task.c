@@ -1,0 +1,27 @@
+/* Per-thread Linux task_struct shadow.
+ *
+ * `current` (and task_struct pointers handed out by kthread_create()) point at
+ * one of these.  The objects are allocated lazily by native_sched.c through
+ * the weak linuxkpi_task_shadow_new() hook and live until the thread exits
+ * (the shadow is currently leaked with the native thread; freeing needs a
+ * thread-exit hook, recorded in docs/linuxkpi-gaps.md). */
+
+#include <linux/sched.h>
+#include <linux/slab.h>
+
+#include <linuxkpi/native_sched.h>
+
+void *linuxkpi_task_shadow_new(void *thread) {
+  struct task_struct *tsk;
+
+  tsk = kzalloc(sizeof(*tsk), GFP_KERNEL);
+  if (!tsk)
+    return NULL;
+
+  tsk->kpi_thread = thread;
+  tsk->state = TASK_RUNNING;
+  tsk->pid = (pid_t)linuxkpi_thread_pid(thread);
+  tsk->tgid = (pid_t)linuxkpi_thread_tgid(thread);
+  linuxkpi_thread_comm(thread, tsk->comm, sizeof(tsk->comm));
+  return tsk;
+}

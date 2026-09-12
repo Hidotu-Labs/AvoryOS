@@ -30,8 +30,26 @@
 #define CONFIG_MMU 1
 #define CONFIG_SMP 1
 
+/* Pointer-sized physical and DMA addresses.  Without these, Linux's types.h
+ * falls back to typedef'ing phys_addr_t/dma_addr_t as u32 (x86_64 selects
+ * both symbols in Kconfig).  A missing PHYS_ADDR_T_64BIT silently truncates
+ * page_to_phys() results to 32 bits. */
+#define CONFIG_PHYS_ADDR_T_64BIT 1
+#define CONFIG_ARCH_DMA_ADDR_T_64BIT 1
+
+/* x86_64 selects this, which makes <linux/mem_encrypt.h> pull in
+ * <asm/mem_encrypt.h> (__sme_pa/__sme_va).  asm/processor.h's load_cr3()
+ * needs __sme_pa; MEM_ENCRYPT itself stays off. */
+#define CONFIG_ARCH_HAS_MEM_ENCRYPT 1
+
 /* Architected page-table geometry: 4-level x86_64 (matches the native VMM). */
 #define CONFIG_PGTABLE_LEVELS 4
+
+/* The direct map base is AvoryOS's runtime HHDM offset, not Linux's compile
+ * time 0xffff888000000000: this makes upstream's __pa()/__va() and the
+ * virt_to_page() macro in asm/page.h agree with pmm_get_hhdm_offset().
+ * page.c defines page_offset_base and pins it at page_init(). */
+#define CONFIG_DYNAMIC_MEMORY_LAYOUT 1
 
 /* x86 cache geometry: 64-byte lines on every x86_64 machine; the internode
  * shift matches what Linux uses for non-VSMP x86_64. */
@@ -58,6 +76,12 @@
 #define CONFIG_DRM 1
 #define CONFIG_DRM_KMS_HELPER 1
 #define CONFIG_DMA_SHARED_BUFFER 1
+#define CONFIG_SYNC_FILE 1
+#define CONFIG_DRM_GEM_SHMEM_HELPER 1
+#define CONFIG_DRM_VGEM 1
+#define CONFIG_DRM_VKMS 1
+#define CONFIG_DRM_SIMPLEDRM 1
+#define CONFIG_CRC32 1
 
 /* Allocators used by imported library code. */
 #define CONFIG_GENERIC_ALLOCATOR 1

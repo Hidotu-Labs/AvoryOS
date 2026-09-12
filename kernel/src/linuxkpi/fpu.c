@@ -51,6 +51,14 @@ static inline uint32_t fpu_cpu_index(void) {
 
 bool irq_fpu_usable(void) { return true; }
 
+/* x86_64 upstream entry point: the mask selects which state components to
+ * initialize; AvoryOS always saves the full XSAVE area and lets the caller
+ * run, which is a superset. */
+void kernel_fpu_begin_mask(unsigned int kfpu_mask) {
+  (void)kfpu_mask;
+  kernel_fpu_begin();
+}
+
 void kernel_fpu_begin(void) {
   uint32_t cpu = fpu_cpu_index();
 

@@ -20,6 +20,16 @@ extern void linuxkpi_test_phase1_libs(void);
 extern void linuxkpi_test_phase1_mem(void);
 extern void linuxkpi_test_phase1_time(void);
 extern void linuxkpi_test_phase1_preempt(void);
+extern void linuxkpi_test_phase1_imports(void);
+extern void linuxkpi_test_phase1_params(void);
+extern void linuxkpi_test_phase1_core(void);
+extern void linuxkpi_test_phase2_page(void);
+extern void linuxkpi_test_phase2_vmalloc(void);
+extern void linuxkpi_test_phase2_dma(void);
+extern void linuxkpi_test_phase2_dmabuf(void);
+extern void linuxkpi_test_phase2_ttm_prep(void);
+extern void linuxkpi_test_phase3_drm(void);
+extern void linuxkpi_test_phase3_drm_modeset(void);
 
 static struct completion boot_tests_done;
 
@@ -30,6 +40,16 @@ static int linuxkpi_boot_tests_thread(void *arg) {
   linuxkpi_test_phase1_mem();
   linuxkpi_test_phase1_time();
   linuxkpi_test_phase1_preempt();
+  linuxkpi_test_phase1_imports();
+  linuxkpi_test_phase1_params();
+  linuxkpi_test_phase1_core();
+  linuxkpi_test_phase2_page();
+  linuxkpi_test_phase2_vmalloc();
+  linuxkpi_test_phase2_dma();
+  linuxkpi_test_phase2_dmabuf();
+  linuxkpi_test_phase2_ttm_prep();
+  linuxkpi_test_phase3_drm();
+  linuxkpi_test_phase3_drm_modeset();
 
   complete(&boot_tests_done);
   return 0;
@@ -47,6 +67,9 @@ void linuxkpi_run_boot_tests(void) {
     linuxkpi_test_phase1_mem();
     linuxkpi_test_phase1_time();
     linuxkpi_test_phase1_preempt();
+    linuxkpi_test_phase1_imports();
+    linuxkpi_test_phase1_params();
+    linuxkpi_test_phase1_core();
     return;
   }
 

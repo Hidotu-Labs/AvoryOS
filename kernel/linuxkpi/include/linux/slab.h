@@ -18,6 +18,23 @@
 #define ZERO_OR_NULL_PTR(x)                                                   \
   ((unsigned long)(x) <= (unsigned long)ZERO_SIZE_PTR)
 
+/* Kmalloc alignment for DMA-safe buffers.  x86 caches are incoherent for DMA
+ * below this anyway; matches upstream x86's 128 on most models. */
+#ifndef ARCH_KMALLOC_MINALIGN
+#define ARCH_KMALLOC_MINALIGN 8
+#endif
+#ifndef ARCH_DMA_MINALIGN
+#define ARCH_DMA_MINALIGN 128
+#endif
+
+/* Slab flags used by imported code.  The native cache ignores them; the
+ * values mirror upstream's so bit tests in callers behave. */
+#define SLAB_HWCACHE_ALIGN ((slab_flags_t __force)0x00002000U)
+#define SLAB_PANIC ((slab_flags_t __force)0x00040000U)
+#define SLAB_TYPESAFE_BY_RCU ((slab_flags_t __force)0x00080000U)
+#define SLAB_RECLAIM_ACCOUNT ((slab_flags_t __force)0x00020000U)
+#define SLAB_ACCOUNT ((slab_flags_t __force)0x04000000U)
+
 struct kmem_cache;
 struct list_lru;
 
@@ -51,6 +68,12 @@ static inline void *kmalloc(size_t size, gfp_t flags) {
 }
 
 static inline void *kmalloc_node(size_t size, gfp_t flags, int node) {
+  (void)node;
+  return __kpi_kmalloc(size, flags);
+}
+
+static inline void *kmalloc_node_track_caller(size_t size, gfp_t flags,
+                                              int node) {
   (void)node;
   return __kpi_kmalloc(size, flags);
 }
@@ -180,26 +203,17 @@ static inline void kmem_cache_free(struct kmem_cache *s, void *obj) {
                              offsetof(struct __struct, __field),              \
                              sizeof_field(struct __struct, __field), NULL)
 
-/* ── vmalloc family (deferred until the VMAP window allocator exists) ──────
+/* ── vmalloc family (implemented in linuxkpi/src/vmalloc.c) ────────────────
  *
- * Aliased to the heap for now so callers that use kv* on small objects work.
- * A real vmalloc implementation lands with the page/vmap phase. */
-
-static inline void *kvmalloc(size_t size, gfp_t flags) {
-  return __kpi_kmalloc(size, flags);
-}
-static inline void *kvzalloc(size_t size, gfp_t flags) {
-  return __kpi_kmalloc(size, flags | __GFP_ZERO);
-}
-static inline void *kvmalloc_array(size_t num, size_t size, gfp_t flags) {
-  return kmalloc_array(num, size, flags);
-}
-static inline void *kvcalloc(size_t num, size_t size, gfp_t flags) {
-  return __kpi_kcalloc(num, size, flags);
-}
-static inline void kvfree(const void *ptr) { __kpi_kfree(ptr); }
-static inline void kvfree_sensitive(const void *ptr) {
-  __kpi_kfree_sensitive(ptr);
-}
+ * kvmalloc tries the heap first and falls back to vmalloc for large or
+ * fragmented requests, matching Linux semantics; kvfree detects which
+ * allocator served the pointer. */
+void *kvmalloc_node(size_t size, gfp_t flags, int node);
+void *kvmalloc(size_t size, gfp_t flags);
+void *kvzalloc(size_t size, gfp_t flags);
+void *kvmalloc_array(size_t num, size_t size, gfp_t flags);
+void *kvcalloc(size_t num, size_t size, gfp_t flags);
+void kvfree(const void *ptr);
+void kvfree_sensitive(const void *ptr, size_t len);
 
 #endif /* __AVORY_LINUXKPI_SLAB_H */

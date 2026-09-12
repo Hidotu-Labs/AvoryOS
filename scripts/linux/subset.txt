@@ -18,12 +18,50 @@ lib/math/int_sqrt.c
 
 # Phase 1 containers and primitives on top of the LinuxKPI slab/lock/RCU
 # cores.  lib/radix-tree.h is the private header xarray.c includes by name.
-# lib/idr.c waits for the full radix-tree.c import (needs timers/hrtimer).
 lib/xarray.c
 lib/refcount.c
 lib/siphash.c
 lib/radix-tree.h
+lib/radix-tree.c
+lib/idr.c
+
+# Phase 1 remaining library imports.  lib/crc32.c needs its private
+# crc32defs.h; linux-import.sh generates the slicing-by-8 crc32table.h.
+lib/math/rational.c
+lib/math/reciprocal_div.c
+lib/crc32.c
+lib/crc32defs.h
+lib/xxhash.c
+lib/kfifo.c
+
+# Full bitmap import (replaces the temporary bitmap_compat.c shim), its
+# _parse_integer dependency from kstrtox.c, and string_helpers.c (which needs
+# the shared hex_asc/_ctype tables).
+lib/bitmap.c
+lib/kstrtox.c
+lib/kstrtox.h
+lib/string_helpers.c
+lib/hexdump.c
+lib/ctype.c
 
 # Kbuild generates <generated/timeconst.h> from HZ; the import script derives
 # it from this script instead of hand-writing constants.
 kernel/time/timeconst.bc
+
+# Phase 2: DMA-buf/fence/resv/sync_file stack.  The whole directory is copied
+# so private headers (dma-buf-sysfs-stats.h, sync_debug.h, ...) are present;
+# scripts/linux/files.txt decides which .c files actually build.
+drivers/dma-buf
+
+# dma-fence-unwrap.c calls sort(); import the self-contained implementation.
+lib/sort.c
+
+# Phase 3: DRM core headers and sources.  The root glob copies drm.ko's and
+# drm_kms_helper.ko's files plus their private headers without dragging in
+# every vendor subdirectory; the canary drivers are listed explicitly.  amdgpu,
+# the display helpers and the scheduler arrive with the phases that need them.
+drivers/gpu/drm/*.h
+drivers/gpu/drm/*.c
+drivers/gpu/drm/vgem
+drivers/gpu/drm/vkms
+drivers/gpu/drm/tiny

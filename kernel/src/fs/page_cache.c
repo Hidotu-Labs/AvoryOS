@@ -62,7 +62,7 @@ vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
   if (!node)
     return NULL;
   spinlock_acquire(&node->pages_lock);
-  vfs_page_t *page = radix_tree_lookup(&node->pages, cache_key(offset));
+  vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
   if (page) {
     page->refs++;
     page->last_used = cache_stamp();
@@ -102,7 +102,7 @@ vfs_page_t *vfs_cache_insert(vfs_node_t *node, uint32_t offset,
   new_page->last_used = cache_stamp();
 
   spinlock_acquire(&node->pages_lock);
-  vfs_page_t *page = radix_tree_lookup(&node->pages, cache_key(offset));
+  vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
   if (page) {
     page->refs++;
     spinlock_release(&node->pages_lock);
@@ -110,7 +110,7 @@ vfs_page_t *vfs_cache_insert(vfs_node_t *node, uint32_t offset,
     pmm_free_page((void *)frame);
     return page;
   }
-  if (radix_tree_insert(&node->pages, cache_key(offset), new_page)) {
+  if (asc_radix_tree_insert(&node->pages, cache_key(offset), new_page)) {
     spinlock_release(&node->pages_lock);
     kfree(new_page);
     return NULL;
@@ -157,10 +157,10 @@ vfs_page_t *vfs_cache_get_or_create(vfs_node_t *node, uint32_t offset) {
 
   bool creator = false;
   spinlock_acquire(&node->pages_lock);
-  page = radix_tree_lookup(&node->pages, cache_key(offset));
+  page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
   if (page) {
     page->refs++;
-  } else if (!radix_tree_insert(&node->pages, cache_key(offset), candidate)) {
+  } else if (!asc_radix_tree_insert(&node->pages, cache_key(offset), candidate)) {
     page = candidate;
     creator = true;
     __atomic_add_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
@@ -318,7 +318,7 @@ uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_byt
     uint32_t page_off = offset + i * PAGE_SIZE;
     if (page_off >= node->length)
       break;
-    vfs_page_t *existing = radix_tree_lookup(&node->pages, cache_key(page_off));
+    vfs_page_t *existing = asc_radix_tree_lookup(&node->pages, cache_key(page_off));
     if (existing) {
       if (missing_count == 0) {
         start_index = i + 1; /* leading present page: keep looking */
@@ -365,8 +365,8 @@ uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_byt
   spinlock_acquire(&node->pages_lock);
   for (uint32_t i = 0; i < allocated; i++) {
     uint32_t page_off = first_off + i * PAGE_SIZE;
-    vfs_page_t *existing = radix_tree_lookup(&node->pages, cache_key(page_off));
-    if (existing || radix_tree_insert(&node->pages, cache_key(page_off), candidates[i])) {
+    vfs_page_t *existing = asc_radix_tree_lookup(&node->pages, cache_key(page_off));
+    if (existing || asc_radix_tree_insert(&node->pages, cache_key(page_off), candidates[i])) {
       break;
     }
     __atomic_add_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
@@ -595,7 +595,7 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
 }
 
 static vfs_page_t *cache_delete_locked(vfs_node_t *node, uint64_t key) {
-  vfs_page_t *page = radix_tree_delete(&node->pages, key);
+  vfs_page_t *page = asc_radix_tree_delete(&node->pages, key);
   if (!page)
     return NULL;
   page->evicted = true;
@@ -644,7 +644,7 @@ static void cache_remove_range(vfs_node_t *node, uint64_t first, uint64_t last,
   while (1) {
     struct key_batch batch = {
         .first = first, .last = last, .unused_only = unused_only};
-    bool complete = radix_tree_for_each_range(&node->pages, first, last,
+    bool complete = asc_radix_tree_for_each_range(&node->pages, first, last,
                                                collect_keys, &batch);
     if (!batch.count)
       break;
@@ -686,7 +686,7 @@ void vfs_cache_update_or_invalidate(vfs_node_t *node, uint32_t offset,
       to_copy = length - written;
 
     spinlock_acquire(&node->pages_lock);
-    vfs_page_t *page = radix_tree_lookup(&node->pages, cache_key(cur_offset));
+    vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(cur_offset));
     if (page && page->frame_phys && !page->loading && !page->evicted) {
       if (page->uptodate) {
         void *page_virt = PHYS_TO_VIRT(page->frame_phys);
@@ -723,7 +723,7 @@ void vfs_cache_clear(vfs_node_t *node) {
   if (!vfs_node_is_alive(node))
     return;
   spinlock_acquire(&node->pages_lock);
-  radix_tree_destroy(&node->pages, cache_destroy_value);
+  asc_radix_tree_destroy(&node->pages, cache_destroy_value);
   spinlock_release(&node->pages_lock);
 }
 
@@ -766,7 +766,7 @@ size_t vfs_cache_reclaim(vfs_node_t *node, size_t target) {
   spinlock_acquire(&node->pages_lock);
   while (reclaimed < target) {
     struct reclaim_search search = {0};
-    radix_tree_for_each(&node->pages, find_reclaimable, &search);
+    asc_radix_tree_for_each(&node->pages, find_reclaimable, &search);
     if (!search.found)
       break;
     vfs_page_t *page = cache_delete_locked(node, search.key);
@@ -783,7 +783,7 @@ void vfs_cache_mark_dirty(vfs_node_t *node, uint32_t offset) {
   if (!node)
     return;
   spinlock_acquire(&node->pages_lock);
-  vfs_page_t *page = radix_tree_lookup(&node->pages, cache_key(offset));
+  vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
   if (page && page->uptodate && !page->evicted) {
     page->dirty = true;
     page->dirty_seq++;
@@ -820,7 +820,7 @@ void vfs_cache_sync(vfs_node_t *node) {
   while (1) {
     struct dirty_search search = {0};
     spinlock_acquire(&node->pages_lock);
-    radix_tree_for_each(&node->pages, find_dirty, &search);
+    asc_radix_tree_for_each(&node->pages, find_dirty, &search);
     spinlock_release(&node->pages_lock);
     if (!search.page)
       break;
@@ -929,7 +929,7 @@ bool vfs_cache_phase3_stress_test(void) {
     if (frames[i] && pmm_get_ref((void *)frames[i]) != 0)
       pass = false;
   }
-  return pass && radix_tree_validate(&node.pages) &&
+  return pass && asc_radix_tree_validate(&node.pages) &&
          vfs_cache_page_count() == cached_before;
 }
 
@@ -1039,7 +1039,7 @@ bool vfs_cache_phase4_stress_test(void) {
     pass = false;
 
   vfs_cache_clear(&node);
-  pass = pass && radix_tree_validate(&node.pages) &&
+  pass = pass && asc_radix_tree_validate(&node.pages) &&
          vfs_cache_page_count() == cached_before;
   kfree(second);
   kfree(buffer);
@@ -1151,6 +1151,6 @@ bool vfs_cache_phase5_stress_test(void) {
   if (vfs_cache_reclaim(&node, remaining) != remaining)
     pass = false;
   vfs_cache_clear(&node);
-  return pass && radix_tree_validate(&node.pages) &&
+  return pass && asc_radix_tree_validate(&node.pages) &&
          vfs_cache_page_count() == cached_before;
 }

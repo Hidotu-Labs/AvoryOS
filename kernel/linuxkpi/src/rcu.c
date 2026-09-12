@@ -9,6 +9,7 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/sched.h>
+#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 
@@ -109,4 +110,27 @@ void linuxkpi_rcu_init(void) {
   init_waitqueue_head(&rcu_wait);
   init_waitqueue_head(&rcu_barrier_wait);
   rcu_task = kthread_run(rcu_kthread, NULL, "rcu_kpi");
+}
+
+/* kfree_rcu support: remember the object behind an embedded rcu_head. */
+struct kfree_rcu_ent {
+  struct rcu_head head;
+  void *obj;
+};
+
+static void kfree_rcu_cb(struct rcu_head *head) {
+  struct kfree_rcu_ent *ent =
+      container_of(head, struct kfree_rcu_ent, head);
+
+  kfree(ent->obj);
+  kfree(ent);
+}
+
+void __kvfree_call_rcu(struct rcu_head *head, __SIZE_TYPE__ offset) {
+  struct kfree_rcu_ent *ent = kmalloc(sizeof(*ent), GFP_KERNEL);
+
+  if (!ent)
+    return; /* leak rather than corrupt; never expected */
+  ent->obj = (void *)((char *)head - offset);
+  call_rcu(&ent->head, kfree_rcu_cb);
 }

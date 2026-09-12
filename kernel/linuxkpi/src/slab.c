@@ -66,15 +66,15 @@ void __kpi_kfree(const void *ptr) {
 }
 
 void __kpi_kfree_sensitive(const void *ptr) {
-  /* TODO: overwrite before freeing once ksize() is tracked. */
+  if (ZERO_OR_NULL_PTR(ptr))
+    return;
+  /* Wipe the whole usable block, as upstream, then release it. */
+  __builtin_memset((void *)ptr, 0, __kpi_ksize(ptr));
   __kpi_kfree(ptr);
 }
 
 size_t __kpi_ksize(const void *ptr) {
-  /* TODO: report the real allocation size once the heap records it.  Zero is
-   * the safe answer: callers may not assume any usable capacity. */
-  (void)ptr;
-  return 0;
+  return asc_heap_ksize(ptr);
 }
 
 void *__kpi_kmemdup(const void *src, size_t len, gfp_t flags) {

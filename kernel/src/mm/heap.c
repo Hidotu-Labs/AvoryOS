@@ -418,6 +418,43 @@ void *krealloc(void *ptr, size_t new_size) {
   return new_ptr;
 }
 
+// Usable capacity of an allocation, matching Linux ksize(): the slab object
+// size for slab-backed blocks (>= the requested size) or the page-backed
+// payload size for large blocks.  Returns 0 for pointers the heap does not
+// own.
+size_t heap_ksize(const void *ptr) {
+  if (!ptr)
+    return 0;
+
+  uint64_t page_base = (uint64_t)ptr & ~0xFFFULL;
+  uint64_t magic_check = *(uint64_t *)page_base;
+
+  if (magic_check == SLAB_MAGIC) {
+    struct slab *s = (struct slab *)page_base;
+    uint64_t object_base = page_base + sizeof(struct slab);
+    if ((uint64_t)ptr < object_base)
+      return 0;
+    uint64_t offset = (uint64_t)ptr - object_base;
+    if (offset % s->cache->obj_size != 0)
+      return 0;
+    uint32_t idx = offset / s->cache->obj_size;
+    if (idx >= s->total_count)
+      return 0;
+    return s->cache->obj_size;
+  }
+
+  if (magic_check == BIG_MAGIC) {
+    struct big_alloc *b = (struct big_alloc *)page_base;
+    if ((uint64_t)ptr != page_base + sizeof(struct big_alloc))
+      return 0;
+    if (b->pages * PAGE_SIZE < sizeof(struct big_alloc))
+      return 0;
+    return (b->pages * PAGE_SIZE) - sizeof(struct big_alloc);
+  }
+
+  return 0;
+}
+
 static void heap_u64_to_str(uint64_t val, char *buf) {
   if (val == 0) {
     buf[0] = '0';

@@ -328,8 +328,17 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
       // Pass MAP_FIXED to internal handler to ensure it respects our vaddr
       uint64_t result =
           node->mmap(node, vaddr, length, prot, flags | MAP_FIXED, offset);
-      if (result == MAP_FAILED || result == (uint64_t)-1)
+      if (result == MAP_FAILED || result == (uint64_t)-1) {
+        /* A failed Linux f_op->mmap must not leave a pending bridge wrapper. */
+        extern void *linuxkpi_vma_take_pending(void) __attribute__((weak));
+        extern void linuxkpi_vma_unref(void *) __attribute__((weak));
+        if (linuxkpi_vma_take_pending && linuxkpi_vma_unref) {
+          void *stale = linuxkpi_vma_take_pending();
+          if (stale)
+            linuxkpi_vma_unref(stale);
+        }
         return E_NOMEM;
+      }
 
       if (current_thread && current_thread->mm) {
         spinlock_acquire(&current_thread->mm->lock);
@@ -338,7 +347,33 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
                     flags, (int)fd, offset, node, 0);
         spinlock_release(&current_thread->mm->lock);
         if (vma_idx < 0) {
+          extern void *linuxkpi_vma_take_pending(void) __attribute__((weak));
+          extern void linuxkpi_vma_unref(void *) __attribute__((weak));
+          if (linuxkpi_vma_take_pending && linuxkpi_vma_unref) {
+            void *stale = linuxkpi_vma_take_pending();
+            if (stale)
+              linuxkpi_vma_unref(stale);
+          }
           return E_NOMEM;
+        }
+
+        /* If this was a Linux f_op->mmap() (imported driver), bind the
+         * Linux-facing vm_area_struct to the native VMA so vm_ops->close()
+         * runs when the last reference goes away.  vma_attach_linux() takes
+         * its own reference; the bridge's pending creator reference is
+         * released here so a full munmap drops the last one and closes the
+         * wrapper exactly once. */
+        extern void *linuxkpi_vma_take_pending(void) __attribute__((weak));
+        extern void linuxkpi_vma_unref(void *) __attribute__((weak));
+        if (linuxkpi_vma_take_pending) {
+          void *lvma = linuxkpi_vma_take_pending();
+          if (lvma) {
+            spinlock_acquire(&current_thread->mm->lock);
+            vma_attach_linux(&current_thread->mm->vmas, result, lvma);
+            spinlock_release(&current_thread->mm->lock);
+            if (linuxkpi_vma_unref)
+              linuxkpi_vma_unref(lvma);
+          }
         }
       }
 

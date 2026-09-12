@@ -58,6 +58,22 @@ SECTIONS {
         __initcall_end = .;
     } :text
 
+    /* LinuxKPI module parameters and __setup/early_param handlers.  The
+     * parser in linuxkpi/src/params.c walks these when applying the boot
+     * command line.  KEEP is mandatory: --gc-sections would discard the
+     * entries (and their referenced variables/functions) otherwise. */
+    .kpi_params : ALIGN(8) {
+        __kpi_param_start = .;
+        KEEP(*(.kpi_params))
+        __kpi_param_end = .;
+    } :text
+
+    .kpi_setups : ALIGN(8) {
+        __kpi_setup_start = .;
+        KEEP(*(.kpi_setups))
+        __kpi_setup_end = .;
+    } :text
+
     . = ALIGN(0x1000);
 
     .rodata : {

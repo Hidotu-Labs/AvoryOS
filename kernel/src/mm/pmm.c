@@ -277,6 +277,17 @@ size_t pmm_get_free_pages(void) {
   return free_pages;
 }
 
+size_t pmm_get_free_pages_including_pcp(void) {
+  size_t free_pages = pmm_get_free_pages();
+
+  for (uint32_t i = 0; i < MAX_CPUS; i++) {
+    /* Loose read: this is a diagnostic statistic and racing with a
+     * concurrent alloc/free can only shift the count by a batch. */
+    free_pages += __atomic_load_n(&pcp_caches[i].count, __ATOMIC_RELAXED);
+  }
+  return free_pages;
+}
+
 static void buddy_free_internal(uint64_t phys, size_t order);
 
 // Internal function to add a free block to the buddy system

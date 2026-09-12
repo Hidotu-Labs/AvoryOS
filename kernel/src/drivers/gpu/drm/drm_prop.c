@@ -5,7 +5,7 @@
 #include "../../../mm/heap.h"
 #include "drm.h"
 
-extern drm_pageflip_fn_t g_drm_pageflip_fn;
+extern drm_pageflip_fn_t g_ascent_drm_pageflip_fn;
 
 /* ── Global property catalogue ──────────────────────────────────────────── */
 
@@ -43,7 +43,7 @@ static const struct drm_property_def drm_prop_catalogue[] = {
 #define PROP_CATALOGUE_SIZE                                                    \
   (sizeof(drm_prop_catalogue) / sizeof(drm_prop_catalogue[0]))
 
-const struct drm_property_def *drm_prop_find_def(uint32_t prop_id) {
+const struct drm_property_def *ascentdrm_prop_find_def(uint32_t prop_id) {
   for (size_t i = 0; i < PROP_CATALOGUE_SIZE; i++) {
     if (drm_prop_catalogue[i].id == prop_id)
       return &drm_prop_catalogue[i];
@@ -54,7 +54,7 @@ const struct drm_property_def *drm_prop_find_def(uint32_t prop_id) {
 /* ── Object property helpers ─────────────────────────────────────────────── */
 
 /* Attach a property with its default value to a mode object */
-void drm_obj_add_prop(struct drm_mode_object *obj, uint32_t prop_id,
+void ascentdrm_obj_add_prop(struct drm_mode_object *obj, uint32_t prop_id,
                       uint64_t default_val) {
   if (obj->prop_count >= DRM_MAX_OBJ_PROPS)
     return;
@@ -64,7 +64,7 @@ void drm_obj_add_prop(struct drm_mode_object *obj, uint32_t prop_id,
 }
 
 /* Get a property value from an object; returns -1 if not found */
-int drm_obj_get_prop(struct drm_mode_object *obj, uint32_t prop_id,
+int ascentdrm_obj_get_prop(struct drm_mode_object *obj, uint32_t prop_id,
                      uint64_t *out) {
   for (uint32_t i = 0; i < obj->prop_count; i++) {
     if (obj->props[i].prop_id == prop_id) {
@@ -76,7 +76,7 @@ int drm_obj_get_prop(struct drm_mode_object *obj, uint32_t prop_id,
 }
 
 /* Set a property value on an object; returns -1 if not found */
-int drm_obj_set_prop(struct drm_mode_object *obj, uint32_t prop_id,
+int ascentdrm_obj_set_prop(struct drm_mode_object *obj, uint32_t prop_id,
                      uint64_t value) {
   for (uint32_t i = 0; i < obj->prop_count; i++) {
     if (obj->props[i].prop_id == prop_id) {
@@ -89,7 +89,7 @@ int drm_obj_set_prop(struct drm_mode_object *obj, uint32_t prop_id,
 
 /* ── Blob management ─────────────────────────────────────────────────────── */
 
-struct drm_prop_blob *drm_blob_create(struct drm_device *dev, const void *data,
+struct drm_prop_blob *ascentdrm_blob_create(struct drm_device *dev, const void *data,
                                       uint32_t length) {
   struct drm_prop_blob *blob = kmalloc(sizeof(struct drm_prop_blob));
   if (!blob)
@@ -112,7 +112,7 @@ struct drm_prop_blob *drm_blob_create(struct drm_device *dev, const void *data,
   return blob;
 }
 
-struct drm_prop_blob *drm_blob_find(struct drm_device *dev, uint32_t id) {
+struct drm_prop_blob *ascentdrm_blob_find(struct drm_device *dev, uint32_t id) {
   struct drm_prop_blob *b;
   list_for_each_entry(b, &dev->blob_objects, list) {
     if (b->id == id)
@@ -121,7 +121,7 @@ struct drm_prop_blob *drm_blob_find(struct drm_device *dev, uint32_t id) {
   return NULL;
 }
 
-void drm_blob_destroy(struct drm_device *dev, uint32_t id) {
+void ascentdrm_blob_destroy(struct drm_device *dev, uint32_t id) {
   spinlock_acquire(&dev->lock);
   struct drm_prop_blob *b;
   list_for_each_entry(b, &dev->blob_objects, list) {
@@ -138,7 +138,7 @@ void drm_blob_destroy(struct drm_device *dev, uint32_t id) {
 
 /* ── DRM_IOCTL_MODE_OBJ_GETPROPERTIES ───────────────────────────────────── */
 
-int drm_ioctl_obj_getprops(struct drm_device *dev, uint64_t arg) {
+int ascentdrm_ioctl_obj_getprops(struct drm_device *dev, uint64_t arg) {
   struct drm_mode_obj_get_properties *req =
       (struct drm_mode_obj_get_properties *)arg;
 
@@ -194,7 +194,7 @@ int drm_ioctl_obj_getprops(struct drm_device *dev, uint64_t arg) {
 
 /* ── DRM_IOCTL_MODE_GETPROPERTY ─────────────────────────────────────────── */
 
-int drm_ioctl_getproperty(struct drm_device *dev, uint64_t arg) {
+int ascentdrm_ioctl_getproperty(struct drm_device *dev, uint64_t arg) {
   (void)dev;
   struct {
     uint64_t values_ptr;
@@ -218,7 +218,7 @@ int drm_ioctl_getproperty(struct drm_device *dev, uint64_t arg) {
   klog_debug_uint64(p->count_enum_blobs);
   klog_debug_puts("\n");
 
-  const struct drm_property_def *def = drm_prop_find_def(p->prop_id);
+  const struct drm_property_def *def = ascentdrm_prop_find_def(p->prop_id);
   if (!def) {
     /* Unknown property — return a harmless stub so userland doesn't crash */
     p->flags = 0;
@@ -295,9 +295,9 @@ int drm_ioctl_getproperty(struct drm_device *dev, uint64_t arg) {
 
 /* ── Atomic commit engine ────────────────────────────────────────────────── */
 
-extern struct drm_gem_object *drm_gem_find_by_handle(struct drm_device *dev,
+extern struct drm_gem_object *ascentdrm_gem_find_by_handle(struct drm_device *dev,
                                                      uint32_t handle);
-extern void drm_file_send_event(struct drm_file *file,
+extern void ascentdrm_file_send_event(struct drm_file *file,
                                 struct drm_event_vblank *ev,
                                 struct vfs_node *node);
 
@@ -305,7 +305,7 @@ static uint32_t drm_atomic_event_sequence = 1;
 
 static uint32_t drm_plane_type(struct drm_plane *plane) {
   uint64_t type = DRM_PLANE_TYPE_OVERLAY;
-  drm_obj_get_prop(&plane->base, DRM_PROP_ID_TYPE, &type);
+  ascentdrm_obj_get_prop(&plane->base, DRM_PROP_ID_TYPE, &type);
   return (uint32_t)type;
 }
 
@@ -358,11 +358,11 @@ static void drm_fill_atomic_vblank_event(struct drm_event_vblank *ev,
  * Apply a single (object, property, value) triple.
  * Returns 0 on success, -1 on unknown object/property.
  */
-int atomic_apply_prop(struct drm_device *dev,
+int ascentdrm_atomic_apply_prop(struct drm_device *dev,
                              struct drm_mode_object *obj, uint32_t prop_id,
                              uint64_t value) {
   /* Validate the property exists in our catalogue */
-  if (!drm_prop_find_def(prop_id))
+  if (!ascentdrm_prop_find_def(prop_id))
     return -38; /* ENOSYS */
 
   switch (obj->type) {
@@ -544,11 +544,11 @@ int atomic_apply_prop(struct drm_device *dev,
   }
 
   /* Persist the value in the object's property table */
-  drm_obj_set_prop(obj, prop_id, value);
+  ascentdrm_obj_set_prop(obj, prop_id, value);
   return 0;
 }
 
-int drm_ioctl_obj_setproperty(struct drm_device *dev, uint64_t arg) {
+int ascentdrm_ioctl_obj_setproperty(struct drm_device *dev, uint64_t arg) {
   struct {
     uint64_t value;
     uint32_t prop_id;
@@ -583,12 +583,12 @@ int drm_ioctl_obj_setproperty(struct drm_device *dev, uint64_t arg) {
     return -2;
   }
 
-  int ret = atomic_apply_prop(dev, mobj, req->prop_id, req->value);
+  int ret = ascentdrm_atomic_apply_prop(dev, mobj, req->prop_id, req->value);
   spinlock_release(&dev->lock);
   return ret;
 }
 
-int drm_ioctl_atomic(struct vfs_node *node, struct drm_file *file,
+int ascentdrm_ioctl_atomic(struct vfs_node *node, struct drm_file *file,
                      struct drm_device *dev, uint64_t arg) {
   struct drm_mode_atomic *req = (struct drm_mode_atomic *)arg;
 
@@ -657,7 +657,7 @@ int drm_ioctl_atomic(struct vfs_node *node, struct drm_file *file,
       if (!test_only) {
         if (mobj->type == DRM_MODE_OBJECT_PLANE &&
             pid == DRM_PROP_ID_FB_DAMAGE_CLIPS && val != 0) {
-          struct drm_prop_blob *blob = drm_blob_find(dev, (uint32_t)val);
+          struct drm_prop_blob *blob = ascentdrm_blob_find(dev, (uint32_t)val);
           if (blob && blob->length >= sizeof(struct drm_mode_rect) &&
               blob->length % sizeof(struct drm_mode_rect) == 0) {
             const struct drm_mode_rect *rects = blob->data;
@@ -692,7 +692,7 @@ int drm_ioctl_atomic(struct vfs_node *node, struct drm_file *file,
             }
           }
         }
-        if (atomic_apply_prop(dev, mobj, pid, val) != 0) {
+        if (ascentdrm_atomic_apply_prop(dev, mobj, pid, val) != 0) {
           klog_debug_puts("[DRM] atomic: unknown prop_id=");
           klog_debug_uint64(pid);
           klog_debug_puts(" on obj=");
@@ -707,8 +707,8 @@ int drm_ioctl_atomic(struct vfs_node *node, struct drm_file *file,
 
   /* Fire a page-flip complete event to the calling client's queue */
   if (!test_only && (req->flags & DRM_MODE_PAGE_FLIP_EVENT)) {
-    if (g_drm_pageflip_fn) {
-      g_drm_pageflip_fn(file, node, event_crtc_id, 0, req->user_data);
+    if (g_ascent_drm_pageflip_fn) {
+      g_ascent_drm_pageflip_fn(file, node, event_crtc_id, 0, req->user_data);
       spinlock_release(&dev->lock);
       goto done;
     }
@@ -718,7 +718,7 @@ int drm_ioctl_atomic(struct vfs_node *node, struct drm_file *file,
     ev.user_data = req->user_data;
     drm_fill_atomic_vblank_event(&ev, event_crtc_id);
     spinlock_release(&dev->lock);
-    drm_file_send_event(file, &ev, node);
+    ascentdrm_file_send_event(file, &ev, node);
     goto done;
   }
 

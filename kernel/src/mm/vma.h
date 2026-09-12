@@ -33,6 +33,11 @@ struct vma {
   uint64_t file_size; // File size in bytes (for demand paging ELF segments)
   int fd; // File descriptor (for file-backed mappings, -1 if anonymous)
   void *file_node; // VFS node pointer (for demand paging)
+  /* Linux-facing vm_area_struct owned by the LinuxKPI mmap bridge, when this
+   * mapping came from a Linux f_op->mmap().  The bridge holds one reference
+   * per native node referencing the wrapper and calls vm_ops->close() when
+   * the last one drops (kernel/linuxkpi/src/mmap.c). */
+  void *linux_vma;
 
   int height; // AVL Balance Height Tracker
   struct vma *left;
@@ -55,6 +60,11 @@ void vma_list_destroy(struct vma_list *list);
 int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
             uint64_t flags, int fd, uint64_t offset, void *file_node,
             uint64_t file_size);
+
+// Attach a Linux vm_area_struct wrapper (owned by the LinuxKPI bridge) to the
+// VMA starting at `start`.  Takes a reference on the wrapper.  A missing VMA
+// at `start` is ignored (best effort for the mmap path).
+void vma_attach_linux(struct vma_list *list, uint64_t start, void *linux_vma);
 
 // Remove a VMA region by address range (auto-splits and auto-unmaps Native
 // structures) Returns true if any region was removed/split

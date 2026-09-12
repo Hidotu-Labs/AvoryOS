@@ -67,10 +67,10 @@ static void tmpfs_uncharge_bytes(tmpfs_sb_t *sb, uint64_t bytes) {
 static tmpfs_page_t *tmpfs_get_page(tmpfs_file_t *file, uint32_t page_index) {
     if (!file)
         return NULL;
-    return (tmpfs_page_t *)radix_tree_lookup(&file->pages, page_index);
+    return (tmpfs_page_t *)asc_radix_tree_lookup(&file->pages, page_index);
 }
 
-/* radix_tree_for_each_range() visits leaves in ascending key order and stops
+/* asc_radix_tree_for_each_range() visits leaves in ascending key order and stops
  * when the callback returns false, so recording the first value is "lowest
  * page index >= from".  The callback runs under the tree's own lock and must
  * not mutate the tree. */
@@ -91,11 +91,11 @@ static bool tmpfs_find_first_page(uint64_t index, void *value, void *context) {
  * the lock. */
 static tmpfs_page_t *tmpfs_take_page_locked(tmpfs_file_t *file, uint32_t from) {
     struct tmpfs_first_page first = { NULL };
-    radix_tree_for_each_range(&file->pages, from, UINT32_MAX,
+    asc_radix_tree_for_each_range(&file->pages, from, UINT32_MAX,
                               tmpfs_find_first_page, &first);
     if (!first.page)
         return NULL;
-    return (tmpfs_page_t *)radix_tree_delete(&file->pages,
+    return (tmpfs_page_t *)asc_radix_tree_delete(&file->pages,
                                              first.page->page_index);
 }
 
@@ -156,7 +156,7 @@ static tmpfs_page_t *tmpfs_get_or_alloc_page(tmpfs_file_t *file,
     np->phys       = (uint64_t)frame;
 
     spinlock_acquire(&file->lock);
-    if (radix_tree_insert(&file->pages, page_index, np) != 0) {
+    if (asc_radix_tree_insert(&file->pages, page_index, np) != 0) {
         /* Lost a race (another thread inserted the page first) or the tree
          * could not allocate a node: keep whichever page is already there. */
         tmpfs_page_t *existing = tmpfs_get_page(file, page_index);
@@ -632,7 +632,7 @@ static vfs_node_t *tmpfs_make_node(tmpfs_sb_t *sb, const char *name,
             tmpfs_free_inode(sb);
             return NULL;
         }
-        radix_tree_init(&f->pages);
+        asc_radix_tree_init(&f->pages);
         f->num_pages = 0;
         f->sb        = sb;
         spinlock_init(&f->lock);
