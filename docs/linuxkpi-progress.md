@@ -556,7 +556,7 @@ mappings, kthread_worker in `kthread.c`.
   userland evidence path is the interactive `make run` run captured in this
   chunk, not a second automation path.
 
-## C6 — verification, docs, handoff (pending commit)
+## C6 — verification, docs, handoff (committed `45ee1af`)
 
 - [x] Kernel + ISO rebuilt after the final C4 changes; Phase 1/2/3 kernel
       suites and the userland DRM test all green at `-smp 4`.
@@ -571,6 +571,27 @@ mappings, kthread_worker in `kthread.c`.
       `bin/test_kpi_drm` -> `=== ALL TESTS PASSED ===` (Chunk 7).
 - [x] Handoff: Phase 3 sources + docs committed; `userland/kria-lang/` and
       `userland/quake2/` intentionally left untracked (build artifacts).
+
+## Phase 4 — TTM + drm_sched + minimal Linux PCI + TTM canary (planned, not started)
+
+Chunk plan: `docs/linuxkpi-phase4-plan.md` (written 2026-09-12 after auditing
+P0–P3 at `45ee1af`).  Chunks: C0 baseline closeout → C1 import/build TTM +
+drm_sched → C2 TTM tests → C3 drm_sched tests → C4 minimal Linux PCI (EDU
+lifecycle test) → C5 bochs canary on `run-linuxdrm` → C6 optional virtio →
+C7 optional amdgpu compile spike.
+
+Open items that C0 must close before any Phase 4 code lands:
+
+- [ ] P1 exit: interactive `make run` desktop boot evidence.
+- [ ] P2 exit: 10-minute soak re-run (`bin/test_kpi_dmabuf 600`, `-smp 4`)
+      after the warm-up-baseline fix; must end `delta=0`.
+- [ ] P3 exit re-check after C0 (`nm` symbol check, `/dev/dri` listing,
+      `bin/test_kpi_drm`).
+
+Deviations from the original Phase 4 sketch are recorded in the plan: QEMU
+11.1 has no `mgag200` (bochs is the TTM canary), bochs lives in
+`drivers/gpu/drm/tiny/bochs.c` and is TTM-backed via
+`drm_gem_vram_helper`, and 6.6 virtio-gpu is GEM-shmem (not TTM).
 
 ## Cross-phase notes
 
