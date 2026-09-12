@@ -12,8 +12,12 @@ typedef enum {
 
 struct rb_node {
     unsigned long __rb_parent_color;  /* parent ptr | color in low bit */
-    struct rb_node *rb_left;
+    /* Field order MUST match stock <linux/rbtree_types.h>: imported Linux
+     * code embeds this layout, while insertion/iteration call the native
+     * rb_* functions (rb_insert_color/rb_next/rb_first), so the two views
+     * have to agree byte for byte.  Upstream puts rb_right before rb_left. */
     struct rb_node *rb_right;
+    struct rb_node *rb_left;
 };
 
 #define rb_parent(r)   ((struct rb_node *)((r)->__rb_parent_color & ~3UL))

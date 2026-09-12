@@ -8,6 +8,39 @@ Update this file in the same change that introduces or closes a gap.
 
 ## Phase 4 gaps (TTM + scheduler bring-up, 2026-09-12)
 
+- **`current` is the `task_struct` shadow everywhere**
+  (`linuxkpi/include/asm/current.h`): the overlay used to cast the native
+  `struct thread *` to `task_struct *`, while `sched.h` returned the shadow.
+  Imported code that dereferences `current->…` (`drm_sched`'s
+  `last_user`/`group_leader`) and dma-fence's `cb.task = current` therefore
+  operated on a native thread (whose first field is `rsp`), so
+  `wake_up_state()` woke a garbage pointer and every fence wait timed out.
+  Both definitions now return `linuxkpi_current_task()`.
+- **`timer_setup()` memsets the timer** (`linuxkpi/include/linux/timer.h`):
+  the overlay did not initialize `running`, so an `INIT_DELAYED_WORK()` on
+  stack/heap memory that was not already zero (e.g. `drm_sched_init()` on a
+  stack `drm_gpu_scheduler`) made `del_timer_sync()`/`cancel_delayed_work_sync()`
+  wait forever on a stale `running=1`.  Stock `__init_timer()` memsets; the
+  overlay now does too.
+- **`schedule_timeout()` has a pending-wake rendezvous**
+  (`linux/src/linuxkpi/native_sched.c`, `kpi_wake_pending`/`kpi_timeout_active`
+  in `kernel/src/sched/sched.h`): `sched_wakeup()` ignores running threads, so
+  a wake that arrived after the waiter committed to sleeping but before it
+  set `THREAD_SLEEPING` was lost and `schedule_timeout()` returned 0 at its
+  deadline.  `linuxkpi_wake_thread()` now arms a per-thread pending flag while
+  a KPI timeout is active; the sleeper consumes it under the run-queue lock.
+  Waitqueue and kthread-start wakes are deliberately excluded (arming them
+  made every later `msleep` return early).
+- **`struct rb_node` layout matched to stock Linux** (`kernel/src/lib/rbtree.h`,
+  C3): the native struct had `rb_left` before `rb_right` while stock
+  `<linux/rbtree_types.h>` has `rb_right` first.  Imported code embeds the
+  stock layout but calls native `rb_insert_color`/`rb_next`/`rb_first`, so
+  every imported rbtree silently corrupted itself.  The first real user was
+  drm_sched's FIFO run queue (`rb_add_cached` in `drm_sched_rq_update_fifo`):
+  entities were never selected, so jobs sat unsignaled.  Lesson for future
+  imports: any type whose operations are shared between native and imported
+  code must have an identical layout; putting the operations in a renamed
+  native namespace (`asc_*`, as done for radix-tree) is the alternative.
 - **Imported `WARN()`/`BUG()` are decoded from `__bug_table`**
   (`kernel/src/cpu/bug_table.c`, hook in `kernel/src/cpu/isr.c`): stock
   `<asm/bug.h>` emits `ud2` plus a table entry; the native invalid-opcode

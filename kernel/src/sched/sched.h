@@ -167,6 +167,13 @@ struct thread {
   thread_state_t state;
   bool waiting_for_child;       // Blocked specifically inside wait4().
   uint64_t wakeup_ticks;
+  /* KPI timeout-sleep rendezvous; see linuxkpi_schedule_timeout_ms().
+   * kpi_wake_pending is armed by linuxkpi_wake_thread() only while
+   * kpi_timeout_active is set, so wakes that target waitqueue/kthread-start
+   * sleeps (which do not use schedule_timeout) cannot leak into a later
+   * timeout and turn it into an early return. */
+  bool kpi_wake_pending;
+  bool kpi_timeout_active;
   struct thread *deadline_next; // Per-CPU ordered timeout queue link
   bool deadline_queued;
   struct fd_table *files;

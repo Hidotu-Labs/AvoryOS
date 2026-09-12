@@ -6,6 +6,7 @@
  * hardirq context. */
 
 #include <linux/kernel.h>
+#include <linux/string.h>
 #include <linux/types.h>
 
 struct timer_list {
@@ -35,11 +36,14 @@ struct timer_list {
 #define DEFINE_TIMER(_name, _function)                                        \
   struct timer_list _name = __TIMER_INITIALIZER(_function, 0)
 
+/* Stock __init_timer() memsets the timer before assigning the callback; do
+ * the same so embedded/stack-allocated timers cannot inherit a stale
+ * `running` value (del_timer_sync() waits on it). */
 #define timer_setup(timer, callback, _flags)                                  \
   do {                                                                        \
+    memset((timer), 0, sizeof(*(timer)));                                     \
     (timer)->function = (callback);                                           \
     (timer)->flags = (_flags);                                                \
-    (timer)->expires = 0;                                                     \
     INIT_LIST_HEAD(&(timer)->entry);                                          \
   } while (0)
 

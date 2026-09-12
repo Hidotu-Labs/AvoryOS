@@ -31,6 +31,7 @@ extern void linuxkpi_test_phase2_ttm_prep(void);
 extern void linuxkpi_test_phase3_drm(void);
 extern void linuxkpi_test_phase3_drm_modeset(void);
 extern void linuxkpi_test_phase4_ttm(void);
+extern void linuxkpi_test_phase4_sched(void);
 
 static struct completion boot_tests_done;
 
@@ -52,6 +53,7 @@ static int linuxkpi_boot_tests_thread(void *arg) {
   linuxkpi_test_phase3_drm();
   linuxkpi_test_phase3_drm_modeset();
   linuxkpi_test_phase4_ttm();
+  linuxkpi_test_phase4_sched();
 
   complete(&boot_tests_done);
   return 0;
@@ -76,6 +78,6 @@ void linuxkpi_run_boot_tests(void) {
   }
 
   /* Bounded wait: a wedged suite must not hold up the boot. */
-  if (wait_for_completion_timeout(&boot_tests_done, 10000) == 0)
+  if (wait_for_completion_timeout(&boot_tests_done, 30000) == 0)
     klog_puts("[WARN] LinuxKPI: boot self-tests timed out\n");
 }

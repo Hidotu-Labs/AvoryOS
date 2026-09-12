@@ -670,6 +670,47 @@ Open items that C0 must close before Phase 4 exit:
   delta (no pass/fail threshold); an explicit eviction-pressure test
   (pinned vs unpinned) was deferred to C5 where bochs exercises real VRAM.
 
+### C3 — drm_sched self-tests (verified 2026-09-12)
+
+- [x] `kernel/src/tests/linuxkpi/linux/test_phase4_sched.c`: fake backend
+      (`run_job` returns a dma_fence signaled by a delayed work;
+      `timedout_job`/`free_job` callbacks), two direct probes plus four
+      subtests:
+      1. raw `schedule_timeout` + `wake_up_process` probe between two KPI
+         threads;
+      2. `dma_fence` waiter woken by `dma_fence_signal` (the
+         `dma_fence_default_wait`/`wake_up_state` path);
+      3. one job through `drm_sched_init`/entity/job/arm/push → finished
+         fence → entity + scheduler teardown;
+      4. 2 entities × 8 jobs in order;
+      5. hung job → `work_tdr` fires `timedout_job`, then manual signal;
+      6. 16-job stress with exact `free_job` count and PMM delta.
+- [x] Bring-up bugs found and fixed (all in `gaps.md`): `struct rb_node`
+      field order vs stock (FIFO run queue lost entities), `asm/current.h`
+      returning the native thread (dma-fence woke garbage), `timer_setup`
+      not zeroing `running` (teardown hung in `del_timer_sync`), and the
+      `schedule_timeout` lost-wake rendezvous.
+- [x] **Exit evidence** (user-run `make run`, `-smp 4`; the temporary
+      `[DBG]`/counter instrumentation was removed afterwards and the kernel
+      rebuilt clean):
+      ```
+      [LINUXKPI] Phase 4 drm_sched self-test
+      [  OK  ] LinuxKPI: sched timeout probe: schedule_timeout woken by wake_up_process
+      [  OK  ] LinuxKPI: sched wakeup probe: fence waiter woken
+      [  OK  ] LinuxKPI: sched one job signals and completes
+      [  OK  ] LinuxKPI: sched scheduler init/fini clean
+      [  OK  ] LinuxKPI: sched 16 jobs across 2 entities complete in order
+      [  OK  ] LinuxKPI: sched timedout_job fired for a hung job
+      [  OK  ] LinuxKPI: sched hung job completes after the fence is signaled
+      [  OK  ] LinuxKPI: sched stress jobs completed
+      [  OK  ] LinuxKPI: sched every stress job freed exactly once
+      [  OK  ] LinuxKPI: sched stress PMM delta=-1
+      [INFO] LinuxKPI: sched calls run_job=34 signal_work=33 freed=33
+      [  OK  ] LinuxKPI: sched suite complete
+      ```
+      All Phase 0–4 TTM suites still green in the same boot; the boot-test
+      bounded wait is now 30 s (was 10 s) to accommodate the longer suite.
+
 Deviations from the original Phase 4 sketch are recorded in the plan: QEMU
 11.1 has no `mgag200` (bochs is the TTM canary), bochs lives in
 `drivers/gpu/drm/tiny/bochs.c` and is TTM-backed via

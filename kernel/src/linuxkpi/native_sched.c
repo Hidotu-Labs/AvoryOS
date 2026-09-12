@@ -137,7 +137,10 @@ int linuxkpi_schedule_timeout_ms(unsigned long ms) {
   }
 
   uint64_t deadline = lapic_timer_get_ticks() + (uint64_t)ms;
+  bool woken = false;
+
   t->wakeup_ticks = deadline;
+  __atomic_store_n(&t->kpi_timeout_active, true, __ATOMIC_RELEASE);
 
   /* Sleep until the deadline, not just for one scheduler pass.
    *
@@ -150,16 +153,40 @@ int linuxkpi_schedule_timeout_ms(unsigned long ms) {
    *
    * A genuine wakeup (linuxkpi_wake_thread() -> sched_wakeup()) clears
    * wakeup_ticks, which also cancels the sleep here; otherwise the loop
-   * re-blocks until the clock reaches the deadline. */
-  while (lapic_timer_get_ticks() < deadline) {
+   * re-blocks until the clock reaches the deadline.
+   *
+   * The kpi_wake_pending flag catches the other interleaving: the waker may
+   * run while this thread is still THREAD_RUNNING (it has committed to sleep
+   * but not yielded yet), in which case sched_wakeup() ignores it.  The flag
+   * is checked and the sleep state is published under the same run-queue lock
+   * sched_wakeup() takes, so either the waker sees THREAD_SLEEPING or this
+   * loop sees the pending wake. */
+  for (;;) {
+    struct cpu_info *cpu = cpu_get_current();
+    if (cpu)
+      spinlock_acquire(&cpu->queue_lock);
+    if (__atomic_exchange_n(&t->kpi_wake_pending, false, __ATOMIC_ACQ_REL)) {
+      if (cpu)
+        spinlock_release(&cpu->queue_lock);
+      woken = true;
+      break;
+    }
     t->state = THREAD_SLEEPING;
+    if (cpu)
+      spinlock_release(&cpu->queue_lock);
+
     sched_yield();
+
     if (!t->wakeup_ticks)
+      break;
+    if (lapic_timer_get_ticks() >= deadline)
       break;
   }
 
-  bool timed_out = lapic_timer_get_ticks() >= deadline;
+  bool timed_out = !woken && lapic_timer_get_ticks() >= deadline;
   t->wakeup_ticks = 0;
+  __atomic_store_n(&t->kpi_wake_pending, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&t->kpi_timeout_active, false, __ATOMIC_RELEASE);
   /* Timed-out sleeping calls can leave the state as SLEEPING when the idle
    * fallback never switched away; the caller is definitely running now. */
   if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED)
@@ -179,6 +206,12 @@ void linuxkpi_wake_thread(void *thread) {
   struct thread *t = (struct thread *)thread;
   if (!t)
     return;
+
+  /* Remember the wake even if the target is still running; see the field
+   * comment in sched.h.  Only timeout sleeps consume it, so waitqueue and
+   * kthread-start wakes stay out of the way. */
+  if (__atomic_load_n(&t->kpi_timeout_active, __ATOMIC_ACQUIRE))
+    __atomic_store_n(&t->kpi_wake_pending, true, __ATOMIC_RELEASE);
 
   /* sched_wakeup() ignores idle threads: they are the per-CPU fallback task
    * and are never runqueue members.  KPI code can still sleep in the boot

@@ -4,18 +4,24 @@
 /* AvoryOS overlay for <asm/current.h>.
  *
  * The upstream header reads a per-CPU `pcpu_hot` block that does not exist
- * here.  `current` is the calling native thread (linuxkpi_current_thread);
- * the pcpu_hot declaration only exists so <asm/processor.h>'s
- * current_top_of_stack() compiles.  Its fields are not maintained. */
+ * here.  `current` must be the per-thread Linux `task_struct` shadow: imported
+ * code dereferences fields on it (`current->group_leader`, `signal_pending`
+ * needs the shadow so it can find the native thread), and dma-fence stores it
+ * in wait callbacks for wake_up_state().  Returning the native `struct thread`
+ * here corrupts every one of those users.  The pcpu_hot declaration only
+ * exists so <asm/processor.h>'s current_top_of_stack() compiles; its fields
+ * are not maintained. */
 
 #include <linux/types.h>
 
 struct task_struct;
 
-void *linuxkpi_current_thread(void);
+/* Per-thread task_struct shadow for the calling thread (linuxkpi/src/task.c).
+ * Declared directly to keep this header independent of the LinuxKPI headers. */
+void *linuxkpi_current_task(void);
 
 static inline struct task_struct *get_current(void) {
-  return (struct task_struct *)linuxkpi_current_thread();
+  return (struct task_struct *)linuxkpi_current_task();
 }
 
 #define current get_current()
