@@ -30,6 +30,7 @@ extern void linuxkpi_test_phase2_dmabuf(void);
 extern void linuxkpi_test_phase2_ttm_prep(void);
 extern void linuxkpi_test_phase3_drm(void);
 extern void linuxkpi_test_phase3_drm_modeset(void);
+extern void linuxkpi_test_phase4_ttm(void);
 
 static struct completion boot_tests_done;
 
@@ -50,6 +51,7 @@ static int linuxkpi_boot_tests_thread(void *arg) {
   linuxkpi_test_phase2_ttm_prep();
   linuxkpi_test_phase3_drm();
   linuxkpi_test_phase3_drm_modeset();
+  linuxkpi_test_phase4_ttm();
 
   complete(&boot_tests_done);
   return 0;

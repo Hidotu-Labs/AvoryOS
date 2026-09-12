@@ -8,6 +8,19 @@ Update this file in the same change that introduces or closes a gap.
 
 ## Phase 4 gaps (TTM + scheduler bring-up, 2026-09-12)
 
+- **Imported `WARN()`/`BUG()` are decoded from `__bug_table`**
+  (`kernel/src/cpu/bug_table.c`, hook in `kernel/src/cpu/isr.c`): stock
+  `<asm/bug.h>` emits `ud2` plus a table entry; the native invalid-opcode
+  handler had no decoder, so any imported WARN panicked.  WARNs now print
+  `WARNING: at file:line (imported WARN)` and resume at RIP+2;
+  `BUG()`/genuine bad opcodes still panic.  This required
+  `CONFIG_DEBUG_BUGVERBOSE` in `autoconf.h` (12-byte entries with file:line;
+  without it entries are 8 bytes and the decoder would not match).
+  `BUGFLAG_ONCE` is honoured with a 64-entry address registry; the table
+  lives in `.rodata`, which is not written to.
+- **`ww_mutex_trylock()` returns 1/0, not 0/-EBUSY** (see the corrected
+  Phase 3 entry above).  Found by the first C2 boot: TTM's
+  `WARN_ON(!dma_resv_trylock())` fired on every successful trylock.
 - **Page cache-mode API is inert** (`linuxkpi/src/x86_stubs.c`): TTM calls
   `set_pages_wb()`, `set_pages_array_uc()`, `set_pages_array_wc()`,
   `set_pages_array_wb()`, `cachemode2protval()` and `pgprot_writecombine()`.
@@ -135,10 +148,15 @@ Update this file in the same change that introduces or closes a gap.
   upstream register-preserving convention; a C implementation silently
   corrupts live caller registers.
 - **ww_mutex cannot wound** (`linuxkpi/src/ww_mutex.c`): recursive
-  acquisition with the same acquire context now returns `-EALREADY` (as
-  upstream, which DRM's `modeset_lock()` treats as success) and trylock
-  follows the 0/-EBUSY convention, but multi-lock acquire sequences still
-  cannot back off under contention; they rely on the plain mutex FIFO.
+  acquisition with the same acquire context returns `-EALREADY` (as
+  upstream, which DRM's `modeset_lock()` treats as success), but multi-lock
+  acquire sequences still cannot back off under contention; they rely on the
+  plain mutex FIFO.  **Correction (C2, 2026-09-12):** `ww_mutex_trylock()`
+  must return `1` on success and `0` when busy, not `0`/`-EBUSY`: upstream
+  `kernel/locking/mutex.c` and the bool casts in `<linux/dma-resv.h>` /
+  `drm_modeset_lock.c` all rely on the truthy convention.  The Phase 3
+  "0/-EBUSY convention" note was wrong and caused
+  `WARN_ON(!dma_resv_trylock())` to fire in TTM's BO init.
 - **rbtree augmented internals are an excerpt** (`linuxkpi/src/rbtree_aug.c`,
   verbatim upstream `lib/rbtree.c`): native `kernel/src/lib/rbtree.c` still
   owns the base `rb_*` API; importing upstream `lib/rbtree.c` requires

@@ -61,6 +61,9 @@
 #define CONFIG_BASE_SMALL 0
 #define CONFIG_GENERIC_BUG 1
 #define CONFIG_GENERIC_BUG_RELATIVE_POINTERS 1
+/* WARN/BUG entries carry file:line; the native decoder in
+ * kernel/src/cpu/bug_table.c matches that 12-byte layout. */
+#define CONFIG_DEBUG_BUGVERBOSE 1
 #define CONFIG_PRINTK 1
 #define CONFIG_HZ 1000
 #define CONFIG_HZ_1000 1

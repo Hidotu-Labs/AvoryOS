@@ -9,6 +9,7 @@
 #include "../syscalls/syscall.h"
 #include "apic/lapic.h"
 #include "arch/x86_64/extable.h"
+#include "bug_table.h"
 #include "fault.h"
 #include "features.h"
 #include "fpu.h"
@@ -1024,6 +1025,8 @@ static void gpf_handler(struct registers *regs) {
 static void invalid_opcode_handler(struct registers *regs) {
   if ((regs->cs & 0x3) == 0x3) {
     isr_report_user_fault(regs, SIGILL, regs->rip);
+  } else if (asc_bug_handle_invalid_opcode(regs)) {
+    /* Imported WARN(): reported and RIP advanced past the ud2. */
   } else {
     isr_panic(regs, "Unhandled Invalid Opcode");
   }

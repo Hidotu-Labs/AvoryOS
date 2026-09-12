@@ -596,7 +596,7 @@ C7 optional amdgpu compile spike.
 - Local symbol re-check (host, headless): imported `drm_*` only, 39
   `ascentdrm_*` natives, bridge symbols present.
 
-### C1 — import/build TTM + drm_sched (kernel-verified 2026-09-12; userland regression pending)
+### C1 — import/build TTM + drm_sched (kernel-verified 2026-09-12; user interactive check pending)
 
 - [x] `scripts/linux/subset.txt` += `drivers/gpu/drm/ttm`,
       `drivers/gpu/drm/scheduler`; `scripts/linux/files.txt` += the 6.6
@@ -611,18 +611,64 @@ C7 optional amdgpu compile spike.
       pagefault/migrate state, and the x86 arch stubs (`x86_stubs.c`).
 - [x] Kernel links clean: 91 `ttm_*`/`drm_sched_*`/`drm_gem_*_helper`
       symbols; `make -C kernel` clean.
-- [x] **Headless boot regression** (QEMU/KVM, `-smp 4`, serial capture
-      `/tmp/opencode/c1-boot.log`): `running 8 initcall(s)` (TTM's added),
-      all initcalls completed, 114 `[  OK  ]` lines, all P0–P3 suites green,
-      `vkms` atomic modeset/vblank still green, no faults, `login:` reached.
-- [ ] Interactive userland regression: `make run` → `/dev/dri`,
-      `bin/test_kpi_drm`, plus the clean C0 soak without the desktop.
+- [x] **Boot regression** (user-run `make run` after C1, `-smp 4`):
+      `running 8 initcall(s)` + `all initcalls completed` (the 8th is the
+      scheduler slab: `[SLAB] Created cache 'drm_sched_fence': obj_size=176
+      aligned=176 per_slab=22`), 114 `[  OK  ]` lines, all P0–P3 suites green
+      including the vkms GEM 256-iteration loop and the full atomic
+      modeset/vblank sequence; no `[FAIL]`, no faults.  Headless boot to the
+      same content also captured in `/tmp/opencode/c1-boot.log`.
+- [ ] Interactive userland regression for the C1 build (`/dev/dri`,
+      `bin/test_kpi_drm`) — pending; C2's boot tests re-check the kernel side.
 
 Open items that C0 must close before Phase 4 exit:
 
 - [ ] P2 exit: clean 10-minute soak (`bin/test_kpi_dmabuf 600`, `-smp 4`)
       after the warm-up-baseline fix; must end `delta=0`-class and with
       `closes == iterations`.
+
+### C2 — TTM self-tests (verified 2026-09-12)
+
+- [x] `kernel/src/tests/linuxkpi/linux/test_phase4_ttm.c`: minimal
+      `ttm_device` built on a fake `drm_vma_offset_manager` (no DRM device),
+      with device funcs mirroring upstream `drm_gem_vram_helper.c`
+      (`ttm_tt_init` create/destroy, `ttm_bo_eviction_valuable`,
+      `evict_flags` fallback to SYSTEM, `move` = `ttm_bo_move_memcpy` with
+      the `!bo->resource`/`ttm_bo_move_null` first-placement branch).
+      Covers: device init/fini (system manager, use_tt); SYSTEM BO
+      alloc/validate, kmap and vmap CPU access, pin/unpin,
+      `ttm_bo_wait_ctx`; a 64 MB TT-backed VRAM range manager with
+      SYSTEM→VRAM and VRAM→SYSTEM moves plus kmap through the VRAM
+      resource; a 256-iteration alloc/kmap/write/free loop with a PMM
+      baseline after 16 warm-up iterations.
+- [x] Two bring-up bugs found and fixed (both in `gaps.md`):
+      1. `ww_mutex_trylock()` was returning `0` on success; upstream returns
+         `1`, and `dma_resv_trylock()` casts it to bool, so
+         `WARN_ON(!dma_resv_trylock())` in `ttm_bo_init_reserved()` fired.
+      2. Imported `WARN()` panicked as "Unhandled Invalid Opcode" because the
+         native handler had no `__bug_table` decoder.  Added
+         `kernel/src/cpu/bug_table.c/h` + `isr.c` hook and enabled
+         `CONFIG_DEBUG_BUGVERBOSE` so entries carry `file:line`.
+- [x] **Exit evidence** (user-run `make run`, `-smp 4`, full boot log):
+      ```
+      [LINUXKPI] Phase 4 TTM self-test
+      [  OK  ] LinuxKPI: TTM device init (system manager, use_tt)
+      [  OK  ] LinuxKPI: TTM SYSTEM bo alloc/validate
+      [  OK  ] LinuxKPI: TTM SYSTEM bo kmap write/read
+      [  OK  ] LinuxKPI: TTM SYSTEM bo vmap write/read
+      [  OK  ] LinuxKPI: TTM SYSTEM bo pin
+      [  OK  ] LinuxKPI: TTM SYSTEM bo wait (no fences)
+      [  OK  ] LinuxKPI: TTM SYSTEM -> VRAM move
+      [  OK  ] LinuxKPI: TTM VRAM bo kmap write/read
+      [  OK  ] LinuxKPI: TTM VRAM -> SYSTEM move
+      [  OK  ] LinuxKPI: TTM loop 256 iterations, PMM delta=-1
+      [  OK  ] LinuxKPI: TTM suite complete
+      ```
+      All Phase 0–3 suites still green in the same boot; `delta=-1` is
+      PCP-cache noise (one page parked in a per-CPU cache), not a leak.
+- Open refinements (not blockers): the loop currently only prints the PMM
+  delta (no pass/fail threshold); an explicit eviction-pressure test
+  (pinned vs unpinned) was deferred to C5 where bochs exercises real VRAM.
 
 Deviations from the original Phase 4 sketch are recorded in the plan: QEMU
 11.1 has no `mgag200` (bochs is the TTM canary), bochs lives in

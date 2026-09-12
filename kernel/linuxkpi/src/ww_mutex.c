@@ -68,17 +68,20 @@ int ww_mutex_lock_slow_interruptible(struct ww_mutex *lock,
   return ww_mutex_lock_interruptible(lock, ctx);
 }
 
-/* Upstream convention: 0 on success, -EBUSY when the lock is taken. */
+/* Upstream returns 1 when the lock was acquired and 0 when it is busy
+ * (kernel/locking/mutex.c: "Returns 1 if the mutex has been acquired
+ * successfully, 0 otherwise").  The `int` prototype and the bool casts in
+ * <linux/dma-resv.h> / drm_modeset_lock.c both rely on that truthy
+ * convention.  There is deliberately no same-context special case: a
+ * re-trylock by the owning context fails like it would upstream. */
 int ww_mutex_trylock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx) {
-  if (ww_mutex_held_by(lock, ctx))
-    return 0;
   if (!mutex_trylock(&lock->base))
-    return -EBUSY;
+    return 0;
   if (ctx) {
     lock->ctx = ctx;
     ctx->acquired++;
   }
-  return 0;
+  return 1;
 }
 
 void ww_mutex_unlock(struct ww_mutex *lock) {
