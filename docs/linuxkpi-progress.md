@@ -1317,6 +1317,35 @@ Audit findings that shape the work (all detailed in the plan):
 
 ### C4 — 6c: firmware + PSP/SMU/GMC/IH + rings (in progress 2026-09-13)
 
+#### Clean redo of the chunk (2026-09-13, after the 4 h debug session)
+
+The first C4 iteration ended with six hand-patched files under
+`kernel/linux/` (five carrying `kpi-trace` diagnostics; `gfx_v10_0.c` with
+diagnostics plus the two behavior workarounds) and a tree that was hard to
+reason about.  Restarted on a clean base, keeping the green work:
+
+- [x] Whole working tree checkpointed as `0b6e3b2` before touching anything;
+      the imported-tree diffs are preserved under
+      `build/p6-c4-imported-diffs/`.
+- [x] Divergences moved to tracked patches applied by `scripts/linux-import.sh`
+      (`scripts/linux/patches/0001-...soc21..., 0002-...gfx10-kiq...`); the
+      full diagnostics set is the on-demand
+      `scripts/linux/patches/debug/0001-p6-c4-ring-diagnostics.patch`
+      (dry-run verified, never auto-applied).  Details in
+      `docs/linuxkpi-gaps.md` P6 C4.
+- [x] `scripts/linux-import.sh` re-run: pristine v6.6.156 restored, both
+      behavior patches applied, 664 objects regenerated; `nm`/`objdump`
+      unaffected.
+- [x] `make run-c4` no longer bakes `kpi_vfio_test=1`: amdgpu owns the MSI
+      vectors, so the P5 suite only produced a `pci_alloc_irq_vectors(1)
+      (-16)` `[FAIL]`.
+- [x] Kernel rebuilt (only the six touched objects + link, clean); watchdog
+      helper `scripts/run-c4-watchdog.sh` stops QEMU at the first terminal
+      marker (login / IB-test failure / GPU-init failure) for bounded runs.
+- [ ] Next: first boot on the redo build (last boot left the device warm at
+      18:40; the failed-PSP teardown usually lets the next boot proceed) and
+      follow PSP -> SMU -> GMC/IH -> SDMA/GFX ring tests -> gfx IB test.
+
 - [x] Firmware manifest pinned: `scripts/linux/firmware-manifest.txt` lists
       the 11 Raphael blobs verified against **linux-firmware 20260910**
       (the default `LINUX_FIRMWARE_REF`): `gc_10_3_6_{ce,me,mec,mec2,pfp,

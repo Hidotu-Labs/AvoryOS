@@ -24,3 +24,6 @@
 *.raw
 *.vdi
 *.vmdk
+
+# Python bytecode caches
+__pycache__/

@@ -137,6 +137,18 @@ while IFS= read -r path; do
     [ "$matched" -eq 1 ] || die "subset path missing in tree: $path"
 done < "$SUBSET_FILE"
 
+# ── Apply AvoryOS divergence patches ─────────────────────────────────────────
+# kernel/linux/ is a pristine vendor tree.  The few deliberate divergences the
+# build needs live as patch files in scripts/linux/patches/ and are applied on
+# every import so a re-import can never silently lose them.  Debug-only
+# patches stay under scripts/linux/patches/debug/ and are applied by hand.
+PATCH_DIR="$ROOT/scripts/linux/patches"
+for p in "$PATCH_DIR"/*.patch; do
+    [ -e "$p" ] || continue
+    log "applying divergence patch: $(basename "$p")"
+    patch -p1 -d "$DEST" -s < "$p" || die "divergence patch failed: $p"
+done
+
 # ── Generate Makefile.files from scripts/linux/files.txt ─────────────────────
 mapfile -t srcfiles < <(grep -v '^[[:space:]]*\(#\|$\)' "$FILES_FILE")
 [ "${#srcfiles[@]}" -gt 0 ] || die "scripts/linux/files.txt lists no source files"

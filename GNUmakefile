@@ -331,7 +331,7 @@ run-vfio: edk2-ovmf $(IMAGE_NAME).iso disk.img
 # default 0xfff7bfff: GFX power gating loses the MEC/KIQ HQD programming on
 # this guest (doorbells dropped, ring test flaky), and C4 does not need GFXOFF.
 .PHONY: run-c4
-run-c4: KERNEL_CMDLINE = kpi_vfio_test=1 kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.dc=0 amdgpu.ppfeaturemask=0xfff73fff
+run-c4: KERNEL_CMDLINE = kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.dc=0 amdgpu.ppfeaturemask=0xfff73fff
 run-c4: SERIAL = file:build/logs/p6-c4.log
 run-c4: DISPLAY_OPT = -display none
 run-c4: VFIO_EXTRA = -device edu

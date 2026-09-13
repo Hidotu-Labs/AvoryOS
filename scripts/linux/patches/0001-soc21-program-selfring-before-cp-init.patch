@@ -1,0 +1,20 @@
+--- a/drivers/gpu/drm/amd/amdgpu/soc21.c
++++ b/drivers/gpu/drm/amd/amdgpu/soc21.c
+@@ -769,6 +769,17 @@
+ 	/* enable the doorbell aperture */
+ 	adev->nbio.funcs->enable_doorbell_aperture(adev, true);
+ 
++	/* AVORYOS P6 C4: also program the selfring doorbell aperture here,
++	 * before the CP/KIQ init.  Upstream defers it to
++	 * soc21_common_late_init() (which runs after the KIQ ring test) only
++	 * because a successful FB BAR resize can move the aperture; this build
++	 * never resizes the BAR, and without it the KIQ doorbell never reaches
++	 * the HQD on this VFIO guest.  The late_init call stays and is
++	 * idempotent.
++	 */
++	if (adev->nbio.funcs->enable_doorbell_selfring_aperture)
++		adev->nbio.funcs->enable_doorbell_selfring_aperture(adev, true);
++
+ 	return 0;
+ }
+ 

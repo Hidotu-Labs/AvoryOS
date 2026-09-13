@@ -337,6 +337,18 @@ Update this file in the same change that introduces or closes a gap.
   candidate re-enabled ~50 us after the MEC unhalt, before the MEC had
   settled, and its write was lost.  Remove both once the upstream sequence
   handles a stale active HQD (or the host resets the GPU before each guest).
+- **Imported-tree divergences are tracked patches, not hand edits** (C4
+  redo, 2026-09-13): the first C4 iteration had edited six files under
+  `kernel/linux/` directly (the two behavior changes above plus
+  `kpi-trace` diagnostics).  They now live in
+  `scripts/linux/patches/0001-soc21-program-selfring-before-cp-init.patch`
+  and
+  `scripts/linux/patches/0002-gfx10-kiq-stale-hqd-and-doorbell-reprogram.patch`;
+  `scripts/linux-import.sh` applies every `patches/*.patch` on import and
+  aborts if one fails to apply.  The diagnostic set (CP/HQD/KIQ/IB dumps)
+  is an on-demand patch in `scripts/linux/patches/debug/` and is never
+  applied automatically.  `build/p6-c4-imported-diffs/` keeps the original
+  hand-edit diffs for reference.
 
 ## Phase 5 gaps (full I/O foundations)
 

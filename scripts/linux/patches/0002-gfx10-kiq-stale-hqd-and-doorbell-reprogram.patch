@@ -1,0 +1,69 @@
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+@@ -6632,6 +6632,17 @@
+ 				break;
+ 			udelay(1);
+ 		}
++		/* AVORYOS P6 C4: a PCI/VFIO reset does not reset the CP, so a
++		 * previous boot can leave this HQD active.  While the MEC is
++		 * halted the dequeue request above cannot complete, and the
++		 * half-deactivated queue then silently drops the doorbell
++		 * programming below (KIQ ring test times out with dbctl=0).
++		 * Force the queue inactive and clear the pending request
++		 * before reprogramming it. */
++		if (RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE) & 1) {
++			WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST, 0);
++			WREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE, 0);
++		}
+ 		WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST,
+ 		       mqd->cp_hqd_dequeue_request);
+ 		WREG32_SOC15(GC, 0, mmCP_HQD_PQ_RPTR,
+@@ -6812,6 +6823,36 @@
+ 	return 0;
+ }
+ 
++/* AVORYOS P6 C4: (re)program the KIQ HQD doorbell aperture.
++ *
++ * gfx_v10_0_kiq_init_register() programs the HQD while the MEC is still
++ * halted, and on this ASIC that doorbell programming does not survive the
++ * MEC start: the KIQ ring test then reads dbctl=0 and times out without the
++ * ring ever being fetched.  Re-assert DOORBELL_EN/DOORBELL_OFFSET once the
++ * MEC has had the whole KCQ-init window to come up, immediately before the
++ * ring test.  This is the same "activate the doorbell after the HQD load"
++ * ordering the KFD queue path uses; it is a no-op when EN is already set,
++ * and DOORBELL_HIT is deliberately left untouched. */
++static void gfx_v10_0_kiq_reprogram_doorbell(struct amdgpu_device *adev)
++{
++	struct amdgpu_ring *ring = &adev->gfx.kiq[0].ring;
++	u32 dbctl;
++
++	if (!ring->use_doorbell)
++		return;
++
++	mutex_lock(&adev->srbm_mutex);
++	nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
++	dbctl = RREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL);
++	dbctl = REG_SET_FIELD(dbctl, CP_HQD_PQ_DOORBELL_CONTROL,
++			      DOORBELL_EN, 1);
++	dbctl = REG_SET_FIELD(dbctl, CP_HQD_PQ_DOORBELL_CONTROL,
++			      DOORBELL_OFFSET, ring->doorbell_index);
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL, dbctl);
++	nv_grbm_select(adev, 0, 0, 0, 0);
++	mutex_unlock(&adev->srbm_mutex);
++}
++
+ static int gfx_v10_0_kcq_resume(struct amdgpu_device *adev)
+ {
+ 	struct amdgpu_ring *ring = NULL;
+@@ -6836,6 +6877,11 @@
+ 			goto done;
+ 	}
+ 
++	/* AVORYOS P6 C4: the MEC has been running for the KCQ-init window
++	 * now; make sure the KIQ doorbell survived it before the ring test. */
++	if (!adev->enable_mes_kiq)
++		gfx_v10_0_kiq_reprogram_doorbell(adev);
++
+ 	r = amdgpu_gfx_enable_kcq(adev, 0);
+ done:
+ 	return r;

@@ -1,0 +1,483 @@
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -625,6 +625,14 @@
+ 						 &adev->gfx.compute_ring[j]);
+ 	}
+ 
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace[enable-kcq]: num_compute=%d queue_mask=%llx kiq_wptr=%llu idx=%u\n",
++		 adev->gfx.num_compute_rings,
++		 (unsigned long long)queue_mask,
++		 (unsigned long long)kiq_ring->wptr,
++		 kiq_ring->doorbell_index);
++
+ 	r = amdgpu_ring_test_helper(kiq_ring);
+ 	spin_unlock(&kiq->ring_lock);
+ 	if (r)
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c
+@@ -2941,6 +2941,11 @@
+ 	ret = psp_cmd_submit_buf(psp, NULL, cmd,
+ 				 psp->fence_buf_mc_addr);
+ 
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(psp->adev->dev,
++		 "kpi-trace[psp-autoload]: ret=%d status=%08x\n",
++		 ret, cmd->resp.status);
++
+ 	release_psp_cmd_buf(psp);
+ 
+ 	return ret;
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+@@ -34,6 +34,7 @@
+ 
+ #include "gc/gc_10_1_0_offset.h"
+ #include "gc/gc_10_1_0_sh_mask.h"
++#include <linuxkpi/native_mm.h>		/* AVORYOS P6 C4 debug */
+ #include "smuio/smuio_11_0_0_offset.h"
+ #include "smuio/smuio_11_0_0_sh_mask.h"
+ #include "navi10_enum.h"
+@@ -3763,6 +3764,56 @@
+ 	amdgpu_ring_write(ring, inv); /* poll interval */
+ }
+ 
++/* AVORYOS P6 C4 debug (temporary): one-line CP/MEC/RLC state dump.
++ *
++ * Deliberately restricted to registers the driver reads elsewhere (or that
++ * this boot already read): CP_MEC_CNTL/CP_CPC_STATUS/MEC instruction pointers
++ * and the CP header-dump registers are NOT safely readable here and hang the
++ * GPU on a read.  CPC_BUSY/RLC_BUSY from GRBM_STATUS2 carry the MEC/RLC
++ * liveness information instead. */
++static void gfx_v10_0_kpi_cp_dump(struct amdgpu_device *adev, const char *tag)
++{
++	u32 cp_stat = RREG32_SOC15(GC, 0, mmCP_STAT);
++	u32 grbm = RREG32_SOC15(GC, 0, mmGRBM_STATUS);
++	u32 grbm2 = RREG32_SOC15(GC, 0, mmGRBM_STATUS2);
++
++	dev_info(adev->dev,
++		 "kpi-trace[%s]: cp_stat=%08x grbm=%08x grbm2=%08x cpc_busy=%u rlc_busy=%u me_busy=%u pf_busy=%u ce_busy=%u me_cntl=%08x rlc_cntl=%08x rlc_stat=%08x boot=%08x\n",
++		 tag, cp_stat, grbm, grbm2,
++		 REG_GET_FIELD(grbm2, GRBM_STATUS2, CPC_BUSY),
++		 REG_GET_FIELD(grbm2, GRBM_STATUS2, RLC_BUSY),
++		 REG_GET_FIELD(cp_stat, CP_STAT, ME_BUSY),
++		 REG_GET_FIELD(cp_stat, CP_STAT, PFP_BUSY),
++		 REG_GET_FIELD(cp_stat, CP_STAT, CE_BUSY),
++		 RREG32_SOC15(GC, 0, mmCP_ME_CNTL),
++		 RREG32_SOC15(GC, 0, mmRLC_CNTL),
++		 RREG32_SOC15(GC, 0, mmRLC_STAT),
++		 RREG32_SOC15(GC, 0, mmRLC_RLCS_BOOTLOAD_STATUS));
++}
++
++/* AVORYOS P6 C4 debug (temporary): one-line KIQ HQD dump. */
++static void gfx_v10_0_kpi_hqd_dump(struct amdgpu_device *adev,
++				   struct amdgpu_ring *ring, const char *tag)
++{
++	u32 active, wptr, rptr, dbctl, pqb, pqctl;
++
++	mutex_lock(&adev->srbm_mutex);
++	nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
++	active = RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE);
++	wptr = RREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_LO);
++	rptr = RREG32_SOC15(GC, 0, mmCP_HQD_PQ_RPTR);
++	dbctl = RREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL);
++	pqb = RREG32_SOC15(GC, 0, mmCP_HQD_PQ_BASE);
++	pqctl = RREG32_SOC15(GC, 0, mmCP_HQD_PQ_CONTROL);
++	nv_grbm_select(adev, 0, 0, 0, 0);
++	mutex_unlock(&adev->srbm_mutex);
++
++	dev_info(adev->dev,
++		 "kpi-trace[%s]: hqd me=%u pipe=%u q=%u active=%08x wptr=%08x rptr=%08x dbctl=%08x pqb=%08x pqctl=%08x\n",
++		 tag, ring->me, ring->pipe, ring->queue, active, wptr, rptr,
++		 dbctl, pqb, pqctl);
++}
++
+ static int gfx_v10_0_ring_test_ring(struct amdgpu_ring *ring)
+ {
+ 	struct amdgpu_device *adev = ring->adev;
+@@ -3771,6 +3822,17 @@
+ 	unsigned int i;
+ 	int r;
+ 
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace[test-entry]: ring=%s type=%d wptr=%llu gpu_addr=%llx db=%d/%u scratch_off=%x\n",
++		 ring->name, (int)ring->funcs->type,
++		 (unsigned long long)ring->wptr,
++		 (unsigned long long)ring->gpu_addr, ring->use_doorbell,
++		 ring->doorbell_index, scratch);
++	gfx_v10_0_kpi_cp_dump(adev, "test-entry");
++	if (ring->funcs->type == AMDGPU_RING_TYPE_KIQ)
++		gfx_v10_0_kpi_hqd_dump(adev, ring, "test-entry");
++
+ 	WREG32(scratch, 0xCAFEDEAD);
+ 	r = amdgpu_ring_alloc(ring, 3);
+ 	if (r) {
+@@ -3785,19 +3847,72 @@
+ 	amdgpu_ring_write(ring, 0xDEADBEEF);
+ 	amdgpu_ring_commit(ring);
+ 
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace[test-committed]: ring=%s wptr=%llu doorbell_idx=%u db_bo_off=%llx db_cpu=%llx\n",
++		 ring->name, (unsigned long long)ring->wptr,
++		 ring->doorbell_index,
++		 adev->doorbell.kernel_doorbells ?
++			(unsigned long long)amdgpu_bo_gpu_offset_no_check(
++				adev->doorbell.kernel_doorbells) : 0,
++		 (unsigned long long)(uintptr_t)
++			(adev->doorbell.cpu_addr ?
++			 adev->doorbell.cpu_addr + ring->doorbell_index :
++			 NULL));
++	if (ring->funcs->type == AMDGPU_RING_TYPE_KIQ)
++		gfx_v10_0_kpi_hqd_dump(adev, ring, "test-committed");
++
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+ 		tmp = RREG32(scratch);
+ 		if (tmp == 0xDEADBEEF)
+ 			break;
++		if (!(i % 10000))
++			dev_info(adev->dev,
++				 "kpi-trace[test-poll]: i=%u scratch=%08x\n",
++				 i, tmp);
+ 		if (amdgpu_emu_mode == 1)
+ 			msleep(1);
+ 		else
+ 			udelay(1);
+ 	}
++	if (tmp == 0xDEADBEEF)
++		dev_info(adev->dev,
++			 "kpi-trace[test-poll]: success at i=%u scratch=%08x\n",
++			 i, tmp);
++
++	if (i >= adev->usec_timeout) {
++		u64 cpu_pa = 0, gart_pte = 0, doorbell_gpu_off = 0;
+ 
+-	if (i >= adev->usec_timeout)
+ 		r = -ETIMEDOUT;
+ 
++		/* AVORYOS P6 C4 debug (temporary): HQD plus the safe CP/RLC
++		 * state (see gfx_v10_0_kpi_cp_dump). */
++		dev_info(adev->dev,
++			 "kpi-kiq-test: %s timeout wptr=%llu db=%d/%u scratch=%08x\n",
++			 ring->name, (unsigned long long)ring->wptr,
++			 ring->use_doorbell, ring->doorbell_index, tmp);
++		gfx_v10_0_kpi_hqd_dump(adev, ring, "test-timeout");
++		gfx_v10_0_kpi_cp_dump(adev, "test-timeout");
++
++		if (adev->doorbell.kernel_doorbells)
++			doorbell_gpu_off = amdgpu_bo_gpu_offset_no_check(
++				adev->doorbell.kernel_doorbells);
++		cpu_pa = asc_vmm_virt_to_phys(asc_vmm_get_kernel_pml4(),
++					      (uint64_t)(uintptr_t)ring->ring);
++		if (adev->gart.ptr && ring->gpu_addr)
++			gart_pte = ((u64 *)adev->gart.ptr)[ring->gpu_addr >> 12];
++
++		dev_info(adev->dev,
++			 "kpi-kiq-test: db_bo_off=%llx db_index=%llu ring=%llx cpu_pa=%llx pte=%llx ring[0..3]=%08x %08x %08x %08x\n",
++			 (unsigned long long)doorbell_gpu_off,
++			 (unsigned long long)ring->doorbell_index,
++			 (unsigned long long)(uintptr_t)ring->ring,
++			 (unsigned long long)cpu_pa,
++			 (unsigned long long)gart_pte,
++			 ring->ring[0], ring->ring[1], ring->ring[2],
++			 ring->ring[3]);
++	}
++
+ 	return r;
+ }
+ 
+@@ -3855,6 +3970,21 @@
+ 
+ 	r = dma_fence_wait_timeout(f, false, timeout);
+ 	if (r == 0) {
++		/* AVORYOS P6 C4 debug (temporary): distinguish "the CP never
++		 * executed the IB" (wb still cafedead) from "the CP executed
++		 * but the fence was never signaled" (wb deadbeef). */
++		dev_info(adev->dev,
++			 "kpi-ib: %s timeout signaled=%d seq=%llu sync_seq=%u last_seq=%u fence_mem=%08x wb=%08x wptr=%llu fallback=%d\n",
++			 ring->name, dma_fence_is_signaled(f),
++			 (unsigned long long)f->seqno,
++			 ring->fence_drv.sync_seq,
++			 atomic_read(&ring->fence_drv.last_seq),
++			 ring->fence_drv.cpu_addr ?
++				le32_to_cpu(*(__le32 *)ring->fence_drv.cpu_addr) :
++				0xffffffff,
++			 le32_to_cpu(*cpu_ptr),
++			 (unsigned long long)ring->wptr,
++			 timer_pending(&ring->fence_drv.fallback_timer));
+ 		r = -ETIMEDOUT;
+ 		goto err2;
+ 	} else if (r < 0) {
+@@ -5615,6 +5745,14 @@
+ 	uint32_t bootload_status;
+ 	int i, r;
+ 
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace[autoload-wait-entry]: cp_stat=%08x boot=%08x rlc_cntl=%08x rlc_stat=%08x\n",
++		 RREG32_SOC15(GC, 0, mmCP_STAT),
++		 RREG32_SOC15(GC, 0, mmRLC_RLCS_BOOTLOAD_STATUS),
++		 RREG32_SOC15(GC, 0, mmRLC_CNTL),
++		 RREG32_SOC15(GC, 0, mmRLC_STAT));
++
+ 	for (i = 0; i < adev->usec_timeout; i++) {
+ 		cp_status = RREG32_SOC15(GC, 0, mmCP_STAT);
+ 		bootload_status = RREG32_SOC15(GC, 0, mmRLC_RLCS_BOOTLOAD_STATUS);
+@@ -5626,6 +5764,11 @@
+ 		udelay(1);
+ 	}
+ 
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace[autoload-wait-exit]: i=%d cp_stat=%08x boot=%08x load_type=%d\n",
++		 i, cp_status, bootload_status, adev->firmware.load_type);
++
+ 	if (i >= adev->usec_timeout) {
+ 		dev_err(adev->dev, "rlc autoload: gc ucode autoload timeout\n");
+ 		return -ETIMEDOUT;
+@@ -6223,6 +6366,10 @@
+ 		adev->gfx.kiq[0].ring.sched.ready = false;
+ 	}
+ 	udelay(50);
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev, "kpi-trace[compute-enable]: enable=%d\n", enable);
++	gfx_v10_0_kpi_cp_dump(adev, enable ? "compute-enable-on" :
++						       "compute-enable-off");
+ }
+ 
+ static int gfx_v10_0_cp_compute_load_microcode(struct amdgpu_device *adev)
+@@ -6617,6 +6764,9 @@
+ 	struct v10_compute_mqd *mqd = ring->mqd_ptr;
+ 	int j;
+ 
++	/* AVORYOS P6 C4 debug (temporary) */
++	gfx_v10_0_kpi_hqd_dump(adev, ring, "kiq-init-reg-entry");
++
+ 	/* inactivate the queue */
+ 	if (amdgpu_sriov_vf(adev))
+ 		WREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE, 0);
+@@ -6708,6 +6858,12 @@
+ 
+ 	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL,
+ 	       mqd->cp_hqd_pq_doorbell_control);
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace: kiq dbctl wrote=%08x read=%08x active=%08x\n",
++		 mqd->cp_hqd_pq_doorbell_control,
++		 RREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL),
++		 RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE));
+ 
+ 	/* reset read and write pointers, similar to CP_RB0_WPTR/_RPTR */
+ 	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_LO,
+@@ -6728,6 +6884,14 @@
+ 	if (ring->use_doorbell)
+ 		WREG32_FIELD15(GC, 0, CP_PQ_STATUS, DOORBELL_ENABLE, 1);
+ 
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace: kiq activated active=%08x dbctl=%08x wptr=%08x pq_status=%08x\n",
++		 RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE),
++		 RREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL),
++		 RREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_LO),
++		 RREG32_SOC15(GC, 0, mmCP_PQ_STATUS));
++
+ 	return 0;
+ }
+ 
+@@ -6759,10 +6923,26 @@
+ 		mutex_lock(&adev->srbm_mutex);
+ 		nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
+ 		amdgpu_ring_init_mqd(ring);
++		/* AVORYOS P6 C4 debug (temporary).  The KIQ MQD is in VRAM
++		 * (AMDGPU_GEM_DOMAIN_VRAM | GTT, first-fit), so only the ring
++		 * address has a GART PTE. */
++		dev_info(adev->dev,
++			 "kpi-trace[kiq-mqd]: dbctl=%08x pqbase_lo=%08x pqbase_hi=%08x active=%08x wptr=%08x mqd_gpu=%llx ring_gpu=%llx ring_pte=%llx\n",
++			 mqd->cp_hqd_pq_doorbell_control,
++			 mqd->cp_hqd_pq_base_lo, mqd->cp_hqd_pq_base_hi,
++			 mqd->cp_hqd_active, mqd->cp_hqd_pq_wptr_lo,
++			 (unsigned long long)ring->mqd_gpu_addr,
++			 (unsigned long long)ring->gpu_addr,
++			 (unsigned long long)(adev->gart.ptr &&
++				ring->gpu_addr ?
++				((u64 *)adev->gart.ptr)
++					[ring->gpu_addr >> 12] : 0));
+ 		gfx_v10_0_kiq_init_register(ring);
+ 		nv_grbm_select(adev, 0, 0, 0, 0);
+ 		mutex_unlock(&adev->srbm_mutex);
+ 
++		gfx_v10_0_kpi_hqd_dump(adev, ring, "kiq-init-done");
++
+ 		if (adev->gfx.kiq[0].mqd_backup)
+ 			memcpy_fromio(adev->gfx.kiq[0].mqd_backup, mqd, sizeof(*mqd));
+ 	}
+@@ -6816,7 +6996,16 @@
+ 		return r;
+ 	}
+ 
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace[kiq-resume]: mqd_gpu=%llx ring_gpu=%llx wptr=%llu use_doorbell=%d idx=%u\n",
++		 (unsigned long long)ring->mqd_gpu_addr,
++		 (unsigned long long)ring->gpu_addr,
++		 (unsigned long long)ring->wptr, ring->use_doorbell,
++		 ring->doorbell_index);
++	gfx_v10_0_kpi_cp_dump(adev, "kiq-resume-before");
+ 	gfx_v10_0_kiq_init_queue(ring);
++
+ 	amdgpu_bo_kunmap(ring->mqd_obj);
+ 	ring->mqd_ptr = NULL;
+ 	amdgpu_bo_unreserve(ring->mqd_obj);
+@@ -6849,6 +7038,11 @@
+ 	dbctl = REG_SET_FIELD(dbctl, CP_HQD_PQ_DOORBELL_CONTROL,
+ 			      DOORBELL_OFFSET, ring->doorbell_index);
+ 	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL, dbctl);
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace: kiq late dbctl wrote=%08x read=%08x active=%08x\n",
++		 dbctl, RREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL),
++		 RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE));
+ 	nv_grbm_select(adev, 0, 0, 0, 0);
+ 	mutex_unlock(&adev->srbm_mutex);
+ }
+@@ -6858,7 +7052,9 @@
+ 	struct amdgpu_ring *ring = NULL;
+ 	int r = 0, i;
+ 
++	gfx_v10_0_kpi_cp_dump(adev, "kcq-resume-entry");
+ 	gfx_v10_0_cp_compute_enable(adev, true);
++	gfx_v10_0_kpi_cp_dump(adev, "kcq-after-unhalt");
+ 
+ 	for (i = 0; i < adev->gfx.num_compute_rings; i++) {
+ 		ring = &adev->gfx.compute_ring[i];
+@@ -6882,6 +7078,11 @@
+ 	if (!adev->enable_mes_kiq)
+ 		gfx_v10_0_kiq_reprogram_doorbell(adev);
+ 
++	/* AVORYOS P6 C4 debug (temporary) */
++	gfx_v10_0_kpi_cp_dump(adev, "kcq-before-ringtest");
++	gfx_v10_0_kpi_hqd_dump(adev, &adev->gfx.kiq[0].ring,
++			       "kcq-before-ringtest");
++
+ 	r = amdgpu_gfx_enable_kcq(adev, 0);
+ done:
+ 	return r;
+@@ -6910,10 +7111,13 @@
+ 		r = amdgpu_mes_kiq_hw_init(adev);
+ 	else
+ 		r = gfx_v10_0_kiq_resume(adev);
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev, "kpi-trace[cp-resume]: kiq_resume=%d\n", r);
+ 	if (r)
+ 		return r;
+ 
+ 	r = gfx_v10_0_kcq_resume(adev);
++	dev_info(adev->dev, "kpi-trace[cp-resume]: kcq_resume=%d\n", r);
+ 	if (r)
+ 		return r;
+ 
+@@ -8290,6 +8494,21 @@
+ 		if (ring->use_doorbell) {
+ 			atomic64_set((atomic64_t *)ring->wptr_cpu_addr,
+ 				     ring->wptr);
++			/* AVORYOS P6 C4 debug (temporary) */
++			if (ring->funcs->type == AMDGPU_RING_TYPE_KIQ)
++				dev_info(adev->dev,
++					 "kpi-trace[wdoorbell]: ring=%s idx=%u val=%llu cpu=%llx bo_off=%llx\n",
++					 ring->name, ring->doorbell_index,
++					 (unsigned long long)ring->wptr,
++					 (unsigned long long)(uintptr_t)
++						(adev->doorbell.cpu_addr ?
++						 adev->doorbell.cpu_addr +
++						 ring->doorbell_index : NULL),
++					 adev->doorbell.kernel_doorbells ?
++						(unsigned long long)
++						amdgpu_bo_gpu_offset_no_check(
++						 adev->doorbell.kernel_doorbells)
++						: 0);
+ 			WDOORBELL64(ring->doorbell_index, ring->wptr);
+ 		} else {
+ 			BUG(); /* only DOORBELL method supported on gfx10 now */
+--- a/drivers/gpu/drm/amd/amdgpu/hdp_v4_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/hdp_v4_0.c
+@@ -48,6 +48,12 @@
+ 		 */
+ 		if (adev->nbio.funcs->get_memsize)
+ 			adev->nbio.funcs->get_memsize(adev);
++		/* AVORYOS P6 C4 debug (temporary) */
++		dev_info(adev->dev,
++			 "kpi-trace[hdp-flush]: remap_off=%08x memsize=%08x\n",
++			 adev->rmmio_remap.reg_offset,
++			 adev->nbio.funcs->get_memsize ?
++				adev->nbio.funcs->get_memsize(adev) : 0);
+ 	} else {
+ 		amdgpu_ring_emit_wreg(ring, (adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL) >> 2, 0);
+ 	}
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c
+@@ -158,6 +158,11 @@
+ 			    BIF_DOORBELL_APER_EN, enable ? 1 : 0);
+ 
+ 	WREG32_SOC15(NBIO, 0, regRCC_DEV0_EPF0_0_RCC_DOORBELL_APER_EN, reg);
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace[nbio-db-aper]: enable=%d cntl=%08x\n",
++		 enable, RREG32_SOC15(NBIO, 0,
++			regRCC_DEV0_EPF0_0_RCC_DOORBELL_APER_EN));
+ }
+ 
+ static void nbio_v7_2_enable_doorbell_selfring_aperture(struct amdgpu_device *adev,
+@@ -183,6 +188,17 @@
+ 
+ 	WREG32_SOC15(NBIO, 0, regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_CNTL,
+ 		tmp);
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace[nbio-selfring]: enable=%d cntl=%08x base_lo=%08x base_hi=%08x doorbell_base=%llx\n",
++		 enable,
++		 RREG32_SOC15(NBIO, 0,
++			regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_CNTL),
++		 RREG32_SOC15(NBIO, 0,
++			regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_LOW),
++		 RREG32_SOC15(NBIO, 0,
++			regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_HIGH),
++		 (unsigned long long)adev->doorbell.base);
+ }
+ 
+ 
+--- a/drivers/gpu/drm/amd/amdgpu/soc21.c
++++ b/drivers/gpu/drm/amd/amdgpu/soc21.c
+@@ -771,14 +771,24 @@
+ 
+ 	/* AVORYOS P6 C4: also program the selfring doorbell aperture here,
+ 	 * before the CP/KIQ init.  Upstream defers it to
+-	 * soc21_common_late_init() (which runs after the KIQ ring test) only
+-	 * because a successful FB BAR resize can move the aperture; this build
+-	 * never resizes the BAR, and without it the KIQ doorbell never reaches
+-	 * the HQD on this VFIO guest.  The late_init call stays and is
+-	 * idempotent.
+-	 */
+-	if (adev->nbio.funcs->enable_doorbell_selfring_aperture)
++	 * soc21_common_late_init() (after the KIQ ring test) only because a
++	 * successful FB BAR resize can move the aperture; this build never
++	 * resizes the BAR, and without it the KIQ doorbell never reaches the
++	 * HQD on this VFIO guest.  The late_init call stays and is idempotent. */
++	if (adev->nbio.funcs->enable_doorbell_selfring_aperture) {
++		/* AVORYOS P6 C4 debug (temporary) */
++		dev_info(adev->dev,
++			 "kpi-trace[soc21-hw-init]: selfring ptr=%llx calling\n",
++			 (unsigned long long)(uintptr_t)
++				adev->nbio.funcs
++					->enable_doorbell_selfring_aperture);
+ 		adev->nbio.funcs->enable_doorbell_selfring_aperture(adev, true);
++		dev_info(adev->dev,
++			 "kpi-trace[soc21-hw-init]: selfring call returned\n");
++	} else {
++		dev_info(adev->dev,
++			 "kpi-trace[soc21-hw-init]: selfring ptr NULL\n");
++	}
+ 
+ 	return 0;
+ }
