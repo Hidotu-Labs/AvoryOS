@@ -347,10 +347,18 @@ Update this file in the same change that introduces or closes a gap.
   the unhalt the same dbctl write sticks (read=40000000), proving the CP
   block rejects the pre-unhalt writes; the KIQ HQD is then empty and the
   ring test times out with the doorbell enabled and `CP_HQD_ACTIVE=0`.
-  Workaround: `gfx_v10_0_kiq_reload_hqd()` re-runs the HQD load (reserve +
-  kmap + `gfx_v10_0_kiq_init_queue()`) from `gfx_v10_0_kcq_resume()` after
-  the unhalt; it mirrors the upstream compute-KCQ ordering.  Remove once
-  the pre-MEC writes are known to stick (host cold-start handling).
+  Workaround: `gfx_v10_0_kiq_reload_hqd()` re-loads the HQD from
+  `gfx_v10_0_kcq_resume()` after the unhalt; it mirrors the upstream
+  compute-KCQ ordering.  The reload is deliberately **write-only**
+  (`gfx_v10_0_kiq_load_hqd_writes()`): once the MEC is running, a CP
+  register *read* hangs the guest - the first pinpoint boot hung on the
+  `WREG32_FIELD15(CP_PQ_WPTR_POLL_CNTL, EN, 0)` read-modify-write inside
+  `gfx_v10_0_kiq_init_register()` (its `poll-cntl done` trace never
+  printed).  The MQD already holds every value from the pre-MEC
+  `amdgpu_ring_init_mqd()` pass, so the reload writes them directly
+  (`CP_PQ_WPTR_POLL_CNTL = 0`, `CP_PQ_STATUS = DOORBELL_ENABLE`) and does
+  not call `gfx_v10_0_kiq_init_queue()` again.  Remove both once the
+  pre-MEC writes are known to stick (host cold-start handling).
 - **Imported-tree divergences are tracked patches, not hand edits** (C4
   redo, 2026-09-13): the first C4 iteration had edited six files under
   `kernel/linux/` directly (behavior changes plus `kpi-trace` diagnostics).

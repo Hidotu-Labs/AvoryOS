@@ -18,25 +18,73 @@
  		WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST,
  		       mqd->cp_hqd_dequeue_request);
  		WREG32_SOC15(GC, 0, mmCP_HQD_PQ_RPTR,
-@@ -6812,6 +6823,38 @@
+@@ -6812,6 +6823,94 @@
  	return 0;
  }
  
-+/* AVORYOS P6 C4: re-load the KIQ HQD after the MEC starts.
++/* AVORYOS P6 C4: re-load the KIQ HQD after the MEC starts, write-only.
 + *
-+ * On this VFIO guest the CP block silently drops CP_HQD_* register writes
-+ * made while the MEC is halted: gfx_v10_0_kiq_init_register() runs from
-+ * gfx_v10_0_kiq_resume() before gfx_v10_0_cp_compute_enable(true), and every
-+ * write reads back 0 (dbctl=0, active=0, pq_base=0).  The compute KCQ HQDs
-+ * are programmed after the MEC start and stick; the KIQ HQD was not, so the
-+ * KIQ ring test then times out with the doorbell enabled but no queue
-+ * active.  Re-run the HQD load now that the MEC is running.  This mirrors
-+ * the upstream compute-KCQ ordering; remove once the pre-MEC writes are
-+ * known to stick (host cold-start handling).
++ * Two environment facts force this: CP_HQD_* *writes* made while the MEC is
++ * halted are dropped (gfx_v10_0_kiq_init_register() runs from
++ * gfx_v10_0_kiq_resume() before gfx_v10_0_cp_compute_enable(true) and every
++ * write reads back 0), and once the MEC is running a CP register *read*
++ * (the CP_PQ_WPTR_POLL_CNTL read-modify-write in kiq_init_register) hangs
++ * the guest.  The MQD in memory already holds every value from the pre-MEC
++ * amdgpu_ring_init_mqd() pass, so load the HQD registers from it with plain
++ * writes and no reads.  This mirrors the upstream compute-KCQ ordering
++ * (queues are armed after the MEC starts); remove once the pre-MEC writes
++ * are known to stick (host cold-start handling).
 + */
++static void gfx_v10_0_kiq_load_hqd_writes(struct amdgpu_device *adev,
++					  struct amdgpu_ring *ring,
++					  struct v10_compute_mqd *mqd)
++{
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL, 0);
++	WREG32_SOC15(GC, 0, mmCP_HQD_EOP_BASE_ADDR,
++		     mqd->cp_hqd_eop_base_addr_lo);
++	WREG32_SOC15(GC, 0, mmCP_HQD_EOP_BASE_ADDR_HI,
++		     mqd->cp_hqd_eop_base_addr_hi);
++	WREG32_SOC15(GC, 0, mmCP_HQD_EOP_CONTROL, mqd->cp_hqd_eop_control);
++	WREG32_SOC15(GC, 0, mmCP_MQD_BASE_ADDR, mqd->cp_mqd_base_addr_lo);
++	WREG32_SOC15(GC, 0, mmCP_MQD_BASE_ADDR_HI, mqd->cp_mqd_base_addr_hi);
++	WREG32_SOC15(GC, 0, mmCP_MQD_CONTROL, mqd->cp_mqd_control);
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_BASE, mqd->cp_hqd_pq_base_lo);
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_BASE_HI, mqd->cp_hqd_pq_base_hi);
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_CONTROL, mqd->cp_hqd_pq_control);
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_RPTR_REPORT_ADDR,
++		     mqd->cp_hqd_pq_rptr_report_addr_lo);
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_RPTR_REPORT_ADDR_HI,
++		     mqd->cp_hqd_pq_rptr_report_addr_hi);
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_POLL_ADDR,
++		     mqd->cp_hqd_pq_wptr_poll_addr_lo);
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_POLL_ADDR_HI,
++		     mqd->cp_hqd_pq_wptr_poll_addr_hi);
++	if (ring->use_doorbell) {
++		WREG32_SOC15(GC, 0, mmCP_MEC_DOORBELL_RANGE_LOWER,
++			     (adev->doorbell_index.kiq * 2) << 2);
++		WREG32_SOC15(GC, 0, mmCP_MEC_DOORBELL_RANGE_UPPER,
++			     (adev->doorbell_index.userqueue_end * 2) << 2);
++	}
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL,
++		     mqd->cp_hqd_pq_doorbell_control);
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_LO, mqd->cp_hqd_pq_wptr_lo);
++	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_HI, mqd->cp_hqd_pq_wptr_hi);
++	WREG32_SOC15(GC, 0, mmCP_HQD_VMID, mqd->cp_hqd_vmid);
++	WREG32_SOC15(GC, 0, mmCP_HQD_PERSISTENT_STATE,
++		     mqd->cp_hqd_persistent_state);
++	/* disable wptr polling without reading the register */
++	WREG32_SOC15(GC, 0, mmCP_PQ_WPTR_POLL_CNTL, 0);
++	/* activate the queue */
++	WREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE, mqd->cp_hqd_active);
++	if (ring->use_doorbell)
++		WREG32_SOC15(GC, 0, mmCP_PQ_STATUS,
++			     CP_PQ_STATUS__DOORBELL_ENABLE_MASK);
++}
++
 +static int gfx_v10_0_kiq_reload_hqd(struct amdgpu_device *adev)
 +{
 +	struct amdgpu_ring *ring = &adev->gfx.kiq[0].ring;
++	struct v10_compute_mqd *mqd;
 +	int r;
 +
 +	r = amdgpu_bo_reserve(ring->mqd_obj, false);
@@ -47,17 +95,25 @@
 +		amdgpu_bo_unreserve(ring->mqd_obj);
 +		return r;
 +	}
-+	r = gfx_v10_0_kiq_init_queue(ring);
++	mqd = ring->mqd_ptr;
++
++	mutex_lock(&adev->srbm_mutex);
++	nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
++	gfx_v10_0_kiq_setting(ring);
++	gfx_v10_0_kiq_load_hqd_writes(adev, ring, mqd);
++	nv_grbm_select(adev, 0, 0, 0, 0);
++	mutex_unlock(&adev->srbm_mutex);
++
 +	amdgpu_bo_kunmap(ring->mqd_obj);
 +	ring->mqd_ptr = NULL;
 +	amdgpu_bo_unreserve(ring->mqd_obj);
-+	return r;
++	return 0;
 +}
 +
  static int gfx_v10_0_kcq_resume(struct amdgpu_device *adev)
  {
  	struct amdgpu_ring *ring = NULL;
-@@ -6835,6 +6878,15 @@
+@@ -6835,6 +6934,15 @@
  		if (r)
  			goto done;
  	}
