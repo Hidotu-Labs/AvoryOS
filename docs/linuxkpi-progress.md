@@ -1342,9 +1342,21 @@ reason about.  Restarted on a clean base, keeping the green work:
 - [x] Kernel rebuilt (only the six touched objects + link, clean); watchdog
       helper `scripts/run-c4-watchdog.sh` stops QEMU at the first terminal
       marker (login / IB-test failure / GPU-init failure) for bounded runs.
-- [ ] Next: first boot on the redo build (last boot left the device warm at
-      18:40; the failed-PSP teardown usually lets the next boot proceed) and
-      follow PSP -> SMU -> GMC/IH -> SDMA/GFX ring tests -> gfx IB test.
+- [x] First redo boots (18:40-18:52): warm-state failures at the KIQ ring
+      test as before; a diagnostic boot then showed `psp-autoload ret=0`,
+      RLC complete, and hung (one vCPU spinning) immediately after the
+      `kiq-resume` trace, inside the diagnostics' pre-MEC `cp_dump` register
+      reads.  The risky pre-MEC CP dumps were removed from the debug patch.
+- [x] **Discovery: the first iteration's selfring fix was dead code.**
+      Raphael (GC 10.3.6) selects `nv_common_ip_block` (`nv.c`);
+      `soc21_common_hw_init()` only runs for GC 11.0.x.  The
+      `kpi-trace[soc21-hw-init]` diagnostics the same iteration had placed
+      beside the call never appear in any log.  Patch 0001 now targets
+      `nv_common_hw_init()` (`scripts/linux/patches/
+      0001-nv-program-selfring-before-cp-init.patch`); the soc21 patch is
+      dropped.  See `docs/linuxkpi-gaps.md` P6 C4.
+- [ ] Next: boot the corrected clean build and follow PSP -> SMU -> GMC/IH
+      -> SDMA/GFX ring tests -> gfx IB test.
 
 - [x] Firmware manifest pinned: `scripts/linux/firmware-manifest.txt` lists
       the 11 Raphael blobs verified against **linux-firmware 20260910**

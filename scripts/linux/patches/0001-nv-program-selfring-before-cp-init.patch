@@ -1,0 +1,19 @@
+--- a/drivers/gpu/drm/amd/amdgpu/nv.c
++++ b/drivers/gpu/drm/amd/amdgpu/nv.c
+@@ -1018,6 +1018,16 @@
+ 	/* enable the doorbell aperture */
+ 	adev->nbio.funcs->enable_doorbell_aperture(adev, true);
+ 
++	/* AVORYOS P6 C4: also program the selfring doorbell aperture here,
++	 * before the CP/KIQ init.  Upstream defers it to nv_common_late_init()
++	 * (which runs after the KIQ ring test) only because a successful FB BAR
++	 * resize can move the aperture; this build never resizes the BAR, and
++	 * without it the KIQ doorbell never reaches the HQD on this VFIO guest.
++	 * The late_init call stays and is idempotent.  This is the GC 10.3.x
++	 * (Raphael) path: the soc21.c equivalent only runs for GC 11.0. */
++	if (adev->nbio.funcs->enable_doorbell_selfring_aperture)
++		adev->nbio.funcs->enable_doorbell_selfring_aperture(adev, true);
++
+ 	return 0;
+ }
+ 

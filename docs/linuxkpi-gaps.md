@@ -339,9 +339,9 @@ Update this file in the same change that introduces or closes a gap.
   handles a stale active HQD (or the host resets the GPU before each guest).
 - **Imported-tree divergences are tracked patches, not hand edits** (C4
   redo, 2026-09-13): the first C4 iteration had edited six files under
-  `kernel/linux/` directly (the two behavior changes above plus
-  `kpi-trace` diagnostics).  They now live in
-  `scripts/linux/patches/0001-soc21-program-selfring-before-cp-init.patch`
+  `kernel/linux/` directly (behavior changes plus `kpi-trace` diagnostics).
+  They now live in
+  `scripts/linux/patches/0001-nv-program-selfring-before-cp-init.patch`
   and
   `scripts/linux/patches/0002-gfx10-kiq-stale-hqd-and-doorbell-reprogram.patch`;
   `scripts/linux-import.sh` applies every `patches/*.patch` on import and
@@ -349,6 +349,18 @@ Update this file in the same change that introduces or closes a gap.
   is an on-demand patch in `scripts/linux/patches/debug/` and is never
   applied automatically.  `build/p6-c4-imported-diffs/` keeps the original
   hand-edit diffs for reference.
+- **The selfring-before-CP-init fix belongs in `nv.c`, not `soc21.c`**
+  (found during the C4 redo, 2026-09-13): the first iteration patched
+  `soc21_common_hw_init()`, but Raphael's GC 10.3.6 selects
+  `nv_common_ip_block` (`amdgpu_discovery.c`); `soc21_common_ip_block` is
+  only added for GC 11.0.x.  No log ever contained the
+  `kpi-trace[soc21-hw-init]` diagnostic that the same iteration had added
+  beside the call, i.e. the fix was dead code and the one passing KIQ boot
+  was misattributed.  The patch now calls
+  `enable_doorbell_selfring_aperture()` from `nv_common_hw_init()` (right
+  after `enable_doorbell_aperture()`), the same ordering intent as the
+  original soc21 patch.  Remove once the upstream (late-init) ordering is
+  known to be sufficient under VFIO.
 
 ## Phase 5 gaps (full I/O foundations)
 
