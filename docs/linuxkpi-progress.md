@@ -1579,6 +1579,10 @@ amdgpu bring-up and all ring tests:
   boots that follow a failed/killed run hit the PSP ring (`-22`) or the
   dropped-write state (`-110`), which the failure teardown clears on the
   next boot.  `kpi_amdgpu=0` remains the one-line revert.
+- **Regressions green** (clean build): `build/logs/p6-c4-regress-gateoff.log`
+  (`gate off leaves the passed GPU unbound and unprobed`, 201 `[  OK  ]`,
+  0 `[FAIL]`) and `build/logs/p6-c4-regress-nogpu.log`
+  (`no AMD GPU present (gate not exercised)`, 211 `[  OK  ]`, 0 `[FAIL]`).
 - **Remaining housekeeping**: C5 (6d queues/VM/BOs/CS) starts from
   `p6-6c`; the on-demand KIQ diagnostics stay in
   `scripts/linux/patches/debug/` (not applied); the vkms GEM PMM drift
