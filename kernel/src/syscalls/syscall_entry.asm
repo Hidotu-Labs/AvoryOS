@@ -41,6 +41,13 @@ syscall_entry:
     mov rbp, rsp
     and rsp, -16
 
+    ; IA32_FMASK masked IF on SYSCALL entry, so the swapgs + stack-switch
+    ; window above cannot be interrupted.  The kernel GS and stack are in
+    ; place now, so open the dispatch: syscalls then run with interrupts on
+    ; and can be preempted by the timer like any other kernel code.  The
+    ; return paths mask again before swapgs/sysret.
+    sti
+
     ; Coarse SMAP user-access window: most syscalls in this kernel still read
     ; and write user memory directly instead of going through copy_*_user, so
     ; set RFLAGS.AC for the dispatch.  IA32_FMASK cleared AC on entry, and

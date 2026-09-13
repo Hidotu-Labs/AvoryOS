@@ -51,7 +51,10 @@ fork_return_to_userspace:
     ; Load rax last — child fork return value (0)
     mov rax, [rax + 48]
 
-    ; Swap GS: put user GS (0) into active, save kernel GS base
+    ; Interrupts may be enabled while the child unwinds; mask them so no ISR
+    ; can observe user GS between swapgs and sysret (same window syscall_entry
+    ; protects), then Swap GS: put user GS (0) into active, save kernel GS base
+    cli
     swapgs
 
     ; Return to user mode

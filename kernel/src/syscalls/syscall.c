@@ -567,10 +567,10 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     klog_puts("\n");
   }
 
-  /* Deferred preemption.  Syscalls run with IF masked (IA32_FMASK), so no
-   * interrupt can interrupt this return path: if this syscall woke a more
-   * eligible thread on this CPU - an X11 client writing a request that wakes
-   * the server - this is the only place it gets serviced promptly. */
+  /* Preemption punt.  IRQs are on throughout the dispatch (syscall_entry
+   * sti), so the timer can already preempt; this remains the deterministic
+   * point where a syscall that woke a more eligible thread on this CPU - an
+   * X11 client writing a request that wakes the server - yields promptly. */
   sched_check_resched(true);
 
   /* Signal frame conversion copies the complete register set. Keep it off the
@@ -604,10 +604,14 @@ void syscall_init(void) {
 
   wrmsr(IA32_LSTAR, (uint64_t)syscall_entry);
 
-  /* Mask IF and AC on SYSCALL entry.  Clearing AC matters for SMAP: RFLAGS.AC
-   * is user-settable (popfq), and without this a process could enter the
-   * kernel with AC already set and bypass supervisor access prevention for
-   * the whole syscall.  syscall_entry.asm re-opens AC deliberately, only for
+  /* Mask IF and AC on SYSCALL entry.  IF protects the swapgs + stack-switch
+   * window before any entry-code instruction runs (an interrupt there would
+   * see kernel CS with user GS or a user stack); syscall_entry.asm runs sti
+   * as soon as the kernel stack and GS are in place, so the dispatch itself
+   * is interruptible.  Clearing AC matters for SMAP: RFLAGS.AC is
+   * user-settable (popfq), and without this a process could enter the kernel
+   * with AC already set and bypass supervisor access prevention for the
+   * whole syscall.  syscall_entry.asm re-opens AC deliberately, only for
    * the dispatch window. */
   wrmsr(IA32_FMASK, 0x200 | (1ULL << 18));
 
