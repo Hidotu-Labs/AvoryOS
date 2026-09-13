@@ -1106,6 +1106,55 @@ MSI/MSI-X), C3 (ACPI tables + firmware loader), C4 (minimal i2c core) and C5
 - [ ] Interactive display run (GTK + virtio-vga) with fastfetch check is
       maintainer-run; the headless evidence above is the C7 gate.
 
+## Phase 5 exit matrix
+
+Maps the original Phase 5 criteria (`docs/linuxkpi-phase5-plan.md` §4) to
+evidence.  Serial excerpts and exact commands are in the chunk sections
+above; the last full VFIO boot was 252 `[  OK  ]` with no `[FAIL]`.
+
+| Original criterion | Status and evidence |
+|---|---|
+| Test PCI driver binds Raphael under VFIO | Green for the C7 validation driver (`pci_enable_device`, regions, BARs, teardown); the real amdgpu bind is P6a. |
+| `ioremap` works on BAR5 | Green: C7 `BAR5 mapped and read once` (`start=0x81100000 size=0x80000`). |
+| MSI-X vectors allocated; a Linux `request_irq` handler runs | Green: C2 EDU exact-count fire + 10k stress; C7 Raphael `msi=1 msix=4 irq=101 installed` (no raise without firmware). |
+| VBIOS hash match | Green: C7 guest `crc32=0x20ef861b size=65536` == host `build/vfio/vbios.rom` (`scripts/vfio-check-rom.sh` → `MATCH`). |
+| Firmware loader reads a test file from the disk image | Green: C3 4 KB `test_fw.bin` full-content match, `-ENOENT`, traversal. |
+| 24 h desktop soak with IRQs-on syscalls, no hangs | 1 h agent soak waived by the maintainer; 24 h protocol documented and pending (user-run).  IRQs-on kernel suites were green in every post-C6 boot. |
+| Stress suite green | Green: full kernel regression each chunk, 252 `[  OK  ]` under VFIO; userland stress is the pending soak item. |
+| `make run-vfio` boots with no unrelated kernel logs | Green headless and with the GTK desktop; the only anomaly is the default-std-VGA bochs canary (documented, avoided with `-vga none -device virtio-vga`). |
+
+## Open items carried into Phase 6
+
+- 24 h desktop soak (user-run protocol above); no 1 h agent soak evidence.
+- `CONFIG_ACPI` stays unset: the guest must read the VBIOS from the ROM BAR
+  image (`romfile=`), because VFCT exists only on the host.
+- Firmware manifest is empty until P6c; SMU/PSP/DMCUB names go into
+  `scripts/linux/firmware-manifest.txt`.
+- i2c SMBus entry points exist only if the P6a census shows consumers.
+- Real runtime PM / system suspend / ASPM / D-states are Phase 8; the PM
+  surface is inert but shape-complete.
+- Sysfs links, device refcounts (`get_device`/`put_device`, `kobject_*`) and
+  `pci_dev_get/put` remain documented no-ops; PCI wrappers live forever.
+- IRQ dispatch holds the descriptor lock while hard handlers run; threaded
+  handlers use the system workqueue; no `IRQF_ONESHOT` masking.
+- PCIe error recovery only needs to compile; no `err_handler` runtime.
+- Bochs canary needs `-device bochs-display` (the default std VGA is a bochs
+  VGA too and fails the stricter BAR0 readback).
+- fastfetch now reports `AMD Raphael` from PCI IDs; the renderer line will
+  become meaningful once amdgpu KMS lands (P6e).
+
+## Phase 5 closeout
+
+- Docs: `docs/linuxkpi.md` (surface, overlay/import rules, porting
+  checklist), `docs/amdgpu-testing.md` (VFIO/VBIOS/firmware workflow),
+  this progress doc (exit matrix + open items), and every divergence in
+  `docs/linuxkpi-gaps.md`.
+- Regression: all `test_phase*` kernel suites green in the same boot; the
+  last full VFIO boot was 252 `[  OK  ]` with no `[FAIL]`; `make -C kernel`
+  clean; `nm kernel/bin-x86_64/kernel | grep ' T drm_'` shows 595 imported
+  DRM symbols, no AvoryOS-authored ones.
+- Baseline tag: `p6-baseline` (Phase 6/amdgpu work starts from it).
+
 ## Cross-phase notes
 
 - `run-vfio` (BDF default `0000:0e:00.0`) has not been booted with the GPU

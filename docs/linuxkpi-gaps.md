@@ -8,6 +8,11 @@ Update this file in the same change that introduces or closes a gap.
 
 ## Phase 5 gaps (full I/O foundations)
 
+Index: C1 PCI · C2 IRQ/MSI · C3 ACPI/firmware · C4 i2c · C5 sysfs/devres/PM ·
+C6 IRQs-on syscalls + context · C7 VFIO/Raphael.  Each section lists the
+divergences for its chunk; the Phase 5 exit matrix in
+`docs/linuxkpi-progress.md` maps the original exit criteria to evidence.
+
 ### C1 — full Linux PCI API (non-IRQ)
 
 - **Saved config state is standard config space only**

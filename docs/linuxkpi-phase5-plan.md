@@ -12,9 +12,9 @@ stubs, IRQs enabled during syscalls — and harden the VFIO loop until the
 Raphael iGPU binds, maps BARs, allocates MSI-X, and serves a Linux
 `request_irq` handler, with the VBIOS hash matching the host ROM.
 
-**Status 2026-09-13: C0–C7 verified (headless VFIO validation green: bind,
-BARs, MSI-X, request_irq, VBIOS CRC MATCH; the 1 h soak was waived and the
-24 h protocol is pending/user-run).  C8 (phase closeout) in progress.**
+**Status 2026-09-13: Phase 5 complete — C0–C7 verified, C8 closeout done,
+tagged `p6-baseline`.  The 1 h soak was waived and the 24 h protocol is
+pending/user-run (the only open Phase 5 item carried to P6).**
 
 ---
 
