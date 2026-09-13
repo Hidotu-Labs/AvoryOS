@@ -1159,7 +1159,7 @@ above; the last full VFIO boot was 252 `[  OK  ]` with no `[FAIL]`.
   Interactive confirmation: the desktop boot lists `AMD Raphael` as the
   second GPU in fastfetch, next to the emulated one.
 
-## Phase 6 — amdgpu bring-up (C3 early init green; C4 in progress)
+## Phase 6 — amdgpu bring-up (C4 green 2026-09-13; C5 next)
 
 Chunk plan: `docs/linuxkpi-phase6-plan.md` (written 2026-09-13 after
 auditing P0–P5 at `2d5a0c0` / `p6-baseline`).  Chunks: C0 baseline +
@@ -1552,6 +1552,37 @@ reason about.  Restarted on a clean base, keeping the green work:
       selfring) is disabled — the doorbell reaches the HQD without it.
       Boots 17–21 (`build/logs/p6-c4-boot1[7-9]*`, `boot2[01]-*`) are
       the evidence trail.
+
+### C4 closeout (2026-09-13, evening)
+
+**C4 is green.**  After a host reboot (cold GPU) and with the tracked
+patch set (0002 only: stale-HQD force + warm-gated halt/arm/restart
+reload; early selfring disabled), the headless run completes the full
+amdgpu bring-up and all ring tests:
+
+- **Cold evidence** `build/logs/p6-c4-boot22-cold.log`: PSP AUTOLOAD
+  `status=0`, `kiq hqd armed=0` → the gated reload rebuilt the cold
+  state, KIQ scratch test `success at i=0`, the two follow-up KIQ tests,
+  `gfx_0.0.0` and all eight `comp_1.x` KCQ scratch tests green, SDMA
+  ring up (`ring sdma0 uses VM inv eng 12`), VCN/JPEG initialized,
+  `Initialized amdgpu ... on minor 2` (`card2`/`renderD129`).
+- **Full evidence (clean build, diagnostics removed)**
+  `build/logs/p6-c4-boot27-evidence.log`: 244 `[  OK  ]`, **0 `[FAIL]`**
+  (the 2 `[SKIP]`s are the bochs canary and the opt-in VFIO suite),
+  `ib test on gfx_0.0.0 succeeded` plus the comp/vcn/jpeg IB tests
+  (`ib ring test failed` never appears), firmware provenance
+  `[  OK  ] fw 11 staged amdgpu blobs match host CRC`, and the C4 suite
+  assertion `[  OK  ] link gate on: amdgpu initialized and bound`.
+- **Warm behavior**: a boot that follows a *successful* init finds the
+  HQD already armed (`armed=1`) and skips the reload
+  (`build/logs/p6-c4-boot24-warm-retry.log`, same all-green result);
+  boots that follow a failed/killed run hit the PSP ring (`-22`) or the
+  dropped-write state (`-110`), which the failure teardown clears on the
+  next boot.  `kpi_amdgpu=0` remains the one-line revert.
+- **Remaining housekeeping**: C5 (6d queues/VM/BOs/CS) starts from
+  `p6-6c`; the on-demand KIQ diagnostics stay in
+  `scripts/linux/patches/debug/` (not applied); the vkms GEM PMM drift
+  watch item from C3 stays on the list for C5.
 
 ## Cross-phase notes
 

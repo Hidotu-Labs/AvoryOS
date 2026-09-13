@@ -286,16 +286,16 @@ Update this file in the same change that introduces or closes a gap.
   max) - slow, but it did pace the loop, so this is **not** the cause of the
   `AUTOLOAD_RLC` BUSY.  Fixed to sleep the whole-millisecond part and spin
   the tail on the TSC (never returns before `min`, no longer over-sleeps).
-- **`AUTOLOAD_RLC` BUSY is still the open C4 blocker**: reconstructed from
-  the two observed boots - (a) cold device: PSP answers `TEE_ERROR_BUSY`
-  (`0xFFFF000D`) and `gfx_v10_0_wait_for_rlc_autoload_complete()` times out;
-  (b) warm device: no warning, the wait passes, but the MEC never runs
-  (`ring kiq_0.2.1.0 test failed (-110)`, `KCQ enable failed`).  Both point
-  at the PSP's GFX autoload not actually bringing up the CP/MEC on this
-  VFIO pass-through.  The next `make run-c4` now bakes `drm.debug=0x1ff`, so
-  the log will show every `LOAD_IP_FW` (fw names/versions/sizes via
-  `psp_print_fw_hdr`) and the exact autoload status.  Compare the RLC/MEC
-  firmware versions and the `AUTOLOAD_RLC` result before changing anything.
+- **`AUTOLOAD_RLC` BUSY is a warm-device symptom, not the blocker**
+  (resolved 2026-09-13): the PSP answers `TEE_ERROR_BUSY` (`0xFFFF000D`)
+  when the previous guest left the PSP running; the driver continues and
+  the failure teardown (or a host reboot) recovers it on the next boot.
+  The real KIQ constraint is the cold-state requirement: pre-MEC
+  `CP_HQD_*` writes are dropped when the previous run did not complete a
+  successful init, and the KIQ has to be armed before the MEC starts.
+  The tracked patch rebuilds that state (halt MEC → arm HQD → restart)
+  and gates itself on the HQD being empty; the full pass is recorded in
+  the C4 closeout in `docs/linuxkpi-progress.md`.
 - **Firmware staging is byte-exact** (ruled out): every staged blob was
   compared against a fresh `zstd -d` of the host's `/lib/firmware` member and
   matches.  The common-header `crc32` field does not match zlib's CRC for the
