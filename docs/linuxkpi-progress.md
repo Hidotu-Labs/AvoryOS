@@ -1713,6 +1713,41 @@ them).  First increment: the P2 VMA-bridge prerequisite, test-first.
   bad-CS/fence-timeout recovery deferred to C8, bridged mremap open/close
   shape).
 
+### C6 — 6e: KMS/DCN (started 2026-09-13)
+
+- Tooling: `run-c6` (DC on, `amdgpu.runpm=0`, `ppfeaturemask=0xfff73fff`,
+  `drm.debug=0x4` = KMS only, serial to `build/logs/p6-c6.log`) and
+  `scripts/run-c6-watchdog.sh` (bounded headless boot).
+- Userland: `bin/test_kpi_amdgpu` gained the C6 KMS section - connector
+  pick (prefer a connected HDMI/DP sink, else force it on through the 6.6
+  RW `status` attribute), atomic property discovery, a primary-plane enable
+  with `PAGE_FLIP_EVENT`, a real page flip, `WAIT_VBLANK`, a cursor-plane
+  commit/off and an atomic disable; the connector is unforced afterwards.
+  Compiles clean; hardware run pending.
+- **Found and fixed: the native `vsnprintf()` infinite loop.**  With the
+  buffer full, `EMIT(*fmt++)` stopped advancing `fmt` (the argument was
+  only evaluated on the store path), so the DM workqueue name
+  `"amdgpu_dm_hpd_rx_offload_wq"` (27 chars) formatted into
+  `alloc_workqueue()`'s 24-byte buffer spun forever inside the amdgpu
+  probe.  RIP capture via the QEMU monitor (`vsnprintf` literal loop,
+  `fmt` parked on the same byte, `pos` climbing) localized it; the fix
+  always evaluates the character and `test_phase1_core6.c` now covers
+  truncating formats.  With it, the DC boot completes:
+  `DMUB hardware initialized`, `Display Core v3.2.247 initialized on DCN
+  3.1.5`, `Initialized amdgpu 3.54.0 ... on minor 2`, `initcalls completed
+  in 0.391 s` (`build/logs/p6-c6-fixed2.log`).
+- **Found and fixed: P5 i2c suite bus collision.**  The suite's fixed
+  `P5C4_NUMBERED_NR = 7` is taken once amdgpu DM registers its DDC
+  adapters; it now picks a free number in `[16, 64)`.
+- **Open: hardware reset at session start with DC active.**  The boot that
+  bound amdgpu reset right after `[PROC] Executing main session:
+  /bin/avoryd` (no panic, no watchdog; `BdsDxe` restarts on serial).  A
+  following boot with a failed warm probe (-22) started the session
+  normally, so the trigger is DC being active.  Needs a cold GPU +
+  `-d int,guest_errors,cpu_reset` capture.
+- The i2c FAILs from the first DC boot (`i2c_add_numbered_adapter -16`)
+  were this test collision, not a core regression; the fix rebuilds clean.
+
 ## Cross-phase notes
 
 - `run-vfio` (BDF default `0000:0e:00.0`) has not been booted with the GPU

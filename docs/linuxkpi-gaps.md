@@ -512,6 +512,39 @@ prerequisites and the hardware-bring-up findings.
   the reset paths).  Hardware evidence lands in the C5 progress entry; the
   `run-c5` target boots it interactively from a cold GPU.
 
+### C6 — 6e: KMS/DCN
+
+- **`vsnprintf()` spun forever once the output buffer was full** (found
+  2026-09-13 with a QEMU-monitor RIP capture; the root cause of what had
+  been filed as a "minutes-slow DCN bring-up").  The `EMIT(c)` macro
+  evaluated its argument only inside the `if (pos + 1 < size)` store path,
+  so the literal loop's `EMIT(*fmt++)` stopped advancing `fmt` the moment
+  the destination filled up and re-read the same character forever, with
+  `pos` climbing until the machine was killed.  `alloc_workqueue()` formats
+  its name with `vsnprintf(tmp, WQ_NAME_LEN, fmt, args)`; amdgpu DM's
+  `"amdgpu_dm_hpd_rx_offload_wq"` (27 chars) overflows the 24-byte
+  `WQ_NAME_LEN` buffer, so the first DC boot hung inside
+  `hpd_rx_irq_create_workqueue()` right after `dcn31_init_hw` powered the
+  pipes down.  `EMIT` now always evaluates the character
+  (`char emit_c_ = (char)(c); ...`), restoring C's side-effect semantics
+  for `*fmt++`; `test_phase1_core6.c` gained truncation cases (the literal
+  workqueue name and `%020d`).  This also explains why no `dc=0` boot ever
+  hit it: without the DM block the workqueues are never created.
+- **The P5 i2c suite used a fixed numbered bus** (`P5C4_NUMBERED_NR = 7`):
+  with `CONFIG_DRM_AMD_DC` live, amdgpu DM registers its DDC adapters first
+  and the number can be taken, so `i2c_add_numbered_adapter` failed
+  `-EBUSY` and the lookup/verify subtests cascaded.  The suite now scans
+  for a free number in `[16, 64)` at run time.
+- **Open (2026-09-13): the guest hardware-resets at session start once
+  amdgpu binds with DC enabled.**  After a full DC init (`DMUB hardware
+  initialized`, `Initialized amdgpu ... on minor 2`), the suites run and
+  the machine resets immediately after `[PROC] Executing main session:
+  /bin/avoryd`, with no panic and no watchdog line (OVMF restarts on the
+  serial stream).  Boots where the probe fails first (-22, warm GPU) start
+  the session normally, so it correlates with DC being active - not with
+  the session binary.  Next step: reproduce on a cold GPU with
+  `-d int,guest_errors,cpu_reset` and read the last exception.
+
 ## Phase 5 gaps (full I/O foundations)
 
 Index: C1 PCI · C2 IRQ/MSI · C3 ACPI/firmware · C4 i2c · C5 sysfs/devres/PM ·

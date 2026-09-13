@@ -352,6 +352,24 @@ run-c5: VFIO_EXTRA = -device edu
 run-c5: QEMUFLAGS = -vga none -device virtio-vga,xres=1280,yres=800
 run-c5: run-vfio
 
+# Phase 6 C6: KMS/DCN bring-up.  Same as C5 but with the dm ip block enabled
+# (`amdgpu.dc` stays at its default 1) so DMUB, DCN 3.1.5 and the connectors
+# come up.  Interactive by default (GTK + virtio-vga desktop) so modetest /
+# bin/test_kpi_amdgpu can run after login; `DISPLAY_OPT='-display none'`
+# overrides for a headless capture.
+# drm.debug=0x4 is the KMS channel only.  The C4/C5 targets use 0x1 (CORE):
+# that logs every DRM ioctl (`drm_ioctl()` -> drm_dbg_core()) and the boot
+# suites' GEM loops turn it into thousands of lines.  CORE also carries the
+# per-ring `ib test on %s succeeded` DRM_DEBUG evidence; when that is wanted,
+# boot with KERNEL_CMDLINE='... drm.debug=0x5'.  Add 0x10 (ATOMIC) for commit
+# state debugging.
+.PHONY: run-c6
+run-c6: KERNEL_CMDLINE = kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x4
+run-c6: SERIAL = file:build/logs/p6-c6.log
+run-c6: VFIO_EXTRA = -device edu
+run-c6: QEMUFLAGS = -vga none -device virtio-vga,xres=1280,yres=800
+run-c6: run-vfio
+
 # Cold-start the passed GPU on the host before a C4+ boot.  QEMU/VFIO does not
 # reset the device on VM exit, and the guest driver's bring-up sequence assumes
 # a cold device (a warm one can answer AUTOLOAD_RLC with TEE_ERROR_BUSY or come
