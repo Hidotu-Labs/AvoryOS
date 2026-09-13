@@ -393,6 +393,26 @@ Update this file in the same change that introduces or closes a gap.
   after `enable_doorbell_aperture()`), the same ordering intent as the
   original soc21 patch.  Remove once the upstream (late-init) ordering is
   known to be sufficient under VFIO.
+- **The post-MEC `RLC_CP_SCHEDULERS` write used the wrong ASIC offset**
+  (found 2026-09-13 20:20): `gfx_v10_0_kiq_setting()` correctly switches
+  to `mmRLC_CP_SCHEDULERS_Sienna_Cichlid` (0x4ca1) for GC 10.3.x, but the
+  C4 reload workaround wrote the generic `mmRLC_CP_SCHEDULERS` (Navi10
+  offset 0x4caa) — a silent no-op, so its read-back was always 0.  The
+  entry itself was already programmed correctly by the pre-MEC
+  `kiq_setting()` (`0x…c8`, upper bits preserved): rewriting it after the
+  MEC start only makes the RLC clear the freshly loaded HQD, so the reload
+  no longer touches it.  The real constraint is that the KIQ must be armed
+  *before* the MEC starts (see the cold-start note in
+  `docs/linuxkpi-progress.md` P6 C4); the reload now gates on the HQD
+  actually being empty and rebuilds the cold state (halt MEC → arm HQD →
+  restart MEC).
+- **Selfring-before-CP-init is not needed** (tested 2026-09-13 20:40):
+  with the early `enable_doorbell_selfring_aperture()` removed the KIQ
+  doorbell still reaches the HQD (`CP_HQD_PQ_WPTR_LO` reads the written
+  value) and the warm-state failure signature is unchanged, so the
+  divergence was disabled (`scripts/linux/patches/disabled/`).  If a cold
+  boot ever shows the doorbell not reaching the HQD, re-enable and
+  re-evaluate.
 
 ## Phase 5 gaps (full I/O foundations)
 

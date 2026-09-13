@@ -1532,6 +1532,26 @@ reason about.  Restarted on a clean base, keeping the green work:
       gate-off regression.  Use `make run-c4`: it bakes
       `kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.dc=0` (no C6 display block),
       goes headless and captures `build/logs/p6-c4.log`.
+- [ ] **Cold-start requirement confirmed for the KIQ (2026-09-13 20:45).**
+      The KIQ has only ever fetched on the milestone boot; every boot
+      since (warm device) drops the pre-MEC CP_HQD writes and the MEC
+      never services the KIQ, even with a perfect HQD: the doorbell
+      reaches it (`CP_HQD_PQ_WPTR_LO=0x100` right after `WDOORBELL64`),
+      then `DOORBELL_CONTROL`/`WPTR` are wiped and `rptr` stays 0; a
+      halt → re-arm → restart of the MEC does not help either.  The
+      `RLC_CP_SCHEDULERS` KIQ entry is fine on this ASIC
+      (`0x…c8`, upper bits preserved); the tracked reload's write went
+      to the generic `mmRLC_CP_SCHEDULERS` (Navi10 offset 0x4caa) and
+      was a no-op on GC 10.3.6 (Sienna offset 0x4ca1) — fixed to the
+      Sienna register, but the entry was already correct and that was
+      not the blocker.  VFIO resets the function on every QEMU start
+      (`vfio-pci …: reset done`) yet that does not restore the CP block;
+      only a host reboot cold-starts it.  Patch 0002 now gates its
+      reload on the HQD being empty (`gfx_v10_0_kiq_hqd_armed()`), so a
+      cold boot keeps the upstream programming; patch 0001 (early
+      selfring) is disabled — the doorbell reaches the HQD without it.
+      Boots 17–21 (`build/logs/p6-c4-boot1[7-9]*`, `boot2[01]-*`) are
+      the evidence trail.
 
 ## Cross-phase notes
 

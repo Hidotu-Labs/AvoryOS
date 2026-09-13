@@ -1,26 +1,3 @@
---- a/drivers/gpu/drm/amd/amdgpu/nv.c
-+++ b/drivers/gpu/drm/amd/amdgpu/nv.c
-@@ -1025,8 +1025,19 @@
- 	 * without it the KIQ doorbell never reaches the HQD on this VFIO guest.
- 	 * The late_init call stays and is idempotent.  This is the GC 10.3.x
- 	 * (Raphael) path: the soc21.c equivalent only runs for GC 11.0. */
--	if (adev->nbio.funcs->enable_doorbell_selfring_aperture)
-+	if (adev->nbio.funcs->enable_doorbell_selfring_aperture) {
-+		/* AVORYOS P6 C4 debug (temporary) */
-+		dev_info(adev->dev,
-+			 "kpi-trace[nv-hw-init]: selfring ptr=%llx calling\n",
-+			 (unsigned long long)(uintptr_t)
-+				adev->nbio.funcs->enable_doorbell_selfring_aperture);
- 		adev->nbio.funcs->enable_doorbell_selfring_aperture(adev, true);
-+		dev_info(adev->dev,
-+			 "kpi-trace[nv-hw-init]: selfring call returned\n");
-+	} else {
-+		dev_info(adev->dev,
-+			 "kpi-trace[nv-hw-init]: selfring ptr NULL\n");
-+	}
- 
- 	return 0;
- }
 --- a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
 +++ b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
 @@ -34,6 +34,7 @@
@@ -31,7 +8,7 @@
  #include "smuio/smuio_11_0_0_offset.h"
  #include "smuio/smuio_11_0_0_sh_mask.h"
  #include "navi10_enum.h"
-@@ -3763,6 +3764,56 @@
+@@ -3763,6 +3764,59 @@
  	amdgpu_ring_write(ring, inv); /* poll interval */
  }
  
@@ -60,6 +37,9 @@
 +		 RREG32_SOC15(GC, 0, mmRLC_CNTL),
 +		 RREG32_SOC15(GC, 0, mmRLC_STAT),
 +		 RREG32_SOC15(GC, 0, mmRLC_RLCS_BOOTLOAD_STATUS));
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev, "kpi-trace[test-timeout]: mec_cntl=%08x\n",
++		 RREG32_SOC15(GC, 0, mmCP_MEC_CNTL_Sienna_Cichlid));
 +}
 +
 +/* AVORYOS P6 C4 debug (temporary): one-line KIQ HQD dump. */
@@ -88,7 +68,7 @@
  static int gfx_v10_0_ring_test_ring(struct amdgpu_ring *ring)
  {
  	struct amdgpu_device *adev = ring->adev;
-@@ -3771,6 +3822,14 @@
+@@ -3771,6 +3825,14 @@
  	unsigned int i;
  	int r;
  
@@ -103,7 +83,7 @@
  	WREG32(scratch, 0xCAFEDEAD);
  	r = amdgpu_ring_alloc(ring, 3);
  	if (r) {
-@@ -3785,19 +3844,70 @@
+@@ -3785,19 +3847,70 @@
  	amdgpu_ring_write(ring, 0xDEADBEEF);
  	amdgpu_ring_commit(ring);
  
@@ -175,7 +155,7 @@
  	return r;
  }
  
-@@ -3855,6 +3965,21 @@
+@@ -3855,6 +3968,21 @@
  
  	r = dma_fence_wait_timeout(f, false, timeout);
  	if (r == 0) {
@@ -197,7 +177,7 @@
  		r = -ETIMEDOUT;
  		goto err2;
  	} else if (r < 0) {
-@@ -5615,6 +5740,14 @@
+@@ -5615,6 +5743,14 @@
  	uint32_t bootload_status;
  	int i, r;
  
@@ -212,7 +192,7 @@
  	for (i = 0; i < adev->usec_timeout; i++) {
  		cp_status = RREG32_SOC15(GC, 0, mmCP_STAT);
  		bootload_status = RREG32_SOC15(GC, 0, mmRLC_RLCS_BOOTLOAD_STATUS);
-@@ -5626,6 +5759,11 @@
+@@ -5626,6 +5762,11 @@
  		udelay(1);
  	}
  
@@ -224,16 +204,18 @@
  	if (i >= adev->usec_timeout) {
  		dev_err(adev->dev, "rlc autoload: gc ucode autoload timeout\n");
  		return -ETIMEDOUT;
-@@ -6223,6 +6361,8 @@
+@@ -6223,6 +6364,10 @@
  		adev->gfx.kiq[0].ring.sched.ready = false;
  	}
  	udelay(50);
 +	/* AVORYOS P6 C4 debug (temporary) */
-+	dev_info(adev->dev, "kpi-trace[compute-enable]: enable=%d\n", enable);
++	dev_info(adev->dev,
++		 "kpi-trace[compute-enable]: enable=%d mec_cntl=%08x\n", enable,
++		 RREG32_SOC15(GC, 0, mmCP_MEC_CNTL_Sienna_Cichlid));
  }
  
  static int gfx_v10_0_cp_compute_load_microcode(struct amdgpu_device *adev)
-@@ -6617,6 +6757,9 @@
+@@ -6617,6 +6762,9 @@
  	struct v10_compute_mqd *mqd = ring->mqd_ptr;
  	int j;
  
@@ -243,7 +225,7 @@
  	/* inactivate the queue */
  	if (amdgpu_sriov_vf(adev))
  		WREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE, 0);
-@@ -6624,14 +6767,27 @@
+@@ -6624,14 +6772,27 @@
  	/* disable wptr polling */
  	WREG32_FIELD15(GC, 0, CP_PQ_WPTR_POLL_CNTL, EN, 0);
  
@@ -271,7 +253,7 @@
  		/* AVORYOS P6 C4: a PCI/VFIO reset does not reset the CP, so a
  		 * previous boot can leave this HQD active.  While the MEC is
  		 * halted the dequeue request above cannot complete, and the
-@@ -6708,6 +6864,12 @@
+@@ -6708,6 +6869,12 @@
  
  	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL,
  	       mqd->cp_hqd_pq_doorbell_control);
@@ -284,7 +266,7 @@
  
  	/* reset read and write pointers, similar to CP_RB0_WPTR/_RPTR */
  	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_LO,
-@@ -6728,6 +6890,14 @@
+@@ -6728,6 +6895,14 @@
  	if (ring->use_doorbell)
  		WREG32_FIELD15(GC, 0, CP_PQ_STATUS, DOORBELL_ENABLE, 1);
  
@@ -299,7 +281,7 @@
  	return 0;
  }
  
-@@ -6759,10 +6929,26 @@
+@@ -6759,10 +6934,26 @@
  		mutex_lock(&adev->srbm_mutex);
  		nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
  		amdgpu_ring_init_mqd(ring);
@@ -326,7 +308,7 @@
  		if (adev->gfx.kiq[0].mqd_backup)
  			memcpy_fromio(adev->gfx.kiq[0].mqd_backup, mqd, sizeof(*mqd));
  	}
-@@ -6816,7 +7002,15 @@
+@@ -6816,7 +7007,15 @@
  		return r;
  	}
  
@@ -342,50 +324,58 @@
  	amdgpu_bo_kunmap(ring->mqd_obj);
  	ring->mqd_ptr = NULL;
  	amdgpu_bo_unreserve(ring->mqd_obj);
-@@ -6899,15 +7093,29 @@
+@@ -6945,22 +7144,32 @@
  	mqd = ring->mqd_ptr;
  
  	mutex_lock(&adev->srbm_mutex);
--	/* The pre-MEC gfx_v10_0_kiq_setting() write was dropped, so the
--	 * RLC still has to be told which queue is the KIQ.  Write the
--	 * scheduler entry in ONE write (0x80 marks it as KIQ); the
--	 * upstream two-step RMW leaves a transient non-KIQ entry when
--	 * done after the MEC has started. */
-+	/* The pre-MEC gfx_v10_0_kiq_setting() write was dropped, so the RLC
-+	 * still has to be told which queue is the KIQ.  Single write (0x80
-+	 * marks the entry as KIQ) to avoid the transient entry the upstream
-+	 * two-step RMW would leave after the MEC has started. */
- 	WREG32_SOC15(GC, 0, mmRLC_CP_SCHEDULERS,
- 		     (ring->me << 5) | (ring->pipe << 3) | ring->queue | 0x80);
+-	/* AVORYOS P6 C4: re-arm the KIQ HQD while the MEC is halted, then
+-	 * restart the MEC, reconstructing the cold-boot state.  On this VFIO
+-	 * guest the pre-MEC gfx_v10_0_kiq_init_register() writes are dropped
+-	 * and a KIQ armed *after* the MEC has started is never fetched (the
+-	 * doorbell reaches the HQD, then the queue is cleared); the MEC needs
+-	 * the queue present when it (re)starts.  The RLC_CP_SCHEDULERS KIQ
+-	 * entry is NOT rewritten here: the pre-MEC gfx_v10_0_kiq_setting()
+-	 * write sticks (read back 0x...c8) and rewriting it after the MEC
+-	 * start only makes the RLC clear the freshly loaded HQD. */
 +	/* AVORYOS P6 C4 debug (temporary) */
-+	dev_info(adev->dev, "kpi-trace[kiq-reload]: rlc_sched=%08x\n",
-+		 RREG32_SOC15(GC, 0, mmRLC_CP_SCHEDULERS));
++	dev_info(adev->dev, "kpi-trace[kiq-reload]: rlc_sched_initial=%08x\n",
++		 RREG32_SOC15(GC, 0, mmRLC_CP_SCHEDULERS_Sienna_Cichlid));
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev, "kpi-trace[kiq-reload]: halting MEC\n");
+ 	gfx_v10_0_kiq_mec_halt(adev, true);
+ 	udelay(50);
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev, "kpi-trace[kiq-reload]: MEC halted, loading HQD\n");
  	nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
-+	/* AVORYOS P6 C4 debug (temporary) */
-+	dev_info(adev->dev, "kpi-trace[kiq-reload]: select done\n");
  	gfx_v10_0_kiq_load_hqd_writes(adev, ring, mqd);
 +	/* AVORYOS P6 C4 debug (temporary) */
 +	dev_info(adev->dev,
-+		 "kpi-trace[kiq-reload]: ranges=%08x..%08x dbctl=%08x active=%08x pqb=%08x\n",
-+		 RREG32_SOC15(GC, 0, mmCP_MEC_DOORBELL_RANGE_LOWER),
-+		 RREG32_SOC15(GC, 0, mmCP_MEC_DOORBELL_RANGE_UPPER),
-+		 RREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL),
++		 "kpi-trace[kiq-reload]: hqd me=%u pipe=%u q=%u active=%08x wptr=%08x dbctl=%08x pqb=%08x\n",
++		 ring->me, ring->pipe, ring->queue,
 +		 RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE),
++		 RREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_LO),
++		 RREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL),
 +		 RREG32_SOC15(GC, 0, mmCP_HQD_PQ_BASE));
-+	/* AVORYOS P6 C4 debug (temporary) */
-+	dev_info(adev->dev, "kpi-trace[kiq-reload]: writes done\n");
  	nv_grbm_select(adev, 0, 0, 0, 0);
+ 	gfx_v10_0_kiq_mec_halt(adev, false);
+ 	udelay(50);
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev,
++		 "kpi-trace[kiq-reload]: mec restarted rlc_sched=%08x\n",
++		 RREG32_SOC15(GC, 0, mmRLC_CP_SCHEDULERS_Sienna_Cichlid));
  	mutex_unlock(&adev->srbm_mutex);
  
-@@ -6917,6 +7125,7 @@
- 	return 0;
- }
- 
-+
- static int gfx_v10_0_kcq_resume(struct amdgpu_device *adev)
- {
- 	struct amdgpu_ring *ring = NULL;
-@@ -6950,6 +7159,10 @@
+ 	amdgpu_bo_kunmap(ring->mqd_obj);
+@@ -6998,12 +7207,19 @@
+ 	 * then re-load it (halt the MEC, arm the HQD, restart).  On a cold
+ 	 * start the writes stuck and the upstream programming is left alone. */
+ 	if (!adev->enable_mes_kiq) {
++		/* AVORYOS P6 C4 debug (temporary) */
++		dev_info(adev->dev, "kpi-trace[kcq]: kiq hqd armed=%d\n",
++			 gfx_v10_0_kiq_hqd_armed(adev));
+ 		if (!gfx_v10_0_kiq_hqd_armed(adev))
+ 			r = gfx_v10_0_kiq_reload_hqd(adev);
+ 		if (r)
  			goto done;
  	}
  
@@ -396,7 +386,7 @@
  	r = amdgpu_gfx_enable_kcq(adev, 0);
  done:
  	return r;
-@@ -6978,10 +7191,13 @@
+@@ -7032,10 +7248,13 @@
  		r = amdgpu_mes_kiq_hw_init(adev);
  	else
  		r = gfx_v10_0_kiq_resume(adev);
@@ -410,7 +400,7 @@
  	if (r)
  		return r;
  
-@@ -8358,7 +8574,48 @@
+@@ -8412,7 +8631,48 @@
  		if (ring->use_doorbell) {
  			atomic64_set((atomic64_t *)ring->wptr_cpu_addr,
  				     ring->wptr);

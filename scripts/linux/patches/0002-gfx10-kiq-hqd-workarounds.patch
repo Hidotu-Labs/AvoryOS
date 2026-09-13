@@ -18,7 +18,7 @@
  		WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST,
  		       mqd->cp_hqd_dequeue_request);
  		WREG32_SOC15(GC, 0, mmCP_HQD_PQ_RPTR,
-@@ -6812,6 +6823,100 @@
+@@ -6812,6 +6823,152 @@
  	return 0;
  }
  
@@ -81,6 +81,52 @@
 +			     CP_PQ_STATUS__DOORBELL_ENABLE_MASK);
 +}
 +
++/* AVORYOS P6 C4: halt or restart both MEC instances (GC 10.3.x uses the
++ * Sienna Cichlid register offset; the generic one is Navi10's). */
++/* AVORYOS P6 C4: is the KIQ HQD already armed?  On a cold start the
++ * pre-MEC gfx_v10_0_kiq_init_register() writes stick and leave
++ * CP_HQD_ACTIVE / DOORBELL_EN set; on a warm device they are dropped and
++ * the HQD comes back empty, which is the case the reload works around. */
++static bool gfx_v10_0_kiq_hqd_armed(struct amdgpu_device *adev)
++{
++	struct amdgpu_ring *ring = &adev->gfx.kiq[0].ring;
++	u32 active, dbctl;
++	bool armed;
++
++	mutex_lock(&adev->srbm_mutex);
++	nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
++	active = RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE);
++	dbctl = RREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL);
++	nv_grbm_select(adev, 0, 0, 0, 0);
++	mutex_unlock(&adev->srbm_mutex);
++
++	armed = (active & 1) &&
++		(dbctl & CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_EN_MASK);
++	return armed;
++}
++
++static void gfx_v10_0_kiq_mec_halt(struct amdgpu_device *adev, bool halt)
++{
++	u32 v = halt ? (CP_MEC_CNTL__MEC_ME1_HALT_MASK |
++			CP_MEC_CNTL__MEC_ME2_HALT_MASK) : 0;
++
++	switch (adev->ip_versions[GC_HWIP][0]) {
++	case IP_VERSION(10, 3, 0):
++	case IP_VERSION(10, 3, 2):
++	case IP_VERSION(10, 3, 1):
++	case IP_VERSION(10, 3, 4):
++	case IP_VERSION(10, 3, 5):
++	case IP_VERSION(10, 3, 6):
++	case IP_VERSION(10, 3, 3):
++	case IP_VERSION(10, 3, 7):
++		WREG32_SOC15(GC, 0, mmCP_MEC_CNTL_Sienna_Cichlid, v);
++		break;
++	default:
++		WREG32_SOC15(GC, 0, mmCP_MEC_CNTL, v);
++		break;
++	}
++}
++
 +static int gfx_v10_0_kiq_reload_hqd(struct amdgpu_device *adev)
 +{
 +	struct amdgpu_ring *ring = &adev->gfx.kiq[0].ring;
@@ -98,16 +144,22 @@
 +	mqd = ring->mqd_ptr;
 +
 +	mutex_lock(&adev->srbm_mutex);
-+	/* The pre-MEC gfx_v10_0_kiq_setting() write was dropped, so the
-+	 * RLC still has to be told which queue is the KIQ.  Write the
-+	 * scheduler entry in ONE write (0x80 marks it as KIQ); the
-+	 * upstream two-step RMW leaves a transient non-KIQ entry when
-+	 * done after the MEC has started. */
-+	WREG32_SOC15(GC, 0, mmRLC_CP_SCHEDULERS,
-+		     (ring->me << 5) | (ring->pipe << 3) | ring->queue | 0x80);
++	/* AVORYOS P6 C4: re-arm the KIQ HQD while the MEC is halted, then
++	 * restart the MEC, reconstructing the cold-boot state.  On this VFIO
++	 * guest the pre-MEC gfx_v10_0_kiq_init_register() writes are dropped
++	 * and a KIQ armed *after* the MEC has started is never fetched (the
++	 * doorbell reaches the HQD, then the queue is cleared); the MEC needs
++	 * the queue present when it (re)starts.  The RLC_CP_SCHEDULERS KIQ
++	 * entry is NOT rewritten here: the pre-MEC gfx_v10_0_kiq_setting()
++	 * write sticks (read back 0x...c8) and rewriting it after the MEC
++	 * start only makes the RLC clear the freshly loaded HQD. */
++	gfx_v10_0_kiq_mec_halt(adev, true);
++	udelay(50);
 +	nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
 +	gfx_v10_0_kiq_load_hqd_writes(adev, ring, mqd);
 +	nv_grbm_select(adev, 0, 0, 0, 0);
++	gfx_v10_0_kiq_mec_halt(adev, false);
++	udelay(50);
 +	mutex_unlock(&adev->srbm_mutex);
 +
 +	amdgpu_bo_kunmap(ring->mqd_obj);
@@ -119,16 +171,18 @@
  static int gfx_v10_0_kcq_resume(struct amdgpu_device *adev)
  {
  	struct amdgpu_ring *ring = NULL;
-@@ -6835,6 +6940,15 @@
+@@ -6835,6 +6992,17 @@
  		if (r)
  			goto done;
  	}
 +
-+	/* AVORYOS P6 C4: the MEC is running now; re-load the KIQ HQD whose
-+	 * pre-MEC register writes this environment dropped, before the ring
-+	 * test that depends on it. */
++	/* AVORYOS P6 C4: the MEC is running now.  On a warm device the
++	 * pre-MEC register writes were dropped and the KIQ HQD is empty; only
++	 * then re-load it (halt the MEC, arm the HQD, restart).  On a cold
++	 * start the writes stuck and the upstream programming is left alone. */
 +	if (!adev->enable_mes_kiq) {
-+		r = gfx_v10_0_kiq_reload_hqd(adev);
++		if (!gfx_v10_0_kiq_hqd_armed(adev))
++			r = gfx_v10_0_kiq_reload_hqd(adev);
 +		if (r)
 +			goto done;
 +	}
