@@ -1053,6 +1053,59 @@ MSI/MSI-X), C3 (ACPI tables + firmware loader), C4 (minimal i2c core) and C5
       run `bin/test_kpi_dmabuf 86400`, leave the session; after 24 h check
       the log for `delta ≈ 0`, no `[FAIL]`, no hang/WARN.  Pending (user).
 
+### C7 — VFIO hardening + Raphael validation, verified 2026-09-13
+
+- [x] `run-vfio` knobs (`GNUmakefile`): `SERIAL` is honored (headless
+      captures), `VFIO_EXTRA` appends devices (`-device edu`), `DISPLAY_OPT`
+      replaces the hardcoded `-display none` (default GTK, headless via
+      `DISPLAY_OPT='-display none'`), and `KERNEL_CMDLINE` bakes a limine
+      `cmdline:` into the ISO for gated tests.  Dry-run verified the expanded
+      QEMU line (romfile auto-detection, `-serial file:...`, `-device edu`).
+- [x] `test_phase5_vfio.c`: gated by the `kpi_vfio_test` module parameter
+      (default 0, set from the kernel cmdline only for the validation boot)
+      so a P6a boot can bind amdgpu without the test owning the device.
+      Covers identity/BAR logging, `pci_enable_device` + regions, BAR5 map
+      and one safe read, bus-master set/clear, `pci_map_rom` + VBIOS CRC32,
+      one MSI/MSI-X vector + `request_irq`, and full teardown.
+- [x] VBIOS extraction correction: Raphael is an APU, so
+      `/sys/bus/pci/devices/0000:0e:00.0/rom` **does not exist** — its VBIOS
+      lives in the system firmware's VFCT ACPI table, not an option ROM.
+      `scripts/vfio-vbios.sh` now falls back to parsing VFCT (matching the
+      BDF in `vfct_image_header`) and pads the image to a power of two with
+      0xFF so the QEMU ROM BAR size matches the host file.  Extracted:
+      44,544-byte image padded to 65,536 bytes.
+- [x] Headless validation run (`make run-vfio KERNEL_CMDLINE=kpi_vfio_test=1
+      SERIAL=file:build/logs/p5-vfio.log VFIO_EXTRA='-device edu'`):
+      ```
+      [LINUXKPI] cmdline: kpi_vfio_test=1
+      [INFO] LinuxKPI: vfio GPU 0000:00:04.0 class=0x000300 rev=0xc6
+      [INFO] LinuxKPI: vfio BAR0 start=0x300000000000 size=0x10000000 ...
+      [INFO] LinuxKPI: vfio BAR5 start=0x81100000 size=0x80000 flags=0x200
+      [  OK  ] LinuxKPI: vfio BAR5 mapped and read once
+      [INFO] LinuxKPI: vfio rom crc32=0x20ef861b size=65536 first=55 aa
+      [  OK  ] LinuxKPI: vfio pci_map_rom VBIOS image ...
+      [INFO] LinuxKPI: vfio msi=1 msix=4
+      [INFO] LinuxKPI: vfio irq=101 installed
+      [  OK  ] LinuxKPI: vfio suite complete
+      ```
+      252 `[  OK  ]`, no unrelated WARN; EDU IRQ + ctx suites green under
+      VFIO.  `scripts/vfio-check-rom.sh` reports `MATCH`
+      (guest `0x20ef861b` size 65536 == host `build/vfio/vbios.rom`).
+- [x] Known environment artifact: run-vfio's default std VGA is itself a
+      bochs VGA (`1234:1111`), so the P4 bochs canary runs but fails its BAR0
+      readback (256) because it is not the `bochs-display` device the canary
+      was written for.  Adding `-vga none -device virtio-vga` (the normal
+      desktop setup) makes the bochs suite skip and re-enables the C1 ROM
+      test; recorded in the gap log.
+- [x] fastfetch GPU line fixed: the disk image no longer bakes in
+      `VirtIO-GPU ... / Mesa llvmpipe`.  The config uses fastfetch's native
+      `"gpu"` module (PCI ID scan); running the guest's fastfetch 2.36.1 on
+      the host prints `GPU 2: AMD Raphael`, and in the guest it lists every
+      display-class PCI device automatically (AMD Raphael under run-vfio,
+      no driver required; stays correct once P6 binds amdgpu).
+- [ ] Interactive display run (GTK + virtio-vga) with fastfetch check is
+      maintainer-run; the headless evidence above is the C7 gate.
+
 ## Cross-phase notes
 
 - `run-vfio` (BDF default `0000:0e:00.0`) has not been booted with the GPU

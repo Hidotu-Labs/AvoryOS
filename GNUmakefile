@@ -299,6 +299,9 @@ run-linuxdrm: edk2-ovmf $(IMAGE_NAME).iso disk.img
 VFIO_BDF ?= 0000:0e:00.0
 VFIO_MEM ?= 4G
 VFIO_ROM ?= build/vfio/vbios.rom
+# Extra QEMU -device arguments for a run-vfio boot, e.g.
+#   make run-vfio VFIO_EXTRA='-device edu'
+VFIO_EXTRA ?=
 VFIO_COMMA := ,
 VFIO_ROM_OPT = $(if $(wildcard $(VFIO_ROM)),$(VFIO_COMMA)romfile=$(VFIO_ROM),)
 
@@ -314,8 +317,9 @@ run-vfio: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-drive file=disk.img,format=raw,if=none,id=nvme0 \
 		-device nvme,serial=avoryos0,drive=nvme0 \
 		-device vfio-pci,host=$(VFIO_BDF),rombar=1$(VFIO_ROM_OPT) \
-		-display none \
-		-serial stdio \
+		$(DISPLAY_OPT) \
+		-serial $(SERIAL) \
+		$(VFIO_EXTRA) \
 		$(QEMUFLAGS)
 
 .PHONY: run-dist
@@ -1122,7 +1126,7 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		debugfs -w -R "mkdir .config" ./part.img >/dev/null 2>&1 || true; \
 		debugfs -w -R "mkdir .config/fastfetch" ./part.img >/dev/null 2>&1 || true; \
 		debugfs -w -R "mkdir fastfetch" ./part.img >/dev/null 2>&1 || true; \
-		echo '{"general": {"detectVersion": false}, "logo": {"source": "/fastfetch/logo.txt", "type": "auto"}, "modules": ["title", "separator", "os", "kernel", "uptime", "packages", {"type": "shell", "format": "bash"}, "de", "wm", "terminal", "cursor", "cpu", {"type": "custom", "key": "GPU", "format": "VirtIO-GPU (virtio-vga, 2D) / Mesa llvmpipe (software 3D)"}, "memory", "swap", "disk", {"type": "localip", "key": "Local IP", "showIpv6": false}, "locale", "break", "colors"]}' > /tmp/ff_config.jsonc; \
+		echo '{"general": {"detectVersion": false}, "logo": {"source": "/fastfetch/logo.txt", "type": "auto"}, "modules": ["title", "separator", "os", "kernel", "uptime", "packages", {"type": "shell", "format": "bash"}, "de", "wm", "terminal", "cursor", "cpu", "gpu", "memory", "swap", "disk", {"type": "localip", "key": "Local IP", "showIpv6": false}, "locale", "break", "colors"]}' > /tmp/ff_config.jsonc; \
 		debugfs -w -R "rm .config/fastfetch/config.jsonc" ./part.img >/dev/null 2>&1 || true; \
 		debugfs -w -R "write /tmp/ff_config.jsonc .config/fastfetch/config.jsonc" ./part.img >/dev/null 2>&1 || true; \
 		debugfs -w -R "rm fastfetch/config.jsonc" ./part.img >/dev/null 2>&1 || true; \
@@ -1229,6 +1233,11 @@ setup:
 kernel: setup
 	$(MAKE) -C kernel
 
+# Optional guest kernel command line baked into the ISO (limine `cmdline:`).
+# linuxkpi_param_parse() applies kpi_* module parameters from it, e.g.:
+#   make run-vfio KERNEL_CMDLINE=kpi_vfio_test=1
+KERNEL_CMDLINE ?=
+
 $(IMAGE_NAME).iso: limine/limine kernel limine.conf
 	rm -rf iso_root
 	mkdir -p iso_root/boot
@@ -1238,6 +1247,12 @@ $(IMAGE_NAME).iso: limine/limine kernel limine.conf
 	# self-contained dist ISO copies the module-enabled configuration verbatim.
 	sed '/^[[:space:]]*module_path: boot():\/disk.img$$/d; /^[[:space:]]*module_string: disk.img$$/d' \
 		limine.conf > iso_root/boot/limine/limine.conf
+	@if [ -n '$(KERNEL_CMDLINE)' ]; then \
+		awk -v c='$(KERNEL_CMDLINE)' \
+			'{print} /^\/AvoryOS$$/ && !done {print "    cmdline: " c; done=1}' \
+			iso_root/boot/limine/limine.conf > iso_root/boot/limine/limine.conf.tmp; \
+		mv iso_root/boot/limine/limine.conf.tmp iso_root/boot/limine/limine.conf; \
+	fi
 	cp -v assets/boo.png iso_root/boot/limine/
 	mkdir -p iso_root/EFI/BOOT
 	cp -v limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/boot/limine/

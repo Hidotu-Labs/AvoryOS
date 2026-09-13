@@ -291,6 +291,40 @@ Update this file in the same change that introduces or closes a gap.
   hour-long userland stress evidence for this chunk; the 24 h protocol in
   the progress doc remains the user-run gate.
 
+### C7 — VFIO hardening + Raphael validation
+
+- **The Raphael VBIOS comes from VFCT, not a ROM BAR**
+  (`scripts/vfio-vbios.sh`): on this APU `/sys/bus/pci/devices/<bdf>/rom`
+  does not exist (no option ROM resource is assigned), so the original
+  ROM-node extraction path cannot work.  The script now falls back to the
+  system firmware's `VFCT` ACPI table (root-only), walks
+  `uefi_acpi_vfct.vbiosimageoffset` → `vfct_image_header` entries (PCI
+  bus/device/function, vendor/device, image length; Linux 6.6
+  `atomfirmware.h` layout), extracts the image matching the BDF, verifies
+  the `55 AA` signature and pads to the next power of two with `0xFF`.
+  The padding matters: QEMU sizes the ROM BAR to a power of two, and C7's
+  host/guest CRC32 comparison only matches if the file has the BAR size.
+- **Gated VFIO validation boot** (`GNUmakefile`, `test_phase5_vfio.c`): the
+  ISO can carry a limine `cmdline:` (`KERNEL_CMDLINE=...`), and
+  `kpi_vfio_test` (module parameter, default 0) makes the validation suite
+  run only when explicitly requested.  A normal P6a boot therefore never
+  has the test touch the passed-through GPU.  `run-vfio` also gained
+  `SERIAL` (headless captures), `VFIO_EXTRA` (e.g. `-device edu`) and uses
+  the shared `DISPLAY_OPT`, so `DISPLAY_OPT='-display none'` is headless
+  while the default opens a window.
+- **The default std VGA changes the P4 bochs canary outcome**: run-vfio
+  without `-vga none` leaves QEMU's std VGA (also `1234:1111`, a bochs VGA)
+  in the guest, so the bochs suite runs on it and fails the BAR0 pattern
+  readback (the canary was written for `-device bochs-display`).  Adding
+  `-vga none -device virtio-vga` makes the suite skip and gives the C1 ROM
+  test its virtio-vga device.  Environmental, not a driver regression.
+- **fastfetch's GPU line is native now** (`GNUmakefile`): the image used to
+  bake in a custom `VirtIO-GPU ... / Mesa llvmpipe` string.  It now uses
+  fastfetch's `"gpu"` module (PCI ID scan), which lists AMD Raphael as soon
+  as the passed-through device is enumerated and keeps working when amdgpu
+  binds in P6.  Renderer details (llvmpipe vs radeonsi) are no longer part
+  of the line.
+
 ## Phase 4 C5 gaps (bochs TTM canary, 2026-09-13)
 
 - **`page_to_phys()` must not walk `compound_head()`** (fixed in
