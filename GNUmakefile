@@ -340,6 +340,18 @@ run-c4: VFIO_EXTRA = -device edu
 run-c4: QEMUFLAGS = -vga none -device virtio-vga,xres=1280,yres=800
 run-c4: run-vfio
 
+# Phase 6 C5: amdgpu queues/VM/BOs/CS.  Same bring-up command line as C4
+# (headless IP set, no DCN) but interactive: the GTK window is where
+# bin/test_kpi_amdgpu is run after login, while the serial log lands in
+# build/logs/p6-c5.log.  Start from a cold GPU (`make reset-gpu` or a host
+# reboot; see docs/amdgpu-testing.md).
+.PHONY: run-c5
+run-c5: KERNEL_CMDLINE = kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.dc=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x1
+run-c5: SERIAL = file:build/logs/p6-c5.log
+run-c5: VFIO_EXTRA = -device edu
+run-c5: QEMUFLAGS = -vga none -device virtio-vga,xres=1280,yres=800
+run-c5: run-vfio
+
 # Cold-start the passed GPU on the host before a C4+ boot.  QEMU/VFIO does not
 # reset the device on VM exit, and the guest driver's bring-up sequence assumes
 # a cold device (a warm one can answer AUTOLOAD_RLC with TEE_ERROR_BUSY or come
@@ -714,6 +726,7 @@ disk.img: userland/test_watchdog.elf
 disk.img: userland/test_kpi_dmabuf.elf
 disk.img: userland/test_kpi_drm.elf
 disk.img: userland/test_kpi_bochs.elf
+disk.img: userland/test_kpi_amdgpu.elf
 disk.img: build/test_fw.bin build/firmware/.stamp
 disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 
@@ -896,6 +909,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/test_kpi_drm.elf bin/test_kpi_drm"; \
 		echo "rm bin/test_kpi_bochs"; \
 		echo "write userland/test_kpi_bochs.elf bin/test_kpi_bochs"; \
+		echo "rm bin/test_kpi_amdgpu"; \
+		echo "write userland/test_kpi_amdgpu.elf bin/test_kpi_amdgpu"; \
 		echo "rm bin/test_child_notify"; \
 		echo "write userland/test_child_notify.elf bin/test_child_notify"; \
 		echo "rm bin/test_pty_master"; \
@@ -1236,6 +1251,7 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field bin/test_kpi_dmabuf mode 0100755"; \
 		echo "set_inode_field bin/test_kpi_drm mode 0100755"; \
 		echo "set_inode_field bin/test_kpi_bochs mode 0100755"; \
+		echo "set_inode_field bin/test_kpi_amdgpu mode 0100755"; \
 		echo "set_inode_field bin/test_child_notify mode 0100755"; \
 		echo "set_inode_field bin/test_pty_master mode 0100755"; \
 		echo "set_inode_field bin/test_uaccess_bench mode 0100755"; \
@@ -1567,6 +1583,14 @@ userland/test_kpi_dmabuf.elf: userland/test_kpi_dmabuf.c $(MUSL_LIBC) \
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
 		-I$(CURDIR)/kernel/linuxkpi/include \
 		userland/test_kpi_dmabuf.c -o userland/test_kpi_dmabuf.elf -lpthread
+
+# Phase 6 C5 amdgpu test: raw-ioctl GEM/PRIME/CTX/VM/BO_LIST, an SDMA copy
+# through AMDGPU_CS + WAIT_CS, and a 1k BO churn loop with a PMM invariant.
+userland/test_kpi_amdgpu.elf: userland/test_kpi_amdgpu.c $(MUSL_LIBC) \
+		kernel/linuxkpi/include/uapi/kpi_dmabuf.h
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		-I$(CURDIR)/kernel/linuxkpi/include \
+		userland/test_kpi_amdgpu.c -o userland/test_kpi_amdgpu.elf
 
 # Phase 3 LinuxKPI DRM test: vkms dumb-buffer GEM mmap/write, renderD128
 # sanity and a modetest-lite atomic enable/disable.  Uses the musl sysroot's

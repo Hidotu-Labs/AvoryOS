@@ -1,5 +1,6 @@
-/* LinuxKPI wound/wait mutex (PI-less, no wounding yet).
- * See linux/ww_mutex.h for the contract and deviations. */
+/* LinuxKPI wound/wait mutex (PI-less, wounding not implemented).
+ * Multi-lock users must acquire in one global order; see linux/ww_mutex.h and
+ * the P6 C5 entry in docs/linuxkpi-gaps.md for the rationale. */
 
 #include <linux/errno.h>
 #include <linux/ww_mutex.h>

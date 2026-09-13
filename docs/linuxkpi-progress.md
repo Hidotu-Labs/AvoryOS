@@ -1656,12 +1656,30 @@ them).  First increment: the P2 VMA-bridge prerequisite, test-first.
     `device-node mapping PTEs zapped too (same address_space)`,
     `unmap_mapping_range did not close wrappers`,
     `both wrappers closed exactly once`.
-- Next (C5 remainder): ww_mutex eviction/contention stress + wound
-  documentation, `amdgpu_bo`/kref teardown audit,
-  `bin/test_kpi_amdgpu` (GEM VRAM/GTT, mmap, PRIME, CTX, VM map/unmap,
-  SDMA-copy CS + `WAIT_CS`, timeout path, INFO/BO list), 1k BO loop
-  invariants.  The hardware half needs a cold GPU (host reboot; see
-  `docs/amdgpu-testing.md`) and `amdgpu.modeset=0`.
+- [x] ww_mutex / BO-prerequisite stress (2026-09-13): a three-thread
+      ordered multi-lock acquisition stress over four ww_mutex BO slots
+      (`test_phase1_core6.c`), and a pinned BO churned against 256 unpinned
+      allocations (every fourth moved through VRAM) in the TTM harness
+      (`test_phase4_ttm.c`).  Wounding stays unimplemented; the ordering
+      assumption and the reason a runtime WARN was rejected are documented
+      in the gap log and `linux/ww_mutex.h`.
+- [x] `bin/test_kpi_amdgpu` (userland, raw ioctls) + GNUmakefile/`disk.img`
+      wiring (mode 0755) + `run-c5` target (interactive GTK, serial to
+      `build/logs/p6-c5.log`).  The suite covers INFO, GEM VRAM/GTT mmap,
+      PRIME fd roundtrip, CTX, GEM_VA, BO_LIST, an SDMA `COPY_LINEAR` through
+      `AMDGPU_CS`/`WAIT_CS` with byte-for-byte verification, and a
+      1000-iteration BO churn loop with a PMM free-page invariant.
+- Evidence (stress + tooling):
+  - Headless `make run-linuxdrm` (no VFIO, cold GPU untouched): **265
+    `[  OK  ]`, 0 `[FAIL]`, login reached**;
+    `[  OK  ] LinuxKPI: ww_mutex multi-lock ordered correct`;
+    `[  OK  ] LinuxKPI: TTM pinned BO survives unpinned eviction churn`.
+  - `disk.img` rebuilt and verified: 11 amdgpu firmware blobs,
+    `bin/test_kpi_amdgpu` mode 0755 size 48104, `bin/test_kpi_dmabuf` size
+    61400.
+- Next: cold-GPU hardware run (`make run-c5`, then `bin/test_kpi_amdgpu`)
+  for the C5 exit evidence; record it here, add the gap-log result, tag
+  `p6-6d`.
 
 ## Cross-phase notes
 

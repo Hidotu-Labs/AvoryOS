@@ -474,6 +474,23 @@ Landed 2026-09-13 (kernel prerequisites; no CS tests yet):
   through the importing device node is invalidated together with the fd
   mapping.  `test_kpi_dmabuf` asserts both PTE pools are zapped and that a
   passed `unmap_mapping_range` does not close either wrapper early.
+- **Stress coverage for the BO prerequisites** (2026-09-13): a three-thread
+  ordered multi-lock stress acquires four ww_mutex BO slots in one global
+  order under contention (`test_phase1_core6.c`, `ww_mutex multi-lock
+  ordered`), and the TTM harness pins a BO then churns 256 unpinned
+  allocations (every fourth moved through VRAM) to prove the pinned buffer's
+  content and pin count survive (`test_phase4_ttm.c`).  Wounding stays
+  unimplemented; see the ww_mutex entry above for why a runtime WARN was
+  rejected in favour of the documented ordering assumption plus this test.
+- **`bin/test_kpi_amdgpu`** (userland, raw ioctls): discovers the amdgpu DRM
+  node by `DRM_IOCTL_VERSION` name, then exercises `AMDGPU_INFO`, GEM
+  create/mmap in VRAM and GTT, a PRIME fd roundtrip, `AMDGPU_CTX` and
+  `AMDGPU_GEM_VA`, `AMDGPU_BO_LIST`, an SDMA `COPY_LINEAR` through
+  `AMDGPU_CS` + `AMDGPU_WAIT_CS` with a byte-for-byte destination check, and
+  a 1000-iteration BO create/map/free loop with a native PMM free-page
+  invariant.  The bad-CS/fence-timeout recovery path stays in C8 (it needs
+  the reset paths).  Hardware evidence lands in the C5 progress entry; the
+  `run-c5` target boots it interactively from a cold GPU.
 
 ## Phase 5 gaps (full I/O foundations)
 
@@ -1086,6 +1103,14 @@ divergences for its chunk; the Phase 5 exit matrix in
   `drm_modeset_lock.c` all rely on the truthy convention.  The Phase 3
   "0/-EBUSY convention" note was wrong and caused
   `WARN_ON(!dma_resv_trylock())` to fire in TTM's BO init.
+  **P6 C5 decision (2026-09-13):** wounding stays unimplemented for now.
+  TTM/amdgpu reserve BO sets in a global order, so the ordered path is the
+  one that runs; a runtime WARN cannot tell that safe contention from a real
+  cycle without wait tracking, so the assumption is documented here and
+  exercised by the three-thread ordered multi-lock stress in
+  `test_phase1_core6.c` (`ww_mutex multi-lock ordered`).  If a future
+  workload acquires ww locks in conflicting orders, implement wound/wait
+  before trusting it (C8 owns the error-injection side).
 - **rbtree augmented internals are an excerpt** (`linuxkpi/src/rbtree_aug.c`,
   verbatim upstream `lib/rbtree.c`): native `kernel/src/lib/rbtree.c` still
   owns the base `rb_*` API; importing upstream `lib/rbtree.c` requires

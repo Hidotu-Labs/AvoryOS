@@ -74,6 +74,79 @@ static bool test_ww_mutex(void) {
   return ok;
 }
 
+/* ── ww_mutex: multi-lock ordered acquisition (TTM/amdgpu BO style) ─────── */
+
+#define WW_BO_LOCKS 4
+static struct ww_class ww_multi_cls;
+static struct ww_mutex ww_multi[WW_BO_LOCKS];
+
+struct ww_multi_test {
+  volatile int iterations;
+  volatile int done;
+  volatile int bad;
+};
+
+static int ww_multi_thread(void *arg) {
+  struct ww_multi_test *t = arg;
+  struct ww_acquire_ctx ctx;
+
+  ww_acquire_init(&ctx, &ww_multi_cls);
+  for (int i = 0; i < 150; i++) {
+    int n = 0;
+
+    /* Every thread acquires in the same global lock order - the invariant
+     * TTM/amdgpu keep when reserving a BO set.  Wounding is not implemented
+     * in this LinuxKPI (see linux/ww_mutex.h), so the order is what makes
+     * multi-lock acquisition deadlock-free; this stress proves the ordered
+     * pattern works under real contention. */
+    for (int k = 0; k < WW_BO_LOCKS; k++) {
+      if (ww_mutex_lock(&ww_multi[k], &ctx) == 0)
+        n++;
+      else
+        break;
+    }
+    for (int k = n - 1; k >= 0; k--)
+      ww_mutex_unlock(&ww_multi[k]);
+    if (n != WW_BO_LOCKS)
+      __atomic_store_n(&t->bad, 1, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&t->iterations, 1, __ATOMIC_RELEASE);
+  }
+  ww_acquire_done(&ctx);
+  __atomic_add_fetch(&t->done, 1, __ATOMIC_RELEASE);
+  return 0;
+}
+
+static bool test_ww_mutex_multi(void) {
+  static struct ww_multi_test t;
+  struct task_struct *th[3];
+
+  for (int i = 0; i < WW_BO_LOCKS; i++)
+    ww_mutex_init(&ww_multi[i], &ww_multi_cls);
+  t.iterations = 0;
+  t.done = 0;
+  t.bad = 0;
+
+  for (int i = 0; i < 3; i++) {
+    th[i] = kthread_run(ww_multi_thread, &t, "kpi/wwm");
+    if (IS_ERR(th[i]))
+      return false;
+  }
+
+  unsigned long deadline = jiffies + msecs_to_jiffies(10000);
+  while (__atomic_load_n(&t.done, __ATOMIC_ACQUIRE) < 3 &&
+         time_before(jiffies, deadline))
+    msleep(1);
+
+  bool ok = __atomic_load_n(&t.done, __ATOMIC_ACQUIRE) == 3 &&
+            __atomic_load_n(&t.bad, __ATOMIC_ACQUIRE) == 0 &&
+            t.iterations == 3 * 150;
+  for (int i = 0; i < 3; i++)
+    kthread_stop(th[i]);
+  for (int i = 0; i < WW_BO_LOCKS; i++)
+    ww_mutex_destroy(&ww_multi[i]);
+  return ok;
+}
+
 /* ── rwsem: readers share, writer excludes ──────────────────────────────── */
 
 static DECLARE_RWSEM(core_rwsem);
@@ -381,6 +454,7 @@ void linuxkpi_test_phase1_core(void) {
     bool (*fn)(void);
   } tests[] = {
       {"ww_mutex", test_ww_mutex},
+      {"ww_mutex multi-lock ordered", test_ww_mutex_multi},
       {"rwsem", test_rwsem},
       {"semaphore", test_semaphore},
       {"wait_bit", test_wait_bit},

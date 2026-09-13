@@ -400,6 +400,98 @@ static void p4t_test_loop(void) {
   kfree(d);
 }
 
+/* P6 C5 prerequisite: a pinned BO must never be evicted or moved by churn of
+ * unpinned buffers.  The test device's shrinker is inert, so the churn forces
+ * fresh allocations and VRAM validations next to the pinned object; the
+ * pinned BO's content and pin count must survive.  (The real eviction path
+ * runs on the passed GPU in the C5 hardware boot; this pins down the
+ * pin/validate semantics in the portable TTM harness.) */
+static void p4t_test_pinned_eviction(void) {
+  struct p4t_dev *d = kzalloc(sizeof(*d), GFP_KERNEL);
+  struct ttm_placement pl = {.num_placement = 1, .placement = &p4t_sys_place};
+  struct ttm_place vram_place = {.fpfn = 0,
+                                 .lpfn = 0,
+                                 .mem_type = TTM_PL_VRAM,
+                                 .flags = 0};
+  struct ttm_placement vram_pl = {.num_placement = 1, .placement = &vram_place};
+  struct ttm_operation_ctx ctx = {.interruptible = true};
+  struct ttm_buffer_object *pinned = NULL, *churn = NULL;
+  struct ttm_bo_kmap_obj kmap;
+  bool is_iomem = false;
+  unsigned char *p;
+  int errs = 0, ret;
+
+  if (!d || p4t_dev_init(d) != 0) {
+    p4t_fail("pinned-eviction device init", 0);
+    kfree(d);
+    return;
+  }
+  if (ttm_range_man_init(&d->bdev, TTM_PL_VRAM, true,
+                         64UL * 1024 * 1024 / PAGE_SIZE)) {
+    p4t_fail("pinned-eviction VRAM manager", 0);
+    goto out_dev;
+  }
+
+  if (p4t_bo_new(&d->bdev, &pl, &pinned)) {
+    p4t_fail("pinned BO alloc", 0);
+    goto out_man;
+  }
+  ret = ttm_bo_kmap(pinned, 0, 1, &kmap);
+  if (ret) {
+    errs++;
+  } else {
+    p = ttm_kmap_obj_virtual(&kmap, &is_iomem);
+    for (int i = 0; i < 256; i++)
+      p[i] = (unsigned char)(i ^ 0x5a);
+    ttm_bo_kunmap(&kmap);
+  }
+  ttm_bo_pin(pinned);
+
+  for (int i = 0; i < 256; i++) {
+    churn = NULL;
+    if (p4t_bo_new(&d->bdev, &pl, &churn)) {
+      errs++;
+      continue;
+    }
+    /* Move every fourth churn BO through VRAM to exercise the managers. */
+    if ((i & 3) == 0 &&
+        ttm_bo_reserve(churn, false, false, NULL) == 0) {
+      ttm_bo_validate(churn, &vram_pl, &ctx);
+      ttm_bo_unreserve(churn);
+    }
+    ttm_bo_put(churn);
+  }
+
+  ret = ttm_bo_kmap(pinned, 0, 1, &kmap);
+  if (ret == 0) {
+    int bad = -1;
+
+    p = ttm_kmap_obj_virtual(&kmap, &is_iomem);
+    for (int i = 0; i < 256; i++) {
+      if (p[i] != (unsigned char)(i ^ 0x5a)) {
+        bad = i;
+        break;
+      }
+    }
+    ttm_bo_kunmap(&kmap);
+    if (bad < 0 && pinned->pin_count > 0 && errs == 0)
+      p4t_ok("pinned BO survives unpinned eviction churn");
+    else
+      p4t_fail("pinned BO content/pin after churn",
+               bad < 0 ? pinned->pin_count : bad);
+  } else {
+    p4t_fail("pinned BO kmap after churn", ret);
+  }
+
+  ttm_bo_unpin(pinned);
+  ttm_bo_put(pinned);
+out_man:
+  ttm_range_man_fini(&d->bdev, TTM_PL_VRAM);
+out_dev:
+  p4t_dev_fini(d);
+  kfree(d);
+}
+
 void linuxkpi_test_phase4_ttm(void) {
   p4t_failures = 0;
   klog_puts("[LINUXKPI] Phase 4 TTM self-test\n");
@@ -407,6 +499,7 @@ void linuxkpi_test_phase4_ttm(void) {
   p4t_test_device();
   p4t_test_system_bo();
   p4t_test_vram_move();
+  p4t_test_pinned_eviction();
   p4t_test_loop();
 
   if (p4t_failures == 0)

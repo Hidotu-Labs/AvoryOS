@@ -135,6 +135,16 @@ nothing is installed by default yet.
   (`KERNEL_CMDLINE` is baked into the ISO; the top Makefile now stamps its
   value, so changing it always rebuilds the ISO instead of silently reusing
   the previous command line.)
+- **C5 hardware runs use `make run-c5`.**  Same bring-up command line as
+  `run-c4`, but the GTK window is kept so `bin/test_kpi_amdgpu` can be run
+  interactively after login; the serial log lands in `build/logs/p6-c5.log`.
+  Start from a cold GPU (`make reset-gpu` when it can help, otherwise a host
+  reboot), boot, then:
+  ```sh
+  bin/test_kpi_amdgpu
+  ```
+  It discovers the amdgpu node by DRM version name and skips cleanly when the
+  driver is not bound.
 - **One QEMU per disk image.**  Close the interactive session before a
   headless run, or point the run at a scratch copy
   (`cp --reflink=auto disk.img build/disk-c6.img`).

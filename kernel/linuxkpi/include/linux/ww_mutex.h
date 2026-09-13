@@ -5,9 +5,14 @@
  *
  * ww_mutex is the wound/wait mutex used by DRM modeset and dma_resv to avoid
  * ABBA deadlocks.  This implementation is a plain sleeping mutex with the
- * acquire-context stamps recorded; wounding is not implemented yet, so
- * multi-lock acquire sequences are not deadlock-free (tracked in the progress
- * doc).  Implementation: linuxkpi/src/ww_mutex.c. */
+ * acquire-context stamps recorded; wounding is NOT implemented, so a
+ * multi-lock acquire sequence is deadlock-free only when every caller
+ * acquires in one global order - the invariant TTM/amdgpu keep when
+ * reserving a BO set.  A runtime WARN cannot distinguish that safe ordered
+ * contention from a real cycle without wait tracking, so the ordering
+ * assumption is documented (P6 C5 gap log) and exercised by the ordered
+ * multi-lock stress in test_phase1_core6.c instead.
+ * Implementation: linuxkpi/src/ww_mutex.c. */
 
 #include <linux/mutex.h>
 #include <linux/sched.h>
