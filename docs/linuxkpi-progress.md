@@ -1016,6 +1016,43 @@ MSI/MSI-X), C3 (ACPI tables + firmware loader), C4 (minimal i2c core) and C5
       no timeout.  C5 is closed.  Divergences in `docs/linuxkpi-gaps.md`
       P5 C5.
 
+### C6 — IRQs-on syscalls + context tracking, verified 2026-09-13
+
+- [x] Correction to the plan sketch (task 1): IA32_FMASK must keep masking
+      IF.  Clearing it would let an interrupt hit the window between SYSCALL
+      and the kernel GS/stack setup (kernel CS with user GS, or an ISR frame
+      on the user RSP).  Instead `syscall_entry.asm` runs `sti` once the
+      kernel GS, kernel stack and register frame are in place, so the whole
+      dispatch is interruptible; `fork_return_to_userspace()` gained the
+      missing `cli` before its swapgs/sysret.  The return paths already
+      masked before swapgs.  This is the chunk's own revertable commit.
+- [x] `might_sleep()` is real: new `#include_next` overlay
+      `linux/kernel.h` + `__kpi_might_sleep()` in `linuxkpi/src/preempt.c`
+      warns (WARN, never BUG) once per caller site when
+      `preempt_count() != 0`, `in_interrupt()`, or IRQs are masked; every
+      hit is counted for tests (`kpi_might_sleep_warnings()`).
+- [x] `test_phase5_ctx.c` written and wired: process-context invariants,
+      `preempt_disable`/`enable` transitions, `might_sleep()` quiet in
+      process context (plus a real `msleep`), atomic-section detection, and
+      an EDU MSI handler that observes `in_interrupt()`/`in_atomic()` and
+      gets a warning from `might_sleep()`.
+- [x] Boot verification (2026-09-13, headless, `-smp 4`): 249 `[  OK  ]`
+      lines, zero `[FAIL]`, `ctx suite complete`, every C0–C5 suite still
+      green in the same boot.  The only WARNING is the deliberate one:
+      ```
+      might_sleep() from atomic context (src/tests/linuxkpi/linux/test_phase5_ctx.c:113, preempt=1 irq=0)
+      WARNING: at linuxkpi/src/preempt.c:105 (imported WARN)
+      [  OK  ] LinuxKPI: ctx might_sleep detects atomic calls
+      ```
+- [ ] 1 h agent soak: **waived by the maintainer on 2026-09-13** ("I don't
+      want 1 hour soak test").  Userland stress evidence stays the
+      interactive `bin/test_kpi_drm` / `bin/test_kpi_dmabuf` runs and the
+      documented 24 h protocol below.
+- [ ] 24 h user protocol (documented, user-run): boot interactive with
+      serial captured to `build/logs/p5-soak-24h.log`, log into the desktop,
+      run `bin/test_kpi_dmabuf 86400`, leave the session; after 24 h check
+      the log for `delta ≈ 0`, no `[FAIL]`, no hang/WARN.  Pending (user).
+
 ## Cross-phase notes
 
 - `run-vfio` (BDF default `0000:0e:00.0`) has not been booted with the GPU

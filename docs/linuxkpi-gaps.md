@@ -252,6 +252,45 @@ Update this file in the same change that introduces or closes a gap.
   growing suite list needed more than the old 30 s bound as a safety net;
   a normal headless boot completes the tests in roughly ten seconds.
 
+### C6 — IRQs-on syscalls + context tracking
+
+- **IRQs are enabled for the syscall dispatch from the entry code, not by
+  clearing FMASK** (`kernel/src/syscalls/syscall_entry.asm`,
+  `syscall.c`): the original sketch proposed masking only AC in
+  `IA32_FMASK`, but an interrupt between the SYSCALL instruction and the
+  kernel-stack/GS setup would run with kernel CS and user GS (or push its
+  frame on the user RSP), so IF stays masked by FMASK.  The entry now runs
+  `sti` once the kernel GS, stack and register frame are in place and the
+  return paths already `cli` before swapgs/sysret.  `fork_return.asm` gained
+  the missing `cli` before its swapgs/sysret; without it, IRQs-on syscalls
+  let an ISR observe user GS in that window.  The scheduler punt
+  (`sched_check_resched(true)`) stays as a deterministic reschedule point.
+- **`might_sleep()` is an additive kernel.h overlay**
+  (`linuxkpi/include/linux/kernel.h`, `linuxkpi/src/preempt.c`): an
+  `#include_next` wrapper keeps stock `<linux/kernel.h>` (so all of its
+  other definitions stay intact) and replaces the no-op `might_sleep()`
+  with `__kpi_might_sleep()`.  It warns when `preempt_count() != 0`,
+  `in_interrupt()`, or IRQs are masked; it is a WARN, never a BUG.
+- **The warning is once per caller site, capped at 8 sites**
+  (`linuxkpi/src/preempt.c`): stock `WARN_ONCE` would have a single
+  once-flag at the `preempt.c` call site, so the ctx self-test's deliberate
+  warning (one per boot) would silence a real violation reported later from
+  a different file/line.  The table compares `__FILE__` pointers, so the
+  ctx test consumes only its own site.  Every atomic call increments
+  `kpi_might_sleep_warnings()` (the tests assert on it) even when the print
+  is suppressed.
+- **One `might_sleep()` WARNING per boot is expected evidence**
+  (`kernel/src/tests/linuxkpi/linux/test_phase5_ctx.c`): the C6 suite
+  deliberately calls `might_sleep()` from `preempt_disable()` and from an
+  EDU MSI handler, so every boot logs exactly one
+  `might_sleep() from atomic context (...)` line and the corresponding
+  `WARNING: at linuxkpi/src/preempt.c:NN (imported WARN)`.  Any other WARN
+  in a C6 boot is a finding.
+- **The 1 h agent soak was waived by the maintainer (2026-09-13)**: C6's
+  kernel-side regression is green (249 OK, no FAIL), but there is no
+  hour-long userland stress evidence for this chunk; the 24 h protocol in
+  the progress doc remains the user-run gate.
+
 ## Phase 4 C5 gaps (bochs TTM canary, 2026-09-13)
 
 - **`page_to_phys()` must not walk `compound_head()`** (fixed in
