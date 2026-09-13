@@ -359,6 +359,16 @@ Update this file in the same change that introduces or closes a gap.
   (`CP_PQ_WPTR_POLL_CNTL = 0`, `CP_PQ_STATUS = DOORBELL_ENABLE`) and does
   not call `gfx_v10_0_kiq_init_queue()` again.  Remove both once the
   pre-MEC writes are known to stick (host cold-start handling).
+- **The reload must not rewrite `RLC_CP_SCHEDULERS`** (same boot series):
+  with the write-only reload the CPU doorbell now reaches the HQD
+  (`CP_HQD_PQ_WPTR_LO` reads 0x100 right after the write, and
+  `CP_MEC_DOORBELL_RANGE_LOWER/UPPER` read back 0..0x450).  Calling
+  `gfx_v10_0_kiq_setting()` from the reload (it writes `RLC_CP_SCHEDULERS`
+  in two steps, 0x48 then 0xC8) after the MEC has started makes the RLC
+  reset the freshly loaded HQD - `CP_HQD_PQ_WPTR_LO`/`DOORBELL_CONTROL`
+  read back 0 at the ring test and the MEC never fetches.  The pre-MEC
+  `kiq_setting()` write is a global (non-GRBM-indexed) register and does
+  stick, so the reload leaves it alone.
 - **Imported-tree divergences are tracked patches, not hand edits** (C4
   redo, 2026-09-13): the first C4 iteration had edited six files under
   `kernel/linux/` directly (behavior changes plus `kpi-trace` diagnostics).

@@ -18,7 +18,7 @@
  		WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST,
  		       mqd->cp_hqd_dequeue_request);
  		WREG32_SOC15(GC, 0, mmCP_HQD_PQ_RPTR,
-@@ -6812,6 +6823,94 @@
+@@ -6812,6 +6823,96 @@
  	return 0;
  }
  
@@ -98,8 +98,10 @@
 +	mqd = ring->mqd_ptr;
 +
 +	mutex_lock(&adev->srbm_mutex);
++	/* The RLC_CP_SCHEDULERS KIQ entry was programmed by the pre-MEC
++	 * gfx_v10_0_kiq_setting(); rewriting it after the MEC starts makes
++	 * the RLC reset the freshly loaded HQD, so leave it alone. */
 +	nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
-+	gfx_v10_0_kiq_setting(ring);
 +	gfx_v10_0_kiq_load_hqd_writes(adev, ring, mqd);
 +	nv_grbm_select(adev, 0, 0, 0, 0);
 +	mutex_unlock(&adev->srbm_mutex);
@@ -113,7 +115,7 @@
  static int gfx_v10_0_kcq_resume(struct amdgpu_device *adev)
  {
  	struct amdgpu_ring *ring = NULL;
-@@ -6835,6 +6934,15 @@
+@@ -6835,6 +6936,15 @@
  		if (r)
  			goto done;
  	}
