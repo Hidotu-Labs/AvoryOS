@@ -337,6 +337,20 @@ Update this file in the same change that introduces or closes a gap.
   candidate re-enabled ~50 us after the MEC unhalt, before the MEC had
   settled, and its write was lost.  Remove both once the upstream sequence
   handles a stale active HQD (or the host resets the GPU before each guest).
+- **CP_HQD_* writes are dropped while the MEC is halted** (root cause found
+  by the C4 diagnostic boot, 2026-09-13; supersedes the "doorbell does not
+  survive the MEC start" reading): every register write made by
+  `gfx_v10_0_kiq_init_register()` reads back as 0
+  (`dbctl wrote=40000000 read=00000000`, `active=0`, `pq_base=0`) because
+  the call runs from `gfx_v10_0_kiq_resume()`, *before*
+  `gfx_v10_0_cp_compute_enable(true)` unhalts the MEC.  Immediately after
+  the unhalt the same dbctl write sticks (read=40000000), proving the CP
+  block rejects the pre-unhalt writes; the KIQ HQD is then empty and the
+  ring test times out with the doorbell enabled and `CP_HQD_ACTIVE=0`.
+  Workaround: `gfx_v10_0_kiq_reload_hqd()` re-runs the HQD load (reserve +
+  kmap + `gfx_v10_0_kiq_init_queue()`) from `gfx_v10_0_kcq_resume()` after
+  the unhalt; it mirrors the upstream compute-KCQ ordering.  Remove once
+  the pre-MEC writes are known to stick (host cold-start handling).
 - **Imported-tree divergences are tracked patches, not hand edits** (C4
   redo, 2026-09-13): the first C4 iteration had edited six files under
   `kernel/linux/` directly (behavior changes plus `kpi-trace` diagnostics).

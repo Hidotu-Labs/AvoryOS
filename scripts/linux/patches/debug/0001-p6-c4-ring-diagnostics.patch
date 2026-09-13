@@ -314,21 +314,18 @@
  	amdgpu_bo_kunmap(ring->mqd_obj);
  	ring->mqd_ptr = NULL;
  	amdgpu_bo_unreserve(ring->mqd_obj);
-@@ -6849,6 +7030,11 @@
- 	dbctl = REG_SET_FIELD(dbctl, CP_HQD_PQ_DOORBELL_CONTROL,
- 			      DOORBELL_OFFSET, ring->doorbell_index);
- 	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL, dbctl);
+@@ -6849,6 +7030,8 @@
+ 		return r;
+ 	}
+ 	r = gfx_v10_0_kiq_init_queue(ring);
 +	/* AVORYOS P6 C4 debug (temporary) */
-+	dev_info(adev->dev,
-+		 "kpi-trace: kiq late dbctl wrote=%08x read=%08x active=%08x\n",
-+		 dbctl, RREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL),
-+		 RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE));
- 	nv_grbm_select(adev, 0, 0, 0, 0);
- 	mutex_unlock(&adev->srbm_mutex);
- }
-@@ -6882,6 +7068,10 @@
- 	if (!adev->enable_mes_kiq)
- 		gfx_v10_0_kiq_reprogram_doorbell(adev);
++	gfx_v10_0_kpi_hqd_dump(adev, ring, "kiq-reload-done");
+ 	amdgpu_bo_kunmap(ring->mqd_obj);
+ 	ring->mqd_ptr = NULL;
+ 	amdgpu_bo_unreserve(ring->mqd_obj);
+@@ -6888,6 +7071,10 @@
+ 			goto done;
+ 	}
  
 +	/* AVORYOS P6 C4 debug (temporary) */
 +	gfx_v10_0_kpi_hqd_dump(adev, &adev->gfx.kiq[0].ring,
@@ -337,7 +334,7 @@
  	r = amdgpu_gfx_enable_kcq(adev, 0);
  done:
  	return r;
-@@ -6910,10 +7100,13 @@
+@@ -6916,10 +7103,13 @@
  		r = amdgpu_mes_kiq_hw_init(adev);
  	else
  		r = gfx_v10_0_kiq_resume(adev);
@@ -351,7 +348,7 @@
  	if (r)
  		return r;
  
-@@ -8290,6 +8483,21 @@
+@@ -8296,6 +8486,21 @@
  		if (ring->use_doorbell) {
  			atomic64_set((atomic64_t *)ring->wptr_cpu_addr,
  				     ring->wptr);

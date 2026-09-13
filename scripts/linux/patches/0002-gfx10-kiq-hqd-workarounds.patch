@@ -1,0 +1,75 @@
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+@@ -6632,6 +6632,17 @@
+ 				break;
+ 			udelay(1);
+ 		}
++		/* AVORYOS P6 C4: a PCI/VFIO reset does not reset the CP, so a
++		 * previous boot can leave this HQD active.  While the MEC is
++		 * halted the dequeue request above cannot complete, and the
++		 * half-deactivated queue then silently drops the doorbell
++		 * programming below (KIQ ring test times out with dbctl=0).
++		 * Force the queue inactive and clear the pending request
++		 * before reprogramming it. */
++		if (RREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE) & 1) {
++			WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST, 0);
++			WREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE, 0);
++		}
+ 		WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST,
+ 		       mqd->cp_hqd_dequeue_request);
+ 		WREG32_SOC15(GC, 0, mmCP_HQD_PQ_RPTR,
+@@ -6812,6 +6823,38 @@
+ 	return 0;
+ }
+ 
++/* AVORYOS P6 C4: re-load the KIQ HQD after the MEC starts.
++ *
++ * On this VFIO guest the CP block silently drops CP_HQD_* register writes
++ * made while the MEC is halted: gfx_v10_0_kiq_init_register() runs from
++ * gfx_v10_0_kiq_resume() before gfx_v10_0_cp_compute_enable(true), and every
++ * write reads back 0 (dbctl=0, active=0, pq_base=0).  The compute KCQ HQDs
++ * are programmed after the MEC start and stick; the KIQ HQD was not, so the
++ * KIQ ring test then times out with the doorbell enabled but no queue
++ * active.  Re-run the HQD load now that the MEC is running.  This mirrors
++ * the upstream compute-KCQ ordering; remove once the pre-MEC writes are
++ * known to stick (host cold-start handling).
++ */
++static int gfx_v10_0_kiq_reload_hqd(struct amdgpu_device *adev)
++{
++	struct amdgpu_ring *ring = &adev->gfx.kiq[0].ring;
++	int r;
++
++	r = amdgpu_bo_reserve(ring->mqd_obj, false);
++	if (unlikely(r != 0))
++		return r;
++	r = amdgpu_bo_kmap(ring->mqd_obj, (void **)&ring->mqd_ptr);
++	if (unlikely(r != 0)) {
++		amdgpu_bo_unreserve(ring->mqd_obj);
++		return r;
++	}
++	r = gfx_v10_0_kiq_init_queue(ring);
++	amdgpu_bo_kunmap(ring->mqd_obj);
++	ring->mqd_ptr = NULL;
++	amdgpu_bo_unreserve(ring->mqd_obj);
++	return r;
++}
++
+ static int gfx_v10_0_kcq_resume(struct amdgpu_device *adev)
+ {
+ 	struct amdgpu_ring *ring = NULL;
+@@ -6835,6 +6878,15 @@
+ 		if (r)
+ 			goto done;
+ 	}
++
++	/* AVORYOS P6 C4: the MEC is running now; re-load the KIQ HQD whose
++	 * pre-MEC register writes this environment dropped, before the ring
++	 * test that depends on it. */
++	if (!adev->enable_mes_kiq) {
++		r = gfx_v10_0_kiq_reload_hqd(adev);
++		if (r)
++			goto done;
++	}
+ 
+ 	r = amdgpu_gfx_enable_kcq(adev, 0);
+ done:
