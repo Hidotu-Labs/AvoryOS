@@ -641,6 +641,12 @@ AetherDE/demo-client/aether-window: AetherDE/demo-client/main.c $(ALPINE_STAMP) 
 
 
 # Create a 5GB ext4 disk image with sample files for testing
+# Deterministic 4 KB firmware blob read by the Phase 5 firmware self-test
+# (byte i = (i * 7 + 3) & 0xff).  Staged into the rootfs /lib/firmware below.
+build/test_fw.bin: GNUmakefile
+	@mkdir -p build
+	@python3 -c 'import sys; open(sys.argv[1], "wb").write(bytes(((i * 7 + 3) & 0xff) for i in range(4096)))' $@
+
 disk.img: GNUmakefile userland/winoptions userland/icewm-menu $(ALPINE_STAMP)
 disk.img: scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh userland/avory-login.elf
 disk.img:  userland/dns_lookup.elf userland/nettest.elf
@@ -667,6 +673,7 @@ disk.img: userland/test_watchdog.elf
 disk.img: userland/test_kpi_dmabuf.elf
 disk.img: userland/test_kpi_drm.elf
 disk.img: userland/test_kpi_bochs.elf
+disk.img: build/test_fw.bin
 disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 
 
@@ -939,6 +946,10 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "rm bin/forkit"; \
 		echo "write userland/forkit.elf bin/forkit"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
+	@if [ -d build/alpine/rootfs ]; then \
+		mkdir -p build/alpine/rootfs/lib/firmware; \
+		cp -f build/test_fw.bin build/alpine/rootfs/lib/firmware/test_fw.bin; \
+	fi
 	@if [ -d build/alpine/rootfs ]; then \
 		echo "Populating Alpine Linux rootfs into disk image..."; \
 		./scripts/configure-accounts.sh build/alpine/rootfs; \

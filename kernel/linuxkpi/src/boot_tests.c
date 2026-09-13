@@ -35,6 +35,12 @@ extern void linuxkpi_test_phase4_sched(void);
 extern void linuxkpi_test_phase4_pci(void);
 extern void linuxkpi_test_phase4_bochs(void);
 extern void linuxkpi_test_phase5_pci(void);
+extern void linuxkpi_test_phase5_irq(void);
+extern void linuxkpi_test_phase5_acpi(void);
+extern void linuxkpi_test_phase5_firmware(void);
+extern void linuxkpi_test_phase5_i2c(void);
+extern void linuxkpi_test_phase5_sysfs(void);
+extern void linuxkpi_test_phase5_devmodel(void);
 
 static struct completion boot_tests_done;
 
@@ -60,6 +66,12 @@ static int linuxkpi_boot_tests_thread(void *arg) {
   linuxkpi_test_phase4_pci();
   linuxkpi_test_phase4_bochs();
   linuxkpi_test_phase5_pci();
+  linuxkpi_test_phase5_irq();
+  linuxkpi_test_phase5_acpi();
+  linuxkpi_test_phase5_firmware();
+  linuxkpi_test_phase5_i2c();
+  linuxkpi_test_phase5_sysfs();
+  linuxkpi_test_phase5_devmodel();
 
   complete(&boot_tests_done);
   return 0;
@@ -84,6 +96,6 @@ void linuxkpi_run_boot_tests(void) {
   }
 
   /* Bounded wait: a wedged suite must not hold up the boot. */
-  if (wait_for_completion_timeout(&boot_tests_done, 30000) == 0)
+  if (wait_for_completion_timeout(&boot_tests_done, 60000) == 0)
     klog_puts("[WARN] LinuxKPI: boot self-tests timed out\n");
 }

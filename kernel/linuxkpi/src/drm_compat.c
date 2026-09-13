@@ -1,47 +1,21 @@
 /* Phase 3 compatibility stubs for infrastructure the DRM canaries compile
  * against but that AvoryOS implements in later phases.  Everything here is
- * weak: the real implementation (i2c core in Phase 5, aperture/VBIOS in
- * Phase 6) overrides these without touching the callers.  Each stub is
- * recorded in docs/linuxkpi-gaps.md. */
+ * weak: the real implementation (aperture/VBIOS in Phase 6) overrides these
+ * without touching the callers.  Each stub is recorded in
+ * docs/linuxkpi-gaps.md.  The i2c stubs that used to live here were replaced
+ * by the real minimal core (linuxkpi/src/i2c.c, Phase 5 C4). */
 
 #include <asm/pgtable_types.h>
 #include <linux/aperture.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
-#include <linux/i2c.h>
 #include <linux/regulator/consumer.h>
 
 /* ── page protection (x86 PAT is not modeled) ───────────────────────────── */
 
 __attribute__((weak)) pgprot_t pgprot_writecombine(pgprot_t prot) {
   return prot;
-}
-
-/* ── i2c (EDID DDC) ──────────────────────────────────────────────────────── */
-
-__attribute__((weak)) int i2c_transfer(struct i2c_adapter *adap,
-                                       struct i2c_msg *msgs, int num) {
-  (void)adap;
-  (void)msgs;
-  (void)num;
-  return -EIO;
-}
-
-__attribute__((weak)) int i2c_master_send(const struct i2c_client *client,
-                                          const char *buf, int count) {
-  (void)client;
-  (void)buf;
-  (void)count;
-  return -EIO;
-}
-
-__attribute__((weak)) int i2c_master_recv(const struct i2c_client *client,
-                                          char *buf, int count) {
-  (void)client;
-  (void)buf;
-  (void)count;
-  return -EIO;
 }
 
 /* ── regulators (simpledrm supplies) ─────────────────────────────────────── */

@@ -23,6 +23,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/irqreturn.h>
+#include <linux/pm.h>
 #include <linux/slab.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
@@ -52,25 +53,9 @@ struct device_dma_parameters {
   unsigned long segment_boundary_mask;
 };
 
-typedef struct pm_message {
-  int event;
-} pm_message_t;
-
-/* Power management is not modeled (CONFIG_PM_SLEEP is unset).  The SET_*_PM_OPS
- * helpers compile callbacks out exactly like upstream's #else arms, and the
- * struct gives drivers that publish a never-called pm pointer (bochs) a
- * complete type.  Stock <linux/pm.h> is deliberately not included because it
- * redefines pm_message_t (same reason as <linux/device/bus.h>). */
-struct dev_pm_ops {
-  int kpi_unused;
-};
-
-#define SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
-#define SET_LATE_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
-#define SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
-#define SET_RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn)
-#define pm_ptr(_ptr) NULL
-#define pm_sleep_ptr(_ptr) NULL
+/* pm_message_t and struct dev_pm_ops come from the <linux/pm.h> overlay;
+ * with CONFIG_PM/CONFIG_PM_SLEEP unset the SET_*_PM_OPS helpers there
+ * compile the callbacks out exactly like upstream's #else arms. */
 
 /* Minimal <linux/device/class.h> shape.  devnode() is what drm_sysfs uses to
  * name the /dev/dri/cardN node; uevent is unused so far. */
@@ -257,6 +242,13 @@ struct device *__kpi_device_create(const struct class *cls,
     __attribute__((format(printf, 5, 6)));
 void __kpi_device_destroy(const struct class *cls, dev_t devt);
 
+struct device *device_create_with_groups(const struct class *cls,
+                                         struct device *parent, dev_t devt,
+                                         void *drvdata,
+                                         const struct attribute_group **groups,
+                                         const char *fmt, ...)
+    __attribute__((format(printf, 6, 7)));
+
 /* Native driver manager owns plain device_create()/device_destroy() with a
  * different signature; imported Linux code goes through the KPI variants. */
 #define device_create(cls, parent, devt, drvdata, fmt, ...)                   \
@@ -290,6 +282,17 @@ void *devm_kzalloc(struct device *dev, size_t size, gfp_t gfp);
 void *devm_kcalloc(struct device *dev, size_t n, size_t size, gfp_t gfp);
 void *devm_kmemdup(struct device *dev, const void *src, size_t len, gfp_t gfp);
 char *devm_kstrdup(struct device *dev, const char *s, gfp_t gfp);
+char *devm_kasprintf(struct device *dev, gfp_t gfp, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+
+static inline void *devm_kmalloc_array(struct device *dev, size_t n,
+                                       size_t size, gfp_t flags) {
+  size_t bytes;
+
+  if (__builtin_mul_overflow(n, size, &bytes))
+    return NULL;
+  return devm_kmalloc(dev, bytes, flags);
+}
 void devm_kfree(struct device *dev, const void *p);
 
 struct resource;
@@ -297,6 +300,10 @@ void __iomem *devm_ioremap(struct device *dev, resource_size_t offset,
                            resource_size_t size);
 void __iomem *devm_ioremap_wc(struct device *dev, resource_size_t offset,
                               resource_size_t size);
+void __iomem *devm_ioremap_resource(struct device *dev,
+                                    const struct resource *res);
+void __iomem *devm_ioremap_resource_wc(struct device *dev,
+                                       const struct resource *res);
 void *devm_memremap(struct device *dev, resource_size_t offset, size_t size,
                     unsigned long flags);
 void devm_memunmap(struct device *dev, void *addr);

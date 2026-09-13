@@ -347,6 +347,22 @@ unsigned int asc_vfs_kernel_read(void *node, unsigned int offset,
   return n->read(n, offset, size, buffer);
 }
 
+unsigned int asc_vfs_kernel_write(void *node, unsigned int offset,
+                                  unsigned int size,
+                                  unsigned char *buffer) {
+  vfs_node_t *n = node;
+
+  if (!n || !n->write)
+    return 0;
+  return n->write(n, offset, size, buffer);
+}
+
+unsigned int asc_vfs_kernel_size(void *node) {
+  vfs_node_t *n = node;
+
+  return n ? (unsigned int)n->length : 0;
+}
+
 void asc_vfs_kernel_close(void *node) {
   if (node)
     vfs_close((vfs_node_t *)node);

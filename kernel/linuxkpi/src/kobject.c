@@ -1,12 +1,15 @@
-/* Minimal kobject/sysfs/class support for imported DRM code.
+/* kobject/sysfs/class support for imported DRM code.
  *
- * The native kernel owns a static sysfs tree; it cannot yet attach arbitrary
- * dynamic groups.  The entry points here therefore validate their arguments,
- * remember nothing, and succeed, so drivers can complete probe and expose
- * their /dev nodes.  sysfs_emit()/show_class_attr_string()/sysfs_streq() are
- * real because attribute show() methods are compiled and exercised.
- *
- * Gap record: docs/linuxkpi-gaps.md, Phase 3. */
+ * sysfs_emit()/show_class_attr_string()/sysfs_streq() are real because
+ * attribute show()/store() methods are compiled and exercised.  The
+ * sysfs_create_*()/sysfs_remove_*() entry points materialize real nodes when
+ * the kobject has a native directory handle (`kobj->sd`, set for class devices
+ * by device_add() and for PCI wrappers at wrapper creation) and otherwise
+ * accept the registration as a no-op.  Device attribute groups, binary
+ * attributes, `is_visible()`/`is_bin_visible()`, named subgroups and
+ * per-attribute context release are implemented; see docs/linuxkpi-gaps.md
+ * (P5 C5) for the remaining divergences (no kernfs link support, no
+ * refcounted kobjects). */
 
 #include <linux/device.h>
 #include <linux/err.h>
@@ -57,100 +60,18 @@ ssize_t show_class_attr_string(const struct class *class,
   return (ssize_t)sysfs_emit(buf, "%s\n", cs->str);
 }
 
-/* ── sysfs registration stubs ───────────────────────────────────────────── */
+/* ── sysfs materialization ──────────────────────────────────────────────── */
 
-int sysfs_create_file_ns(struct kobject *kobj, const struct attribute *attr,
-                         const void *ns) {
-  (void)ns;
-  if (!kobj || !attr)
-    return -EINVAL;
-  return 0;
-}
-
-int sysfs_create_file(struct kobject *kobj, const struct attribute *attr) {
-  return sysfs_create_file_ns(kobj, attr, NULL);
-}
-
-void sysfs_remove_file_ns(struct kobject *kobj, const struct attribute *attr,
-                          const void *ns) {
-  (void)kobj;
-  (void)attr;
-  (void)ns;
-}
-
-void sysfs_remove_file(struct kobject *kobj, const struct attribute *attr) {
-  sysfs_remove_file_ns(kobj, attr, NULL);
-}
-
-int sysfs_create_files(struct kobject *kobj,
-                       const struct attribute *const *attr) {
-  (void)attr;
-  return kobj ? 0 : -EINVAL;
-}
-
-int sysfs_create_group(struct kobject *kobj,
-                       const struct attribute_group *grp) {
-  (void)grp;
-  return kobj ? 0 : -EINVAL;
-}
-
-int sysfs_create_groups(struct kobject *kobj,
-                        const struct attribute_group **groups) {
-  (void)groups;
-  return kobj ? 0 : -EINVAL;
-}
-
-void sysfs_remove_group(struct kobject *kobj,
-                        const struct attribute_group *grp) {
-  (void)kobj;
-  (void)grp;
-}
-
-void sysfs_remove_groups(struct kobject *kobj,
-                         const struct attribute_group **groups) {
-  (void)kobj;
-  (void)groups;
-}
-
-int sysfs_create_bin_file(struct kobject *kobj,
-                          const struct bin_attribute *attr) {
-  if (!kobj || !attr)
-    return -EINVAL;
-  return 0;
-}
-
-void sysfs_remove_bin_file(struct kobject *kobj,
-                           const struct bin_attribute *attr) {
-  (void)kobj;
-  (void)attr;
-}
-
-int sysfs_create_link(struct kobject *kobj, struct kobject *target,
-                      const char *name) {
-  if (!kobj || !target || !name)
-    return -EINVAL;
-  return 0;
-}
-
-void sysfs_remove_link(struct kobject *kobj, const char *name) {
-  (void)kobj;
-  (void)name;
-}
-
-int sysfs_create_link_nowarn(struct kobject *kobj, struct kobject *target,
-                             const char *name) {
-  return sysfs_create_link(kobj, target, name);
-}
-
-/* ── attribute materialization ──────────────────────────────────────────── */
-
-/* Device attribute groups (DRM connectors use these) are real: the native
- * file's read/write calls back into the attribute's show/store with the
- * owning device. */
+/* Attribute contexts live in the native sysfs record and are freed through its
+ * release callback when the file is removed.  `kobj->sd` is the opaque native
+ * directory handle; kobjects without one (not yet attached to the native tree)
+ * accept registrations without creating nodes, as before. */
 struct kpi_dev_attr_ctx {
   struct device *dev;
   const struct device_attribute *attr;
 };
+
+static void kpi_attr_ctx_free(void *ctx) { kfree(ctx); }
 
 static int kpi_dev_attr_show(void *ctx, char *buf, unsigned int size) {
   struct kpi_dev_attr_ctx *c = ctx;
@@ -170,31 +91,333 @@ static int kpi_dev_attr_store(void *ctx, const char *buf, unsigned int size) {
                              size);
 }
 
-int device_add_groups(struct device *dev, const struct attribute_group **groups) {
-  if (!dev || !dev->kobj.sd || !groups)
+/* Create one device attribute under `dir`.  -EEXIST is tolerated as success
+ * (re-adding a group that survived), matching the class bridge. */
+static int kpi_create_attr_at(struct kobject *kobj, void *dir,
+                              const struct attribute *attr) {
+  struct kpi_dev_attr_ctx *ctx;
+  int ret;
+
+  if (!dir || !attr || !attr->name)
     return 0;
 
-  for (int g = 0; groups[g]; g++) {
-    const struct attribute_group *grp = groups[g];
+  ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+  if (!ctx)
+    return -ENOMEM;
+  ctx->dev = kobj_to_dev(kobj);
+  ctx->attr = container_of(attr, struct device_attribute, attr);
+  ret = asc_sysfs_attr_file(dir, attr->name, attr->mode, ctx,
+                            kpi_dev_attr_show, kpi_dev_attr_store,
+                            kpi_attr_ctx_free);
+  if (ret) {
+    kfree(ctx);
+    return ret == -17 ? 0 : ret;
+  }
+  return 0;
+}
 
-    if (!grp->attrs)
-      continue;
-    for (int i = 0; grp->attrs[i]; i++) {
+static void kpi_remove_attr_at(void *dir, const char *name) {
+  if (dir && name)
+    asc_sysfs_remove(dir, name);
+}
+
+/* Binary attribute contexts. */
+struct kpi_bin_attr_ctx {
+  struct kobject *kobj;
+  const struct bin_attribute *attr;
+};
+
+static void kpi_bin_ctx_free(void *ctx) { kfree(ctx); }
+
+static int kpi_bin_read(void *ctx, unsigned int offset, char *buf,
+                        unsigned int size) {
+  struct kpi_bin_attr_ctx *c = ctx;
+  ssize_t ret;
+
+  if (!c->attr->read)
+    return -5;
+  ret = c->attr->read(NULL, c->kobj, (struct bin_attribute *)c->attr, buf,
+                      (loff_t)offset, size);
+  return (int)ret;
+}
+
+static int kpi_bin_write(void *ctx, unsigned int offset, const char *buf,
+                         unsigned int size) {
+  struct kpi_bin_attr_ctx *c = ctx;
+  ssize_t ret;
+
+  if (!c->attr->write)
+    return -5;
+  ret = c->attr->write(NULL, c->kobj, (struct bin_attribute *)c->attr,
+                       (char *)buf, (loff_t)offset, size);
+  return (int)ret;
+}
+
+static int kpi_create_bin_at(struct kobject *kobj, void *dir,
+                             const struct bin_attribute *attr) {
+  struct kpi_bin_attr_ctx *ctx;
+  int ret;
+
+  if (!dir || !attr || !attr->attr.name)
+    return 0;
+
+  ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+  if (!ctx)
+    return -ENOMEM;
+  ctx->kobj = kobj;
+  ctx->attr = attr;
+  ret = asc_sysfs_bin_file(dir, attr->attr.name, attr->attr.mode, ctx,
+                           kpi_bin_read, kpi_bin_write, kpi_bin_ctx_free);
+  if (ret) {
+    kfree(ctx);
+    return ret == -17 ? 0 : ret;
+  }
+  return 0;
+}
+
+/* is_visible()/is_bin_visible() are honored; on failure the attributes added
+ * so far in the group are rolled back by name. */
+static int kpi_create_group_at(struct kobject *kobj, void *dir,
+                               const struct attribute_group *grp) {
+  int i, j, ret;
+
+  if (!dir || !grp)
+    return 0;
+
+  if (grp->attrs) {
+    for (i = 0; grp->attrs[i]; i++) {
       const struct attribute *attr = grp->attrs[i];
-      struct kpi_dev_attr_ctx *ctx;
 
       if (grp->is_visible &&
-          !grp->is_visible(&dev->kobj, (struct attribute *)attr, i))
+          !grp->is_visible(kobj, (struct attribute *)attr, i))
         continue;
+      ret = kpi_create_attr_at(kobj, dir, attr);
+      if (ret) {
+        for (j = 0; j < i; j++) {
+          if (!grp->attrs[j])
+            continue;
+          if (grp->is_visible &&
+              !grp->is_visible(kobj, (struct attribute *)grp->attrs[j], j))
+            continue;
+          kpi_remove_attr_at(dir, grp->attrs[j]->name);
+        }
+        return ret;
+      }
+    }
+  }
 
-      ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-      if (!ctx)
-        return -ENOMEM;
-      ctx->dev = dev;
-      ctx->attr = container_of(attr, struct device_attribute, attr);
-      if (asc_sysfs_attr_file(dev->kobj.sd, attr->name, attr->mode, ctx,
-                              kpi_dev_attr_show, kpi_dev_attr_store))
-        kfree(ctx);
+  if (grp->bin_attrs) {
+    for (i = 0; grp->bin_attrs[i]; i++) {
+      const struct bin_attribute *bin = grp->bin_attrs[i];
+
+      if (grp->is_bin_visible &&
+          !grp->is_bin_visible(kobj, (struct bin_attribute *)bin, i))
+        continue;
+      ret = kpi_create_bin_at(kobj, dir, bin);
+      if (ret) {
+        for (j = 0; j < i; j++) {
+          if (grp->bin_attrs[j])
+            kpi_remove_attr_at(dir, grp->bin_attrs[j]->attr.name);
+        }
+        return ret;
+      }
+    }
+  }
+
+  if (grp->groups) {
+    for (i = 0; grp->groups[i]; i++) {
+      const struct attribute_group *sub = grp->groups[i];
+      void *subdir = dir;
+
+      if (sub->name) {
+        subdir = asc_sysfs_device_dir(dir, sub->name);
+        if (!subdir)
+          return -ENOMEM;
+      }
+      ret = kpi_create_group_at(kobj, subdir, sub);
+      if (ret)
+        return ret;
+    }
+  }
+  return 0;
+}
+
+static void kpi_remove_group_at(struct kobject *kobj, void *dir,
+                                const struct attribute_group *grp) {
+  int i;
+
+  if (!dir || !grp)
+    return;
+
+  if (grp->attrs) {
+    for (i = 0; grp->attrs[i]; i++) {
+      if (grp->is_visible &&
+          !grp->is_visible(kobj, (struct attribute *)grp->attrs[i], i))
+        continue;
+      kpi_remove_attr_at(dir, grp->attrs[i]->name);
+    }
+  }
+  if (grp->bin_attrs) {
+    for (i = 0; grp->bin_attrs[i]; i++) {
+      if (grp->is_bin_visible &&
+          !grp->is_bin_visible(kobj, (struct bin_attribute *)grp->bin_attrs[i],
+                               i))
+        continue;
+      kpi_remove_attr_at(dir, grp->bin_attrs[i]->attr.name);
+    }
+  }
+  if (grp->groups) {
+    for (i = 0; grp->groups[i]; i++) {
+      const struct attribute_group *sub = grp->groups[i];
+
+      if (sub->name)
+        kpi_remove_attr_at(dir, sub->name);
+      else
+        kpi_remove_group_at(kobj, dir, sub);
+    }
+  }
+}
+
+int sysfs_create_file_ns(struct kobject *kobj, const struct attribute *attr,
+                         const void *ns) {
+  (void)ns;
+  if (!kobj || !attr)
+    return -EINVAL;
+  return kpi_create_attr_at(kobj, kobj->sd, attr);
+}
+
+int sysfs_create_file(struct kobject *kobj, const struct attribute *attr) {
+  return sysfs_create_file_ns(kobj, attr, NULL);
+}
+
+void sysfs_remove_file_ns(struct kobject *kobj, const struct attribute *attr,
+                          const void *ns) {
+  (void)ns;
+  if (kobj && attr)
+    kpi_remove_attr_at(kobj->sd, attr->name);
+}
+
+void sysfs_remove_file(struct kobject *kobj, const struct attribute *attr) {
+  sysfs_remove_file_ns(kobj, attr, NULL);
+}
+
+int sysfs_create_files(struct kobject *kobj,
+                       const struct attribute *const *attr) {
+  int i;
+
+  if (!kobj || !attr)
+    return -EINVAL;
+  for (i = 0; attr[i]; i++) {
+    int ret = kpi_create_attr_at(kobj, kobj->sd, attr[i]);
+
+    if (ret) {
+      while (--i >= 0)
+        kpi_remove_attr_at(kobj->sd, attr[i]->name);
+      return ret;
+    }
+  }
+  return 0;
+}
+
+int sysfs_create_group(struct kobject *kobj,
+                       const struct attribute_group *grp) {
+  void *dir;
+
+  if (!kobj || !grp)
+    return -EINVAL;
+  dir = kobj->sd;
+  if (!dir)
+    return 0;
+  if (grp->name) {
+    dir = asc_sysfs_device_dir(dir, grp->name);
+    if (!dir)
+      return -ENOMEM;
+  }
+  return kpi_create_group_at(kobj, dir, grp);
+}
+
+int sysfs_create_groups(struct kobject *kobj,
+                        const struct attribute_group **groups) {
+  int i;
+
+  if (!kobj || !groups)
+    return -EINVAL;
+  for (i = 0; groups[i]; i++) {
+    int ret = sysfs_create_group(kobj, groups[i]);
+
+    if (ret) {
+      while (--i >= 0)
+        sysfs_remove_group(kobj, groups[i]);
+      return ret;
+    }
+  }
+  return 0;
+}
+
+void sysfs_remove_group(struct kobject *kobj,
+                        const struct attribute_group *grp) {
+  if (!kobj || !grp || !kobj->sd)
+    return;
+  if (grp->name)
+    kpi_remove_attr_at(kobj->sd, grp->name);
+  else
+    kpi_remove_group_at(kobj, kobj->sd, grp);
+}
+
+void sysfs_remove_groups(struct kobject *kobj,
+                         const struct attribute_group **groups) {
+  int i;
+
+  if (!kobj || !groups)
+    return;
+  for (i = 0; groups[i]; i++)
+    sysfs_remove_group(kobj, groups[i]);
+}
+
+int sysfs_create_bin_file(struct kobject *kobj,
+                          const struct bin_attribute *attr) {
+  if (!kobj || !attr)
+    return -EINVAL;
+  return kpi_create_bin_at(kobj, kobj->sd, attr);
+}
+
+void sysfs_remove_bin_file(struct kobject *kobj,
+                           const struct bin_attribute *attr) {
+  if (kobj && attr)
+    kpi_remove_attr_at(kobj->sd, attr->attr.name);
+}
+
+int sysfs_create_link(struct kobject *kobj, struct kobject *target,
+                      const char *name) {
+  if (!kobj || !target || !name)
+    return -EINVAL;
+  return 0;
+}
+
+void sysfs_remove_link(struct kobject *kobj, const char *name) {
+  (void)kobj;
+  (void)name;
+}
+
+int sysfs_create_link_nowarn(struct kobject *kobj, struct kobject *target,
+                             const char *name) {
+  return sysfs_create_link(kobj, target, name);
+}
+
+/* ── device groups ──────────────────────────────────────────────────────── */
+
+int device_add_groups(struct device *dev, const struct attribute_group **groups) {
+  int i;
+
+  if (!dev || !groups)
+    return 0;
+  for (i = 0; groups[i]; i++) {
+    int ret = sysfs_create_group(&dev->kobj, groups[i]);
+
+    if (ret) {
+      while (--i >= 0)
+        sysfs_remove_group(&dev->kobj, groups[i]);
+      return ret;
     }
   }
   return 0;
@@ -202,8 +425,12 @@ int device_add_groups(struct device *dev, const struct attribute_group **groups)
 
 void device_remove_groups(struct device *dev,
                           const struct attribute_group **groups) {
-  (void)dev;
-  (void)groups;
+  int i;
+
+  if (!dev || !groups)
+    return;
+  for (i = 0; groups[i]; i++)
+    sysfs_remove_group(&dev->kobj, groups[i]);
 }
 
 /* ── kobjects ───────────────────────────────────────────────────────────── */
@@ -324,7 +551,8 @@ int class_create_file_ns(const struct class *class,
   ctx->class = class;
   ctx->attr = attr;
   ret = asc_sysfs_attr_file(dir, attr->attr.name, attr->attr.mode, ctx,
-                            kpi_class_attr_show, kpi_class_attr_store);
+                            kpi_class_attr_show, kpi_class_attr_store,
+                            kpi_attr_ctx_free);
   if (ret) {
     kfree(ctx);
     return ret == -17 ? 0 : ret;

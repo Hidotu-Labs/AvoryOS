@@ -184,6 +184,23 @@ struct resource *platform_get_resource(struct platform_device *pdev,
   return NULL;
 }
 
+void __iomem *devm_platform_get_and_ioremap_resource(
+    struct platform_device *pdev, unsigned int index, struct resource **res) {
+  struct resource *r;
+
+  if (!pdev)
+    return ERR_PTR(-EINVAL);
+  r = platform_get_resource(pdev, IORESOURCE_MEM, index);
+  if (res)
+    *res = r;
+  return devm_ioremap_resource(&pdev->dev, r);
+}
+
+void __iomem *devm_platform_ioremap_resource(struct platform_device *pdev,
+                                             unsigned int index) {
+  return devm_platform_get_and_ioremap_resource(pdev, index, NULL);
+}
+
 int platform_get_irq(struct platform_device *pdev, unsigned int num) {
   struct resource *r = platform_get_resource(pdev, IORESOURCE_IRQ, num);
 

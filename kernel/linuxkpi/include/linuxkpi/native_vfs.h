@@ -74,8 +74,12 @@ void *asc_vfs_kernel_open(const char *path);
 int asc_vfs_kernel_ioctl(void *node, unsigned int request,
                          __UINT64_TYPE__ arg);
 int asc_vfs_kernel_poll(void *node, int events);
+/* File size (`length`) of a node opened with asc_vfs_kernel_open(). */
+unsigned int asc_vfs_kernel_size(void *node);
 unsigned int asc_vfs_kernel_read(void *node, unsigned int offset,
                                  unsigned int size, unsigned char *buffer);
+unsigned int asc_vfs_kernel_write(void *node, unsigned int offset,
+                                  unsigned int size, unsigned char *buffer);
 void asc_vfs_kernel_close(void *node);
 
 /* Native fd table.  asc_vfs_fd_alloc reserves a descriptor (returns < 0 on

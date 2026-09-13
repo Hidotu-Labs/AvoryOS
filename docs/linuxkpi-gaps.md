@@ -6,6 +6,252 @@ needed it, the current workaround, and what a complete implementation needs.
 
 Update this file in the same change that introduces or closes a gap.
 
+## Phase 5 gaps (full I/O foundations)
+
+### C1 — full Linux PCI API (non-IRQ)
+
+- **Saved config state is standard config space only**
+  (`linuxkpi/src/pci.c`): `pci_save_state()` snapshots the 16 dwords at
+  0x00..0x3F and `pci_restore_state()` writes them back;
+  `pci_store_saved_state()`/`pci_load_saved_state()` copy that software
+  snapshot (upstream semantics: loading does not touch hardware; call
+  `pci_restore_state()` to program it).  Upstream also saves PCIe/PCIx/LTR/
+  DPC/AER/PTM/VC capability state, which amdgpu's reset path uses on real
+  hardware; implementing that needs the capability save/restore machinery
+  from drivers/pci/pci.c and the `pci_cap_saved_state` hlist.  Phase 6 reset
+  testing will show whether the reduced form is enough under VFIO.
+- **Expansion ROM BAR is sized and assigned on demand**
+  (`linuxkpi/src/pci.c:pci_map_rom`): upstream maps the resource decoded at
+  boot and calls `pci_assign_resource()` when unassigned.  AvoryOS sizes the
+  ROM BAR with the standard all-ones write (like `pci_read_bases()`), then,
+  when the readback is an unassigned all-ones pattern (OVMF leaves ROM BARs
+  this way) or zero, assigns a 64K-aligned slot by scanning the low 32-bit
+  MMIO hole (0x80000000..0xFEC00000) downwards against every decoded BAR.
+  This is deliberately shim-local: there is no bridge-window/ACPI `_CRS`
+  resource tree, so it cannot know the real windows.  Works on QEMU q35 and
+  VFIO boots; real hardware with firmware-assigned ROM BARs takes the plain
+  path.  No `IORESOURCE_ROM_SHADOW` and no PCIR length refinement.  An
+  unassigned 64K BAR reads back `0xFFFF0000` after the sizing write, so the
+  unassigned test compares against the sized readback, not a fixed mask.
+- **`pci_wait_for_pending_transaction()` is a bounded 100 ms poll**
+  (`linuxkpi/src/pci.c`): reads `PCI_EXP_DEVSTA.TRPND` every 1 ms, returns 1
+  when clear, 0 on timeout; non-PCIe devices return 1.  Upstream uses the
+  same semantics with a jiffies deadline.
+- **`pci_release_resource()` has no resource tree to release from**
+  (`linuxkpi/src/pci.c`): BAR resources are decoded snapshots with
+  `parent == NULL`, so the function clears the resource and only calls
+  `__release_region()` when a parent was recorded (none are today).
+- **`pci_device_is_present()` reads the vendor ID directly**
+  (`linuxkpi/src/pci.c`) instead of `pci_bus_read_dev_vendor_id()`; there is
+  no `pci_bus` config accessor in the shim.
+- **PCIe link helpers implemented from Link Capabilities 2 / Link
+  Capabilities** (`linuxkpi/src/pci.c`): `pcie_get_speed_cap()`,
+  `pcie_get_width_cap()`, `pcie_print_link_status()`.  They do not implement
+  the "capable faster than current link" advice text.
+- **`pci_revision_id`/`pci_address_name` were census false positives**: the
+  amdgpu hits are a local variable around `pci_name()` and a `dc_types.h`
+  struct field, not Linux PCI APIs.
+- **`pci_p2pdma_distance()` comes from the stock inline stub**
+  (`linux/pci-p2pdma.h`, `CONFIG_PCI_P2PDMA` unset → returns -1), which is
+  what `amdgpu_dma_buf.c` checks for.  No implementation needed until real
+  P2P support.
+- **`pci_dev_get()`/`pci_dev_put()` remain documented no-ops** (carried from
+  C4): wrappers live for the kernel's lifetime.
+
+### C2 — IRQ core + MSI/MSI-X bridge
+
+- **The descriptor spinlock is held while hard handlers run**
+  (`linuxkpi/src/irq.c`): action nodes are allocated by
+  `request_threaded_irq()` and freed by `free_irq()`, so dispatch serializes
+  against unlink rather than using RCU/refcounts.  Consequence: a hard
+  handler must not call `request_irq()`/`free_irq()`/`disable_irq()` on its
+  own IRQ (deadlock).  amdgpu's IH handler only schedules work, so this is
+  safe for P6; revisit if a driver needs more.
+- **`IRQF_ONESHOT` does not mask in hardware**
+  (`linuxkpi/src/irq.c`): `disable_irq()` runs the per-vector mask callback
+  (MSI/MSI-X only); legacy INTx has no mask callback, so a disabled INTx
+  action only drops interrupts in the dispatcher until the device is
+  acknowledged.  Documented for drivers that rely on ONESHOT masking.
+- **Threaded handlers use the system workqueue**
+  (`linuxkpi/src/irq.c`): `request_threaded_irq()` queues `thread_fn` with
+  `schedule_work()` instead of a dedicated per-IRQ kthread.  The thread
+  function runs in normal process context (`in_interrupt()` false) and may
+  sleep; it is not pinned to the interrupting CPU.  A dedicated IRQ-thread
+  queue can replace this when the workqueue grows CPU affinity.
+- **Legacy INTx uses IDT vector 32 + line as the Linux IRQ number**
+  (`linuxkpi/src/irq.c`, `linuxkpi/src/pci.c`,
+  `kernel/src/linuxkpi/native_irq.c`): the native `irq_install_handler()`
+  routes legacy line N to vector 32 + N and runs the LinuxKPI trampoline
+  there; MSI/MSI-X use the native vector (0x60..0xDF) directly.  One
+  dispatcher reads `regs->int_no`, so no per-vector stubs are needed.
+- **`pci_msi_vec_count()` returns 1**
+  (`linuxkpi/src/pci.c`): the native MSI path enables exactly one vector.
+  `pci_msix_vec_count()` decodes the real MSI-X table size (EDU has MSI only,
+  so it returns 0).  `pci_alloc_irq_vectors()` allocates exactly `min_vecs`
+  (it does not grow towards `max_vecs`), all vectors target the current CPU
+  via `pci_irq_request_modes_routed()`, and `pci_alloc_irq_vectors_affinity()`
+  ignores the affinity descriptor.  `pci_irq_get_affinity()` returns NULL.
+- **`devm_request_irq()` is a devres action that calls `free_irq()`**
+  (`linuxkpi/src/device.c`); `devm_free_irq()` walks the devres list and
+  unregisters the matching action.  The fake-device test path relies on
+  `device_initialize()` + `devres_release_all()`.
+
+### C3 — ACPI table access + firmware loader
+
+- **`CONFIG_ACPI` stays unset with the table-accessor subset only**
+  (`linuxkpi/include/linux/acpi.h`, `linuxkpi/src/acpi.c`): the native ACPI
+  layer parses MADT/FADT/MCFG/HPET and `acpi_get_table()` returns the first
+  table with a matching 4-character signature via `acpi_find_table()`.
+  `acpi_put_table()` is a no-op (tables live for the kernel's lifetime) and
+  instance 0 and 1 both mean "the first table" (real callers such as amdgpu's
+  VFCT lookup use 1; the native walker keeps no instance list).  There is no
+  AML interpreter, no `acpi_evaluate_*`, no notify/hotplug: enabling ACPI and
+  building `amdgpu_acpi.o`/`amdgpu_atpx_handler.o` remains Phase 8/bare metal.
+  The audit confirmed 6.6 amdgpu's ACPI references are all gated by
+  `CONFIG_ACPI` (`amdgpu_bios.c` VFCT, display brightness, kfd off), so a
+  `CONFIG_ACPI=n` build is viable through P6.
+- **The firmware loader moved to the Linux-API tree with
+  `CONFIG_FW_LOADER=1`** (`linuxkpi/src/firmware.c`,
+  `linuxkpi/include/generated/autoconf.h`): `<linux/firmware.h>` now declares
+  the real externs instead of the `!CONFIG_FW_LOADER` inline stubs, and the
+  implementation reads `/lib/firmware/<name>` through
+  `asc_vfs_kernel_open/size/read/close`.  The old
+  `kernel/src/linuxkpi/firmware.c` (legacy header, `struct firmware` without
+  `priv`) is retired.  Synchronous `request_firmware()`/`release_firmware()`
+  only: `request_firmware_nowait`/`_direct`/`_into_buf` and the cache/uevent
+  paths are not implemented until a compiled driver needs them (6.6 amdgpu
+  uses plain `request_firmware`).  Names are validated as before (no absolute
+  paths, `.`/`..`, backslashes), size capped at 16 MiB, `priv` stays NULL.
+- **The self-test blob is staged through the rootfs overlay**
+  (`GNUmakefile`): `build/test_fw.bin` (4 KB, byte i = `(i*7+3)&0xff`) is
+  copied to `build/alpine/rootfs/lib/firmware/test_fw.bin` before
+  `populate-ext2-dir.sh` syncs the rootfs, so it lands in `/lib/firmware` in
+  `disk.img`.  Rebuilding `disk.img` now requires the test blob; close any
+  running VM before `make run*` rebuilds the image.  P7 replaces this with the
+  linux-firmware manifest flow.
+
+### C4 — minimal I2C core (DDC/EDID)
+
+- **Self-authored minimal core, no `i2c-core-base.c` import**
+  (`linuxkpi/src/i2c.c`): about 230 LOC behind
+  `linuxkpi/include/linux/i2c.h`.  Scope is adapter registration plus master
+  transfers; there are no i2c clients/instantiation, no OF/ACPI/fwnode
+  adapter lookup, no `/dev/i2c-N`, no class/bus matching and no driver
+  binding.  Drivers publish a `master_xfer` algorithm, call `i2c_transfer()`
+  and nothing else is required for P6a.  Importing the stock core stays a P6
+  contingency (phases plan §1 item 5).
+- **`struct i2c_adapter` is the overlay type; `bus_lock` is a plain mutex**
+  (`linuxkpi/include/linux/i2c.h`): upstream's `rt_mutex` plus
+  `i2c_lock_operations`, `I2C_LOCK_SEGMENT`, mux and `locked_flags` are not
+  modeled and `i2c_lock_bus()`/`i2c_trylock_bus()` do not exist.  Adapters
+  are embedded in driver allocations as upstream expects; the core
+  initializes `bus_lock` in `i2c_add_adapter()`.
+- **Registry is a 64-slot array, not an idr** (`linuxkpi/src/i2c.c`):
+  `i2c_add_adapter()` takes the lowest free bus number,
+  `i2c_add_numbered_adapter()` fails `-EINVAL` when `adap->nr < 0` and
+  `-EBUSY` when the number is taken; bus numbers are reused immediately
+  after `i2c_del_adapter()`, and buses ≥ 64 fail with `-ENOSPC`.
+- **No adapter reference counting** (`linuxkpi/src/i2c.c`):
+  `i2c_put_adapter()` is a no-op and `i2c_get_adapter()` returns the
+  registered pointer without `get_device()`.  Safe while adapters outlive
+  their deregistration (the P5 model); revisit with hot-unplug.
+- **`i2c_verify_adapter()` checks a real overlay `i2c_adapter_type`**
+  (`linuxkpi/src/i2c.c`): `i2c_add_adapter()` stamps `adap->dev.type`, so a
+  device pointer that is not an adapter returns NULL like upstream.
+- **Retries re-run the whole transfer; `timeout` is ignored**
+  (`linuxkpi/src/i2c.c`): `__i2c_transfer()` loops on `-EAGAIN` up to
+  `adap->retries` extra attempts (negative retries clamp to 0);
+  `adap->timeout` is carried for shape but never bounds the loop, and the
+  6.6 per-message retry loop/jiffies deadline is not replicated.  The DRM
+  EDID path adds its own 5-attempt loop on top anyway.
+- **`adap->quirks` is carried but not enforced** (`linuxkpi/src/i2c.c`):
+  `struct i2c_adapter_quirks` exists so driver initializers compile;
+  `i2c_check_for_quirks()` (max messages, combined-message and length
+  limits) is not implemented because no P5 consumer sets quirks.
+- **No SMBus emulation** (`linuxkpi/include/linux/i2c.h`):
+  `union i2c_smbus_data` is forward-declared only, `struct i2c_algorithm`
+  carries `smbus_xfer` for driver initializers, and no `i2c_smbus_*` entry
+  points exist.  amdgpu DM uses only `i2c_transfer`, so the census keeps
+  them out of P5 scope.
+- **`i2c_master_send`/`i2c_master_recv` are real functions, not the stock
+  inlines** (`linuxkpi/src/i2c.c`): both route through
+  `i2c_transfer_buffer_flags()` (one message, `count` bytes,
+  `I2C_CLIENT_TEN` honored) and return `count` on success, matching upstream
+  semantics.
+- **The DRM EDID path is validated at message level**: the C4 test drives
+  the exact `drm_do_probe_ddc_edid()` sequences (2 messages for the base
+  block, 3 with the 0x30 segment write for block 2) against a synthetic EDID
+  and checks the fetched block with the imported `drm_edid_block_valid()`.
+  The connector-level `drm_edid_read_ddc()` plumbing stays P6e evidence.
+
+### C5 — sysfs/devres/device/PM completion
+
+- **`struct dev_pm_ops` is the 6.6 layout but there is no PM core**
+  (`linuxkpi/include/linux/pm.h`): the overlay carries `pm_message_t`, the
+  full callback set, `enum rpm_status`/`rpm_request`, the
+  `SYSTEM/LATE/NOIRQ/RUNTIME_PM_OPS` field macros and `pm_ptr`/`pm_sleep_ptr`.
+  With `CONFIG_PM`/`CONFIG_PM_SLEEP` unset, `SET_*_PM_OPS` expand to nothing
+  (upstream's #else arms), so drivers publish a callback table nobody calls;
+  stock `<linux/pm_runtime.h>` no-op inlines are what drivers actually link.
+  Real runtime/system PM remains Phase 8.  The overlay intentionally replaces
+  stock `pm.h`, which redefines `pm_message_t` and would fight the device
+  overlay.
+- **Dynamic sysfs nodes require a native directory handle**
+  (`linuxkpi/src/kobject.c`): `kobj->sd` is the opaque `vfs_node_t` of the
+  kobject's directory.  Class devices get one in `device_add()`; PCI wrappers
+  resolve `/sys/bus/pci/devices/<bdf>` in `kpi_pci_dev_new()`.  A kobject
+  without a handle accepts `sysfs_create_*` as a no-op instead of failing.
+- **`sysfs_create_file()` assumes a device attribute**
+  (`linuxkpi/src/kobject.c`): the bridge extracts `container_of(attr, struct
+  device_attribute, attr)` and the owning device from the kobject, so plain
+  `attribute`s backed by `kobj_type->sysfs_ops` are not supported (no
+  in-tree consumer).  `sysfs_create_link()` stays a no-op: the native tree
+  has no dynamic symlinks for Linux code.
+- **Named groups become subdirectories; EEXIST is success**
+  (`linuxkpi/src/kobject.c`): `grp->name` creates/uses a child directory and
+  removal deletes the whole subtree (releasing contexts).  Re-adding an
+  existing attribute is tolerated as success rather than `-EEXIST`.
+- **Binary attributes are offset-aware; `mmap` is unsupported**
+  (`linuxkpi/src/kobject.c`, `kernel/src/fs/sysfs.c`): reads/writes receive
+  the file offset and bounds, so partial reads and EOF work.  A
+  `bin_attribute.mmap` is never invoked (`mmap` returns `-ENOSYS` at the
+  native file layer), which no P5 consumer needs.
+- **Per-attribute contexts are released by the native removal path**
+  (`kernel/src/fs/sysfs.c`): every dynamic record carries a release callback;
+  `asc_sysfs_remove()`/`sysfs_remove_children()` free the record and context
+  before unlinking.  While bringing this up, `sysfs_remove_children()` was
+  found to reuse the shared static `dirent` returned by `ramfs_readdir()`
+  across a recursive call, so `vfs_rmdir()` saw a clobbered name, failed, and
+  the loop spun forever; the name is now copied before recursion.
+- **Devres releases LIFO and devices unlink on unregister**
+  (`linuxkpi/src/device.c`): `devres_release_all()` and
+  `devres_release_group()` release in reverse registration order (the old
+  FIFO order broke `devm` dependencies), and `device_unregister()` removes
+  the device from `created_devices` so manual unregister + `kfree()` (tests)
+  cannot leave dangling list nodes.
+- **`get_device()`/`put_device()`/`kobject_get()`/`kobject_put()` are still
+  no-ops** (`linuxkpi/src/device.c`, `linuxkpi/src/kobject.c`): there is no
+  device reference count or release-on-last-put; devices live as long as
+  their owner.  Unchanged from P3 and documented for the P6 compile.
+- **PCI power helpers do bookkeeping only** (`linuxkpi/src/pci.c`):
+  `pci_set_power_state()` records `current_state` and returns 0,
+  `pci_choose_state()` answers `PCI_D3hot`, `pci_wake_from_d3()` is a no-op.
+  No PMCSR writes, ASPM, or D-state transitions until Phase 8.
+- **Driver `dev_groups` attach on bind, detach on unbind**
+  (`linuxkpi/src/pci.c`): the direct probe registry calls
+  `device_add_groups()` after a successful probe and
+  `device_remove_groups()` before `remove()`, mirroring the driver core
+  enough for amdgpu's `dev_groups`.
+- **`CONFIG_HAS_IOMEM` is now set** (`linuxkpi/include/generated/autoconf.h`):
+  x86 always selects it; this makes stock `<linux/platform_device.h>`
+  declare `devm_platform_ioremap_resource()` extern (implemented in
+  `linuxkpi/src/platform.c`) instead of the `-EINVAL` inline.
+  `devm_ioremap_resource[_wc]()` rejects resources with `IORESOURCE_UNSET`
+  and otherwise maps through `devm_ioremap[_wc]()`.
+- **The boot self-test wait is 60 s** (`linuxkpi/src/boot_tests.c`): the
+  growing suite list needed more than the old 30 s bound as a safety net;
+  a normal headless boot completes the tests in roughly ten seconds.
+
 ## Phase 4 C5 gaps (bochs TTM canary, 2026-09-13)
 
 - **`page_to_phys()` must not walk `compound_head()`** (fixed in

@@ -688,10 +688,26 @@ void sysfs_init(void) {
 
 /* ── dynamic class/device/attribute nodes (LinuxKPI device core) ─────────── */
 
+/* Dynamic sysfs nodes created by the LinuxKPI bridge.  `impl` carries a magic
+ * so the removal path (asc_sysfs_remove/sysfs_remove_children) can release the
+ * context and the record before the ramfs core frees the node — ramfs_unlink()
+ * would otherwise mistake node->device for a ramfs_file_t. */
+#define SYSFS_DYN_ATTR_MAGIC 0x53444154u /* "SDAT" */
+#define SYSFS_DYN_BIN_MAGIC 0x5344424Eu  /* "SDB N" */
+
 struct sysfs_dyn_attr {
   void *ctx;
   int (*show)(void *ctx, char *buf, unsigned int size);
   int (*store)(void *ctx, const char *buf, unsigned int size);
+  void (*release)(void *ctx);
+};
+
+struct sysfs_dyn_bin {
+  void *ctx;
+  int (*read)(void *ctx, unsigned int offset, char *buf, unsigned int size);
+  int (*write)(void *ctx, unsigned int offset, const char *buf,
+               unsigned int size);
+  void (*release)(void *ctx);
 };
 
 static uint32_t sysfs_dyn_attr_read(vfs_node_t *node, uint32_t offset,
@@ -722,6 +738,17 @@ static uint32_t sysfs_dyn_attr_read(vfs_node_t *node, uint32_t offset,
   return n;
 }
 
+static uint32_t sysfs_dyn_bin_read(vfs_node_t *node, uint32_t offset,
+                                   uint32_t size, uint8_t *buffer) {
+  struct sysfs_dyn_bin *bin = node ? (struct sysfs_dyn_bin *)node->device : NULL;
+  int n;
+
+  if (!bin || !bin->read || !size)
+    return 0;
+  n = bin->read(bin->ctx, offset, (char *)buffer, size);
+  return n < 0 ? 0 : (uint32_t)n;
+}
+
 static uint32_t sysfs_dyn_attr_write(vfs_node_t *node, uint32_t offset,
                                      uint32_t size, uint8_t *buffer) {
   struct sysfs_dyn_attr *attr = node ? (struct sysfs_dyn_attr *)node->device : NULL;
@@ -738,6 +765,24 @@ static uint32_t sysfs_dyn_attr_write(vfs_node_t *node, uint32_t offset,
   memcpy(tmp, buffer, size);
   tmp[size] = '\0';
   ret = attr->store(attr->ctx, tmp, size);
+  kfree(tmp);
+  return ret < 0 ? 0 : size;
+}
+
+static uint32_t sysfs_dyn_bin_write(vfs_node_t *node, uint32_t offset,
+                                    uint32_t size, uint8_t *buffer) {
+  struct sysfs_dyn_bin *bin = node ? (struct sysfs_dyn_bin *)node->device : NULL;
+  char *tmp;
+  int ret;
+
+  if (!bin || !bin->write || !size)
+    return 0;
+  tmp = kmalloc((size_t)size + 1);
+  if (!tmp)
+    return 0;
+  memcpy(tmp, buffer, size);
+  tmp[size] = '\0';
+  ret = bin->write(bin->ctx, offset, tmp, size);
   kfree(tmp);
   return ret < 0 ? 0 : size;
 }
@@ -762,6 +807,38 @@ void *asc_sysfs_device_dir(void *class_dir, const char *dev_name) {
   return sysfs_mkdir((vfs_node_t *)class_dir, dev_name);
 }
 
+/* Release the bridge record attached to a dynamic node before the ramfs core
+ * frees the node itself.  Plain sysfs files (ramfs_file_t) are left alone. */
+static void sysfs_dyn_node_release(vfs_node_t *child) {
+  if (!child)
+    return;
+
+  if (child->impl == SYSFS_DYN_ATTR_MAGIC) {
+    struct sysfs_dyn_attr *a = child->device;
+
+    if (a) {
+      if (a->release)
+        a->release(a->ctx);
+      kfree(a);
+    }
+    child->device = NULL;
+  } else if (child->impl == SYSFS_DYN_BIN_MAGIC) {
+    struct sysfs_dyn_bin *b = child->device;
+
+    if (b) {
+      if (b->release)
+        b->release(b->ctx);
+      kfree(b);
+    }
+    child->device = NULL;
+  }
+}
+
+static void sysfs_remove_file_child(vfs_node_t *dir, vfs_node_t *child) {
+  sysfs_dyn_node_release(child);
+  vfs_unlink(dir, child->name);
+}
+
 static void sysfs_remove_children(vfs_node_t *dir) {
   for (;;) {
     bool removed = false;
@@ -769,20 +846,28 @@ static void sysfs_remove_children(vfs_node_t *dir) {
     struct dirent *de;
 
     while ((de = vfs_readdir(dir, index)) != NULL) {
+      char name[128];
+      vfs_node_t *child;
+
       if (strcmp(de->name, ".") == 0 || strcmp(de->name, "..") == 0) {
         index++;
         continue;
       }
-      vfs_node_t *child = vfs_finddir(dir, de->name);
+      /* Copy before anything can recurse: ramfs_readdir returns a shared
+       * static dirent, and removing a subdirectory reads it again. */
+      strncpy(name, de->name, sizeof(name) - 1);
+      name[sizeof(name) - 1] = '\0';
+
+      child = vfs_finddir(dir, name);
       if (!child) {
         index++;
         continue;
       }
       if ((child->flags & FS_TYPE_MASK) == FS_DIRECTORY) {
         sysfs_remove_children(child);
-        vfs_rmdir(dir, de->name);
+        vfs_rmdir(dir, name);
       } else {
-        vfs_unlink(dir, de->name);
+        sysfs_remove_file_child(dir, child);
       }
       removed = true;
       break; /* enumeration shifted; restart from the first entry */
@@ -805,7 +890,7 @@ void asc_sysfs_remove(void *dir, const char *name) {
     sysfs_remove_children(child);
     vfs_rmdir(d, (char *)name);
   } else {
-    vfs_unlink(d, (char *)name);
+    sysfs_remove_file_child(d, child);
   }
 }
 
@@ -813,7 +898,8 @@ int asc_sysfs_attr_file(void *dir, const char *name, unsigned int mode,
                         void *ctx,
                         int (*show)(void *ctx, char *buf, unsigned int size),
                         int (*store)(void *ctx, const char *buf,
-                                     unsigned int size)) {
+                                     unsigned int size),
+                        void (*release)(void *ctx)) {
   vfs_node_t *d = dir;
   struct sysfs_dyn_attr *attr;
   vfs_node_t *file;
@@ -833,12 +919,14 @@ int asc_sysfs_attr_file(void *dir, const char *name, unsigned int mode,
   attr->ctx = ctx;
   attr->show = show;
   attr->store = store;
+  attr->release = release;
 
   vfs_node_init(file);
   strncpy(file->name, name, sizeof(file->name) - 1);
   file->name[sizeof(file->name) - 1] = '\0';
   file->flags = FS_FILE | FS_PERSISTENT;
   file->mask = (uint16_t)mode;
+  file->impl = SYSFS_DYN_ATTR_MAGIC;
   file->device = attr;
   file->read = sysfs_dyn_attr_read;
   file->write = sysfs_dyn_attr_write;
@@ -846,4 +934,65 @@ int asc_sysfs_attr_file(void *dir, const char *name, unsigned int mode,
   ramfs_mount_node(d, file);
   vfs_dentry_invalidate(d, (char *)name);
   return 0;
+}
+
+int asc_sysfs_bin_file(void *dir, const char *name, unsigned int mode,
+                       void *ctx,
+                       int (*read)(void *ctx, unsigned int offset, char *buf,
+                                   unsigned int size),
+                       int (*write)(void *ctx, unsigned int offset,
+                                    const char *buf, unsigned int size),
+                       void (*release)(void *ctx)) {
+  vfs_node_t *d = dir;
+  struct sysfs_dyn_bin *bin;
+  vfs_node_t *file;
+
+  if (!d || !name || !*name)
+    return -22; /* EINVAL */
+  if (vfs_finddir(d, (char *)name))
+    return -17; /* EEXIST */
+
+  bin = kmalloc(sizeof(*bin));
+  file = kmalloc(sizeof(*file));
+  if (!bin || !file) {
+    kfree(bin);
+    kfree(file);
+    return -12; /* ENOMEM */
+  }
+  bin->ctx = ctx;
+  bin->read = read;
+  bin->write = write;
+  bin->release = release;
+
+  vfs_node_init(file);
+  strncpy(file->name, name, sizeof(file->name) - 1);
+  file->name[sizeof(file->name) - 1] = '\0';
+  file->flags = FS_FILE | FS_PERSISTENT;
+  file->mask = (uint16_t)mode;
+  file->impl = SYSFS_DYN_BIN_MAGIC;
+  file->device = bin;
+  file->read = sysfs_dyn_bin_read;
+  file->write = sysfs_dyn_bin_write;
+
+  ramfs_mount_node(d, file);
+  vfs_dentry_invalidate(d, (char *)name);
+  return 0;
+}
+
+void *asc_sysfs_dir_by_path(const char *path) {
+  vfs_node_t *node;
+
+  if (!path)
+    return NULL;
+  node = vfs_resolve_path(path);
+  if (!node)
+    return NULL;
+  if ((node->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
+    vfs_close(node);
+    return NULL;
+  }
+  /* Match asc_sysfs_class_dir(): return the tree pointer, not the extra
+   * lookup reference.  Sysfs directories live for the kernel's lifetime. */
+  vfs_close(node);
+  return node;
 }

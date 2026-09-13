@@ -5,6 +5,8 @@
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/errno.h>
+#include <linux/interrupt.h>
+#include <linux/ioport.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 
@@ -122,6 +124,10 @@ void device_unregister(struct device *dev) {
     return;
   devres_release_all(dev);
   device_del(dev);
+  /* Devices created by __kpi_device_create() are on the global list; manual
+   * unregister+kfree (tests) must unlink them so the list never dangles. */
+  if (dev->kpi_list.next && dev->kpi_list.next != &dev->kpi_list)
+    list_del(&dev->kpi_list);
   if (dev->release)
     dev->release(dev);
 }
@@ -176,11 +182,12 @@ void class_destroy(const struct class *cls) {
     kfree((void *)cls);
 }
 
-struct device *__kpi_device_create(const struct class *cls,
-                                   struct device *parent, dev_t devt,
-                                   void *drvdata, const char *fmt, ...) {
+static struct device *kpi_device_create_va(const struct class *cls,
+                                           struct device *parent, dev_t devt,
+                                           void *drvdata,
+                                           const struct attribute_group **groups,
+                                           const char *fmt, va_list ap) {
   struct device *dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-  va_list ap;
 
   if (!dev)
     return ERR_PTR(-ENOMEM);
@@ -190,14 +197,39 @@ struct device *__kpi_device_create(const struct class *cls,
   dev->parent = parent;
   dev->devt = devt;
   dev->driver_data = drvdata;
+  dev->groups = groups;
 
-  va_start(ap, fmt);
   vsnprintf(dev->kpi_name, sizeof(dev->kpi_name), fmt, ap);
-  va_end(ap);
   dev->init_name = dev->kpi_name;
 
   list_add_tail(&dev->kpi_list, &created_devices);
   device_register(dev);
+  return dev;
+}
+
+struct device *__kpi_device_create(const struct class *cls,
+                                   struct device *parent, dev_t devt,
+                                   void *drvdata, const char *fmt, ...) {
+  struct device *dev;
+  va_list ap;
+
+  va_start(ap, fmt);
+  dev = kpi_device_create_va(cls, parent, devt, drvdata, NULL, fmt, ap);
+  va_end(ap);
+  return dev;
+}
+
+struct device *device_create_with_groups(const struct class *cls,
+                                         struct device *parent, dev_t devt,
+                                         void *drvdata,
+                                         const struct attribute_group **groups,
+                                         const char *fmt, ...) {
+  struct device *dev;
+  va_list ap;
+
+  va_start(ap, fmt);
+  dev = kpi_device_create_va(cls, parent, devt, drvdata, groups, fmt, ap);
+  va_end(ap);
   return dev;
 }
 
@@ -207,7 +239,6 @@ void __kpi_device_destroy(const struct class *cls, dev_t devt) {
   (void)cls;
   list_for_each_entry_safe(dev, tmp, &created_devices, kpi_list) {
     if (dev->devt == devt) {
-      list_del(&dev->kpi_list);
       device_unregister(dev);
       kfree(dev);
       return;
@@ -338,7 +369,7 @@ void devres_close_group(struct device *dev, void *id) {
 void devres_release_group(struct device *dev, void *id) {
   struct devres_node *node;
   struct devres_alloc_rec *rec;
-  struct list_head *pos, *next;
+  struct list_head *pos;
   struct list_head *start;
 
   (void)id;
@@ -348,25 +379,31 @@ void devres_release_group(struct device *dev, void *id) {
   start = dev->kpi_group_node_mark
               ? (struct list_head *)dev->kpi_group_node_mark
               : &dev->devres_head;
-  for (pos = start->next; pos != &dev->devres_head; pos = next) {
-    next = pos->next;
+  for (pos = dev->devres_head.prev; pos != &dev->devres_head && pos != start;) {
+    struct list_head *prev = pos->prev;
+
     node = list_entry(pos, struct devres_node, entry);
     list_del(pos);
     if (node->release)
       node->release(node->data);
     kfree(node);
+    pos = prev;
   }
 
   start = dev->kpi_group_alloc_mark
               ? (struct list_head *)dev->kpi_group_alloc_mark
               : &devres_alloc_list;
-  for (pos = start->next; pos != &devres_alloc_list; pos = next) {
-    next = pos->next;
+  for (pos = devres_alloc_list.prev; pos != &devres_alloc_list && pos != start;) {
+    struct list_head *prev = pos->prev;
+
     rec = list_entry(pos, struct devres_alloc_rec, list);
-    list_del(pos);
-    if (rec->release)
-      rec->release(dev, rec->data);
-    kfree(rec);
+    if (rec->dev == dev) {
+      list_del(pos);
+      if (rec->release)
+        rec->release(dev, rec->data);
+      kfree(rec);
+    }
+    pos = prev;
   }
 
   dev->kpi_group_node_mark = NULL;
@@ -374,16 +411,18 @@ void devres_release_group(struct device *dev, void *id) {
 }
 
 void devres_release_all(struct device *dev) {
-  struct devres_node *node, *tmp;
   struct devres_alloc_rec *rec, *rtmp;
 
-  if (dev && dev->devres_head.next) {
-    list_for_each_entry_safe(node, tmp, &dev->devres_head, entry) {
-      list_del(&node->entry);
-      if (node->release)
-        node->release(node->data);
-      kfree(node);
-    }
+  /* Devres resources are released in reverse registration order (LIFO), so
+   * later actions can still use earlier ones. */
+  while (dev && dev->devres_head.next && !list_empty(&dev->devres_head)) {
+    struct devres_node *node =
+        list_last_entry(&dev->devres_head, struct devres_node, entry);
+
+    list_del(&node->entry);
+    if (node->release)
+      node->release(node->data);
+    kfree(node);
   }
 
   list_for_each_entry_safe(rec, rtmp, &devres_alloc_list, list) {
@@ -393,6 +432,69 @@ void devres_release_all(struct device *dev) {
         rec->release(dev, rec->data);
       kfree(rec);
     }
+  }
+}
+
+/* ── devm_request_irq / devm_free_irq ───────────────────────────────────── */
+
+struct kpi_devm_irq {
+  unsigned int irq;
+  void *dev_id;
+};
+
+static void kpi_devm_irq_release(void *data) {
+  struct kpi_devm_irq *w = data;
+
+  free_irq(w->irq, w->dev_id);
+  kfree(w);
+}
+
+int devm_request_irq(struct device *dev, unsigned int irq,
+                     irqreturn_t (*handler)(int, void *),
+                     unsigned long irqflags, const char *devname,
+                     void *dev_id) {
+  struct kpi_devm_irq *w;
+  int ret;
+
+  if (!dev)
+    return -EINVAL;
+  ret = request_irq(irq, handler, irqflags, devname, dev_id);
+  if (ret)
+    return ret;
+
+  w = kmalloc(sizeof(*w), GFP_KERNEL);
+  if (!w) {
+    free_irq(irq, dev_id);
+    return -ENOMEM;
+  }
+  w->irq = irq;
+  w->dev_id = dev_id;
+  if (devm_add_action(dev, kpi_devm_irq_release, w)) {
+    free_irq(irq, dev_id);
+    kfree(w);
+    return -ENOMEM;
+  }
+  return 0;
+}
+
+void devm_free_irq(struct device *dev, unsigned int irq, void *dev_id) {
+  struct devres_node *node, *tmp;
+
+  if (!dev || !dev->devres_head.next)
+    return;
+  list_for_each_entry_safe(node, tmp, &dev->devres_head, entry) {
+    struct kpi_devm_irq *w;
+
+    if (node->release != kpi_devm_irq_release)
+      continue;
+    w = node->data;
+    if (!w || w->irq != irq || w->dev_id != dev_id)
+      continue;
+    list_del(&node->entry);
+    kfree(node);
+    free_irq(irq, dev_id);
+    kfree(w);
+    return;
   }
 }
 
@@ -435,6 +537,31 @@ char *devm_kstrdup(struct device *dev, const char *s, gfp_t gfp) {
   if (p)
     memcpy(p, s, len);
   return p;
+}
+
+char *devm_kasprintf(struct device *dev, gfp_t gfp, const char *fmt, ...) {
+  size_t size = 128;
+  char *buf;
+
+  for (;;) {
+    va_list ap;
+    int n;
+
+    buf = devm_kmalloc(dev, size, gfp);
+    if (!buf)
+      return NULL;
+
+    va_start(ap, fmt);
+    n = vsnprintf(buf, size, fmt, ap);
+    va_end(ap);
+
+    if (n >= 0 && (size_t)n < size)
+      return buf;
+    devm_kfree(dev, buf);
+    size = n >= 0 ? (size_t)n + 1 : size * 2;
+    if (size > (1u << 20))
+      return NULL;
+  }
 }
 
 void devm_kfree(struct device *dev, const void *p) {
@@ -484,6 +611,42 @@ void __iomem *devm_ioremap_wc(struct device *dev, resource_size_t offset,
   if (devm_add_action(dev, __kpi_devm_iounmap_action, (void *)addr)) {
     iounmap(addr);
     return NULL;
+  }
+  return addr;
+}
+
+void __iomem *devm_ioremap_resource(struct device *dev,
+                                    const struct resource *res) {
+  void __iomem *addr;
+
+  if (!res || (res->flags & IORESOURCE_UNSET)) {
+    if (dev)
+      dev_err(dev, "invalid resource\n");
+    return ERR_PTR(-EINVAL);
+  }
+  addr = devm_ioremap(dev, res->start, resource_size(res));
+  if (!addr || IS_ERR(addr)) {
+    if (dev)
+      dev_err(dev, "ioremap failed\n");
+    return addr ? addr : ERR_PTR(-ENOMEM);
+  }
+  return addr;
+}
+
+void __iomem *devm_ioremap_resource_wc(struct device *dev,
+                                       const struct resource *res) {
+  void __iomem *addr;
+
+  if (!res || (res->flags & IORESOURCE_UNSET)) {
+    if (dev)
+      dev_err(dev, "invalid resource\n");
+    return ERR_PTR(-EINVAL);
+  }
+  addr = devm_ioremap_wc(dev, res->start, resource_size(res));
+  if (!addr || IS_ERR(addr)) {
+    if (dev)
+      dev_err(dev, "ioremap failed\n");
+    return addr ? addr : ERR_PTR(-ENOMEM);
   }
   return addr;
 }

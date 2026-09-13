@@ -1,26 +1,31 @@
-// SPDX-License-Identifier: GPL-2.0
-/* Minimal, synchronous Linux firmware-loader compatibility for kernel drivers. */
+/* Linux firmware loader for LinuxKPI (Phase 5 C3).
+ *
+ * Synchronous request_firmware() over the native VFS: it reads
+ * /lib/firmware/<name> through the kernel-side open/size/read/close bridge
+ * (asc_vfs_kernel_*).  This is the path amdgpu's PSP/SMU/DMCUB blobs will
+ * use from Phase 6c on; the disk image installs them with the
+ * linux-firmware-install.sh manifest.
+ *
+ * Deliberate simplifications (docs/linuxkpi-gaps.md):
+ *   - synchronous only: request_firmware_nowait/direct/into_buf are not
+ *     implemented until a compiled driver needs them,
+ *   - no firmware caching layer, no sysfs fallback, no uevents,
+ *   - the `priv` field is unused (NULL). */
 
+#include <linux/err.h>
+#include <linux/errno.h>
 #include <linux/firmware.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 
-#include "fs/vfs.h"
-#include "lib/string.h"
-#include "mm/heap.h"
-
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+#include <linuxkpi/native_vfs.h>
 
 #define LINUX_FIRMWARE_PREFIX "/lib/firmware/"
 #define LINUX_FIRMWARE_NAME_MAX 192u
 #define LINUX_FIRMWARE_SIZE_MAX (16u * 1024u * 1024u)
 
-#define LINUX_EINVAL 22
-#define LINUX_ENOENT 2
-#define LINUX_ENOMEM 12
-#define LINUX_EFBIG 27
-#define LINUX_EIO 5
-
+/* Reject absolute paths, empty components, "." and ".." components and
+ * backslashes, matching the old loader's validation. */
 static bool firmware_name_valid(const char *name, size_t *length_out) {
   if (!name || !name[0] || name[0] == '/')
     return false;
@@ -52,56 +57,62 @@ static bool firmware_name_valid(const char *name, size_t *length_out) {
 }
 
 int request_firmware(const struct firmware **firmware_p, const char *name,
-                     const struct device *device) {
-  (void)device;
-  if (!firmware_p)
-    return -LINUX_EINVAL;
-  *firmware_p = NULL;
-
-  size_t name_length = 0;
-  if (!firmware_name_valid(name, &name_length))
-    return -LINUX_EINVAL;
-
+                     struct device *device) {
+  struct firmware *firmware;
+  unsigned char *data;
   char path[sizeof(LINUX_FIRMWARE_PREFIX) + LINUX_FIRMWARE_NAME_MAX];
   size_t prefix_length = sizeof(LINUX_FIRMWARE_PREFIX) - 1;
+  size_t name_length = 0;
+  unsigned int size, read;
+  void *node;
+
+  (void)device;
+  if (!firmware_p)
+    return -EINVAL;
+  *firmware_p = NULL;
+  if (!firmware_name_valid(name, &name_length))
+    return -EINVAL;
+
   memcpy(path, LINUX_FIRMWARE_PREFIX, prefix_length);
   memcpy(path + prefix_length, name, name_length + 1);
 
-  vfs_node_t *node = vfs_resolve_path(path);
+  node = asc_vfs_kernel_open(path);
   if (!node)
-    return -LINUX_ENOENT;
-  if ((node->flags & FS_TYPE_MASK) != FS_FILE || !node->length) {
-    vfs_close(node);
-    return -LINUX_EINVAL;
+    return -ENOENT;
+
+  size = asc_vfs_kernel_size(node);
+  if (!size) {
+    asc_vfs_kernel_close(node);
+    return -EINVAL;
   }
-  if (node->length > LINUX_FIRMWARE_SIZE_MAX) {
-    vfs_close(node);
-    return -LINUX_EFBIG;
+  if (size > LINUX_FIRMWARE_SIZE_MAX) {
+    asc_vfs_kernel_close(node);
+    return -EFBIG;
   }
 
-  struct firmware *firmware = kmalloc(sizeof(*firmware));
-  uint8_t *data = kmalloc(node->length);
+  firmware = kzalloc(sizeof(*firmware), GFP_KERNEL);
+  data = kmalloc(size, GFP_KERNEL);
   if (!firmware || !data) {
     if (data)
       kfree(data);
     if (firmware)
       kfree(firmware);
-    vfs_close(node);
-    return -LINUX_ENOMEM;
+    asc_vfs_kernel_close(node);
+    return -ENOMEM;
   }
 
-  uint32_t size = node->length;
-  uint32_t read = vfs_read(node, 0, size, data);
-  vfs_close(node);
+  read = asc_vfs_kernel_read(node, 0, size, data);
+  asc_vfs_kernel_close(node);
   if (read != size) {
     memset(data, 0, size);
     kfree(data);
     kfree(firmware);
-    return -LINUX_EIO;
+    return -EIO;
   }
 
   firmware->size = size;
   firmware->data = data;
+  firmware->priv = NULL;
   *firmware_p = firmware;
   return 0;
 }

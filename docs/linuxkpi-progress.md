@@ -572,7 +572,7 @@ mappings, kthread_worker in `kthread.c`.
 - [x] Handoff: Phase 3 sources + docs committed; `userland/kria-lang/` and
       `userland/quake2/` intentionally left untracked (build artifacts).
 
-## Phase 4 — TTM + drm_sched + minimal Linux PCI + TTM canary (in progress)
+## Phase 4 — TTM + drm_sched + minimal Linux PCI + TTM canary (exited 2026-09-13)
 
 Chunk plan: `docs/linuxkpi-phase4-plan.md` (written 2026-09-12 after auditing
 P0–P3 at `45ee1af`).  Chunks: C0 baseline closeout → C1 import/build TTM +
@@ -621,11 +621,11 @@ C7 optional amdgpu compile spike.
 - [ ] Interactive userland regression for the C1 build (`/dev/dri`,
       `bin/test_kpi_drm`) — pending; C2's boot tests re-check the kernel side.
 
-Open items that C0 must close before Phase 4 exit:
+Open items that C0 had to close before Phase 4 exit:
 
-- [ ] P2 exit: clean 10-minute soak (`bin/test_kpi_dmabuf 600`, `-smp 4`)
-      after the warm-up-baseline fix; must end `delta=0`-class and with
-      `closes == iterations`.
+- [x] P2 exit: clean 10-minute soak (`bin/test_kpi_dmabuf 600`, `-smp 4`)
+      after the warm-up-baseline fix; closed 2026-09-13 with the P4 exit
+      (maintainer-run, `closes == iterations`, delta ≈ 0-class).
 
 ### C2 — TTM self-tests (verified 2026-09-12)
 
@@ -789,10 +789,232 @@ Open items that C0 must close before Phase 4 exit:
       All P0–P4 suites green in the same boot (TTM and sched report their
       usual one-page `delta=-1`); boot reaches the login prompt.
 
+### C5 — bochs TTM canary (verified 2026-09-13, P4 exit)
+
+- [x] `test_phase4_bochs.c`: discovers bochs by `DRM_IOCTL_VERSION` name
+      (`/dev/dri/card2`), checks the PCI parent, discovers CRTC/connector/
+      plane, writes a pixel pattern through `ttm_bo_vmap`, commits an atomic
+      enable, verifies the VBE XRES/YRES registers through BAR2, reads the
+      pattern back through the BAR0 VRAM mapping at the BO's offset, disables
+      the commit, and runs a warm-up + 2x128 VRAM BO create/map/pin/free loop
+      with PMM and TTM VRAM-manager invariants.
+- [x] Root cause found while bringing the canary up: `page_to_phys()` walked
+      `compound_head(page)`, which aliased every page of a non-compound
+      high-order allocation (TTM's pool allocates order-N pages without
+      `__GFP_COMP`) onto the block head.  It now returns `page->pfn <<
+      PAGE_SHIFT` like upstream; `alloc_pages()` only builds compound
+      bookkeeping when `__GFP_COMP` is set, and the Phase 2 page test now
+      covers both compound (`__GFP_COMP`) and plain high-order semantics.
+- [x] **Exit evidence** (maintainer-run `run-linuxdrm`, `-smp 4`, serial):
+      ```
+      [drm] Initialized bochs-drm 1.0.0 20130925 for 0000:00:03.0 on minor 2
+      [  OK  ] LinuxKPI: page order alloc/free correct
+      [  OK  ] LinuxKPI: bochs PCI parent is a bochs VGA device
+      [  OK  ] LinuxKPI: bochs objects crtc=35 conn=31 plane=33 modes=15 (1280x800)
+      [  OK  ] LinuxKPI: bochs dumb buffer pattern written via vmap
+      [  OK  ] LinuxKPI: bochs atomic enable commit
+      [  OK  ] LinuxKPI: bochs VBE registers match the committed mode
+      [  OK  ] LinuxKPI: bochs BAR0 pattern readback at the BO's VRAM offset
+      [  OK  ] LinuxKPI: bochs atomic disable commit
+      [  OK  ] LinuxKPI: bochs 2x128 VRAM BO create/map/pin/free loop, PMM + VRAM stable
+      [  OK  ] LinuxKPI: bochs suite complete
+      ```
+      All Phase 0–4 suites green in the same boot; no `[FAIL]` from the
+      kernel suites; boot reaches the login prompt.
+- [x] **Phase 4 exit confirmed 2026-09-13**; the C0 baseline gate for Phase 5
+      is closed.  Next: Phase 5 C1 (full Linux PCI API, non-IRQ) per
+      `docs/linuxkpi-phase5-plan.md`.
+
 Deviations from the original Phase 4 sketch are recorded in the plan: QEMU
 11.1 has no `mgag200` (bochs is the TTM canary), bochs lives in
 `drivers/gpu/drm/tiny/bochs.c` and is TTM-backed via
 `drm_gem_vram_helper`, and 6.6 virtio-gpu is GEM-shmem (not TTM).
+
+## Phase 5 — full I/O foundations + VFIO hardening (planned)
+
+Chunk plan: `docs/linuxkpi-phase5-plan.md` (written 2026-09-12 after auditing
+P0–P4 at `4e7dd65` plus the C5 working tree).  Chunks: C0 baseline closeout →
+C1 full PCI API (non-IRQ) → C2 IRQ core + MSI/MSI-X → C3 ACPI audit +
+firmware verification → C4 minimal i2c core → C5 sysfs/devres/PM completion →
+C6 IRQs-on syscalls + soak → C7 VFIO/Raphael validation → C8 closeout.
+
+**Status 2026-09-13: C0–C5 verified.**  C1 (full PCI API), C2 (IRQ core +
+MSI/MSI-X), C3 (ACPI tables + firmware loader), C4 (minimal i2c core) and C5
+(dynamic sysfs/devres/PM completion) are green in the same boot; next is C6
+(IRQs-on syscalls + context tracking + soak) per `docs/linuxkpi-phase5-plan.md`.
+
+### C1 — full Linux PCI API (non-IRQ), verified 2026-09-13
+
+- [x] `test_phase5_pci.c` written first and wired into `boot_tests.c` after
+      the bochs suite: config state save/restore + store/load, ROM map on
+      virtio-vga (size + 55AA + 4 map/unmap cycles), PCIe speed/width caps,
+      pending-transaction wait, device-present probe, resource release.
+- [x] `linuxkpi/src/pci.c`: `pci_save_state`/`restore_state`/`store_saved_state`/
+      `load_saved_state`/`load_and_free_saved_state`, `pcie_get_speed_cap`/
+      `pcie_get_width_cap`/`pcie_print_link_status`,
+      `pci_wait_for_pending_transaction`, `pci_device_is_present`,
+      `pci_release_resource`, and a real `pci_map_rom` (ROM BAR sizing plus a
+      shim-local assignment scan for the unassigned all-ones BAR that OVMF
+      leaves behind).
+- [x] First boot found two issues, both fixed: the test checked the hardware
+      command register right after `pci_load_saved_state()` (that API is
+      software-only; hardware is programmed by `pci_restore_state()`), and
+      the unassigned-ROM test compared against `PCI_ROM_ADDRESS_MASK` instead
+      of the sized readback (`0xFFFF0000` for a 64K ROM), so the shim mapped
+      the bogus all-ones address.  Details in `docs/linuxkpi-gaps.md` (P5 C1).
+- [x] Boot verification (2026-09-13, `run-linuxdrm`): all ten `pci5` checks
+      `[  OK  ]`, ending with `pci5 suite complete`; ROM mapped at
+      `0xfebf0000` with the 55AA signature.  C1 is green.
+
+### C2 — IRQ core + MSI/MSI-X bridge, verified 2026-09-13
+
+- [x] `test_phase5_irq.c` written first and wired into `boot_tests.c` after
+      the PCI suite: MSI allocation + `request_irq` + delivery,
+      disable/enable gating, a 64 raise/ack exact-count loop, the legacy INTx
+      fallback, `request_threaded_irq` (asserts `!in_interrupt()` in the
+      thread), shared handlers, `devm_request_irq` release on devres
+      teardown, and a 10k-interrupt stress loop with a PMM baseline.
+- [x] New `linuxkpi/src/irq.c`: 256-entry vector-indexed descriptor table,
+      shared action chains, threaded handlers queued on the system workqueue,
+      enable/disable/synchronize with per-vector mask callbacks.
+      `devm_request_irq`/`devm_free_irq` implemented in `device.c`.
+- [x] New native trampoline + PCI bridge
+      `kernel/src/linuxkpi/native_irq.c` (`isr_t` reads `regs->int_no`; owns
+      the opaque `struct pci_irq`), and `linuxkpi/src/pci.c` gained
+      `pci_alloc_irq_vectors[_affinity]`, `pci_free_irq_vectors`,
+      `pci_irq_vector`, `pci_msi_vec_count`, `pci_msix_vec_count`,
+      `pci_irq_get_affinity`.
+- [x] Build + ISO clean; `nm` shows the new entry points.
+- [x] Verification run (2026-09-13, `run-linuxdrm`, `-smp 4`): MSI works
+      (`vector=105`, `mc=0x0081 addr=0xfee00000 data=0x0069`) once the test
+      calls `pci_set_master()` — QEMU's MSI message path needs bus mastering,
+      which every real driver enables before MSI.  All checks green
+      (delivery, disable/enable, 64-cycle exact loop, INTx fallback, threaded,
+      shared, 10k stress, PMM stable) except a test-side ordering race in the
+      devm block (the counter baseline was sampled after raising); fixed, and
+      the re-run is expected fully green.  C1 `pci5` stayed green in the same
+      boot.  Divergences (lock-held dispatch, no ONESHOT masking, workqueue
+      threading, INTx vector numbering) are in `docs/linuxkpi-gaps.md` P5 C2.
+- [x] Re-run (2026-09-13, `run-linuxdrm`, `-smp 4`): the fixed devm block
+      passes and the suite is fully green —
+      `[  OK  ] LinuxKPI: irq devm_request_irq delivers`,
+      `[  OK  ] LinuxKPI: irq devres teardown frees the IRQ`,
+      `[  OK  ] LinuxKPI: irq 10k interrupts exact`,
+      `[  OK  ] LinuxKPI: irq IRQ stress PMM stable`,
+      `[  OK  ] LinuxKPI: irq suite complete` — with C1 `pci5` green in the
+      same boot.  C2 is closed.
+
+### C3 — ACPI table access + firmware loader, verified 2026-09-13
+
+- [x] ACPI audit: with `CONFIG_ACPI=n`, `amdgpu_acpi.o`/`amdgpu_atpx_handler.o`
+      are not built, `amdgpu_bios.c`'s VFCT path is `#ifdef CONFIG_ACPI`, and
+      the display's ACPI references are inside `#if defined(CONFIG_ACPI)`.
+      No compiled TU needs ACPI symbols beyond the overlay.
+- [x] `linux/acpi.h` overlay gained `acpi_status`/`ACPI_SUCCESS`,
+      `struct acpi_table_header`, `ACPI_SIG_*` and
+      `acpi_get_table`/`acpi_put_table` over the new native bridge
+      (`kernel/src/linuxkpi/native_acpi.c`).
+- [x] `CONFIG_FW_LOADER=1`; the loader moved from
+      `kernel/src/linuxkpi/firmware.c` (legacy header) to
+      `linuxkpi/src/firmware.c` using stock `<linux/firmware.h>` and
+      `asc_vfs_kernel_*`; the old file is deleted; `asc_vfs_kernel_size()`
+      added to the VFS bridge.
+- [x] Tests `test_phase5_acpi.c` (FADT/MADT, unknown signature, put_table) and
+      `test_phase5_firmware.c` (full 4 KB content match, `-ENOENT`,
+      traversal) written and wired after the IRQ suite.
+- [x] `build/test_fw.bin` generated and copied into
+      `build/alpine/rootfs/lib/firmware/` before the rootfs populate; kernel +
+      ISO build clean and all new symbols are linked.
+- [x] Boot verification (2026-09-13, `run-linuxdrm`, `-smp 4`): FADT/MADT
+      resolve through the native walker (`FADT len=244 rev=3`), the unknown
+      signature fails cleanly, the 4 KB `test_fw.bin` content matches, and
+      `-ENOENT`/traversal handling is correct —
+      `[  OK  ] LinuxKPI: acpi suite complete`,
+      `[  OK  ] LinuxKPI: fw suite complete` — with C1/C2 green in the same
+      boot.  C3 is closed.  Divergences recorded in `docs/linuxkpi-gaps.md`
+      P5 C3.
+
+### C4 — minimal I2C core (DDC/EDID), verified 2026-09-13
+
+- [x] `test_phase5_i2c.c` written first and wired into `boot_tests.c` after
+      the firmware suite: dynamic + numbered registration and lookup, a
+      scripted roundtrip backend (address/flag/length, `I2C_M_RD`,
+      zero-length messages, `i2c_master_send`/`i2c_master_recv`), `-EAGAIN`
+      retry semantics (succeeds inside `adap->retries`, gives up after),
+      two-thread serialization through one adapter, 1000 add/del cycles with
+      id reuse and a PMM baseline, and the exact `drm_edid.c` DDC sequences
+      (2 messages for the base block, 3 with the 0x30 segment write for block
+      2) against a synthetic 128-byte EDID validated by the imported
+      `drm_edid_block_valid()`.
+- [x] New `linuxkpi/src/i2c.c`: adapter registry (64 slots, lowest-free
+      dynamic ids, `-EBUSY`/`-EINVAL` on numbered conflicts), `i2c_transfer`
+      under `adap->bus_lock` + `__i2c_transfer` unlocked flavor,
+      `i2c_get_adapter`/`i2c_put_adapter`, `i2c_verify_adapter` via a real
+      `i2c_adapter_type`, `i2c_master_*` through
+      `i2c_transfer_buffer_flags`.  The `linux/i2c.h` overlay grew the
+      adapter/algorithm/client/lock types and `I2C_FUNC_*`/`I2C_CLASS_DDC`.
+- [x] The weak `i2c_transfer`/`i2c_master_*` stubs in `drm_compat.c` are
+      removed; the real core overrides them.
+- [x] Build + link clean; `nm` shows `i2c_transfer`, `__i2c_transfer`,
+      `i2c_add_adapter`, `i2c_del_adapter`, `i2c_get_adapter` etc.
+- [x] Boot verification (2026-09-13, `run-linuxdrm`, `-smp 4`): the whole
+      suite is green, ending with
+      `[  OK  ] LinuxKPI: i2c DDC 2-message read validates via drm_edid_block_valid`,
+      `[  OK  ] LinuxKPI: i2c DDC 3-message segment sequence`,
+      `[  OK  ] LinuxKPI: i2c suite complete`, with all C0–C3 suites green in
+      the same boot.  C4 is closed.  Divergences recorded in
+      `docs/linuxkpi-gaps.md` P5 C4 (no clients/instantiation, no OF/ACPI
+      lookup, no SMBus, 64-adapter cap, no refcounting, `timeout` unused).
+
+### C5 — sysfs/devres/device/PM completion, verified 2026-09-13
+
+- [x] `test_phase5_sysfs.c` written first and wired into `boot_tests.c`:
+      `device_create_with_groups()` on a test class, RO/RW attributes read
+      and written through the native sysfs path, `is_visible()` skipping, a
+      named subgroup in its own directory, a 256-byte binary attribute
+      (partial reads, EOF clamp, partial write), `device_remove_groups()`
+      unlinking and `device_add_groups()` re-creating, devres reverse-order
+      release, `devm_kasprintf`/`devm_kmalloc_array`,
+      `devm_ioremap_resource()` rejecting an unset resource, and a 64×
+      create/group-remove/destroy loop with a PMM baseline.
+- [x] `test_phase5_devmodel.c`: an "amdgpu-shaped" `struct pci_driver` with
+      `.driver.dev_groups` and a full 6.6-layout `.driver.pm` binds EDU,
+      exercises stock `<linux/pm_runtime.h>` no-ops,
+      `pci_set_power_state`/`pci_choose_state`/`pci_wake_from_d3`, shows its
+      group under `/sys/bus/pci/devices/<bdf>` (plus a direct
+      `sysfs_create_file`), and removes both on unbind.
+- [x] Native sysfs bridge (`kernel/src/fs/sysfs.c`,
+      `linuxkpi/native_sysfs.h`): `asc_sysfs_dir_by_path()`, offset-aware
+      `asc_sysfs_bin_file()`, a release callback on every dynamic record, and
+      a removal path that frees the LinuxKPI context before the ramfs core
+      frees the node.  Fixed while bringing C5 up: `ramfs_readdir()` returns a
+      shared static `dirent`, so `sysfs_remove_children()` must copy the name
+      before recursing — otherwise `vfs_rmdir()` gets a clobbered name, fails,
+      and the removal loop spins forever.
+- [x] `linuxkpi/src/kobject.c`: real `sysfs_create_file(s)`/`create_group(s)`/
+      `remove_*`/`create_bin_file`/`remove_bin_file` with per-attribute
+      contexts, `is_visible`/`is_bin_visible`, named and nested groups.
+      `device_add_groups()`/`device_remove_groups()` route through them.
+- [x] `linuxkpi/src/device.c`: `device_create_with_groups()`,
+      `devm_kasprintf()`, `devm_kmalloc_array()` (inline),
+      `devm_ioremap_resource[_wc]()`, LIFO devres release (was FIFO), and
+      `device_unregister()` unlinks created devices from the global list.
+- [x] New `<linux/pm.h>` overlay with the 6.6 `dev_pm_ops` layout and
+      `pm_ptr`/`SET_*_PM_OPS`; stock `pm_runtime.h` no-ops compile against it.
+      `CONFIG_HAS_IOMEM` set; `devm_platform_ioremap_resource()` implemented
+      over `platform_get_resource()`.
+- [x] `linuxkpi/src/pci.c`: PCI wrappers resolve their
+      `/sys/bus/pci/devices/<bdf>` directory at creation; `dev_groups` attach
+      on successful probe and are removed on unbind; inert
+      `pci_set_power_state`/`pci_choose_state`/`pci_wake_from_d3`.
+- [x] Boot self-test wait raised 30 s → 60 s: the suite list outgrew the old
+      bound even though the full run now completes in ~11 s.
+- [x] Boot verification (2026-09-13, explicit headless QEMU, scratch disk,
+      `-smp 4`): all C0–C4 suites green, then
+      `[  OK  ] LinuxKPI: sysfs suite complete` (21 checks) and
+      `[  OK  ] LinuxKPI: devmodel suite complete` (8 checks); no `[FAIL]`,
+      no timeout.  C5 is closed.  Divergences in `docs/linuxkpi-gaps.md`
+      P5 C5.
 
 ## Cross-phase notes
 

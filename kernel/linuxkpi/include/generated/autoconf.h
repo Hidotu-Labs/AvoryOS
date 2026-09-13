@@ -98,4 +98,14 @@
 #define CONFIG_DRM_SCHED 1
 #define CONFIG_DRM_BOCHS 1
 
+/* Phase 5 C3: the real firmware loader declarations in <linux/firmware.h>
+ * (request_firmware/release_firmware) instead of the !CONFIG_FW_LOADER inline
+ * stubs.  Implementation: linuxkpi/src/firmware.c over the native VFS. */
+#define CONFIG_FW_LOADER 1
+
+/* Phase 5 C5: x86 always selects HAS_IOMEM.  With it set, stock
+ * <linux/platform_device.h> declares devm_platform_ioremap_resource() extern
+ * (implemented in linuxkpi/src/platform.c) instead of the -EINVAL inline. */
+#define CONFIG_HAS_IOMEM 1
+
 #endif /* __AVORY_LINUXKPI_AUTOCONF_H */
