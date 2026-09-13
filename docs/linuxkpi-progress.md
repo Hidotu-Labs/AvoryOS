@@ -1103,8 +1103,10 @@ MSI/MSI-X), C3 (ACPI tables + firmware loader), C4 (minimal i2c core) and C5
       the host prints `GPU 2: AMD Raphael`, and in the guest it lists every
       display-class PCI device automatically (AMD Raphael under run-vfio,
       no driver required; stays correct once P6 binds amdgpu).
-- [ ] Interactive display run (GTK + virtio-vga) with fastfetch check is
-      maintainer-run; the headless evidence above is the C7 gate.
+- [x] Interactive display run (GTK + virtio-vga), 2026-09-13
+      (maintainer-run): the desktop boots with the passed GPU and
+      fastfetch's native `gpu` module reports `GPU 2: AMD Raphael` next to
+      the emulated GPU.  C7 is closed.
 
 ## Phase 5 exit matrix
 
@@ -1154,6 +1156,8 @@ above; the last full VFIO boot was 252 `[  OK  ]` with no `[FAIL]`.
   clean; `nm kernel/bin-x86_64/kernel | grep ' T drm_'` shows 595 imported
   DRM symbols, no AvoryOS-authored ones.
 - Baseline tag: `p6-baseline` (Phase 6/amdgpu work starts from it).
+  Interactive confirmation: the desktop boot lists `AMD Raphael` as the
+  second GPU in fastfetch, next to the emulated one.
 
 ## Cross-phase notes
 
