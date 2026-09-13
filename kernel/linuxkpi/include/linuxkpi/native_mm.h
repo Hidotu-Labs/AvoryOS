@@ -77,6 +77,13 @@ extern __UINT64_TYPE__ asc_vmm_virt_to_phys(__UINT64_TYPE__ *pml4,
                                             __UINT64_TYPE__ virtual_addr)
     __asm__("vmm_virt_to_phys");
 
+/* kernel/src/mm/mapping_unmap.c: LinuxKPI unmap_mapping_range() backend.
+ * Zaps bridged mappings of `mapping` covering the file range. */
+extern void vma_unmap_mapping_range(void *mapping,
+                                    __UINT64_TYPE__ file_begin,
+                                    __UINT64_TYPE__ file_end,
+                                    _Bool even_cows);
+
 /* Page-table entry flags (kernel/src/mm/vmm.h). */
 #define ASC_PAGE_PRESENT 0x001ULL
 #define ASC_PAGE_RW 0x002ULL

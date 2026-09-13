@@ -72,6 +72,16 @@ void vma_attach_linux(struct vma_list *list, uint64_t start, void *linux_vma);
 void vma_linux_get(void *linux_vma);
 void vma_linux_put(void *linux_vma);
 
+// Collect the VA ranges of Linux-bridged VMAs (`v->linux_vma` set) whose
+// address_space is `mapping` and whose file range overlaps
+// [file_begin, file_end).  `from_start` resumes after a fixed-size batch
+// (nodes with start <= from_start are skipped).  Appends at most `cap`
+// [starts[i], ends[i]) pairs and returns how many were appended.
+int vma_collect_mapping(struct vma_list *list, void *mapping,
+                        uint64_t file_begin, uint64_t file_end,
+                        bool even_cows, uint64_t from_start,
+                        uint64_t starts[], uint64_t ends[], int cap);
+
 // Remove a VMA region by address range (auto-splits and auto-unmaps Native
 // structures) Returns true if any region was removed/split
 bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end);

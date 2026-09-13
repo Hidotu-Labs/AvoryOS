@@ -36,6 +36,16 @@
 #define KPI_DMABUF_IOC_BO_PAGES _IOR(KPI_DMABUF_MAGIC, 0x08, unsigned long)
 /* Check every page of the current BO: head page, refcount == 1, managed. */
 #define KPI_DMABUF_IOC_VERIFY _IO(KPI_DMABUF_MAGIC, 0x09)
+/* Invalidate userspace mappings of the BO's address_space: calls
+ * unmap_mapping_range(dmabuf->file->f_mapping, 0, 0, 1).  Every mapping of
+ * the BO is affected, including ones made through the device node:
+ * dma_buf_mmap() rebinds their vm_file to the dma-buf file (upstream
+ * vma_set_file()), so they all live in this address_space. */
+#define KPI_DMABUF_IOC_UNMAP_MAPPING _IO(KPI_DMABUF_MAGIC, 0x0a)
+/* Return 1 when the calling process has a page-table entry at VA `arg`,
+ * 0 when not (and -EINVAL for a non-user address).  Lets the test observe
+ * the PTE invalidations unmap_mapping_range() performs. */
+#define KPI_DMABUF_IOC_PTE_PRESENT _IOWR(KPI_DMABUF_MAGIC, 0x0b, unsigned long)
 
 #define KPI_DMABUF_MAX_PAGES 4096 /* 16 MiB per BO */
 

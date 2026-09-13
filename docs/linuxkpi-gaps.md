@@ -448,6 +448,32 @@ Landed 2026-09-13 (kernel prerequisites; no CS tests yet):
   exactly once, but it is observable as an extra open/close pair).  No
   current consumer expands a bridged mapping; `VM_DONTEXPAND` covers all of
   them.
+- **`unmap_mapping_range()` is real** (`linuxkpi/src/mmap.c` +
+  `kernel/src/mm/mapping_unmap.c`, 2026-09-13).  The old stub ignored the
+  address_space, so a BO moved or freed while userspace had it mapped left
+  stale PTEs behind (TTM/amdgpu call this on eviction and object free).  The
+  new walk validates every address space (thread list read under
+  `tid_lock`, one `mm->ref_count` reference per mm so a concurrent reap
+  cannot free the page tables; matched VA ranges collected under
+  `mm->lock`), matches bridged VMAs through their wrapper's
+  `vm_file->f_mapping`, and zaps the PTE range for the file range requested.
+  Semantics: `holelen == 0` means "to the end of the file", `even_cows == 0`
+  skips private mappings, the start is rounded down and the length up to
+  pages, and the VMA itself stays in place (the next access refaults, or
+  faults for mappings without a fault handler).  Pages stay owned by the
+  backing object - TTM installs PTEs with `vmf_insert_pfn_prot()`, so there
+  are no mapping references to drop - matching the native munmap path.
+  Batches: 16 VA ranges per tree walk, 128 address spaces per call (an
+  overflow is reported).
+- **`alloc_file_pseudo()` now sets `file->f_mapping`** (upstream
+  `alloc_file()` links it to the inode's address_space).  Without it every
+  dma-buf file had a NULL mapping and `unmap_mapping_range(dmabuf file
+  mapping)` could not find its VMAs.  Note that every mapping of a BO ends
+  up in that address_space: `dma_buf_mmap()` rebinds the VMA's `vm_file` to
+  the dma-buf file (`vma_set_file()`, upstream parity), so a mapping made
+  through the importing device node is invalidated together with the fd
+  mapping.  `test_kpi_dmabuf` asserts both PTE pools are zapped and that a
+  passed `unmap_mapping_range` does not close either wrapper early.
 
 ## Phase 5 gaps (full I/O foundations)
 

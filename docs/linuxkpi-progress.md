@@ -1632,8 +1632,32 @@ them).  First increment: the P2 VMA-bridge prerequisite, test-first.
   node's wrapper closes (refs balanced, each wrapper closes exactly once;
   upstream keeps one VMA and calls `vm_ops->open`).  No current consumer
   expands a bridged mapping; `VM_DONTEXPAND` covers all of them.
-- Next (C5 remainder): real `unmap_mapping_range()`, ww_mutex
-  eviction/contention stress, `amdgpu_bo` teardown audit,
+- [x] Real `unmap_mapping_range()` (2026-09-13): `linuxkpi/src/mmap.c` now
+      calls `kernel/src/mm/mapping_unmap.c`, which walks every address space
+      (thread list under `tid_lock`, one `mm->ref_count` reference per mm),
+      matches bridged VMAs by `vm_file->f_mapping`, and zaps the PTE range
+      for the requested file range; `holelen == 0` means to the end,
+      `even_cows == 0` skips private mappings.  Batches: 16 ranges per tree
+      walk, 128 address spaces.  Pages stay owned by the BO (TTM uses
+      `vmf_insert_pfn_prot`, no PTE refs), matching munmap.  Also fixed
+      `alloc_file_pseudo()` to set `file->f_mapping` (upstream `alloc_file()`
+      does), without which every dma-buf file had a NULL mapping.
+- [x] Tests: `kpi_dmabuf` testdev gained `UNMAP_MAPPING` and `PTE_PRESENT`
+      ioctls; `test_kpi_dmabuf` gained an unmapping section asserting both
+      the fd mapping and the device-node mapping (which `dma_buf_mmap()`
+      rebinds to the dma-buf file via `vma_set_file()`) lose their PTEs
+      without an early close, and close exactly once each at munmap.
+- Evidence (unmap):
+  - Headless `make run-linuxdrm`: **263 `[  OK  ]`, 0 `[FAIL]`, login**;
+    `[  OK  ] LinuxKPI: mmu_notifier compile-out + unmap_mapping_range(NULL)
+    safe`.
+  - `bin/test_kpi_dmabuf`: `=== ALL TESTS PASSED ===` including
+    `fd mapping PTEs zapped by unmap_mapping_range`,
+    `device-node mapping PTEs zapped too (same address_space)`,
+    `unmap_mapping_range did not close wrappers`,
+    `both wrappers closed exactly once`.
+- Next (C5 remainder): ww_mutex eviction/contention stress + wound
+  documentation, `amdgpu_bo`/kref teardown audit,
   `bin/test_kpi_amdgpu` (GEM VRAM/GTT, mmap, PRIME, CTX, VM map/unmap,
   SDMA-copy CS + `WAIT_CS`, timeout path, INFO/BO list), 1k BO loop
   invariants.  The hardware half needs a cold GPU (host reboot; see

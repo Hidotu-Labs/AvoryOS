@@ -1,10 +1,12 @@
 /* Phase 2 - TTM preparation checks.
  *
  * TTM (Phase 7) registers a shrinker (ttm_pool) and calls
- * unmap_mapping_range() from its VM code.  Both are stubs today; this suite
- * proves the symbols compile and link, that the shrinker registration is
- * inert, and that the CONFIG_MMU_NOTIFIER compile-out used by dma-resv.c is
- * visible from a Linux-API translation unit. */
+ * unmap_mapping_range() from its VM code.  The shrinker is still inert; the
+ * unmap path is real since P6 C5.  This suite proves both symbols compile and
+ * link, that the shrinker registration is inert, that a NULL
+ * unmap_mapping_range() is a safe no-op, and that the CONFIG_MMU_NOTIFIER
+ * compile-out used by dma-resv.c is visible from a Linux-API translation
+ * unit. */
 
 #include <linux/mm.h>
 #include <linux/mmu_notifier.h>
@@ -68,8 +70,10 @@ static bool test_mmu_notifier_compileout(void) {
   range.end = 0x2000;
   range.flags = MMU_NOTIFY_CLEAR;
 
-  /* unmap_mapping_range() is a no-op stub in linuxkpi/src/mmap.c; calling it
-   * here pins the symbol down at link time for the TTM import. */
+  /* unmap_mapping_range() is real since P6 C5 (linuxkpi/src/mmap.c walks the
+   * bridged VMAs via kernel/src/mm/mapping_unmap.c), but a NULL mapping must
+   * stay a safe no-op.  Calling it here also pins the symbol down at link
+   * time for the TTM import. */
   unmap_mapping_range(NULL, 0, 0, 1);
 
   return range.start == 0x1000 && range.end == 0x2000;
@@ -86,7 +90,7 @@ void linuxkpi_test_phase2_ttm_prep(void) {
 
   if (test_mmu_notifier_compileout())
     klog_puts("[  OK  ] LinuxKPI: mmu_notifier compile-out + "
-              "unmap_mapping_range stub correct\n");
+              "unmap_mapping_range(NULL) safe\n");
   else
     klog_puts("[ FAIL ] LinuxKPI: mmu_notifier compile-out wrong result\n");
 }

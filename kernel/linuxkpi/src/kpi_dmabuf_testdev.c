@@ -416,6 +416,19 @@ static long kpi_dmabuf_dev_ioctl(struct file *file, unsigned int cmd,
         return -EIO;
     }
     return (long)st->bo->n_pages;
+  case KPI_DMABUF_IOC_UNMAP_MAPPING:
+    if (!st->dmabuf)
+      return -EINVAL;
+    /* Invalidate every userspace mapping of this BO's address_space, the way
+     * TTM/amdgpu do when a BO is evicted or freed while mapped. */
+    unmap_mapping_range(st->dmabuf->file->f_mapping, 0, 0, 1);
+    return 0;
+  case KPI_DMABUF_IOC_PTE_PRESENT:
+    /* Observation helper: the ioctl runs in the calling process, so the
+     * active PML4 is the address space to inspect. */
+    if (arg > 0x00007FFFFFFFFFFFUL)
+      return -EINVAL;
+    return asc_vmm_virt_to_phys(asc_vmm_get_active_pml4(), arg) != 0;
   default:
     return -ENOTTY;
   }

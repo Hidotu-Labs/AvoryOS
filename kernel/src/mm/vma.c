@@ -432,6 +432,67 @@ int vma_mprotect(struct vma_list *list, uint64_t start, uint64_t end,
   return 0;
 }
 
+/* ── unmap_mapping_range() support ─────────────────────────────────────── */
+
+static inline void *bridge_mapping(void *linux_vma) {
+  extern void *linuxkpi_vma_mapping(void *) __attribute__((weak));
+  return (linux_vma && linuxkpi_vma_mapping) ? linuxkpi_vma_mapping(linux_vma)
+                                             : NULL;
+}
+
+static inline bool bridge_is_shared(void *linux_vma) {
+  extern bool linuxkpi_vma_is_shared(void *) __attribute__((weak));
+  return linux_vma && linuxkpi_vma_is_shared &&
+         linuxkpi_vma_is_shared(linux_vma);
+}
+
+static int collect_mapping_recursive(struct vma *node, void *mapping,
+                                     uint64_t file_begin, uint64_t file_end,
+                                     bool even_cows, uint64_t from_start,
+                                     uint64_t starts[], uint64_t ends[],
+                                     int cap, int count) {
+  if (!node || count >= cap)
+    return count;
+
+  count = collect_mapping_recursive(node->left, mapping, file_begin, file_end,
+                                    even_cows, from_start, starts, ends, cap,
+                                    count);
+  if (count >= cap)
+    return count;
+
+  if (node->start > from_start && node->linux_vma &&
+      bridge_mapping(node->linux_vma) == mapping &&
+      (even_cows || bridge_is_shared(node->linux_vma))) {
+    uint64_t vfile = node->offset;
+    uint64_t vlen = node->end - node->start;
+    uint64_t begin = file_begin > vfile ? file_begin : vfile;
+    uint64_t vend = vfile + vlen;
+    uint64_t end = file_end < vend ? file_end : vend;
+
+    if (begin < end) {
+      starts[count] = node->start + (begin - vfile);
+      ends[count] = node->start + (end - vfile);
+      count++;
+    }
+  }
+
+  if (count >= cap)
+    return count;
+  return collect_mapping_recursive(node->right, mapping, file_begin, file_end,
+                                   even_cows, from_start, starts, ends, cap,
+                                   count);
+}
+
+int vma_collect_mapping(struct vma_list *list, void *mapping,
+                        uint64_t file_begin, uint64_t file_end, bool even_cows,
+                        uint64_t from_start, uint64_t starts[],
+                        uint64_t ends[], int cap) {
+  if (!list || !mapping || cap <= 0)
+    return 0;
+  return collect_mapping_recursive(list->root, mapping, file_begin, file_end,
+                                   even_cows, from_start, starts, ends, cap, 0);
+}
+
 static struct vma *vma_find_recursive(struct vma *node, uint64_t addr) {
   if (!node)
     return NULL;

@@ -366,6 +366,10 @@ struct file *alloc_file_pseudo(struct inode *inode, struct vfsmount *mnt,
   atomic_set(&dentry->d_count, 1);
 
   file->f_inode = inode;
+  /* Upstream alloc_file() links the file to the inode's address_space; the
+   * dma-buf and DRM mmap paths (drm_vma_node_unmap -> unmap_mapping_range)
+   * depend on it. */
+  file->f_mapping = inode->i_mapping;
   file->f_path.mnt = mnt;
   file->f_path.dentry = dentry;
   return file;
@@ -575,6 +579,20 @@ void linuxkpi_vma_rebase(void *w, unsigned long start, unsigned long end,
   b->vma.vm_start = start;
   b->vma.vm_end = end;
   b->vma.vm_pgoff = pgoff >> PAGE_SHIFT;
+}
+
+/* Address-space matching for unmap_mapping_range(): the VMA's file mapping
+ * (NULL when the backing file has no inode mapping yet). */
+void *linuxkpi_vma_mapping(void *w) {
+  struct kpi_mmap_bridge *b = w;
+
+  return (b && b->vma.vm_file) ? b->vma.vm_file->f_mapping : NULL;
+}
+
+bool linuxkpi_vma_is_shared(void *w) {
+  struct kpi_mmap_bridge *b = w;
+
+  return b && (b->vma.vm_flags & VM_SHARED);
 }
 
 static unsigned long kpi_prot_to_vm_flags(uint64_t prot, uint64_t flags) {

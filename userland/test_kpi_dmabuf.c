@@ -11,10 +11,14 @@
 //      VMA remove/re-add, so vm_ops->close() runs exactly once, at munmap.
 //   4. mremap() on a mapped BO: VM_DONTEXPAND mappings are rejected with
 //      EINVAL like upstream, leaving the mapping intact.
-//   5. fork(): the child imports the inherited dma-buf fd (dma_buf_get),
+//   5. unmap_mapping_range() over the dma-buf's address_space (what TTM does
+//      on BO eviction): both the fd mapping and the device-node mapping of
+//      the BO (dma_buf_mmap rebinds it to the dma-buf file) lose their PTEs,
+//      and both still close exactly once.
+//   6. fork(): the child imports the inherited dma-buf fd (dma_buf_get),
 //      waits on an inherited sync_file fd, maps the BO, checks the parent's
 //      pattern and writes its own; the parent sees the child's write.
-//   6. Alloc/map/free soak loop with a native PMM free-page check.
+//   7. Alloc/map/free soak loop with a native PMM free-page check.
 //
 // Build: userland/test_kpi_dmabuf.elf, installed as /bin/test_kpi_dmabuf.
 
@@ -322,7 +326,98 @@ static void test_mremap_bridge(int dev) {
     close(fd);
 }
 
-/* 5. fork(): inherited dma-buf + sync_file fds across two processes. */
+/* 5. unmap_mapping_range() over the dma-buf's address_space: every mapping
+ * of the BO is invalidated.  dma_buf_mmap() rebinds the device-node VMA's
+ * vm_file to the dma-buf file (upstream vma_set_file()), so the fd mapping
+ * and the device-node mapping both live in the dma-buf file's address_space
+ * and both lose their PTEs; neither closes early, and both still close
+ * exactly once at munmap. */
+static int pte_present(int dev, const void *p) {
+    long r = ioctl(dev, KPI_DMABUF_IOC_PTE_PRESENT, (unsigned long)p);
+
+    return r == 1;
+}
+
+static void test_unmap_mapping(int dev) {
+    unsigned long pages = 64;
+    size_t size = pages * PAGE_SIZE_;
+    unsigned long before, after;
+    int fd;
+    unsigned char *p_fd, *p_dev;
+
+    printf("\n=== unmap_mapping_range invalidates the dma-buf mapping ===\n");
+
+    before = close_count(dev);
+    fd = (int)ioctl(dev, KPI_DMABUF_IOC_ALLOC, pages);
+    if (fd < 0) {
+        fail("ioctl(ALLOC) returned a dma-buf fd", errno);
+        return;
+    }
+
+    p_fd = map_fd(fd, pages, MAP_SHARED);
+    if (!p_fd) {
+        fail("mmap(dma-buf fd)", errno);
+        close(fd);
+        return;
+    }
+    p_dev = map_fd(dev, pages, MAP_SHARED);
+    if (!p_dev) {
+        fail("mmap(device node)", errno);
+        munmap(p_fd, size);
+        close(fd);
+        return;
+    }
+
+    p_fd[0] = 0xa1;
+    p_fd[size - 1] = 0xa2;
+    p_dev[0] = 0xb1;
+    p_dev[size - 1] = 0xb2;
+
+    if (pte_present(dev, p_fd) && pte_present(dev, p_fd + size - PAGE_SIZE_) &&
+        pte_present(dev, p_dev) && pte_present(dev, p_dev + size - PAGE_SIZE_))
+        pass("all four addresses have PTEs before invalidation");
+    else
+        fail("PTEs missing before invalidation", 0);
+
+    if (ioctl(dev, KPI_DMABUF_IOC_UNMAP_MAPPING, 0) == 0)
+        pass("ioctl(UNMAP_MAPPING)");
+    else
+        fail("ioctl(UNMAP_MAPPING)", errno);
+
+    if (!pte_present(dev, p_fd) && !pte_present(dev, p_fd + size / 2) &&
+        !pte_present(dev, p_fd + size - PAGE_SIZE_))
+        pass("fd mapping PTEs zapped by unmap_mapping_range");
+    else
+        fail("fd mapping still has PTEs after unmap_mapping_range", 0);
+
+    if (!pte_present(dev, p_dev) && !pte_present(dev, p_dev + size / 2) &&
+        !pte_present(dev, p_dev + size - PAGE_SIZE_))
+        pass("device-node mapping PTEs zapped too (same address_space)");
+    else
+        fail("device-node mapping still has PTEs after unmap_mapping_range", 0);
+
+    if (close_count(dev) == before)
+        pass("unmap_mapping_range did not close wrappers");
+    else
+        fail("unmap_mapping_range closed a wrapper", 0);
+
+    if (munmap(p_fd, size) == 0 && munmap(p_dev, size) == 0)
+        pass("munmap both mappings after invalidation");
+    else
+        fail("munmap after invalidation", errno);
+
+    after = close_count(dev);
+    if (after == before + 2) {
+        pass("both wrappers closed exactly once");
+    } else {
+        failures++;
+        printf("  [FAIL] unmap close count %lu -> %lu (expected +2)\n",
+               before, after);
+    }
+    close(fd);
+}
+
+/* 6. fork(): inherited dma-buf + sync_file fds across two processes. */
 static int test_fork_prime(int dev) {
     unsigned long pages = 256;
     size_t size = pages * PAGE_SIZE_;
@@ -424,7 +519,7 @@ static int test_fork_prime(int dev) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-/* 6. Alloc/map/free loop with a PMM free-page delta. */
+/* 7. Alloc/map/free loop with a PMM free-page delta. */
 static void test_soak(int dev) {
     long baseline, final;
     unsigned long c0, c1;
@@ -661,6 +756,7 @@ int main(int argc, char **argv) {
     test_device_mmap(dev);
     test_mprotect_bridge(dev);
     test_mremap_bridge(dev);
+    test_unmap_mapping(dev);
     test_fork_prime(dev);
     test_soak(dev);
 
