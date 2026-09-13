@@ -1740,11 +1740,21 @@ them).  First increment: the P2 VMA-bridge prerequisite, test-first.
   `P5C4_NUMBERED_NR = 7` is taken once amdgpu DM registers its DDC
   adapters; it now picks a free number in `[16, 64)`.
 - **Kernel-side DCN KMS suite landed** (`test_phase6_dcn.c`, wired after
-  the link suite): discovers the amdgpu card by DRM name, forces an HDMI/DP
-  connector on through the 6.6 RW `status` attribute when no sink is
-  attached, runs the atomic enable/flip/flip/vblank/cursor/disable sequence
-  on the largest noedid mode, and restores "detect" afterwards.  It gives
-  every headless C6 boot automatic KMS evidence; first run pending.
+  the link suite): discovers the amdgpu card by DRM name, then sets an EDID
+  override (a generated 1920x1080@60 + 640x480@60 EDID) on an HDMI/DP
+  connector and forces it on - the igt-style headless combination - so DM
+  builds its emulated sink and exposes modes; it runs the atomic
+  enable/flip/flip/vblank/cursor/disable sequence on the largest mode and
+  resets the override/force afterwards.  The first run proved force alone
+  is not enough: amdgpu DM logs `No EDID firmware found on connector ...
+  forcing to OFF!` and the connector ends up disconnected (no dc_sink).
+  The userland KMS section now skips cleanly when no sink can be forced.
+- **Kernel-side connector access helper** (`linuxkpi_drm_find_dev()` in
+  `drm_file.c`): finds a registered DRM device by driver name via the
+  internal minor xarray, used by the DCN suite to reach the connector list.
+- **Confirmed: a clean guest `poweroff` cold-resets the passed GPU** for
+  the next boot (no host reboot needed when runs are powered off, not
+  killed); recorded in `docs/amdgpu-testing.md`.
 - **Watch item: one hardware reset at session start did not reproduce.**
   The first DC-active boot of `p6-c6-fixed2.log` reset right after
   `[PROC] Executing main session: /bin/avoryd` (no panic, no watchdog).

@@ -116,7 +116,11 @@ nothing is installed by default yet.
      reset capability and never leaves the function orphaned).
   3. reboot the host.
   Once amdgpu is bound, prefer a clean guest shutdown over killing QEMU.
-  The guest-side `pci_reset_function()` is still a `-ENOTSUPP` stub (P5 C1
+  **Confirmed 2026-09-13:** a clean guest `poweroff` (ACPI S5) leaves the
+  passed GPU cold for the next boot - C6 runs after a guest poweroff came
+  up without the warm `-22`, so a host reboot is only needed if a run was
+  killed rather than powered off.  The guest-side `pci_reset_function()` is
+  still a `-ENOTSUPP` stub (P5 C1
   gap), so the driver's own recovery path cannot reset the device yet.
   `make reset-gpu` (`sudo scripts/vfio-reset-gpu.sh [BDF]`) automates step 2
   and is now the recommended way to start a C4+ evidence run: the driver's

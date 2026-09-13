@@ -82,6 +82,26 @@ static void *linuxkpi_drm_dev_open(void *metadata) {
   return file->f_asc_node;
 }
 
+/* Find a registered DRM device by driver name.  Used by the Phase 6 DCN
+ * self-test to reach the amdgpu connectors for the EDID-override + force
+ * combination igt uses on headless boots; the device stays alive while the
+ * driver is bound, so no minor reference is taken. */
+struct drm_device *linuxkpi_drm_find_dev(const char *name) {
+  struct drm_minor *minor;
+  unsigned long index;
+
+  if (!name)
+    return NULL;
+  xa_for_each(&drm_minors_xa, index, minor) {
+    if (!minor || !minor->dev || !minor->dev->driver)
+      continue;
+    if (minor->dev->driver->name &&
+        strcmp(minor->dev->driver->name, name) == 0)
+      return minor->dev;
+  }
+  return NULL;
+}
+
 /* Split a class devnode path ("dri/card1") into directory and leaf name.
  * Returns 0 or -EINVAL. */
 static int drm_split_devnode_path(const char *path, char *dir, size_t dirsz,

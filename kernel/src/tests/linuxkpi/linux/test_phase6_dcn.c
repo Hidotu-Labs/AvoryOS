@@ -26,15 +26,24 @@
  */
 
 #include <drm/drm.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_device.h>
+#include <drm/drm_edid.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_mode.h>
 #include <linux/delay.h>
+#include <linux/mutex.h>
 #include <linux/sprintf.h>
 #include <linux/string.h>
 
 #include <linuxkpi/log.h>
 #include <linuxkpi/native_mm.h>
 #include <linuxkpi/native_vfs.h>
+
+extern struct drm_device *linuxkpi_drm_find_dev(const char *name);
+extern int drm_edid_override_set(struct drm_connector *connector,
+                                 const void *edid, size_t size);
+extern int drm_edid_override_reset(struct drm_connector *connector);
 
 /* Scratch user VA (distinct from the P3 suite's 0x10000000).  Layout:
  *   0x000  ioctl argument struct
@@ -170,45 +179,65 @@ static void *p6d_find_card(struct p6d_scratch *s, int *card_out) {
   return NULL;
 }
 
-/* Force the first present HDMI/DP connector on through the 6.6 RW `status`
- * sysfs attribute.  Returns 0 and fills `path_out` on success. */
-static int p6d_force_connector(int card, char *path_out, unsigned int len) {
-  static const char *names[] = {
-      "HDMI-A-1", "HDMI-B-1", "DP-1", "DP-2", "DP-3", "DP-4",
-  };
-  static const unsigned char on[] = {'o', 'n', '\n'};
+/* Force an HDMI/DP connector on with an EDID override, the igt-style
+ * headless combination: amdgpu DM refuses `force=on` without an EDID, but
+ * with `connector->edid_override` set `amdgpu_dm_connector_funcs_force()`
+ * copies it into `aconnector->edid` and `handle_edid_mgmt()` builds an
+ * emulated sink, so modes exist without a physical monitor.  Returns the
+ * connector (to unforce later) or NULL. */
+static struct drm_connector *p6d_find_connector(struct drm_device *dev) {
+  struct drm_connector *connector, *hdmi = NULL, *dp = NULL;
+  struct drm_connector_list_iter iter;
 
-  for (unsigned int i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-    char path[80];
-    void *node;
-
-    snprintf(path, sizeof(path), "/sys/class/drm/card%d-%s/status", card,
-             names[i]);
-    node = asc_vfs_kernel_open(path);
-    if (!node)
-      continue;
-    if (asc_vfs_kernel_write(node, 0, sizeof(on), (unsigned char *)on) ==
-        sizeof(on)) {
-      asc_vfs_kernel_close(node);
-      snprintf(path_out, len, "%s", path);
-      return 0;
-    }
-    asc_vfs_kernel_close(node);
+  drm_connector_list_iter_begin(dev, &iter);
+  drm_for_each_connector_iter(connector, &iter) {
+    if (connector->connector_type == DRM_MODE_CONNECTOR_HDMIA && !hdmi)
+      hdmi = connector;
+    else if (connector->connector_type == DRM_MODE_CONNECTOR_DisplayPort &&
+             !dp)
+      dp = connector;
   }
-  return -1;
+  drm_connector_list_iter_end(&iter);
+  return hdmi ? hdmi : dp;
 }
 
-static void p6d_restore_connector(const char *path) {
-  static const unsigned char detect[] = {'d', 'e', 't', 'e', 'c', 't', '\n'};
-  void *node;
+/* One 128-byte EDID: 1920x1080@60 DTD (preferred) plus 640x480@60 and
+ * 1024x768@60 established timings. */
+static void p6d_build_edid(u8 *e) {
+  static const u8 dtd_1080p[18] = {
+      0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58,
+      0x2c, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1e,
+  };
+  static const u8 dtd_480p[18] = {
+      0xd5, 0x09, 0x80, 0xa0, 0x20, 0xe0, 0x2d, 0x10, 0x10,
+      0x60, 0xa2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1e,
+  };
+  u32 sum = 0;
 
-  if (!path || !path[0])
-    return;
-  node = asc_vfs_kernel_open(path);
-  if (!node)
-    return;
-  asc_vfs_kernel_write(node, 0, sizeof(detect), (unsigned char *)detect);
-  asc_vfs_kernel_close(node);
+  memset(e, 0, 128);
+  e[0] = 0x00;
+  memset(&e[1], 0xff, 6);
+  e[7] = 0x00;
+  e[8] = 0x04; /* mfg id */
+  e[9] = 0x21;
+  e[10] = 0x34; /* product code */
+  e[11] = 0x12;
+  e[16] = 0x00; /* week/year (2020) */
+  e[17] = 0x1e;
+  e[18] = 0x01; /* EDID 1.3 */
+  e[19] = 0x03;
+  e[20] = 0x80; /* digital input */
+  e[21] = 16;   /* h size cm */
+  e[22] = 10;   /* v size cm */
+  e[23] = 120;  /* gamma 2.2 */
+  e[24] = 0x02; /* preferred timing in the first DTD */
+  e[35] = 0x20; /* established: 640x480@60 */
+  e[36] = 0x08; /* established: 1024x768@60 */
+  memcpy(&e[54], dtd_1080p, sizeof(dtd_1080p));
+  memcpy(&e[72], dtd_480p, sizeof(dtd_480p));
+  for (int i = 0; i < 127; i++)
+    sum += e[i];
+  e[127] = (u8)(0 - sum);
 }
 
 /* ── resources ──────────────────────────────────────────────────────────── */
@@ -523,10 +552,11 @@ void linuxkpi_test_phase6_dcn(void) {
   uint32_t dumb2 = 0, pitch2 = 0, fb2 = 0;
   uint32_t cdumb = 0, cpitch = 0, cfb = 0;
   uint32_t blob_id = 0;
-  char forced[80] = {0};
+  struct drm_device *dev;
+  struct drm_connector *aconnector = NULL;
+  u8 edid[128];
   void *node;
   int card = -1;
-  int have_force;
 
   p6d_failures = 0;
   memset(&mode, 0, sizeof(mode));
@@ -545,7 +575,25 @@ void linuxkpi_test_phase6_dcn(void) {
   }
   blob = P6D_STRUCT(&s);
 
-  have_force = p6d_force_connector(card, forced, sizeof(forced)) == 0;
+  /* Headless sink: EDID override + force, then a probe so DM builds its
+   * emulated sink and exposes modes on the forced connector. */
+  dev = linuxkpi_drm_find_dev("amdgpu");
+  if (dev)
+    aconnector = p6d_find_connector(dev);
+  if (!aconnector) {
+    klog_puts("[SKIP] LinuxKPI: dcn no amdgpu connector to force\n");
+    goto out;
+  }
+  p6d_build_edid(edid);
+  if (drm_edid_override_set(aconnector, edid, sizeof(edid))) {
+    p6d_fail("EDID override rejected", 0);
+    goto out;
+  }
+  mutex_lock(&dev->mode_config.mutex);
+  aconnector->force = DRM_FORCE_ON;
+  aconnector->funcs->fill_modes(aconnector, dev->mode_config.max_width,
+                                dev->mode_config.max_height);
+  mutex_unlock(&dev->mode_config.mutex);
 
   if (p6d_set_atomic_cap(node, &s) ||
       p6d_get_resources(node, &s, crtcs, &n_crtcs, conns, &n_conns) ||
@@ -555,19 +603,15 @@ void linuxkpi_test_phase6_dcn(void) {
   }
   if (p6d_pick_connector(node, &s, conns, n_conns, &conn_id, &mode,
                          &mode_count)) {
-    if (!have_force)
-      klog_puts("[SKIP] LinuxKPI: dcn no connector with modes "
-                "(no sink and force failed)\n");
-    else
-      p6d_fail("forced connector has no modes", 0);
+    p6d_fail("forced connector has no modes", 0);
     goto out;
   }
   crtc_id = crtcs[0];
 
-  klogf("[  OK  ] LinuxKPI: dcn forced %s (card%d), connector=%u crtc=%u "
-        "modes=%u (%ux%u)\n",
-        have_force ? "connector on (noedid)" : "no connector (sink already up)",
-        card, conn_id, crtc_id, mode_count, mode.hdisplay, mode.vdisplay);
+  klogf("[  OK  ] LinuxKPI: dcn forced %s (card%d, EDID override), "
+        "connector=%u crtc=%u modes=%u (%ux%u)\n",
+        aconnector->name, card, conn_id, crtc_id, mode_count, mode.hdisplay,
+        mode.vdisplay);
 
   if (p6d_obj_props(node, &s, conn_id, DRM_MODE_OBJECT_CONNECTOR,
                     &conn_props) ||
@@ -812,8 +856,10 @@ out:
     p6d_dumb_destroy(node, &s, dumb2);
   if (dumb1)
     p6d_dumb_destroy(node, &s, dumb1);
-  if (have_force)
-    p6d_restore_connector(forced);
+  if (aconnector) {
+    aconnector->force = DRM_FORCE_UNSPECIFIED;
+    drm_edid_override_reset(aconnector);
+  }
 
   asc_vfs_kernel_close(node);
   p6d_scratch_free(&s);
