@@ -88,7 +88,7 @@
  static int gfx_v10_0_ring_test_ring(struct amdgpu_ring *ring)
  {
  	struct amdgpu_device *adev = ring->adev;
-@@ -3771,6 +3822,17 @@
+@@ -3771,6 +3822,14 @@
  	unsigned int i;
  	int r;
  
@@ -99,14 +99,11 @@
 +		 (unsigned long long)ring->wptr,
 +		 (unsigned long long)ring->gpu_addr, ring->use_doorbell,
 +		 ring->doorbell_index, scratch);
-+	gfx_v10_0_kpi_cp_dump(adev, "test-entry");
-+	if (ring->funcs->type == AMDGPU_RING_TYPE_KIQ)
-+		gfx_v10_0_kpi_hqd_dump(adev, ring, "test-entry");
 +
  	WREG32(scratch, 0xCAFEDEAD);
  	r = amdgpu_ring_alloc(ring, 3);
  	if (r) {
-@@ -3785,19 +3847,72 @@
+@@ -3785,19 +3844,70 @@
  	amdgpu_ring_write(ring, 0xDEADBEEF);
  	amdgpu_ring_commit(ring);
  
@@ -122,8 +119,6 @@
 +			(adev->doorbell.cpu_addr ?
 +			 adev->doorbell.cpu_addr + ring->doorbell_index :
 +			 NULL));
-+	if (ring->funcs->type == AMDGPU_RING_TYPE_KIQ)
-+		gfx_v10_0_kpi_hqd_dump(adev, ring, "test-committed");
 +
  	for (i = 0; i < adev->usec_timeout; i++) {
  		tmp = RREG32(scratch);
@@ -180,7 +175,7 @@
  	return r;
  }
  
-@@ -3855,6 +3970,21 @@
+@@ -3855,6 +3965,21 @@
  
  	r = dma_fence_wait_timeout(f, false, timeout);
  	if (r == 0) {
@@ -202,7 +197,7 @@
  		r = -ETIMEDOUT;
  		goto err2;
  	} else if (r < 0) {
-@@ -5615,6 +5745,14 @@
+@@ -5615,6 +5740,14 @@
  	uint32_t bootload_status;
  	int i, r;
  
@@ -217,7 +212,7 @@
  	for (i = 0; i < adev->usec_timeout; i++) {
  		cp_status = RREG32_SOC15(GC, 0, mmCP_STAT);
  		bootload_status = RREG32_SOC15(GC, 0, mmRLC_RLCS_BOOTLOAD_STATUS);
-@@ -5626,6 +5764,11 @@
+@@ -5626,6 +5759,11 @@
  		udelay(1);
  	}
  
@@ -229,7 +224,7 @@
  	if (i >= adev->usec_timeout) {
  		dev_err(adev->dev, "rlc autoload: gc ucode autoload timeout\n");
  		return -ETIMEDOUT;
-@@ -6223,6 +6366,8 @@
+@@ -6223,6 +6361,8 @@
  		adev->gfx.kiq[0].ring.sched.ready = false;
  	}
  	udelay(50);
@@ -238,7 +233,7 @@
  }
  
  static int gfx_v10_0_cp_compute_load_microcode(struct amdgpu_device *adev)
-@@ -6617,6 +6762,9 @@
+@@ -6617,6 +6757,9 @@
  	struct v10_compute_mqd *mqd = ring->mqd_ptr;
  	int j;
  
@@ -248,7 +243,7 @@
  	/* inactivate the queue */
  	if (amdgpu_sriov_vf(adev))
  		WREG32_SOC15(GC, 0, mmCP_HQD_ACTIVE, 0);
-@@ -6708,6 +6856,12 @@
+@@ -6708,6 +6851,12 @@
  
  	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL,
  	       mqd->cp_hqd_pq_doorbell_control);
@@ -261,7 +256,7 @@
  
  	/* reset read and write pointers, similar to CP_RB0_WPTR/_RPTR */
  	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_WPTR_LO,
-@@ -6728,6 +6882,14 @@
+@@ -6728,6 +6877,14 @@
  	if (ring->use_doorbell)
  		WREG32_FIELD15(GC, 0, CP_PQ_STATUS, DOORBELL_ENABLE, 1);
  
@@ -276,7 +271,7 @@
  	return 0;
  }
  
-@@ -6759,10 +6921,26 @@
+@@ -6759,10 +6916,26 @@
  		mutex_lock(&adev->srbm_mutex);
  		nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
  		amdgpu_ring_init_mqd(ring);
@@ -303,7 +298,7 @@
  		if (adev->gfx.kiq[0].mqd_backup)
  			memcpy_fromio(adev->gfx.kiq[0].mqd_backup, mqd, sizeof(*mqd));
  	}
-@@ -6816,7 +6994,15 @@
+@@ -6816,7 +6989,15 @@
  		return r;
  	}
  
@@ -319,7 +314,7 @@
  	amdgpu_bo_kunmap(ring->mqd_obj);
  	ring->mqd_ptr = NULL;
  	amdgpu_bo_unreserve(ring->mqd_obj);
-@@ -6849,6 +7035,11 @@
+@@ -6849,6 +7030,11 @@
  	dbctl = REG_SET_FIELD(dbctl, CP_HQD_PQ_DOORBELL_CONTROL,
  			      DOORBELL_OFFSET, ring->doorbell_index);
  	WREG32_SOC15(GC, 0, mmCP_HQD_PQ_DOORBELL_CONTROL, dbctl);
@@ -331,7 +326,7 @@
  	nv_grbm_select(adev, 0, 0, 0, 0);
  	mutex_unlock(&adev->srbm_mutex);
  }
-@@ -6882,6 +7073,10 @@
+@@ -6882,6 +7068,10 @@
  	if (!adev->enable_mes_kiq)
  		gfx_v10_0_kiq_reprogram_doorbell(adev);
  
@@ -342,7 +337,7 @@
  	r = amdgpu_gfx_enable_kcq(adev, 0);
  done:
  	return r;
-@@ -6910,10 +7105,13 @@
+@@ -6910,10 +7100,13 @@
  		r = amdgpu_mes_kiq_hw_init(adev);
  	else
  		r = gfx_v10_0_kiq_resume(adev);
@@ -356,7 +351,7 @@
  	if (r)
  		return r;
  
-@@ -8290,6 +8488,21 @@
+@@ -8290,6 +8483,21 @@
  		if (ring->use_doorbell) {
  			atomic64_set((atomic64_t *)ring->wptr_cpu_addr,
  				     ring->wptr);

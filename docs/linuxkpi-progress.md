@@ -1355,6 +1355,11 @@ reason about.  Restarted on a clean base, keeping the green work:
       `nv_common_hw_init()` (`scripts/linux/patches/
       0001-nv-program-selfring-before-cp-init.patch`); the soc21 patch is
       dropped.  See `docs/linuxkpi-gaps.md` P6 C4.
+- [x] Corrected-build boots (19:00): the first boot after the hung VM was
+      killed failed fast at `PSP create ring failed!` (the hung probe left
+      the PSP ring allocated; `-22`).  The failure teardown destroys the
+      ring, so the next boot is the fair test of the nv.c fix
+      (`build/logs/p6-c4-boot4-pspring.log`).
 - [ ] Next: boot the corrected clean build and follow PSP -> SMU -> GMC/IH
       -> SDMA/GFX ring tests -> gfx IB test.
 
