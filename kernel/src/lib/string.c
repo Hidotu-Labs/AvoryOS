@@ -301,10 +301,17 @@ int strncasecmp(const char *s1, const char *s2, size_t n) {
 }
 
 
+/* Emit one character and advance the output position.  The argument is
+ * ALWAYS evaluated, even when the buffer is full: call sites pass
+ * side-effecting expressions (e.g. `*fmt++` in the literal loop), and
+ * skipping the evaluation used to leave `fmt` parked on the same character
+ * forever once the buffer filled up (found via amdgpu's 27-char workqueue
+ * name formatted into alloc_workqueue()'s 24-byte WQ_NAME_LEN buffer). */
 #define EMIT(c)                          \
     do {                                 \
+        char emit_c_ = (char)(c);        \
         if (pos + 1 < size)              \
-            buf[pos] = (char)(c);        \
+            buf[pos] = emit_c_;          \
         pos++;                           \
     } while (0)
 

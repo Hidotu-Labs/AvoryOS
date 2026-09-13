@@ -359,7 +359,29 @@ static bool test_formats(void) {
   /* '+'/' '/'#' flags must be consumed too: an unrecognized flag consumes
    * no argument and shifts every later conversion the same way. */
   snprintf(buf, sizeof(buf), "%+d %#x % d %05d", 5, 0x2a, 7, -3);
-  return strcmp(buf, "+5 0x2a  7 -0003") == 0;
+  if (strcmp(buf, "+5 0x2a  7 -0003") != 0)
+    return false;
+
+  /* Buffer-full paths: the literal emit used to stop advancing the format
+   * pointer once the destination was full (the side-effecting `*fmt++` was
+   * skipped with the store), so any format longer than the buffer spun
+   * forever.  Hit at C6 via alloc_workqueue() formatting the 27-char
+   * "amdgpu_dm_hpd_rx_offload_wq" into its 24-byte WQ_NAME_LEN buffer.  A
+   * truncating format must terminate and still return the full length. */
+  {
+    char small[8];
+    int n;
+
+    n = snprintf(small, sizeof(small), "amdgpu_dm_hpd_rx_offload_wq");
+    if (n != 27 || strcmp(small, "amdgpu_") != 0)
+      return false;
+
+    n = snprintf(small, sizeof(small), "%020d", 5);
+    if (n != 20 || strcmp(small, "0000000") != 0)
+      return false;
+  }
+
+  return true;
 }
 
 /* ── bitmap / kstrtox ───────────────────────────────────────────────────── */
