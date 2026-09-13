@@ -7,10 +7,9 @@
  *   - with kpi_amdgpu=0 the passed GPU, if present, stays unbound and is
  *     never probed (the C2 revert path must keep working);
  *   - with kpi_amdgpu=1 (the default since C3) the passed GPU is routed
- *     through amdgpu_pci_probe().  Until C4 stages firmware the probe is
- *     expected to fail after early init, so the machine check here is "probe
- *     ran and BAR5 was mapped", not "probe succeeded"; C4 tightens it to a
- *     bound driver once rings and firmware land.
+ *     through amdgpu_pci_probe(); C4 requires the probe to complete and bind
+ *     the driver, so a gate-on probe that does not bind is a suite failure
+ *     (run C4 boots from a cold GPU; see docs/amdgpu-testing.md).
  *
  * When amdgpu is not linked (KPI_AMDGPU=0) the driver is not registered, so
  * the suite logs [SKIP] and never fails.  The helpers it calls live in
@@ -68,16 +67,22 @@ void linuxkpi_test_phase6_link(void) {
       p6l_fail("gate off but the GPU is bound", 1);
   } else if (pdev->dev.driver && pdev->dev.driver->name &&
              !strcmp(pdev->dev.driver->name, "amdgpu")) {
-    p6l_ok("gate on binds the passed GPU to amdgpu");
+    if (linuxkpi_pci_amdgpu_probe_result() == 0)
+      p6l_ok("gate on: amdgpu initialized and bound");
+    else
+      p6l_fail("gate on: bound to amdgpu but probe result nonzero",
+               linuxkpi_pci_amdgpu_probe_result());
   } else if (linuxkpi_pci_amdgpu_probe_attempted()) {
     klogf("[INFO] LinuxKPI: link amdgpu probe result %d "
-          "(firmware and rings land in C4)\n",
+          "(cold-start the GPU before a C4 boot)\n",
           linuxkpi_pci_amdgpu_probe_result());
     if (linuxkpi_ioremap_was_mapped(pci_resource_start(pdev, 5),
                                     pci_resource_len(pdev, 5)))
-      p6l_ok("gate on reached early init (BAR5 mapped)");
+      p6l_fail("gate on: amdgpu init did not complete (BAR5 mapped)",
+               linuxkpi_pci_amdgpu_probe_result());
     else
-      p6l_fail("gate on probed the GPU but BAR5 was never mapped", 0);
+      p6l_fail("gate on: amdgpu probe failed before BAR5 was mapped",
+               linuxkpi_pci_amdgpu_probe_result());
   } else {
     p6l_fail("gate on but no amdgpu probe was attempted", 0);
   }

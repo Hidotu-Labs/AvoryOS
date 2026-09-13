@@ -324,14 +324,14 @@ run-vfio: edk2-ovmf $(IMAGE_NAME).iso disk.img
 
 # Phase 6 C4: headless amdgpu bring-up.  `amdgpu.dc=0` skips the dm ip block
 # (DCN display bring-up is minutes-slow in this environment and only needed at
-# C6); the serial log lands in build/logs/p6-c4.log.  drm.debug stays off here:
-# it floods the serial with per-ioctl lines and the C4 evidence is the
-# `kpi-kiq:` diagnostics plus the amdgpu init log.
+# C6); the serial log lands in build/logs/p6-c4.log.  drm.debug=0x1 enables the
+# DRM_UT_CORE channel only: it carries the per-ring `ib test on %s succeeded`
+# lines (success is otherwise silent), which the C4 evidence needs.
 # `amdgpu.ppfeaturemask=0xfff73fff` clears PP_GFXOFF_MASK (0x8000) from the
 # default 0xfff7bfff: GFX power gating loses the MEC/KIQ HQD programming on
 # this guest (doorbells dropped, ring test flaky), and C4 does not need GFXOFF.
 .PHONY: run-c4
-run-c4: KERNEL_CMDLINE = kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.dc=0 amdgpu.ppfeaturemask=0xfff73fff
+run-c4: KERNEL_CMDLINE = kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.dc=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x1
 run-c4: SERIAL = file:build/logs/p6-c4.log
 run-c4: DISPLAY_OPT = -display none
 run-c4: VFIO_EXTRA = -device edu
