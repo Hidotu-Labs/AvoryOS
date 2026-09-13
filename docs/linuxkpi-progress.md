@@ -1739,12 +1739,19 @@ them).  First increment: the P2 VMA-bridge prerequisite, test-first.
 - **Found and fixed: P5 i2c suite bus collision.**  The suite's fixed
   `P5C4_NUMBERED_NR = 7` is taken once amdgpu DM registers its DDC
   adapters; it now picks a free number in `[16, 64)`.
-- **Open: hardware reset at session start with DC active.**  The boot that
-  bound amdgpu reset right after `[PROC] Executing main session:
-  /bin/avoryd` (no panic, no watchdog; `BdsDxe` restarts on serial).  A
-  following boot with a failed warm probe (-22) started the session
-  normally, so the trigger is DC being active.  Needs a cold GPU +
-  `-d int,guest_errors,cpu_reset` capture.
+- **Kernel-side DCN KMS suite landed** (`test_phase6_dcn.c`, wired after
+  the link suite): discovers the amdgpu card by DRM name, forces an HDMI/DP
+  connector on through the 6.6 RW `status` attribute when no sink is
+  attached, runs the atomic enable/flip/flip/vblank/cursor/disable sequence
+  on the largest noedid mode, and restores "detect" afterwards.  It gives
+  every headless C6 boot automatic KMS evidence; first run pending.
+- **Watch item: one hardware reset at session start did not reproduce.**
+  The first DC-active boot of `p6-c6-fixed2.log` reset right after
+  `[PROC] Executing main session: /bin/avoryd` (no panic, no watchdog).
+  After the cold host reboot the same build booted clean with DC active
+  (`p6-c6-crash.log`: 0 `[FAIL]`s, i2c suite green, session started,
+  login reached), so the reset is intermittent until seen again; the
+  `-d int,guest_errors,cpu_reset` capture recipe is ready if it returns.
 - The i2c FAILs from the first DC boot (`i2c_add_numbered_adapter -16`)
   were this test collision, not a core regression; the fix rebuilds clean.
 

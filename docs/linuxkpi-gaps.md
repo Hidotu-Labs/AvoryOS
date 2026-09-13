@@ -535,15 +535,13 @@ prerequisites and the hardware-bring-up findings.
   and the number can be taken, so `i2c_add_numbered_adapter` failed
   `-EBUSY` and the lookup/verify subtests cascaded.  The suite now scans
   for a free number in `[16, 64)` at run time.
-- **Open (2026-09-13): the guest hardware-resets at session start once
-  amdgpu binds with DC enabled.**  After a full DC init (`DMUB hardware
-  initialized`, `Initialized amdgpu ... on minor 2`), the suites run and
-  the machine resets immediately after `[PROC] Executing main session:
-  /bin/avoryd`, with no panic and no watchdog line (OVMF restarts on the
-  serial stream).  Boots where the probe fails first (-22, warm GPU) start
-  the session normally, so it correlates with DC being active - not with
-  the session binary.  Next step: reproduce on a cold GPU with
-  `-d int,guest_errors,cpu_reset` and read the last exception.
+- **Watch item (2026-09-13): one guest hardware-reset at session start
+  did not reproduce.**  The first DC-active boot reset immediately after
+  `[PROC] Executing main session: /bin/avoryd`, with no panic and no
+  watchdog line (OVMF restarted on the serial stream).  After a cold host
+  reboot the same build booted clean with DC active (0 `[FAIL]`s, session
+  started, login reached), so the reset is intermittent until seen again;
+  re-run with `-d int,guest_errors,cpu_reset` if it returns.
 
 ## Phase 5 gaps (full I/O foundations)
 
