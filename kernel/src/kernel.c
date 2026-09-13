@@ -608,6 +608,7 @@ mount_success:
   extern void linuxkpi_time_init(void);
   extern void linuxkpi_workqueue_init(void);
   extern void linuxkpi_rcu_init(void);
+  extern void linuxkpi_x86_cpu_init(void);
   extern void linuxkpi_run_boot_tests(void);
   extern void linuxkpi_param_init(void);
   extern void linuxkpi_page_init(void);
@@ -620,6 +621,9 @@ mount_success:
   linuxkpi_time_init();
   linuxkpi_workqueue_init();
   linuxkpi_rcu_init();
+  /* Fill boot_cpu_data.x86_capability before any driver reads boot_cpu_has()
+   * (amdgpu's passthrough detection depends on it; see x86_stubs.c). */
+  linuxkpi_x86_cpu_init();
   /* Apply kernel command-line module parameters, then run module_init-style
    * drivers (dma-buf among them) from a kthread, matching Linux kernel_init.
    * The suites exercise those drivers, so the order matters. */

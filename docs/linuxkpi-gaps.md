@@ -6,6 +6,338 @@ needed it, the current workaround, and what a complete implementation needs.
 
 Update this file in the same change that introduces or closes a gap.
 
+## Phase 6 gaps (amdgpu bring-up)
+
+### C1 — import tree + Kbuild evaluator + helper imports
+
+- **The amdgpu object list is generated, not hand-curated**
+  (`scripts/linux/kbuild-subset.py` → `kernel/linux/Makefile.kbuild`): the
+  generator evaluates the pinned 6.6 Makefiles (variables including computed
+  names, `ifdef/ifndef/ifeq/ifneq/else`, `include`,
+  `addprefix/addsuffix/filter/filter-out/patsubst/strip/sort/...`, and
+  `$(call cc-option|cc-disable-warning|gcc-min-version)`) against
+  `autoconf.h` and emits the object list, the include-path union
+  (`ccflags-y` + `subdir-ccflags-y`) and per-file `CFLAGS_<path>` rules.
+  Current output: 664 objects (656 amd + 8 display helper), 31 includes,
+  33 per-file rules, 0 unsupported constructs, 0 missing known objects.  It
+  fails on any construct it does not model.  The list is gated by
+  `KPI_AMDGPU` (`kernel/GNUmakefile`, default 0) so the default build stays
+  the Phase 5 baseline until 6a links.
+- **Warning flags in the Makefiles are not imported**: `-W*` tokens from
+  `ccflags-y`/`subdir-ccflags-y`/`CFLAGS_*` (`-Wextra`,
+  `-Wmissing-prototypes`, `-Wframe-larger-than=2048`, ...) are dropped; the
+  curated `LINUX_CFLAGS` in `kernel/GNUmakefile` governs warnings.  All
+  `-I`/`-D` tokens are kept (`-DBUILD_FEATURE_TIMING_SYNC=0` included).
+- **Whole `drivers/gpu/drm/amd` import**: 425 MB on disk
+  (`include/asic_reg` alone 387 MB / 398 headers), gitignored; the ISO is
+  unaffected.
+- **Unreferenced helper symbols are dropped by `--gc-sections`**:
+  `i2c_bit_add_bus`, `drm_exec_*`, `drm_dp_aux_init`, `kvrealloc` and
+  friends exist in their objects but not in the linked image while only the
+  (gated) amdgpu objects reference them.  They re-appear with
+  `KPI_AMDGPU=1`; documented so the missing symbol is not mistaken for a gap.
+- **i2c overlay grew for i2c-algo-bit/drm_dp_helper**: `struct
+  i2c_lock_operations` + `i2c_adapter.lock_ops` + `I2C_LOCK_ROOT_ADAPTER`/
+  `I2C_LOCK_SEGMENT`, `master_xfer_atomic`/`smbus_xfer_atomic`, the uapi
+  SMBus data (`union i2c_smbus_data`, `I2C_SMBUS_*` sizes,
+  `I2C_FUNC_SMBUS_EMUL[_ALL]`), the `I2C_AQ_*` quirk flags and
+  `S_IRUGO`.  The core installs a default `lock_ops` over `bus_lock` and
+  `i2c_transfer()` takes the root-adapter lock through `lock_ops`, so
+  `drm_dp_helper`'s segment-aware ops are honored.  Still absent (P5 C4
+  scope): SMBus emulation, client instantiation, quirk enforcement, adapter
+  refcounting.
+- **`wait_event_interruptible_locked` is real** (`linuxkpi/src/wait.c`,
+  overlay `linux/wait.h`): `do_wait_intr`/`do_wait_intr_irq` drop the
+  caller's `wq.lock` around `schedule()` and re-acquire it, with the four
+  upstream macros.  `drm_suballoc.c` depends on the lock-drop semantics.
+- **`___ratelimit` is self-authored** (`linuxkpi/src/compat_stubs.c`):
+  upstream `lib/ratelimit.c` logic, but the state lock is a plain
+  `raw_spin_lock_irqsave` rather than a trylock (contention serializes
+  instead of suppressing), and the "callbacks suppressed" report is printed
+  inline (`printk_deferred` does not exist here).
+  `dev_*_ratelimited()` callers (`drm_dp_helper`) get normal burst/interval
+  behavior.
+- **`strlcat` and `request_firmware_direct` provided** (`compat_stubs.c`,
+  `firmware.c`): `strlcat` is the upstream `lib/string.c` implementation
+  (used by `drm_dp_mst_topology`); `request_firmware_direct` is an alias of
+  `request_firmware` because a static kernel has no usermode fallback
+  (used by `drm_hdcp_helper`).
+- **`kvrealloc` implemented** (`linuxkpi/src/vmalloc.c`), grow-only,
+  matching upstream `mm/util.c` (needed by `drm_exec`).
+- **`get_jiffies_64()` inline** (overlay `linux/jiffies.h`) over the tracked
+  `jiffies_64` (used by `drm_dp_mst_topology`).
+- **fb constants added** (overlay `linux/fb.h`): `FB_MAX` and
+  `FB_BLANK_*`; stock `<linux/backlight.h>` inlines pulled in by
+  `drm_dp_helper.c` write them to `fb_blank`.
+- **`module_param_unsafe` added** (overlay `linux/moduleparam.h`), an alias
+  of `module_param_named`; `drm_dp_helper.c` uses it.
+- **`<drm/display/drm_dp_helper.h>` overlay**: includes
+  `<linux/workqueue.h>` before the stock header because `struct drm_dp_aux`
+  embeds `struct delayed_work` and the stock header relies on the includer
+  having pulled it.
+- **First amdgpu TU (`amdgpu_drv.c`) needs the C2 API wave**: the
+  generator's include paths and per-file flags are correct (dry-run
+  verified), and the TU compiles far enough to surface 73 API errors, first
+  clusters: PM runtime flags (`DPM_FLAG_*`, `dev_pm_set_driver_flags`),
+  folio/mm state surface (`folio_page_idx/pgdat/zone/test_large`,
+  `memcpy_from/to_page`, `memzero_page`, `virt_to_head_page`,
+  `page_pgdat`, `mod_zone_page_state`, `page::pgmap`, `folio::swap`),
+  rwsem lockdep macros, `fl_owner_t`, `mmu_notifier_synchronize`,
+  `wait_on_bit`, `TRUE`, `PF_KSWAPD`, `HARDIRQ_OFFSET`/`SOFTIRQ_OFFSET`/
+  `NR_SOFTIRQS`, `CLONE_NEWUSER`, `__I_NEW`, a `dma_data_direction`
+  redeclaration, `plist_node`, `vga_pm_domain`,
+  `__DELAYED_WORK_INITIALIZER`, RCU lockdep helpers and the
+  `KPI_PARAM_bint`/`ullong` module-param types.  These belong to C2 by
+  design; C1 only had to prove the plumbing.
+
+### C2 — 6a: full amdgpu object set compiles and links
+
+- **Outcome**: the default build (`KPI_AMDGPU ?= 1` in `kernel/GNUmakefile`)
+  compiles 656 amd + 8 display-helper generated objects and links cleanly;
+  `nm` shows 940 `T amdgpu_*` and 738 `T drm_*` symbols.  The runtime
+  probe gate stays 0, so a normal boot never binds the passed GPU.
+- **Wave history** (`scripts/kpi-triage.sh`, logs under `build/logs/`):
+  3775 → 478 → 117 → 82 → 90 → 25 → 4 → **0 compile errors**;
+  76 → 1 → **0 undefined references**; 27 multiple-definition errors fixed
+  (the generated drm_display_helper set and HDMI were listed both in the
+  generator output and in `files.txt`; the hand list now only carries
+  drm_buddy/drm_exec/drm_suballoc/i2c-algo-bit/hdmi).
+- **Boot-safety gate**: `kpi_amdgpu` (module parameter, default 0) in
+  `linuxkpi/src/pci.c` makes `pci_register_driver()` register the "amdgpu"
+  driver but skip probing; `linuxkpi_pci_driver_registered()` and
+  `linuxkpi_pci_amdgpu_gate()` expose the state to
+  `test_phase6_link.c`.  Flip the default in C3.
+- **i2c**: `struct i2c_lock_operations` + `adapter.lock_ops` +
+  `I2C_LOCK_*`, `master_xfer_atomic`/`smbus_xfer_atomic`, uapi SMBus data
+  (`union i2c_smbus_data`, sizes, `I2C_FUNC_SMBUS_EMUL[_ALL]`), `I2C_AQ_*`
+  quirks, `sysfs_bin_attr_init` context and `S_IRUGO`; the core installs a
+  default `lock_ops` over `bus_lock` and `i2c_transfer()` locks through it.
+  `i2c_new_client_device()` still fails with `-ENODEV` (no client model);
+  SMBus emulation and quirk enforcement remain absent (P5 C4 scope).
+- **Core primitives added**: `wait_event_interruptible_locked[_irq]`
+  (real lock-drop semantics, `drm_suballoc`), `___ratelimit` +
+  `printk_ratelimit_state`, `strlcat`/`strnstr`/`strnlen`/`strsep`/
+  `strcspn`/`sscanf`/`vmemdup_user`, `kvrealloc`, `get_jiffies_64`,
+  `ktime_get_mono_fast_ns`/`ktime_get_real_seconds`,
+  `request_firmware_direct`, `rb_first_postorder`/`rb_next_postorder`
+  (native rbtree), `add_taint`/`system_state`/`orderly_poweroff`/
+  `emergency_restart`, `__put_task_struct` (no-op; shadows live until a
+  thread-exit hook exists).
+- **Shapes added to overlays**: `struct page::pgmap`, `struct folio::swap`,
+  `struct dev_pm_domain`, `kobj_type`/`kset` + `kobject_init/add/set_name`,
+  `kset_register/unregister/create_and_add`, `struct sysfs_ops`,
+  `BIN_ATTR*`/`sysfs_attr_init`, `sysfs_{add,remove}_file_to_group` (group
+  name ignored; file is placed on the kobject directory),
+  `device_create_file/remove_file`, `devm_device_add_group`
+  (sysfs_create_group; devres auto-remove not wired),
+  `ATTRIBUTE_GROUPS`, `dev_is_removable` + `device.removable`,
+  `dev_WARN`/`dev_WARN_ONCE`/`dev_{dbg,err}_ratelimited`,
+  task fields `mm`/`active_mm`/`reclaim_state`/`usage`/`alloc_lock`/
+  `rcu`/`thread`, `preemptible()`, `PF_KSWAPD`, `CONFIG_NR_CPUS=4`,
+  `arch_thread_struct_whitelist` config, `get_jiffies_64`,
+  mmzone page<->zone helpers (macros, `page_to_nid`/`pfn_to_nid` = 0),
+  `page_is_ram`/`totalram_pages` (real, PMM-backed),
+  `page_to_virt`/`VM_ACCESS_FLAGS`, scatterlist
+  `sg_dma_address`/`sg_dma_len` as lvalue macros, DMA
+  `dma_set_max_seg_size`/`dma_addressing_limited`/`dma_map_resource`/
+  `dma_unmap_resource` (identity), `arch_phys_wc_*`/`arch_io_*_memtype_wc`
+  no-ops.
+- **Header overlays added for include-chain restoration**:
+  `linux/firmware.h`, `linux/debugfs.h`, `linux/proc_fs.h`, `linux/rtc.h`,
+  `linux/pid.h` (token pid model moved out of sched.h), `linux/timerqueue.h`
+  (list-based node; stock rtc.h), `linux/irqdomain.h` (wait/workqueue before
+  the stock header), `linux/device/driver.h` + `linux/device/bus.h`
+  (redirect to the device.h overlay), `linux/syscalls.h` (shape-only; stock
+  header pulls the full task/ptrace/security surface), plus
+  `linux/io-64-nonatomic-lo-hi.h` reaching from `linux/io.h`.
+- **Config additions**: `CONFIG_IRQ_DOMAIN`,
+  `CONFIG_HAVE_ARCH_THREAD_STRUCT_WHITELIST`, `CONFIG_NR_CPUS=4`;
+  imported CFLAGS gained `-fshort-wchar` (stock `efi.h` inline takes
+  `L"SecureBoot"` as `efi_char16_t *`).
+- **Stubs with runtime consequences (all on paths that are off for
+  Raphael/single-partition)**: IRQ-domain API
+  (`__irq_domain_add` returns NULL, `irq_create_mapping_affinity` returns
+  the hwirq, `generic_handle_domain_irq` returns `-EINVAL`,
+  `irq_set_chip_and_handler_name`/`handle_simple_irq` inert); PCIe
+  `pcie_get_mps` (128), `pcie_bandwidth_available` (0/unknown),
+  `pci_reset_function`/`pci_resize_resource` (`-ENOTSUPP`),
+  `pci_rebar_get_possible_sizes` (0), `pci_enable_atomic_ops_to_root`
+  (`-EINVAL`), `pci_ignore_hotplug`/`pci_restore_msi_state`/
+  `pci_assign_unassigned_bus_resources` no-ops, `pci_bus_resource_n` NULL;
+  `backlight_device_register`/`hwmon_device_register_with_groups` return
+  `ERR_PTR(-ENODEV)` (registration is skipped), unregister no-ops;
+  `drm_client_dev_hotplug` no-op; `amdgpu_xcp_drm_dev_alloc` weak
+  `-ENODEV` (amdxcp is a separate upstream module); uniprocessor percpu
+  emulation extended with `__per_cpu_offset[NR_CPUS]` and `cpu_info`
+  (single shared instance).
+- **HDMI import**: `drivers/video/hdmi.c` (subset + files) provides the
+  `hdmi_*_infoframe_*` symbols the display helper and DM link need.
+- **Lost-wakeup fix for plain blocking waits** (found by the first C2 boot
+  with the VFIO suite: `sched timedout_job did not fire`).  `sched_wakeup()`
+  ignores `THREAD_RUNNING` threads, and `linuxkpi_thread_block()` published
+  `THREAD_BLOCKED` *after* the caller's condition check, so a wake arriving
+  in that window was dropped and the waiter slept until the test's timeout.
+  `struct thread` gained `kpi_block_pending`: `linuxkpi_wake_thread()` arms
+  it for every wake, and `linuxkpi_thread_block()` exchanges it under the
+  run-queue lock before publishing `THREAD_BLOCKED` (same rendezvous shape
+  as `kpi_wake_pending` for `schedule_timeout`).  A stale flag can only
+  produce one harmless spurious wakeup.  Fixes the P4 drm_sched TDR subtest
+  under load; verified green by the follow-up VFIO boot (all P0–P5 suites
+  plus the P6 link suite).
+
+### C3 — 6b: early init on the real GPU
+
+- **Probe gate default flipped to 1** (`linuxkpi/src/pci.c`): a boot now
+  routes the passed GPU through `amdgpu_pci_probe()`; `kpi_amdgpu=0` is the
+  one-line revert and must stay regression-clean.  The registry records that
+  amdgpu's probe ran and its return value
+  (`linuxkpi_pci_amdgpu_probe_attempted()`/`_probe_result()`), because the
+  driver core unbinds the device when probe fails.  `test_phase6_link.c`
+  asserts gate-off = registered and never probed, gate-on = probe ran and
+  reached BAR5; it tightens to "bound" in C4 once firmware and rings land.
+- **ioremap "ever mapped" trace** (`linuxkpi/src/vmalloc.c`,
+  `linuxkpi_ioremap_was_mapped()`): a 16-entry table remembers ioremap calls
+  after iounmap, so the failed C3 probe can still be checked for "reached
+  its MMIO setup".  Diagnostic only; overflow drops later mappings.
+- **`module.param=value` boot syntax now matches** (`linuxkpi/src/params.c`):
+  the param table has no per-module scoping (`KBUILD_MODNAME` is one constant
+  for the whole build), so after an exact-name miss the dispatcher retries
+  with the suffix following the last '.'; `drm.debug=0x1ff` and
+  `amdgpu.runpm=0` now apply.  The assumption is unique param names across
+  the linked modules — a duplicate would silently take the first section
+  entry (the table is small and audited; revisit if a collision appears).
+- **`amdgpu.modeset` does not exist in the pinned 6.6 tree**: `amdgpu.h` has
+  a dead `extern int amdgpu_modeset;` with no definition, module_param, or
+  user (tree-wide grep: one hit).  The plan's "keep `amdgpu.modeset=0` until
+  C6" is void; `amdgpu.dc` (default -1/auto), `amdgpu.dcdebugmask` and
+  `amdgpu.runpm` are the available levers.  Verify what headless C4/C5 need
+  with `amdgpu.dc=0` before relying on it.
+- **Native `vsnprintf` flag/precision gaps fixed** (`kernel/src/lib/string.c`):
+  `drm.debug=0x1ff` exposed two argument-desync faults in stock DRM prints.
+  (1) `%.*s` (precision from an argument, what `drm_printf_indent()` emits)
+  was parsed as an unknown conversion that consumed nothing, so the next
+  `%s` read the indent integer and faulted (`CR2=0x2`); `.*` is now parsed.
+  (2) `+`, ` ` and `#` flags were unknown conversions with the same desync
+  effect; they are now consumed, with `%+d`/`% d` signing and `%#x`/`%#o`
+  prefixes implemented.  `test_phase1_core6.c` (`pointer formats`) covers
+  both shapes.  Any further kernel format specifier that reaches these logs
+  must be handled the same way (unknown conversions must not shift args).
+- **Threaded hrtimer callbacks and vkms vblank disable** (upstream
+  CVE-2025-71315, latent in 6.6): `drm_crtc_vblank_off()` holds
+  `event_lock`+`vbl_lock` with IRQs off while `vkms_disable_vblank()` calls
+  `hrtimer_cancel()`, and `vkms_vblank_simulate()` (running in the LinuxKPI
+  `ktimers` thread, not hardirq) spins on `event_lock` in
+  `drm_handle_vblank()` - the first C3 boot froze CPU3 there.  In atomic
+  context `hrtimer_cancel()` now sets `timer->cancel_pending` and returns
+  without waiting; the callback loop skips the `HRTIMER_RESTART` re-enqueue,
+  so the cancel still takes effect once the in-flight callback drains.
+  Process-context callers keep wait-for-completion.  The in-flight callback
+  can still observe the CRTC mid-disable (vkms may log one `vkms failure on
+  handling vblank`); the proper fix is upstream's generic vblank timer
+  (6.18.y backports), revisit when vkms gains more users.  `timer_list`
+  callbacks share the threaded model but `del_timer_sync()` is still
+  wait-for-completion; audit before any atomic-context caller appears.
+
+### C4 — 6c: firmware + PSP/SMU/GMC/IH + rings
+
+- **`boot_cpu_data.x86_capability` was a zeroed record**
+  (`linuxkpi/src/x86_stubs.c` now fills it from CPUID at boot):
+  `boot_cpu_has()` answered "no" to every feature, so `is_virtual_machine()`
+  (`X86_FEATURE_HYPERVISOR`) missed the VFIO host, `AMDGPU_PASSTHROUGH_MODE`
+  stayed unset, and the APU took the bare-metal branches:
+  `amdgpu_device_flush_hdp()`/`invalidate_hdp()` returned early (no HDP flush
+  around `psp_ring_cmd_submit`), and `gmc_v10_0` picked the MC framebuffer
+  aperture over BAR0.  The PSP bootloader answered the mailbox handshakes, but
+  its ring fence never advanced (`psp gfx command UNKNOWN CMD(0x0)`,
+  `Failed to load toc`, `PSP tmr init failed!`, `hw_init of IP block <psp>
+  failed -22`) after ~200 s of fence polling.  The fix is
+  `linuxkpi_x86_cpu_init()` called from `kernel/src/kernel.c` before the
+  initcalls; words 0/1/4/6/9 mirror `arch/x86/kernel/cpu/common.c`.
+- **Initcall timeout vs. a long amdgpu probe**: the 30 s wait
+  (`linuxkpi/src/initcalls.c`) elapsed while the broken PSP path spun, so the
+  boot tests ran concurrently with amdgpu's probe: the Phase 5 VFIO suite
+  failed `pci_alloc_irq_vectors(1) (-16)` (amdgpu owned the vectors) and the
+  failed probe's teardown logged 16 `amdgpu_irq.c:621` imported WARNs.  With
+  the CPU-feature fix the probe works but still takes minutes, so the wait is
+  now 10 minutes with a "still running" line every 30 s and a completion
+  timing line; the suites must not start while amdgpu owns the device.
+  Re-tune downward once C4 init timing is known.
+- **The generated firmware manifest was invisible to the LinuxKPI compile**:
+  `-I ../build/firmware` was added to the global `CPPFLAGS`, but
+  `src/tests/linuxkpi/linux/*.c` and `linuxkpi/src/*.c` are compiled with
+  `LINUX_CPPFLAGS` (kernel/GNUmakefile), so `__has_include(<kpi_fw_manifest.h>)`
+  was false and the Phase 5 suite logged `[SKIP] fw amdgpu manifest not
+  staged` even though the image carried the blobs.  The include now lives in
+  `LINUX_CPPFLAGS`; the CRC check runs on the next build.
+- **Raphael does not load an SMU blob**: `smu_v13_0_5_ppt_funcs` omits
+  `.init_microcode`, and `smu_ppt_funcs()` returns 0 for a NULL method, so
+  `amdgpu/smu_13_0_5.bin` is never requested (the file does not exist in
+  linux-firmware).  The manifest stages only the files early init asks for.
+- **`AUTOLOAD_RLC` answers `TEE_ERROR_BUSY` (`0xFFFF000D`)**: after the RLC
+  firmware went in via `psp_execute_ip_fw_load()`, `psp_rlc_autoload_start()`
+  gets a BUSY response; `psp_cmd_submit_buf()` only warns for a non-zero
+  status when not SRIOV and not timed out, so loading continues.  Observed
+  on the C4 boots; re-check when the GFX hw_init/ring tests land.
+- **`usleep_range()` over-slept sub-millisecond requests**
+  (`linuxkpi/src/time.c`): `usecs_to_jiffies()` rounds up, so
+  `schedule_timeout(usecs_to_jiffies(min))` turned every `min < 1000` at
+  HZ=1000 into one jiffy (1 ms).  The PSP fence loop's
+  `usleep_range(60, 100)` therefore slept ~1 ms per iteration (10x its
+  max) - slow, but it did pace the loop, so this is **not** the cause of the
+  `AUTOLOAD_RLC` BUSY.  Fixed to sleep the whole-millisecond part and spin
+  the tail on the TSC (never returns before `min`, no longer over-sleeps).
+- **`AUTOLOAD_RLC` BUSY is still the open C4 blocker**: reconstructed from
+  the two observed boots - (a) cold device: PSP answers `TEE_ERROR_BUSY`
+  (`0xFFFF000D`) and `gfx_v10_0_wait_for_rlc_autoload_complete()` times out;
+  (b) warm device: no warning, the wait passes, but the MEC never runs
+  (`ring kiq_0.2.1.0 test failed (-110)`, `KCQ enable failed`).  Both point
+  at the PSP's GFX autoload not actually bringing up the CP/MEC on this
+  VFIO pass-through.  The next `make run-c4` now bakes `drm.debug=0x1ff`, so
+  the log will show every `LOAD_IP_FW` (fw names/versions/sizes via
+  `psp_print_fw_hdr`) and the exact autoload status.  Compare the RLC/MEC
+  firmware versions and the `AUTOLOAD_RLC` result before changing anything.
+- **Firmware staging is byte-exact** (ruled out): every staged blob was
+  compared against a fresh `zstd -d` of the host's `/lib/firmware` member and
+  matches.  The common-header `crc32` field does not match zlib's CRC for the
+  gfx/PSP blobs (`vcn_3_1_2.bin` is the exception), but the kernel never
+  validates that field - it is AMD tooling's convention, not corruption.
+- **DCN `dc_hardware_init` is minutes-slow in this environment** (the probe
+  reaches `DMUB hardware initialized` and then sits in display bring-up).
+  C4 runs avoid it with `amdgpu.dc=0` (the `dm` ip block is not added);
+  profile the DCN register/wait path as part of C6.  A failed PSP handshake
+  left by a previous run is cleared by simply retrying the boot or by the
+  host-side reset recipe in `docs/amdgpu-testing.md`.
+- **`ioremap()` mapped device memory as UC-, and `ioremap_wc()` as WB**
+  (`linuxkpi/src/vmalloc.c`): PTE bits select an IA32_PAT entry as
+  `(PAT<<2)|(PWT<<1)|PCD`; AvoryOS keeps the architectural default PAT table
+  and only programs entry 7 to WC (`kernel/src/cpu/features.c`), unlike Linux
+  which also re-programs entry 1. So `ASC_PAGE_PCD` alone was PAT entry 2
+  (UC-), which an MTRR (or a WB MTRR default type) can override back to
+  cacheable, and `ASC_PAGE_PAT` alone was entry 4 (WB), not WC. Under VFIO
+  that turns BAR5, the doorbell BO and (TTM `ioremap`s of) the GART table
+  into CPU-cacheable mappings: register reads go stale, doorbell writes land
+  only on cache eviction and GART PTEs may not be in VRAM when the CP walks
+  them - the flaky `ring kiq_0.2.1.0 test failed (-110)` / `dbctl=0` /
+  `rptr==wptr at failure` pattern. Fixed to the encodings the native kernel
+  already uses: UC = `PCD|PWT` (entry 3, MTRR-proof), WC =
+  `PAT|PCD|PWT` (entry 7). `mmap.c`'s VM_IO user mapping was left as-is for
+  now (it ignores the caller's `pgprot`; honoring it is a C5 item).
+- **KIQ HQD doorbell state does not survive a warm re-init** (driver-side,
+  `gfx_v10_0.c`, AVORYOS P6 C4 tags; replaces the earlier candidate patch): a
+  PCI/VFIO reset does not reset the CP, so `gfx_v10_0_kiq_init_register()`
+  can find the KIQ HQD still active from a previous boot.  While the MEC is
+  halted the graceful `DEQUEUE_REQUEST` cannot complete (100 ms timeout), and
+  the half-deactivated queue silently drops the
+  `CP_HQD_PQ_DOORBELL_CONTROL` programming that follows, so the first KCQ
+  ring test times out (`hqd=1/0/0/0`: `dbctl=0`, `wptr=0`, `pqb`/`active`
+  intact).  Two bounded changes: (1) if the dequeue does not complete, force
+  `CP_HQD_ACTIVE=0` and clear the pending request before reprogramming;
+  (2) re-assert `DOORBELL_EN|DOORBELL_OFFSET` after the KCQ queues are
+  initialized and immediately before `amdgpu_gfx_enable_kcq()` - the earlier
+  candidate re-enabled ~50 us after the MEC unhalt, before the MEC had
+  settled, and its write was lost.  Remove both once the upstream sequence
+  handles a stale active HQD (or the host resets the GPU before each guest).
+
 ## Phase 5 gaps (full I/O foundations)
 
 Index: C1 PCI · C2 IRQ/MSI · C3 ACPI/firmware · C4 i2c · C5 sysfs/devres/PM ·

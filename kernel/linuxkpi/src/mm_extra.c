@@ -39,3 +39,14 @@ void si_meminfo(struct sysinfo *val) {
   val->freeram = (unsigned long)asc_pmm_get_free_pages_total();
   val->mem_unit = PAGE_SIZE;
 }
+
+/* RAM checks and stock page counters.  There is no memory hotplug or NUMA:
+ * every PMM-managed pfn is RAM. */
+int page_is_ram(unsigned long pfn) {
+  (void)pfn;
+  return 1;
+}
+
+unsigned long totalram_pages(void) {
+  return (unsigned long)(asc_pmm_get_total_memory() / PAGE_SIZE);
+}

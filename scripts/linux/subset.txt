@@ -71,3 +71,18 @@ drivers/gpu/drm/tiny
 # live in the source directories, so the whole directories are copied.
 drivers/gpu/drm/ttm
 drivers/gpu/drm/scheduler
+
+# Phase 6: the amdgpu driver tree (amdgpu/display/pm/include, including the
+# asic_reg register headers, ~400 MB in the gitignored import) and the
+# drm_display_helper sources amdgpu selects.  The amdgpu object list itself is
+# generated from the Kbuild fragments by scripts/linux/kbuild-subset.py, not
+# hand-maintained in files.txt.
+drivers/gpu/drm/amd
+drivers/gpu/drm/display
+
+# Phase 6: i2c-algo-bit, used by amdgpu_i2c.c for DDC/EDID bit-banging.
+drivers/i2c/algos/i2c-algo-bit.c
+
+# Phase 6 C2: HDMI infoframe packing (drivers/video/hdmi.c) — the DRM HDMI
+# helper and amdgpu's DM link code link against hdmi_*_infoframe_*().
+drivers/video/hdmi.c

@@ -116,6 +116,27 @@ dma_addr_t dma_map_single_attrs(struct device *dev, void *ptr, size_t size,
   return kpi_dma_phys(ptr);
 }
 
+/* Resource mapping is identity too (no IOMMU): amdgpu_vram_mgr maps VRAM
+ * pages through dma_map_resource() and expects the physical address back. */
+dma_addr_t dma_map_resource(struct device *dev, phys_addr_t phys_addr,
+                            size_t size, enum dma_data_direction dir,
+                            unsigned long attrs) {
+  (void)dev;
+  (void)size;
+  (void)dir;
+  (void)attrs;
+  return (dma_addr_t)phys_addr;
+}
+
+void dma_unmap_resource(struct device *dev, dma_addr_t addr, size_t size,
+                        enum dma_data_direction dir, unsigned long attrs) {
+  (void)dev;
+  (void)addr;
+  (void)size;
+  (void)dir;
+  (void)attrs;
+}
+
 void dma_unmap_single_attrs(struct device *dev, dma_addr_t addr, size_t size,
                             enum dma_data_direction dir, unsigned long attrs) {
   (void)dev;

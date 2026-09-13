@@ -50,6 +50,15 @@ struct dev_pm_ops {
   int (*runtime_idle)(struct device *dev);
 };
 
+/* A device's power-management domain.  amdgpu embeds one in struct
+ * amdgpu_device (vga_pm_domain); only the type is needed because runtime PM
+ * is inert (docs/linuxkpi-gaps.md, P5 C5). */
+struct dev_pm_domain {
+  struct dev_pm_ops ops;
+  int (*start)(struct device *dev);
+  void (*dismiss)(struct device *dev);
+};
+
 /* Runtime-PM status enums: stock <linux/pm_runtime.h> uses these in its
  * !CONFIG_PM inline helpers even though no runtime PM exists. */
 enum rpm_status {
@@ -103,5 +112,20 @@ enum rpm_request {
 #define pm_ptr(_ptr) NULL
 #define pm_sleep_ptr(_ptr) NULL
 #define pm_runtime_ptr(_ptr) NULL
+
+/* PM driver flags (stock pm.h values) and the TRUE/FALSE constants upstream
+ * picks up from <acpi/actypes.h> when CONFIG_ACPI is on.  amdgpu_drv.c's
+ * runpm block needs them although runtime PM is inert here. */
+#define DPM_FLAG_NO_DIRECT_COMPLETE (1U << 0)
+#define DPM_FLAG_SMART_PREPARE (1U << 1)
+#define DPM_FLAG_SMART_SUSPEND (1U << 2)
+#define DPM_FLAG_MAY_SKIP_RESUME (1U << 3)
+
+#ifndef TRUE
+#define TRUE 1
+#endif
+#ifndef FALSE
+#define FALSE 0
+#endif
 
 #endif /* __AVORY_LINUXKPI_PM_H */

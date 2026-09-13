@@ -126,3 +126,12 @@ __attribute__((weak)) int drm_aperture_remove_conflicting_pci_framebuffers(
   (void)req_driver;
   return 0;
 }
+
+/* amdgpu_xcp.c allocates a separate DRM device per partition when XCP is
+ * active.  The amdxcp helper is a separate module upstream; a weak stub keeps
+ * the XCP path linkable and disables it at runtime (single-partition APU).
+ * Weak so importing amdxcp later wins without edits. */
+__attribute__((weak)) int amdgpu_xcp_drm_dev_alloc(struct drm_device **ddev) {
+  (void)ddev;
+  return -ENODEV;
+}

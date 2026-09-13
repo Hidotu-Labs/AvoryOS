@@ -125,6 +125,12 @@ void flush_workqueue(struct workqueue_struct *wq) {
   wait_event(wq->flush_wait, wq->active == 0);
 }
 
+/* Upstream also cancels the pending timer; the delayed-work timer only
+ * enqueues the work, so flushing the work covers the observable behavior. */
+bool flush_delayed_work(struct delayed_work *dwork) {
+  return flush_work(&dwork->work);
+}
+
 void drain_workqueue(struct workqueue_struct *wq) {
   /* Conservative equivalent of upstream's drain: wait until nothing is
    * pending/running.  New work queued after this returns simply runs; it is

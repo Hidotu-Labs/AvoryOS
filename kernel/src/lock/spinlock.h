@@ -162,13 +162,20 @@ static inline bool spinlock_is_locked(spinlock_t *lock) {
 // ---------------------------------------------------------------------------
 // rawspinlock_t — the same lock WITHOUT masking interrupts, held or waited on.
 //
-// Use this for locks that:
-//   1. Can be held while another CPU sends TLB shootdown IPIs (e.g. vmm_lock)
-//   2. Are never acquired from an IRQ handler
-//   3. Can be held for longer durations (page table walks, etc.)
+// WARNING: a raw holder stays preemptible.  Since syscall dispatch became
+// interruptible (syscall_entry.asm runs sti), the LAPIC tick can switch away
+// from a kernel context that owns a raw lock, stranding the lock behind a
+// thread that is no longer running; the next context that needs it then spins
+// with interrupts masked by the exception gate and can never reschedule the
+// owner.  vmm_lock and shootdown_lock were both moved to spinlock_t for
+// exactly that reason.
 //
-// Waiters stay interruptible so they can ack an IPI, and a holder never runs
-// with IF=0, so it can ack one too.
+// Only use this for locks that are provably never held across a preemption
+// point (e.g. late-boot or interrupt-free code), or when a native preemption
+// guard exists.  The original motivation — keeping a holder able to
+// acknowledge a TLB shootdown IPI — is preserved for waiters by
+// spinlock_acquire's open-while-spinning path; the holder itself does not
+// need interrupts for any lock currently in the tree.
 // ---------------------------------------------------------------------------
 typedef struct {
   volatile uint32_t locked;

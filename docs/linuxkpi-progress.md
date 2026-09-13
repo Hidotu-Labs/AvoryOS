@@ -1159,6 +1159,334 @@ above; the last full VFIO boot was 252 `[  OK  ]` with no `[FAIL]`.
   Interactive confirmation: the desktop boot lists `AMD Raphael` as the
   second GPU in fastfetch, next to the emulated one.
 
+## Phase 6 — amdgpu bring-up (C3 early init green; C4 in progress)
+
+Chunk plan: `docs/linuxkpi-phase6-plan.md` (written 2026-09-13 after
+auditing P0–P5 at `2d5a0c0` / `p6-baseline`).  Chunks: C0 baseline +
+environment freeze → C1 import tree + Kbuild subset generator + config
+census → C2 (6a) compile/link → C3 (6b) early init → C4 (6c)
+firmware/PSP/SMU/GMC/IH + rings → C5 (6d) queues/VM/BOs/CS → C6 (6e)
+KMS/DCN → C7 (6f) Mesa radeonsi → C8 (6g) stability → C9 closeout.
+
+Audit findings that shape the work (all detailed in the plan):
+
+- The amd subtree has 749 `.c` files; the effective amdgpu set is on the
+  order of 500 objects, so a Kbuild subset evaluator
+  (`scripts/linux/kbuild-subset.py` → `kernel/linux/Makefile.kbuild`)
+  replaces hand-curated `files.txt` entries for the driver.
+- Importing `drivers/gpu/drm/amd` adds ~400 MB (`include/asic_reg`) to the
+  gitignored `kernel/linux/` tree; the ISO is unaffected.
+- PSP 13.0.5 is TOC-based: `psp_13_0_5_toc.bin` + `psp_13_0_5_ta.bin`
+  (no `_sos` for this revision).
+- `amdgpu_vcn_early_init()` requests `vcn_3_1_2.bin` during early init, so
+  it is mandatory even though video decode is out of scope.
+- `amdgpu_i2c.c` calls `i2c_bit_add_bus()`; `drivers/i2c/algos/
+  i2c-algo-bit.c` must be imported for DDC/EDID.
+- `amdgpu_pm.c` calls `hwmon_device_register_with_groups()` unguarded;
+  weak stubs cover the `CONFIG_HWMON` select until a real consumer appears.
+- A probe gate (`kpi_amdgpu`, default 0) keeps `make run-vfio` bootable
+  while 6a–6c iterate; it is a documented non-upstream knob.
+- With vkms/vgem linked, amdgpu lands on `card2`/`renderD129`; tests must
+  discover the node by name.
+
+### C1 — import tree + Kbuild evaluator + config census (tooling green 2026-09-13)
+
+- [x] `scripts/linux/subset.txt` += `drivers/gpu/drm/amd` (425 MB;
+      `include/asic_reg` is 387 MB / 398 headers), `drivers/gpu/drm/display`,
+      `drivers/i2c/algos/i2c-algo-bit.c`.
+- [x] `scripts/linux/kbuild-subset.py` evaluates the pinned Kbuild fragments
+      and writes `kernel/linux/Makefile.kbuild` + `kbuild-report.txt`:
+      **664 objects** (656 amd + 8 display helper), 31 include paths,
+      33 per-file flag rules, 0 unsupported constructs, 0 missing known
+      objects.  Deterministic and strict (unknown syntax fails the import).
+      It is invoked by `scripts/linux-import.sh` after the pin is written.
+- [x] `kernel/GNUmakefile` includes `linux/Makefile.kbuild`; the amd object
+      list is gated by `KPI_AMDGPU` (default 0), so the default build stays
+      the Phase 5 baseline.  Target-specific flags verified with `make -n`:
+      DML objects get `-mno-sse -mno-sse2 -mhard-float -msse -msse2`, all amd
+      objects get the include union plus `-DBUILD_FEATURE_TIMING_SYNC=0`.
+- [x] `autoconf.h` += the plan's Appendix B set (DRM_AMDGPU/DC/DC_FP,
+      DRM_DISPLAY_* helpers, DRM_BUDDY/EXEC/SUBALLOC, I2C_ALGOBIT).
+- [x] `scripts/linux/files.txt` += drm_buddy/drm_exec/drm_suballoc, the eight
+      display-helper objects and i2c-algo-bit; the kernel links clean.
+- [x] First amdgpu TU smoke: plumbing is correct (compiler reaches amdgpu
+      code with the generated includes/flags); `amdgpu_drv.c` surfaces 73
+      API errors, which are the C2 worklist.  First clusters are listed in
+      `docs/linuxkpi-gaps.md` (P6 C1).
+- [x] Regression: headless `-smp 4` boot with the new helpers —
+      **249 `[  OK  ]`, 0 `[FAIL]`, login prompt**
+      (`build/logs/p6-c1-regress.log`); the maintainer's `run-vfio` boot with
+      `kpi_vfio_test=1` is green through the Phase 5 VFIO suite as well.
+- Deviation: C1's "first amdgpu TU compiles" is deferred to C2, where the
+  API wave is fixed; C1 proves the generated list/flags and keeps the tree
+  bootable (recorded in the gap log).
+- Next: C2 (6a) compile waves with `KPI_AMDGPU=1`; write the triage helper
+  and start from the `amdgpu_drv.c` clusters (PM flags, folio/mm surface,
+  `fl_owner_t`, `mmu_notifier_synchronize`, ...).
+
+### C2 — 6a compile/link (green 2026-09-13)
+
+- [x] `scripts/kpi-triage.sh` (buckets missing headers, implicit
+      declarations, normalized error messages, undefined references, failing
+      units; writes `build/p6a-gaps.md`).
+- [x] All 656 amd + 8 display-helper generated objects compile and link:
+      wave history **3775 → 478 → 117 → 82 → 90 → 25 → 4 → 0 compile
+      errors**, **76 → 1 → 0 undefined references**, plus 27
+      multiple-definition fixes (duplicate display-helper/HDMI entries
+      between the generator and `files.txt`).
+- [x] `KPI_AMDGPU` flipped to default **1**; `make -C kernel` clean.
+      `nm kernel/bin-x86_64/kernel | grep -c ' T amdgpu_'` = **940**;
+      `' T drm_'` = **738**.  Image size grew accordingly (kernel ~105 MB,
+      ISO ~110 MB with debug info; stripping/`-Os` is a P7 item).
+- [x] Boot-safety gate `kpi_amdgpu` (module parameter, default 0) keeps the
+      passed GPU unbound; `test_phase6_link.c` (wired after the P5 VFIO
+      suite) asserts registration + gate behavior.  `linuxkpi/src/pci.c`
+      exposes `linuxkpi_pci_driver_registered()`/`linuxkpi_pci_amdgpu_gate()`.
+- [x] Import additions: `drivers/video/hdmi.c`; display helpers now only
+      come from the generator; `-fshort-wchar` for imported CFLAGS.
+- [x] Boot regression with amdgpu linked (maintainer-run, 2026-09-13):
+      `run-vfio` with `kpi_vfio_test=1` (needed the lost-wakeup fix below
+      for the sched suite) — all P0–P5 suites green, then:
+      ```
+      [  OK  ] LinuxKPI: sched timedout_job fired for a hung job
+      [  OK  ] LinuxKPI: sched hung job completes after the fence is signaled
+      [INFO] LinuxKPI: sched calls run_job=34 signal_work=33 freed=33
+      [  OK  ] LinuxKPI: vfio suite complete
+      [  OK  ] LinuxKPI: link amdgpu pci driver registered
+      [  OK  ] LinuxKPI: link gate off leaves the passed GPU unbound
+      [  OK  ] LinuxKPI: link suite complete
+      ```
+      Login reached; no `[FAIL]`.  One-line revert remains
+      `make KPI_AMDGPU=0`.
+- [x] **Lost-wakeup fix** (found by the first C2 VFIO boot):
+      `sched_wakeup()` drops wakes for `THREAD_RUNNING` threads, and
+      `linuxkpi_thread_block()` published `THREAD_BLOCKED` after the
+      caller's condition check, so a wake racing that window was lost
+      (the drm_sched TDR kthread slept through the test's 2 s bound).
+      `struct thread` gained `kpi_block_pending`: every
+      `linuxkpi_wake_thread()` arms it and `linuxkpi_thread_block()`
+      exchanges it under the run-queue lock before publishing
+      `THREAD_BLOCKED` (same rendezvous as `kpi_wake_pending` for
+      `schedule_timeout`); a stale flag causes at most one spurious
+      wakeup.  Verified green by the boot above.
+- [ ] `p6-6a` tag: pending a commit of the C2 working tree (all C2 changes
+      are uncommitted in the maintainer's tree; the interactive session was
+      left untouched).
+- Next: C3 (6b) — flip the `kpi_amdgpu` probe-gate default to 1 and run
+      headless early init on the passed GPU (IP dump).  Every stub and
+      divergence added by C2 is in `docs/linuxkpi-gaps.md` (P6 C2).
+
+### C3 — 6b: early init on the real GPU (green 2026-09-13)
+
+- [x] Probe-gate default flipped to 1 (`linuxkpi/src/pci.c`); the registry
+      records the probe attempt and its return value, so the suite can
+      check a failed-and-unbound probe.  `kpi_amdgpu=0` remains the
+      one-line revert.
+- [x] Gate-on boot on the passed Raphael (`kpi_vfio_test=1`, gate default
+      1): `ATOM BIOS: 102-RAPHAEL-008`, complete 10-block IP dump
+      (`nv_common, gmc_v10_0, navi10_ih, psp, smu, dm, gfx_v10_0,
+      sdma_v5_2, vcn_v3_0, jpeg_v3_0`).  The discovery table pinned the
+      versions the C4 firmware set needs: **GC 10.3.6, MP0/MP1/MP2 13.0.5,
+      DMU/DCE 3.1.5, SDMA 5.2.6, VCN 3.1.2, UMC 9.5.0, DF 4.0.1** (plus
+      THM 13.0.4, SMUIO 13.0.10, NBIF 7.3.0, ...).
+- [x] Clean failure path: with firmware not yet staged, psp/dm/gfx/vcn
+      early_init return `-ENODEV` (`amdgpu_ucode_request()` remaps a failed
+      `request_firmware()`), `amdgpu_device_ip_early_init()` returns
+      `-ENODEV`, and the driver core unbinds — `Fatal error during GPU
+      init`, `finishing device`, no hang.  `test_phase6_link.c` asserts the
+      C3 half ("probe ran + BAR5 mapped"): `link gate on reached early init
+      (BAR5 mapped)`, `probe result -19 (firmware and rings land in C4)`.
+- [x] Hang fixed (found by the first debug C3 boot): the vkms `atomic
+      disable` commit froze CPU3 in `drm_crtc_vblank_off()` →
+      `hrtimer_cancel()` from atomic context, and `drm.debug=0x1ff`
+      exposed `%.*s`/flag argument-desync faults in the native `vsnprintf`.
+      `linuxkpi/src/timer.c` (atomic-context cancel) and `src/lib/string.c`
+      (formats) fixed both; post-fix boots (`p6-panic.log`,
+      `p6-linger.log`, `p6-desktop.log`) are **249 `[  OK  ]` / 0
+      `[FAIL]`** to login, including the full vkms enable/vblank/disable
+      sequence and the link suite.  Pre-fix hang log: `p6-c3.log`.
+- [x] IP pinning: the C3 dump selects the C4 firmware set — see the C4
+      manifest entry below; notably there is no SMU blob for 13.0.5
+      (`smu_v13_0_5_ppt_funcs` omits `.init_microcode`, so
+      `smu_init_microcode()` is a no-op) and no `_sos` (TOC-based PSP).
+- [ ] Evidence-only leftovers: re-run the plan's exact debug command
+      (`drm.debug=0x1ff`) on the fixed build for a clean
+      `p6-c3-postfix.log`, and one `kpi_amdgpu=0` boot to re-confirm the
+      gate-off revert path.
+- [ ] `p6-6b` tag pending a commit of the C2+C3 working tree.
+
+### C4 — 6c: firmware + PSP/SMU/GMC/IH + rings (in progress 2026-09-13)
+
+- [x] Firmware manifest pinned: `scripts/linux/firmware-manifest.txt` lists
+      the 11 Raphael blobs verified against **linux-firmware 20260910**
+      (the default `LINUX_FIRMWARE_REF`): `gc_10_3_6_{ce,me,mec,mec2,pfp,
+      rlc}`, `psp_13_0_5_{toc,ta}`, `sdma_5_2_6`, `vcn_3_1_2`,
+      `dcn_3_1_5_dmcub`.
+- [x] Staging wired: `scripts/linux-firmware-install.sh` now also accepts a
+      plain firmware tree (`LINUX_FIRMWARE_SRC=/lib/firmware`, distro
+      `.zst`/`.xz` members are decompressed), and emits
+      `build/firmware/kpi_fw_manifest.h` (name/size/zlib CRC per blob).
+      The top GNUmakefile depends on the staging stamp and installs
+      `build/firmware/lib/firmware` into the disk image at `/lib/firmware`;
+      the P5 `test_fw.bin` blob is kept.
+- [x] Boot-time provenance check: `test_phase5_firmware.c` re-reads every
+      staged blob through `request_firmware()` and compares size + CRC32
+      against the generated manifest (`[SKIP]` when no firmware is staged,
+      so fresh checkouts still build and boot).
+- [x] The loader logs any missing name it is asked for
+      (`linuxkpi/src/firmware.c`), so the next gate-on serial lists every
+      blob the driver requests that the manifest missed.
+- [x] First gate-on boot with firmware staged (maintainer-run, 2026-09-13):
+      early init passed (no `-19`), VRAM/GART came up (`amdgpu: 512M of VRAM
+      memory ready`, `PCIE GART of 1024M enabled`), `Loading DMUB firmware
+      via PSP: version=0x05003300`, `Found VCN firmware Version ENC: 1.33
+      DEC: 4 VEP: 0 Revision: 15` — then the PSP ring fence never advanced
+      (`psp gfx command UNKNOWN CMD(0x0)`, `Failed to load toc`, `PSP tmr
+      init failed!`, `hw_init of IP block <psp> failed -22`).  Root cause
+      (gap log P6 C4): zeroed `boot_cpu_data` made `boot_cpu_has()` answer
+      "no", so `amdgpu_passthrough()` stayed false under VFIO and the APU
+      skipped its HDP flushes and VRAM-aperture handling.  Fix:
+      `linuxkpi_x86_cpu_init()` (`x86_stubs.c`) called from
+      `kernel/src/kernel.c`.
+- [x] CPU-feature fix verified on the second gate-on boot (maintainer-run,
+      2026-09-13): `X86_FEATURE_HYPERVISOR set`, `Detected VRAM RAM=512M,
+      BAR=256M`, `reserve 0xa00000 from 0xf41e000000 for PSP TMR`, `RAS/RAP/
+      SECUREDISPLAY ta ucode is not available` (optional), `SMU is
+      initialized successfully!`, `Display Core v3.2.247 initialized on DCN
+      3.1.5`, `DMUB hardware initialized: version=0x05003300`.  PSP, SMU and
+      DMUB all come up; the probe works and is slow (minutes), not hung.
+- [x] Initcall wait raised again for the working-but-slow probe: 30 s → 120 s
+      → **10 min** with a "still running" line every 30 s and a completion
+      timing line (`linuxkpi/src/initcalls.c`).  On the second boot the 120 s
+      bound expired, the suites overlapped the still-probing GPU and the VFIO
+      suite lost its MSI vectors (`-16`) even though amdgpu later bound
+      (`link gate on binds the passed GPU to amdgpu`).  The next boot will
+      report `initcalls completed in N s`.
+- [x] Found and fixed the firmware-CRC-test `[SKIP]`: the generated
+      `kpi_fw_manifest.h` include was on the global `CPPFLAGS`, but the
+      LinuxKPI tests compile with `LINUX_CPPFLAGS` (kernel/GNUmakefile); the
+      include moved there.
+- [x] Third gate-on boot (maintainer-run, 2026-09-13): firmware provenance
+      green — `[  OK  ] LinuxKPI: fw 11 staged amdgpu blobs match host CRC`.
+      The probe failed in 0.6 s (`initcalls completed in 0.608 s`) at
+      `PSP create ring failed!` / `hw_init of IP block <psp> failed -22`:
+      the device was still warm from the previous successful run (PSP SOS
+      left running; QEMU does not reset the iGPU between VMs).  The reset
+      recipe and clean-shutdown practice are now in
+      `docs/amdgpu-testing.md`.  Not a code failure.
+- [x] `make run-c4` target added (bakes
+      `kpi_vfio_test=1 kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.dc=0`, headless,
+      `build/logs/p6-c4.log`); `KERNEL_CMDLINE` is now stamped so changing it
+      rebuilds the ISO instead of silently reusing the old cmdline.
+      First `run-c4` boot honored all of it: no `<dm>` block, no Display
+      Core/DMUB, probe failed fast at `PSP create ring failed!` because the
+      previous (Ctrl-C'd) DCN run left the PSP warm.  The failure teardown
+      destroys the old ring, so the next boot is expected to proceed —
+      alternating fail/success is the observed pattern with the current
+      host-side warm-state handling.
+- [x] **`usleep_range()` precision fix (2026-09-13)**: `usecs_to_jiffies()`
+      rounds up, so the old `schedule_timeout(usecs_to_jiffies(min))` turned
+      every sub-millisecond request into one jiffy (1 ms).  Over-sleeping,
+      not returning early - it is **not** the `AUTOLOAD_RLC` reason.  The
+      call now sleeps the whole-millisecond part and spins the tail on the
+      TSC (returns after `min`, never before).  `linuxkpi/src/time.c`.
+- [ ] **C4 blocker: the PSP GFX autoload does not bring up the CP/MEC.**
+      Cold device: `psp gfx command AUTOLOAD_RLC(0x21) failed and response
+      status is (0xFFFF000D)` then `rlc autoload: gc ucode autoload timeout`.
+      Warm device (`p6-c4.log`): no warning and the RLC wait passes, but
+      `ring kiq_0.2.1.0 test failed (-110)` / `KCQ enable failed`.  Same net
+      effect: the MEC never executes.  `make run-c4` now bakes
+      `drm.debug=0x1ff`, so the next boot logs every firmware load and the
+      autoload result (`build/logs/p6-c4.log`) - start the diagnosis there.
+      Firmware staging is ruled out: every staged blob is byte-identical to
+      the host's decompressed linux-firmware member.
+- [ ] **Temporary KIQ diagnostics in the imported tree** (remove at C4 exit):
+      `kernel/linux/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c` now prints
+      `kpi-kiq:` lines (HQD active/doorbell registers after activation, global
+      CP/RLC state after `gfx_v10_0_kiq_resume`, `CP_MEC_CNTL`/`CP_STAT` after
+      the MEC unhalt) and `kpi-kiq-test:` lines with the ring's wptr/doorbell/
+      GPU/MQD addresses plus (v2) the HQD-side wptr/rptr under GRBM selection,
+      the doorbell aperture readback and the GART PTE for the ring.  This is a
+      debug-only divergence; revert by re-running the import.
+- [x] **Doorbell-path diagnosis (2026-09-13)**.  The IP dump says
+      `NBIF v7.3.0`, so the driver uses `nbio_v7_2_funcs` (not v7.9); its
+      aperture register `RCC_DEV0_EPF0_0_RCC_DOORBELL_APER_EN` (base idx 2)
+      read back **1** at the failure.  `BIFC_DOORBELL_ACCESS_EN_PF`
+      (`0xcf6e`, base idx 8) belongs to the 7.9 file and is not programmed on
+      this ASIC - the earlier `access_en=0` reading was a red herring.
+      What remains: the KIQ HQD is active and correctly programmed
+      (`pq_base=0x6000`, `dbctl=0x40000000` right after init), the GART PTE
+      is valid, yet at the test the HQD shows no doorbell activity and the
+      ring packet is never fetched.
+- [ ] **Candidate fix under test - selfring aperture before CP init**:
+      `soc21_common_hw_init()` now calls `enable_doorbell_selfring_aperture()`
+      right after the BAR aperture enable.  Upstream defers the selfring to
+      `soc21_common_late_init()` (which runs *after* the KIQ ring test) purely
+      because a successful FB BAR resize can move the aperture; this build
+      never resizes (APU), and the selfring base is the guest-assigned BAR2
+      address - if BAR2 doorbells are synthesized through the selfring
+      window, the pre-init programming is what makes them work under VFIO.
+      The late_init call remains (idempotent).
+- [x] **C4 milestone: the PSP/SMU/GFX bring-up completes and amdgpu initializes
+  (2026-09-13).** The selfring-aperture ordering fix (below) made the KIQ
+  ring test pass: `hqd wptr=100 rptr=100`, all eight KCQ tests passed, VCN
+  decode/encode and JPEG initialized, and the driver registered
+  `Initialized amdgpu 3.54.0 20150101 for 0000:00:03.0 on minor 2`
+  (`/dev/dri/card2`, `renderD129`). The `kpi-kiq:` diagnostics were removed
+  afterwards (failure-only dumps remain).
+- [x] **Diagnostic regression fixed (2026-09-13 17:32)**: trimming the
+  diagnostic block had accidentally dropped `amdgpu_ring_commit(ring)` from
+  `gfx_v10_0_ring_test_ring()`, so the two boots after the milestone run
+  never rang a doorbell (`kpi-kiq-test: ... wptr=67 ... hqd=1/0/0/40000000`)
+  and were invalid for the C4 diagnosis.  The call is restored; the file now
+  differs from pristine 6.6.156 only by the two failure-only diagnostic
+  blocks.  The `soc21.c` selfring change is unchanged.
+- [x] **Ring content and mapping verified (2026-09-13 17:37 boot)**: the
+  CPU mapping physical page equals the GART PTE address
+  (`cpu_pa=7a600000 == pte&~0xfff`) and `ring[0]=0xc006a000` is exactly
+  `PACKET3(SET_RESOURCES, 6)` (`0xC0000000 | (0xA0<<8) | (6<<16)`), so the
+  driver writes and the GPU view agree.  The flaky part is
+  `CP_HQD_PQ_DOORBELL_CONTROL`: it reads back `0xc0000000` (EN+HIT) in
+  passing boots and `0` in failing boots - the DOORBELL_EN bit is lost
+  after `gfx_v10_0_kiq_resume()` programs the HQD, most likely because that
+  runs before `gfx_v10_0_cp_compute_enable(true)` starts the MEC.
+- [ ] **GFXOFF hypothesis and cmdline-only test (17:40 build)**: the
+  doorbell re-program after the MEC unhalt did **not** survive the boot
+  (`dbctl=0` at test time again), so the clobber is not an ordering issue
+  around `kiq_resume` - it is power related.  `GFX_OFF_DELAY_ENABLE` is only
+  100 ms and `PP_GFXOFF_MASK` is set in the default `amdgpu_pp_feature_mask`
+  (`0xfff7bfff`); GFX power gating loses the MEC/KIQ HQD programming and
+  kills the doorbell.  `run-c4` now bakes
+  `amdgpu.ppfeaturemask=0xfff73fff` (clears bit 15) so GFXOFF is a no-op -
+  no code change.  If the KIQ test is green consistently with this, the fix
+  is to keep GFXOFF off during bring-up (boot default or managed patch) and
+  revisit GFXOFF-aware handling later.
+- [ ] **GFX ring IB test times out** in
+  `amdgpu_device_delayed_init_work_handler()` (~1 s timeout):
+  `*ERROR* IB test failed on gfx_0.0.0 (-110)` then
+  `*ERROR* ib ring test failed (-110)`.  The scratch ring test during
+  hw_init passed, so the CP executes direct ring packets; the IB test needs
+  the drm_sched job + indirect-buffer fetch + fence signalling.  A
+  failure-only `kpi-ib:` dump prints fence/wb state (`wb=deadbeef` means the
+  CP ran the IB and only signalling failed; `wb=cafedead` means the IB never
+  executed).  Reached only in boots where the KIQ test passes.
+- [ ] **`kpi_vfio_test=1` now conflicts with a bound amdgpu** in `run-c4`:
+  the Phase 5 VFIO suite runs after initcalls and fails
+  `pci_alloc_irq_vectors(1) (-16)` because amdgpu owns the MSI vectors
+  (`[FAIL] vfio suite had 1 failure(s)`).  Once the IB test passes, drop
+  `kpi_vfio_test=1` from `run-c4` (C4+ boots own the device).
+- [ ] Open regression to watch: one earlier boot failed the Phase 3 suite
+      with `[FAIL] vkms GEM loop PMM drift 1 pages on the warm second pass
+      (first-pass immediate 0)` — the first vkms GEM-loop failure seen.  It
+      was green in the `run-c4` boot above; if it reappears, treat it as a
+      real page leak (possibly from the failed amdgpu probe) and bisect.
+- [ ] Re-run the gate-on boot (reset the GPU first, see
+      `docs/amdgpu-testing.md`) and follow PSP → SOS/TA → GMC/IH →
+      SDMA/GFX ring tests; then the firmware-less failure path and a
+      gate-off regression.  Use `make run-c4`: it bakes
+      `kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.dc=0` (no C6 display block),
+      goes headless and captures `build/logs/p6-c4.log`.
+
 ## Cross-phase notes
 
 - `run-vfio` (BDF default `0000:0e:00.0`) has not been booted with the GPU

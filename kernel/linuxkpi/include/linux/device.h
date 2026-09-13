@@ -24,6 +24,7 @@
 #include <linux/mutex.h>
 #include <linux/irqreturn.h>
 #include <linux/pm.h>
+#include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
@@ -90,6 +91,7 @@ struct device {
   u64 dma_mask;          /* DMA addressing limit (linuxkpi/dma-mapping.c) */
   u64 coherent_dma_mask; /* coherent allocation addressing limit           */
   struct device_dma_parameters dma_parms;
+  bool removable; /* dev_is_removable() consumers (stock device.h) */
   struct list_head devres_head;
   struct list_head kpi_list; /* global created-device list (device_destroy) */
   char kpi_name[48];
@@ -310,5 +312,41 @@ void devm_memunmap(struct device *dev, void *addr);
 int devm_request_irq(struct device *dev, unsigned int irq,
                      irqreturn_t (*handler)(int, void *), unsigned long irqflags,
                      const char *devname, void *dev_id);
+
+/* Shape-only pieces stock <linux/device.h> provides that imported drivers
+ * use.  Removability/PM flags are inert (no hotplug, no runtime PM). */
+enum device_removable {
+  DEVICE_REMOVABLE_NOT_SUPPORTED = 0,
+  DEVICE_REMOVABLE_UNKNOWN,
+  DEVICE_REMOVABLE,
+};
+
+static inline bool dev_is_removable(struct device *dev) {
+  return dev->removable == DEVICE_REMOVABLE;
+}
+
+static inline void dev_pm_set_driver_flags(struct device *dev, u32 flags) {
+  (void)dev;
+  (void)flags;
+}
+
+#define ATTRIBUTE_GROUPS(name)                                                 \
+  static const struct attribute_group name##_group = {                         \
+      .attrs = name##_attrs,                                                   \
+  };                                                                           \
+  static const struct attribute_group *name##_groups[] = {&name##_group, NULL}
+
+#define dev_WARN(dev, fmt, ...) dev_warn(dev, fmt, ##__VA_ARGS__)
+#define dev_WARN_ONCE(dev, condition, fmt, ...)                                \
+  do {                                                                        \
+    if (condition)                                                             \
+      dev_warn(dev, fmt, ##__VA_ARGS__);                                       \
+  } while (0)
+#define dev_err_ratelimited(dev, fmt, ...) dev_err(dev, fmt, ##__VA_ARGS__)
+#define dev_dbg_ratelimited(dev, fmt, ...) dev_dbg(dev, fmt, ##__VA_ARGS__)
+
+int device_create_file(struct device *dev, const struct device_attribute *attr);
+void device_remove_file(struct device *dev,
+                        const struct device_attribute *attr);
 
 #endif /* __AVORY_LINUXKPI_DEVICE_H */

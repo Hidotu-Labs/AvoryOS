@@ -38,6 +38,32 @@ static inline void *kmap_local(struct page *page) {
 }
 static inline void kunmap_local(const void *addr) { (void)addr; }
 
+/* Upstream highmem.h helpers; kept here because AvoryOS replaces the stock
+ * header.  All pages are HHDM-mapped, so no flush is needed (x86 coherent).
+ * VM_BUG_ON bounds checks are omitted (no VM debugging). */
+static inline void memcpy_from_page(char *to, struct page *page, size_t offset,
+                                    size_t len) {
+  char *from = kmap_local_page(page);
+
+  __builtin_memcpy(to, from + offset, len);
+  kunmap_local(from);
+}
+
+static inline void memcpy_to_page(struct page *page, size_t offset,
+                                  const char *from, size_t len) {
+  char *to = kmap_local_page(page);
+
+  __builtin_memcpy(to + offset, from, len);
+  kunmap_local(to);
+}
+
+static inline void memzero_page(struct page *page, size_t offset, size_t len) {
+  char *addr = kmap_local_page(page);
+
+  __builtin_memset(addr + offset, 0, len);
+  kunmap_local(addr);
+}
+
 static inline void *kmap_atomic(struct page *page) {
   return page_address(compound_head(page));
 }

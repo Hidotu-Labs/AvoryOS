@@ -272,7 +272,21 @@ static bool test_formats(void) {
     return false;
 
   pv_helper(buf, sizeof(buf), "val=%d", 42);
-  return strcmp(buf, "pre val=42 post") == 0;
+  if (strcmp(buf, "pre val=42 post") != 0)
+    return false;
+
+  /* "%.*s" (precision from an argument) is what stock drm_printf_indent()
+   * prepends; if the parser does not consume the precision and string
+   * arguments, the following %s reads an integer and faults (seen at C3). */
+  snprintf(buf, sizeof(buf), "%.*sallocated by = %s", 2, "\t\t\t\t\tX",
+           "kpi/tests");
+  if (strcmp(buf, "\t\tallocated by = kpi/tests") != 0)
+    return false;
+
+  /* '+'/' '/'#' flags must be consumed too: an unrecognized flag consumes
+   * no argument and shifts every later conversion the same way. */
+  snprintf(buf, sizeof(buf), "%+d %#x % d %05d", 5, 0x2a, 7, -3);
+  return strcmp(buf, "+5 0x2a  7 -0003") == 0;
 }
 
 /* ── bitmap / kstrtox ───────────────────────────────────────────────────── */

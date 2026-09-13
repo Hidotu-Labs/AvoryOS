@@ -190,6 +190,23 @@ if [ -f "$GEN_SRC/asm-offsets.h" ]; then
         "$DEST/arch/x86/include/generated/asm-offsets.h"
 fi
 
+# <asm/unistd_64.h> is a Kbuild product (scripts/syscallhdr.sh parsing
+# arch/x86/entry/syscalls/syscall_64.tbl); generate it so <asm/unistd.h> and
+# anything that includes it resolve.  Only the 64-bit/common ABIs are emitted.
+if [ -f "$SRC_DIR/arch/x86/entry/syscalls/syscall_64.tbl" ]; then
+    mkdir -p "$DEST/arch/x86/include/generated/uapi/asm"
+    awk '$2 == "common" || $2 == "64" { printf "#define __NR_%s %s\n", $3, $1 }' \
+        "$SRC_DIR/arch/x86/entry/syscalls/syscall_64.tbl" \
+        > "$DEST/arch/x86/include/generated/uapi/asm/unistd_64.h"
+    awk '$2 == "x32" { printf "#define __NR_%s (0x40000000 + %s)\n", $3, $1 }' \
+        "$SRC_DIR/arch/x86/entry/syscalls/syscall_64.tbl" \
+        > "$DEST/arch/x86/include/generated/uapi/asm/unistd_64_x32.h"
+    awk '$2 == "i386" { printf "#define __NR_%s %s\n", $3, $1 }' \
+        "$SRC_DIR/arch/x86/entry/syscalls/syscall_32.tbl" \
+        > "$DEST/arch/x86/include/generated/uapi/asm/unistd_32_ia32.h" 2>/dev/null || true
+    log "generated arch/x86/include/generated/uapi/asm/unistd_64.h (+x32/ia32)"
+fi
+
 # Kbuild-generated asm-generic wrappers for both the kernel and UAPI include
 # trees (see the gen_asm_wrappers comment above).  These are what make
 # <asm/types.h>, <asm/io.h>, <asm/div64.h> ... resolve on x86.
@@ -232,6 +249,19 @@ tag=$TAG
 commit=$COMMIT
 imported=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
+
+# ── Generate the Kbuild-derived amdgpu object list (Phase 6) ─────────────────
+# The amdgpu tree's Makefiles are evaluated (not hand-curated) so the object
+# list, include paths and per-file flags stay in sync with the pinned tree.
+# Runs after the pin is written so the generated header records the tag.
+command -v python3 >/dev/null 2>&1 || die "python3 is required by kbuild-subset.py"
+log "generating kernel/linux/Makefile.kbuild from the pinned Kbuild fragments"
+python3 "$ROOT/scripts/linux/kbuild-subset.py" \
+    --tree "$DEST" \
+    --config "$GEN_SRC/autoconf.h" \
+    --out "$DEST/Makefile.kbuild" \
+    --report "$DEST/kbuild-report.txt" \
+    || die "kbuild-subset.py failed"
 
 log "done: kernel/linux @ $TAG ($COMMIT)"
 log "build the kernel with: make -C kernel"

@@ -215,5 +215,7 @@ void *kvmalloc_array(size_t num, size_t size, gfp_t flags);
 void *kvcalloc(size_t num, size_t size, gfp_t flags);
 void kvfree(const void *ptr);
 void kvfree_sensitive(const void *ptr, size_t len);
+/* Reallocate a kvmalloc() buffer, growing only (upstream mm/util.c). */
+void *kvrealloc(const void *p, size_t oldsize, size_t newsize, gfp_t flags);
 
 #endif /* __AVORY_LINUXKPI_SLAB_H */

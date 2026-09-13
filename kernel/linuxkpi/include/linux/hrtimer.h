@@ -33,11 +33,9 @@ enum hrtimer_mode {
 
 /* Upstream's node is an rbtree node (timerqueue_node).  AvoryOS keeps the
  * expiry list as a sorted list, but keeps the `node.expires` member path that
- * callers such as vkms use. */
-struct timerqueue_node {
-  struct list_head node; /* Avory: sorted-list link, not an rb_node */
-  ktime_t expires;
-};
+ * callers such as vkms use.  The type comes from the timerqueue.h overlay so
+ * stock rtc.h and this header cannot redefine it. */
+#include <linux/timerqueue.h>
 
 struct hrtimer {
   struct timerqueue_node node;
@@ -45,6 +43,10 @@ struct hrtimer {
   int queued;
   int clock_id;
   volatile int running;
+  /* Set by hrtimer_cancel() in atomic context: the in-flight callback must
+   * not be waited for (threaded callbacks can ABBA on the caller's locks),
+   * and the callback loop must not re-enqueue it on HRTIMER_RESTART. */
+  volatile int cancel_pending;
 };
 
 #define hrtimer_cb_get_time(timer) ktime_get()

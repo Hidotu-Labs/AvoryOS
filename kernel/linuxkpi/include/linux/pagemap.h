@@ -11,6 +11,7 @@
 
 #include <linux/fs.h>
 #include <linux/mm.h>
+#include <linux/uaccess.h>
 #include <linux/pagevec.h>
 
 /* Mapping GFP helpers (upstream pagemap.h). */

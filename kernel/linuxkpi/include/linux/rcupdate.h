@@ -22,6 +22,15 @@ void __kpi_rcu_read_unlock(void);
 #define rcu_read_lock() __kpi_rcu_read_lock()
 #define rcu_read_unlock() __kpi_rcu_read_unlock()
 
+/* Lockdep/RCU assertion helpers.  AvoryOS has no lockdep and its readers are
+ * tracked by a nesting counter, so the "am I in a read-side section?" probes
+ * report 1 like upstream does when PROVE_RCU is off.  Implementations in
+ * linuxkpi/src/rcu.c. */
+int rcu_read_lock_held(void);
+int rcu_read_lock_bh_held(void);
+int rcu_read_lock_sched_held(void);
+int rcu_read_lock_any_held(void);
+
 #define rcu_dereference(p) READ_ONCE(p)
 #define rcu_dereference_raw(p) READ_ONCE(p)
 #define rcu_dereference_check(p, c) ((void)(c), READ_ONCE(p))
@@ -71,5 +80,13 @@ void linuxkpi_rcu_init(void);
   list_for_each_entry_safe(pos, n, head, member)
 #define hlist_for_each_entry_rcu(pos, head, member)                           \
   hlist_for_each_entry(pos, head, member)
+
+/* RCU lockdep assertion (upstream rcupdate.h): no lockdep here, so it is a
+ * no-op that still consumes its arguments. */
+#define RCU_LOCKDEP_WARN(c, s)                                                 \
+  do {                                                                         \
+    (void)(c);                                                                 \
+    (void)(s);                                                                 \
+  } while (0)
 
 #endif /* __AVORY_LINUXKPI_RCUPDATE_H */

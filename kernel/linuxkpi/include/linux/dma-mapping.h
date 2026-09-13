@@ -13,14 +13,8 @@
 #include <linux/errno.h>
 #include <linux/device.h>
 #include <linux/scatterlist.h>
+#include <linux/dma-direction.h>
 #include <asm/barrier.h>
-
-enum dma_data_direction {
-  DMA_BIDIRECTIONAL = 0,
-  DMA_TO_DEVICE = 1,
-  DMA_FROM_DEVICE = 2,
-  DMA_NONE = 3,
-};
 
 #define DMA_MAPPING_ERROR (~(dma_addr_t)0)
 
@@ -94,6 +88,23 @@ static inline dma_addr_t dma_map_single(struct device *dev, void *ptr,
                                         enum dma_data_direction dir) {
   return dma_map_single_attrs(dev, ptr, size, dir, 0);
 }
+
+/* Segment/pressure helpers (identity-mapped DMA) and resource mapping for
+ * peer/device physical addresses (amdgpu_vram_mgr's VRAM mappings). */
+static inline void dma_set_max_seg_size(struct device *dev,
+                                        unsigned int size) {
+  (void)dev;
+  (void)size;
+}
+static inline bool dma_addressing_limited(struct device *dev) {
+  (void)dev;
+  return false;
+}
+dma_addr_t dma_map_resource(struct device *dev, phys_addr_t phys_addr,
+                            size_t size, enum dma_data_direction dir,
+                            unsigned long attrs);
+void dma_unmap_resource(struct device *dev, dma_addr_t addr, size_t size,
+                        enum dma_data_direction dir, unsigned long attrs);
 
 static inline void dma_unmap_single(struct device *dev, dma_addr_t addr,
                                     size_t size,

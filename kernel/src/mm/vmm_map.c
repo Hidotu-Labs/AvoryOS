@@ -13,9 +13,9 @@
 
 #define PHYS_TO_VIRT(p) ((void *)((uint64_t)(p) + pmm_get_hhdm_offset()))
 
-static rawspinlock_t vmm_lock = RAWSPINLOCK_INIT;
+static spinlock_t vmm_lock = SPINLOCK_INIT;
 
-rawspinlock_t *vmm_get_lock(void) { return &vmm_lock; }
+spinlock_t *vmm_get_lock(void) { return &vmm_lock; }
 
 /* Diagnostics used below and defined next to vmm_debug_walk() at the bottom
  * of the file.  Declared here so page-table teardown/split paths can log. */
@@ -42,14 +42,26 @@ static bool vmm_dbg_range_has_lapic(uint64_t base, uint64_t size) {
  * holder, how long it has been held and where it was taken from.  Uncontended
  * acquisitions cost no rdtsc and no extra atomic: the try-acquire below *is*
  * the acquisition, and the contended path is the one worth measuring.
+ *
+ * It is a spinlock_t rather than a rawspinlock for the same reason
+ * shootdown_lock is: syscalls run interruptible since C6, so an IRQs-on
+ * holder can be preempted by the tick mid-walk and then the next page fault
+ * on that CPU - which must reach the page tables through this lock - spins
+ * forever on a lock whose owner is not running.  Masking interrupts while
+ * the lock is held makes the holder non-preemptible; a waiter that had
+ * interrupts enabled still opens them while spinning, so it can answer a
+ * TLB shootdown IPI.  A held vmm_lock now delays the acknowledgement of an
+ * incoming shootdown until release instead of answering inside the critical
+ * section, which is bounded: nothing in a vmm_lock section sleeps or waits
+ * on another core.
  * -------------------------------------------------------------------------- */
 void vmm_lock_acquire_at(uint64_t caller_ip) {
-  if (rawspinlock_try_acquire(&vmm_lock)) {
+  if (spinlock_try_acquire(&vmm_lock)) {
     lockdiag_spot_take(LOCKDIAG_SPOT_VMM, 0, caller_ip);
     return;
   }
   uint64_t t0 = rdtsc();
-  rawspinlock_acquire(&vmm_lock);
+  spinlock_acquire(&vmm_lock);
   lockdiag_spot_take(LOCKDIAG_SPOT_VMM, rdtsc() - t0, caller_ip);
 }
 
@@ -116,7 +128,10 @@ static void vmm_drain_pending(void) {
 
 void vmm_lock_release(void) {
   lockdiag_spot_drop(LOCKDIAG_SPOT_VMM);
-  rawspinlock_release(&vmm_lock);
+  /* spinlock_release restores the caller's interrupt state before the drain
+   * runs, so the deferred shootdowns below execute in exactly the context
+   * that would have issued them inline. */
+  spinlock_release(&vmm_lock);
   vmm_drain_pending();
 }
 

@@ -25,6 +25,8 @@ enum kpi_param_type {
   KPI_PARAM_hexint,
   KPI_PARAM_charp,
   KPI_PARAM_string,
+  KPI_PARAM_bint,   /* bool written as an integer (amdgpu's int params) */
+  KPI_PARAM_ullong, /* unsigned long long (amdgpu's 64-bit params) */
 };
 
 struct kpi_param {
@@ -54,6 +56,11 @@ struct kpi_setup {
 
 #define module_param_named_unsafe(name, value, type, perm)                    \
   module_param_named(name, value, type, perm)
+
+/* The "unsafe" variants exist for kernel-doc/tooling metadata upstream; the
+ * runtime behavior is identical to the regular macros. */
+#define module_param_unsafe(name, type, perm)                                 \
+  module_param_named(name, name, type, perm)
 
 #define core_param(name, var, type, perm)                                     \
   module_param_named(name, var, type, perm)

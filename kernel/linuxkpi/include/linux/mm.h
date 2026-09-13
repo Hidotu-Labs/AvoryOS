@@ -18,6 +18,7 @@
 #include <linux/pfn.h>
 #include <linux/shrinker.h>
 #include <linux/mmap_lock.h>
+#include <linux/uaccess.h>
 #include <asm/page.h>
 #include <asm/pgtable.h>
 
@@ -27,6 +28,26 @@ struct sysinfo;
 /* Upstream mm.h provides these; imported TTM/DRM code uses them.  There is no
  * init-on-free poisoning in AvoryOS, so want_init_on_free() is constant. */
 static inline bool want_init_on_free(void) { return false; }
+
+/* Page <-> zone/node helpers: upstream keeps them in mm.h, which AvoryOS
+ * replaces; stock mmzone.h-based headers expect them (see mmzone.h overlay).
+ * Guarded macros so both paths agree without redefinition. */
+#ifndef folio_page_idx
+#define folio_page_idx(folio, p) ((p) - &(folio)->page)
+#endif
+#ifndef page_zone
+#define page_zone(page)                                                        \
+  (&NODE_DATA(page_to_nid(page))->node_zones[page_zonenum(page)])
+#endif
+#ifndef page_pgdat
+#define page_pgdat(page) NODE_DATA(page_to_nid(page))
+#endif
+#ifndef folio_zone
+#define folio_zone(folio) page_zone(&(folio)->page)
+#endif
+#ifndef folio_pgdat
+#define folio_pgdat(folio) page_pgdat(&(folio)->page)
+#endif
 
 bool set_page_dirty(struct page *page);      /* linuxkpi/src/mm_extra.c */
 void mark_page_accessed(struct page *page);  /* linuxkpi/src/mm_extra.c */
@@ -68,7 +89,23 @@ static inline unsigned long folio_pfn(struct folio *folio) {
 #define virt_to_pfn(kaddr) (__pa(kaddr) >> PAGE_SHIFT)
 #define pfn_to_virt(pfn) __va((phys_addr_t)(pfn) << PAGE_SHIFT)
 
+/* Upstream helpers: page_to_virt() is page_address() for kernel pages, and
+ * VM_ACCESS_FLAGS is the read/write/exec set (amdgpu_gem uses it). */
+#define page_to_virt(page) page_address(page)
+#define VM_ACCESS_FLAGS (VM_READ | VM_WRITE | VM_EXEC)
+
+/* Upstream mm.h helper (slab/bio paths use it); must come after pfn_to_page
+ * is declared because asm/page.h's virt_to_page() expands to it. */
+static inline struct page *virt_to_head_page(const void *x) {
+  return compound_head(virt_to_page(x));
+}
+
 bool is_vmalloc_addr(const void *x);
+
+/* RAM checks and the global page counters (page_is_ram is used by amdgpu's
+ * GMC setup; all PMM-managed RAM is "RAM" here). */
+int page_is_ram(unsigned long pfn);
+unsigned long totalram_pages(void);
 
 /* ------------------------------------------------------------------------- */
 /* kmap: all kernel memory is permanently mapped through the HHDM             */

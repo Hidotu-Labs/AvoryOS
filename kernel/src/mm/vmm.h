@@ -177,7 +177,7 @@ uint64_t vmm_get_vsyscall_page_phys(void);
 //
 // Prefer vmm_lock_acquire()/vmm_lock_release() below: this is only for code
 // that has to reason about the lock itself.
-rawspinlock_t *vmm_get_lock(void);
+spinlock_t *vmm_get_lock(void);
 
 // Instrumented acquisition of vmm_lock.  vmm_lock is the lock the page fault
 // handler also needs, so a holder that blocks while holding it stops every

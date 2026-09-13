@@ -74,4 +74,13 @@ int irq_set_affinity_notifier(unsigned int irq, void *notify);
 int irq_set_vcpu_affinity(unsigned int irq, void *vcpu_info);
 void irq_update_affinity_hint(unsigned int irq, const struct cpumask *m);
 
+/* AvoryOS has no softirq machinery, but imported headers index the upstream
+ * enum (softirq_to_name, tracepoints); keep the count available. */
+#define NR_SOFTIRQS 10
+
+/* amdgpu_irq.h/amdgpu_ras.h embed delayed_work fields; upstream interrupt.h
+ * users reach workqueue.h through their own includes, but the amdgpu headers
+ * rely on it transitively.  Keep the chain intact here. */
+#include <linux/workqueue.h>
+
 #endif /* __AVORY_LINUXKPI_INTERRUPT_H */

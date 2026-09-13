@@ -18,6 +18,9 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/atomic.h>
+#include <linux/uidgid.h>
+#include <linux/wait_bit.h>
+#include <uapi/linux/fs.h>
 #include <linux/errno.h>
 #include <linux/compiler.h>
 #include <linux/kdev_t.h>
@@ -105,11 +108,15 @@ struct inode {
   atomic_t i_count;
   spinlock_t i_lock;
   struct address_space *i_mapping;
+  unsigned long i_state; /* upstream inode state bits (I_NEW, ...) */
 };
 
 static inline void inode_set_bytes(struct inode *inode, loff_t n) {
   inode->i_bytes = (unsigned long)n;
 }
+
+/* Upstream fs.h helpers imported code uses. */
+typedef void *fl_owner_t;
 
 struct dentry {
   struct qstr d_name;
@@ -120,6 +127,10 @@ struct dentry {
   unsigned int d_flags;
   atomic_t d_count;
 };
+
+static inline struct inode *d_inode(const struct dentry *dentry) {
+  return dentry->d_inode;
+}
 
 struct dentry_operations {
   int (*d_revalidate)(struct dentry *, unsigned int);
@@ -224,5 +235,15 @@ int register_chrdev(unsigned int major, const char *name,
 void unregister_chrdev(unsigned int major, const char *name);
 
 struct file *file_clone_open(struct file *file);
+
+/* Inode state bits (upstream fs.h values); I_NEW marks an inode under
+ * construction. */
+#define __I_NEW 3
+#define I_NEW (1 << __I_NEW)
+
+/* Upstream fs.h default file_operations seek; AvoryOS files are seekable
+ * through the native layer, so this keeps the stock signature for drivers
+ * that publish it. */
+loff_t default_llseek(struct file *file, loff_t offset, int whence);
 
 #endif /* __AVORY_LINUXKPI_FS_H */

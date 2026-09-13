@@ -441,11 +441,18 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
 
         /* ---- Parse flags ---- */
         int left_align = 0;
+        int show_sign  = 0; /* '+' */
+        int space_sign = 0; /* ' ' */
+        int alt_form   = 0; /* '#' */
         char pad_char  = ' ';
 
-        while (*fmt == '-' || *fmt == '0') {
+        while (*fmt == '-' || *fmt == '0' || *fmt == '+' || *fmt == ' ' ||
+               *fmt == '#') {
             if (*fmt == '-') left_align = 1;
             if (*fmt == '0' && !left_align) pad_char = '0';
+            if (*fmt == '+') show_sign = 1;
+            if (*fmt == ' ') space_sign = 1;
+            if (*fmt == '#') alt_form = 1;
             fmt++;
         }
         /* Left-align overrides zero-pad */
@@ -469,9 +476,19 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
         int prec = -1; /* -1 means "not specified" */
         if (*fmt == '.') {
             fmt++;
-            prec = 0;
-            while (*fmt >= '0' && *fmt <= '9')
-                prec = prec * 10 + (*fmt++ - '0');
+            if (*fmt == '*') {
+                /* "%.*s" takes the precision from an argument (stock
+                 * drm_printf_indent() relies on it).  A negative value is
+                 * treated as "not specified", as in C. */
+                prec = va_arg(ap, int);
+                fmt++;
+                if (prec < 0)
+                    prec = -1;
+            } else {
+                prec = 0;
+                while (*fmt >= '0' && *fmt <= '9')
+                    prec = prec * 10 + (*fmt++ - '0');
+            }
         }
 
         /* ---- Parse length modifier ---- */
@@ -531,12 +548,14 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
                 /* Apply precision: minimum digit count */
                 int digits = n;
                 if (prec > digits) digits = prec;
-                int total = digits + (neg ? 1 : 0);
+                char sign = neg ? '-' : (show_sign ? '+' : (space_sign ? ' ' : 0));
+                int sign_len = sign ? 1 : 0;
+                int total = digits + sign_len;
 
                 if (!left_align && pad_char == '0') {
                     /* sign then zeros then digits */
-                    if (neg) EMIT('-');
-                    for (int i = total - (neg ? 1 : 0); i < width - (neg ? 1 : 0); i++)
+                    if (sign) EMIT(sign);
+                    for (int i = total - sign_len; i < width - sign_len; i++)
                         EMIT('0');
                     for (int i = digits - n; i > 0; i--) EMIT('0');
                     for (int i = 0; i < n; i++) EMIT(tmp[i]);
@@ -544,7 +563,7 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
                     /* build into a local array for emit_padded */
                     char full[80];
                     int  fi = 0;
-                    if (neg) full[fi++] = '-';
+                    if (sign) full[fi++] = sign;
                     for (int i = digits - n; i > 0; i--) full[fi++] = '0';
                     for (int i = 0; i < n; i++) full[fi++] = tmp[i];
                     pos = emit_padded(buf, size, pos, full, (size_t)fi,
@@ -575,13 +594,29 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap) {
                 int digits = n;
                 if (prec > digits) digits = prec;
 
+                /* '%#x'/'%#X' prefix "0x"; '%#o' ensures a leading zero. */
+                char prefix[2] = { 0, 0 };
+                int prefix_len = 0;
+                if (alt_form && val != 0) {
+                    if (base == 16) {
+                        prefix[0] = '0';
+                        prefix[1] = uppercase ? 'X' : 'x';
+                        prefix_len = 2;
+                    } else if (base == 8 && tmp[0] != '0') {
+                        prefix[0] = '0';
+                        prefix_len = 1;
+                    }
+                }
+
                 if (!left_align && pad_char == '0') {
-                    for (int i = digits; i < width; i++) EMIT('0');
+                    for (int i = 0; i < prefix_len; i++) EMIT(prefix[i]);
+                    for (int i = digits + prefix_len; i < width; i++) EMIT('0');
                     for (int i = digits - n; i > 0; i--) EMIT('0');
                     for (int i = 0; i < n; i++) EMIT(tmp[i]);
                 } else {
                     char full[80];
                     int  fi = 0;
+                    for (int i = 0; i < prefix_len; i++) full[fi++] = prefix[i];
                     for (int i = digits - n; i > 0; i--) full[fi++] = '0';
                     for (int i = 0; i < n; i++) full[fi++] = tmp[i];
                     pos = emit_padded(buf, size, pos, full, (size_t)fi,

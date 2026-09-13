@@ -29,6 +29,11 @@ unsigned long nsecs_to_jiffies(u64 n);
 static inline u64 nsecs_to_jiffies64(u64 n) {
   return (u64)nsecs_to_jiffies(n);
 }
+
+/* 64-bit tick count for code that must not worry about the 32-bit wrap
+ * (drm_dp_mst_topology uses it for AUX timeout bookkeeping).  Upstream
+ * exports this as a function; ours is the tracked counter. */
+static inline u64 get_jiffies_64(void) { return jiffies_64; }
 u64 jiffies_to_nsecs(const unsigned long j);
 
 #define time_after(a, b) ((long)((b) - (a)) < 0)

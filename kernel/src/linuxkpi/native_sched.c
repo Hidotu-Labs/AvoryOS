@@ -122,8 +122,32 @@ void linuxkpi_thread_block(void) {
   struct thread *t = sched_get_current();
   if (!t)
     return;
+
+  /* Same rendezvous as the timeout sleep: publish the blocking decision
+   * under the run-queue lock and consume a wake that raced the caller's
+   * condition check.  Without this, a waker that runs while this thread is
+   * still THREAD_RUNNING is ignored by sched_wakeup() (it only wakes
+   * BLOCKED/SLEEPING threads) and the wait would never be satisfied. */
+  struct cpu_info *cpu = cpu_get_current();
+  if (cpu)
+    spinlock_acquire(&cpu->queue_lock);
+  if (__atomic_exchange_n(&t->kpi_block_pending, false, __ATOMIC_ACQ_REL)) {
+    if (cpu)
+      spinlock_release(&cpu->queue_lock);
+    /* A wake already arrived: the caller re-checks its condition. */
+    return;
+  }
   t->state = THREAD_BLOCKED;
+  if (cpu)
+    spinlock_release(&cpu->queue_lock);
+
   sched_yield();
+
+  /* If no wake re-marked us runnable (e.g. the yield resumed us directly),
+   * do not stay marked blocked while running; sched_wakeup() would then try
+   * to enqueue a running thread for a later wake. */
+  if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING)
+    t->state = THREAD_RUNNING;
 }
 
 int linuxkpi_schedule_timeout_ms(unsigned long ms) {
@@ -207,9 +231,14 @@ void linuxkpi_wake_thread(void *thread) {
   if (!t)
     return;
 
-  /* Remember the wake even if the target is still running; see the field
-   * comment in sched.h.  Only timeout sleeps consume it, so waitqueue and
-   * kthread-start wakes stay out of the way. */
+  /* Arm the plain-block rendezvous for every wake: a waitqueue wait that is
+   * still running (about to call schedule()) consumes it in
+   * linuxkpi_thread_block() instead of losing the wake in sched_wakeup(). */
+  __atomic_store_n(&t->kpi_block_pending, true, __ATOMIC_RELEASE);
+
+  /* Remember the timeout wake even if the target is still running; see the
+   * field comment in sched.h.  Only timeout sleeps consume it, so waitqueue
+   * and kthread-start wakes stay out of the way. */
   if (__atomic_load_n(&t->kpi_timeout_active, __ATOMIC_ACQUIRE))
     __atomic_store_n(&t->kpi_wake_pending, true, __ATOMIC_RELEASE);
 

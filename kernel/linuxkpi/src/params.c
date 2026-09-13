@@ -112,6 +112,16 @@ static void param_set_value(const struct kpi_param *p, const char *val) {
     if (ok)
       *(unsigned long *)p->value = (unsigned long)l;
     break;
+  case KPI_PARAM_ullong:
+    l = kpi_parse_long(val, &ok);
+    if (ok)
+      *(unsigned long long *)p->value = (unsigned long long)l;
+    break;
+  case KPI_PARAM_bint:
+    l = kpi_parse_long(val, &ok);
+    if (ok)
+      *(int *)p->value = (int)l;
+    break;
   case KPI_PARAM_hexint:
     l = kpi_parse_long(val, &ok);
     if (ok)
@@ -158,6 +168,7 @@ static const char *setup_match(const char *token, const char *str) {
 static void token_dispatch(char *token) {
   char *eq = NULL;
   const char *val = NULL;
+  const char *dot;
 
   for (char *q = token; *q; q++) {
     if (*q == '=') {
@@ -186,6 +197,23 @@ static void token_dispatch(char *token) {
     if (strcmp(token, p->name) == 0) {
       param_set_value(p, val);
       return;
+    }
+  }
+
+  /* Accept the upstream `module.param=value` spelling.  The param table has
+   * no per-module scoping (KBUILD_MODNAME is a single constant for the whole
+   * kernel here), so after an exact miss retry with the suffix following the
+   * last '.'.  Param names must therefore stay unique across the linked
+   * modules; the table is small and audited (drm.debug, amdgpu.runpm, ...).
+   * Phase 6 C3 addition; see docs/linuxkpi-gaps.md. */
+  dot = strrchr(token, '.');
+  if (dot && dot[1]) {
+    for (const struct kpi_param *p = __kpi_param_start; p < __kpi_param_end;
+         p++) {
+      if (strcmp(dot + 1, p->name) == 0) {
+        param_set_value(p, val);
+        return;
+      }
     }
   }
 }

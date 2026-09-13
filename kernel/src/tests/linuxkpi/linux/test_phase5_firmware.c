@@ -3,14 +3,28 @@
  * Reads /lib/firmware/test_fw.bin, staged into the disk image by the
  * top-level build (a 4 KB file where byte i is (i * 7 + 3) & 0xff), and
  * checks the full size + content, the -ENOENT path and path-traversal
- * rejection.  This is the loader amdgpu's PSP/SMU blobs use from 6c on. */
+ * rejection.
+ *
+ * Phase 6 C4 adds the amdgpu manifest check: the staging pass
+ * (scripts/linux-firmware-install.sh) writes kpi_fw_manifest.h with the
+ * name/size/zlib-CRC of every blob it installed, and this suite re-reads
+ * each one through request_firmware() and compares.  Builds without
+ * firmware staged simply skip that half. */
 
+#include <linux/crc32.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/firmware.h>
 #include <linux/string.h>
 
 #include <linuxkpi/log.h>
+
+#if defined(__has_include)
+#  if __has_include(<kpi_fw_manifest.h>)
+#    include <kpi_fw_manifest.h>
+#    define P5F_HAVE_MANIFEST 1
+#  endif
+#endif
 
 #define P5F_SIZE 4096u
 
@@ -65,6 +79,36 @@ void linuxkpi_test_phase5_firmware(void) {
     p5f_ok("path traversal rejected");
   else
     p5f_fail("path traversal", ret);
+
+#ifdef P5F_HAVE_MANIFEST
+  {
+    int manifest_bad = 0;
+
+    for (i = 0; i < (unsigned int)KPI_FW_MANIFEST_COUNT; i++) {
+      const struct kpi_fw_manifest_entry *entry = &kpi_fw_manifest[i];
+
+      ret = request_firmware(&fw, entry->name, NULL);
+      if (ret == 0 && fw) {
+        u32 crc = crc32_le(~0u, fw->data, fw->size) ^ ~0u;
+
+        if (fw->size != entry->size || crc != entry->crc32) {
+          p5f_fail(entry->name, (long)crc);
+          manifest_bad++;
+        }
+        release_firmware(fw);
+        fw = NULL;
+      } else {
+        p5f_fail(entry->name, ret);
+        manifest_bad++;
+      }
+    }
+    if (manifest_bad == 0)
+      klogf("[  OK  ] LinuxKPI: fw %u staged amdgpu blobs match host CRC\n",
+            (unsigned int)KPI_FW_MANIFEST_COUNT);
+  }
+#else
+  klog_puts("[SKIP] LinuxKPI: fw amdgpu manifest not staged\n");
+#endif
 
   if (p5f_failures == 0)
     klog_puts("[  OK  ] LinuxKPI: fw suite complete\n");

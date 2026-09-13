@@ -60,13 +60,10 @@ static inline void sg_set_dma_address(struct scatterlist *sg,
   sg->dma_address = dma_address;
 }
 
-static inline dma_addr_t sg_dma_address(struct scatterlist *sg) {
-  return sg->dma_address;
-}
-
-static inline unsigned int sg_dma_len(struct scatterlist *sg) {
-  return sg->dma_length;
-}
+/* Upstream scatterlist.h exposes these as lvalues; amdgpu assigns through
+ * them (sg_dma_address(sg) = addr).  Macros, not functions. */
+#define sg_dma_address(sg) ((sg)->dma_address)
+#define sg_dma_len(sg) ((sg)->dma_length)
 
 static inline void sg_dma_mark_bus_address(struct scatterlist *sg) {}
 

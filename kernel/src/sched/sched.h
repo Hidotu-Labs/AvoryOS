@@ -174,6 +174,12 @@ struct thread {
    * timeout and turn it into an early return. */
   bool kpi_wake_pending;
   bool kpi_timeout_active;
+  /* KPI plain-block rendezvous (linuxkpi_thread_block()).  Armed by every
+   * linuxkpi_wake_thread() call and consumed under the run-queue lock before
+   * a thread publishes THREAD_BLOCKED, so a wake that races the condition
+   * check of a wait_event()/schedule() loop is not dropped by sched_wakeup()
+   * seeing THREAD_RUNNING.  A stale flag only causes one spurious wakeup. */
+  bool kpi_block_pending;
   struct thread *deadline_next; // Per-CPU ordered timeout queue link
   bool deadline_queued;
   struct fd_table *files;

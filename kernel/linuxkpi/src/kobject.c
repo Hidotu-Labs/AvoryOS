@@ -433,6 +433,20 @@ void device_remove_groups(struct device *dev,
     sysfs_remove_group(&dev->kobj, groups[i]);
 }
 
+/* Stock device.h entry points over a device's kobject. */
+int device_create_file(struct device *dev,
+                       const struct device_attribute *attr) {
+  if (!dev || !attr)
+    return -EINVAL;
+  return sysfs_create_file(&dev->kobj, &attr->attr);
+}
+
+void device_remove_file(struct device *dev,
+                        const struct device_attribute *attr) {
+  if (dev && attr)
+    sysfs_remove_file(&dev->kobj, &attr->attr);
+}
+
 /* ── kobjects ───────────────────────────────────────────────────────────── */
 
 int kobject_init_and_add(struct kobject *kobj, const struct kobj_type *ktype,
@@ -450,6 +464,72 @@ int kobject_init_and_add(struct kobject *kobj, const struct kobj_type *ktype,
   return 0;
 }
 
+void kobject_init(struct kobject *kobj, const struct kobj_type *ktype) {
+  if (!kobj)
+    return;
+  kobj->ktype = ktype;
+  INIT_LIST_HEAD(&kobj->entry);
+}
+
+int kobject_add(struct kobject *kobj, struct kobject *parent, const char *fmt,
+                ...) {
+  va_list args;
+
+  if (!kobj)
+    return -EINVAL;
+  kobj->parent = parent;
+  va_start(args, fmt);
+  vsnprintf(kobj->kpi_name, sizeof(kobj->kpi_name), fmt, args);
+  va_end(args);
+  kobj->name = kobj->kpi_name;
+  return 0;
+}
+
+/* Upstream lib/kobject.c provides kobj_sysfs_ops for kernfs-backed kobjects;
+ * AvoryOS kobjects are shapes, so the vtable is present but unused. */
+const struct sysfs_ops kobj_sysfs_ops = {NULL, NULL};
+
+void sysfs_remove_files(struct kobject *kobj,
+                        const struct attribute *const *ptr) {
+  int i;
+
+  if (!kobj || !ptr)
+    return;
+  for (i = 0; ptr[i]; i++)
+    sysfs_remove_file(kobj, ptr[i]);
+}
+
+/* Group-relative file registration: the native sysfs bridge places files on
+ * the kobject directory, so the group name is not modeled (documented). */
+int sysfs_add_file_to_group(struct kobject *kobj, const struct attribute *attr,
+                            const char *group) {
+  (void)group;
+  return sysfs_create_file(kobj, attr);
+}
+
+void sysfs_remove_file_from_group(struct kobject *kobj,
+                                  const struct attribute *attr,
+                                  const char *group) {
+  (void)group;
+  sysfs_remove_file(kobj, attr);
+}
+
+/* Managed group add/remove: the add is a plain sysfs_create_group and the
+ * remove is available explicitly; devres auto-removal is not wired because
+ * the native sysfs bridge owns attribute lifetimes (P5 C5 divergence). */
+int devm_device_add_group(struct device *dev,
+                          const struct attribute_group *grp) {
+  if (!dev || !grp)
+    return -EINVAL;
+  return sysfs_create_group(&dev->kobj, grp);
+}
+
+void devm_device_remove_group(struct device *dev,
+                              const struct attribute_group *grp) {
+  if (dev && grp)
+    sysfs_remove_group(&dev->kobj, grp);
+}
+
 void kobject_del(struct kobject *kobj) {
   (void)kobj;
 }
@@ -459,6 +539,51 @@ void kobject_put(struct kobject *kobj) {
 }
 
 struct kobject *kobject_get(struct kobject *kobj) { return kobj; }
+
+int kobject_set_name(struct kobject *kobj, const char *fmt, ...) {
+  va_list args;
+
+  if (!kobj)
+    return -EINVAL;
+  va_start(args, fmt);
+  vsnprintf(kobj->kpi_name, sizeof(kobj->kpi_name), fmt, args);
+  va_end(args);
+  kobj->name = kobj->kpi_name;
+  return 0;
+}
+
+/* kset bookkeeping: see the struct comment in the overlay.  amdgpu's
+ * discovery sysfs tree is created with these; nothing is materialized in the
+ * native sysfs tree, so registration only prepares the child list. */
+int kset_register(struct kset *kset) {
+  if (!kset)
+    return -EINVAL;
+  INIT_LIST_HEAD(&kset->list);
+  spin_lock_init(&kset->list_lock);
+  return 0;
+}
+
+void kset_unregister(struct kset *kset) {
+  if (kset)
+    INIT_LIST_HEAD(&kset->list);
+}
+
+struct kset *kset_create_and_add(const char *name,
+                                 const struct kset_uevent_ops *uevent_ops,
+                                 struct kobject *parent) {
+  struct kset *kset = kzalloc(sizeof(*kset), GFP_KERNEL);
+
+  if (!kset)
+    return NULL;
+  kset->uevent_ops = uevent_ops;
+  kset->kobj.parent = parent;
+  kset->kobj.name = name;
+  if (kset_register(kset)) {
+    kfree(kset);
+    return NULL;
+  }
+  return kset;
+}
 
 /* ── uevents ────────────────────────────────────────────────────────────── */
 

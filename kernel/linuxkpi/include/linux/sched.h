@@ -11,13 +11,18 @@
 
 #include <linux/capability.h>
 #include <linux/limits.h>
+#include <linux/mutex.h>
+#include <linux/pid.h>
 #include <linux/preempt.h>
 #include <linux/rbtree.h>
+#include <linux/refcount.h>
 #include <linux/timer.h>
 #include <linux/types.h>
 #include <linux/ktime.h>
 #include <linux/kernel.h>
 #include <asm/vdso/processor.h>
+#include <asm/processor.h>
+#include <uapi/linux/sched.h>
 #include <uapi/linux/signal.h>
 
 #ifndef NUMA_NO_NODE
@@ -52,7 +57,27 @@ struct task_struct {
    * leader and exit_code stays 0 unless a native exit hook sets it. */
   struct task_struct *group_leader;
   int exit_code;
+  /* Fields stock <linux/sched/task.h> touches: the RCU free head and the
+   * arch thread block (x86 thread_struct). */
+  struct rcu_head rcu;
+  struct thread_struct thread;
+  /* mm/oom/reclaim surface amdgpu touches (amdgpu_gem.c reads current->mm).
+   * There is no Linux mm, so mm/active_mm stay NULL and reclaim_state is a
+   * placeholder; usage is initialized so refcount helpers do not underflow. */
+  struct mm_struct *mm;
+  struct mm_struct *active_mm;
+  struct reclaim_state *reclaim_state;
+  refcount_t usage;
+  spinlock_t alloc_lock;
 };
+
+/* Process flags stock headers reference; only the one amdgpu uses is defined
+ * (upstream sched.h has the full PF_* set). */
+#define PF_KSWAPD 0x00040000
+
+/* Upstream sched.h: can this context sleep?  preempt_count() is the whole
+ * story here (no irqs_disabled() tracking in this predicate). */
+static inline int preemptible(void) { return preempt_count() == 0; }
 
 #define current ((struct task_struct *)linuxkpi_current_task())
 
@@ -69,11 +94,6 @@ static inline void *task_struct_to_thread(const struct task_struct *p) {
  * task_tgid() returns an opaque token built from the shadow's tgid. */
 static inline struct pid *task_tgid(const struct task_struct *p) {
   return (struct pid *)(unsigned long)((p ? p->tgid : 0) + 1);
-}
-static inline struct pid *get_pid(struct pid *pid) { return pid; }
-static inline void put_pid(struct pid *pid) { (void)pid; }
-static inline pid_t pid_nr(struct pid *pid) {
-  return pid ? (pid_t)((unsigned long)pid - 1) : 0;
 }
 
 static inline pid_t task_pid_nr(const struct task_struct *p) {

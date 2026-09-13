@@ -216,4 +216,10 @@ static inline bool folio_test_dirty(const struct folio *folio) {
   return test_bit(PG_dirty, (unsigned long *)&folio->page.flags);
 }
 
+/* Order-0 folios only: a folio is never "large" in AvoryOS. */
+static inline bool folio_test_large(const struct folio *folio) {
+  (void)folio;
+  return false;
+}
+
 #endif /* __AVORY_LINUXKPI_PAGE_FLAGS_H */

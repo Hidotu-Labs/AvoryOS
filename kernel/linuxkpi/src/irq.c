@@ -19,6 +19,7 @@
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/interrupt.h>
+#include <linux/irqdomain.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -288,3 +289,55 @@ void irq_update_affinity_hint(unsigned int irq, const struct cpumask *m) {
   (void)irq;
   (void)m;
 }
+
+/* ── IRQ domains (amdgpu_irq.c) ───────────────────────────────────────────
+ *
+ * AvoryOS has no irq_domain core; amdgpu creates one for its ACP interrupt
+ * sources (disabled here) and maps hwirq -> virq.  Stock <linux/irqdomain.h>
+ * provides irq_domain_add_linear()/irq_create_mapping() as inlines over the
+ * externs implemented here.  No real domain is created: mapping falls back to
+ * the hwirq number.  Real support is only needed if the ACP/domain path is
+ * ever enabled (docs/linuxkpi-gaps.md P6 C2). */
+struct irq_domain *__irq_domain_add(struct fwnode_handle *fwnode,
+                                    unsigned int size,
+                                    irq_hw_number_t hwirq_max, int direct_max,
+                                    const struct irq_domain_ops *ops,
+                                    void *host_data) {
+  (void)fwnode;
+  (void)size;
+  (void)hwirq_max;
+  (void)direct_max;
+  (void)ops;
+  (void)host_data;
+  return NULL;
+}
+
+void irq_domain_remove(struct irq_domain *domain) { (void)domain; }
+
+unsigned int irq_create_mapping_affinity(struct irq_domain *domain,
+                                         irq_hw_number_t hwirq,
+                                         const struct irq_affinity_desc *affinity) {
+  (void)domain;
+  (void)affinity;
+  return (unsigned int)hwirq;
+}
+
+int generic_handle_domain_irq(struct irq_domain *domain, unsigned int hwirq) {
+  (void)domain;
+  (void)hwirq;
+  return -EINVAL;
+}
+
+/* IRQ-chip registration is inert (the native IDT/vector layer owns dispatch);
+ * amdgpu_irq.c calls these for its optional ACP domain path.  Recorded in
+ * docs/linuxkpi-gaps.md (P6 C2). */
+void irq_set_chip_and_handler_name(unsigned int irq, struct irq_chip *chip,
+                                   irq_flow_handler_t handle,
+                                   const char *name) {
+  (void)irq;
+  (void)chip;
+  (void)handle;
+  (void)name;
+}
+
+void handle_simple_irq(struct irq_desc *desc) { (void)desc; }

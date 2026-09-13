@@ -52,4 +52,15 @@ static inline struct timespec64 ktime_to_timespec(const ktime_t kt) {
   return ktime_to_timespec64(kt);
 }
 
+/* Upstream ktime.h helper (used by amdgpu's fence/debug paths). */
+static inline s64 ktime_us_delta(const ktime_t later, const ktime_t earlier) {
+  return ktime_to_us(ktime_sub(later, earlier));
+}
+
+/* Fast/mono and wall-clock variants amdgpu timestamps with.  There is no
+ * clocksource split here: both return the monotonic nanosecond clock, and the
+ * wall clock is derived from it (no RTC offset). */
+u64 ktime_get_mono_fast_ns(void);
+time64_t ktime_get_real_seconds(void);
+
 #endif /* __AVORY_LINUXKPI_KTIME_H */

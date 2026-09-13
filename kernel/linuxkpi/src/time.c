@@ -66,6 +66,15 @@ u64 ktime_get_boottime_ns(void) { return ktime_get_ns(); }
 ktime_t ktime_get_raw(void) { return ktime_get(); }
 u64 ktime_get_raw_ns(void) { return ktime_get_ns(); }
 
+/* Fast/mono and wall-clock variants amdgpu timestamps with.  There is no
+ * clocksource split here: both return the monotonic nanosecond clock, and the
+ * wall clock is derived from it (no RTC offset). */
+u64 ktime_get_mono_fast_ns(void) { return ktime_get_ns(); }
+
+time64_t ktime_get_real_seconds(void) {
+  return (time64_t)(ktime_get_ns() / 1000000000ULL);
+}
+
 void schedule(void) { linuxkpi_thread_block(); }
 
 void yield(void) { schedule(); }
@@ -134,11 +143,39 @@ unsigned long msleep_interruptible(unsigned int msecs) {
   return time_before(jiffies, deadline) ? (deadline - jiffies) : 0;
 }
 
+/* usleep_range() precision: the native tick is 1 ms (HZ=1000), so the old
+ * shape - schedule_timeout(usecs_to_jiffies(min)) - rounded every
+ * sub-millisecond request UP to one jiffy.  That over-slept (e.g. the PSP
+ * fence loop's usleep_range(60, 100) slept ~1 ms per iteration, 10x its
+ * max) but never returned early, so it was not the AUTOLOAD_RLC failure.
+ * Sleep the whole-millisecond part on the scheduler, then spin out the tail
+ * on the calibrated TSC: the call now returns after `min` us (never before),
+ * matching upstream's range-sleep semantics. */
 void usleep_range(unsigned long min, unsigned long max) {
+  unsigned long long start, deadline, now;
+
   (void)max;
   if (min == 0)
     return;
-  schedule_timeout((long)usecs_to_jiffies((unsigned int)min));
+
+  start = linuxkpi_monotonic_ns();
+  if (!start) {
+    /* TSC not calibrated yet (cannot happen once the initcalls run). */
+    msleep((min + 999) / 1000);
+    return;
+  }
+
+  deadline = start + (unsigned long long)min * 1000ULL;
+
+  if (min >= 1000)
+    schedule_timeout((long)msecs_to_jiffies((unsigned int)(min / 1000)));
+
+  for (;;) {
+    now = linuxkpi_monotonic_ns();
+    if (now >= deadline)
+      break;
+    linuxkpi_udelay_ns(deadline - now);
+  }
 }
 
 void usleep_range_state(unsigned long min, unsigned long max,

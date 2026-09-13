@@ -138,4 +138,8 @@ static inline void pagefault_disable(void) { }
 static inline void pagefault_enable(void) { }
 static inline bool pagefault_disabled(void) { return false; }
 
+/* x86 passes addresses through unchanged (no LAM/5-level tagging to strip in
+ * this kernel); stock uaccess.h defines the same for such configs. */
+static inline unsigned long untagged_addr(unsigned long addr) { return addr; }
+
 #endif /* __AVORY_LINUXKPI_UACCESS_H */

@@ -21,8 +21,28 @@
  * Per-CPU TLB shootdown state
  * ------------------------------------------------------------------------- */
 
-/* Global lock for shootdown serialization (without disabling interrupts to avoid IPI deadlock). */
-static rawspinlock_t shootdown_lock = RAWSPINLOCK_INIT;
+/*
+ * Global lock for shootdown serialization.
+ *
+ * This used to be a rawspinlock, on the theory that a holder waiting for
+ * acknowledgements must stay interruptible.  That is backwards for the
+ * *holder*: since C6 made syscall dispatch interruptible (syscall_entry.asm
+ * runs sti), a timer tick can preempt a thread inside the ack wait, leave
+ * shootdown_lock held behind a thread that is no longer running, and the
+ * next CoW fault on that same CPU then spins here with interrupts masked
+ * from the exception gate - the holder can never be rescheduled on the only
+ * core that can run it.  Exactly that produced
+ * "cpu 0 stopped taking timer ticks ... WAITING-ON lock=shootdown_lock"
+ * with every other core idle.
+ *
+ * A spinlock_t masks interrupts from before the lock is won until release,
+ * so the holder cannot be preempted.  Waiters that arrive with interrupts
+ * enabled still open them while spinning (see spinlock_acquire), so a CPU
+ * that becomes a target of the current holder's IPI can still answer it
+ * while it waits for the lock.  The holder itself needs no interrupts - it
+ * is the initiator, and cpu_needs_shootdown() never targets self.
+ */
+static spinlock_t shootdown_lock = SPINLOCK_INIT;
 
 /* Per-CPU pending virtual address (written by initiator, read by target). */
 #define MAX_CPUS 64
@@ -502,7 +522,7 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t caller_ip) {
         return;
     }
 
-    rawspinlock_acquire(&shootdown_lock);
+    spinlock_acquire(&shootdown_lock);
 
     LOCKDIAG_STAT(shootdowns, 1);
     tlb_stat_add(&tlb_stats.shootdowns, 1);
@@ -619,7 +639,7 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t caller_ip) {
         }
     }
 
-    rawspinlock_release(&shootdown_lock);
+    spinlock_release(&shootdown_lock);
 }
 
 void tlb_shootdown_page(uint64_t addr) {

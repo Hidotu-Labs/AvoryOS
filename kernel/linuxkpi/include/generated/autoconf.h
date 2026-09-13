@@ -108,4 +108,35 @@
  * (implemented in linuxkpi/src/platform.c) instead of the -EINVAL inline. */
 #define CONFIG_HAS_IOMEM 1
 
+/* Phase 6 C1: amdgpu and the DRM helper libraries its Kconfig selects.
+ *
+ * The object list is generated from the pinned 6.6 Makefiles by
+ * scripts/linux/kbuild-subset.py; these symbols control both the generated
+ * list and the #if arms in the sources.  Deliberately absent (see
+ * docs/linuxkpi-gaps.md P6 C1): HWMON (weak stubs), POWER_SUPPLY (stock
+ * stub), INTERVAL_TREE (amdgpu_vm.c defines its own), PROC_FS, PERF_EVENTS,
+ * COMPAT, VGA_SWITCHEROO, HSA_AMD, DRM_AMD_ACP, DRM_AMDGPU_SI/CIK,
+ * HMM_MIRROR, DRM_AMD_SECURE_DISPLAY, DRM_FBDEV_EMULATION, DRM_DP_AUX_BUS. */
+#define CONFIG_DRM_AMDGPU 1
+#define CONFIG_DRM_AMD_DC 1
+#define CONFIG_DRM_AMD_DC_FP 1
+#define CONFIG_DRM_DISPLAY_HELPER 1
+#define CONFIG_DRM_DISPLAY_DP_HELPER 1
+#define CONFIG_DRM_DISPLAY_HDMI_HELPER 1
+#define CONFIG_DRM_DISPLAY_HDCP_HELPER 1
+#define CONFIG_DRM_BUDDY 1
+#define CONFIG_DRM_EXEC 1
+#define CONFIG_DRM_SUBALLOC_HELPER 1
+#define CONFIG_I2C_ALGOBIT 1
+
+/* Phase 6 C2: amdgpu_irq.c uses the IRQ domain API unconditionally, and x86
+ * provides arch_thread_struct_whitelist() (so the stock sched/task.h fallback
+ * must stay disabled). */
+#define CONFIG_IRQ_DOMAIN 1
+#define CONFIG_HAVE_ARCH_THREAD_STRUCT_WHITELIST 1
+
+/* The kernel boots up to 4 CPUs (tests run at -smp 4); stock headers size
+ * cpumasks and the percpu offset array from this. */
+#define CONFIG_NR_CPUS 4
+
 #endif /* __AVORY_LINUXKPI_AUTOCONF_H */

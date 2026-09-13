@@ -68,6 +68,9 @@ struct page {
   unsigned long private; /* Filesystem/driver private data (upstream type;   */
                          /* TTM stores an allocation order and a helper      */
                          /* pointer here)                                    */
+  /* dev_pagemap back-pointer.  ZONE_DEVICE is off, so it is only ever read
+   * by the stock memremap.h inline predicates; carried so they type-check. */
+  struct dev_pagemap *pgmap;
 } __attribute__((aligned(64)));
 
 /* Order-0 folios: a folio is a head page plus the guarantee that its mapping
@@ -77,6 +80,9 @@ struct page {
  * directly in the current import set (checked), so the layout this simple. */
 struct folio {
   struct page page;
+  /* Stock swap.h's page_swap_entry() reads folio->swap; there is no swap in
+   * AvoryOS, so the field is carried for the inline to type-check. */
+  swp_entry_t swap;
 };
 
 /* ------------------------------------------------------------------------- */

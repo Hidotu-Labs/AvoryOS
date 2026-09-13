@@ -113,6 +113,17 @@ static int wait_thread(void *arg) {
   return 0;
 }
 
+static int wait_locked_thread(void *arg) {
+  struct wait_test *w = arg;
+
+  msleep(20);
+  spin_lock(&w->wq.lock);
+  w->flag = 2;
+  wake_up_all_locked(&w->wq);
+  spin_unlock(&w->wq.lock);
+  return 0;
+}
+
 static bool test_wait_event(void) {
   struct wait_test w;
 
@@ -125,7 +136,17 @@ static bool test_wait_event(void) {
 
   long ret = wait_event_timeout(w.wq, w.flag, 1000);
   kthread_stop(task);
-  return ret > 0 && w.flag == 1;
+  if (ret <= 0 || w.flag != 1)
+    return false;
+
+  /* Exercise wake_up_all_locked with wq.lock held */
+  task = kthread_run(wait_locked_thread, &w, "kpi/wltest");
+  if (IS_ERR(task))
+    return false;
+
+  ret = wait_event_timeout(w.wq, w.flag == 2, 1000);
+  kthread_stop(task);
+  return ret > 0 && w.flag == 2;
 }
 
 /* ── sleeping mutex under contention ────────────────────────────────────── */

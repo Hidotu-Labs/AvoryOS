@@ -9,10 +9,21 @@
  * attribute macros and the sysfs_emit() formatting helpers are real, because
  * show() methods are compiled and may be called from tests. */
 
+#include <linux/idr.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
 #include <linux/stringify.h>
 #include <linux/types.h>
+
+/* Upstream sysfs.h reaches kernfs.h, which brings in <linux/idr.h>; the
+ * overlay keeps kernfs opaque, so pull idr.h explicitly.  amdgpu_ctx.h embeds
+ * a `struct idr` and depends on this chain through device.h -> kobject.h ->
+ * sysfs.h. */
+struct sysfs_ops {
+  ssize_t (*show)(struct kobject *kobj, struct attribute *attr, char *buf);
+  ssize_t (*store)(struct kobject *kobj, struct attribute *attr,
+                   const char *buf, size_t count);
+};
 
 struct file;
 struct device;
@@ -82,6 +93,42 @@ struct device_attribute {
 #define DEVICE_ATTR_WO(_name)                                                 \
   struct device_attribute dev_attr_##_name = __ATTR_WO(_name)
 
+/* Binary attributes (stock sysfs.h shapes; amdgpu_ras publishes one). */
+#define __BIN_ATTR(_name, _mode, _read, _write, _size)                        \
+  {                                                                           \
+    .attr = {.name = __stringify(_name), .mode = (_mode)},                    \
+    .read = (_read), .write = (_write), .size = (_size),                      \
+  }
+#define __BIN_ATTR_RO(_name, _size) {                                         \
+  .attr = {.name = __stringify(_name), .mode = 0444},                         \
+  .read = _name##_read, .size = (_size),                                      \
+}
+#define __BIN_ATTR_WO(_name, _size) {                                         \
+  .attr = {.name = __stringify(_name), .mode = 0200},                         \
+  .write = _name##_write, .size = (_size),                                    \
+}
+#define __BIN_ATTR_RW(_name, _size)                                           \
+  __BIN_ATTR(_name, 0644, _name##_read, _name##_write, _size)
+
+#define BIN_ATTR(_name, _mode, _read, _write, _size)                          \
+  struct bin_attribute bin_attr_##_name =                                     \
+      __BIN_ATTR(_name, _mode, _read, _write, _size)
+#define BIN_ATTR_RO(_name, _size)                                             \
+  struct bin_attribute bin_attr_##_name = __BIN_ATTR_RO(_name, _size)
+#define BIN_ATTR_WO(_name, _size)                                             \
+  struct bin_attribute bin_attr_##_name = __BIN_ATTR_WO(_name, _size)
+#define BIN_ATTR_RW(_name, _size)                                             \
+  struct bin_attribute bin_attr_##_name = __BIN_ATTR_RW(_name, _size)
+
+/* Upstream initializes lockdep keys for attributes; no lockdep here. */
+static inline void sysfs_attr_init(struct attribute *attr) { (void)attr; }
+
+int sysfs_add_file_to_group(struct kobject *kobj, const struct attribute *attr,
+                            const char *group);
+void sysfs_remove_file_from_group(struct kobject *kobj,
+                                  const struct attribute *attr,
+                                  const char *group);
+
 int sysfs_create_file_ns(struct kobject *kobj, const struct attribute *attr,
                          const void *ns);
 int sysfs_create_file(struct kobject *kobj, const struct attribute *attr);
@@ -115,5 +162,11 @@ int sysfs_emit_at(char *buf, int at, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 
 static inline bool sysfs_attr_mode_is_visible(umode_t mode) { return mode != 0; }
+
+/* Upstream initializes the attribute for sysfs; no debugfs/sysfs bin attr
+ * registration happens here, so it is a shape-only no-op. */
+static inline void sysfs_bin_attr_init(struct bin_attribute *bin_attr) {
+  (void)bin_attr;
+}
 
 #endif /* __AVORY_LINUXKPI_SYSFS_H */

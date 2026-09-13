@@ -134,6 +134,7 @@ void hrtimer_init(struct hrtimer *timer, clockid_t which_clock,
   timer->queued = 0;
   timer->clock_id = which_clock;
   timer->running = 0;
+  timer->cancel_pending = 0;
 }
 
 int hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim, u64 delta_ns,
@@ -148,6 +149,7 @@ int hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim, u64 delta_ns,
     list_del_init(&timer->node.node);
     timer->queued = 0;
   }
+  timer->cancel_pending = 0;
   timer->node.expires = when;
   __hrtimer_enqueue_locked(timer);
   timer->queued = 1;
@@ -178,7 +180,28 @@ int hrtimer_try_to_cancel(struct hrtimer *timer) {
 }
 
 int hrtimer_cancel(struct hrtimer *timer) {
-  int ret = hrtimer_try_to_cancel(timer);
+  int ret;
+
+  /* Callbacks run in the ktimers thread (not hardirq).  A caller in atomic
+   * context - IRQs off or preemption disabled, e.g. vkms_disable_vblank()
+   * under drm_crtc_vblank_off()'s event_lock/vbl_lock - must not sleep
+   * waiting for the callback: the callback may be spinning on one of the
+   * caller's locks, which is the vkms vblank ABBA (upstream CVE-2025-71315,
+   * much more likely with threaded callbacks).  Mark the timer so the
+   * callback loop does not re-enqueue it and return; the in-flight callback
+   * finishes once the caller releases its locks.  Process-context callers
+   * keep upstream's wait-for-completion semantics. */
+  if (irqs_disabled() || in_atomic()) {
+    unsigned long flags;
+
+    spin_lock_irqsave(&timer_lock, flags);
+    timer->cancel_pending = 1;
+    spin_unlock_irqrestore(&timer_lock, flags);
+
+    return hrtimer_try_to_cancel(timer);
+  }
+
+  ret = hrtimer_try_to_cancel(timer);
 
   while (__atomic_load_n(&timer->running, __ATOMIC_ACQUIRE))
     wait_event(timer_done_wq,
@@ -303,15 +326,25 @@ static int timer_kthread(void *arg) {
 
       if (restart == HRTIMER_RESTART) {
         ktime_t when = h->node.expires;
-        if (when <= ktime_get())
-          when = ktime_get() + 1000000; /* 1 ms floor */
+        bool requeue = false;
 
         spin_lock_irqsave(&timer_lock, flags);
-        h->node.expires = when;
-        __hrtimer_enqueue_locked(h);
-        h->queued = 1;
+        if (h->cancel_pending) {
+          /* hrtimer_cancel() ran in atomic context while this callback was
+           * in flight; do not restart. */
+          h->cancel_pending = 0;
+        } else {
+          if (when <= ktime_get())
+            when = ktime_get() + 1000000; /* 1 ms floor */
+
+          h->node.expires = when;
+          __hrtimer_enqueue_locked(h);
+          h->queued = 1;
+          requeue = true;
+        }
         spin_unlock_irqrestore(&timer_lock, flags);
-        timer_signal_change();
+        if (requeue)
+          timer_signal_change();
       }
 
       __kpi_wake_up(&timer_done_wq, 0, 0);

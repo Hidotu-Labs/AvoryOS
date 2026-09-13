@@ -80,11 +80,19 @@ static inline void lockdep_init_map(struct lockdep_map *map, const char *name,
 #define lock_contended(l, ip) do { } while (0)
 #define lock_map_acquire(l) do { } while (0)
 #define lock_map_acquire_read(l) do { } while (0)
+#define lock_map_acquire_try(l) do { } while (0)
 #define lock_map_release(l) do { } while (0)
+
+/* Lockdep wait-context maps: only the shape matters without lockdep. */
+struct lock_map {
+  int kpi_unused;
+};
+#define DEFINE_WAIT_OVERRIDE_MAP(name, subclass)                              \
+  struct lock_map name = {0}
 #define rwsem_acquire(l, s, t, ip) do { } while (0)
 #define rwsem_acquire_read(l, s, t, ip) do { } while (0)
 #define rwsem_acquire_nest(l, s, t, n, ip) do { } while (0)
-#define rwsem_release(l, t, ip) do { } while (0)
+#define rwsem_release(l, ip) do { } while (0)
 #define lockdep_rcu_suspicious(f, l, s) do { } while (0)
 #define lockdep_assert_held_exclusive(l) ((void)(l))
 #define lockdep_assert_held_first(l) ((void)(l))

@@ -1,13 +1,15 @@
 /* Minimal Linux I2C core for LinuxKPI (Phase 5 C4).
  *
  * Scope: adapter registration and master transfers for the DRM DDC/EDID path
- * and the future amdgpu DM adapter.  This is deliberately not i2c-core-base.c
- * (the plan rules that import out of P5): no clients/instantiation, no
- * OF/ACPI adapter lookup, no SMBus emulation, no /dev/i2c-N, no
- * suspend/resume or mux/segment locking.  Every divergence is recorded in
- * docs/linuxkpi-gaps.md (P5 C4). */
+ * and the amdgpu DM adapter.  This is deliberately not i2c-core-base.c (the
+ * plan rules that import out of P5): no clients/instantiation, no
+ * OF/ACPI adapter lookup, no /dev/i2c-N, no suspend/resume.  Lock ops and the
+ * SMBus data types exist for i2c-algo-bit/drm_dp_helper; SMBus emulation
+ * itself is still absent.  Every divergence is recorded in
+ * docs/linuxkpi-gaps.md (P5 C4 / P6 C1). */
 
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/i2c.h>
 #include <linux/mutex.h>
@@ -17,6 +19,30 @@
 
 struct device_type i2c_adapter_type = {
     .name = "i2c_adapter",
+};
+
+/* Default bus locking: upstream's i2c_adapter_lock_ops over rt_mutex; ours is
+ * the plain sleeping mutex.  Drivers with segment-aware needs (drm_dp_helper)
+ * replace lock_ops after registration. */
+static void i2c_kpi_lock_bus(struct i2c_adapter *adap, unsigned int flags) {
+  (void)flags;
+  mutex_lock(&adap->bus_lock);
+}
+
+static int i2c_kpi_trylock_bus(struct i2c_adapter *adap, unsigned int flags) {
+  (void)flags;
+  return mutex_trylock(&adap->bus_lock);
+}
+
+static void i2c_kpi_unlock_bus(struct i2c_adapter *adap, unsigned int flags) {
+  (void)flags;
+  mutex_unlock(&adap->bus_lock);
+}
+
+static const struct i2c_lock_operations i2c_kpi_default_lock_ops = {
+    .lock_bus = i2c_kpi_lock_bus,
+    .trylock_bus = i2c_kpi_trylock_bus,
+    .unlock_bus = i2c_kpi_unlock_bus,
 };
 
 /* Adapter registry.  The array caps the bus count at 64; slots are taken
@@ -48,6 +74,8 @@ static int i2c_kpi_register(struct i2c_adapter *adap, int nr) {
   }
 
   mutex_init(&adap->bus_lock);
+  if (!adap->lock_ops)
+    adap->lock_ops = &i2c_kpi_default_lock_ops;
   adap->nr = id;
   adap->dev.type = &i2c_adapter_type;
   if (!adap->name[0])
@@ -122,9 +150,11 @@ int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num) {
   if (!adap || !adap->algo || !adap->algo->master_xfer)
     return -EOPNOTSUPP;
 
-  mutex_lock(&adap->bus_lock);
+  /* Upstream takes the root-adapter lock through lock_ops; DP AUX replaces
+   * the default mutex with segment-aware locking. */
+  i2c_lock_bus(adap, I2C_LOCK_ROOT_ADAPTER);
   ret = __i2c_transfer(adap, msgs, num);
-  mutex_unlock(&adap->bus_lock);
+  i2c_unlock_bus(adap, I2C_LOCK_ROOT_ADAPTER);
   return ret;
 }
 
@@ -149,4 +179,13 @@ int i2c_master_send(const struct i2c_client *client, const char *buf,
 
 int i2c_master_recv(const struct i2c_client *client, char *buf, int count) {
   return i2c_transfer_buffer_flags(client, buf, count, I2C_M_RD);
+}
+
+/* Upstream instantiates a client from board info; AvoryOS has no client
+ * model, so optional probes get -ENODEV. */
+struct i2c_client *i2c_new_client_device(struct i2c_adapter *adap,
+                                         const struct i2c_board_info *info) {
+  (void)adap;
+  (void)info;
+  return ERR_PTR(-ENODEV);
 }

@@ -20,4 +20,9 @@ struct mmu_notifier_range {
 #define MMU_NOTIFY_RELEASE 0
 #define MMU_NOTIFY_CLEAR 1
 
+/* amdgpu_drv.c calls this on module exit; with CONFIG_MMU_NOTIFIER off there
+ * is no notifier list, so it is a no-op (stock mmu_notifier.h's
+ * !CONFIG_MMU_NOTIFIER arm provides the same). */
+static inline void mmu_notifier_synchronize(void) {}
+
 #endif /* __AVORY_LINUXKPI_MMU_NOTIFIER_H */

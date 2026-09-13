@@ -18,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include <linuxkpi/log.h>
 #include <linuxkpi/native_vfs.h>
 
 #define LINUX_FIRMWARE_PREFIX "/lib/firmware/"
@@ -77,8 +78,12 @@ int request_firmware(const struct firmware **firmware_p, const char *name,
   memcpy(path + prefix_length, name, name_length + 1);
 
   node = asc_vfs_kernel_open(path);
-  if (!node)
+  if (!node) {
+    /* Phase 6 C4 relies on this line to list every blob a driver asked for
+     * and did not find (the amdgpu early-init requests included). */
+    klogf("[INFO] LinuxKPI: firmware '%s' not found\n", name);
     return -ENOENT;
+  }
 
   size = asc_vfs_kernel_size(node);
   if (!size) {
@@ -125,4 +130,11 @@ void release_firmware(const struct firmware *firmware) {
     kfree((void *)firmware->data);
   }
   kfree((void *)firmware);
+}
+
+/* Static kernel: there is no usermode-helper fallback, so the "direct"
+ * flavor is the same synchronous VFS read as request_firmware(). */
+int request_firmware_direct(const struct firmware **firmware_p,
+                            const char *name, struct device *device) {
+  return request_firmware(firmware_p, name, device);
 }

@@ -89,6 +89,52 @@ nothing is installed by default yet.
 
 ## Known issues / gotchas
 
+- **Warm GPU state between runs.**  QEMU does not reset the passed-through
+  iGPU when a VM exits.  A run that got as far as loading PSP SOS and was
+  then killed leaves the PSP running; the next `make run-vfio` can fail
+  early with `PSP create ring failed!` / probe `-22` because the bootloader
+  handshake no longer answers.  The device exposes only the `bus` reset
+  method (`/sys/.../reset_method` = `bus`; no FLR/PM), so try in order:
+  1. just retry the boot -- a failed PSP handshake followed by the driver's
+     `psp_ring_destroy()` teardown has unstuck it before (fail -> success
+     across two consecutive runs);
+  2. function reset **while the device is still bound** (unbinding first can
+     put it into D3cold, after which config space is gone and every reset
+     method returns `-ENOTTY`):
+     ```sh
+     cat /sys/bus/pci/devices/0000:0e:00.0/reset_method   # reports "bus"
+     sudo sh -c 'echo 1 > /sys/bus/pci/devices/0000:0e:00.0/reset'
+     ```
+     On this box the write fails with `Inappropriate ioctl for device`: the
+     `reset_method=bus` probe passes, but `0e:00.0` shares bus `0x0e` with
+     five other functions (HD audio, PSP/CCP, two xHCI USB controllers, more
+     audio), and the kernel refuses a parent-bus reset of a shared bus.
+     **Do not force a secondary-bus reset of `00:08.1` with `setpci`** - it
+     would reset those USB controllers as well.  On this machine a host
+     reboot is therefore the only safe way to cold-start the GPU; use
+     `make reset-gpu` to at least re-bind vfio-pci (it reports the actual
+     reset capability and never leaves the function orphaned).
+  3. reboot the host.
+  Once amdgpu is bound, prefer a clean guest shutdown over killing QEMU.
+  The guest-side `pci_reset_function()` is still a `-ENOTSUPP` stub (P5 C1
+  gap), so the driver's own recovery path cannot reset the device yet.
+  `make reset-gpu` (`sudo scripts/vfio-reset-gpu.sh [BDF]`) automates step 2
+  and is now the recommended way to start a C4+ evidence run: the driver's
+  bring-up sequence assumes a cold device, and a warm one shows up as
+  `AUTOLOAD_RLC` answering `TEE_ERROR_BUSY` or the KIQ HQD coming back with
+  cleared doorbell state (`dbctl=0`) and a `-110` ring test.
+- **C4 headless runs use `amdgpu.dc=0`.**  It makes
+  `amdgpu_device_asic_has_dc_support()` false, so the `dm` ip block is never
+  added: no DMUB hardware init / DCN register bring-up (still slow and not
+  needed before C6), just PSP/SMU/GMC/IH and the SDMA/GFX rings.  Use the
+  dedicated target -- it bakes the right cmdline, goes headless and captures
+  `build/logs/p6-c4.log`:
+  ```sh
+  make run-c4
+  ```
+  (`KERNEL_CMDLINE` is baked into the ISO; the top Makefile now stamps its
+  value, so changing it always rebuilds the ISO instead of silently reusing
+  the previous command line.)
 - **One QEMU per disk image.**  Close the interactive session before a
   headless run, or point the run at a scratch copy
   (`cp --reflink=auto disk.img build/disk-c6.img`).
@@ -110,6 +156,9 @@ nothing is installed by default yet.
   `vendor`, `device`, `class` and `subsystem_vendor`.
 
 ## Phase 6 expectations
+
+Full chunked plan: `docs/linuxkpi-phase6-plan.md` (C0–C9, written
+2026-09-13).  Summary:
 
 1. P6a: compile/link the amdgpu subset against the Phase 5 LinuxKPI surface
    (no hardware ownership).

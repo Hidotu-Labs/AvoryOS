@@ -33,6 +33,13 @@ void __kpi_rcu_read_unlock(void) {
   preempt_enable();
 }
 
+/* Lockdep-less RCU probes: a kernel without PROVE_RCU reports "held" for all
+ * of them (upstream debug_lockdep_rcu_enabled() == 0 path). */
+int rcu_read_lock_held(void) { return 1; }
+int rcu_read_lock_bh_held(void) { return 1; }
+int rcu_read_lock_sched_held(void) { return 1; }
+int rcu_read_lock_any_held(void) { return 1; }
+
 static void rcu_wait_grace_period(void) {
   while (__atomic_load_n(&rcu_readers, __ATOMIC_ACQUIRE) != 0)
     msleep(1);

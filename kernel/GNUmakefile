@@ -182,10 +182,9 @@ LINUX_CPPFLAGS :=
 LINUX_CFLAGS :=
 -include linux/Makefile.files
 ifneq ($(linux-obj-y),)
-    override LINUX_OBJ := \
-        $(addprefix obj-$(ARCH)/linux/,$(linux-obj-y:.c=.c.o))
     override LINUX_CPPFLAGS := \
         -I linuxkpi/include \
+        -I ../build/firmware \
         -I linux/arch/x86/include \
         -I linux/arch/x86/include/generated \
         -I linux/include \
@@ -206,12 +205,28 @@ ifneq ($(linux-obj-y),)
     override LINUX_CFLAGS := \
         -fno-strict-aliasing \
         -fno-common \
+        -fshort-wchar \
         -Wno-unused-parameter \
         -Wno-unused-function \
         -Wno-unused-but-set-variable \
         -Wno-sign-compare \
         -Wno-missing-field-initializers
     override CPPFLAGS += -DLINUXKPI_LINUX_IMPORTED=1
+
+    # Phase 6 (amdgpu): generated object list + include paths + per-file flags
+    # from the pinned Kbuild fragments (scripts/linux/kbuild-subset.py).
+    # KPI_AMDGPU defaults to 1 now that 6a links cleanly; the boot-safety gate
+    # (kpi_amdgpu, default 1 since C3 in linuxkpi/src/pci.c) lets amdgpu probe
+    # the passed GPU, with `kpi_amdgpu=0` as the C2 revert.  `make KPI_AMDGPU=0`
+    # returns to the Phase 5 baseline object set.
+    # Makefile.kbuild must be included before LINUX_OBJ is computed (it
+    # appends to linux-obj-y) but after LINUX_CPPFLAGS/LINUX_CFLAGS (the
+    # generated per-target rules append to them at parse time).
+    KPI_AMDGPU ?= 1
+    -include linux/Makefile.kbuild
+
+    override LINUX_OBJ := \
+        $(addprefix obj-$(ARCH)/linux/,$(linux-obj-y:.c=.c.o))
 
     # AvoryOS-authored LinuxKPI implementations and Linux-API boot tests.
     # Both are compiled only when the Linux tree exists, because they include

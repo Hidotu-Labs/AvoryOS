@@ -23,6 +23,9 @@ void *linuxkpi_task_shadow_new(void *thread) {
   tsk->pid = (pid_t)linuxkpi_thread_pid(thread);
   tsk->tgid = (pid_t)linuxkpi_thread_tgid(thread);
   linuxkpi_thread_comm(thread, tsk->comm, sizeof(tsk->comm));
+  /* Kernel-thread shadows are not refcounted yet; start at 1 so imported
+   * refcount helpers (get_task_struct/put_task_struct) cannot underflow. */
+  refcount_set(&tsk->usage, 1);
   /* No shared signal_struct yet: each thread is its own group leader.  The
    * only consumer is drm_sched's per-user submission tracking, which keys on
    * group_leader identity and compares it against itself. */

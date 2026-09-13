@@ -33,6 +33,7 @@
 #include <linux/ioport.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/moduleparam.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -63,6 +64,39 @@ struct kpi_pci_driver {
 };
 
 static LIST_HEAD(kpi_pci_drivers);
+
+/* Phase 6 boot-safety gate.  pci_register_driver() still registers the
+ * "amdgpu" driver, but skips probing unless kpi_amdgpu=1 (module parameter,
+ * from the Limine cmdline).  The default was flipped to 1 in C3: early init
+ * must run on the passed GPU, and `kpi_amdgpu=0` stays as the one-line revert
+ * to the C2 behavior.  Deliberately non-upstream; recorded in
+ * docs/linuxkpi-gaps.md (P6 C2/C3). */
+static bool kpi_amdgpu = true;
+module_param(kpi_amdgpu, bool, 0);
+
+bool linuxkpi_pci_amdgpu_gate(void) { return kpi_amdgpu; }
+
+/* Test support for test_phase6_link: amdgpu's probe fails while firmware and
+ * rings are still missing (C4), and the driver core unbinds the device on
+ * probe failure, so remember that the probe ran and what it returned. */
+static bool kpi_amdgpu_probed;
+static int kpi_amdgpu_probe_result;
+
+bool linuxkpi_pci_amdgpu_probe_attempted(void) { return kpi_amdgpu_probed; }
+int linuxkpi_pci_amdgpu_probe_result(void) { return kpi_amdgpu_probe_result; }
+
+/* Test support for test_phase6_link: is a driver with this name registered?
+ * The registry is append-only and boot-time only, so no locking is needed. */
+bool linuxkpi_pci_driver_registered(const char *name) {
+  struct kpi_pci_driver *node;
+
+  if (!name)
+    return false;
+  list_for_each_entry(node, &kpi_pci_drivers, node)
+    if (node->drv && node->drv->name && !strcmp(node->drv->name, name))
+      return true;
+  return false;
+}
 
 /* ── regions (conflict registry; native port I/O is raw in/out) ─────────── */
 
@@ -354,6 +388,10 @@ static void kpi_pci_probe_device(struct pci_driver *drv,
     return;
 
   ret = drv->probe(pdev, id);
+  if (!strcmp(drv->name, "amdgpu")) {
+    kpi_amdgpu_probed = true;
+    kpi_amdgpu_probe_result = ret;
+  }
   if (ret) {
     klogf("[KERNEL] LinuxKPI: pci %s probe %s failed: %d\n", drv->name,
           pci_name(pdev), ret);
@@ -387,6 +425,10 @@ int __pci_register_driver(struct pci_driver *drv, struct module *owner,
     return -ENOMEM;
   node->drv = drv;
   list_add_tail(&node->node, &kpi_pci_drivers);
+
+  /* Phase 6 C2 boot-safety gate: see kpi_amdgpu above. */
+  if (!kpi_amdgpu && !strcmp(drv->name, "amdgpu"))
+    return 0;
 
   for (i = 0; i < kpi_dev_count; i++)
     kpi_pci_probe_device(drv, kpi_devs[i]);
@@ -1519,3 +1561,66 @@ void pci_unmap_rom(struct pci_dev *pdev, void __iomem *rom) {
   if (!(res->flags & IORESOURCE_ROM_ENABLE))
     pci_disable_rom(pdev);
 }
+
+/* ── Link-wave stubs (P6 C2) ──────────────────────────────────────────────
+ *
+ * Surface amdgpu references that has no native equivalent.  None of it is on
+ * the Raphael bring-up path: PCIe MPS/bandwidth reporting, BAR resizing,
+ * function-level reset and resource reassignment (no bridge windows), atomic
+ * ops-to-root (no ACS routing), hotplug ignore, and MSI state restore.
+ * Recorded in docs/linuxkpi-gaps.md (P6 C2). */
+
+int pcie_get_mps(struct pci_dev *dev) {
+  (void)dev;
+  return 128; /* upstream default MPS when the Link Control field is unset */
+}
+
+u32 pcie_bandwidth_available(struct pci_dev *dev, struct pci_dev **limiting_dev,
+                             enum pci_bus_speed *speed,
+                             enum pcie_link_width *width) {
+  if (limiting_dev)
+    *limiting_dev = dev;
+  if (speed)
+    *speed = PCI_SPEED_UNKNOWN;
+  if (width)
+    *width = PCIE_LNK_WIDTH_UNKNOWN;
+  return 0;
+}
+
+int pci_reset_function(struct pci_dev *dev) {
+  (void)dev;
+  return -ENOTSUPP;
+}
+
+u32 pci_rebar_get_possible_sizes(struct pci_dev *pdev, int bar) {
+  (void)pdev;
+  (void)bar;
+  return 0;
+}
+
+int pci_resize_resource(struct pci_dev *dev, int i, int size,
+                        int exclude_bars) {
+  (void)dev;
+  (void)i;
+  (void)size;
+  (void)exclude_bars;
+  return -ENOTSUPP;
+}
+
+int pci_enable_atomic_ops_to_root(struct pci_dev *dev, u32 cap_mask) {
+  (void)dev;
+  (void)cap_mask;
+  return -EINVAL;
+}
+
+void pci_ignore_hotplug(struct pci_dev *dev) { (void)dev; }
+
+void pci_restore_msi_state(struct pci_dev *dev) { (void)dev; }
+
+struct resource *pci_bus_resource_n(const struct pci_bus *bus, int n) {
+  (void)bus;
+  (void)n;
+  return NULL;
+}
+
+void pci_assign_unassigned_bus_resources(struct pci_bus *bus) { (void)bus; }

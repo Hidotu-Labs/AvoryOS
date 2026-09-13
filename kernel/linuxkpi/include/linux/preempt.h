@@ -59,4 +59,22 @@ static inline void preempt_fold_need_resched(void) { }
 static inline void migrate_disable(void) { }
 static inline void migrate_enable(void) { }
 
+/* Preempt-count bit layout, matching upstream <linux/preempt.h>.  The AvoryOS
+ * preempt_count is advisory, but imported headers compute offsets/masks from
+ * these (vtime.h uses HARDIRQ_OFFSET; softirq paths use NR_SOFTIRQS). */
+#define PREEMPT_BITS 8
+#define SOFTIRQ_BITS 8
+#define HARDIRQ_BITS 4
+#define NMI_BITS 1
+
+#define PREEMPT_SHIFT 0
+#define SOFTIRQ_SHIFT (PREEMPT_SHIFT + PREEMPT_BITS)
+#define HARDIRQ_SHIFT (SOFTIRQ_SHIFT + SOFTIRQ_BITS)
+#define NMI_SHIFT (HARDIRQ_SHIFT + HARDIRQ_BITS)
+
+#define SOFTIRQ_OFFSET (1UL << SOFTIRQ_SHIFT)
+#define HARDIRQ_OFFSET (1UL << HARDIRQ_SHIFT)
+#define NMI_OFFSET (1UL << NMI_SHIFT)
+#define SOFTIRQ_DISABLE_OFFSET (2 * SOFTIRQ_OFFSET)
+
 #endif /* __AVORY_LINUXKPI_PREEMPT_H */

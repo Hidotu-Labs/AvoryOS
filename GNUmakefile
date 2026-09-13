@@ -322,6 +322,33 @@ run-vfio: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		$(VFIO_EXTRA) \
 		$(QEMUFLAGS)
 
+# Phase 6 C4: headless amdgpu bring-up.  `amdgpu.dc=0` skips the dm ip block
+# (DCN display bring-up is minutes-slow in this environment and only needed at
+# C6); the serial log lands in build/logs/p6-c4.log.  drm.debug stays off here:
+# it floods the serial with per-ioctl lines and the C4 evidence is the
+# `kpi-kiq:` diagnostics plus the amdgpu init log.
+# `amdgpu.ppfeaturemask=0xfff73fff` clears PP_GFXOFF_MASK (0x8000) from the
+# default 0xfff7bfff: GFX power gating loses the MEC/KIQ HQD programming on
+# this guest (doorbells dropped, ring test flaky), and C4 does not need GFXOFF.
+.PHONY: run-c4
+run-c4: KERNEL_CMDLINE = kpi_vfio_test=1 kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.dc=0 amdgpu.ppfeaturemask=0xfff73fff
+run-c4: SERIAL = file:build/logs/p6-c4.log
+run-c4: DISPLAY_OPT = -display none
+run-c4: VFIO_EXTRA = -device edu
+# Drop the default gtk display from QEMUFLAGS; keep virtio-vga (the default
+# std VGA trips the P4 bochs canary).  Command-line QEMUFLAGS still wins.
+run-c4: QEMUFLAGS = -vga none -device virtio-vga,xres=1280,yres=800
+run-c4: run-vfio
+
+# Cold-start the passed GPU on the host before a C4+ boot.  QEMU/VFIO does not
+# reset the device on VM exit, and the guest driver's bring-up sequence assumes
+# a cold device (a warm one can answer AUTOLOAD_RLC with TEE_ERROR_BUSY or come
+# up with cleared KIQ doorbell state).  Needs root; see
+# scripts/vfio-reset-gpu.sh and docs/amdgpu-testing.md.
+.PHONY: reset-gpu
+reset-gpu:
+	sudo scripts/vfio-reset-gpu.sh $(VFIO_BDF)
+
 .PHONY: run-dist
 run-dist: edk2-ovmf avoryos-dist.iso
 	qemu-system-$(ARCH) \
@@ -651,6 +678,16 @@ build/test_fw.bin: GNUmakefile
 	@mkdir -p build
 	@python3 -c 'import sys; open(sys.argv[1], "wb").write(bytes(((i * 7 + 3) & 0xff) for i in range(4096)))' $@
 
+# Phase 6 C4: amdgpu firmware blobs.  scripts/linux-firmware-install.sh follows
+# scripts/linux/firmware-manifest.txt and stages the pinned linux-firmware ref
+# (the script's default; override with LINUX_FIRMWARE_REF=).  Point
+# LINUX_FIRMWARE_SRC=/lib/firmware at a distro firmware tree to skip the git
+# checkout for local runs; .zst/.xz members are decompressed during staging.
+LINUX_FIRMWARE_REF ?= 20260910
+build/firmware/.stamp: scripts/linux-firmware-install.sh scripts/linux/firmware-manifest.txt
+	LINUX_FIRMWARE_REF='$(LINUX_FIRMWARE_REF)' scripts/linux-firmware-install.sh
+	@touch $@
+
 disk.img: GNUmakefile userland/winoptions userland/icewm-menu $(ALPINE_STAMP)
 disk.img: scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh userland/avory-login.elf
 disk.img:  userland/dns_lookup.elf userland/nettest.elf
@@ -677,7 +714,7 @@ disk.img: userland/test_watchdog.elf
 disk.img: userland/test_kpi_dmabuf.elf
 disk.img: userland/test_kpi_drm.elf
 disk.img: userland/test_kpi_bochs.elf
-disk.img: build/test_fw.bin
+disk.img: build/test_fw.bin build/firmware/.stamp
 disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 
 
@@ -953,6 +990,9 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 	@if [ -d build/alpine/rootfs ]; then \
 		mkdir -p build/alpine/rootfs/lib/firmware; \
 		cp -f build/test_fw.bin build/alpine/rootfs/lib/firmware/test_fw.bin; \
+		if [ -d build/firmware/lib/firmware ]; then \
+			cp -a build/firmware/lib/firmware/. build/alpine/rootfs/lib/firmware/; \
+		fi; \
 	fi
 	@if [ -d build/alpine/rootfs ]; then \
 		echo "Populating Alpine Linux rootfs into disk image..."; \
@@ -1238,7 +1278,17 @@ kernel: setup
 #   make run-vfio KERNEL_CMDLINE=kpi_vfio_test=1
 KERNEL_CMDLINE ?=
 
-$(IMAGE_NAME).iso: limine/limine kernel limine.conf
+# Make tracks files, not variable values: without this stamp a new
+# KERNEL_CMDLINE would silently reuse the previously baked ISO cmdline.
+.PHONY: FORCE
+FORCE:
+
+build/kernel_cmdline.stamp: FORCE
+	@mkdir -p build
+	@printf '%s' '$(KERNEL_CMDLINE)' > $@.tmp
+	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
+
+$(IMAGE_NAME).iso: limine/limine kernel limine.conf build/kernel_cmdline.stamp
 	rm -rf iso_root
 	mkdir -p iso_root/boot
 	cp -v kernel/bin-$(ARCH)/kernel iso_root/boot/

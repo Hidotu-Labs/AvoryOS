@@ -11,7 +11,11 @@
 #include <drm/drm_client.h>
 #include <drm/drm_utils.h>
 #include <linux/component.h>
+#include <linux/device.h>
+#include <linux/err.h>
 #include <linux/fwnode.h>
+#include <linux/backlight.h>
+#include <linux/hwmon.h>
 #include <linux/ioport.h>
 #include <linux/jump_label.h>
 #include <linux/kernel.h>
@@ -220,4 +224,41 @@ __attribute__((weak)) bool llist_add_batch(struct llist_node *new_first,
  * from an inline asm with an empty clobber list and therefore requires the
  * upstream "preserve every register except the result" convention that a C
  * function cannot provide. */
+
+/* ── backlight / hwmon (P6 C2) ────────────────────────────────────────────
+ *
+ * amdgpu registers a backlight (non-ACPI path) and an hwmon device.  Neither
+ * subsystem is implemented: the backlight register fails with -ENODEV so DM's
+ * backlight setup is skipped, and hwmon registration fails the same way
+ * (amdgpu_pm tolerates a missing device).  Recorded in the gap log. */
+
+struct backlight_device *
+backlight_device_register(const char *name, struct device *dev, void *devdata,
+                          const struct backlight_ops *ops,
+                          const struct backlight_properties *props) {
+  (void)name;
+  (void)dev;
+  (void)devdata;
+  (void)ops;
+  (void)props;
+  return ERR_PTR(-ENODEV);
+}
+
+void backlight_device_unregister(struct backlight_device *bd) { (void)bd; }
+
+struct device *hwmon_device_register_with_groups(
+    struct device *dev, const char *name, void *drvdata,
+    const struct attribute_group **groups) {
+  (void)dev;
+  (void)name;
+  (void)drvdata;
+  (void)groups;
+  return ERR_PTR(-ENODEV);
+}
+
+void hwmon_device_unregister(struct device *dev) { (void)dev; }
+
+/* Stock drm_client.c hotplug notification; no clients are registered (fbdev
+ * emulation is off), so it is a no-op. */
+void drm_client_dev_hotplug(struct drm_device *dev) { (void)dev; }
 

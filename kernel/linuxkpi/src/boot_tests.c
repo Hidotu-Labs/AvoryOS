@@ -43,6 +43,7 @@ extern void linuxkpi_test_phase5_sysfs(void);
 extern void linuxkpi_test_phase5_devmodel(void);
 extern void linuxkpi_test_phase5_ctx(void);
 extern void linuxkpi_test_phase5_vfio(void);
+extern void linuxkpi_test_phase6_link(void);
 
 static struct completion boot_tests_done;
 
@@ -76,6 +77,7 @@ static int linuxkpi_boot_tests_thread(void *arg) {
   linuxkpi_test_phase5_devmodel();
   linuxkpi_test_phase5_ctx();
   linuxkpi_test_phase5_vfio();
+  linuxkpi_test_phase6_link();
 
   complete(&boot_tests_done);
   return 0;

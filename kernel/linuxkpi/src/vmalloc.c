@@ -295,6 +295,50 @@ unsigned long vmalloc_to_pfn(const void *addr) {
 
 /* ── ioremap family ─────────────────────────────────────────────────────── */
 
+/* Boot-test support: remember which physical ranges were ioremapped, even
+ * after iounmap(), so a probe that failed and unwound can still be checked
+ * for "reached its MMIO setup" (amdgpu maps BAR5 in amdgpu_device_init before
+ * early init and unmaps it again on the error path).  Diagnostic only: the
+ * table keeps the first KPI_IOREMAP_TRACE mappings and drops later ones. */
+#define KPI_IOREMAP_TRACE 16
+static resource_size_t kpi_ioremap_trace_off[KPI_IOREMAP_TRACE];
+static unsigned long kpi_ioremap_trace_size[KPI_IOREMAP_TRACE];
+static unsigned int kpi_ioremap_trace_count;
+
+static void kpi_ioremap_trace_add(resource_size_t offset, unsigned long size) {
+  unsigned long flags;
+
+  spin_lock_irqsave(&vmap_lock, flags);
+  if (kpi_ioremap_trace_count < KPI_IOREMAP_TRACE) {
+    kpi_ioremap_trace_off[kpi_ioremap_trace_count] = offset;
+    kpi_ioremap_trace_size[kpi_ioremap_trace_count] = size;
+    kpi_ioremap_trace_count++;
+  }
+  spin_unlock_irqrestore(&vmap_lock, flags);
+}
+
+bool linuxkpi_ioremap_was_mapped(resource_size_t offset, unsigned long size) {
+  unsigned long flags;
+  bool hit = false;
+  unsigned int i;
+
+  if (!size)
+    return false;
+
+  spin_lock_irqsave(&vmap_lock, flags);
+  for (i = 0; i < kpi_ioremap_trace_count; i++) {
+    resource_size_t start = kpi_ioremap_trace_off[i];
+    resource_size_t end = start + kpi_ioremap_trace_size[i];
+
+    if (offset >= start && offset < end) {
+      hit = true;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&vmap_lock, flags);
+  return hit;
+}
+
 static void *ioremap_flags(resource_size_t offset, unsigned long size,
                            unsigned long pte_flags) {
   struct vmap_area *area;
@@ -316,15 +360,35 @@ static void *ioremap_flags(resource_size_t offset, unsigned long size,
   for (unsigned long i = 0; i < nr; i++)
     vmap_map_page(area->start + i * PAGE_SIZE, base + i * PAGE_SIZE, pte_flags);
 
+  kpi_ioremap_trace_add(base, (unsigned long)nr * PAGE_SIZE);
+
   return (void *)(area->start + first_off);
 }
 
+/* Cache-mode encodings for this kernel's PAT table.
+ *
+ * PTE bits select an IA32_PAT entry as (PAT << 2) | (PWT << 1) | PCD.
+ * The native kernel keeps the architectural default table and only programs
+ * entry 7 (PAT|PWT|PCD) to WC (`cpu_pat_init()`), unlike Linux, which
+ * reprograms entry 1 as well.  So on AvoryOS:
+ *
+ *   PCD|PWT         -> entry 3, UC   (the MTRR-proof uncached type; what
+ *                                     every native MMIO driver uses)
+ *   PAT|PCD|PWT     -> entry 7, WC   (same bits fb/drm use)
+ *   PWT             -> entry 1, WT
+ *   0               -> entry 0, WB
+ *
+ * ioremap() must be true UC, not PCD-only: PCD alone is UC-, which an MTRR
+ * (or a WB MTRR default type) can override back to cacheable, and a cached
+ * BAR yields stale register reads and delayed doorbell writes.  ioremap_wc()
+ * must use entry 7; PAT alone selects entry 4, which is WB. */
 void *ioremap(resource_size_t offset, unsigned long size) {
-  return ioremap_flags(offset, size, ASC_PAGE_PCD);
+  return ioremap_flags(offset, size, ASC_PAGE_PCD | ASC_PAGE_PWT);
 }
 
 void *ioremap_wc(resource_size_t offset, unsigned long size) {
-  return ioremap_flags(offset, size, ASC_PAGE_PAT);
+  return ioremap_flags(offset, size,
+                       ASC_PAGE_PAT | ASC_PAGE_PCD | ASC_PAGE_PWT);
 }
 
 void *ioremap_wt(resource_size_t offset, unsigned long size) {
@@ -426,6 +490,20 @@ void kvfree_sensitive(const void *addr, size_t len) {
   } else {
     __kpi_kfree_sensitive(addr);
   }
+}
+
+/* Upstream mm/util.c: grow-only reallocation of a kvmalloc() buffer. */
+void *kvrealloc(const void *p, size_t oldsize, size_t newsize, gfp_t flags) {
+  void *newp;
+
+  if (oldsize >= newsize)
+    return (void *)p;
+  newp = kvmalloc(newsize, flags);
+  if (!newp)
+    return NULL;
+  __builtin_memcpy(newp, p, oldsize);
+  kvfree(p);
+  return newp;
 }
 
 /* ── init ───────────────────────────────────────────────────────────────── */

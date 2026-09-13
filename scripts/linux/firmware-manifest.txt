@@ -2,21 +2,34 @@
 #
 # One path or glob per line, relative to the linux-firmware tree root.
 # scripts/linux-firmware-install.sh copies every match into
-# build/firmware/lib/firmware/, which the top-level image build will install at
-# /lib/firmware once amdgpu bring-up starts (Phase 6).
+# build/firmware/lib/firmware/, which the top-level GNUmakefile installs at
+# /lib/firmware in the disk image (Phase 6 C4).
 #
-# Keep this list exact: shipping the whole linux-firmware tree is hundreds of
-# megabytes, and amdgpu only needs its own blobs.
+# Pinned ref: linux-firmware 20260910 (LINUX_FIRMWARE_REF in the install
+# script).  Keep this list exact: shipping the whole linux-firmware tree is
+# hundreds of megabytes, and amdgpu only needs its own blobs.  Add names in
+# the same change as the boot that requests them; the Phase 5 firmware
+# self-test CRC-checks every staged file against the staging host.
 #
-# Phase 6 will add the Raphael set, for example (verify exact names against
-# the driver log and linux-firmware's WHENCE before enabling):
+# Raphael (RDNA2 iGPU): GC 10.3.6 / MP0-MP1-MP2 13.0.5 / DCN 3.1.5 /
+# SDMA 5.2.6 / VCN 3.1.2, pinned by the Phase 6 C3 IP dump.
 #
-# amdgpu/gc_10_3_6_me.bin
-# amdgpu/gc_10_3_6_mec.bin
-# amdgpu/gc_10_3_6_mec2.bin
-# amdgpu/gc_10_3_6_pfp.bin
-# amdgpu/gc_10_3_6_rlc.bin
-# amdgpu/psp_13_0_5_sos.bin
-# amdgpu/psp_13_0_5_ta.bin
-# amdgpu/smu_13_0_5.bin
-# amdgpu/dcn_3_1_*_dmcub.bin
+# Notes for this ASIC:
+#   - no smu_13_0_5.bin: smu_v13_0_5's pptable_funcs omit .init_microcode,
+#     so smu_init_microcode() is a no-op and no SMU file is requested (the
+#     name does not exist in linux-firmware);
+#   - no psp_13_0_5_sos.bin: 13.0.5 is TOC-based (psp_13_0_5_toc.bin +
+#     psp_13_0_5_ta.bin) and psp_v13_0_init_microcode() never asks for SOS;
+#   - no jpeg blob: jpeg_v3_0's sw_init loads no firmware (JPEG shares the
+#     VCN image).
+amdgpu/gc_10_3_6_ce.bin
+amdgpu/gc_10_3_6_me.bin
+amdgpu/gc_10_3_6_mec.bin
+amdgpu/gc_10_3_6_mec2.bin
+amdgpu/gc_10_3_6_pfp.bin
+amdgpu/gc_10_3_6_rlc.bin
+amdgpu/psp_13_0_5_toc.bin
+amdgpu/psp_13_0_5_ta.bin
+amdgpu/sdma_5_2_6.bin
+amdgpu/vcn_3_1_2.bin
+amdgpu/dcn_3_1_5_dmcub.bin

@@ -13,6 +13,7 @@
 #include <linux/kthread.h>
 
 #include <linuxkpi/log.h>
+#include <linuxkpi/native_sched.h>
 
 extern void linuxkpi_run_initcalls_inline(void);
 extern void linuxkpi_pci_scan(void);
@@ -32,8 +33,12 @@ static int linuxkpi_initcalls_thread(void *arg) {
 
 void linuxkpi_run_initcalls(void) {
   struct task_struct *task;
+  unsigned long long start, elapsed;
+  unsigned int waited_ms = 0;
+  bool completed = false;
 
   init_completion(&initcalls_done);
+  start = linuxkpi_monotonic_ms();
 
   task = kthread_run(linuxkpi_initcalls_thread, NULL, "kpi/initcalls");
   if (IS_ERR(task)) {
@@ -45,7 +50,30 @@ void linuxkpi_run_initcalls(void) {
   }
 
   /* Bounded wait (this shim's jiffy is 1 ms): a wedged driver must not hold
-   * up the rest of the boot forever, but the timeout is reported loudly. */
-  if (wait_for_completion_timeout(&initcalls_done, 30000) == 0)
-    klog_puts("[WARN] LinuxKPI: initcalls timed out\n");
+   * up the rest of the boot forever, but the timeout is reported loudly.
+   * 10 minutes because a single amdgpu probe legitimately runs minutes on
+   * the passed-through GPU (PSP firmware loads, SMU/DMUB handshakes, DCN
+   * register bring-up in this emulation); running the suites while it is
+   * still probing makes them fight over the device (P6 C4: the VFIO suite
+   * lost its MSI vectors with -EBUSY).  Progress is logged every 30 s so a
+   * long-but-working probe is distinguishable from a wedge. */
+  while (waited_ms < 600000) {
+    if (wait_for_completion_timeout(&initcalls_done, 2000) > 0) {
+      completed = true;
+      break;
+    }
+    waited_ms += 2000;
+    if ((waited_ms % 30000) == 0)
+      klogf("[INFO] LinuxKPI: initcalls still running (%u s)\n",
+            waited_ms / 1000);
+  }
+
+  elapsed = linuxkpi_monotonic_ms() - start;
+  if (completed)
+    klogf("[INFO] LinuxKPI: initcalls completed in %lu.%03lu s\n",
+          (unsigned long)(elapsed / 1000),
+          (unsigned long)(elapsed % 1000));
+  else
+    klogf("[WARN] LinuxKPI: initcalls timed out after %lu s\n",
+          (unsigned long)(elapsed / 1000));
 }

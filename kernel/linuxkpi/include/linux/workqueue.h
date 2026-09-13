@@ -100,6 +100,20 @@ bool queue_delayed_work(struct workqueue_struct *wq,
                         struct delayed_work *dwork, unsigned long delay);
 bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *dwork,
                       unsigned long delay);
+
+/* Additions used by amdgpu (P6 C2). */
+bool flush_delayed_work(struct delayed_work *dwork);
+static inline bool cancel_work(struct work_struct *work) {
+  return cancel_work_sync(work);
+}
+#define __DELAYED_WORK_INITIALIZER(n, f, t)                                   \
+  {                                                                           \
+    .work = {.entry = {&(n).work.entry, &(n).work.entry}, .func = (f)},        \
+    .timer = {.entry = {&(n).timer.entry, &(n).timer.entry},                   \
+              .function = delayed_work_timer_fn},                              \
+  }
+#define create_singlethread_workqueue(name) alloc_ordered_workqueue(name, 0)
+#define create_workqueue(name) alloc_workqueue(name, 0, 0)
 bool cancel_delayed_work(struct delayed_work *dwork);
 bool cancel_delayed_work_sync(struct delayed_work *dwork);
 bool schedule_delayed_work_on(int cpu, struct delayed_work *dwork,
