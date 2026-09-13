@@ -34,7 +34,6 @@
 #define P5C4_ADAPTER_CYCLES 1000
 #define P5C4_THREAD_XFERS 50
 #define P5C4_GENERAL_ADDR 0x18
-#define P5C4_NUMBERED_NR 7
 #define P5C4_RD_PATTERN 0xA0
 /* E-DDC segment pointer (drm_edid.c defines the same value locally). */
 #define P5C4_DDC_SEG_ADDR 0x30
@@ -249,6 +248,7 @@ void linuxkpi_test_phase5_i2c(void) {
   u8 wbuf[3] = {0xde, 0xad, 0x01};
   u8 rbuf[8];
   int ret, first_id = -1;
+  int numbered_nr;
   int i;
 
   p5c4_failures = 0;
@@ -257,6 +257,21 @@ void linuxkpi_test_phase5_i2c(void) {
   memset(&p5c4_ddc, 0, sizeof(p5c4_ddc));
   memset(rbuf, 0, sizeof(rbuf));
   klog_puts("[LINUXKPI] Phase 5 i2c self-test\n");
+
+  /* Pick a numbered bus no other adapter has taken.  With CONFIG_DRM_AMD_DC
+   * live the boot has already registered the amdgpu DM DDC buses, so a fixed
+   * number (the old P5C4_NUMBERED_NR = 7) can collide and fail the suite. */
+  numbered_nr = -1;
+  for (i = 16; i < 64; i++) {
+    if (!i2c_get_adapter(i)) {
+      numbered_nr = i;
+      break;
+    }
+  }
+  if (numbered_nr < 0) {
+    p5c4_fail("no free numbered i2c bus", 0);
+    return;
+  }
 
   /* 1: dynamic and numbered registration, lookup, verify. */
   p5c4_init_adap(&p5c4_general.adap, "p5c4-general", &p5c4_general_algo,
@@ -269,9 +284,9 @@ void linuxkpi_test_phase5_i2c(void) {
 
   p5c4_init_adap(&p5c4_numbered.adap, "p5c4-numbered", &p5c4_general_algo,
                  &p5c4_numbered);
-  p5c4_numbered.adap.nr = P5C4_NUMBERED_NR;
+  p5c4_numbered.adap.nr = numbered_nr;
   ret = i2c_add_numbered_adapter(&p5c4_numbered.adap);
-  if (ret == 0 && p5c4_numbered.adap.nr == P5C4_NUMBERED_NR)
+  if (ret == 0 && p5c4_numbered.adap.nr == numbered_nr)
     p5c4_ok("i2c_add_numbered_adapter keeps the requested bus number");
   else
     p5c4_fail("i2c_add_numbered_adapter", ret);
@@ -282,7 +297,7 @@ void linuxkpi_test_phase5_i2c(void) {
 
     memset(&clash, 0, sizeof(clash));
     p5c4_init_adap(&clash.adap, "p5c4-clash", &p5c4_general_algo, &clash);
-    clash.adap.nr = P5C4_NUMBERED_NR;
+    clash.adap.nr = numbered_nr;
     clash_ret = i2c_add_numbered_adapter(&clash.adap);
     if (clash_ret == -EBUSY)
       p5c4_ok("numbered clash fails with -EBUSY");
@@ -304,7 +319,7 @@ void linuxkpi_test_phase5_i2c(void) {
       p5c4_fail("numbered without number", bad_ret);
   }
 
-  found = i2c_get_adapter(P5C4_NUMBERED_NR);
+  found = i2c_get_adapter(numbered_nr);
   if (found == &p5c4_numbered.adap)
     p5c4_ok("i2c_get_adapter finds the registered bus");
   else
