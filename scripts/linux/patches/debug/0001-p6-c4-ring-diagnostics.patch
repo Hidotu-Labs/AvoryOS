@@ -342,20 +342,27 @@
  	amdgpu_bo_kunmap(ring->mqd_obj);
  	ring->mqd_ptr = NULL;
  	amdgpu_bo_unreserve(ring->mqd_obj);
-@@ -6899,11 +7093,24 @@
+@@ -6899,15 +7093,29 @@
  	mqd = ring->mqd_ptr;
  
  	mutex_lock(&adev->srbm_mutex);
--	/* The RLC_CP_SCHEDULERS KIQ entry was programmed by the pre-MEC
--	 * gfx_v10_0_kiq_setting(); rewriting it after the MEC starts makes
--	 * the RLC reset the freshly loaded HQD, so leave it alone. */
+-	/* The pre-MEC gfx_v10_0_kiq_setting() write was dropped, so the
+-	 * RLC still has to be told which queue is the KIQ.  Write the
+-	 * scheduler entry in ONE write (0x80 marks it as KIQ); the
+-	 * upstream two-step RMW leaves a transient non-KIQ entry when
+-	 * done after the MEC has started. */
++	/* The pre-MEC gfx_v10_0_kiq_setting() write was dropped, so the RLC
++	 * still has to be told which queue is the KIQ.  Single write (0x80
++	 * marks the entry as KIQ) to avoid the transient entry the upstream
++	 * two-step RMW would leave after the MEC has started. */
+ 	WREG32_SOC15(GC, 0, mmRLC_CP_SCHEDULERS,
+ 		     (ring->me << 5) | (ring->pipe << 3) | ring->queue | 0x80);
++	/* AVORYOS P6 C4 debug (temporary) */
++	dev_info(adev->dev, "kpi-trace[kiq-reload]: rlc_sched=%08x\n",
++		 RREG32_SOC15(GC, 0, mmRLC_CP_SCHEDULERS));
  	nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
 +	/* AVORYOS P6 C4 debug (temporary) */
 +	dev_info(adev->dev, "kpi-trace[kiq-reload]: select done\n");
-+	/* AVORYOS P6 C4 debug (temporary): do not rewrite RLC_CP_SCHEDULERS
-+	 * after the MEC starts; just report what the pre-MEC setting left. */
-+	dev_info(adev->dev, "kpi-trace[kiq-reload]: rlc_sched=%08x\n",
-+		 RREG32_SOC15(GC, 0, mmRLC_CP_SCHEDULERS));
  	gfx_v10_0_kiq_load_hqd_writes(adev, ring, mqd);
 +	/* AVORYOS P6 C4 debug (temporary) */
 +	dev_info(adev->dev,
@@ -370,7 +377,7 @@
  	nv_grbm_select(adev, 0, 0, 0, 0);
  	mutex_unlock(&adev->srbm_mutex);
  
-@@ -6913,6 +7120,7 @@
+@@ -6917,6 +7125,7 @@
  	return 0;
  }
  
@@ -378,7 +385,7 @@
  static int gfx_v10_0_kcq_resume(struct amdgpu_device *adev)
  {
  	struct amdgpu_ring *ring = NULL;
-@@ -6946,6 +7154,10 @@
+@@ -6950,6 +7159,10 @@
  			goto done;
  	}
  
@@ -389,7 +396,7 @@
  	r = amdgpu_gfx_enable_kcq(adev, 0);
  done:
  	return r;
-@@ -6974,10 +7186,13 @@
+@@ -6978,10 +7191,13 @@
  		r = amdgpu_mes_kiq_hw_init(adev);
  	else
  		r = gfx_v10_0_kiq_resume(adev);
@@ -403,7 +410,7 @@
  	if (r)
  		return r;
  
-@@ -8354,7 +8569,48 @@
+@@ -8358,7 +8574,48 @@
  		if (ring->use_doorbell) {
  			atomic64_set((atomic64_t *)ring->wptr_cpu_addr,
  				     ring->wptr);

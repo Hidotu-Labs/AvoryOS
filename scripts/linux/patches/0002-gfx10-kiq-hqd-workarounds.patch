@@ -18,7 +18,7 @@
  		WREG32_SOC15(GC, 0, mmCP_HQD_DEQUEUE_REQUEST,
  		       mqd->cp_hqd_dequeue_request);
  		WREG32_SOC15(GC, 0, mmCP_HQD_PQ_RPTR,
-@@ -6812,6 +6823,96 @@
+@@ -6812,6 +6823,100 @@
  	return 0;
  }
  
@@ -98,9 +98,13 @@
 +	mqd = ring->mqd_ptr;
 +
 +	mutex_lock(&adev->srbm_mutex);
-+	/* The RLC_CP_SCHEDULERS KIQ entry was programmed by the pre-MEC
-+	 * gfx_v10_0_kiq_setting(); rewriting it after the MEC starts makes
-+	 * the RLC reset the freshly loaded HQD, so leave it alone. */
++	/* The pre-MEC gfx_v10_0_kiq_setting() write was dropped, so the
++	 * RLC still has to be told which queue is the KIQ.  Write the
++	 * scheduler entry in ONE write (0x80 marks it as KIQ); the
++	 * upstream two-step RMW leaves a transient non-KIQ entry when
++	 * done after the MEC has started. */
++	WREG32_SOC15(GC, 0, mmRLC_CP_SCHEDULERS,
++		     (ring->me << 5) | (ring->pipe << 3) | ring->queue | 0x80);
 +	nv_grbm_select(adev, ring->me, ring->pipe, ring->queue, 0);
 +	gfx_v10_0_kiq_load_hqd_writes(adev, ring, mqd);
 +	nv_grbm_select(adev, 0, 0, 0, 0);
@@ -115,7 +119,7 @@
  static int gfx_v10_0_kcq_resume(struct amdgpu_device *adev)
  {
  	struct amdgpu_ring *ring = NULL;
-@@ -6835,6 +6936,15 @@
+@@ -6835,6 +6940,15 @@
  		if (r)
  			goto done;
  	}
