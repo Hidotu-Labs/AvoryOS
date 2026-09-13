@@ -1588,6 +1588,57 @@ amdgpu bring-up and all ring tests:
   `scripts/linux/patches/debug/` (not applied); the vkms GEM PMM drift
   watch item from C3 stays on the list for C5.
 
+### C5 — 6d: queues, VM, BOs, command submission (in progress 2026-09-13)
+
+Started from `p6-6c` (annotated tag created on the C4-closeout commit
+`f41699f`; `p6-6a`/`p6-6b` were never tagged because C1–C3 all landed in the
+single `0b6e3b2` checkpoint, so there is no clean per-chunk commit for
+them).  First increment: the P2 VMA-bridge prerequisite, test-first.
+
+- [x] P2 gap fixed: every VMA remove/re-add preserves the Linux wrapper.
+      `vma_linux_get()`/`vma_linux_put()` are public; `vma_mprotect()` holds
+      a reference across the split/re-add, the mremap grow/move paths take
+      the pending `f_op->mmap()` wrapper and attach it to the re-added node
+      (`linuxkpi_vma_rebase()` widens it onto the whole node and restores
+      `vm_pgoff`), and the grows-down fault path does the same.
+      `linuxkpi_vma_no_expand()` makes mremap of a `VM_DONTEXPAND`
+      (GEM/dma-buf) mapping return `-EINVAL` like upstream, keeping those
+      mappings out of the native re-add paths.  Files:
+      `kernel/src/mm/vma.{c,h}`, `kernel/src/syscalls/sys_mm.c`,
+      `kernel/src/mm/vmm_fault.c`, `kernel/linuxkpi/src/file.c`.
+- [x] Tests: `userland/test_kpi_dmabuf.c` gained an mprotect section
+      (full-range + split-range: wrapper must not close at mprotect, exactly
+      once at munmap) and an mremap section (EINVAL, mapping intact, one
+      close at munmap).
+- Evidence:
+  - Headless `make run-linuxdrm SERIAL=file:build/logs/p6-c5-vma-regress.log
+    DISPLAY_OPT='-display none'` (no VFIO, GPU untouched):
+    **263 `[  OK  ]`, 0 `[FAIL]`, login reached**;
+    `[  OK  ] LinuxKPI: fw 11 staged amdgpu blobs match host CRC`;
+    `[  OK  ] LinuxKPI: i2c two threads serialize through one adapter`.
+  - `bin/test_kpi_dmabuf` in the interactive session:
+    `=== ALL TESTS PASSED ===`, including `mprotect did not close the
+    wrapper`, `wrapper closed exactly once at munmap`, `mremap rejected with
+    EINVAL (VM_DONTEXPAND)`, `rejected mremap did not close the wrapper`,
+    and the 200-loop soak with `PMM ... delta=193` (not backwards).
+  - Incident during the session: an earlier boot from a disk image whose
+    rebuild had been interrupted showed 12 firmware `[FAIL]`s and an i2c
+    serialization failure + `boot self-tests timed out`.  Root cause was the
+    image missing `/lib/firmware`, not the kernel: the clean boot above is
+    green and has never had that failure in any C4 log.  Do not kill a
+    `make` during the disk rebuild (make deletes `disk.img` on interrupt).
+- Deviation recorded (`docs/linuxkpi-gaps.md` P6 C5): mremap of a movable
+  bridged mapping creates a fresh wrapper via `f_op->mmap` and the removed
+  node's wrapper closes (refs balanced, each wrapper closes exactly once;
+  upstream keeps one VMA and calls `vm_ops->open`).  No current consumer
+  expands a bridged mapping; `VM_DONTEXPAND` covers all of them.
+- Next (C5 remainder): real `unmap_mapping_range()`, ww_mutex
+  eviction/contention stress, `amdgpu_bo` teardown audit,
+  `bin/test_kpi_amdgpu` (GEM VRAM/GTT, mmap, PRIME, CTX, VM map/unmap,
+  SDMA-copy CS + `WAIT_CS`, timeout path, INFO/BO list), 1k BO loop
+  invariants.  The hardware half needs a cold GPU (host reboot; see
+  `docs/amdgpu-testing.md`) and `amdgpu.modeset=0`.
+
 ## Cross-phase notes
 
 - `run-vfio` (BDF default `0000:0e:00.0`) has not been booted with the GPU

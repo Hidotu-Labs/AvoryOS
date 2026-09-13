@@ -37,17 +37,25 @@ static inline void vma_drop_file_ref(struct vma *v) {
 /* Linux vm_area_struct wrapper lifetime.  Native nodes share one wrapper per
  * original mapping; the bridge calls vm_ops->close() exactly once, when the
  * last reference drops (kernel/linuxkpi/src/mmap.c). */
-static inline void vma_linux_ref(void *linux_vma) {
+void vma_linux_get(void *linux_vma) {
   extern void linuxkpi_vma_ref(void *) __attribute__((weak));
   if (linux_vma && linuxkpi_vma_ref)
     linuxkpi_vma_ref(linux_vma);
 }
 
-static inline void vma_drop_linux_ref(struct vma *v) {
+void vma_linux_put(void *linux_vma) {
   extern void linuxkpi_vma_unref(void *) __attribute__((weak));
+  if (linux_vma && linuxkpi_vma_unref)
+    linuxkpi_vma_unref(linux_vma);
+}
+
+static inline void vma_linux_ref(void *linux_vma) {
+  vma_linux_get(linux_vma);
+}
+
+static inline void vma_drop_linux_ref(struct vma *v) {
   if (v && v->linux_vma) {
-    if (linuxkpi_vma_unref)
-      linuxkpi_vma_unref(v->linux_vma);
+    vma_linux_put(v->linux_vma);
     v->linux_vma = NULL;
   }
 }
@@ -364,11 +372,7 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
      * pieces each took one above, so a wrapper shared by pieces stays alive
      * until the last piece goes.  A fully-covered node's last reference was
      * just dropped by delete_node(), closing the wrapper. */
-    if (vma_linux_vma) {
-      extern void linuxkpi_vma_unref(void *) __attribute__((weak));
-      if (linuxkpi_vma_unref)
-        linuxkpi_vma_unref(vma_linux_vma);
-    }
+    vma_linux_put(vma_linux_vma);
   }
 
   return overall_removed;
@@ -399,7 +403,13 @@ int vma_mprotect(struct vma_list *list, uint64_t start, uint64_t end,
     uint64_t orig_file_size = v->file_size;
     void *vma_file_node = v->file_node;
     uint64_t original_start = v->start;
+    /* Keep the Linux wrapper alive across the remove/re-add: a full-range
+     * mprotect drops the last node reference inside vma_remove(), and the
+     * re-added node must inherit the wrapper (upstream neither closes the
+     * mapping nor loses its vm_ops when protections change). */
+    void *vma_linux_vma = v->linux_vma;
     vma_file_ref(vma_file_node);
+    vma_linux_get(vma_linux_vma);
 
     uint64_t rel = m_start - original_start;
     uint64_t m_len = m_end - m_start;
@@ -414,6 +424,8 @@ int vma_mprotect(struct vma_list *list, uint64_t start, uint64_t end,
     vma_add(list, m_start, m_end, new_prot, flags, fd,
             offset + rel, vma_file_node, sub_file_size);
     vma_file_unref(vma_file_node);
+    vma_attach_linux(list, m_start, vma_linux_vma);
+    vma_linux_put(vma_linux_vma);
 
     curr = m_end;
   }

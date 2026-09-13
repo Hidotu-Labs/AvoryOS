@@ -421,19 +421,26 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       uint64_t flags = vma->flags;
       int fd = vma->fd;
       uint64_t offset = vma->offset;
+      /* Stack VMAs are anonymous, but a MAP_GROWSDOWN file mapping can carry
+       * a bridge wrapper; keep it across the remove/re-add (P2 gap). */
+      void *keep_lvma = vma->linux_vma;
 
+      vma_linux_get(keep_lvma);
       vma_remove(&current->mm->vmas, old_start, old_end);
       if (vma_add(&current->mm->vmas, new_start, old_end, prot, flags, fd,
                   offset, NULL, 0) != 0) {
         klog_puts("[VMM] Stack expansion failed (overlap?) for CR2=");
         klog_hex64(cr2);
         klog_puts("\n");
-        vma_add(&current->mm->vmas, old_start, old_end, prot, flags, fd, offset,
-                NULL, 0);
+        if (vma_add(&current->mm->vmas, old_start, old_end, prot, flags, fd,
+                    offset, NULL, 0) == 0)
+          vma_attach_linux(&current->mm->vmas, old_start, keep_lvma);
         vma = NULL;
       } else {
+        vma_attach_linux(&current->mm->vmas, new_start, keep_lvma);
         vma = vma_find(&current->mm->vmas, cr2);
       }
+      vma_linux_put(keep_lvma);
     } else {
       struct vma *potential =
           vma_find_growdown(&current->mm->vmas, cr2, 1024ULL * 1024 * 1024);

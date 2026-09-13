@@ -66,6 +66,12 @@ int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
 // at `start` is ignored (best effort for the mmap path).
 void vma_attach_linux(struct vma_list *list, uint64_t start, void *linux_vma);
 
+// Take/drop a bare reference on a Linux wrapper without touching a native
+// node.  Callers that must keep the wrapper alive across a remove/re-add
+// (mprotect, mremap, stack growth) hold one across the operation.
+void vma_linux_get(void *linux_vma);
+void vma_linux_put(void *linux_vma);
+
 // Remove a VMA region by address range (auto-splits and auto-unmaps Native
 // structures) Returns true if any region was removed/split
 bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end);

@@ -414,6 +414,41 @@ Update this file in the same change that introduces or closes a gap.
   boot ever shows the doorbell not reaching the HQD, re-enable and
   re-evaluate.
 
+### C5 — 6d: queues, VM, BOs, command submission
+
+Landed 2026-09-13 (kernel prerequisites; no CS tests yet):
+
+- **VMA re-adds preserve the Linux wrapper** (`kernel/src/mm/vma.c`,
+  `kernel/src/syscalls/sys_mm.c`, `kernel/src/mm/vmm_fault.c`,
+  `kernel/linuxkpi/src/file.c`).  The Phase 2 gap: only the
+  sys_mmap/teardown/clone paths called `vma_attach_linux()`; mprotect,
+  mremap and stack growth re-added native VMAs with plain `vma_add()`, so a
+  bridged mapping (dma-buf, later amdgpu BOs) could lose its `vm_ops` — a
+  full-range mprotect dropped the last wrapper reference inside
+  `vma_remove()`, closing at mprotect time and re-adding with no wrapper.
+  `vma_linux_get()`/`vma_linux_put()` are now public and every remove/re-add
+  holds a temporary reference across the gap: `vma_mprotect()` (all splits),
+  the mremap grow and move paths, and the grows-down fault path.
+- **mremap attaches the wrapper the `f_op->mmap()` created.**  The
+  shared-file grow/move paths take the thread's pending bridge wrapper and
+  attach it to the re-added node; `linuxkpi_vma_rebase()` widens it from
+  the new pages to the whole native node and restores the original
+  `vm_pgoff`, so a later fault still resolves the right file offset.  Before
+  this the pending wrapper was simply leaked and the new node had no
+  `vm_ops`.
+- **mremap on `VM_DONTEXPAND` returns `-EINVAL`** like upstream:
+  `sys_mremap()` asks the bridge via `linuxkpi_vma_no_expand()` (the flag
+  lives only in the Linux-facing `vm_area_struct`).  GEM and dma-buf
+  mappings set `VM_DONTEXPAND`, so they now stay out of the native
+  remove/re-add paths entirely, matching Linux `do_mremap()`.
+- Divergence that remains: upstream mremap of a movable bridged mapping
+  keeps one VMA and calls `vm_ops->open()`; here the shared-file paths
+  create a fresh wrapper through `f_op->mmap()` and the removed node's
+  wrapper closes (object references stay balanced and each wrapper closes
+  exactly once, but it is observable as an extra open/close pair).  No
+  current consumer expands a bridged mapping; `VM_DONTEXPAND` covers all of
+  them.
+
 ## Phase 5 gaps (full I/O foundations)
 
 Index: C1 PCI · C2 IRQ/MSI · C3 ACPI/firmware · C4 i2c · C5 sysfs/devres/PM ·
@@ -1075,6 +1110,10 @@ divergences for its chunk; the Phase 5 exit matrix in
   therefore lose its `vm_ops` (close fires via the old wrapper reference while
   the new VMA has none).  Phase 6/7 (amdgpu VM) must route every re-add through
   `vma_attach_linux()` to preserve exactly-once close semantics.
+  **Fixed in P6 C5 (2026-09-13):** every remove/re-add now holds a
+  `vma_linux_get()` reference across the gap and attaches it to the re-added
+  node; mremap on a `VM_DONTEXPAND` bridged mapping is rejected with
+  `-EINVAL` like upstream.  Details in "Phase 6 gaps" C5.
 - **Shrinker API is inert** (`linuxkpi/src/shrinker.c`): registration succeeds
   and the callback is never invoked, so TTM's pool never proactively evicts
   under memory pressure.  Reclaim currently has no shrinker caller at all; the

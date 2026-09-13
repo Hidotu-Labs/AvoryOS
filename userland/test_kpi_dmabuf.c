@@ -7,10 +7,14 @@
 //      back, munmap and verify vm_ops->close ran exactly once.
 //   2. Same on the device node itself, whose f_op->mmap() drives the
 //      driver-side dma_buf_mmap() path.
-//   3. fork(): the child imports the inherited dma-buf fd (dma_buf_get),
+//   3. mprotect() on a mapped BO: the bridge wrapper must survive the native
+//      VMA remove/re-add, so vm_ops->close() runs exactly once, at munmap.
+//   4. mremap() on a mapped BO: VM_DONTEXPAND mappings are rejected with
+//      EINVAL like upstream, leaving the mapping intact.
+//   5. fork(): the child imports the inherited dma-buf fd (dma_buf_get),
 //      waits on an inherited sync_file fd, maps the BO, checks the parent's
 //      pattern and writes its own; the parent sees the child's write.
-//   4. Alloc/map/free soak loop with a native PMM free-page check.
+//   6. Alloc/map/free soak loop with a native PMM free-page check.
 //
 // Build: userland/test_kpi_dmabuf.elf, installed as /bin/test_kpi_dmabuf.
 
@@ -166,7 +170,159 @@ static void test_device_mmap(int dev) {
     close(fd);
 }
 
-/* 3. fork(): inherited dma-buf + sync_file fds across two processes. */
+/* 3. mprotect() must keep the Linux vm_area_struct wrapper attached: upstream
+ * neither closes the mapping when protections change nor loses its vm_ops.
+ * The wrapper is shared by the split native VMAs, so vm_ops->close() must
+ * still run exactly once, at munmap. */
+static void test_mprotect_bridge(int dev) {
+    unsigned long pages = 64;
+    size_t size = pages * PAGE_SIZE_;
+    unsigned long before, mid, after;
+    int fd;
+    unsigned char *p;
+
+    printf("\n=== mprotect keeps the bridge wrapper (close only at munmap) ===\n");
+
+    before = close_count(dev);
+    fd = (int)ioctl(dev, KPI_DMABUF_IOC_ALLOC, pages);
+    if (fd < 0) {
+        fail("ioctl(ALLOC) returned a dma-buf fd", errno);
+        return;
+    }
+
+    p = map_fd(fd, pages, MAP_SHARED);
+    if (!p) {
+        fail("mmap(dma-buf fd)", errno);
+        close(fd);
+        return;
+    }
+
+    p[0] = 0x5a;
+    p[size - 1] = 0xa5;
+
+    /* Full-range protection change.  With the wrapper dropped on the re-add
+     * this closed the mapping right here instead of at munmap. */
+    if (mprotect(p, size, PROT_READ) == 0)
+        pass("mprotect(full range, PROT_READ)");
+    else
+        fail("mprotect(full range, PROT_READ)", errno);
+
+    if (p[0] == 0x5a && p[size - 1] == 0xa5)
+        pass("mapping readable while write-protected");
+    else
+        fail("mapping readable while write-protected", 0);
+
+    /* Split-range change: the middle native VMA splits off and must keep a
+     * reference to the same wrapper. */
+    if (mprotect(p + PAGE_SIZE_, 3 * PAGE_SIZE_, PROT_READ) == 0)
+        pass("mprotect(split range, PROT_READ)");
+    else
+        fail("mprotect(split range, PROT_READ)", errno);
+
+    if (mprotect(p, size, PROT_READ | PROT_WRITE) == 0)
+        pass("mprotect(full range, PROT_READ|PROT_WRITE)");
+    else
+        fail("mprotect(full range, PROT_READ|PROT_WRITE)", errno);
+
+    p[PAGE_SIZE_] = 0x5b;
+    if (p[0] == 0x5a && p[PAGE_SIZE_] == 0x5b && p[size - 1] == 0xa5)
+        pass("data survives the protection changes");
+    else
+        fail("data survives the protection changes", 0);
+
+    mid = close_count(dev);
+    if (mid == before) {
+        pass("mprotect did not close the wrapper");
+    } else {
+        failures++;
+        printf("  [FAIL] mprotect close count %lu -> %lu (expected +0)\n",
+               before, mid);
+    }
+
+    if (munmap(p, size) == 0)
+        pass("munmap after mprotect");
+    else
+        fail("munmap after mprotect", errno);
+
+    after = close_count(dev);
+    if (after == before + 1) {
+        pass("wrapper closed exactly once at munmap");
+    } else {
+        failures++;
+        printf("  [FAIL] mprotect close count %lu -> %lu (expected +1)\n",
+               before, after);
+    }
+    close(fd);
+}
+
+/* 4. mremap() on a VM_DONTEXPAND mapping (GEM/dma-buf mappings set it) must
+ * fail with EINVAL like upstream and leave the mapping untouched. */
+static void test_mremap_bridge(int dev) {
+    unsigned long pages = 32;
+    size_t size = pages * PAGE_SIZE_;
+    unsigned long before, after;
+    void *q;
+    int fd;
+    unsigned char *p;
+
+    printf("\n=== mremap on a VM_DONTEXPAND mapping is rejected ===\n");
+
+    before = close_count(dev);
+    fd = (int)ioctl(dev, KPI_DMABUF_IOC_ALLOC, pages);
+    if (fd < 0) {
+        fail("ioctl(ALLOC) returned a dma-buf fd", errno);
+        return;
+    }
+
+    p = map_fd(fd, pages, MAP_SHARED);
+    if (!p) {
+        fail("mmap(dma-buf fd)", errno);
+        close(fd);
+        return;
+    }
+    p[0] = 0x77;
+    p[size - 1] = 0x88;
+
+    errno = 0;
+    q = mremap(p, size, size * 2, MREMAP_MAYMOVE);
+    if (q == MAP_FAILED && errno == EINVAL) {
+        pass("mremap rejected with EINVAL (VM_DONTEXPAND)");
+    } else if (q == MAP_FAILED) {
+        fail("mremap rejected with EINVAL", errno);
+    } else {
+        fail("mremap unexpectedly succeeded on a VM_DONTEXPAND mapping", 0);
+        munmap(q, size * 2);
+        close(fd);
+        return;
+    }
+
+    if (p[0] == 0x77 && p[size - 1] == 0x88)
+        pass("mapping intact after the rejected mremap");
+    else
+        fail("mapping intact after the rejected mremap", 0);
+
+    if (close_count(dev) == before)
+        pass("rejected mremap did not close the wrapper");
+    else
+        fail("rejected mremap did not close the wrapper", 0);
+
+    if (munmap(p, size) == 0)
+        pass("munmap after rejected mremap");
+    else
+        fail("munmap after rejected mremap", errno);
+
+    after = close_count(dev);
+    if (after == before + 1) {
+        pass("wrapper closed exactly once at munmap");
+    } else {
+        failures++;
+        printf("  [FAIL] mremap close count %lu -> %lu (expected +1)\n",
+               before, after);
+    }
+    close(fd);
+}
+
+/* 5. fork(): inherited dma-buf + sync_file fds across two processes. */
 static int test_fork_prime(int dev) {
     unsigned long pages = 256;
     size_t size = pages * PAGE_SIZE_;
@@ -268,7 +424,7 @@ static int test_fork_prime(int dev) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-/* 4. Alloc/map/free loop with a PMM free-page delta. */
+/* 6. Alloc/map/free loop with a PMM free-page delta. */
 static void test_soak(int dev) {
     long baseline, final;
     unsigned long c0, c1;
@@ -503,6 +659,8 @@ int main(int argc, char **argv) {
 
     test_fd_mmap(dev);
     test_device_mmap(dev);
+    test_mprotect_bridge(dev);
+    test_mremap_bridge(dev);
     test_fork_prime(dev);
     test_soak(dev);
 

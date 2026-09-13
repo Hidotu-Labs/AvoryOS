@@ -554,6 +554,29 @@ void linuxkpi_vma_unref(void *w) {
   kfree(b);
 }
 
+/* VM_DONTEXPAND lives only in the Linux-facing vm_area_struct; native mremap
+ * asks through here so GEM/dma-buf mappings reject with -EINVAL like upstream
+ * instead of going through the native remove/re-add paths. */
+bool linuxkpi_vma_no_expand(void *w) {
+  struct kpi_mmap_bridge *b = w;
+
+  return b && (b->vma.vm_flags & VM_DONTEXPAND);
+}
+
+/* After mremap grew or moved the native VMA, the wrapper created for the new
+ * pages only covers that sub-range.  Rebase it onto the whole native node and
+ * restore the original file offset so fault-time pgoff stays correct. */
+void linuxkpi_vma_rebase(void *w, unsigned long start, unsigned long end,
+                         unsigned long pgoff) {
+  struct kpi_mmap_bridge *b = w;
+
+  if (!b)
+    return;
+  b->vma.vm_start = start;
+  b->vma.vm_end = end;
+  b->vma.vm_pgoff = pgoff >> PAGE_SHIFT;
+}
+
 static unsigned long kpi_prot_to_vm_flags(uint64_t prot, uint64_t flags) {
   unsigned long vm = 0;
 

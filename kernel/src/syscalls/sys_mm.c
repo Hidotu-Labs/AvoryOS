@@ -643,6 +643,19 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
 
   spinlock_acquire(&current->mm->lock);
 
+  /* Upstream rejects any mremap of a VM_DONTEXPAND VMA (GEM and dma-buf
+   * mappings set it).  The native tree has no such flag, so ask the bridge
+   * wrapper; this also keeps those mappings out of the remove/re-add paths
+   * below, exactly like upstream. */
+  struct vma *orig_vma = vma_find(&current->mm->vmas, old_addr);
+  if (orig_vma && orig_vma->linux_vma) {
+    extern bool linuxkpi_vma_no_expand(void *) __attribute__((weak));
+    if (linuxkpi_vma_no_expand && linuxkpi_vma_no_expand(orig_vma->linux_vma)) {
+      spinlock_release(&current->mm->lock);
+      return E_INVAL;
+    }
+  }
+
   // Shrink: just unmap the tail pages and update the VMA.
   if (aligned_new <= aligned_old) {
     if (aligned_new < aligned_old) {
@@ -676,8 +689,8 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
     }
   }
 
-  // Look up the original VMA to get its protection/flags.
-  struct vma *orig_vma = vma_find(&current->mm->vmas, old_addr);
+  // The original VMA was looked up above for the VM_DONTEXPAND check; the
+  // shrink path returned already, so it is still valid here.
   if (!orig_vma) {
     spinlock_release(&current->mm->lock);
     return E_INVAL;
@@ -688,6 +701,14 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
   uint64_t vma_offset = orig_vma->offset;
   vfs_node_t *vma_file = (vfs_node_t *)orig_vma->file_node;
   uint64_t page_flags = build_page_flags(prot);
+
+  /* A Linux f_op->mmap() call leaves its bridge wrapper pending on this
+   * thread; the remove/re-add paths below must attach it to the new native
+   * VMA, or vm_ops->close() is never tied to this mapping (P2 gap). */
+  extern void *linuxkpi_vma_take_pending(void) __attribute__((weak));
+  extern void linuxkpi_vma_unref(void *) __attribute__((weak));
+  extern void linuxkpi_vma_rebase(void *, unsigned long, unsigned long,
+                                  unsigned long) __attribute__((weak));
 
   if (can_grow_inplace) {
     /* Preserve the backing object when a shared file mapping grows.
@@ -702,12 +723,26 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
         return E_NOMEM;
       }
 
+      /* The f_op->mmap() above created a wrapper covering only the new
+       * pages; make the re-added node own it and rebase it onto the whole
+       * mapping so fault-time pgoff stays at vma_offset. */
+      void *new_lvma =
+          linuxkpi_vma_take_pending ? linuxkpi_vma_take_pending() : NULL;
+
       /* Keep the file alive while replacing the old VMA reference. */
       vfs_node_ref(vma_file);
       vma_remove(&current->mm->vmas, old_addr, old_addr + aligned_old);
       int add_ret =
           vma_add(&current->mm->vmas, old_addr, old_addr + aligned_new, prot,
                   vma_flags, vma_fd, vma_offset, vma_file, 0);
+      if (add_ret == 0 && new_lvma) {
+        if (linuxkpi_vma_rebase)
+          linuxkpi_vma_rebase(new_lvma, old_addr, old_addr + aligned_new,
+                              vma_offset);
+        vma_attach_linux(&current->mm->vmas, old_addr, new_lvma);
+      }
+      if (new_lvma && linuxkpi_vma_unref)
+        linuxkpi_vma_unref(new_lvma);
       vfs_close(vma_file);
       if (add_ret < 0) {
         spinlock_release(&current->mm->lock);
@@ -733,10 +768,17 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
       void *kva = (void *)((uint64_t)phys + HHDM_OFFSET);
       memset(kva, 0, PAGE_SIZE);
     }
-    // Extend the VMA to cover the new range.
+    // Extend the VMA to cover the new range, keeping any bridge wrapper.
+    void *keep_lvma = orig_vma->linux_vma;
+    vma_linux_get(keep_lvma);
     vma_remove(&current->mm->vmas, old_addr, old_addr + aligned_old);
     vma_add(&current->mm->vmas, old_addr, old_addr + aligned_new, prot,
             vma_flags, -1, 0, NULL, 0);
+    if (keep_lvma && linuxkpi_vma_rebase)
+      linuxkpi_vma_rebase(keep_lvma, old_addr, old_addr + aligned_new,
+                          vma_offset);
+    vma_attach_linux(&current->mm->vmas, old_addr, keep_lvma);
+    vma_linux_put(keep_lvma);
     spinlock_release(&current->mm->lock);
     return old_addr;
   }
@@ -767,6 +809,11 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
       return E_NOMEM;
     }
 
+    /* The f_op->mmap() above created the wrapper for the new address; the
+     * re-added node owns it (the old wrapper closes with the removed node). */
+    void *new_lvma =
+        linuxkpi_vma_take_pending ? linuxkpi_vma_take_pending() : NULL;
+
     vfs_node_ref(vma_file);
     teardown_range(pml4, current, old_addr, aligned_old, true,
                    "mremap file move");
@@ -774,6 +821,14 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
     int add_ret =
         vma_add(&current->mm->vmas, new_addr, new_addr + aligned_new, prot,
                 vma_flags, vma_fd, vma_offset, vma_file, 0);
+    if (add_ret == 0 && new_lvma) {
+      if (linuxkpi_vma_rebase)
+        linuxkpi_vma_rebase(new_lvma, new_addr, new_addr + aligned_new,
+                            vma_offset);
+      vma_attach_linux(&current->mm->vmas, new_addr, new_lvma);
+    }
+    if (new_lvma && linuxkpi_vma_unref)
+      linuxkpi_vma_unref(new_lvma);
     vfs_close(vma_file);
     if (add_ret < 0) {
       spinlock_release(&current->mm->lock);
@@ -814,13 +869,20 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
     }
   }
 
-  // Tear down old mapping.
+  // Tear down old mapping, keeping any bridge wrapper for the new node.
+  void *keep_lvma = orig_vma->linux_vma;
+  vma_linux_get(keep_lvma);
   teardown_range(pml4, current, old_addr, aligned_old, true, "mremap move");
   vma_remove(&current->mm->vmas, old_addr, old_addr + aligned_old);
 
-  // Register new VMA.
+  // Register new VMA and hand it the preserved wrapper.
   vma_add(&current->mm->vmas, new_addr, new_addr + aligned_new, prot, vma_flags,
           -1, 0, NULL, 0);
+  if (keep_lvma && linuxkpi_vma_rebase)
+    linuxkpi_vma_rebase(keep_lvma, new_addr, new_addr + aligned_new,
+                        vma_offset);
+  vma_attach_linux(&current->mm->vmas, new_addr, keep_lvma);
+  vma_linux_put(keep_lvma);
 
   current->mm->mmap_next_addr =
       MAX(current->mm->mmap_next_addr, new_addr + aligned_new);
