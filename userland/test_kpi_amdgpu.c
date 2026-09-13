@@ -268,6 +268,7 @@ static int cs_submit(int fd, uint32_t ctx_id, uint32_t bo_list_handle,
                      uint32_t ib_bytes, uint64_t *out_fence) {
     struct drm_amdgpu_cs_chunk_ib ib;
     struct drm_amdgpu_cs_chunk chunk;
+    uint64_t chunk_ptrs[1];
     union drm_amdgpu_cs args;
 
     memset(&ib, 0, sizeof(ib));
@@ -283,11 +284,16 @@ static int cs_submit(int fd, uint32_t ctx_id, uint32_t bo_list_handle,
     chunk.length_dw = sizeof(ib) / 4;
     chunk.chunk_data = (uint64_t)(uintptr_t)&ib;
 
+    /* 6.6 uAPI: cs.in.chunks points to an array of u64 pointers, and each
+     * entry points at the chunk descriptor (drm_amdgpu_cs_parser_init()
+     * copies the pointer array first, then each chunk). */
+    chunk_ptrs[0] = (uint64_t)(uintptr_t)&chunk;
+
     memset(&args, 0, sizeof(args));
     args.in.ctx_id = ctx_id;
     args.in.bo_list_handle = bo_list_handle;
     args.in.num_chunks = 1;
-    args.in.chunks = (uint64_t)(uintptr_t)&chunk;
+    args.in.chunks = (uint64_t)(uintptr_t)chunk_ptrs;
     if (ioctl(fd, DRM_IOCTL_AMDGPU_CS, &args))
         return -1;
     *out_fence = args.out.handle;

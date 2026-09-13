@@ -416,7 +416,9 @@ Update this file in the same change that introduces or closes a gap.
 
 ### C5 — 6d: queues, VM, BOs, command submission
 
-Landed 2026-09-13 (kernel prerequisites; no CS tests yet):
+Green 2026-09-13 (cold-GPU `run-c5` boot: `bin/test_kpi_amdgpu` ALL TESTS
+PASSED, kernel suites 246 OK / 0 FAIL).  Entries below are the kernel
+prerequisites and the hardware-bring-up findings.
 
 - **VMA re-adds preserve the Linux wrapper** (`kernel/src/mm/vma.c`,
   `kernel/src/syscalls/sys_mm.c`, `kernel/src/mm/vmm_fault.c`,
@@ -474,6 +476,24 @@ Landed 2026-09-13 (kernel prerequisites; no CS tests yet):
   through the importing device node is invalidated together with the fd
   mapping.  `test_kpi_dmabuf` asserts both PTE pools are zapped and that a
   passed `unmap_mapping_range` does not close either wrapper early.
+- **Bridged faults must page-align the fault address** (found 2026-09-13
+  during the C5 hardware run): `linuxkpi_vma_fault()` passed the raw CR2 -
+  the exact faulting offset - to `vm_ops->fault()`.  TTM's
+  `vmf_insert_pfn_prot(vma, addr, ...)` rejects `addr + PAGE_SIZE >
+  vm_end`, so the last page of a mapping faulting at an unaligned address
+  returned SIGBUS; TTM turns that into `VM_FAULT_NOPAGE` (not an error), the
+  bridge reported the fault "handled" and the CPU re-faulted the same
+  instruction forever.  Linux's `handle_mm_fault()` aligns the address
+  before calling the handler; `linuxkpi_vma_fault()` now does the same for
+  `vmf.address` and `vmf.pgoff`.  Symptom was a userland livelock (CPU
+  spinning in the fault path, no VM-fault counter, no GPU hang) at the last
+  bytes of a 64 KiB BO mapping.
+- **`AMDGPU_CS` chunks use the 6.6 pointer-array uAPI** (found the same
+  day): `drm_amdgpu_cs_in.chunks` points to an array of `u64` pointers and
+  each entry points at a `drm_amdgpu_cs_chunk`; passing the chunk struct
+  directly (older uAPI shape) makes the parser copy a pointer out of
+  `chunk_id|length_dw` and return `-EFAULT`.  `bin/test_kpi_amdgpu` builds
+  the pointer array (`amdgpu_cs_parser_init()` copies it first).
 - **Stress coverage for the BO prerequisites** (2026-09-13): a three-thread
   ordered multi-lock stress acquires four ww_mutex BO slots in one global
   order under contention (`test_phase1_core6.c`, `ww_mutex multi-lock

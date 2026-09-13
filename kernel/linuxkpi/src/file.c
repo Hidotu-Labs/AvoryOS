@@ -662,20 +662,28 @@ void linuxkpi_file_close(void *node) {
 int linuxkpi_vma_fault(void *w, unsigned long addr, unsigned long error) {
   struct kpi_mmap_bridge *b = w;
   struct vm_fault vmf;
+  unsigned long aligned;
   int ret;
 
   if (!b)
     return KPI_VM_FAULT_REJECT;
   if (!b->vma.vm_ops || !b->vma.vm_ops->fault)
     return KPI_VM_FAULT_REJECT;
-  if (addr < b->vma.vm_start || addr >= b->vma.vm_end)
+
+  /* Linux's handle_mm_fault() passes a page-aligned address to
+   * vm_ops->fault(); hardware CR2 carries the exact faulting offset.  A
+   * handler that inserts a PTE for the page (TTM's does) rejects the
+   * unaligned address when it is in the last page of the VMA
+   * (addr + PAGE_SIZE > vm_end -> SIGBUS -> NOPAGE -> re-fault livelock). */
+  aligned = addr & PAGE_MASK;
+  if (aligned < b->vma.vm_start || aligned >= b->vma.vm_end)
     return KPI_VM_FAULT_REJECT;
 
   __builtin_memset(&vmf, 0, sizeof(vmf));
   vmf.vma = &b->vma;
-  vmf.address = addr;
+  vmf.address = aligned;
   vmf.pgoff = b->vma.vm_pgoff +
-              ((addr - b->vma.vm_start) >> PAGE_SHIFT);
+              ((aligned - b->vma.vm_start) >> PAGE_SHIFT);
   vmf.flags = (error & 0x2) ? FAULT_FLAG_WRITE : 0;
 
   ret = b->vma.vm_ops->fault(&vmf);

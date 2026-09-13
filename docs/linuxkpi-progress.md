@@ -1159,7 +1159,7 @@ above; the last full VFIO boot was 252 `[  OK  ]` with no `[FAIL]`.
   Interactive confirmation: the desktop boot lists `AMD Raphael` as the
   second GPU in fastfetch, next to the emulated one.
 
-## Phase 6 — amdgpu bring-up (C4 green 2026-09-13; C5 next)
+## Phase 6 — amdgpu bring-up (C5 green 2026-09-13; C6 next)
 
 Chunk plan: `docs/linuxkpi-phase6-plan.md` (written 2026-09-13 after
 auditing P0–P5 at `2d5a0c0` / `p6-baseline`).  Chunks: C0 baseline +
@@ -1588,7 +1588,7 @@ amdgpu bring-up and all ring tests:
   `scripts/linux/patches/debug/` (not applied); the vkms GEM PMM drift
   watch item from C3 stays on the list for C5.
 
-### C5 — 6d: queues, VM, BOs, command submission (in progress 2026-09-13)
+### C5 — 6d: queues, VM, BOs, command submission (green 2026-09-13)
 
 Started from `p6-6c` (annotated tag created on the C4-closeout commit
 `f41699f`; `p6-6a`/`p6-6b` were never tagged because C1–C3 all landed in the
@@ -1677,9 +1677,41 @@ them).  First increment: the P2 VMA-bridge prerequisite, test-first.
   - `disk.img` rebuilt and verified: 11 amdgpu firmware blobs,
     `bin/test_kpi_amdgpu` mode 0755 size 48104, `bin/test_kpi_dmabuf` size
     61400.
-- Next: cold-GPU hardware run (`make run-c5`, then `bin/test_kpi_amdgpu`)
-  for the C5 exit evidence; record it here, add the gap-log result, tag
-  `p6-6d`.
+- [x] Cold-GPU hardware validation (2026-09-13, host reboot first):
+      `make run-c5` then `bin/test_kpi_amdgpu` in the guest →
+      **`=== ALL TESTS PASSED ===`** in `build/logs/p6-c5.log`:
+  - `AMDGPU_CS submitted to SDMA ring 0`,
+    `AMDGPU_WAIT_CS completed (fence signaled)`,
+    `SDMA copy verified byte-for-byte (64 KiB)`.
+  - `1000 loops completed without errors`,
+    `PMM free-page count did not go backwards`.
+  - Kernel suites in the same boot: **246 `[  OK  ]`, 0 `[FAIL]`, 2
+    `[SKIP]`** (bochs canary without a bochs card, opt-in VFIO suite) — C4's
+    244 plus the two new stress tests; `[  OK  ] link gate on: amdgpu
+    initialized and bound`; no VM-fault lines.
+- Bugs found and fixed during the hardware bring-up:
+  - **Bridged faults were not page-aligned**: `linuxkpi_vma_fault()` passed
+    the raw CR2 (the exact faulting offset) to `vm_ops->fault()`.  TTM's
+    `vmf_insert_pfn_prot(vma, addr, ...)` rejects `addr + PAGE_SIZE >
+    vm_end`, so the last page of a 64 KiB mapping faulted at an unaligned
+    address, returned SIGBUS → TTM `NOPAGE` → the bridge called it
+    "handled" → the instruction re-faulted immediately, forever (a CPU-side
+    livelock, not a GPU hang).  `linuxkpi_vma_fault()` now page-aligns
+    `vmf.address`/`vmf.pgoff` exactly like Linux `handle_mm_fault()`.
+  - `test_kpi_amdgpu`'s `AMDGPU_CS` chunk marshalling was wrong for 6.6:
+    `cs.in.chunks` is a pointer to an array of `u64` pointers, each pointing
+    at a `drm_amdgpu_cs_chunk` (`amdgpu_cs_parser_init()` copies the pointer
+    array first).  The old direct-struct form returned `-EFAULT`.
+- Temporary diagnostics used to find the livelock (a `[kpi-fault]` bracket
+  in `linuxkpi/src/file.c` and an on-demand TTM trace plus a 5 s fence
+  bound in `drivers/gpu/drm/ttm/ttm_bo_vm.c`) were removed afterwards; the
+  imported tree is back to pristine v6.6.156 + the two tracked behavior
+  patches.
+- C5 exit reached: userland CS through SDMA works, no VA faults, leak-free
+  1k BO loop, all prior suites green.  Remaining C5-era documents: the
+  accepted deviations in `docs/linuxkpi-gaps.md` P6 C5 (ww_mutex wounding,
+  bad-CS/fence-timeout recovery deferred to C8, bridged mremap open/close
+  shape).
 
 ## Cross-phase notes
 
