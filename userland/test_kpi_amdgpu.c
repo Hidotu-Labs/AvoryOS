@@ -51,6 +51,11 @@
 
 #define PAGE_SIZE_ 4096UL
 #define BO_LOOP 1000
+/* Global PMM counter drift allowed across the BO loop: the loop's own 16
+ * pages per iteration are all freed, but unrelated kernel threads can
+ * allocate a page or two in the window.  A real per-iteration leak here would
+ * show up as ~BO_LOOP pages (or at least order(s) of magnitude more). */
+#define PMM_SLACK_PAGES 16
 
 /* Kernel-internal DRM plane types; the uapi exposes them as the "type"
  * property enum (0 overlay, 1 primary, 2 cursor).  libdrm's names are not
@@ -316,18 +321,29 @@ static int cs_submit(int fd, uint32_t ctx_id, uint32_t bo_list_handle,
     return 0;
 }
 
-/* timeout_ns: 0 means "wait forever" in the amdgpu ABI. */
+/* CLOCK_MONOTONIC in ns; the amdgpu wait ABI takes absolute deadlines. */
+static uint64_t monotonic_ns(void) {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* timeout_ns is a relative duration: 0 waits forever (the ABI's negative
+ * absolute-timeout encoding maps to MAX_SCHEDULE_TIMEOUT).  drm_amdgpu_
+ * wait_cs_in.timeout is an absolute ktime, not a relative ns count. */
 static int wait_cs(int fd, uint64_t fence, uint32_t ctx_id, uint32_t ip_type,
                    uint32_t ring, uint64_t timeout_ns, uint64_t *status) {
     union drm_amdgpu_wait_cs args;
 
     memset(&args, 0, sizeof(args));
     args.in.handle = fence;
-    args.in.timeout = timeout_ns;
+    args.in.timeout = timeout_ns ? monotonic_ns() + timeout_ns : ~0ull;
     args.in.ip_type = ip_type;
     args.in.ip_instance = 0;
     args.in.ring = ring;
     args.in.ctx_id = ctx_id;
+    errno = 0;
     if (ioctl(fd, DRM_IOCTL_AMDGPU_WAIT_CS, &args))
         return -1;
     *status = args.out.status;
@@ -638,12 +654,20 @@ static void test_sdma_copy(int fd) {
         goto out;
     }
 
-    /* 5 s in nanoseconds; 0 would wait forever. */
-    if (wait_cs(fd, fence, ctx, AMDGPU_HW_IP_DMA, 0, 5000000000ULL, &status) == 0 &&
-        status == 0)
-        pass("AMDGPU_WAIT_CS completed (fence signaled)");
-    else
-        fail("AMDGPU_WAIT_CS", errno);
+    /* 5 s relative; 0 would wait forever. */
+    {
+        int rc = wait_cs(fd, fence, ctx, AMDGPU_HW_IP_DMA, 0, 5000000000ULL,
+                         &status);
+
+        if (rc == 0 && status == 0)
+            pass("AMDGPU_WAIT_CS completed (fence signaled)");
+        else if (rc == 0) {
+            failures++;
+            printf("  [FAIL] AMDGPU_WAIT_CS timed out (fence still busy, "
+                   "status=%llu)\n", (unsigned long long)status);
+        } else
+            fail("AMDGPU_WAIT_CS", errno);
+    }
 
     {
         int mismatch = -1;
@@ -746,8 +770,8 @@ static void test_bo_loop(int fd) {
 
         info("PMM free pages baseline", baseline);
         info("PMM free pages final", final);
-        if (delta <= 0)
-            pass("PMM free-page count did not go backwards");
+        if (delta <= PMM_SLACK_PAGES)
+            pass("PMM free-page count stable (within async-kernel slack)");
         else {
             failures++;
             printf("  [FAIL] PMM free pages dropped by %ld\n", delta);
@@ -976,34 +1000,66 @@ static int pick_connector(const char *card, struct conn_pick *pick) {
     return found ? 0 : -1;
 }
 
-/* Encoder -> possible CRTCs -> the CRTC id for this connector. */
+/* Encoder -> possible CRTCs -> the CRTC id for this connector.  The
+ * connector's `encoder_id` is only set after a successful modeset, so use
+ * the possible-encoder mask (encoder_id first when present).  Every
+ * GETRESOURCES gets a freshly zeroed struct with explicit count fields, the
+ * idiom the kernel-side suite uses. */
 static uint32_t connector_crtc(int fd, uint32_t conn_id) {
     struct drm_mode_get_connector con;
     struct drm_mode_get_encoder enc;
     struct drm_mode_card_res res;
     uint32_t crtcs[16] = {0};
+    uint32_t encs[8] = {0};
+    uint32_t n_crtcs, n_enc = 0;
+
+    memset(&res, 0, sizeof(res));
+    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res)) {
+        printf("  [WARN] GETRESOURCES failed (errno=%d %s)\n", errno,
+               strerror(errno));
+        return 0;
+    }
+    n_crtcs = res.count_crtcs;
+    if (!n_crtcs || n_crtcs > 16) {
+        printf("  [WARN] GETRESOURCES count_crtcs=%u\n", n_crtcs);
+        return 0;
+    }
+    memset(&res, 0, sizeof(res));
+    res.crtc_id_ptr = (uint64_t)(uintptr_t)crtcs;
+    res.count_crtcs = n_crtcs;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) || !res.count_crtcs) {
+        printf("  [WARN] GETRESOURCES(ids) failed (errno=%d %s)\n", errno,
+               strerror(errno));
+        return 0;
+    }
 
     memset(&con, 0, sizeof(con));
     con.connector_id = conn_id;
-    if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &con) || !con.encoder_id)
-        return 0;
+    con.encoders_ptr = (uint64_t)(uintptr_t)encs;
+    con.count_encoders = 8;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &con)) {
+        printf("  [WARN] GETCONNECTOR failed (errno=%d %s)\n", errno,
+               strerror(errno));
+        return crtcs[0];
+    }
 
-    memset(&enc, 0, sizeof(enc));
-    enc.encoder_id = con.encoder_id;
-    if (ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &enc))
-        return 0;
+    if (con.encoder_id) {
+        encs[0] = con.encoder_id;
+        n_enc = 1;
+    } else {
+        n_enc = con.count_encoders > 8 ? 8 : con.count_encoders;
+    }
 
-    memset(&res, 0, sizeof(res));
-    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) || !res.count_crtcs ||
-        res.count_crtcs > 16)
-        return 0;
-    res.crtc_id_ptr = (uint64_t)(uintptr_t)crtcs;
-    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res))
-        return 0;
-
-    for (uint32_t i = 0; i < res.count_crtcs; i++)
-        if (enc.possible_crtcs & (1u << i))
-            return crtcs[i];
+    for (uint32_t e = 0; e < n_enc; e++) {
+        memset(&enc, 0, sizeof(enc));
+        enc.encoder_id = encs[e];
+        if (ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &enc))
+            continue;
+        for (uint32_t i = 0; i < n_crtcs && i < 16; i++)
+            if (enc.possible_crtcs & (1u << i))
+                return crtcs[i];
+    }
+    /* DCN encoders are possible on every pipe; first CRTC is the fallback. */
     return crtcs[0];
 }
 
@@ -1100,10 +1156,44 @@ static int add_fb2(int fd, uint32_t handle, uint32_t w, uint32_t h,
     return 0;
 }
 
-static uint32_t find_plane(int fd, uint64_t want_type, struct prop_set *props) {
+/* Index of `crtc_id` in the card's CRTC list, which is the bit position the
+ * plane `possible_crtcs` masks use.  Returns -1 when not found. */
+static int crtc_index_of(int fd, uint32_t crtc_id) {
+    struct drm_mode_card_res res;
+    uint32_t crtcs[16] = {0};
+    uint32_t n;
+
+    if (!crtc_id)
+        return -1;
+    memset(&res, 0, sizeof(res));
+    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res))
+        return -1;
+    n = res.count_crtcs;
+    if (!n || n > 16)
+        return -1;
+    memset(&res, 0, sizeof(res));
+    res.crtc_id_ptr = (uint64_t)(uintptr_t)crtcs;
+    res.count_crtcs = n;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res))
+        return -1;
+    for (uint32_t i = 0; i < n; i++)
+        if (crtcs[i] == crtc_id)
+            return (int)i;
+    return -1;
+}
+
+/* Find a plane of `want_type`.  When `crtc_id` names a CRTC, prefer a plane
+ * whose possible_crtcs mask allows it: DM gives each primary plane its own
+ * pipe, and drm_atomic_plane_check() rejects a mismatched (plane, CRTC) pair
+ * with -EINVAL.  Falls back to any plane of the type if nothing matches. */
+static uint32_t find_plane(int fd, uint64_t want_type, uint32_t crtc_id,
+                           struct prop_set *props) {
     struct drm_mode_get_plane_res pres;
     uint32_t ids[32];
     struct prop_set ps;
+    int crtc_idx = crtc_index_of(fd, crtc_id);
+    uint32_t fallback = 0;
+    struct prop_set fallback_props;
 
     memset(&pres, 0, sizeof(pres));
     if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &pres) || !pres.count_planes)
@@ -1115,15 +1205,31 @@ static uint32_t find_plane(int fd, uint64_t want_type, struct prop_set *props) {
         return 0;
 
     for (uint32_t i = 0; i < pres.count_planes; i++) {
+        struct drm_mode_get_plane pl;
         uint64_t type;
 
+        memset(&pl, 0, sizeof(pl));
+        pl.plane_id = ids[i];
+        if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &pl))
+            continue;
         if (obj_props(fd, ids[i], DRM_MODE_OBJECT_PLANE, &ps))
             continue;
-        if (prop_find(fd, &ps, "type", 0, &type) == 0 && type == want_type) {
+        if (prop_find(fd, &ps, "type", 0, &type) || type != want_type)
+            continue;
+        if (crtc_idx < 0 || (pl.possible_crtcs & (1u << crtc_idx))) {
             if (props)
                 *props = ps;
             return ids[i];
         }
+        if (!fallback) {
+            fallback = ids[i];
+            fallback_props = ps;
+        }
+    }
+    if (fallback) {
+        if (props)
+            *props = fallback_props;
+        return fallback;
     }
     return 0;
 }
@@ -1202,6 +1308,7 @@ static void test_kms(int fd, const char *card) {
     uint64_t values[16];
     uint32_t n;
     int forced = 0;
+    int crtc_idx = 0;
 
     memset(&blob, 0, sizeof(blob));
     printf("\n=== KMS: connector + atomic modeset (DCN) ===\n");
@@ -1256,6 +1363,7 @@ static void test_kms(int fd, const char *card) {
         fail("no CRTC for the connector", 0);
         goto out_unforce;
     }
+    crtc_idx = crtc_index_of(fd, crtc_id);
 
     if (obj_props(fd, pick.conn_id, DRM_MODE_OBJECT_CONNECTOR, &conn_props) ||
         prop_find(fd, &conn_props, "CRTC_ID", &conn_crtc_id, 0) ||
@@ -1266,8 +1374,8 @@ static void test_kms(int fd, const char *card) {
         goto out_unforce;
     }
 
-    plane_id = find_plane(fd, KPI_PLANE_TYPE_PRIMARY, &plane_props);
-    cursor_id = find_plane(fd, KPI_PLANE_TYPE_CURSOR, &cursor_props);
+    plane_id = find_plane(fd, KPI_PLANE_TYPE_PRIMARY, crtc_id, &plane_props);
+    cursor_id = find_plane(fd, KPI_PLANE_TYPE_CURSOR, crtc_id, &cursor_props);
     if (!plane_id || prop_find(fd, &plane_props, "FB_ID", &plane_fb_id, 0) ||
         prop_find(fd, &plane_props, "CRTC_ID", &plane_crtc_id, 0) ||
         prop_find(fd, &plane_props, "SRC_X", &p_src_x, 0) ||
@@ -1379,6 +1487,8 @@ static void test_kms(int fd, const char *card) {
 
     memset(&vbl, 0, sizeof(vbl));
     vbl.request.type = _DRM_VBLANK_RELATIVE;
+    if (crtc_idx > 0)
+        vbl.request.type |= (uint32_t)crtc_idx << _DRM_VBLANK_HIGH_CRTC_SHIFT;
     vbl.request.sequence = 1;
     if (ioctl(fd, DRM_IOCTL_WAIT_VBLANK, &vbl) == 0)
         pass("WAIT_VBLANK relative 1 returned");

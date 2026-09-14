@@ -79,6 +79,28 @@ The default boot (no flags) enumerates the GPU but no driver binds it; the
 desktop renders on `virtio-vga` and Mesa uses llvmpipe.  fastfetch's native
 `gpu` module already lists `AMD Raphael` from PCI IDs.
 
+### C6 physical-monitor run
+
+*Not exercised on this host (2026-09-14): the main monitor is on the NVIDIA
+card and cannot be replugged, and the passed iGPU's motherboard ports have
+no spare monitor / dummy plug / capture dongle; C6 closed on the
+emulated-sink path.  This is the recipe for when a sink is available.*
+
+1. Connect a monitor/cable to one of the passed GPU's HDMI/DP outputs (the
+   motherboard outputs on this APU).  The host needs another display path for
+   the duration of the run (see the C6 note below).
+2. `make run-c6` (DC on, `drm.debug=0x4`, serial to `build/logs/p6-c6.log`),
+   log in, then run:
+   ```sh
+   bin/test_kpi_amdgpu
+   ```
+3. Evidence in the log: `dcn physical <connector>` plus the monitor's real
+   Modeline (its EDID read over DDC), then `atomic enable commit`, both
+   page-flip events, `WAIT_VBLANK`, cursor commit/off and the atomic disable
+   on the physical connector - with no `[FAIL]` and no WARN.  Hot-plugging
+   the monitor after boot is the HPD IRQ check (watch for the connector
+   hotplug event).
+
 ## Firmware staging (Phase 6)
 
 `scripts/linux-firmware-install.sh` copies the names in
@@ -157,9 +179,15 @@ nothing is installed by default yet.
   readback (it expects `-device bochs-display`).  Adding
   `-vga none -device virtio-vga` makes it skip and gives the C1 ROM test a
   virtio-vga device.
-- **No display output from the passed GPU yet.**  The guest has no amdgpu, so
-  the physical connectors show nothing; the GTK window is the virtual
-  desktop.  Real display output starts at P6e (KMS/connectors/EDID).
+- **Display output from the passed GPU (C6).**  Once AvoryOS binds amdgpu with
+  DC on (`run-c6`), KMS drives the GPU's physical HDMI/DP connectors and a
+  monitor attached to them shows the guest.  While the VM holds the device
+  (`vfio-pci`), the host does **not** drive it, so the host must not depend on
+  the passed GPU for its own display: keep a second monitor / another GPU /
+  SSH+serial for host control.  The GTK window remains the virtual desktop.
+  With no sink attached the DCN suite falls back to a generated EDID override
+  and logs `dcn forced ... (EDID override)`; with a sink it logs
+  `dcn physical ...` and uses the monitor's own EDID over DDC.
 - **`build/vfio/vbios.rom` is host-extracted**; never commit it (gitignored
   build tree), and re-extract after firmware updates.
 - **Do not write to the GPU's MMIO/config from the C7 test**; it only reads

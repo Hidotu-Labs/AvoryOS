@@ -1713,7 +1713,7 @@ them).  First increment: the P2 VMA-bridge prerequisite, test-first.
   bad-CS/fence-timeout recovery deferred to C8, bridged mremap open/close
   shape).
 
-### C6 — 6e: KMS/DCN (started 2026-09-13)
+### C6 — 6e: KMS/DCN (started 2026-09-13, closed 2026-09-14)
 
 - Tooling: `run-c6` (DC on, `amdgpu.runpm=0`, `ppfeaturemask=0xfff73fff`,
   `drm.debug=0x4` = KMS only, serial to `build/logs/p6-c6.log`) and
@@ -1723,7 +1723,7 @@ them).  First increment: the P2 VMA-bridge prerequisite, test-first.
   RW `status` attribute), atomic property discovery, a primary-plane enable
   with `PAGE_FLIP_EVENT`, a real page flip, `WAIT_VBLANK`, a cursor-plane
   commit/off and an atomic disable; the connector is unforced afterwards.
-  Compiles clean; hardware run pending.
+  Compiles clean.
 - **Found and fixed: the native `vsnprintf()` infinite loop.**  With the
   buffer full, `EMIT(*fmt++)` stopped advancing `fmt` (the argument was
   only evaluated on the store path), so the DM workqueue name
@@ -1764,6 +1764,55 @@ them).  First increment: the P2 VMA-bridge prerequisite, test-first.
   `-d int,guest_errors,cpu_reset` capture recipe is ready if it returns.
 - The i2c FAILs from the first DC boot (`i2c_add_numbered_adapter -16`)
   were this test collision, not a core regression; the fix rebuilds clean.
+- **Hardware evidence (2026-09-14, `build/logs/p6-c6.log`, 0 `[FAIL]`).**
+  Both suites are green on the passed Raphael in one boot:
+  - kernel DCN: `atomic enable commit (forced connector, ALLOW_MODESET)`,
+    page-flip events 1 and 2, `WAIT_VBLANK relative 1 returned`, cursor
+    commit/off, `atomic disable commit`;
+  - userland `bin/test_kpi_amdgpu`: `=== ALL TESTS PASSED ===` including
+    INFO/GEM/PRIME/CTX/VM/BO_LIST, the SDMA `COPY_LINEAR` through
+    `AMDGPU_CS`/`WAIT_CS` with byte-for-byte verification, the 1000x BO
+    loop with the PMM invariant, and the whole KMS section (atomic enable
+    at 1920x1080, flip events 1/2, `WAIT_VBLANK`, cursor commit/off,
+    disable).
+- **Found and fixed in the final bring-up** (all in the committed diff):
+  - DM creates primary planes in reverse pipe order, so the first primary
+    plane's `possible_crtcs` is `1 << 3`; the atomic commit failed `-EINVAL`
+    in `drm_atomic_plane_check()` when paired with `crtcs[0]`.  Both suites
+    now read `DRM_IOCTL_MODE_GETPLANE` and commit on the CRTC the plane's
+    mask allows.
+  - `DRM_IOCTL_MODE_GETRESOURCES` is a two-call ioctl: the second call must
+    zero the struct (or pass non-NULL id pointers), otherwise the stock
+    `put_user()` into `connector_id_ptr`/`encoder_id_ptr` with reused
+    nonzero counts returns `-EFAULT` ("no CRTC for the connector").
+  - `AMDGPU_WAIT_CS`'s timeout is an absolute ktime; the test's relative
+    5 s became a past deadline on a manual run, so the wait degenerated to
+    a poll and reported a stale `errno=22`.  `wait_cs()` now converts to a
+    CLOCK_MONOTONIC deadline and reports the busy status.
+  - `WAIT_VBLANK` selects its CRTC through `_DRM_VBLANK_HIGH_CRTC_SHIFT`;
+    the unselected request hit stream-less CRTC 0 (scanout-pos WARN, failed
+    wait).  Both suites encode the committed CRTC index.
+  - `p6d_wait()`'s `movaps` crash was the misaligned synthetic thread
+    frame; `sched_create_kernel_thread()`/`thread_stub` now keep the SysV
+    16-byte alignment.
+  - The BO-loop PMM check allows 16 pages of async-kernel drift
+    (`PMM_SLACK_PAGES`); a one-page global-counter wobble failed it.
+- **Scope decision (maintainer, 2026-09-14): C6 closes on the emulated-sink
+  path.**  The passed iGPU's outputs cannot be given a sink on this host
+  (the main monitor is on the NVIDIA card and cannot be replugged; the
+  motherboard DP/HDMI ports are empty and no dummy plug/capture dongle is
+  available).  The physical-sink check - real EDID over DDC, DP link
+  training, HPD, visible output - is carried as an open hardware-validation
+  item (see the gap log); the DCN suite already prefers a real sink when
+  one is attached (`dcn physical <connector>` instead of `dcn forced ...
+  (EDID override)`), so the run becomes the physical evidence automatically.
+- **Open finding (carried to C7/backlog):** the TTM page-fault path can
+  sleep (`ttm_bo_vm_fault_idle()` -> `dma_resv_wait_timeout()` ->
+  `dma_fence_wait_timeout()`), but AvoryOS delivers #PF with IRQs disabled,
+  so `might_sleep()` warns (`dma-fence.c:508`, preempt=0 irq=0).  The run
+  still passes; the fix is to open an IRQ window in the fault path (Linux
+  semantics) or make TTM's fault wait non-sleeping.  Recorded in the gap
+  log.
 
 ## Cross-phase notes
 

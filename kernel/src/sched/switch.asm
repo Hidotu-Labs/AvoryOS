@@ -83,6 +83,10 @@ switch_context:
 ; This stub is where newly created threads begin execution.
 ; The switch_context "ret" instruction pops into here.
 ; 'r12' contains the actual C function entry point (set in sched_create_kernel_thread).
+; Entry contract: rsp is 16-byte aligned and [rsp] = thread_exit (see
+; sched_create_kernel_thread), so the `call` below hands the entry function a
+; standard SysV frame (rsp % 16 == 8), and the fall-through `ret` enters
+; thread_exit with the same alignment.
 thread_stub:
     ; Ensure interrupts are enabled for the new thread
     sti
@@ -90,6 +94,6 @@ thread_stub:
     ; Call the entry function
     call r12
 
-    ; If the entry function returns, it will return into thread_exit()
-    ; because thread_exit was pushed just below the context struct.
+    ; If the entry function returns, it falls through into thread_exit(),
+    ; whose address was pushed just below the context struct.
     ret

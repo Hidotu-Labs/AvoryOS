@@ -832,6 +832,67 @@ divergences for its chunk; the Phase 5 exit matrix in
   kernel-side regression is green (249 OK, no FAIL), but there is no
   hour-long userland stress evidence for this chunk; the 24 h protocol in
   the progress doc remains the user-run gate.
+- **Hardware findings from the first C6 DCN run (2026-09-14)**, both fixed:
+  - The atomic enable commit failed `-EINVAL` in `drm_atomic_plane_check()`,
+    not in DC validation: DM initializes primary planes in *reverse* pipe
+    order (`amdgpu_dm.c` `for (i = primary_planes - 1; ...)`), so the first
+    primary plane in the DRM plane list is pipe 3 with
+    `possible_crtcs = 1 << 3`, while both KMS tests committed it against
+    `crtcs[0]`.  The suite now reads `DRM_IOCTL_MODE_GETPLANE`'s
+    `possible_crtcs` and picks the CRTC from the chosen plane's mask (the
+    userland `find_plane()` requires the mask to allow the commit CRTC).
+  - `DRM_IOCTL_MODE_GETRESOURCES` is a two-call ioctl whose second call
+    must not carry stale nonzero `count_connectors`/`count_encoders` with
+    NULL id pointers: stock `drm_mode_getresources()` `put_user()`s into
+    those pointers whenever the count field is nonzero, so a reused first
+    call's struct made the second call fail `-EFAULT` (reported as "no CRTC
+    for the connector").  Every resource query now zeroes the struct and
+    sets explicit counts/pointers.
+  - `AMDGPU_WAIT_CS`'s `drm_amdgpu_wait_cs_in.timeout` is an **absolute**
+    ktime, not a relative ns count: the 5 s relative value from the test
+    was in the past on a manually-run session, so
+    `amdgpu_gem_timeout()` returned 0, the wait degenerated to a single
+    poll and reported `status=1` with a stale `errno=22`.  `wait_cs()`
+    converts the relative duration to a CLOCK_MONOTONIC deadline (0 stays
+    the infinite `~0ull` encoding) and reports the busy status explicitly.
+  - `WAIT_VBLANK` selects its CRTC through the high bits of
+    `request.type` (`_DRM_VBLANK_HIGH_CRTC_SHIFT`), defaulting to CRTC 0.
+    The DCN suite's commit lands on the primary plane's own pipe, so the
+    unselected request asked for vblanks on a stream-less CRTC 0
+    (`dc_stream_state is NULL for crtc '0'`, scanout-pos WARN, wait
+    failed).  Both tests now encode the committed CRTC index.
+  - The `bin/test_kpi_amdgpu` PMM invariant allowed no drift at all; over
+    the 1000-iteration window a single page from unrelated asynchronous
+    kernel activity failed it.  The check now allows 16 pages of slack
+    (`PMM_SLACK_PAGES`), far below a real per-iteration leak
+    (~BO_LOOP pages).
+- **C6 closed on the emulated-sink path (maintainer, 2026-09-14).**  The
+  passed iGPU's motherboard DP/HDMI outputs cannot be given a sink on this
+  host (the main monitor is on the NVIDIA card and cannot be replugged; no
+  spare monitor / dummy plug / capture dongle available), so the physical
+  connector check is deferred, not waived as a software gap:
+  - **Open hardware-validation item:** real monitor/dummy sink on the passed
+    iGPU - DDC EDID read, DP link training, HPD IRQ, visible 1080p60.  The
+    DCN suite already prefers a connected connector and probes it without
+    force/override (`dcn physical <connector>`, real Modeline) and only
+    falls back to the generated EDID override when the connector reports
+    disconnected (`dcn forced ... (EDID override)`); a run with a sink
+    attached therefore produces the physical evidence with no code change.
+    `docs/amdgpu-testing.md` has the wiring/run recipe.
+- **Open software finding: page faults sleep with IRQs off in the TTM fault
+  path.**  `ttm_bo_vm_fault_idle()` waits on the BO's reservation
+  (`dma_resv_wait_timeout()` -> `dma_fence_wait_timeout()`, which calls
+  `might_sleep()`) when the faulting buffers are not idle.  AvoryOS enters
+  every handler through `isr_common_stub` with IF still clear, so the wait
+  runs with interrupts disabled and `__kpi_might_sleep()` reports
+  `might_sleep() from atomic context (linux/drivers/dma-buf/dma-fence.c:508,
+  preempt=0 irq=0)`; a genuine fence wait would also block with IRQs off.
+  Linux permits sleeping on page faults because its fault path runs with
+  IRQs enabled.  Fix options: open the IRQ window in the #PF path
+  (`page_fault_handler`/`vmm_handle_page_fault`) before dispatching into
+  driver `vm_ops->fault()`, or make TTM's fault wait non-sleeping.  The C6
+  run passes today because the fence signals quickly; the warning is the
+  finding.
 
 ### C7 — VFIO hardening + Raphael validation
 

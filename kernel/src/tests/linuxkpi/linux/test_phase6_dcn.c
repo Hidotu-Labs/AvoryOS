@@ -185,19 +185,36 @@ static void *p6d_find_card(struct p6d_scratch *s, int *card_out) {
  * copies it into `aconnector->edid` and `handle_edid_mgmt()` builds an
  * emulated sink, so modes exist without a physical monitor.  Returns the
  * connector (to unforce later) or NULL. */
+/* Prefer a connector with a physical sink attached, then any HDMI, then DP.
+ * Callers fall back to the EDID-override + force path only when the chosen
+ * connector reports disconnected. */
 static struct drm_connector *p6d_find_connector(struct drm_device *dev) {
   struct drm_connector *connector, *hdmi = NULL, *dp = NULL;
+  struct drm_connector *conn_hdmi = NULL, *conn_dp = NULL;
   struct drm_connector_list_iter iter;
 
   drm_connector_list_iter_begin(dev, &iter);
   drm_for_each_connector_iter(connector, &iter) {
-    if (connector->connector_type == DRM_MODE_CONNECTOR_HDMIA && !hdmi)
-      hdmi = connector;
-    else if (connector->connector_type == DRM_MODE_CONNECTOR_DisplayPort &&
-             !dp)
-      dp = connector;
+    bool connected = connector->status == connector_status_connected;
+
+    if (connector->connector_type == DRM_MODE_CONNECTOR_HDMIA) {
+      if (!hdmi)
+        hdmi = connector;
+      if (connected && !conn_hdmi)
+        conn_hdmi = connector;
+    } else if (connector->connector_type == DRM_MODE_CONNECTOR_DisplayPort) {
+      if (!dp)
+        dp = connector;
+      if (connected && !conn_dp)
+        conn_dp = connector;
+    }
   }
   drm_connector_list_iter_end(&iter);
+
+  if (conn_hdmi)
+    return conn_hdmi;
+  if (conn_dp)
+    return conn_dp;
   return hdmi ? hdmi : dp;
 }
 
@@ -301,6 +318,22 @@ static int p6d_get_planes(void *node, struct p6d_scratch *s,
   for (uint32_t i = 0; i < *count; i++)
     plane_ids[i] = ids[i];
   return *count ? 0 : -1;
+}
+
+/* Primary planes are per-pipe: DM sets possible_crtcs = 1 << pipe_index for
+ * them, and drm_atomic_plane_check() rejects a (plane, CRTC) pair that is not
+ * in that mask with -EINVAL, before amdgpu_dm_atomic_check() ever runs. */
+static int p6d_get_plane(void *node, struct p6d_scratch *s, uint32_t plane_id,
+                         uint32_t *possible_crtcs) {
+  struct drm_mode_get_plane *p = P6D_STRUCT(s);
+
+  memset(p, 0, sizeof(*p));
+  p->plane_id = plane_id;
+  if (p6d_ioctl(node, DRM_IOCTL_MODE_GETPLANE))
+    return -1;
+  if (possible_crtcs)
+    *possible_crtcs = p->possible_crtcs;
+  return 0;
 }
 
 /* Pick the connector with modes (prefer connection == connected) and its
@@ -525,11 +558,16 @@ static uint32_t p6d_wait_flip_event(void *node, struct p6d_scratch *s) {
   return ev.sequence ? ev.sequence : 1;
 }
 
-static int p6d_wait_vblank(void *node, struct p6d_scratch *s) {
+/* The vblank request selects its CRTC through the high bits of `type`
+ * (`drm_wait_vblank_ioctl()`); without them it defaults to CRTC 0, which has
+ * no stream once the commit landed on the primary plane's own pipe. */
+static int p6d_wait_vblank(void *node, struct p6d_scratch *s,
+                           uint32_t crtc_index) {
   union drm_wait_vblank *vbl = P6D_STRUCT(s);
 
   memset(vbl, 0, sizeof(*vbl));
-  vbl->request.type = _DRM_VBLANK_RELATIVE;
+  vbl->request.type = _DRM_VBLANK_RELATIVE |
+                      (crtc_index << _DRM_VBLANK_HIGH_CRTC_SHIFT);
   vbl->request.sequence = 1;
   return p6d_ioctl(node, DRM_IOCTL_WAIT_VBLANK);
 }
@@ -544,7 +582,7 @@ void linuxkpi_test_phase6_dcn(void) {
   struct drm_mode_create_blob *blob;
   uint32_t crtcs[8], conns[8], n_crtcs = 0, n_conns = 0;
   uint32_t plane_ids[16], plane_count = 0, primary_plane = 0, cursor_plane = 0;
-  uint32_t crtc_id = 0, conn_id = 0, mode_count = 0;
+  uint32_t crtc_id = 0, conn_id = 0, mode_count = 0, crtc_index = 0;
   uint32_t conn_crtc_id, crtc_mode_id, crtc_active, plane_fb_id, plane_crtc_id;
   uint32_t p_src_x, p_src_y, p_src_w, p_src_h;
   uint32_t p_crtc_x, p_crtc_y, p_crtc_w, p_crtc_h;
@@ -557,6 +595,8 @@ void linuxkpi_test_phase6_dcn(void) {
   u8 edid[128];
   void *node;
   int card = -1;
+  int ret;
+  int forced = 0;
 
   p6d_failures = 0;
   memset(&mode, 0, sizeof(mode));
@@ -575,8 +615,10 @@ void linuxkpi_test_phase6_dcn(void) {
   }
   blob = P6D_STRUCT(&s);
 
-  /* Headless sink: EDID override + force, then a probe so DM builds its
-   * emulated sink and exposes modes on the forced connector. */
+  /* A physical monitor comes first: probe without force/override so the real
+   * EDID (DDC) and link drive the modes.  Only when the connector reports
+   * disconnected fall back to the igt-style EDID override + force, which is
+   * what makes a headless boot exercise KMS through DM's emulated sink. */
   dev = linuxkpi_drm_find_dev("amdgpu");
   if (dev)
     aconnector = p6d_find_connector(dev);
@@ -584,16 +626,29 @@ void linuxkpi_test_phase6_dcn(void) {
     klog_puts("[SKIP] LinuxKPI: dcn no amdgpu connector to force\n");
     goto out;
   }
-  p6d_build_edid(edid);
-  if (drm_edid_override_set(aconnector, edid, sizeof(edid))) {
-    p6d_fail("EDID override rejected", 0);
-    goto out;
-  }
+
   mutex_lock(&dev->mode_config.mutex);
-  aconnector->force = DRM_FORCE_ON;
+  aconnector->force = DRM_FORCE_UNSPECIFIED;
   aconnector->funcs->fill_modes(aconnector, dev->mode_config.max_width,
                                 dev->mode_config.max_height);
   mutex_unlock(&dev->mode_config.mutex);
+
+  if (aconnector->status == connector_status_connected) {
+    klogf("[  OK  ] LinuxKPI: dcn physical sink %s (card%d)\n",
+          aconnector->name, card);
+  } else {
+    forced = 1;
+    p6d_build_edid(edid);
+    if (drm_edid_override_set(aconnector, edid, sizeof(edid))) {
+      p6d_fail("EDID override rejected", 0);
+      goto out;
+    }
+    mutex_lock(&dev->mode_config.mutex);
+    aconnector->force = DRM_FORCE_ON;
+    aconnector->funcs->fill_modes(aconnector, dev->mode_config.max_width,
+                                  dev->mode_config.max_height);
+    mutex_unlock(&dev->mode_config.mutex);
+  }
 
   if (p6d_set_atomic_cap(node, &s) ||
       p6d_get_resources(node, &s, crtcs, &n_crtcs, conns, &n_conns) ||
@@ -603,15 +658,66 @@ void linuxkpi_test_phase6_dcn(void) {
   }
   if (p6d_pick_connector(node, &s, conns, n_conns, &conn_id, &mode,
                          &mode_count)) {
-    p6d_fail("forced connector has no modes", 0);
+    p6d_fail(forced ? "forced connector has no modes"
+                    : "physical connector has no modes", 0);
     goto out;
   }
-  crtc_id = crtcs[0];
+  /* Primary plane: immutable "type" == 1; cursor plane: == 2.  DM gives
+   * every primary plane its own pipe (possible_crtcs = 1 << pipe_index), and
+   * drm_atomic_plane_check() rejects a plane paired with a CRTC outside that
+   * mask with -EINVAL, long before amdgpu_dm_atomic_check() runs.  Pick the
+   * CRTC from the chosen primary plane's mask instead of assuming crtcs[0]. */
+  {
+    for (uint32_t i = 0; i < plane_count; i++) {
+      struct p6d_prop_set ps;
+      uint64_t type_val = 0;
+      uint32_t possible = 0;
 
-  klogf("[  OK  ] LinuxKPI: dcn forced %s (card%d, EDID override), "
-        "connector=%u crtc=%u modes=%u (%ux%u)\n",
-        aconnector->name, card, conn_id, crtc_id, mode_count, mode.hdisplay,
-        mode.vdisplay);
+      if (p6d_obj_props(node, &s, plane_ids[i], DRM_MODE_OBJECT_PLANE, &ps))
+        continue;
+      if (p6d_prop_find(node, &s, &ps, "type", 0, &type_val))
+        continue;
+      if (type_val == 1 && !primary_plane) {
+        primary_plane = plane_ids[i];
+        if (!p6d_get_plane(node, &s, plane_ids[i], &possible) && possible)
+          crtc_index = (uint32_t)__builtin_ctz(possible);
+        break;
+      }
+    }
+    if (!primary_plane) {
+      p6d_fail("no primary plane found", 0);
+      goto out;
+    }
+    for (uint32_t i = 0; i < plane_count; i++) {
+      struct p6d_prop_set ps;
+      uint64_t type_val = 0;
+      uint32_t possible = 0;
+
+      if (p6d_obj_props(node, &s, plane_ids[i], DRM_MODE_OBJECT_PLANE, &ps))
+        continue;
+      if (p6d_prop_find(node, &s, &ps, "type", 0, &type_val) || type_val != 2)
+        continue;
+      if (!p6d_get_plane(node, &s, plane_ids[i], &possible) &&
+          !(possible & (1u << crtc_index)))
+        continue;
+      cursor_plane = plane_ids[i];
+      break;
+    }
+    if (crtc_index >= n_crtcs)
+      crtc_index = 0;
+    crtc_id = crtcs[crtc_index];
+  }
+
+  if (forced)
+    klogf("[  OK  ] LinuxKPI: dcn forced %s (card%d, EDID override), "
+          "connector=%u crtc=%u modes=%u (%ux%u)\n",
+          aconnector->name, card, conn_id, crtc_id, mode_count, mode.hdisplay,
+          mode.vdisplay);
+  else
+    klogf("[  OK  ] LinuxKPI: dcn physical %s (card%d), connector=%u crtc=%u "
+          "modes=%u (%ux%u)\n",
+          aconnector->name, card, conn_id, crtc_id, mode_count, mode.hdisplay,
+          mode.vdisplay);
 
   if (p6d_obj_props(node, &s, conn_id, DRM_MODE_OBJECT_CONNECTOR,
                     &conn_props) ||
@@ -623,22 +729,7 @@ void linuxkpi_test_phase6_dcn(void) {
     goto out;
   }
 
-  /* Primary plane: immutable "type" == 1; cursor plane: == 2. */
-  for (uint32_t i = 0; i < plane_count; i++) {
-    struct p6d_prop_set ps;
-    uint64_t type_val = 0;
-
-    if (p6d_obj_props(node, &s, plane_ids[i], DRM_MODE_OBJECT_PLANE, &ps))
-      continue;
-    if (p6d_prop_find(node, &s, &ps, "type", 0, &type_val))
-      continue;
-    if (type_val == 1 && !primary_plane)
-      primary_plane = plane_ids[i];
-    if (type_val == 2 && !cursor_plane)
-      cursor_plane = plane_ids[i];
-  }
-  if (!primary_plane ||
-      p6d_obj_props(node, &s, primary_plane, DRM_MODE_OBJECT_PLANE,
+  if (p6d_obj_props(node, &s, primary_plane, DRM_MODE_OBJECT_PLANE,
                     &plane_props) ||
       p6d_prop_find(node, &s, &plane_props, "FB_ID", &plane_fb_id, 0) ||
       p6d_prop_find(node, &s, &plane_props, "CRTC_ID", &plane_crtc_id, 0) ||
@@ -719,10 +810,11 @@ void linuxkpi_test_phase6_dcn(void) {
   ab->props[12] = p_crtc_h;
   ab->values[12] = mode.vdisplay;
 
-  if (p6d_atomic_commit(node, &s, 3,
-                        DRM_MODE_ATOMIC_ALLOW_MODESET |
-                            DRM_MODE_PAGE_FLIP_EVENT)) {
-    p6d_fail("atomic enable commit failed", 0);
+  ret = p6d_atomic_commit(node, &s, 3,
+                          DRM_MODE_ATOMIC_ALLOW_MODESET |
+                              DRM_MODE_PAGE_FLIP_EVENT);
+  if (ret) {
+    p6d_fail("atomic enable commit failed", ret);
     goto out;
   }
   p6d_ok("atomic enable commit (forced connector, ALLOW_MODESET)");
@@ -742,8 +834,9 @@ void linuxkpi_test_phase6_dcn(void) {
   ab->counts[0] = 1;
   ab->props[0] = plane_fb_id;
   ab->values[0] = fb2;
-  if (p6d_atomic_commit(node, &s, 1, DRM_MODE_PAGE_FLIP_EVENT)) {
-    p6d_fail("atomic page flip to fb2 failed", 0);
+  ret = p6d_atomic_commit(node, &s, 1, DRM_MODE_PAGE_FLIP_EVENT);
+  if (ret) {
+    p6d_fail("atomic page flip to fb2 failed", ret);
   } else {
     uint32_t seq = p6d_wait_flip_event(node, &s);
 
@@ -753,7 +846,7 @@ void linuxkpi_test_phase6_dcn(void) {
       p6d_fail("page-flip event 2 missing", 0);
   }
 
-  if (p6d_wait_vblank(node, &s) == 0)
+  if (p6d_wait_vblank(node, &s, crtc_index) == 0)
     p6d_ok("WAIT_VBLANK relative 1 returned");
   else
     p6d_fail("WAIT_VBLANK failed", 0);
@@ -801,8 +894,9 @@ void linuxkpi_test_phase6_dcn(void) {
       ab->values[8] = 64ULL << 16;
       ab->props[9] = c_sh;
       ab->values[9] = 64ULL << 16;
-      if (p6d_atomic_commit(node, &s, 1, 0))
-        p6d_fail("cursor plane commit failed", 0);
+      ret = p6d_atomic_commit(node, &s, 1, 0);
+      if (ret)
+        p6d_fail("cursor plane commit failed", ret);
       else
         p6d_ok("cursor plane commit");
 
@@ -811,8 +905,9 @@ void linuxkpi_test_phase6_dcn(void) {
       ab->values[0] = 0;
       ab->props[1] = c_crtc;
       ab->values[1] = 0;
-      if (p6d_atomic_commit(node, &s, 1, 0))
-        p6d_fail("cursor plane off failed", 0);
+      ret = p6d_atomic_commit(node, &s, 1, 0);
+      if (ret)
+        p6d_fail("cursor plane off failed", ret);
       else
         p6d_ok("cursor plane off");
     }
@@ -836,8 +931,9 @@ void linuxkpi_test_phase6_dcn(void) {
   ab->values[3] = 0;
   ab->props[4] = plane_crtc_id;
   ab->values[4] = 0;
-  if (p6d_atomic_commit(node, &s, 3, DRM_MODE_ATOMIC_ALLOW_MODESET))
-    p6d_fail("atomic disable commit failed", 0);
+  ret = p6d_atomic_commit(node, &s, 3, DRM_MODE_ATOMIC_ALLOW_MODESET);
+  if (ret)
+    p6d_fail("atomic disable commit failed", ret);
   else
     p6d_ok("atomic disable commit");
 

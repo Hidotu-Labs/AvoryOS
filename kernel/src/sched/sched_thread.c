@@ -115,8 +115,14 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
   uint64_t stack_top = t->stack_base + THREAD_STACK_SIZE;
   stack_top &= ~0xFULL; // Align stack
 
-  // 1. Push the thread exit function (simulating a return address)
-  stack_top -= 8;
+  // 1. Build thread_stub's synthetic frame.  The stub is entered by
+  //    switch_context's `ret`, so it must land 16-byte aligned with
+  //    [rsp] = thread_exit: its `call entry` then pushes a proper SysV
+  //    frame (entry sees rsp % 16 == 8) and its fall-through `ret` enters
+  //    thread_exit the same way.  An 8-byte-aligned frame here leaves every
+  //    callee off by 8, which faults on the aligned SSE spills the AMD DML
+  //    code uses (`movaps` -> #GP).
+  stack_top -= 16;
   *(uint64_t *)stack_top = (uint64_t)thread_exit;
 
   // 2. Setup context frame
