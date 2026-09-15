@@ -302,6 +302,11 @@ VFIO_ROM ?= build/vfio/vbios.rom
 # Extra QEMU -device arguments for a run-vfio boot, e.g.
 #   make run-vfio VFIO_EXTRA='-device edu'
 VFIO_EXTRA ?=
+# Extra raw QEMU arguments for a run-vfio boot, e.g. to capture the exceptions
+# around a silent triple-fault reset (the VM stops at the fault instead of
+# rebooting):
+#   make run-c7 QEMU_EXTRA='-no-reboot -d int,cpu_reset,guest_errors -D build/logs/p6-c7-qemu.log'
+QEMU_EXTRA ?=
 VFIO_COMMA := ,
 VFIO_ROM_OPT = $(if $(wildcard $(VFIO_ROM)),$(VFIO_COMMA)romfile=$(VFIO_ROM),)
 
@@ -320,6 +325,7 @@ run-vfio: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		$(DISPLAY_OPT) \
 		-serial $(SERIAL) \
 		$(VFIO_EXTRA) \
+		$(QEMU_EXTRA) \
 		$(QEMUFLAGS)
 
 # Phase 6 C4: headless amdgpu bring-up.  `amdgpu.dc=0` skips the dm ip block
@@ -369,6 +375,19 @@ run-c6: SERIAL = file:build/logs/p6-c6.log
 run-c6: VFIO_EXTRA = -device edu
 run-c6: QEMUFLAGS = -vga none -device virtio-vga,xres=1280,yres=800
 run-c6: run-vfio
+
+# Phase 6 C7: Mesa radeonsi 3D + accelerated Xorg/Wayland sessions.  Same as
+# C6 plus `kpi_emu_sink=1`: the DCN self-test keeps its EDID-override emulated
+# sink in place, so Xorg / Weston / KWin can start on amdgpu's card even
+# though no physical monitor is attached to the passed iGPU (the QEMU window
+# stays the native card0 desktop).  Interactive by default; override
+# DISPLAY_OPT='-display none' for a headless capture to build/logs/p6-c7.log.
+.PHONY: run-c7
+run-c7: KERNEL_CMDLINE = kpi_amdgpu=1 kpi_emu_sink=1 amdgpu.runpm=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x4
+run-c7: SERIAL = file:build/logs/p6-c7.log
+run-c7: VFIO_EXTRA = -device edu
+run-c7: QEMUFLAGS = -vga none -device virtio-vga,xres=1280,yres=800
+run-c7: run-vfio
 
 # Cold-start the passed GPU on the host before a C4+ boot.  QEMU/VFIO does not
 # reset the device on VM exit, and the guest driver's bring-up sequence assumes
@@ -745,12 +764,13 @@ disk.img: userland/test_kpi_dmabuf.elf
 disk.img: userland/test_kpi_drm.elf
 disk.img: userland/test_kpi_bochs.elf
 disk.img: userland/test_kpi_amdgpu.elf
+disk.img: userland/test_kpi_radeonsi.elf
 disk.img: build/test_fw.bin build/firmware/.stamp
 disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 
 
 disk.img: $(BASH_STAMP) $(COREUTILS_STAMP) $(ALPINE_STAMP) $(QUAKE2_BUNDLE_FILES)
-disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/forkit.elf userland/about.elf userland/hello_glibc.elf userland/booter.elf userland/reboot.elf userland/shutdown.elf userland/apm.elf userland/test_cpp.elf  userland/kilo.elf  userland/ls.elf userland/lspci.elf userland/lsblk.elf userland/readelf.elf userland/pong.elf userland/raycast.elf userland/asplay.elf userland/kria.elf userland/doom.elf userland/doom_x11.elf userland/gtk_test.elf userland/qt5_test.elf userland/sdl3_test.elf userland/tglgears_fb.elf userland/tglgears_drm.elf userland/tglhello_drm.elf userland/test_mem_stress.elf userland/classicube.elf userland/terrain.png userland/texpacks/classicube.zip initrd/startx.sh initrd/startw.sh initrd/weston.ini AetherDE/x11-wm/AetherWM AetherDE/aether-dock/aether-dock AetherDE/aether-panel/aether-panel AetherDE/wayland-compositor/aether-compositor AetherDE/demo-client/aether-window AetherDE/scripts/sax11.sh AetherDE/scripts/sawayland.sh userland/avoryd.elf $(AVORYD_CONFIG_FILES)
+disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/forkit.elf userland/about.elf userland/hello_glibc.elf userland/booter.elf userland/reboot.elf userland/shutdown.elf userland/apm.elf userland/test_cpp.elf  userland/kilo.elf  userland/ls.elf userland/lspci.elf userland/lsblk.elf userland/readelf.elf userland/pong.elf userland/raycast.elf userland/asplay.elf userland/kria.elf userland/doom.elf userland/doom_x11.elf userland/gtk_test.elf userland/qt5_test.elf userland/sdl3_test.elf userland/tglgears_fb.elf userland/tglgears_drm.elf userland/tglhello_drm.elf userland/test_mem_stress.elf userland/classicube.elf userland/terrain.png userland/texpacks/classicube.zip initrd/startx.sh initrd/startw.sh initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh AetherDE/x11-wm/AetherWM AetherDE/aether-dock/aether-dock AetherDE/aether-panel/aether-panel AetherDE/wayland-compositor/aether-compositor AetherDE/demo-client/aether-window AetherDE/scripts/sax11.sh AetherDE/scripts/sawayland.sh userland/avoryd.elf $(AVORYD_CONFIG_FILES)
 	@echo "Creating root filesystem (ext4)..."
 	rm -f ./part.img
 	dd if=/dev/zero of=./part.img bs=1M count=5119
@@ -929,6 +949,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/test_kpi_bochs.elf bin/test_kpi_bochs"; \
 		echo "rm bin/test_kpi_amdgpu"; \
 		echo "write userland/test_kpi_amdgpu.elf bin/test_kpi_amdgpu"; \
+		echo "rm bin/test_kpi_radeonsi"; \
+		echo "write userland/test_kpi_radeonsi.elf bin/test_kpi_radeonsi"; \
 		echo "rm bin/test_child_notify"; \
 		echo "write userland/test_child_notify.elf bin/test_child_notify"; \
 		echo "rm bin/test_pty_master"; \
@@ -1041,10 +1063,16 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write initrd/startx.sh bin/startx.sh"; \
 		echo "rm bin/startw.sh"; \
 		echo "write initrd/startw.sh bin/startw.sh"; \
+		echo "rm bin/drm-pick.sh"; \
+		echo "write initrd/drm-pick.sh bin/drm-pick.sh"; \
+		echo "rm etc/profile.d/avory-drm.sh"; \
+		echo "write initrd/avory-drm.sh etc/profile.d/avory-drm.sh"; \
 		echo "rm etc/weston.ini"; \
 		echo "write initrd/weston.ini etc/weston.ini"; \
 		echo "set_inode_field bin/startx.sh mode 0100755"; \
 		echo "set_inode_field bin/startw.sh mode 0100755"; \
+		echo "set_inode_field bin/drm-pick.sh mode 0100755"; \
+		echo "set_inode_field etc/profile.d/avory-drm.sh mode 0100644"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
 	@echo "Installing Quake II into disk image..."
 	@./scripts/populate-ext2-dir.sh ./part.img userland/quake2 opt/quake2
@@ -1270,6 +1298,7 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field bin/test_kpi_drm mode 0100755"; \
 		echo "set_inode_field bin/test_kpi_bochs mode 0100755"; \
 		echo "set_inode_field bin/test_kpi_amdgpu mode 0100755"; \
+		echo "set_inode_field bin/test_kpi_radeonsi mode 0100755"; \
 		echo "set_inode_field bin/test_child_notify mode 0100755"; \
 		echo "set_inode_field bin/test_pty_master mode 0100755"; \
 		echo "set_inode_field bin/test_uaccess_bench mode 0100755"; \
@@ -1609,6 +1638,26 @@ userland/test_kpi_amdgpu.elf: userland/test_kpi_amdgpu.c $(MUSL_LIBC) \
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
 		-I$(CURDIR)/kernel/linuxkpi/include \
 		userland/test_kpi_amdgpu.c -o userland/test_kpi_amdgpu.elf
+
+# Phase 6 C7 radeonsi test: headless GBM/EGL/GLES on amdgpu's render node.
+# Unlike the raw-ioctl suites this one must be dynamically linked: it uses the
+# Alpine rootfs Mesa/GBM/EGL shared libraries (static Mesa is not packaged),
+# so it links the musl loader the guest already has at
+# /lib/ld-musl-x86_64.so.1.  It asserts the renderer string is radeonsi,
+# renders timed frames (fps) and round-trips a dma-buf through EGL.
+userland/test_kpi_radeonsi.elf: userland/test_kpi_radeonsi.c $(MUSL_SYSROOT)/lib/libc.so \
+		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) -O2 -Wall -Wextra \
+		-fno-stack-protector \
+		-I$(ALPINE_SYSROOT)/usr/include \
+		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
+		userland/test_kpi_radeonsi.c -o userland/test_kpi_radeonsi.elf \
+		-L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
+		-lEGL -lgbm -lGLESv2 -ldrm \
+		-Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+		-Wl,-rpath,/usr/lib \
+		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
+		-Wl,--allow-shlib-undefined
 
 # Phase 3 LinuxKPI DRM test: vkms dumb-buffer GEM mmap/write, renderD128
 # sanity and a modetest-lite atomic enable/disable.  Uses the musl sysroot's

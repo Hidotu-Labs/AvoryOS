@@ -21,6 +21,9 @@
  * Per-CPU TLB shootdown state
  * ------------------------------------------------------------------------- */
 
+static void local_flush(uint64_t addr, uint16_t pcid);
+static uint16_t pcid_for_pml4(uint64_t pml4);
+
 /*
  * Global lock for shootdown serialization.
  *
@@ -319,6 +322,20 @@ static uint16_t local_pcid(void) {
     return (uint16_t)(cr3 & CR3_PCID_MASK);
 }
 
+/* Which PCID's cached translations cover @pml4, as seen from this CPU: the
+ * loaded PCID when that address space is the active one, else the
+ * conservative PCID_KERNEL (every target flushes everything rather than
+ * risking a stale entry under the wrong tag). */
+static uint16_t pcid_for_pml4(uint64_t pml4) {
+    if (!cpu_has_pcid())
+        return PCID_KERNEL;
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    if ((cr3 & CR3_ADDR_MASK) == (pml4 & CR3_ADDR_MASK))
+        return (uint16_t)(cr3 & CR3_PCID_MASK);
+    return PCID_KERNEL;
+}
+
 /*
  * Invalidate on this CPU.  With a known PCID the affected address space is the
  * one loaded here (see tlb_shootdown_page_for), so a single invlpg suffices.
@@ -477,18 +494,38 @@ void tlb_flush_deferred_all(void) {
   hal_irq_restore(flags);
 }
 
-void tlb_flush_deferred_drain(void) {
+bool tlb_flush_deferred_drain(void) {
   int slot = tlb_self_slot();
   if (slot < 0)
-    return;
+    return true;
 
   hal_irq_state_t flags = hal_irq_save();
   uint8_t all = __atomic_load_n(&tlb_pending_all[slot], __ATOMIC_RELAXED);
   uint32_t n = __atomic_load_n(&tlb_pending_count[slot], __ATOMIC_RELAXED);
   if (!all && n == 0) {
     hal_irq_restore(flags);
-    return;
+    return true;
   }
+
+  if (!(flags & SPINLOCK_RFLAGS_IF)) {
+    /* Interrupts are masked: waiting for remote acknowledgements here would
+     * deadlock against a target sitting in another masked section (a page
+     * fault handler, for instance), because such a target can never run the
+     * IPI handler.  Do what this CPU needs immediately - the local
+     * invalidations - and leave the remote part queued for a drain that can
+     * wait.  Returning false tells the caller that page-table frames must
+     * stay parked: a remote CPU may still be walking them. */
+    hal_irq_restore(flags);
+    if (all) {
+      local_flush(TLB_SHOOTDOWN_ALL, PCID_KERNEL);
+    } else {
+      for (uint32_t i = 0; i < n; i++)
+        local_flush(tlb_pending[slot][i].addr,
+                    pcid_for_pml4(tlb_pending[slot][i].pml4));
+    }
+    return false;
+  }
+
   __atomic_store_n(&tlb_pending_all[slot], 0, __ATOMIC_RELAXED);
   __atomic_store_n(&tlb_pending_count[slot], 0, __ATOMIC_RELAXED);
   hal_irq_restore(flags);
@@ -497,11 +534,12 @@ void tlb_flush_deferred_drain(void) {
    * harmless, so the list is replayed as recorded. */
   if (all) {
     tlb_shootdown_all();
-    return;
+    return true;
   }
   for (uint32_t i = 0; i < n; i++)
     tlb_shootdown_page_for(tlb_pending[slot][i].addr,
                            tlb_pending[slot][i].pml4);
+  return true;
 }
 
 static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t caller_ip) {
@@ -519,6 +557,25 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t caller_ip) {
 
     if (targets == 0) {
         local_flush(addr, pcid);
+        return;
+    }
+
+    /* A caller with interrupts masked cannot wait for acknowledgements.  A
+     * target that is itself in an interrupt-masked section (the page-fault
+     * gate enters with IF=0 and its handler runs under it) can never run the
+     * shootdown IPI handler, so the ack cannot arrive: the initiator would
+     * spin here forever while the target spins behind a lock this path never
+     * releases.  Invalidate locally - which is what this CPU needs before it
+     * re-executes the faulting access - and record the remote part for the
+     * next drain that can wait (see tlb_flush_deferred_drain()). */
+    if (!hal_irq_enabled()) {
+        local_flush(addr, pcid);
+        if (tlb_self_slot() >= 0) {
+            if (addr == TLB_SHOOTDOWN_ALL)
+                tlb_flush_deferred_all();
+            else
+                tlb_flush_deferred(addr, source_cr3 & CR3_ADDR_MASK);
+        }
         return;
     }
 
@@ -654,17 +711,12 @@ void tlb_shootdown_page(uint64_t addr) {
 }
 
 void tlb_shootdown_page_for(uint64_t addr, uint64_t pml4) {
-    uint16_t pcid = PCID_KERNEL;
-    if (cpu_has_pcid()) {
-        uint64_t cr3;
-        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-        if ((cr3 & CR3_ADDR_MASK) == (pml4 & CR3_ADDR_MASK))
-            pcid = (uint16_t)(cr3 & CR3_PCID_MASK);
-        /* Otherwise the caller is tearing down an address space that is not
-         * loaded here, and we genuinely do not know which PCID owns the stale
-         * entries: PCID_KERNEL makes every target behave conservatively. */
-    }
-    do_shootdown(addr, pcid, (uint64_t)__builtin_return_address(0));
+    /* When the address space is not the one loaded here the caller is tearing
+     * down an address space that is not loaded on this CPU, and we genuinely
+     * do not know which PCID owns the stale entries: pcid_for_pml4() returns
+     * PCID_KERNEL and every target behaves conservatively. */
+    do_shootdown(addr, pcid_for_pml4(pml4),
+                 (uint64_t)__builtin_return_address(0));
 }
 
 void tlb_shootdown_all(void) {

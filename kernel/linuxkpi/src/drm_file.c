@@ -39,7 +39,9 @@ static void *linuxkpi_drm_dev_open(void *metadata) {
   struct drm_minor *minor;
   struct inode *inode;
   struct file *file;
-  uint32_t devt = asc_vfs_node_inode(metadata);
+  /* The native node stores the userspace ABI encoding (what stat reports as
+   * st_rdev); the Linux inode needs the kernel dev_t for iminor(). */
+  dev_t devt = new_decode_dev(asc_vfs_node_inode(metadata));
   int ret;
 
   /* DRM's open path only needs the inode's dev_t (drm_open -> iminor), and

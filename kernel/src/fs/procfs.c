@@ -631,18 +631,26 @@ uint32_t procfs_filesystems_read(vfs_node_t *node, uint32_t offset,
   return size;
 }
 
+/* The real Limine command line (kernel/src/kernel.c), matching upstream
+ * /proc/cmdline.  Session helpers parse it (drm-pick.sh looks for the
+ * kpi_emu_sink boot parameter); it used to be a hard-coded "Xfbdev" string. */
+extern const char *kernel_boot_cmdline;
+
 uint32_t procfs_cmdline_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                              uint8_t *buffer) {
   (void)node;
-  const char *cmd = "Xfbdev\n";
+  const char *cmd = kernel_boot_cmdline ? kernel_boot_cmdline : "";
   uint32_t len = (uint32_t)strlen(cmd);
+  uint32_t total = len + 1; /* upstream prints the cmdline plus '\n' */
 
-  if (offset >= len)
+  if (offset >= total)
     return 0;
-  if (offset + size > len) {
-    size = len - offset;
+  if (offset + size > total)
+    size = total - offset;
+  for (uint32_t i = 0; i < size; i++) {
+    uint32_t pos = offset + i;
+    buffer[i] = (pos < len) ? (uint8_t)cmd[pos] : (uint8_t)'\n';
   }
-  memcpy(buffer, cmd + offset, size);
   return size;
 }
 

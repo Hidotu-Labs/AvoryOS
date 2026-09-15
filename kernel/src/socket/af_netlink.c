@@ -204,17 +204,19 @@ static void netlink_push_fake_uevent(socket_t *sock) {
     return;
   netlink_sock_t *nsk = (netlink_sock_t *)sock->sk;
 
-  // Devices to notify: DRM card, DRM connector, Keyboard, Mouse
+  // Devices to notify: DRM card0, connector, DRM card2 (amdgpu, Phase 6 C7),
+  // Keyboard, Mouse
   const char *devpaths[] = {sysfs_gpu_devpath, sysfs_gpu_connector_devpath,
+                            sysfs_gpu2_devpath,
                             "/devices/virtual/input/input0/event0",
                             "/devices/virtual/input/input1/event1"};
-  const char *subsystems[] = {"drm", "drm", "input", "input"};
-  const char *devnames[] = {"/dev/dri/card0", "", "/dev/input/event0",
-                            "/dev/input/event1"};
-  const char *majors[] = {"226", "", "13", "13"};
-  const char *minors[] = {"0", "", "64", "65"};
+  const char *subsystems[] = {"drm", "drm", "drm", "input", "input"};
+  const char *devnames[] = {"/dev/dri/card0", "", "/dev/dri/card2",
+                            "/dev/input/event0", "/dev/input/event1"};
+  const char *majors[] = {"226", "", "226", "13", "13"};
+  const char *minors[] = {"0", "", "2", "64", "65"};
 
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 5; i++) {
     char uevent_buf[512];
     memset(uevent_buf, 0, sizeof(uevent_buf));
     size_t pos = 0;

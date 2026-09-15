@@ -149,8 +149,18 @@ static vfs_node_t *kpi_devnode_open_instance(vfs_node_t *metadata) {
   if (!open_fn)
     return NULL;
   node = (vfs_node_t *)open_fn(metadata);
-  if (node)
+  if (node) {
+    /* The descriptor stands for the registered node, so fstat() must report
+     * the same type and dev_t.  Open callbacks build the instance with
+     * asc_vfs_anon_node(), which leaves it a plain FS_FILE with inode 0;
+     * libdrm identifies a DRM node exactly that way (fstat -> S_ISCHR +
+     * st_rdev -> drmGetDevice2), so without this Mesa's loader sees no
+     * amdgpu device on /dev/dri/renderD129 and falls back to llvmpipe. */
+    node->flags = (node->flags & ~FS_TYPE_MASK) |
+                  (metadata->flags & FS_TYPE_MASK);
+    node->inode = metadata->inode;
     node->refcount = 0;
+  }
   return node;
 }
 
@@ -188,6 +198,20 @@ struct kpi_path_devnode {
 static struct kpi_path_devnode kpi_path_devnodes[KPI_DEVNODE_REGISTRY_MAX];
 static int kpi_path_devnode_count;
 
+/* The native `inode` word is reported verbatim as st_rdev by fill_kstat(), so
+ * it must carry the userspace dev_t ABI encoding (glibc/musl
+ * <sys/sysmacros.h>: minor low byte | major << 8 | minor-high << 12), the same
+ * convention every native chardev (evdev, DRM card0, ALSA, ...) follows.
+ * Callers pass the kernel dev_t (MKDEV(), 20-bit minor); open callbacks that
+ * need it back (DRM sets inode->i_rdev and calls iminor()) decode the word
+ * with Linux's new_decode_dev(). */
+static uint32_t kpi_userspace_devt(uint32_t kdevt) {
+  uint32_t major = (kdevt >> 20) & 0xfff;
+  uint32_t minor = kdevt & 0xfffff;
+
+  return (minor & 0xff) | (major << 8) | ((minor & ~0xffu) << 12);
+}
+
 int asc_vfs_register_devnode_at(const char *dir, const char *name,
                                 __UINT32_TYPE__ rdev,
                                 void *(*open_fn)(void *)) {
@@ -218,14 +242,16 @@ int asc_vfs_register_devnode_at(const char *dir, const char *name,
   node->mask = 0666;
   node->device = (void *)open_fn;
   node->open_instance = kpi_devnode_open_instance;
-  node->inode = (uint32_t)rdev;
+  node->inode = kpi_userspace_devt((uint32_t)rdev);
 
   entry = &kpi_path_devnodes[kpi_path_devnode_count++];
   strncpy(entry->dir, dir, sizeof(entry->dir) - 1);
   entry->dir[sizeof(entry->dir) - 1] = '\0';
   strncpy(entry->name, name, sizeof(entry->name) - 1);
   entry->name[sizeof(entry->name) - 1] = '\0';
-  entry->rdev = (uint32_t)rdev;
+  /* readdir's d_ino should match the node's st_ino, which is the encoded
+   * word (the registry value only feeds drm_dri_readdir). */
+  entry->rdev = kpi_userspace_devt((uint32_t)rdev);
   entry->metadata = node;
   return 0;
 }

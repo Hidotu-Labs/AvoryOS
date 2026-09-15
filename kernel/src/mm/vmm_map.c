@@ -106,8 +106,13 @@ static void vmm_defer_table_free(void *phys) {
 }                      /* been freed, rather than losing the request        */
 
 static void vmm_drain_pending(void) {
-  /* Order matters: invalidate, then release the frames. */
-  tlb_flush_deferred_drain();
+  /* Order matters: invalidate, then release the frames.  A drain from an
+   * interrupt-masked context (the page-fault path releases vmm_lock with
+   * IF=0) cannot wait for remote acknowledgements and leaves the requests
+   * queued; keep the table frames parked until a drain that can wait has
+   * actually acknowledged, or a remote CPU could walk a freed table. */
+  if (!tlb_flush_deferred_drain())
+    return;
 
   int slot = vmm_pending_slot();
   if (slot < 0)

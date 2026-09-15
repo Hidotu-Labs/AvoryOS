@@ -20,6 +20,11 @@
  *   5. cursor plane on/off (64x64 ARGB) and the atomic disable commit;
  *   6. teardown and connector unforce.
  *
+ * `kpi_emu_sink=1` (default 0) keeps the EDID override + force in place after
+ * the suite, so a desktop session started later in the same boot can run on
+ * amdgpu's card with no physical monitor attached (C7: Xorg/Weston/KWin on
+ * card2).  The default path restores the connector exactly as C6 did.
+ *
  * Like the Phase 3 modeset suite, arguments and pointed-to arrays live in a
  * scratch region mapped into the user range of the active PML4, because the
  * DRM ioctl wrapper copies them with copy_from_user()/put_user().
@@ -32,6 +37,7 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_mode.h>
 #include <linux/delay.h>
+#include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/sprintf.h>
 #include <linux/string.h>
@@ -39,6 +45,12 @@
 #include <linuxkpi/log.h>
 #include <linuxkpi/native_mm.h>
 #include <linuxkpi/native_vfs.h>
+
+/* C7: keep the emulated sink after the suite so the desktop session (Xorg /
+ * Weston / KWin) can start on amdgpu's card without a physical monitor.
+ * Default 0 keeps the C6 behavior (connector restored after the suite). */
+static bool kpi_emu_sink;
+module_param(kpi_emu_sink, bool, 0);
 
 extern struct drm_device *linuxkpi_drm_find_dev(const char *name);
 extern int drm_edid_override_set(struct drm_connector *connector,
@@ -597,6 +609,7 @@ void linuxkpi_test_phase6_dcn(void) {
   int card = -1;
   int ret;
   int forced = 0;
+  int keep_sink = 0;
 
   p6d_failures = 0;
   memset(&mode, 0, sizeof(mode));
@@ -648,6 +661,8 @@ void linuxkpi_test_phase6_dcn(void) {
     aconnector->funcs->fill_modes(aconnector, dev->mode_config.max_width,
                                   dev->mode_config.max_height);
     mutex_unlock(&dev->mode_config.mutex);
+    /* C7: hand the emulated sink to the session instead of tearing it down. */
+    keep_sink = kpi_emu_sink ? 1 : 0;
   }
 
   if (p6d_set_atomic_cap(node, &s) ||
@@ -953,8 +968,14 @@ out:
   if (dumb1)
     p6d_dumb_destroy(node, &s, dumb1);
   if (aconnector) {
-    aconnector->force = DRM_FORCE_UNSPECIFIED;
-    drm_edid_override_reset(aconnector);
+    if (keep_sink)
+      klogf("[  OK  ] LinuxKPI: dcn emulated sink kept on %s (card%d, "
+            "kpi_emu_sink=1)\n",
+            aconnector->name, card);
+    else {
+      aconnector->force = DRM_FORCE_UNSPECIFIED;
+      drm_edid_override_reset(aconnector);
+    }
   }
 
   asc_vfs_kernel_close(node);

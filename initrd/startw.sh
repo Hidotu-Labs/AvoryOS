@@ -5,9 +5,11 @@
 #   none    — just Weston with its built-in panel (default)
 #   xfce4   — auto-launch XFCE4 inside XWayland once Weston is ready
 #
-# Renderer is selected by ASCENT_RENDERER (default: pixman):
+# Renderer is selected by ASCENT_RENDERER (default: auto):
+#   auto    — GPU (radeonsi) when the session runs on amdgpu, else pixman
+#   gpu     — force the GPU gl-renderer (radeonsi)
+#   llvmpipe / gl — Mesa llvmpipe software OpenGL path
 #   pixman  — CPU software rasteriser, safe on all QEMU configs
-#   llvmpipe / gl — Mesa llvmpipe OpenGL path
 #
 # Examples:
 #   /bin/startw.sh
@@ -57,13 +59,46 @@ else
     unset WAYLAND_DEBUG WESTON_DEBUG_COMPOSITOR WLR_LOG_LEVEL
 fi
 
-# ── Renderer selection ───────────────────────────────────────────────────
+# ── DRM card + renderer selection (Phase 6 C7) ───────────────────────────
+# Prefer amdgpu when it can drive a display (a monitor, or the C6/C7 emulated
+# sink kept by kpi_emu_sink=1), else the native card0.  On amdgpu the default
+# renderer is the real GPU (radeonsi via Weston's gl-renderer); card0 keeps
+# the pixman software default because ascentdrm has no render node.
+DRM_CARD="$(/bin/drm-pick.sh 2>/dev/null)"
+[ -n "$DRM_CARD" ] || DRM_CARD=/dev/dri/card0
+CARD_NAME="${DRM_CARD#/dev/dri/}"
+echo "[startw] DRM card: $DRM_CARD"
+
+# Alpine installs Mesa's DRI drivers under /usr/lib/xorg/modules/dri, while
+# Mesa's default search path is /usr/lib/dri: without LIBGL_DRIVERS_PATH the
+# EGL/GBM loader finds no radeonsi and silently falls back to llvmpipe.
+if [ -d /usr/lib/xorg/modules/dri ]; then
+    export LIBGL_DRIVERS_PATH="/usr/lib/xorg/modules/dri${LIBGL_DRIVERS_PATH:+:$LIBGL_DRIVERS_PATH}"
+fi
+
 export WLR_RENDERER_ALLOW_SOFTWARE=1
 
 renderer=pixman
-case "${ASCENT_RENDERER:-pixman}" in
+case "${ASCENT_RENDERER:-auto}" in
+    auto)
+        if [ "$DRM_CARD" != "/dev/dri/card0" ]; then
+            renderer=gl
+            unset GBM_ALWAYS_SOFTWARE LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER
+        else
+            renderer=pixman
+            unset GBM_ALWAYS_SOFTWARE
+            export LIBGL_ALWAYS_SOFTWARE=1
+            export GALLIUM_DRIVER=llvmpipe
+        fi
+        ;;
+    gpu|radeonsi)
+        renderer=gl
+        FORCE_GL=1
+        unset GBM_ALWAYS_SOFTWARE LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER
+        ;;
     llvmpipe|gl)
         renderer=gl
+        FORCE_GL=1
         export GBM_ALWAYS_SOFTWARE=1
         export LIBGL_ALWAYS_SOFTWARE=1
         export GALLIUM_DRIVER=llvmpipe
@@ -75,10 +110,47 @@ case "${ASCENT_RENDERER:-pixman}" in
         export GALLIUM_DRIVER=llvmpipe
         ;;
     *)
-        echo "[startw] Unknown ASCENT_RENDERER='${ASCENT_RENDERER}' (expected: pixman, llvmpipe)" >&2
+        echo "[startw] Unknown ASCENT_RENDERER='${ASCENT_RENDERER}' (expected: auto, gpu, llvmpipe, pixman)" >&2
         exit 2
         ;;
 esac
+
+run_weston() {
+    weston \
+        --backend=drm-backend.so \
+        --renderer="$1" \
+        --drm-device="$CARD_NAME" \
+        -c /etc/weston.ini \
+        --log="$LOG"
+}
+
+# ── C7 helper diagnostics ────────────────────────────────────────────────
+# Weston spawns /usr/libexec/weston-desktop-shell and weston-keyboard itself
+# and only reports "apparently cannot run at all" when they die immediately;
+# their own stderr is lost.  Wrap them once so their output and exit status
+# land in /tmp/helper-<name>.log, which is dumped below if Weston fails.
+install_helper_probe() {
+    helper="/usr/libexec/$1"
+    [ -x "$helper" ] || return 0
+    [ -e "${helper}.real" ] && return 0
+
+    mv "$helper" "${helper}.real"
+    cat > "$helper" <<'PROBE'
+#!/bin/sh
+helper="$0"
+log="/tmp/helper-$(basename "$helper").log"
+{
+    echo "=== $(basename "$helper") started $(date) uid=$(id -u) XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+    "${helper}.real" "$@"
+    st=$?
+    echo "=== $(basename "$helper") exited status=$st"
+} >>"$log" 2>&1
+exit $st
+PROBE
+    chmod +x "$helper"
+}
+install_helper_probe weston-desktop-shell
+install_helper_probe weston-keyboard
 
 LOG="/tmp/weston-$uid.log"
 echo "[startw] starting weston at $(date) (renderer: ${renderer})" > "$LOG"
@@ -118,17 +190,82 @@ case "${ASCENT_SESSION:-none}" in
 esac
 
 # ── Start Weston ──────────────────────────────────────────────────────────
-weston \
-    --backend=drm-backend.so \
-    --renderer="$renderer" \
-    -c /etc/weston.ini \
-    --log="$LOG"
+# Run Weston in the background first so a Wayland client can be used to
+# prove the compositor is actually serving its socket (there may be no
+# physical monitor on the passed GPU to look at), then wait on it as before.
+run_weston "$renderer" &
+WESTON_PID=$!
 
+WL_SOCKET=""
+for i in $(seq 1 40); do
+    for s in "$XDG_RUNTIME_DIR"/wayland-*; do
+        case "$s" in
+            *.lock) continue ;;
+        esac
+        if [ -S "$s" ]; then
+            WL_SOCKET="$s"
+            break
+        fi
+    done
+    [ -n "$WL_SOCKET" ] && break
+    sleep 0.5
+done
+
+if [ -n "$WL_SOCKET" ]; then
+    WAYLAND_DISPLAY="$(basename "$WL_SOCKET")"
+    export WAYLAND_DISPLAY
+    echo "[startw] wayland socket: $WL_SOCKET"
+
+    if command -v es2gears_wayland >/dev/null 2>&1; then
+        sleep 2
+        es2gears_wayland >/tmp/wayland-probe.log 2>&1 &
+        PROBE_PID=$!
+        sleep 3
+        if kill -0 "$PROBE_PID" 2>/dev/null; then
+            echo "[startw] wayland probe: es2gears_wayland is rendering (compositor + GL OK)"
+            kill "$PROBE_PID" 2>/dev/null
+            wait "$PROBE_PID" 2>/dev/null
+        else
+            wait "$PROBE_PID"
+            echo "[startw] wayland probe: es2gears_wayland exited $?"
+            echo "[startw] --- /tmp/wayland-probe.log ---"
+            cat /tmp/wayland-probe.log 2>/dev/null || true
+            echo "[startw] --- end /tmp/wayland-probe.log ---"
+        fi
+    else
+        echo "[startw] no es2gears_wayland client available for a probe"
+    fi
+else
+    echo "[startw] warning: no wayland socket appeared" >&2
+fi
+
+wait "$WESTON_PID"
 status=$?
+
+# If the GPU renderer could not come up (Mesa/radeonsi failure, no render
+# node, ...), keep the session usable by falling back to pixman on the same
+# card.  An explicit ASCENT_RENDERER=gpu/llvmpipe is taken as final.
+if [ "$status" -ne 0 ] && [ "$renderer" = "gl" ] && [ -z "${FORCE_GL:-}" ]; then
+    echo "[startw] weston gl-renderer failed (status $status); retrying with pixman"
+    echo "[startw] retrying with pixman after gl-renderer failure" >> "$LOG"
+    unset GBM_ALWAYS_SOFTWARE
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
+    renderer=pixman
+    run_weston "$renderer"
+    status=$?
+fi
+
 if [ "$status" -ne 0 ]; then
     echo "[startw] weston exited with status $status"
     echo "[startw] --- $LOG ---"
     cat "$LOG" 2>/dev/null || true
     echo "[startw] --- end $LOG ---"
+    for l in /tmp/helper-*.log; do
+        [ -e "$l" ] || continue
+        echo "[startw] --- $l ---"
+        cat "$l"
+        echo "[startw] --- end $l ---"
+    done
 fi
 exit "$status"

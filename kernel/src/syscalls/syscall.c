@@ -24,6 +24,7 @@ void syscall_register_raw(int num, syscall_raw_handler_t handler) {
 }
 
 void syscall_register_aio(void);
+void syscall_register_kcmp(void);
 
 static const char *const syscall_names[MAX_SYSCALL] = {
     [0] = "read",
@@ -584,6 +585,7 @@ void syscall_init(void) {
   // Register all syscall subsystems
   syscall_register_io();
   syscall_register_process();
+  syscall_register_kcmp();
   syscall_register_mm();
   syscall_register_arch();
   syscall_register_signal();
@@ -595,8 +597,19 @@ void syscall_init(void) {
   syscall_register_futex();
   syscall_register_aio();
 
+  syscall_init_cpu();
+
+  klog_puts("[OK] Syscall Infrastructure (MSRs) initialized.\n");
+}
+
+/* Per-CPU SYSCALL/SYSRET configuration.  EFER is a per-core register and the
+ * AP trampoline only sets LME|NXE, so an AP that runs a user thread without
+ * this faults every `syscall` instruction with #UD (SIGILL); STAR/LSTAR/
+ * FMASK are per-core too.  Call once per CPU before user code can run on it;
+ * syscall_init() calls it for the BSP. */
+void syscall_init_cpu(void) {
   uint64_t efer = rdmsr(IA32_EFER);
-  efer |= IA32_EFER_SCE | (1ULL << 11); 
+  efer |= IA32_EFER_SCE | (1ULL << 11);
   wrmsr(IA32_EFER, efer);
 
   uint64_t star = ((uint64_t)0x1B << 48) | ((uint64_t)0x08 << 32);
@@ -614,6 +627,4 @@ void syscall_init(void) {
    * whole syscall.  syscall_entry.asm re-opens AC deliberately, only for
    * the dispatch window. */
   wrmsr(IA32_FMASK, 0x200 | (1ULL << 18));
-
-  klog_puts("[OK] Syscall Infrastructure (MSRs) initialized.\n");
 }

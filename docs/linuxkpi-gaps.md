@@ -543,6 +543,192 @@ prerequisites and the hardware-bring-up findings.
   started, login reached), so the reset is intermittent until seen again;
   re-run with `-d int,guest_errors,cpu_reset` if it returns.
 
+### C7 — 6f: Mesa radeonsi 3D + accelerated sessions
+
+- **`kpi_emu_sink` boot parameter (non-upstream, test-only).**  The C6 DCN
+  suite builds an emulated sink (generated EDID override + `DRM_FORCE_ON`) on
+  a disconnected amdgpu connector for its own atomic sequence, then restores
+  the connector.  With `kpi_emu_sink=1` the suite leaves the override and
+  force in place, so a desktop session started later in the same boot can run
+  on amdgpu's card with no physical monitor attached.  Upstream has no
+  equivalent userland path in this build: the EDID override lives in
+  DRM debugfs (`CONFIG_DEBUG_FS` is off) and the sysfs `status` force alone
+  is refused by `amdgpu_dm_connector_funcs_force()` without an EDID.  The
+  parameter defaults to 0, so gate-off and normal boots restore the C6
+  behavior exactly.  `run-c7` bakes it; a physical monitor takes precedence
+  automatically (`dcn physical ...`, no override needed).
+- **Session DRM selection is a guest helper, not static config.**
+  `/bin/drm-pick.sh` prints the card a session should use: amdgpu's node by
+  driver name (sysfs `device/driver` symlink, falling back to the known
+  card2/renderD129 layout), selected only when a connector reports
+  connected or `kpi_emu_sink=1` is on the cmdline; otherwise `/dev/dri/card0`
+  (the native ascentdrm desktop).  `startx.sh` rewrites
+  `/etc/X11/xorg.conf.d/10-modesetting.conf` with
+  `Option "kmsdev" "<card>"` for a non-card0 choice; the packaged file stays
+  as the static card0 fallback for launchers that never run the script.
+  `startw.sh` passes `--drm-device=cardN` to Weston 14's DRM backend and
+  picks the renderer by card (`auto`: radeonsi gl-renderer on amdgpu, pixman
+  on card0; explicit `gpu`/`llvmpipe`/`pixman` still work), with a one-shot
+  pixman retry if the GL renderer fails on the amdgpu card.
+  `/etc/profile.d/avory-drm.sh` exports `KWIN_DRM_DEVICES` for Plasma
+  Wayland.  This is deliberately a session-level choice, not a kernel
+  default: the native card0 desktop keeps working on every boot without
+  amdgpu.
+- **`bin/test_kpi_radeonsi` needs dynamic musl linking.**  It is the first
+  test that consumes the Alpine rootfs' Mesa shared libraries (libEGL,
+  libgbm, libGLESv2); the other userland suites are static musl.  It is
+  linked against the rootfs `libc.musl-x86_64.so.1` with the guest loader
+  path `/lib/ld-musl-x86_64.so.1` (same recipe as `userland/about.elf`),
+  `-Wl,--allow-shlib-undefined` because libEGL pulls in `libLLVM` whose
+  `libstdc++` symbols are only resolved at runtime.  Alpine's `mesa-gbm`
+  package ships only `libgbm.so.1` (verified against pkgs.alpinelinux.org);
+  the DRI backend is built into libgbm, so `gbm_create_device` works once
+  the DRI driver search path is right.  The first C7 boot's "gbm device
+  unavailable" was therefore the same `LIBGL_DRIVERS_PATH` problem as the
+  llvmpipe renderer, not a missing backend module.
+- **TTM fault-path `might_sleep()` is now on the hot path.**  The finding
+  recorded in the P5 C7 section (faults enter with IRQs off; a non-idle BO
+  waits under `dma_fence_wait_timeout()` -> `might_sleep()` warning) only
+  saw occasional traffic in C6.  Mesa maps buffers far more aggressively, so
+  C7 should decide between opening the IRQ window in the #PF path and making
+  TTM's fault wait non-sleeping instead of leaving the warning in every
+  render log.
+- **Mesa's DRI path is Alpine's split layout.**  Alpine installs the
+  Gallium DRI drivers under `/usr/lib/xorg/modules/dri`
+  (`radeonsi_dri.so`, `libdril_dri.so`, ...), while Mesa's default loader
+  search path is `/usr/lib/dri`.  Without
+  `LIBGL_DRIVERS_PATH=/usr/lib/xorg/modules/dri` EGL/GBM silently fall back
+  to llvmpipe (observed in the first C7 boot: GBM device creation failed and
+  the surfaceless platform reported `llvmpipe`).  `bin/test_kpi_radeonsi`
+  sets it before EGL init, `startw.sh` exports it for Weston's gl-renderer,
+  and `/etc/profile.d/avory-drm.sh` exports it session-wide.  This is a
+  packaging-layout fact, not a kernel divergence; `setup-mocktail.sh`
+  already carried the same export.
+- **Xorg's modesetting driver needs a `BusID` when `kmsdev` is used.**
+  With only `Option "kmsdev" "/dev/dri/card2"` the modesetting legacy probe
+  cannot associate the card with a platform device (the fake sysfs bridge
+  did not expose card2 at the time) and claims an **fb slot**;
+  `xf86PostProbe()` then fatals with `Cannot run in framebuffer mode.
+  Please specify busIDs for all framebuffer devices` because the native
+  framebuffer slot is also claimed.  `startx.sh` derives the amdgpu BusID
+  from `/sys/bus/pci/devices` (`PCI:0:3:0`, with the fixed guest BDF as
+  fallback) so the probe claims the PCI slot and the fatal disappears.
+- **Mesa/libdrm identify a GPU through `/sys/dev/char/<maj>:<min>` and
+  require `PCI_SLOT_NAME` in the PCI `uevent`.**  After
+  `LIBGL_DRIVERS_PATH` was right, `gbm_create_device` still failed and the
+  EGL device list had a single entry with `card=(none) render=(none)`.
+  libdrm 2.4.123's `drmGetDevice2()` chain
+  (`drmGetDeviceFromDevId` -> `process_device` -> `drmProcessPciDevice` ->
+  `drmParsePciBusInfo`) starts at `/sys/dev/char/226:129`, requires
+  `/sys/dev/char/<maj>:<min>/device/drm` to list the node, resolves the
+  `device` symlink, reads `vendor`/`device`/`subsystem_vendor`/
+  `subsystem_device`, and parses `PCI_SLOT_NAME` from the PCI `uevent`
+  (`sysfs_uevent_get()`); any missing piece makes it skip the device
+  entirely, after which Mesa silently falls back to llvmpipe.  The bridge
+  now creates `/sys/class/drm/renderD129`, its device dir (`dev` = 226:129,
+  `DEVNAME=dri/renderD129`), the `devices/` entry, `/sys/dev/char/226:129`,
+  and `sysfs_pci.c`'s `PCI_ATTR_UEVENT` emits
+  `PCI_SUBSYS_ID`/`PCI_SLOT_NAME` (upstream Linux shape) so the PCI parse
+  succeeds.  Note `sysfs_mkfile()` cannot overwrite an existing file, so the
+  DRM block's earlier private `uevent` write on the shared PCI node was a
+  silent no-op - the PCI attribute provider is the single source of truth.
+- **The LinuxKPI per-open devnode did not expose its dev_t.**  The nested
+  devnode bridge stores a device's `dev_t` in the registered node's `inode`,
+  but the per-open node handed to `sys_open()` was the open callback's fresh
+  `asc_vfs_anon_node()` (`FS_FILE`, `inode` 0).  `fstat()` therefore reported
+  a regular file with `st_rdev = 0` for every imported DRM fd, while libdrm
+  identifies a DRM device exactly that way (`drmGetDevice2()`:
+  `S_ISCHR(st_mode)` plus `major/minor(st_rdev)` ->
+  `/sys/dev/char/<maj>:<min>`), so the sysfs entries alone still left Mesa's
+  EGL device list software-only.  `kpi_devnode_open_instance()`
+  (`kernel/src/linuxkpi/native_vfs.c`) now copies the registered node's type
+  and `inode` into the per-open instance; the Phase 3 DRM self-test checks
+  the dev_t survives the open.  On real Linux the device core creates the
+  `/sys/dev/char` entry when the device is added; the native bridge has no
+  equivalent, so the node type/dev_t pair is the part that must stay in
+  sync.
+- **The nested devnodes stored the kernel dev_t, not the userspace ABI
+  word.**  `asc_vfs_register_devnode_at()` put the caller's `dev->devt`
+  (`MKDEV()`, 20-bit minor: `226:129` -> `0x0E200081`) straight into the
+  native node's `inode`, and `fill_kstat()` reports that word verbatim as
+  `st_rdev`.  The userspace ABI encoding is `new_encode_dev()` ->
+  `0xE281`, which musl/glibc `major()`/`minor()` decode as `226:129`; every
+  native chardev (evdev, DRM card0, ALSA) already used it.  With the kernel
+  word, `fstat()` on the amdgpu render node decoded as `0:57985`, so libdrm
+  looked for `/sys/dev/char/0:57985` and returned `-EINVAL`
+  (`drmGetDevice2`), `gbm_create_device()` fell through to `kms_swrast`, and
+  the EGL device list found only card0 (minor 0 is encoding-agnostic).  The
+  bridge now stores `kpi_userspace_devt()` and `linuxkpi_drm_dev_open()`
+  decodes it back with `new_decode_dev()` for `inode->i_rdev`/`iminor()`.
+  The `/dev/char` symlinks, the PCI uevent/ID files and the sysfs fix were
+  all fine; the encoding was the last missing piece.
+- **`kcmp(2)` is not implemented; `libdrm_amdgpu` warns once.**  radeonsi's
+  `amdgpu_device_initialize()` calls `os_same_file_description()`, which uses
+  `kcmp` to decide whether two DRM fds share a file description.  AvoryOS
+  logs `Unimplemented syscall: 312 (kcmp)` and libdrm proceeds assuming they
+  differ ("bad things may happen" only if they really alias).  Benign for the
+  single-fd uses here; implement `kcmp` if fd aliasing ever matters.
+- **SYSCALL/SYSRET MSRs are per-CPU; APs had none.**  `syscall_init()` set
+  `EFER.SCE`, `STAR`, `LSTAR` and `FMASK` on the BSP only, and the AP
+  trampoline writes just `EFER.LME|NXE`.  Any user thread scheduled on an AP
+  therefore took `#UD` on its next `syscall` instruction - observed as a
+  SIGILL inside musl's `munmap` from one of radeonsi's compiler threads,
+  which is exactly the kind of "intermittent" crash that is hard to attribute.
+  `syscall_init_cpu()` is now called for the BSP by `syscall_init()` and by
+  every `ap_main()` during bring-up.  Any future per-CPU CPU state (PAT is
+  already handled this way) must be set on both paths.
+- **The user-fault reporter dereferenced `phys + HHDM` unvalidated.**  User
+  PTEs can legitimately name frames outside the direct map: a VRAM BO mapping
+  points at the GPU BAR aperture (`0x300000000000`-range), which the kernel
+  maps explicitly with PCD/PWT rather than relying on Limine's HHDM.  The
+  report path translated the user address for a hex dump and read the HHDM
+  slot directly, so reporting a SIGILL became a nested kernel #PF (a silent
+  triple-fault reset before the #DF IST existed).  `klog_user_kaddr()` now
+  validates the direct-map entry before every reporter read (`klog_dump_ptr`,
+  `CODE AT RIP`, `USER STACK`) and prints `<... not backed by a readable
+  frame>` when it is absent.  The #DF gate also moved to its own TSS IST
+  stack so nested faults produce a panic instead of a reset.
+- **Weston resolves `--drm-device` through udev, and the fake sysfs only
+  knew card0.**  `weston --drm-device=card2` logged `DRM device 'card2' is
+  not a KMS device` and exited: Weston (and eudev's
+  `udev_device_new_from_subsystem_sysname`) look the name up under
+  `/sys/class/drm/<name>`, which the native bridge did not create for the
+  imported amdgpu card.  `kernel/src/fs/sysfs.c` now mirrors the card0 fake
+  device for card2 (`/sys/class/drm/card2`, `card2/dev` = 226:2,
+  `DEVNAME=dri/card2`, the `devices/` directory entry, and
+  `/sys/dev/char/226:2`), and `af_netlink.c` pushes its fake uevent.  The
+  native card0 entry still uses the display-class PCI address for its path,
+  a pre-existing inaccuracy left unchanged to avoid disturbing the working
+  desktop.
+- **VMA merges dropped every Linux wrapper (kernel fault + false SIGSEGV).**
+  `vma_merge_adjacent()` rebuilds the whole tree whenever any pair of
+  anonymous VMAs merges: it called `vma_list_destroy()` and `vma_add()` for
+  every node, but never carried `linux_vma` through the rebuild.  So the
+  first merge anywhere in a process dropped the bridge (and ran
+  `vm_ops->close()`) of *every* GEM/dma-buf mapping in it.  Mesa's
+  `glBufferData` then faulted on a 2 MB BO whose VMA still existed but had no
+  `vm_ops`; the fault path reloaded a wrapper whose `close` had cleared
+  `vm_private_data` and dereferenced NULL (`CR2=0x178` =
+  `offsetof(ttm_buffer_object, bdev)`).  The rebuild now refs each entry's
+  `linux_vma` across the destroy, re-attaches it, and refuses to merge two
+  runs with different wrappers.  The fault path also takes its own bridge
+  reference while `mm->lock` still pins the VMA (the driver fault can sleep
+  in TTM's fence wait, while a concurrent munmap otherwise closes the
+  wrapper mid-fault) and revalidates the mapping after a successful fault.
+- **TLB shootdowns from interrupt-masked contexts deadlocked.**
+  `tlb_shootdown_page()` called from the CoW paths runs in the page-fault
+  gate (`IF=0`); `vmm_lock_release()` drains deferred flushes with the
+  caller's flags restored, which is also `IF=0` on the fault path.  If
+  another CPU held `shootdown_lock` waiting for this CPU's acknowledgement,
+  the ack could never be delivered: the initiator waited on a CPU that was
+  itself spinning behind the shootdown lock in a handler that cannot take an
+  IPI.  `do_shootdown()` now detects `!hal_irq_enabled()`, does the local
+  invalidation immediately, and records the remote part in the deferred
+  queue; `tlb_flush_deferred_drain()` does the same and reports that it
+  could not wait, so `vmm_drain_pending()` leaves emptied page-table frames
+  parked until a drain that can take IPIs acknowledges them.  A masked
+  context can no longer wait on, or block, the shootdown protocol.
+
 ## Phase 5 gaps (full I/O foundations)
 
 Index: C1 PCI · C2 IRQ/MSI · C3 ACPI/firmware · C4 i2c · C5 sysfs/devres/PM ·

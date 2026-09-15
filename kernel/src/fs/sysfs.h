@@ -10,5 +10,8 @@ void sysfs_gpu_update_connector(uint32_t scanout, bool connected, const char *mo
 // GPU device path for netlink uevents (e.g. "/devices/pci0000:00/0000:00:02.0/drm/card0")
 extern char sysfs_gpu_devpath[128];
 extern char sysfs_gpu_connector_devpath[128];
+// Phase 6 C7: amdgpu's card (minor 2) path for netlink uevents; Weston's
+// --drm-device/udev lookup and the session helpers need it in the fake sysfs.
+extern char sysfs_gpu2_devpath[128];
 
 #endif

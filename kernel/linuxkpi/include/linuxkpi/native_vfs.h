@@ -33,8 +33,11 @@ void asc_vfs_node_unref(void *node);
  * file through the node's own close path cannot recurse.  Nodes already torn
  * down by an fd close (refcount 0) are left alone. */
 void asc_vfs_node_release_kernel(void *node);
-/* The node's rdev/inode word, used to hand a char device's dev_t to a Linux
- * open path (DRM stores MKDEV(DRM_MAJOR, minor->index) here). */
+/* The node's rdev/inode word.  It is reported verbatim as st_rdev by the
+ * native stat, so it uses the userspace dev_t ABI encoding (glibc/musl
+ * <sys/sysmacros.h>, new_encode_dev()); an open callback that needs the
+ * kernel dev_t (DRM sets inode->i_rdev and calls iminor()) converts with
+ * new_decode_dev(). */
 __UINT32_TYPE__ asc_vfs_node_inode(void *node);
 
 /* Register /dev/<name> as a character device whose per-open native node is
@@ -47,9 +50,10 @@ int asc_vfs_register_devnode(const char *name, void *(*open_fn)(void *));
 /* Same, but for a nested path below /dev (e.g. dir="dri", name="card1").
  * The metadata node is kept in a small registry; directories that own a
  * custom finddir/readdir (like /dev/dri) enumerate it with
- * asc_vfs_devnode_lookup()/asc_vfs_devnode_name_at().  `rdev` is exported to
- * the open callback through asc_vfs_node_inode().  Returns 0, -EEXIST if the
- * path is already registered, or another negative errno. */
+ * asc_vfs_devnode_lookup()/asc_vfs_devnode_name_at().  `rdev` is the kernel
+ * dev_t (MKDEV()); it is stored ABI-encoded and exported to the open callback
+ * through asc_vfs_node_inode().  Returns 0, -EEXIST if the path is already
+ * registered, or another negative errno. */
 int asc_vfs_register_devnode_at(const char *dir, const char *name,
                                 __UINT32_TYPE__ rdev,
                                 void *(*open_fn)(void *));

@@ -683,6 +683,7 @@ void vma_merge_adjacent(struct vma_list *list) {
     uint64_t start, end, prot, flags, offset, file_size;
     int      fd;
     void    *file_node;
+    void    *linux_vma;
   };
 
   struct vma_merged_entry merged_stack[VMA_STACK_CAP];
@@ -711,6 +712,7 @@ void vma_merge_adjacent(struct vma_list *list) {
   merged[0].file_size = arr[0]->file_size;
   merged[0].fd        = arr[0]->fd;
   merged[0].file_node = arr[0]->file_node;
+  merged[0].linux_vma = arr[0]->linux_vma;
   m = 1;
 
   for (int i = 1; i < idx; i++) {
@@ -731,6 +733,7 @@ void vma_merge_adjacent(struct vma_list *list) {
                      (prev->flags == cur->flags)   &&
                      (prev->file_node == NULL)      &&
                      (cur->file_node  == NULL)      &&
+                     (prev->linux_vma == cur->linux_vma) &&
                      !((prev->flags | cur->flags) &
                        (MAP_GROWSDOWN | MAP_SYSV_SHM));
 
@@ -746,14 +749,22 @@ void vma_merge_adjacent(struct vma_list *list) {
       merged[m].file_size = cur->file_size;
       merged[m].fd        = cur->fd;
       merged[m].file_node = cur->file_node;
+      merged[m].linux_vma = cur->linux_vma;
       m++;
     }
   }
 
   // Only rebuild the tree if at least one merge actually happened.
   if (m < idx) {
-    for (int i = 0; i < m; i++)
+    /* The rebuild destroys every node, so hold a reference to each file node
+     * and Linux wrapper across it: an unrelated merge of two anonymous VMAs
+     * must not close the bridge of a GEM/dma-buf mapping that is simply being
+     * carried through.  Without this, every bridged VMA in the process lost
+     * its vm_ops wrapper (and ->close ran) the first time any merge happened. */
+    for (int i = 0; i < m; i++) {
       vma_file_ref(merged[i].file_node);
+      vma_linux_get(merged[i].linux_vma);
+    }
     vma_list_destroy(list); // frees all nodes, resets root + count
     for (int i = 0; i < m; i++) {
       vma_add(list,
@@ -761,7 +772,9 @@ void vma_merge_adjacent(struct vma_list *list) {
               merged[i].prot,  merged[i].flags,
               merged[i].fd,    merged[i].offset,
               merged[i].file_node, merged[i].file_size);
+      vma_attach_linux(list, merged[i].start, merged[i].linux_vma);
       vma_file_unref(merged[i].file_node);
+      vma_linux_put(merged[i].linux_vma);
     }
   }
 

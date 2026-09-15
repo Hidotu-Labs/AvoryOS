@@ -42,6 +42,13 @@ fork_return_to_userspace:
     mov rcx, [rax + 104]    ; RCX = user RIP (sysret jumps here)
     mov r11, [rax + 112]    ; R11 = user RFLAGS (sysret loads this)
 
+    ; Mask interrupts BEFORE the user RSP is loaded.  Interrupts may be
+    ; enabled while the child unwinds; after `mov rsp, ...` the CPU is still
+    ; ring 0 but RSP is the user stack, and an ISR landing in that window
+    ; pushes its frame onto user memory (SMAP fault -> nested fault -> #DF).
+    ; Same window syscall_entry protects on its way out.
+    cli
+
     ; Load user RSP
     mov rsp, [rax + 120]
 
@@ -51,10 +58,7 @@ fork_return_to_userspace:
     ; Load rax last — child fork return value (0)
     mov rax, [rax + 48]
 
-    ; Interrupts may be enabled while the child unwinds; mask them so no ISR
-    ; can observe user GS between swapgs and sysret (same window syscall_entry
-    ; protects), then Swap GS: put user GS (0) into active, save kernel GS base
-    cli
+    ; Swap GS: put user GS (0) into active, save kernel GS base
     swapgs
 
     ; Return to user mode

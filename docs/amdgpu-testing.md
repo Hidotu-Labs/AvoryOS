@@ -197,6 +197,57 @@ nothing is installed by default yet.
   nothing, check that the guest's `/sys/bus/pci/devices/<bdf>/` still exposes
   `vendor`, `device`, `class` and `subsystem_vendor`.
 
+## C7 run (radeonsi + accelerated sessions)
+
+`make run-c7` is C6 plus `kpi_emu_sink=1` (see below); it binds amdgpu, runs
+the full boot regression, and leaves an emulated sink on an amdgpu connector
+so a session can run on card2 with no physical monitor attached.
+
+```sh
+make run-c7                       # interactive (GTK), serial -> build/logs/p6-c7.log
+make run-c7 DISPLAY_OPT='-display none' SERIAL=file:build/logs/p6-c7.log   # headless
+```
+
+In the guest (console login is on the serial line):
+
+```sh
+bin/test_kpi_radeonsi      # headless GBM/EGL/GLES2 on renderD129: renderer
+                           # string, timed frames (fps), dma-buf EGL roundtrip
+bin/drm-pick.sh            # should print /dev/dri/card2 while the emulated
+                           # sink is up; /dev/dri/card0 otherwise
+startx.sh                  # Xorg+LightDM on the selected card (card2)
+glxgears                   # GLX fps on the accelerated X server
+ASCENT_RENDERER=gpu startw.sh   # Weston DRM + gl-renderer on card2
+startplasma-wayland        # KWin Wayland (KWIN_DRM_DEVICES via profile.d)
+```
+
+Notes:
+
+- **Emulated sink**: with no monitor on the passed iGPU's ports the DCN
+  self-test (`kpi_emu_sink=1`) keeps a generated EDID override + force on an
+  HDMI/DP connector.  The session output goes to that connector (invisible);
+  the QEMU window keeps showing the native card0 desktop.  Attaching a real
+  monitor to the iGPU replaces the override automatically (`dcn physical`),
+  and the same sessions then run visibly on it.
+- **Card selection**: `bin/drm-pick.sh` prefers amdgpu only when it can
+  drive a display (a connected connector, or `kpi_emu_sink=1`); otherwise it
+  returns `/dev/dri/card0`, so `startx.sh`/`startw.sh`/Plasma keep working on
+  a normal boot.  `ASCENT_DRM_CARD=card2` forces a choice.
+- **Renderer selection**: `startw.sh` defaults to `ASCENT_RENDERER=auto`
+  (radeonsi gl-renderer on amdgpu, pixman on card0); `gpu`, `llvmpipe` and
+  `pixman` are explicit overrides.  Xorg's modesetting driver uses the card
+  written to `/etc/X11/xorg.conf.d/10-modesetting.conf` by `startx.sh`
+  (`Option "kmsdev"` plus a derived `BusID`, without which the modesetting
+  probe claims an fb slot and Xorg fatals), so the static packaged file
+  stays the card0 fallback.
+- **Mesa DRI path**: Alpine keeps the DRI drivers in
+  `/usr/lib/xorg/modules/dri`; the session scripts and
+  `bin/test_kpi_radeonsi` export
+  `LIBGL_DRIVERS_PATH=/usr/lib/xorg/modules/dri`.  If a renderer string
+  comes back `llvmpipe`, that variable is the first thing to check.
+- **Cold start**: as every C4+ run, start from a cold GPU (`make reset-gpu`
+  or a host reboot after a killed run; a clean guest `poweroff` is enough).
+
 ## Phase 6 expectations
 
 Full chunked plan: `docs/linuxkpi-phase6-plan.md` (C0–C9, written
@@ -209,3 +260,5 @@ Full chunked plan: `docs/linuxkpi-phase6-plan.md` (C0–C9, written
 4. P6e: display — connectors, EDID over the C4 i2c core, atomic modeset;
    this is when the desktop can move to the real GPU and fastfetch's output
    becomes meaningful beyond PCI enumeration.
+5. P6f (C7): Mesa radeonsi 3D through the render node, and the Xorg/Weston/
+   KWin sessions select amdgpu when it can drive a display.

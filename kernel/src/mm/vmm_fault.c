@@ -462,6 +462,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
   uint64_t vma_start = 0;
   uint64_t vma_end = 0;
   void *vma_file_node = NULL;
+  void *vma_linux = NULL;
   if (vma) {
     vma_prot = vma->prot;
     vma_flags = vma->flags;
@@ -472,18 +473,52 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     vma_start = vma->start;
     vma_end = vma->end;
     vma_file_node = vma->file_node;
+
+    /* The Linux-facing bridge wrapper can go away the moment a concurrent
+     * munmap removes this native VMA, and the imported driver's ->close
+     * callback (TTM's clears vma->vm_private_data) would then run while a
+     * fault on this CPU is still in flight - the fault reloads
+     * vm_private_data and dereferences NULL.  The fault can also sleep
+     * (TTM waits on a dma-fence), so mm->lock cannot be held across it
+     * either.  Take a reference while the VMA is still pinned by mm->lock
+     * and hold it until the fault returns: ->close only runs when the last
+     * reference drops. */
+    vma_linux = vma->linux_vma;
+    if (vma_linux)
+      vma_linux_get(vma_linux);
   }
   spinlock_release(&current->mm->lock);
 
   /* Imported Linux drivers can handle the fault themselves through
    * vm_ops->fault(); the bridge builds a struct vm_fault and installs PTEs
    * on their behalf if they ask for it. */
-  if (vma && vma->linux_vma) {
+  if (vma_linux) {
     extern int linuxkpi_vma_fault(void *, unsigned long, unsigned long)
         __attribute__((weak));
+
     if (linuxkpi_vma_fault &&
-        linuxkpi_vma_fault(vma->linux_vma, cr2, error_code) == 0)
+        linuxkpi_vma_fault(vma_linux, cr2, error_code) == 0) {
+      /* The driver fault can sleep (TTM waits on a dma-fence) and another
+       * thread may have unmapped this range meanwhile.  A PTE it installed
+       * then outlives the buffer object whose mapping is gone, so validate
+       * the VMA again under mm->lock and drop the translation if it is no
+       * longer the same mapping.  mm->lock -> vmm_lock is the established
+       * order (see vmm_map_cow_cluster()). */
+      spinlock_acquire(&current->mm->lock);
+      struct vma *still = vma_find(&current->mm->vmas, cr2);
+      bool same_mapping = still && still->linux_vma == vma_linux;
+      spinlock_release(&current->mm->lock);
+      /* Tear the translation down before dropping the last reference: the
+       * put may run ->close and free the buffer object behind it. */
+      if (!same_mapping)
+        vmm_unmap_page((uint64_t *)target_cr3, cr2 & ~0xFFFULL);
+      vma_linux_put(vma_linux);
+      if (!same_mapping)
+        return PF_REJECT("driver mapping disappeared while the fault was in "
+                         "flight (racing munmap)", cr2, 0);
       return 0;
+    }
+    vma_linux_put(vma_linux);
   }
 
   if (!vma) {

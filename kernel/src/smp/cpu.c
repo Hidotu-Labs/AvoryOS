@@ -12,6 +12,7 @@
 #include "lib/string.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
+#include "syscalls/syscall.h"
 #include <stddef.h>
 
 // External Trampoline Symbols
@@ -142,6 +143,11 @@ void ap_main(void) {
 
   // 3. Load the IDT for this core (reuse the BSP's already-built table)
   idt_load();
+
+  // 3.5. Program this core's SYSCALL/SYSRET MSRs.  They are per-CPU: without
+  // this, a user thread scheduled here executes `syscall` with EFER.SCE clear
+  // and takes a #UD (observed as a SIGILL in radeonsi's compiler threads).
+  syscall_init_cpu();
 
   // 4. initialize the LAPIC timer for this core so it can independently preempt
   lapic_timer_init_ap();

@@ -1135,7 +1135,13 @@ echo "[*] Configuring Xorg DRM/modesetting..."
 XORG_CONF_DIR="${ROOTFS_DIR}/etc/X11/xorg.conf.d"
 mkdir -p "${XORG_CONF_DIR}"
 rm -f "${ROOTFS_DIR}/usr/share/X11/xorg.conf.d/40-libinput.conf"
+# This is the static fallback: card0 (the native virtio-vga/ascentdrm
+# desktop).  startx.sh rewrites the file at session start with
+# Option "kmsdev" when bin/drm-pick.sh selects another card (amdgpu), so a
+# session can run on the passed GPU without touching this packaged default.
 cat > "${XORG_CONF_DIR}/10-modesetting.conf" <<EOF
+# Rewritten by /bin/startx.sh when bin/drm-pick.sh selects an amdgpu card
+# (Phase 6 C7).  The content below is the native card0 fallback.
 Section "ServerLayout"
     Identifier  "AvoryLayout"
     Screen      0 "Screen0" 0 0
@@ -1169,6 +1175,18 @@ Section "InputDevice"
     Option      "CorePointer" "true"
 EndSection
 EOF
+
+# 4a-bis. Phase 6 C7 DRM selection helpers.  drm-pick.sh prints the card a
+# session should use (amdgpu when it can drive a display, else card0);
+# startx.sh/startw.sh call it, and /etc/profile.d/avory-drm.sh exports
+# KWIN_DRM_DEVICES for a Plasma Wayland session started from a login shell.
+if [ -f "${ROOT_DIR}/initrd/drm-pick.sh" ]; then
+    install -m 0755 "${ROOT_DIR}/initrd/drm-pick.sh" "${ROOTFS_DIR}/bin/drm-pick.sh"
+fi
+if [ -f "${ROOT_DIR}/initrd/avory-drm.sh" ]; then
+    mkdir -p "${ROOTFS_DIR}/etc/profile.d"
+    install -m 0644 "${ROOT_DIR}/initrd/avory-drm.sh" "${ROOTFS_DIR}/etc/profile.d/avory-drm.sh"
+fi
 
 # 4b. Configure the default X11 session for startx(1): KDE Plasma 6.
 # Alpine's startx runs $HOME/.xinitrc; root's home is / on AvoryOS.  Plasma

@@ -20,6 +20,7 @@
 char sysfs_gpu_devpath[128] = "/devices/pci0000:00/0000:00:01.0/drm/card0";
 char sysfs_gpu_connector_devpath[128] =
     "/devices/pci0000:00/0000:00:01.0/drm/card0/card0-HDMI-A-1";
+char sysfs_gpu2_devpath[128] = "/devices/pci0000:00/0000:00:01.0/drm/card2";
 static vfs_node_t *net_class_root;
 static vfs_node_t *gpu_status_nodes[VIRTIO_GPU_MAX_SCANOUTS];
 static vfs_node_t *gpu_enabled_nodes[VIRTIO_GPU_MAX_SCANOUTS];
@@ -388,6 +389,28 @@ void sysfs_init(void) {
     strcat(conn_sl_target, "/drm/card0/card0-HDMI-A-1");
     sysfs_symlink(drm_class, "card0-HDMI-A-1", conn_sl_target);
 
+    /* Phase 6 C7: the imported amdgpu DRM device is card2 (LinuxKPI minor
+     * 2).  Weston's --drm-device and udev resolve a name through
+     * /sys/class/<subsystem>/<sysname> (eudev's subsystem_sysname_dirs), so
+     * the node must exist here or `weston --drm-device=card2` logs "not a
+     * KMS device" and never opens it.  The devnode name comes from the
+     * uevent file's DEVNAME. */
+    char sl_target2[128];
+    strcpy(sl_target2, "../../devices/pci0000:00/");
+    strcat(sl_target2, pci_addr);
+    strcat(sl_target2, "/drm/card2");
+    sysfs_symlink(drm_class, "card2", sl_target2);
+
+    /* amdgpu's render node.  Mesa's loader (loader_get_driver_for_fd ->
+     * drmGetDevice2) resolves it through /sys/dev/char/226:129/device/drm
+     * and the PCI subsystem IDs; without this entry it cannot identify the
+     * GPU and falls back to llvmpipe. */
+    char sl_target3[128];
+    strcpy(sl_target3, "../../devices/pci0000:00/");
+    strcat(sl_target3, pci_addr);
+    strcat(sl_target3, "/drm/renderD129");
+    sysfs_symlink(drm_class, "renderD129", sl_target3);
+
     // Also create the real device directory that the symlink points to
     vfs_node_t *pci_seg = sysfs_mkdir(devices_dir, "pci0000:00");
     vfs_node_t *gpu_dev = sysfs_mkdir(pci_seg, pci_addr);
@@ -417,6 +440,24 @@ void sysfs_init(void) {
     // /sys/class/drm/
     sysfs_symlink(card0_dir, "subsystem", "../../../../../class/drm");
     sysfs_symlink(card0_dir, "device", "../..");
+
+    /* Phase 6 C7: card2 (amdgpu) fake device, mirrored from card0. */
+    vfs_node_t *card2_dir = sysfs_mkdir(drm_dev, "card2");
+    sysfs_mkfile(card2_dir, "dev", "226:2\n");
+    sysfs_mkfile(card2_dir, "uevent",
+                 "MAJOR=226\nMINOR=2\nDEVNAME=dri/card2\n"
+                 "DEVTYPE=drm_minor\nSUBSYSTEM=drm\n");
+    sysfs_symlink(card2_dir, "subsystem", "../../../../../class/drm");
+    sysfs_symlink(card2_dir, "device", "../..");
+
+    /* renderD129 (amdgpu render node, DRM minor 129). */
+    vfs_node_t *render_dir = sysfs_mkdir(drm_dev, "renderD129");
+    sysfs_mkfile(render_dir, "dev", "226:129\n");
+    sysfs_mkfile(render_dir, "uevent",
+                 "MAJOR=226\nMINOR=129\nDEVNAME=dri/renderD129\n"
+                 "DEVTYPE=drm_minor\nSUBSYSTEM=drm\n");
+    sysfs_symlink(render_dir, "subsystem", "../../../../../class/drm");
+    sysfs_symlink(render_dir, "device", "../..");
     // Keep the intermediate drm/ and pci0000:00/ directories as plain sysfs
     // containers. Giving either a uevent file makes libudev treat it as a
     // device, but neither has a subsystem; Xorg then dereferences a NULL
@@ -430,6 +471,7 @@ void sysfs_init(void) {
     // node), so we must add vendor/device/class/irq files here explicitly.
     {
       uint32_t vid = 0x1234, did = 0x1111, cls = 0x030000;
+      uint32_t sub_vid = 0, sub_did = 0;
       uint32_t pci_cnt = pci_get_device_count();
       for (uint32_t ii = 0; ii < pci_cnt; ii++) {
         struct pci_device *gpd = asc_pci_get_device(ii);
@@ -438,9 +480,27 @@ void sysfs_init(void) {
           did = gpd->device_id;
           cls = ((uint32_t)gpd->class_code << 16) |
                 ((uint32_t)gpd->subclass << 8) | gpd->prog_if;
+          /* libdrm's drmGetDevice2()/drmParsePciIds() reads all four IDs;
+           * without subsystem_vendor/device Mesa cannot identify the GPU
+           * and silently falls back to llvmpipe (Phase 6 C7). */
+          uint32_t sub = pci_config_read32(gpd->bus, gpd->slot, gpd->func,
+                                           0x2c);
+          sub_vid = sub & 0xffff;
+          sub_did = sub >> 16;
           break;
         }
       }
+      char ssvbuf[10], ssdbuf[10];
+      ssvbuf[0] = '0';
+      ssvbuf[1] = 'x';
+      u32_to_hex(sub_vid, ssvbuf + 2, 4);
+      ssvbuf[6] = '\n';
+      ssvbuf[7] = '\0';
+      ssdbuf[0] = '0';
+      ssdbuf[1] = 'x';
+      u32_to_hex(sub_did, ssdbuf + 2, 4);
+      ssdbuf[6] = '\n';
+      ssdbuf[7] = '\0';
       char vbuf[10], dbuf[10], cbuf[12];
       vbuf[0] = '0';
       vbuf[1] = 'x';
@@ -459,6 +519,8 @@ void sysfs_init(void) {
       cbuf[9] = '\0';
       sysfs_mkfile(gpu_dev, "vendor", vbuf);
       sysfs_mkfile(gpu_dev, "device", dbuf);
+      sysfs_mkfile(gpu_dev, "subsystem_vendor", ssvbuf);
+      sysfs_mkfile(gpu_dev, "subsystem_device", ssdbuf);
       sysfs_mkfile(gpu_dev, "class", cbuf);
       sysfs_mkfile(gpu_dev, "irq", "11\n");
       sysfs_mkfile(gpu_dev, "enable", "1\n");
@@ -470,6 +532,9 @@ void sysfs_init(void) {
     strcat(sysfs_gpu_devpath, "/drm/card0");
     strcpy(sysfs_gpu_connector_devpath, sysfs_gpu_devpath);
     strcat(sysfs_gpu_connector_devpath, "/card0-HDMI-A-1");
+    strcpy(sysfs_gpu2_devpath, "/devices/pci0000:00/");
+    strcat(sysfs_gpu2_devpath, pci_addr);
+    strcat(sysfs_gpu2_devpath, "/drm/card2");
 
     // Add devices/ directory under drm_class so that
     // /sys/subsystem/drm/devices/ enumeration finds card0
@@ -488,6 +553,19 @@ void sysfs_init(void) {
       strcat(conn_rel, pci_addr);
       strcat(conn_rel, "/drm/card0/card0-HDMI-A-1");
       sysfs_symlink(drm_devices_dir, "card0-HDMI-A-1", conn_rel);
+
+      /* Phase 6 C7: same for amdgpu's card2 and render node. */
+      char card2_rel[128];
+      strcpy(card2_rel, "../../../devices/pci0000:00/");
+      strcat(card2_rel, pci_addr);
+      strcat(card2_rel, "/drm/card2");
+      sysfs_symlink(drm_devices_dir, "card2", card2_rel);
+
+      char render_rel[128];
+      strcpy(render_rel, "../../../devices/pci0000:00/");
+      strcat(render_rel, pci_addr);
+      strcat(render_rel, "/drm/renderD129");
+      sysfs_symlink(drm_devices_dir, "renderD129", render_rel);
     }
   }
 
@@ -606,6 +684,20 @@ void sysfs_init(void) {
     strcat(dev_target, pci_addr2);
     strcat(dev_target, "/drm/card0");
     sysfs_symlink(char_dir, "226:0", dev_target);
+
+    /* Phase 6 C7: amdgpu's card2 and renderD129 char devices.  libdrm's
+     * drmGetDevice2() starts from /sys/dev/char/<major>:<minor>. */
+    char dev_target2[128];
+    strcpy(dev_target2, "../../devices/pci0000:00/");
+    strcat(dev_target2, pci_addr2);
+    strcat(dev_target2, "/drm/card2");
+    sysfs_symlink(char_dir, "226:2", dev_target2);
+
+    char dev_target3[128];
+    strcpy(dev_target3, "../../devices/pci0000:00/");
+    strcat(dev_target3, pci_addr2);
+    strcat(dev_target3, "/drm/renderD129");
+    sysfs_symlink(char_dir, "226:129", dev_target3);
   }
 
   // Input char devices: /sys/dev/char/13:64 -> symlink to virtual device

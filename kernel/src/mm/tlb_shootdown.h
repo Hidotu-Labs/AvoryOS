@@ -2,6 +2,7 @@
 #define MM_TLB_SHOOTDOWN_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define IPI_VECTOR_TLB_SHOOTDOWN 50
 
@@ -65,7 +66,16 @@ uint64_t tlb_shootdown_caller_info(int slot, uint64_t *ip, uint64_t *total,
  * page. */
 void tlb_flush_deferred(uint64_t addr, uint64_t pml4);
 void tlb_flush_deferred_all(void);
-void tlb_flush_deferred_drain(void);
+
+/* Perform the queued invalidations and wait for the remote CPUs to
+ * acknowledge.  Must only be called from a context that can take an IPI
+ * (interrupts enabled): a masked caller cannot answer another CPU's
+ * shootdown, and it cannot wait for one either, so instead the local
+ * invalidations are done and the requests stay queued.  Returns true when
+ * the queue was fully drained (remote acks included), false when it was only
+ * locally invalidated and the caller must keep any emptied page-table frames
+ * parked - a remote CPU may still be walking them. */
+bool tlb_flush_deferred_drain(void);
 void tlb_shootdown_reset_stats(void);
 
 #endif // MM_TLB_SHOOTDOWN_H

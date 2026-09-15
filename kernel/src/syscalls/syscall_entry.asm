@@ -68,6 +68,15 @@ syscall_entry:
     clac
 .clac_done:
 
+    ; Interrupts must be masked before the user RSP is loaded.  After
+    ; `pop rsp` the CPU is still ring 0 but RSP is the user stack, so a timer
+    ; IRQ landing in that window pushes its exception frame onto user memory
+    ; (a SMAP fault), the nested delivery faults again, and the machine takes
+    ; a #DF with the interrupted RIP saved as the `cli` that had not run yet.
+    ; The entry side is safe because IA32_FMASK masks IF until the kernel GS
+    ; and stack are in place; the same has to hold on the way out.
+    cli
+
     ; rt_sigreturn requires IRETQ to restore user RCX and R11.
     mov rax, gs:[384]
     test rax, rax
@@ -93,10 +102,8 @@ syscall_entry:
     pop r11 ; User RFLAGS
     pop rsp ; User RSP
 
-    ; Swap GS back to User TLS (if any)
-    ; Disable interrupts to protect the window between swapgs and sysret,
-    ; as the ISR would now see a kernel CS but with user GS.
-    cli
+    ; Swap GS back to User TLS (if any).  Interrupts are already masked from
+    ; above, so the ISR can never observe a kernel CS with user GS.
     swapgs
 
     ; Return to user mode safely

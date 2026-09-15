@@ -201,6 +201,7 @@
 #define SYS_OPEN_BY_HANDLE_AT 304
 #define SYS_SENDMMSG 307
 #define SYS_GETCPU    309
+#define SYS_KCMP      312
 #define SYS_GETRANDOM 318
 #define SYS_MEMFD_CREATE 319
 #define SYS_MEMBARRIER 324
@@ -303,6 +304,11 @@ void syscall_register_futex(void);
 const char *syscall_get_name(uint64_t num);
 
 void syscall_init(void);
+
+/* Program a CPU's SYSCALL/SYSRET MSRs (EFER.SCE, STAR, LSTAR, FMASK).
+ * syscall_init() does this for the BSP; every AP must call it during bring-up
+ * before user code can run there, or `syscall` faults as #UD. */
+void syscall_init_cpu(void);
 
 uint64_t mm_alloc_mmap_region(uint64_t length);
 

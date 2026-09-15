@@ -613,16 +613,35 @@ static void klog_rflags_decoded(uint64_t rflags) {
   klog_puts("]\n");
 }
 
+/* Translate a user address into a kernel-readable HHDM pointer for the fault
+ * report.  The direct map does not necessarily cover every frame a user PTE
+ * can name (device memory, stale entries, boot-time holes), and this code runs
+ * inside the exception path: dereferencing phys + hhdm unvalidated turns a
+ * user fault report into a nested #PF and a triple-fault reset.  Validating
+ * the direct-map entry first keeps the report alive. */
+static bool klog_user_kaddr(uint64_t *pml4, uint64_t uaddr, uint64_t *kaddr_out) {
+    uint64_t phys;
+
+    if (!pml4)
+        return false;
+    phys = vmm_virt_to_phys(pml4, uaddr);
+    if (!phys)
+        return false;
+    if (!vmm_virt_to_phys(pml4, phys + pmm_get_hhdm_offset()))
+        return false;
+    *kaddr_out = phys + pmm_get_hhdm_offset();
+    return true;
+}
+
 static void klog_dump_ptr(const char *reg_name, uint64_t val) {
     if (val < 0x10000) return; // likely small constant or null
     if (val >= 0x0000800000000000ULL && val < 0xFFFF800000000000ULL) return; // non-canonical
     if (val >= 0xFFFF800000000000ULL) return; // kernel address (don't dump from user fault)
     
     uint64_t *pml4 = vmm_get_active_pml4();
-    uint64_t phys = vmm_virt_to_phys(pml4, val);
-    if (phys != 0) {
+    uint64_t hhdm_addr;
+    if (klog_user_kaddr(pml4, val, &hhdm_addr)) {
         klog_puts("  *"); klog_puts(reg_name); klog_puts(" ("); klog_hex64(val); klog_puts("): ");
-        uint64_t hhdm_addr = phys + pmm_get_hhdm_offset();
         // Dump 32 bytes or until page boundary
         uint64_t offset_in_page = val & 0xFFF;
         uint32_t to_dump = 32;
@@ -636,6 +655,9 @@ static void klog_dump_ptr(const char *reg_name, uint64_t val) {
             klog_putchar(' ');
         }
         klog_puts("\n");
+    } else {
+        klog_puts("  *"); klog_puts(reg_name); klog_puts(" ("); klog_hex64(val);
+        klog_puts("): <user address not backed by a readable frame>\n");
     }
 }
 
@@ -901,9 +923,9 @@ void isr_report_user_fault(struct registers *regs, int sig,
       klog_puts("CODE AT RIP: ");
       for (int i = -8; i < 24; i++) {
           uint64_t vaddr = regs->rip + i;
-          uint64_t phys = vmm_virt_to_phys(pml4, vaddr);
-          if (phys) {
-              uint8_t b = *(uint8_t*)(phys + pmm_get_hhdm_offset());
+          uint64_t kaddr;
+          if (klog_user_kaddr(pml4, vaddr, &kaddr)) {
+              uint8_t b = *(uint8_t*)kaddr;
               if (i == 0) klog_puts(KLOG_CLR_GREEN ">");
               const char *_h = "0123456789ABCDEF";
               klog_putchar(_h[(b >> 4) & 0xF]);
@@ -920,10 +942,10 @@ void isr_report_user_fault(struct registers *regs, int sig,
       klog_puts("USER STACK (RSP):\n");
       for (int i = 0; i < 16; i++) {
           uint64_t saddr = regs->rsp + (i * 8);
-          uint64_t phys = vmm_virt_to_phys(pml4, saddr);
+          uint64_t kaddr;
           klog_puts("  ["); klog_hex64(saddr); klog_puts("] = ");
-          if (phys != 0) {
-              uint64_t val = *(uint64_t*)(phys + pmm_get_hhdm_offset());
+          if (klog_user_kaddr(pml4, saddr, &kaddr)) {
+              uint64_t val = *(uint64_t*)kaddr;
               klog_hex64(val);
               // Try to find if it corresponds to any VMA or is a string
               struct vma *sv = vma_find(&current->mm->vmas, val);
@@ -1040,6 +1062,20 @@ static void stack_fault_handler(struct registers *regs) {
   }
 }
 
+/* Delivered when a fault occurs while the CPU is delivering another fault
+ * (typically a nested #PF inside the page-fault handler).  The gate carries
+ * IST1 (see gdt.c/idt.c), so the frame is valid even when the stack that
+ * faulted is not; without it these reset the machine silently.  CR2 still
+ * holds the second fault's address, and kpf_dump_page_fault() writes straight
+ * to the serial line before the console path can fail. */
+static void double_fault_handler(struct registers *regs) {
+  uint64_t cr2 = 0;
+
+  __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+  kpf_dump_page_fault(regs, cr2);
+  isr_panic(regs, "Double fault (exception during exception handling)");
+}
+
 /*
  * int3 from user mode.  This is how debuggers plant breakpoints and how
  * GLib's G_BREAKPOINT() (g_error, g_assert) deliberately traps; the only
@@ -1068,6 +1104,7 @@ void isr_init_exceptions(void) {
   register_interrupt_handler(3, breakpoint_handler);
   register_interrupt_handler(4, overflow_handler);
   register_interrupt_handler(6, invalid_opcode_handler);
+  register_interrupt_handler(8, double_fault_handler);
   register_interrupt_handler(12, stack_fault_handler);
   register_interrupt_handler(13, gpf_handler);
   register_interrupt_handler(14, page_fault_handler);

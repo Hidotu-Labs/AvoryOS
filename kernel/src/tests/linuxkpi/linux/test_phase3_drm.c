@@ -67,6 +67,17 @@ static int phase3_check_devnode(const char *path) {
     return 0;
   }
 
+  /* The per-open descriptor must carry the registered node's dev_t.  libdrm
+   * identifies a DRM node from fstat(st_rdev) (drmGetDevice2 -> major/minor
+   * -> /sys/dev/char/...), and Mesa's loader/GBM/EGL use that to pick the
+   * DRI driver; an instance without it silently falls back to llvmpipe
+   * (Phase 6 C7). */
+  if (asc_vfs_node_inode(node) == 0) {
+    klogf("[ FAIL ] LinuxKPI: %s per-open node lost its dev_t\n", path);
+    asc_vfs_kernel_close(node);
+    return -1;
+  }
+
   /* poll(2) path: a fresh DRM file has no events queued, so drm_poll() must
    * return 0.  Running it also records the file's native poll queue so a
    * later wake_up(event_wait) can wake sys_poll() waiters. */

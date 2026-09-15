@@ -1814,6 +1814,178 @@ them).  First increment: the P2 VMA-bridge prerequisite, test-first.
   semantics) or make TTM's fault wait non-sleeping.  Recorded in the gap
   log.
 
+### C7 — 6f: Mesa radeonsi 3D + accelerated Xorg/Wayland (started 2026-09-14)
+
+Started from `p6-6e` (annotated on the C6 closeout commit `d9d74ff`).  The
+chunk goal is unmodified Mesa radeonsi through amdgpu's render node plus
+session-level device selection, so Xorg/Weston/Plasma use the passed GPU when
+it can drive a display and keep the native card0 path otherwise.
+
+Landed so far:
+
+- [x] **`kpi_emu_sink` boot parameter** (default 0): with `=1` the DCN
+      self-test keeps its generated EDID override + `DRM_FORCE_ON` on the
+      amdgpu connector after the suite, so a desktop session started later in
+      the same boot can run on card2 with no physical monitor attached.  A
+      real monitor still takes precedence (`dcn physical ...`, no override).
+      `test_phase6_dcn.c` logs `dcn emulated sink kept on ...` when it is
+      left in place; the C6 default path is unchanged.
+- [x] **Guest DRM selection** `initrd/drm-pick.sh`: prints amdgpu's card when
+      it can drive a display (a connector reports connected, or
+      `kpi_emu_sink=1` is on the real `/proc/cmdline`), else
+      `/dev/dri/card0`; `ASCENT_DRM_CARD` overrides.  Node discovery is by
+      driver name with the card2/renderD129 layout as fallback - never
+      hard-coded in the tests.
+- [x] **Xorg**: `initrd/startx.sh` rewrites
+      `/etc/X11/xorg.conf.d/10-modesetting.conf` before LightDM starts and
+      adds `Option "kmsdev" "/dev/dri/cardN"` for a non-card0 choice; the
+      packaged file stays the static card0 fallback.
+- [x] **Weston**: `initrd/startw.sh` passes `--drm-device=cardN` and defaults
+      to `ASCENT_RENDERER=auto` - radeonsi gl-renderer on amdgpu, pixman on
+      card0 - with a one-shot pixman retry if the GPU renderer fails;
+      `gpu`/`llvmpipe`/`pixman` remain explicit.
+- [x] **Plasma Wayland**: `initrd/avory-drm.sh` installed as
+      `/etc/profile.d/avory-drm.sh` exports `KWIN_DRM_DEVICES` for a session
+      started from a login shell.  `kwin_x11` follows the Xorg config.
+- [x] **`/proc/cmdline` now returns the real Limine command line** (it was a
+      hard-coded `"Xfbdev"` stub).  `drm-pick.sh` parses `kpi_emu_sink` from
+      it (`kernel/src/fs/procfs.c`).
+- [x] **`run-c7` target** (C6 cmdline + `kpi_emu_sink=1`, interactive or
+      `DISPLAY_OPT='-display none'`, serial to `build/logs/p6-c7.log`).
+- [x] **`bin/test_kpi_radeonsi`** (`userland/test_kpi_radeonsi.c`): discovers
+      the amdgpu render node by DRM name, opens GBM/EGL/GLES2 (GBM, else
+      EGL_EXT_platform_device, else surfaceless), asserts the renderer string
+      is radeonsi, renders and reads back a triangle, times 300 frames for
+      fps, and round-trips a GBM dma-buf through
+      `EGL_EXT_image_dma_buf_import` when the backend supports it.  It is the
+      first dynamically-linked musl userland test (Mesa shared libraries from
+      the Alpine rootfs; `-Wl,--allow-shlib-undefined` for libLLVM's runtime
+      libstdc++ symbols).
+- [x] **First hardware boot (maintainer-run, 2026-09-14).**  `kpi_emu_sink=1`
+      worked end to end: `/proc/cmdline` now returns the real cmdline,
+      `dcn emulated sink kept on HDMI-A-1 (card2, kpi_emu_sink=1)`, and
+      `link gate on: amdgpu initialized and bound` (card2/renderD129).  The
+      first boot hit the documented warm-GPU `PSP create ring failed!
+      (-22)` and passed on retry; one `[FAIL]` remains from the pre-existing
+      vkms GEM-loop PMM drift watch item (3 pages, warm second pass).
+- [x] **Found: Mesa fell back to llvmpipe.**  `bin/test_kpi_radeonsi` found
+      renderD129 but `gbm_create_device` returned NULL and the surfaceless
+      platform picked `llvmpipe (LLVM 19.1.4)`.  Alpine installs the DRI
+      drivers under `/usr/lib/xorg/modules/dri` while Mesa searches
+      `/usr/lib/dri`; `LIBGL_DRIVERS_PATH` is mandatory.  The test now sets
+      it, `startw.sh` exports it for Weston's gl-renderer, and
+      `/etc/profile.d/avory-drm.sh` exports it for the session.  The EGL
+      device fallback now also matches `EGL_DRM_RENDER_NODE_FILE_EXT`.
+- [x] **Found: Xorg fatal "Cannot run in framebuffer mode".**  The kmsdev
+      choice worked (`modeset(0): using /dev/dri/card2`) but the modesetting
+      legacy probe claimed an **fb slot** (no matching platform/PCI device),
+      and `xf86PostProbe()` fatals when an fb slot and a PCI slot are both
+      claimed.  `startx.sh` now derives the amdgpu `BusID "PCI:0:3:0"` from
+      `/sys/bus/pci` so the driver claims the PCI slot instead.
+- [x] **Found: Weston `--drm-device=card2` -> "not a KMS device".**  Weston
+      resolves the name through udev (`/sys/class/drm/<name>`), but the fake
+      sysfs bridge only exposed card0, attributed to the amdgpu PCI address.
+      The bridge now also creates `/sys/class/drm/card2` (and its `devices/`
+      and `/sys/dev/char/226:2` links, `DEVNAME=dri/card2`) and pushes the
+      card2 fake uevent.
+- [x] **Second hardware boot (maintainer-run, 2026-09-14): Xorg on card2
+      works.**  The card2 fake sysfs entry alone fixed the modesetting
+      probe: Xorg ran on card2 with `modeset(0)`, committed the 1920x1080
+      emulated-sink stream and started its greeter (`dc_commit_streams:
+      1 streams`, no framebuffer fatal).  Weston also resolved card2
+      (`using /dev/dri/card2`, DRM caps logged) but failed at
+      `failed to initialize egl`.
+- [x] **Found: the Mesa loader could not identify the GPU at all.**  With
+      `LIBGL_DRIVERS_PATH` set, `gbm_create_device` still failed and the
+      EGL device list showed only `card=(none) render=(none)`.  libdrm's
+      `drmGetDevice2()` resolves `/sys/dev/char/226:129` (renderD129),
+      reads `uevent`, follows the `device` symlink and parses the PCI IDs -
+      the fake sysfs had no render node entry and the fake PCI device no
+      `subsystem_vendor`/`subsystem_device`.  Fixed in
+      `kernel/src/fs/sysfs.c` (renderD129 dir + class/devices/char links +
+      subsystem IDs).
+- [x] **Found: the per-open devnode lost its `dev_t` (second C7 boot: still
+      llvmpipe with the sysfs fix in the kernel).**  libdrm and
+      `gbm_create_device()` identify a DRM node from `fstat()` (`S_ISCHR` +
+      `st_rdev`), but the LinuxKPI bridge installed the open callback's fresh
+      `asc_vfs_anon_node()` - a plain `FS_FILE` with `inode` 0 - so every
+      imported DRM fd reported a regular file with `st_rdev = 0` and
+      `drmGetDevices2()` skipped all of `/dev/dri`.
+      `kpi_devnode_open_instance()` (`kernel/src/linuxkpi/native_vfs.c`) now
+      mirrors the registered node's type and `dev_t` into the per-open
+      instance, and the Phase 3 DRM self-test asserts the dev_t survives the
+      open (`linuxkpi_test_phase3_drm`).  `bin/test_kpi_radeonsi` also walks
+      the libdrm identification chain as `[DIAG]` lines (`/dev/dri` listing,
+      `fstat`, the `/sys/dev/char/<maj>:<min>` links, PCI uevent/IDs,
+      `drmGetDevices2`, `drmGetDevice2`) and exports `LIBGL_DEBUG=verbose`,
+      so a third boot shows the exact missing link instead of only the
+      llvmpipe renderer string.
+- [x] **Found: the nested devnodes stored the kernel dev_t, not the
+      userspace ABI word (third C7 boot).**  The `[DIAG]` block showed
+      `fstat(/dev/dri/renderD129): chardev rdev=0:57985`: the bridge had put
+      `dev->devt` (`MKDEV(226,129)` = `0x0E200081`, 20-bit minor) into the
+      native node's `inode`, which `fill_kstat()` reports verbatim as
+      `st_rdev`.  Userspace expects `new_encode_dev()` = `0xE281` (which musl
+      decodes as 226:129) - the encoding every native chardev (evdev, card0,
+      ALSA) already uses.  With the kernel word, libdrm rejects the node
+      (`drmGetDevice2 -> -22`, `/sys/dev/char/0:57985` does not exist) while
+      path-stat still found card0 (minor 0 is encoding-agnostic), so
+      `drmGetDevices2` returned a render-less card0 and Mesa's EGL device
+      list stayed software-only.  `asc_vfs_register_devnode_at()` now stores
+      `kpi_userspace_devt()` and `linuxkpi_drm_dev_open()` decodes with
+      `new_decode_dev()` for `inode->i_rdev`/`iminor()`.  The Phase 3
+      self-test covers the per-open dev_t.
+- [x] **Fourth boot: the dev_t fix worked end to end.**  The `[DIAG]` block
+      showed `fstat(...) rdev=226:129 (0xe281)`, `/sys/dev/char/226:129`
+      resolving through `device` to the PCI dir,
+      `PCI_SLOT_NAME=0000:00:03.0`, `drmGetDevices2 -> 1` with
+      `primary=/dev/dri/card2 render=/dev/dri/renderD129 ids=1002:164e`,
+      `drmGetDevice2 -> 0`, and GBM creating a real radeonsi screen
+      (shader-cache `fallocate`, `/usr/share/libdrm/amdgpu.ids`, radeonsi
+      helper threads; the `MESA-LOADER` failure line is gone).  The remaining
+      `eglChooseConfig` failure was the test's own pbuffer request - Mesa's
+      DRM/GBM platform adds `EGL_WINDOW_BIT` configs only
+      (`platform_drm.c`) - so the suite now creates a GBM surface (format
+      from `EGL_NATIVE_VISUAL_ID`) and an EGL window surface on the GBM path,
+      keeping pbuffers for device/surfaceless.  The dma-buf roundtrip also
+      passes the plane modifier when the import-modifiers extension is
+      present.  A `kcmp` (syscall 312) warning from libdrm's fd comparison
+      and the known TTM fault-path `might_sleep()` warn remain (both benign
+      here; logged in the gap doc).
+- [x] **Fifth boot: SIGILL in radeonsi's compiler threads + a reporter panic
+      (two independent bugs).**  With the window-surface fix, radeonsi's
+      screen came up and its shader threads started, then the box reset with
+      no panic output; `drm.debug=0x5` + the new `[KPI-FAULT]` trace narrowed
+      it to a user SIGILL at a `syscall` instruction inside musl's `munmap`.
+      Root cause: SYSCALL/SYSRET MSRs are per-CPU (`EFER.SCE`, `STAR`,
+      `LSTAR`, `FMASK`) and only the BSP ever set them - the AP trampoline
+      sets just `LME|NXE`, so any syscall on an AP faults as #UD.  The
+      reporter then turned the SIGILL into a panic of its own: it read user
+      pages through `phys + HHDM` without checking the direct-map entry, and
+      the register it inspected happened to be a VRAM BO mapping whose PTE
+      frame is the GPU BAR aperture (`0x300000000000 + BO offset`), which the
+      HHDM deliberately does not cover (MMIO).  Fixes: `syscall_init_cpu()`
+      is called by `syscall_init()` and every `ap_main()`; the fault reporter
+      validates the direct-map translation (`klog_user_kaddr()`) before
+      dereferencing and prints `<... not backed by a readable frame>`
+      otherwise.  Panic safety net: #DF now has its own IST stack and prints
+      a real panic instead of a silent triple-fault reset.
+- [x] **Parked the half-landed kpi_mirror glue.**  An earlier C7 attempt had
+      added a primary-plane mirror to `amdgpu_dm.c`/`amdgpu_dm_plane.c` that
+      calls the never-written native `ascentdrm_mirror_enabled()` and
+      `ascentdrm_mirror_present()` (the vendored tree stopped linking).  The
+      full diff is saved as
+      `scripts/linux/patches/disabled/0002-p6-c7-kpi-mirror.patch` (applies
+      with `patch -p1 -d kernel/linux`), and `kernel/linux/` was re-imported
+      so every C7 boot links again.  The native mirror side is still to be
+      designed; do not re-apply the patch before it exists.
+- [ ] Hardware evidence (next `run-c7` boot): renderer string + fps from
+      `bin/test_kpi_radeonsi` (must say radeonsi; the `[DIAG]` block must
+      show 226:129 and the amdgpu render node), Xorg/glxgears and Weston
+      gl-renderer on card2; boot regression still green.  Fill in below when
+      the run lands.
+- [ ] `p6-6f` tag at exit (plan's C7 exit evidence in this doc).
+
 ## Cross-phase notes
 
 - `run-vfio` (BDF default `0000:0e:00.0`) has not been booted with the GPU

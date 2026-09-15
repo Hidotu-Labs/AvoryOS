@@ -19,6 +19,13 @@ static struct gdt_entry gdt[GDT_ENTRIES];
 static struct gdt_ptr gp;
 static struct tss_entry tss_table[MAX_CPUS];
 
+/* #DF must run on a stack that is still valid even when the faulting kernel
+ * stack is not (overflow, corruption during a nested fault).  Each CPU gets
+ * its own stack, wired through the TSS IST1 field; idt.c sets IST1 for
+ * vector 8.  Without this a nested fault triple-faults and the box resets
+ * with nothing on the serial line. */
+static uint8_t df_stack[MAX_CPUS][8192] __attribute__((aligned(16)));
+
 extern void gdt_flush(uint64_t);
 
 static inline uint16_t tss_selector(uint32_t cpu_id) {
@@ -93,6 +100,8 @@ void gdt_init(void) {
   for (uint32_t i = 0; i < MAX_CPUS; i++) {
     memset(&tss_table[i], 0, sizeof(struct tss_entry));
     tss_table[i].iopb_offset = sizeof(struct tss_entry);
+    tss_table[i].ist1 =
+        (uint64_t)(df_stack[i] + sizeof(df_stack[i])) & ~0xFULL;
     gdt_set_tss(GDT_TSS_BASE + 2 * (int)i, (uint64_t)&tss_table[i],
                 sizeof(struct tss_entry) - 1);
   }

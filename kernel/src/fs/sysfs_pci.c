@@ -217,17 +217,28 @@ static int pci_show(void *opaque, char *buf, size_t size) {
                     "pci:v0000%04Xd0000%04Xsv00000000sd00000000bc%02Xsc%02Xi%02X\n",
                     pci->vendor_id, pci->device_id, pci->class_code,
                     pci->subclass, pci->prog_if);
-  case PCI_ATTR_UEVENT:
+  case PCI_ATTR_UEVENT: {
+    /* libdrm's drmParsePciBusInfo() reads PCI_SLOT_NAME from this uevent;
+     * without it drmGetDevice2() fails and Mesa's loader cannot identify
+     * the GPU (Phase 6 C7 - silently fell back to llvmpipe).  Subsystem IDs
+     * are in the separate attribute files, but upstream also lists them
+     * here. */
+    uint32_t sub = pci_config_read32(pci->bus, pci->slot, pci->func, 0x2c);
     return snprintf(buf, size,
                     "DRIVER=%s\nPCI_CLASS=%02X%02X%02X\nPCI_ID=%04X:%04X\n"
-                    "MODALIAS=pci:v0000%04Xd0000%04Xsv00000000sd00000000bc%02Xsc%02Xi%02X\n",
+                    "PCI_SUBSYS_ID=%04X:%04X\n"
+                    "PCI_SLOT_NAME=%04X:%02X:%02X.%u\n"
+                    "MODALIAS=pci:v0000%04Xd0000%04Xsv%08Xsd%08Xbc%02Xsc%02Xi%02X\n",
                     pci->kernel_device && pci->kernel_device->driver
                         ? pci->kernel_device->driver->name
                         : "",
                     pci->class_code, pci->subclass, pci->prog_if,
-                    pci->vendor_id, pci->device_id, pci->vendor_id,
-                    pci->device_id, pci->class_code, pci->subclass,
-                    pci->prog_if);
+                    pci->vendor_id, pci->device_id,
+                    sub & 0xffff, sub >> 16,
+                    0, pci->bus, pci->slot, pci->func,
+                    pci->vendor_id, pci->device_id, sub & 0xffff, sub >> 16,
+                    pci->class_code, pci->subclass, pci->prog_if);
+  }
   case PCI_ATTR_ENABLE: {
     uint16_t command = pci_config_read16(pci->bus, pci->slot, pci->func, 0x04);
     return snprintf(buf, size, "%u\n", (command & 3) != 0);
