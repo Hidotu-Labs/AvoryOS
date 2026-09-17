@@ -1,11 +1,14 @@
 #include "vfs.h"
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
+#include "../cpu/tsc.h"
 #include "../lib/string.h"
+#include "../lib/tsc.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include "../sched/sched.h"
 #include "../sched/wait.h"
+#include "../smp/cpu.h"
 #include "arch/uaccess.h"
 
 #define PHYS_TO_VIRT(p) ((void *)((uint64_t)(p) + pmm_get_hhdm_offset()))
@@ -13,10 +16,37 @@
 #define CACHE_NODE_LIMIT 256u
 
 static uint64_t vfs_cached_pages;
-static uint64_t vfs_cache_clock;
+
+/* Access stamps used for reclaim ordering.  A single global atomic meant every
+ * cache hit wrote the same cache line, so cores bounced it between themselves;
+ * reclaim only needs a rough recency order, so each CPU owns a private counter
+ * and the CPU id is folded into the low bits.  The counters are not globally
+ * ordered and a lost increment under preemption is harmless: the stamp feeds a
+ * heuristic, never correctness. */
+struct vfs_cache_stamp_slot {
+  uint64_t counter;
+} __attribute__((aligned(64)));
+
+static struct vfs_cache_stamp_slot vfs_cache_stamps[MAX_CPUS];
+
+/* Logical CPU index read straight out of the per-CPU struct through GS.
+ * cpu_get_current() goes through rdmsr(MSR_GS_BASE) - a VM exit under KVM -
+ * and this runs on every cache hit.  Valid from the moment cpu_init() has
+ * installed the GS base, which is long before any VFS traffic. */
+static inline uint32_t cache_cpu_id(void) {
+  uint32_t id;
+  __asm__ volatile("movl %%gs:%c1, %0"
+                   : "=r"(id)
+                   : "i"(offsetof(struct cpu_info, cpu_id)));
+  return id;
+}
 
 static uint64_t cache_stamp(void) {
-  return __atomic_add_fetch(&vfs_cache_clock, 1, __ATOMIC_RELAXED);
+  uint32_t id = cache_cpu_id();
+  if (id >= MAX_CPUS)
+    id = 0;
+  uint64_t tick = ++vfs_cache_stamps[id].counter;
+  return (tick << 6) | id;
 }
 
 static uint64_t cache_key(uint32_t offset) { return (uint64_t)(offset >> 12); }
@@ -64,7 +94,7 @@ vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
   spinlock_acquire(&node->pages_lock);
   vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
   if (page) {
-    page->refs++;
+    vfs_page_get(page);
     page->last_used = cache_stamp();
   }
   spinlock_release(&node->pages_lock);
@@ -74,14 +104,10 @@ vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
 void vfs_cache_put(vfs_node_t *node, vfs_page_t *page) {
   if (!node || !page)
     return;
-  bool release = false;
-  spinlock_acquire(&node->pages_lock);
-  if (page->refs)
-    page->refs--;
-  if (!page->refs && page->evicted)
-    release = true;
-  spinlock_release(&node->pages_lock);
-  if (release)
+  /* No pages_lock: the packed reference word arbitrates the release, so a put
+   * never has to disable interrupts just to drop a reference.  See the
+   * vfs_page_t comment in vfs.h. */
+  if (vfs_page_put(page))
     cache_page_release(page);
 }
 
@@ -104,7 +130,7 @@ vfs_page_t *vfs_cache_insert(vfs_node_t *node, uint32_t offset,
   spinlock_acquire(&node->pages_lock);
   vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
   if (page) {
-    page->refs++;
+    vfs_page_get(page);
     spinlock_release(&node->pages_lock);
     kfree(new_page);
     pmm_free_page((void *)frame);
@@ -159,7 +185,7 @@ vfs_page_t *vfs_cache_get_or_create(vfs_node_t *node, uint32_t offset) {
   spinlock_acquire(&node->pages_lock);
   page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
   if (page) {
-    page->refs++;
+    vfs_page_get(page);
   } else if (!asc_radix_tree_insert(&node->pages, cache_key(offset), candidate)) {
     page = candidate;
     creator = true;
@@ -197,7 +223,7 @@ vfs_page_t *vfs_cache_get_or_create(vfs_node_t *node, uint32_t offset) {
            PAGE_SIZE - read);
 
   spinlock_acquire(&node->pages_lock);
-  page->uptodate = read == to_read && !page->evicted;
+  page->uptodate = read == to_read && !vfs_page_is_evicted(page);
   page->loading = false;
   bool ok = page->uptodate;
   spinlock_release(&node->pages_lock);
@@ -594,11 +620,16 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   return done;
 }
 
-static vfs_page_t *cache_delete_locked(vfs_node_t *node, uint64_t key) {
+/* Remove `key` from the tree and mark the page evicted.  Returns the page, or
+ * NULL when it was not cached.  `releasable` is set when the caller must free
+ * it: no transient reference existed and no racing put can own the final
+ * release (see the packed-refcount note in vfs.h). */
+static vfs_page_t *cache_delete_locked(vfs_node_t *node, uint64_t key,
+                                       bool *releasable) {
   vfs_page_t *page = asc_radix_tree_delete(&node->pages, key);
   if (!page)
     return NULL;
-  page->evicted = true;
+  *releasable = vfs_page_evict(page);
   __atomic_sub_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
   return page;
 }
@@ -606,11 +637,11 @@ static vfs_page_t *cache_delete_locked(vfs_node_t *node, uint64_t key) {
 void vfs_cache_invalidate(vfs_node_t *node, uint32_t offset) {
   if (!node)
     return;
+  bool releasable = false;
   spinlock_acquire(&node->pages_lock);
-  vfs_page_t *page = cache_delete_locked(node, cache_key(offset));
-  bool release = page && !page->refs;
+  vfs_page_t *page = cache_delete_locked(node, cache_key(offset), &releasable);
   spinlock_release(&node->pages_lock);
-  if (release)
+  if (page && releasable)
     cache_page_release(page);
 }
 
@@ -632,8 +663,8 @@ static bool collect_keys(uint64_t key, void *value, void *opaque) {
   if (key < batch->first || key > batch->last)
     return true;
   if (batch->unused_only &&
-      (page->refs || page->dirty || page->loading || page->writeback ||
-       pmm_get_ref((void *)page->frame_phys) != 1))
+      (vfs_page_ref_count(page) || page->dirty || page->loading ||
+       page->writeback || pmm_get_ref((void *)page->frame_phys) != 1))
     return true;
   batch->keys[batch->count++] = key;
   return batch->count < CACHE_BATCH;
@@ -649,10 +680,10 @@ static void cache_remove_range(vfs_node_t *node, uint64_t first, uint64_t last,
     if (!batch.count)
       break;
     for (uint32_t i = 0; i < batch.count; i++) {
-      vfs_page_t *page = cache_delete_locked(node, batch.keys[i]);
-      if (!page)
-        continue;
-      if (!page->refs)
+      bool releasable = false;
+      vfs_page_t *page =
+          cache_delete_locked(node, batch.keys[i], &releasable);
+      if (page && releasable)
         cache_page_release(page);
     }
     if (complete)
@@ -687,7 +718,8 @@ void vfs_cache_update_or_invalidate(vfs_node_t *node, uint32_t offset,
 
     spinlock_acquire(&node->pages_lock);
     vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(cur_offset));
-    if (page && page->frame_phys && !page->loading && !page->evicted) {
+    if (page && page->frame_phys && !page->loading &&
+        !vfs_page_is_evicted(page)) {
       if (page->uptodate) {
         void *page_virt = PHYS_TO_VIRT(page->frame_phys);
         if (buffer) {
@@ -713,9 +745,8 @@ static void cache_destroy_value(void *value) {
     cache_report_invalid_value(value);
     return;
   }
-  page->evicted = true;
   __atomic_sub_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
-  if (!page->refs)
+  if (vfs_page_evict(page))
     cache_page_release(page);
 }
 
@@ -748,8 +779,8 @@ static bool find_reclaimable(uint64_t key, void *value, void *opaque) {
     return true;
   }
   struct reclaim_search *search = opaque;
-  if (page->refs || page->dirty || page->loading || page->writeback ||
-      pmm_get_ref((void *)page->frame_phys) != 1)
+  if (vfs_page_ref_count(page) || page->dirty || page->loading ||
+      page->writeback || pmm_get_ref((void *)page->frame_phys) != 1)
     return true;
   if (!search->found || page->last_used < search->stamp) {
     search->found = true;
@@ -769,10 +800,12 @@ size_t vfs_cache_reclaim(vfs_node_t *node, size_t target) {
     asc_radix_tree_for_each(&node->pages, find_reclaimable, &search);
     if (!search.found)
       break;
-    vfs_page_t *page = cache_delete_locked(node, search.key);
+    bool releasable = false;
+    vfs_page_t *page = cache_delete_locked(node, search.key, &releasable);
     if (!page)
       continue;
-    cache_page_release(page);
+    if (releasable)
+      cache_page_release(page);
     reclaimed++;
   }
   spinlock_release(&node->pages_lock);
@@ -784,7 +817,7 @@ void vfs_cache_mark_dirty(vfs_node_t *node, uint32_t offset) {
     return;
   spinlock_acquire(&node->pages_lock);
   vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
-  if (page && page->uptodate && !page->evicted) {
+  if (page && page->uptodate && !vfs_page_is_evicted(page)) {
     page->dirty = true;
     page->dirty_seq++;
     page->last_used = cache_stamp();
@@ -808,7 +841,7 @@ static bool find_dirty(uint64_t key, void *value, void *opaque) {
   if (!page->dirty || page->loading || page->writeback)
     return true;
   page->writeback = true;
-  page->refs++;
+  vfs_page_get(page);
   search->page = page;
   search->dirty_seq = page->dirty_seq;
   return false;
@@ -904,7 +937,8 @@ bool vfs_cache_phase3_stress_test(void) {
     uint64_t held_frame = held->frame_phys;
     vfs_cache_invalidate(&node, held->offset);
     vfs_page_t *gone = vfs_cache_lookup(&node, held->offset);
-    if (gone || !held->evicted || pmm_get_ref((void *)held_frame) != 1)
+    if (gone || !vfs_page_is_evicted(held) ||
+        pmm_get_ref((void *)held_frame) != 1)
       pass = false;
     if (gone)
       vfs_cache_put(&node, gone);
@@ -1153,4 +1187,260 @@ bool vfs_cache_phase5_stress_test(void) {
   vfs_cache_clear(&node);
   return pass && asc_radix_tree_validate(&node.pages) &&
          vfs_cache_page_count() == cached_before;
+}
+
+/* ── `vfs_selftest=1` / `vfs_bench=1` page-cache pieces ─────────────────────
+ *
+ * The selftest pins the packed-reference arbitration: a held reference keeps an
+ * evicted page alive until its final put, eviction with no users frees right
+ * away, and a failed load leaves nothing behind.  The benchmark contrasts the
+ * lock-free put against the old lock+IRQ-mask form, and the per-CPU stamp
+ * against the global atomic it replaced - same working set, back to back.
+ * Entry points and gating live in vfs.c. */
+
+bool vfs_cache_ref_selftest(void) {
+  bool pass = true;
+  size_t cached_before = vfs_cache_page_count();
+  vfs_node_t node;
+  vfs_node_init(&node);
+  node.flags = FS_FILE | FS_PAGE_CACHE;
+  node.length = 4 * PAGE_SIZE;
+
+  /* 1. A held reference outlives eviction; the last put frees the page. */
+  void *frame = pmm_alloc_page();
+  if (!frame) {
+    vfs_cache_clear(&node);
+    return false;
+  }
+  vfs_page_t *page = vfs_cache_insert(&node, 0, (uint64_t)frame);
+  if (!page) {
+    pmm_free_page(frame);
+    vfs_cache_clear(&node);
+    return false;
+  }
+  vfs_cache_put(&node, page); /* cached, no transient users now */
+
+  vfs_page_t *held = vfs_cache_lookup(&node, 0);
+  if (!held || vfs_page_ref_count(held) != 1)
+    pass = false;
+  if (held) {
+    uint64_t held_frame = held->frame_phys;
+    vfs_cache_invalidate(&node, 0);
+    if (!vfs_page_is_evicted(held) || pmm_get_ref((void *)held_frame) != 1)
+      pass = false;
+    vfs_page_t *gone = vfs_cache_lookup(&node, 0);
+    if (gone) {
+      pass = false;
+      vfs_cache_put(&node, gone);
+    }
+    vfs_cache_put(&node, held);
+  }
+
+  /* 2. Eviction with no transient users frees immediately. */
+  void *frame2 = pmm_alloc_page();
+  if (!frame2) {
+    pass = false;
+  } else {
+    vfs_page_t *page2 = vfs_cache_insert(&node, PAGE_SIZE, (uint64_t)frame2);
+    if (!page2) {
+      pmm_free_page(frame2);
+      pass = false;
+    } else {
+      vfs_cache_put(&node, page2);
+      vfs_cache_invalidate(&node, PAGE_SIZE);
+    }
+  }
+
+  /* 3. A failed load (no read callback) must not stay cached as valid. */
+  vfs_page_t *failed = vfs_cache_get_or_create(&node, 2 * PAGE_SIZE);
+  if (failed) {
+    pass = false;
+    vfs_cache_put(&node, failed);
+  }
+  vfs_page_t *lingering = vfs_cache_lookup(&node, 2 * PAGE_SIZE);
+  if (lingering) {
+    pass = false;
+    vfs_cache_put(&node, lingering);
+  }
+
+  vfs_cache_clear(&node);
+  return pass && asc_radix_tree_validate(&node.pages) &&
+         vfs_cache_page_count() == cached_before;
+}
+
+static void vfs_cache_bench_report(const char *name, uint64_t ops,
+                                   uint64_t cycles) {
+  uint64_t ns = tsc_cycles_to_ns(cycles);
+  klog_puts("[VFS-BENCH] ");
+  klog_puts(name);
+  klog_puts(": ");
+  klog_uint64(ops);
+  klog_puts(" ops, ");
+  klog_uint64(ops ? cycles / ops : 0);
+  klog_puts(" cycles/op");
+  if (ns) {
+    klog_puts(", ");
+    klog_uint64(ops ? ns / ops : 0);
+    klog_puts(" ns/op");
+  }
+  klog_putchar('\n');
+}
+
+/* ── Multi-CPU lookup+put scaling ───────────────────────────────────────────
+ * The single-CPU pair cannot show what the packed refcount buys when several
+ * CPUs touch the same file: the old put took pages_lock, so even a pure cache
+ * hit serialized across cores.  Fan three kthreads over the APs and compare
+ * the aggregate rate with the single-thread number reported above.
+ * `sched_create_kernel_thread` takes no argument, so each worker reads its
+ * context from the shared array. */
+#define VFS_PC_BENCH_THREADS 3
+#define VFS_PC_BENCH_ITERS 200000
+
+struct vfs_pc_bench_ctx {
+  vfs_node_t *node;
+  uint64_t iters;
+};
+
+static struct vfs_pc_bench_ctx vfs_pc_bench_ctxs[VFS_PC_BENCH_THREADS];
+static volatile uint32_t vfs_pc_bench_go;
+static volatile uint32_t vfs_pc_bench_done;
+
+static void vfs_pc_bench_worker(struct vfs_pc_bench_ctx *ctx) {
+  while (!__atomic_load_n(&vfs_pc_bench_go, __ATOMIC_ACQUIRE))
+    sched_yield();
+  for (uint64_t i = 0; i < ctx->iters; i++) {
+    vfs_page_t *page = vfs_cache_lookup(ctx->node, 0);
+    if (page)
+      vfs_cache_put(ctx->node, page);
+  }
+  __atomic_add_fetch(&vfs_pc_bench_done, 1, __ATOMIC_ACQ_REL);
+}
+
+static void vfs_pc_bench_worker0(void) {
+  vfs_pc_bench_worker(&vfs_pc_bench_ctxs[0]);
+}
+static void vfs_pc_bench_worker1(void) {
+  vfs_pc_bench_worker(&vfs_pc_bench_ctxs[1]);
+}
+static void vfs_pc_bench_worker2(void) {
+  vfs_pc_bench_worker(&vfs_pc_bench_ctxs[2]);
+}
+
+static void vfs_pc_bench_multicore(vfs_node_t *node) {
+  if (cpu_get_count() < 2) {
+    klog_puts("[VFS-BENCH] multi-cpu lookup+put skipped: single CPU\n");
+    return;
+  }
+
+  static void (*const entries[VFS_PC_BENCH_THREADS])(void) = {
+      vfs_pc_bench_worker0, vfs_pc_bench_worker1, vfs_pc_bench_worker2};
+  uint32_t started = 0;
+
+  for (uint32_t i = 0; i < VFS_PC_BENCH_THREADS; i++) {
+    /* Pin one worker per AP: a NULL explicit CPU would put them all on the
+     * BSP, which is exactly the serialization the test exists to expose. */
+    struct cpu_info *target = cpu_get_info(i + 1);
+    if (!target || target->status == CPU_STATUS_OFFLINE)
+      break;
+    vfs_pc_bench_ctxs[i].node = node;
+    vfs_pc_bench_ctxs[i].iters = VFS_PC_BENCH_ITERS;
+    if (!sched_create_kernel_thread(entries[i], target, true))
+      break;
+    started++;
+  }
+  if (!started)
+    return;
+
+  __atomic_store_n(&vfs_pc_bench_go, 1, __ATOMIC_RELEASE);
+
+  uint64_t ops = 0;
+  uint64_t t0 = rdtsc_fence();
+  for (uint64_t i = 0; i < VFS_PC_BENCH_ITERS; i++) {
+    vfs_page_t *page = vfs_cache_lookup(node, 0);
+    if (!page)
+      break;
+    vfs_cache_put(node, page);
+    ops++;
+  }
+
+  /* Bounded wait: a worker that never gets scheduled must not wedge boot. */
+  uint64_t deadline = tsc_get_freq_khz() * 500;
+  while (__atomic_load_n(&vfs_pc_bench_done, __ATOMIC_ACQUIRE) < started) {
+    if (deadline && rdtsc_fence() - t0 > deadline)
+      break;
+    sched_yield();
+  }
+  uint64_t cycles = rdtsc_fence() - t0;
+
+  ops += (uint64_t)started * VFS_PC_BENCH_ITERS;
+  klog_puts("[VFS-BENCH] lookup+put ");
+  klog_uint64(started + 1);
+  klog_puts("cpu aggregate: ");
+  klog_uint64(ops);
+  klog_puts(" ops, ");
+  klog_uint64(ops ? cycles / ops : 0);
+  klog_puts(" cycles/op\n");
+}
+
+void vfs_cache_bench(void) {
+  const uint64_t iters = 200000;
+  vfs_node_t node;
+  vfs_node_init(&node);
+  node.flags = FS_FILE | FS_PAGE_CACHE;
+  node.length = PAGE_SIZE;
+
+  void *frame = pmm_alloc_page();
+  if (!frame) {
+    vfs_cache_clear(&node);
+    return;
+  }
+  vfs_page_t *page = vfs_cache_insert(&node, 0, (uint64_t)frame);
+  if (!page) {
+    pmm_free_page(frame);
+    vfs_cache_clear(&node);
+    return;
+  }
+  vfs_cache_put(&node, page);
+
+  /* New form: lookup plus the lock-free packed put. */
+  uint64_t ops = 0;
+  uint64_t t0 = rdtsc_fence();
+  for (uint64_t i = 0; i < iters; i++) {
+    vfs_page_t *p = vfs_cache_lookup(&node, 0);
+    if (!p)
+      break;
+    vfs_cache_put(&node, p);
+    ops++;
+  }
+  vfs_cache_bench_report("lookup+put atomic ", ops, rdtsc_fence() - t0);
+
+  /* Old form: the put side took the page lock with interrupts masked. */
+  ops = 0;
+  t0 = rdtsc_fence();
+  for (uint64_t i = 0; i < iters; i++) {
+    vfs_page_t *p = vfs_cache_lookup(&node, 0);
+    if (!p)
+      break;
+    spinlock_acquire(&node.pages_lock);
+    __atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL);
+    spinlock_release(&node.pages_lock);
+    ops++;
+  }
+  vfs_cache_bench_report("lookup+put locked ", ops, rdtsc_fence() - t0);
+
+  /* Stamp pair: one global atomic cache line vs the per-CPU counter. */
+  uint64_t global_clock = 0;
+  t0 = rdtsc_fence();
+  for (uint64_t i = 0; i < iters; i++)
+    __atomic_add_fetch(&global_clock, 1, __ATOMIC_RELAXED);
+  vfs_cache_bench_report("stamp global-atomic", iters, rdtsc_fence() - t0);
+
+  t0 = rdtsc_fence();
+  for (uint64_t i = 0; i < iters; i++)
+    cache_stamp();
+  vfs_cache_bench_report("stamp per-cpu      ", iters, rdtsc_fence() - t0);
+
+  vfs_pc_bench_multicore(&node);
+
+  vfs_cache_clear(&node);
 }

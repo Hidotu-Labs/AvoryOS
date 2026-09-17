@@ -47,14 +47,54 @@ typedef struct vfs_page {
   uint32_t magic;        // VFS_PAGE_MAGIC while the object is live
   uint64_t frame_phys;   // Physical address of the frame
   bool dirty;            // True if data has been modified but not written back
-  bool evicted;          // Removed from the tree; free after final transient ref
   bool loading;          // One owner is filling this page from the filesystem
   bool uptodate;         // Frame contains a complete, valid file page
   bool writeback;        // Filesystem write is currently using this frame
-  uint32_t refs;         // Transient users; the tree owns a separate cache ref
-  uint64_t last_used;    // Monotonic access stamp used for cache reclaim
+  uint32_t refs;         // Packed: transient count | VFS_PAGE_EVICTED
+  uint64_t last_used;    // Access stamp used for cache reclaim (per-CPU order)
   uint64_t dirty_seq;    // Detects modifications racing with writeback
 } vfs_page_t;
+
+/* Transient-reference word.  The low 31 bits count transient users (the tree
+ * itself owns the page, not a reference); the top bit is the eviction marker.
+ * A page is freed exactly once, by whichever transition below takes it to
+ * "zero + marker":
+ *
+ *  - vfs_page_put() drops a transient ref; a result of exactly the marker
+ *    means this put owned the last reference of an already-evicted page.
+ *  - vfs_page_evict() marks the page evicted after it left the tree; a result
+ *    of 0 means it was removed while no transient user held it.
+ *
+ * Packing both into one word is what lets a plain ref drop stay lock-free:
+ * two racing owners cannot both observe "zero + marker", so exactly one of
+ * them frees.  Keep every access to `refs` on these helpers. */
+#define VFS_PAGE_EVICTED (1u << 31)
+
+static inline uint32_t vfs_page_ref_count(const vfs_page_t *page) {
+  return __atomic_load_n(&((vfs_page_t *)page)->refs, __ATOMIC_RELAXED) &
+         ~VFS_PAGE_EVICTED;
+}
+
+static inline bool vfs_page_is_evicted(const vfs_page_t *page) {
+  return (__atomic_load_n(&((vfs_page_t *)page)->refs, __ATOMIC_RELAXED) &
+          VFS_PAGE_EVICTED) != 0;
+}
+
+static inline void vfs_page_get(vfs_page_t *page) {
+  __atomic_add_fetch(&page->refs, 1, __ATOMIC_RELAXED);
+}
+
+/* Drop a transient ref; returns true when the caller must free the page. */
+static inline bool vfs_page_put(vfs_page_t *page) {
+  return __atomic_sub_fetch(&page->refs, 1, __ATOMIC_ACQ_REL) ==
+         VFS_PAGE_EVICTED;
+}
+
+/* Mark the page evicted after it left the tree; returns true when the caller
+ * must free it.  Must be called exactly once per page, after tree removal. */
+static inline bool vfs_page_evict(vfs_page_t *page) {
+  return __atomic_fetch_or(&page->refs, VFS_PAGE_EVICTED, __ATOMIC_ACQ_REL) == 0;
+}
 
 struct dirent {
   char name[128];
@@ -304,5 +344,13 @@ void vfs_cache_prefetch_async(vfs_node_t *node, uint32_t offset,
                               uint32_t length);
 bool vfs_cache_phase4_stress_test(void);
 bool vfs_cache_phase5_stress_test(void);
+
+/* Boot-time checks and benchmarks, gated on the kernel command line through
+ * these entry points (`vfs_selftest=1` / `vfs_bench=1`).  They run once from
+ * kmain after the root filesystem is mounted. */
+void vfs_selftest_maybe_run(void);
+void vfs_bench_maybe_run(void);
+bool vfs_cache_ref_selftest(void);
+void vfs_cache_bench(void);
 
 #endif

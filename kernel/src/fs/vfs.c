@@ -1,6 +1,7 @@
 #include "vfs.h"
 #include "../console/klog.h"
 #include "../lib/string.h"
+#include "../lib/tsc.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include "../sched/sched.h"
@@ -185,6 +186,7 @@ typedef struct vfs_path_cache_entry {
   uint32_t hash;
   uint16_t path_len;
   bool valid;
+  uint64_t gen;       // Invalidation generation this entry was last valid in
   char path[256];
 } vfs_path_cache_entry_t;
 
@@ -195,6 +197,108 @@ typedef struct vfs_path_cache_bucket {
 } vfs_path_cache_bucket_t;
 
 static vfs_path_cache_bucket_t vfs_path_cache[VFS_PATH_CACHE_BUCKETS];
+
+/* ── Path-cache invalidation log ─────────────────────────────────────────
+ *
+ * A deletion or rename used to walk all 1024 path-cache buckets, take each
+ * bucket lock with interrupts masked and run strstr() on every cached path
+ * string.  Deletions are common (build systems, package installs, temporary
+ * files) and the cost was paid even when no cached path mentioned the removed
+ * name.
+ *
+ * Instead, every invalidation appends the removed component name to a small
+ * generation-stamped ring.  Each path-cache entry remembers the generation it
+ * was last validated against; a lookup whose entry predates the current
+ * generation replays only the records appended since (at most
+ * VFS_PATH_INVAL_LOG_SIZE), using the same component-boundary test the old
+ * full scan used.  Entries older than the ring are treated as invalid, so the
+ * answer is always the conservative one the scan produced.
+ *
+ * Readers take the log lock only while replaying; a lookup of a
+ * current-generation entry never touches it, and the invalidating writer does
+ * no cache walk at all. */
+#define VFS_PATH_INVAL_LOG_SIZE 32
+#define VFS_PATH_INVAL_NAME_MAX 256
+
+typedef struct vfs_path_inval_record {
+  uint64_t gen;
+  char name[VFS_PATH_INVAL_NAME_MAX];
+} vfs_path_inval_record_t;
+
+static vfs_path_inval_record_t vfs_path_inval_log[VFS_PATH_INVAL_LOG_SIZE];
+static uint64_t vfs_path_inval_gen;
+static spinlock_t vfs_path_inval_lock = SPINLOCK_INIT;
+
+/* Bench-only switch: when set, removals take the pre-log full-table scan so
+ * `vfs_bench=1` can run the old and new forms of the same syscall back to
+ * back.  It is never set outside the benchmark. */
+static bool vfs_path_invalidation_force_scan;
+
+/* True when `name` appears in `path` as a whole path component.  This mirrors
+ * the boundary test the old full-table invalidation scan applied. */
+static bool vfs_path_component_match(const char *path, const char *name,
+                                     size_t name_len) {
+  const char *p = path;
+  while ((p = strstr(p, name)) != NULL) {
+    bool left_bound = (p == path || *(p - 1) == '/');
+    bool right_bound = (p[name_len] == '\0' || p[name_len] == '/');
+    if (left_bound && right_bound)
+      return true;
+    p++;
+  }
+  return false;
+}
+
+/* Append one invalidation for `name`.  O(1): no bucket is visited. */
+static void vfs_path_invalidate_record(const char *name) {
+  size_t name_len = strlen(name);
+  if (name_len == 0 || name_len >= VFS_PATH_INVAL_NAME_MAX)
+    return;
+
+  spinlock_acquire(&vfs_path_inval_lock);
+  uint64_t gen = ++vfs_path_inval_gen;
+  vfs_path_inval_record_t *record =
+      &vfs_path_inval_log[gen % VFS_PATH_INVAL_LOG_SIZE];
+  record->gen = 0;
+  memcpy(record->name, name, name_len);
+  record->name[name_len] = '\0';
+  record->gen = gen;
+  spinlock_release(&vfs_path_inval_lock);
+}
+
+/* Validate `entry` against the invalidations recorded since its last check.
+ * Runs under the entry's bucket lock and may update entry->gen. */
+static bool vfs_path_entry_validate_locked(vfs_path_cache_entry_t *entry) {
+  uint64_t gen = __atomic_load_n(&vfs_path_inval_gen, __ATOMIC_ACQUIRE);
+  if (entry->gen == gen)
+    return true;
+  /* Older than the ring (or somehow ahead of it): cannot be proven. */
+  if (entry->gen > gen || gen - entry->gen > VFS_PATH_INVAL_LOG_SIZE)
+    return false;
+
+  bool valid = true;
+  spinlock_acquire(&vfs_path_inval_lock);
+  for (uint64_t g = entry->gen + 1; g <= gen; g++) {
+    vfs_path_inval_record_t *record =
+        &vfs_path_inval_log[g % VFS_PATH_INVAL_LOG_SIZE];
+    if (record->gen != g) {
+      /* The ring moved past this record without it ever being visible. */
+      valid = false;
+      break;
+    }
+    size_t name_len = strlen(record->name);
+    if (name_len && vfs_path_component_match(entry->path, record->name,
+                                             name_len)) {
+      valid = false;
+      break;
+    }
+  }
+  spinlock_release(&vfs_path_inval_lock);
+
+  if (valid)
+    entry->gen = gen;
+  return valid;
+}
 
 static uint32_t vfs_path_hash(vfs_node_t *dir, const char *path) {
   uint64_t hash = ((uint64_t)(uintptr_t)dir >> 4) ^ 0xcbf29ce484222325ULL;
@@ -217,19 +321,39 @@ static vfs_node_t *vfs_path_cache_lookup(vfs_node_t *dir, const char *path) {
   uint32_t hash = vfs_path_hash(dir, path);
   uint32_t slot = hash % VFS_PATH_CACHE_BUCKETS;
   vfs_path_cache_bucket_t *bucket = &vfs_path_cache[slot];
+  vfs_node_t *stale_node = NULL;
+  vfs_node_t *stale_dir = NULL;
 
   spinlock_acquire(&bucket->lock);
   for (uint32_t i = 0; i < VFS_PATH_CACHE_WAYS; i++) {
     vfs_path_cache_entry_t *entry = &bucket->entries[i];
     if (entry->valid && entry->hash == hash && entry->path_len == len &&
         entry->dir == dir && memcmp(entry->path, path, len) == 0) {
+      if (!vfs_path_entry_validate_locked(entry)) {
+        /* A deletion since this entry was cached covers it: retire the
+         * entry and let the caller resolve the path from scratch. */
+        stale_node = entry->node;
+        stale_dir = entry->dir;
+        entry->valid = false;
+        entry->dir = NULL;
+        entry->node = NULL;
+        entry->hash = 0;
+        entry->path_len = 0;
+        entry->path[0] = '\0';
+        break;
+      }
       vfs_node_t *node = entry->node;
-      vfs_open(node);
+      vfs_node_ref(node);
       spinlock_release(&bucket->lock);
       return node;
     }
   }
   spinlock_release(&bucket->lock);
+
+  if (stale_node)
+    vfs_close(stale_node);
+  if (stale_dir)
+    vfs_close(stale_dir);
   return NULL;
 }
 
@@ -277,6 +401,7 @@ static void vfs_path_cache_insert(vfs_node_t *dir, const char *path, vfs_node_t 
   entry->path_len = len;
   memcpy(entry->path, path, len);
   entry->path[len] = '\0';
+  entry->gen = __atomic_load_n(&vfs_path_inval_gen, __ATOMIC_ACQUIRE);
   entry->valid = true;
   spinlock_release(&bucket->lock);
 
@@ -400,13 +525,15 @@ void vfs_path_cache_invalidate(void) {
 }
 
 /*
- * Selectively invalidate path cache entries containing 'name' as a distinct
- * path component or anchored directly at parent.
- *
- * This preserves unrelated cached paths (e.g. dynamic linkers, shared libraries,
- * and system utilities) when a temporary file or specific directory entry is removed.
+ * The invalidation scan this cache used before the generation log existed.
+ * Unlink/rmdir/rename no longer use it: every removal now only appends to
+ * vfs_path_inval_log.  It is kept so `vfs_bench=1` can measure the old and
+ * new forms back to back on the same working set, the way serial_bench
+ * contrasts the old tick policy with the new one.  Do not call it on the
+ * live path: it walks all 1024 buckets and runs strstr() per entry.
  */
-static void vfs_path_cache_invalidate_name(vfs_node_t *parent, const char *name) {
+static void vfs_path_cache_invalidate_name_scan(vfs_node_t *parent,
+                                                const char *name) {
   if (!name || name[0] == '\0')
     return;
 
@@ -430,19 +557,8 @@ static void vfs_path_cache_invalidate_name(vfs_node_t *parent, const char *name)
       if (entry->dir == parent && entry->path_len == nlen &&
           memcmp(entry->path, name, nlen) == 0) {
         match = true;
-      } else {
-        /* Check if 'name' appears as a distinct path component in entry->path:
-         * e.g. "name", "name/...", ".../name", or ".../name/..." */
-        const char *p = strstr(entry->path, name);
-        while (p) {
-          bool left_bound = (p == entry->path || *(p - 1) == '/');
-          bool right_bound = (p[nlen] == '\0' || p[nlen] == '/');
-          if (left_bound && right_bound) {
-            match = true;
-            break;
-          }
-          p = strstr(p + 1, name);
-        }
+      } else if (vfs_path_component_match(entry->path, name, nlen)) {
+        match = true;
       }
 
       if (match) {
@@ -466,12 +582,16 @@ static void vfs_path_cache_invalidate_name(vfs_node_t *parent, const char *name)
 }
 
 void vfs_dentry_invalidate(vfs_node_t *parent, const char *name) {
-  /* With a concrete parent and name, invalidate only entries referencing this
-   * name in the path cache, and only the single bucket holding (parent, name)
-   * in the dentry cache. A NULL argument means "everything", which genuinely
-   * does need the full table scan (e.g. unmounts). */
+  /* With a concrete parent and name, the dentry cache needs only the single
+   * bucket holding (parent, name), and the path cache only needs a record in
+   * the invalidation log - each entry rechecks it lazily on its next lookup.
+   * A NULL argument means "everything", which genuinely does need the full
+   * table scan (e.g. unmounts). */
   if (parent && name) {
-    vfs_path_cache_invalidate_name(parent, name);
+    if (vfs_path_invalidation_force_scan)
+      vfs_path_cache_invalidate_name_scan(parent, name);
+    else
+      vfs_path_invalidate_record(name);
     vfs_dentry_bucket_invalidate(parent, name);
     return;
   }
@@ -1039,4 +1159,309 @@ int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count) {
     curr = curr->next;
   }
   return count;
+}
+
+/* ── `vfs_selftest=1` / `vfs_bench=1` ───────────────────────────────────────
+ *
+ * The path cache invalidates lazily now: a removal appends the name to
+ * vfs_path_inval_log and each entry revalidates on its next lookup.  The
+ * selftest pins the semantics the old eager scan provided (whole-component
+ * matching, unrelated paths surviving, entries older than the log window
+ * failing closed), and the benchmark runs the old full-table scan and the
+ * new log append back to back on the same synthetic working set - the way
+ * serial_bench contrasts both tick policies.  Both run once from kmain after
+ * the root filesystem is mounted, gated on the kernel command line, and clean
+ * up every synthetic entry afterwards.
+ */
+
+extern const char *kernel_boot_cmdline;
+
+#define VFS_BENCH_NODES 64u
+#define VFS_BENCH_PATHS 4096u
+#define VFS_BENCH_ITERS 128u
+
+static uint32_t vfs_selftest_failures;
+
+static void vfs_selftest_expect(bool ok, const char *what) {
+  if (!ok)
+    vfs_selftest_failures++;
+  klog_puts(ok ? "[VFS-SELFTEST] ok   " : "[VFS-SELFTEST] FAIL ");
+  klog_puts(what);
+  klog_putchar('\n');
+}
+
+static vfs_node_t *vfs_probe_node_create(const char *name) {
+  vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
+  if (!node)
+    return NULL;
+  vfs_node_init(node);
+  strncpy(node->name, name, 127);
+  node->name[127] = '\0';
+  node->flags = FS_FILE;
+  node->mask = 0644;
+  return node;
+}
+
+/* Append `value` in decimal without pulling printf into the VFS. */
+static uint32_t vfs_probe_append_uint(char *buf, uint32_t pos, uint32_t value) {
+  char digits[10];
+  int n = 0;
+  do {
+    digits[n++] = (char)('0' + value % 10);
+    value /= 10;
+  } while (value);
+  while (n > 0)
+    buf[pos++] = digits[--n];
+  return pos;
+}
+
+static void vfs_selftest_make_name(char *buf, uint32_t index) {
+  uint32_t pos = 0;
+  const char prefix[] = "z_inval_";
+  for (uint32_t i = 0; i < sizeof(prefix) - 1; i++)
+    buf[pos++] = prefix[i];
+  buf[vfs_probe_append_uint(buf, pos, index)] = '\0';
+}
+
+static void vfs_bench_make_path(char *buf, uint32_t index) {
+  uint32_t pos = 0;
+  const char prefix[] = "/vfsbench/d";
+  for (uint32_t i = 0; i < sizeof(prefix) - 1; i++)
+    buf[pos++] = prefix[i];
+  pos = vfs_probe_append_uint(buf, pos, index);
+  buf[pos++] = '/';
+  buf[pos++] = 'f';
+  pos = vfs_probe_append_uint(buf, pos, index);
+  buf[pos] = '\0';
+}
+
+static bool vfs_path_cache_selftest(void) {
+  if (!fs_root)
+    return false;
+
+  vfs_node_t *probe = vfs_probe_node_create("vfs_selftest_probe");
+  if (!probe)
+    return false;
+
+  vfs_node_t *hit;
+
+  /* 1. A cached resolution is served until its name is invalidated. */
+  vfs_path_cache_insert(fs_root, "/vfs_selftest_probe", probe);
+  hit = vfs_path_cache_lookup(fs_root, "/vfs_selftest_probe");
+  vfs_selftest_expect(hit == probe, "cached path resolves before invalidation");
+  if (hit)
+    vfs_close(hit);
+
+  /* 2. A removal retires it on the next lookup. */
+  vfs_path_invalidate_record("vfs_selftest_probe");
+  hit = vfs_path_cache_lookup(fs_root, "/vfs_selftest_probe");
+  vfs_selftest_expect(!hit, "removed component invalidates the cached path");
+  if (hit)
+    vfs_close(hit);
+
+  /* 3. Matching is whole-component: a name that is only a substring of the
+   *    cached path's components must not invalidate it. */
+  vfs_path_cache_insert(fs_root, "/vfs_selftest_probe_extra", probe);
+  vfs_path_invalidate_record("vfs_selftest");
+  hit = vfs_path_cache_lookup(fs_root, "/vfs_selftest_probe_extra");
+  vfs_selftest_expect(hit == probe,
+                      "substring (non-component) leaves the entry valid");
+  if (hit)
+    vfs_close(hit);
+  vfs_path_invalidate_record("vfs_selftest_probe_extra");
+  hit = vfs_path_cache_lookup(fs_root, "/vfs_selftest_probe_extra");
+  vfs_selftest_expect(!hit, "whole component invalidates the cached path");
+  if (hit)
+    vfs_close(hit);
+
+  /* 4. Removing an interior directory invalidates paths resolved through it. */
+  vfs_path_cache_insert(fs_root, "/vfs_selftest_dir/child", probe);
+  vfs_path_invalidate_record("vfs_selftest_dir");
+  hit = vfs_path_cache_lookup(fs_root, "/vfs_selftest_dir/child");
+  vfs_selftest_expect(!hit,
+                      "interior directory component invalidates long path");
+  if (hit)
+    vfs_close(hit);
+
+  /* 5. An entry older than the log window fails closed. */
+  vfs_path_cache_insert(fs_root, "/vfs_selftest_ring", probe);
+  for (uint32_t i = 0; i < VFS_PATH_INVAL_LOG_SIZE + 4; i++) {
+    char name[32];
+    vfs_selftest_make_name(name, i);
+    vfs_path_invalidate_record(name);
+  }
+  hit = vfs_path_cache_lookup(fs_root, "/vfs_selftest_ring");
+  vfs_selftest_expect(!hit, "entry older than the invalidation log fails closed");
+  if (hit)
+    vfs_close(hit);
+
+  /* 6. Entries inserted after the wrap are usable again. */
+  vfs_path_cache_insert(fs_root, "/vfs_selftest_fresh", probe);
+  hit = vfs_path_cache_lookup(fs_root, "/vfs_selftest_fresh");
+  vfs_selftest_expect(hit == probe, "entry inserted after the wrap resolves");
+  if (hit)
+    vfs_close(hit);
+
+  vfs_path_cache_drop(fs_root, "/vfs_selftest_probe");
+  vfs_path_cache_drop(fs_root, "/vfs_selftest_probe_extra");
+  vfs_path_cache_drop(fs_root, "/vfs_selftest_dir/child");
+  vfs_path_cache_drop(fs_root, "/vfs_selftest_ring");
+  vfs_path_cache_drop(fs_root, "/vfs_selftest_fresh");
+  vfs_close(probe);
+  return vfs_selftest_failures == 0;
+}
+
+void vfs_selftest_maybe_run(void) {
+  if (!kernel_boot_cmdline || !strstr(kernel_boot_cmdline, "vfs_selftest"))
+    return;
+
+  vfs_selftest_failures = 0;
+  klog_puts("[VFS-SELFTEST] path cache invalidation + page cache refs\n");
+  bool path_ok = vfs_path_cache_selftest();
+  bool page_ok = vfs_cache_ref_selftest();
+  klog_puts("[VFS-SELFTEST] path cache: ");
+  klog_puts(path_ok ? "PASS" : "FAIL");
+  klog_puts(", page cache refs: ");
+  klog_puts(page_ok ? "PASS" : "FAIL");
+  klog_putchar('\n');
+}
+
+static void vfs_bench_report(const char *name, uint64_t ops, uint64_t cycles) {
+  uint64_t ns = tsc_cycles_to_ns(cycles);
+  klog_puts("[VFS-BENCH] ");
+  klog_puts(name);
+  klog_puts(": ");
+  klog_uint64(ops);
+  klog_puts(" ops, ");
+  klog_uint64(ops ? cycles / ops : 0);
+  klog_puts(" cycles/op");
+  if (ns) {
+    klog_puts(", ");
+    klog_uint64(ops ? ns / ops : 0);
+    klog_puts(" ns/op");
+  }
+  klog_putchar('\n');
+}
+
+/* Fill the path cache with VFS_BENCH_PATHS synthetic entries backed by a pool
+ * of probe nodes.  Returns the number of nodes created (0 on allocation
+ * failure); the caller owns them and must flush the cache before closing. */
+static uint32_t vfs_bench_fill_cache(vfs_node_t *pool[VFS_BENCH_NODES]) {
+  uint32_t created = 0;
+
+  for (uint32_t i = 0; i < VFS_BENCH_NODES; i++) {
+    pool[i] = vfs_probe_node_create("vfsbench");
+    if (!pool[i])
+      break;
+    created++;
+  }
+  if (!created)
+    return 0;
+
+  char path[64];
+  for (uint32_t i = 0; i < VFS_BENCH_PATHS; i++) {
+    vfs_bench_make_path(path, i);
+    vfs_path_cache_insert(fs_root, path, pool[i % created]);
+  }
+  return created;
+}
+
+static void vfs_path_cache_bench(void) {
+  vfs_node_t *pool[VFS_BENCH_NODES];
+  uint32_t created = vfs_bench_fill_cache(pool);
+  if (!created)
+    return;
+
+  /* Old form: every removal walks all 1024 buckets and runs strstr() on each
+   * valid entry.  The probe name matches nothing, so all iterations pay the
+   * same full cost the old unlink path paid. */
+  uint64_t t0 = rdtsc_fence();
+  for (uint32_t i = 0; i < VFS_BENCH_ITERS; i++)
+    vfs_path_cache_invalidate_name_scan(fs_root, "z_no_such_component_xyz");
+  vfs_bench_report("path-inval old-scan", VFS_BENCH_ITERS,
+                   rdtsc_fence() - t0);
+
+  /* New form: one generation-stamped log append, no bucket touched. */
+  t0 = rdtsc_fence();
+  for (uint32_t i = 0; i < VFS_BENCH_ITERS; i++)
+    vfs_path_invalidate_record("z_no_such_component_xyz");
+  vfs_bench_report("path-inval log-append", VFS_BENCH_ITERS,
+                   rdtsc_fence() - t0);
+
+  vfs_path_cache_invalidate();
+  for (uint32_t i = 0; i < created; i++)
+    vfs_close(pool[i]);
+}
+
+/* The microbenchmark above isolates invalidation; this one runs the same
+ * create+unlink pair a real workload issues, with the same warm cache, once
+ * with the old scan forced and once with the log.  The difference is the
+ * per-syscall cost the change removed. */
+static bool vfs_path_unlink_bench(void) {
+  vfs_node_t *dir = vfs_resolve_path("/tmp");
+  if (!dir || (dir->flags & FS_TYPE_MASK) != FS_DIRECTORY || !dir->create ||
+      !dir->unlink) {
+    vfs_close(dir);
+    return false;
+  }
+
+  char name[] = "vfsbench.tmp";
+  vfs_node_t *pool[VFS_BENCH_NODES];
+  uint32_t created = vfs_bench_fill_cache(pool);
+  if (!created) {
+    vfs_close(dir);
+    return false;
+  }
+
+  /* Warm the tmpfs inode/dentry paths so the timed loops measure the steady
+   * state, not first-touch. */
+  for (uint32_t i = 0; i < 16; i++) {
+    if (vfs_create(dir, name, 0644) == 0)
+      vfs_unlink(dir, name);
+  }
+  vfs_unlink(dir, name);
+
+  const uint32_t iters = 512;
+
+  vfs_path_invalidation_force_scan = true;
+  uint64_t t0 = rdtsc_fence();
+  for (uint32_t i = 0; i < iters; i++) {
+    if (vfs_create(dir, name, 0644) == 0)
+      vfs_unlink(dir, name);
+  }
+  uint64_t old_cycles = rdtsc_fence() - t0;
+
+  vfs_path_invalidation_force_scan = false;
+  t0 = rdtsc_fence();
+  for (uint32_t i = 0; i < iters; i++) {
+    if (vfs_create(dir, name, 0644) == 0)
+      vfs_unlink(dir, name);
+  }
+  uint64_t new_cycles = rdtsc_fence() - t0;
+
+  vfs_unlink(dir, name);
+  vfs_bench_report("create+unlink old-inval", iters, old_cycles);
+  vfs_bench_report("create+unlink new-inval", iters, new_cycles);
+  if (old_cycles > new_cycles)
+    vfs_bench_report("create+unlink saved   ", iters, old_cycles - new_cycles);
+
+  vfs_path_cache_invalidate();
+  for (uint32_t i = 0; i < created; i++)
+    vfs_close(pool[i]);
+  vfs_close(dir);
+  return true;
+}
+
+void vfs_bench_maybe_run(void) {
+  if (!kernel_boot_cmdline || !strstr(kernel_boot_cmdline, "vfs_bench"))
+    return;
+
+  klog_puts("[VFS-BENCH] path cache + page cache operations (");
+  klog_uint64(VFS_BENCH_PATHS);
+  klog_puts(" cached paths)\n");
+  vfs_path_cache_bench();
+  if (!vfs_path_unlink_bench())
+    klog_puts("[VFS-BENCH] create+unlink pair skipped: no writable /tmp\n");
+  vfs_cache_bench();
+  klog_puts("[VFS-BENCH] done\n");
 }

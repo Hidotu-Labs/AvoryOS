@@ -62,7 +62,8 @@ static void vmm_map_cow_cluster(uint64_t *pml4, uint64_t cr2,
       continue; // partial tail: zeros come from the copy-now path
     uint32_t file_off = (uint32_t)(vma_offset + page_off);
     vfs_page_t *p = asc_radix_tree_lookup(&node->pages, (uint64_t)(file_off >> 12));
-    if (p && !p->loading && p->uptodate && p->frame_phys && !p->evicted) {
+    if (p && !p->loading && p->uptodate && p->frame_phys &&
+        !vfs_page_is_evicted(p)) {
       batch[batch_count].vpage = vpage;
       batch[batch_count].phys = p->frame_phys;
       pmm_incref((void *)p->frame_phys);
@@ -780,7 +781,8 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 
         uint32_t foff = (uint32_t)(vma_offset + (vpage - vma_start));
         vfs_page_t *p = asc_radix_tree_lookup(&node->pages, (uint64_t)(foff >> 12));
-        if (p && !p->loading && p->uptodate && p->frame_phys && !p->evicted) {
+        if (p && !p->loading && p->uptodate && p->frame_phys &&
+        !vfs_page_is_evicted(p)) {
           batch[batch_count].vpage = vpage;
           batch[batch_count].phys = p->frame_phys;
           pmm_incref((void *)p->frame_phys);
