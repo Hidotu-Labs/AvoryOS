@@ -15,6 +15,11 @@
 #define CACHE_BATCH 64u
 #define CACHE_NODE_LIMIT 256u
 
+/* Bench-only: force the scatter staging path even when the frames are one
+ * contiguous run, so vfs_bench=1 can measure the bounce copy this change
+ * removed.  Never set outside the benchmark. */
+static bool vfs_readahead_force_scratch;
+
 static uint64_t vfs_cached_pages;
 
 /* Access stamps used for reclaim ordering.  A single global atomic meant every
@@ -259,6 +264,19 @@ static void vfs_readahead_warn_short(uint32_t off, uint32_t got,
           off, got, want);
 }
 
+/* True when pages[first..first+count-1] name one physically contiguous run.
+ * Readahead takes frames as contiguous PMM blocks whenever it can, so this is
+ * the common case and lets the device fill the cache pages directly. */
+static bool vfs_cache_frames_contiguous(vfs_page_t **pages, uint32_t first,
+                                        uint32_t count) {
+  uint64_t base = pages[first]->frame_phys;
+  for (uint32_t i = 1; i < count; i++) {
+    if (pages[first + i]->frame_phys != base + (uint64_t)i * PAGE_SIZE)
+      return false;
+  }
+  return true;
+}
+
 static uint32_t vfs_cache_fill_pages(vfs_node_t *node, uint32_t offset,
                                      vfs_page_t **pages, uint32_t count) {
   if (!node || !node->read || !count)
@@ -271,13 +289,35 @@ static uint32_t vfs_cache_fill_pages(vfs_node_t *node, uint32_t offset,
       chunk = READAHEAD_SCRATCH_CHUNK;
 
     uint32_t chunk_off = offset + done * PAGE_SIZE;
+    uint32_t want = chunk * PAGE_SIZE;
+    uint32_t valid = node->length > chunk_off ? node->length - chunk_off : 0;
+    uint32_t ask = want < valid ? want : valid;
+
+    /* Preferred: the frames are one contiguous run, so the device reads
+     * straight into the page-cache memory - one transfer, no bounce copy.
+     * The benchmark can force the staging path to price the old form. */
+    if (!vfs_readahead_force_scratch && chunk > 1 &&
+        vfs_cache_frames_contiguous(pages, done, chunk)) {
+      uint8_t *dest = (uint8_t *)PHYS_TO_VIRT(pages[done]->frame_phys);
+      uint32_t got = ask ? node->read(node, chunk_off, ask, dest) : 0;
+      if (got > ask)
+        got = ask;
+      if (got < ask) {
+        vfs_readahead_warn_short(chunk_off, got, ask);
+        return done;
+      }
+      if (got < want)
+        memset(dest + got, 0, want - got);
+      done += chunk;
+      continue;
+    }
+
+    /* Scattered frames: stage the run through a contiguous scratch block so
+     * the filesystem/block layer still issues one transfer. */
     uint8_t *scratch = chunk > 1 ? pmm_alloc_pages(chunk) : NULL;
 
     if (scratch) {
       uint8_t *scratch_virt = (uint8_t *)PHYS_TO_VIRT((uint64_t)scratch);
-      uint32_t want = chunk * PAGE_SIZE;
-      uint32_t valid = node->length > chunk_off ? node->length - chunk_off : 0;
-      uint32_t ask = want < valid ? want : valid;
       uint32_t got = ask ? node->read(node, chunk_off, ask, scratch_virt) : 0;
       if (got > ask)
         got = ask;
@@ -365,23 +405,55 @@ uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_byt
   vfs_page_t *candidates[MAX_READAHEAD_PAGES] = {0};
   uint32_t allocated = 0;
 
-  for (uint32_t i = 0; i < missing_count; i++) {
-    frames[i] = pmm_alloc_page();
-    if (!frames[i])
-      break;
-    candidates[i] = kmalloc(sizeof(vfs_page_t));
-    if (!candidates[i]) {
-      pmm_free_page(frames[i]);
-      break;
+  /* Take frames as contiguous PMM runs whenever possible so the fill below
+   * can DMA/read straight into them; fall back to single pages when the
+   * buddy allocator cannot supply a block. */
+  while (allocated < missing_count) {
+    uint32_t chunk = missing_count - allocated;
+    if (chunk > READAHEAD_SCRATCH_CHUNK)
+      chunk = READAHEAD_SCRATCH_CHUNK;
+
+    void *run = chunk > 1 ? pmm_alloc_pages(chunk) : NULL;
+    if (run) {
+      /* pmm_alloc_pages rounds up to a power of two; hand the unused tail
+       * pages straight back so only the frames stay allocated. */
+      uint32_t run_pages = 1;
+      while (run_pages < chunk)
+        run_pages <<= 1;
+      for (uint32_t k = chunk; k < run_pages; k++)
+        pmm_free_page((void *)((uint64_t)run + (uint64_t)k * PAGE_SIZE));
     }
-    memset(candidates[i], 0, sizeof(vfs_page_t));
-    candidates[i]->magic = VFS_PAGE_MAGIC;
-    candidates[i]->offset = first_off + i * PAGE_SIZE;
-    candidates[i]->frame_phys = (uint64_t)frames[i];
-    candidates[i]->loading = true;
-    candidates[i]->refs = 1;
-    candidates[i]->last_used = cache_stamp();
-    allocated++;
+
+    uint32_t got = 0;
+    for (uint32_t j = 0; j < chunk; j++) {
+      void *frame = run ? (void *)((uint64_t)run + (uint64_t)j * PAGE_SIZE)
+                        : pmm_alloc_page();
+      if (!frame)
+        break;
+      vfs_page_t *candidate = kmalloc(sizeof(vfs_page_t));
+      if (!candidate) {
+        if (run) {
+          for (uint32_t k = j; k < chunk; k++)
+            pmm_free_page((void *)((uint64_t)run + (uint64_t)k * PAGE_SIZE));
+        } else {
+          pmm_free_page(frame);
+        }
+        break;
+      }
+      memset(candidate, 0, sizeof(vfs_page_t));
+      candidate->magic = VFS_PAGE_MAGIC;
+      candidate->offset = first_off + (allocated + j) * PAGE_SIZE;
+      candidate->frame_phys = (uint64_t)frame;
+      candidate->loading = true;
+      candidate->refs = 1;
+      candidate->last_used = cache_stamp();
+      frames[allocated + j] = frame;
+      candidates[allocated + j] = candidate;
+      got++;
+    }
+    allocated += got;
+    if (got < chunk)
+      break;
   }
 
   if (allocated == 0)
@@ -1287,17 +1359,24 @@ static void vfs_cache_bench_report(const char *name, uint64_t ops,
 }
 
 /* ── Multi-CPU lookup+put scaling ───────────────────────────────────────────
- * The single-CPU pair cannot show what the packed refcount buys when several
- * CPUs touch the same file: the old put took pages_lock, so even a pure cache
- * hit serialized across cores.  Fan three kthreads over the APs and compare
- * the aggregate rate with the single-thread number reported above.
+ * The single-CPU pair above cannot attribute contention: several CPUs on the
+ * same file can serialize on pages_lock, on the page's refcount line, or not
+ * at all.  Run the same fan-out in three shapes and compare each with the
+ * single-CPU cycles/op reported above:
+ *
+ *   same page   - all workers on one page: worst case for both lines
+ *   spread page - one page per worker on one node: isolates pages_lock
+ *   per node    - one node per worker: the no-sharing baseline
+ *
  * `sched_create_kernel_thread` takes no argument, so each worker reads its
  * context from the shared array. */
 #define VFS_PC_BENCH_THREADS 3
+#define VFS_PC_BENCH_CPUS (VFS_PC_BENCH_THREADS + 1)
 #define VFS_PC_BENCH_ITERS 200000
 
 struct vfs_pc_bench_ctx {
   vfs_node_t *node;
+  uint32_t offset;
   uint64_t iters;
 };
 
@@ -1309,7 +1388,7 @@ static void vfs_pc_bench_worker(struct vfs_pc_bench_ctx *ctx) {
   while (!__atomic_load_n(&vfs_pc_bench_go, __ATOMIC_ACQUIRE))
     sched_yield();
   for (uint64_t i = 0; i < ctx->iters; i++) {
-    vfs_page_t *page = vfs_cache_lookup(ctx->node, 0);
+    vfs_page_t *page = vfs_cache_lookup(ctx->node, ctx->offset);
     if (page)
       vfs_cache_put(ctx->node, page);
   }
@@ -1326,15 +1405,70 @@ static void vfs_pc_bench_worker2(void) {
   vfs_pc_bench_worker(&vfs_pc_bench_ctxs[2]);
 }
 
-static void vfs_pc_bench_multicore(vfs_node_t *node) {
-  if (cpu_get_count() < 2) {
-    klog_puts("[VFS-BENCH] multi-cpu lookup+put skipped: single CPU\n");
-    return;
+static uint32_t vfs_readahead_bench_read(vfs_node_t *node, uint32_t offset,
+                                         uint32_t size, uint8_t *buffer) {
+  (void)node;
+  (void)offset;
+  memset(buffer, 0x5a, size);
+  return size;
+}
+
+/* Readahead pair: a 256 KiB window (the 64-page cap) read from a synthetic
+ * node, once with the frames taken as PMM runs and filled directly, once with
+ * the staging path forced.  The difference is the per-page bounce copy the
+ * direct path removed. */
+static void vfs_cache_readahead_bench(void) {
+  const uint32_t file_bytes = 256u * 1024u;
+  const uint32_t rounds = 32;
+
+  klog_puts("[VFS-BENCH] readahead ");
+  klog_uint64(file_bytes / 1024);
+  klog_puts(" KiB x ");
+  klog_uint64(rounds);
+  klog_puts(" rounds\n");
+
+  for (uint32_t mode = 0; mode < 2; mode++) {
+    vfs_readahead_force_scratch = (mode == 1);
+
+    vfs_node_t node;
+    vfs_node_init(&node);
+    node.flags = FS_FILE | FS_PAGE_CACHE;
+    node.length = file_bytes;
+    node.read = vfs_readahead_bench_read;
+
+    uint64_t t0 = rdtsc_fence();
+    for (uint32_t round = 0; round < rounds; round++) {
+      vfs_cache_readahead(&node, 0, file_bytes);
+      vfs_cache_clear(&node);
+    }
+    uint64_t cycles = rdtsc_fence() - t0;
+    vfs_cache_bench_report(mode ? "readahead staged" : "readahead direct",
+                           rounds, cycles);
+    vfs_cache_clear(&node);
   }
 
+  vfs_readahead_force_scratch = false;
+}
+
+static void vfs_pc_bench_print_x100(uint64_t x100) {
+  klog_uint64(x100 / 100);
+  klog_putchar('.');
+  uint64_t frac = x100 % 100;
+  if (frac < 10)
+    klog_putchar('0');
+  klog_uint64(frac);
+}
+
+static void vfs_pc_bench_run_phase(const char *name,
+                                   vfs_node_t *const nodes[VFS_PC_BENCH_CPUS],
+                                   const uint32_t offsets[VFS_PC_BENCH_CPUS],
+                                   uint64_t single_cycles) {
   static void (*const entries[VFS_PC_BENCH_THREADS])(void) = {
       vfs_pc_bench_worker0, vfs_pc_bench_worker1, vfs_pc_bench_worker2};
   uint32_t started = 0;
+
+  __atomic_store_n(&vfs_pc_bench_go, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&vfs_pc_bench_done, 0, __ATOMIC_RELEASE);
 
   for (uint32_t i = 0; i < VFS_PC_BENCH_THREADS; i++) {
     /* Pin one worker per AP: a NULL explicit CPU would put them all on the
@@ -1342,7 +1476,8 @@ static void vfs_pc_bench_multicore(vfs_node_t *node) {
     struct cpu_info *target = cpu_get_info(i + 1);
     if (!target || target->status == CPU_STATUS_OFFLINE)
       break;
-    vfs_pc_bench_ctxs[i].node = node;
+    vfs_pc_bench_ctxs[i].node = nodes[i + 1];
+    vfs_pc_bench_ctxs[i].offset = offsets[i + 1];
     vfs_pc_bench_ctxs[i].iters = VFS_PC_BENCH_ITERS;
     if (!sched_create_kernel_thread(entries[i], target, true))
       break;
@@ -1356,10 +1491,10 @@ static void vfs_pc_bench_multicore(vfs_node_t *node) {
   uint64_t ops = 0;
   uint64_t t0 = rdtsc_fence();
   for (uint64_t i = 0; i < VFS_PC_BENCH_ITERS; i++) {
-    vfs_page_t *page = vfs_cache_lookup(node, 0);
+    vfs_page_t *page = vfs_cache_lookup(nodes[0], offsets[0]);
     if (!page)
       break;
-    vfs_cache_put(node, page);
+    vfs_cache_put(nodes[0], page);
     ops++;
   }
 
@@ -1373,13 +1508,92 @@ static void vfs_pc_bench_multicore(vfs_node_t *node) {
   uint64_t cycles = rdtsc_fence() - t0;
 
   ops += (uint64_t)started * VFS_PC_BENCH_ITERS;
-  klog_puts("[VFS-BENCH] lookup+put ");
-  klog_uint64(started + 1);
-  klog_puts("cpu aggregate: ");
+  uint64_t per_op = ops ? cycles / ops : 0;
+  klog_puts("[VFS-BENCH] ");
+  klog_puts(name);
+  klog_puts(": ");
   klog_uint64(ops);
   klog_puts(" ops, ");
-  klog_uint64(ops ? cycles / ops : 0);
-  klog_puts(" cycles/op\n");
+  klog_uint64(per_op);
+  klog_puts(" cycles/op, ");
+  if (per_op) {
+    vfs_pc_bench_print_x100(single_cycles * 100 / per_op);
+    klog_puts("x 1cpu\n");
+  } else {
+    klog_puts("n/a\n");
+  }
+}
+
+static void vfs_pc_bench_scaling(uint64_t single_cycles) {
+  if (cpu_get_count() < 2) {
+    klog_puts("[VFS-BENCH] multi-cpu lookup+put skipped: single CPU\n");
+    return;
+  }
+
+  vfs_node_t shared;
+  vfs_node_t separate[VFS_PC_BENCH_CPUS];
+  bool shared_ready = false;
+  uint32_t separate_ready = 0;
+
+  vfs_node_init(&shared);
+  shared.flags = FS_FILE | FS_PAGE_CACHE;
+  shared.length = VFS_PC_BENCH_CPUS * PAGE_SIZE;
+  shared_ready = true;
+  for (uint32_t i = 0; i < VFS_PC_BENCH_CPUS; i++) {
+    void *frame = pmm_alloc_page();
+    if (!frame)
+      goto cleanup;
+    vfs_page_t *page = vfs_cache_insert(&shared, i * PAGE_SIZE, (uint64_t)frame);
+    if (!page) {
+      pmm_free_page(frame);
+      goto cleanup;
+    }
+    vfs_cache_put(&shared, page);
+  }
+
+  for (uint32_t i = 0; i < VFS_PC_BENCH_CPUS; i++) {
+    vfs_node_init(&separate[i]);
+    separate[i].flags = FS_FILE | FS_PAGE_CACHE;
+    separate[i].length = PAGE_SIZE;
+    separate_ready++;
+    void *frame = pmm_alloc_page();
+    if (!frame)
+      goto cleanup;
+    vfs_page_t *page = vfs_cache_insert(&separate[i], 0, (uint64_t)frame);
+    if (!page) {
+      pmm_free_page(frame);
+      goto cleanup;
+    }
+    vfs_cache_put(&separate[i], page);
+  }
+
+  vfs_node_t *same_page[VFS_PC_BENCH_CPUS] = {&shared, &shared, &shared, &shared};
+  uint32_t same_page_off[VFS_PC_BENCH_CPUS] = {0, 0, 0, 0};
+  vfs_node_t *spread[VFS_PC_BENCH_CPUS];
+  uint32_t spread_off[VFS_PC_BENCH_CPUS];
+  vfs_node_t *per_node[VFS_PC_BENCH_CPUS];
+  uint32_t per_node_off[VFS_PC_BENCH_CPUS];
+  for (uint32_t i = 0; i < VFS_PC_BENCH_CPUS; i++) {
+    spread[i] = &shared;
+    spread_off[i] = i * PAGE_SIZE;
+    per_node[i] = &separate[i];
+    per_node_off[i] = 0;
+  }
+
+  klog_puts("[VFS-BENCH] multi-cpu lookup+put (single-cpu ");
+  klog_uint64(single_cycles);
+  klog_puts(" cycles/op)\n");
+  vfs_pc_bench_run_phase("4cpu same page  ", same_page, same_page_off,
+                         single_cycles);
+  vfs_pc_bench_run_phase("4cpu spread page", spread, spread_off, single_cycles);
+  vfs_pc_bench_run_phase("4cpu per node  ", per_node, per_node_off,
+                         single_cycles);
+
+cleanup:
+  if (shared_ready)
+    vfs_cache_clear(&shared);
+  for (uint32_t i = 0; i < separate_ready; i++)
+    vfs_cache_clear(&separate[i]);
 }
 
 void vfs_cache_bench(void) {
@@ -1412,7 +1626,9 @@ void vfs_cache_bench(void) {
     vfs_cache_put(&node, p);
     ops++;
   }
-  vfs_cache_bench_report("lookup+put atomic ", ops, rdtsc_fence() - t0);
+  uint64_t atomic_cycles = rdtsc_fence() - t0;
+  vfs_cache_bench_report("lookup+put atomic ", ops, atomic_cycles);
+  uint64_t single_cycles = ops ? atomic_cycles / ops : 0;
 
   /* Old form: the put side took the page lock with interrupts masked. */
   ops = 0;
@@ -1440,7 +1656,9 @@ void vfs_cache_bench(void) {
     cache_stamp();
   vfs_cache_bench_report("stamp per-cpu      ", iters, rdtsc_fence() - t0);
 
-  vfs_pc_bench_multicore(&node);
+  vfs_cache_readahead_bench();
+
+  vfs_pc_bench_scaling(single_cycles);
 
   vfs_cache_clear(&node);
 }
