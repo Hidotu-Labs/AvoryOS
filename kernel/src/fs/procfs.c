@@ -73,6 +73,8 @@ static uint32_t procfs_drmstats_read(vfs_node_t *node, uint32_t offset,
       "copy_cycles: %llu\n"
       "average_copy_cycles: %llu\n"
       "max_copy_cycles: %llu\n"
+      "damage_clips: %llu\n"
+      "bbox_bytes: %llu\n"
       "tsc_khz: %llu\n"
       "virtio_commands_submitted: %llu\n"
       "virtio_commands_completed: %llu\n"
@@ -121,6 +123,8 @@ static uint32_t procfs_drmstats_read(vfs_node_t *node, uint32_t offset,
       (unsigned long long)stats.copy_cycles,
       (unsigned long long)average_cycles,
       (unsigned long long)stats.max_copy_cycles,
+      (unsigned long long)stats.damage_clips,
+      (unsigned long long)stats.bbox_bytes,
       (unsigned long long)tsc_get_freq_khz(),
       (unsigned long long)gpu_stats.commands_submitted,
       (unsigned long long)gpu_stats.commands_completed,

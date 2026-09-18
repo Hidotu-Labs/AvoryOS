@@ -348,6 +348,11 @@ struct drm_stats {
   uint64_t bytes_copied;
   uint64_t copy_cycles;
   uint64_t max_copy_cycles;
+  /* Damage-shape accounting: how many clip rectangles a frame reported, and
+   * how many bytes the old bounding-box upload would have copied for them.
+   * bbox_bytes / bytes_copied is the precision the clip list bought. */
+  uint64_t damage_clips;
+  uint64_t bbox_bytes;
 };
 
 struct drm_device {
@@ -406,6 +411,14 @@ struct drm_crtc {
   struct drm_framebuffer *fb;
 };
 
+/* Upper bound on the DIRTYFB clip rectangles retained per framebuffer.
+ * Xorg's damage region is a short list of disjoint rectangles; keeping them
+ * separate lets the software blit skip the gaps between them.  The cap
+ * matches the blit's per-scanline span capacity; past it the closest pair of
+ * clips is merged instead of collapsing the whole list, so a fragmented
+ * region degrades gradually rather than into one huge box. */
+#define DRM_MAX_DAMAGE_CLIPS 64
+
 struct drm_framebuffer {
   struct drm_mode_object base;
   uint32_t width, height;
@@ -415,10 +428,12 @@ struct drm_framebuffer {
 
   /* Legacy DIRTYFB damage retained until this buffer is next scanned out.
    * A new framebuffer is always uploaded in full once; afterwards a producer
-   * which supplies DIRTYFB can avoid a redundant full upload on PAGE_FLIP. */
+   * which supplies DIRTYFB can avoid a redundant full upload on PAGE_FLIP.
+   * The clips stay distinct so the blit copies only what was damaged. */
   uint8_t scanout_valid;
   uint8_t pending_damage_valid;
-  struct drm_clip_rect pending_damage;
+  uint8_t pending_damage_count;
+  struct drm_clip_rect pending_damage[DRM_MAX_DAMAGE_CLIPS];
 };
 
 struct drm_encoder {

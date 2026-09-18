@@ -2,6 +2,7 @@
 #include "drivers/gpu/virtio_gpu/virtio_gpu.h"
 #include "../../../apic/lapic_timer.h"
 #include "../../../console/klog.h"
+#include "../../../cpu/tsc.h"
 #include "../../../fb/framebuffer.h"
 #include "../../../fs/ramfs.h"
 #include "../../../lib/string.h"
@@ -185,6 +186,534 @@ static bool drm_damage_intersects(const struct drm_clip_rect *a,
          a->y1 <= b->y2 && b->y1 <= a->y2;
 }
 
+/* Merge one DIRTYFB clip into the framebuffer's pending damage list.  Keeping
+ * the clips distinct instead of collapsing them into a bounding box lets the
+ * software blit skip the gaps between them: a compositor repainting two
+ * distant windows used to copy the whole union between them.  A clip already
+ * covered by an earlier one is dropped; when the list is full the new clip is
+ * folded into the nearest existing one, so over-fragmented damage degrades
+ * gradually instead of turning into one huge box. */
+static void drm_damage_add(struct drm_framebuffer *fb,
+                           const struct drm_clip_rect *clip) {
+  if (clip->x2 <= clip->x1 || clip->y2 <= clip->y1)
+    return;
+
+  for (uint32_t i = 0; i < fb->pending_damage_count; i++) {
+    const struct drm_clip_rect *c = &fb->pending_damage[i];
+    if (clip->x1 >= c->x1 && clip->y1 >= c->y1 &&
+        clip->x2 <= c->x2 && clip->y2 <= c->y2)
+      return; /* already covered */
+  }
+
+  if (fb->pending_damage_count >= DRM_MAX_DAMAGE_CLIPS) {
+    uint32_t best = 0;
+    uint64_t best_dist = UINT64_MAX;
+    for (uint32_t i = 0; i < fb->pending_damage_count; i++) {
+      const struct drm_clip_rect *c = &fb->pending_damage[i];
+      uint64_t dx = 0, dy = 0;
+      if (clip->x2 <= c->x1) dx = (uint64_t)c->x1 - clip->x2;
+      else if (c->x2 <= clip->x1) dx = (uint64_t)clip->x1 - c->x2;
+      if (clip->y2 <= c->y1) dy = (uint64_t)c->y1 - clip->y2;
+      else if (c->y2 <= clip->y1) dy = (uint64_t)clip->y1 - c->y2;
+      uint64_t dist = dx + dy;
+      if (dist < best_dist) {
+        best_dist = dist;
+        best = i;
+      }
+      if (!dist)
+        break;
+    }
+    struct drm_clip_rect *c = &fb->pending_damage[best];
+    if (clip->x1 < c->x1) c->x1 = clip->x1;
+    if (clip->y1 < c->y1) c->y1 = clip->y1;
+    if (clip->x2 > c->x2) c->x2 = clip->x2;
+    if (clip->y2 > c->y2) c->y2 = clip->y2;
+    fb->pending_damage_valid = 1;
+    return;
+  }
+
+  fb->pending_damage[fb->pending_damage_count++] = *clip;
+  fb->pending_damage_valid = 1;
+}
+
+/* Copy the damaged rectangles of a write-back framebuffer into the scanout.
+ * Spans are unioned per scanline so overlapping clips write each pixel once.
+ * A single rectangle takes a direct path: full-width damage becomes one
+ * linear copy and anything else walks its rows without rebuilding the span
+ * set (this is the common case - a window repaint or a cursor move).
+ * Returns the number of bytes written; the caller owns the sfence. */
+static uint64_t drm_blit_damage(uint8_t *dst, uint32_t dst_pitch,
+                                const uint8_t *src, uint32_t src_pitch,
+                                uint32_t width, uint32_t height, uint32_t cpp,
+                                const struct drm_clip_rect *clips,
+                                uint32_t num_clips) {
+  uint64_t copied = 0;
+
+  if (!dst || !src || !cpp)
+    return 0;
+
+  if (num_clips == 1) {
+    uint32_t x1 = clips[0].x1, y1 = clips[0].y1;
+    uint32_t x2 = clips[0].x2, y2 = clips[0].y2;
+    if (x2 > width) x2 = width;
+    if (y2 > height) y2 = height;
+    if (x1 >= x2 || y1 >= y2)
+      return 0;
+
+    size_t xoff = (size_t)x1 * cpp;
+    if (xoff >= dst_pitch || xoff >= src_pitch)
+      return 0;
+    size_t row_bytes = (size_t)(x2 - x1) * cpp;
+    if (row_bytes > dst_pitch - xoff)
+      row_bytes = dst_pitch - xoff;
+    if (row_bytes > src_pitch - xoff)
+      row_bytes = src_pitch - xoff;
+    if (!row_bytes)
+      return 0;
+
+    uint8_t *d = dst + (size_t)y1 * dst_pitch + xoff;
+    const uint8_t *s = src + (size_t)y1 * src_pitch + xoff;
+    if (x1 == 0 && dst_pitch == src_pitch && row_bytes >= dst_pitch) {
+      size_t bytes = (size_t)dst_pitch * (y2 - y1);
+      memcpy_to_wc(d, s, bytes);
+      return bytes;
+    }
+    for (uint32_t y = y1; y < y2; y++) {
+      memcpy_to_wc(d, s, row_bytes);
+      d += dst_pitch;
+      s += src_pitch;
+    }
+    return (uint64_t)row_bytes * (y2 - y1);
+  }
+
+  struct drm_damage_span { uint32_t x1, x2; };
+  struct drm_damage_span spans[64];
+  uint32_t damage_y1 = height, damage_y2 = 0;
+  for (uint32_t i = 0; i < num_clips; i++) {
+    uint32_t y1 = clips[i].y1;
+    uint32_t y2 = clips[i].y2;
+    if (y1 > height) y1 = height;
+    if (y2 > height) y2 = height;
+    if (y2 <= y1)
+      continue;
+    if (y1 < damage_y1) damage_y1 = y1;
+    if (y2 > damage_y2) damage_y2 = y2;
+  }
+
+  /* Build a union of the damage on each scanline.  Xorg can send
+   * overlapping clips; copying each rectangle independently writes those
+   * pixels to the WC scanout more than once. */
+  for (uint32_t y = damage_y1; y < damage_y2; y++) {
+    uint32_t span_count = 0;
+    for (uint32_t i = 0; i < num_clips; i++) {
+      if (y < clips[i].y1 || y >= clips[i].y2)
+        continue;
+      uint32_t x1 = clips[i].x1;
+      uint32_t x2 = clips[i].x2;
+      if (x1 > width) x1 = width;
+      if (x2 > width) x2 = width;
+      if (x2 <= x1)
+        continue;
+
+      uint32_t pos = 0;
+      while (pos < span_count && spans[pos].x2 < x1)
+        pos++;
+      uint32_t end = pos;
+      while (end < span_count && spans[end].x1 <= x2) {
+        if (spans[end].x1 < x1) x1 = spans[end].x1;
+        if (spans[end].x2 > x2) x2 = spans[end].x2;
+        end++;
+      }
+
+      if (end > pos) {
+        spans[pos].x1 = x1;
+        spans[pos].x2 = x2;
+        uint32_t remove = end - pos - 1;
+        for (uint32_t j = end; j < span_count; j++)
+          spans[j - remove] = spans[j];
+        span_count -= remove;
+      } else if (span_count < 64) {
+        for (uint32_t j = span_count; j > pos; j--)
+          spans[j] = spans[j - 1];
+        spans[pos].x1 = x1;
+        spans[pos].x2 = x2;
+        span_count++;
+      } else {
+        /* Pathological fragmentation: one bounding span still avoids a
+         * full-height framebuffer copy. */
+        uint32_t bx1 = x1, bx2 = x2;
+        for (uint32_t j = 0; j < span_count; j++) {
+          if (spans[j].x1 < bx1) bx1 = spans[j].x1;
+          if (spans[j].x2 > bx2) bx2 = spans[j].x2;
+        }
+        spans[0].x1 = bx1;
+        spans[0].x2 = bx2;
+        span_count = 1;
+      }
+    }
+
+    for (uint32_t i = 0; i < span_count; i++) {
+      size_t xoff = (size_t)spans[i].x1 * cpp;
+      if (xoff >= dst_pitch || xoff >= src_pitch)
+        continue;
+      size_t line_bytes = (size_t)(spans[i].x2 - spans[i].x1) * cpp;
+      if (line_bytes > dst_pitch - xoff)
+        line_bytes = dst_pitch - xoff;
+      if (line_bytes > src_pitch - xoff)
+        line_bytes = src_pitch - xoff;
+      if (!line_bytes)
+        continue;
+      memcpy_to_wc(dst + (size_t)y * dst_pitch + xoff,
+                   src + (size_t)y * src_pitch + xoff, line_bytes);
+      copied += line_bytes;
+    }
+  }
+
+  return copied;
+}
+
+/* Boot-time verification of the damage planner, enabled with
+ * `drm_selftest=1` on the kernel command line.  It drives drm_blit_damage()
+ * over kmalloc'd WB buffers and checks that exactly the damaged pixels are
+ * copied: the multi-rectangle case is what a bounding-box upload used to get
+ * wrong (it also touched the gap between the rectangles), and the overlap
+ * case checks the per-scanline span union. */
+void ascentdrm_damage_selftest(void) {
+  extern const char *kernel_boot_cmdline;
+  if (!kernel_boot_cmdline || !strstr(kernel_boot_cmdline, "drm_selftest"))
+    return;
+
+  const uint32_t W = 64, H = 32, CPP = 4;
+  const uint32_t pitch = W * CPP;
+  const uint32_t sentinel = 0xA5A5A5A5u;
+  uint32_t *src = kmalloc((size_t)pitch * H);
+  uint32_t *dst = kmalloc((size_t)pitch * H);
+  bool ok = true;
+
+  if (!src || !dst) {
+    klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
+              " DRM damage selftest: allocation failed\n");
+    if (src) kfree(src);
+    if (dst) kfree(dst);
+    return;
+  }
+
+  for (uint32_t i = 0; i < W * H; i++)
+    src[i] = 0x11000000u | i;
+
+  /* 1. Two distant rectangles: the gap between them must stay untouched. */
+  for (uint32_t i = 0; i < W * H; i++)
+    dst[i] = sentinel;
+  struct drm_clip_rect far_clips[2] = {
+      { .x1 = 0, .y1 = 0, .x2 = 16, .y2 = 8 },
+      { .x1 = 48, .y1 = 24, .x2 = 64, .y2 = 32 },
+  };
+  uint64_t bytes = drm_blit_damage((uint8_t *)dst, pitch,
+                                   (const uint8_t *)src, pitch, W, H, CPP,
+                                   far_clips, 2);
+  __asm__ volatile("sfence" ::: "memory");
+  if (bytes != (uint64_t)(16 * 8 + 16 * 8) * CPP)
+    ok = false;
+  for (uint32_t y = 0; y < H; y++) {
+    for (uint32_t x = 0; x < W; x++) {
+      bool damaged = (x < 16 && y < 8) || (x >= 48 && y >= 24);
+      uint32_t expect = damaged ? src[y * W + x] : sentinel;
+      if (dst[y * W + x] != expect)
+        ok = false;
+    }
+  }
+
+  /* 2. Overlapping rectangles: unioned per scanline, no double writes.
+   * Row bands: 0-7 -> x[0,32), 8-15 -> x[0,48), 16-23 -> x[16,48). */
+  for (uint32_t i = 0; i < W * H; i++)
+    dst[i] = sentinel;
+  struct drm_clip_rect overlap_clips[2] = {
+      { .x1 = 0, .y1 = 0, .x2 = 32, .y2 = 16 },
+      { .x1 = 16, .y1 = 8, .x2 = 48, .y2 = 24 },
+  };
+  bytes = drm_blit_damage((uint8_t *)dst, pitch, (const uint8_t *)src, pitch,
+                          W, H, CPP, overlap_clips, 2);
+  __asm__ volatile("sfence" ::: "memory");
+  if (bytes != (uint64_t)(8 * 32 + 8 * 48 + 8 * 32) * CPP)
+    ok = false;
+  for (uint32_t y = 0; y < H; y++) {
+    for (uint32_t x = 0; x < W; x++) {
+      bool damaged = (y < 8)                    ? (x < 32)
+                     : (y < 16)                 ? (x < 48)
+                     : (y < 24)                 ? (x >= 16 && x < 48)
+                                                : false;
+      uint32_t expect = damaged ? src[y * W + x] : sentinel;
+      if (dst[y * W + x] != expect)
+        ok = false;
+    }
+  }
+
+  /* 3. Single rectangle: the fast path, including a full-width bulk copy. */
+  for (uint32_t i = 0; i < W * H; i++)
+    dst[i] = sentinel;
+  struct drm_clip_rect full_clip = { .x1 = 0, .y1 = 4, .x2 = W, .y2 = 12 };
+  bytes = drm_blit_damage((uint8_t *)dst, pitch, (const uint8_t *)src, pitch,
+                          W, H, CPP, &full_clip, 1);
+  __asm__ volatile("sfence" ::: "memory");
+  if (bytes != (uint64_t)pitch * 8)
+    ok = false;
+  for (uint32_t y = 0; y < H; y++) {
+    for (uint32_t x = 0; x < W; x++) {
+      uint32_t expect = (y >= 4 && y < 12) ? src[y * W + x] : sentinel;
+      if (dst[y * W + x] != expect)
+        ok = false;
+    }
+  }
+
+  /* 4. Clip merging: contained clips are dropped; past the cap the nearest
+   * pair merges, and the stored union must still cover every added clip. */
+  struct drm_framebuffer fb;
+  memset(&fb, 0, sizeof(fb));
+  struct drm_clip_rect a = { .x1 = 0, .y1 = 0, .x2 = 10, .y2 = 10 };
+  struct drm_clip_rect b = { .x1 = 5, .y1 = 5, .x2 = 15, .y2 = 15 };
+  struct drm_clip_rect inner = { .x1 = 1, .y1 = 1, .x2 = 9, .y2 = 9 };
+  drm_damage_add(&fb, &a);
+  drm_damage_add(&fb, &b);
+  drm_damage_add(&fb, &inner);
+  if (!fb.pending_damage_valid || fb.pending_damage_count != 2)
+    ok = false;
+
+  uint32_t union_x1 = 0, union_y1 = 0, union_x2 = 15, union_y2 = 15;
+  for (uint32_t i = 0; i < DRM_MAX_DAMAGE_CLIPS + 20; i++) {
+    struct drm_clip_rect c = {
+        .x1 = (uint16_t)(i * 3), .y1 = (uint16_t)(i % 7),
+        .x2 = (uint16_t)(i * 3 + 2), .y2 = (uint16_t)(i % 7 + 2) };
+    drm_damage_add(&fb, &c);
+    if (c.x1 < union_x1) union_x1 = c.x1;
+    if (c.y1 < union_y1) union_y1 = c.y1;
+    if (c.x2 > union_x2) union_x2 = c.x2;
+    if (c.y2 > union_y2) union_y2 = c.y2;
+  }
+  if (fb.pending_damage_count != DRM_MAX_DAMAGE_CLIPS ||
+      !fb.pending_damage_valid)
+    ok = false;
+  uint32_t bx1 = UINT16_MAX, by1 = UINT16_MAX, bx2 = 0, by2 = 0;
+  for (uint32_t i = 0; i < fb.pending_damage_count; i++) {
+    const struct drm_clip_rect *c = &fb.pending_damage[i];
+    if (c->x2 <= c->x1 || c->y2 <= c->y1)
+      ok = false;
+    if (c->x1 < bx1) bx1 = c->x1;
+    if (c->y1 < by1) by1 = c->y1;
+    if (c->x2 > bx2) bx2 = c->x2;
+    if (c->y2 > by2) by2 = c->y2;
+  }
+  if (bx1 > union_x1 || by1 > union_y1 || bx2 < union_x2 || by2 < union_y2)
+    ok = false;
+
+  klog_puts(ok ? KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
+                 " DRM damage planner selftest: rects, overlap, fast path, merge\n"
+               : KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
+                 " DRM damage planner selftest FAILED\n");
+  kfree(src);
+  kfree(dst);
+}
+
+/* Time the damage blit on the real scanout for the patterns a compositor
+ * produces, enabled with `drm_bench=1`.  The two-window case is printed twice
+ * - once with the clips kept separate and once as the bounding box the old
+ * planner collapsed them into - so the extra bytes a bounding-box upload
+ * copies are visible directly. The screen is restored from the console
+ * backbuffer afterwards. */
+/* Run one blit pattern `iters` times; returns cycles per frame and the bytes
+ * the last iteration copied. */
+static uint64_t drm_bench_run(const struct drm_clip_rect *clips,
+                              uint32_t num_clips, uint32_t iters, uint8_t *dst,
+                              const uint8_t *src, uint32_t w, uint32_t h,
+                              uint32_t cpp, uint32_t pitch,
+                              uint64_t *bytes_out) {
+  uint64_t bytes = 0;
+  uint64_t t0 = drm_read_cycles();
+  for (uint32_t i = 0; i < iters; i++)
+    bytes = drm_blit_damage(dst, pitch, src, pitch, w, h, cpp, clips,
+                            num_clips);
+  __asm__ volatile("sfence" ::: "memory");
+  if (bytes_out)
+    *bytes_out = bytes;
+  return (drm_read_cycles() - t0) / iters;
+}
+
+static void drm_bench_print(const char *name, const char *tag, uint64_t bytes,
+                            uint64_t cycles) {
+  uint64_t khz = tsc_get_freq_khz();
+
+  klog_puts("[DRM-BENCH] ");
+  klog_puts(name);
+  klog_puts(" ");
+  klog_puts(tag);
+  klog_puts(": ");
+  klog_uint64(bytes);
+  klog_puts(" B");
+  if (khz && cycles) {
+    klog_puts(", ");
+    klog_uint64(cycles * 1000ULL / khz);
+    klog_puts(" us, ");
+    klog_uint64((bytes * khz) / (cycles * 1000ULL));
+    klog_puts(" MB/s");
+  } else {
+    klog_puts(", ");
+    klog_uint64(cycles);
+    klog_puts(" cycles");
+  }
+  klog_puts("\n");
+}
+
+/* Measure a damage pattern twice: once with the clip list (new planner) and
+ * once as the bounding box the old planner collapsed it into, then report the
+ * difference.  Both calls go through drm_blit_damage(), so the only variable
+ * is the rectangle set. */
+static void drm_bench_pair(const char *name, const struct drm_clip_rect *clips,
+                           uint32_t num_clips, uint32_t iters, uint8_t *dst,
+                           const uint8_t *src, uint32_t w, uint32_t h,
+                           uint32_t cpp, uint32_t pitch) {
+  uint64_t clips_bytes = 0, box_bytes = 0;
+
+  struct drm_clip_rect box = { .x1 = UINT16_MAX, .y1 = UINT16_MAX,
+                               .x2 = 0, .y2 = 0 };
+  for (uint32_t i = 0; i < num_clips; i++) {
+    if (clips[i].x1 < box.x1) box.x1 = clips[i].x1;
+    if (clips[i].y1 < box.y1) box.y1 = clips[i].y1;
+    if (clips[i].x2 > box.x2) box.x2 = clips[i].x2;
+    if (clips[i].y2 > box.y2) box.y2 = clips[i].y2;
+  }
+  /* Two identical clips force the generic per-scanline span path - exactly
+   * what the old planner always ran for a reported damage rect.  A single
+   * clip would take the new fast path and understate the old cost; the bytes
+   * copied are the same either way. */
+  struct drm_clip_rect box_pair[2] = { box, box };
+
+  /* Interleave two passes and keep the best time per side: whichever side
+   * ran first after the previous case carries the cold-cache cost, and the
+   * minimum cancels that ordering bias. */
+  uint64_t c1, c2, b1, b2;
+  uint64_t cc1 = drm_bench_run(clips, num_clips, iters, dst, src, w, h, cpp,
+                               pitch, &c1);
+  uint64_t bc1 = drm_bench_run(box_pair, 2, iters, dst, src, w, h, cpp, pitch,
+                               &b1);
+  uint64_t bc2 = drm_bench_run(box_pair, 2, iters, dst, src, w, h, cpp, pitch,
+                               &b2);
+  uint64_t cc2 = drm_bench_run(clips, num_clips, iters, dst, src, w, h, cpp,
+                               pitch, &c2);
+  uint64_t clips_cycles = cc1 < cc2 ? cc1 : cc2;
+  uint64_t box_cycles = bc1 < bc2 ? bc1 : bc2;
+  (void)c1;
+  (void)b1;
+  clips_bytes = c2;
+  box_bytes = b2;
+
+  drm_bench_print(name, "clips", clips_bytes, clips_cycles);
+  drm_bench_print(name, "bbox ", box_bytes, box_cycles);
+
+  uint64_t khz = tsc_get_freq_khz();
+  uint64_t clips_us = khz ? clips_cycles * 1000ULL / khz : clips_cycles;
+  uint64_t box_us = khz ? box_cycles * 1000ULL / khz : box_cycles;
+  uint64_t saved_bytes = box_bytes > clips_bytes ? box_bytes - clips_bytes : 0;
+  uint64_t saved_us = box_us > clips_us ? box_us - clips_us : 0;
+
+  klog_puts("[DRM-BENCH] ");
+  klog_puts(name);
+  klog_puts("saved: ");
+  klog_uint64(saved_bytes);
+  klog_puts(" B (");
+  klog_uint64(box_bytes ? saved_bytes * 100ULL / box_bytes : 0);
+  klog_puts("%), ");
+  klog_uint64(saved_us);
+  if (khz)
+    klog_puts(" us");
+  else
+    klog_puts(" cycles");
+  klog_puts(" (");
+  klog_uint64(box_us ? saved_us * 100ULL / box_us : 0);
+  klog_puts("%)\n");
+}
+
+void ascentdrm_damage_bench(void) {
+  extern const char *kernel_boot_cmdline;
+  if (!kernel_boot_cmdline || !strstr(kernel_boot_cmdline, "drm_bench"))
+    return;
+
+  uint32_t w = fb_get_width();
+  uint32_t h = fb_get_height();
+  uint32_t pitch = fb_get_pitch();
+  uint32_t cpp = fb_get_bpp() / 8;
+  uint8_t *dst = (uint8_t *)fb_get_base();
+  if (!w || !h || !pitch || !cpp || !dst)
+    return;
+
+  uint8_t *src = kmalloc((size_t)pitch * h);
+  if (!src) {
+    klog_puts("[DRM-BENCH] skipped: no source buffer\n");
+    return;
+  }
+  for (uint32_t y = 0; y < h; y++) {
+    uint32_t *row = (uint32_t *)(src + (size_t)y * pitch);
+    for (uint32_t x = 0; x < w; x++)
+      row[x] = 0x11223344u ^ (x * 2654435761u) ^ (y * 40503u);
+  }
+
+  klog_puts("[DRM-BENCH] scanout damage blit: ");
+  klog_uint64(w);
+  klog_puts("x");
+  klog_uint64(h);
+  klog_puts("\n");
+
+  struct drm_clip_rect full = { .x1 = 0, .y1 = 0,
+                                .x2 = (uint16_t)w, .y2 = (uint16_t)h };
+  drm_bench_pair("full-frame ", &full, 1, 20, dst, src, w, h, cpp, pitch);
+
+  struct drm_clip_rect win = { .x1 = 100, .y1 = 100,
+                               .x2 = 700, .y2 = 500 };
+  drm_bench_pair("window     ", &win, 1, 100, dst, src, w, h, cpp, pitch);
+
+  struct drm_clip_rect cursor = { .x1 = 640, .y1 = 400,
+                                  .x2 = 672, .y2 = 432 };
+  drm_bench_pair("cursor     ", &cursor, 1, 2000, dst, src, w, h, cpp, pitch);
+
+  struct drm_clip_rect two[2] = {
+      { .x1 = 50, .y1 = 50, .x2 = 650, .y2 = 450 },
+      { .x1 = 700, .y1 = 300, .x2 = 1200, .y2 = 700 },
+  };
+  drm_bench_pair("two-windows", two, 2, 50, dst, src, w, h, cpp, pitch);
+
+  struct drm_clip_rect four[4] = {
+      { .x1 = 40, .y1 = 40, .x2 = 440, .y2 = 340 },
+      { .x1 = 840, .y1 = 40, .x2 = 1240, .y2 = 340 },
+      { .x1 = 40, .y1 = 460, .x2 = 440, .y2 = 760 },
+      { .x1 = 840, .y1 = 460, .x2 = 1240, .y2 = 760 },
+  };
+  drm_bench_pair("four-window", four, 4, 40, dst, src, w, h, cpp, pitch);
+
+  struct drm_clip_rect tiles[16];
+  uint32_t tile = 0;
+  for (uint32_t ty = 0; ty < 4; ty++) {
+    for (uint32_t tx = 0; tx < 4; tx++) {
+      uint16_t x1 = (uint16_t)(20 + tx * 310);
+      uint16_t y1 = (uint16_t)(20 + ty * 190);
+      tiles[tile].x1 = x1;
+      tiles[tile].y1 = y1;
+      tiles[tile].x2 = (uint16_t)(x1 + 240);
+      tiles[tile].y2 = (uint16_t)(y1 + 140);
+      tile++;
+    }
+  }
+  drm_bench_pair("tiles-16   ", tiles, 16, 30, dst, src, w, h, cpp, pitch);
+
+  struct drm_clip_rect typing[2] = {
+      { .x1 = 100, .y1 = 600, .x2 = 900, .y2 = 620 },
+      { .x1 = 110, .y1 = 600, .x2 = 126, .y2 = 616 },
+  };
+  drm_bench_pair("typing     ", typing, 2, 500, dst, src, w, h, cpp, pitch);
+
+  kfree(src);
+
+  /* Put the console contents back on screen. */
+  fb_swap_buffer_rect(0, 0, w, h);
+}
+
 static void drm_commit_damage(struct drm_device *dev,
                               const struct drm_clip_rect *clips,
                               uint32_t num_clips, uint32_t target_fb_id) {
@@ -238,88 +767,36 @@ static void drm_commit_damage(struct drm_device *dev,
             saw_direct_scanout = true;
 
           if (!direct_scanout && clips && num_clips) {
-            struct drm_damage_span { uint32_t x1, x2; };
-            struct drm_damage_span spans[64];
             uint32_t cpp = crtc->fb->bpp / 8;
             if (!cpp) cpp = 4;
-            uint32_t damage_y1 = height, damage_y2 = 0;
-            for (uint32_t i = 0; i < num_clips; i++) {
-              uint32_t y1 = clips[i].y1;
-              uint32_t y2 = clips[i].y2;
-              if (y1 > height) y1 = height;
-              if (y2 > height) y2 = height;
-              if (y2 <= y1) continue;
-              if (y1 < damage_y1) damage_y1 = y1;
-              if (y2 > damage_y2) damage_y2 = y2;
+            uint64_t blitted = drm_blit_damage(
+                (uint8_t *)hw_fb, hw_pitch,
+                (const uint8_t *)crtc->fb->gem_obj->virt_addr, sw_pitch,
+                width, height, cpp, clips, num_clips);
+            if (blitted) {
+              copied_bytes += blitted;
+              wrote_wc = true;
             }
 
-            /* Build a union of the damage on each scanline.  Xorg can send
-             * overlapping clips; copying each rectangle independently writes
-             * those pixels to the WC scanout more than once. */
-            for (uint32_t y = damage_y1; y < damage_y2; y++) {
-              uint32_t span_count = 0;
-              for (uint32_t i = 0; i < num_clips; i++) {
-                if (y < clips[i].y1 || y >= clips[i].y2)
-                  continue;
-                uint32_t x1 = clips[i].x1;
-                uint32_t x2 = clips[i].x2;
-                if (x1 > width) x1 = width;
-                if (x2 > width) x2 = width;
-                if (x2 <= x1) continue;
-
-                uint32_t pos = 0;
-                while (pos < span_count && spans[pos].x2 < x1)
-                  pos++;
-                uint32_t end = pos;
-                while (end < span_count && spans[end].x1 <= x2) {
-                  if (spans[end].x1 < x1) x1 = spans[end].x1;
-                  if (spans[end].x2 > x2) x2 = spans[end].x2;
-                  end++;
-                }
-
-                if (end > pos) {
-                  spans[pos].x1 = x1;
-                  spans[pos].x2 = x2;
-                  uint32_t remove = end - pos - 1;
-                  for (uint32_t j = end; j < span_count; j++)
-                    spans[j - remove] = spans[j];
-                  span_count -= remove;
-                } else if (span_count < 64) {
-                  for (uint32_t j = span_count; j > pos; j--)
-                    spans[j] = spans[j - 1];
-                  spans[pos].x1 = x1;
-                  spans[pos].x2 = x2;
-                  span_count++;
-                } else {
-                  /* Pathological fragmentation: one bounding span still
-                   * avoids a full-height framebuffer copy. */
-                  uint32_t bx1 = x1, bx2 = x2;
-                  for (uint32_t j = 0; j < span_count; j++) {
-                    if (spans[j].x1 < bx1) bx1 = spans[j].x1;
-                    if (spans[j].x2 > bx2) bx2 = spans[j].x2;
-                  }
-                  spans[0].x1 = bx1;
-                  spans[0].x2 = bx2;
-                  span_count = 1;
-                }
-              }
-
-              for (uint32_t i = 0; i < span_count; i++) {
-                size_t xoff = (size_t)spans[i].x1 * cpp;
-                if (xoff >= hw_pitch || xoff >= sw_pitch) continue;
-                size_t line_bytes = (size_t)(spans[i].x2 - spans[i].x1) * cpp;
-                if (line_bytes > hw_pitch - xoff)
-                  line_bytes = hw_pitch - xoff;
-                if (line_bytes > sw_pitch - xoff)
-                  line_bytes = sw_pitch - xoff;
-                if (!line_bytes) continue;
-                memcpy_to_wc((uint8_t *)hw_fb + (size_t)y * hw_pitch + xoff,
-                             (uint8_t *)crtc->fb->gem_obj->virt_addr +
-                                 (size_t)y * sw_pitch + xoff,
-                             line_bytes);
-                copied_bytes += line_bytes;
-                wrote_wc = true;
-              }
+            /* Accounting: the same clips as a bounding box are exactly what
+             * the old planner would have copied. */
+            uint32_t bx1 = UINT32_MAX, by1 = UINT32_MAX, bx2 = 0, by2 = 0;
+            for (uint32_t i = 0; i < num_clips; i++) {
+              uint32_t ax = clips[i].x1 < width ? clips[i].x1 : width;
+              uint32_t ay = clips[i].y1 < height ? clips[i].y1 : height;
+              uint32_t az = clips[i].x2 < width ? clips[i].x2 : width;
+              uint32_t aw = clips[i].y2 < height ? clips[i].y2 : height;
+              if (ax >= az || ay >= aw)
+                continue;
+              if (ax < bx1) bx1 = ax;
+              if (ay < by1) by1 = ay;
+              if (az > bx2) bx2 = az;
+              if (aw > by2) by2 = aw;
+            }
+            if (bx1 < bx2 && by1 < by2) {
+              drm_perf_stats.damage_clips += num_clips;
+              drm_perf_stats.bbox_bytes +=
+                  (uint64_t)(bx2 - bx1) * (by2 - by1) * cpp;
             }
           } else if (!direct_scanout && hw_pitch == sw_pitch) {
 #if DRM_DEBUG_LOGGING
@@ -537,8 +1014,8 @@ static void drm_commit_heads(struct drm_device *dev,const struct drm_clip_rect *
  * A buffer that has never been scanned out remains a full upload: the host
  * has no valid contents for it yet. */
 static void drm_commit_flipped_crtc(struct drm_device *dev, uint32_t crtc_id) {
-  struct drm_clip_rect damage;
-  bool have_damage = false;
+  struct drm_clip_rect clips[DRM_MAX_DAMAGE_CLIPS];
+  uint32_t count = 0;
 
   spinlock_acquire(&dev->lock);
   struct drm_mode_object *obj = drm_mode_object_find(dev, crtc_id);
@@ -547,17 +1024,20 @@ static void drm_commit_flipped_crtc(struct drm_device *dev, uint32_t crtc_id) {
     struct drm_framebuffer *fb = crtc->fb;
     if (fb) {
       if (fb->scanout_valid && fb->pending_damage_valid) {
-        damage = fb->pending_damage;
-        have_damage = true;
+        count = fb->pending_damage_count;
+        if (count > DRM_MAX_DAMAGE_CLIPS)
+          count = DRM_MAX_DAMAGE_CLIPS;
+        for (uint32_t i = 0; i < count; i++)
+          clips[i] = fb->pending_damage[i];
       }
       fb->pending_damage_valid = 0;
+      fb->pending_damage_count = 0;
       fb->scanout_valid = 1;
     }
   }
   spinlock_release(&dev->lock);
 
-  drm_commit_damage(dev, have_damage ? &damage : NULL, have_damage ? 1 : 0,
-                    crtc_id);
+  drm_commit_damage(dev, count ? clips : NULL, count, crtc_id);
 }
 
 static void drm_commit(struct drm_device *dev) {
@@ -567,6 +1047,8 @@ static void drm_commit(struct drm_device *dev) {
 /* Store legacy damage on the framebuffer. If it is already visible, submit
  * it immediately; otherwise PAGE_FLIP will submit it when that buffer is
  * selected. */
+static bool drm_dirtyfb_seen_damage;
+
 static int drm_dirtyfb(struct drm_device *dev,
                        const struct drm_mode_fb_dirty_cmd *dirty) {
   if (!dirty)
@@ -574,30 +1056,8 @@ static int drm_dirtyfb(struct drm_device *dev,
   if (dirty->num_clips > 4096)
     return -22;
 
-  struct drm_clip_rect damage = {0};
   bool have_damage = false;
-  if (dirty->num_clips && dirty->clips_ptr) {
-    const struct drm_clip_rect *clips =
-        (const struct drm_clip_rect *)dirty->clips_ptr;
-    uint32_t x1 = UINT16_MAX, y1 = UINT16_MAX, x2 = 0, y2 = 0;
-    for (uint32_t i = 0; i < dirty->num_clips; i++) {
-      if (clips[i].x2 <= clips[i].x1 || clips[i].y2 <= clips[i].y1)
-        continue;
-      if (clips[i].x1 < x1) x1 = clips[i].x1;
-      if (clips[i].y1 < y1) y1 = clips[i].y1;
-      if (clips[i].x2 > x2) x2 = clips[i].x2;
-      if (clips[i].y2 > y2) y2 = clips[i].y2;
-    }
-    if (x1 < x2 && y1 < y2) {
-      damage.x1 = (uint16_t)x1;
-      damage.y1 = (uint16_t)y1;
-      damage.x2 = (uint16_t)x2;
-      damage.y2 = (uint16_t)y2;
-      have_damage = true;
-    }
-  }
 
-  bool active = false;
   spinlock_acquire(&dev->lock);
   struct drm_mode_object *obj = drm_mode_object_find(dev, dirty->fb_id);
   if (!obj || obj->type != DRM_MODE_OBJECT_FB) {
@@ -605,21 +1065,24 @@ static int drm_dirtyfb(struct drm_device *dev,
     return -2;
   }
   struct drm_framebuffer *fb = (struct drm_framebuffer *)obj;
-  if (have_damage) {
-    if (damage.x2 > fb->width) damage.x2 = fb->width;
-    if (damage.y2 > fb->height) damage.y2 = fb->height;
-    if (damage.x1 < damage.x2 && damage.y1 < damage.y2) {
-      if (fb->pending_damage_valid) {
-        if (damage.x1 < fb->pending_damage.x1) fb->pending_damage.x1 = damage.x1;
-        if (damage.y1 < fb->pending_damage.y1) fb->pending_damage.y1 = damage.y1;
-        if (damage.x2 > fb->pending_damage.x2) fb->pending_damage.x2 = damage.x2;
-        if (damage.y2 > fb->pending_damage.y2) fb->pending_damage.y2 = damage.y2;
-      } else {
-        fb->pending_damage = damage;
-        fb->pending_damage_valid = 1;
-      }
+
+  if (dirty->num_clips && dirty->clips_ptr) {
+    const struct drm_clip_rect *clips =
+        (const struct drm_clip_rect *)dirty->clips_ptr;
+    for (uint32_t i = 0; i < dirty->num_clips; i++) {
+      struct drm_clip_rect clip = clips[i];
+      if (clip.x1 > fb->width) clip.x1 = fb->width;
+      if (clip.x2 > fb->width) clip.x2 = fb->width;
+      if (clip.y1 > fb->height) clip.y1 = fb->height;
+      if (clip.y2 > fb->height) clip.y2 = fb->height;
+      if (clip.x2 <= clip.x1 || clip.y2 <= clip.y1)
+        continue;
+      drm_damage_add(fb, &clip);
+      have_damage = true;
     }
   }
+
+  bool active = false;
   struct drm_mode_object *iter;
   list_for_each_entry(iter, &dev->kms_objects, list) {
     if (iter->type == DRM_MODE_OBJECT_CRTC &&
@@ -628,19 +1091,36 @@ static int drm_dirtyfb(struct drm_device *dev,
       break;
     }
   }
+
+  struct drm_clip_rect commit_clips[DRM_MAX_DAMAGE_CLIPS];
+  uint32_t commit_count = 0;
+  bool announce_damage;
   if (active) {
-    if (have_damage)
-      damage = fb->pending_damage;
+    if (have_damage) {
+      commit_count = fb->pending_damage_count;
+      if (commit_count > DRM_MAX_DAMAGE_CLIPS)
+        commit_count = DRM_MAX_DAMAGE_CLIPS;
+      for (uint32_t i = 0; i < commit_count; i++)
+        commit_clips[i] = fb->pending_damage[i];
+    }
     /* An empty or malformed DIRTYFB is conservatively a full update; do not
      * let a region from an earlier frame turn its following flip into a
      * partial upload. */
     fb->pending_damage_valid = 0;
+    fb->pending_damage_count = 0;
     fb->scanout_valid = 1;
   }
+  /* One line the first time a compositor actually reports damage, so a boot
+   * log shows whether the dirty path is live at all. */
+  announce_damage = have_damage && !drm_dirtyfb_seen_damage;
+  drm_dirtyfb_seen_damage = drm_dirtyfb_seen_damage || have_damage;
   spinlock_release(&dev->lock);
 
+  if (announce_damage)
+    klog_puts("[DRM] DIRTYFB damage tracking active\n");
+
   if (active)
-    drm_commit_damage(dev, have_damage ? &damage : NULL, have_damage ? 1 : 0,
+    drm_commit_damage(dev, commit_count ? commit_clips : NULL, commit_count,
                       dirty->fb_id);
   return 0;
 }
