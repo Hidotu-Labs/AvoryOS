@@ -1292,6 +1292,11 @@ divergences for its chunk; the Phase 5 exit matrix in
 - **`drain_workqueue()` equals `flush_workqueue()`**
   (`linuxkpi/src/workqueue.c`): upstream's "draining" state that blocks new
   submissions does not exist; the call waits for pending/running work only.
+  Workqueue workers are created on demand and retire after 5 s idle
+  (`KPI_SERVICE_IDLE_MS`), so an unused queue shows no `kworker/*` thread;
+  `kworker/vkms_co` and the `card1-crtc0` vblank worker follow the same
+  retire/respawn rule.  Workers that self-retire leave their task shadow and
+  kthread control block retained (the documented self-exit behaviour).
 - **`struct mm_struct` is still a placeholder** but now carries `pgd`,
   `init_mm` is a zeroed instance, and `swp_entry_t`/`enum fault_flag` are
   defined in the `mm_types.h` overlay because stock `<linux/pgtable.h>` needs
@@ -1309,13 +1314,22 @@ divergences for its chunk; the Phase 5 exit matrix in
 
 ## Deliberate divergences
 
-- **`struct page`** (`linuxkpi/include/linux/mm_types.h`): trimmed layout with
-  an extra `pfn` field; no fields/flags area, no folio embedding.  `PageTail`
+- **`struct page`** (`linuxkpi/include/linux/mm_types.h`): trimmed 64-byte
+  layout with a 32-bit `pfn` field and `pgmap` folded into the
+  `lru`/compound union; no fields/flags area, no folio embedding.  `PageTail`
   is an AvoryOS-only flag bit backed by a plain `compound_head` pointer.
   `linuxkpi/include/linux/page-flags.h` is a compact overlay, not upstream's.
+  The 64-byte size matters: the sparse mem_map holds one descriptor per
+  managed page, so a 4 GiB machine pays 2 MiB per 128 MB section.  Keep the
+  descriptor at or below 64 bytes (the `aligned(64)` attribute rounds any
+  65..128-byte layout up to 128).
 - **`asm-generic/memory_model.h`** is shadowed with an empty file:
   `pfn_to_page()`/`page_to_pfn()` are real functions over AvoryOS's sparse
-  mem_map instead of the FLATMEM/SPARSEMEM macros.
+  mem_map instead of the FLATMEM/SPARSEMEM macros.  Section maps are
+  allocated lazily by `pfn_to_page()` on first touch; do not pre-build them
+  at init (that cost ~136 MiB with the old 128-byte descriptor) and do not
+  sweep pfns across all of RAM from tests, which forces every section map to
+  materialize.
 - **`struct page::_refcount` is authoritative** for pages handed to Linux
   code; the native PMM reference is dropped exactly once when it reaches zero.
   Native CoW/refcount paths must not touch such pages (documented in page.c).
@@ -1368,8 +1382,14 @@ divergences for its chunk; the Phase 5 exit matrix in
   returns -ENODEV.
 - **`struct task_struct` is a per-thread shadow** (`linuxkpi/src/task.c`) with
   `kpi_thread` first; `task_tgid()` returns an opaque token built from the
-  native tgid, not a `struct pid`.  Shadows are leaked with their thread until
-  a thread-exit hook exists.
+  native tgid, not a `struct pid`.  The native exit path now calls
+  `linuxkpi_thread_exiting()`, which clears `kpi_thread` before the reaper can
+  free the thread; the shadow object itself is still deliberately retained for
+  kernel threads so a later `kthread_stop()` can resolve `kpi_control` (the
+  shadow with no control block, e.g. for user threads, is leaked too - freeing
+  it needs reference counting against imported code that stores task
+  pointers).  `kthread_stop()` must keep working after the thread has exited
+  and been reaped; this is the hook that makes that safe.
 - **Initcalls run in a kthread with a bounded wait**
   (`linuxkpi/src/initcalls.c`): the walker itself stays native
   (`kernel/src/linuxkpi/init.c`), but it is invoked from a `kpi/initcalls`

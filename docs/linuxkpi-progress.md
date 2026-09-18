@@ -1238,6 +1238,17 @@ Audit findings that shape the work (all detailed in the plan):
       `nm kernel/bin-x86_64/kernel | grep -c ' T amdgpu_'` = **940**;
       `' T drm_'` = **738**.  Image size grew accordingly (kernel ~105 MB,
       ISO ~110 MB with debug info; stripping/`-Os` is a P7 item).
+- [x] **ISO kernel copy is stripped (2026-09-16).**  The ~95 MB of DWARF in
+      `kernel/bin-x86_64/kernel` was being shipped in `iso_root/boot/kernel`
+      verbatim.  Both ISO recipes (`GNUmakefile` and `create_dist_usb.sh`)
+      now `strip --strip-all` the copy only; the build ELF stays unstripped
+      for `addr2line`/GDB (same addresses).  ISO **110 MB -> 12.2 MB**
+      (kernel 8.2 MB stripped vs 105.6 MB unstripped).  It also recovers
+      RAM: Limine stages the kernel file and the bootloader reclamation does
+      not return it all, so the usable-memory lines went from
+      `3913 MB` (unstripped ISO) to **`4006 MB`** (stripped) on the same
+      `-m 4G` machine - ~93 MB more usable RAM.  Verified with a headless
+      boot: 265 `[  OK  ]`, no `[FAIL]`, login reached.
 - [x] Boot-safety gate `kpi_amdgpu` (module parameter, default 0) keeps the
       passed GPU unbound; `test_phase6_link.c` (wired after the P5 VFIO
       suite) asserts registration + gate behavior.  `linuxkpi/src/pci.c`
@@ -1979,6 +1990,103 @@ Landed so far:
       with `patch -p1 -d kernel/linux`), and `kernel/linux/` was re-imported
       so every C7 boot links again.  The native mirror side is still to be
       designed; do not re-apply the patch before it exists.
+- [x] **Kernel threads now actually exit (boot-test thread leak fixed,
+      2026-09-15).**  Every kernel thread that returned from its entry point
+      went through `thread_exit()` (`kernel/src/sched/sched_thread.c`), which
+      marked it `THREAD_DEAD` but never queued it for the reaper.  The thread
+      stayed in `global_thread_list` forever and kept its kernel stack
+      (16 KiB), `struct thread`, `mm`, fd table and Linux task shadow - so
+      after the boot self-tests the `kpi/tests` thread itself plus every test
+      worker (`kpi/ctest/mtx*/ww*`, `p4s-tmo/probe/basic/order/timeout/stress`,
+      `kpi/i2c*`, 20 `kworker/ttm`, ...) and `kpi/initcalls` kept showing up
+      as tasks that "never exit".  `thread_exit()` now mirrors the detached
+      user-thread path (`t->state = THREAD_DEAD; sched_queue_reap(t)`) and
+      calls the new `linuxkpi_thread_exiting()` hook first, which clears the
+      task shadow's `kpi_thread` back-pointer so `kthread_stop()` /
+      `wake_up_process()` cannot reach a freed thread.
+      `struct task_struct` gained `kpi_control`; `kthread_stop()` resolves the
+      magic-tagged control block through the shadow and does the stop-flag
+      store + wake under the block's lock, with the trampoline retiring its
+      native pointer under the same lock before completing `->exited`.  So
+      stopping a thread that already self-exited (the common test pattern) is
+      race-free.  Verified with a temporary reap print on a headless
+      `run-linuxdrm` boot: 48 threads reaped by the login prompt (all test
+      workers, `kpi/tests` tid 24, `kpi/initcalls`, 20 `kworker/ttm`), 265
+      `[  OK  ]` lines, no faults.  `boot_tests.c` now logs the whole-run PMM
+      delta (`[INFO] LinuxKPI: boot self-tests PMM delta=-122 pages`
+      on the final boot), which pins the test-suite footprint to ~half a
+      megabyte of net allocation.  (The `~150 MB` "after the tests" figure
+      originally attributed here turned out to be kernel pages after all -
+      the LinuxKPI sparse mem_map; see the 2026-09-16 entry below.)  Shadows
+      (no control block) and never-stopped kernel-thread control blocks are
+      still retained deliberately; see `docs/linuxkpi-gaps.md`.
+  - Follow-up (2026-09-16): the `kpi/tests` / `kpi/initcalls` threads are now
+    also explicitly joined with `kthread_stop()` once their completion fires
+    (`boot_tests.c`, `initcalls.c`), so their control blocks are released at
+    exit instead of being kept for the boot.
+  - The "tests keep using CPU after init" symptom that prompted the join was
+    actually the console read path: `keyboard_get_char()`
+    (`kernel/src/drivers/input/keyboard.c`) polled with a bare `sched_yield()`
+    until a key arrived, so `avory-login` reading `/dev/console` pegged the
+    BSP at 100% forever (confirmed with a QEMU gdbstub backtrace:
+    `console_dev_read -> keyboard_get_char -> sched_schedule`).  It now blocks
+    on `keyboard_wait_queue` with the same IRQ-safe re-check pattern as
+    `evdev_vfs_read()`.  Headless verified: ~100% -> ~0% host CPU at the login
+    prompt, 265 `[  OK  ]` lines unchanged.
+- [x] **`struct page` / sparse mem_map footprint fixed (2026-09-16).**
+  `fastfetch` reported ~150 MB used at the login prompt; gdbstub walking the
+  kernel confirmed the bulk was the LinuxKPI page model, not the test
+  threads.  `struct page` was 128 bytes (`__attribute__((aligned(64)))`
+  rounded a 72-byte layout up) and `linuxkpi_page_init()` eagerly built all
+  34 section maps for 4 GiB (34 x 32768 x 128 = 136 MiB), while the Phase 2
+  pfn roundtrip test swept pfns across all of RAM, so every section would
+  have materialized even with lazy maps.  Fixes:
+  - `struct page` is 64 bytes now (`linuxkpi/include/linux/mm_types.h`):
+    32-bit `pfn` (max_pfn is ~1M here) and `pgmap` folded into the
+    `lru`/compound union.
+  - The eager section pre-build is gone; `pfn_to_page()` allocates a
+    section map lazily on first touch again (`linuxkpi/src/page.c`).
+  - `test_page_roundtrip()` samples a few pfns (start of memory, mid-RAM,
+    top of RAM) instead of every ~64 MB (`test_phase2_page.c`).
+  Evidence, headless `run-linuxdrm` boot: boot-test end free pages
+  `997886` vs `965117` before (+128 MiB); **4 / 34** section maps allocated
+  at the login prompt (~8 MiB mem_map), `sizeof(struct page)=64`, used
+  memory ~15 MB; all 265 `[  OK  ]` lines and every per-suite PMM invariant
+  green (vkms first-pass delta 2, TTM 0, sched -1, irq/i2c/sysfs stable).
+  The whole-run delta is now `-1668 pages` because section maps are charged
+  lazily during the suites; it grows with the RAM a workload actually
+  touches, up to the 68 MiB all-sections ceiling.  Do not re-add an eager
+  pre-build or a full-RAM pfn sweep.
+- [x] **Idle LinuxKPI daemons now exit and respawn on demand (2026-09-16).**
+  After the boot tests the `ps` list still showed `ktimers`, `rcu_kpi`,
+  `irq_work`, eight `kworker/*` and `card1-crtc0`/`kworker/vkms_co`; every one
+  pinned a 16 KiB kernel stack and looked like a "test process that never
+  exits".  New `linuxkpi/src/service.c` (`struct kpi_service`) implements the
+  retire/respawn protocol: producers bump a generation and kick, the worker
+  retires after `KPI_SERVICE_IDLE_MS` (5 s) only if the generation is
+  unchanged, and the kick either wakes the live thread or creates a new one
+  under the service lock.  Wired into:
+  - `timer.c`: `timer_signal_change()` → kick; `ktimers` retires when both
+    wheels are empty.
+  - `rcu.c`: `call_rcu()` → kick; the drain thread retires when the callback
+    list is empty.
+  - `irq_work.c`: `irq_work_queue()` → kick; retires when the list is empty.
+  - `workqueue.c`: `alloc_workqueue()` no longer spawns workers; `__queue_work`
+    creates one on demand (extra workers under load, capped by `max_active`)
+    and workers retire after the idle timeout; `destroy_workqueue` stops any
+    live ones.
+  - `kthread.c`: `kthread_create_worker*()` is lazy (name is stored; note
+    `drm_vblank_work` calls the no-op `sched_set_fifo(NULL)`), `kthread_worker_fn`
+    retires when idle and `kthread_queue_work()` spawns a replacement.
+  Temporary `[PROBE]` boot verified all five paths after retirement
+  (`call_rcu`, `irq_work_queue`, `schedule_work`, `mod_timer`,
+  `kthread_queue_work` each ran their callback and the threads retired again);
+  probe removed afterwards.  Clean headless boot: 265 `[  OK  ]`, no
+  `[FAIL]`, and after ~9 s idle the live list is only userland + native
+  daemons (`vfs-prefetch`, `tcp-timer`, `net-worker`, `virtio-gpu`, idle) -
+  no LinuxKPI thread left.  The retired workers' shadows/control blocks are
+  retained (the documented self-exit behaviour); respawns are rare on an
+  active system because any work within 5 s keeps the thread alive.
 - [ ] Hardware evidence (next `run-c7` boot): renderer string + fps from
       `bin/test_kpi_radeonsi` (must say radeonsi; the `[DIAG]` block must
       show 226:129 and the amdgpu render node), Xorg/glxgears and Weston
