@@ -50,7 +50,12 @@ typedef struct {
 
 struct page {
   unsigned long flags;   /* PG_* bits, see <linux/page-flags.h>              */
-  unsigned long pfn;     /* Avory extension: physical page number            */
+  unsigned int pfn;      /* Avory extension: physical page number.  32-bit  */
+                         /* is plenty (max_pfn is ~1M on a 4 GiB machine);  */
+                         /* keeping it narrow plus folding pgmap into the   */
+                         /* union below halves this descriptor from 128 to  */
+                         /* 64 bytes, and the sparse mem_map holds one of   */
+                         /* these per managed page.                          */
   atomic_t _refcount;    /* Allocation reference count (authoritative for    */
                          /* pages handed out through the Linux API)          */
   atomic_t _mapcount;    /* Number of PTEs referencing the page              */
@@ -62,15 +67,16 @@ struct page {
       struct page *compound_head; /* valid on PageHead and PageTail pages   */
       unsigned long compound_order; /* valid on PageHead pages              */
     };
+    /* dev_pagemap back-pointer.  ZONE_DEVICE is off, so it is only ever read
+     * by the stock memremap.h inline predicates that type-check; it shares
+     * the lru/compound union because nothing sets it. */
+    struct dev_pagemap *pgmap;
   };
   struct address_space *mapping; /* Page cache owner, NULL when anonymous    */
   pgoff_t index;         /* Offset in the mapping, in pages                  */
   unsigned long private; /* Filesystem/driver private data (upstream type;   */
                          /* TTM stores an allocation order and a helper      */
                          /* pointer here)                                    */
-  /* dev_pagemap back-pointer.  ZONE_DEVICE is off, so it is only ever read
-   * by the stock memremap.h inline predicates; carried so they type-check. */
-  struct dev_pagemap *pgmap;
 } __attribute__((aligned(64)));
 
 /* Order-0 folios: a folio is a head page plus the guarantee that its mapping

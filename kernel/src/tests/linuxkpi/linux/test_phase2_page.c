@@ -14,34 +14,46 @@
 
 /* ── pfn/page/address round trips ───────────────────────────────────────── */
 
+static bool p2_page_roundtrip_pfn(unsigned long pfn, uint64_t hhdm) {
+  struct page *page = pfn_to_page(pfn);
+  phys_addr_t phys;
+  void *addr;
+
+  if (!page)
+    return false;
+  if (page_to_pfn(page) != pfn)
+    return false;
+  if (compound_head(page) != page || PageTail(page))
+    return false;
+
+  phys = page_to_phys(page);
+  if (phys != ((phys_addr_t)pfn << PAGE_SHIFT))
+    return false;
+
+  addr = page_address(page);
+  if ((uint64_t)addr != (uint64_t)phys + hhdm)
+    return false;
+
+  /* virt_to_page(page_address(p)) must return the same descriptor. */
+  return virt_to_page(addr) == page;
+}
+
 static bool test_page_roundtrip(void) {
   uint64_t total = asc_pmm_get_total_memory();
   uint64_t hhdm = asc_pmm_get_hhdm_offset();
-  uint64_t last_pfn = total >> PAGE_SHIFT;
-  unsigned long step = (last_pfn / 64) | 1;
+  unsigned long last_pfn = (unsigned long)(total >> PAGE_SHIFT);
 
-  for (unsigned long pfn = 0; pfn < last_pfn; pfn += step) {
-    struct page *page = pfn_to_page(pfn);
-    phys_addr_t phys;
-    void *addr;
+  /* pfn_to_page() materializes the 128 MB section's struct page map on first
+   * touch and the map is never freed.  The old sweep sampled every ~64 MB of
+   * RAM and therefore built a map for every section, leaving the whole sparse
+   * mem_map (~136 MiB with the old 128-byte descriptor) resident for the rest
+   * of the boot.  A few samples are enough to exercise the sparse lookup: the
+   * section arithmetic is identical for every section. */
+  const unsigned long samples[] = {0, 1, last_pfn / 2, last_pfn - 2,
+                                   last_pfn - 1};
 
-    if (!page)
-      return false;
-    if (page_to_pfn(page) != pfn)
-      return false;
-    if (compound_head(page) != page || PageTail(page))
-      return false;
-
-    phys = page_to_phys(page);
-    if (phys != ((phys_addr_t)pfn << PAGE_SHIFT))
-      return false;
-
-    addr = page_address(page);
-    if ((uint64_t)addr != (uint64_t)phys + hhdm)
-      return false;
-
-    /* virt_to_page(page_address(p)) must return the same descriptor. */
-    if (virt_to_page(addr) != page)
+  for (unsigned i = 0; i < sizeof(samples) / sizeof(samples[0]); i++) {
+    if (!p2_page_roundtrip_pfn(samples[i], hhdm))
       return false;
   }
   return true;

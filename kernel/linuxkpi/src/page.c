@@ -160,14 +160,14 @@ void linuxkpi_page_init(void) {
   physmem_end = total;
   page_model_ready = true;
 
-  /* Allocate every section's descriptor array up front.  Linux's vmemmap is
-   * effectively fully populated at boot on x86 too; doing it eagerly keeps
-   * the metadata cost out of per-allocation accounting, so free-page
-   * invariants around driver tests stay exact.  At 64 bytes per 4 KB page
-   * this is 1/64 of RAM (2 MB per 128 MB section).  Sections that fail to
-   * allocate fall back to the lazy path. */
-  for (unsigned long s = 0; s < sections; s++)
-    (void)page_section_alloc(s);
+  /* Section maps are allocated lazily by pfn_to_page() the first time a page
+   * in that section is handed out, so a 4 GiB machine pays only for the
+   * sections that actually carry Linux-managed pages (a 128 MB section costs
+   * 2 MB at 64 bytes per page).  The eager alternative built all 34 sections
+   * (~68 MiB) at boot even though the boot-time desktop touches a handful;
+   * see the "~150 MB used after the KPI tests" report.  Driver tests that
+   * track PMM free-page deltas warm up before sampling, which absorbs the
+   * one-time map allocation of a newly touched section. */
 }
 
 /* ------------------------------------------------------------------------- */
