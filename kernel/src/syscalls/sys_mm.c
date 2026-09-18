@@ -7,6 +7,7 @@
 #include "../mm/tlb_shootdown.h"
 #include "../sched/sched.h"
 #include "syscall.h"
+#include "arch/uaccess.h"
 #include <stdint.h>
 
 // Linux mmap constants
@@ -1034,6 +1035,162 @@ static uint64_t sys_msync(uint64_t addr, uint64_t len, uint64_t flags,
   return 0;
 }
 
+// Linux NUMA memory policy constants
+#define MPOL_DEFAULT    0
+#define MPOL_PREFERRED  1
+#define MPOL_BIND       2
+#define MPOL_INTERLEAVE 3
+#define MPOL_LOCAL      4
+#define MPOL_MAX        5
+
+#define MPOL_F_NODE         (1 << 0)
+#define MPOL_F_ADDR         (1 << 1)
+#define MPOL_F_MEMS_ALLOWED (1 << 2)
+
+#define MPOL_F_STATIC_NODES   (1 << 15)
+#define MPOL_F_RELATIVE_NODES (1 << 14)
+#define MPOL_MODE_FLAGS       (MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES)
+
+// sys_get_mempolicy(int *mode, unsigned long *nodemask, unsigned long maxnode,
+//                   unsigned long addr, unsigned long flags)
+// Retrieves the NUMA memory policy for the calling thread or for a specific address.
+// AvoryOS is a single-node system (node 0).
+static uint64_t sys_get_mempolicy(uint64_t mode_ptr, uint64_t nodemask_ptr,
+                                  uint64_t maxnode, uint64_t addr,
+                                  uint64_t flags, uint64_t a5) {
+  (void)a5;
+
+  if (flags & ~(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED))
+    return (uint64_t)-22; // EINVAL
+
+  if ((flags & MPOL_F_MEMS_ALLOWED) && (flags & (MPOL_F_ADDR | MPOL_F_NODE)))
+    return (uint64_t)-22; // EINVAL
+
+  if (flags & MPOL_F_ADDR) {
+    if (!addr || !is_user_pointer(addr))
+      return (uint64_t)-14; // EFAULT
+
+    if (flags & MPOL_F_NODE) {
+      if (mode_ptr) {
+        int node = 0;
+        if (copy_to_user((void *)mode_ptr, &node, sizeof(node)) != 0)
+          return (uint64_t)-14; // EFAULT
+      }
+      return 0;
+    }
+
+    if (mode_ptr) {
+      int pol = MPOL_DEFAULT;
+      if (copy_to_user((void *)mode_ptr, &pol, sizeof(pol)) != 0)
+        return (uint64_t)-14; // EFAULT
+    }
+    if (nodemask_ptr) {
+      if (maxnode < 1)
+        return (uint64_t)-22; // EINVAL
+      unsigned long copy_bytes = ((maxnode - 1 + 63) / 64) * sizeof(unsigned long);
+      if (copy_bytes > PAGE_SIZE)
+        return (uint64_t)-22; // EINVAL
+      if (clear_user((void *)nodemask_ptr, copy_bytes) != 0)
+        return (uint64_t)-14; // EFAULT
+    }
+    return 0;
+  }
+
+  if (addr != 0)
+    return (uint64_t)-22; // EINVAL
+
+  if (flags & MPOL_F_NODE)
+    return (uint64_t)-22; // EINVAL
+
+  if (flags & MPOL_F_MEMS_ALLOWED) {
+    if (nodemask_ptr) {
+      if (maxnode < 1)
+        return (uint64_t)-22; // EINVAL
+      unsigned long copy_bytes = ((maxnode - 1 + 63) / 64) * sizeof(unsigned long);
+      if (copy_bytes > PAGE_SIZE)
+        return (uint64_t)-22; // EINVAL
+      if (clear_user((void *)nodemask_ptr, copy_bytes) != 0)
+        return (uint64_t)-14; // EFAULT
+      unsigned long mask = 1UL; // Node 0
+      if (copy_to_user((void *)nodemask_ptr, &mask, sizeof(mask)) != 0)
+        return (uint64_t)-14; // EFAULT
+    }
+    return 0;
+  }
+
+  // flags == 0: default policy
+  if (mode_ptr) {
+    int pol = MPOL_DEFAULT;
+    if (copy_to_user((void *)mode_ptr, &pol, sizeof(pol)) != 0)
+      return (uint64_t)-14; // EFAULT
+  }
+
+  if (nodemask_ptr) {
+    if (maxnode < 1)
+      return (uint64_t)-22; // EINVAL
+    unsigned long copy_bytes = ((maxnode - 1 + 63) / 64) * sizeof(unsigned long);
+    if (copy_bytes > PAGE_SIZE)
+      return (uint64_t)-22; // EINVAL
+    if (clear_user((void *)nodemask_ptr, copy_bytes) != 0)
+      return (uint64_t)-14; // EFAULT
+  }
+
+  return 0;
+}
+
+static uint64_t sys_set_mempolicy(uint64_t mode_raw, uint64_t nodemask_ptr,
+                                  uint64_t maxnode, uint64_t a3,
+                                  uint64_t a4, uint64_t a5) {
+  (void)a3;
+  (void)a4;
+  (void)a5;
+
+  int mode = (int)(mode_raw & ~MPOL_MODE_FLAGS);
+  if (mode < 0 || mode >= MPOL_MAX)
+    return (uint64_t)-22; // EINVAL
+
+  if (mode == MPOL_DEFAULT)
+    return 0;
+
+  if (nodemask_ptr) {
+    if (maxnode < 1)
+      return (uint64_t)-22; // EINVAL
+    unsigned long mask = 0;
+    if (copy_from_user(&mask, (const void *)nodemask_ptr, sizeof(mask)) != 0)
+      return (uint64_t)-14; // EFAULT
+    if (!(mask & 1UL))
+      return (uint64_t)-22; // EINVAL
+  }
+  return 0;
+}
+
+static uint64_t sys_mbind(uint64_t addr, uint64_t len, uint64_t mode_raw,
+                          uint64_t nodemask_ptr, uint64_t maxnode,
+                          uint64_t flags) {
+  (void)flags;
+  (void)len;
+  if (!addr || !is_user_pointer(addr) || (addr & (PAGE_SIZE - 1)))
+    return (uint64_t)-22; // EINVAL
+
+  int mode = (int)(mode_raw & ~MPOL_MODE_FLAGS);
+  if (mode < 0 || mode >= MPOL_MAX)
+    return (uint64_t)-22; // EINVAL
+
+  if (mode == MPOL_DEFAULT)
+    return 0;
+
+  if (nodemask_ptr) {
+    if (maxnode < 1)
+      return (uint64_t)-22; // EINVAL
+    unsigned long mask = 0;
+    if (copy_from_user(&mask, (const void *)nodemask_ptr, sizeof(mask)) != 0)
+      return (uint64_t)-14; // EFAULT
+    if (!(mask & 1UL))
+      return (uint64_t)-22; // EINVAL
+  }
+  return 0;
+}
+
 // Public API
 
 void syscall_register_mm(void) {
@@ -1045,6 +1202,9 @@ void syscall_register_mm(void) {
   syscall_register(SYS_MADVISE, sys_madvise);
   syscall_register(SYS_BRK, sys_brk);
   syscall_register(SYS_MPROTECT, sys_mprotect);
+  syscall_register(SYS_MBIND, sys_mbind);
+  syscall_register(SYS_SET_MEMPOLICY, sys_set_mempolicy);
+  syscall_register(SYS_GET_MEMPOLICY, sys_get_mempolicy);
 }
 // Called from process_exec when loading a new process image.
 void mm_reset_mmap_state(struct thread *t) {
