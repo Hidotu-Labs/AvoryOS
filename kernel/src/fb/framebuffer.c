@@ -392,6 +392,10 @@ static bool fb_wc_mapped = false;
  * WC versus MTRR: a firmware MTRR that already marks the range UC wins over
  * PAT.  In that case this is harmless but the win comes from the non-temporal
  * stores in fb_swap_buffer_rect() instead.
+ *
+ * A KVM guest ignores the guest PAT for the emulated aperture - the stores
+ * stay slow whatever we set here - so the console batches its swaps instead
+ * (see console_request_swap()).
  */
 void fb_map_wc(void) {
     if (fb_wc_mapped)
@@ -499,6 +503,10 @@ int fb_get_kd_mode(void) {
 }
 
 void fb_set_kd_mode(int mode) {
+    /* A pending console swap would clobber a graphics client's pixels, and it
+     * must not land after the graphics client takes over. */
+    if (mode == KD_GRAPHICS)
+        console_flush_pending_swap();
     fb_global.kd_mode = mode;
 }
 

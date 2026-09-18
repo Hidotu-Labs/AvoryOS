@@ -21,6 +21,8 @@ void *fb_get_base(void);
 void *fb_get_backbuffer(void);
 bool fb_is_backbuffer_enabled(void);
 void fb_set_backbuffer_mode(bool enabled);
+void fb_backbuffer_scroll(uint32_t pixel_rows);
+uint32_t fb_backbuffer_row(uint32_t y);
 
 /* ── Screen Geometry & Info ──────────────────────────────────────────────── */
 uint32_t fb_get_width(void);

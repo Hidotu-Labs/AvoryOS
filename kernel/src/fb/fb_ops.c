@@ -8,6 +8,34 @@
 
 extern struct fb_info fb_global;
 
+/* Copy a byte range between a linear caller buffer and the ring-rotated
+ * backbuffer.  /dev/fb0 offsets are display-relative, so translate each row
+ * through the rotation instead of accessing the buffer linearly. */
+static void fb_backbuffer_copy(uint8_t *linear, uint32_t offset, uint32_t size, bool from_backbuffer) {
+    uint32_t pitch = fb_global.fix.line_length;
+    uint8_t *bb = (uint8_t *)fb_global.backbuffer;
+    if (!pitch)
+        return;
+
+    while (size) {
+        uint32_t row = offset / pitch;
+        uint32_t col = offset - row * pitch;
+        uint32_t chunk = pitch - col;
+        if (chunk > size)
+            chunk = size;
+
+        uint8_t *bb_row = bb + (uint64_t)fb_backbuffer_row(row) * pitch + col;
+        if (from_backbuffer)
+            memcpy(linear, bb_row, chunk);
+        else
+            memcpy(bb_row, linear, chunk);
+
+        linear += chunk;
+        offset += chunk;
+        size -= chunk;
+    }
+}
+
 uint32_t fb_dev_read(struct vfs_node *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
     (void)node;
     if (!buffer || !size || offset >= fb_global.screen_size)
@@ -16,13 +44,15 @@ uint32_t fb_dev_read(struct vfs_node *node, uint32_t offset, uint32_t size, uint
     if (offset + size > fb_global.screen_size)
         size = (uint32_t)(fb_global.screen_size - offset);
 
-    void *src_base = (fb_global.backbuffer_enabled && fb_global.backbuffer)
-                         ? fb_global.backbuffer
-                         : fb_global.screen_base;
+    bool from_backbuffer = fb_global.backbuffer_enabled && fb_global.backbuffer;
+    void *src_base = from_backbuffer ? fb_global.backbuffer : fb_global.screen_base;
     if (!src_base)
         return 0;
 
-    memcpy(buffer, (const uint8_t *)src_base + offset, size);
+    if (from_backbuffer)
+        fb_backbuffer_copy(buffer, offset, size, true);
+    else
+        memcpy(buffer, (const uint8_t *)src_base + offset, size);
     return size;
 }
 
@@ -34,34 +64,37 @@ uint32_t fb_dev_write(struct vfs_node *node, uint32_t offset, uint32_t size, uin
     if (offset + size > fb_global.screen_size)
         size = (uint32_t)(fb_global.screen_size - offset);
 
-    void *target = (fb_global.backbuffer_enabled && fb_global.backbuffer)
-                       ? fb_global.backbuffer
-                       : fb_global.screen_base;
+    bool to_backbuffer = fb_global.backbuffer_enabled && fb_global.backbuffer;
+    void *target = to_backbuffer ? fb_global.backbuffer : fb_global.screen_base;
     if (!target)
         return 0;
 
-    uint8_t *dst = (uint8_t *)target + offset;
-    const uint8_t *src = buffer;
-    size_t count = size;
+    if (to_backbuffer) {
+        fb_backbuffer_copy(buffer, offset, size, false);
+    } else {
+        uint8_t *dst = (uint8_t *)target + offset;
+        const uint8_t *src = buffer;
+        size_t count = size;
 
-    while (count > 0 && (((uintptr_t)dst | (uintptr_t)src) & 7) != 0) {
-        *dst++ = *src++;
-        count--;
-    }
+        while (count > 0 && (((uintptr_t)dst | (uintptr_t)src) & 7) != 0) {
+            *dst++ = *src++;
+            count--;
+        }
 
-    size_t qwords = count >> 3;
-    uint64_t *d64 = (uint64_t *)dst;
-    const uint64_t *s64 = (const uint64_t *)src;
-    for (size_t q = 0; q < qwords; q++) {
-        d64[q] = s64[q];
-    }
+        size_t qwords = count >> 3;
+        uint64_t *d64 = (uint64_t *)dst;
+        const uint64_t *s64 = (const uint64_t *)src;
+        for (size_t q = 0; q < qwords; q++) {
+            d64[q] = s64[q];
+        }
 
-    size_t rem = count & 7;
-    if (rem) {
-        uint8_t *drem = (uint8_t *)d64 + (qwords << 3);
-        const uint8_t *srem = (const uint8_t *)s64 + (qwords << 3);
-        for (size_t r = 0; r < rem; r++) {
-            drem[r] = srem[r];
+        size_t rem = count & 7;
+        if (rem) {
+            uint8_t *drem = (uint8_t *)d64 + (qwords << 3);
+            const uint8_t *srem = (const uint8_t *)s64 + (qwords << 3);
+            for (size_t r = 0; r < rem; r++) {
+                drem[r] = srem[r];
+            }
         }
     }
 
@@ -107,7 +140,8 @@ uint64_t fb_dev_mmap(struct vfs_node *node, uint64_t addr, uint64_t length,
     if (!phys_base)
         return (uint64_t)-14;
 
-    /* Write-Combining (WC) page attributes for user MMIO (PAT entry 7: PAT=1, PCD=1, PWT=1) */
+    /* Write-Combining (WC) page attributes for user MMIO (PAT entry 7:
+     * PAT=1, PCD=1, PWT=1). */
     uint64_t page_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_USER |
                           PAGE_FLAG_PAT | PAGE_FLAG_PCD | PAGE_FLAG_PWT;
 

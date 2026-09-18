@@ -20,6 +20,8 @@ static void draw_char_colored(uint32_t c, uint32_t col, uint32_t row,
 static void draw_history_char(uint32_t col, uint32_t row);
 static void draw_cursor_block(uint32_t col, uint32_t row);
 static void console_wipe_history_unlocked(void);
+static void console_serial_flush(void);
+static void console_flush_pending_locked(void);
 
 static bool terminal_escape = false;
 static char terminal_escape_buffer[64];
@@ -34,6 +36,22 @@ static bool terminal_osc_esc = false;
 static uint32_t utf8_codepoint = 0;
 static int utf8_bytes_remaining = 0;
 static void console_render_char(uint32_t cp);
+
+/* Serial mirror batching: rendered bytes are forwarded to COM1 as they are
+ * printed, but one port access per character costs a VM exit per character
+ * under KVM.  Collect the raw bytes and hand them to serial_write_async() in
+ * one burst at the end of the batch.  The mirror is best-effort: it never
+ * waits on the UART, because blocking here would cap the console at the
+ * serial line rate.  Escape sequences are still never forwarded. */
+static char serial_mirror_buf[128];
+static size_t serial_mirror_len = 0;
+
+static void console_serial_flush(void) {
+  if (!serial_mirror_len)
+    return;
+  serial_write_async(serial_mirror_buf, serial_mirror_len);
+  serial_mirror_len = 0;
+}
 
 #define BG_COLOR 0x00000000
 #define FG_COLOR 0x00CDD6F4
@@ -135,6 +153,7 @@ static uint32_t scroll_region_bottom = 0; // 0 means "use max_rows-1"
 static uint32_t last_printed_cp = ' ';    // for REP (ESC[nb)
 
 static void console_redraw(void) {
+  console_flush_pending_locked();
   fb_set_backbuffer_mode(true);
   fb_clear(BG_COLOR);
 
@@ -147,20 +166,23 @@ static void console_redraw(void) {
     if (h_row > end_row)
       break;
 
+    console_char_t *cells = history[h_row % HISTORY_MAX];
+    uint32_t py = y * FONT_HEIGHT;
+
     for (uint32_t x = 0; x < max_cols; x++) {
-      console_char_t *ch = &history[h_row % HISTORY_MAX][x];
+      console_char_t *ch = &cells[x];
       uint32_t px = x * FONT_WIDTH;
-      uint32_t py = y * FONT_HEIGHT;
 
       if (ch->c != 0) {
+        /* One glyph scanline at a time: fb_draw_glyph_scanline() is the same
+         * 8-pixel renderer the live console uses, and the old per-pixel
+         * fb_put_pixel() loop paid a bounds check and a dirty mark for every
+         * single pixel of the cell. */
         const uint8_t *glyph = font_get_glyph(ch->c);
         for (uint32_t gy = 0; gy < FONT_HEIGHT; gy++) {
           uint8_t bits =
               (ch->underline && gy >= FONT_HEIGHT - 2) ? 0xFF : glyph[gy];
-          for (uint32_t gx = 0; gx < FONT_WIDTH; gx++) {
-            uint32_t color = (bits & (0x80 >> gx)) ? ch->fg : ch->bg;
-            fb_put_pixel(px + gx, py + gy, color);
-          }
+          fb_draw_glyph_scanline(px, py + gy, bits, ch->fg, ch->bg);
         }
       } else if (ch->bg != BG_COLOR) {
         // Cell is blank but has a non-default background (e.g. reverse video
@@ -206,21 +228,31 @@ uint32_t console_get_rows(void) { return max_rows; }
 static void scroll_up(void) {
   uint32_t fb_w = fb_get_width();
   uint32_t fb_h = fb_get_height();
-  uint32_t pitch = fb_get_pitch();
-  void *base = fb_is_backbuffer_enabled() ? fb_get_backbuffer() : fb_get_base();
-
   uint32_t move_height = fb_h - FONT_HEIGHT;
-  uint64_t bytes_to_copy = (uint64_t)move_height * pitch;
 
-  uint8_t *dst = (uint8_t *)base;
-  uint8_t *src = (uint8_t *)base + (FONT_HEIGHT * pitch);
+  if (fb_is_backbuffer_enabled()) {
+    /* Ring rotation: the scroll only advances the backbuffer origin; the
+     * swap maps display rows through it.  Moving every pixel once per
+     * scrolled line was the console's hottest path (one full-screen memcpy
+     * per newline at the bottom of the screen). */
+    fb_backbuffer_scroll(FONT_HEIGHT);
+    fb_mark_dirty(0, 0, fb_w, move_height);
+  } else {
+    uint32_t pitch = fb_get_pitch();
+    void *base = fb_get_base();
+    uint64_t bytes_to_copy = (uint64_t)move_height * pitch;
 
-  memcpy(dst, src, bytes_to_copy);
-  fb_mark_dirty(0, 0, fb_w, move_height);
+    uint8_t *dst = (uint8_t *)base;
+    uint8_t *src = (uint8_t *)base + (FONT_HEIGHT * pitch);
+
+    memcpy(dst, src, bytes_to_copy);
+    fb_mark_dirty(0, 0, fb_w, move_height);
+  }
 
   /* A terminal scroll exposes blank cells using the current rendition.
    * Full-screen programs (including nyancat) commonly keep a non-default
-   * background selected while repainting. */
+   * background selected while repainting.  This also clears the scanlines
+   * the ring rotation just recycled into the bottom of the screen. */
   fb_fill_rect(0, fb_h - FONT_HEIGHT, fb_w, FONT_HEIGHT, current_bg);
 
   if (cursor_y > 0) {
@@ -267,17 +299,19 @@ static void console_clear_line_from_cursor(void) {
     cell->c = 0;
     cell->fg = current_fg;
     cell->bg = current_bg;
-    if (view_scroll_offset == 0) {
-      fb_fill_rect(x * FONT_WIDTH, cursor_y * FONT_HEIGHT, FONT_WIDTH,
-                   FONT_HEIGHT, current_bg);
-    }
   }
+  /* Every erased cell shares one background, so paint the whole tail of the
+   * row with a single fill: one damage span instead of one per cell. */
+  if (view_scroll_offset == 0 && cursor_x < max_cols)
+    fb_fill_rect(cursor_x * FONT_WIDTH, cursor_y * FONT_HEIGHT,
+                 (max_cols - cursor_x) * FONT_WIDTH, FONT_HEIGHT, current_bg);
 }
 
 static void console_wipe_history_unlocked(void) {
   /* Keep the front and back buffers synchronized. Clearing only the front
      buffer allowed the next text swap to restore stale boot output and the
      cursor drawn at its old position. */
+  console_flush_pending_locked();
   if (fb_get_backbuffer()) {
     fb_set_backbuffer_mode(true);
     fb_clear(BG_COLOR);
@@ -510,11 +544,10 @@ static void console_process_escape_sequence(void) {
         history[row][x].c = 0;
         history[row][x].fg = current_fg;
         history[row][x].bg = current_bg;
-        if (view_scroll_offset == 0) {
-          fb_fill_rect(x * FONT_WIDTH, cursor_y * FONT_HEIGHT, FONT_WIDTH,
-                       FONT_HEIGHT, current_bg);
-        }
       }
+      if (view_scroll_offset == 0 && cursor_x < max_cols)
+        fb_fill_rect(0, cursor_y * FONT_HEIGHT, (cursor_x + 1) * FONT_WIDTH,
+                     FONT_HEIGHT, current_bg);
     } else if (value == 2) {
       // Erase entire viewport but keep scrollback
       for (uint32_t y = 0; y < max_rows; y++) {
@@ -547,11 +580,10 @@ static void console_process_escape_sequence(void) {
         history[row][x].c = 0;
         history[row][x].fg = current_fg;
         history[row][x].bg = current_bg;
-        if (view_scroll_offset == 0) {
-          fb_fill_rect(x * FONT_WIDTH, cursor_y * FONT_HEIGHT, FONT_WIDTH,
-                       FONT_HEIGHT, current_bg);
-        }
       }
+      if (view_scroll_offset == 0 && cursor_x < max_cols)
+        fb_fill_rect(0, cursor_y * FONT_HEIGHT, (cursor_x + 1) * FONT_WIDTH,
+                     FONT_HEIGHT, current_bg);
     } else if (value == 2) {
       // Erase entire line
       uint32_t row = console_history_row(cursor_y);
@@ -559,11 +591,10 @@ static void console_process_escape_sequence(void) {
         history[row][x].c = 0;
         history[row][x].fg = current_fg;
         history[row][x].bg = current_bg;
-        if (view_scroll_offset == 0) {
-          fb_fill_rect(x * FONT_WIDTH, cursor_y * FONT_HEIGHT, FONT_WIDTH,
-                       FONT_HEIGHT, current_bg);
-        }
       }
+      if (view_scroll_offset == 0)
+        fb_fill_rect(0, cursor_y * FONT_HEIGHT, max_cols * FONT_WIDTH,
+                     FONT_HEIGHT, current_bg);
     }
     break;
 
@@ -773,15 +804,17 @@ static void console_process_escape_sequence(void) {
               // cursor)
     int n = (value > 0) ? value : 1;
     uint32_t row = console_history_row(cursor_y);
+    uint32_t count = 0;
     for (int i = 0; i < n && cursor_x + (uint32_t)i < max_cols; i++) {
       uint32_t cx = cursor_x + (uint32_t)i;
       history[row][cx].c = 0;
       history[row][cx].fg = current_fg;
       history[row][cx].bg = current_bg;
-      if (view_scroll_offset == 0)
-        fb_fill_rect(cx * FONT_WIDTH, cursor_y * FONT_HEIGHT, FONT_WIDTH,
-                     FONT_HEIGHT, current_bg);
+      count++;
     }
+    if (view_scroll_offset == 0 && count)
+      fb_fill_rect(cursor_x * FONT_WIDTH, cursor_y * FONT_HEIGHT,
+                   count * FONT_WIDTH, FONT_HEIGHT, current_bg);
     break;
   }
 
@@ -1200,8 +1233,12 @@ static void console_putchar_unlocked(char c) {
     return;
   }
 
-  // Always forward raw bytes to serial (serial terminals handle UTF-8 natively)
-  serial_putchar(c);
+  // Always forward raw bytes to serial (serial terminals handle UTF-8 natively).
+  // Buffered until the batch ends: one burst instead of one port access per
+  // character on the hot path.
+  if (serial_mirror_len == sizeof(serial_mirror_buf))
+    console_serial_flush();
+  serial_mirror_buf[serial_mirror_len++] = c;
 
   // UTF-8 multi-byte decoding
   // Continuation byte (10xxxxxx)
@@ -1249,6 +1286,71 @@ static void console_putchar_unlocked(char c) {
 
 // Public API
 
+/* ── Deferred backbuffer swaps ─────────────────────────────────────────────
+ * A scrolled console frame is a full-screen frontbuffer copy, which costs
+ * ~24 ms under KVM (the aperture's stores are uncached there).  Paying that
+ * once per write() makes line-oriented output crawl.  Instead, swap at most
+ * once per interval: writes that arrive inside the interval just leave the
+ * dirty spans pending and the BSP tick (or the next write past the interval)
+ * flushes them.  All the output then lands in one copy per ~8 ms. */
+#define CONSOLE_SWAP_INTERVAL_MS 8
+#define CONSOLE_SWAP_MAX_PENDING 128
+
+static bool console_swap_pending = false;
+static uint32_t console_swap_pending_writes = 0;
+static uint64_t console_last_swap_ms = 0;
+
+static void console_flush_pending_locked(void) {
+  if (!console_swap_pending)
+    return;
+  fb_swap_buffer();
+  console_swap_pending = false;
+  console_swap_pending_writes = 0;
+  console_last_swap_ms = lapic_timer_get_ms();
+}
+
+static void console_request_swap(void) {
+  uint64_t now = lapic_timer_get_ms();
+  console_swap_pending_writes++;
+
+  /* Put the frame on screen when enough output has piled up, or when the
+   * previous frame is already old enough that this is interactive latency
+   * rather than a burst.  Otherwise leave the spans dirty: the idle tick or
+   * the next write flushes them, so a mushy stream of lines costs one
+   * full-screen copy per batch instead of one per write(). */
+  if (console_swap_pending_writes >= CONSOLE_SWAP_MAX_PENDING ||
+      (now - console_last_swap_ms) >= CONSOLE_SWAP_INTERVAL_MS) {
+    console_swap_pending = false;
+    console_swap_pending_writes = 0;
+    fb_swap_buffer();
+    /* Sample after the copy: the copy itself can outlast the interval, and
+     * the next write must still be treated as part of the same burst. */
+    console_last_swap_ms = lapic_timer_get_ms();
+    return;
+  }
+
+  console_swap_pending = true;
+}
+
+/* Called from the BSP idle loop (process context) to put a deferred frame on
+ * screen; the copy can be expensive, so it must not run in the timer ISR.
+ * try_acquire so a busy writer is never blocked by the idle CPU. */
+void console_tick(void) {
+  if (!console_swap_pending)
+    return;
+  if (!spinlock_try_acquire(&console_lock))
+    return;
+  console_flush_pending_locked();
+  spinlock_release(&console_lock);
+}
+
+/* Flush a pending swap from process context (mode changes, redraws). */
+void console_flush_pending_swap(void) {
+  spinlock_acquire(&console_lock);
+  console_flush_pending_locked();
+  spinlock_release(&console_lock);
+}
+
 void console_putchar(char c) {
   if (fb_get_kd_mode() == KD_GRAPHICS)
     return;
@@ -1259,8 +1361,9 @@ void console_putchar(char c) {
   // swaps.
   fb_set_backbuffer_mode(true);
   console_putchar_unlocked(c);
-  fb_swap_buffer();
+  console_request_swap();
   fb_set_backbuffer_mode(false);
+  console_serial_flush();
 
   spinlock_release(&console_lock);
 }
@@ -1282,8 +1385,9 @@ void console_puts(const char *s) {
   if (was_visible && view_scroll_offset == 0)
     console_set_cursor_visible_unlocked(true);
 
-  fb_swap_buffer();
+  console_request_swap();
   fb_set_backbuffer_mode(false);
+  console_serial_flush();
   spinlock_release(&console_lock);
 }
 
@@ -1311,8 +1415,9 @@ void console_write_batch(const char *buf, size_t len) {
   if (cursor_phys_on && view_scroll_offset == 0)
     draw_cursor_block(cursor_x, cursor_y);
 
-  fb_swap_buffer();
+  console_request_swap();
   fb_set_backbuffer_mode(false);
+  console_serial_flush();
 
   spinlock_release(&console_lock);
 }

@@ -196,10 +196,10 @@ struct fb_info {
     void *backbuffer;             /* System RAM cacheable backbuffer */
     bool backbuffer_enabled;      /* Rendering targets backbuffer when true */
     bool is_dirty;                /* Pending blit to frontbuffer */
-    uint32_t dirty_min_x;
-    uint32_t dirty_min_y;
-    uint32_t dirty_max_x;
-    uint32_t dirty_max_y;
+    uint32_t backbuffer_origin;   /* Physical scanline shown at display row 0.
+                                   * The console scrolls by advancing this
+                                   * origin instead of memmoving the whole
+                                   * screen; the swap undoes the rotation. */
 
     int kd_mode;                  /* KD_TEXT (0) or KD_GRAPHICS (1) */
     bool blanked;
