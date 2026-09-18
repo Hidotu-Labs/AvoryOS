@@ -78,4 +78,8 @@ void tlb_flush_deferred_all(void);
 bool tlb_flush_deferred_drain(void);
 void tlb_shootdown_reset_stats(void);
 
+/* `tlb_bench=1` on the kernel command line: measure the single-page shootdown
+ * path once the APs are online.  No-op without the flag. */
+void tlb_bench_maybe_run(void);
+
 #endif // MM_TLB_SHOOTDOWN_H

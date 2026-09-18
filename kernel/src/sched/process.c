@@ -786,6 +786,7 @@ bool process_exec_argv(const char **argv) {
   struct thread *current = sched_get_current();
   if (current && current->mm) {
     current->cr3 = (uint64_t)pml4;
+    cpu_set_active_cr3(current->cr3);
     __asm__ volatile("mov %0, %%cr3" ::"r"(current->cr3) : "memory");
 
     // Destroy old VMA tree nodes before resetting

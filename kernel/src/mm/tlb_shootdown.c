@@ -6,12 +6,14 @@
 #include "../sched/sched.h"
 #include "../smp/cpu.h"
 #include "pcid.h"
+#include "pmm.h"
 #include "vmm.h"
 #include "../lock/spinlock.h"
 #include "../lock/lockdiag.h"
 #include "../cpu/features.h"
 #include "../cpu/kpf_dump.h"
 #include "../drivers/serial.h"
+#include "../lib/string.h"
 #include "../lib/tsc.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -94,18 +96,33 @@ void tlb_shootdown_reset_stats(void) {
 }
 
 static bool cpu_needs_shootdown(struct cpu_info *cpu, struct cpu_info *self,
-                                uint64_t addr, uint64_t source_cr3) {
-    (void)addr;
-    (void)source_cr3;
+                                uint64_t addr, uint64_t pml4_base) {
     if (!cpu || cpu == self)
         return false;
     if (cpu->status != CPU_STATUS_ONLINE && cpu->status != CPU_STATUS_BSP)
         return false;
-    /* Broadcast shootdown to all online remote CPUs. With lazy CR3 and
-     * PCID-enabled context switching (CR3_NOFLUSH), any remote CPU may hold
-     * stale cached translations for user address spaces even when idle or
-     * currently switched away. */
-    return true;
+
+    /* A full invalidation, and every kernel-space mapping, can be cached by
+     * any CPU whatever address space it has loaded - kernel page tables are
+     * shared by all of them. */
+    if (addr == TLB_SHOOTDOWN_ALL || addr > USER_SPACE_LIMIT)
+        return true;
+
+    /* With PCID, a CPU that switched this address space out can still hold
+     * translations under its PCID, and reaching them is the handler's job -
+     * keep the conservative broadcast rather than risk a stale entry. */
+    if (cpu_has_pcid())
+        return true;
+
+    /* Without PCID every CR3 load flushes the previous address space's
+     * non-global entries, so only a CPU with this exact pml4 in CR3 can have
+     * user translations for it.  Skipping the rest is what makes a
+     * single-threaded process's faults and unmaps IPI-free: before this,
+     * every page invalidation interrupted every other core for nothing. */
+    uint64_t loaded = __atomic_load_n(&cpu->active_cr3, __ATOMIC_ACQUIRE);
+    if (loaded == 0)
+        return true; /* tracking not published yet: be conservative */
+    return (loaded & CR3_ADDR_MASK) == (pml4_base & CR3_ADDR_MASK);
 }
 
 void tlb_shootdown_handle_ipi(void) {
@@ -542,17 +559,22 @@ bool tlb_flush_deferred_drain(void) {
   return true;
 }
 
-static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t caller_ip) {
+static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
+                        uint64_t caller_ip) {
     uint32_t cpu_count = cpu_get_count();
     struct cpu_info *self = cpu_get_current();
-    uint64_t source_cr3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(source_cr3));
 
+    /* Freeze the target set before anything is published: the predicate reads
+     * live per-CPU state, and the publish/send/wait phases must all agree on
+     * exactly which CPUs were told to invalidate. */
+    uint64_t target_mask = 0;
     uint32_t targets = 0;
     for (uint32_t i = 0; i < cpu_count && i < MAX_CPUS; i++) {
         struct cpu_info *c = cpu_get_info(i);
-        if (cpu_needs_shootdown(c, self, addr, source_cr3))
-            targets++;
+        if (!cpu_needs_shootdown(c, self, addr, pml4_base))
+            continue;
+        target_mask |= 1ULL << c->cpu_id;
+        targets++;
     }
 
     if (targets == 0) {
@@ -574,7 +596,7 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t caller_ip) {
             if (addr == TLB_SHOOTDOWN_ALL)
                 tlb_flush_deferred_all();
             else
-                tlb_flush_deferred(addr, source_cr3 & CR3_ADDR_MASK);
+                tlb_flush_deferred(addr, pml4_base);
         }
         return;
     }
@@ -590,7 +612,7 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t caller_ip) {
     /* Publish address to all target CPUs. */
     for (uint32_t i = 0; i < cpu_count && i < MAX_CPUS; i++) {
         struct cpu_info *c = cpu_get_info(i);
-        if (!cpu_needs_shootdown(c, self, addr, source_cr3))
+        if (!(target_mask & (1ULL << c->cpu_id)))
             continue;
         __atomic_store_n(&cpu_shootdown_pcid[c->cpu_id], pcid, __ATOMIC_RELEASE);
         __atomic_store_n(&cpu_shootdown_addr[c->cpu_id], addr, __ATOMIC_RELEASE);
@@ -603,7 +625,7 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t caller_ip) {
     /* Send all IPIs in one burst. */
     for (uint32_t i = 0; i < cpu_count && i < MAX_CPUS; i++) {
         struct cpu_info *c = cpu_get_info(i);
-        if (!cpu_needs_shootdown(c, self, addr, source_cr3))
+        if (!(target_mask & (1ULL << c->cpu_id)))
             continue;
         lapic_send_ipi(c->apic_id, IPI_VECTOR_TLB_SHOOTDOWN);
     }
@@ -656,9 +678,8 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t caller_ip) {
     uint64_t wait_start = rdtsc();
     for (uint32_t i = 0; i < cpu_count && i < MAX_CPUS; i++) {
         struct cpu_info *c = cpu_get_info(i);
-        if (!c || c == self) continue;
-        if (c->status != CPU_STATUS_ONLINE && c->status != CPU_STATUS_BSP) continue;
-        if (!cpu_needs_shootdown(c, self, addr, source_cr3)) continue;
+        if (!c || !(target_mask & (1ULL << c->cpu_id)))
+            continue;
         while (__atomic_load_n(&cpu_shootdown_ack[c->cpu_id], __ATOMIC_ACQUIRE) != 0) {
             hal_cpu_relax();
             if (deadline) {
@@ -699,6 +720,13 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t caller_ip) {
     spinlock_release(&shootdown_lock);
 }
 
+/* This CPU's loaded pml4 physical address. */
+static uint64_t local_pml4(void) {
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    return cr3 & CR3_ADDR_MASK;
+}
+
 void tlb_shootdown_page(uint64_t addr) {
     /*
      * Assumes the affected address space is the one loaded on this CPU, which
@@ -707,7 +735,8 @@ void tlb_shootdown_page(uint64_t addr) {
      * tlb_shootdown_page_for(), or remote CPUs will be told to flush the wrong
      * PCID.
      */
-    do_shootdown(addr, local_pcid(), (uint64_t)__builtin_return_address(0));
+    do_shootdown(addr, local_pcid(), local_pml4(),
+                 (uint64_t)__builtin_return_address(0));
 }
 
 void tlb_shootdown_page_for(uint64_t addr, uint64_t pml4) {
@@ -715,11 +744,111 @@ void tlb_shootdown_page_for(uint64_t addr, uint64_t pml4) {
      * down an address space that is not loaded on this CPU, and we genuinely
      * do not know which PCID owns the stale entries: pcid_for_pml4() returns
      * PCID_KERNEL and every target behaves conservatively. */
-    do_shootdown(addr, pcid_for_pml4(pml4),
+    do_shootdown(addr, pcid_for_pml4(pml4), pml4 & CR3_ADDR_MASK,
                  (uint64_t)__builtin_return_address(0));
 }
 
 void tlb_shootdown_all(void) {
-    do_shootdown(TLB_SHOOTDOWN_ALL, PCID_KERNEL,
+    do_shootdown(TLB_SHOOTDOWN_ALL, PCID_KERNEL, 0,
                  (uint64_t)__builtin_return_address(0));
+}
+
+/* ── `tlb_bench=1`: single-page shootdown cost ───────────────────────────────
+ *
+ * The dominant cost of a page invalidation is the remote part: every online
+ * CPU is interrupted and must acknowledge, whether or not it ever ran the
+ * address space being modified.  This measures the two shapes on the real
+ * hardware path, against a scratch address space:
+ *
+ *  - "foreign-mm": the space is not loaded anywhere else (a single-threaded
+ *    process, or a teardown on another CPU).  There is nothing for remote
+ *    CPUs to invalidate;
+ *  - "active-mm": the space is the one loaded on the idle CPUs (the kernel
+ *    pml4), so they really do hold user-range entries and must be told.
+ *
+ * Each case reports cycles/op and what the /proc/tlb_stats accounting saw:
+ * IPIs per op and acknowledgements per op.  Gated on the kernel command line
+ * like fb_bench/serial_bench; runs once after the APs are online and frees
+ * the scratch address space when it is done.
+ */
+#define TLB_BENCH_ITERS 4000
+#define TLB_BENCH_PASSES 3
+
+static void tlb_bench_case(const char *name, uint64_t addr, uint64_t pml4,
+                           uint32_t iters) {
+    uint64_t best = 0;
+    tlb_shootdown_reset_stats();
+
+    for (uint32_t pass = 0; pass < TLB_BENCH_PASSES; pass++) {
+        uint64_t t0 = rdtsc_fence();
+        for (uint32_t i = 0; i < iters; i++)
+            tlb_shootdown_page_for(addr, pml4);
+        uint64_t cycles = rdtsc_fence() - t0;
+        if (best == 0 || cycles < best)
+            best = cycles;
+    }
+
+    tlb_shootdown_stats_t st;
+    tlb_shootdown_get_stats(&st);
+
+    uint64_t total = (uint64_t)iters * TLB_BENCH_PASSES;
+    uint64_t ns = tsc_cycles_to_ns(best);
+    klog_puts("[TLB-BENCH] ");
+    klog_puts(name);
+    klog_puts(": ");
+    klog_uint64(best / iters);
+    klog_puts(" cycles/op");
+    if (ns) {
+        klog_puts(", ");
+        klog_uint64(ns / iters);
+        klog_puts(" ns/op");
+    }
+    klog_puts(", IPIs/op x100=");
+    klog_uint64(st.ipis_sent * 100 / total);
+    klog_puts(", remote-acks/op x100=");
+    klog_uint64(st.shootdowns * 100 / total);
+    klog_puts("\n");
+}
+
+void tlb_bench_maybe_run(void) {
+    extern const char *kernel_boot_cmdline;
+    if (!kernel_boot_cmdline || !strstr(kernel_boot_cmdline, "tlb_bench"))
+        return;
+    if (cpu_get_count() < 2) {
+        klog_puts("[TLB-BENCH] skipped: needs at least 2 CPUs\n");
+        return;
+    }
+
+    uint64_t *scratch = vmm_create_pml4();
+    void *frame = pmm_alloc();
+    const uint64_t user_va = 0x400000;
+    bool mapped = scratch && frame &&
+                  vmm_map_page(scratch, user_va, (uint64_t)frame,
+                               PAGE_FLAG_PRESENT | PAGE_FLAG_USER | PAGE_FLAG_RW);
+    if (!mapped) {
+        klog_puts("[TLB-BENCH] skipped: no scratch address space\n");
+        if (frame && scratch)
+            pmm_free_page(frame);
+        if (scratch)
+            vmm_free_user_pages((uint64_t)scratch);
+        return;
+    }
+
+    klog_puts("\n[TLB-BENCH] single-page shootdown, ");
+    klog_uint64(cpu_get_count());
+    klog_puts(" CPUs, best of ");
+    klog_uint64(TLB_BENCH_PASSES);
+    klog_puts(" x ");
+    klog_uint64(TLB_BENCH_ITERS);
+    klog_puts(" iterations\n");
+
+    tlb_bench_case("foreign-mm", user_va, (uint64_t)scratch, TLB_BENCH_ITERS);
+
+    uint64_t active;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(active));
+    tlb_bench_case("active-mm ", user_va, active & CR3_ADDR_MASK,
+                   TLB_BENCH_ITERS);
+
+    vmm_free_user_pages((uint64_t)scratch);
+    klog_puts("[TLB-BENCH] done\n");
 }

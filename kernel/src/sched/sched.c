@@ -517,9 +517,11 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
             /* First time running this PCID on this CPU — flushing load */
             cpu_pcid_mark_cached(cpu, pcid);
           }
+          cpu_set_active_cr3(cr3_val);
           __asm__ volatile("mov %0, %%cr3" ::"r"(cr3_val) : "memory");
         } else {
           /* No PCID support — plain flushing CR3 load */
+          cpu_set_active_cr3(nxt_base);
           __asm__ volatile("mov %0, %%cr3" ::"r"(nxt_base) : "memory");
         }
       }

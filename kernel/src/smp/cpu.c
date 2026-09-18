@@ -135,6 +135,7 @@ void ap_main(void) {
   // 1.5 Switch to the dedicated kernel stack and page tables.
   // This is CRITICAL: APs must be off all bootloader memory (including tables)
 
+  cpu_set_active_cr3(current->kernel_cr3);
   __asm__ volatile("mov %0, %%cr3" ::"r"(current->kernel_cr3) : "memory");
   cpu_switch_stack(current->stack_top);
 
@@ -248,6 +249,9 @@ void cpu_init(void) {
   for (uint32_t i = 0; i < cpu_count; i++) {
     cpus[i].kernel_cr3 = cr3;
   }
+  // The BSP is running on the kernel CR3 right now; APs publish their own
+  // when they load it in ap_main().
+  cpus[0].active_cr3 = cr3;
 
   // Step 5: Set GS base for the BSP
   // We do this EARLY in cpu_init so that any early interrupts or code that

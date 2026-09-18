@@ -372,6 +372,7 @@ void process_do_exit(uint64_t status) {
     // Reaping handles the address-space reference after this task is off-CPU.
     if (current->cr3) {
       struct cpu_info *cpu = cpu_get_current();
+      cpu_set_active_cr3(cpu->kernel_cr3);
       __asm__ volatile("mov %0, %%cr3" :: "r"(cpu->kernel_cr3) : "memory");
     }
 
@@ -1163,6 +1164,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   }
 
   current->cr3 = (uint64_t)new_pml4;
+  cpu_set_active_cr3(current->cr3);
   __asm__ volatile("mov %0, %%cr3" ::"r"(current->cr3) : "memory");
 
   // Reset memory placement for the candidate image. Process-visible state is
@@ -1177,6 +1179,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
     klog_puts(path);
     klog_puts("\" errno=8 (elf_load)\n");
     current->cr3 = old_cr3;
+    cpu_set_active_cr3(current->cr3);
     __asm__ volatile("mov %0, %%cr3" ::"r"(current->cr3) : "memory");
     if (shared_mm) {
       // A vfork/CLONE_VM exec temporarily detached from the shared mm.
@@ -1367,6 +1370,7 @@ static void fork_child_entry(void) {
   struct syscall_regs *child_regs = (struct syscall_regs *)self->fork_ctx;
 
   // Switch to the child's cloned address space
+  cpu_set_active_cr3(self->cr3);
   __asm__ volatile("mov %0, %%cr3" ::"r"(self->cr3) : "memory");
 
   // Set TSS rsp0 so interrupts and syscalls from Ring 3 use this CPU's

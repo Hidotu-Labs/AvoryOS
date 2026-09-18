@@ -59,6 +59,13 @@ struct cpu_info {
   struct thread *fpu_owner; // Currently loaded FPU/SSE state owner on this CPU
   struct eevfd_rq eevfd;    // EEVFD Runqueue structure
   uint64_t active_pcids_bmp[64]; // PCID caching tracking (4096 bits)
+  // CR3 value currently loaded on this CPU (base | PCID | NOFLUSH bits), or 0
+  // before the first tracked load.  TLB shootdowns consult this to skip CPUs
+  // that cannot hold user translations for a given address space: without
+  // PCID every CR3 load flushes the previous space's non-global entries, so
+  // only the base currently in CR3 can have user entries cached.  Updated by
+  // every CR3 load through cpu_set_active_cr3().
+  uint64_t active_cr3;
 } __attribute__((aligned(64)));
 
 
@@ -92,5 +99,20 @@ struct cpu_info *cpu_get_info(uint32_t cpu_id);
 
 // Returns the BSP's cpu_info.
 struct cpu_info *cpu_get_bsp(void);
+
+/* Record the CR3 value that this CPU is about to load.  Call it immediately
+ * before the instruction that writes CR3, and make it a full barrier: a
+ * concurrent shootdown may decide to skip this CPU based on the value it
+ * reads, and it relies on the publish being visible (in one order or the
+ * other) relative to its own page-table store and to the page walks that
+ * follow this CR3 load.  The exchange is a locked operation on x86, so the
+ * walk cannot start before the publish is globally visible, and the caller
+ * releases the page-table lock before it reads this value - together that is
+ * the same store/load discipline switch_mm + mm_cpumask use on Linux. */
+static inline void cpu_set_active_cr3(uint64_t cr3) {
+  struct cpu_info *c = cpu_get_current();
+  if (c)
+    __atomic_exchange_n(&c->active_cr3, cr3, __ATOMIC_ACQ_REL);
+}
 
 #endif

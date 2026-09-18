@@ -2,6 +2,7 @@
 #include "msr.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #define IA32_PAT_MSR 0x277
 
@@ -18,67 +19,71 @@ static inline void cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax,
   if (edx) *edx = d;
 }
 
+/* Cached CPUID feature bits.  CPUID is serializing and, under KVM, a VM exit;
+ * the predicates below are called from hot paths - context switches
+ * (fsgsbase), uaccess (smap), the TLB shootdown path (pcid/invpcid) - so they
+ * must not re-execute it.  cpu_features_init() probes once per CPU; a caller
+ * that arrives even earlier triggers the same one-shot probe. */
+static uint32_t feat_max_leaf;
+static uint32_t feat_1_ecx;
+static uint32_t feat_7_0_ebx;
+static bool feat_probed;
+
+static void features_probe(void) {
+  cpuid(0, 0, &feat_max_leaf, NULL, NULL, NULL);
+  cpuid(1, 0, NULL, NULL, &feat_1_ecx, NULL);
+  if (feat_max_leaf >= 7)
+    cpuid(7, 0, NULL, &feat_7_0_ebx, NULL, NULL);
+  __atomic_store_n(&feat_probed, true, __ATOMIC_RELEASE);
+}
+
+static inline void features_ensure_probed(void) {
+  if (!__atomic_load_n(&feat_probed, __ATOMIC_ACQUIRE))
+    features_probe();
+}
+
 bool cpu_has_pcid(void) {
-  uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
-  cpuid(1, 0, &eax, &ebx, &ecx, &edx);
-  return (ecx & (1U << 17)) != 0; // CPUID.01H:ECX.PCID[bit 17]
+  features_ensure_probed();
+  return (feat_1_ecx & (1U << 17)) != 0; // CPUID.01H:ECX.PCID[bit 17]
 }
 
 bool cpu_has_invpcid(void) {
-  uint32_t max_leaf = 0, ebx = 0, ecx = 0, edx = 0;
-  cpuid(0, 0, &max_leaf, &ebx, &ecx, &edx);
-  if (max_leaf < 7)
+  features_ensure_probed();
+  if (feat_max_leaf < 7)
     return false;
-
-  uint32_t eax = 0;
-  cpuid(7, 0, &eax, &ebx, &ecx, &edx);
-  return (ebx & (1U << 10)) != 0; // CPUID.07H:EBX.INVPCID[bit 10]
+  return (feat_7_0_ebx & (1U << 10)) != 0; // CPUID.07H:EBX.INVPCID[bit 10]
 }
 
 
 bool cpu_has_fsgsbase(void) {
-  uint32_t max_leaf = 0, ebx = 0, ecx = 0, edx = 0;
-  cpuid(0, 0, &max_leaf, &ebx, &ecx, &edx);
-  if (max_leaf < 7)
+  features_ensure_probed();
+  if (feat_max_leaf < 7)
     return false;
-
-  uint32_t eax = 0;
-  cpuid(7, 0, &eax, &ebx, &ecx, &edx);
-  return (ebx & (1U << 0)) != 0; // CPUID.(EAX=07H,ECX=0H):EBX.FSGSBASE[bit 0]
+  return (feat_7_0_ebx & (1U << 0)) != 0; // CPUID.07H:EBX.FSGSBASE[bit 0]
 }
 
 bool cpu_has_smep(void) {
-  uint32_t max_leaf = 0, ebx = 0, ecx = 0, edx = 0;
-  cpuid(0, 0, &max_leaf, &ebx, &ecx, &edx);
-  if (max_leaf < 7)
+  features_ensure_probed();
+  if (feat_max_leaf < 7)
     return false;
-
-  uint32_t eax = 0;
-  cpuid(7, 0, &eax, &ebx, &ecx, &edx);
-  return (ebx & (1U << 7)) != 0; // CPUID.(EAX=07H,ECX=0H):EBX.SMEP[bit 7]
+  return (feat_7_0_ebx & (1U << 7)) != 0; // CPUID.07H:EBX.SMEP[bit 7]
 }
 
 bool cpu_has_smap(void) {
-  uint32_t max_leaf = 0, ebx = 0, ecx = 0, edx = 0;
-  cpuid(0, 0, &max_leaf, &ebx, &ecx, &edx);
-  if (max_leaf < 7)
+  features_ensure_probed();
+  if (feat_max_leaf < 7)
     return false;
-
-  uint32_t eax = 0;
-  cpuid(7, 0, &eax, &ebx, &ecx, &edx);
-  return (ebx & (1U << 20)) != 0; // CPUID.(EAX=07H,ECX=0H):EBX.SMAP[bit 20]
+  return (feat_7_0_ebx & (1U << 20)) != 0; // CPUID.07H:EBX.SMAP[bit 20]
 }
 
 bool cpu_has_xsave(void) {
-  uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
-  cpuid(1, 0, &eax, &ebx, &ecx, &edx);
-  return (ecx & (1U << 26)) != 0; // CPUID.01H:ECX.XSAVE[bit 26]
+  features_ensure_probed();
+  return (feat_1_ecx & (1U << 26)) != 0; // CPUID.01H:ECX.XSAVE[bit 26]
 }
 
 bool cpu_has_avx(void) {
-  uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
-  cpuid(1, 0, &eax, &ebx, &ecx, &edx);
-  return (ecx & (1U << 28)) != 0; // CPUID.01H:ECX.AVX[bit 28]
+  features_ensure_probed();
+  return (feat_1_ecx & (1U << 28)) != 0; // CPUID.01H:ECX.AVX[bit 28]
 }
 
 static inline void __attribute__((unused)) xsetbv(uint32_t index, uint64_t value) {
@@ -103,6 +108,11 @@ bool cpu_has_smap_flag = false;
 
 // Enable SSE/SSE2, PCID, FSGSBASE, AVX/XSAVE, SMEP and SMAP for long mode.
 void cpu_features_init(void) {
+  /* Publish the cached CPUID bits before any of the predicates below runs;
+   * the lazy probe makes this redundant but keeps the "probed on every CPU
+   * before anything else" property obvious. */
+  features_ensure_probed();
+
   uint64_t cr0;
   __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
   cr0 &= ~(1ULL << 2); // EM — no x87 emulation
