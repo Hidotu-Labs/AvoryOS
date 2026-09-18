@@ -367,6 +367,17 @@ void kmain(void) {
   sb16_reserve_dma();
   console_init(fb);
   klog_set_screen_logging(false);
+
+  /* `fb_bench=1` measures the damage/swap path before any boot output exists
+   * and blanks the screen again when it is done. */
+  extern void fb_bench_maybe_run(void);
+  fb_bench_maybe_run();
+
+  /* `serial_bench=1` measures the COM1 drain paths (tick, console mirror,
+   * synchronous klog burst) before the boot log pushes anything through them. */
+  extern void serial_bench_maybe_run(void);
+  serial_bench_maybe_run();
+
   dm_init();
 
   console_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
@@ -460,6 +471,12 @@ void kmain_high_half(void) {
   ramdisk_init(module_request.response);
 
   pmm_reclaim_bootloader(k_phys);
+
+  /* `tlb_bench=1` measures the single-page shootdown path once the APs are
+   * online and can answer IPIs.  Run after the APs' own boot prints so the
+   * results are not interleaved with them. */
+  extern void tlb_bench_maybe_run(void);
+  tlb_bench_maybe_run();
 
   // Initialize Virtual Filesystem and Ramfs
   klog_puts(KLOG_CLR_GREEN
@@ -588,6 +605,20 @@ mount_success:
   }
   ascentdrm_register_vfs();
   fb_detect_drm_backend();
+
+  /* `drm_selftest=1` verifies the DIRTYFB damage planner (rect union and the
+   * multi-clip fast paths) before userland can present anything. */
+  extern void ascentdrm_damage_selftest(void);
+  extern void ascentdrm_damage_bench(void);
+  ascentdrm_damage_selftest();
+  ascentdrm_damage_bench();
+
+  /* `vfs_selftest=1` checks the lazy path-cache invalidation and the packed
+   * page-cache references, and `vfs_bench=1` measures the old and new hot
+   * paths back to back.  Both need the mounted root, so they run here. */
+  vfs_selftest_maybe_run();
+  vfs_bench_maybe_run();
+
   mouse_register_vfs();
   random_register_vfs();
   extern void pty_register_devices(void);
@@ -632,6 +663,10 @@ mount_success:
   /* The Phase 1 suites sleep too; they get their own kthread instead of the
    * idle context kmain_high_half runs in. */
   linuxkpi_run_boot_tests();
+  /* `rcu_bench=1` measures the KPI RCU read side and grace-period latency
+   * (spawns its own kthread). */
+  extern void rcu_bench_maybe_run(void);
+  rcu_bench_maybe_run();
 #endif
 
 mount_fail:
@@ -677,8 +712,20 @@ mount_fail:
      * a timer armed here the BSP stops taking ticks the moment it goes idle:
      * lockdiag then sees a stale heartbeat, and every BSP-only service above
      * goes silent.  rearm_if_earlier() - not arm_at() - so a scheduler
-     * deadline armed just before the switch to idle is never pushed out. */
-    lapic_timer_rearm_if_earlier(lapic_timer_get_ms() + 1000);
+     * deadline armed just before the switch to idle is never pushed out.
+     *
+     * Serial mirror bytes are queued without blocking their writer, so while
+     * any are pending the idle tick runs at 1 ms to push them out at roughly
+     * line rate instead of one FIFO per second.  The pump below moves a slice
+     * of the backlog per idle iteration using CPU that would otherwise halt,
+     * so the mirror keeps up with the framebuffer console at the UART's own
+     * pace; the tick only drains while the BSP is busy.  A deferred console
+     * frame is flushed here too: the frontbuffer copy is far too slow to run
+     * in the timer ISR. */
+    console_tick();
+    serial_flush_idle();
+    uint64_t idle_ms = serial_pending_bytes() ? 1 : 1000;
+    lapic_timer_rearm_if_earlier(lapic_timer_get_ms() + idle_ms);
     hal_cpu_halt();
   }
 }
