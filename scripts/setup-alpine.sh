@@ -1723,6 +1723,15 @@ backend=drm-backend.so
 shell=desktop-shell.so
 xwayland=true
 
+# Pointer acceleration is handed to libinput.  In a VM the host already
+# accelerates the pointer before QEMU forwards the motion, so keep the guest
+# at a constant speed with the flat profile instead of accelerating quick
+# movements a second time (factor = 1 + accel-speed, 0.0 is 1:1).
+# Tune accel-speed between -1.0 (slowest) and 0.0 (1:1).
+[libinput]
+accel-profile=flat
+accel-speed=0.0
+
 [shell]
 panel-position=top
 locking=false
@@ -1981,6 +1990,8 @@ install_apk "qt6-qtimageformats" "community" "${QT6_BRANCH}"
 install_apk "qt6-qtmultimedia" "community" "${QT6_BRANCH}"
 install_apk "qt6-qtnetworkauth" "community" "${QT6_BRANCH}"
 install_apk "qt6-qtvirtualkeyboard" "community" "${QT6_BRANCH}"
+# libQt6Bluetooth.so.6 (needed by kdeconnect / org.kde.kdeconnect)
+install_apk "qt6-qtconnectivity" "community" "${QT6_BRANCH}"
 
 # --- KDE Frameworks 6 extras ---
 install_apk "baloo" "community"
@@ -2013,6 +2024,12 @@ install_apk "kdeclarative" "community"
 install_apk "oxygen" "community"
 install_apk "xdg-utils" "community"
 install_apk "desktop-file-utils" "community"
+# libKF6Prison.so.6 (needed by libklipper / org.kde.plasma.clipboard)
+install_apk "libdmtx-libs" "community"
+install_apk "libdmtx" "community"
+install_apk "zxing-cpp" "community"
+install_apk "libqrencode" "community"
+install_apk "prison" "community"
 
 # 5. Inject custom binaries
 echo "[*] Injecting custom binaries into rootfs..."

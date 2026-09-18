@@ -495,6 +495,16 @@ if [ "$has_graphics" -eq 0 ]; then
     set -- --graphics opengl "$@"
 fi
 
+# AvoryOS: a killed Mocktail run can leave its external-launch socket behind.
+# The broker only unlinks sockets it considers stale, and a bind() over the
+# leftover node has failed with EINVAL here ("cannot activate external-launch
+# socket: Invalid argument"), aborting startup before any window exists.
+# Clear the per-user endpoint directory when no other instance is alive.
+ENDPOINT_DIR="/tmp/mocktail-$(id -u 2>/dev/null || echo 0)"
+if ! pgrep -f "mocktail-bundle/mocktail/bin/mocktail" >/dev/null 2>&1; then
+    rm -rf "${ENDPOINT_DIR}" 2>/dev/null || true
+fi
+
 echo "[mocktail] Starting Mocktail Roblox runtime..."
 
 if [ -x "${RUNTIME_ROOT}/bin/mocktail" ]; then
