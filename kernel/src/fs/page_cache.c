@@ -152,7 +152,9 @@ vfs_page_t *vfs_cache_insert(vfs_node_t *node, uint32_t offset,
 }
 
 vfs_page_t *vfs_cache_get_or_create(vfs_node_t *node, uint32_t offset) {
-  vfs_page_t *page = vfs_cache_lookup(node, offset);
+  vfs_page_t *page;
+retry:
+  page = vfs_cache_lookup(node, offset);
   if (page) {
     while (1) {
       spinlock_acquire(&node->pages_lock);
@@ -162,8 +164,12 @@ vfs_page_t *vfs_cache_get_or_create(vfs_node_t *node, uint32_t offset) {
       if (!loading) {
         if (uptodate)
           return page;
+        /* A page whose fill failed can sit in the tree until its owner
+         * invalidates it.  Drop it and refill instead of reporting a
+         * short read to the caller. */
         vfs_cache_put(node, page);
-        return NULL;
+        vfs_cache_invalidate(node, offset);
+        goto retry;
       }
       sched_yield();
     }
@@ -212,7 +218,8 @@ vfs_page_t *vfs_cache_get_or_create(vfs_node_t *node, uint32_t offset) {
         if (uptodate)
           return page;
         vfs_cache_put(node, page);
-        return NULL;
+        vfs_cache_invalidate(node, offset);
+        goto retry;
       }
       sched_yield();
     }
@@ -660,6 +667,23 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       count = size - done;
 
     vfs_page_t *page = vfs_cache_lookup(node, page_offset);
+    if (page) {
+      /* Readahead and the exec-time prefetcher publish a page before its
+       * frame is filled (loading=true), and a failed fill can leave a page
+       * parked until its owner invalidates it.  Copying the frame here would
+       * hand the caller zeros or stale bytes and turn a transient fill
+       * failure into a silent short read.  Confirm readiness the same way
+       * the fault path does and let get_or_create() wait/retry instead. */
+      bool ready = false;
+      spinlock_acquire(&node->pages_lock);
+      if (!page->loading && page->uptodate && page->frame_phys)
+        ready = true;
+      spinlock_release(&node->pages_lock);
+      if (!ready) {
+        vfs_cache_put(node, page);
+        page = NULL;
+      }
+    }
     if (!page) {
       if (node->length >= 64 * 1024) {
         uint32_t ra_bytes = 128 * 1024;
@@ -671,8 +695,16 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       }
       page = vfs_cache_get_or_create(node, page_offset);
     }
-    if (!page)
+    if (!page) {
+      /* offset < node->length here, so this is an I/O or allocation
+       * failure, not EOF.  Make it visible instead of returning a silent
+       * zero-length read (musl then reports "No error information"). */
+      static uint32_t cache_read_failures;
+      if (__atomic_add_fetch(&cache_read_failures, 1, __ATOMIC_RELAXED) <= 8)
+        klogf("[VFS] page-cache read failed node='%s' off=%u size=%u\n",
+              node->name, offset, size);
       break;
+    }
     if (is_user_ptr((uint64_t)buffer)) {
       unsigned long uncopied = copy_to_user(
           buffer + done,
@@ -1270,6 +1302,14 @@ bool vfs_cache_phase5_stress_test(void) {
  * against the global atomic it replaced - same working set, back to back.
  * Entry points and gating live in vfs.c. */
 
+static uint32_t vfs_ref_selftest_read(vfs_node_t *node, uint32_t offset,
+                                      uint32_t size, uint8_t *buffer) {
+  (void)node;
+  for (uint32_t i = 0; i < size; i++)
+    buffer[i] = (uint8_t)(offset + i + 1);
+  return size;
+}
+
 bool vfs_cache_ref_selftest(void) {
   bool pass = true;
   size_t cached_before = vfs_cache_page_count();
@@ -1333,6 +1373,39 @@ bool vfs_cache_ref_selftest(void) {
   if (lingering) {
     pass = false;
     vfs_cache_put(&node, lingering);
+  }
+
+  /* 4. A parked page whose fill failed must be dropped and refilled instead
+   *    of being handed back as a short read. */
+  void *frame3 = pmm_alloc_page();
+  if (!frame3) {
+    pass = false;
+  } else {
+    vfs_page_t *parked = vfs_cache_insert(&node, 3 * PAGE_SIZE, (uint64_t)frame3);
+    if (!parked) {
+      pmm_free_page(frame3);
+      pass = false;
+    } else {
+      vfs_cache_put(&node, parked); /* cached, no transient users */
+      spinlock_acquire(&node.pages_lock);
+      parked->uptodate = false; /* as if the fill had failed */
+      spinlock_release(&node.pages_lock);
+
+      node.read = vfs_ref_selftest_read;
+      vfs_page_t *refilled = vfs_cache_get_or_create(&node, 3 * PAGE_SIZE);
+      if (!refilled) {
+        pass = false;
+      } else {
+        const uint8_t *data =
+            (const uint8_t *)PHYS_TO_VIRT(refilled->frame_phys);
+        for (uint32_t i = 0; i < PAGE_SIZE; i++) {
+          if (data[i] != (uint8_t)(3 * PAGE_SIZE + i + 1))
+            pass = false;
+        }
+        vfs_cache_put(&node, refilled);
+      }
+      node.read = NULL;
+    }
   }
 
   vfs_cache_clear(&node);
