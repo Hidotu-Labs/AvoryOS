@@ -22,6 +22,12 @@ int linuxkpi_max_cpus(void);
 /* x86 PAUSE hint, the native equivalent of cpu_relax(). */
 void linuxkpi_cpu_relax(void);
 
+/* TSC-based timing for KPI-side benchmarks.  The native <stdint.h> and the
+ * Linux headers typedef uint64_t differently, so the bridge carries plain
+ * unsigned long long values. */
+unsigned long long linuxkpi_rdtsc_fence(void);
+unsigned long long linuxkpi_cycles_to_ns(unsigned long long cycles);
+
 /* Kernel command line from the bootloader (empty string when none). */
 const char *linuxkpi_boot_cmdline(void);
 

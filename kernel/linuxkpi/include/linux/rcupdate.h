@@ -3,11 +3,14 @@
 
 /* Linux <linux/rcupdate.h> overlay.
  *
- * Read side: per-CPU nesting counter (linuxkpi/src/rcu.c).  Grace periods are
- * detected by polling those counters, so a reader that blocks or is preempted
- * keeps the grace period open; callbacks are invoked by a dedicated kthread.
- * This is correct but not yet optimized (no tree RCU, no expedited IPI path).
- */
+ * Read side: preempt_disable() plus a global reader count (linuxkpi/src/rcu.c),
+ * the classic non-preemptible RCU shape.  Grace periods are event-driven: the
+ * reader that brings the count to zero wakes the waiter, so synchronize_rcu()
+ * and the callback kthread complete as soon as the last reader leaves instead
+ * of at the next poll.  Callbacks run on a dedicated kthread.
+ *
+ * The shared counter still serializes readers across CPUs; sharding it needs
+ * a quiescent-state driven grace-period engine and is future work. */
 
 #include <linux/compiler.h>
 #include <linux/list.h>
