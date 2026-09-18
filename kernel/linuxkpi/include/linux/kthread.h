@@ -40,6 +40,9 @@ struct kthread_worker {
   wait_queue_head_t wait;      /* worker sleeps here when idle */
   wait_queue_head_t wait_idle; /* flush_worker() waits for idleness */
   int should_stop;
+  /* Avory: kept so a worker that retired after an idle timeout can be
+   * respawned with its original name by kthread_queue_work(). */
+  char name[16];
 };
 
 struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),

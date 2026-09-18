@@ -16,18 +16,17 @@
 
 #include <linuxkpi/log.h>
 #include <linuxkpi/native_sched.h>
+#include <linuxkpi/service.h>
 
 static LIST_HEAD(timer_wheel);
 static LIST_HEAD(hrtimer_wheel);
 static DEFINE_SPINLOCK(timer_lock);
 static struct wait_queue_head timer_wait;
 static struct wait_queue_head timer_done_wq;
-static volatile unsigned int timer_gen;
-static struct task_struct *timer_task;
+static struct kpi_service timer_svc;
 
 static void timer_signal_change(void) {
-  __atomic_add_fetch(&timer_gen, 1, __ATOMIC_RELEASE);
-  __kpi_wake_up(&timer_wait, 0, 0);
+  kpi_service_kick(&timer_svc, true);
 }
 
 int timer_pending(const struct timer_list *timer) {
@@ -254,12 +253,14 @@ static int timer_kthread(void *arg) {
   (void)arg;
 
   for (;;) {
-    if (kthread_should_stop())
+    if (kthread_should_stop()) {
+      kpi_service_forget(&timer_svc);
       return 0;
+    }
 
     linuxkpi_jiffies_sync();
 
-    unsigned int gen = __atomic_load_n(&timer_gen, __ATOMIC_ACQUIRE);
+    unsigned int gen = kpi_service_gen(&timer_svc);
     unsigned long now = jiffies;
     ktime_t now_ns = ktime_get();
 
@@ -351,14 +352,21 @@ static int timer_kthread(void *arg) {
     }
 
     if (wait_ms == 0) {
-      wait_event(timer_wait,
-                 __atomic_load_n(&timer_gen, __ATOMIC_ACQUIRE) != gen ||
-                     kthread_should_stop());
+      /* Nothing queued: idle out and let the next mod_timer() respawn us. */
+      (void)wait_event_timeout(timer_wait,
+                               kpi_service_gen(&timer_svc) != gen ||
+                                   kthread_should_stop(),
+                               msecs_to_jiffies(KPI_SERVICE_IDLE_MS));
+      if (kthread_should_stop()) {
+        kpi_service_forget(&timer_svc);
+        return 0;
+      }
+      if (kpi_service_retire(&timer_svc, gen))
+        return 0;
     } else {
-      wait_event_timeout(
+      (void)wait_event_timeout(
           timer_wait,
-          __atomic_load_n(&timer_gen, __ATOMIC_ACQUIRE) != gen ||
-              kthread_should_stop(),
+          kpi_service_gen(&timer_svc) != gen || kthread_should_stop(),
           wait_ms);
     }
   }
@@ -367,7 +375,5 @@ static int timer_kthread(void *arg) {
 void linuxkpi_timer_init(void) {
   init_waitqueue_head(&timer_wait);
   init_waitqueue_head(&timer_done_wq);
-  timer_task = kthread_run(timer_kthread, NULL, "ktimers");
-  if (IS_ERR(timer_task))
-    klog_puts("[WARN] LinuxKPI: ktimers thread creation failed\n");
+  kpi_service_init(&timer_svc, "ktimers", timer_kthread, NULL);
 }

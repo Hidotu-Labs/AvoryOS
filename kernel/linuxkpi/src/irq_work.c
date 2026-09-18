@@ -11,11 +11,13 @@
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 
+#include <linuxkpi/service.h>
+
 static DEFINE_SPINLOCK(irq_work_lock);
 static struct irq_work *irq_work_head;
 static struct irq_work *irq_work_tail;
 static struct wait_queue_head irq_work_wait;
-static struct task_struct *irq_work_task;
+static struct kpi_service irq_work_svc;
 
 void init_irq_work(struct irq_work *work, void (*func)(struct irq_work *)) {
   work->next = NULL;
@@ -44,8 +46,7 @@ bool irq_work_queue(struct irq_work *work) {
   }
   spin_unlock_irqrestore(&irq_work_lock, flags);
 
-  if (irq_work_task)
-    wake_up_process(irq_work_task);
+  kpi_service_kick(&irq_work_svc, true);
   return true;
 }
 
@@ -55,11 +56,22 @@ static int irq_work_kthread(void *arg) {
   for (;;) {
     unsigned long flags;
     struct irq_work *work;
+    unsigned int gen = kpi_service_gen(&irq_work_svc);
 
-    wait_event_interruptible(irq_work_wait,
-                             kthread_should_stop() || irq_work_head);
-    if (kthread_should_stop())
+    (void)wait_event_interruptible_timeout(
+        irq_work_wait, kthread_should_stop() || irq_work_head != NULL,
+        msecs_to_jiffies(KPI_SERVICE_IDLE_MS));
+
+    if (kthread_should_stop()) {
+      kpi_service_forget(&irq_work_svc);
       return 0;
+    }
+
+    if (!irq_work_head) {
+      if (kpi_service_retire(&irq_work_svc, gen))
+        return 0;
+      continue;
+    }
 
     spin_lock_irqsave(&irq_work_lock, flags);
     work = irq_work_head;
@@ -86,5 +98,5 @@ void irq_work_sync(struct irq_work *work) {
 
 void linuxkpi_irq_work_init(void) {
   init_waitqueue_head(&irq_work_wait);
-  irq_work_task = kthread_run(irq_work_kthread, NULL, "irq_work");
+  kpi_service_init(&irq_work_svc, "irq_work", irq_work_kthread, NULL);
 }

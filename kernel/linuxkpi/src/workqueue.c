@@ -12,6 +12,7 @@
 #include <linux/workqueue.h>
 
 #include <linuxkpi/log.h>
+#include <linuxkpi/service.h>
 
 #define KPI_WQ_MAX_WORKERS 4
 
@@ -22,8 +23,16 @@ struct workqueue_struct {
   struct wait_queue_head more_work;
   struct wait_queue_head flush_wait;
   unsigned int active; /* queued + running */
-  int nr_workers;
+  unsigned int gen;    /* bumped on every enqueue */
+  int max_workers;
+  unsigned int nr_workers; /* live workers */
   struct task_struct *workers[KPI_WQ_MAX_WORKERS];
+};
+
+/* Worker start record: which queue and which slot this thread owns. */
+struct wq_worker {
+  struct workqueue_struct *wq;
+  int idx;
 };
 
 struct workqueue_struct *system_wq;
@@ -34,14 +43,43 @@ struct workqueue_struct *system_power_efficient_wq;
 struct workqueue_struct *system_freezable_wq;
 
 static int worker_fn(void *arg) {
-  struct workqueue_struct *wq = arg;
+  struct wq_worker *wa = arg;
+  struct workqueue_struct *wq = wa->wq;
+  int idx = wa->idx;
+  kfree(wa);
 
   for (;;) {
-    wait_event(wq->more_work,
-               kthread_should_stop() || !list_empty(&wq->pending));
+    unsigned int gen = __atomic_load_n(&wq->gen, __ATOMIC_ACQUIRE);
+
+    (void)wait_event_timeout(wq->more_work,
+                             kthread_should_stop() ||
+                                 !list_empty(&wq->pending),
+                             msecs_to_jiffies(KPI_SERVICE_IDLE_MS));
 
     if (kthread_should_stop())
-      return 0;
+      break;
+
+    if (list_empty(&wq->pending)) {
+      /* Idle timeout: retire unless work was published since the sample.
+       * The slot clear and the generation check happen under the queue
+       * lock, so a concurrent __queue_work() either sees this worker alive
+       * or respawns one. */
+      bool idle;
+
+      spin_lock(&wq->lock);
+      idle = list_empty(&wq->pending) &&
+             __atomic_load_n(&wq->gen, __ATOMIC_ACQUIRE) == gen;
+      if (idle) {
+        wq->workers[idx] = NULL;
+        if (wq->nr_workers)
+          wq->nr_workers--;
+      }
+      spin_unlock(&wq->lock);
+
+      if (idle)
+        return 0; /* the next queue_work() creates a replacement */
+      continue;
+    }
 
     LIST_HEAD(batch);
 
@@ -68,6 +106,65 @@ static int worker_fn(void *arg) {
         __kpi_wake_up(&wq->flush_wait, 0, 0);
     }
   }
+
+  spin_lock(&wq->lock);
+  if (wq->workers[idx]) {
+    wq->workers[idx] = NULL;
+    if (wq->nr_workers)
+      wq->nr_workers--;
+  }
+  spin_unlock(&wq->lock);
+  return 0;
+}
+
+/* Create a replacement worker when the queue has none.  Called after work is
+ * enqueued; runs under the queue lock so a worker retiring concurrently
+ * either observes the new work or leaves its slot empty for us. */
+static void wq_ensure_worker(struct workqueue_struct *wq) {
+  spin_lock(&wq->lock);
+
+  if (wq->nr_workers > 0) {
+    /* Spawn extra help only when the queued+running work outnumbers the
+     * live workers; otherwise the existing ones already own it. */
+    bool need_more = wq->active > wq->nr_workers &&
+                     wq->nr_workers < (unsigned int)wq->max_workers;
+    if (!need_more) {
+      spin_unlock(&wq->lock);
+      return;
+    }
+  }
+
+  int idx = -1;
+  for (int i = 0; i < KPI_WQ_MAX_WORKERS; i++) {
+    if (!wq->workers[i]) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx < 0) {
+    spin_unlock(&wq->lock);
+    return;
+  }
+
+  struct wq_worker *wa = kmalloc(sizeof(*wa), GFP_KERNEL);
+  if (!wa) {
+    spin_unlock(&wq->lock);
+    return;
+  }
+  wa->wq = wq;
+  wa->idx = idx;
+
+  struct task_struct *t =
+      kthread_create(worker_fn, wa, "kworker/%s", wq->name);
+  if (IS_ERR(t)) {
+    kfree(wa);
+  } else {
+    wq->workers[idx] = t;
+    wq->nr_workers++;
+    wake_up_process(t);
+  }
+
+  spin_unlock(&wq->lock);
 }
 
 static bool __queue_work(struct workqueue_struct *wq, struct work_struct *work) {
@@ -81,11 +178,13 @@ static bool __queue_work(struct workqueue_struct *wq, struct work_struct *work) 
   work->pending = 1;
   work->wq = wq;
   wq->active++;
+  wq->gen++;
   list_add_tail(&work->entry, &wq->pending);
 
   spin_unlock(&wq->lock);
 
   __kpi_wake_up(&wq->more_work, 1, 0);
+  wq_ensure_worker(wq);
   return true;
 }
 
@@ -252,19 +351,24 @@ struct workqueue_struct *alloc_workqueue(const char *fmt, unsigned int flags,
     max_active = 1;
   if (max_active > KPI_WQ_MAX_WORKERS)
     max_active = KPI_WQ_MAX_WORKERS;
-  wq->nr_workers = max_active;
-
-  for (int i = 0; i < wq->nr_workers; i++) {
-    wq->workers[i] = kthread_run(worker_fn, wq, "kworker/%s", wq->name);
-  }
+  wq->max_workers = max_active;
+  /* Workers are created on demand by wq_ensure_worker() and retire after an
+   * idle timeout, so an unused queue costs no thread. */
 
   return wq;
 }
 
 void destroy_workqueue(struct workqueue_struct *wq) {
-  for (int i = 0; i < wq->nr_workers; i++) {
-    if (wq->workers[i])
-      kthread_stop(wq->workers[i]);
+  for (int i = 0; i < KPI_WQ_MAX_WORKERS; i++) {
+    struct task_struct *t;
+
+    spin_lock(&wq->lock);
+    t = wq->workers[i];
+    wq->workers[i] = NULL;
+    spin_unlock(&wq->lock);
+
+    if (t)
+      kthread_stop(t);
   }
   kfree(wq->name);
   kfree(wq);

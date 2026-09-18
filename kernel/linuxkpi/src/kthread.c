@@ -18,6 +18,7 @@
 
 #include <linuxkpi/log.h>
 #include <linuxkpi/native_sched.h>
+#include <linuxkpi/service.h>
 
 #define KPI_KTHREAD_MAGIC 0x4b544852u /* "KTHR" */
 
@@ -172,10 +173,27 @@ void kthread_init_worker(struct kthread_worker *worker) {
   init_waitqueue_head(&worker->wait_idle);
   worker->should_stop = 0;
   worker->task = NULL;
+  worker->name[0] = '\0';
 }
 
 static bool kthread_worker_idle(struct kthread_worker *worker) {
   return list_empty(&worker->work_list) && !worker->current_work;
+}
+
+/* Create the worker thread for @worker if none is live; called from
+ * kthread_queue_work() after the work is linked, under worker->lock so a
+ * concurrently retiring worker either sees the work or leaves task NULL. */
+static void kthread_worker_spawn(struct kthread_worker *worker) {
+  spin_lock(&worker->lock);
+  if (!worker->task) {
+    struct task_struct *t =
+        kthread_create(kthread_worker_fn, worker, "%s", worker->name);
+    if (!IS_ERR(t)) {
+      worker->task = t;
+      wake_up_process(t);
+    }
+  }
+  spin_unlock(&worker->lock);
 }
 
 int kthread_worker_fn(void *worker_ptr) {
@@ -183,17 +201,23 @@ int kthread_worker_fn(void *worker_ptr) {
   struct kthread_work *work;
 
   for (;;) {
-    wait_event(worker->wait,
-               worker->should_stop || !list_empty(&worker->work_list));
+    (void)wait_event_timeout(worker->wait,
+                             worker->should_stop ||
+                                 !list_empty(&worker->work_list),
+                             msecs_to_jiffies(KPI_SERVICE_IDLE_MS));
 
     spin_lock(&worker->lock);
     if (worker->should_stop && list_empty(&worker->work_list)) {
+      worker->task = NULL;
       spin_unlock(&worker->lock);
       break;
     }
     if (list_empty(&worker->work_list)) {
+      /* Idle timeout with nothing queued: retire; the next
+       * kthread_queue_work() spawns a replacement. */
+      worker->task = NULL;
       spin_unlock(&worker->lock);
-      continue;
+      return 0;
     }
     work = list_first_entry(&worker->work_list, struct kthread_work, node);
     list_del_init(&work->node);
@@ -217,6 +241,7 @@ int kthread_worker_fn(void *worker_ptr) {
 bool kthread_queue_work(struct kthread_worker *worker,
                         struct kthread_work *work) {
   bool ret = false;
+  bool spawn;
 
   spin_lock(&worker->lock);
   if (!work->queued) {
@@ -226,7 +251,11 @@ bool kthread_queue_work(struct kthread_worker *worker,
     list_add_tail(&work->node, &worker->work_list);
     ret = true;
   }
+  spawn = (worker->task == NULL);
   spin_unlock(&worker->lock);
+
+  if (spawn)
+    kthread_worker_spawn(worker);
 
   if (ret)
     wake_up(&worker->wait);
@@ -265,7 +294,6 @@ bool kthread_cancel_work_sync(struct kthread_work *work) {
 struct kthread_worker *kthread_create_worker_on_cpu(int cpu, unsigned int flags,
                                                     const char namefmt[], ...) {
   struct kthread_worker *worker;
-  struct task_struct *task;
   char name[16];
   va_list args;
 
@@ -280,21 +308,17 @@ struct kthread_worker *kthread_create_worker_on_cpu(int cpu, unsigned int flags,
   va_start(args, namefmt);
   vsnprintf(name, sizeof(name), namefmt, args);
   va_end(args);
+  __builtin_strncpy(worker->name, name, sizeof(worker->name) - 1);
+  worker->name[sizeof(worker->name) - 1] = '\0';
 
-  task = kthread_create(kthread_worker_fn, worker, "%s", name);
-  if (IS_ERR(task)) {
-    kfree(worker);
-    return ERR_CAST(task);
-  }
-  worker->task = task;
-  wake_up_process(task);
+  /* No thread until the first kthread_queue_work(): an unused worker costs
+   * nothing, and an idle one retires after KPI_SERVICE_IDLE_MS. */
   return worker;
 }
 
 struct kthread_worker *kthread_create_worker(unsigned int flags,
                                              const char namefmt[], ...) {
   struct kthread_worker *worker;
-  struct task_struct *task;
   char name[16];
   va_list args;
 
@@ -308,27 +332,28 @@ struct kthread_worker *kthread_create_worker(unsigned int flags,
   va_start(args, namefmt);
   vsnprintf(name, sizeof(name), namefmt, args);
   va_end(args);
+  __builtin_strncpy(worker->name, name, sizeof(worker->name) - 1);
+  worker->name[sizeof(worker->name) - 1] = '\0';
 
-  task = kthread_create(kthread_worker_fn, worker, "%s", name);
-  if (IS_ERR(task)) {
-    kfree(worker);
-    return ERR_CAST(task);
-  }
-  worker->task = task;
-  wake_up_process(task);
   return worker;
 }
 
 void kthread_destroy_worker(struct kthread_worker *worker) {
+  struct task_struct *task;
+
   if (!worker)
     return;
-  if (worker->task) {
-    kthread_flush_worker(worker);
-    spin_lock(&worker->lock);
-    worker->should_stop = 1;
-    spin_unlock(&worker->lock);
-    kthread_stop(worker->task);
-  }
+
+  /* Stop first and detach the task so a concurrent queue cannot mistake the
+   * retiring worker for a live one. */
+  spin_lock(&worker->lock);
+  worker->should_stop = 1;
+  task = worker->task;
+  worker->task = NULL;
+  spin_unlock(&worker->lock);
+
+  if (task)
+    kthread_stop(task);
   kfree(worker);
 }
 
