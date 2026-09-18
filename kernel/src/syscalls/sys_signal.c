@@ -556,6 +556,16 @@ void signal_deliver(struct registers *regs) {
       return;
     klog_puts("[SIGNAL] Default action (terminate) for sig ");
     klog_uint64(sig);
+    klog_puts(" comm=");
+    klog_puts(current->comm);
+    klog_puts(" tid=");
+    klog_uint64(current->tid);
+    klog_puts(" rip=");
+    klog_uint64(regs->rip);
+    klog_puts(" rsp=");
+    klog_uint64(regs->rsp);
+    klog_puts(" rax=");
+    klog_uint64(regs->rax);
     klog_puts("\n");
 
     // Print full registers, backtrace, and memory inspection only for fatal crash signals

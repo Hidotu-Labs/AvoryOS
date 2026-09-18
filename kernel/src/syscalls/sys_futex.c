@@ -349,12 +349,14 @@ static uint64_t futex_wait(uint32_t *uaddr, uint32_t val,
 static inline uint64_t futex_wake_key(struct futex_key key, uint32_t val, uint32_t bitset) {
   uint32_t bucket = futex_hash_key(key);
 
-  // Fast path: if no waiters exist in this hash bucket, skip spinlock acquisition
-  if (__builtin_expect(!futex_hash[bucket].head, 1)) {
-    futex_bucket_note(bucket, false);
-    return 0;
-  }
-
+  /*
+   * The waiter checks the user value and enqueues itself while holding the
+   * bucket lock, so a lockless "is the list empty?" probe is not safe: the
+   * waker can publish its new user value, read the still-empty list, and
+   * return before the waiter (which read the old value just before the
+   * store became visible) enqueues and parks.  That interleaving loses the
+   * wakeup permanently.  Take the lock for every wake instead.
+   */
   uint32_t woken = 0;
   spinlock_acquire(&futex_hash[bucket].lock);
   struct futex_waiter **pp = &futex_hash[bucket].head;

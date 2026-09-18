@@ -197,7 +197,10 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
     size_t head      = usk->recv_buf_head;
     size_t tail      = usk->recv_buf_tail;
     size_t old_size  = usk->recv_buf_size;
-    size_t available = (tail - head + old_size) % old_size;
+    /* A socket that has not allocated its receive ring yet reports size 0;
+     * dividing by it is a hard #DE in the kernel (plasmashell hits this with
+     * SO_RCVBUF right after startup). */
+    size_t available = old_size ? (tail - head + old_size) % old_size : 0;
 
     size_t keep = available < (size_t)val ? available : (size_t)val;
     unix_ring_consume(usk->recv_buf, old_size, head, new_buf, keep);
