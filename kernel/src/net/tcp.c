@@ -1369,7 +1369,29 @@ static size_t ooo_drain_locked(struct tcp_tcb *t)
     size_t total = 0;
     for (;;) {
         struct tcp_ooo_seg *s = t->ooo_head;
-        if (!s || s->seq != t->rcv_nxt)
+        if (!s)
+            break;
+
+        /* An in-order segment can cover bytes that were already queued here
+         * (a coalesced retransmission, for example).  Drop or trim the stale
+         * prefix first, otherwise the queue head stays below rcv_nxt and no
+         * later segment ever drains. */
+        if (seq_lt(s->seq, t->rcv_nxt)) {
+            uint32_t skip = t->rcv_nxt - s->seq;
+            if (skip >= s->len) {
+                t->ooo_head = s->next;
+                t->ooo_count--;
+                t->ooo_bytes -= s->len;
+                kfree(s);
+                continue;
+            }
+            memmove(s->data, s->data + skip, (size_t)s->len - skip);
+            s->seq = t->rcv_nxt;
+            s->len = (uint16_t)(s->len - skip);
+            t->ooo_bytes -= skip;
+        }
+
+        if (s->seq != t->rcv_nxt)
             break;
         size_t used = t->rx_head - t->rx_tail;
         size_t space = used < t->rx_capacity ? (t->rx_capacity - used) : 0;
@@ -1596,6 +1618,19 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
     }
 
     if (flags & RST) {
+        /* RFC 5961: only accept a reset that is in the receive window.  A
+         * stale reset from an earlier incarnation of the same 4-tuple must
+         * not tear down the live connection. */
+        bool acceptable;
+        if (t->state == TCP_SYN_SENT)
+            acceptable = (flags & ACK) && ack == t->snd_nxt;
+        else
+            acceptable = seq == t->rcv_nxt;
+        if (!acceptable) {
+            stats.duplicates++;
+            act->send_ack = true;   /* challenge ACK */
+            return;
+        }
         t->error = t->state == TCP_SYN_SENT ? 111 : 104;
         t->state = TCP_RESET;
         t->deadline = 0;
@@ -1729,20 +1764,31 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
     }
 
     if (flags & FIN) {
-        t->rcv_nxt++;
-        t->peer_closed = true;
+        /* The FIN sequence number is seq+len.  Only accept it when it is the
+         * next byte in the stream: an out-of-order FIN would otherwise skip
+         * the missing gap, advance rcv_nxt past it and silently truncate the
+         * peer's data. */
+        if (!t->peer_closed && t->rcv_nxt == seq + (uint32_t)len) {
+            t->rcv_nxt++;
+            t->peer_closed = true;
 
-        if (t->state == TCP_ESTABLISHED) {
-            t->state = TCP_CLOSE_WAIT;
-            t->deadline = 0;
-            t->retries = 0;
-        } else {
-            t->state = TCP_TIME_WAIT;
-            t->deadline = now + TCP_TIME_WAIT_TIMEOUT_MS;
+            if (t->state == TCP_ESTABLISHED) {
+                t->state = TCP_CLOSE_WAIT;
+                t->deadline = 0;
+                t->retries = 0;
+            } else {
+                t->state = TCP_TIME_WAIT;
+                t->deadline = now + TCP_TIME_WAIT_TIMEOUT_MS;
+            }
+
+            act->send_ack = true;
+            wake(t);
+        } else if (!t->peer_closed && t->ooo_ack_count < 8) {
+            /* Gap before the FIN: ACK now so the peer retransmits the hole
+             * instead of waiting for its retransmission timeout. */
+            act->send_ack = true;
+            t->ooo_ack_count++;
         }
-
-        act->send_ack = true;
-        wake(t);
     }
 }
 
@@ -2099,10 +2145,12 @@ void tcp_timer_tick(uint64_t now)
 
         if (t->persist_deadline && now >= t->persist_deadline &&
             t->state == TCP_ESTABLISHED && seq_lt(t->snd_nxt, t->tx_head)) {
+            /* Window is (still) zero: send a 1-byte-before probe so a lost
+             * window update cannot leave the connection stalled forever. */
             if (nw < TCP_TIMER_WORK_MAX) {
                 work[nw].t = t;
                 work[nw].seq = 0;
-                work[nw].kind = WORK_OUTPUT;
+                work[nw].kind = WORK_PROBE;
                 t->refs++;
                 nw++;
             }
