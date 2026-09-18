@@ -3,6 +3,11 @@
 .DEFAULT_GOAL := all
 
 ARCH := x86_64
+# QEMU audio backend latency (microseconds).  The guest HDA driver targets tens
+# of milliseconds end to end, so a 500 ms host backend would swamp it.  Raise
+# AUDIO_LATENCY/AUDIO_BUFLEN if the host audio crackles on a loaded machine.
+AUDIO_LATENCY ?= 50000
+AUDIO_BUFLEN ?= 100000
 QEMUFLAGS := -m 4G \
 	-vga none \
 	-device virtio-vga,xres=1280,yres=800 \
@@ -232,7 +237,7 @@ run: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-cpu host -enable-kvm \
 		-smp 4 \
 		-serial stdio \
-		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=500000,out.latency=500000 \
+		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
 		-device rtl8139,netdev=net0 \
 		-netdev user,id=net0 \
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
@@ -275,7 +280,7 @@ run-linuxdrm: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-device bochs-display \
 		$(DISPLAY_OPT) \
 		-device edu \
-		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=500000,out.latency=500000 \
+		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
 		-device rtl8139,netdev=net0 \
 		-netdev user,id=net0 \
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
@@ -424,7 +429,7 @@ run-x86_64: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-device nvme,serial=avoryos0,drive=nvme0 \
 		-smp 4 \
 		-serial stdio \
-		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=500000,out.latency=500000 \
+		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
 		-device rtl8139,netdev=net0 \
 		-netdev user,id=net0 \
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
@@ -446,7 +451,7 @@ run-sata: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-cpu host -enable-kvm \
 		-smp 4 \
 		-serial stdio \
-		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=500000,out.latency=500000 \
+		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
 		-device rtl8139,netdev=net0 \
 		-netdev user,id=net0 \
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
@@ -463,7 +468,7 @@ run-sata-tcg: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-drive file=disk.img,format=raw,if=none,id=disk0 -device ide-hd,drive=disk0,bus=ide.0 \
 		-smp 4 \
 		-serial stdio \
-		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=500000,out.latency=500000 \
+		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
 		-device rtl8139,netdev=net0 \
 		-netdev user,id=net0 \
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
@@ -1355,6 +1360,11 @@ $(IMAGE_NAME).iso: limine/limine kernel limine.conf build/kernel_cmdline.stamp
 	rm -rf iso_root
 	mkdir -p iso_root/boot
 	cp -v kernel/bin-$(ARCH)/kernel iso_root/boot/
+	# Ship a stripped copy.  The build ELF carries ~95 MB of debug info that
+	# addr2line/GDB use against kernel/bin-$(ARCH)/kernel; nothing at runtime
+	# reads it, and Limine only loads the PT_LOAD segments.  Stripping the
+	# copy keeps the ISO small without losing post-mortem symbolization.
+	strip --strip-all iso_root/boot/kernel
 	mkdir -p iso_root/boot/limine
 	# The regular ISO expects disk.img as a separate QEMU drive. Only the
 	# self-contained dist ISO copies the module-enabled configuration verbatim.

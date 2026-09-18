@@ -71,8 +71,9 @@ dd if=disk.img  of="$SHRUNK_DISK" bs=512 count=2048  status=none
 dd if="$TMPPART" of="$SHRUNK_DISK" bs=512 seek=2048  status=none conv=notrunc
 rm -f "$TMPPART"; TMPPART=""
 
-# Kernel
+# Kernel (stripped; the unstripped build ELF stays in kernel/bin-${ARCH}/)
 cp -v "kernel/bin-${ARCH}/kernel"   "$ISO_ROOT/boot/"
+strip --strip-all "$ISO_ROOT/boot/kernel"
 
 # Limine loads the embedded disk image as a boot module. The kernel's ramdisk
 # driver locates it by the module string/path and exposes its first partition.
