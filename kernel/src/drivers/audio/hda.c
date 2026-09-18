@@ -19,10 +19,20 @@
 #include "../../sched/wait.h"
 #include "../pci/pci.h"
 
-// Number of cyclic DMA buffers and buffer size (16 cyclic buffers = 64KB DMA ring, ~370ms lookahead)
-#define HDA_BDL_ENTRIES 16
-#define HDA_BUFFER_SIZE 4096 // 4KB per buffer (~23.2ms @ 44.1kHz / ~21.3ms @ 48kHz 16-bit stereo)
-#define HDA_RING_SIZE   (512 * 1024) // 512KB ring buffer (~3.0s under heavy load)
+// Cyclic DMA ring.  The whole ring is hardware look-ahead: every byte written
+// is only audible once the ring has drained behind it, so keep it to a few
+// short periods (4 x 2 KiB = 8 KiB, ~42.7 ms @ 48 kHz 16-bit stereo).
+#define HDA_BDL_ENTRIES 4
+#define HDA_BUFFER_SIZE 2048 // one period: ~10.7 ms @ 48 kHz / ~11.6 ms @ 44.1 kHz
+#define HDA_HW_BYTES    (HDA_BDL_ENTRIES * HDA_BUFFER_SIZE)
+
+// Cap on bytes in flight (software ring + DMA ring).  hda_write_pcm() blocks at
+// this point instead of letting an application fill the whole staging ring, so
+// queued audio cannot run seconds ahead of the DAC.  8 x 2 KiB ≈ 85 ms.
+#define HDA_DEFAULT_QUEUE_BYTES (8 * HDA_BUFFER_SIZE)
+#define HDA_MIN_QUEUE_BYTES     (HDA_HW_BYTES + HDA_BUFFER_SIZE)
+
+#define HDA_RING_SIZE   (512 * 1024) // staging ring; latency bounded by the queue cap
 
 // Hardware PCI & Base MMIO
 static struct pci_device *hda_pci = NULL;
@@ -36,6 +46,7 @@ static uint32_t hda_stream_offset = 0; // Stream 0 MMIO offset
 static uint8_t active_codec = 0;
 static uint8_t active_dac_nid = 0;
 static uint8_t active_pin_nid = 0;
+static uint32_t active_dac_pcm_caps = 0; // HDA_PARAM_PCM_SIZE_RATE of the DAC
 
 // Active Stream Format
 static uint32_t current_sample_rate = 48000;
@@ -47,8 +58,30 @@ static struct hda_bdl_entry *hda_bdl = NULL;
 static uint64_t hda_bdl_phys = 0;
 static uint8_t *hda_buffers[HDA_BDL_ENTRIES];
 static uint64_t hda_buffers_phys[HDA_BDL_ENTRIES];
-static volatile uint8_t hda_refill_idx = 0;
 static volatile uint32_t hda_underflow_count = 0;
+// Real audio bytes sitting in the DMA ring that have not played out yet, plus
+// per-slot accounting so silence padding never inflates the delay figure.
+static volatile uint32_t hda_dma_pending = 0;
+static uint16_t hda_slot_bytes[HDA_BDL_ENTRIES];
+
+// LPIB-driven DMA bookkeeping.  hda_lpib_pos counts bytes played since the
+// stream started, hda_refill_pos counts descriptors reprogrammed since then,
+// and hda_last_lpib is the raw ring offset at the previous service call.
+static volatile uint32_t hda_last_lpib = 0;
+static volatile uint64_t hda_lpib_pos = 0;
+static volatile uint64_t hda_refill_pos = 0;
+static volatile uint8_t  hda_playing_desc = 0;
+
+// Adaptive queue headroom.  After an underrun the cap doubles so a starved
+// application can stay further ahead, then decays back once playback has been
+// clean for a while.  Keeps idle latency low without sizzling under load.
+#define HDA_SAFETY_MAX_SCALE 4
+#define HDA_MAX_QUEUE_BYTES  (128 * 1024)
+static uint32_t hda_queue_base = HDA_DEFAULT_QUEUE_BYTES;
+static uint32_t hda_safety_scale = 1;
+static volatile uint64_t hda_last_underrun_ms = 0;
+static uint32_t hda_last_grow_ms = 0;
+static volatile uint32_t hda_queue_limit = HDA_DEFAULT_QUEUE_BYTES;
 
 // Kernel Audio Ring Buffer
 static uint8_t *hda_ring = NULL;
@@ -61,6 +94,8 @@ static volatile uint32_t total_played_blocks = 0;
 
 // Wait Queue for blocking writes & poll
 static wait_queue_t hda_wait_queue;
+// Invoked from the ISR so upper layers can refill the queue (ALSA mmap path).
+static void (*hda_tick_callback)(void) = NULL;
 
 // MMIO Access Helpers
 static inline uint8_t hda_read8(uint32_t reg) {
@@ -191,13 +226,15 @@ static uint16_t hda_compute_format(uint32_t rate, uint8_t channels, uint8_t bits
     } else if (rate == 192000) {
         fmt |= (3U << 11);
     } else if (rate == 32000) {
-        fmt |= (2U << 8);
+        fmt |= (1U << 11) | (2U << 8); // 48 kHz * 2/3
     }
 
+    // Sample size codes (HDA spec / AC_FMT_BITS_*): 0 = 8, 1 = 16, 2 = 20,
+    // 3 = 24, 4 = 32 bits.
     if (bits == 24) {
-        fmt |= (4U << 4);
+        fmt |= (3U << 4);
     } else if (bits == 32) {
-        fmt |= (5U << 4);
+        fmt |= (4U << 4);
     } else if (bits == 8) {
         fmt |= (0U << 4);
     } else {
@@ -231,34 +268,161 @@ static void hda_apply_format(uint32_t rate, uint8_t channels, uint8_t bits) {
     }
 }
 
-// Initial Audio Pump: fills DMA buffers at stream launch
-static void hda_pump_audio(void) {
+// Copy up to HDA_BUFFER_SIZE bytes from the software ring into one DMA slot
+// and return how many real audio bytes went in; the tail is padded with
+// silence.  A partial chunk is copied greedily instead of being left in the
+// ring, so the last bytes of a write are not stranded behind a whole period.
+static uint32_t hda_fill_dma_slot(uint8_t *dst) {
+    uint32_t chunk = ring_count;
+    if (chunk > HDA_BUFFER_SIZE) {
+        chunk = HDA_BUFFER_SIZE;
+    }
+    chunk &= ~3U; // keep 4-byte sample alignment
+
+    if (chunk == 0) {
+        memset(dst, 0, HDA_BUFFER_SIZE);
+        return 0;
+    }
+
+    uint32_t unread1 = HDA_RING_SIZE - ring_tail;
+    if (chunk <= unread1) {
+        memcpy(dst, hda_ring + ring_tail, chunk);
+        ring_tail = (ring_tail + chunk) % HDA_RING_SIZE;
+    } else {
+        memcpy(dst, hda_ring + ring_tail, unread1);
+        uint32_t rem = chunk - unread1;
+        memcpy(dst + unread1, hda_ring, rem);
+        ring_tail = rem;
+    }
+    if (chunk < HDA_BUFFER_SIZE) {
+        memset(dst + chunk, 0, HDA_BUFFER_SIZE - chunk);
+    }
+    ring_count -= chunk;
+    return chunk;
+}
+
+// Effective queue cap = client-requested base x adaptive safety scale.
+static void hda_apply_queue_limit(void) {
+    uint64_t limit = (uint64_t)hda_queue_base * hda_safety_scale;
+    if (limit > HDA_MAX_QUEUE_BYTES) {
+        limit = HDA_MAX_QUEUE_BYTES;
+    }
+    if (limit > HDA_RING_SIZE) {
+        limit = HDA_RING_SIZE;
+    }
+    hda_queue_limit = (uint32_t)limit;
+}
+
+// Called whenever a descriptor had to be padded with silence: grow the
+// headroom so a starved writer can rebuild its lead (at most every 500 ms).
+static void hda_note_underrun(void) {
+    uint64_t now = lapic_timer_get_ticks();
+    hda_last_underrun_ms = now;
+    if (hda_safety_scale >= HDA_SAFETY_MAX_SCALE) {
+        return;
+    }
+    if (now - hda_last_grow_ms < 500) {
+        return;
+    }
+    hda_last_grow_ms = (uint32_t)now;
+    hda_safety_scale *= 2;
+    hda_apply_queue_limit();
+}
+
+// Decay the extra headroom once playback has been clean for a few seconds.
+static void hda_safety_tick(void) {
+    if (hda_safety_scale <= 1 || !hda_last_underrun_ms) {
+        return;
+    }
+    uint64_t now = lapic_timer_get_ticks();
+    if (now - hda_last_underrun_ms > 3000) {
+        hda_safety_scale >>= 1;
+        hda_apply_queue_limit();
+        hda_last_underrun_ms = now; // next step another 3 s of clean playback
+    }
+}
+
+// Prime every descriptor from the staging ring and start the DMA engine.
+// RUN 0->1 restarts the DMA at BDL entry 0: the controller re-parses the BDL
+// and clears LPIB (QEMU's intel_hda_parse_bdl() does exactly this, and the
+// previous refill code relied on it).  Never seed the rotation from the frozen
+// LPIB left by a previous run -- that shifts every refill by one or more
+// descriptors and overwrites slots the DAC has not played yet, which drops
+// whole periods and makes playback stutter.
+static void hda_start_stream(void) {
     if (!hda_present)
         return;
 
-    for (int i = 0; i < HDA_BDL_ENTRIES; i++) {
-        uint8_t *dst = hda_buffers[i];
+    hda_last_lpib = 0;
+    hda_lpib_pos = 0;
+    hda_refill_pos = 0;
+    hda_playing_desc = 0;
+    hda_underflow_count = 0;
 
-        if (ring_count >= HDA_BUFFER_SIZE) {
-            uint32_t chunk = HDA_BUFFER_SIZE;
-            uint32_t unread1 = HDA_RING_SIZE - ring_tail;
-            if (chunk <= unread1) {
-                memcpy(dst, hda_ring + ring_tail, chunk);
-                ring_tail = (ring_tail + chunk) % HDA_RING_SIZE;
-            } else {
-                memcpy(dst, hda_ring + ring_tail, unread1);
-                uint32_t rem = chunk - unread1;
-                memcpy(dst + unread1, hda_ring, rem);
-                ring_tail = rem;
-            }
-            ring_count -= chunk;
-            total_played_bytes += chunk;
-            total_played_blocks = (uint32_t)(total_played_bytes / HDA_BUFFER_SIZE);
-        } else {
-            memset(dst, 0, HDA_BUFFER_SIZE);
-        }
+    uint32_t pending = 0;
+    for (int i = 0; i < HDA_BDL_ENTRIES; i++) {
+        uint32_t copied = hda_fill_dma_slot(hda_buffers[i]);
+        hda_slot_bytes[i] = (uint16_t)copied;
+        pending += copied;
     }
-    hda_refill_idx = 0;
+    hda_dma_pending = pending;
+
+    uint8_t ctl = hda_sd_read8(HDA_SD_CTL);
+    hda_sd_write8(HDA_SD_CTL, ctl | HDA_SD_CTL_RUN | HDA_SD_CTL_IOCE |
+                              HDA_SD_CTL_FEIE | HDA_SD_CTL_DEIE);
+    hda_is_playing = true;
+}
+
+// Program every descriptor the DAC has finished since the last call.  LPIB is
+// authoritative, so a delayed or coalesced completion interrupt can never make
+// the driver overwrite the descriptor currently being played -- which is what
+// turns a busy system into permanent sizzle.  Must run with IRQs disabled.
+static void hda_service_descriptors(void) {
+    uint32_t lpib = hda_sd_read32(HDA_SD_LPIB) % HDA_HW_BYTES;
+    uint32_t delta = (lpib + HDA_HW_BYTES - hda_last_lpib) % HDA_HW_BYTES;
+    hda_last_lpib = lpib;
+
+    if (delta) {
+        hda_lpib_pos += delta;
+        total_played_bytes += delta;
+        total_played_blocks = (uint32_t)(total_played_bytes / HDA_BUFFER_SIZE);
+    }
+
+    uint64_t completed = hda_lpib_pos / HDA_BUFFER_SIZE;
+    int refills = 0;
+    while (hda_refill_pos < completed && refills < HDA_BDL_ENTRIES) {
+        uint8_t slot = (uint8_t)((hda_playing_desc + hda_refill_pos) % HDA_BDL_ENTRIES);
+
+        // The slot's old contents are behind the DAC now.
+        if (hda_dma_pending >= hda_slot_bytes[slot]) {
+            hda_dma_pending -= hda_slot_bytes[slot];
+        } else {
+            hda_dma_pending = 0;
+        }
+
+        uint32_t copied = hda_fill_dma_slot(hda_buffers[slot]);
+        hda_slot_bytes[slot] = (uint16_t)copied;
+        hda_dma_pending += copied;
+
+        if (copied) {
+            hda_underflow_count = 0;
+        } else {
+            hda_underflow_count++;
+            hda_note_underrun();
+        }
+        hda_refill_pos++;
+        refills++;
+    }
+
+    if (hda_underflow_count >= HDA_BDL_ENTRIES) {
+        // Whole ring drained to silence: stop the engine until data arrives.
+        uint8_t ctl = hda_sd_read8(HDA_SD_CTL);
+        hda_sd_write8(HDA_SD_CTL, ctl & ~HDA_SD_CTL_RUN);
+        hda_is_playing = false;
+        hda_underflow_count = 0;
+        hda_dma_pending = 0;
+        memset(hda_slot_bytes, 0, sizeof(hda_slot_bytes));
+    }
 }
 
 // Hardware Interrupt Service Routine
@@ -281,41 +445,13 @@ static void hda_isr(struct registers *regs) {
     hda_sd_write8(HDA_SD_STS, sts);
 
     if (sts & HDA_SD_STS_BCIS) {
-        uint8_t slot = hda_refill_idx;
-        hda_refill_idx = (slot + 1) % HDA_BDL_ENTRIES;
-
-        uint8_t *dst = hda_buffers[slot];
-
-        if (ring_count >= HDA_BUFFER_SIZE) {
-            hda_underflow_count = 0;
-            uint32_t chunk = HDA_BUFFER_SIZE;
-            uint32_t unread1 = HDA_RING_SIZE - ring_tail;
-            if (chunk <= unread1) {
-                memcpy(dst, hda_ring + ring_tail, chunk);
-                ring_tail = (ring_tail + chunk) % HDA_RING_SIZE;
-            } else {
-                memcpy(dst, hda_ring + ring_tail, unread1);
-                uint32_t rem = chunk - unread1;
-                memcpy(dst + unread1, hda_ring, rem);
-                ring_tail = rem;
-            }
-            ring_count -= chunk;
-            total_played_bytes += chunk;
-            total_played_blocks = (uint32_t)(total_played_bytes / HDA_BUFFER_SIZE);
-        } else {
-            // Underflow: pad slot with silence without advancing unaligned user data
-            memset(dst, 0, HDA_BUFFER_SIZE);
-            hda_underflow_count++;
-            if (hda_underflow_count >= HDA_BDL_ENTRIES) {
-                // All DMA buffers drained to silence; stop DMA engine so next write restarts cleanly at buffer 0!
-                uint8_t ctl0 = hda_sd_read8(HDA_SD_CTL);
-                hda_sd_write8(HDA_SD_CTL, ctl0 & ~HDA_SD_CTL_RUN);
-                hda_is_playing = false;
-                hda_refill_idx = 0;
-                hda_underflow_count = 0;
-            }
+        if (hda_is_playing) {
+            hda_service_descriptors();
+            hda_safety_tick();
         }
-
+        if (hda_tick_callback) {
+            hda_tick_callback();
+        }
         // Wake all threads blocked on wait_queue / poll
         wait_queue_wake_all(&hda_wait_queue);
     }
@@ -385,6 +521,28 @@ static bool hda_setup_codec(void) {
 
     if (!active_dac_nid) active_dac_nid = 0x02;
     if (!active_pin_nid) active_pin_nid = 0x03;
+
+    // Ask the codec which PCM sizes/rates the DAC can actually render.  The
+    // ALSA layer uses this so it never advertises a format the hardware would
+    // misinterpret (float or 32-bit on a 16-bit-only codec sounds like noise).
+    uint32_t dac_cap = hda_exec_verb(active_codec, active_dac_nid,
+                                     HDA_VERB_GET_PARAM, HDA_PARAM_AUDIO_WIDGET_CAP);
+    uint32_t pcm_caps = 0;
+    if (dac_cap & (1U << 4)) { // Format Override: widget reports its own caps
+        pcm_caps = hda_exec_verb(active_codec, active_dac_nid,
+                                 HDA_VERB_GET_PARAM, HDA_PARAM_PCM_SIZE_RATE);
+    }
+    if (!pcm_caps || pcm_caps == 0xFFFFFFFF) {
+        pcm_caps = hda_exec_verb(active_codec, afg_nid,
+                                 HDA_VERB_GET_PARAM, HDA_PARAM_PCM_SIZE_RATE);
+    }
+    if (!pcm_caps || pcm_caps == 0xFFFFFFFF) {
+        pcm_caps = (1U << 17); // assume 16-bit
+    }
+    active_dac_pcm_caps = pcm_caps;
+    klog_puts("[HDA] DAC PCM caps: ");
+    klog_hex32(active_dac_pcm_caps);
+    klog_puts("\n");
 
     // Configure Pin Complex: Enable Output + EAPD + 0dB Gain
     hda_exec_verb(active_codec, active_pin_nid, HDA_VERB_SET_PIN_WIDGET_CTRL, 0x40); // Pin Out Enable
@@ -537,6 +695,20 @@ bool hda_is_present(void) {
     return hda_present;
 }
 
+// HDA_PARAM_PCM_SIZE_RATE of the active DAC (0 if unknown).
+bool hda_get_pcm_caps(uint32_t *caps) {
+    if (!hda_present || !caps || !active_dac_pcm_caps) {
+        return false;
+    }
+    *caps = active_dac_pcm_caps;
+    return true;
+}
+
+// Bytes not yet played out of the speaker: software ring + DMA ring.
+static inline uint32_t hda_inflight_bytes(void) {
+    return ring_count + hda_dma_pending;
+}
+
 // PCM Write with Blocking Wait Queue
 uint32_t hda_write_pcm(const void *buffer, uint32_t bytes, uint32_t rate, uint8_t channels, uint8_t bits) {
     if (!hda_present || !buffer || bytes == 0)
@@ -554,7 +726,7 @@ uint32_t hda_write_pcm(const void *buffer, uint32_t bytes, uint32_t rate, uint8_
 
     while (written < bytes) {
         hal_irq_disable();
-        while ((HDA_RING_SIZE - ring_count) < 4) {
+        while (hda_inflight_bytes() + 4 > hda_queue_limit) {
             wait_queue_entry_t wq_entry;
             struct thread *t = sched_get_current();
             if (t) {
@@ -582,7 +754,10 @@ uint32_t hda_write_pcm(const void *buffer, uint32_t bytes, uint32_t rate, uint8_
             }
         }
 
-        uint32_t space = HDA_RING_SIZE - ring_count;
+        uint32_t inflight = hda_inflight_bytes();
+        uint32_t space = (hda_queue_limit > inflight) ? (hda_queue_limit - inflight) : 0;
+        uint32_t ring_space = HDA_RING_SIZE - ring_count;
+        if (space > ring_space) space = ring_space;
         uint32_t to_write = bytes - written;
         if (to_write > space) to_write = space;
         to_write = (to_write / 4) * 4;
@@ -605,12 +780,13 @@ uint32_t hda_write_pcm(const void *buffer, uint32_t bytes, uint32_t rate, uint8_
         ring_count += to_write;
         written += to_write;
 
-        // Start hardware playback if not running
+        // Push new data into any descriptor the DAC has already finished, then
+        // (re)start the engine if it went idle while the ring was filling.
+        if (hda_is_playing) {
+            hda_service_descriptors();
+        }
         if (!hda_is_playing && ring_count >= HDA_BUFFER_SIZE) {
-            hda_pump_audio();
-            uint8_t ctl0 = hda_sd_read8(HDA_SD_CTL);
-            hda_sd_write8(HDA_SD_CTL, ctl0 | HDA_SD_CTL_RUN | HDA_SD_CTL_IOCE | HDA_SD_CTL_FEIE | HDA_SD_CTL_DEIE);
-            hda_is_playing = true;
+            hda_start_stream();
         }
 
         hal_irq_enable();
@@ -619,8 +795,64 @@ uint32_t hda_write_pcm(const void *buffer, uint32_t bytes, uint32_t rate, uint8_
     return written;
 }
 
+void hda_set_tick_callback(void (*cb)(void)) {
+    hda_tick_callback = cb;
+}
+
+// Non-blocking queue: copy what fits under the queue cap and return the number
+// of bytes accepted.  Safe to call from the ISR (the HDA-owner lock is the
+// interrupt-disable critical section the ISR already runs in).
+uint32_t hda_queue_pcm(const void *buffer, uint32_t bytes, uint32_t rate,
+                       uint8_t channels, uint8_t bits) {
+    if (!hda_present || !buffer || bytes == 0)
+        return 0;
+
+    if (rate != current_sample_rate || channels != current_channels || bits != current_bits) {
+        current_sample_rate = rate;
+        current_channels = channels;
+        current_bits = bits;
+        hda_apply_format(rate, channels, bits);
+    }
+
+    const uint8_t *src = (const uint8_t *)buffer;
+    hal_irq_disable();
+
+    uint32_t inflight = hda_inflight_bytes();
+    uint32_t space = (hda_queue_limit > inflight) ? (hda_queue_limit - inflight) : 0;
+    uint32_t ring_space = HDA_RING_SIZE - ring_count;
+    if (space > ring_space) space = ring_space;
+    if (bytes < space) space = bytes;
+    space &= ~3U;
+
+    if (space) {
+        uint32_t unwritten1 = HDA_RING_SIZE - ring_head;
+        if (space <= unwritten1) {
+            memcpy(hda_ring + ring_head, src, space);
+            ring_head = (ring_head + space) % HDA_RING_SIZE;
+        } else {
+            memcpy(hda_ring + ring_head, src, unwritten1);
+            uint32_t rem = space - unwritten1;
+            memcpy(hda_ring, src + unwritten1, rem);
+            ring_head = rem;
+        }
+        ring_count += space;
+
+        if (hda_is_playing) {
+            hda_service_descriptors();
+        } else if (ring_count >= HDA_BUFFER_SIZE) {
+            hda_start_stream();
+        }
+    }
+
+    hal_irq_enable();
+    return space;
+}
+
 uint32_t hda_get_ring_count(void) {
-    return ring_count;
+    hal_irq_disable();
+    uint32_t count = ring_count;
+    hal_irq_enable();
+    return count;
 }
 
 uint64_t hda_get_played_bytes(void) {
@@ -631,6 +863,49 @@ void *hda_get_wait_queue(void) {
     return &hda_wait_queue;
 }
 
+// Everything written but not yet played: software ring + DMA ring.
+uint32_t hda_get_delay_bytes(void) {
+    hal_irq_disable();
+    uint32_t delay = hda_inflight_bytes();
+    hal_irq_enable();
+    return delay;
+}
+
+// How much more may be queued before hda_write_pcm() blocks.
+uint32_t hda_get_free_bytes(void) {
+    hal_irq_disable();
+    uint32_t used = hda_inflight_bytes();
+    uint32_t limit = hda_queue_limit;
+    hal_irq_enable();
+    return (limit > used) ? (limit - used) : 0;
+}
+
+uint32_t hda_get_queue_limit(void) {
+    return hda_queue_limit;
+}
+
+void hda_set_queue_limit(uint32_t bytes) {
+    if (bytes == 0) {
+        bytes = HDA_DEFAULT_QUEUE_BYTES;
+    }
+    if (bytes < HDA_MIN_QUEUE_BYTES) {
+        bytes = HDA_MIN_QUEUE_BYTES;
+    }
+    if (bytes > HDA_RING_SIZE) {
+        bytes = HDA_RING_SIZE;
+    }
+    hal_irq_disable();
+    hda_queue_base = bytes;
+    // A newly negotiated stream starts with fresh, tight headroom.
+    hda_safety_scale = 1;
+    hda_last_underrun_ms = 0;
+    hda_last_grow_ms = 0;
+    hda_apply_queue_limit();
+    hal_irq_enable();
+    // A blocked writer may now fit within the new limit.
+    wait_queue_wake_all(&hda_wait_queue);
+}
+
 void hda_reset_stream(void) {
     if (!hda_present) return;
     hal_irq_disable();
@@ -638,8 +913,13 @@ void hda_reset_stream(void) {
     total_played_bytes = 0;
     total_played_blocks = 0;
     hda_is_playing = false;
-    hda_refill_idx = 0;
     hda_underflow_count = 0;
+    hda_dma_pending = 0;
+    hda_last_lpib = 0;
+    hda_lpib_pos = 0;
+    hda_refill_pos = 0;
+    hda_playing_desc = 0;
+    memset(hda_slot_bytes, 0, sizeof(hda_slot_bytes));
     uint32_t ctl = hda_sd_read32(HDA_SD_CTL);
     hda_sd_write32(HDA_SD_CTL, ctl & ~HDA_SD_CTL_RUN);
     hal_irq_enable();
@@ -668,14 +948,7 @@ int hda_ioctl_handler(uint32_t request, uint64_t arg) {
     switch (request) {
     case 0x5000: // SNDCTL_DSP_RESET
     {
-        hal_irq_disable();
-        ring_head = ring_tail = ring_count = 0;
-        total_played_bytes = 0;
-        total_played_blocks = 0;
-        hda_is_playing = false;
-        uint32_t ctl = hda_sd_read32(HDA_SD_CTL);
-        hda_sd_write32(HDA_SD_CTL, ctl & ~HDA_SD_CTL_RUN);
-        hal_irq_enable();
+        hda_reset_stream();
         return 0;
     }
     case 0x5001: // SNDCTL_DSP_SYNC
@@ -717,9 +990,10 @@ int hda_ioctl_handler(uint32_t request, uint64_t arg) {
             int bytes;
         } *info = (void *)arg;
         if (!info) return -14;
+        uint32_t free_bytes = hda_get_free_bytes();
         info->fragsize = HDA_BUFFER_SIZE;
-        info->fragstotal = HDA_RING_SIZE / HDA_BUFFER_SIZE;
-        info->bytes = HDA_RING_SIZE - ring_count;
+        info->fragstotal = (int)(hda_get_queue_limit() / HDA_BUFFER_SIZE);
+        info->bytes = (int)free_bytes;
         info->fragments = info->bytes / info->fragsize;
         return 0;
     }
@@ -785,10 +1059,7 @@ int hda_ioctl_handler(uint32_t request, uint64_t arg) {
         hal_irq_disable();
         if (*trig & 0x02) { // PCM_ENABLE_OUTPUT
             if (!hda_is_playing && ring_count >= HDA_BUFFER_SIZE) {
-                hda_pump_audio();
-                uint8_t ctl0 = hda_sd_read8(HDA_SD_CTL);
-                hda_sd_write8(HDA_SD_CTL, ctl0 | HDA_SD_CTL_RUN | HDA_SD_CTL_IOCE | HDA_SD_CTL_FEIE | HDA_SD_CTL_DEIE);
-                hda_is_playing = true;
+                hda_start_stream();
             }
         } else if (*trig == 0) {
             if (hda_is_playing) {
@@ -814,9 +1085,7 @@ int hda_ioctl_handler(uint32_t request, uint64_t arg) {
     {
         int *delay = (int *)arg;
         if (!delay) return -14;
-        hal_irq_disable();
-        *delay = (int)ring_count;
-        hal_irq_enable();
+        *delay = (int)hda_get_delay_bytes();
         return 0;
     }
     case 0x80045002: // SOUND_PCM_READ_RATE
@@ -902,11 +1171,8 @@ int hda_poll_handler(int events) {
         return 0;
 
     int revents = 0;
-    hal_irq_disable();
-    uint32_t cnt = ring_count;
-    hal_irq_enable();
-
-    if ((events & (POLLOUT | POLLWRNORM)) && (HDA_RING_SIZE - cnt) >= HDA_BUFFER_SIZE) {
+    // Writable while hda_write_pcm() would not block.
+    if ((events & (POLLOUT | POLLWRNORM)) && hda_get_free_bytes() >= 4) {
         revents |= (events & (POLLOUT | POLLWRNORM));
     }
     return revents;

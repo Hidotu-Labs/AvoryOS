@@ -119,9 +119,19 @@ struct hda_bdl_entry {
 void hda_init(void);
 void hda_register_vfs(void);
 bool hda_is_present(void);
+// HDA_PARAM_PCM_SIZE_RATE of the active DAC: bits 0-10 = supported rates,
+// bits 16-20 = supported sample sizes (8/16/20/24/32).
+bool hda_get_pcm_caps(uint32_t *caps);
 
 // Audio playback routines
 uint32_t hda_write_pcm(const void *buffer, uint32_t bytes, uint32_t rate, uint8_t channels, uint8_t bits);
+// Non-blocking variant: queues what fits under the queue cap and returns the
+// number of bytes accepted.  Used by the ALSA mmap pump, which runs in
+// interrupt context.
+uint32_t hda_queue_pcm(const void *buffer, uint32_t bytes, uint32_t rate, uint8_t channels, uint8_t bits);
+// Callback invoked from the HDA interrupt after each completed descriptor.
+// Gives upper layers (ALSA mmap buffers) a chance to refill the queue.
+void hda_set_tick_callback(void (*cb)(void));
 int hda_ioctl_handler(uint32_t request, uint64_t arg);
 int hda_poll_handler(int events);
 uint32_t hda_get_ring_count(void);
@@ -129,5 +139,16 @@ uint64_t hda_get_played_bytes(void);
 void *hda_get_wait_queue(void);
 void hda_reset_stream(void);
 void hda_set_format(uint32_t rate, uint8_t channels, uint8_t bits);
+
+// Queue introspection.  delay counts everything written but not yet played
+// (software ring plus the DMA ring the DAC is working through), which is what
+// ALSA delay/OSS GETODELAY must report to keep clients from queueing ahead.
+uint32_t hda_get_delay_bytes(void);
+uint32_t hda_get_free_bytes(void);
+uint32_t hda_get_queue_limit(void);
+// Bound bytes in flight; hda_write_pcm blocks at this point.  ALSA clients pass
+// the buffer size they negotiated so the kernel queue cannot grow past it.
+// Passing 0 restores the default.
+void hda_set_queue_limit(uint32_t bytes);
 
 #endif // AUDIO_HDA_H

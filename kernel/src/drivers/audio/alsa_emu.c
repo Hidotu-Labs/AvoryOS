@@ -330,9 +330,18 @@ static uint64_t  alsa_control_page_phys = 0;
 static uint32_t alsa_sample_rate = 44100;
 static uint8_t alsa_channels = 2;
 static uint8_t alsa_bits = 16;
-static int alsa_pcm_state = 0; // 0 = OPEN, 1 = PREPARED, 2 = RUNNING
+static int alsa_pcm_state = 0; // 0 = OPEN, 1 = SETUP, 2 = PREPARED, 3 = RUNNING, 6 = PAUSED
 static uint64_t alsa_appl_ptr = 0;
 static uint64_t alsa_hw_ptr = 0;
+// Playback buffer the client negotiated in HW_PARAMS, in frames.  It bounds
+// both the driver queue and the avail figures reported back to alsa-lib.
+static uint64_t alsa_buffer_frames = 0;
+// mmap-transfer tracking.  In MMAP access mode the application (or one of
+// alsa-lib's converter chains) writes straight into alsa_dma_buf and publishes
+// the new write position in the shared control page; alsa_mmap_pump() copies
+// that data into the HDA ring.
+static bool alsa_access_mmap = false;
+static uint64_t alsa_mmap_consumed = 0;
 
 // alsa-lib passes 0/1 by value for some _IOW('A', …, int) PCM ioctls (e.g. PAUSE).
 static int alsa_ioctl_get_int(uint64_t arg, int *out) {
@@ -606,6 +615,118 @@ static bool alsa_interval_exact(const struct snd_interval *it) {
     return it && !it->empty && it->min == it->max;
 }
 
+static uint32_t alsa_frame_bytes(void) {
+    uint32_t frame_size = (alsa_bits / 8) * alsa_channels;
+    return frame_size ? frame_size : 4;
+}
+
+// Sample formats this emulation can hand to the HDA engine sample-for-sample.
+// HDA DACs have no float format and are little-endian, so those are never
+// advertised, and 32-bit is only offered when the codec reports that it can
+// play it.  This matters: ALSA clients such as VLC keep the decoder's native
+// format whenever the mask claims support, so advertising FLOAT made AAC
+// streams (float) reach the DAC as garbage while S16 MP3 stayed fine.
+static uint32_t alsa_supported_formats(void) {
+    uint32_t formats = (1U << 2); // S16_LE is always renderable
+    uint32_t caps = 0;
+    if (hda_get_pcm_caps(&caps) && (((caps >> 16) & 0x1F) & (1U << 4))) {
+        formats |= (1U << 10); // S32_LE (codec advertises 32-bit)
+    }
+    return formats;
+}
+
+// Publish the hardware pointer into the mmap status page.  alsa-lib reads
+// hw_ptr straight from that page to pace writes, so it must advance while the
+// stream plays, not only when an ioctl happens to be issued.
+static void alsa_publish_hw_ptr(void) {
+    uint32_t frame_size = alsa_frame_bytes();
+    uint64_t delay_frames = 0;
+    if (hda_is_present()) {
+        delay_frames = hda_get_delay_bytes() / frame_size;
+    }
+    if (alsa_access_mmap) {
+        // MMAP mode: frames written by the client may still sit in alsa_dma_buf
+        // waiting for the pump, so hw_ptr is derived from what has actually
+        // been handed to (and played by) the DMA, not from appl_ptr.
+        alsa_hw_ptr = (alsa_mmap_consumed > delay_frames)
+                          ? (alsa_mmap_consumed - delay_frames) : 0;
+    } else {
+        if (delay_frames > alsa_appl_ptr) {
+            delay_frames = alsa_appl_ptr;
+        }
+        alsa_hw_ptr = alsa_appl_ptr - delay_frames;
+    }
+    if (alsa_status_page_virt) {
+        struct snd_pcm_mmap_status *st = (struct snd_pcm_mmap_status *)alsa_status_page_virt;
+        st->state = alsa_pcm_state;
+        st->hw_ptr = alsa_hw_ptr;
+    }
+}
+
+// Frames that may still be queued without exceeding the negotiated buffer.
+static uint64_t alsa_avail_frames(void) {
+    uint32_t frame_size = alsa_frame_bytes();
+    uint64_t buffer_frames = alsa_buffer_frames;
+    if (buffer_frames == 0) {
+        buffer_frames = ALSA_DMA_BUF_SIZE / frame_size;
+    }
+    // hw_ptr is the played position; everything between it and the client's
+    // write pointer is queued (HDA ring or still in the mmap buffer).
+    uint64_t used = (alsa_appl_ptr > alsa_hw_ptr) ? (alsa_appl_ptr - alsa_hw_ptr) : 0;
+    if (used > buffer_frames) {
+        used = buffer_frames;
+    }
+    return buffer_frames - used;
+}
+
+// Move newly written mmap frames from alsa_dma_buf into the HDA ring.  In
+// MMAP access mode nothing issues a write ioctl, so the kernel has to observe
+// the shared write pointer itself; this runs from the HDA interrupt (tick
+// callback) and from the query ioctls.  hda_queue_pcm() handles its own IRQ
+// masking and never blocks.
+static void alsa_mmap_pump(void) {
+    if (!alsa_access_mmap || !hda_is_present() || !alsa_dma_buf_virt ||
+        !alsa_control_page_virt || !alsa_buffer_frames) {
+        return;
+    }
+
+    uint64_t appl = ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr;
+    if (appl > alsa_appl_ptr) {
+        alsa_appl_ptr = appl;
+    }
+
+    if (appl <= alsa_mmap_consumed) {
+        alsa_publish_hw_ptr();
+        return;
+    }
+
+    uint32_t frame_size = alsa_frame_bytes();
+    uint64_t pending = appl - alsa_mmap_consumed;
+    if (pending > alsa_buffer_frames) {
+        pending = alsa_buffer_frames;
+    }
+
+    while (pending) {
+        uint64_t off = alsa_mmap_consumed % alsa_buffer_frames;
+        uint64_t cont = alsa_buffer_frames - off;
+        if (pending < cont) {
+            cont = pending;
+        }
+        uint32_t accepted = hda_queue_pcm(alsa_dma_buf_virt + off * frame_size,
+                                          (uint32_t)(cont * frame_size),
+                                          alsa_sample_rate, alsa_channels, alsa_bits);
+        if (accepted < frame_size) {
+            break;
+        }
+        uint64_t done = accepted / frame_size;
+        alsa_mmap_consumed += done;
+        pending -= done;
+    }
+
+    alsa_pcm_state = 3; // SNDRV_PCM_STATE_RUNNING
+    alsa_publish_hw_ptr();
+}
+
 // Keep period/buffer/periods and derived byte/time fields consistent.
 // alsa-lib rejects HW_PARAMS when buffer_size is not an exact multiple of
 // period_size even if both intervals were individually refined to min==max.
@@ -789,8 +910,11 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
 
         // ALSA access enum: MMAP_INTERLEAVED=0, MMAP_NONINTERLEAVED=1, MMAP_COMPLEX=2,
         //                   RW_INTERLEAVED=3, RW_NONINTERLEAVED=4
+        // MMAP access stays advertised because alsa-lib's plug/convert chains
+        // transfer through the slave's mmap areas; the mmap pump below copies
+        // those writes into the HDA ring.  RW clients keep using WRITEI.
         uint32_t supported_access = (1U << 0) | (1U << 1) | (1U << 2) | (1U << 3) | (1U << 4);
-        uint32_t supported_format = (1U << 0) | (1U << 1) | (1U << 2) | (1U << 3) | (1U << 6) | (1U << 10) | (1U << 14);
+        uint32_t supported_format = alsa_supported_formats();
         uint32_t supported_subformat = (1U << 0);
 
         if (params->masks[0].bits[0]) {
@@ -868,6 +992,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         if (params->masks[0].bits[0]) {
             chosen_access = 1U << (__builtin_ctz(params->masks[0].bits[0]));
         }
+        alsa_access_mmap = (chosen_access & ((1U << 0) | (1U << 1) | (1U << 2))) != 0;
         params->masks[0].bits[0] = chosen_access;
         for (int b = 1; b < 8; b++) params->masks[0].bits[b] = 0;
 
@@ -875,6 +1000,9 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         uint32_t chosen_format = (1U << 2); // S16_LE
         if (params->masks[1].bits[0]) {
             chosen_format = 1U << (__builtin_ctz(params->masks[1].bits[0]));
+        }
+        if (!(chosen_format & alsa_supported_formats())) {
+            return -22; // -EINVAL: format would not render correctly
         }
         params->masks[1].bits[0] = chosen_format;
         for (int b = 1; b < 8; b++) params->masks[1].bits[b] = 0;
@@ -888,6 +1016,10 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         alsa_bits = alsa_format_to_bits(params->masks[1].bits[0]);
         alsa_channels = (uint8_t)params->intervals[2].min;
         alsa_sample_rate = params->intervals[3].min;
+        alsa_buffer_frames = params->intervals[9].min; // BUFFER_SIZE in frames
+        if (alsa_buffer_frames < 2) {
+            alsa_buffer_frames = 2;
+        }
 
         params->rmask = 0;
         params->cmask = 0;
@@ -901,11 +1033,14 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
 
         if (hda_is_present()) {
             hda_set_format(alsa_sample_rate, alsa_channels, alsa_bits);
+            // Never queue more than the buffer the client negotiated.
+            hda_set_queue_limit((uint32_t)(alsa_buffer_frames * alsa_frame_bytes()));
             hda_reset_stream();
         }
         alsa_pcm_state = 1; // SNDRV_PCM_STATE_SETUP
         alsa_appl_ptr = 0;
         alsa_hw_ptr = 0;
+        alsa_mmap_consumed = 0;
         alsa_mmap_appl_offset = 0;
         if (alsa_status_page_virt) {
             ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
@@ -918,6 +1053,10 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
     }
 
     if (request == SNDRV_PCM_IOCTL_HW_FREE) {
+        alsa_buffer_frames = 0;
+        if (hda_is_present()) {
+            hda_set_queue_limit(0); // back to the default cap
+        }
         return 0;
     }
 
@@ -938,12 +1077,9 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
     if (request == SNDRV_PCM_IOCTL_DELAY) {
         int64_t *delay = (int64_t *)arg;
         if (!delay) return -14;
-        uint32_t frame_size = (alsa_bits / 8) * alsa_channels;
-        if (frame_size == 0) frame_size = 4;
-        uint32_t queued = hda_is_present() ? hda_get_ring_count() : 0;
-        uint64_t queued_frames = queued / frame_size;
-        if (queued_frames > alsa_appl_ptr) queued_frames = alsa_appl_ptr;
-        *delay = (int64_t)queued_frames;
+        alsa_mmap_pump();
+        alsa_publish_hw_ptr();
+        *delay = (int64_t)(alsa_appl_ptr - alsa_hw_ptr);
         return 0;
     }
 
@@ -962,13 +1098,10 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
             sync->c.control.avail_min = 1;
         }
 
+        alsa_mmap_pump();
+        alsa_publish_hw_ptr();
         sync->s.status.state = alsa_pcm_state;
-        uint32_t frame_size = (alsa_bits / 8) * alsa_channels;
-        if (frame_size == 0) frame_size = 4;
-        uint32_t queued_bytes = hda_is_present() ? hda_get_ring_count() : 0;
-        uint64_t queued_frames = queued_bytes / frame_size;
-        if (queued_frames > alsa_appl_ptr) queued_frames = alsa_appl_ptr;
-        sync->s.status.hw_ptr = alsa_appl_ptr - queued_frames;
+        sync->s.status.hw_ptr = alsa_hw_ptr;
         return 0;
     }
 
@@ -979,6 +1112,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         alsa_pcm_state = 2; // SNDRV_PCM_STATE_PREPARED
         alsa_appl_ptr = 0;
         alsa_hw_ptr = 0;
+        alsa_mmap_consumed = 0;
         if (alsa_status_page_virt) {
             ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
             ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->hw_ptr = 0;
@@ -1004,6 +1138,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         alsa_pcm_state = 1; // SNDRV_PCM_STATE_SETUP
         alsa_appl_ptr = 0;
         alsa_hw_ptr = 0;
+        alsa_mmap_consumed = 0;
         if (alsa_status_page_virt) {
             ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
             ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->hw_ptr = 0;
@@ -1025,7 +1160,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
             return ret;
         }
         if (enable) {
-            alsa_pcm_state = 5; // SNDRV_PCM_STATE_PAUSED
+            alsa_pcm_state = 6; // SNDRV_PCM_STATE_PAUSED
         } else {
             alsa_pcm_state = 3; // SNDRV_PCM_STATE_RUNNING
         }
@@ -1056,12 +1191,11 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         xferi->result = frames_written;
         alsa_appl_ptr += frames_written;
         alsa_pcm_state = 3; // SNDRV_PCM_STATE_RUNNING
-        if (alsa_status_page_virt) {
-            ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
-        }
         if (alsa_control_page_virt) {
             ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = alsa_appl_ptr;
         }
+        // Let alsa-lib see how much of what it just wrote is still queued.
+        alsa_publish_hw_ptr();
         return 0;
     }
 
@@ -1110,12 +1244,10 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         alsa_appl_ptr += frames;
         alsa_pcm_state = 3; // SNDRV_PCM_STATE_RUNNING
         xferi->result = (int64_t)frames;
-        if (alsa_status_page_virt) {
-            ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
-        }
         if (alsa_control_page_virt) {
             ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = alsa_appl_ptr;
         }
+        alsa_publish_hw_ptr();
         return 0;
     }
 
@@ -1129,17 +1261,14 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         if (!st) return -14;
         memset(st, 0, sizeof(*st));
         st->state = alsa_pcm_state;
-        uint32_t frame_size = (alsa_bits / 8) * alsa_channels;
-        if (frame_size == 0) frame_size = 4;
-        uint32_t queued_bytes = hda_is_present() ? hda_get_ring_count() : 0;
-        uint64_t queued_frames = queued_bytes / frame_size;
-        if (queued_frames > alsa_appl_ptr) queued_frames = alsa_appl_ptr;
+        alsa_mmap_pump();
+        alsa_publish_hw_ptr();
         st->appl_ptr  = alsa_appl_ptr;
-        st->hw_ptr    = alsa_appl_ptr - queued_frames;
-        st->delay     = (int64_t)queued_frames;
-        uint32_t avail_bytes = (ALSA_DMA_BUF_SIZE > queued_bytes) ? (ALSA_DMA_BUF_SIZE - queued_bytes) : 0;
-        st->avail     = avail_bytes / frame_size;
-        st->avail_max = ALSA_DMA_BUF_SIZE / frame_size;
+        st->hw_ptr    = alsa_hw_ptr;
+        st->delay     = (int64_t)(alsa_appl_ptr - alsa_hw_ptr);
+        st->avail     = alsa_avail_frames();
+        st->avail_max = alsa_buffer_frames ? alsa_buffer_frames
+                                           : ALSA_DMA_BUF_SIZE / alsa_frame_bytes();
         return 0;
     }
 
@@ -1168,22 +1297,42 @@ static uint32_t alsa_pcm_write(struct vfs_node *node, uint32_t offset,
                               uint32_t size, uint8_t *buffer) {
     (void)node;
     (void)offset;
+    uint32_t written;
     if (hda_is_present()) {
-        return hda_write_pcm(buffer, size, alsa_sample_rate, alsa_channels, alsa_bits);
+        written = hda_write_pcm(buffer, size, alsa_sample_rate, alsa_channels, alsa_bits);
+    } else {
+        vfs_node_t *dsp = fb_lookup_device("dsp");
+        if (dsp && dsp->write) {
+            written = dsp->write(dsp, offset, size, buffer);
+        } else {
+            written = size;
+        }
     }
-    vfs_node_t *dsp = fb_lookup_device("dsp");
-    if (dsp && dsp->write) {
-        return dsp->write(dsp, offset, size, buffer);
-    }
-    return size;
+    alsa_appl_ptr += written / alsa_frame_bytes();
+    alsa_publish_hw_ptr();
+    return written;
 }
 
 static int alsa_pcm_poll(struct vfs_node *node, int events) {
     (void)node;
-    if (hda_is_present()) {
-        return hda_poll_handler(events);
+    if (!hda_is_present()) {
+        return (events & (POLLOUT | POLLWRNORM));
     }
-    return (events & (POLLOUT | POLLWRNORM));
+
+    alsa_mmap_pump();
+    alsa_publish_hw_ptr();
+    uint64_t avail_min = 1;
+    if (alsa_control_page_virt) {
+        uint64_t m = ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->avail_min;
+        if (m) {
+            avail_min = m;
+        }
+    }
+    int revents = 0;
+    if ((events & (POLLOUT | POLLWRNORM)) && alsa_avail_frames() >= avail_min) {
+        revents |= (events & (POLLOUT | POLLWRNORM));
+    }
+    return revents;
 }
 
 // ALSA Timer Callbacks for /dev/snd/timer
@@ -1342,6 +1491,10 @@ void alsa_emu_init(void) {
 }
 
 void alsa_emu_register_vfs(void) {
+    // Let the HDA interrupt drive the mmap pump so MMAP-mode clients (and the
+    // plug/convert chains) keep feeding the DMA ring.
+    hda_set_tick_callback(alsa_mmap_pump);
+
     vfs_node_t *snd_dir = NULL;
     vfs_node_t *dev_dir = vfs_resolve_path("/dev");
     if (dev_dir) {
