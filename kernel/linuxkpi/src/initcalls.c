@@ -69,11 +69,16 @@ void linuxkpi_run_initcalls(void) {
   }
 
   elapsed = linuxkpi_monotonic_ms() - start;
-  if (completed)
+  if (completed) {
     klogf("[INFO] LinuxKPI: initcalls completed in %lu.%03lu s\n",
           (unsigned long)(elapsed / 1000),
           (unsigned long)(elapsed % 1000));
-  else
+    /* Join the walker thread so its kthread control block is freed now; the
+     * native thread itself is reaped by thread_exit().  A timed-out walker
+     * may still be probing, so it is left alone. */
+    kthread_stop(task);
+  } else {
     klogf("[WARN] LinuxKPI: initcalls timed out after %lu s\n",
           (unsigned long)(elapsed / 1000));
+  }
 }

@@ -3,8 +3,11 @@
  *
  * Each thread carries a control block (magic-tagged, stored in the native
  * thread's kpi_data) with the Linux threadfn/data and the cooperative stop
- * flag.  Blocks are freed by kthread_stop(); threads that are never stopped
- * keep their (small) control block for the thread's lifetime. */
+ * flag.  The block pointer is also cached in the task shadow (kpi_control),
+ * so kthread_stop() can still find it after the native thread exited and was
+ * reaped; kthread_stop() frees the block.  A self-exiting thread that nobody
+ * stops leaves its (small) block and shadow behind - the documented
+ * behaviour for kernel threads the boot never joins. */
 
 #include <linux/completion.h>
 #include <linux/err.h>
@@ -24,18 +27,43 @@ struct kpi_kthread {
   void *data;
   volatile int should_stop;
   struct completion exited;
+  /* Native thread pointer while the thread runs; set when the trampoline
+   * starts and cleared before it completes `exited`, so kthread_stop() can
+   * wake only a live thread and never races the reaper that frees it.
+   * Guarded by `lock`. */
+  void *native;
+  spinlock_t lock;
 };
 
 static void kpi_kthread_trampoline(void *arg) {
   struct kpi_kthread *k = arg;
 
+  /* The thread is unquestionably alive here; publish its native handle for
+   * kthread_stop().  A stop requested before this point needs no wake (the
+   * thread has not started), and after this point native is valid until the
+   * epilogue clears it under the same lock. */
+  spin_lock(&k->lock);
+  k->native = linuxkpi_current_thread();
+  spin_unlock(&k->lock);
+
   k->threadfn(k->data);
+
+  spin_lock(&k->lock);
+  k->native = NULL;
+  spin_unlock(&k->lock);
   complete(&k->exited);
 }
 
 static struct kpi_kthread *kthread_control(struct task_struct *task) {
-  struct kpi_kthread *k = linuxkpi_thread_data(task_struct_to_thread(task));
+  struct kpi_kthread *k;
 
+  if (!task)
+    return NULL;
+
+  /* Resolve through the shadow, not through the native thread: by the time
+   * kthread_stop() runs the thread may already have exited and been reaped
+   * (its shadow keeps the control pointer for exactly this reason). */
+  k = task->kpi_control;
   if (k && k->magic == KPI_KTHREAD_MAGIC)
     return k;
   return NULL;
@@ -62,6 +90,8 @@ struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),
   k->data = data;
   k->should_stop = 0;
   init_completion(&k->exited);
+  k->native = NULL;
+  spin_lock_init(&k->lock);
 
   void *thread = linuxkpi_kthread_create(kpi_kthread_trampoline, k, name);
   if (!thread) {
@@ -70,8 +100,13 @@ struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),
   }
 
   /* Hand out the Linux task shadow, not the native pointer: every other
-   * task_struct in the system is a shadow too (see linuxkpi/src/task.c). */
-  return (struct task_struct *)linuxkpi_task_for_thread(thread);
+   * task_struct in the system is a shadow too (see linuxkpi/src/task.c).
+   * kthread_stop() resolves the control block through this field, so it
+   * survives the native thread. */
+  struct task_struct *task = linuxkpi_task_for_thread(thread);
+  if (task)
+    task->kpi_control = k;
+  return task;
 }
 
 struct task_struct *kthread_run_on_cpu(int (*threadfn)(void *data), void *data,
@@ -85,15 +120,26 @@ struct task_struct *kthread_run_on_cpu(int (*threadfn)(void *data), void *data,
 
 int kthread_stop(struct task_struct *task) {
   struct kpi_kthread *k = kthread_control(task);
+  void *native;
 
   if (!k)
     return -EINVAL;
 
+  /* Setting the flag and waking the thread happen together under the lock
+   * the trampoline uses to retire `native`: from here, either the wake is
+   * delivered while the thread is alive or the handle is already NULL
+   * because the thread ran its epilogue (and its completion is done). */
+  spin_lock(&k->lock);
   k->should_stop = 1;
-  linuxkpi_wake_thread(task_struct_to_thread(task));
+  native = k->native;
+  if (native)
+    linuxkpi_wake_thread(native);
+  spin_unlock(&k->lock);
 
   wait_for_completion(&k->exited);
   kfree(k);
+  if (task)
+    task->kpi_control = NULL;
   return 0;
 }
 

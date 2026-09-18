@@ -13,6 +13,7 @@
 #include <linux/kthread.h>
 
 #include <linuxkpi/log.h>
+#include <linuxkpi/native_mm.h>
 
 /* Defined by the Linux-API test translation units; see
  * kernel/src/tests/linuxkpi/linux/. */
@@ -88,6 +89,8 @@ static int linuxkpi_boot_tests_thread(void *arg) {
 void linuxkpi_run_boot_tests(void) {
   init_completion(&boot_tests_done);
 
+  unsigned long free_before = asc_pmm_get_free_pages_total();
+
   struct task_struct *task =
       kthread_run(linuxkpi_boot_tests_thread, NULL, "kpi/tests");
   if (IS_ERR(task)) {
@@ -104,6 +107,24 @@ void linuxkpi_run_boot_tests(void) {
   }
 
   /* Bounded wait: a wedged suite must not hold up the boot. */
-  if (wait_for_completion_timeout(&boot_tests_done, 60000) == 0)
+  if (wait_for_completion_timeout(&boot_tests_done, 60000) == 0) {
     klog_puts("[WARN] LinuxKPI: boot self-tests timed out\n");
+  } else {
+    /* The thread signals the completion on its last line, then returns and
+     * runs thread_exit().  Join it so its kthread control block is released
+     * now instead of being retained for the rest of the boot; the native
+     * thread and its stack are reaped by thread_exit()/sched_reap_thread().
+     * On timeout the thread may still be mid-suite, so leave it alone. */
+    kthread_stop(task);
+  }
+
+  /* The suites run asynchronously; this is the last common point where a
+   * whole-run PMM delta can be observed.  A large positive delta after the
+   * final suite points at a leak in it (each suite also checks its own
+   * delta; this catches allocations that only show once the test thread
+   * exits or the device teardown runs). */
+  unsigned long free_after = asc_pmm_get_free_pages_total();
+  klogf("[INFO] LinuxKPI: boot self-tests PMM delta=%ld pages "
+        "(free=%lu)\n",
+        (long)free_after - (long)free_before, free_after);
 }

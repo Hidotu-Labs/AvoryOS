@@ -62,6 +62,12 @@ unsigned long linuxkpi_current_tgid(void);
 void *linuxkpi_current_task(void);
 void *linuxkpi_task_for_thread(void *thread);
 void *linuxkpi_task_thread(void *task);
+
+/* Called by the native kernel-thread exit path (thread_exit) before the
+ * thread can be reaped.  Drops the task shadow's back-pointer to the native
+ * thread so stale task_struct handles cannot reach freed memory; the shadow
+ * object itself stays allocated for the thread's (now dead) lifetime. */
+void linuxkpi_thread_exiting(void *thread);
 unsigned long linuxkpi_thread_tgid(void *thread);
 unsigned long linuxkpi_thread_pid(void *thread);
 void linuxkpi_thread_comm(void *thread, char *buf, unsigned long size);

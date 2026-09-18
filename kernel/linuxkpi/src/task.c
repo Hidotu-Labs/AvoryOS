@@ -2,9 +2,14 @@
  *
  * `current` (and task_struct pointers handed out by kthread_create()) point at
  * one of these.  The objects are allocated lazily by native_sched.c through
- * the weak linuxkpi_task_shadow_new() hook and live until the thread exits
- * (the shadow is currently leaked with the native thread; freeing needs a
- * thread-exit hook, recorded in docs/linuxkpi-gaps.md). */
+ * the weak linuxkpi_task_shadow_new() hook.  The native exit path
+ * (linuxkpi_thread_exiting()) clears kpi_thread so stale handles cannot reach
+ * the freed native thread, but the shadow object itself is retained: a
+ * kthread control block lives in it (kpi_control) and kthread_stop() may run
+ * after the thread has been reaped.  Shadows with no control block (user
+ * threads, plain kernel threads) are still leaked with their thread; freeing
+ * them needs reference counting against imported code that stores task
+ * pointers, recorded in docs/linuxkpi-gaps.md. */
 
 #include <linux/sched.h>
 #include <linux/slab.h>

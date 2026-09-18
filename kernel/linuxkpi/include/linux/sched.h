@@ -69,6 +69,11 @@ struct task_struct {
   struct reclaim_state *reclaim_state;
   refcount_t usage;
   spinlock_t alloc_lock;
+  /* LinuxKPI kernel-thread control block (linuxkpi/src/kthread.c) for
+   * kthread_create()'d threads, else NULL.  It lives in the shadow so
+   * kthread_stop() can still resolve it after the native thread exited and
+   * its kpi_thread back-pointer was dropped (see linuxkpi_thread_exiting). */
+  void *kpi_control;
 };
 
 /* Process flags stock headers reference; only the one amdgpu uses is defined

@@ -318,6 +318,20 @@ void *linuxkpi_task_thread(void *task) {
   return task ? *(void **)task : 0;
 }
 
+void linuxkpi_thread_exiting(void *thread) {
+  struct thread *t = (struct thread *)thread;
+
+  if (!t || !t->kpi_task)
+    return;
+
+  /* Drop the shadow's back-pointer before the reaper frees this thread:
+   * a later wake_up_process()/kthread_stop() that still holds the shadow
+   * must not resolve a freed native thread.  The shadow object itself is
+   * retained (the kthread control block lives in it), see
+   * docs/linuxkpi-gaps.md. */
+  *(void **)t->kpi_task = NULL;
+}
+
 unsigned long long linuxkpi_monotonic_ms(void) { return lapic_timer_get_ms(); }
 
 unsigned long long linuxkpi_monotonic_ns(void) { return lapic_timer_get_ns(); }

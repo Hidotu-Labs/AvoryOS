@@ -37,9 +37,26 @@ void thread_stack_release(uint64_t stack_base) {
 static void thread_exit(void) {
   hal_irq_disable();
   struct cpu_info *cpu = cpu_get_current();
-  if (cpu->current_thread) {
-    cpu->current_thread->state = THREAD_DEAD;
+  struct thread *t = cpu ? cpu->current_thread : NULL;
+
+  if (t) {
+    /* Let the LinuxKPI bridge detach its task shadow from this thread while
+     * the native struct is still valid (kthread_stop() may resolve the
+     * shadow after the thread is gone). */
+    extern void linuxkpi_thread_exiting(void *thread) __attribute__((weak));
+    if (linuxkpi_thread_exiting)
+      linuxkpi_thread_exiting(t);
+
+    /* Hand the thread to the reaper the same way a detached user thread
+     * does: mark it DEAD and queue it, then switch away.  The reaper frees
+     * the kernel stack, mm, fd table and struct thread once this context is
+     * off-CPU.  Without this, every kernel thread that returns from its
+     * entry point (all the LinuxKPI self-test workers, drm_sched threads,
+     * ...) stayed in the global thread list forever. */
+    t->state = THREAD_DEAD;
+    sched_queue_reap(t);
   }
+
   while (1) {
     sched_yield();
   }
