@@ -1239,16 +1239,41 @@ if [ ! -S /run/dbus/system_bus_socket ] && command -v dbus-daemon >/dev/null 2>&
 fi
 
 # startplasma-x11 expects a session bus; startx does not start one.
+# Publish this session's environment to the D-Bus activation environment:
+# KDE activates a number of services over the bus (kscreen_osd_service,
+# portals, kded modules, ...) and a Qt service that cannot see DISPLAY /
+# XDG_RUNTIME_DIR / QT_QPA_PLATFORM calls qFatal("no Qt platform plugin
+# could be initialized") and aborts.
+update_dbus_env() {
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment --all 2>/dev/null || true
+    fi
+}
 if [ -n "$DBUS_SESSION_BUS_ADDRESS" ]; then
+    update_dbus_env
     exec startplasma-x11
 else
-    exec dbus-run-session -- startplasma-x11
+    exec dbus-run-session -- /bin/sh -c 'dbus-update-activation-environment --all 2>/dev/null || true; exec startplasma-x11'
 fi
 EOF
 chmod +x "${ROOTFS_DIR}/etc/skel/.xinitrc"
 
 # Root's home is / on AvoryOS.
 cp "${ROOTFS_DIR}/etc/skel/.xinitrc" "${ROOTFS_DIR}/.xinitrc"
+
+# Xsession (LightDM and other display managers) sources these before running
+# the session; DISPLAY is set by then, so push the full X environment into the
+# D-Bus daemon's activation environment.  Without this, bus-activated Qt
+# services (e.g. kscreen_osd_service) start without DISPLAY and abort.
+mkdir -p "${ROOTFS_DIR}/etc/X11/xinit/xinitrc.d"
+cat > "${ROOTFS_DIR}/etc/X11/xinit/xinitrc.d/01-avory-dbus-env.sh" << 'EOF'
+# Publish the X session environment to the D-Bus activation environment.
+if [ -n "$DBUS_SESSION_BUS_ADDRESS" ] &&
+   command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    dbus-update-activation-environment --all 2>/dev/null || true
+fi
+EOF
+chmod +x "${ROOTFS_DIR}/etc/X11/xinit/xinitrc.d/01-avory-dbus-env.sh"
 
 # Minimal Openbox rc.xml (no dbus dependency, clean keybinds)
 mkdir -p "${ROOTFS_DIR}/etc/xdg/openbox"
@@ -1966,6 +1991,14 @@ install_apk "discount" "community"
 install_apk "hunspell" "main"
 install_apk "sonnet" "community"
 install_apk "okular" "community"
+# spectacle and OpenCV dependencies (libopencv_core.so.410, libopencv_imgproc.so.410)
+install_apk "libquadmath" "main"
+install_apk "libgfortran" "main"
+install_apk "openblas" "community"
+install_apk "hwloc" "main"
+install_apk "onetbb" "community"
+install_apk "libopencv_core" "community"
+install_apk "libopencv_imgproc" "community"
 install_apk "spectacle" "community"
 # gwenview and dependencies
 install_apk "exiv2" "community"
@@ -2031,6 +2064,15 @@ install_apk "zxing-cpp" "community"
 install_apk "libqrencode" "community"
 install_apk "prison" "community"
 
+# --- OpenRC init system ---
+install_apk "openrc" "main"
+install_apk "openrc-init" "main"
+# System D-Bus daemon + its OpenRC service.  dbus-openrc ships
+# /etc/init.d/dbus (the daemon binary comes with the dbus package pulled in
+# by desktop dependencies); enabling it gives a /run/dbus/system_bus_socket
+# for lightdm, portals, NetworkManager and the like.
+install_apk "dbus-openrc" "main"
+
 # 5. Inject custom binaries
 echo "[*] Injecting custom binaries into rootfs..."
 mkdir -p "${ROOTFS_DIR}/bin"
@@ -2046,6 +2088,105 @@ if [ -f "${ROOT_DIR}/userland/sdl3_test.elf" ]; then
     cp "${ROOT_DIR}/userland/sdl3_test.elf" "${ROOTFS_DIR}/bin/sdl3_test"
     chmod +x "${ROOTFS_DIR}/bin/sdl3_test"
 fi
+if [ -f "${ROOT_DIR}/userland/avory-login.elf" ]; then
+    cp "${ROOT_DIR}/userland/avory-login.elf" "${ROOTFS_DIR}/bin/avory-login"
+    chmod +x "${ROOTFS_DIR}/bin/avory-login"
+fi
+
+# 6. Configure OpenRC for AvoryOS
+echo "[*] Configuring OpenRC for AvoryOS..."
+mkdir -p "${ROOTFS_DIR}/run/openrc" "${ROOTFS_DIR}/run/lock" "${ROOTFS_DIR}/var/log"
+mkdir -p "${ROOTFS_DIR}/etc/runlevels/sysinit" \
+         "${ROOTFS_DIR}/etc/runlevels/boot" \
+         "${ROOTFS_DIR}/etc/runlevels/default" \
+         "${ROOTFS_DIR}/etc/runlevels/shutdown"
+
+# OpenRC main config: disable cgroup controllers (AvoryOS kernel does not use cgroups)
+cat <<'EOF' > "${ROOTFS_DIR}/etc/rc.conf"
+# /etc/rc.conf - OpenRC Configuration for AvoryOS
+rc_parallel="NO"
+rc_controller_cgroups="NO"
+rc_sys=""
+rc_tty_number=1
+rc_logger="YES"
+rc_log_path="/var/log/rc.log"
+EOF
+
+# Inittab for AvoryOS (used by BusyBox init / /sbin/init)
+cat <<'EOF' > "${ROOTFS_DIR}/etc/inittab"
+# /etc/inittab for AvoryOS
+
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+# Console login on tty1
+tty1::respawn:/bin/avory-login
+
+# Shutdown & reboot
+::shutdown:/sbin/openrc shutdown
+::ctrlaltdel:/sbin/reboot
+EOF
+
+# AvoryOS login OpenRC service unit
+cat <<'EOF' > "${ROOTFS_DIR}/etc/init.d/avory-login"
+#!/sbin/openrc-run
+description="AvoryOS Console Login"
+
+depend() {
+    after localmount
+    keyword -shutdown
+}
+
+command="/bin/avory-login"
+command_background=true
+pidfile="/run/avory-login.pid"
+EOF
+chmod +x "${ROOTFS_DIR}/etc/init.d/avory-login"
+
+# The AvoryOS kernel owns /dev.  Alpine services such as hwdrivers and
+# machine-id `need dev`, which stock Alpine gets from busybox-mdev-openrc.
+# AvoryOS does not run mdev, so provide a no-op `dev` service instead: it
+# satisfies the dependency without touching the kernel-managed /dev.
+cat <<'EOF' > "${ROOTFS_DIR}/etc/init.d/dev"
+#!/sbin/openrc-run
+description="AvoryOS kernel-managed /dev"
+
+depend() {
+    provide dev
+    keyword -shutdown
+}
+
+start() {
+    return 0
+}
+EOF
+chmod +x "${ROOTFS_DIR}/etc/init.d/dev"
+
+# Populate runlevels with standard compatible services
+for s in devfs dev dmesg sysfs; do
+    if [ -f "${ROOTFS_DIR}/etc/init.d/${s}" ]; then
+        ln -sfn "/etc/init.d/${s}" "${ROOTFS_DIR}/etc/runlevels/sysinit/${s}"
+    fi
+done
+
+for s in bootmisc hostname localmount; do
+    if [ -f "${ROOTFS_DIR}/etc/init.d/${s}" ]; then
+        ln -sfn "/etc/init.d/${s}" "${ROOTFS_DIR}/etc/runlevels/boot/${s}"
+    fi
+done
+
+for s in dbus local avory-login; do
+    if [ -f "${ROOTFS_DIR}/etc/init.d/${s}" ]; then
+        ln -sfn "/etc/init.d/${s}" "${ROOTFS_DIR}/etc/runlevels/default/${s}"
+    fi
+done
+
+for s in killprocs mount-ro; do
+    if [ -f "${ROOTFS_DIR}/etc/init.d/${s}" ]; then
+        ln -sfn "/etc/init.d/${s}" "${ROOTFS_DIR}/etc/runlevels/shutdown/${s}"
+    fi
+done
 
 # Generate caches last: no subsequent rootfs customization may make their
 # configuration or source-directory metadata stale before image population.

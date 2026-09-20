@@ -15,6 +15,12 @@
 #define CACHE_BATCH 64u
 #define CACHE_NODE_LIMIT 256u
 
+/* How long a demand fault waits for another owner to finish filling a page
+ * before declaring the fill abandoned and refilling it.  Without a bound, a
+ * loader killed mid-read (or a tree leaf whose slab chunk was recycled) turns
+ * the wait inside vfs_cache_get_or_create() into a permanent spin. */
+#define VFS_PAGE_LOAD_TIMEOUT_MS 2000
+
 /* Bench-only: force the scatter staging path even when the frames are one
  * contiguous run, so vfs_bench=1 can measure the bounce copy this change
  * removed.  Never set outside the benchmark. */
@@ -66,7 +72,21 @@ static bool page_value_valid(const void *value) {
   const vfs_page_t *page = (const vfs_page_t *)value;
   if (!page || (uint64_t)page & 7 || !pmm_kernel_ptr_is_managed(page))
     return false;
-  return page->magic == VFS_PAGE_MAGIC;
+  if (page->magic != VFS_PAGE_MAGIC)
+    return false;
+  /* The four flags are C bools: anything above 1 in their bytes means this
+   * 64-byte slab chunk was reused after the page was released (or overflowed
+   * from a neighbour).  A tree entry in that state used to make the
+   * loading-wait loop below spin forever, so reject it here and let the
+   * caller drop the leaf and refill.  Read the bytes directly: _Bool is
+   * always 0/1 to the compiler, so a comparison on the fields themselves
+   * would be optimized away. */
+  const uint8_t *flags = (const uint8_t *)&page->dirty;
+  if (flags[0] > 1 || flags[1] > 1 || flags[2] > 1 || flags[3] > 1)
+    return false;
+  if (page->frame_phys & (PAGE_SIZE - 1))
+    return false;
+  return true;
 }
 
 static uint64_t cache_invalid_values;
@@ -74,13 +94,36 @@ static uint64_t cache_invalid_values;
 static void cache_report_invalid_value(const void *value) {
   uint64_t count =
       __atomic_add_fetch(&cache_invalid_values, 1, __ATOMIC_RELAXED);
-  if (count <= 8) {
-    klog_puts(KLOG_CLR_YELLOW
-              "[VFS] WARNING: page cache tree holds an invalid entry "
-              KLOG_CLR_RESET);
-    klog_hex64((uint64_t)value);
-    klog_puts("\n");
+  if (count > 8)
+    return;
+
+  klog_puts(KLOG_CLR_YELLOW
+            "[VFS] WARNING: page cache tree holds an invalid entry "
+            KLOG_CLR_RESET);
+  klog_hex64((uint64_t)value);
+
+  uint64_t free_caller = 0;
+  if (heap_last_free_caller(value, &free_caller)) {
+    klog_puts(" freed-from=");
+    klog_hex64(free_caller);
   }
+
+  /* Only dereference a pointer that is aligned and inside managed RAM: a
+   * wild leaf must not turn the report itself into a fault. Reading the raw
+   * fields tells apart "freed and recycled" (magic overwritten or flags
+   * outside 0/1) from a genuinely wild pointer. */
+  if (value && ((uint64_t)value & 7) == 0 &&
+      pmm_kernel_ptr_is_managed(value)) {
+    const uint32_t *raw = (const uint32_t *)value;
+    klog_puts(" magic=");
+    klog_hex64(raw[1]);
+    klog_puts(" flags=");
+    klog_hex64(((const uint8_t *)value)[0x10] |
+               ((uint64_t)((const uint8_t *)value)[0x11] << 8) |
+               ((uint64_t)((const uint8_t *)value)[0x12] << 16) |
+               ((uint64_t)((const uint8_t *)value)[0x13] << 24));
+  }
+  klog_puts("\n");
 }
 
 size_t vfs_cache_page_count(void) {
@@ -88,9 +131,30 @@ size_t vfs_cache_page_count(void) {
 }
 
 static void cache_page_release(vfs_page_t *page) {
+  /* A page can only be released once.  The live marker catches a second
+   * release (kfree() overwrites the object) before the heap sees a double
+   * free, which would let two owners hand out the same chunk. */
+  if (page->magic != VFS_PAGE_MAGIC) {
+    cache_report_invalid_value(page);
+    return;
+  }
   pmm_free_page((void *)page->frame_phys);
   page->magic = 0;
   kfree(page);
+}
+
+bool vfs_cache_page_valid(const vfs_page_t *page) {
+  return page_value_valid(page);
+}
+
+/* Drop a leaf that failed validation.  Caller holds node->pages_lock and owns
+ * the tree lock via the asc_* call.  The leaf value is opaque, so it is just
+ * discarded: a wild value has no page to release. */
+static void cache_drop_invalid_locked(vfs_node_t *node, uint32_t offset,
+                                      const void *value) {
+  cache_report_invalid_value(value);
+  asc_radix_tree_delete(&node->pages, cache_key(offset));
+  __atomic_sub_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
 }
 
 vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
@@ -98,6 +162,10 @@ vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
     return NULL;
   spinlock_acquire(&node->pages_lock);
   vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
+  if (page && !page_value_valid(page)) {
+    cache_drop_invalid_locked(node, offset, page);
+    page = NULL;
+  }
   if (page) {
     vfs_page_get(page);
     page->last_used = cache_stamp();
@@ -109,6 +177,14 @@ vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
 void vfs_cache_put(vfs_node_t *node, vfs_page_t *page) {
   if (!node || !page)
     return;
+  /* Never touch the packed reference word of an object that is already
+   * released: a put can race a stale pointer left in a page-cache tree by an
+   * earlier heap use-after-free, and decrementing a reused chunk corrupts its
+   * new owner. */
+  if (page->magic != VFS_PAGE_MAGIC) {
+    cache_report_invalid_value(page);
+    return;
+  }
   /* No pages_lock: the packed reference word arbitrates the release, so a put
    * never has to disable interrupts just to drop a reference.  See the
    * vfs_page_t comment in vfs.h. */
@@ -134,6 +210,10 @@ vfs_page_t *vfs_cache_insert(vfs_node_t *node, uint32_t offset,
 
   spinlock_acquire(&node->pages_lock);
   vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
+  if (page && !page_value_valid(page)) {
+    cache_drop_invalid_locked(node, offset, page);
+    page = NULL;
+  }
   if (page) {
     vfs_page_get(page);
     spinlock_release(&node->pages_lock);
@@ -156,6 +236,7 @@ vfs_page_t *vfs_cache_get_or_create(vfs_node_t *node, uint32_t offset) {
 retry:
   page = vfs_cache_lookup(node, offset);
   if (page) {
+    uint64_t wait_start = lapic_timer_get_ms();
     while (1) {
       spinlock_acquire(&node->pages_lock);
       bool loading = page->loading;
@@ -167,6 +248,14 @@ retry:
         /* A page whose fill failed can sit in the tree until its owner
          * invalidates it.  Drop it and refill instead of reporting a
          * short read to the caller. */
+        vfs_cache_put(node, page);
+        vfs_cache_invalidate(node, offset);
+        goto retry;
+      }
+      if (lapic_timer_get_ms() - wait_start >= VFS_PAGE_LOAD_TIMEOUT_MS) {
+        /* The owner never finished: a thread killed mid-fill, a blocked
+         * reader that will never be woken, or a recycled tree leaf.  Retire
+         * the entry so a fresh fill can make progress. */
         vfs_cache_put(node, page);
         vfs_cache_invalidate(node, offset);
         goto retry;
@@ -195,6 +284,10 @@ retry:
   bool creator = false;
   spinlock_acquire(&node->pages_lock);
   page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
+  if (page && !page_value_valid(page)) {
+    cache_drop_invalid_locked(node, offset, page);
+    page = NULL;
+  }
   if (page) {
     vfs_page_get(page);
   } else if (!asc_radix_tree_insert(&node->pages, cache_key(offset), candidate)) {
@@ -209,6 +302,7 @@ retry:
     pmm_free_page(frame);
     if (!page)
       return NULL;
+    uint64_t wait_start = lapic_timer_get_ms();
     while (1) {
       spinlock_acquire(&node->pages_lock);
       bool loading = page->loading;
@@ -217,6 +311,11 @@ retry:
       if (!loading) {
         if (uptodate)
           return page;
+        vfs_cache_put(node, page);
+        vfs_cache_invalidate(node, offset);
+        goto retry;
+      }
+      if (lapic_timer_get_ms() - wait_start >= VFS_PAGE_LOAD_TIMEOUT_MS) {
         vfs_cache_put(node, page);
         vfs_cache_invalidate(node, offset);
         goto retry;
@@ -392,6 +491,10 @@ uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_byt
     if (page_off >= node->length)
       break;
     vfs_page_t *existing = asc_radix_tree_lookup(&node->pages, cache_key(page_off));
+    if (existing && !page_value_valid(existing)) {
+      cache_drop_invalid_locked(node, page_off, existing);
+      existing = NULL;
+    }
     if (existing) {
       if (missing_count == 0) {
         start_index = i + 1; /* leading present page: keep looking */
@@ -471,6 +574,10 @@ uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_byt
   for (uint32_t i = 0; i < allocated; i++) {
     uint32_t page_off = first_off + i * PAGE_SIZE;
     vfs_page_t *existing = asc_radix_tree_lookup(&node->pages, cache_key(page_off));
+    if (existing && !page_value_valid(existing)) {
+      cache_drop_invalid_locked(node, page_off, existing);
+      existing = NULL;
+    }
     if (existing || asc_radix_tree_insert(&node->pages, cache_key(page_off), candidates[i])) {
       break;
     }
@@ -822,6 +929,10 @@ void vfs_cache_update_or_invalidate(vfs_node_t *node, uint32_t offset,
 
     spinlock_acquire(&node->pages_lock);
     vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(cur_offset));
+    if (page && !page_value_valid(page)) {
+      cache_drop_invalid_locked(node, cur_offset, page);
+      page = NULL;
+    }
     if (page && page->frame_phys && !page->loading &&
         !vfs_page_is_evicted(page)) {
       if (page->uptodate) {
@@ -921,6 +1032,10 @@ void vfs_cache_mark_dirty(vfs_node_t *node, uint32_t offset) {
     return;
   spinlock_acquire(&node->pages_lock);
   vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
+  if (page && !page_value_valid(page)) {
+    cache_drop_invalid_locked(node, offset, page);
+    page = NULL;
+  }
   if (page && page->uptodate && !vfs_page_is_evicted(page)) {
     page->dirty = true;
     page->dirty_seq++;

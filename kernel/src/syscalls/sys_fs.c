@@ -708,6 +708,56 @@ static uint64_t sys_symlinkat(uint64_t target_ptr, uint64_t newdirfd,
     return sys_symlink(target_ptr, linkpath_ptr, 0, 0, 0, 0);
 }
 
+// ---------------------------------------------------------------------------
+// mknod
+// ---------------------------------------------------------------------------
+
+/* Linux mknod(2).  AvoryOS has no major/minor driver registry: the created
+ * node carries the type so stat() reports it and the rdev is kept in inode
+ * for userland that inspects it.  Services such as dmesg create /dev/kmsg
+ * this way; without the syscall they fail with ENOSYS. */
+static uint64_t sys_mknod(uint64_t pathname_ptr, uint64_t mode, uint64_t dev,
+                          uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)a3; (void)a4; (void)a5;
+    const char *path = (const char *)pathname_ptr;
+    if (!path) return (uint64_t)-14;
+
+    uint32_t type;
+    switch ((uint32_t)mode & 0170000u) {
+        case 0000000u: type = FS_FILE;     break; // regular
+        case 0010000u: type = FS_PIPE;     break; // S_IFIFO
+        case 0020000u: type = FS_CHARDEV;  break; // S_IFCHR
+        case 0060000u: type = FS_BLOCKDEV; break; // S_IFBLK
+        default:       return (uint64_t)-22;      // EINVAL (dirs use mkdir)
+    }
+
+    char name[128];
+    vfs_node_t *parent =
+        resolve_parent_and_name(path, name, sizeof(name));
+    if (!parent) return (uint64_t)-2;
+    if (!vfs_access(parent, 3)) {
+        vfs_close(parent);
+        return (uint64_t)-13;
+    }
+    vfs_node_t *existing = vfs_finddir(parent, name);
+    if (existing) {
+        vfs_close(existing);
+        vfs_close(parent);
+        return (uint64_t)-17; // EEXIST
+    }
+
+    int rc = vfs_mknod(parent, name, (uint16_t)(mode & 07777), type, NULL);
+    if (rc == 0 && (type == FS_CHARDEV || type == FS_BLOCKDEV)) {
+        vfs_node_t *created = vfs_finddir(parent, name);
+        if (created) {
+            created->inode = (uint32_t)dev; // st_rdev for stat()
+            vfs_close(created);
+        }
+    }
+    vfs_close(parent);
+    return rc == 0 ? 0 : (uint64_t)-1;
+}
+
 static uint64_t sys_readlink(uint64_t pathname_ptr, uint64_t buf_ptr,
                               uint64_t bufsiz, uint64_t a3, uint64_t a4,
                               uint64_t a5) {
@@ -1393,6 +1443,7 @@ static uint64_t sys_open_by_handle_at(uint64_t mountdirfd, uint64_t handle, uint
 void syscall_register_fs(void) {
     syscall_register(SYS_MKDIR,      sys_mkdir);
     syscall_register(SYS_MKDIRAT,    sys_mkdirat);
+    syscall_register(SYS_MKNOD,      sys_mknod);
     syscall_register(SYS_UNLINK,     sys_unlink);
     syscall_register(SYS_UNLINKAT,   sys_unlinkat);
     syscall_register(SYS_RMDIR,      sys_rmdir);

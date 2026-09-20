@@ -685,13 +685,14 @@ int ext4_alloc_extent(ext2_mount_t *mnt, ext2_inode_t *inode,
             goto done;
         }
         if (count == 0 && goal > 0 && blk != goal) {
-            /* Another concurrent file claimed the adjacent block. Jump ahead to avoid leapfrogging */
-            ext2_free_block(mnt, blk);
-            goal = blk + 256 + ((inode_num % 16) * 64);
-            blk = ext2_alloc_block_hint(mnt, goal);
-            if (!blk) {
-                fail_reason = 2;
-                goto done;
+            /* Prefer adjacency with the goal, but never give up the block we
+             * already own: if the jump-ahead target is also taken, keep this
+             * one instead of failing the whole write. */
+            uint32_t alt_goal = blk + 256 + ((inode_num % 16) * 64);
+            uint32_t alt = ext2_alloc_block_hint(mnt, alt_goal);
+            if (alt) {
+                ext2_free_block(mnt, blk);
+                blk = alt;
             }
         } else if (count > 0 && blk != blocks[0] + count) {
             ext2_free_block(mnt, blk);
@@ -724,6 +725,10 @@ done:
         klog_uint64(logical_block);
         klog_puts(" reason=");
         klog_uint64(fail_reason);
+        if (fail_reason == 2) {
+            klog_puts(" fs_free=");
+            klog_uint64(mnt->sb.s_free_blocks_count);
+        }
         klog_puts("\n");
         for (uint32_t i = 0; i < count; i++)
             ext2_free_block(mnt, blocks[i]);

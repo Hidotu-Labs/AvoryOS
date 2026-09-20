@@ -14,6 +14,22 @@
 struct drm_device global_ascentdrm_dev;
 static struct drm_stats drm_perf_stats;
 
+/* The DRM client allocates its own framebuffers, but this backend blits the
+ * damaged regions into the same scanout buffer the framebuffer console owns
+ * (fb_get_base()).  Until a client actually takes the display over, kernel
+ * messages are still expected there; the first real modeset/flip is the point
+ * where console painting must stop, or every later klog line lands on top of
+ * the graphics client's pixels. */
+static void drm_console_takeover(void) {
+  if (fb_get_kd_mode() == KD_GRAPHICS)
+    return;
+  /* Flush whatever the console already rendered, then hand the scanout over.
+   * Wiping the stale boot log gives the client a clean black screen instead
+   * of console text showing through wherever the client has not painted. */
+  fb_set_kd_mode(KD_GRAPHICS);
+  fb_clear(0x00000000u);
+}
+
 static inline uint64_t drm_read_cycles(void) {
   uint32_t lo, hi;
   __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) : : "memory");
@@ -1877,6 +1893,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
         g_ascent_drm_set_fb_fn(crtc->base.id, crtc->fb);
     }
     spinlock_release(&dev->lock);
+    drm_console_takeover();
     drm_commit_flipped_crtc(dev, crtc_cmd->crtc_id);
     return 0;
   }
@@ -1912,6 +1929,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       if (g_ascent_drm_pageflip_fn)
         g_ascent_drm_pageflip_fn(file, node, flip->crtc_id, flip->fb_id, flip->user_data);
       spinlock_release(&dev->lock);
+      drm_console_takeover();
       drm_commit_flipped_crtc(dev, flip->crtc_id);
       /* If no virtio hook took ownership, deliver event via legacy path */
       if (!g_ascent_drm_pageflip_fn) {
@@ -1925,6 +1943,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       return 0;
     }
     spinlock_release(&dev->lock);
+    drm_console_takeover();
     drm_commit_flipped_crtc(dev, flip->crtc_id);
     return 0;
   }
@@ -1938,6 +1957,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       klog_debug_puts("[DRM] ATOMIC commit triggering drm_commit\n");
 #endif
       drm_sync_cursor_backend(dev, 0);
+      drm_console_takeover();
       drm_commit_atomic(dev);
     }
     return ret;

@@ -20,6 +20,7 @@
 
 static mouse_state_t global_mouse_state = {0, 0, false, false, false};
 static bool prev_left = false, prev_right = false, prev_middle = false;
+static bool prev_side = false, prev_extra = false;
 static uint8_t mouse_cycle = 0;
 static uint8_t mouse_packet[3];
 
@@ -86,9 +87,13 @@ static void mouse_callback(struct registers *regs) {
     mouse_cycle = 0;
 
     // Decode buttons
-    global_mouse_state.left_button = (mouse_packet[0] & 0x01) != 0;
-    global_mouse_state.right_button = (mouse_packet[0] & 0x02) != 0;
-    global_mouse_state.middle_button = (mouse_packet[0] & 0x04) != 0;
+    uint32_t buttons = 0;
+    if (mouse_packet[0] & 0x01)
+      buttons |= 0x01; // left
+    if (mouse_packet[0] & 0x02)
+      buttons |= 0x02; // right
+    if (mouse_packet[0] & 0x04)
+      buttons |= 0x04; // middle
 
     // Decode deltas
     int32_t dx = (int32_t)mouse_packet[1];
@@ -104,54 +109,81 @@ static void mouse_callback(struct registers *regs) {
     // Screen Y axis: down is positive
     dy = -dy;
 
-    // Update absolute coordinates
-    global_mouse_state.x += dx;
-    global_mouse_state.y += dy;
-
-    // Clamp to screen
-    uint32_t width = fb_get_width();
-    uint32_t height = fb_get_height();
-
-    if (global_mouse_state.x < 0)
-      global_mouse_state.x = 0;
-    if (global_mouse_state.y < 0)
-      global_mouse_state.y = 0;
-    if (width > 0 && global_mouse_state.x >= (int32_t)width)
-      global_mouse_state.x = width - 1;
-    if (height > 0 && global_mouse_state.y >= (int32_t)height)
-      global_mouse_state.y = height - 1;
-
-    // Push evdev events for X11
-    evdev_device_t *mdev = evdev_get_mouse();
-    if (mdev) {
-      // Relative motion events
-      if (dx != 0)
-        evdev_push_event(mdev, EV_REL, REL_X, dx);
-      if (dy != 0)
-        evdev_push_event(mdev, EV_REL, REL_Y, dy);
-
-      // Button state change events
-      bool cur_left = global_mouse_state.left_button;
-      bool cur_right = global_mouse_state.right_button;
-      bool cur_middle = global_mouse_state.middle_button;
-
-      bool changed = dx != 0 || dy != 0;
-      if (cur_left != prev_left)
-        changed |= evdev_report_key(mdev, BTN_LEFT, cur_left);
-      if (cur_right != prev_right)
-        changed |= evdev_report_key(mdev, BTN_RIGHT, cur_right);
-      if (cur_middle != prev_middle)
-        changed |= evdev_report_key(mdev, BTN_MIDDLE, cur_middle);
-
-      prev_left = cur_left;
-      prev_right = cur_right;
-      prev_middle = cur_middle;
-
-      // SYN_REPORT marks the end of this event batch
-      if (changed)
-        evdev_sync(mdev);
-    }
+    mouse_apply_report(dx, dy, 0, 0, buttons);
     break;
+  }
+}
+
+void mouse_apply_report(int32_t dx, int32_t dy, int32_t wheel, int32_t hwheel,
+                        uint32_t buttons) {
+  static uint32_t apply_logs;
+  apply_logs++;
+  if (apply_logs <= 32 || (apply_logs & 0x3FFU) == 0)
+    klogf("[MOUSE] apply #%u dx=%d dy=%d wheel=%d hwheel=%d buttons=0x%X "
+          "pos=(%d,%d)\n",
+          apply_logs, dx, dy, wheel, hwheel, buttons, global_mouse_state.x,
+          global_mouse_state.y);
+
+  // Update the shared absolute state (the PS/2 and USB paths both feed it).
+  global_mouse_state.x += dx;
+  global_mouse_state.y += dy;
+
+  uint32_t width = fb_get_width();
+  uint32_t height = fb_get_height();
+
+  if (global_mouse_state.x < 0)
+    global_mouse_state.x = 0;
+  if (global_mouse_state.y < 0)
+    global_mouse_state.y = 0;
+  if (width > 0 && global_mouse_state.x >= (int32_t)width)
+    global_mouse_state.x = (int32_t)width - 1;
+  if (height > 0 && global_mouse_state.y >= (int32_t)height)
+    global_mouse_state.y = (int32_t)height - 1;
+
+  bool left = (buttons & 0x01) != 0;
+  bool right = (buttons & 0x02) != 0;
+  bool middle = (buttons & 0x04) != 0;
+  bool side = (buttons & 0x08) != 0;
+  bool extra = (buttons & 0x10) != 0;
+
+  global_mouse_state.left_button = left;
+  global_mouse_state.right_button = right;
+  global_mouse_state.middle_button = middle;
+
+  // Push evdev events for X11.  Xorg reads relative deltas and button state
+  // transitions; SYN_REPORT terminates one report batch.
+  evdev_device_t *mdev = evdev_get_mouse();
+  if (mdev) {
+    bool changed = dx != 0 || dy != 0 || wheel != 0 || hwheel != 0;
+
+    if (dx != 0)
+      evdev_push_event(mdev, EV_REL, REL_X, dx);
+    if (dy != 0)
+      evdev_push_event(mdev, EV_REL, REL_Y, dy);
+    if (wheel != 0)
+      evdev_push_event(mdev, EV_REL, REL_WHEEL, wheel);
+    if (hwheel != 0)
+      evdev_push_event(mdev, EV_REL, REL_HWHEEL, hwheel);
+
+    if (left != prev_left)
+      changed |= evdev_report_key(mdev, BTN_LEFT, left);
+    if (right != prev_right)
+      changed |= evdev_report_key(mdev, BTN_RIGHT, right);
+    if (middle != prev_middle)
+      changed |= evdev_report_key(mdev, BTN_MIDDLE, middle);
+    if (side != prev_side)
+      changed |= evdev_report_key(mdev, BTN_SIDE, side);
+    if (extra != prev_extra)
+      changed |= evdev_report_key(mdev, BTN_EXTRA, extra);
+
+    prev_left = left;
+    prev_right = right;
+    prev_middle = middle;
+    prev_side = side;
+    prev_extra = extra;
+
+    if (changed)
+      evdev_sync(mdev);
   }
 }
 

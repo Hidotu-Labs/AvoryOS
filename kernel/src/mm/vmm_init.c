@@ -100,10 +100,19 @@ static void vmm_protect_table_recursive(uint64_t phys, int level) {
 
     if (level > 1) {
       if (entry & PAGE_FLAG_PS) {
+        /* A 2 MB/1 GB huge page can start inside a reclaimable entry while
+         * most of its range covers ordinary usable RAM.  Marking the whole
+         * huge-page range would set the buddy allocator's allocation bitmap
+         * on pages that are still linked in its free lists, which desyncs
+         * the allocator (the blocks can then be handed out twice or dropped
+         * by the integrity checks).  Protect only the pages that really are
+         * reclaimable. */
         uint64_t leaf_phys = entry & PAGE_MASK;
-        if (pmm_is_reclaimable(leaf_phys)) {
-          size_t page_count = (level == 3) ? 0x40000 : 0x200;
-          pmm_mark_used((void *)leaf_phys, page_count);
+        size_t page_count = (level == 3) ? 0x40000 : 0x200;
+        for (size_t p = 0; p < page_count; p++) {
+          uint64_t page = leaf_phys + p * PAGE_SIZE;
+          if (pmm_is_reclaimable(page))
+            pmm_mark_used((void *)page, 1);
         }
       } else {
         vmm_protect_table_recursive(entry & PAGE_MASK, level - 1);

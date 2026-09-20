@@ -9,6 +9,11 @@
 // before the panic, because the panic itself only writes to the console.
 void kpf_dump_page_fault(struct registers *regs, uint64_t cr2);
 
+// Full lock-free dump for exceptions that never reach the paging engine
+// (#UD, #GP, #SS, unhandled vectors): machine state, thread context, a page
+// walk for RIP, the code bytes there, a stack scan and the RBP chain.
+void kpf_dump_exception(const char *reason, struct registers *regs);
+
 // One lock-free line announcing that a panic started, for the case where the
 // console dump that follows never gets finished.
 void kpf_dump_panic_entry(const char *reason, struct registers *regs);

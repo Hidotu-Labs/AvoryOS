@@ -255,29 +255,11 @@ static uint64_t sys_pidfd_open(uint64_t pid, uint64_t flags, uint64_t a2,
 void process_do_exit(uint64_t status) __attribute__((noreturn));
 void process_do_exit(uint64_t status) {
   struct thread *current = sched_get_current();
-  if (current && current->is_forked_child) {
-    klog_proc_exit(current->tid, current->tgid,
-                   (current->clone_flags & CLONE_THREAD) != 0,
-                   current->comm, status);
-  }
   if (current && current->tid_address) {
     uint32_t *tidptr = (uint32_t *)current->tid_address;
     if (vmm_is_user_addr_range_writable((uint64_t)tidptr, sizeof(*tidptr))) {
       __atomic_store_n(tidptr, 0, __ATOMIC_RELEASE);
-      uint64_t woken = futex_wake_user(tidptr, 1);
-      klog_puts("[PROC] clear_child_tid tid=");
-      klog_uint64(current->tid);
-      klog_puts(" addr=");
-      klog_hex64((uint64_t)tidptr);
-      klog_puts(" woken=");
-      klog_uint64(woken);
-      klog_puts("\n");
-    } else {
-      klog_puts("[PROC] clear_child_tid tid=");
-      klog_uint64(current->tid);
-      klog_puts(" addr=");
-      klog_hex64((uint64_t)tidptr);
-      klog_puts(" NOT WRITABLE\n");
+      futex_wake_user(tidptr, 1);
     }
     current->tid_address = NULL;
   }
@@ -398,18 +380,6 @@ static uint64_t __attribute__((noreturn)) sys_exit(uint64_t status, uint64_t a1,
   (void)a3;
   (void)a4;
   (void)a5;
-  struct thread *cur = sched_get_current();
-  if (cur) {
-    klog_puts("[PROC] sys_exit: tid=");
-    klog_uint64(cur->tid);
-    klog_puts(" tgid=");
-    klog_uint64(cur->tgid);
-    klog_puts(" comm=");
-    klog_puts(cur->comm[0] ? cur->comm : "?");
-    klog_puts(" status=");
-    klog_uint64(status);
-    klog_puts("\n");
-  }
   process_do_exit((int)status);
 }
 
@@ -421,18 +391,6 @@ sys_exit_group(uint64_t status, uint64_t a1, uint64_t a2, uint64_t a3,
   (void)a3;
   (void)a4;
   (void)a5;
-  struct thread *cur = sched_get_current();
-  if (cur) {
-    klog_puts("[PROC] sys_exit_group: tid=");
-    klog_uint64(cur->tid);
-    klog_puts(" tgid=");
-    klog_uint64(cur->tgid);
-    klog_puts(" comm=");
-    klog_puts(cur->comm[0] ? cur->comm : "?");
-    klog_puts(" status=");
-    klog_uint64(status);
-    klog_puts("\n");
-  }
   sched_terminate_thread_group(sched_get_current());
   process_do_exit(status);
 }
@@ -468,6 +426,8 @@ static uint64_t sys_gettid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
   (void)a5;
 
   struct thread *current = sched_get_current();
+  if (current && current->is_main_session)
+    return 1;
   return current ? current->tid : 0;
 }
 
@@ -482,6 +442,8 @@ static uint64_t sys_getpid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 
   struct thread *current = sched_get_current();
   if (current) {
+    if (current->is_main_session)
+      return 1;
     return current->tgid;
   }
   return 0;
@@ -1885,6 +1847,31 @@ struct utsname {
   char domainname[65];
 };
 
+/* System hostname: set by sethostname(2), reported back through uname(2).
+ * OpenRC's `hostname` service fails the whole boot runlevel without it. */
+static char system_nodename[65] = "AvoryOS";
+
+static uint64_t sys_sethostname(uint64_t name_ptr, uint64_t len, uint64_t a2,
+                                uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+
+  if (len > 64)
+    return (uint64_t)-22; // EINVAL: Linux caps the hostname at 64 bytes
+  if (len && !name_ptr)
+    return (uint64_t)-14; // EFAULT
+
+  char tmp[65];
+  if (len && copy_from_user(tmp, (const void *)name_ptr, len) != 0)
+    return (uint64_t)-14;
+  tmp[len] = '\0';
+
+  memcpy(system_nodename, tmp, len + 1);
+  return 0;
+}
+
 static uint64_t sys_uname(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5) {
   (void)a1;
@@ -1897,7 +1884,7 @@ static uint64_t sys_uname(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
     return (uint64_t)-14; // EFAULT
 
   strcpy(buf->sysname, "Ascension");
-  strcpy(buf->nodename, "AvoryOS");
+  strcpy(buf->nodename, system_nodename);
   strcpy(buf->release, "2.5.0 Beta");
 
   // Dynamic date/time from RTC
@@ -2327,8 +2314,13 @@ static uint64_t sys_getppid(struct syscall_regs *regs) {
   struct thread *t = sched_get_current();
   if (!t)
     return 0;
-  if (t->parent)
+  if (t->is_main_session)
+    return 0;
+  if (t->parent) {
+    if (t->parent->is_main_session)
+      return 1;
     return t->parent->tgid;
+  }
   return 0;
 }
 
@@ -3274,6 +3266,7 @@ void syscall_register_process(void) {
   syscall_register(SYS_WAIT4, sys_wait4);
   syscall_register(SYS_WAITID, sys_waitid);
   syscall_register(SYS_UNAME, sys_uname);
+  syscall_register(SYS_SETHOSTNAME, sys_sethostname);
   syscall_register(SYS_SYSINFO, sys_sysinfo);
   syscall_register(SYS_UPTIME, sys_uptime);
   syscall_register(SYS_GETCWD, sys_getcwd);

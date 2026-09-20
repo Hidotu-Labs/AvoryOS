@@ -193,6 +193,52 @@ static int evdev_vfs_poll(struct vfs_node *node, int events) {
   return revents;
 }
 
+// VFS write callback.
+//
+// Linux evdev nodes accept EV_LED / EV_REP / EV_SYN records from userspace;
+// Xorg's evdev driver batches five EV_LED events plus SYN_REPORT to sync the
+// keyboard LEDs and treats a short write as a failure ("Failed to set
+// keyboard controls").  Consume the whole buffer and remember the LED state
+// so the error storm stops and EVIOCGLED has something to report.
+static uint32_t evdev_vfs_write(struct vfs_node *node, uint32_t offset,
+                                uint32_t size, uint8_t *buffer) {
+  (void)offset;
+  evdev_device_t *dev = node ? (evdev_device_t *)node->device : NULL;
+  if (!dev || !buffer)
+    return (uint32_t)-14; // -EFAULT
+
+  if (size == 0)
+    return 0;
+  if (size % sizeof(struct input_event))
+    return (uint32_t)-22; // -EINVAL: partial records are not writable
+
+  uint32_t count = size / sizeof(struct input_event);
+  for (uint32_t i = 0; i < count; i++) {
+    const struct input_event *ev =
+        (const struct input_event *)(buffer + i * sizeof(struct input_event));
+
+    switch (ev->type) {
+    case EV_LED:
+      if (ev->code < 8) {
+        spinlock_acquire(&dev->lock);
+        if (ev->value)
+          dev->led_state |= (uint8_t)(1u << ev->code);
+        else
+          dev->led_state &= (uint8_t)~(1u << ev->code);
+        spinlock_release(&dev->lock);
+      }
+      break;
+    case EV_REP:
+    case EV_SYN:
+      break;
+    default:
+      return (uint32_t)-22; // -EINVAL
+    }
+  }
+
+  return size;
+}
+
 // Helper: set a bit in a bitmask array
 static void set_bit(uint8_t *mask, int bit) {
   mask[bit / 8] |= (1 << (bit % 8));
@@ -298,6 +344,12 @@ static int evdev_vfs_ioctl(struct vfs_node *node, uint32_t request,
       spinlock_acquire(&dev->lock);
       memcpy(buf, dev->key_state, state_len);
       spinlock_release(&dev->lock);
+    } else if ((request & 0xC000FFFF) == 0x80004519) {
+      if (len > 0) {
+        spinlock_acquire(&dev->lock);
+        buf[0] = dev->led_state;
+        spinlock_release(&dev->lock);
+      }
     }
     return 0;
   }
@@ -355,10 +407,14 @@ static int evdev_vfs_ioctl(struct vfs_node *node, uint32_t request,
 
     if (ev_type == 0) {
       // EV_SYN bitmask (which event types this device supports)
-      set_bit(buf, EV_SYN);
-      set_bit(buf, EV_KEY);
-      if (dev->type == EVDEV_MOUSE)
+      if (EV_SYN / 8 < (int)len)
+        set_bit(buf, EV_SYN);
+      if (EV_KEY / 8 < (int)len)
+        set_bit(buf, EV_KEY);
+      if (dev->type == EVDEV_MOUSE && EV_REL / 8 < (int)len)
         set_bit(buf, EV_REL);
+      if (dev->type == EVDEV_KEYBOARD && EV_LED / 8 < (int)len)
+        set_bit(buf, EV_LED);
       return 0;
     }
 
@@ -371,21 +427,25 @@ static int evdev_vfs_ioctl(struct vfs_node *node, uint32_t request,
             set_bit(buf, i);
         }
       } else if (dev->type == EVDEV_MOUSE) {
-        // BTN_LEFT (0x110) / BTN_MOUSE = 272
-        if (272 / 8 < (int)len)
-          set_bit(buf, 272);
-        if (273 / 8 < (int)len)
-          set_bit(buf, 273);
-        if (274 / 8 < (int)len)
-          set_bit(buf, 274);
+        // BTN_LEFT (0x110) / BTN_MOUSE = 272, plus side/extra buttons
+        for (int b = BTN_LEFT; b <= BTN_EXTRA; b++) {
+          if (b / 8 < (int)len)
+            set_bit(buf, b);
+        }
       }
       return 0;
     }
 
     if (ev_type == EV_REL) {
       if (dev->type == EVDEV_MOUSE) {
-        set_bit(buf, REL_X);
-        set_bit(buf, REL_Y);
+        if (REL_X / 8 < (int)len)
+          set_bit(buf, REL_X);
+        if (REL_Y / 8 < (int)len)
+          set_bit(buf, REL_Y);
+        if (REL_WHEEL / 8 < (int)len)
+          set_bit(buf, REL_WHEEL);
+        if (REL_HWHEEL / 8 < (int)len)
+          set_bit(buf, REL_HWHEEL);
       }
       return 0;
     }
@@ -394,6 +454,18 @@ static int evdev_vfs_ioctl(struct vfs_node *node, uint32_t request,
       if (dev->type == EVDEV_MOUSE) {
         set_bit(buf, ABS_X);
         set_bit(buf, ABS_Y);
+      }
+      return 0;
+    }
+
+    if (ev_type == EV_LED) {
+      if (dev->type == EVDEV_KEYBOARD) {
+        if (LED_NUML / 8 < (int)len)
+          set_bit(buf, LED_NUML);
+        if (LED_CAPSL / 8 < (int)len)
+          set_bit(buf, LED_CAPSL);
+        if (LED_SCROLLL / 8 < (int)len)
+          set_bit(buf, LED_SCROLLL);
       }
       return 0;
     }
@@ -513,6 +585,7 @@ static void evdev_create_node(evdev_device_t *dev, const char *node_name, vfs_no
     node->inode = (13 << 8) | 65;
   }
   node->read = evdev_vfs_read;
+  node->write = evdev_vfs_write;
   node->poll = evdev_vfs_poll;
   node->ioctl = evdev_vfs_ioctl;
   node->wait_queue = &dev->wait;
@@ -548,6 +621,7 @@ static void evdev_create_node(evdev_device_t *dev, const char *node_name, vfs_no
          mice->mask = node->mask;
          mice->device = node->device;
          mice->read = node->read;
+         mice->write = node->write;
          mice->poll = node->poll;
          mice->ioctl = node->ioctl;
          mice->wait_queue = node->wait_queue;

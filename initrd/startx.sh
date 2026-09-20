@@ -108,6 +108,14 @@ if [ ! -s /etc/machine-id ]; then
 fi
 [ -f /var/lib/dbus/machine-id ] || cp -f /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null || true
 
+# Userspace services (PipeWire, D-Bus activated apps, ...) derive their socket
+# paths from XDG_RUNTIME_DIR.  LightDM does not create one on AvoryOS, so set
+# a stable path before the session bus inherits the environment; otherwise
+# clients fall back to /run/pipewire, which the session daemon never uses.
+XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-0}"
+export XDG_RUNTIME_DIR
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 0700 "$XDG_RUNTIME_DIR"
+
 if command -v dbus-daemon >/dev/null 2>&1 && [ ! -S /run/dbus/system_bus_socket ]; then
     rm -f /tmp/ascent-system-dbus.log
     dbus-daemon --system --nofork >/tmp/ascent-system-dbus.log 2>&1 &
@@ -124,6 +132,10 @@ if command -v dbus-daemon >/dev/null 2>&1; then
     rm -f /tmp/avory-session-bus
     dbus-daemon --session --fork --address=unix:path=/tmp/avory-session-bus 2>/dev/null || true
     export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/avory-session-bus
+    # DISPLAY is added by the X session wrapper (xinitrc.d hook) once LightDM
+    # has started the server; this publishes everything known at this point.
+    command -v dbus-update-activation-environment >/dev/null 2>&1 &&
+        dbus-update-activation-environment --all 2>/dev/null || true
 fi
 
 chmod 1777 /tmp /tmp/.X11-unix 2>/dev/null || true

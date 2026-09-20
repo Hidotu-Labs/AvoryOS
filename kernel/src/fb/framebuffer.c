@@ -580,13 +580,15 @@ void fb_register_vfs(void) {
 
     devfs_register_node("console", &console_vfs_node);
     devfs_register_node("tty0", &tty0_vfs_node);
+    devfs_register_node("tty1", &console_vfs_node);
     devfs_register_node("tty", &tty_vfs_node);
 
     fb_register_device_node("console", &console_vfs_node);
     fb_register_device_node("tty0", &tty0_vfs_node);
+    fb_register_device_node("tty1", &console_vfs_node);
     fb_register_device_node("tty", &tty_vfs_node);
 
-    klog_puts("[FB] Registered /dev/fb0, /dev/fb, /dev/console, /dev/tty0, and /dev/tty devices\n");
+    klog_puts("[FB] Registered /dev/fb0, /dev/fb, /dev/console, /dev/tty0, /dev/tty1, and /dev/tty devices\n");
 }
 
 /* ── DRM Backend Detection ───────────────────────────────────────────────── */

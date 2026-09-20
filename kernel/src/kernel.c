@@ -3,6 +3,7 @@
 #include "apic/lapic.h"
 #include "apic/lapic_timer.h"
 #include "console/console.h"
+#include "console/debug.h"
 #include "console/klog.h"
 #include "cpu/fault.h"
 #include "cpu/features.h"
@@ -58,6 +59,7 @@
 #include "hal/hal.h"
 #include "io/io.h"
 #include "lib/radix_tree.h"
+#include "lib/string.h"
 #include "mm/dma_alloc.h"
 #include "mm/heap.h"
 #include "mm/pcid.h"
@@ -154,6 +156,27 @@ static void halt(void) {
   }
 }
 
+/* Kernel-cmdline helpers for diagnostic boot options. */
+static bool cmdline_has(const char *name) {
+  return kernel_boot_cmdline && strstr(kernel_boot_cmdline, name) != NULL;
+}
+
+static uint32_t cmdline_uint(const char *name, uint32_t fallback) {
+  if (!kernel_boot_cmdline)
+    return fallback;
+  const char *p = strstr(kernel_boot_cmdline, name);
+  if (!p)
+    return fallback;
+  p += strlen(name);
+  uint32_t value = 0;
+  bool any = false;
+  while (*p >= '0' && *p <= '9' && value < 1000000) {
+    value = value * 10 + (uint32_t)(*p++ - '0');
+    any = true;
+  }
+  return any ? value : fallback;
+}
+
 static void init_thread_entry(void);
 void kmain_high_half(void);
 
@@ -198,30 +221,94 @@ static void init_thread_entry(void) {
   precache_hot_files();
 
   // Clear console only once when userland starts
-  console_clear();
-  klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
-                           " Console cleared, starting session...\n");
+  if (!cmdline_has("screenlog")) {
+    console_clear();
+    klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
+                             " Console cleared, starting session...\n");
+  } else {
+    klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
+                             " screenlog: keeping boot log on screen.\n");
+  }
+
+  /* `bootpause=N` holds the boot log on screen for N seconds so a machine
+   * without serial can be photographed before userland takes over. */
+  {
+    uint32_t pause_s = cmdline_uint("bootpause=", 0);
+    if (pause_s > 600)
+      pause_s = 600;
+    if (pause_s) {
+      klog_puts("[BOOT] holding boot log for ");
+      klog_uint64(pause_s);
+      klog_puts(" s (bootpause)\n");
+      lapic_timer_sleep(pause_s * 1000U);
+    }
+  }
+
+  char custom_init[128] = {0};
+  if (kernel_boot_cmdline) {
+    const char *p = strstr(kernel_boot_cmdline, "init=");
+    if (p) {
+      p += 5;
+      size_t i = 0;
+      while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' &&
+             i < sizeof(custom_init) - 1) {
+        custom_init[i++] = *p++;
+      }
+      custom_init[i] = '\0';
+    }
+  }
 
   while (1) {
-    // Start AvoryD as the main userspace session. Fall back to bash if the
-    // root filesystem does not provide it yet.
-    const char *sh_argv[] = {"/bin/avoryd", NULL};
-
     struct thread *current = sched_get_current();
     if (current) {
       current->is_main_session = true;
+      extern spinlock_t tid_lock;
+      spinlock_acquire(&tid_lock);
+      current->tid = 1;
+      current->tgid = 1;
+      current->pgid = 1;
+      current->sid = 1;
+      spinlock_release(&tid_lock);
     }
 
-    if (!process_exec_argv(sh_argv)) {
-      // Fallback: try bash directly if sh failed
-      const char *bash_argv[] = {"/bin/bash", NULL};
-      if (!process_exec_argv(bash_argv)) {
-        klog_puts("\n" KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
-                  " Failed to start Bash. Falling back to shell.\n");
-        shell_init();
-        shell_run();
-        break;
+    if (custom_init[0]) {
+      const char *custom_argv[] = {custom_init, NULL};
+      klog_puts("[ INIT ] Executing requested init: ");
+      klog_puts(custom_init);
+      klog_puts("\n");
+      klog_freeze_boot_log();
+      if (process_exec_argv(custom_argv)) {
+        continue;
       }
+      klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
+                             " Failed to start requested init. Falling back...\n");
+    }
+
+    // Primary: OpenRC or SysV init (/sbin/init, /sbin/openrc-init)
+    klog_freeze_boot_log();
+    const char *init_argv[] = {"/sbin/init", NULL};
+    if (process_exec_argv(init_argv)) {
+      continue;
+    }
+    const char *openrc_argv[] = {"/sbin/openrc-init", NULL};
+    if (process_exec_argv(openrc_argv)) {
+      continue;
+    }
+
+    // Secondary fallback: /bin/avoryd
+    const char *sh_argv[] = {"/bin/avoryd", NULL};
+    if (process_exec_argv(sh_argv)) {
+      continue;
+    }
+
+    // Fallback: try bash directly if sh failed
+    const char *bash_argv[] = {"/bin/bash", NULL};
+    if (!process_exec_argv(bash_argv)) {
+      klog_puts("\n" KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
+                " Failed to start Bash. Falling back to shell.\n");
+      shell_init();
+      shell_run();
+      break;
     }
   }
 }
@@ -366,7 +453,13 @@ void kmain(void) {
   dma_alloc_init();
   sb16_reserve_dma();
   console_init(fb);
-  klog_set_screen_logging(false);
+  /* Diagnostic boot (`screenlog`): keep the kernel log on the framebuffer,
+   * paired with the Limine Rescue Shell entry, on a machine without serial.
+   * Normal boots give the console the screen and send klog to serial only. */
+  if (cmdline_has("screenlog"))
+    klog_set_console_sink(true);
+  else
+    klog_set_screen_logging(false);
 
   /* `fb_bench=1` measures the damage/swap path before any boot output exists
    * and blanks the screen again when it is done. */
@@ -440,7 +533,13 @@ void kmain_high_half(void) {
     klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
                              " APIC interrupt mode ACTIVE.\n\n");
 
+    /* The PIT-based TSC calibration ran before ACPI brought the HPET up.
+     * Re-derive the rate from the HPET so a broken PIT latch cannot poison
+     * monotonic_ms() (timeouts, sleeps, console frame pacing). */
+    tsc_recalibrate_hpet();
+
     lapic_timer_init();
+    DBG("[BOOT] LAPIC timer init done\n");
 
     if (hpet_is_backup_available()) {
       klog_puts(KLOG_CLR_BLUE "[ INFO ]" KLOG_CLR_RESET
@@ -448,13 +547,16 @@ void kmain_high_half(void) {
     }
 
     tlb_shootdown_init();
+    DBG("[BOOT] TLB shootdown init done\n");
 
     /* Hang/deadlock report.  Registered before the APs are brought online so
      * every core can already answer the liveness probe, and the heartbeat
      * grace period is measured from here. */
     lockdiag_init();
+    DBG("[BOOT] lockdiag init done\n");
 
     cpu_init_aps();
+    DBG("[BOOT] cpu_init_aps done\n");
   } else {
     klog_puts(KLOG_CLR_YELLOW
               "[ WARN ]" KLOG_CLR_RESET
@@ -503,6 +605,23 @@ void kmain_high_half(void) {
   uhci_init();
   ohci_init();
 
+  /* `usbdump` in the kernel cmdline prints the USB diagnostics at boot.
+   * /proc/usb has the same content after boot; this variant exists for
+   * rescue boots and for machines where only the serial log is captured. */
+  if (cmdline_has("usbdump")) {
+    static char usbdump_buf[1025];
+    uint32_t usbdump_off = 0;
+    uint32_t usbdump_n;
+    klog_puts("=== USB diagnostics ===\n");
+    while ((usbdump_n = usb_diag_read(usbdump_off, sizeof(usbdump_buf) - 1,
+                                      (uint8_t *)usbdump_buf)) > 0) {
+      usbdump_buf[usbdump_n] = '\0';
+      klog_puts(usbdump_buf);
+      usbdump_off += usbdump_n;
+    }
+    klog_puts("=== end USB diagnostics ===\n");
+  }
+
   // Storage controllers.  NVMe probes before AHCI so a machine with both
   // prefers the NVMe namespace for the root filesystem.
   nvme_init();
@@ -510,6 +629,12 @@ void kmain_high_half(void) {
   {
     extern void nvme_selftest(void);
     nvme_selftest();
+  }
+#endif
+#ifdef USB_MOUSE_SELFTEST
+  {
+    extern void usb_mouse_selftest(void);
+    usb_mouse_selftest();
   }
 #endif
 

@@ -5,6 +5,7 @@
 #include "drivers/gpu/drm/drm.h"
 #include "drivers/gpu/virtio_gpu/virtio_gpu.h"
 #include "drivers/timer/rtc.h"
+#include "drivers/usb/usb.h"
 #include "cpu/tsc.h"
 #include "fs/ramfs.h"
 #include "fs/vfs.h"
@@ -633,6 +634,44 @@ uint32_t procfs_filesystems_read(vfs_node_t *node, uint32_t offset,
     size = len - offset;
   memcpy(buffer, fs + offset, size);
   return size;
+}
+
+/* /proc/klog — the persistent boot-log ring (console/klog.c).  Reading from
+ * offset 0 rewinds to the oldest retained byte. */
+uint32_t procfs_klog_read(vfs_node_t *node, uint32_t offset, uint32_t size,
+                          uint8_t *buffer) {
+  uint32_t total = klog_ring_length();
+  node->length = total;
+  return klog_ring_read(offset, size, buffer);
+}
+
+/* /proc/bootlog — frozen boot-log snapshot (console/klog.c). */
+uint32_t procfs_bootlog_read(vfs_node_t *node, uint32_t offset, uint32_t size,
+                             uint8_t *buffer) {
+  uint32_t total = klog_bootlog_length();
+  node->length = total;
+  return klog_bootlog_read(offset, size, buffer);
+}
+
+/* /proc/usb — USB controller/device/HID-driver diagnostics (drivers/usb). */
+uint32_t procfs_usb_read(vfs_node_t *node, uint32_t offset, uint32_t size,
+                         uint8_t *buffer) {
+  (void)node;
+  return usb_diag_read(offset, size, buffer);
+}
+
+/* /proc/usb_mouse, /proc/usb_xhci — short per-subsystem views so a single
+ * `cat` on a console without scrollback shows the failing pipe. */
+uint32_t procfs_usb_mouse_read(vfs_node_t *node, uint32_t offset, uint32_t size,
+                               uint8_t *buffer) {
+  (void)node;
+  return usb_mouse_diag_read(offset, size, buffer);
+}
+
+uint32_t procfs_usb_xhci_read(vfs_node_t *node, uint32_t offset, uint32_t size,
+                              uint8_t *buffer) {
+  (void)node;
+  return usb_xhci_diag_read(offset, size, buffer);
 }
 
 /* The real Limine command line (kernel/src/kernel.c), matching upstream
@@ -1427,6 +1466,71 @@ void procfs_init(void) {
       meminfo_node->length = 512; // Dummy size, redefined on read
 
       ramfs_mount_node(procfs_root, meminfo_node);
+    }
+
+    // Add /proc/klog: the persistent boot-log ring (console/klog.c).  Serial
+    // capture is not always available on real hardware; this makes the boot
+    // log readable after the machine is up.
+    vfs_node_t *klog_node = kmalloc(sizeof(vfs_node_t));
+    if (klog_node) {
+      vfs_node_init(klog_node);
+      strncpy(klog_node->name, "klog", 127);
+      klog_node->flags = FS_FILE | FS_PERSISTENT;
+      klog_node->mask = 0444;
+      klog_node->read = procfs_klog_read;
+      klog_node->length = 65536;
+      ramfs_mount_node(procfs_root, klog_node);
+    }
+
+    // Add /proc/bootlog: frozen snapshot of the boot log up to the first
+    // userspace exec, so driver bring-up lines survive userland log spam.
+    vfs_node_t *bootlog_node = kmalloc(sizeof(vfs_node_t));
+    if (bootlog_node) {
+      vfs_node_init(bootlog_node);
+      strncpy(bootlog_node->name, "bootlog", 127);
+      bootlog_node->flags = FS_FILE | FS_PERSISTENT;
+      bootlog_node->mask = 0444;
+      bootlog_node->read = procfs_bootlog_read;
+      bootlog_node->length = 262144;
+      ramfs_mount_node(procfs_root, bootlog_node);
+    }
+
+    // Add /proc/usb: USB host-controller, device and HID-driver state.
+    // The driver's probe decisions survive boot here, so a machine without a
+    // serial capture can still show why a mouse was not claimed.
+    vfs_node_t *usb_node = kmalloc(sizeof(vfs_node_t));
+    if (usb_node) {
+      vfs_node_init(usb_node);
+      strncpy(usb_node->name, "usb", 127);
+      usb_node->flags = FS_FILE | FS_PERSISTENT;
+      usb_node->mask = 0444;
+      usb_node->read = procfs_usb_read;
+      usb_node->length = 16384;
+      ramfs_mount_node(procfs_root, usb_node);
+    }
+
+    // Add /proc/usb_mouse and /proc/usb_xhci: short focused views of the same
+    // state, so one `cat` on a screen without scrollback is enough.
+    vfs_node_t *usb_mouse_node = kmalloc(sizeof(vfs_node_t));
+    if (usb_mouse_node) {
+      vfs_node_init(usb_mouse_node);
+      strncpy(usb_mouse_node->name, "usb_mouse", 127);
+      usb_mouse_node->flags = FS_FILE | FS_PERSISTENT;
+      usb_mouse_node->mask = 0444;
+      usb_mouse_node->read = procfs_usb_mouse_read;
+      usb_mouse_node->length = 16384;
+      ramfs_mount_node(procfs_root, usb_mouse_node);
+    }
+
+    vfs_node_t *usb_xhci_node = kmalloc(sizeof(vfs_node_t));
+    if (usb_xhci_node) {
+      vfs_node_init(usb_xhci_node);
+      strncpy(usb_xhci_node->name, "usb_xhci", 127);
+      usb_xhci_node->flags = FS_FILE | FS_PERSISTENT;
+      usb_xhci_node->mask = 0444;
+      usb_xhci_node->read = procfs_usb_xhci_read;
+      usb_xhci_node->length = 32768;
+      ramfs_mount_node(procfs_root, usb_xhci_node);
     }
 
     // Add /proc/drmstats

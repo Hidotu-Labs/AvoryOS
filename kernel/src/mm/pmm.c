@@ -908,6 +908,8 @@ uint16_t pmm_get_ref(void *ptr) {
   return __atomic_load_n(&refcounts[pfn - lowest_page], __ATOMIC_RELAXED);
 }
 
+static volatile uint64_t buddy_mark_used_skips;
+
 void pmm_mark_used(void *ptr, size_t count) {
   if (count == 0 || !ptr)
     return;
@@ -917,7 +919,29 @@ void pmm_mark_used(void *ptr, size_t count) {
     return;
 
   size_t start_bit = addr / PAGE_SIZE;
-  bitmap_set_range(bitmap, start_bit, count);
+
+  /* Setting the allocation bit on a page that is still linked in a buddy
+   * free list desynchronizes the allocator: the node fails the free-list
+   * integrity checks (bitmap says "allocated") or the page gets handed out
+   * while the list still points at it.  Free managed pages are owned by the
+   * buddy allocator, so refuse to mark them and report the caller bug. */
+  for (size_t i = 0; i < count; i++) {
+    size_t pfn = start_bit + i;
+    if (managed_bitmap && pfn >= lowest_page && pfn < highest_page &&
+        bitmap_test(managed_bitmap, pfn - lowest_page) &&
+        !bitmap_test(bitmap, pfn - lowest_page)) {
+      uint64_t n =
+          __atomic_add_fetch(&buddy_mark_used_skips, 1, __ATOMIC_RELAXED);
+      if (n <= 8) {
+        klog_puts(KLOG_CLR_RED
+                  "[PMM] WARN: pmm_mark_used on a free buddy page " KLOG_CLR_RESET);
+        klog_hex64((uint64_t)pfn * PAGE_SIZE);
+        klog_puts(" - ignored\n");
+      }
+      continue;
+    }
+    bitmap_set_range(bitmap, pfn, 1);
+  }
 }
 
 bool pmm_is_reclaimable(uint64_t phys) {

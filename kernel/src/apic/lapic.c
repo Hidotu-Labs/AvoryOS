@@ -10,6 +10,33 @@
 static volatile uint32_t *lapic_base = NULL;
 static uint64_t lapic_phys_base = 0;
 
+// Set when the LAPIC is in x2APIC mode and must be driven through MSRs.
+// lapic_init() detects the mode the firmware left the LAPIC in; the same
+// accessors below then serve IPIs, EOI and the timer in both xAPIC (MMIO)
+// and x2APIC (MSR) modes.
+static bool lapic_x2apic = false;
+
+#define MSR_IA32_APIC_BASE 0x1B
+#define APIC_BASE_X2APIC_ENABLE (1ULL << 10)
+#define X2APIC_MSR_BASE 0x800u
+
+static inline uint64_t lapic_rdmsr(uint32_t msr) {
+  uint32_t lo, hi;
+  __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+  return ((uint64_t)hi << 32) | lo;
+}
+
+static inline void lapic_wrmsr(uint32_t msr, uint64_t value) {
+  uint32_t lo = (uint32_t)(value & 0xFFFFFFFF);
+  uint32_t hi = (uint32_t)(value >> 32);
+  __asm__ volatile("wrmsr" : : "c"(msr), "a"(lo), "d"(hi));
+}
+
+// x2APIC exposes each LAPIC register as an MSR at 0x800 + (MMIO offset / 16).
+static inline uint32_t x2apic_msr(uint32_t reg) {
+  return X2APIC_MSR_BASE + (reg >> 4);
+}
+
 uint64_t lapic_get_va(void) { return (uint64_t)lapic_base; }
 uint64_t lapic_get_phys(void) { return lapic_phys_base; }
 
@@ -23,9 +50,19 @@ static void print_hex32(uint32_t num) {
 
 // MMIO Register Access
 
-uint32_t lapic_read(uint32_t reg) { return lapic_base[reg / 4]; }
+uint32_t lapic_read(uint32_t reg) {
+  if (lapic_x2apic)
+    return (uint32_t)lapic_rdmsr(x2apic_msr(reg));
+  return lapic_base[reg / 4];
+}
 
-void lapic_write(uint32_t reg, uint32_t value) { lapic_base[reg / 4] = value; }
+void lapic_write(uint32_t reg, uint32_t value) {
+  if (lapic_x2apic) {
+    lapic_wrmsr(x2apic_msr(reg), value);
+    return;
+  }
+  lapic_base[reg / 4] = value;
+}
 
 // EOI
 
@@ -41,7 +78,14 @@ bool lapic_is_ready(void) {
 
 // APIC ID
 
-uint32_t lapic_get_id(void) { return lapic_read(LAPIC_ID) >> 24; }
+uint32_t lapic_get_id(void) {
+  uint32_t id = lapic_read(LAPIC_ID);
+  // The xAPIC ID register keeps the ID in bits 31:24; the x2APIC MSR holds it
+  // in bits 31:0.
+  return lapic_x2apic ? id : (id >> 24);
+}
+
+bool lapic_is_x2apic(void) { return lapic_x2apic; }
 
 // Spurious interrupt handler (must NOT send EOI)
 static void spurious_handler(struct registers *regs) {
@@ -52,9 +96,29 @@ static void spurious_handler(struct registers *regs) {
 // Initialization
 
 void lapic_init(uint64_t base_phys) {
+  /* ACPI reports 0 in the MADT Local APIC Address field on some x2APIC-only
+   * firmware; the architectural default is still 0xFEE00000.  Without this,
+   * the boot log prints "Local APIC Base: 0x00000000" and xAPIC MMIO (if the
+   * firmware happened to stay in xAPIC mode) would talk to physical 0. */
+  if (base_phys == 0)
+    base_phys = 0xFEE00000ULL;
+
   // Map the LAPIC registers into virtual memory via the HHDM
   lapic_phys_base = base_phys;
   lapic_base = (volatile uint32_t *)(base_phys + pmm_get_hhdm_offset());
+
+  /* Firmware can leave the LAPIC in x2APIC mode, where the MMIO interface
+   * this kernel uses everywhere else is not decoded at all.  In that mode
+   * every "IPI" write below would silently go nowhere and AP bring-up would
+   * spin forever.  Stay in x2APIC (clearing the enable bit is rejected by
+   * some hypervisors and would strand APIC IDs wider than 8 bits) and drive
+   * the registers through their MSR interface instead; the accessors below
+   * dispatch transparently. */
+  uint64_t apic_base = lapic_rdmsr(MSR_IA32_APIC_BASE);
+  if (apic_base & APIC_BASE_X2APIC_ENABLE) {
+    lapic_x2apic = true;
+    console_puts("[INFO] LAPIC is in x2APIC mode; using MSR access.\n");
+  }
 
   console_puts("[OK] Local APIC Base: 0x");
   print_hex32((uint32_t)base_phys);
@@ -67,11 +131,15 @@ void lapic_init(uint64_t base_phys) {
   // A TPR of 0 means we accept all interrupt priority classes.
   lapic_write(LAPIC_TPR, 0);
 
-  // Step 2: Set the Destination Format Register to Flat Model
-  lapic_write(LAPIC_DFR, 0xFFFFFFFF);
+  // Step 2: Set the Destination Format Register to Flat Model.
+  // DFR/LDR have no useful meaning in x2APIC (physical destination mode is
+  // used throughout, and some implementations reject writes to them there).
+  if (!lapic_x2apic) {
+    lapic_write(LAPIC_DFR, 0xFFFFFFFF);
 
-  // Step 3: Set the Logical Destination Register
-  lapic_write(LAPIC_LDR, (lapic_read(LAPIC_LDR) & 0x00FFFFFF) | 0x01000000);
+    // Step 3: Set the Logical Destination Register
+    lapic_write(LAPIC_LDR, (lapic_read(LAPIC_LDR) & 0x00FFFFFF) | 0x01000000);
+  }
 
   // Step 4: Enable the APIC via the Spurious Interrupt Vector Register
   // Set the spurious vector to 0xFF and flip the enable bit.
@@ -101,15 +169,38 @@ void lapic_init(uint64_t base_phys) {
   console_puts("\n");
 }
 
+void lapic_write_icr(uint32_t apic_id, uint32_t icr_low) {
+  if (lapic_x2apic) {
+    // x2APIC: one 64-bit MSR write; destination ID lives in bits 63:32.
+    lapic_wrmsr(x2apic_msr(LAPIC_ICR_LOW),
+                ((uint64_t)apic_id << 32) | (uint64_t)icr_low);
+    return;
+  }
+  lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
+  lapic_write(LAPIC_ICR_LOW, icr_low);
+}
+
+uint32_t lapic_read_icr(void) {
+  if (lapic_x2apic)
+    return (uint32_t)lapic_rdmsr(x2apic_msr(LAPIC_ICR_LOW));
+  return lapic_read(LAPIC_ICR_LOW);
+}
+
+bool lapic_icr_idle(void) { return (lapic_read_icr() & LAPIC_ICR_PENDING) == 0; }
+
 void lapic_send_ipi(uint32_t lapic_id, uint8_t vector) {
   if (!lapic_base) return;
-  lapic_write(LAPIC_ICR_HIGH, lapic_id << 24);
   /* Fixed IPIs use edge trigger; level+deassert is not deliverable. */
-  lapic_write(LAPIC_ICR_LOW, LAPIC_ICR_FIXED | LAPIC_ICR_EDGE | vector);
+  lapic_write_icr(lapic_id, LAPIC_ICR_FIXED | LAPIC_ICR_EDGE | vector);
 }
 
 void lapic_send_ipi_all_but_self(uint8_t vector) {
   if (!lapic_base) return;
-  lapic_write(LAPIC_ICR_LOW, LAPIC_ICR_FIXED | LAPIC_ICR_EDGE |
-                               LAPIC_ICR_DEST_ALL_BUT_SELF | vector);
+  uint32_t icr_low =
+      LAPIC_ICR_FIXED | LAPIC_ICR_EDGE | LAPIC_ICR_DEST_ALL_BUT_SELF | vector;
+  if (lapic_x2apic) {
+    lapic_wrmsr(x2apic_msr(LAPIC_ICR_LOW), icr_low);
+    return;
+  }
+  lapic_write(LAPIC_ICR_LOW, icr_low);
 }

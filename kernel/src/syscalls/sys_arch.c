@@ -389,8 +389,35 @@ static uint64_t sys_membarrier(uint64_t cmd, uint64_t flags, uint64_t cpu_id,
   return 0;
 }
 
+/* syslog(type, bufp, len) - syscall 103.
+ *
+ * The kernel log goes straight to the console and has no ring buffer, so
+ * there is nothing to read back yet.  The console-level controls are
+ * accepted as no-ops so busybox `dmesg -n <level>` (the OpenRC dmesg
+ * service) succeeds instead of failing the boot with ENOSYS. */
+static uint64_t sys_syslog(uint64_t type, uint64_t bufp, uint64_t len,
+                           uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)bufp;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  switch (type) {
+  case 0: /* SYSLOG_ACTION_CLOSE */
+  case 1: /* SYSLOG_ACTION_OPEN */
+  case 5: /* SYSLOG_ACTION_CLEAR */
+  case 6: /* SYSLOG_ACTION_CONSOLE_OFF */
+  case 7: /* SYSLOG_ACTION_CONSOLE_ON */
+    return 0;
+  case 8: /* SYSLOG_ACTION_CONSOLE_LEVEL */
+    return len <= 8 ? 0 : (uint64_t)-22;
+  default:
+    return (uint64_t)-38; /* ENOSYS: no readable log buffer exists */
+  }
+}
+
 void syscall_register_arch(void) {
   syscall_register(SYS_ARCH_PRCTL, sys_arch_prctl);
+  syscall_register(SYS_SYSLOG, sys_syslog);
   syscall_register(SYS_CLOCK_GETTIME, sys_clock_gettime);
   syscall_register(SYS_CLOCK_GETRES, sys_clock_getres);
   syscall_register(SYS_CLOCK_NANOSLEEP, sys_clock_nanosleep);

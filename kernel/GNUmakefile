@@ -102,6 +102,15 @@ endif
 endif
 endif
 
+# USB HID mouse parser self-test.  Parses built-in report descriptors
+# (boot / gaming / touchpad layouts) and decodes sample reports through the
+# same code path the interrupt handlers use.  A normal build compiles it out.
+#
+#   make USB_MOUSE_SELFTEST=1
+ifeq ($(USB_MOUSE_SELFTEST),1)
+override CPPFLAGS += -DUSB_MOUSE_SELFTEST=1
+endif
+
 # NVMe completion interrupt knobs (Phase 4).  The driver falls back through
 # MSI-X -> MSI -> INTx -> polled; these force a lower mode for the stress
 # matrix.  NVME_FAULT_DROP_IRQ consumes completions in the handler but delays

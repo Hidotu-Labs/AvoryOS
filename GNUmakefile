@@ -416,6 +416,54 @@ run-dist: edk2-ovmf avoryos-dist.iso
 avoryos-dist.iso: limine/limine kernel disk.img limine.conf create_dist_usb.sh
 	./create_dist_usb.sh avoryos-dist.iso
 
+# ── Minimal ISO ─────────────────────────────────────────────────────────────
+# bash + GNU coreutils + Xorg + IceWM + OpenRC/D-Bus + st, without the full
+# desktop stack.  scripts/build-minimal.sh assembles an independent rootfs and
+# disk image under build/minimal/; create_dist_usb.sh packages it as a
+# self-contained ISO (the disk image is embedded as a Limine module, exactly
+# like avoryos-dist.iso).
+MINIMAL_ISO := avoryos-minimal.iso
+MINIMAL_DISK := build/minimal/disk.img
+MINIMAL_STAMP := build/minimal/rootfs/.avoryos-minimal
+
+$(MINIMAL_STAMP): scripts/build-minimal.sh
+	chmod +x scripts/build-minimal.sh
+	./scripts/build-minimal.sh rootfs
+
+.PHONY: minimal-rootfs
+minimal-rootfs: $(MINIMAL_STAMP)
+
+$(MINIMAL_DISK): $(MINIMAL_STAMP) scripts/build-minimal.sh
+	./scripts/build-minimal.sh disk
+
+.PHONY: minimal-disk
+minimal-disk: $(MINIMAL_DISK)
+
+$(MINIMAL_ISO): kernel limine/limine $(MINIMAL_DISK) limine-minimal.conf create_dist_usb.sh
+	DISK_IMG=$(MINIMAL_DISK) LIMINE_CONF=limine-minimal.conf \
+		./create_dist_usb.sh $(MINIMAL_ISO)
+
+.PHONY: minimal-iso
+minimal-iso: $(MINIMAL_ISO)
+
+.PHONY: run-minimal
+run-minimal: edk2-ovmf $(MINIMAL_ISO)
+	qemu-system-$(ARCH) \
+		-M q35,pcspk-audiodev=snd0 \
+		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
+		-cdrom $(MINIMAL_ISO) \
+		-serial stdio \
+		-device rtl8139,netdev=net0 \
+		-netdev user,id=net0 \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0 \
+		-device usb-mouse,bus=xhci.0 \
+		$(QEMUFLAGS)
+
+.PHONY: clean-minimal
+clean-minimal:
+	rm -rf build/minimal $(MINIMAL_ISO)
+
 .PHONY: run-x86_64
 # Default interactive target on a machine without /dev/kvm: TCG, no KVM flag,
 # root filesystem on an NVMe namespace.  run-sata-tcg keeps the old IDE/ATA
@@ -1372,7 +1420,7 @@ $(IMAGE_NAME).iso: limine/limine kernel limine.conf build/kernel_cmdline.stamp
 		limine.conf > iso_root/boot/limine/limine.conf
 	@if [ -n '$(KERNEL_CMDLINE)' ]; then \
 		awk -v c='$(KERNEL_CMDLINE)' \
-			'{print} /^\/AvoryOS$$/ && !done {print "    cmdline: " c; done=1}' \
+			'{print} /^\/AvoryOS/ && !done {print "    cmdline: " c; done=1}' \
 			iso_root/boot/limine/limine.conf > iso_root/boot/limine/limine.conf.tmp; \
 		mv iso_root/boot/limine/limine.conf.tmp iso_root/boot/limine/limine.conf; \
 	fi
@@ -1395,7 +1443,7 @@ clean:
 	rm -f $(IMAGE_NAME).iso
 
 .PHONY: clean-all
-clean-all: clean-musl clean-doom clean-coreutils clean-tar clean-apm
+clean-all: clean-musl clean-doom clean-coreutils clean-tar clean-apm clean-minimal
 	$(MAKE) -C kernel clean
 	rm -rf iso_root $(IMAGE_NAME).iso $(IMAGE_NAME).hdd build/alpine
 

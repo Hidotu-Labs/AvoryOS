@@ -4,6 +4,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <stdint.h>
 #include <errno.h>
 
 #define WATCHDOG_IOCTL_BASE 'W'
@@ -109,9 +111,42 @@ static void test_watchdog_device(const char *dev_path) {
     ret = ioctl(fd, WDIOC_SETOPTIONS, &opt);
     TEST_ASSERT(ret == 0, "WDIOC_SETOPTIONS re-enable card");
 
-    // 8. Magic close - first write 'V' to set magic close flag, then
-    // explicitly disable the card so the watchdog is definitely inactive
-    // even if the VFS close path doesn't propagate node->close on process exit.
+    // 8. Hardening: every pointer is validated and copied through the
+    //    exception-table uaccess helpers, so a bogus or partially mapped
+    //    buffer must come back as EFAULT instead of faulting the kernel.
+    errno = 0;
+    ret = ioctl(fd, WDIOC_GETTIMEOUT, (void *)0x1);
+    TEST_ASSERT(ret == -1 && errno == EFAULT,
+                "WDIOC_GETTIMEOUT rejects an unmapped pointer");
+
+    errno = 0;
+    ret = ioctl(fd, WDIOC_GETSUPPORT, (void *)0x1);
+    TEST_ASSERT(ret == -1 && errno == EFAULT,
+                "WDIOC_GETSUPPORT rejects an unmapped pointer");
+
+    errno = 0;
+    ssize_t bad_write = write(fd, (void *)0x1, 4);
+    TEST_ASSERT(bad_write == -1 && errno == EFAULT,
+                "write rejects an unmapped pointer");
+
+    // A buffer that starts readable and runs into a PROT_NONE page: the
+    // driver copies in bounded chunks, so the fault lands in copy_from_user
+    // and surfaces as EFAULT rather than a kernel-mode page fault.
+    long page = sysconf(_SC_PAGESIZE);
+    uint8_t *guard = mmap(NULL, (size_t)page * 2, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (guard != MAP_FAILED) {
+        mprotect(guard + page, (size_t)page, PROT_NONE);
+        errno = 0;
+        bad_write = write(fd, guard + page - 2, 4);
+        TEST_ASSERT(bad_write == -1 && errno == EFAULT,
+                    "write rejects a buffer crossing into a PROT_NONE page");
+        munmap(guard, (size_t)page * 2);
+    }
+
+    // 9. Magic close - 'V' marks this descriptor for disarm; the timer goes
+    //    away when the last descriptor closes.  The explicit disable below
+    //    keeps the machine safe even if a later test step fails.
     written = write(fd, "V", 1);
     TEST_ASSERT(written == 1, "Write magic close character 'V'");
 

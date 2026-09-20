@@ -43,10 +43,30 @@ void klog_hex64(uint64_t num);
 void klog_hex32(uint32_t num);
 void klogf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void vklogf(const char *fmt, va_list ap);
-void klog_proc_exit(uint32_t tid, uint32_t tgid, bool is_thread, const char *comm, uint64_t status);
 void klog_proc_exec(uint32_t tid, const char *path);
 void klog_ramfs_free(void *ptr, uint64_t capacity, bool is_pmm, uint64_t pages);
 
 void klog_set_screen_logging(bool enabled);
+
+/* Persistent boot-log ring: the last KLOG_RING_SIZE bytes of kernel output,
+ * readable at /proc/klog.  klog_ring_read() serves [offset, offset+size) from
+ * the oldest retained byte and returns the number of bytes copied. */
+uint32_t klog_ring_length(void);
+uint32_t klog_ring_read(uint32_t offset, uint32_t size, uint8_t *buffer);
+
+/* Frozen boot-log snapshot (stops at the first userspace exec), readable at
+ * /proc/bootlog.  Unlike the live ring this never loses the driver bring-up
+ * lines to later userland output. */
+void klog_freeze_boot_log(void);
+uint32_t klog_bootlog_length(void);
+uint32_t klog_bootlog_read(uint32_t offset, uint32_t size, uint8_t *buffer);
+
+/* Route screen copies of klog output through the interactive console instead
+ * of klog's own top-left framebuffer writer.  Call once console_init() has
+ * taken over the display; klog output then shares the console cursor, handles
+ * ANSI escapes and is mirrored to COM1 by the console itself.  Without this,
+ * "screen logging" after console_init() draws over the console and the boot
+ * log (AP bring-up, drivers, VFS, ...) only reaches the serial port. */
+void klog_set_console_sink(bool enabled);
 
 #endif

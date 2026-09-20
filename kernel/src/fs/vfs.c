@@ -716,7 +716,13 @@ void vfs_close(vfs_node_t *node) {
     vfs_cache_clear(node);
     node->ep_watchers.next = NULL;
     node->ep_watchers.prev = NULL;
-    if (!(node->flags & FS_PERSISTENT)) {
+    /* A node whose name was removed while descriptors still referenced it:
+     * the last close releases the filesystem-private payload exactly once. */
+    if ((node->flags & FS_DELETED) && node->destroy) {
+      node->destroy(node);
+      node->destroy = NULL;
+    }
+    if (!(node->flags & FS_PERSISTENT) || (node->flags & FS_DELETED)) {
       node->magic = 0;
       kfree(node);
     }
@@ -730,6 +736,23 @@ void vfs_close(vfs_node_t *node) {
     extern void wait_queue_wake_all(void *wq);
     wait_queue_wake_all(wq);
   }
+}
+
+void vfs_node_retire(vfs_node_t *node) {
+  if (!node)
+    return;
+
+  node->flags |= FS_DELETED;
+  if (__atomic_load_n(&node->refcount, __ATOMIC_ACQUIRE) != 0)
+    return; /* the last vfs_close() finishes the teardown */
+
+  vfs_cache_clear(node);
+  if (node->destroy) {
+    node->destroy(node);
+    node->destroy = NULL;
+  }
+  node->magic = 0;
+  kfree(node);
 }
 
 struct dirent *vfs_readdir(vfs_node_t *node, uint32_t index) {
@@ -752,18 +775,29 @@ vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
       return 0;
     }
 
-    vfs_mount_entry_t *curr = vfs_mount_list;
-    while (curr) {
-      if (curr->mountpoint && curr->mountpoint->inode == res->inode &&
-          curr->mountpoint->device == res->device) {
-        if (curr->target != res) {
-          vfs_close(res);
-          vfs_open(curr->target);
-          vfs_dentry_insert(node, name, curr->target);
-          return curr->target;
+    /* Follow mounts transitively.  Mounts can stack (the kernel mounts a
+     * ramfs at /run, then localmount mounts a tmpfs over it), and the visible
+     * node is the top of the stack; stopping at the first matching entry left
+     * later mounts shadowed under their own mountpoint.  The `res != target`
+     * guard also terminates a mount that points back at itself. */
+    for (int hops = 0; hops < 32; hops++) {
+      vfs_node_t *next = NULL;
+      vfs_mount_entry_t *curr = vfs_mount_list;
+      while (curr) {
+        if (curr->mountpoint && curr->mountpoint->inode == res->inode &&
+            curr->mountpoint->device == res->device) {
+          if (curr->target != res) {
+            next = curr->target;
+            break;
+          }
         }
+        curr = curr->next;
       }
-      curr = curr->next;
+      if (!next)
+        break;
+      vfs_close(res);
+      vfs_open(next);
+      res = next;
     }
     vfs_dentry_insert(node, name, res);
     return res;

@@ -15,12 +15,21 @@
 #define FS_PIPE 0x05
 #define FS_SYMLINK 0x06
 #define FS_SOCKET 0x07
-#define FS_MOUNTPOINT 0x08
 #define FS_EPOLL 0x09
 #define FS_PERSISTENT 0x10
 #define FS_NONBLOCK 0x20
 #define FS_DENTRY_NOCACHE 0x40
 #define FS_PAGE_CACHE 0x80
+/* Mount markers live outside FS_TYPE_MASK.  A node used as a mountpoint is
+ * still whatever it was (almost always a directory), and every type check in
+ * the kernel is `flags & FS_TYPE_MASK`; setting a type bit here corrupted the
+ * directory bit into 0x0A and made operations like mkdirat() fail with
+ * ENOTDIR on /run after userland mounted a tmpfs over it. */
+#define FS_MOUNTPOINT 0x100
+/* The filesystem removed this name but live descriptors, mappings or caches
+ * still reference the node.  vfs_close() destroys the device payload through
+ * ->destroy and frees the node when the last reference drops. */
+#define FS_DELETED 0x200
 #define FS_TYPE_MASK 0x0F
 
 /* Live-object markers.  A node or cached page that has been freed has its
@@ -195,6 +204,7 @@ typedef struct vfs_node {
   write_type_t write;
   open_type_t open;
   close_type_t close;
+  close_type_t destroy; // Release device payload once a retired node is final
   open_instance_type_t open_instance; // Optional per-open node factory
   readdir_type_t readdir;
   finddir_type_t finddir;
@@ -252,6 +262,12 @@ uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
                    uint8_t *buffer);
 void vfs_open(vfs_node_t *node);
 void vfs_close(vfs_node_t *node);
+
+/* The filesystem unlinked `node`.  When nothing references it anymore its
+ * ->destroy callback releases the device payload and the node is freed;
+ * otherwise the last vfs_close() does both.  Backends that kfree() the node
+ * outright in unlink/rmdir must call this instead. */
+void vfs_node_retire(vfs_node_t *node);
 
 /* True when `node` is a kernel pointer into managed RAM that still carries the
  * live-node marker.  Safe to call on a wild pointer: the RAM window is checked
@@ -321,6 +337,7 @@ typedef struct vfs_mount_info {
 int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count);
 
 // Page Cache API
+bool vfs_cache_page_valid(const vfs_page_t *page);
 vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset);
 vfs_page_t *vfs_cache_insert(vfs_node_t *node, uint32_t offset, uint64_t frame);
 size_t vfs_cache_page_count(void);

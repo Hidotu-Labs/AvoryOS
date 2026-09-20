@@ -13,6 +13,9 @@
 
 static uint32_t tmpfs_next_inode = 1;
 
+static void tmpfs_destroy_node(vfs_node_t *node);
+static void tmpfs_free_all_pages(tmpfs_file_t *file);
+
 static tmpfs_sb_t *tmpfs_sb_from_node(vfs_node_t *node) {
     if (!node || !node->device)
         return NULL;
@@ -122,6 +125,36 @@ static void tmpfs_release_pages(tmpfs_page_t **pages, uint32_t n) {
             pmm_free_page((void *)p->phys);
         kfree(p);
     }
+}
+
+/* Release the filesystem-private payload of a node whose name is gone.
+ * Called once, either directly from vfs_node_retire() when no reference is
+ * left, or from vfs_close() when the last descriptor closes.  Freeing the
+ * node here used to happen in tmpfs_unlink/rmdir even while an open
+ * descriptor or mmap still pointed at it, which turned a normal
+ * unlink-while-open into a use-after-free. */
+static void tmpfs_destroy_node(vfs_node_t *node) {
+    if (!node || !node->device)
+        return;
+
+    uint32_t type = node->flags & FS_TYPE_MASK;
+    if (type == FS_FILE) {
+        tmpfs_file_t *f = (tmpfs_file_t *)node->device;
+        tmpfs_free_all_pages(f);
+        kfree(f);
+    } else if (type == FS_DIRECTORY) {
+        tmpfs_dir_t *d = (tmpfs_dir_t *)node->device;
+        tmpfs_child_t *c = d->children;
+        while (c) {
+            tmpfs_child_t *next = c->next;
+            kfree(c);
+            c = next;
+        }
+        kfree(d);
+    } else if (type == FS_SYMLINK) {
+        kfree(node->device);
+    }
+    node->device = NULL;
 }
 
 static tmpfs_page_t *tmpfs_get_or_alloc_page(tmpfs_file_t *file,
@@ -624,6 +657,7 @@ static vfs_node_t *tmpfs_make_node(tmpfs_sb_t *sb, const char *name,
     n->chmod     = tmpfs_chmod;
     n->chown     = tmpfs_chown;
     n->statfs    = tmpfs_statfs;
+    n->destroy   = tmpfs_destroy_node;
 
     if (type == FS_FILE) {
         tmpfs_file_t *f = kmalloc(sizeof(tmpfs_file_t));
@@ -799,22 +833,14 @@ static int tmpfs_unlink(vfs_node_t *node, char *name) {
             else
                 dir->children = curr->next;
 
-            if (type == FS_FILE && curr->node->device) {
-                tmpfs_file_t *f = (tmpfs_file_t *)curr->node->device;
-                tmpfs_sb_t   *sb = f->sb;
-                tmpfs_free_all_pages(f);
-                kfree(f);
-                if (sb)
-                    tmpfs_free_inode(sb);
-            } else if (type == FS_SYMLINK && curr->node->device) {
-                tmpfs_symlink_t *sl = (tmpfs_symlink_t *)curr->node->device;
-                tmpfs_sb_t      *sb = sl->sb;
-                kfree(sl);
-                if (sb)
-                    tmpfs_free_inode(sb);
-            }
+            tmpfs_sb_t *sb = tmpfs_sb_from_node(curr->node);
+            if (sb)
+                tmpfs_free_inode(sb);
 
-            kfree(curr->node);
+            /* The name is gone, but descriptors and mappings may still hold
+             * references: retire the node instead of kfree()ing it under
+             * them. */
+            vfs_node_retire(curr->node);
             kfree(curr);
             return 0;
         }
@@ -847,11 +873,12 @@ static int tmpfs_rmdir(vfs_node_t *node, char *name) {
                 dir->children = curr->next;
 
             tmpfs_sb_t *sb = child_dir->sb;
-            kfree(child_dir);
-            kfree(curr->node);
-            kfree(curr);
             if (sb)
                 tmpfs_free_inode(sb);
+            /* Same deferred teardown as unlink: an open directory descriptor
+             * keeps the node (and its child list) alive. */
+            vfs_node_retire(curr->node);
+            kfree(curr);
             return 0;
         }
         prev = curr;

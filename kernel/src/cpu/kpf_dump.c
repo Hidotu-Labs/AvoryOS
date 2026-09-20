@@ -639,6 +639,70 @@ void kpf_dump_page_fault(struct registers *regs, uint64_t cr2) {
           "only)\n");
 }
 
+/* Same lock-free treatment as the page-fault dump, for the exceptions that do
+ * not go through the paging engine (invalid opcode, #GP, stack fault, an
+ * unhandled vector).  A wild RIP usually lives outside the kernel image, so
+ * the stack scan and the recorded "last kernel site" are what identify the
+ * path that jumped there. */
+void kpf_dump_exception(const char *reason, struct registers *regs) {
+  if (!regs)
+    return;
+
+  static volatile unsigned reported;
+  if (__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL)) {
+    out_lit("\n[KPF] exception dump already reported for an earlier fault\n");
+    return;
+  }
+
+  uint64_t live_rsp;
+  uint64_t cr2 = 0;
+  __asm__ volatile("mov %%rsp, %0" : "=r"(live_rsp));
+  __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+
+  out_lit("\n[KPF] +----------------------------------------------------------"
+          "------------------+\n");
+  out_lit("[KPF] | UNHANDLED CPU EXCEPTION - panicking, this is fatal      "
+          "                 |\n");
+  out_lit("[KPF] +----------------------------------------------------------"
+          "------------------+\n");
+
+  out_lit("[KPF] REASON: ");
+  out_str(reason);
+  out_lit(" int=");
+  out_dec(regs->int_no);
+  out_lit(" err=");
+  out_hexn(regs->err_code, 4);
+  out_lit("\n");
+
+  dump_machine_state(regs, cr2, live_rsp);
+  dump_thread_context();
+
+  if (regs->rip >= HHDM_BASE && regs->rip < VMAP_BASE) {
+    out_lit("[KPF] RIP IS IN THE HHDM DIRECT MAP: phys=");
+    out_hex(regs->rip - pmm_get_hhdm_offset());
+    out_lit(" - an instruction fetch from data, not from kernel text\n");
+    uint64_t page = regs->rip & ~0xFFFULL;
+    uint64_t hhdm = pmm_get_hhdm_offset();
+    if (readable(page + hhdm, 16)) {
+      uint64_t w0 = *(volatile uint64_t *)(uintptr_t)(page + hhdm);
+      uint64_t w1 = *(volatile uint64_t *)(uintptr_t)(page + hhdm + 8);
+      out_lit("[KPF]   page header: ");
+      out_hex(w0);
+      out_lit(" ");
+      out_hex(w1);
+      out_lit("\n");
+    }
+  }
+
+  dump_walk(regs->rip, 0);
+  dump_code_at_rip(regs->rip);
+  dump_stack_scan(live_rsp, sched_get_current());
+  dump_rbp_chain(regs->rbp);
+
+  out_lit("[KPF] exception report complete - console panic banner follows\n");
+  (void)cr2;
+}
+
 void kpf_dump_panic_entry(const char *reason, struct registers *regs) {
   out_lit("\n[PANIC] ");
   out_lit(reason ? reason : "<no reason given>");

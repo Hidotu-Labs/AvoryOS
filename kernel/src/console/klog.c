@@ -9,8 +9,83 @@
 
 static spinlock_t klog_lock = SPINLOCK_INIT;
 static bool screen_logging_enabled = false;
+static bool console_sink_enabled = false;
 static uint32_t screen_x = 0;
 static uint32_t screen_y = 0;
+
+/* Persistent boot log.  Serial capture is not always available (no cable,
+ * fast boot, no reader attached), so the last KLOG_RING_SIZE bytes of every
+ * kernel message are also kept in a ring buffer and exposed at /proc/klog.
+ * The ring is written from every context (IRQs, faults, SMP bring-up), so it
+ * has its own lock; a byte is dropped rather than deadlocking if the lock is
+ * already held by the same CPU. */
+#define KLOG_RING_SIZE (256 * 1024)
+static char klog_ring[KLOG_RING_SIZE];
+static uint32_t klog_ring_head;  /* next write index */
+static uint32_t klog_ring_count; /* bytes currently stored */
+static spinlock_t klog_ring_lock = SPINLOCK_INIT;
+
+/* Boot-log snapshot.  The live ring keeps only the most recent bytes and
+ * userland (process execs, services) fills it within seconds of starting, so
+ * the driver bring-up lines would be gone by the time anyone can read
+ * /proc/klog.  This copy stops at the first userspace exec and is served at
+ * /proc/bootlog, which keeps the boot decisions readable indefinitely. */
+#define KLOG_BOOT_SIZE (256 * 1024)
+static char klog_boot[KLOG_BOOT_SIZE];
+static uint32_t klog_boot_len;
+static bool klog_boot_frozen;
+
+static void klog_ring_append(const char *s, size_t len) {
+  if (!spinlock_try_acquire(&klog_ring_lock))
+    return;
+  for (size_t i = 0; i < len; i++) {
+    klog_ring[klog_ring_head] = s[i];
+    klog_ring_head++;
+    if (klog_ring_head == KLOG_RING_SIZE)
+      klog_ring_head = 0;
+    if (klog_ring_count < KLOG_RING_SIZE)
+      klog_ring_count++;
+    if (!klog_boot_frozen && klog_boot_len < KLOG_BOOT_SIZE)
+      klog_boot[klog_boot_len++] = s[i];
+  }
+  spinlock_release(&klog_ring_lock);
+}
+
+void klog_freeze_boot_log(void) { klog_boot_frozen = true; }
+
+uint32_t klog_bootlog_length(void) { return klog_boot_len; }
+
+uint32_t klog_bootlog_read(uint32_t offset, uint32_t size, uint8_t *buffer) {
+  if (offset >= klog_boot_len || !buffer)
+    return 0;
+  uint32_t n = klog_boot_len - offset;
+  if (n > size)
+    n = size;
+  for (uint32_t i = 0; i < n; i++)
+    buffer[i] = (uint8_t)klog_boot[offset + i];
+  return n;
+}
+
+uint32_t klog_ring_length(void) { return klog_ring_count; }
+
+uint32_t klog_ring_read(uint32_t offset, uint32_t size, uint8_t *buffer) {
+  uint64_t flags;
+  spinlock_acquire_save(&klog_ring_lock, &flags);
+  if (offset >= klog_ring_count || !buffer) {
+    spinlock_release_restore(&klog_ring_lock, flags);
+    return 0;
+  }
+  uint32_t available = klog_ring_count - offset;
+  if (size > available)
+    size = available;
+  uint32_t start = (klog_ring_head + KLOG_RING_SIZE - klog_ring_count) %
+                   KLOG_RING_SIZE;
+  for (uint32_t i = 0; i < size; i++)
+    buffer[i] = (uint8_t)klog_ring[(start + offset + i) % KLOG_RING_SIZE];
+  spinlock_release_restore(&klog_ring_lock, flags);
+  return size;
+}
+
 
 #define KLOG_FG 0x00FFFFFF
 #define KLOG_BG 0x00000000
@@ -36,6 +111,12 @@ static uint32_t klog_ansi_colors[8] = {
 void klog_set_screen_logging(bool enabled) {
   spinlock_acquire(&klog_lock);
   screen_logging_enabled = enabled;
+  spinlock_release(&klog_lock);
+}
+
+void klog_set_console_sink(bool enabled) {
+  spinlock_acquire(&klog_lock);
+  console_sink_enabled = enabled;
   spinlock_release(&klog_lock);
 }
 
@@ -119,6 +200,27 @@ static inline void klog_write_dispatch(const char *s, size_t len) {
   if (!s || len == 0)
     return;
 
+  /* Keep a persistent copy for /proc/klog before anything can drop it. */
+  klog_ring_append(s, len);
+
+  /* After console_init() the console owns the screen and keeps its own
+   * cursor.  Route the screen copy through it so the boot log stays visible
+   * on the framebuffer (console_write_batch_try also mirrors to serial).
+   * If the console is busy, fall back to serial-only rather than block: this
+   * path runs from fault and hang diagnostics too. */
+  if (__builtin_expect(screen_logging_enabled && console_sink_enabled, 0)) {
+    if (console_write_batch_try(s, len)) {
+      /* A completed line is a debug checkpoint: push it to the front buffer
+       * now so a hang on the next statement cannot leave the screen showing
+       * an older frame that cuts the line in half. */
+      if (s[len - 1] == '\n')
+        console_tick();
+      return;
+    }
+    serial_write(s, len);
+    return;
+  }
+
   serial_write(s, len);
 
   if (__builtin_expect(screen_logging_enabled, 0)) {
@@ -134,15 +236,7 @@ static inline void klog_write_dispatch(const char *s, size_t len) {
   }
 }
 
-void klog_putchar(char c) {
-  serial_putchar(c);
-  if (__builtin_expect(screen_logging_enabled, 0)) {
-    if (spinlock_try_acquire(&klog_lock)) {
-      klog_putchar_screen_unlocked(c);
-      spinlock_release(&klog_lock);
-    }
-  }
-}
+void klog_putchar(char c) { klog_write_dispatch(&c, 1); }
 
 void klog_puts(const char *s) {
   if (!s)
@@ -234,82 +328,6 @@ void klogf(const char *fmt, ...) {
   va_start(ap, fmt);
   vklogf(fmt, ap);
   va_end(ap);
-}
-
-void klog_proc_exit(uint32_t tid, uint32_t tgid, bool is_thread, const char *comm, uint64_t status) {
-  char buf[160];
-  char *p = buf;
-
-  const char pfx[] = "[PROC] exit tid=";
-  for (size_t i = 0; i < sizeof(pfx) - 1; i++)
-    *p++ = pfx[i];
-
-  char num_buf[24];
-  int ni = 0;
-  uint64_t n = tid;
-  if (n == 0) {
-    num_buf[ni++] = '0';
-  } else {
-    while (n > 0) {
-      num_buf[ni++] = '0' + (n % 10);
-      n /= 10;
-    }
-  }
-  while (ni > 0)
-    *p++ = num_buf[--ni];
-
-  const char tgid_s[] = " tgid=";
-  for (size_t i = 0; i < sizeof(tgid_s) - 1; i++)
-    *p++ = tgid_s[i];
-  n = tgid;
-  if (n == 0) {
-    num_buf[ni++] = '0';
-  } else {
-    while (n > 0) {
-      num_buf[ni++] = '0' + (n % 10);
-      n /= 10;
-    }
-  }
-  while (ni > 0)
-    *p++ = num_buf[--ni];
-
-  const char *kind_str = is_thread ? " kind=thread comm=" : " kind=process comm=";
-  while (*kind_str)
-    *p++ = *kind_str++;
-
-  if (comm && *comm) {
-    while (*comm)
-      *p++ = *comm++;
-  } else {
-    *p++ = '?';
-  }
-
-  const char st_s[] = " status=";
-  for (size_t i = 0; i < sizeof(st_s) - 1; i++)
-    *p++ = st_s[i];
-  n = status;
-  if (n == 0) {
-    num_buf[ni++] = '0';
-  } else {
-    while (n > 0) {
-      num_buf[ni++] = '0' + (n % 10);
-      n /= 10;
-    }
-  }
-  while (ni > 0)
-    *p++ = num_buf[--ni];
-
-  *p++ = '\n';
-
-  klog_write_dispatch(buf, (size_t)(p - buf));
-
-  if (status != 0) {
-    char warn[160];
-    int wlen = snprintf(warn, sizeof(warn), "[PROC] WARNING: tid=%u comm=%s exited with failure status=%llu\n",
-                        tid, comm ? comm : "?", (unsigned long long)status);
-    if (wlen > 0)
-      klog_write_dispatch(warn, (size_t)wlen);
-  }
 }
 
 void klog_proc_exec(uint32_t tid, const char *path) {

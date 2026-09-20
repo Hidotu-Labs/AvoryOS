@@ -25,6 +25,12 @@ void *krealloc(void *ptr, size_t new_size);
 // pointers the heap does not own.
 size_t heap_ksize(const void *ptr);
 
+// Debug aid: the most recent kfree() call site for `ptr`, if it is still in
+// the bounded free log.  Used by the page-cache corruption report to say
+// whether a bad tree entry was freed (double free / use after free) and from
+// where.  Returns false when the pointer has no recorded free.
+bool heap_last_free_caller(const void *ptr, uint64_t *caller);
+
 // Get heap statistics formatted as a string
 void heap_get_info(char *buf);
 

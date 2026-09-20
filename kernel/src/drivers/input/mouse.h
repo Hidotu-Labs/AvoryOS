@@ -22,4 +22,11 @@ void mouse_init(void);
 mouse_state_t mouse_get_state(void);
 void mouse_register_vfs(void);
 
+/* Apply one relative pointer report from any mouse backend (PS/2 IRQ, USB HID).
+ * `buttons` uses HID button order: bit0=left, bit1=right, bit2=middle,
+ * bit3=side, bit4=extra.  Updates the global mouse state and pushes the
+ * matching evdev events (REL_X/REL_Y/REL_WHEEL/REL_HWHEEL + EV_KEY + SYN). */
+void mouse_apply_report(int32_t dx, int32_t dy, int32_t wheel, int32_t hwheel,
+                        uint32_t buttons);
+
 #endif

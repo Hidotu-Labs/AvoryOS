@@ -549,10 +549,43 @@ void ehci_init(void) {
       hc->device_id = pdev->device_id;
       hc->irq_line = pdev->irq_line;
 
+      /* Power the function to D0 and enable memory decoding before reading
+       * its MMIO.  A controller left in D3hot by firmware otherwise reads as
+       * 0xFFFFFFFF and is skipped (same fix as xhci_probe). */
+      uint16_t pci_status =
+          pci_config_read16(hc->pci_bus, hc->pci_slot, hc->pci_func, 0x06);
+      if (pci_status & (1U << 4)) {
+        uint8_t cap =
+            pci_config_read8(hc->pci_bus, hc->pci_slot, hc->pci_func, 0x34) &
+            0xFC;
+        for (int guard = 0; cap && guard < 48; guard++) {
+          uint8_t id =
+              pci_config_read8(hc->pci_bus, hc->pci_slot, hc->pci_func, cap);
+          uint8_t next =
+              pci_config_read8(hc->pci_bus, hc->pci_slot, hc->pci_func,
+                               (uint16_t)cap + 1) &
+              0xFC;
+          if (id == 0x01) {
+            uint16_t pmcsr = pci_config_read16(
+                hc->pci_bus, hc->pci_slot, hc->pci_func, (uint16_t)cap + 4);
+            pci_config_write16(hc->pci_bus, hc->pci_slot, hc->pci_func,
+                               (uint16_t)cap + 4, pmcsr & ~0x3U);
+            for (int i = 0; i < 10000; i++)
+              io_wait();
+            break;
+          }
+          if (next == cap)
+            break;
+          cap = next;
+        }
+      }
       uint32_t pci_cmd =
           pci_config_read32(hc->pci_bus, hc->pci_slot, hc->pci_func, 0x04);
       pci_config_write32(hc->pci_bus, hc->pci_slot, hc->pci_func, 0x04,
                          pci_cmd | 0x06);
+      klogf("[EHCI] probing %02x:%02x.%u vendor=0x%04X device=0x%04X\n",
+            hc->pci_bus, hc->pci_slot, hc->pci_func, hc->vendor_id,
+            hc->device_id);
 
       uintptr_t phys_base = pdev->bar[0] & 0xFFFFFFF0;
       uintptr_t virt_base = phys_base + pmm_get_hhdm_offset();
@@ -710,4 +743,25 @@ struct ehci_controller *ehci_get_controller(int index) {
   if (index < 0 || index >= ehci_count)
     return NULL;
   return &controllers[index];
+}
+
+// Diagnostics (/proc/usb)
+void ehci_diag(struct usb_diag *d) {
+  usb_diag_printf(d, "EHCI controllers: %d\n", ehci_count);
+  for (int i = 0; i < ehci_count; i++) {
+    struct ehci_controller *hc = &controllers[i];
+    usb_diag_printf(d, "  ehci%d: %02x:%02x.%u ports=%u present=%u\n", i,
+                    hc->pci_bus, hc->pci_slot, hc->pci_func, hc->num_ports,
+                    hc->present ? 1 : 0);
+    uint8_t limit = hc->num_ports < 16 ? hc->num_ports : 16;
+    for (uint8_t p = 0; p < limit; p++) {
+      uint32_t portsc = ehci_read_op(hc, EHCI_REG_PORTSC + (p * 4));
+      usb_diag_printf(d,
+                      "    port %u: PORTSC=0x%08X connect=%u enable=%u "
+                      "owner=%u\n",
+                      p + 1, portsc, (portsc & EHCI_PORT_CONNECT) ? 1 : 0,
+                      (portsc & EHCI_PORT_ENABLE) ? 1 : 0,
+                      (portsc & EHCI_PORT_OWNER) ? 1 : 0);
+    }
+  }
 }

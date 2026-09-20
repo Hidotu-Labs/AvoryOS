@@ -8,6 +8,7 @@
 #include "../socket/socket.h"
 #include "../syscalls/syscall.h"
 #include "apic/lapic.h"
+#include "../apic/lapic_timer.h"
 #include "arch/x86_64/extable.h"
 #include "bug_table.h"
 #include "fault.h"
@@ -487,6 +488,12 @@ static void isr_panic(struct registers *regs, const char *msg) {
    * console dump never reaches the log if that hangs. */
   kpf_dump_panic_entry(msg, regs);
 
+  /* #PF and #DF already produced the rich page-fault report before calling
+   * here; every other fatal exception gets the same treatment, because a wild
+   * RIP cannot be diagnosed from the console register dump alone. */
+  if (regs->int_no != 14 && regs->int_no != 8)
+    kpf_dump_exception(msg, regs);
+
   /* A panic that faults on the way out - the console dump touches the
    * framebuffer, locks and the faulting thread's stack - used to re-enter this
    * function and start the whole dump again, forever. That loop is what looks
@@ -684,6 +691,18 @@ static const char *get_signal_name(int sig) {
   }
 }
 
+static const char *thread_state_name(thread_state_t state) {
+  switch (state) {
+    case THREAD_RUNNING: return "RUNNING";
+    case THREAD_READY:   return "READY";
+    case THREAD_BLOCKED: return "BLOCKED";
+    case THREAD_SLEEPING: return "SLEEPING";
+    case THREAD_DEAD:    return "DEAD";
+    case THREAD_ZOMBIE:  return "ZOMBIE";
+    default:             return "?";
+  }
+}
+
 void isr_report_user_fault(struct registers *regs, int sig,
                            uint64_t addr) {
   struct thread *current = sched_get_current();
@@ -877,6 +896,63 @@ void isr_report_user_fault(struct registers *regs, int sig,
         }
         if (fd_count == 0) {
           klog_puts("  <none>\n");
+        }
+      }
+
+      /* Threads in this process: a watchdog/canary fault (WebKit's
+       * WatchDogQueue is the classic one) usually means the process is trying
+       * to exit while a sibling is still parked somewhere.  Show where every
+       * thread is.  Trylock only - the fault handler must never wait on the
+       * scheduler's tid_lock. */
+      {
+        extern spinlock_t tid_lock;
+        if (spinlock_try_acquire(&tid_lock)) {
+          int shown = 0;
+          klog_puts(KLOG_CLR_CYAN "PROCESS THREADS:\n" KLOG_CLR_RESET);
+          for (struct thread *t = sched_get_thread_list_head(); t;
+               t = t->global_next) {
+            if (t->tgid != current->tgid)
+              continue;
+            if (shown >= 24)
+              break;
+            shown++;
+            klog_puts("  tid=");
+            klog_uint64(t->tid);
+            klog_puts(" comm='");
+            klog_puts(t->comm[0] ? t->comm : "?");
+            klog_puts("' state=");
+            klog_puts(thread_state_name(t->state));
+            if (t->last_syscall_num) {
+              const char *sn = syscall_get_name(t->last_syscall_num);
+              klog_puts(" syscall=");
+              klog_puts(sn ? sn : "?");
+              klog_puts("#");
+              klog_uint64(t->last_syscall_num);
+            }
+            if (t->last_kernel_func) {
+              klog_puts(" at ");
+              klog_puts(t->last_kernel_file ? t->last_kernel_file : "?");
+              klog_puts(":");
+              klog_uint64(t->last_kernel_line);
+              klog_puts(" ");
+              klog_puts(t->last_kernel_func);
+            }
+            if (t->blocked_since_ms) {
+              uint64_t now_ms = lapic_timer_get_ms();
+              klog_puts(" parked=");
+              klog_uint64(now_ms > t->blocked_since_ms
+                              ? now_ms - t->blocked_since_ms
+                              : 0);
+              klog_puts("ms");
+            }
+            klog_puts("\n");
+          }
+          if (shown == 0)
+            klog_puts("  <none>\n");
+          spinlock_release(&tid_lock);
+        } else {
+          klog_puts(KLOG_CLR_CYAN "PROCESS THREADS:\n" KLOG_CLR_RESET
+                    "  <tid_lock busy; skipped>\n");
         }
       }
 

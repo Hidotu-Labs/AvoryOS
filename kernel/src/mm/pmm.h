@@ -55,6 +55,11 @@ bool pmm_kernel_ptr_is_managed(const void *ptr);
 #define pmm_free pmm_free_page
 #define pmm_free_blocks pmm_free_pages
 
+// Reserve pages so the buddy allocator never hands them out.  Pages that are
+// currently free and linked in the buddy free lists are ignored (with a
+// warning): setting their allocation bit while the list still points at them
+// would desynchronize the allocator.  Only reserved/MMIO pages or pages that
+// are already allocated may be marked.
 void pmm_mark_used(void *ptr, size_t count);
 
 // Reclaims the memory occupied by the Limine bootloader after boot structures
@@ -73,6 +78,7 @@ uint64_t pmm_get_hhdm_offset(void);
 
 // Statistics
 size_t pmm_get_free_pages(void);
+
 // Free pages including those parked in the per-CPU (PCP) caches.  The plain
 // pmm_get_free_pages() intentionally reports only buddy lists, so it drops by
 // up to PCP_CAPACITY*MAX_CPUS pages after heavy churn even though those pages

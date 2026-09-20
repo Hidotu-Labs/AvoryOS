@@ -449,99 +449,113 @@ int ext2_set_block_num(ext2_mount_t *mnt, ext2_inode_t *inode,
   return -1;
 }
 
+/* Scan one group's bitmap for a free block, journal it as used and return its
+ * block number (0 when the group is full).  The bitmap buffer is provided by
+ * the caller and reused across groups.  start_bit is only meaningful for the
+ * group containing the allocation goal: it makes the scan wrap within that
+ * group so the search still starts near the goal. */
+static uint32_t ext2_alloc_in_group(ext2_mount_t *mnt, uint32_t g,
+                                    uint32_t start_bit, uint8_t *bitmap) {
+  if (ext2_read_block(mnt, mnt->bgdt[g].bg_block_bitmap, bitmap) != 0)
+    return 0;
+
+  uint32_t blocks_in_group = mnt->sb.s_blocks_per_group;
+  if (g == mnt->groups_count - 1) {
+    /* Block numbers are offset by first_data_block and the last group is
+     * short.  The old formula subtracted only the group offset, which lets
+     * the scan walk one block past the end of the filesystem. */
+    uint32_t group_start =
+        mnt->sb.s_first_data_block + g * mnt->sb.s_blocks_per_group;
+    if (group_start >= mnt->sb.s_blocks_count)
+      return 0;
+    uint32_t remaining = mnt->sb.s_blocks_count - group_start;
+    if (remaining < blocks_in_group)
+      blocks_in_group = remaining;
+  }
+
+  /* Two windows: [start_bit, end) then [0, start_bit).  With start_bit == 0
+   * the second pass is empty. */
+  for (int pass = 0; pass < 2; pass++) {
+    uint32_t b0 = (pass == 0) ? start_bit : 0;
+    uint32_t b1 = (pass == 0) ? blocks_in_group : start_bit;
+    if (b1 > blocks_in_group)
+      b1 = blocks_in_group;
+
+    for (uint32_t b = b0; b < b1; b++) {
+      uint32_t byte_idx = b / 8;
+      uint8_t bit_mask = (uint8_t)(1u << (b % 8));
+      if (bitmap[byte_idx] & bit_mask)
+        continue;
+
+      bitmap[byte_idx] |= bit_mask;
+      ext3_journal_block(mnt, mnt->bgdt[g].bg_block_bitmap, bitmap);
+
+      if (mnt->bgdt[g].bg_free_blocks_count)
+        mnt->bgdt[g].bg_free_blocks_count--;
+      if (mnt->sb.s_free_blocks_count)
+        mnt->sb.s_free_blocks_count--;
+      ext2_mark_metadata_dirty(mnt);
+
+      uint32_t allocated_block = mnt->sb.s_first_data_block +
+                                 g * mnt->sb.s_blocks_per_group + b;
+      uint32_t c_idx = allocated_block % EXT2_CACHE_SIZE;
+      spinlock_acquire(&mnt->cache_lock);
+      if (mnt->cache[c_idx].num == allocated_block) {
+        mnt->cache[c_idx].num = 0;
+      }
+      spinlock_release(&mnt->cache_lock);
+      return allocated_block;
+    }
+  }
+
+  return 0;
+}
+
 uint32_t ext2_alloc_block_hint(ext2_mount_t *mnt, uint32_t goal) {
   ext3_journal_start(mnt);
   uint8_t *bitmap = kmalloc(mnt->block_size);
-  if (!bitmap)
+  if (!bitmap) {
+    ext3_journal_stop(mnt);
     return 0;
+  }
 
   uint32_t start_group = 0;
   uint32_t start_bit = 0;
 
   if (goal >= mnt->sb.s_first_data_block && goal < mnt->sb.s_blocks_count) {
-    start_group = (goal - mnt->sb.s_first_data_block) / mnt->sb.s_blocks_per_group;
-    start_bit   = (goal - mnt->sb.s_first_data_block) % mnt->sb.s_blocks_per_group;
+    uint32_t rel = goal - mnt->sb.s_first_data_block;
+    start_group = rel / mnt->sb.s_blocks_per_group;
+    start_bit = rel % mnt->sb.s_blocks_per_group;
     if (start_group >= mnt->groups_count) {
       start_group = 0;
       start_bit = 0;
     }
   }
 
-  for (uint32_t i = 0; i < mnt->groups_count; i++) {
+  uint32_t allocated = 0;
+
+  /* Fast path: trust the in-memory group counters and start at the goal's
+   * group. */
+  for (uint32_t i = 0; i < mnt->groups_count && !allocated; i++) {
     uint32_t g = (start_group + i) % mnt->groups_count;
     if (mnt->bgdt[g].bg_free_blocks_count == 0)
       continue;
+    allocated = ext2_alloc_in_group(mnt, g, i == 0 ? start_bit : 0, bitmap);
+  }
 
-    ext2_read_block(mnt, mnt->bgdt[g].bg_block_bitmap, bitmap);
-
-    uint32_t blocks_in_group = mnt->sb.s_blocks_per_group;
-    if (g == mnt->groups_count - 1) {
-      uint32_t remaining =
-          mnt->sb.s_blocks_count - (g * mnt->sb.s_blocks_per_group);
-      if (remaining < blocks_in_group)
-        blocks_in_group = remaining;
-    }
-
-    uint32_t b_start = (i == 0) ? start_bit : 0;
-    for (uint32_t b = b_start; b < blocks_in_group; b++) {
-      uint32_t byte_idx = b / 8;
-      uint8_t  bit_mask = 1 << (b % 8);
-      if (!(bitmap[byte_idx] & bit_mask)) {
-        bitmap[byte_idx] |= bit_mask;
-        ext3_journal_block(mnt, mnt->bgdt[g].bg_block_bitmap, bitmap);
-
-        mnt->bgdt[g].bg_free_blocks_count--;
-        mnt->sb.s_free_blocks_count--;
-        ext2_mark_metadata_dirty(mnt);
-
-        uint32_t allocated_block = g * mnt->sb.s_blocks_per_group + b +
-                                   mnt->sb.s_first_data_block;
-        uint32_t c_idx = allocated_block % EXT2_CACHE_SIZE;
-        spinlock_acquire(&mnt->cache_lock);
-        if (mnt->cache[c_idx].num == allocated_block) {
-          mnt->cache[c_idx].num = 0;
-        }
-        spinlock_release(&mnt->cache_lock);
-
-        ext3_journal_stop(mnt);
-        kfree(bitmap);
-        return allocated_block;
-      }
-    }
-
-    if (i == 0 && start_bit > 0) {
-      uint32_t b_limit = (start_bit < blocks_in_group) ? start_bit : blocks_in_group;
-      for (uint32_t b = 0; b < b_limit; b++) {
-        uint32_t byte_idx = b / 8;
-        uint8_t  bit_mask = 1 << (b % 8);
-        if (!(bitmap[byte_idx] & bit_mask)) {
-          bitmap[byte_idx] |= bit_mask;
-          ext3_journal_block(mnt, mnt->bgdt[g].bg_block_bitmap, bitmap);
-
-          mnt->bgdt[g].bg_free_blocks_count--;
-          mnt->sb.s_free_blocks_count--;
-          ext2_mark_metadata_dirty(mnt);
-
-          uint32_t allocated_block = g * mnt->sb.s_blocks_per_group + b +
-                                     mnt->sb.s_first_data_block;
-          uint32_t c_idx = allocated_block % EXT2_CACHE_SIZE;
-          spinlock_acquire(&mnt->cache_lock);
-          if (mnt->cache[c_idx].num == allocated_block) {
-            mnt->cache[c_idx].num = 0;
-          }
-          spinlock_release(&mnt->cache_lock);
-
-          ext3_journal_stop(mnt);
-          kfree(bitmap);
-          return allocated_block;
-        }
-      }
-    }
+  /* Slow path: an interrupted write or journal replay can leave a group's
+   * free counter stale at 0 while its bitmap still has free blocks.  Ignore
+   * the counters for those groups and make one full pass so a filesystem with
+   * free space can still allocate. */
+  for (uint32_t g = 0; g < mnt->groups_count && !allocated; g++) {
+    if (mnt->bgdt[g].bg_free_blocks_count != 0)
+      continue; /* already covered by the fast path */
+    allocated = ext2_alloc_in_group(mnt, g, 0, bitmap);
   }
 
   ext3_journal_stop(mnt);
   kfree(bitmap);
-  return 0;
+  return allocated;
 }
 
 uint32_t ext2_alloc_block(ext2_mount_t *mnt) {

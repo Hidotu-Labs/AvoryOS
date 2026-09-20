@@ -231,7 +231,7 @@ struct usb_kbd_state {
 
   // DMA buffer for interrupt transfer data (8 bytes for boot protocol)
   void *report_buf;
-  uint32_t report_buf_phys;
+  uint64_t report_buf_phys;
 
   // Previous report for detecting press/release transitions
   struct usb_kbd_report prev_report;
@@ -387,6 +387,35 @@ static void usb_kbd_inject_key(struct usb_kbd_state *kbd, uint8_t usage,
 
   // Handle extended keys → escape sequences
   if (extended) {
+    /* Linux VT scrollback bindings, matching the PS/2 path in keyboard.c:
+     *   Shift+PgUp/PgDn  page up/down
+     *   Shift+Up/Down    one line
+     *   Shift+Home/End   top/bottom
+     * These must be intercepted before the keys become escape sequences. */
+    if (shift) {
+      switch (usage) {
+      case 0x4B: // Page Up
+        console_scroll_view_try((int)console_get_rows() - 1);
+        return;
+      case 0x4E: // Page Down
+        console_scroll_view_try(-(int)(console_get_rows() - 1));
+        return;
+      case 0x52: // Up
+        console_scroll_view_try(1);
+        return;
+      case 0x51: // Down
+        console_scroll_view_try(-1);
+        return;
+      case 0x4A: // Home
+        console_scroll_view_try(1000000);
+        return;
+      case 0x4D: // End
+        console_scroll_view_try(-1000000);
+        return;
+      default:
+        break;
+      }
+    }
     switch (usage) {
     case 0x52: { // Up
       const char seq[] = {'\x1B', '[', 'A'};
@@ -610,7 +639,7 @@ static void usb_kbd_setup_interrupt_xfer(struct usb_kbd_state *kbd) {
                        ((uint32_t)kbd->data_toggle << 19) |
                        ((uint32_t)kbd->ep_number << 15) |
                        ((uint32_t)kbd->dev->address << 8) | TD_PID_IN;
-  kbd->int_td->buffer = kbd->report_buf_phys;
+  kbd->int_td->buffer = (uint32_t)kbd->report_buf_phys;
 
   // Point QH to our TD
   kbd->int_qh->head = QH_LINK_TERMINATE; // No horizontal link
@@ -663,7 +692,7 @@ static void usb_kbd_resubmit_td(struct usb_kbd_state *kbd) {
                        ((uint32_t)kbd->data_toggle << 19) |
                        ((uint32_t)kbd->ep_number << 15) |
                        ((uint32_t)kbd->dev->address << 8) | TD_PID_IN;
-  kbd->int_td->buffer = kbd->report_buf_phys;
+  kbd->int_td->buffer = (uint32_t)kbd->report_buf_phys;
 
   // Re-point QH element to our TD
   __asm__ volatile("mfence" ::: "memory");
@@ -754,12 +783,22 @@ bool usb_kbd_probe(struct usb_device *dev) {
       klog_hex32(iface->interface_protocol);
       klog_puts("\n");
 
-      if (iface->interface_class == USB_CLASS_HID &&
-          iface->interface_subclass == USB_SUBCLASS_BOOT &&
-          iface->interface_protocol == USB_PROTOCOL_KEYBOARD) {
-        found_keyboard = true;
-        in_keyboard_iface = true;
-        iface_num = iface->interface_number;
+      if (iface->interface_class == USB_CLASS_HID) {
+        bool match = iface->interface_protocol == USB_PROTOCOL_KEYBOARD;
+        if (!match && iface->interface_protocol == 0) {
+          match = usb_hid_usage_matches(dev, iface->interface_number, 0x06);
+          klog_puts(match
+                        ? "[USB-KBD] protocol-0 interface matched by report descriptor\n"
+                        : "[USB-KBD] protocol-0 interface has no keyboard usage in its report descriptor\n");
+        }
+        if (match) {
+          found_keyboard = true;
+          in_keyboard_iface = true;
+          iface_num = iface->interface_number;
+          klog_puts("[USB-KBD] HID keyboard interface selected\n");
+        } else {
+          in_keyboard_iface = false;
+        }
       } else {
         in_keyboard_iface = false;
       }
@@ -819,21 +858,15 @@ bool usb_kbd_probe(struct usb_device *dev) {
   for (int i = 0; i < 5000; i++)
     io_wait();
 
-  // 4. SET_PROTOCOL to Boot Protocol (protocol 0)
-  //    bmRequestType=0x21 (class, interface), bRequest=0x0B
-  req.request_type = 0x21;
-  req.request = USB_REQ_SET_PROTOCOL;
-  req.value = HID_PROTOCOL_BOOT;
-  req.index = iface_num;
-  req.length = 0;
+  // 4. Do NOT send SET_PROTOCOL.  Linux's usbhid never sends it, and the
+  //    Logitech Unifying receiver's mouse interface stops forwarding reports
+  //    when a protocol request is issued on the device.  The bus reset during
+  //    enumeration leaves the keyboard in report protocol; the report decoder
+  //    below already handles both the plain 8-byte and Report-ID formats.
+  //    (SET_IDLE stays: it drives the periodic reports used for key repeat.)
 
-  res = usb_control_transfer(dev, &req, NULL, 0);
-  if (res < 0) {
-    klog_puts("[USB-KBD] SET_PROTOCOL failed (non-fatal)\n");
-    // Not fatal — many keyboards work in boot protocol by default
-  }
-
-  // 5. SET_IDLE (duration=0 means report only on change)
+  // 5. SET_IDLE (duration=10 means reports continue every 40ms, which the
+  //    repeat logic relies on)
   //    bmRequestType=0x21, bRequest=0x0A
   req.request_type = 0x21;
   req.request = USB_REQ_SET_IDLE;
@@ -846,9 +879,11 @@ bool usb_kbd_probe(struct usb_device *dev) {
     klog_puts("[USB-KBD] SET_IDLE failed (non-fatal)\n");
   }
 
-  // 6. Allocate DMA buffer for interrupt transfer reports
+  // 6. Allocate DMA buffer for interrupt transfer reports.  Keep it below
+  // 4GB: some controllers (and the UHCI fallback path) cannot address higher
+  // memory, and a truncated 32-bit address silently DMAs to the wrong place.
   uint64_t phys;
-  void *buf = dma_alloc_page(&phys);
+  void *buf = dma_alloc_page_flags(DMA_FLAG_32BIT, &phys);
   if (!buf) {
     klog_puts("[USB-KBD] Failed to allocate DMA buffer\n");
     return false;
@@ -869,7 +904,7 @@ bool usb_kbd_probe(struct usb_device *dev) {
   kbd->interval = ep_interval;
   kbd->data_toggle = 0;
   kbd->report_buf = buf;
-  kbd->report_buf_phys = (uint32_t)phys;
+  kbd->report_buf_phys = phys;
   kbd->interface_number = iface_num;
   kbd->caps_lock = false;
   kbd->report_format_known = false;
@@ -1097,4 +1132,30 @@ void usb_kbd_poll(void) {
 
     usb_kbd_resubmit_td(kbd);
   }
+}
+
+// Diagnostics (/proc/usb)
+
+void usb_kbd_diag(struct usb_diag *d) {
+  usb_diag_printf(d, "USB keyboard driver:\n");
+  int active = 0;
+  for (int i = 0; i < kbd_count; i++) {
+    struct usb_kbd_state *kbd = &keyboards[i];
+    if (!kbd->active)
+      continue;
+    active++;
+    usb_diag_printf(d,
+                    "  kbd%d: addr=%u iface=%u ep=0x%02X maxpkt=%u "
+                    "interval=%u pipe=%s report=%s\n",
+                    i, kbd->dev ? kbd->dev->address : 0, kbd->interface_number,
+                    kbd->ep_addr, kbd->max_packet, kbd->interval,
+                    kbd->generic_pipe ? "generic" :
+                    (kbd->ehci_pipe ? "ehci" :
+                     (kbd->ohci_pipe ? "ohci" : "uhci")),
+                    !kbd->report_format_known ? "unknown" :
+                    (kbd->report_has_id ? "9-byte+report-id"
+                                        : "8-byte boot"));
+  }
+  if (!active)
+    usb_diag_printf(d, "  none active\n");
 }

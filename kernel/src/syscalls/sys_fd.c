@@ -19,6 +19,7 @@
 #include "syscall.h"
 #include "../fs/ext2.h"
 #include "../fs/ext4.h"
+#include "../fs/tmpfs.h"
 #include "../drivers/storage/block.h"
 #include "arch/uaccess.h"
 #include <stdint.h>
@@ -1231,15 +1232,67 @@ static uint64_t sys_fadvise64(uint64_t fd, uint64_t offset, uint64_t len,
 static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
                           uint64_t fstype_ptr, uint64_t flags,
                           uint64_t data_ptr, uint64_t a5) {
-    (void)fstype_ptr;
-    (void)flags;
     (void)data_ptr;
     (void)a5;
 
     const char *source = (const char *)source_ptr;
     const char *target = (const char *)target_ptr;
+    const char *fstype = (const char *)fstype_ptr;
 
-    if (!source || !target)
+    if (!target)
+        return (uint64_t)-14;
+
+    /* Linux MS_REMOUNT = 0x20 */
+    if (flags & 0x20) {
+        vfs_node_t *mountpoint = vfs_resolve_path(target);
+        if (mountpoint) {
+            vfs_close(mountpoint);
+            return 0;
+        }
+        return (uint64_t)-2;
+    }
+
+    /* Pseudo-filesystems handling */
+    if (fstype) {
+        if (strcmp(fstype, "proc") == 0 ||
+            strcmp(fstype, "sysfs") == 0 ||
+            strcmp(fstype, "devtmpfs") == 0 ||
+            strcmp(fstype, "devfs") == 0) {
+            vfs_node_t *mountpoint = vfs_resolve_path(target);
+            if (mountpoint) {
+                vfs_close(mountpoint);
+                return 0;
+            }
+            return (uint64_t)-2;
+        }
+
+        if (strcmp(fstype, "tmpfs") == 0 || strcmp(fstype, "ramfs") == 0) {
+            vfs_node_t *mountpoint = vfs_resolve_path(target);
+            if (!mountpoint)
+                return (uint64_t)-2;
+            vfs_close(mountpoint);
+            tmpfs_mount_at(target);
+            return 0;
+        }
+
+        if (strcmp(fstype, "cgroup") == 0 ||
+            strcmp(fstype, "cgroup2") == 0 ||
+            strcmp(fstype, "securityfs") == 0 ||
+            strcmp(fstype, "debugfs") == 0 ||
+            strcmp(fstype, "pstore") == 0 ||
+            strcmp(fstype, "configfs") == 0 ||
+            strcmp(fstype, "mqueue") == 0 ||
+            strcmp(fstype, "fusectl") == 0) {
+            vfs_node_t *mountpoint = vfs_resolve_path(target);
+            if (mountpoint) {
+                vfs_close(mountpoint);
+                return 0;
+            }
+            return (uint64_t)-2;
+        }
+    }
+
+    if (!source)
         return (uint64_t)-14;
 
     vfs_node_t *mountpoint = vfs_resolve_path(target);
@@ -1282,6 +1335,23 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
     return (uint64_t)-22;
 }
 
+static uint64_t sys_umount2(uint64_t target_ptr, uint64_t flags,
+                            uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)flags;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    (void)a6;
+    const char *target = (const char *)target_ptr;
+    if (!target)
+        return (uint64_t)-14;
+    vfs_node_t *mountpoint = vfs_resolve_path(target);
+    if (!mountpoint)
+        return (uint64_t)-2;
+    vfs_close(mountpoint);
+    return 0;
+}
+
 void syscall_register_fd(void) {
   syscall_register(SYS_READ, sys_read);
   syscall_register(SYS_WRITE, sys_write);
@@ -1303,6 +1373,7 @@ void syscall_register_fd(void) {
   syscall_register(SYS_FSYNC, sys_fsync);
   syscall_register(SYS_FDATASYNC, sys_fdatasync);
   syscall_register(SYS_MOUNT, sys_mount);
+  syscall_register(SYS_UMOUNT2, sys_umount2);
   syscall_register(SYS_SENDFILE, sys_sendfile);
   syscall_register(SYS_COPY_FILE_RANGE, sys_copy_file_range);
   syscall_register(SYS_SPLICE, sys_splice);

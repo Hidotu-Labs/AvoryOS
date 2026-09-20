@@ -49,6 +49,39 @@ struct big_alloc {
 
 static struct big_alloc *big_alloc_head = NULL;
 
+/* Bounded log of recent frees: (object, caller).  This is only a debugging
+ * aid: use-after-free reports name the call site that handed the object back
+ * to the heap, which usually identifies the double owner.  Plain 64-bit
+ * stores keep it lock-free; a racing read can at worst miss an entry. */
+#define KFREE_TRACE_DEPTH 256
+static struct {
+  void *ptr;
+  void *caller;
+} kfree_trace[KFREE_TRACE_DEPTH];
+static uint32_t kfree_trace_next;
+
+static void kfree_trace_record(void *ptr, void *caller) {
+  uint32_t slot =
+      __atomic_add_fetch(&kfree_trace_next, 1, __ATOMIC_RELAXED) %
+      KFREE_TRACE_DEPTH;
+  kfree_trace[slot].ptr = ptr;
+  __atomic_store_n(&kfree_trace[slot].caller, caller, __ATOMIC_RELEASE);
+}
+
+bool heap_last_free_caller(const void *ptr, uint64_t *caller) {
+  if (!ptr || !caller)
+    return false;
+  for (uint32_t n = 1; n <= KFREE_TRACE_DEPTH; n++) {
+    uint32_t slot = (kfree_trace_next - n) % KFREE_TRACE_DEPTH;
+    if (__atomic_load_n(&kfree_trace[slot].ptr, __ATOMIC_ACQUIRE) == ptr &&
+        kfree_trace[slot].caller) {
+      *caller = (uint64_t)kfree_trace[slot].caller;
+      return true;
+    }
+  }
+  return false;
+}
+
 static struct slab_cache caches[] = {
     {32,   SPINLOCK_INIT, NULL, NULL, NULL},
     {64,   SPINLOCK_INIT, NULL, NULL, NULL},
@@ -300,6 +333,8 @@ void *kmalloc(size_t size) {
 void kfree(void *ptr) {
   if (!ptr)
     return;
+
+  kfree_trace_record(ptr, __builtin_return_address(0));
 
   uint64_t page_base = (uint64_t)ptr & ~0xFFFULL;
   uint64_t magic_check = *(uint64_t *)page_base;

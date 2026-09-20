@@ -1,15 +1,18 @@
 #include "console.h"
 #include "../apic/lapic_timer.h"
+#include "../cpu/tsc.h"
 #include "../drivers/input/keyboard.h"
 #include "../drivers/serial.h"
 #include "fb/framebuffer.h"
 #include "font/font.h"
+#include "klog.h"
 #include "lib/string.h"
 #include "lock/spinlock.h"
 #include <stddef.h>
 #include <stdint.h>
 
 static spinlock_t console_lock = SPINLOCK_INIT;
+static bool console_initialized = false;
 static void console_set_cursor_visible_unlocked(bool visible);
 static void console_refresh_cursor_unlocked(void);
 static uint32_t console_history_row(uint32_t screen_row);
@@ -199,9 +202,7 @@ static void console_redraw(void) {
   fb_set_backbuffer_mode(false);
 }
 
-void console_scroll_view(int delta) {
-  spinlock_acquire(&console_lock);
-
+static void console_scroll_view_locked(int delta) {
   int new_offset = (int)view_scroll_offset + delta;
   if (new_offset < 0)
     new_offset = 0;
@@ -219,8 +220,26 @@ void console_scroll_view(int delta) {
     view_scroll_offset = (uint32_t)new_offset;
     console_redraw();
   }
+}
 
+void console_scroll_view(int delta) {
+  spinlock_acquire(&console_lock);
+  console_scroll_view_locked(delta);
   spinlock_release(&console_lock);
+}
+
+bool console_scroll_view_try(int delta) {
+  /* Input drivers may run in IRQ context, and the console lock can be held by
+   * the very context an IRQ interrupted (the ANSI parser calls back into the
+   * keyboard ring buffer).  A blocking acquire there is a self-deadlock, so
+   * the keyboard paths try the lock and skip a scroll that cannot run. */
+  if (!spinlock_try_acquire(&console_lock))
+    return false;
+  uint32_t before = view_scroll_offset;
+  console_scroll_view_locked(delta);
+  bool changed = view_scroll_offset != before;
+  spinlock_release(&console_lock);
+  return changed;
 }
 
 uint32_t console_get_rows(void) { return max_rows; }
@@ -283,6 +302,10 @@ void console_init(struct limine_framebuffer *framebuffer) {
   last_printed_cp = ' ';
 
   fb_clear(BG_COLOR);
+  console_initialized = true;
+  klogf("[CONSOLE] build %s %s (scrollback: Shift+PgUp/PgDn, Shift+Up/Down, "
+        "Shift+Home/End)\n",
+        __DATE__, __TIME__);
 }
 
 static uint32_t console_history_row(uint32_t screen_row) {
@@ -1295,10 +1318,20 @@ static void console_putchar_unlocked(char c) {
  * flushes them.  All the output then lands in one copy per ~8 ms. */
 #define CONSOLE_SWAP_INTERVAL_MS 8
 #define CONSOLE_SWAP_MAX_PENDING 128
+/* When the TSC calibration is missing or implausible, the interval check
+ * below can never fire (or fires every write, which crawls).  Fall back to a
+ * plain write count so the screen is guaranteed to advance. */
+#define CONSOLE_SWAP_FALLBACK_WRITES 32
 
 static bool console_swap_pending = false;
 static uint32_t console_swap_pending_writes = 0;
 static uint64_t console_last_swap_ms = 0;
+
+static bool console_timebase_ok(void) {
+  /* Every real x86-64 CPU runs its TSC far above 100 MHz; anything below
+   * that is a failed PIT-based calibration, not a slow clock. */
+  return tsc_get_freq_khz() >= 100000;
+}
 
 static void console_flush_pending_locked(void) {
   if (!console_swap_pending)
@@ -1310,8 +1343,21 @@ static void console_flush_pending_locked(void) {
 }
 
 static void console_request_swap(void) {
-  uint64_t now = lapic_timer_get_ms();
   console_swap_pending_writes++;
+
+  if (!console_timebase_ok()) {
+    /* No usable clock: bound the time a frame can sit in the backbuffer. */
+    if (console_swap_pending_writes >= CONSOLE_SWAP_FALLBACK_WRITES) {
+      console_swap_pending = false;
+      console_swap_pending_writes = 0;
+      fb_swap_buffer();
+    } else {
+      console_swap_pending = true;
+    }
+    return;
+  }
+
+  uint64_t now = lapic_timer_get_ms();
 
   /* Put the frame on screen when enough output has piled up, or when the
    * previous frame is already old enough that this is interactive latency
@@ -1372,6 +1418,12 @@ void console_putchar(char c) {
 // This is the main anti-flicker fix — kilo sends one large write() per frame
 // so everything lands in one swap.
 void console_puts(const char *s) {
+  /* A DRM client (Xorg) renders into the same scanout buffer this console
+   * uses.  Once it owns the display, kernel messages must not be painted
+   * over it. */
+  if (fb_get_kd_mode() == KD_GRAPHICS)
+    return;
+
   spinlock_acquire(&console_lock);
   fb_set_backbuffer_mode(true);
 
@@ -1386,6 +1438,11 @@ void console_puts(const char *s) {
     console_set_cursor_visible_unlocked(true);
 
   console_request_swap();
+  /* console_puts() carries complete boot/status messages.  Flush the frame
+   * now instead of leaving it to the deferred-swap timer: a hang right after
+   * this call must still show the message (the deferred path depends on the
+   * timebase being healthy). */
+  console_flush_pending_locked();
   fb_set_backbuffer_mode(false);
   console_serial_flush();
   spinlock_release(&console_lock);
@@ -1393,11 +1450,7 @@ void console_puts(const char *s) {
 
 // Batch write used by the VFS console node and fd 1/2 in sys_write.
 // Renders all characters then swaps the backbuffer exactly once.
-void console_write_batch(const char *buf, size_t len) {
-  if (fb_get_kd_mode() == KD_GRAPHICS)
-    return;
-  spinlock_acquire(&console_lock);
-
+static void console_write_batch_locked(const char *buf, size_t len) {
   fb_set_backbuffer_mode(true);
 
   // Don't toggle cursor visibility - just skip drawing it and restore after
@@ -1418,8 +1471,24 @@ void console_write_batch(const char *buf, size_t len) {
   console_request_swap();
   fb_set_backbuffer_mode(false);
   console_serial_flush();
+}
 
+void console_write_batch(const char *buf, size_t len) {
+  if (!console_initialized || fb_get_kd_mode() == KD_GRAPHICS)
+    return;
+  spinlock_acquire(&console_lock);
+  console_write_batch_locked(buf, len);
   spinlock_release(&console_lock);
+}
+
+bool console_write_batch_try(const char *buf, size_t len) {
+  if (!console_initialized || fb_get_kd_mode() == KD_GRAPHICS)
+    return false;
+  if (!spinlock_try_acquire(&console_lock))
+    return false;
+  console_write_batch_locked(buf, len);
+  spinlock_release(&console_lock);
+  return true;
 }
 
 static void console_set_cursor_visible_unlocked(bool visible) {

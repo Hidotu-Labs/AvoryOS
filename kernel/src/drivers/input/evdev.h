@@ -34,6 +34,13 @@ struct input_event {
 #define SYN_MT_REPORT 2
 #define SYN_DROPPED 3
 
+// LED codes (EV_LED)
+#define LED_NUML 0x00
+#define LED_CAPSL 0x01
+#define LED_SCROLLL 0x02
+#define LED_COMPOSE 0x03
+#define LED_KANA 0x04
+
 // Relative axis codes (EV_REL)
 #define REL_X 0x00
 #define REL_Y 0x01
@@ -221,6 +228,7 @@ typedef struct evdev_device {
   volatile uint32_t head;
   volatile uint32_t tail;
   uint8_t key_state[(KEY_MAX_EV + 8) / 8];
+  uint8_t led_state;    // EV_LED state written by userspace (Xorg kbd driver)
 
   wait_queue_t wait;    // For blocking reads / poll
   spinlock_t lock;      // Protects head/tail and ring buffer

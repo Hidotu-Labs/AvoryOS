@@ -932,7 +932,13 @@ static void reason_stuck_cpu(char *out, size_t outsz, uint32_t victim) {
 static void check_serial_trigger(void) {
   static char window[4];
   static unsigned n;
-  for (;;) {
+
+  /* Bounded per tick.  On boards whose SuperIO does not decode COM1, the
+   * line-status register floats high and reads 0xFF: every poll looks like a
+   * received byte and never clears.  An unbounded drain here hangs the timer
+   * ISR forever on the very first tick.  A real UART delivers at most a few
+   * characters per millisecond, so a small budget loses nothing. */
+  for (int budget = 0; budget < 64; budget++) {
     int c = serial_try_get_char();
     if (c < 0)
       return;

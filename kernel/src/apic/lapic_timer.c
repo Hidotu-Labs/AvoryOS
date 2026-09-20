@@ -1,10 +1,13 @@
 #include "lapic_timer.h"
 #include "hal/hal.h"
 #include "lapic.h"
+#include "../console/debug.h"
 #include "../cpu/isr.h"
 #include "../console/console.h"
 #include "../console/klog.h"
 #include "../cpu/tsc.h"
+#include "../drivers/timer/hpet.h"
+#include "../lib/string.h"
 #include "../lib/tsc.h"
 #include "../drivers/usb/xhci.h"
 #include "../io/io.h"
@@ -53,15 +56,19 @@ static uint32_t deadline_to_initial_count(uint64_t deadline_ms) {
 }
 
 // Helpers
-static void print_hex32(uint32_t num) {
-    const char *hex = "0123456789ABCDEF";
-    for (int i = 28; i >= 0; i -= 4) {
-        klog_putchar(hex[(num >> i) & 0xF]);
-    }
-}
 
 // Timer ISR
 void lapic_timer_handler(struct registers *regs) {
+    /* First-tick breadcrumb: this is the first time the timer ISR has ever
+     * run on a machine booted with a broken PIT calibration, and if the box
+     * wedges in here the on-screen log has to say the tick was reached. */
+    static bool first_tick_reported;
+    if (!first_tick_reported) {
+        first_tick_reported = true;
+        struct cpu_info *c = cpu_get_current();
+        DBG("[TMR] first LAPIC tick on CPU %u\n", c ? c->cpu_id : 0U);
+    }
+
     struct cpu_info *cpu = cpu_get_current();
     if (cpu) cpu->timer_deadline_ms = 0;
     extern void timerfd_tick(void);
@@ -144,30 +151,114 @@ static uint32_t calibrate_lapic_timer(void) {
 
     // Stop the LAPIC timer
     lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
-    uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CURRENT);
+    uint32_t current = lapic_read(LAPIC_TIMER_CURRENT);
+    uint32_t elapsed = 0xFFFFFFFF - current;
+
+    DBG("[TMR] PIT reference: lapic current=0x%x elapsed=%u over %u ms\n",
+        current, elapsed, CALIBRATION_MS);
 
     // ticks_per_ms = elapsed / CALIBRATION_MS
     return elapsed / CALIBRATION_MS;
 }
 
+// HPET-referenced calibration, used when the PIT latch measurement is
+// unusable (some chipsets do not make channel 0 readable).  The HPET main
+// counter is a free-running clock this kernel already uses for its backup
+// timer, and hpet_init() has run by the time the LAPIC timer is calibrated.
+static uint32_t calibrate_lapic_timer_hpet(void) {
+    if (!hpet_is_available())
+        return 0;
+
+    uint64_t hz = hpet_get_frequency();
+    if (hz < 1000)
+        return 0;
+
+    uint64_t wait = hz / 100; // ~10 ms
+    if (wait == 0)
+        wait = 1;
+
+    lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
+    lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
+    lapic_write(LAPIC_TIMER_INIT, 0xFFFFFFFF);
+
+    uint64_t h0 = hpet_read_counter();
+    uint64_t guard = rdtsc();
+    while ((hpet_read_counter() - h0) < wait) {
+        if (rdtsc() - guard > 100000000000ULL)
+            break;
+        hal_cpu_relax();
+    }
+
+    lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
+    uint32_t current = lapic_read(LAPIC_TIMER_CURRENT);
+    uint32_t elapsed = 0xFFFFFFFF - current;
+
+    DBG("[TMR] HPET reference: lapic current=0x%x elapsed=%u over %u ms\n",
+        current, elapsed, CALIBRATION_MS);
+
+    return elapsed / CALIBRATION_MS;
+}
+
 // Public API
 
-void lapic_timer_init(void) {
-    klog_puts("[INFO] Calibrating LAPIC timer against PIT...\n");
+// A plausible LAPIC timer rate.  Anything outside this range means the
+// reference wait itself was broken (a PIT latch read that returns instantly
+// yields a tiny nonzero rate, which arms the next one-shot for a few
+// microseconds and turns the first tick into an interrupt storm), not a real
+// APIC clock.
+#define LAPIC_TICKS_PER_MS_MIN 1000U
+#define LAPIC_TICKS_PER_MS_MAX 50000000U
 
-    ticks_per_ms = calibrate_lapic_timer();
+static bool lapic_rate_plausible(uint32_t ticks) {
+    return ticks >= LAPIC_TICKS_PER_MS_MIN && ticks <= LAPIC_TICKS_PER_MS_MAX;
+}
+
+void lapic_timer_init(void) {
+    klog_puts("[INFO] Calibrating LAPIC timer...\n");
+
+    /* Prefer the HPET: it is a free-running clock with a well-defined rate,
+     * while the PIT channel-0 latch read is unreliable on some chipsets.
+     * Fall back to the PIT only when the HPET result is implausible. */
+    uint32_t hpet_ticks = calibrate_lapic_timer_hpet();
+    uint32_t pit_ticks = 0;
+    const char *ref = NULL;
+
+    if (lapic_rate_plausible(hpet_ticks)) {
+        ticks_per_ms = hpet_ticks;
+        ref = "HPET";
+    } else {
+        pit_ticks = calibrate_lapic_timer();
+        if (lapic_rate_plausible(pit_ticks)) {
+            ticks_per_ms = pit_ticks;
+            ref = "PIT";
+        } else {
+            ticks_per_ms = 0;
+        }
+    }
+
     boot_tsc = rdtsc();
 
-    klog_puts("     LAPIC ticks/ms: 0x");
-    print_hex32(ticks_per_ms);
-    klog_puts(" (");
-    klog_uint64(ticks_per_ms);
-    klog_puts(")\n");
-
-    if (ticks_per_ms == 0) {
-        klog_puts("[ERR] LAPIC timer calibration failed (0 ticks/ms). Aborting.\n");
-        return;
+    /* One complete line, so the value can never be split across two frames
+     * on screen (the "LAPIC ticks/ms: 0x" with no digits symptom). */
+    {
+        char line[112];
+        int n;
+        if (ref) {
+            n = snprintf(line, sizeof(line),
+                         "     LAPIC ticks/ms: 0x%08X (%u), reference %s\n",
+                         ticks_per_ms, ticks_per_ms, ref);
+        } else {
+            n = snprintf(line, sizeof(line),
+                         "[ERR] LAPIC calibration implausible "
+                         "(HPET=%u, PIT=%u ticks/ms); timer left disabled\n",
+                         hpet_ticks, pit_ticks);
+        }
+        if (n > 0)
+            klog_puts(line);
     }
+
+    if (!ref)
+        return;
 
     // Register ISR for our timer vector
     register_interrupt_handler(LAPIC_TIMER_VECTOR, lapic_timer_handler);
@@ -179,7 +270,9 @@ void lapic_timer_init(void) {
     klog_uint64(LAPIC_TIMER_VECTOR);
     klog_puts(")\n");
     lapic_timer_arm_at(monotonic_ms() + LAPIC_SCHED_QUANTUM_MS);
+    DBG("[TMR] timer armed: ticks/ms=%u\n", ticks_per_ms);
     vmm_update_vdso_data();
+    DBG("[TMR] vdso data updated\n");
 }
 
 
@@ -223,6 +316,15 @@ void lapic_timer_rearm_if_earlier(uint64_t deadline_ms) {
 }
 
 void lapic_timer_sleep(uint32_t ms) {
+    /* If the LAPIC timer never calibrated (or the TSC timebase is missing),
+     * the halt loop below would never see monotonic_ms() advance and would
+     * sleep forever.  Fall back to a bounded busy-wait in that case. */
+    if (tsc_get_freq_khz() == 0 || ticks_per_ms == 0) {
+        for (uint64_t i = 0; i < (uint64_t)ms * 100000; i++)
+            hal_cpu_relax();
+        return;
+    }
+
     uint64_t target = monotonic_ms() + ms;
     while (monotonic_ms() < target) {
         lapic_timer_rearm_if_earlier(target);

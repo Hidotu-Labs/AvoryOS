@@ -4,12 +4,16 @@
 #include "apic/lapic.h"
 #include "apic/lapic_timer.h"
 #include "console/console.h"
+#include "console/debug.h"
 #include "console/klog.h"
 #include "cpu/features.h"
 #include "cpu/gdt.h"
 #include "cpu/idt.h"
+#include "cpu/tsc.h"
 #include "drivers/timer/pit.h"
+#include "io/io.h"
 #include "lib/string.h"
+#include "lib/tsc.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "syscalls/syscall.h"
@@ -117,6 +121,7 @@ static volatile struct cpu_info *starting_cpu = NULL;
 
 void ap_main(void) {
   klog_puts("AP IN MAIN!\n");
+  DBG("[AP] entered long mode\n");
 
   // We are now in 64-bit Long Mode!
 
@@ -127,6 +132,7 @@ void ap_main(void) {
   struct cpu_info *bootstrap = (struct cpu_info *)starting_cpu;
   gdt_load_ap(bootstrap ? bootstrap->cpu_id : 0);
   cpu_features_init();
+  DBG("[AP] gdt + cpu features ok\n");
 
   // 1. Setup GS base using the pointer passed by the BSP
   cpu_set_gs_base((struct cpu_info *)starting_cpu);
@@ -138,9 +144,11 @@ void ap_main(void) {
   cpu_set_active_cr3(current->kernel_cr3);
   __asm__ volatile("mov %0, %%cr3" ::"r"(current->kernel_cr3) : "memory");
   cpu_switch_stack(current->stack_top);
+  DBG("[AP] cpu %u: cr3 + kernel stack ok\n", current->cpu_id);
 
   // 2. Initialize the LAPIC for this core (needs the HHDM base mapping)
   lapic_init((uint64_t)acpi_get_lapic_base());
+  DBG("[AP] cpu %u: lapic ok\n", current->cpu_id);
 
   // 3. Load the IDT for this core (reuse the BSP's already-built table)
   idt_load();
@@ -152,6 +160,7 @@ void ap_main(void) {
 
   // 4. initialize the LAPIC timer for this core so it can independently preempt
   lapic_timer_init_ap();
+  DBG("[AP] cpu %u: idt + syscall + timer ok\n", current->cpu_id);
 
   // 5. Enable interrupts locally on this core
   hal_irq_enable();
@@ -164,6 +173,7 @@ void ap_main(void) {
   klog_puts(" (APIC ID ");
   klog_hex32(current->apic_id);
   klog_puts(") ONLINE.\n");
+  DBG("[AP] cpu %u: ONLINE, entering idle\n", current->cpu_id);
 
   // Endless loop, waiting for IPIs or scheduler interrupts.
   //
@@ -293,9 +303,142 @@ void cpu_init(void) {
   }
 }
 
+// ── AP startup ──────────────────────────────────────────────────────────────
+//
+// These helpers run before any AP is online, so they must not rely on IPIs,
+// the scheduler, or the LAPIC timer (which may not have calibrated).  Delays
+// are TSC busy-waits, paced with I/O port writes only if the TSC frequency is
+// unknown.
+
+static void ap_delay_us(uint32_t us) {
+  uint64_t khz = tsc_get_freq_khz();
+  if (khz != 0) {
+    uint64_t cycles = (khz * (uint64_t)us) / 1000;
+    uint64_t start = rdtsc();
+    while (rdtsc() - start < cycles)
+      hal_cpu_relax();
+    return;
+  }
+  // No TSC timebase.  Port 0x80 is the legacy POST port; each write is a
+  // few hundred nanoseconds on real hardware.  Crude, but bounded.
+  for (uint64_t i = 0; i < (uint64_t)us * 10; i++)
+    outb(0x80, 0);
+}
+
+static bool ap_wait_icr_idle(uint32_t timeout_us) {
+  uint64_t khz = tsc_get_freq_khz();
+  if (khz != 0) {
+    uint64_t cycles = (khz * (uint64_t)timeout_us) / 1000;
+    uint64_t start = rdtsc();
+    while (rdtsc() - start < cycles) {
+      if (lapic_icr_idle())
+        return true;
+      hal_cpu_relax();
+    }
+  } else {
+    for (uint64_t i = 0; i < (uint64_t)timeout_us * 100; i++) {
+      if (lapic_icr_idle())
+        return true;
+      hal_cpu_relax();
+    }
+  }
+  return lapic_icr_idle();
+}
+
+static bool ap_wait_online(struct cpu_info *ap, uint32_t timeout_ms) {
+  uint64_t khz = tsc_get_freq_khz();
+  if (khz != 0) {
+    uint64_t cycles = khz * (uint64_t)timeout_ms;
+    uint64_t start = rdtsc();
+    while (__atomic_load_n(&ap->status, __ATOMIC_ACQUIRE) !=
+           CPU_STATUS_ONLINE) {
+      if (rdtsc() - start >= cycles)
+        break;
+      hal_cpu_relax();
+    }
+  } else {
+    for (uint64_t i = 0; i < (uint64_t)timeout_ms * 200000; i++) {
+      if (__atomic_load_n(&ap->status, __ATOMIC_ACQUIRE) == CPU_STATUS_ONLINE)
+        break;
+      hal_cpu_relax();
+    }
+  }
+  return __atomic_load_n(&ap->status, __ATOMIC_ACQUIRE) == CPU_STATUS_ONLINE;
+}
+
+// Put a CPU back into wait-for-SIPI state.  Called when an AP did not come
+// online so it cannot wake up later and consume the shared trampoline baton
+// that the next AP is about to reuse.
+static void ap_park(uint32_t apic_id) {
+  lapic_write_icr(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_ASSERT);
+  (void)ap_wait_icr_idle(1000);
+  ap_delay_us(10000);
+  lapic_write_icr(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_DEASSERT);
+  (void)ap_wait_icr_idle(1000);
+}
+
+// Returns true when the AP reached CPU_STATUS_ONLINE.
+static bool ap_start(struct cpu_info *ap, volatile uint64_t *ptr_stack,
+                     uint8_t sipi_vector) {
+  *ptr_stack = ap->stack_top;
+  starting_cpu = ap;
+
+  DBG("[SMP] AP %u (APIC 0x%x): INIT assert\n", ap->cpu_id, ap->apic_id);
+
+  // Intel SDM 8.4.4: INIT is a level-triggered assertion followed by a
+  // deassert.  The old sequence sent an edge-encoded INIT and a single
+  // STARTUP; some real chipsets ignore that INIT and then drop the SIPI,
+  // leaving the BSP spinning in the old unbounded ONLINE loop forever.
+  lapic_write_icr(ap->apic_id,
+                  LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_ASSERT);
+  if (!ap_wait_icr_idle(1000))
+    DBG("[SMP] AP %u: INIT delivery status stuck busy\n", ap->cpu_id);
+  ap_delay_us(10000);
+
+  lapic_write_icr(ap->apic_id,
+                  LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_DEASSERT);
+  (void)ap_wait_icr_idle(1000);
+  ap_delay_us(200);
+
+  // Send STARTUP twice: the first SIPI can be lost while the AP is still
+  // finishing its reset microcode.
+  for (int attempt = 0; attempt < 2; attempt++) {
+    DBG("[SMP] AP %u: SIPI #%d -> vector 0x%x\n", ap->cpu_id, attempt + 1,
+        sipi_vector);
+    lapic_write_icr(ap->apic_id,
+                    LAPIC_ICR_STARTUP | LAPIC_ICR_EDGE | sipi_vector);
+    if (!ap_wait_icr_idle(1000))
+      DBG("[SMP] AP %u: SIPI #%d delivery status stuck busy\n", ap->cpu_id,
+          attempt + 1);
+    ap_delay_us(200);
+    if (__atomic_load_n(&ap->status, __ATOMIC_ACQUIRE) == CPU_STATUS_ONLINE) {
+      DBG("[SMP] AP %u: online\n", ap->cpu_id);
+      return true;
+    }
+  }
+
+  if (ap_wait_online(ap, 1000)) {
+    DBG("[SMP] AP %u: online (late)\n", ap->cpu_id);
+    return true;
+  }
+
+  // Park the AP before the caller reuses the trampoline for the next CPU.
+  DBG("[SMP] AP %u: no response after 2 SIPIs; parking and continuing\n",
+      ap->cpu_id);
+  ap_park(ap->apic_id);
+
+  console_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET " CPU ");
+  print_uint32(ap->cpu_id);
+  console_puts(" (APIC ID 0x");
+  print_hex32(ap->apic_id);
+  console_puts(") did not come online.\n");
+  return false;
+}
+
 void cpu_init_aps(void) {
   // Step 7: Wake up the Application Processors
   if (cpu_count > 1) {
+    DBG("[SMP] cpu_init_aps: entering bring-up\n");
     console_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
                                 " Waking up Application Processors...\n");
 
@@ -331,32 +474,31 @@ void cpu_init_aps(void) {
     *ptr_cr3 = cr3;
     *ptr_rip = (uint64_t)ap_main;
 
+    uint8_t vector = tramp_phys >> 12; // 0x08
+
+    DBG("[SMP] %u AP(s) to start; LAPIC mode: %s; trampoline at 0x%x\n",
+        cpu_count - 1, lapic_is_x2apic() ? "x2APIC (MSR)" : "xAPIC (MMIO)",
+        (unsigned)tramp_phys);
+
+    uint32_t online = 1; // the BSP
+    uint32_t failed = 0;
+
     for (uint32_t i = 1; i < cpu_count; i++) {
       if (cpus[i].status == CPU_STATUS_BSP)
         continue;
 
-      // Give this AP its distinct stack
-      *ptr_stack = cpus[i].stack_top;
+      if (ap_start(&cpus[i], ptr_stack, vector))
+        online++;
+      else
+        failed++;
+    }
 
-      // Set the baton so `ap_main` knows who to map its GS-base to
-      starting_cpu = &cpus[i];
-
-      // 1. Send INIT IPI (Edge Triggered, Physical Destination)
-      lapic_write(LAPIC_ICR_HIGH, cpus[i].apic_id << 24);
-      lapic_write(LAPIC_ICR_LOW, LAPIC_ICR_INIT);
-
-      // 2. Wait 10ms
-      lapic_timer_sleep(10);
-
-      // 3. Send STARTUP SIPI (Edge Triggered, Physical Destination)
-      uint8_t vector = tramp_phys >> 12; // 0x08
-      lapic_write(LAPIC_ICR_HIGH, cpus[i].apic_id << 24);
-      lapic_write(LAPIC_ICR_LOW, vector | LAPIC_ICR_STARTUP);
-
-      // Wait for AP to finish booting and signal ONLINE
-      while (cpus[i].status != CPU_STATUS_ONLINE) {
-        hal_cpu_relax();
-      }
+    if (failed > 0) {
+      console_puts(KLOG_CLR_YELLOW "[ WARN ]" KLOG_CLR_RESET " ");
+      print_uint32(failed);
+      console_puts(" Application Processor(s) failed to start; continuing with ");
+      print_uint32(online);
+      console_puts(" CPU(s).\n");
     }
   }
 }

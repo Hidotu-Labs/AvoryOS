@@ -35,6 +35,16 @@ struct usb_interrupt_pipe {
   uint16_t actual_length; // Bytes received by the most recent transfer.
   uint8_t endpoint;
   bool active;
+
+  /* Runtime counters kept by the HCD and the generic wrappers.  A silent
+   * mouse has no report to show, so the only evidence that anything happened
+   * is how often a transfer completed, failed, or returned zero bytes.  These
+   * are reported at /proc/usb. */
+  uint32_t completions;      // Successful or short completions observed
+  uint32_t errors;           // Error completions observed
+  uint32_t zero_length;      // Completions that carried no payload
+  uint8_t last_completion;   // HCD completion code of the most recent transfer
+  uint16_t last_length;      // Actual length of the most recent transfer
 };
 
 // USB Request Types
@@ -120,7 +130,49 @@ struct usb_device {
   void *hcd_data;
   struct usb_device_descriptor desc;
   struct usb_hcd *hcd; // Reference to the host controller driver
+  uint8_t claimed_by;  // 0=none, bit0=keyboard, bit1=mouse, bit2=hub
+  /* Enumeration retry.  A device that fails its first descriptor read used to
+   * stay dead until it was unplugged; real controllers can NAK/timeout once
+   * during link training.  The watchdog retries a bounded number of times. */
+  uint8_t enumerate_attempts;
+  bool enumerate_failed;
 };
+
+// Diagnostics
+//
+// Drivers append human-readable state into a caller-provided buffer; the
+// result is served at /proc/usb.  This is the only reliable way to inspect
+// USB bring-up on machines without a serial capture, so each driver reports
+// its probe decisions, not just its successes.
+struct usb_diag {
+  char *data;
+  uint32_t cap;
+  uint32_t len;
+};
+
+void usb_diag_printf(struct usb_diag *d, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+uint32_t usb_diag_read(uint32_t offset, uint32_t size, uint8_t *buffer);
+
+/* Verbose bring-up tracing shared by the USB core and the HCDs.  Logs one
+ * compact line ("tag len=N bytes=00112233 ...") so raw descriptors, report
+ * buffers and xHCI transfer payloads can be compared on real hardware without
+ * a debugger. */
+void usb_debug_hexdump(const char *tag, const void *data, uint32_t len,
+                       uint32_t max_bytes);
+
+// Per-driver diagnostics (implemented next to the state they report).
+void xhci_diag(struct usb_diag *d);
+void ehci_diag(struct usb_diag *d);
+void usb_core_diag(struct usb_diag *d);
+void usb_kbd_diag(struct usb_diag *d);
+void usb_mouse_diag(struct usb_diag *d);
+
+/* Short per-subsystem views of the same diagnostics, readable as
+ * /proc/usb_mouse and /proc/usb_xhci.  A full /proc/usb is long; these make
+ * one `cat` decisive on a console without scrollback. */
+uint32_t usb_mouse_diag_read(uint32_t offset, uint32_t size, uint8_t *buffer);
+uint32_t usb_xhci_diag_read(uint32_t offset, uint32_t size, uint8_t *buffer);
 
 // Core API
 
@@ -131,6 +183,18 @@ bool usb_speed_is_low(enum usb_speed speed);
 int usb_control_transfer(struct usb_device *dev,
                          struct usb_control_request *req, void *data,
                          uint16_t len);
+
+/* Fetch an interface's HID report descriptor into buf (zero-padded on a short
+ * transfer).  Returns 0 on success, -1 when the request failed. */
+int usb_hid_get_report_descriptor(struct usb_device *dev, uint8_t iface_num,
+                                  uint8_t *buf, uint16_t len);
+
+/* True when a HID interface's report descriptor declares a top-level usage on
+ * the Generic Desktop page (0x06 keyboard, 0x02 mouse, ...).  Many real
+ * keyboards/mice report subclass 0 / protocol 0 and would otherwise be
+ * ignored by the boot-protocol-only matching in the HID drivers. */
+bool usb_hid_usage_matches(struct usb_device *dev, uint8_t iface_num,
+                           uint8_t usage);
 struct usb_interrupt_pipe *usb_interrupt_open(
     struct usb_device *dev, uint8_t endpoint, uint16_t max_packet,
     uint8_t interval, void *buffer, uint64_t buffer_phys);
@@ -142,5 +206,10 @@ void usb_interrupt_cancel(struct usb_interrupt_pipe *pipe);
 void usb_device_discovered(struct usb_hcd *hcd, uint8_t port,
                            enum usb_speed speed);
 void usb_device_removed(struct usb_hcd *hcd, uint8_t port);
+
+/* Retry devices whose enumeration failed (bounded per device).  Called from
+ * the xHCI watchdog so a one-off descriptor timeout does not leave a device
+ * permanently invisible. */
+void usb_retry_failed_enumerations(void);
 
 #endif

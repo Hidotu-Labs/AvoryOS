@@ -42,3 +42,7 @@ uint32_t usb_kbd_active_count(void);
 const char *usb_kbd_report_format(void);
 
 #endif
+
+// Diagnostics (/proc/usb)
+struct usb_diag;
+void usb_kbd_diag(struct usb_diag *d);

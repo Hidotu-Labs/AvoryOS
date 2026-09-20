@@ -159,10 +159,8 @@ void sched_init(void) {
     if (fs_root)
       vfs_open(fs_root);
 
-    // Assign a proper TID to the idle thread (don't use 0)
-    spinlock_acquire(&tid_lock);
-    idle_thread->tid = next_tid++;
-    spinlock_release(&tid_lock);
+    // Assign a dedicated TID in a high range so PID 1 is reserved for userspace init
+    idle_thread->tid = 0x7FFFFFF0 + i;
     idle_thread->tgid = idle_thread->tid;
     idle_thread->ss_flags = SS_DISABLE;
     idle_thread->is_idle = true;

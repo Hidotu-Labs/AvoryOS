@@ -94,6 +94,11 @@ void keyboard_push_scancode(uint8_t scancode, bool extended, bool release) {
 }
 
 void keyboard_push_bytes(const char *bytes, uint32_t len) {
+  /* Linux VT behavior: any key that produces console input returns the view
+   * to the live bottom.  The scrollback keys themselves call
+   * console_scroll_view_try() directly and never reach this path. */
+  if (len)
+    console_scroll_view_try(-1000000);
   hal_irq_disable();
   for (uint32_t i = 0; i < len; i++) {
     ring_buffer_push(bytes[i]);
@@ -279,22 +284,22 @@ static void keyboard_callback(struct registers *regs) {
 
       if (shift) {
         if (c == KEY_PGUP) {
-          console_scroll_view(console_get_rows() - 1);
+          console_scroll_view_try(console_get_rows() - 1);
           return;
         } else if (c == KEY_PGDN) {
-          console_scroll_view(-(int)(console_get_rows() - 1));
+          console_scroll_view_try(-(int)(console_get_rows() - 1));
           return;
         } else if (c == KEY_UP) {
-          console_scroll_view(1);
+          console_scroll_view_try(1);
           return;
         } else if (c == KEY_DOWN) {
-          console_scroll_view(-1);
+          console_scroll_view_try(-1);
           return;
         } else if (c == KEY_HOME) {
-          console_scroll_view(1000000); // Jump to top
+          console_scroll_view_try(1000000); // Jump to top
           return;
         } else if (c == KEY_END) {
-          console_scroll_view(-1000000); // Jump to bottom
+          console_scroll_view_try(-1000000); // Jump to bottom
           return;
         }
       }
@@ -378,7 +383,7 @@ static void keyboard_callback(struct registers *regs) {
       switch ((unsigned char)c) {
       case KEY_UP: {
         if (shift) {
-          console_scroll_view(1);
+          console_scroll_view_try(1);
           return;
         }
         const char seq[] = {'\x1B', '[', 'A'};
@@ -387,7 +392,7 @@ static void keyboard_callback(struct registers *regs) {
       }
       case KEY_DOWN: {
         if (shift) {
-          console_scroll_view(-1);
+          console_scroll_view_try(-1);
           return;
         }
         const char seq[] = {'\x1B', '[', 'B'};
@@ -406,7 +411,7 @@ static void keyboard_callback(struct registers *regs) {
       }
       case KEY_PGUP: {
         if (shift) {
-          console_scroll_view(console_get_rows() - 1);
+          console_scroll_view_try(console_get_rows() - 1);
           return;
         }
         const char seq[] = {'\x1B', '[', '5', '~'};
@@ -415,7 +420,7 @@ static void keyboard_callback(struct registers *regs) {
       }
       case KEY_PGDN: {
         if (shift) {
-          console_scroll_view(-(int)(console_get_rows() - 1));
+          console_scroll_view_try(-(int)(console_get_rows() - 1));
           return;
         }
         const char seq[] = {'\x1B', '[', '6', '~'};
@@ -483,6 +488,8 @@ static void keyboard_callback(struct registers *regs) {
         break;
       }
       default:
+        /* Typing a normal character exits scrollback, like a Linux VT. */
+        console_scroll_view_try(-1000000);
         ring_buffer_push(c);
         break;
       }

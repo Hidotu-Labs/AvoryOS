@@ -28,6 +28,32 @@ void ramfs_free_file_data(ramfs_file_t *file) {
 
 static int ramfs_chmod(vfs_node_t *node, uint16_t permission);
 static int ramfs_chown(vfs_node_t *node, uint32_t uid, uint32_t gid);
+static void ramfs_destroy_node(vfs_node_t *node);
+
+/* Release the filesystem-private payload of a node whose name is gone.
+ * Called once, either directly from vfs_node_retire() when no reference is
+ * left, or from vfs_close() when the last descriptor closes. */
+static void ramfs_destroy_node(vfs_node_t *node) {
+  if (!node || !node->device)
+    return;
+
+  uint32_t type = node->flags & FS_TYPE_MASK;
+  if (type == FS_FILE) {
+    ramfs_file_t *file = (ramfs_file_t *)node->device;
+    ramfs_free_file_data(file);
+    kfree(file);
+  } else if (type == FS_DIRECTORY) {
+    ramfs_dir_t *dir = (ramfs_dir_t *)node->device;
+    child_node_t *c = dir->children;
+    while (c) {
+      child_node_t *next = c->next;
+      kfree(c);
+      c = next;
+    }
+    kfree(dir);
+  }
+  node->device = NULL;
+}
 
 // VFS Implementations
 
@@ -312,6 +338,7 @@ static vfs_node_t *ramfs_make_node(char *name, uint16_t perm, uint32_t type) {
 
   n->chmod = ramfs_chmod;
   n->chown = ramfs_chown;
+  n->destroy = ramfs_destroy_node;
 
   return n;
 }
@@ -419,13 +446,9 @@ static int ramfs_unlink(vfs_node_t *node, char *name) {
       else
         dir->children = curr->next;
 
-      // Free the file data if it's a ramfs file
-      if (curr->node->device && (curr->node->flags & FS_TYPE_MASK) == FS_FILE) {
-        ramfs_file_t *file = (ramfs_file_t *)curr->node->device;
-        ramfs_free_file_data(file);
-        kfree(file);
-      }
-      kfree(curr->node);
+      /* Descriptors and mappings may still reference the node: retire it and
+       * let the last close release the file data and the node itself. */
+      vfs_node_retire(curr->node);
       kfree(curr);
       return 0;
     }
@@ -452,8 +475,7 @@ static int ramfs_rmdir(vfs_node_t *node, char *name) {
         prev->next = curr->next;
       else
         dir->children = curr->next;
-      kfree(child_dir);
-      kfree(curr->node);
+      vfs_node_retire(curr->node);
       kfree(curr);
       return 0;
     }

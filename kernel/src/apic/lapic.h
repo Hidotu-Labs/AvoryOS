@@ -77,9 +77,22 @@ void lapic_init(uint64_t base_phys);
 // Signal End-of-Interrupt to the Local APIC.
 void lapic_send_eoi(void);
 
-// Raw MMIO read/write for the LAPIC register space.
+// Raw LAPIC register access.  Transparently uses the MMIO interface or the
+// x2APIC MSR interface, depending on the mode the LAPIC is running in.
 uint32_t lapic_read(uint32_t reg);
 void lapic_write(uint32_t reg, uint32_t value);
+
+// Send a 32-bit ICR command to a physical APIC ID.  Unlike a raw
+// lapic_write(LAPIC_ICR_LOW, ...) this encodes the destination correctly in
+// both xAPIC (ICR high MMIO) and x2APIC (single 64-bit MSR) modes.
+void lapic_write_icr(uint32_t apic_id, uint32_t icr_low);
+uint32_t lapic_read_icr(void);
+
+// True while the previously sent IPI has not been delivered yet.
+bool lapic_icr_idle(void);
+
+// True when the LAPIC is driven through x2APIC MSRs instead of MMIO.
+bool lapic_is_x2apic(void);
 
 // Returns true if the LAPIC MMIO is mapped and ready for use.
 bool lapic_is_ready(void);
