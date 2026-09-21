@@ -8,6 +8,7 @@
 #include "../../lib/string.h"
 #include "../../lock/spinlock.h"
 #include "../../mm/heap.h"
+#include "../usb/usb_debug.h"
 #include "drivers/input/evdev.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -119,10 +120,10 @@ void mouse_apply_report(int32_t dx, int32_t dy, int32_t wheel, int32_t hwheel,
   static uint32_t apply_logs;
   apply_logs++;
   if (apply_logs <= 32 || (apply_logs & 0x3FFU) == 0)
-    klogf("[MOUSE] apply #%u dx=%d dy=%d wheel=%d hwheel=%d buttons=0x%X "
-          "pos=(%d,%d)\n",
-          apply_logs, dx, dy, wheel, hwheel, buttons, global_mouse_state.x,
-          global_mouse_state.y);
+    usb_dbgf("[MOUSE] apply #%u dx=%d dy=%d wheel=%d hwheel=%d buttons=0x%X "
+             "pos=(%d,%d)\n",
+             apply_logs, dx, dy, wheel, hwheel, buttons, global_mouse_state.x,
+             global_mouse_state.y);
 
   // Update the shared absolute state (the PS/2 and USB paths both feed it).
   global_mouse_state.x += dx;

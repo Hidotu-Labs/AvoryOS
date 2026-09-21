@@ -1,6 +1,7 @@
 #ifndef DRIVERS_USB_USB_H
 #define DRIVERS_USB_USB_H
 
+#include "usb_debug.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -157,9 +158,13 @@ uint32_t usb_diag_read(uint32_t offset, uint32_t size, uint8_t *buffer);
 /* Verbose bring-up tracing shared by the USB core and the HCDs.  Logs one
  * compact line ("tag len=N bytes=00112233 ...") so raw descriptors, report
  * buffers and xHCI transfer payloads can be compared on real hardware without
- * a debugger. */
+ * a debugger.  Only emits when usb_verbose is on. */
 void usb_debug_hexdump(const char *tag, const void *data, uint32_t len,
                        uint32_t max_bytes);
+
+/* Runtime verbose-trace switch (/proc/usb_debug, `usbdebug` cmdline). */
+void usb_set_verbose(bool on);
+bool usb_get_verbose(void);
 
 // Per-driver diagnostics (implemented next to the state they report).
 void xhci_diag(struct usb_diag *d);

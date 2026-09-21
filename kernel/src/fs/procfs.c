@@ -674,6 +674,36 @@ uint32_t procfs_usb_xhci_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   return usb_xhci_diag_read(offset, size, buffer);
 }
 
+/* /proc/usb_debug — runtime switch for the verbose USB transfer trace.
+ * `echo 1 > /proc/usb_debug` enables it, `echo 0` disables it. */
+uint32_t procfs_usb_debug_read(vfs_node_t *node, uint32_t offset, uint32_t size,
+                               uint8_t *buffer) {
+  (void)node;
+  static const char on[] = "1\n";
+  static const char off[] = "0\n";
+  const char *s = usb_get_verbose() ? on : off;
+  uint32_t len = 2;
+  if (offset >= len || !buffer)
+    return 0;
+  uint32_t n = len - offset;
+  if (n > size)
+    n = size;
+  for (uint32_t i = 0; i < n; i++)
+    buffer[i] = (uint8_t)s[offset + i];
+  return n;
+}
+
+uint32_t procfs_usb_debug_write(vfs_node_t *node, uint32_t offset,
+                                uint32_t size, uint8_t *buffer) {
+  (void)node;
+  (void)offset;
+  if (!buffer || !size)
+    return 0;
+  char c = (char)buffer[0];
+  usb_set_verbose(c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T');
+  return size;
+}
+
 /* The real Limine command line (kernel/src/kernel.c), matching upstream
  * /proc/cmdline.  Session helpers parse it (drm-pick.sh looks for the
  * kpi_emu_sink boot parameter); it used to be a hard-coded "Xfbdev" string. */
@@ -1531,6 +1561,19 @@ void procfs_init(void) {
       usb_xhci_node->read = procfs_usb_xhci_read;
       usb_xhci_node->length = 32768;
       ramfs_mount_node(procfs_root, usb_xhci_node);
+    }
+
+    // Add /proc/usb_debug: runtime switch for the verbose USB transfer trace.
+    vfs_node_t *usb_debug_node = kmalloc(sizeof(vfs_node_t));
+    if (usb_debug_node) {
+      vfs_node_init(usb_debug_node);
+      strncpy(usb_debug_node->name, "usb_debug", 127);
+      usb_debug_node->flags = FS_FILE | FS_PERSISTENT;
+      usb_debug_node->mask = 0644;
+      usb_debug_node->read = procfs_usb_debug_read;
+      usb_debug_node->write = procfs_usb_debug_write;
+      usb_debug_node->length = 2;
+      ramfs_mount_node(procfs_root, usb_debug_node);
     }
 
     // Add /proc/drmstats

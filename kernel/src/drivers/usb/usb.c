@@ -21,10 +21,24 @@ void usb_enumerate_device(struct usb_device *dev);
 
 static bool usb_initialized = false;
 
+bool usb_verbose = false;
+
+void usb_set_verbose(bool on) {
+  usb_verbose = on;
+  klogf("[USB] verbose tracing %s\n", on ? "enabled" : "disabled");
+}
+
+bool usb_get_verbose(void) { return usb_verbose; }
+
 void usb_init(void) {
   if (usb_initialized)
     return;
   usb_initialized = true;
+  {
+    extern const char *kernel_boot_cmdline;
+    if (kernel_boot_cmdline && strstr(kernel_boot_cmdline, "usbdebug"))
+      usb_verbose = true;
+  }
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " USB: Subsystem initialized.\n");
   klogf("[USB] core build %s %s\n", __DATE__, __TIME__);
   for (int i = 0; i < MAX_USB_DEVICES; i++)
@@ -61,7 +75,7 @@ int usb_control_transfer(struct usb_device *dev,
     dev->hcd->stats.control_failed++;
   else
     dev->hcd->stats.control_completed++;
-  klogf("[USB-CTL] dev=%u hcd=%s type=0x%02X req=0x%02X val=0x%04X idx=%u "
+  usb_dbgf("[USB-CTL] dev=%u hcd=%s type=0x%02X req=0x%02X val=0x%04X idx=%u "
         "len=%u -> %d\n",
         dev->address, dev->hcd->name ? dev->hcd->name : "?", req->request_type,
         req->request, req->value, req->index, len, result);
@@ -148,6 +162,8 @@ bool usb_hid_usage_matches(struct usb_device *dev, uint8_t iface_num,
 
 void usb_debug_hexdump(const char *tag, const void *data, uint32_t len,
                        uint32_t max_bytes) {
+  if (!usb_verbose)
+    return;
   static const char hex[] = "0123456789ABCDEF";
   const uint8_t *p = (const uint8_t *)data;
   uint32_t n = len < max_bytes ? len : max_bytes;
@@ -173,7 +189,7 @@ struct usb_interrupt_pipe *usb_interrupt_open(
     struct usb_device *dev, uint8_t endpoint, uint16_t max_packet,
     uint8_t interval, void *buffer, uint64_t buffer_phys) {
   if (!dev || !dev->connected || !dev->hcd || !dev->hcd->interrupt_open) {
-    klogf("[USB-INT] open dev=%u ep=0x%02X maxpkt=%u interval=%u REJECTED "
+    usb_dbgf("[USB-INT] open dev=%u ep=0x%02X maxpkt=%u interval=%u REJECTED "
           "(dev=%p connected=%u hcd=%p)\n",
           dev ? dev->address : 0, endpoint, max_packet, interval, (void *)dev,
           dev ? dev->connected : 0, dev ? (void *)dev->hcd : NULL);
@@ -181,7 +197,7 @@ struct usb_interrupt_pipe *usb_interrupt_open(
   }
   struct usb_interrupt_pipe *pipe = dev->hcd->interrupt_open(
       dev->hcd, dev, endpoint, max_packet, interval, buffer, buffer_phys);
-  klogf("[USB-INT] open dev=%u ep=0x%02X maxpkt=%u interval=%u buf=0x%llX "
+  usb_dbgf("[USB-INT] open dev=%u ep=0x%02X maxpkt=%u interval=%u buf=0x%llX "
         "-> %s\n",
         dev->address, endpoint, max_packet, interval,
         (unsigned long long)buffer_phys, pipe ? "ok" : "FAIL");
@@ -208,7 +224,7 @@ bool usb_interrupt_completed(struct usb_interrupt_pipe *pipe) {
     if (len == 0)
       pipe->zero_length++;
     if (pipe->completions <= 4 || (pipe->completions & 0xFFFU) == 0)
-      klogf("[USB-INT] completed dev=%u ep=0x%02X len=%u code=%u n=%u\n",
+      usb_dbgf("[USB-INT] completed dev=%u ep=0x%02X len=%u code=%u n=%u\n",
             pipe->dev->address, pipe->endpoint, len,
             pipe->last_completion, pipe->completions);
   }
@@ -218,12 +234,12 @@ bool usb_interrupt_completed(struct usb_interrupt_pipe *pipe) {
 int usb_interrupt_resubmit(struct usb_interrupt_pipe *pipe) {
   if (!pipe || !pipe->active || !pipe->dev || !pipe->dev->hcd ||
       !pipe->dev->hcd->interrupt_resubmit) {
-    klogf("[USB-INT] resubmit ep=0x%02X REJECTED\n", pipe ? pipe->endpoint : 0);
+    usb_dbgf("[USB-INT] resubmit ep=0x%02X REJECTED\n", pipe ? pipe->endpoint : 0);
     return -1;
   }
   int result = pipe->dev->hcd->interrupt_resubmit(pipe->dev->hcd, pipe);
   if (result < 0)
-    klogf("[USB-INT] resubmit dev=%u ep=0x%02X -> FAIL %d\n",
+    usb_dbgf("[USB-INT] resubmit dev=%u ep=0x%02X -> FAIL %d\n",
           pipe->dev->address, pipe->endpoint, result);
   return result;
 }
@@ -231,7 +247,7 @@ int usb_interrupt_resubmit(struct usb_interrupt_pipe *pipe) {
 void usb_interrupt_cancel(struct usb_interrupt_pipe *pipe) {
   if (!pipe || !pipe->active || !pipe->dev || !pipe->dev->hcd)
     return;
-  klogf("[USB-INT] cancel dev=%u ep=0x%02X\n", pipe->dev->address,
+  usb_dbgf("[USB-INT] cancel dev=%u ep=0x%02X\n", pipe->dev->address,
         pipe->endpoint);
   if (pipe->dev->hcd->interrupt_cancel)
     pipe->dev->hcd->interrupt_cancel(pipe->dev->hcd, pipe);
@@ -276,7 +292,7 @@ void usb_device_discovered(struct usb_hcd *hcd, uint8_t port,
   dev->enumerate_attempts = 0;
   dev->enumerate_failed = false;
   hcd->stats.devices_connected++;
-  klogf("[USB-DBG] discovered port=%u speed=%s hcd=%s gen=%u index=%d\n",
+  usb_dbgf("[USB-DBG] discovered port=%u speed=%s hcd=%s gen=%u index=%d\n",
         port + 1, usb_speed_name(speed), hcd->name ? hcd->name : "?",
         dev->generation, device_count);
 
@@ -309,7 +325,7 @@ void usb_enumerate_device(struct usb_device *dev) {
   int res = usb_control_transfer(dev, &req, &dev->desc, 8);
   if (res < 0) {
     klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET " USB: Failed to get device descriptor (8 bytes)\n");
-    klogf("[USB-DBG] first 8 bytes failed for port=%u speed=%s hcd=%s\n",
+    usb_dbgf("[USB-DBG] first 8 bytes failed for port=%u speed=%s hcd=%s\n",
           dev->port + 1, usb_speed_name(dev->speed),
           dev->hcd && dev->hcd->name ? dev->hcd->name : "?");
     dev->enumerate_failed = true;
@@ -340,11 +356,11 @@ void usb_enumerate_device(struct usb_device *dev) {
   }
   if (res < 0) {
     klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET " USB: Failed to set address\n");
-    klogf("[USB-DBG] set address failed requested=%u\n", new_addr);
+    usb_dbgf("[USB-DBG] set address failed requested=%u\n", new_addr);
     dev->enumerate_failed = true;
     return;
   }
-  klogf("[USB-DBG] address assigned=%u requested=%u\n", dev->address,
+  usb_dbgf("[USB-DBG] address assigned=%u requested=%u\n", dev->address,
         new_addr);
 
   for (int i = 0; i < 1000; i++)
@@ -370,7 +386,7 @@ void usb_enumerate_device(struct usb_device *dev) {
   klog_puts(" Product: ");
   klog_hex32(dev->desc.product_id);
   klog_puts("\n");
-  klogf("[USB-DBG] class=0x%02X subclass=0x%02X protocol=0x%02X "
+  usb_dbgf("[USB-DBG] class=0x%02X subclass=0x%02X protocol=0x%02X "
         "bcdUSB=0x%04X bMaxPacket0=%u num_configs=%u\n",
         dev->desc.device_class, dev->desc.device_subclass,
         dev->desc.device_protocol, dev->desc.usb_version,
