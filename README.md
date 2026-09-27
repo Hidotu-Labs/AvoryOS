@@ -164,7 +164,6 @@ AvoryOS/
 ├── kernel/             # Monolithic kernel source
 │   ├── src/            # Architecture, scheduler, memory, drivers, IPv4/IPv6, and VFS
 │   ├── linuxkpi/       # LinuxKPI compatibility layer & driver bridges
-│   └── include/        # Kernel headers and interfaces
 ├── userland/           # Userland applications, utilities, tests, and games
 ├── AetherDE/           # Aether Desktop Environment & Wayland compositor
 ├── scripts/            # Build automation, toolchain setup, Minecraft/Mocktail setup
