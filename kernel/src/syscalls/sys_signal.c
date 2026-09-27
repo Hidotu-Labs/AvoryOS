@@ -5,6 +5,7 @@
 #include "../cpu/fpu.h"
 #include "../cpu/isr.h"
 #include "../fs/vfs.h"
+#include "../include/arch/uaccess.h"
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
 #include "../mm/heap.h"
@@ -170,7 +171,8 @@ static void fill_signal_context(struct sigframe *frame, int sig,
      Ensure this thread's FPU state is live in hardware before saving. */
   fpu_ensure_loaded(current);
   if (cpu_has_xsave_flag) {
-    uint32_t eax = 0xFFFFFFFF, edx = 0xFFFFFFFF;
+    uint64_t mask = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE);
+    uint32_t eax = (uint32_t)mask, edx = (uint32_t)(mask >> 32);
     __asm__ volatile("xsave64 %0" : "=m"(current->fpu_state) : "a"(eax), "d"(edx) : "memory");
     memcpy(uc->fpregs_mem, (const void *)current->fpu_state, 512);
   } else {
@@ -196,17 +198,27 @@ static uint64_t sys_rt_sigaction(uint64_t signum, uint64_t act_ptr,
     return (uint64_t)-1;
   uint64_t idx = signum - 1;
 
+  /* Never dereference userspace after a separate VMA validation. Another
+   * thread can unmap or reprotect the range between the check and access.
+   * The uaccess helpers have exception-table fixups for that race and apply
+   * the required SMAP access window. */
+  struct k_sigaction new_action;
+  if (act_ptr && copy_from_user(&new_action, (const void *)act_ptr,
+                                sizeof(new_action)) != 0)
+    return (uint64_t)-14; // EFAULT
+
   if (oldact_ptr) {
-    if (!vmm_is_user_addr_range_writable(oldact_ptr, sizeof(struct k_sigaction)))
+    struct k_sigaction old_action;
+    extern spinlock_t tid_lock;
+    spinlock_acquire(&tid_lock);
+    old_action = current->signal_handlers[idx];
+    spinlock_release(&tid_lock);
+    if (copy_to_user((void *)oldact_ptr, &old_action,
+                     sizeof(old_action)) != 0)
       return (uint64_t)-14; // EFAULT
-    struct k_sigaction *old = (struct k_sigaction *)oldact_ptr;
-    *old = current->signal_handlers[idx];
   }
 
   if (act_ptr) {
-    if (!vmm_is_user_addr_range_valid(act_ptr, sizeof(struct k_sigaction)))
-      return (uint64_t)-14;
-    struct k_sigaction *new = (struct k_sigaction *)act_ptr;
     if (signum == SIGKILL || signum == SIGSTOP)
       return (uint64_t)-22;
     extern struct thread *global_thread_list;
@@ -214,7 +226,7 @@ static uint64_t sys_rt_sigaction(uint64_t signum, uint64_t act_ptr,
     spinlock_acquire(&tid_lock);
     for (struct thread *t = global_thread_list; t; t = t->global_next) {
       if (t->tgid == current->tgid) {
-        t->signal_handlers[idx] = *new;
+        t->signal_handlers[idx] = new_action;
       }
     }
     spinlock_release(&tid_lock);
@@ -367,6 +379,27 @@ static uint64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_ptr,
   return 0;
 }
 
+// rt_sigpending: examine the calling thread's pending (blocked-raised) set.
+// Linux reports all pending signals, whether blocked or not; this kernel
+// keeps the pending set per thread, so a plain copy is exact.
+static uint64_t sys_rt_sigpending(uint64_t set_ptr, uint64_t sigsetsize,
+                                  uint64_t a2, uint64_t a3, uint64_t a4,
+                                  uint64_t a5) {
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  if (sigsetsize != 8)
+    return (uint64_t)-22;
+  if (!set_ptr || !vmm_is_user_addr_range_writable(set_ptr, sizeof(uint64_t)))
+    return (uint64_t)-14;
+  struct thread *current = sched_get_current();
+  if (!current)
+    return (uint64_t)-1;
+  *(uint64_t *)set_ptr = current->pending_signals;
+  return 0;
+}
+
 // rt_sigsuspend: Temporarily replace signal mask and suspend execution until signal
 static uint64_t sys_rt_sigsuspend(uint64_t unewset, uint64_t sigsetsize,
                                   uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -459,6 +492,8 @@ static uint64_t sys_rt_sigreturn(struct syscall_regs *sregs) {
   current->signal_mask = frame->ucontext.uc_sigmask[0];
   current->signal_mask &=
       ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+  current->fault_regs_valid = false;
+  current->fault_addr = 0;
  if ((current->sigreturn_regs.cs & 3) != 3 || (current->sigreturn_regs.ss & 3) != 3 ||
       current->sigreturn_regs.rip >= 0x0000800000000000ULL ||
       current->sigreturn_regs.rsp >= 0x0000800000000000ULL) {
@@ -477,7 +512,8 @@ static uint64_t sys_rt_sigreturn(struct syscall_regs *sregs) {
     // Preserve extended AVX/YMM state: update only the legacy 512-byte region
     // at the beginning of current->fpu_state without clearing upper YMM registers
     memcpy(&current->fpu_state, (const void *)frame->ucontext.fpregs_mem, 512);
-    uint32_t eax = 0xFFFFFFFF, edx = 0xFFFFFFFF;
+    uint64_t mask = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE);
+    uint32_t eax = (uint32_t)mask, edx = (uint32_t)(mask >> 32);
     __asm__ volatile("xrstor64 %0" : : "m"(current->fpu_state), "a"(eax), "d"(edx) : "memory");
   } else {
     uint8_t aligned_fpregs[512] __attribute__((aligned(16)));
@@ -530,9 +566,21 @@ void signal_deliver(struct registers *regs) {
   if (!sig)
     return;
 
+  /* Synchronous faults can remain pending while masked and be noticed here
+   * at syscall exit. Restore the original exception frame before building a
+   * signal frame or reporting the default action. */
+  if ((sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE) &&
+      current->fault_regs_valid)
+    *regs = current->fault_regs;
+
   uint64_t bit = (1ULL << (sig - 1));
   extern struct thread *global_thread_list;
   extern spinlock_t tid_lock;
+  uint32_t capacity = __atomic_load_n(&global_thread_count, __ATOMIC_ACQUIRE);
+  struct thread **notify = capacity ? kmalloc(capacity * sizeof(*notify)) : NULL;
+  if (capacity && !notify)
+    return;
+  uint32_t notify_count = 0;
   spinlock_acquire(&tid_lock);
   for (struct thread *t = global_thread_list; t; t = t->global_next) {
     if (t->tgid == current->tgid) {
@@ -571,12 +619,14 @@ void signal_deliver(struct registers *regs) {
     // Print full registers, backtrace, and memory inspection only for fatal crash signals
     if (sig == SIGQUIT || sig == SIGILL || sig == SIGTRAP || sig == SIGABRT ||
         sig == SIGFPE || sig == SIGSEGV || sig == SIGBUS || sig == SIGSYS) {
-      isr_report_user_fault(regs, sig, current->fault_addr);
+      uint64_t report_addr = current->fault_regs_valid ? current->fault_addr : regs->rip;
+      isr_report_user_fault(regs, sig, report_addr);
       if (process_core_dump_enabled) {
         process_dump_core(current, regs, sig);
       }
     }
 
+    current->exit_status = 128 + sig;
     sched_terminate_thread_group(current);
     process_do_exit(128 + sig);
     return;
@@ -702,6 +752,12 @@ void signal_deliver_syscall(struct syscall_regs *sregs) {
 // tgkill, sigaltstack, and helpers
 // Forward declaration - defined after signalfd types below
 void signal_notify_thread(struct thread *t, int sig);
+
+/* Wake signalfd readers/pollers in `t` for `sig` without waking the thread
+ * itself.  A consumer that blocks a signal and reads it through signalfd is
+ * exactly the case signal_notify_thread's thread wakeup is skipped for, but
+ * its poll()/read() still has to end.  Defined after the signalfd types. */
+static void signal_notify_signalfds(struct thread *t, int sig);
 
 static uint64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig,
                            uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -870,13 +926,14 @@ void signal_notify_parent_exit(struct thread *child) {
 
   struct thread *parent = child->parent;
 
-  /* Never queue a signal the parent will not act on: Linux drops ignored signals
-   * before they reach the pending mask, and here a pending signal also means a
-   * spurious -EINTR from a blocking poll(). */
+  /* An explicitly ignored SIGCHLD never becomes pending, as on Linux.  SIG_DFL
+   * is different: its default action is "ignore", but Linux still queues the
+   * signal, which is what signalfd consumers (bwrap and every glib spawn that
+   * reaps through a signalfd) block it for.  signal_deliver() consumes a
+   * default-ignore bit without delivering anything, so leaving it pending is
+   * safe. */
   struct k_sigaction *pa = &parent->signal_handlers[sig - 1];
   if (pa->sa_handler == (void *)SIG_IGN)
-    return;
-  if (pa->sa_handler == (void *)SIG_DFL && signal_default_is_ignore(sig))
     return;
 
   extern struct thread *global_thread_list;
@@ -884,7 +941,18 @@ void signal_notify_parent_exit(struct thread *child) {
   uint64_t bit = 1ULL << (sig - 1);
   uint32_t child_pid = child->tgid ? child->tgid : child->tid;
 
+  /* Waking signalfd and scheduler waiters can acquire wait-queue/runqueue
+   * locks. Snapshot the group under tid_lock, then perform wakeups after
+   * releasing it to avoid inverting the scheduler's lock order. */
+  uint32_t capacity = __atomic_load_n(&global_thread_count, __ATOMIC_ACQUIRE);
+  struct thread **notify = capacity ? kmalloc(capacity * sizeof(*notify)) : NULL;
+  if (capacity && !notify)
+    return;
+  uint32_t notify_count = 0;
+
   spinlock_acquire(&tid_lock);
+  bool default_ignore =
+      pa->sa_handler == (void *)SIG_DFL && signal_default_is_ignore(sig);
   for (struct thread *t = global_thread_list; t; t = t->global_next) {
     if (t->tgid != parent->tgid)
       continue;
@@ -892,12 +960,19 @@ void signal_notify_parent_exit(struct thread *child) {
     /* Delivered as SI_USER-style info from the child, which is what a
      * SIGCHLD handler expects to see in si_pid. */
     t->signal_sender_pid[sig - 1] = child_pid;
-    /* A thread that blocks the signal keeps it pending for the ones that do not,
-     * so waking it would only churn the scheduler. */
-    if (!(t->signal_mask & bit))
-      signal_notify_thread(t, sig);
+    if (notify_count < capacity)
+      notify[notify_count++] = t;
   }
   spinlock_release(&tid_lock);
+
+  for (uint32_t i = 0; i < notify_count; i++) {
+    struct thread *t = notify[i];
+    if ((t->signal_mask & bit) || default_ignore)
+      signal_notify_signalfds(t, sig);
+    else
+      signal_notify_thread(t, sig);
+  }
+  kfree(notify);
 }
 
 // Send signal to all processes in a process group
@@ -906,6 +981,11 @@ void signal_send_pgid(uint32_t pgid, int sig) {  if (sig <= 0 || sig > 64)
 
   extern struct thread *global_thread_list;
   extern spinlock_t tid_lock;
+  uint32_t capacity = __atomic_load_n(&global_thread_count, __ATOMIC_ACQUIRE);
+  struct thread **notify = capacity ? kmalloc(capacity * sizeof(*notify)) : NULL;
+  if (capacity && !notify)
+    return;
+  uint32_t notify_count = 0;
   spinlock_acquire(&tid_lock);
 
   struct thread *sender = sched_get_current();
@@ -917,11 +997,15 @@ void signal_send_pgid(uint32_t pgid, int sig) {  if (sig <= 0 || sig > 64)
         sender->uid == t->uid || sender->euid == t->uid)) {
       t->pending_signals |= (1ULL << (sig - 1));
       t->signal_sender_pid[sig - 1] = sender_pid;
-      signal_notify_thread(t, sig);
+      if (notify_count < capacity)
+        notify[notify_count++] = t;
     }
     t = t->global_next;
   }
   spinlock_release(&tid_lock);
+  for (uint32_t i = 0; i < notify_count; i++)
+    signal_notify_thread(notify[i], sig);
+  kfree(notify);
 }
 
 static uint64_t sys_kill(uint64_t pid_val, uint64_t sig, uint64_t a2,
@@ -1169,15 +1253,11 @@ static void signalfd_close(vfs_node_t *node) {
   }
 }
 
-// signal_notify_thread must be defined AFTER signalfd_ctx_t and signalfd_read
-void signal_notify_thread(struct thread *t, int sig) {
+// signal_notify_signalfds/signal_notify_thread must be defined AFTER
+// signalfd_ctx_t and signalfd_read.
+static void signal_notify_signalfds(struct thread *t, int sig) {
   if (!t || sig <= 0 || sig > 64)
     return;
-
-  // Wake up thread if it's sleeping/blocked
-  if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {
-    sched_wakeup(t);
-  }
 
   /* Exit teardown clears the shared descriptor table before every possible
    * asynchronous signal source (notably ITIMER_REAL) has observed the dead
@@ -1198,6 +1278,18 @@ void signal_notify_thread(struct thread *t, int sig) {
       }
     }
   }
+}
+
+void signal_notify_thread(struct thread *t, int sig) {
+  if (!t || sig <= 0 || sig > 64)
+    return;
+
+  // Wake up thread if it's sleeping/blocked
+  if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {
+    sched_wakeup(t);
+  }
+
+  signal_notify_signalfds(t, sig);
 }
 
 static uint64_t sys_signalfd4(uint64_t fd, uint64_t mask_ptr, uint64_t sizemask,
@@ -1308,9 +1400,77 @@ static uint64_t sys_tkill(uint64_t tid, uint64_t sig, uint64_t a2, uint64_t a3,
   return 0;
 }
 
+/* Minimal ptrace(2): TRACEME / ATTACH / DETACH only.  Single-stepping,
+ * breakpoints, and peek/poke need debugger stop semantics this kernel does
+ * not implement yet, so those requests fail EINVAL (documented, not silent).
+ * The tracer relationship (thread->tracer_tid) is what ATTACH/DETACH and any
+ * future stop/continue support key off. */
+#define PTRACE_TRACEME 0
+#define PTRACE_ATTACH 16
+#define PTRACE_DETACH 17
+static uint64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
+                           uint64_t data, uint64_t a4, uint64_t a5) {
+  (void)addr;
+  (void)a4;
+  (void)a5;
+  struct thread *current = sched_get_current();
+  if (!current)
+    return (uint64_t)-1;
+
+  switch (request) {
+  case PTRACE_TRACEME: {
+    /* "Trace me": the parent becomes our tracer from now on. */
+    if (current->tracer_tid)
+      return (uint64_t)-1; // EPERM: already traced
+    current->tracer_tid =
+        current->parent ? current->parent->tid : current->tid;
+    return 0;
+  }
+  case PTRACE_ATTACH: {
+    struct thread *target = sched_get_thread_by_tid((uint32_t)pid);
+    if (!target)
+      return (uint64_t)-3; // ESRCH
+    if (target->tracer_tid && target->tracer_tid != current->tid)
+      return (uint64_t)-1; // EPERM: traced by someone else
+    if (current->euid != 0 && current->uid != target->uid &&
+        current->euid != target->uid)
+      return (uint64_t)-1; // EPERM
+    target->tracer_tid = current->tid;
+    /* Linux stops the tracee with SIGSTOP on attach. */
+    target->pending_signals |= (1ULL << (SIGSTOP - 1));
+    target->signal_sender_pid[SIGSTOP - 1] =
+        current->tgid ? current->tgid : current->tid;
+    signal_notify_thread(target, SIGSTOP);
+    return 0;
+  }
+  case PTRACE_DETACH: {
+    struct thread *target = sched_get_thread_by_tid((uint32_t)pid);
+    if (!target)
+      return (uint64_t)-3; // ESRCH
+    if (target->tracer_tid != current->tid)
+      return (uint64_t)-1; // EPERM: not our tracee
+    target->tracer_tid = 0;
+    /* data = signal to inject on detach (0 = none). */
+    if (data != 0) {
+      if (data > 64)
+        return (uint64_t)-22; // EINVAL
+      target->pending_signals |= (1ULL << (data - 1));
+      target->signal_sender_pid[data - 1] =
+          current->tgid ? current->tgid : current->tid;
+      signal_notify_thread(target, (int)data);
+    }
+    return 0;
+  }
+  default:
+    return (uint64_t)-22; // EINVAL: PEEK/POKE/CONT/etc. not implemented
+  }
+}
+
 void syscall_register_signal(void) {
+  syscall_register(SYS_PTRACE, sys_ptrace);
   syscall_register(SYS_RT_SIGACTION, sys_rt_sigaction);
   syscall_register(SYS_RT_SIGPROCMASK, sys_rt_sigprocmask);
+  syscall_register(SYS_RT_SIGPENDING, sys_rt_sigpending);
   syscall_register(SYS_RT_SIGSUSPEND, sys_rt_sigsuspend);
   syscall_register(SYS_RT_SIGTIMEDWAIT, sys_rt_sigtimedwait);
   syscall_register_raw(SYS_RT_SIGRETURN, sys_rt_sigreturn);

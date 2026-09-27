@@ -33,8 +33,25 @@ endif
 CFLAGS := -g -O2 -pipe
 CPPFLAGS :=
 
+# Syscall tracing.
+#
+#   make SYSCALL_LOG=1         every syscall of every process (very noisy)
+#   make SYSCALL_LOG=browser   only the badwolf/WebKit/bwrap process tree
+#
+# The browser mode marks a task when it execs something under badwolf/WebKit/
+# bwrap and inherits the mark through fork/clone; it also logs syscall errors
+# and every open() path (see kernel/src/syscalls/syscall.c).
 ifeq ($(SYSCALL_LOG),1)
 override CPPFLAGS += -DSYSCALL_LOG=1
+else ifeq ($(SYSCALL_LOG),browser)
+override CPPFLAGS += -DSYSCALL_LOG=2
+endif
+
+# /proc/klog ring buffer size, in KiB (default 256).  Browser syscall traces
+# produce megabytes, so a tracing boot usually wants a larger ring:
+#   make SYSCALL_LOG=browser KLOG_RING_KB=8192
+ifneq ($(KLOG_RING_KB),)
+override CPPFLAGS += -DKLOG_RING_KB=$(KLOG_RING_KB)
 endif
 
 # Diagnostics knobs.

@@ -63,12 +63,16 @@ static bool extended_scancode = false;
 
 wait_queue_t keyboard_wait_queue;
 
+/* fb/framebuffer.c: wake epoll watchers on the console/tty nodes. */
+extern void console_input_ready(void);
+
 static void ring_buffer_push(char c) {
   uint32_t next = (kbd_head + 1) % KBD_BUFFER_SIZE;
   if (next != kbd_tail) {
     kbd_buffer[kbd_head] = c;
     kbd_head = next;
     wait_queue_wake_all(&keyboard_wait_queue);
+    console_input_ready();
   }
 }
 

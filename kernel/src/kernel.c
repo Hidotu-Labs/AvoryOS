@@ -11,6 +11,7 @@
 #include "cpu/idt.h"
 #include "cpu/irq.h"
 #include "cpu/isr.h"
+#include "cpu/panic_screen.h"
 #include "cpu/pic.h"
 #include "cpu/tsc.h"
 #include "lock/lockdiag.h"
@@ -337,6 +338,7 @@ void kmain(void) {
   // Initialize basic PMM state (hhdm offset) so fb_init can work
   pmm_init_early(hhdm_request.response->offset);
   fb_init(fb);
+  panic_screen_init(fb);
   klog_set_screen_logging(true);
 
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
@@ -645,6 +647,32 @@ void kmain_high_half(void) {
   // Mount root filesystem
   struct block_device *boot_dev = NULL;
 
+  // 1. Smart discovery: partition typed as Linux root or labeled rootfs/AvoryOS-Root
+  boot_dev = block_find_by_type(PART_TYPE_LINUX_ROOT);
+  if (!boot_dev)
+    boot_dev = block_find_by_partlabel("rootfs");
+  if (!boot_dev)
+    boot_dev = block_find_by_partlabel("AvoryOS-Root");
+
+  if (boot_dev) {
+    klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
+                             " Identified root partition: ");
+    klog_puts(boot_dev->name);
+    if (boot_dev->partlabel[0]) {
+      klog_puts(" (\"");
+      klog_puts(boot_dev->partlabel);
+      klog_puts("\")");
+    }
+    klog_puts("...\n");
+    if (ext4_mount_root(boot_dev) == 0) {
+      goto mount_success;
+    }
+    if (ext2_mount_root(boot_dev) == 0) {
+      goto mount_success;
+    }
+  }
+
+  // 2. Sequential fallback across all partitions
   for (int i = 1; i < block_count(); i++) {
     boot_dev = block_get(i);
     if (boot_dev) {
@@ -686,6 +714,23 @@ mount_success:
   ramfs_mount_at("/dev");
   tmpfs_mount_at("/tmp");
   ramfs_mount_at("/run");
+
+  /* WebKitGTK assumes bubblewrap sandboxing works unless it finds
+   * /run/.containerenv; when the file is present it probes bwrap once and
+   * disables the sandbox itself if the probe fails.  AvoryOS cannot create
+   * user/mount namespaces, so without this marker WebKit always execs bwrap,
+   * which dies in its namespace setup and takes the WebProcess with it (the
+   * browser window then never renders a page).  The marker makes WebKit run
+   * its probe, fail it, and fall back to a direct, unsandboxed WebProcess.
+   * Delete this once namespaces exist: the probe will then succeed and WebKit
+   * re-enables its sandbox without any other change. */
+  {
+    vfs_node_t *run_dir = vfs_resolve_path("/run");
+    if (run_dir) {
+      vfs_create(run_dir, ".containerenv", 0644);
+      vfs_close(run_dir);
+    }
+  }
 
   /* POSIX shared memory.  shm_open(), X11 MIT-SHM, Qt's QSharedMemory and
    * Mesa's shared caches all expect a real memory-backed filesystem here;
@@ -753,6 +798,12 @@ mount_success:
   extern void rfkill_init(void);
   rfkill_init();
   procfs_init();
+
+  /* `vfs_selftest=1` additionally proves that no /proc resolution is entered
+   * into the full-path cache: procfs nodes are generated per lookup and die
+   * with their task, and /proc/self is caller-dependent.  It needs the
+   * mounted /proc, so it runs here rather than with the VFS checks above. */
+  vfs_procfs_selftest();
 
   /* LinuxKPI bring-up: run the Phase 0 self-test, then every registered
    * initcall (module_init-style drivers bind here once they are imported). */
@@ -849,7 +900,12 @@ mount_fail:
      * in the timer ISR. */
     console_tick();
     serial_flush_idle();
-    uint64_t idle_ms = serial_pending_bytes() ? 1 : 1000;
+    /* Deferred address-space teardown drains on the idle BSP too (APs do the
+     * same in ap_main): this core is halted anyway, so drain all pending nodes
+     * immediately to prevent repeated 1 ms idle timer wakeups. */
+    vmm_defer_drain(VMM_DEFER_IDLE_NODES);
+    uint64_t idle_ms =
+        (serial_pending_bytes() || vmm_defer_pending()) ? 1 : 1000;
     lapic_timer_rearm_if_earlier(lapic_timer_get_ms() + idle_ms);
     hal_cpu_halt();
   }

@@ -323,8 +323,12 @@ int vfs_mknod(vfs_node_t *node, char *name, uint16_t permission, uint32_t flags,
 int vfs_poll(vfs_node_t *node, int events);
 void vfs_node_init(vfs_node_t *node);
 int vfs_mount(vfs_node_t *mountpoint, vfs_node_t *target);
+/* `path` is the mountpoint as userspace sees it ("/run", "/tmp", ...).  It is
+ * what /proc/mounts reports and what mountinfo(1)-style consumers match on;
+ * pass NULL to fall back to the mountpoint node's own name. */
 int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
-                 const char *dev_name, const char *fs_type);
+                 const char *dev_name, const char *fs_type,
+                 const char *path);
 int vfs_statfs(vfs_node_t *node, void *buf);
 
 typedef struct vfs_mount_info {
@@ -366,6 +370,10 @@ bool vfs_cache_phase5_stress_test(void);
  * these entry points (`vfs_selftest=1` / `vfs_bench=1`).  They run once from
  * kmain after the root filesystem is mounted. */
 void vfs_selftest_maybe_run(void);
+/* Second half of `vfs_selftest=1`: proves that no /proc resolution is
+ * entered into the full-path cache.  kmain() calls it after procfs_init(),
+ * because it needs the mounted /proc. */
+void vfs_procfs_selftest(void);
 void vfs_bench_maybe_run(void);
 bool vfs_cache_ref_selftest(void);
 void vfs_cache_bench(void);

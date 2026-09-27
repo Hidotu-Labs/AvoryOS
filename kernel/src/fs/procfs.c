@@ -12,6 +12,7 @@
 #include "lib/string.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
+#include "mm/vmm.h"
 #include "mm/tlb_shootdown.h"
 #include "sched/sched.h"
 #include "smp/cpu.h"
@@ -40,6 +41,42 @@ uint32_t procfs_meminfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       (unsigned long long)available_kb,
       (unsigned long long)cached_kb,
       (unsigned long long)total_kb);
+
+  node->length = (uint32_t)len;
+  if (offset >= (uint32_t)len)
+    return 0;
+  if (offset + size > (uint32_t)len)
+    size = (uint32_t)len - offset;
+  memcpy(buffer, buf + offset, size);
+  return size;
+}
+
+/* /proc/zoneinfo — memory zone watermarks and free-page counts.  WebKit's
+ * memory-pressure monitor reads it (and tools like htop/btop parse it).
+ * AvoryOS has a single PMM zone, reported as "Normal"; the watermarks are
+ * zero because there is no reclaimable page-cache watermark accounting. */
+static uint32_t procfs_zoneinfo_read(vfs_node_t *node, uint32_t offset,
+                                     uint32_t size, uint8_t *buffer) {
+  char buf[320];
+
+  uint64_t free_pages = (uint64_t)pmm_get_free_pages();
+  uint64_t total_pages = pmm_get_usable_memory() / 4096;
+
+  int len = snprintf(buf, sizeof(buf),
+      "Node 0, zone   Normal\n"
+      "  pages free     %llu\n"
+      "        min      0\n"
+      "        low      0\n"
+      "        high     0\n"
+      "        spanned  %llu\n"
+      "        present  %llu\n"
+      "        managed  %llu\n",
+      (unsigned long long)free_pages,
+      (unsigned long long)total_pages,
+      (unsigned long long)total_pages,
+      (unsigned long long)total_pages);
+  if (len <= 0)
+    return 0;
 
   node->length = (uint32_t)len;
   if (offset >= (uint32_t)len)
@@ -277,6 +314,25 @@ uint32_t procfs_cpuinfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       pos += snprintf(buf + pos, 16384 - pos, "model name      : %s\n", trimmed);
     }
 
+    uint32_t max_leaf;
+    __asm__ volatile("cpuid" : "=a"(max_leaf) : "a"(0));
+    uint32_t leaf7_ebx = 0, leaf7_ecx = 0;
+    if (max_leaf >= 7) {
+      uint32_t unused_a, unused_d;
+      __asm__ volatile("cpuid"
+                       : "=a"(unused_a), "=b"(leaf7_ebx), "=c"(leaf7_ecx), "=d"(unused_d)
+                       : "a"(7), "c"(0));
+    }
+
+    uint32_t ext_max = 0, ext_ecx = 0, ext_edx = 0;
+    __asm__ volatile("cpuid" : "=a"(ext_max) : "a"(0x80000000));
+    if (ext_max >= 0x80000001) {
+      uint32_t unused_a, unused_b;
+      __asm__ volatile("cpuid"
+                       : "=a"(unused_a), "=b"(unused_b), "=c"(ext_ecx), "=d"(ext_edx)
+                       : "a"(0x80000001));
+    }
+
     pos += snprintf(buf + pos, 16384 - pos, "flags           :");
 #define CPUINFO_FLAG(bits, bit, name)                                          \
     do {                                                                        \
@@ -300,13 +356,31 @@ uint32_t procfs_cpuinfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     CPUINFO_FLAG(features_ecx, 0, "sse3");
     CPUINFO_FLAG(features_ecx, 1, "pclmulqdq");
     CPUINFO_FLAG(features_ecx, 9, "ssse3");
+    CPUINFO_FLAG(features_ecx, 12, "fma");
     CPUINFO_FLAG(features_ecx, 13, "cx16");
     CPUINFO_FLAG(features_ecx, 19, "sse4_1");
     CPUINFO_FLAG(features_ecx, 20, "sse4_2");
     CPUINFO_FLAG(features_ecx, 22, "movbe");
     CPUINFO_FLAG(features_ecx, 23, "popcnt");
     CPUINFO_FLAG(features_ecx, 25, "aes");
+    CPUINFO_FLAG(features_ecx, 26, "xsave");
+    CPUINFO_FLAG(features_ecx, 27, "osxsave");
+    CPUINFO_FLAG(features_ecx, 28, "avx");
+    CPUINFO_FLAG(features_ecx, 29, "f16c");
     CPUINFO_FLAG(features_ecx, 30, "rdrand");
+
+    CPUINFO_FLAG(ext_edx, 11, "syscall");
+    CPUINFO_FLAG(ext_edx, 20, "nx");
+    CPUINFO_FLAG(ext_edx, 29, "lm");
+    CPUINFO_FLAG(ext_ecx, 0, "lahf_lm");
+
+    CPUINFO_FLAG(leaf7_ebx, 0, "fsgsbase");
+    CPUINFO_FLAG(leaf7_ebx, 3, "bmi1");
+    CPUINFO_FLAG(leaf7_ebx, 5, "avx2");
+    CPUINFO_FLAG(leaf7_ebx, 7, "smep");
+    CPUINFO_FLAG(leaf7_ebx, 8, "bmi2");
+    CPUINFO_FLAG(leaf7_ebx, 10, "invpcid");
+    CPUINFO_FLAG(leaf7_ebx, 20, "smap");
 #undef CPUINFO_FLAG
     pos += snprintf(buf + pos, 16384 - pos, "\n\n");
   }
@@ -488,29 +562,40 @@ uint32_t procfs_stat_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   if (ncpus == 0)
     ncpus = 1;
 
-  /* Get aggregated user/idle time in ms, then convert to jiffies (USER_HZ=100,
-   * so 1 jiffy = 10 ms).  Divide evenly across CPUs for the per-cpu lines. */
-  uint64_t total_user_ms, total_idle_ms;
-  sched_get_total_cpu_ms(&total_user_ms, &total_idle_ms);
+  /* Snapshot scheduler-accounted time per CPU. USER_HZ=100, so one jiffy is
+   * 10 ms. Aggregate by summing the real CPU-local counters below. */
+  uint64_t total_user_ms = 0, total_system_ms = 0, total_idle_ms = 0;
+  uint64_t cpu_user_ms[MAX_CPUS] = {0};
+  uint64_t cpu_system_ms[MAX_CPUS] = {0};
+  uint64_t cpu_idle_ms[MAX_CPUS] = {0};
+  if (ncpus > MAX_CPUS)
+    ncpus = MAX_CPUS;
+  for (uint32_t i = 0; i < ncpus; i++) {
+    sched_get_cpu_times(i, &cpu_user_ms[i], &cpu_system_ms[i],
+                        &cpu_idle_ms[i]);
+    total_user_ms += cpu_user_ms[i];
+    total_system_ms += cpu_system_ms[i];
+    total_idle_ms += cpu_idle_ms[i];
+  }
 
   uint64_t user_jiffies = total_user_ms / 10;
+  uint64_t system_jiffies = total_system_ms / 10;
   uint64_t idle_jiffies = total_idle_ms / 10;
 
   /* "cpu" aggregate line: fields are user nice system idle iowait irq softirq */
   int pos = snprintf(buf, 2048,
-      "cpu  %llu 0 0 %llu 0 0 0 0 0 0\n",
+      "cpu  %llu 0 %llu %llu 0 0 0 0 0 0\n",
       (unsigned long long)user_jiffies,
+      (unsigned long long)system_jiffies,
       (unsigned long long)idle_jiffies);
 
-  /* Per-CPU lines — split the aggregate evenly across cores. */
-  uint64_t per_cpu_user = user_jiffies / ncpus;
-  uint64_t per_cpu_idle = idle_jiffies / ncpus;
   for (uint32_t i = 0; i < ncpus; i++) {
     pos += snprintf(buf + pos, 2048 - pos,
-        "cpu%u %llu 0 0 %llu 0 0 0 0 0 0\n",
+        "cpu%u %llu 0 %llu %llu 0 0 0 0 0 0\n",
         i,
-        (unsigned long long)per_cpu_user,
-        (unsigned long long)per_cpu_idle);
+        (unsigned long long)(cpu_user_ms[i] / 10),
+        (unsigned long long)(cpu_system_ms[i] / 10),
+        (unsigned long long)(cpu_idle_ms[i] / 10));
   }
 
   uint16_t nthreads = sched_get_thread_count();
@@ -764,19 +849,24 @@ static uint32_t procfs_pid_stat_read(vfs_node_t *node, uint32_t offset,
     return 0;
 
   char buf[512];
-  uint64_t jiffies = t.runtime_total / 10;
+  uint64_t user_jiffies = t.runtime_user_ms / 10;
+  uint64_t system_jiffies = t.runtime_system_ms / 10;
 
   // Fields: pid (comm) state ppid pgrp session tty_nr tpgid flags
-  //         minflt cminflt majflt cmajflt utime stime [37 stub zeros]
+  //         minflt cminflt majflt cmajflt utime stime [fields 16..38: 23 zeroes]
+  //         processor (field 39) [fields 40..52: 13 zeroes]
   int len = snprintf(buf, sizeof(buf),
-      "%u (%s) %c %u %u 0 0 0 0 0 0 0 0 %llu 0 "
-      "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+      "%u (%s) %c %u %u 0 0 0 0 0 0 0 0 %llu %llu "
+      "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 %u "
+      "0 0 0 0 0 0 0 0 0 0 0 0 0\n",
       pid,
       t.comm[0] ? t.comm : "unknown",
       thread_state_char(t.state),
       t.parent_tid,
       t.pgid,
-      (unsigned long long)jiffies);
+      (unsigned long long)user_jiffies,
+      (unsigned long long)system_jiffies,
+      t.cpu_index);
 
   node->length = (uint32_t)len;
   if (offset >= (uint32_t)len)
@@ -799,17 +889,12 @@ static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
   if (!buf)
     return 0;
 
-  uint64_t virt_kb = 2048;
-  uint64_t rss_kb  = 512;
-  if (t.virt_bytes) {
-    uint64_t virt_bytes = t.virt_bytes;
-    if (virt_bytes < 2 * 1024 * 1024)
-      virt_bytes = 2 * 1024 * 1024;
-    virt_kb = virt_bytes / 1024;
-    rss_kb  = virt_kb / 4;
-    if (rss_kb < 512)
-      rss_kb = 512;
-  }
+  uint64_t virt_bytes = 0;
+  uint64_t res_bytes = 0;
+  sched_get_mem_snapshot(pid, &virt_bytes, &res_bytes);
+
+  uint64_t virt_kb = virt_bytes / 1024;
+  uint64_t rss_kb  = res_bytes / 1024;
 
   int len = snprintf(buf, 768,
       "Name:\t%s\n"
@@ -884,6 +969,25 @@ static uint32_t procfs_pid_cmdline_read(vfs_node_t *node, uint32_t offset,
  * distinct from cmdline: comm is capped at 15 characters and holds a bare
  * name, never a path.
  */
+/* /proc/<pid>/cgroup — cgroup v2 membership.  AvoryOS has no cgroup
+ * controllers, so every process lives in the root cgroup.  WebKit's
+ * memory-pressure monitor parses this before looking for per-cgroup memory
+ * limits (which it will not find, and handles). */
+static uint32_t procfs_pid_cgroup_read(vfs_node_t *node, uint32_t offset,
+                                       uint32_t size, uint8_t *buffer) {
+  static const char cgroup_line[] = "0::/\n";
+  uint32_t len = (uint32_t)(sizeof(cgroup_line) - 1);
+
+  if (node)
+    node->length = len;
+  if (offset >= len)
+    return 0;
+  if (offset + size > len)
+    size = len - offset;
+  memcpy(buffer, cgroup_line + offset, size);
+  return size;
+}
+
 static uint32_t procfs_pid_comm_read(vfs_node_t *node, uint32_t offset,
                                      uint32_t size, uint8_t *buffer) {
   uint32_t pid = node->impl;
@@ -917,19 +1021,20 @@ static uint32_t procfs_pid_statm_read(vfs_node_t *node, uint32_t offset,
 
   char buf[64];
 
-  uint64_t virt_bytes = t.virt_bytes;
-  uint64_t res_bytes = t.resident_bytes;
-  if (virt_bytes < 2 * 1024 * 1024) virt_bytes = 2 * 1024 * 1024;
-  if (res_bytes  < 512 * 1024)      res_bytes  = 512 * 1024;
+  /* Field 2 (resident) is what WTF::memoryFootprint() reads to decide whether
+   * to kill a WebKit web process, so it has to be the real count - see
+   * vmm_user_resident_bytes(). */
+  uint64_t virt_bytes = 0;
+  uint64_t res_bytes = 0;
+  sched_get_mem_snapshot(pid, &virt_bytes, &res_bytes);
 
   uint64_t vp = virt_bytes / 4096;
-  uint64_t rp = res_bytes  / 4096;
+  uint64_t rp = res_bytes / 4096;
 
   int len = snprintf(buf, sizeof(buf),
-      "%llu %llu 0 0 0 %llu 0\n",
+      "%llu %llu 0 0 0 0 0\n",
       (unsigned long long)vp,
-      (unsigned long long)rp,
-      (unsigned long long)vp);
+      (unsigned long long)rp);
 
   node->length = (uint32_t)len;
   if (offset >= (uint32_t)len)
@@ -966,6 +1071,168 @@ static uint32_t procfs_pid_auxv_read(vfs_node_t *node, uint32_t offset,
                                      uint32_t size, uint8_t *buffer) {
   uint32_t pid = node->impl;
   return (uint32_t)sched_read_thread_auxv(pid, offset, size, buffer);
+}
+
+// Helper to recursively collect VMAs in address order into a flat array
+static void procfs_vma_collect(struct vma *node, struct vma **arr, int *count, int max_count) {
+  if (!node || *count >= max_count)
+    return;
+  procfs_vma_collect(node->left, arr, count, max_count);
+  if (*count < max_count) {
+    arr[*count] = node;
+    (*count)++;
+  }
+  procfs_vma_collect(node->right, arr, count, max_count);
+}
+
+// /proc/<pid>/maps
+static uint32_t procfs_pid_maps_read(vfs_node_t *node, uint32_t offset,
+                                     uint32_t size, uint8_t *buffer) {
+  uint32_t pid = node->impl;
+  struct thread *t = sched_get_thread_by_tid(pid);
+  if (!t || !t->mm)
+    return 0;
+
+  spinlock_acquire(&t->mm->lock);
+
+  int vma_count = t->mm->vmas.count;
+  if (vma_count <= 0) {
+    spinlock_release(&t->mm->lock);
+    return 0;
+  }
+
+  // Allocate an array of vma pointers to snapshot the tree under lock
+  int max_vmas = vma_count + 16;
+  struct vma **vma_ptrs = kmalloc(sizeof(struct vma *) * max_vmas);
+  if (!vma_ptrs) {
+    spinlock_release(&t->mm->lock);
+    return 0;
+  }
+
+  int collected = 0;
+  procfs_vma_collect(t->mm->vmas.root, vma_ptrs, &collected, max_vmas);
+
+  // Allocate snapshot entries so we can release t->mm->lock quickly
+  struct vma_snap {
+    uint64_t start;
+    uint64_t end;
+    uint64_t prot;
+    uint64_t flags;
+    uint64_t offset;
+    int fd;
+    void *file_node;
+    uint32_t inode;
+  };
+
+  struct vma_snap *snaps = kmalloc(sizeof(struct vma_snap) * collected);
+  if (!snaps) {
+    kfree(vma_ptrs);
+    spinlock_release(&t->mm->lock);
+    return 0;
+  }
+
+  for (int i = 0; i < collected; i++) {
+    struct vma *v = vma_ptrs[i];
+    snaps[i].start = v->start;
+    snaps[i].end = v->end;
+    snaps[i].prot = v->prot;
+    snaps[i].flags = v->flags;
+    snaps[i].offset = v->offset;
+    snaps[i].fd = v->fd;
+    snaps[i].file_node = v->file_node;
+    if (v->file_node && vfs_node_is_alive((vfs_node_t *)v->file_node)) {
+      snaps[i].inode = ((vfs_node_t *)v->file_node)->inode;
+    } else {
+      snaps[i].inode = 0;
+    }
+  }
+
+  uint64_t brk_base = t->mm->brk_base;
+  uint64_t brk_current = t->mm->brk_current;
+
+  kfree(vma_ptrs);
+  spinlock_release(&t->mm->lock);
+
+  // Now format each line into a dynamically sized buffer
+  // Typical line length is ~80-120 bytes. Let's allocate 256 bytes per VMA.
+  size_t buf_cap = (size_t)collected * 256 + 256;
+  char *buf = kmalloc(buf_cap);
+  if (!buf) {
+    kfree(snaps);
+    return 0;
+  }
+
+  size_t pos = 0;
+  for (int i = 0; i < collected; i++) {
+    struct vma_snap *s = &snaps[i];
+
+    char perms[5];
+    perms[0] = (s->prot & 0x1) ? 'r' : '-';
+    perms[1] = (s->prot & 0x2) ? 'w' : '-';
+    perms[2] = (s->prot & 0x4) ? 'x' : '-';
+    perms[3] = (s->flags & MAP_SHARED) ? 's' : 'p';
+    perms[4] = '\0';
+
+    char path_buf[256];
+    path_buf[0] = '\0';
+
+    if (s->flags & MAP_GROWSDOWN) {
+      strcpy(path_buf, "[stack]");
+    } else if (brk_base && s->start >= brk_base && s->end <= brk_current) {
+      strcpy(path_buf, "[heap]");
+    } else if (s->start == VDSO_USER_BASE) {
+      strcpy(path_buf, "[vdso]");
+    } else if (s->fd >= 0) {
+      if (!sched_get_fd_path_snapshot(pid, (uint32_t)s->fd, path_buf, sizeof(path_buf))) {
+        path_buf[0] = '\0';
+      }
+    } else if (s->file_node && vfs_node_is_alive((vfs_node_t *)s->file_node)) {
+      vfs_node_t *vn = (vfs_node_t *)s->file_node;
+      if (vn->name[0]) {
+        strncpy(path_buf, vn->name, sizeof(path_buf) - 1);
+        path_buf[sizeof(path_buf) - 1] = '\0';
+      }
+    }
+
+    // Format line: address perms offset dev inode pathname\n
+    // e.g., 00400000-00452000 r-xp 00000000 08:02 173521 /usr/bin/foo
+    int written;
+    if (path_buf[0]) {
+      written = snprintf(buf + pos, buf_cap - pos,
+                         "%08lx-%08lx %s %08lx 00:00 %u %s\n",
+                         (unsigned long)s->start, (unsigned long)s->end,
+                         perms, (unsigned long)s->offset,
+                         s->inode, path_buf);
+    } else {
+      written = snprintf(buf + pos, buf_cap - pos,
+                         "%08lx-%08lx %s %08lx 00:00 %u\n",
+                         (unsigned long)s->start, (unsigned long)s->end,
+                         perms, (unsigned long)s->offset,
+                         s->inode);
+    }
+
+    if (written > 0 && pos + (size_t)written < buf_cap) {
+      pos += (size_t)written;
+    } else {
+      break;
+    }
+  }
+
+  kfree(snaps);
+
+  node->length = (uint32_t)pos;
+  if (offset >= (uint32_t)pos) {
+    kfree(buf);
+    return 0;
+  }
+
+  uint32_t to_copy = (uint32_t)pos - offset;
+  if (to_copy > size)
+    to_copy = size;
+
+  memcpy(buffer, buf + offset, to_copy);
+  kfree(buf);
+  return to_copy;
 }
 
 // /proc/<pid>/fd/ support
@@ -1042,6 +1309,101 @@ static struct dirent *procfs_pid_fd_readdir(vfs_node_t *node, uint32_t index) {
   return &d;
 }
 
+// /proc/<pid>/ns/ support
+//
+// bwrap (and with it WebKitGTK's sandbox setup) opens /proc/<pid>/ns as a
+// directory and fstatat()s the entries to read namespace IDs before it starts
+// a sandbox; container runtimes do the same.  AvoryOS has a single instance of
+// each namespace, but the files have to exist and carry a stable inode number,
+// because that number is how namespace identity is compared.  The entries are
+// regular files rather than Linux's magic symlinks: the stat must succeed, and
+// there is no meaningful target path to follow.
+static const struct {
+  const char *name;
+  uint32_t inode;
+} procfs_ns_entries[] = {
+    {"cgroup", 0x4E530001}, {"ipc", 0x4E530002}, {"mnt", 0x4E530003},
+    {"net", 0x4E530004},    {"pid", 0x4E530005}, {"time", 0x4E530006},
+    {"user", 0x4E530007},   {"uts", 0x4E530008},
+};
+
+#define PROCFS_NS_ENTRY_COUNT \
+  (sizeof(procfs_ns_entries) / sizeof(procfs_ns_entries[0]))
+
+static uint32_t procfs_pid_ns_read(vfs_node_t *node, uint32_t offset,
+                                   uint32_t size, uint8_t *buffer) {
+  uint32_t idx = node->impl;
+  if (idx >= PROCFS_NS_ENTRY_COUNT || !buffer)
+    return 0;
+
+  char text[48];
+  int len = snprintf(text, sizeof(text), "%s:[%u]",
+                     procfs_ns_entries[idx].name, procfs_ns_entries[idx].inode);
+  if (len <= 0)
+    return 0;
+
+  uint32_t total = (uint32_t)len;
+  if (offset >= total)
+    return 0;
+  uint32_t n = total - offset;
+  if (n > size)
+    n = size;
+  memcpy(buffer, text + offset, n);
+  return n;
+}
+
+static vfs_node_t *procfs_pid_ns_finddir(vfs_node_t *node, char *name) {
+  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+    vfs_open(node);
+    return node;
+  }
+
+  for (uint32_t i = 0; i < PROCFS_NS_ENTRY_COUNT; i++) {
+    if (strcmp(name, procfs_ns_entries[i].name) != 0)
+      continue;
+
+    vfs_node_t *entry = kmalloc(sizeof(vfs_node_t));
+    if (!entry)
+      return NULL;
+    vfs_node_init(entry);
+    strncpy(entry->name, name, sizeof(entry->name) - 1);
+    entry->flags = FS_FILE;
+    entry->mask = 0444;
+    entry->inode = procfs_ns_entries[i].inode;
+    entry->impl = i;
+    entry->length = 32;
+    entry->read = procfs_pid_ns_read;
+    return entry;
+  }
+  return NULL;
+}
+
+static struct dirent *procfs_pid_ns_readdir(vfs_node_t *node, uint32_t index) {
+  static struct dirent d;
+  memset(&d, 0, sizeof(d));
+
+  if (index == 0) {
+    strcpy(d.name, ".");
+    d.ino = node->inode;
+    d.d_type = DT_DIR;
+    return &d;
+  }
+  if (index == 1) {
+    strcpy(d.name, "..");
+    d.ino = node->inode;
+    d.d_type = DT_DIR;
+    return &d;
+  }
+
+  uint32_t i = index - 2;
+  if (i >= PROCFS_NS_ENTRY_COUNT)
+    return NULL;
+  strncpy(d.name, procfs_ns_entries[i].name, sizeof(d.name) - 1);
+  d.ino = procfs_ns_entries[i].inode;
+  d.d_type = DT_REG;
+  return &d;
+}
+
 // Synthesise a /proc/<pid>/ directory node on demand
 
 typedef struct procfs_pid_cache_entry {
@@ -1087,6 +1449,47 @@ static void procfs_pid_dir_close(vfs_node_t *node) {
     child = next;
   }
   kfree(dir);
+}
+
+static int procfs_pid_exe_readlink(vfs_node_t *node, char *buf, uint32_t size) {
+  uint32_t pid = node->impl;
+  struct sched_thread_snapshot snapshot;
+  if (!sched_get_thread_snapshot(pid, &snapshot))
+    return -2; // ENOENT
+  const char *target = snapshot.exe_path[0] ? snapshot.exe_path : "/init";
+  uint32_t len = (uint32_t)strlen(target);
+  if (len > size)
+    len = size;
+  memcpy(buf, target, len);
+  return (int)len;
+}
+
+static int procfs_pid_cwd_readlink(vfs_node_t *node, char *buf, uint32_t size) {
+  uint32_t pid = node->impl;
+  struct sched_thread_snapshot snapshot;
+  if (!sched_get_thread_snapshot(pid, &snapshot))
+    return -2; // ENOENT
+  const char *target = snapshot.cwd_path[0] ? snapshot.cwd_path : "/";
+  uint32_t len = (uint32_t)strlen(target);
+  if (len > size)
+    len = size;
+  memcpy(buf, target, len);
+  return (int)len;
+}
+
+static int procfs_thread_self_readlink(vfs_node_t *node, char *buf, uint32_t size) {
+  (void)node;
+  struct thread *t = sched_get_current();
+  if (!t)
+    return -1;
+  char link_str[32];
+  uint32_t tgid = t->tgid ? t->tgid : t->tid;
+  snprintf(link_str, sizeof(link_str), "%u/task/%u", tgid, t->tid);
+  uint32_t len = (uint32_t)strlen(link_str);
+  if (len > size)
+    len = size;
+  memcpy(buf, link_str, len);
+  return (int)len;
 }
 
 static void procfs_make_pid_ramfs_ephemeral(vfs_node_t *dir) {
@@ -1162,6 +1565,19 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     ramfs_mount_node(dir, comm_node);
   }
 
+  // cgroup — cgroup v2 membership line (memory-pressure monitors read it)
+  vfs_node_t *cgroup_node = kmalloc(sizeof(vfs_node_t));
+  if (cgroup_node) {
+    vfs_node_init(cgroup_node);
+    strcpy(cgroup_node->name, "cgroup");
+    cgroup_node->flags = FS_FILE;
+    cgroup_node->mask = 0444;
+    cgroup_node->impl = pid;
+    cgroup_node->length = 6;
+    cgroup_node->read = procfs_pid_cgroup_read;
+    ramfs_mount_node(dir, cgroup_node);
+  }
+
   // statm — memory usage in pages (VIRT/RES for htop)
   vfs_node_t *statm_node = kmalloc(sizeof(vfs_node_t));
   if (statm_node) {
@@ -1201,6 +1617,19 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     ramfs_mount_node(dir, auxv_node);
   }
 
+  // maps — memory regions / VMAs
+  vfs_node_t *maps_node = kmalloc(sizeof(vfs_node_t));
+  if (maps_node) {
+    vfs_node_init(maps_node);
+    strcpy(maps_node->name, "maps");
+    maps_node->flags = FS_FILE;
+    maps_node->mask = 0444;
+    maps_node->impl = pid;
+    maps_node->length = 4096;
+    maps_node->read = procfs_pid_maps_read;
+    ramfs_mount_node(dir, maps_node);
+  }
+
   // fd directory
   vfs_node_t *fd_dir = kmalloc(sizeof(vfs_node_t));
   if (fd_dir) {
@@ -1212,6 +1641,21 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     fd_dir->readdir = procfs_pid_fd_readdir;
     fd_dir->finddir = procfs_pid_fd_finddir;
     ramfs_mount_node(dir, fd_dir);
+  }
+
+  // ns directory — namespace identity files.  bwrap opens this directory and
+  // fstatat()s the entries before starting a sandbox; without it the sandbox
+  // launcher dies with "open /proc/<pid>/ns failed" before it can fall back.
+  vfs_node_t *ns_dir = kmalloc(sizeof(vfs_node_t));
+  if (ns_dir) {
+    vfs_node_init(ns_dir);
+    strcpy(ns_dir->name, "ns");
+    ns_dir->flags = FS_DIRECTORY | FS_DENTRY_NOCACHE;
+    ns_dir->mask = 0555;
+    ns_dir->impl = pid;
+    ns_dir->readdir = procfs_pid_ns_readdir;
+    ns_dir->finddir = procfs_pid_ns_finddir;
+    ramfs_mount_node(dir, ns_dir);
   }
 
   // task/<pid>/ directory — htop opens task/<pid>/stat to read per-thread stat.
@@ -1254,6 +1698,30 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     }
 
     ramfs_mount_node(dir, task_dir);
+  }
+
+  // exe symlink — /proc/<pid>/exe
+  vfs_node_t *exe_link = kmalloc(sizeof(vfs_node_t));
+  if (exe_link) {
+    vfs_node_init(exe_link);
+    strcpy(exe_link->name, "exe");
+    exe_link->flags = FS_SYMLINK;
+    exe_link->mask = 0777;
+    exe_link->impl = pid;
+    exe_link->readlink = procfs_pid_exe_readlink;
+    ramfs_mount_node(dir, exe_link);
+  }
+
+  // cwd symlink — /proc/<pid>/cwd
+  vfs_node_t *cwd_link = kmalloc(sizeof(vfs_node_t));
+  if (cwd_link) {
+    vfs_node_init(cwd_link);
+    strcpy(cwd_link->name, "cwd");
+    cwd_link->flags = FS_SYMLINK;
+    cwd_link->mask = 0777;
+    cwd_link->impl = pid;
+    cwd_link->readlink = procfs_pid_cwd_readlink;
+    ramfs_mount_node(dir, cwd_link);
   }
 
   return dir;
@@ -1331,7 +1799,8 @@ static int procfs_self_readlink(vfs_node_t *node, char *buf, uint32_t size) {
   if (!t)
     return -1;
   char pid_str[16];
-  snprintf(pid_str, sizeof(pid_str), "%u", t->tid);
+  uint32_t pid = t->tgid ? t->tgid : t->tid;
+  snprintf(pid_str, sizeof(pid_str), "%u", pid);
   uint32_t len = (uint32_t)strlen(pid_str);
   if (len > size)
     len = size;
@@ -1418,6 +1887,17 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, char *name) {
     self_link->readlink = procfs_self_readlink;
     return self_link;
   }
+  if (strcmp(name, "thread-self") == 0) {
+    vfs_node_t *tself_link = kmalloc(sizeof(vfs_node_t));
+    if (!tself_link)
+      return NULL;
+    vfs_node_init(tself_link);
+    strcpy(tself_link->name, "thread-self");
+    tself_link->flags = FS_SYMLINK;
+    tself_link->mask = 0777;
+    tself_link->readlink = procfs_thread_self_readlink;
+    return tself_link;
+  }
 
   // First try the static ramfs children
   typedef struct child_node_s {
@@ -1482,7 +1962,7 @@ void procfs_init(void) {
     vfs_open(procfs_root); // Permanent reference for the mount entry
 
     // Apply the mount: anyone looking up 'proc' will now get our virtual root
-    vfs_mount_ex(proc_dir, procfs_root, "proc", "procfs");
+    vfs_mount_ex(proc_dir, procfs_root, "proc", "procfs", "/proc");
     vfs_close(proc_dir);
 
     // Add /proc/meminfo
@@ -1496,6 +1976,20 @@ void procfs_init(void) {
       meminfo_node->length = 512; // Dummy size, redefined on read
 
       ramfs_mount_node(procfs_root, meminfo_node);
+    }
+
+    // Add /proc/zoneinfo — PMM zone watermarks/free pages.  WebKit's
+    // memory-pressure monitor opens it unconditionally; htop/btop read it.
+    vfs_node_t *zoneinfo_node = kmalloc(sizeof(vfs_node_t));
+    if (zoneinfo_node) {
+      vfs_node_init(zoneinfo_node);
+      strncpy(zoneinfo_node->name, "zoneinfo", 127);
+      zoneinfo_node->flags = FS_FILE | FS_PERSISTENT;
+      zoneinfo_node->mask = 0444;
+      zoneinfo_node->read = procfs_zoneinfo_read;
+      zoneinfo_node->length = 256; // Dummy size, redefined on read
+
+      ramfs_mount_node(procfs_root, zoneinfo_node);
     }
 
     // Add /proc/klog: the persistent boot-log ring (console/klog.c).  Serial

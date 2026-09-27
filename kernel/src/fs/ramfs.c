@@ -50,6 +50,7 @@ static void ramfs_destroy_node(vfs_node_t *node) {
       kfree(c);
       c = next;
     }
+    vfs_dirindex_destroy(dir); /* bucket array; wrappers freed above */
     kfree(dir);
   }
   node->device = NULL;
@@ -254,7 +255,11 @@ static struct dirent *ramfs_readdir(vfs_node_t *node, uint32_t index) {
   }
 
   index -= 2;
-  /* Resume from the cursor for sequential getdents; otherwise rescan. */
+  /* Resume from the cursor for sequential getdents; otherwise rescan.  The
+   * walk runs under the index lock - entries behind the cursor can be
+   * unlinked (and their wrappers freed) at any time - and the dirent is
+   * filled while still locked. */
+  vfs_dirindex_lock(dir);
   child_node_t *cursor = dir->cursor;
   uint32_t cursor_index = dir->cursor_index;
   child_node_t *curr;
@@ -272,32 +277,18 @@ static struct dirent *ramfs_readdir(vfs_node_t *node, uint32_t index) {
     strcpy(d.name, curr->node->name);
     d.ino = curr->node->inode;
     d.d_type = vfs_dtype(curr->node->flags);
-    return &d;
   }
+  vfs_dirindex_unlock(dir);
+
+  if (curr)
+    return &d;
 
   return 0; // End of directory
 }
 
-static vfs_node_t *ramfs_finddir(vfs_node_t *node, char *name) {
-  if (!node || !node->device)
-    return 0;
-
-  ramfs_dir_t *dir = (ramfs_dir_t *)node->device;
-
-  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
-    return node;
-  }
-
-  child_node_t *curr = dir->children;
-  while (curr) {
-    if (strcmp(curr->node->name, name) == 0) {
-      return curr->node;
-    }
-    curr = curr->next;
-  }
-
-  return 0;
-}
+/* Name lookup is the shared dirindex implementation (dirindex.h); "." and
+ * ".." resolve to the node itself and a found child is returned bare, both
+ * exactly as the old list-walk did. */
 
 // Helper to construct a new node linked to ramfs standard APIs
 static vfs_node_t *ramfs_make_node(char *name, uint16_t perm, uint32_t type) {
@@ -318,12 +309,14 @@ static vfs_node_t *ramfs_make_node(char *name, uint16_t perm, uint32_t type) {
 
   if (type == FS_DIRECTORY) {
     ramfs_dir_t *d = kmalloc(sizeof(ramfs_dir_t));
-    d->children = 0;
-    d->cursor = 0;
-    d->cursor_index = 0;
+    if (!d) {
+      kfree(n);
+      return 0;
+    }
+    vfs_dirindex_init(d);
     n->device = d;
     n->readdir = ramfs_readdir;
-    n->finddir = ramfs_finddir;
+    n->finddir = vfs_dirindex_finddir_ref;
   } else if (type == FS_FILE) {
     ramfs_file_t *f = kmalloc(sizeof(ramfs_file_t));
     f->data = 0;
@@ -343,26 +336,44 @@ static vfs_node_t *ramfs_make_node(char *name, uint16_t perm, uint32_t type) {
   return n;
 }
 
-// Internal helper to add node to dir
-static void ramfs_add_child(vfs_node_t *parent, vfs_node_t *child) {
-  ramfs_dir_t *dir = (ramfs_dir_t *)parent->device;
+/* Link `child` into the parent's directory index.  The wrapper is allocated
+ * before the index sees the child, so an allocation failure anywhere leaves
+ * the directory unchanged and reports -1 to the caller instead of the old
+ * behavior of "success" plus an unreachable node. */
+static bool ramfs_add_child(vfs_node_t *parent, vfs_node_t *child) {
   child_node_t *cn = kmalloc(sizeof(child_node_t));
+  if (!cn)
+    return false;
   cn->node = child;
-  cn->next = dir->children;
-  dir->children = cn;
+  if (!vfs_dirindex_insert((ramfs_dir_t *)parent->device, cn)) {
+    kfree(cn);
+    return false;
+  }
+  return true;
+}
+
+/* Creation failed after the node existed: run the payload teardown once and
+ * free the node, so a failed create does not leak inode/memory. */
+static void ramfs_discard_node(vfs_node_t *n) {
+  if (n->destroy)
+    n->destroy(n);
+  kfree(n);
 }
 
 static int ramfs_create(vfs_node_t *node, char *name, uint16_t permission) {
   if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
     return -1;
-  if (ramfs_finddir(node, name) != 0)
+  if (vfs_dirindex_finddir(node, name) != 0)
     return -1; // File exists
 
   vfs_node_t *new_node = ramfs_make_node(name, permission, FS_FILE);
   if (!new_node)
     return -1;
 
-  ramfs_add_child(node, new_node);
+  if (!ramfs_add_child(node, new_node)) {
+    ramfs_discard_node(new_node);
+    return -1;
+  }
   return 0;
 }
 
@@ -370,7 +381,7 @@ static int ramfs_mknod(vfs_node_t *node, char *name, uint16_t permission,
                        uint32_t flags, void *device) {
   if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
     return -1;
-  if (ramfs_finddir(node, name) != 0)
+  if (vfs_dirindex_finddir(node, name) != 0)
     return -1; // Node exists
 
   vfs_node_t *new_node = ramfs_make_node(name, permission, flags);
@@ -378,7 +389,13 @@ static int ramfs_mknod(vfs_node_t *node, char *name, uint16_t permission,
     return -1;
 
   new_node->device = device;
-  ramfs_add_child(node, new_node);
+  if (!ramfs_add_child(node, new_node)) {
+    /* Deliberately not destroy(): an mknod node's device payload belongs to
+     * the caller/driver, and ramfs_destroy_node() would interpret it as a
+     * ramfs file when the node type is FS_FILE. */
+    kfree(new_node);
+    return -1;
+  }
   return 0;
 }
 
@@ -389,7 +406,7 @@ static int ramfs_rename(vfs_node_t *node, char *old_name, char *new_name);
 static int ramfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
   if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
     return -1;
-  if (ramfs_finddir(node, name) != 0)
+  if (vfs_dirindex_finddir(node, name) != 0)
     return -1; // Directory exists
 
   vfs_node_t *new_node = ramfs_make_node(name, permission, FS_DIRECTORY);
@@ -406,7 +423,10 @@ static int ramfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
   new_node->chmod = ramfs_chmod;
   new_node->chown = ramfs_chown;
 
-  ramfs_add_child(node, new_node);
+  if (!ramfs_add_child(node, new_node)) {
+    ramfs_discard_node(new_node);
+    return -1;
+  }
   return 0;
 }
 
@@ -431,58 +451,58 @@ static int ramfs_unlink(vfs_node_t *node, char *name) {
     return -1;
 
   ramfs_dir_t *dir = (ramfs_dir_t *)node->device;
-  child_node_t *prev = 0;
-  child_node_t *curr = dir->children;
 
-  while (curr) {
-    if (strcmp(curr->node->name, name) == 0) {
-      // Don't allow unlinking directories via unlink
-      if ((curr->node->flags & FS_TYPE_MASK) == FS_DIRECTORY)
-        return -1; // EISDIR
-
-      // Unlink from the list
-      if (prev)
-        prev->next = curr->next;
-      else
-        dir->children = curr->next;
-
-      /* Descriptors and mappings may still reference the node: retire it and
-       * let the last close release the file data and the node itself. */
-      vfs_node_retire(curr->node);
-      kfree(curr);
-      return 0;
-    }
-    prev = curr;
-    curr = curr->next;
+  vfs_dirindex_lock(dir);
+  child_node_t *curr = vfs_dirindex_find_locked(dir, name);
+  if (!curr) {
+    vfs_dirindex_unlock(dir);
+    return -1;
   }
-  return -1; // Not found
+  // Don't allow unlinking directories via unlink
+  if ((curr->node->flags & FS_TYPE_MASK) == FS_DIRECTORY) {
+    vfs_dirindex_unlock(dir);
+    return -1; // EISDIR
+  }
+  vfs_dirindex_detach_locked(dir, curr);
+  vfs_dirindex_unlock(dir);
+
+  /* Descriptors and mappings may still reference the node: retire it and
+   * let the last close release the file data and the node itself.  Both run
+   * outside the index lock - retire can tear down payloads and take other
+   * locks, which must not happen under an IRQ-masked section. */
+  vfs_node_retire(curr->node);
+  kfree(curr);
+  return 0;
 }
 
 static int ramfs_rmdir(vfs_node_t *node, char *name) {
   if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY || !node->device)
     return -1;
   ramfs_dir_t *dir = (ramfs_dir_t *)node->device;
-  child_node_t *prev = NULL;
-  child_node_t *curr = dir->children;
-  while (curr) {
-    if (strcmp(curr->node->name, name) == 0) {
-      if ((curr->node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
-        return -1;
-      ramfs_dir_t *child_dir = (ramfs_dir_t *)curr->node->device;
-      if (!child_dir || child_dir->children)
-        return -1;
-      if (prev)
-        prev->next = curr->next;
-      else
-        dir->children = curr->next;
-      vfs_node_retire(curr->node);
-      kfree(curr);
-      return 0;
-    }
-    prev = curr;
-    curr = curr->next;
+
+  vfs_dirindex_lock(dir);
+  child_node_t *curr = vfs_dirindex_find_locked(dir, name);
+  if (!curr || (curr->node->flags & FS_TYPE_MASK) != FS_DIRECTORY ||
+      !curr->node->device) {
+    vfs_dirindex_unlock(dir);
+    return -1;
   }
-  return -1;
+  /* Emptiness is the child index's count.  Nesting the child's lock under
+   * the parent's (depth order, the only nesting in this backend) makes the
+   * check atomic against a concurrent create inside the child. */
+  vfs_dirindex_t *child_di = vfs_dirindex_of(curr->node);
+  vfs_dirindex_lock(child_di);
+  bool empty = child_di->count == 0;
+  if (empty)
+    vfs_dirindex_detach_locked(dir, curr);
+  vfs_dirindex_unlock(child_di);
+  vfs_dirindex_unlock(dir);
+  if (!empty)
+    return -1;
+
+  vfs_node_retire(curr->node);
+  kfree(curr);
+  return 0;
 }
 
 // ramfs_rename: Rename a file within the same directory
@@ -491,9 +511,9 @@ static int ramfs_rename(vfs_node_t *node, char *old_name, char *new_name) {
     return -1;
 
   // Check that new_name doesn't already exist
-  if (ramfs_finddir(node, new_name) != 0) {
+  if (vfs_dirindex_finddir(node, new_name) != 0) {
     // If target exists, unlink it first (overwrite semantics per POSIX)
-    vfs_node_t *target = ramfs_finddir(node, new_name);
+    vfs_node_t *target = vfs_dirindex_finddir(node, new_name);
     if (target && (target->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
       ramfs_unlink(node, new_name);
     } else {
@@ -501,13 +521,20 @@ static int ramfs_rename(vfs_node_t *node, char *old_name, char *new_name) {
     }
   }
 
-  vfs_node_t *child = ramfs_finddir(node, old_name);
+  vfs_node_t *child = vfs_dirindex_finddir(node, old_name);
   if (!child)
     return -1; // Source not found
 
-  strncpy(child->name, new_name, 127);
-  child->name[127] = '\0';
-  return 0;
+  /* Re-key the entry in the hash under the same lock as the lookup, so a
+   * concurrent find cannot see the node under its old bucket and name at
+   * once. */
+  ramfs_dir_t *dir = (ramfs_dir_t *)node->device;
+  vfs_dirindex_lock(dir);
+  child_node_t *entry = vfs_dirindex_find_locked(dir, old_name);
+  if (entry)
+    vfs_dirindex_rename_locked(dir, entry, new_name);
+  vfs_dirindex_unlock(dir);
+  return entry ? 0 : -1;
 }
 
 // Public APIs
@@ -538,7 +565,7 @@ void ramfs_mount_node(vfs_node_t *root, vfs_node_t *node) {
   if ((root->flags & FS_TYPE_MASK) != FS_DIRECTORY)
     return;
 
-  if (ramfs_finddir(root, node->name) != NULL)
+  if (vfs_dirindex_finddir(root, node->name) != NULL)
     return;
 
   ramfs_add_child(root, node);
@@ -552,6 +579,7 @@ void ramfs_mount_on(vfs_node_t *node) {
   if (!dir)
     return;
   memset(dir, 0, sizeof(ramfs_dir_t));
+  vfs_dirindex_init(dir);
 
   // Transform the existing node into a ramfs directory
   node->device = dir;
@@ -560,7 +588,7 @@ void ramfs_mount_on(vfs_node_t *node) {
   node->read = 0;
   node->write = 0;
   node->readdir = ramfs_readdir;
-  node->finddir = ramfs_finddir;
+  node->finddir = vfs_dirindex_finddir_ref;
   node->create = ramfs_create;
   node->mkdir = ramfs_mkdir;
   node->unlink = ramfs_unlink;
@@ -594,7 +622,7 @@ void ramfs_mount_at(char *path) {
     strncpy(ram_root->name, name, 127);
 
     ramfs_mount_on(ram_root);
-    vfs_mount(mountpoint, ram_root);
+    vfs_mount_ex(mountpoint, ram_root, "none", "unknown", path);
     vfs_close(mountpoint);
   }
 }

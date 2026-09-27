@@ -1,25 +1,66 @@
 #!/usr/bin/env bash
-# scripts/setup-mocktail.sh - Downloads and installs Mocktail AppImage into AvoryOS disk image
+# scripts/setup-mocktail.sh - Downloads and installs the Mocktail AppImage into the AvoryOS disk image
 #
-# Mocktail is an experimental Roblox compatibility runtime that runs the Android
-# x86_64 Roblox client on Linux via SDL3 + OpenGL/EGL.
+# Mocktail 1.0.3 uses the portable usr/share/mocktail-bundle layout; newer
+# releases use sharun/AppDir packaging. This script handles both layouts and:
+#
+#   * downloads the pinned AppImage release (override with MOCKTAIL_VERSION),
+#   * installs the runtime under /opt/mocktail-<version>,
+#   * keeps the Roblox payload in the shared legacy location /opt/mocktail/data
+#     (reused by every mocktail version, so it is never duplicated),
+#   * installs the AppImage runtime without binary modifications,
+#   * installs launchers:
+#       /usr/bin/mocktail            -> new runtime (primary)
+#       /usr/bin/mocktail-<version>  -> new runtime
+#       /usr/bin/mocktail-<version>  -> selected runtime
+#     and removes any stale /usr/bin/mocktail-legacy alias,
+#   * injects everything into disk.img.
 #
 # Usage:
 #   ./scripts/setup-mocktail.sh
+#   MOCKTAIL_VERSION=1.0.3 ./scripts/setup-mocktail.sh
+#   MOCKTAIL_REFRESH_PAYLOAD=0 ./scripts/setup-mocktail.sh # use cached payload offline
+#   MOCKTAIL_FORCE_PAYLOAD=1 ./scripts/setup-mocktail.sh   # force payload restage
 #
 # Prerequisites:
 #   1. Run ./scripts/setup-alpine.sh first (installs runtime deps in rootfs)
-#   2. Host system needs: wget or curl
+#   2. Host system needs: wget or curl, sha256sum, dd, debugfs
 
 set -euo pipefail
+trap 'status=$?; printf "[!] setup-mocktail.sh failed at line %s: %s (exit %s)\\n" "${LINENO}" "${BASH_COMMAND}" "${status}" >&2' ERR
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DISK_IMG="${ROOT_DIR}/disk.img"
 BUILD_DIR="${ROOT_DIR}/build/alpine"
 ROOTFS_DIR="${BUILD_DIR}/rootfs"
-POPULATE_SCRIPT="${ROOT_DIR}/scripts/populate-ext2-dir.sh"
 MOCKTAIL_BUILD_DIR="${BUILD_DIR}/mocktail-build"
 HOST_DATA_DIR="${ROOT_DIR}/build/mocktail-host-data"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Release pinning
+# ─────────────────────────────────────────────────────────────────────────────
+MOCKTAIL_VERSION="${MOCKTAIL_VERSION:-1.0.3}"
+MOCKTAIL_REFRESH_PAYLOAD="${MOCKTAIL_REFRESH_PAYLOAD:-1}"
+if [ "${MOCKTAIL_VERSION}" = "continuous" ]; then
+    APPIMAGE_NAME="mocktail-nightly.AppImage"
+elif [ "${MOCKTAIL_VERSION}" = "1.0.3" ]; then
+    APPIMAGE_NAME="Mocktail-x86_64.AppImage"
+else
+    APPIMAGE_NAME="Mocktail-${MOCKTAIL_VERSION}-x86_64.AppImage"
+fi
+APPIMAGE_URL="https://github.com/komaruworld/mocktail/releases/download/${MOCKTAIL_VERSION}/${APPIMAGE_NAME}"
+if [ "${MOCKTAIL_VERSION}" = "continuous" ]; then
+    APPIMAGE_SHA256="${APPIMAGE_SHA256:-1253ab0ec719450b14d9956422b60f6d3212b42697559bba88169bdb5e5abe23}"
+elif [ "${MOCKTAIL_VERSION}" = "1.0.3" ]; then
+    APPIMAGE_SHA256="${APPIMAGE_SHA256:-fe674f9cd5ac870eb94a9ebcfd6f7a824645b6d7275d0b48744c8e81d5629131}"
+else
+    APPIMAGE_SHA256="${APPIMAGE_SHA256:-07f1c93a00809b436d2f0bb5609f88be20ec3bf7126f253e6e81186d6cb54efe}"
+fi
+
+RUNTIME_DIR_NAME="mocktail-${MOCKTAIL_VERSION}"
+RUNTIME_INSTALL_DIR="/opt/${RUNTIME_DIR_NAME}"
+BUNDLE_ROOT="${ROOTFS_DIR}${RUNTIME_INSTALL_DIR}"
+DATA_ROOT="${ROOTFS_DIR}/opt/mocktail/data"
 
 SUDO=""
 if [ "$(id -u)" -ne 0 ] && ! [ -w "${ROOTFS_DIR}" ]; then
@@ -38,7 +79,6 @@ fi
     exit 1
 }
 
-# Check for download tool
 DOWNLOAD_CMD=""
 if command -v wget >/dev/null 2>&1; then
     DOWNLOAD_CMD="wget -O"
@@ -52,204 +92,223 @@ fi
 mkdir -p "${MOCKTAIL_BUILD_DIR}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Download Mocktail AppImage
+# 1. Download the pinned AppImage
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== [1/4] Downloading Mocktail AppImage ==="
+echo "=== [1/5] Downloading Mocktail ${MOCKTAIL_VERSION} ==="
 
-APPIMAGE_URL="https://github.com/komaruworld/mocktail/releases/latest/download/mocktail-x86_64.AppImage"
-APPIMAGE_FILE="${MOCKTAIL_BUILD_DIR}/mocktail.AppImage"
+APPIMAGE_FILE="${MOCKTAIL_BUILD_DIR}/mocktail-${MOCKTAIL_VERSION}.AppImage"
+NEED_APPIMAGE=1
+if [ -f "${APPIMAGE_FILE}" ] && [ -n "${APPIMAGE_SHA256}" ] && \
+   [ "$(sha256sum "${APPIMAGE_FILE}" | cut -d' ' -f1)" = "${APPIMAGE_SHA256}" ]; then
+    echo "[*] Cached AppImage matches ${APPIMAGE_SHA256:0:12}…, skipping download"
+    NEED_APPIMAGE=0
+fi
 
-if [ ! -f "${APPIMAGE_FILE}" ]; then
-    echo "[*] Downloading Mocktail AppImage from GitHub releases..."
+if [ "${NEED_APPIMAGE}" -eq 1 ]; then
+    echo "[*] Downloading ${APPIMAGE_NAME}..."
     ${DOWNLOAD_CMD} "${APPIMAGE_FILE}" "${APPIMAGE_URL}"
     chmod +x "${APPIMAGE_FILE}"
-    echo "[+] AppImage downloaded"
-else
-    echo "[*] AppImage already exists, skipping download"
+    if [ -n "${APPIMAGE_SHA256}" ] && \
+       [ "$(sha256sum "${APPIMAGE_FILE}" | cut -d' ' -f1)" != "${APPIMAGE_SHA256}" ]; then
+        echo "[!] AppImage sha256 mismatch. Aborting."
+        exit 1
+    fi
+    echo "[+] AppImage downloaded and verified"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Extract AppImage contents
+# 2. Extract and install the runtime
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== [2/4] Extracting AppImage ==="
+echo "=== [2/5] Extracting and installing the runtime ==="
 
-EXTRACT_DIR="${MOCKTAIL_BUILD_DIR}/mocktail-extracted"
+EXTRACT_DIR="${MOCKTAIL_BUILD_DIR}/mocktail-extracted-${MOCKTAIL_VERSION}"
 rm -rf "${EXTRACT_DIR}"
 mkdir -p "${EXTRACT_DIR}"
 
 echo "[*] Extracting AppImage contents..."
-cd "${EXTRACT_DIR}"
-"${APPIMAGE_FILE}" --appimage-extract >/dev/null 2>&1 || {
-    echo "[!] Failed to extract AppImage. Trying alternative method..."
-    # Alternative: manually extract (AppImages are ISO9660 + offset)
-    OFFSET=$(LC_ALL=C grep -aobm1 "ELF" "${APPIMAGE_FILE}" | cut -d: -f1)
-    if [ -n "${OFFSET}" ]; then
-        dd if="${APPIMAGE_FILE}" bs=1 skip="${OFFSET}" of="${EXTRACT_DIR}/mocktail.elf" 2>/dev/null
-        chmod +x "${EXTRACT_DIR}/mocktail.elf"
-        echo "[+] Extracted ELF binary directly"
-    else
-        echo "[!] Could not extract AppImage. Manual installation required."
+(
+    cd "${EXTRACT_DIR}"
+    "${APPIMAGE_FILE}" --appimage-extract >/dev/null 2>&1 || {
+        echo "[!] Failed to extract AppImage."
         exit 1
-    fi
-}
+    }
+)
 
-# AppImage extracts to squashfs-root/
-if [ -d "squashfs-root" ]; then
-    echo "[*] Copying AppImage contents to rootfs..."
-    
-    # Install the main binary
-    ${SUDO} mkdir -p "${ROOTFS_DIR}/usr/bin"
-    ${SUDO} mkdir -p "${ROOTFS_DIR}/opt/mocktail"
-    
-    # Ensure write permissions on existing files so read-only assets don't fail overwrite
-    [ -d "${ROOTFS_DIR}/opt/mocktail" ] && chmod -R u+w "${ROOTFS_DIR}/opt/mocktail" 2>/dev/null || true
-
-    # Copy all AppImage contents to /opt/mocktail
-    ${SUDO} cp -rf --remove-destination squashfs-root/* "${ROOTFS_DIR}/opt/mocktail/"
-    
-    # Fix permissions for all executables and scripts
-    ${SUDO} find "${ROOTFS_DIR}/opt/mocktail" -type f -name "*.sh" -exec chmod +x {} \;
-    ${SUDO} find "${ROOTFS_DIR}/opt/mocktail" -type f -name "AppRun" -exec chmod +x {} \;
-    ${SUDO} find "${ROOTFS_DIR}/opt/mocktail/usr/bin" -type f -exec chmod +x {} \; 2>/dev/null || true
-    ${SUDO} find "${ROOTFS_DIR}/opt/mocktail/usr/share/mocktail-bundle" -type f -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
-    
-    # Replace mocktail_failure_dialog with a lightweight stub so it won't crash,
-    # require heavy GTK4/Libadwaita dependencies, or trigger IFUNC relink errors
-    DIALOG_BIN="${ROOTFS_DIR}/opt/mocktail/usr/share/mocktail-bundle/mocktail/bin/mocktail_failure_dialog"
-    if [ -f "${DIALOG_BIN}" ] || [ -f "${DIALOG_BIN}.real" ]; then
-        ${SUDO} rm -f "${DIALOG_BIN}" "${DIALOG_BIN}.real"
-        ${SUDO} tee "${DIALOG_BIN}" > /dev/null << 'WRAPPER_EOF'
-#!/bin/sh
-# Mocktail failure and progress dialog stub for AvoryOS
-case "$1" in
-    --message|--warning)
-        echo "[mocktail] $1: $2" >&2
-        ;;
-    --monitor|--progress-monitor)
-        cat >/dev/null 2>&1
-        ;;
-    *)
-        [ -n "$*" ] && echo "[mocktail] Dialog: $*" >&2
-        ;;
-esac
-exit 0
-WRAPPER_EOF
-        ${SUDO} chmod +x "${DIALOG_BIN}"
-    fi
-
-    # Stub mocktail_updater to prevent hanging on online update preflight
-    IN_GUEST_UPDATER="${ROOTFS_DIR}/opt/mocktail/usr/share/mocktail-bundle/mocktail/bin/mocktail_updater"
-    if [ -f "${IN_GUEST_UPDATER}" ] && [ ! -f "${IN_GUEST_UPDATER}.real" ]; then
-        ${SUDO} cp -f "${IN_GUEST_UPDATER}" "${IN_GUEST_UPDATER}.real"
-        ${SUDO} tee "${IN_GUEST_UPDATER}" > /dev/null << 'UPDATER_STUB_EOF'
-#!/bin/sh
-# Mocktail updater stub for AvoryOS - prevents hanging on online update checks
-case "$*" in
-    *verify-current*)
-        exec "${0}.real" "$@"
-        ;;
-    *)
-        exit 0
-        ;;
-esac
-UPDATER_STUB_EOF
-        ${SUDO} chmod +x "${IN_GUEST_UPDATER}"
-    fi
-
-    # Patch update_roblox_payload.sh to bypass APK signature verification
-    UPDATE_SCRIPT="${ROOTFS_DIR}/opt/mocktail/usr/share/mocktail-bundle/mocktail/scripts/update_roblox_payload.sh"
-    if [ -f "${UPDATE_SCRIPT}" ]; then
-        ${SUDO} sed -i 's|apksigner verify.*||g' "${UPDATE_SCRIPT}"
-        ${SUDO} sed -i 's|die "APK signing certificate is not trusted for com.roblox.client"|true|g' "${UPDATE_SCRIPT}"
-        ${SUDO} sed -i 's|die "base and split APKs do not share a signing certificate"|true|g' "${UPDATE_SCRIPT}"
-        ${SUDO} sed -i 's|die "base APK signature verification failed"|true|g' "${UPDATE_SCRIPT}"
-        ${SUDO} sed -i 's|die "split APK signature verification failed"|true|g' "${UPDATE_SCRIPT}"
-    fi
-
-    # Ensure glibc DNS resolver libraries and resolv.conf exist in rootfs
-    ${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_dns.so.2" "${ROOTFS_DIR}/lib64/" 2>/dev/null || true
-    ${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_files.so.2" "${ROOTFS_DIR}/lib64/" 2>/dev/null || true
-    ${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_dns.so.2" "${ROOTFS_DIR}/lib/" 2>/dev/null || true
-    ${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_files.so.2" "${ROOTFS_DIR}/lib/" 2>/dev/null || true
-    ${SUDO} tee "${ROOTFS_DIR}/etc/resolv.conf" > /dev/null << 'RESOLV_EOF'
-nameserver 10.0.2.3
-nameserver 1.1.1.1
-RESOLV_EOF
-
-    echo "[+] AppImage contents installed to /opt/mocktail (signature checks bypassed)"
+APP_DIR="${EXTRACT_DIR}/squashfs-root"
+if [ -f "${APP_DIR}/shared/bin/mocktail" ]; then
+    UPDATER_BIN="${APP_DIR}/shared/bin/mocktail_updater"
+    RUNTIME_LIBRARY_DIR="${APP_DIR}/lib/mocktail"
+    PROJECT_ROOT="${APP_DIR}/share/mocktail"
+    COMPATIBILITY_MANIFEST="${PROJECT_ROOT}/metadata/roblox_compatibility.json"
+    SIGNING_MANIFEST="${PROJECT_ROOT}/metadata/roblox_signing_certificates.json"
+    ABI_REFERENCE="${PROJECT_ROOT}/metadata/roblox_host_abi_reference.json"
+    BOOTSTRAP_SOURCES="${PROJECT_ROOT}/metadata/roblox_bootstrap_sources.json"
+elif [ -f "${APP_DIR}/usr/share/mocktail-bundle/mocktail/bin/mocktail" ]; then
+    LEGACY_ROOT="${APP_DIR}/usr/share/mocktail-bundle/mocktail"
+    UPDATER_BIN="${LEGACY_ROOT}/bin/mocktail_updater"
+    RUNTIME_LIBRARY_DIR="${LEGACY_ROOT}/lib"
+    PROJECT_ROOT="${LEGACY_ROOT}"
+    COMPATIBILITY_MANIFEST="${LEGACY_ROOT}/metadata/roblox_compatibility.json"
+    SIGNING_MANIFEST="${LEGACY_ROOT}/metadata/roblox_signing_certificates.json"
+    ABI_REFERENCE="${LEGACY_ROOT}/metadata/roblox_host_abi_reference.json"
+    BOOTSTRAP_SOURCES="${LEGACY_ROOT}/metadata/roblox_bootstrap_sources.json"
 else
-    # Fallback: AppImage didn't extract properly
-    echo "[!] No squashfs-root found after extraction"
+    echo "[!] Unexpected AppImage layout (Mocktail executable not found)."
     exit 1
 fi
 
-cd "${ROOT_DIR}"
+echo "[*] Installing runtime to ${RUNTIME_INSTALL_DIR}..."
+${SUDO} rm -rf "${BUNDLE_ROOT}"
+${SUDO} mkdir -p "${BUNDLE_ROOT}"
+${SUDO} cp -a "${APP_DIR}/." "${BUNDLE_ROOT}/"
+
+# WebKitGTK 6.0 in the standalone Mocktail bundle looks up its helper
+# processes and injected bundle under the compiled-in namespace path. Normally
+# the portable launcher exposes these through bwrap's /usr overlay, but Avory
+# skips that namespace because it does not implement mount namespaces. Stage
+# links to the bundled files at the same absolute paths so WebKit can spawn
+# WebKitNetworkProcess (and its companion processes) without bwrap.
+PROJECT_RELATIVE="${PROJECT_ROOT#${APP_DIR}/}"
+BUNDLE_PROJECT_ROOT="${BUNDLE_ROOT}/${PROJECT_RELATIVE}"
+WEBKIT_ENV_FILE="${BUNDLE_PROJECT_ROOT}/webkit.env"
+if [ -f "${WEBKIT_ENV_FILE}" ]; then
+    WEBKIT_NAMESPACE_DIR="$(sed -n 's/^MOCKTAIL_WEBKITGTK6_NAMESPACE_DIR=//p' \
+        "${WEBKIT_ENV_FILE}" | sed -n '1p')"
+    case "${WEBKIT_NAMESPACE_DIR}" in
+        /usr/lib/webkitgtk-6.0|/usr/lib64/webkitgtk-6.0|\
+        /usr/libexec/webkitgtk-6.0|/usr/lib/x86_64-linux-gnu/webkitgtk-6.0)
+            WEBKIT_NAMESPACE_SOURCE="${BUNDLE_PROJECT_ROOT}/namespace${WEBKIT_NAMESPACE_DIR}"
+            WEBKIT_SYSTEM_DIR="${ROOTFS_DIR}${WEBKIT_NAMESPACE_DIR}"
+            if [ -d "${WEBKIT_NAMESPACE_SOURCE}" ]; then
+                ${SUDO} mkdir -p "${WEBKIT_SYSTEM_DIR}"
+                for helper in WebKitWebProcess WebKitNetworkProcess WebKitGPUProcess; do
+                    if [ -x "${WEBKIT_NAMESPACE_SOURCE}/${helper}" ]; then
+                        ${SUDO} ln -sfn \
+                            "${RUNTIME_INSTALL_DIR}/${PROJECT_RELATIVE}/namespace${WEBKIT_NAMESPACE_DIR}/${helper}" \
+                            "${WEBKIT_SYSTEM_DIR}/${helper}"
+                    fi
+                done
+                if [ -d "${WEBKIT_NAMESPACE_SOURCE}/injected-bundle" ]; then
+                    ${SUDO} ln -sfn \
+                        "${RUNTIME_INSTALL_DIR}/${PROJECT_RELATIVE}/namespace${WEBKIT_NAMESPACE_DIR}/injected-bundle" \
+                        "${WEBKIT_SYSTEM_DIR}/injected-bundle"
+                fi
+                echo "[+] Exposed bundled WebKitGTK 6.0 helpers at ${WEBKIT_NAMESPACE_DIR}"
+            else
+                echo "[!] WebKit namespace helper directory is missing: ${WEBKIT_NAMESPACE_SOURCE}"
+            fi
+            ;;
+        *)
+            echo "[!] Refusing unexpected WebKit namespace path: ${WEBKIT_NAMESPACE_DIR}"
+            ;;
+    esac
+fi
+
+# Retire the runtimes being replaced. The payload remains at /opt/mocktail/data.
+for stale_runtime in "${ROOTFS_DIR}/opt/mocktail-continuous" "${ROOTFS_DIR}/opt/mocktail-1.0.4"; do
+    if [ -d "${stale_runtime}" ] && [ "${stale_runtime}" != "${BUNDLE_ROOT}" ]; then
+        ${SUDO} rm -rf "${stale_runtime}"
+    fi
+done
+${SUDO} rm -f "${ROOTFS_DIR}/usr/bin/mocktail-continuous" \
+    "${ROOTFS_DIR}/usr/bin/mocktail-nightly" \
+    "${ROOTFS_DIR}/usr/bin/mocktail104" \
+    "${ROOTFS_DIR}/usr/bin/mocktail-1.0.4"
+# Do not leave a system GLX link pointing into the removed 1.0.4 bundle.
+if [ -L "${ROOTFS_DIR}/usr/lib/libGLX.so.1" ] && \
+   [[ "$(readlink "${ROOTFS_DIR}/usr/lib/libGLX.so.1")" == *mocktail-1.0.4* ]]; then
+    ${SUDO} rm -f "${ROOTFS_DIR}/usr/lib/libGLX.so.1"
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Download & extract Roblox payload on host
+# 3. Roblox payload (shared with the legacy install)
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== [3/4] Pre-installing Roblox Payload (Host-Side) ==="
+echo "=== [3/5] Preparing the Roblox payload ==="
 
-BUNDLE_DIR="${ROOTFS_DIR}/opt/mocktail/usr/share/mocktail-bundle/mocktail"
-UPDATER_BIN="${BUNDLE_DIR}/bin/mocktail_updater"
+case "${MOCKTAIL_REFRESH_PAYLOAD}" in
+    0|1) ;;
+    *) echo "[!] MOCKTAIL_REFRESH_PAYLOAD must be 0 or 1"; exit 1 ;;
+esac
 
 NEED_DOWNLOAD=1
 if [ -f "${HOST_DATA_DIR}/mocktail/current.json" ]; then
     CURRENT_PAYLOAD_PATH=$(grep -o '"payload_path": "[^"]*"' "${HOST_DATA_DIR}/mocktail/current.json" 2>/dev/null | cut -d'"' -f4 || true)
     if [ -n "${CURRENT_PAYLOAD_PATH}" ] && [ -f "${HOST_DATA_DIR}/mocktail/${CURRENT_PAYLOAD_PATH}/libroblox.so" ]; then
-        echo "[*] Found existing valid Roblox payload in cache: ${CURRENT_PAYLOAD_PATH}"
-        NEED_DOWNLOAD=0
+        if [ "${MOCKTAIL_REFRESH_PAYLOAD}" = "1" ]; then
+            echo "[*] Cached Roblox payload found; checking for the newest supported x86_64 build..."
+        else
+            echo "[*] Using cached Roblox payload offline: ${CURRENT_PAYLOAD_PATH}"
+            NEED_DOWNLOAD=0
+        fi
     fi
 fi
 
 if [ "${NEED_DOWNLOAD}" -eq 1 ]; then
-    echo "[*] Running mocktail_updater on host to download supported Roblox payload..."
+    echo "[*] Running mocktail_updater on host to download a supported Roblox payload..."
     if [ ! -x "${UPDATER_BIN}" ]; then
         echo "[!] mocktail_updater binary not found at ${UPDATER_BIN}"
         exit 1
     fi
-
-    LD_LIBRARY_PATH="${BUNDLE_DIR}/lib:${BUNDLE_DIR}/bin:/lib64:/usr/lib64:${LD_LIBRARY_PATH:-}" \
-    MOCKTAIL_PROJECT_ROOT="${BUNDLE_DIR}" \
-    MOCKTAIL_COMPATIBILITY_MANIFEST="${BUNDLE_DIR}/metadata/roblox_compatibility.json" \
-    MOCKTAIL_UPDATE_COMPATIBILITY_PATH="${BUNDLE_DIR}/metadata/roblox_compatibility.json" \
-    MOCKTAIL_UPDATE_SIGNING_TRUST_PATH="${BUNDLE_DIR}/metadata/roblox_signing_certificates.json" \
-    MOCKTAIL_UPDATE_HOST_ABI_REFERENCE="${BUNDLE_DIR}/metadata/roblox_host_abi_reference.json" \
-    MOCKTAIL_BOOTSTRAP_SOURCES_PATH="${BUNDLE_DIR}/metadata/roblox_bootstrap_sources.json" \
-    XDG_DATA_HOME="${HOST_DATA_DIR}" \
-    "${UPDATER_BIN}" update --skip-canary || {
-        echo "[!] mocktail_updater failed during host-side download"
-        exit 1
-    }
+    env \
+        LD_LIBRARY_PATH="${APP_DIR}/lib:${RUNTIME_LIBRARY_DIR}:/lib64:/usr/lib64:${LD_LIBRARY_PATH:-}" \
+        MOCKTAIL_RUNTIME_LIBRARY_DIR="${RUNTIME_LIBRARY_DIR}" \
+        MOCKTAIL_PROJECT_ROOT="${PROJECT_ROOT}" \
+        MOCKTAIL_PACKAGED_COMPATIBILITY_MANIFEST="${COMPATIBILITY_MANIFEST}" \
+        MOCKTAIL_UPDATE_COMPATIBILITY_PATH="${COMPATIBILITY_MANIFEST}" \
+        MOCKTAIL_UPDATE_SIGNING_TRUST_PATH="${SIGNING_MANIFEST}" \
+        MOCKTAIL_UPDATE_HOST_ABI_REFERENCE="${ABI_REFERENCE}" \
+        MOCKTAIL_BOOTSTRAP_SOURCES_PATH="${BOOTSTRAP_SOURCES}" \
+        MOCKTAIL_PORTABLE_MODE=standalone \
+        XDG_DATA_HOME="${HOST_DATA_DIR}" \
+        XDG_CACHE_HOME="${HOST_DATA_DIR}/cache" \
+        XDG_STATE_HOME="${HOST_DATA_DIR}/state" \
+        MOCKTAIL_DATA_ROOT="${HOST_DATA_DIR}/mocktail" \
+        MOCKTAIL_CACHE_ROOT="${HOST_DATA_DIR}/cache/mocktail" \
+        "${UPDATER_BIN}" update --skip-canary || {
+            echo "[!] mocktail_updater failed during host-side download"
+            exit 1
+        }
     echo "[+] Download and extraction complete on host"
 fi
 
-# Clean up failed / inactive candidate payloads to conserve disk space
-if [ -d "${HOST_DATA_DIR}/mocktail/payloads" ] && [ -f "${HOST_DATA_DIR}/mocktail/current.json" ]; then
-    ACTIVE_PAYLOAD=$(grep -o '"payload_id": "[^"]*"' "${HOST_DATA_DIR}/mocktail/current.json" 2>/dev/null | cut -d'"' -f4 || true)
-    for pdir in "${HOST_DATA_DIR}/mocktail/payloads"/*; do
-        if [ -d "${pdir}" ]; then
-            pname=$(basename "${pdir}")
-            if [ -n "${ACTIVE_PAYLOAD}" ] && [ "${pname}" != "${ACTIVE_PAYLOAD}" ]; then
-                echo "[*] Cleaning up inactive payload candidate: ${pname}"
-                rm -rf "${pdir}"
-            fi
-        fi
-    done
+# Do not continue with a stale or incomplete selection after an updater run.
+ACTIVE_PAYLOAD_PATH=$(grep -o '"payload_path": "[^"]*"' \
+    "${HOST_DATA_DIR}/mocktail/current.json" 2>/dev/null | cut -d'"' -f4 || true)
+ACTIVE_PAYLOAD=$(grep -o '"payload_id": "[^"]*"' \
+    "${HOST_DATA_DIR}/mocktail/current.json" 2>/dev/null | cut -d'"' -f4 || true)
+ACTIVE_PAYLOAD_VERSION=$(grep -o '"version_name": "[^"]*"' \
+    "${HOST_DATA_DIR}/mocktail/${ACTIVE_PAYLOAD_PATH}/roblox_payload.json" \
+    2>/dev/null | cut -d'"' -f4 || true)
+if [[ ! "${ACTIVE_PAYLOAD}" =~ ^[0-9]+-[0-9a-f]{40}$ ]] || \
+   [ "${ACTIVE_PAYLOAD_PATH}" != "payloads/${ACTIVE_PAYLOAD}" ] || \
+   [ ! -f "${HOST_DATA_DIR}/mocktail/${ACTIVE_PAYLOAD_PATH}/libroblox.so" ] || \
+   [ -z "${ACTIVE_PAYLOAD_VERSION}" ]; then
+    echo "[!] Updater did not leave a valid supported Roblox payload selected."
+    exit 1
 fi
 
-# Copy payload to /opt/mocktail/data (shared system location, no duplication)
-echo "[*] Installing Roblox payload into /opt/mocktail/data..."
-${SUDO} mkdir -p "${ROOTFS_DIR}/opt/mocktail"
-${SUDO} rm -rf "${ROOTFS_DIR}/opt/mocktail/data"
-${SUDO} cp -rf "${HOST_DATA_DIR}/mocktail" "${ROOTFS_DIR}/opt/mocktail/data"
-${SUDO} chmod -R a+rX "${ROOTFS_DIR}/opt/mocktail/data"
+# Stage only the selected payload. Inactive updater candidates can be
+# read-only (or partially downloaded), and are neither needed by the guest nor
+# safe to remove from the updater's cache. The disk image keeps its Android
+# userdata independently; only the active payload and manifest are refreshed.
+echo "[*] Staging payload in /opt/mocktail/data..."
+${SUDO} rm -rf "${DATA_ROOT}"
+${SUDO} mkdir -p "${DATA_ROOT}/payloads"
+${SUDO} cp -a "${HOST_DATA_DIR}/mocktail/current.json" "${DATA_ROOT}/current.json"
+${SUDO} cp -a "${HOST_DATA_DIR}/mocktail/${ACTIVE_PAYLOAD_PATH}" \
+    "${DATA_ROOT}/${ACTIVE_PAYLOAD_PATH}"
+${SUDO} chmod -R a+rwX "${DATA_ROOT}"
+if [ -d "${DATA_ROOT}/android/data/files/appData/LocalStorage" ] && \
+   [ ! -e "${DATA_ROOT}/android/data/files/appData/localStorage" ]; then
+    ${SUDO} ln -s LocalStorage \
+        "${DATA_ROOT}/android/data/files/appData/localStorage"
+fi
 
-# Pre-cache NotoSansCJK fallback font so Roblox never downloads 16MB CJK font over network
-for pdir in "${ROOTFS_DIR}/opt/mocktail/data/payloads"/*; do
+# Pre-cache the NotoSansCJK fallback font so Roblox never downloads it.
+for pdir in "${DATA_ROOT}/payloads"/*; do
     if [ -d "${pdir}/assets" ]; then
         FONT_DST="${pdir}/assets/fonts/NotoSansCJK-Regular.otf"
         JSON_DST="${pdir}/assets/content/fonts/families/NotoSansCJKFallback.json"
@@ -267,14 +326,155 @@ for pdir in "${ROOTFS_DIR}/opt/mocktail/data/payloads"/*; do
     fi
 done
 
-# Link active payload to /opt/mocktail/roblox for instant startup without update checks
-ACTIVE_PAYLOAD_PATH=$(grep -o '"payload_path": "[^"]*"' "${ROOTFS_DIR}/opt/mocktail/data/current.json" 2>/dev/null | cut -d'"' -f4 || true)
-if [ -n "${ACTIVE_PAYLOAD_PATH}" ]; then
-    ${SUDO} ln -sfn "data/${ACTIVE_PAYLOAD_PATH}" "${ROOTFS_DIR}/opt/mocktail/roblox"
-    echo "[+] Linked active Roblox payload to /opt/mocktail/roblox"
+# Ensure glibc DNS resolver libraries and resolv.conf exist in the rootfs
+# (the bundled glibc also ships libnss_*, this keeps the system paths valid).
+${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_dns.so.2" "${ROOTFS_DIR}/lib64/" 2>/dev/null || true
+${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_files.so.2" "${ROOTFS_DIR}/lib64/" 2>/dev/null || true
+${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_dns.so.2" "${ROOTFS_DIR}/lib/" 2>/dev/null || true
+${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_files.so.2" "${ROOTFS_DIR}/lib/" 2>/dev/null || true
+
+# Avory's base runtime is musl. Install the real glibc runtime privately so
+# the glibc-only Mocktail 1.0.3 standalone bundle can run. gcompat's ld-linux
+# and libc.so.6 stubs are not sufficient for this bundle. Musl programs
+# continue to use ld-musl-x86_64.so.1.
+GLIBC_SYSROOT="${ROOT_DIR}/toolchain/glibc-sysroot"
+if [ ! -s "${GLIBC_SYSROOT}/lib/ld-linux-x86-64.so.2" ] || \
+   [ ! -s "${GLIBC_SYSROOT}/lib/libc.so.6" ]; then
+    echo "[!] A built x86_64 glibc sysroot is required. Run ./scripts/glibc-toolchain.sh first."
+    exit 1
+fi
+echo "[*] Installing glibc compatibility runtime alongside musl..."
+GLIBC_COMPAT_DIR="${ROOTFS_DIR}/opt/avory-glibc/lib"
+${SUDO} mkdir -p "${GLIBC_COMPAT_DIR}"
+for glibc_library in "${GLIBC_SYSROOT}"/lib/*.so.*; do
+    [ -e "${glibc_library}" ] || continue
+    ${SUDO} cp -a "${glibc_library}" "${GLIBC_COMPAT_DIR}/"
+done
+${SUDO} cp -a "${GLIBC_SYSROOT}/lib/ld-linux-x86-64.so.2" "${GLIBC_COMPAT_DIR}/ld-linux-x86-64.so.2"
+echo "[*] Staging glibc Mesa/EGL software graphics stack..."
+# Avory's /usr/lib contains musl-linked Mesa libraries and cannot serve the
+# glibc Mocktail process. Stage the build host's glibc Mesa/GLVND stack and
+# software DRI driver privately, including each library's resolved dependency
+# closure. This gives SDL/EGL a usable llvmpipe backend without mixing libc.
+find_host_library() {
+    local soname="$1" path=""
+    if command -v ldconfig >/dev/null 2>&1; then
+        # Consume all output; an early awk exit trips pipefail via SIGPIPE.
+        path="$(ldconfig -p 2>/dev/null | awk -v soname="${soname}" '$1 == soname && !found { path=$NF; found=1 } END { if (found) print path }')"
+    fi
+    if [ -z "${path}" ] && [ -e "/usr/lib/${soname}" ]; then
+        path="/usr/lib/${soname}"
+    fi
+    printf '%s' "${path}"
+}
+
+MESA_HOST_LIBS=()
+for host_soname in \
+    libdrm.so.2 libgbm.so.1 libexpat.so.1 \
+    libEGL.so.1 libEGL_mesa.so.0 libGLdispatch.so.0 \
+    libGL.so.1 libGLX.so.0 libGLX_mesa.so.0 libOpenGL.so.0 libGLESv2.so.2; do
+    host_library="$(find_host_library "${host_soname}")"
+    if [ -n "${host_library}" ] && [ -f "${host_library}" ] && \
+       readelf -d "${host_library}" 2>/dev/null | grep -q 'Shared library: \[libc.so.6\]' && \
+       ! readelf -d "${host_library}" 2>/dev/null | grep -q 'libc.musl'; then
+        ${SUDO} cp -L "${host_library}" "${GLIBC_COMPAT_DIR}/${host_soname}"
+        MESA_HOST_LIBS+=("${host_library}")
+        echo "[+] Staged ${host_soname} from ${host_library}"
+    else
+        echo "[!] Missing glibc-linked ${host_soname} on the build host."
+    fi
+done
+
+HOST_DRI_DIR="${LIBGL_DRIVERS_PATH:-/usr/lib/dri}"
+if [ -f "${HOST_DRI_DIR}/swrast_dri.so" ]; then
+    ${SUDO} mkdir -p "${ROOTFS_DIR}/opt/avory-glibc/dri"
+    ${SUDO} cp -L "${HOST_DRI_DIR}/swrast_dri.so" "${ROOTFS_DIR}/opt/avory-glibc/dri/swrast_dri.so"
+    MESA_HOST_LIBS+=("${HOST_DRI_DIR}/swrast_dri.so")
+    echo "[+] Staged software DRI driver from ${HOST_DRI_DIR}/swrast_dri.so"
+else
+    echo "[!] No host swrast_dri.so found at ${HOST_DRI_DIR}; software EGL may not initialize."
 fi
 
-# Create default configuration in /opt/mocktail/config
+if command -v ldd >/dev/null 2>&1; then
+    for host_library in "${MESA_HOST_LIBS[@]}"; do
+        while IFS= read -r dependency; do
+            dependency_soname="$(basename "${dependency}")"
+            case "${dependency_soname}" in
+                ld-linux-x86-64.so.2|libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|libresolv.so.2|libutil.so.1|libanl.so.1|libBrokenLocale.so.1|libnss_*.so.*)
+                    continue
+                    ;;
+            esac
+            [ -f "${dependency}" ] || continue
+            ${SUDO} cp -L "${dependency}" "${GLIBC_COMPAT_DIR}/${dependency_soname}"
+        done < <(ldd "${host_library}" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }' | sort -u)
+    done
+fi
+
+MESA_VENDOR_DIR="${ROOTFS_DIR}/opt/avory-glibc/share/glvnd/egl_vendor.d"
+${SUDO} mkdir -p "${MESA_VENDOR_DIR}"
+if [ -f /usr/share/glvnd/egl_vendor.d/50_mesa.json ]; then
+    ${SUDO} cp -f /usr/share/glvnd/egl_vendor.d/50_mesa.json "${MESA_VENDOR_DIR}/50_mesa.json"
+else
+    ${SUDO} tee "${MESA_VENDOR_DIR}/50_mesa.json" > /dev/null <<'MESA_VENDOR_EOF'
+{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_mesa.so.0"}}
+MESA_VENDOR_EOF
+fi
+echo "[*] Installing glibc loader links in the rootfs..."
+${SUDO} rm -f "${ROOTFS_DIR}/lib/ld-linux-x86-64.so.2" "${ROOTFS_DIR}/lib/libc.so.6"
+${SUDO} ln -s /opt/avory-glibc/lib/ld-linux-x86-64.so.2 "${ROOTFS_DIR}/lib/ld-linux-x86-64.so.2"
+${SUDO} ln -s /opt/avory-glibc/lib/libc.so.6 "${ROOTFS_DIR}/lib/libc.so.6"
+${SUDO} touch "${ROOTFS_DIR}/etc/avory-glibc-runtime"
+
+# Mocktail asks for ~5 MB guardless pthread stacks, but its Main thread needs
+# ~5 MB + a few KB at startup and dies with SIGSEGV in __libc_ns_samename.
+# The kernel cannot resize an app-sized stack, so ship a tiny LD_PRELOAD shim
+# (glibc-linked) that clamps thread stacks to >= 8 MB + 4 KB guard. Larger
+# stacks and explicit mappings pass through untouched.
+echo "[*] Building pthread stack-clamp shim..."
+GLIBC_CC="${ROOT_DIR}/toolchain/x86_64-linux-glibc/bin/x86_64-buildroot-linux-gnu-gcc"
+GLIBC_SYSROOT_DIR="${ROOT_DIR}/toolchain/glibc-sysroot"
+if [ ! -x "${GLIBC_CC}" ]; then
+    echo "[!] glibc toolchain missing at ${GLIBC_CC}. Run ./scripts/glibc-toolchain.sh first."
+    exit 1
+fi
+"${GLIBC_CC}" -shared -fPIC -O2 -Wall -Wextra -fno-stack-protector \
+    --sysroot="${GLIBC_SYSROOT_DIR}" \
+    "${ROOT_DIR}/scripts/mocktail-stack-shim.c" \
+    -o "${MOCKTAIL_BUILD_DIR}/mocktail-stack-shim.so" -ldl
+${SUDO} cp -f "${MOCKTAIL_BUILD_DIR}/mocktail-stack-shim.so" \
+    "${ROOTFS_DIR}/opt/avory-glibc/lib/mocktail-stack-shim.so"
+echo "[+] Installed stack-clamp shim to /opt/avory-glibc/lib"
+
+# The upstream 1.0.3 preflight equates the shell's libc with the host ABI.
+# Avory now has a real glibc loader and libraries for glibc applications, even
+# though its base shell remains musl. Teach the bundled check to detect that
+# installed runtime, and refresh the bundle's integrity entry for this local
+# packaging adaptation.
+PORTABLE_LAUNCHER="${BUNDLE_ROOT}/usr/share/mocktail-bundle/mocktail/scripts/portable_launcher.sh"
+PORTABLE_CHECKSUMS="${BUNDLE_ROOT}/usr/share/mocktail-bundle/mocktail/metadata/SHA256SUMS.txt"
+if [ -f "${PORTABLE_LAUNCHER}" ] && [ -f "${PORTABLE_CHECKSUMS}" ]; then
+    if ! grep -Fq 'avory-glibc-runtime' "${PORTABLE_LAUNCHER}"; then
+        ${SUDO} sed -i '/DetectHostLibc() {/a\
+  if [[ -e /etc/avory-glibc-runtime && -x /lib64/ld-linux-x86-64.so.2 ]]; then\
+    printf glibc\
+    return 0\
+  fi' "${PORTABLE_LAUNCHER}"
+        PORTABLE_SHA256="$(sha256sum "${PORTABLE_LAUNCHER}" | cut -d' ' -f1)"
+        ${SUDO} sed -i "s|^[0-9a-fA-F]*  ./mocktail/scripts/portable_launcher.sh$|${PORTABLE_SHA256}  ./mocktail/scripts/portable_launcher.sh|" "${PORTABLE_CHECKSUMS}"
+    fi
+fi
+${SUDO} tee "${ROOTFS_DIR}/etc/resolv.conf" > /dev/null << 'RESOLV_EOF'
+nameserver 10.0.2.3
+nameserver 1.1.1.1
+RESOLV_EOF
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Launcher scripts, configs and desktop entry
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== [4/5] Creating launchers and configuration ==="
+
+# Default configuration (used on first launch).
 ${SUDO} mkdir -p "${ROOTFS_DIR}/opt/mocktail/config"
 ${SUDO} tee "${ROOTFS_DIR}/opt/mocktail/config/config.yaml" > /dev/null << 'CONFIG_EOF'
 version: 1
@@ -303,7 +503,6 @@ ${SUDO} tee "${ROOTFS_DIR}/opt/mocktail/config/fflags.json" > /dev/null << 'FFLA
   "FFlagDebugGraphicsPreferVulkan": "False",
   "FFlagDebugGraphicsPreferOpenGL": "True",
   "DFIntTaskSchedulerTargetFps": "60",
-  "FFlagDebugDisableAudio": "True",
   "FFlagDisablePostFx": "True",
   "FIntRenderShadowIntensity": "0",
   "FFlagGlobalWindRendering": "False",
@@ -334,157 +533,86 @@ ${SUDO} tee "${ROOTFS_DIR}/opt/mocktail/config/fflags.json" > /dev/null << 'FFLA
 FFLAGS_EOF
 ${SUDO} chmod 644 "${ROOTFS_DIR}/opt/mocktail/config/fflags.json"
 
-# Create symlinks and default configs for root and user avory
-${SUDO} mkdir -p "${ROOTFS_DIR}/root/.local/share"
-${SUDO} rm -rf "${ROOTFS_DIR}/root/.local/share/mocktail"
-${SUDO} ln -sfn /opt/mocktail/data "${ROOTFS_DIR}/root/.local/share/mocktail"
-
-${SUDO} mkdir -p "${ROOTFS_DIR}/root/.config/mocktail"
-${SUDO} cp -f "${ROOTFS_DIR}/opt/mocktail/config/config.yaml" "${ROOTFS_DIR}/root/.config/mocktail/config.yaml"
-${SUDO} cp -f "${ROOTFS_DIR}/opt/mocktail/config/fflags.json" "${ROOTFS_DIR}/root/.config/mocktail/fflags.json"
-
-${SUDO} mkdir -p "${ROOTFS_DIR}/home/avory/.local/share"
-${SUDO} rm -rf "${ROOTFS_DIR}/home/avory/.local/share/mocktail"
-${SUDO} ln -sfn /opt/mocktail/data "${ROOTFS_DIR}/home/avory/.local/share/mocktail"
-
-${SUDO} mkdir -p "${ROOTFS_DIR}/home/avory/.config/mocktail"
-${SUDO} cp -f "${ROOTFS_DIR}/opt/mocktail/config/config.yaml" "${ROOTFS_DIR}/home/avory/.config/mocktail/config.yaml"
-${SUDO} cp -f "${ROOTFS_DIR}/opt/mocktail/config/fflags.json" "${ROOTFS_DIR}/home/avory/.config/mocktail/config.json" 2>/dev/null || true
-${SUDO} cp -f "${ROOTFS_DIR}/opt/mocktail/config/fflags.json" "${ROOTFS_DIR}/home/avory/.config/mocktail/fflags.json"
-${SUDO} chown -R 1000:1000 "${ROOTFS_DIR}/home/avory/.local" "${ROOTFS_DIR}/home/avory/.config" 2>/dev/null || true
-
-${SUDO} mkdir -p "${ROOTFS_DIR}/.local/share"
-${SUDO} rm -rf "${ROOTFS_DIR}/.local/share/mocktail"
-${SUDO} ln -sfn /opt/mocktail/data "${ROOTFS_DIR}/.local/share/mocktail"
-
-${SUDO} mkdir -p "${ROOTFS_DIR}/.config/mocktail"
-${SUDO} cp -f "${ROOTFS_DIR}/opt/mocktail/config/config.yaml" "${ROOTFS_DIR}/.config/mocktail/config.yaml"
-${SUDO} cp -f "${ROOTFS_DIR}/opt/mocktail/config/fflags.json" "${ROOTFS_DIR}/.config/mocktail/fflags.json"
-echo "[+] Roblox payload installed in /opt/mocktail/data"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Create launcher script, desktop entry, and inject into disk.img
-# ─────────────────────────────────────────────────────────────────────────────
-echo ""
-echo "=== [4/4] Creating launcher and injecting into disk.img ==="
-
-# Create wrapper script
-${SUDO} tee "${ROOTFS_DIR}/usr/bin/mocktail" > /dev/null << 'LAUNCHER_EOF'
+# Launcher for the runtime.  Running through AppRun / sharun ensures the
+# bundled glibc ld-linux dynamic linker and runtime hooks are used, avoiding
+# symbol lookup errors against host/guest musl libc.
+${SUDO} mkdir -p "${ROOTFS_DIR}/usr/bin"
+${SUDO} tee "${ROOTFS_DIR}/usr/bin/mocktail-${MOCKTAIL_VERSION}" > /dev/null << 'LAUNCHER_EOF'
 #!/bin/sh
-# Mocktail fast direct launcher for AvoryOS
+# Mocktail __VERSION__ launcher for AvoryOS (installed by setup-mocktail.sh).
+#
+# Runs the AppImage's AppRun entry point with the environment its runtime
+# expects, reuses the shared Roblox payload in /opt/mocktail/data, and
+# never starts a payload download from the guest.
 
-export DISPLAY="${DISPLAY:-:0}"
-export APPDIR="/opt/mocktail"
+APPDIR="__RUNTIME_INSTALL_DIR__"
+export APPDIR
 
-BUNDLE_ROOT="/opt/mocktail/usr/share/mocktail-bundle"
-RUNTIME_ROOT="${BUNDLE_ROOT}/mocktail"
-SUPPORT_ROOT="${RUNTIME_ROOT}/runtime"
-
-export PATH="${SUPPORT_ROOT}/bin:${RUNTIME_ROOT}/runtime/android-tools/bin:${PATH}"
-export LD_LIBRARY_PATH="${RUNTIME_ROOT}/lib:${RUNTIME_ROOT}/bin:/lib64:/usr/lib64:/lib:/usr/lib:${LD_LIBRARY_PATH}"
-
-# Mocktail configuration paths
-export MOCKTAIL_FREEBSD_SOCKET_HELPER="${RUNTIME_ROOT}/bin/mocktail_freebsd_socket_helper"
-export MOCKTAIL_PROJECT_ROOT="${RUNTIME_ROOT}"
-export MOCKTAIL_COMPATIBILITY_MANIFEST="${RUNTIME_ROOT}/metadata/roblox_compatibility.json"
-export MOCKTAIL_UPDATE_COMPATIBILITY_PATH="${RUNTIME_ROOT}/metadata/roblox_compatibility.json"
-export MOCKTAIL_UPDATE_SIGNING_TRUST_PATH="${RUNTIME_ROOT}/metadata/roblox_signing_certificates.json"
-export MOCKTAIL_UPDATE_HOST_ABI_REFERENCE="${RUNTIME_ROOT}/metadata/roblox_host_abi_reference.json"
-export MOCKTAIL_BOOTSTRAP_SOURCES_PATH="${RUNTIME_ROOT}/metadata/roblox_bootstrap_sources.json"
-export MOCKTAIL_UPDATE_HELPER="${RUNTIME_ROOT}/bin/mocktail_updater"
-export MOCKTAIL_UPDATE_CANARY_BIN="${RUNTIME_ROOT}/bin/mocktail"
-export MOCKTAIL_UPDATE_SMOKE_SCRIPT="${RUNTIME_ROOT}/scripts/real_bringup_smoke.sh"
-export MOCKTAIL_BIN="${RUNTIME_ROOT}/bin/mocktail"
-export MOCKTAIL_PORTABLE_MODE="standalone"
-
-# Python & Java runtimes
-export PYTHONHOME="${SUPPORT_ROOT}/python"
-unset PYTHONPATH PYTHONUSERBASE
-export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
-export JAVA_HOME="${SUPPORT_ROOT}/jre"
-export SSL_CERT_FILE="${SUPPORT_ROOT}/share/ca-certificates/ca-bundle.crt"
-export REQUESTS_CA_BUNDLE="${SSL_CERT_FILE}"
-
-# WebKit & GStreamer configuration
-export WEBKIT_EXEC_PATH="${RUNTIME_ROOT}/libexec/webkitgtk-6.0"
-export WEBKIT_INJECTED_BUNDLE_PATH="${RUNTIME_ROOT}/lib/webkitgtk-6.0/injected-bundle"
-export GST_PLUGIN_PATH_1_0="${RUNTIME_ROOT}/lib/plugins/gstreamer-1.0"
-export GST_PLUGIN_SYSTEM_PATH_1_0=""
-export GST_PLUGIN_SCANNER="${RUNTIME_ROOT}/libexec/gstreamer-1.0/gst-plugin-scanner"
-export GIO_EXTRA_MODULES="${RUNTIME_ROOT}/lib/plugins/gio/modules"
-export GIO_USE_TLS="gnutls"
-export GDK_PIXBUF_MODULE_FILE="${RUNTIME_ROOT}/lib/plugins/gdk-pixbuf-2.0/2.10.0/loaders.cache"
-export GLYCIN_DATA_DIR="${RUNTIME_ROOT}/share/glycin-loaders/2+"
-export GSETTINGS_SCHEMA_DIR="${RUNTIME_ROOT}/share/glib-2.0/schemas"
-export XDG_DATA_DIRS="${RUNTIME_ROOT}/share${XDG_DATA_DIRS:+:${XDG_DATA_DIRS}}"
-
-# Disable sandboxes that require unshare / user namespaces
-export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
-export WEBKIT_FORCE_SANDBOX=0
-export MOCKTAIL_SKIP_NAMESPACE_CHECK=1
-export MOCKTAIL_STANDALONE_NAMESPACE=1
-export MOCKTAIL_SKIP_HOST_CHECK=1
+export MOCKTAIL_DATA_ROOT="${MOCKTAIL_DATA_ROOT:-/opt/mocktail/data}"
 export MOCKTAIL_SKIP_UPDATE_CHECK=1
-export MOCKTAIL_DATA_ROOT="/opt/mocktail/data"
+export MOCKTAIL_PORTABLE_MODE=standalone
+export MOCKTAIL_DISABLE_FAILURE_DIALOG=1
+# Avory does not implement mount namespaces; avoid the bundle's bwrap wrapper,
+# which otherwise tries mount(NULL, "/", MS_SLAVE|MS_REC) and aborts.
+export MOCKTAIL_SKIP_NAMESPACE_CHECK=1
+# Keep the glibc app isolated from Avory's musl-linked /usr/lib libraries.
+# Required host-side compatibility libraries are staged into this private dir.
+export LD_LIBRARY_PATH="/opt/avory-glibc/lib"
+# Widen mocktail's undersized pthread stacks (5 MB guardless overflows in its
+# Main thread). The shim only raises stacks below 8 MB / guards below 4 KB.
+# Disable with MOCKTAIL_STACK_SHIM_OFF=1.
+export LD_PRELOAD="/opt/avory-glibc/lib/mocktail-stack-shim.so${LD_PRELOAD:+:$LD_PRELOAD}"
 
-# OpenGL/EGL configuration (software rendering via llvmpipe)
+# Roblox currently spells this directory `localStorage`, while the staged
+# Android data tree from the payload uses `LocalStorage`. Linux paths are
+# case-sensitive, so the lowercase path otherwise fails with ENOENT during
+# app startup. Keep both spellings pointed at the same writable data.
+ANDROID_APPDATA="${MOCKTAIL_DATA_ROOT}/android/data/files/appData"
+if [ -d "${ANDROID_APPDATA}/LocalStorage" ] && [ ! -e "${ANDROID_APPDATA}/localStorage" ]; then
+    ln -s LocalStorage "${ANDROID_APPDATA}/localStorage" 2>/dev/null || true
+else
+    mkdir -p "${ANDROID_APPDATA}/localStorage"
+fi
+
+# AvoryOS: a killed Mocktail run can leave its external-launch socket behind.
+ENDPOINT_DIR="/tmp/mocktail-$(id -u 2>/dev/null || echo 0)"
+if ! pgrep -f "mocktail" >/dev/null 2>&1; then
+    rm -rf "${ENDPOINT_DIR}" 2>/dev/null || true
+    find "${MOCKTAIL_DATA_ROOT}" -name "*.lock" -delete 2>/dev/null || true
+fi
+
+# Windowing and software OpenGL.
+export DISPLAY="${DISPLAY:-:0}"
+export SDL_VIDEODRIVER=x11
+# Let SDL3 select the real system audio backend (ALSA/PulseAudio/PipeWire).
+# Clear inherited overrides so Mocktail cannot accidentally get the dummy
+# backend from a shell or desktop launcher environment.
+unset SDL_AUDIODRIVER
 export LIBGL_ALWAYS_SOFTWARE=1
 export GALLIUM_DRIVER=llvmpipe
-export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
-export LIBGL_DRIVERS_PATH=/usr/lib/xorg/modules/dri
-export LP_NUM_THREADS=$(nproc 2>/dev/null || echo 4)
-export MESA_NO_ERROR=1
+export MESA_LOADER_DRIVER_OVERRIDE=swrast
+export LIBGL_DRIVERS_PATH=/opt/avory-glibc/dri
+export __EGL_VENDOR_LIBRARY_FILENAMES=/opt/avory-glibc/share/glvnd/egl_vendor.d/50_mesa.json
 export MESA_GL_VERSION_OVERRIDE=3.3
 export MESA_GLSL_VERSION_OVERRIDE=330
+export WEBKIT_DISABLE_COMPOSITING_MODE=1
+export XCURSOR_THEME=Adwaita
+export XCURSOR_SIZE=24
+export XCURSOR_PATH=/usr/share/icons:/usr/share/pixmaps
+# On the guest X11 path SDL can enter relative mode while Roblox is still on
+# its menu. Keep the SDL system cursor visible in that mode and use SDL's
+# default system cursor instead of inheriting a missing/empty cursor shape.
+export SDL_MOUSE_RELATIVE_CURSOR_VISIBLE=1
+export SDL_MOUSE_DEFAULT_SYSTEM_CURSOR=0
+# Do not inherit verbose SDL diagnostics from the shell or desktop session.
+unset SDL_LOGGING SDL_EVENT_LOGGING
 
-# Disable broken GTK4 failure dialog
-export MOCKTAIL_DISABLE_FAILURE_DIALOG=1
-
-# SDL / X11 Windowing
-export SDL_VIDEO_DRIVER=x11
-export MOCKTAIL_FORCE_X11=1
-export MOCKTAIL_DEBUG_SHOW_WINDOW_BEFORE_FRAME=1
-export MOCKTAIL_HIDE_WINDOW_UNTIL_FIRST_SWAP=0
-
-# Disable audio for now (SDL dummy driver)
-export SDL_AUDIODRIVER=dummy
-
-# XDG directories
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME:-/root}/.config}"
 export XDG_DATA_HOME="${XDG_DATA_HOME:-${HOME:-/root}/.local/share}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME:-/root}/.cache}"
-mkdir -p "${XDG_CONFIG_HOME}/mocktail" "${XDG_DATA_HOME}" "${XDG_CACHE_HOME}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-${HOME:-/root}/.local/state}"
 
-# If no user payload, link to shared system payload
-MOCKTAIL_SYSTEM_DATA="/opt/mocktail/data"
-MOCKTAIL_USER_DATA="${XDG_DATA_HOME}/mocktail"
-if [ ! -f "${MOCKTAIL_USER_DATA}/current.json" ] && [ -f "${MOCKTAIL_SYSTEM_DATA}/current.json" ]; then
-    mkdir -p "${XDG_DATA_HOME}"
-    rm -rf "${MOCKTAIL_USER_DATA}"
-    ln -sfn "${MOCKTAIL_SYSTEM_DATA}" "${MOCKTAIL_USER_DATA}"
-fi
-
-# Ensure user config.yaml is cleanly installed without directory collisions
-rm -rf "${XDG_CONFIG_HOME}/mocktail/config.yaml"
-if [ -f "/opt/mocktail/config/config.yaml" ]; then
-    cp -f /opt/mocktail/config/config.yaml "${XDG_CONFIG_HOME}/mocktail/config.yaml"
-fi
-if [ -f "${XDG_CONFIG_HOME}/mocktail/config.yaml" ]; then
-    sed -i 's/backend:[[:space:]]*direct-vulkan/backend: opengl/g' "${XDG_CONFIG_HOME}/mocktail/config.yaml" 2>/dev/null || true
-    sed -i '/roblox_library:/d' "${XDG_CONFIG_HOME}/mocktail/config.yaml" 2>/dev/null || true
-fi
-
-# Sync default fflags to user config so patch-disabling flags and optimizations are always applied
-rm -rf "${XDG_CONFIG_HOME}/mocktail/fflags.json"
-if [ -f "/opt/mocktail/config/fflags.json" ]; then
-    mkdir -p "${XDG_CONFIG_HOME}/mocktail"
-    cp -f /opt/mocktail/config/fflags.json "${XDG_CONFIG_HOME}/mocktail/fflags.json"
-fi
-
-# Ensure Roblox cache directory exists
-mkdir -p "${XDG_DATA_HOME}/mocktail/android/data/user/0/com.roblox.client/cache" 2>/dev/null || true
-
-# Pass --graphics opengl if not explicitly specified
+# Default to the software OpenGL backend unless the user picked one.
 has_graphics=0
 for arg in "$@"; do
     case "$arg" in
@@ -495,34 +623,33 @@ if [ "$has_graphics" -eq 0 ]; then
     set -- --graphics opengl "$@"
 fi
 
-# AvoryOS: a killed Mocktail run can leave its external-launch socket behind.
-# The broker only unlinks sockets it considers stale, and a bind() over the
-# leftover node has failed with EINVAL here ("cannot activate external-launch
-# socket: Invalid argument"), aborting startup before any window exists.
-# Clear the per-user endpoint directory when no other instance is alive.
-ENDPOINT_DIR="/tmp/mocktail-$(id -u 2>/dev/null || echo 0)"
-if ! pgrep -f "mocktail-bundle/mocktail/bin/mocktail" >/dev/null 2>&1; then
-    rm -rf "${ENDPOINT_DIR}" 2>/dev/null || true
-fi
-
-echo "[mocktail] Starting Mocktail Roblox runtime..."
-
-if [ -x "${RUNTIME_ROOT}/bin/mocktail" ]; then
-    cd "${RUNTIME_ROOT}"
-    exec "${RUNTIME_ROOT}/bin/mocktail" "$@"
-elif [ -x "$APPDIR/AppRun" ]; then
-    cd "$APPDIR"
+if [ -x "$APPDIR/AppRun" ]; then
     exec "$APPDIR/AppRun" "$@"
+elif [ -x "$APPDIR/bin/mocktail" ]; then
+    exec "$APPDIR/bin/mocktail" "$@"
+elif [ -x "$APPDIR/lib/ld-linux-x86-64.so.2" ] && [ -x "$APPDIR/shared/bin/mocktail" ]; then
+    exec "$APPDIR/lib/ld-linux-x86-64.so.2" --library-path "$APPDIR/lib:$APPDIR/lib/mocktail" "$APPDIR/shared/bin/mocktail" "$@"
 else
-    echo "[mocktail] ERROR: Could not find mocktail executable"
-    exit 1
+    exec "$APPDIR/shared/bin/mocktail" "$@"
 fi
 LAUNCHER_EOF
 
-${SUDO} chmod +x "${ROOTFS_DIR}/usr/bin/mocktail"
-echo "[+] Created /usr/bin/mocktail launcher"
+# Substitute the version and install path, then add the aliases.
+${SUDO} sed -i \
+    -e "s|__VERSION__|${MOCKTAIL_VERSION}|g" \
+    -e "s|__RUNTIME_INSTALL_DIR__|${RUNTIME_INSTALL_DIR}|g" \
+    "${ROOTFS_DIR}/usr/bin/mocktail-${MOCKTAIL_VERSION}"
+${SUDO} chmod +x "${ROOTFS_DIR}/usr/bin/mocktail-${MOCKTAIL_VERSION}"
+if [ "${MOCKTAIL_VERSION}" = "continuous" ]; then
+    ${SUDO} cp -f "${ROOTFS_DIR}/usr/bin/mocktail-${MOCKTAIL_VERSION}" "${ROOTFS_DIR}/usr/bin/mocktail-nightly"
+fi
+${SUDO} cp -f "${ROOTFS_DIR}/usr/bin/mocktail-${MOCKTAIL_VERSION}" "${ROOTFS_DIR}/usr/bin/mocktail"
+echo "[+] Created /usr/bin/mocktail (${MOCKTAIL_VERSION})"
+if [ "${MOCKTAIL_VERSION}" = "continuous" ]; then
+    echo "[+] Created /usr/bin/mocktail-nightly alias"
+fi
 
-# Desktop entry
+# Desktop entry (kept named mocktail so existing menus keep working).
 ${SUDO} mkdir -p "${ROOTFS_DIR}/usr/share/applications"
 ${SUDO} tee "${ROOTFS_DIR}/usr/share/applications/mocktail.desktop" > /dev/null << 'DESKTOP_EOF'
 [Desktop Entry]
@@ -546,90 +673,200 @@ if [ -f "${OPENBOX_MENU}" ] && ! ${SUDO} grep -q 'mocktail' "${OPENBOX_MENU}"; t
     echo "[+] Added Mocktail to Openbox menu"
 fi
 
-# Inject into disk.img
-echo "[*] Injecting into disk.img..."
-PART_IMG="${BUILD_DIR}/part_mocktail.img"
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Inject into disk.img
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "=== [5/5] Injecting into disk.img ==="
+
+PART_IMG="${MOCKTAIL_BUILD_DIR}/part_mocktail.img"
 dd if="${DISK_IMG}" of="${PART_IMG}" bs=1M skip=1 status=none
 
-echo "[*] Populating partition with Mocktail installation..."
-"${POPULATE_SCRIPT}" "${PART_IMG}" "${ROOTFS_DIR}/opt/mocktail" "/opt/mocktail"
-
-# Inject symlinks and single files directly via debugfs
 DEBUGFS_BIN="debugfs"
 [ -x /run/host/usr/bin/debugfs ] && DEBUGFS_BIN=/run/host/usr/bin/debugfs
 
-"${DEBUGFS_BIN}" -w "${PART_IMG}" << EOF >/dev/null 2>&1
-cd /
-rm /.local/share/mocktail
-mkdir /.local
-mkdir /.local/share
-symlink /.local/share/mocktail /opt/mocktail/data
+# Runtime tree (always rewritten).
+"${ROOT_DIR}/scripts/populate-ext2-dir.sh" "${PART_IMG}" "${BUNDLE_ROOT}" "${RUNTIME_INSTALL_DIR}"
+"${ROOT_DIR}/scripts/populate-ext2-dir.sh" "${PART_IMG}" \
+    "${ROOTFS_DIR}/opt/avory-glibc" /opt/avory-glibc
 
-mkdir /.config
-mkdir /.config/mocktail
-rm /.config/mocktail/config.yaml
-write ${ROOTFS_DIR}/opt/mocktail/config/config.yaml /.config/mocktail/config.yaml
-rm /.config/mocktail/fflags.json
-write ${ROOTFS_DIR}/opt/mocktail/config/fflags.json /.config/mocktail/fflags.json
+# Refresh only the selected payload and its manifest. Preserve Android data,
+# cookies, logs, and local storage already inside /opt/mocktail/data.
+IMAGE_PAYLOAD_ID=$("${DEBUGFS_BIN}" -R "cat /opt/mocktail/data/current.json" \
+    "${PART_IMG}" 2>/dev/null | grep -o '"payload_id": "[^"]*"' | cut -d'"' -f4 || true)
+if [ "${MOCKTAIL_FORCE_PAYLOAD:-0}" = "1" ] || \
+   [ "${IMAGE_PAYLOAD_ID}" != "${ACTIVE_PAYLOAD}" ]; then
+    echo "[*] Installing supported Roblox ${ACTIVE_PAYLOAD_VERSION} (${ACTIVE_PAYLOAD}) into disk.img"
+    "${ROOT_DIR}/scripts/populate-ext2-dir.sh" "${PART_IMG}" \
+        "${DATA_ROOT}/${ACTIVE_PAYLOAD_PATH}" "/opt/mocktail/data/${ACTIVE_PAYLOAD_PATH}"
 
-mkdir /root/.local
-mkdir /root/.local/share
-rm /root/.local/share/mocktail
-symlink /root/.local/share/mocktail /opt/mocktail/data
+    if "${DEBUGFS_BIN}" -R "stat /opt/mocktail/data/current.json" "${PART_IMG}" >/dev/null 2>&1; then
+        "${DEBUGFS_BIN}" -w -R "rm /opt/mocktail/data/current.json" \
+            "${PART_IMG}" >/dev/null 2>&1 || {
+            echo "[!] Could not replace the Roblox payload manifest in disk.img"
+            exit 1
+        }
+    fi
+    "${DEBUGFS_BIN}" -w -R \
+        "write ${DATA_ROOT}/current.json /opt/mocktail/data/current.json" \
+        "${PART_IMG}" >/dev/null 2>&1 || {
+        echo "[!] Could not install the Roblox payload manifest in disk.img"
+        exit 1
+    }
+    "${DEBUGFS_BIN}" -w -R "sif /opt/mocktail/data/current.json mode 0100644" \
+        "${PART_IMG}" >/dev/null 2>&1 || true
+else
+    echo "[*] Roblox payload ${ACTIVE_PAYLOAD} is already in disk.img"
+fi
 
-mkdir /root/.config
-mkdir /root/.config/mocktail
-rm /root/.config/mocktail/config.yaml
-write ${ROOTFS_DIR}/opt/mocktail/config/config.yaml /root/.config/mocktail/config.yaml
-rm /root/.config/mocktail/fflags.json
-write ${ROOTFS_DIR}/opt/mocktail/config/fflags.json /root/.config/mocktail/fflags.json
+# Drop runtimes from previous installs and their entry points. Only the shared payload
+# (/opt/mocktail/data) and configs survive from the legacy layout.  debugfs'
+# rm_rf command is missing from some e2fsprogs builds, so this is best-effort:
+# the small files are unlinked in a separate command file (missing files must
+# not fail the main batch) and a failed tree removal only leaves disk usage.
+"${DEBUGFS_BIN}" -w -R "rm_rf /opt/mocktail/usr" "${PART_IMG}" >/dev/null 2>&1 || true
+"${DEBUGFS_BIN}" -w -R "rm_rf /opt/mocktail-continuous" "${PART_IMG}" >/dev/null 2>&1 || true
+"${DEBUGFS_BIN}" -w -R "rm_rf /opt/mocktail-1.0.4" "${PART_IMG}" >/dev/null 2>&1 || true
+LEGACY_CMDS="$(mktemp)"
+{
+    echo "cd /"
+    echo "rm /opt/mocktail/AppRun"
+    echo "rm /opt/mocktail/space.bigrat.mocktail.desktop"
+    echo "rm /opt/mocktail/space.bigrat.mocktail.svg"
+    echo "rm /opt/mocktail/roblox"
+    echo "rm /usr/bin/mocktail.desktop"
+    echo "rm /usr/bin/mocktail-continuous"
+    echo "rm /usr/bin/mocktail-nightly"
+    echo "rm /usr/bin/mocktail104"
+    echo "rm /usr/bin/mocktail-1.0.4"
+    echo "rm /usr/lib/libGLX.so.1"
+    echo "rm /lib/ld-linux-x86-64.so.2"
+    echo "symlink /lib/ld-linux-x86-64.so.2 /opt/avory-glibc/lib/ld-linux-x86-64.so.2"
+    echo "rm /lib/libc.so.6"
+    echo "symlink /lib/libc.so.6 /opt/avory-glibc/lib/libc.so.6"
+} > "${LEGACY_CMDS}"
+"${DEBUGFS_BIN}" -w -f "${LEGACY_CMDS}" "${PART_IMG}" >/dev/null 2>&1 || true
+rm -f "${LEGACY_CMDS}"
+if "${DEBUGFS_BIN}" -R "ls -l /opt/mocktail" "${PART_IMG}" 2>/dev/null | grep -q " usr$"; then
+    echo "[!] This debugfs has no rm_rf; the legacy runtime is still at /opt/mocktail/usr."
+    echo "    Remove it from inside AvoryOS with:  rm -rf /opt/mocktail/usr"
+fi
 
-mkdir /home/avory/.local
-mkdir /home/avory/.local/share
-rm /home/avory/.local/share/mocktail
-symlink /home/avory/.local/share/mocktail /opt/mocktail/data
-set_inode_field /home/avory/.local uid 1000
-set_inode_field /home/avory/.local gid 1000
+# Launchers, configs and XDG symlinks.
+{
+    echo "cd /usr/bin"
+    echo "rm mocktail"
+    echo "write ${ROOTFS_DIR}/usr/bin/mocktail mocktail"
+    echo "sif mocktail mode 0100755"
+    echo "rm mocktail-continuous"
+    echo "rm mocktail-nightly"
+    echo "rm mocktail104"
+    echo "rm mocktail104"
+    echo "rm mocktail-${MOCKTAIL_VERSION}"
+    echo "write ${ROOTFS_DIR}/usr/bin/mocktail-${MOCKTAIL_VERSION} mocktail-${MOCKTAIL_VERSION}"
+    echo "sif mocktail-${MOCKTAIL_VERSION} mode 0100755"
+    # Drop stale launcher aliases if an earlier setup left them.
+    echo "rm mocktail-legacy"
+    echo "rm mocktail.bin"
 
-mkdir /home/avory/.config
-mkdir /home/avory/.config/mocktail
-rm /home/avory/.config/mocktail/config.yaml
-write ${ROOTFS_DIR}/opt/mocktail/config/config.yaml /home/avory/.config/mocktail/config.yaml
-set_inode_field /home/avory/.config/mocktail/config.yaml uid 1000
-set_inode_field /home/avory/.config/mocktail/config.yaml gid 1000
-rm /home/avory/.config/mocktail/fflags.json
-write ${ROOTFS_DIR}/opt/mocktail/config/fflags.json /home/avory/.config/mocktail/fflags.json
-set_inode_field /home/avory/.config/mocktail/fflags.json uid 1000
-set_inode_field /home/avory/.config/mocktail/fflags.json gid 1000
-set_inode_field /home/avory/.config uid 1000
-set_inode_field /home/avory/.config gid 1000
+    echo "mkdir /opt/mocktail"
+    echo "mkdir /opt/mocktail/config"
+    echo "rm /opt/mocktail/config/config.yaml"
+    echo "write ${ROOTFS_DIR}/opt/mocktail/config/config.yaml /opt/mocktail/config/config.yaml"
+    echo "sif /opt/mocktail/config/config.yaml mode 0100644"
+    echo "rm /opt/mocktail/config/fflags.json"
+    echo "write ${ROOTFS_DIR}/opt/mocktail/config/fflags.json /opt/mocktail/config/fflags.json"
+    echo "sif /opt/mocktail/config/fflags.json mode 0100644"
 
-cd /opt/mocktail
-rm roblox
-symlink roblox data/${ACTIVE_PAYLOAD_PATH}
+    echo "cd /"
 
-cd /usr/bin
-rm mocktail
-write ${ROOTFS_DIR}/usr/bin/mocktail mocktail
-sif mocktail mode 0100755
+    # Desktop entry (name kept as mocktail so existing menus keep working).
+    echo "mkdir /usr/share/applications"
+    echo "rm /usr/share/applications/mocktail.desktop"
+    echo "write ${ROOTFS_DIR}/usr/share/applications/mocktail.desktop /usr/share/applications/mocktail.desktop"
+    echo "sif /usr/share/applications/mocktail.desktop mode 0100644"
 
-cd /usr/share/applications
-rm mocktail.desktop
-write ${ROOTFS_DIR}/usr/share/applications/mocktail.desktop mocktail.desktop
-sif mocktail.desktop mode 0100644
+    echo "rm /.local/share/mocktail"
+    echo "mkdir /.local"
+    echo "mkdir /.local/share"
+    echo "mkdir /.local/state"
+    echo "mkdir /.local/state/mocktail"
+    echo "symlink /.local/share/mocktail /opt/mocktail/data"
 
-mkdir /.cache
-sif /.cache mode 040755
+    echo "mkdir /.config"
+    echo "mkdir /.config/mocktail"
+    echo "rm /.config/mocktail/config.yaml"
+    echo "write ${ROOTFS_DIR}/opt/mocktail/config/config.yaml /.config/mocktail/config.yaml"
+    echo "rm /.config/mocktail/fflags.json"
+    echo "write ${ROOTFS_DIR}/opt/mocktail/config/fflags.json /.config/mocktail/fflags.json"
 
-mkdir /tmp
-sif /tmp mode 040777
-EOF
+    echo "mkdir /root/.local"
+    echo "mkdir /root/.local/share"
+    # Mocktail stores window geometry below XDG_STATE_HOME (by default
+    # ~/.local/state/mocktail). Pre-create the directory on the image so the
+    # first window-state save does not depend on runtime mkdir support.
+    echo "mkdir /root/.local/state"
+    echo "mkdir /root/.local/state/mocktail"
+    echo "rm /root/.local/share/mocktail"
+    echo "symlink /root/.local/share/mocktail /opt/mocktail/data"
+
+    echo "mkdir /root/.config"
+    echo "mkdir /root/.config/mocktail"
+    echo "rm /root/.config/mocktail/config.yaml"
+    echo "write ${ROOTFS_DIR}/opt/mocktail/config/config.yaml /root/.config/mocktail/config.yaml"
+    echo "rm /root/.config/mocktail/fflags.json"
+    echo "write ${ROOTFS_DIR}/opt/mocktail/config/fflags.json /root/.config/mocktail/fflags.json"
+
+    echo "mkdir /home/avory/.local"
+    echo "mkdir /home/avory/.local/share"
+    echo "mkdir /home/avory/.local/state"
+    echo "mkdir /home/avory/.local/state/mocktail"
+    echo "rm /home/avory/.local/share/mocktail"
+    echo "symlink /home/avory/.local/share/mocktail /opt/mocktail/data"
+    echo "set_inode_field /home/avory/.local uid 1000"
+    echo "set_inode_field /home/avory/.local gid 1000"
+    echo "set_inode_field /home/avory/.local/state uid 1000"
+    echo "set_inode_field /home/avory/.local/state gid 1000"
+    echo "set_inode_field /home/avory/.local/state/mocktail uid 1000"
+    echo "set_inode_field /home/avory/.local/state/mocktail gid 1000"
+
+    echo "mkdir /home/avory/.config"
+    echo "mkdir /home/avory/.config/mocktail"
+    echo "rm /home/avory/.config/mocktail/config.yaml"
+    echo "write ${ROOTFS_DIR}/opt/mocktail/config/config.yaml /home/avory/.config/mocktail/config.yaml"
+    echo "set_inode_field /home/avory/.config/mocktail/config.yaml uid 1000"
+    echo "set_inode_field /home/avory/.config/mocktail/config.yaml gid 1000"
+    echo "rm /home/avory/.config/mocktail/fflags.json"
+    echo "write ${ROOTFS_DIR}/opt/mocktail/config/fflags.json /home/avory/.config/mocktail/fflags.json"
+    echo "set_inode_field /home/avory/.config/mocktail/fflags.json uid 1000"
+    echo "set_inode_field /home/avory/.config/mocktail/fflags.json gid 1000"
+    echo "set_inode_field /home/avory/.config uid 1000"
+    echo "set_inode_field /home/avory/.config gid 1000"
+    echo "rm /home/avory/.xinitrc"
+    echo "write ${ROOTFS_DIR}/home/avory/.xinitrc /home/avory/.xinitrc"
+    echo "sif /home/avory/.xinitrc mode 0100755"
+    echo "set_inode_field /home/avory/.xinitrc uid 1000"
+    echo "set_inode_field /home/avory/.xinitrc gid 1000"
+
+    echo "mkdir /.cache"
+    echo "sif /.cache mode 040755"
+
+    echo "mkdir /tmp"
+    echo "sif /tmp mode 040777"
+} > "${MOCKTAIL_BUILD_DIR}/mocktail-debugfs.cmds"
+
+"${DEBUGFS_BIN}" -w -f "${MOCKTAIL_BUILD_DIR}/mocktail-debugfs.cmds" "${PART_IMG}" >/dev/null 2>&1 || {
+    echo "[!] debugfs launcher/config injection failed"
+    rm -f "${MOCKTAIL_BUILD_DIR}/mocktail-debugfs.cmds"
+    exit 1
+}
+rm -f "${MOCKTAIL_BUILD_DIR}/mocktail-debugfs.cmds"
 
 if [ -f "${OPENBOX_MENU}" ]; then
-    "${DEBUGFS_BIN}" -w "${PART_IMG}" << EOF >/dev/null 2>&1
+    "${DEBUGFS_BIN}" -w "${PART_IMG}" >/dev/null 2>&1 << EOF
 cd /etc/xdg/openbox
 rm menu.xml
-write ${ROOTFS_DIR}/etc/xdg/openbox/menu.xml menu.xml
+write ${OPENBOX_MENU} menu.xml
 sif menu.xml mode 0100644
 EOF
 fi
@@ -640,13 +877,15 @@ rm -f "${PART_IMG}"
 
 echo ""
 echo "=================================================================="
-echo "  [SUCCESS] Mocktail AppImage & Roblox payload ready in AvoryOS!"
+echo "  [SUCCESS] Mocktail ${MOCKTAIL_VERSION} installed in AvoryOS!"
 echo "=================================================================="
 echo "  Boot AvoryOS -> open a terminal -> type:  mocktail"
 echo ""
-echo "  Roblox payload is pre-installed (no in-guest download needed)."
-echo "  Configure FFlags in: ~/.config/mocktail/fflags.json"
+echo "  Runtime:  ${RUNTIME_INSTALL_DIR}"
+echo "  Payload:  /opt/mocktail/data (shared, version-independent)"
+echo "  Roblox:   ${ACTIVE_PAYLOAD_VERSION} (newest exact-supported x86_64 build)"
+echo "  Config:   ~/.config/mocktail/{config.yaml,fflags.json}"
 echo ""
-echo "  Note: Audio is DISABLED (SDL_AUDIODRIVER=dummy)"
+echo "  Audio: SDL3 automatic system backend selection"
 echo "        Using software OpenGL rendering (llvmpipe)"
 echo "=================================================================="

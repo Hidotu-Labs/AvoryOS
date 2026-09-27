@@ -132,7 +132,7 @@ typedef struct {
   ext2_inode_t journal_inode;
   uint8_t *desc_block_buf;
   uint32_t blocks_in_trans;
-  spinlock_t lock;
+  rawspinlock_t lock;
 } ext3_journal_state_t;
 
 #define EXT2_CACHE_SIZE 2048

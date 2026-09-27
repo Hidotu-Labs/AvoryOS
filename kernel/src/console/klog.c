@@ -18,8 +18,15 @@ static uint32_t screen_y = 0;
  * kernel message are also kept in a ring buffer and exposed at /proc/klog.
  * The ring is written from every context (IRQs, faults, SMP bring-up), so it
  * has its own lock; a byte is dropped rather than deadlocking if the lock is
- * already held by the same CPU. */
-#define KLOG_RING_SIZE (256 * 1024)
+ * already held by the same CPU.
+ *
+ * Tracing builds can enlarge it (`make KLOG_RING_KB=4096`): browser syscall
+ * traces produce megabytes, and the default 256 KiB wraps in well under a
+ * second of WebKit activity. */
+#ifndef KLOG_RING_KB
+#define KLOG_RING_KB 256
+#endif
+#define KLOG_RING_SIZE (KLOG_RING_KB * 1024)
 static char klog_ring[KLOG_RING_SIZE];
 static uint32_t klog_ring_head;  /* next write index */
 static uint32_t klog_ring_count; /* bytes currently stored */
@@ -330,44 +337,14 @@ void klogf(const char *fmt, ...) {
   va_end(ap);
 }
 
+bool klog_path_is_browser(const char *path) {
+  return path && (strstr(path, "badwolf") || strstr(path, "bwrap") ||
+                  strstr(path, "WebKit") || strstr(path, "webkit") ||
+                  strstr(path, "mocktail") || strstr(path, "MiniBrowser"));
+}
+
 void klog_proc_exec(uint32_t tid, const char *path) {
-  char buf[256];
-  char *p = buf;
-
-  const char pfx[] = "[PROC] exec tid=";
-  for (size_t i = 0; i < sizeof(pfx) - 1; i++)
-    *p++ = pfx[i];
-
-  char num_buf[24];
-  int ni = 0;
-  uint64_t n = tid;
-  if (n == 0) {
-    num_buf[ni++] = '0';
-  } else {
-    while (n > 0) {
-      num_buf[ni++] = '0' + (n % 10);
-      n /= 10;
-    }
-  }
-  while (ni > 0)
-    *p++ = num_buf[--ni];
-
-  const char path_s[] = " path=";
-  for (size_t i = 0; i < sizeof(path_s) - 1; i++)
-    *p++ = path_s[i];
-
-  if (path && *path) {
-    while (*path && (size_t)(p - buf) < sizeof(buf) - 2)
-      *p++ = *path++;
-  } else {
-    *p++ = '?';
-  }
-
-  *p++ = '\n';
-
-  klog_write_dispatch(buf, (size_t)(p - buf));
-
-  if (path && (strstr(path, "badwolf") || strstr(path, "bwrap") || strstr(path, "WebKit") || strstr(path, "webkit"))) {
+  if (klog_path_is_browser(path)) {
     char note[160];
     int nlen = snprintf(note, sizeof(note), "[PROC] [WEBKIT/BROWSER] Launching %s (tid=%u)\n",
                         path, tid);

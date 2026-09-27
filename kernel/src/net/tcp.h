@@ -15,7 +15,9 @@
 #define TCP_MAX_CONNECTIONS 2048
 #define TCP_MAX_TCBS TCP_MAX_CONNECTIONS /* legacy alias */
 
-#define TCP_DEFAULT_RCVBUF (64 * 1024)
+/* A 64 KiB default window can throttle high-latency CDN downloads. Keep a
+ * moderate per-connection buffer; window scaling lets peers use the full size. */
+#define TCP_DEFAULT_RCVBUF (256 * 1024)
 #define TCP_MIN_RCVBUF     (4 * 1024)
 #define TCP_MAX_RCVBUF     (4 * 1024 * 1024)
 
@@ -187,6 +189,7 @@ struct tcp_tcb *tcp_accept(struct tcp_tcb *, bool);
 bool tcp_readable(const struct tcp_tcb *);
 bool tcp_writable(const struct tcp_tcb *);
 bool tcp_accept_pending(const struct tcp_tcb *);
+size_t tcp_rx_available(const struct tcp_tcb *);
 
 /* Socket option plumbing (Phase 1). */
 void tcp_set_rcvbuf(struct tcp_tcb *, size_t);

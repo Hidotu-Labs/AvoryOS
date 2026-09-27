@@ -17,8 +17,12 @@
 uint32_t next_tid = 1;
 spinlock_t tid_lock = SPINLOCK_INIT;
 struct thread *global_thread_list = NULL;
+/* Atomic mirror of global_thread_list's length: +1 at the insert below and
+ * at the idle-thread insert in sched.c, -1 at the unlink in sched_reap.c. */
+uint32_t global_thread_count = 0;
 
 extern void thread_stub(void); // Defined in switch.asm
+extern void signal_send(struct thread *t, int sig);
 
 void *thread_stack_alloc(void) {
   void *phys = pmm_alloc_pages(THREAD_STACK_SIZE / PAGE_SIZE);
@@ -108,6 +112,14 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
   if (cpu_count == 64)
     t->cpu_affinity = ~0ULL;
 
+  /* Keep the requested/home CPU as a placement hint even for suspended
+   * threads (fork/clone and worker setup enqueue only after initialization).
+   * A zeroed cpu_index silently biases those later balanced enqueues toward
+   * the BSP regardless of which CPU created the thread. */
+  struct cpu_info *home_cpu = explicit_cpu ? explicit_cpu : cpu_get_current();
+  if (home_cpu && home_cpu->cpu_id < cpu_count)
+    t->cpu_index = home_cpu->cpu_id;
+
   t->state = THREAD_READY;
   eevfd_entity_init(&t->se, 0, 0);
   t->priority = SCHED_PRIORITY_DEFAULT;
@@ -163,7 +175,8 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
   if (!fpu_init_done) {
     memset(initial_fpu_state, 0, sizeof(initial_fpu_state));
     if (cpu_has_xsave()) {
-      uint32_t eax = 0xFFFFFFFF, edx = 0xFFFFFFFF;
+      uint64_t mask = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE);
+      uint32_t eax = (uint32_t)mask, edx = (uint32_t)(mask >> 32);
       __asm__ volatile("fninit; xsave64 %0" : "=m"(initial_fpu_state) : "a"(eax), "d"(edx));
     } else {
       __asm__ volatile("fninit; fxsave64 %0" : "=m"(initial_fpu_state));
@@ -189,6 +202,7 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
   }
   t->global_next = global_thread_list;
   global_thread_list = t;
+  __atomic_add_fetch(&global_thread_count, 1, __ATOMIC_RELAXED);
   spinlock_release(&tid_lock);
 
   // Balance and add to a CPU's runqueue conditionally
@@ -235,25 +249,97 @@ bool sched_get_thread_snapshot(uint32_t tid,
   snapshot->pgid = t->pgid;
   snapshot->state = t->state;
   snapshot->runtime_total = t->runtime_total;
+  snapshot->runtime_user_ms =
+      __atomic_load_n(&t->runtime_user_ms, __ATOMIC_RELAXED);
+  snapshot->runtime_system_ms =
+      __atomic_load_n(&t->runtime_system_ms, __ATOMIC_RELAXED);
   snapshot->uid = t->uid;
   snapshot->gid = t->gid;
   snapshot->euid = t->euid;
   snapshot->egid = t->egid;
   snapshot->suid = t->suid;
   snapshot->sgid = t->sgid;
+  snapshot->cpu_index = t->cpu_index;
   memcpy(snapshot->comm, t->comm, sizeof(snapshot->comm));
   snapshot->comm[sizeof(snapshot->comm) - 1] = 0;
-
-  if (t->mm) {
-    if (t->mm->brk_current > t->mm->brk_base)
-      snapshot->virt_bytes = t->mm->brk_current - t->mm->brk_base;
-    uint64_t mmap_used = 0x800000000000ULL - t->mm->mmap_next_addr;
-    if ((int64_t)mmap_used > 0)
-      snapshot->virt_bytes += mmap_used;
-    snapshot->resident_bytes = snapshot->virt_bytes / 2;
-  }
+  memcpy(snapshot->exe_path, t->exe_path, sizeof(snapshot->exe_path));
+  snapshot->exe_path[sizeof(snapshot->exe_path) - 1] = 0;
+  memcpy(snapshot->cwd_path, t->cwd_path, sizeof(snapshot->cwd_path));
+  snapshot->cwd_path[sizeof(snapshot->cwd_path) - 1] = 0;
 
   spinlock_release(&tid_lock);
+  return true;
+}
+
+/*
+ * Virtual + resident bytes for /proc/<pid>/{status,statm}.
+ *
+ * Both numbers used to be invented right here in the snapshot:
+ *
+ *   virt_bytes  = (brk span) + (0x800000000000 - mmap_next_addr)
+ *   resident    = virt_bytes / 2
+ *
+ * mmap grows *upward* from MMAP_REGION_BASE, so the second term was the arena
+ * still free rather than what was mapped - a fresh process claimed ~1 TiB of
+ * virtual memory, and the figure *fell* as the process allocated more.  The
+ * resident value was then half of that fiction: a WebKit web process reported
+ * ~448 GB of RSS from /proc/self/statm, which WTF::memoryFootprint() compares
+ * against its 8 GB kill threshold, so the memory monitor killed the process on
+ * every poll ("Unable to shrink memory footprint ... below the kill thresold"),
+ * and the webview reported web process terminated reason=memory-limit.
+ *
+ * Now: virtual size is the sum of the VMAs, resident size is counted from the
+ * page tables.  Both walks happen after dropping tid_lock - this lock masks
+ * interrupts for its holder and is taken on every scheduler lookup, so it
+ * cannot be held across a page-table walk.
+ *
+ * The mm reference taken here is what keeps the page tables alive while the
+ * lock is dropped; mm_put() hands it back and frees them if we turn out to be
+ * the last holder.
+ */
+bool sched_get_mem_snapshot(uint32_t tid, uint64_t *virt_bytes,
+                            uint64_t *resident_bytes) {
+  if (virt_bytes)
+    *virt_bytes = 0;
+  if (resident_bytes)
+    *resident_bytes = 0;
+
+  struct mm_struct *mm = NULL;
+  uint64_t cr3 = 0;
+
+  spinlock_acquire(&tid_lock);
+  struct thread *t = find_thread_by_tid_locked(tid);
+  if (t && t->mm) {
+    /* A thread found under tid_lock is still linked, so the reaper has not
+     * reached its mm drop yet - this reference is taken on a live mm. */
+    mm = t->mm;
+    cr3 = t->cr3;
+    __atomic_add_fetch(&mm->ref_count, 1, __ATOMIC_ACQ_REL);
+  }
+  spinlock_release(&tid_lock);
+
+  if (!mm)
+    return false;
+
+  spinlock_acquire(&mm->lock);
+  uint64_t virt = vma_total_bytes(&mm->vmas);
+  spinlock_release(&mm->lock);
+
+  uint64_t resident = vmm_user_resident_bytes(cr3);
+
+  /* A few user pages are mapped without a VMA covering them (vdso, vsyscall,
+   * the signal trampoline are installed directly by the fault/exec paths), so
+   * RSS can legitimately edge past VSZ by pages.  Never report that: VmSize
+   * below VmRSS reads as >100% to htop and ps. */
+  if (virt < resident)
+    virt = resident;
+
+  if (virt_bytes)
+    *virt_bytes = virt;
+  if (resident_bytes)
+    *resident_bytes = resident;
+
+  mm_put(mm, cr3);
   return true;
 }
 
@@ -330,15 +416,9 @@ bool sched_get_nth_thread_tid(uint32_t index, uint32_t *tid) {
 }
 
 uint16_t sched_get_thread_count(void) {
-  spinlock_acquire(&tid_lock);
-  uint16_t count = 0;
-  struct thread *curr = global_thread_list;
-  while (curr) {
-    count++;
-    curr = curr->global_next;
-  }
-  spinlock_release(&tid_lock);
-  return count;
+  /* Count is maintained at insert/unlink time - no list walk, no tid_lock
+   * (the walk was half of sys_sysinfo's 1.5us). */
+  return (uint16_t)__atomic_load_n(&global_thread_count, __ATOMIC_RELAXED);
 }
 
 uint16_t sched_get_runnable_thread_count(void) {
@@ -379,6 +459,24 @@ void sched_get_total_cpu_ms(uint64_t *out_user_ms, uint64_t *out_idle_ms) {
   if (out_idle_ms) *out_idle_ms = total_ms - user_ms;
 }
 
+void sched_get_cpu_times(uint32_t cpu_id, uint64_t *out_user_ms,
+                         uint64_t *out_system_ms, uint64_t *out_idle_ms) {
+  struct cpu_info *cpu = cpu_get_info(cpu_id);
+  if (!cpu) {
+    if (out_user_ms) *out_user_ms = 0;
+    if (out_system_ms) *out_system_ms = 0;
+    if (out_idle_ms) *out_idle_ms = 0;
+    return;
+  }
+  if (out_user_ms)
+    *out_user_ms = __atomic_load_n(&cpu->stats_user_ms, __ATOMIC_RELAXED);
+  if (out_system_ms)
+    *out_system_ms =
+        __atomic_load_n(&cpu->stats_system_ms, __ATOMIC_RELAXED);
+  if (out_idle_ms)
+    *out_idle_ms = __atomic_load_n(&cpu->stats_idle_ms, __ATOMIC_RELAXED);
+}
+
 struct thread *sched_get_thread_list_head(void) { return global_thread_list; }
 
 void sched_reparent_children(struct thread *parent) {
@@ -413,6 +511,9 @@ void sched_reparent_children(struct thread *parent) {
   struct thread *child = parent->children;
   while (child) {
     struct thread *next_sibling = child->sibling_next;
+    if (child->pdeath_signal > 0 && child->pdeath_signal <= 64) {
+      signal_send(child, child->pdeath_signal);
+    }
     child->parent = adopter;
     if (adopter) {
       child->sibling_next = adopter->children;

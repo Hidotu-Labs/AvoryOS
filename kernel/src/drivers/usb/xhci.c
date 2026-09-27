@@ -402,7 +402,10 @@ static uint32_t xhci_drain_events(struct xhci_controller *hc,
           state->pipe.last_completion = ev_cc;
         }
         uint16_t actual_len = state->pipe.actual_length;
-        state->completed = true;
+        /* Publish completion metadata before the timer/IRQ-side poller sees
+         * the flag. xHCI events may be drained on a different CPU from the
+         * consumer now that SMP scheduling is active. */
+        __atomic_store_n(&state->completed, true, __ATOMIC_RELEASE);
         state->completions++;
         matched = true;
         /* Log the first few events of every pipe in full, then only
@@ -1025,7 +1028,7 @@ static void xhci_remove_device(struct usb_hcd *hcd, struct usb_device *dev) {
     if (state->pipe.dev != dev)
       continue;
     state->pipe.active = false;
-    state->completed = false;
+    __atomic_store_n(&state->completed, false, __ATOMIC_RELEASE);
     state->pipe.dev = NULL;
   }
   xhci_submit_command(hc, 0, 0,
@@ -1104,7 +1107,7 @@ static int xhci_interrupt_submit(struct xhci_controller *hc,
   trb->control = XHCI_TRB_TYPE(XHCI_TRB_NORMAL) | XHCI_TRB_IOC |
                  XHCI_TRB_ISP | state->cycle;
   state->expected_trb = state->ring_phys + index * sizeof(*trb);
-  state->completed = false;
+  __atomic_store_n(&state->completed, false, __ATOMIC_RELEASE);
   state->completion_code = 0;
   /* Do not clear pipe.actual_length here: another CPU may still be reading it
    * for the completion that just happened.  The next Transfer Event overwrites
@@ -1300,12 +1303,12 @@ static int xhci_interrupt_resubmit(struct usb_hcd *hcd,
 static bool xhci_interrupt_completed(struct usb_hcd *hcd,
                                      struct usb_interrupt_pipe *pipe) {
   struct xhci_interrupt_state *state = pipe ? pipe->hcd_data : NULL;
-  if (!state || !state->completed)
+  if (!state ||
+      !__atomic_exchange_n(&state->completed, false, __ATOMIC_ACQ_REL))
     return false;
 
   uint8_t code = state->completion_code;
   uint16_t actual_len = pipe->actual_length;
-  state->completed = false;
 
   if (code == XHCI_COMPLETION_SUCCESS || code == 13) { /* 13 = Short Packet */
     if (code == XHCI_COMPLETION_SUCCESS)
@@ -1365,7 +1368,7 @@ static void xhci_interrupt_cancel(struct usb_hcd *hcd,
                           ((uint32_t)state->endpoint_id << 16) |
                           ((uint32_t)slot->id << 24),
                       NULL);
-  state->completed = false;
+  __atomic_store_n(&state->completed, false, __ATOMIC_RELEASE);
   pipe->active = false;
 }
 

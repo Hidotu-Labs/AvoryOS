@@ -38,7 +38,10 @@
  * and the overflow path is reported rather than silent. */
 #define VMA_UNMAP_MM_MAX 128
 
-static void mm_put(struct mm_struct *mm, uint64_t cr3) {
+/* Last reference: mirror the scheduler reaper's teardown for a shared mm
+ * (kernel/src/sched/sched_reap.c).  The page tables must be freed before the
+ * VMA list they describe. */
+void mm_put(struct mm_struct *mm, uint64_t cr3) {
   int refs;
 
   refs = __atomic_sub_fetch(&mm->ref_count, 1, __ATOMIC_ACQ_REL);

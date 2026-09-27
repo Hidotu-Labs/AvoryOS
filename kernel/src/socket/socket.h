@@ -249,6 +249,12 @@ typedef struct socket {
   uint64_t refcount;     // Reference count
   volatile bool closing; // Last file reference was closed
   spinlock_t lock;       // Spinlock for synchronization
+  int table_index;       // socket_table[] slot (-1 until installed)
+  /* Embedded wait_queue_t storage: the queue used to be a separate kmalloc,
+   * costing every socket()/socketpair() an extra heap operation.
+   * socket_wait_queue_init() static-asserts that today's wait_queue_t still
+   * fits here. */
+  uint64_t _wait_queue_mem[4];
 } socket_t;
 
 // Socket Subsystem Initialization

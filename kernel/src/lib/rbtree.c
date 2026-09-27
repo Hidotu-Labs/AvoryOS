@@ -278,11 +278,19 @@ void rb_erase_augmented(struct rb_node *node, struct rb_root *root,
             root->rb_node = child;
         }
 
-        if (rb_parent(node) == old)
+        if (rb_parent(node) == old) {
+            /* The successor is old's direct right child. Preserve its right
+             * child instead of copying old->rb_right (which is node itself)
+             * into node->rb_right. Otherwise erase fixup walks a self-cycle. */
             parent = node;
+            if (child)
+                rb_set_parent(child, node);
+        } else {
+            node->rb_right = old->rb_right;
+            rb_set_parent(old->rb_right, node);
+        }
 
         rb_set_parent_color(node, rb_parent(old), rb_color(old));
-        node->rb_right = old->rb_right;
         node->rb_left = old->rb_left;
 
         if (rb_parent(old)) {
@@ -295,8 +303,6 @@ void rb_erase_augmented(struct rb_node *node, struct rb_root *root,
         }
 
         rb_set_parent(old->rb_left, node);
-        if (old->rb_right)
-            rb_set_parent(old->rb_right, node);
 
         if (augment_cb) {
             augment_cb(node);

@@ -41,6 +41,12 @@ uint64_t *vmm_get_active_pml4(void);
 bool vmm_map_page(uint64_t *pml4, uint64_t virtual_addr, uint64_t physical_addr,
                   uint64_t flags);
 
+// Internal batch variant. The caller must already hold vmm_lock; deferred TLB
+// invalidations are queued and must be drained after releasing the lock.
+bool vmm_map_page_locked(uint64_t *pml4, uint64_t virtual_addr,
+                         uint64_t physical_addr, uint64_t flags,
+                         bool *changed);
+
 // Maps a virtual page only if no present mapping already exists.
 // Returns true on successful mapping, false if already mapped or on OOM.
 bool vmm_map_page_if_unmapped(uint64_t *pml4, uint64_t virtual_addr,
@@ -56,6 +62,10 @@ bool vmm_map_huge_page(uint64_t *pml4, uint64_t virtual_addr,
 
 // Unmap a virtual page
 void vmm_unmap_page(uint64_t *pml4, uint64_t virtual_addr);
+/* Release a frame only after this CPU's queued TLB shootdowns are acknowledged. */
+void vmm_defer_frame_free(void *phys, uint16_t pages);
+/* Drain this CPU's queued TLB work and release frames parked behind it. */
+void vmm_drain_deferred_work(void);
 
 // Returns true if the address is mapped with a huge page (PS bit set on PD/PDPT)
 bool vmm_is_huge_page(uint64_t *pml4, uint64_t virtual_addr);
@@ -77,6 +87,14 @@ static inline void vmm_flush_tlb(uint64_t virtual_addr) {
 // Resolve a virtual address to its physical address using the given PML4.
 // Returns 0 if the mapping does not exist.
 uint64_t vmm_virt_to_phys(uint64_t *pml4, uint64_t virtual_addr);
+
+// Resident (physical) bytes mapped in the *user* half of the address space
+// rooted at `cr3` (a physical address; 0 for a kernel-only thread).  This is
+// what /proc/<pid>/statm field 2 and /proc/<pid>/VmRSS must report: WebKit
+// reads it as the process "footprint" and kills the web process above its
+// threshold, so an estimate here is a process killed or spared at random.
+// Lock free by design - see the comment at the definition.
+uint64_t vmm_user_resident_bytes(uint64_t cr3);
 
 // ---- Bring-up diagnostics (temporary) -----------------------------------
 // Raw page-table walk that never follows a frame that is not RAM, so it is
@@ -124,6 +142,26 @@ void vmm_free_user_pages(uint64_t cr3);
 // VMA-aware version: consults vmas to skip freeing physical pages
 // that belong to MAP_SHARED mappings (e.g. device MMIO like framebuffer).
 void vmm_free_user_pages_vma(uint64_t cr3, struct vma_list *vmas);
+
+// Deferred teardown: queue_* takes ownership of a dead address space (cr3,
+// and for queue_free_mm the whole mm_struct) and returns immediately; the
+// actual page-table walk + PMM frees run later on an idle CPU or - if the
+// backlog outgrows the idle drains - in sched_process_reap_queue().  Used by
+// execve (old address space) and the thread reaper, which otherwise pays the
+// teardown inside the parent's wait4().
+struct mm_struct;
+void vmm_queue_free_user_pages_vma(uint64_t cr3, struct vma_list *vmas);
+void vmm_queue_free_mm(uint64_t cr3, struct mm_struct *mm);
+// Drains up to max_nodes deferred teardowns (all of them when max_nodes <= 0).
+int vmm_defer_drain(int max_nodes);
+// Current backlog depth - O(1), lock-free.
+unsigned vmm_defer_pending(void);
+// sched_process_reap_queue() drains only past this depth, so wait4's own
+// yield loop never pays for a node it queued microseconds ago; idle CPUs
+// (which drain unconditionally) keep the common-case depth far below it.
+#define VMM_DEFER_INLINE_BACKLOG 64
+#define VMM_DEFER_INLINE_NODES 8
+#define VMM_DEFER_IDLE_NODES 64
 
 struct registers;
 

@@ -7,6 +7,7 @@
 #define IPI_VECTOR_TLB_SHOOTDOWN 50
 
 #define TLB_SHOOTDOWN_ALL UINT64_MAX
+#define TLB_SHOOTDOWN_CONTEXT (UINT64_MAX - 1)
 
 void tlb_shootdown_init(void);
 
@@ -20,9 +21,13 @@ void tlb_shootdown_page(uint64_t addr);
  * you have one.
  */
 void tlb_shootdown_page_for(uint64_t addr, uint64_t pml4);
+/* Invalidate every non-global translation for one address space. */
+void tlb_shootdown_context_for(uint64_t pml4);
 
 void tlb_shootdown_all(void);
 
+struct registers;
+void tlb_shootdown_handle_ipi_regs(struct registers *regs);
 void tlb_shootdown_handle_ipi(void);
 
 /* Cost counters, exported for /proc/tlb_stats.
@@ -65,6 +70,7 @@ uint64_t tlb_shootdown_caller_info(int slot, uint64_t *ip, uint64_t *total,
  * addresses accumulate, so a large range costs one broadcast rather than one per
  * page. */
 void tlb_flush_deferred(uint64_t addr, uint64_t pml4);
+void tlb_flush_deferred_context(uint64_t pml4);
 void tlb_flush_deferred_all(void);
 
 /* Perform the queued invalidations and wait for the remote CPUs to

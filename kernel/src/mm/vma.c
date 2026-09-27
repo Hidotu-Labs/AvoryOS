@@ -1,4 +1,6 @@
 #include "vma.h"
+#define TSC_PROBES_ENABLE
+#include "../lib/tsc.h"
 #include "../console/klog.h"
 #include "../fs/vfs.h"
 #include "heap.h"
@@ -263,13 +265,17 @@ void vma_list_destroy(struct vma_list *list) {
 int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
             uint64_t flags, int fd, uint64_t offset, void *file_node,
             uint64_t file_size) {
+  TSC_BEGIN(vma_add);
   if (vma_find_overlap(list, start, end)) {
+    TSC_END(vma_add);
     return -1; // Overlapping regions rejected
   }
 
   struct vma *new_node = vma_node_alloc();
-  if (!new_node)
+  if (!new_node) {
+    TSC_END(vma_add);
     return -1; // OOM
+  }
 
   new_node->start = start;
   new_node->end = end;
@@ -289,6 +295,7 @@ int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
   list->root = insert_node(list->root, new_node);
   list->count++;
 
+  TSC_END(vma_add);
   return 0; // Success
 }
 
@@ -308,6 +315,7 @@ void vma_attach_linux(struct vma_list *list, uint64_t start, void *linux_vma) {
 }
 
 bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
+  TSC_BEGIN(vma_remove);
   bool overall_removed = false;
   struct vma *v;
 
@@ -375,6 +383,7 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
     vma_linux_put(vma_linux_vma);
   }
 
+  TSC_END(vma_remove);
   return overall_removed;
 }
 
@@ -558,19 +567,105 @@ struct vma *vma_find_growdown(struct vma_list *list, uint64_t cr2,
   return vma_find_growdown_recursive(list->root, cr2, max_limit);
 }
 
-static void clone_recursive(struct vma_list *dst, struct vma *node) {
-  if (!node)
+static void vma_snapshot_fill(struct vma_snapshot *dst, const struct vma *src) {
+  if (!dst)
     return;
-  vma_add(dst, node->start, node->end, node->prot, node->flags, node->fd,
-          node->offset, node->file_node, node->file_size);
-  vma_attach_linux(dst, node->start, node->linux_vma);
-  clone_recursive(dst, node->left);
-  clone_recursive(dst, node->right);
+  if (!src) {
+    dst->valid = false;
+    return;
+  }
+  dst->start = src->start;
+  dst->end = src->end;
+  dst->prot = src->prot;
+  dst->flags = src->flags;
+  dst->offset = src->offset;
+  dst->fd = src->fd;
+  dst->valid = true;
 }
 
-void vma_list_clone(struct vma_list *dst, struct vma_list *src) {
+static void vma_neighbors_recursive(struct vma *node, uint64_t addr,
+                                    struct vma_snapshot *prev,
+                                    struct vma_snapshot *hit,
+                                    struct vma_snapshot *next) {
+  if (!node)
+    return;
+  if (addr >= node->start && addr < node->end) {
+    vma_snapshot_fill(hit, node);
+    /* A containing node is neither prev nor next, but both subtrees may
+     * still hold a closer neighbor on either side. */
+    vma_neighbors_recursive(node->left, addr, prev, hit, next);
+    vma_neighbors_recursive(node->right, addr, prev, hit, next);
+    return;
+  }
+  if (addr < node->start) {
+    if (!next->valid || node->start < next->start)
+      vma_snapshot_fill(next, node);
+    vma_neighbors_recursive(node->left, addr, prev, hit, next);
+    return;
+  }
+  /* addr >= node->end */
+  if (!prev->valid || node->start > prev->start)
+    vma_snapshot_fill(prev, node);
+  vma_neighbors_recursive(node->right, addr, prev, hit, next);
+}
+
+void vma_snapshot_neighbors(struct vma_list *list, uint64_t addr,
+                            struct vma_snapshot *prev,
+                            struct vma_snapshot *hit,
+                            struct vma_snapshot *next) {
+  if (prev)
+    prev->valid = false;
+  if (hit)
+    hit->valid = false;
+  if (next)
+    next->valid = false;
+  if (!list)
+    return;
+  vma_neighbors_recursive(list->root, addr, prev, hit, next);
+}
+
+static void vma_stacks_recursive(struct vma *node, struct vma_snapshot *out,
+                                 int cap, int *total) {
+  if (!node)
+    return;
+  vma_stacks_recursive(node->left, out, cap, total);
+  if (node->flags & MAP_STACK) {
+    if (*total < cap)
+      vma_snapshot_fill(&out[*total], node);
+    (*total)++;
+  }
+  vma_stacks_recursive(node->right, out, cap, total);
+}
+
+int vma_snapshot_stacks(struct vma_list *list, struct vma_snapshot *out,
+                        int cap) {
+  int total = 0;
+  if (!list || !out || cap <= 0)
+    return 0;
+  /* In-order walk yields stacks sorted by address without allocation. */
+  vma_stacks_recursive(list->root, out, cap, &total);
+  return total;
+}
+
+static bool clone_recursive(struct vma_list *dst, struct vma *node) {
+  if (!node)
+    return true;
+  if (vma_add(dst, node->start, node->end, node->prot, node->flags, node->fd,
+              node->offset, node->file_node, node->file_size) != 0)
+    return false;
+  vma_attach_linux(dst, node->start, node->linux_vma);
+  return clone_recursive(dst, node->left) &&
+         clone_recursive(dst, node->right);
+}
+
+bool vma_list_clone(struct vma_list *dst, struct vma_list *src) {
+  if (!dst || !src)
+    return false;
   vma_list_init(dst);
-  clone_recursive(dst, src->root);
+  if (clone_recursive(dst, src->root))
+    return true;
+  vma_list_destroy(dst);
+  return false;
 }
 
 static void inorder_gather(struct vma *node, struct vma **array, int *index) {
@@ -828,4 +923,26 @@ void vma_dump(struct vma_list *list) {
     return;
   }
   vma_dump_recursive(list->root);
+}
+
+/* Total bytes described by the tree, for /proc/<pid>/{status,statm}.
+ *
+ * This replaces the old snapshot maths, which derived "virtual size" from the
+ * mmap bump pointer as (0x800000000000 - mmap_next_addr).  mmap grows
+ * *upward* from MMAP_REGION_BASE, so that expression measures the arena still
+ * left over rather than what is mapped - it shrank as a process allocated
+ * more, and every process started out claiming a terabyte of RAM.  Summing the
+ * VMAs is exact, needs no allocation, and only walks a balanced tree that a
+ * process with hundreds of mappings keeps a dozen levels deep. */
+static uint64_t vma_total_bytes_recursive(struct vma *node) {
+  if (!node)
+    return 0;
+  return (node->end - node->start) + vma_total_bytes_recursive(node->left) +
+         vma_total_bytes_recursive(node->right);
+}
+
+uint64_t vma_total_bytes(struct vma_list *list) {
+  if (!list)
+    return 0;
+  return vma_total_bytes_recursive(list->root);
 }

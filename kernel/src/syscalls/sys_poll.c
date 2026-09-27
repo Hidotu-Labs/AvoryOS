@@ -16,6 +16,12 @@ static inline bool is_user_ptr(uint64_t addr) {
   return addr != 0 && addr <= USER_ADDR_MAX;
 }
 
+/* Safety-net rescan for a blocking poll(): wait queues drive normal wakeups,
+ * this only bounds how long a producer that never signals one can go
+ * unnoticed.  Was 10 ticks, i.e. a full re-scan of every fd roughly every
+ * 10 ms (~100/s) for every blocked poll(). */
+#define POLL_SAFETY_NET_MS 1000
+
 struct pollfd {
   int fd;
   short events;
@@ -93,23 +99,28 @@ static uint64_t do_poll(struct pollfd *fds, uint64_t nfds,
       break;
 
     size_t wq_count = 0;
-    for (uint64_t i = 0; i < nfds && wq_count < max_wq; i++) {
+    size_t valid_fds = 0;
+    for (uint64_t i = 0; i < nfds; i++) {
       int fd = fds[i].fd;
-      if (fd >= 0 && fd < MAX_FDS && t->fds[fd] && t->fds[fd]->wait_queue) {
-        wait_queue_t *wq = (wait_queue_t *)t->fds[fd]->wait_queue;
-        wq_entries[wq_count].thread = t;
-        wq_entries[wq_count].next = NULL;
-        wq_ptrs[wq_count] = wq;
-        wait_queue_add(wq, &wq_entries[wq_count]);
-        wq_count++;
+      if (fd >= 0 && fd < MAX_FDS && t->fds[fd]) {
+        valid_fds++;
+        if (wq_count < max_wq && t->fds[fd]->wait_queue) {
+          wait_queue_t *wq = (wait_queue_t *)t->fds[fd]->wait_queue;
+          wq_entries[wq_count].thread = t;
+          wq_entries[wq_count].next = NULL;
+          wq_ptrs[wq_count] = wq;
+          wait_queue_add(wq, &wq_entries[wq_count]);
+          wq_count++;
+        }
       }
     }
 
     t->state = THREAD_BLOCKED;
+    uint64_t safety_at = lapic_timer_get_ticks() + POLL_SAFETY_NET_MS;
     if (deadline != (uint64_t)-1) {
-      t->wakeup_ticks = deadline;
+      t->wakeup_ticks = (deadline < safety_at) ? deadline : safety_at;
     } else {
-      t->wakeup_ticks = lapic_timer_get_ticks() + 10;
+      t->wakeup_ticks = safety_at;
     }
 
     ready = poll_check_fds(fds, nfds, t);
@@ -196,7 +207,13 @@ static uint64_t sys_ppoll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ptr,
 static uint64_t do_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
                             uint64_t exceptfds, uint64_t timeout_ms) {
   size_t set_size = (nfds + 7) / 8;
-  struct pollfd pfds[MAX_FDS];
+  if (nfds == 0)
+    return 0;
+  if (nfds > MAX_FDS)
+    nfds = MAX_FDS;
+  struct pollfd *pfds = kmalloc(nfds * sizeof(*pfds));
+  if (!pfds)
+    return (uint64_t)-12; // ENOMEM
   uint64_t p_count = 0;
   for (int fd = 0; fd < (int)nfds && p_count < MAX_FDS; fd++) {
     short events = 0;
@@ -228,12 +245,15 @@ static uint64_t do_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
       memset((void *)writefds, 0, set_size);
     if (exceptfds)
       memset((void *)exceptfds, 0, set_size);
+    kfree(pfds);
     return 0;
   }
 
   uint64_t ready = do_poll(pfds, p_count, timeout_ms);
-  if ((int64_t)ready < 0)
+  if ((int64_t)ready < 0) {
+    kfree(pfds);
     return ready;
+  }
 
   if (readfds)
     memset((void *)readfds, 0, set_size);
@@ -258,6 +278,7 @@ static uint64_t do_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
       res_count++;
     }
   }
+  kfree(pfds);
   return res_count;
 }
 

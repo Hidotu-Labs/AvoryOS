@@ -11,6 +11,34 @@
 
 #include <linuxkpi/native_vfs.h>
 
+/* Small UAPI structs used by probes from Mesa's virtio DRM backend and
+ * libdrm. Keep these layouts in sync with Linux's x86_64 DRM UAPI. */
+struct drm_virtgpu_getparam_uapi {
+  uint64_t param;
+  uint64_t value;
+};
+
+struct drm_virtgpu_get_caps_uapi {
+  uint32_t cap_set_id;
+  uint32_t cap_set_ver;
+  uint64_t addr;
+  uint32_t size;
+  uint32_t pad;
+};
+
+struct drm_mode_list_lessees_uapi {
+  uint32_t count_lessees;
+  uint32_t pad;
+  uint64_t lessees_ptr;
+};
+
+_Static_assert(sizeof(struct drm_virtgpu_getparam_uapi) == 16,
+               "virtgpu getparam UAPI size");
+_Static_assert(sizeof(struct drm_virtgpu_get_caps_uapi) == 24,
+               "virtgpu get_caps UAPI size");
+_Static_assert(sizeof(struct drm_mode_list_lessees_uapi) == 16,
+               "DRM list lessees UAPI size");
+
 struct drm_device global_ascentdrm_dev;
 static struct drm_stats drm_perf_stats;
 
@@ -1177,6 +1205,50 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
 #endif
 
   switch (request) {
+
+  /* Mesa probes virtio ioctls while identifying the DRM driver. This device
+   * is AscentDRM, not virtio-gpu: report the known optional virtio features
+   * as absent, and reject unknown parameter IDs as Linux drivers do. */
+  case 0xC0106443: { /* DRM_IOCTL_VIRTGPU_GETPARAM */
+    if (!arg || !vmm_is_user_addr_range_valid(
+                    arg, sizeof(struct drm_virtgpu_getparam_uapi)))
+      return -14; /* EFAULT */
+    struct drm_virtgpu_getparam_uapi *p = (void *)arg;
+    switch (p->param) {
+    case 1: /* VIRTGPU_PARAM_3D_FEATURES */
+    case 2: /* VIRTGPU_PARAM_CAPSET_QUERY_FIX */
+    case 3: /* VIRTGPU_PARAM_RESOURCE_BLOB */
+    case 4: /* VIRTGPU_PARAM_HOST_VISIBLE */
+    case 5: /* VIRTGPU_PARAM_CROSS_DEVICE */
+    case 6: /* VIRTGPU_PARAM_CONTEXT_INIT */
+    case 7: /* VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs */
+      p->value = 0;
+      return 0;
+    default:
+      return -22; /* EINVAL */
+    }
+  }
+  case 0xC0186449: { /* DRM_IOCTL_VIRTGPU_GET_CAPS */
+    if (!arg || !vmm_is_user_addr_range_valid(
+                    arg, sizeof(struct drm_virtgpu_get_caps_uapi)))
+      return -14; /* EFAULT */
+    /* AscentDRM has no virtio capability sets. EINVAL is the normal
+     * unsupported-capset response; ENOTTY incorrectly claims no handler. */
+    return -22;
+  }
+  case DRM_IOCTL_MODE_LIST_LESSEES: {
+    if (!arg || !vmm_is_user_addr_range_valid(
+                    arg, sizeof(struct drm_mode_list_lessees_uapi)))
+      return -14; /* EFAULT */
+    struct drm_mode_list_lessees_uapi *list = (void *)arg;
+    if (!file->is_master)
+      return -13; /* EACCES */
+    if (list->pad)
+      return -22; /* EINVAL */
+    /* Lease creation is unsupported, so there are no lessees to enumerate. */
+    list->count_lessees = 0;
+    return 0;
+  }
 
   /* ── Version / caps ──────────────────────────────────────────────── */
   case DRM_IOCTL_VERSION: {

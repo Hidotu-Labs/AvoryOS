@@ -2,12 +2,15 @@
 #define FS_RAMFS_H
 
 #include "vfs.h"
+#include "dirindex.h"
 #include "../lock/spinlock.h"
 
-typedef struct child_node {
-  struct vfs_node *node;
-  struct child_node *next;
-} child_node_t;
+/* ramfs stores its children in the shared directory index (dirindex.h):
+ * an order list for readdir plus a name hash for O(1) lookup.  The types are
+ * aliases so the backend code reads exactly as before - ramfs has no
+ * per-directory state beyond the index itself. */
+typedef vfs_child_t child_node_t;
+typedef vfs_dirindex_t ramfs_dir_t;
 
 // For files, device points to this
 typedef struct {
@@ -15,13 +18,6 @@ typedef struct {
   uint32_t capacity;
   uint8_t data_is_pmm;
 } ramfs_file_t;
-
-// For directories, device points to this
-typedef struct {
-  child_node_t *children;
-  child_node_t *cursor;       // sequential readdir resume point
-  uint32_t cursor_index;      // child index the cursor points at
-} ramfs_dir_t;
 
 // Initialize the root ramfs and mount it to fs_root
 void ramfs_init(void);

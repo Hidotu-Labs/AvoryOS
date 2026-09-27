@@ -4,6 +4,7 @@ prog "File Manager (Thunar)" system-file-manager thunar
 prog "File Manager (PCManFM)" system-file-manager pcmanfm
 separator
 menu "Internet" applications-internet {
+    prog "Firefox" web-browser firefox
     prog "NetSurf" web-browser netsurf
     prog "Badwolf" web-browser badwolf
 }

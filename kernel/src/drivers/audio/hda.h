@@ -139,6 +139,8 @@ uint64_t hda_get_played_bytes(void);
 void *hda_get_wait_queue(void);
 void hda_reset_stream(void);
 void hda_set_format(uint32_t rate, uint8_t channels, uint8_t bits);
+bool hda_is_stream_playing(void);
+void hda_start_playback(void);
 
 // Queue introspection.  delay counts everything written but not yet played
 // (software ring plus the DMA ring the DAC is working through), which is what

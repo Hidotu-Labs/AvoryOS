@@ -49,8 +49,17 @@ struct mm_struct {
   uint64_t arg_end;     // User VA just past the last argv string
 };
 
+/*
+ * Drop one lifetime reference on an mm (the reference is taken with an atomic
+ * ref_count++ while holding tid_lock, exactly as vma_unmap_mapping_range()
+ * does).  The last one frees the page tables at `cr3` and then the mm itself,
+ * so a caller that borrowed a reference from a thread lookup has to hand it
+ * back through here rather than simply decrementing.
+ */
+void mm_put(struct mm_struct *mm, uint64_t cr3);
 
-#define MAX_FDS 256
+
+#define MAX_FDS 1024
 
 struct fd_path {
   uint32_t ref_count;
@@ -116,6 +125,7 @@ struct fd_table {
 
 // sigaction flags
 #define SA_SIGINFO 0x00000004
+#define SA_NOCLDWAIT 0x00000002
 #define SA_ONSTACK 0x08000000
 #define SA_RESTORER 0x04000000
 #define SA_NODEFER 0x40000000
@@ -215,6 +225,7 @@ struct thread {
   uint8_t queued_priority;     // Queue containing this thread
   uint64_t ready_since_ms;     // Start of current runnable wait
   struct thread *reap_next;    // Used for automatic reaping of detached threads
+  bool reap_queued;            // Protected by reap_queue_lock; includes in-flight reap
   bool reap_remove_runqueue;   // Remote exit_group victim still needs unlink
   char cwd_path[256];          // Current working directory
   vfs_node_t *cwd_node;        // Current working directory VFS node
@@ -245,11 +256,18 @@ struct thread {
   struct k_sigaction signal_handlers[64];
   uint64_t pending_signals;
   uint32_t signal_sender_pid[64];
+  int pdeath_signal;
+  uint32_t tracer_tid; // ptrace tracer tid (0 = not traced)
   uint64_t signal_mask;
   uint64_t saved_signal_mask;
   bool has_saved_signal_mask;
   uint64_t fault_addr;
   uint32_t fault_code;
+  /* Preserve the original synchronous fault frame when delivery is deferred
+   * until a later syscall (for example, while SIGSEGV is temporarily blocked).
+   * The syscall return frame is not the instruction that caused the fault. */
+  bool fault_regs_valid;
+  struct registers fault_regs;
   uint64_t last_report_rip;
   uint64_t last_report_addr;
   int last_report_sig;
@@ -272,12 +290,16 @@ struct thread {
   // Scheduling/EEVFD priority state
   struct sched_entity se;  // EEVFD scheduling entity
   uint32_t cpu_index;      // Index of CPU this thread is enqueued on
+  bool has_started;        // True once dispatched; its scheduler stack is CPU-local
   uint8_t priority;        // Current dynamic priority (0-31)
   uint8_t static_priority; // Base priority
   int8_t nice_value;       // Userspace nice value (-20..19)
   uint64_t time_slice;     // Remaining ticks in current quantum
   uint64_t
       runtime_total; // Total CPU time consumed (in LAPIC ticks, 1 tick = 1ms)
+  uint64_t runtime_user_ms;
+  uint64_t runtime_system_ms;
+  bool in_syscall;
   uint64_t runtime_burst; // CPU time used in current quantum (for MLFQ)
   char comm[16];          // Executable name (basename, max 15 chars + NUL)
   char exe_path[256];     // Full path of the current executable (for /proc/self/exe)
@@ -323,6 +345,16 @@ struct thread {
    * must not observe the suspended handler's context. */
   uint32_t kpi_irq_depth;
   uint32_t kpi_softirq_depth;
+
+  /* Browser syscall tracing (debug builds, SYSCALL_LOG=2).  Set when this
+   * task execs something under badwolf/WebKit/bwrap and inherited by its
+   * children, so the whole browser process tree can be traced without
+   * drowning the log in every other process.  Appended at the end: assembly
+   * pins offsets earlier in this struct, not these. */
+  bool trace_syscalls;
+  uint64_t last_error_syscall_num;
+  char last_error_path[128];
+  char last_stderr[256];
 };
 
 /*
@@ -336,10 +368,13 @@ struct sched_thread_snapshot {
   uint32_t pgid;
   thread_state_t state;
   uint64_t runtime_total;
-  uint64_t virt_bytes;
-  uint64_t resident_bytes;
+  uint64_t runtime_user_ms;
+  uint64_t runtime_system_ms;
   uint32_t uid, gid, euid, egid, suid, sgid;
+  uint32_t cpu_index;
   char comm[16];
+  char exe_path[256];
+  char cwd_path[256];
 };
 
 bool fd_path_set(struct thread *t, int fd, const char *path);
@@ -359,6 +394,8 @@ struct thread *sched_create_kernel_thread(void (*entry_point)(void),
 
 void sched_tick(struct registers *regs);
 void sched_yield_user(void);
+void sched_itimer_arm(struct thread *t, uint64_t next_ms, uint64_t interval_ms, uint64_t value_ms);
+void sched_itimer_disarm(struct thread *t);
 
 /* Deferred preemption point for the interrupt and syscall return paths.
  * to_user is true when the caller is about to return to ring 3. */
@@ -378,6 +415,17 @@ bool sched_terminate_thread(uint32_t tid);
 struct thread *sched_get_thread_by_tid(uint32_t tid);
 bool sched_get_thread_snapshot(uint32_t tid,
                                struct sched_thread_snapshot *snapshot);
+
+/*
+ * Virtual and resident bytes behind a thread's address space, for
+ * /proc/<pid>/{status,statm}.  Deliberately not part of
+ * sched_get_thread_snapshot(): this walks the process's page tables, which is
+ * correct but far too expensive to run on every procfs probe - and on the
+ * futex fast path, which shares the snapshot helper.  Returns false when the
+ * thread (or its mm) is gone, having zeroed both outputs.
+ */
+bool sched_get_mem_snapshot(uint32_t tid, uint64_t *virt_bytes,
+                            uint64_t *resident_bytes);
 size_t sched_read_thread_auxv(uint32_t tid, uint32_t offset, uint32_t size,
                               uint8_t *buffer);
 /* /proc/<pid>/cmdline backing store: copies out of the argv snapshot taken at
@@ -395,12 +443,16 @@ bool sched_get_fd_path_snapshot(uint32_t tid, uint32_t fd, char *path,
 void sched_reap_thread(struct thread *t);
 void sched_queue_reap(struct thread *t);
 void sched_queue_reap_and_wait(struct thread *t);
+bool sched_prepare_thread_reap(struct thread *t);
 void sched_terminate_thread_group(struct thread *current);
 void sched_share_files(struct thread *child, struct thread *parent);
 void sched_release_files(struct thread *t);
 bool sched_ensure_files(struct thread *t);
 
 // Returns the total number of threads in the global thread list
+/* Exact length of global_thread_count's list, maintained atomically at the
+ * insert/unlink sites so readers never walk global_thread_list. */
+extern uint32_t global_thread_count;
 uint16_t sched_get_thread_count(void);
 uint16_t sched_get_runnable_thread_count(void);
 
@@ -408,6 +460,8 @@ uint16_t sched_get_runnable_thread_count(void);
 // *out_user_ms = sum of runtime_total for non-idle threads (ms)
 // *out_idle_ms = total elapsed CPU-ms minus user_ms (ms)
 void sched_get_total_cpu_ms(uint64_t *out_user_ms, uint64_t *out_idle_ms);
+void sched_get_cpu_times(uint32_t cpu_id, uint64_t *out_user_ms,
+                         uint64_t *out_system_ms, uint64_t *out_idle_ms);
 
 // Returns the head of the global thread list (caller must hold no locks;
 // used by procfs for read-only enumeration under tid_lock)

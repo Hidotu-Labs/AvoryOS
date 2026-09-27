@@ -27,6 +27,7 @@ static inline void cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax,
 static uint32_t feat_max_leaf;
 static uint32_t feat_1_ecx;
 static uint32_t feat_7_0_ebx;
+static uint64_t feat_xstate_mask;
 static bool feat_probed;
 
 static void features_probe(void) {
@@ -34,6 +35,11 @@ static void features_probe(void) {
   cpuid(1, 0, NULL, NULL, &feat_1_ecx, NULL);
   if (feat_max_leaf >= 7)
     cpuid(7, 0, NULL, &feat_7_0_ebx, NULL, NULL);
+  if (feat_max_leaf >= 0xD) {
+    uint32_t xstate_lo = 0, xstate_hi = 0;
+    cpuid(0xD, 0, &xstate_lo, NULL, NULL, &xstate_hi);
+    feat_xstate_mask = ((uint64_t)xstate_hi << 32) | xstate_lo;
+  }
   __atomic_store_n(&feat_probed, true, __ATOMIC_RELEASE);
 }
 
@@ -104,6 +110,8 @@ static void cpu_pat_init(void) {
 }
 
 bool cpu_has_xsave_flag = false;
+/* x87 + SSE are the architectural baseline once OSXSAVE is enabled. */
+uint64_t cpu_xsave_mask = 3ULL;
 bool cpu_has_smap_flag = false;
 
 // Enable SSE/SSE2, PCID, FSGSBASE, AVX/XSAVE, SMEP and SMAP for long mode.
@@ -156,16 +164,28 @@ void cpu_features_init(void) {
 
   __asm__ volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
 
-  // Initialize XCR0 with x87, SSE, and AVX state components
+  // Initialize XCR0 with x87, SSE, and AVX state components. AVX-512
+  // instructions also require opmask and ZMM state (XCR0 bits 5-7). The CPU
+  // may advertise AVX-512 directly to user mode, so leaving those components
+  // disabled makes otherwise valid userspace AVX-512 code raise #UD/SIGILL.
   if (cpu_has_xsave()) {
     uint64_t xcr0 = 1ULL | 2ULL; // x87 (bit 0) | SSE (bit 1)
     if (cpu_has_avx()) {
       xcr0 |= 4ULL; // AVX (bit 2)
     }
+    const uint64_t avx512_state = (1ULL << 5) | (1ULL << 6) | (1ULL << 7);
+    const bool avx512f = feat_max_leaf >= 7 && (feat_7_0_ebx & (1U << 16));
+    if (avx512f && cpu_has_avx() &&
+        (feat_xstate_mask & avx512_state) == avx512_state) {
+      xcr0 |= avx512_state;
+    }
+    /* Publish the exact enabled state set before any thread context can use
+     * XSAVE/XRSTOR.  Requesting all bits in those instructions is not valid:
+     * the mask must be a subset of XCR0 or the CPU raises #GP. */
     xsetbv(0, xcr0);
+    __atomic_store_n(&cpu_xsave_mask, xcr0, __ATOMIC_RELEASE);
   }
 
   __asm__ volatile("fninit");
   cpu_pat_init();
 }
-

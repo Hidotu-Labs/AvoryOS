@@ -628,6 +628,8 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     int total_fds = 0;
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg);
     while (cmsg) {
+      if (cmsg->cmsg_len < sizeof(struct cmsghdr))
+        break;
       if (cmsg->cmsg_len >= sizeof(struct cmsghdr) &&
           cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
         int count = (int)((cmsg->cmsg_len - CMSG_ALIGN(sizeof(struct cmsghdr))) / sizeof(int));
@@ -645,11 +647,15 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
 
         cmsg = CMSG_FIRSTHDR(msg);
         while (cmsg) {
+          if (cmsg->cmsg_len < sizeof(struct cmsghdr))
+            break;
           if (cmsg->cmsg_len >= sizeof(struct cmsghdr) &&
               cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
             int *fds = (int *)CMSG_DATA(cmsg);
             int count = (int)((cmsg->cmsg_len - CMSG_ALIGN(sizeof(struct cmsghdr))) / sizeof(int));
             for (int i = 0; i < count; i++) {
+              if (scm_item->count >= total_fds)
+                break;
               int fd = fds[i];
               if (fd >= 0 && fd < MAX_FDS && current->fds[fd]) {
                 vfs_node_t *node = current->fds[fd];
@@ -771,6 +777,8 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   int total_fds = 0;
   struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg);
   while (cmsg) {
+    if (cmsg->cmsg_len < sizeof(struct cmsghdr))
+      break;
     if (cmsg->cmsg_len >= sizeof(struct cmsghdr) &&
         cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
       int count = (int)((cmsg->cmsg_len - CMSG_ALIGN(sizeof(struct cmsghdr))) /
@@ -790,12 +798,16 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
 
       cmsg = CMSG_FIRSTHDR(msg);
       while (cmsg) {
+        if (cmsg->cmsg_len < sizeof(struct cmsghdr))
+          break;
         if (cmsg->cmsg_len >= sizeof(struct cmsghdr) &&
             cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
           int *fds = (int *)CMSG_DATA(cmsg);
           int count = (int)((cmsg->cmsg_len - CMSG_ALIGN(sizeof(struct cmsghdr))) /
                             sizeof(int));
           for (int i = 0; i < count; i++) {
+            if (scm_item->count >= total_fds)
+              break;
             int fd = fds[i];
             if (fd >= 0 && fd < MAX_FDS && current->fds[fd]) {
               vfs_node_t *node = current->fds[fd];
@@ -916,6 +928,7 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     goto no_data;
 
   struct thread *current = sched_get_current();
+  bool is_peek = (flags & 0x02) != 0; // MSG_PEEK
 
   if (sock->type == SOCK_SEQPACKET || sock->type == SOCK_DGRAM) {
     while (1) {
@@ -1007,7 +1020,7 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       }
     }
 
-    if (pkt->scm != NULL) {
+    if (pkt->scm != NULL && !is_peek) {
       unix_scm_msg_t *head = pkt->scm;
       if (have_control && control_capacity - control_used >= sizeof(struct cmsghdr)) {
         struct cmsghdr *cmsg = (struct cmsghdr *)
@@ -1026,6 +1039,8 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         int actual_count = 0;
         for (int i = 0; i < max_fds; i++) {
           vfs_node_t *node = head->nodes[i];
+          if (!node)
+            continue;
           int new_fd = alloc_fd(current);
           if (new_fd >= 0) {
             current->fds[new_fd] = node;
@@ -1112,6 +1127,8 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   }
 
   // Block until data is available; keep recv_lock held on exit from loop
+  // An SCM_RIGHTS message with zero payload still makes recvmsg readable:
+  // break when an SCM sits at the current stream position even with no bytes.
   while (1) {
     spinlock_acquire(&usk->recv_lock);
 
@@ -1122,6 +1139,9 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
 
     if (available > 0)
       break; // Data ready – recv_lock stays held
+    if (usk->scm_queue_head != NULL &&
+        usk->bytes_read >= usk->scm_queue_head->stream_offset)
+      break; // Zero-data SCM ready – deliver control without data
 
     if (sock->closing || sock->state != SS_CONNECTED) {
       spinlock_release(&usk->recv_lock);
@@ -1203,7 +1223,7 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   }
 
   size_t max_stream_bytes = (size_t)-1;
-  if (usk->scm_queue_head != NULL) {
+  if (usk->scm_queue_head != NULL && !is_peek) {
     unix_scm_msg_t *head = usk->scm_queue_head;
     if (usk->bytes_read < head->stream_offset) {
       // SCM belongs to future bytes in the stream.
@@ -1211,7 +1231,20 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       max_stream_bytes = head->stream_offset - usk->bytes_read;
     } else {
       // Stream position is at SCM boundary: deliver SCM!
-      if (have_control && control_capacity - control_used >= sizeof(struct cmsghdr)) {
+      // Without a control buffer the fds are discarded (Linux: MSG_CTRUNC).
+      if (!have_control) {
+        msg->msg_flags |= MSG_CTRUNC;
+        for (int i = 0; i < head->count; i++) {
+          if (head->nodes[i]) {
+            vfs_close(head->nodes[i]);
+            head->nodes[i] = NULL;
+          }
+        }
+        usk->scm_queue_head = head->next;
+        if (!usk->scm_queue_head)
+          usk->scm_queue_tail = NULL;
+        kfree(head);
+      } else if (control_capacity - control_used >= sizeof(struct cmsghdr)) {
         struct cmsghdr *cmsg = (struct cmsghdr *)
             ((uint8_t *)msg->msg_control + control_used);
         cmsg->cmsg_level = SOL_SOCKET;
@@ -1228,6 +1261,8 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         int actual_count = 0;
         for (int i = 0; i < max_fds; i++) {
           vfs_node_t *node = head->nodes[i];
+          if (!node)
+            continue;
           int new_fd = alloc_fd(current);
           if (new_fd >= 0) {
             current->fds[new_fd] = node;
@@ -1253,32 +1288,39 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
           }
         }
 
-        if (!(flags & 0x02)) { // MSG_PEEK
-          usk->scm_queue_head = head->next;
-          if (!usk->scm_queue_head)
-            usk->scm_queue_tail = NULL;
-          kfree(head);
-        }
-      } else if (have_control) {
+        usk->scm_queue_head = head->next;
+        if (!usk->scm_queue_head)
+          usk->scm_queue_tail = NULL;
+        kfree(head);
+      } else {
         msg->msg_flags |= MSG_CTRUNC;
-        if (!(flags & 0x02)) {
-          for (int i = 0; i < head->count; i++) {
-            if (head->nodes[i]) {
-              vfs_close(head->nodes[i]);
-              head->nodes[i] = NULL;
-            }
+        for (int i = 0; i < head->count; i++) {
+          if (head->nodes[i]) {
+            vfs_close(head->nodes[i]);
+            head->nodes[i] = NULL;
           }
-          usk->scm_queue_head = head->next;
-          if (!usk->scm_queue_head)
-            usk->scm_queue_tail = NULL;
-          kfree(head);
         }
+        usk->scm_queue_head = head->next;
+        if (!usk->scm_queue_head)
+          usk->scm_queue_tail = NULL;
+        kfree(head);
       }
 
       // If another SCM is queued after this one, cap read to that SCM's boundary
       if (usk->scm_queue_head && usk->scm_queue_head->stream_offset > usk->bytes_read) {
         max_stream_bytes = usk->scm_queue_head->stream_offset - usk->bytes_read;
       }
+    }
+  } else if (usk->scm_queue_head != NULL && is_peek) {
+    // MSG_PEEK must not consume or install SCM fds: leave queued and cap
+    // the data peek at the SCM boundary so fd/message association is kept.
+    // At the boundary itself, peek the message data without consuming the SCM;
+    // the real recv will deliver both together.
+    unix_scm_msg_t *head = usk->scm_queue_head;
+    if (usk->bytes_read < head->stream_offset) {
+      max_stream_bytes = head->stream_offset - usk->bytes_read;
+    } else if (head->next && head->next->stream_offset > usk->bytes_read) {
+      max_stream_bytes = head->next->stream_offset - usk->bytes_read;
     }
   }
 

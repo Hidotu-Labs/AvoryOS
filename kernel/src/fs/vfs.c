@@ -1,4 +1,5 @@
 #include "vfs.h"
+#include "dirindex.h"
 #include "../console/klog.h"
 #include "../lib/string.h"
 #include "../lib/tsc.h"
@@ -47,6 +48,11 @@ typedef struct vfs_mount_entry {
   vfs_node_t *target;
   char dev_name[64];
   char fs_type[32];
+  /* The mountpoint as userspace sees it ("/run", "/tmp", ...).  /proc/mounts
+   * must report this rather than the mountpoint node's bare name: tools like
+   * OpenRC's mountinfo compare the second field against a full path, and with
+   * only "run" they would mount a fresh tmpfs over the kernel's /run. */
+  char path[256];
   struct vfs_mount_entry *next;
 } vfs_mount_entry_t;
 
@@ -827,8 +833,17 @@ int vfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
 
 int vfs_unlink(vfs_node_t *node, char *name) {
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->unlink) {
+    /* Keep the resolved vnode alive across dentry invalidation and the
+     * backend unlink.  Filesystems can then retire the actual object after
+     * removing its name, while open descriptors and mappings drain normally. */
+    vfs_node_t *target = vfs_finddir(node, name);
     vfs_dentry_invalidate(node, name);
-    return node->unlink(node, name);
+    int result = node->unlink(node, name);
+    if (result == 0 && target)
+      vfs_node_retire(target);
+    if (target)
+      vfs_close(target);
+    return result;
   }
   return -1;
 }
@@ -860,9 +875,20 @@ int vfs_symlink(vfs_node_t *node, char *name, char *target) {
 
 int vfs_rename(vfs_node_t *node, char *old_name, char *new_name) {
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->rename) {
+    vfs_node_t *source = vfs_finddir(node, old_name);
+    vfs_node_t *replaced = vfs_finddir(node, new_name);
     vfs_dentry_invalidate(node, old_name);
     vfs_dentry_invalidate(node, new_name);
-    return node->rename(node, old_name, new_name);
+    int result = node->rename(node, old_name, new_name);
+    bool same_inode = source && replaced && source->device == replaced->device &&
+                      source->inode == replaced->inode;
+    if (result == 0 && replaced && !same_inode)
+      vfs_node_retire(replaced);
+    if (replaced)
+      vfs_close(replaced);
+    if (source)
+      vfs_close(source);
+    return result;
   }
   return -1;
 }
@@ -908,12 +934,23 @@ int vfs_fallocate(vfs_node_t *node, int mode, uint32_t offset, uint32_t len) {
   }
   if (node && (node->flags & FS_TYPE_MASK) == FS_FILE) {
     // Mode 0: standard allocation (posix_fallocate)
-    if (mode == 0) {
+    // Mode 1: FALLOC_FL_KEEP_SIZE (allocate space without extending file size)
+    if (mode == 0 || mode == 0x01) {
       uint32_t required = offset + len;
       if (required > node->length) {
-        if (node->truncate)
-          return node->truncate(node, required);
-        node->length = required;
+        if (mode == 0) {
+          if (node->truncate)
+            return node->truncate(node, required);
+          node->length = required;
+        } else {
+          // KEEP_SIZE: ensure underlying space without altering node->length
+          if (node->truncate) {
+            uint32_t old_len = node->length;
+            int r = node->truncate(node, required);
+            node->length = old_len;
+            return r;
+          }
+        }
       }
       return 0;
     }
@@ -935,7 +972,7 @@ int vfs_poll(vfs_node_t *node, int events) {
 #define MAX_SYMLINK_DEPTH 8
 
 vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
-  if (!path || !fs_root)
+  if (!path || !path[0] || !fs_root)
     return 0;
 
   vfs_node_t *effective_dir = (path[0] == '/') ? fs_root : (dir ? dir : fs_root);
@@ -955,6 +992,14 @@ vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
   vfs_open(current); // Reference for 'current'
 
   int symlink_depth = 0;
+  /* Set when this walk descends through (or starts in) a node marked
+   * FS_DENTRY_NOCACHE: a synthetic container whose children are generated
+   * per lookup and disappear with their task (procfs' /proc root and its
+   * per-task pid dirs, drm's dynamic nodes).  Such a result is not a pure
+   * function of the path string, so it must never enter the full-path
+   * cache — see the insert at the end of this function. */
+  bool synthetic_descent =
+      (effective_dir->flags & FS_DENTRY_NOCACHE) != 0;
   char *p = path_buf;
 
 #define VFS_PARENT_STACK_DEPTH 32
@@ -1051,6 +1096,8 @@ vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
     }
 
     // Descent
+    if ((next->flags & FS_DENTRY_NOCACHE) != 0)
+      synthetic_descent = true;
     if (stack_top < VFS_PARENT_STACK_DEPTH - 1) {
       stack_top++;
       parent_stack[stack_top] = current;
@@ -1068,8 +1115,18 @@ vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
     vfs_close(parent_stack[j]);
   }
 
-  // Cache successfully resolved path
-  if (current && strstr(path, "..") == NULL) {
+  /* Cache successfully resolved path — but only for walks that never left an
+   * ordinary (non-synthetic) tree.  A cached /proc entry would outlive the
+   * task that produced it: the first process to open "/proc/self/statm"
+   * pinned its own <tid>/statm node for every later opener, and once that
+   * task was reaped the node read as EOF forever, so open()+pread() never
+   * delivered three parseable fields again (Roblox logs
+   * "[FLog::Output] Failed to scan size, resident, and shared" on every
+   * memory poll).  /proc/self is caller-dependent on top of that: no single
+   * cached node can ever be right for every caller.  Skipping the insert
+   * makes each open walk the subtree again, which is also what Linux pays
+   * for /proc lookups. */
+  if (current && !synthetic_descent && strstr(path, "..") == NULL) {
     vfs_path_cache_insert(effective_dir, path, current);
   }
 
@@ -1107,7 +1164,8 @@ bool vfs_node_is_alive(const vfs_node_t *node) {
 }
 
 int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
-                 const char *dev_name, const char *fs_type) {
+                 const char *dev_name, const char *fs_type,
+                 const char *path) {
   if (!target)
     return -1;
 
@@ -1118,6 +1176,17 @@ int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
   entry->target = target;
   strncpy(entry->dev_name, dev_name ? dev_name : "none", 63);
   strncpy(entry->fs_type, fs_type ? fs_type : "unknown", 31);
+  entry->dev_name[63] = '\0';
+  entry->fs_type[31] = '\0';
+  if (path && path[0]) {
+    strncpy(entry->path, path, sizeof(entry->path) - 1);
+    entry->path[sizeof(entry->path) - 1] = '\0';
+  } else if (mountpoint) {
+    strncpy(entry->path, mountpoint->name, sizeof(entry->path) - 1);
+    entry->path[sizeof(entry->path) - 1] = '\0';
+  } else {
+    strcpy(entry->path, "/");
+  }
   entry->next = vfs_mount_list;
   vfs_mount_list = entry;
 
@@ -1135,7 +1204,7 @@ int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
 }
 
 int vfs_mount(vfs_node_t *mountpoint, vfs_node_t *target) {
-  return vfs_mount_ex(mountpoint, target, "none", "unknown");
+  return vfs_mount_ex(mountpoint, target, "none", "unknown", NULL);
 }
 
 int vfs_statfs(vfs_node_t *node, void *buf) {
@@ -1173,12 +1242,11 @@ int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count) {
 
   vfs_mount_entry_t *curr = vfs_mount_list;
   while (curr && count < max_count) {
-    if (curr->mountpoint) {
-      strncpy(buffer[count].mountpoint, curr->mountpoint->name, 127);
-      buffer[count].mountpoint[127] = '\0';
-    } else {
-      strcpy(buffer[count].mountpoint, "/");
-    }
+    /* Use the recorded mountpoint path, not the node's name: userspace
+     * (OpenRC's mountinfo, findmnt, ...) matches full paths. */
+    strncpy(buffer[count].mountpoint,
+            (curr->path[0] ? curr->path : "/"), 127);
+    buffer[count].mountpoint[127] = '\0';
 
     strncpy(buffer[count].target, curr->target->name, 127);
     buffer[count].target[127] = '\0';
@@ -1353,10 +1421,74 @@ void vfs_selftest_maybe_run(void) {
   klog_puts("[VFS-SELFTEST] path cache invalidation + page cache refs\n");
   bool path_ok = vfs_path_cache_selftest();
   bool page_ok = vfs_cache_ref_selftest();
+  bool dir_ok = vfs_dirindex_selftest();
   klog_puts("[VFS-SELFTEST] path cache: ");
   klog_puts(path_ok ? "PASS" : "FAIL");
   klog_puts(", page cache refs: ");
   klog_puts(page_ok ? "PASS" : "FAIL");
+  klog_puts(", dirindex: ");
+  klog_puts(dir_ok ? "PASS" : "FAIL");
+  klog_putchar('\n');
+}
+
+/* ── `vfs_selftest` for /proc resolutions ───────────────────────────────────
+ *
+ * Called from kmain() after procfs_init(): the checks above need the mounted
+ * root, this one needs a mounted /proc.  Same `vfs_selftest` token.
+ *
+ * /proc nodes are generated per lookup and die with their task, and
+ * /proc/self resolves differently for every caller, so no resolution under
+ * /proc may be entered into the full-path cache.  When one was, the first
+ * process to open "/proc/self/statm" pinned its own <tid>/statm node for
+ * every later opener: once that task was reaped the node read as EOF
+ * forever, so open()+pread() never delivered three parseable fields again
+ * (Roblox logs "[FLog::Output] Failed to scan size, resident, and shared"
+ * on every memory poll). */
+void vfs_procfs_selftest(void) {
+  if (!kernel_boot_cmdline || !strstr(kernel_boot_cmdline, "vfs_selftest"))
+    return;
+
+  vfs_selftest_failures = 0;
+
+  vfs_node_t *node = vfs_resolve_path("/proc/self/statm");
+  vfs_selftest_expect(node != NULL, "/proc/self/statm resolves");
+  if (node) {
+    uint8_t buf[64];
+    vfs_selftest_expect(vfs_read(node, 0, sizeof(buf) - 1, buf) > 0,
+                        "/proc/self/statm read returns data");
+    vfs_close(node);
+  }
+
+  vfs_node_t *cached = vfs_path_cache_lookup(fs_root, "/proc/self/statm");
+  vfs_selftest_expect(!cached,
+                      "/proc/self/statm has no full-path cache entry");
+  if (cached)
+    vfs_close(cached);
+
+  struct thread *self = sched_get_current();
+  if (self) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%u/statm", self->tid);
+
+    vfs_node_t *pid_node = vfs_resolve_path(path);
+    vfs_selftest_expect(pid_node != NULL,
+                        "explicit /proc/<tid>/statm resolves");
+    if (pid_node) {
+      uint8_t buf[64];
+      vfs_selftest_expect(vfs_read(pid_node, 0, sizeof(buf) - 1, buf) > 0,
+                          "explicit /proc/<tid>/statm read returns data");
+      vfs_close(pid_node);
+    }
+
+    cached = vfs_path_cache_lookup(fs_root, path);
+    vfs_selftest_expect(
+        !cached, "explicit /proc/<tid>/statm has no full-path cache entry");
+    if (cached)
+      vfs_close(cached);
+  }
+
+  klog_puts("[VFS-SELFTEST] procfs paths: ");
+  klog_puts(vfs_selftest_failures == 0 ? "PASS" : "FAIL");
   klog_putchar('\n');
 }
 
@@ -1497,5 +1629,8 @@ void vfs_bench_maybe_run(void) {
   if (!vfs_path_unlink_bench())
     klog_puts("[VFS-BENCH] create+unlink pair skipped: no writable /tmp\n");
   vfs_cache_bench();
+  /* Last: the dirindex A/B creates and removes its own files under /tmp, so
+   * it runs after the caches above have taken their measurements. */
+  vfs_dirindex_bench();
   klog_puts("[VFS-BENCH] done\n");
 }

@@ -71,6 +71,13 @@ typedef struct epitem {
   
   // Edge-triggered state tracking
   uint32_t last_events;        // Last known event state (for ET mode)
+  /* One-shot cached edge: the event mask that was actually true when
+   * epoll_notify_event()/epoll_notify_socket() queued this item on the ready
+   * list (or when the in-wait rescan found it).  ep_check_events() consumes
+   * it with an atomic exchange instead of re-polling the fd, then falls back
+   * to a real vfs_poll() on every subsequent check - a stale mask is trusted
+   * at most once, which keeps level-triggered requeue verification honest. */
+  uint32_t ready_events;
   bool on_ready_list;          // Currently on ready list
   bool oneshot;                // One-shot mode active
   bool oneshot_disabled;        // One-shot has fired, needs re-arm
@@ -94,7 +101,10 @@ typedef struct eventpoll {
    * so the missed-wakeup rescan in epoll_wait_impl() can walk this instead of
    * all EPOLL_MAX_WATCHED slots on every pass. */
   int items_high;
-  
+  /* Tick at which the next rate-limited fallback rescan may run.  Zero means
+   * "due now", so the first wait after create still performs a full scan. */
+  uint64_t next_scan_ticks;
+
   // Ready list - FDs with events pending
   struct list_head rdllist;    // Ready list head
   int rdllist_count;           // Number of ready items

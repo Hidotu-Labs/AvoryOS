@@ -1,6 +1,7 @@
 #include "lapic.h"
 #include "../console/console.h"
 #include "../cpu/isr.h"
+#include "../mm/vmm.h"
 #include "../mm/pmm.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -203,4 +204,37 @@ void lapic_send_ipi_all_but_self(uint8_t vector) {
     return;
   }
   lapic_write(LAPIC_ICR_LOW, icr_low);
+}
+
+/* A panic-stop NMI reaches one online CPU even when it has interrupts
+ * disabled or is stuck in a lock holder. Keep the wait bounded: panic
+ * reporting must not turn a busy LAPIC into an unbounded secondary failure. */
+void lapic_send_nmi(uint32_t apic_id) {
+  if (!lapic_base)
+    return;
+
+  /* xAPIC delivery uses the MMIO window, which user address spaces do not
+   * always map. Borrow the permanent kernel CR3 only for the ICR write, then
+   * restore the crashing task's CR3 so its fault report remains accurate. */
+  uint64_t saved_cr3 = 0;
+  bool switched_cr3 = false;
+  if (!lapic_x2apic) {
+    __asm__ volatile("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint64_t kernel_cr3 =
+        (uint64_t)(uintptr_t)vmm_get_kernel_pml4() & PAGE_MASK;
+    if (kernel_cr3 && (saved_cr3 & PAGE_MASK) != kernel_cr3) {
+      __asm__ volatile("mov %0, %%cr3" : : "r"(kernel_cr3) : "memory");
+      switched_cr3 = true;
+    }
+  }
+
+  for (uint32_t spins = 0; spins < 100000; spins++) {
+    if (lapic_icr_idle())
+      break;
+    __asm__ volatile("pause" ::: "memory");
+  }
+  uint32_t icr_low = LAPIC_ICR_NMI | LAPIC_ICR_EDGE;
+  lapic_write_icr(apic_id, icr_low);
+  if (switched_cr3)
+    __asm__ volatile("mov %0, %%cr3" : : "r"(saved_cr3) : "memory");
 }

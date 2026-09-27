@@ -620,14 +620,23 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
   process_copy_to_user(vmm_get_active_pml4(), final_sp, stack_entries,
                        idx * sizeof(uint64_t));
 
-  klog_puts("[PROC] Stack built:\n");
-  klog_puts("  argc=");
-  klog_uint64(argc);
-  klog_puts("  random_addr=");
-  klog_uint64(at_random_addr);
-  klog_puts("  final_sp=");
-  klog_uint64(final_sp);
-  klog_puts("\n");
+  /* This dump sits inside the execve_stack probe.  Serial console output
+   * costs ~10us per character, so printing it on every exec made each one
+   * pay ~1ms here (measured floor: 941us).  First few launches only. */
+  {
+    static uint32_t stack_dumps;
+    if (stack_dumps < 4) {
+      stack_dumps++;
+      klog_puts("[PROC] Stack built:\n");
+      klog_puts("  argc=");
+      klog_uint64(argc);
+      klog_puts("  random_addr=");
+      klog_uint64(at_random_addr);
+      klog_puts("  final_sp=");
+      klog_uint64(final_sp);
+      klog_puts("\n");
+    }
+  }
 
   kfree(argv_ptrs);
   kfree(envp_ptrs);

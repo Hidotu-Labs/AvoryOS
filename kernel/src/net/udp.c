@@ -252,7 +252,10 @@ ssize_t udp_sendto(struct udp_socket *s, const void *buf, size_t len,
     uint16_t csum = udp_cksum(cfg->address, dst_ip, seg, udp_len);
     put16_be(seg + 6, csum);
 
-    int r = ipv4_send_raw_tos(dst_ip, 17, s->tos, seg, udp_len);
+    uint32_t local_ip = cfg->address;
+    uint16_t local_port = s->local_port;
+    uint8_t tos = s->tos;
+    int r = ipv4_send_raw_tos(dst_ip, 17, tos, seg, udp_len);
     return r < 0 ? (ssize_t)r : (ssize_t)len;
 }
 
@@ -363,12 +366,12 @@ void udp_deliver(uint32_t src_ip, uint16_t src_port,
         s->refs++;
     spinlock_release(&table_lock);
 
-    if (!s)
+    if (!s) {
         return;
+    }
 
     size_t copy = length > UDP_PAYLOAD_MAX ? UDP_PAYLOAD_MAX : length;
     bool wake = false;
-
     spinlock_acquire(&s->lock);
     for (;;) {
         size_t free_bytes = s->rx_capacity - (s->rx_write - s->rx_read);

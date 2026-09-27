@@ -135,8 +135,8 @@
 #define CONFIG_IRQ_DOMAIN 1
 #define CONFIG_HAVE_ARCH_THREAD_STRUCT_WHITELIST 1
 
-/* The kernel boots up to 4 CPUs (tests run at -smp 4); stock headers size
+/* The interactive QEMU desktop boots up to 8 CPUs; stock headers size
  * cpumasks and the percpu offset array from this. */
-#define CONFIG_NR_CPUS 4
+#define CONFIG_NR_CPUS 8
 
 #endif /* __AVORY_LINUXKPI_AUTOCONF_H */

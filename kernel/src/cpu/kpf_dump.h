@@ -5,21 +5,25 @@
 #include "isr.h"
 
 // Report a kernel-mode page fault that the paging engine refused, going
-// straight to the serial port without taking a single lock. Called right
-// before the panic, because the panic itself only writes to the console.
+// straight to the serial port without taking a single lock. Called before the
+// panic screen is written directly to the cached framebuffer scanout.
 void kpf_dump_page_fault(struct registers *regs, uint64_t cr2);
+
+// Compact lock-free register and control-state record for #DF. It avoids page
+// walks, thread lookups, and the ordinary panic/console machinery.
+void kpf_dump_double_fault(struct registers *regs);
 
 // Full lock-free dump for exceptions that never reach the paging engine
 // (#UD, #GP, #SS, unhandled vectors): machine state, thread context, a page
 // walk for RIP, the code bytes there, a stack scan and the RBP chain.
 void kpf_dump_exception(const char *reason, struct registers *regs);
 
-// One lock-free line announcing that a panic started, for the case where the
-// console dump that follows never gets finished.
+// One lock-free line announcing that a panic started, in case later reporting
+// fails before the serial dump or direct scanout has finished.
 void kpf_dump_panic_entry(const char *reason, struct registers *regs);
 
-// Panic on top of a panic that was still printing. The console path is proven
-// unusable at this point, so this is all that goes out before halting.
+// Panic on top of a panic that was still printing. Keep this path compact and
+// lock-free, then halt without attempting a second report.
 void kpf_dump_panic_recursion(const char *reason, struct registers *regs);
 
 #endif

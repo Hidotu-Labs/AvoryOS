@@ -1,5 +1,4 @@
 #include "isr.h"
-#include "../console/console.h"
 #include "../console/klog.h"
 #include "../mm/pmm.h"
 #include "../mm/vma.h"
@@ -15,6 +14,7 @@
 #include "features.h"
 #include "fpu.h"
 #include "kpf_dump.h"
+#include "panic_screen.h"
 #include "ktrack.h"
 #include "msr.h"
 #include "pic.h"
@@ -52,366 +52,6 @@ const char *exception_messages[] = {"Division By Zero",
                                     "VMM Communication Exception",
                                     "Security Exception",
                                     "Reserved"};
-
-// Low-level output helpers
-
-static void print_hex(uint64_t value) {
-  const char *hex_chars = "0123456789ABCDEF";
-  console_puts("0x");
-  for (int i = 15; i >= 0; i--) {
-    console_putchar(hex_chars[(value >> (i * 4)) & 0xF]);
-  }
-}
-
-static void print_hex8(uint8_t value) {
-  const char *hex_chars = "0123456789ABCDEF";
-  console_puts("0x");
-  console_putchar(hex_chars[(value >> 4) & 0xF]);
-  console_putchar(hex_chars[value & 0xF]);
-}
-
-static void print_dec(uint64_t value) {
-  if (value == 0) {
-    console_putchar('0');
-    return;
-  }
-  char buf[21];
-  int i = 0;
-  while (value > 0) {
-    buf[i++] = '0' + (value % 10);
-    value /= 10;
-  }
-  for (int j = i - 1; j >= 0; j--)
-    console_putchar(buf[j]);
-}
-
-static void print_reg_line(const char *name, uint64_t value) {
-  console_puts(name);
-  console_puts(": ");
-  print_hex(value);
-  console_puts("\n");
-}
-
-static void print_yes_no(const char *name, bool value) {
-  console_puts(name);
-  console_puts("=");
-  console_puts(value ? "1 " : "0 ");
-}
-
-static bool is_canonical_addr(uint64_t vaddr) {
-  uint64_t high = vaddr >> 48;
-  return (high == 0x0000ULL) || (high == 0xFFFFULL);
-}
-
-// RFLAGS decoder
-
-static void print_rflags_decoded(uint64_t rflags) {
-  console_puts("RFLAGS: ");
-  print_hex(rflags);
-  console_puts("\n  Flags: ");
-  print_yes_no("CF", (rflags >> 0) & 1);
-  print_yes_no("PF", (rflags >> 2) & 1);
-  print_yes_no("AF", (rflags >> 4) & 1);
-  print_yes_no("ZF", (rflags >> 6) & 1);
-  print_yes_no("SF", (rflags >> 7) & 1);
-  print_yes_no("TF", (rflags >> 8) & 1);
-  print_yes_no("IF", (rflags >> 9) & 1);
-  print_yes_no("DF", (rflags >> 10) & 1);
-  print_yes_no("OF", (rflags >> 11) & 1);
-  console_puts("\n  IOPL=");
-  print_dec((rflags >> 12) & 0x3);
-  print_yes_no(" NT", (rflags >> 14) & 1);
-  print_yes_no("RF", (rflags >> 16) & 1);
-  print_yes_no("VM", (rflags >> 17) & 1);
-  print_yes_no("AC", (rflags >> 18) & 1);
-  print_yes_no("VIF", (rflags >> 19) & 1);
-  print_yes_no("VIP", (rflags >> 20) & 1);
-  print_yes_no("ID", (rflags >> 21) & 1);
-  console_puts("\n");
-}
-
-// Control register diagnostics
-
-static void print_cr_state(void) {
-  uint64_t cr0, cr3, cr4;
-  __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-  __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-  __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
-
-  console_puts("\nCONTROL REGISTERS:\n");
-
-  console_puts("CR0: ");
-  print_hex(cr0);
-  console_puts("\n  ");
-  print_yes_no("PE", (cr0 >> 0) & 1);
-  print_yes_no("WP", (cr0 >> 16) & 1);
-  print_yes_no("PG", (cr0 >> 31) & 1);
-  console_puts("\n");
-
-  console_puts("CR3: ");
-  print_hex(cr3);
-  console_puts("\n  PCID=");
-  print_hex(cr3 & 0xFFF);
-  console_puts(" PML4_PHYS=");
-  print_hex(cr3 & ~0xFFFULL);
-  console_puts("\n");
-
-  console_puts("CR4: ");
-  print_hex(cr4);
-  console_puts("\n  ");
-  print_yes_no("PSE", (cr4 >> 4) & 1);
-  print_yes_no("PAE", (cr4 >> 5) & 1);
-  print_yes_no("PGE", (cr4 >> 7) & 1);
-  print_yes_no("SMEP", (cr4 >> 20) & 1);
-  print_yes_no("SMAP", (cr4 >> 21) & 1);
-  print_yes_no("PKE", (cr4 >> 22) & 1);
-  print_yes_no("CET", (cr4 >> 23) & 1);
-  console_puts("\n");
-}
-
-// GP fault decoder
-
-static void print_gp_error_details(uint64_t err_code) {
-  console_puts("GP_ERR_DETAILS: ");
-  if (err_code == 0) {
-    console_puts("none (not selector-related)\n");
-    return;
-  }
-  const char *tbl_names[] = {"GDT", "IDT", "LDT", "IDT"};
-  uint8_t ext = err_code & 0x1;
-  uint8_t tbl = (err_code >> 1) & 0x3;
-  uint16_t idx = (err_code >> 3) & 0x1FFF;
-  console_puts("ext=");
-  print_hex8(ext);
-  console_puts(" tbl=");
-  console_puts(tbl_names[tbl]);
-  console_puts(" idx=");
-  print_dec(idx);
-  console_puts(" (");
-  print_hex(err_code);
-  console_puts(")\n");
-}
-
-// PF fault error code decoder
-
-static void print_pf_error_details(uint64_t err_code) {
-  bool p = (err_code >> 0) & 1;    /* page present */
-  bool w = (err_code >> 1) & 1;    /* write */
-  bool u = (err_code >> 2) & 1;    /* user mode */
-  bool rsvd = (err_code >> 3) & 1; /* reserved bit set in PTE */
-  bool i = (err_code >> 4) & 1;    /* instruction fetch */
-  bool pk = (err_code >> 5) & 1;   /* protection key */
-  bool ss = (err_code >> 6) & 1;   /* shadow stack */
-
-  console_puts("PF_ERR_DETAILS: ");
-  print_yes_no("P", p);
-  print_yes_no("W", w);
-  print_yes_no("U", u);
-  print_yes_no("RSVD", rsvd);
-  print_yes_no("I", i);
-  print_yes_no("PK", pk);
-  print_yes_no("SS", ss);
-  console_puts("\n  Cause: ");
-  if (i)
-    console_puts("instruction fetch from ");
-  else if (w)
-    console_puts("write to ");
-  else
-    console_puts("read from ");
-  console_puts(p ? "present page (protection violation)" : "non-present page");
-  if (u)
-    console_puts(", from user mode");
-  else
-    console_puts(", from kernel mode");
-  if (rsvd)
-    console_puts(" [RSVD BIT IN PTE - possible corruption]");
-  if (pk)
-    console_puts(" [protection-key violation]");
-  if (ss)
-    console_puts(" [shadow stack violation]");
-  console_puts("\n");
-}
-
-static void analyze_pte_corruption(uint64_t pte) {
-  const uint64_t PA_MASK = 0x000FFFFFFFFFF000ULL;
-  const uint64_t LOW_MASK = 0xFFFULL;               /* bits [11:0] */
-  const uint64_t HIGH_MASK = 0x7FF0000000000000ULL; /* bits [62:52] */
-
-  uint64_t low_bits = pte & LOW_MASK;
-  uint64_t high_bits = pte & HIGH_MASK;
-  uint64_t pa = pte & PA_MASK;
-
-  bool present = (pte >> 0) & 1;
-  bool rw = (pte >> 1) & 1;
-  bool us = (pte >> 2) & 1;
-  bool dirty = (pte >> 6) & 1;
-  bool global = (pte >> 8) & 1;
-  bool nx = (pte >> 63) & 1;
-
-  console_puts("  PTE_CORRUPTION_ANALYSIS:\n");
-  console_puts("    raw=");
-  print_hex(pte);
-  console_puts("\n    PA field=");
-  print_hex(pa);
-  console_puts("\n    low_bits[11:0]=");
-  print_hex(low_bits);
-  console_puts(" high_bits[62:52]=");
-  print_hex(high_bits);
-  console_puts("\n");
-
-  if (high_bits != 0) {
-    console_puts("    WARN: bits [62:52] are non-zero (");
-    print_hex(high_bits);
-    console_puts(") -- reserved or OS-specific bits set; likely corruption\n");
-  }
-
-  uint32_t lo32 = (uint32_t)(pte & 0xFFFFFFFFULL);
-  uint32_t hi32 = (uint32_t)(pte >> 32);
-  if (hi32 != 0 && hi32 != 0xFFFFFFFF) {
-    uint32_t diff = lo32 ^ hi32;
-    if (__builtin_popcount(diff) <= 4) {
-      console_puts("    WARN: upper and lower 32-bit halves differ by only ");
-      print_dec(__builtin_popcount(diff));
-      console_puts(" bit(s) (lo=");
-      print_hex(lo32);
-      console_puts(" hi=");
-      print_hex(hi32);
-      console_puts(
-          ") -- looks like a 32-bit value replicated into both halves\n");
-    }
-  }
-
-  if (!present && dirty)
-    console_puts("    WARN: D=1 but P=0 (dirty non-present page)\n");
-  if (!present && global)
-    console_puts("    WARN: G=1 but P=0 (global non-present page)\n");
-  if (!rw && dirty)
-    console_puts("    NOTE: D=1 but RW=0 (was writable, now read-only)\n");
-  if (nx && !us && !present)
-    console_puts("    NOTE: NX + kernel + non-present\n");
-
-  if (high_bits == 0 && lo32 == 0 && hi32 == 0)
-    console_puts("    PTE is completely zero (was never mapped or was "
-                 "explicitly cleared)\n");
-}
-
-static void print_paging_entry_flags(uint64_t entry, bool is_leaf,
-                                     bool is_pde) {
-  print_yes_no("P", (entry & (1ULL << 0)) != 0);
-  print_yes_no("RW", (entry & (1ULL << 1)) != 0);
-  print_yes_no("US", (entry & (1ULL << 2)) != 0);
-  print_yes_no("PWT", (entry & (1ULL << 3)) != 0);
-  print_yes_no("PCD", (entry & (1ULL << 4)) != 0);
-  print_yes_no("A", (entry & (1ULL << 5)) != 0);
-  if (is_leaf || is_pde)
-    print_yes_no("D", (entry & (1ULL << 6)) != 0);
-  if (is_pde)
-    print_yes_no("PS", (entry & (1ULL << 7)) != 0);
-  else if (is_leaf)
-    print_yes_no("PAT", (entry & (1ULL << 7)) != 0);
-  if (is_leaf)
-    print_yes_no("G", (entry & (1ULL << 8)) != 0);
-  print_yes_no("NX", (entry & (1ULL << 63)) != 0);
-  console_puts("\n");
-}
-
-static void print_entry_summary(const char *name, size_t idx, uint64_t entry,
-                                bool is_leaf, bool is_pde) {
-  console_puts("  ");
-  console_puts(name);
-  console_puts("[");
-  print_hex(idx);
-  console_puts("] raw=");
-  print_hex(entry);
-  console_puts(" phys_base=");
-  print_hex(entry & PAGE_MASK);
-  console_puts("\n    flags: ");
-  print_paging_entry_flags(entry, is_leaf, is_pde);
-}
-
-static void print_neighbor_entries(const char *label, uint64_t *table,
-                                   size_t index) {
-  size_t start = (index > 1) ? index - 1 : 0;
-  size_t end = (index < 510) ? index + 1 : 511;
-
-  console_puts("    ");
-  console_puts(label);
-  console_puts(" neighborhood:\n");
-  for (size_t i = start; i <= end; i++) {
-    console_puts("      [");
-    print_hex(i);
-    console_puts("] = ");
-    print_hex(table[i]);
-    if (i == index)
-      console_puts("  <target>");
-    console_puts("\n");
-  }
-}
-
-static void print_pf_walk(uint64_t cr2) {
-  uint64_t hhdm = pmm_get_hhdm_offset();
-  uint64_t *pml4_phys = vmm_get_active_pml4();
-  uint64_t *pml4 = (uint64_t *)((uint64_t)pml4_phys + hhdm);
-
-  size_t pml4_i = (cr2 >> 39) & 0x1FF;
-  size_t pdpt_i = (cr2 >> 30) & 0x1FF;
-  size_t pd_i = (cr2 >> 21) & 0x1FF;
-  size_t pt_i = (cr2 >> 12) & 0x1FF;
-  uint64_t page_off = cr2 & 0xFFF;
-
-  console_puts("PF_WALK:\n");
-  uint64_t pml4e = pml4[pml4_i];
-  print_entry_summary("PML4E", pml4_i, pml4e, false, false);
-  if (!(pml4e & 1))
-    return;
-
-  uint64_t *pdpt = (uint64_t *)((pml4e & PAGE_MASK) + hhdm);
-  uint64_t pdpte = pdpt[pdpt_i];
-  print_entry_summary("PDPTE", pdpt_i, pdpte, false, false);
-  if (!(pdpte & 1) || (pdpte & (1ULL << 7)))
-    return;
-
-  uint64_t *pd = (uint64_t *)((pdpte & PAGE_MASK) + hhdm);
-  uint64_t pde = pd[pd_i];
-  print_entry_summary("PDE", pd_i, pde, false, true);
-  if (!(pde & 1) || (pde & (1ULL << 7)))
-    return;
-
-  uint64_t *pt = (uint64_t *)((pde & PAGE_MASK) + hhdm);
-  uint64_t pte = pt[pt_i];
-  print_entry_summary("PTE", pt_i, pte, true, false);
-}
-
-static void print_user_stack_words(uint64_t user_rsp, int words) {
-  uint64_t *pml4 = vmm_get_active_pml4();
-  console_puts("USER_STACK_TOP:\n");
-  for (int i = 0; i < words; i++) {
-    uint64_t addr = user_rsp + ((uint64_t)i * sizeof(uint64_t));
-    console_puts("  [");
-    print_hex(addr);
-    console_puts("] = ");
-    if (vmm_virt_to_phys(pml4, addr) == 0) {
-      console_puts("<unmapped>\n");
-      continue;
-    }
-    print_hex(*(volatile uint64_t *)addr);
-    console_puts("\n");
-  }
-}
-
-static void print_context_summary(struct registers *regs) {
-  uint8_t cpl = regs->cs & 0x3;
-  console_puts("CONTEXT: ");
-  if (cpl == 0)
-    console_puts("kernel (ring 0)");
-  else
-    console_puts("user   (ring 3)");
-  console_puts("  CS=");
-  print_hex(regs->cs);
-  console_puts("  SS=");
-  print_hex(regs->ss);
-  console_puts("\n");
-}
 
 static isr_t interrupt_handlers[256] = {0};
 static bool apic_mode = false;
@@ -454,27 +94,36 @@ static void send_eoi(struct registers *regs) {
   if (regs->int_no < 32)
     return;
   if (apic_mode) {
-    /* Bring-up diagnostic: prove the LAPIC page is reachable in the active
-     * address space before the store faults on it.  serial_write_sync() does
-     * not take klog locks, so this is safe even when the interrupt landed in
-     * the middle of a klog print (which is exactly when the missing mapping
-     * used to show up). */
+    /* x2APIC EOI is an MSR write and does not need the LAPIC HHDM mapping.
+     * In xAPIC mode, however, a process PML4 can lack the MMIO slot even
+     * though the permanent kernel PML4 maps it.  Switch only around the EOI
+     * store so the interrupt is acknowledged without faulting, then restore
+     * the interrupted address space before returning to the ISR epilogue. */
+    uint64_t saved_cr3 = 0;
+    bool switched_cr3 = false;
     uint64_t lapic_va = lapic_get_va();
-    if (lapic_va) {
-      uint64_t cr3;
-      __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-      uint64_t cr3_base = cr3 & PAGE_MASK;
-      if (!vmm_debug_walk(cr3_base, lapic_va, NULL)) {
+    if (!lapic_is_x2apic() && lapic_va) {
+      __asm__ volatile("mov %%cr3, %0" : "=r"(saved_cr3));
+      uint64_t active_cr3 = saved_cr3 & PAGE_MASK;
+      if (!vmm_debug_walk(active_cr3, lapic_va, NULL)) {
         static volatile unsigned eoi_reported;
         if (!__atomic_exchange_n(&eoi_reported, 1, __ATOMIC_ACQ_REL)) {
-          vmm_debug_dump_walk("eoi-missing active", cr3_base, lapic_va);
+          vmm_debug_dump_walk("eoi-missing active", active_cr3, lapic_va);
           vmm_debug_dump_walk("eoi-missing kernel",
                               (uint64_t)(uintptr_t)vmm_get_kernel_pml4(),
                               lapic_va);
         }
+        uint64_t kernel_cr3 =
+            (uint64_t)(uintptr_t)vmm_get_kernel_pml4() & PAGE_MASK;
+        if (kernel_cr3 && kernel_cr3 != active_cr3) {
+          __asm__ volatile("mov %0, %%cr3" : : "r"(kernel_cr3) : "memory");
+          switched_cr3 = true;
+        }
       }
     }
     lapic_send_eoi();
+    if (switched_cr3)
+      __asm__ volatile("mov %0, %%cr3" : : "r"(saved_cr3) : "memory");
   } else if (regs->int_no <= 47) {
     pic_send_eoi(regs->int_no - 32);
   }
@@ -482,111 +131,76 @@ static void send_eoi(struct registers *regs) {
 
 // Exception Handling & Signals
 
-static void isr_panic(struct registers *regs, const char *msg) {
-  /* Announce the panic on the serial line before touching the console: the
-   * framebuffer path takes locks this CPU may already be holding, and the
-   * console dump never reaches the log if that hangs. */
-  kpf_dump_panic_entry(msg, regs);
+/* Only one CPU may own the fatal report.  In SMP crashes, concurrent CPUs
+ * used to print separate register/VMA dumps into the same UART stream. */
+static volatile uint64_t fatal_report_owner;
 
-  /* #PF and #DF already produced the rich page-fault report before calling
-   * here; every other fatal exception gets the same treatment, because a wild
-   * RIP cannot be diagnosed from the console register dump alone. */
-  if (regs->int_no != 14 && regs->int_no != 8)
-    kpf_dump_exception(msg, regs);
+static bool fatal_report_claim(void) {
+  uint64_t me = (uint64_t)panic_screen_current_apic_id() + 1;
+  uint64_t expected = 0;
+  if (__atomic_compare_exchange_n(&fatal_report_owner, &expected, me, false,
+                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    return true;
+  return expected == me;
+}
 
-  /* A panic that faults on the way out - the console dump touches the
-   * framebuffer, locks and the faulting thread's stack - used to re-enter this
-   * function and start the whole dump again, forever. That loop is what looks
-   * like a hang on the serial line. Give up on the console after the first
-   * attempt and stop cleanly instead. */
-  static volatile int panicking;
-  if (__atomic_exchange_n(&panicking, 1, __ATOMIC_ACQ_REL)) {
-    kpf_dump_panic_recursion(msg, regs);
-    for (;;) {
-      __asm__ volatile("cli; hlt");
-    }
-  }
-
-  console_clear();
-  console_puts("==================== KERNEL PANIC ====================\n");
-  console_puts(msg);
-  console_puts("  [INT ");
-  print_dec(regs->int_no);
-  console_puts("]\n");
-
-  if (regs->int_no < 32) {
-    console_puts("Exception: ");
-    console_puts(exception_messages[regs->int_no]);
-    console_puts("\n");
-  }
-
-  console_puts("ERR_CODE: ");
-  print_hex(regs->err_code);
-  console_puts("\n\n");
-
-  print_context_summary(regs);
-
-  // RIP is always valid (CPU saves it for all exceptions).
-  // RSP/SS are only pushed by the CPU on a privilege-level change (ring-3 →
-  // ring-0). For ring-0 exceptions, regs->rsp and regs->ss are garbage from
-  // adjacent stack memory.  In that case, grab a live RSP snapshot via inline
-  // asm — it won't be the exact pre-fault RSP, but it's in the right ballpark.
-  uint8_t cpl = regs->cs & 0x3;
-  uint64_t display_rsp;
-  if (cpl == 0) {
-    __asm__ volatile("mov %%rsp, %0" : "=r"(display_rsp));
-    console_puts("RIP: ");
-    print_hex(regs->rip);
-    console_puts("\nRSP: ");
-    print_hex(display_rsp);
-    console_puts(" (live snapshot; fault RSP not saved by CPU for ring-0)\n");
-  } else {
-    console_puts("RIP: ");
-    print_hex(regs->rip);
-    console_puts(" RSP: ");
-    print_hex(regs->rsp);
-    console_puts("\n");
-  }
-
-  // General-purpose registers
-  console_puts("\nGENERAL PURPOSE REGISTERS:\n");
-  print_reg_line("  RAX", regs->rax);
-  print_reg_line("  RBX", regs->rbx);
-  print_reg_line("  RCX", regs->rcx);
-  print_reg_line("  RDX", regs->rdx);
-  print_reg_line("  RSI", regs->rsi);
-  print_reg_line("  RDI", regs->rdi);
-  print_reg_line("  RBP", regs->rbp);
-  print_reg_line("  R8 ", regs->r8);
-  print_reg_line("  R9 ", regs->r9);
-  print_reg_line("  R10", regs->r10);
-  print_reg_line("  R11", regs->r11);
-  print_reg_line("  R12", regs->r12);
-  print_reg_line("  R13", regs->r13);
-  print_reg_line("  R14", regs->r14);
-  print_reg_line("  R15", regs->r15);
-
-  print_rflags_decoded(regs->rflags);
-
-  if (regs->int_no == 13) {
-    print_gp_error_details(regs->err_code);
-  } else if (regs->int_no == 14) {
-    uint64_t cr2;
-    __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-    console_puts("CR2: ");
-    print_hex(cr2);
-    console_puts("\n");
-    print_pf_error_details(regs->err_code);
-    print_pf_walk(cr2);
-  }
-
-  print_cr_state();
-
-  console_puts("\nSystem Halted.\n");
-  serial_flush_sync();
+static void fatal_report_halt(void) {
   for (;;) {
     __asm__ volatile("cli; hlt");
   }
+}
+
+static void isr_panic(struct registers *regs, const char *msg);
+
+/* NMI IPI used to freeze every peer before panic diagnostics touch shared
+ * serial or display state. Normal NMIs retain the existing fatal-exception
+ * behavior. */
+static void panic_stop_nmi_handler(struct registers *regs) {
+  if (panic_screen_is_active()) {
+    panic_screen_ack_stopped_cpu();
+    panic_screen_stop_this_cpu();
+  }
+  isr_panic(regs, "Unexpected Non Maskable Interrupt");
+}
+
+static void isr_panic(struct registers *regs, const char *msg) {
+  if (!fatal_report_claim())
+    fatal_report_halt();
+
+  /* Set this before writing anything: a fault while printing must not start a
+   * second full panic path on the same CPU. */
+  static volatile int panicking;
+  if (__atomic_exchange_n(&panicking, 1, __ATOMIC_ACQ_REL)) {
+    kpf_dump_panic_recursion(msg, regs);
+    fatal_report_halt();
+  }
+
+  if (!panic_screen_stop_other_cpus()) {
+    kpf_dump_panic_recursion("fatal exception on another CPU", regs);
+    fatal_report_halt();
+  }
+
+  /* Serial diagnostics stay independent of all screen and scheduler locks. */
+  kpf_dump_panic_entry(msg, regs);
+
+  /* #PF gets its page walk here, after peer CPUs have stopped. Every other
+   * fatal exception gets the general register, stack and instruction report;
+   * #DF stays on its dedicated minimal-risk path below. */
+  if (regs->int_no == 14) {
+    uint64_t cr2;
+    __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    kpf_dump_page_fault(regs, cr2);
+  } else if (regs->int_no != 8) {
+    kpf_dump_exception(msg, regs);
+  }
+
+  uint64_t cr2 = 0;
+  bool has_cr2 = regs->int_no == 14 || regs->int_no == 8;
+  if (has_cr2)
+    __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+  panic_screen_render(msg, regs, has_cr2, cr2);
+  serial_flush_sync();
+  fatal_report_halt();
 }
 
 static void klog_print_yes_no(const char *name, bool value) {
@@ -640,15 +254,77 @@ static bool klog_user_kaddr(uint64_t *pml4, uint64_t uaddr, uint64_t *kaddr_out)
     return true;
 }
 
-static void klog_dump_ptr(const char *reg_name, uint64_t val) {
+/* Resolve runtime addresses to the mapped image and file offset without doing
+ * filesystem I/O or faulting in pages from the exception path. */
+static void klog_resolve_fault_address(struct thread *current, uint64_t addr) {
+    if (addr >= 0xFFFFFFFF80000000ULL) {
+        klog_puts(" [kernel-image+");
+        klog_hex64(addr - 0xFFFFFFFF80000000ULL);
+        klog_puts("]");
+        return;
+    }
+    if (addr >= 0x0000800000000000ULL) {
+        klog_puts(" [non-canonical]");
+        return;
+    }
+    if (!current || !current->mm)
+        return;
+
+    struct vma *v = vma_find(&current->mm->vmas, addr);
+    if (!v) {
+        klog_puts(" [no VMA]");
+        return;
+    }
+    klog_puts(" [");
+    if (v->file_node) {
+        vfs_node_t *node = (vfs_node_t *)v->file_node;
+        klog_puts(node->name[0] ? node->name : "file");
+        klog_puts("+file-offset=");
+        klog_hex64(v->offset + (addr - v->start));
+    } else {
+        klog_puts("anonymous+");
+        klog_hex64(addr - v->start);
+    }
+    klog_puts(", vma="); klog_hex64(v->start); klog_puts("-");
+    klog_hex64(v->end); klog_puts(", prot="); klog_hex64(v->prot);
+    klog_puts(", flags="); klog_hex64(v->flags); klog_puts("]");
+}
+
+static void klog_page_fault_bits(uint64_t err) {
+    klog_puts("  Page-fault bits: ");
+    klog_puts((err & 1) ? "P=protection " : "P=not-present ");
+    klog_puts((err & 2) ? "W=write " : "W=read ");
+    klog_puts((err & 4) ? "U=user " : "U=supervisor ");
+    if (err & 8) klog_puts("RSVD=1 ");
+    if (err & 16) klog_puts("I=instruction-fetch ");
+    if (err & 32) klog_puts("PK=1 ");
+    if (err & 64) klog_puts("SS=1 ");
+    if (err & 128) klog_puts("SGX=1 ");
+    klog_puts("\n");
+}
+
+static void klog_dump_ptr(struct thread *current, const char *reg_name,
+                          uint64_t val) {
     if (val < 0x10000) return; // likely small constant or null
-    if (val >= 0x0000800000000000ULL && val < 0xFFFF800000000000ULL) return; // non-canonical
-    if (val >= 0xFFFF800000000000ULL) return; // kernel address (don't dump from user fault)
+    if (val >= 0x0000800000000000ULL && val < 0xFFFF800000000000ULL) {
+        klog_puts("  *"); klog_puts(reg_name); klog_puts(" (");
+        klog_hex64(val); klog_puts("): <non-canonical pointer>\n");
+        return;
+    }
+    if (val >= 0xFFFF800000000000ULL) {
+        klog_puts("  *"); klog_puts(reg_name); klog_puts(" (");
+        klog_hex64(val); klog_puts("): ");
+        klog_resolve_fault_address(current, val);
+        klog_puts(" <not dereferenced>\n");
+        return;
+    }
     
     uint64_t *pml4 = vmm_get_active_pml4();
     uint64_t hhdm_addr;
     if (klog_user_kaddr(pml4, val, &hhdm_addr)) {
         klog_puts("  *"); klog_puts(reg_name); klog_puts(" ("); klog_hex64(val); klog_puts("): ");
+        klog_resolve_fault_address(current, val);
+        klog_puts(" ");
         // Dump 32 bytes or until page boundary
         uint64_t offset_in_page = val & 0xFFF;
         uint32_t to_dump = 32;
@@ -703,10 +379,242 @@ static const char *thread_state_name(thread_state_t state) {
   }
 }
 
+static volatile uint32_t user_fault_detail_count;
+
+/* ── Fault-address VMA neighborhood diagnostics ──────────────────────────
+ * A bare "[no VMA]" on CR2/RSP cannot tell a genuine stack overflow from a
+ * truncated mapping, so snapshot the surrounding VMAs while holding mm->lock
+ * and print after releasing it (klog can take console locks). */
+static void isr_print_vma_snapshot(const char *label,
+                                   const struct vma_snapshot *s) {
+  klog_puts("  ");
+  klog_puts(label);
+  klog_puts(": ");
+  if (!s || !s->valid) {
+    klog_puts("<none>\n");
+    return;
+  }
+  klog_hex64(s->start);
+  klog_puts(" - ");
+  klog_hex64(s->end);
+  klog_puts(" (");
+  klog_uint64(s->end - s->start);
+  klog_puts(" bytes, ");
+  klog_puts((s->prot & 0x1) ? "r" : "-");
+  klog_puts((s->prot & 0x2) ? "w" : "-");
+  klog_puts((s->prot & 0x4) ? "x" : "-");
+  klog_puts(",");
+  if (s->flags & 0x01)
+    klog_puts("shared,");
+  if (s->flags & 0x02)
+    klog_puts("private,");
+  if (s->flags & 0x20)
+    klog_puts("anon,");
+  if (s->flags & MAP_GROWSDOWN)
+    klog_puts("GROWSDOWN,");
+  if (s->flags & MAP_STACK)
+    klog_puts("STACK,");
+  if (s->flags & 0x100000000ULL)
+    klog_puts("SYSV_SHM,");
+  if (s->flags & 0x200000000ULL)
+    klog_puts("HUGEPAGE,");
+  if (s->flags & 0x400000000ULL)
+    klog_puts("PAGECACHE,");
+  klog_puts("flags=");
+  klog_hex64(s->flags);
+  if (s->fd != -1) {
+    klog_puts(" fd=");
+    klog_uint64((uint64_t)s->fd);
+    klog_puts(" off=");
+    klog_hex64(s->offset);
+  }
+  klog_puts(")\n");
+}
+
+static void isr_report_vma_neighborhood(struct thread *current, uint64_t addr,
+                                        uint64_t rsp) {
+  struct vma_snapshot fault_prev, fault_hit, fault_next;
+  struct vma_snapshot rsp_prev, rsp_hit, rsp_next;
+  struct vma_snapshot grow_hit;
+#define ISR_STACK_SURVEY_CAP 32
+  struct vma_snapshot stacks[ISR_STACK_SURVEY_CAP];
+  bool stack_guarded[ISR_STACK_SURVEY_CAP];
+  uint64_t stack_guard_size[ISR_STACK_SURVEY_CAP];
+  int stack_total = 0;
+  int stack_shown = 0;
+  bool have_grow = false;
+  uint64_t grow_start = 0;
+  bool locked = false;
+
+  fault_prev.valid = fault_hit.valid = fault_next.valid = false;
+  rsp_prev.valid = rsp_hit.valid = rsp_next.valid = false;
+  grow_hit.valid = false;
+
+  if (!current->mm)
+    goto print;
+  /* Never block in the fault path: the fault may have interrupted code that
+   * already holds mm->lock (e.g. a nested fault during copy_to_user). */
+  if (!spinlock_try_acquire(&current->mm->lock))
+    goto print_locked_busy;
+  locked = true;
+  vma_snapshot_neighbors(&current->mm->vmas, addr, &fault_prev, &fault_hit,
+                         &fault_next);
+  if (rsp != addr)
+    vma_snapshot_neighbors(&current->mm->vmas, rsp, &rsp_prev, &rsp_hit,
+                           &rsp_next);
+  else {
+    rsp_prev = fault_prev;
+    rsp_hit = fault_hit;
+    rsp_next = fault_next;
+  }
+  /* Stack-growth eligibility uses the same 8MB window as the fault handler. */
+  {
+    struct vma *grow =
+        vma_find_growdown(&current->mm->vmas, addr, 8 * 1024 * 1024);
+    if (grow) {
+      have_grow = true;
+      grow_start = grow->start;
+      grow_hit.start = grow->start;
+      grow_hit.end = grow->end;
+      grow_hit.prot = grow->prot;
+      grow_hit.flags = grow->flags;
+      grow_hit.offset = grow->offset;
+      grow_hit.fd = grow->fd;
+      grow_hit.valid = true;
+    }
+  }
+  /* Survey every pthread stack: size outliers and missing guards explain a
+   * marginal overflow (this fault missed by 568B) vs a wild RSP. */
+  stack_total = vma_snapshot_stacks(&current->mm->vmas, stacks,
+                                    ISR_STACK_SURVEY_CAP);
+  stack_shown = stack_total < ISR_STACK_SURVEY_CAP ? stack_total
+                                                   : ISR_STACK_SURVEY_CAP;
+  for (int i = 0; i < stack_shown; i++) {
+    stack_guarded[i] = false;
+    stack_guard_size[i] = 0;
+    if (!stacks[i].valid || stacks[i].start == 0)
+      continue;
+    struct vma *g = vma_find(&current->mm->vmas, stacks[i].start - 1);
+    if (g && g->prot == 0 && g->end == stacks[i].start) {
+      stack_guarded[i] = true;
+      stack_guard_size[i] = g->end - g->start;
+    }
+  }
+  spinlock_release(&current->mm->lock);
+  locked = false;
+
+print:
+  klog_puts(KLOG_CLR_CYAN "VMA NEIGHBORHOOD (fault addr):\n" KLOG_CLR_RESET);
+  if (!current->mm) {
+    klog_puts("  <no mm>\n");
+  } else if (!locked && !fault_prev.valid && !fault_hit.valid &&
+             !fault_next.valid && !have_grow) {
+    /* Fall through to the per-snapshot prints so the <none> lines still show
+     * the address that was probed. */
+  }
+  isr_print_vma_snapshot("fault-hit ", &fault_hit);
+  isr_print_vma_snapshot("fault-prev", &fault_prev);
+  isr_print_vma_snapshot("fault-next", &fault_next);
+  if (fault_prev.valid && addr >= fault_prev.end) {
+    klog_puts("  fault is ");
+    klog_uint64(addr - fault_prev.end);
+    klog_puts(" bytes above fault-prev end\n");
+  }
+  if (fault_next.valid && addr < fault_next.start) {
+    klog_puts("  fault is ");
+    klog_uint64(fault_next.start - addr);
+    klog_puts(" bytes below fault-next start\n");
+  }
+  if (have_grow) {
+    klog_puts("  growdown candidate within 8MB at ");
+    klog_hex64(grow_start);
+    klog_puts("\n");
+  } else {
+    klog_puts("  no GROWSDOWN VMA within 8MB below fault\n");
+  }
+  if (rsp != addr) {
+    klog_puts(KLOG_CLR_CYAN "VMA NEIGHBORHOOD (RSP):\n" KLOG_CLR_RESET);
+    klog_puts("  RSP=");
+    klog_hex64(rsp);
+    klog_puts(rsp == addr - 8 || rsp == addr + 8 ? " (adjacent to fault: likely push/call)\n" : "\n");
+    isr_print_vma_snapshot("rsp-hit ", &rsp_hit);
+    isr_print_vma_snapshot("rsp-prev", &rsp_prev);
+    isr_print_vma_snapshot("rsp-next", &rsp_next);
+    if (rsp_prev.valid && rsp >= rsp_prev.end) {
+      klog_puts("  RSP is ");
+      klog_uint64(rsp - rsp_prev.end);
+      klog_puts(" bytes above rsp-prev end\n");
+    }
+    if (rsp_next.valid && rsp < rsp_next.start) {
+      klog_puts("  RSP is ");
+      klog_uint64(rsp_next.start - rsp);
+      klog_puts(" bytes below rsp-next start\n");
+    }
+    if (addr + 8 == rsp || rsp + 8 == addr) {
+      klog_puts("  fault == RSP-8: matches a push/call stack-store fault\n");
+    }
+  }
+  klog_puts(KLOG_CLR_CYAN "THREAD STACKS (MAP_STACK):\n" KLOG_CLR_RESET);
+  if (!current->mm) {
+    klog_puts("  <no mm>\n");
+  } else {
+    klog_puts("  count=");
+    klog_uint64((uint64_t)stack_total);
+    klog_puts("\n");
+    for (int i = 0; i < stack_shown; i++) {
+      if (!stacks[i].valid)
+        continue;
+      klog_puts("  [");
+      klog_uint64((uint64_t)i);
+      klog_puts("] ");
+      klog_hex64(stacks[i].start);
+      klog_puts(" - ");
+      klog_hex64(stacks[i].end);
+      klog_puts(" (");
+      klog_uint64(stacks[i].end - stacks[i].start);
+      klog_puts(" bytes) guard=");
+      if (stack_guarded[i]) {
+        klog_uint64(stack_guard_size[i]);
+        klog_puts("B");
+      } else {
+        klog_puts("NONE");
+      }
+      if (fault_next.valid && stacks[i].start == fault_next.start &&
+          fault_next.valid)
+        klog_puts(" <-- fault-next (this thread)");
+      klog_puts("\n");
+    }
+    if (stack_total > stack_shown) {
+      klog_puts("  ... truncated, ");
+      klog_uint64((uint64_t)(stack_total - stack_shown));
+      klog_puts(" more\n");
+    }
+  }
+  return;
+
+print_locked_busy:
+  klog_puts(KLOG_CLR_CYAN "VMA NEIGHBORHOOD:\n" KLOG_CLR_RESET
+            "  <mm->lock busy; skipped>\n");
+}
+
 void isr_report_user_fault(struct registers *regs, int sig,
                            uint64_t addr) {
   struct thread *current = sched_get_current();
   if (current) {
+    /* A blocked synchronous SIGSEGV may only be delivered at a later syscall
+     * boundary. Keep the exception frame so that deferred delivery and crash
+     * reports describe the actual faulting instruction, not that syscall. */
+    bool captured_sync_fault = false;
+    bool is_sync = (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE);
+    if (is_sync &&
+        (regs->int_no == 13 || regs->int_no == 14 || regs->int_no == 6 ||
+         regs->int_no == 0 || regs->int_no == 16) &&
+        !current->fault_regs_valid) {
+      current->fault_regs = *regs;
+      current->fault_regs_valid = true;
+      captured_sync_fault = true;
+    }
+
     bool has_custom_handler = false;
     if (sig >= 1 && sig <= 64) {
       void *handler = (void *)current->signal_handlers[sig - 1].sa_handler;
@@ -715,7 +623,24 @@ void isr_report_user_fault(struct registers *regs, int sig,
       }
     }
 
-    if (!has_custom_handler) {
+    if (has_custom_handler) {
+      if (is_sync) {
+        klog_puts("[SIGNAL] Exception ");
+        klog_uint64(sig);
+        klog_puts(" (");
+        klog_puts(get_signal_name(sig));
+        klog_puts(") to custom handler comm='");
+        klog_puts(current->comm);
+        klog_puts("' tid=");
+        klog_uint64(current->tid);
+        klog_puts(" rip=");
+        klog_hex64(regs->rip);
+        klog_resolve_fault_address(current, regs->rip);
+        klog_puts(" addr=");
+        klog_hex64(addr);
+        klog_puts("\n");
+      }
+    } else {
       if (current->last_report_sig == sig &&
           current->last_report_rip == regs->rip &&
           current->last_report_addr == addr) {
@@ -724,6 +649,9 @@ void isr_report_user_fault(struct registers *regs, int sig,
       current->last_report_sig = sig;
       current->last_report_rip = regs->rip;
       current->last_report_addr = addr;
+      uint32_t seen = __atomic_add_fetch(&user_fault_detail_count, 1,
+                                         __ATOMIC_RELAXED);
+      if (seen <= 4) {
       // 1. Log detailed report to kernel console
       klog_puts("\n" KLOG_CLR_RED "################################################################################" KLOG_CLR_RESET "\n");
       klog_puts(KLOG_CLR_RED "[ USER FAULT ]" KLOG_CLR_RESET " process '");
@@ -787,6 +715,7 @@ void isr_report_user_fault(struct registers *regs, int sig,
       klog_puts("\n");
 
       klog_puts("  RIP: "); klog_hex64(regs->rip);
+      klog_resolve_fault_address(current, regs->rip);
       if (current->mm) {
         struct vma *rvma = vma_find(&current->mm->vmas, regs->rip);
         if (rvma) {
@@ -797,9 +726,17 @@ void isr_report_user_fault(struct registers *regs, int sig,
       klog_puts("\n");
       klog_puts(regs->int_no == 14 ? "  CR2: " : "  ADDR: ");
       klog_hex64(addr);
+      klog_resolve_fault_address(current, addr);
+      klog_puts("  VECTOR: "); klog_uint64(regs->int_no);
       klog_puts("  ERR: "); klog_hex64(regs->err_code);
       klog_puts("  CS: "); klog_hex64(regs->cs);
       klog_puts("\n");
+      if (regs->int_no == 14)
+        klog_page_fault_bits(regs->err_code);
+
+      /* Neighboring VMAs + RSP gap: distinguishes stack overflow (fault/RSP
+       * just below a MAP_STACK/PROT_NONE guard) from a truncated mapping. */
+      isr_report_vma_neighborhood(current, addr, regs->rsp);
 
       // Subsystem context
       if (current->last_subsystem || current->last_kernel_file) {
@@ -820,6 +757,22 @@ void isr_report_user_fault(struct registers *regs, int sig,
         if (current->last_error_code != 0) {
           klog_puts("  Last Error: ");
           klog_int64(current->last_error_code);
+          const char *err_sc = syscall_get_name(current->last_error_syscall_num);
+          klog_puts(" in syscall ");
+          klog_puts(err_sc ? err_sc : "unknown");
+          klog_puts(" (");
+          klog_uint64(current->last_error_syscall_num);
+          klog_puts(")");
+          if (current->last_error_path[0]) {
+            klog_puts(" path='");
+            klog_puts(current->last_error_path);
+            klog_puts("'");
+          }
+          klog_puts("\n");
+        }
+        if (current->last_stderr[0]) {
+          klog_puts(KLOG_CLR_YELLOW "  Last Stderr: " KLOG_CLR_RESET);
+          klog_puts(current->last_stderr);
           klog_puts("\n");
         }
       }
@@ -978,21 +931,21 @@ void isr_report_user_fault(struct registers *regs, int sig,
 
       // Pointer-like register inspection
       klog_puts("REGISTER MEMORY INSPECTION:\n");
-      klog_dump_ptr("RAX", regs->rax);
-      klog_dump_ptr("RBX", regs->rbx);
-      klog_dump_ptr("RCX", regs->rcx);
-      klog_dump_ptr("RDX", regs->rdx);
-      klog_dump_ptr("RSI", regs->rsi);
-      klog_dump_ptr("RDI", regs->rdi);
-      klog_dump_ptr("RBP", regs->rbp);
-      klog_dump_ptr("R8 ", regs->r8);
-      klog_dump_ptr("R9 ", regs->r9);
-      klog_dump_ptr("R10", regs->r10);
-      klog_dump_ptr("R11", regs->r11);
-      klog_dump_ptr("R12", regs->r12);
-      klog_dump_ptr("R13", regs->r13);
-      klog_dump_ptr("R14", regs->r14);
-      klog_dump_ptr("R15", regs->r15);
+      klog_dump_ptr(current, "RAX", regs->rax);
+      klog_dump_ptr(current, "RBX", regs->rbx);
+      klog_dump_ptr(current, "RCX", regs->rcx);
+      klog_dump_ptr(current, "RDX", regs->rdx);
+      klog_dump_ptr(current, "RSI", regs->rsi);
+      klog_dump_ptr(current, "RDI", regs->rdi);
+      klog_dump_ptr(current, "RBP", regs->rbp);
+      klog_dump_ptr(current, "R8 ", regs->r8);
+      klog_dump_ptr(current, "R9 ", regs->r9);
+      klog_dump_ptr(current, "R10", regs->r10);
+      klog_dump_ptr(current, "R11", regs->r11);
+      klog_dump_ptr(current, "R12", regs->r12);
+      klog_dump_ptr(current, "R13", regs->r13);
+      klog_dump_ptr(current, "R14", regs->r14);
+      klog_dump_ptr(current, "R15", regs->r15);
 
       // Hex dump of code at RIP
       uint64_t *pml4 = vmm_get_active_pml4();
@@ -1023,11 +976,7 @@ void isr_report_user_fault(struct registers *regs, int sig,
           if (klog_user_kaddr(pml4, saddr, &kaddr)) {
               uint64_t val = *(uint64_t*)kaddr;
               klog_hex64(val);
-              // Try to find if it corresponds to any VMA or is a string
-              struct vma *sv = vma_find(&current->mm->vmas, val);
-              if (sv) {
-                  klog_puts(" (VMA: "); klog_hex64(sv->start); klog_puts(")");
-              }
+              klog_resolve_fault_address(current, val);
           } else {
               klog_puts("<unmapped>");
           }
@@ -1039,19 +988,18 @@ void isr_report_user_fault(struct registers *regs, int sig,
       uint64_t curr_rbp = regs->rbp;
       for (int i = 0; i < 16; i++) {
           if (curr_rbp < 0x1000 || curr_rbp >= 0x0000800000000000ULL) break;
-          uint64_t phys_rbp = vmm_virt_to_phys(pml4, curr_rbp);
-          if (!phys_rbp) break;
-          
-          uint64_t *rbp_ptr = (uint64_t*)(phys_rbp + pmm_get_hhdm_offset());
+          uint64_t old_rbp_kaddr, ret_addr_kaddr;
+          if ((curr_rbp & 7) ||
+              !klog_user_kaddr(pml4, curr_rbp, &old_rbp_kaddr) ||
+              !klog_user_kaddr(pml4, curr_rbp + sizeof(uint64_t),
+                               &ret_addr_kaddr))
+              break;
           // [0] = old RBP, [1] = return address
-          uint64_t next_rbp = rbp_ptr[0];
-          uint64_t ret_addr = rbp_ptr[1];
+          uint64_t next_rbp = *(uint64_t *)old_rbp_kaddr;
+          uint64_t ret_addr = *(uint64_t *)ret_addr_kaddr;
           
           klog_puts("  #"); klog_uint64(i); klog_puts(": "); klog_hex64(ret_addr);
-          struct vma *rv = vma_find(&current->mm->vmas, ret_addr);
-          if (rv) {
-              klog_puts(" (VMA: "); klog_hex64(rv->start); klog_puts(")");
-          }
+          klog_resolve_fault_address(current, ret_addr);
           klog_puts("\n");
           
           if (next_rbp <= curr_rbp) break; // Avoid infinite loops
@@ -1060,24 +1008,46 @@ void isr_report_user_fault(struct registers *regs, int sig,
 
       // Process context extra info
       klog_puts("\nPROCESS EXTRA INFO:\n");
+      klog_puts("  EXE: "); klog_puts(current->exe_path[0] ? current->exe_path : "?"); klog_puts("\n");
       klog_puts("  CWD: "); klog_puts(current->cwd_path); klog_puts("\n");
       klog_puts("  UID/GID: "); klog_uint64(current->uid); klog_puts("/"); klog_uint64(current->gid);
       klog_puts("  Pending Signals: "); klog_hex64(current->pending_signals);
       klog_puts("  Signal Mask: "); klog_hex64(current->signal_mask);
       klog_puts("\n");
 
-      // Virtual Memory Area (VMA) Dump
-      klog_puts("PROCESS VMAs:\n");
-      vma_dump(&current->mm->vmas);
       klog_puts(KLOG_CLR_RED "################################################################################" KLOG_CLR_RESET "\n");
+      } else if (seen <= 8 || (seen & 0xFFu) == 0) {
+        klog_puts("[USERFAULT] process='");
+        klog_puts(current->comm);
+        klog_puts("' tid=");
+        klog_uint64(current->tid);
+        klog_puts(" signal=");
+        klog_uint64(sig);
+        klog_puts(" rip=");
+        klog_hex64(regs->rip);
+        klog_puts(" addr=");
+        klog_hex64(addr);
+        klog_puts(" err=");
+        klog_hex64(regs->err_code);
+        klog_puts(" count=");
+        klog_uint64(seen);
+        klog_puts("\n");
+      } else if (seen == 9) {
+        klog_puts("[USERFAULT] repeated detailed reports suppressed; "
+                  "sampling every 256th (counter is global)\n");
+      }
     }
 
     // 2. Add to /dev/faults for userland monitors
     fault_log_add(regs, sig, addr);
 
-    // 3. Mark signal for delivery and record fault address
-    current->fault_addr = addr;
-    current->fault_code = (uint32_t)regs->err_code;
+    // 3. Mark signal for delivery and retain fault metadata. If SIGSEGV is
+    // deferred while blocked, keep the address/error paired with the first
+    // saved exception frame instead of combining it with a later retry.
+    if (!is_sync || captured_sync_fault || !current->fault_regs_valid) {
+      current->fault_addr = addr;
+      current->fault_code = (uint32_t)regs->err_code;
+    }
     current->pending_signals |= (1ULL << (sig - 1));
   } else {
     isr_panic(regs, "User fault with no thread context");
@@ -1088,12 +1058,6 @@ static void page_fault_handler(struct registers *regs) {
   uint64_t cr2;
   __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
 
-  struct thread *current = sched_get_current();
-  if (current) {
-    current->fault_addr = cr2;
-    current->fault_code = (uint32_t)regs->err_code;
-  }
-
   if (vmm_handle_page_fault(cr2, regs->err_code, regs) != 0) {
     if ((regs->cs & 0x3) == 0x3) {
       isr_report_user_fault(regs, SIGSEGV, cr2);
@@ -1101,12 +1065,8 @@ static void page_fault_handler(struct registers *regs) {
       if (extable_fixup(regs)) {
         return;
       }
-      klog_puts("[VMM] KERNEL-mode fault could not be handled by paging "
-                "engine!\n");
-      /* Everything the paging engine knew, written straight to the serial port
-       * without a lock: isr_panic() only prints to the console, and the box is
-       * about to stop listening to anything else. */
-      kpf_dump_page_fault(regs, cr2);
+      /* isr_panic() claims the report, stops peer CPUs, then logs the saved
+       * CR2 and page-table walk over the lock-free serial path. */
       isr_panic(regs, "Unhandled Kernel Page Fault");
     }
   }
@@ -1145,11 +1105,16 @@ static void stack_fault_handler(struct registers *regs) {
  * holds the second fault's address, and kpf_dump_page_fault() writes straight
  * to the serial line before the console path can fail. */
 static void double_fault_handler(struct registers *regs) {
+  /* #DF runs on IST1 and can bypass the framebuffer, serial and scheduler
+   * locks. Its report stays compact on serial, while the cached scanout gives
+   * the user a readable crash screen even when DRM owns the display. */
+  if (!panic_screen_stop_other_cpus())
+    fatal_report_halt();
+  kpf_dump_double_fault(regs);
   uint64_t cr2 = 0;
-
   __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-  kpf_dump_page_fault(regs, cr2);
-  isr_panic(regs, "Double fault (exception during exception handling)");
+  panic_screen_render("Double Fault", regs, true, cr2);
+  fatal_report_halt();
 }
 
 /*
@@ -1177,6 +1142,7 @@ static void overflow_handler(struct registers *regs) {
 }
 
 void isr_init_exceptions(void) {
+  register_interrupt_handler(2, panic_stop_nmi_handler);
   register_interrupt_handler(3, breakpoint_handler);
   register_interrupt_handler(4, overflow_handler);
   register_interrupt_handler(6, invalid_opcode_handler);
@@ -1204,11 +1170,6 @@ static void isr_dispatch(struct registers *regs) {
 
     send_eoi(regs);
 
-    /* Only hardware IRQs (and IPIs) are preemption points here, and only
-     * after EOI: an exception return may be an extable fixup, and switching
-     * with a vector still in-service starves this CPU's LAPIC. */
-    if (regs->int_no >= 32)
-      sched_check_resched((regs->cs & 0x3) == 0x3);
     return;
   }
 
@@ -1219,7 +1180,6 @@ static void isr_dispatch(struct registers *regs) {
       user_access_end();
     }
     send_eoi(regs);
-    sched_check_resched((regs->cs & 0x3) == 0x3);
     return;
   }
 
@@ -1241,4 +1201,9 @@ void isr_handler(struct registers *regs) {
 
   if (is_hw_irq && linuxkpi_irq_exit)
     linuxkpi_irq_exit();
+
+  /* Complete both the controller EOI and LinuxKPI hardirq accounting before
+   * a reschedule request can switch away from this interrupt frame. */
+  if (is_hw_irq)
+    sched_check_resched((regs->cs & 0x3) == 0x3);
 }

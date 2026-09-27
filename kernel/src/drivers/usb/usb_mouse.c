@@ -661,6 +661,12 @@ struct usb_mouse_state {
 
 static struct usb_mouse_state mice[MAX_USB_MICE];
 static int mouse_count = 0;
+/* xHCI calls usb_mouse_poll() from both its IRQ and timer paths. With SMP the
+ * timer watchdog may run on a different CPU while an IRQ is consuming the
+ * same completion, so only one caller may inspect/resubmit each pipe at once.
+ * This is a try-gate: a concurrent poll can be skipped and the next tick will
+ * observe any completion that remains pending. */
+static volatile uint8_t usb_mouse_polling;
 
 // Report decoding
 
@@ -1744,6 +1750,9 @@ static void usb_mouse_recover_silent(struct usb_mouse_state *ms) {
 }
 
 void usb_mouse_poll(void) {
+  if (__atomic_test_and_set(&usb_mouse_polling, __ATOMIC_ACQUIRE))
+    return;
+
   for (int i = 0; i < mouse_count; i++) {
     struct usb_mouse_state *ms = &mice[i];
     if (!ms->active)
@@ -1843,6 +1852,8 @@ void usb_mouse_poll(void) {
 
     usb_mouse_resubmit_td(ms);
   }
+
+  __atomic_clear(&usb_mouse_polling, __ATOMIC_RELEASE);
 }
 
 // Layout self-test

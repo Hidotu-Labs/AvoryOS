@@ -89,6 +89,22 @@ int unix_getsockopt_impl(socket_t *sock, int level, int optname,
     return -92; // ENOPROTOOPT
 
   switch (optname) {
+  case SO_ERROR: {
+    if (*optlen < (int)sizeof(int))
+      return -22;
+    *(int *)optval = socket_get_error(sock);
+    *optlen = sizeof(int);
+    return 0;
+  }
+
+  case SO_TYPE: {
+    if (*optlen < (int)sizeof(int))
+      return -22;
+    *(int *)optval = sock->type;
+    *optlen = sizeof(int);
+    return 0;
+  }
+
   case SO_ACCEPTCONN:
     if (*optlen < (int)sizeof(int))
       return -22;
@@ -108,7 +124,9 @@ int unix_getsockopt_impl(socket_t *sock, int level, int optname,
       klog_puts("[WARN] unix_getsockopt: SO_PEERCRED buffer too small\n");
       return -22;
     }
+    spinlock_acquire(&sock->lock);
     if (!usk->peer) {
+      spinlock_release(&sock->lock);
       klog_puts("[WARN] unix_getsockopt: SO_PEERCRED but no peer\n");
       return -107; // ENOTCONN
     }
@@ -116,6 +134,7 @@ int unix_getsockopt_impl(socket_t *sock, int level, int optname,
     cred->pid = usk->peer->owner_pid;
     cred->uid = usk->peer->owner_uid;
     cred->gid = usk->peer->owner_gid;
+    spinlock_release(&sock->lock);
     *optlen = (int)UCRED_SIZE;
     return 0;
   }
@@ -153,7 +172,7 @@ int unix_getsockopt_impl(socket_t *sock, int level, int optname,
       return -22;
     *(int *)optval = 0;
     *optlen = sizeof(int);
-    klog_puts("[OK] unix_getsockopt: SO_KEEPALIVE (0)\n");
+    klog_debug_puts("[OK] unix_getsockopt: SO_KEEPALIVE (0)\n");
     return 0;
   }
 
@@ -213,9 +232,9 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
     sock->rcvbuf       = val;
     spinlock_release(&usk->recv_lock);
 
-    klog_puts("[OK] unix_setsockopt: SO_RCVBUF set to ");
-    klog_uint64(val);
-    klog_puts("\n");
+    klog_debug_puts("[OK] unix_setsockopt: SO_RCVBUF set to ");
+    klog_debug_uint64(val);
+    klog_debug_puts("\n");
     return 0;
   }
 
@@ -241,9 +260,9 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
     sock->sndbuf       = val;
     spinlock_release(&usk->send_lock);
 
-    klog_puts("[OK] unix_setsockopt: SO_SNDBUF set to ");
-    klog_uint64(val);
-    klog_puts("\n");
+    klog_debug_puts("[OK] unix_setsockopt: SO_SNDBUF set to ");
+    klog_debug_uint64(val);
+    klog_debug_puts("\n");
     return 0;
   }
 
@@ -293,9 +312,9 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
     if (optlen < (int)sizeof(int))
       return -22;
     usk->passcred = (*(const int *)optval != 0);
-    klog_puts("[OK] unix_setsockopt: SO_PASSCRED set to ");
-    klog_uint64(usk->passcred ? 1 : 0);
-    klog_puts("\n");
+    klog_debug_puts("[OK] unix_setsockopt: SO_PASSCRED set to ");
+    klog_debug_uint64(usk->passcred ? 1 : 0);
+    klog_debug_puts("\n");
     return 0;
 
   case SO_RCVTIMEO: {
@@ -307,9 +326,9 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
     } else {
       usk->rcvtimeo_ms = *(const int *)optval;
     }
-    klog_puts("[OK] unix_setsockopt: SO_RCVTIMEO set to ");
-    klog_uint64(usk->rcvtimeo_ms);
-    klog_puts(" ms\n");
+    klog_debug_puts("[OK] unix_setsockopt: SO_RCVTIMEO set to ");
+    klog_debug_uint64(usk->rcvtimeo_ms);
+    klog_debug_puts(" ms\n");
     return 0;
   }
 
@@ -322,21 +341,21 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
     } else {
       usk->sndtimeo_ms = *(const int *)optval;
     }
-    klog_puts("[OK] unix_setsockopt: SO_SNDTIMEO set to ");
-    klog_uint64(usk->sndtimeo_ms);
-    klog_puts(" ms\n");
+    klog_debug_puts("[OK] unix_setsockopt: SO_SNDTIMEO set to ");
+    klog_debug_uint64(usk->sndtimeo_ms);
+    klog_debug_puts(" ms\n");
     return 0;
   }
 
   case 9: // SO_KEEPALIVE
-    klog_puts("[OK] unix_setsockopt: SO_KEEPALIVE\n");
+    klog_debug_puts("[OK] unix_setsockopt: SO_KEEPALIVE\n");
     return 0;
 
   case 12: // SO_PRIORITY
     /* Linux accepts SO_PRIORITY for every socket family; AF_UNIX has no
      * priority to apply, so it is accepted and ignored.  libpulse sets it on
      * its native-protocol socket; rejecting it only produced noise. */
-    klog_puts("[OK] unix_setsockopt: SO_PRIORITY\n");
+    klog_debug_puts("[OK] unix_setsockopt: SO_PRIORITY\n");
     return 0;
 
   case 31: // SO_PEERSEC

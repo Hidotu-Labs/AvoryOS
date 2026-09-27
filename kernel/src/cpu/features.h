@@ -13,6 +13,9 @@ bool cpu_has_fsgsbase(void);
 bool cpu_has_smep(void);
 bool cpu_has_smap(void);
 extern bool cpu_has_xsave_flag;
+/* XCR0 components enabled by cpu_features_init(); XSAVE/XRSTOR masks must
+ * never request bits outside this mask. */
+extern uint64_t cpu_xsave_mask;
 
 /* True once CR4.SMAP has been enabled on the BSP.  stac/clac are #UD on CPUs
  * that do not enumerate SMAP, so every stac/clac site gates on this flag. */
@@ -52,4 +55,3 @@ static inline uint64_t rdfsbase(void) {
 }
 
 #endif
-

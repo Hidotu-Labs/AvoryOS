@@ -112,5 +112,6 @@ uint64_t lapic_get_phys(void);
 
 void lapic_send_ipi(uint32_t lapic_id, uint8_t vector);
 void lapic_send_ipi_all_but_self(uint8_t vector);
+void lapic_send_nmi(uint32_t lapic_id);
 
 #endif

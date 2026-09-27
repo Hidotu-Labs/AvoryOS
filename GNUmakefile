@@ -226,6 +226,7 @@ all: $(IMAGE_NAME).iso
 # `make run` boots the NVMe desktop with KVM; `make run-tcg` is the same
 # configuration without KVM.  The arch-specific run-x86_64 target remains the
 # TCG implementation behind run-tcg.
+RUN_SMP ?= 8
 .PHONY: run run-tcg
 run: edk2-ovmf $(IMAGE_NAME).iso disk.img
 	qemu-system-$(ARCH) \
@@ -235,7 +236,7 @@ run: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-drive file=disk.img,format=raw,if=none,id=nvme0 \
 		-device nvme,serial=avoryos0,drive=nvme0 \
 		-cpu host -enable-kvm \
-		-smp 4 \
+		-smp $(RUN_SMP) \
 		-serial stdio \
 		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
 		-device rtl8139,netdev=net0 \
@@ -272,7 +273,7 @@ run-linuxdrm: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-drive file=disk.img,format=raw,if=none,id=nvme0 \
 		-device nvme,serial=avoryos0,drive=nvme0 \
 		-cpu host -enable-kvm \
-		-smp 4 \
+		-smp $(RUN_SMP) \
 		-serial $(SERIAL) \
 		$(QEMU_MEM) \
 		-vga none \
@@ -475,7 +476,7 @@ run-x86_64: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-cdrom $(IMAGE_NAME).iso \
 		-drive file=disk.img,format=raw,if=none,id=nvme0 \
 		-device nvme,serial=avoryos0,drive=nvme0 \
-		-smp 4 \
+		-smp $(RUN_SMP) \
 		-serial stdio \
 		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
 		-device rtl8139,netdev=net0 \
@@ -797,6 +798,7 @@ disk.img: userland/test_clone_futex.elf
 disk.img: userland/test_futex_pi.elf
 disk.img: userland/test_unix_sockets.elf
 disk.img: userland/test_syscall_speed.elf
+disk.img: userland/test_syscall_cpu.elf
 disk.img: userland/test_hugepages.elf
 disk.img: userland/test_zero_page.elf
 disk.img: userland/test_copy_user.elf
@@ -824,9 +826,22 @@ disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 
 disk.img: $(BASH_STAMP) $(COREUTILS_STAMP) $(ALPINE_STAMP) $(QUAKE2_BUNDLE_FILES)
 disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/forkit.elf userland/about.elf userland/hello_glibc.elf userland/booter.elf userland/reboot.elf userland/shutdown.elf userland/apm.elf userland/test_cpp.elf  userland/kilo.elf  userland/ls.elf userland/lspci.elf userland/lsblk.elf userland/readelf.elf userland/pong.elf userland/raycast.elf userland/asplay.elf userland/kria.elf userland/doom.elf userland/doom_x11.elf userland/gtk_test.elf userland/qt5_test.elf userland/sdl3_test.elf userland/tglgears_fb.elf userland/tglgears_drm.elf userland/tglhello_drm.elf userland/test_mem_stress.elf userland/classicube.elf userland/terrain.png userland/texpacks/classicube.zip initrd/startx.sh initrd/startw.sh initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh AetherDE/x11-wm/AetherWM AetherDE/aether-dock/aether-dock AetherDE/aether-panel/aether-panel AetherDE/wayland-compositor/aether-compositor AetherDE/demo-client/aether-window AetherDE/scripts/sax11.sh AetherDE/scripts/sawayland.sh userland/avoryd.elf $(AVORYD_CONFIG_FILES)
-	@echo "Creating root filesystem (ext4)..."
+	@echo "Creating partitioned disk image (GPT)..."
+	@if [ -L ./part.img ]; then \
+		old_loop=$$(readlink ./part.img); \
+		case "$$old_loop" in /dev/loop*) losetup -d "$$old_loop" >/dev/null 2>&1 || true;; esac; \
+	fi
 	rm -f ./part.img
-	dd if=/dev/zero of=./part.img bs=1M count=5119
+	truncate -s 6144M disk.img
+	printf 'label: gpt\nstart=2048, size=12578816, type=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709, name="rootfs"\n' | sfdisk disk.img >/dev/null 2>&1 || (parted -s disk.img mklabel gpt && parted -s disk.img mkpart rootfs ext4 1MiB 6143MiB)
+	@if loop=$$(losetup --find --show --offset 1048576 --sizelimit 6440353792 disk.img 2>/dev/null); then \
+		ln -s "$$loop" ./part.img; \
+		echo "Using partition loop device $$loop (formatting in place)"; \
+	else \
+		echo "Loop device unavailable; using sparse temporary partition image"; \
+		truncate -s 6142M ./part.img; \
+	fi
+	@echo "Creating root filesystem (ext4)..."
 	mkfs.ext4 -F -b 1024 -I 128 \
 		-O extent,filetype,has_journal,dir_index,^64bit,^metadata_csum,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^metadata_csum_seed,^orphan_file \
 		./part.img
@@ -1010,6 +1025,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/test_pty_master.elf bin/test_pty_master"; \
 		echo "rm bin/test_syscall_speed"; \
 		echo "write userland/test_syscall_speed.elf bin/test_syscall_speed"; \
+		echo "rm bin/test_syscall_cpu"; \
+		echo "write userland/test_syscall_cpu.elf bin/test_syscall_cpu"; \
 		echo "rm bin/test_hugepages"; \
 		echo "write userland/test_hugepages.elf bin/test_hugepages"; \
 		echo "rm bin/test_zero_page"; \
@@ -1360,11 +1377,14 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field home/avory gid 1000"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
 
-	@echo "Creating partitioned disk image (MBR)..."
-	dd if=/dev/zero of=disk.img bs=1M count=5120
-	echo '2048,,L,*' | sfdisk disk.img >/dev/null 2>&1 || (parted -s disk.img mklabel msdos && parted -s disk.img mkpart primary ext3 1MiB 100% && parted -s disk.img set 1 boot on)
-	dd if=./part.img of=disk.img bs=1M seek=1 conv=notrunc
-	rm -f ./part.img
+	@if [ -L ./part.img ]; then \
+		loop=$$(readlink ./part.img); \
+		rm -f ./part.img; \
+		losetup -d "$$loop"; \
+	else \
+		dd if=./part.img of=disk.img bs=1M seek=1 conv=notrunc,sparse; \
+		rm -f ./part.img; \
+	fi
 	@touch disk.img
 
 edk2-ovmf:
@@ -1385,6 +1405,11 @@ setup:
 	chmod +x bootstrap.sh
 	./bootstrap.sh
 
+# Kernel build flags (SYSCALL_LOG, KLOG_RING_KB, ...) are ordinary make
+# variables and reach the sub-make through MAKEFLAGS, so a tracing image is
+# built by prefixing any kernel-dependent target:
+#   make SYSCALL_LOG=browser KLOG_RING_KB=8192 avoryos-x86_64.iso
+#   make SYSCALL_LOG=browser run
 .PHONY: kernel
 kernel: setup
 	$(MAKE) -C kernel
@@ -1741,6 +1766,10 @@ userland/test_pty_master.elf: userland/test_pty_master.c $(MUSL_LIBC)
 userland/test_syscall_speed.elf: userland/test_syscall_speed.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
 		userland/test_syscall_speed.c -o userland/test_syscall_speed.elf
+
+userland/test_syscall_cpu.elf: userland/test_syscall_cpu.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/test_syscall_cpu.c -o userland/test_syscall_cpu.elf
 
 userland/test_hugepages.elf: userland/test_hugepages.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \

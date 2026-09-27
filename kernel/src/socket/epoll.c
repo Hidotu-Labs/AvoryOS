@@ -20,7 +20,14 @@ static vfs_node_t epoll_vfs_pool[EPOLL_MAX_INSTANCES];
 static uint64_t epoll_free_bitmap = ~0ULL; // 1 = free, 0 = in use
 static spinlock_t epoll_table_lock = SPINLOCK_INIT;
 
-#define EPOLL_RESCAN_INTERVAL_MS 100
+/* Fallback full rescan of the watched set.  Event discovery is driven by
+ * epoll_notify_event(); the rescan is only a safety net for producers that
+ * never notify (pidfd exit, pty slave input, console input) and for lost
+ * wakeups.  It is rate-limited to at most one O(watched-fd) pass per interval
+ * per epoll instance, instead of one pass every time epoll_wait() parks with
+ * an empty ready list.  Raised from 100 ms, which cost a full wakeup + scan
+ * ten times per second per idle epoll_wait. */
+#define EPOLL_RESCAN_INTERVAL_MS 1000
 
 static int epoll_table_alloc(void) {
   spinlock_acquire(&epoll_table_lock);
@@ -76,20 +83,23 @@ eventpoll_t *epoll_create(void) {
 
   eventpoll_t *ep = &epoll_pool[idx];
 
-  // Fast reset: item_count and watched items only reset if previously used
-  if (ep->item_count > 0) {
-    for (int i = 0; i < EPOLL_MAX_WATCHED; i++) {
+  /* Slot hygiene, bounded by items_high (#6): epoll_destroy() already freed
+   * and NULLed every item before the slot returned to the bitmap, so after a
+   * normal destroy items_high is 0 and this scans nothing.  The old code
+   * unconditionally touched all EPOLL_MAX_WATCHED (4096) slots on every
+   * single epoll_create() - one full 4096-pointer pass in either branch -
+   * which capped create/destroy-heavy workloads for no benefit. */
+  {
+    int hi = ep->items_high;
+    if (hi > EPOLL_MAX_WATCHED)
+      hi = EPOLL_MAX_WATCHED;
+    for (int i = 0; i < hi; i++) {
       if (ep->items[i]) {
         epitem_free(ep->items[i]);
         ep->items[i] = NULL;
       }
     }
     ep->item_count = 0;
-  } else {
-    // Ensure array is null-initialized
-    for (int i = 0; i < EPOLL_MAX_WATCHED; i++) {
-      ep->items[i] = NULL;
-    }
   }
 
   // Fast targeted field initialization
@@ -97,6 +107,7 @@ eventpoll_t *epoll_create(void) {
   ep->vfs_node = NULL;
   ep->item_count = 0;
   ep->items_high = 0;
+  ep->next_scan_ticks = 0; // due immediately: first wait does a full scan
   INIT_LIST_HEAD(&ep->rdllist);
   ep->rdllist_count = 0;
   wait_queue_init(&ep->wq);
@@ -120,9 +131,15 @@ void epoll_destroy(eventpoll_t *ep) {
   wait_queue_wake_all(&ep->wq);
 
   // Free all watched items and release the VFS references acquired by
-  // EPOLL_CTL_ADD.
-  if (ep->item_count > 0) {
-    for (int i = 0; i < EPOLL_MAX_WATCHED; i++) {
+  // EPOLL_CTL_ADD.  Every live item sits at its fd index, and items_high is
+  // (highest fd ever used + 1), so scanning to items_high covers all items
+  // without the old unconditional pass over all 4096 slots - for a typical
+  // low-fd set that is a handful of slots instead of EPOLL_MAX_WATCHED.
+  {
+    int hi = ep->items_high;
+    if (hi > EPOLL_MAX_WATCHED)
+      hi = EPOLL_MAX_WATCHED;
+    for (int i = 0; i < hi; i++) {
       epitem_t *epi = ep->items[i];
       if (epi) {
         if (epi->on_ready_list) {
@@ -140,8 +157,8 @@ void epoll_destroy(eventpoll_t *ep) {
       }
     }
     ep->item_count = 0;
+    ep->items_high = 0;
   }
-  ep->items_high = 0;
 
   int idx = (int)(ep - epoll_pool);
   if (idx >= 0 && idx < EPOLL_MAX_INSTANCES) {
@@ -174,12 +191,24 @@ static uint32_t ep_check_events(epitem_t *epi) {
   uint32_t watch_mask =
       epi->registered_events &
       ~(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLWAKEUP);
+  uint32_t valid = watch_mask | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+
+  /* Fast path: deliver the cached edge from epoll_notify_event() /
+   * epoll_notify_socket() / the rescan instead of calling vfs_poll() (which
+   * reaches into the socket/pipe/device poll callback, taking its lock).
+   * The exchange consumes the mask, so this item is guaranteed to take the
+   * real vfs_poll() path on its next check: a cached edge is trusted exactly
+   * once, and the level-triggered requeue in epoll_wait_impl() therefore
+   * verifies true readiness on the pass after a cached delivery. */
+  uint32_t cached = __atomic_exchange_n(&epi->ready_events, 0, __ATOMIC_ACQUIRE);
+  if (cached)
+    return cached & valid;
 
   // Call VFS poll to get current events
   int revents = vfs_poll(epi->node, watch_mask);
 
   // Mask to only requested events plus error/hangup
-  return (uint32_t)revents & (watch_mask | EPOLLERR | EPOLLHUP | EPOLLRDHUP);
+  return (uint32_t)revents & valid;
 }
 
 // Helper: Add item to ready list
@@ -370,6 +399,10 @@ int epoll_ctl_mod(eventpoll_t *ep, int fd, struct epoll_event *event) {
   // Update event mask
   spinlock_acquire(&epi->lock);
   epi->event = *event;
+  /* Drop any cached edge from before the MOD: the registered mask is about
+   * to change, so the ep_check_events() below must poll under the new mask
+   * instead of consuming a mask computed against the old one. */
+  __atomic_store_n(&epi->ready_events, 0, __ATOMIC_RELEASE);
   epi->oneshot = (event->events & EPOLLONESHOT) != 0;
   epi->exclusive = (event->events & EPOLLEXCLUSIVE) != 0;
   epi->registered_events = event->events; // Always update registered_events
@@ -454,6 +487,13 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
         if (epi->event.events & EPOLLET) {
           epi->last_events = current_events &
                              (EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM);
+        } else if (!epi->oneshot) {
+          /* Level-triggered and still ready (we just polled it): put it back
+           * on the ready list so the next epoll_wait returns immediately while
+           * the data stays unread.  This is the level-triggered re-report path
+           * now that the full rescan in step 4 is rate-limited.  Called from
+           * outside ep->lock; the helper takes it and wakes co-waiters. */
+          ep_add_to_ready_list(ep, epi);
         }
         if (epi->oneshot) {
           epi->oneshot_disabled = true;
@@ -469,25 +509,39 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
     if (timeout_ms == 0)
       break;
 
-    // 4. Check all watched items outside ep->lock for missed/level-triggered events
-    int items_high = __atomic_load_n(&ep->items_high, __ATOMIC_RELAXED);
-    for (int _i = 0; _i < items_high; _i++) {
-      epitem_t *_epi = ep->items[_i];
-      if (!_epi || _epi->on_ready_list)
-        continue;
-      if (_epi->oneshot && _epi->oneshot_disabled)
-        continue;
-      uint32_t _ev = ep_check_events(_epi);
-      if (_ev) {
-        spinlock_acquire(&ep->lock);
-        if (!_epi->on_ready_list) {
-          _epi->last_events = _ev;
-          list_add_tail(&_epi->rdllink, &ep->rdllist);
-          _epi->on_ready_list = true;
-          ep->rdllist_count++;
+    // 4. Rate-limited fallback rescan of every watched item, outside ep->lock.
+    //    Discovery is driven by epoll_notify_event() and level-triggered
+    //    re-reporting by the requeue in step 2, so this no longer runs on
+    //    every pass with an empty ready list: only when due, or always on the
+    //    nonblocking path whose semantics require a full poll.  This bounds
+    //    idle O(watched-fd) scans to one per EPOLL_RESCAN_INTERVAL_MS.
+    uint64_t scan_now = lapic_timer_get_ticks();
+    if (timeout_ms == 0 ||
+        scan_now >= __atomic_load_n(&ep->next_scan_ticks, __ATOMIC_RELAXED)) {
+      int items_high = __atomic_load_n(&ep->items_high, __ATOMIC_RELAXED);
+      for (int _i = 0; _i < items_high; _i++) {
+        epitem_t *_epi = ep->items[_i];
+        if (!_epi || _epi->on_ready_list)
+          continue;
+        if (_epi->oneshot && _epi->oneshot_disabled)
+          continue;
+        uint32_t _ev = ep_check_events(_epi);
+        if (_ev) {
+          spinlock_acquire(&ep->lock);
+          if (!_epi->on_ready_list) {
+            _epi->last_events = _ev;
+            /* We polled it microseconds ago: publish the mask so the
+             * delivery in step 2 doesn't poll the same fd a second time. */
+            __atomic_fetch_or(&_epi->ready_events, _ev, __ATOMIC_RELAXED);
+            list_add_tail(&_epi->rdllink, &ep->rdllist);
+            _epi->on_ready_list = true;
+            ep->rdllist_count++;
+          }
+          spinlock_release(&ep->lock);
         }
-        spinlock_release(&ep->lock);
       }
+      __atomic_store_n(&ep->next_scan_ticks, scan_now + EPOLL_RESCAN_INTERVAL_MS,
+                       __ATOMIC_RELAXED);
     }
 
     // 5. Prepare to block under ep->lock
@@ -500,10 +554,16 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
     }
 
     current->state = THREAD_BLOCKED;
+    /* Wake for the user deadline or when the next fallback rescan is due,
+     * whichever comes first; without a timeout, only for the rescan.  An
+     * event wake comes from ep_add_to_ready_list(), which clears
+     * wakeup_ticks.  Step 4 just ran, so scan_at is always in the future. */
+    uint64_t scan_at = __atomic_load_n(&ep->next_scan_ticks, __ATOMIC_RELAXED);
     if (timeout_ms > 0 && timeout_ms != -1) {
-      current->wakeup_ticks = deadline_ticks;
+      current->wakeup_ticks =
+          (deadline_ticks < scan_at) ? deadline_ticks : scan_at;
     } else if (timeout_ms == -1) {
-      current->wakeup_ticks = lapic_timer_get_ticks() + EPOLL_RESCAN_INTERVAL_MS;
+      current->wakeup_ticks = scan_at;
     } else {
       current->wakeup_ticks = 0;
     }
@@ -733,6 +793,11 @@ void epoll_notify_event(struct vfs_node *node, uint32_t events) {
     if (!mask)
       continue;
 
+    /* Cache the asserted edge: the waiter will deliver this exact mask
+     * without re-polling the fd.  Fresh by construction - the producer just
+     * changed the state it is reporting. */
+    __atomic_fetch_or(&epi->ready_events, mask, __ATOMIC_RELAXED);
+
     // ep_add_to_ready_list now handles both adding to the ready list AND
     // waking up waiters atomically under ep->lock, eliminating the
     // missed-wakeup race.
@@ -748,11 +813,18 @@ void epoll_notify_event(struct vfs_node *node, uint32_t events) {
 
 // Notify epoll by socket FD (for abstract sockets without VFS node)
 void epoll_notify_socket(int fd, uint32_t events) {
-  if (fd < 0)
+  if (fd < 0 || fd >= EPOLL_MAX_WATCHED)
     return;
 
-  // Find all epoll instances watching this FD
-  for (int i = 0; i < EPOLL_MAX_INSTANCES; i++) {
+  /* Walk only live instances: the free-bitmap marks in-use slots (1 = free),
+   * so a system with a handful of epoll instances open does a handful of
+   * iterations instead of unconditionally probing all 64.  The bitmap and
+   * epoll_table[] are read racily, exactly as the old loop did - a slot
+   * missed in this instant is covered by epoll_wait's rate-limited rescan. */
+  uint64_t live = ~__atomic_load_n(&epoll_free_bitmap, __ATOMIC_RELAXED);
+  while (live) {
+    int i = __builtin_ctzll(live);
+    live &= live - 1;
     eventpoll_t *ep = epoll_table[i];
     if (!ep)
       continue;
@@ -770,6 +842,8 @@ void epoll_notify_socket(int fd, uint32_t events) {
         events & (epi->registered_events | EPOLLERR | EPOLLHUP | EPOLLRDHUP);
 
     if (mask) {
+      // Same cached-edge fast path as epoll_notify_event().
+      __atomic_fetch_or(&epi->ready_events, mask, __ATOMIC_RELAXED);
       // ep_add_to_ready_list handles both adding to the ready list AND
       // waking up waiters atomically under ep->lock.
       ep_add_to_ready_list(ep, epi);

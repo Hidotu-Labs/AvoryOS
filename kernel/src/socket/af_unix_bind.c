@@ -7,7 +7,8 @@ static int unix_bind_abstract(unix_sock_t *usk, struct sockaddr_un *sun,
   if (unix_find_socket_by_addr(sun, addrlen))
     return -EADDRINUSE;
 
-  memcpy(&usk->addr, sun, addrlen);
+  size_t copy = (size_t)addrlen < sizeof(usk->addr) ? (size_t)addrlen : sizeof(usk->addr);
+  memcpy(&usk->addr, sun, copy);
   usk->addr_len = addrlen;
   usk->is_abstract = true;
 
@@ -17,7 +18,7 @@ static int unix_bind_abstract(unix_sock_t *usk, struct sockaddr_un *sun,
 
   usk->parent->state = SS_UNCONNECTED;
 
-  klog_puts("[OK] unix_bind: bound to abstract address\n");
+  klog_debug_puts("[OK] unix_bind: bound to abstract address\n");
   return 0;
 }
 
@@ -49,7 +50,10 @@ static int unix_bind_fs(unix_sock_t *usk, struct sockaddr_un *sun, int addrlen) 
   struct thread *current_thread = sched_get_current();
   vfs_node_t *cwd_node = fs_root;
   vfs_node_t *cwd_owned = NULL;
-  if (current_thread && current_thread->cwd_path[0]) {
+  /* Absolute socket paths ignore the base entirely
+   * (vfs_resolve_path_at() anchors them at fs_root), so only pay for a CWD
+   * resolution when the parent is actually relative. */
+  if (parent_path[0] != '/' && current_thread && current_thread->cwd_path[0]) {
     cwd_node = vfs_resolve_path(current_thread->cwd_path);
     if (!cwd_node)
       cwd_node = fs_root;
@@ -111,7 +115,10 @@ static int unix_bind_fs(unix_sock_t *usk, struct sockaddr_un *sun, int addrlen) 
 
   usk->bound_vnode = fs_node; // reference transferred to the socket
 
-  memcpy(&usk->addr, sun, addrlen);
+  {
+    size_t copy = (size_t)addrlen < sizeof(usk->addr) ? (size_t)addrlen : sizeof(usk->addr);
+    memcpy(&usk->addr, sun, copy);
+  }
   usk->addr_len = addrlen;
   usk->is_abstract = false;
 
@@ -121,9 +128,9 @@ static int unix_bind_fs(unix_sock_t *usk, struct sockaddr_un *sun, int addrlen) 
 
   usk->parent->state = SS_UNCONNECTED;
 
-  klog_puts("[OK] unix_bind: bound to filesystem path: ");
-  klog_puts(sun->sun_path);
-  klog_puts("\n");
+  klog_debug_puts("[OK] unix_bind: bound to filesystem path: ");
+  klog_debug_puts(sun->sun_path);
+  klog_debug_puts("\n");
   vfs_close(parent);
   if (cwd_owned) vfs_close(cwd_owned);
   return 0;

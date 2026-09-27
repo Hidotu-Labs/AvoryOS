@@ -536,6 +536,7 @@ install_apk "yaml" "main"
 install_apk "graphene" "main"
 install_apk "gtksourceview5" "community"
 install_apk "gtk4.0" "community"
+install_apk "cups-libs" "main"
 install_apk "harfbuzz" "main"
 install_apk "harfbuzz-subset" "main"
 install_apk "gsettings-desktop-schemas" "community"
@@ -559,6 +560,16 @@ install_apk "opusfile" "main"
 # ffmpeg libs (for additional codec support)
 install_apk "ffmpeg-libavcodec" "community"
 install_apk "ffmpeg-libavformat" "community"
+
+# Minimal Firefox runtime. Most GTK, X11, Mesa, font, and codec libraries are
+# already installed above; add only Firefox's remaining shared-library deps.
+install_apk "libevent" "main"
+install_apk "nspr" "main"
+install_apk "nss" "main"
+install_apk "pciutils-libs" "main"
+install_apk "scudo-malloc" "main"
+install_apk "firefox" "community"
+
 # libasyncns is needed by libpulsecommon (inside libpulse)
 install_apk "libasyncns" "community"
 install_apk "libpulse" "community"
@@ -1051,18 +1062,30 @@ install_apk "btop" "community"
 # 4. Finalize GTK environment
 echo "[*] Setting up global audio environment variables..."
 mkdir -p "${ROOTFS_DIR}/etc/profile.d" "${ROOTFS_DIR}/etc/pulse"
+# No PULSE_SERVER override: an empty value makes libpulse build broken
+# socket paths ("//.config/pulse/...-runtime is not absolute") instead of
+# falling back.  The PipeWire-Pulse server (started by OpenRC, see below)
+# listens at $XDG_RUNTIME_DIR/pulse/native (/tmp/runtime-0, same dir the
+# graphical session exports in startx.sh), which is exactly where libpulse
+# looks when PULSE_SERVER is unset.
 cat > "${ROOTFS_DIR}/etc/profile.d/gtk_avoryos.sh" << 'ENV_EOF'
-export PULSE_SERVER=""
+# Audio goes through the PipeWire-Pulse server; leave PULSE_SERVER unset so
+# clients resolve $XDG_RUNTIME_DIR/pulse/native (ALSA direct is the fallback).
+unset PULSE_SERVER
 ENV_EOF
 chmod +x "${ROOTFS_DIR}/etc/profile.d/gtk_avoryos.sh"
 
 cat > "${ROOTFS_DIR}/etc/environment" << 'ENV_EOF'
-PULSE_SERVER=""
+# AvoryOS: no global overrides (PULSE_SERVER intentionally unset for PipeWire).
 ENV_EOF
 
+# PipeWire provides the PulseAudio protocol (pipewire-pulse), so the client
+# must be allowed to spawn/connect and to use shared memory.  (The previous
+# autospawn=no / disable-shm=yes belonged to the serverless ALSA-fallback
+# era and starves every Pulse client when a server is actually running.)
 cat > "${ROOTFS_DIR}/etc/pulse/client.conf" << 'PULSE_EOF'
-autospawn = no
-disable-shm = yes
+autospawn = yes
+disable-shm = no
 PULSE_EOF
 
 # Disable D-Bus activation for GVfs volume monitors to prevent 25s timeouts and abort crashes
@@ -1212,6 +1235,28 @@ if [ -z "$XDG_RUNTIME_DIR" ]; then
 fi
 mkdir -p "$XDG_RUNTIME_DIR" && chmod 0700 "$XDG_RUNTIME_DIR"
 
+# Ensure user desktop and XDG standard directories exist
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+mkdir -p "$XDG_CONFIG_HOME" "$HOME/Desktop"
+if [ ! -f "$XDG_CONFIG_HOME/user-dirs.dirs" ]; then
+    cat > "$XDG_CONFIG_HOME/user-dirs.dirs" << 'UDEOF'
+XDG_DESKTOP_DIR="$HOME/Desktop"
+XDG_DOWNLOAD_DIR="$HOME/Downloads"
+XDG_TEMPLATES_DIR="$HOME/Templates"
+XDG_PUBLICSHARE_DIR="$HOME/Public"
+XDG_DOCUMENTS_DIR="$HOME/Documents"
+XDG_MUSIC_DIR="$HOME/Music"
+XDG_PICTURES_DIR="$HOME/Pictures"
+XDG_VIDEOS_DIR="$HOME/Videos"
+UDEOF
+fi
+if command -v xdg-user-dirs-update >/dev/null 2>&1; then
+    xdg-user-dirs-update 2>/dev/null || true
+fi
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 --no-incremental 2>/dev/null || true
+fi
+
 # startx registers a second xauth entry for "<hostname>:0" (a TCP/hostname
 # entry) next to the local ":0" entry.  AvoryOS sessions only use the local
 # display, so drop the hostname entry.  xauth stores/prints the local entry as
@@ -1260,6 +1305,12 @@ chmod +x "${ROOTFS_DIR}/etc/skel/.xinitrc"
 
 # Root's home is / on AvoryOS.
 cp "${ROOTFS_DIR}/etc/skel/.xinitrc" "${ROOTFS_DIR}/.xinitrc"
+mkdir -p "${ROOTFS_DIR}/root"
+cp "${ROOTFS_DIR}/etc/skel/.xinitrc" "${ROOTFS_DIR}/root/.xinitrc"
+if [ -d "${ROOTFS_DIR}/home/avory" ]; then
+    cp "${ROOTFS_DIR}/etc/skel/.xinitrc" "${ROOTFS_DIR}/home/avory/.xinitrc"
+    chown 1000:1000 "${ROOTFS_DIR}/home/avory/.xinitrc" 2>/dev/null || true
+fi
 
 # Xsession (LightDM and other display managers) sources these before running
 # the session; DISPLAY is set by then, so push the full X environment into the
@@ -1384,23 +1435,27 @@ export XCURSOR_THEME=Adwaita
 export XCURSOR_SIZE=24
 
 # Ensure XDG dirs exist
-export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
-export XDG_DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
+HOME_BASE="${HOME:-/}"
+HOME_BASE="${HOME_BASE%/}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME_BASE}/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${HOME_BASE}/.local/share}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME_BASE}/.cache}"
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" \
-         "$HOME/Desktop" "$HOME/Templates" "$HOME/Downloads" "$HOME/Documents" \
-         "$HOME/Pictures" "$HOME/Music" "$HOME/Videos" \
+         "${HOME_BASE}/Desktop" "${HOME_BASE}/Templates" \
+         "${HOME_BASE}/Downloads" "${HOME_BASE}/Documents" \
+         "${HOME_BASE}/Pictures" "${HOME_BASE}/Music" \
+         "${HOME_BASE}/Videos" \
          "$XDG_CONFIG_HOME/gtk-3.0"
 
-cat > "$XDG_CONFIG_HOME/user-dirs.dirs" << 'USER_DIRS_EOF'
-XDG_DESKTOP_DIR="$HOME/Desktop"
-XDG_DOWNLOAD_DIR="$HOME/Downloads"
-XDG_TEMPLATES_DIR="$HOME/Templates"
-XDG_PUBLICSHARE_DIR="$HOME/Public"
-XDG_DOCUMENTS_DIR="$HOME/Documents"
-XDG_MUSIC_DIR="$HOME/Music"
-XDG_PICTURES_DIR="$HOME/Pictures"
-XDG_VIDEOS_DIR="$HOME/Videos"
+cat > "$XDG_CONFIG_HOME/user-dirs.dirs" <<USER_DIRS_EOF
+XDG_DESKTOP_DIR="${HOME_BASE}/Desktop"
+XDG_DOWNLOAD_DIR="${HOME_BASE}/Downloads"
+XDG_TEMPLATES_DIR="${HOME_BASE}/Templates"
+XDG_PUBLICSHARE_DIR="${HOME_BASE}/Public"
+XDG_DOCUMENTS_DIR="${HOME_BASE}/Documents"
+XDG_MUSIC_DIR="${HOME_BASE}/Music"
+XDG_PICTURES_DIR="${HOME_BASE}/Pictures"
+XDG_VIDEOS_DIR="${HOME_BASE}/Videos"
 USER_DIRS_EOF
 
 rm -rf "$XDG_CACHE_HOME"/*-socket* "$XDG_CACHE_HOME"/pcmanfm* "$XDG_CACHE_HOME"/Thunar* /tmp/.*-lock /tmp/*-socket*
@@ -1689,6 +1744,11 @@ export XDG_SESSION_DESKTOP=xfce
 export DESKTOP_SESSION=xfce
 export XDG_CONFIG_DIRS=/etc/xdg:/etc
 export XDG_DATA_DIRS=/usr/local/share:/usr/share
+AVORY_HOME_BASE="${HOME:-/}"
+AVORY_HOME_BASE="${AVORY_HOME_BASE%/}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${AVORY_HOME_BASE}/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${AVORY_HOME_BASE}/.local/share}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${AVORY_HOME_BASE}/.cache}"
 export GDK_GL=disable
 export LIBGL_DRI3_DISABLE=1
 export NO_AT_BRIDGE=1
@@ -1896,6 +1956,13 @@ install_apk "kpipewire" "community"
 # PipeWire audio infrastructure
 install_apk "pipewire-libs" "community"
 install_apk "pipewire-pulse" "community"
+install_apk "pipewire-alsa" "community"
+install_apk "pipewire-tools" "community"
+# Official OpenRC user-service scripts (exist on Alpine ≥3.22; the lookup
+# fails gracefully on older branches, where the system services created
+# below cover startup instead).
+install_apk "pipewire-openrc" "community" || true
+install_apk "pipewire-pulse-openrc" "community" || true
 install_apk "wireplumber" "community"
 install_apk "wireplumber-libs" "community"
 install_apk "pulseaudio-utils" "community"
@@ -2056,6 +2123,7 @@ install_apk "polkit-qt6" "community"
 install_apk "kdeclarative" "community"
 install_apk "oxygen" "community"
 install_apk "xdg-utils" "community"
+install_apk "xdg-user-dirs" "community"
 install_apk "desktop-file-utils" "community"
 # libKF6Prison.so.6 (needed by libklipper / org.kde.plasma.clipboard)
 install_apk "libdmtx-libs" "community"
@@ -2063,6 +2131,40 @@ install_apk "libdmtx" "community"
 install_apk "zxing-cpp" "community"
 install_apk "libqrencode" "community"
 install_apk "prison" "community"
+
+# Configure default XDG user directories and Desktop folders
+mkdir -p "${ROOTFS_DIR}/etc/xdg"
+cat > "${ROOTFS_DIR}/etc/xdg/user-dirs.defaults" << 'EOF'
+DESKTOP=Desktop
+DOWNLOAD=Downloads
+TEMPLATES=Templates
+PUBLICSHARE=Public
+DOCUMENTS=Documents
+MUSIC=Music
+PICTURES=Pictures
+VIDEOS=Videos
+EOF
+cat > "${ROOTFS_DIR}/etc/xdg/user-dirs.conf" << 'EOF'
+enabled=True
+EOF
+
+# Pre-create Desktop & XDG user directories for root, skeleton, and avory user
+for udir in "${ROOTFS_DIR}/etc/skel" "${ROOTFS_DIR}/root" "${ROOTFS_DIR}" "${ROOTFS_DIR}/home/avory"; do
+    mkdir -p "$udir/Desktop" "$udir/Downloads" "$udir/Documents" "$udir/.config"
+    cat > "$udir/.config/user-dirs.dirs" << 'UDEOF'
+XDG_DESKTOP_DIR="$HOME/Desktop"
+XDG_DOWNLOAD_DIR="$HOME/Downloads"
+XDG_TEMPLATES_DIR="$HOME/Templates"
+XDG_PUBLICSHARE_DIR="$HOME/Public"
+XDG_DOCUMENTS_DIR="$HOME/Documents"
+XDG_MUSIC_DIR="$HOME/Music"
+XDG_PICTURES_DIR="$HOME/Pictures"
+XDG_VIDEOS_DIR="$HOME/Videos"
+UDEOF
+done
+if [ -d "${ROOTFS_DIR}/home/avory" ]; then
+    chown -R 1000:1000 "${ROOTFS_DIR}/home/avory" 2>/dev/null || true
+fi
 
 # --- OpenRC init system ---
 install_apk "openrc" "main"
@@ -2163,6 +2265,110 @@ start() {
 EOF
 chmod +x "${ROOTFS_DIR}/etc/init.d/dev"
 
+# PipeWire audio stack as system-level OpenRC services.
+# Upstream ships these as OpenRC *user* services (pipewire-openrc), which need
+# elogind user sessions that AvoryOS does not have, so provide system services
+# instead (they are also what makes audio work on the v3.21 branch, which has
+# no pipewire-openrc subpackage at all).
+# A single static ALSA sink on the Intel HDA (hw:0, 48k stereo S16 — the only
+# format the kernel ALSA emulation keeps stable across concurrent streams) is
+# created once the daemon is up; WirePlumber is intentionally not required
+# (no hotplug/policy to manage with one static device).  XDG_RUNTIME_DIR
+# matches the graphical session (startx.sh), so session clients find the
+# server sockets with no extra environment.
+cat <<'EOF' > "${ROOTFS_DIR}/etc/init.d/pipewire"
+#!/sbin/openrc-run
+description="PipeWire multimedia server (AvoryOS system instance)"
+
+export XDG_RUNTIME_DIR=/tmp/runtime-0
+
+command="/usr/bin/pipewire"
+supervisor=supervise-daemon
+# Throttle respawns: default is respawn immediately (delay 0), so a
+# crashing daemon (bind conflict, missing D-Bus, second autospawned
+# instance) turns supervise-daemon into a 95% CPU fork+exec loop
+# (PID 3758 in htop: 10:30 CPU while children sit at 0%).
+respawn_delay=5
+respawn_max=3
+respawn_period=60
+# File log, not per-line `logger` fork: a verbose daemon makes
+# --stderr-logger fork+exec `logger` for every line inside the
+# supervisor, which also shows up as supervisor CPU.
+error_log="/var/log/pipewire.log"
+
+depend() {
+    use dbus
+    keyword -shutdown
+}
+
+start_pre() {
+    mkdir -p "$XDG_RUNTIME_DIR"
+    # 0700 root-owned blocks lightdm/avory clients -> they autospawn a
+    # second pipewire fighting over pipewire-0 -> bind conflict ->
+    # crash/respawn loop (two /usr/bin/pipewire in htop). Shared
+    # system instance needs world access.
+    chmod 1777 "$XDG_RUNTIME_DIR"
+}
+
+start_post() {
+    # Publish one static ALSA sink once the daemon is up.
+    # Device discovery (WirePlumber/udev) does not exist here, so without
+    # this there would be no nodes at all.  Runs detached: a stuck client
+    # must never stall the boot (the daemon itself is already listening).
+    # NOTE: sink only. The kernel only registers pcmC0D0p (playback);
+    # READI_FRAMES returns -EINVAL, there is no pcmC0D0c, so the
+    # Audio/Source probe can never succeed and only spams logs.
+    # Guarded by flock so every respawn does not pile up another
+    # background subshell (zombie `timeout 20 pw-cli` in htop).
+    (
+        if command -v flock >/dev/null 2>&1; then
+            flock -n 9 || exit 0
+        fi
+        i=0
+        while [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ] && [ $i -lt 10 ]; do
+            sleep 1
+            i=$((i + 1))
+        done
+        if [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
+            logger -t pipewire "socket never appeared; no ALSA nodes created"
+            exit 0
+        fi
+        export XDG_RUNTIME_DIR
+        PWCLI="pw-cli"
+        command -v timeout >/dev/null 2>&1 && PWCLI="timeout -k 5 10 pw-cli"
+        $PWCLI create-node adapter '{ factory.name=api.alsa.pcm.sink node.name=alsa_output.hda media.class=Audio/Sink api.alsa.path=hw:0 audio.rate=48000 audio.channels=2 }' >/dev/null 2>&1 \
+            || logger -t pipewire "failed to create ALSA sink node"
+    ) 9>/tmp/.pipewire-alsa-setup.lock &
+    return 0
+}
+EOF
+chmod +x "${ROOTFS_DIR}/etc/init.d/pipewire"
+
+cat <<'EOF' > "${ROOTFS_DIR}/etc/init.d/pipewire-pulse"
+#!/sbin/openrc-run
+description="PulseAudio compatibility layer for PipeWire"
+
+export XDG_RUNTIME_DIR=/tmp/runtime-0
+
+command="/usr/bin/pipewire-pulse"
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=3
+respawn_period=60
+error_log="/var/log/pipewire-pulse.log"
+
+depend() {
+    need pipewire
+    keyword -shutdown
+}
+
+start_pre() {
+    mkdir -p "$XDG_RUNTIME_DIR"
+    chmod 1777 "$XDG_RUNTIME_DIR"
+}
+EOF
+chmod +x "${ROOTFS_DIR}/etc/init.d/pipewire-pulse"
+
 # Populate runlevels with standard compatible services
 for s in devfs dev dmesg sysfs; do
     if [ -f "${ROOTFS_DIR}/etc/init.d/${s}" ]; then
@@ -2176,7 +2382,7 @@ for s in bootmisc hostname localmount; do
     fi
 done
 
-for s in dbus local avory-login; do
+for s in dbus local pipewire pipewire-pulse avory-login; do
     if [ -f "${ROOTFS_DIR}/etc/init.d/${s}" ]; then
         ln -sfn "/etc/init.d/${s}" "${ROOTFS_DIR}/etc/runlevels/default/${s}"
     fi
@@ -2220,4 +2426,3 @@ fi
 
 mkdir -p "${BUILD_DIR}"
 touch "${BUILD_DIR}/.built"
-

@@ -2,6 +2,7 @@
 #define FS_TMPFS_H
 
 #include "vfs.h"
+#include "dirindex.h"
 #include "../lock/spinlock.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -28,15 +29,14 @@ typedef struct {
     tmpfs_sb_t   *sb;
 } tmpfs_file_t;
 
-typedef struct tmpfs_child {
-    vfs_node_t        *node;
-    struct tmpfs_child *next;
-} tmpfs_child_t;
+/* Children live in the shared directory index (dirindex.h): order list for
+ * readdir, name hash for O(1) lookup.  tmpfs_dir_t keeps the index FIRST so
+ * node->device can be read as a vfs_dirindex_t by the shared finddir
+ * callback, with the superblock pointer after it. */
+typedef vfs_child_t tmpfs_child_t;
 
 typedef struct {
-    tmpfs_child_t *children;
-    tmpfs_child_t *cursor;       /* sequential readdir resume point */
-    uint32_t       cursor_index; /* child index the cursor points at */
+    vfs_dirindex_t di;
     tmpfs_sb_t    *sb;
 } tmpfs_dir_t;
 

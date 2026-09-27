@@ -170,15 +170,66 @@ static void sysfs_populate_block(vfs_node_t *block_class_dir) {
     strcat(devbuf, "\n");
     sysfs_mkfile(bdir, "dev", devbuf);
 
-    // size: total bytes
+    // size: device capacity in 512-byte sectors (Linux convention; userspace
+    // multiplies by 512).  sector_size only describes the logical unit.
+    uint64_t bytes = (uint64_t)bd->total_sectors *
+                     (bd->sector_size ? bd->sector_size : 512);
     char sbuf[32];
-    uint64_t bytes =
-        (uint64_t)bd->total_sectors * (bd->sector_size ? bd->sector_size : 512);
-    u64_to_dec(bytes, sbuf);
+    u64_to_dec(bytes / 512, sbuf);
     strcat(sbuf, "\n");
     sysfs_mkfile(bdir, "size", sbuf);
 
     sysfs_mkfile(bdir, "removable", "0\n");
+    sysfs_mkfile(bdir, "ro", "0\n");
+
+    // uevent: what udev/libblkid parse to identify a block device.
+    char uevent[128];
+    snprintf(uevent, sizeof(uevent),
+             "MAJOR=8\nMINOR=%d\nDEVNAME=%s\nDEVTYPE=disk\n", i, bd->name);
+    sysfs_mkfile(bdir, "uevent", uevent);
+
+    // stat: 11 space-separated counters (reads, merges, sectors, ms, ...).
+    // Per-device I/O accounting does not exist yet, so report zeros.
+    sysfs_mkfile(bdir, "stat", "0 0 0 0 0 0 0 0 0 0 0\n");
+
+    // holders/: stacked devices (dm/md).  libblkid stats this directory for
+    // every candidate whole-disk device; it must exist even when empty.
+    sysfs_mkdir(bdir, "holders");
+
+    // queue/: request-queue properties read by lsblk, libblkid, udev.
+    vfs_node_t *queue = sysfs_mkdir(bdir, "queue");
+    if (queue) {
+      uint64_t ss = bd->sector_size ? bd->sector_size : 512;
+      char qbuf[32];
+      u64_to_dec(ss, qbuf);
+      strcat(qbuf, "\n");
+      sysfs_mkfile(queue, "logical_block_size", qbuf);
+      sysfs_mkfile(queue, "physical_block_size", qbuf);
+      sysfs_mkfile(queue, "hw_sector_size", qbuf);
+      sysfs_mkfile(queue, "minimum_io_size", qbuf);
+      sysfs_mkfile(queue, "optimal_io_size", "0\n");
+      sysfs_mkfile(queue, "rotational", "0\n");
+      sysfs_mkfile(queue, "max_sectors_kb", "1024\n");
+      sysfs_mkfile(queue, "nr_requests", "128\n");
+    }
+  }
+}
+
+// /sys/block — Linux's top-level alias for the block class.  Tools such as
+// libblkid (and therefore GIO's volume monitors) enumerate devices here and
+// follow the entry to read queue/holders/dev attributes.  Entries are
+// symlinks into /sys/class/block, which holds the real nodes.
+static void sysfs_populate_block_alias(vfs_node_t *block_root) {
+  if (!block_root)
+    return;
+  int count = block_count();
+  for (int i = 0; i < count; i++) {
+    struct block_device *bd = block_get(i);
+    if (!bd)
+      continue;
+    char target[96];
+    snprintf(target, sizeof(target), "../class/block/%s", bd->name);
+    sysfs_symlink(block_root, bd->name, target);
   }
 }
 
@@ -289,6 +340,7 @@ static void sysfs_populate_cpus(vfs_node_t *cpu_dir) {
   strcat(cpumask, "\n");
   sysfs_mkfile(cpu_dir, "possible", cpumask);
   sysfs_mkfile(cpu_dir, "present", cpumask);
+  sysfs_mkfile(cpu_dir, "online", cpumask);
 }
 
 // Main init
@@ -317,7 +369,7 @@ void sysfs_init(void) {
   vfs_node_init(sysfs_root);
   strcpy(sysfs_root->name, "sys");
   ramfs_mount_on(sysfs_root);
-  vfs_mount(sys_dir, sysfs_root);
+  vfs_mount_ex(sys_dir, sysfs_root, "none", "unknown", "/sys");
   vfs_close(sys_dir);
 
   // /sys/bus/pci/devices
@@ -338,6 +390,11 @@ void sysfs_init(void) {
   // /sys/class/block
   vfs_node_t *block_class = sysfs_mkdir(class_dir, "block");
   sysfs_populate_block(block_class);
+
+  // /sys/block — top-level alias for the block class.  Created after the
+  // class so the symlink targets exist.
+  vfs_node_t *block_alias = sysfs_mkdir(sysfs_root, "block");
+  sysfs_populate_block_alias(block_alias);
 
   // /sys/class/net
   net_class_root = sysfs_mkdir(class_dir, "net");

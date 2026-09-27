@@ -20,7 +20,7 @@ fork_return_to_userspace:
 
     ; Set user data segment selectors
     push rax
-    mov  ax, 0x1B           ; User Data selector (0x18 | RPL=3)
+    mov  ax, 0x23           ; User Data selector (0x20 | RPL=3)
     mov  ds, ax
     mov  es, ax
     pop  rax

@@ -2,8 +2,10 @@
 #include "../arch/x86_64/extable.h"
 #include "../console/klog.h"
 #include "../fs/vfs.h"
+#include "../hal/hal.h"
 #include "../lib/string.h"
 #include "../sched/sched.h"
+#include "../smp/cpu.h"
 #include "pmm.h"
 #include "tlb_shootdown.h"
 #include "vma.h"
@@ -17,6 +19,30 @@
 #define PROT_READ 0x1
 #define PROT_WRITE 0x2
 #define PROT_EXEC 0x4
+
+/* Bad user pointers can fault on several worker threads at once.  Printing an
+ * entire VMA tree for each one floods and interleaves the serial log; keep a
+ * few representative records and retain a suppression count for the rest. */
+static volatile uint32_t no_vma_user_log_count;
+
+/* Page faults enter through an interrupt gate, so IF is normally clear even
+ * for user tasks. File-cache fills and imported driver faults may read, wait,
+ * or yield; let IPIs and timer/device IRQs run around those calls, but never
+ * open interrupts from a nested hard-IRQ fault. */
+static bool pf_enable_irqs_for_wait(void) {
+  bool were_enabled = hal_irq_enabled();
+  if (!were_enabled) {
+    extern int linuxkpi_irq_depth(void) __attribute__((weak));
+    if (!linuxkpi_irq_depth || linuxkpi_irq_depth() == 0)
+      hal_irq_enable();
+  }
+  return were_enabled;
+}
+
+static void pf_restore_irqs_after_wait(bool were_enabled) {
+  if (!were_enabled)
+    hal_irq_disable();
+}
 
 static uint64_t dp_build_flags(uint64_t prot) {
   if (prot == PROT_NONE)
@@ -111,28 +137,35 @@ static void vmm_map_cow_cluster(uint64_t *pml4, uint64_t cr2,
  *
  * Plain stores only: this runs on the fault path, where taking a lock or
  * allocating can fault again or spin forever on a ticket lock this CPU already
- * holds. A record torn by a rejection on another CPU only garbles one line on a
- * machine that is about to panic anyway.
+ * holds. Records are per CPU so a simultaneous rejection elsewhere cannot
+ * overwrite the context being reported.
  */
-static struct vmm_fault_reject pf_reject;
-static volatile uint32_t pf_reject_seq;
+static struct vmm_fault_reject pf_reject[MAX_CPUS];
+static volatile uint32_t pf_reject_seq[MAX_CPUS];
+
+static uint32_t pf_reject_cpu_index(void) {
+  struct cpu_info *cpu = cpu_get_current();
+  return cpu && cpu->cpu_id < MAX_CPUS ? cpu->cpu_id : 0;
+}
 
 static int pf_reject_record(uint64_t cr2, uint64_t error_code,
                             const struct registers *regs,
                             const struct thread *current, const char *reason,
                             const char *file, uint32_t line, uint64_t detail,
                             uint64_t detail2) {
-  pf_reject.reason = reason;
-  pf_reject.file = file;
-  pf_reject.line = line;
-  pf_reject.cr2 = cr2;
-  pf_reject.err_code = error_code;
-  pf_reject.rip = regs ? regs->rip : 0;
-  pf_reject.detail = detail;
-  pf_reject.detail2 = detail2;
-  pf_reject.tid = current ? current->tid : 0;
-  pf_reject.seq = pf_reject_seq + 1;
-  pf_reject_seq = pf_reject.seq;
+  uint32_t cpu = pf_reject_cpu_index();
+  struct vmm_fault_reject *r = &pf_reject[cpu];
+  r->reason = reason;
+  r->file = file;
+  r->line = line;
+  r->cr2 = cr2;
+  r->err_code = error_code;
+  r->rip = regs ? regs->rip : 0;
+  r->detail = detail;
+  r->detail2 = detail2;
+  r->tid = current ? current->tid : 0;
+  r->seq = pf_reject_seq[cpu] + 1;
+  pf_reject_seq[cpu] = r->seq;
   return -1;
 }
 
@@ -144,10 +177,11 @@ static int pf_reject_record(uint64_t cr2, uint64_t error_code,
 bool vmm_get_last_fault_reject(struct vmm_fault_reject *out) {
   if (!out)
     return false;
-  uint32_t seq = pf_reject_seq;
+  uint32_t cpu = pf_reject_cpu_index();
+  uint32_t seq = pf_reject_seq[cpu];
   if (seq == 0)
     return false;
-  *out = pf_reject;
+  *out = pf_reject[cpu];
   return out->seq == seq;
 }
 
@@ -497,8 +531,12 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     extern int linuxkpi_vma_fault(void *, unsigned long, unsigned long)
         __attribute__((weak));
 
-    if (linuxkpi_vma_fault &&
-        linuxkpi_vma_fault(vma_linux, cr2, error_code) == 0) {
+    bool irq_state = pf_enable_irqs_for_wait();
+    int driver_fault_result =
+        linuxkpi_vma_fault ? linuxkpi_vma_fault(vma_linux, cr2, error_code)
+                           : -1;
+    pf_restore_irqs_after_wait(irq_state);
+    if (linuxkpi_vma_fault && driver_fault_result == 0) {
       /* The driver fault can sleep (TTM waits on a dma-fence) and another
        * thread may have unmapped this range meanwhile.  A PTE it installed
        * then outlives the buffer object whose mapping is gone, so validate
@@ -543,16 +581,26 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       void *handler = (void *)current->signal_handlers[10].sa_handler;
       bool has_custom_handler = (handler != NULL && handler != (void *)1);
       if (!has_custom_handler) {
-        klog_puts("[VMM] No VMA for CR2=");
-        klog_hex64(cr2);
-        klog_puts(" RIP=");
-        klog_hex64(regs->rip);
-        klog_puts(" process '");
-        klog_puts(current->comm);
-        klog_puts("' (tid=");
-        klog_uint64(current->tid);
-        klog_puts(")\n[VMM] Active VMAs:\n");
-        vma_dump(&current->mm->vmas);
+        uint32_t seen = __atomic_add_fetch(&no_vma_user_log_count, 1,
+                                           __ATOMIC_RELAXED);
+        if (seen <= 8 || (seen & 0xFFu) == 0) {
+          klog_puts("[VMM] user fault outside VMA cr2=");
+          klog_hex64(cr2);
+          klog_puts(" rip=");
+          klog_hex64(regs->rip);
+          klog_puts(" err=");
+          klog_hex64(error_code);
+          klog_puts(" tid=");
+          klog_uint64(current->tid);
+          klog_puts(" comm='");
+          klog_puts(current->comm);
+          klog_puts("' count=");
+          klog_uint64(seen);
+          klog_puts("\n");
+        } else if (seen == 9) {
+          klog_puts("[VMM] repeated user no-VMA faults suppressed; sampling "
+                    "every 256th (counter is global)\n");
+        }
       }
       return PF_REJECT("no VMA covers the faulting address", cr2, 0);
     }
@@ -562,67 +610,29 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
         return PF_REJECT("kernel read of a user address at a guarded (extable) "
                          "instruction", cr2, regs->rip);
       }
-      klog_puts("\n" KLOG_CLR_RED "[ FATAL ]" KLOG_CLR_RESET
-                " KERNEL-MODE FAULT on user address\n");
-      klog_puts("          CR2:  ");
+      klog_puts("[VMM] kernel access faulted on user address cr2=");
       klog_hex64(cr2);
-      klog_puts("\n");
-      klog_puts("          RIP:  ");
+      klog_puts(" rip=");
       klog_hex64(regs->rip);
-      klog_puts("\n");
-      klog_puts("          TID:  ");
+      klog_puts(" tid=");
       klog_uint64(current->tid);
-      klog_puts(" COMM: '");
+      klog_puts(" comm='");
       klog_puts((current->comm[0]) ? current->comm : "?");
-      klog_puts("'\n\n");
-
-      klog_puts("      RAX: ");
-      klog_hex64(regs->rax);
-      klog_puts(" RBX: ");
-      klog_hex64(regs->rbx);
-      klog_puts("\n");
-      klog_puts("      RCX: ");
-      klog_hex64(regs->rcx);
-      klog_puts(" RDX: ");
-      klog_hex64(regs->rdx);
-      klog_puts("\n");
-      klog_puts("      RSI: ");
-      klog_hex64(regs->rsi);
-      klog_puts(" RDI: ");
-      klog_hex64(regs->rdi);
-      klog_puts("\n");
-      klog_puts("      RBP: ");
-      klog_hex64(regs->rbp);
-      klog_puts(" RSP: ");
-      klog_hex64(regs->rsp);
-      klog_puts("\n");
-      klog_puts("      R8:  ");
-      klog_hex64(regs->r8);
-      klog_puts(" R9:  ");
-      klog_hex64(regs->r9);
-      klog_puts("\n");
-      klog_puts("      R10: ");
-      klog_hex64(regs->r10);
-      klog_puts(" R11: ");
-      klog_hex64(regs->r11);
-      klog_puts("\n");
-      klog_puts("      R12: ");
-      klog_hex64(regs->r12);
-      klog_puts(" R13: ");
-      klog_hex64(regs->r13);
-      klog_puts("\n");
-      klog_puts("      R14: ");
-      klog_hex64(regs->r14);
-      klog_puts(" R15: ");
-      klog_hex64(regs->r15);
+      klog_puts("' err=");
+      klog_hex64(regs->err_code);
       klog_puts("\n");
 
       process_do_exit(11); // SIGSEGV
     }
     klog_puts("[VMM] Segmentation fault at CR2=");
     klog_hex64(cr2);
-    klog_puts("\n[VMM] Active VMAs:\n");
-    vma_dump(&current->mm->vmas);
+    klog_puts(" RIP=");
+    klog_hex64(regs->rip);
+    klog_puts(" tid=");
+    klog_uint64(current->tid);
+    klog_puts(" comm='");
+    klog_puts(current->comm);
+    klog_puts("'\n");
     return PF_REJECT(user_mode
                          ? "no VMA covers the faulting address"
                          : "kernel address is not covered by a VMA, so there is "
@@ -670,6 +680,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       //    so those keep the copy-now path.
       uint32_t file_offset = (uint32_t)(vma_offset + page_offset);
       vfs_page_t *cached = vfs_cache_lookup(node, file_offset);
+      bool irq_state = pf_enable_irqs_for_wait();
       if (!cached) {
         // Clustered 128 KB read-ahead into VFS page cache (32 pages)
         vfs_cache_readahead(node, file_offset, 128 * 1024);
@@ -677,6 +688,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
         vfs_cache_put(node, cached);
       }
       cached = vfs_cache_get_or_create(node, file_offset);
+      pf_restore_irqs_after_wait(irq_state);
 
       if (!cached || !cached->frame_phys) {
         if (cached)
@@ -724,6 +736,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       //    Use shared VFS page-cache frame directly.
       uint32_t file_offset = (uint32_t)(vma_offset + page_offset);
       vfs_page_t *cached = vfs_cache_lookup(node, file_offset);
+      bool irq_state = pf_enable_irqs_for_wait();
       if (cached) {
         // Fast path: verify page is ready without redundant lookup cycle
         bool ready = false;
@@ -741,6 +754,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
         vfs_cache_readahead(node, file_offset, 128 * 1024);
         cached = vfs_cache_get_or_create(node, file_offset);
       }
+      pf_restore_irqs_after_wait(irq_state);
 
       if (cached && cached->frame_phys) {
         frame = (void *)cached->frame_phys;
@@ -859,7 +873,27 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     frame = pmm_alloc_page();
 
     if (!frame) {
-      klog_puts("[VMM] OOM during demand paging!\n");
+      size_t free_buddy = pmm_get_free_pages();
+      size_t free_all = pmm_get_free_pages_including_pcp();
+      klogf("[VMM] OOM demand-page alloc=4KB cr2=%016llx page=%016llx "
+            "rip=%016llx rsp=%016llx err=%016llx vma=[%016llx-%016llx) "
+            "prot=%llx flags=%llx huge=%u free_pages=%llu free_pages_pcp=%llu "
+            "tid=%u comm='%s' mode=%s\n",
+            (unsigned long long)cr2,
+            (unsigned long long)(cr2 & ~0xFFFULL),
+            (unsigned long long)(regs ? regs->rip : 0),
+            (unsigned long long)(regs ? regs->rsp : 0),
+            (unsigned long long)error_code,
+            (unsigned long long)vma_start,
+            (unsigned long long)vma_end,
+            (unsigned long long)vma_prot,
+            (unsigned long long)vma_flags,
+            (vma_flags & MAP_HUGEPAGE) ? 1U : 0U,
+            (unsigned long long)free_buddy,
+            (unsigned long long)free_all,
+            current ? current->tid : 0,
+            (current && current->comm[0]) ? current->comm : "?",
+            user_mode ? "user" : "kernel");
       if (user_mode) {
         sched_terminate_thread(current->tid);
         return 0;
@@ -874,30 +908,51 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
   // ---- Map the faulting page ----------------------------------------------
 
   // The frame was prepared without mm->lock (file I/O is slow). Another
-  // thread may have munmapped this range meanwhile. Mapping into a VA
-  // with no VMA creates a phantom page: the app reads zeros instead of
-  // faulting, which corrupts heap metadata (e.g. musl malloc asserts).
+  // thread may have munmapped and reused this range meanwhile. Merely checking
+  // that *some* VMA still covers the address is insufficient: it could now be
+  // a different anonymous/file mapping, and installing this frame would
+  // silently corrupt the new mapping (including allocator metadata).
   spinlock_acquire(&current->mm->lock);
   struct vma *recheck = vma_find(&current->mm->vmas, cr2);
-  spinlock_release(&current->mm->lock);
-  if (!recheck) {
+  uint64_t page_vaddr = cr2 & PAGE_MASK;
+  uint64_t original_page_offset =
+      vma_offset + (page_vaddr >= vma_start ? page_vaddr - vma_start : 0);
+  uint64_t current_page_offset =
+      recheck && page_vaddr >= recheck->start
+          ? recheck->offset + (page_vaddr - recheck->start)
+          : UINT64_MAX;
+  bool same_mapping =
+      recheck && recheck->prot == vma_prot && recheck->flags == vma_flags &&
+      recheck->fd == vma_fd && current_page_offset == original_page_offset &&
+      recheck->file_size == vma_file_size &&
+      recheck->file_node == vma_file_node && recheck->linux_vma == vma_linux;
+  if (!same_mapping) {
+    spinlock_release(&current->mm->lock);
     if (!node) {
       pmm_free_page(frame);
     } else {
       pmm_decref((void *)frame);
     }
-    return PF_REJECT("VMA disappeared while the frame was being prepared "
-                     "(racing munmap or mprotect)", cr2, vma_start);
+    /* The fault raced with munmap/mmap/mprotect while the frame was being
+     * prepared.  Do not turn that transient race into SIGSEGV: retry the
+     * instruction so the page-fault path resolves the address against the
+     * current VMA (or rejects it if it is really unmapped/protected). */
+    vma_linux_put(vma_linux);
+    return 0;
   }
 
   uint64_t flags = dp_build_flags(vma_prot);
   if (cow_mapping)
     flags = (flags & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
   uint64_t vpage = cr2 & ~0xFFFULL;
-  if (!vmm_map_page_if_unmapped((uint64_t *)target_cr3, vpage, (uint64_t)frame,
-                                flags)) {
+  bool mapped = vmm_map_page_if_unmapped((uint64_t *)target_cr3, vpage,
+                                         (uint64_t)frame, flags);
+  uint64_t existing_phys =
+      mapped ? 0 : vmm_virt_to_phys((uint64_t *)target_cr3, vpage);
+  spinlock_release(&current->mm->lock);
+  if (!mapped) {
     // If another thread already mapped this page while we prepared the frame:
-    if (vmm_virt_to_phys((uint64_t *)target_cr3, vpage) != 0) {
+    if (existing_phys != 0) {
       if (!node) {
         pmm_free_page(frame);
       } else {

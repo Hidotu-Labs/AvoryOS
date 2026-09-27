@@ -2,6 +2,7 @@
 #include "mm/vmm.h"
 #include "syscalls/syscall.h"
 #include "arch/uaccess.h"
+#include "sched/sched.h"
 
 uint32_t ext2_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
                         uint8_t *buffer) {
@@ -31,7 +32,45 @@ uint32_t ext2_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
       to_copy = size - bytes_read;
 
     uint32_t disk_block = ext2_get_block_num(mnt, &inode, logical_block);
-    if (disk_block == 0) {
+    if (disk_block != 0 && disk_block >= mnt->sb.s_blocks_count) {
+      union { uint32_t u; char s[4]; } alias = { .u = disk_block };
+      struct thread *ct = sched_get_current();
+      int hit_fd = -1;
+      char hit_path[64] = {0};
+      if (ct && ct->files) {
+        spinlock_acquire(&ct->files->lock);
+        for (int fd = 0; fd < MAX_FDS; fd++) {
+          if (ct->files->fds[fd] == node) {
+            hit_fd = fd;
+            struct fd_path *fp = ct->files->fd_paths[fd];
+            if (fp && fp->value[0]) {
+              size_t n = 0;
+              while (n < sizeof(hit_path)-1 && fp->value[n]) {
+                hit_path[n] = fp->value[n];
+                n++;
+              }
+              hit_path[n] = '\0';
+            }
+            break;
+          }
+        }
+        spinlock_release(&ct->files->lock);
+      }
+      klogf("[EXT2] bad block ref: ino=%u logical=%u disk=%u ascii='%c%c%c%c'"
+            " size=%u fd=%d path='%s' comm='%s' tid=%u\n",
+            node->inode, logical_block, disk_block,
+            alias.s[0] >= 32 && alias.s[0] < 127 ? alias.s[0] : '.',
+            alias.s[1] >= 32 && alias.s[1] < 127 ? alias.s[1] : '.',
+            alias.s[2] >= 32 && alias.s[2] < 127 ? alias.s[2] : '.',
+            alias.s[3] >= 32 && alias.s[3] < 127 ? alias.s[3] : '.',
+            inode.i_size, hit_fd, hit_path,
+            (ct && ct->comm[0]) ? ct->comm : "?",
+            ct ? ct->tid : 0);
+      if (is_user)
+        clear_user(buffer + bytes_read, to_copy);
+      else
+        memset(buffer + bytes_read, 0, to_copy);
+    } else if (disk_block == 0) {
       if (is_user)
         clear_user(buffer + bytes_read, to_copy);
       else
@@ -68,7 +107,7 @@ uint32_t ext2_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
 }
 
 int ext2_truncate_impl(vfs_node_t *node, uint32_t new_len) {
-  if (!node || node->flags != FS_FILE || !node->device)
+  if (!node || (node->flags & FS_TYPE_MASK) != FS_FILE || !node->device)
     return -1;
 
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
@@ -268,6 +307,11 @@ int ext2_rename_impl(vfs_node_t *node, char *old_name, char *new_name) {
 
   vfs_node_t *dst_node = ext2_finddir_impl(node, new_name);
   if (dst_node) {
+    if (dst_node->inode == src_node->inode) {
+      kfree(dst_node);
+      kfree(src_node);
+      return 0;
+    }
     if ((dst_node->flags & FS_TYPE_MASK) == FS_DIRECTORY) {
       kfree(dst_node);
       kfree(src_node);
@@ -350,35 +394,62 @@ int ext2_unlink_impl(vfs_node_t *node, char *name) {
   ext3_journal_start(mnt);
 
   vfs_node_t *target = ext2_finddir_impl(node, name);
-  if (!target)
+  if (!target) {
+    ext3_journal_stop(mnt);
     return -1;
+  }
 
   uint32_t target_ino = target->inode;
   kfree(target);
 
   ext2_inode_t inode;
-  if (ext2_read_inode(mnt, target_ino, &inode))
+  if (ext2_read_inode(mnt, target_ino, &inode)) {
+    ext3_journal_stop(mnt);
     return -1;
+  }
 
-  if ((inode.i_mode & 0xF000) == EXT2_S_IFDIR)
+  if ((inode.i_mode & 0xF000) == EXT2_S_IFDIR) {
+    ext3_journal_stop(mnt);
     return -1;
+  }
 
-  if (ext2_remove_dir_entry(mnt, node->inode, name))
+  if (ext2_remove_dir_entry(mnt, node->inode, name)) {
+    ext3_journal_stop(mnt);
     return -1;
+  }
 
   inode.i_links_count--;
 
   if (inode.i_links_count == 0) {
-    ext2_free_all_blocks(mnt, &inode);
     inode.i_dtime = ext2_current_time();
     ext2_write_inode(mnt, target_ino, &inode);
-    ext2_free_inode(mnt, target_ino);
   } else {
     ext2_write_inode(mnt, target_ino, &inode);
   }
 
   ext3_journal_stop(mnt);
   return 0;
+}
+
+/* ext2 has no persistent open-file table, so defer reclaiming an unlinked
+ * regular inode until the VFS has dropped its final descriptor/mapping/cache
+ * reference.  Otherwise a concurrent create can reuse its inode while a
+ * mapped VMA still faults pages from that file. */
+void ext2_destroy_unlinked_node(vfs_node_t *node) {
+  if (!node || !node->device || (node->flags & FS_TYPE_MASK) != FS_FILE)
+    return;
+  ext2_mount_t *mnt = (ext2_mount_t *)node->device;
+  if (ext3_journal_start(mnt) != 0)
+    return;
+
+  ext2_inode_t inode;
+  if (ext2_read_inode(mnt, node->inode, &inode) == 0 &&
+      inode.i_links_count == 0 && inode.i_dtime != 0) {
+    ext2_free_all_blocks(mnt, &inode);
+    ext2_write_inode(mnt, node->inode, &inode);
+    ext2_free_inode(mnt, node->inode);
+  }
+  ext3_journal_stop(mnt);
 }
 
 int ext2_rmdir_impl(vfs_node_t *node, char *name) {

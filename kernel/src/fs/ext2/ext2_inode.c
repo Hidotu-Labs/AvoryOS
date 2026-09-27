@@ -20,6 +20,7 @@ extern int           ext2_chmod_impl(vfs_node_t *, uint16_t);
 extern int           ext2_chown_impl(vfs_node_t *, uint32_t, uint32_t);
 extern int           ext2_mknod_impl(vfs_node_t *, char *, uint16_t, uint32_t,
                                      void *);
+extern void          ext2_destroy_unlinked_node(vfs_node_t *);
 
 vfs_node_t *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
                                 ext2_inode_t *inode) {
@@ -69,6 +70,7 @@ vfs_node_t *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
     node->mmap     = ext2_mmap_impl;
     node->chmod    = ext2_chmod_impl;
     node->chown    = ext2_chown_impl;
+    node->destroy  = ext2_destroy_unlinked_node;
   } else if (type == EXT2_S_IFLNK) {
     node->flags    = FS_SYMLINK;
     node->readlink = ext2_readlink_impl;

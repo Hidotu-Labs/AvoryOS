@@ -21,14 +21,36 @@ uint32_t ext4_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_
     if (!ext4_inode_has_extents(&inode))
         return ext2_read_impl(node, offset, size, buffer);
 
-    if (offset >= inode.i_size) {
+    /* The VFS node size is normally the size visible to concurrent readers.
+     * An extent-backed file can be extended while a page fault or readahead is
+     * loading it, so never shrink the visible size from a separately-read
+     * inode snapshot.  But dentry aliases can leave a VFS node behind after a
+     * committed extension; in that case the on-disk inode is newer and must
+     * repair the stale zero/small node length or mmap page fills fail at EOF. */
+    uint32_t vnode_size = node->length;
+    uint32_t file_size = vnode_size;
+    if (inode.i_size > file_size) {
+        file_size = inode.i_size;
+        node->length = file_size;
+        static uint32_t size_repairs;
+        if (__atomic_add_fetch(&size_repairs, 1, __ATOMIC_RELAXED) <= 8)
+            klogf("[EXT4] repaired stale node size: inode=%u name='%s' "
+                  "vnode_size=%u inode_size=%u blocks=%u block_size=%u\n",
+                  node->inode, node->name[0] ? node->name : "?", vnode_size,
+                  inode.i_size, inode.i_blocks, mnt->block_size);
+    }
+    if (offset >= file_size) {
         static uint32_t eof_errs;
         if (__atomic_add_fetch(&eof_errs, 1, __ATOMIC_RELAXED) <= 8)
-            klogf("[EXT4] read past EOF: off=%u i_size=%llu\n", offset,
-                  (unsigned long long)inode.i_size);
+            klogf("[EXT4] read past EOF: inode=%u name='%s' "
+                  "range=[%u,%llu) vnode_size=%u inode_size=%u "
+                  "blocks=%u block_size=%u flags=0x%x\n",
+                  node->inode, node->name[0] ? node->name : "?", offset,
+                  (unsigned long long)offset + size, vnode_size, inode.i_size,
+                  inode.i_blocks, mnt->block_size, inode.i_flags);
         return 0;
     }
-    if (offset + size > inode.i_size) size = inode.i_size - offset;
+    if (size > file_size - offset) size = file_size - offset;
 
     uint32_t bytes_read = 0;
     uint8_t *block_buf = kmalloc(mnt->block_size);
@@ -410,7 +432,7 @@ int ext4_mount_root(struct block_device *dev) {
 
     fs_root = root_vfs;
 
-    if (vfs_mount_ex(NULL, root_vfs, dev->name, "ext4") != 0)
+    if (vfs_mount_ex(NULL, root_vfs, dev->name, "ext4", "/") != 0)
         klog_puts("[WARN] Failed to register ext4 root mount metadata.\n");
 
     klog_puts("[OK] Ext4 filesystem mounted as root (/)\n");

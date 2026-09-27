@@ -248,14 +248,27 @@ void net_core_init(void) {
 }
 
 void net_core_start_worker(void) {
-  uint32_t cpus = cpu_get_count();
-  uint32_t workers = (cpus > 1) ? 2 : 1;
-  if (workers > 4)
-    workers = 4;
+  struct cpu_info *online_cpus[4];
+  uint32_t online_count = 0;
+  uint32_t cpu_count = cpu_get_count();
+  for (uint32_t i = 0; i < cpu_count && online_count < 4; i++) {
+    struct cpu_info *cpu = cpu_get_info(i);
+    if (cpu && cpu->status != CPU_STATUS_OFFLINE)
+      online_cpus[online_count++] = cpu;
+  }
+
+  uint32_t workers = online_count > 1 ? 2 : 1;
+  if (!online_count) {
+    klog_puts("[NET] no online CPU for RX workers\n");
+    ready = false;
+    return;
+  }
 
   for (uint32_t i = 0; i < workers; i++) {
+    struct cpu_info *target = online_cpus[i];
+    /* Prepare the worker before publishing it to a remote CPU's runqueue. */
     struct thread *worker =
-        sched_create_kernel_thread(net_worker, cpu_get_current(), true);
+        sched_create_kernel_thread(net_worker, target, false);
     if (!worker) {
       ready = false;
       klog_puts("[NET] worker creation failed\n");
@@ -263,6 +276,10 @@ void net_core_start_worker(void) {
     }
     strcpy(worker->comm, "net-worker");
     sched_set_priority(worker, 0, -20);
+    sched_enqueue_thread(worker, target);
+    klog_puts("[NET] rx worker assigned cpu=");
+    klog_uint64(target->cpu_id);
+    klog_puts("\n");
   }
   klog_puts("[NET] rx workers started\n");
 }

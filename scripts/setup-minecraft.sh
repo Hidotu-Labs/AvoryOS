@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# scripts/setup-minecraft.sh -- Stage Minecraft Alpha 1.0 into AvoryOS
+# scripts/setup-minecraft.sh -- Stage Minecraft 1.16.5 into AvoryOS
 #
 # Prerequisites:
 #   1. Run ./scripts/setup-alpine.sh first  (provides Alpine rootfs, disk.img, OpenJDK 17)
-#   2. assets/minecraft.jar  must be the Alpha 1.0 client JAR
+#   2. Network access on the first run: the client JAR is downloaded from the
+#      mcversions.net link, libraries/assets from Mojang (includes all 2,336
+#      OGG sound files of asset index 1.16)
 #
 # Usage:
-#   ./scripts/setup-minecraft.sh [--expand-disk] [--username NAME]
+#   ./scripts/setup-minecraft.sh [--expand-disk] [--username NAME] [--jar PATH]
 #
 # Options:
 #   --expand-disk   Grow disk.img to 8 GiB
 #   --username NAME Offline username written into the launcher (default: Player)
+#   --jar PATH      Use a locally saved 1.16.5 client JAR (e.g. downloaded from
+#                   https://mcversions.net/download/1.16.5) instead of fetching it
 
 set -euo pipefail
 
@@ -19,14 +23,23 @@ DISK_IMG="${ROOT_DIR}/disk.img"
 BUILD_DIR="${ROOT_DIR}/build/alpine"
 ROOTFS_DIR="${BUILD_DIR}/rootfs"
 POPULATE_SCRIPT="${ROOT_DIR}/scripts/populate-ext2-dir.sh"
-MC_JAR_SRC="${ROOT_DIR}/assets/minecraft.jar"
 
+MC_VERSION="1.16.5"
+# Client JAR published on mcversions.net (https://mcversions.net/download/1.16.5);
+# piston-data.mojang.com addresses objects by their SHA-1.
+MC_CLIENT_URL="https://piston-data.mojang.com/v1/objects/37fd3c903861eeff3bc24b71eed48f828b5269c8/client.jar"
+MC_CLIENT_SHA1="37fd3c903861eeff3bc24b71eed48f828b5269c8"
+MC_ASSET_INDEX="1.16"
+VERSION_MANIFEST_URL="https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+
+MC_JAR_OVERRIDE=""
 EXPAND_DISK=0
 MC_USERNAME="Player"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --expand-disk) EXPAND_DISK=1; shift ;;
         --username)    MC_USERNAME="${2:-Player}"; shift 2 ;;
+        --jar)         MC_JAR_OVERRIDE="${2:-}"; shift 2 ;;
         *) echo "[!] Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -36,10 +49,6 @@ done
 # ─────────────────────────────────────────────────────────────────────────────
 [ ! -d "${ROOTFS_DIR}/etc" ] && {
     echo "[!] Alpine rootfs not found. Run ./scripts/setup-alpine.sh first."
-    exit 1
-}
-[ ! -f "${MC_JAR_SRC}" ] && {
-    echo "[!] assets/minecraft.jar not found."
     exit 1
 }
 [ ! -f "${DISK_IMG}" ] && {
@@ -137,6 +146,17 @@ echo "[+] Using JDK: ${JAVA_HOME_GUEST}"
 install_apk_mc "openal-soft-libs" "community"
 install_apk_mc "openal-soft" "community"
 
+# Minecraft 1.16.5 uses LWJGL 3/GLFW, which dlopen()s these X11 client
+# libraries at window-creation time. Install them explicitly: dependencies
+# are not resolved automatically.
+install_apk_mc "libx11"       "main"
+install_apk_mc "libxext"      "main"
+install_apk_mc "libxi"        "main"
+install_apk_mc "libxrandr"    "main"
+install_apk_mc "libxcursor"   "main"
+install_apk_mc "libxinerama"  "main"
+install_apk_mc "libxxf86vm"   "main"
+
 # All JVM internal .so files use RPATH=$ORIGIN/../lib which AvoryOS's musl
 # doesn't reliably resolve. Copy every .so from the JVM lib dir into /usr/lib/
 # so musl's hardcoded search path always finds them.
@@ -161,16 +181,28 @@ cp -f "${JAVA_HOME_ROOTFS}/lib/server/libjvm.so" "${ROOTFS_DIR}/usr/lib/server/l
 echo "[+] Copied server/libjvm.so → /usr/lib/server/"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Download Minecraft 1.8.9 libraries from Mojang + Maven Central
+# 1. Download Minecraft 1.16.5 libraries + Linux natives
+#    (version metadata from Mojang; client JAR link comes from mcversions.net)
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== [1/4] Fetching Minecraft 1.8.9 libraries ==="
+echo "=== [1/4] Fetching Minecraft ${MC_VERSION} libraries ==="
 
-LIBS_DIR="${BUILD_DIR}/mc189-libs"
-NATIVES_BUILD_DIR="${BUILD_DIR}/mc189-natives"
+LIBS_DIR="${BUILD_DIR}/mc1165-libs"
+NATIVES_BUILD_DIR="${BUILD_DIR}/mc1165-natives"
+NATIVES_LIST="${BUILD_DIR}/mc1165-natives.list"
 MC_LIBS_ROOTFS="${ROOTFS_DIR}/opt/minecraft/libs"
 MC_NATIVES_ROOTFS="${ROOTFS_DIR}/opt/minecraft/natives"
 mkdir -p "${LIBS_DIR}" "${NATIVES_BUILD_DIR}" "${MC_LIBS_ROOTFS}" "${MC_NATIVES_ROOTFS}"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "[!] python3 is required to download Minecraft libraries and assets." >&2
+    exit 1
+fi
+
+# Remove anything staged by an older setup run: leftover LWJGL 2 and
+# log4j 2.0-beta9 JARs from 1.8.9 must not end up on the 1.16.5 classpath.
+rm -f "${MC_LIBS_ROOTFS:?}"/*.jar
+rm -f "${MC_NATIVES_ROOTFS:?}"/*.so
 
 # Helper: download a file if not already cached
 dl() {
@@ -181,135 +213,162 @@ dl() {
     fi
 }
 
-# Convert Maven coordinate to Mojang libraries CDN URL
-# e.g.  org.lwjgl.lwjgl:lwjgl:2.9.4-nightly-20150209
-#    -> https://libraries.minecraft.net/org/lwjgl/lwjgl/lwjgl/2.9.4-nightly-20150209/lwjgl-2.9.4-nightly-20150209.jar
-maven_url() {
-    local coord="$1"          # group:artifact:version
-    local classifier="${2:-}" # optional: natives-linux etc.
-    local base="https://libraries.minecraft.net"
-    local IFS=':' parts
-    read -r -a parts <<< "${coord}"
-    local group="${parts[0]//\.//}"
-    local artifact="${parts[1]}"
-    local version="${parts[2]}"
-    local fname="${artifact}-${version}${classifier:+-${classifier}}.jar"
-    echo "${base}/${group}/${artifact}/${version}/${fname}"
-}
+# Resolve every classpath JAR and Linux natives JAR from Mojang's own 1.16.5
+# version metadata (same data mcversions.net links against), applying Mojang's
+# OS rules so macOS/Windows-only libraries never reach the classpath.
+echo "[*] Fetching Minecraft ${MC_VERSION} version metadata..."
+python3 - "${MC_VERSION}" "${VERSION_MANIFEST_URL}" "${LIBS_DIR}" \
+    "${NATIVES_BUILD_DIR}" "${NATIVES_LIST}" <<'LIB_DOWNLOADER_EOF'
+import concurrent.futures
+import hashlib
+import json
+import sys
+import time
+import urllib.request
+from pathlib import Path
 
-maven_central_url() {
-    local coord="$1"
-    local base="https://repo1.maven.org/maven2"
-    local IFS=':' parts
-    read -r -a parts <<< "${coord}"
-    local group="${parts[0]//\.//}"
-    local artifact="${parts[1]}"
-    local version="${parts[2]}"
-    local fname="${artifact}-${version}.jar"
-    echo "${base}/${group}/${artifact}/${version}/${fname}"
-}
+VERSION, MANIFEST_URL, LIBS_DIR, NATIVES_DIR, NATIVES_LIST = sys.argv[1:6]
+LIBS_DIR = Path(LIBS_DIR)
+NATIVES_DIR = Path(NATIVES_DIR)
+USER_AGENT = {"User-Agent": "AvoryOS-Minecraft-Setup/1"}
 
-# ── All JARs needed by Minecraft 1.8.9 on the classpath ─────────────────────
-declare -a MC189_LIBS=(
-    # LWJGL 2.9.4
-    "org.lwjgl.lwjgl:lwjgl:2.9.4-nightly-20150209"
-    "org.lwjgl.lwjgl:lwjgl_util:2.9.4-nightly-20150209"
 
-    # Mojang authlib & realms
-    "com.mojang:authlib:1.5.21"
-    "com.mojang:realms:1.7.59"
-    "com.mojang:netty:1.8.8"
+def fetch(url, retries=3):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            request = urllib.request.Request(url, headers=USER_AGENT)
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.read()
+        except Exception as error:
+            last_error = error
+            time.sleep(attempt + 1)
+    raise RuntimeError(f"failed to download {url}: {last_error}")
 
-    # Logging
-    "org.apache.logging.log4j:log4j-api:2.0-beta9"
-    "org.apache.logging.log4j:log4j-core:2.0-beta9"
 
-    # Google
-    "com.google.code.gson:gson:2.2.4"
-    "com.google.guava:guava:17.0"
+def sha1_hex(data):
+    return hashlib.sha1(data).hexdigest()
 
-    # Apache Commons
-    "commons-codec:commons-codec:1.9"
-    "commons-io:commons-io:2.4"
-    "commons-lang:commons-lang:2.6"
-    "org.apache.commons:commons-lang3:3.3.2"
-    "commons-logging:commons-logging:1.1.3"
-    "org.apache.commons:commons-compress:1.8.1"
 
-    # HTTP
-    "org.apache.httpcomponents:httpclient:4.3.3"
-    "org.apache.httpcomponents:httpcore:4.3.2"
+def rules_allow_linux(library):
+    """Evaluate Mojang's library rules for (linux, x86_64)."""
+    rules = library.get("rules")
+    if not rules:
+        return True
+    allowed = False
+    for rule in rules:
+        os_spec = rule.get("os", {})
+        matches = os_spec.get("name") in (None, "linux")
+        if os_spec.get("arch") not in (None, "amd64", "x86_64"):
+            matches = False  # e.g. {"arch": "x86"} only applies to 32-bit
+        if matches:
+            allowed = rule.get("action", "allow") == "allow"
+    return allowed
 
-    # Netty
-    "io.netty:netty-all:4.0.23.Final"
 
-    # JInput & JUtils
-    "net.java.jinput:jinput:2.0.5"
-    "net.java.jutils:jutils:1.0.0"
+manifest = json.loads(fetch(MANIFEST_URL))
+entry = next((v for v in manifest["versions"] if v["id"] == VERSION), None)
+if entry is None:
+    raise SystemExit(f"Minecraft {VERSION} is missing from Mojang's version manifest")
 
-    # CLI args & ICU
-    "net.sf.jopt-simple:jopt-simple:4.6"
-    "com.ibm.icu:icu4j-core-mojang:51.2"
+metadata_raw = fetch(entry["url"])
+if sha1_hex(metadata_raw) != entry["sha1"]:
+    raise SystemExit(f"SHA-1 mismatch for the {VERSION} version metadata")
+metadata = json.loads(metadata_raw)
 
-    # System info & Twitch
-    "net.java.dev.jna:jna:3.4.0"
-    "net.java.dev.jna:platform:3.4.0"
-    "oshi-project:oshi-core:1.1"
-    "tv.twitch:twitch:6.5"
+# Keyed by destination so repeated coordinates (LWJGL appears several times)
+# are only downloaded once.
+jobs = {}
+native_jars = set()
+for library in metadata["libraries"]:
+    if not rules_allow_linux(library):
+        continue
+    downloads = library.get("downloads", {})
+    artifact = downloads.get("artifact")
+    if artifact is None:
+        # Coordinates without a "downloads" block still live on the Mojang CDN.
+        group, name, version = library["name"].split(":")[:3]
+        rel_path = f"{group.replace('.', '/')}/{name}/{version}/{name}-{version}.jar"
+        artifact = {
+            "path": rel_path,
+            "url": f"https://libraries.minecraft.net/{rel_path}",
+            "sha1": None,
+        }
+    jobs[LIBS_DIR / Path(artifact["path"]).name] = (artifact["url"], artifact.get("sha1"))
 
-    # Paul's SoundSystem
-    "com.paulscode:codecjorbis:20101023"
-    "com.paulscode:codecwav:20101023"
-    "com.paulscode:libraryjavasound:20101123"
-    "com.paulscode:librarylwjglopenal:20100824"
-    "com.paulscode:soundsystem:20120107"
+    natives_key = library.get("natives", {}).get("linux")
+    if natives_key:
+        classifier = downloads.get("classifiers", {}).get(natives_key)
+        if classifier is None:
+            raise SystemExit(f"{library['name']} declares Linux natives but ships no classifier")
+        dest = NATIVES_DIR / Path(classifier["path"]).name
+        jobs[dest] = (classifier["url"], classifier.get("sha1"))
+        native_jars.add(dest)
+
+
+def is_valid(dest, expected_sha1):
+    if not dest.is_file():
+        return False
+    if expected_sha1 is None:
+        return True
+    return sha1_hex(dest.read_bytes()) == expected_sha1
+
+
+def download(item):
+    dest, (url, expected_sha1) = item
+    if is_valid(dest, expected_sha1):
+        return False
+    data = fetch(url)
+    if expected_sha1 is not None and sha1_hex(data) != expected_sha1:
+        raise SystemExit(f"SHA-1 mismatch downloading {url}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temporary = dest.with_name(dest.name + ".tmp")
+    temporary.write_bytes(data)
+    temporary.replace(dest)
+    return True
+
+
+downloaded = 0
+failures = []
+with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+    futures = [executor.submit(download, item) for item in jobs.items()]
+    for future in concurrent.futures.as_completed(futures):
+        try:
+            was_downloaded = future.result()
+        except Exception as error:
+            failures.append(str(error))
+        else:
+            downloaded += was_downloaded
+
+if failures:
+    for failure in failures:
+        print(f"[!] {failure}", file=sys.stderr)
+    raise SystemExit("Could not download all Minecraft 1.16.5 libraries")
+
+native_jars_sorted = sorted(native_jars)
+Path(NATIVES_LIST).write_text("".join(f"{path}\n" for path in native_jars_sorted))
+
+artifact_count = sum(1 for dest in jobs if dest.parent == LIBS_DIR)
+print(
+    f"[+] {artifact_count} classpath JARs, {len(native_jars)} native JARs "
+    f"({downloaded} downloaded)"
 )
+LIB_DOWNLOADER_EOF
 
-# Try Mojang CDN first, fall back to Maven Central
-dl_lib() {
-    local coord="$1"
-    local IFS=':' parts
-    read -r -a parts <<< "${coord}"
-    local artifact="${parts[1]}"
-    local version="${parts[2]}"
-    local fname="${artifact}-${version}.jar"
-    local dest="${LIBS_DIR}/${fname}"
-    if [ -f "${dest}" ]; then return 0; fi
-    local url1; url1=$(maven_url "${coord}")
-    local url2; url2=$(maven_central_url "${coord}")
-    if curl -sSLf --retry 2 "${url1}" -o "${dest}" 2>/dev/null; then
-        echo "[+] ${fname} (Mojang CDN)"
-    elif curl -sSLf --retry 2 "${url2}" -o "${dest}" 2>/dev/null; then
-        echo "[+] ${fname} (Maven Central)"
-    else
-        echo "[!] Could not download ${coord}" >&2
-        rm -f "${dest}"
-        return 1
-    fi
-}
-
-for lib in "${MC189_LIBS[@]}"; do
-    dl_lib "${lib}" || true
-done
-
-# ── Linux natives JAR (LWJGL 2.9.4 + jinput) ────────────────────────────────
-LWJGL_NAT_JAR="${LIBS_DIR}/lwjgl-platform-2.9.4-nightly-20150209-natives-linux.jar"
-LWJGL_NAT_URL="https://libraries.minecraft.net/org/lwjgl/lwjgl/lwjgl-platform/2.9.4-nightly-20150209/lwjgl-platform-2.9.4-nightly-20150209-natives-linux.jar"
-dl "${LWJGL_NAT_URL}" "${LWJGL_NAT_JAR}"
-
-JINPUT_NAT_JAR="${LIBS_DIR}/jinput-platform-2.0.5-natives-linux.jar"
-JINPUT_NAT_URL="https://libraries.minecraft.net/net/java/jinput/jinput-platform/2.0.5/jinput-platform-2.0.5-natives-linux.jar"
-dl "${JINPUT_NAT_URL}" "${JINPUT_NAT_JAR}"
-
-# Extract all .so files from native JARs into the natives directory
+# ── Extract the Linux natives (LWJGL 3.2.2, GLFW, OpenAL, STB, ...) ─────────
 echo "[*] Extracting Linux native .so files..."
-for nat_jar in "${LWJGL_NAT_JAR}" "${JINPUT_NAT_JAR}"; do
-    if [ -f "${nat_jar}" ]; then
-        unzip -oj "${nat_jar}" "*.so" -d "${MC_NATIVES_ROOTFS}" 2>/dev/null || true
+while IFS= read -r nat_jar; do
+    [ -n "${nat_jar}" ] || continue
+    if [ ! -f "${nat_jar}" ]; then
+        echo "[!] Missing native JAR: ${nat_jar}" >&2
+        exit 1
     fi
-done
+    unzip -oj "${nat_jar}" "*.so" -d "${MC_NATIVES_ROOTFS}" 2>/dev/null || true
+done < "${NATIVES_LIST}"
 
-# Replace LWJGL's legacy glibc OpenAL with Alpine's musl-native OpenAL Soft.
+# LWJGL bundles its own glibc-built OpenAL. Replace it with Alpine's
+# musl-native OpenAL Soft (LWJGL 3 probes libopenal.so.1/libopenal.so and
+# must find the musl build under every one of those names).
 SYSTEM_OPENAL="${ROOTFS_DIR}/usr/lib/libopenal.so.1"
 if [ ! -f "${SYSTEM_OPENAL}" ]; then
     echo "[!] Alpine OpenAL Soft library was not installed at /usr/lib/libopenal.so.1" >&2
@@ -319,9 +378,10 @@ if readelf --version-info "${SYSTEM_OPENAL}" 2>/dev/null | grep -q 'GLIBC_'; the
     echo "[!] Refusing to stage a glibc OpenAL library in the musl rootfs." >&2
     exit 1
 fi
-cp -Lf "${SYSTEM_OPENAL}" "${MC_NATIVES_ROOTFS}/libopenal64.so"
-cp -Lf "${SYSTEM_OPENAL}" "${MC_NATIVES_ROOTFS}/libopenal.so"
-echo "[+] Replaced legacy OpenAL with Alpine's musl-native OpenAL Soft"
+for openal_name in libopenal.so libopenal.so.1 libopenal64.so; do
+    cp -Lf "${SYSTEM_OPENAL}" "${MC_NATIVES_ROOTFS}/${openal_name}"
+done
+echo "[+] Replaced bundled OpenAL with Alpine's musl-native OpenAL Soft"
 
 # Copy all library JARs into rootfs
 cp -f "${LIBS_DIR}"/*.jar "${MC_LIBS_ROOTFS}/" 2>/dev/null || true
@@ -333,15 +393,12 @@ echo "[+] Staged ${NATIVES_COUNT} native .so files → /opt/minecraft/natives/"
 
 # The official launcher normally downloads the asset index and hashed object
 # store. This custom launcher bypasses it, so fetch and verify those assets here.
-ASSETS_BUILD_DIR="${BUILD_DIR}/mc189-assets"
+# Index 1.16 holds 2,615 objects (334 MB) including all 2,336 OGG sounds.
+ASSETS_BUILD_DIR="${BUILD_DIR}/mc1165-assets"
 MC_ASSETS_ROOTFS="${ROOTFS_DIR}/opt/minecraft/assets"
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "[!] python3 is required to download Minecraft assets." >&2
-    exit 1
-fi
 
-echo "[*] Fetching Minecraft 1.8 asset index and objects..."
-python3 - "${ASSETS_BUILD_DIR}" <<'ASSET_DOWNLOADER_EOF'
+echo "[*] Fetching Minecraft ${MC_VERSION} asset index ${MC_ASSET_INDEX} and objects (incl. sounds)..."
+python3 - "${ASSETS_BUILD_DIR}" "${MC_VERSION}" "${MC_ASSET_INDEX}" <<'ASSET_DOWNLOADER_EOF'
 import concurrent.futures
 import hashlib
 import json
@@ -351,7 +408,8 @@ import sys
 import time
 import urllib.request
 
-VERSION = "1.8.9"
+VERSION = sys.argv[2]
+INDEX_ID = sys.argv[3]
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 ASSET_OBJECT_URL = "https://resources.download.minecraft.net/{prefix}/{digest}"
 CACHE = Path(sys.argv[1])
@@ -389,11 +447,11 @@ except StopIteration:
 
 version_data = json.loads(checked_fetch(version_entry["url"], version_entry["sha1"]))
 asset_index = version_data["assetIndex"]
-if asset_index["id"] != "1.8":
-    raise SystemExit(f"Expected asset index 1.8, got {asset_index['id']}")
+if asset_index["id"] != INDEX_ID:
+    raise SystemExit(f"Expected asset index {INDEX_ID}, got {asset_index['id']}")
 
 index_data = checked_fetch(asset_index["url"], asset_index["sha1"])
-index_path = INDEXES / "1.8.json"
+index_path = INDEXES / f"{INDEX_ID}.json"
 index_path.write_bytes(index_data)
 index = json.loads(index_data)
 
@@ -425,13 +483,16 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
             print(f"    Verified {completed}/{len(futures)} asset objects", flush=True)
 
 sound_count = sum(name.endswith(".ogg") for name in index["objects"])
-print(f"[+] Asset index 1.8 ready: {len(items)} objects, {sound_count} OGG sounds ({downloaded} downloaded)")
+print(
+    f"[+] Asset index {INDEX_ID} ready: {len(items)} objects, "
+    f"{sound_count} OGG sounds ({downloaded} downloaded)"
+)
 ASSET_DOWNLOADER_EOF
 
 rm -rf "${MC_ASSETS_ROOTFS}"
 mkdir -p "${MC_ASSETS_ROOTFS}"
 cp -a "${ASSETS_BUILD_DIR}/." "${MC_ASSETS_ROOTFS}/"
-echo "[+] Staged Minecraft assets → /opt/minecraft/assets/"
+echo "[+] Staged Minecraft assets (all OGG sounds included) → /opt/minecraft/assets/"
 
 # Mojang's LWJGL natives reference glibc fortify entry points that musl does
 # not export. Without them, lazy PLT calls jump into an unrebased trampoline
@@ -512,11 +573,42 @@ echo "[+] Built native compatibility shim → /usr/lib/libavory-native-compat.so
 # 2. Stage minecraft.jar
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== [2/4] Staging minecraft.jar ==="
+echo "=== [2/4] Staging Minecraft ${MC_VERSION} client JAR ==="
+
+jar_sha1() { sha1sum "$1" 2>/dev/null | awk '{print $1}'; }
+jar_is_target() { [ "$(jar_sha1 "$1")" = "${MC_CLIENT_SHA1}" ]; }
+
+MC_JAR_CACHE="${BUILD_DIR}/mc1165-client.jar"
+MC_JAR_SRC=""
+if [ -n "${MC_JAR_OVERRIDE}" ]; then
+    [ -f "${MC_JAR_OVERRIDE}" ] || {
+        echo "[!] --jar file not found: ${MC_JAR_OVERRIDE}" >&2
+        exit 1
+    }
+    MC_JAR_SRC="${MC_JAR_OVERRIDE}"
+    jar_is_target "${MC_JAR_SRC}" ||
+        echo "[!] Warning: --jar SHA-1 differs from the official ${MC_VERSION} client JAR; continuing."
+elif jar_is_target "${MC_JAR_CACHE}"; then
+    MC_JAR_SRC="${MC_JAR_CACHE}"
+elif jar_is_target "${ROOT_DIR}/assets/minecraft.jar"; then
+    # A previously downloaded 1.16.5 client JAR kept in assets/ (gitignored).
+    cp -f "${ROOT_DIR}/assets/minecraft.jar" "${MC_JAR_CACHE}"
+    MC_JAR_SRC="${MC_JAR_CACHE}"
+else
+    echo "[*] Downloading Minecraft ${MC_VERSION} client JAR (link from mcversions.net)..."
+    rm -f "${MC_JAR_CACHE}"
+    dl "${MC_CLIENT_URL}" "${MC_JAR_CACHE}"
+    jar_is_target "${MC_JAR_CACHE}" || {
+        echo "[!] Client JAR SHA-1 verification failed (expected ${MC_CLIENT_SHA1})." >&2
+        rm -f "${MC_JAR_CACHE}"
+        exit 1
+    }
+    MC_JAR_SRC="${MC_JAR_CACHE}"
+fi
 
 mkdir -p "${ROOTFS_DIR}/opt/minecraft"
 cp "${MC_JAR_SRC}" "${ROOTFS_DIR}/opt/minecraft/minecraft.jar"
-echo "[+] Staged minecraft.jar → /opt/minecraft/"
+echo "[+] Staged minecraft.jar (${MC_VERSION}) → /opt/minecraft/"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Launcher script + desktop entries
@@ -527,21 +619,22 @@ echo "=== [3/4] Writing launcher + desktop entries ==="
 mkdir -p "${ROOTFS_DIR}/usr/bin"
 cat > "${ROOTFS_DIR}/usr/bin/minecraft" << LAUNCHER_EOF
 #!/bin/sh
-# Minecraft 1.8.9 launcher for AvoryOS
+# Minecraft 1.16.5 launcher for AvoryOS
 
 export DISPLAY="\${DISPLAY:-:0}"
 
 # Software GL (Max Performance llvmpipe)
 export LIBGL_ALWAYS_SOFTWARE=1
 export GALLIUM_DRIVER=llvmpipe
-export LP_NUM_THREADS="${LP_NUM_THREADS:-4}"
+export LP_NUM_THREADS="\${LP_NUM_THREADS:-4}"
 export LP_PERF=no_linear,no_mipmap
-export MESA_GL_VERSION_OVERRIDE=2.1
-export MESA_GLSL_VERSION_OVERRIDE=120
 export MESA_NO_DITHER=1
 export vblank_mode=0
 export MESA_SHADER_CACHE_DISABLE=true
 export MESA_GLSL_CACHE_DISABLE=true
+# Minecraft 1.16.5 renders via Blaze3D, which needs OpenGL 3.2 core / GLSL 150.
+# Do not pin MESA_GL_VERSION_OVERRIDE or MESA_GLSL_VERSION_OVERRIDE here:
+# llvmpipe already advertises OpenGL 4.5, and forcing 2.1/120 breaks shaders.
 # AvoryOS exposes its HDA/AC97 audio through the OSS-compatible /dev/dsp.
 # ALSOFT_CONF must be a config-file path, not inline configuration text.
 # Restrict OpenAL Soft to OSS so it does not probe unsupported host backends.
@@ -549,13 +642,15 @@ export ALSOFT_DRIVERS="\${ALSOFT_DRIVERS:-oss}"
 
 JAVA_HOME="${JAVA_HOME_GUEST}"
 export PATH="\${JAVA_HOME}/bin:\${PATH}"
-export LD_LIBRARY_PATH="\${JAVA_HOME}/lib:\${JAVA_HOME}/lib/server:/usr/lib:/lib:\${LD_LIBRARY_PATH:-}"
+# The natives directory must be first: musl resolves bare sonames such as
+# libopenal.so through LD_LIBRARY_PATH when LWJGL/GLFW dlopen() them.
+export LD_LIBRARY_PATH="/opt/minecraft/natives:\${JAVA_HOME}/lib:\${JAVA_HOME}/lib/server:/usr/lib:/lib:\${LD_LIBRARY_PATH:-}"
 
 MC_PRELOAD="/usr/lib/libavory-native-compat.so"
 [ -f /usr/lib/libjemalloc.so.2 ] && MC_PRELOAD="\${MC_PRELOAD}:/usr/lib/libjemalloc.so.2"
 
 MC_USER="\${MC_USER:-${MC_USERNAME}}"
-MC_RAM="\${MC_RAM:-512m}"
+MC_RAM="\${MC_RAM:-1024m}"
 MC_HOME="\${HOME}/.minecraft"
 mkdir -p "\${MC_HOME}/saves" "\${MC_HOME}/resourcepacks"
 
@@ -565,9 +660,9 @@ for jar in /opt/minecraft/libs/*.jar; do
     MC_CP="\${MC_CP}:\${jar}"
 done
 
-# Write 1.8.9-compatible options.txt (sound enabled)
+# Write 1.16.5-compatible options.txt (sound enabled); unknown keys are
+# ignored by the game, so only well-known keys are written here.
 cat > "\${MC_HOME}/options.txt" << 'OPT_EOF'
-version:1343
 invertYMouse:false
 mouseSensitivity:0.5
 fov:0.0
@@ -579,15 +674,14 @@ bobView:false
 anaglyph3d:false
 clouds:0
 fancyGraphics:true
-ambientocclusion:0
+ambientocclusion:false
 useVbo:true
 mipmapLevels:0
 entityShadows:false
-fboEnable:false
 showCape:false
 difficulty:1
 resourcePacks:[]
-lang:en_US
+lang:en_us
 chatVisibility:0
 chatColors:true
 chatLinks:false
@@ -607,7 +701,8 @@ chatHeightFocused:1.0
 chatHeightUnfocused:0.44366196
 chatScale:1.0
 chatWidth:1.0
-showInventoryAchievementHint:false
+autoJump:false
+forceUnicodeFont:false
 soundCategory_master:1.0
 soundCategory_music:0.5
 soundCategory_record:1.0
@@ -620,7 +715,7 @@ soundCategory_ambient:1.0
 soundCategory_voice:1.0
 OPT_EOF
 
-echo "[minecraft] Starting Minecraft 1.8.9 as '\${MC_USER}' (Heap: \${MC_RAM}, Max FPS Profile)..."
+echo "[minecraft] Starting Minecraft ${MC_VERSION} as '\${MC_USER}' (Heap: \${MC_RAM}, Max FPS Profile)..."
 # Resolve all PLT entries while loading. AvoryOS's current runtime loader can
 # leave lazy JUMP_SLOT trampolines in dlopen'd libraries such as OpenAL
 # unrebased (for example, jumping to 0x86ae instead of base+0x86ae).
@@ -630,7 +725,7 @@ MALLOC_CONF="background_thread:false,dirty_decay_ms:5000,muzzy_decay_ms:5000" \
 exec "\${JAVA_HOME}/bin/java" \
     -server \
     -Xms256m -Xmx"\${MC_RAM}" \
-    -Xss512k \
+    -Xss1m \
     -XX:+UseParallelGC \
     -XX:ParallelGCThreads=2 \
     -XX:CICompilerCount=2 \
@@ -653,23 +748,23 @@ exec "\${JAVA_HOME}/bin/java" \
     -Dsun.net.client.defaultConnectTimeout=3000 \
     -Dsun.net.client.defaultReadTimeout=3000 \
     -Djdk.lang.Process.launchMechanism=posix_spawn \
-    -Dorg.lwjgl.opengl.Display.allowSoftwareOpenGL=true \
-    -DLWJGL_DISABLE_XRANDR=true \
+    -Dminecraft.launcher.brand=AvoryOS \
+    -Dminecraft.launcher.version=${MC_VERSION} \
     -Dorg.lwjgl.librarypath=/opt/minecraft/natives \
     -Dnet.java.games.input.librarypath=/opt/minecraft/natives \
     -Djava.library.path=/opt/minecraft/natives \
     -Dos.name=Linux \
-    -Dminecraft.applet.TargetDirectory="\${MC_HOME}" \
     -cp "\${MC_CP}" \
     net.minecraft.client.main.Main \
     --username "\${MC_USER}" \
-    --version "1.8.9" \
+    --version "${MC_VERSION}" \
     --gameDir "\${MC_HOME}" \
     --assetsDir "/opt/minecraft/assets" \
-    --assetIndex "1.8" \
+    --assetIndex "${MC_ASSET_INDEX}" \
     --uuid "00000000-0000-0000-0000-000000000000" \
     --accessToken "0" \
-    --userType "legacy"
+    --userType "legacy" \
+    --versionType "release"
 LAUNCHER_EOF
 
 chmod +x "${ROOTFS_DIR}/usr/bin/minecraft"
@@ -677,26 +772,34 @@ echo "[+] Wrote /usr/bin/minecraft"
 
 # .desktop file
 mkdir -p "${ROOTFS_DIR}/usr/share/applications"
-cat > "${ROOTFS_DIR}/usr/share/applications/minecraft-alpha.desktop" << DESKTOP_EOF
+# Drop the entry written by pre-1.16.5 setups.
+rm -f "${ROOTFS_DIR}/usr/share/applications/minecraft-alpha.desktop"
+cat > "${ROOTFS_DIR}/usr/share/applications/minecraft-${MC_VERSION}.desktop" << DESKTOP_EOF
 [Desktop Entry]
 Type=Application
-Name=Minecraft 1.8.9
+Name=Minecraft ${MC_VERSION}
 GenericName=Block Game
-Comment=Minecraft 1.8.9 Java Edition
+Comment=Minecraft ${MC_VERSION} Java Edition
 Exec=minecraft
 Icon=minecraft-alpha
 Terminal=false
 Categories=Game;
 Keywords=minecraft;blocks;survival;
 DESKTOP_EOF
-echo "[+] Wrote minecraft-1.8.9.desktop"
+echo "[+] Wrote minecraft-${MC_VERSION}.desktop"
 
 # Openbox menu entry
 OPENBOX_MENU="${ROOTFS_DIR}/etc/xdg/openbox/menu.xml"
-if [ -f "${OPENBOX_MENU}" ] && ! grep -q 'minecraft' "${OPENBOX_MENU}"; then
-    sed -i 's|<separator/>|<item label="Minecraft 1.8.9">\n      <action name="Execute"><execute>st -e minecraft</execute></action>\n    </item>\n    <separator/>|' \
-        "${OPENBOX_MENU}"
-    echo "[+] Patched Openbox menu.xml"
+if [ -f "${OPENBOX_MENU}" ]; then
+    if grep -q 'st -e minecraft' "${OPENBOX_MENU}"; then
+        sed -i "s|<item label=\"Minecraft [^\"]*\">|<item label=\"Minecraft ${MC_VERSION}\">|" \
+            "${OPENBOX_MENU}"
+        echo "[+] Updated Openbox menu.xml → Minecraft ${MC_VERSION}"
+    elif ! grep -q 'minecraft' "${OPENBOX_MENU}"; then
+        sed -i "s|<separator/>|<item label=\"Minecraft ${MC_VERSION}\">\n      <action name=\"Execute\"><execute>st -e minecraft</execute></action>\n    </item>\n    <separator/>|" \
+            "${OPENBOX_MENU}"
+        echo "[+] Patched Openbox menu.xml"
+    fi
 fi
 
 # Java PATH profile
@@ -742,9 +845,10 @@ rm -f "${PART_IMG}"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════════╗"
-echo "║  [SUCCESS] Minecraft Release 1.0 is ready in AvoryOS!             ║"
+echo "║  [SUCCESS] Minecraft 1.16.5 is ready in AvoryOS!                 ║"
 echo "╠══════════════════════════════════════════════════════════════════╣"
-echo "║  Boot AvoryOS → open a terminal → type:  minecraft              ║"
+echo "║  Boot AvoryOS → open a terminal → type:  minecraft               ║"
 echo "║  Custom username:  MC_USER=YourName minecraft                    ║"
 echo "║  Custom RAM:       MC_RAM=1536m minecraft                        ║"
+echo "║  Assets incl. 2,336 OGG sounds staged in /opt/minecraft/assets   ║"
 echo "╚══════════════════════════════════════════════════════════════════╝"

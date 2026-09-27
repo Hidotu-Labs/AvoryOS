@@ -1,6 +1,7 @@
 #ifndef SYSCALL_H
 #define SYSCALL_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #define IA32_EFER 0xC0000080
@@ -34,6 +35,8 @@
 #define SYS_PWRITE64 18
 #define SYS_READV 19
 #define SYS_WRITEV 20
+#define SYS_PREADV 295
+#define SYS_PWRITEV 296
 #define SYS_ACCESS 21
 #define SYS_PIPE 22
 #define SYS_SELECT 23
@@ -47,6 +50,8 @@
 #define SYS_SHMCTL 31
 #define SYS_DUP 32
 #define SYS_DUP2 33
+#define SYS_DUP3 292
+#define SYS_SETRLIMIT 160
 #define SYS_NANOSLEEP 35
 #define SYS_ALARM 37
 #define SYS_SETITIMER 38
@@ -106,6 +111,8 @@
 #define SYS_GETRLIMIT 97
 #define SYS_GETRUSAGE 98
 #define SYS_SYSINFO 99
+#define SYS_TIMES 100
+#define SYS_PTRACE 101
 #define SYS_GETUID 102
 #define SYS_SYSLOG 103
 #define SYS_GETGID 104
@@ -131,6 +138,7 @@
 #define SYS_GETSID 124
 #define SYS_CAPGET 125
 #define SYS_CAPSET 126
+#define SYS_RT_SIGPENDING 127
 #define SYS_SIGALTSTACK 131
 #define SYS_SECCOMP 317
 #define SYS_STATFS 137
@@ -149,10 +157,13 @@
 #define SYS_SCHED_GETPARAM 143
 #define SYS_SCHED_GET_PRIORITY_MAX 146
 #define SYS_SCHED_GET_PRIORITY_MIN 147
+#define SYS_SCHED_RR_GET_INTERVAL 148
 #define SYS_PRCTL 157
 #define SYS_ARCH_PRCTL 158
 #define SYS_GETTID 186
+#define SYS_READAHEAD 187
 #define SYS_TKILL 200
+#define SYS_TIME 201
 #define SYS_TGKILL 234
 #define SYS_FUTEX 202
 #define SYS_SCHED_SETAFFINITY 203
@@ -186,6 +197,7 @@
 #define SYS_PSELECT6 270
 #define SYS_PPOLL 271
 #define SYS_UNSHARE 272
+#define SYS_SYNC_FILE_RANGE 277
 #define SYS_UTIMES 280
 #define SYS_EPOLL_PWAIT 281
 #define SYS_SIGNALFD 282
@@ -217,7 +229,12 @@
 #define SYS_RENAMEAT2 316
 #define SYS_RSEQ 334
 #define SYS_MKNOD 133
+#define SYS_CHROOT 161
+#define SYS_SETTIMEOFDAY 164
 #define SYS_MOUNT 165
+#define SYS_SWAPON 167
+#define SYS_INIT_MODULE 175
+#define SYS_DELETE_MODULE 176
 #define SYS_UMOUNT2 166
 #define SYS_SETHOSTNAME 170
 #define SYS_REBOOT 169
@@ -245,13 +262,25 @@
 
 /* Moving data between descriptors */
 #define SYS_SPLICE           275
+#define SYS_TEE              276
 #define SYS_COPY_FILE_RANGE  326
 
 #define MAX_SYSCALL 512
 
+/* Syscall tracing.
+ *   0         compiled out (default)
+ *   1         log every syscall of every process
+ *   2         log only tasks whose `trace_syscalls` flag is set, i.e. the
+ *             badwolf/WebKit/bwrap process tree (build with
+ *             `make SYSCALL_LOG=browser`). */
 #ifndef SYSCALL_LOG
 #define SYSCALL_LOG 0
 #endif
+
+struct thread;
+
+/* True when the active trace mode wants syscalls from this task logged. */
+bool syscall_log_allowed(const struct thread *t);
 
 #define CLONE_VM 0x00000100
 #define CLONE_FS 0x00000200

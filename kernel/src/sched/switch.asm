@@ -4,6 +4,7 @@ global thread_stub
 section .text
 
 extern cpu_has_xsave_flag
+extern cpu_xsave_mask
 
 ; void switch_context(struct thread *old_t, struct thread *new_t)
 ; rdi = pointer to old thread struct
@@ -27,8 +28,9 @@ switch_context:
     cmp byte [rel cpu_has_xsave_flag], 0
     je .save_fxsave
 
-    mov eax, 0xFFFFFFFF
-    mov edx, 0xFFFFFFFF
+    mov rax, [rel cpu_xsave_mask]
+    mov rdx, rax
+    shr rdx, 32
     xsave64 [rdi + 64]
     jmp .fpu_saved
 
@@ -50,8 +52,9 @@ switch_context:
     cmp byte [rel cpu_has_xsave_flag], 0
     je .restore_fxrstor
 
-    mov eax, 0xFFFFFFFF
-    mov edx, 0xFFFFFFFF
+    mov rax, [rel cpu_xsave_mask]
+    mov rdx, rax
+    shr rdx, 32
     xrstor64 [rsi + 64]
     jmp .fpu_restored
 
@@ -67,15 +70,14 @@ switch_context:
     pop rbp
     pop rbx
 
-    ; Restore this thread's RFLAGS (including the AC window) before returning.
-    ; IF is explicitly cleared again: the scheduler invariant is that a resumed
-    ; thread runs with interrupts masked until sched_schedule() reaches its
-    ; hal_irq_enable(), and letting popfq re-enable IF here allowed an
-    ; interrupt to nest a second schedule while the first one was still
-    ; unwinding (random corrupted returns).  AC must survive - it is the
-    ; coarse SMAP window for a syscall that blocked mid-dispatch.
+    ; Restore this thread's RFLAGS (including the AC window) with IF masked.
+    ; The resumed scheduler continuation restores its caller's original IF
+    ; after bookkeeping. Clearing IF in the saved value avoids the interrupt
+    ; window that popfq; cli would leave between those two instructions.
+    pop rax
+    btr rax, 9
+    push rax
     popfq
-    cli
 
     ; Return to the address left on the new thread's stack
     ret

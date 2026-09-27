@@ -50,17 +50,26 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a2,
       if (cur)
         cur->fs_base = addr;
     }
-    klog_puts("[ARCH_PRCTL] SET_FS = ");
-    klog_uint64(addr);
-    klog_puts(" (MSR readback=");
-    klog_hex64(rdmsr(IA32_FS_BASE));
-    klog_puts(", thread->fs_base=");
+    /* ld.so calls SET_FS once per process launch and this block printed
+     * ~97 chars (~1ms of serial console) plus an MSR readback every time.
+     * First few launches only. */
     {
-      extern struct thread *sched_get_current(void);
-      struct thread *cur2 = sched_get_current();
-      klog_hex64(cur2 ? cur2->fs_base : 0);
+      static uint32_t setfs_dumps;
+      if (setfs_dumps < 4) {
+        setfs_dumps++;
+        klog_puts("[ARCH_PRCTL] SET_FS = ");
+        klog_uint64(addr);
+        klog_puts(" (MSR readback=");
+        klog_hex64(rdmsr(IA32_FS_BASE));
+        klog_puts(", thread->fs_base=");
+        {
+          extern struct thread *sched_get_current(void);
+          struct thread *cur2 = sched_get_current();
+          klog_hex64(cur2 ? cur2->fs_base : 0);
+        }
+        klog_puts(")\n");
+      }
     }
-    klog_puts(")\n");
     return 0;
 
   case ARCH_GET_FS:
@@ -302,6 +311,51 @@ static uint64_t sys_gettimeofday(uint64_t tv_ptr, uint64_t tz_ptr, uint64_t a2,
   return 0;
 }
 
+// settimeofday(tv, tz) - syscall 164
+// NULL/NULL is a harmless no-op probe (returns 0, like Linux).  Actually
+// setting the clock is not supported - there is no RTC-write path - so any
+// real request fails EPERM after pointer validation.
+static uint64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz_ptr, uint64_t a2,
+                                 uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+
+  if (!tv_ptr && !tz_ptr)
+    return 0;
+  // struct timeval is 16 bytes; struct timezone is 8 bytes.
+  if (tv_ptr && !vmm_is_user_addr_range_valid(tv_ptr, 16))
+    return (uint64_t)-14; // EFAULT
+  if (tz_ptr && !vmm_is_user_addr_range_valid(tz_ptr, 8))
+    return (uint64_t)-14; // EFAULT
+  return (uint64_t)-1; // EPERM: setting the clock is not supported
+}
+
+// time(tloc) - syscall 201
+// Returns seconds since the Epoch (1970-01-01 00:00:00 UTC).
+// If tloc is non-NULL, also stores the value at *tloc.
+static uint64_t sys_time(uint64_t tloc_ptr, uint64_t a1, uint64_t a2,
+                         uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a1;
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+
+  uint64_t ns = lapic_timer_get_ns();
+  uint64_t sec = rtc_get_boot_timestamp() + (ns / 1000000000ULL);
+
+  if (tloc_ptr) {
+    if (tloc_ptr >= 0x8000000000000000ULL) {
+      return (uint64_t)-14; // EFAULT
+    }
+    *(uint64_t *)tloc_ptr = sec;
+  }
+
+  return sec;
+}
+
 static uint64_t sys_mlock(uint64_t addr, uint64_t len, uint64_t a2, uint64_t a3,
                           uint64_t a4, uint64_t a5) {
   (void)addr;
@@ -423,6 +477,8 @@ void syscall_register_arch(void) {
   syscall_register(SYS_CLOCK_NANOSLEEP, sys_clock_nanosleep);
   syscall_register(SYS_NANOSLEEP, sys_nanosleep);
   syscall_register(SYS_GETTIMEOFDAY, sys_gettimeofday);
+  syscall_register(SYS_SETTIMEOFDAY, sys_settimeofday);
+  syscall_register(SYS_TIME, sys_time);
   syscall_register(SYS_MLOCK, sys_mlock);
   syscall_register(SYS_MUNLOCK, sys_munlock);
   syscall_register(SYS_MLOCKALL, sys_mlockall);

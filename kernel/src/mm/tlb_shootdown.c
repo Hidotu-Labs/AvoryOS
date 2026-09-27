@@ -57,6 +57,23 @@ static volatile uint8_t  cpu_shootdown_ack[MAX_CPUS];
  * initiator could not tell us (it was modifying an address space other than
  * the one loaded on its own CPU). */
 static volatile uint16_t cpu_shootdown_pcid[MAX_CPUS];
+/* Timing and execution-context snapshots for the current serialized request.
+ * The target records entry/ack timestamps on its own CPU; the initiator records
+ * the send timestamp immediately before raising the IPI.  These are diagnostic
+ * only and are published before the release-store to cpu_shootdown_ack. */
+static volatile uint64_t cpu_shootdown_sent_tsc[MAX_CPUS];
+static volatile uint64_t cpu_shootdown_entry_tsc[MAX_CPUS];
+static volatile uint64_t cpu_shootdown_ack_tsc[MAX_CPUS];
+static volatile uint64_t cpu_shootdown_seen_cr3[MAX_CPUS];
+static volatile uint64_t cpu_shootdown_seen_tid[MAX_CPUS];
+static volatile uint64_t cpu_shootdown_seen_tgid[MAX_CPUS];
+static volatile uint64_t cpu_shootdown_interrupted_rip[MAX_CPUS];
+static volatile uint64_t cpu_shootdown_interrupted_cs[MAX_CPUS];
+static volatile uint64_t cpu_shootdown_interrupted_rflags[MAX_CPUS];
+static volatile uint64_t cpu_shootdown_interrupted_rsp[MAX_CPUS];
+static volatile uint64_t cpu_shootdown_kernel_stack[MAX_CPUS][4];
+static char cpu_shootdown_seen_comm[MAX_CPUS][16];
+static volatile uint32_t slow_ack_log_count;
 
 /* Cost counters for /proc/tlb_stats.  Relaxed atomics: these are allowed to be
  * a few increments behind, they only need to be close enough to compare two
@@ -96,7 +113,8 @@ void tlb_shootdown_reset_stats(void) {
 }
 
 static bool cpu_needs_shootdown(struct cpu_info *cpu, struct cpu_info *self,
-                                uint64_t addr, uint64_t pml4_base) {
+                                uint64_t addr, uint64_t pcid,
+                                uint64_t pml4_base) {
     if (!cpu || cpu == self)
         return false;
     if (cpu->status != CPU_STATUS_ONLINE && cpu->status != CPU_STATUS_BSP)
@@ -105,14 +123,39 @@ static bool cpu_needs_shootdown(struct cpu_info *cpu, struct cpu_info *self,
     /* A full invalidation, and every kernel-space mapping, can be cached by
      * any CPU whatever address space it has loaded - kernel page tables are
      * shared by all of them. */
-    if (addr == TLB_SHOOTDOWN_ALL || addr > USER_SPACE_LIMIT)
+    if (addr == TLB_SHOOTDOWN_ALL ||
+        (addr > USER_SPACE_LIMIT && addr != TLB_SHOOTDOWN_CONTEXT))
         return true;
 
-    /* With PCID, a CPU that switched this address space out can still hold
-     * translations under its PCID, and reaching them is the handler's job -
-     * keep the conservative broadcast rather than risk a stale entry. */
-    if (cpu_has_pcid())
-        return true;
+    /* With a known PCID, only a CPU currently running that address space
+     * needs an IPI.  An inactive CPU may retain tagged translations, so clear
+     * its scheduler bookkeeping while holding queue_lock.  The scheduler
+     * checks that bit and loads CR3 with flushing semantics before it can run
+     * the address space again.  queue_lock closes the race with the CR3 load:
+     * either we observe it active and send an IPI, or its later switch sees
+     * the cleared bit and flushes locally.  If the lock is busy, target it
+     * conservatively; this keeps shootdown latency independent of runqueue
+     * lock contention and preserves correctness.
+     *
+     * Unknown PCIDs still require a broadcast, because we cannot safely
+     * identify which tagged translations belong to this page-table root. */
+    if (cpu_has_pcid()) {
+        if (pcid == PCID_KERNEL)
+            return true;
+
+        if (!spinlock_try_acquire(&cpu->queue_lock))
+            return true;
+
+        uint64_t loaded = __atomic_load_n(&cpu->active_cr3, __ATOMIC_ACQUIRE);
+        bool active = loaded != 0 &&
+                      (loaded & CR3_ADDR_MASK) == (pml4_base & CR3_ADDR_MASK) &&
+                      (loaded & CR3_PCID_MASK) == (pcid & CR3_PCID_MASK);
+        if (!active)
+            cpu_pcid_invalidate(cpu, (uint16_t)pcid);
+
+        spinlock_release(&cpu->queue_lock);
+        return active;
+    }
 
     /* Without PCID every CR3 load flushes the previous address space's
      * non-global entries, so only a CPU with this exact pml4 in CR3 can have
@@ -125,7 +168,9 @@ static bool cpu_needs_shootdown(struct cpu_info *cpu, struct cpu_info *self,
     return (loaded & CR3_ADDR_MASK) == (pml4_base & CR3_ADDR_MASK);
 }
 
-void tlb_shootdown_handle_ipi(void) {
+#define KERNEL_IMAGE_BASE 0xFFFFFFFF80000000ULL
+
+void tlb_shootdown_handle_ipi_regs(struct registers *regs) {
     struct cpu_info *self = cpu_get_current();
     if (!self)
         return;
@@ -133,6 +178,63 @@ void tlb_shootdown_handle_ipi(void) {
     uint32_t id = self->cpu_id;
     if (id >= MAX_CPUS)
         return;
+
+    uint64_t entry_tsc = rdtsc();
+    uint64_t active_cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(active_cr3));
+    struct thread *current = self->current_thread;
+    uint64_t current_tid = current ? current->tid : 0;
+    uint64_t current_tgid = current ? current->tgid : 0;
+    __atomic_store_n(&cpu_shootdown_entry_tsc[id], entry_tsc,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&cpu_shootdown_seen_cr3[id], active_cr3,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&cpu_shootdown_seen_tid[id], current_tid,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&cpu_shootdown_seen_tgid[id], current_tgid,
+                     __ATOMIC_RELAXED);
+
+    if (current && current->comm[0]) {
+        for (int c = 0; c < 15; c++) {
+            cpu_shootdown_seen_comm[id][c] = current->comm[c];
+            if (!current->comm[c]) break;
+        }
+        cpu_shootdown_seen_comm[id][15] = '\0';
+    } else {
+        cpu_shootdown_seen_comm[id][0] = '\0';
+    }
+
+    if (regs) {
+        __atomic_store_n(&cpu_shootdown_interrupted_rip[id], regs->rip, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu_shootdown_interrupted_cs[id], regs->cs, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu_shootdown_interrupted_rflags[id], regs->rflags, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu_shootdown_interrupted_rsp[id], regs->rsp, __ATOMIC_RELAXED);
+
+        /* If interrupted in kernel mode, sample up to 4 return addresses from stack */
+        if ((regs->cs & 3) == 0 && regs->rsp >= KERNEL_IMAGE_BASE && regs->rsp < 0xFFFFFFFFFF000000ULL) {
+            uint64_t *sp = (uint64_t *)regs->rsp;
+            int found = 0;
+            for (int i = 0; i < 16 && found < 4; i++) {
+                uint64_t val = sp[i];
+                if (val >= KERNEL_IMAGE_BASE && val < 0xFFFFFFFFFF000000ULL) {
+                    cpu_shootdown_kernel_stack[id][found++] = val;
+                }
+            }
+            while (found < 4) {
+                cpu_shootdown_kernel_stack[id][found++] = 0;
+            }
+        } else {
+            for (int i = 0; i < 4; i++)
+                cpu_shootdown_kernel_stack[id][i] = 0;
+        }
+    } else {
+        __atomic_store_n(&cpu_shootdown_interrupted_rip[id], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu_shootdown_interrupted_cs[id], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu_shootdown_interrupted_rflags[id], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu_shootdown_interrupted_rsp[id], 0, __ATOMIC_RELAXED);
+        for (int i = 0; i < 4; i++)
+            cpu_shootdown_kernel_stack[id][i] = 0;
+    }
 
     uint64_t addr = __atomic_load_n(&cpu_shootdown_addr[id], __ATOMIC_ACQUIRE);
 
@@ -145,6 +247,36 @@ void tlb_shootdown_handle_ipi(void) {
             __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
             cr3 &= ~CR3_NOFLUSH;
             __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+        }
+    } else if (addr == TLB_SHOOTDOWN_CONTEXT) {
+        uint16_t pcid = __atomic_load_n(&cpu_shootdown_pcid[id], __ATOMIC_ACQUIRE);
+        if (!cpu_has_pcid() || pcid == PCID_KERNEL) {
+            if (cpu_has_pcid()) {
+                cpu_pcid_invalidate_all(self);
+                pcid_flush_all();
+            } else {
+                uint64_t cr3;
+                __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+                cr3 &= ~CR3_NOFLUSH;
+                __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+            }
+            tlb_stat_add(&tlb_stats.handler_full_flushes, 1);
+        } else {
+            uint64_t cr3;
+            __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+            uint16_t loaded = (uint16_t)(cr3 & CR3_PCID_MASK);
+            if (loaded == pcid) {
+                if (cpu_has_invpcid()) {
+                    struct invpcid_desc desc = {0};
+                    desc.pcid = pcid;
+                    invpcid(INVPCID_TYPE_SINGLE_CTXT, &desc);
+                } else {
+                    cr3 &= ~CR3_NOFLUSH;
+                    __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+                }
+            } else {
+                cpu_pcid_invalidate(self, pcid);
+            }
         }
     } else if (addr != 0) {
         /*
@@ -206,13 +338,17 @@ void tlb_shootdown_handle_ipi(void) {
         }
     }
 
-    /* Ack: store 0 to signal the initiator we are done. */
+    /* Ack: publish the completion snapshot before signaling the initiator. */
+    __atomic_store_n(&cpu_shootdown_ack_tsc[id], rdtsc(), __ATOMIC_RELAXED);
     __atomic_store_n(&cpu_shootdown_ack[id], 0, __ATOMIC_RELEASE);
 }
 
+void tlb_shootdown_handle_ipi(void) {
+    tlb_shootdown_handle_ipi_regs(NULL);
+}
+
 static void tlb_shootdown_isr(struct registers *regs) {
-    (void)regs;
-    tlb_shootdown_handle_ipi();
+    tlb_shootdown_handle_ipi_regs(regs);
 }
 
 /* -------------------------------------------------------------------------
@@ -314,6 +450,11 @@ void tlb_shootdown_init(void) {
         cpu_shootdown_addr[i] = 0;
         cpu_shootdown_pcid[i] = PCID_KERNEL;
         cpu_shootdown_ack[i]  = 0;
+        cpu_shootdown_sent_tsc[i] = 0;
+        cpu_shootdown_entry_tsc[i] = 0;
+        cpu_shootdown_ack_tsc[i] = 0;
+        cpu_shootdown_seen_cr3[i] = 0;
+        cpu_shootdown_seen_tid[i] = 0;
     }
     register_interrupt_handler(IPI_VECTOR_TLB_SHOOTDOWN, tlb_shootdown_isr);
     klog_puts("[TLB] Shootdown IPI handler registered on vector 0x");
@@ -369,6 +510,33 @@ static void local_flush(uint64_t addr, uint16_t pcid) {
             __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
             cr3 &= ~CR3_NOFLUSH;
             __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+        }
+        return;
+    }
+
+    if (addr == TLB_SHOOTDOWN_CONTEXT) {
+        if (!cpu_has_pcid() || pcid == PCID_KERNEL) {
+            if (cpu_has_pcid()) {
+                cpu_pcid_invalidate_all(cpu_get_current());
+                pcid_flush_all();
+            } else {
+                uint64_t cr3;
+                __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+                cr3 &= ~CR3_NOFLUSH;
+                __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+            }
+        } else if (cpu_has_invpcid()) {
+            struct invpcid_desc desc = {0};
+            desc.pcid = pcid;
+            invpcid(INVPCID_TYPE_SINGLE_CTXT, &desc);
+        } else {
+            uint64_t cr3;
+            __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+            if ((cr3 & CR3_PCID_MASK) == pcid) {
+                cr3 &= ~CR3_NOFLUSH;
+                __asm__ volatile("mov %0, %%cr3" :: "r"(cr3) : "memory");
+            } else
+                cpu_pcid_invalidate(cpu_get_current(), pcid);
         }
         return;
     }
@@ -448,9 +616,9 @@ uint64_t tlb_shootdown_caller_info(int slot, uint64_t *ip, uint64_t *total,
  * Requests are per-CPU and need no lock: only their own CPU appends or drains
  * them.  The IRQ guard covers the case where a fault on this same CPU re-enters
  * the paging engine and drains the list underneath us; draining early is always
- * safe, losing an append never is.  When the list fills up it collapses into a
- * single full invalidation, which is conservative and bounded, so a large mmap
- * or unmap costs one broadcast instead of one per page. */
+ * safe, losing an append never is.  A full list of user mappings for one root
+ * collapses into a context invalidation; mixed roots or kernel mappings retain
+ * the conservative global fallback. */
 #define TLB_DEFER_SLOTS 32
 #define TLB_MAX_CPUS 64
 
@@ -485,11 +653,59 @@ void tlb_flush_deferred(uint64_t addr, uint64_t pml4) {
     return; /* already collapsed */
   }
   uint32_t n = __atomic_load_n(&tlb_pending_count[slot], __ATOMIC_RELAXED);
+
+  /* A context invalidation subsumes every user-page invalidation for that
+   * same page-table root. Coalesce it before the bounded queue can overflow. */
+  uint64_t root = pml4 & CR3_ADDR_MASK;
+  bool user_scoped = addr == TLB_SHOOTDOWN_CONTEXT ||
+                     (addr != 0 && addr <= USER_SPACE_LIMIT);
+  if (root && user_scoped) {
+    for (uint32_t i = 0; i < n; i++) {
+      uint64_t queued_addr = tlb_pending[slot][i].addr;
+      uint64_t queued_root = tlb_pending[slot][i].pml4 & CR3_ADDR_MASK;
+      if (queued_root == root && queued_addr == TLB_SHOOTDOWN_CONTEXT) {
+        hal_irq_restore(flags);
+        return;
+      }
+    }
+
+    if (addr == TLB_SHOOTDOWN_CONTEXT) {
+      uint32_t out = 0;
+      for (uint32_t i = 0; i < n; i++) {
+        uint64_t queued_addr = tlb_pending[slot][i].addr;
+        uint64_t queued_root = tlb_pending[slot][i].pml4 & CR3_ADDR_MASK;
+        bool same_user_root = queued_root == root && queued_addr != 0 &&
+                              queued_addr <= USER_SPACE_LIMIT;
+        if (!same_user_root)
+          tlb_pending[slot][out++] = tlb_pending[slot][i];
+      }
+      n = out;
+      __atomic_store_n(&tlb_pending_count[slot], n, __ATOMIC_RELAXED);
+    }
+  }
+
   if (n >= TLB_DEFER_SLOTS) {
-    /* Too many distinct addresses: one broadcast is cheaper than tracking them
-     * and strictly more conservative. */
-    __atomic_store_n(&tlb_pending_all[slot], 1, __ATOMIC_RELAXED);
-    __atomic_store_n(&tlb_pending_count[slot], 0, __ATOMIC_RELAXED);
+    /* A burst of unmaps from one process needs one context flush, not a
+     * machine-wide broadcast. Retain the global fallback only for mixed roots
+     * or kernel mappings, where the affected translations cannot be scoped. */
+    bool collapse_context = root && user_scoped;
+    for (uint32_t i = 0; collapse_context && i < n; i++) {
+      uint64_t queued_addr = tlb_pending[slot][i].addr;
+      uint64_t queued_root = tlb_pending[slot][i].pml4 & CR3_ADDR_MASK;
+      bool queued_user = queued_addr == TLB_SHOOTDOWN_CONTEXT ||
+                         (queued_addr != 0 &&
+                          queued_addr <= USER_SPACE_LIMIT);
+      if (queued_root != root || !queued_user)
+        collapse_context = false;
+    }
+    if (collapse_context) {
+      tlb_pending[slot][0].addr = TLB_SHOOTDOWN_CONTEXT;
+      tlb_pending[slot][0].pml4 = root;
+      __atomic_store_n(&tlb_pending_count[slot], 1, __ATOMIC_RELAXED);
+    } else {
+      __atomic_store_n(&tlb_pending_all[slot], 1, __ATOMIC_RELAXED);
+      __atomic_store_n(&tlb_pending_count[slot], 0, __ATOMIC_RELAXED);
+    }
     hal_irq_restore(flags);
     return;
   }
@@ -497,6 +713,10 @@ void tlb_flush_deferred(uint64_t addr, uint64_t pml4) {
   tlb_pending[slot][n].pml4 = pml4;
   __atomic_store_n(&tlb_pending_count[slot], n + 1, __ATOMIC_RELAXED);
   hal_irq_restore(flags);
+}
+
+void tlb_flush_deferred_context(uint64_t pml4) {
+  tlb_flush_deferred(TLB_SHOOTDOWN_CONTEXT, pml4);
 }
 
 void tlb_flush_deferred_all(void) {
@@ -543,19 +763,64 @@ bool tlb_flush_deferred_drain(void) {
     return false;
   }
 
+  /* Take a stable snapshot before reopening interrupts. New invalidations
+   * queued while this batch waits for remote CPUs belong to the next drain;
+   * they must not overwrite entries this drain is still reading. */
+  tlb_pending_t requests[TLB_DEFER_SLOTS];
+  for (uint32_t i = 0; i < n; i++)
+    requests[i] = tlb_pending[slot][i];
   __atomic_store_n(&tlb_pending_all[slot], 0, __ATOMIC_RELAXED);
   __atomic_store_n(&tlb_pending_count[slot], 0, __ATOMIC_RELAXED);
   hal_irq_restore(flags);
 
-  /* Only the last request for an address matters, and a duplicate flush is
-   * harmless, so the list is replayed as recorded. */
+  /* A context flush subsumes every page flush for that user address space.
+   * Grouping a burst of unmaps this way avoids serially taking shootdown_lock
+   * and waiting for the same CPUs once per page. */
   if (all) {
     tlb_shootdown_all();
     return true;
   }
+  bool processed[TLB_DEFER_SLOTS] = {false};
   for (uint32_t i = 0; i < n; i++)
-    tlb_shootdown_page_for(tlb_pending[slot][i].addr,
-                           tlb_pending[slot][i].pml4);
+    if (!processed[i]) {
+      uint64_t addr = requests[i].addr;
+      uint64_t root = requests[i].pml4 & CR3_ADDR_MASK;
+      bool user_page = addr != 0 && addr <= USER_SPACE_LIMIT;
+      if (root && (addr == TLB_SHOOTDOWN_CONTEXT || user_page)) {
+        uint32_t same_root_pages = 0;
+        bool has_context = addr == TLB_SHOOTDOWN_CONTEXT;
+        for (uint32_t j = i; j < n; j++) {
+          uint64_t other_root = requests[j].pml4 & CR3_ADDR_MASK;
+          uint64_t other_addr = requests[j].addr;
+          if (other_root != root)
+            continue;
+          if (other_addr == TLB_SHOOTDOWN_CONTEXT) {
+            has_context = true;
+          } else if (other_addr != 0 && other_addr <= USER_SPACE_LIMIT) {
+            same_root_pages++;
+          }
+        }
+        if (has_context || same_root_pages > 1) {
+          for (uint32_t j = i; j < n; j++) {
+            uint64_t other_root = requests[j].pml4 & CR3_ADDR_MASK;
+            uint64_t other_addr = requests[j].addr;
+            bool other_user = other_addr == TLB_SHOOTDOWN_CONTEXT ||
+                              (other_addr != 0 &&
+                               other_addr <= USER_SPACE_LIMIT);
+            if (other_root == root && other_user)
+              processed[j] = true;
+          }
+          tlb_shootdown_context_for(root);
+        } else {
+          processed[i] = true;
+          tlb_shootdown_page_for(addr, requests[i].pml4);
+        }
+      } else if (addr == TLB_SHOOTDOWN_CONTEXT) {
+        tlb_shootdown_context_for(requests[i].pml4);
+      } else {
+        tlb_shootdown_page_for(addr, requests[i].pml4);
+      }
+    }
   return true;
 }
 
@@ -571,7 +836,7 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
     uint32_t targets = 0;
     for (uint32_t i = 0; i < cpu_count && i < MAX_CPUS; i++) {
         struct cpu_info *c = cpu_get_info(i);
-        if (!cpu_needs_shootdown(c, self, addr, pml4_base))
+        if (!cpu_needs_shootdown(c, self, addr, pcid, pml4_base))
             continue;
         target_mask |= 1ULL << c->cpu_id;
         targets++;
@@ -616,6 +881,11 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
             continue;
         __atomic_store_n(&cpu_shootdown_pcid[c->cpu_id], pcid, __ATOMIC_RELEASE);
         __atomic_store_n(&cpu_shootdown_addr[c->cpu_id], addr, __ATOMIC_RELEASE);
+        __atomic_store_n(&cpu_shootdown_sent_tsc[c->cpu_id], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu_shootdown_entry_tsc[c->cpu_id], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu_shootdown_ack_tsc[c->cpu_id], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu_shootdown_seen_cr3[c->cpu_id], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu_shootdown_seen_tid[c->cpu_id], 0, __ATOMIC_RELAXED);
         __atomic_store_n(&cpu_shootdown_ack[c->cpu_id], 1, __ATOMIC_RELEASE);
     }
 
@@ -627,6 +897,8 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
         struct cpu_info *c = cpu_get_info(i);
         if (!(target_mask & (1ULL << c->cpu_id)))
             continue;
+        __atomic_store_n(&cpu_shootdown_sent_tsc[c->cpu_id], rdtsc(),
+                         __ATOMIC_RELAXED);
         lapic_send_ipi(c->apic_id, IPI_VECTOR_TLB_SHOOTDOWN);
     }
 
@@ -676,19 +948,43 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
         mhz ? rdtsc() + mhz * 1000ULL * SHOOTDOWN_TIMEOUT_MS : 0;
     uint64_t fallback_spins = 400000000ULL;
     uint64_t wait_start = rdtsc();
-    for (uint32_t i = 0; i < cpu_count && i < MAX_CPUS; i++) {
-        struct cpu_info *c = cpu_get_info(i);
-        if (!c || !(target_mask & (1ULL << c->cpu_id)))
-            continue;
-        while (__atomic_load_n(&cpu_shootdown_ack[c->cpu_id], __ATOMIC_ACQUIRE) != 0) {
-            hal_cpu_relax();
-            if (deadline) {
-                if (rdtsc() > deadline)
-                    shootdown_stuck(self, c, addr);
-            } else if (--fallback_spins == 0) {
-                shootdown_stuck(self, c, addr);
+    uint64_t ack_observed_tsc[MAX_CPUS] = {0};
+    uint64_t pending_mask = target_mask;
+    while (pending_mask) {
+        bool progress = false;
+        for (uint32_t i = 0; i < cpu_count && i < MAX_CPUS; i++) {
+            struct cpu_info *c = cpu_get_info(i);
+            if (!c || !(pending_mask & (1ULL << c->cpu_id)))
+                continue;
+            if (__atomic_load_n(&cpu_shootdown_ack[c->cpu_id],
+                                __ATOMIC_ACQUIRE) == 0) {
+                /* This timestamp shares the initiator's TSC with sent_tsc, so
+                 * ack_us below does not depend on cross-core TSC alignment. */
+                ack_observed_tsc[c->cpu_id] = rdtsc();
+                pending_mask &= ~(1ULL << c->cpu_id);
+                progress = true;
             }
         }
+        if (!pending_mask)
+            break;
+
+        if (deadline) {
+            if (rdtsc() > deadline) {
+                for (uint32_t i = 0; i < cpu_count && i < MAX_CPUS; i++) {
+                    struct cpu_info *c = cpu_get_info(i);
+                    if (c && (pending_mask & (1ULL << c->cpu_id)))
+                        shootdown_stuck(self, c, addr);
+                }
+            }
+        } else if (--fallback_spins == 0) {
+            for (uint32_t i = 0; i < cpu_count && i < MAX_CPUS; i++) {
+                struct cpu_info *c = cpu_get_info(i);
+                if (c && (pending_mask & (1ULL << c->cpu_id)))
+                    shootdown_stuck(self, c, addr);
+            }
+        }
+        if (!progress)
+            hal_cpu_relax();
     }
 
     uint64_t waited = rdtsc() - wait_start;
@@ -696,24 +992,169 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
         tlb_stat_add(&tlb_stats.ack_wait_ns, waited / mhz);
         tlb_stat_max(&tlb_stats.max_ack_wait_ns, waited / mhz);
 
-        /* Waited time in real milliseconds.  Note mhz is TSC ticks per
-         * MICROSECOND, so a millisecond is mhz*1000 ticks: the deadline above
-         * uses mhz alone, which makes SHOOTDOWN_TIMEOUT_MS a 10 ms timeout, not
-         * 10 s.  Measuring here makes that visible either way. */
+        /* mhz is TSC ticks per microsecond. */
         uint64_t waited_ms = waited / (mhz * 1000ULL);
         LOCKDIAG_STAT_MAX(shootdown_max_ack_ns,
                           tsc_cycles_to_ns(waited));
         if (waited_ms > LOCKDIAG_SLOW_ACK_MS) {
             LOCKDIAG_STAT(shootdown_slow_acks, 1);
+            uint32_t slow_seen = __atomic_add_fetch(&slow_ack_log_count, 1,
+                                                    __ATOMIC_RELAXED);
+            /* A single busy process can generate thousands of page shootdowns.
+             * Keep the initial breakdown, then sample periodically; the full
+             * count and worst latency remain available in lockdiag stats. */
+            bool emit_detail = slow_seen <= 32 || (slow_seen & 0x1Fu) == 0;
+            if (slow_seen == 33) {
+                sd_note("[TLB] further SLOW ack breakdowns suppressed; "
+                        "sampling every 32nd event (counter remains in stats)\n");
+            }
+            if (emit_detail) {
             sd_note("\n[TLB] SLOW ack wait=");
             sd_dec(waited_ms);
-            sd_note("ms addr=");
+            sd_note("ms/");
+            sd_dec(waited / mhz);
+            sd_note("us kind=");
+            sd_note(addr == TLB_SHOOTDOWN_ALL ? "all" :
+                    addr == TLB_SHOOTDOWN_CONTEXT ? "context" : "page");
+            sd_note(" addr=");
             sd_hex(addr);
+            sd_note(" pml4=");
+            sd_hex(pml4_base);
+            sd_note(" pcid=");
+            sd_hex(pcid);
             sd_note(" targets=");
             sd_dec(targets);
+            sd_note(" mask=");
+            sd_hex(target_mask);
             sd_note(" initiator_cpu=");
             sd_dec(self ? self->cpu_id : 0xFFFFFFFFFFFFFFFFULL);
+            sd_note(" caller=");
+            sd_hex(caller_ip);
             sd_note("\n");
+
+            /* The aggregate only says that at least one target was late.
+             * Break it down per core so an IPI delivery delay can be separated
+             * from time spent executing the invalidation handler. */
+            for (uint32_t i = 0; i < cpu_count && i < MAX_CPUS; i++) {
+                struct cpu_info *c = cpu_get_info(i);
+                if (!c || !(target_mask & (1ULL << c->cpu_id)))
+                    continue;
+
+                uint32_t id = c->cpu_id;
+                uint64_t sent = __atomic_load_n(&cpu_shootdown_sent_tsc[id],
+                                                __ATOMIC_RELAXED);
+                uint64_t entry = __atomic_load_n(&cpu_shootdown_entry_tsc[id],
+                                                 __ATOMIC_RELAXED);
+                uint64_t ack = __atomic_load_n(&cpu_shootdown_ack_tsc[id],
+                                               __ATOMIC_RELAXED);
+                uint64_t seen_cr3 = __atomic_load_n(&cpu_shootdown_seen_cr3[id],
+                                                    __ATOMIC_RELAXED);
+                uint64_t seen_tid = __atomic_load_n(&cpu_shootdown_seen_tid[id],
+                                                    __ATOMIC_RELAXED);
+                uint64_t seen_tgid = __atomic_load_n(&cpu_shootdown_seen_tgid[id],
+                                                     __ATOMIC_RELAXED);
+                uint64_t ack_seen = ack_observed_tsc[id];
+                uint64_t ack_us = sent && ack_seen >= sent
+                                      ? (ack_seen - sent) / mhz : 0;
+                uint64_t delivery_us = sent && entry >= sent
+                                           ? (entry - sent) / mhz : 0;
+                uint64_t handler_us = entry && ack >= entry ? (ack - entry) / mhz : 0;
+                uint64_t rtt_us = ack && ack_seen >= ack ? (ack_seen - ack) / mhz : 0;
+
+                uint64_t rip = __atomic_load_n(&cpu_shootdown_interrupted_rip[id], __ATOMIC_RELAXED);
+                uint64_t cs = __atomic_load_n(&cpu_shootdown_interrupted_cs[id], __ATOMIC_RELAXED);
+                uint64_t rflags = __atomic_load_n(&cpu_shootdown_interrupted_rflags[id], __ATOMIC_RELAXED);
+                uint64_t rsp = __atomic_load_n(&cpu_shootdown_interrupted_rsp[id], __ATOMIC_RELAXED);
+
+                sd_note("[TLB]   cpu=");
+                sd_dec(id);
+                sd_note(" apic=");
+                sd_dec(c->apic_id);
+                sd_note(" ack_us=");
+                sd_dec(ack_us);
+                sd_note(" (delivery=");
+                sd_dec(delivery_us);
+                sd_note("us handler=");
+                sd_dec(handler_us);
+                sd_note("us rtt=");
+                sd_dec(rtt_us);
+                sd_note("us) cr3=");
+                sd_hex(seen_cr3);
+                sd_note(" tid=");
+                sd_dec(seen_tid);
+                sd_note(" tgid=");
+                sd_dec(seen_tgid);
+                if (cpu_shootdown_seen_comm[id][0]) {
+                    sd_note(" comm='");
+                    sd_note(cpu_shootdown_seen_comm[id]);
+                    sd_note("'");
+                }
+                sd_note("\n");
+
+                sd_note("[TLB]     interrupted mode=");
+                if ((cs & 3) == 3) {
+                    sd_note("USER");
+                } else if (cs != 0) {
+                    sd_note("KERNEL");
+                } else {
+                    sd_note("UNKNOWN");
+                }
+                sd_note(" rip=");
+                sd_hex(rip);
+                sd_note(" cs=");
+                sd_hex(cs);
+                sd_note(" rflags=");
+                sd_hex(rflags);
+                sd_note(" rsp=");
+                sd_hex(rsp);
+                sd_note("\n");
+
+                if ((cs & 3) == 0 && rip != 0) {
+                    bool has_stack = false;
+                    for (int k = 0; k < 4; k++) {
+                        if (cpu_shootdown_kernel_stack[id][k]) {
+                            has_stack = true;
+                            break;
+                        }
+                    }
+                    if (has_stack) {
+                        sd_note("[TLB]     stack:");
+                        for (int k = 0; k < 4; k++) {
+                            if (cpu_shootdown_kernel_stack[id][k]) {
+                                sd_note(" ");
+                                sd_hex(cpu_shootdown_kernel_stack[id][k]);
+                            }
+                        }
+                        sd_note("\n");
+                    }
+                }
+
+                uint64_t w_lock = 0, w_ip = 0, w_since = 0;
+                if (lockdiag_get_spin_wait(id, &w_lock, &w_ip, &w_since)) {
+                    sd_note("[TLB]     WAITING-ON lock=");
+                    sd_hex(w_lock);
+                    sd_note(" at=");
+                    sd_hex(w_ip);
+                    if (w_since && mhz && rdtsc() > w_since) {
+                        sd_note(" for=");
+                        sd_dec((rdtsc() - w_since) / (mhz * 1000ULL));
+                        sd_note("ms");
+                    }
+                    sd_note("\n");
+                }
+
+                for (int s = 0; s < LOCKDIAG_SPOT_COUNT; s++) {
+                    lockdiag_spot_t *sp = lockdiag_spot(s);
+                    if (sp && sp->depth && sp->owner_cpu == id) {
+                        sd_note("[TLB]     HOLDS ");
+                        sd_note(lockdiag_spot_name(s));
+                        sd_note(" taken_at=");
+                        sd_hex(sp->taken_ip);
+                        sd_note("\n");
+                    }
+                }
+            }
+            }
         }
     }
 
@@ -745,6 +1186,12 @@ void tlb_shootdown_page_for(uint64_t addr, uint64_t pml4) {
      * do not know which PCID owns the stale entries: pcid_for_pml4() returns
      * PCID_KERNEL and every target behaves conservatively. */
     do_shootdown(addr, pcid_for_pml4(pml4), pml4 & CR3_ADDR_MASK,
+                 (uint64_t)__builtin_return_address(0));
+}
+
+void tlb_shootdown_context_for(uint64_t pml4) {
+    do_shootdown(TLB_SHOOTDOWN_CONTEXT, pcid_for_pml4(pml4),
+                 pml4 & CR3_ADDR_MASK,
                  (uint64_t)__builtin_return_address(0));
 }
 

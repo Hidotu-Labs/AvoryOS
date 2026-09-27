@@ -73,17 +73,14 @@ static int unix_shutdown(socket_t *sock, int how) {
 
   switch (how) {
   case SHUT_RD:
-    klog_puts("[OK] unix_shutdown: SHUT_RD\n");
     usk->read_shutdown = true;
     break;
 
   case SHUT_WR:
-    klog_puts("[OK] unix_shutdown: SHUT_WR\n");
     usk->write_shutdown = true;
     break;
 
   case SHUT_RDWR:
-    klog_puts("[OK] unix_shutdown: SHUT_RDWR\n");
     usk->read_shutdown  = true;
     usk->write_shutdown = true;
     break;
@@ -123,6 +120,10 @@ static int unix_poll(socket_t *sock, int events) {
     size_t size      = usk->recv_buf_size;
     size_t available = (size > 0) ? (tail - head + size) % size : 0;
     has_data = (available > 0);
+    // Zero-payload SCM_RIGHTS still makes recvmsg readable.
+    if (!has_data && usk->scm_queue_head != NULL &&
+        usk->bytes_read >= usk->scm_queue_head->stream_offset)
+      has_data = true;
   }
   spinlock_release(&usk->recv_lock);
 
@@ -349,7 +350,7 @@ void unix_destroy(socket_t *sock) {
     unix_sock_t *peer = usk->peer;
     socket_t *peer_parent = peer->parent;
 
-    if (peer_parent) {
+    if (peer_parent && socket_try_get(peer_parent)) {
       spinlock_acquire(&peer_parent->lock);
       if (peer->peer == usk)
         peer->peer = NULL;
@@ -360,9 +361,12 @@ void unix_destroy(socket_t *sock) {
         wait_queue_wake_all((wait_queue_t *)peer_parent->wait_queue);
       if (peer_parent->node)
         epoll_notify_event(peer_parent->node, EPOLLIN | EPOLLHUP | EPOLLRDHUP);
+      if (peer->wait)
+        wait_queue_wake_all(peer->wait);
+
+      socket_put(peer_parent);
     }
 
-    wait_queue_wake_all(peer->wait);
     usk->peer = NULL;
   }
 

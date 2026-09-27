@@ -144,12 +144,13 @@ static void tmpfs_destroy_node(vfs_node_t *node) {
         kfree(f);
     } else if (type == FS_DIRECTORY) {
         tmpfs_dir_t *d = (tmpfs_dir_t *)node->device;
-        tmpfs_child_t *c = d->children;
+        tmpfs_child_t *c = d->di.children;
         while (c) {
             tmpfs_child_t *next = c->next;
             kfree(c);
             c = next;
         }
+        vfs_dirindex_destroy(&d->di); /* bucket array; wrappers freed above */
         kfree(d);
     } else if (type == FS_SYMLINK) {
         kfree(node->device);
@@ -547,54 +548,63 @@ static struct dirent *tmpfs_readdir(vfs_node_t *node, uint32_t index) {
 
     /* getdents walks indices in sequence.  Resuming from the per-directory
      * cursor makes each step O(1); anything else (random access, two readers
-     * interleaving) safely falls back to a scan from the head. */
-    tmpfs_child_t *cursor = dir->cursor;
-    uint32_t cursor_index = dir->cursor_index;
+     * interleaving) safely falls back to a scan from the head.  The walk and
+     * the dirent fill run under the index lock: entries behind the cursor
+     * can be unlinked (wrappers freed) at any moment. */
+    vfs_dirindex_lock(&dir->di);
+    tmpfs_child_t *cursor = dir->di.cursor;
+    uint32_t cursor_index = dir->di.cursor_index;
     tmpfs_child_t *curr;
     if (cursor && index == cursor_index + 1) {
         curr = cursor->next;
     } else {
-        curr = dir->children;
+        curr = dir->di.children;
         for (uint32_t i = 0; i < index && curr; i++)
             curr = curr->next;
     }
-    dir->cursor = curr;
-    dir->cursor_index = index;
+    dir->di.cursor = curr;
+    dir->di.cursor_index = index;
 
     if (curr) {
         strncpy(d.name, curr->node->name, 127);
         d.name[127] = '\0';
         d.ino = curr->node->inode;
         d.d_type = vfs_dtype(curr->node->flags);
+    }
+    vfs_dirindex_unlock(&dir->di);
+
+    if (curr)
         return &d;
-    }
     return NULL;
 }
 
-static vfs_node_t *tmpfs_finddir(vfs_node_t *node, char *name) {
-    if (!node || !node->device)
-        return NULL;
-    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
-        return node;
+/* Name lookup is the shared dirindex implementation (dirindex.h): "." and
+ * ".." resolve to the node itself, a found child is returned bare - both
+ * exactly as the old list-walk did. */
 
-    tmpfs_dir_t   *dir  = (tmpfs_dir_t *)node->device;
-    tmpfs_child_t *curr = dir->children;
-    while (curr) {
-        if (strcmp(curr->node->name, name) == 0)
-            return curr->node;
-        curr = curr->next;
-    }
-    return NULL;
-}
-
-static void tmpfs_add_child(vfs_node_t *parent, vfs_node_t *child) {
-    tmpfs_dir_t   *dir = (tmpfs_dir_t *)parent->device;
+static bool tmpfs_add_child(vfs_node_t *parent, vfs_node_t *child) {
     tmpfs_child_t *cn  = kmalloc(sizeof(tmpfs_child_t));
     if (!cn)
-        return;
-    cn->node      = child;
-    cn->next      = dir->children;
-    dir->children = cn;
+        return false;
+    cn->node = child;
+    if (!vfs_dirindex_insert(&((tmpfs_dir_t *)parent->device)->di, cn)) {
+        kfree(cn);
+        return false;
+    }
+    return true;
+}
+
+/* Creation failed after the node was built: release payload + node and put
+ * back the inode quota.  `sb` is passed explicitly because tmpfs_sb_from_node()
+ * cannot see it for every node type (mknod devices report NULL).  destroy is
+ * invoked only when the node carries one - mknod nodes deliberately do not,
+ * since their device payload belongs to the driver. */
+static void tmpfs_discard_node(vfs_node_t *n, tmpfs_sb_t *sb) {
+    if (n->destroy)
+        n->destroy(n);
+    kfree(n);
+    if (sb)
+        tmpfs_free_inode(sb);
 }
 
 static int tmpfs_chmod(vfs_node_t *node, uint16_t permission) {
@@ -683,13 +693,11 @@ static vfs_node_t *tmpfs_make_node(tmpfs_sb_t *sb, const char *name,
             tmpfs_free_inode(sb);
             return NULL;
         }
-        d->children = NULL;
-        d->cursor   = NULL;
-        d->cursor_index = 0;
+        vfs_dirindex_init(&d->di);
         d->sb       = sb;
         n->device   = d;
         n->readdir  = tmpfs_readdir;
-        n->finddir  = tmpfs_finddir;
+        n->finddir  = vfs_dirindex_finddir_ref;
     }
 
     return n;
@@ -698,7 +706,7 @@ static vfs_node_t *tmpfs_make_node(tmpfs_sb_t *sb, const char *name,
 static int tmpfs_create(vfs_node_t *node, char *name, uint16_t permission) {
     if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
         return -1;
-    if (tmpfs_finddir(node, name))
+    if (vfs_dirindex_finddir(node, name))
         return -1;
 
     tmpfs_sb_t *sb    = ((tmpfs_dir_t *)node->device)->sb;
@@ -706,14 +714,17 @@ static int tmpfs_create(vfs_node_t *node, char *name, uint16_t permission) {
     if (!child)
         return -1;
 
-    tmpfs_add_child(node, child);
+    if (!tmpfs_add_child(node, child)) {
+        tmpfs_discard_node(child, sb);
+        return -1;
+    }
     return 0;
 }
 
 static int tmpfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
     if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
         return -1;
-    if (tmpfs_finddir(node, name))
+    if (vfs_dirindex_finddir(node, name))
         return -1;
 
     tmpfs_sb_t *sb    = ((tmpfs_dir_t *)node->device)->sb;
@@ -722,14 +733,17 @@ static int tmpfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
         return -1;
 
     tmpfs_wire_dir_ops(child);
-    tmpfs_add_child(node, child);
+    if (!tmpfs_add_child(node, child)) {
+        tmpfs_discard_node(child, sb);
+        return -1;
+    }
     return 0;
 }
 
 static int tmpfs_symlink(vfs_node_t *node, char *name, char *target) {
     if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
         return -1;
-    if (tmpfs_finddir(node, name))
+    if (vfs_dirindex_finddir(node, name))
         return -1;
 
     tmpfs_sb_t *sb  = ((tmpfs_dir_t *)node->device)->sb;
@@ -765,8 +779,15 @@ static int tmpfs_symlink(vfs_node_t *node, char *name, char *target) {
     sl->sb          = sb;
     child->device   = sl;
     child->length   = (uint32_t)strlen(sl->target);
+    /* Let the standard teardown release the target buffer.  Without this the
+     * last close of an unlinked symlink freed the node but leaked sl - and a
+     * failed insert would leak it immediately. */
+    child->destroy  = tmpfs_destroy_node;
 
-    tmpfs_add_child(node, child);
+    if (!tmpfs_add_child(node, child)) {
+        tmpfs_discard_node(child, sb);
+        return -1;
+    }
     return 0;
 }
 
@@ -785,7 +806,7 @@ static int tmpfs_mknod(vfs_node_t *node, char *name, uint16_t permission,
                         uint32_t flags, void *device) {
     if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
         return -1;
-    if (tmpfs_finddir(node, name))
+    if (vfs_dirindex_finddir(node, name))
         return -1;
 
     tmpfs_sb_t *sb  = ((tmpfs_dir_t *)node->device)->sb;
@@ -810,7 +831,13 @@ static int tmpfs_mknod(vfs_node_t *node, char *name, uint16_t permission,
     child->chown     = tmpfs_chown;
     child->statfs    = tmpfs_statfs;
 
-    tmpfs_add_child(node, child);
+    if (!tmpfs_add_child(node, child)) {
+        /* No destroy on mknod nodes: device is the caller's payload.
+         * The inode quota is put back explicitly. */
+        kfree(child);
+        tmpfs_free_inode(sb);
+        return -1;
+    }
     return 0;
 }
 
@@ -818,93 +845,97 @@ static int tmpfs_unlink(vfs_node_t *node, char *name) {
     if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY || !node->device)
         return -1;
 
-    tmpfs_dir_t   *dir  = (tmpfs_dir_t *)node->device;
-    tmpfs_child_t *prev = NULL;
-    tmpfs_child_t *curr = dir->children;
+    tmpfs_dir_t *dir = (tmpfs_dir_t *)node->device;
 
-    while (curr) {
-        if (strcmp(curr->node->name, name) == 0) {
-            uint32_t type = curr->node->flags & FS_TYPE_MASK;
-            if (type == FS_DIRECTORY)
-                return -1;
-
-            if (prev)
-                prev->next = curr->next;
-            else
-                dir->children = curr->next;
-
-            tmpfs_sb_t *sb = tmpfs_sb_from_node(curr->node);
-            if (sb)
-                tmpfs_free_inode(sb);
-
-            /* The name is gone, but descriptors and mappings may still hold
-             * references: retire the node instead of kfree()ing it under
-             * them. */
-            vfs_node_retire(curr->node);
-            kfree(curr);
-            return 0;
-        }
-        prev = curr;
-        curr = curr->next;
+    vfs_dirindex_lock(&dir->di);
+    tmpfs_child_t *curr = vfs_dirindex_find_locked(&dir->di, name);
+    if (!curr) {
+        vfs_dirindex_unlock(&dir->di);
+        return -1;
     }
-    return -1;
+    uint32_t type = curr->node->flags & FS_TYPE_MASK;
+    if (type == FS_DIRECTORY) {
+        vfs_dirindex_unlock(&dir->di);
+        return -1;
+    }
+    vfs_dirindex_detach_locked(&dir->di, curr);
+    vfs_dirindex_unlock(&dir->di);
+
+    /* Past the lock: retire can run ->destroy (page teardown) and the
+     * wrapper free needs no exclusion once it is out of both views. */
+    tmpfs_sb_t *sb = tmpfs_sb_from_node(curr->node);
+    if (sb)
+        tmpfs_free_inode(sb);
+
+    /* The name is gone, but descriptors and mappings may still hold
+     * references: retire the node instead of kfree()ing it under
+     * them. */
+    vfs_node_retire(curr->node);
+    kfree(curr);
+    return 0;
 }
 
 static int tmpfs_rmdir(vfs_node_t *node, char *name) {
     if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY || !node->device)
         return -1;
 
-    tmpfs_dir_t   *dir  = (tmpfs_dir_t *)node->device;
-    tmpfs_child_t *prev = NULL;
-    tmpfs_child_t *curr = dir->children;
+    tmpfs_dir_t *dir = (tmpfs_dir_t *)node->device;
 
-    while (curr) {
-        if (strcmp(curr->node->name, name) == 0) {
-            if ((curr->node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
-                return -1;
-
-            tmpfs_dir_t *child_dir = (tmpfs_dir_t *)curr->node->device;
-            if (!child_dir || child_dir->children)
-                return -1;
-
-            if (prev)
-                prev->next = curr->next;
-            else
-                dir->children = curr->next;
-
-            tmpfs_sb_t *sb = child_dir->sb;
-            if (sb)
-                tmpfs_free_inode(sb);
-            /* Same deferred teardown as unlink: an open directory descriptor
-             * keeps the node (and its child list) alive. */
-            vfs_node_retire(curr->node);
-            kfree(curr);
-            return 0;
-        }
-        prev = curr;
-        curr = curr->next;
+    vfs_dirindex_lock(&dir->di);
+    tmpfs_child_t *curr = vfs_dirindex_find_locked(&dir->di, name);
+    if (!curr || (curr->node->flags & FS_TYPE_MASK) != FS_DIRECTORY ||
+        !curr->node->device) {
+        vfs_dirindex_unlock(&dir->di);
+        return -1;
     }
-    return -1;
+    /* Emptiness is the child's count; nesting child under parent (depth
+     * order, the only nesting here) makes the check atomic against a
+     * concurrent create inside the child. */
+    vfs_dirindex_t *child_di = vfs_dirindex_of(curr->node);
+    vfs_dirindex_lock(child_di);
+    bool empty = child_di->count == 0;
+    if (empty)
+        vfs_dirindex_detach_locked(&dir->di, curr);
+    vfs_dirindex_unlock(child_di);
+    vfs_dirindex_unlock(&dir->di);
+    if (!empty)
+        return -1;
+
+    tmpfs_sb_t *sb = tmpfs_sb_from_node(curr->node);
+    if (sb)
+        tmpfs_free_inode(sb);
+    /* Same deferred teardown as unlink: an open directory descriptor
+     * keeps the node (and its child list) alive. */
+    vfs_node_retire(curr->node);
+    kfree(curr);
+    return 0;
 }
 
 static int tmpfs_rename(vfs_node_t *node, char *old_name, char *new_name) {
     if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY || !node->device)
         return -1;
 
-    vfs_node_t *existing = tmpfs_finddir(node, new_name);
+    vfs_node_t *existing = vfs_dirindex_finddir(node, new_name);
     if (existing) {
         if ((existing->flags & FS_TYPE_MASK) == FS_DIRECTORY)
             return -1;
         tmpfs_unlink(node, new_name);
     }
 
-    vfs_node_t *child = tmpfs_finddir(node, old_name);
+    vfs_node_t *child = vfs_dirindex_finddir(node, old_name);
     if (!child)
         return -1;
 
-    strncpy(child->name, new_name, 127);
-    child->name[127] = '\0';
-    return 0;
+    /* Re-key the entry in the hash under the same lock as the lookup, so a
+     * concurrent find cannot see the node under its old bucket and name at
+     * once. */
+    tmpfs_dir_t *dir = (tmpfs_dir_t *)node->device;
+    vfs_dirindex_lock(&dir->di);
+    tmpfs_child_t *entry = vfs_dirindex_find_locked(&dir->di, old_name);
+    if (entry)
+        vfs_dirindex_rename_locked(&dir->di, entry, new_name);
+    vfs_dirindex_unlock(&dir->di);
+    return entry ? 0 : -1;
 }
 
 vfs_node_t *tmpfs_create_root(tmpfs_sb_t *sb) {
@@ -964,7 +995,7 @@ void tmpfs_mount_at_sized(const char *path, uint64_t max_bytes,
     strncpy(root->name, name, 127);
     root->name[127] = '\0';
 
-    vfs_mount_ex(mountpoint, root, "tmpfs", "tmpfs");
+    vfs_mount_ex(mountpoint, root, "tmpfs", "tmpfs", path);
 
     klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " tmpfs mounted at ");
     klog_puts(path);

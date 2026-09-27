@@ -8,7 +8,13 @@
 #include "../sched/sched.h"
 #include "syscall.h"
 #include "arch/uaccess.h"
+#include "../console/klog.h"
 #include <stdint.h>
+
+// LinuxKPI's native preemption pin keeps this per-CPU deferred TLB queue
+// drain on the CPU that recorded it while interrupts are enabled.
+extern void __kpi_preempt_disable(void);
+extern void __kpi_preempt_enable(void);
 
 // Linux mmap constants
 #define PROT_NONE 0x0
@@ -21,6 +27,9 @@
 #define MAP_FIXED 0x10
 #define MAP_ANONYMOUS 0x20
 #define MAP_HUGETLB 0x40000         /* Linux user-space: request huge pages */
+/* Linux user-space: pthread stack hint. Stored verbatim in vma.flags (see
+ * vma.h); used here only to trace stack-size intent. */
+#define MAP_STACK 0x20000
 /* Kernel-internal MAP_HUGEPAGE — must match vma.h */
 #define MAP_HUGEPAGE 0x200000000ULL /* enable 2MB demand paging for this VMA */
 
@@ -31,6 +40,26 @@
 #define E_NOMEM ((uint64_t)-12)
 #define E_BADF ((uint64_t)-9)
 
+// Stack-intent tracing for the mocktail guard investigation: log what
+// userspace actually requests for pthread stacks (MAP_STACK) and guards
+// (mprotect PROT_NONE). Rate-limited; allocation-free.
+#define MM_STACK_LOG_CAP 48
+static volatile uint64_t mm_stack_mmap_logs;
+static volatile uint64_t mm_guard_mprotect_logs;
+
+static void mm_log_stack_mmap(uint64_t vaddr, uint64_t len, uint64_t prot) {
+  if (__atomic_add_fetch(&mm_stack_mmap_logs, 1, __ATOMIC_RELAXED) >
+      MM_STACK_LOG_CAP)
+    return;
+  klog_puts("[MM] MAP_STACK mmap len=");
+  klog_uint64(len);
+  klog_puts(" -> ");
+  klog_hex64(vaddr);
+  klog_puts(" prot=");
+  klog_hex64(prot);
+  klog_puts("\n");
+}
+
 // Helpers
 
 #define PAGE_ALIGN_UP(x) (((x) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
@@ -40,7 +69,6 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 // User-space pointer validation: reject anything above canonical user range.
-#define USER_ADDR_MAX 0x00007FFFFFFFFFFFULL
 static inline bool is_user_pointer(uint64_t addr) {
   return addr <= USER_ADDR_MAX;
 }
@@ -48,7 +76,7 @@ static inline bool is_user_pointer(uint64_t addr) {
 static uint64_t build_page_flags(uint64_t prot) {
   // PROT_NONE → no flags at all (page must stay non-present).
   // On x86-64 there is no "read disable" bit; PRESENT alone grants reads.
-  if (prot == PROT_NONE)
+  if ((prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) == PROT_NONE)
     return 0;
 
   uint64_t flags = PAGE_FLAG_PRESENT | PAGE_FLAG_USER;
@@ -71,13 +99,20 @@ static void safe_unmap_and_free(uint64_t *pml4, uint64_t va, uint64_t phys,
   // Step 1: remove the PTE.  After this the frame is unreachable via this VA.
   vmm_unmap_page(pml4, va);
 
-  /* Step 2: only now is it safe to recycle the frame - and only if removing
-   * the PTE actually succeeded.  vmm_unmap_page() silently declines anything
-   * under a 1 GB leaf, and freeing a frame that is still mapped hands live
-   * memory to the next allocation. */
+  /* Step 2: wait for every CPU that could have cached the old translation
+   * before recycling the frame.  vmm_unmap_page() queues its shootdown while
+   * interrupts are masked; its lock-release drain can therefore do only the
+   * local invalidation and leave remote acknowledgements pending.  In that
+   * case keep the frame allocated.  Leaking it is safer than letting another
+   * CPU continue writing through a stale TLB entry after the PMM reuses it. */
+  bool shootdown_complete = tlb_flush_deferred_drain();
   if (free_phys && phys != 0) {
-    if (vmm_virt_to_phys(pml4, va) == 0)
-      pmm_free((void *)phys);
+    if (vmm_virt_to_phys(pml4, va) == 0) {
+      if (shootdown_complete)
+        pmm_free((void *)phys);
+      else
+        vmm_defer_frame_free((void *)phys, 1);
+    }
   }
 }
 
@@ -227,8 +262,6 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
   /* Kernel-internal VMA bits are never accepted from user space. */
   flags &= ~MAP_PAGECACHE;
 
-  bool is_shared = (map_type == MAP_SHARED || map_type == 0x03);
-  bool is_private = (map_type == MAP_PRIVATE);
   if (length == 0) {
     return E_INVAL;
   }
@@ -250,26 +283,47 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
     }
     vaddr = addr;
 
-    // Tear down any existing mappings in the target range.  teardown_range()
-    // does its own short-lived mm->lock for the VMA lookups it needs; taking
-    // the lock here as well would keep it held across every per-page TLB
-    // shootdown in the range.
-    teardown_range(pml4, current_thread, vaddr, aligned_len, false,
-                   "MAP_FIXED teardown");
     if (current_thread && current_thread->mm) {
       spinlock_acquire(&current_thread->mm->lock);
+      /* Serialize the PTE teardown with demand faults and remove the old VMA
+       * before dropping mm->lock.  TLB waits are deferred while this lock
+       * masks interrupts, then drained below after faults can run again. */
+      teardown_range(pml4, current_thread, vaddr, aligned_len, true,
+                     "MAP_FIXED teardown");
       vma_remove(&current_thread->mm->vmas, vaddr, vaddr + aligned_len);
+      /* Keep non-fixed mmap reservations above this range while a
+       * file-backed MAP_FIXED operation finishes outside mm->lock. */
+      if (vaddr < MMAP_REGION_LIMIT &&
+          vaddr + aligned_len > MMAP_REGION_BASE) {
+        uint64_t reservation_end = vaddr + aligned_len;
+        if (reservation_end > MMAP_REGION_LIMIT)
+          reservation_end = MMAP_REGION_LIMIT;
+        current_thread->mm->mmap_next_addr =
+            MAX(current_thread->mm->mmap_next_addr,
+                reservation_end);
+      }
       spinlock_release(&current_thread->mm->lock);
+      vmm_drain_deferred_work();
+    } else {
+      teardown_range(pml4, current_thread, vaddr, aligned_len, false,
+                     "MAP_FIXED teardown");
     }
   } else {
     // Non-fixed: allocate dynamically utilizing AVL Interval Gap Finding
     if (current_thread && current_thread->mm) {
       spinlock_acquire(&current_thread->mm->lock);
 
+      /* Non-fixed mappings are reserved by advancing mmap_next_addr while
+       * holding mm->lock.  File-backed mmap handlers run after that lock is
+       * dropped, before their VMA is installed; searching below the high-water
+       * mark could hand the same gap to another thread during that window. */
+      uint64_t search_base = MAX(MMAP_REGION_BASE,
+                                 current_thread->mm->mmap_next_addr);
+
       // Try addr as a hint if provided and aligned
       if (addr != 0 && (addr & (PAGE_SIZE - 1)) == 0 &&
           is_user_pointer(addr) && is_user_pointer(addr + aligned_len - 1) &&
-          addr >= MMAP_REGION_BASE && addr + aligned_len <= MMAP_REGION_LIMIT) {
+          addr >= search_base && addr + aligned_len <= MMAP_REGION_LIMIT) {
         if (!vma_find_overlap(&current_thread->mm->vmas, addr, addr + aligned_len)) {
           vaddr = addr;
         }
@@ -277,19 +331,11 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
 
       if (vaddr == 0) {
         vaddr = vma_find_gap(&current_thread->mm->vmas, aligned_len,
-                             MMAP_REGION_BASE, MMAP_REGION_LIMIT);
+                             search_base, MMAP_REGION_LIMIT);
       }
 
-      if (vaddr == 0) {
-        vaddr = mm_alloc_mmap_region(aligned_len);
-      }
-
-      if (vaddr == 0 || vaddr + aligned_len > MMAP_REGION_LIMIT) {
-        spinlock_release(&current_thread->mm->lock);
-        return E_NOMEM;
-      }
-
-      if (flags & MAP_ANONYMOUS) {
+      if (vaddr && vaddr + aligned_len <= MMAP_REGION_LIMIT &&
+          (flags & MAP_ANONYMOUS)) {
         uint64_t vma_flags = flags;
         if (flags & MAP_HUGETLB)
           vma_flags |= MAP_HUGEPAGE;
@@ -302,9 +348,18 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
         current_thread->mm->mmap_next_addr =
             MAX(current_thread->mm->mmap_next_addr, vaddr + aligned_len);
         spinlock_release(&current_thread->mm->lock);
+        if (flags & MAP_STACK)
+          mm_log_stack_mmap(vaddr, aligned_len, prot);
         return vaddr;
       }
 
+      if (!vaddr || vaddr + aligned_len > MMAP_REGION_LIMIT)
+        vaddr = 0;
+      else
+        /* Reserve file-backed ranges before releasing mm->lock.  A failed
+         * mmap may leave a harmless hole in this monotonic allocation cursor. */
+        current_thread->mm->mmap_next_addr =
+            MAX(current_thread->mm->mmap_next_addr, vaddr + aligned_len);
       spinlock_release(&current_thread->mm->lock);
     }
 
@@ -425,12 +480,15 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
     spinlock_release(&current_thread->mm->lock);
   }
 
+  if (flags & MAP_STACK)
+    mm_log_stack_mmap(vaddr, aligned_len, prot);
   return vaddr;
 }
 
 // sys_munmap
 // Linux ABI: munmap(addr, length)
 //   rdi=addr  rsi=length
+#define MUNMAP_BATCH_PAGES 32
 uint64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t a2, uint64_t a3,
                     uint64_t a4, uint64_t a5) {
   (void)a2;
@@ -456,20 +514,37 @@ uint64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t a2, uint64_t a3,
 
   uint64_t aligned_len = PAGE_ALIGN_UP(length);
   uint64_t *pml4 = vmm_get_active_pml4();
+  uint64_t end = addr + aligned_len;
 
-  // Unmap and free.  teardown_range() takes mm->lock itself, for as long as it
-  // needs to read the VMA tree: a second thread's mmap()/mprotect() can free
-  // the very node it is reading.  It must not be called with that lock held,
-  // because every unmap in the range issues a TLB shootdown and waits for the
-  // other CPUs, and a CPU faulting into this address space is waiting on the
-  // same lock with interrupts masked.
-  teardown_range(pml4, current, addr, aligned_len, false, "sys_munmap");
-
-  // Remove VMAs
   spinlock_acquire(&current->mm->lock);
-  vma_remove(&current->mm->vmas, addr, addr + aligned_len);
+  /* Reserve the range as inaccessible before dropping mm->lock.  That stops
+   * page faults from reinstalling PTEs and keeps mmap's gap search from reusing
+   * the address while teardown runs in bounded batches. */
+  vma_mprotect(&current->mm->vmas, addr, end, PROT_NONE);
+  spinlock_release(&current->mm->lock);
+
+  uint64_t batch_bytes = (uint64_t)MUNMAP_BATCH_PAGES * PAGE_SIZE;
+  for (uint64_t batch_start = addr; batch_start < end;) {
+    uint64_t batch_end = batch_start + batch_bytes;
+    if (batch_end < batch_start || batch_end > end)
+      batch_end = end;
+
+    spinlock_acquire(&current->mm->lock);
+    teardown_range(pml4, current, batch_start, batch_end - batch_start, true,
+                   "sys_munmap");
+    spinlock_release(&current->mm->lock);
+    /* The per-CPU deferred queues are deliberately bounded.  Drain before
+     * starting another batch so no page frames are stranded on overflow and
+     * remote CPUs can acknowledge between short mm critical sections. */
+    vmm_drain_deferred_work();
+    batch_start = batch_end;
+  }
+
+  spinlock_acquire(&current->mm->lock);
+  vma_remove(&current->mm->vmas, addr, end);
   vma_merge_adjacent(&current->mm->vmas);
   spinlock_release(&current->mm->lock);
+  vmm_drain_deferred_work();
 
   return 0;
 }
@@ -547,8 +622,9 @@ static uint64_t sys_brk(uint64_t addr, uint64_t a1, uint64_t a2, uint64_t a3,
   return ret;
 }
 
-// sys_mprotect  (unchanged from original — included for completeness)
+// sys_mprotect
 // Linux ABI: mprotect(addr, len, prot)
+#define MPROTECT_BATCH_PAGES 64
 static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
                              uint64_t a3, uint64_t a4, uint64_t a5) {
   (void)a3;
@@ -561,7 +637,8 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
     return 0;
 
   uint64_t aligned_len = PAGE_ALIGN_UP(len);
-  if (!is_user_pointer(addr) || !is_user_pointer(addr + aligned_len - 1))
+  if (addr + aligned_len < addr || !is_user_pointer(addr) ||
+      !is_user_pointer(addr + aligned_len - 1))
     return E_NOMEM;
 
   uint64_t *pml4 = vmm_get_active_pml4();
@@ -570,42 +647,83 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
   if (!current || !current->mm)
     return E_INVAL;
 
-  spinlock_acquire(&current->mm->lock);
-
-  for (uint64_t va = addr; va < addr + aligned_len; va += PAGE_SIZE) {
-    uint64_t phys = vmm_virt_to_phys(pml4, va);
-    if (phys == 0)
-      continue;
-
-    uint64_t new_flags = build_page_flags(prot);
-    if (prot == PROT_NONE) {
-      // Keep the PTE present so teardown_range / vmm_virt_to_phys can still
-      // find this physical frame at munmap time. Without a present PTE the
-      // frame becomes unreachable and is never freed (3200 kB leak).
-      // Omitting PAGE_FLAG_USER means any ring-3 access will #PF, which is
-      // the correct PROT_NONE semantics on x86-64.
-      new_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_NX;
-    } else if (prot & PROT_WRITE) {
-      struct vma *v = vma_find(&current->mm->vmas, va);
-      if (PAGE_ALIGN_DOWN(phys) == pmm_get_zero_page_phys() ||
-          (v && (v->flags & MAP_PRIVATE) && v->file_node != NULL)) {
-        // Shared page cache frame or zero page made writable:
-        // Must stay read-only and marked COW so subsequent writes allocate a private frame.
-        new_flags = (new_flags & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
-      }
-    }
-    if (!vmm_map_page(pml4, va, PAGE_ALIGN_DOWN(phys), new_flags)) {
-      spinlock_release(&current->mm->lock);
-      return E_NOMEM;
-    }
+  if (prot == PROT_NONE &&
+      __atomic_add_fetch(&mm_guard_mprotect_logs, 1, __ATOMIC_RELAXED) <=
+          MM_STACK_LOG_CAP) {
+    klog_puts("[MM] mprotect PROT_NONE addr=");
+    klog_hex64(addr);
+    klog_puts(" len=");
+    klog_uint64(aligned_len);
+    klog_puts("\n");
   }
 
-  // Synchronize the VMA tree so that syscall validation
-  // (vmm_is_user_addr_range_valid) sees the updated protection bits.
-  vma_mprotect(&current->mm->vmas, addr, addr + aligned_len, prot);
-  vma_merge_adjacent(&current->mm->vmas);
+  uint64_t end = addr + aligned_len;
+  for (uint64_t batch_start = addr; batch_start < end;) {
+    uint64_t batch_end = batch_start +
+        (uint64_t)MPROTECT_BATCH_PAGES * PAGE_SIZE;
+    if (batch_end < batch_start || batch_end > end)
+      batch_end = end;
 
-  spinlock_release(&current->mm->lock);
+    spinlock_acquire(&current->mm->lock);
+    vmm_lock_acquire();
+    bool ok = true;
+    bool touched = false;
+
+    for (uint64_t va = batch_start; va < batch_end; va += PAGE_SIZE) {
+      uint64_t phys = vmm_virt_to_phys(pml4, va);
+      if (phys == 0)
+        continue;
+
+      uint64_t new_flags = build_page_flags(prot);
+      if (prot == PROT_NONE) {
+        // Keep the PTE present so teardown_range / vmm_virt_to_phys can still
+        // find this physical frame at munmap time. Omitting PAGE_FLAG_USER
+        // gives ring 3 the expected protection fault.
+        new_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_NX;
+      } else if (prot & PROT_WRITE) {
+        struct vma *v = vma_find(&current->mm->vmas, va);
+        if (PAGE_ALIGN_DOWN(phys) == pmm_get_zero_page_phys() ||
+            (v && (v->flags & MAP_PRIVATE) && v->file_node != NULL)) {
+          // Shared page-cache and zero-page frames stay read-only until COW.
+          new_flags = (new_flags & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
+        }
+      }
+      bool changed = false;
+      if (!vmm_map_page_locked(pml4, va, PAGE_ALIGN_DOWN(phys), new_flags,
+                               &changed)) {
+        ok = false;
+        break;
+      }
+      touched |= changed;
+    }
+
+    if (ok) {
+      // Publish each bounded range's VMA permissions while the same mm lock
+      // still excludes concurrent faults and mapping changes.
+      vma_mprotect(&current->mm->vmas, batch_start, batch_end, prot);
+      vma_merge_adjacent(&current->mm->vmas);
+    }
+
+    // Deferred requests live in a per-CPU queue. Pin this thread across the
+    // unlock-to-drain window so a timer tick cannot migrate it and strand the
+    // queue on the CPU that performed the page-table writes.
+    __kpi_preempt_disable();
+    if (touched)
+      tlb_flush_deferred_context((uint64_t)pml4);
+    vmm_lock_release();
+    spinlock_release(&current->mm->lock);
+
+    // The VMM lock's automatic drain sees IF=0 while mm->lock is held and
+    // deliberately defers remote waits. Drain now that peers can take IPIs;
+    // one address-space flush covers the whole batch's changed PTEs.
+    if (touched)
+      (void)tlb_flush_deferred_drain();
+    __kpi_preempt_enable();
+    if (!ok)
+      return E_NOMEM;
+
+    batch_start = batch_end;
+  }
 
   return 0;
 }
@@ -948,8 +1066,13 @@ static uint64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice,
     spinlock_release(&current->mm->lock);
     teardown_range(pml4, current, addr, aligned_len, false,
                    "madvise DONTNEED");
-    /* Belt-and-braces flush, also outside the lock. */
-    tlb_shootdown_all();
+    /* No global flush here.  Every unmap inside teardown_range() clears its
+     * PTE and drains a targeted, ack-waited shootdown at vmm_lock_release()
+     * BEFORE the frame returns to the PMM - that deferred queue is the whole
+     * point of tlb_flush_deferred().  munmap() and brk-shrink have never had
+     * an extra broadcast; this belt-and-braces tlb_shootdown_all() was a
+     * second all-CPU IPI round-trip plus a kernel-TLB flush on every CPU on
+     * each madvise() call (~half of the measured 9.7us for one 4 KB page). */
     return 0;
   }
 

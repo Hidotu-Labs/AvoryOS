@@ -17,6 +17,7 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "syscalls/syscall.h"
+#include <stdbool.h>
 #include <stddef.h>
 
 // External Trampoline Symbols
@@ -74,6 +75,12 @@ static inline uint64_t rdmsr(uint32_t msr) {
   return ((uint64_t)hi << 32) | lo;
 }
 
+/* Before every CPU has installed its own GS base, cpu_get_current() must use
+ * RDMSR. This is one global fast-path gate, so it is enabled only after AP
+ * startup finishes; setting it in cpu_set_gs_base() would let the BSP's flag
+ * make a later-starting AP dereference its still-uninitialized GS base. */
+static volatile bool cpu_gs_installed;
+
 // Set GS base for the current CPU
 static void cpu_set_gs_base(struct cpu_info *info) {
   wrmsr(MSR_GS_BASE, (uint64_t)info);
@@ -95,7 +102,19 @@ static uint64_t alloc_cpu_stack(void) {
 
 // Public API
 
+/* GS base points at this CPU's cpu_info and cpu_info.self (offset 0) points
+ * back at itself, so the current CPU struct is one segment-relative load
+ * away.  The old rdmsr(MSR_GS_BASE) is a VM exit under KVM (see the matching
+ * note in fs/page_cache.c) and this runs on every syscall via
+ * sched_get_current() plus every kmalloc/kfree.  Until cpu_set_gs_base() has
+ * installed a self-pointing base we must return the raw MSR value exactly as
+ * before - see cpu_gs_installed above. */
 struct cpu_info *cpu_get_current(void) {
+  if (__atomic_load_n(&cpu_gs_installed, __ATOMIC_ACQUIRE)) {
+    struct cpu_info *info;
+    __asm__ volatile("movq %%gs:0, %0" : "=r"(info));
+    return info;
+  }
   return (struct cpu_info *)rdmsr(MSR_GS_BASE);
 }
 
@@ -166,7 +185,7 @@ void ap_main(void) {
   hal_irq_enable();
 
   // Mark as online to unblock the BSP's boot loop
-  current->status = CPU_STATUS_ONLINE;
+  __atomic_store_n(&current->status, CPU_STATUS_ONLINE, __ATOMIC_RELEASE);
 
   klog_puts("     AP Woke up! CPU ");
   klog_uint64(current->cpu_id);
@@ -188,7 +207,15 @@ void ap_main(void) {
     /* rearm_if_earlier(), not arm_at(): a sleeping thread's deadline may have
      * been armed by sched_arm_next_deadline() on the way into this idle loop,
      * and a plain rearm here would push that wakeup out to a full second. */
-    lapic_timer_rearm_if_earlier(lapic_timer_get_ms() + 1000);
+    /* Deferred address-space teardown (execve / process reaper) drains here:
+     * this core would be halted anyway, so turning a dead process's page
+     * tables into free frames costs nothing.  While a backlog exists, tick at
+     * 1 ms (the same trick as the BSP's serial-pending idle tick) so the
+     * drain outruns producers; otherwise keep the 1 s tick for hang
+     * detection. */
+    vmm_defer_drain(VMM_DEFER_IDLE_NODES);
+    lapic_timer_rearm_if_earlier(lapic_timer_get_ms() +
+                                 (vmm_defer_pending() ? 1 : 1000));
     hal_cpu_halt();
   }
 }
@@ -501,4 +528,9 @@ void cpu_init_aps(void) {
       console_puts(" CPU(s).\n");
     }
   }
+
+  /* The BSP and every AP that successfully started have their own GS base.
+   * Keep using RDMSR during bootstrap, then publish the safe GS:0 fast path
+   * once no additional AP can still be running with the trampoline GS state. */
+  __atomic_store_n(&cpu_gs_installed, true, __ATOMIC_RELEASE);
 }

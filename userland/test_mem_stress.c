@@ -38,16 +38,29 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <sys/xattr.h>
+#include <sys/sem.h>
+#include <sys/ipc.h>
+
 #define DEBUGLOG(...) printf(__VA_ARGS__)
 
 #ifndef SYS_pidfd_open
 #define SYS_pidfd_open 434
+#endif
+#ifndef SYS_clone3
+#define SYS_clone3 435
 #endif
 #ifndef SYS_close_range
 #define SYS_close_range 436
 #endif
 #ifndef SYS_faccessat2
 #define SYS_faccessat2 439
+#endif
+#ifndef SYS_fchmodat2
+#define SYS_fchmodat2 452
+#endif
+#ifndef SYS_uptime
+#define SYS_uptime 399
 #endif
 
 #define NUM_ITERATIONS 100
@@ -1845,6 +1858,294 @@ void test_wait4_stress() {
   DEBUGLOG("WAIT4 stress test PASSED\n");
 }
 
+// ---- xattr stress ----
+void test_xattr_stress(void) {
+  DEBUGLOG("Starting XATTR stress test...\n");
+  char path[] = "/tmp/xattr_stress.tmp";
+  char sympath[] = "/tmp/xattr_symlink.tmp";
+  char listbuf[256];
+  char valbuf[64];
+
+  int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0666);
+  if (fd < 0) {
+    perror("xattr open");
+    return;
+  }
+  write(fd, "test", 4);
+  symlink(path, sympath);
+
+  for (int i = 0; i < NUM_ITERATIONS * 2; i++) {
+    // setxattr, lsetxattr, fsetxattr
+    setxattr(path, "user.stress", "val1", 4, 0);
+    fsetxattr(fd, "user.stress2", "val2", 4, 0);
+    lsetxattr(sympath, "user.stress3", "val3", 4, 0);
+
+    // getxattr, lgetxattr, fgetxattr
+    getxattr(path, "user.stress", valbuf, sizeof(valbuf));
+    fgetxattr(fd, "user.stress2", valbuf, sizeof(valbuf));
+    lgetxattr(sympath, "user.stress3", valbuf, sizeof(valbuf));
+
+    // listxattr, llistxattr, flistxattr
+    listxattr(path, listbuf, sizeof(listbuf));
+    flistxattr(fd, listbuf, sizeof(listbuf));
+    llistxattr(sympath, listbuf, sizeof(listbuf));
+
+    // removexattr, lremovexattr, fremovexattr
+    removexattr(path, "user.stress");
+    fremovexattr(fd, "user.stress2");
+    lremovexattr(sympath, "user.stress3");
+
+    if (i % 50 == 0)
+      DEBUGLOG("XATTR iteration %d complete\n", i);
+  }
+
+  close(fd);
+  unlink(sympath);
+  unlink(path);
+  DEBUGLOG("XATTR stress test PASSED\n");
+}
+
+// ---- sysv semaphores stress ----
+void test_sysv_sem_stress(void) {
+  DEBUGLOG("Starting SYSV SEMAPHORE stress test...\n");
+  for (int i = 0; i < NUM_ITERATIONS * 2; i++) {
+    int semid = semget(IPC_PRIVATE, 1, IPC_CREAT | 0600);
+    if (semid < 0) {
+      if (i == 0) DEBUGLOG("Skipping SYSV SEM (not implemented)\n");
+      break;
+    }
+
+    // semctl SETVAL
+    union semun {
+      int val;
+      struct semid_ds *buf;
+      unsigned short *array;
+    } arg;
+    arg.val = 1;
+    semctl(semid, 0, SETVAL, arg);
+
+    // semop (decrement, then increment)
+    struct sembuf sb_down = {0, -1, IPC_NOWAIT};
+    struct sembuf sb_up = {0, 1, 0};
+    semop(semid, &sb_down, 1);
+    semop(semid, &sb_up, 1);
+
+    // semtimedop (non-blocking 0 timeout)
+    struct timespec ts = {0, 0};
+    syscall(SYS_semtimedop, semid, &sb_down, 1, &ts);
+    syscall(SYS_semtimedop, semid, &sb_up, 1, &ts);
+
+    // semctl GETVAL
+    semctl(semid, 0, GETVAL, 0);
+
+    // semctl IPC_RMID
+    semctl(semid, 0, IPC_RMID, 0);
+
+    if (i % 50 == 0)
+      DEBUGLOG("SYSV SEM iteration %d complete\n", i);
+  }
+  DEBUGLOG("SYSV SEMAPHORE stress test PASSED\n");
+}
+
+// ---- splice / copy_file_range stress ----
+void test_splice_copy_range_stress(void) {
+  DEBUGLOG("Starting SPLICE / COPY_FILE_RANGE stress test...\n");
+  char in_path[] = "/tmp/cfr_in.tmp";
+  char out_path[] = "/tmp/cfr_out.tmp";
+  char splice_path[] = "/tmp/splice_out.tmp";
+
+  int pfd[2];
+  if (pipe(pfd) < 0) {
+    perror("splice pipe");
+    return;
+  }
+
+  for (int i = 0; i < NUM_ITERATIONS * 2; i++) {
+    // 1. Test splice: pipe -> file
+    write(pfd[1], "splice_data", 11);
+    int sfd = open(splice_path, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (sfd >= 0) {
+      loff_t off_out = 0;
+      splice(pfd[0], NULL, sfd, &off_out, 11, SPLICE_F_NONBLOCK);
+      close(sfd);
+      unlink(splice_path);
+    }
+
+    // 2. Test copy_file_range: file -> file
+    int ifd = open(in_path, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    int ofd = open(out_path, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (ifd >= 0 && ofd >= 0) {
+      write(ifd, "copy_file_range_data", 20);
+      loff_t off_in = 0;
+      loff_t off_out = 0;
+      copy_file_range(ifd, &off_in, ofd, &off_out, 20, 0);
+    }
+    if (ifd >= 0) { close(ifd); unlink(in_path); }
+    if (ofd >= 0) { close(ofd); unlink(out_path); }
+
+    if (i % 50 == 0)
+      DEBUGLOG("SPLICE/CFR iteration %d complete\n", i);
+  }
+
+  close(pfd[0]);
+  close(pfd[1]);
+  DEBUGLOG("SPLICE / COPY_FILE_RANGE stress test PASSED\n");
+}
+
+// ---- sendmmsg / recvmmsg stress ----
+void test_msg_vector_stress(void) {
+  DEBUGLOG("Starting SENDMMSG / RECVMMSG stress test...\n");
+  for (int i = 0; i < NUM_ITERATIONS * 2; i++) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0)
+      break;
+
+    char buf1[] = "hello";
+    char buf2[] = "world";
+    struct iovec iov[2];
+    iov[0].iov_base = buf1; iov[0].iov_len = sizeof(buf1);
+    iov[1].iov_base = buf2; iov[1].iov_len = sizeof(buf2);
+
+    struct mmsghdr msgs[2];
+    memset(msgs, 0, sizeof(msgs));
+    msgs[0].msg_hdr.msg_iov = &iov[0];
+    msgs[0].msg_hdr.msg_iovlen = 1;
+    msgs[1].msg_hdr.msg_iov = &iov[1];
+    msgs[1].msg_hdr.msg_iovlen = 1;
+
+    sendmmsg(sv[0], msgs, 2, 0);
+
+    char rbuf1[16];
+    char rbuf2[16];
+    struct iovec riov[2];
+    riov[0].iov_base = rbuf1; riov[0].iov_len = sizeof(rbuf1);
+    riov[1].iov_base = rbuf2; riov[1].iov_len = sizeof(rbuf2);
+
+    struct mmsghdr rmsgs[2];
+    memset(rmsgs, 0, sizeof(rmsgs));
+    rmsgs[0].msg_hdr.msg_iov = &riov[0];
+    rmsgs[0].msg_hdr.msg_iovlen = 1;
+    rmsgs[1].msg_hdr.msg_iov = &riov[1];
+    rmsgs[1].msg_hdr.msg_iovlen = 1;
+
+    struct timespec timeout = {0, 0};
+    recvmmsg(sv[1], rmsgs, 2, MSG_DONTWAIT, &timeout);
+
+    close(sv[0]);
+    close(sv[1]);
+
+    if (i % 50 == 0)
+      DEBUGLOG("SENDMMSG/RECVMMSG iteration %d complete\n", i);
+  }
+  DEBUGLOG("SENDMMSG / RECVMMSG stress test PASSED\n");
+}
+
+// ---- msync / mincore / mlockall / mlock2 / mbind / set_mempolicy / get_mempolicy stress ----
+void test_mem_policy_stress(void) {
+  DEBUGLOG("Starting MEMORY POLICY & EXTENDED MM stress test...\n");
+  size_t sz = 4 * 4096;
+  void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) {
+    perror("mem_policy mmap");
+    return;
+  }
+  memset(p, 0xEE, sz);
+
+  for (int i = 0; i < NUM_ITERATIONS * 2; i++) {
+    // msync
+    msync(p, sz, MS_ASYNC);
+    msync(p, sz, MS_SYNC);
+
+    // mincore
+    unsigned char vec[4] = {0};
+    mincore(p, sz, vec);
+
+    // mlockall / munlockall
+    mlockall(MCL_CURRENT);
+    munlockall();
+
+    // mlock2
+    syscall(SYS_mlock2, p, sz, 0);
+    munlock(p, sz);
+
+    // mbind / set_mempolicy / get_mempolicy
+    int mode = 0;
+    unsigned long nodemask = 0;
+    syscall(SYS_get_mempolicy, &mode, &nodemask, sizeof(nodemask) * 8, 0, 0);
+    syscall(SYS_set_mempolicy, 0 /* MPOL_DEFAULT */, NULL, 0);
+    syscall(SYS_mbind, p, sz, 0 /* MPOL_DEFAULT */, NULL, 0, 0);
+
+    if (i % 50 == 0)
+      DEBUGLOG("MEM POLICY iteration %d complete\n", i);
+  }
+
+  munmap(p, sz);
+  DEBUGLOG("MEMORY POLICY & EXTENDED MM stress test PASSED\n");
+}
+
+// ---- pause / rt_sigsuspend / rt_sigtimedwait / signalfd4 / rt_sigreturn stress ----
+static volatile sig_atomic_t g_ext_sig_handled = 0;
+static void ext_sig_handler(int sig) {
+  (void)sig;
+  g_ext_sig_handled = 1;
+}
+
+void test_extended_signals_stress(void) {
+  DEBUGLOG("Starting EXTENDED SIGNALS stress test...\n");
+
+  // 1. rt_sigtimedwait & signalfd4
+  sigset_t waitmask;
+  sigemptyset(&waitmask);
+  sigaddset(&waitmask, SIGUSR2);
+  struct timespec zero_ts = {0, 0};
+  siginfo_t sinfo;
+
+  for (int i = 0; i < NUM_ITERATIONS * 2; i++) {
+    syscall(SYS_rt_sigtimedwait, &waitmask, &sinfo, &zero_ts, 8 /* sizeof(sigset_t) */);
+
+    int sfd = syscall(SYS_signalfd4, -1, &waitmask, 8, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (sfd >= 0) close(sfd);
+
+    if (i % 50 == 0)
+      DEBUGLOG("SIGTIMEDWAIT/SIGNALFD4 iteration %d complete\n", i);
+  }
+
+  // 2. pause, rt_sigsuspend, and rt_sigreturn via handler dispatch in child
+  for (int i = 0; i < NUM_ITERATIONS / 5; i++) {
+    pid_t cpid = fork();
+    if (cpid == 0) {
+      struct sigaction sa;
+      memset(&sa, 0, sizeof(sa));
+      sa.sa_handler = ext_sig_handler;
+      sigemptyset(&sa.sa_mask);
+      sigaction(SIGUSR1, &sa, NULL);
+
+      // Child sets alarm so it never hangs if signal is lost
+      alarm(2);
+
+      // Parent sends SIGUSR1; pause() catches it and returns -1 with EINTR
+      // The return from ext_sig_handler automatically invokes SYS_rt_sigreturn!
+      pause();
+
+      // Next, test sigsuspend
+      sigset_t suspend_mask;
+      sigemptyset(&suspend_mask);
+      sigsuspend(&suspend_mask);
+
+      _exit(0);
+    } else if (cpid > 0) {
+      usleep(2000);
+      kill(cpid, SIGUSR1);
+      usleep(2000);
+      kill(cpid, SIGUSR1);
+      int status;
+      waitpid(cpid, &status, 0);
+    }
+  }
+
+  DEBUGLOG("EXTENDED SIGNALS stress test PASSED\n");
+}
+
 // ---- remaining registered syscall families ----
 // These complement the focused stress tests above. Privileged calls are made
 // with invalid authorization arguments, so the handler is exercised without
@@ -1866,6 +2167,11 @@ static void run_registered_syscall_coverage(int iterations) {
     fdatasync(fd);
     posix_fadvise(fd, 0, 0, POSIX_FADV_NORMAL);
     syscall(SYS_faccessat2, AT_FDCWD, path, F_OK, 0);
+
+    // fchmod, fchown, lchown
+    fchmod(fd, 0644);
+    fchown(fd, 0, 0);
+    lchown(path, 0, 0);
 
     int doomed = dup(fd);
     if (doomed >= 0)
@@ -1898,6 +2204,91 @@ static void run_registered_syscall_coverage(int iterations) {
     struct timespec resolution;
     clock_getres(CLOCK_MONOTONIC, &resolution);
     clock_nanosleep(CLOCK_MONOTONIC, 0, &zero_ts, NULL);
+
+    // getrusage
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+
+    // syslog query
+    syscall(SYS_syslog, 10 /* SYSLOG_ACTION_SIZE_BUFFER */, NULL, 0);
+
+    // setreuid, setregid
+    setreuid(0, 0);
+    setregid(0, 0);
+
+    // capget, capset
+    struct { uint32_t version; int pid; } cap_hdr = { 0x20080522, 0 };
+    struct { uint32_t eff, perm, inh; } cap_data[2] = {{0, 0, 0}, {0, 0, 0}};
+    syscall(SYS_capget, &cap_hdr, cap_data);
+    syscall(SYS_capset, &cap_hdr, cap_data);
+
+    // mknod (FIFO)
+    char fifo_path[64];
+    snprintf(fifo_path, sizeof(fifo_path), "/tmp/fifo_cov_%d.tmp", i);
+    mknod(fifo_path, S_IFIFO | 0644, 0);
+    unlink(fifo_path);
+
+    // umount2
+    syscall(SYS_umount2, "/nonexistent_mount_test", 1 /* MNT_FORCE */);
+
+    // sethostname
+    sethostname("avory", 5);
+
+    // waitid (non-blocking WNOHANG)
+    siginfo_t wi_info;
+    memset(&wi_info, 0, sizeof(wi_info));
+    syscall(SYS_waitid, P_ALL, 0, &wi_info, WEXITED | WNOHANG, NULL);
+
+    // inotify_init
+    int infd = syscall(SYS_inotify_init);
+    if (infd >= 0) close(infd);
+
+    // renameat, linkat, symlinkat, readlinkat, renameat2, fchmodat2
+    char at_path1[64], at_path2[64], at_sym[64], at_rbuf[64];
+    snprintf(at_path1, sizeof(at_path1), "/tmp/at_cov1_%d.tmp", i);
+    snprintf(at_path2, sizeof(at_path2), "/tmp/at_cov2_%d.tmp", i);
+    snprintf(at_sym, sizeof(at_sym), "/tmp/at_sym_%d.tmp", i);
+    int at_fd = open(at_path1, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (at_fd >= 0) {
+      write(at_fd, "at", 2);
+      close(at_fd);
+      linkat(AT_FDCWD, at_path1, AT_FDCWD, at_path2, 0);
+      unlinkat(AT_FDCWD, at_path2, 0);
+      symlinkat(at_path1, AT_FDCWD, at_sym);
+      readlinkat(AT_FDCWD, at_sym, at_rbuf, sizeof(at_rbuf));
+      unlink(at_sym);
+      syscall(SYS_renameat2, AT_FDCWD, at_path1, AT_FDCWD, at_path2, 0);
+      syscall(SYS_fchmodat2, AT_FDCWD, at_path2, 0600, 0);
+      renameat(AT_FDCWD, at_path2, AT_FDCWD, at_path1);
+      unlink(at_path1);
+    }
+
+    // unshare
+    syscall(SYS_unshare, 0);
+
+    // get_robust_list
+    void *rob_head = NULL;
+    size_t rob_len = 0;
+    syscall(SYS_get_robust_list, 0, &rob_head, &rob_len);
+
+    // name_to_handle_at, open_by_handle_at
+    struct file_handle fh;
+    int mount_id = 0;
+    syscall(SYS_name_to_handle_at, AT_FDCWD, path, &fh, &mount_id, 0);
+    syscall(SYS_open_by_handle_at, AT_FDCWD, &fh, O_RDONLY);
+
+    // getcpu
+    unsigned cpu_num = 0, node_num = 0;
+    syscall(SYS_getcpu, &cpu_num, &node_num, NULL);
+
+    // kcmp
+    syscall(SYS_kcmp, getpid(), getpid(), 1 /* KCMP_VM */, 0, 0);
+
+    // seccomp
+    syscall(SYS_seccomp, 0 /* SECCOMP_SET_MODE_STRICT */, 0, NULL);
+
+    // clone3 (invalid args test returns -EINVAL cleanly)
+    syscall(SYS_clone3, NULL, 0);
 
     close(fd);
     unlink(path);
@@ -2287,6 +2678,30 @@ int main(int argc, char **argv) {
   printf("\n--- Running WAIT4 Stress ---\n");
   test_wait4_stress();
   check_leak("WAIT4 Stress", &current_mem);
+
+  printf("\n--- Running XATTR Stress ---\n");
+  test_xattr_stress();
+  check_leak("XATTR Stress", &current_mem);
+
+  printf("\n--- Running SYSV SEMAPHORE Stress ---\n");
+  test_sysv_sem_stress();
+  check_leak("SYSV Semaphore Stress", &current_mem);
+
+  printf("\n--- Running SPLICE / COPY_FILE_RANGE Stress ---\n");
+  test_splice_copy_range_stress();
+  check_leak("SPLICE/CFR Stress", &current_mem);
+
+  printf("\n--- Running SENDMMSG / RECVMMSG Stress ---\n");
+  test_msg_vector_stress();
+  check_leak("SENDMMSG/RECVMMSG Stress", &current_mem);
+
+  printf("\n--- Running MEMORY POLICY & EXTENDED MM Stress ---\n");
+  test_mem_policy_stress();
+  check_leak("Memory Policy Stress", &current_mem);
+
+  printf("\n--- Running EXTENDED SIGNALS Stress ---\n");
+  test_extended_signals_stress();
+  check_leak("Extended Signals Stress", &current_mem);
 
   printf("\n--- Running REGISTERED SYSCALL COVERAGE Stress ---\n");
   test_registered_syscall_coverage();

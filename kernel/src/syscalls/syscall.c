@@ -400,8 +400,20 @@ const char *syscall_get_name(uint64_t num) {
   return 0;
 }
 
+bool syscall_log_allowed(const struct thread *t) {
+#if SYSCALL_LOG == 2
+  return t && t->trace_syscalls;
+#else
+  (void)t;
+  return true;
+#endif
+}
+
 #if SYSCALL_LOG
 static void log_syscall_entry(struct syscall_regs *regs, struct thread *t) {
+  if (!syscall_log_allowed(t))
+    return;
+
   const char *name = syscall_get_name(regs->rax);
   klog_puts("[SYSCALL] ");
   klog_puts(name ? name : "unknown");
@@ -431,6 +443,23 @@ static void log_syscall_entry(struct syscall_regs *regs, struct thread *t) {
 }
 #endif
 
+/* Browser-mode trace: one compact line per failing syscall.  Successful calls
+ * already have their entry line, and on a rendering bug the interesting event
+ * is almost always the ENOENT/EINVAL/ENOSYS that follows one of them. */
+#if SYSCALL_LOG == 2
+static void log_syscall_error(uint64_t syscall_num, struct thread *t,
+                              int64_t ret) {
+  if (ret >= 0 || ret < -4095 || !syscall_log_allowed(t))
+    return;
+  const char *name = syscall_get_name(syscall_num);
+  klog_puts("[SYSCALL] FAIL ");
+  klog_puts(name ? name : "unknown");
+  klog_puts(" errno=");
+  klog_int64(-ret);
+  klog_puts("\n");
+}
+#endif
+
 static void log_unimplemented_syscall(struct syscall_regs *regs, struct thread *t) {
   const char *name = syscall_get_name(regs->rax);
   klogf(KLOG_CLR_YELLOW "[WARN] Unimplemented syscall: " KLOG_CLR_RESET
@@ -449,9 +478,16 @@ static void log_unimplemented_syscall(struct syscall_regs *regs, struct thread *
         (unsigned long long)regs->r9);
 }
 
+static inline void record_syscall_error(struct thread *t, uint64_t syscall_num, int64_t err) {
+  if (!t) return;
+  t->last_error_code = err;
+  t->last_error_syscall_num = syscall_num;
+}
+
 void syscall_dispatcher(struct syscall_regs *regs) {
   struct thread *t = sched_get_current();
   if (t) {
+    __atomic_store_n(&t->in_syscall, true, __ATOMIC_RELAXED);
     t->last_syscall_num = regs->rax;
     t->last_syscall_args[0] = regs->rdi;
     t->last_syscall_args[1] = regs->rsi;
@@ -466,41 +502,14 @@ void syscall_dispatcher(struct syscall_regs *regs) {
   }
 
   uint64_t syscall_num = regs->rax;
-  bool is_mocktail = (t && t->comm[0] && strstr(t->comm, "mocktail") != NULL);
-  (void)is_mocktail;
-  bool log_mocktail = false;
-
-  if (log_mocktail) {
-    const char *name = syscall_get_name(syscall_num);
-    klog_puts("[MOCKTAIL SYS] ");
-    klog_puts(name ? name : "?");
-    klog_puts("(");
-    klog_uint64(syscall_num);
-    klog_puts(") tid=");
-    klog_uint64(t->tid);
-    klog_puts(" args: ");
-    klog_hex64(regs->rdi);
-    klog_puts(" ");
-    klog_hex64(regs->rsi);
-    klog_puts(" ");
-    klog_hex64(regs->rdx);
-    if (syscall_num == 202) {
-      klog_puts(" t/o=");
-      klog_hex64(regs->r10);
-      klog_puts(" u2=");
-      klog_hex64(regs->r8);
-      klog_puts(" v3=");
-      klog_hex64(regs->r9);
-    }
-    klog_puts("\n");
-  }
 
   if (regs->rax >= MAX_SYSCALL) {
     log_unimplemented_syscall(regs, t);
     regs->rax = (uint64_t)-38; // ENOSYS
     if (t) {
       t->last_syscall_ret = (int64_t)-38;
-      t->last_error_code = -38;
+      record_syscall_error(t, syscall_num, -38);
+      __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
     return;
   }
@@ -512,21 +521,15 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     log_syscall_entry(regs, t);
 #endif
     regs->rax = raw_handler(regs);
+#if SYSCALL_LOG == 2
+    log_syscall_error(syscall_num, t, (int64_t)regs->rax);
+#endif
     if (t) {
       t->last_syscall_ret = (int64_t)regs->rax;
       if ((int64_t)regs->rax < 0 && (int64_t)regs->rax >= -4095) {
-        t->last_error_code = (int64_t)regs->rax;
+        record_syscall_error(t, syscall_num, (int64_t)regs->rax);
       }
-    }
-    if (log_mocktail && (syscall_num == 202 || syscall_num == 42 || syscall_num == 435)) {
-      const char *name = syscall_get_name(syscall_num);
-      klog_puts("[MOCKTAIL SYS RET] ");
-      klog_puts(name ? name : "?");
-      klog_puts(" tid=");
-      klog_uint64(t->tid);
-      klog_puts(" ret=");
-      klog_hex64(regs->rax);
-      klog_puts("\n");
+      __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
     return;
   }
@@ -536,7 +539,8 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     regs->rax = (uint64_t)-38; // ENOSYS
     if (t) {
       t->last_syscall_ret = (int64_t)-38;
-      t->last_error_code = -38;
+      record_syscall_error(t, syscall_num, -38);
+      __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
     return;
   }
@@ -549,23 +553,15 @@ void syscall_dispatcher(struct syscall_regs *regs) {
 
   regs->rax =
       handler(regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8, regs->r9);
+#if SYSCALL_LOG == 2
+  log_syscall_error(syscall_num, t, (int64_t)regs->rax);
+#endif
 
   if (t) {
     t->last_syscall_ret = (int64_t)regs->rax;
     if ((int64_t)regs->rax < 0 && (int64_t)regs->rax >= -4095) {
-      t->last_error_code = (int64_t)regs->rax;
+      record_syscall_error(t, syscall_num, (int64_t)regs->rax);
     }
-  }
-
-  if (log_mocktail && (syscall_num == 202 || syscall_num == 42 || syscall_num == 435)) {
-    const char *name = syscall_get_name(syscall_num);
-    klog_puts("[MOCKTAIL SYS RET] ");
-    klog_puts(name ? name : "?");
-    klog_puts(" tid=");
-    klog_uint64(t->tid);
-    klog_puts(" ret=");
-    klog_hex64(regs->rax);
-    klog_puts("\n");
   }
 
   /* Preemption punt.  IRQs are on throughout the dispatch (syscall_entry
@@ -578,6 +574,8 @@ void syscall_dispatcher(struct syscall_regs *regs) {
    * syscall hot path unless this thread can actually deliver a signal. */
   if (t && (t->pending_signals & ~t->signal_mask))
     signal_deliver_syscall(regs);
+  if (t)
+    __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
 }
 
 // Core initialization
@@ -598,6 +596,12 @@ void syscall_init(void) {
   syscall_register_aio();
 
   syscall_init_cpu();
+
+#if SYSCALL_LOG == 2
+  klog_puts("[SYSCALL] browser-only trace active (badwolf/WebKit/bwrap)\n");
+#elif SYSCALL_LOG == 1
+  klog_puts("[SYSCALL] tracing every syscall (SYSCALL_LOG=1)\n");
+#endif
 
   klog_puts("[OK] Syscall Infrastructure (MSRs) initialized.\n");
 }

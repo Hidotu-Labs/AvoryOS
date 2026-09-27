@@ -20,6 +20,17 @@
  * loader killed mid-read (or a tree leaf whose slab chunk was recycled) turns
  * the wait inside vfs_cache_get_or_create() into a permanent spin. */
 #define VFS_PAGE_LOAD_TIMEOUT_MS 2000
+/* A timeout above lets us recover from a single abandoned fill, but retries
+ * must share a deadline: a succession of new stuck fills must not keep a
+ * demand read spinning forever. */
+#define VFS_PAGE_LOAD_MAX_WAIT_MS 10000
+
+/* Keep early failures visible and continue reporting recurring failures at
+ * exponentially wider intervals. A first-eight-only cap hides regressions
+ * after the initial boot noise. */
+static bool vfs_should_log_failure(uint32_t count) {
+  return count <= 8 || (count && (count & (count - 1)) == 0);
+}
 
 /* Bench-only: force the scatter staging path even when the frames are one
  * contiguous run, so vfs_bench=1 can measure the bounce copy this change
@@ -233,7 +244,24 @@ vfs_page_t *vfs_cache_insert(vfs_node_t *node, uint32_t offset,
 
 vfs_page_t *vfs_cache_get_or_create(vfs_node_t *node, uint32_t offset) {
   vfs_page_t *page;
+  uint64_t request_wait_start = lapic_timer_get_ms();
 retry:
+  if (lapic_timer_get_ms() - request_wait_start >=
+      VFS_PAGE_LOAD_MAX_WAIT_MS) {
+    static uint32_t retry_deadlines;
+    uint32_t count =
+        __atomic_add_fetch(&retry_deadlines, 1, __ATOMIC_RELAXED);
+    if (vfs_should_log_failure(count)) {
+      struct thread *current = sched_get_current();
+      klogf("[VFS] page fill retry deadline exceeded node='%s' inode=%u "
+            "page_off=%u waited_ms=%u comm='%s' tid=%u\n",
+            node->name, node->inode, offset, VFS_PAGE_LOAD_MAX_WAIT_MS,
+            (current && current->comm[0]) ? current->comm : "?",
+            current ? current->tid : 0);
+    }
+    vfs_cache_invalidate(node, offset);
+    return NULL;
+  }
   page = vfs_cache_lookup(node, offset);
   if (page) {
     uint64_t wait_start = lapic_timer_get_ms();
@@ -253,6 +281,26 @@ retry:
         goto retry;
       }
       if (lapic_timer_get_ms() - wait_start >= VFS_PAGE_LOAD_TIMEOUT_MS) {
+        uint64_t total_wait = lapic_timer_get_ms() - request_wait_start;
+        if (total_wait >= VFS_PAGE_LOAD_MAX_WAIT_MS) {
+          static uint32_t wait_timeouts;
+          uint32_t count = __atomic_add_fetch(&wait_timeouts, 1,
+                                               __ATOMIC_RELAXED);
+          if (vfs_should_log_failure(count)) {
+            struct thread *current = sched_get_current();
+            klogf("[VFS] page fill wait timed out node='%s' inode=%u "
+                  "page_off=%u waited_ms=%llu loading=%u refs=%u "
+                  "comm='%s' tid=%u\n",
+                  node->name, node->inode, offset,
+                  (unsigned long long)total_wait, 1u,
+                  vfs_page_ref_count(page),
+                  (current && current->comm[0]) ? current->comm : "?",
+                  current ? current->tid : 0);
+          }
+          vfs_cache_put(node, page);
+          vfs_cache_invalidate(node, offset);
+          return NULL;
+        }
         /* The owner never finished: a thread killed mid-fill, a blocked
          * reader that will never be woken, or a recycled tree leaf.  Retire
          * the entry so a fresh fill can make progress. */
@@ -316,6 +364,26 @@ retry:
         goto retry;
       }
       if (lapic_timer_get_ms() - wait_start >= VFS_PAGE_LOAD_TIMEOUT_MS) {
+        uint64_t total_wait = lapic_timer_get_ms() - request_wait_start;
+        if (total_wait >= VFS_PAGE_LOAD_MAX_WAIT_MS) {
+          static uint32_t wait_timeouts;
+          uint32_t count = __atomic_add_fetch(&wait_timeouts, 1,
+                                               __ATOMIC_RELAXED);
+          if (vfs_should_log_failure(count)) {
+            struct thread *current = sched_get_current();
+            klogf("[VFS] page fill wait timed out node='%s' inode=%u "
+                  "page_off=%u waited_ms=%llu loading=%u refs=%u "
+                  "comm='%s' tid=%u\n",
+                  node->name, node->inode, offset,
+                  (unsigned long long)total_wait, 1u,
+                  vfs_page_ref_count(page),
+                  (current && current->comm[0]) ? current->comm : "?",
+                  current ? current->tid : 0);
+          }
+          vfs_cache_put(node, page);
+          vfs_cache_invalidate(node, offset);
+          return NULL;
+        }
         vfs_cache_put(node, page);
         vfs_cache_invalidate(node, offset);
         goto retry;
@@ -339,6 +407,20 @@ retry:
   bool ok = page->uptodate;
   spinlock_release(&node->pages_lock);
   if (!ok) {
+    static uint32_t page_fill_failures;
+    uint32_t failure_count =
+        __atomic_add_fetch(&page_fill_failures, 1, __ATOMIC_RELAXED);
+    if (vfs_should_log_failure(failure_count)) {
+      struct thread *current = sched_get_current();
+      klogf("[VFS] page fill failed node='%s' inode=%u type=0x%x flags=0x%x "
+            "page_off=%u node_size=%u requested=%u got=%u read_cb=%u "
+            "comm='%s' tid=%u\n",
+            node->name, node->inode, node->flags & FS_TYPE_MASK, node->flags,
+            offset, node->length, to_read, read,
+            node->read != NULL,
+            (current && current->comm[0]) ? current->comm : "?",
+            current ? current->tid : 0);
+    }
     vfs_cache_invalidate(node, offset);
     vfs_cache_put(node, page);
     return NULL;
@@ -368,6 +450,32 @@ static void vfs_readahead_warn_short(uint32_t off, uint32_t got,
   if (__atomic_add_fetch(&warned, 1, __ATOMIC_RELAXED) <= 4)
     klogf("[VFS] readahead short read: off=%u got=%u want=%u (pages dropped)\n",
           off, got, want);
+}
+
+/* Retry a failed clustered transfer page by page before dropping the cache
+ * entries. Some filesystem/device paths reject large requests but can read
+ * the same bytes through smaller requests. */
+static uint32_t vfs_cache_fill_pages_individually(vfs_node_t *node,
+                                                   uint32_t offset,
+                                                   vfs_page_t **pages,
+                                                   uint32_t first,
+                                                   uint32_t count) {
+  uint32_t done = 0;
+  while (done < count) {
+    uint32_t page_off = offset + (first + done) * PAGE_SIZE;
+    uint32_t available = node->length > page_off ? node->length - page_off : 0;
+    uint32_t to_read = available > PAGE_SIZE ? PAGE_SIZE : available;
+    void *frame_virt = PHYS_TO_VIRT(pages[first + done]->frame_phys);
+    uint32_t got = to_read ? node->read(node, page_off, to_read, frame_virt) : 0;
+    if (got < to_read) {
+      vfs_readahead_warn_short(page_off, got, to_read);
+      return done;
+    }
+    if (got < PAGE_SIZE)
+      memset((uint8_t *)frame_virt + got, 0, PAGE_SIZE - got);
+    done++;
+  }
+  return done;
 }
 
 /* True when pages[first..first+count-1] name one physically contiguous run.
@@ -410,7 +518,8 @@ static uint32_t vfs_cache_fill_pages(vfs_node_t *node, uint32_t offset,
         got = ask;
       if (got < ask) {
         vfs_readahead_warn_short(chunk_off, got, ask);
-        return done;
+        return done + vfs_cache_fill_pages_individually(
+                          node, offset, pages, done, chunk);
       }
       if (got < want)
         memset(dest + got, 0, want - got);
@@ -430,7 +539,8 @@ static uint32_t vfs_cache_fill_pages(vfs_node_t *node, uint32_t offset,
       if (got < ask) {
         vfs_readahead_warn_short(chunk_off, got, ask);
         pmm_free_pages(scratch, chunk);
-        return done;
+        return done + vfs_cache_fill_pages_individually(
+                          node, offset, pages, done, chunk);
       }
       if (got < want)
         memset(scratch_virt + got, 0, want - got);
@@ -473,7 +583,9 @@ uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_byt
   if (max_bytes > available)
     max_bytes = available;
 
-  uint32_t max_pages = (max_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+  uint32_t max_pages = max_bytes / PAGE_SIZE;
+  if (max_bytes % PAGE_SIZE)
+    max_pages++;
   if (max_pages > MAX_READAHEAD_PAGES)
     max_pages = MAX_READAHEAD_PAGES;
   if (max_pages == 0)
@@ -506,7 +618,7 @@ uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_byt
   }
   spinlock_release(&node->pages_lock);
 
-  if (missing_count <= 1)
+  if (missing_count == 0)
     return 0;
 
   uint32_t first_off = offset + start_index * PAGE_SIZE;
@@ -761,6 +873,7 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                         uint8_t *buffer) {
   if (!node || !buffer || !size || offset >= node->length)
     return 0;
+  uint32_t requested_size = size;
   if (size > node->length - offset)
     size = node->length - offset;
 
@@ -807,9 +920,26 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
        * failure, not EOF.  Make it visible instead of returning a silent
        * zero-length read (musl then reports "No error information"). */
       static uint32_t cache_read_failures;
-      if (__atomic_add_fetch(&cache_read_failures, 1, __ATOMIC_RELAXED) <= 8)
-        klogf("[VFS] page-cache read failed node='%s' off=%u size=%u\n",
-              node->name, offset, size);
+      uint32_t failure_count =
+          __atomic_add_fetch(&cache_read_failures, 1, __ATOMIC_RELAXED);
+      if (vfs_should_log_failure(failure_count)) {
+        struct thread *current = sched_get_current();
+        uint64_t request_end = (uint64_t)offset + requested_size;
+        uint64_t cached_pages =
+            __atomic_load_n(&vfs_cached_pages, __ATOMIC_RELAXED);
+        klogf("[VFS] page-cache read failed node='%s' inode=%u "
+              "type=0x%x flags=0x%x node_size=%u "
+              "request=[%u,%llu) effective_size=%u failed_page=%u "
+              "in_page=%u done=%u remaining=%u read_cb=%u "
+              "cached_pages=%llu comm='%s' tid=%u\n",
+              node->name, node->inode, node->flags & FS_TYPE_MASK,
+              node->flags, node->length, offset,
+              (unsigned long long)request_end, size, page_offset, in_page,
+              done, size - done, node->read != NULL,
+              (unsigned long long)cached_pages,
+              (current && current->comm[0]) ? current->comm : "?",
+              current ? current->tid : 0);
+      }
       break;
     }
     if (is_user_ptr((uint64_t)buffer)) {
@@ -859,6 +989,8 @@ void vfs_cache_invalidate(vfs_node_t *node, uint32_t offset) {
 struct key_batch {
   uint64_t keys[CACHE_BATCH];
   uint32_t count;
+  uint64_t invalid_keys[CACHE_BATCH];
+  uint32_t invalid_count;
   uint64_t first;
   uint64_t last;
   bool unused_only;
@@ -866,19 +998,20 @@ struct key_batch {
 
 static bool collect_keys(uint64_t key, void *value, void *opaque) {
   struct key_batch *batch = opaque;
+  if (key < batch->first || key > batch->last)
+    return true;
   vfs_page_t *page = value;
   if (!page_value_valid(page)) {
     cache_report_invalid_value(value);
-    return true;
+    batch->invalid_keys[batch->invalid_count++] = key;
+    return batch->count + batch->invalid_count < CACHE_BATCH;
   }
-  if (key < batch->first || key > batch->last)
-    return true;
   if (batch->unused_only &&
       (vfs_page_ref_count(page) || page->dirty || page->loading ||
        page->writeback || pmm_get_ref((void *)page->frame_phys) != 1))
     return true;
   batch->keys[batch->count++] = key;
-  return batch->count < CACHE_BATCH;
+  return batch->count + batch->invalid_count < CACHE_BATCH;
 }
 
 static void cache_remove_range(vfs_node_t *node, uint64_t first, uint64_t last,
@@ -888,8 +1021,15 @@ static void cache_remove_range(vfs_node_t *node, uint64_t first, uint64_t last,
         .first = first, .last = last, .unused_only = unused_only};
     bool complete = asc_radix_tree_for_each_range(&node->pages, first, last,
                                                collect_keys, &batch);
-    if (!batch.count)
+    if (!batch.count && !batch.invalid_count)
       break;
+    /* Invalid leaves are opaque garbage: unlink them, but never pass them to
+     * vfs_page_evict() or free. Keeping them in the tree makes every reclaim
+     * and sync scan report the same corruption indefinitely. */
+    for (uint32_t i = 0; i < batch.invalid_count; i++) {
+      if (asc_radix_tree_delete(&node->pages, batch.invalid_keys[i]))
+        __atomic_sub_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
+    }
     for (uint32_t i = 0; i < batch.count; i++) {
       bool releasable = false;
       vfs_page_t *page =
@@ -933,8 +1073,16 @@ void vfs_cache_update_or_invalidate(vfs_node_t *node, uint32_t offset,
       cache_drop_invalid_locked(node, cur_offset, page);
       page = NULL;
     }
-    if (page && page->frame_phys && !page->loading &&
-        !vfs_page_is_evicted(page)) {
+    if (page && page->loading) {
+      /* A disk fill that started before this write may still contain stale
+       * bytes (or observe the old on-disk inode size). Retire it so the fill
+       * cannot publish that snapshot as an uptodate page after the write. */
+      bool releasable = false;
+      vfs_page_t *evicted =
+          cache_delete_locked(node, cache_key(cur_offset), &releasable);
+      if (evicted && releasable)
+        cache_page_release(evicted);
+    } else if (page && page->frame_phys && !vfs_page_is_evicted(page)) {
       if (page->uptodate) {
         void *page_virt = PHYS_TO_VIRT(page->frame_phys);
         if (buffer) {
@@ -984,16 +1132,20 @@ void vfs_cache_clear_unused(vfs_node_t *node) {
 struct reclaim_search {
   uint64_t key;
   uint64_t stamp;
+  uint64_t invalid_key;
   bool found;
+  bool invalid;
 };
 
 static bool find_reclaimable(uint64_t key, void *value, void *opaque) {
+  struct reclaim_search *search = opaque;
   vfs_page_t *page = value;
   if (!page_value_valid(page)) {
     cache_report_invalid_value(value);
-    return true;
+    search->invalid = true;
+    search->invalid_key = key;
+    return false;
   }
-  struct reclaim_search *search = opaque;
   if (vfs_page_ref_count(page) || page->dirty || page->loading ||
       page->writeback || pmm_get_ref((void *)page->frame_phys) != 1)
     return true;
@@ -1013,6 +1165,13 @@ size_t vfs_cache_reclaim(vfs_node_t *node, size_t target) {
   while (reclaimed < target) {
     struct reclaim_search search = {0};
     asc_radix_tree_for_each(&node->pages, find_reclaimable, &search);
+    if (search.invalid) {
+      if (asc_radix_tree_delete(&node->pages, search.invalid_key))
+        __atomic_sub_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
+      else
+        break;
+      continue;
+    }
     if (!search.found)
       break;
     bool releasable = false;
@@ -1047,15 +1206,18 @@ void vfs_cache_mark_dirty(vfs_node_t *node, uint32_t offset) {
 struct dirty_search {
   vfs_page_t *page;
   uint64_t dirty_seq;
+  uint64_t invalid_key;
+  bool invalid;
 };
 
 static bool find_dirty(uint64_t key, void *value, void *opaque) {
-  (void)key;
   struct dirty_search *search = opaque;
   vfs_page_t *page = value;
   if (!page_value_valid(page)) {
     cache_report_invalid_value(value);
-    return true;
+    search->invalid = true;
+    search->invalid_key = key;
+    return false;
   }
   if (!page->dirty || page->loading || page->writeback)
     return true;
@@ -1073,7 +1235,20 @@ void vfs_cache_sync(vfs_node_t *node) {
     struct dirty_search search = {0};
     spinlock_acquire(&node->pages_lock);
     asc_radix_tree_for_each(&node->pages, find_dirty, &search);
+    bool invalid_removed = false;
+    if (search.invalid) {
+      invalid_removed = asc_radix_tree_delete(&node->pages,
+                                               search.invalid_key) != NULL;
+      if (invalid_removed)
+        __atomic_sub_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
+    }
     spinlock_release(&node->pages_lock);
+    if (search.invalid) {
+      if (invalid_removed)
+        continue;
+      else
+        break;
+    }
     if (!search.page)
       break;
     uint32_t available = node->length > search.page->offset

@@ -74,9 +74,13 @@
 #define SNDRV_PCM_IOCTL_UNLINK          0x00004171
 
 // ALSA PCM mmap special offsets
-#define SNDRV_PCM_MMAP_OFFSET_DATA      0x00000000U
-#define SNDRV_PCM_MMAP_OFFSET_STATUS    0x80000000U
-#define SNDRV_PCM_MMAP_OFFSET_CONTROL   0x81000000U
+#define SNDRV_PCM_MMAP_OFFSET_DATA          0x00000000ULL
+#define SNDRV_PCM_MMAP_OFFSET_STATUS_OLD    0x80000000ULL
+#define SNDRV_PCM_MMAP_OFFSET_CONTROL_OLD   0x81000000ULL
+#define SNDRV_PCM_MMAP_OFFSET_STATUS_NEW    0x82000000ULL
+#define SNDRV_PCM_MMAP_OFFSET_CONTROL_NEW   0x83000000ULL
+#define SNDRV_PCM_MMAP_OFFSET_STATUS        SNDRV_PCM_MMAP_OFFSET_STATUS_OLD
+#define SNDRV_PCM_MMAP_OFFSET_CONTROL       SNDRV_PCM_MMAP_OFFSET_CONTROL_OLD
 
 // ALSA HW_PARAM Indices
 #define SNDRV_PCM_HW_PARAM_ACCESS       0
@@ -232,6 +236,22 @@ struct snd_pcm_hw_params {
     uint8_t reserved[64];
 };
 
+struct snd_pcm_sw_params {
+    int32_t tstamp_mode;
+    uint32_t period_step;
+    uint32_t sleep_min;
+    uint64_t avail_min;
+    uint64_t xfer_align;
+    uint64_t start_threshold;
+    uint64_t stop_threshold;
+    uint64_t silence_threshold;
+    uint64_t silence_size;
+    uint64_t boundary;
+    uint32_t proto;
+    uint32_t tstamp_type;
+    uint8_t reserved[56];
+};
+
 struct snd_pcm_status {
     int32_t state;
     struct {
@@ -327,12 +347,13 @@ static uint8_t  *alsa_control_page_virt = NULL;
 static uint64_t  alsa_control_page_phys = 0;
 
 // Internal ALSA state
-static uint32_t alsa_sample_rate = 44100;
+static uint32_t alsa_sample_rate = 48000;
 static uint8_t alsa_channels = 2;
 static uint8_t alsa_bits = 16;
 static int alsa_pcm_state = 0; // 0 = OPEN, 1 = SETUP, 2 = PREPARED, 3 = RUNNING, 6 = PAUSED
 static uint64_t alsa_appl_ptr = 0;
 static uint64_t alsa_hw_ptr = 0;
+static uint64_t alsa_avail_min = 1;
 // Playback buffer the client negotiated in HW_PARAMS, in frames.  It bounds
 // both the driver queue and the avail figures reported back to alsa-lib.
 static uint64_t alsa_buffer_frames = 0;
@@ -656,10 +677,15 @@ static void alsa_publish_hw_ptr(void) {
         }
         alsa_hw_ptr = alsa_appl_ptr - delay_frames;
     }
+
     if (alsa_status_page_virt) {
         struct snd_pcm_mmap_status *st = (struct snd_pcm_mmap_status *)alsa_status_page_virt;
         st->state = alsa_pcm_state;
         st->hw_ptr = alsa_hw_ptr;
+        extern uint64_t lapic_timer_get_ms(void);
+        uint64_t ms = lapic_timer_get_ms();
+        st->tstamp.tv_sec = ms / 1000;
+        st->tstamp.tv_nsec = (ms % 1000) * 1000000;
     }
 }
 
@@ -686,13 +712,17 @@ static uint64_t alsa_avail_frames(void) {
 // masking and never blocks.
 static void alsa_mmap_pump(void) {
     if (!alsa_access_mmap || !hda_is_present() || !alsa_dma_buf_virt ||
-        !alsa_control_page_virt || !alsa_buffer_frames) {
+        !alsa_buffer_frames) {
         return;
     }
 
-    uint64_t appl = ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr;
-    if (appl > alsa_appl_ptr) {
-        alsa_appl_ptr = appl;
+    uint64_t appl = alsa_appl_ptr;
+    if (alsa_control_page_virt) {
+        uint64_t ctrl_appl = ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr;
+        if (ctrl_appl > appl) {
+            appl = ctrl_appl;
+            alsa_appl_ptr = appl;
+        }
     }
 
     if (appl <= alsa_mmap_consumed) {
@@ -727,6 +757,11 @@ static void alsa_mmap_pump(void) {
     alsa_publish_hw_ptr();
 }
 
+static void alsa_tick(void) {
+    alsa_mmap_pump();
+    alsa_publish_hw_ptr();
+}
+
 // Keep period/buffer/periods and derived byte/time fields consistent.
 // alsa-lib rejects HW_PARAMS when buffer_size is not an exact multiple of
 // period_size even if both intervals were individually refined to min==max.
@@ -745,27 +780,12 @@ static void alsa_reconcile_hw_params(struct snd_pcm_hw_params *params, bool comm
 
     uint8_t bits = alsa_format_to_bits(params->masks[1].bits[0]);
 
+    // Single global HDA format: concurrent Firefox streams (VOD 48k stereo +
+    // notification/live 44.1k or mono) share one DAC. Reprogramming per-stream
+    // corrupts the other stream's timing and cubeb errors the VOD. Force 48k
+    // stereo here; cubeb resamples/upmixes in software.
     uint32_t ch = 2;
-    if (!channels->empty) {
-        if (channels->min == channels->max) {
-            ch = channels->min;
-        } else if (channels->min >= 1 && channels->min <= 2) {
-            ch = channels->min;
-        } else if (channels->max >= 1 && channels->max <= 2) {
-            ch = channels->max;
-        }
-    }
-
-    uint32_t r = 44100;
-    if (!rate->empty) {
-        if (rate->min == rate->max) {
-            r = rate->min;
-        } else if (rate->min >= 8000 && rate->min <= 192000) {
-            r = rate->min;
-        } else if (rate->max >= 8000 && rate->max <= 192000) {
-            r = rate->max;
-        }
-    }
+    uint32_t r = 48000;
 
     uint32_t frame_bytes = ((uint32_t)bits / 8U) * ch;
     if (frame_bytes == 0) {
@@ -805,10 +825,10 @@ static void alsa_reconcile_hw_params(struct snd_pcm_hw_params *params, bool comm
     if (!buffer_size->empty) {
         if (buffer_size->min == buffer_size->max && buffer_size->min >= psize) {
             bsize = buffer_size->min;
-        } else if (buffer_size->min > psize && buffer_size->min <= max_buf_frames) {
-            bsize = buffer_size->min;
         } else if (buffer_size->max >= psize * 2 && buffer_size->max <= max_buf_frames) {
             bsize = buffer_size->max;
+        } else if (buffer_size->min > psize && buffer_size->min <= max_buf_frames) {
+            bsize = buffer_size->min;
         }
     }
     if (bsize == 0 && !buffer_time->empty && buffer_time->min != 0 && r != 0) {
@@ -853,12 +873,16 @@ static void alsa_reconcile_hw_params(struct snd_pcm_hw_params *params, bool comm
         return;
     }
 
-    alsa_set_interval(sample_bits, bits);
-    alsa_set_interval(frame_bits, fb);
-    if (!channels->empty) {
+    if (commit || alsa_interval_exact(sample_bits)) {
+        alsa_set_interval(sample_bits, bits);
+    }
+    if (commit || alsa_interval_exact(frame_bits)) {
+        alsa_set_interval(frame_bits, fb);
+    }
+    if (!channels->empty && (commit || alsa_interval_exact(channels))) {
         alsa_set_interval(channels, ch);
     }
-    if (!rate->empty) {
+    if (!rate->empty && (commit || alsa_interval_exact(rate))) {
         alsa_set_interval(rate, r);
     }
     alsa_set_interval(period_size, psize);
@@ -910,10 +934,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
 
         // ALSA access enum: MMAP_INTERLEAVED=0, MMAP_NONINTERLEAVED=1, MMAP_COMPLEX=2,
         //                   RW_INTERLEAVED=3, RW_NONINTERLEAVED=4
-        // MMAP access stays advertised because alsa-lib's plug/convert chains
-        // transfer through the slave's mmap areas; the mmap pump below copies
-        // those writes into the HDA ring.  RW clients keep using WRITEI.
-        uint32_t supported_access = (1U << 0) | (1U << 1) | (1U << 2) | (1U << 3) | (1U << 4);
+        uint32_t supported_access = (1U << 0) | (1U << 3);
         uint32_t supported_format = alsa_supported_formats();
         uint32_t supported_subformat = (1U << 0);
 
@@ -957,8 +978,8 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
 
         REFINE_INTERVAL(0, 8, 32);          // SAMPLE_BITS
         REFINE_INTERVAL(1, 8, 64);          // FRAME_BITS
-        REFINE_INTERVAL(2, 1, 2);           // CHANNELS
-        REFINE_INTERVAL(3, 8000, 192000);   // RATE
+        REFINE_INTERVAL(2, 2, 2);           // CHANNELS: stereo only, cubeb upmixes mono
+        REFINE_INTERVAL(3, 48000, 48000);   // RATE: 48k only, cubeb resamples (single global HDA format)
         REFINE_INTERVAL(4, 100, 10000000);  // PERIOD_TIME
         REFINE_INTERVAL(5, 16, 65536);      // PERIOD_SIZE
         REFINE_INTERVAL(6, 64, 262144);     // PERIOD_BYTES
@@ -969,16 +990,22 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         REFINE_INTERVAL(11, 0, 0);          // TICK_TIME
         #undef REFINE_INTERVAL
 
-        params->info = 0x00000001 | 0x00000002 | 0x00000100 | 0x00000200 |
+        params->info = 0x00000001 | 0x00000002 | 0x00000100 |
                        0x00010000 | 0x00040000 | 0x00080000;
         params->msbits = 16;
-        params->rate_num = alsa_sample_rate ? alsa_sample_rate : 44100;
-        params->rate_den = 1;
         params->fifo_size = 0;
         params->cmask = params->rmask ? params->rmask : 0xFFFFFFFF;
         params->rmask = 0;
 
         alsa_reconcile_hw_params(params, false);
+
+        if (alsa_interval_exact(&params->intervals[3])) {
+            params->rate_num = params->intervals[3].min;
+            params->rate_den = 1;
+        } else {
+            params->rate_num = 0;
+            params->rate_den = 0;
+        }
 
         return 0;
     }
@@ -1020,10 +1047,13 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         if (alsa_buffer_frames < 2) {
             alsa_buffer_frames = 2;
         }
+        klogf("[ALSA] HW_PARAMS access=%u fmt=0x%x ch=%u rate=%u buf=%u per=%u\n",
+              chosen_access, params->masks[1].bits[0], alsa_channels,
+              alsa_sample_rate, params->intervals[9].min, params->intervals[5].min);
 
         params->rmask = 0;
         params->cmask = 0;
-        params->info = 0x00000001 | 0x00000002 | 0x00000100 | 0x00000200 |
+        params->info = 0x00000001 | 0x00000002 | 0x00000100 |
                        0x00010000 | 0x00040000 | 0x00080000;
         params->flags &= ~0x4U;
         params->msbits = alsa_bits;
@@ -1033,8 +1063,12 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
 
         if (hda_is_present()) {
             hda_set_format(alsa_sample_rate, alsa_channels, alsa_bits);
-            // Never queue more than the buffer the client negotiated.
-            hda_set_queue_limit((uint32_t)(alsa_buffer_frames * alsa_frame_bytes()));
+            // Ensure ample queue headroom so video decode jitter doesn't starve the audio engine
+            uint32_t qlimit = (uint32_t)(alsa_buffer_frames * alsa_frame_bytes());
+            if (qlimit < 65536) {
+                qlimit = 65536;
+            }
+            hda_set_queue_limit(qlimit);
             hda_reset_stream();
         }
         alsa_pcm_state = 1; // SNDRV_PCM_STATE_SETUP
@@ -1062,12 +1096,30 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
 
     if (request == SNDRV_PCM_IOCTL_SW_PARAMS || request == SNDRV_PCM_IOCTL_SW_PARAMS_OLD ||
         (request & 0xFFFF) == 0x4113) {
+        struct snd_pcm_sw_params *sw = (struct snd_pcm_sw_params *)arg;
+        if (!sw) return -14;
+        uint64_t buf_frames = alsa_buffer_frames ? alsa_buffer_frames : (ALSA_DMA_BUF_SIZE / alsa_frame_bytes());
+        uint64_t boundary = buf_frames;
+        while (boundary * 2 <= 0x7FFFFFFFFFFFFFFFULL - buf_frames) {
+            boundary *= 2;
+        }
+        sw->boundary = boundary;
+        if (sw->avail_min == 0) {
+            sw->avail_min = 1;
+        }
+        alsa_avail_min = sw->avail_min;
+        if (alsa_control_page_virt) {
+            ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->avail_min = sw->avail_min;
+        }
         return 0;
     }
 
     if (request == SNDRV_PCM_IOCTL_CHANNEL_INFO) {
         struct snd_pcm_channel_info *ch = (struct snd_pcm_channel_info *)arg;
         if (!ch) return -14;
+        if (ch->channel >= alsa_channels) {
+            return -22; // -EINVAL
+        }
         ch->offset = 0; // Page-aligned byte offset for mmap (0 for interleaved DMA buffer)
         ch->first = ch->channel * alsa_bits; // Bit offset of this channel within the frame (0 or 16)
         ch->step = alsa_channels * alsa_bits; // Bit step between samples for this channel (32 bits)
@@ -1089,19 +1141,32 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
 
         if (!(sync->flags & (1U << 1) /* SNDRV_PCM_SYNC_PTR_APPL */)) {
             alsa_appl_ptr = sync->c.control.appl_ptr;
+            if (alsa_control_page_virt) {
+                ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = alsa_appl_ptr;
+            }
         } else {
             sync->c.control.appl_ptr = alsa_appl_ptr;
         }
         if (!(sync->flags & (1U << 2) /* SNDRV_PCM_SYNC_PTR_AVAIL_MIN */)) {
-            // Keep user avail_min
+            if (alsa_control_page_virt) {
+                ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->avail_min = sync->c.control.avail_min;
+            }
         } else {
-            sync->c.control.avail_min = 1;
+            if (alsa_control_page_virt) {
+                sync->c.control.avail_min = ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->avail_min;
+            } else {
+                sync->c.control.avail_min = 1;
+            }
         }
 
         alsa_mmap_pump();
         alsa_publish_hw_ptr();
         sync->s.status.state = alsa_pcm_state;
         sync->s.status.hw_ptr = alsa_hw_ptr;
+        extern uint64_t lapic_timer_get_ms(void);
+        uint64_t ms = lapic_timer_get_ms();
+        sync->s.status.tstamp.tv_sec = ms / 1000;
+        sync->s.status.tstamp.tv_nsec = (ms % 1000) * 1000000;
         return 0;
     }
 
@@ -1113,25 +1178,33 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         alsa_appl_ptr = 0;
         alsa_hw_ptr = 0;
         alsa_mmap_consumed = 0;
-        if (alsa_status_page_virt) {
-            ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
-            ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->hw_ptr = 0;
-        }
+        alsa_mmap_appl_offset = 0;
+        alsa_publish_hw_ptr();
         if (alsa_control_page_virt) {
             ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = 0;
+        }
+        if (hda_is_present()) {
+            extern void wait_queue_wake_all(void *wq);
+            wait_queue_wake_all(hda_get_wait_queue());
         }
         return 0;
     }
 
     if (request == SNDRV_PCM_IOCTL_START) {
         alsa_pcm_state = 3; // SNDRV_PCM_STATE_RUNNING
-        if (alsa_status_page_virt) {
-            ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
+        alsa_mmap_pump();
+        if (hda_is_present()) {
+            hda_start_playback();
+        }
+        alsa_publish_hw_ptr();
+        if (hda_is_present()) {
+            extern void wait_queue_wake_all(void *wq);
+            wait_queue_wake_all(hda_get_wait_queue());
         }
         return 0;
     }
 
-    if (request == SNDRV_PCM_IOCTL_DROP || request == SNDRV_PCM_IOCTL_RESET) {
+    if (request == SNDRV_PCM_IOCTL_DROP) {
         if (hda_is_present()) {
             hda_reset_stream();
         }
@@ -1139,17 +1212,53 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         alsa_appl_ptr = 0;
         alsa_hw_ptr = 0;
         alsa_mmap_consumed = 0;
-        if (alsa_status_page_virt) {
-            ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
-            ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->hw_ptr = 0;
-        }
+        alsa_mmap_appl_offset = 0;
+        alsa_publish_hw_ptr();
         if (alsa_control_page_virt) {
             ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = 0;
+        }
+        if (hda_is_present()) {
+            extern void wait_queue_wake_all(void *wq);
+            wait_queue_wake_all(hda_get_wait_queue());
         }
         return 0;
     }
 
-    if (request == SNDRV_PCM_IOCTL_DRAIN || request == SNDRV_PCM_IOCTL_HWSYNC) {
+    if (request == SNDRV_PCM_IOCTL_RESET) {
+        if (hda_is_present()) {
+            hda_reset_stream();
+        }
+        alsa_appl_ptr = 0;
+        alsa_hw_ptr = 0;
+        alsa_mmap_consumed = 0;
+        alsa_mmap_appl_offset = 0;
+        if (alsa_pcm_state != 2 /* PREPARED */ && alsa_pcm_state != 3 /* RUNNING */) {
+            alsa_pcm_state = 1; // SNDRV_PCM_STATE_SETUP
+        }
+        alsa_publish_hw_ptr();
+        if (alsa_control_page_virt) {
+            ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = 0;
+        }
+        if (hda_is_present()) {
+            extern void wait_queue_wake_all(void *wq);
+            wait_queue_wake_all(hda_get_wait_queue());
+        }
+        return 0;
+    }
+
+    if (request == SNDRV_PCM_IOCTL_DRAIN) {
+        if (alsa_pcm_state == 3 /* RUNNING */) {
+            alsa_pcm_state = 5; // SNDRV_PCM_STATE_DRAINING
+            if (alsa_status_page_virt) {
+                ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
+            }
+        }
+        return 0;
+    }
+
+    if (request == SNDRV_PCM_IOCTL_HWSYNC) {
+        alsa_mmap_pump();
+        alsa_publish_hw_ptr();
         return 0;
     }
 
@@ -1174,7 +1283,12 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         struct snd_xferi *xferi = (struct snd_xferi *)arg;
         if (!xferi || !xferi->buf) return -14;
 
+        if (alsa_pcm_state == 4 /* SNDRV_PCM_STATE_XRUN */ || alsa_pcm_state == 2 /* SNDRV_PCM_STATE_PREPARED */) {
+            alsa_pcm_state = 3; // SNDRV_PCM_STATE_RUNNING
+        }
+
         uint32_t frame_size = (alsa_bits / 8) * alsa_channels;
+        if (frame_size == 0) frame_size = 4;
         uint32_t total_bytes = (uint32_t)(xferi->frames * frame_size);
 
         uint32_t written = 0;
@@ -1196,6 +1310,10 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         }
         // Let alsa-lib see how much of what it just wrote is still queued.
         alsa_publish_hw_ptr();
+        if (hda_is_present()) {
+            extern void wait_queue_wake_all(void *wq);
+            wait_queue_wake_all(hda_get_wait_queue());
+        }
         return 0;
     }
 
@@ -1208,7 +1326,9 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         if (!area) return -14;
         uint32_t frame_size = (alsa_bits / 8) * alsa_channels;
         if (frame_size == 0) frame_size = 4;
-        uint32_t buf_frames = ALSA_DMA_BUF_SIZE / frame_size;
+        uint32_t buf_frames = alsa_buffer_frames ? (uint32_t)alsa_buffer_frames
+                                                 : ALSA_DMA_BUF_SIZE / frame_size;
+        if (buf_frames == 0) buf_frames = 2;
         uint32_t off = (uint32_t)(alsa_mmap_appl_offset % buf_frames);
         area->offset = off;
         area->frames = buf_frames - off; // contiguous frames available
@@ -1221,9 +1341,14 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         if (!xferi) return -14;
         uint32_t frame_size = (alsa_bits / 8) * alsa_channels;
         if (frame_size == 0) frame_size = 4;
-        uint32_t buf_frames = ALSA_DMA_BUF_SIZE / frame_size;
+        uint32_t buf_frames = alsa_buffer_frames ? (uint32_t)alsa_buffer_frames
+                                                 : ALSA_DMA_BUF_SIZE / frame_size;
+        if (buf_frames == 0) buf_frames = 2;
         uint64_t frames = xferi->frames;
         if (frames == 0) { xferi->result = 0; return 0; }
+        if (frames > 16384)
+            klogf("[ALSA] MMAP_COMMIT large frames=%llu buf=%u rate=%u\n",
+                  (unsigned long long)frames, buf_frames, alsa_sample_rate);
         if (frames > buf_frames) frames = buf_frames;
         uint32_t off = (uint32_t)(alsa_mmap_appl_offset % buf_frames);
         uint32_t byte_off = off * frame_size;
@@ -1260,9 +1385,13 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         struct snd_pcm_status *st = (struct snd_pcm_status *)arg;
         if (!st) return -14;
         memset(st, 0, sizeof(*st));
-        st->state = alsa_pcm_state;
         alsa_mmap_pump();
         alsa_publish_hw_ptr();
+        st->state = alsa_pcm_state;
+        extern uint64_t lapic_timer_get_ms(void);
+        uint64_t ms = lapic_timer_get_ms();
+        st->tstamp.tv_sec = ms / 1000;
+        st->tstamp.tv_nsec = (ms % 1000) * 1000000;
         st->appl_ptr  = alsa_appl_ptr;
         st->hw_ptr    = alsa_hw_ptr;
         st->delay     = (int64_t)(alsa_appl_ptr - alsa_hw_ptr);
@@ -1272,7 +1401,19 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         return 0;
     }
 
-    if (request == SNDRV_PCM_IOCTL_RESUME || request == SNDRV_PCM_IOCTL_XRUN) {
+    if (request == SNDRV_PCM_IOCTL_RESUME) {
+        return 0;
+    }
+
+    if (request == SNDRV_PCM_IOCTL_XRUN) {
+        alsa_pcm_state = 4; // SNDRV_PCM_STATE_XRUN
+        if (alsa_status_page_virt) {
+            ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
+        }
+        if (hda_is_present()) {
+            extern void wait_queue_wake_all(void *wq);
+            wait_queue_wake_all(hda_get_wait_queue());
+        }
         return 0;
     }
 
@@ -1285,6 +1426,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         return -22; // -EINVAL (non-interleaved not supported)
     }
 
+    klogf("[ALSA] Unhandled PCM ioctl 0x%08x\n", request);
     return -25; // -ENOTTY (Inappropriate ioctl for device)
 }
 
@@ -1319,9 +1461,22 @@ static int alsa_pcm_poll(struct vfs_node *node, int events) {
         return (events & (POLLOUT | POLLWRNORM));
     }
 
+    if (alsa_pcm_state == 4 /* SNDRV_PCM_STATE_XRUN */) {
+        return (events & (POLLOUT | POLLWRNORM));
+    }
+
+    if (alsa_pcm_state == 2 /* SNDRV_PCM_STATE_PREPARED */) {
+        return (events & (POLLOUT | POLLWRNORM));
+    }
+
     alsa_mmap_pump();
     alsa_publish_hw_ptr();
-    uint64_t avail_min = 1;
+
+    if (alsa_pcm_state == 4 /* SNDRV_PCM_STATE_XRUN */) {
+        return (events & (POLLOUT | POLLWRNORM));
+    }
+
+    uint64_t avail_min = alsa_avail_min ? alsa_avail_min : 1;
     if (alsa_control_page_virt) {
         uint64_t m = ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->avail_min;
         if (m) {
@@ -1455,22 +1610,22 @@ static uint64_t alsa_pcm_mmap(struct vfs_node *node, uint64_t addr,
     uint64_t phys_base;
     uint64_t map_size;
 
-    if (offset >= SNDRV_PCM_MMAP_OFFSET_CONTROL) {
+    if (offset == SNDRV_PCM_MMAP_OFFSET_CONTROL_OLD ||
+        offset == SNDRV_PCM_MMAP_OFFSET_CONTROL_NEW ||
+        offset == 0x81000000ULL || offset == 0x83000000ULL) {
         // Control page: the hw plugin writes appl_ptr/avail_min here
         if (!alsa_control_page_phys) { return (uint64_t)-1; }
         phys_base = alsa_control_page_phys;
         map_size  = 4096;
-    } else if (offset >= SNDRV_PCM_MMAP_OFFSET_STATUS) {
+    } else if (offset == SNDRV_PCM_MMAP_OFFSET_STATUS_OLD ||
+               offset == SNDRV_PCM_MMAP_OFFSET_STATUS_NEW ||
+               offset == 0x80000000ULL || offset == 0x82000000ULL) {
         // Status page: the hw plugin reads state/hw_ptr from here
         if (!alsa_status_page_phys) { return (uint64_t)-1; }
         phys_base = alsa_status_page_phys;
         map_size  = 4096;
         // Reflect current state into the status page
-        struct snd_pcm_mmap_status *st = (struct snd_pcm_mmap_status *)alsa_status_page_virt;
-        if (st) {
-            st->state  = alsa_pcm_state;
-            st->hw_ptr = alsa_hw_ptr;
-        }
+        alsa_publish_hw_ptr();
     } else {
         // DATA area: the audio ring buffer
         if (!alsa_dma_buf_virt || !alsa_dma_buf_phys) { return (uint64_t)-1; }
@@ -1491,9 +1646,9 @@ void alsa_emu_init(void) {
 }
 
 void alsa_emu_register_vfs(void) {
-    // Let the HDA interrupt drive the mmap pump so MMAP-mode clients (and the
-    // plug/convert chains) keep feeding the DMA ring.
-    hda_set_tick_callback(alsa_mmap_pump);
+    // Let the HDA interrupt drive the mmap pump and status updates so both
+    // MMAP-mode and standard RW-mode clients keep pace with the DMA ring.
+    hda_set_tick_callback(alsa_tick);
 
     vfs_node_t *snd_dir = NULL;
     vfs_node_t *dev_dir = vfs_resolve_path("/dev");

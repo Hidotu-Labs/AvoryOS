@@ -172,6 +172,7 @@ void lockdiag_wq_drop(const void *wq);
  * leaves its slot set, so the report can say exactly what it was waiting on. */
 void lockdiag_spin_begin(const void *lock, uint64_t ip);
 void lockdiag_spin_end(const void *lock);
+bool lockdiag_get_spin_wait(uint32_t cpu_id, uint64_t *lock_out, uint64_t *ip_out, uint64_t *since_tsc_out);
 
 #define LOCKDIAG_SPIN_BEGIN(lock)                                              \
   lockdiag_spin_begin((const void *)(lock),                                    \

@@ -114,7 +114,10 @@ fi
 # clients fall back to /run/pipewire, which the session daemon never uses.
 XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-0}"
 export XDG_RUNTIME_DIR
-mkdir -p "$XDG_RUNTIME_DIR" && chmod 0700 "$XDG_RUNTIME_DIR"
+# Must match pipewire OpenRC service (setup-alpine.sh): shared system
+# instance, so 1777. 0700 root-owned blocks lightdm/avory clients and
+# makes them autospawn a second pipewire -> bind conflict -> respawn loop.
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 1777 "$XDG_RUNTIME_DIR"
 
 if command -v dbus-daemon >/dev/null 2>&1 && [ ! -S /run/dbus/system_bus_socket ]; then
     rm -f /tmp/ascent-system-dbus.log

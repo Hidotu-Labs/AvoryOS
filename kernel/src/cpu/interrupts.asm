@@ -109,7 +109,7 @@ isr_common_stub:
     ;
     ; NOTE: for ring-0 exceptions [rsp+40] and [rsp+48] are NOT pushed by CPU.
     ; The struct registers rsp/ss fields will contain garbage in that case.
-    ; isr_panic() compensates by reading RSP directly via inline asm for ring-0.
+    ; The fault reporter reconstructs the pre-fault ring-0 RSP from this frame.
 
     ; The kernel is entirely responsible for the direction flag: memset and
     ; memcpy here are REP strings, so an interrupted context with RFLAGS.DF=1

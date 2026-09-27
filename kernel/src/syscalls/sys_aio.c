@@ -1,5 +1,5 @@
 // sys_aio.c — Async / event I/O syscalls:
-//   eventfd2, timerfd_create/settime/gettime, pipe, pipe2,
+//   eventfd2, timerfd_create/settime/gettime, pipe, pipe2, tee,
 //   inotify_init, inotify_init1, inotify_add_watch,
 //   memfd_create
 #include "sys_io_shared.h"
@@ -576,6 +576,183 @@ static void pipe_close(vfs_node_t *node) {
     }
 }
 
+static int pipe_ioctl(vfs_node_t *node, uint32_t request, uint64_t arg) {
+    if (!node || !node->device) return -9; // EBADF
+    pipe_end_t *end = (pipe_end_t *)node->device;
+    pipe_ctx_t *ctx = end->ctx;
+    if (!ctx) return -9;
+
+    switch (request) {
+    case 0x541B: { // FIONREAD / TIOCINQ
+        int *out = (int *)arg;
+        if (!out || !vmm_is_user_addr_range_valid(arg, sizeof(int))) {
+            return -14; // EFAULT
+        }
+        spinlock_acquire(&ctx->lock);
+        int unread = 0;
+        if (ctx->length > ctx->read_offset) {
+            unread = (int)(ctx->length - ctx->read_offset);
+        }
+        spinlock_release(&ctx->lock);
+        *out = unread;
+        return 0;
+    }
+    default:
+        return -25; // ENOTTY
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tee: duplicate pipe content to a second pipe without consuming the input.
+// tee(fd_in, fd_out, len, flags) - syscall 276.
+// ---------------------------------------------------------------------------
+
+#define TEE_F_MOVE     0x01
+#define TEE_F_NONBLOCK 0x02
+#define TEE_F_MORE     0x04
+#define TEE_F_GIFT     0x08
+#define TEE_CHUNK      4096
+
+static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
+                        uint64_t flags, uint64_t a4, uint64_t a5) {
+    (void)a4; (void)a5;
+    if (flags & ~(uint64_t)(TEE_F_MOVE | TEE_F_NONBLOCK | TEE_F_MORE | TEE_F_GIFT))
+        return (uint64_t)-22; // EINVAL: unknown flag bits
+
+    struct thread *t = sched_get_current();
+    if (!t || fd_in >= MAX_FDS || fd_out >= MAX_FDS || !t->fds[fd_in] ||
+        !t->fds[fd_out])
+        return (uint64_t)-9; // EBADF
+
+    vfs_node_t *in_node = t->fds[fd_in];
+    vfs_node_t *out_node = t->fds[fd_out];
+    /* Both ends must be pipes, opened the right way: the input needs the
+     * read side, the output the write side. */
+    if ((in_node->flags & FS_TYPE_MASK) != FS_PIPE ||
+        (out_node->flags & FS_TYPE_MASK) != FS_PIPE || !in_node->read ||
+        !out_node->write)
+        return (uint64_t)-22; // EINVAL: not a pipe pair
+
+    pipe_end_t *in_end = (pipe_end_t *)in_node->device;
+    pipe_end_t *out_end = (pipe_end_t *)out_node->device;
+    pipe_ctx_t *in_ctx = in_end ? in_end->ctx : NULL;
+    pipe_ctx_t *out_ctx = out_end ? out_end->ctx : NULL;
+    if (!in_ctx || !out_ctx)
+        return (uint64_t)-9;
+    /* Linux rejects duplicating a pipe into itself. */
+    if (in_ctx == out_ctx)
+        return (uint64_t)-22;
+
+    if (len == 0)
+        return 0;
+
+    bool nonblock = (flags & TEE_F_NONBLOCK) != 0;
+    if (!nonblock && (t->fd_flags[fd_in] & 0x800))
+        nonblock = true; // O_NONBLOCK on the input, like pipe_read
+
+    /* Order nested acquisition by address so two threads teeing in opposite
+     * directions cannot deadlock each other. */
+    pipe_ctx_t *first = in_ctx < out_ctx ? in_ctx : out_ctx;
+    pipe_ctx_t *second = in_ctx < out_ctx ? out_ctx : in_ctx;
+
+    /* Wait for input data the same way pipe_read does when blocking. */
+    for (;;) {
+        spinlock_acquire(&first->lock);
+        if (second != first)
+            spinlock_acquire(&second->lock);
+        uint32_t avail = (in_ctx->length > in_ctx->read_offset)
+                             ? (in_ctx->length - in_ctx->read_offset)
+                             : 0;
+        if (avail > 0)
+            break; // locks held, data ready
+        bool writer_gone = !in_ctx->writer_open;
+        spinlock_release(&second->lock);
+        if (second != first)
+            spinlock_release(&first->lock);
+        if (writer_gone)
+            return 0; // EOF: nothing to duplicate
+        if (nonblock)
+            return (uint64_t)-11; // EAGAIN
+        wait_queue_entry_t entry = {.thread = t, .next = NULL};
+        /* Re-check under the input lock before sleeping: pipe_read's pattern
+         * guards the wakeup race the same way. */
+        spinlock_acquire(&in_ctx->lock);
+        if (in_ctx->read_offset < in_ctx->length || !in_ctx->writer_open) {
+            spinlock_release(&in_ctx->lock);
+            continue;
+        }
+        wait_queue_add(&in_ctx->wq, &entry);
+        t->state = THREAD_BLOCKED;
+        spinlock_release(&in_ctx->lock);
+        sched_yield();
+        t->state = THREAD_RUNNING;
+        wait_queue_remove(&in_ctx->wq, &entry);
+    }
+
+    uint8_t *buf = kmalloc(TEE_CHUNK);
+    if (!buf) {
+        spinlock_release(&second->lock);
+        if (second != first)
+            spinlock_release(&first->lock);
+        return (uint64_t)-12;
+    }
+
+    /* Duplicate from the input's unread window without advancing it, and
+     * append to the output pipe. */
+    uint64_t want = len;
+    uint32_t avail = in_ctx->length - in_ctx->read_offset;
+    if (want > avail)
+        want = avail;
+    uint64_t done = 0;
+    int64_t err = 0;
+    while (done < want) {
+        uint32_t chunk = (want - done > TEE_CHUNK) ? TEE_CHUNK
+                                                   : (uint32_t)(want - done);
+        vfs_node_t in_storage = {0};
+        in_storage.device = &in_ctx->ramfs;
+        in_storage.length = in_ctx->length;
+        int32_t got = (int32_t)ramfs_read(&in_storage,
+                                          in_ctx->read_offset + (uint32_t)done,
+                                          chunk, buf);
+        if (got <= 0) {
+            if (done == 0)
+                err = got < 0 ? got : -5; // EIO on a short buffer
+            break;
+        }
+        vfs_node_t out_storage = {0};
+        out_storage.device = &out_ctx->ramfs;
+        out_storage.length = out_ctx->length;
+        int32_t put = (int32_t)ramfs_write(&out_storage, out_ctx->length,
+                                           (uint32_t)got, buf);
+        if (put <= 0) {
+            if (done == 0)
+                err = put < 0 ? put : -28; // ENOSPC if the sink took nothing
+            break;
+        }
+        out_ctx->length = out_storage.length;
+        done += (uint64_t)put;
+        if (put < got)
+            break;
+    }
+    vfs_node_t *notify_read =
+        (out_ctx->reader_open && out_ctx->read_node) ? out_ctx->read_node
+                                                     : NULL;
+    bool woke_data = done > 0;
+    spinlock_release(&second->lock);
+    if (second != first)
+        spinlock_release(&first->lock);
+    kfree(buf);
+
+    if (woke_data) {
+        wait_queue_wake_all(&out_ctx->wq);
+        if (notify_read)
+            epoll_notify_event(notify_read, 0x0001); // POLLIN, like pipe_write
+    }
+    if (err && done == 0)
+        return (uint64_t)err;
+    return done;
+}
+
 static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,
                            uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
@@ -641,6 +818,7 @@ static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,
     read_node->read = pipe_read;
     write_node->write = pipe_write;
     read_node->poll = write_node->poll = pipe_poll;
+    read_node->ioctl = write_node->ioctl = pipe_ioctl;
     read_node->close = write_node->close = pipe_close;
     read_node->wait_queue = write_node->wait_queue = &ctx->wq;
     ctx->read_node = read_node;
@@ -977,6 +1155,7 @@ void syscall_register_aio(void) {
     syscall_register(SYS_TIMERFD_GETTIME,  sys_timerfd_gettime);
     syscall_register(SYS_PIPE,             sys_pipe);
     syscall_register(SYS_PIPE2,            sys_pipe2);
+    syscall_register(SYS_TEE,              sys_tee);
     syscall_register(SYS_INOTIFY_INIT,     sys_inotify_init);
     syscall_register(SYS_INOTIFY_INIT1,    sys_inotify_init1);
     syscall_register(SYS_INOTIFY_ADD_WATCH, sys_inotify_add_watch);

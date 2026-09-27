@@ -203,6 +203,19 @@ void lockdiag_spin_end(const void *lock) {
     __atomic_store_n(&w->active, 0, __ATOMIC_RELEASE);
 }
 
+bool lockdiag_get_spin_wait(uint32_t cpu_id, uint64_t *lock_out, uint64_t *ip_out, uint64_t *since_tsc_out) {
+  if (cpu_id >= MAX_CPUS)
+    return false;
+  const spin_wait_t *w = &g_spin_wait[cpu_id];
+  if (__atomic_load_n(&w->active, __ATOMIC_ACQUIRE) && w->lock) {
+    if (lock_out) *lock_out = w->lock;
+    if (ip_out) *ip_out = w->ip;
+    if (since_tsc_out) *since_tsc_out = w->since_tsc;
+    return true;
+  }
+  return false;
+}
+
 /* --- wait-queue holder tracking ----------------------------------------- */
 
 #define WQ_HOLD_SLOTS 24
@@ -809,6 +822,29 @@ void lockdiag_dump_all(const char *reason) {
           ld_comm(t->comm);
           ld_str(" ");
           ld_str(state_name(t->state));
+          ld_str(" parent=");
+          if (t->parent) {
+            ld_dec(t->parent->tid);
+            ld_str("/");
+            ld_dec(t->parent->tgid);
+            ld_str("(");
+            ld_comm(t->parent->comm);
+            ld_str(")");
+          } else {
+            ld_str("none");
+          }
+          ld_str(" exit-signal=");
+          ld_dec(t->clone_flags & 0xff);
+          ld_str(" reap-queued=");
+          ld_dec(__atomic_load_n(&t->reap_queued, __ATOMIC_RELAXED));
+          if (t->parent && SIGCHLD > 0 && SIGCHLD <= 64) {
+            const struct k_sigaction *chld =
+                &t->parent->signal_handlers[SIGCHLD - 1];
+            ld_str(" parent-SIGCHLD-handler=");
+            ld_hex((uint64_t)(uintptr_t)chld->sa_handler);
+            ld_str(" flags=");
+            ld_hex(chld->sa_flags);
+          }
           dead_shown++;
         }
         continue;

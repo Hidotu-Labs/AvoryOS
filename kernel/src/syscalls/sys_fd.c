@@ -63,6 +63,67 @@ int alloc_fd_from(struct thread *t, int from) {
   return -1;
 }
 
+/* Pin the node while an fd operation runs. CLONE_FILES threads can close and
+ * reuse an fd concurrently; holding only the pointer lets the last close tear
+ * down a tmpfs node while its read callback or page-cache fill is in flight. */
+static vfs_node_t *fd_pin_node(struct thread *t, uint64_t fd,
+                               uint64_t *offset_out,
+                               uint64_t *fd_flags_out) {
+  if (!t || !t->files || fd >= MAX_FDS)
+    return NULL;
+
+  spinlock_acquire(&t->files->lock);
+  vfs_node_t *node = t->files->fds[fd];
+  if (!node || node == FD_RESERVED) {
+    node = NULL;
+  } else {
+    vfs_node_ref(node);
+    if (offset_out)
+      *offset_out = t->files->fd_offsets[fd];
+    if (fd_flags_out)
+      *fd_flags_out = t->files->fd_flags[fd];
+  }
+  spinlock_release(&t->files->lock);
+  return node;
+}
+
+static void fd_advance_offset(struct thread *t, uint64_t fd,
+                              vfs_node_t *node, uint64_t amount) {
+  if (!t || !t->files || !node || fd >= MAX_FDS || !amount)
+    return;
+  spinlock_acquire(&t->files->lock);
+  /* A concurrent close may have reused this slot for a different file. */
+  if (t->files->fds[fd] == node)
+    t->files->fd_offsets[fd] += amount;
+  spinlock_release(&t->files->lock);
+}
+
+/* /proc/self/fd/N is a magic link on Linux: opening it reopens the referenced
+ * object, rather than resolving the printable target returned by readlink.
+ * Firefox uses this to create a read-only descriptor for a memfd. */
+static bool parse_proc_self_fd_path(const char *path, uint64_t *fd_out) {
+  static const char prefix[] = "/proc/self/fd/";
+  if (!path || !fd_out || strncmp(path, prefix, sizeof(prefix) - 1) != 0)
+    return false;
+
+  const char *p = path + sizeof(prefix) - 1;
+  if (*p < '0' || *p > '9')
+    return false;
+  uint64_t fd = 0;
+  do {
+    uint32_t digit = (uint32_t)(*p - '0');
+    if (fd > (UINT64_MAX - digit) / 10)
+      return false;
+    fd = fd * 10 + digit;
+    p++;
+  } while (*p >= '0' && *p <= '9');
+  if (*p != '\0')
+    return false;
+
+  *fd_out = fd;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // open / openat
 // ---------------------------------------------------------------------------
@@ -74,9 +135,14 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     return (uint64_t)-14; // EFAULT
 
 #if SYSCALL_LOG
-  klog_puts("[SYSCALL] open path=\"");
-  klog_puts(path);
-  klog_puts("\"\n");
+  {
+    struct thread *log_t = sched_get_current();
+    if (log_t && syscall_log_allowed(log_t)) {
+      klog_puts("[SYSCALL] open path=\"");
+      klog_puts(path);
+      klog_puts("\"\n");
+    }
+  }
 #endif
 
   (void)flags;
@@ -213,6 +279,18 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
 
     if (!node)
       node = fb_lookup_device((char *)dev_path);
+  }
+
+  if (!node) {
+    uint64_t proc_fd;
+    if (parse_proc_self_fd_path(path, &proc_fd)) {
+      node = fd_pin_node(t, proc_fd, NULL, NULL);
+      if (!node)
+        return (uint64_t)-2; // ENOENT: no such open descriptor
+      /* Treat the pin as the resolver's owned reference. open_done() takes
+       * the descriptor reference and drops this temporary reference. */
+      node_owned = true;
+    }
   }
 
   if (!node) {
@@ -386,8 +464,17 @@ static uint64_t sys_openat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
                            uint64_t mode, uint64_t a4, uint64_t a5) {
   (void)a4;
   (void)a5;
-  return (uint64_t)(int)sys_open_path((int)dirfd, (const char *)path_ptr, flags,
-                                    mode);
+  int ret = (int)sys_open_path((int)dirfd, (const char *)path_ptr, flags, mode);
+  if (ret < 0) {
+    struct thread *t = sched_get_current();
+    if (t) {
+      if (path_ptr && is_user_range((const void *)path_ptr, 1)) {
+        strncpy(t->last_error_path, (const char *)path_ptr, sizeof(t->last_error_path) - 1);
+        t->last_error_path[sizeof(t->last_error_path) - 1] = '\0';
+      }
+    }
+  }
+  return (uint64_t)(int64_t)ret;
 }
 
 static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode,
@@ -526,6 +613,36 @@ static uint64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t a2,
   return newfd;
 }
 
+static uint64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags,
+                         uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  if (flags & ~(uint64_t)O_CLOEXEC)
+    return (uint64_t)-22; // EINVAL: only O_CLOEXEC is valid
+  struct thread *t = sched_get_current();
+  if (!t || oldfd >= MAX_FDS || newfd >= MAX_FDS || !t->fds[oldfd] ||
+      t->fds[oldfd] == FD_RESERVED)
+    return (uint64_t)-9; // EBADF
+  if (oldfd == newfd)
+    return (uint64_t)-22; // EINVAL: Linux dup3 rejects oldfd==newfd
+  vfs_node_t *old_node = t->fds[oldfd];
+  vfs_node_t *prev = t->fds[newfd];
+  if (prev && prev != FD_RESERVED)
+    vfs_close(prev);
+  else if (prev == FD_RESERVED)
+    prev = NULL;
+
+  t->fds[newfd] = old_node;
+  t->fd_offsets[newfd] = t->fd_offsets[oldfd];
+  t->fd_flags[newfd] = t->fd_flags[oldfd] & ~(uint64_t)FD_FLAGS_CLOEXEC_BIT;
+  if (flags & O_CLOEXEC)
+    t->fd_flags[newfd] |= FD_FLAGS_CLOEXEC_BIT;
+  fd_path_dup(t, (int)newfd, (int)oldfd);
+  vfs_open(old_node);
+  return newfd;
+}
+
 // ---------------------------------------------------------------------------
 // read / write helpers
 // ---------------------------------------------------------------------------
@@ -535,10 +652,18 @@ static void trace_userspace_debug_write(struct thread *t, int fd,
   if (!t || fd < 0 || fd >= MAX_FDS || !t->fds[fd] || !buf || count == 0)
     return;
 
+  /* Only two node names ever match the strcmp()s below.  Running the pair on
+   * every write() showed up as the ~20-50ns gap between write(16) and
+   * read(16) in test_syscall_speed (identical paths otherwise); reject on
+   * the first byte so the common case is two loads and two compares. */
+  const char *name = t->fds[fd]->name;
+  if (name[0] != 'w' && name[0] != 'x')
+    return;
+
   const char *prefix = NULL;
-  if (strcmp(t->fds[fd]->name, "weston-debug.log") == 0)
+  if (strcmp(name, "weston-debug.log") == 0)
     prefix = "[WESTON-LOG] ";
-  else if (strcmp(t->fds[fd]->name, "xfwm4.log") == 0)
+  else if (strcmp(name, "xfwm4.log") == 0)
     prefix = "[XFWM4-LOG] ";
   else
     return;
@@ -557,15 +682,19 @@ static void trace_userspace_debug_write(struct thread *t, int fd,
 
 static int64_t fd_write(int fd, const void *buf, size_t count) {
   struct thread *t = sched_get_current();
-  if (!t || fd < 0 || fd >= MAX_FDS || !t->fds[fd])
+  if (!t || fd < 0 || fd >= MAX_FDS)
     return -9;
 
-  vfs_node_t *node = t->fds[fd];
+  uint64_t offset = 0;
+  vfs_node_t *node = fd_pin_node(t, (uint64_t)fd, &offset, NULL);
+  if (!node)
+    return -9;
   trace_userspace_debug_write(t, fd, buf, count);
   int32_t bytes_written =
-      (int32_t)vfs_write(node, t->fd_offsets[fd], count, (uint8_t *)buf);
+      (int32_t)vfs_write(node, (uint32_t)offset, count, (uint8_t *)buf);
   if (bytes_written > 0)
-    t->fd_offsets[fd] += (uint32_t)bytes_written;
+    fd_advance_offset(t, (uint64_t)fd, node, (uint32_t)bytes_written);
+  vfs_close(node);
   return (int64_t)bytes_written;
 }
 
@@ -577,14 +706,18 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count, uint64_t a3,
   struct thread *t = sched_get_current();
   if (!is_user_range((const void *)buf, count))
     return (uint64_t)-14;
-  if (!t || fd >= MAX_FDS || !t->fds[fd])
+  if (!t || fd >= MAX_FDS)
     return (uint64_t)-9;
 
-  vfs_node_t *node = t->fds[fd];
+  uint64_t offset = 0;
+  vfs_node_t *node = fd_pin_node(t, fd, &offset, NULL);
+  if (!node)
+    return (uint64_t)-9;
   int32_t bytes_read =
-      (int32_t)vfs_read(node, t->fd_offsets[fd], count, (uint8_t *)buf);
+      (int32_t)vfs_read(node, (uint32_t)offset, count, (uint8_t *)buf);
   if (bytes_read > 0)
-    t->fd_offsets[fd] += (uint32_t)bytes_read;
+    fd_advance_offset(t, fd, node, (uint32_t)bytes_read);
+  vfs_close(node);
 
   return (uint64_t)(int64_t)bytes_read;
 }
@@ -596,6 +729,16 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count,
   (void)a5;
   if (!is_user_range((const void *)buf, count))
     return (uint64_t)-14;
+
+  if (fd == 2) {
+    struct thread *t = sched_get_current();
+    if (t) {
+      size_t copy_len = count < sizeof(t->last_stderr) - 1 ? count : sizeof(t->last_stderr) - 1;
+      memcpy(t->last_stderr, (const void *)buf, copy_len);
+      t->last_stderr[copy_len] = '\0';
+    }
+  }
+
   return (uint64_t)fd_write((int)fd, (const void *)buf, (size_t)count);
 }
 
@@ -606,12 +749,15 @@ static uint64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count,
   struct thread *t = sched_get_current();
   if (!is_user_range((const void *)buf, count))
     return (uint64_t)-14;
-  if (!t || fd >= MAX_FDS || !t->fds[fd])
+  if (!t || fd >= MAX_FDS)
     return (uint64_t)-9;
 
-  vfs_node_t *node = t->fds[fd];
+  vfs_node_t *node = fd_pin_node(t, fd, NULL, NULL);
+  if (!node)
+    return (uint64_t)-9;
   int32_t bytes_read =
       (int32_t)vfs_read(node, (uint32_t)offset, count, (uint8_t *)buf);
+  vfs_close(node);
   return (uint64_t)(int64_t)bytes_read;
 }
 
@@ -622,12 +768,15 @@ static uint64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
   struct thread *t = sched_get_current();
   if (!is_user_range((const void *)buf, count))
     return (uint64_t)-14;
-  if (!t || fd >= MAX_FDS || !t->fds[fd])
+  if (!t || fd >= MAX_FDS)
     return (uint64_t)-9;
 
-  vfs_node_t *node = t->fds[fd];
+  vfs_node_t *node = fd_pin_node(t, fd, NULL, NULL);
+  if (!node)
+    return (uint64_t)-9;
   int32_t bytes_written =
       (int32_t)vfs_write(node, (uint32_t)offset, count, (uint8_t *)buf);
+  vfs_close(node);
   return (uint64_t)(int64_t)bytes_written;
 }
 
@@ -642,9 +791,28 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
   if (iovcnt > 1024)
     return (uint64_t)-22;
 
-  struct user_iovec *iov = (struct user_iovec *)iov_u;
-  if (!is_user_range((const void *)iov_u, iovcnt * sizeof(*iov)))
+  if (!is_user_range((const void *)iov_u, iovcnt * sizeof(struct user_iovec)))
     return (uint64_t)-14;
+  struct user_iovec *iov = kmalloc(iovcnt * sizeof(*iov));
+  if (!iov)
+    return (uint64_t)-12;
+  if (copy_from_user(iov, (const void *)iov_u,
+                     iovcnt * sizeof(*iov)) != 0) {
+    kfree(iov);
+    return (uint64_t)-14;
+  }
+
+  struct thread *ct = sched_get_current();
+  if (!ct || fd >= MAX_FDS) {
+    kfree(iov);
+    return (uint64_t)-9;
+  }
+  uint64_t offset = 0;
+  vfs_node_t *node = fd_pin_node(ct, fd, &offset, NULL);
+  if (!node) {
+    kfree(iov);
+    return (uint64_t)-9;
+  }
 
   size_t total = 0;
 
@@ -653,27 +821,29 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     uint64_t len = iov[i].iov_len;
     if (len == 0)
       continue;
-    if (!is_user_range((const void *)base, len))
+    if (!is_user_range((const void *)base, len)) {
+      vfs_close(node);
+      kfree(iov);
       return (uint64_t)-14;
-
-    struct thread *ct = sched_get_current();
-    if (!ct || fd >= MAX_FDS || !ct->fds[fd])
-      return (uint64_t)-9;
-
-    vfs_node_t *node = ct->fds[fd];
+    }
     int32_t bytes_read =
-        (int32_t)vfs_read(node, ct->fd_offsets[fd], len, (uint8_t *)base);
+        (int32_t)vfs_read(node, (uint32_t)(offset + total), len,
+                          (uint8_t *)base);
     if (bytes_read < 0) {
       if (total > 0)
         break;
+      vfs_close(node);
+      kfree(iov);
       return (uint64_t)(int64_t)bytes_read;
     }
-    if (bytes_read > 0)
-      ct->fd_offsets[fd] += (uint32_t)bytes_read;
     total += (size_t)bytes_read;
     if ((uint32_t)bytes_read < len)
       break;
   }
+  if (total > 0)
+    fd_advance_offset(ct, fd, node, total);
+  vfs_close(node);
+  kfree(iov);
   return total;
 }
 
@@ -687,14 +857,56 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
   if (iovcnt > 1024)
     return (uint64_t)-22;
 
-  struct user_iovec *iov = (struct user_iovec *)iov_u;
-  if (!is_user_range((const void *)iov_u, iovcnt * sizeof(*iov)))
+  if (!is_user_range((const void *)iov_u, iovcnt * sizeof(struct user_iovec)))
     return (uint64_t)-14;
 
+  /* The syscall runs with SMAP enabled. Keep both the descriptors and their
+   * payloads in kernel memory before any socket/filesystem path inspects them;
+   * a range check alone does not make direct user loads safe. */
+  struct user_iovec *iov = kmalloc(iovcnt * sizeof(*iov));
+  struct iovec *kernel_iov = kmalloc(iovcnt * sizeof(*kernel_iov));
+  if (!iov || !kernel_iov) {
+    if (iov) kfree(iov);
+    if (kernel_iov) kfree(kernel_iov);
+    return (uint64_t)-12;
+  }
+  if (copy_from_user(iov, (const void *)iov_u,
+                     iovcnt * sizeof(*iov)) != 0) {
+    kfree(kernel_iov);
+    kfree(iov);
+    return (uint64_t)-14;
+  }
+  size_t payload_size = 0;
+
   for (uint64_t i = 0; i < iovcnt; i++) {
-    if (iov[i].iov_len > 0 &&
-        !is_user_range((const void *)iov[i].iov_base, iov[i].iov_len))
+    uint64_t len = iov[i].iov_len;
+    if ((len && !is_user_range((const void *)iov[i].iov_base, len)) ||
+        len > SIZE_MAX - payload_size) {
+      kfree(kernel_iov);
+      kfree(iov);
       return (uint64_t)-14;
+    }
+    kernel_iov[i].iov_len = (size_t)len;
+    payload_size += (size_t)len;
+  }
+  uint8_t *payload = payload_size ? kmalloc(payload_size) : NULL;
+  if (payload_size && !payload) {
+    kfree(kernel_iov);
+    kfree(iov);
+    return (uint64_t)-12;
+  }
+  size_t payload_offset = 0;
+  for (uint64_t i = 0; i < iovcnt; i++) {
+    size_t len = (size_t)iov[i].iov_len;
+    kernel_iov[i].iov_base = payload ? payload + payload_offset : NULL;
+    if (len && copy_from_user(kernel_iov[i].iov_base,
+                              (const void *)iov[i].iov_base, len) != 0) {
+      if (payload) kfree(payload);
+      kfree(kernel_iov);
+      kfree(iov);
+      return (uint64_t)-14;
+    }
+    payload_offset += len;
   }
 
   /* A socket writev is one send operation.  Splitting it into write calls can
@@ -703,28 +915,38 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
   if (sock && socket_try_get(sock)) {
     if (sock->closing) {
       socket_put(sock);
+      if (payload) kfree(payload);
+      kfree(kernel_iov);
+      kfree(iov);
       return (uint64_t)-32;
     }
     struct msghdr msg = {0};
-    msg.msg_iov = (struct iovec *)iov;
+    msg.msg_iov = kernel_iov;
     msg.msg_iovlen = (size_t)iovcnt;
     ssize_t ret = sock->ops && sock->ops->sendmsg
                       ? sock->ops->sendmsg(sock, &msg, 0)
                       : -95;
     socket_put(sock);
+    if (payload) kfree(payload);
+    kfree(kernel_iov);
+    kfree(iov);
     return (uint64_t)ret;
   }
 
   size_t total = 0;
   for (uint64_t i = 0; i < iovcnt; i++) {
-    uint64_t base = iov[i].iov_base;
+    uint64_t base = (uint64_t)kernel_iov[i].iov_base;
     uint64_t len = iov[i].iov_len;
     if (len == 0)
       continue;
 
     int64_t w = fd_write((int)fd, (const void *)base, (size_t)len);
-    if (w < 0)
+    if (w < 0) {
+      if (payload) kfree(payload);
+      kfree(kernel_iov);
+      kfree(iov);
       return total > 0 ? total : (uint64_t)w;
+    }
     if (w == 0 && len != 0) {
       /* A non-empty writev must not report a zero-byte success: callers such
        * as GNU ld retry it forever. Leave a focused diagnostic while finding
@@ -745,12 +967,150 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       else
         klog_puts("0");
       klog_puts("\n");
+      if (payload) kfree(payload);
+      kfree(kernel_iov);
+      kfree(iov);
       return total > 0 ? total : (uint64_t)-5; /* EIO */
     }
     total += (size_t)w;
     if ((size_t)w != len)
       break;
   }
+  if (payload) kfree(payload);
+  kfree(kernel_iov);
+  kfree(iov);
+  return total;
+}
+
+// ---------------------------------------------------------------------------
+// preadv / pwritev: vectored I/O at an explicit offset, fd position untouched.
+// Mirrors readv/writev validation; like pread64/pwrite64 the offset is passed
+// straight to the VFS layer (pipes and sockets ignore it there).
+// ---------------------------------------------------------------------------
+
+static uint64_t sys_preadv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
+                           uint64_t offset, uint64_t a4, uint64_t a5) {
+  (void)a4;
+  (void)a5;
+
+  if (iovcnt == 0)
+    return 0;
+  if (iovcnt > 1024)
+    return (uint64_t)-22;
+
+  if (!is_user_range((const void *)iov_u, iovcnt * sizeof(struct user_iovec)))
+    return (uint64_t)-14;
+  struct user_iovec *iov = kmalloc(iovcnt * sizeof(*iov));
+  if (!iov)
+    return (uint64_t)-12;
+  if (copy_from_user(iov, (const void *)iov_u,
+                     iovcnt * sizeof(*iov)) != 0) {
+    kfree(iov);
+    return (uint64_t)-14;
+  }
+
+  struct thread *ct = sched_get_current();
+  if (!ct || fd >= MAX_FDS) {
+    kfree(iov);
+    return (uint64_t)-9;
+  }
+  vfs_node_t *node = fd_pin_node(ct, fd, NULL, NULL);
+  if (!node) {
+    kfree(iov);
+    return (uint64_t)-9;
+  }
+
+  size_t total = 0;
+
+  for (uint64_t i = 0; i < iovcnt; i++) {
+    uint64_t base = iov[i].iov_base;
+    uint64_t len = iov[i].iov_len;
+    if (len == 0)
+      continue;
+    if (!is_user_range((const void *)base, len)) {
+      vfs_close(node);
+      kfree(iov);
+      return (uint64_t)-14;
+    }
+    int32_t bytes_read =
+        (int32_t)vfs_read(node, (uint32_t)(offset + total), len,
+                          (uint8_t *)base);
+    if (bytes_read < 0) {
+      if (total > 0)
+        break;
+      vfs_close(node);
+      kfree(iov);
+      return (uint64_t)(int64_t)bytes_read;
+    }
+    total += (size_t)bytes_read;
+    if ((uint32_t)bytes_read < len)
+      break;
+  }
+  vfs_close(node);
+  kfree(iov);
+  return total;
+}
+
+static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
+                            uint64_t offset, uint64_t a4, uint64_t a5) {
+  (void)a4;
+  (void)a5;
+
+  if (iovcnt == 0)
+    return 0;
+  if (iovcnt > 1024)
+    return (uint64_t)-22;
+
+  if (!is_user_range((const void *)iov_u, iovcnt * sizeof(struct user_iovec)))
+    return (uint64_t)-14;
+  struct user_iovec *iov = kmalloc(iovcnt * sizeof(*iov));
+  if (!iov)
+    return (uint64_t)-12;
+  if (copy_from_user(iov, (const void *)iov_u,
+                     iovcnt * sizeof(*iov)) != 0) {
+    kfree(iov);
+    return (uint64_t)-14;
+  }
+
+  struct thread *ct = sched_get_current();
+  if (!ct || fd >= MAX_FDS) {
+    kfree(iov);
+    return (uint64_t)-9;
+  }
+  vfs_node_t *node = fd_pin_node(ct, fd, NULL, NULL);
+  if (!node) {
+    kfree(iov);
+    return (uint64_t)-9;
+  }
+
+  size_t total = 0;
+
+  for (uint64_t i = 0; i < iovcnt; i++) {
+    uint64_t base = iov[i].iov_base;
+    uint64_t len = iov[i].iov_len;
+    if (len == 0)
+      continue;
+    if (!is_user_range((const void *)base, len)) {
+      vfs_close(node);
+      kfree(iov);
+      return (uint64_t)-14;
+    }
+    int32_t bytes_written =
+        (int32_t)vfs_write(node, (uint32_t)(offset + total), len,
+                           (uint8_t *)base);
+    if (bytes_written < 0) {
+      if (total > 0)
+        break;
+      vfs_close(node);
+      kfree(iov);
+      return (uint64_t)(int64_t)bytes_written;
+    }
+    total += (size_t)bytes_written;
+    if ((uint32_t)bytes_written < len)
+      break;
+  }
+  vfs_close(node);
+  kfree(iov);
   return total;
 }
 
@@ -1148,12 +1508,26 @@ static uint64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t a2,
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
-  if (!t || fd >= MAX_FDS || !t->fds[fd])
+  vfs_node_t *node = fd_pin_node(t, fd, NULL, NULL);
+  if (!node) {
+    uintptr_t slot = 0;
+    if (t && t->files && fd < MAX_FDS) {
+      spinlock_acquire(&t->files->lock);
+      slot = (uintptr_t)t->files->fds[fd];
+      spinlock_release(&t->files->lock);
+    }
+    klogf("[FTRUNCATE] EBADF fd=%llu slot=%p comm='%s' tid=%u\n",
+          (unsigned long long)fd, (void *)slot,
+          (t && t->comm[0]) ? t->comm : "?", t ? t->tid : 0);
     return (uint64_t)-9;
-  vfs_node_t *node = t->fds[fd];
-  if (!node || (node->flags & FS_TYPE_MASK) != FS_FILE)
+  }
+  if ((node->flags & FS_TYPE_MASK) != FS_FILE) {
+    vfs_close(node);
     return (uint64_t)-1;
-  return vfs_truncate(node, (uint32_t)length) == 0 ? 0 : (uint64_t)-1;
+  }
+  int result = vfs_truncate(node, (uint32_t)length);
+  vfs_close(node);
+  return result == 0 ? 0 : (uint64_t)-1;
 }
 
 static uint64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
@@ -1161,28 +1535,26 @@ static uint64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
-  if (!t || fd >= MAX_FDS || !t->fds[fd])
+  vfs_node_t *node = fd_pin_node(t, fd, NULL, NULL);
+  if (!node) {
+    uintptr_t slot = 0;
+    if (t && t->files && fd < MAX_FDS) {
+      spinlock_acquire(&t->files->lock);
+      slot = (uintptr_t)t->files->fds[fd];
+      spinlock_release(&t->files->lock);
+    }
+    klogf("[FALLOCATE] EBADF fd=%llu slot=%p comm='%s' tid=%u\n",
+          (unsigned long long)fd, (void *)slot,
+          (t && t->comm[0]) ? t->comm : "?", t ? t->tid : 0);
     return (uint64_t)-9;
-  vfs_node_t *node = t->fds[fd];
-  if (!node)
-    return (uint64_t)-9;
-  if ((node->flags & FS_TYPE_MASK) != FS_FILE)
+  }
+  if ((node->flags & FS_TYPE_MASK) != FS_FILE) {
+    vfs_close(node);
     return (uint64_t)-22;
-
-  klog_puts("[SYSCALL] fallocate: fd=");
-  klog_uint64(fd);
-  klog_puts(" mode=");
-  klog_uint64(mode);
-  klog_puts(" offset=");
-  klog_uint64(offset);
-  klog_puts(" len=");
-  klog_uint64(len);
-  klog_puts("\n");
+  }
 
   int ret = vfs_fallocate(node, (int)mode, (uint32_t)offset, (uint32_t)len);
-  klog_puts("[SYSCALL] fallocate: result=");
-  klog_uint64((uint64_t)(int64_t)ret);
-  klog_puts("\n");
+  vfs_close(node);
   if (ret != 0)
     return ret == -1 ? (uint64_t)-95 : (uint64_t)ret; // -95 = -EOPNOTSUPP
   return 0;
@@ -1218,6 +1590,29 @@ static uint64_t sys_fdatasync(uint64_t fd, uint64_t a1, uint64_t a2,
   return sys_fsync(fd, a1, a2, a3, a4, a5);
 }
 
+/* Linux sync_file_range(2).  WAIT_BEFORE/WRITE/WAIT_AFTER stage writeback of
+ * a byte range; this kernel has no dirty-page tracking to flush selectively,
+ * so any valid request degrades to the same cache sync fsync performs. */
+#define SYNC_FILE_RANGE_WAIT_BEFORE 1
+#define SYNC_FILE_RANGE_WRITE 2
+#define SYNC_FILE_RANGE_WAIT_AFTER 4
+static uint64_t sys_sync_file_range(uint64_t fd, uint64_t offset,
+                                    uint64_t nbytes, uint64_t flags,
+                                    uint64_t a4, uint64_t a5) {
+  (void)offset;
+  (void)nbytes;
+  (void)a4;
+  (void)a5;
+  if (flags & ~(uint64_t)(SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE |
+                          SYNC_FILE_RANGE_WAIT_AFTER))
+    return (uint64_t)-22; // EINVAL: unknown flag bits
+  struct thread *t = sched_get_current();
+  if (!t || fd >= MAX_FDS || !t->fds[fd])
+    return (uint64_t)-9; // EBADF
+  vfs_cache_sync(t->fds[fd]);
+  return 0;
+}
+
 static uint64_t sys_fadvise64(uint64_t fd, uint64_t offset, uint64_t len,
                               uint64_t advice, uint64_t a4, uint64_t a5) {
   (void)fd;
@@ -1226,6 +1621,48 @@ static uint64_t sys_fadvise64(uint64_t fd, uint64_t offset, uint64_t len,
   (void)advice;
   (void)a4;
   (void)a5;
+  return 0;
+}
+
+static uint64_t sys_readahead(uint64_t fd, uint64_t offset, uint64_t count,
+                              uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a3;
+  (void)a4;
+  (void)a5;
+
+  struct thread *t = sched_get_current();
+  uint64_t fd_flags = 0;
+  vfs_node_t *node = fd_pin_node(t, fd, NULL, &fd_flags);
+  if (!node)
+    return (uint64_t)-9; // EBADF
+
+  if ((fd_flags & O_PATH) || (fd_flags & O_ACCMODE) == O_WRONLY) {
+    vfs_close(node);
+    return (uint64_t)-9; // EBADF: descriptor is not open for reading
+  }
+  if ((int64_t)offset < 0) {
+    vfs_close(node);
+    return (uint64_t)-22; // EINVAL
+  }
+  if ((node->flags & FS_TYPE_MASK) != FS_FILE) {
+    vfs_close(node);
+    return (uint64_t)-29; // ESPIPE: no seekable file to prefetch
+  }
+  if (!node->read) {
+    vfs_close(node);
+    return (uint64_t)-22; // EINVAL: file does not support reads
+  }
+
+  /* VFS file lengths are currently 32-bit. Treat larger offsets as EOF and
+   * clamp the byte count before handing it to the page-cache read-ahead path. */
+  if (count && offset < node->length) {
+    uint32_t byte_offset = (uint32_t)offset;
+    uint32_t available = node->length - byte_offset;
+    uint32_t bytes = count < available ? (uint32_t)count : available;
+    (void)vfs_cache_readahead(node, byte_offset, bytes);
+  }
+
+  vfs_close(node);
   return 0;
 }
 
@@ -1359,12 +1796,15 @@ void syscall_register_fd(void) {
   syscall_register(SYS_PWRITE64, sys_pwrite64);
   syscall_register(SYS_READV, sys_readv);
   syscall_register(SYS_WRITEV, sys_writev);
+  syscall_register(SYS_PREADV, sys_preadv);
+  syscall_register(SYS_PWRITEV, sys_pwritev);
   syscall_register(SYS_OPEN, sys_open);
   syscall_register(SYS_OPENAT, sys_openat);
   syscall_register(SYS_CLOSE, sys_close);
   syscall_register(SYS_CLOSE_RANGE, sys_close_range);
   syscall_register(SYS_DUP, sys_dup);
   syscall_register(SYS_DUP2, sys_dup2);
+  syscall_register(SYS_DUP3, sys_dup3);
   syscall_register(SYS_LSEEK, sys_lseek);
   syscall_register(SYS_FCNTL, sys_fcntl);
   syscall_register(SYS_FTRUNCATE, sys_ftruncate);
@@ -1372,10 +1812,12 @@ void syscall_register_fd(void) {
   syscall_register(SYS_FLOCK, sys_flock);
   syscall_register(SYS_FSYNC, sys_fsync);
   syscall_register(SYS_FDATASYNC, sys_fdatasync);
+  syscall_register(SYS_SYNC_FILE_RANGE, sys_sync_file_range);
   syscall_register(SYS_MOUNT, sys_mount);
   syscall_register(SYS_UMOUNT2, sys_umount2);
   syscall_register(SYS_SENDFILE, sys_sendfile);
   syscall_register(SYS_COPY_FILE_RANGE, sys_copy_file_range);
   syscall_register(SYS_SPLICE, sys_splice);
   syscall_register(SYS_FADVISE64, sys_fadvise64);
+  syscall_register(SYS_READAHEAD, sys_readahead);
 }

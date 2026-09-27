@@ -4,6 +4,7 @@
 #include "fs/vfs.h"
 #include "lib/string.h"
 #include "mm/heap.h"
+#include "mm/vmm.h"
 #include "net/ipv4.h"
 #include "net/raw_icmp.h"
 #include "net/tcp.h"
@@ -265,23 +266,120 @@ static ssize_t inet_recv(socket_t *sock, void *buf, size_t len, int flags) {
 }
 
 static ssize_t inet_sendmsg(socket_t *sock, struct msghdr *msg, int flags) {
+    inet_sock_t *isk = sock ? (inet_sock_t *)sock->sk : NULL;
+    if (!isk || !msg || !msg->msg_iov) return -22;
     struct sockaddr *dest = NULL;
     int addrlen = 0;
     if (msg->msg_name && msg->msg_namelen >= sizeof(struct sockaddr_in)) {
         dest = (struct sockaddr *)msg->msg_name;
         addrlen = (int)msg->msg_namelen;
     }
+
+    /* A datagram sendmsg is one packet whose payload is the concatenation of
+     * all iovecs. Sending each vector through udp_sendto() creates multiple
+     * unrelated datagrams, breaking scatter/gather UDP protocols. */
+    if (isk->udp) {
+        uint8_t datagram[UDP_PAYLOAD_MAX];
+        size_t total = 0;
+        for (size_t i = 0; i < msg->msg_iovlen; i++) {
+            size_t length = msg->msg_iov[i].iov_len;
+            if (length > sizeof(datagram) - total) return -90;
+            memcpy(datagram + total, msg->msg_iov[i].iov_base, length);
+            total += length;
+        }
+        return inet_sendto(sock, datagram, total, flags, dest, addrlen);
+    }
+
     ssize_t total = 0;
     for (size_t i = 0; i < msg->msg_iovlen; i++) {
         ssize_t r = inet_sendto(sock, msg->msg_iov[i].iov_base,
                                 msg->msg_iov[i].iov_len, flags, dest, addrlen);
         if (r < 0) return total > 0 ? total : r;
         total += r;
+        if ((size_t)r < msg->msg_iov[i].iov_len) break;
     }
     return total;
 }
 
 static ssize_t inet_recvmsg(socket_t *sock, struct msghdr *msg, int flags) {
+    inet_sock_t *isk = sock ? (inet_sock_t *)sock->sk : NULL;
+    if (!isk || !msg || !msg->msg_iov) return -22;
+
+    /* Stream recvmsg/readv is one read across the concatenated vectors. Doing
+     * a blocking recv once per vector can consume the available bytes from
+     * the first vector, then sleep waiting for more before returning. */
+    if (isk->tcp) {
+        size_t capacity = 0;
+        for (size_t i = 0; i < msg->msg_iovlen; i++) {
+            if (msg->msg_iov[i].iov_len > (size_t)-1 - capacity) return -90;
+            capacity += msg->msg_iov[i].iov_len;
+        }
+        if (!capacity) return 0;
+        uint8_t *buffer = kmalloc(capacity);
+        if (!buffer) return -12;
+        ssize_t received = inet_recvfrom(sock, buffer, capacity, flags,
+                                         NULL, NULL);
+        if (received > 0) {
+            size_t remaining = (size_t)received;
+            size_t copied = 0;
+            for (size_t i = 0; i < msg->msg_iovlen && remaining; i++) {
+                size_t count = msg->msg_iov[i].iov_len;
+                if (count > remaining) count = remaining;
+                if (count) {
+                    memcpy(msg->msg_iov[i].iov_base, buffer + copied, count);
+                    copied += count;
+                    remaining -= count;
+                }
+            }
+        }
+        kfree(buffer);
+        return received;
+    }
+
+    /* recvmsg consumes one UDP datagram. Receive once, then scatter its bytes
+     * across the iovecs; receiving once per iovec can consume the first
+     * packet and block forever waiting for another. */
+    if (isk->udp) {
+        uint8_t datagram[UDP_PAYLOAD_MAX];
+        size_t capacity = 0;
+        for (size_t i = 0; i < msg->msg_iovlen &&
+                            capacity < sizeof(datagram); i++) {
+            size_t room = sizeof(datagram) - capacity;
+            capacity += msg->msg_iov[i].iov_len < room
+                            ? msg->msg_iov[i].iov_len
+                            : room;
+        }
+        struct sockaddr_in source;
+        memset(&source, 0, sizeof(source));
+        int source_len = sizeof(source);
+        ssize_t received = inet_recvfrom(
+            sock, datagram, capacity, flags,
+            msg->msg_name ? (struct sockaddr *)&source : NULL,
+            msg->msg_name ? &source_len : NULL);
+        if (received < 0) return received;
+
+        size_t remaining = (size_t)received;
+        size_t copied = 0;
+        for (size_t i = 0; i < msg->msg_iovlen && remaining; i++) {
+            size_t count = msg->msg_iov[i].iov_len;
+            if (count > remaining) count = remaining;
+            if (count) {
+                memcpy(msg->msg_iov[i].iov_base, datagram + copied, count);
+                copied += count;
+                remaining -= count;
+            }
+        }
+        if (msg->msg_name) {
+            size_t name_bytes = msg->msg_namelen < sizeof(source)
+                                    ? msg->msg_namelen
+                                    : sizeof(source);
+            if (name_bytes) memcpy(msg->msg_name, &source, name_bytes);
+            msg->msg_namelen = sizeof(source);
+        }
+        msg->msg_flags = 0;
+        return received;
+    }
+
     struct sockaddr *src = NULL;
     int addrlen = 0;
     if (msg->msg_name && msg->msg_namelen >= sizeof(struct sockaddr_in)) {
@@ -585,6 +683,35 @@ static int inet_poll(socket_t *sock, int events) {
     return revents;
 }
 
+static int inet_ioctl(socket_t *sock, uint32_t request, uint64_t arg) {
+    if (request != 0x541B) /* FIONREAD / TIOCINQ */
+        return -25;
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int)))
+        return -14;
+
+    inet_sock_t *isk = sock ? (inet_sock_t *)sock->sk : NULL;
+    if (!isk)
+        return -9;
+
+    size_t available = 0;
+    if (isk->tcp) {
+        available = tcp_rx_available(isk->tcp);
+    } else if (isk->udp) {
+        spinlock_acquire(&isk->udp->lock);
+        if (isk->udp->q_tail != isk->udp->q_head && isk->udp->rx_depth) {
+            struct udp_rxdesc *next =
+                &isk->udp->rx_desc[isk->udp->q_tail % isk->udp->rx_depth];
+            available = next->len;
+        }
+        spinlock_release(&isk->udp->lock);
+    } else if (isk->raw) {
+        available = raw_icmp_available(isk->raw);
+    }
+
+    *(int *)arg = available > 0x7fffffffU ? 0x7fffffff : (int)available;
+    return 0;
+}
+
 static sock_ops_t inet_udp_ops = {
     .bind        = inet_bind,
     .connect     = inet_connect,
@@ -600,7 +727,7 @@ static sock_ops_t inet_udp_ops = {
     .setsockopt  = inet_setsockopt,
     .shutdown    = inet_shutdown,
     .poll        = inet_poll,
-    .ioctl       = NULL,
+    .ioctl       = inet_ioctl,
     .getsockname = inet_getsockname,
     .getpeername = inet_getpeername,
     .destroy     = inet_destroy,

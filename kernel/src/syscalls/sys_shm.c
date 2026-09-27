@@ -16,6 +16,8 @@
 #include "../mm/vmm.h"
 #include "../sched/sched.h"
 #include "syscall.h"
+#define TSC_PROBES_ENABLE
+#include "../lib/tsc.h"
 
 #define PHYS_TO_VIRT(p) ((void *)((uint64_t)(p) + pmm_get_hhdm_offset()))
 
@@ -246,6 +248,7 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
   }
 
   // Map each page of the segment
+  TSC_BEGIN(shmat_map);
   uint64_t *pml4 = vmm_get_active_pml4();
   uint64_t flags = PAGE_FLAG_PRESENT | PAGE_FLAG_USER;
   if (!(shmflg & SHM_RDONLY)) {
@@ -288,6 +291,7 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
   seg->last_pid = t->tid;
 
   spinlock_release(&shm_lock);
+  TSC_END(shmat_map);
   return (int64_t)vaddr;
 }
 
@@ -342,6 +346,7 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t a1, uint64_t a2, uint64_t a3,
   }
 
   // Unmap pages and decrement refcounts
+  TSC_BEGIN(shmdt_unmap);
   for (uint32_t i = 0; i < num_pages; i++) {
     uint64_t va = shmaddr + i * PAGE_SIZE;
     uint64_t phys = vmm_virt_to_phys(pml4, va);
@@ -356,6 +361,7 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t a1, uint64_t a2, uint64_t a3,
   if (t->mm) {
     vma_remove(&t->mm->vmas, shmaddr, shmaddr + size);
   }
+  TSC_END(shmdt_unmap);
 
   if (seg) {
     if (seg->nattch > 0)

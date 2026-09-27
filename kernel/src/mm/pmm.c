@@ -17,6 +17,7 @@
 struct pcp_cache {
   void *pages[PCP_CAPACITY];
   uint32_t count;
+  spinlock_t lock;
 };
 
 static struct pcp_cache pcp_caches[MAX_CPUS];
@@ -118,6 +119,65 @@ static bool buddy_node_valid(const struct list_head *node, size_t order) {
   return block->node.next->prev == node && block->node.prev->next == node;
 }
 
+/* Same checks as buddy_node_valid, but names the first failure so the report
+ * distinguishes a double-owned page (bitmap says allocated) from an
+ * overwritten header (order/links).  Runs under b_zone.lock, allocation-free. */
+static const char *buddy_node_bad_reason(const struct list_head *node,
+                                         size_t order) {
+  uint64_t addr = (uint64_t)node;
+  struct list_head *head = &b_zone.free_list[order];
+  uint64_t block_size = (uint64_t)1 << (order + 12);
+  const struct buddy_block *block = (const struct buddy_block *)node;
+
+  if (!node)
+    return "null node";
+  if (!pmm_kernel_ptr_is_managed(node))
+    return "node outside managed RAM";
+  if (addr & (block_size - 1))
+    return "node misaligned for order";
+  if (block->order != order)
+    return "order field mismatch (header overwritten?)";
+
+  uint64_t pfn = (addr - physical_memory_offset) / PAGE_SIZE;
+  if (pfn < lowest_page || pfn >= highest_page)
+    return "pfn outside managed range";
+  if (bitmap_test(bitmap, pfn - lowest_page))
+    return "bitmap says allocated (double-owned or PCP-parked?)";
+
+  uint64_t next = (uint64_t)block->node.next;
+  uint64_t prev = (uint64_t)block->node.prev;
+  if (next != (uint64_t)head && !pmm_kernel_ptr_is_managed((void *)next))
+    return "next outside managed RAM";
+  if (prev != (uint64_t)head && !pmm_kernel_ptr_is_managed((void *)prev))
+    return "prev outside managed RAM";
+
+  return "links not reciprocal";
+}
+
+static void buddy_report_node_detail(const struct list_head *node,
+                                     size_t order) {
+  const struct buddy_block *block = (const struct buddy_block *)node;
+  klog_puts(" reason=");
+  klog_puts(buddy_node_bad_reason(node, order));
+  if (pmm_kernel_ptr_is_managed(node)) {
+    klog_puts(" stored_order=");
+    klog_uint64(block->order);
+    klog_puts(" next=");
+    klog_hex64((uint64_t)block->node.next);
+    klog_puts(" prev=");
+    klog_hex64((uint64_t)block->node.prev);
+    uint64_t addr = (uint64_t)node;
+    uint64_t pfn = (addr - physical_memory_offset) / PAGE_SIZE;
+    if (pfn >= lowest_page && pfn < highest_page) {
+      klog_puts(" bitmap_alloc_bit=");
+      klog_uint64(bitmap_test(bitmap, pfn - lowest_page) ? 1 : 0);
+      klog_puts(" refcount=");
+      klog_uint64(__atomic_load_n(&refcounts[pfn - lowest_page],
+                                  __ATOMIC_RELAXED));
+    }
+  }
+}
+
 /* True when the list has a valid first node.  Drops corrupted head nodes
  * (keeping a believable successor when there is one) so callers proceed. */
 static bool buddy_list_nonempty(size_t order) {
@@ -131,6 +191,8 @@ static bool buddy_list_nonempty(size_t order) {
       return true;
 
     buddy_report_corruption("first link", order, first);
+    buddy_report_node_detail(first, order);
+    klog_puts("\n");
     if (pmm_kernel_ptr_is_managed(first)) {
       struct list_head *next = first->next;
       if (next != head && pmm_kernel_ptr_is_managed(next)) {
@@ -164,6 +226,8 @@ static void buddy_list_validate(size_t order) {
   while (pos != head) {
     if (++steps > page_count || !buddy_node_valid(pos, order)) {
       buddy_report_corruption("link", order, pos);
+      buddy_report_node_detail(pos, order);
+      klog_puts("\n");
       prev->next = head;
       head->prev = prev;
       return;
@@ -656,6 +720,7 @@ void *pmm_alloc_pages_range(size_t count, uint64_t min_phys_addr,
 void pmm_pcp_init(void) {
   for (uint32_t i = 0; i < MAX_CPUS; i++) {
     pcp_caches[i].count = 0;
+    spinlock_init(&pcp_caches[i].lock);
   }
   pcp_initialized = true;
   klog_puts("[PMM] Per-CPU Page Frame Allocator (PCP) initialized.\n");
@@ -704,10 +769,12 @@ __attribute__((optimize("O3"))) void *pmm_alloc_page(void) {
   }
 
   struct pcp_cache *pcp = &pcp_caches[cpu->cpu_id];
+  spinlock_acquire(&pcp->lock);
   if (pcp->count > 0) {
     void *page = pcp->pages[--pcp->count];
     uint64_t pfn = (uint64_t)page / PAGE_SIZE;
     __atomic_store_n(&refcounts[pfn - lowest_page], 1, __ATOMIC_RELEASE);
+    spinlock_release(&pcp->lock);
     hal_irq_restore(flags);
     return page;
   }
@@ -727,6 +794,26 @@ __attribute__((optimize("O3"))) void *pmm_alloc_page(void) {
     page = pcp->pages[--pcp->count];
     uint64_t pfn = (uint64_t)page / PAGE_SIZE;
     __atomic_store_n(&refcounts[pfn - lowest_page], 1, __ATOMIC_RELEASE);
+  }
+  spinlock_release(&pcp->lock);
+
+  /* A CPU-local cache is still free memory.  If the buddy lists are empty,
+   * reclaim one page from another CPU's cache before reporting OOM. */
+  if (!page) {
+    for (uint32_t i = 0; i < MAX_CPUS; i++) {
+      if (i == cpu->cpu_id)
+        continue;
+      struct pcp_cache *other = &pcp_caches[i];
+      spinlock_acquire(&other->lock);
+      if (other->count > 0) {
+        page = other->pages[--other->count];
+        uint64_t pfn = (uint64_t)page / PAGE_SIZE;
+        __atomic_store_n(&refcounts[pfn - lowest_page], 1, __ATOMIC_RELEASE);
+      }
+      spinlock_release(&other->lock);
+      if (page)
+        break;
+    }
   }
   hal_irq_restore(flags);
   return page;
@@ -881,8 +968,10 @@ __attribute__((optimize("O3"))) void pmm_decref(void *ptr) {
   }
 
   struct pcp_cache *pcp = &pcp_caches[cpu->cpu_id];
+  spinlock_acquire(&pcp->lock);
   if (pcp->count < PCP_CAPACITY) {
     pcp->pages[pcp->count++] = ptr;
+    spinlock_release(&pcp->lock);
     hal_irq_restore(flags);
     return;
   }
@@ -895,6 +984,7 @@ __attribute__((optimize("O3"))) void pmm_decref(void *ptr) {
   }
   buddy_free_internal((uint64_t)ptr, 0);
   spinlock_release(&b_zone.lock);
+  spinlock_release(&pcp->lock);
 
   hal_irq_restore(flags);
 }

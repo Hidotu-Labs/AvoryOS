@@ -12,6 +12,8 @@
 #include "../sched/sched.h"
 #include "../socket/af_unix.h"
 #include "syscall.h"
+#define TSC_PROBES_ENABLE
+#include "../lib/tsc.h"
 #include <stdint.h>
 
 #define AT_REMOVEDIR        0x200
@@ -232,13 +234,14 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
         }
     }
 
-    char parent_path[128], dir_name[128];
+    char parent_path[256], dir_name[128];
     size_t len = strlen(path);
-    if (len == 0 || len >= sizeof(dir_name)) {
+    if (len == 0) {
         if (base_owned) vfs_close(base_owned);
         return (uint64_t)-14;
     }
 
+    TSC_BEGIN(mkdir_resolve);
     const char *slash = 0;
     for (const char *p = path; *p; p++)
         if (*p == '/') slash = p;
@@ -252,6 +255,7 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
         } else {
             if (parent_len >= sizeof(parent_path)) {
                 if (base_owned) vfs_close(base_owned);
+                TSC_END(mkdir_resolve);
                 return (uint64_t)-14;
             }
             for (size_t i = 0; i < parent_len; i++)
@@ -264,20 +268,29 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
         if (dlen == 0 || dlen >= sizeof(dir_name)) {
             if (parent_owned) vfs_close(parent);
             if (base_owned) vfs_close(base_owned);
+            TSC_END(mkdir_resolve);
             return (uint64_t)-22;
         }
         strcpy(dir_name, slash + 1);
     } else {
+        if (len >= sizeof(dir_name)) {
+            if (base_owned) vfs_close(base_owned);
+            TSC_END(mkdir_resolve);
+            return (uint64_t)-36; // ENAMETOOLONG
+        }
         strcpy(dir_name, path);
     }
+    TSC_END(mkdir_resolve);
 
     if (!parent) {
         if (base_owned) vfs_close(base_owned);
         return (uint64_t)-2; // ENOENT
     }
+    TSC_BEGIN(mkdir_op);
     if ((parent->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
         if (parent_owned) vfs_close(parent);
         if (base_owned) vfs_close(base_owned);
+        TSC_END(mkdir_op);
         return (uint64_t)-20; // ENOTDIR
     }
     vfs_node_t *existing = vfs_finddir(parent, dir_name);
@@ -285,11 +298,13 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
         vfs_close(existing);
         if (parent_owned) vfs_close(parent);
         if (base_owned) vfs_close(base_owned);
+        TSC_END(mkdir_op);
         return (uint64_t)-17;
     }
     if (!vfs_access(parent, 3)) {
         if (parent_owned) vfs_close(parent);
         if (base_owned) vfs_close(base_owned);
+        TSC_END(mkdir_op);
         return (uint64_t)-13;
     }
     mode &= ~t->umask;
@@ -297,6 +312,7 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
     if (vfs_mkdir(parent, dir_name, (uint16_t)mode) != 0) {
         if (parent_owned) vfs_close(parent);
         if (base_owned) vfs_close(base_owned);
+        TSC_END(mkdir_op);
         return (uint64_t)-17;
     }
     vfs_node_t *created = vfs_finddir(parent, dir_name);
@@ -307,6 +323,7 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
     }
     if (parent_owned) vfs_close(parent);
     if (base_owned) vfs_close(base_owned);
+    TSC_END(mkdir_op);
     return 0;
 }
 
@@ -323,6 +340,7 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
     struct thread *t = sched_get_current();
     if (!t) return (uint64_t)-1;
 
+    TSC_BEGIN(unlink_resolve);
     vfs_node_t *base_dir = fs_root;
     vfs_node_t *base_owned = NULL;
     if (path[0] != '/') {
@@ -334,16 +352,18 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
             base_dir = t->fds[dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
                 if (base_owned) vfs_close(base_owned);
+                TSC_END(unlink_resolve);
                 return (uint64_t)-20;
             }
         } else {
+            TSC_END(unlink_resolve);
             return (uint64_t)-9;
         }
     }
 
-    char parent_path[128], file_name[128];
+    char parent_path[256], file_name[128];
     size_t len = strlen(path);
-    if (len == 0 || len >= sizeof(file_name)) {
+    if (len == 0) {
         if (base_owned) vfs_close(base_owned);
         return (uint64_t)-14;
     }
@@ -377,24 +397,32 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
         }
         strcpy(file_name, slash + 1);
     } else {
+        if (len >= sizeof(file_name)) {
+            if (base_owned) vfs_close(base_owned);
+            return (uint64_t)-36; // ENAMETOOLONG
+        }
         strcpy(file_name, path);
     }
+    TSC_END(unlink_resolve);
 
     if (!parent || (parent->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
         if (parent_owned) vfs_close(parent);
         if (base_owned) vfs_close(base_owned);
         return (uint64_t)-2;
     }
+    TSC_BEGIN(unlink_op);
     vfs_node_t *victim = vfs_finddir(parent, file_name);
     if (!victim) {
         if (parent_owned) vfs_close(parent);
         if (base_owned) vfs_close(base_owned);
+        TSC_END(unlink_op);
         return (uint64_t)-2;
     }
     if (!vfs_may_remove(parent, victim)) {
         vfs_close(victim);
         if (parent_owned) vfs_close(parent);
         if (base_owned) vfs_close(base_owned);
+        TSC_END(unlink_op);
         return (uint64_t)-13;
     }
 
@@ -423,6 +451,7 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
                                         : vfs_unlink(parent, file_name);
     if (parent_owned) vfs_close(parent);
     if (base_owned) vfs_close(base_owned);
+    TSC_END(unlink_op);
     return result == 0 ? 0 : (uint64_t)-2;
 }
 
@@ -586,11 +615,15 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
     }
 
     char old_bn[128], new_bn[128];
+    TSC_BEGIN(rename_resolve);
+    char old_pdir[256];
+    size_t old_plen = 0;
+    bool old_had_slash = false;
     const char *old_slash = strrchr(oldname, '/');
     vfs_node_t *old_parent = old_base;
     bool old_parent_owned = false;
     if (old_slash) {
-        char old_pdir[256];
+        old_had_slash = true;
         size_t plen = (size_t)(old_slash - oldname);
         if (plen == 0) {
             old_parent = fs_root;
@@ -598,6 +631,7 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
             if (plen >= sizeof(old_pdir)) return (uint64_t)-14;
             memcpy(old_pdir, oldname, plen);
             old_pdir[plen] = '\0';
+            old_plen = plen;
             old_parent = vfs_resolve_path_at(old_base, old_pdir);
             old_parent_owned = old_parent != NULL;
         }
@@ -621,23 +655,36 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
             }
             memcpy(new_pdir, newname, plen);
             new_pdir[plen] = '\0';
-            new_parent = vfs_resolve_path_at(new_base, new_pdir);
-            new_parent_owned = new_parent != NULL;
+            /* Same-directory fast path: identical parent dirs share one
+             * resolution (the common rename-in-place case).  Bases match
+             * whenever both paths are absolute or were resolved from the
+             * same base above; comparing the dir strings covers both. */
+            if (old_had_slash && old_parent && plen == old_plen &&
+                old_plen > 0 && memcmp(new_pdir, old_pdir, plen) == 0 &&
+                old_base == new_base) {
+                new_parent = old_parent;
+            } else {
+                new_parent = vfs_resolve_path_at(new_base, new_pdir);
+                new_parent_owned = new_parent != NULL;
+            }
         }
         strncpy(new_bn, new_slash + 1, sizeof(new_bn) - 1);
     } else {
         strncpy(new_bn, newname, sizeof(new_bn) - 1);
     }
+    TSC_END(rename_resolve);
 
     if (!old_parent || !new_parent) {
         if (old_parent_owned) vfs_close(old_parent);
         if (new_parent_owned) vfs_close(new_parent);
         return (uint64_t)-2; // ENOENT
     }
+    TSC_BEGIN(rename_op);
     vfs_node_t *old_node = vfs_finddir(old_parent, old_bn);
     if (!old_node) {
         if (old_parent_owned) vfs_close(old_parent);
         if (new_parent_owned) vfs_close(new_parent);
+        TSC_END(rename_op);
         return (uint64_t)-2;
     }
 
@@ -646,12 +693,14 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
         vfs_close(old_node);
         if (old_parent_owned) vfs_close(old_parent);
         if (new_parent_owned) vfs_close(new_parent);
+        TSC_END(rename_op);
         return rc;
     }
 
     vfs_close(old_node);
     if (old_parent_owned) vfs_close(old_parent);
     if (new_parent_owned) vfs_close(new_parent);
+    TSC_END(rename_op);
     return (uint64_t)-18; // EXDEV
 }
 
@@ -675,16 +724,21 @@ static uint64_t sys_symlink(uint64_t target_ptr, uint64_t linkpath_ptr,
     if (!target || !linkpath) return (uint64_t)-14;
 
     char link_name[128];
+    TSC_BEGIN(symlink_resolve);
     vfs_node_t *parent = resolve_parent_and_name(linkpath, link_name, sizeof(link_name));
+    TSC_END(symlink_resolve);
     if (!parent) return (uint64_t)-2;
+    TSC_BEGIN(symlink_op);
     if (!vfs_access(parent, 3)) {
         vfs_close(parent);
+        TSC_END(symlink_op);
         return (uint64_t)-13;
     }
     vfs_node_t *existing = vfs_finddir(parent, link_name);
     if (existing) {
         vfs_close(existing);
         vfs_close(parent);
+        TSC_END(symlink_op);
         return (uint64_t)-17;
     }
 
@@ -692,12 +746,14 @@ static uint64_t sys_symlink(uint64_t target_ptr, uint64_t linkpath_ptr,
     size_t t_len = strlen(target);
     if (t_len == 0 || t_len >= sizeof(target_buf)) {
         vfs_close(parent);
+        TSC_END(symlink_op);
         return (uint64_t)-14;
     }
     strcpy(target_buf, target);
 
     int rc = vfs_symlink(parent, link_name, target_buf) == 0 ? 0 : (uint64_t)-1;
     vfs_close(parent);
+    TSC_END(symlink_op);
     return rc;
 }
 
@@ -833,11 +889,20 @@ static uint64_t sys_link(uint64_t oldpath_ptr, uint64_t newpath_ptr,
         return (uint64_t)-1;
     }
 
+    // Only the destination *basename* has to fit in file_name[].  The old
+    // check compared strlen(newpath) against sizeof(file_name), so any link
+    // whose full destination path was >= 128 bytes failed with ENAMETOOLONG
+    // even though the name itself was short.  That broke every WebKit cache
+    // link: .../WebKitCache/Version 17/Records/<40 hex>/Resource/<40
+    // hex>-blob is ~150 bytes with a 45-byte basename.
     char file_name[128];
-    size_t len = strlen(newpath);
-    if (len == 0 || len >= sizeof(file_name)) {
+    const char *dst_slash = NULL;
+    for (const char *p = newpath; *p; p++)
+        if (*p == '/') dst_slash = p;
+    const char *dst_base = dst_slash ? dst_slash + 1 : newpath;
+    if (!dst_base[0] || strlen(dst_base) >= sizeof(file_name)) {
         vfs_close(src);
-        return (uint64_t)-36;
+        return (uint64_t)-36; // ENAMETOOLONG
     }
 
     vfs_node_t *parent =
@@ -966,12 +1031,10 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
         return (uint64_t)-9; // EBADF
     }
 
+    // file_name[] only has to hold the destination *basename*; the full
+    // newpath may be much longer (see the comment in sys_link).  The length
+    // is validated below, right before the basename is copied into file_name.
     char file_name[128];
-    size_t len = strlen(newpath);
-    if (len == 0 || len >= sizeof(file_name)) {
-        if (src_owned) vfs_close(src);
-        return (uint64_t)-36; // ENAMETOOLONG
-    }
 
     // Temporarily override the cwd so resolve_parent_and_name picks up new_base.
     // Instead, parse the new path manually the same way sys_link does.
@@ -1398,6 +1461,32 @@ static uint64_t sys_fchdir(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4,
 }
 
 // ---------------------------------------------------------------------------
+// chroot: change the process root directory.
+// Full namei validation (EFAULT/ENOENT/ENOTDIR) is performed, but the actual
+// confinement is not implemented: pathname resolution is anchored at the
+// global fs_root with no per-thread root slot, so plumbing a private root
+// through every resolver is future work.  Returns EPERM for a valid
+// directory rather than pretending confinement happened.
+// ---------------------------------------------------------------------------
+
+static uint64_t sys_chroot(uint64_t path_ptr, uint64_t a1, uint64_t a2,
+                           uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    if (!path_ptr) return (uint64_t)-14; // EFAULT
+    const char *path = (const char *)path_ptr;
+    if (!is_user_range(path, 1)) return (uint64_t)-14;
+    size_t len = strlen(path);
+    if (len == 0) return (uint64_t)-2; // ENOENT
+    if (len >= 4096) return (uint64_t)-36; // ENAMETOOLONG
+    vfs_node_t *node = vfs_resolve_path(path);
+    if (!node) return (uint64_t)-2; // ENOENT
+    bool is_dir = (node->flags & FS_TYPE_MASK) == FS_DIRECTORY;
+    vfs_close(node);
+    if (!is_dir) return (uint64_t)-20; // ENOTDIR
+    return (uint64_t)-1; // EPERM: confinement not implemented
+}
+
+// ---------------------------------------------------------------------------
 // utimensat / futimesat / utimes stubs
 // ---------------------------------------------------------------------------
 
@@ -1468,6 +1557,7 @@ void syscall_register_fs(void) {
     syscall_register(SYS_FACCESSAT,  sys_faccessat);
     syscall_register(SYS_FACCESSAT2, sys_faccessat2);
     syscall_register(SYS_FCHDIR,     sys_fchdir);
+    syscall_register(SYS_CHROOT,     sys_chroot);
     syscall_register(SYS_UTIMENSAT,  sys_utimensat);
     syscall_register(SYS_FUTIMESAT,  sys_futimesat);
     syscall_register(SYS_UTIMES,     sys_utimes);

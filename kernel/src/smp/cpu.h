@@ -12,7 +12,7 @@ struct thread;
 
 // Limits
 #define MAX_CPUS 64
-#define CPU_STACK_SIZE (16384) // 16 KiB kernel stack per CPU
+#define CPU_STACK_SIZE (65536) // 64 KiB kernel/interrupt stack per CPU
 
 // CPU Status
 #define CPU_STATUS_OFFLINE 0
@@ -66,6 +66,13 @@ struct cpu_info {
   // only the base currently in CR3 can have user entries cached.  Updated by
   // every CR3 load through cpu_set_active_cr3().
   uint64_t active_cr3;
+
+  /* CPU-local busy/idle wall time used by /proc/stat. Written by this CPU's
+   * scheduler while queue_lock is held; readers use atomic snapshots. */
+  uint64_t stats_user_ms;
+  uint64_t stats_system_ms;
+  uint64_t stats_idle_ms;
+  uint64_t stats_last_ms;
 } __attribute__((aligned(64)));
 
 

@@ -1,10 +1,17 @@
 #include "ext2_internal.h"
+#include "apic/lapic_timer.h"
 #include "drivers/timer/rtc.h"
 #include "fs/ext4/ext4_extent.h"
 #include "console/klog.h"
+#include "sched/sched.h"
 
 uint32_t ext2_current_time(void) {
-  return (uint32_t)rtc_get_timestamp();
+  /* Never touch the CMOS RTC here: rtc_get_timestamp() costs ~50us (eight
+   * register reads through ports 0x70/0x71 plus the update-in-progress wait)
+   * and this runs on every write/create/mkdir for inode timestamps.  The RTC
+   * snapshot taken at boot plus monotonic uptime yields the same
+   * second-granularity wall time with no port I/O. */
+  return (uint32_t)(rtc_get_boot_timestamp() + lapic_timer_get_ms() / 1000);
 }
 
 int ext2_read_block(ext2_mount_t *mnt, uint32_t block_num, void *buffer) {
@@ -28,9 +35,20 @@ int ext2_read_block(ext2_mount_t *mnt, uint32_t block_num, void *buffer) {
   int err = mnt->dev->read_sectors(mnt->dev, lba, sectors, buffer);
   if (err) {
     static uint32_t err_count;
-    if (__atomic_add_fetch(&err_count, 1, __ATOMIC_RELAXED) <= 8)
-      klogf("[EXT2] block %u read failed: lba=%llu sectors=%u err=%d\n",
-            block_num, (unsigned long long)lba, sectors, err);
+    if (__atomic_add_fetch(&err_count, 1, __ATOMIC_RELAXED) <= 8) {
+      union { uint32_t u; char s[4]; } alias = { .u = block_num };
+      struct thread *ct = sched_get_current();
+      klogf("[EXT2] block %u read failed: lba=%llu sectors=%u err=%d"
+            " ascii='%c%c%c%c' bs=%u nblocks=%u comm='%s' tid=%u tgid=%u\n",
+            block_num, (unsigned long long)lba, sectors, err,
+            alias.s[0] >= 32 && alias.s[0] < 127 ? alias.s[0] : '.',
+            alias.s[1] >= 32 && alias.s[1] < 127 ? alias.s[1] : '.',
+            alias.s[2] >= 32 && alias.s[2] < 127 ? alias.s[2] : '.',
+            alias.s[3] >= 32 && alias.s[3] < 127 ? alias.s[3] : '.',
+            mnt->block_size, mnt->sb.s_blocks_count,
+            (ct && ct->comm[0]) ? ct->comm : "?",
+            ct ? ct->tid : 0, ct ? ct->tgid : 0);
+    }
     return err;
   }
 
@@ -214,8 +232,25 @@ uint32_t ext2_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode,
     return ext4_get_block_num(mnt, inode, logical_block);
   uint32_t ptrs_per_block = mnt->block_size / 4;
 
-  if (logical_block < EXT2_DIRECT_BLOCKS)
-    return inode->i_block[logical_block];
+  if (logical_block < EXT2_DIRECT_BLOCKS) {
+    uint32_t result = inode->i_block[logical_block];
+    if (result != 0 && result >= mnt->sb.s_blocks_count) {
+      union { uint32_t u; char s[4]; } alias = { .u = result };
+      struct thread *ct = sched_get_current();
+      klogf("[EXT2] bad direct block: logical=%u result=%u ascii='%c%c%c%c'"
+            " i_block0=%u i_block1=%u nblocks=%u comm='%s' tid=%u\n",
+            logical_block, result,
+            alias.s[0] >= 32 && alias.s[0] < 127 ? alias.s[0] : '.',
+            alias.s[1] >= 32 && alias.s[1] < 127 ? alias.s[1] : '.',
+            alias.s[2] >= 32 && alias.s[2] < 127 ? alias.s[2] : '.',
+            alias.s[3] >= 32 && alias.s[3] < 127 ? alias.s[3] : '.',
+            inode->i_block[0], inode->i_block[1],
+            mnt->sb.s_blocks_count,
+            (ct && ct->comm[0]) ? ct->comm : "?",
+            ct ? ct->tid : 0);
+    }
+    return result;
+  }
 
   logical_block -= EXT2_DIRECT_BLOCKS;
 
@@ -565,8 +600,10 @@ uint32_t ext2_alloc_block(ext2_mount_t *mnt) {
 uint32_t ext2_alloc_inode(ext2_mount_t *mnt) {
   ext3_journal_start(mnt);
   uint8_t *bitmap = kmalloc(mnt->block_size);
-  if (!bitmap)
+  if (!bitmap) {
+    ext3_journal_stop(mnt);
     return 0;
+  }
 
   for (uint32_t g = 0; g < mnt->groups_count; g++) {
     if (mnt->bgdt[g].bg_free_inodes_count == 0)

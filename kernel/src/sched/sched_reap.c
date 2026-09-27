@@ -1,4 +1,6 @@
 #include "sched.h"
+#define TSC_PROBES_ENABLE
+#include "../lib/tsc.h"
 #include "sched_internal.h"
 #include "wait.h"
 #include "hal/hal.h"
@@ -27,23 +29,19 @@ static struct thread *reap_queue = NULL;
 static spinlock_t reap_queue_lock = SPINLOCK_INIT;
 static spinlock_t reap_worker_lock = SPINLOCK_INIT;
 
-bool sched_thread_off_cpu(struct thread *t) {
-  for (uint32_t i = 0; i < cpu_get_count(); i++) {
-    struct cpu_info *cpu = cpu_get_info(i);
-    if (!cpu || cpu->status == CPU_STATUS_OFFLINE)
-      continue;
-    if (__atomic_load_n(&cpu->current_thread, __ATOMIC_ACQUIRE) == t ||
-        __atomic_load_n(&cpu->switching_from, __ATOMIC_ACQUIRE) == t)
-      return false;
-  }
-  return true;
-}
-
 void sched_queue_reap(struct thread *t) {
   if (!t || t->is_idle)
     return;
 
   spinlock_acquire(&reap_queue_lock);
+  /* Exit, remote termination, and group teardown can all converge on the
+   * same thread. A duplicate queue link becomes a dangling pointer after the
+   * first reaper frees the thread and can corrupt unrelated scheduler lists. */
+  if (__atomic_load_n(&t->reap_queued, __ATOMIC_RELAXED)) {
+    spinlock_release(&reap_queue_lock);
+    return;
+  }
+  __atomic_store_n(&t->reap_queued, true, __ATOMIC_RELAXED);
   t->reap_next = reap_queue;
   reap_queue = t;
   spinlock_release(&reap_queue_lock);
@@ -83,7 +81,7 @@ void sched_process_reap_queue(struct thread *prev) {
       spinlock_acquire(&reap_queue_lock);
       struct thread **link = &reap_queue;
       while (*link) {
-        if (*link != prev && sched_thread_off_cpu(*link)) {
+        if (*link != prev && sched_prepare_thread_reap(*link)) {
           victim = *link;
           *link = victim->reap_next;
           victim->reap_next = NULL;
@@ -99,8 +97,17 @@ void sched_process_reap_queue(struct thread *prev) {
     }
     spinlock_release(&reap_worker_lock);
   }
-}
 
+  /* Backlog safety net for the deferred mm teardown: normally the idle CPUs
+   * (ticking at 1 ms while vmm_defer_pending()) drain faster than producers
+   * queue.  If every core is busy - or this is a UP build - drain a few nodes
+   * here so dead address spaces cannot pile up unboundedly.  The >64
+   * threshold keeps the common case, including wait4's
+   * sched_queue_reap_and_wait() yield loop, from ever paying for a teardown
+   * it queued microseconds ago. */
+  if (vmm_defer_pending() > VMM_DEFER_INLINE_BACKLOG)
+    vmm_defer_drain(VMM_DEFER_INLINE_NODES);
+}
 void sched_reap_thread(struct thread *t) {
   if (!t || t->is_idle)
     return;
@@ -112,25 +119,29 @@ void sched_reap_thread(struct thread *t) {
   futex_remove_thread_waiters(t);
   wait_queue_cleanup_thread(t);
 
-  /* The reap-queue claimant already verified sched_thread_off_cpu() while
-   * holding reap_queue_lock. DEAD threads cannot become runnable again, so
-   * repeating that check here can only spin forever on a stale hazard. */
+  /* The reap-queue claimant checked terminal state and detached the thread
+   * from its runqueue while holding the owning CPU's queue_lock. */
 
   /* Ensure reaped thread is removed from its CPU's runqueue before freeing */
   remove_from_runqueue(t);
 
   klog_debug_puts("[REAP] Step 1: remove from lists\n");
+  TSC_BEGIN(reap_lists);
+  sched_itimer_disarm(t);
   spinlock_acquire(&tid_lock);
 
   // 1.5 Remove from global thread list
   if (global_thread_list == t) {
     global_thread_list = t->global_next;
+    __atomic_sub_fetch(&global_thread_count, 1, __ATOMIC_RELAXED);
   } else {
     struct thread *prev_g = global_thread_list;
     while (prev_g && prev_g->global_next != t)
       prev_g = prev_g->global_next;
-    if (prev_g)
+    if (prev_g) {
       prev_g->global_next = t->global_next;
+      __atomic_sub_fetch(&global_thread_count, 1, __ATOMIC_RELAXED);
+    }
   }
 
   // 1.75 Remove from parent's children list
@@ -167,6 +178,7 @@ void sched_reap_thread(struct thread *t) {
   t->children = NULL;
   t->sibling_next = NULL;
   spinlock_release(&tid_lock);
+  TSC_END(reap_lists);
 
   /* Monitoring tools poll /proc continuously. Drop the cached PID tree
    * after the task has been removed from global lookup. */
@@ -187,25 +199,20 @@ void sched_reap_thread(struct thread *t) {
     t->cwd_node = NULL;
   }
 
-  // 4. Free user page tables (CR3) and MM if last thread
+  // 4. Hand user page tables (CR3) and MM to the deferred drain if last thread
   if (t->mm) {
     /* Lifetime references are independent of VMA mutations. An atomic drop
      * avoids waiting on an mm lock from scheduler/reaper context and makes
      * exactly one reaper responsible for final destruction. */
     int refs = __atomic_sub_fetch(&t->mm->ref_count, 1, __ATOMIC_ACQ_REL);
     if (refs == 0) {
-      klog_debug_puts("[REAP] Last thread, freeing MM resources\n");
-      if (t->cr3) {
-        vmm_free_user_pages_vma(t->cr3, &t->mm->vmas);
-        t->cr3 = 0;
-      }
-      if (t->mm->pcid) {
-        pcid_free(t->mm->pcid);
-        t->mm->pcid = 0;
-      }
-      vma_list_destroy(&t->mm->vmas);
-      kfree(t->mm);
-
+      /* The page-table walk and per-page PMM frees dwarf the rest of this
+       * function, and this reaper runs inside the waker's sched_schedule() -
+       * for a fork+wait4 parent that is inside the measured wait4().  The PID
+       * and thread struct are already gone (wait4 has everything it needs),
+       * so queue the teardown for an idle CPU instead of paying it here. */
+      vmm_queue_free_mm(t->cr3, t->mm);
+      t->cr3 = 0;
     } else {
       klog_debug_puts("[REAP] MM still shared, skipping CR3 free\n");
       t->cr3 = 0; // Don't free for THIS thread
@@ -276,18 +283,37 @@ void sched_terminate_thread_group(struct thread *current) {
   // If leader was found and is not current, preserve leader as ZOMBIE
   if (leader && leader != current) {
     leader->reap_remove_runqueue = true;
-    remove_from_runqueue(leader);
-    leader->state = THREAD_ZOMBIE;
+    __atomic_store_n(&leader->state, THREAD_ZOMBIE, __ATOMIC_RELEASE);
     leader->exit_status = current->exit_status ? current->exit_status : 0;
+    /* The leader may still be executing on another CPU. Removing its entity
+     * here would mutate that CPU's current EEVDF entity from the wrong core;
+     * the next scheduler entry drops terminal candidates under queue_lock.
+     * Kick an active owner so a leader in a long kernel path reaches that
+     * safe scheduler boundary promptly. */
+    struct cpu_info *leader_cpu = cpu_get_info(leader->cpu_index);
+    if (leader_cpu && leader_cpu->status != CPU_STATUS_OFFLINE &&
+        (__atomic_load_n(&leader_cpu->current_thread, __ATOMIC_ACQUIRE) ==
+             leader ||
+         __atomic_load_n(&leader_cpu->switching_from, __ATOMIC_ACQUIRE) ==
+             leader))
+      lapic_send_ipi(leader_cpu->apic_id, IPI_VECTOR_RESCHEDULE);
+
     struct thread *parent_to_wake = NULL;
     if (leader->parent) {
       uint32_t parent_tgid = leader->parent->tgid;
-      for (struct thread *waiter = global_thread_list; waiter;
-           waiter = waiter->global_next) {
-        if (waiter->tgid == parent_tgid && waiter->waiting_for_child &&
-            waiter->state == THREAD_BLOCKED) {
-          parent_to_wake = waiter;
-          break;
+      /* O(1) fast path, same rationale as process_do_exit(). */
+      if (leader->parent->tgid == parent_tgid &&
+          leader->parent->waiting_for_child &&
+          leader->parent->state == THREAD_BLOCKED) {
+        parent_to_wake = leader->parent;
+      } else {
+        for (struct thread *waiter = global_thread_list; waiter;
+             waiter = waiter->global_next) {
+          if (waiter->tgid == parent_tgid && waiter->waiting_for_child &&
+              waiter->state == THREAD_BLOCKED) {
+            parent_to_wake = waiter;
+            break;
+          }
         }
       }
     }

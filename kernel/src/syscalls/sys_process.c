@@ -18,6 +18,8 @@
 #include "../smp/cpu.h"
 #include "sys_io_shared.h"
 #include "syscall.h"
+#define TSC_PROBES_ENABLE
+#include "../lib/tsc.h"
 #include <stdint.h>
 
 // Wake waiters after CLONE_CHILD_CLEARTID/set_tid_address exit cleanup.
@@ -278,6 +280,7 @@ void process_do_exit(uint64_t status) {
   // Common cleanup. CLONE_FILES tables remain alive until the final thread
   // drops its reference; closing every fd on each pthread exit would break
   // descriptors still in use by its siblings.
+  TSC_BEGIN(exit_files);
   if (current) {
     sched_release_files(current);
     klog_debug_puts("[EXITDBG] files released\n");
@@ -288,8 +291,10 @@ void process_do_exit(uint64_t status) {
     }
     klog_debug_puts("[EXITDBG] cwd released\n");
   }
+  TSC_END(exit_files);
 
   if (current && current->is_forked_child) {
+    TSC_BEGIN(exit_publish);
     current->exit_status = (int)status;
 
     struct thread *parent_to_wake = NULL;
@@ -314,26 +319,64 @@ void process_do_exit(uint64_t status) {
       /* Serialize zombie publication with wait4's transition to BLOCKED. */
       klog_debug_puts("[EXITDBG] publishing zombie\n");
       spinlock_acquire(&tid_lock);
-      current->state = THREAD_ZOMBIE;
+      struct thread *parent = current->parent;
+      int exit_signal = (int)(current->clone_flags & 0xff);
+      bool auto_reap = false;
+      if (parent && exit_signal == SIGCHLD) {
+        struct k_sigaction *chld_action =
+            &parent->signal_handlers[SIGCHLD - 1];
+        auto_reap = chld_action->sa_handler == (void *)SIG_IGN ||
+                    (chld_action->sa_flags & SA_NOCLDWAIT) != 0;
+      }
+      current->state = auto_reap ? THREAD_DEAD : THREAD_ZOMBIE;
       if (current->parent) {
         uint32_t parent_tgid = current->parent->tgid;
-        for (struct thread *waiter = global_thread_list; waiter;
-             waiter = waiter->global_next) {
-          if (waiter->tgid == parent_tgid && waiter->waiting_for_child &&
-              waiter->state == THREAD_BLOCKED) {
-            parent_to_wake = waiter;
-            break;
+        /* O(1) fast path: the single-threaded parent waiting in wait4() is
+         * itself blocked with the flag set.  Checking it first avoids a full
+         * global-list walk per exit (wake-one order was already arbitrary).
+         * Anything else falls back to the scan below. */
+        if (current->parent->tgid == parent_tgid &&
+            current->parent->waiting_for_child &&
+            current->parent->state == THREAD_BLOCKED) {
+          parent_to_wake = current->parent;
+        } else {
+          for (struct thread *waiter = global_thread_list; waiter;
+               waiter = waiter->global_next) {
+            if (waiter->tgid == parent_tgid && waiter->waiting_for_child &&
+                waiter->state == THREAD_BLOCKED) {
+              parent_to_wake = waiter;
+              break;
+            }
           }
         }
       }
+      if (auto_reap && parent) {
+        /* No waitable child should remain when SIGCHLD is explicitly ignored
+         * or SA_NOCLDWAIT is set. Unlink it before waking waiters so their
+         * rescan observes ECHILD instead of parking on a zombie that will be
+         * removed asynchronously by the reaper. Keep parent until notification
+         * completes; the reaper clears the back-pointer before freeing. */
+        if (parent->children == current) {
+          parent->children = current->sibling_next;
+        } else {
+          struct thread *sibling = parent->children;
+          while (sibling && sibling->sibling_next != current)
+            sibling = sibling->sibling_next;
+          if (sibling)
+            sibling->sibling_next = current->sibling_next;
+        }
+        current->sibling_next = NULL;
+      }
       spinlock_release(&tid_lock);
-      klog_debug_puts("[EXITDBG] zombie published\n");
+      klog_debug_puts("[EXITDBG] exit state published\n");
       /* Anyone waiting on a pidfd for this process (poll or waitid(P_PIDFD))
-       * is woken here; they re-scan and observe the zombie. */
+       * is woken here to observe its terminal state. */
       pidfd_wake_waiters();
       /* ... and the parent's SIGCHLD handler runs here, the way Linux sends
        * do_notify_parent() right after publishing the zombie. */
       signal_notify_parent_exit(current);
+      if (auto_reap)
+        sched_queue_reap(current);
     }
 
     /* A vfork parent is blocked inside sys_clone_internal(), before it can
@@ -352,6 +395,7 @@ void process_do_exit(uint64_t status) {
     }
 
     // Reaping handles the address-space reference after this task is off-CPU.
+    TSC_END(exit_publish);
     if (current->cr3) {
       struct cpu_info *cpu = cpu_get_current();
       cpu_set_active_cr3(cpu->kernel_cr3);
@@ -612,7 +656,9 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
       // Destruction must wait until the exiting child has switched off its
       // kernel stack.  On SMP the awakened parent can run concurrently with
       // process_do_exit(), so direct reaping here would free a live stack.
+      TSC_BEGIN(wait4_reap);
       sched_queue_reap_and_wait(zombie);
+      TSC_END(wait4_reap);
 
       current->waiting_for_child = false;
       return (uint64_t)reaped_pid;
@@ -872,7 +918,6 @@ static void exec_close_cloexec(struct thread *t) {
 }
 
 // sys_execve
-#define TSC_PROBES_ENABLE
 #include "../lib/tsc.h"
 
 static uint64_t sys_execve(struct syscall_regs *regs) {
@@ -1331,9 +1376,13 @@ static void fork_child_entry(void) {
   struct thread *self = sched_get_current();
   struct syscall_regs *child_regs = (struct syscall_regs *)self->fork_ctx;
 
-  // Switch to the child's cloned address space
-  cpu_set_active_cr3(self->cr3);
-  __asm__ volatile("mov %0, %%cr3" ::"r"(self->cr3) : "memory");
+  // Switch to the child's cloned address space if not already loaded by sched_schedule
+  uint64_t current_cr3;
+  __asm__ volatile("mov %%cr3, %0" : "=r"(current_cr3));
+  if ((current_cr3 & CR3_ADDR_MASK) != (self->cr3 & CR3_ADDR_MASK)) {
+    cpu_set_active_cr3(self->cr3);
+    __asm__ volatile("mov %0, %%cr3" ::"r"(self->cr3) : "memory");
+  }
 
   // Set TSS rsp0 so interrupts and syscalls from Ring 3 use this CPU's
   // kernel stack.
@@ -1362,48 +1411,85 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   // 1. Get current parent state
   uint64_t *parent_pml4_phys = vmm_get_active_pml4();
   struct thread *parent = sched_get_current();
+  if (!regs || !parent || !parent->mm)
+    return (uint64_t)-22;
 
   // 2. Clone the user address space with VMA awareness
   //    Shared mappings share physical pages, private mappings get copied
   TSC_BEGIN(fork_clone);
   uint64_t child_cr3 = vmm_clone_user_mappings_vma(
-      parent_pml4_phys, (parent && parent->mm) ? &parent->mm->vmas : NULL);
+      parent_pml4_phys, &parent->mm->vmas);
   TSC_END(fork_clone);
   fork_probe_maybe_dump();
+  /* Never publish a child that would enter fork_child_entry with CR3 == 0.
+   * The VMM clone returns zero when it cannot allocate the child page tables. */
+  if (!child_cr3)
+    return (uint64_t)-12;
 
   // 3. Allocate and populate the child's saved register state.
   //    RAX = 0 so the child sees fork() returning 0.
   struct syscall_regs *child_regs = kmalloc(sizeof(struct syscall_regs));
   if (!child_regs) {
-    if (child_cr3) {
-      vmm_free_user_pages_vma(
-          child_cr3, (parent && parent->mm) ? &parent->mm->vmas : NULL);
-    }
+    vmm_free_user_pages_vma(child_cr3, &parent->mm->vmas);
     return (uint64_t)(-12);
   }
   memcpy(child_regs, regs, sizeof(struct syscall_regs));
   child_regs->rax = 0; // Child return value
 
-  // 4. Create a kernel thread for the child process.
-  //    sched_create_kernel_thread enqueues it on a CPU's run queue.
+  /* Prepare every fallible process resource before publishing a thread. */
+  struct mm_struct *child_mm = kmalloc(sizeof(*child_mm));
+  if (!child_mm) {
+    kfree(child_regs);
+    vmm_free_user_pages_vma(child_cr3, &parent->mm->vmas);
+    return (uint64_t)-12;
+  }
+  memset(child_mm, 0, sizeof(*child_mm));
+  vma_list_init(&child_mm->vmas);
+  TSC_BEGIN(fork_vma);
+  if (!vma_list_clone(&child_mm->vmas, &parent->mm->vmas)) {
+    kfree(child_mm);
+    kfree(child_regs);
+    vmm_free_user_pages_vma(child_cr3, &parent->mm->vmas);
+    return (uint64_t)-12;
+  }
+  TSC_END(fork_vma);
+  child_mm->brk_base = parent->mm->brk_base;
+  child_mm->brk_current = parent->mm->brk_current;
+  child_mm->mmap_next_addr = parent->mm->mmap_next_addr;
+  child_mm->ref_count = 1;
+  child_mm->pcid = pcid_alloc();
+  spinlock_init(&child_mm->lock);
+  memcpy(child_mm->saved_auxv, parent->mm->saved_auxv,
+         sizeof(child_mm->saved_auxv));
+  child_mm->auxv_count = parent->mm->auxv_count;
+  memcpy(child_mm->saved_cmdline, parent->mm->saved_cmdline,
+         sizeof(child_mm->saved_cmdline));
+  child_mm->cmdline_len = parent->mm->cmdline_len;
+  child_mm->arg_start = parent->mm->arg_start;
+  child_mm->arg_end = parent->mm->arg_end;
+
+  // 4. Create a kernel thread for the child process, not yet runnable.
+  TSC_BEGIN(fork_thread);
   struct thread *child =
-      sched_create_kernel_thread(fork_child_entry, cpu_get_current(), false);
+      sched_create_kernel_thread(fork_child_entry, NULL, false);
   if (!child) {
     kfree(child_regs);
-    if (child_cr3) {
-      vmm_free_user_pages_vma(
-          child_cr3, (parent && parent->mm) ? &parent->mm->vmas : NULL);
-    }
+    pcid_free(child_mm->pcid);
+    vma_list_destroy(&child_mm->vmas);
+    kfree(child_mm);
+    vmm_free_user_pages_vma(child_cr3, &parent->mm->vmas);
     return (uint64_t)(-12);
   }
 
   // Clear or free the default MM allocated by sched_create_kernel_thread
   // as we're about to replace it with a cloned one.
   if (child->mm) {
+    pcid_free(child->mm->pcid);
     vma_list_destroy(&child->mm->vmas);
     kfree(child->mm);
-    child->mm = NULL;
   }
+  child->mm = child_mm;
+  TSC_END(fork_thread);
 
   // 5. Configure child thread
   child->cr3 = child_cr3;
@@ -1422,6 +1508,7 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   child->clone_flags = SIGCHLD;
 
   // 6. Copy file descriptors from parent to child (with reference counting)
+  TSC_BEGIN(fork_fds);
   if (parent) {
     for (int i = 0; i < MAX_FDS; i++) {
       if (parent->fds[i] && parent->fds[i] != FD_RESERVED) {
@@ -1437,27 +1524,6 @@ uint64_t sys_fork(struct syscall_regs *regs) {
         vfs_open(child->fds[i]);
       }
     }
-    // 7. Clone memory state
-    child->mm = kmalloc(sizeof(struct mm_struct));
-    if (child->mm) {
-      vma_list_init(&child->mm->vmas);
-      vma_list_clone(&child->mm->vmas, &parent->mm->vmas);
-      child->mm->brk_base = parent->mm->brk_base;
-      child->mm->brk_current = parent->mm->brk_current;
-      child->mm->mmap_next_addr = parent->mm->mmap_next_addr;
-      child->mm->ref_count = 1;
-      child->mm->pcid = pcid_alloc();
-      spinlock_init(&child->mm->lock);
-      memcpy(child->mm->saved_auxv, parent->mm->saved_auxv,
-             sizeof(child->mm->saved_auxv));
-      child->mm->auxv_count = parent->mm->auxv_count;
-      memcpy(child->mm->saved_cmdline, parent->mm->saved_cmdline,
-             sizeof(child->mm->saved_cmdline));
-      child->mm->cmdline_len = parent->mm->cmdline_len;
-      child->mm->arg_start   = parent->mm->arg_start;
-      child->mm->arg_end     = parent->mm->arg_end;
-    }
-
     memcpy(child->cwd_path, parent->cwd_path, sizeof(child->cwd_path));
     // sched_create_kernel_thread() already inherited and referenced the
     // parent's CWD. Do not take a second, unmatched reference here.
@@ -1488,12 +1554,16 @@ uint64_t sys_fork(struct syscall_regs *regs) {
     child->ss_size = parent->ss_size;
     child->ss_flags = parent->ss_flags;
   }
+  TSC_END(fork_fds);
 
-  // 8. Enqueue child thread now that it is fully configured
-  sched_enqueue_thread(child, cpu_get_current());
+  // 8. Enqueue child only after its address space and inherited state are set.
+  // Keep the return value independent of the child allocation in case it exits
+  // quickly after being scheduled.
+  uint32_t child_tid = child->tid;
+  sched_enqueue_thread(child, NULL);
 
   // 9. Return child PID to parent
-  return child->tid;
+  return child_tid;
 }
 
 static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
@@ -1581,7 +1651,13 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     }
     memset(child_mm, 0, sizeof(*child_mm));
     vma_list_init(&child_mm->vmas);
-    vma_list_clone(&child_mm->vmas, &parent->mm->vmas);
+    if (!vma_list_clone(&child_mm->vmas, &parent->mm->vmas)) {
+      kfree(child_mm);
+      vmm_free_user_pages_vma(child_cr3, &parent->mm->vmas);
+      PIDFD_UNRESERVE();
+      kfree(child_regs);
+      return (uint64_t)-12;
+    }
     child_mm->brk_base = parent->mm->brk_base;
     child_mm->brk_current = parent->mm->brk_current;
     child_mm->mmap_next_addr = parent->mm->mmap_next_addr;
@@ -1590,8 +1666,10 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     spinlock_init(&child_mm->lock);
   }
 
+  bool vfork = (flags & CLONE_VFORK) != 0;
+  struct cpu_info *target_cpu = vfork ? cpu_get_current() : NULL;
   struct thread *child =
-      sched_create_kernel_thread(fork_child_entry, cpu_get_current(), false);
+      sched_create_kernel_thread(fork_child_entry, target_cpu, false);
   if (!child) {
     PIDFD_UNRESERVE();
     if (private_mm) {
@@ -1700,19 +1778,20 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     int pidfd_user = pidfd_fd;
     copy_to_user((void *)pidfd_slot, &pidfd_user, sizeof(int));
   }
-  bool vfork = (flags & CLONE_VFORK) != 0;
   if (vfork)
     parent->state = THREAD_BLOCKED;
 
-  /* Publication is the final creation step. */
-  sched_enqueue_thread(child, cpu_get_current());
+  /* Runqueue publication is the final creation step. */
+  /* Snapshot the result before making the child runnable. */
+  uint32_t child_tid = child->tid;
+  sched_enqueue_thread(child, target_cpu);
 
   if (vfork) {
     while (parent->state == THREAD_BLOCKED)
       sched_yield();
   }
 
-  return child->tid;
+  return child_tid;
 #undef PIDFD_UNRESERVE
 }
 // sys_clone (syscall 56)
@@ -1887,14 +1966,22 @@ static uint64_t sys_uname(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
   strcpy(buf->nodename, system_nodename);
   strcpy(buf->release, "2.5.0 Beta");
 
-  // Dynamic date/time from RTC
-  char datetime[32];
-  rtc_format_datetime(rtc_get_timestamp(), datetime, sizeof(datetime));
-
-  char version[80];
-  strcpy(version, "2.5.0 Beta ");
-  strcat(version, datetime);
-  strcpy(buf->version, version);
+  /* Reading the RTC costs tens of microseconds of CMOS port I/O, which used
+   * to dominate this syscall (and gethostname, which is layered on uname).
+   * The date only changes once per second, so rebuild the version string at
+   * most once per second off the cheap monotonic clock.  A lost race merely
+   * repeats an RTC read; the cached bytes are always self-consistent. */
+  static char cached_version[80] = "";
+  static uint64_t cached_ms = 0;
+  uint64_t now_ms = lapic_timer_get_ms();
+  if (!cached_version[0] || now_ms - cached_ms >= 1000) {
+    char datetime[32];
+    rtc_format_datetime(rtc_get_timestamp(), datetime, sizeof(datetime));
+    strcpy(cached_version, "2.5.0 Beta ");
+    strcat(cached_version, datetime);
+    cached_ms = now_ms;
+  }
+  strcpy(buf->version, cached_version);
 
   strcpy(buf->machine, "x86_64");
   strcpy(buf->domainname, "localhost");
@@ -1992,8 +2079,7 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     return 0;
   case 39: // PR_GET_NO_NEW_PRIVS
     return 0;
-  case 0x41555856: { // PR_GET_AUXV (Linux 6.4+)
-    if (!arg2 || !arg3)
+  case 0x41555856: { // PR_GET_AUXV (Linux 6.4+)    if (!arg2 || !arg3)
       return (uint64_t)-14; // EFAULT
     if (!current->mm)
       return 0;
@@ -2017,6 +2103,10 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
       return (uint64_t)-14; // EFAULT
     memcpy((void *)arg2, src, to_copy);
     return (uint64_t)to_copy;
+  }
+  case 0x50544344: { // TEMPORARY "PTCD": dump TSC probe stats (syscall profiler)
+    tsc_probe_dump();
+    return 0;
   }
   default:
     return (uint64_t)-22; // EINVAL
@@ -2660,10 +2750,26 @@ static uint64_t sys_prlimit64(struct syscall_regs *regs) {
   }
 
   if (new_limit) {
-    // Stub: we don't actually enforce many limits yet,
-    // so we just ignore the new limits for now.
+    // No enforcement yet (except the fixed-size fd table for NOFILE).
+    // Report success so glibc/Firefox raise-probes (e.g. to 4096) do not
+    // fail; the effective limit stays MAX_FDS as reported above.
   }
 
+  return 0;
+}
+
+static uint64_t sys_setrlimit(uint64_t resource, uint64_t rlim_ptr, uint64_t a2,
+                              uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  if (resource > 16)
+    return (uint64_t)-22; // EINVAL
+  if (!rlim_ptr)
+    return (uint64_t)-14; // EFAULT
+  // Same policy as prlimit64: accept (clamp to MAX_FDS for NOFILE
+  // implicitly by ignoring) so setrlimit(RLIMIT_NOFILE, 4096) probes succeed.
   return 0;
 }
 
@@ -2853,6 +2959,65 @@ static uint64_t sys_sched_get_priority_min(uint64_t policy, uint64_t a1,
   if (clean_policy == SCHED_OTHER || clean_policy == SCHED_BATCH || clean_policy == SCHED_IDLE)
     return 0;
   return (uint64_t)-22; // EINVAL
+}
+
+// sys_sched_rr_get_interval (syscall 148)
+// Writes the SCHED_RR timeslice quantum for the given pid.  This kernel runs
+// an EEVDF scheduler with no fixed per-policy quantum; the reported 100 ms
+// matches the tick accounting the scheduler itself uses (1 LAPIC tick ~= 1 ms,
+// idle quantum initialised to 100 ticks in sched.c).
+static uint64_t sys_sched_rr_get_interval(uint64_t pid, uint64_t tp_ptr,
+                                          uint64_t a2, uint64_t a3,
+                                          uint64_t a4, uint64_t a5) {
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+
+  struct thread *current = sched_get_current();
+  struct thread *target =
+      pid == 0 ? current : sched_get_thread_by_tid((uint32_t)pid);
+  if (!target)
+    return (uint64_t)-3; // ESRCH
+  (void)current;
+
+  if (!tp_ptr || !vmm_is_user_addr_range_writable(tp_ptr, 16))
+    return (uint64_t)-14; // EFAULT
+
+  // struct timespec { tv_sec, tv_nsec }: 100 ms quantum.
+  ((uint64_t *)tp_ptr)[0] = 0;
+  ((uint64_t *)tp_ptr)[1] = 100000000ULL;
+  return 0;
+}
+
+// sys_times (syscall 100)
+// Fills struct tms { utime, stime, cutime, cstime } in clock ticks
+// (USER_HZ = 100) and returns elapsed ticks since boot.  User vs system time
+// is not tracked separately (getrusage reports the same total as utime) and
+// child times are not accumulated (RUSAGE_CHILDREN is zeroed there too).
+static uint64_t sys_times(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
+                          uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a1;
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+
+  struct thread *t = sched_get_current();
+  if (!t)
+    return (uint64_t)-1;
+
+  if (buf_ptr) {
+    if (!vmm_is_user_addr_range_writable(buf_ptr, 4 * sizeof(long)))
+      return (uint64_t)-14; // EFAULT
+    long *tms = (long *)buf_ptr;
+    tms[0] = (long)(t->runtime_total / 10); // utime: ms -> 100 Hz ticks
+    tms[1] = 0;                             // stime: not tracked separately
+    tms[2] = 0;                             // cutime: children not accumulated
+    tms[3] = 0;                             // cstime: children not accumulated
+  }
+
+  return lapic_timer_get_ticks() / 10; // boot-relative ticks at 100 Hz
 }
 
 // sys_sched_getscheduler (syscall 145)
@@ -3133,6 +3298,57 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 }
 
 // ---------------------------------------------------------------------------
+// init_module / delete_module / swapon: no-ops with honest errors.
+// This kernel has no loadable-module support and no swap activation, so
+// after validating arguments these fail without side effects:
+//   init_module   -> EPERM  (loading is not implemented)
+//   delete_module -> ENOENT (no modules are ever loaded)
+//   swapon        -> EPERM  (swap areas cannot be activated)
+// ---------------------------------------------------------------------------
+
+static uint64_t sys_init_module(uint64_t image_ptr, uint64_t len,
+                                uint64_t param_ptr, uint64_t a3, uint64_t a4,
+                                uint64_t a5) {
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  if (!image_ptr)
+    return (uint64_t)-14; // EFAULT
+  if (!vmm_is_user_addr_range_valid(image_ptr, len ? 1 : 0))
+    return (uint64_t)-14; // EFAULT
+  if (param_ptr && !vmm_is_user_addr_range_valid(param_ptr, 1))
+    return (uint64_t)-14; // EFAULT
+  return (uint64_t)-1; // EPERM: module loading is not supported
+}
+
+static uint64_t sys_delete_module(uint64_t name_ptr, uint64_t flags,
+                                  uint64_t a2, uint64_t a3, uint64_t a4,
+                                  uint64_t a5) {
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  if (!name_ptr || !vmm_is_user_addr_range_valid(name_ptr, 1))
+    return (uint64_t)-14; // EFAULT
+  // Linux delete_module flags: O_NONBLOCK | O_TRUNC.
+  if (flags & ~(uint64_t)(0x800 | 0x200))
+    return (uint64_t)-22; // EINVAL
+  return (uint64_t)-2; // ENOENT: no modules are loaded, no name can match
+}
+
+static uint64_t sys_swapon(uint64_t path_ptr, uint64_t flags, uint64_t a2,
+                           uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)flags;
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  if (!path_ptr || !vmm_is_user_addr_range_valid(path_ptr, 1))
+    return (uint64_t)-14; // EFAULT
+  return (uint64_t)-1; // EPERM: swap activation is not supported
+}
+
+// ---------------------------------------------------------------------------
 // sys_capget (125) / sys_capset (126)
 //
 // AvoryOS runs as all-capable root and has no capability enforcement layer.
@@ -3304,6 +3520,7 @@ void syscall_register_process(void) {
   syscall_register_raw(SYS_SETFSUID, sys_setfsuid);
   syscall_register_raw(SYS_SETFSGID, sys_setfsgid);
   syscall_register(SYS_GETRLIMIT, sys_getrlimit);
+  syscall_register(SYS_SETRLIMIT, sys_setrlimit);
   syscall_register(SYS_GETRUSAGE, sys_getrusage);
   syscall_register_raw(SYS_PRLIMIT64, sys_prlimit64);
   syscall_register(SYS_MEMBARRIER, sys_membarrier);
@@ -3314,6 +3531,8 @@ void syscall_register_process(void) {
   syscall_register(SYS_SCHED_SETPARAM, sys_sched_setparam);
   syscall_register(SYS_SCHED_GET_PRIORITY_MAX, sys_sched_get_priority_max);
   syscall_register(SYS_SCHED_GET_PRIORITY_MIN, sys_sched_get_priority_min);
+  syscall_register(SYS_SCHED_RR_GET_INTERVAL, sys_sched_rr_get_interval);
+  syscall_register(SYS_TIMES, sys_times);
   syscall_register(SYS_SCHED_GETSCHEDULER, sys_sched_getscheduler);
   syscall_register(SYS_SCHED_SETSCHEDULER, sys_sched_setscheduler);
   syscall_register(SYS_SETPRIORITY, sys_setpriority);
@@ -3321,6 +3540,9 @@ void syscall_register_process(void) {
   syscall_register(SYS_SET_ROBUST_LIST, sys_set_robust_list);
   syscall_register(SYS_GET_ROBUST_LIST, sys_get_robust_list);
   syscall_register(SYS_REBOOT, sys_reboot);
+  syscall_register(SYS_INIT_MODULE, sys_init_module);
+  syscall_register(SYS_DELETE_MODULE, sys_delete_module);
+  syscall_register(SYS_SWAPON, sys_swapon);
   syscall_register(SYS_PIDFD_OPEN, sys_pidfd_open);
   syscall_register(SYS_GETCPU, sys_getcpu);
   syscall_register(SYS_CAPGET, sys_capget);

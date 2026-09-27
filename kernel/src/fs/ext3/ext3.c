@@ -15,7 +15,7 @@ static ext3_journal_state_t *ext3_journal_state(ext2_mount_t *mnt) {
 
 void ext3_init_journal(ext2_mount_t *mnt) {
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
-  spinlock_init(&trans->lock);
+  rawspinlock_init(&trans->lock);
   trans->active = false;
   trans->owner_tid = 0;
   trans->depth = 0;
@@ -109,7 +109,9 @@ int ext3_journal_start(ext2_mount_t *mnt) {
    * Only the owning thread may nest a transaction. Other writers wait until
    * the complete journal commit/checkpoint sequence has finished.
    */
-  spinlock_acquire(&trans->lock);
+  while (!rawspinlock_try_acquire(&trans->lock)) {
+    sched_yield();
+  }
   trans->active = true;
   trans->owner_tid = tid;
   trans->depth = 1;
@@ -243,7 +245,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
   jsb->s_start = 0;
   ext2_write_block(mnt, sb_phys, sb_buf);
   kfree(sb_buf);
-  spinlock_release(&trans->lock);
+  rawspinlock_release(&trans->lock);
 
   return 0;
 }

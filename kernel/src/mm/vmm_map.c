@@ -79,6 +79,11 @@ void vmm_lock_acquire_at(uint64_t caller_ip) {
 
 static void *vmm_pending_tables[MAX_CPUS][VMM_PENDING_TABLES];
 static uint32_t vmm_pending_table_count[MAX_CPUS];
+static struct {
+  void *phys;
+  uint16_t pages;
+} vmm_pending_frames[MAX_CPUS][VMM_PENDING_TABLES];
+static uint32_t vmm_pending_frame_count[MAX_CPUS];
 
 static int vmm_pending_slot(void) {
   struct cpu_info *c = cpu_get_current();
@@ -105,6 +110,23 @@ static void vmm_defer_table_free(void *phys) {
   pmm_free_page(phys); /* list full: fall back to freeing where it has always */
 }                      /* been freed, rather than losing the request        */
 
+void vmm_defer_frame_free(void *phys, uint16_t pages) {
+  if (!phys || !pages)
+    return;
+  int slot = vmm_pending_slot();
+  if (slot < 0)
+    return; /* Without a CPU slot we cannot prove remote TLBs are clear. */
+  hal_irq_state_t flags = hal_irq_save();
+  uint32_t n = vmm_pending_frame_count[slot];
+  if (n < VMM_PENDING_TABLES) {
+    vmm_pending_frames[slot][n].phys = phys;
+    vmm_pending_frames[slot][n].pages = pages;
+    vmm_pending_frame_count[slot] = n + 1;
+  }
+  /* A full queue intentionally leaks this allocation. */
+  hal_irq_restore(flags);
+}
+
 static void vmm_drain_pending(void) {
   /* Order matters: invalidate, then release the frames.  A drain from an
    * interrupt-masked context (the page-fault path releases vmm_lock with
@@ -129,7 +151,25 @@ static void vmm_drain_pending(void) {
     hal_irq_restore(flags);
     pmm_free_page(phys);
   }
+  for (;;) {
+    hal_irq_state_t flags = hal_irq_save();
+    uint32_t n = vmm_pending_frame_count[slot];
+    if (n == 0) {
+      hal_irq_restore(flags);
+      break;
+    }
+    void *phys = vmm_pending_frames[slot][n - 1].phys;
+    uint16_t pages = vmm_pending_frames[slot][n - 1].pages;
+    vmm_pending_frame_count[slot] = n - 1;
+    hal_irq_restore(flags);
+    if (pages == 1)
+      pmm_free_page(phys);
+    else
+      pmm_free_pages(phys, pages);
+  }
 }
+
+void vmm_drain_deferred_work(void) { vmm_drain_pending(); }
 
 void vmm_lock_release(void) {
   lockdiag_spot_drop(LOCKDIAG_SPOT_VMM);
@@ -357,6 +397,28 @@ bool vmm_map_page(uint64_t *pml4, uint64_t virtual_addr, uint64_t physical_addr,
   return ok;
 }
 
+/* Update one leaf while the caller already owns vmm_lock.  This is for
+ * bounded batches whose caller also protects the owning mm; it avoids a lock
+ * acquire/release (and deferred-drain attempt) for every page. */
+bool vmm_map_page_locked(uint64_t *pml4, uint64_t virtual_addr,
+                         uint64_t physical_addr, uint64_t flags,
+                         bool *changed) {
+  if (changed)
+    *changed = false;
+  uint64_t want = (physical_addr & PAGE_MASK) | flags | PAGE_FLAG_PRESENT;
+  uint64_t cur = vmm_leaf_entry_nolock(pml4, virtual_addr);
+  if ((cur & PAGE_FLAG_PRESENT) && !(cur & PAGE_FLAG_PS) &&
+      ((cur ^ want) & ~(PAGE_FLAG_A | PAGE_FLAG_D)) == 0)
+    return true;
+
+  bool replacing = (cur & PAGE_FLAG_PRESENT) != 0;
+  bool ok = vmm_map_page_nolock(pml4, virtual_addr, physical_addr, flags,
+                                replacing);
+  if (ok && changed)
+    *changed = true;
+  return ok;
+}
+
 bool vmm_map_page_if_unmapped(uint64_t *pml4, uint64_t virtual_addr,
                              uint64_t physical_addr, uint64_t flags) {
   vmm_lock_acquire();
@@ -464,6 +526,10 @@ void vmm_free_empty_tables(uint64_t *pml4, uint64_t virtual_addr) {
     vmm_dbg_out(" kernel=");
     vmm_dbg_hex((uint64_t)(uintptr_t)vmm_get_kernel_pml4());
     vmm_dbg_out("\n");
+    /* The kernel half is shared by every process. Do not walk into or free
+     * its page tables through a process PML4; doing so can invalidate the
+     * LAPIC HHDM mapping used to acknowledge interrupts. */
+    return;
   }
 
   uint64_t *pml4_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)pml4 & PAGE_MASK);
@@ -559,6 +625,23 @@ void vmm_unmap_page(uint64_t *pml4, uint64_t virtual_addr) {
   vmm_lock_acquire();
 
   size_t pml4_index = (virtual_addr >> 39) & 0x1FF;
+
+  /* Kernel-half mappings are shared. A process PML4 contains copies of the
+   * kernel root entries, so unmapping through it can clear a shared leaf or
+   * release a shared page-table page and make later IRQ handling fault. */
+  if (pml4_index >= 256 &&
+      (uint64_t)(uintptr_t)pml4 !=
+          (uint64_t)(uintptr_t)vmm_get_kernel_pml4()) {
+    vmm_dbg_out("[VMMDBG] BLOCKED kernel-half unmap through process PML4 va=");
+    vmm_dbg_hex(virtual_addr);
+    vmm_dbg_out(" cr3=");
+    vmm_dbg_hex((uint64_t)(uintptr_t)pml4);
+    vmm_dbg_out(" kernel=");
+    vmm_dbg_hex((uint64_t)(uintptr_t)vmm_get_kernel_pml4());
+    vmm_dbg_out("\n");
+    goto unlock;
+  }
+
   size_t pdpt_index = (virtual_addr >> 30) & 0x1FF;
   size_t pd_index   = (virtual_addr >> 21) & 0x1FF;
   size_t pt_index   = (virtual_addr >> 12) & 0x1FF;
@@ -589,11 +672,23 @@ void vmm_unmap_page(uint64_t *pml4, uint64_t virtual_addr) {
     pd_virt[pd_index] = 0;
     tlb_flush_deferred(virtual_addr & ~0x1FFFFFULL, (uint64_t)pml4);
     vmm_lock_release();
-    pmm_free_pages((void *)huge_phys, 512);
+    /* The vmm lock release may have been reached with interrupts masked, in
+     * which case it performed the local invalidation but left remote TLB
+     * acknowledgements queued.  Do not recycle any of the 512 frames until
+     * those CPUs have stopped using the huge translation. */
+    if (tlb_flush_deferred_drain())
+      pmm_free_pages((void *)huge_phys, 512);
+    else
+      vmm_defer_frame_free((void *)huge_phys, 512);
     return;
   }
 
   uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT(pd_entry & PAGE_MASK);
+  /* Unmapping a hole cannot leave a stale translation behind.  Besides being
+   * redundant work, queuing a remote shootdown for every absent page in a
+   * sparse munmap range can interrupt every CPU sharing this address space. */
+  if (!(pt_virt[pt_index] & PAGE_FLAG_PRESENT))
+    goto unlock;
   pt_virt[pt_index] = 0;
   tlb_flush_deferred(virtual_addr, (uint64_t)pml4);
 
@@ -666,9 +761,13 @@ out:
     /* Replacing a leaf PDE with a table pointer does not invalidate the
      * large-page translation other CPUs have already cached, and one invlpg
      * for a single 4 KB page inside it is not enough to clear all 512.  This is
-     * a rare path (only hit when a huge mapping is partially torn down), so a
-     * full flush is the cheap way to be sure. */
-    tlb_shootdown_all();
+     * a rare path (only hit when a huge mapping is partially torn down). A
+     * user mapping needs a context flush; only shared kernel mappings need a
+     * machine-wide flush. */
+    if (virtual_addr <= USER_SPACE_LIMIT)
+      tlb_shootdown_context_for((uint64_t)pml4);
+    else
+      tlb_shootdown_all();
   }
 
   return ok;
@@ -681,16 +780,17 @@ out:
  * vmm_virt_to_phys() assumes every intermediate entry is a valid RAM page
  * table.  When the tables are the thing under suspicion (a missing LAPIC
  * mapping after exec, a GPF in the panic reporter) that assumption turns the
- * diagnostic into a second fault.  This walk checks each frame against
- * pmm_get_total_memory() before dereferencing it, and prints via
- * serial_write_sync() so it is safe from an interrupt that interrupted klog.
+ * diagnostic into a second fault. This walk checks each frame against the
+ * PMM's managed-frame bitmap before dereferencing it. Aggregate memory size is
+ * not a physical-address ceiling: RAM can be sparse and a valid frame can sit
+ * above the summed byte count. It prints via serial_write_sync() so it is safe
+ * from an interrupt that interrupted klog.
  * -------------------------------------------------------------------------- */
 
 static bool vmm_debug_frame_ok(uint64_t phys) {
   if (phys == 0 || (phys & 0xFFF) != 0)
     return false;
-  uint64_t total = pmm_get_total_memory();
-  return total >= PAGE_SIZE && phys < total;
+  return pmm_is_managed(phys);
 }
 
 uint64_t vmm_debug_walk(uint64_t pml4_phys, uint64_t virtual_addr,
@@ -741,33 +841,100 @@ static void vmm_dbg_hex(uint64_t v) {
   serial_write_sync(b, sizeof(b));
 }
 
+static void vmm_dbg_entry_flags(uint64_t entry) {
+  vmm_dbg_out(" flags=");
+  vmm_dbg_out((entry & PAGE_FLAG_PRESENT) ? "P" : "-");
+  vmm_dbg_out((entry & PAGE_FLAG_RW) ? " RW" : " RO");
+  vmm_dbg_out((entry & PAGE_FLAG_USER) ? " US" : " supervisor");
+  if (entry & PAGE_FLAG_PS)
+    vmm_dbg_out(" PS");
+  if (entry & PAGE_FLAG_NX)
+    vmm_dbg_out(" NX");
+}
+
 void vmm_debug_dump_walk(const char *tag, uint64_t pml4_phys,
                          uint64_t virtual_addr) {
   static const char *level_name[4] = {"PML4E", "PDPTE", "PDE", "PTE"};
-  uint64_t entries[4] = {0, 0, 0, 0};
-  uint64_t phys = vmm_debug_walk(pml4_phys, virtual_addr, entries);
+  uint64_t indices[4];
+  uint64_t table = pml4_phys & PAGE_MASK;
+  uint64_t hhdm = pmm_get_hhdm_offset();
+  uint64_t phys = 0;
+  const char *stop = "walk complete";
+
+  for (int i = 0; i < 4; i++)
+    indices[i] = (virtual_addr >> (39 - i * 9)) & 0x1FF;
 
   vmm_dbg_out("[VMMDBG] ");
   vmm_dbg_out(tag);
   vmm_dbg_out(" cr3=");
   vmm_dbg_hex(pml4_phys);
-  vmm_dbg_out(" va=");
+  vmm_dbg_out(" (base=");
+  vmm_dbg_hex(table);
+  vmm_dbg_out(") va=");
   vmm_dbg_hex(virtual_addr);
-  vmm_dbg_out(" -> phys=");
-  vmm_dbg_hex(phys);
+  vmm_dbg_out(" idx=");
+  for (int i = 0; i < 4; i++) {
+    if (i)
+      vmm_dbg_out("/");
+    vmm_dbg_hex(indices[i]);
+  }
   vmm_dbg_out("\n");
+
   for (int i = 0; i < 4; i++) {
     vmm_dbg_out("  ");
     vmm_dbg_out(level_name[i]);
-    vmm_dbg_out("=");
-    vmm_dbg_hex(entries[i]);
-    if (!(entries[i] & PAGE_FLAG_PRESENT)) {
-      vmm_dbg_out(" (not present)");
+    vmm_dbg_out(" table=");
+    vmm_dbg_hex(table);
+    if (!vmm_debug_frame_ok(table)) {
+      vmm_dbg_out(" UNMANAGED_TABLE_FRAME\n");
+      stop = "unmanaged table frame";
       break;
     }
-    if (i == 3 || (entries[i] & PAGE_FLAG_PS))
+
+    uint64_t *entries = (uint64_t *)(uintptr_t)(table + hhdm);
+    uint64_t entry = entries[indices[i]];
+    vmm_dbg_out(" index=");
+    vmm_dbg_hex(indices[i]);
+    vmm_dbg_out(" entry=");
+    vmm_dbg_hex(entry);
+    vmm_dbg_entry_flags(entry);
+    if (!(entry & PAGE_FLAG_PRESENT)) {
+      vmm_dbg_out("\n");
+      stop = "not-present";
       break;
+    }
+
+    if (i == 3) {
+      phys = (entry & PAGE_MASK) | (virtual_addr & 0xFFFULL);
+      vmm_dbg_out(" leaf=4K\n");
+      stop = "leaf=4K";
+      break;
+    }
+    if (entry & PAGE_FLAG_PS) {
+      if (i == 1) {
+        phys = (entry & 0x000FFFFFC0000000ULL) |
+               (virtual_addr & 0x3FFFFFFFULL);
+        vmm_dbg_out(" leaf=1G\n");
+        stop = "leaf=1G";
+      } else if (i == 2) {
+        phys = (entry & 0x000FFFFFFFE00000ULL) |
+               (virtual_addr & 0x1FFFFFULL);
+        vmm_dbg_out(" leaf=2M\n");
+        stop = "leaf=2M";
+      } else {
+        vmm_dbg_out(" INVALID_PS_AT_PML4\n");
+        stop = "invalid PS at PML4";
+      }
+      break;
+    }
+    vmm_dbg_out("\n");
+    table = entry & PAGE_MASK;
   }
+
+  vmm_dbg_out("  result=");
+  vmm_dbg_hex(phys);
+  vmm_dbg_out(" stop=");
+  vmm_dbg_out(stop);
   vmm_dbg_out("\n");
 }
 
@@ -832,3 +999,66 @@ bool vmm_is_huge_page(uint64_t *pml4_phys, uint64_t virtual_addr) {
   return (entry & PAGE_FLAG_PS) != 0; // 2 MB huge page
 }
 
+
+/* --------------------------------------------------------------------------
+ * Resident-set accounting for /proc/<pid>/{statm,status}
+ *
+ * Counts every present entry in the user half of an address space (PML4 slots
+ * 0-255) and returns bytes.  2 MB and 1 GB leaves count as the 512 / 262144
+ * pages they cover, so the figure is directly comparable with what Linux puts
+ * in statm's resident field - which is what glibc-side readers such as WebKit
+ * (WTF::memoryFootprint -> /proc/self/statm field 2 * page size) multiply by
+ * page size and compare against their kill threshold.
+ *
+ * Deliberately lock free: PTEs are written as single aligned 64-bit stores, so
+ * a concurrent fault, munmap or fork can only leave this one sample stale,
+ * never torn.  Reading a frame that teardown has just returned to the PMM
+ * yields a wrong count rather than a fault, because the HHDM maps all RAM
+ * permanently - again, a stale sample.  The walk itself never blocks and never
+ * runs with a scheduler lock held, which is what makes it safe to call from a
+ * /proc read with interrupts enabled.
+ *
+ * Cost is bounded by the page tables the process actually has, i.e. roughly
+ * proportional to its own RSS (and the sum over all processes is bounded by
+ * physical RAM), so polling every process from htop stays cheap.
+ * -------------------------------------------------------------------------- */
+uint64_t vmm_user_resident_bytes(uint64_t cr3) {
+  if (!cr3)
+    return 0;
+
+  uint64_t *pml4_virt = (uint64_t *)PHYS_TO_VIRT(cr3 & PAGE_MASK);
+  uint64_t pages = 0;
+
+  for (size_t i = 0; i < 256; i++) {
+    if (!(pml4_virt[i] & PAGE_FLAG_PRESENT))
+      continue;
+
+    uint64_t *pdpt_virt = (uint64_t *)PHYS_TO_VIRT(pml4_virt[i] & PAGE_MASK);
+    for (size_t j = 0; j < 512; j++) {
+      if (!(pdpt_virt[j] & PAGE_FLAG_PRESENT))
+        continue;
+      if (pdpt_virt[j] & PAGE_FLAG_PS) {
+        pages += 262144; // 1 GB leaf
+        continue;
+      }
+
+      uint64_t *pd_virt = (uint64_t *)PHYS_TO_VIRT(pdpt_virt[j] & PAGE_MASK);
+      for (size_t k = 0; k < 512; k++) {
+        if (!(pd_virt[k] & PAGE_FLAG_PRESENT))
+          continue;
+        if (pd_virt[k] & PAGE_FLAG_PS) {
+          pages += 512; // 2 MB leaf
+          continue;
+        }
+
+        uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT(pd_virt[k] & PAGE_MASK);
+        for (size_t l = 0; l < 512; l++) {
+          if (pt_virt[l] & PAGE_FLAG_PRESENT)
+            pages++;
+        }
+      }
+    }
+  }
+
+  return pages * PAGE_SIZE;
+}

@@ -88,10 +88,17 @@ bool sched_ensure_files(struct thread *t) {
 }
 
 void sched_release_files(struct thread *t) {
-  if (!t || !t->files)
+  if (!t)
     return;
 
+  /* Serialize detaching the per-thread table with users that take a stable
+   * snapshot under tid_lock (signal notification, proc fd inspection). */
+  spinlock_acquire(&tid_lock);
   struct fd_table *files = t->files;
+  if (!files) {
+    spinlock_release(&tid_lock);
+    return;
+  }
   bool last = false;
   if (t->is_forked_child) {
     klog_debug_puts("[FDDBG] lock table ");
@@ -109,6 +116,7 @@ void sched_release_files(struct thread *t) {
     last = true;
   spinlock_release(&files->lock);
   thread_set_files(t, NULL);
+  spinlock_release(&tid_lock);
 
   if (!last)
     return;

@@ -3,6 +3,7 @@
 #include "lib/string.h"
 #include "lock/spinlock.h"
 #include "mm/heap.h"
+#include "mm/vmm.h"
 #include "net/ipv6.h"
 #include "net/tcp.h"
 #include "sched/sched.h"
@@ -254,13 +255,28 @@ static ssize_t inet6_recvfrom(socket_t *sock, void *buf, size_t len, int flags,
       spinlock_release(&udp6_lock);
       return copy;
     }
-    spinlock_release(&udp6_lock);
-    if (socket_is_nonblocking(sock) || (flags & MSG_DONTWAIT)) return -11;
+    if (socket_is_nonblocking(sock) || (flags & MSG_DONTWAIT)) {
+      spinlock_release(&udp6_lock);
+      return -11;
+    }
     struct thread *t = sched_get_current();
     wait_queue_entry_t e = {.thread = t};
     wait_queue_t *wq = (wait_queue_t *)(sock->wait_queue ? sock->wait_queue : &s->wait);
-    wait_queue_add(wq, &e); t->state = THREAD_BLOCKED;
-    sched_yield(); wait_queue_remove(wq, &e);
+    /* Register and block while holding udp6_lock. udp6_input() takes this
+     * lock before queueing and waking, so a datagram cannot land between the
+     * empty check and waiter registration and leave recvfrom asleep. */
+    wait_queue_add(wq, &e);
+    if (t) {
+      t->state = THREAD_BLOCKED;
+      t->wakeup_ticks = 0;
+    }
+    spinlock_release(&udp6_lock);
+    sched_yield();
+    if (t) {
+      t->wakeup_ticks = 0;
+      if (t->state == THREAD_BLOCKED) t->state = THREAD_RUNNING;
+    }
+    wait_queue_remove(wq, &e);
   }
 }
 
@@ -365,6 +381,7 @@ static ssize_t inet6_sendmsg(socket_t *sock, struct msghdr *msg, int flags) {
                              msg->msg_iov[i].iov_len, flags);
       if (r < 0) return total ? total : r;
       total += r;
+      if ((size_t)r < msg->msg_iov[i].iov_len) break;
     }
     return total;
   }
@@ -380,13 +397,75 @@ static ssize_t inet6_sendmsg(socket_t *sock, struct msghdr *msg, int flags) {
 
 static ssize_t inet6_recvmsg(socket_t *sock, struct msghdr *msg, int flags) {
   if (!msg || !msg->msg_iov || !msg->msg_iovlen) return -22;
-  int addrlen = (int)msg->msg_namelen;
-  ssize_t r = inet6_recvfrom(sock, msg->msg_iov[0].iov_base,
-                             msg->msg_iov[0].iov_len, flags,
-                             (struct sockaddr *)msg->msg_name,
-                             msg->msg_name ? &addrlen : NULL);
-  if (r >= 0 && msg->msg_name) msg->msg_namelen = (uint32_t)addrlen;
-  return r;
+  struct inet6_sock *s = sock ? (struct inet6_sock *)sock->sk : NULL;
+  if (!s) return -22;
+  if (s->tcp) {
+    size_t capacity = 0;
+    for (size_t i = 0; i < msg->msg_iovlen; i++) {
+      if (msg->msg_iov[i].iov_len > (size_t)-1 - capacity) return -90;
+      capacity += msg->msg_iov[i].iov_len;
+    }
+    if (!capacity) return 0;
+    uint8_t *buffer = kmalloc(capacity);
+    if (!buffer) return -12;
+    ssize_t received = inet6_recvfrom(sock, buffer, capacity, flags, NULL, NULL);
+    if (received > 0) {
+      size_t remaining = (size_t)received;
+      size_t copied = 0;
+      for (size_t i = 0; i < msg->msg_iovlen && remaining; i++) {
+        size_t count = msg->msg_iov[i].iov_len;
+        if (count > remaining) count = remaining;
+        if (count) {
+          memcpy(msg->msg_iov[i].iov_base, buffer + copied, count);
+          copied += count;
+          remaining -= count;
+        }
+      }
+    }
+    kfree(buffer);
+    return received;
+  }
+
+  /* IPv6 datagrams also span the complete iovec array, but are dequeued only
+   * once. Scatter the one received packet instead of silently discarding its
+   * tail after filling iov[0]. */
+  uint8_t datagram[UDP6_PAYLOAD];
+  size_t capacity = 0;
+  for (size_t i = 0; i < msg->msg_iovlen && capacity < sizeof(datagram); i++) {
+    size_t room = sizeof(datagram) - capacity;
+    capacity += msg->msg_iov[i].iov_len < room
+                    ? msg->msg_iov[i].iov_len
+                    : room;
+  }
+  struct sockaddr_in6 source;
+  memset(&source, 0, sizeof(source));
+  int source_len = sizeof(source);
+  ssize_t received = inet6_recvfrom(
+      sock, datagram, capacity, flags,
+      msg->msg_name ? (struct sockaddr *)&source : NULL,
+      msg->msg_name ? &source_len : NULL);
+  if (received < 0) return received;
+
+  size_t remaining = (size_t)received;
+  size_t copied = 0;
+  for (size_t i = 0; i < msg->msg_iovlen && remaining; i++) {
+    size_t count = msg->msg_iov[i].iov_len;
+    if (count > remaining) count = remaining;
+    if (count) {
+      memcpy(msg->msg_iov[i].iov_base, datagram + copied, count);
+      copied += count;
+      remaining -= count;
+    }
+  }
+  if (msg->msg_name) {
+    size_t name_bytes = msg->msg_namelen < sizeof(source)
+                            ? msg->msg_namelen
+                            : sizeof(source);
+    if (name_bytes) memcpy(msg->msg_name, &source, name_bytes);
+    msg->msg_namelen = sizeof(source);
+  }
+  msg->msg_flags = 0;
+  return received;
 }
 
 static int inet6_getsockopt(socket_t *sock, int level, int option,
@@ -485,6 +564,29 @@ static int inet6_setsockopt(socket_t *sock, int level, int option,
   return 0;
 }
 
+static int inet6_ioctl(socket_t *sock, uint32_t request, uint64_t arg) {
+  if (request != 0x541B) /* FIONREAD / TIOCINQ */
+    return -25;
+  if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int)))
+    return -14;
+
+  struct inet6_sock *s = sock ? (struct inet6_sock *)sock->sk : NULL;
+  if (!s)
+    return -9;
+
+  size_t available = 0;
+  if (s->tcp) {
+    available = tcp_rx_available(s->tcp);
+  } else {
+    spinlock_acquire(&udp6_lock);
+    if (s->used && s->tail != s->head)
+      available = s->queue[s->tail % UDP6_QUEUE].length;
+    spinlock_release(&udp6_lock);
+  }
+  *(int *)arg = available > 0x7fffffffU ? 0x7fffffff : (int)available;
+  return 0;
+}
+
 static sock_ops_t inet6_ops = {
   .bind=inet6_bind, .connect=inet6_connect, .listen=inet6_listen,
   .accept=inet6_accept,
@@ -493,6 +595,7 @@ static sock_ops_t inet6_ops = {
   .sendmsg=inet6_sendmsg, .recvmsg=inet6_recvmsg,
   .poll=inet6_poll, .getsockname=inet6_getsockname,
   .getpeername=inet6_getpeername, .destroy=inet6_destroy,
+  .ioctl=inet6_ioctl,
   .shutdown=inet6_shutdown,
   .getsockopt=inet6_getsockopt, .setsockopt=inet6_setsockopt,
 };

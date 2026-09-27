@@ -21,5 +21,6 @@ int raw_icmp_send(struct raw_icmp_socket *, const void *, size_t, uint32_t);
 ssize_t raw_icmp_recv(struct raw_icmp_socket *, void *, size_t, uint32_t *,
                       bool nonblocking);
 bool raw_icmp_readable(struct raw_icmp_socket *);
+size_t raw_icmp_available(struct raw_icmp_socket *);
 void raw_icmp_deliver(uint32_t, uint32_t, const uint8_t *, size_t);
 #endif

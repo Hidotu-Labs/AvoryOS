@@ -96,6 +96,7 @@ static volatile uint32_t total_played_blocks = 0;
 static wait_queue_t hda_wait_queue;
 // Invoked from the ISR so upper layers can refill the queue (ALSA mmap path).
 static void (*hda_tick_callback)(void) = NULL;
+static void hda_start_stream(void);
 
 // MMIO Access Helpers
 static inline uint8_t hda_read8(uint32_t reg) {
@@ -221,12 +222,22 @@ static uint16_t hda_compute_format(uint32_t rate, uint8_t channels, uint8_t bits
         fmt |= (1U << 14) | (1U << 11);
     } else if (rate == 176400) {
         fmt |= (1U << 14) | (3U << 11);
+    } else if (rate == 22050) {
+        fmt |= (1U << 14) | (1U << 8); // 44.1 kHz / 2
+    } else if (rate == 11025) {
+        fmt |= (1U << 14) | (3U << 8); // 44.1 kHz / 4
     } else if (rate == 96000) {
         fmt |= (1U << 11);
     } else if (rate == 192000) {
         fmt |= (3U << 11);
     } else if (rate == 32000) {
         fmt |= (1U << 11) | (2U << 8); // 48 kHz * 2/3
+    } else if (rate == 24000) {
+        fmt |= (1U << 8); // 48 kHz / 2
+    } else if (rate == 16000) {
+        fmt |= (2U << 8); // 48 kHz / 3
+    } else if (rate == 8000) {
+        fmt |= (5U << 8); // 48 kHz / 6
     }
 
     // Sample size codes (HDA spec / AC_FMT_BITS_*): 0 = 8, 1 = 16, 2 = 20,
@@ -264,7 +275,7 @@ static void hda_apply_format(uint32_t rate, uint8_t channels, uint8_t bits) {
     }
 
     if (hda_is_playing) {
-        hda_sd_write8(HDA_SD_CTL, ctl | HDA_SD_CTL_RUN);
+        hda_start_stream();
     }
 }
 
@@ -329,17 +340,9 @@ static void hda_note_underrun(void) {
     hda_apply_queue_limit();
 }
 
-// Decay the extra headroom once playback has been clean for a few seconds.
+// Keep queue headroom stable during continuous playback to avoid abrupt queue shrinkage.
 static void hda_safety_tick(void) {
-    if (hda_safety_scale <= 1 || !hda_last_underrun_ms) {
-        return;
-    }
-    uint64_t now = lapic_timer_get_ticks();
-    if (now - hda_last_underrun_ms > 3000) {
-        hda_safety_scale >>= 1;
-        hda_apply_queue_limit();
-        hda_last_underrun_ms = now; // next step another 3 s of clean playback
-    }
+    return;
 }
 
 // Prime every descriptor from the staging ring and start the DMA engine.
@@ -415,13 +418,14 @@ static void hda_service_descriptors(void) {
     }
 
     if (hda_underflow_count >= HDA_BDL_ENTRIES) {
-        // Whole ring drained to silence: stop the engine until data arrives.
-        uint8_t ctl = hda_sd_read8(HDA_SD_CTL);
-        hda_sd_write8(HDA_SD_CTL, ctl & ~HDA_SD_CTL_RUN);
-        hda_is_playing = false;
-        hda_underflow_count = 0;
+        // Starvation: keep playing silence without stopping the DMA engine.
+        // Interrupts continue firing and timers/waiters continue advancing.
+        hda_underflow_count = HDA_BDL_ENTRIES;
         hda_dma_pending = 0;
-        memset(hda_slot_bytes, 0, sizeof(hda_slot_bytes));
+        if (hda_tick_callback) {
+            hda_tick_callback();
+        }
+        wait_queue_wake_all(&hda_wait_queue);
     }
 }
 
@@ -785,7 +789,7 @@ uint32_t hda_write_pcm(const void *buffer, uint32_t bytes, uint32_t rate, uint8_
         if (hda_is_playing) {
             hda_service_descriptors();
         }
-        if (!hda_is_playing && ring_count >= HDA_BUFFER_SIZE) {
+        if (!hda_is_playing && ring_count > 0) {
             hda_start_stream();
         }
 
@@ -839,7 +843,7 @@ uint32_t hda_queue_pcm(const void *buffer, uint32_t bytes, uint32_t rate,
 
         if (hda_is_playing) {
             hda_service_descriptors();
-        } else if (ring_count >= HDA_BUFFER_SIZE) {
+        } else if (ring_count > 0) {
             hda_start_stream();
         }
     }
@@ -923,6 +927,7 @@ void hda_reset_stream(void) {
     uint32_t ctl = hda_sd_read32(HDA_SD_CTL);
     hda_sd_write32(HDA_SD_CTL, ctl & ~HDA_SD_CTL_RUN);
     hal_irq_enable();
+    wait_queue_wake_all(&hda_wait_queue);
 }
 
 void hda_set_format(uint32_t rate, uint8_t channels, uint8_t bits) {
@@ -931,6 +936,19 @@ void hda_set_format(uint32_t rate, uint8_t channels, uint8_t bits) {
     current_channels = channels;
     current_bits = bits;
     hda_apply_format(rate, channels, bits);
+}
+
+bool hda_is_stream_playing(void) {
+    return hda_is_playing;
+}
+
+void hda_start_playback(void) {
+    if (!hda_present) return;
+    hal_irq_disable();
+    if (!hda_is_playing) {
+        hda_start_stream();
+    }
+    hal_irq_enable();
 }
 
 // VFS Callbacks

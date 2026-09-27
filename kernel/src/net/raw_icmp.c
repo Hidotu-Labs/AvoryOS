@@ -69,6 +69,17 @@ bool raw_icmp_readable(struct raw_icmp_socket*s) {
   return r;
 }
 
+size_t raw_icmp_available(struct raw_icmp_socket *s) {
+  if (!s)
+    return 0;
+  spinlock_acquire(&lock);
+  size_t available = s->head != s->tail
+                         ? s->queue[s->tail % RAW_ICMP_QUEUE_DEPTH].length
+                         : 0;
+  spinlock_release(&lock);
+  return available;
+}
+
 void raw_icmp_deliver(uint32_t src,uint32_t dst,const uint8_t*p,size_t n){
 
  spinlock_acquire(&lock);for(int i=0;i<RAW_ICMP_MAX_SOCKETS;i++){struct raw_icmp_socket*s=&sockets[i];

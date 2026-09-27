@@ -13,6 +13,7 @@
 #include "../mm/vmm.h"
 #include "../sched/sched.h"
 #include "../sched/wait.h"
+#include "../socket/epoll.h"
 
 struct fb_info fb_global;
 static vfs_node_t fb_vfs_node;
@@ -140,6 +141,12 @@ static int console_dev_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) 
         ws->ws_row = (unsigned short)(h ? h / 16 : 25);
         ws->ws_xpixel = (unsigned short)w;
         ws->ws_ypixel = (unsigned short)h;
+        return 0;
+    }
+    case 0x5414: { // TIOCSWINSZ
+        const struct winsize *ws = (const struct winsize *)arg;
+        if (!ws || !vmm_is_user_addr_range_valid(arg, sizeof(struct winsize)))
+            return -14; // -EFAULT
         return 0;
     }
     case TCGETS: {
@@ -512,6 +519,15 @@ void fb_set_kd_mode(int mode) {
 
 /* ── VFS DevFS Registration ──────────────────────────────────────────────── */
 
+/* Keyboard input just landed in the ring buffer: wake epoll watchers on the
+ * console family.  poll() waiters are covered separately through
+ * node->wait_queue, which points at keyboard_wait_queue. */
+void console_input_ready(void) {
+    epoll_notify_event(&console_vfs_node, EPOLLIN);
+    epoll_notify_event(&tty0_vfs_node, EPOLLIN);
+    epoll_notify_event(&tty_vfs_node, EPOLLIN);
+}
+
 void fb_register_vfs(void) {
     /* Setup Framebuffer character device */
     vfs_node_init(&fb_vfs_node);
@@ -555,6 +571,10 @@ void fb_register_vfs(void) {
     console_vfs_node.poll = console_dev_poll;
     console_vfs_node.open = console_dev_open;
     console_vfs_node.close = console_dev_close;
+    /* keyboard_wait_queue is woken on every keystroke (ring_buffer_push);
+     * without this, poll()/select() on the console had no wake source and only
+     * noticed input at the periodic safety-net rescan. */
+    console_vfs_node.wait_queue = &keyboard_wait_queue;
 
     vfs_node_init(&tty0_vfs_node);
     strncpy(tty0_vfs_node.name, "tty0", 127);
@@ -566,6 +586,7 @@ void fb_register_vfs(void) {
     tty0_vfs_node.poll = console_dev_poll;
     tty0_vfs_node.open = console_dev_open;
     tty0_vfs_node.close = console_dev_close;
+    tty0_vfs_node.wait_queue = &keyboard_wait_queue;
 
     vfs_node_init(&tty_vfs_node);
     strncpy(tty_vfs_node.name, "tty", 127);
@@ -577,6 +598,7 @@ void fb_register_vfs(void) {
     tty_vfs_node.poll = console_dev_poll;
     tty_vfs_node.open = console_dev_open;
     tty_vfs_node.close = console_dev_close;
+    tty_vfs_node.wait_queue = &keyboard_wait_queue;
 
     devfs_register_node("console", &console_vfs_node);
     devfs_register_node("tty0", &tty0_vfs_node);

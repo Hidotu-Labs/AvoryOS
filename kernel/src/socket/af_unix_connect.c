@@ -2,6 +2,8 @@
 
 #include "af_unix_internal.h"
 
+static volatile uint32_t unix_missing_destination_logs;
+
 int unix_listen_impl(socket_t *sock, int backlog) {
   if (!sock)
     return -22; // EINVAL
@@ -20,9 +22,9 @@ int unix_listen_impl(socket_t *sock, int backlog) {
 
   spinlock_release(&sock->lock);
 
-  klog_puts("[OK] unix_listen: socket is now listening (backlog=");
-  klog_uint64(usk->backlog);
-  klog_puts(")\n");
+  klog_debug_puts("[OK] unix_listen: socket is now listening (backlog=");
+  klog_debug_uint64(usk->backlog);
+  klog_debug_puts(")\n");
   return 0;
 }
 
@@ -52,16 +54,31 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
 
   unix_sock_t *dusk = unix_find_socket_by_addr_ref(sun, addrlen);
   if (!dusk) {
-    klog_puts("[WARN] unix_connect: destination not found: \"");
+    uint32_t seen = __atomic_add_fetch(&unix_missing_destination_logs, 1,
+                                       __ATOMIC_RELAXED);
+    bool log_missing = seen <= 8 || (seen & 0x7Fu) == 0;
+    if (seen == 9)
+      klog_puts("[WARN] repeated missing AF_UNIX destinations suppressed; "
+                "sampling every 128th (counter is global)\n");
+    if (log_missing)
+      klog_puts("[WARN] unix_connect: destination not found: \"");
     if (sun->sun_path[0] == '\0') {
-      klog_puts("@");
-      klog_puts(sun->sun_path + 1);
-      klog_puts("\"\n");
+      if (log_missing) {
+        klog_puts("@");
+        klog_puts(sun->sun_path + 1);
+        klog_puts("\" count=");
+        klog_uint64(seen);
+        klog_puts("\n");
+      }
       KTRACK_ERR(KSUBSYS_AF_UNIX, -111);
       return -111; // ECONNREFUSED
     } else {
-      klog_puts(sun->sun_path);
-      klog_puts("\"\n");
+      if (log_missing) {
+        klog_puts(sun->sun_path);
+        klog_puts("\" count=");
+        klog_uint64(seen);
+        klog_puts("\n");
+      }
       KTRACK_ERR(KSUBSYS_AF_UNIX, -2);
       return -2; // ENOENT
     }
@@ -136,10 +153,15 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
   }
   dusk->accept_queue_len++;
 
-  // Notify listener
-  epoll_notify_socket(listener_sock->fd, POLLIN);
+  // Notify listener.  The epitems register on the socket's VFS node, so the
+  // node walk reaches every watcher; the by-fd scan is only the fallback for
+  // a nodeless socket.  The old code ran BOTH unconditionally, paying the
+  // 64-instance scan on every incoming connection and notifying the same
+  // epitems twice.
   if (listener_sock->node) {
     epoll_notify_event(listener_sock->node, POLLIN);
+  } else if (listener_sock->fd >= 0) {
+    epoll_notify_socket(listener_sock->fd, POLLIN);
   }
   if (listener_sock->wait_queue) {
     wait_queue_wake_all((wait_queue_t *)listener_sock->wait_queue);
@@ -201,6 +223,5 @@ int unix_accept_impl(socket_t *sock, socket_t **newsock) {
 
   *newsock = new_sock;
 
-  klog_puts("[OK] unix_accept: retrieved early-linked connection\n");
   return 0;
 }

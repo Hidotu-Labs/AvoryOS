@@ -11,6 +11,10 @@
 #define MAP_FIXED 0x10
 #define MAP_ANONYMOUS 0x20
 #define MAP_GROWSDOWN 0x0100
+/* Linux user-space flag: pthread stacks are created with this.  The kernel
+ * stores it verbatim in vma.flags (it is not stripped on mmap) so the fault
+ * report can tell a fixed-size thread stack from a GROWSDOWN main stack. */
+#define MAP_STACK 0x20000
 #define MAP_HUGETLB 0x40000  /* Linux user-space flag: request huge pages */
 /* Kernel-internal flags — stored in vma.flags, never exposed to user space */
 #define MAP_SYSV_SHM 0x100000000ULL
@@ -101,6 +105,32 @@ struct vma *vma_find_overlap(struct vma_list *list, uint64_t start,
 struct vma *vma_find_growdown(struct vma_list *list, uint64_t cr2,
                               uint64_t max_limit);
 
+/* Fault-report snapshot.  Copied out under mm->lock so the reporter can print
+ * without holding the lock (klog can take console locks). */
+struct vma_snapshot {
+  uint64_t start;
+  uint64_t end;
+  uint64_t prot;
+  uint64_t flags;
+  uint64_t offset;
+  int fd;
+  bool valid;
+};
+
+/* Fill prev/hit/next around addr: hit is the VMA containing addr (if any),
+ * prev is the closest VMA ending at or below addr, next is the closest VMA
+ * starting above addr.  Caller must hold mm->lock; performs no allocation. */
+void vma_snapshot_neighbors(struct vma_list *list, uint64_t addr,
+                            struct vma_snapshot *prev,
+                            struct vma_snapshot *hit,
+                            struct vma_snapshot *next);
+
+/* Snapshot up to cap MAP_STACK VMAs (pthread thread stacks) into out.
+ * Returns the total number of MAP_STACK VMAs (may exceed cap; only the first
+ * cap are stored).  Caller must hold mm->lock; performs no allocation. */
+int vma_snapshot_stacks(struct vma_list *list, struct vma_snapshot *out,
+                        int cap);
+
 // Scan tree to find the first linearly unmapped gap capable of fitting 'length'
 // cleanly.
 uint64_t vma_find_gap(struct vma_list *list, uint64_t length,
@@ -110,8 +140,14 @@ uint64_t vma_find_gap(struct vma_list *list, uint64_t length,
 // monolithic mappings natively.
 void vma_merge_adjacent(struct vma_list *list);
 
-// Clone VMA list for fork (shared mappings stay shared, private get copied)
-void vma_list_clone(struct vma_list *dst, struct vma_list *src);
+// Clone VMA list for fork (shared mappings stay shared, private get copied).
+// Returns false and destroys any partial destination on allocation failure.
+bool vma_list_clone(struct vma_list *dst, struct vma_list *src);
+
+// Sum of every VMA's [start, end) length, in bytes: the address space a
+// process has actually declared, which is what Linux reports as VmSize.
+// Callers must hold mm->lock (the tree is mutated in place by brk/mmap/munmap).
+uint64_t vma_total_bytes(struct vma_list *list);
 
 // Dump VMA list to klog for debugging
 void vma_dump(struct vma_list *list);

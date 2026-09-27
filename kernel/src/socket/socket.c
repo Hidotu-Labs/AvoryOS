@@ -16,12 +16,115 @@
 #include "af_inet6.h"
 #include "socket_internal.h"
 #include "../syscalls/sys_io_shared.h"
+#include "../net/core.h"
+#include "../net/ipv4.h"
 #include <stdint.h>
 
 // Global Socket Table
 socket_t *socket_table[SOCKET_MAX_COUNT];
 int socket_count = 0;
 spinlock_t socket_table_lock = SPINLOCK_INIT;
+
+/* Linux x86_64 SIOCGIFCONF ABI: ifconf is 16 bytes and each IPv4 ifreq is
+ * 40 bytes. Avory currently routes IPv4 through the default net_device. */
+struct avory_ifconf64 {
+  int32_t length;
+  uint32_t _pad;
+  uint64_t buffer;
+};
+
+struct avory_ifreq64 {
+  char name[16];
+  uint16_t family;
+  uint8_t address_data[14];
+  uint8_t _union_padding[8];
+};
+_Static_assert(sizeof(struct avory_ifconf64) == 16, "Linux x86_64 ifconf ABI");
+_Static_assert(sizeof(struct avory_ifreq64) == 40, "Linux x86_64 ifreq ABI");
+
+static int socket_ioctl_ifconf(uint64_t arg) {
+  if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(struct avory_ifconf64)))
+    return -14;
+
+  struct avory_ifconf64 ifc;
+  memcpy(&ifc, (const void *)arg, sizeof(ifc));
+  if (ifc.length < 0)
+    return -22;
+
+  struct net_device *dev = net_device_default();
+  const struct ipv4_config *cfg = ipv4_get_config();
+  bool have_ipv4 = dev && dev->registered && cfg && cfg->address != 0;
+  int written = 0;
+
+  if (have_ipv4 && ifc.length >= (int32_t)sizeof(struct avory_ifreq64)) {
+    if (!ifc.buffer || !vmm_is_user_addr_range_valid(
+                           ifc.buffer, sizeof(struct avory_ifreq64)))
+      return -14;
+
+    struct avory_ifreq64 ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    size_t name_len = strlen(dev->name);
+    if (name_len >= sizeof(ifr.name))
+      name_len = sizeof(ifr.name) - 1;
+    memcpy(ifr.name, dev->name, name_len);
+    ifr.family = 2; /* AF_INET */
+    /* sockaddr_in address begins after family and the two-byte port. */
+    ifr.address_data[2] = (uint8_t)(cfg->address >> 24);
+    ifr.address_data[3] = (uint8_t)(cfg->address >> 16);
+    ifr.address_data[4] = (uint8_t)(cfg->address >> 8);
+    ifr.address_data[5] = (uint8_t)cfg->address;
+    memcpy((void *)ifc.buffer, &ifr, sizeof(ifr));
+    written = sizeof(ifr);
+  }
+
+  ifc.length = written;
+  memcpy((void *)arg, &ifc, sizeof(ifc));
+  return 0;
+}
+
+static bool socket_ifreq_name_is(const char requested[16], const char *actual) {
+  if (!actual || !requested[0])
+    return false;
+  for (size_t i = 0; i < 16; i++) {
+    if (requested[i] != actual[i])
+      return false;
+    if (!actual[i])
+      return true;
+  }
+  return true;
+}
+
+static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
+  if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(struct avory_ifreq64)))
+    return -14;
+
+  struct avory_ifreq64 ifr;
+  memcpy(&ifr, (const void *)arg, sizeof(ifr));
+  struct net_device *dev = net_device_default();
+  if (!dev || !dev->registered || !socket_ifreq_name_is(ifr.name, dev->name))
+    return -19; /* ENODEV */
+
+  if (request == 0x8915) { /* SIOCGIFADDR */
+    const struct ipv4_config *cfg = ipv4_get_config();
+    if (!cfg || !cfg->address)
+      return -99; /* EADDRNOTAVAIL */
+    memset(&ifr.family, 0, sizeof(ifr) - 16);
+    ifr.family = 2; /* AF_INET */
+    ifr.address_data[2] = (uint8_t)(cfg->address >> 24);
+    ifr.address_data[3] = (uint8_t)(cfg->address >> 16);
+    ifr.address_data[4] = (uint8_t)(cfg->address >> 8);
+    ifr.address_data[5] = (uint8_t)cfg->address;
+  } else if (request == 0x8933) { /* SIOCGIFINDEX */
+    uint32_t ifindex = 2; /* route netlink reports the default device as 2 */
+    memset(&ifr.family, 0, sizeof(ifr) - 16);
+    memcpy(&ifr.family, &ifindex, sizeof(ifindex));
+  } else {
+    return -25;
+  }
+
+  memcpy((void *)arg, &ifr, sizeof(ifr));
+  return 0;
+}
 
 // Socket Family Registry
 static net_family_t *family_registry = NULL;
@@ -141,11 +244,10 @@ bool skb_queue_empty(sk_buff_head_t *list) { return list->head == NULL; }
 // Socket Wait Queue Helpers
 
 void socket_wait_queue_init(socket_t *sock) {
-  wait_queue_t *wq = kmalloc(sizeof(wait_queue_t));
-  if (wq) {
-    wait_queue_init(wq);
-    sock->wait_queue = wq;
-  }
+  _Static_assert(sizeof(wait_queue_t) <= sizeof(sock->_wait_queue_mem),
+                 "wait_queue_t grew: enlarge socket_t._wait_queue_mem");
+  wait_queue_init((wait_queue_t *)sock->_wait_queue_mem);
+  sock->wait_queue = sock->_wait_queue_mem;
 }
 
 void socket_wait(socket_t *sock) {
@@ -219,6 +321,7 @@ socket_t *socket_create(int domain, int type, int protocol) {
   sock->wait_queue = NULL;
   sock->refcount = 1;
   sock->closing = false;
+  sock->table_index = -1; // memset left 0, which is a valid table slot
   spinlock_init(&sock->lock);
 
   // Allocate socket table slot
@@ -230,6 +333,7 @@ socket_t *socket_create(int domain, int type, int protocol) {
   }
 
   socket_table[idx] = sock;
+  sock->table_index = idx;
 
   // Initialize wait queue
   socket_wait_queue_init(sock);
@@ -240,8 +344,7 @@ socket_t *socket_create(int domain, int type, int protocol) {
     int ret = family->create(sock, protocol);
     if (ret < 0) {
       socket_table_free(idx);
-      if (sock->wait_queue)
-        kfree(sock->wait_queue);
+      sock->wait_queue = NULL; // embedded storage, nothing to free
       kfree(sock);
       return NULL;
     }
@@ -255,20 +358,21 @@ void socket_destroy(socket_t *sock) {
   if (!sock)
     return;
 
-  spinlock_acquire(&sock->lock);
-
-  // Call family-specific destroy
+  // Call family-specific destroy first without holding sock->lock.
+  // Family destroy (e.g. unix_destroy) may need to notify/lock the peer socket.
+  // Not holding sock->lock prevents AB-BA deadlocks when peers are destroyed concurrently.
   if (sock->ops && sock->ops->destroy) {
     sock->ops->destroy(sock);
   }
 
-  // Free wait queue
+  spinlock_acquire(&sock->lock);
+
+  // Release wait queue (embedded in the socket: wake and detach, no free)
   if (sock->wait_queue) {
     /* Waking is attempted by every family's destroy handler, but do it here as
-     * well: this is the last point before the queue memory goes away, and
+     * well: this is the last point before the queue goes away, and
      * wait_queue_wake_all() detaches entries so nothing can touch it after. */
     wait_queue_wake_all((wait_queue_t *)sock->wait_queue);
-    kfree(sock->wait_queue);
     sock->wait_queue = NULL;
   }
 
@@ -283,13 +387,22 @@ void socket_destroy(socket_t *sock) {
     sock->node = NULL;
   }
 
+  sock->peer = NULL;
+
   spinlock_release(&sock->lock);
 
-  // Free socket table slot
-  for (int i = 0; i < SOCKET_MAX_COUNT; i++) {
-    if (socket_table[i] == sock) {
-      socket_table_free(i);
-      break;
+  // Free socket table slot. The index is remembered at create time; this
+  // used to rescan all SOCKET_MAX_COUNT (4096) slots on every close to find
+  // the socket's own slot.
+  int idx = sock->table_index;
+  if (idx >= 0 && idx < SOCKET_MAX_COUNT && socket_table[idx] == sock) {
+    socket_table_free(idx);
+  } else {
+    for (int i = 0; i < SOCKET_MAX_COUNT; i++) {
+      if (socket_table[i] == sock) {
+        socket_table_free(i);
+        break;
+      }
     }
   }
 
@@ -705,6 +818,20 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   if (sock->closing) {
     socket_put(sock);
     return -9;
+  }
+
+  /* SIOCGIFCONF is a socket ioctl used by libc and clients to enumerate
+   * configured IPv4 interfaces. The network stack has one IPv4 config tied
+   * to its default device, which is the complete set currently available. */
+  if (request == 0x8912) {
+    int ret = socket_ioctl_ifconf(arg);
+    socket_put(sock);
+    return ret;
+  }
+  if (request == 0x8915 || request == 0x8933) {
+    int ret = socket_ioctl_ifreq(request, arg);
+    socket_put(sock);
+    return ret;
   }
 
   /* FIONBIO is a generic socket ioctl. Rust std/rustix uses it to put TCP
