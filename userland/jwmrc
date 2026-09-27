@@ -3,7 +3,6 @@
     <!-- The root menu. -->
     <RootMenu onroot="12">
         <Program icon="utilities-terminal" label="Terminal">st</Program>
-        <Program icon="web-browser" label="Forkit Browser">forkit</Program>
         <Program icon="applications-games" label="Doom">doom_x11</Program>
         <Program icon="eyes" label="xeyes">xeyes</Program>
         <Program icon="help-about" label="About AscentOS">about</Program>

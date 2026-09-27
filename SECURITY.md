@@ -4,17 +4,18 @@
 
 | Version | Supported          | Known Issues                                           |
 | ------- | ------------------ | ------------------------------------------------------ |
-| 2.x     | :warning:          | No issues                                         |
-| 1.x     | :warning:          | PTY stopping, 300KB mem leak |
+| 2.x     | :warning:          | Unbalanced CPU usage, user faults in certain programs, AMD GPU renderer not working |
+| 1.x     | :x:                | End of support (PTY stopping, memory leaks)           |
 | < 1.0   | :x:                | End of support                                         |
 
 ## Known Issues
 
 ### Version 2.x
-- **No issues**: Currently no known issues other than speed
+- **Unbalanced CPU Usage**: Workload scheduling across SMP cores can become unbalanced under certain multitasking conditions, resulting in uneven core utilization.
+- **User Faults in Some Programs**: Certain userland programs may trigger unexpected user-space faults / crashes due to incomplete syscall corner cases or edge behaviors.
+- **AMD GPU Renderer Not Working**: LinuxKPI AMDGPU hardware 3D acceleration via radeonsi is currently non-functional / broken. Use VirtIO-GPU or software rendering (pixman / llvmpipe) for stable graphics sessions.
 
-
-### Version 1.x
+### Version 1.x (Legacy)
 - **PTY Stopping Issue**: PTY (pseudo-terminal) processes may stop unexpectedly under certain conditions. Workaround: restart the terminal session.
 - **Memory Leak**: Approximately 300KB memory leak detected during normal system operation.
 

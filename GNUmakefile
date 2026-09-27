@@ -825,7 +825,7 @@ disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 
 
 disk.img: $(BASH_STAMP) $(COREUTILS_STAMP) $(ALPINE_STAMP) $(QUAKE2_BUNDLE_FILES)
-disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/forkit.elf userland/about.elf userland/hello_glibc.elf userland/booter.elf userland/reboot.elf userland/shutdown.elf userland/apm.elf userland/test_cpp.elf  userland/kilo.elf  userland/ls.elf userland/lspci.elf userland/lsblk.elf userland/readelf.elf userland/pong.elf userland/raycast.elf userland/asplay.elf userland/kria.elf userland/doom.elf userland/doom_x11.elf userland/gtk_test.elf userland/qt5_test.elf userland/sdl3_test.elf userland/tglgears_fb.elf userland/tglgears_drm.elf userland/tglhello_drm.elf userland/test_mem_stress.elf userland/classicube.elf userland/terrain.png userland/texpacks/classicube.zip initrd/startx.sh initrd/startw.sh initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh AetherDE/x11-wm/AetherWM AetherDE/aether-dock/aether-dock AetherDE/aether-panel/aether-panel AetherDE/wayland-compositor/aether-compositor AetherDE/demo-client/aether-window AetherDE/scripts/sax11.sh AetherDE/scripts/sawayland.sh userland/avoryd.elf $(AVORYD_CONFIG_FILES)
+disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/about.elf userland/hello_glibc.elf userland/booter.elf userland/reboot.elf userland/shutdown.elf userland/apm.elf userland/test_cpp.elf  userland/kilo.elf  userland/ls.elf userland/lspci.elf userland/lsblk.elf userland/readelf.elf userland/pong.elf userland/raycast.elf userland/asplay.elf userland/kria.elf userland/doom.elf userland/doom_x11.elf userland/gtk_test.elf userland/qt5_test.elf userland/sdl3_test.elf userland/tglgears_fb.elf userland/tglgears_drm.elf userland/tglhello_drm.elf userland/test_mem_stress.elf userland/classicube.elf userland/terrain.png userland/texpacks/classicube.zip initrd/startx.sh initrd/startw.sh initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh AetherDE/x11-wm/AetherWM AetherDE/aether-dock/aether-dock AetherDE/aether-panel/aether-panel AetherDE/wayland-compositor/aether-compositor AetherDE/demo-client/aether-window AetherDE/scripts/sax11.sh AetherDE/scripts/sawayland.sh userland/avoryd.elf $(AVORYD_CONFIG_FILES)
 	@echo "Creating partitioned disk image (GPT)..."
 	@if [ -L ./part.img ]; then \
 		old_loop=$$(readlink ./part.img); \
@@ -1064,8 +1064,6 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/texpacks/classicube.zip texpacks/classicube.zip"; \
 		echo "rm texpacks/default.zip"; \
 		echo "write userland/texpacks/classicube.zip texpacks/default.zip"; \
-		echo "rm bin/forkit.elf"; \
-		echo "write userland/forkit.elf bin/forkit.elf"; \
 		echo "rm bin/fault_mon"; \
 		echo "write userland/fault_mon.elf bin/fault_mon"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
@@ -1081,37 +1079,6 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 	debugfs -w -R "write /tmp/classicube_options.txt options.txt" ./part.img >/dev/null 2>&1 || true
 	rm -f /tmp/classicube_options.txt
 	rm -f /tmp/avoryos_hello.txt /tmp/avoryos_readme.txt
-	@echo "Installing Forkit assets (fonts + test pages) into disk image..."
-	@{ \
-		echo "cd /"; \
-		echo "mkdir usr"; \
-		echo "mkdir usr/share"; \
-		echo "mkdir usr/share/forkit"; \
-		echo "mkdir usr/share/forkit/assets"; \
-		echo "mkdir usr/share/forkit/assets/fonts"; \
-		echo "rm usr/share/forkit/assets/test.html"; \
-		echo "write build/forkit/assets/test.html usr/share/forkit/assets/test.html"; \
-		echo "rm usr/share/forkit/assets/html-test.html"; \
-		echo "write build/forkit/assets/html-test.html usr/share/forkit/assets/html-test.html"; \
-		echo "rm usr/share/forkit/assets/css-test.html"; \
-		echo "write build/forkit/assets/css-test.html usr/share/forkit/assets/css-test.html"; \
-		echo "rm usr/share/forkit/assets/js-test.html"; \
-		echo "write build/forkit/assets/js-test.html usr/share/forkit/assets/js-test.html"; \
-		echo "rm usr/share/forkit/assets/fonts/NotoSans-Regular.ttf"; \
-		echo "write build/forkit/assets/fonts/NotoSans-Regular.ttf usr/share/forkit/assets/fonts/NotoSans-Regular.ttf"; \
-		echo "rm usr/share/forkit/assets/fonts/NotoSans-Bold.ttf"; \
-		echo "write build/forkit/assets/fonts/NotoSans-Bold.ttf usr/share/forkit/assets/fonts/NotoSans-Bold.ttf"; \
-		echo "rm usr/share/forkit/assets/fonts/NotoSans-Italic.ttf"; \
-		echo "write build/forkit/assets/fonts/NotoSans-Italic.ttf usr/share/forkit/assets/fonts/NotoSans-Italic.ttf"; \
-		echo "rm usr/share/forkit/assets/fonts/NotoSans-BoldItalic.ttf"; \
-		echo "write build/forkit/assets/fonts/NotoSans-BoldItalic.ttf usr/share/forkit/assets/fonts/NotoSans-BoldItalic.ttf"; \
-		echo "rm usr/share/forkit/assets/fonts/NotoSansMono-Regular.ttf"; \
-		echo "write build/forkit/assets/fonts/NotoSansMono-Regular.ttf usr/share/forkit/assets/fonts/NotoSansMono-Regular.ttf"; \
-		echo "rm usr/share/forkit/assets/fonts/NotoSansMono-Bold.ttf"; \
-		echo "write build/forkit/assets/fonts/NotoSansMono-Bold.ttf usr/share/forkit/assets/fonts/NotoSansMono-Bold.ttf"; \
-		echo "rm bin/forkit"; \
-		echo "write userland/forkit.elf bin/forkit"; \
-	} | debugfs -w ./part.img >/dev/null 2>&1 || true
 	@if [ -d build/alpine/rootfs ]; then \
 		mkdir -p build/alpine/rootfs/lib/firmware; \
 		cp -f build/test_fw.bin build/alpine/rootfs/lib/firmware/test_fw.bin; \
@@ -1350,7 +1317,6 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field bin/aether-panel mode 0100755"; \
 		echo "set_inode_field bin/aether-compositor mode 0100755"; \
 		echo "set_inode_field bin/aether-window mode 0100755"; \
-		echo "set_inode_field bin/forkit mode 0100755"; \
 		echo "set_inode_field bin/test_cred mode 0100755"; \
 		echo "set_inode_field bin/test_accounts mode 0100755"; \
 		echo "set_inode_field bin/test_hugepages mode 0100755"; \
@@ -1850,9 +1816,6 @@ userland/tglhello_drm.elf: userland/tglhello_drm.c $(MUSL_LIBC) $(TINYGL_LIB)
 
 userland/classicube.elf: $(ALPINE_STAMP) $(MUSL_LIBC) scripts/build-classicube.sh
 	./scripts/build-classicube.sh
-
-userland/forkit.elf: $(MUSL_LIBC) scripts/build-forkit.sh
-	./scripts/build-forkit.sh
 
 userland/about.elf: userland/about.c scripts/build-about.sh $(ALPINE_STAMP) $(MUSL_LIBC)
 	./scripts/build-about.sh

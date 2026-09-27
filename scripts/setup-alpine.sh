@@ -1376,9 +1376,6 @@ cat > "${ROOTFS_DIR}/etc/xdg/openbox/menu.xml" << 'EOF'
     <item label="Terminal (st)">
       <action name="Execute"><execute>st</execute></action>
     </item>
-    <item label="Forkit Browser">
-      <action name="Execute"><execute>forkit</execute></action>
-    </item>
     <item label="NetSurf Browser">
       <action name="Execute"><execute>netsurf-gtk</execute></action>
     </item>
