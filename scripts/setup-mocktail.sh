@@ -23,7 +23,7 @@
 #   MOCKTAIL_FORCE_PAYLOAD=1 ./scripts/setup-mocktail.sh   # force payload restage
 #
 # Prerequisites:
-#   1. Run ./scripts/setup-alpine.sh first (installs runtime deps in rootfs)
+#   1. Run ./scripts/setup-arch.sh first (installs runtime deps in rootfs)
 #   2. Host system needs: wget or curl, sha256sum, dd, debugfs
 
 set -euo pipefail
@@ -71,7 +71,7 @@ fi
 # Sanity checks
 # ─────────────────────────────────────────────────────────────────────────────
 [ ! -d "${ROOTFS_DIR}/etc" ] && {
-    echo "[!] Alpine rootfs not found. Run ./scripts/setup-alpine.sh first."
+    echo "[!] Alpine rootfs not found. Run ./scripts/setup-arch.sh first."
     exit 1
 }
 [ ! -f "${DISK_IMG}" ] && {

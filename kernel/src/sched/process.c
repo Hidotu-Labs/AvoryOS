@@ -421,7 +421,7 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
       "HOME=/",
       "TERM=xterm-256color",
       "USER=root",
-      "PS1=\033[0;32mRoot@AscentOS\033[0m:\\w\\$ ",
+      "PS1=\033[0;32mRoot@AvoryOS\033[0m:\\w\\$ ",
       NULL};
   if (!envp) {
     envp = default_envp;
@@ -866,6 +866,9 @@ bool process_exec_argv(const char **argv) {
     current_thread->fd_offsets[0] = 0;
     current_thread->fd_offsets[1] = 0;
     current_thread->fd_offsets[2] = 0;
+    current_thread->fd_flags[0] = 0;
+    current_thread->fd_flags[1] = 1;
+    current_thread->fd_flags[2] = 1;
     fd_path_set(current_thread, 0, "/dev/console");
     fd_path_dup(current_thread, 1, 0);
     fd_path_dup(current_thread, 2, 0);

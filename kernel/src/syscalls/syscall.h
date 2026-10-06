@@ -140,12 +140,15 @@
 #define SYS_CAPSET 126
 #define SYS_RT_SIGPENDING 127
 #define SYS_SIGALTSTACK 131
+#define SYS_UTIME 132
 #define SYS_SECCOMP 317
 #define SYS_STATFS 137
 #define SYS_GETDENTS 78
 #define SYS_FSTATFS 138
 #define SYS_GETPRIORITY 140
 #define SYS_SETPRIORITY 141
+#define SYS_IOPRIO_SET 251
+#define SYS_IOPRIO_GET 252
 #define SYS_SCHED_SETSCHEDULER 144
 #define SYS_SCHED_GETSCHEDULER 145
 #define SYS_MLOCK 149
@@ -172,19 +175,27 @@
 #define SYS_GETDENTS64 217
 #define SYS_SET_TID_ADDRESS 218
 #define SYS_FADVISE64 221
+#define SYS_TIMER_CREATE 222
+#define SYS_TIMER_SETTIME 223
+#define SYS_TIMER_GETTIME 224
+#define SYS_TIMER_GETOVERRUN 225
+#define SYS_TIMER_DELETE 226
+#define SYS_CLOCK_SETTIME 227
 #define SYS_CLOCK_GETTIME 228
 #define SYS_CLOCK_GETRES 229
 #define SYS_CLOCK_NANOSLEEP 230
 #define SYS_EXIT_GROUP 231
 #define SYS_EPOLL_WAIT 232
 #define SYS_EPOLL_CTL 233
-#define SYS_UTIMENSAT 235
+#define SYS_UTIMES 235
 #define SYS_MBIND 237
 #define SYS_SET_MEMPOLICY 238
 #define SYS_GET_MEMPOLICY 239
 #define SYS_INOTIFY_INIT 253
 #define SYS_INOTIFY_ADD_WATCH 254
 #define SYS_INOTIFY_RM_WATCH 255
+#define SYS_MIGRATE_PAGES 256
+#define SYS_MOVE_PAGES 279
 #define SYS_OPENAT 257
 #define SYS_MKDIRAT 258
 #define SYS_FCHOWNAT 260
@@ -198,7 +209,7 @@
 #define SYS_PPOLL 271
 #define SYS_UNSHARE 272
 #define SYS_SYNC_FILE_RANGE 277
-#define SYS_UTIMES 280
+#define SYS_UTIMENSAT 280
 #define SYS_EPOLL_PWAIT 281
 #define SYS_SIGNALFD 282
 #define SYS_TIMERFD_CREATE 283
@@ -229,6 +240,7 @@
 #define SYS_RENAMEAT2 316
 #define SYS_RSEQ 334
 #define SYS_MKNOD 133
+#define SYS_PIVOT_ROOT 155
 #define SYS_CHROOT 161
 #define SYS_SETTIMEOFDAY 164
 #define SYS_MOUNT 165
@@ -240,11 +252,27 @@
 #define SYS_REBOOT 169
 #define SYS_UPTIME 399
 #define SYS_PIDFD_OPEN 434
+#define SYS_PIDFD_SEND_SIGNAL 424
+#define SYS_PIDFD_GETFD 438
 #define SYS_CLONE3 435
 #define SYS_CLOSE_RANGE 436
 #define SYS_FACCESSAT 269
 #define SYS_FACCESSAT2 439
 #define SYS_FCHMODAT2  452
+#define SYS_QUOTACTL   179
+#define SYS_QUOTACTL_FD 443
+
+/* New mount API (428..433, 442): not implemented yet. Registered as
+ * explicit -ENOSYS stubs in sys_fs.c so callers (e.g. util-linux mount,
+ * which falls back to legacy mount(2) on ENOSYS) fail cleanly without
+ * SYSDIAG "MISSING SYSCALL" noise. */
+#define SYS_OPEN_TREE   428
+#define SYS_MOVE_MOUNT  429
+#define SYS_FSOPEN      430
+#define SYS_FSCONFIG    431
+#define SYS_FSMOUNT     432
+#define SYS_FSPICK      433
+#define SYS_MOUNT_SETATTR 442
 
 /* Extended attributes (188..199) */
 #define SYS_SETXATTR      188
@@ -272,7 +300,10 @@
  *   1         log every syscall of every process
  *   2         log only tasks whose `trace_syscalls` flag is set, i.e. the
  *             badwolf/WebKit/bwrap process tree (build with
- *             `make SYSCALL_LOG=browser`). */
+ *             `make SYSCALL_LOG=browser`).
+ *   3         log only tasks whose `trace_syscalls` flag is set, i.e. the
+ *             sddm/Xorg/greeter process tree (build with
+ *             `make SYSCALL_LOG=sddm`). */
 #ifndef SYSCALL_LOG
 #define SYSCALL_LOG 0
 #endif
@@ -305,6 +336,8 @@ bool syscall_log_allowed(const struct thread *t);
 #define CLONE_NEWPID 0x20000000
 #define CLONE_NEWNET 0x40000000
 #define CLONE_IO 0x80000000
+#define CLONE_NEWCGROUP 0x02000000
+#define CLONE_NEWTIME 0x00000080
 
 struct syscall_regs {
   uint64_t rdi, rsi, rdx, r10, r8, r9, rax, rbx, rbp, r12, r13, r14, r15;

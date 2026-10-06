@@ -110,3 +110,48 @@ void devfs_setup_chardev(
     ramfs_mount_node(dir, node);
   }
 }
+
+// /dev/kmsg: accept kernel-log writes, serve the klog ring on read.
+// Writes are "<prio>text" on Linux; AvoryOS logs the payload verbatim and
+// returns size so writev() never sees a zero-write -> ENOSPC.
+static uint32_t kmsg_write(struct vfs_node *node, uint32_t offset,
+                           uint32_t size, uint8_t *buffer) {
+  (void)node;
+  (void)offset;
+  if (!buffer || !size)
+    return 0;
+  for (uint32_t i = 0; i < size; i++)
+    klog_putchar((char)buffer[i]);
+  return size;
+}
+
+static uint32_t kmsg_read(struct vfs_node *node, uint32_t offset,
+                          uint32_t size, uint8_t *buffer) {
+  (void)node;
+  if (!buffer || !size)
+    return 0;
+  return klog_ring_read(offset, size, buffer);
+}
+
+void devfs_init(void) {
+  if (!fs_root)
+    return;
+  vfs_node_t *dev_dir = vfs_resolve_path("/dev");
+  if (!dev_dir)
+    return;
+
+  // Pre-populate standard /dev symlinks
+  vfs_symlink(dev_dir, "fd", "/proc/self/fd");
+  vfs_symlink(dev_dir, "stdin", "/proc/self/fd/0");
+  vfs_symlink(dev_dir, "stdout", "/proc/self/fd/1");
+  vfs_symlink(dev_dir, "stderr", "/proc/self/fd/2");
+
+  // /dev/kmsg: Linux accepts writes (e.g. "<6>message") into the kernel
+  // ring buffer. Without a write handler vfs_write() returns 0 and writev()
+  // reports "[WRITEV] zero write ... node=kmsg" + ENOSPC. Pre-register so
+  // userspace mknod gets EEXIST and open/write hits this node.
+  devfs_setup_chardev(dev_dir, "kmsg", kmsg_read, kmsg_write, NULL, NULL,
+                      NULL, NULL, NULL, NULL, 0, 0);
+
+  vfs_close(dev_dir);
+}

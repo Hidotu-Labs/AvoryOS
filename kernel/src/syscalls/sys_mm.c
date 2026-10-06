@@ -2,8 +2,12 @@
 #include "../fs/vfs.h"
 #include "../lib/string.h"
 #include "../mm/pmm.h"
+#include "../mm/numa.h"
+#include "../mm/mempolicy.h"
+#include "../mm/numa_migrate.h"
 #include "../mm/vma.h"
 #include "../mm/vmm.h"
+#include "../mm/vmm_internal.h"
 #include "../mm/tlb_shootdown.h"
 #include "../sched/sched.h"
 #include "syscall.h"
@@ -26,6 +30,7 @@ extern void __kpi_preempt_enable(void);
 #define MAP_PRIVATE 0x02
 #define MAP_FIXED 0x10
 #define MAP_ANONYMOUS 0x20
+#define MAP_FIXED_NOREPLACE 0x100000 /* Linux: fail with EEXIST if range busy */
 #define MAP_HUGETLB 0x40000         /* Linux user-space: request huge pages */
 /* Linux user-space: pthread stack hint. Stored verbatim in vma.flags (see
  * vma.h); used here only to trace stack-size intent. */
@@ -39,6 +44,7 @@ extern void __kpi_preempt_enable(void);
 #define E_INVAL ((uint64_t)-22)
 #define E_NOMEM ((uint64_t)-12)
 #define E_BADF ((uint64_t)-9)
+#define E_EXIST ((uint64_t)-17)
 
 // Stack-intent tracing for the mocktail guard investigation: log what
 // userspace actually requests for pthread stacks (MAP_STACK) and guards
@@ -169,14 +175,169 @@ static bool range_page_is_pagecache(struct thread *t, uint64_t va,
 //   Used by both MAP_FIXED pre-teardown and munmap proper.
 //   Does NOT touch the VMA list — callers manage that themselves.
 //
-//   @mm_locked: true when the caller holds t->mm->lock.  Passing true keeps the
-//   whole teardown atomic against the caller's own VMA edits, but it also means
-//   the per-page TLB shootdowns are issued while holding an interrupt-masked
-//   lock - a CPU faulting into this same address space then waits for that lock
-//   and cannot acknowledge the IPI.  Callers that do not need the atomicity
-//   should pass false.
+//   @mm_locked: true when the caller holds t->mm->lock. The locked path is
+//   batched (one vmm_lock hold, one deferred drain and one empty-table sweep
+//   per 64-page chunk, VMA ownership hoisted per interval); the unlocked path
+//   keeps the old per-page behavior for callers that cannot hold mm->lock.
+
+// Frames collected under vmm_lock; released after the deferred drain.
+#define TEARDOWN_COLLECT 64
+
+static void teardown_release_collected(uint64_t *phys, uint16_t *npages,
+                                       int n) {
+  bool complete = tlb_flush_deferred_drain();
+  for (int i = 0; i < n; i++) {
+    if (complete) {
+      if (npages[i] == 1)
+        pmm_free_page((void *)phys[i]);
+      else
+        pmm_free_pages((void *)phys[i], npages[i]);
+    } else {
+      vmm_defer_frame_free((void *)phys[i], npages[i]);
+    }
+  }
+}
+
+// Locked, batched teardown. Caller holds t->mm->lock (VMA tree stable).
+static void teardown_range_locked(uint64_t *pml4, struct thread *t,
+                                  uint64_t base, uint64_t len) {
+  uint64_t end = base + len;
+  uint64_t va = base;
+
+  uint64_t fphys[TEARDOWN_COLLECT];
+  uint16_t fnpages[TEARDOWN_COLLECT];
+  int nf = 0;
+
+  // Empty-table sweep ledger: at most one sweep per touched PT.
+  uint64_t sweep_pt = ~(uint64_t)0; // va>>21 key of the open PT
+  bool pt_dirty = false;
+  uint64_t sweep_rep = 0; // representative VA inside the open PT
+
+  // VMA ownership cache: one lookup per interval instead of two per page.
+  struct vma *cv = NULL;
+  uint64_t cv_end = base;
+  bool ours = false, pagecache = false;
+
+  vmm_lock_acquire();
+  // Flush collected frames + sweep the open PT. Drops and re-takes vmm_lock
+  // around the drain (the drain must run off-lock).
+  while (va < end) {
+    if (va >= cv_end) {
+      cv = vma_find(&t->mm->vmas, va);
+      if (cv) {
+        cv_end = cv->end;
+        ours = (cv->fd == -1 && (cv->flags & MAP_PRIVATE) &&
+                (cv->flags & MAP_ANONYMOUS));
+        pagecache = (cv->flags & MAP_PAGECACHE) != 0;
+      } else {
+        // Gap: unmap without freeing; re-evaluate on the next page. Gaps
+        // are rare in teardown ranges, so one lookup per gap page is fine.
+        cv_end = va + PAGE_SIZE;
+        ours = false;
+        pagecache = false;
+      }
+    }
+
+    uint64_t frame = 0;
+    vmm_unmap_kind_t kind = vmm_unmap_page_locked(pml4, va, &frame);
+    if (kind == VMM_UNMAP_4K) {
+      uint64_t ptk = va >> 21;
+      if (ptk != sweep_pt) {
+        if (pt_dirty)
+          vmm_free_empty_tables(pml4, sweep_rep);
+        sweep_pt = ptk;
+        pt_dirty = false;
+      }
+      pt_dirty = true;
+      sweep_rep = va;
+      if ((ours || pagecache) && frame != 0) {
+        fphys[nf] = frame;
+        fnpages[nf] = 1;
+        nf++;
+      }
+      va += PAGE_SIZE;
+    } else if (kind == VMM_UNMAP_HOLE) {
+      va += PAGE_SIZE;
+    } else {
+      // 2 MB PDE. Bulk-release only the whole-block-owned case inline (the
+      // same rule as the old per-page path); anything else is rare enough
+      // for the slow path below.
+#define HUGE_2MB (2ULL * 1024 * 1024)
+      uint64_t block = va & ~(HUGE_2MB - 1);
+      uint64_t block_end = block + HUGE_2MB;
+#undef HUGE_2MB
+      if (va == block && block_end <= end && ours) {
+        uint64_t huge_base = 0;
+        vmm_unmap_huge_locked(pml4, va, &huge_base);
+        if (pt_dirty) {
+          vmm_free_empty_tables(pml4, sweep_rep);
+          pt_dirty = false;
+        }
+        sweep_pt = ~(uint64_t)0;
+        if (huge_base != 0) {
+          fphys[nf] = huge_base;
+          fnpages[nf] = 512;
+          nf++;
+        }
+        va = block_end;
+        // Fall through to the capacity check below.
+      } else {
+        // Partial/shared huge mapping: split it on the slow path, then
+        // resume the batch on 4 KB granularity.
+        if (pt_dirty) {
+          vmm_free_empty_tables(pml4, sweep_rep);
+          pt_dirty = false;
+        }
+        sweep_pt = ~(uint64_t)0;
+        vmm_lock_release();
+        teardown_release_collected(fphys, fnpages, nf);
+        nf = 0;
+        vmm_drain_deferred_work();
+        if (!vmm_split_huge_page(pml4, va)) {
+          // OOM: keep the mapping intact rather than free live frames.
+          va += PAGE_SIZE;
+        }
+        // Re-resolve the VMA interval (split does not touch VMAs, but the
+        // lock was dropped and another thread may have edited the tree).
+        cv_end = va;
+        vmm_lock_acquire();
+        continue;
+      }
+    }
+
+    if (nf >= TEARDOWN_COLLECT - 1) {
+      if (pt_dirty) {
+        vmm_free_empty_tables(pml4, sweep_rep);
+        pt_dirty = false;
+      }
+      sweep_pt = ~(uint64_t)0;
+      vmm_lock_release();
+      teardown_release_collected(fphys, fnpages, nf);
+      nf = 0;
+      vmm_drain_deferred_work();
+      // VMA tree may have changed while mm->lock was... (it wasn't: the
+      // caller holds mm->lock throughout. Only vmm_lock was dropped, so
+      // the interval cache stays valid.)
+      vmm_lock_acquire();
+    }
+  }
+  if (pt_dirty)
+    vmm_free_empty_tables(pml4, sweep_rep);
+  vmm_lock_release();
+
+  teardown_release_collected(fphys, fnpages, nf);
+  // Release page-table frames parked by the sweep above.
+  vmm_drain_deferred_work();
+}
 static void teardown_range(uint64_t *pml4, struct thread *t, uint64_t base,
                            uint64_t len, bool mm_locked, const char *ctx) {
+  (void)ctx;
+  if (len == 0)
+    return;
+  if (mm_locked) {
+    teardown_range_locked(pml4, t, base, len);
+    return;
+  }
   uint64_t end = base + len;
 
   for (uint64_t va = base; va < end; va += PAGE_SIZE) {
@@ -274,7 +435,12 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
   uint64_t *pml4 = vmm_get_active_pml4();
   uint64_t vaddr = 0;
 
-  if (flags & MAP_FIXED) {
+  bool fixed_noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
+  bool fixed = (flags & MAP_FIXED) != 0;
+  if (fixed && fixed_noreplace)
+    return E_INVAL;
+
+  if (fixed || fixed_noreplace) {
     if (addr == 0 || (addr & (PAGE_SIZE - 1))) {
       return E_INVAL;
     }
@@ -285,6 +451,12 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
 
     if (current_thread && current_thread->mm) {
       spinlock_acquire(&current_thread->mm->lock);
+      if (fixed_noreplace &&
+          vma_find_overlap(&current_thread->mm->vmas, vaddr,
+                           vaddr + aligned_len)) {
+        spinlock_release(&current_thread->mm->lock);
+        return E_EXIST;
+      }
       /* Serialize the PTE teardown with demand faults and remove the old VMA
        * before dropping mm->lock.  TLB waits are deferred while this lock
        * masks interrupts, then drained below after faults can run again. */
@@ -1059,20 +1231,28 @@ static uint64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice,
     uint64_t *pml4 = (uint64_t *)current->cr3;
     if (!pml4)
       pml4 = vmm_get_active_pml4();
-    /* mm->lock goes back before the teardown: teardown_range() must not run
-     * with it held, because each page it unmaps issues a TLB shootdown and
-     * waits for every other CPU, while a CPU faulting into this address space
-     * waits on this same lock with interrupts masked by the fault gate. */
     spinlock_release(&current->mm->lock);
-    teardown_range(pml4, current, addr, aligned_len, false,
-                   "madvise DONTNEED");
-    /* No global flush here.  Every unmap inside teardown_range() clears its
-     * PTE and drains a targeted, ack-waited shootdown at vmm_lock_release()
-     * BEFORE the frame returns to the PMM - that deferred queue is the whole
-     * point of tlb_flush_deferred().  munmap() and brk-shrink have never had
-     * an extra broadcast; this belt-and-braces tlb_shootdown_all() was a
-     * second all-CPU IPI round-trip plus a kernel-TLB flush on every CPU on
-     * each madvise() call (~half of the measured 9.7us for one 4 KB page). */
+    /* Batched exactly like sys_munmap: each 32-page chunk runs under mm->lock
+     * so the VMA classification is stable, and the deferred shootdown queue
+     * fills enough to coalesce into one context flush per batch. Holding
+     * mm->lock across the whole range would stall faulting peers for the
+     * full span; 32 pages keeps every critical section bounded. */
+#define MADVISE_BATCH_PAGES 32
+    for (uint64_t b = addr; b < end;) {
+      uint64_t be = b + (uint64_t)MADVISE_BATCH_PAGES * PAGE_SIZE;
+      if (be < b || be > end)
+        be = end;
+      spinlock_acquire(&current->mm->lock);
+      teardown_range(pml4, current, b, be - b, true,
+                     "madvise DONTNEED");
+      spinlock_release(&current->mm->lock);
+      /* Drain before the next batch so no frames are stranded on deferred
+       * queue overflow and remote CPUs can acknowledge between short mm
+       * critical sections. */
+      vmm_drain_deferred_work();
+      b = be;
+    }
+#undef MADVISE_BATCH_PAGES
     return 0;
   }
 
@@ -1189,100 +1369,125 @@ static uint64_t sys_get_mempolicy(uint64_t mode_ptr, uint64_t nodemask_ptr,
   if ((flags & MPOL_F_MEMS_ALLOWED) && (flags & (MPOL_F_ADDR | MPOL_F_NODE)))
     return (uint64_t)-22; // EINVAL
 
+  struct thread *current = sched_get_current();
+  if (!current)
+    return (uint64_t)-1;
+
+  uint32_t active_nodes = numa_node_count();
+  uint64_t online_mask = 0;
+  for (uint32_t i = 0; i < active_nodes && i < MAX_NUMA_NODES; i++) {
+    struct numa_node *n = numa_get_node(i);
+    if (n && n->online)
+      online_mask |= (1ULL << i);
+  }
+  if (online_mask == 0) online_mask = 1ULL;
+
+  if (flags & MPOL_F_MEMS_ALLOWED) {
+    if (nodemask_ptr) {
+      if (maxnode < 1) return (uint64_t)-22;
+      unsigned long mask = (unsigned long)online_mask;
+      if (copy_to_user((void *)nodemask_ptr, &mask, sizeof(mask)) != 0)
+        return (uint64_t)-14;
+    }
+    return 0;
+  }
+
   if (flags & MPOL_F_ADDR) {
     if (!addr || !is_user_pointer(addr))
       return (uint64_t)-14; // EFAULT
 
     if (flags & MPOL_F_NODE) {
+      uint64_t cr3 = (current->cr3 != 0) ? current->cr3 : (uint64_t)vmm_get_active_pml4();
+      uint64_t *pte_ptr = vmm_get_pte_ptr((uint64_t *)cr3, addr);
+      int node = 0;
+      if (pte_ptr && (*pte_ptr & PAGE_FLAG_PRESENT)) {
+        node = numa_phys_to_node(*pte_ptr & PAGE_MASK);
+      }
       if (mode_ptr) {
-        int node = 0;
         if (copy_to_user((void *)mode_ptr, &node, sizeof(node)) != 0)
-          return (uint64_t)-14; // EFAULT
+          return (uint64_t)-14;
       }
       return 0;
     }
 
+    spinlock_acquire(&current->mm->lock);
+    struct vma *v = vma_find(&current->mm->vmas, addr);
+    int pol = (v && v->numa_policy != 0) ? v->numa_policy : current->numa_policy.mode;
+    unsigned long mask = (v && v->numa_nodemask != 0) ? (unsigned long)v->numa_nodemask : (unsigned long)current->numa_policy.nodemask;
+    spinlock_release(&current->mm->lock);
+
     if (mode_ptr) {
-      int pol = MPOL_DEFAULT;
       if (copy_to_user((void *)mode_ptr, &pol, sizeof(pol)) != 0)
-        return (uint64_t)-14; // EFAULT
+        return (uint64_t)-14;
     }
-    if (nodemask_ptr) {
-      if (maxnode < 1)
-        return (uint64_t)-22; // EINVAL
-      unsigned long copy_bytes = ((maxnode - 1 + 63) / 64) * sizeof(unsigned long);
-      if (copy_bytes > PAGE_SIZE)
-        return (uint64_t)-22; // EINVAL
-      if (clear_user((void *)nodemask_ptr, copy_bytes) != 0)
-        return (uint64_t)-14; // EFAULT
-    }
-    return 0;
-  }
-
-  if (addr != 0)
-    return (uint64_t)-22; // EINVAL
-
-  if (flags & MPOL_F_NODE)
-    return (uint64_t)-22; // EINVAL
-
-  if (flags & MPOL_F_MEMS_ALLOWED) {
-    if (nodemask_ptr) {
-      if (maxnode < 1)
-        return (uint64_t)-22; // EINVAL
-      unsigned long copy_bytes = ((maxnode - 1 + 63) / 64) * sizeof(unsigned long);
-      if (copy_bytes > PAGE_SIZE)
-        return (uint64_t)-22; // EINVAL
-      if (clear_user((void *)nodemask_ptr, copy_bytes) != 0)
-        return (uint64_t)-14; // EFAULT
-      unsigned long mask = 1UL; // Node 0
+    if (nodemask_ptr && maxnode > 0) {
       if (copy_to_user((void *)nodemask_ptr, &mask, sizeof(mask)) != 0)
-        return (uint64_t)-14; // EFAULT
+        return (uint64_t)-14;
     }
     return 0;
   }
 
-  // flags == 0: default policy
+  // Default query: current thread's policy and nodemask
   if (mode_ptr) {
-    int pol = MPOL_DEFAULT;
+    int pol = current->numa_policy.mode;
     if (copy_to_user((void *)mode_ptr, &pol, sizeof(pol)) != 0)
-      return (uint64_t)-14; // EFAULT
+      return (uint64_t)-14;
   }
-
-  if (nodemask_ptr) {
-    if (maxnode < 1)
-      return (uint64_t)-22; // EINVAL
-    unsigned long copy_bytes = ((maxnode - 1 + 63) / 64) * sizeof(unsigned long);
-    if (copy_bytes > PAGE_SIZE)
-      return (uint64_t)-22; // EINVAL
-    if (clear_user((void *)nodemask_ptr, copy_bytes) != 0)
-      return (uint64_t)-14; // EFAULT
+  if (nodemask_ptr && maxnode > 0) {
+    unsigned long mask = (unsigned long)current->numa_policy.nodemask;
+    if (copy_to_user((void *)nodemask_ptr, &mask, sizeof(mask)) != 0)
+      return (uint64_t)-14;
   }
-
   return 0;
 }
 
 static uint64_t sys_set_mempolicy(uint64_t mode_raw, uint64_t nodemask_ptr,
                                   uint64_t maxnode, uint64_t a3,
                                   uint64_t a4, uint64_t a5) {
-  (void)a3;
-  (void)a4;
-  (void)a5;
-
+  (void)a3; (void)a4; (void)a5;
   int mode = (int)(mode_raw & ~MPOL_MODE_FLAGS);
   if (mode < 0 || mode >= MPOL_MAX)
     return (uint64_t)-22; // EINVAL
 
-  if (mode == MPOL_DEFAULT)
-    return 0;
+  struct thread *current = sched_get_current();
+  if (!current)
+    return (uint64_t)-1;
 
-  if (nodemask_ptr) {
-    if (maxnode < 1)
-      return (uint64_t)-22; // EINVAL
-    unsigned long mask = 0;
+  unsigned long mask = 0;
+  if (nodemask_ptr && maxnode > 0) {
     if (copy_from_user(&mask, (const void *)nodemask_ptr, sizeof(mask)) != 0)
       return (uint64_t)-14; // EFAULT
-    if (!(mask & 1UL))
+  }
+
+  if (mode == MPOL_DEFAULT) {
+    current->numa_policy.mode = MPOL_DEFAULT;
+    current->numa_policy.nodemask = 1ULL;
+    current->numa_policy.preferred_node = 0;
+    return 0;
+  }
+
+  uint32_t active_nodes = numa_node_count();
+  uint64_t online_mask = 0;
+  for (uint32_t i = 0; i < active_nodes && i < MAX_NUMA_NODES; i++) {
+    struct numa_node *n = numa_get_node(i);
+    if (n && n->online)
+      online_mask |= (1ULL << i);
+  }
+
+  if (mode == MPOL_BIND || mode == MPOL_INTERLEAVE) {
+    if ((mask & online_mask) == 0)
       return (uint64_t)-22; // EINVAL
+  }
+
+  current->numa_policy.mode = mode;
+  current->numa_policy.nodemask = mask & online_mask;
+  if (mode == MPOL_PREFERRED) {
+    for (int i = 0; i < MAX_NUMA_NODES; i++) {
+      if (mask & (1ULL << i)) {
+        current->numa_policy.preferred_node = i;
+        break;
+      }
+    }
   }
   return 0;
 }
@@ -1290,27 +1495,60 @@ static uint64_t sys_set_mempolicy(uint64_t mode_raw, uint64_t nodemask_ptr,
 static uint64_t sys_mbind(uint64_t addr, uint64_t len, uint64_t mode_raw,
                           uint64_t nodemask_ptr, uint64_t maxnode,
                           uint64_t flags) {
-  (void)flags;
-  (void)len;
   if (!addr || !is_user_pointer(addr) || (addr & (PAGE_SIZE - 1)))
     return (uint64_t)-22; // EINVAL
+  if (len == 0)
+    return 0;
 
   int mode = (int)(mode_raw & ~MPOL_MODE_FLAGS);
   if (mode < 0 || mode >= MPOL_MAX)
     return (uint64_t)-22; // EINVAL
 
-  if (mode == MPOL_DEFAULT)
-    return 0;
+  struct thread *current = sched_get_current();
+  if (!current || !current->mm)
+    return (uint64_t)-1;
 
-  if (nodemask_ptr) {
-    if (maxnode < 1)
-      return (uint64_t)-22; // EINVAL
-    unsigned long mask = 0;
+  unsigned long mask = 0;
+  if (nodemask_ptr && maxnode > 0) {
     if (copy_from_user(&mask, (const void *)nodemask_ptr, sizeof(mask)) != 0)
       return (uint64_t)-14; // EFAULT
-    if (!(mask & 1UL))
-      return (uint64_t)-22; // EINVAL
   }
+
+  uint64_t end = (addr + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+  spinlock_acquire(&current->mm->lock);
+  for (uint64_t va = addr; va < end; va += PAGE_SIZE) {
+    struct vma *v = vma_find(&current->mm->vmas, va);
+    if (v) {
+      v->numa_policy = mode;
+      v->numa_nodemask = mask;
+      if (mode == MPOL_PREFERRED) {
+        for (int i = 0; i < MAX_NUMA_NODES; i++) {
+          if (mask & (1ULL << i)) {
+            v->numa_preferred_node = i;
+            break;
+          }
+        }
+      }
+      if (v->end > va)
+        va = v->end - PAGE_SIZE;
+    }
+  }
+  spinlock_release(&current->mm->lock);
+
+  if (flags & (MPOL_MF_MOVE | MPOL_MF_MOVE_ALL)) {
+    int target_node = 0;
+    for (int i = 0; i < MAX_NUMA_NODES; i++) {
+      if (mask & (1ULL << i)) {
+        target_node = i;
+        break;
+      }
+    }
+    for (uint64_t va = addr; va < end; va += PAGE_SIZE) {
+      numa_migrate_page(current, va, target_node);
+    }
+  }
+
   return 0;
 }
 
@@ -1328,6 +1566,8 @@ void syscall_register_mm(void) {
   syscall_register(SYS_MBIND, sys_mbind);
   syscall_register(SYS_SET_MEMPOLICY, sys_set_mempolicy);
   syscall_register(SYS_GET_MEMPOLICY, sys_get_mempolicy);
+  syscall_register(SYS_MOVE_PAGES, sys_move_pages);
+  syscall_register(SYS_MIGRATE_PAGES, sys_migrate_pages);
 }
 // Called from process_exec when loading a new process image.
 void mm_reset_mmap_state(struct thread *t) {

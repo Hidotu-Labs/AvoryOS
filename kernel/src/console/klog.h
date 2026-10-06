@@ -50,6 +50,10 @@ void klog_proc_exec(uint32_t tid, const char *path);
  * klog_proc_exec() and the SYSCALL_LOG=2 syscall trace flag. */
 bool klog_path_is_browser(const char *path);
 
+/* True when an exec path belongs to the SDDM/Xorg display-manager tree.
+ * Drives the SYSCALL_LOG=3 (`make SYSCALL_LOG=sddm`) syscall trace flag. */
+bool klog_path_is_sddm(const char *path);
+
 void klog_ramfs_free(void *ptr, uint64_t capacity, bool is_pmm, uint64_t pages);
 
 void klog_set_screen_logging(bool enabled);

@@ -4,6 +4,8 @@
 // Shared types, constants, and helpers used across the sys_io modules.
 
 #include "../fs/vfs.h"
+#include "../lock/spinlock.h"
+#include "../sched/wait.h"
 #include "../mm/vmm.h"
 #include "../sched/sched.h"
 #include "arch/uaccess.h"
@@ -25,12 +27,14 @@
 #define O_DIRECTORY 0x10000
 #define O_CLOEXEC 0x80000
 
-/* O_PATH shares its bit with __O_TMPFILE, exactly like Linux (both 010000000).
- * A request is an O_TMPFILE only when the directory bit is set with it *and*
- * the caller asked for write access; read-only + O_DIRECTORY is an O_PATH
- * handle, which is what QProcess opens for a child's working directory. */
+/* Linux x86_64 octal values: O_PATH = 010000000 (0x200000) and
+ * __O_TMPFILE = 020000000 (0x400000) are DIFFERENT bits (O_TMPFILE is
+ * __O_TMPFILE|O_DIRECTORY). A request is an O_TMPFILE only when the
+ * O_TMPFILE bits are set *and* the caller asked for write access;
+ * read-only + O_DIRECTORY with the O_PATH bit is an O_PATH handle, which
+ * is what QProcess opens for a child's working directory. */
 #define __O_TMPFILE 0x400000
-#define O_PATH 0x400000
+#define O_PATH 0x200000
 #define O_TMPFILE (__O_TMPFILE | O_DIRECTORY)
 
 /* FD_CLOEXEC packed into fd_flags[] above the status-flag range */
@@ -40,6 +44,10 @@
  * installing the node, so a concurrent fork or lookup never sees a half-built
  * descriptor that looks like a real file. */
 #define FD_RESERVED ((vfs_node_t *)-1)
+
+static inline bool fd_is_valid_node(const vfs_node_t *node) {
+  return node != NULL && node != FD_RESERVED;
+}
 
 #define FD_CLOEXEC 1
 
@@ -141,6 +149,11 @@ struct statx {
 #define TCSETS 0x5402
 #define TCSETSW 0x5403
 #define TCSETSF 0x5404
+/* Queue selectors for TCFLSH (passed by value, not a pointer). */
+#define TCFLSH 0x540B
+#define TCIFLUSH 0
+#define TCOFLUSH 1
+#define TCIOFLUSH 2
 #define TIOCGPGRP 0x540F
 #define TIOCSPGRP 0x5410
 #define TIOCGWINSZ 0x5413
@@ -239,6 +252,10 @@ typedef struct {
   uint64_t event_queue[256];
   uint32_t queue_head;
   uint32_t queue_tail;
+  /* Event wait state. Producers are not hooked up yet, so the queue stays
+   * empty and readers park here instead of spinning on EOF. */
+  wait_queue_t wq;
+  spinlock_t lock;
 } inotify_instance_t;
 
 extern inotify_instance_t inotify_instances[MAX_INOTIFY_INSTANCES];

@@ -598,7 +598,7 @@ Goal: a real monitor connected to the passed GPU shows AvoryOS, driven by
 amdgpu's DCN 3.1.x, with atomic modeset, page flip, vblank and cursor.
 
 Test first: extend the raw-ioctl userland test with a KMS sequence (or use
-`modetest` from Alpine's `libdrm-tests`, installed by `setup-alpine.sh`)
+`modetest` from Alpine's `libdrm-tests`, installed by `setup-arch.sh`)
 against the amdgpu card; kernel-side, keep the boot log evidence primary.
 
 Tasks:

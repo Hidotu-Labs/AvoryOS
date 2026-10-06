@@ -738,11 +738,20 @@ uint32_t hda_write_pcm(const void *buffer, uint32_t bytes, uint32_t rate, uint8_
                 wq_entry.next = NULL;
                 wq_entry.thread_next = NULL;
                 wq_entry.thread_prev = NULL;
-                wq_entry.wq = &hda_wait_queue;
+                wq_entry.wq = NULL;
+                t->state = THREAD_BLOCKED;
                 wait_queue_add(&hda_wait_queue, &wq_entry);
 
-                t->state = THREAD_BLOCKED;
                 t->wakeup_ticks = lapic_timer_get_ticks() + 50; // 50ms safety timeout
+                /* Recheck space: IRQ may have drained between check and add. */
+                if (hda_inflight_bytes() + 4 <= hda_queue_limit) {
+                    t->state = THREAD_RUNNING;
+                    t->wakeup_ticks = 0;
+                    hal_irq_enable();
+                    wait_queue_remove(&hda_wait_queue, &wq_entry);
+                    t->state = THREAD_RUNNING;
+                    continue;
+                }
 
                 hal_irq_enable();
                 sched_yield();

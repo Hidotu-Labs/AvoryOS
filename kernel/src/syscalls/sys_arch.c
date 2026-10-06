@@ -445,13 +445,14 @@ static uint64_t sys_membarrier(uint64_t cmd, uint64_t flags, uint64_t cpu_id,
 
 /* syslog(type, bufp, len) - syscall 103.
  *
- * The kernel log goes straight to the console and has no ring buffer, so
- * there is nothing to read back yet.  The console-level controls are
- * accepted as no-ops so busybox `dmesg -n <level>` (the OpenRC dmesg
- * service) succeeds instead of failing the boot with ENOSYS. */
+ * Actions 0/1/5/6/7/8 are console-level controls (no-ops) so busybox
+ * `dmesg -n <level>` (the OpenRC dmesg service) succeeds.  Actions
+ * 2/3/4/9/10 are served from the klog ring buffer so `dmesg` can actually
+ * read the boot log: 9/10 report the buffered size, 2/3 copy it out,
+ * 4 copies it out (clear is a no-op: the ring is also exposed at
+ * /proc/klog and /dev/klog, so dropping it would break those readers). */
 static uint64_t sys_syslog(uint64_t type, uint64_t bufp, uint64_t len,
                            uint64_t a3, uint64_t a4, uint64_t a5) {
-  (void)bufp;
   (void)a3;
   (void)a4;
   (void)a5;
@@ -464,8 +465,19 @@ static uint64_t sys_syslog(uint64_t type, uint64_t bufp, uint64_t len,
     return 0;
   case 8: /* SYSLOG_ACTION_CONSOLE_LEVEL */
     return len <= 8 ? 0 : (uint64_t)-22;
+  case 9:  /* SYSLOG_ACTION_SIZE_UNREAD */
+  case 10: /* SYSLOG_ACTION_SIZE_BUFFER */
+    return (uint64_t)klog_ring_length();
+  case 2: /* SYSLOG_ACTION_READ */
+  case 3: /* SYSLOG_ACTION_READ_ALL */
+  case 4: /* SYSLOG_ACTION_READ_CLEAR */
+    if (len == 0)
+      return 0;
+    if (!bufp || !vmm_is_user_addr_range_writable(bufp, (size_t)len))
+      return (uint64_t)-14; // EFAULT
+    return (uint64_t)klog_ring_read(0, (uint32_t)len, (uint8_t *)bufp);
   default:
-    return (uint64_t)-38; /* ENOSYS: no readable log buffer exists */
+    return (uint64_t)-38; /* ENOSYS: unknown syslog action */
   }
 }
 

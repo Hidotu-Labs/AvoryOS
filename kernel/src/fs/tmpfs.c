@@ -79,13 +79,15 @@ static tmpfs_page_t *tmpfs_get_page(tmpfs_file_t *file, uint32_t page_index) {
  * not mutate the tree. */
 struct tmpfs_first_page {
     tmpfs_page_t *page;
+    uint64_t index;
 };
 
 static bool tmpfs_find_first_page(uint64_t index, void *value, void *context) {
-    (void)index;
     struct tmpfs_first_page *first = (struct tmpfs_first_page *)context;
-    if (!first->page)
+    if (!first->page) {
         first->page = (tmpfs_page_t *)value;
+        first->index = index;
+    }
     return false;
 }
 
@@ -93,13 +95,12 @@ static bool tmpfs_find_first_page(uint64_t index, void *value, void *context) {
  * from the tree and returns it; the frame is released by the caller outside
  * the lock. */
 static tmpfs_page_t *tmpfs_take_page_locked(tmpfs_file_t *file, uint32_t from) {
-    struct tmpfs_first_page first = { NULL };
+    struct tmpfs_first_page first = { NULL, 0 };
     asc_radix_tree_for_each_range(&file->pages, from, UINT32_MAX,
                               tmpfs_find_first_page, &first);
     if (!first.page)
         return NULL;
-    return (tmpfs_page_t *)asc_radix_tree_delete(&file->pages,
-                                             first.page->page_index);
+    return (tmpfs_page_t *)asc_radix_tree_delete(&file->pages, first.index);
 }
 
 #define TMPFS_PAGE_BATCH 64
@@ -242,6 +243,11 @@ static uint32_t tmpfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
 
     tmpfs_file_t *file = (tmpfs_file_t *)node->device;
     uint32_t      done = 0;
+    /* Hoisted: user-ness of the destination never changes mid-call, and the
+     * frame is pinned with an extra pmm ref under the lock so the copy below
+     * runs without holding file->lock (a spinlock with IRQs masked must never
+     * cover a 4K copy, let alone a faulting copy_to_user). */
+    bool to_user = is_user_ptr((uint64_t)buffer);
 
     while (done < size) {
         uint32_t page_index = (offset + done) / PAGE_SIZE;
@@ -250,26 +256,34 @@ static uint32_t tmpfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
         if (chunk > size - done)
             chunk = size - done;
 
+        uint64_t phys = 0;
+        bool have = false;
         spinlock_acquire(&file->lock);
         tmpfs_page_t *pg = tmpfs_get_page(file, page_index);
-        if (!pg) {
-            spinlock_release(&file->lock);
-            if (is_user_ptr((uint64_t)buffer))
+        if (pg) {
+            phys = pg->phys;
+            have = true;
+            pmm_incref((void *)phys);
+        }
+        spinlock_release(&file->lock);
+
+        if (!have) {
+            if (to_user)
                 clear_user(buffer + done, chunk);
             else
                 memset(buffer + done, 0, chunk);
         } else {
-            uint8_t *virt = (uint8_t *)PHYS_TO_VIRT(pg->phys);
-            if (is_user_ptr((uint64_t)buffer)) {
-                unsigned long uncopied = copy_to_user(buffer + done, virt + page_off, chunk);
-                spinlock_release(&file->lock);
+            uint8_t *virt = (uint8_t *)PHYS_TO_VIRT(phys) + page_off;
+            if (to_user) {
+                unsigned long uncopied = copy_to_user(buffer + done, virt, chunk);
+                pmm_free_page((void *)phys);
                 if (uncopied > 0) {
                     done += (chunk - (uint32_t)uncopied);
                     break;
                 }
             } else {
-                memcpy(buffer + done, virt + page_off, chunk);
-                spinlock_release(&file->lock);
+                memcpy(buffer + done, virt, chunk);
+                pmm_free_page((void *)phys);
             }
         }
         done += chunk;
@@ -279,7 +293,9 @@ static uint32_t tmpfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
 
 static uint32_t tmpfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
                              uint8_t *buffer) {
-    if (!node || !node->device || !buffer || size == 0)
+    if (!node || !node->device || !buffer)
+        return (uint32_t)-14;
+    if (size == 0)
         return 0;
 
     tmpfs_file_t *file = (tmpfs_file_t *)node->device;
@@ -293,14 +309,25 @@ static uint32_t tmpfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
             chunk = size - done;
 
         tmpfs_page_t *pg = tmpfs_get_or_alloc_page(file, page_index);
-        if (!pg)
+        if (!pg) {
+            /* Quota (ENOSPC) or OOM: report an errno when nothing was
+             * written so write()/writev() propagate ENOSPC instead of a
+             * zero-byte "success" (curl saw this as [WRITEV] zero write
+             * on /tmp/apm/*.apk after a few packages filled the 64MB
+             * /tmp). A partial write returns the short count; the next
+             * call reports the errno. */
+            if (done == 0)
+                return (uint32_t)-28;
             break;
+        }
 
         uint8_t *virt = (uint8_t *)PHYS_TO_VIRT(pg->phys);
         if (is_user_ptr((uint64_t)buffer)) {
             unsigned long uncopied = copy_from_user(virt + page_off, buffer + done, chunk);
             if (uncopied > 0) {
                 done += (chunk - (uint32_t)uncopied);
+                if (done == 0)
+                    return (uint32_t)-14;
                 break;
             }
         } else {
@@ -497,23 +524,31 @@ static int tmpfs_statfs(vfs_node_t *node, struct statfs_buf *buf) {
     if (!node || !buf)
         return -1;
     tmpfs_sb_t *sb = tmpfs_sb_from_node(node);
-    if (!sb)
-        return -1;
+    /* Device nodes created via tmpfs_mknod() carry the driver's payload in
+     * ->device, not a tmpfs_sb, so sb lookup fails. Report the default
+     * budget rather than -1 (which would surface as 0 B in df/Plasma). */
+    uint64_t max_bytes = sb ? sb->max_bytes : TMPFS_DEFAULT_MAX_BYTES;
+    uint64_t max_inodes = sb ? sb->max_inodes : TMPFS_DEFAULT_MAX_INODES;
+    uint64_t used_bytes = 0, used_inodes = 0;
+    if (sb) {
+      spinlock_acquire(&sb->lock);
+      used_bytes = sb->used_bytes;
+      used_inodes = sb->used_inodes;
+      spinlock_release(&sb->lock);
+    }
 
-    spinlock_acquire(&sb->lock);
-    uint64_t total_pages = sb->max_bytes / PAGE_SIZE;
-    uint64_t used_pages  = (sb->used_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t total_pages = max_bytes / PAGE_SIZE;
+    uint64_t used_pages  = (used_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t free_pages  = total_pages > used_pages ? total_pages - used_pages : 0;
-    uint64_t free_inodes = sb->max_inodes > sb->used_inodes
-                               ? sb->max_inodes - sb->used_inodes : 0;
-    spinlock_release(&sb->lock);
+    uint64_t free_inodes = max_inodes > used_inodes
+                               ? max_inodes - used_inodes : 0;
 
     buf->f_type    = TMPFS_MAGIC;
     buf->f_bsize   = PAGE_SIZE;
     buf->f_blocks  = (int64_t)total_pages;
     buf->f_bfree   = (int64_t)free_pages;
     buf->f_bavail  = (int64_t)free_pages;
-    buf->f_files   = (int64_t)sb->max_inodes;
+    buf->f_files   = (int64_t)max_inodes;
     buf->f_ffree   = (int64_t)free_inodes;
     buf->f_fsid[0] = 0;
     buf->f_fsid[1] = 0;
@@ -868,9 +903,9 @@ static int tmpfs_unlink(vfs_node_t *node, char *name) {
         tmpfs_free_inode(sb);
 
     /* The name is gone, but descriptors and mappings may still hold
-     * references: retire the node instead of kfree()ing it under
-     * them. */
-    vfs_node_retire(curr->node);
+     * references: mark deleted and release the directory's reference. */
+    curr->node->flags |= FS_DELETED;
+    vfs_close(curr->node);
     kfree(curr);
     return 0;
 }
@@ -936,6 +971,90 @@ static int tmpfs_rename(vfs_node_t *node, char *old_name, char *new_name) {
         vfs_dirindex_rename_locked(&dir->di, entry, new_name);
     vfs_dirindex_unlock(&dir->di);
     return entry ? 0 : -1;
+}
+
+/* Cross-directory rename within one tmpfs instance: /tmp/.XXXX/s ->
+ * /tmp/sddm-... is the Qt QLocalServer pattern (bind to a tempdir socket,
+ * chmod, rename into place) that SDDM's greeter socket relies on.  The plain
+ * rename op only spans one directory, and the syscall layer used to answer
+ * EXDEV for anything else - even on the same filesystem.
+ *
+ * Directories are refused (-EXDEV, as before): without parent links a move
+ * of a directory into its own subtree cannot be detected and would cycle
+ * path resolution.  Files, symlinks, sockets and other leaf nodes move by
+ * detaching one dirindex wrapper and inserting it in the other directory,
+ * so the node object (and any open references, epoll watches, or socket
+ * bindings on it) survives the move untouched. */
+int tmpfs_rename_cross(vfs_node_t *old_parent, char *old_name,
+                       vfs_node_t *new_parent, char *new_name) {
+    if (!old_parent || !new_parent || !old_name || !new_name)
+        return -22; // EINVAL
+    if ((old_parent->flags & FS_TYPE_MASK) != FS_DIRECTORY ||
+        (new_parent->flags & FS_TYPE_MASK) != FS_DIRECTORY ||
+        !old_parent->device || !new_parent->device)
+        return -22; // EINVAL
+    /* Same backend (both wired to tmpfs_rename) on the same mount. */
+    if (old_parent->rename != tmpfs_rename ||
+        new_parent->rename != tmpfs_rename)
+        return -18; // EXDEV
+    tmpfs_sb_t *old_sb = tmpfs_sb_from_node(old_parent);
+    tmpfs_sb_t *new_sb = tmpfs_sb_from_node(new_parent);
+    if (!old_sb || old_sb != new_sb)
+        return -18; // EXDEV: different filesystems
+
+    /* Replace an existing non-directory destination first, mirroring
+     * tmpfs_rename (own locking, like the same-directory path). */
+    vfs_node_t *existing = vfs_dirindex_finddir(new_parent, new_name);
+    if (existing) {
+        if ((existing->flags & FS_TYPE_MASK) == FS_DIRECTORY)
+            return -21; // EISDIR
+        if (tmpfs_unlink(new_parent, new_name) != 0)
+            return -1;
+    }
+
+    tmpfs_dir_t *odir = (tmpfs_dir_t *)old_parent->device;
+    tmpfs_dir_t *ndir = (tmpfs_dir_t *)new_parent->device;
+
+    /* One lock at a time: detach from the source first (the entry is then
+     * privately owned), rename the node, and insert it into the
+     * destination, which handles its own locking and bucket growth.
+     * Nesting both index locks would deadlock against insert's own
+     * acquisition, and allocating bucket growth under an IRQ-masked
+     * spinlock is forbidden - hence this order.  The lookup gaps match
+     * the pre-existing races of create/unlink on these backends. */
+    vfs_dirindex_lock(&odir->di);
+    tmpfs_child_t *entry = vfs_dirindex_find_locked(&odir->di, old_name);
+    if (!entry) {
+        vfs_dirindex_unlock(&odir->di);
+        return -2; // ENOENT: vanished under us
+    }
+    if ((entry->node->flags & FS_TYPE_MASK) == FS_DIRECTORY) {
+        vfs_dirindex_unlock(&odir->di);
+        return -18; // EXDEV: directory moves across dirs unsupported
+    }
+    vfs_dirindex_detach_locked(&odir->di, (vfs_child_t *)entry);
+    vfs_dirindex_unlock(&odir->di);
+
+    /* A concurrent create may have repopulated the destination after the
+     * pre-lock unlink above; never index two entries under one name. */
+    if (vfs_dirindex_find(&ndir->di, new_name)) {
+        strncpy(entry->node->name, old_name, 127);
+        entry->node->name[127] = '\0';
+        vfs_dirindex_insert(&odir->di, (vfs_child_t *)entry);
+        return -17; // EEXIST
+    }
+
+    strncpy(entry->node->name, new_name, 127);
+    entry->node->name[127] = '\0';
+    if (!vfs_dirindex_insert(&ndir->di, (vfs_child_t *)entry)) {
+        /* Only fails when the destination's first bucket array could not
+         * be allocated; the source still has its buckets, so roll back. */
+        strncpy(entry->node->name, old_name, 127);
+        entry->node->name[127] = '\0';
+        vfs_dirindex_insert(&odir->di, (vfs_child_t *)entry);
+        return -12; // ENOMEM
+    }
+    return 0;
 }
 
 vfs_node_t *tmpfs_create_root(tmpfs_sb_t *sb) {

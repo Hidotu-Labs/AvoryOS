@@ -383,6 +383,73 @@ static int alsa_ioctl_get_int(uint64_t arg, int *out) {
 }
 
 // ALSA Control Node Callbacks
+#define MAX_USER_CONTROLS 16
+
+struct user_control {
+    bool used;
+    struct snd_ctl_elem_id id;
+    int type;
+    unsigned int access;
+    unsigned int count;
+    long min;
+    long max;
+    long step;
+    long values[32];
+};
+
+static struct user_control user_controls[MAX_USER_CONTROLS];
+
+// Seed the mixer with the standard controls every HDA card exposes, so
+// PipeWire/alsamixer probes (ELEM_INFO/READ by name) succeed instead of
+// hitting ENOENT on an empty control array. Full volume, unmuted.
+// Idempotent: skips names that already exist (e.g. created via ELEM_ADD).
+static void alsa_seed_default_mixer(void) {
+    static const struct {
+        const char *name;
+        int type; // 1=BOOLEAN, 2=INTEGER (Linux SNDRV_CTL_ELEM_TYPE_*)
+        long max;
+        long value;
+    } defaults[] = {
+        { "Master Playback Volume", 2, 255, 255 },
+        { "Master Playback Switch", 1, 1, 1 },
+        { "PCM Playback Volume",    2, 255, 255 },
+        { "Capture Volume",         2, 255, 255 },
+        { "Capture Switch",         1, 1, 1 },
+    };
+    for (size_t d = 0; d < sizeof(defaults) / sizeof(defaults[0]); d++) {
+        int free_slot = -1;
+        bool present = false;
+        for (int i = 0; i < MAX_USER_CONTROLS; i++) {
+            if (user_controls[i].used) {
+                if (strcmp((char *)user_controls[i].id.name, defaults[d].name) == 0) {
+                    present = true;
+                    break;
+                }
+            } else if (free_slot < 0) {
+                free_slot = i;
+            }
+        }
+        if (present || free_slot < 0)
+            continue;
+        struct user_control *c = &user_controls[free_slot];
+        memset(c, 0, sizeof(*c));
+        c->used = true;
+        c->id.iface = 2; // SNDRV_CTL_ELEM_IFACE_MIXER
+        c->id.device = 0;
+        c->id.subdevice = 0;
+        c->id.index = 0;
+        strncpy((char *)c->id.name, defaults[d].name, sizeof(c->id.name) - 1);
+        c->id.numid = (uint32_t)(free_slot + 1);
+        c->type = defaults[d].type;
+        c->access = (1u << 0) | (1u << 1) | (1u << 29); // READWRITE | USER
+        c->count = 2; // stereo
+        c->min = 0;
+        c->max = defaults[d].max;
+        c->step = 0;
+        for (unsigned int ch = 0; ch < 2; ch++)
+            c->values[ch] = defaults[d].value;
+    }
+}
 static int alsa_ctl_ioctl_internal(struct vfs_node *node, uint32_t request, uint64_t arg) {
     (void)node;
     if (request == SNDRV_CTL_IOCTL_PVERSION) {
@@ -429,22 +496,6 @@ static int alsa_ctl_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         request == SNDRV_CTL_IOCTL_SUBSCRIBE_EVENTS) {
         return 0;
     }
-
-#define MAX_USER_CONTROLS 16
-
-struct user_control {
-    bool used;
-    struct snd_ctl_elem_id id;
-    int type;
-    unsigned int access;
-    unsigned int count;
-    long min;
-    long max;
-    long step;
-    long values[32];
-};
-
-static struct user_control user_controls[MAX_USER_CONTROLS];
 
     if (request == SNDRV_CTL_IOCTL_ELEM_LIST || (request & 0xFFFF) == 0x5510) {
         struct snd_ctl_elem_list *list = (struct snd_ctl_elem_list *)arg;
@@ -527,6 +578,19 @@ static struct user_control user_controls[MAX_USER_CONTROLS];
                 return 0;
             }
         }
+        // Diagnostic: name the missing control (first few only) so the next
+        // SYSDIAG triage can extend the seeded mixer instead of guessing.
+        {
+            static uint32_t miss_logs;
+            if (miss_logs < 8) {
+                miss_logs++;
+                klog_puts("[ALSA] ELEM_INFO miss numid=");
+                klog_uint64(info->id.numid);
+                klog_puts(" name='");
+                klog_puts(info->id.name[0] ? (const char *)info->id.name : "<by-id>");
+                klog_puts("'\n");
+            }
+        }
         return -2; // -ENOENT
     }
 
@@ -541,6 +605,17 @@ static struct user_control user_controls[MAX_USER_CONTROLS];
                     val->value.integer.value[c] = user_controls[i].values[c];
                 }
                 return 0;
+            }
+        }
+        {
+            static uint32_t miss_logs;
+            if (miss_logs < 8) {
+                miss_logs++;
+                klog_puts("[ALSA] ELEM_READ miss numid=");
+                klog_uint64(val->id.numid);
+                klog_puts(" name='");
+                klog_puts(val->id.name[0] ? (const char *)val->id.name : "<by-id>");
+                klog_puts("'\n");
             }
         }
         return -2; // -ENOENT
@@ -1649,6 +1724,11 @@ void alsa_emu_register_vfs(void) {
     // Let the HDA interrupt drive the mmap pump and status updates so both
     // MMAP-mode and standard RW-mode clients keep pace with the DMA ring.
     hda_set_tick_callback(alsa_tick);
+
+    // Standard mixer controls (Master/PCM/Capture): PipeWire and alsamixer
+    // probe these by name at startup; without them every ELEM_INFO/READ
+    // misses with ENOENT.
+    alsa_seed_default_mixer();
 
     vfs_node_t *snd_dir = NULL;
     vfs_node_t *dev_dir = vfs_resolve_path("/dev");

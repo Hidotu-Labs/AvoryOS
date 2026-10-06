@@ -157,13 +157,23 @@ static int inet_connect(socket_t *sock, struct sockaddr *addr, int addrlen) {
         /* Block on wait queue until established, error, or timeout */
         uint64_t deadline = lapic_timer_get_ticks() + 3000;
         struct thread *self = sched_get_current();
-        wait_queue_entry_t wqe = { .thread = self, .next = NULL };
+        wait_queue_entry_t wqe = { .thread = self, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL };
         while (isk->tcp->state == TCP_SYN_SENT && !isk->tcp->error) {
             if (lapic_timer_get_ticks() >= deadline) break;
-            wait_queue_add(sock->wait_queue, &wqe);
             if (self) {
-                self->wakeup_ticks = lapic_timer_get_ticks() + 50;
                 self->state = THREAD_BLOCKED;
+                self->wakeup_ticks = lapic_timer_get_ticks() + 50;
+            }
+            wait_queue_add(sock->wait_queue, &wqe);
+            if (isk->tcp->state != TCP_SYN_SENT || isk->tcp->error) {
+                if (self) {
+                    self->state = THREAD_RUNNING;
+                    self->wakeup_ticks = 0;
+                }
+                wait_queue_remove(sock->wait_queue, &wqe);
+                if (self && self->state == THREAD_BLOCKED)
+                    self->state = THREAD_RUNNING;
+                continue;
             }
             sched_yield();
             if (self) self->wakeup_ticks = 0;

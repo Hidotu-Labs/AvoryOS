@@ -1,4 +1,5 @@
 #include "vmm.h"
+#include "vmm_internal.h"
 #include "../apic/lapic.h"
 #include "../console/klog.h"
 #include "../drivers/serial.h"
@@ -11,16 +12,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define PHYS_TO_VIRT(p) ((void *)((uint64_t)(p) + pmm_get_hhdm_offset()))
-
 static spinlock_t vmm_lock = SPINLOCK_INIT;
 
 spinlock_t *vmm_get_lock(void) { return &vmm_lock; }
-
-/* Diagnostics used below and defined next to vmm_debug_walk() at the bottom
- * of the file.  Declared here so page-table teardown/split paths can log. */
-static void vmm_dbg_out(const char *s);
-static void vmm_dbg_hex(uint64_t v);
 
 /* True when the virtual range [base, base + size) contains the LAPIC MMIO
  * page as seen through the HHDM.  Used to flag any page-table operation that
@@ -316,7 +310,7 @@ static bool vmm_map_page_nolock(uint64_t *pml4, uint64_t virtual_addr,
 
 // Caller holds vmm_lock. Check leaf presence without allocating page-table
 // levels. Fresh mappings must not wait for a remote TLB acknowledgement.
-static bool vmm_page_present_nolock(uint64_t *pml4, uint64_t virtual_addr) {
+bool vmm_page_present_nolock(uint64_t *pml4, uint64_t virtual_addr) {
   size_t pml4_index = (virtual_addr >> 39) & 0x1FF;
   size_t pdpt_index = (virtual_addr >> 30) & 0x1FF;
   size_t pd_index = (virtual_addr >> 21) & 0x1FF;
@@ -455,9 +449,17 @@ bool vmm_map_huge_page(uint64_t *pml4, uint64_t virtual_addr,
     goto unlock;
   pdpt_virt[pdpt_index] |= propagate_flags;
 
+  /* Only install over an empty slot. Overwriting a PDE that already points
+   * at a page table would leak that table and discard its live 4 KB
+   * mappings (e.g. pages faulted before MADV_HUGEPAGE was set); the caller
+   * falls back to the 4 KB path instead. A fresh slot needs no TLB
+   * invalidation either: no translation for this range could have been
+   * cached, mirroring vmm_map_range()'s flush_tlb=false rationale. */
+  if (pd_virt[pd_index] & PAGE_FLAG_PRESENT)
+    goto unlock;
+
   pd_virt[pd_index] =
       (physical_addr & PAGE_MASK) | flags | PAGE_FLAG_PRESENT | PAGE_FLAG_PS;
-  tlb_flush_deferred(virtual_addr, (uint64_t)pml4);
   success = true;
 
 unlock:
@@ -701,6 +703,84 @@ unlock:
   vmm_lock_release();
 }
 
+/* Batch unmap primitive for teardown_range(). The caller must hold both
+ * mm->lock (so no fault can install concurrently) and vmm_lock.
+ *
+ * Clears one 4 KB PTE and queues its invalidation, reporting the released
+ * frame in *frame_out (PAGE_MASKed). 2 MB PDEs are only *reported*
+ * (VMM_UNMAP_HUGE) without being cleared: wholesale release is only valid
+ * when the whole block is going away *and* owned, which the caller decides
+ * from VMA state. Empty-table reclamation, the deferred drain and the PMM
+ * free all happen once per batch in the caller — this removes one
+ * vmm_lock round-trip, one 512-entry PT scan and one drain attempt per
+ * page versus vmm_unmap_page(). */
+vmm_unmap_kind_t vmm_unmap_page_locked(uint64_t *pml4, uint64_t virtual_addr,
+                                       uint64_t *frame_out) {
+  size_t pml4_index = (virtual_addr >> 39) & 0x1FF;
+  size_t pdpt_index = (virtual_addr >> 30) & 0x1FF;
+  size_t pd_index   = (virtual_addr >> 21) & 0x1FF;
+  size_t pt_index   = (virtual_addr >> 12) & 0x1FF;
+
+  if (pml4_index >= 256 &&
+      (uint64_t)(uintptr_t)pml4 !=
+          (uint64_t)(uintptr_t)vmm_get_kernel_pml4()) {
+    return VMM_UNMAP_HOLE;
+  }
+
+  uint64_t *pml4_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)pml4 & PAGE_MASK);
+  if (!(pml4_virt[pml4_index] & PAGE_FLAG_PRESENT))
+    return VMM_UNMAP_HOLE;
+  uint64_t *pdpt_virt =
+      (uint64_t *)PHYS_TO_VIRT(pml4_virt[pml4_index] & PAGE_MASK);
+
+  uint64_t pdpt_entry = pdpt_virt[pdpt_index];
+  if (!(pdpt_entry & PAGE_FLAG_PRESENT) || (pdpt_entry & PAGE_FLAG_PS))
+    return VMM_UNMAP_HOLE; // hole or 1 GB leaf: not 4 KB granular
+
+  uint64_t *pd_virt = (uint64_t *)PHYS_TO_VIRT(pdpt_entry & PAGE_MASK);
+  uint64_t pd_entry = pd_virt[pd_index];
+  if (!(pd_entry & PAGE_FLAG_PRESENT))
+    return VMM_UNMAP_HOLE;
+
+  if (pd_entry & PAGE_FLAG_PS) {
+    if (frame_out)
+      *frame_out = pd_entry & 0xFFFFFFFE00000ULL;
+    return VMM_UNMAP_HUGE;
+  }
+
+  uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT(pd_entry & PAGE_MASK);
+  uint64_t pte = pt_virt[pt_index];
+  if (!(pte & PAGE_FLAG_PRESENT))
+    return VMM_UNMAP_HOLE;
+  pt_virt[pt_index] = 0;
+  tlb_flush_deferred(virtual_addr, (uint64_t)pml4);
+  if (frame_out)
+    *frame_out = pte & PAGE_MASK;
+  return VMM_UNMAP_4K;
+}
+
+/* Clear a whole 2 MB PDE while holding vmm_lock (batch counterpart of the
+ * huge branch in vmm_unmap_page()). Reports the block base in *base_out for
+ * the caller to release after the deferred drain, mirroring the
+ * drain-then-free ordering of safe_unmap_and_free(). */
+void vmm_unmap_huge_locked(uint64_t *pml4, uint64_t virtual_addr,
+                           uint64_t *base_out) {
+  size_t pd_index   = (virtual_addr >> 21) & 0x1FF;
+  size_t pdpt_index = (virtual_addr >> 30) & 0x1FF;
+  size_t pml4_index = (virtual_addr >> 39) & 0x1FF;
+
+  uint64_t *pml4_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)pml4 & PAGE_MASK);
+  uint64_t *pdpt_virt =
+      (uint64_t *)PHYS_TO_VIRT(pml4_virt[pml4_index] & PAGE_MASK);
+  uint64_t *pd_virt =
+      (uint64_t *)PHYS_TO_VIRT(pdpt_virt[pdpt_index] & PAGE_MASK);
+  uint64_t pd_entry = pd_virt[pd_index];
+  if (base_out)
+    *base_out = pd_entry & 0xFFFFFFFE00000ULL;
+  pd_virt[pd_index] = 0;
+  tlb_flush_deferred_context((uint64_t)pml4);
+}
+
 
 /*
  * vmm_split_huge_page - replace a 2 MB leaf mapping with 512 equivalent 4 KB
@@ -770,295 +850,4 @@ out:
       tlb_shootdown_all();
   }
 
-  return ok;
-}
-
-
-/* --------------------------------------------------------------------------
- * Bring-up diagnostics (temporary)
- *
- * vmm_virt_to_phys() assumes every intermediate entry is a valid RAM page
- * table.  When the tables are the thing under suspicion (a missing LAPIC
- * mapping after exec, a GPF in the panic reporter) that assumption turns the
- * diagnostic into a second fault. This walk checks each frame against the
- * PMM's managed-frame bitmap before dereferencing it. Aggregate memory size is
- * not a physical-address ceiling: RAM can be sparse and a valid frame can sit
- * above the summed byte count. It prints via serial_write_sync() so it is safe
- * from an interrupt that interrupted klog.
- * -------------------------------------------------------------------------- */
-
-static bool vmm_debug_frame_ok(uint64_t phys) {
-  if (phys == 0 || (phys & 0xFFF) != 0)
-    return false;
-  return pmm_is_managed(phys);
-}
-
-uint64_t vmm_debug_walk(uint64_t pml4_phys, uint64_t virtual_addr,
-                        uint64_t entries[4]) {
-  uint64_t hhdm = pmm_get_hhdm_offset();
-  uint64_t table = pml4_phys & PAGE_MASK;
-
-  for (int level = 0; level < 4; level++) {
-    if (entries)
-      entries[level] = 0;
-    if (!vmm_debug_frame_ok(table))
-      return 0;
-    uint64_t *tbl = (uint64_t *)(uintptr_t)(table + hhdm);
-    uint64_t index = (virtual_addr >> (39 - level * 9)) & 0x1FF;
-    uint64_t e = tbl[index];
-    if (entries)
-      entries[level] = e;
-    if (!(e & PAGE_FLAG_PRESENT))
-      return 0;
-    if (level == 3)
-      return (e & PAGE_MASK) | (virtual_addr & 0xFFFULL);
-    if (e & PAGE_FLAG_PS) {
-      if (level == 1)
-        return (e & 0x000FFFFFC0000000ULL) | (virtual_addr & 0x3FFFFFFFULL);
-      if (level == 2)
-        return (e & 0x000FFFFFFFE00000ULL) | (virtual_addr & 0x1FFFFFULL);
-      return 0; /* PS at PML4: corruption */
-    }
-    table = e & PAGE_MASK;
-  }
-  return 0;
-}
-
-static void vmm_dbg_out(const char *s) {
-  size_t n = 0;
-  while (n < 256 && s[n])
-    n++;
-  serial_write_sync(s, n);
-}
-
-static void vmm_dbg_hex(uint64_t v) {
-  static const char hex[] = "0123456789ABCDEF";
-  char b[18];
-  b[0] = '0';
-  b[1] = 'x';
-  for (int i = 0; i < 16; i++)
-    b[2 + i] = hex[(v >> ((15 - i) * 4)) & 0xF];
-  serial_write_sync(b, sizeof(b));
-}
-
-static void vmm_dbg_entry_flags(uint64_t entry) {
-  vmm_dbg_out(" flags=");
-  vmm_dbg_out((entry & PAGE_FLAG_PRESENT) ? "P" : "-");
-  vmm_dbg_out((entry & PAGE_FLAG_RW) ? " RW" : " RO");
-  vmm_dbg_out((entry & PAGE_FLAG_USER) ? " US" : " supervisor");
-  if (entry & PAGE_FLAG_PS)
-    vmm_dbg_out(" PS");
-  if (entry & PAGE_FLAG_NX)
-    vmm_dbg_out(" NX");
-}
-
-void vmm_debug_dump_walk(const char *tag, uint64_t pml4_phys,
-                         uint64_t virtual_addr) {
-  static const char *level_name[4] = {"PML4E", "PDPTE", "PDE", "PTE"};
-  uint64_t indices[4];
-  uint64_t table = pml4_phys & PAGE_MASK;
-  uint64_t hhdm = pmm_get_hhdm_offset();
-  uint64_t phys = 0;
-  const char *stop = "walk complete";
-
-  for (int i = 0; i < 4; i++)
-    indices[i] = (virtual_addr >> (39 - i * 9)) & 0x1FF;
-
-  vmm_dbg_out("[VMMDBG] ");
-  vmm_dbg_out(tag);
-  vmm_dbg_out(" cr3=");
-  vmm_dbg_hex(pml4_phys);
-  vmm_dbg_out(" (base=");
-  vmm_dbg_hex(table);
-  vmm_dbg_out(") va=");
-  vmm_dbg_hex(virtual_addr);
-  vmm_dbg_out(" idx=");
-  for (int i = 0; i < 4; i++) {
-    if (i)
-      vmm_dbg_out("/");
-    vmm_dbg_hex(indices[i]);
-  }
-  vmm_dbg_out("\n");
-
-  for (int i = 0; i < 4; i++) {
-    vmm_dbg_out("  ");
-    vmm_dbg_out(level_name[i]);
-    vmm_dbg_out(" table=");
-    vmm_dbg_hex(table);
-    if (!vmm_debug_frame_ok(table)) {
-      vmm_dbg_out(" UNMANAGED_TABLE_FRAME\n");
-      stop = "unmanaged table frame";
-      break;
-    }
-
-    uint64_t *entries = (uint64_t *)(uintptr_t)(table + hhdm);
-    uint64_t entry = entries[indices[i]];
-    vmm_dbg_out(" index=");
-    vmm_dbg_hex(indices[i]);
-    vmm_dbg_out(" entry=");
-    vmm_dbg_hex(entry);
-    vmm_dbg_entry_flags(entry);
-    if (!(entry & PAGE_FLAG_PRESENT)) {
-      vmm_dbg_out("\n");
-      stop = "not-present";
-      break;
-    }
-
-    if (i == 3) {
-      phys = (entry & PAGE_MASK) | (virtual_addr & 0xFFFULL);
-      vmm_dbg_out(" leaf=4K\n");
-      stop = "leaf=4K";
-      break;
-    }
-    if (entry & PAGE_FLAG_PS) {
-      if (i == 1) {
-        phys = (entry & 0x000FFFFFC0000000ULL) |
-               (virtual_addr & 0x3FFFFFFFULL);
-        vmm_dbg_out(" leaf=1G\n");
-        stop = "leaf=1G";
-      } else if (i == 2) {
-        phys = (entry & 0x000FFFFFFFE00000ULL) |
-               (virtual_addr & 0x1FFFFFULL);
-        vmm_dbg_out(" leaf=2M\n");
-        stop = "leaf=2M";
-      } else {
-        vmm_dbg_out(" INVALID_PS_AT_PML4\n");
-        stop = "invalid PS at PML4";
-      }
-      break;
-    }
-    vmm_dbg_out("\n");
-    table = entry & PAGE_MASK;
-  }
-
-  vmm_dbg_out("  result=");
-  vmm_dbg_hex(phys);
-  vmm_dbg_out(" stop=");
-  vmm_dbg_out(stop);
-  vmm_dbg_out("\n");
-}
-
-uint64_t vmm_virt_to_phys(uint64_t *pml4_phys, uint64_t virtual_addr) {
-  size_t pml4_index = (virtual_addr >> 39) & 0x1FF;
-  size_t pdpt_index = (virtual_addr >> 30) & 0x1FF;
-  size_t pd_index   = (virtual_addr >> 21) & 0x1FF;
-  size_t pt_index   = (virtual_addr >> 12) & 0x1FF;
-
-  uint64_t *pml4_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)pml4_phys & PAGE_MASK);
-  uint64_t  entry;
-
-  entry = pml4_virt[pml4_index];
-  if (!(entry & PAGE_FLAG_PRESENT))
-    return 0;
-
-  uint64_t *pdpt_virt = (uint64_t *)PHYS_TO_VIRT(entry & PAGE_MASK);
-  entry = pdpt_virt[pdpt_index];
-  if (!(entry & PAGE_FLAG_PRESENT))
-    return 0;
-  if (entry & PAGE_FLAG_PS) // 1 GB huge page
-    return (entry & 0xFFFFFC0000000ULL) | (virtual_addr & 0x3FFFFFFFULL);
-
-  uint64_t *pd_virt = (uint64_t *)PHYS_TO_VIRT(entry & PAGE_MASK);
-  entry = pd_virt[pd_index];
-  if (!(entry & PAGE_FLAG_PRESENT))
-    return 0;
-  if (entry & PAGE_FLAG_PS) // 2 MB huge page
-    return (entry & 0xFFFFFFFE00000ULL) | (virtual_addr & 0x1FFFFFULL);
-
-  uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT(entry & PAGE_MASK);
-  entry = pt_virt[pt_index];
-  if (!(entry & PAGE_FLAG_PRESENT))
-    return 0;
-  return (entry & PAGE_MASK) | (virtual_addr & 0xFFFULL);
-}
-
-bool vmm_is_huge_page(uint64_t *pml4_phys, uint64_t virtual_addr) {
-  if (!pml4_phys)
-    return false;
-
-  size_t pml4_index = (virtual_addr >> 39) & 0x1FF;
-  size_t pdpt_index = (virtual_addr >> 30) & 0x1FF;
-  size_t pd_index   = (virtual_addr >> 21) & 0x1FF;
-
-  uint64_t *pml4_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)pml4_phys & PAGE_MASK);
-  uint64_t  entry = pml4_virt[pml4_index];
-  if (!(entry & PAGE_FLAG_PRESENT))
-    return false;
-
-  uint64_t *pdpt_virt = (uint64_t *)PHYS_TO_VIRT(entry & PAGE_MASK);
-  entry = pdpt_virt[pdpt_index];
-  if (!(entry & PAGE_FLAG_PRESENT))
-    return false;
-  if (entry & PAGE_FLAG_PS)
-    return true; // 1 GB huge page
-
-  uint64_t *pd_virt = (uint64_t *)PHYS_TO_VIRT(entry & PAGE_MASK);
-  entry = pd_virt[pd_index];
-  if (!(entry & PAGE_FLAG_PRESENT))
-    return false;
-  return (entry & PAGE_FLAG_PS) != 0; // 2 MB huge page
-}
-
-
-/* --------------------------------------------------------------------------
- * Resident-set accounting for /proc/<pid>/{statm,status}
- *
- * Counts every present entry in the user half of an address space (PML4 slots
- * 0-255) and returns bytes.  2 MB and 1 GB leaves count as the 512 / 262144
- * pages they cover, so the figure is directly comparable with what Linux puts
- * in statm's resident field - which is what glibc-side readers such as WebKit
- * (WTF::memoryFootprint -> /proc/self/statm field 2 * page size) multiply by
- * page size and compare against their kill threshold.
- *
- * Deliberately lock free: PTEs are written as single aligned 64-bit stores, so
- * a concurrent fault, munmap or fork can only leave this one sample stale,
- * never torn.  Reading a frame that teardown has just returned to the PMM
- * yields a wrong count rather than a fault, because the HHDM maps all RAM
- * permanently - again, a stale sample.  The walk itself never blocks and never
- * runs with a scheduler lock held, which is what makes it safe to call from a
- * /proc read with interrupts enabled.
- *
- * Cost is bounded by the page tables the process actually has, i.e. roughly
- * proportional to its own RSS (and the sum over all processes is bounded by
- * physical RAM), so polling every process from htop stays cheap.
- * -------------------------------------------------------------------------- */
-uint64_t vmm_user_resident_bytes(uint64_t cr3) {
-  if (!cr3)
-    return 0;
-
-  uint64_t *pml4_virt = (uint64_t *)PHYS_TO_VIRT(cr3 & PAGE_MASK);
-  uint64_t pages = 0;
-
-  for (size_t i = 0; i < 256; i++) {
-    if (!(pml4_virt[i] & PAGE_FLAG_PRESENT))
-      continue;
-
-    uint64_t *pdpt_virt = (uint64_t *)PHYS_TO_VIRT(pml4_virt[i] & PAGE_MASK);
-    for (size_t j = 0; j < 512; j++) {
-      if (!(pdpt_virt[j] & PAGE_FLAG_PRESENT))
-        continue;
-      if (pdpt_virt[j] & PAGE_FLAG_PS) {
-        pages += 262144; // 1 GB leaf
-        continue;
-      }
-
-      uint64_t *pd_virt = (uint64_t *)PHYS_TO_VIRT(pdpt_virt[j] & PAGE_MASK);
-      for (size_t k = 0; k < 512; k++) {
-        if (!(pd_virt[k] & PAGE_FLAG_PRESENT))
-          continue;
-        if (pd_virt[k] & PAGE_FLAG_PS) {
-          pages += 512; // 2 MB leaf
-          continue;
-        }
-
-        uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT(pd_virt[k] & PAGE_MASK);
-        for (size_t l = 0; l < 512; l++) {
-          if (pt_virt[l] & PAGE_FLAG_PRESENT)
-            pages++;
-        }
-      }
-    }
-  }
-
-  return pages * PAGE_SIZE;
 }

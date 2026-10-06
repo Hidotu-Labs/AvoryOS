@@ -1,4 +1,5 @@
 #include "syscall.h"
+#include "sysdiag.h"
 #include "../console/klog.h"
 #include "../cpu/ktrack.h"
 #include "../cpu/msr.h"
@@ -24,6 +25,7 @@ void syscall_register_raw(int num, syscall_raw_handler_t handler) {
 }
 
 void syscall_register_aio(void);
+void syscall_register_timer(void);
 void syscall_register_kcmp(void);
 
 static const char *const syscall_names[MAX_SYSCALL] = {
@@ -401,7 +403,7 @@ const char *syscall_get_name(uint64_t num) {
 }
 
 bool syscall_log_allowed(const struct thread *t) {
-#if SYSCALL_LOG == 2
+#if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
   return t && t->trace_syscalls;
 #else
   (void)t;
@@ -414,61 +416,16 @@ static void log_syscall_entry(struct syscall_regs *regs, struct thread *t) {
   if (!syscall_log_allowed(t))
     return;
 
+  /* Single klogf so the line is one serial/ring dispatch.  The old version
+   * emitted ~15 separate klog_puts() calls, so two traced tasks on different
+   * CPUs interleaved mid-line and the log was unparseable. */
   const char *name = syscall_get_name(regs->rax);
-  klog_puts("[SYSCALL] ");
-  klog_puts(name ? name : "unknown");
-  klog_puts("(");
-  klog_hex64(regs->rax);
-  klog_puts(") pid=");
-  klog_uint64(t ? t->tgid : 0);
-  klog_puts(" tid=");
-  klog_uint64(t ? t->tid : 0);
-  klog_puts(" comm=");
-  klog_puts((t && t->comm[0]) ? t->comm : "?");
-  klog_puts(" rip=");
-  klog_hex64(regs->rip);
-  klog_puts(" args=");
-  klog_hex64(regs->rdi);
-  klog_puts(",");
-  klog_hex64(regs->rsi);
-  klog_puts(",");
-  klog_hex64(regs->rdx);
-  klog_puts(",");
-  klog_hex64(regs->r10);
-  klog_puts(",");
-  klog_hex64(regs->r8);
-  klog_puts(",");
-  klog_hex64(regs->r9);
-  klog_puts("\n");
-}
-#endif
-
-/* Browser-mode trace: one compact line per failing syscall.  Successful calls
- * already have their entry line, and on a rendering bug the interesting event
- * is almost always the ENOENT/EINVAL/ENOSYS that follows one of them. */
-#if SYSCALL_LOG == 2
-static void log_syscall_error(uint64_t syscall_num, struct thread *t,
-                              int64_t ret) {
-  if (ret >= 0 || ret < -4095 || !syscall_log_allowed(t))
-    return;
-  const char *name = syscall_get_name(syscall_num);
-  klog_puts("[SYSCALL] FAIL ");
-  klog_puts(name ? name : "unknown");
-  klog_puts(" errno=");
-  klog_int64(-ret);
-  klog_puts("\n");
-}
-#endif
-
-static void log_unimplemented_syscall(struct syscall_regs *regs, struct thread *t) {
-  const char *name = syscall_get_name(regs->rax);
-  klogf(KLOG_CLR_YELLOW "[WARN] Unimplemented syscall: " KLOG_CLR_RESET
-        "%llu (%s) [comm: '%s', pid: %u, tid: %u] rip: 0x%016llx args: (0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx, 0x%llx)\n",
-        (unsigned long long)regs->rax,
+  klogf("[SYSCALL] %s(0x%llx) pid=%u tid=%u comm=%s rip=0x%llx args=(0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx)\n",
         name ? name : "unknown",
-        (t && t->comm[0]) ? t->comm : "unknown",
+        (unsigned long long)regs->rax,
         t ? t->tgid : 0,
         t ? t->tid : 0,
+        (t && t->comm[0]) ? t->comm : "?",
         (unsigned long long)regs->rip,
         (unsigned long long)regs->rdi,
         (unsigned long long)regs->rsi,
@@ -476,6 +433,28 @@ static void log_unimplemented_syscall(struct syscall_regs *regs, struct thread *
         (unsigned long long)regs->r10,
         (unsigned long long)regs->r8,
         (unsigned long long)regs->r9);
+}
+#endif
+
+/* Filtered-mode trace: one compact line per failing syscall.  Successful calls
+ * already have their entry line, and on a rendering bug the interesting event
+ * is almost always the ENOENT/EINVAL/ENOSYS that follows one of them. */
+#if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
+static void log_syscall_error(uint64_t syscall_num, struct thread *t,
+                              int64_t ret) {
+  if (ret >= 0 || ret < -4095 || !syscall_log_allowed(t))
+    return;
+  const char *name = syscall_get_name(syscall_num);
+  klogf("[SYSCALL] FAIL %s errno=%lld pid=%u comm=%s\n",
+        name ? name : "unknown", (long long)-ret,
+        t ? t->tgid : 0, (t && t->comm[0]) ? t->comm : "?");
+}
+#endif
+
+static void log_unimplemented_syscall(struct syscall_regs *regs, struct thread *t) {
+  if (regs) {
+    sysdiag_record_missing_syscall(regs->rax, t, regs);
+  }
 }
 
 static inline void record_syscall_error(struct thread *t, uint64_t syscall_num, int64_t err) {
@@ -509,6 +488,8 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     if (t) {
       t->last_syscall_ret = (int64_t)-38;
       record_syscall_error(t, syscall_num, -38);
+      rseq_update_cpu_id(t);
+      rseq_maybe_abort(t, &regs->rip);
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
     return;
@@ -521,14 +502,17 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     log_syscall_entry(regs, t);
 #endif
     regs->rax = raw_handler(regs);
-#if SYSCALL_LOG == 2
+#if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
     log_syscall_error(syscall_num, t, (int64_t)regs->rax);
 #endif
     if (t) {
       t->last_syscall_ret = (int64_t)regs->rax;
       if ((int64_t)regs->rax < 0 && (int64_t)regs->rax >= -4095) {
         record_syscall_error(t, syscall_num, (int64_t)regs->rax);
+        sysdiag_record_syscall_error(syscall_num, (int64_t)regs->rax, t, regs);
       }
+      rseq_update_cpu_id(t);
+      rseq_maybe_abort(t, &regs->rip);
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
     return;
@@ -540,6 +524,8 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     if (t) {
       t->last_syscall_ret = (int64_t)-38;
       record_syscall_error(t, syscall_num, -38);
+      rseq_update_cpu_id(t);
+      rseq_maybe_abort(t, &regs->rip);
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
     return;
@@ -553,7 +539,7 @@ void syscall_dispatcher(struct syscall_regs *regs) {
 
   regs->rax =
       handler(regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8, regs->r9);
-#if SYSCALL_LOG == 2
+#if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
   log_syscall_error(syscall_num, t, (int64_t)regs->rax);
 #endif
 
@@ -561,6 +547,7 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     t->last_syscall_ret = (int64_t)regs->rax;
     if ((int64_t)regs->rax < 0 && (int64_t)regs->rax >= -4095) {
       record_syscall_error(t, syscall_num, (int64_t)regs->rax);
+      sysdiag_record_syscall_error(syscall_num, (int64_t)regs->rax, t, regs);
     }
   }
 
@@ -569,6 +556,14 @@ void syscall_dispatcher(struct syscall_regs *regs) {
    * point where a syscall that woke a more eligible thread on this CPU - an
    * X11 client writing a request that wakes the server - yields promptly. */
   sched_check_resched(true);
+
+  /* rseq: publish the current CPU and abort any critical section this
+   * syscall (or a preemption during it) interrupted, before signal delivery
+   * possibly redirects RIP to a handler. */
+  if (t) {
+    rseq_update_cpu_id(t);
+    rseq_maybe_abort(t, &regs->rip);
+  }
 
   /* Signal frame conversion copies the complete register set. Keep it off the
    * syscall hot path unless this thread can actually deliver a signal. */
@@ -580,6 +575,7 @@ void syscall_dispatcher(struct syscall_regs *regs) {
 
 // Core initialization
 void syscall_init(void) {
+  sysdiag_init();
   // Register all syscall subsystems
   syscall_register_io();
   syscall_register_process();
@@ -594,11 +590,14 @@ void syscall_init(void) {
   syscall_register_sem();
   syscall_register_futex();
   syscall_register_aio();
+  syscall_register_timer();
 
   syscall_init_cpu();
 
 #if SYSCALL_LOG == 2
   klog_puts("[SYSCALL] browser-only trace active (badwolf/WebKit/bwrap)\n");
+#elif SYSCALL_LOG == 3
+  klog_puts("[SYSCALL] sddm-only trace active (sddm/Xorg/greeter)\n");
 #elif SYSCALL_LOG == 1
   klog_puts("[SYSCALL] tracing every syscall (SYSCALL_LOG=1)\n");
 #endif

@@ -176,13 +176,23 @@ static int inet6_connect(socket_t *sock, struct sockaddr *addr, int len) {
     if (socket_is_nonblocking(sock)) { sock->state = SS_CONNECTING; return -115; }
     uint64_t deadline = lapic_timer_get_ticks() + 10000;
     struct thread *self = sched_get_current();
-    wait_queue_entry_t wqe = { .thread = self, .next = NULL };
+    wait_queue_entry_t wqe = { .thread = self, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL };
     while (s->tcp->state == TCP_SYN_SENT && !s->tcp->error &&
            lapic_timer_get_ticks() < deadline) {
-      wait_queue_add(sock->wait_queue, &wqe);
       if (self) {
-        self->wakeup_ticks = lapic_timer_get_ticks() + 50;
         self->state = THREAD_BLOCKED;
+        self->wakeup_ticks = lapic_timer_get_ticks() + 50;
+      }
+      wait_queue_add(sock->wait_queue, &wqe);
+      if (s->tcp->state != TCP_SYN_SENT || s->tcp->error) {
+        if (self) {
+          self->state = THREAD_RUNNING;
+          self->wakeup_ticks = 0;
+        }
+        wait_queue_remove(sock->wait_queue, &wqe);
+        if (self && self->state == THREAD_BLOCKED)
+          self->state = THREAD_RUNNING;
+        continue;
       }
       sched_yield();
       if (self) self->wakeup_ticks = 0;
@@ -260,15 +270,26 @@ static ssize_t inet6_recvfrom(socket_t *sock, void *buf, size_t len, int flags,
       return -11;
     }
     struct thread *t = sched_get_current();
-    wait_queue_entry_t e = {.thread = t};
+    wait_queue_entry_t e = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
     wait_queue_t *wq = (wait_queue_t *)(sock->wait_queue ? sock->wait_queue : &s->wait);
-    /* Register and block while holding udp6_lock. udp6_input() takes this
+    /* BLOCKED before add + recheck under udp6_lock. udp6_input() takes this
      * lock before queueing and waking, so a datagram cannot land between the
      * empty check and waiter registration and leave recvfrom asleep. */
-    wait_queue_add(wq, &e);
     if (t) {
       t->state = THREAD_BLOCKED;
       t->wakeup_ticks = 0;
+    }
+    wait_queue_add(wq, &e);
+    if (s->tail != s->head) {
+      if (t) {
+        t->state = THREAD_RUNNING;
+        t->wakeup_ticks = 0;
+      }
+      spinlock_release(&udp6_lock);
+      wait_queue_remove(wq, &e);
+      if (t && t->state == THREAD_BLOCKED)
+        t->state = THREAD_RUNNING;
+      continue;
     }
     spinlock_release(&udp6_lock);
     sched_yield();

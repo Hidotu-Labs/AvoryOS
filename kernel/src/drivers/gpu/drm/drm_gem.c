@@ -24,7 +24,7 @@ struct drm_gem_object *ascentdrm_gem_object_create(struct drm_device *dev, size_
     obj->phys_addr = (uint64_t)phys;
     obj->virt_addr = (void *)((uint64_t)phys + pmm_get_hhdm_offset());
     obj->cache_mode = DRM_GEM_CACHE_WB;
-    obj->refcount = 1;
+    __atomic_store_n(&obj->refcount, 1, __ATOMIC_RELAXED);
 
     spinlock_acquire(&dev->lock);
     obj->handle = dev->next_gem_handle++;
@@ -49,6 +49,24 @@ struct drm_gem_object *ascentdrm_gem_find_by_handle(struct drm_device *dev, uint
     struct drm_gem_object *obj;
     list_for_each_entry(obj, &dev->gem_objects, list) {
         if (obj->handle == handle) {
+            spinlock_release(&dev->lock);
+            return obj;
+        }
+    }
+    spinlock_release(&dev->lock);
+    return NULL;
+}
+
+/* Find by global handle and take a reference under dev->lock, so the object
+ * cannot be freed between the lookup and the get. Returns NULL with no
+ * reference taken when unknown. */
+struct drm_gem_object *ascentdrm_gem_find_by_handle_get(struct drm_device *dev,
+                                                  uint32_t handle) {
+    spinlock_acquire(&dev->lock);
+    struct drm_gem_object *obj;
+    list_for_each_entry(obj, &dev->gem_objects, list) {
+        if (obj->handle == handle) {
+            __atomic_fetch_add(&obj->refcount, 1, __ATOMIC_RELAXED);
             spinlock_release(&dev->lock);
             return obj;
         }

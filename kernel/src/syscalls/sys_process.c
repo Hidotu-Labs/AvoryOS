@@ -18,6 +18,7 @@
 #include "../smp/cpu.h"
 #include "sys_io_shared.h"
 #include "syscall.h"
+#include "sysdiag.h"
 #define TSC_PROBES_ENABLE
 #include "../lib/tsc.h"
 #include <stdint.h>
@@ -107,6 +108,9 @@ extern struct thread *global_thread_list;
 /* Queues the child's exit signal on its parent, as Linux's do_notify_parent().
  * Implemented in sys_signal.c. */
 extern void signal_notify_parent_exit(struct thread *child);
+extern void signal_notify_thread(struct thread *t, int sig);
+extern uint64_t futex_wake_user(uint32_t *uaddr, uint32_t count);
+static void robust_handle_death(struct thread *t);
 
 struct pidfd_ctx { uint32_t pid; };
 
@@ -164,7 +168,7 @@ static void pidfd_close(vfs_node_t *node) {
  * read as a struct pidfd_ctx by waitid(P_PIDFD), turning a stray file descriptor
  * into a wait on an arbitrary process. */
 static struct pidfd_ctx *pidfd_ctx_of(vfs_node_t *node) {
-  if (!node || node->poll != pidfd_poll || !node->device)
+  if (!fd_is_valid_node(node) || node->poll != pidfd_poll || !node->device)
     return NULL;
   return (struct pidfd_ctx *)node->device;
 }
@@ -253,10 +257,130 @@ static uint64_t sys_pidfd_open(uint64_t pid, uint64_t flags, uint64_t a2,
   return pidfd_install(sched_get_current(), (uint32_t)pid, flags);
 }
 
+static uint64_t sys_pidfd_send_signal(uint64_t pidfd, uint64_t sig,
+                                      uint64_t info_ptr, uint64_t flags,
+                                      uint64_t a4, uint64_t a5) {
+  (void)a4;
+  (void)a5;
+  if (flags != 0)
+    return (uint64_t)-22; // EINVAL: only 0 supported
+  if (sig > 64)
+    return (uint64_t)-22;
+  if (info_ptr && !vmm_is_user_addr_range_valid(info_ptr, 128))
+    return (uint64_t)-14; // EFAULT
+  struct thread *current = sched_get_current();
+  if (!current || pidfd >= MAX_FDS)
+    return (uint64_t)-9; // EBADF
+  vfs_node_t *node = current->fds[pidfd];
+  struct pidfd_ctx *ctx = pidfd_ctx_of(node);
+  if (!ctx)
+    return (uint64_t)-9;
+  uint32_t pid = ctx->pid;
+  if (sig == 0)
+    return pidfd_task_state(pid, &(bool){0}) ? 0 : (uint64_t)-3;
+  extern struct thread *global_thread_list;
+  extern spinlock_t tid_lock;
+  spinlock_acquire(&tid_lock);
+  struct thread *target = NULL;
+  for (struct thread *t = global_thread_list; t; t = t->global_next) {
+    if (t->tgid == pid || t->tid == pid) {
+      target = t;
+      break;
+    }
+  }
+  if (!target) {
+    spinlock_release(&tid_lock);
+    return (uint64_t)-3; // ESRCH
+  }
+  if (current->euid != 0 && current->uid != target->uid &&
+      current->euid != target->uid) {
+    spinlock_release(&tid_lock);
+    return (uint64_t)-1; // EPERM
+  }
+  uint32_t sender_pid = current->tgid ? current->tgid : current->tid;
+  target->pending_signals |= (1ULL << (sig - 1));
+  target->signal_sender_pid[sig - 1] = sender_pid;
+  target->signal_sender_code[sig - 1] = 0; /* SI_USER */
+  spinlock_release(&tid_lock);
+  signal_notify_thread(target, (int)sig);
+  return 0;
+}
+
+static uint64_t sys_pidfd_getfd(uint64_t pidfd, uint64_t targetfd,
+                                 uint64_t flags, uint64_t a3, uint64_t a4,
+                                 uint64_t a5) {
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  if (flags != 0)
+    return (uint64_t)-22;
+  struct thread *current = sched_get_current();
+  if (!current || pidfd >= MAX_FDS)
+    return (uint64_t)-9;
+  vfs_node_t *pnode = current->fds[pidfd];
+  struct pidfd_ctx *ctx = pidfd_ctx_of(pnode);
+  if (!ctx)
+    return (uint64_t)-9;
+  uint32_t pid = ctx->pid;
+  extern struct thread *global_thread_list;
+  extern spinlock_t tid_lock;
+  spinlock_acquire(&tid_lock);
+  struct thread *target = NULL;
+  for (struct thread *t = global_thread_list; t; t = t->global_next) {
+    if (t->tgid == pid || t->tid == pid) {
+      target = t;
+      break;
+    }
+  }
+  if (!target) {
+    spinlock_release(&tid_lock);
+    return (uint64_t)-3;
+  }
+  if (!target->fds || targetfd >= MAX_FDS) {
+    spinlock_release(&tid_lock);
+    return (uint64_t)-9;
+  }
+  spinlock_acquire(&target->files->lock);
+  vfs_node_t *node = target->fds[targetfd];
+  if (!node || node == FD_RESERVED) {
+    spinlock_release(&target->files->lock);
+    spinlock_release(&tid_lock);
+    return (uint64_t)-9;
+  }
+  vfs_open(node);
+  spinlock_release(&target->files->lock);
+  spinlock_release(&tid_lock);
+  int new_fd = alloc_fd(current);
+  if (new_fd < 0) {
+    vfs_close(node);
+    return (uint64_t)-24; // EMFILE
+  }
+  spinlock_acquire(&current->files->lock);
+  current->fds[new_fd] = node;
+  spinlock_release(&current->files->lock);
+  current->fd_offsets[new_fd] = 0;
+  current->fd_flags[new_fd] = 0;
+  return (uint64_t)new_fd;
+}
+
 // exit / exit_group (shared)
 void process_do_exit(uint64_t status) __attribute__((noreturn));
 void process_do_exit(uint64_t status) {
   struct thread *current = sched_get_current();
+  if (!current) {
+    while (1)
+      sched_yield();
+  }
+  if (current->state == THREAD_DEAD || current->state == THREAD_ZOMBIE) {
+    while (1) {
+      sched_yield();
+    }
+  }
+  // Robust mutexes held by this thread must be marked OWNER_DIED and woken
+  // while the address space is still live; otherwise the next locker spins
+  // into musl's a_crash (HLT) on impossible owner state.
+  if (current && current->robust_list)
+    robust_handle_death(current);
   if (current && current->tid_address) {
     uint32_t *tidptr = (uint32_t *)current->tid_address;
     if (vmm_is_user_addr_range_writable((uint64_t)tidptr, sizeof(*tidptr))) {
@@ -327,6 +451,29 @@ void process_do_exit(uint64_t status) {
             &parent->signal_handlers[SIGCHLD - 1];
         auto_reap = chld_action->sa_handler == (void *)SIG_IGN ||
                     (chld_action->sa_flags & SA_NOCLDWAIT) != 0;
+        /* Keep default-disposition children waitable, including when the
+         * parent is a GUI/daemon using pidfds, signalfd, or a later waitpid.
+         * Process names and whether a wait syscall is currently blocked do
+         * not establish that the parent has abandoned the exit status.
+         * Only retain the existing PID-1 fallback for orphan collection. */
+        bool parent_group_waiting = false;
+        if (parent->waiting_for_child) {
+          parent_group_waiting = true;
+        } else {
+          for (struct thread *w = global_thread_list; w; w = w->global_next) {
+            if (w->tgid == parent->tgid && w->waiting_for_child) {
+              parent_group_waiting = true;
+              break;
+            }
+          }
+        }
+        if (!auto_reap &&
+            (chld_action->sa_handler == (void *)SIG_DFL || chld_action->sa_handler == NULL) &&
+            !parent_group_waiting) {
+          if (parent->tgid == 1 || parent->tid == 1) {
+            auto_reap = true;
+          }
+        }
       }
       current->state = auto_reap ? THREAD_DEAD : THREAD_ZOMBIE;
       if (current->parent) {
@@ -736,7 +883,7 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
 
   if (idtype == P_PIDFD) {
     struct pidfd_ctx *pctx =
-        (id < MAX_FDS && current->fds[id]) ? pidfd_ctx_of(current->fds[id]) : NULL;
+        (id < MAX_FDS && fd_is_valid_node(current->fds[id])) ? pidfd_ctx_of(current->fds[id]) : NULL;
     if (!pctx)
       return (uint64_t)-9; // EBADF
     target_pid = pctx->pid;
@@ -871,9 +1018,13 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
       wait_queue_entry_t pidfd_entry;
       pidfd_entry.thread = current;
       pidfd_entry.next = NULL;
+      pidfd_entry.wq = NULL;
+      pidfd_entry.thread_next = NULL;
+      pidfd_entry.thread_prev = NULL;
       bool on_pidfd_wq = false;
 
       if (idtype == P_PIDFD) {
+        current->state = THREAD_BLOCKED;
         wait_queue_add(&pidfd_event_wait, &pidfd_entry);
         on_pidfd_wq = true;
         current->wakeup_ticks = lapic_timer_get_ticks() + 10;
@@ -884,6 +1035,8 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
       if (on_pidfd_wq) {
         wait_queue_remove(&pidfd_event_wait, &pidfd_entry);
         current->wakeup_ticks = 0;
+        if (current->state == THREAD_BLOCKED)
+          current->state = THREAD_RUNNING;
       }
       /* waiting_for_child stays set — cleared at top of next iteration
        * after we reacquire tid_lock, same as sys_wait4. */
@@ -1244,9 +1397,16 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   }
   current->pending_signals = 0;
   memset(current->signal_sender_pid, 0, sizeof(current->signal_sender_pid));
+  memset(current->signal_sender_code, 0, sizeof(current->signal_sender_code));
 
   // The old address space is gone, so any robust list registered in it is too.
   current->robust_list = 0;
+
+  // Same for rseq: the old registration pointed into the dead address space
+  // (Linux flush_thread() clears it on exec).
+  current->rseq_addr = 0;
+  current->rseq_len = 0;
+  current->rseq_sig = 0;
 
   // We are now safely loaded into the new address space!
   TSC_BEGIN(execve_stack);
@@ -1292,6 +1452,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
   // Automatic desktop interactive prioritization (KDE Plasma, KWin, Xorg)
   if (strcmp(current->comm, "kwin_x11") == 0 ||
+      strcmp(current->comm, "kwin_x11-bin") == 0 ||
       strcmp(current->comm, "kwin_wayland") == 0 ||
       strcmp(current->comm, "kwin") == 0 ||
       strcmp(current->comm, "plasmashell") == 0 ||
@@ -1303,6 +1464,13 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
   if (current->is_forked_child) {
     klog_proc_exec(current->tid, path);
+#if SYSCALL_LOG == 2
+    if (klog_path_is_browser(path))
+      current->trace_syscalls = true;
+#elif SYSCALL_LOG == 3
+    if (klog_path_is_sddm(path))
+      current->trace_syscalls = true;
+#endif
   }
 
   // Store the full executable path for /proc/self/exe
@@ -1553,6 +1721,10 @@ uint64_t sys_fork(struct syscall_regs *regs) {
     child->ss_sp = parent->ss_sp;
     child->ss_size = parent->ss_size;
     child->ss_flags = parent->ss_flags;
+
+#if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
+    child->trace_syscalls = parent->trace_syscalls;
+#endif
   }
   TSC_END(fork_fds);
 
@@ -1579,6 +1751,13 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     return (uint64_t)-22;
   if ((flags & CLONE_THREAD) && !(flags & CLONE_SIGHAND))
     return (uint64_t)-22;
+  /* No namespace isolation on AvoryOS: reject namespace flags with EPERM
+   * (matches unshare handling) so bwrap/glycin probes detect "sandbox
+   * unavailable" and fall back instead of half-isolating. pthreads never
+   * pass these flags. */
+  if (flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC |
+               CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWTIME))
+    return (uint64_t)-1; // EPERM
   if ((flags & CLONE_VM) && !(flags & CLONE_VFORK) && child_stack == 0)
     return (uint64_t)-22;
   if ((flags & CLONE_PARENT_SETTID) &&
@@ -1629,7 +1808,11 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
 
   uint64_t child_cr3 = parent->cr3;
   struct mm_struct *child_mm = parent->mm;
-  bool private_mm = !(flags & CLONE_VM);
+  bool vfork = (flags & CLONE_VFORK) != 0;
+  // If CLONE_VFORK is requested, allocate a private COW address space so the child
+  // cannot clobber the parent's memory/stack. This eliminates deadlocks and
+  // lock inversion with sibling threads in multithreaded processes (e.g. plasmashell).
+  bool private_mm = !(flags & CLONE_VM) || vfork;
 
   if (private_mm) {
     TSC_BEGIN(fork_clone);
@@ -1666,7 +1849,6 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     spinlock_init(&child_mm->lock);
   }
 
-  bool vfork = (flags & CLONE_VFORK) != 0;
   struct cpu_info *target_cpu = vfork ? cpu_get_current() : NULL;
   struct thread *child =
       sched_create_kernel_thread(fork_child_entry, target_cpu, false);
@@ -1718,6 +1900,16 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   // A new task starts from the parent's robust list, exactly like Linux; a
   // fresh thread installs its own through set_robust_list(2).
   child->robust_list = parent->robust_list;
+  // rseq follows Linux copy_process()/rseq_fork(): the child's registration
+  // is always cleared, even for CLONE_THREAD. Each thread owns a struct rseq
+  // in its own TLS at a different virtual address; inheriting the parent's
+  // pointer makes the child's subsequent rseq(2) registration of its own TLS
+  // area fail with EBUSY, which glibc treats as fatal ("rseq registration
+  // failed") and aborts (observed as Xorg + all threaded glibc programs
+  // dying with SIGABRT). The child re-registers on thread startup.
+  child->rseq_addr = 0;
+  child->rseq_len = 0;
+  child->rseq_sig = 0;
 
   if (flags & CLONE_FILES) {
     sched_share_files(child, parent);
@@ -1765,6 +1957,9 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     child->ss_flags = parent->ss_flags;
   }
   memcpy(child->comm, parent->comm, sizeof(child->comm));
+#if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
+  child->trace_syscalls = parent->trace_syscalls;
+#endif
 
   if (flags & CLONE_PARENT_SETTID)
     __atomic_store_n((uint32_t *)ptid, child->tid, __ATOMIC_RELEASE);
@@ -1778,18 +1973,10 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     int pidfd_user = pidfd_fd;
     copy_to_user((void *)pidfd_slot, &pidfd_user, sizeof(int));
   }
-  if (vfork)
-    parent->state = THREAD_BLOCKED;
-
   /* Runqueue publication is the final creation step. */
   /* Snapshot the result before making the child runnable. */
   uint32_t child_tid = child->tid;
   sched_enqueue_thread(child, target_cpu);
-
-  if (vfork) {
-    while (parent->state == THREAD_BLOCKED)
-      sched_yield();
-  }
 
   return child_tid;
 #undef PIDFD_UNRESERVE
@@ -1815,9 +2002,13 @@ uint64_t sys_clone(struct syscall_regs *regs) {
 
 // sys_vfork (syscall 58)
 uint64_t sys_vfork(struct syscall_regs *regs) {
-  // vfork is essentially clone with shared VM and parent blocking.
-  // Standard flags: CLONE_VM | CLONE_VFORK | SIGCHLD
-  return sys_clone_internal(regs, CLONE_VM | CLONE_VFORK | 17, 0, 0, 0, 0, 0);
+  // POSIX explicitly permits implementing vfork as fork.
+  // In AvoryOS, using shared VM and parent-blocking for vfork in multithreaded
+  // environments (like KDE Plasma 6 / plasmashell) leads to severe lock-inversion,
+  // stack clobbering, and multi-minute stalls.
+  // Using COW fork provides full memory isolation, zero stack contention,
+  // and instant process startup without blocking the parent.
+  return sys_fork(regs);
 }
 
 struct clone_args {
@@ -2038,10 +2229,14 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
 
   switch (option) {
   case 1: // PR_SET_PDEATHSIG
-    return 0;
+    if (arg2 == 0 || (arg2 > 0 && arg2 <= 64)) {
+      current->pdeath_signal = (int)arg2;
+      return 0;
+    }
+    return (uint64_t)-22;
   case 2: // PR_GET_PDEATHSIG
     if (arg2 && vmm_is_user_addr_range_writable(arg2, sizeof(int))) {
-      *(int *)arg2 = 0;
+      *(int *)arg2 = current->pdeath_signal;
       return 0;
     }
     return (uint64_t)-14;
@@ -2067,6 +2262,62 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     strncpy(out, current->comm, 16);
     return 0;
   }
+  case 7: // PR_GET_KEEPCAPS
+    return 0;
+  case 8: // PR_SET_KEEPCAPS
+    return 0;
+  case 23: // PR_CAPBSET_READ
+    // Return 1 if capability is in bounding set (all caps 0..40 present),
+    // or -EINVAL (-22) if capability is invalid (> 40).
+    if (arg2 <= 40)
+      return 1;
+    return (uint64_t)-22;
+  case 24: // PR_CAPBSET_DROP
+    if (arg2 <= 40)
+      return 0;
+    return (uint64_t)-22;
+  case 27: // PR_GET_SECUREBITS
+    return 0;
+  case 28: // PR_SET_SECUREBITS
+    return 0;
+  case 13: // PR_GET_TIMING
+    return 0;
+  case 14: // PR_SET_TIMING
+    return 0;
+  case 19: // PR_GET_ENDIAN
+    if (arg2 && vmm_is_user_addr_range_writable(arg2, sizeof(int))) {
+      *(int *)arg2 = 1; // PR_ENDIAN_LITTLE
+      return 0;
+    }
+    return (uint64_t)-14;
+  case 20: // PR_SET_ENDIAN
+    return (arg2 == 1) ? 0 : (uint64_t)-22;
+  case 21: // PR_GET_SECCOMP
+    return 0;
+  case 22: // PR_SET_SECCOMP
+    return 0;
+  case 25: // PR_GET_TSC
+    if (arg2 && vmm_is_user_addr_range_writable(arg2, sizeof(int))) {
+      *(int *)arg2 = 1; // PR_TSC_ENABLE
+      return 0;
+    }
+    return (uint64_t)-14;
+  case 26: // PR_SET_TSC
+    return 0;
+  case 29: // PR_SET_TIMERSLACK
+    return 0;
+  case 30: // PR_GET_TIMERSLACK
+    return 50000; // 50 microseconds
+  case 35: { // PR_SET_MM (0x23)
+    if (!current->mm)
+      return 0;
+    if (arg2 == 8 /* PR_SET_MM_ARG_START */) {
+      current->mm->arg_start = arg3;
+    } else if (arg2 == 9 /* PR_SET_MM_ARG_END */) {
+      current->mm->arg_end = arg3;
+    }
+    return 0;
+  }
   case 36: // PR_SET_CHILD_SUBREAPER
     return 0;
   case 37: // PR_GET_CHILD_SUBREAPER
@@ -2078,6 +2329,44 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
   case 38: // PR_SET_NO_NEW_PRIVS
     return 0;
   case 39: // PR_GET_NO_NEW_PRIVS
+    return 0;
+  case 41: // PR_SET_THP_DISABLE
+    return 0;
+  case 42: // PR_GET_THP_DISABLE
+    return 0;
+  case 47: // PR_CAP_AMBIENT
+    switch (arg2) {
+    case 1: // PR_CAP_AMBIENT_IS_SET
+      if (arg3 <= 40)
+        return 0;
+      return (uint64_t)-22;
+    case 2: // PR_CAP_AMBIENT_RAISE
+    case 3: // PR_CAP_AMBIENT_LOWER
+      if (arg3 <= 40)
+        return 0;
+      return (uint64_t)-22;
+    case 4: // PR_CAP_AMBIENT_CLEAR_ALL
+      return 0;
+    default:
+      return (uint64_t)-22;
+    }
+  case 40: // PR_GET_TID_ADDRESS
+    if (arg2 && vmm_is_user_addr_range_writable(arg2, sizeof(uint64_t))) {
+      *(uint64_t *)arg2 = (uint64_t)current->tid_address;
+      return 0;
+    }
+    return (uint64_t)-14;
+  case 52: // PR_GET_SPECULATION_CTRL
+    return 0; // PR_SPEC_NOT_AFFECTED
+  case 53: // PR_SET_SPECULATION_CTRL
+    return 0;
+  case 55: // PR_SET_TAGGED_ADDR_CTRL
+    return 0;
+  case 56: // PR_GET_TAGGED_ADDR_CTRL
+    return 0;
+  case 0x59616d61: // PR_SET_PTRACER
+    return 0;
+  case 0x53564d41: // PR_SET_VMA
     return 0;
   case 0x41555856: { // PR_GET_AUXV (Linux 6.4+)    if (!arg2 || !arg3)
       return (uint64_t)-14; // EFAULT
@@ -2108,8 +2397,12 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     tsc_probe_dump();
     return 0;
   }
-  default:
+  default: {
+    char opt_str[32];
+    snprintf(opt_str, sizeof(opt_str), "option=0x%llx", (unsigned long long)option);
+    sysdiag_record_unimplemented_feature("prctl", opt_str, current, -22);
     return (uint64_t)-22; // EINVAL
+  }
   }
 }
 
@@ -2493,15 +2786,144 @@ static uint64_t sys_getpgrp(struct syscall_regs *regs) {
   return t->pgid;
 }
 
-// sys_rseq implementation (stub)
+// sys_rseq: restartable sequences (Linux rseq(2) ABI).
+//
+// Registration model (matches Linux): each thread registers one 32-byte
+// struct rseq { cpu_id_start, cpu_id, rseq_cs, flags, node_id, mm_cid }.
+// The kernel keeps cpu_id/cpu_id_start/node_id current on every return to
+// user mode (see rseq_update_cpu_id callers in syscall.c / isr.c) and
+// redirects RIP to abort_ip when a preemption/signal/migration interrupts
+// an active critical section (see rseq_maybe_abort).
+//
+// Preemption *between* user instructions always funnels back through a
+// return-to-user path (syscall tail, interrupt return, signal delivery),
+// so no user-memory access happens in sched_schedule() itself, where the
+// runqueue lock is held and IRQs are masked.
+#define RSEQ_LEN 32
+#define RSEQ_FLAG_UNREGISTER 1
+#define RSEQ_CPU_ID_UNINITIALIZED 0xFFFFFFFFu
+#define RSEQ_CS_FLAG_NO_RESTART_ON_PREEMPT 1
+#define RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL 2
+#define RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE 4
+
+struct rseq_cs_abi {
+  uint32_t version;
+  uint32_t flags;
+  uint64_t start_ip;
+  uint64_t post_commit_offset;
+  uint64_t abort_ip;
+};
+
+bool rseq_update_cpu_id(struct thread *t) {
+  if (!t || !t->rseq_addr)
+    return true;
+  struct cpu_info *cpu = cpu_get_current();
+  uint32_t id = cpu ? cpu->cpu_id : 0;
+  uint32_t node = 0;
+  uint32_t mm_cid = 0;
+  // Fault-safe: an unmapped/torn-down rseq area just keeps stale values;
+  // the next successful update fixes it. Offsets per Linux struct rseq:
+  // cpu_id_start@0, cpu_id@4, flags@16, node_id@20, mm_cid@24.
+  unsigned long left = 0;
+  left |= copy_to_user((void *)(t->rseq_addr + 0), &id, sizeof(id));
+  left |= copy_to_user((void *)(t->rseq_addr + 4), &id, sizeof(id));
+  left |= copy_to_user((void *)(t->rseq_addr + 20), &node, sizeof(node));
+  left |= copy_to_user((void *)(t->rseq_addr + 24), &mm_cid, sizeof(mm_cid));
+  return left == 0;
+}
+
+bool rseq_maybe_abort(struct thread *t, uint64_t *rip_inout) {
+  if (!t || !t->rseq_addr || !rip_inout)
+    return false;
+  uint64_t cs_ptr = 0;
+  if (copy_from_user(&cs_ptr, (const void *)(t->rseq_addr + 8),
+                     sizeof(cs_ptr)) != 0)
+    return false;
+  if (!cs_ptr)
+    return false; // Not inside a critical section.
+  struct rseq_cs_abi cs;
+  if (copy_from_user(&cs, (const void *)cs_ptr, sizeof(cs)) != 0)
+    return false;
+  if (cs.version != 0)
+    return false;
+  uint64_t rip = *rip_inout;
+  if (rip < cs.start_ip || rip >= cs.start_ip + cs.post_commit_offset)
+    return false; // Outside the critical section: nothing to abort.
+  if (cs.flags & (RSEQ_CS_FLAG_NO_RESTART_ON_PREEMPT |
+                  RSEQ_CS_FLAG_NO_RESTART_ON_SIGNAL |
+                  RSEQ_CS_FLAG_NO_RESTART_ON_MIGRATE))
+    return false; // Userspace asked to handle this event itself.
+  if (t->rseq_sig != 0) {
+    uint32_t sig_at_abort = 0;
+    if (copy_from_user(&sig_at_abort, (const void *)cs.abort_ip,
+                       sizeof(sig_at_abort)) != 0)
+      return false;
+    if (sig_at_abort != t->rseq_sig)
+      return false; // Signature mismatch: refuse to redirect.
+  }
+  uint64_t zero = 0;
+  copy_to_user((void *)(t->rseq_addr + 8), &zero, sizeof(zero));
+  *rip_inout = cs.abort_ip;
+  return true;
+}
+
 uint64_t sys_rseq(struct syscall_regs *regs) {
-  (void)regs;
-  // AvoryOS does not maintain kernel restartable sequences.
-  // Returning 0 causes glibc 2.35+ / 2.42 to believe rseq is registered,
-  // but rseq_area.cpu_id remains -1 (RSEQ_CPU_ID_UNINITIALIZED), causing
-  // glibc tcache/malloc or locks to hang/spin indefinitely.
-  // Returning -ENOSYS allows glibc to cleanly disable rseq and fallback.
-  return (uint64_t)-38; // -ENOSYS
+  uint64_t addr = regs->rdi;
+  uint64_t len = regs->rsi;
+  uint64_t flags = regs->rdx;
+  uint64_t sig = regs->r10; // 4th syscall arg arrives in r10, not rcx.
+  struct thread *current = sched_get_current();
+  if (!current)
+    return (uint64_t)-14; // EFAULT: no thread to register for.
+
+  if (flags & (uint64_t)~(uint64_t)RSEQ_FLAG_UNREGISTER)
+    return (uint64_t)-22; // EINVAL: unknown flags.
+
+  if (flags & RSEQ_FLAG_UNREGISTER) {
+    // Idempotent: unregistering when nothing is registered succeeds.
+    current->rseq_addr = 0;
+    current->rseq_len = 0;
+    current->rseq_sig = 0;
+    return 0;
+  }
+
+  if (len != RSEQ_LEN)
+    return (uint64_t)-22; // EINVAL: struct rseq is 32 bytes.
+  if (addr & 31)
+    return (uint64_t)-22; // EINVAL: 32-byte alignment required.
+  if (!vmm_is_user_addr_range_writable(addr, RSEQ_LEN))
+    return (uint64_t)-14; // EFAULT.
+  if (current->rseq_addr && current->rseq_addr != addr)
+    return (uint64_t)-16; // EBUSY: already registered elsewhere.
+
+  current->rseq_addr = addr;
+  current->rseq_len = RSEQ_LEN;
+  current->rseq_sig = (uint32_t)sig;
+
+  // Publish the initial state so glibc never observes UNINITIALIZED:
+  // flags/node/mm_cid zero, cpu ids = current CPU. Every copy is checked:
+  // returning 0 while leaving cpu_id == UNINITIALIZED makes glibc abort
+  // with the same "rseq registration failed" message as a syscall error.
+  {
+    uint32_t zero = 0;
+    unsigned long left = 0;
+    left |= copy_to_user((void *)(addr + 16), &zero, sizeof(zero)); // flags
+    left |= copy_to_user((void *)(addr + 20), &zero, sizeof(zero)); // node_id
+    left |= copy_to_user((void *)(addr + 24), &zero, sizeof(zero)); // mm_cid
+    if (left != 0) {
+      current->rseq_addr = 0;
+      current->rseq_len = 0;
+      current->rseq_sig = 0;
+      return (uint64_t)-14; // EFAULT.
+    }
+  }
+  if (!rseq_update_cpu_id(current)) {
+    current->rseq_addr = 0;
+    current->rseq_len = 0;
+    current->rseq_sig = 0;
+    return (uint64_t)-14; // EFAULT: could not publish cpu_id.
+  }
+  return 0;
 }
 
 // sys_setsid
@@ -2511,13 +2933,19 @@ static uint64_t sys_setsid(struct syscall_regs *regs) {
   if (!current)
     return (uint64_t)-1;
 
-  // POSIX: A process group leader cannot create a new session
-  if (current->tid == current->pgid) {
-    return (uint64_t)-1; // EPERM
+  // POSIX: setsid() operates on the calling *process* (thread group), not an
+  // individual thread. Use tgid (== tid for the group leader/single-threaded
+  // case) so a non-leader thread of a group-leader process still gets EPERM.
+  uint32_t pid = current->tgid ? current->tgid : current->tid;
+  // POSIX: A process group leader cannot create a new session.
+  // PID 1 (init) is pgid 1 by design (see kernel.c), so setsid() from init
+  // correctly returns -EPERM; callers are expected to fork first.
+  if (pid == current->pgid) {
+    return (uint64_t)-1; // -EPERM
   }
 
-  current->sid = current->tid;
-  current->pgid = current->tid;
+  current->sid = pid;
+  current->pgid = pid;
   current->ctty = NULL; // Clear controlling terminal
 
   klog_debugf("[SETSID] New session created: %llu\n", (unsigned long long)current->sid);
@@ -2718,6 +3146,9 @@ static uint64_t sys_getrlimit(uint64_t resource, uint64_t rlim_ptr, uint64_t a2,
   } else if (resource == 4) { // RLIMIT_CORE (default 0 on Linux)
     r->rlim_cur = 0;
     r->rlim_max = RLIM_INFINITY;
+  } else if (resource == 3) { // RLIMIT_STACK (default 8MB on Linux)
+    r->rlim_cur = 8 * 1024 * 1024;
+    r->rlim_max = 8 * 1024 * 1024;
   }
 
   return 0;
@@ -2746,6 +3177,9 @@ static uint64_t sys_prlimit64(struct syscall_regs *regs) {
     } else if (resource == 4) { // RLIMIT_CORE
       old_limit->rlim_cur = 0;
       old_limit->rlim_max = RLIM_INFINITY;
+    } else if (resource == 3) { // RLIMIT_STACK (default 8MB on Linux)
+      old_limit->rlim_cur = 8 * 1024 * 1024;
+      old_limit->rlim_max = 8 * 1024 * 1024;
     }
   }
 
@@ -3147,9 +3581,124 @@ static uint64_t sys_getpriority(uint64_t which, uint64_t who, uint64_t a2,
   return (uint64_t)(20 - target->nice_value);
 }
 
+// ioprio_set (251) / ioprio_get (252).
+// There is no block-I/O scheduler here, so priorities are validated for
+// Linux-correct errors and otherwise accepted as no-ops; get reports the
+// default best-effort/4. baloo_file sets IDLE on its indexer at startup and
+// treats anything but success as fatal, so ENOSYS here breaks file indexing.
+#define IOPRIO_WHO_PROCESS 1
+#define IOPRIO_WHO_PGRP 2
+#define IOPRIO_WHO_USER 3
+#define IOPRIO_CLASS_RT 1
+#define IOPRIO_CLASS_BE 2
+#define IOPRIO_CLASS_IDLE 3
+#define IOPRIO_DEFAULT_PRIO ((IOPRIO_CLASS_BE << 13) | 4)
+
+static uint64_t sys_ioprio_set(uint64_t which, uint64_t who, uint64_t ioprio,
+                               uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a3; (void)a4; (void)a5;
+  if (which < IOPRIO_WHO_PROCESS || which > IOPRIO_WHO_USER)
+    return (uint64_t)-22;
+  uint64_t cls = ioprio >> 13;
+  uint64_t data = ioprio & 0x1FFF;
+  if (cls > IOPRIO_CLASS_IDLE)
+    return (uint64_t)-22;
+  if ((cls == IOPRIO_CLASS_RT || cls == IOPRIO_CLASS_BE) && data > 7)
+    return (uint64_t)-22;
+  struct thread *current = sched_get_current();
+  if (which == IOPRIO_WHO_PROCESS && who != 0) {
+    struct thread *target = sched_get_thread_by_tid((uint32_t)who);
+    if (!target) return (uint64_t)-3;
+    if (current && current->euid != 0 && current->uid != target->uid &&
+        current->euid != target->uid) return (uint64_t)-1;
+  }
+  if (cls == IOPRIO_CLASS_RT && current && current->euid != 0)
+    return (uint64_t)-1; // RT I/O class needs privilege, as on Linux
+  return 0;
+}
+
+static uint64_t sys_ioprio_get(uint64_t which, uint64_t who, uint64_t a2,
+                               uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a2; (void)a3; (void)a4; (void)a5;
+  if (which < IOPRIO_WHO_PROCESS || which > IOPRIO_WHO_USER)
+    return (uint64_t)-22;
+  if (which == IOPRIO_WHO_PROCESS && who != 0 &&
+      !sched_get_thread_by_tid((uint32_t)who))
+    return (uint64_t)-3;
+  return (uint64_t)IOPRIO_DEFAULT_PRIO;
+}
+
 /* sizeof(struct robust_list_head) on x86-64: list.next, futex_offset and
  * list_op_pending.  Linux rejects every other length with EINVAL. */
 #define ROBUST_LIST_HEAD_LEN 24
+#define ROBUST_MAX_WALK 4096
+
+static void robust_handle_futex_death(uint64_t futex_uaddr, uint32_t dying_tid) {
+  if (!vmm_is_user_addr_range_writable(futex_uaddr, sizeof(uint32_t)))
+    return;
+  if (futex_uaddr & 3)
+    return;
+  uint32_t *uaddr = (uint32_t *)futex_uaddr;
+  for (;;) {
+    uint32_t cur = __atomic_load_n(uaddr, __ATOMIC_ACQUIRE);
+    if ((cur & 0x3fffffff) != dying_tid)
+      return; // Not owned by the dying thread.
+    uint32_t newv = (cur & 0x80000000) | 0x40000000; // keep WAITERS, set OWNER_DIED
+    uint32_t expected = cur;
+    if (__atomic_compare_exchange_n(uaddr, &expected, newv, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      futex_wake_user(uaddr, 1);
+      return;
+    }
+  }
+}
+
+static void robust_handle_death(struct thread *t) {
+  if (!t)
+    return;
+  uint64_t head_addr = t->robust_list;
+  if (!head_addr)
+    return;
+  t->robust_list = 0; // Prevent double handling on re-entry.
+  // Verified musl ABI (pthread_impl.h: _m_lock=__vi[1] off 4,
+  // _m_next=__p[4] off 32; pthread_create.c sets off=-28 and processes
+  // private/detached lists in userspace, leaving pshared for the kernel).
+  // Sanity range below still guards corrupted heads.
+  if (!vmm_is_user_addr_range_valid(head_addr, ROBUST_LIST_HEAD_LEN))
+    return;
+  uint64_t head_next = 0;
+  uint64_t futex_offset_u = 0;
+  uint64_t pending = 0;
+  if (copy_from_user(&head_next, (const void *)head_addr, 8) != 0)
+    return;
+  if (copy_from_user(&futex_offset_u, (const void *)(head_addr + 8), 8) != 0)
+    return;
+  if (copy_from_user(&pending, (const void *)(head_addr + 16), 8) != 0)
+    return;
+  int64_t futex_offset = (int64_t)futex_offset_u;
+  // Corrupted heads (e.g. UAF) yield wild offsets; Linux offsets are tiny
+  // (futex word inside the mutex). Refuse to walk instead of CASing heap.
+  if (futex_offset < -32768 || futex_offset > 32768)
+    return;
+  uint32_t dying_tid = t->tid;
+  // Lock operation in progress at death: handle it first, like Linux.
+  if (pending && pending != head_addr &&
+      vmm_is_user_addr_range_valid(pending, 8)) {
+    uint64_t futex_uaddr = pending + (uint64_t)futex_offset;
+    robust_handle_futex_death(futex_uaddr, dying_tid);
+  }
+  uint64_t entry = head_next;
+  for (int i = 0; i < ROBUST_MAX_WALK && entry && entry != head_addr; i++) {
+    if (!vmm_is_user_addr_range_valid(entry, 8))
+      break;
+    uint64_t next = 0;
+    if (copy_from_user(&next, (const void *)entry, 8) != 0)
+      break;
+    uint64_t futex_uaddr = entry + (uint64_t)futex_offset;
+    robust_handle_futex_death(futex_uaddr, dying_tid);
+    entry = next;
+  }
+}
 
 static uint64_t sys_set_robust_list(uint64_t head, uint64_t len, uint64_t a2,
                                     uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -3359,6 +3908,10 @@ static uint64_t sys_swapon(uint64_t path_ptr, uint64_t flags, uint64_t a2,
 // Structures mirror the Linux uapi/linux/capability.h layout (version 3 = V3).
 // ---------------------------------------------------------------------------
 
+#define _LINUX_CAPABILITY_VERSION_1 0x19980330
+#define _LINUX_CAPABILITY_U32S_1    1
+#define _LINUX_CAPABILITY_VERSION_2 0x20071026
+#define _LINUX_CAPABILITY_U32S_2    2
 #define _LINUX_CAPABILITY_VERSION_3 0x20080522
 #define _LINUX_CAPABILITY_U32S_3    2
 
@@ -3386,23 +3939,33 @@ static uint64_t sys_capget(uint64_t hdrp_arg, uint64_t datap_arg,
   if (!vmm_is_user_addr_range_valid((uint64_t)hdrp, sizeof(*hdrp)))
     return (uint64_t)-14; // EFAULT
 
-  // Normalise version: write back V3 so the caller knows what we support.
   uint32_t version = hdrp->version;
-  if (version != _LINUX_CAPABILITY_VERSION_3) {
+  int tocopy = _LINUX_CAPABILITY_U32S_3;
+
+  switch (version) {
+  case _LINUX_CAPABILITY_VERSION_1:
+    tocopy = _LINUX_CAPABILITY_U32S_1;
+    break;
+  case _LINUX_CAPABILITY_VERSION_2:
+  case _LINUX_CAPABILITY_VERSION_3:
+    tocopy = _LINUX_CAPABILITY_U32S_3;
+    break;
+  default:
     hdrp->version = _LINUX_CAPABILITY_VERSION_3;
-    if (!datap)
-      return (uint64_t)-22; // EINVAL — caller must re-issue with correct version
+    return (uint64_t)-22; // EINVAL — unsupported version
   }
+
+  hdrp->version = _LINUX_CAPABILITY_VERSION_3;
 
   if (!datap)
     return 0;
 
   if (!vmm_is_user_addr_range_valid((uint64_t)datap,
-                                     sizeof(*datap) * _LINUX_CAPABILITY_U32S_3))
+                                     sizeof(*datap) * tocopy))
     return (uint64_t)-14; // EFAULT
 
-  // Grant all capabilities in both 32-bit words (caps 0-63).
-  for (int i = 0; i < _LINUX_CAPABILITY_U32S_3; i++) {
+  // Grant all capabilities in requested words
+  for (int i = 0; i < tocopy; i++) {
     datap[i].effective   = 0xFFFFFFFFu;
     datap[i].permitted   = 0xFFFFFFFFu;
     datap[i].inheritable = 0xFFFFFFFFu;
@@ -3460,16 +4023,39 @@ static uint64_t sys_seccomp(uint64_t op, uint64_t flags, uint64_t uargs,
 }
 
 // sys_unshare (272)
-// Namespaces are unsupported in AvoryOS. Returning -ENOSYS tells bwrap,
-// container runtimes, and WebKit that unprivileged user/mount namespaces
-// are unavailable so they can fail gracefully or fallback to direct execution.
+// AvoryOS has no namespace isolation: fail namespace flags with EPERM so
+// sandbox tools (bwrap/glycin/WebKit) fall back to unsandboxed execution
+// instead of entering a half-sandbox that fails hard later (glycin exit 1
+// -> libwnck base abort). Matches Linux with userns disabled.
 static uint64_t sys_unshare(uint64_t flags, uint64_t a2, uint64_t a3,
                             uint64_t a4, uint64_t a5, uint64_t a6) {
   (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+  uint64_t known = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS |
+                   CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID |
+                   CLONE_NEWNET | CLONE_NEWTIME | CLONE_SYSVSEM |
+                   CLONE_FILES | CLONE_FS;
+
+  if (flags & ~known) {
+    klog_puts("[SYSCALL] unshare: unknown flags=0x");
+    klog_hex64(flags);
+    klog_puts(" -> EINVAL\n");
+    return (uint64_t)-22; // EINVAL
+  }
+
+  uint64_t ns_flags = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS |
+                      CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID |
+                      CLONE_NEWNET | CLONE_NEWTIME;
+  if (flags & ns_flags) {
+    klog_puts("[SYSCALL] unshare: flags=0x");
+    klog_hex64(flags);
+    klog_puts(" -> EPERM (namespaces unsupported, sandbox fallback)\n");
+    return (uint64_t)-1; // EPERM
+  }
+
   klog_puts("[SYSCALL] unshare: flags=0x");
   klog_hex64(flags);
-  klog_puts(" -> ENOSYS\n");
-  return (uint64_t)-38; // -ENOSYS
+  klog_puts(" -> OK\n");
+  return 0;
 }
 
 void syscall_register_process(void) {
@@ -3537,6 +4123,8 @@ void syscall_register_process(void) {
   syscall_register(SYS_SCHED_SETSCHEDULER, sys_sched_setscheduler);
   syscall_register(SYS_SETPRIORITY, sys_setpriority);
   syscall_register(SYS_GETPRIORITY, sys_getpriority);
+  syscall_register(SYS_IOPRIO_SET, sys_ioprio_set);
+  syscall_register(SYS_IOPRIO_GET, sys_ioprio_get);
   syscall_register(SYS_SET_ROBUST_LIST, sys_set_robust_list);
   syscall_register(SYS_GET_ROBUST_LIST, sys_get_robust_list);
   syscall_register(SYS_REBOOT, sys_reboot);
@@ -3544,6 +4132,8 @@ void syscall_register_process(void) {
   syscall_register(SYS_DELETE_MODULE, sys_delete_module);
   syscall_register(SYS_SWAPON, sys_swapon);
   syscall_register(SYS_PIDFD_OPEN, sys_pidfd_open);
+  syscall_register(SYS_PIDFD_SEND_SIGNAL, sys_pidfd_send_signal);
+  syscall_register(SYS_PIDFD_GETFD, sys_pidfd_getfd);
   syscall_register(SYS_GETCPU, sys_getcpu);
   syscall_register(SYS_CAPGET, sys_capget);
   syscall_register(SYS_CAPSET, sys_capset);

@@ -29,6 +29,15 @@ struct block_device {
     char name[16];              // e.g. "ata0", "ata1"
     uint32_t sector_size;       // Usually 512
     uint64_t total_sectors;     // Total number of sectors on the device
+    /* Linux-compatible major:minor for this device. Assigned once in
+     * block_register() and never changed: NVMe devices use major 259 like
+     * Linux, everything else uses major 8. Minor is the registration index,
+     * unique across whole disks and partitions. All of sysfs dev, proc
+     * partitions, diskstats, mountinfo and stat st_rdev/st_dev must agree
+     * on these numbers or UDisks2/Solid cannot match a mount to its block
+     * device and Plasma Disk Usage widget stays at 0 B. */
+    uint32_t linux_major;
+    uint32_t linux_minor;
     int (*read_sectors)(struct block_device *dev, uint64_t lba, uint32_t count, void *buf);
     int (*write_sectors)(struct block_device *dev, uint64_t lba, uint32_t count, const void *buf);
     // Optional: write with FUA (force unit access) so the device makes the
@@ -37,6 +46,19 @@ struct block_device {
     int (*write_sectors_fua)(struct block_device *dev, uint64_t lba, uint32_t count, const void *buf);
     int (*flush)(struct block_device *dev);
     void *driver_data;          // Opaque pointer for the specific driver
+
+    /* I/O statistics for /proc/diskstats (all in 512-byte sector units,
+     * matching Linux which always reports 512B units regardless of the
+     * hardware sector size). Updated with lock-free atomics at the driver
+     * entry points, so no per-device lock is needed. Partition devices
+     * count their own I/O while the parent counts the same request again
+     * when the partition wrapper forwards it — exactly like Linux, which
+     * accounts both the partition and the whole disk. Zero-initialized
+     * with the rest of the struct by every driver (memset). */
+    uint64_t stat_reads;        // completed read operations
+    uint64_t stat_read_sectors; // 512B sectors read
+    uint64_t stat_writes;       // completed write operations
+    uint64_t stat_write_sectors;// 512B sectors written
 
     // Partition metadata (if this device is a partition)
     char partuuid[37];          // Null-terminated PARTUUID string
@@ -60,6 +82,29 @@ int block_flush(struct block_device *dev);
 int block_write_fua(struct block_device *dev, uint64_t lba, uint32_t count,
                     const void *buf);
 
+// Account one completed I/O on `dev` for /proc/diskstats. `count` is in
+// units of the device's own sector size; statistics are kept in
+// Linux-compatible 512-byte units. Call only on success from the driver
+// read/write entry points (and the partition wrappers); lock-free atomics
+// mean no per-device lock is needed.
+static inline void block_stat_read(struct block_device *dev, uint32_t count) {
+  if (!dev || count == 0)
+    return;
+  uint64_t s512 =
+      (uint64_t)count * (dev->sector_size ? dev->sector_size : 512) / 512;
+  __atomic_add_fetch(&dev->stat_reads, 1, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&dev->stat_read_sectors, s512, __ATOMIC_RELAXED);
+}
+
+static inline void block_stat_write(struct block_device *dev, uint32_t count) {
+  if (!dev || count == 0)
+    return;
+  uint64_t s512 =
+      (uint64_t)count * (dev->sector_size ? dev->sector_size : 512) / 512;
+  __atomic_add_fetch(&dev->stat_writes, 1, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&dev->stat_write_sectors, s512, __ATOMIC_RELAXED);
+}
+
 // Create and register a partition on a parent block device.
 // part_index is 1-based (e.g. 1 for sda1).
 // Returns 0 on success, negative on error.
@@ -73,6 +118,15 @@ int block_add_partition_ex(struct block_device *parent, int part_index,
 
 // Lookup a block device by PARTUUID (case-insensitive)
 struct block_device *block_find_by_partuuid(const char *uuid);
+
+// Lookup a block device by name. Accepts both bare names ("nvme0n1p1") and
+// full dev paths ("/dev/nvme0n1p1"). Returns NULL when not found.
+struct block_device *block_get_by_name(const char *name);
+
+// Userspace dev_t (glibc/musl sysmacros encoding) for stat()->st_rdev/st_dev:
+// (minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12). Matches the
+// kpi_userspace_devt() convention used by every native chardev.
+uint32_t block_device_userspace_rdev(const struct block_device *dev);
 
 // Lookup a block device by PARTLABEL (exact match)
 struct block_device *block_find_by_partlabel(const char *label);

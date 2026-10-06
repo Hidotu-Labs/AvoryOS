@@ -4,6 +4,7 @@
 #include "../../../console/klog.h"
 #include "../../../cpu/tsc.h"
 #include "../../../fb/framebuffer.h"
+#include "../../../fb/vblank.h"
 #include "../../../fs/ramfs.h"
 #include "../../../lib/string.h"
 #include "../../../mm/heap.h"
@@ -86,14 +87,14 @@ extern void ascentdrm_framebuffer_free(struct drm_device *dev,
                                  struct drm_framebuffer *fb);
 extern void epoll_notify_event(struct vfs_node *node, uint32_t events);
 
-static uint32_t drm_event_sequence = 1;
-
 static void drm_fill_vblank_event(struct drm_event_vblank *ev,
                                   uint32_t crtc_id) {
-  uint64_t ms = lapic_timer_get_ms();
-  ev->tv_sec = (uint32_t)(ms / 1000);
-  ev->tv_usec = (uint32_t)((ms % 1000) * 1000);
-  ev->sequence = drm_event_sequence++;
+  uint32_t seq = vblank_sequence();
+  uint32_t sec, usec;
+  vblank_timestamp(seq, &sec, &usec);
+  ev->tv_sec = sec;
+  ev->tv_usec = usec;
+  ev->sequence = seq;
   ev->crtc_id = crtc_id;
 }
 
@@ -113,6 +114,8 @@ extern void ascentdrm_file_free(struct drm_file *file);
 extern uint32_t ascentdrm_file_gem_register(struct drm_file *file,
                                       struct drm_gem_object *obj);
 extern struct drm_gem_object *ascentdrm_file_gem_lookup(struct drm_file *file,
+                                                  uint32_t handle);
+extern struct drm_gem_object *ascentdrm_file_gem_lookup_get(struct drm_file *file,
                                                   uint32_t handle);
 extern void ascentdrm_file_gem_release(struct drm_file *file, uint32_t handle);
 extern void ascentdrm_file_send_event(struct drm_file *file,
@@ -1451,7 +1454,9 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       ascentdrm_gem_object_free(dev, obj);
       return -12;
     }
-    obj->refcount--; /* transfer creator ownership to the handle */
+    /* Transfer creator ownership to the handle: register took its own ref
+     * (1 -> 2), so drop the creator ref (2 -> 1, never last here). */
+    __atomic_fetch_sub(&obj->refcount, 1, __ATOMIC_ACQ_REL);
     c->handle = local_h;
     klog_debug_puts("[DRM] GEM_CREATE size=");
     klog_debug_uint64(c->size);
@@ -1492,7 +1497,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       if (rc != 0 || !obj) return rc ? rc : -12;
       uint32_t local_h = ascentdrm_file_gem_register(file, obj);
       if (!local_h) { ascentdrm_gem_object_free(dev, obj); return -12; }
-      obj->refcount--; /* transfer creator ownership to the handle */
+      __atomic_fetch_sub(&obj->refcount, 1, __ATOMIC_ACQ_REL);
       c->pitch = c->width * (c->bpp / 8);
       c->size = obj->size;
       c->handle = local_h;
@@ -1510,7 +1515,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       ascentdrm_gem_object_free(dev, obj);
       return -12;
     }
-    obj->refcount--; /* transfer creator ownership to the handle */
+    __atomic_fetch_sub(&obj->refcount, 1, __ATOMIC_ACQ_REL);
     c->handle = local_h;
     klog_debug_puts("[DRM] CREATE_DUMB out handle=");
     klog_debug_uint64(c->handle);
@@ -1911,7 +1916,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     klog_debug_puts("[DRM] ADDFB out fb_id=");
     klog_debug_uint64(cmd->fb_id);
     klog_debug_puts(" gem_phys=0x");
-    klog_debug_hex64(gem->phys_addr);
+    klog_debug_hex64(fb->gem_obj ? fb->gem_obj->phys_addr : 0);
     klog_debug_puts("\n");
     return 0;
   }
@@ -1964,6 +1969,8 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       if (g_ascent_drm_set_fb_fn)
         g_ascent_drm_set_fb_fn(crtc->base.id, crtc->fb);
     }
+    if (crtc_cmd->mode_valid && crtc_cmd->mode.vrefresh)
+      vblank_set_refresh_hz(crtc_cmd->mode.vrefresh);
     spinlock_release(&dev->lock);
     drm_console_takeover();
     drm_commit_flipped_crtc(dev, crtc_cmd->crtc_id);
@@ -2003,8 +2010,13 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       spinlock_release(&dev->lock);
       drm_console_takeover();
       drm_commit_flipped_crtc(dev, flip->crtc_id);
-      /* If no virtio hook took ownership, deliver event via legacy path */
+      /* If no virtio hook took ownership, deliver event via legacy path.
+       * Pace the event to the next vblank boundary: without this the
+       * completion fires the instant the blit finishes and compositors
+       * present uncapped. An interrupted wait still delivers the event;
+       * the flip already happened, so failing the ioctl would lie. */
       if (!g_ascent_drm_pageflip_fn) {
+        vblank_wait_next();
         struct drm_event_vblank ev = {0};
         ev.base.type = DRM_EVENT_FLIP_COMPLETE;
         ev.base.length = sizeof(ev);
@@ -2065,10 +2077,13 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   /* ── GEM PRIME / DMA-buf ─────────────────────────────────────────── */
   case DRM_IOCTL_PRIME_HANDLE_TO_FD: {
     struct drm_prime_handle *p = (struct drm_prime_handle *)arg;
-    struct drm_gem_object *obj = ascentdrm_file_gem_lookup(file, p->handle);
+    struct drm_gem_object *obj = ascentdrm_file_gem_lookup_get(file, p->handle);
     if (!obj)
       return -2; /* ENOENT */
     int prime_fd = ascentdrm_prime_export(obj);
+    /* Drop the lookup reference; the exported fd holds its own. */
+    if (ascentdrm_gem_put_last(obj))
+      ascentdrm_gem_object_free(dev, obj);
     if (prime_fd < 0)
       return -1; /* generic error for now */
     p->fd = prime_fd;
@@ -2089,9 +2104,8 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   case DRM_IOCTL_WAIT_VBLANK: {
     union drm_wait_vblank *vbl = (union drm_wait_vblank *)arg;
     uint32_t type = vbl->request.type;
+    uint32_t req_seq = vbl->request.sequence;
     uint64_t user_data = vbl->request.signal;
-    uint64_t ms = lapic_timer_get_ms();
-    uint32_t seq = drm_event_sequence++;
 #if DRM_DEBUG_LOGGING
     klog_debug_puts("[DRM] WAIT_VBLANK type=0x");
     klog_debug_hex32(type);
@@ -2099,21 +2113,109 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     klog_debug_uint64(vbl->request.sequence);
     klog_debug_puts("\n");
 #endif
+    /* Sequence targets follow Linux rules: RELATIVE counts from the current
+     * boundary, ABSOLUTE names one; an already-passed target returns the
+     * current count immediately instead of hanging. Far-future targets are
+     * clamped to ~10s out so garbage cannot wedge the caller (signals still
+     * break the wait early). Previously this replied instantly with a fresh
+     * made-up sequence, so nothing ever throttled on it. */
+    uint32_t cur = vblank_sequence();
+    uint32_t target;
+    if (type & DRM_VBLANK_RELATIVE)
+      target = cur + (req_seq & 0x00ffffff);
+    else
+      target = req_seq;
+    int64_t wrc = 0;
+    if ((int32_t)(target - cur) > 0) {
+      if ((int32_t)(target - cur) > 600)
+        target = cur + 600;
+      wrc = vblank_wait_for(target);
+    }
+    uint32_t seq = vblank_sequence();
+    uint32_t sec, usec;
+    vblank_timestamp(seq, &sec, &usec);
     vbl->reply.type = type;
     vbl->reply.sequence = seq;
-    vbl->reply.tval_sec = (long)(ms / 1000);
-    vbl->reply.tval_usec = (long)((ms % 1000) * 1000);
+    vbl->reply.tval_sec = (long)sec;
+    vbl->reply.tval_usec = (long)usec;
     if (type & DRM_VBLANK_EVENT) {
+      /* No vblank IRQ exists to deliver this asynchronously, so the event
+       * carries the boundary we just waited for and is queued before return.
+       * Slightly early relative to true async delivery, but sequenced and
+       * timestamped correctly. */
       struct drm_event_vblank ev = {0};
       ev.base.type = DRM_EVENT_VBLANK;
       ev.base.length = sizeof(ev);
       ev.user_data = user_data;
-      ev.tv_sec = (uint32_t)vbl->reply.tval_sec;
-      ev.tv_usec = (uint32_t)vbl->reply.tval_usec;
+      ev.tv_sec = sec;
+      ev.tv_usec = usec;
       ev.sequence = seq;
       ev.crtc_id = 0;
       ascentdrm_file_send_event(file, &ev, node);
     }
+    return wrc == 0 ? 0 : -4; /* EINTR when a signal broke the wait */
+  }
+
+  case DRM_IOCTL_CRTC_GET_SEQUENCE: {
+    struct drm_crtc_get_sequence *s = (struct drm_crtc_get_sequence *)arg;
+    spinlock_acquire(&dev->lock);
+    struct drm_mode_object *mobj = drm_mode_object_find(dev, s->crtc_id);
+    if (!mobj || mobj->type != DRM_MODE_OBJECT_CRTC) {
+      spinlock_release(&dev->lock);
+      return -2; /* ENOENT: unknown CRTC, same as GETCONNECTOR */
+    }
+    uint32_t active = ((struct drm_crtc *)mobj)->fb ? 1 : 0;
+    spinlock_release(&dev->lock);
+    /* Sequence and timestamp come from the same software vblank engine
+     * that backs WAIT_VBLANK, so the two ioctls agree with each other. */
+    uint32_t seq = vblank_sequence();
+    uint32_t sec, usec;
+    vblank_timestamp(seq, &sec, &usec);
+    s->active = active;
+    s->sequence = seq;
+    s->sequence_ns = (uint64_t)sec * 1000000000ULL + (uint64_t)usec * 1000ULL;
+    return 0;
+  }
+
+  case DRM_IOCTL_CRTC_QUEUE_SEQUENCE: {
+    struct drm_crtc_queue_sequence *q = (struct drm_crtc_queue_sequence *)arg;
+    if (q->flags &
+        ~(DRM_CRTC_SEQUENCE_RELATIVE | DRM_CRTC_SEQUENCE_NEXT_ON_MISS))
+      return -22; /* EINVAL */
+    spinlock_acquire(&dev->lock);
+    struct drm_mode_object *mobj = drm_mode_object_find(dev, q->crtc_id);
+    if (!mobj || mobj->type != DRM_MODE_OBJECT_CRTC) {
+      spinlock_release(&dev->lock);
+      return -2; /* ENOENT */
+    }
+    if (!((struct drm_crtc *)mobj)->fb) {
+      spinlock_release(&dev->lock);
+      return -22; /* EINVAL: CRTC off, like Linux vblank_get */
+    }
+    spinlock_release(&dev->lock);
+    uint32_t cur = vblank_sequence();
+    uint64_t target = q->sequence;
+    if (q->flags & DRM_CRTC_SEQUENCE_RELATIVE)
+      target = (uint64_t)cur + (q->sequence & 0x00ffffff);
+    if ((q->flags & DRM_CRTC_SEQUENCE_NEXT_ON_MISS) &&
+        (int64_t)(target - cur) <= 0)
+      target = (uint64_t)cur + 1;
+    /* No vblank IRQ exists to arm against, and the boundary clock only
+     * moves forward, so deliver the event synchronously with the queued
+     * sequence — same approach as WAIT_VBLANK_EVENT above. */
+    uint32_t tseq = (uint32_t)target;
+    uint32_t sec, usec;
+    vblank_timestamp(tseq, &sec, &usec);
+    struct drm_event_vblank ev = {0};
+    ev.base.type = DRM_EVENT_VBLANK;
+    ev.base.length = sizeof(ev);
+    ev.user_data = q->user_data;
+    ev.tv_sec = sec;
+    ev.tv_usec = usec;
+    ev.sequence = tseq;
+    ev.crtc_id = q->crtc_id;
+    ascentdrm_file_send_event(file, &ev, node);
+    q->sequence = target;
     return 0;
   }
 
@@ -2409,14 +2511,28 @@ static uint32_t drm_read(struct vfs_node *node, uint32_t offset,
 
   spinlock_acquire(&file->lock);
   while (list_empty(&file->event_queue)) {
-    spinlock_release(&file->lock);
     struct thread *current = sched_get_current();
-    wait_queue_entry_t entry = {.thread = current, .next = NULL};
+    wait_queue_entry_t entry = {.thread = current, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
+    if (current)
+      current->state = THREAD_BLOCKED;
+    /* file->lock held across add+recheck: event delivery takes the same
+     * lock before waking, so no wake can slip between. */
     wait_queue_add(&file->event_wq, &entry);
-    current->state = THREAD_BLOCKED;
+    if (!list_empty(&file->event_queue)) {
+      if (current)
+        current->state = THREAD_RUNNING;
+      spinlock_release(&file->lock);
+      wait_queue_remove(&file->event_wq, &entry);
+      if (current && current->state == THREAD_BLOCKED)
+        current->state = THREAD_RUNNING;
+      spinlock_acquire(&file->lock);
+      continue;
+    }
+    spinlock_release(&file->lock);
     sched_yield();
     wait_queue_remove(&file->event_wq, &entry);
-    current->state = THREAD_RUNNING;
+    if (current && current->state == THREAD_BLOCKED)
+      current->state = THREAD_RUNNING;
     spinlock_acquire(&file->lock);
   }
 
@@ -2554,7 +2670,7 @@ void ascentdrm_init(void) {
       fb_obj->phys_addr = fb_phys;
       fb_obj->virt_addr = fb_base;
       fb_obj->cache_mode = DRM_GEM_CACHE_WC;
-      fb_obj->refcount = 1;
+      __atomic_store_n(&fb_obj->refcount, 1, __ATOMIC_RELAXED);
       fb_obj->handle = 0xF0B0;
       spinlock_acquire(&global_ascentdrm_dev.lock);
       list_add_tail(&fb_obj->list, &global_ascentdrm_dev.gem_objects);

@@ -209,18 +209,6 @@ static int write_all_fd(int fd, const unsigned char *buf, size_t len)
     return 0;
 }
 
-static int write_slice(const char *path, const unsigned char *buf,
-                       size_t off, size_t len)
-{
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0)
-        return -1;
-    int rc = write_all_fd(fd, buf + off, len);
-    if (close(fd) < 0 && rc == 0)
-        rc = -1;
-    return rc;
-}
-
 static void index_path(const char *branch, const char *repo,
                        char *out, size_t out_sz)
 {
@@ -497,49 +485,83 @@ static int install_path_safe(const char *name)
 
 static int extract_data_stream(const char *apk, const char *tar_path)
 {
-    unsigned char *buf = NULL;
-    size_t len = 0;
-    if (read_all(apk, &buf, &len) < 0) {
-        fprintf(stderr, "[apm] cannot read APK\n");
-        return -1;
-    }
+    /*
+     * Modern Alpine APKs are a single gzip-compressed tarball containing
+     * .SIGN.*, .PKGINFO and the payload (verified with xeyes-1.3.0-r0.apk:
+     * one gzip member, `gzip -dc` -> tar with .SIGN/.PKGINFO/usr/...).
+     * Older APKs are 3 concatenated gzip streams (signature + control +
+     * data); `gzip -dc` concatenates them and `tar --ignore-zeros` skips
+     * the inter-stream padding (see scripts/setup-arch.sh).
+     *
+     * The previous implementation brute-forced every 0x1f8b offset from the
+     * end and validated each slice. Deflate data routinely contains bytes
+     * that look like gzip headers, so it picked truncated inner slices
+     * (missing leading members) on GNU toolchains and failed entirely on
+     * busybox (stricter gzip/tar) with "could not locate a valid APK data
+     * tar stream". It was also O(n^2) I/O: an 8MB package means millions
+     * of slice+fork+exec iterations.
+     *
+     * Fix: decompress once from offset 0, then validate as tar.
+     */
+    char cmd[PATH_MAX * 2];
 
-    /* Alpine APK data is the final gzip member.  Test gzip candidates from
-       the end, and validate the decompressed result as a tar archive. */
-    int found = 0;
-    for (size_t i = len; i >= 2; --i) {
-        size_t off = i - 2;
-        if (buf[off] != 0x1f || buf[off + 1] != 0x8b)
-            continue;
+    unlink(tar_path);
 
-        char gz_path[PATH_MAX];
-        snprintf(gz_path, sizeof(gz_path), "%s.candidate.gz", tar_path);
-        if (write_slice(gz_path, buf, off, len - off) < 0)
-            continue;
-
-        char cmd[PATH_MAX * 2];
-        snprintf(cmd, sizeof(cmd), "gzip -dc '%s' > '%s' 2>/dev/null",
-                 gz_path, tar_path);
-        if (!command_ok(cmd)) {
-            unlink(gz_path);
-            unlink(tar_path);
-            continue;
-        }
-
-        /* Validate without extracting. */
+    snprintf(cmd, sizeof(cmd), "gzip -dc '%s' > '%s' 2>/dev/null",
+             apk, tar_path);
+    if (command_ok(cmd)) {
         snprintf(cmd, sizeof(cmd), "tar -tf '%s' >/dev/null 2>&1", tar_path);
-        if (command_ok(cmd)) {
-            unlink(gz_path);
-            found = 1;
-            break;
-        }
-
-        unlink(gz_path);
-        unlink(tar_path);
+        if (command_ok(cmd))
+            return 0;
+        /* Old 3-stream APKs have zero blocks between members. */
+        snprintf(cmd, sizeof(cmd),
+                 "tar --ignore-zeros -tf '%s' >/dev/null 2>&1", tar_path);
+        if (command_ok(cmd))
+            return 0;
     }
 
-    free(buf);
-    return found ? 0 : -1;
+    /* Fallback for toolchains where `gzip` is missing but tar has built-in
+     * gzip support (e.g. busybox tar). This is the AvoryOS case from the
+     * xeyes report: `tar -tzf` succeeds while `gzip -dc` fails. Materialize
+     * the plain tar using only tar: unpack with tar's internal inflate,
+     * then repack. Shell `>` redirection is avoided entirely here. */
+    snprintf(cmd, sizeof(cmd), "tar -tzf '%s' >/dev/null 2>&1", apk);
+    if (command_ok(cmd)) {
+        snprintf(cmd, sizeof(cmd), "busybox gzip -dc '%s' > '%s' 2>/dev/null",
+                 apk, tar_path);
+        if (command_ok(cmd)) {
+            snprintf(cmd, sizeof(cmd), "tar -tf '%s' >/dev/null 2>&1",
+                     tar_path);
+            if (command_ok(cmd))
+                return 0;
+        }
+        {
+            char tmpdir[PATH_MAX];
+            snprintf(tmpdir, sizeof(tmpdir), "%s.fallback-%ld", tar_path,
+                     (long)getpid());
+            snprintf(cmd, sizeof(cmd),
+                     "rm -rf '%s' && mkdir -p '%s' && "
+                     "tar -xzf '%s' -C '%s' 2>/dev/null && "
+                     "tar -cf '%s' -C '%s' . 2>/dev/null",
+                     tmpdir, tmpdir, apk, tmpdir, tar_path, tmpdir);
+            if (command_ok(cmd)) {
+                snprintf(cmd, sizeof(cmd), "tar -tf '%s' >/dev/null 2>&1",
+                         tar_path);
+                if (command_ok(cmd)) {
+                    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+                    command(cmd);
+                    return 0;
+                }
+            }
+            snprintf(cmd, sizeof(cmd), "rm -rf '%s'", tmpdir);
+            command(cmd);
+        }
+        fprintf(stderr,
+                "[apm] APK is a valid gzip tar but no working gzip found\n");
+    }
+
+    unlink(tar_path);
+    return -1;
 }
 
 static int path_is_safe_tar_name(const char *name)
@@ -579,10 +601,17 @@ static int build_manifest(const char *tar_path, const char *manifest)
     snprintf(listing, sizeof(listing), "%s.list", tar_path);
 
     char cmd[PATH_MAX * 2];
-    snprintf(cmd, sizeof(cmd), "tar -tf '%s' > '%s'", tar_path, listing);
+    snprintf(cmd, sizeof(cmd), "tar -tf '%s' > '%s' 2>/dev/null", tar_path,
+             listing);
     if (!command_ok(cmd)) {
-        unlink(listing);
-        return -1;
+        /* Old 3-stream APKs need --ignore-zeros (see setup-arch.sh). */
+        snprintf(cmd, sizeof(cmd),
+                 "tar --ignore-zeros -tf '%s' > '%s' 2>/dev/null", tar_path,
+                 listing);
+        if (!command_ok(cmd)) {
+            unlink(listing);
+            return -1;
+        }
     }
 
     FILE *in = fopen(listing, "r");
@@ -601,6 +630,8 @@ static int build_manifest(const char *tar_path, const char *manifest)
             fclose(in); fclose(out); unlink(listing); return -1;
         }
         if (strcmp(line, ".PKGINFO") == 0 ||
+            strncmp(line, ".SIGN.", 6) == 0 ||
+            strncmp(line, "./.SIGN.", 8) == 0 ||
             strncmp(line, ".INSTALL", 8) == 0 ||
             strncmp(line, ".pre", 4) == 0 ||
             strncmp(line, ".post", 5) == 0 ||
@@ -628,17 +659,33 @@ static int install_tar(const char *tar_path, const char *root)
      * replaces a file already present on the target OS.  We intentionally do
      * not restore Alpine's uid/gid/mode timestamps; those are host-OS policy.
      * --touch avoids utime/utimensat failures on minimal kernels/VFSes.
+     * --ignore-zeros handles old 3-stream APK padding (setup-arch.sh).
      */
     snprintf(cmd, sizeof(cmd),
-             "tar -xf '%s' -C '%s' --overwrite --no-same-owner "
+             "tar --ignore-zeros -xf '%s' -C '%s' --overwrite --no-same-owner "
              "--no-same-permissions --touch "
-             "--exclude=.PKGINFO --exclude=.INSTALL "
+             "--exclude=.PKGINFO --exclude=.SIGN.* --exclude=.INSTALL "
              "--exclude=.pre-install --exclude=.post-install "
              "--exclude=.pre-deinstall --exclude=.post-deinstall "
              "--exclude=.pre-upgrade --exclude=.post-upgrade "
-             "--exclude=.trigger",
+             "--exclude=.trigger 2>/dev/null",
              tar_path, root);
+    if (command_ok(cmd))
+        return 0;
 
+    /* Busybox tar may lack --overwrite/--touch/--exclude/--ignore-zeros:
+     * retry with a portable subset. Metadata strays stay in staging and
+     * are never moved into / (build_manifest filters them). */
+    snprintf(cmd, sizeof(cmd),
+             "tar -xf '%s' -C '%s' --no-same-owner "
+             "--no-same-permissions --touch 2>/dev/null",
+             tar_path, root);
+    if (command_ok(cmd))
+        return 0;
+
+    /* Last resort: plain extraction (tar_path is already plain tar). */
+    snprintf(cmd, sizeof(cmd), "tar -xf '%s' -C '%s' 2>/dev/null",
+             tar_path, root);
     return command_ok(cmd) ? 0 : -1;
 }
 
@@ -802,7 +849,8 @@ static int install_one(const char *name, int depth)
     /* Validate every archive member before touching the target filesystem. */
     if (build_manifest(tar_path, manifest) < 0) {
         fprintf(stderr, "[apm] unsafe or unreadable tar archive\n");
-        command("rm -rf '/tmp/apm/stage-invalid'");
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", stage);
+        command(cmd);
         unlink(apk); unlink(tar_path); unlink(manifest);
         return 1;
     }

@@ -146,10 +146,10 @@ ssize_t unix_send_impl(socket_t *sock, const void *buf, size_t len, int flags) {
       return -107; // ENOTCONN
 
     struct thread *current = sched_get_current();
-    wait_queue_entry_t entry = {.thread = current, .next = NULL};
+    wait_queue_entry_t entry = {.thread = current, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
 
-    wait_queue_add(usk->wait, &entry);
     current->state = THREAD_BLOCKED;
+    wait_queue_add(usk->wait, &entry);
 
     if (usk->peer != NULL || sock->state != SS_CONNECTING) {
       current->state = THREAD_RUNNING;
@@ -169,6 +169,15 @@ ssize_t unix_send_impl(socket_t *sock, const void *buf, size_t len, int flags) {
     return -107; // ENOTCONN
   }
 
+  uint64_t sndtimeo_deadline = 0;
+  if (usk->sndtimeo_ms > 0)
+    sndtimeo_deadline = lapic_timer_get_ticks() + (uint64_t)usk->sndtimeo_ms;
+
+  if (peer && peer->is_syslog_sink) {
+    socket_put(peer_sock);
+    return (ssize_t)len;
+  }
+
   if (sock->type == SOCK_SEQPACKET || sock->type == SOCK_DGRAM) {
     while (1) {
       if (sock->closing || peer_sock->closing || peer->read_shutdown) {
@@ -185,14 +194,35 @@ ssize_t unix_send_impl(socket_t *sock, const void *buf, size_t len, int flags) {
         }
 
         struct thread *current = sched_get_current();
-        wait_queue_entry_t entry = {.thread = current, .next = NULL};
-        wait_queue_add(peer->wait, &entry);
+        wait_queue_entry_t entry = {.thread = current, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
         current->state = THREAD_BLOCKED;
+        wait_queue_add(peer->wait, &entry);
+        if (sndtimeo_deadline != 0)
+          current->wakeup_ticks = sndtimeo_deadline;
+        /* Recheck under recv_lock: a consume+wake between the first check
+         * and the add would otherwise be lost (wake sees RUNNING). */
+        if (!(peer->packet_queue_bytes + len > 4 * 1024 * 1024 && peer->packet_queue_bytes > 0)) {
+          current->state = THREAD_RUNNING;
+          current->wakeup_ticks = 0;
+          spinlock_release(&peer->recv_lock);
+          wait_queue_remove(peer->wait, &entry);
+          current->state = THREAD_RUNNING;
+          if (sndtimeo_deadline != 0 && lapic_timer_get_ticks() >= sndtimeo_deadline) {
+            socket_put(peer_sock);
+            return -11; // EAGAIN
+          }
+          continue;
+        }
 
         spinlock_release(&peer->recv_lock);
         sched_yield();
         wait_queue_remove(peer->wait, &entry);
         current->state = THREAD_RUNNING;
+        current->wakeup_ticks = 0;
+        if (sndtimeo_deadline != 0 && lapic_timer_get_ticks() >= sndtimeo_deadline) {
+          socket_put(peer_sock);
+          return -11; // EAGAIN
+        }
         continue;
       }
       break;
@@ -274,15 +304,53 @@ ssize_t unix_send_impl(socket_t *sock, const void *buf, size_t len, int flags) {
       }
 
       struct thread *current = sched_get_current();
-      wait_queue_entry_t entry = {.thread = current, .next = NULL};
+      wait_queue_entry_t entry = {.thread = current, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
 
-      wait_queue_add(peer->wait, &entry);
       current->state = THREAD_BLOCKED;
+      wait_queue_add(peer->wait, &entry);
+      if (sndtimeo_deadline != 0)
+        current->wakeup_ticks = sndtimeo_deadline;
+      /* Recheck space under recv_lock before parking. */
+      {
+        size_t rh = peer->recv_buf_head;
+        size_t rt = peer->recv_buf_tail;
+        size_t rs = peer->recv_buf_size;
+        size_t rspace = (rs > 0) ? (rh - rt - 1 + rs) % rs : 0;
+        if (rspace != 0 || sent > 0 || sock->closing || peer_sock->closing || sock->error) {
+          current->state = THREAD_RUNNING;
+          current->wakeup_ticks = 0;
+          spinlock_release(&peer->recv_lock);
+          wait_queue_remove(peer->wait, &entry);
+          current->state = THREAD_RUNNING;
+          if (sndtimeo_deadline != 0 && lapic_timer_get_ticks() >= sndtimeo_deadline) {
+            socket_put(peer_sock);
+            return sent > 0 ? (ssize_t)sent : -11; // EAGAIN
+          }
+          if (sock->closing || peer_sock->closing) {
+            socket_put(peer_sock);
+            return -32; // EPIPE
+          }
+          if (sock->error) {
+            int err = sock->error;
+            socket_put(peer_sock);
+            return -err;
+          }
+          if (rspace != 0 || sent > 0)
+            continue;
+          continue;
+        }
+      }
 
       spinlock_release(&peer->recv_lock);
       sched_yield();
       wait_queue_remove(peer->wait, &entry);
       current->state = THREAD_RUNNING;
+      current->wakeup_ticks = 0;
+
+      if (sndtimeo_deadline != 0 && lapic_timer_get_ticks() >= sndtimeo_deadline) {
+        socket_put(peer_sock);
+        return sent > 0 ? (ssize_t)sent : -11; // EAGAIN
+      }
 
       if (sock->closing || peer_sock->closing) {
         socket_put(peer_sock);
@@ -325,6 +393,10 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
 
   unix_sock_t *usk = (unix_sock_t *)sock->sk;
 
+  uint64_t rcvtimeo_deadline = 0;
+  if (usk->rcvtimeo_ms > 0)
+    rcvtimeo_deadline = lapic_timer_get_ticks() + (uint64_t)usk->rcvtimeo_ms;
+
   if (sock->type == SOCK_SEQPACKET || sock->type == SOCK_DGRAM) {
     while (1) {
       spinlock_acquire(&usk->recv_lock);
@@ -336,20 +408,23 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
         return 0; // EOF
       }
 
-      if (sock->state != SS_CONNECTED) {
+      /* SEQPACKET is connection-oriented; DGRAM is connectionless! */
+      if (sock->type == SOCK_SEQPACKET && sock->state != SS_CONNECTED) {
         spinlock_release(&usk->recv_lock);
-        return 0; // EOF
+        return usk->was_connected ? 0 : -107; // ENOTCONN
       }
 
       bool peer_shut = false;
-      spinlock_acquire(&sock->lock);
-      if (usk->peer && usk->peer->write_shutdown)
-        peer_shut = true;
-      spinlock_release(&sock->lock);
+      if (sock->type == SOCK_SEQPACKET) {
+        spinlock_acquire(&sock->lock);
+        if (usk->peer && usk->peer->write_shutdown)
+          peer_shut = true;
+        spinlock_release(&sock->lock);
 
-      if (peer_shut) {
-        spinlock_release(&usk->recv_lock);
-        return 0; // EOF
+        if (peer_shut) {
+          spinlock_release(&usk->recv_lock);
+          return 0; // EOF
+        }
       }
 
       if ((sock->flags & SOCK_NONBLOCK) || (flags & 0x40)) { // MSG_DONTWAIT
@@ -357,22 +432,42 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
         return -11; // EAGAIN
       }
 
-      uint64_t rcvtimeo_deadline = 0;
-      if (usk->rcvtimeo_ms > 0)
-        rcvtimeo_deadline = lapic_timer_get_ticks() + (uint64_t)usk->rcvtimeo_ms;
-
       struct thread *current = sched_get_current();
-      wait_queue_entry_t entry = {.thread = current, .next = NULL};
-      wait_queue_add(usk->wait, &entry);
+      if (thread_has_pending_signal(current)) {
+        spinlock_release(&usk->recv_lock);
+        return -4; // EINTR
+      }
+
+      wait_queue_entry_t entry = {.thread = current, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
       current->state = THREAD_BLOCKED;
+      wait_queue_add(usk->wait, &entry);
       if (rcvtimeo_deadline != 0)
         current->wakeup_ticks = rcvtimeo_deadline;
+      /* Recheck under recv_lock: packet may have arrived between the
+       * first empty check and the add (wake lost, sees RUNNING). */
+      if (usk->packet_queue_head != NULL || sock->closing || usk->read_shutdown || sock->error) {
+        current->state = THREAD_RUNNING;
+        current->wakeup_ticks = 0;
+        spinlock_release(&usk->recv_lock);
+        wait_queue_remove(usk->wait, &entry);
+        current->state = THREAD_RUNNING;
+        if (rcvtimeo_deadline != 0 && lapic_timer_get_ticks() >= rcvtimeo_deadline)
+          return -11; // EAGAIN
+        if (sock->closing || usk->read_shutdown)
+          return 0;
+        if (sock->error)
+          return -(int)sock->error;
+        continue;
+      }
 
       spinlock_release(&usk->recv_lock);
       sched_yield();
       wait_queue_remove(usk->wait, &entry);
       current->state = THREAD_RUNNING;
       current->wakeup_ticks = 0;
+
+      if (thread_has_pending_signal(current))
+        return -4; // EINTR
 
       if (rcvtimeo_deadline != 0 && lapic_timer_get_ticks() >= rcvtimeo_deadline)
         return -11; // EAGAIN
@@ -387,6 +482,13 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
     size_t to_copy = (len < pkt->data_len) ? len : pkt->data_len;
     if (to_copy > 0 && buf)
       memcpy(buf, pkt->data, to_copy);
+
+    if (pkt->sender_addr_len > 0) {
+      memcpy(&usk->last_sender_addr, &pkt->sender_addr, sizeof(struct sockaddr_un));
+      usk->last_sender_addr_len = pkt->sender_addr_len;
+    } else {
+      usk->last_sender_addr_len = 0;
+    }
 
     if (!(flags & 0x02)) { // MSG_PEEK
       usk->packet_queue_head = pkt->next;
@@ -422,7 +524,7 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
 
   if (sock->state != SS_CONNECTED &&
       usk->recv_buf_head == usk->recv_buf_tail) {
-    return 0; // EOF
+    return usk->was_connected ? 0 : -107; // ENOTCONN
   }
 
   uint8_t *dest     = (uint8_t *)buf;
@@ -445,6 +547,8 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
       if (sock->state != SS_CONNECTED) {
         usk->accepted_orphaned = false;
         spinlock_release(&usk->recv_lock);
+        if (!usk->was_connected && received == 0)
+          return -107; // ENOTCONN
         return (ssize_t)received;
       }
 
@@ -470,24 +574,52 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
       }
 
       struct thread *current = sched_get_current();
-      wait_queue_entry_t entry = {.thread = current, .next = NULL};
+      wait_queue_entry_t entry = {.thread = current, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
 
-      wait_queue_add(usk->wait, &entry);
       current->state = THREAD_BLOCKED;
+      wait_queue_add(usk->wait, &entry);
+      if (rcvtimeo_deadline != 0)
+        current->wakeup_ticks = rcvtimeo_deadline;
+
+      /* Recheck under recv_lock before parking. */
+      {
+        size_t rh = usk->recv_buf_head;
+        size_t rt = usk->recv_buf_tail;
+        size_t rs = usk->recv_buf_size;
+        size_t ravail = (rs > 0) ? (rt - rh + rs) % rs : 0;
+        if (ravail != 0 || sock->closing || usk->read_shutdown || sock->error) {
+          current->state = THREAD_RUNNING;
+          current->wakeup_ticks = 0;
+          spinlock_release(&usk->recv_lock);
+          wait_queue_remove(usk->wait, &entry);
+          current->state = THREAD_RUNNING;
+          if (rcvtimeo_deadline != 0 && lapic_timer_get_ticks() >= rcvtimeo_deadline)
+            return received > 0 ? (ssize_t)received : -11; // EAGAIN
+          if (sock->closing || usk->read_shutdown)
+            return (ssize_t)received; // EOF
+          if (sock->error)
+            return -sock->error;
+          continue;
+        }
+      }
 
       spinlock_release(&usk->recv_lock);
       sched_yield();
       wait_queue_remove(usk->wait, &entry);
       current->state = THREAD_RUNNING;
+      current->wakeup_ticks = 0;
+
+      if (rcvtimeo_deadline != 0 && lapic_timer_get_ticks() >= rcvtimeo_deadline)
+        return received > 0 ? (ssize_t)received : -11; // EAGAIN
 
       if (sock->closing || usk->read_shutdown)
-        return 0; // EOF
+        return (ssize_t)received; // EOF
 
       spinlock_acquire(&sock->lock);
       bool peer_shut_after_wait = (usk->peer && usk->peer->write_shutdown);
       spinlock_release(&sock->lock);
       if (peer_shut_after_wait && usk->recv_buf_head == usk->recv_buf_tail)
-        return 0; // EOF
+        return (ssize_t)received; // EOF
 
       if (sock->error)
         return -sock->error;
@@ -534,20 +666,34 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
   return (ssize_t)received;
 }
 
+ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags);
+
 ssize_t unix_sendto_impl(socket_t *sock, const void *buf, size_t len,
                          int flags, struct sockaddr *dest_addr, int addrlen) {
-  (void)addrlen;
   if (!dest_addr)
     return unix_send_impl(sock, buf, len, flags);
 
-  klog_puts("[WARN] unix_sendto: with address not implemented (DGRAM)\n");
-  return -95; // EOPNOTSUPP
+  struct iovec iov = {
+    .iov_base = (void *)buf,
+    .iov_len = len,
+  };
+  struct msghdr msg = {
+    .msg_name = dest_addr,
+    .msg_namelen = (uint32_t)addrlen,
+    .msg_iov = &iov,
+    .msg_iovlen = 1,
+    .msg_control = NULL,
+    .msg_controllen = 0,
+    .msg_flags = 0,
+  };
+  return unix_sendmsg_impl(sock, &msg, flags);
 }
 
 ssize_t unix_recvfrom_impl(socket_t *sock, void *buf, size_t len, int flags,
                            struct sockaddr *src_addr, int *addrlen) {
   ssize_t ret = unix_recv_impl(sock, buf, len, flags);
   if (ret >= 0 && src_addr && addrlen) {
+    unix_sock_t *usk = sock ? (unix_sock_t *)sock->sk : NULL;
     unix_sock_t *peer = NULL;
     socket_t *peer_sock = unix_get_live_peer(sock, &peer);
     if (peer_sock && peer) {
@@ -565,8 +711,18 @@ ssize_t unix_recvfrom_impl(socket_t *sock, void *buf, size_t len, int flags,
         *addrlen = (int)sizeof(sa_family_t);
       }
       socket_put(peer_sock);
+    } else if (sock && sock->type == SOCK_DGRAM && usk && usk->last_sender_addr_len > 0) {
+      int to_copy = usk->last_sender_addr_len < *addrlen ? usk->last_sender_addr_len : *addrlen;
+      memcpy(src_addr, &usk->last_sender_addr, (size_t)to_copy);
+      *addrlen = usk->last_sender_addr_len;
     } else {
-      *addrlen = 0;
+      struct sockaddr_un *sun = (struct sockaddr_un *)src_addr;
+      int copy = (int)sizeof(sa_family_t) < *addrlen
+                     ? (int)sizeof(sa_family_t)
+                     : *addrlen;
+      memset(sun, 0, (size_t)copy);
+      sun->sun_family = AF_UNIX;
+      *addrlen = (int)sizeof(sa_family_t);
     }
   }
   return ret;
@@ -584,16 +740,44 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   unix_sock_t *peer = NULL;
   socket_t *peer_sock = unix_get_live_peer(sock, &peer);
   if (!peer_sock || !peer) {
-    if (usk->was_connected)
-      return -32; // EPIPE
-    return -107; // ENOTCONN
+    if (msg->msg_name && msg->msg_namelen >= sizeof(sa_family_t)) {
+      struct sockaddr_un *sun = (struct sockaddr_un *)msg->msg_name;
+      unix_sock_t *dusk = unix_find_socket_by_addr_ref(sun, msg->msg_namelen);
+      if (dusk) {
+        if (dusk->is_syslog_sink) {
+          if (dusk->parent)
+            socket_put(dusk->parent);
+          size_t tlen = 0;
+          for (size_t i = 0; i < msg->msg_iovlen; i++)
+            tlen += msg->msg_iov[i].iov_len;
+          return (ssize_t)tlen;
+        }
+        socket_t *dsock = dusk->parent;
+        if (dsock && af_unix_sock_live(dusk, &dsock)) {
+          peer = dusk;
+          peer_sock = dsock;
+        } else if (dsock) {
+          socket_put(dsock);
+        }
+      }
+    }
+    if (!peer_sock || !peer) {
+      if (usk->was_connected)
+        return -32; // EPIPE
+      return -107; // ENOTCONN
+    }
   }
-
-  struct thread *current = sched_get_current();
 
   size_t total_len = 0;
   for (size_t i = 0; i < msg->msg_iovlen; i++)
     total_len += msg->msg_iov[i].iov_len;
+
+  if (peer && peer->is_syslog_sink) {
+    socket_put(peer_sock);
+    return (ssize_t)total_len;
+  }
+
+  struct thread *current = sched_get_current();
 
   if (sock->type == SOCK_SEQPACKET || sock->type == SOCK_DGRAM) {
     while (1) {
@@ -611,9 +795,17 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         }
 
         struct thread *ct = sched_get_current();
-        wait_queue_entry_t entry = {.thread = ct, .next = NULL};
-        wait_queue_add(peer->wait, &entry);
+        wait_queue_entry_t entry = {.thread = ct, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
         ct->state = THREAD_BLOCKED;
+        wait_queue_add(peer->wait, &entry);
+        /* Recheck under recv_lock before parking. */
+        if (!(peer->packet_queue_bytes + total_len > 4 * 1024 * 1024 && peer->packet_queue_bytes > 0)) {
+          ct->state = THREAD_RUNNING;
+          spinlock_release(&peer->recv_lock);
+          wait_queue_remove(peer->wait, &entry);
+          ct->state = THREAD_RUNNING;
+          continue;
+        }
 
         spinlock_release(&peer->recv_lock);
         sched_yield();
@@ -691,6 +883,12 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     pkt->data_len = total_len;
     pkt->scm = scm_item;
     pkt->cred_pending = false;
+    if (usk->addr_len > 0) {
+      memcpy(&pkt->sender_addr, &usk->addr, sizeof(struct sockaddr_un));
+      pkt->sender_addr_len = usk->addr_len;
+    } else {
+      pkt->sender_addr_len = 0;
+    }
 
     size_t offset = 0;
     for (size_t i = 0; i < msg->msg_iovlen; i++) {
@@ -751,9 +949,29 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       }
 
       struct thread *ct = sched_get_current();
-      wait_queue_entry_t entry = {.thread = ct, .next = NULL};
-      wait_queue_add(peer->wait, &entry);
+      wait_queue_entry_t entry = {.thread = ct, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
       ct->state = THREAD_BLOCKED;
+      wait_queue_add(peer->wait, &entry);
+      /* Recheck under recv_lock: space may have freed between the first
+       * check and the add. */
+      {
+        size_t rh = peer->recv_buf_head;
+        size_t rt = peer->recv_buf_tail;
+        size_t rs = peer->recv_buf_size;
+        size_t rspace = (rs > 0) ? (rh - rt - 1 + rs) % rs : 0;
+        if (rspace != 0 || sock->closing || peer_sock->closing) {
+          ct->state = THREAD_RUNNING;
+          spinlock_release(&peer->recv_lock);
+          wait_queue_remove(peer->wait, &entry);
+          ct->state = THREAD_RUNNING;
+          if (sock->closing || peer_sock->closing) {
+            socket_put(peer_sock);
+            return -32; // EPIPE
+          }
+          spinlock_acquire(&peer->recv_lock);
+          continue;
+        }
+      }
 
       spinlock_release(&peer->recv_lock);
       sched_yield();
@@ -893,6 +1111,14 @@ static void unix_fill_msg_name(socket_t *sock, struct msghdr *msg) {
   spinlock_acquire(&sock->lock);
   unix_sock_t *peer = usk->peer;
   if (!peer) {
+    if (sock->type == SOCK_DGRAM && usk->last_sender_addr_len > 0) {
+      uint32_t cap = msg->msg_namelen;
+      uint32_t copy = (uint32_t)usk->last_sender_addr_len < cap ? (uint32_t)usk->last_sender_addr_len : cap;
+      memcpy(msg->msg_name, &usk->last_sender_addr, copy);
+      msg->msg_namelen = (uint32_t)usk->last_sender_addr_len;
+      spinlock_release(&sock->lock);
+      return;
+    }
     spinlock_release(&sock->lock);
     msg->msg_namelen = 0;
     return;
@@ -927,6 +1153,10 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   if (sock->closing)
     goto no_data;
 
+  uint64_t rcvtimeo_deadline = 0;
+  if (usk->rcvtimeo_ms > 0)
+    rcvtimeo_deadline = lapic_timer_get_ticks() + (uint64_t)usk->rcvtimeo_ms;
+
   struct thread *current = sched_get_current();
   bool is_peek = (flags & 0x02) != 0; // MSG_PEEK
 
@@ -941,20 +1171,24 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         goto no_data;
       }
 
-      if (sock->state != SS_CONNECTED) {
+      /* SEQPACKET is connection-oriented; DGRAM is connectionless! */
+      if (sock->type == SOCK_SEQPACKET && sock->state != SS_CONNECTED) {
         spinlock_release(&usk->recv_lock);
+        if (!usk->was_connected) return -107; // ENOTCONN
         goto no_data;
       }
 
       bool peer_shut = false;
-      spinlock_acquire(&sock->lock);
-      if (usk->peer && usk->peer->write_shutdown)
-        peer_shut = true;
-      spinlock_release(&sock->lock);
+      if (sock->type == SOCK_SEQPACKET) {
+        spinlock_acquire(&sock->lock);
+        if (usk->peer && usk->peer->write_shutdown)
+          peer_shut = true;
+        spinlock_release(&sock->lock);
 
-      if (peer_shut) {
-        spinlock_release(&usk->recv_lock);
-        goto no_data;
+        if (peer_shut) {
+          spinlock_release(&usk->recv_lock);
+          goto no_data;
+        }
       }
 
       if ((sock->flags & SOCK_NONBLOCK) || (flags & 0x40)) {
@@ -962,22 +1196,41 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         return -11; // EAGAIN
       }
 
-      uint64_t rcvtimeo_deadline = 0;
-      if (usk->rcvtimeo_ms > 0)
-        rcvtimeo_deadline = lapic_timer_get_ticks() + (uint64_t)usk->rcvtimeo_ms;
-
       struct thread *ct = sched_get_current();
-      wait_queue_entry_t entry = {.thread = ct, .next = NULL};
-      wait_queue_add(usk->wait, &entry);
+      if (thread_has_pending_signal(ct)) {
+        spinlock_release(&usk->recv_lock);
+        return -4; // EINTR
+      }
+
+      wait_queue_entry_t entry = {.thread = ct, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
       ct->state = THREAD_BLOCKED;
+      wait_queue_add(usk->wait, &entry);
       if (rcvtimeo_deadline != 0)
         ct->wakeup_ticks = rcvtimeo_deadline;
+      /* Recheck under recv_lock before parking. */
+      if (usk->packet_queue_head != NULL || sock->closing || usk->read_shutdown || sock->error) {
+        ct->state = THREAD_RUNNING;
+        ct->wakeup_ticks = 0;
+        spinlock_release(&usk->recv_lock);
+        wait_queue_remove(usk->wait, &entry);
+        ct->state = THREAD_RUNNING;
+        if (rcvtimeo_deadline != 0 && lapic_timer_get_ticks() >= rcvtimeo_deadline)
+          return -11; // EAGAIN
+        if (sock->closing || usk->read_shutdown)
+          goto no_data;
+        if (sock->error)
+          return -(int)sock->error;
+        continue;
+      }
 
       spinlock_release(&usk->recv_lock);
       sched_yield();
       wait_queue_remove(usk->wait, &entry);
       ct->state = THREAD_RUNNING;
       ct->wakeup_ticks = 0;
+
+      if (thread_has_pending_signal(ct))
+        return -4; // EINTR
 
       if (rcvtimeo_deadline != 0 && lapic_timer_get_ticks() >= rcvtimeo_deadline)
         return -11; // EAGAIN
@@ -989,6 +1242,12 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     }
 
     unix_packet_t *pkt = usk->packet_queue_head;
+    if (pkt->sender_addr_len > 0) {
+      memcpy(&usk->last_sender_addr, &pkt->sender_addr, sizeof(struct sockaddr_un));
+      usk->last_sender_addr_len = pkt->sender_addr_len;
+    } else {
+      usk->last_sender_addr_len = 0;
+    }
 
     size_t control_capacity = msg->msg_controllen;
     size_t control_used = 0;
@@ -1143,9 +1402,13 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         usk->bytes_read >= usk->scm_queue_head->stream_offset)
       break; // Zero-data SCM ready – deliver control without data
 
-    if (sock->closing || sock->state != SS_CONNECTED) {
+    if (sock->closing || (sock->state != SS_CONNECTED && usk->was_connected)) {
       spinlock_release(&usk->recv_lock);
       goto no_data;
+    }
+    if (sock->state != SS_CONNECTED && !usk->was_connected) {
+      spinlock_release(&usk->recv_lock);
+      return -107; // ENOTCONN
     }
 
     if ((sock->flags & SOCK_NONBLOCK) || (flags & 0x40)) {
@@ -1153,17 +1416,35 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       return -11; // EAGAIN
     }
 
-    uint64_t rcvtimeo_deadline = 0;
-    if (usk->rcvtimeo_ms > 0) {
-      rcvtimeo_deadline = lapic_timer_get_ticks() + (uint64_t)usk->rcvtimeo_ms;
-    }
-
     struct thread *ct = sched_get_current();
-    wait_queue_entry_t entry = {.thread = ct, .next = NULL};
-    wait_queue_add(usk->wait, &entry);
+    wait_queue_entry_t entry = {.thread = ct, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
     ct->state = THREAD_BLOCKED;
+    wait_queue_add(usk->wait, &entry);
     if (rcvtimeo_deadline != 0) {
       ct->wakeup_ticks = rcvtimeo_deadline;
+    }
+    /* Recheck under recv_lock before parking. */
+    {
+      size_t rh = usk->recv_buf_head;
+      size_t rt = usk->recv_buf_tail;
+      size_t rs = usk->recv_buf_size;
+      size_t ravail = (rs > 0) ? (rt - rh + rs) % rs : 0;
+      bool scm_ready = usk->scm_queue_head != NULL &&
+                       usk->bytes_read >= usk->scm_queue_head->stream_offset;
+      if (ravail > 0 || scm_ready || sock->closing || sock->error) {
+        ct->state = THREAD_RUNNING;
+        ct->wakeup_ticks = 0;
+        spinlock_release(&usk->recv_lock);
+        wait_queue_remove(usk->wait, &entry);
+        ct->state = THREAD_RUNNING;
+        if (rcvtimeo_deadline != 0 && lapic_timer_get_ticks() >= rcvtimeo_deadline)
+          return -11; // EAGAIN
+        if (sock->closing)
+          goto no_data;
+        if (sock->error)
+          return -(int)sock->error;
+        continue;
+      }
     }
 
     spinlock_release(&usk->recv_lock);

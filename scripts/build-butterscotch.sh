@@ -7,6 +7,8 @@
 #   ./scripts/build-butterscotch.sh clean     # remove build artefacts
 #
 # Butterscotch: https://github.com/ButterscotchRunner/Butterscotch
+# The target rootfs and SDL2 package use glibc, so this target uses the matching
+# glibc cross-compiler instead of the independent musl toolchain.
 # The runner looks for game data (data.win / game.unx) next to the binary.
 # The disk image installs both files under /opt/butterscotch/.
 
@@ -17,19 +19,22 @@ BUILD_DIR="${BUILD_DIR:-"$ROOT_DIR/build/butterscotch"}"
 SOURCE_DIR="$BUILD_DIR/Butterscotch"
 OUTPUT_DIR="$ROOT_DIR/userland"
 ALPINE_ROOTFS="${ALPINE_ROOTFS:-"$ROOT_DIR/build/alpine/rootfs"}"
-MUSL_TOOLCHAIN_BIN="${MUSL_TOOLCHAIN_BIN:-"$ROOT_DIR/toolchain/x86_64-linux-musl/bin"}"
-MUSL_SYSROOT="${MUSL_SYSROOT:-"$ROOT_DIR/toolchain/musl-sysroot"}"
+GLIBC_TOOLCHAIN_BIN="${GLIBC_TOOLCHAIN_BIN:-"$ROOT_DIR/toolchain/x86_64-linux-glibc/bin"}"
 REPO_URL="${BUTTERSCOTCH_REPO_URL:-"https://github.com/ButterscotchRunner/Butterscotch.git"}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 
 find_compiler() {
-    local_cc="$MUSL_TOOLCHAIN_BIN/x86_64-linux-musl-gcc"
+    local_cc="$GLIBC_TOOLCHAIN_BIN/x86_64-buildroot-linux-gnu-gcc"
     if [ -x "$local_cc" ]; then
         CC="$local_cc"
-    elif command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
-        CC=x86_64-linux-musl-gcc
+    elif [ -x "$GLIBC_TOOLCHAIN_BIN/x86_64-linux-gcc" ]; then
+        CC="$GLIBC_TOOLCHAIN_BIN/x86_64-linux-gcc"
+    elif command -v x86_64-buildroot-linux-gnu-gcc >/dev/null 2>&1; then
+        CC=x86_64-buildroot-linux-gnu-gcc
+    elif command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
+        CC=x86_64-linux-gnu-gcc
     else
-        echo "Error: x86_64-linux-musl-gcc not found; run scripts/musl-toolchain.sh first." >&2
+        echo "Error: glibc cross-compiler not found; run scripts/glibc-toolchain.sh first." >&2
         exit 1
     fi
 }
@@ -39,7 +44,7 @@ check_dependencies() {
         "$ALPINE_ROOTFS/usr/include/SDL2/SDL.h" \
         "$ALPINE_ROOTFS/usr/lib/libSDL2.so"; do
         if [ ! -e "$f" ]; then
-            echo "Error: missing $f; run scripts/setup-alpine.sh first." >&2
+            echo "Error: missing $f; run scripts/setup-arch.sh first." >&2
             exit 1
         fi
     done
@@ -67,15 +72,16 @@ build_butterscotch() {
     CMAKE_BUILD_DIR="$BUILD_DIR/cmake-build"
     mkdir -p "$CMAKE_BUILD_DIR"
 
-    echo "[*] Configuring Butterscotch with CMake (SDL2 backend, miniaudio, musl)..."
+    echo "[*] Configuring Butterscotch with CMake (SDL2 backend, miniaudio, glibc)..."
 
-    # Write a minimal toolchain file so CMake uses our musl cross-compiler.
-    TOOLCHAIN_FILE="$BUILD_DIR/musl-toolchain.cmake"
+    # Write a minimal toolchain file for the glibc cross-compiler.
+    TOOLCHAIN_FILE="$BUILD_DIR/glibc-toolchain.cmake"
     cat > "$TOOLCHAIN_FILE" <<EOF
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
 set(CMAKE_C_COMPILER   "$CC")
-set(CMAKE_FIND_ROOT_PATH "$MUSL_SYSROOT" "$ALPINE_ROOTFS")
+set(CMAKE_SYSROOT "$ALPINE_ROOTFS")
+set(CMAKE_FIND_ROOT_PATH "$ALPINE_ROOTFS")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
@@ -86,15 +92,25 @@ EOF
     export PKG_CONFIG_LIBDIR="$ALPINE_ROOTFS/usr/lib/pkgconfig"
     export PKG_CONFIG_SYSROOT_DIR="$ALPINE_ROOTFS"
 
-    # Additional CFLAGS / LDFLAGS so the linker can resolve Alpine shared libs
+    # Additional CFLAGS / LDFLAGS so the linker can resolve target shared libs
     # at link time while embedding an rpath that resolves them at runtime in the VM.
-    EXTRA_CFLAGS="-I$ALPINE_ROOTFS/usr/include -I$ALPINE_ROOTFS/usr/include/SDL2 -fno-stack-protector -DMA_NO_ALSA"
+    EXTRA_CFLAGS="-I$ALPINE_ROOTFS/usr/include/SDL2 -fno-stack-protector -DMA_NO_ALSA"
     EXTRA_LDFLAGS="-L$ALPINE_ROOTFS/usr/lib -L$ALPINE_ROOTFS/lib \
--Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
 -Wl,-rpath,/usr/lib \
 -Wl,-rpath-link,$ALPINE_ROOTFS/usr/lib \
 -Wl,-rpath-link,$ALPINE_ROOTFS/lib \
 -Wl,--allow-shlib-undefined"
+
+    # CMake caches its compiler. Drop an older musl-configured tree so the
+    # glibc compiler switch cannot leave stale objects behind.
+    CMAKE_COMPILER_INFO=$(find "$CMAKE_BUILD_DIR/CMakeFiles" -name CMakeCCompiler.cmake -print -quit 2>/dev/null || true)
+    if [ -f "$CMAKE_BUILD_DIR/CMakeCache.txt" ] && \
+       [ -n "$CMAKE_COMPILER_INFO" ] && \
+       ! grep -Fq "set(CMAKE_C_COMPILER \"$CC\")" "$CMAKE_COMPILER_INFO"; then
+        rm -rf "$CMAKE_BUILD_DIR"
+        mkdir -p "$CMAKE_BUILD_DIR"
+    fi
 
     cmake \
         -S "$SOURCE_DIR" \

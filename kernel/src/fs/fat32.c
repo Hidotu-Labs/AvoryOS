@@ -17,6 +17,7 @@ static uint32_t fat32_write_impl(vfs_node_t *node, uint32_t offset,
 static int fat32_unlink_impl(vfs_node_t *parent, char *name);
 static int fat32_rmdir_impl(vfs_node_t *parent, char *name);
 static int fat32_truncate_impl(vfs_node_t *node, uint32_t new_size);
+int fat32_statfs_impl(vfs_node_t *node, struct statfs_buf *buf);
 
 // Internal Helpers
 
@@ -453,11 +454,69 @@ static int fat32_truncate_impl(vfs_node_t *node, uint32_t new_size) {
   return 0;
 }
 
+#define MSDOS_SUPER_MAGIC 0x4d44
+
+int fat32_statfs_impl(vfs_node_t *node, struct statfs_buf *buf) {
+  fat32_mount_t *mnt = node ? (fat32_mount_t *)node->device : NULL;
+  if (!mnt || !buf)
+    return -1;
+  uint64_t total = mnt->total_clusters;
+  /* Count free clusters by scanning the FAT in bulk. A per-cluster
+   * fat32_get_next_cluster() call does a kmalloc + sector read each time,
+   * which makes statfs (df, Plasma) painfully slow; read each FAT sector
+   * once and count zero entries instead. */
+  uint64_t free_clusters = 0;
+  uint32_t entries_per_sector = mnt->bytes_per_sector / 4;
+  uint8_t *sec = kmalloc(mnt->bytes_per_sector);
+  if (sec) {
+    uint32_t total_entries = total + 2;
+    for (uint32_t s = 0; s < mnt->fat_size_sectors; s++) {
+      uint32_t base = s * entries_per_sector;
+      if (base >= total_entries)
+        break;
+      if (mnt->dev->read_sectors(mnt->dev, mnt->fat_start_sector + s, 1, sec) != 0)
+        break;
+      uint32_t *e = (uint32_t *)sec;
+      uint32_t n = entries_per_sector;
+      if (base + n > total_entries)
+        n = total_entries - base;
+      uint32_t start = (base < 2) ? (2 - base) : 0;
+      for (uint32_t i = start; i < n; i++) {
+        if ((e[i] & 0x0FFFFFFF) == 0)
+          free_clusters++;
+      }
+      if (base + n >= total_entries)
+        break;
+    }
+    kfree(sec);
+  } else {
+    /* Allocation failed: report a conservative half-free so callers never
+     * see 0 B total. */
+    free_clusters = total / 2;
+  }
+  uint64_t bsize = mnt->bytes_per_cluster ? mnt->bytes_per_cluster : 4096;
+  buf->f_type = MSDOS_SUPER_MAGIC;
+  buf->f_bsize = (int64_t)bsize;
+  buf->f_blocks = (int64_t)total;
+  buf->f_bfree = (int64_t)free_clusters;
+  buf->f_bavail = (int64_t)free_clusters;
+  buf->f_files = (int64_t)total;
+  buf->f_ffree = (int64_t)free_clusters;
+  buf->f_fsid[0] = 0;
+  buf->f_fsid[1] = 0;
+  buf->f_namelen = 255;
+  buf->f_frsize = (int64_t)bsize;
+  buf->f_flags = 0;
+  return 0;
+}
+
 // Write to a file
 static uint32_t fat32_write_impl(vfs_node_t *node, uint32_t offset,
                                  uint32_t size, uint8_t *buffer) {
   fat32_mount_t *mnt = (fat32_mount_t *)node->device;
-  if (!mnt)
+  if (!mnt || !buffer)
+    return (uint32_t)-14;
+  if (size == 0)
     return 0;
 
   uint32_t cluster_size = mnt->bytes_per_cluster;
@@ -467,14 +526,14 @@ static uint32_t fat32_write_impl(vfs_node_t *node, uint32_t offset,
   if (cluster == 0) {
     cluster = fat32_alloc_cluster(mnt, 0);
     if (cluster == 0)
-      return 0;
+      return (uint32_t)-28;
     node->impl = cluster;
   }
 
   // Allocate cluster buffer
   uint8_t *cluster_buf = kmalloc(cluster_size);
   if (!cluster_buf)
-    return 0;
+    return (uint32_t)-12;
 
   uint32_t bytes_written = 0;
   uint32_t current_offset = 0;
@@ -490,7 +549,7 @@ static uint32_t fat32_write_impl(vfs_node_t *node, uint32_t offset,
       next = fat32_alloc_cluster(mnt, cluster);
       if (next == 0) {
         kfree(cluster_buf);
-        return bytes_written;
+        return bytes_written ? bytes_written : (uint32_t)-28;
       }
     }
 
@@ -532,6 +591,11 @@ static uint32_t fat32_write_impl(vfs_node_t *node, uint32_t offset,
       }
       cluster = next;
     }
+  }
+
+  if (bytes_written == 0) {
+    kfree(cluster_buf);
+    return (uint32_t)-28;
   }
 
   kfree(cluster_buf);
@@ -845,6 +909,7 @@ static vfs_node_t *fat32_make_vfs_node(fat32_mount_t *mnt,
   if (!(entry->attr & FAT32_ATTR_READ_ONLY)) {
     node->mask |= 0222; // Add write permission
   }
+  node->statfs = fat32_statfs_impl;
 
   return node;
 }
@@ -1284,6 +1349,7 @@ int fat32_mount(struct block_device *dev, vfs_node_t *mountpoint) {
   root_vfs->rmdir = fat32_rmdir_impl;
   root_vfs->mask = 0755;
   root_vfs->inode = mnt->root_cluster;
+  root_vfs->statfs = fat32_statfs_impl;
 
   mnt->root_node = root_vfs;
 
@@ -1296,6 +1362,7 @@ int fat32_mount(struct block_device *dev, vfs_node_t *mountpoint) {
   mountpoint->create = fat32_create_impl;
   mountpoint->unlink = fat32_unlink_impl;
   mountpoint->rmdir = fat32_rmdir_impl;
+  mountpoint->statfs = fat32_statfs_impl;
 
   klog_puts("[OK] FAT32 filesystem mounted.\n");
   return 0;

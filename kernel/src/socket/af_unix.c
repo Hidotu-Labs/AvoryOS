@@ -157,15 +157,62 @@ static int unix_poll(socket_t *sock, int events) {
     }
   }
 
-  if (sock->state == SS_CONNECTED && has_peer && !usk->write_shutdown) {
+  if (sock->type == SOCK_DGRAM && !usk->write_shutdown) {
     revents |= 0x004; // POLLOUT
     revents |= 0x100; // POLLWRNORM
+  } else if (sock->state == SS_CONNECTED && has_peer && !usk->write_shutdown) {
+    // Level-triggered epoll re-reports POLLOUT forever; lying when the peer
+    // ring is full turns any EPOLLOUT watch (PipeWire/wireplumber main loop)
+    // into a 100% CPU spin. Gate on actual peer space (try-lock only: poll
+    // must never block). No recv_buf yet means empty -> writable.
+    bool peer_has_space = true;
+    socket_t *peer_sock = NULL;
+    unix_sock_t *peer_usk = NULL;
+    spinlock_acquire(&sock->lock);
+    {
+      unix_sock_t *p = usk->peer;
+      if (p && p->parent && socket_try_get(p->parent)) {
+        peer_sock = p->parent;
+        peer_usk = p;
+      }
+    }
+    spinlock_release(&sock->lock);
+    if (peer_sock && peer_usk) {
+      if (sock->type == SOCK_SEQPACKET || sock->type == SOCK_DGRAM) {
+        if (spinlock_try_acquire(&peer_usk->recv_lock)) {
+          peer_has_space =
+              (peer_usk->packet_queue_bytes < 4 * 1024 * 1024);
+          spinlock_release(&peer_usk->recv_lock);
+        }
+      } else {
+        if (spinlock_try_acquire(&peer_usk->recv_lock)) {
+          if (peer_usk->recv_buf && peer_usk->recv_buf_size > 0) {
+            size_t head = peer_usk->recv_buf_head;
+            size_t tail = peer_usk->recv_buf_tail;
+            size_t size = peer_usk->recv_buf_size;
+            size_t space = (head - tail - 1 + size) % size;
+            peer_has_space = (space > 0);
+          } else {
+            peer_has_space = true;
+          }
+          spinlock_release(&peer_usk->recv_lock);
+        }
+      }
+      socket_put(peer_sock);
+    }
+    if (peer_has_space) {
+      revents |= 0x004; // POLLOUT
+      revents |= 0x100; // POLLWRNORM
+    }
   }
 
   if (usk->is_listener && usk->accept_next)
     revents |= 0x001; // POLLIN
 
-  return revents & events;
+  // POLLERR/POLLHUP must be reported even when not asked for (pipes do this);
+  // otherwise a POLLIN-only waiter never learns the peer closed and spins or
+  // sleeps depending on the notify cache.
+  return revents & (events | 0x008 | 0x010 | 0x020 | 0x2000);
 }
 
 // ── ioctl ────────────────────────────────────────────────────────────────────
@@ -178,20 +225,22 @@ static int unix_ioctl(socket_t *sock, uint32_t request, uint64_t arg) {
 
   switch (request) {
   case 0x541B: { // FIONREAD
-    int *val = (int *)arg;
-    if (!val)
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int)))
       return -14; // EFAULT
+    int unread = 0;
     spinlock_acquire(&usk->recv_lock);
     if (sock->type == SOCK_SEQPACKET || sock->type == SOCK_DGRAM) {
-      *val = usk->packet_queue_head ? (int)usk->packet_queue_head->data_len : 0;
+      unread = usk->packet_queue_head ? (int)usk->packet_queue_head->data_len : 0;
     } else {
       size_t head      = usk->recv_buf_head;
       size_t tail      = usk->recv_buf_tail;
       size_t sz        = usk->recv_buf_size;
       size_t available = (sz > 0) ? (tail - head + sz) % sz : 0;
-      *val = (int)available;
+      unread = (int)available;
     }
     spinlock_release(&usk->recv_lock);
+    if (copy_to_user((void *)arg, &unread, sizeof(int)) != 0)
+      return -14;
     return 0;
   }
   case 0x5421: { // FIONBIO
@@ -450,11 +499,54 @@ sock_ops_t   *unix_get_ops(void)    { return &unix_ops; }
 
 // ── Initialisation ───────────────────────────────────────────────────────────
 
+static void af_unix_create_sink(const char *path) {
+  socket_t *sock = kmalloc(sizeof(socket_t));
+  unix_sock_t *usk = kmalloc(sizeof(unix_sock_t));
+  if (!sock || !usk) {
+    if (sock) kfree(sock);
+    if (usk) kfree(usk);
+    return;
+  }
+  memset(sock, 0, sizeof(socket_t));
+  memset(usk, 0, sizeof(unix_sock_t));
+
+  sock->domain = AF_UNIX;
+  sock->type = SOCK_DGRAM;
+  sock->state = SS_UNCONNECTED;
+  sock->ops = &unix_ops;
+  sock->sk = usk;
+  sock->refcount = 1000000;
+  sock->table_index = -1;
+  spinlock_init(&sock->lock);
+  socket_wait_queue_init(sock);
+
+  usk->parent = sock;
+  usk->addr.sun_family = AF_UNIX;
+  strncpy(usk->addr.sun_path, path, UNIX_PATH_MAX - 1);
+  usk->addr_len = sizeof(struct sockaddr_un);
+  usk->is_syslog_sink = true;
+  usk->wait = (wait_queue_t *)sock->wait_queue;
+  INIT_LIST_HEAD(&usk->bind_node);
+  spinlock_init(&usk->recv_lock);
+  spinlock_init(&usk->send_lock);
+
+  spinlock_acquire(&unix_bound_lock);
+  list_add_tail(&usk->bind_node, &unix_bound_list);
+  spinlock_release(&unix_bound_lock);
+}
+
 void af_unix_init(void) {
   INIT_LIST_HEAD(&unix_bound_list);
   spinlock_init(&unix_bound_lock);
 
   sock_register_family(&unix_family);
 
-  klog_puts("[OK] AF_UNIX socket family registered\n");
+  // Register in-kernel sinks for syslog and systemd journal.
+  // This allows glibc/GLib/Qt to connect and write logs without failing
+  // or entering 100% CPU spin loops when no external syslogd runs.
+  af_unix_create_sink("/dev/log");
+  af_unix_create_sink("/run/systemd/journal/socket");
+  af_unix_create_sink("/run/systemd/journal/stdout");
+
+  klog_puts("[OK] AF_UNIX socket family registered (with /dev/log sink)\n");
 }

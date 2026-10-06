@@ -18,8 +18,17 @@ typedef uint16_t sa_family_t;
 #define AF_INET 2
 #define AF_INET6 10
 #define AF_NETLINK 16
+#define AF_QIPCRTR 42
 #define NETLINK_ROUTE 0
+#define NETLINK_AUDIT 9
 #define NETLINK_KOBJECT_UEVENT 15
+
+// QRTR Address Structure
+struct sockaddr_qrtr {
+  sa_family_t sq_family; // AF_QIPCRTR (42)
+  uint32_t sq_node;
+  uint32_t sq_port;
+};
 
 // Netlink Address Structure
 struct sockaddr_nl {

@@ -4,6 +4,7 @@
 #include "lib/string.h"
 #include "sched/sched.h"
 #include "mm/heap.h"
+#include "apic/lapic_timer.h"
 #include <stdbool.h>
 
 static int ext3_recover_journal(ext2_mount_t *mnt, jbd_superblock_t *jsb,
@@ -13,12 +14,40 @@ static ext3_journal_state_t *ext3_journal_state(ext2_mount_t *mnt) {
   return &mnt->journal;
 }
 
+/* Called only with the transaction lock held. Recovery uses uncached
+ * mappings; normal transactions never change the journal inode itself. */
+static uint32_t ext3_journal_phys(ext2_mount_t *mnt, uint32_t logical) {
+  ext3_journal_state_t *trans = ext3_journal_state(mnt);
+  if (trans->journal_blocks && logical >= trans->journal_blocks)
+    return 0;
+  uint32_t slot = logical % EXT3_JOURNAL_MAP_SLOTS;
+  if (trans->map_keys[slot] == logical + 1)
+    return trans->map_blocks[slot];
+  uint32_t phys = ext2_get_block_num(mnt, &trans->journal_inode, logical);
+  if (!phys || phys >= mnt->sb.s_blocks_count)
+    return 0;
+  trans->map_blocks[slot] = phys;
+  trans->map_keys[slot] = logical + 1;
+  return phys;
+}
+
+static int ext3_finish_transaction(ext3_journal_state_t *trans, int result) {
+  trans->active = false;
+  trans->owner_tid = 0;
+  trans->depth = 0;
+  rawspinlock_release(&trans->lock);
+  return result;
+}
+
 void ext3_init_journal(ext2_mount_t *mnt) {
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
   rawspinlock_init(&trans->lock);
   trans->active = false;
   trans->owner_tid = 0;
   trans->depth = 0;
+  trans->io_failed = false;
+  trans->journal_blocks = 0;
+  memset(trans->map_keys, 0, sizeof(trans->map_keys));
   if (!(mnt->sb.s_feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL)) {
     return;
   }
@@ -68,6 +97,7 @@ void ext3_init_journal(ext2_mount_t *mnt) {
   }
 
   trans->sequence = __builtin_bswap32(jsb->s_sequence);
+  trans->journal_blocks = __builtin_bswap32(jsb->s_maxlen);
   uint32_t start = __builtin_bswap32(jsb->s_start);
 
   klog_puts("[JBD2] Found valid journal.\n");
@@ -109,18 +139,28 @@ int ext3_journal_start(ext2_mount_t *mnt) {
    * Only the owning thread may nest a transaction. Other writers wait until
    * the complete journal commit/checkpoint sequence has finished.
    */
+  uint64_t wait_start = lapic_timer_get_ms();
+  bool warned = false;
   while (!rawspinlock_try_acquire(&trans->lock)) {
+    if (!warned && lapic_timer_get_ms() - wait_start > 5000) {
+      klogf("[JBD2] transaction wait tid=%u owner=%u active=%u depth=%u blocks=%u\n",
+            tid, trans->owner_tid, trans->active, trans->depth, trans->blocks_in_trans);
+      warned = true;
+    }
     sched_yield();
   }
   trans->active = true;
   trans->owner_tid = tid;
   trans->depth = 1;
   trans->blocks_in_trans = 0;
+  trans->io_failed = false;
 
   trans->start_block = 1;
 
   if (!trans->desc_block_buf)
     trans->desc_block_buf = kmalloc(mnt->block_size);
+  if (!trans->desc_block_buf)
+    return ext3_finish_transaction(trans, -1);
   memset(trans->desc_block_buf, 0, mnt->block_size);
 
   jbd_header_t *h = (jbd_header_t *)trans->desc_block_buf;
@@ -135,11 +175,16 @@ int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data) {
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
   if (!trans->active)
     return ext2_write_block(mnt, block_nr, data);
+  if (trans->io_failed)
+    return -1;
 
   uint32_t tag_offset = sizeof(jbd_header_t) + (trans->blocks_in_trans *
                                                 sizeof(jbd_block_tag_t));
   if (tag_offset + sizeof(jbd_block_tag_t) > mnt->block_size) {
-    return ext2_write_block(mnt, block_nr, data);
+    int result = ext2_write_block(mnt, block_nr, data);
+    if (result != 0)
+      trans->io_failed = true;
+    return result;
   }
 
   jbd_block_tag_t *tag =
@@ -150,24 +195,17 @@ int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data) {
   uint32_t journal_data_pos =
       trans->start_block + 1 + trans->blocks_in_trans;
   uint32_t phys_pos =
-      ext2_get_block_num(mnt, &trans->journal_inode, journal_data_pos);
+      ext3_journal_phys(mnt, journal_data_pos);
 
   uint8_t *safe_data = (uint8_t *)data;
   if (*(const uint32_t *)data == __builtin_bswap32(EXT3_JOURNAL_MAGIC_NUMBER)) {
     tag->t_flags |= __builtin_bswap32(JBD_FLAG_ESCAPE);
   }
 
-  ext2_write_block(mnt, phys_pos, safe_data);
-
-  int cache_idx = block_nr % EXT2_CACHE_SIZE;
-  spinlock_acquire(&mnt->cache_lock);
-  if (!mnt->cache[cache_idx].data)
-    mnt->cache[cache_idx].data = kmalloc(mnt->block_size);
-  if (mnt->cache[cache_idx].data) {
-    mnt->cache[cache_idx].num = block_nr;
-    memcpy(mnt->cache[cache_idx].data, data, mnt->block_size);
+  if (!phys_pos || ext2_write_block(mnt, phys_pos, safe_data) != 0) {
+    trans->io_failed = true;
+    return -1;
   }
-  spinlock_release(&mnt->cache_lock);
 
   /*
    * The transaction's cache is direct-mapped and is only an acceleration,
@@ -175,9 +213,12 @@ int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data) {
    * reread the pre-transaction bitmap and hand out an extent-tree block a
    * second time.  Keep the home block coherent immediately; the journal
    * record is still written first and is replayable on recovery.
+   * ext2_write_block publishes the cache image and tracks overlapping misses.
    */
-  if (ext2_write_block(mnt, block_nr, data) != 0)
+  if (ext2_write_block(mnt, block_nr, data) != 0) {
+    trans->io_failed = true;
     return -1;
+  }
 
   trans->blocks_in_trans++;
   return 0;
@@ -190,7 +231,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
      * allocator counters here.  On journaled mounts stop() is only reached by
      * the transaction owner, which takes the commit path below. */
     if (!(mnt->sb.s_feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL))
-      ext2_flush_metadata(mnt);
+      return ext2_flush_metadata(mnt);
     return 0;
   }
   if (trans->depth > 1) {
@@ -201,7 +242,13 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
   /* All group-descriptor and superblock changes made by this transaction are
    * written once, before the descriptor is finalised, so recovery replays
    * them together with the bitmap blocks. */
-  ext2_flush_metadata(mnt);
+  if (trans->io_failed || ext2_flush_metadata(mnt) != 0 || trans->io_failed)
+    return ext3_finish_transaction(trans, -1);
+
+  /* Read-only nested helpers and unchanged chown calls need no log records. */
+  if (trans->blocks_in_trans == 0) {
+    return ext3_finish_transaction(trans, 0);
+  }
 
   if (trans->blocks_in_trans > 0) {
     uint32_t last_tag_off =
@@ -212,11 +259,16 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
     tag->t_flags |= __builtin_bswap32(JBD_FLAG_LAST_TAG);
   }
 
-  uint32_t desc_phys = ext2_get_block_num(mnt, &trans->journal_inode,
-                                          trans->start_block);
-  ext2_write_block(mnt, desc_phys, trans->desc_block_buf);
-
-  uint8_t *commit_buf = kmalloc(mnt->block_size);
+  /* Reuse scratch storage under the mount's transaction lock. The journal
+   * superblock is still reread for each commit; caching its contents could
+   * hide changes after an I/O failure. */
+  if (!trans->commit_block_buf)
+    trans->commit_block_buf = kmalloc(mnt->block_size);
+  if (!trans->super_block_buf)
+    trans->super_block_buf = kmalloc(mnt->block_size);
+  if (!trans->commit_block_buf || !trans->super_block_buf)
+    return ext3_finish_transaction(trans, -1);
+  uint8_t *commit_buf = trans->commit_block_buf;
   memset(commit_buf, 0, mnt->block_size);
   jbd_header_t *ch = (jbd_header_t *)commit_buf;
   ch->h_magic = __builtin_bswap32(EXT3_JOURNAL_MAGIC_NUMBER);
@@ -226,28 +278,29 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
   uint32_t commit_pos =
       trans->start_block + 1 + trans->blocks_in_trans;
   uint32_t commit_phys =
-      ext2_get_block_num(mnt, &trans->journal_inode, commit_pos);
-  ext2_write_block(mnt, commit_phys, commit_buf);
-  kfree(commit_buf);
+      ext3_journal_phys(mnt, commit_pos);
+  uint32_t desc_phys = ext3_journal_phys(mnt, trans->start_block);
+  uint32_t sb_phys = ext3_journal_phys(mnt, 0);
+  if (!desc_phys || !commit_phys || !sb_phys)
+    return ext3_finish_transaction(trans, -1);
+  if (ext2_write_block(mnt, desc_phys, trans->desc_block_buf) != 0 ||
+      ext2_write_block(mnt, commit_phys, commit_buf) != 0)
+    return ext3_finish_transaction(trans, -1);
 
-  uint8_t *sb_buf = kmalloc(mnt->block_size);
-  uint32_t sb_phys = ext2_get_block_num(mnt, &trans->journal_inode, 0);
-  ext2_read_block(mnt, sb_phys, sb_buf);
+  uint8_t *sb_buf = trans->super_block_buf;
+  if (ext2_read_block(mnt, sb_phys, sb_buf) != 0)
+    return ext3_finish_transaction(trans, -1);
   jbd_superblock_t *jsb = (jbd_superblock_t *)sb_buf;
   jsb->s_start = __builtin_bswap32(trans->start_block);
-  ext2_write_block(mnt, sb_phys, sb_buf);
-  trans->sequence++;
-  trans->active = false;
-  trans->owner_tid = 0;
-  trans->depth = 0;
+  if (ext2_write_block(mnt, sb_phys, sb_buf) != 0)
+    return ext3_finish_transaction(trans, -1);
 
-  jsb->s_sequence = __builtin_bswap32(trans->sequence);
+  jsb->s_sequence = __builtin_bswap32(trans->sequence + 1);
   jsb->s_start = 0;
-  ext2_write_block(mnt, sb_phys, sb_buf);
-  kfree(sb_buf);
-  rawspinlock_release(&trans->lock);
-
-  return 0;
+  if (ext2_write_block(mnt, sb_phys, sb_buf) != 0)
+    return ext3_finish_transaction(trans, -1);
+  trans->sequence++;
+  return ext3_finish_transaction(trans, 0);
 }
 
 static int ext3_recover_journal(ext2_mount_t *mnt, jbd_superblock_t *jsb,

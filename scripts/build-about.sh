@@ -14,7 +14,7 @@ else
 fi
 
 if [ ! -d "$SYSROOT" ]; then
-    echo "Error: Alpine rootfs not found. Run scripts/setup-alpine.sh first."
+    echo "Error: Alpine rootfs not found. Run scripts/setup-arch.sh first."
     exit 1
 fi
 

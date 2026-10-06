@@ -37,7 +37,7 @@ QUAKE2_STAMP := build/quake2/.built
 # unless the outputs are actually missing.
 $(QUAKE2_BUNDLE_FILES): $(QUAKE2_STAMP)
 
-$(QUAKE2_STAMP): $(ALPINE_STAMP) scripts/build-quake2.sh \
+$(QUAKE2_STAMP): $(ALPINE_STAMP) $(GLIBC_STAMP) scripts/build-quake2.sh \
 		scripts/quake2-sdl2-config.in scripts/quake2-avoryos-evdev.h
 	./scripts/build-quake2.sh && \
 		mkdir -p $(dir $(QUAKE2_STAMP)) && \
@@ -45,7 +45,7 @@ $(QUAKE2_STAMP): $(ALPINE_STAMP) scripts/build-quake2.sh \
 
 BUTTERSCOTCH_STAMP := build/butterscotch/.built
 
-$(BUTTERSCOTCH_STAMP): $(ALPINE_STAMP) $(MUSL_LIBC) scripts/build-butterscotch.sh
+$(BUTTERSCOTCH_STAMP): $(ALPINE_STAMP) $(GLIBC_STAMP) scripts/build-butterscotch.sh
 	./scripts/build-butterscotch.sh && \
 		mkdir -p $(dir $(BUTTERSCOTCH_STAMP)) && \
 		touch $(BUTTERSCOTCH_STAMP)
@@ -83,11 +83,11 @@ GLIBC_CC := $(GLIBC_TOOLCHAIN_BIN)/x86_64-buildroot-linux-gnu-gcc
 GLIBC_USER_CFLAGS := -O2 -Wall -Wextra -fno-stack-protector \
 	--sysroot=$(GLIBC_SYSROOT)
 
-# Alpine rootfs sysroot (built by scripts/setup-alpine.sh)
+# Alpine rootfs sysroot (built by scripts/setup-arch.sh)
 ALPINE_SYSROOT := $(CURDIR)/build/alpine/rootfs
 ALPINE_STAMP := $(CURDIR)/build/alpine/.built
 
-$(ALPINE_STAMP): scripts/setup-alpine.sh
+$(ALPINE_STAMP): scripts/setup-arch.sh
 	@mkdir -p $(dir $(ALPINE_STAMP))
 	@touch $(ALPINE_STAMP)
 
@@ -182,12 +182,12 @@ GTK3_LDFLAGS := \
 
 # Qt5 test - include/lib flags
 QT5_INCLUDES := \
-	-I$(ALPINE_SYSROOT)/usr/include/qt5 \
-	-I$(ALPINE_SYSROOT)/usr/include/qt5/QtCore \
-	-I$(ALPINE_SYSROOT)/usr/include/qt5/QtGui \
-	-I$(ALPINE_SYSROOT)/usr/include/qt5/QtWidgets \
-	-I$(ALPINE_SYSROOT)/usr/include/qt5/QtOpenGL \
-	-I$(ALPINE_SYSROOT)/usr/include/qt5/QtPrintSupport
+	-I$(ALPINE_SYSROOT)/usr/include/qt \
+	-I$(ALPINE_SYSROOT)/usr/include/qt/QtCore \
+	-I$(ALPINE_SYSROOT)/usr/include/qt/QtGui \
+	-I$(ALPINE_SYSROOT)/usr/include/qt/QtWidgets \
+	-I$(ALPINE_SYSROOT)/usr/include/qt/QtOpenGL \
+	-I$(ALPINE_SYSROOT)/usr/include/qt/QtPrintSupport
 QT5_LIBS := \
 	-L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
 	-lQt5Widgets -lQt5Gui -lQt5Core \
@@ -247,6 +247,38 @@ run: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-device usb-mouse,bus=xhci.0 \
 		$(QEMUFLAGS)
 run-tcg: run-x86_64
+
+# ── NUMA multi-node test target ──────────────────────────────────────────────
+#
+# Boots AvoryOS with 2 NUMA nodes, 4 vCPUs (2 per node), 4GB RAM (2GB per node),
+# and explicit inter-node distance matrix.
+.PHONY: run-numa
+run-numa: edk2-ovmf $(IMAGE_NAME).iso disk.img
+	qemu-system-$(ARCH) \
+		-M q35,pcspk-audiodev=snd0 \
+		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
+		-cdrom $(IMAGE_NAME).iso \
+		-drive file=disk.img,format=raw,if=none,id=nvme0 \
+		-device nvme,serial=avoryos0,drive=nvme0 \
+		-cpu host -enable-kvm \
+		-smp $(RUN_SMP),sockets=2,cores=4,threads=1 \
+		-m 4G \
+		-object memory-backend-ram,id=mem0,size=2G \
+		-object memory-backend-ram,id=mem1,size=2G \
+		-numa node,nodeid=0,cpus=0-3,memdev=mem0 \
+		-numa node,nodeid=1,cpus=4-7,memdev=mem1 \
+		-numa dist,src=0,dst=1,val=21 \
+		-numa dist,src=1,dst=0,val=21 \
+		-serial stdio \
+		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
+		-device rtl8139,netdev=net0 \
+		-netdev user,id=net0 \
+		-device intel-hda -device hda-duplex,audiodev=snd0 \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0 \
+		-device usb-mouse,bus=xhci.0 \
+		$(QEMUFLAGS)
+
 
 # ── LinuxKPI DRM canary (Phase 4+) ──────────────────────────────────────────
 #
@@ -792,13 +824,16 @@ build/firmware/.stamp: scripts/linux-firmware-install.sh scripts/linux/firmware-
 	@touch $@
 
 disk.img: GNUmakefile userland/winoptions userland/icewm-menu $(ALPINE_STAMP)
-disk.img: scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh userland/avory-login.elf
+disk.img: scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh userland/avory-login.elf userland/avory-installer.elf
 disk.img:  userland/dns_lookup.elf userland/nettest.elf
 disk.img: userland/test_clone_futex.elf
 disk.img: userland/test_futex_pi.elf
 disk.img: userland/test_unix_sockets.elf
 disk.img: userland/test_syscall_speed.elf
+disk.img: userland/test_mm_speed.elf
+disk.img: userland/test_journal_speed.elf
 disk.img: userland/test_syscall_cpu.elf
+disk.img: userland/test_blocking_liveness.elf
 disk.img: userland/test_hugepages.elf
 disk.img: userland/test_zero_page.elf
 disk.img: userland/test_copy_user.elf
@@ -825,7 +860,7 @@ disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 
 
 disk.img: $(BASH_STAMP) $(COREUTILS_STAMP) $(ALPINE_STAMP) $(QUAKE2_BUNDLE_FILES)
-disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/about.elf userland/hello_glibc.elf userland/booter.elf userland/reboot.elf userland/shutdown.elf userland/apm.elf userland/test_cpp.elf  userland/kilo.elf  userland/ls.elf userland/lspci.elf userland/lsblk.elf userland/readelf.elf userland/pong.elf userland/raycast.elf userland/asplay.elf userland/kria.elf userland/doom.elf userland/doom_x11.elf userland/gtk_test.elf userland/qt5_test.elf userland/sdl3_test.elf userland/tglgears_fb.elf userland/tglgears_drm.elf userland/tglhello_drm.elf userland/test_mem_stress.elf userland/classicube.elf userland/terrain.png userland/texpacks/classicube.zip initrd/startx.sh initrd/startw.sh initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh AetherDE/x11-wm/AetherWM AetherDE/aether-dock/aether-dock AetherDE/aether-panel/aether-panel AetherDE/wayland-compositor/aether-compositor AetherDE/demo-client/aether-window AetherDE/scripts/sax11.sh AetherDE/scripts/sawayland.sh userland/avoryd.elf $(AVORYD_CONFIG_FILES)
+disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/about.elf userland/hello_glibc.elf userland/booter.elf userland/reboot.elf userland/shutdown.elf userland/apm.elf userland/test_cpp.elf  userland/kilo.elf  userland/ls.elf userland/lspci.elf userland/lsblk.elf userland/readelf.elf userland/pong.elf userland/raycast.elf userland/asplay.elf userland/kria.elf userland/doom.elf userland/doom_x11.elf userland/gtk3_test.elf userland/qt5_test.elf userland/sdl3_test.elf userland/tglgears_fb.elf userland/tglgears_drm.elf userland/tglhello_drm.elf userland/test_mem_stress.elf userland/classicube.elf userland/terrain.png userland/texpacks/classicube.zip initrd/startx.sh initrd/startw.sh initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh AetherDE/x11-wm/AetherWM AetherDE/aether-dock/aether-dock AetherDE/aether-panel/aether-panel AetherDE/wayland-compositor/aether-compositor AetherDE/demo-client/aether-window AetherDE/scripts/sax11.sh AetherDE/scripts/sawayland.sh userland/avoryd.elf $(AVORYD_CONFIG_FILES)
 	@echo "Creating partitioned disk image (GPT)..."
 	@if [ -L ./part.img ]; then \
 		old_loop=$$(readlink ./part.img); \
@@ -850,7 +885,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "cd /"; \
 		echo "mkdir tmp"; \
 		echo "mkdir bin"; \
-		echo "mkdir lib"; \
+		echo "mkdir .config"; \
+		echo "mkdir .cache"; \
 		echo "rm bin/startx.sh"; \
 		echo "write initrd/startx.sh bin/startx.sh"; \
 		echo "rm bin/startw.sh"; \
@@ -873,6 +909,16 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/avoryd.elf bin/avoryd"; \
 		echo "rm bin/avory-login"; \
 		echo "write userland/avory-login.elf bin/avory-login"; \
+		echo "rm bin/avory-installer"; \
+		echo "write userland/avory-installer.elf bin/avory-installer"; \
+		echo "rm usr/sbin/avory-installer"; \
+		echo "write userland/avory-installer.elf usr/sbin/avory-installer"; \
+		echo "rm bin/install-avoryos"; \
+		echo "symlink bin/install-avoryos /usr/sbin/avory-installer"; \
+		echo "rm bin/false"; \
+		echo "symlink bin/false /usr/bin/false"; \
+		echo "rm bin/true"; \
+		echo "symlink bin/true /usr/bin/true"; \
 		echo "mkdir etc"; \
 		echo "mkdir etc/apm"; \
 		echo "mkdir etc/apm/cache"; \
@@ -891,19 +937,6 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write initrd/avoryd/services/x11.service etc/avoryd/services/x11.service"; \
 		echo "rm etc/weston.ini"; \
 		echo "write initrd/weston.ini etc/weston.ini"; \
-		echo "rm lib/libc.so"; \
-		echo "write toolchain/musl-sysroot/lib/libc.so lib/libc.so"; \
-		echo "rm lib/ld-musl-x86_64.so.1"; \
-		echo "write toolchain/musl-sysroot/lib/libc.so lib/ld-musl-x86_64.so.1"; \
-		echo "mkdir lib64"; \
-		echo "rm lib64/libc.so.6"; \
-		echo "write toolchain/glibc-sysroot/lib/libc.so.6 lib64/libc.so.6"; \
-		echo "rm lib64/libm.so.6"; \
-		echo "write toolchain/glibc-sysroot/lib/libm.so.6 lib64/libm.so.6"; \
-		echo "rm lib64/ld-linux-x86-64.so.2"; \
-		echo "write toolchain/glibc-sysroot/lib/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2"; \
-		echo "rm lib64/libresolv.so.2"; \
-		echo "write toolchain/glibc-sysroot/lib/libresolv.so.2 lib64/libresolv.so.2"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
 	@if [ -d AetherDE ]; then \
 		echo "Installing AetherDE into disk image (/AetherDE)..."; \
@@ -913,10 +946,11 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "Installing GLIBC headers into disk image (opt/glibc/include)..."; \
 		./scripts/populate-ext2-dir.sh ./part.img toolchain/glibc-sysroot/usr/include opt/glibc/include; \
 	fi
-	@if [ -d toolchain/glibc-sysroot/usr/lib ]; then \
-		echo "Installing GLIBC libs into /usr/lib64..."; \
-		./scripts/populate-ext2-dir.sh ./part.img toolchain/glibc-sysroot/usr/lib usr/lib64; \
-	fi
+	# NOTE: the toolchain glibc *libs* are deliberately NOT copied anymore.
+	# The userland tree now ships its own glibc (Arch), and overlaying the
+	# older toolchain build on top mixes two glibc versions in /usr/lib,
+	# which breaks every dynamically linked binary (e.g. bash failing on
+	# __pointer_chk_guard). This step only made sense for the old musl tree.
 	@{ \
 		echo "cd /"; \
 		echo "rm bin/netlink_test"; \
@@ -1025,8 +1059,14 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/test_pty_master.elf bin/test_pty_master"; \
 		echo "rm bin/test_syscall_speed"; \
 		echo "write userland/test_syscall_speed.elf bin/test_syscall_speed"; \
+		echo "rm bin/test_mm_speed"; \
+		echo "write userland/test_mm_speed.elf bin/test_mm_speed"; \
+		echo "rm bin/test_journal_speed"; \
+		echo "write userland/test_journal_speed.elf bin/test_journal_speed"; \
 		echo "rm bin/test_syscall_cpu"; \
 		echo "write userland/test_syscall_cpu.elf bin/test_syscall_cpu"; \
+		echo "rm bin/test_blocking_liveness"; \
+		echo "write userland/test_blocking_liveness.elf bin/test_blocking_liveness"; \
 		echo "rm bin/test_hugepages"; \
 		echo "write userland/test_hugepages.elf bin/test_hugepages"; \
 		echo "rm bin/test_zero_page"; \
@@ -1087,11 +1127,29 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		fi; \
 	fi
 	@if [ -d build/alpine/rootfs ]; then \
-		echo "Populating Alpine Linux rootfs into disk image..."; \
+		echo "Populating Arch Linux rootfs into disk image..."; \
 		./scripts/configure-accounts.sh build/alpine/rootfs; \
 		./scripts/populate-ext2-dir.sh ./part.img build/alpine/rootfs /; \
 	fi
-	# The Alpine rootfs also has a stale bin/startx.sh.  Restore these
+	@_dbg=debugfs; if [ -x /run/host/usr/bin/debugfs ]; then _dbg=/run/host/usr/bin/debugfs; fi; \
+	echo "Verifying image libc matches build tree..."; \
+	_img_ver=$$("$$_dbg" -R "dump usr/lib/libc.so.6 /tmp/avoryos-img-libc-check" ./part.img 2>/dev/null && strings -a /tmp/avoryos-img-libc-check 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
+	rm -f /tmp/avoryos-img-libc-check; \
+	_tree_ver=$$(strings -a build/alpine/rootfs/usr/lib/libc.so.6 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
+	if [ "$$_img_ver" != "$$_tree_ver" ] || [ "$$_img_ver" = "MISSING" ]; then \
+		echo "ERROR: image libc ($$_img_ver) != tree libc ($$_tree_ver): refusing mixed-libc image" >&2; \
+		echo "ERROR: full clean rebuild required (interrupted populates leave stale libs)" >&2; \
+		exit 1; \
+	fi; \
+	echo "Verifying image loader matches build tree..."; \
+	_img_ld=$$("$$_dbg" -R "dump usr/lib/ld-linux-x86-64.so.2 /tmp/avoryos-img-ld-check" ./part.img 2>/dev/null && strings -a /tmp/avoryos-img-ld-check 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
+	rm -f /tmp/avoryos-img-ld-check; \
+	_tree_ld=$$(strings -a build/alpine/rootfs/usr/lib/ld-linux-x86-64.so.2 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
+	if [ "$$_img_ld" != "$$_tree_ld" ] || [ "$$_img_ld" = "MISSING" ]; then \
+		echo "ERROR: image loader ($$_img_ld) != tree loader ($$_tree_ld): refusing mixed-libc image" >&2; \
+		exit 1; \
+	fi
+	# The Arch rootfs also has a stale bin/startx.sh.  Restore these
 	# AvoryOS-owned files after the overlay, otherwise XFCE runs startxfce4
 	# and opens its failsafe-session error dialog.
 	@{ \
@@ -1110,6 +1168,25 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field bin/startw.sh mode 0100755"; \
 		echo "set_inode_field bin/drm-pick.sh mode 0100755"; \
 		echo "set_inode_field etc/profile.d/avory-drm.sh mode 0100644"; \
+		echo "set_inode_field var/lib/sddm mode 040775"; \
+		_sddm_u=$$(awk -F: '/^sddm:/{print $$3; exit}' build/alpine/rootfs/etc/passwd 2>/dev/null); \
+		_sddm_g=$$(awk -F: '/^sddm:/{print $$3; exit}' build/alpine/rootfs/etc/group 2>/dev/null); \
+		[ -n "$$_sddm_u" ] || _sddm_u=642; \
+		[ -n "$$_sddm_g" ] || _sddm_g=642; \
+		echo "set_inode_field var/lib/sddm uid $$_sddm_u"; \
+		echo "set_inode_field var/lib/sddm gid $$_sddm_g"; \
+		echo "set_inode_field var/lib/sddm/.config mode 040775"; \
+		echo "set_inode_field var/lib/sddm/.config uid $$_sddm_u"; \
+		echo "set_inode_field var/lib/sddm/.config gid $$_sddm_g"; \
+		echo "set_inode_field var/lib/sddm/.config/sddm-greeter-qt6rc mode 0100664"; \
+		echo "set_inode_field var/lib/sddm/.config/sddm-greeter-qt6rc uid $$_sddm_u"; \
+		echo "set_inode_field var/lib/sddm/.config/sddm-greeter-qt6rc gid $$_sddm_g"; \
+		echo "set_inode_field var/lib/sddm/.config/sddm-greeter-qt5rc mode 0100664"; \
+		echo "set_inode_field var/lib/sddm/.config/sddm-greeter-qt5rc uid $$_sddm_u"; \
+		echo "set_inode_field var/lib/sddm/.config/sddm-greeter-qt5rc gid $$_sddm_g"; \
+		echo "set_inode_field usr/libexec/dbus-daemon-launch-helper mode 0104755"; \
+		echo "set_inode_field usr/libexec/dbus-daemon-launch-helper uid 0"; \
+		echo "set_inode_field usr/libexec/dbus-daemon-launch-helper gid 86"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
 	@echo "Installing Quake II into disk image..."
 	@./scripts/populate-ext2-dir.sh ./part.img userland/quake2 opt/quake2
@@ -1142,26 +1219,47 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field opt/butterscotch/butterscotch mode 0100755"; \
 		echo "set_inode_field usr/bin/butterscotch mode 0100755"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
-	@echo "Fixing up glibc/musl library coexistence..."
+	@echo "Installing Arch glibc into /lib and /lib64 (no symlinks)..."
+	@# The guest kernel does not resolve the usrmerge symlinks for the
+	@# interpreter path (/lib64/ld-linux... -> usr/lib/...): with /lib64 as
+	@# a symlink, exec of /bin/sh fails with
+	@#   ELF load failed: File not found: /lib64/ld-linux-x86-64.so.2
+	@# while a real /lib64 dir with the old toolchain glibc 2.43 loads but
+	@# then fails every dynamic binary with
+	@#   undefined symbol: __pointer_chk_guard, version GLIBC_PRIVATE
+	@# (Arch glibc is 2.44: libc UNDs it, ld.so defines it; 2.43 has neither).
+	@# So keep /lib and /lib64 as real dirs holding the SAME Arch 2.44 libs
+	@# as /usr/lib. No version skew, no symlink dependency.
 	@{ \
-		echo "cd /lib"; \
-		echo "rm libc.so.6"; \
-		echo "rm libm.so.6"; \
-		echo "rm libpthread.so.0"; \
-		echo "rm ld-linux-x86-64.so.2"; \
-		echo "rm libresolv.so.2"; \
-		echo "rm librt.so.1"; \
-		echo "rm libutil.so.1"; \
+		echo "cd /"; \
+		echo "rm lib"; \
+		echo "rm lib64"; \
+		echo "rmdir lib"; \
+		echo "rmdir lib64"; \
+		echo "rm_rf lib"; \
+		echo "rm_rf lib64"; \
+		echo "mkdir lib"; \
+		echo "mkdir lib64"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
-	@# Restore real glibc libs to /lib so glibc-linked binaries (coreutils sleep,
-	@# mkdir etc.) resolve symbols correctly. musl stub at /lib/libc.so.6 lacks
-	@# glibc-specific symbols like re_syntax_options which crashes those binaries.
-	@if [ -f toolchain/glibc-sysroot/lib/libc.so.6 ]; then \
-		echo "Restoring real glibc libc.so.6 to /lib..."; \
-		debugfs -w -R "write toolchain/glibc-sysroot/lib/libc.so.6 lib/libc.so.6" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write toolchain/glibc-sysroot/lib/libm.so.6 lib/libm.so.6" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write toolchain/glibc-sysroot/lib/ld-linux-x86-64.so.2 lib/ld-linux-x86-64.so.2" ./part.img >/dev/null 2>&1 || true; \
+	@debugfs -w -R "write build/alpine/rootfs/usr/lib/ld-linux-x86-64.so.2 lib/ld-linux-x86-64.so.2" ./part.img >/dev/null 2>&1 || true; \
+	debugfs -w -R "write build/alpine/rootfs/usr/lib/libc.so.6 lib/libc.so.6" ./part.img >/dev/null 2>&1 || true; \
+	debugfs -w -R "write build/alpine/rootfs/usr/lib/libm.so.6 lib/libm.so.6" ./part.img >/dev/null 2>&1 || true; \
+	debugfs -w -R "write build/alpine/rootfs/usr/lib/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2" ./part.img >/dev/null 2>&1 || true; \
+	debugfs -w -R "write build/alpine/rootfs/usr/lib/libc.so.6 lib64/libc.so.6" ./part.img >/dev/null 2>&1 || true; \
+	debugfs -w -R "write build/alpine/rootfs/usr/lib/libm.so.6 lib64/libm.so.6" ./part.img >/dev/null 2>&1 || true; \
+	if [ -f build/alpine/rootfs/usr/lib/musl/lib/libc.so ]; then \
+		debugfs -w -R "write build/alpine/rootfs/usr/lib/musl/lib/libc.so lib/ld-musl-x86_64.so.1" ./part.img >/dev/null 2>&1 || true; \
 	fi
+	@_dbg=debugfs; if [ -x /run/host/usr/bin/debugfs ]; then _dbg=/run/host/usr/bin/debugfs; fi; \
+	echo "Verifying image loader matches build tree..."; \
+	_img_ld=$$("$$_dbg" -R "dump lib64/ld-linux-x86-64.so.2 /tmp/avoryos-img-ld-check" ./part.img 2>/dev/null && strings -a /tmp/avoryos-img-ld-check 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
+	rm -f /tmp/avoryos-img-ld-check; \
+	_tree_ld=$$(strings -a build/alpine/rootfs/usr/lib/ld-linux-x86-64.so.2 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
+	if [ "$$_img_ld" != "$$_tree_ld" ] || [ "$$_img_ld" = "MISSING" ]; then \
+		echo "ERROR: image /lib64 loader ($$_img_ld) != tree loader ($$_tree_ld)" >&2; \
+		exit 1; \
+	fi; \
+	echo "glibc compat dirs OK (/lib, /lib64 hold Arch 2.44 libs)";
 	@echo "Populating root filesystem with additional tools..."
 
 	@if [ -d build/tcc-glibc-install/opt/tcc ]; then \
@@ -1169,8 +1267,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		./scripts/populate-ext2-dir.sh ./part.img build/tcc-glibc-install/opt/tcc opt/tcc; \
 		debugfs -w -R "rm bin/tcc" ./part.img >/dev/null 2>&1 || true; \
 		debugfs -w -R "write build/tcc-glibc-install/opt/tcc/bin/tcc bin/tcc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm lib64/libtcc.so" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write build/tcc-glibc-install/opt/tcc/lib/libtcc.so lib64/libtcc.so" ./part.img >/dev/null 2>&1 || true; \
+		debugfs -w -R "rm usr/lib/libtcc.so" ./part.img >/dev/null 2>&1 || true; \
+		debugfs -w -R "write build/tcc-glibc-install/opt/tcc/lib/libtcc.so usr/lib/libtcc.so" ./part.img >/dev/null 2>&1 || true; \
 		if [ -f toolchain/musl-sysroot/lib/libc.a ]; then \
 			echo "Installing musl static libs into TCC lib dir for static linking..."; \
 			debugfs -w -R "mkdir opt/tcc/lib/musl" ./part.img >/dev/null 2>&1 || true; \
@@ -1234,6 +1332,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "SSL_CERT_DIR=/etc/ssl/certs" >> /tmp/bashrc; \
 		echo "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt" >> /tmp/bashrc; \
 		echo "export SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE" >> /tmp/bashrc; \
+		echo 'export XDG_RUNTIME_DIR="$${XDG_RUNTIME_DIR:-/tmp/runtime-$$(id -u)}"' >> /tmp/bashrc; \
+		echo 'mkdir -p "$$XDG_RUNTIME_DIR" 2>/dev/null && chmod 1777 "$$XDG_RUNTIME_DIR" 2>/dev/null' >> /tmp/bashrc; \
 		debugfs -w -R "mkdir etc" ./part.img >/dev/null 2>&1 || true; \
 		echo "nameserver 10.0.2.3" > /tmp/resolv.conf; \
 		echo "127.0.0.1 localhost" > /tmp/hosts; \
@@ -1307,8 +1407,9 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "rm bin/ls"; \
 		echo "symlink bin/ls /opt/coreutils/bin/ls"; \
 		echo "set_inode_field bin/bash mode 0100755"; \
-		echo "set_inode_field bin/sh mode 0100755"; \
 		echo "set_inode_field bin/avory-login mode 0100755"; \
+		echo "set_inode_field bin/avory-installer mode 0100755"; \
+		echo "set_inode_field usr/sbin/avory-installer mode 0100755"; \
 		echo "set_inode_field bin/avoryd mode 0100755"; \
 		echo "set_inode_field bin/sax11.sh mode 0100755"; \
 		echo "set_inode_field bin/sawayland.sh mode 0100755"; \
@@ -1338,9 +1439,17 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field bin/test_child_notify mode 0100755"; \
 		echo "set_inode_field bin/test_pty_master mode 0100755"; \
 		echo "set_inode_field bin/test_uaccess_bench mode 0100755"; \
+		echo "set_inode_field bin/test_mm_speed mode 0100755"; \
+		echo "set_inode_field bin/test_journal_speed mode 0100755"; \
 		echo "set_inode_field bin/test_readahead mode 0100755"; \
+		echo "set_inode_field etc/X11/xinit/xserverrc mode 0100755"; \
+		echo "set_inode_field etc/X11/xinit/xinitrc mode 0100755"; \
+		echo "set_inode_field etc/xdg/xfce4/xinitrc mode 0100755"; \
+		echo "set_inode_field usr/lib/dbus-daemon-launch-helper mode 0104755"; \
 		echo "set_inode_field home/avory uid 1000"; \
 		echo "set_inode_field home/avory gid 1000"; \
+		echo "set_inode_field .config mode 040777"; \
+		echo "set_inode_field .cache mode 040777"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
 
 	@if [ -L ./part.img ]; then \
@@ -1484,6 +1593,10 @@ userland/avoryd.elf: userland/avoryd.c $(MUSL_LIBC)
 userland/avory-login.elf: userland/avory-login.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
 		userland/avory-login.c -lcrypt -o userland/avory-login.elf
+
+userland/avory-installer.elf: userland/avory-installer.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/avory-installer.c -o userland/avory-installer.elf
 
 userland/nvme_test.elf: userland/nvme_test.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
@@ -1733,9 +1846,21 @@ userland/test_syscall_speed.elf: userland/test_syscall_speed.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
 		userland/test_syscall_speed.c -o userland/test_syscall_speed.elf
 
+userland/test_mm_speed.elf: userland/test_mm_speed.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/test_mm_speed.c -o userland/test_mm_speed.elf
+
+userland/test_journal_speed.elf: userland/test_journal_speed.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/test_journal_speed.c -o userland/test_journal_speed.elf -lpthread
+
 userland/test_syscall_cpu.elf: userland/test_syscall_cpu.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
 		userland/test_syscall_cpu.c -o userland/test_syscall_cpu.elf
+
+userland/test_blocking_liveness.elf: userland/test_blocking_liveness.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/test_blocking_liveness.c -o userland/test_blocking_liveness.elf -lpthread
 
 userland/test_hugepages.elf: userland/test_hugepages.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \

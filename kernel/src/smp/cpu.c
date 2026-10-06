@@ -15,6 +15,7 @@
 #include "lib/string.h"
 #include "lib/tsc.h"
 #include "mm/pmm.h"
+#include "mm/numa.h"
 #include "mm/vmm.h"
 #include "syscalls/syscall.h"
 #include <stdbool.h>
@@ -204,6 +205,8 @@ void ap_main(void) {
   // one tick a second, which is enough for all of them to notice a hang and
   // enough for any of them to read the serial console.
   while (1) {
+    extern void sched_reap_orphaned_zombies(void);
+    sched_reap_orphaned_zombies();
     /* rearm_if_earlier(), not arm_at(): a sleeping thread's deadline may have
      * been armed by sched_arm_next_deadline() on the way into this idle loop,
      * and a plain rearm here would push that wakeup out to a full second. */
@@ -211,11 +214,17 @@ void ap_main(void) {
      * this core would be halted anyway, so turning a dead process's page
      * tables into free frames costs nothing.  While a backlog exists, tick at
      * 1 ms (the same trick as the BSP's serial-pending idle tick) so the
-     * drain outruns producers; otherwise keep the 1 s tick for hang
-     * detection. */
-    vmm_defer_drain(VMM_DEFER_IDLE_NODES);
+     * drain outruns producers; otherwise keep a slow tick for hang
+     * detection.  The pending check is lock-free: an empty queue must not pay
+     * a spinlock acquire/release (and its cache-line bounce) on every wake. */
+    bool defer_pending = vmm_defer_pending() != 0;
+    if (defer_pending)
+      vmm_defer_drain(VMM_DEFER_IDLE_NODES);
+    /* Slow tick at 2 s: lockdiag flags a CPU hung after 3 s
+     * (LOCKDIAG_HUNG_CPU_MS), so 2 s still reports promptly while halving
+     * idle wakeups vs the old 1 s. */
     lapic_timer_rearm_if_earlier(lapic_timer_get_ms() +
-                                 (vmm_defer_pending() ? 1 : 1000));
+                                 (defer_pending ? 1 : 2000));
     hal_cpu_halt();
   }
 }
@@ -269,6 +278,11 @@ void cpu_init(void) {
     }
   }
 
+  // Register all discovered CPUs with NUMA subsystem
+  for (uint32_t i = 0; i < cpu_count; i++) {
+    numa_register_cpu(cpus[i].cpu_id, cpus[i].apic_id);
+  }
+
   // Step 3: Allocate kernel stacks
   for (uint32_t i = 0; i < cpu_count; i++) {
     cpus[i].stack_top = alloc_cpu_stack();
@@ -309,7 +323,8 @@ void cpu_init(void) {
     print_hex32(cpus[i].apic_id);
     console_puts(", Stack=0x");
     print_hex32((uint32_t)(cpus[i].stack_top >> 32));
-    print_hex32((uint32_t)(cpus[i].stack_top & 0xFFFFFFFF));
+    console_puts(", Node ");
+    print_uint32((uint32_t)numa_cpu_to_node(cpus[i].cpu_id));
     if (cpus[i].status == CPU_STATUS_BSP) {
       console_puts(" [BSP]");
     } else {

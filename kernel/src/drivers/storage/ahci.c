@@ -659,14 +659,20 @@ static int ahci_io(ahci_port_t *port, uint64_t lba, uint32_t count, void *buf,
 static int ahci_read(struct block_device *dev, uint64_t lba, uint32_t count,
                      void *buf) {
   struct ahci_drive *drive = (struct ahci_drive *)dev->driver_data;
-  return ahci_io(drive->port, lba, count, buf, 0);
+  int ret = ahci_io(drive->port, lba, count, buf, 0);
+  if (ret == 0)
+    block_stat_read(dev, count);
+  return ret;
 }
 
 static int ahci_write(struct block_device *dev, uint64_t lba, uint32_t count,
                       const void *buf) {
   struct ahci_drive *drive = (struct ahci_drive *)dev->driver_data;
   // Cast away const for our naive physical address calculation
-  return ahci_io(drive->port, lba, count, (void *)buf, 1);
+  int ret = ahci_io(drive->port, lba, count, (void *)buf, 1);
+  if (ret == 0)
+    block_stat_write(dev, count);
+  return ret;
 }
 
 static int ahci_flush(struct block_device *dev) {

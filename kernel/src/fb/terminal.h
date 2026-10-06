@@ -79,6 +79,11 @@ struct termios2 {
 #define TCSETS2 0x402c542b
 #define TCSETSW2 0x402c542c
 #define TCSETSF2 0x402c542d
+/* Queue selectors for TCFLSH (passed by value, not a pointer). */
+#define TCFLSH 0x540B
+#define TCIFLUSH 0
+#define TCOFLUSH 1
+#define TCIOFLUSH 2
 #define TIOCGPGRP 0x540F
 #define TIOCSPGRP 0x5410
 #define TIOCGWINSZ 0x5413

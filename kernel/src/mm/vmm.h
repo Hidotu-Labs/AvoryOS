@@ -62,6 +62,24 @@ bool vmm_map_huge_page(uint64_t *pml4, uint64_t virtual_addr,
 
 // Unmap a virtual page
 void vmm_unmap_page(uint64_t *pml4, uint64_t virtual_addr);
+/* Batch unmap primitives for teardown_range(): the caller must hold mm->lock
+ * and vmm_lock. vmm_unmap_page_locked() clears one 4 KB PTE (queuing the
+ * invalidation) and reports the frame; 2 MB PDEs are reported as
+ * VMM_UNMAP_HUGE without being cleared. vmm_unmap_huge_locked() clears a
+ * whole 2 MB PDE (whole-block owned case) and reports the block base. The
+ * caller drains once per batch and frees/reports frames afterwards. */
+typedef enum {
+  VMM_UNMAP_HOLE = 0,
+  VMM_UNMAP_4K = 1,
+  VMM_UNMAP_HUGE = 2,
+} vmm_unmap_kind_t;
+vmm_unmap_kind_t vmm_unmap_page_locked(uint64_t *pml4, uint64_t virtual_addr,
+                                       uint64_t *frame_out);
+void vmm_unmap_huge_locked(uint64_t *pml4, uint64_t virtual_addr,
+                           uint64_t *base_out);
+/* Caller holds vmm_lock. True when any present leaf (4 KB or huge) covers
+ * the address; allocates no page-table levels. */
+bool vmm_page_present_nolock(uint64_t *pml4, uint64_t virtual_addr);
 /* Release a frame only after this CPU's queued TLB shootdowns are acknowledged. */
 void vmm_defer_frame_free(void *phys, uint16_t pages);
 /* Drain this CPU's queued TLB work and release frames parked behind it. */

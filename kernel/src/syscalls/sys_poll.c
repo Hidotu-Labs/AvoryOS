@@ -7,14 +7,9 @@
 #include "../mm/vmm.h"
 #include "../sched/sched.h"
 #include "../sched/wait.h"
+#include "sys_io_shared.h"
 #include "syscall.h"
 #include <stdint.h>
-
-// User-space pointer validation: reject kernel/HHDM addresses
-#define USER_ADDR_MAX 0x00007FFFFFFFFFFFULL
-static inline bool is_user_ptr(uint64_t addr) {
-  return addr != 0 && addr <= USER_ADDR_MAX;
-}
 
 /* Safety-net rescan for a blocking poll(): wait queues drive normal wakeups,
  * this only bounds how long a producer that never signals one can go
@@ -36,7 +31,7 @@ static int poll_check_fds(struct pollfd *fds, uint64_t nfds, struct thread *t) {
     fds[i].revents = 0;
     if (fd < 0)
       continue;
-    if (fd >= MAX_FDS || !t->fds[fd]) {
+    if (fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd])) {
       fds[i].revents = POLLNVAL;
       ready++;
       continue;
@@ -58,6 +53,36 @@ static uint64_t do_poll(struct pollfd *fds, uint64_t nfds,
   struct thread *t = sched_get_current();
   if (!t)
     return (uint64_t)-1;
+
+  /* Snapshot the polled set for /proc/PID/syscall spin diagnosis. Runs in
+   * the target's own context, so fd tables can be read directly. */
+  {
+    uint64_t n = nfds < 8 ? nfds : 8;
+    for (uint64_t i = 0; i < 8; i++) {
+      if (i < n && fds) {
+        int fd = fds[i].fd;
+        t->last_poll_fds[i] = fd;
+        t->last_poll_events[i] = fds[i].events;
+        const char *p = "?";
+        if (fd >= 0 && fd < MAX_FDS) {
+          if (t->fd_paths && t->fd_paths[fd] && t->fd_paths[fd]->value[0])
+            p = t->fd_paths[fd]->value;
+          else if (t->fds && fd_is_valid_node(t->fds[fd]))
+            p = t->fds[fd]->name;
+        }
+        uint64_t j = 0;
+        while (j < 47 && p[j]) {
+          t->last_poll_paths[i][j] = p[j];
+          j++;
+        }
+        t->last_poll_paths[i][j] = '\0';
+      } else {
+        t->last_poll_fds[i] = -1;
+        t->last_poll_events[i] = 0;
+        t->last_poll_paths[i][0] = '\0';
+      }
+    }
+  }
 
   /* Fast path: check immediately. */
   int ready = poll_check_fds(fds, nfds, t);
@@ -100,14 +125,18 @@ static uint64_t do_poll(struct pollfd *fds, uint64_t nfds,
 
     size_t wq_count = 0;
     size_t valid_fds = 0;
+    t->state = THREAD_BLOCKED;
     for (uint64_t i = 0; i < nfds; i++) {
       int fd = fds[i].fd;
-      if (fd >= 0 && fd < MAX_FDS && t->fds[fd]) {
+      if (fd >= 0 && fd < MAX_FDS && fd_is_valid_node(t->fds[fd])) {
         valid_fds++;
         if (wq_count < max_wq && t->fds[fd]->wait_queue) {
           wait_queue_t *wq = (wait_queue_t *)t->fds[fd]->wait_queue;
           wq_entries[wq_count].thread = t;
           wq_entries[wq_count].next = NULL;
+          wq_entries[wq_count].wq = NULL;
+          wq_entries[wq_count].thread_next = NULL;
+          wq_entries[wq_count].thread_prev = NULL;
           wq_ptrs[wq_count] = wq;
           wait_queue_add(wq, &wq_entries[wq_count]);
           wq_count++;
@@ -115,7 +144,6 @@ static uint64_t do_poll(struct pollfd *fds, uint64_t nfds,
       }
     }
 
-    t->state = THREAD_BLOCKED;
     uint64_t safety_at = lapic_timer_get_ticks() + POLL_SAFETY_NET_MS;
     if (deadline != (uint64_t)-1) {
       t->wakeup_ticks = (deadline < safety_at) ? deadline : safety_at;
@@ -186,8 +214,6 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms,
 
 static uint64_t sys_ppoll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ptr,
                           uint64_t sigmask, uint64_t sigsetsize, uint64_t a5) {
-  (void)sigmask;
-  (void)sigsetsize;
   (void)a5;
 
   uint64_t timeout_ms = (uint64_t)-1;
@@ -198,10 +224,38 @@ static uint64_t sys_ppoll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ptr,
     } *ts = (void *)timeout_ptr;
     if (!vmm_is_user_addr_range_valid(timeout_ptr, 16))
       return (uint64_t)-14;
+    /* Remember the raw request for /proc/PID/syscall spin diagnosis. */
+    struct thread *cur = sched_get_current();
+    if (cur) {
+      cur->last_poll_sec = ts->tv_sec;
+      cur->last_poll_nsec = ts->tv_nsec;
+      cur->last_poll_nfds = nfds;
+    }
     timeout_ms = (uint64_t)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
+  } else {
+    struct thread *cur = sched_get_current();
+    if (cur) {
+      cur->last_poll_sec = -1;
+      cur->last_poll_nsec = 0;
+      cur->last_poll_nfds = nfds;
+    }
   }
 
-  return sys_poll(fds_ptr, nfds, timeout_ms, 0, 0, 0);
+  struct thread *t = sched_get_current();
+  uint64_t old_mask = t ? t->signal_mask : 0;
+  bool swapped = false;
+  if (sigmask && is_user_ptr(sigmask) && sigsetsize == 8 && t) {
+    if (!vmm_is_user_addr_range_valid(sigmask, 8))
+      return (uint64_t)-14;
+    uint64_t new_mask = *(uint64_t *)sigmask;
+    new_mask &= ~((1ULL << (9 - 1)) | (1ULL << (19 - 1))); // SIGKILL/SIGSTOP
+    t->signal_mask = new_mask;
+    swapped = true;
+  }
+  uint64_t ret = sys_poll(fds_ptr, nfds, timeout_ms, 0, 0, 0);
+  if (swapped)
+    t->signal_mask = old_mask;
+  return ret;
 }
 
 static uint64_t do_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
@@ -285,7 +339,6 @@ static uint64_t do_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
 static uint64_t sys_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
                              uint64_t exceptfds, uint64_t timeout,
                              uint64_t sigmask) {
-  (void)sigmask;
   if (nfds > 1024)
     return (uint64_t)-22;
   size_t set_size = (nfds + 7) / 8;
@@ -310,7 +363,34 @@ static uint64_t sys_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
     timeout_ms = (uint64_t)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
   }
 
-  return do_pselect6(nfds, readfds, writefds, exceptfds, timeout_ms);
+  struct thread *t = sched_get_current();
+  uint64_t old_mask = t ? t->signal_mask : 0;
+  bool swapped = false;
+  if (sigmask && is_user_ptr(sigmask) && t) {
+    // pselect6 passes struct { const sigset_t *ss; size_t ss_len; }
+    if (vmm_is_user_addr_range_valid(sigmask, 16)) {
+      uint64_t ss_ptr = *(uint64_t *)sigmask;
+      uint64_t ss_len = *((uint64_t *)sigmask + 1);
+      if (ss_ptr && ss_len == 8 && vmm_is_user_addr_range_valid(ss_ptr, 8)) {
+        uint64_t new_mask = *(uint64_t *)ss_ptr;
+        new_mask &= ~((1ULL << (9 - 1)) | (1ULL << (19 - 1)));
+        t->signal_mask = new_mask;
+        swapped = true;
+      } else if (ss_ptr == 0) {
+        // NULL ss with pselect6 means no mask change; fall through.
+      } else if (ss_ptr && vmm_is_user_addr_range_valid(ss_ptr, 8)) {
+        uint64_t new_mask = *(uint64_t *)ss_ptr;
+        new_mask &= ~((1ULL << (9 - 1)) | (1ULL << (19 - 1)));
+        t->signal_mask = new_mask;
+        swapped = true;
+      }
+    }
+  }
+
+  uint64_t ret = do_pselect6(nfds, readfds, writefds, exceptfds, timeout_ms);
+  if (swapped)
+    t->signal_mask = old_mask;
+  return ret;
 }
 
 static uint64_t sys_select(uint64_t nfds, uint64_t readfds, uint64_t writefds,

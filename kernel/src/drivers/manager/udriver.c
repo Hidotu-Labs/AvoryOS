@@ -915,9 +915,23 @@ static uint32_t driverctl_read(vfs_node_t *node, uint32_t offset,
       spinlock_release(&irq_dispatch_lock);
       return (uint32_t)-11;
     }
-    wait_queue_entry_t entry = {.thread = current, .next = NULL};
-    wait_queue_add(&session->irq_waitq, &entry);
+    wait_queue_entry_t entry = {.thread = current, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
     current->state = THREAD_BLOCKED;
+    wait_queue_add(&session->irq_waitq, &entry);
+    /* Recheck pending under irq_dispatch_lock before parking. */
+    {
+      bool rep = false;
+      for (size_t i = 0; i < UDRIVER_MAX_CLAIMS; i++) {
+        if (session->irqs[i].active && session->irqs[i].pending) { rep = true; break; }
+      }
+      if (rep) {
+        current->state = THREAD_RUNNING;
+        spinlock_release(&irq_dispatch_lock);
+        wait_queue_remove(&session->irq_waitq, &entry);
+        current->state = THREAD_RUNNING;
+        continue;
+      }
+    }
     spinlock_release(&irq_dispatch_lock);
     sched_yield();
     current->state = THREAD_RUNNING;

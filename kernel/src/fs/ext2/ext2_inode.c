@@ -40,6 +40,17 @@ vfs_node_t *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
   node->ctime  = inode->i_ctime;
 
   uint16_t type = inode->i_mode & 0xF000;
+  if (type == 0) {
+    static uint32_t invalid_inode_logs;
+    if (__atomic_add_fetch(&invalid_inode_logs, 1, __ATOMIC_RELAXED) <= 8)
+      klogf("[EXT2-INODE] invalid type inode=%u mode=%x links=%u size=%u "
+            "table=%u bs=%u\n", inode_num, inode->i_mode,
+            inode->i_links_count, inode->i_size,
+            mnt->bgdt[(inode_num - 1) / mnt->inodes_per_group].bg_inode_table,
+            mnt->block_size);
+    kfree(node);
+    return NULL;
+  }
 
   if (type == EXT2_S_IFDIR) {
     node->flags   = FS_DIRECTORY;
@@ -84,6 +95,15 @@ vfs_node_t *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
 
   if (mnt->sb.s_feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS)
     node->statfs = ext4_statfs_impl;
+  else {
+    /* Pure ext2 files/dirs previously had no statfs handler, so
+     * statfs()/fstatfs() on any non-root path fell back to a fake 2 GiB
+     * value (or, for tools that don't accept the fallback magic, 0 B).
+     * ext4_statfs_impl only reads the shared ext2 superblock fields, so it
+     * is valid for plain ext2 mounts as well. */
+    extern int ext4_statfs_impl(vfs_node_t *, struct statfs_buf *);
+    node->statfs = ext4_statfs_impl;
+  }
 
   return node;
 }

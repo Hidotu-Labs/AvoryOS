@@ -200,6 +200,8 @@ static int ata_pio_read(struct block_device *dev, uint64_t lba, uint32_t count,
   spinlock_acquire(&ata_lock);
   int ret = ata_pio_read_unlocked(dev, lba, count, buf);
   spinlock_release(&ata_lock);
+  if (ret == 0)
+    block_stat_read(dev, count);
   return ret;
 }
 
@@ -244,6 +246,8 @@ static int ata_pio_write(struct block_device *dev, uint64_t lba, uint32_t count,
   spinlock_acquire(&ata_lock);
   int ret = ata_pio_write_unlocked(dev, lba, count, buf);
   spinlock_release(&ata_lock);
+  if (ret == 0)
+    block_stat_write(dev, count);
   return ret;
 }
 

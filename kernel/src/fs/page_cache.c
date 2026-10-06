@@ -89,15 +89,33 @@ static bool page_value_valid(const void *value) {
    * 64-byte slab chunk was reused after the page was released (or overflowed
    * from a neighbour).  A tree entry in that state used to make the
    * loading-wait loop below spin forever, so reject it here and let the
-   * caller drop the leaf and refill.  Read the bytes directly: _Bool is
-   * always 0/1 to the compiler, so a comparison on the fields themselves
-   * would be optimized away. */
-  const uint8_t *flags = (const uint8_t *)&page->dirty;
-  if (flags[0] > 1 || flags[1] > 1 || flags[2] > 1 || flags[3] > 1)
+   * caller drop the leaf and refill.  Single 32-bit test instead of four
+   * byte loads: _Bool is always 0/1, so any 0xFE bit means reuse. Layout is
+   * asserted below (dirty..writeback must stay consecutive). */
+  _Static_assert(__builtin_offsetof(vfs_page_t, writeback) ==
+                     __builtin_offsetof(vfs_page_t, dirty) + 3,
+                 "vfs_page flag bytes must stay consecutive");
+  uint32_t flags_word;
+  __builtin_memcpy(&flags_word, &page->dirty, sizeof(flags_word));
+  if (flags_word & 0xFEFEFEFEu)
     return false;
   if (page->frame_phys & (PAGE_SIZE - 1))
     return false;
   return true;
+}
+
+/* Hot-path precheck for vfs_cache_lookup(): aligned + managed + live marker
+ * only, no flag-bytes/frame-alignment loads. A recycled slab chunk that keeps
+ * a valid magic but corrupts the flag bytes can pass here; it is still caught
+ * by the full page_value_valid() in insert/reclaim/sync and by the loading
+ * wait timeout in vfs_cache_get_or_create()/vfs_cache_read(), which drop and
+ * refill the leaf. Lookup stays fault-safe: the managed-RAM window is checked
+ * before magic is read. */
+static inline bool page_value_fast(const void *value) {
+  const vfs_page_t *page = (const vfs_page_t *)value;
+  if (!page || ((uint64_t)page & 7) || !pmm_kernel_ptr_is_managed(page))
+    return false;
+  return page->magic == VFS_PAGE_MAGIC;
 }
 
 static uint64_t cache_invalid_values;
@@ -173,7 +191,7 @@ vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
     return NULL;
   spinlock_acquire(&node->pages_lock);
   vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
-  if (page && !page_value_valid(page)) {
+  if (page && !page_value_fast(page)) {
     cache_drop_invalid_locked(node, offset, page);
     page = NULL;
   }
@@ -1186,6 +1204,75 @@ size_t vfs_cache_reclaim(vfs_node_t *node, size_t target) {
   return reclaimed;
 }
 
+// OOM hook for mm (heap.c / slab_cache.c call it via weak symbol).
+// Frees up to `target` clean, unmapped page-cache pages owned by files
+// mapped into the CURRENT process. Bounded and allocation-free: node
+// pointers are collected on the stack under a try-locked mm->lock (skipped
+// when contended, e.g. OOM inside mmap while holding it), each pinned with
+// vfs_node_tryref and released with vfs_close after reclaim.
+size_t mm_file_cache_reclaim(size_t target) {
+  if (!target)
+    return 0;
+
+#define MM_RECLAIM_MAX_NODES 32u
+  struct thread *t = sched_get_current();
+  if (!t || !t->mm)
+    return 0;
+  if (!spinlock_try_acquire(&t->mm->lock))
+    return 0;
+
+  vfs_node_t *nodes[MM_RECLAIM_MAX_NODES];
+  uint32_t n = 0;
+
+  // In-order walk of the VMA interval tree, deduped (one file often backs
+  // several VMAs: .text/.rodata/.data). Recursion depth is the AVL height
+  // (~log N); iterative to avoid stack blowup on a degenerate tree.
+  struct vma *stack[64];
+  int sp = 0;
+  struct vma *cur = t->mm->vmas.root;
+  while (cur || sp > 0) {
+    while (cur) {
+      if (sp >= 64)
+        break;
+      stack[sp++] = cur;
+      cur = cur->left;
+    }
+    if (sp == 0)
+      break;
+    if (sp >= 64 && cur) // degenerate: give up rather than overflow
+      break;
+    cur = stack[--sp];
+    struct vma *v = cur;
+    cur = cur->right;
+    vfs_node_t *node = (vfs_node_t *)v->file_node;
+    if (!node || n >= MM_RECLAIM_MAX_NODES)
+      continue;
+    if (!vfs_node_is_alive(node) || !(node->flags & FS_PAGE_CACHE))
+      continue;
+    bool dup = false;
+    for (uint32_t i = 0; i < n; i++) {
+      if (nodes[i] == node) {
+        dup = true;
+        break;
+      }
+    }
+    if (dup)
+      continue;
+    if (!vfs_node_tryref(node))
+      continue;
+    nodes[n++] = node;
+  }
+  spinlock_release(&t->mm->lock);
+
+  size_t reclaimed = 0;
+  for (uint32_t i = 0; i < n && reclaimed < target; i++) {
+    reclaimed += vfs_cache_reclaim(nodes[i], target - reclaimed);
+    vfs_close(nodes[i]);
+  }
+  return reclaimed;
+#undef MM_RECLAIM_MAX_NODES
+}
+
 void vfs_cache_mark_dirty(vfs_node_t *node, uint32_t offset) {
   if (!node)
     return;
@@ -1957,6 +2044,144 @@ cleanup:
     vfs_cache_clear(&shared);
   for (uint32_t i = 0; i < separate_ready; i++)
     vfs_cache_clear(&separate[i]);
+}
+
+/* ── Boot-time fill-integrity check (runs unconditionally once) ──────────
+ *
+ * Why this exists and why it runs on every boot: userspace shells die with
+ * ld.so reporting an "undefined symbol" inside libc.so.6 while the file on
+ * disk verifies byte-identical to a known-good copy. The kernel maps the
+ * binary and its interpreter and never resolves versions itself, so the
+ * only in-kernel explanation left is the fill path serving different bytes
+ * than the disk holds (stale/zero-filled bulk windows, short reads marked
+ * uptodate). This test compares, page by page over libc's first 128 KB
+ * (ELF headers, .dynsym, version definitions - the exact area the loader
+ * chokes on), three reads of the same bytes:
+ *
+ *   1. direct backend reads (node->read), which never touch the page cache;
+ *   2. a bulk vfs_cache_readahead() window snapshotted exactly the way the
+ *      demand-fault path snapshots it (lookup + loading/uptodate check,
+ *      get_or_create() fallback).
+ *
+ * A mismatch prints the first differing file offset and both bytes: proof
+ * with a location. A pass prints the byte count. Either way it costs one
+ * 128 KB pass over one file, once per boot. */
+#define VFS_FILLTEST_BYTES (128u * 1024u)
+
+void vfs_cache_fill_selftest(void) {
+  static const char *candidates[] = {
+      "/usr/lib/libc.so.6",
+      "/usr/lib/musl/lib/libc.so",
+      NULL,
+  };
+  vfs_node_t *node = NULL;
+  for (int i = 0; candidates[i] && !node; i++)
+    node = vfs_resolve_path(candidates[i]);
+  if (!node) {
+    klog_puts("[VFS-FILLTEST] skipped: no libc candidate found\n");
+    return;
+  }
+
+  bool is_file = (node->flags & FS_TYPE_MASK) == FS_FILE;
+  uint32_t want = node->length & ~(uint32_t)(PAGE_SIZE - 1);
+  if (want > VFS_FILLTEST_BYTES)
+    want = VFS_FILLTEST_BYTES;
+  if (!is_file || !node->read || want < 2u * PAGE_SIZE) {
+    klog_puts("[VFS-FILLTEST] skipped: unsuitable target\n");
+    vfs_close(node);
+    return;
+  }
+
+  uint8_t *direct = kmalloc(PAGE_SIZE);
+  uint8_t *cached = kmalloc(PAGE_SIZE);
+  if (!direct || !cached) {
+    klog_puts("[VFS-FILLTEST] skipped: out of memory\n");
+    if (direct)
+      kfree(direct);
+    if (cached)
+      kfree(cached);
+    vfs_close(node);
+    return;
+  }
+
+  klog_puts("[VFS-FILLTEST] checking ");
+  klog_uint64(want);
+  klog_puts(" bytes of ");
+  klog_puts(node->name[0] ? node->name : "?");
+  klog_puts(" (direct backend reads vs readahead window)\n");
+
+  /* Publish the whole window through the bulk path first, mirroring what
+   * demand faults observe for a freshly exec'd library. */
+  vfs_cache_invalidate_range(node, 0, want);
+  vfs_cache_readahead(node, 0, want);
+
+  uint32_t checked = 0;
+  bool fail = false;
+  for (uint32_t off = 0; off < want && !fail; off += PAGE_SIZE) {
+    /* Backend truth for this page: bypasses the cache entirely. */
+    if (vfs_read(node, off, PAGE_SIZE, direct) != PAGE_SIZE) {
+      klog_puts("[VFS-FILLTEST] FAIL: short direct read at file offset ");
+      klog_uint64(off);
+      klog_puts(" (backend or size problem, not the cache)\n");
+      fail = true;
+      break;
+    }
+
+    /* Bulk-path snapshot, exactly like vmm_fault's shared-mapping fast
+     * path: lockless lookup, readiness recheck under the lock, and only
+     * then get_or_create() (which waits out a concurrent fill). */
+    vfs_page_t *page = vfs_cache_lookup(node, off);
+    if (page) {
+      bool ready = false;
+      spinlock_acquire(&node->pages_lock);
+      if (!page->loading && page->uptodate && page->frame_phys)
+        ready = true;
+      spinlock_release(&node->pages_lock);
+      if (!ready) {
+        vfs_cache_put(node, page);
+        page = NULL;
+      }
+    }
+    if (!page)
+      page = vfs_cache_get_or_create(node, off);
+    if (!page) {
+      klog_puts("[VFS-FILLTEST] FAIL: no page for file offset ");
+      klog_uint64(off);
+      klog_puts(" (fill never completed)\n");
+      fail = true;
+      break;
+    }
+    memcpy(cached, PHYS_TO_VIRT(page->frame_phys), PAGE_SIZE);
+    vfs_cache_put(node, page);
+
+    for (uint32_t i = 0; i < PAGE_SIZE; i++) {
+      if (cached[i] != direct[i]) {
+        klog_puts("[VFS-FILLTEST] FAIL: first diff at file offset ");
+        klog_uint64(off + i);
+        klog_puts(" (page ");
+        klog_uint64(off / PAGE_SIZE);
+        klog_puts("): direct=0x");
+        klog_hex64(direct[i]);
+        klog_puts(" cached=0x");
+        klog_hex64(cached[i]);
+        klog_puts("\n");
+        fail = true;
+        break;
+      }
+    }
+    if (!fail)
+      checked += PAGE_SIZE;
+  }
+
+  if (!fail) {
+    klog_puts("[VFS-FILLTEST] PASS ");
+    klog_uint64(checked);
+    klog_puts(" bytes identical\n");
+  }
+
+  kfree(direct);
+  kfree(cached);
+  vfs_close(node);
 }
 
 void vfs_cache_bench(void) {

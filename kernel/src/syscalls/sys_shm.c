@@ -88,7 +88,7 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg, uint64_t a3,
   (void)a4;
   (void)a5;
 
-  if (size == 0 || size > SHM_MAX_SIZE)
+  if (size > SHM_MAX_SIZE)
     return -22; // EINVAL
 
   spinlock_acquire(&shm_lock);
@@ -101,6 +101,22 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg, uint64_t a3,
           spinlock_release(&shm_lock);
           return -17; // EEXIST
         }
+        // Linux compat: re-requesting an existing key with a larger size
+        // must fail with EINVAL. Silently returning the smaller segment
+        // makes the caller overflow it (e.g. llvmpipe writing past the
+        // end of a reused MIT-SHM segment and faulting on the first
+        // unmapped page after it). size==0 is allowed as a pure lookup.
+        if (size != 0 && size > shm_table[i].size) {
+          uint64_t want = size;
+          uint64_t have = shm_table[i].size;
+          uint32_t id_dbg = shm_table[i].shmid;
+          spinlock_release(&shm_lock);
+          klogf("[SHM] shmget key=%u denied: want=%llu > segsz=%llu "
+                "(shmid=%u)\n",
+                (unsigned)key, (unsigned long long)want,
+                (unsigned long long)have, id_dbg);
+          return -22; // EINVAL
+        }
         uint32_t id = shm_table[i].shmid;
         spinlock_release(&shm_lock);
         return (int64_t)id;
@@ -111,6 +127,13 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg, uint64_t a3,
       spinlock_release(&shm_lock);
       return -2; // ENOENT
     }
+    if (size == 0) {
+      spinlock_release(&shm_lock);
+      return -22; // EINVAL
+    }
+  } else if (size == 0) {
+    spinlock_release(&shm_lock);
+    return -22; // EINVAL
   }
 
   // Find a free slot

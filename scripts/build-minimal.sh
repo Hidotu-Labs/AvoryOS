@@ -2,7 +2,7 @@
 # scripts/build-minimal.sh - Build the minimal AvoryOS root filesystem and
 # disk image: GNU bash + GNU coreutils, Xorg, IceWM, OpenRC with D-Bus and st.
 #
-# The regular build (scripts/setup-alpine.sh + the GNUmakefile disk.img target)
+# The regular build (scripts/setup-arch.sh + the GNUmakefile disk.img target)
 # layers a full desktop rootfs (KDE/XFCE/GTK/VLC/...).  This script produces a
 # small, independent rootfs under build/minimal/ that contains only the
 # requested stack:
@@ -160,6 +160,7 @@ configure_rootfs() {
         "${ROOTFS_DIR}/etc/runlevels/shutdown" \
         "${ROOTFS_DIR}/root/.icewm" \
         "${ROOTFS_DIR}/run/dbus" \
+        "${ROOTFS_DIR}/run/mount" \
         "${ROOTFS_DIR}/run/openrc" \
         "${ROOTFS_DIR}/run/user/0" \
         "${ROOTFS_DIR}/usr/local/bin" \
@@ -288,7 +289,7 @@ chmod 0700 "$XDG_RUNTIME_DIR"
 # The OpenRC `dbus` service has already run by the time inittab gets here;
 # start the system bus here too if that service is not enabled.
 if [ ! -S /run/dbus/system_bus_socket ] && command -v dbus-daemon >/dev/null 2>&1; then
-    mkdir -p /run/dbus
+    mkdir -p /run/dbus /run/mount
     dbus-daemon --system --fork 2>/dev/null || true
 fi
 

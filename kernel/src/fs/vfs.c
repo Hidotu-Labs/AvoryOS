@@ -6,6 +6,7 @@
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include "../sched/sched.h"
+#include "../syscalls/sysdiag.h"
 
 #define PHYS_TO_VIRT(p) ((void *)((uint64_t)(p) + pmm_get_hhdm_offset()))
 
@@ -22,6 +23,17 @@ bool vfs_in_group(uint32_t gid) {
 
 bool vfs_access(vfs_node_t *node, uint32_t requested) {
   if (!node) return false;
+  /* Fast path: every class grants `requested` (common for 0755/0777 dirs on
+   * a path walk). No thread lookup, no supplementary-group loop. */
+  uint32_t o = (node->mask >> 6) & 7;
+  uint32_t g = (node->mask >> 3) & 7;
+  uint32_t u = node->mask & 7;
+  if (((o & requested) == requested) && ((g & requested) == requested) &&
+      ((u & requested) == requested)) {
+    if ((requested & 1) && !(node->mask & 0111) &&
+        (node->flags & FS_TYPE_MASK) != FS_DIRECTORY) return false;
+    return true;
+  }
   struct thread *t = sched_get_current();
   if (!t || t->euid == 0) {
     if ((requested & 1) && !(node->mask & 0111) &&
@@ -32,6 +44,19 @@ bool vfs_access(vfs_node_t *node, uint32_t requested) {
   if (t->fsuid == node->uid) bits = (node->mask >> 6) & 7;
   else if (vfs_in_group(node->gid)) bits = (node->mask >> 3) & 7;
   return (bits & requested) == requested;
+}
+
+/* Conservative ".." test matching the old strstr(path, "..") call sites: any
+ * two consecutive dots mean "skip the caches". Cheaper than strstr (single
+ * forward scan, no substring table), computed once per resolve and reused. */
+static bool vfs_path_has_dotdot(const char *path) {
+  if (!path) return false;
+  char prev = '\0';
+  for (const char *p = path; *p; p++) {
+    if (*p == '.' && prev == '.') return true;
+    prev = *p;
+  }
+  return false;
 }
 
 bool vfs_may_remove(vfs_node_t *parent, vfs_node_t *target) {
@@ -63,6 +88,12 @@ static vfs_mount_entry_t *vfs_mount_list = NULL;
 #define VFS_DENTRY_CACHE_SIZE 16384
 #define VFS_DENTRY_WAYS 4
 #define VFS_DENTRY_BUCKETS (VFS_DENTRY_CACHE_SIZE / VFS_DENTRY_WAYS)
+/* Bucket counts are powers of two, so indexing uses a mask (one AND) instead
+ * of a modulo (a division). Same result for unsigned hashes, runs per path
+ * component on every open/stat. */
+#define VFS_DENTRY_BUCKET_MASK (VFS_DENTRY_BUCKETS - 1)
+_Static_assert((VFS_DENTRY_BUCKETS & (VFS_DENTRY_BUCKETS - 1)) == 0,
+               "VFS_DENTRY_BUCKETS must be a power of two");
 
 typedef struct vfs_dentry_cache_entry {
   vfs_node_t *parent;
@@ -75,6 +106,7 @@ typedef struct vfs_dentry_cache_entry {
 
 typedef struct vfs_dentry_cache_bucket {
   vfs_dentry_cache_entry_t entries[VFS_DENTRY_WAYS];
+  uint32_t seq;
   uint8_t next_victim;
   spinlock_t lock;
 } vfs_dentry_cache_bucket_t;
@@ -102,9 +134,13 @@ static vfs_node_t *vfs_dentry_lookup(vfs_node_t *parent, const char *name,
 
   uint16_t len = (uint16_t)len_sz;
   uint32_t hash = vfs_dentry_hash(parent, name);
-  uint32_t slot = hash % VFS_DENTRY_BUCKETS;
+  uint32_t slot = hash & VFS_DENTRY_BUCKET_MASK;
   vfs_dentry_cache_bucket_t *bucket = &vfs_dentry_cache[slot];
 
+  /* The cache owns a node reference only while the entry remains installed.
+   * Take the caller's reference under the same lock that protects eviction.
+   * A sequence recheck cannot make tryref on an already freed node safe;
+   * lockless readers would require deferred reclamation of nodes as well. */
   spinlock_acquire(&bucket->lock);
   for (uint32_t i = 0; i < VFS_DENTRY_WAYS; i++) {
     vfs_dentry_cache_entry_t *entry = &bucket->entries[i];
@@ -134,7 +170,7 @@ static void vfs_dentry_insert(vfs_node_t *parent, const char *name,
 
   uint16_t len = (uint16_t)len_sz;
   uint32_t hash = vfs_dentry_hash(parent, name);
-  uint32_t slot = hash % VFS_DENTRY_BUCKETS;
+  uint32_t slot = hash & VFS_DENTRY_BUCKET_MASK;
   vfs_dentry_cache_bucket_t *bucket = &vfs_dentry_cache[slot];
   vfs_node_t *evicted = NULL;
   vfs_node_t *evicted_parent = NULL;
@@ -162,6 +198,8 @@ static void vfs_dentry_insert(vfs_node_t *parent, const char *name,
   vfs_node_ref(parent);
   if (child)
     vfs_node_ref(child);
+
+  __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
   entry->parent = parent;
   entry->child = child;
   entry->hash = hash;
@@ -169,6 +207,8 @@ static void vfs_dentry_insert(vfs_node_t *parent, const char *name,
   memcpy(entry->name, name, len);
   entry->name[len] = '\0';
   entry->valid = true;
+  __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
+
   spinlock_release(&bucket->lock);
 
   if (evicted)
@@ -185,6 +225,9 @@ static void vfs_dentry_insert(vfs_node_t *parent, const char *name,
 #define VFS_PATH_CACHE_SIZE 4096
 #define VFS_PATH_CACHE_WAYS 4
 #define VFS_PATH_CACHE_BUCKETS (VFS_PATH_CACHE_SIZE / VFS_PATH_CACHE_WAYS)
+#define VFS_PATH_CACHE_BUCKET_MASK (VFS_PATH_CACHE_BUCKETS - 1)
+_Static_assert((VFS_PATH_CACHE_BUCKETS & (VFS_PATH_CACHE_BUCKETS - 1)) == 0,
+               "VFS_PATH_CACHE_BUCKETS must be a power of two");
 
 typedef struct vfs_path_cache_entry {
   vfs_node_t *dir;
@@ -198,6 +241,7 @@ typedef struct vfs_path_cache_entry {
 
 typedef struct vfs_path_cache_bucket {
   vfs_path_cache_entry_t entries[VFS_PATH_CACHE_WAYS];
+  uint32_t seq;
   uint8_t next_victim;
   spinlock_t lock;
 } vfs_path_cache_bucket_t;
@@ -325,8 +369,12 @@ static vfs_node_t *vfs_path_cache_lookup(vfs_node_t *dir, const char *path) {
 
   uint16_t len = (uint16_t)len_sz;
   uint32_t hash = vfs_path_hash(dir, path);
-  uint32_t slot = hash % VFS_PATH_CACHE_BUCKETS;
+  uint32_t slot = hash & VFS_PATH_CACHE_BUCKET_MASK;
   vfs_path_cache_bucket_t *bucket = &vfs_path_cache[slot];
+
+  /* Pin the cached node while eviction is excluded, as in dentry lookup.
+   * Nodes are freed immediately on last close; there is no RCU grace period
+   * to protect an unlocked pointer between lookup and reference acquisition. */
   vfs_node_t *stale_node = NULL;
   vfs_node_t *stale_dir = NULL;
 
@@ -340,12 +388,14 @@ static vfs_node_t *vfs_path_cache_lookup(vfs_node_t *dir, const char *path) {
          * entry and let the caller resolve the path from scratch. */
         stale_node = entry->node;
         stale_dir = entry->dir;
+        __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
         entry->valid = false;
         entry->dir = NULL;
         entry->node = NULL;
         entry->hash = 0;
         entry->path_len = 0;
         entry->path[0] = '\0';
+        __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
         break;
       }
       vfs_node_t *node = entry->node;
@@ -373,7 +423,7 @@ static void vfs_path_cache_insert(vfs_node_t *dir, const char *path, vfs_node_t 
 
   uint16_t len = (uint16_t)len_sz;
   uint32_t hash = vfs_path_hash(dir, path);
-  uint32_t slot = hash % VFS_PATH_CACHE_BUCKETS;
+  uint32_t slot = hash & VFS_PATH_CACHE_BUCKET_MASK;
   vfs_path_cache_bucket_t *bucket = &vfs_path_cache[slot];
   vfs_node_t *evicted_node = NULL;
   vfs_node_t *evicted_dir = NULL;
@@ -401,6 +451,7 @@ static void vfs_path_cache_insert(vfs_node_t *dir, const char *path, vfs_node_t 
 
   vfs_node_ref(dir);
   vfs_node_ref(node);
+  __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
   entry->dir = dir;
   entry->node = node;
   entry->hash = hash;
@@ -409,6 +460,7 @@ static void vfs_path_cache_insert(vfs_node_t *dir, const char *path, vfs_node_t 
   entry->path[len] = '\0';
   entry->gen = __atomic_load_n(&vfs_path_inval_gen, __ATOMIC_ACQUIRE);
   entry->valid = true;
+  __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
   spinlock_release(&bucket->lock);
 
   if (evicted_node)
@@ -433,13 +485,14 @@ static void vfs_dentry_bucket_invalidate(vfs_node_t *parent, const char *name) {
 
   uint16_t len = (uint16_t)len_sz;
   uint32_t hash = vfs_dentry_hash(parent, name);
-  uint32_t slot = hash % VFS_DENTRY_BUCKETS;
+  uint32_t slot = hash & VFS_DENTRY_BUCKET_MASK;
   vfs_dentry_cache_bucket_t *bucket = &vfs_dentry_cache[slot];
   vfs_node_t *released[VFS_DENTRY_WAYS];
   vfs_node_t *released_parents[VFS_DENTRY_WAYS];
   uint32_t released_count = 0;
 
   spinlock_acquire(&bucket->lock);
+  __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
   for (uint32_t i = 0; i < VFS_DENTRY_WAYS; i++) {
     vfs_dentry_cache_entry_t *entry = &bucket->entries[i];
     if (entry->valid && entry->hash == hash && entry->name_len == len &&
@@ -454,6 +507,7 @@ static void vfs_dentry_bucket_invalidate(vfs_node_t *parent, const char *name) {
       entry->name[0] = '\0';
     }
   }
+  __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
   spinlock_release(&bucket->lock);
 
   for (uint32_t i = 0; i < released_count; i++) {
@@ -471,13 +525,14 @@ static void vfs_path_cache_drop(vfs_node_t *dir, const char *path) {
 
   uint16_t len = (uint16_t)len_sz;
   uint32_t hash = vfs_path_hash(dir, path);
-  uint32_t slot = hash % VFS_PATH_CACHE_BUCKETS;
+  uint32_t slot = hash & VFS_PATH_CACHE_BUCKET_MASK;
   vfs_path_cache_bucket_t *bucket = &vfs_path_cache[slot];
   vfs_node_t *rel_node[VFS_PATH_CACHE_WAYS];
   vfs_node_t *rel_dir[VFS_PATH_CACHE_WAYS];
   uint32_t count = 0;
 
   spinlock_acquire(&bucket->lock);
+  __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
   for (uint32_t i = 0; i < VFS_PATH_CACHE_WAYS; i++) {
     vfs_path_cache_entry_t *entry = &bucket->entries[i];
     if (entry->valid && entry->hash == hash && entry->path_len == len &&
@@ -492,6 +547,7 @@ static void vfs_path_cache_drop(vfs_node_t *dir, const char *path) {
       entry->path[0] = '\0';
     }
   }
+  __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
   spinlock_release(&bucket->lock);
 
   for (uint32_t i = 0; i < count; i++) {
@@ -508,6 +564,7 @@ void vfs_path_cache_invalidate(void) {
     vfs_path_cache_bucket_t *bucket = &vfs_path_cache[b];
 
     spinlock_acquire(&bucket->lock);
+    __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
     for (uint32_t i = 0; i < VFS_PATH_CACHE_WAYS; i++) {
       vfs_path_cache_entry_t *entry = &bucket->entries[i];
       if (entry->valid) {
@@ -521,6 +578,7 @@ void vfs_path_cache_invalidate(void) {
         entry->path[0] = '\0';
       }
     }
+    __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
     spinlock_release(&bucket->lock);
 
     for (uint32_t i = 0; i < count; i++) {
@@ -611,6 +669,7 @@ void vfs_dentry_invalidate(vfs_node_t *parent, const char *name) {
     vfs_dentry_cache_bucket_t *bucket = &vfs_dentry_cache[b];
 
     spinlock_acquire(&bucket->lock);
+    __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
     for (uint32_t i = 0; i < VFS_DENTRY_WAYS; i++) {
       vfs_dentry_cache_entry_t *entry = &bucket->entries[i];
       if (entry->valid && (!parent || entry->parent == parent) &&
@@ -625,6 +684,7 @@ void vfs_dentry_invalidate(vfs_node_t *parent, const char *name) {
         entry->name[0] = '\0';
       }
     }
+    __atomic_add_fetch(&bucket->seq, 1, __ATOMIC_RELEASE);
     spinlock_release(&bucket->lock);
 
     for (uint32_t i = 0; i < released_count; i++) {
@@ -683,11 +743,17 @@ uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
 uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
                    uint8_t *buffer) {
   if (!node)
+    return (uint32_t)-9; // EBADF
+
+  if (size == 0)
     return 0;
 
   struct thread *t = sched_get_current();
-  if (size && t && t->euid != 0 && (node->mask & 06000))
+  if (t && t->euid != 0 && (node->mask & 06000))
     vfs_chmod(node, (uint16_t)(node->mask & ~06000));
+
+  if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY)
+    return (uint32_t)-21; // EISDIR
 
   if (node->write) {
     uint32_t written = node->write(node, offset, size, buffer);
@@ -695,7 +761,10 @@ uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
       vfs_cache_update_or_invalidate(node, offset, written, buffer);
     return written;
   }
-  return 0;
+  if (node->flags & FS_DENTRY_NOCACHE) {
+    sysdiag_record_missing_fs_node(node->name, t, -30 /* -EROFS */, "write");
+  }
+  return (uint32_t)-9; // EBADF: node has no write operation
 }
 
 void vfs_open(vfs_node_t *node) {
@@ -730,6 +799,7 @@ void vfs_close(vfs_node_t *node) {
     }
     if (!(node->flags & FS_PERSISTENT) || (node->flags & FS_DELETED)) {
       node->magic = 0;
+      vfs_xattr_clear(node);
       kfree(node);
     }
     return;
@@ -758,6 +828,7 @@ void vfs_node_retire(vfs_node_t *node) {
     node->destroy = NULL;
   }
   node->magic = 0;
+  vfs_xattr_clear(node);
   kfree(node);
 }
 
@@ -785,7 +856,14 @@ vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
      * ramfs at /run, then localmount mounts a tmpfs over it), and the visible
      * node is the top of the stack; stopping at the first matching entry left
      * later mounts shadowed under their own mountpoint.  The `res != target`
-     * guard also terminates a mount that points back at itself. */
+     * guard also terminates a mount that points back at itself.
+     *
+     * NOTE: do not gate this walk on FS_MOUNTPOINT. Mounts match by
+     * (inode, device) value, but disk backends (ext2/ext4) hand out a fresh
+     * kmalloc'd node per lookup, so the flag lives on only one instance of
+     * a mountpoint while matches happen on ephemeral ones. Skipping by flag
+     * hung the boot at /dev/driverctl registration; the scan is ~5 entries
+     * and not worth the fragility. */
     for (int hops = 0; hops < 32; hops++) {
       vfs_node_t *next = NULL;
       vfs_mount_entry_t *curr = vfs_mount_list;
@@ -880,6 +958,13 @@ int vfs_rename(vfs_node_t *node, char *old_name, char *new_name) {
     vfs_dentry_invalidate(node, old_name);
     vfs_dentry_invalidate(node, new_name);
     int result = node->rename(node, old_name, new_name);
+    if (result == 0) {
+      /* Readers can refill either entry while the backend rename waits or
+       * performs I/O. Drop pre-mutation positive/negative entries again once
+       * the new namespace state is installed. */
+      vfs_dentry_invalidate(node, old_name);
+      vfs_dentry_invalidate(node, new_name);
+    }
     bool same_inode = source && replaced && source->device == replaced->device &&
                       source->inode == replaced->inode;
     if (result == 0 && replaced && !same_inode)
@@ -891,6 +976,24 @@ int vfs_rename(vfs_node_t *node, char *old_name, char *new_name) {
     return result;
   }
   return -1;
+}
+
+int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
+                     vfs_node_t *new_parent, char *new_name) {
+  if (!old_parent || !new_parent || !old_name || !new_name)
+    return -22; // EINVAL
+  vfs_dentry_invalidate(old_parent, old_name);
+  vfs_dentry_invalidate(new_parent, new_name);
+  /* Route on the parents' op table: tmpfs_rename_cross re-validates that
+   * both parents really are tmpfs directories of one mount and answers
+   * EXDEV for anything else, so other backends keep their old behaviour. */
+  if (old_parent->rename && old_parent->rename == new_parent->rename) {
+    extern int tmpfs_rename_cross(vfs_node_t *, char *, vfs_node_t *, char *);
+    int rc = tmpfs_rename_cross(old_parent, old_name, new_parent, new_name);
+    if (rc != -18)
+      return rc;
+  }
+  return -18; // EXDEV
 }
 
 int vfs_chmod(vfs_node_t *node, uint16_t permission) {
@@ -971,17 +1074,138 @@ int vfs_poll(vfs_node_t *node, int events) {
 
 #define MAX_SYMLINK_DEPTH 8
 
+/*
+ * Speculative cached path walker.
+ *
+ * Walks multi-component paths through dentry-cache hits with a reference
+ * acquired under each bucket lock. Avoids the general walk's parent stack;
+ * intermediate nodes remain referenced until the next component is pinned.
+ *
+ * If any component is a symlink, relative '..', negative cache entry, or cache miss,
+ * it returns NULL, cleanly falling back to the standard refcounted walk.
+ */
+static vfs_node_t *vfs_lookup_cached_path(vfs_node_t *base_dir, const char *path) {
+  if (!base_dir || !path || !path[0])
+    return NULL;
+
+  /* If base has no-cache flag or path contains '..', skip cached walk. */
+  if ((base_dir->flags & FS_DENTRY_NOCACHE) || vfs_path_has_dotdot(path))
+    return NULL;
+
+  const char *p = path;
+  if (*p == '/') {
+    while (*p == '/')
+      p++;
+  }
+  if (*p == '\0') {
+    /* Path was just "/" or empty after slashes */
+    vfs_open(base_dir);
+    return base_dir;
+  }
+
+  vfs_node_t *current = base_dir;
+  vfs_node_t *current_ref = NULL; // Non-NULL if current holds a refcount we acquired
+
+  while (*p) {
+    while (*p == '/')
+      p++;
+    if (*p == '\0')
+      break;
+
+    char comp[128];
+    int i = 0;
+    while (*p && *p != '/' && i < 127) {
+      comp[i++] = *p++;
+    }
+    comp[i] = '\0';
+
+    if (strcmp(comp, ".") == 0)
+      continue;
+
+    /* Permission check on directory */
+    if (!vfs_access(current, 1)) {
+      if (current_ref)
+        vfs_close(current_ref);
+      return NULL;
+    }
+
+    bool negative = false;
+    vfs_node_t *next = vfs_dentry_lookup(current, comp, &negative);
+    if (!next || negative) {
+      /* Cache miss or negative hit: abort cached walk and fallback. */
+      if (current_ref)
+        vfs_close(current_ref);
+      return NULL;
+    }
+
+    /* If symlink or synthetic node (procfs etc), abort cached walk. */
+    if (((next->flags & FS_TYPE_MASK) == FS_SYMLINK) ||
+        (next->flags & FS_DENTRY_NOCACHE)) {
+      vfs_close(next);
+      if (current_ref)
+        vfs_close(current_ref);
+      return NULL;
+    }
+
+    /* Lockless mountpoint traversal */
+    for (int hops = 0; hops < 32; hops++) {
+      vfs_node_t *m_next = NULL;
+      vfs_mount_entry_t *curr = __atomic_load_n(&vfs_mount_list, __ATOMIC_ACQUIRE);
+      while (curr) {
+        if (curr->mountpoint && curr->mountpoint->inode == next->inode &&
+            curr->mountpoint->device == next->device) {
+          if (curr->target != next) {
+            m_next = curr->target;
+            break;
+          }
+        }
+        curr = __atomic_load_n(&curr->next, __ATOMIC_ACQUIRE);
+      }
+      if (!m_next)
+        break;
+      vfs_close(next);
+      if (!vfs_node_is_alive(m_next) || !vfs_node_tryref(m_next)) {
+        if (current_ref)
+          vfs_close(current_ref);
+        return NULL;
+      }
+      next = m_next;
+    }
+
+    /* Advance: release previous intermediate reference if held */
+    if (current_ref)
+      vfs_close(current_ref);
+    current = next;
+    current_ref = next;
+  }
+
+  return current_ref;
+}
+
 vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
   if (!path || !path[0] || !fs_root)
     return 0;
 
   vfs_node_t *effective_dir = (path[0] == '/') ? fs_root : (dir ? dir : fs_root);
+  /* One scan reused by the cached-walk guard and both cache inserts below. */
+  bool path_has_dotdot = vfs_path_has_dotdot(path);
 
   // 1. Fast Path Full-Path Dcache lookup:
   // Check if we already resolved this exact path string from this directory
   vfs_node_t *cached = vfs_path_cache_lookup(effective_dir, path);
   if (cached) {
     return cached;
+  }
+
+  // 2. Speculative cached walk across path components, with owned references.
+  vfs_node_t *cached_node = vfs_lookup_cached_path(effective_dir, path);
+  if (cached_node) {
+    if ((effective_dir->flags & FS_DENTRY_NOCACHE) == 0 &&
+        (cached_node->flags & FS_DENTRY_NOCACHE) == 0 &&
+        !path_has_dotdot) {
+      vfs_path_cache_insert(effective_dir, path, cached_node);
+    }
+    return cached_node;
   }
 
   char path_buf[512];
@@ -1126,7 +1350,7 @@ vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
    * cached node can ever be right for every caller.  Skipping the insert
    * makes each open walk the subtree again, which is also what Linux pays
    * for /proc lookups. */
-  if (current && !synthetic_descent && strstr(path, "..") == NULL) {
+  if (current && !synthetic_descent && !path_has_dotdot) {
     vfs_path_cache_insert(effective_dir, path, current);
   }
 
@@ -1137,6 +1361,9 @@ fail:
   for (int j = 0; j <= stack_top; j++)
     vfs_close(parent_stack[j]);
   vfs_close(current);
+  if (path && (strncmp(path, "/proc/", 6) == 0 || strncmp(path, "/sys/", 5) == 0)) {
+    sysdiag_record_missing_fs_node(path, sched_get_current(), -2, "lookup");
+  }
   return 0;
 }
 
@@ -1187,8 +1414,8 @@ int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
   } else {
     strcpy(entry->path, "/");
   }
-  entry->next = vfs_mount_list;
-  vfs_mount_list = entry;
+  entry->next = __atomic_load_n(&vfs_mount_list, __ATOMIC_ACQUIRE);
+  __atomic_store_n(&vfs_mount_list, entry, __ATOMIC_RELEASE);
 
   /* A prior lookup may have cached the node hidden by this mount. */
   vfs_dentry_invalidate(NULL, NULL);
@@ -1235,7 +1462,7 @@ int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count) {
       strcpy(buffer[count].mountpoint, "/");
       strcpy(buffer[count].target, "/");
       strcpy(buffer[count].dev_name, "none");
-      strcpy(buffer[count].fs_type, "ext3"); // Common default for this OS
+      strcpy(buffer[count].fs_type, "ext4");
       count++;
     }
   }
@@ -1404,11 +1631,19 @@ static bool vfs_path_cache_selftest(void) {
   if (hit)
     vfs_close(hit);
 
+  /* 7. Repeated cached lookup acquires a caller reference. */
+  vfs_path_cache_insert(fs_root, "/vfs_selftest_rcu", probe);
+  hit = vfs_path_cache_lookup(fs_root, "/vfs_selftest_rcu");
+  vfs_selftest_expect(hit == probe, "cached lookup resolves probe with reference");
+  if (hit)
+    vfs_close(hit);
+
   vfs_path_cache_drop(fs_root, "/vfs_selftest_probe");
   vfs_path_cache_drop(fs_root, "/vfs_selftest_probe_extra");
   vfs_path_cache_drop(fs_root, "/vfs_selftest_dir/child");
   vfs_path_cache_drop(fs_root, "/vfs_selftest_ring");
   vfs_path_cache_drop(fs_root, "/vfs_selftest_fresh");
+  vfs_path_cache_drop(fs_root, "/vfs_selftest_rcu");
   vfs_close(probe);
   return vfs_selftest_failures == 0;
 }
@@ -1552,6 +1787,21 @@ static void vfs_path_cache_bench(void) {
   for (uint32_t i = 0; i < VFS_BENCH_ITERS; i++)
     vfs_path_invalidate_record("z_no_such_component_xyz");
   vfs_bench_report("path-inval log-append", VFS_BENCH_ITERS,
+                   rdtsc_fence() - t0);
+
+  /* Benchmark path cache lookup */
+  t0 = rdtsc_fence();
+  uint64_t hits = 0;
+  for (uint32_t i = 0; i < VFS_BENCH_ITERS; i++) {
+    char pbuf[64];
+    vfs_bench_make_path(pbuf, i % VFS_BENCH_PATHS);
+    vfs_node_t *h = vfs_path_cache_lookup(fs_root, pbuf);
+    if (h) {
+      hits++;
+      vfs_close(h);
+    }
+  }
+  vfs_bench_report("cached dcache-hit", VFS_BENCH_ITERS,
                    rdtsc_fence() - t0);
 
   vfs_path_cache_invalidate();

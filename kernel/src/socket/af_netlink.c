@@ -5,6 +5,7 @@
 #include "../net/core.h"
 #include "../net/ipv4.h"
 #include "../mm/heap.h"
+#include "../mm/vmm.h"
 #include "../sched/sched.h"
 #include "epoll.h"
 #include "socket.h"
@@ -205,18 +206,27 @@ static void netlink_push_fake_uevent(socket_t *sock) {
   netlink_sock_t *nsk = (netlink_sock_t *)sock->sk;
 
   // Devices to notify: DRM card0, connector, DRM card2 (amdgpu, Phase 6 C7),
-  // Keyboard, Mouse
+  // Keyboard, Mouse, HDA sound card0/controlC0/pcmC0D0p (stable ALSA
+  // enumeration so hardware.audio monitor blocks instead of rescanning).
   const char *devpaths[] = {sysfs_gpu_devpath, sysfs_gpu_connector_devpath,
                             sysfs_gpu2_devpath,
                             "/devices/virtual/input/input0/event0",
-                            "/devices/virtual/input/input1/event1"};
-  const char *subsystems[] = {"drm", "drm", "drm", "input", "input"};
+                            "/devices/virtual/input/input1/event1",
+                            "/devices/virtual/sound/card0",
+                            "/devices/virtual/sound/controlC0",
+                            "/devices/virtual/sound/pcmC0D0p"};
+  const char *subsystems[] = {"drm", "drm", "drm", "input", "input",
+                              "sound", "sound", "sound"};
   const char *devnames[] = {"/dev/dri/card0", "", "/dev/dri/card2",
-                            "/dev/input/event0", "/dev/input/event1"};
-  const char *majors[] = {"226", "", "226", "13", "13"};
-  const char *minors[] = {"0", "", "2", "64", "65"};
+                            "/dev/input/event0", "/dev/input/event1",
+                            "/dev/snd/controlC0", "/dev/snd/controlC0",
+                            "/dev/snd/pcmC0D0p"};
+  const char *majors[] = {"226", "", "226", "13", "13",
+                          "116", "116", "116"};
+  const char *minors[] = {"0", "", "2", "64", "65",
+                          "0", "0", "24"};
 
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < 8; i++) {
     char uevent_buf[512];
     memset(uevent_buf, 0, sizeof(uevent_buf));
     size_t pos = 0;
@@ -428,6 +438,11 @@ static int netlink_setsockopt(socket_t *sock, int level, int optname,
       return 0; // Stub success
     case 2:     // SO_REUSEADDR
       return 0;
+    case 7:     // SO_SNDBUF
+    case 8:     // SO_RCVBUF
+    case 32:    // SO_SNDBUFFORCE
+    case 33:    // SO_RCVBUFFORCE
+      return 0;
     }
   }
 
@@ -457,8 +472,32 @@ static ssize_t netlink_recvfrom(socket_t *sock, void *buf, size_t len,
       spinlock_release(&nsk->recv_queue.lock);
       return -11; // EAGAIN
     }
+    /* Race-free wait: BLOCKED+add while holding recv_queue.lock, recheck
+     * before parking. socket_wait() alone would lose a wake between the
+     * empty check and the add. */
+    struct thread *cur = sched_get_current();
+    wait_queue_entry_t nle = {.thread = cur, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
+    if (cur)
+      cur->state = THREAD_BLOCKED;
+    if (sock->wait_queue)
+      wait_queue_add((wait_queue_t *)sock->wait_queue, &nle);
+    if (nsk->recv_queue.head != NULL) {
+      if (cur)
+        cur->state = THREAD_RUNNING;
+      if (sock->wait_queue)
+        wait_queue_remove((wait_queue_t *)sock->wait_queue, &nle);
+      if (cur)
+        cur->state = THREAD_RUNNING;
+      continue;
+    }
     spinlock_release(&nsk->recv_queue.lock);
-    socket_wait(sock);
+    sched_yield();
+    if (sock->wait_queue)
+      wait_queue_remove((wait_queue_t *)sock->wait_queue, &nle);
+    if (cur)
+      cur->state = THREAD_RUNNING;
+    if (cur && thread_has_pending_signal(cur))
+      return -4; // EINTR
     spinlock_acquire(&nsk->recv_queue.lock);
   }
 
@@ -474,7 +513,7 @@ static ssize_t netlink_recvfrom(socket_t *sock, void *buf, size_t len,
   spinlock_release(&nsk->recv_queue.lock);
 
   if (!skb)
-    return 0;
+    return -11; // EAGAIN
 
   size_t to_copy = (len < skb->len) ? len : skb->len;
   memcpy(buf, skb->data, to_copy);
@@ -691,6 +730,38 @@ static void netlink_destroy(socket_t *sock) {
   }
 }
 
+static int netlink_ioctl(socket_t *sock, uint32_t request, uint64_t arg) {
+  if (!sock || !sock->sk)
+    return -22;
+  netlink_sock_t *nsk = (netlink_sock_t *)sock->sk;
+  switch (request) {
+  case 0x541B: { // FIONREAD / TIOCINQ
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int)))
+      return -14;
+    spinlock_acquire(&nsk->recv_queue.lock);
+    int unread = nsk->recv_queue.head ? (int)nsk->recv_queue.head->len : 0;
+    spinlock_release(&nsk->recv_queue.lock);
+    if (copy_to_user((void *)arg, &unread, sizeof(int)) != 0)
+      return -14;
+    return 0;
+  }
+  case 0x5421: { // FIONBIO
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int)))
+      return -14;
+    int nonblocking = 0;
+    if (copy_from_user(&nonblocking, (const void *)arg, sizeof(int)) != 0)
+      return -14;
+    if (nonblocking)
+      sock->flags |= SOCK_NONBLOCK;
+    else
+      sock->flags &= ~SOCK_NONBLOCK;
+    return 0;
+  }
+  default:
+    return -25; // ENOTTY
+  }
+}
+
 static sock_ops_t netlink_ops = {
     .bind = netlink_bind,
     .recv = netlink_recv,
@@ -703,6 +774,7 @@ static sock_ops_t netlink_ops = {
     .setsockopt = netlink_setsockopt,
     .getsockopt = netlink_getsockopt,
     .getsockname = netlink_getsockname,
+    .ioctl = netlink_ioctl,
     .destroy = netlink_destroy,
 };
 

@@ -806,7 +806,7 @@ void lockdiag_dump_all(const char *reason) {
   int shown = 0, blocked_total = 0;
   int dead_shown = 0, dead_total = 0;
   if (spinlock_try_acquire(&tid_lock)) {
-    ld_str("\n[LOCKDIAG] blocked threads:");
+    ld_str("\n[LOCKDIAG] blocked / waiting threads (event loops, I/O, sleep):");
     for (const struct thread *t = global_thread_list; t; t = t->global_next) {
       /* A thread that died while holding a lock leaves it held forever, and it
        * will never appear in the blocked list: the lock spotlight above is what
@@ -814,7 +814,7 @@ void lockdiag_dump_all(const char *reason) {
       if (t->state == THREAD_DEAD || t->state == THREAD_ZOMBIE) {
         dead_total++;
         if (dead_shown < 8) {
-          ld_str("\n[LOCKDIAG]   [dead/zombie] tid=");
+          ld_str("\n[LOCKDIAG]   [zombie/exited] tid=");
           ld_dec(t->tid);
           ld_str(" tgid=");
           ld_dec(t->tgid);
@@ -909,7 +909,7 @@ void lockdiag_dump_all(const char *reason) {
     if (dead_total) {
       ld_str("; ");
       ld_dec((uint64_t)dead_total);
-      ld_str(" dead/zombie (see above)");
+      ld_str(" zombie/exited (see above)");
     }
   } else {
     /* Saying so is the point: tid_lock is held by somebody, and that somebody
@@ -923,7 +923,11 @@ void lockdiag_dump_all(const char *reason) {
    * tail of the log is sitting in a buffer, not lost. */
   ld_str("\n[LOCKDIAG] serial ring: ");
   ld_dec(serial_pending_bytes());
-  ld_str(" bytes queued but not yet on the wire");
+  ld_str(" bytes queued but not yet on the wire\n");
+
+  /* Missing syscalls and unhandled ioctls diagnostic report */
+  extern void sysdiag_dump_report(void);
+  sysdiag_dump_report();
 
   ld_str("\n[LOCKDIAG] ===================================================");
   ld_str("\n[LOCKDIAG] addresses are raw: resolve with "
@@ -994,6 +998,11 @@ static void check_serial_trigger(void) {
         window[3] == 'p') {
       n = 0;
       lockdiag_dump_all("manual trigger: the word 'dump' on the serial console");
+    } else if (n == 4 && window[0] == 'd' && window[1] == 'i' && window[2] == 'a' &&
+               window[3] == 'g') {
+      n = 0;
+      extern void sysdiag_dump_report(void);
+      sysdiag_dump_report();
     }
   }
 }

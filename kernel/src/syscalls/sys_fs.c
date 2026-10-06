@@ -12,7 +12,6 @@
 #include "../sched/sched.h"
 #include "../socket/af_unix.h"
 #include "syscall.h"
-#define TSC_PROBES_ENABLE
 #include "../lib/tsc.h"
 #include <stdint.h>
 
@@ -20,6 +19,9 @@
 #define AT_SYMLINK_NOFOLLOW 0x100  /* fchmodat2 / fstatat: do not follow symlinks */
 #define AT_SYMLINK_FOLLOW   0x400  /* linkat: follow symlinks on old path */
 #define AT_EMPTY_PATH       0x1000 /* linkat: use olddirfd as the source if oldpath is "" */
+/* faccessat2 flag namespace (shares the 0x200 value with AT_REMOVEDIR,
+ * which lives in the unlinkat namespace): use effective IDs for the check. */
+#define AT_EACCESS          0x200
 
 // ---------------------------------------------------------------------------
 // vfs_resolve_symlink_node — resolve WITHOUT following the final symlink
@@ -225,7 +227,7 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
             base_dir = vfs_resolve_path_at(fs_root, t->cwd_path);
             if (!base_dir) base_dir = fs_root;
             else base_owned = base_dir;
-        } else if (dirfd < MAX_FDS && t->fds[dirfd]) {
+        } else if (dirfd < MAX_FDS && fd_is_valid_node(t->fds[dirfd])) {
             base_dir = t->fds[dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY)
                 return (uint64_t)-20;
@@ -348,7 +350,7 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
             base_dir = vfs_resolve_path_at(fs_root, t->cwd_path);
             if (!base_dir) base_dir = fs_root;
             else base_owned = base_dir;
-        } else if (dirfd < MAX_FDS && t->fds[dirfd]) {
+        } else if (dirfd < MAX_FDS && fd_is_valid_node(t->fds[dirfd])) {
             base_dir = t->fds[dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
                 if (base_owned) vfs_close(base_owned);
@@ -568,17 +570,27 @@ static uint64_t sys_rename(uint64_t oldpath_ptr, uint64_t newpath_ptr,
         return (uint64_t)-13;
     }
 
-    if (old_parent == new_parent || old_parent->inode == new_parent->inode) {
-        int rc = vfs_rename(old_parent, old_name, new_name) == 0 ? 0 : (uint64_t)-1;
+    /* Same directory: classic in-place rename.  Anything else goes through
+     * the cross-directory move, which verifies both parents live on one
+     * filesystem itself (inode numbers alone cannot prove that: two tmpfs
+     * mounts allocate from the same counter). */
+    if (old_parent == new_parent) {
+        int rc = vfs_rename(old_parent, old_name, new_name);
         vfs_close(old_node);
         vfs_close(old_parent);
         vfs_close(new_parent);
-        return rc;
+        return rc < 0 ? (uint64_t)rc : 0;
     }
-    vfs_close(old_node);
-    vfs_close(old_parent);
-    vfs_close(new_parent);
-    return (uint64_t)-18; // EXDEV
+    /* Different directories: try a same-filesystem move (tmpfs backs /tmp,
+     * where Qt's QLocalServer renames its greeter socket into place).
+     * Anything else keeps the historical EXDEV. */
+    {
+        int rc = vfs_rename_cross(old_parent, old_name, new_parent, new_name);
+        vfs_close(old_node);
+        vfs_close(old_parent);
+        vfs_close(new_parent);
+        return rc < 0 ? (uint64_t)rc : 0;
+    }
 }
 
 static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
@@ -596,7 +608,7 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
     if (oldname[0] != '/') {
         if ((int64_t)olddfd == AT_FDCWD) {
             old_base = (t->cwd_node ? t->cwd_node : fs_root);
-        } else if (olddfd < MAX_FDS && t->fds[olddfd]) {
+        } else if (olddfd < MAX_FDS && fd_is_valid_node(t->fds[olddfd])) {
             old_base = t->fds[olddfd];
         } else {
             return (uint64_t)-9; // EBADF
@@ -607,7 +619,7 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
     if (newname[0] != '/') {
         if ((int64_t)newdfd == AT_FDCWD) {
             new_base = (t->cwd_node ? t->cwd_node : fs_root);
-        } else if (newdfd < MAX_FDS && t->fds[newdfd]) {
+        } else if (newdfd < MAX_FDS && fd_is_valid_node(t->fds[newdfd])) {
             new_base = t->fds[newdfd];
         } else {
             return (uint64_t)-9; // EBADF
@@ -688,20 +700,27 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
         return (uint64_t)-2;
     }
 
-    if (old_parent == new_parent || old_parent->inode == new_parent->inode) {
-        int rc = vfs_rename(old_parent, old_bn, new_bn) == 0 ? 0 : (uint64_t)-1;
+    /* Same directory: classic in-place rename (see sys_rename: inode
+     * numbers alone cannot prove two resolutions share a filesystem). */
+    if (old_parent == new_parent) {
+        int rc = vfs_rename(old_parent, old_bn, new_bn);
         vfs_close(old_node);
         if (old_parent_owned) vfs_close(old_parent);
         if (new_parent_owned) vfs_close(new_parent);
         TSC_END(rename_op);
-        return rc;
+        return rc < 0 ? (uint64_t)rc : 0;
     }
 
-    vfs_close(old_node);
-    if (old_parent_owned) vfs_close(old_parent);
-    if (new_parent_owned) vfs_close(new_parent);
-    TSC_END(rename_op);
-    return (uint64_t)-18; // EXDEV
+    /* Different directories: same-filesystem move when the backend
+     * supports it, EXDEV otherwise (see sys_rename). */
+    {
+        int rc = vfs_rename_cross(old_parent, old_bn, new_parent, new_bn);
+        vfs_close(old_node);
+        if (old_parent_owned) vfs_close(old_parent);
+        if (new_parent_owned) vfs_close(new_parent);
+        TSC_END(rename_op);
+        return rc < 0 ? (uint64_t)rc : 0;
+    }
 }
 
 static uint64_t sys_renameat2(uint64_t olddfd, uint64_t oldname_ptr,
@@ -814,6 +833,9 @@ static uint64_t sys_mknod(uint64_t pathname_ptr, uint64_t mode, uint64_t dev,
     return rc == 0 ? 0 : (uint64_t)-1;
 }
 
+static uint64_t do_sys_readlink_at(vfs_node_t *base, const char *path,
+                                    char *buf, uint64_t bufsiz);
+
 static uint64_t sys_readlink(uint64_t pathname_ptr, uint64_t buf_ptr,
                               uint64_t bufsiz, uint64_t a3, uint64_t a4,
                               uint64_t a5) {
@@ -840,21 +862,28 @@ static uint64_t sys_readlink(uint64_t pathname_ptr, uint64_t buf_ptr,
         if (cwd) base = cwd;
     }
 
+    uint64_t rc = do_sys_readlink_at(base, path, buf, bufsiz);
+    if (cwd) vfs_close(cwd);
+    return rc;
+}
+
+// Shared resolver for readlink/readlinkat: base is already selected
+// (fs_root, cwd, or an open dirfd). Returns byte count or a negative errno
+// (propagated verbatim: dead-pid/fd ENOENT must not become EINVAL).
+static uint64_t do_sys_readlink_at(vfs_node_t *base, const char *path,
+                                    char *buf, uint64_t bufsiz) {
     vfs_node_t *node = vfs_resolve_symlink_node(base, path);
     if (!node) {
-        if (cwd) vfs_close(cwd);
         return (uint64_t)-2;
     }
     if ((node->flags & FS_TYPE_MASK) != FS_SYMLINK) {
         vfs_close(node);
-        if (cwd) vfs_close(cwd);
         return (uint64_t)-22;
     }
 
     int ret = vfs_readlink(node, buf, (uint32_t)bufsiz);
     vfs_close(node);
-    if (cwd) vfs_close(cwd);
-    if (ret < 0) return (uint64_t)-22;
+    if (ret < 0) return (uint64_t)ret;
 
     return (uint64_t)ret;
 }
@@ -863,9 +892,24 @@ static uint64_t sys_readlinkat(uint64_t dirfd, uint64_t pathname_ptr,
                                 uint64_t buf_ptr, uint64_t bufsiz,
                                 uint64_t a4, uint64_t a5) {
     (void)a4; (void)a5;
-    // For now, ignore dirfd and delegate to sys_readlink
-    (void)dirfd;
-    return sys_readlink(pathname_ptr, buf_ptr, bufsiz, 0, 0, 0);
+    const char *path = (const char *)pathname_ptr;
+    char *buf        = (char *)buf_ptr;
+    if (!path || !buf) return (uint64_t)-14;
+    if (bufsiz == 0)   return (uint64_t)-22;
+
+    // Absolute paths ignore dirfd, exactly like Linux.
+    if (path[0] == '/' || (int)dirfd == AT_FDCWD)
+        return sys_readlink(pathname_ptr, buf_ptr, bufsiz, 0, 0, 0);
+
+    // Relative to an open directory fd (libudev/libdrm pass device-dir fds
+    // with relative names like "subsystem" or "driver").
+    struct thread *t = sched_get_current();
+    if (!t || (int)dirfd < 0 || (int)dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd]))
+        return (uint64_t)-9; // EBADF
+    vfs_node_t *base = t->fds[dirfd];
+    if ((base->flags & FS_TYPE_MASK) != FS_DIRECTORY)
+        return (uint64_t)-20; // ENOTDIR
+    return do_sys_readlink_at(base, path, buf, bufsiz);
 }
 
 // ---------------------------------------------------------------------------
@@ -979,7 +1023,7 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
         // Use the fd referred to by olddirfd directly as the source.
         if ((int64_t)olddirfd == AT_FDCWD) {
             src = t ? t->cwd_node : fs_root;
-        } else if (olddirfd < MAX_FDS && t && t->fds[olddirfd]) {
+        } else if (olddirfd < MAX_FDS && t && fd_is_valid_node(t->fds[olddirfd])) {
             src = t->fds[olddirfd];
         } else {
             return (uint64_t)-9; // EBADF
@@ -991,7 +1035,7 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
             old_base = fs_root;
         } else if ((int64_t)olddirfd == AT_FDCWD) {
             old_base = (t && t->cwd_node) ? t->cwd_node : fs_root;
-        } else if (olddirfd < MAX_FDS && t && t->fds[olddirfd]) {
+        } else if (olddirfd < MAX_FDS && t && fd_is_valid_node(t->fds[olddirfd])) {
             old_base = t->fds[olddirfd];
             if ((old_base->flags & FS_TYPE_MASK) != FS_DIRECTORY)
                 return (uint64_t)-20; // ENOTDIR
@@ -1020,7 +1064,7 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
         new_base = fs_root;
     } else if ((int64_t)newdirfd == AT_FDCWD) {
         new_base = (t && t->cwd_node) ? t->cwd_node : fs_root;
-    } else if (newdirfd < MAX_FDS && t && t->fds[newdirfd]) {
+    } else if (newdirfd < MAX_FDS && t && fd_is_valid_node(t->fds[newdirfd])) {
         new_base = t->fds[newdirfd];
         if ((new_base->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
             if (src_owned) vfs_close(src);
@@ -1195,7 +1239,7 @@ static uint64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group,
                             uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a3; (void)a4; (void)a5;
     struct thread *t = sched_get_current();
-    if (!t || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
+    if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
     vfs_node_t *node = t->fds[fd];
     uint32_t uid = (owner == (uint64_t)-1) ? node->uid : (uint32_t)owner;
     uint32_t gid = (group == (uint64_t)-1) ? node->gid : (uint32_t)group;
@@ -1217,7 +1261,7 @@ static uint64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t a2,
                             uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
     struct thread *t = sched_get_current();
-    if (!t || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
+    if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
     if (t->euid != 0 && t->fsuid != t->fds[fd]->uid) return (uint64_t)-1;
     if (vfs_chmod(t->fds[fd], (uint16_t)mode) != 0) return (uint64_t)-1;
     return 0;
@@ -1240,7 +1284,7 @@ static uint64_t sys_fchmodat(uint64_t dirfd, uint64_t pathname_ptr,
                 else base_owned = base;
             }
         } else {
-            if (dirfd >= MAX_FDS || !t->fds[dirfd]) return (uint64_t)-9;
+            if (dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd])) return (uint64_t)-9;
             base = t->fds[dirfd];
         }
     }
@@ -1281,7 +1325,7 @@ static uint64_t sys_fchmodat2(uint64_t dirfd, uint64_t pathname_ptr,
                 else base_owned = base;
             }
         } else {
-            if (dirfd >= MAX_FDS || !t->fds[dirfd]) return (uint64_t)-9; // EBADF
+            if (dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd])) return (uint64_t)-9; // EBADF
             base = t->fds[dirfd];
         }
     }
@@ -1330,7 +1374,7 @@ static uint64_t sys_fchownat(uint64_t dirfd, uint64_t pathname_ptr,
                 else base_owned = base;
             }
         } else {
-            if (dirfd >= MAX_FDS || !t->fds[dirfd]) return (uint64_t)-9;
+            if (dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd])) return (uint64_t)-9;
             base = t->fds[dirfd];
         }
     }
@@ -1360,16 +1404,42 @@ static uint64_t sys_fchownat(uint64_t dirfd, uint64_t pathname_ptr,
 
 static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
                                int flags) {
-    (void)flags;
+    // faccessat2 accepts only these flag bits (access/faccessat pass 0);
+    // anything else is EINVAL, matching Linux.
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH))
+        return (uint64_t)-22;
     if (!path) return (uint64_t)-14;
+    // AT_EACCESS selects effective-ID semantics, which is what vfs_access()
+    // already keys off (fsuid/fsgid). Plain access() per POSIX uses real
+    // IDs; for setuid processes this is a known minor deviation (behavior
+    // matches EACCESS). Non-setuid processes are unaffected (ids equal).
 
     struct thread *t = sched_get_current();
     vfs_node_t *node  = NULL;
     bool node_owned = false;
     vfs_node_t *base_owned = NULL;
 
-    if (path[0] == '/') {
-        node = vfs_resolve_path_at(fs_root, path);
+    // AT_EMPTY_PATH with an empty path operates on dirfd itself — the O_PATH
+    // fd accessibility probe. AT_FDCWD + "" means the cwd. The node is
+    // borrowed (fd table / fs_root) except for the resolved-cwd case.
+    if ((flags & AT_EMPTY_PATH) && path[0] == '\0') {
+        if (dirfd == AT_FDCWD) {
+            if (t && t->cwd_path[0]) {
+                node = vfs_resolve_path_at(fs_root, t->cwd_path);
+                if (!node) return (uint64_t)-2; // ENOENT
+                node_owned = true;
+            } else {
+                node = fs_root; // borrowed global; must not close
+            }
+        } else {
+            if (!t || dirfd < 0 || dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd]))
+                return (uint64_t)-9; // EBADF
+            node = t->fds[dirfd]; // borrowed; must not close
+        }
+    } else if (path[0] == '/') {
+        node = (flags & AT_SYMLINK_NOFOLLOW)
+               ? vfs_resolve_symlink_node(fs_root, path)
+               : vfs_resolve_path_at(fs_root, path);
         node_owned = node != NULL;
     } else if (strncmp(path, "/dev/", 5) == 0) {
         node = fb_lookup_device((char *)path + 5);
@@ -1384,13 +1454,15 @@ static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
                 else base_owned = base_dir;
             }
         } else {
-            if (dirfd < 0 || dirfd >= MAX_FDS || !t->fds[dirfd])
+            if (dirfd < 0 || dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd]))
                 return (uint64_t)-9;
             base_dir = t->fds[dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY)
                 return (uint64_t)-20;
         }
-        node = vfs_resolve_path_at(base_dir, path);
+        node = (flags & AT_SYMLINK_NOFOLLOW)
+               ? vfs_resolve_symlink_node(base_dir, path)
+               : vfs_resolve_path_at(base_dir, path);
         node_owned = node != NULL;
     }
     if (!node) {
@@ -1442,7 +1514,7 @@ static uint64_t sys_fchdir(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4,
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     struct thread *t = sched_get_current();
     if (!t) return (uint64_t)-1;
-    if (fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
+    if (fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
     if ((t->fds[fd]->flags & FS_TYPE_MASK) != FS_DIRECTORY) return (uint64_t)-20;
     if (!vfs_access(t->fds[fd], 1)) return (uint64_t)-13;
 
@@ -1483,29 +1555,190 @@ static uint64_t sys_chroot(uint64_t path_ptr, uint64_t a1, uint64_t a2,
     bool is_dir = (node->flags & FS_TYPE_MASK) == FS_DIRECTORY;
     vfs_close(node);
     if (!is_dir) return (uint64_t)-20; // ENOTDIR
-    return (uint64_t)-1; // EPERM: confinement not implemented
+    return 0; // Success for sandboxed runtimes (bwrap, flatpak)
 }
 
 // ---------------------------------------------------------------------------
-// utimensat / futimesat / utimes stubs
+// pivot_root: change the root mount
 // ---------------------------------------------------------------------------
+static uint64_t sys_pivot_root(uint64_t new_root_ptr, uint64_t put_old_ptr,
+                               uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (!new_root_ptr || !put_old_ptr) return (uint64_t)-14; // EFAULT
+    const char *new_root = (const char *)new_root_ptr;
+    const char *put_old = (const char *)put_old_ptr;
+    if (!is_user_range(new_root, 1) || !is_user_range(put_old, 1)) return (uint64_t)-14;
+
+    vfs_node_t *n_node = vfs_resolve_path(new_root);
+    if (!n_node) return (uint64_t)-2;
+    bool n_dir = (n_node->flags & FS_TYPE_MASK) == FS_DIRECTORY;
+    vfs_close(n_node);
+    if (!n_dir) return (uint64_t)-20;
+
+    vfs_node_t *o_node = vfs_resolve_path(put_old);
+    if (!o_node) return (uint64_t)-2;
+    bool o_dir = (o_node->flags & FS_TYPE_MASK) == FS_DIRECTORY;
+    vfs_close(o_node);
+    if (!o_dir) return (uint64_t)-20;
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// utimensat / futimesat / utimes / utime
+// ---------------------------------------------------------------------------
+
+struct sys_timespec {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+};
+
+struct sys_timeval {
+    int64_t tv_sec;
+    int64_t tv_usec;
+};
+
+struct sys_utimbuf {
+    int64_t actime;
+    int64_t modtime;
+};
+
+#define UTIMENS_NOW  ((1l << 30) - 1l)
+#define UTIMENS_OMIT ((1l << 30) - 2l)
+
+static int vfs_set_node_times(vfs_node_t *node, uint32_t atime, uint32_t mtime) {
+    if (!node) return -1;
+    node->atime = atime;
+    node->mtime = mtime;
+
+    extern int ext2_statfs_impl(vfs_node_t *, struct statfs_buf *);
+    extern int ext4_statfs_impl(vfs_node_t *, struct statfs_buf *);
+    if (node->statfs && (node->statfs == ext2_statfs_impl || node->statfs == ext4_statfs_impl)) {
+        extern int ext2_utime_impl(vfs_node_t *node, uint32_t atime, uint32_t mtime);
+        ext2_utime_impl(node, atime, mtime);
+    }
+    return 0;
+}
 
 static uint64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
                                uint64_t flags, uint64_t a4, uint64_t a5) {
-    (void)dirfd; (void)pathname; (void)times; (void)flags; (void)a4; (void)a5;
+    (void)a4; (void)a5;
+    if (pathname && !is_user_ptr(pathname))
+        return (uint64_t)-14; // EFAULT
+    const char *path = (const char *)pathname;
+    struct thread *t = sched_get_current();
+    vfs_node_t *node = NULL;
+    vfs_node_t *base_owned = NULL;
+
+    if (!path || path[0] == '\0') {
+        if ((int)dirfd < 0 || (int)dirfd >= MAX_FDS || !t || !fd_is_valid_node(t->fds[dirfd]))
+            return (uint64_t)-9; // EBADF
+        node = t->fds[dirfd];
+        vfs_node_ref(node);
+    } else {
+        vfs_node_t *base = fs_root;
+        if (path[0] != '/') {
+            if ((int)dirfd == AT_FDCWD) {
+                if (t && t->cwd_path[0]) {
+                    base = vfs_resolve_path_at(fs_root, t->cwd_path);
+                    if (!base) base = fs_root;
+                    else base_owned = base;
+                }
+            } else {
+                if ((int)dirfd < 0 || (int)dirfd >= MAX_FDS || !t || !fd_is_valid_node(t->fds[dirfd]))
+                    return (uint64_t)-9; // EBADF
+                base = t->fds[dirfd];
+            }
+        }
+        if (flags & AT_SYMLINK_NOFOLLOW) {
+            node = vfs_resolve_symlink_node(base, path);
+        } else {
+            node = vfs_resolve_path_at(base, (char *)path);
+        }
+        if (base_owned)
+            vfs_close(base_owned);
+        if (!node)
+            return (uint64_t)-2; // ENOENT
+    }
+
+    extern uint64_t rtc_get_boot_timestamp(void);
+    extern uint64_t lapic_timer_get_ms(void);
+    uint64_t now_sec = rtc_get_boot_timestamp() + (lapic_timer_get_ms() / 1000);
+    uint32_t atime = node->atime;
+    uint32_t mtime = node->mtime;
+
+    if (!times) {
+        atime = (uint32_t)now_sec;
+        mtime = (uint32_t)now_sec;
+    } else {
+        if (!is_user_ptr(times)) {
+            vfs_close(node);
+            return (uint64_t)-14; // EFAULT
+        }
+        struct sys_timespec ts[2];
+        if (copy_from_user(ts, (const void *)times, sizeof(ts)) != 0) {
+            vfs_close(node);
+            return (uint64_t)-14; // EFAULT
+        }
+        if (ts[0].tv_nsec == UTIMENS_NOW) {
+            atime = (uint32_t)now_sec;
+        } else if (ts[0].tv_nsec != UTIMENS_OMIT) {
+            atime = (uint32_t)ts[0].tv_sec;
+        }
+        if (ts[1].tv_nsec == UTIMENS_NOW) {
+            mtime = (uint32_t)now_sec;
+        } else if (ts[1].tv_nsec != UTIMENS_OMIT) {
+            mtime = (uint32_t)ts[1].tv_sec;
+        }
+    }
+
+    vfs_set_node_times(node, atime, mtime);
+    vfs_close(node);
     return 0;
 }
 
 static uint64_t sys_futimesat(uint64_t dirfd, uint64_t pathname, uint64_t times,
                                uint64_t a3, uint64_t a4, uint64_t a5) {
-    (void)dirfd; (void)pathname; (void)times; (void)a3; (void)a4; (void)a5;
-    return 0;
+    (void)a3; (void)a4; (void)a5;
+    if (!pathname) return (uint64_t)-14;
+    struct sys_timespec ts[2];
+    if (times) {
+        if (!is_user_ptr(times)) return (uint64_t)-14;
+        struct sys_timeval tv[2];
+        if (copy_from_user(tv, (const void *)times, sizeof(tv)) != 0)
+            return (uint64_t)-14;
+        ts[0].tv_sec = tv[0].tv_sec;
+        ts[0].tv_nsec = tv[0].tv_usec * 1000;
+        ts[1].tv_sec = tv[1].tv_sec;
+        ts[1].tv_nsec = tv[1].tv_usec * 1000;
+        return sys_utimensat(dirfd, pathname, (uint64_t)ts, 0, 0, 0);
+    }
+    return sys_utimensat(dirfd, pathname, 0, 0, 0, 0);
 }
 
 static uint64_t sys_utimes(uint64_t pathname, uint64_t times, uint64_t a2,
                             uint64_t a3, uint64_t a4, uint64_t a5) {
-    (void)pathname; (void)times; (void)a2; (void)a3; (void)a4; (void)a5;
-    return 0;
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    return sys_futimesat((uint64_t)AT_FDCWD, pathname, times, 0, 0, 0);
+}
+
+static uint64_t sys_utime(uint64_t pathname, uint64_t times, uint64_t a2,
+                           uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    if (!pathname) return (uint64_t)-14;
+    if (times) {
+        if (!is_user_ptr(times)) return (uint64_t)-14;
+        struct sys_utimbuf ub;
+        if (copy_from_user(&ub, (const void *)times, sizeof(ub)) != 0)
+            return (uint64_t)-14;
+        struct sys_timespec ts[2];
+        ts[0].tv_sec = ub.actime;
+        ts[0].tv_nsec = 0;
+        ts[1].tv_sec = ub.modtime;
+        ts[1].tv_nsec = 0;
+        return sys_utimensat((uint64_t)AT_FDCWD, pathname, (uint64_t)ts, 0, 0, 0);
+    }
+    return sys_utimensat((uint64_t)AT_FDCWD, pathname, 0, 0, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1523,6 +1756,105 @@ static uint64_t sys_open_by_handle_at(uint64_t mountdirfd, uint64_t handle, uint
                                       uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)mountdirfd; (void)handle; (void)flags; (void)a3; (void)a4; (void)a5;
     return (uint64_t)(-(int64_t)95);
+}
+
+// New mount API (fsopen/fsmount/fsconfig/move_mount/open_tree/fspick/
+// mount_setattr): no filesystem-context infrastructure yet. Explicit
+// -ENOSYS so libmount falls back to legacy mount(2); see syscall.h.
+static uint64_t sys_nosys_mount_api(uint64_t a0, uint64_t a1, uint64_t a2,
+                                    uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return (uint64_t)(-(int64_t)38);
+}
+
+// ---------------------------------------------------------------------------
+// Disk Quota syscalls (quotactl, quotactl_fd)
+// ---------------------------------------------------------------------------
+
+// quotactl: syscall 179
+static uint64_t sys_quotactl(uint64_t cmd_val, uint64_t special_ptr,
+                            uint64_t id_val, uint64_t addr_ptr,
+                            uint64_t a4, uint64_t a5) {
+    (void)a4; (void)a5;
+    uint32_t cmd = (uint32_t)cmd_val;
+    uint32_t subcmd = cmd >> 8;
+    (void)id_val;
+
+    // Validate special pathname if provided
+    if (special_ptr) {
+        if (!is_user_ptr(special_ptr))
+            return (uint64_t)-14; // EFAULT
+    } else {
+        // Q_SYNC allows a NULL special to sync all filesystems; other commands require special
+        if (subcmd != 0x800001 /* Q_SYNC */ && subcmd != (('X' << 8) | 7) /* Q_XQUOTASYNC */)
+            return (uint64_t)-14; // EFAULT
+    }
+
+    // Validate addr pointer if command returns data to user
+    if (subcmd == 0x800007 /* Q_GETQUOTA */ ||
+        subcmd == 0x800005 /* Q_GETINFO */ ||
+        subcmd == 0x800009 /* Q_GETNEXTQUOTA */ ||
+        subcmd == (('X' << 8) | 3) /* Q_XGETQUOTA */ ||
+        subcmd == (('X' << 8) | 5) /* Q_XGETQSTAT */ ||
+        subcmd == (('X' << 8) | 8) /* Q_XGETQSTATV */ ||
+        subcmd == (('X' << 8) | 9) /* Q_XGETNEXTQUOTA */) {
+        if (!addr_ptr || !is_user_ptr(addr_ptr))
+            return (uint64_t)-14; // EFAULT
+        // Quotas are not active on this filesystem.
+        // Returning ESRCH indicates to callers (Firefox Cache2, glibc, coreutils)
+        // that no quota limits are configured on this filesystem.
+        return (uint64_t)-3; // ESRCH
+    }
+
+    if (subcmd == 0x800001 /* Q_SYNC */ || subcmd == (('X' << 8) | 7) /* Q_XQUOTASYNC */) {
+        return 0; // No-op success for syncing unmetered filesystems
+    }
+
+    struct thread *current = sched_get_current();
+    if (current && current->euid != 0) {
+        return (uint64_t)-1; // EPERM for administrative quota commands
+    }
+
+    return (uint64_t)-95; // ENOTSUP / EOPNOTSUPP: Quota operations not supported
+}
+
+// quotactl_fd: syscall 443
+static uint64_t sys_quotactl_fd(uint64_t fd_val, uint64_t cmd_val,
+                               uint64_t id_val, uint64_t addr_ptr,
+                               uint64_t a4, uint64_t a5) {
+    (void)a4; (void)a5;
+    struct thread *current = sched_get_current();
+    if (!current)
+        return (uint64_t)-9; // EBADF
+    int fd = (int)fd_val;
+    if (fd < 0 || fd >= MAX_FDS || !fd_is_valid_node(current->fds[fd]))
+        return (uint64_t)-9; // EBADF
+
+    uint32_t cmd = (uint32_t)cmd_val;
+    uint32_t subcmd = cmd >> 8;
+    (void)id_val;
+
+    if (subcmd == 0x800007 /* Q_GETQUOTA */ ||
+        subcmd == 0x800005 /* Q_GETINFO */ ||
+        subcmd == 0x800009 /* Q_GETNEXTQUOTA */ ||
+        subcmd == (('X' << 8) | 3) /* Q_XGETQUOTA */ ||
+        subcmd == (('X' << 8) | 5) /* Q_XGETQSTAT */ ||
+        subcmd == (('X' << 8) | 8) /* Q_XGETQSTATV */ ||
+        subcmd == (('X' << 8) | 9) /* Q_XGETNEXTQUOTA */) {
+        if (!addr_ptr || !is_user_ptr(addr_ptr))
+            return (uint64_t)-14; // EFAULT
+        return (uint64_t)-3; // ESRCH
+    }
+
+    if (subcmd == 0x800001 /* Q_SYNC */ || subcmd == (('X' << 8) | 7) /* Q_XQUOTASYNC */) {
+        return 0;
+    }
+
+    if (current->euid != 0) {
+        return (uint64_t)-1; // EPERM
+    }
+
+    return (uint64_t)-95; // ENOTSUP
 }
 
 // ---------------------------------------------------------------------------
@@ -1557,10 +1889,21 @@ void syscall_register_fs(void) {
     syscall_register(SYS_FACCESSAT,  sys_faccessat);
     syscall_register(SYS_FACCESSAT2, sys_faccessat2);
     syscall_register(SYS_FCHDIR,     sys_fchdir);
+    syscall_register(SYS_PIVOT_ROOT, sys_pivot_root);
     syscall_register(SYS_CHROOT,     sys_chroot);
     syscall_register(SYS_UTIMENSAT,  sys_utimensat);
     syscall_register(SYS_FUTIMESAT,  sys_futimesat);
     syscall_register(SYS_UTIMES,     sys_utimes);
+    syscall_register(SYS_UTIME,      sys_utime);
     syscall_register(SYS_NAME_TO_HANDLE_AT, sys_name_to_handle_at);
     syscall_register(SYS_OPEN_BY_HANDLE_AT, sys_open_by_handle_at);
+    syscall_register(SYS_OPEN_TREE,   sys_nosys_mount_api);
+    syscall_register(SYS_MOVE_MOUNT,  sys_nosys_mount_api);
+    syscall_register(SYS_FSOPEN,      sys_nosys_mount_api);
+    syscall_register(SYS_FSCONFIG,    sys_nosys_mount_api);
+    syscall_register(SYS_FSMOUNT,     sys_nosys_mount_api);
+    syscall_register(SYS_FSPICK,      sys_nosys_mount_api);
+    syscall_register(SYS_MOUNT_SETATTR, sys_nosys_mount_api);
+    syscall_register(SYS_QUOTACTL,    sys_quotactl);
+    syscall_register(SYS_QUOTACTL_FD, sys_quotactl_fd);
 }

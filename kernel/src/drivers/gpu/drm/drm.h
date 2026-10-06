@@ -5,6 +5,7 @@
 #include "../../../lib/list.h"
 #include "../../../lib/string.h"
 #include "../../../lock/spinlock.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -32,6 +33,11 @@
 #define DRM_IOCTL_GEM_MMAP 0xC0106403
 #define DRM_IOCTL_GEM_CLOSE 0x40086409
 #define DRM_IOCTL_WAIT_VBLANK 0xC018643A
+#define DRM_IOCTL_CRTC_GET_SEQUENCE 0xC018643B
+#define DRM_IOCTL_CRTC_QUEUE_SEQUENCE 0xC018643C
+
+#define DRM_CRTC_SEQUENCE_RELATIVE 0x00000001
+#define DRM_CRTC_SEQUENCE_NEXT_ON_MISS 0x00000002
 
 #define DRM_IOCTL_SET_MASTER 0x0000641E
 #define DRM_IOCTL_DROP_MASTER 0x0000641F
@@ -172,6 +178,9 @@ struct drm_mode_fb_dirty_cmd {
 };
 
 #define DRM_MODE_PAGE_FLIP_EVENT 0x01
+#define DRM_VBLANK_ABSOLUTE 0x0U
+#define DRM_VBLANK_RELATIVE 0x1U
+#define DRM_VBLANK_NEXTONMISS 0x08000000U
 #define DRM_VBLANK_EVENT 0x04000000U
 
 struct drm_wait_vblank_request {
@@ -191,6 +200,35 @@ union drm_wait_vblank {
   struct drm_wait_vblank_request request;
   struct drm_wait_vblank_reply reply;
 };
+
+/* DRM_IOCTL_CRTC_GET_SEQUENCE: current vblank count + the monotonic
+ * timestamp of that vblank for a CRTC. Xorg's modesetting driver queries
+ * this at startup for Present timing. `active` mirrors whether the CRTC
+ * currently scans out (has an fb bound). */
+struct drm_crtc_get_sequence {
+  uint32_t crtc_id;
+  uint32_t active;
+  uint64_t sequence;
+  uint64_t sequence_ns;
+};
+
+_Static_assert(sizeof(struct drm_crtc_get_sequence) == 24,
+               "drm_crtc_get_sequence ABI size");
+_Static_assert(offsetof(struct drm_crtc_get_sequence, sequence) == 8,
+               "drm_crtc_get_sequence ABI sequence offset");
+
+/* DRM_IOCTL_CRTC_QUEUE_SEQUENCE: arm a vblank event for a target sequence.
+ * Unlike WAIT_VBLANK this never sleeps in Linux either — it just arms the
+ * event and rewrites `sequence` with the queued target. */
+struct drm_crtc_queue_sequence {
+  uint32_t crtc_id;
+  uint32_t flags; /* DRM_CRTC_SEQUENCE_* */
+  uint64_t sequence; /* in: target (or offset), out: queued target */
+  uint64_t user_data;
+};
+
+_Static_assert(sizeof(struct drm_crtc_queue_sequence) == 24,
+               "drm_crtc_queue_sequence ABI size");
 
 #define DRM_MODE_CURSOR_BO 0x01
 #define DRM_MODE_CURSOR_MOVE 0x02
@@ -645,6 +683,11 @@ enum drm_gem_cache_mode {
 };
 
 // GEM internals
+// refcount is accessed only with __atomic builtins (see drm_gem_get/put):
+// plain int ++/-- from two threads probing the same dumb buffer (Xorg
+// startup does CREATE_DUMB/ADDFB/CLOSE from several paths at once) let both
+// sides observe 1, both call pmm_free_blocks on the same phys range, and the
+// buddy allocator reports "double free of linked block".
 struct drm_gem_object {
   struct drm_device *dev;
   uint32_t handle;
@@ -690,10 +733,21 @@ void ascentdrm_register_scanout_backend(drm_create_dumb_fn_t create_dumb,
                                   drm_pageflip_fn_t pageflip);
 struct drm_gem_object *ascentdrm_gem_object_create(struct drm_device *dev, size_t size);
 void ascentdrm_gem_object_free(struct drm_device *dev, struct drm_gem_object *obj);
+struct drm_gem_object *ascentdrm_gem_find_by_handle_get(struct drm_device *dev, uint32_t handle);
+/* Atomic lifetime helpers (implemented in drm_gem.c). get() adds one
+ * reference; put() drops one and returns true exactly once, when the last
+ * reference went away and the caller must free the object. */
+static inline void ascentdrm_gem_get(struct drm_gem_object *obj) {
+  __atomic_fetch_add(&obj->refcount, 1, __ATOMIC_RELAXED);
+}
+static inline bool ascentdrm_gem_put_last(struct drm_gem_object *obj) {
+  return __atomic_fetch_sub(&obj->refcount, 1, __ATOMIC_ACQ_REL) == 1;
+}
 void ascentdrm_file_send_event(struct drm_file *file, struct drm_event_vblank *ev,
                          struct vfs_node *node);
 uint32_t ascentdrm_file_gem_register(struct drm_file *file, struct drm_gem_object *obj);
 struct drm_gem_object *ascentdrm_file_gem_lookup(struct drm_file *file, uint32_t handle);
+struct drm_gem_object *ascentdrm_file_gem_lookup_get(struct drm_file *file, uint32_t handle);
 void ascentdrm_file_gem_release(struct drm_file *file, uint32_t handle);
 extern struct drm_device global_ascentdrm_dev;
 

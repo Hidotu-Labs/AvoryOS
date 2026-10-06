@@ -205,66 +205,101 @@ void *kmem_cache_alloc(kmem_cache_t *cache) {
   if (!cache)
     return NULL;
 
-  spinlock_acquire(&slab_global_lock);
+  void *ret_ctor_arg = NULL;
+  void (*ctor)(void *) = NULL;
 
-  // 1. Try partial slab first
-  struct slab_page *s = cache->slabs_partial;
+  // Bounded retry: first PMM failure shrinks empty slabs elsewhere, then
+  // tries exactly once more. Never loops (shrink makes no progress when
+  // every cache is fully used).
+  for (int attempt = 0; attempt < 2; attempt++) {
+    spinlock_acquire(&slab_global_lock);
 
-  // 2. If no partial, try free list
-  if (!s) {
-    if (cache->slabs_free) {
-      s = cache->slabs_free;
-      slab_unlink(&cache->slabs_free, s);
-    } else {
-      // 3. Allocate a brand new slab page
-      s = slab_page_alloc(cache);
-      if (!s) {
+    // 1. Scan all partial slabs for a free slot. The old head-only lookup
+    //    returned NULL when the head was full/corrupt even though another
+    //    partial slab still had space.
+    struct slab_page *s = NULL;
+    int free_idx = -1;
+    for (struct slab_page *cand = cache->slabs_partial; cand;
+         cand = cand->next) {
+      free_idx = -1;
+      for (int i = 0; i < (int)cand->total_count; i++) {
+        if (!BITMAP_TEST(cand->bitmap, i)) {
+          free_idx = i;
+          break;
+        }
+      }
+      if (free_idx != -1) {
+        s = cand;
+        break;
+      }
+      // Full or corrupt header: try the next partial slab.
+    }
+
+    // 2. No space in partials: reuse one slab from the free list, else
+    //    allocate a brand new slab page.
+    if (!s) {
+      if (cache->slabs_free) {
+        s = cache->slabs_free;
+        slab_unlink(&cache->slabs_free, s);
+      } else {
+        // 3. Allocate a brand new slab page
+        s = slab_page_alloc(cache);
+        if (!s) {
+          spinlock_release(&slab_global_lock);
+          if (attempt == 0) {
+            kmem_cache_shrink_all();
+            continue;
+          }
+          return NULL;
+        }
+      }
+      // Move to partial
+      slab_push(&cache->slabs_partial, s);
+
+      free_idx = -1;
+      for (int i = 0; i < (int)s->total_count; i++) {
+        if (!BITMAP_TEST(s->bitmap, i)) {
+          free_idx = i;
+          break;
+        }
+      }
+      if (free_idx == -1) {
+        // Corrupt reused/new slab: park it back on the free list so a
+        // later shrink can reclaim it instead of handing out a duplicate.
+        slab_unlink(&cache->slabs_partial, s);
+        slab_push(&cache->slabs_free, s);
         spinlock_release(&slab_global_lock);
         return NULL;
       }
     }
-    // Move to partial
-    slab_push(&cache->slabs_partial, s);
-  }
 
-  // Find a free bit in the bitmap
-  int free_idx = -1;
-  for (int i = 0; i < (int)s->total_count; i++) {
-    if (!BITMAP_TEST(s->bitmap, i)) {
-      free_idx = i;
-      break;
+    BITMAP_SET(s->bitmap, free_idx);
+    if (s->free_count > 0)
+      s->free_count--;
+
+    // If slab is now full, move from partial to full
+    if (s->free_count == 0) {
+      slab_unlink(&cache->slabs_partial, s);
+      slab_push(&cache->slabs_full, s);
     }
-  }
 
-  if (free_idx == -1) {
-    // Should never happen — partial slab must have free slots
+    cache->total_allocs++;
+    cache->active_objects++;
+
+    uint8_t *obj_base = (uint8_t *)s + sizeof(struct slab_page);
+    ret_ctor_arg = obj_base + (free_idx * cache->obj_aligned);
+    ctor = cache->ctor;
+
     spinlock_release(&slab_global_lock);
-    return NULL;
+    break;
   }
 
-  BITMAP_SET(s->bitmap, free_idx);
-  s->free_count--;
-
-  // If slab is now full, move from partial to full
-  if (s->free_count == 0) {
-    slab_unlink(&cache->slabs_partial, s);
-    slab_push(&cache->slabs_full, s);
+  // Call constructor outside the lock, as before.
+  if (ret_ctor_arg && ctor) {
+    ctor(ret_ctor_arg);
   }
 
-  cache->total_allocs++;
-  cache->active_objects++;
-
-  uint8_t *obj_base = (uint8_t *)s + sizeof(struct slab_page);
-  void *ptr = obj_base + (free_idx * cache->obj_aligned);
-
-  spinlock_release(&slab_global_lock);
-
-  // Call constructor if present
-  if (cache->ctor) {
-    cache->ctor(ptr);
-  }
-
-  return ptr;
+  return ret_ctor_arg;
 }
 
 void kmem_cache_free(kmem_cache_t *cache, void *obj) {
@@ -372,6 +407,28 @@ void kmem_cache_shrink(kmem_cache_t *cache) {
     cache->total_slabs--;
   }
 
+  spinlock_release(&slab_global_lock);
+}
+
+// OOM reclaim: release empty slabs from every cache. Used as the single
+// bounded retry step by kmem_cache_alloc() (and, via weak symbol, by the
+// generic heap in heap.c). Caller must NOT hold slab_global_lock.
+void kmem_cache_shrink_all(void) {
+  spinlock_acquire(&slab_global_lock);
+  for (int i = 0; i < SLAB_CACHE_MAX_CACHES; i++) {
+    if (!cache_used[i])
+      continue;
+    kmem_cache_t *c = &cache_pool[i];
+    while (c->slabs_free) {
+      struct slab_page *s = c->slabs_free;
+      slab_unlink(&c->slabs_free, s);
+      uint64_t *pml4 = vmm_get_active_pml4();
+      uint64_t phys = vmm_virt_to_phys(pml4, (uint64_t)s);
+      if (phys)
+        pmm_free_page((void *)(phys & 0x000FFFFFFFFFF000ULL));
+      c->total_slabs--;
+    }
+  }
   spinlock_release(&slab_global_lock);
 }
 

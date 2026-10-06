@@ -1,6 +1,8 @@
 
 
+#include "../../../console/console.h"
 #include "../../../console/klog.h"
+#include "../../../fb/framebuffer.h"
 #include "../../../fs/ramfs.h"
 #include "../../../lib/string.h"
 #include "../../../mm/heap.h"
@@ -33,7 +35,7 @@ struct drm_file *ascentdrm_file_alloc(struct drm_device *dev) {
   spinlock_acquire(&dev->lock);
   if (list_empty(&dev->file_list)) {
     file->is_master = 1;
-    klog_puts("[DRM] First client granted Master status\n");
+    klog_debug_puts("[DRM] First client granted Master status\n");
   }
   list_add_tail(&file->list, &dev->file_list);
   spinlock_release(&dev->lock);
@@ -63,16 +65,16 @@ struct drm_file *ascentdrm_file_alloc(struct drm_device *dev) {
      */
     spinlock_acquire(&file->lock);
     file->hw_fb_gem = hw_fb;
-    hw_fb->refcount++;
+    ascentdrm_gem_get(hw_fb);
     spinlock_release(&file->lock);
   }
 
-  klog_puts("[DRM] drm_file allocated, client count=");
+  klog_debug_puts("[DRM] drm_file allocated, client count=");
   uint32_t n = 0;
   struct drm_file *f;
   list_for_each_entry(f, &dev->file_list, list) n++;
-  klog_uint64(n);
-  klog_puts("\n");
+  klog_debug_uint64(n);
+  klog_debug_puts("\n");
 
   return file;
 }
@@ -82,19 +84,24 @@ void ascentdrm_file_free(struct drm_file *file) {
     return;
   struct drm_device *dev = file->dev;
 
-  /* Release all GEM handles owned by this client */
+  /* Release all GEM handles owned by this client. Collect last-refs under
+   * the lock and free them after unlock: the refcount itself is atomic, so
+   * exactly one closer observes the 1->0 transition even when two files
+   * share the object. */
+  struct drm_gem_object *to_free[DRM_MAX_HANDLES_PER_FILE];
+  uint32_t n_free = 0;
   spinlock_acquire(&file->lock);
   for (uint32_t i = 0; i < DRM_MAX_HANDLES_PER_FILE; i++) {
     if (file->handles[i]) {
-      file->handles[i]->refcount--;
-      if (file->handles[i]->refcount <= 0)
-        ascentdrm_gem_object_free(dev, file->handles[i]);
+      struct drm_gem_object *obj = file->handles[i];
       file->handles[i] = NULL;
+      if (ascentdrm_gem_put_last(obj) && n_free < DRM_MAX_HANDLES_PER_FILE)
+        to_free[n_free++] = obj;
     }
   }
   /* Release legacy hw FB reference */
   if (file->hw_fb_gem) {
-    file->hw_fb_gem->refcount--;
+    __atomic_fetch_sub(&file->hw_fb_gem->refcount, 1, __ATOMIC_ACQ_REL);
     /* Never free the hw FB object itself — it's the physical framebuffer */
     file->hw_fb_gem = NULL;
   }
@@ -107,11 +114,28 @@ void ascentdrm_file_free(struct drm_file *file) {
   }
   spinlock_release(&file->lock);
 
+  for (uint32_t i = 0; i < n_free; i++)
+    ascentdrm_gem_object_free(dev, to_free[i]);
+
   spinlock_acquire(&dev->lock);
   list_del(&file->list);
+  bool last_client = list_empty(&dev->file_list);
   spinlock_release(&dev->lock);
 
-  klog_puts("[DRM] drm_file freed\n");
+  /* Plymouth quit/kill while its splash resource is scanned out leaves the
+   * TTY login running blind (serial shows `AvoryOS login`, QEMU black).
+   * Always hand back on last close, not only when kd==GRAPHICS, since the
+   * scanout can switch while kd stayed TEXT. Redraw first so GOP has the
+   * login prompt, then re-present GOP. Transient closes while already TEXT
+   * just re-present the same image. */
+  /* Redraw text into the GOP fb first, then re-present it: restore copies
+   * GOP -> native scanout, so order matters. */
+  if (last_client) {
+    fb_set_kd_mode(0); /* KD_TEXT, redraws console */
+    virtio_gpu_restore_console_scanout();
+  }
+
+  klog_debug_puts("[DRM] drm_file freed\n");
   kfree(file);
 }
 
@@ -142,7 +166,7 @@ uint32_t ascentdrm_file_gem_register(struct drm_file *file,
   do {
     if (!file->handles[h]) {
       file->handles[h] = obj;
-      obj->refcount++;
+      ascentdrm_gem_get(obj);
       file->next_handle = h + 1;
       if (file->next_handle >= DRM_MAX_HANDLES_PER_FILE)
         file->next_handle = 1;
@@ -198,6 +222,35 @@ struct drm_gem_object *ascentdrm_file_gem_lookup(struct drm_file *file,
 }
 
 /*
+ * Locked lookup+get: find the object and take a reference while still
+ * holding file->lock, so a concurrent close/release cannot free it between
+ * the lookup and the refcount increment. Returns NULL with no reference
+ * taken when the handle is unknown.
+ */
+struct drm_gem_object *ascentdrm_file_gem_lookup_get(struct drm_file *file,
+                                               uint32_t handle) {
+  if (handle > 0 && handle < DRM_MAX_HANDLES_PER_FILE) {
+    spinlock_acquire(&file->lock);
+    struct drm_gem_object *obj = file->handles[handle];
+    if (obj)
+      ascentdrm_gem_get(obj);
+    spinlock_release(&file->lock);
+    if (obj)
+      return obj;
+  }
+  if (handle == 0xF0B0) {
+    spinlock_acquire(&file->lock);
+    struct drm_gem_object *obj = file->hw_fb_gem;
+    if (obj)
+      ascentdrm_gem_get(obj);
+    spinlock_release(&file->lock);
+    if (obj)
+      return obj;
+  }
+  return ascentdrm_file_gem_lookup(file, handle);
+}
+
+/*
  * Release a local handle.  Decrements gem refcount; frees if zero.
  */
 void ascentdrm_file_gem_release(struct drm_file *file, uint32_t handle) {
@@ -207,12 +260,10 @@ void ascentdrm_file_gem_release(struct drm_file *file, uint32_t handle) {
   struct drm_gem_object *obj = file->handles[handle];
   if (obj) {
     file->handles[handle] = NULL;
-    obj->refcount--;
-    if (obj->refcount <= 0) {
-      spinlock_release(&file->lock);
+    spinlock_release(&file->lock);
+    if (ascentdrm_gem_put_last(obj))
       ascentdrm_gem_object_free(file->dev, obj);
-      return;
-    }
+    return;
   }
   spinlock_release(&file->lock);
 }
@@ -287,8 +338,7 @@ static void prime_close(struct vfs_node *node) {
   /* When the prime fd is closed, drop the gem refcount */
   struct drm_gem_object *obj = (struct drm_gem_object *)node->device;
   if (obj) {
-    obj->refcount--;
-    if (obj->refcount <= 0 && obj->dev)
+    if (ascentdrm_gem_put_last(obj) && obj->dev)
       ascentdrm_gem_object_free(obj->dev, obj);
   }
   klog_puts("[DRM] PRIME fd closed\n");
@@ -323,7 +373,7 @@ int ascentdrm_prime_export(struct drm_gem_object *obj) {
   prime_node->close = prime_close;
   prime_node->refcount = 1;
 
-  obj->refcount++; /* prime fd holds a reference */
+  ascentdrm_gem_get(obj); /* prime fd holds a reference */
 
   t->fds[fd] = prime_node;
   t->fd_offsets[fd] = 0;

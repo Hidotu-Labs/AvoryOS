@@ -108,6 +108,30 @@ char *strstr(const char *haystack, const char *needle) {
 
 void *memset(void *s, int c, size_t n) {
   void *d = s;
+  if (n >= 32) {
+    /* Bulk zero/set with 8-byte stores: ~8x fewer loop iterations than
+     * rep stosb under virtualization without ERMS passthrough. This is the
+     * dominant cost in demand-zero fault handling (4 KB per fault, 2 MB per
+     * THP fault) and in every page-table allocation. */
+    uint8_t *p = (uint8_t *)s;
+    uint64_t c8 = (uint8_t)c * 0x0101010101010101ULL;
+    while (n && ((uintptr_t)p & 7)) {
+      *p++ = (uint8_t)c;
+      n--;
+    }
+    uint64_t *pw = (uint64_t *)p;
+    size_t q = n / 8;
+    __asm__ volatile("rep stosq"
+                     : "+D"(pw), "+c"(q)
+                     : "a"(c8)
+                     : "memory");
+    p = (uint8_t *)pw;
+    n %= 8;
+    while (n--) {
+      *p++ = (uint8_t)c;
+    }
+    return d;
+  }
   __asm__ volatile("rep stosb"
                    : "+D"(s), "+c"(n)
                    : "a"((uint8_t)c)
@@ -117,6 +141,23 @@ void *memset(void *s, int c, size_t n) {
 
 void *memcpy(void *dest, const void *src, size_t n) {
   void *d = dest;
+  if (n >= 64 && (((uintptr_t)dest & 7) == ((uintptr_t)src & 7))) {
+    /* Same bulk rationale as memset: 8-byte moves for the aligned middle.
+     * Only valid when both ends share alignment; otherwise fall through to
+     * the byte loop, which handles every case correctly. */
+    while (n && ((uintptr_t)dest & 7)) {
+      *(uint8_t *)dest = *(const uint8_t *)src;
+      dest = (uint8_t *)dest + 1;
+      src = (const uint8_t *)src + 1;
+      n--;
+    }
+    size_t q = n / 8;
+    __asm__ volatile("rep movsq"
+                     : "+D"(dest), "+S"(src), "+c"(q)
+                     :
+                     : "memory");
+    n %= 8;
+  }
   __asm__ volatile("rep movsb"
                    : "+D"(dest), "+S"(src), "+c"(n)
                    :
@@ -155,9 +196,10 @@ void *memmove(void *dest, const void *src, size_t n) {
 }
 
 static int memcpy_wc_use_rep(void) {
-  /* Give QEMU TCG one REP string operation instead of a guest loop with one
-   * MOVNTI per machine word. Cache the vendor check because damage blits call
-   * memcpy_to_wc once per affected span. */
+  /* Give QEMU (both KVM and TCG) and hardware with ERMS fast string operations
+   * instead of a guest loop with MOVNTI per machine word. In KVM and TCG,
+   * MOVNTI is an un-accelerated MMIO exit per 8 bytes, causing severe console lag.
+   * REP MOVSQ is handled in kernel/host fastpath. */
   static uint8_t mode;
   uint8_t cached = __atomic_load_n(&mode, __ATOMIC_RELAXED);
   if (cached)
@@ -166,17 +208,23 @@ static int memcpy_wc_use_rep(void) {
   uint32_t eax = 1, ebx, ecx, edx;
   __asm__ volatile("cpuid"
                    : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
-  int tcg = 0;
+  int use_rep = 0;
   if (ecx & (1U << 31)) {
-    eax = 0x40000000;
+    /* Running inside a hypervisor (KVM, QEMU TCG, Xen, VMware, Hyper-V).
+     * Emulated MMIO/WC stores are vastly faster with REP MOVSQ than MOVNTI. */
+    use_rep = 1;
+  } else {
+    /* On bare metal, check for ERMS (Enhanced REP MOVSB/STOSB) */
+    uint32_t eax7 = 7, ecx7 = 0;
+    uint32_t ebx7 = 0, edx7 = 0;
     __asm__ volatile("cpuid"
-                     : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
-    /* "TCGTCGTCGTCG" consists of the same little-endian dword repeated. */
-    tcg = ebx == 0x54474354U && ecx == 0x54474354U &&
-          edx == 0x54474354U;
+                     : "+a"(eax7), "=b"(ebx7), "+c"(ecx7), "=d"(edx7));
+    if (ebx7 & (1U << 9)) {
+      use_rep = 1;
+    }
   }
-  __atomic_store_n(&mode, tcg ? 2 : 1, __ATOMIC_RELAXED);
-  return tcg;
+  __atomic_store_n(&mode, use_rep ? 2 : 1, __ATOMIC_RELAXED);
+  return use_rep;
 }
 
 void *memcpy_to_wc(void *dest, const void *src, size_t n) {

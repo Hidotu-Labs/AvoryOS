@@ -140,18 +140,21 @@ uint32_t ext4_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_
 
 uint32_t ext4_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
     ext2_mount_t *mnt = (ext2_mount_t *)node->device;
-    if (!mnt) return 0;
+    if (!mnt || !buffer)
+        return (uint32_t)-14;
+    if (size == 0)
+        return 0;
 
     ext2_inode_t inode;
-    if (ext2_read_inode(mnt, node->inode, &inode)) return 0;
+    if (ext2_read_inode(mnt, node->inode, &inode)) return (uint32_t)-5;
     if (!ext4_inode_has_extents(&inode))
         return ext2_write_impl(node, offset, size, buffer);
 
     uint8_t *block_buf = kmalloc(mnt->block_size);
-    if (!block_buf) return 0;
+    if (!block_buf) return (uint32_t)-12;
     if (ext3_journal_start(mnt) != 0) {
         kfree(block_buf);
-        return 0;
+        return (uint32_t)-5;
     }
 
     uint32_t bytes_written = 0;
@@ -208,6 +211,12 @@ uint32_t ext4_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8
             if (uncopied > 0) {
                 bytes_written += (count - (uint32_t)uncopied);
                 ext2_write_block(mnt, disk_block, block_buf);
+                if (bytes_written == 0) {
+                    ext2_write_inode(mnt, node->inode, &inode);
+                    ext3_journal_stop(mnt);
+                    kfree(block_buf);
+                    return (uint32_t)-14;
+                }
                 break;
             }
         } else {
@@ -225,6 +234,13 @@ uint32_t ext4_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8
         }
         bytes_written += count;
         blocks_in_batch++;
+    }
+
+    if (bytes_written == 0) {
+        ext2_write_inode(mnt, node->inode, &inode);
+        ext3_journal_stop(mnt);
+        kfree(block_buf);
+        return (uint32_t)-28; /* ENOSPC: never return 0 for len!=0 */
     }
 
     if (offset + bytes_written > inode.i_size)

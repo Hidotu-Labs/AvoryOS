@@ -84,6 +84,10 @@ void kmem_cache_free(kmem_cache_t *cache, void *obj);
 // Shrink a cache: release completely empty slabs back to PMM.
 void kmem_cache_shrink(kmem_cache_t *cache);
 
+// Shrink every cache: single bounded OOM-reclaim step. Caller must NOT hold
+// the slab lock. Used before exactly one retry, never in a loop.
+void kmem_cache_shrink_all(void);
+
 // Introspection
 
 // Print statistics for all registered caches (serial/klog)

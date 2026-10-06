@@ -70,6 +70,12 @@ bool virtio_gpu_phase3_init_scanout(void);
 bool virtio_gpu_phase3_stress_test(uint32_t resource_cycles, uint32_t frames);
 bool virtio_gpu_phase4_bind_drm(void);
 bool virtio_gpu_phase4_stress_test(uint32_t resource_cycles, uint32_t damage_cycles);
+/* Plymouth quit / last DRM close while kd==GRAPHICS leaves the stale black
+ * splash resource scanned out, so the TTY login runs blind. Revert head 0
+ * to VGA/fbcon; fb_set_kd_mode() redraws text afterwards. */
+void virtio_gpu_restore_console_scanout(void);
+/* Mirror a freshly swapped fbcon rect to the display while fbcon owns it. */
+void virtio_gpu_console_commit(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 bool virtio_gpu_phase6_start(void);
 bool virtio_gpu_phase7_start(void);
 bool virtio_gpu_phase8_start(void);

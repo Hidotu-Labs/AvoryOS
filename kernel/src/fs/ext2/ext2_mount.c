@@ -61,7 +61,7 @@ ext2_mount_t *ext2_init_mount(struct block_device *dev) {
   return mnt;
 }
 
-static int ext2_statfs_impl(vfs_node_t *node, struct statfs_buf *buf) {
+int ext2_statfs_impl(vfs_node_t *node, struct statfs_buf *buf) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;

@@ -203,14 +203,14 @@ static uint64_t sys_epoll_pwait(uint64_t epfd, uint64_t events_ptr,
   // Call implementation
   int ret = epoll_wait_impl(ep, events, (int)maxevents, (int)timeout_ms);
 
-  // Check for pending signals (EINTR handling)
-  if (ret >= 0) {
+  // Linux returns EINTR if an unmasked signal became pending during the wait,
+  // even when events are also ready. do_poll/epoll_wait_impl already checks
+  // thread_has_pending_signal, but pwait swapped the mask, so re-check here
+  // against the temporary mask before restoring.
+  if (current) {
     uint64_t pending = current->pending_signals & ~current->signal_mask;
-    if (pending) {
-      // Signal pending - would normally return EINTR
-      // For now, we just return the events we got
-      // In a full implementation, we'd check if a signal interrupted
-    }
+    if (pending)
+      ret = -4; // EINTR
   }
 
   // Restore old signal mask if we changed it

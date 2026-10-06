@@ -1,5 +1,7 @@
 #include "drivers/gpu/virtio_gpu/virtio_gpu.h"
 #include "../../../lock/lockdiag.h"
+#include "../../../fb/vblank.h"
+#include "../../../fb/framebuffer.h"
 #include "apic/lapic_timer.h"
 #include "cpu/irq.h"
 #include "sched/sched.h"
@@ -21,6 +23,7 @@
 #define RESP_OFF       2048
 #define RESP_CAP       (PAGE_SIZE - RESP_OFF)
 static struct virtio_gpu_device gpu;
+static uint32_t fbcon_scanout_id = 0;
 static spinlock_t gpu_poll_lock;
 static spinlock_t gpu_present_lock;
 static wait_queue_t gpu_worker_wait;
@@ -534,6 +537,31 @@ static bool transfer_2d(uint32_t id, uint32_t w, uint32_t h) {
     r.resource_id = id;
     return nodata(&r, sizeof(r));
 }
+static bool transfer_2d_rect(uint32_t id, uint32_t x, uint32_t y, uint32_t w,
+                             uint32_t h, uint64_t off) {
+    struct virtio_gpu_transfer_to_host_2d r;
+    memset(&r, 0, sizeof(r));
+    init_hdr(&r.hdr, VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+    r.r.x = x;
+    r.r.y = y;
+    r.r.width = w;
+    r.r.height = h;
+    r.offset = off;
+    r.resource_id = id;
+    return nodata(&r, sizeof(r));
+}
+static bool flush_rect(uint32_t id, uint32_t x, uint32_t y, uint32_t w,
+                       uint32_t h) {
+    struct virtio_gpu_resource_flush r;
+    memset(&r, 0, sizeof(r));
+    init_hdr(&r.hdr, VIRTIO_GPU_CMD_RESOURCE_FLUSH);
+    r.r.x = x;
+    r.r.y = y;
+    r.r.width = w;
+    r.r.height = h;
+    r.resource_id = id;
+    return nodata(&r, sizeof(r));
+}
 static bool flush_resource(uint32_t id, uint32_t w, uint32_t h) {
     struct virtio_gpu_resource_flush r;
     memset(&r, 0, sizeof(r));
@@ -607,6 +635,7 @@ bool virtio_gpu_phase3_init_scanout(void) {
     gpu.head_resource[0] = id;
     gpu.queued_head_resource[0] = id;
     gpu.owns_scanout = true;
+    fbcon_scanout_id = id;
     klog_puts("[VIRTIO-GPU] Native scanout active: resource=");
     klog_uint64(id);
     klog_puts(" size=");
@@ -879,8 +908,19 @@ static bool handle_async_completion(void *cookie, uint32_t used_len) {
         }
     }
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
-    if (send_event)
+    if (send_event) {
+        /* Pace flip completion to the vblank boundary: the host ACK arrives
+         * mid-scanout, and delivering instantly lets compositors present
+         * uncapped. No locks are held here (worker thread context). */
+        vblank_wait_next();
+        uint32_t seq = vblank_sequence();
+        uint32_t sec, usec;
+        vblank_timestamp(seq, &sec, &usec);
+        ev.tv_sec = sec;
+        ev.tv_usec = usec;
+        ev.sequence = seq;
         ascentdrm_file_send_event(event_file, &ev, event_node);
+    }
     return true;
 }
 
@@ -1103,7 +1143,7 @@ static void gpu_handle_config_event(void) {
 
 static void virtio_gpu_worker(void) {
     struct thread *self = sched_get_current();
-    wait_queue_entry_t entry = {.thread = self, .next = NULL};
+    wait_queue_entry_t entry = {.thread = self, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
     for (;;) {
         uint32_t pending = __atomic_exchange_n(&gpu_pending_work, 0, __ATOMIC_ACQ_REL);
         /* Poll periodically only when interrupts are unavailable.  In IRQ mode,
@@ -1115,16 +1155,24 @@ static void virtio_gpu_worker(void) {
             gpu_handle_config_event();
         gpu_drain_completions();
         gpu_drain_cursor_completions();
+        self->state = THREAD_BLOCKED;
         wait_queue_add(&gpu_worker_wait, &entry);
         if (gpu.controlq.last_used_idx == gpu.controlq.used->idx &&
             gpu.cursorq.last_used_idx == gpu.cursorq.used->idx && !gpu_pending_work) {
-            self->state = THREAD_BLOCKED;
             self->wakeup_ticks = gpu_irq_installed ? 0 : lapic_timer_get_ticks() + 1;
-        } else
-            wait_queue_wake_one(&gpu_worker_wait);
+        } else {
+            self->state = THREAD_RUNNING;
+            self->wakeup_ticks = 0;
+            wait_queue_remove(&gpu_worker_wait, &entry);
+            if (self->state == THREAD_BLOCKED)
+                self->state = THREAD_RUNNING;
+            continue;
+        }
         sched_yield();
         self->wakeup_ticks = 0;
         wait_queue_remove(&gpu_worker_wait, &entry);
+        if (self->state == THREAD_BLOCKED)
+            self->state = THREAD_RUNNING;
     }
 }
 
@@ -1412,23 +1460,157 @@ static bool disable_scanout(uint32_t head) {
     r.resource_id = 0;
     return nodata(&r, sizeof(r));
 }
+void virtio_gpu_restore_console_scanout(void) {
+    /* -vga none: no VGA fallback, so disabling leaves "Display output is
+     * not active". Re-present a native fbcon resource instead, seeded
+     * from the GOP fb (already redrawn with the login prompt). Phase3
+     * init never runs on this config, so allocate the native resource
+     * on demand the first time Plymouth quits. */
+    if (!gpu.initialized)
+        return;
+    if (!fbcon_scanout_id) {
+        uint32_t dw = fb_get_width(), dh = fb_get_height();
+        if (!dw || !dh || dw > 8192 || dh > 8192) {
+            dw = gpu.scanout_width;
+            dh = gpu.scanout_height;
+        }
+        if (!dw || !dh || dw > 8192 || dh > 8192)
+            return;
+        uint64_t bytes = (uint64_t)dw * dh * 4ULL;
+        if (!bytes || bytes > 0xFFFFFFFFULL)
+            return;
+        dma_buffer_t *dma = dma_alloc((size_t)bytes, DMA_FLAG_32BIT);
+        if (!dma)
+            return;
+        uint32_t id = ++gpu.next_resource_id;
+        if (!create_2d(id, dw, dh) ||
+            !attach_backing(id, dma->phys, (uint32_t)bytes)) {
+            if (gpu.resources_live)
+                unref_resource(id);
+            return;
+        }
+        gpu.scanout_dma = dma;
+        gpu.scanout_width = dw;
+        gpu.scanout_height = dh;
+        fbcon_scanout_id = id;
+    }
+    if (!gpu.scanout_dma || !gpu.scanout_dma->virt)
+        return;
+    void *base = fb_get_base();
+    uint32_t fw = fb_get_width(), fh = fb_get_height(), pitch = fb_get_pitch();
+    uint32_t sw = gpu.scanout_width, sh = gpu.scanout_height;
+    if (!base || !fw || !fh || !pitch || !sw || !sh)
+        return;
+    uint32_t w = fw < sw ? fw : sw;
+    uint32_t h = fh < sh ? fh : sh;
+    uint8_t *dst = (uint8_t *)gpu.scanout_dma->virt;
+    uint8_t *src = (uint8_t *)base;
+    uint32_t dst_pitch = sw * 4;
+    for (uint32_t y = 0; y < h; y++)
+        memcpy(dst + (uint64_t)y * dst_pitch, src + (uint64_t)y * pitch,
+               (size_t)w * 4);
+    __asm__ volatile("" ::: "memory");
+    transfer_2d(fbcon_scanout_id, sw, sh);
+    set_scanout(0, fbcon_scanout_id, sw, sh);
+    flush_resource(fbcon_scanout_id, sw, sh);
+    gpu.head_resource[0] = fbcon_scanout_id;
+    gpu.queued_head_resource[0] = fbcon_scanout_id;
+    gpu.scanout_resource_id = fbcon_scanout_id;
+    gpu.queued_scanout_resource_id = fbcon_scanout_id;
+    gpu.owns_scanout = true;
+}
+/* Live console mirror: fb_swap just copied back->front (GOP). While the
+ * fbcon resource is scanned out (post-Plymouth text login), copy the same
+ * dirty rect front->scanout_dma and present it, so typing/scrolling shows.
+ * Skipped when a DRM master (Plymouth splash, SDDM, Weston) owns the head —
+ * those present themselves. */
+static uint64_t last_console_commit_ms = 0;
+static uint32_t pending_cx = 0, pending_cy = 0, pending_cw = 0, pending_ch = 0;
+static bool console_commit_pending = false;
+
+void virtio_gpu_console_commit(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (!gpu.initialized || !fbcon_scanout_id || !gpu.scanout_dma ||
+        !gpu.scanout_dma->virt)
+        return;
+    if (gpu.head_resource[0] != fbcon_scanout_id)
+        return;
+    void *base = fb_get_base();
+    uint32_t fw = fb_get_width(), fh = fb_get_height(), pitch = fb_get_pitch();
+    uint32_t sw = gpu.scanout_width, sh = gpu.scanout_height;
+    if (!base || !fw || !fh || !pitch || !sw || !sh || !w || !h)
+        return;
+    if (x >= fw || y >= fh || x >= sw || y >= sh)
+        return;
+    if (x + w > fw) w = fw - x;
+    if (y + h > fh) h = fh - y;
+    if (x + w > sw) w = sw - x;
+    if (y + h > sh) h = sh - y;
+    if (!w || !h)
+        return;
+
+    if (!console_commit_pending) {
+        pending_cx = x;
+        pending_cy = y;
+        pending_cw = w;
+        pending_ch = h;
+        console_commit_pending = true;
+    } else {
+        uint32_t x1 = pending_cx < x ? pending_cx : x;
+        uint32_t y1 = pending_cy < y ? pending_cy : y;
+        uint32_t x2 = (pending_cx + pending_cw) > (x + w) ? (pending_cx + pending_cw) : (x + w);
+        uint32_t y2 = (pending_cy + pending_ch) > (y + h) ? (pending_cy + pending_ch) : (y + h);
+        pending_cx = x1;
+        pending_cy = y1;
+        pending_cw = x2 - x1;
+        pending_ch = y2 - y1;
+    }
+
+    uint64_t now = lapic_timer_get_ms();
+    /* Rate limit synchronous VirtIO GPU commits to ~60 FPS (16ms)
+     * to eliminate busy-spinning and VM exit overhead during rapid console writes. */
+    if (now - last_console_commit_ms < 16)
+        return;
+
+    last_console_commit_ms = now;
+    uint32_t cx = pending_cx, cy = pending_cy, cw = pending_cw, ch = pending_ch;
+    console_commit_pending = false;
+
+    uint8_t *dst = (uint8_t *)gpu.scanout_dma->virt;
+    uint8_t *src = (uint8_t *)base;
+    uint32_t dst_pitch = sw * 4;
+    for (uint32_t r = 0; r < ch; r++)
+        memcpy(dst + (uint64_t)(cy + r) * dst_pitch + (uint64_t)cx * 4,
+               src + (uint64_t)(cy + r) * pitch + (uint64_t)cx * 4,
+               (size_t)cw * 4);
+    __asm__ volatile("" ::: "memory");
+    uint64_t off = (uint64_t)cy * dst_pitch + (uint64_t)cx * 4;
+    transfer_2d_rect(fbcon_scanout_id, cx, cy, cw, ch, off);
+    flush_rect(fbcon_scanout_id, cx, cy, cw, ch);
+}
 static void virtio_gpu_gem_free(struct drm_device *dev, struct drm_gem_object *obj) {
     (void)dev;
     struct virtio_gpu_gem *vg = (struct virtio_gpu_gem *)obj->driver_private;
     if (vg) {
         if (gpu_irq_installed && gpu_worker_started && sched_get_current()) {
             struct thread *self = sched_get_current();
-            wait_queue_entry_t entry = {.thread = self, .next = NULL};
+            wait_queue_entry_t entry = {.thread = self, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
             uint64_t deadline = lapic_timer_get_ticks() + (GPU_TIMEOUT_MS / 10 > 0 ? GPU_TIMEOUT_MS / 10 : 100);
             while (__atomic_load_n(&vg->inflight, __ATOMIC_ACQUIRE) > 0) {
                 if (lapic_timer_get_ticks() >= deadline)
                     break;
-                wait_queue_add(&gpu_gem_drain_wait, &entry);
                 self->state = THREAD_BLOCKED;
+                wait_queue_add(&gpu_gem_drain_wait, &entry);
+                if (__atomic_load_n(&vg->inflight, __ATOMIC_ACQUIRE) == 0) {
+                    self->state = THREAD_RUNNING;
+                    wait_queue_remove(&gpu_gem_drain_wait, &entry);
+                    self->state = THREAD_RUNNING;
+                    break;
+                }
                 self->wakeup_ticks = deadline;
                 sched_yield();
                 self->wakeup_ticks = 0;
                 wait_queue_remove(&gpu_gem_drain_wait, &entry);
+                self->state = THREAD_RUNNING;
             }
         } else {
             for (uint32_t tries = 0;
@@ -1584,14 +1766,20 @@ static void virtio_gpu_complete_flip(uint32_t head) {
     gpu.pending_flip_file = NULL;
     gpu.pending_flip_node = NULL;
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
+    /* Same vblank pacing as the async path: deliver on the next boundary
+     * with the engine sequence, not the instant the upload finished.
+     * Runs in the commit (ioctl) context with no locks held. */
+    vblank_wait_next();
+    sequence = vblank_sequence();
     struct drm_event_vblank ev;
     memset(&ev, 0, sizeof(ev));
-    uint64_t ms = lapic_timer_get_ms();
+    uint32_t sec, usec;
+    vblank_timestamp(sequence, &sec, &usec);
     ev.base.type = DRM_EVENT_FLIP_COMPLETE;
     ev.base.length = sizeof(ev);
     ev.user_data = user_data;
-    ev.tv_sec = (uint32_t)(ms / 1000);
-    ev.tv_usec = (uint32_t)((ms % 1000) * 1000);
+    ev.tv_sec = sec;
+    ev.tv_usec = usec;
     ev.sequence = sequence;
     ev.crtc_id = crtc_id;
     ascentdrm_file_send_event(file, &ev, node);

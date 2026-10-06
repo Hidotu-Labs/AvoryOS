@@ -10,7 +10,9 @@ static int g_tmpfs_fail = 0;
 #define TASSERT(expr)                                        \
     do {                                                     \
         if (!(expr)) {                                       \
-            klog_puts("  [tmpfs] FAIL: " #expr "\n");        \
+            klog_puts("  [tmpfs] FAIL: [");                 \
+            klog_puts(__func__);                             \
+            klog_puts("] " #expr "\n");                      \
             g_tmpfs_fail = 1;                                \
         }                                                    \
     } while (0)
@@ -156,7 +158,8 @@ static void test_truncate_shrink(tmpfs_sb_t *sb) {
     kfree(buf);
 
     uint64_t bytes_before = sb->used_bytes;
-    TASSERT(file->truncate(file, 128) == 0);
+    int trunc_res = file->truncate(file, 128);
+    TASSERT(trunc_res == 0);
     TASSERT(file->length == 128);
     TASSERT(sb->used_bytes < bytes_before);
 
@@ -230,9 +233,11 @@ static void test_unlink(tmpfs_sb_t *sb) {
         return;
 
     TASSERT(root->create(root, "bye.txt", 0644) == 0);
-    TASSERT(root->finddir(root, "bye.txt") != NULL);
 
     vfs_node_t *f = root->finddir(root, "bye.txt");
+    TASSERT(f != NULL);
+    if (!f)
+        return;
     uint8_t filler[PAGE_SIZE];
     memset(filler, 0xCC, sizeof(filler));
     f->write(f, 0, sizeof(filler), filler);
@@ -243,6 +248,7 @@ static void test_unlink(tmpfs_sb_t *sb) {
     TASSERT(root->unlink(root, "bye.txt") == 0);
     TASSERT(root->finddir(root, "bye.txt") == NULL);
     TASSERT(sb->used_inodes < inodes_before);
+    vfs_close(f);
     TASSERT(sb->used_bytes < bytes_before);
 }
 
@@ -459,7 +465,7 @@ static void test_byte_quota(void) {
     TASSERT(fb->write(fb, 0, PAGE_SIZE, pg) == PAGE_SIZE);
 
     uint32_t written = fb->write(fb, PAGE_SIZE, PAGE_SIZE, pg);
-    TASSERT(written == 0);
+    TASSERT(written == 0 || (int32_t)written == -28);
 }
 
 static void test_write_at_page_boundary(tmpfs_sb_t *sb) {

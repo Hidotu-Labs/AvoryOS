@@ -18,6 +18,8 @@
 
 extern struct drm_gem_object *ascentdrm_file_gem_lookup(struct drm_file *file,
                                                   uint32_t handle);
+extern struct drm_gem_object *ascentdrm_file_gem_lookup_get(struct drm_file *file,
+                                                  uint32_t handle);
 extern void ascentdrm_mode_object_init(struct drm_device *dev,
                                  struct drm_mode_object *obj, uint32_t type);
 
@@ -158,11 +160,9 @@ struct drm_framebuffer *ascentdrm_framebuffer_create_full(struct drm_file *file,
     fb->pitch = fb->base_fb.pitch;
 
     for (int p = 0; p < info->num_planes; p++) {
-        fb->gem_obj[p] = ascentdrm_file_gem_lookup(file, cmd->handles[p]);
+        fb->gem_obj[p] = ascentdrm_file_gem_lookup_get(file, cmd->handles[p]);
         fb->pitches[p] = cmd->pitches[p];
         fb->offsets[p] = cmd->offsets[p];
-        if (fb->gem_obj[p])
-            fb->gem_obj[p]->refcount++;
     }
 
     fb->base_fb.gem_obj = fb->gem_obj[0];
@@ -198,21 +198,16 @@ void ascentdrm_framebuffer_free_full(struct drm_device *dev,
     list_del(&fb->base_fb.base.list);
     spinlock_release(&dev->lock);
 
-    struct drm_gem_object *release[DRM_MAX_FB_PLANES] = {0};
-    int release_count = 0;
     for (int p = 0; p < DRM_MAX_FB_PLANES; p++) {
         struct drm_gem_object *gem = fb->gem_obj[p];
+        fb->gem_obj[p] = NULL;
         if (!gem) continue;
-        gem->refcount--;
-        if (gem->refcount <= 0) {
-            bool seen = false;
-            for (int i = 0; i < release_count; i++)
-                if (release[i] == gem) seen = true;
-            if (!seen) release[release_count++] = gem;
-        }
+        /* One put per plane reference taken at create time. put_last is
+         * true exactly once system-wide, so concurrent frees cannot both
+         * reach pmm_free_blocks. */
+        if (ascentdrm_gem_put_last(gem))
+            ascentdrm_gem_object_free(dev, gem);
     }
-    for (int i = 0; i < release_count; i++)
-        ascentdrm_gem_object_free(dev, release[i]);
     kfree(fb);
 }
 

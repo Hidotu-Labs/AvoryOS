@@ -10,6 +10,7 @@
 #include "../fs/procfs.h"
 #include "../fs/ramfs.h"
 #include "../fs/vfs.h"
+#include "../fs/fifo.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
 #include "../mm/vmm.h"
@@ -17,8 +18,10 @@
 #include "../socket/socket.h"
 #include "sys_io_shared.h"
 #include "syscall.h"
+#include "sysdiag.h"
 #include "../fs/ext2.h"
 #include "../fs/ext4.h"
+#include "../fs/fat32.h"
 #include "../fs/tmpfs.h"
 #include "../drivers/storage/block.h"
 #include "arch/uaccess.h"
@@ -98,6 +101,38 @@ static void fd_advance_offset(struct thread *t, uint64_t fd,
   spinlock_release(&t->files->lock);
 }
 
+/* Vectored I/O descriptor snapshot. Small counts (the common 1-4 iovec
+ * Wayland/file pattern) stay on the caller's stack; larger ones use the
+ * heap. Pair with fd_release_iov(). Returns 0 on success, -12 on allocation
+ * failure, -14 on a bad user pointer. */
+#define FD_IOV_STACK_MAX 16u
+
+static int fd_snap_iov(uint64_t iov_u, uint64_t iovcnt,
+                       struct user_iovec *stack, struct user_iovec **out) {
+  struct user_iovec *iov =
+      iovcnt <= FD_IOV_STACK_MAX ? stack : kmalloc(iovcnt * sizeof(*iov));
+  if (!iov)
+    return -12;
+  if (copy_from_user(iov, (const void *)iov_u,
+                     iovcnt * sizeof(*iov)) != 0) {
+    if (iov != stack)
+      kfree(iov);
+    return -14;
+  }
+  *out = iov;
+  return 0;
+}
+
+static void fd_release_iov(struct user_iovec *iov, struct user_iovec *stack) {
+  if (iov && iov != stack)
+    kfree(iov);
+}
+
+static void fd_release_kvec(struct iovec *vec, struct iovec *stack) {
+  if (vec && vec != stack)
+    kfree(vec);
+}
+
 /* /proc/self/fd/N is a magic link on Linux: opening it reopens the referenced
  * object, rather than resolving the printable target returned by readlink.
  * Firefox uses this to create a read-only descriptor for a memfd. */
@@ -128,25 +163,91 @@ static bool parse_proc_self_fd_path(const char *path, uint64_t *fd_out) {
 // open / openat
 // ---------------------------------------------------------------------------
 
+/* Copy a path argument to a kernel buffer, whether the caller passed a user
+ * pointer (open/openat) or a kernel pointer (TIOCGPTPEER-style peer_path).
+ * Returns 0 on success with dst NUL-terminated, -14 on fault. */
+static int open_copy_path(const char *path, char *dst, size_t dst_size)
+{
+  if (!path || !dst || dst_size == 0)
+    return -14;
+  if (is_user_range(path, 1)) {
+    long n = strncpy_from_user(dst, path, (long)dst_size);
+    if (n < 0)
+      return -14;
+    if ((size_t)n >= dst_size)
+      dst[dst_size - 1] = '\0';
+    else
+      dst[n] = '\0';
+    return 0;
+  }
+  strncpy(dst, path, dst_size - 1);
+  dst[dst_size - 1] = '\0';
+  return 0;
+}
+
+#if SYSCALL_LOG
+static void open_log_entry(int dirfd, const char *kpath, uint64_t flags,
+                           uint64_t mode)
+{
+  struct thread *log_t = sched_get_current();
+  if (!log_t || !syscall_log_allowed(log_t))
+    return;
+  const char *accmode = "RDONLY";
+  if ((flags & O_ACCMODE) == O_WRONLY)
+    accmode = "WRONLY";
+  else if ((flags & O_ACCMODE) == O_RDWR)
+    accmode = "RDWR";
+  klogf("[SYSCALL] open dirfd=%d path=\"%s\" flags=0x%llx(%s%s%s%s%s%s%s) mode=0%llo\n",
+        dirfd, kpath, (unsigned long long)flags, accmode,
+        (flags & O_CREAT) ? "|CREAT" : "",
+        (flags & O_EXCL) ? "|EXCL" : "",
+        (flags & O_TRUNC) ? "|TRUNC" : "",
+        (flags & O_APPEND) ? "|APPEND" : "",
+        (flags & O_NONBLOCK) ? "|NONBLOCK" : "",
+        (flags & O_CLOEXEC) ? "|CLOEXEC" : "",
+        (unsigned long long)mode);
+}
+
+static void open_log_result(const char *kpath, int64_t ret)
+{
+  struct thread *log_t = sched_get_current();
+  if (!log_t || !syscall_log_allowed(log_t))
+    return;
+  if (ret >= 0)
+    klogf("[SYSCALL] open path=\"%s\" -> fd=%lld\n", kpath,
+          (long long)ret);
+  else
+    klogf("[SYSCALL] open path=\"%s\" -> errno=%lld\n", kpath,
+          (long long)-ret);
+}
+#endif
+
 uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
                             uint64_t mode) {
-  (void)dirfd;
   if (!path)
     return (uint64_t)-14; // EFAULT
 
+  /* Snapshot the user string once: the direct klog_puts(path)/strlen/strncmp
+   * pattern used to dereference the user pointer unbounded, faulting in the
+   * kernel without an exception-table fixup when the string ran into an
+   * unmapped page. All VFS work below uses the kernel copy. */
+  char kpath[512];
+  if (open_copy_path(path, kpath, sizeof(kpath)) < 0) {
 #if SYSCALL_LOG
-  {
-    struct thread *log_t = sched_get_current();
-    if (log_t && syscall_log_allowed(log_t)) {
-      klog_puts("[SYSCALL] open path=\"");
-      klog_puts(path);
-      klog_puts("\"\n");
+    {
+      struct thread *log_t = sched_get_current();
+      if (log_t && syscall_log_allowed(log_t))
+        klogf("[SYSCALL] open dirfd=%d path=\"<fault>\" flags=0x%llx\n",
+              dirfd, (unsigned long long)flags);
     }
-  }
 #endif
+    return (uint64_t)-14;
+  }
+  path = kpath;
 
-  (void)flags;
-  (void)mode;
+#if SYSCALL_LOG
+  open_log_entry(dirfd, kpath, flags, mode);
+#endif
 
   struct thread *t = sched_get_current();
   if (!t)
@@ -161,12 +262,12 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
    * Answering like a pre-3.11 kernel lets those callers fall back to a named
    * temporary file, which is the behaviour they all already implement.
    *
-   * __O_TMPFILE shares its bit with O_PATH, so O_TMPFILE is only in play when
-   * the caller also asked for write access.  Reading the same bits as
-   * read-only plus O_DIRECTORY is an O_PATH handle, which Qt's QProcess uses
-   * for the child's working directory (open(dir, O_RDONLY|O_DIRECTORY|O_PATH)
-   * followed by fchdir) - rejecting that makes Konsole report
-   * "Could not start program '/bin/bash'". */
+   * __O_TMPFILE (0x400000) and O_PATH (0x200000) are different bits, so
+   * O_TMPFILE is only in play when the caller also asked for write access.
+   * Reading the same bits as read-only plus O_DIRECTORY is an O_PATH handle,
+   * which Qt's QProcess uses for the child's working directory (open(dir,
+   * O_RDONLY|O_DIRECTORY|O_PATH) followed by fchdir) - rejecting that makes
+   * Konsole report "Could not start program '/bin/bash'". */
   if ((flags & O_TMPFILE) == O_TMPFILE && (flags & O_ACCMODE) != O_RDONLY)
     return (uint64_t)-95; // EOPNOTSUPP
 
@@ -227,6 +328,10 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
       pty->master_node = node;
       klog_puts("[PTYMASTER] pair=");
       klog_uint64((uint64_t)pty->index);
+      if (flags & O_DIRECTORY) {
+        kfree(node);
+        return (uint64_t)-20; // ENOTDIR: ptmx is not a directory
+      }
       // The descriptor installed below owns the initial reference.
       node->refcount = 0;
       goto open_done;
@@ -264,6 +369,10 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
       node->mmap = pty_slave_mmap;
       node->device = pty;
       node->wait_queue = pty->slave_waitq;
+      if (flags & O_DIRECTORY) {
+        kfree(node);
+        return (uint64_t)-20; // ENOTDIR: a pty slave is not a directory
+      }
       // The descriptor installed below owns the initial reference.
       node->refcount = 0;
       goto open_done;
@@ -272,6 +381,8 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     if (strcmp(dev_path, "tty") == 0) {
       struct thread *ct = sched_get_current();
       if (ct && ct->ctty) {
+        if (flags & O_DIRECTORY)
+          return (uint64_t)-20; // ENOTDIR: controlling tty is not a directory
         node = ct->ctty;
         goto open_done;
       }
@@ -374,9 +485,14 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
   }
 
   uint32_t requested = 0;
-  if ((flags & O_ACCMODE) == O_RDONLY) requested = 4;
-  else if ((flags & O_ACCMODE) == O_WRONLY) requested = 2;
-  else if ((flags & O_ACCMODE) == O_RDWR) requested = 6;
+  /* O_PATH handles carry no I/O rights: Linux skips the file's own permission
+   * check at open (path-component search checks still applied during the
+   * resolve above). */
+  if (!(flags & O_PATH)) {
+    if ((flags & O_ACCMODE) == O_RDONLY) requested = 4;
+    else if ((flags & O_ACCMODE) == O_WRONLY) requested = 2;
+    else if ((flags & O_ACCMODE) == O_RDWR) requested = 6;
+  }
   if (requested && !vfs_access(node, requested)) {
     if (node_owned) vfs_close(node);
     return (uint64_t)-13;
@@ -384,9 +500,10 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
 
   /* Directories are read-only descriptors (readdir(2) is the only thing you
    * can do with one).  Returning a writable handle would let callers believe
-   * they created something inside the directory. */
+   * they created something inside the directory. O_PATH handles are exempt:
+   * they cannot be used for I/O at all. */
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY &&
-      (flags & O_ACCMODE) != O_RDONLY) {
+      (flags & O_ACCMODE) != O_RDONLY && !(flags & O_PATH)) {
     if (node_owned) vfs_close(node);
     return (uint64_t)-21; // EISDIR
   }
@@ -398,7 +515,17 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
 
   /* Persistent metadata may provide a fresh per-open object.  DRM was the
    * first user of this pattern; driver capability handles use it as well. */
-  if (node->open_instance) {
+  if ((node->flags & FS_TYPE_MASK) == FS_PIPE) {
+    vfs_node_t *prev = node;
+    vfs_node_t *inst = NULL;
+    int err = fifo_open(prev, flags, &inst);
+    if (node_owned) vfs_close(prev);
+    if (err != 0) {
+      return (uint64_t)err;
+    }
+    node = inst;
+    node_owned = true;
+  } else if (node->open_instance) {
     vfs_node_t *prev = node;
     node = node->open_instance(prev);
     if (!node) {
@@ -414,6 +541,14 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
       return (uint64_t)-12;
     }
     node_owned = false; // fresh client node owns no resolver reference
+  }
+
+  /* Linux fails open(file, O_DIRECTORY) with ENOTDIR here, so musl opendir()
+   * rejects files at open time instead of surfacing the error later from
+   * getdents. Applies to O_PATH handles as well. */
+  if ((flags & O_DIRECTORY) && (node->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
+    if (node_owned) vfs_close(node);
+    return (uint64_t)-20; // ENOTDIR
   }
 
 open_done:
@@ -465,12 +600,29 @@ static uint64_t sys_openat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
   (void)a4;
   (void)a5;
   int ret = (int)sys_open_path((int)dirfd, (const char *)path_ptr, flags, mode);
+#if SYSCALL_LOG
+  {
+    char kpath[512];
+    if (open_copy_path((const char *)path_ptr, kpath, sizeof(kpath)) == 0)
+      open_log_result(kpath, (int64_t)ret);
+    else
+      open_log_result("<fault>", (int64_t)ret);
+  }
+#endif
   if (ret < 0) {
     struct thread *t = sched_get_current();
     if (t) {
       if (path_ptr && is_user_range((const void *)path_ptr, 1)) {
-        strncpy(t->last_error_path, (const char *)path_ptr, sizeof(t->last_error_path) - 1);
-        t->last_error_path[sizeof(t->last_error_path) - 1] = '\0';
+        long n = strncpy_from_user(t->last_error_path,
+                                   (const char *)path_ptr,
+                                   (long)sizeof(t->last_error_path));
+        if (n < 0) {
+          t->last_error_path[0] = '\0';
+        } else if ((size_t)n >= sizeof(t->last_error_path)) {
+          t->last_error_path[sizeof(t->last_error_path) - 1] = '\0';
+        } else {
+          t->last_error_path[n] = '\0';
+        }
       }
     }
   }
@@ -681,20 +833,51 @@ static void trace_userspace_debug_write(struct thread *t, int fd,
 }
 
 static int64_t fd_write(int fd, const void *buf, size_t count) {
+  if (count == 0)
+    return 0;
+
   struct thread *t = sched_get_current();
   if (!t || fd < 0 || fd >= MAX_FDS)
     return -9;
 
   uint64_t offset = 0;
-  vfs_node_t *node = fd_pin_node(t, (uint64_t)fd, &offset, NULL);
-  if (!node)
+  uint64_t flags = 0;
+  vfs_node_t *node = fd_pin_node(t, (uint64_t)fd, &offset, &flags);
+  if (!node) {
+    static uint32_t missing_write_fd_logs;
+    if (__atomic_add_fetch(&missing_write_fd_logs, 1, __ATOMIC_RELAXED) <= 8)
+      klogf("[FD-WRITE] missing fd=%d tid=%u tgid=%u\n", fd, t->tid, t->tgid);
     return -9;
+  }
+
   trace_userspace_debug_write(t, fd, buf, count);
   int32_t bytes_written =
       (int32_t)vfs_write(node, (uint32_t)offset, count, (uint8_t *)buf);
+  if (bytes_written == -9) {
+    static uint32_t bad_write_node_logs;
+    if (__atomic_add_fetch(&bad_write_node_logs, 1, __ATOMIC_RELAXED) <= 8)
+      klogf("[FD-WRITE] backend EBADF fd=%d tid=%u tgid=%u node=%p "
+            "magic=%x inode=%u type=%x refs=%u write=%p name='%s'\n",
+            fd, t->tid, t->tgid, node, node->magic, node->inode,
+            node->flags & FS_TYPE_MASK,
+            __atomic_load_n(&node->refcount, __ATOMIC_RELAXED),
+            node->write, node->name);
+  }
   if (bytes_written > 0)
     fd_advance_offset(t, (uint64_t)fd, node, (uint32_t)bytes_written);
   vfs_close(node);
+
+  /* A non-empty write MUST NEVER return 0.
+   * Standard C runtimes (glibc, musl, Qt, etc.) treat a 0-byte return as a
+   * partial write of 0 bytes and immediately retry in an infinite spin loop,
+   * driving 100% CPU. If the underlying device or pipe cannot accept bytes
+   * and didn't block, return -EAGAIN if non-blocking or -ENOSPC / -EIO. */
+  if (bytes_written == 0 && count > 0) {
+    if (flags & (O_NONBLOCK | 0x800))
+      return -11; // EAGAIN
+    return -28;   // ENOSPC
+  }
+
   return (int64_t)bytes_written;
 }
 
@@ -734,8 +917,14 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count,
     struct thread *t = sched_get_current();
     if (t) {
       size_t copy_len = count < sizeof(t->last_stderr) - 1 ? count : sizeof(t->last_stderr) - 1;
-      memcpy(t->last_stderr, (const void *)buf, copy_len);
-      t->last_stderr[copy_len] = '\0';
+      if (copy_len > 0) {
+        if (copy_from_user(t->last_stderr, (const void *)buf, copy_len) != 0)
+          t->last_stderr[0] = '\0';
+        else
+          t->last_stderr[copy_len] = '\0';
+      } else {
+        t->last_stderr[0] = '\0';
+      }
     }
   }
 
@@ -793,24 +982,21 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
 
   if (!is_user_range((const void *)iov_u, iovcnt * sizeof(struct user_iovec)))
     return (uint64_t)-14;
-  struct user_iovec *iov = kmalloc(iovcnt * sizeof(*iov));
-  if (!iov)
-    return (uint64_t)-12;
-  if (copy_from_user(iov, (const void *)iov_u,
-                     iovcnt * sizeof(*iov)) != 0) {
-    kfree(iov);
-    return (uint64_t)-14;
-  }
+  struct user_iovec stack_iov[FD_IOV_STACK_MAX];
+  struct user_iovec *iov = NULL;
+  int snap_rc = fd_snap_iov(iov_u, iovcnt, stack_iov, &iov);
+  if (snap_rc != 0)
+    return (uint64_t)snap_rc;
 
   struct thread *ct = sched_get_current();
   if (!ct || fd >= MAX_FDS) {
-    kfree(iov);
+    fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
   }
   uint64_t offset = 0;
   vfs_node_t *node = fd_pin_node(ct, fd, &offset, NULL);
   if (!node) {
-    kfree(iov);
+    fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
   }
 
@@ -823,7 +1009,7 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       continue;
     if (!is_user_range((const void *)base, len)) {
       vfs_close(node);
-      kfree(iov);
+      fd_release_iov(iov, stack_iov);
       return (uint64_t)-14;
     }
     int32_t bytes_read =
@@ -833,7 +1019,7 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       if (total > 0)
         break;
       vfs_close(node);
-      kfree(iov);
+      fd_release_iov(iov, stack_iov);
       return (uint64_t)(int64_t)bytes_read;
     }
     total += (size_t)bytes_read;
@@ -843,7 +1029,7 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
   if (total > 0)
     fd_advance_offset(ct, fd, node, total);
   vfs_close(node);
-  kfree(iov);
+  fd_release_iov(iov, stack_iov);
   return total;
 }
 
@@ -862,19 +1048,20 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
 
   /* The syscall runs with SMAP enabled. Keep both the descriptors and their
    * payloads in kernel memory before any socket/filesystem path inspects them;
-   * a range check alone does not make direct user loads safe. */
-  struct user_iovec *iov = kmalloc(iovcnt * sizeof(*iov));
-  struct iovec *kernel_iov = kmalloc(iovcnt * sizeof(*kernel_iov));
-  if (!iov || !kernel_iov) {
-    if (iov) kfree(iov);
-    if (kernel_iov) kfree(kernel_iov);
+   * a range check alone does not make direct user loads safe. Small descriptor
+   * counts stay on the stack; the payload itself always needs the heap. */
+  struct user_iovec stack_iov[FD_IOV_STACK_MAX];
+  struct user_iovec *iov = NULL;
+  int snap_rc = fd_snap_iov(iov_u, iovcnt, stack_iov, &iov);
+  if (snap_rc != 0)
+    return (uint64_t)snap_rc;
+  struct iovec stack_kvec[FD_IOV_STACK_MAX];
+  struct iovec *kernel_iov = iovcnt <= FD_IOV_STACK_MAX
+                                 ? stack_kvec
+                                 : kmalloc(iovcnt * sizeof(*kernel_iov));
+  if (!kernel_iov) {
+    fd_release_iov(iov, stack_iov);
     return (uint64_t)-12;
-  }
-  if (copy_from_user(iov, (const void *)iov_u,
-                     iovcnt * sizeof(*iov)) != 0) {
-    kfree(kernel_iov);
-    kfree(iov);
-    return (uint64_t)-14;
   }
   size_t payload_size = 0;
 
@@ -882,8 +1069,8 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     uint64_t len = iov[i].iov_len;
     if ((len && !is_user_range((const void *)iov[i].iov_base, len)) ||
         len > SIZE_MAX - payload_size) {
-      kfree(kernel_iov);
-      kfree(iov);
+      fd_release_kvec(kernel_iov, stack_kvec);
+      fd_release_iov(iov, stack_iov);
       return (uint64_t)-14;
     }
     kernel_iov[i].iov_len = (size_t)len;
@@ -891,8 +1078,8 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
   }
   uint8_t *payload = payload_size ? kmalloc(payload_size) : NULL;
   if (payload_size && !payload) {
-    kfree(kernel_iov);
-    kfree(iov);
+    fd_release_kvec(kernel_iov, stack_kvec);
+    fd_release_iov(iov, stack_iov);
     return (uint64_t)-12;
   }
   size_t payload_offset = 0;
@@ -902,8 +1089,8 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     if (len && copy_from_user(kernel_iov[i].iov_base,
                               (const void *)iov[i].iov_base, len) != 0) {
       if (payload) kfree(payload);
-      kfree(kernel_iov);
-      kfree(iov);
+      fd_release_kvec(kernel_iov, stack_kvec);
+      fd_release_iov(iov, stack_iov);
       return (uint64_t)-14;
     }
     payload_offset += len;
@@ -916,8 +1103,8 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     if (sock->closing) {
       socket_put(sock);
       if (payload) kfree(payload);
-      kfree(kernel_iov);
-      kfree(iov);
+      fd_release_kvec(kernel_iov, stack_kvec);
+      fd_release_iov(iov, stack_iov);
       return (uint64_t)-32;
     }
     struct msghdr msg = {0};
@@ -928,8 +1115,8 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
                       : -95;
     socket_put(sock);
     if (payload) kfree(payload);
-    kfree(kernel_iov);
-    kfree(iov);
+    fd_release_kvec(kernel_iov, stack_kvec);
+    fd_release_iov(iov, stack_iov);
     return (uint64_t)ret;
   }
 
@@ -943,42 +1130,53 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     int64_t w = fd_write((int)fd, (const void *)base, (size_t)len);
     if (w < 0) {
       if (payload) kfree(payload);
-      kfree(kernel_iov);
-      kfree(iov);
+      fd_release_kvec(kernel_iov, stack_kvec);
+      fd_release_iov(iov, stack_iov);
       return total > 0 ? total : (uint64_t)w;
     }
     if (w == 0 && len != 0) {
-      /* A non-empty writev must not report a zero-byte success: callers such
-       * as GNU ld retry it forever. Leave a focused diagnostic while finding
-       * the backing filesystem path responsible for the short write. */
+      /* A non-empty write must never report zero-byte success: callers such
+       * as curl retry/fail the download (apm saw this as stalled .apk
+       * writes once /tmp filled). Filesystems now return -ENOSPC instead
+       * of 0, so reaching here means a backend bug — report ENOSPC so
+       * userspace sees "No space left" rather than generic EIO. */
       struct thread *t = sched_get_current();
+      vfs_node_t *wnode = (t && fd < MAX_FDS) ? t->fds[fd] : NULL;
+      uint64_t woff = (t && fd < MAX_FDS) ? t->fd_offsets[fd] : 0;
       klog_puts("[WRITEV] zero write fd=");
       klog_uint64(fd);
       klog_puts(" len=");
       klog_uint64(len);
+      klog_puts(" off=");
+      klog_uint64(woff);
       klog_puts(" node=");
-      if (t && fd < MAX_FDS && t->fds[fd])
-        klog_puts(t->fds[fd]->name);
+      if (wnode)
+        klog_puts(wnode->name);
       else
         klog_puts("(invalid)");
       klog_puts(" flags=");
-      if (t && fd < MAX_FDS && t->fds[fd])
-        klog_uint64(t->fds[fd]->flags);
+      if (wnode)
+        klog_uint64(wnode->flags);
+      else
+        klog_puts("0");
+      klog_puts(" file_len=");
+      if (wnode)
+        klog_uint64(wnode->length);
       else
         klog_puts("0");
       klog_puts("\n");
       if (payload) kfree(payload);
-      kfree(kernel_iov);
-      kfree(iov);
-      return total > 0 ? total : (uint64_t)-5; /* EIO */
+      fd_release_kvec(kernel_iov, stack_kvec);
+      fd_release_iov(iov, stack_iov);
+      return total > 0 ? total : (uint64_t)-28; /* ENOSPC */
     }
     total += (size_t)w;
     if ((size_t)w != len)
       break;
   }
   if (payload) kfree(payload);
-  kfree(kernel_iov);
-  kfree(iov);
+  fd_release_kvec(kernel_iov, stack_kvec);
+  fd_release_iov(iov, stack_iov);
   return total;
 }
 
@@ -1000,23 +1198,20 @@ static uint64_t sys_preadv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
 
   if (!is_user_range((const void *)iov_u, iovcnt * sizeof(struct user_iovec)))
     return (uint64_t)-14;
-  struct user_iovec *iov = kmalloc(iovcnt * sizeof(*iov));
-  if (!iov)
-    return (uint64_t)-12;
-  if (copy_from_user(iov, (const void *)iov_u,
-                     iovcnt * sizeof(*iov)) != 0) {
-    kfree(iov);
-    return (uint64_t)-14;
-  }
+  struct user_iovec stack_iov[FD_IOV_STACK_MAX];
+  struct user_iovec *iov = NULL;
+  int snap_rc = fd_snap_iov(iov_u, iovcnt, stack_iov, &iov);
+  if (snap_rc != 0)
+    return (uint64_t)snap_rc;
 
   struct thread *ct = sched_get_current();
   if (!ct || fd >= MAX_FDS) {
-    kfree(iov);
+    fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
   }
   vfs_node_t *node = fd_pin_node(ct, fd, NULL, NULL);
   if (!node) {
-    kfree(iov);
+    fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
   }
 
@@ -1029,7 +1224,7 @@ static uint64_t sys_preadv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       continue;
     if (!is_user_range((const void *)base, len)) {
       vfs_close(node);
-      kfree(iov);
+      fd_release_iov(iov, stack_iov);
       return (uint64_t)-14;
     }
     int32_t bytes_read =
@@ -1039,7 +1234,7 @@ static uint64_t sys_preadv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       if (total > 0)
         break;
       vfs_close(node);
-      kfree(iov);
+      fd_release_iov(iov, stack_iov);
       return (uint64_t)(int64_t)bytes_read;
     }
     total += (size_t)bytes_read;
@@ -1047,7 +1242,7 @@ static uint64_t sys_preadv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       break;
   }
   vfs_close(node);
-  kfree(iov);
+  fd_release_iov(iov, stack_iov);
   return total;
 }
 
@@ -1063,23 +1258,20 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
 
   if (!is_user_range((const void *)iov_u, iovcnt * sizeof(struct user_iovec)))
     return (uint64_t)-14;
-  struct user_iovec *iov = kmalloc(iovcnt * sizeof(*iov));
-  if (!iov)
-    return (uint64_t)-12;
-  if (copy_from_user(iov, (const void *)iov_u,
-                     iovcnt * sizeof(*iov)) != 0) {
-    kfree(iov);
-    return (uint64_t)-14;
-  }
+  struct user_iovec stack_iov[FD_IOV_STACK_MAX];
+  struct user_iovec *iov = NULL;
+  int snap_rc = fd_snap_iov(iov_u, iovcnt, stack_iov, &iov);
+  if (snap_rc != 0)
+    return (uint64_t)snap_rc;
 
   struct thread *ct = sched_get_current();
   if (!ct || fd >= MAX_FDS) {
-    kfree(iov);
+    fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
   }
   vfs_node_t *node = fd_pin_node(ct, fd, NULL, NULL);
   if (!node) {
-    kfree(iov);
+    fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
   }
 
@@ -1092,7 +1284,7 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       continue;
     if (!is_user_range((const void *)base, len)) {
       vfs_close(node);
-      kfree(iov);
+      fd_release_iov(iov, stack_iov);
       return (uint64_t)-14;
     }
     int32_t bytes_written =
@@ -1102,7 +1294,7 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       if (total > 0)
         break;
       vfs_close(node);
-      kfree(iov);
+      fd_release_iov(iov, stack_iov);
       return (uint64_t)(int64_t)bytes_written;
     }
     total += (size_t)bytes_written;
@@ -1110,7 +1302,7 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       break;
   }
   vfs_close(node);
-  kfree(iov);
+  fd_release_iov(iov, stack_iov);
   return total;
 }
 
@@ -1124,8 +1316,8 @@ static uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd,
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
-  if (!t || out_fd >= MAX_FDS || in_fd >= MAX_FDS || !t->fds[out_fd] ||
-      !t->fds[in_fd])
+  if (!t || out_fd >= MAX_FDS || in_fd >= MAX_FDS || !fd_is_valid_node(t->fds[out_fd]) ||
+      !fd_is_valid_node(t->fds[in_fd]))
     return (uint64_t)-9;
 
   vfs_node_t *out_node = t->fds[out_fd];
@@ -1312,8 +1504,8 @@ static uint64_t sys_copy_file_range(uint64_t fd_in, uint64_t off_in,
                                     uint64_t fd_out, uint64_t off_out,
                                     uint64_t len, uint64_t flags) {
   struct thread *t = sched_get_current();
-  if (!t || fd_in >= MAX_FDS || fd_out >= MAX_FDS || !t->fds[fd_in] ||
-      !t->fds[fd_out])
+  if (!t || fd_in >= MAX_FDS || fd_out >= MAX_FDS || !fd_is_valid_node(t->fds[fd_in]) ||
+      !fd_is_valid_node(t->fds[fd_out]))
     return (uint64_t)-9;
 
   if (flags != 0)
@@ -1325,8 +1517,8 @@ static uint64_t sys_copy_file_range(uint64_t fd_in, uint64_t off_in,
 static uint64_t sys_splice(uint64_t fd_in, uint64_t off_in, uint64_t fd_out,
                            uint64_t off_out, uint64_t len, uint64_t flags) {
   struct thread *t = sched_get_current();
-  if (!t || fd_in >= MAX_FDS || fd_out >= MAX_FDS || !t->fds[fd_in] ||
-      !t->fds[fd_out])
+  if (!t || fd_in >= MAX_FDS || fd_out >= MAX_FDS || !fd_is_valid_node(t->fds[fd_in]) ||
+      !fd_is_valid_node(t->fds[fd_out]))
     return (uint64_t)-9;
 
   /* splice(2) moves data through a pipe. A plain file-to-file request is
@@ -1354,7 +1546,7 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
-  if (!t || fd >= MAX_FDS || !t->fds[fd])
+  if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd]))
     return (uint64_t)-9;
 
   vfs_node_t *node = t->fds[fd];
@@ -1384,7 +1576,7 @@ static uint64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a3,
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
-  if (!t || fd >= MAX_FDS || !t->fds[fd])
+  if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd]))
     return (uint64_t)-9; // EBADF
 
   switch (cmd) {
@@ -1489,11 +1681,15 @@ static uint64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a3,
       return (uint64_t)-22;
     return (uint64_t)node->impl;
   }
-  default:
+  default: {
+    char cmd_buf[32];
+    snprintf(cmd_buf, sizeof(cmd_buf), "cmd=%lu", (unsigned long)cmd);
+    sysdiag_record_unimplemented_feature("fcntl", cmd_buf, t, -22);
     klog_puts("[SYSCALL] sys_fcntl: unhandled cmd=");
     klog_uint64(cmd);
     klog_puts("\n");
     return (uint64_t)-22;
+  }
   }
 }
 
@@ -1579,7 +1775,7 @@ static uint64_t sys_fsync(uint64_t fd, uint64_t a1, uint64_t a2, uint64_t a3,
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
-  if (!t || fd >= MAX_FDS || !t->fds[fd])
+  if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd]))
     return (uint64_t)-9;
   vfs_cache_sync(t->fds[fd]);
   return 0;
@@ -1607,7 +1803,7 @@ static uint64_t sys_sync_file_range(uint64_t fd, uint64_t offset,
                           SYNC_FILE_RANGE_WAIT_AFTER))
     return (uint64_t)-22; // EINVAL: unknown flag bits
   struct thread *t = sched_get_current();
-  if (!t || fd >= MAX_FDS || !t->fds[fd])
+  if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd]))
     return (uint64_t)-9; // EBADF
   vfs_cache_sync(t->fds[fd]);
   return 0;
@@ -1666,6 +1862,196 @@ static uint64_t sys_readahead(uint64_t fd, uint64_t offset, uint64_t count,
   return 0;
 }
 
+// Minimal cgroup2 hierarchy: tmpfs-backed mount with empty controller files
+// so elogind can determine root cgroup ("0::/\n" + mountinfo entry) and
+// allocate its manager. Without this, mount is a no-op stub and elogind
+// fails with "Cannot determine cgroup ...: No data available".
+#define CGROUP2_SUPER_MAGIC 0x63677262
+#define CGROUP_SUPER_MAGIC 0x27e0eb
+
+static int cgroup2_statfs(struct vfs_node *node, struct statfs_buf *buf) {
+  (void)node;
+  if (!buf)
+    return -1;
+  buf->f_type = CGROUP2_SUPER_MAGIC;
+  buf->f_bsize = 4096;
+  buf->f_blocks = (int64_t)(64ULL * 1024 * 1024 / 4096);
+  buf->f_bfree = buf->f_blocks;
+  buf->f_bavail = buf->f_blocks;
+  buf->f_files = 65536;
+  buf->f_ffree = 65500;
+  buf->f_fsid[0] = 0;
+  buf->f_fsid[1] = 0;
+  buf->f_namelen = 255;
+  buf->f_frsize = 4096;
+  buf->f_flags = 0;
+  return 0;
+}
+
+static int cgroup1_statfs(struct vfs_node *node, struct statfs_buf *buf) {
+  int r = cgroup2_statfs(node, buf);
+  if (r == 0)
+    buf->f_type = CGROUP_SUPER_MAGIC;
+  return r;
+}
+
+// Resolve /proc/self/fd/N and /proc/<pid>/fd/N to the fd's canonical path
+// (libmount/OpenRC mount via fd to avoid TOCTOU). Returns buf when resolved,
+// else the original target. Used so mountinfo shows real paths and tmpfs
+// mounts can be guarded against shadowing /sys/fs/cgroup.
+static const char *mount_canonicalize(const char *target, char *buf,
+                                      uint32_t bufsz) {
+  if (!target || strncmp(target, "/proc/", 6) != 0 ||
+      strstr(target, "/fd/") == NULL)
+    return target;
+  const char *fdpart = strstr(target, "/fd/");
+  uint32_t fd = 0;
+  for (const char *p = fdpart + 4; *p >= '0' && *p <= '9'; p++)
+    fd = fd * 10 + (uint32_t)(*p - '0');
+  uint32_t pid = 0;
+  struct thread *cur = sched_get_current();
+  if (strncmp(target, "/proc/self/fd/", 14) == 0) {
+    pid = cur ? (cur->tgid ? cur->tgid : cur->tid) : 0;
+  } else {
+    for (const char *p = target + 6; *p >= '0' && *p <= '9'; p++)
+      pid = pid * 10 + (uint32_t)(*p - '0');
+  }
+  if (pid && sched_get_fd_path_snapshot(pid, fd, buf, bufsz) && buf[0] == '/')
+    return buf;
+  return target;
+}
+
+uint64_t cgroup2_mount_at(const char *target, const char *fstype) {
+  // OpenRC mounts via /proc/self/fd/N to avoid TOCTOU: canonicalize to the
+  // real path so mountinfo shows /sys/fs/cgroup, not /proc/self/fd/N.
+  // Otherwise elogind never finds the hierarchy (ENOMEDIUM).
+  char canon[256];
+  const char *ctarget = mount_canonicalize(target, canon, sizeof(canon));
+
+  vfs_node_t *mountpoint = vfs_resolve_path(ctarget);
+  if (!mountpoint) {
+    // Auto-create leaf subdir for cgroup subhierarchies (e.g. .../unified)
+    // when parent tmpfs root exists but leaf doesn't yet. Mirrors
+    // OpenRC mkdir-before-mount without failing the mount.
+    if (strncmp(ctarget, "/sys/fs/cgroup/", 15) == 0) {
+      const char *leaf = ctarget + 15;
+      // Single-level names only (unified/elogind/openrc); deeper paths fail.
+      if (leaf[0] && strchr(leaf, '/') == NULL) {
+        vfs_node_t *parent = vfs_resolve_path("/sys/fs/cgroup");
+        if (parent) {
+          if (parent->mkdir)
+            parent->mkdir(parent, (char *)leaf, 0755);
+          vfs_close(parent);
+          mountpoint = vfs_resolve_path(ctarget);
+        }
+      }
+    }
+    if (!mountpoint)
+      return (uint64_t)-2;
+  }
+  if ((mountpoint->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
+    vfs_close(mountpoint);
+    return (uint64_t)-20; // ENOTDIR: never mount over /proc fd files/sockets
+  }
+  vfs_close(mountpoint);
+
+  // Hybrid layout: /sys/fs/cgroup itself is tmpfs (mounted by OpenRC/elogind),
+  // subdirs are cgroup2/v1 hierarchies. Do NOT auto-mount parent as cgroup2:
+  // that would shadow the tmpfs container. Submounts only need the parent dir
+  // to exist (ensured by sysfs_init + tmpfs root mount).
+  mountpoint = vfs_resolve_path(ctarget);
+  if (!mountpoint)
+    return (uint64_t)-2;
+
+  // Already has a cgroup mount? vfs_get_mounts is the mountinfo source, so
+  // check for an existing entry to make mount idempotent.
+  {
+    vfs_mount_info_t mounts[16];
+    int n = vfs_get_mounts(mounts, 16);
+    for (int i = 0; i < n; i++) {
+      if (strcmp(mounts[i].mountpoint, ctarget) == 0 &&
+          (strcmp(mounts[i].fs_type, "cgroup") == 0 ||
+           strcmp(mounts[i].fs_type, "cgroup2") == 0)) {
+        vfs_close(mountpoint);
+        return 0;
+      }
+    }
+  }
+
+  tmpfs_sb_t *sb = kmalloc(sizeof(tmpfs_sb_t));
+  if (!sb) {
+    vfs_close(mountpoint);
+    return (uint64_t)-12;
+  }
+  sb->max_bytes = 64ULL * 1024 * 1024;
+  sb->max_inodes = 65536;
+  sb->used_bytes = 0;
+  sb->used_inodes = 0;
+  spinlock_init(&sb->lock);
+
+  vfs_node_t *root = tmpfs_create_root(sb);
+  if (!root) {
+    kfree(sb);
+    vfs_close(mountpoint);
+    return (uint64_t)-12;
+  }
+  const char *name = ctarget;
+  for (const char *p = ctarget; *p; p++)
+    if (*p == '/')
+      name = p + 1;
+  strncpy(root->name, name, 127);
+  root->name[127] = '\0';
+  // statfs magic decides unified vs legacy in cg_all_unified():
+  // tmpfs magic => not unified => ENODATA. Report real cgroup magics.
+  if (fstype && strcmp(fstype, "cgroup") == 0)
+    root->statfs = cgroup1_statfs;
+  else
+    root->statfs = cgroup2_statfs;
+
+  if (vfs_mount_ex(mountpoint, root, "cgroup2", fstype ? fstype : "cgroup2",
+                   ctarget) != 0) {
+    vfs_close(mountpoint);
+    return (uint64_t)-12;
+  }
+  vfs_close(mountpoint);
+
+  // Stub control files: elogind 252 expects unified hierarchy with usable
+  // controllers. Empty controllers => root deemed unusable => hybrid fallback
+  // => ENODATA. Pre-populate with fake controller list; writes (e.g. "+cpu"
+  // to subtree_control, PIDs to procs) succeed via tmpfs and are ignored.
+  // Include v1 names (tasks) so hybrid submounts don't fail on missing files.
+  vfs_node_t *cgroup_root = vfs_resolve_path(ctarget);
+  if (cgroup_root) {
+    const char *files[] = {"cgroup.controllers", "cgroup.procs",
+                           "cgroup.threads", "cgroup.subtree_control",
+                           "cgroup.events", "cgroup.kill", "tasks",
+                           "notify_on_release", NULL};
+    for (int i = 0; files[i]; i++)
+      vfs_create(cgroup_root, (char *)files[i], 0644);
+    // cgroup.controllers: advertise controllers (no real control).
+    vfs_node_t *ctrl = vfs_finddir(cgroup_root, "cgroup.controllers");
+    if (ctrl) {
+      const char *list = "cpu memory pids\n";
+      vfs_write(ctrl, 0, (uint32_t)strlen(list), (uint8_t *)list);
+      vfs_close(ctrl);
+    }
+    // cgroup.events: valid populated count.
+    vfs_node_t *ev = vfs_finddir(cgroup_root, "cgroup.events");
+    if (ev) {
+      const char *e = "populated 0\n";
+      vfs_write(ev, 0, (uint32_t)strlen(e), (uint8_t *)e);
+      vfs_close(ev);
+    }
+    vfs_close(cgroup_root);
+  }
+  klog_puts("[  OK  ] cgroup2 mounted at ");
+  klog_puts(ctarget);
+  klog_puts(" fstype=");
+  klog_puts(fstype ? fstype : "?");
+  klog_puts("\n");
+  return 0;
+}
+
 static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
                           uint64_t fstype_ptr, uint64_t flags,
                           uint64_t data_ptr, uint64_t a5) {
@@ -1689,6 +2075,35 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
         return (uint64_t)-2;
     }
 
+    /* Linux mount propagation changes:
+     * MS_SHARED = 1<<20, MS_SLAVE = 1<<19, MS_PRIVATE = 1<<18, MS_UNBINDABLE = 1<<17
+     * Often used by bwrap (e.g. mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)).
+     */
+    if (flags & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20))) {
+        vfs_node_t *mountpoint = vfs_resolve_path(target);
+        if (mountpoint) {
+            vfs_close(mountpoint);
+            return 0;
+        }
+        return (uint64_t)-2;
+    }
+
+    /* Linux MS_BIND = 0x1000 */
+    if (flags & 0x1000) {
+        if (!source)
+            return (uint64_t)-14;
+        vfs_node_t *src_node = vfs_resolve_path(source);
+        if (!src_node)
+            return (uint64_t)-2;
+        vfs_node_t *target_node = vfs_resolve_path(target);
+        if (!target_node) {
+            vfs_close(src_node);
+            return (uint64_t)-2;
+        }
+        vfs_mount_ex(target_node, src_node, source, "bind", target);
+        return 0;
+    }
+
     /* Pseudo-filesystems handling */
     if (fstype) {
         if (strcmp(fstype, "proc") == 0 ||
@@ -1704,17 +2119,25 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
         }
 
         if (strcmp(fstype, "tmpfs") == 0 || strcmp(fstype, "ramfs") == 0) {
-            vfs_node_t *mountpoint = vfs_resolve_path(target);
+            char tcanon[256];
+            const char *ct = mount_canonicalize(target, tcanon, sizeof(tcanon));
+            vfs_node_t *mountpoint = vfs_resolve_path(ct);
             if (!mountpoint)
                 return (uint64_t)-2;
             vfs_close(mountpoint);
-            tmpfs_mount_at(target);
+            tmpfs_mount_at(ct);
             return 0;
         }
 
-        if (strcmp(fstype, "cgroup") == 0 ||
-            strcmp(fstype, "cgroup2") == 0 ||
-            strcmp(fstype, "securityfs") == 0 ||
+        if (strcmp(fstype, "cgroup2") == 0) {
+            return cgroup2_mount_at(target, fstype);
+        }
+
+        if (strcmp(fstype, "cgroup") == 0) {
+            return cgroup2_mount_at(target, fstype);
+        }
+
+        if (strcmp(fstype, "securityfs") == 0 ||
             strcmp(fstype, "debugfs") == 0 ||
             strcmp(fstype, "pstore") == 0 ||
             strcmp(fstype, "configfs") == 0 ||
@@ -1759,12 +2182,55 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
         return (uint64_t)-6;
     }
 
-    if (ext4_mount(dev, mountpoint) == 0)
-        return 0;
-    if (ext2_mount(dev, mountpoint) == 0)
-        return 0;
+    if (fstype) {
+        if (strcmp(fstype, "vfat") == 0 || strcmp(fstype, "fat32") == 0 || strcmp(fstype, "msdos") == 0) {
+            if (fat32_mount(dev, mountpoint) == 0) {
+                vfs_mount_ex(mountpoint, mountpoint, dev->name, "vfat", target);
+                return 0;
+            }
+            vfs_close(mountpoint);
+            return (uint64_t)-22;
+        }
+        if (strcmp(fstype, "ext4") == 0) {
+            if (ext4_mount(dev, mountpoint) == 0) {
+                vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext4", target);
+                return 0;
+            }
+            if (ext2_mount(dev, mountpoint) == 0) {
+                vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext2", target);
+                return 0;
+            }
+            vfs_close(mountpoint);
+            return (uint64_t)-22;
+        }
+        if (strcmp(fstype, "ext2") == 0 || strcmp(fstype, "ext3") == 0) {
+            if (ext2_mount(dev, mountpoint) == 0) {
+                vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext2", target);
+                return 0;
+            }
+            if (ext4_mount(dev, mountpoint) == 0) {
+                vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext4", target);
+                return 0;
+            }
+            vfs_close(mountpoint);
+            return (uint64_t)-22;
+        }
+    }
 
-    /* Both probes failed before touching mountpoint: drop our resolver ref.
+    if (ext4_mount(dev, mountpoint) == 0) {
+        vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext4", target);
+        return 0;
+    }
+    if (ext2_mount(dev, mountpoint) == 0) {
+        vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext2", target);
+        return 0;
+    }
+    if (fat32_mount(dev, mountpoint) == 0) {
+        vfs_mount_ex(mountpoint, mountpoint, dev->name, "vfat", target);
+        return 0;
+    }
+
+    /* All probes failed before touching mountpoint: drop our resolver ref.
      * On success the filesystem adopts the node in place (clearing
      * FS_PERSISTENT), so that reference is what keeps the mounted root alive
      * and must not be dropped. */

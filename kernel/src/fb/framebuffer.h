@@ -37,6 +37,7 @@ void fb_clear(uint32_t color);
 void fb_put_pixel(uint32_t x, uint32_t y, uint32_t color);
 void fb_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
 void fb_draw_glyph_scanline(uint32_t x, uint32_t y, uint8_t bits, uint32_t fg, uint32_t bg);
+void fb_draw_glyph_8x16(uint32_t px, uint32_t py, const uint8_t *glyph, uint32_t fg, uint32_t bg, bool underline);
 void fb_copyarea(const struct fb_copyarea *area);
 void fb_imageblit(const struct fb_image *image);
 

@@ -7,6 +7,31 @@
 
 static uint32_t next_inode = 1;
 
+#define RAMFS_MAGIC 0x858458f6
+
+static int ramfs_statfs(vfs_node_t *node, struct statfs_buf *buf) {
+  (void)node;
+  if (!buf)
+    return -1;
+  uint64_t total_bytes = pmm_get_usable_memory();
+  uint64_t free_pages = (uint64_t)pmm_get_free_pages();
+  uint64_t total_pages = total_bytes / 4096;
+  uint64_t free_p = free_pages > total_pages ? total_pages : free_pages;
+  buf->f_type = RAMFS_MAGIC;
+  buf->f_bsize = 4096;
+  buf->f_blocks = (int64_t)total_pages;
+  buf->f_bfree = (int64_t)free_p;
+  buf->f_bavail = (int64_t)free_p;
+  buf->f_files = 65536;
+  buf->f_ffree = 32768;
+  buf->f_fsid[0] = 0;
+  buf->f_fsid[1] = 0;
+  buf->f_namelen = 255;
+  buf->f_frsize = 4096;
+  buf->f_flags = 0;
+  return 0;
+}
+
 void ramfs_free_file_data(ramfs_file_t *file) {
   if (!file || !file->data)
     return;
@@ -26,9 +51,15 @@ void ramfs_free_file_data(ramfs_file_t *file) {
   file->data_is_pmm = 0;
 }
 
+typedef struct {
+  char target[512];
+} ramfs_symlink_t;
+
 static int ramfs_chmod(vfs_node_t *node, uint16_t permission);
 static int ramfs_chown(vfs_node_t *node, uint32_t uid, uint32_t gid);
 static void ramfs_destroy_node(vfs_node_t *node);
+static int ramfs_symlink(vfs_node_t *node, char *name, char *target);
+static int ramfs_readlink(vfs_node_t *node, char *buf, uint32_t size);
 
 /* Release the filesystem-private payload of a node whose name is gone.
  * Called once, either directly from vfs_node_retire() when no reference is
@@ -52,6 +83,8 @@ static void ramfs_destroy_node(vfs_node_t *node) {
     }
     vfs_dirindex_destroy(dir); /* bucket array; wrappers freed above */
     kfree(dir);
+  } else if (type == FS_SYMLINK) {
+    kfree(node->device);
   }
   node->device = NULL;
 }
@@ -105,7 +138,9 @@ static uint8_t *ramfs_alloc_buffer(ramfs_file_t *file, uint32_t req_cap, uint32_
 
 uint32_t ramfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
                      uint8_t *buffer) {
-  if (!node || !node->device)
+  if (!node || !node->device || !buffer)
+    return (uint32_t)-14;
+  if (size == 0)
     return 0;
 
   ramfs_file_t *file = (ramfs_file_t *)node->device;
@@ -120,7 +155,7 @@ uint32_t ramfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
     uint8_t new_is_pmm = 0;
     uint8_t *new_data = ramfs_alloc_buffer(file, req_cap, &new_cap, &new_is_pmm);
     if (!new_data)
-      return 0; // OOM
+      return (uint32_t)-12; // ENOMEM: propagate instead of zero-write
 
     if (file->data) {
       uint32_t copy_len = node->length < file->capacity ? node->length : file->capacity;
@@ -290,6 +325,30 @@ static struct dirent *ramfs_readdir(vfs_node_t *node, uint32_t index) {
  * ".." resolve to the node itself and a found child is returned bare, both
  * exactly as the old list-walk did. */
 
+// /dev/kmsg fallback: userspace mknod after boot (or a wiped /dev) must get
+// the same handlers as the devfs pre-registered node, otherwise writes
+// return 0 -> "[WRITEV] zero write ... node=kmsg" + ENOSPC.
+static uint32_t ramfs_kmsg_write(struct vfs_node *node, uint32_t offset,
+                                 uint32_t size, uint8_t *buffer) {
+  (void)node;
+  (void)offset;
+  if (!buffer || !size)
+    return 0;
+  for (uint32_t i = 0; i < size; i++)
+    klog_putchar((char)buffer[i]);
+  return size;
+}
+
+static uint32_t ramfs_kmsg_read(struct vfs_node *node, uint32_t offset,
+                                uint32_t size, uint8_t *buffer) {
+  (void)node;
+  if (!buffer || !size)
+    return 0;
+  extern uint32_t klog_ring_read(uint32_t offset, uint32_t size,
+                                 uint8_t *buffer);
+  return klog_ring_read(offset, size, buffer);
+}
+
 // Helper to construct a new node linked to ramfs standard APIs
 static vfs_node_t *ramfs_make_node(char *name, uint16_t perm, uint32_t type) {
   vfs_node_t *n = kmalloc(sizeof(vfs_node_t));
@@ -332,6 +391,7 @@ static vfs_node_t *ramfs_make_node(char *name, uint16_t perm, uint32_t type) {
   n->chmod = ramfs_chmod;
   n->chown = ramfs_chown;
   n->destroy = ramfs_destroy_node;
+  n->statfs = ramfs_statfs;
 
   return n;
 }
@@ -389,6 +449,11 @@ static int ramfs_mknod(vfs_node_t *node, char *name, uint16_t permission,
     return -1;
 
   new_node->device = device;
+  if ((flags & 0x0F) == 0x03 && strcmp(name, "kmsg") == 0) {
+    // Attach kmsg handlers to userspace-created /dev/kmsg (see devfs_init).
+    new_node->read = ramfs_kmsg_read;
+    new_node->write = ramfs_kmsg_write;
+  }
   if (!ramfs_add_child(node, new_node)) {
     /* Deliberately not destroy(): an mknod node's device payload belongs to
      * the caller/driver, and ramfs_destroy_node() would interpret it as a
@@ -422,9 +487,49 @@ static int ramfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
   new_node->mknod = ramfs_mknod;
   new_node->chmod = ramfs_chmod;
   new_node->chown = ramfs_chown;
+  new_node->symlink = ramfs_symlink;
 
   if (!ramfs_add_child(node, new_node)) {
     ramfs_discard_node(new_node);
+    return -1;
+  }
+  return 0;
+}
+
+static int ramfs_readlink(vfs_node_t *node, char *buf, uint32_t size) {
+  if (!node || !node->device || !buf || size == 0)
+    return -1;
+  ramfs_symlink_t *sl = (ramfs_symlink_t *)node->device;
+  uint32_t len = (uint32_t)strlen(sl->target);
+  if (len > size)
+    len = size;
+  memcpy(buf, sl->target, len);
+  return (int)len;
+}
+
+static int ramfs_symlink(vfs_node_t *node, char *name, char *target) {
+  if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
+    return -1;
+  if (vfs_dirindex_finddir(node, name) != 0)
+    return -1;
+
+  vfs_node_t *child = ramfs_make_node(name, 0777, FS_SYMLINK);
+  if (!child)
+    return -1;
+
+  ramfs_symlink_t *sl = kmalloc(sizeof(ramfs_symlink_t));
+  if (!sl) {
+    ramfs_discard_node(child);
+    return -1;
+  }
+  strncpy(sl->target, target, 511);
+  sl->target[511] = '\0';
+  child->device = sl;
+  child->length = (uint32_t)strlen(sl->target);
+  child->readlink = ramfs_readlink;
+
+  if (!ramfs_add_child(node, child)) {
+    ramfs_discard_node(child);
     return -1;
   }
   return 0;
@@ -568,6 +673,18 @@ void ramfs_mount_node(vfs_node_t *root, vfs_node_t *node) {
   if (vfs_dirindex_finddir(root, node->name) != NULL)
     return;
 
+  /* statfs is filesystem-level, but the VFS dispatches it per-node. Children
+   * attached here are usually hand-built (procfs/sysfs leaves, /dev nodes)
+   * with no handler of their own, so statfs() on e.g. /proc/meminfo fell
+   * through to the fake 2 GiB fallback. Inherit the containing filesystem's
+   * handler. The second clause covers dirs built via ramfs_mount_on()
+   * (generic ramfs_statfs) being grafted under a pseudo root with its own
+   * magic (proc/sysfs): they must report the parent's magic, not ramfs'. */
+  if (root->statfs && (!node->statfs ||
+                       (node->statfs == ramfs_statfs &&
+                        root->statfs != ramfs_statfs)))
+    node->statfs = root->statfs;
+
   ramfs_add_child(root, node);
 }
 void ramfs_mount_on(vfs_node_t *node) {
@@ -597,6 +714,9 @@ void ramfs_mount_on(vfs_node_t *node) {
   node->mknod = ramfs_mknod;
   node->chmod = ramfs_chmod;
   node->chown = ramfs_chown;
+  node->symlink = ramfs_symlink;
+  if (!node->statfs)
+    node->statfs = ramfs_statfs;
 }
 
 void ramfs_mount_at(char *path) {
@@ -622,7 +742,7 @@ void ramfs_mount_at(char *path) {
     strncpy(ram_root->name, name, 127);
 
     ramfs_mount_on(ram_root);
-    vfs_mount_ex(mountpoint, ram_root, "none", "unknown", path);
+    vfs_mount_ex(mountpoint, ram_root, "ramfs", "ramfs", path);
     vfs_close(mountpoint);
   }
 }

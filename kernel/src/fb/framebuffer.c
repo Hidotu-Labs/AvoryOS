@@ -203,6 +203,14 @@ static int console_dev_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) 
         memcpy(console_termios.c_cc, t2->c_cc, KERNEL_NCCS);
         return 0;
     }
+    case TCFLSH: {
+        /* arg is a queue selector by value: TCIFLUSH (0), TCOFLUSH (1),
+         * TCIOFLUSH (2). The kernel console has no queued input to drop,
+         * so any valid selector succeeds as a no-op. */
+        if (arg > TCIOFLUSH)
+            return -22; // EINVAL
+        return 0;
+    }
     case TIOCGPGRP: {
         int *pgrp = (int *)arg;
         if (!pgrp || !vmm_is_user_addr_range_valid(arg, sizeof(int)))
@@ -236,6 +244,11 @@ static int console_dev_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) 
     case VT_WAITACTIVE:
     case VT_RELDISP:
     case VT_DISALLOCATE:
+    case 0x541D: // TIOCCONS
+    case 0x5456: // TIOCGLCKTRMIOS
+    case 0x5457: // TIOCSLCKTRMIOS
+    case 0x4B70: // GIO_CMAP
+    case 0x4B71: // PIO_CMAP
         return 0;
     default:
         return -25; // -ENOTTY
@@ -510,11 +523,20 @@ int fb_get_kd_mode(void) {
 }
 
 void fb_set_kd_mode(int mode) {
+    int old = fb_global.kd_mode;
     /* A pending console swap would clobber a graphics client's pixels, and it
      * must not land after the graphics client takes over. */
     if (mode == KD_GRAPHICS)
         console_flush_pending_swap();
     fb_global.kd_mode = mode;
+    /* Plymouth DRM splash quits via KDSETMODE KD_TEXT but never unblanks or
+     * redraws, leaving the last splash buffer (often cleared black) scanned
+     * out while SDDM/login runs blind underneath. Restore the text console
+     * immediately on GRAPHICS->TEXT so quit hands back a live display. */
+    if (mode == KD_TEXT && old != KD_TEXT) {
+        fb_global.blanked = false;
+        console_redraw_all();
+    }
 }
 
 /* ── VFS DevFS Registration ──────────────────────────────────────────────── */
@@ -603,14 +625,24 @@ void fb_register_vfs(void) {
     devfs_register_node("console", &console_vfs_node);
     devfs_register_node("tty0", &tty0_vfs_node);
     devfs_register_node("tty1", &console_vfs_node);
+    devfs_register_node("tty2", &console_vfs_node);
+    devfs_register_node("tty3", &console_vfs_node);
+    devfs_register_node("tty4", &console_vfs_node);
+    devfs_register_node("tty5", &console_vfs_node);
+    devfs_register_node("tty6", &console_vfs_node);
     devfs_register_node("tty", &tty_vfs_node);
 
     fb_register_device_node("console", &console_vfs_node);
     fb_register_device_node("tty0", &tty0_vfs_node);
     fb_register_device_node("tty1", &console_vfs_node);
+    fb_register_device_node("tty2", &console_vfs_node);
+    fb_register_device_node("tty3", &console_vfs_node);
+    fb_register_device_node("tty4", &console_vfs_node);
+    fb_register_device_node("tty5", &console_vfs_node);
+    fb_register_device_node("tty6", &console_vfs_node);
     fb_register_device_node("tty", &tty_vfs_node);
 
-    klog_puts("[FB] Registered /dev/fb0, /dev/fb, /dev/console, /dev/tty0, /dev/tty1, and /dev/tty devices\n");
+    klog_puts("[FB] Registered /dev/fb0, /dev/fb, /dev/console, /dev/tty0-tty6, and /dev/tty devices\n");
 }
 
 /* ── DRM Backend Detection ───────────────────────────────────────────────── */

@@ -4,8 +4,16 @@
 
 export PATH="/usr/bin:/bin:/usr/local/bin:/opt/coreutils/bin:/opt/bash/bin:${PATH}"
 export LD_LIBRARY_PATH="/usr/lib:/lib:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+# Enable KWin's OpenGL compositor by default. Users can still set
+# KWIN_COMPOSE=N in the environment to disable it for troubleshooting.
+# NOTE: KWin 6 dropped the XRender backend, so OpenGL/llvmpipe is the only
+# X11 compositing path (Q is Wayland-only).
+export KWIN_COMPOSE="${KWIN_COMPOSE:-O2}"
 export NO_AT_BRIDGE=1
 export GTK_A11Y=none
+export WEBKIT_FORCE_SANDBOX=0
+export GLYCIN_SANDBOX=none
+export LIBRSVG_SANDBOX=none
 
 # ── DRM card selection (Phase 6 C7) ────────────────────────────────────────
 # Prefer amdgpu (card2) when it can drive a display, else the native card0.
@@ -54,6 +62,7 @@ EndSection
 Section "Device"
     Identifier  "Card0"
     Driver      "modesetting"
+    Option      "AccelMethod" "glamor"
 $KMSDEV_OPT
 $KMS_BUSID_LINE
     Option      "SWcursor" "true"
@@ -82,21 +91,31 @@ EOF
 rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
 
 mkdir -p /var/log /var/lib/dbus /run/dbus /var/run \
-         /run/lightdm /var/lib/lightdm /var/log/lightdm /var/cache/lightdm \
-         /run/systemd /run/user /var/lib/lightdm-data
+         /run/sddm /var/lib/sddm /var/log/sddm \
+         /run/systemd /run/user /root
 [ -e /var/run/dbus ] || ln -sf /run/dbus /var/run/dbus 2>/dev/null || true
 touch /var/run/utmp /var/log/wtmp /var/log/lastlog /run/utmp 2>/dev/null || true
 chmod 0664 /var/run/utmp /var/log/wtmp /var/log/lastlog /run/utmp 2>/dev/null || true
 
 # ── Dynamic account provisioning ──────────────────────────────────────────
-if ! grep -q "^lightdm:" /etc/group 2>/dev/null; then
-    echo "lightdm:x:620:" >> /etc/group
+# Internal system daemon account for SDDM greeter sandbox.
+# The Arch package may own sddm under a different id via sysusers, so
+# resolve instead of assuming: mismatched ownership locks the greeter
+# session out of /var/lib/sddm (black screen, parked processes).
+if ! grep -q "^sddm:" /etc/group 2>/dev/null; then
+    echo "sddm:x:642:" >> /etc/group
 fi
-if ! grep -q "^lightdm:" /etc/passwd 2>/dev/null; then
-    echo "lightdm:!:620:620:LightDM daemon:/var/lib/lightdm:/sbin/nologin" >> /etc/passwd
+if ! grep -q "^sddm:" /etc/passwd 2>/dev/null; then
+    echo "sddm:!:642:642:SDDM daemon:/var/lib/sddm:/sbin/nologin" >> /etc/passwd
 fi
-chown -R 620:620 /var/lib/lightdm /run/lightdm /var/log/lightdm /var/cache/lightdm /var/lib/lightdm-data 2>/dev/null || true
-chmod 0777 /var/lib/lightdm /var/cache/lightdm /var/lib/lightdm-data 2>/dev/null || true
+SDDM_UID="$(id -u sddm 2>/dev/null || echo 642)"
+SDDM_GID="$(id -g sddm 2>/dev/null || echo 642)"
+mkdir -p /var/lib/sddm/.config /var/lib/sddm/.cache /var/lib/sddm/.local/share \
+         /run/sddm /var/log/sddm
+touch /var/lib/sddm/.config/sddm-greeter-qt6rc /var/lib/sddm/.config/sddm-greeter-qt5rc 2>/dev/null || true
+chown -R "$SDDM_UID:$SDDM_GID" /var/lib/sddm /run/sddm /var/log/sddm 2>/dev/null || true
+chmod -R 0775 /var/lib/sddm /run/sddm /var/log/sddm 2>/dev/null || true
+chmod 0664 /var/lib/sddm/.config/sddm-greeter-qt6rc /var/lib/sddm/.config/sddm-greeter-qt5rc 2>/dev/null || true
 
 # ── D-Bus Initialization ──────────────────────────────────────────────────
 if [ ! -s /etc/machine-id ]; then
@@ -108,15 +127,15 @@ if [ ! -s /etc/machine-id ]; then
 fi
 [ -f /var/lib/dbus/machine-id ] || cp -f /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null || true
 
+# Ensure SDDM D-Bus policy is loaded in system bus configuration
+mkdir -p /etc/dbus-1/system.d
+[ -f /etc/dbus-1/system.d/org.freedesktop.DisplayManager.conf ] || \
+    cp -f /usr/share/dbus-1/system.d/org.freedesktop.DisplayManager.conf /etc/dbus-1/system.d/ 2>/dev/null || true
+
 # Userspace services (PipeWire, D-Bus activated apps, ...) derive their socket
-# paths from XDG_RUNTIME_DIR.  LightDM does not create one on AvoryOS, so set
-# a stable path before the session bus inherits the environment; otherwise
-# clients fall back to /run/pipewire, which the session daemon never uses.
+# paths from XDG_RUNTIME_DIR.
 XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-0}"
 export XDG_RUNTIME_DIR
-# Must match pipewire OpenRC service (setup-alpine.sh): shared system
-# instance, so 1777. 0700 root-owned blocks lightdm/avory clients and
-# makes them autospawn a second pipewire -> bind conflict -> respawn loop.
 mkdir -p "$XDG_RUNTIME_DIR" && chmod 1777 "$XDG_RUNTIME_DIR"
 
 if command -v dbus-daemon >/dev/null 2>&1 && [ ! -S /run/dbus/system_bus_socket ]; then
@@ -135,47 +154,80 @@ if command -v dbus-daemon >/dev/null 2>&1; then
     rm -f /tmp/avory-session-bus
     dbus-daemon --session --fork --address=unix:path=/tmp/avory-session-bus 2>/dev/null || true
     export DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/avory-session-bus
-    # DISPLAY is added by the X session wrapper (xinitrc.d hook) once LightDM
-    # has started the server; this publishes everything known at this point.
     command -v dbus-update-activation-environment >/dev/null 2>&1 &&
         dbus-update-activation-environment --all 2>/dev/null || true
 fi
 
 chmod 1777 /tmp /tmp/.X11-unix 2>/dev/null || true
-chmod 0777 /run/lightdm /var/lib/lightdm /var/log/lightdm /var/cache/lightdm /var/lib/lightdm-data 2>/dev/null || true
 
-# ── Launch LightDM ────────────────────────────────────────────────────────
-if command -v lightdm >/dev/null 2>&1; then
-    echo "[startx] Launching LightDM display manager..."
+# ── Launch SDDM ───────────────────────────────────────────────────────────
+if command -v sddm >/dev/null 2>&1; then
+    echo "[startx] Launching SDDM display manager..."
 
-    # Configure LightDM with GTK greeter and disable logind seat probing
-    cat > /etc/lightdm/lightdm.conf << 'LDMCFG'
-[LightDM]
-run-directory=/run/lightdm
-start-default-seat=true
-logind-load-seats=false
-logind-check-graphical=false
+    XORG_BIN="/usr/libexec/Xorg"
+    [ -x "$XORG_BIN" ] || XORG_BIN="/usr/bin/Xorg"
 
-[Seat:*]
-type=local
-greeter-session=lightdm-gtk-greeter
-greeter-hide-users=false
-user-session=xfce
-xserver-command=/usr/libexec/Xorg -noreset -nolisten tcp -ac
-session-wrapper=/etc/X11/xinit/Xsession
-LDMCFG
+    SDDM_THEME="elarun"
+    if [ -d /usr/share/sddm/themes/breeze ]; then
+        SDDM_THEME="breeze"
+    fi
 
-    cat > /etc/lightdm/lightdm-gtk-greeter.conf << 'GREETERCFG'
-[greeter]
-at-spi-enabled=false
-indicators=~host;~spacer;~clock;~power
-theme-name=Adwaita
-icon-theme-name=Adwaita
-GREETERCFG
+    # Make sure Xsession and Xsetup are executable
+    if [ ! -f /usr/share/sddm/scripts/Xsetup ]; then
+        mkdir -p /usr/share/sddm/scripts
+        echo "#!/bin/sh" > /usr/share/sddm/scripts/Xsetup
+    fi
+    chmod +x /usr/share/sddm/scripts/Xsetup /usr/share/sddm/scripts/Xsession 2>/dev/null || true
 
-    # Ensure PAM services for LightDM greeter, login, and autologin are clean and working
+    mkdir -p /etc/sddm.conf.d /etc
+    cat > /etc/sddm.conf << SDDMCFG
+[General]
+DisplayServer=x11
+HaltCommand=/sbin/poweroff
+RebootCommand=/sbin/reboot
+Numlock=none
+
+[Theme]
+Current=${SDDM_THEME}
+ThemeDir=/usr/share/sddm/themes
+FacesDir=/usr/share/sddm/faces
+CursorTheme=Adwaita
+
+[X11]
+ServerPath=${XORG_BIN}
+ServerArguments=-noreset -nolisten tcp -ac
+SessionCommand=/usr/share/sddm/scripts/Xsession
+SessionDir=/usr/share/xsessions
+DisplayCommand=/usr/share/sddm/scripts/Xsetup
+DisplayStopCommand=/usr/share/sddm/scripts/Xstop
+XauthPath=/usr/bin/xauth
+EnableHiDPI=true
+
+[Users]
+DefaultPath=/usr/bin:/bin:/usr/local/bin:/opt/coreutils/bin:/opt/bash/bin
+MinimumUid=0
+MaximumUid=60000
+HideUsers=
+RememberLastUser=true
+RememberLastSession=true
+
+[Last]
+Session=plasmax11.desktop
+User=root
+SDDMCFG
+    # Ensure PAM services for SDDM greeter and user login permit root login
     mkdir -p /etc/pam.d
-    cat > /etc/pam.d/lightdm-greeter << 'PAMCFG'
+    cat > /etc/pam.d/sddm-greeter << 'PAMCFG'
+#%PAM-1.0
+auth      required  pam_env.so
+auth      required  pam_permit.so
+account   required  pam_permit.so
+password  required  pam_deny.so
+session   required  pam_unix.so
+-session  optional  pam_elogind.so
+PAMCFG
+
+    cat > /etc/pam.d/sddm << 'PAMCFG'
 #%PAM-1.0
 auth      required  pam_permit.so
 account   required  pam_permit.so
@@ -183,9 +235,10 @@ password  required  pam_deny.so
 session   required  pam_env.so
 session   required  pam_unix.so
 -session  optional  pam_limits.so
+-session  optional  pam_elogind.so
 PAMCFG
 
-    cat > /etc/pam.d/lightdm << 'PAMCFG'
+    cat > /etc/pam.d/sddm-autologin << 'PAMCFG'
 #%PAM-1.0
 auth      required  pam_permit.so
 account   required  pam_permit.so
@@ -193,30 +246,17 @@ password  required  pam_deny.so
 session   required  pam_env.so
 session   required  pam_unix.so
 -session  optional  pam_limits.so
+-session  optional  pam_elogind.so
 PAMCFG
 
-    cat > /etc/pam.d/lightdm-autologin << 'PAMCFG'
-#%PAM-1.0
-auth      required  pam_permit.so
-account   required  pam_permit.so
-password  required  pam_deny.so
-session   required  pam_env.so
-session   required  pam_unix.so
--session  optional  pam_limits.so
-PAMCFG
-
-    lightdm --debug
+    sddm
+    echo "=== /var/log/sddm.log ==="
+    [ -f /var/log/sddm.log ] && cat /var/log/sddm.log
     echo "=== /.xsession-errors ==="
     [ -f /.xsession-errors ] && cat /.xsession-errors
     [ -f /root/.xsession-errors ] && cat /root/.xsession-errors
-    echo "=== /var/log/lightdm/lightdm.log ==="
-    [ -f /var/log/lightdm/lightdm.log ] && cat /var/log/lightdm/lightdm.log
-    echo "=== /var/log/lightdm/seat0-greeter.log ==="
-    [ -f /var/log/lightdm/seat0-greeter.log ] && cat /var/log/lightdm/seat0-greeter.log
-    echo "=== /var/log/lightdm/x-0.log ==="
-    [ -f /var/log/lightdm/x-0.log ] && cat /var/log/lightdm/x-0.log
     exec /bin/sh
 fi
 
-echo "[startx] Error: lightdm binary not found."
+echo "[startx] Error: sddm binary not found."
 exec /bin/sh

@@ -14,6 +14,7 @@
 #include "af_netlink.h"
 #include "af_inet.h"
 #include "af_inet6.h"
+#include "af_qrtr.h"
 #include "socket_internal.h"
 #include "../syscalls/sys_io_shared.h"
 #include "../net/core.h"
@@ -258,14 +259,18 @@ void socket_wait(socket_t *sock) {
   if (!current)
     return;
 
-  wait_queue_entry_t entry = {.thread = current, .next = NULL};
-
-  wait_queue_add(sock->wait_queue, &entry);
+  /* NOTE: unconditional wait, no condition to recheck. Callers with a
+   * condition must add+recheck under their object lock instead of using
+   * this (see netlink_recvfrom). Kept race-narrow: BLOCKED before add. */
+  wait_queue_entry_t entry = {.thread = current, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
 
   current->state = THREAD_BLOCKED;
+  wait_queue_add(sock->wait_queue, &entry);
+
   sched_yield();
 
   wait_queue_remove(sock->wait_queue, &entry);
+  current->state = THREAD_RUNNING;
 }
 
 void socket_wake(socket_t *sock) {
@@ -278,7 +283,7 @@ void socket_wake(socket_t *sock) {
 socket_t *socket_create(int domain, int type, int protocol) {
   // Validate domain
   if (domain != AF_UNIX && domain != AF_INET && domain != AF_INET6 &&
-      domain != AF_NETLINK) {
+      domain != AF_NETLINK && domain != AF_QIPCRTR) {
     return NULL; // EAFNOSUPPORT
   }
 
@@ -491,6 +496,9 @@ ssize_t socket_send(socket_t *sock, const void *buf, size_t len, int flags) {
 }
 
 ssize_t socket_recv(socket_t *sock, void *buf, size_t len, int flags) {
+  if (len == 0)
+    return 0;
+
   if (!sock || !buf)
     return -22; // EINVAL
 
@@ -502,6 +510,9 @@ ssize_t socket_recv(socket_t *sock, void *buf, size_t len, int flags) {
 
 ssize_t socket_sendto(socket_t *sock, const void *buf, size_t len, int flags,
                       struct sockaddr *dest_addr, int addrlen) {
+  if (len == 0)
+    return 0;
+
   if (!sock || !buf)
     return -22;
 
@@ -513,6 +524,9 @@ ssize_t socket_sendto(socket_t *sock, const void *buf, size_t len, int flags,
 
 ssize_t socket_recvfrom(socket_t *sock, void *buf, size_t len, int flags,
                         struct sockaddr *src_addr, int *addrlen) {
+  if (len == 0)
+    return 0;
+
   if (!sock || !buf)
     return -22;
 
@@ -576,6 +590,14 @@ int socket_create_pair(int domain, int type, int protocol, socket_t *sv[2]) {
     usk1->peer = usk0;
     usk0->was_connected = true;
     usk1->was_connected = true;
+    usk0->peer_cred_pid = usk1->owner_pid;
+    usk0->peer_cred_uid = usk1->owner_uid;
+    usk0->peer_cred_gid = usk1->owner_gid;
+    usk0->peer_cred_valid = true;
+    usk1->peer_cred_pid = usk0->owner_pid;
+    usk1->peer_cred_uid = usk0->owner_uid;
+    usk1->peer_cred_gid = usk0->owner_gid;
+    usk1->peer_cred_valid = true;
   }
 
   sv[0] = sock0;
@@ -686,18 +708,21 @@ uint32_t socket_vfs_read(struct vfs_node *node, uint32_t offset, uint32_t size,
                          uint8_t *buffer) {
   (void)offset; // Sockets don't use offset
 
-  if (!node || !buffer)
+  if (size == 0)
     return 0;
+
+  if (!node || !buffer)
+    return (uint32_t)(int32_t)-14;
 
   socket_t *sock = (socket_t *)node->device;
   if (!sock)
-    return 0;
+    return (uint32_t)(int32_t)-9;
 
   if (!socket_try_get(sock))
-    return 0;
+    return (uint32_t)(int32_t)-9;
   if (sock->closing) {
     socket_put(sock);
-    return 0;
+    return 0; // EOF on closed socket
   }
 
   ssize_t ret = socket_recv(sock, buffer, size, 0);
@@ -709,12 +734,15 @@ uint32_t socket_vfs_write(struct vfs_node *node, uint32_t offset, uint32_t size,
                           uint8_t *buffer) {
   (void)offset; // Sockets don't use offset
 
-  if (!node || !buffer)
+  if (size == 0)
     return 0;
+
+  if (!node || !buffer)
+    return (uint32_t)(int32_t)-14;
 
   socket_t *sock = (socket_t *)node->device;
   if (!sock)
-    return 0;
+    return (uint32_t)(int32_t)-9;
 
   if (!socket_try_get(sock))
     return (uint32_t)(int32_t)-9;
@@ -725,6 +753,8 @@ uint32_t socket_vfs_write(struct vfs_node *node, uint32_t offset, uint32_t size,
 
   ssize_t ret = socket_send(sock, buffer, size, 0);
   socket_put(sock);
+  if (ret == 0 && size > 0)
+    return (uint32_t)(int32_t)-11; // EAGAIN
   return (uint32_t)ret;
 }
 
@@ -858,8 +888,24 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
 
   if (sock->ops && sock->ops->ioctl) {
     int ret = sock->ops->ioctl(sock, request, arg);
+    if (ret != -25 || request != 0x541B) {
+      socket_put(sock);
+      return ret;
+    }
+  }
+
+  if (request == 0x541B) { /* FIONREAD / TIOCINQ fallback */
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int))) {
+      socket_put(sock);
+      return -14;
+    }
+    int unread = 0;
+    if (copy_to_user((void *)arg, &unread, sizeof(int)) != 0) {
+      socket_put(sock);
+      return -14;
+    }
     socket_put(sock);
-    return ret;
+    return 0;
   }
 
   socket_put(sock);
@@ -899,6 +945,7 @@ void socket_init(void) {
   af_netlink_init();
   af_inet_init();
   af_inet6_init();
+  af_qrtr_init();
 
   klog_puts("[OK] Socket subsystem initialized (max sockets: ");
   klog_uint64(SOCKET_MAX_COUNT);

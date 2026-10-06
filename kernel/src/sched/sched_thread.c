@@ -75,6 +75,9 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
     return NULL;
 
   memset(t, 0, sizeof(struct thread));
+  t->start_time_ms = lapic_timer_get_ms();
+  if (t->start_time_ms == 0)
+    t->start_time_ms = 1;
   if (!sched_ensure_files(t)) {
     kfree(t);
     return NULL;
@@ -88,6 +91,9 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
   if (current) {
     strcpy(t->cwd_path, current->cwd_path);
     t->cwd_node = current->cwd_node;
+    mempolicy_copy(&t->numa_policy, &current->numa_policy);
+  } else {
+    mempolicy_init(&t->numa_policy);
   }
   if (t->cwd_node)
     vfs_open(t->cwd_node);
@@ -253,6 +259,7 @@ bool sched_get_thread_snapshot(uint32_t tid,
       __atomic_load_n(&t->runtime_user_ms, __ATOMIC_RELAXED);
   snapshot->runtime_system_ms =
       __atomic_load_n(&t->runtime_system_ms, __ATOMIC_RELAXED);
+  snapshot->start_time_ms = t->start_time_ms;
   snapshot->uid = t->uid;
   snapshot->gid = t->gid;
   snapshot->euid = t->euid;
@@ -260,6 +267,22 @@ bool sched_get_thread_snapshot(uint32_t tid,
   snapshot->suid = t->suid;
   snapshot->sgid = t->sgid;
   snapshot->cpu_index = t->cpu_index;
+  snapshot->last_syscall_num = t->last_syscall_num;
+  snapshot->last_syscall_ret = t->last_syscall_ret;
+  for (int i = 0; i < 6; i++)
+    snapshot->last_syscall_args[i] = t->last_syscall_args[i];
+  snapshot->last_poll_sec = t->last_poll_sec;
+  snapshot->last_poll_nsec = t->last_poll_nsec;
+  snapshot->last_poll_nfds = t->last_poll_nfds;
+  for (int i = 0; i < 8; i++) {
+    snapshot->last_poll_fds[i] = t->last_poll_fds[i];
+    snapshot->last_poll_events[i] = t->last_poll_events[i];
+    for (int j = 0; j < 48; j++) {
+      snapshot->last_poll_paths[i][j] = t->last_poll_paths[i][j];
+      if (!t->last_poll_paths[i][j])
+        break;
+    }
+  }
   memcpy(snapshot->comm, t->comm, sizeof(snapshot->comm));
   snapshot->comm[sizeof(snapshot->comm) - 1] = 0;
   memcpy(snapshot->exe_path, t->exe_path, sizeof(snapshot->exe_path));
@@ -508,9 +531,21 @@ void sched_reparent_children(struct thread *parent) {
       adopter = adopter->global_next;
   }
 
+  struct thread *to_reap = NULL;
   struct thread *child = parent->children;
   while (child) {
     struct thread *next_sibling = child->sibling_next;
+    /* If the child has already terminated, its parent exited without reading
+     * its exit status. When reparenting to init (or if adopter is not waiting),
+     * reap the dead zombie immediately so orphans do not leak. */
+    if (child->state == THREAD_ZOMBIE || child->state == THREAD_DEAD) {
+      child->sibling_next = to_reap;
+      to_reap = child;
+      child->parent = NULL;
+      child->state = THREAD_DEAD;
+      child = next_sibling;
+      continue;
+    }
     if (child->pdeath_signal > 0 && child->pdeath_signal <= 64) {
       signal_send(child, child->pdeath_signal);
     }
@@ -525,4 +560,11 @@ void sched_reparent_children(struct thread *parent) {
   }
   parent->children = NULL;
   spinlock_release(&tid_lock);
+
+  while (to_reap) {
+    struct thread *victim = to_reap;
+    to_reap = to_reap->sibling_next;
+    victim->sibling_next = NULL;
+    sched_queue_reap(victim);
+  }
 }

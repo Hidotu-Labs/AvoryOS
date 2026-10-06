@@ -9,11 +9,13 @@
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
 #include "../mm/heap.h"
+#include "../mm/vma.h"
 #include "../mm/vmm.h"
 #include "../sched/sched.h"
 #include "../sched/wait.h"
 #include "../smp/cpu.h"
 #include "../socket/epoll.h"
+#include "sys_io_shared.h"
 #include "syscall.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -118,7 +120,10 @@ static void fill_signal_context(struct sigframe *frame, int sig,
   info->si_signo = sig;
   uint32_t sender_pid = current->signal_sender_pid[sig - 1];
   if (sender_pid) {
-    info->si_code = 0; /* SI_USER */
+    /* glibc's SIGSETXID handler requires SI_TKILL for tgkill/tkill;
+     * reporting SI_USER makes it ignore the credential-change request
+     * while the initiating thread waits forever for its acknowledgement. */
+    info->si_code = current->signal_sender_code[sig - 1];
     info->_kill.si_pid = sender_pid;
     info->_kill.si_uid = 0;
   } else {
@@ -127,7 +132,18 @@ static void fill_signal_context(struct sigframe *frame, int sig,
 
   if (sig == SIGSEGV || sig == SIGBUS) {
     uint64_t fault_address = current->fault_addr;
-    info->si_code = (current->fault_code & 1) ? 2 /* SEGV_ACCERR */ : 1 /* SEGV_MAPERR */;
+    /* Linux reports SEGV_MAPERR iff no VMA covers the address, else
+     * SEGV_ACCERR. The old P-bit test misclassifies PROT_NONE guards
+     * (JVM yellow/red zones, pthread guard pages): they have no PTE
+     * (P=0) but a VMA exists, so they must be ACCERR. JVM's stack-overflow
+     * handler checks this and loops forever on MAPERR. */
+    int code = (current->fault_code & 1) ? 2 /* SEGV_ACCERR */ : 1 /* SEGV_MAPERR */;
+    if (current->mm && spinlock_try_acquire(&current->mm->lock)) {
+      struct vma *v = vma_find(&current->mm->vmas, fault_address);
+      code = v ? 2 : 1;
+      spinlock_release(&current->mm->lock);
+    }
+    info->si_code = code;
     info->_sigfault.si_addr = fault_address;
   } else if (sig == SIGILL || sig == SIGFPE) {
     uint64_t fault_address = frame->regs.rip;
@@ -249,7 +265,12 @@ static int sigtimedwait_dequeue(struct thread *t, uint64_t mask,
     if (info) {
       memset(info, 0, sizeof(*info));
       info->si_signo = sig;
-      info->si_code = 128; /* SI_KERNEL */
+      if (t->signal_sender_pid[i]) {
+        info->si_code = t->signal_sender_code[i];
+        info->_kill.si_pid = t->signal_sender_pid[i];
+      } else {
+        info->si_code = 128; /* SI_KERNEL */
+      }
     }
     return sig;
   }
@@ -800,6 +821,7 @@ static uint64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig,
   }
   target->pending_signals |= (1ULL << (sig - 1));
   target->signal_sender_pid[sig - 1] = sender_pid;
+  target->signal_sender_code[sig - 1] = -6; /* SI_TKILL */
   signal_notify_thread(target, (int)sig);
 
   return 0;
@@ -892,6 +914,7 @@ void signal_send(struct thread *t, int sig) {
   uint32_t sender_pid = sender ? (sender->tgid ? sender->tgid : sender->tid) : 0;
   t->pending_signals |= (1ULL << (sig - 1));
   t->signal_sender_pid[sig - 1] = sender_pid;
+  t->signal_sender_code[sig - 1] = 0; /* SI_USER */
   signal_notify_thread(t, sig);
 }
 
@@ -960,6 +983,7 @@ void signal_notify_parent_exit(struct thread *child) {
     /* Delivered as SI_USER-style info from the child, which is what a
      * SIGCHLD handler expects to see in si_pid. */
     t->signal_sender_pid[sig - 1] = child_pid;
+    t->signal_sender_code[sig - 1] = 0;
     if (notify_count < capacity)
       notify[notify_count++] = t;
   }
@@ -997,6 +1021,7 @@ void signal_send_pgid(uint32_t pgid, int sig) {  if (sig <= 0 || sig > 64)
         sender->uid == t->uid || sender->euid == t->uid)) {
       t->pending_signals |= (1ULL << (sig - 1));
       t->signal_sender_pid[sig - 1] = sender_pid;
+      t->signal_sender_code[sig - 1] = 0; /* SI_USER */
       if (notify_count < capacity)
         notify[notify_count++] = t;
     }
@@ -1092,6 +1117,7 @@ static uint64_t sys_kill(uint64_t pid_val, uint64_t sig, uint64_t a2,
       found = true;
       t->pending_signals |= (1ULL << (sig - 1));
       t->signal_sender_pid[sig - 1] = sender_pid;
+      t->signal_sender_code[sig - 1] = 0; /* SI_USER */
       signal_notify_thread(t, (int)sig);
     }
     t = t->global_next;
@@ -1214,11 +1240,21 @@ static uint32_t signalfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       }
     }
 
-    // No signals, block if needed
-    // (In a real OS we'd check O_NONBLOCK, but for now we assume blocking)
-    wait_queue_entry_t entry = {.thread = t, .next = NULL};
-    wait_queue_add(&ctx->wq, &entry);
+    // No signals: honour O_NONBLOCK like eventfd/timerfd do.
+    int sig_fd = -1;
+    if (t) {
+      for (int i = 0; i < MAX_FDS; i++) {
+        if (t->fds[i] == node) {
+          sig_fd = i;
+          break;
+        }
+      }
+    }
+    if (sig_fd != -1 && t && (t->fd_flags[sig_fd] & 0x800))
+      return (uint32_t)-11; // EAGAIN
+    wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
     t->state = THREAD_BLOCKED;
+    wait_queue_add(&ctx->wq, &entry);
 
     if (get_pending_signals_tgid(t, ctx->mask)) {
       t->state = THREAD_RUNNING;
@@ -1268,7 +1304,7 @@ static void signal_notify_signalfds(struct thread *t, int sig) {
   // Find all signalfds in this thread and wake them
   for (int i = 0; i < MAX_FDS; i++) {
     vfs_node_t *node = t->fds[i];
-    if (node && node->read == signalfd_read) {
+    if (fd_is_valid_node(node) && node->read == signalfd_read) {
       signalfd_ctx_t *ctx = (signalfd_ctx_t *)node->device;
       if (ctx && (ctx->mask & (1ULL << (sig - 1)))) {
         // Wake up poll() and read() waiters
@@ -1319,7 +1355,7 @@ static uint64_t sys_signalfd4(uint64_t fd, uint64_t mask_ptr, uint64_t sizemask,
     mask = *(uint64_t *)mask_ptr;
 
   // If fd != -1, update existing signalfd
-  if ((int64_t)fd >= 0 && fd < MAX_FDS && t->fds[fd]) {
+  if ((int64_t)fd >= 0 && fd < MAX_FDS && fd_is_valid_node(t->fds[fd])) {
     vfs_node_t *node = t->fds[fd];
     if (node->read == signalfd_read) {
       signalfd_ctx_t *ctx = (signalfd_ctx_t *)node->device;
@@ -1396,6 +1432,7 @@ static uint64_t sys_tkill(uint64_t tid, uint64_t sig, uint64_t a2, uint64_t a3,
   uint32_t sender_pid = sender ? (sender->tgid ? sender->tgid : sender->tid) : 0;
   target->pending_signals |= (1ULL << (sig - 1));
   target->signal_sender_pid[sig - 1] = sender_pid;
+  target->signal_sender_code[sig - 1] = -6; /* SI_TKILL */
   signal_notify_thread(target, (int)sig);
   return 0;
 }
@@ -1440,6 +1477,7 @@ static uint64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
     target->pending_signals |= (1ULL << (SIGSTOP - 1));
     target->signal_sender_pid[SIGSTOP - 1] =
         current->tgid ? current->tgid : current->tid;
+    target->signal_sender_code[SIGSTOP - 1] = 0; /* SI_USER */
     signal_notify_thread(target, SIGSTOP);
     return 0;
   }
@@ -1457,6 +1495,7 @@ static uint64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
       target->pending_signals |= (1ULL << (data - 1));
       target->signal_sender_pid[data - 1] =
           current->tgid ? current->tgid : current->tid;
+      target->signal_sender_code[data - 1] = 0; /* SI_USER */
       signal_notify_thread(target, (int)data);
     }
     return 0;

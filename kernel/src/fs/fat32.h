@@ -146,6 +146,7 @@ int fat32_mount(struct block_device *dev, vfs_node_t *mountpoint);
 // Mount FAT32 as the root filesystem, replacing the current fs_root.
 // Returns 0 on success, -1 on failure.
 int fat32_mount_root(struct block_device *dev);
+int fat32_statfs_impl(vfs_node_t *node, struct statfs_buf *buf);
 
 // Read a cluster from the filesystem.
 // Returns 0 on success, -1 on failure.

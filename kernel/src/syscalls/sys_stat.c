@@ -3,6 +3,7 @@
 //   getdents, getdents64
 #include "sys_io_shared.h"
 #include "../console/klog.h"
+#include "../drivers/storage/block.h"
 #include "../fb/framebuffer.h"
 #include "../fs/vfs.h"
 #include "../lib/string.h"
@@ -11,6 +12,13 @@
 #include "../sched/sched.h"
 #include "syscall.h"
 #include <stdint.h>
+
+/* Block-backed filesystem statfs handlers. When a file/dir carries one of
+ * these, node->device points at a mount struct whose first word is the
+ * backing struct block_device* (ext2_mount_t::dev, fat32_mount_t::dev). */
+extern int ext4_statfs_impl(vfs_node_t *, struct statfs_buf *);
+extern int ext2_statfs_impl(vfs_node_t *, struct statfs_buf *);
+extern int fat32_statfs_impl(vfs_node_t *, struct statfs_buf *);
 
 // ---------------------------------------------------------------------------
 // fill_kstat — convert a vfs_node into a kstat structure
@@ -36,9 +44,32 @@ void fill_kstat(struct kstat *ks, vfs_node_t *node) {
     ks->st_gid   = node->gid;
     ks->__pad0   = 0;
     ks->st_rdev  = 0;
-    if ((node->flags & FS_TYPE_MASK) == FS_CHARDEV ||
-        (node->flags & FS_TYPE_MASK) == FS_BLOCKDEV)
+    if ((node->flags & FS_TYPE_MASK) == FS_CHARDEV)
         ks->st_rdev = (uint64_t)node->inode;
+    if ((node->flags & FS_TYPE_MASK) == FS_BLOCKDEV && node->device) {
+        /* /dev/<disk> nodes: report the same major:minor that /sys/block,
+         * /proc/partitions and /proc/self/mountinfo advertise. The inode
+         * already carries the userspace dev_t (set in block_publish_node),
+         * but older nodes registered before that change have inode 0, so
+         * derive it from the block device when needed. */
+        struct block_device *bd = (struct block_device *)node->device;
+        uint32_t rdev = block_device_userspace_rdev(bd);
+        ks->st_rdev = (uint64_t)(rdev ? rdev : node->inode);
+    }
+    /* st_dev for files on block filesystems: the filesystem's device number.
+     * Qt/UDisks match stat().st_dev against mountinfo's devno to find the
+     * mount a path belongs to; with st_dev 0 every file looks like it lives
+     * on no device and the match falls back to pure path prefixing. */
+    if (((node->flags & FS_TYPE_MASK) == FS_FILE ||
+         (node->flags & FS_TYPE_MASK) == FS_DIRECTORY) &&
+        node->device && node->statfs &&
+        (node->statfs == ext4_statfs_impl ||
+         node->statfs == ext2_statfs_impl ||
+         node->statfs == fat32_statfs_impl)) {
+        struct block_device *bd = *(struct block_device **)node->device;
+        if (bd && (bd->linux_major || bd->linux_minor))
+            ks->st_dev = (uint64_t)block_device_userspace_rdev(bd);
+    }
 
     ks->st_size    = (int64_t)node->length;
     ks->st_blksize = 4096;
@@ -122,7 +153,7 @@ static uint64_t sys_fstat(uint64_t fd, uint64_t statbuf_ptr, uint64_t a2,
     if (!ks || !is_user_ptr((uint64_t)ks)) return (uint64_t)-14;
 
     struct thread *t = sched_get_current();
-    if (!t || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
+    if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
 
     fill_kstat(ks, t->fds[fd]);
     return 0;
@@ -203,6 +234,27 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
     stx->stx_atime.tv_sec = (int64_t)node->atime;
     stx->stx_mtime.tv_sec = (int64_t)node->mtime;
     stx->stx_ctime.tv_sec = (int64_t)node->ctime;
+    /* Device numbers for Qt's mount matching (see fill_kstat): block devices
+     * report their own number as rdev, files on block filesystems report
+     * their filesystem's number as dev. */
+    if ((node->flags & FS_TYPE_MASK) == FS_BLOCKDEV && node->device) {
+        struct block_device *bd = (struct block_device *)node->device;
+        if (bd && (bd->linux_major || bd->linux_minor)) {
+            stx->stx_rdev_major = bd->linux_major;
+            stx->stx_rdev_minor = bd->linux_minor;
+        }
+    } else if (((node->flags & FS_TYPE_MASK) == FS_FILE ||
+                (node->flags & FS_TYPE_MASK) == FS_DIRECTORY) &&
+               node->device && node->statfs &&
+               (node->statfs == ext4_statfs_impl ||
+                node->statfs == ext2_statfs_impl ||
+                node->statfs == fat32_statfs_impl)) {
+        struct block_device *bd = *(struct block_device **)node->device;
+        if (bd && (bd->linux_major || bd->linux_minor)) {
+            stx->stx_dev_major = bd->linux_major;
+            stx->stx_dev_minor = bd->linux_minor;
+        }
+    }
     if (node_owned) vfs_close(node);
     if (base_owned) vfs_close(base_owned);
     return 0;
@@ -224,7 +276,7 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
     if (!t) return (uint64_t)-1;
 
     if ((flags & AT_EMPTY_PATH) && path && path[0] == '\0') {
-        if ((int)dirfd < 0 || dirfd >= MAX_FDS || !t->fds[dirfd])
+        if ((int)dirfd < 0 || dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd]))
             return (uint64_t)-9;
         fill_kstat(ks, t->fds[dirfd]);
         return 0;
@@ -241,7 +293,7 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
                 else base_owned = base_dir;
             }
         } else {
-            if ((int)dirfd < 0 || (int)dirfd >= MAX_FDS || !t->fds[dirfd])
+            if ((int)dirfd < 0 || dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd]))
                 return (uint64_t)-9;
             base_dir = t->fds[dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY)
@@ -297,6 +349,7 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
     if (!t || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
 
     vfs_node_t *node = t->fds[fd];
+    if (t->fd_flags[fd] & O_PATH) return (uint64_t)-9; // EBADF: O_PATH fds are not readable
     if ((node->flags & FS_TYPE_MASK) != FS_DIRECTORY) return (uint64_t)-20;
 
     uint8_t *buf = (uint8_t *)dirp;
@@ -339,6 +392,7 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
     if (!t || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
 
     vfs_node_t *node = t->fds[fd];
+    if (t->fd_flags[fd] & O_PATH) return (uint64_t)-9; // EBADF: O_PATH fds are not readable
     if ((node->flags & FS_TYPE_MASK) != FS_DIRECTORY) return (uint64_t)-20;
 
     uint8_t *buf = (uint8_t *)dirp;
@@ -373,6 +427,48 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
 // statfs / fstatfs
 // ---------------------------------------------------------------------------
 
+#define PIPEFS_MAGIC 0x50495045
+#define SOCKFS_MAGIC 0x534F434B
+#define ANON_INODE_FS_MAGIC 0x09041934
+
+/* Non-storage nodes (pipes, sockets, epoll) carry no filesystem handler.
+ * Linux reports them as 0-block pseudo filesystems instead of failing, so
+ * do the same: truthful "no storage here", not an error retry loop. */
+static void statfs_pseudo(struct statfs_buf *buf, int64_t magic) {
+    buf->f_type    = magic;
+    buf->f_bsize   = 4096;
+    buf->f_blocks  = 0;
+    buf->f_bfree   = 0;
+    buf->f_bavail  = 0;
+    buf->f_files   = 0;
+    buf->f_ffree   = 0;
+    buf->f_fsid[0] = 0;
+    buf->f_fsid[1] = 0;
+    buf->f_namelen = 255;
+    buf->f_frsize  = 4096;
+    buf->f_flags   = 0;
+}
+
+/* A regular file/dir without a handler is a real coverage gap. The old code
+ * filled in fake 2 GiB disk values and returned success, which made df lie.
+ * Be loud instead: rate-limited klog plus ENOSYS so the gap gets fixed. */
+static uint32_t statfs_nohandler_count;
+
+static int64_t statfs_handle_missing(vfs_node_t *node, struct statfs_buf *buf) {
+    uint32_t type = node ? (node->flags & FS_TYPE_MASK) : 0;
+    if (type == FS_PIPE)   { statfs_pseudo(buf, PIPEFS_MAGIC); return 0; }
+    if (type == FS_SOCKET) { statfs_pseudo(buf, SOCKFS_MAGIC); return 0; }
+    if (type == FS_EPOLL)  { statfs_pseudo(buf, ANON_INODE_FS_MAGIC); return 0; }
+    if (__atomic_add_fetch(&statfs_nohandler_count, 1, __ATOMIC_RELAXED) <= 8) {
+        klog_puts("[STATFS] no handler: type=");
+        klog_uint64(type);
+        klog_puts(" inode=");
+        klog_uint64(node ? (uint64_t)node->inode : 0);
+        klog_puts("\n");
+    }
+    return -38; /* ENOSYS */
+}
+
 static uint64_t sys_statfs(uint64_t path_ptr, uint64_t buf_ptr, uint64_t a3,
                             uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
@@ -386,21 +482,9 @@ static uint64_t sys_statfs(uint64_t path_ptr, uint64_t buf_ptr, uint64_t a3,
 
     int ret = vfs_statfs(node, buf);
     if (ret != 0) {
-        /* Fallback: 2 GiB total disk, ~200 MiB used (rough estimate).
-         * f_bsize = 4096, f_blocks = 2 GiB / 4096 = 524288 blocks
-         * f_bfree / f_bavail = (2 GiB - 200 MiB) / 4096 ~ 471040 blocks */
-        buf->f_type    = 0x61657673;
-        buf->f_bsize   = 4096;
-        buf->f_blocks  = 524288;   /* 2 GiB total */
-        buf->f_bfree   = 471040;   /* ~1.8 GiB free */
-        buf->f_bavail  = 471040;
-        buf->f_files   = 10000;
-        buf->f_ffree   = 5000;
-        buf->f_fsid[0] = 1;
-        buf->f_fsid[1] = 0;
-        buf->f_namelen = 255;
-        buf->f_frsize  = 4096;
-        buf->f_flags   = 0;
+        int64_t missing = statfs_handle_missing(node, buf);
+        vfs_close(node);
+        return (uint64_t)missing;
     }
     vfs_close(node);
     return 0;
@@ -417,21 +501,8 @@ static uint64_t sys_fstatfs(uint64_t fd, uint64_t buf_ptr, uint64_t a3,
     vfs_node_t        *node = t->fds[fd];
     int ret = vfs_statfs(node, buf);
     if (ret != 0) {
-        /* Fallback: 2 GiB total disk, ~200 MiB used (rough estimate).
-         * f_bsize = 4096, f_blocks = 2 GiB / 4096 = 524288 blocks
-         * f_bfree / f_bavail = (2 GiB - 200 MiB) / 4096 ~ 471040 blocks */
-        buf->f_type    = 0x61657673;
-        buf->f_bsize   = 4096;
-        buf->f_blocks  = 524288;   /* 2 GiB total */
-        buf->f_bfree   = 471040;   /* ~1.8 GiB free */
-        buf->f_bavail  = 471040;
-        buf->f_files   = 10000;
-        buf->f_ffree   = 5000;
-        buf->f_fsid[0] = 1;
-        buf->f_fsid[1] = 0;
-        buf->f_namelen = 255;
-        buf->f_frsize  = 4096;
-        buf->f_flags   = 0;
+        int64_t missing = statfs_handle_missing(node, buf);
+        return (uint64_t)missing;
     }
     return 0;
 }

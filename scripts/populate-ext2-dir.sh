@@ -77,19 +77,44 @@ ensure_dir_cmds() {
 
 ensure_dir_cmds "$DST_DIR"
 
+# Space-separated SRC_DIR-relative prefixes excluded from the image to keep
+# it fitting comfortably: build headers, documentation and static archives
+# are never read at runtime (rebuilds compile against the build tree, not
+# the image). Override from the environment to adjust, e.g.
+# EXCLUDE_IMAGE_PATHS="usr/include" for a fuller image.
+EXCLUDE_IMAGE_PATHS="${EXCLUDE_IMAGE_PATHS:-usr/include usr/share/doc usr/share/man}"
+
+# Assemble find(1) prune primaries from the exclusion list.
+PRUNE_EXPR=""
+for _ex in $EXCLUDE_IMAGE_PATHS; do
+  # shellcheck disable=SC2086
+  if [ -z "$PRUNE_EXPR" ]; then
+    PRUNE_EXPR="-path ./$_ex"
+  else
+    PRUNE_EXPR="$PRUNE_EXPR -o -path ./$_ex"
+  fi
+done
+
 (
   cd "$SRC_DIR"
   # First create all directories
-  find . -type d | while IFS= read -r dir_path; do
+  # shellcheck disable=SC2086
+  find . \( $PRUNE_EXPR \) -prune -o -type d -print | while IFS= read -r dir_path; do
     rel_path=${dir_path#./}
     [ "$rel_path" = "." ] && continue
     echo "mkdir $DST_DIR/$rel_path" >> "$CMDS_FILE"
     mode=$(stat -c %a "$dir_path")
-    echo "set_inode_field $DST_DIR/$rel_path mode 040$mode" >> "$CMDS_FILE"
+    # S_IFDIR (0040000) + permission bits, including setuid/setgid/sticky.
+    # Old code used 040$mode which breaks 4-digit modes (e.g. 2755 ->
+    # 0402755 instead of 042755).
+    full_mode=$(printf "0%o" $((8#40000 + 8#$mode)))
+    echo "set_inode_field $DST_DIR/$rel_path mode $full_mode" >> "$CMDS_FILE"
   done
 
-  # Then write files and symlinks
-  find . -type f -o -type l | while IFS= read -r file_path; do
+  # Then write files and symlinks (static archives are build-only, like
+  # the excluded include tree above).
+  # shellcheck disable=SC2086
+  find . \( $PRUNE_EXPR \) -prune -o \( -type f ! -name '*.a' -o -type l \) -print | while IFS= read -r file_path; do
     rel_path=${file_path#./}
     if [ -L "$file_path" ]; then
       target=$(readlink "$file_path")
@@ -98,7 +123,11 @@ ensure_dir_cmds "$DST_DIR"
       echo "rm $DST_DIR/$rel_path" >> "$CMDS_FILE"
       echo "write $SRC_DIR/$rel_path $DST_DIR/$rel_path" >> "$CMDS_FILE"
       mode=$(stat -c %a "$file_path")
-      echo "set_inode_field $DST_DIR/$rel_path mode 0100$mode" >> "$CMDS_FILE"
+      # S_IFREG (0100000) + permission bits, including setuid/setgid/sticky.
+      # Old code used 0100$mode which breaks 4-digit modes (e.g. 4755 ->
+      # 01004755 instead of 0104755).
+      full_mode=$(printf "0%o" $((8#100000 + 8#$mode)))
+      echo "set_inode_field $DST_DIR/$rel_path mode $full_mode" >> "$CMDS_FILE"
       mtime=$(stat -c %Y "$file_path")
       echo "set_inode_field $DST_DIR/$rel_path mtime @$mtime" >> "$CMDS_FILE"
     fi
@@ -106,10 +135,18 @@ ensure_dir_cmds "$DST_DIR"
 
   # Creating children changes directory mtimes. Restore them only after the
   # complete tree has been populated so metadata-based caches (notably
-  # Fontconfig) remain valid in the image.
+  # Fontconfig) remain valid in the image. (-prune is ineffective with
+  # -depth, so excluded prefixes are skipped in shell here.)
   find . -depth -type d | while IFS= read -r dir_path; do
     rel_path=${dir_path#./}
     [ "$rel_path" = "." ] && continue
+    _skip=""
+    for _ex in $EXCLUDE_IMAGE_PATHS; do
+      case "$rel_path" in
+        "$_ex"|"$_ex"/*) _skip=1; break;;
+      esac
+    done
+    [ -n "$_skip" ] && continue
     mtime=$(stat -c %Y "$dir_path")
     echo "set_inode_field $DST_DIR/$rel_path mtime @$mtime" >> "$CMDS_FILE"
   done

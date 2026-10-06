@@ -533,7 +533,7 @@ int ext2_mkdir_impl(vfs_node_t *node, char *name, uint16_t permission) {
 
   uint32_t group = (new_ino - 1) / mnt->inodes_per_group;
   mnt->bgdt[group].bg_used_dirs_count++;
-  ext2_mark_metadata_dirty(mnt);
+  ext2_mark_group_dirty(mnt, group);
 
   ext3_journal_stop(mnt);
   return 0;

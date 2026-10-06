@@ -126,6 +126,17 @@ int unix_getsockopt_impl(socket_t *sock, int level, int optname,
     }
     spinlock_acquire(&sock->lock);
     if (!usk->peer) {
+      // Peer gone: serve the cached cred from when it was connected, like
+      // Linux. Only never-connected sockets get ENOTCONN.
+      if (usk->was_connected && usk->peer_cred_valid) {
+        struct ucred_local *cached = (struct ucred_local *)optval;
+        cached->pid = (int)usk->peer_cred_pid;
+        cached->uid = usk->peer_cred_uid;
+        cached->gid = usk->peer_cred_gid;
+        spinlock_release(&sock->lock);
+        *optlen = (int)UCRED_SIZE;
+        return 0;
+      }
       spinlock_release(&sock->lock);
       klog_puts("[WARN] unix_getsockopt: SO_PEERCRED but no peer\n");
       return -107; // ENOTCONN
@@ -134,6 +145,11 @@ int unix_getsockopt_impl(socket_t *sock, int level, int optname,
     cred->pid = usk->peer->owner_pid;
     cred->uid = usk->peer->owner_uid;
     cred->gid = usk->peer->owner_gid;
+    // Refresh the disconnect cache on every successful live query.
+    usk->peer_cred_pid = usk->peer->owner_pid;
+    usk->peer_cred_uid = usk->peer->owner_uid;
+    usk->peer_cred_gid = usk->peer->owner_gid;
+    usk->peer_cred_valid = true;
     spinlock_release(&sock->lock);
     *optlen = (int)UCRED_SIZE;
     return 0;
@@ -176,9 +192,36 @@ int unix_getsockopt_impl(socket_t *sock, int level, int optname,
     return 0;
   }
 
+  case 59: { // SO_PEERGROUPS
+    uint32_t peer_pid = 0;
+    spinlock_acquire(&sock->lock);
+    if (usk->peer) {
+      peer_pid = usk->peer->owner_pid;
+    } else if (usk->was_connected && usk->peer_cred_valid) {
+      peer_pid = (uint32_t)usk->peer_cred_pid;
+    } else {
+      spinlock_release(&sock->lock);
+      return -107; // ENOTCONN
+    }
+    spinlock_release(&sock->lock);
+
+    struct thread *peer_thread = sched_get_thread_by_tid(peer_pid);
+    uint32_t count = peer_thread ? peer_thread->supplementary_group_count : 0;
+    int needed_bytes = (int)(count * sizeof(uint32_t));
+    if (*optlen < needed_bytes) {
+      *optlen = needed_bytes;
+      return -34; // ERANGE
+    }
+    if (count > 0 && peer_thread) {
+      memcpy(optval, peer_thread->supplementary_groups, needed_bytes);
+    }
+    *optlen = needed_bytes;
+    return 0;
+  }
+
   case 31: // SO_PEERSEC
-  case 59: // SO_PEERGROUPS
-    return -92; // ENOPROTOOPT (unsupported security context / groups)
+  case 77: // SO_PEERPIDFD
+    return -92; // ENOPROTOOPT (unsupported security context / pidfd)
 
   default:
     klog_puts("[WARN] unix_getsockopt: unknown optname ");
@@ -194,6 +237,11 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
     return -22; // EINVAL
 
   unix_sock_t *usk = (unix_sock_t *)sock->sk;
+
+  /* Blind TCP_NODELAY from libraries (GLib GSocket, Qt) that don't check
+   * family before setting socket flags */
+  if ((level == 6 /* SOL_TCP/IPPROTO_TCP */) && optname == 1 /* TCP_NODELAY */)
+    return 0;
 
   if (level != SOL_SOCKET)
     return -92; // ENOPROTOOPT

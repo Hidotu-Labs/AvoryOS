@@ -251,11 +251,10 @@ static void scroll_up(void) {
 
   if (fb_is_backbuffer_enabled()) {
     /* Ring rotation: the scroll only advances the backbuffer origin; the
-     * swap maps display rows through it.  Moving every pixel once per
-     * scrolled line was the console's hottest path (one full-screen memcpy
-     * per newline at the bottom of the screen). */
+     * swap maps display rows through it.  Marking full-screen dirty enables
+     * the O(1) two-chunk contiguous swap instead of scanning 800 rows. */
     fb_backbuffer_scroll(FONT_HEIGHT);
-    fb_mark_dirty(0, 0, fb_w, move_height);
+    fb_mark_dirty(0, 0, fb_w, fb_h);
   } else {
     uint32_t pitch = fb_get_pitch();
     void *base = fb_get_base();
@@ -265,7 +264,7 @@ static void scroll_up(void) {
     uint8_t *src = (uint8_t *)base + (FONT_HEIGHT * pitch);
 
     memcpy(dst, src, bytes_to_copy);
-    fb_mark_dirty(0, 0, fb_w, move_height);
+    fb_mark_dirty(0, 0, fb_w, fb_h);
   }
 
   /* A terminal scroll exposes blank cells using the current rendition.
@@ -904,12 +903,7 @@ static void draw_char_colored(uint32_t c, uint32_t col, uint32_t row,
   const uint8_t *glyph = font_get_glyph(c);
   uint32_t px = col * FONT_WIDTH;
   uint32_t py = row * FONT_HEIGHT;
-
-  for (uint32_t y = 0; y < FONT_HEIGHT; y++) {
-    // Bottom two rows become the underline bar when underline is active
-    uint8_t bits = (underline && y >= FONT_HEIGHT - 2) ? 0xFF : glyph[y];
-    fb_draw_glyph_scanline(px, py + y, bits, fg, bg);
-  }
+  fb_draw_glyph_8x16(px, py, glyph, fg, bg, underline);
 }
 
 static void draw_history_char(uint32_t col, uint32_t row) {

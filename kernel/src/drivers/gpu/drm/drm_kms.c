@@ -75,9 +75,15 @@ struct drm_connector *ascentdrm_connector_create(struct drm_device *dev, uint32_
     conn->connection_status = 1; // Connected
     ascentdrm_mode_object_init(dev, &conn->base, DRM_MODE_OBJECT_CONNECTOR);
 
-    /* Attach standard connector properties */
+    /* Attach standard connector properties.  NOTE: do not advertise a
+     * CONNECTOR_ID object property here.  Real drivers have no such kernel
+     * property (the id is the object id itself; Xorg publishes its own
+     * CONNECTOR_ID RandR property from it), and Xorg's modesetting
+     * set_property walk dereferences props[i].atoms[0] for every
+     * registered non-RANGE/non-ENUM property - a NULL-atoms entry
+     * segfaults Xorg the first time any client (e.g. KWin) sets an output
+     * property past index 0. */
     ascentdrm_obj_add_prop(&conn->base, DRM_PROP_ID_DPMS,         0);
-    ascentdrm_obj_add_prop(&conn->base, DRM_PROP_ID_CONNECTOR_ID, conn->base.id);
     ascentdrm_obj_add_prop(&conn->base, DRM_PROP_ID_CRTC_ID,      0); /* set by atomic */
     return conn;
 }
@@ -125,11 +131,15 @@ void ascentdrm_kms_init(struct drm_device *dev) {
 }
 
 struct drm_framebuffer *ascentdrm_framebuffer_create(struct drm_device *dev, struct drm_mode_fb_cmd *cmd) {
-    struct drm_gem_object *gem_obj = ascentdrm_gem_find_by_handle(dev, cmd->handle);
+    struct drm_gem_object *gem_obj = ascentdrm_gem_find_by_handle_get(dev, cmd->handle);
     if (!gem_obj) return NULL;
 
     struct drm_framebuffer *fb = kmalloc(sizeof(struct drm_framebuffer));
-    if (!fb) return NULL;
+    if (!fb) {
+        if (ascentdrm_gem_put_last(gem_obj))
+            ascentdrm_gem_object_free(dev, gem_obj);
+        return NULL;
+    }
     memset(fb, 0, sizeof(struct drm_framebuffer));
 
     fb->width = cmd->width;
@@ -147,7 +157,6 @@ struct drm_framebuffer *ascentdrm_framebuffer_create(struct drm_device *dev, str
     else
         fb->pixel_format = 0;
     fb->gem_obj = gem_obj;
-    gem_obj->refcount++;
 
     ascentdrm_mode_object_init(dev, &fb->base, DRM_MODE_OBJECT_FB);
     return fb;
@@ -159,9 +168,10 @@ void ascentdrm_framebuffer_free(struct drm_device *dev, struct drm_framebuffer *
     spinlock_release(&dev->lock);
 
     if (fb->gem_obj) {
-        fb->gem_obj->refcount--;
-        if (fb->gem_obj->refcount <= 0)
-            ascentdrm_gem_object_free(dev, fb->gem_obj);
+        struct drm_gem_object *gem = fb->gem_obj;
+        fb->gem_obj = NULL;
+        if (ascentdrm_gem_put_last(gem))
+            ascentdrm_gem_object_free(dev, gem);
     }
     kfree(fb);
 }

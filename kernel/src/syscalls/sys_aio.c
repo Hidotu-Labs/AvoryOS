@@ -59,9 +59,17 @@ static uint32_t eventfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
             spinlock_release(&ctx->lock);
             return (uint32_t)-11;
         }
-        wait_queue_entry_t entry = {.thread = t, .next = NULL};
-        wait_queue_add(&ctx->wq, &entry);
+        wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
         t->state = THREAD_BLOCKED;
+        wait_queue_add(&ctx->wq, &entry);
+        if (ctx->counter != 0) {
+            t->state = THREAD_RUNNING;
+            spinlock_release(&ctx->lock);
+            wait_queue_remove(&ctx->wq, &entry);
+            t->state = THREAD_RUNNING;
+            spinlock_acquire(&ctx->lock);
+            continue;
+        }
         spinlock_release(&ctx->lock);
         sched_yield();
         t->state = THREAD_RUNNING;
@@ -72,7 +80,11 @@ static uint32_t eventfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     if (ctx->flags & EFD_SEMAPHORE) { val = 1; ctx->counter -= 1; }
     else { val = ctx->counter; ctx->counter = 0; }
     spinlock_release(&ctx->lock);
-    memcpy(buffer, &val, 8);
+    if (is_user_ptr((uint64_t)buffer)) {
+        if (copy_to_user(buffer, &val, 8) != 0) return (uint32_t)-14;
+    } else {
+        memcpy(buffer, &val, 8);
+    }
     return 8;
 }
 
@@ -83,11 +95,19 @@ static uint32_t eventfd_write(vfs_node_t *node, uint32_t offset, uint32_t size,
     eventfd_ctx_t *ctx = (eventfd_ctx_t *)node->device;
     if (!ctx) return (uint32_t)-22;
 
-    uint64_t val;
-    memcpy(&val, buffer, 8);
-    if (val == 0) return (uint32_t)-22;
+    uint64_t val = 0;
+    if (is_user_ptr((uint64_t)buffer)) {
+        if (copy_from_user(&val, buffer, 8) != 0) return (uint32_t)-14;
+    } else {
+        memcpy(&val, buffer, 8);
+    }
+    if (val == 0xffffffffffffffffULL) return (uint32_t)-22;
 
     spinlock_acquire(&ctx->lock);
+    if (0xfffffffffffffffeULL - ctx->counter < val) {
+        spinlock_release(&ctx->lock);
+        return (uint32_t)-22; // overflow
+    }
     ctx->counter += val;
     spinlock_release(&ctx->lock);
 
@@ -135,6 +155,7 @@ static uint64_t sys_eventfd2(uint64_t initval, uint64_t flags, uint64_t a2,
     vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
     if (!node) return (uint64_t)-12;
     vfs_node_init(node);
+    strncpy(node->name, "eventfd", sizeof(node->name) - 1);
 
     eventfd_ctx_t *ctx = kmalloc(sizeof(eventfd_ctx_t));
     if (!ctx) { kfree(node); return (uint64_t)-12; }
@@ -154,8 +175,10 @@ static uint64_t sys_eventfd2(uint64_t initval, uint64_t flags, uint64_t a2,
 
     t->fds[fd]        = node;
     t->fd_offsets[fd] = 0;
-    t->fd_flags[fd]   = (flags & EFD_NONBLOCK ? O_NONBLOCK : 0) |
+    t->fd_flags[fd]   = O_RDWR |
+                        (flags & EFD_NONBLOCK ? O_NONBLOCK : 0) |
                         (flags & EFD_CLOEXEC ? FD_FLAGS_CLOEXEC_BIT : 0);
+    fd_path_set(t, fd, "anon_inode:[eventfd]");
     return fd;
 }
 
@@ -263,9 +286,17 @@ static uint32_t timerfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
             spinlock_release(&ctx->lock);
             return (uint32_t)-11;
         }
-        wait_queue_entry_t entry = {.thread = t, .next = NULL};
-        wait_queue_add(&ctx->wq, &entry);
+        wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
         t->state = THREAD_BLOCKED;
+        wait_queue_add(&ctx->wq, &entry);
+        if (ctx->expirations != 0) {
+            t->state = THREAD_RUNNING;
+            spinlock_release(&ctx->lock);
+            wait_queue_remove(&ctx->wq, &entry);
+            t->state = THREAD_RUNNING;
+            spinlock_acquire(&ctx->lock);
+            continue;
+        }
         spinlock_release(&ctx->lock);
         sched_yield();
         t->state = THREAD_RUNNING;
@@ -453,6 +484,7 @@ typedef struct {
     bool reader_open;
     bool writer_open;
     vfs_node_t *read_node;
+    vfs_node_t *write_node;
 } pipe_ctx_t;
 
 typedef struct {
@@ -463,9 +495,10 @@ typedef struct {
 static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                            uint8_t *buffer) {
     (void)offset;
+    if (size == 0) return 0;
     pipe_end_t *end = (pipe_end_t *)node->device;
     pipe_ctx_t *ctx = end ? end->ctx : NULL;
-    if (!ctx) return 0;
+    if (!ctx) return (uint32_t)-9; // EBADF
 
     spinlock_acquire(&ctx->lock);
     while (ctx->read_offset >= ctx->length) {
@@ -482,9 +515,17 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
             spinlock_release(&ctx->lock);
             return (uint32_t)-11;
         }
-        wait_queue_entry_t entry = {.thread = t, .next = NULL};
-        wait_queue_add(&ctx->wq, &entry);
+        wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
         t->state = THREAD_BLOCKED;
+        wait_queue_add(&ctx->wq, &entry);
+        if (ctx->read_offset < ctx->length || !ctx->writer_open) {
+            t->state = THREAD_RUNNING;
+            spinlock_release(&ctx->lock);
+            wait_queue_remove(&ctx->wq, &entry);
+            t->state = THREAD_RUNNING;
+            spinlock_acquire(&ctx->lock);
+            continue;
+        }
         spinlock_release(&ctx->lock);
         sched_yield();
         t->state = THREAD_RUNNING;
@@ -496,26 +537,87 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     storage.device = &ctx->ramfs;
     storage.length = ctx->length;
     int32_t ret = (int32_t)ramfs_read(&storage, ctx->read_offset, size, buffer);
+    vfs_node_t *wnode = NULL;
     if (ret > 0) {
         ctx->read_offset += (uint32_t)ret;
         if (ctx->read_offset >= ctx->length) {
             ctx->read_offset = 0;
             ctx->length = 0;
         }
+        wnode = ctx->writer_open ? ctx->write_node : NULL;
+        wait_queue_wake_all(&ctx->wq);
     }
     spinlock_release(&ctx->lock);
+    if (wnode)
+        epoll_notify_event(wnode, POLLOUT | POLLWRNORM);
     return (uint32_t)ret;
 }
 
 static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
                             uint8_t *buffer) {
     (void)offset;
+    if (size == 0) return 0;
     pipe_end_t *end = (pipe_end_t *)node->device;
     pipe_ctx_t *ctx = end ? end->ctx : NULL;
-    if (!ctx) return 0;
+    if (!ctx) return (uint32_t)-9; // EBADF
 
     spinlock_acquire(&ctx->lock);
-    if (!ctx->reader_open) { spinlock_release(&ctx->lock); return (uint32_t)-32; }
+    if (!ctx->reader_open) {
+        spinlock_release(&ctx->lock);
+        struct thread *t = sched_get_current();
+        if (t) t->pending_signals |= (1ULL << (SIGPIPE - 1));
+        return (uint32_t)-32;
+    }
+
+    // Limit pipe buffer to 64KB
+    while ((ctx->length - ctx->read_offset) >= 65536) {
+        struct thread *t = sched_get_current();
+        int fd = -1;
+        for (int i = 0; i < MAX_FDS; i++) {
+            if (t->fds[i] == node) { fd = i; break; }
+        }
+        if (fd != -1 && (t->fd_flags[fd] & 0x800)) {
+            spinlock_release(&ctx->lock);
+            return (uint32_t)-11; // EAGAIN
+        }
+        if (!ctx->reader_open) {
+            spinlock_release(&ctx->lock);
+            if (t) t->pending_signals |= (1ULL << (SIGPIPE - 1));
+            return (uint32_t)-32;
+        }
+        if (t && (t->pending_signals & ~t->signal_mask)) {
+            spinlock_release(&ctx->lock);
+            return (uint32_t)-4; // EINTR
+        }
+
+        wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
+        t->state = THREAD_BLOCKED;
+        wait_queue_add(&ctx->wq, &entry);
+        if ((ctx->length - ctx->read_offset) < 65536 || !ctx->reader_open) {
+            t->state = THREAD_RUNNING;
+            spinlock_release(&ctx->lock);
+            wait_queue_remove(&ctx->wq, &entry);
+            t->state = THREAD_RUNNING;
+            spinlock_acquire(&ctx->lock);
+            continue;
+        }
+        spinlock_release(&ctx->lock);
+        sched_yield();
+        t->state = THREAD_RUNNING;
+        wait_queue_remove(&ctx->wq, &entry);
+        spinlock_acquire(&ctx->lock);
+    }
+
+    // Compact unread data to offset 0
+    if (ctx->read_offset > 0) {
+        uint32_t unread = ctx->length - ctx->read_offset;
+        if (unread > 0 && ctx->ramfs.data) {
+            memmove(ctx->ramfs.data, ctx->ramfs.data + ctx->read_offset, unread);
+        }
+        ctx->length = unread;
+        ctx->read_offset = 0;
+    }
+
     vfs_node_t storage = {0};
     storage.device = &ctx->ramfs;
     storage.length = ctx->length;
@@ -530,7 +632,7 @@ static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
         return (uint32_t)ret;
     }
     spinlock_release(&ctx->lock);
-    return (uint32_t)ret;
+    return ret < 0 ? (uint32_t)ret : (uint32_t)-28; // -ENOSPC (never 0)
 }
 
 static int pipe_poll(vfs_node_t *node, int events) {
@@ -540,9 +642,16 @@ static int pipe_poll(vfs_node_t *node, int events) {
     int revents = 0;
     spinlock_acquire(&ctx->lock);
     if (!end->writer && ctx->length > ctx->read_offset) revents |= (POLLIN | POLLRDNORM);
-    if (!end->writer && !ctx->writer_open)              revents |= POLLHUP;
+    if (!end->writer && !ctx->writer_open) {
+        // EOF reads as readable: QProcess::waitForStarted polls POLLIN-only
+        // for the exec-time EOF from its CLOEXEC started-pipe. POLLHUP alone
+        // is filtered out of its check and the 30s wait expires as
+        // "Could not start program '/bin/bash'".
+        revents |= (POLLIN | POLLRDNORM | POLLHUP);
+    }
     if (end->writer && !ctx->reader_open)               revents |= POLLERR;
-    if (end->writer && ctx->reader_open)                revents |= (POLLOUT | POLLWRNORM);
+    if (end->writer && ctx->reader_open && (ctx->length - ctx->read_offset) < 65536)
+        revents |= (POLLOUT | POLLWRNORM);
     spinlock_release(&ctx->lock);
     /* poll(2) reports POLLERR and POLLHUP regardless of the requested mask.
      * A POLLIN-only reader must wake when the final pipe writer closes. */
@@ -557,6 +666,7 @@ static void pipe_close(vfs_node_t *node) {
     spinlock_acquire(&ctx->lock);
     if (end->writer) {
         ctx->writer_open = false;
+        ctx->write_node = NULL;
         if (ctx->reader_open && ctx->read_node)
             notify_read = ctx->read_node;
     } else {
@@ -620,8 +730,8 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
         return (uint64_t)-22; // EINVAL: unknown flag bits
 
     struct thread *t = sched_get_current();
-    if (!t || fd_in >= MAX_FDS || fd_out >= MAX_FDS || !t->fds[fd_in] ||
-        !t->fds[fd_out])
+    if (!t || fd_in >= MAX_FDS || fd_out >= MAX_FDS || !fd_is_valid_node(t->fds[fd_in]) ||
+        !fd_is_valid_node(t->fds[fd_out]))
         return (uint64_t)-9; // EBADF
 
     vfs_node_t *in_node = t->fds[fd_in];
@@ -673,16 +783,18 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
             return 0; // EOF: nothing to duplicate
         if (nonblock)
             return (uint64_t)-11; // EAGAIN
-        wait_queue_entry_t entry = {.thread = t, .next = NULL};
-        /* Re-check under the input lock before sleeping: pipe_read's pattern
-         * guards the wakeup race the same way. */
+        wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
+        /* BLOCKED before add + recheck under input lock. */
+        t->state = THREAD_BLOCKED;
         spinlock_acquire(&in_ctx->lock);
+        wait_queue_add(&in_ctx->wq, &entry);
         if (in_ctx->read_offset < in_ctx->length || !in_ctx->writer_open) {
+            t->state = THREAD_RUNNING;
             spinlock_release(&in_ctx->lock);
+            wait_queue_remove(&in_ctx->wq, &entry);
+            t->state = THREAD_RUNNING;
             continue;
         }
-        wait_queue_add(&in_ctx->wq, &entry);
-        t->state = THREAD_BLOCKED;
         spinlock_release(&in_ctx->lock);
         sched_yield();
         t->state = THREAD_RUNNING;
@@ -822,6 +934,7 @@ static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,
     read_node->close = write_node->close = pipe_close;
     read_node->wait_queue = write_node->wait_queue = &ctx->wq;
     ctx->read_node = read_node;
+    ctx->write_node = write_node;
 
     t->fds[fd_read] = read_node;
     t->fds[fd_write] = write_node;
@@ -853,8 +966,88 @@ static uint64_t sys_pipe(uint64_t pipefd_ptr, uint64_t a1, uint64_t a2,
 static void inotify_close(vfs_node_t *node) {
     if (!node || !node->device) return;
     inotify_instance_t *instance = (inotify_instance_t *)node->device;
+    /* Wake parked readers before the slot goes away; they re-validate the
+     * instance id on wake and fail cleanly instead of sleeping forever. */
+    wait_queue_wake_all(&instance->wq);
     memset(instance, 0, sizeof(*instance));
     node->device = NULL;
+}
+
+/* Level-triggered readiness: readable only while queued events exist.
+ * Previously the node had no poll callback at all, so the fd behaved
+ * according to its type default instead of its queue state. */
+static int inotify_poll(vfs_node_t *node, int events) {
+    inotify_instance_t *instance =
+        (inotify_instance_t *)(node ? node->device : NULL);
+    if (!instance) return 0;
+    int revents = 0;
+    spinlock_acquire(&instance->lock);
+    if (instance->queue_head != instance->queue_tail)
+        revents |= POLLIN;
+    spinlock_release(&instance->lock);
+    return revents & events;
+}
+
+/* Blocking read. No producer enqueues events yet, so the queue is empty and
+ * this parks (or returns -EAGAIN on O_NONBLOCK) instead of returning 0.
+ * Returning 0 means EOF to userspace: glib treats an inotify EOF as a dead
+ * descriptor, drops it and re-creates it, which is a 100% single-threaded
+ * poll/read spin for every GFileMonitor client (wireplumber included). */
+static uint32_t inotify_read(vfs_node_t *node, uint32_t offset, uint32_t size,
+                             uint8_t *buffer) {
+    (void)offset;
+    (void)buffer;
+    inotify_instance_t *instance =
+        (inotify_instance_t *)(node ? node->device : NULL);
+    if (!instance) return (uint32_t)-22;
+    if (size < 16) return (uint32_t)-22; /* sizeof(struct inotify_event) */
+
+    struct thread *t = sched_get_current();
+    int fd = -1;
+    if (t) {
+        for (int i = 0; i < MAX_FDS; i++) {
+            if (t->fds[i] == node) { fd = i; break; }
+        }
+    }
+
+    spinlock_acquire(&instance->lock);
+    for (;;) {
+        if (instance->instance_id == 0) {
+            spinlock_release(&instance->lock);
+            return (uint32_t)-9; /* closed under us */
+        }
+        if (instance->queue_head != instance->queue_tail) {
+            // No VFS producer decodes events yet: drop the stale markers and
+            // keep blocking instead of returning a fake 16-byte event with
+            // uninitialized userspace memory (glib would cache garbage).
+            instance->queue_head = instance->queue_tail;
+            // Fall through to blocking/EAGAIN handling below.
+        }
+        if (instance->queue_head == instance->queue_tail) {
+            if (fd != -1 && t && (t->fd_flags[fd] & O_NONBLOCK)) {
+                spinlock_release(&instance->lock);
+                return (uint32_t)-11; /* EAGAIN */
+            }
+            if (!t) {
+                spinlock_release(&instance->lock);
+                return (uint32_t)-11;
+            }
+            wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL,
+                                        .thread_next = NULL, .thread_prev = NULL};
+            t->state = THREAD_BLOCKED;
+            wait_queue_add(&instance->wq, &entry);
+            spinlock_release(&instance->lock);
+            sched_yield();
+            t->state = THREAD_RUNNING;
+            wait_queue_remove(&instance->wq, &entry);
+            if (thread_has_pending_signal(t))
+                return (uint32_t)-4; /* EINTR */
+            spinlock_acquire(&instance->lock);
+            continue;
+        }
+        spinlock_release(&instance->lock);
+        return (uint32_t)-11;
+    }
 }
 
 static uint64_t sys_inotify_init(uint64_t a1, uint64_t a2, uint64_t a3,
@@ -874,6 +1067,8 @@ static uint64_t sys_inotify_init(uint64_t a1, uint64_t a2, uint64_t a3,
     instance->instance_id = next_instance_id++;
     instance->num_watches = 0;
     instance->queue_head  = instance->queue_tail = 0;
+    spinlock_init(&instance->lock);
+    wait_queue_init(&instance->wq);
 
     int fd = alloc_fd(t);
     if (fd < 0) return (uint64_t)-24;
@@ -886,6 +1081,9 @@ static uint64_t sys_inotify_init(uint64_t a1, uint64_t a2, uint64_t a3,
     node->impl  = instance->instance_id;
     node->device = instance;
     node->close = inotify_close;
+    node->poll = inotify_poll;
+    node->read = inotify_read;
+    node->wait_queue = &instance->wq;
     node->name[0] = '\0';
     strcat(node->name, "inotify");
 
@@ -1138,7 +1336,7 @@ static uint64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags_arg,
     t->fd_offsets[fd] = 0;
     /* Set the descriptor flags explicitly: the slot may still hold the flags of
      * whatever descriptor number was reused. */
-    t->fd_flags[fd]   = (flags_arg & MFD_CLOEXEC) ? FD_FLAGS_CLOEXEC_BIT : 0;
+    t->fd_flags[fd]   = O_RDWR | ((flags_arg & MFD_CLOEXEC) ? FD_FLAGS_CLOEXEC_BIT : 0);
     fd_path_set(t, fd, node_name);
 
     return (uint64_t)fd;

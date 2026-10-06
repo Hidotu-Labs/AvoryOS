@@ -381,6 +381,17 @@ static const char *thread_state_name(thread_state_t state) {
 
 static volatile uint32_t user_fault_detail_count;
 
+/* Serializes the multi-line fault dumps. Concurrent faults from several
+ * threads (llvmpipe workers, JVM GC threads) otherwise interleave klog
+ * fragments into unreadable soup. try_acquire only: kfence-style, never
+ * block in the fault path — losers skip logging but still queue delivery
+ * and record /dev/faults. */
+/* This is a try-only diagnostic gate, never a blocking raw lock. Preserve
+ * the caller's interrupt state: masking IRQs across the entire dump delays
+ * TLB acknowledgements for hundreds of milliseconds during a userspace
+ * abort. A preempted reporter is safe because contenders simply skip it. */
+static rawspinlock_t user_fault_log_lock = RAWSPINLOCK_INIT;
+
 /* ── Fault-address VMA neighborhood diagnostics ──────────────────────────
  * A bare "[no VMA]" on CR2/RSP cannot tell a genuine stack overflow from a
  * truncated mapping, so snapshot the surrounding VMAs while holding mm->lock
@@ -601,6 +612,8 @@ void isr_report_user_fault(struct registers *regs, int sig,
                            uint64_t addr) {
   struct thread *current = sched_get_current();
   if (current) {
+    /* Serialize multi-line dumps; losers still capture/queue/record. */
+    bool have_fault_log = rawspinlock_try_acquire(&user_fault_log_lock);
     /* A blocked synchronous SIGSEGV may only be delivered at a later syscall
      * boundary. Keep the exception frame so that deferred delivery and crash
      * reports describe the actual faulting instruction, not that syscall. */
@@ -615,6 +628,61 @@ void isr_report_user_fault(struct registers *regs, int sig,
       captured_sync_fault = true;
     }
 
+    /* Synchronous faults cannot make progress while blocked: returning to the
+     * faulting RIP just re-faults immediately. Linux force-kills in this
+     * case. Without this, a SIGSEGV inside a SIGSEGV handler (e.g. KDE's
+     * libKF6Crash handler faulting on null at +0x51C1 while SIGSEGV is
+     * blocked via SA_NODEFER==0) re-queues forever and spams:
+     *   [SIGNAL] Exception 11 ... comm='systemsettings' ... addr=0x0
+     * The same applies to a second sync fault before sigreturn (recursive
+     * handler crash): fault_regs_valid is still set from the first fault. */
+    if (is_sync && sig >= 1 && sig <= 64) {
+      uint64_t sig_bit = (1ULL << (sig - 1));
+      bool blocked = (current->signal_mask & sig_bit) != 0;
+      /* fault_regs_valid && !captured means a previous sync fault hasn't
+       * sigreturned yet. That's only a recursive handler crash if the new
+       * fault is at a *different* location: signal_deliver()'s DFL path
+       * re-calls isr_report_user_fault() with the same regs for the detailed
+       * dump, which must not be mistaken for recursion. */
+      bool same_fault = current->fault_regs_valid &&
+                        regs->rip == current->fault_regs.rip &&
+                        addr == current->fault_addr;
+      bool recursive = current->fault_regs_valid && !captured_sync_fault &&
+                       !same_fault;
+      if (blocked || recursive) {
+        if (have_fault_log) {
+          klog_puts("[SIGNAL] Sync fault ");
+          klog_uint64((uint64_t)sig);
+          klog_puts(" (");
+          klog_puts(get_signal_name(sig));
+          klog_puts(blocked ? ") while blocked" : ") recursive in handler");
+          klog_puts(" comm='");
+          klog_puts(current->comm);
+          klog_puts("' tid=");
+          klog_uint64(current->tid);
+          klog_puts(" rip=");
+          klog_hex64(regs->rip);
+          klog_resolve_fault_address(current, regs->rip);
+          klog_puts(" addr=");
+          klog_hex64(addr);
+          if (recursive && current->fault_regs_valid) {
+            klog_puts(" first_rip=");
+            klog_hex64(current->fault_regs.rip);
+            klog_resolve_fault_address(current, current->fault_regs.rip);
+          }
+          klog_puts("; terminating (handler would loop)\n");
+        }
+        fault_log_add(regs, sig, addr);
+        current->fault_addr = addr;
+        current->fault_code = (uint32_t)regs->err_code;
+        current->exit_status = 128 + sig;
+        if (have_fault_log)
+          rawspinlock_release(&user_fault_log_lock);
+        sched_terminate_thread_group(current);
+        process_do_exit(128 + sig);
+      }
+    }
+
     bool has_custom_handler = false;
     if (sig >= 1 && sig <= 64) {
       void *handler = (void *)current->signal_handlers[sig - 1].sa_handler;
@@ -625,25 +693,116 @@ void isr_report_user_fault(struct registers *regs, int sig,
 
     if (has_custom_handler) {
       if (is_sync) {
-        klog_puts("[SIGNAL] Exception ");
-        klog_uint64(sig);
-        klog_puts(" (");
-        klog_puts(get_signal_name(sig));
-        klog_puts(") to custom handler comm='");
-        klog_puts(current->comm);
-        klog_puts("' tid=");
-        klog_uint64(current->tid);
-        klog_puts(" rip=");
-        klog_hex64(regs->rip);
-        klog_resolve_fault_address(current, regs->rip);
-        klog_puts(" addr=");
-        klog_hex64(addr);
-        klog_puts("\n");
+        /* Rate-limit: the handler-crash loop used to spam this line
+         * thousands of times (same tid/rip/addr). Dedup identical faults
+         * and sample the rest. last_report_* is shared with the DFL path
+         * so a custom->DFL transition doesn't reset the suppression. */
+        if (current->last_report_sig == sig &&
+            current->last_report_rip == regs->rip &&
+            current->last_report_addr == addr) {
+          /* Still queue for delivery below; just don't log again. */
+        } else {
+          current->last_report_sig = sig;
+          current->last_report_rip = regs->rip;
+          current->last_report_addr = addr;
+          uint32_t seen = __atomic_add_fetch(&user_fault_detail_count, 1,
+                                             __ATOMIC_RELAXED);
+          if (!have_fault_log) {
+            /* Another CPU/thread is dumping; delivery + /dev/faults below
+             * still happen, we just don't interleave klog fragments. */
+          } else if (seen <= 8 || (seen & 0xFFu) == 0) {
+            klog_puts("[SIGNAL] Exception ");
+            klog_uint64(sig);
+            klog_puts(" (");
+            klog_puts(get_signal_name(sig));
+            klog_puts(") to custom handler comm='");
+            klog_puts(current->comm);
+            klog_puts("' tid=");
+            klog_uint64(current->tid);
+            klog_puts(" rip=");
+            klog_hex64(regs->rip);
+            klog_resolve_fault_address(current, regs->rip);
+            klog_puts(" addr=");
+            klog_hex64(addr);
+            klog_puts(" count=");
+            klog_uint64(seen);
+            klog_puts("\n");
+            /* First few custom-handler faults also get a compact
+             * register/stack dump: without it a Qt/QML null-deref
+             * (e.g. QV4::MemoryManager) is undebuggable from one line. */
+            if (seen <= 4) {
+              klog_puts("  VECTOR: "); klog_uint64(regs->int_no);
+              klog_puts("  ERR: "); klog_hex64(regs->err_code);
+              klog_puts("  CS: "); klog_hex64(regs->cs);
+              klog_puts("\n");
+              if (regs->int_no == 14)
+                klog_page_fault_bits(regs->err_code);
+              isr_report_vma_neighborhood(current, addr, regs->rsp);
+              klog_rflags_decoded(regs->rflags);
+              klog_puts("REGISTERS:\n");
+              klog_puts("  RAX="); klog_hex64(regs->rax); klog_puts(" RBX="); klog_hex64(regs->rbx);
+              klog_puts(" RCX="); klog_hex64(regs->rcx); klog_puts(" RDX="); klog_hex64(regs->rdx);
+              klog_puts("\n  RSI="); klog_hex64(regs->rsi); klog_puts(" RDI="); klog_hex64(regs->rdi);
+              klog_puts(" RBP="); klog_hex64(regs->rbp); klog_puts(" RSP="); klog_hex64(regs->rsp);
+              klog_puts("\n  R8 ="); klog_hex64(regs->r8);  klog_puts(" R9 ="); klog_hex64(regs->r9);
+              klog_puts(" R10="); klog_hex64(regs->r10); klog_puts(" R11="); klog_hex64(regs->r11);
+              klog_puts("\n  R12="); klog_hex64(regs->r12); klog_puts(" R13="); klog_hex64(regs->r13);
+              klog_puts(" R14="); klog_hex64(regs->r14); klog_puts(" R15="); klog_hex64(regs->r15);
+              klog_puts("\n");
+              uint64_t *pml4 = vmm_get_active_pml4();
+              klog_puts("CODE AT RIP: ");
+              for (int i = -8; i < 24; i++) {
+                uint64_t vaddr = regs->rip + i;
+                uint64_t kaddr;
+                if (klog_user_kaddr(pml4, vaddr, &kaddr)) {
+                  uint8_t b = *(uint8_t*)kaddr;
+                  if (i == 0) klog_puts(">");
+                  const char *_h = "0123456789ABCDEF";
+                  klog_putchar(_h[(b >> 4) & 0xF]);
+                  klog_putchar(_h[b & 0xF]);
+                  if (i == 0) klog_puts("<");
+                  klog_putchar(' ');
+                } else {
+                  klog_puts("?? ");
+                }
+              }
+              klog_puts("\nUSER STACK (RSP):\n");
+              /* Deep dump: ply_event_loop_stop_watching_fd buries its return
+               * address ~264B above RSP (0xB8 locals + pushes + snprintf
+               * temporaries). 8 entries only show logger args (file/line
+               * strings like 0x11253/0x130A0), never the caller. */
+              for (int i = 0; i < 40; i++) {
+                uint64_t saddr = regs->rsp + (i * 8);
+                uint64_t kaddr;
+                klog_puts("  ["); klog_hex64(saddr); klog_puts("] = ");
+                if (klog_user_kaddr(pml4, saddr, &kaddr)) {
+                  uint64_t val = *(uint64_t*)kaddr;
+                  klog_hex64(val);
+                  klog_resolve_fault_address(current, val);
+                } else {
+                  klog_puts("<unmapped>");
+                }
+                klog_puts("\n");
+              }
+              const char *sc_name = syscall_get_name(current->last_syscall_num);
+              klog_puts("LAST SYSCALL: ");
+              klog_puts(sc_name ? sc_name : "unknown");
+              klog_puts(" ("); klog_uint64(current->last_syscall_num); klog_puts(") -> ");
+              klog_int64(current->last_syscall_ret); klog_puts("\n");
+              klog_puts("EXE: "); klog_puts(current->exe_path[0] ? current->exe_path : "?"); klog_puts("\n");
+            }
+          } else if (seen == 9) {
+            klog_puts("[SIGNAL] repeated custom-handler faults suppressed; "
+                      "sampling every 256th (counter is global)\n");
+          }
+        }
       }
     } else {
       if (current->last_report_sig == sig &&
           current->last_report_rip == regs->rip &&
           current->last_report_addr == addr) {
+        if (have_fault_log)
+          rawspinlock_release(&user_fault_log_lock);
         return;
       }
       current->last_report_sig = sig;
@@ -651,7 +810,7 @@ void isr_report_user_fault(struct registers *regs, int sig,
       current->last_report_addr = addr;
       uint32_t seen = __atomic_add_fetch(&user_fault_detail_count, 1,
                                          __ATOMIC_RELAXED);
-      if (seen <= 4) {
+      if (seen <= 4 && have_fault_log) {
       // 1. Log detailed report to kernel console
       klog_puts("\n" KLOG_CLR_RED "################################################################################" KLOG_CLR_RESET "\n");
       klog_puts(KLOG_CLR_RED "[ USER FAULT ]" KLOG_CLR_RESET " process '");
@@ -967,9 +1126,9 @@ void isr_report_user_fault(struct registers *regs, int sig,
       }
       klog_puts("\n");
 
-      // Stack Snapshot
+      // Stack Snapshot (deep: captures callers buried under large frames)
       klog_puts("USER STACK (RSP):\n");
-      for (int i = 0; i < 16; i++) {
+      for (int i = 0; i < 48; i++) {
           uint64_t saddr = regs->rsp + (i * 8);
           uint64_t kaddr;
           klog_puts("  ["); klog_hex64(saddr); klog_puts("] = ");
@@ -1006,6 +1165,39 @@ void isr_report_user_fault(struct registers *regs, int sig,
           curr_rbp = next_rbp;
       }
 
+      /* Stack scan for return addresses: when RBP is corrupt (e.g. 0x40
+       * wild watch in ply_event_loop_stop_watching_fd) the RBP chain is
+       * empty, but return addresses remain on the stack in executable
+       * VMAs. Scan the dumped range and report plausible callers. */
+      klog_puts("USER STACK CALLERS (scan):\n");
+      for (int i = 0; i < 48; i++) {
+          uint64_t saddr = regs->rsp + (i * 8);
+          uint64_t kaddr;
+          if (!klog_user_kaddr(pml4, saddr, &kaddr))
+              continue;
+          uint64_t val = *(uint64_t*)kaddr;
+          if (val < 0x1000 || val >= 0x0000800000000000ULL)
+              continue;
+          struct vma *rv = NULL;
+          if (current->mm)
+              rv = vma_find(&current->mm->vmas, val);
+          if (!rv)
+              continue;
+          /* Only executable mappings can be return addresses; this skips
+           * rodata strings like 0x11253/0x130A0 that otherwise flood the
+           * scan (they are logger file/func args, not callers). */
+          if (!(rv->prot & 0x4))
+              continue;
+          /* Heuristic: return address must be in executable mapping and
+           * 8-byte aligned Stack content; skip the faulting RIP itself. */
+          if (val == regs->rip)
+              continue;
+          klog_puts("  ["); klog_hex64(saddr); klog_puts("] ret=");
+          klog_hex64(val);
+          klog_resolve_fault_address(current, val);
+          klog_puts("\n");
+      }
+
       // Process context extra info
       klog_puts("\nPROCESS EXTRA INFO:\n");
       klog_puts("  EXE: "); klog_puts(current->exe_path[0] ? current->exe_path : "?"); klog_puts("\n");
@@ -1016,7 +1208,7 @@ void isr_report_user_fault(struct registers *regs, int sig,
       klog_puts("\n");
 
       klog_puts(KLOG_CLR_RED "################################################################################" KLOG_CLR_RESET "\n");
-      } else if (seen <= 8 || (seen & 0xFFu) == 0) {
+      } else if (have_fault_log && (seen <= 8 || (seen & 0xFFu) == 0)) {
         klog_puts("[USERFAULT] process='");
         klog_puts(current->comm);
         klog_puts("' tid=");
@@ -1032,7 +1224,7 @@ void isr_report_user_fault(struct registers *regs, int sig,
         klog_puts(" count=");
         klog_uint64(seen);
         klog_puts("\n");
-      } else if (seen == 9) {
+      } else if (have_fault_log && seen == 9) {
         klog_puts("[USERFAULT] repeated detailed reports suppressed; "
                   "sampling every 256th (counter is global)\n");
       }
@@ -1049,6 +1241,8 @@ void isr_report_user_fault(struct registers *regs, int sig,
       current->fault_code = (uint32_t)regs->err_code;
     }
     current->pending_signals |= (1ULL << (sig - 1));
+    if (have_fault_log)
+      rawspinlock_release(&user_fault_log_lock);
   } else {
     isr_panic(regs, "User fault with no thread context");
   }
@@ -1206,4 +1400,17 @@ void isr_handler(struct registers *regs) {
    * a reschedule request can switch away from this interrupt frame. */
   if (is_hw_irq)
     sched_check_resched((regs->cs & 0x3) == 0x3);
+
+  /* rseq: an IRQ (e.g. the timer) may have preempted a restartable critical
+   * section or migrated this thread. Publish the current CPU and abort the
+   * section before returning to ring 3. Signal delivery above already ran;
+   * if it redirected RIP to a handler, the abort check harmlessly no-ops,
+   * and the post-handler resume is covered by the syscall/sigreturn hooks. */
+  if ((regs->cs & 0x3) == 0x3) {
+    struct thread *rt = sched_get_current();
+    if (rt) {
+      rseq_update_cpu_id(rt);
+      rseq_maybe_abort(rt, &regs->rip);
+    }
+  }
 }

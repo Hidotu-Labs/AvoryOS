@@ -87,9 +87,36 @@ bool cpu_has_xsave(void) {
   return (feat_1_ecx & (1U << 26)) != 0; // CPUID.01H:ECX.XSAVE[bit 26]
 }
 
+bool cpu_has_avx(void);
 bool cpu_has_avx(void) {
   features_ensure_probed();
   return (feat_1_ecx & (1U << 28)) != 0; // CPUID.01H:ECX.AVX[bit 28]
+}
+
+bool cpu_has_avx2(void) {
+  features_ensure_probed();
+  if (feat_max_leaf < 7)
+    return false;
+  bool feat = (feat_7_0_ebx & (1U << 5)) != 0; // CPUID.07H:EBX.AVX2[bit 5]
+  uint64_t xmask = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE);
+  return feat && ((xmask & 6ULL) == 6ULL); // Requires XCR0 bits 1 & 2 (SSE + AVX)
+}
+
+bool cpu_has_avx512(void) {
+  features_ensure_probed();
+  if (feat_max_leaf < 7)
+    return false;
+  bool feat = (feat_7_0_ebx & (1U << 16)) != 0; // CPUID.07H:EBX.AVX512F[bit 16]
+  const uint64_t avx512_state = (1ULL << 5) | (1ULL << 6) | (1ULL << 7);
+  uint64_t xmask = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE);
+  return feat && ((xmask & avx512_state) == avx512_state);
+}
+
+bool cpu_has_erms(void) {
+  features_ensure_probed();
+  if (feat_max_leaf < 7)
+    return false;
+  return (feat_7_0_ebx & (1U << 9)) != 0; // CPUID.07H:EBX.ERMS[bit 9]
 }
 
 static inline void __attribute__((unused)) xsetbv(uint32_t index, uint64_t value) {

@@ -159,8 +159,8 @@ static uint32_t evdev_vfs_read(struct vfs_node *node, uint32_t offset,
     }
 
     // No data, must block.
-    wait_queue_add(&dev->wait, entry);
     t->state = THREAD_BLOCKED;
+    wait_queue_add(&dev->wait, entry);
 
     // Check one last time while state is BLOCKED and we still hold the lock.
     // If an event comes now, it's either already here (seen by this check)

@@ -54,12 +54,19 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
 
   unix_sock_t *dusk = unix_find_socket_by_addr_ref(sun, addrlen);
   if (!dusk) {
-    uint32_t seen = __atomic_add_fetch(&unix_missing_destination_logs, 1,
-                                       __ATOMIC_RELAXED);
-    bool log_missing = seen <= 8 || (seen & 0x7Fu) == 0;
-    if (seen == 9)
-      klog_puts("[WARN] repeated missing AF_UNIX destinations suppressed; "
-                "sampling every 128th (counter is global)\n");
+    bool is_benign = (sun->sun_path[0] != '\0') &&
+      (strcmp(sun->sun_path, "/dev/log") == 0 ||
+       strncmp(sun->sun_path, "/run/systemd/journal", 20) == 0 ||
+       strncmp(sun->sun_path, "/var/run/nscd", 13) == 0 ||
+       strncmp(sun->sun_path, "/run/nscd", 9) == 0);
+
+    uint32_t seen = 0;
+    if (!is_benign) {
+      seen = __atomic_add_fetch(&unix_missing_destination_logs, 1, __ATOMIC_RELAXED);
+    }
+    bool log_missing = !is_benign && (seen <= 5);
+    if (!is_benign && seen == 6)
+      klog_puts("[WARN] repeated missing AF_UNIX destinations suppressed\n");
     if (log_missing)
       klog_puts("[WARN] unix_connect: destination not found: \"");
     if (sun->sun_path[0] == '\0') {
@@ -92,6 +99,14 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
     return -111; // ECONNREFUSED
   }
 
+  if (dusk->is_syslog_sink) {
+    usk->peer = dusk;
+    sock->state = SS_CONNECTED;
+    usk->was_connected = true;
+    socket_put(listener_sock);
+    return 0;
+  }
+
   if (listener_sock->state != SS_LISTENING) {
     klog_puts("[WARN] unix_connect: destination is not listening\n");
     socket_put(listener_sock);
@@ -119,6 +134,17 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
   server_sock->state = SS_CONNECTED;
   usk->was_connected        = true;
   server_usk->was_connected = true;
+  // Preliminary peer-cred snapshot; the client side is refreshed at accept()
+  // once the daemon owns the accepted socket, and both sides refresh again
+  // on every successful live SO_PEERCRED query.
+  usk->peer_cred_pid = server_usk->owner_pid;
+  usk->peer_cred_uid = server_usk->owner_uid;
+  usk->peer_cred_gid = server_usk->owner_gid;
+  usk->peer_cred_valid = true;
+  server_usk->peer_cred_pid = usk->owner_pid;
+  server_usk->peer_cred_uid = usk->owner_uid;
+  server_usk->peer_cred_gid = usk->owner_gid;
+  server_usk->peer_cred_valid = true;
 
   spinlock_acquire(&listener_sock->lock);
 
@@ -193,16 +219,28 @@ int unix_accept_impl(socket_t *sock, socket_t **newsock) {
     wait_queue_entry_t entry;
     entry.thread = current;
     entry.next   = NULL;
+    entry.wq = NULL;
+    entry.thread_next = NULL;
+    entry.thread_prev = NULL;
 
-    wait_queue_add(usk->wait, &entry);
     current->state = THREAD_BLOCKED;
+    wait_queue_add(usk->wait, &entry);
+    /* Recheck under sock->lock: connect+wake between the first empty
+     * check and the add would otherwise be lost. */
+    if (usk->accept_next != NULL) {
+      current->state = THREAD_RUNNING;
+      spinlock_release(&sock->lock);
+      wait_queue_remove(usk->wait, &entry);
+      current->state = THREAD_RUNNING;
+      spinlock_acquire(&sock->lock);
+    } else {
+      spinlock_release(&sock->lock);
+      sched_yield();
+      wait_queue_remove(usk->wait, &entry);
+      current->state = THREAD_RUNNING;
 
-    spinlock_release(&sock->lock);
-    sched_yield();
-    wait_queue_remove(usk->wait, &entry);
-    current->state = THREAD_RUNNING;
-
-    spinlock_acquire(&sock->lock);
+      spinlock_acquire(&sock->lock);
+    }
   }
 
   unix_sock_t *new_usk   = usk->accept_next;
@@ -219,6 +257,21 @@ int unix_accept_impl(socket_t *sock, socket_t **newsock) {
     new_usk->owner_pid = current_thread->tgid;
     new_usk->owner_uid = current_thread->euid;
     new_usk->owner_gid = current_thread->egid;
+  }
+  // Refresh the client side's disconnect cache now that the daemon owns the
+  // accepted socket (at connect time its owner was still the connector).
+  {
+    unix_sock_t *client_usk = new_usk->peer;
+    if (client_usk) {
+      client_usk->peer_cred_pid = new_usk->owner_pid;
+      client_usk->peer_cred_uid = new_usk->owner_uid;
+      client_usk->peer_cred_gid = new_usk->owner_gid;
+      client_usk->peer_cred_valid = true;
+      new_usk->peer_cred_pid = client_usk->owner_pid;
+      new_usk->peer_cred_uid = client_usk->owner_uid;
+      new_usk->peer_cred_gid = client_usk->owner_gid;
+      new_usk->peer_cred_valid = true;
+    }
   }
 
   *newsock = new_sock;

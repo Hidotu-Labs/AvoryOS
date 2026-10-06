@@ -128,6 +128,69 @@ struct acpi_mcfg *acpi_get_mcfg(void) {
   return (struct acpi_mcfg *)acpi_find_table("MCFG");
 }
 
+struct acpi_srat *acpi_get_srat(void) {
+  return (struct acpi_srat *)acpi_find_table("SRAT");
+}
+
+struct acpi_slit *acpi_get_slit(void) {
+  return (struct acpi_slit *)acpi_find_table("SLIT");
+}
+
+void *acpi_early_find_table(struct limine_rsdp_response *response,
+                            uint64_t hhdm_offset, const char *signature) {
+  if (!response || !response->address)
+    return NULL;
+
+  struct acpi_rsdp *p_rsdp = (struct acpi_rsdp *)response->address;
+  struct acpi_sdt_header *root = NULL;
+  bool is_xsdt = false;
+
+  if (p_rsdp->revision >= 2) {
+    struct acpi_rsdp_ext *rsdp_ext = (struct acpi_rsdp_ext *)p_rsdp;
+    if (acpi_validate_checksum(rsdp_ext, rsdp_ext->length)) {
+      is_xsdt = true;
+      root = (struct acpi_sdt_header *)(rsdp_ext->xsdt_address + hhdm_offset);
+    }
+  }
+
+  if (!is_xsdt) {
+    if (acpi_validate_checksum(p_rsdp, 20)) {
+      root = (struct acpi_sdt_header *)((uint64_t)p_rsdp->rsdt_address + hhdm_offset);
+    } else {
+      return NULL;
+    }
+  }
+
+  if (!root || !acpi_validate_checksum(root, root->length))
+    return NULL;
+
+  size_t entries = (root->length - sizeof(struct acpi_sdt_header));
+  if (is_xsdt) {
+    entries /= 8;
+    struct acpi_xsdt *xsdt = (struct acpi_xsdt *)root;
+    for (size_t i = 0; i < entries; i++) {
+      struct acpi_sdt_header *hdr =
+          (struct acpi_sdt_header *)(xsdt->pointers[i] + hhdm_offset);
+      if (strncmp(hdr->signature, signature, 4) == 0) {
+        if (acpi_validate_checksum(hdr, hdr->length))
+          return hdr;
+      }
+    }
+  } else {
+    entries /= 4;
+    struct acpi_rsdt *rsdt = (struct acpi_rsdt *)root;
+    for (size_t i = 0; i < entries; i++) {
+      struct acpi_sdt_header *hdr =
+          (struct acpi_sdt_header *)((uint64_t)rsdt->pointers[i] + hhdm_offset);
+      if (strncmp(hdr->signature, signature, 4) == 0) {
+        if (acpi_validate_checksum(hdr, hdr->length))
+          return hdr;
+      }
+    }
+  }
+  return NULL;
+}
+
 // FADT Data
 static struct acpi_fadt *fadt_table = NULL;
 

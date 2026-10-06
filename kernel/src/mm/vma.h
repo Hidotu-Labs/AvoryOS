@@ -43,6 +43,11 @@ struct vma {
    * the last one drops (kernel/linuxkpi/src/mmap.c). */
   void *linux_vma;
 
+  // NUMA Memory Policy
+  int numa_policy;
+  uint64_t numa_nodemask;
+  int numa_preferred_node;
+
   int height; // AVL Balance Height Tracker
   struct vma *left;
   struct vma *right;

@@ -343,6 +343,11 @@ bool klog_path_is_browser(const char *path) {
                   strstr(path, "mocktail") || strstr(path, "MiniBrowser"));
 }
 
+bool klog_path_is_sddm(const char *path) {
+  return path && (strstr(path, "sddm") || strstr(path, "Xorg") ||
+                  strstr(path, "sddm-greeter") || strstr(path, "sddm-helper"));
+}
+
 void klog_proc_exec(uint32_t tid, const char *path) {
   if (klog_path_is_browser(path)) {
     char note[160];

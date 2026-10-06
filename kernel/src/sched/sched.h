@@ -5,6 +5,7 @@
 #include "../fs/vfs.h"
 #include "../lib/rbtree.h"
 #include "../mm/vma.h"
+#include "../mm/mempolicy.h"
 #include "eevfd.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -256,6 +257,7 @@ struct thread {
   struct k_sigaction signal_handlers[64];
   uint64_t pending_signals;
   uint32_t signal_sender_pid[64];
+  int32_t signal_sender_code[64]; /* SI_USER or SI_TKILL for queued signals */
   int pdeath_signal;
   uint32_t tracer_tid; // ptrace tracer tid (0 = not traced)
   uint64_t signal_mask;
@@ -299,6 +301,7 @@ struct thread {
       runtime_total; // Total CPU time consumed (in LAPIC ticks, 1 tick = 1ms)
   uint64_t runtime_user_ms;
   uint64_t runtime_system_ms;
+  uint64_t start_time_ms;
   bool in_syscall;
   uint64_t runtime_burst; // CPU time used in current quantum (for MLFQ)
   char comm[16];          // Executable name (basename, max 15 chars + NUL)
@@ -314,6 +317,15 @@ struct thread {
   uint64_t last_syscall_num;
   uint64_t last_syscall_args[6];
   int64_t last_syscall_ret;
+  /* Last ppoll/poll/select timeout seen on entry (raw timespec). Lets
+   * /proc/PID/syscall distinguish "userspace asked for zero" from
+   * "kernel expired early" on event-loop spins. */
+  int64_t last_poll_sec;
+  int64_t last_poll_nsec;
+  uint64_t last_poll_nfds;
+  int32_t last_poll_fds[8];
+  int16_t last_poll_events[8];
+  char last_poll_paths[8][48];
 
   // Futex parking diagnostics (lock/lockdiag.c).  A thread blocked on a futex
   // with no timeout armed is the shape of a lost wakeup, and these three are
@@ -346,15 +358,25 @@ struct thread {
   uint32_t kpi_irq_depth;
   uint32_t kpi_softirq_depth;
 
-  /* Browser syscall tracing (debug builds, SYSCALL_LOG=2).  Set when this
-   * task execs something under badwolf/WebKit/bwrap and inherited by its
-   * children, so the whole browser process tree can be traced without
+  /* Filtered syscall tracing (debug builds, SYSCALL_LOG=2/3).  Set when this
+   * task execs a matching path (browser or sddm/Xorg) and inherited by its
+   * children, so the whole process tree can be traced without
    * drowning the log in every other process.  Appended at the end: assembly
    * pins offsets earlier in this struct, not these. */
   bool trace_syscalls;
   uint64_t last_error_syscall_num;
   char last_error_path[128];
   char last_stderr[256];
+
+  // NUMA Memory Policy
+  struct mempolicy numa_policy;
+
+  /* Restartable sequences (rseq(2)) per-thread registration. Appended at
+   * the end: assembly pins offsets earlier in this struct, not these.
+   * rseq_addr is a user pointer to struct rseq (0 = not registered). */
+  uint64_t rseq_addr;
+  uint32_t rseq_len;
+  uint32_t rseq_sig;
 };
 
 /*
@@ -370,8 +392,18 @@ struct sched_thread_snapshot {
   uint64_t runtime_total;
   uint64_t runtime_user_ms;
   uint64_t runtime_system_ms;
+  uint64_t start_time_ms;
   uint32_t uid, gid, euid, egid, suid, sgid;
   uint32_t cpu_index;
+  uint64_t last_syscall_num;
+  int64_t last_syscall_ret;
+  uint64_t last_syscall_args[6];
+  int64_t last_poll_sec;
+  int64_t last_poll_nsec;
+  uint64_t last_poll_nfds;
+  int32_t last_poll_fds[8];
+  int16_t last_poll_events[8];
+  char last_poll_paths[8][48];
   char comm[16];
   char exe_path[256];
   char cwd_path[256];
@@ -400,6 +432,16 @@ void sched_itimer_disarm(struct thread *t);
 /* Deferred preemption point for the interrupt and syscall return paths.
  * to_user is true when the caller is about to return to ring 3. */
 void sched_check_resched(bool to_user);
+
+/* Restartable sequences (rseq(2)): refresh user cpu_id/node_id for the
+ * current CPU. Fault-safe (uses copy_to_user); no-op when unregistered.
+ * Returns true when the user area was updated (or no registration exists). */
+bool rseq_update_cpu_id(struct thread *t);
+
+/* If *rip_inout lies inside an active rseq critical section, redirect it to
+ * the section's abort_ip and clear rseq_cs. Returns true when redirected.
+ * Fault-safe: any user-memory fault means "leave RIP alone". */
+bool rseq_maybe_abort(struct thread *t, uint64_t *rip_inout);
 
 // Returns the current thread *for the CPU currently executing this code*
 struct thread *sched_get_current(void);
@@ -438,6 +480,9 @@ bool sched_get_nth_thread_tid(uint32_t index, uint32_t *tid);
 bool sched_get_nth_open_fd(uint32_t tid, uint32_t index, uint32_t *fd);
 bool sched_get_fd_path_snapshot(uint32_t tid, uint32_t fd, char *path,
                                 size_t path_size);
+bool sched_get_fd_info_snapshot(uint32_t tid, uint32_t fd, uint64_t *out_pos,
+                                uint32_t *out_flags, uint32_t *out_ino,
+                                bool *out_is_pidfd, uint32_t *out_target_pid);
 
 // Reap a zombie thread (remove from runqueue, free resources)
 void sched_reap_thread(struct thread *t);
@@ -470,17 +515,38 @@ struct thread *sched_get_thread_list_head(void);
 // Reparent children to init
 void sched_reparent_children(struct thread *parent);
 
+// Reap dead orphaned zombies attached to init
+void sched_reap_orphaned_zombies(void);
+
 int alloc_fd(struct thread *t);
 
 /*
- * Returns true if the calling thread has at least one unmasked pending signal.
+ * Returns true if the calling thread has an actionable unmasked signal.
  * Used by blocking syscalls to break out of their wait loops and return
  * -EINTR, allowing signal delivery before re-entering the syscall.
  */
 static inline bool thread_has_pending_signal(struct thread *t) {
   if (!t) return false;
   uint64_t unmaskable = (1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1));
-  return (t->pending_signals & (~t->signal_mask | unmaskable)) != 0;
+  uint64_t pending = t->pending_signals & (~t->signal_mask | unmaskable);
+  if (pending & unmaskable)
+    return true;
+  while (pending) {
+    unsigned index = (unsigned)__builtin_ctzll(pending);
+    pending &= pending - 1;
+    const struct k_sigaction *action = &t->signal_handlers[index];
+    if (action->sa_handler == (void *)SIG_IGN)
+      continue;
+    unsigned sig = index + 1;
+    /* Keep default-ignore signals pending for signalfd, but do not turn a
+     * pidfd/event-loop wake into EINTR merely because the same child exit
+     * also queued an unhandled SIGCHLD. Match signal_deliver's ignore list. */
+    if (action->sa_handler == (void *)SIG_DFL &&
+        (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH))
+      continue;
+    return true;
+  }
+  return false;
 }
 
 // Userspace Management

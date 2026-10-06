@@ -17,6 +17,7 @@
 #include "../mm/pcid.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
+#include "../mm/numa.h"
 #include "../smp/cpu.h"
 
 extern void switch_context(struct thread *old_t, struct thread *new_t);
@@ -178,10 +179,9 @@ static uint32_t sched_cpu_load(struct cpu_info *cpu) {
 }
 
 static struct cpu_info *sched_least_loaded_cpu(uint64_t affinity,
+                                                int preferred_node,
                                                 uint32_t *load_out) {
   static volatile uint32_t sched_rr_seed = 0;
-  struct cpu_info *best = NULL;
-  uint32_t best_load = UINT32_MAX;
   uint32_t count = cpu_get_count();
   if (count == 0) {
     if (load_out)
@@ -189,6 +189,32 @@ static struct cpu_info *sched_least_loaded_cpu(uint64_t affinity,
     return NULL;
   }
 
+  // 1. Try CPUs in preferred NUMA node first if valid and completely idle
+  if (preferred_node >= 0 && preferred_node < MAX_NUMA_NODES) {
+    struct numa_node *pnode = numa_get_node(preferred_node);
+    if (pnode && pnode->online && pnode->cpu_mask) {
+      uint64_t node_affinity = affinity & pnode->cpu_mask;
+      if (node_affinity) {
+        for (uint32_t i = 0; i < count; i++) {
+          if (!(node_affinity & (1ULL << i)))
+            continue;
+          struct cpu_info *cpu = cpu_get_info(i);
+          if (!sched_cpu_accepting_work(cpu))
+            continue;
+          uint32_t load = sched_cpu_load(cpu);
+          if (load == 0) {
+            if (load_out)
+              *load_out = 0;
+            return cpu;
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Global search
+  struct cpu_info *best = NULL;
+  uint32_t best_load = UINT32_MAX;
   uint32_t start =
       __atomic_fetch_add(&sched_rr_seed, 1, __ATOMIC_RELAXED) % count;
 
@@ -237,6 +263,7 @@ void sched_init(void) {
     // Create the idle thread for this specific CPU
     struct thread *idle_thread = kmalloc(sizeof(struct thread));
     memset(idle_thread, 0, sizeof(struct thread));
+    mempolicy_init(&idle_thread->numa_policy);
     idle_thread->cwd_path[0] = '/';
     idle_thread->cwd_node = fs_root;
     if (fs_root)
@@ -304,7 +331,11 @@ __attribute__((optimize("O3"))) void sched_enqueue_thread(struct thread *t, stru
                                     : explicit_cpu;
 
   if (!has_started && !target_cpu) {
-    target_cpu = sched_least_loaded_cpu(t->cpu_affinity, NULL);
+    int pref_node = -1;
+    if (t->numa_policy.mode != MPOL_DEFAULT) {
+      pref_node = mempolicy_select_node(&t->numa_policy, 0);
+    }
+    target_cpu = sched_least_loaded_cpu(t->cpu_affinity, pref_node, NULL);
   }
 
   if (!sched_cpu_accepting_work(target_cpu)) {
@@ -667,6 +698,8 @@ __attribute__((optimize("O3"))) void sched_tick(struct registers *regs) {
     cpu->ticks = now;
 
     if (cpu == cpu_get_bsp()) {
+      extern void posix_timer_tick(void);
+      posix_timer_tick();
       /* Skip tid_lock and thread list traversal entirely when no itimers are
        * active or when the earliest deadline has not arrived yet. */
       if (__atomic_load_n(&active_itimer_count, __ATOMIC_RELAXED) > 0) {
@@ -753,7 +786,10 @@ __attribute__((optimize("O3"))) void sched_tick(struct registers *regs) {
 }
 
 struct thread *sched_get_current(void) {
-  return cpu_get_current()->current_thread;
+  struct cpu_info *cpu = cpu_get_current();
+  if (!cpu)
+    return NULL;
+  return cpu->current_thread;
 }
 
 bool sched_validate_runqueues(struct cpu_info *cpu) {

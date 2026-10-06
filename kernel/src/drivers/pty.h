@@ -18,6 +18,11 @@
 #define TCSETS 0x5402
 #define TCSETSW 0x5403
 #define TCSETSF 0x5404
+/* Queue selectors for TCFLSH (passed by value, not a pointer). */
+#define TCFLSH 0x540B
+#define TCIFLUSH 0
+#define TCOFLUSH 1
+#define TCIOFLUSH 2
 
 #define TIOCGWINSZ 0x5413
 #define TIOCSWINSZ 0x5414
@@ -49,6 +54,11 @@ typedef struct pty_pair {
   bool packet_mode;     // Prefix master reads with a TIOCPKT control byte
   struct vfs_node *master_node; // Dynamic node watched by poll/epoll
   int slave_open_count; // Number of open slave handles
+  // Set on the first slave open. Reads/poll on the master report EOF/HUP
+  // only after a slave existed and went away; before the child opens the
+  // slave the master must block, otherwise Konsole wins a startup race,
+  // sees an instant EOF and shows a blank tab while bash is still starting.
+  bool slave_ever_opened;
 
   // Master → Slave buffer (data written by master, read by slave)
   uint8_t master_to_slave[PTY_BUFFER_SIZE];

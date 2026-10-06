@@ -20,13 +20,17 @@ DEMO_SHA256=7ace5a43983f10d6bdc9d9b6e17a1032ba6223118d389bd170df89b945a04a1e
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 
 find_compiler() {
-    local_cc="$ROOT_DIR/toolchain/x86_64-linux-musl/bin/x86_64-linux-musl-gcc"
+    local_cc="$ROOT_DIR/toolchain/x86_64-linux-glibc/bin/x86_64-buildroot-linux-gnu-gcc"
     if [ -x "$local_cc" ]; then
         CC="$local_cc"
-    elif command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
-        CC=x86_64-linux-musl-gcc
+    elif [ -x "$ROOT_DIR/toolchain/x86_64-linux-glibc/bin/x86_64-linux-gcc" ]; then
+        CC="$ROOT_DIR/toolchain/x86_64-linux-glibc/bin/x86_64-linux-gcc"
+    elif command -v x86_64-buildroot-linux-gnu-gcc >/dev/null 2>&1; then
+        CC=x86_64-buildroot-linux-gnu-gcc
+    elif command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
+        CC=x86_64-linux-gnu-gcc
     else
-        echo "Error: x86_64-linux-musl-gcc not found; run scripts/musl-toolchain.sh first." >&2
+        echo "Error: glibc cross-compiler not found; run scripts/glibc-toolchain.sh first." >&2
         exit 1
     fi
 }
@@ -37,7 +41,7 @@ check_dependencies() {
         "$ALPINE_ROOTFS/usr/lib/libSDL2.so" \
         "$ALPINE_ROOTFS/usr/lib/libz.so"; do
         if [ ! -e "$file" ]; then
-            echo "Error: missing $file; run scripts/setup-alpine.sh first." >&2
+            echo "Error: missing $file; run scripts/setup-arch.sh first." >&2
             exit 1
         fi
     done
@@ -115,6 +119,14 @@ build_engine() {
         "$ROOT_DIR/scripts/quake2-sdl2-config.in" > "$wrapper_dir/sdl2-config"
     chmod +x "$wrapper_dir/sdl2-config"
 
+    # The source tree's generated .d files can retain headers from the former
+    # musl/Alpine build (for example bits/alltypes.h), which do not exist in
+    # the current glibc rootfs. Drop those objects before switching libc.
+    if [ -f "$SOURCE_DIR/config.mk" ] && \
+       ! grep -Fqx "CC=$CC" "$SOURCE_DIR/config.mk"; then
+        make -C "$SOURCE_DIR" clean
+    fi
+
     cat > "$SOURCE_DIR/config.mk" <<EOF
 CC=$CC
 YQ2_OSTYPE=Linux
@@ -126,9 +138,9 @@ WITH_RPATH=no
 WITH_SDL3=no
 WITH_SYSTEMWIDE=no
 WITH_XDG=no
-INCLUDE=-I$ALPINE_ROOTFS/usr/include
-CFLAGS=-O2 -Wall -pipe -fomit-frame-pointer -fno-stack-protector -DASCENTOS
-LDFLAGS=-L$ALPINE_ROOTFS/usr/lib -L$ALPINE_ROOTFS/lib -Wl,-rpath-link,$ALPINE_ROOTFS/usr/lib -Wl,-rpath-link,$ALPINE_ROOTFS/lib -Wl,--allow-shlib-undefined -Wl,-rpath,/usr/lib:/lib
+INCLUDE=--sysroot=$ALPINE_ROOTFS -I$ALPINE_ROOTFS/usr/include
+CFLAGS=--sysroot=$ALPINE_ROOTFS -O2 -Wall -pipe -fomit-frame-pointer -fno-stack-protector -DASCENTOS
+LDFLAGS=--sysroot=$ALPINE_ROOTFS -L$ALPINE_ROOTFS/usr/lib -L$ALPINE_ROOTFS/lib -Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 -Wl,-rpath-link,$ALPINE_ROOTFS/usr/lib -Wl,-rpath-link,$ALPINE_ROOTFS/lib -Wl,--allow-shlib-undefined -Wl,-rpath,/usr/lib:/lib
 EOF
 
     echo "[*] Building Yamagi Quake II (SDL2 software renderer)..."

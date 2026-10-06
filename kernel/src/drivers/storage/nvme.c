@@ -2033,19 +2033,28 @@ static int nvme_io(struct nvme_namespace *ns, uint64_t lba, uint32_t count,
 static int nvme_ns_read(struct block_device *dev, uint64_t lba, uint32_t count,
                         void *buf) {
   struct nvme_namespace *ns = nvme_ns_from_block(dev);
-  return nvme_io(ns, lba, count, (uint8_t *)buf, false, false);
+  int ret = nvme_io(ns, lba, count, (uint8_t *)buf, false, false);
+  if (ret == 0)
+    block_stat_read(dev, count);
+  return ret;
 }
 
 static int nvme_ns_write(struct block_device *dev, uint64_t lba,
                          uint32_t count, const void *buf) {
   struct nvme_namespace *ns = nvme_ns_from_block(dev);
-  return nvme_io(ns, lba, count, (uint8_t *)buf, true, NVME_FUA_DEFAULT);
+  int ret = nvme_io(ns, lba, count, (uint8_t *)buf, true, NVME_FUA_DEFAULT);
+  if (ret == 0)
+    block_stat_write(dev, count);
+  return ret;
 }
 
 static int nvme_ns_write_fua(struct block_device *dev, uint64_t lba,
                              uint32_t count, const void *buf) {
   struct nvme_namespace *ns = nvme_ns_from_block(dev);
-  return nvme_io(ns, lba, count, (uint8_t *)buf, true, true);
+  int ret = nvme_io(ns, lba, count, (uint8_t *)buf, true, true);
+  if (ret == 0)
+    block_stat_write(dev, count);
+  return ret;
 }
 
 static int nvme_flush_once(struct nvme_controller *ctrl,

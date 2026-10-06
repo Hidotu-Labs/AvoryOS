@@ -1,6 +1,7 @@
 #include "framebuffer.h"
 #include "fb.h"
 #include "terminal.h"
+#include "vblank.h"
 #include "../fs/vfs.h"
 #include "../mm/vmm.h"
 #include "../lib/string.h"
@@ -200,8 +201,29 @@ int fb_dev_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) {
     case FBIOGETCMAP:
     case FBIOPUTCMAP:
     case FBIO_CURSOR:
-    case FBIO_WAITFORVSYNC:
         return 0;
+
+    case FBIO_WAITFORVSYNC: {
+        /* Linux takes a user u32 frame count. Block until that many
+         * boundaries have passed so fbdev clients pace to the refresh
+         * rate instead of spinning. Previously this returned instantly,
+         * which uncapped every client throttling on it. */
+        uint32_t count = 1;
+        if (arg) {
+            if (!vmm_is_user_addr_range_valid(arg, sizeof(uint32_t)))
+                return -14; // -EFAULT
+            count = *(volatile uint32_t *)arg;
+            if (count == 0)
+                count = 1;
+            if (count > 240)
+                count = 240;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            if (vblank_wait_next() != 0)
+                return -4; // -EINTR
+        }
+        return 0;
+    }
 
     case FBIODIRTYRECT: {
         if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(struct fb_copyarea)))

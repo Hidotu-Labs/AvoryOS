@@ -68,8 +68,11 @@ static int partition_read(struct block_device *dev, uint64_t lba,
       lba >= dev->total_sectors ||
       (uint64_t)count > dev->total_sectors - lba)
     return -1;
-  return wrap->parent->read_sectors(wrap->parent, lba + wrap->start_lba, count,
-                                    buf);
+  int ret = wrap->parent->read_sectors(wrap->parent, lba + wrap->start_lba,
+                                       count, buf);
+  if (ret == 0)
+    block_stat_read(dev, count);
+  return ret;
 }
 
 static int partition_write(struct block_device *dev, uint64_t lba,
@@ -79,8 +82,11 @@ static int partition_write(struct block_device *dev, uint64_t lba,
       count == 0 || lba >= dev->total_sectors ||
       (uint64_t)count > dev->total_sectors - lba)
     return -1;
-  return wrap->parent->write_sectors(wrap->parent, lba + wrap->start_lba, count,
-                                     buf);
+  int ret = wrap->parent->write_sectors(wrap->parent, lba + wrap->start_lba,
+                                        count, buf);
+  if (ret == 0)
+    block_stat_write(dev, count);
+  return ret;
 }
 
 static int partition_write_fua(struct block_device *dev, uint64_t lba,
@@ -92,11 +98,17 @@ static int partition_write_fua(struct block_device *dev, uint64_t lba,
     return -1;
   uint64_t parent_lba = lba + wrap->start_lba;
   struct block_device *parent = wrap->parent;
+  int ret;
   if (parent->write_sectors_fua)
-    return parent->write_sectors_fua(parent, parent_lba, count, buf);
-  if (parent->write_sectors(parent, parent_lba, count, buf) != 0)
-    return -1;
-  return block_flush(parent);
+    ret = parent->write_sectors_fua(parent, parent_lba, count, buf);
+  else {
+    if (parent->write_sectors(parent, parent_lba, count, buf) != 0)
+      return -1;
+    ret = block_flush(parent);
+  }
+  if (ret == 0)
+    block_stat_write(dev, count);
+  return ret;
 }
 
 static int partition_flush(struct block_device *dev) {
@@ -354,6 +366,15 @@ static int block_vfs_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) {
     return 0;
   }
 
+  case 0x80041284:
+  case 0x1284: { // BLKPBSZGET (physical block size, unsigned int *)
+    unsigned int *out = (unsigned int *)arg;
+    if (!out || !vmm_is_user_addr_range_valid(arg, sizeof(unsigned int)))
+      return -14;
+    *out = sector_size;
+    return 0;
+  }
+
   case 0x127E: { // BLKROTATIONAL (unsigned short *)
     unsigned short *out = (unsigned short *)arg;
     if (!out || !vmm_is_user_addr_range_valid(arg, sizeof(unsigned short)))
@@ -401,13 +422,51 @@ static void block_publish_node(struct block_device *dev) {
   node->read = block_vfs_read;
   node->write = block_vfs_write;
   node->ioctl = block_vfs_ioctl;
+  /* stat() on /dev/<name> must report the same major:minor that
+   * /sys/block, /proc/partitions and /proc/self/mountinfo advertise,
+   * otherwise UDisks2/libmount cannot match the device to its mount and
+   * Plasma's Disk Usage stays at 0 B. fill_kstat() reports inode verbatim
+   * as st_rdev, so store the userspace dev_t encoding here. */
+  node->inode = block_device_userspace_rdev(dev);
 
   devfs_register_node(dev->name, node);
+}
+
+uint32_t block_device_userspace_rdev(const struct block_device *dev) {
+  if (!dev)
+    return 0;
+  uint32_t major = dev->linux_major;
+  uint32_t minor = dev->linux_minor;
+  return (minor & 0xffu) | (major << 8) | ((minor & ~0xffu) << 12);
+}
+
+struct block_device *block_get_by_name(const char *name) {
+  if (!name || !*name)
+    return NULL;
+  /* Accept "/dev/nvme0n1p1" as well as bare "nvme0n1p1". */
+  if (strncmp(name, "/dev/", 5) == 0)
+    name += 5;
+  for (int i = 0; i < num_devices; i++) {
+    struct block_device *dev = registered[i];
+    if (dev && strcmp(dev->name, name) == 0)
+      return dev;
+  }
+  return NULL;
 }
 
 int block_register(struct block_device *dev) {
   if (num_devices >= BLOCK_MAX_DEVICES)
     return -1;
+  /* Assign a stable Linux-compatible device number once. NVMe uses major
+   * 259 like Linux; everything else uses major 8. Minor is the registration
+   * index, unique across whole disks and partitions. */
+  if (dev->linux_major == 0 && dev->linux_minor == 0) {
+    if (strncmp(dev->name, "nvme", 4) == 0)
+      dev->linux_major = 259;
+    else
+      dev->linux_major = 8;
+    dev->linux_minor = (uint32_t)num_devices;
+  }
   registered[num_devices++] = dev;
 
   // Register to VFS if root exists

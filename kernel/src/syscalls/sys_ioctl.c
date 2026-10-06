@@ -10,6 +10,7 @@
 #include "../sched/sched.h"
 #include "sys_io_shared.h"
 #include "syscall.h"
+#include "sysdiag.h"
 #include <stdint.h>
 
 #ifndef IOCTL_DEBUG_LOGGING
@@ -46,8 +47,15 @@ static const char *ioctl_request_name(uint32_t request) {
   switch (request) {
   case 0x0301: return "HDIO_GETGEO";
   case 0x540B: return "TCFLSH";
+  case 0x80086601: return "FS_IOC_GETFLAGS";
+  case 0x40086602: return "FS_IOC_SETFLAGS";
   case 0x5414: return "TIOCSWINSZ";
   case 0x541B: return "FIONREAD/TIOCINQ";
+  case 0x541D: return "TIOCCONS";
+  case 0x5456: return "TIOCGLCKTRMIOS";
+  case 0x5457: return "TIOCSLCKTRMIOS";
+  case 0x4B70: return "GIO_CMAP";
+  case 0x4B71: return "PIO_CMAP";
   case 0x1260: return "BLKGETSIZE";
   case 0x1268: return "BLKSSZGET";
   case 0x1272:
@@ -58,8 +66,12 @@ static const char *ioctl_request_name(uint32_t request) {
   case 0xC0186449: return "DRM_IOCTL_VIRTGPU_GET_CAPS";
   case 0xC0106443: return "DRM_IOCTL_VIRTGPU_GETPARAM";
   case 0xC01064C7: return "DRM_IOCTL_MODE_LIST_LESSEES";
+  case 0xC018643B: return "DRM_IOCTL_CRTC_GET_SEQUENCE";
+  case 0xC018643C: return "DRM_IOCTL_CRTC_QUEUE_SEQUENCE";
   case 0x40049409: return "FICLONE/BTRFS_IOC_CLONE";
   case 0x4020940D: return "FICLONERANGE";
+  case 0x81009431: return "BTRFS_IOC_GET_FSLABEL";
+  case 0x41009432: return "BTRFS_IOC_SET_FSLABEL";
   default: return "unknown";
   }
 }
@@ -103,6 +115,8 @@ static bool ioctl_miss_should_log(const char *node_name, uint32_t request,
 static void ioctl_log_unhandled(struct thread *thread, uint64_t fd,
                                 uint32_t request, uint64_t arg,
                                 vfs_node_t *node, bool handler_called) {
+  sysdiag_record_missing_ioctl(fd, request, arg, thread, node, handler_called);
+
   /* Xorg probes evdev descriptors with TCFLSH. It is a terminal-only ioctl,
    * and the evdev handler intentionally returns ENOTTY for this probe. */
   if (request == 0x540B && node &&
@@ -205,12 +219,11 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
   if (arg > USER_ADDR_MAX)
     return (uint64_t)-14;
 
-  if (!t || fd >= MAX_FDS)
+  if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd]))
     return (uint64_t)-9;
 
-  if (fd < MAX_FDS && t->fds[fd]) {
-    vfs_node_t *node = t->fds[fd];
-    ioctl_node = node;
+  vfs_node_t *node = t->fds[fd];
+  ioctl_node = node;
 #if IOCTL_DEBUG_LOGGING
     klog_puts("[SYSCALL] ioctl: node name=");
     klog_puts(node->name);
@@ -241,7 +254,6 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
       if (res != (uint64_t)-25)
         return res;
     }
-  }
 
   uint64_t ret = 0;
   switch ((uint32_t)request) {
@@ -463,6 +475,22 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
   case 0x5451:
     ret = 0;
     break; // KDSIGACCEPT
+  case 0x541D:
+    ret = 0;
+    break; // TIOCCONS
+  case 0x5422: { // TIOCNOTTY — detach controlling terminal
+    struct thread *cur = sched_get_current();
+    if (cur)
+      cur->ctty = NULL;
+    ret = 0;
+    break;
+  }
+  case 0x5456: // TIOCGLCKTRMIOS
+  case 0x5457: // TIOCSLCKTRMIOS
+  case 0x4B70: // GIO_CMAP
+  case 0x4B71: // PIO_CMAP
+    ret = 0;
+    break;
   case TIOCGETD: {
     int *ldisc = (int *)arg;
     if (!ldisc) {
@@ -487,11 +515,33 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
       } else {
         unread = 0;
       }
-      *(int *)arg = unread;
+      if (copy_to_user((void *)arg, &unread, sizeof(int)) != 0) {
+        ret = (uint64_t)-14;
+        break;
+      }
       ret = 0;
       break;
+    } else if (ioctl_node && ((ioctl_node->flags & FS_TYPE_MASK) == FS_PIPE ||
+                              (ioctl_node->flags & FS_TYPE_MASK) == FS_SOCKET)) {
+      if (ioctl_node->ioctl) {
+        ret = (uint64_t)ioctl_node->ioctl(ioctl_node, 0x541B, arg);
+        break;
+      }
     }
     ret = (uint64_t)-25; // ENOTTY
+    break;
+  }
+  case 0x5421: { // FIONBIO
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int))) {
+      ret = (uint64_t)-14;
+      break;
+    }
+    int nonblocking = *(int *)arg;
+    if (nonblocking)
+      t->fd_flags[fd] |= O_NONBLOCK;
+    else
+      t->fd_flags[fd] &= ~O_NONBLOCK;
+    ret = 0;
     break;
   }
   case 0x40049409: { // FICLONE / BTRFS_IOC_CLONE
@@ -627,6 +677,60 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     kfree(buf);
     if (err) {
       ret = (uint64_t)-5;
+      break;
+    }
+    ret = 0;
+    break;
+  }
+  case 0x80086601: { // FS_IOC_GETFLAGS: _IOR('f', 1, long)
+    // Baloo's database layer asks for extent flags on its index file/dir.
+    // This VFS tracks no per-file flags, so report none.
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(long))) {
+      ret = (uint64_t)-14; // EFAULT
+      break;
+    }
+    if (ioctl_node) {
+      uint32_t type = ioctl_node->flags & FS_TYPE_MASK;
+      if (type != FS_FILE && type != FS_DIRECTORY) {
+        ret = (uint64_t)-25; // ENOTTY
+        break;
+      }
+    }
+    *(long *)arg = 0;
+    ret = 0;
+    break;
+  }
+  case 0x40086602: { // FS_IOC_SETFLAGS: _IOW('f', 2, long)
+    // Paired with GETFLAGS above: validated and accepted, nothing to store.
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(long))) {
+      ret = (uint64_t)-14; // EFAULT
+      break;
+    }
+    if (ioctl_node) {
+      uint32_t type = ioctl_node->flags & FS_TYPE_MASK;
+      if (type != FS_FILE && type != FS_DIRECTORY) {
+        ret = (uint64_t)-25; // ENOTTY
+        break;
+      }
+    }
+    ret = 0;
+    break;
+  }
+  case 0x81009431: { // BTRFS_IOC_GET_FSLABEL: _IOR(0x94, 49, char[256])
+    // kded6 and other desktop tools probe the label of "/" on startup.
+    // AvoryOS root is not btrfs, so report an empty (unlabeled) label.
+    if (!arg || !vmm_is_user_addr_range_valid(arg, 256)) {
+      ret = (uint64_t)-14; // EFAULT
+      break;
+    }
+    memset((void *)arg, 0, 256);
+    ret = 0;
+    break;
+  }
+  case 0x41009432: { // BTRFS_IOC_SET_FSLABEL: _IOW(0x94, 50, char[256])
+    // No btrfs label store; accept-and-ignore so formatting tools succeed.
+    if (!arg || !vmm_is_user_addr_range_valid(arg, 256)) {
+      ret = (uint64_t)-14; // EFAULT
       break;
     }
     ret = 0;

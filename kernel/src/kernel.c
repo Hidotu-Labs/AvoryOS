@@ -65,6 +65,7 @@
 #include "mm/heap.h"
 #include "mm/pcid.h"
 #include "mm/pmm.h"
+#include "mm/numa.h"
 #include "mm/shm.h"
 #include "mm/slab_cache.h"
 #include "mm/tlb_shootdown.h"
@@ -216,6 +217,10 @@ static void init_thread_entry(void) {
     }
   }
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " Init thread started\n");
+
+  /* ── NUMA Subsystem self test ── */
+  extern void test_numa(void);
+  test_numa();
 
   // Pre-populate the VFS page cache with the dynamic linker and hot shared
   // libraries so that every subsequent execve() hits warm cache.
@@ -372,6 +377,7 @@ void kmain(void) {
     halt();
   }
 
+  numa_init(rsdp_request.response, hhdm_request.response->offset);
   pmm_init(memmap_request.response, hhdm_request.response->offset);
 
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
@@ -386,6 +392,8 @@ void kmain(void) {
 
   gdt_init();
   cpu_features_init();
+  extern void page_ops_init(void);
+  page_ops_init();
   tsc_init();
   idt_init();
   syscall_init();
@@ -437,9 +445,19 @@ void kmain(void) {
   extern void test_vmm_clone(void);
   test_vmm_clone();
 
+  /* ── Zero-Fill Neighbor Alias test (gdb us SIGSEGV regression: a present
+   * anonymous data page must never read back zero after zero-page installs
+   * in neighboring holes) ── */
+  extern void test_zero_alias(void);
+  test_zero_alias();
+
   /* ── Fast Word-at-a-time uaccess test ── */
   extern void test_uaccess(void);
   test_uaccess();
+
+  /* ── Hardware-Accelerated Page Operations test ── */
+  extern void test_page_ops(void);
+  test_page_ops();
 
   slab_cache_init();
 
@@ -575,6 +593,13 @@ void kmain_high_half(void) {
   ramdisk_init(module_request.response);
 
   pmm_reclaim_bootloader(k_phys);
+
+  /* Initialize Per-CPU Page Allocator (PCP) now that APs are online and boot memory is reclaimed */
+  pmm_pcp_init();
+
+  /* ── Per-CPU Page Allocator (PCP) self-test ── */
+  extern void test_pmm_pcp(void);
+  test_pmm_pcp();
 
   /* `tlb_bench=1` measures the single-page shootdown path once the APs are
    * online and can answer IPIs.  Run after the APs' own boot prints so the
@@ -712,25 +737,24 @@ mount_success:
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
                            " Root filesystem mounted successfully.\n");
   ramfs_mount_at("/dev");
-  tmpfs_mount_at("/tmp");
+  /* /tmp holds apm's download workspace (APK + decompressed tar + staging
+   * copy concurrently, i.e. ~3x the package size). The 64MB default filled
+   * after a few packages and surfaced as [WRITEV] zero-write ENOSPC on
+   * *.apk; give it headroom matching typical package sets. */
+  tmpfs_mount_at_sized("/tmp", 256ULL * 1024 * 1024, TMPFS_DEFAULT_MAX_INODES);
   ramfs_mount_at("/run");
-
-  /* WebKitGTK assumes bubblewrap sandboxing works unless it finds
-   * /run/.containerenv; when the file is present it probes bwrap once and
-   * disables the sandbox itself if the probe fails.  AvoryOS cannot create
-   * user/mount namespaces, so without this marker WebKit always execs bwrap,
-   * which dies in its namespace setup and takes the WebProcess with it (the
-   * browser window then never renders a page).  The marker makes WebKit run
-   * its probe, fail it, and fall back to a direct, unsandboxed WebProcess.
-   * Delete this once namespaces exist: the probe will then succeed and WebKit
-   * re-enables its sandbox without any other change. */
+  /* Login records: elogind falls back to the /dev/null/utmp dummy (and warns
+   * "Failed to set utmp path") when /run/utmp is missing. OpenRC bootmisc
+   * normally creates it, but it is skipped when fsck fails, so create the
+   * empty database here on the fresh ramfs before any userspace starts. */
   {
     vfs_node_t *run_dir = vfs_resolve_path("/run");
     if (run_dir) {
-      vfs_create(run_dir, ".containerenv", 0644);
+      vfs_create(run_dir, "utmp", 0664);
       vfs_close(run_dir);
     }
   }
+
 
   /* POSIX shared memory.  shm_open(), X11 MIT-SHM, Qt's QSharedMemory and
    * Mesa's shared caches all expect a real memory-backed filesystem here;
@@ -747,6 +771,8 @@ mount_success:
     }
     tmpfs_mount_at_sized("/dev/shm", TMPFS_SHM_MAX_BYTES, TMPFS_SHM_MAX_INODES);
   }
+  extern void devfs_init(void);
+  devfs_init();
   fault_init();
 
   extern void sysfs_init(void);
@@ -788,6 +814,11 @@ mount_success:
    * paths back to back.  Both need the mounted root, so they run here. */
   vfs_selftest_maybe_run();
   vfs_bench_maybe_run();
+  /* Always-on fill-integrity check (see page_cache.c): compares the bytes a
+   * bulk readahead window publishes against independent single-page reads
+   * of the same range. A mismatch is the only in-kernel explanation for
+   * userspace seeing different bytes than the disk holds. */
+  vfs_cache_fill_selftest();
 
   mouse_register_vfs();
   random_register_vfs();
@@ -899,13 +930,23 @@ mount_fail:
      * frame is flushed here too: the frontbuffer copy is far too slow to run
      * in the timer ISR. */
     console_tick();
-    serial_flush_idle();
+    sched_reap_orphaned_zombies();
+    /* serial_flush_idle() early-outs on an empty ring, but check first so a
+     * quiet desktop does not pay the lock attempt on every wake. The idle
+     * drain budget (SERIAL_IDLE_DRAIN_BYTES) clears backlogs in fewer 1 ms
+     * iterations, returning to the slow tick sooner. */
+    if (serial_pending_bytes())
+      serial_flush_idle();
     /* Deferred address-space teardown drains on the idle BSP too (APs do the
      * same in ap_main): this core is halted anyway, so drain all pending nodes
-     * immediately to prevent repeated 1 ms idle timer wakeups. */
-    vmm_defer_drain(VMM_DEFER_IDLE_NODES);
+     * immediately to prevent repeated 1 ms idle timer wakeups. Skip the
+     * spinlock entirely when the queue is empty. Slow tick at 2 s to match
+     * the AP idle loop (lockdiag hang threshold is 3 s). */
+    bool defer_pending = vmm_defer_pending() != 0;
+    if (defer_pending)
+      vmm_defer_drain(VMM_DEFER_IDLE_NODES);
     uint64_t idle_ms =
-        (serial_pending_bytes() || vmm_defer_pending()) ? 1 : 1000;
+        (serial_pending_bytes() || defer_pending) ? 1 : 2000;
     lapic_timer_rearm_if_earlier(lapic_timer_get_ms() + idle_ms);
     hal_cpu_halt();
   }

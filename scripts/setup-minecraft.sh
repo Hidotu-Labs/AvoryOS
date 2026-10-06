@@ -2,7 +2,7 @@
 # scripts/setup-minecraft.sh -- Stage Minecraft 1.16.5 into AvoryOS
 #
 # Prerequisites:
-#   1. Run ./scripts/setup-alpine.sh first  (provides Alpine rootfs, disk.img, OpenJDK 17)
+#   1. Run ./scripts/setup-arch.sh first  (provides Alpine rootfs, disk.img, OpenJDK 17)
 #   2. Network access on the first run: the client JAR is downloaded from the
 #      mcversions.net link, libraries/assets from Mojang (includes all 2,336
 #      OGG sound files of asset index 1.16)
@@ -48,7 +48,7 @@ done
 # Sanity checks
 # ─────────────────────────────────────────────────────────────────────────────
 [ ! -d "${ROOTFS_DIR}/etc" ] && {
-    echo "[!] Alpine rootfs not found. Run ./scripts/setup-alpine.sh first."
+    echo "[!] Alpine rootfs not found. Run ./scripts/setup-arch.sh first."
     exit 1
 }
 [ ! -f "${DISK_IMG}" ] && {

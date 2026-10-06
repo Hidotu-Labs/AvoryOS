@@ -225,6 +225,10 @@ typedef struct vfs_node {
   ioctl_type_t ioctl; // Device-specific ioctl handler
   fallocate_type_t fallocate;
   void *wait_queue; // Pointer to wait_queue_t for poll() wakeups
+  /* In-memory extended-attribute list head (fs/xattr.c, opaque
+   * xattr_entry_t *). NULL when the node carries no xattrs. vfs_node_init()
+   * zeroes it; vfs_close()/vfs_node_retire() release it. */
+  void *xattrs;
 
   struct list_head ep_watchers; // List of epitem_t watching this node
   spinlock_t ep_lock;           // Lock for ep_watchers
@@ -314,6 +318,11 @@ int vfs_rmdir(vfs_node_t *node, char *name);
 int vfs_readlink(vfs_node_t *node, char *buf, uint32_t size);
 int vfs_symlink(vfs_node_t *node, char *name, char *target);
 int vfs_rename(vfs_node_t *node, char *old_name, char *new_name);
+/* Cross-directory rename of a leaf node within one filesystem instance
+ * (tmpfs only for now; anything else answers -EXDEV).  Returns 0 or a
+ * negative errno. */
+int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
+                     vfs_node_t *new_parent, char *new_name);
 int vfs_chmod(vfs_node_t *node, uint16_t permission);
 int vfs_chown(vfs_node_t *node, uint32_t uid, uint32_t gid);
 int vfs_truncate(vfs_node_t *node, uint32_t size);
@@ -330,6 +339,26 @@ int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
                  const char *dev_name, const char *fs_type,
                  const char *path);
 int vfs_statfs(vfs_node_t *node, void *buf);
+
+/* In-memory extended attributes (fs/xattr.c). Generic per-node store backing
+ * setxattr/getxattr/listxattr/removexattr so cp -a, tar, and Baloo don't spin
+ * on EOPNOTSUPP. Only the user.* namespace is stored; anything else reports
+ * EOPNOTSUPP. Returns 0 on success or a negative errno (-61 ENODATA, -17
+ * EEXIST, -34 ERANGE, -7 E2BIG, -12 ENOMEM, -95 EOPNOTSUPP). get/list follow
+ * Linux sizing semantics: a NULL/zero-size buffer returns the required size.
+ * NOTE: ext2/ext4/fat32 hand out ephemeral nodes per lookup (dentry-cached),
+ * so attributes there live for the cache lifetime, not across reboot. tmpfs
+ * and ramfs nodes are persistent and fully correct. On-disk xattr blocks are
+ * future work. */
+int vfs_setxattr(vfs_node_t *node, const char *name, const void *value,
+                 uint32_t size, int flags);
+int vfs_getxattr(vfs_node_t *node, const char *name, void *value,
+                 uint32_t size);
+int vfs_listxattr(vfs_node_t *node, char *list, uint32_t size);
+int vfs_removexattr(vfs_node_t *node, const char *name);
+/* Release every xattr on `node` (NULL-safe). Called from vfs_close() and
+ * vfs_node_retire() before the node is freed. */
+void vfs_xattr_clear(vfs_node_t *node);
 
 typedef struct vfs_mount_info {
   char mountpoint[128];
@@ -355,6 +384,9 @@ void vfs_cache_clear_unused(vfs_node_t *node);
 void vfs_cache_sync(vfs_node_t *node);
 void vfs_cache_mark_dirty(vfs_node_t *node, uint32_t offset);
 size_t vfs_cache_reclaim(vfs_node_t *node, size_t target);
+// OOM hook for mm (see heap.c heap_oom_reclaim): reclaim up to `target`
+// clean unmapped pages from the current process's mapped files.
+size_t mm_file_cache_reclaim(size_t target);
 vfs_page_t *vfs_cache_get_or_create(vfs_node_t *node, uint32_t offset);
 void vfs_cache_put(vfs_node_t *node, vfs_page_t *page);
 bool vfs_cache_phase3_stress_test(void);
@@ -370,6 +402,9 @@ bool vfs_cache_phase5_stress_test(void);
  * these entry points (`vfs_selftest=1` / `vfs_bench=1`).  They run once from
  * kmain after the root filesystem is mounted. */
 void vfs_selftest_maybe_run(void);
+/* Boot-time fill-integrity check, runs unconditionally once (see page_cache.c
+ * for why it earned that). */
+void vfs_cache_fill_selftest(void);
 /* Second half of `vfs_selftest=1`: proves that no /proc resolution is
  * entered into the full-path cache.  kmain() calls it after procfs_init(),
  * because it needs the mounted /proc. */

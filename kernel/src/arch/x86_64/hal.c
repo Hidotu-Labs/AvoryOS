@@ -9,7 +9,14 @@ const char *hal_arch_name_impl(void) { return "x86_64"; }
 
 void hal_cpu_relax(void) { __asm__ volatile("pause" ::: "memory"); }
 
-void hal_cpu_halt(void) { __asm__ volatile("hlt"); }
+void hal_cpu_halt(void) {
+  /* Idle path: enable interrupts and halt atomically. `sti` takes effect
+   * after the next instruction, so `sti; hlt` cannot miss a wakeup that
+   * fires between the enable and the halt. A bare `hlt` with IF clear
+   * (e.g. after a scheduler path that left interrupts disabled) would park
+   * the CPU forever except for NMIs. */
+  __asm__ volatile("sti; hlt" ::: "memory");
+}
 
 uint64_t hal_cpu_cycle_count(void) {
   uint32_t low;

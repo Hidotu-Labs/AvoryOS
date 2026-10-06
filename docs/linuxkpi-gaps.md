@@ -1152,7 +1152,7 @@ divergences for its chunk; the Phase 5 exit matrix in
   `drivers/video/aperture.c` wins if it is ever compiled.
 - **modetest cross-check**: Alpine's `libdrm-tests` package (provides
   `modetest`) is now installed into the Alpine rootfs by
-  `scripts/setup-alpine.sh`; the primary C5 evidence remains the kernel suite
+  `scripts/setup-arch.sh`; the primary C5 evidence remains the kernel suite
   plus `bin/test_kpi_bochs` (same fallback P3 used for vkms).
 
 ## Phase 4 gaps (TTM + scheduler + minimal PCI, 2026-09-12)

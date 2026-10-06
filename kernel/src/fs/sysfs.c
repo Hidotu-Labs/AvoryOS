@@ -1,5 +1,6 @@
 #include "fs/sysfs.h"
 #include "fs/sysfs_pci.h"
+#include "fs/tmpfs.h"
 #include "console/klog.h"
 #include "drivers/pci/pci.h"
 #include "drivers/gpu/virtio_gpu/virtio_gpu.h"
@@ -9,12 +10,34 @@
 #include "lib/string.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
+#include "mm/numa.h"
 #include "net/core.h"
 #include "net/ipv4.h"
 #include "net/ipv6.h"
 #include "smp/cpu.h"
 
 #include <linuxkpi/native_sysfs.h>
+
+#define SYSFS_MAGIC 0x62656572
+
+static int sysfs_statfs(vfs_node_t *node, struct statfs_buf *buf) {
+  (void)node;
+  if (!buf)
+    return -1;
+  buf->f_type = SYSFS_MAGIC;
+  buf->f_bsize = 4096;
+  buf->f_blocks = 0;
+  buf->f_bfree = 0;
+  buf->f_bavail = 0;
+  buf->f_files = 0;
+  buf->f_ffree = 0;
+  buf->f_fsid[0] = 0;
+  buf->f_fsid[1] = 0;
+  buf->f_namelen = 255;
+  buf->f_frsize = 4096;
+  buf->f_flags = 0;
+  return 0;
+}
 
 // GPU device path for netlink uevents
 char sysfs_gpu_devpath[128] = "/devices/pci0000:00/0000:00:01.0/drm/card0";
@@ -162,11 +185,18 @@ static void sysfs_populate_block(vfs_node_t *block_class_dir) {
     if (!bdir)
       continue;
 
-    // dev: major:minor  (8:N for SCSI/ATA)
-    char devbuf[16];
-    devbuf[0] = '8';
-    devbuf[1] = ':';
-    u64_to_dec(i, devbuf + 2);
+    /* dev: major:minor — must match /proc/partitions, /proc/diskstats,
+     * /proc/self/mountinfo and stat()->st_rdev or UDisks2/Solid cannot
+     * match a mount to its block device and Plasma Disk Usage stays at
+     * 0 B. Numbers come from block_register() (259:N for NVMe, 8:N
+     * otherwise). */
+    char devbuf[32];
+    char majbuf[16], minbuf[16];
+    u64_to_dec(bd->linux_major, majbuf);
+    u64_to_dec(bd->linux_minor, minbuf);
+    strcpy(devbuf, majbuf);
+    strcat(devbuf, ":");
+    strcat(devbuf, minbuf);
     strcat(devbuf, "\n");
     sysfs_mkfile(bdir, "dev", devbuf);
 
@@ -183,9 +213,10 @@ static void sysfs_populate_block(vfs_node_t *block_class_dir) {
     sysfs_mkfile(bdir, "ro", "0\n");
 
     // uevent: what udev/libblkid parse to identify a block device.
-    char uevent[128];
+    char uevent[160];
     snprintf(uevent, sizeof(uevent),
-             "MAJOR=8\nMINOR=%d\nDEVNAME=%s\nDEVTYPE=disk\n", i, bd->name);
+             "MAJOR=%u\nMINOR=%u\nDEVNAME=%s\nDEVTYPE=disk\n",
+             bd->linux_major, bd->linux_minor, bd->name);
     sysfs_mkfile(bdir, "uevent", uevent);
 
     // stat: 11 space-separated counters (reads, merges, sectors, ms, ...).
@@ -332,6 +363,15 @@ static void sysfs_populate_cpus(vfs_node_t *cpu_dir) {
     if (!cdir)
       continue;
     sysfs_mkfile(cdir, "online", "1\n");
+    /* Linux normalizes maximum CPU capacity to 1024. AvoryOS currently
+     * treats every CPU equally, so expose that homogeneous capacity on
+     * each CPU for Qt and other userspace topology probes. */
+    sysfs_mkfile(cdir, "cpu_capacity", "1024\n");
+    int node = numa_cpu_to_node(i);
+    char nodename[16];
+    strcpy(nodename, "node");
+    u64_to_dec(node, nodename + 4);
+    sysfs_mkdir(cdir, nodename);
   }
   // Also add a 'possible' and 'present' file at the cpu/ level
   char cpumask[16];
@@ -341,6 +381,98 @@ static void sysfs_populate_cpus(vfs_node_t *cpu_dir) {
   sysfs_mkfile(cpu_dir, "possible", cpumask);
   sysfs_mkfile(cpu_dir, "present", cpumask);
   sysfs_mkfile(cpu_dir, "online", cpumask);
+}
+
+static void sysfs_populate_nodes(vfs_node_t *node_dir) {
+  uint32_t count = numa_node_count();
+  char nodestr[32];
+
+  if (count > 1) {
+    strcpy(nodestr, "0-");
+    u64_to_dec(count - 1, nodestr + 2);
+    strcat(nodestr, "\n");
+  } else {
+    strcpy(nodestr, "0\n");
+  }
+
+  sysfs_mkfile(node_dir, "online", nodestr);
+  sysfs_mkfile(node_dir, "possible", nodestr);
+  sysfs_mkfile(node_dir, "has_cpu", nodestr);
+  sysfs_mkfile(node_dir, "has_normal_memory", nodestr);
+
+  for (uint32_t i = 0; i < count; i++) {
+    struct numa_node *n = numa_get_node(i);
+    if (!n || !n->online)
+      continue;
+
+    char nname[16];
+    strcpy(nname, "node");
+    u64_to_dec(i, nname + 4);
+    vfs_node_t *ndir = sysfs_mkdir(node_dir, nname);
+    if (!ndir)
+      continue;
+
+    // cpumap
+    char cpumap[32];
+    u32_to_hex((uint32_t)n->cpu_mask, cpumap, 8);
+    strcat(cpumap, "\n");
+    sysfs_mkfile(ndir, "cpumap", cpumap);
+
+    // cpulist
+    char cpulist[32];
+    int first_cpu = -1, last_cpu = -1;
+    for (int c = 0; c < 64; c++) {
+      if (n->cpu_mask & (1ULL << c)) {
+        if (first_cpu < 0) first_cpu = c;
+        last_cpu = c;
+      }
+    }
+    if (first_cpu >= 0) {
+      if (first_cpu == last_cpu) {
+        u64_to_dec(first_cpu, cpulist);
+        strcat(cpulist, "\n");
+      } else {
+        u64_to_dec(first_cpu, cpulist);
+        strcat(cpulist, "-");
+        u64_to_dec(last_cpu, cpulist + strlen(cpulist));
+        strcat(cpulist, "\n");
+      }
+    } else {
+      strcpy(cpulist, "0\n");
+    }
+    sysfs_mkfile(ndir, "cpulist", cpulist);
+
+    // distance
+    char distance[128] = "";
+    for (uint32_t j = 0; j < count; j++) {
+      char dstr[16];
+      u64_to_dec(numa_distance(i, j), dstr);
+      strcat(distance, dstr);
+      if (j + 1 < count)
+        strcat(distance, " ");
+      else
+        strcat(distance, "\n");
+    }
+    sysfs_mkfile(ndir, "distance", distance);
+
+    // meminfo
+    char meminfo[256];
+    strcpy(meminfo, "Node ");
+    u64_to_dec(i, meminfo + strlen(meminfo));
+    strcat(meminfo, " MemTotal: ");
+    u64_to_dec(n->total_memory / 1024, meminfo + strlen(meminfo));
+    strcat(meminfo, " kB\nNode ");
+    u64_to_dec(i, meminfo + strlen(meminfo));
+    strcat(meminfo, " MemFree: ");
+    u64_to_dec(n->usable_memory / 1024, meminfo + strlen(meminfo));
+    strcat(meminfo, " kB\nNode ");
+    u64_to_dec(i, meminfo + strlen(meminfo));
+    strcat(meminfo, " MemUsed: ");
+    uint64_t used = (n->total_memory > n->usable_memory) ? (n->total_memory - n->usable_memory) : 0;
+    u64_to_dec(used / 1024, meminfo + strlen(meminfo));
+    strcat(meminfo, " kB\n");
+    sysfs_mkfile(ndir, "meminfo", meminfo);
+  }
 }
 
 // Main init
@@ -369,12 +501,25 @@ void sysfs_init(void) {
   vfs_node_init(sysfs_root);
   strcpy(sysfs_root->name, "sys");
   ramfs_mount_on(sysfs_root);
-  vfs_mount_ex(sys_dir, sysfs_root, "none", "unknown", "/sys");
+  sysfs_root->statfs = sysfs_statfs;
+  vfs_mount_ex(sys_dir, sysfs_root, "sysfs", "sysfs", "/sys");
   vfs_close(sys_dir);
 
   // /sys/bus/pci/devices
   vfs_node_t *bus_dir = sysfs_mkdir(sysfs_root, "bus");
   vfs_node_t *pci_dir = sysfs_mkdir(bus_dir, "pci");
+
+  // /sys/module/user_namespace/parameters/enable (queried by bwrap/flatpak)
+  vfs_node_t *module_dir = sysfs_mkdir(sysfs_root, "module");
+  if (module_dir) {
+    vfs_node_t *userns_dir = sysfs_mkdir(module_dir, "user_namespace");
+    if (userns_dir) {
+      vfs_node_t *params_dir = sysfs_mkdir(userns_dir, "parameters");
+      if (params_dir) {
+        sysfs_mkfile(params_dir, "enable", "Y\n");
+      }
+    }
+  }
 
   // /sys/class
   vfs_node_t *class_dir = sysfs_mkdir(sysfs_root, "class");
@@ -386,6 +531,8 @@ void sysfs_init(void) {
   vfs_node_t *system_dir = sysfs_mkdir(devices_dir, "system");
   vfs_node_t *cpu_dir = sysfs_mkdir(system_dir, "cpu");
   sysfs_populate_cpus(cpu_dir);
+  vfs_node_t *node_dir = sysfs_mkdir(system_dir, "node");
+  sysfs_populate_nodes(node_dir);
 
   // /sys/class/block
   vfs_node_t *block_class = sysfs_mkdir(class_dir, "block");
@@ -398,6 +545,16 @@ void sysfs_init(void) {
 
   // /sys/class/net
   net_class_root = sysfs_mkdir(class_dir, "net");
+
+  // /sys/class/power_supply
+  vfs_node_t *ps_class = sysfs_mkdir(class_dir, "power_supply");
+  if (ps_class) {
+    vfs_node_t *acad = sysfs_mkdir(ps_class, "ACAD");
+    if (acad) {
+      sysfs_mkfile(acad, "type", "Mains\n");
+      sysfs_mkfile(acad, "online", "1\n");
+    }
+  }
 
   // /sys/class/drm/card0
   // card0 is a symlink to the real device path (wlroots uses readlink on it)
@@ -703,9 +860,83 @@ void sysfs_init(void) {
     sysfs_symlink(input_devices_dir, "event1", "../event1");
   }
 
+  // /sys/class/sound — HDA card0 (major 116, see alsa_emu.c). Without these
+  // nodes the ALSA monitor enumerates zero cards and rescans in a
+  // ppoll(timeout=0) loop (wireplumber 100% CPU); with a stable card0 it
+  // enumerates once then blocks on uevent hotplug like Linux.
+  vfs_node_t *sound_class = sysfs_mkdir(class_dir, "sound");
+  if (sound_class) {
+    vfs_node_t *card0_dir = sysfs_mkdir(sound_class, "card0");
+    if (card0_dir) {
+      sysfs_mkfile(card0_dir, "number", "0\n");
+      sysfs_mkfile(card0_dir, "uevent",
+                   "MAJOR=116\nMINOR=0\nDEVNAME=snd/controlC0\n"
+                   "SUBSYSTEM=sound\nSOUND_CLASS=control\n");
+      sysfs_symlink(card0_dir, "subsystem", "../../class/sound");
+    }
+    vfs_node_t *ctl_dir = sysfs_mkdir(sound_class, "controlC0");
+    if (ctl_dir) {
+      sysfs_mkfile(ctl_dir, "dev", "116:0\n");
+      sysfs_mkfile(ctl_dir, "uevent",
+                   "MAJOR=116\nMINOR=0\nDEVNAME=snd/controlC0\n"
+                   "SUBSYSTEM=sound\n");
+      sysfs_symlink(ctl_dir, "subsystem", "../../class/sound");
+    }
+    vfs_node_t *pcm_dir = sysfs_mkdir(sound_class, "pcmC0D0p");
+    if (pcm_dir) {
+      sysfs_mkfile(pcm_dir, "dev", "116:24\n");
+      sysfs_mkfile(pcm_dir, "uevent",
+                   "MAJOR=116\nMINOR=24\nDEVNAME=snd/pcmC0D0p\n"
+                   "SUBSYSTEM=sound\n");
+      sysfs_symlink(pcm_dir, "subsystem", "../../class/sound");
+    }
+    vfs_node_t *snd_devices_dir = sysfs_mkdir(sound_class, "devices");
+    if (snd_devices_dir) {
+      sysfs_symlink(snd_devices_dir, "card0", "../card0");
+      sysfs_symlink(snd_devices_dir, "controlC0", "../controlC0");
+      sysfs_symlink(snd_devices_dir, "pcmC0D0p", "../pcmC0D0p");
+    }
+  }
+
+  // /sys/class/tty/tty0/active — elogind manager_connect_console() opens it
+  // to watch foreground VT switches; seat_read_active_vt() parses the content
+  // with vtnr_from_tty(), which expects a TTY *name* ("tty1"), not a bare
+  // number ("0"/"1" fail its "tty" prefix check with EINVAL). AvoryOS has a
+  // single console; report VT 1. Without the file elogind warns "System has
+  // /dev/tty0 but not .../active".
+  vfs_node_t *tty_class = sysfs_mkdir(class_dir, "tty");
+  if (tty_class) {
+    vfs_node_t *tty0_dir = sysfs_mkdir(tty_class, "tty0");
+    if (tty0_dir)
+      sysfs_mkfile(tty0_dir, "active", "tty1\n");
+  }
+
   // /sys/dev/block  /sys/dev/char
   vfs_node_t *dev_dir = sysfs_mkdir(sysfs_root, "dev");
-  sysfs_mkdir(dev_dir, "block");
+  vfs_node_t *dev_block_dir = sysfs_mkdir(dev_dir, "block");
+  /* UDisks2 resolves every block device through /sys/dev/block/<major>:<minor>
+   * (libudev's sysname path). Without these symlinks it sees /sys/block but
+   * cannot map a /dev node back to its sysfs entry, so no StorageVolume gets
+   * a Size or MountPoints and Plasma Disk Usage stays at 0 B. */
+  if (dev_block_dir) {
+    int bcount = block_count();
+    for (int bi = 0; bi < bcount; bi++) {
+      struct block_device *bd = block_get(bi);
+      if (!bd || !bd->name[0])
+        continue;
+      char link_name[32];
+      char majbuf[16], minbuf[16];
+      u64_to_dec(bd->linux_major, majbuf);
+      u64_to_dec(bd->linux_minor, minbuf);
+      strcpy(link_name, majbuf);
+      strcat(link_name, ":");
+      strcat(link_name, minbuf);
+      char link_target[96];
+      snprintf(link_target, sizeof(link_target), "../../class/block/%s",
+               bd->name);
+      sysfs_symlink(dev_block_dir, link_name, link_target);
+    }
+  }
   vfs_node_t *char_dir = sysfs_mkdir(dev_dir, "char");
   {
     // Find the GPU PCI address (same logic as above)
@@ -767,6 +998,11 @@ void sysfs_init(void) {
   // ../../devices/virtual/input/input1/event1
   sysfs_symlink(char_dir, "13:65", "../../devices/virtual/input/input1/event1");
 
+  // Sound char devices (major 116, see alsa_emu.c): libudev resolves
+  // /dev/snd/* back to /sys/class/sound through these.
+  sysfs_symlink(char_dir, "116:0", "../../class/sound/controlC0");
+  sysfs_symlink(char_dir, "116:24", "../../class/sound/pcmC0D0p");
+
   // /sys/subsystem
   // libinput and others expect this to exist for device discovery.
   // Modern Linux has /sys/subsystem/ where entries are symlinks to bus or
@@ -776,6 +1012,7 @@ void sysfs_init(void) {
     sysfs_symlink(subsystem_dir, "pci", "../bus/pci");
     sysfs_symlink(subsystem_dir, "input", "../class/input");
     sysfs_symlink(subsystem_dir, "drm", "../class/drm");
+    sysfs_symlink(subsystem_dir, "sound", "../class/sound");
   }
 
   // /sys/kernel
@@ -785,6 +1022,22 @@ void sysfs_init(void) {
   // /sys/power
   vfs_node_t *power_dir = sysfs_mkdir(sysfs_root, "power");
   sysfs_mkfile(power_dir, "state", "mem\n");
+
+  // /sys/fs/cgroup mountpoint for cgroup2. OpenRC/elogind mount cgroup2
+  // here; without the dirs mount(2) fails with ENOENT and elogind fails
+  // with "Cannot determine cgroup we are running in: No data available".
+  // NOTE: dirs only, no pre-mount. Hybrid layout is tmpfs root + cgroup2/v1
+  // subdirs (mounted by OpenRC/elogind). Pre-mounting cgroup2 at root breaks
+  // their tmpfs-root expectation (EBUSY) and shadows the container.
+  vfs_node_t *fs_dir = sysfs_mkdir(sysfs_root, "fs");
+  if (fs_dir)
+    sysfs_mkdir(fs_dir, "cgroup");
+
+  // Hybrid root must be tmpfs (container), not sysfs dir: elogind stats
+  // /sys/fs/cgroup expecting tmpfs (hybrid) or cgroup2 (unified); sysfs magic
+  // yields ENOMEDIUM without further reads. Pre-mount tmpfs here so the first
+  // statfs already sees tmpfs; submounts (unified/elogind) stack on top.
+  tmpfs_mount_at("/sys/fs/cgroup");
 
   // /run/udev/data population
   // libinput often falls back to the udev database if uevent is insufficient.
@@ -820,12 +1073,17 @@ void sysfs_init(void) {
                    "E:ID_INPUT_MOUSE=1\n"
                    "E:ID_SEAT=seat0\n"
                    "E:NAME=\"AscentOS Mouse\"\n");
+      sysfs_mkfile(data_dir, "c116:0",
+                   "P:/class/sound/controlC0\n"
+                   "E:SUBSYSTEM=sound\n"
+                   "E:SOUND_CLASS=control\n"
+                   "E:ID_SEAT=seat0\n");
+      sysfs_mkfile(data_dir, "c116:24",
+                   "P:/class/sound/pcmC0D0p\n"
+                   "E:SUBSYSTEM=sound\n"
+                   "E:ID_SEAT=seat0\n");
     }
 
-    // Mark system as container-like environment so WebKitGTK and sandbox tools
-    // detect that unprivileged user namespaces are not available and use their
-    // native non-sandboxed process execution path automatically.
-    sysfs_mkfile(run_dir, ".containerenv", "engine=avoryos\n");
 
     if (data_dir) vfs_close(data_dir);
     if (udev_dir) vfs_close(udev_dir);

@@ -134,6 +134,7 @@ void pty_init(void) {
     pty_pool[i].packet_mode = false;
     pty_pool[i].master_node = NULL;
     pty_pool[i].slave_open_count = 0;
+    pty_pool[i].slave_ever_opened = false;
     pty_pool[i].m2s_head = 0;
     pty_pool[i].m2s_tail = 0;
     pty_pool[i].m2s_newline_count = 0;
@@ -196,6 +197,7 @@ int pty_alloc_pair(void) {
       pty_pool[idx].packet_mode = false;
       pty_pool[idx].master_node = NULL;
       pty_pool[idx].slave_open_count = 0;
+      pty_pool[idx].slave_ever_opened = false;
       pty_pool[idx].m2s_head = 0;
       pty_pool[idx].m2s_tail = 0;
       pty_pool[idx].m2s_newline_count = 0;
@@ -284,10 +286,12 @@ uint32_t ptmx_read(struct vfs_node *node, uint32_t offset, uint32_t size,
   spinlock_acquire(&pty->lock);
   // Master reads from slave→master buffer
   while (ring_empty(pty->s2m_head, pty->s2m_tail)) {
-    if (pty->slave_open_count == 0) {
+    if (pty->slave_open_count == 0 && pty->slave_ever_opened) {
       spinlock_release(&pty->lock);
-      return 0; // EOF: No slaves left
+      return 0; // EOF: slaves opened then all closed (hangup)
     }
+    // Before the first slave open there is no hangup yet: fall through to
+    // the blocking / EAGAIN path instead of returning EOF.
 
     struct thread *current = sched_get_current();
     bool is_nonblock = (node->flags & FS_NONBLOCK) != 0;
@@ -307,12 +311,12 @@ uint32_t ptmx_read(struct vfs_node *node, uint32_t offset, uint32_t size,
     // Wait for data from slave
     wait_queue_entry_t entry = {0};
     entry.thread = sched_get_current();
-    wait_queue_add((wait_queue_t *)pty->master_waitq, &entry);
     entry.thread->state = THREAD_BLOCKED;
+    wait_queue_add((wait_queue_t *)pty->master_waitq, &entry);
 
     // Last second check while BLOCKED
     if (!ring_empty(pty->s2m_head, pty->s2m_tail) ||
-        pty->slave_open_count == 0) {
+        (pty->slave_open_count == 0 && pty->slave_ever_opened)) {
       entry.thread->state = THREAD_RUNNING;
       spinlock_release(&pty->lock);
     } else {
@@ -351,7 +355,7 @@ uint32_t ptmx_write(struct vfs_node *node, uint32_t offset, uint32_t size,
 
   pty_pair_t *pty = (pty_pair_t *)node->device;
   if (!pty)
-    return 0;
+    return (uint32_t)-9; // EBADF
 
 #if PTY_DEBUG_LOGGING
   klog_puts("[PTY] ptmx_write: size=");
@@ -376,13 +380,15 @@ uint32_t ptmx_write(struct vfs_node *node, uint32_t offset, uint32_t size,
   klog_puts("\n");
 #endif
 
-  if (pty->slave_open_count == 0) {
+  if (pty->slave_open_count == 0 && pty->slave_ever_opened) {
     spinlock_release(&pty->lock);
 #if PTY_DEBUG_LOGGING
-    klog_puts("[PTY] ptmx_write: no slave open, returning 0\n");
+    klog_puts("[PTY] ptmx_write: slave hung up, returning EIO\n");
 #endif
-    return 0; // Or return -EPIPE/-32
+    return (uint32_t)-5; // EIO: slave side closed after being opened
   }
+  // No slave yet (child hasn't opened /dev/pts/N): buffer the data for the
+  // slave instead of dropping it with a zero return.
 
   // Fast path for raw mode (no input/output processing, no echo)
   // Even in raw mode we must still check ISIG control characters.
@@ -698,6 +704,28 @@ int ptmx_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     break;
   }
 
+  case TCFLSH: {
+    /* arg is a queue selector by value: TCIFLUSH (0), TCOFLUSH (1),
+     * TCIOFLUSH (2). The master's input queue is the slave->master ring;
+     * output has no queue on a pty, so TCOFLUSH is a no-op success. */
+    if (arg > TCIOFLUSH) {
+      ret = -22; // EINVAL
+    } else {
+      if (arg == TCIFLUSH || arg == TCIOFLUSH)
+        pty->s2m_tail = pty->s2m_head;
+      ret = 0;
+    }
+    break;
+  }
+
+  case 0x5422: { // TIOCNOTTY — detach controlling terminal
+    struct thread *t = sched_get_current();
+    if (t)
+      t->ctty = NULL;
+    ret = 0;
+    break;
+  }
+
   default:
     ret = -25; // ENOTTY
     break;
@@ -726,7 +754,7 @@ int ptmx_poll(struct vfs_node *node, int events) {
     // Master can read if slave has written anything
     if (!ring_empty(pty->s2m_head, pty->s2m_tail)) {
       revents |= (events & (POLLIN | POLLRDNORM));
-    } else if (pty->slave_open_count == 0) {
+    } else if (pty->slave_open_count == 0 && pty->slave_ever_opened) {
       revents |= POLLHUP;
     }
   }
@@ -852,8 +880,8 @@ uint32_t pty_slave_read(struct vfs_node *node, uint32_t offset, uint32_t size,
 #endif
     wait_queue_entry_t entry = {0};
     entry.thread = sched_get_current();
-    wait_queue_add((wait_queue_t *)pty->slave_waitq, &entry);
     entry.thread->state = THREAD_BLOCKED;
+    wait_queue_add((wait_queue_t *)pty->slave_waitq, &entry);
 
     // Check availability again while BLOCKED
     bool recheck_can_read = false;
@@ -973,8 +1001,8 @@ uint32_t pty_slave_write(struct vfs_node *node, uint32_t offset, uint32_t size,
       // Wait for space
       wait_queue_entry_t entry = {0};
       entry.thread = sched_get_current();
-      wait_queue_add((wait_queue_t *)pty->slave_write_waitq, &entry);
       entry.thread->state = THREAD_BLOCKED;
+      wait_queue_add((wait_queue_t *)pty->slave_write_waitq, &entry);
 
       // Re-check space while BLOCKED
       if (ring_free(pty->s2m_head, pty->s2m_tail) > 0 || !pty->master_open) {
@@ -1051,6 +1079,8 @@ uint32_t pty_slave_write(struct vfs_node *node, uint32_t offset, uint32_t size,
   klog_uint64(total_written);
   klog_puts("\n");
 #endif
+  if (total_written == 0 && size != 0)
+    return (uint32_t)-5; // EIO: master gone, never return 0 for len != 0
   return total_written;
 }
 
@@ -1205,6 +1235,33 @@ int pty_slave_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     break;
   }
 
+  case 0x5422: { // TIOCNOTTY — detach controlling terminal
+    struct thread *t = sched_get_current();
+    if (t)
+      t->ctty = NULL;
+    ret = 0;
+    break;
+  }
+
+  case 0x541D: { // TIOCCONS — redirect console output to this terminal
+    ret = 0;
+    break;
+  }
+
+  case TCFLSH: {
+    /* arg is a queue selector by value: TCIFLUSH (0), TCOFLUSH (1),
+     * TCIOFLUSH (2). The slave's input queue is the master->slave ring;
+     * output has no queue on a pty, so TCOFLUSH is a no-op success. */
+    if (arg > TCIOFLUSH) {
+      ret = -22; // EINVAL
+    } else {
+      if (arg == TCIFLUSH || arg == TCIOFLUSH)
+        pty->m2s_tail = pty->m2s_head;
+      ret = 0;
+    }
+    break;
+  }
+
   default:
     ret = -25; // ENOTTY
     break;
@@ -1260,6 +1317,7 @@ void pty_slave_open(struct vfs_node *node) {
   // the final close can remove all of them from the pair-wide count.
   node->impl++;
   pty->slave_open_count++;
+  pty->slave_ever_opened = true;
   spinlock_release(&pty->lock);
 
   // Set this as the controlling terminal for the current process

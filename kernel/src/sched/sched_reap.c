@@ -2,6 +2,7 @@
 #define TSC_PROBES_ENABLE
 #include "../lib/tsc.h"
 #include "sched_internal.h"
+#include "../lib/string.h"
 #include "wait.h"
 #include "hal/hal.h"
 #include "../apic/lapic.h"
@@ -128,6 +129,7 @@ void sched_reap_thread(struct thread *t) {
   klog_debug_puts("[REAP] Step 1: remove from lists\n");
   TSC_BEGIN(reap_lists);
   sched_itimer_disarm(t);
+  uint32_t reap_tgid = t->tgid ? t->tgid : t->tid;
   spinlock_acquire(&tid_lock);
 
   // 1.5 Remove from global thread list
@@ -179,6 +181,11 @@ void sched_reap_thread(struct thread *t) {
   t->sibling_next = NULL;
   spinlock_release(&tid_lock);
   TSC_END(reap_lists);
+
+  {
+    extern void posix_timer_delete_process(uint32_t tgid);
+    posix_timer_delete_process(reap_tgid);
+  }
 
   /* Monitoring tools poll /proc continuously. Drop the cached PID tree
    * after the task has been removed from global lookup. */
@@ -280,46 +287,87 @@ void sched_terminate_thread_group(struct thread *current) {
     killed++;
   }
 
-  // If leader was found and is not current, preserve leader as ZOMBIE
+  // If leader was found and is not current, preserve leader as ZOMBIE or auto-reap
   if (leader && leader != current) {
     leader->reap_remove_runqueue = true;
-    __atomic_store_n(&leader->state, THREAD_ZOMBIE, __ATOMIC_RELEASE);
     leader->exit_status = current->exit_status ? current->exit_status : 0;
-    /* The leader may still be executing on another CPU. Removing its entity
-     * here would mutate that CPU's current EEVDF entity from the wrong core;
-     * the next scheduler entry drops terminal candidates under queue_lock.
-     * Kick an active owner so a leader in a long kernel path reaches that
-     * safe scheduler boundary promptly. */
-    struct cpu_info *leader_cpu = cpu_get_info(leader->cpu_index);
-    if (leader_cpu && leader_cpu->status != CPU_STATUS_OFFLINE &&
-        (__atomic_load_n(&leader_cpu->current_thread, __ATOMIC_ACQUIRE) ==
-             leader ||
-         __atomic_load_n(&leader_cpu->switching_from, __ATOMIC_ACQUIRE) ==
-             leader))
-      lapic_send_ipi(leader_cpu->apic_id, IPI_VECTOR_RESCHEDULE);
 
-    struct thread *parent_to_wake = NULL;
-    if (leader->parent) {
-      uint32_t parent_tgid = leader->parent->tgid;
-      /* O(1) fast path, same rationale as process_do_exit(). */
-      if (leader->parent->tgid == parent_tgid &&
-          leader->parent->waiting_for_child &&
-          leader->parent->state == THREAD_BLOCKED) {
-        parent_to_wake = leader->parent;
-      } else {
-        for (struct thread *waiter = global_thread_list; waiter;
-             waiter = waiter->global_next) {
-          if (waiter->tgid == parent_tgid && waiter->waiting_for_child &&
-              waiter->state == THREAD_BLOCKED) {
-            parent_to_wake = waiter;
-            break;
-          }
+    struct thread *parent = leader->parent;
+    int exit_signal = (int)(leader->clone_flags & 0xff);
+    bool auto_reap = false;
+    if (parent && exit_signal == SIGCHLD) {
+      struct k_sigaction *chld_action =
+          &parent->signal_handlers[SIGCHLD - 1];
+      auto_reap = chld_action->sa_handler == (void *)SIG_IGN ||
+                  (chld_action->sa_flags & SA_NOCLDWAIT) != 0;
+      if (!auto_reap &&
+          (chld_action->sa_handler == (void *)SIG_DFL || chld_action->sa_handler == NULL) &&
+          !parent->waiting_for_child) {
+        if (parent->tgid == 1 || parent->tid == 1) {
+          auto_reap = true;
         }
       }
     }
-    spinlock_release(&tid_lock);
-    if (parent_to_wake)
-      sched_wakeup(parent_to_wake);
+
+    if (auto_reap) {
+      __atomic_store_n(&leader->state, THREAD_DEAD, __ATOMIC_RELEASE);
+      if (parent) {
+        if (parent->children == leader) {
+          parent->children = leader->sibling_next;
+        } else {
+          for (struct thread *c = parent->children; c; c = c->sibling_next) {
+            if (c->sibling_next == leader) {
+              c->sibling_next = leader->sibling_next;
+              break;
+            }
+          }
+        }
+        leader->parent = NULL;
+      }
+      struct cpu_info *leader_cpu = cpu_get_info(leader->cpu_index);
+      if (leader_cpu && leader_cpu->status != CPU_STATUS_OFFLINE &&
+          (__atomic_load_n(&leader_cpu->current_thread, __ATOMIC_ACQUIRE) ==
+               leader ||
+           __atomic_load_n(&leader_cpu->switching_from, __ATOMIC_ACQUIRE) ==
+               leader))
+        lapic_send_ipi(leader_cpu->apic_id, IPI_VECTOR_RESCHEDULE);
+
+      sched_queue_reap(leader);
+      killed++;
+      spinlock_release(&tid_lock);
+    } else {
+      __atomic_store_n(&leader->state, THREAD_ZOMBIE, __ATOMIC_RELEASE);
+      struct cpu_info *leader_cpu = cpu_get_info(leader->cpu_index);
+      if (leader_cpu && leader_cpu->status != CPU_STATUS_OFFLINE &&
+          (__atomic_load_n(&leader_cpu->current_thread, __ATOMIC_ACQUIRE) ==
+               leader ||
+           __atomic_load_n(&leader_cpu->switching_from, __ATOMIC_ACQUIRE) ==
+               leader))
+        lapic_send_ipi(leader_cpu->apic_id, IPI_VECTOR_RESCHEDULE);
+
+      struct thread *parent_to_wake = NULL;
+      if (leader->parent) {
+        uint32_t parent_tgid = leader->parent->tgid;
+        /* O(1) fast path, same rationale as process_do_exit(). */
+        if (leader->parent->tgid == parent_tgid &&
+            leader->parent->waiting_for_child &&
+            leader->parent->state == THREAD_BLOCKED) {
+          parent_to_wake = leader->parent;
+        } else {
+          for (struct thread *waiter = global_thread_list; waiter;
+               waiter = waiter->global_next) {
+            if (waiter->tgid == parent_tgid && waiter->waiting_for_child &&
+                waiter->state == THREAD_BLOCKED) {
+              parent_to_wake = waiter;
+              break;
+            }
+          }
+        }
+      }
+      spinlock_release(&tid_lock);
+      if (parent_to_wake)
+        sched_wakeup(parent_to_wake);
+    }
   } else {
     spinlock_release(&tid_lock);
   }
@@ -332,5 +380,68 @@ void sched_terminate_thread_group(struct thread *current) {
     klog_debug_puts("[EXIT_GROUP] queued sibling threads: ");
     klog_debug_uint64(killed);
     klog_debug_puts("\n");
+  }
+}
+
+void sched_reap_orphaned_zombies(void) {
+  struct thread *to_reap = NULL;
+  extern struct thread *global_thread_list;
+  extern spinlock_t tid_lock;
+
+  spinlock_acquire(&tid_lock);
+  for (struct thread *t = global_thread_list; t; t = t->global_next) {
+    if (t->state != THREAD_ZOMBIE && t->state != THREAD_DEAD)
+      continue;
+    if (t->is_idle)
+      continue;
+    if (__atomic_load_n(&t->reap_queued, __ATOMIC_RELAXED))
+      continue;
+
+    struct thread *parent = t->parent;
+    bool can_reap = false;
+    if (!parent) {
+      can_reap = true;
+    } else {
+      if (parent->state == THREAD_DEAD || parent->state == THREAD_ZOMBIE) {
+        can_reap = true;
+      } else if (!parent->waiting_for_child) {
+        if (parent->tgid == 1 || parent->tid == 1) {
+          struct k_sigaction *chld_action = &parent->signal_handlers[SIGCHLD - 1];
+          if (chld_action->sa_handler == (void *)SIG_DFL ||
+              chld_action->sa_handler == NULL ||
+              chld_action->sa_handler == (void *)SIG_IGN ||
+              (chld_action->sa_flags & SA_NOCLDWAIT) != 0) {
+            can_reap = true;
+          }
+        }
+      }
+    }
+
+    if (can_reap) {
+      if (parent) {
+        if (parent->children == t) {
+          parent->children = t->sibling_next;
+        } else {
+          for (struct thread *c = parent->children; c; c = c->sibling_next) {
+            if (c->sibling_next == t) {
+              c->sibling_next = t->sibling_next;
+              break;
+            }
+          }
+        }
+        t->parent = NULL;
+      }
+      t->state = THREAD_DEAD;
+      t->sibling_next = to_reap;
+      to_reap = t;
+    }
+  }
+  spinlock_release(&tid_lock);
+
+  while (to_reap) {
+    struct thread *victim = to_reap;
+    to_reap = to_reap->sibling_next;
+    victim->sibling_next = NULL;
+    sched_queue_reap(victim);
   }
 }

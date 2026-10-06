@@ -37,14 +37,17 @@ CPPFLAGS :=
 #
 #   make SYSCALL_LOG=1         every syscall of every process (very noisy)
 #   make SYSCALL_LOG=browser   only the badwolf/WebKit/bwrap process tree
+#   make SYSCALL_LOG=sddm      only the sddm/Xorg/greeter process tree
 #
-# The browser mode marks a task when it execs something under badwolf/WebKit/
-# bwrap and inherits the mark through fork/clone; it also logs syscall errors
-# and every open() path (see kernel/src/syscalls/syscall.c).
+# The filtered modes mark a task when it execs a matching path and inherit
+# the mark through fork/clone; they also log syscall errors and every open()
+# path (see kernel/src/syscalls/syscall.c).
 ifeq ($(SYSCALL_LOG),1)
 override CPPFLAGS += -DSYSCALL_LOG=1
 else ifeq ($(SYSCALL_LOG),browser)
 override CPPFLAGS += -DSYSCALL_LOG=2
+else ifeq ($(SYSCALL_LOG),sddm)
+override CPPFLAGS += -DSYSCALL_LOG=3
 endif
 
 # /proc/klog ring buffer size, in KiB (default 256).  Browser syscall traces

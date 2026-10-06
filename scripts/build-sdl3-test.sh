@@ -20,7 +20,7 @@ fi
 
 if [ ! -d "$SYSROOT" ]; then
     echo "Error: Alpine rootfs not found at $SYSROOT" >&2
-    echo "       Run scripts/setup-alpine.sh first." >&2
+    echo "       Run scripts/setup-arch.sh first." >&2
     exit 1
 fi
 
@@ -33,7 +33,7 @@ for hdr in \
     if [ ! -f "$hdr" ]; then
         echo "Error: missing header $hdr" >&2
         echo "       Make sure sdl3-dev, sdl3_ttf-dev, libplacebo-dev and capstone-dev" >&2
-        echo "       were installed by setup-alpine.sh." >&2
+        echo "       were installed by setup-arch.sh." >&2
         exit 1
     fi
 done

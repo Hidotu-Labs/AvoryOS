@@ -103,17 +103,23 @@ static void net_worker(void) {
       }
     }
 
+    self->state = THREAD_BLOCKED;
     wait_queue_add(&worker_wait, entry);
     spinlock_acquire(&lock);
     bool empty = (head == tail);
-    if (empty) {
-      self->state = THREAD_BLOCKED;
+    if (!empty) {
+      self->state = THREAD_RUNNING;
+    } else {
       self->wakeup_ticks = lapic_timer_get_ticks() + 50;
     }
     spinlock_release(&lock);
     if (empty) {
       sched_yield();
       self->wakeup_ticks = 0;
+    } else {
+      self->wakeup_ticks = 0;
+      wait_queue_remove(&worker_wait, entry);
+      continue;
     }
     wait_queue_remove(&worker_wait, entry);
   }

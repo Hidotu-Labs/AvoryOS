@@ -3,6 +3,8 @@
 
 extern struct fb_info fb_global;
 extern void *fb_get_target_buffer(void);
+extern void virtio_gpu_console_commit(uint32_t x, uint32_t y, uint32_t w,
+                                      uint32_t h);
 
 /* ── Per-scanline dirty tracking ─────────────────────────────────────────────
  * The console paints horizontal runs: a prompt row, a status bar, a blinking
@@ -221,6 +223,38 @@ void fb_draw_glyph_scanline(uint32_t x, uint32_t y, uint8_t bits, uint32_t fg, u
     fb_mark_dirty(x, y, 8, 1);
 }
 
+void fb_draw_glyph_8x16(uint32_t px, uint32_t py, const uint8_t *glyph, uint32_t fg, uint32_t bg, bool underline) {
+    if (py + 16 > fb_global.var.yres || px + 8 > fb_global.var.xres || !glyph)
+        return;
+
+    void *target = fb_get_target_buffer();
+    if (!target)
+        return;
+
+    uint32_t pitch = fb_global.fix.line_length;
+    for (uint32_t y = 0; y < 16; y++) {
+        uint8_t bits = (underline && y >= 14) ? 0xFF : glyph[y];
+        uint8_t *row = (uint8_t *)target + (uint64_t)fb_row_phys(target, py + y) * pitch + (uint64_t)px * 4;
+
+        uint64_t p0 = (bits & 0x80) ? fg : bg;
+        uint64_t p1 = (bits & 0x40) ? fg : bg;
+        uint64_t p2 = (bits & 0x20) ? fg : bg;
+        uint64_t p3 = (bits & 0x10) ? fg : bg;
+        uint64_t p4 = (bits & 0x08) ? fg : bg;
+        uint64_t p5 = (bits & 0x04) ? fg : bg;
+        uint64_t p6 = (bits & 0x02) ? fg : bg;
+        uint64_t p7 = (bits & 0x01) ? fg : bg;
+
+        uint64_t *d64 = (uint64_t *)row;
+        d64[0] = (p1 << 32) | p0;
+        d64[1] = (p3 << 32) | p2;
+        d64[2] = (p5 << 32) | p4;
+        d64[3] = (p7 << 32) | p6;
+    }
+
+    fb_mark_dirty(px, py, 8, 16);
+}
+
 static inline void fb_row_copy(uint8_t *dst, const uint8_t *src, size_t n) {
     if (dst == src || n == 0)
         return;
@@ -425,6 +459,9 @@ void fb_swap_buffer_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     /* Non-temporal stores retire out of order; fence them out before the
      * display engine (or another CPU) is allowed to look at the aperture. */
     __asm__ volatile("sfence" ::: "memory");
+    /* While fbcon owns the scanout (post-Plymouth text login), mirror the
+     * same rect to the display; no-op under a DRM master. */
+    virtio_gpu_console_commit(x, y, w, h);
 }
 
 void fb_swap_buffer(void) {
@@ -520,4 +557,8 @@ void fb_swap_buffer(void) {
 
     fb_dirty_reset();
     __asm__ volatile("sfence" ::: "memory");
+    /* Mirror the bounding box while fbcon owns the scanout. */
+    if (max_row >= min_row)
+        virtio_gpu_console_commit(0, min_row, max_w,
+                                  max_row - min_row + 1);
 }

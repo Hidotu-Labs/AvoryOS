@@ -121,70 +121,138 @@ int ext2_truncate_impl(vfs_node_t *node, uint32_t new_len) {
   return ext2_write_inode(mnt, node->inode, &inode);
 }
 
+/* Bound lock hold time and journal descriptor usage for large writes. A write
+ * of four 1 KiB blocks shares one transaction instead of four allocator
+ * commits plus one inode commit. Data blocks retain their existing home-write
+ * policy; this does not turn the journal into a data journal. */
+#define EXT2_WRITE_BATCH_BLOCKS 32
+
 uint32_t ext2_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
                          uint8_t *buffer) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
-  if (!mnt)
+  if (!mnt || !buffer)
+    return (uint32_t)-14;
+  if (size == 0)
     return 0;
+  if (size > UINT32_MAX - offset)
+    return (uint32_t)-27;
 
-  ext2_inode_t inode;
-  if (ext2_read_inode(mnt, node->inode, &inode))
-    return 0;
-
-  uint32_t bytes_written = 0;
-  uint8_t *block_buf     = kmalloc(mnt->block_size);
+  uint8_t *block_buf = kmalloc(mnt->block_size);
   if (!block_buf)
-    return 0;
+    return (uint32_t)-12;
+  uint32_t bytes_written = 0;
+  int error = 0;
+  bool is_user = is_user_ptr((uint64_t)buffer);
 
-  while (bytes_written < size) {
-    uint32_t current_offset  = offset + bytes_written;
-    uint32_t logical_block   = current_offset / mnt->block_size;
-    uint32_t offset_in_block = current_offset % mnt->block_size;
-    uint32_t to_write        = mnt->block_size - offset_in_block;
-    if (to_write > size - bytes_written)
-      to_write = size - bytes_written;
-
-    uint32_t disk_block = ext2_get_block_num(mnt, &inode, logical_block);
-
-    if (disk_block == 0) {
-      disk_block = ext2_alloc_block(mnt);
-      if (disk_block == 0)
-        break;
-      ext2_set_block_num(mnt, &inode, logical_block, disk_block);
-      inode.i_blocks += mnt->block_size / 512;
-      memset(block_buf, 0, mnt->block_size);
-    } else if (offset_in_block != 0 || to_write < mnt->block_size) {
-      ext2_read_block(mnt, disk_block, block_buf);
+  while (bytes_written < size && !error) {
+    /* Acquire before reading the inode, not merely before publishing it:
+     * another writer may have extended its map during the previous batch. */
+    if (ext3_journal_start(mnt)) {
+      error = 5;
+      break;
     }
-
-    if (is_user_ptr((uint64_t)buffer)) {
-      unsigned long uncopied = copy_from_user(block_buf + offset_in_block, buffer + bytes_written, to_write);
-      if (uncopied > 0) {
-        bytes_written += (to_write - (uint32_t)uncopied);
-        ext2_write_block(mnt, disk_block, block_buf);
-        break;
-      }
+    ext2_inode_t inode;
+    uint32_t batch_start = bytes_written;
+    bool mapping_changed = false;
+    if (ext2_read_inode(mnt, node->inode, &inode)) {
+      error = 5;
     } else {
-      memcpy(block_buf + offset_in_block, buffer + bytes_written, to_write);
-    }
-    ext2_write_block(mnt, disk_block, block_buf);
+      for (unsigned touched = 0;
+           touched < EXT2_WRITE_BATCH_BLOCKS && bytes_written < size;
+           touched++) {
+        uint32_t current_offset = offset + bytes_written;
+        uint32_t logical_block = current_offset / mnt->block_size;
+        uint32_t offset_in_block = current_offset % mnt->block_size;
+        uint32_t to_write = mnt->block_size - offset_in_block;
+        if (to_write > size - bytes_written)
+          to_write = size - bytes_written;
 
-    bytes_written += to_write;
+        uint32_t disk_block;
+        bool allocated = false;
+        if (ext2_get_block_num_checked(mnt, &inode, logical_block, &disk_block)) {
+          error = 5;
+          break;
+        }
+        if (!disk_block) {
+          disk_block = ext2_alloc_block(mnt);
+          if (!disk_block) {
+            error = 28;
+            break;
+          }
+          /* Mapping helpers can install indirect roots before a later I/O
+           * failure. Preserve their inode changes even on that error path. */
+          mapping_changed = true;
+          if (ext2_set_block_num(mnt, &inode, logical_block, disk_block)) {
+            error = 5;
+            break;
+          }
+          inode.i_blocks += mnt->block_size / 512;
+          memset(block_buf, 0, mnt->block_size);
+          allocated = true;
+        } else if (is_user || offset_in_block || to_write < mnt->block_size) {
+          /* A partial user fault on a full-block overwrite must retain the
+           * existing suffix rather than writing uninitialized scratch bytes. */
+          if (ext2_read_block(mnt, disk_block, block_buf)) {
+            error = 5;
+            break;
+          }
+        }
+
+        uint32_t copied = to_write;
+        if (is_user) {
+          unsigned long uncopied = copy_from_user(
+              block_buf + offset_in_block, buffer + bytes_written, to_write);
+          if (uncopied > to_write) {
+            error = 14;
+            break;
+          }
+          copied -= (uint32_t)uncopied;
+          if (uncopied)
+            error = 14;
+        } else {
+          memcpy(block_buf + offset_in_block, buffer + bytes_written, to_write);
+        }
+        /* A new block installed into a sparse existing file must be zeroed
+         * even if the user copy faults before copying its first byte. */
+        if (copied || allocated) {
+          if (ext2_write_block(mnt, disk_block, block_buf)) {
+            error = 5;
+            break;
+          }
+          bytes_written += copied;
+        }
+        if (error)
+          break;
+      }
+
+      if (bytes_written > batch_start || mapping_changed) {
+        if (offset + bytes_written > inode.i_size && bytes_written > batch_start)
+          inode.i_size = offset + bytes_written;
+        if (bytes_written > batch_start) {
+          uint32_t now = ext2_current_time();
+          inode.i_mtime = now;
+          inode.i_ctime = now;
+        }
+        if (ext2_write_inode(mnt, node->inode, &inode))
+          error = 5;
+      }
+    }
+    /* Always release ownership, including read, allocation, user-copy, and
+     * inode errors. The existing journal cannot roll back prior home writes. */
+    if (ext3_journal_stop(mnt))
+      error = 5;
+    if (error != 5 && (bytes_written > batch_start || mapping_changed)) {
+      node->length = inode.i_size;
+      node->mtime = inode.i_mtime;
+      node->ctime = inode.i_ctime;
+    }
   }
 
-  if (offset + bytes_written > inode.i_size)
-    inode.i_size = offset + bytes_written;
-
-  uint32_t now  = ext2_current_time();
-  inode.i_mtime = now;
-  inode.i_ctime = now;
-
-  ext3_journal_start(mnt);
-  ext2_write_inode(mnt, node->inode, &inode);
-  ext3_journal_stop(mnt);
-  node->length = inode.i_size;
-
   kfree(block_buf);
+  /* User faults and exhaustion retain traditional short-write behavior;
+   * failed metadata or commit I/O must never masquerade as byte success. */
+  if (error == 5 || !bytes_written)
+    return (uint32_t)-(error ? error : 28);
   return bytes_written;
 }
 
@@ -296,7 +364,8 @@ int ext2_symlink_impl(vfs_node_t *node, char *name, char *target) {
   return 0;
 }
 
-int ext2_rename_impl(vfs_node_t *node, char *old_name, char *new_name) {
+static int ext2_rename_in_transaction(vfs_node_t *node, char *old_name,
+                                     char *new_name) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
@@ -346,43 +415,102 @@ int ext2_rename_impl(vfs_node_t *node, char *old_name, char *new_name) {
   return 0;
 }
 
+int ext2_rename_impl(vfs_node_t *node, char *old_name, char *new_name) {
+  if (!node || !node->device)
+    return -1;
+  ext2_mount_t *mnt = (ext2_mount_t *)node->device;
+  /* Both names share directory blocks. Serialize the full read/modify/write
+   * sequence, including source lookup, so parallel renames cannot overwrite
+   * each other's directory images or join another thread's transaction. */
+  if (ext3_journal_start(mnt) != 0)
+    return -1;
+  int result = ext2_rename_in_transaction(node, old_name, new_name);
+  int stop_result = ext3_journal_stop(mnt);
+  return result != 0 ? result : stop_result;
+}
+
 int ext2_chmod_impl(vfs_node_t *node, uint16_t permission) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
+  if (ext3_journal_start(mnt) != 0)
+    return -1;
 
   ext2_inode_t inode;
-  if (ext2_read_inode(mnt, node->inode, &inode))
+  if (ext2_read_inode(mnt, node->inode, &inode)) {
+    ext3_journal_stop(mnt);
     return -1;
+  }
 
   inode.i_mode  = (inode.i_mode & 0xF000) | (permission & 0x0FFF);
   inode.i_ctime = ext2_current_time();
 
-  if (ext2_write_inode(mnt, node->inode, &inode))
+  if (ext2_write_inode(mnt, node->inode, &inode)) {
+    ext3_journal_stop(mnt);
     return -1;
+  }
 
   node->mask = permission & 0x0FFF;
-  return 0;
+  return ext3_journal_stop(mnt);
 }
 
 int ext2_chown_impl(vfs_node_t *node, uint32_t uid, uint32_t gid) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
+  if (ext3_journal_start(mnt) != 0)
+    return -1;
+
+  ext2_inode_t inode;
+  if (ext2_read_inode(mnt, node->inode, &inode)) {
+    ext3_journal_stop(mnt);
+    return -1;
+  }
+
+  uint32_t now = ext2_current_time();
+  if (inode.i_uid == uid && inode.i_gid == gid && inode.i_ctime == now) {
+    node->uid = uid;
+    node->gid = gid;
+    return ext3_journal_stop(mnt);
+  }
+
+  inode.i_uid   = uid;
+  inode.i_gid   = gid;
+  inode.i_ctime = now;
+
+  if (ext2_write_inode(mnt, node->inode, &inode)) {
+    ext3_journal_stop(mnt);
+    return -1;
+  }
+
+  node->uid = uid;
+  node->gid = gid;
+  return ext3_journal_stop(mnt);
+}
+
+int ext2_utime_impl(vfs_node_t *node, uint32_t atime, uint32_t mtime) {
+  ext2_mount_t *mnt = (ext2_mount_t *)node->device;
+  if (!mnt)
+    return -1;
 
   ext2_inode_t inode;
   if (ext2_read_inode(mnt, node->inode, &inode))
     return -1;
 
-  inode.i_uid   = uid;
-  inode.i_gid   = gid;
+  inode.i_atime = atime;
+  inode.i_mtime = mtime;
   inode.i_ctime = ext2_current_time();
 
-  if (ext2_write_inode(mnt, node->inode, &inode))
+  ext3_journal_start(mnt);
+  if (ext2_write_inode(mnt, node->inode, &inode)) {
+    ext3_journal_stop(mnt);
     return -1;
+  }
+  ext3_journal_stop(mnt);
 
-  node->uid = uid;
-  node->gid = gid;
+  node->atime = atime;
+  node->mtime = mtime;
+  node->ctime = inode.i_ctime;
   return 0;
 }
 
@@ -505,7 +633,7 @@ int ext2_rmdir_impl(vfs_node_t *node, char *name) {
   uint32_t group = (target_ino - 1) / mnt->inodes_per_group;
   if (mnt->bgdt[group].bg_used_dirs_count > 0)
     mnt->bgdt[group].bg_used_dirs_count--;
-  ext2_mark_metadata_dirty(mnt);
+  ext2_mark_group_dirty(mnt, group);
 
   ext3_journal_stop(mnt);
   return 0;

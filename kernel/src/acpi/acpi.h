@@ -104,6 +104,62 @@ struct acpi_mcfg {
   struct acpi_mcfg_entry entries[];
 } __attribute__((packed));
 
+// SRAT (System Resource Affinity Table)
+struct acpi_srat {
+  struct acpi_sdt_header header;
+  uint32_t table_revision;
+  uint64_t reserved;
+  uint8_t entries[];
+} __attribute__((packed));
+
+struct acpi_srat_entry_header {
+  uint8_t type;
+  uint8_t length;
+} __attribute__((packed));
+
+// SRAT Entry Type 0: Processor Local APIC/SAPIC Affinity
+struct acpi_srat_cpu_affinity {
+  struct acpi_srat_entry_header header;
+  uint8_t proximity_domain_lo;
+  uint8_t apic_id;
+  uint32_t flags; // bit 0 = Enabled
+  uint8_t local_sapic_eid;
+  uint8_t proximity_domain_hi[3];
+  uint32_t clock_domain;
+} __attribute__((packed));
+
+// SRAT Entry Type 1: Memory Affinity
+struct acpi_srat_mem_affinity {
+  struct acpi_srat_entry_header header;
+  uint32_t proximity_domain;
+  uint16_t reserved1;
+  uint32_t base_address_lo;
+  uint32_t base_address_hi;
+  uint32_t length_lo;
+  uint32_t length_hi;
+  uint32_t reserved2;
+  uint32_t flags; // bit 0 = Enabled, bit 1 = Hot Pluggable, bit 2 = Non-Volatile
+  uint64_t reserved3;
+} __attribute__((packed));
+
+// SRAT Entry Type 2: Processor Local x2APIC Affinity
+struct acpi_srat_x2apic_affinity {
+  struct acpi_srat_entry_header header;
+  uint16_t reserved;
+  uint32_t proximity_domain;
+  uint32_t x2apic_id;
+  uint32_t flags; // bit 0 = Enabled
+  uint32_t clock_domain;
+  uint32_t reserved2;
+} __attribute__((packed));
+
+// SLIT (System Locality Distance Information Table)
+struct acpi_slit {
+  struct acpi_sdt_header header;
+  uint64_t localities_count;
+  uint8_t matrix[];
+} __attribute__((packed));
+
 // FADT (Fixed ACPI Description Table)
 struct acpi_fadt {
   struct acpi_sdt_header header;
@@ -311,6 +367,16 @@ struct acpi_mcfg *acpi_get_mcfg(void);
 
 // Returns the FADT table if present, otherwise NULL.
 struct acpi_fadt *acpi_get_fadt(void);
+
+// Returns the SRAT table if present, otherwise NULL.
+struct acpi_srat *acpi_get_srat(void);
+
+// Returns the SLIT table if present, otherwise NULL.
+struct acpi_slit *acpi_get_slit(void);
+
+// Early table lookup before PMM is initialized
+void *acpi_early_find_table(struct limine_rsdp_response *response,
+                            uint64_t hhdm_offset, const char *signature);
 
 // Parses and logs FADT information. Returns true if FADT found.
 bool acpi_parse_fadt(void);

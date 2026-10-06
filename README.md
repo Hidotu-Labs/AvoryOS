@@ -81,7 +81,7 @@ Run the bootstrap script to pull protocol headers, runtime submodules, and prepa
 Populate the root filesystem with packages (X11, KDE/XFCE/IceWM, Mesa, GCC toolchain, Firefox, fonts, and core utilities):
 
 ```bash
-./scripts/setup-alpine.sh
+./scripts/setup-arch.sh
 ```
 
 ### 3. Build Ported Userland Software & Games

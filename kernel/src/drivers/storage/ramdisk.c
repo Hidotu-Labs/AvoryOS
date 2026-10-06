@@ -24,6 +24,7 @@ static int ramdisk_read(struct block_device *dev, uint64_t lba,
         len = rd->size_bytes - offset;
 
     memcpy(buf, rd->base + offset, len);
+    block_stat_read(dev, (uint32_t)(len / BLOCK_SECTOR_SIZE));
     return 0;
 }
 
@@ -40,6 +41,7 @@ static int ramdisk_write(struct block_device *dev, uint64_t lba,
         len = rd->size_bytes - offset;
 
     memcpy(rd->base + offset, buf, len);
+    block_stat_write(dev, (uint32_t)(len / BLOCK_SECTOR_SIZE));
     return 0;
 }
 

@@ -43,6 +43,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/prctl.h>
+#include <sys/signalfd.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -116,7 +118,10 @@ static void test_sigchld_death_pipe(void) {
   /* No wait4() here on purpose: the handler is the only thing allowed to reap,
      exactly as in QProcess::waitForFinished(). */
   struct pollfd pfd = {.fd = notify_pipe[0], .events = POLLIN, .revents = 0};
-  int ready = poll(&pfd, 1, 5000);
+  int ready;
+  do {
+    ready = poll(&pfd, 1, 5000);
+  } while (ready < 0 && errno == EINTR);
   check(ready == 1, "poll(death pipe) wakes when the child exits");
   if (ready != 1) {
     close(notify_pipe[0]);
@@ -199,6 +204,91 @@ static void test_pidfd_only(void) {
   r = waitid(P_PIDFD, fd, &si, WEXITED | WNOHANG);
   check(r == -1 && errno == EBADF, "a regular file gives EBADF, not a foreign wait");
   close(fd);
+}
+
+/* A desktop parent can observe exit through a pidfd before it calls waitid.
+ * SIG_DFL must retain the status even when no wait syscall is blocked yet.
+ * The old process-name heuristic discarded children of these names. */
+static void test_desktop_delayed_wait(void) {
+  printf("== desktop process names preserve delayed child waits\n");
+  char original_name[16] = {0};
+  if (prctl(PR_GET_NAME, original_name) != 0) {
+    check(0, "read process name");
+    return;
+  }
+  struct sigaction dfl;
+  memset(&dfl, 0, sizeof(dfl));
+  dfl.sa_handler = SIG_DFL;
+  sigemptyset(&dfl.sa_mask);
+  check(sigaction(SIGCHLD, &dfl, NULL) == 0, "default SIGCHLD for delayed wait");
+  const char *names[] = {"sddm", "dbus-daemon", "plasmashell", "startplasma-x11"};
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+    check(prctl(PR_SET_NAME, names[i]) == 0, names[i]);
+    for (int round = 0; round < 8; round++) {
+      int pidfd = -1;
+      long child = syscall(SYS_clone, CLONE_PIDFD | SIGCHLD, 0, &pidfd, 0, 0);
+      if (child == 0)
+        _exit(37);
+      if (child < 0 || pidfd < 0) {
+        check(0, "create desktop child with pidfd");
+        if (child > 0)
+          waitpid((pid_t)child, NULL, 0);
+        break;
+      }
+      struct pollfd pfd = {.fd = pidfd, .events = POLLIN};
+      int ready = poll(&pfd, 1, 3000);
+      check(ready == 1, "pidfd reports desktop child exit before wait");
+      /* Let any asynchronous reaper run, while no wait syscall is active. */
+      usleep(20000);
+      siginfo_t si;
+      memset(&si, 0, sizeof(si));
+      int result = waitid(P_PIDFD, pidfd, &si, WEXITED | WNOHANG | WNOWAIT);
+      check(result == 0 && si.si_pid == child && si.si_status == 37,
+            "delayed waitid(WNOWAIT) retains exit status");
+      int status = 0;
+      pid_t reaped = waitpid((pid_t)child, &status, ready == 1 ? WNOHANG : 0);
+      check(reaped == child && WIFEXITED(status) && WEXITSTATUS(status) == 37,
+            "waitpid consumes retained desktop child status");
+      close(pidfd);
+    }
+  }
+  check(prctl(PR_SET_NAME, original_name) == 0, "restore process name");
+}
+
+static void test_blocked_sigchld_signalfd(void) {
+  printf("== blocked default SIGCHLD remains readable through signalfd\n");
+  sigset_t mask, saved_mask;
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGCHLD);
+  if (sigprocmask(SIG_BLOCK, &mask, &saved_mask) != 0) {
+    check(0, "block SIGCHLD for signalfd");
+    return;
+  }
+  int fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+  check(fd >= 0, "create SIGCHLD signalfd");
+  if (fd >= 0) {
+    pid_t child = fork();
+    if (child == 0)
+      _exit(29);
+    check(child > 0, "fork signalfd child");
+    if (child > 0) {
+      struct pollfd pfd = {.fd = fd, .events = POLLIN};
+      int ready = poll(&pfd, 1, 3000);
+      check(ready == 1, "blocked SIGCHLD wakes signalfd poll");
+      struct signalfd_siginfo info = {0};
+      ssize_t bytes = read(fd, &info, sizeof(info));
+      check(bytes == sizeof(info) && info.ssi_signo == SIGCHLD &&
+                info.ssi_pid == (uint32_t)child,
+            "signalfd identifies the exited child");
+      int status = 0;
+      check(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+                WEXITSTATUS(status) == 29,
+            "signalfd notification preserves waitable status");
+    }
+    close(fd);
+  }
+  check(sigprocmask(SIG_SETMASK, &saved_mask, NULL) == 0,
+        "restore signal mask after signalfd");
 }
 
 /* ------------------------------------------------------------------------ */
@@ -332,6 +422,8 @@ int main(void) {
   test_sigchld_death_pipe();
   test_clone_pidfd();
   test_pidfd_only();
+  test_desktop_delayed_wait();
+  test_blocked_sigchld_signalfd();
   test_exec_closes_started_pipe();
   printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
   return failures ? 1 : 0;

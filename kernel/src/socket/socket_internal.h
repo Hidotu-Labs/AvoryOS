@@ -36,6 +36,8 @@ typedef struct unix_packet {
   int cred_pid;
   int cred_uid;
   int cred_gid;
+  struct sockaddr_un sender_addr;
+  int sender_addr_len;
   uint8_t data[];           // Inline packet payload
 } unix_packet_t;
 
@@ -43,6 +45,8 @@ typedef struct unix_sock {
   socket_t *parent;           // Pointer to the parent socket structure
   struct sockaddr_un addr;    // Bound address
   int addr_len;               // Address length
+  struct sockaddr_un last_sender_addr; // Last datagram sender address
+  int last_sender_addr_len;
   struct list_head bind_node; // Node in the bound sockets list
 
   // Connection state
@@ -86,9 +90,20 @@ typedef struct unix_sock {
   bool orphaned;          // Client closed before accept - pending cleanup
   bool accepted_orphaned; // Accepted socket whose peer closed before accept
   bool was_connected;     // Ever reached SS_CONNECTED (survives peer teardown)
+  // Cached peer credentials for SO_PEERCRED after disconnect. Linux retains
+  // the peer cred even when the peer closed; D-Bus/X11 query creds during
+  // teardown handshakes when usk->peer is already NULL (log: "SO_PEERCRED
+  // but no peer" -> ENOTCONN stalls kwin components -> no frames ->
+  // FreezeDetector SIGABRT). Updated on every successful live query plus at
+  // link/accept time; returned when the peer is gone but was connected.
+  uint32_t peer_cred_pid;
+  uint32_t peer_cred_uid;
+  uint32_t peer_cred_gid;
+  bool peer_cred_valid;
 
 
   bool passcred;   // SO_PASSCRED - pass credentials in recvmsg
+  bool is_syslog_sink; // In-kernel syslog / journal datagram sink
   int rcvtimeo_ms; // SO_RCVTIMEO - receive timeout in ms
   int sndtimeo_ms; // SO_SNDTIMEO - send timeout in ms
 

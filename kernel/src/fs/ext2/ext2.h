@@ -123,19 +123,31 @@ typedef struct {
   char name[];
 } __attribute__((packed)) ext2_dirent_t;
 
+#define EXT3_JOURNAL_MAP_SLOTS 64
+
 typedef struct {
   bool active;
+  bool io_failed;
   uint32_t owner_tid;
   uint32_t depth;
   uint32_t sequence;
   uint32_t start_block;
   ext2_inode_t journal_inode;
   uint8_t *desc_block_buf;
+  uint8_t *commit_block_buf;
+  uint8_t *super_block_buf;
+  /* The journal inode's allocation is fixed for the lifetime of this mount.
+   * Cache only mappings, never mutable journal contents. Keys are logical+1
+   * so a zero-initialized slot is empty. Collisions just remap on demand. */
+  uint32_t map_keys[EXT3_JOURNAL_MAP_SLOTS];
+  uint32_t map_blocks[EXT3_JOURNAL_MAP_SLOTS];
+  uint32_t journal_blocks;
   uint32_t blocks_in_trans;
   rawspinlock_t lock;
 } ext3_journal_state_t;
 
 #define EXT2_CACHE_SIZE 2048
+#define EXT2_DIRTY_BGD_MAX 64
 
 typedef struct {
   struct block_device *dev;
@@ -149,6 +161,10 @@ typedef struct {
   struct {
     uint32_t num;
     uint8_t *data;
+    /* Protected by cache_lock. Misses must not install an image read across
+     * a write, even if another block has evicted the writer's cache entry. */
+    uint64_t write_seq;
+    uint32_t writes_inflight;
   } cache[EXT2_CACHE_SIZE];
   spinlock_t cache_lock;
   /* Group-descriptor table and superblock counters are mutated in memory by
@@ -156,11 +172,17 @@ typedef struct {
    * journal transaction (ext2_flush_metadata, called from
    * ext3_journal_stop), not after every single allocation. */
   bool metadata_dirty;
+  /* Descriptor blocks touched by allocator counters. Overflow falls back
+   * to the full table; correctness never depends on this list fitting. */
+  bool bgdt_all_dirty;
+  uint32_t dirty_bgd_count;
+  uint32_t dirty_bgd_blocks[EXT2_DIRTY_BGD_MAX];
   ext3_journal_state_t journal;
 } ext2_mount_t;
 
 int ext2_mount(struct block_device *dev, vfs_node_t *mountpoint);
 int ext2_mount_root(struct block_device *dev);
+int ext2_statfs_impl(vfs_node_t *node, struct statfs_buf *buf);
 int ext2_read_block(ext2_mount_t *mnt, uint32_t block_num, void *buffer);
 int ext2_write_block(ext2_mount_t *mnt, uint32_t block_num, const void *buffer);
 int ext2_read_inode(ext2_mount_t *mnt, uint32_t inode_num, ext2_inode_t *out);

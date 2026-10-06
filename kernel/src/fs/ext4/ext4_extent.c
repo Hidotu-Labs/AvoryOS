@@ -651,16 +651,9 @@ int ext4_alloc_extent(ext2_mount_t *mnt, ext2_inode_t *inode,
     if (!mnt || !inode || !out_phys || !num_blocks || num_blocks > 0x7FFF)
         return -1;
 
-    uint32_t stack_blocks[32];
-    uint32_t *blocks = (num_blocks <= 32) ? stack_blocks : kmalloc(num_blocks * sizeof(*blocks));
-    if (!blocks)
-        return -1;
-
     int fail_reason = 0;
-    if (ext3_journal_start(mnt) != 0) {
-        if (blocks != stack_blocks) kfree(blocks);
+    if (ext3_journal_start(mnt) != 0)
         return -1;
-    }
 
     uint32_t goal = 0;
     if (logical_block > 0) {
@@ -674,32 +667,14 @@ int ext4_alloc_extent(ext2_mount_t *mnt, ext2_inode_t *inode,
                ((inode_num % 64) * 64);
     }
 
+    /* One reservation publishes all bits in a contiguous run together.
+     * The allocator may return a shorter run on fragmentation or a group
+     * boundary; the write loop will request the remaining blocks later. */
     uint32_t count = 0;
     int result = -1;
-    while (count < num_blocks) {
-        uint32_t hint = goal ? (goal + count) : 0;
-        uint32_t blk = ext2_alloc_block_hint(mnt, hint);
-        if (!blk) {
-            if (count > 0) break;
-            fail_reason = 2; /* No free blocks */
-            goto done;
-        }
-        if (count == 0 && goal > 0 && blk != goal) {
-            /* Prefer adjacency with the goal, but never give up the block we
-             * already own: if the jump-ahead target is also taken, keep this
-             * one instead of failing the whole write. */
-            uint32_t alt_goal = blk + 256 + ((inode_num % 16) * 64);
-            uint32_t alt = ext2_alloc_block_hint(mnt, alt_goal);
-            if (alt) {
-                ext2_free_block(mnt, blk);
-                blk = alt;
-            }
-        } else if (count > 0 && blk != blocks[0] + count) {
-            ext2_free_block(mnt, blk);
-            break;
-        }
-        blocks[count++] = blk;
-    }
+    uint32_t first = ext2_alloc_run_hint(mnt, goal, num_blocks, &count);
+    if (!first)
+        count = 0;
 
     if (count == 0) {
         if (!fail_reason) fail_reason = 2;
@@ -707,14 +682,14 @@ int ext4_alloc_extent(ext2_mount_t *mnt, ext2_inode_t *inode,
     }
 
     int insert_err = ext4_extent_insert(mnt, inode, inode_num, logical_block,
-                                        blocks[0], (uint16_t)count);
+                                        first, (uint16_t)count);
     if (insert_err != 0) {
         fail_reason = 3; /* Extent tree insert failed */
         goto done;
     }
 
     inode->i_blocks += count * (mnt->block_size / 512);
-    *out_phys = blocks[0];
+    *out_phys = first;
     result = 0;
 
 done:
@@ -731,10 +706,10 @@ done:
         }
         klog_puts("\n");
         for (uint32_t i = 0; i < count; i++)
-            ext2_free_block(mnt, blocks[i]);
+            ext2_free_block(mnt, first + i);
     }
-    ext3_journal_stop(mnt);
-    if (blocks != stack_blocks) kfree(blocks);
+    if (ext3_journal_stop(mnt) != 0)
+        result = -1;
     return result;
 }
 static void ext4_extent_unaccount(ext2_mount_t *mnt, ext2_inode_t *inode,

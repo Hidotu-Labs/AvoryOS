@@ -1084,19 +1084,32 @@ struct tcp_tcb *tcp_accept(struct tcp_tcb *t, bool nonblock)
 
         if (t->wait_queue) {
             wait_queue_t *wq = (wait_queue_t *)t->wait_queue;
-            wait_queue_entry_t entry = { .thread = cur, .next = NULL };
-            /* Link and block before dropping the TCP lock.  A completed
-             * handshake cannot then slip between the empty check and waiter
-             * registration, leaving accept asleep until its polling timeout. */
-            wait_queue_add(wq, &entry);
+            wait_queue_entry_t entry = { .thread = cur, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL };
+            /* BLOCKED before add + recheck under TCP lock: a completed
+             * handshake between the first empty check and the add would
+             * otherwise lose its wake (wake sees RUNNING). */
             if (cur) {
                 cur->state = THREAD_BLOCKED;
                 cur->wakeup_ticks = lapic_timer_get_ticks() + 100;
+            }
+            wait_queue_add(wq, &entry);
+            if (t->accept_head != t->accept_tail) {
+                if (cur) {
+                    cur->state = THREAD_RUNNING;
+                    cur->wakeup_ticks = 0;
+                }
+                spinlock_release(&lock);
+                wait_queue_remove(wq, &entry);
+                if (cur && cur->state == THREAD_BLOCKED)
+                    cur->state = THREAD_RUNNING;
+                continue;
             }
             spinlock_release(&lock);
             sched_yield();
             if (cur) cur->wakeup_ticks = 0;
             wait_queue_remove(wq, &entry);
+            if (cur && cur->state == THREAD_BLOCKED)
+                cur->state = THREAD_RUNNING;
         } else {
             spinlock_release(&lock);
             sched_yield();
@@ -1227,18 +1240,35 @@ int tcp_send(struct tcp_tcb *t, const void *buf, size_t len, bool nonblock)
             if (t->wait_queue) {
                 wait_queue_t *wq = (wait_queue_t *)t->wait_queue;
                 struct thread *cur = sched_get_current();
-                wait_queue_entry_t entry = { .thread = cur, .next = NULL };
-                /* ACK processing wakes senders under the TCP lock.  Register
-                 * this waiter before releasing it so an ACK cannot be lost. */
-                wait_queue_add(wq, &entry);
+                wait_queue_entry_t entry = { .thread = cur, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL };
+                /* ACK processing wakes senders under the TCP lock.  BLOCKED
+                 * before add + recheck space so an ACK cannot be lost. */
                 if (cur) {
                     cur->state = THREAD_BLOCKED;
                     cur->wakeup_ticks = lapic_timer_get_ticks() + 50;
+                }
+                wait_queue_add(wq, &entry);
+                {
+                    size_t ub = t->tx_head - t->snd_una;
+                    size_t rsp = ub < t->tx_capacity ? t->tx_capacity - ub : 0;
+                    if (rsp != 0 || !t->used || t->state != TCP_ESTABLISHED || t->error) {
+                        if (cur) {
+                            cur->state = THREAD_RUNNING;
+                            cur->wakeup_ticks = 0;
+                        }
+                        spinlock_release(&lock);
+                        wait_queue_remove(wq, &entry);
+                        if (cur && cur->state == THREAD_BLOCKED)
+                            cur->state = THREAD_RUNNING;
+                        continue;
+                    }
                 }
                 spinlock_release(&lock);
                 sched_yield();
                 if (cur) cur->wakeup_ticks = 0;
                 wait_queue_remove(wq, &entry);
+                if (cur && cur->state == THREAD_BLOCKED)
+                    cur->state = THREAD_RUNNING;
             } else {
                 spinlock_release(&lock);
                 sched_yield();
@@ -1373,13 +1403,26 @@ int tcp_recv(struct tcp_tcb *t, void *buf, size_t len, bool nonblock)
 
         if (t->wait_queue) {
             wait_queue_t *wq = (wait_queue_t *)t->wait_queue;
-            wait_queue_entry_t entry = { .thread = cur, .next = NULL };
-            /* Pair the empty check with queue registration while holding the
-             * TCP lock.  Incoming data takes this same lock before waking us. */
-            wait_queue_add(wq, &entry);
+            wait_queue_entry_t entry = { .thread = cur, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL };
+            /* BLOCKED before add + recheck data under TCP lock. Incoming
+             * data takes this same lock before waking us. */
             if (cur) {
                 cur->state = THREAD_BLOCKED;
                 cur->wakeup_ticks = lapic_timer_get_ticks() + 100;
+            }
+            wait_queue_add(wq, &entry);
+            if ((t->rx_head - t->rx_tail) != 0 || !t->used || t->peer_closed || t->error) {
+                if (cur) {
+                    cur->state = THREAD_RUNNING;
+                    cur->wakeup_ticks = 0;
+                }
+                spinlock_release(&lock);
+                if (send_flush_ack)
+                    emit(t, ACK, NULL, 0);
+                wait_queue_remove(wq, &entry);
+                if (cur && cur->state == THREAD_BLOCKED)
+                    cur->state = THREAD_RUNNING;
+                continue;
             }
             spinlock_release(&lock);
             if (send_flush_ack)
@@ -1387,6 +1430,8 @@ int tcp_recv(struct tcp_tcb *t, void *buf, size_t len, bool nonblock)
             sched_yield();
             if (cur) cur->wakeup_ticks = 0;
             wait_queue_remove(wq, &entry);
+            if (cur && cur->state == THREAD_BLOCKED)
+                cur->state = THREAD_RUNNING;
         } else {
             spinlock_release(&lock);
             if (send_flush_ack)

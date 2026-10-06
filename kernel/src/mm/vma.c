@@ -206,6 +206,9 @@ static struct vma *delete_node(struct vma *node, uint64_t start,
       temp->file_node = NULL;
       node->linux_vma = temp->linux_vma;
       temp->linux_vma = NULL;
+      node->numa_policy = temp->numa_policy;
+      node->numa_nodemask = temp->numa_nodemask;
+      node->numa_preferred_node = temp->numa_preferred_node;
 
       // Delete the inorder successor
       node->right = delete_node(node->right, temp->start, deleted);
@@ -288,6 +291,9 @@ int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
   new_node->file_node = file_node;
   vma_file_ref(file_node);
   new_node->linux_vma = NULL;
+  new_node->numa_policy = 0;
+  new_node->numa_nodemask = 0;
+  new_node->numa_preferred_node = 0;
   new_node->height = 1;
   new_node->left = NULL;
   new_node->right = NULL;
@@ -654,6 +660,12 @@ static bool clone_recursive(struct vma_list *dst, struct vma *node) {
               node->offset, node->file_node, node->file_size) != 0)
     return false;
   vma_attach_linux(dst, node->start, node->linux_vma);
+  struct vma *cloned = vma_find(dst, node->start);
+  if (cloned) {
+    cloned->numa_policy = node->numa_policy;
+    cloned->numa_nodemask = node->numa_nodemask;
+    cloned->numa_preferred_node = node->numa_preferred_node;
+  }
   return clone_recursive(dst, node->left) &&
          clone_recursive(dst, node->right);
 }
@@ -779,6 +791,9 @@ void vma_merge_adjacent(struct vma_list *list) {
     int      fd;
     void    *file_node;
     void    *linux_vma;
+    int      numa_policy;
+    uint64_t numa_nodemask;
+    int      numa_preferred_node;
   };
 
   struct vma_merged_entry merged_stack[VMA_STACK_CAP];
@@ -799,33 +814,32 @@ void vma_merge_adjacent(struct vma_list *list) {
   int m = 0; // number of output regions
 
   // Seed with the first entry — copy all fields.
-  merged[0].start     = arr[0]->start;
-  merged[0].end       = arr[0]->end;
-  merged[0].prot      = arr[0]->prot;
-  merged[0].flags     = arr[0]->flags;
-  merged[0].offset    = arr[0]->offset;
-  merged[0].file_size = arr[0]->file_size;
-  merged[0].fd        = arr[0]->fd;
-  merged[0].file_node = arr[0]->file_node;
-  merged[0].linux_vma = arr[0]->linux_vma;
+  merged[0].start               = arr[0]->start;
+  merged[0].end                 = arr[0]->end;
+  merged[0].prot                = arr[0]->prot;
+  merged[0].flags               = arr[0]->flags;
+  merged[0].offset              = arr[0]->offset;
+  merged[0].file_size           = arr[0]->file_size;
+  merged[0].fd                  = arr[0]->fd;
+  merged[0].file_node           = arr[0]->file_node;
+  merged[0].linux_vma           = arr[0]->linux_vma;
+  merged[0].numa_policy         = arr[0]->numa_policy;
+  merged[0].numa_nodemask       = arr[0]->numa_nodemask;
+  merged[0].numa_preferred_node = arr[0]->numa_preferred_node;
   m = 1;
 
   for (int i = 1; i < idx; i++) {
     struct vma *cur              = arr[i];
     struct vma_merged_entry *prev = &merged[m - 1];
 
-    // Only merge truly anonymous adjacent regions with identical prot and
-    // flags.  ELF PT_LOAD VMAs deliberately use fd == -1 because they are
-    // backed directly by a vfs_node rather than a process descriptor, so fd
-    // alone cannot distinguish them from anonymous mappings.  Merging two
-    // such file-backed VMAs loses the second region's offset/file_size; after
-    // a RELRO mprotect this makes the dynamic loader see zero-filled init
-    // arrays and can lead to an indirect call through address zero.
-    // Additionally, we avoid merging GROWSDOWN VMAs (stack) to preserve their 
-    // identity for the fault handler's growth logic.
+    // Only merge truly anonymous adjacent regions with identical prot, flags,
+    // and NUMA policy.
     bool can_merge = (prev->end   == cur->start) &&
                      (prev->prot  == cur->prot)   &&
                      (prev->flags == cur->flags)   &&
+                     (prev->numa_policy == cur->numa_policy) &&
+                     (prev->numa_nodemask == cur->numa_nodemask) &&
+                     (prev->numa_preferred_node == cur->numa_preferred_node) &&
                      (prev->file_node == NULL)      &&
                      (cur->file_node  == NULL)      &&
                      (prev->linux_vma == cur->linux_vma) &&
@@ -836,15 +850,18 @@ void vma_merge_adjacent(struct vma_list *list) {
       prev->end = cur->end; // extend the current run
     } else {
       // Carry the VMA through unchanged — preserve every field.
-      merged[m].start     = cur->start;
-      merged[m].end       = cur->end;
-      merged[m].prot      = cur->prot;
-      merged[m].flags     = cur->flags;
-      merged[m].offset    = cur->offset;
-      merged[m].file_size = cur->file_size;
-      merged[m].fd        = cur->fd;
-      merged[m].file_node = cur->file_node;
-      merged[m].linux_vma = cur->linux_vma;
+      merged[m].start               = cur->start;
+      merged[m].end                 = cur->end;
+      merged[m].prot                = cur->prot;
+      merged[m].flags               = cur->flags;
+      merged[m].offset              = cur->offset;
+      merged[m].file_size           = cur->file_size;
+      merged[m].fd                  = cur->fd;
+      merged[m].file_node           = cur->file_node;
+      merged[m].linux_vma           = cur->linux_vma;
+      merged[m].numa_policy         = cur->numa_policy;
+      merged[m].numa_nodemask       = cur->numa_nodemask;
+      merged[m].numa_preferred_node = cur->numa_preferred_node;
       m++;
     }
   }
@@ -868,6 +885,12 @@ void vma_merge_adjacent(struct vma_list *list) {
               merged[i].fd,    merged[i].offset,
               merged[i].file_node, merged[i].file_size);
       vma_attach_linux(list, merged[i].start, merged[i].linux_vma);
+      struct vma *restored = vma_find(list, merged[i].start);
+      if (restored) {
+        restored->numa_policy = merged[i].numa_policy;
+        restored->numa_nodemask = merged[i].numa_nodemask;
+        restored->numa_preferred_node = merged[i].numa_preferred_node;
+      }
       vma_file_unref(merged[i].file_node);
       vma_linux_put(merged[i].linux_vma);
     }

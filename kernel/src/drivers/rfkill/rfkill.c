@@ -136,8 +136,8 @@ static uint32_t rfkill_vfs_read(struct vfs_node *node, uint32_t offset,
       return (uint32_t)-11; // -EAGAIN
     }
 
-    wait_queue_add(&f->read_wait, entry);
     t->state = THREAD_BLOCKED;
+    wait_queue_add(&f->read_wait, entry);
 
     /* The broadcaster queues events under g_lock before waking, so either the
      * event is visible here or the wake lands after we are queued+blocked. */

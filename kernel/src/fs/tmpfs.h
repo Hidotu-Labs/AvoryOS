@@ -57,4 +57,12 @@ void        tmpfs_mount_at(const char *path);
 void        tmpfs_mount_at_sized(const char *path, uint64_t max_bytes, uint64_t max_inodes);
 vfs_node_t *tmpfs_create_root(tmpfs_sb_t *sb);
 
+/* Cross-directory rename within a single tmpfs instance (both parents must
+ * be directories of the same mount).  Directories themselves are refused
+ * with -EXDEV (no parent links exist to detect subtree cycles); anything
+ * else moves by re-keying one dirindex entry, so no data is copied and the
+ * inode accounting does not change.  Returns 0 or a negative errno. */
+int         tmpfs_rename_cross(vfs_node_t *old_parent, char *old_name,
+                               vfs_node_t *new_parent, char *new_name);
+
 #endif

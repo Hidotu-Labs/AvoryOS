@@ -161,6 +161,20 @@ bool sched_get_nth_open_fd(uint32_t tid, uint32_t index, uint32_t *fd) {
     return false;
   spinlock_acquire(&tid_lock);
   struct thread *t = find_thread_by_tid_locked(tid);
+  /* /proc/<pid> uses the TGID. For multithreaded processes (wireplumber,
+   * pipewire) the TGID may differ from the thread holding the fd table
+   * lookup, or the leader may share files with workers. Fall back to any
+   * thread in the same group that has an fd table. */
+  if ((!t || !t->files) && global_thread_list) {
+    struct thread *curr = global_thread_list;
+    while (curr) {
+      if (curr->tgid == tid && curr->files) {
+        t = curr;
+        break;
+      }
+      curr = curr->global_next;
+    }
+  }
   if (!t || !t->files) {
     spinlock_release(&tid_lock);
     return false;
@@ -188,6 +202,16 @@ bool sched_get_fd_path_snapshot(uint32_t tid, uint32_t fd, char *path,
     return false;
   spinlock_acquire(&tid_lock);
   struct thread *t = find_thread_by_tid_locked(tid);
+  if ((!t || !t->files) && global_thread_list) {
+    struct thread *curr = global_thread_list;
+    while (curr) {
+      if (curr->tgid == tid && curr->files) {
+        t = curr;
+        break;
+      }
+      curr = curr->global_next;
+    }
+  }
   if (!t || !t->files) {
     spinlock_release(&tid_lock);
     return false;
@@ -208,3 +232,47 @@ bool sched_get_fd_path_snapshot(uint32_t tid, uint32_t fd, char *path,
   spinlock_release(&tid_lock);
   return found;
 }
+
+bool sched_get_fd_info_snapshot(uint32_t tid, uint32_t fd, uint64_t *out_pos,
+                                uint32_t *out_flags, uint32_t *out_ino,
+                                bool *out_is_pidfd, uint32_t *out_target_pid) {
+  if (fd >= MAX_FDS)
+    return false;
+  spinlock_acquire(&tid_lock);
+  struct thread *t = find_thread_by_tid_locked(tid);
+  if ((!t || !t->files) && global_thread_list) {
+    struct thread *curr = global_thread_list;
+    while (curr) {
+      if (curr->tgid == tid && curr->files) {
+        t = curr;
+        break;
+      }
+      curr = curr->global_next;
+    }
+  }
+  if (!t || !t->files) {
+    spinlock_release(&tid_lock);
+    return false;
+  }
+
+  spinlock_acquire(&t->files->lock);
+  vfs_node_t *node = t->fds[fd];
+  bool found = node && node != (vfs_node_t *)-1;
+  if (found) {
+    if (out_pos)
+      *out_pos = (fd < MAX_FDS) ? t->fd_offsets[fd] : 0;
+    if (out_flags)
+      *out_flags = (fd < MAX_FDS) ? t->fd_flags[fd] : 0;
+    if (out_ino)
+      *out_ino = node->inode ? node->inode : fd;
+    bool is_pidfd = (strcmp(node->name, "pidfd") == 0 && node->device != NULL);
+    if (out_is_pidfd)
+      *out_is_pidfd = is_pidfd;
+    if (out_target_pid)
+      *out_target_pid = is_pidfd ? *(uint32_t *)node->device : 0;
+  }
+  spinlock_release(&t->files->lock);
+  spinlock_release(&tid_lock);
+  return found;
+}
+

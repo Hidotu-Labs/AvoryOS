@@ -7,13 +7,15 @@
 #include "../sched/sched.h"
 #include "../smp/cpu.h"
 #include "pmm.h"
+#include "numa.h"
+#include "mempolicy.h"
+#include "page_ops.h"
 #include "tlb_shootdown.h"
 #include "vma.h"
 #include "vmm.h"
+#include "vmm_internal.h"
 #include <stddef.h>
 #include <stdint.h>
-
-#define PHYS_TO_VIRT(p) ((void *)((uint64_t)(p) + pmm_get_hhdm_offset()))
 
 #define PROT_NONE 0x0
 #define PROT_READ 0x1
@@ -54,6 +56,75 @@ static uint64_t dp_build_flags(uint64_t prot) {
   if (!(prot & PROT_EXEC))
     flags |= PAGE_FLAG_NX;
   return flags;
+}
+
+static inline void *vmm_alloc_page_numa(int vma_numa_policy, uint64_t vma_numa_nodemask,
+                                        int vma_numa_preferred_node, uint64_t vaddr) {
+  struct thread *current = sched_get_current();
+  if (__builtin_expect(vma_numa_policy == MPOL_DEFAULT &&
+                       (!current || current->numa_policy.mode == MPOL_DEFAULT), 1)) {
+    return pmm_alloc_page();
+  }
+
+  struct mempolicy pol;
+
+  if (vma_numa_policy != MPOL_DEFAULT) {
+    pol.mode = vma_numa_policy;
+    pol.nodemask = vma_numa_nodemask;
+    pol.preferred_node = vma_numa_preferred_node;
+    pol.interleave_idx = 0;
+  } else if (current) {
+    mempolicy_copy(&pol, &current->numa_policy);
+  } else {
+    mempolicy_init(&pol);
+  }
+
+  int target_node = mempolicy_select_node(&pol, vaddr);
+  struct cpu_info *cpu = cpu_get_current();
+  int local_node = (cpu && cpu->cpu_id < MAX_CPUS) ? numa_cpu_to_node(cpu->cpu_id) : 0;
+
+  if (target_node == local_node &&
+      (pol.mode != MPOL_BIND || (pol.nodemask & (1ULL << (local_node % 64))))) {
+    void *page = pmm_pcp_alloc_page();
+    if (page)
+      return page;
+  }
+
+  uint64_t mask = (pol.mode == MPOL_BIND) ? pol.nodemask : 0;
+  return pmm_alloc_pages_nodemask(1, target_node, mask);
+}
+
+static inline void *vmm_alloc_huge_page_numa(int vma_numa_policy, uint64_t vma_numa_nodemask,
+                                             int vma_numa_preferred_node, uint64_t vaddr) {
+  struct thread *current = sched_get_current();
+  if (__builtin_expect(vma_numa_policy == MPOL_DEFAULT &&
+                       (!current || current->numa_policy.mode == MPOL_DEFAULT), 1)) {
+    return pmm_alloc_huge_page();
+  }
+
+  struct mempolicy pol;
+
+  if (vma_numa_policy != MPOL_DEFAULT) {
+    pol.mode = vma_numa_policy;
+    pol.nodemask = vma_numa_nodemask;
+    pol.preferred_node = vma_numa_preferred_node;
+    pol.interleave_idx = 0;
+  } else if (current) {
+    mempolicy_copy(&pol, &current->numa_policy);
+  } else {
+    mempolicy_init(&pol);
+  }
+
+  int target_node = mempolicy_select_node(&pol, vaddr);
+  uint64_t mask = (pol.mode == MPOL_BIND) ? pol.nodemask : 0;
+  void *phys = pmm_alloc_pages_nodemask(512, target_node, mask);
+  if (!phys)
+    return NULL;
+  if ((uint64_t)phys & 0x1FFFFFULL) {
+    pmm_free_pages(phys, 512);
+    return NULL;
+  }
+  return phys;
 }
 
 /* Map already-cached neighbours of a freshly faulted private file page in one
@@ -135,55 +206,8 @@ static void vmm_map_cow_cluster(uint64_t *pml4, uint64_t cr2,
  * vmm_handle_page_fault() annotates itself and page_fault_handler() prints the
  * record through kpf_dump.c while the machine can still talk.
  *
- * Plain stores only: this runs on the fault path, where taking a lock or
- * allocating can fault again or spin forever on a ticket lock this CPU already
- * holds. Records are per CPU so a simultaneous rejection elsewhere cannot
- * overwrite the context being reported.
+ * Implemented in vmm_fault_check.c.
  */
-static struct vmm_fault_reject pf_reject[MAX_CPUS];
-static volatile uint32_t pf_reject_seq[MAX_CPUS];
-
-static uint32_t pf_reject_cpu_index(void) {
-  struct cpu_info *cpu = cpu_get_current();
-  return cpu && cpu->cpu_id < MAX_CPUS ? cpu->cpu_id : 0;
-}
-
-static int pf_reject_record(uint64_t cr2, uint64_t error_code,
-                            const struct registers *regs,
-                            const struct thread *current, const char *reason,
-                            const char *file, uint32_t line, uint64_t detail,
-                            uint64_t detail2) {
-  uint32_t cpu = pf_reject_cpu_index();
-  struct vmm_fault_reject *r = &pf_reject[cpu];
-  r->reason = reason;
-  r->file = file;
-  r->line = line;
-  r->cr2 = cr2;
-  r->err_code = error_code;
-  r->rip = regs ? regs->rip : 0;
-  r->detail = detail;
-  r->detail2 = detail2;
-  r->tid = current ? current->tid : 0;
-  r->seq = pf_reject_seq[cpu] + 1;
-  pf_reject_seq[cpu] = r->seq;
-  return -1;
-}
-
-/* Only usable inside vmm_handle_page_fault(), whose locals it borrows. */
-#define PF_REJECT(reason, detail, detail2)                                     \
-  pf_reject_record(cr2, error_code, regs, current, (reason), __FILE__,         \
-                   __LINE__, (uint64_t)(detail), (uint64_t)(detail2))
-
-bool vmm_get_last_fault_reject(struct vmm_fault_reject *out) {
-  if (!out)
-    return false;
-  uint32_t cpu = pf_reject_cpu_index();
-  uint32_t seq = pf_reject_seq[cpu];
-  if (seq == 0)
-    return false;
-  *out = pf_reject[cpu];
-  return out->seq == seq;
-}
 
 int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
                           struct registers *regs) {
@@ -272,8 +296,14 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       // Not marked COW yet. Is it a MAP_PRIVATE VMA that's now writable?
       // (This can happen if it was first mapped read-only and then mprotected).
       // mm->lock is already held, so the VMA tree may be walked directly.
+      int v_numa_policy = 0;
+      uint64_t v_numa_nodemask = 0;
+      int v_numa_preferred_node = 0;
       struct vma *v = vma_find(&current->mm->vmas, cr2);
       if (v) {
+        v_numa_policy = v->numa_policy;
+        v_numa_nodemask = v->numa_nodemask;
+        v_numa_preferred_node = v->numa_preferred_node;
         if ((v->flags & MAP_PRIVATE) && (v->prot & PROT_WRITE)) {
           // Writable private mappings may have been remapped read-only for
           // CoW. Read-only executable/file mappings must stay protected.
@@ -286,12 +316,12 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       uint64_t old_phys = *pte & PAGE_MASK;
 
       if (old_phys == pmm_get_zero_page_phys()) {
-        void *new_phys = pmm_alloc_page();
+        void *new_phys = vmm_alloc_page_numa(0, 0, 0, virt);
         if (!new_phys)
           WALK_REJECT("CoW break of the shared zero page: PMM out of "
                       "memory", old_phys, 0);
 
-        memset(PHYS_TO_VIRT((uint64_t)new_phys), 0, PAGE_SIZE);
+        page_zero(PHYS_TO_VIRT((uint64_t)new_phys));
 
         *pte = ((uint64_t)new_phys & PAGE_MASK) |
                (*pte & ~PAGE_MASK & ~PAGE_FLAG_COW) | PAGE_FLAG_RW;
@@ -307,12 +337,11 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 
       if (refs > 1) {
         // Multiple owners — make a private copy.
-        void *new_phys = pmm_alloc_page();
+        void *new_phys = vmm_alloc_page_numa(0, 0, 0, virt);
         if (!new_phys)
           WALK_REJECT("CoW copy: PMM out of memory", old_phys, refs);
 
-        memcpy(PHYS_TO_VIRT((uint64_t)new_phys), PHYS_TO_VIRT(old_phys),
-               PAGE_SIZE);
+        page_copy(PHYS_TO_VIRT((uint64_t)new_phys), PHYS_TO_VIRT(old_phys));
 
         *pte = ((uint64_t)new_phys & PAGE_MASK) |
                (*pte & ~PAGE_MASK & ~PAGE_FLAG_COW) | PAGE_FLAG_RW;
@@ -498,6 +527,9 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
   uint64_t vma_end = 0;
   void *vma_file_node = NULL;
   void *vma_linux = NULL;
+  int vma_numa_policy = 0;
+  uint64_t vma_numa_nodemask = 0;
+  int vma_numa_preferred_node = 0;
   if (vma) {
     vma_prot = vma->prot;
     vma_flags = vma->flags;
@@ -508,6 +540,9 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     vma_start = vma->start;
     vma_end = vma->end;
     vma_file_node = vma->file_node;
+    vma_numa_policy = vma->numa_policy;
+    vma_numa_nodemask = vma->numa_nodemask;
+    vma_numa_preferred_node = vma->numa_preferred_node;
 
     /* The Linux-facing bridge wrapper can go away the moment a concurrent
      * munmap removes this native VMA, and the imported driver's ->close
@@ -561,21 +596,6 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
   }
 
   if (!vma) {
-    // If cr2 is in page 0 (0x0 .. 0xFFF) and it is a user-mode read fault in butterscotch,
-    // map the global shared zero page (read-only, non-executable) so reading null strings
-    // in writeEscapedString reads zeroes without crashing.
-    if (!write_fault && !exec_fault && user_mode && (cr2 < PAGE_SIZE)) {
-      if (current->comm && strstr(current->comm, "butterscotch")) {
-        uint64_t zp = pmm_get_zero_page_phys();
-        if (zp) {
-          uint64_t flags = PAGE_FLAG_PRESENT | PAGE_FLAG_USER | PAGE_FLAG_NX;
-          if (vmm_map_page((uint64_t *)target_cr3, 0, zp, flags)) {
-            return 0; // Handled butterscotch null-pointer read fault
-          }
-        }
-      }
-    }
-
     // No VMA covers this address — genuine segfault.
     if (user_mode) {
       void *handler = (void *)current->signal_handlers[10].sa_handler;
@@ -622,6 +642,12 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       klog_hex64(regs->err_code);
       klog_puts("\n");
 
+      if (current->state == THREAD_DEAD || current->state == THREAD_ZOMBIE) {
+        while (1) {
+          sched_yield();
+        }
+      }
+
       process_do_exit(11); // SIGSEGV
     }
     klog_puts("[VMM] Segmentation fault at CR2=");
@@ -660,11 +686,11 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 
     if (page_offset >= eff_file_size) {
       // 1. Pure BSS page (past eff_file_size) — allocate zero-filled page
-      frame = pmm_alloc_page();
+      frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
       if (!frame)
         return PF_REJECT("PMM out of memory for a BSS page", page_offset,
                          eff_file_size);
-      memset(PHYS_TO_VIRT((uint64_t)frame), 0, 4096);
+      page_zero(PHYS_TO_VIRT((uint64_t)frame));
     } else if ((vma_flags & MAP_PRIVATE) && (vma_prot & PROT_WRITE)) {
       // 2. Private Writable file mapping (e.g. ELF .data / .got / partial BSS)
       //
@@ -709,14 +735,14 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       } else {
         // The page is about to be dirtied (or is the partial tail of the
         // segment): take the private zero-filled copy now.
-        frame = pmm_alloc_page();
+        frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
         if (!frame) {
           vfs_cache_put(node, cached);
           return PF_REJECT("PMM out of memory for a private file page",
                            page_offset, eff_file_size);
         }
         void *priv_virt = PHYS_TO_VIRT((uint64_t)frame);
-        memset(priv_virt, 0, 4096);
+        page_zero(priv_virt);
 
         uint32_t valid_bytes = 4096;
         if (page_offset + 4096 > eff_file_size)
@@ -777,8 +803,11 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 
       // Proactive cluster mapping: map adjacent cached pages in a 128 KB window (32 pages)
       // to avoid dozens of redundant page faults during library / binary startup.
+      // The window is revalidated against the current VMA under mm->lock so a
+      // racing munmap/mprotect/mmap cannot alias a file frame into a different
+      // (e.g. anonymous) mapping. This mirrors vmm_map_cow_cluster(): SMP
+      // exposes the race that single-CPU execution hid.
       uint64_t cluster_vstart = cr2 & ~0x1FFFFULL;
-      uint64_t pt_flags = dp_build_flags(vma_prot);
       struct {
         uint64_t vpage;
         uint64_t phys;
@@ -805,12 +834,48 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       }
       spinlock_release(&node->pages_lock);
 
+      spinlock_acquire(&current->mm->lock);
       for (uint32_t bi = 0; bi < batch_count; bi++) {
-        if (!vmm_map_page_if_unmapped((uint64_t *)target_cr3, batch[bi].vpage,
-                                      batch[bi].phys, pt_flags)) {
+        struct vma *nv = vma_find(&current->mm->vmas, batch[bi].vpage);
+        uint64_t nv_file_size =
+            nv ? ((nv->file_size > 0) ? nv->file_size : (nv->end - nv->start)) : 0;
+        uint64_t nv_page_off = (nv && batch[bi].vpage >= nv->start)
+                                   ? (batch[bi].vpage - nv->start)
+                                   : UINT64_MAX;
+        bool ok =
+            nv && (nv->prot & PROT_READ) && batch[bi].vpage >= nv->start &&
+            batch[bi].vpage + PAGE_SIZE <= nv->end &&
+            nv_page_off + PAGE_SIZE <= nv_file_size &&
+            (void *)nv->file_node == (void *)node &&
+            (uint32_t)(nv->offset + nv_page_off) ==
+                (uint32_t)(vma_offset + (batch[bi].vpage - vma_start));
+        uint64_t page_flags = ok ? dp_build_flags(nv->prot) : 0;
+        // Drop the mm->lock around the PTE install would reopen the race;
+        // mm->lock -> vmm_lock is the established order, so keep both.
+        // vmm_map_page_if_unmapped() takes vmm_lock internally.
+        if (!ok) {
+          // Release mm->lock for the decref? decref is lock-free; keep it
+          // simple and decref while holding mm->lock (short, no IPI).
           pmm_decref((void *)batch[bi].phys);
+          continue;
         }
+        // Temporarily release mm->lock? No: map under the same hold so a
+        // concurrent munmap cannot slip in between validation and install.
+        // vmm_map_page_if_unmapped acquires vmm_lock (mm->vmm order).
+        // To avoid nested-lock subtleties, release and re-acquire per page
+        // is worse; keep the hold and call directly.
+        // NOTE: spinlock here is not recursive, but vmm_lock is a separate
+        // lock, so this nesting is the documented order.
+        bool installed;
+        // Unlock annotation: vmm_map_page_if_unmapped may block briefly on
+        // vmm_lock; mm->lock is held as in vmm_map_cow_cluster().
+        installed = vmm_map_page_if_unmapped((uint64_t *)target_cr3,
+                                             batch[bi].vpage, batch[bi].phys,
+                                             page_flags);
+        if (!installed)
+          pmm_decref((void *)batch[bi].phys);
       }
+      spinlock_release(&current->mm->lock);
     }
 
   } else {
@@ -828,18 +893,14 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 #define HUGE_PAGE_SIZE (2ULL * 1024 * 1024)
       uint64_t hp_base = cr2 & ~(HUGE_PAGE_SIZE - 1ULL); // 2 MB-align down
       if (hp_base >= vma_start && hp_base + HUGE_PAGE_SIZE <= vma_end) {
-        void *huge_phys = pmm_alloc_huge_page();
+        void *huge_phys = vmm_alloc_huge_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
         if (huge_phys) {
           // Zero the entire 2 MB frame.
-          memset((void *)((uint64_t)huge_phys + pmm_get_hhdm_offset()),
-                 0, HUGE_PAGE_SIZE);
+          page_zero_huge((void *)((uint64_t)huge_phys + pmm_get_hhdm_offset()));
 
           uint64_t hp_flags = dp_build_flags(vma_prot);
           if (vmm_map_huge_page((uint64_t *)target_cr3, hp_base,
                                 (uint64_t)huge_phys, hp_flags)) {
-            klog_puts("[THP] Installed 2MB huge page at VA ");
-            klog_hex64(hp_base);
-            klog_puts("\n");
             // Success — the whole 2 MB region is now mapped.
             return 0;
           }
@@ -852,25 +913,73 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 #undef HUGE_PAGE_SIZE
     }
 
-    // Zero-Page Sharing: If this is a read fault on a private anonymous mapping
-    // that is strictly read-only, map the global shared zero page (read-only + COW).
-    // Writable anonymous mappings (heap/stack) directly allocate private frames to
-    // eliminate COW overhead and race conditions between concurrent threads.
-    if (!write_fault && (vma_flags & MAP_PRIVATE) && !(vma_prot & PROT_WRITE)) {
+    // Zero-Page Sharing: a read fault on a private anonymous mapping shares
+    // the global zero page (read-only + COW) instead of allocating a frame.
+    // The first write to the page breaks CoW via the dedicated zero-page path
+    // above (fresh zeroed frame, never a write to the shared page). This is
+    // the standard demand-paging tradeoff: read-mostly pages cost one light
+    // fault with no allocation or zeroing, while read-then-write pages pay a
+    // second (CoW-break) fault. Write faults skip this and allocate directly.
+    //
+    // Fault-around: the faulting page is ~370 ns of fixed cost (entry/exit,
+    // two mm->lock sections, two VMA lookups) even with nothing to allocate,
+    // so mapping one page per fault caps a 4 MB scan at ~380 us. Like Linux
+    // (fault_around_bytes = 64K), one fault maps up to the next 16 pages in
+    // the same VMA. Zero pages consume no frames, so over-mapping is free —
+    // and every eliminated fault saves the whole fixed cost.
+#define FAULT_AROUND_PAGES 16
+    if (!write_fault && (vma_flags & MAP_PRIVATE)) {
       uint64_t zp = pmm_get_zero_page_phys();
       if (zp) {
         uint64_t flags = (dp_build_flags(vma_prot) & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
-        if (vmm_map_page_if_unmapped((uint64_t *)target_cr3, cr2 & ~0xFFFULL, zp, flags)) {
+        uint64_t fault_page = cr2 & ~0xFFFULL;
+        /* One lock hold per 16 pages, not one per page: the per-page
+         * vmm_lock round-trip (CLI/STI + MFENCE + drain attempt) was
+         * ~130 ns x 16, most of the fault-around cost. Lock order
+         * mm->lock -> vmm_lock matches the CoW path above, and the window
+         * is clamped to the VMA found under the same hold, so a racing
+         * munmap/mprotect cannot leave zero pages outside the VMA. */
+        spinlock_acquire(&current->mm->lock);
+        struct vma *w = vma_find(&current->mm->vmas, fault_page);
+        if (w && (w->flags & MAP_PRIVATE)) {
+          uint64_t win_end = fault_page + (uint64_t)FAULT_AROUND_PAGES * PAGE_SIZE;
+          if (win_end < fault_page || win_end > w->end)
+            win_end = w->end;
+          vmm_lock_acquire();
+          for (uint64_t va2 = fault_page; va2 < win_end;
+               va2 += PAGE_SIZE) {
+            if (!vmm_page_present_nolock((uint64_t *)target_cr3, va2)) {
+              bool changed = false;
+              vmm_map_page_locked((uint64_t *)target_cr3, va2, zp, flags,
+                                  &changed);
+            }
+          }
+          vmm_lock_release();
+          spinlock_release(&current->mm->lock);
+          return 0;
+        }
+        spinlock_release(&current->mm->lock);
+        if (vmm_map_page_if_unmapped((uint64_t *)target_cr3, fault_page, zp, flags)) {
           return 0; // Zero page mapped! No physical allocation or zeroing needed.
         }
-        if (vmm_virt_to_phys((uint64_t *)target_cr3, cr2 & ~0xFFFULL) != 0) {
+        if (vmm_virt_to_phys((uint64_t *)target_cr3, fault_page) != 0) {
           return 0; // Concurrently mapped by another thread
         }
       }
     }
+#undef FAULT_AROUND_PAGES
 
     // 4 KB fallback (always correct, also handles non-huge VMAs).
-    frame = pmm_alloc_page();
+    frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
+
+    if (!frame) {
+      // Reclaim before giving up: deferred frees may be parked on the drain
+      // queue and clean file-cache pages are droppable. Failing here kills a
+      // userspace thread, so one bounded recovery pass is worth it.
+      vmm_drain_deferred_work();
+      mm_file_cache_reclaim(64);
+      frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
+    }
 
     if (!frame) {
       size_t free_buddy = pmm_get_free_pages();
@@ -901,7 +1010,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       return PF_REJECT("PMM out of memory while demand paging a 4KB page",
                        vma_start, vma_end);
     }
-    memset(PHYS_TO_VIRT((uint64_t)frame), 0, 4096);
+    page_zero(PHYS_TO_VIRT((uint64_t)frame));
   }
 
 
@@ -1070,96 +1179,4 @@ void vmm_map_vsyscall_page(uint64_t *pml4) {
   vmm_map_page(pml4, VSYSCALL_BASE, vsyscall_page_phys, PAGE_FLAG_USER);
   // Map standard ELF vDSO page (0x700000000000) for musl/glibc dynamic linker
   vmm_map_page(pml4, VDSO_USER_BASE, vsyscall_page_phys, PAGE_FLAG_USER);
-}
-
-
-bool vmm_is_user_addr_range_valid(uint64_t addr, size_t size) {
-  if (addr > USER_SPACE_LIMIT || (addr + size) > 0x800000000000ULL) {
-    klog_puts("[VMM] Range validation failed: out of bounds\n");
-    return false;
-  }
-
-  struct thread *current = sched_get_current();
-  if (!current)
-    return false;
-
-  uint64_t start_page = addr & ~0xFFFULL;
-  uint64_t end_page = (addr + size + 0xFFF) & ~0xFFFULL;
-
-  // Acquire the MM lock once for the entire range scan instead of once per
-  // page.  For a 1 MB buffer (256 pages) the old code did 256 lock/unlock
-  // round-trips; now it does one.
-  //
-  // Additionally, when a VMA covers multiple pages we jump straight to its
-  // end boundary rather than re-querying vma_find for every page inside it.
-  // This reduces AVL tree lookups from O(pages) to O(distinct VMAs in range),
-  // which for a normal process is typically 1-3 for any contiguous buffer.
-  spinlock_acquire(&current->mm->lock);
-
-  uint64_t page = start_page;
-  while (page < end_page) {
-    struct vma *v = vma_find(&current->mm->vmas, page);
-    if (!v)
-      v = vma_find_growdown(&current->mm->vmas, page, 8 * 1024 * 1024);
-
-    if (!v) {
-      klog_puts("[VMM] Range validation failed (No VMA) at ");
-      klog_hex64(page);
-      klog_puts(" in thread ");
-      klog_uint64(current->tid);
-      klog_puts("\n[VMM] Active VMAs:\n");
-      vma_dump(&current->mm->vmas);
-      spinlock_release(&current->mm->lock);
-      return false;
-    }
-
-    if (v->prot == PROT_NONE) {
-      klog_puts("[VMM] Range validation failed (PROT_NONE) at 0x");
-      klog_uint64(page);
-      klog_puts("\n");
-      spinlock_release(&current->mm->lock);
-      return false;
-    }
-
-    // Skip to the end of this VMA — every page inside it has the same prot.
-    // Clamp to end_page so we don't overshoot on the last VMA.
-    page = v->end < end_page ? v->end : end_page;
-  }
-
-  spinlock_release(&current->mm->lock);
-  return true;
-}
-
-
-bool vmm_is_user_addr_range_writable(uint64_t addr, size_t size) {
-  if (size == 0)
-    return true;
-  if (addr > USER_SPACE_LIMIT || size > 0x800000000000ULL - addr)
-    return false;
-
-  struct thread *current = sched_get_current();
-  if (!current || !current->mm)
-    return false;
-
-  uint64_t start_page = addr & ~0xFFFULL;
-  uint64_t end_page = (addr + size + 0xFFF) & ~0xFFFULL;
-
-  spinlock_acquire(&current->mm->lock);
-
-  uint64_t page = start_page;
-  while (page < end_page) {
-    struct vma *v = vma_find(&current->mm->vmas, page);
-    if (!v)
-      v = vma_find_growdown(&current->mm->vmas, page, 8 * 1024 * 1024);
-
-    if (!v || !(v->prot & PROT_WRITE)) {
-      spinlock_release(&current->mm->lock);
-      return false;
-    }
-
-    page = v->end < end_page ? v->end : end_page;
-  }
-
-  spinlock_release(&current->mm->lock);
-  return true;
 }

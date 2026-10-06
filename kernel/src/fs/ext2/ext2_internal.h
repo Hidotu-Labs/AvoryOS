@@ -17,13 +17,18 @@ int  ext2_write_bgdt(ext2_mount_t *mnt);
 /* Lazy metadata counters: allocators mark the mount dirty, the journal commit
  * (or an explicit flush when no transaction is active) writes bgdt + sb. */
 void ext2_mark_metadata_dirty(ext2_mount_t *mnt);
-void ext2_flush_metadata(ext2_mount_t *mnt);
+void ext2_mark_group_dirty(ext2_mount_t *mnt, uint32_t group);
+int ext2_flush_metadata(ext2_mount_t *mnt);
 
 uint32_t ext2_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode,
                             uint32_t logical_block);
+int ext2_get_block_num_checked(ext2_mount_t *mnt, ext2_inode_t *inode,
+                                uint32_t logical_block, uint32_t *disk_block);
 int      ext2_set_block_num(ext2_mount_t *mnt, ext2_inode_t *inode,
                             uint32_t logical_block, uint32_t disk_block);
 
+uint32_t ext2_alloc_run_hint(ext2_mount_t *mnt, uint32_t goal,
+                              uint32_t max_blocks, uint32_t *run_count);
 uint32_t ext2_alloc_block(ext2_mount_t *mnt);
 uint32_t ext2_alloc_block_hint(ext2_mount_t *mnt, uint32_t goal);
 uint32_t ext2_alloc_inode(ext2_mount_t *mnt);
@@ -69,6 +74,7 @@ int ext2_symlink_impl(vfs_node_t *node, char *name, char *target);
 int ext2_rename_impl(vfs_node_t *node, char *old_name, char *new_name);
 int ext2_chmod_impl(vfs_node_t *node, uint16_t permission);
 int ext2_chown_impl(vfs_node_t *node, uint32_t uid, uint32_t gid);
+int ext2_utime_impl(vfs_node_t *node, uint32_t atime, uint32_t mtime);
 int ext2_mknod_impl(vfs_node_t *node, char *name, uint16_t permission,
                     uint32_t flags, void *device);
 

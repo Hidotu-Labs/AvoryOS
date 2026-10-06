@@ -11,6 +11,7 @@
 #include "../socket/socket.h"
 #include "../socket/socket_internal.h"
 #include "syscall.h"
+#include "sysdiag.h"
 #include <stdint.h>
 
 #define SOCKET_FD_FLAGS_CLOEXEC_BIT (1u << 24)
@@ -71,16 +72,32 @@ static uint64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
   int typ = (int)type;
   int proto = (int)protocol;
 
+  /* There is no audit subsystem yet. Linux-PAM treats EPROTONOSUPPORT
+   * from audit_open() as auditing unavailable and preserves the PAM result.
+   * Accepting this socket instead makes libaudit wait for an ACK that the
+   * netlink stub never produces, stalling SDDM before its greeter starts. */
+  if (dom == AF_NETLINK && proto == NETLINK_AUDIT)
+    return (uint64_t)-EPROTONOSUPPORT;
+
   // Create socket
   socket_t *sock = socket_create(dom, typ, proto);
   if (!sock) {
     // Determine error - extract base type for comparison
     int base = typ & ~SOCK_NONBLOCK & ~SOCK_CLOEXEC;
-    if (dom != AF_UNIX && dom != AF_INET && dom != AF_INET6 && dom != AF_NETLINK)
+    if (dom != AF_UNIX && dom != AF_INET && dom != AF_INET6 &&
+        dom != AF_NETLINK && dom != AF_QIPCRTR) {
+      char buf[32];
+      snprintf(buf, sizeof(buf), "af_domain=%d", dom);
+      sysdiag_record_unimplemented_feature("socket", buf, sched_get_current(), -EAFNOSUPPORT);
       return (uint64_t)-EAFNOSUPPORT;
+    }
     if (base != SOCK_STREAM && base != SOCK_DGRAM && base != SOCK_RAW &&
-        base != SOCK_SEQPACKET)
+        base != SOCK_SEQPACKET) {
+      char buf[32];
+      snprintf(buf, sizeof(buf), "sock_type=%d", base);
+      sysdiag_record_unimplemented_feature("socket", buf, sched_get_current(), -EPROTONOSUPPORT);
       return (uint64_t)-EPROTONOSUPPORT;
+    }
     return (uint64_t)-12; // ENOMEM
   }
 
@@ -339,8 +356,12 @@ static uint64_t sys_sendto(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
   int fd = (int)sockfd;
 
   // Validate buffer pointer
-  if (!is_user_ptr(buf_ptr) || (len > 0 && !is_user_ptr(buf_ptr + len - 1))) {
+  if (len > 0 && (!is_user_ptr(buf_ptr) || !is_user_ptr(buf_ptr + len - 1))) {
     return (uint64_t)-14; // EFAULT
+  }
+
+  if (len == 0) {
+    return 0;
   }
 
   // Get socket from FD
@@ -378,8 +399,12 @@ static uint64_t sys_recvfrom(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
   int fd = (int)sockfd;
 
   // Validate buffer pointer
-  if (!is_user_ptr(buf_ptr) || (len > 0 && !is_user_ptr(buf_ptr + len - 1))) {
+  if (len > 0 && (!is_user_ptr(buf_ptr) || !is_user_ptr(buf_ptr + len - 1))) {
     return (uint64_t)-14; // EFAULT
+  }
+
+  if (len == 0) {
+    return 0;
   }
 
   // Get socket from FD
@@ -397,6 +422,7 @@ static uint64_t sys_recvfrom(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
   void *buf = (void *)buf_ptr;
   struct sockaddr *src_addr = NULL;
   int *addrlen = NULL;
+  int k_addrlen = 0;
 
   if (src_addr_ptr) {
     if (!is_user_ptr(src_addr_ptr)) {
@@ -411,10 +437,17 @@ static uint64_t sys_recvfrom(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
       socket_put(sock);
       return (uint64_t)-14;
     }
-    addrlen = (int *)addrlen_ptr;
+    if (copy_from_user(&k_addrlen, (const void *)addrlen_ptr, sizeof(int)) != 0) {
+      socket_put(sock);
+      return (uint64_t)-14;
+    }
+    addrlen = &k_addrlen;
   }
 
   ssize_t ret = socket_recvfrom(sock, buf, len, (int)flags, src_addr, addrlen);
+  if (ret >= 0 && addrlen_ptr) {
+    copy_to_user((void *)addrlen_ptr, &k_addrlen, sizeof(int));
+  }
   socket_put(sock);
   return (uint64_t)ret;
 }
@@ -816,9 +849,71 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
   if (sock->ops && sock->ops->getsockopt) {
     int ret =
         sock->ops->getsockopt(sock, (int)level, (int)optname, optval, optlen);
-    return (uint64_t)ret;
+    if (ret == 0)
+      return 0;
+    // Family explicitly reports "not supported" for a well-formed request
+    // (e.g. SO_PEERSEC/SO_PEERGROUPS on AF_UNIX): propagate it so the
+    // caller's SELinux/apparmor fallback path triggers, exactly like Linux.
+    if (ret == -92)
+      return (uint64_t)ret;
   }
 
+  // Generic SOL_SOCKET integer-option fallback. Linux accepts these on every
+  // socket type with sensible defaults; failing them with ENOPROTOOPT breaks
+  // pipewire/SPA, dbus and other runtimes that probe buffer sizes, timestamps
+  // or credentials unconditionally. This mirrors what sys_setsockopt() already
+  // does (stub success) so set-then-get stays coherent.
+  if ((int)level == SOL_SOCKET && *optlen >= (int)sizeof(int)) {
+    switch ((int)optname) {
+    case SO_DONTROUTE:
+    case SO_BROADCAST:
+    case SO_OOBINLINE:
+    case SO_PRIORITY:
+    case SO_BSDCOMPAT:
+    case SO_REUSEPORT:
+    case SO_RCVLOWAT:
+    case SO_SNDLOWAT:
+    case 29: // SO_TIMESTAMP
+    case 35: // SO_TIMESTAMPNS
+    case 37: // SO_TIMESTAMPING
+    case 41: // SO_SELECT_ERR_QUEUE
+    case 39: // SO_DOMAIN (non-generic sockets)
+    case 38: // SO_PROTOCOL (non-generic sockets)
+      *(int *)optval = 0;
+      *optlen = sizeof(int);
+      return 0;
+    case SO_LINGER: {
+      // struct linger { int l_onoff, l_linger; } — report disabled.
+      if (*optlen >= 8) {
+        ((int *)optval)[0] = 0;
+        ((int *)optval)[1] = 0;
+        *optlen = 8;
+        return 0;
+      }
+      break;
+    }
+    case SO_RCVTIMEO:
+    case SO_SNDTIMEO: {
+      // struct timeval { long tv_sec, tv_usec; } — report zero timeout.
+      // Some callers pass an int-sized buffer; honor that too.
+      if (*optlen >= 16) {
+        ((long *)optval)[0] = 0;
+        ((long *)optval)[1] = 0;
+        *optlen = 16;
+        return 0;
+      }
+      *(int *)optval = 0;
+      *optlen = sizeof(int);
+      return 0;
+    }
+    default:
+      break;
+    }
+  }
+
+  char opt_buf[48];
+  snprintf(opt_buf, sizeof(opt_buf), "getsockopt lvl=%d opt=%d", (int)level, (int)optname);
+  sysdiag_record_unimplemented_feature("socket", opt_buf, sched_get_current(), -92);
   return (uint64_t)-92; // ENOPROTOOPT
 }
 

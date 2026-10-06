@@ -1,5 +1,6 @@
 #include "../../../console/klog.h"
 #include "../../../fb/framebuffer.h"
+#include "../../../fb/vblank.h"
 #include "../../../apic/lapic_timer.h"
 #include "../../../lib/string.h"
 #include "../../../mm/heap.h"
@@ -301,8 +302,6 @@ extern void ascentdrm_file_send_event(struct drm_file *file,
                                 struct drm_event_vblank *ev,
                                 struct vfs_node *node);
 
-static uint32_t drm_atomic_event_sequence = 1;
-
 static uint32_t drm_plane_type(struct drm_plane *plane) {
   uint64_t type = DRM_PLANE_TYPE_OVERLAY;
   ascentdrm_obj_get_prop(&plane->base, DRM_PROP_ID_TYPE, &type);
@@ -347,10 +346,12 @@ static int drm_cursor_fb_validate(struct drm_framebuffer *fb) {
 
 static void drm_fill_atomic_vblank_event(struct drm_event_vblank *ev,
                                          uint32_t crtc_id) {
-  uint64_t ms = lapic_timer_get_ms();
-  ev->tv_sec = (uint32_t)(ms / 1000);
-  ev->tv_usec = (uint32_t)((ms % 1000) * 1000);
-  ev->sequence = drm_atomic_event_sequence++;
+  uint32_t seq = vblank_sequence();
+  uint32_t sec, usec;
+  vblank_timestamp(seq, &sec, &usec);
+  ev->tv_sec = sec;
+  ev->tv_usec = usec;
+  ev->sequence = seq;
   ev->crtc_id = crtc_id;
 }
 
@@ -712,12 +713,16 @@ int ascentdrm_ioctl_atomic(struct vfs_node *node, struct drm_file *file,
       spinlock_release(&dev->lock);
       goto done;
     }
+    spinlock_release(&dev->lock);
+    /* Pace to the next vblank like the legacy flip path: instant delivery
+     * lets compositors present uncapped. An interrupted wait still sends
+     * the event; the commit happened, so failing would lie. */
+    vblank_wait_next();
     struct drm_event_vblank ev = {0};
     ev.base.type = DRM_EVENT_FLIP_COMPLETE;
     ev.base.length = sizeof(struct drm_event_vblank);
     ev.user_data = req->user_data;
     drm_fill_atomic_vblank_event(&ev, event_crtc_id);
-    spinlock_release(&dev->lock);
     ascentdrm_file_send_event(file, &ev, node);
     goto done;
   }

@@ -305,30 +305,41 @@ ssize_t udp_recvfrom(struct udp_socket *s, void *buf, size_t len,
 
         if (s->wait_queue) {
             wait_queue_t *wq = (wait_queue_t *)s->wait_queue;
-            wait_queue_entry_t entry = { .thread = self, .next = NULL };
+            wait_queue_entry_t entry = { .thread = self, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL };
+            if (self)
+                self->state = THREAD_BLOCKED;
             wait_queue_add(wq, &entry);
             spinlock_acquire(&s->lock);
             bool empty = s->q_head == s->q_tail;
             bool alive = s->used;
             spinlock_release(&s->lock);
             if (!alive) {
+                if (self) {
+                    self->state = THREAD_RUNNING;
+                    self->wakeup_ticks = 0;
+                }
                 wait_queue_remove(wq, &entry);
                 return -105;
             }
-            if (empty && self) {
-                self->state = THREAD_BLOCKED;
+            if (!empty) {
+                if (self) {
+                    self->state = THREAD_RUNNING;
+                    self->wakeup_ticks = 0;
+                }
+                wait_queue_remove(wq, &entry);
+                continue;
+            }
+            if (self) {
                 if (timeout_ms > 0)
                     self->wakeup_ticks = deadline;
                 else
                     self->wakeup_ticks = lapic_timer_get_ticks() + 100;
             }
-            if (!empty) {
-                wait_queue_remove(wq, &entry);
-                continue;
-            }
             sched_yield();
             if (self) self->wakeup_ticks = 0;
             wait_queue_remove(wq, &entry);
+            if (self && self->state == THREAD_BLOCKED)
+                self->state = THREAD_RUNNING;
         } else {
             if (timeout_ms > 0 && self)
                 self->wakeup_ticks = deadline;

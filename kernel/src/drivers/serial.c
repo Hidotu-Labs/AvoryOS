@@ -91,7 +91,7 @@ void serial_init(void) {
  *    and the hang detector still get a turn between slices). */
 #define SERIAL_TICK_DRAIN_BYTES 32u
 #define SERIAL_ASYNC_DRAIN_BYTES 128u
-#define SERIAL_IDLE_DRAIN_BYTES 512u
+#define SERIAL_IDLE_DRAIN_BYTES 2048u
 
 /* Move up to `budget` bytes from the ring to the UART, one FIFO burst per
  * THRE check, stopping as soon as the UART stops accepting.  Caller holds

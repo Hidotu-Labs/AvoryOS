@@ -139,7 +139,7 @@ grep -A5 "^/AvoryOS" "$ISO_ROOT/boot/limine/limine.conf"
 
 # ── Generate the ISO ─────────────────────────────────────────────────────────
 echo "[INFO] Running xorriso..."
-xorriso -as mkisofs -R -r -J \
+xorriso -as mkisofs -iso-level 3 -R -r -J \
     -b boot/limine/limine-bios-cd.bin \
     -no-emul-boot -boot-load-size 4 -boot-info-table \
     -hfsplus -apm-block-size 2048 \
