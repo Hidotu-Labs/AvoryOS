@@ -106,8 +106,8 @@ static uint64_t vmap_area_reserve_locked(size_t size) {
 
 /* ── mapping helpers ────────────────────────────────────────────────────── */
 
-static void vmap_map_page(uint64_t va, uint64_t pa, unsigned long flags) {
-  asc_vmm_map_page(asc_vmm_get_kernel_pml4(), va, pa,
+static bool vmap_map_page(uint64_t va, uint64_t pa, unsigned long flags) {
+  return asc_vmm_map_page(asc_vmm_get_kernel_pml4(), va, pa,
                    ASC_PAGE_PRESENT | ASC_PAGE_RW | ASC_PAGE_NX | flags);
 }
 
@@ -147,7 +147,9 @@ static void *vmap_do_alloc(unsigned long size, struct page **given_pages,
                            bool is_ioremap, unsigned long map_flags) {
   struct vmap_area *area;
   unsigned long nr_pages;
-  uint64_t va;
+
+  if (size > ~(unsigned long)0 - (PAGE_SIZE - 1))
+    return NULL;
 
   if (size == 0)
     return ZERO_SIZE_PTR;
@@ -161,9 +163,16 @@ static void *vmap_do_alloc(unsigned long size, struct page **given_pages,
     /* vmap: caller-owned pages, caller-owned array (never freed here). */
     area->pages = given_pages;
     area->owns_pages = false;
-    for (unsigned long i = 0; i < nr_pages; i++)
-      vmap_map_page(area->start + i * PAGE_SIZE, page_to_phys(given_pages[i]),
-                    map_flags);
+    unsigned long i;
+    for (i = 0; i < nr_pages; i++) {
+      if (!vmap_map_page(area->start + i * PAGE_SIZE,
+                         page_to_phys(given_pages[i]),
+                         map_flags)) {
+        while (i-- > 0)
+          vmap_unmap_page(area->start + i * PAGE_SIZE);
+        goto fail_area;
+      }
+    }
     return (void *)area->start;
   }
 
@@ -177,8 +186,9 @@ static void *vmap_do_alloc(unsigned long size, struct page **given_pages,
       area->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
       if (!area->pages[i])
         goto fail_pages;
-      vmap_map_page(area->start + i * PAGE_SIZE, page_to_phys(area->pages[i]),
-                    map_flags);
+      if (!vmap_map_page(area->start + i * PAGE_SIZE,
+                         page_to_phys(area->pages[i]), map_flags))
+        goto fail_pages;
     }
     return (void *)area->start;
   }
@@ -243,8 +253,6 @@ void vfree(const void *addr) {
 
   spin_lock_irqsave(&vmap_lock, flags);
   area = vmap_area_at((uint64_t)addr);
-  if (area)
-    vmap_area_remove_locked(area);
   spin_unlock_irqrestore(&vmap_lock, flags);
 
   if (!area)
@@ -263,6 +271,12 @@ void vfree(const void *addr) {
         __free_page(area->pages[i]);
     kfree(area->pages);
   }
+  /* Keep the address reserved until its old PTEs are gone. TTM can vmap
+   * another BO concurrently; publishing a hole before teardown lets that
+   * allocation reuse our VA and then lose its freshly installed mappings. */
+  spin_lock_irqsave(&vmap_lock, flags);
+  vmap_area_remove_locked(area);
+  spin_unlock_irqrestore(&vmap_lock, flags);
   kfree(area);
 }
 
@@ -351,14 +365,27 @@ static void *ioremap_flags(resource_size_t offset, unsigned long size,
 
   base = offset & ~(uint64_t)(PAGE_SIZE - 1);
   first_off = offset & (PAGE_SIZE - 1);
+  if (size > ~(unsigned long)0 - first_off - (PAGE_SIZE - 1))
+    return NULL;
   nr = (first_off + size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-  area = vmap_area_alloc(size, nr, true);
+  area = vmap_area_alloc((unsigned long)nr * PAGE_SIZE, nr, true);
   if (!area)
     return NULL;
 
-  for (unsigned long i = 0; i < nr; i++)
-    vmap_map_page(area->start + i * PAGE_SIZE, base + i * PAGE_SIZE, pte_flags);
+  for (unsigned long i = 0; i < nr; i++) {
+    if (!vmap_map_page(area->start + i * PAGE_SIZE,
+                       base + i * PAGE_SIZE, pte_flags)) {
+      while (i-- > 0)
+        vmap_unmap_page(area->start + i * PAGE_SIZE);
+      unsigned long flags;
+      spin_lock_irqsave(&vmap_lock, flags);
+      vmap_area_remove_locked(area);
+      spin_unlock_irqrestore(&vmap_lock, flags);
+      kfree(area);
+      return NULL;
+    }
+  }
 
   kpi_ioremap_trace_add(base, (unsigned long)nr * PAGE_SIZE);
 
@@ -409,9 +436,7 @@ void iounmap(volatile void __iomem *addr) {
 
   spin_lock_irqsave(&vmap_lock, flags);
   area = vmap_area_at(va);
-  if (area && area->is_ioremap)
-    vmap_area_remove_locked(area);
-  else
+  if (area && !area->is_ioremap)
     area = NULL;
   spin_unlock_irqrestore(&vmap_lock, flags);
 
@@ -423,6 +448,9 @@ void iounmap(volatile void __iomem *addr) {
     asc_vmm_free_empty_tables(asc_vmm_get_kernel_pml4(),
                               area->start + i * PAGE_SIZE);
   }
+  spin_lock_irqsave(&vmap_lock, flags);
+  vmap_area_remove_locked(area);
+  spin_unlock_irqrestore(&vmap_lock, flags);
   kfree(area);
 }
 

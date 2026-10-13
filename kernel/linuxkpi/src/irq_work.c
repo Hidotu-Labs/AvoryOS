@@ -56,6 +56,7 @@ static int irq_work_kthread(void *arg) {
   for (;;) {
     unsigned long flags;
     struct irq_work *work;
+    void (*func)(struct irq_work *);
     unsigned int gen = kpi_service_gen(&irq_work_svc);
 
     (void)wait_event_interruptible_timeout(
@@ -80,13 +81,18 @@ static int irq_work_kthread(void *arg) {
       if (!irq_work_head)
         irq_work_tail = NULL;
       work->next = NULL;
-    }
-    spin_unlock_irqrestore(&irq_work_lock, flags);
-
-    if (work && work->func) {
-      work->func(work);
+      /* Drop the pending claim before execution, as Linux irq_work does.
+       * Fence-chain callbacks can requeue this same object while executing.
+       * Fence-array completion can drop its final reference and free it via
+       * RCU on another CPU: task context does not provide an IRQ's implicit
+       * RCU protection, so do not touch the object after calling its func. */
       work->queued = 0;
     }
+    func = work ? work->func : NULL;
+    spin_unlock_irqrestore(&irq_work_lock, flags);
+
+    if (func)
+      func(work);
   }
 }
 

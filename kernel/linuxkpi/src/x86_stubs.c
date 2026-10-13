@@ -20,6 +20,7 @@
 #include <asm/set_memory.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/percpu.h>
 
 #include <linuxkpi/log.h>
 
@@ -72,13 +73,7 @@ int set_pages_array_wb(struct page **pages, int addrinarray) {
   return 0;
 }
 
-/* Uniprocessor percpu emulation (docs/linuxkpi-gaps.md P1/P2): stock x86
- * paths index __per_cpu_offset[] and take the address of cpu_info.  One
- * shared instance is correct while per-CPU use is scratch under preempt
- * disable; the array exists so per_cpu_offset()/per_cpu_ptr() link. */
-unsigned long __per_cpu_offset[NR_CPUS];
-
-struct cpuinfo_x86 cpu_info;
+DEFINE_PER_CPU(struct cpuinfo_x86, cpu_info);
 
 /* ── boot CPU feature record ──────────────────────────────────────────────
  *

@@ -91,12 +91,21 @@ SECTIONS {
     . = ALIGN(0x1000);
 
     .data : {
+        . = ALIGN(0x1000);
+        __kpi_percpu_start = .;
+        KEEP(*(.kpi_percpu .data..percpu .data..percpu.*))
+        . = ALIGN(0x1000);
+        __kpi_percpu_end = .;
         *(.data .data.*)
     } :data
 
     .bss : {
         *(.bss .bss.*)
         *(COMMON)
+        . = ALIGN(0x1000);
+        __kpi_percpu_copies = .;
+        /* Native MAX_CPUS=64: CPU zero uses the initialized template. */
+        . += (__kpi_percpu_end - __kpi_percpu_start) * 63;
     } :data
 
     /DISCARD/ : {

@@ -852,6 +852,8 @@ mount_success:
   extern void linuxkpi_page_init(void);
   extern void linuxkpi_vmalloc_init(void);
   extern void linuxkpi_irq_work_init(void);
+  extern void linuxkpi_percpu_init(void);
+  linuxkpi_percpu_init();
   linuxkpi_radix_init();
   linuxkpi_page_init();
   linuxkpi_vmalloc_init();

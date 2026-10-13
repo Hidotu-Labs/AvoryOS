@@ -54,10 +54,11 @@ static inline void cond_resched(void) { }
 
 static inline void preempt_fold_need_resched(void) { }
 
-/* No page migration exists, so migration disable is a no-op (stock io-mapping
- * inlines pair migrate_disable()/migrate_enable()). */
-static inline void migrate_disable(void) { }
-static inline void migrate_enable(void) { }
+/* CPU migration must stay disabled while a local mapping/FPU section is
+ * active. Native scheduling has no separate migration pin, so use its
+ * stronger preemption pin. This concerns tasks, not physical page migration. */
+static inline void migrate_disable(void) { preempt_disable(); }
+static inline void migrate_enable(void) { preempt_enable(); }
 
 /* Preempt-count bit layout, matching upstream <linux/preempt.h>.  The AvoryOS
  * preempt_count is advisory, but imported headers compute offsets/masks from

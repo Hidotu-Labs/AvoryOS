@@ -850,4 +850,6 @@ out:
       tlb_shootdown_all();
   }
 
+  return ok;
+
 }

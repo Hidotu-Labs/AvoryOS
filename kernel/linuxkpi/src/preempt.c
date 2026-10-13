@@ -27,20 +27,34 @@ static inline int kpi_cpu(void) {
 }
 
 unsigned int __kpi_preempt_count(void) {
-  return __atomic_load_n(&preempt_counts[kpi_cpu()], __ATOMIC_RELAXED);
+  unsigned long flags;
+  unsigned int count;
+  local_irq_save(flags);
+  count = __atomic_load_n(&preempt_counts[kpi_cpu()], __ATOMIC_RELAXED);
+  local_irq_restore(flags);
+  return count;
 }
 
 void __kpi_preempt_add(int val) {
+  unsigned long flags;
+  /* The CPU lookup itself is not a pin. A timer interrupt between lookup
+   * and increment can migrate the task, leaving the new CPU preemptible
+   * and charging an unrelated CPU. Mask IRQs until the count pins us. */
+  local_irq_save(flags);
   __atomic_add_fetch(&preempt_counts[kpi_cpu()], (unsigned int)val,
                      __ATOMIC_ACQ_REL);
+  local_irq_restore(flags);
 }
 
 void __kpi_preempt_sub(int val) {
+  unsigned long flags;
+  local_irq_save(flags);
   unsigned int *count = &preempt_counts[kpi_cpu()];
   unsigned int cur = __atomic_load_n(count, __ATOMIC_RELAXED);
 
   if (cur >= (unsigned int)val)
     __atomic_sub_fetch(count, (unsigned int)val, __ATOMIC_ACQ_REL);
+  local_irq_restore(flags);
 }
 
 void __kpi_preempt_disable(void) { __kpi_preempt_add(1); }
