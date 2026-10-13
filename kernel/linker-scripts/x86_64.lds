@@ -20,7 +20,9 @@ SECTIONS {
     . = ALIGN(0x1000);
 
     .text : {
+        __kernel_text_start = .;
         *(.text .text.*)
+        __kernel_text_end = .;
     } :text
 
     /* LinuxKPI initcalls (module_init and friends).  Upstream Linux places

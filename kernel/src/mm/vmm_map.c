@@ -353,6 +353,23 @@ static uint64_t vmm_leaf_entry_nolock(uint64_t *pml4, uint64_t virtual_addr) {
 // Public API
 // ---------------------------------------------------------------------------
 
+uint64_t vmm_debug_cache_flags(uint64_t *pml4, uint64_t addr) {
+  uint64_t entries[4]={0};
+  vmm_lock_acquire();
+  vmm_debug_walk((uint64_t)pml4,addr,entries);
+  uint64_t leaf=entries[3];
+  bool huge=false;
+  if (entries[1]&PAGE_FLAG_PS) { leaf=entries[1]; huge=true; }
+  else if (entries[2]&PAGE_FLAG_PS) { leaf=entries[2]; huge=true; }
+  uint64_t flags=UINT64_MAX;
+  if (leaf&PAGE_FLAG_PRESENT) {
+    flags=leaf&(PAGE_FLAG_PWT|PAGE_FLAG_PCD);
+    if (leaf&(huge ? (1ULL<<12) : PAGE_FLAG_PAT)) flags|=PAGE_FLAG_PAT;
+  }
+  vmm_lock_release();
+  return flags;
+}
+
 bool vmm_map_page(uint64_t *pml4, uint64_t virtual_addr, uint64_t physical_addr,
                   uint64_t flags) {
   vmm_lock_acquire();
@@ -605,7 +622,12 @@ void vmm_free_empty_tables(uint64_t *pml4, uint64_t virtual_addr) {
         }
       }
 
-      if (pdpt_empty) {
+      /* Process roots shallow-copy kernel PML4 entries. The shared PDPT
+       * must retain its identity even when empty: clearing the kernel's
+       * entry neither clears those copies nor updates them on the next
+       * mapping. Recycling it leaves live roots pointing at unrelated RAM.
+       * In particular, VMAP's pre-populated entries must survive vunmap. */
+      if (pdpt_empty && pml4_index < 256) {
         pml4_virt[pml4_index] = 0;
         if (vmm_dbg_range_has_lapic(virtual_addr, 512ULL << 30)) {
           vmm_dbg_out("[VMMDBG] free PDPT: cleared PML4E covering LAPIC va=");

@@ -6,6 +6,7 @@
 #include "mm/vmm.h"
 #include "net/ipv6.h"
 #include "net/tcp.h"
+#include "net/udp.h"
 #include "sched/sched.h"
 #include "sched/wait.h"
 #include "socket/epoll.h"
@@ -25,6 +26,8 @@ struct udp6_packet {
 struct inet6_sock {
   socket_t *parent;
   bool used, bound, connected;
+  bool v6only;
+  struct udp_socket *udp4;
   uint8_t local[16], remote[16];
   uint16_t local_port, remote_port;
   uint32_t scope_id;
@@ -85,23 +88,54 @@ static bool port_used(uint16_t port, const struct inet6_sock *skip) {
   return false;
 }
 
+static bool mapped_addr(const uint8_t a[16]) {
+  static const uint8_t prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+  return memcmp(a, prefix, sizeof(prefix)) == 0;
+}
+static uint32_t mapped_ip(const uint8_t a[16]) {
+  return (uint32_t)a[12] << 24 | (uint32_t)a[13] << 16 |
+         (uint32_t)a[14] << 8 | a[15];
+}
+static void map_ip(uint8_t a[16], uint32_t ip) {
+  memset(a, 0, 16); a[10] = a[11] = 0xff;
+  a[12] = ip >> 24; a[13] = ip >> 16; a[14] = ip >> 8; a[15] = ip;
+}
+static void udp4_input(struct udp_socket *, uint32_t, uint16_t,
+                        const uint8_t *, uint16_t);
+
 static int bind_port(struct inet6_sock *s, uint16_t port) {
+  if (s->bound) return -22;
+  bool dual = !s->v6only && (zero_addr(s->local) || mapped_addr(s->local));
+  struct udp_socket *u = dual ? udp_socket_alloc() : NULL;
+  if (dual && !u) return -105;
+  if (u) {
+    u->deliver = udp4_input;
+    u->deliver_context = s;
+  }
   spinlock_acquire(&udp6_lock);
-  if (port && port_used(port, s)) {
-    spinlock_release(&udp6_lock);
-    return -98;
-  }
-  if (!port) {
-    for (uint32_t n = 0; n < 16384; n++) {
-      uint16_t candidate = next_port++;
+  int result = -98;
+  bool ephemeral = port == 0;
+  for (uint32_t n = 0; n < (ephemeral ? 16384u : 1u); n++) {
+    uint16_t candidate = port;
+    if (ephemeral) {
+      candidate = next_port++;
       if (next_port < 49152) next_port = 49152;
-      if (!port_used(candidate, s)) { port = candidate; break; }
     }
+    if (port_used(candidate, s)) continue;
+    if (u) {
+      result = udp_bind(u, mapped_addr(s->local) ? mapped_ip(s->local) : 0,
+                        candidate);
+      if (result < 0) continue;
+    }
+    s->udp4 = u;
+    s->local_port = candidate;
+    s->bound = true;
+    result = 0;
+    break;
   }
-  if (!port) { spinlock_release(&udp6_lock); return -98; }
-  s->local_port = port; s->bound = true;
   spinlock_release(&udp6_lock);
-  return 0;
+  if (result < 0 && u) udp_socket_free(u);
+  return result;
 }
 
 static void fill_addr(struct sockaddr_in6 *out, const uint8_t addr[16],
@@ -118,9 +152,16 @@ static int inet6_bind(socket_t *sock, struct sockaddr *addr, int len) {
     return -22;
   struct inet6_sock *s = sock->sk;
   struct sockaddr_in6 *a = (struct sockaddr_in6 *)addr;
-  if (s->tcp)
+  bool mapped = mapped_addr(a->sin6_addr.s6_addr);
+  if (mapped && s->v6only) return -22;
+  if (s->tcp) {
+    if (mapped)
+      return tcp_bind(s->tcp, mapped_ip(a->sin6_addr.s6_addr),
+                       get16((uint8_t *)&a->sin6_port));
     return tcp_bind6(s->tcp, a->sin6_addr.s6_addr,
                      get16((uint8_t *)&a->sin6_port));
+  }
+  if (s->bound) return -22;
   memcpy(s->local, a->sin6_addr.s6_addr, 16);
   s->scope_id = a->sin6_scope_id;
   return bind_port(s, get16((uint8_t *)&a->sin6_port));
@@ -131,6 +172,7 @@ static int inet6_connect(socket_t *sock, struct sockaddr *addr, int len) {
   if (!s) return -22;
   if (addr && addr->sa_family == 0 /* AF_UNSPEC */ && sock->type == SOCK_DGRAM) {
     spinlock_acquire(&udp6_lock);
+    if (s->udp4) udp_disconnect(s->udp4);
     s->connected = false;
     memset(s->remote, 0, sizeof(s->remote));
     s->remote_port = 0;
@@ -143,13 +185,20 @@ static int inet6_connect(socket_t *sock, struct sockaddr *addr, int len) {
   struct sockaddr_in6 *a = (struct sockaddr_in6 *)addr;
   const struct ipv6_config *cfg = ipv6_get_config();
   const uint8_t *destination = a->sin6_addr.s6_addr;
+  bool mapped = mapped_addr(destination);
+  if (mapped && (s->v6only || (s->bound && !s->udp4 && !s->tcp))) return -101;
+  if (!mapped && (mapped_addr(s->local) ||
+                  (s->tcp && s->tcp->local_port && s->tcp->address_family == 4)))
+    return -101;
+  if (mapped && s->tcp && s->tcp->local_port &&
+      s->tcp->address_family == 6 && !zero_addr(s->tcp->local_ip6)) return -101;
   bool link = link_local_addr(destination);
   bool loop = loopback_addr(destination);
   bool mcast = destination[0] == 0xff;
   bool dest_global = (destination[0] & 0xe0) == 0x20;
   bool cfg_global = cfg->global_valid && ((cfg->global[0] & 0xe0) == 0x20);
 
-  if (!link && !loop && !mcast) {
+  if (!mapped && !link && !loop && !mcast) {
     if (!cfg->global_valid || (dest_global && !cfg_global))
       return -101; // ENETUNREACH
   }
@@ -167,8 +216,11 @@ static int inet6_connect(socket_t *sock, struct sockaddr *addr, int len) {
                       s->keepintvl_s, s->keepcnt);
     if (s->linger_seconds >= 0)
       tcp_set_linger(s->tcp, s->linger_seconds);
-    int r = tcp_active_open6(s->tcp, a->sin6_addr.s6_addr,
-                             get16((uint8_t *)&a->sin6_port));
+    int r = mapped
+        ? tcp_active_open(s->tcp, mapped_ip(destination),
+                           get16((uint8_t *)&a->sin6_port))
+        : tcp_active_open6(s->tcp, destination,
+                            get16((uint8_t *)&a->sin6_port));
     if (r < 0) return r;
     memcpy(s->remote, a->sin6_addr.s6_addr, 16);
     s->remote_port = get16((uint8_t *)&a->sin6_port);
@@ -205,6 +257,11 @@ static int inet6_connect(socket_t *sock, struct sockaddr *addr, int len) {
   }
 
   if (!s->bound) { int r = bind_port(s, 0); if (r < 0) return r; }
+  if (s->udp4) {
+    if (mapped) udp_connect(s->udp4, mapped_ip(destination),
+                             get16((uint8_t *)&a->sin6_port));
+    else udp_disconnect(s->udp4);
+  }
   memcpy(s->remote, a->sin6_addr.s6_addr, 16);
   s->remote_port = get16((uint8_t *)&a->sin6_port);
   s->scope_id = a->sin6_scope_id;
@@ -226,8 +283,13 @@ static ssize_t inet6_sendto(socket_t *sock, const void *buf, size_t len,
     port = get16((uint8_t *)&a->sin6_port);
   } else if (s->connected) { address = s->remote; port = s->remote_port; }
   else return -107;
+  bool mapped = mapped_addr(address);
+  if (mapped && (s->v6only || (s->bound && !s->udp4))) return -101;
+  if (!mapped && mapped_addr(s->local)) return -101;
   if (len > UDP6_PAYLOAD) return -90;
   if (!s->bound) { int r = bind_port(s, 0); if (r < 0) return r; }
+  if (mapped)
+    return udp_sendto(s->udp4, buf, len, mapped_ip(address), port);
   const struct ipv6_config *cfg = ipv6_get_config();
   const uint8_t *source = !zero_addr(s->local) ? s->local :
       (address[0] == 0xfe ? cfg->link_local : cfg->global);
@@ -312,6 +374,11 @@ static int inet6_name(socket_t *sock, struct sockaddr *addr, int *len,
   if (s->tcp) {
     if (peer && !s->tcp->remote_port) return -107;
     const uint8_t *a = peer ? s->tcp->remote_ip6 : s->tcp->local_ip6;
+    uint8_t mapped[16];
+    if (s->tcp->address_family == 4) {
+      map_ip(mapped, peer ? s->tcp->remote_ip : s->tcp->local_ip);
+      a = mapped;
+    }
     fill_addr((struct sockaddr_in6 *)addr, a,
               peer ? s->tcp->remote_port : s->tcp->local_port, s->scope_id);
     *len = sizeof(struct sockaddr_in6); return 0;
@@ -353,6 +420,11 @@ static void inet6_destroy(socket_t *sock) {
   struct inet6_sock *s = sock->sk;
   if (!s) return;
   if (s->tcp) { tcp_close(s->tcp); tcp_put(s->tcp); s->tcp = NULL; }
+  spinlock_acquire(&udp6_lock);
+  struct udp_socket *u = s->udp4;
+  s->udp4 = NULL;
+  spinlock_release(&udp6_lock);
+  if (u) udp_socket_free(u);
   if (s->heap_allocated) kfree(s);
   else { spinlock_acquire(&udp6_lock); memset(s, 0, sizeof(*s));
          spinlock_release(&udp6_lock); }
@@ -362,6 +434,10 @@ static void inet6_destroy(socket_t *sock) {
 static int inet6_listen(socket_t *sock, int backlog) {
   struct inet6_sock *s = sock->sk;
   if (!s->tcp) return -95;
+  if (!s->tcp->local_port) {
+    int r = tcp_bind6(s->tcp, s->local, 0);
+    if (r < 0) return r;
+  }
   int r = tcp_listen(s->tcp, backlog);
   if (!r) sock->state = SS_LISTENING;
   return r;
@@ -377,6 +453,7 @@ static int inet6_accept(socket_t *sock, socket_t **out) {
   struct inet6_sock *n = ns->sk;
   tcp_free(n->tcp);
   n->tcp = child;
+  n->v6only = s->v6only;
   tcp_attach_socket(child, &n->wait, ns->node);
   memcpy(n->remote, child->remote_ip6, 16); n->remote_port = child->remote_port;
   n->connected = true; ns->state = SS_CONNECTED; *out = ns; return 0;
@@ -507,7 +584,7 @@ static int inet6_getsockopt(socket_t *sock, int level, int option,
   else if (level == SOL_TCP && option == TCP_KEEPIDLE) result = s->keepidle_s;
   else if (level == SOL_TCP && option == TCP_KEEPINTVL) result = s->keepintvl_s;
   else if (level == SOL_TCP && option == TCP_KEEPCNT) result = s->keepcnt;
-  else if (level == SOL_IPV6 && option == IPV6_V6ONLY) result = 1;
+  else if (level == SOL_IPV6 && option == IPV6_V6ONLY) result = s->v6only ? 1 : 0;
   else return -92;
   *(int *)value = result; *length = sizeof(int); return 0;
 }
@@ -518,8 +595,12 @@ static int inet6_setsockopt(socket_t *sock, int level, int option,
   if (!s || !value || length < (int)sizeof(int)) return -22;
   int v = *(const int *)value;
 
-  if (level == SOL_IPV6 && option == IPV6_V6ONLY)
-    return v == 1 ? 0 : -92;
+  if (level == SOL_IPV6 && option == IPV6_V6ONLY) {
+    if (s->bound || (s->tcp && s->tcp->local_port)) return -22;
+    s->v6only = v != 0;
+    if (s->tcp) s->tcp->ipv6_dualstack = !s->v6only;
+    return 0;
+  }
 
   if (level == SOL_SOCKET) {
     if (option == SO_REUSEADDR) {
@@ -627,6 +708,7 @@ static int inet6_create(socket_t *sock, int protocol) {
     struct inet6_sock *s = kmalloc(sizeof(*s));
     if (!s) return -12;
     memset(s, 0, sizeof(*s)); s->used = true; s->heap_allocated = true;
+    s->v6only = true;
     s->parent = sock; wait_queue_init(&s->wait); s->tcp = tcp_alloc();
     if (!s->tcp) { kfree(s); return -105; }
     s->tcp->address_family = 6;
@@ -646,8 +728,37 @@ static int inet6_create(socket_t *sock, int protocol) {
   }
   spinlock_release(&udp6_lock);
   if (!s) return -105;
+  s->v6only = true;
   s->parent = sock; wait_queue_init(&s->wait);
   sock->sk = s; sock->ops = &inet6_ops; return 0;
+}
+
+static void queue_datagram(struct inet6_sock *s, const uint8_t src[16],
+                            uint16_t sport, const uint8_t *payload,
+                            uint16_t length) {
+  if (length > UDP6_PAYLOAD || s->head - s->tail >= UDP6_QUEUE) return;
+  struct udp6_packet *p = &s->queue[s->head++ % UDP6_QUEUE];
+  memcpy(p->source, src, 16); p->port = sport;
+  p->length = length;
+  memcpy(p->data, payload, p->length);
+  wait_queue_wake_all(&s->wait);
+  if (s->parent) {
+    if (s->parent->wait_queue)
+      wait_queue_wake_all((wait_queue_t *)s->parent->wait_queue);
+    if (s->parent->node)
+      epoll_notify_event(s->parent->node, EPOLLIN);
+  }
+}
+
+static void udp4_input(struct udp_socket *u, uint32_t ip, uint16_t port,
+                        const uint8_t *payload, uint16_t length) {
+  struct inet6_sock *s = u->deliver_context;
+  uint8_t source[16]; map_ip(source, ip);
+  spinlock_acquire(&udp6_lock);
+  if (s->used && s->udp4 == u &&
+      (!s->connected || (same_addr(s->remote, source) && s->remote_port == port)))
+    queue_datagram(s, source, port, payload, length);
+  spinlock_release(&udp6_lock);
 }
 
 static void udp6_input(const uint8_t src[16], const uint8_t dst[16],
@@ -665,18 +776,8 @@ static void udp6_input(const uint8_t src[16], const uint8_t dst[16],
         (!zero_addr(s->local) && !same_addr(s->local, dst)) ||
         (s->connected && (!same_addr(s->remote, src) || s->remote_port != sport)))
       continue;
-    if (s->head - s->tail >= UDP6_QUEUE) break;
-    struct udp6_packet *p = &s->queue[s->head++ % UDP6_QUEUE];
-    memcpy(p->source, src, 16); p->port = sport;
-    p->length = (uint16_t)(get16(segment + 4) - 8);
-    memcpy(p->data, segment + 8, p->length);
-    wait_queue_wake_all(&s->wait);
-    if (s->parent) {
-      if (s->parent->wait_queue)
-        wait_queue_wake_all((wait_queue_t *)s->parent->wait_queue);
-      if (s->parent->node)
-        epoll_notify_event(s->parent->node, EPOLLIN);
-    }
+    queue_datagram(s, src, sport, segment + 8,
+                    (uint16_t)(get16(segment + 4) - 8));
     break;
   }
   spinlock_release(&udp6_lock);

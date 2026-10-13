@@ -34,6 +34,7 @@ static uint64_t g_fs_miss_total_calls = 0;
 static sysdiag_syscall_error_t g_syscall_errors[SYSDIAG_MAX_SYSCALL_ERRORS];
 static size_t g_syscall_error_count = 0;
 static uint64_t g_syscall_error_total_calls = 0;
+static uint64_t g_syscall_error_evictions = 0;
 
 /* Helper to decode common Linux ioctl request numbers */
 static const char *sysdiag_lookup_ioctl_name(uint32_t req) {
@@ -262,6 +263,7 @@ void sysdiag_init(void) {
   memset(g_syscall_errors, 0, sizeof(g_syscall_errors));
   g_syscall_error_count = 0;
   g_syscall_error_total_calls = 0;
+  g_syscall_error_evictions = 0;
   spinlock_release(&g_sysdiag_lock);
 }
 
@@ -547,6 +549,13 @@ static bool sysdiag_is_severe_syscall_error(uint64_t num, int64_t err,
                                             const struct syscall_regs *regs) {
   int e = (int)(err < 0 ? -err : err);
 
+  /* Rust's try_statx availability probe deliberately passes NULL for both
+   * pointers and expects EFAULT. Ignore r9: statx has only five arguments.
+   * Other statx faults remain severe, even from the same process. */
+  if (num == 332 && err == -14 && regs && !regs->rdi && !regs->rsi &&
+      !regs->rdx && regs->r10 == 0x0fff && !regs->r8)
+    return false;
+
   // prctl(PR_CAPBSET_READ, >40) returning -EINVAL is the standard Linux cap loop end condition
   if (num == 157 /* prctl */ && regs && regs->rdi == 23 /* PR_CAPBSET_READ */ && regs->rsi > 40) {
     return false;
@@ -625,6 +634,14 @@ static void sysdiag_capture_error_path(uint64_t num,
     return;
   uint64_t path_ptr = 0;
   switch (num) {
+  case 9: { // file-backed mmap: pathname comes from its descriptor, not addr
+    if (regs->r10 & 0x20 /* MAP_ANONYMOUS */)
+      return;
+    struct thread *t = sched_get_current();
+    if (t && regs->r8 < MAX_FDS)
+      sched_get_fd_path_snapshot(t->tid, (uint32_t)regs->r8, out, outsz);
+    return;
+  }
   case 2:  // open
   case 4:  // stat
   case 6:  // lstat
@@ -634,6 +651,14 @@ static void sysdiag_capture_error_path(uint64_t num,
   case 84: // rmdir
   case 87: // unlink
   case 89: // readlink
+  case 188: // setxattr
+  case 189: // lsetxattr
+  case 191: // getxattr
+  case 192: // lgetxattr
+  case 194: // listxattr
+  case 195: // llistxattr
+  case 197: // removexattr
+  case 198: // lremovexattr
     path_ptr = regs->rdi;
     break;
   case 257: // openat
@@ -683,6 +708,61 @@ static void sysdiag_capture_error_path(uint64_t num,
   sysdiag_copy_user_path(path_ptr, out, outsz);
 }
 
+/* Copy the attribute name before taking the diagnostic lock. Never classify
+ * a faulted or truncated name as a known probe. listxattr has no name arg. */
+static bool sysdiag_capture_xattr_name(uint64_t num,
+                                      const struct syscall_regs *regs,
+                                      char *out, size_t outsz) {
+  out[0] = '\0';
+  if (!regs || !regs->rsi || outsz < 2 ||
+      !((num >= 188 && num <= 193) || (num >= 197 && num <= 199)))
+    return false;
+  long n = strncpy_from_user(out, (const char *)regs->rsi, (long)outsz);
+  if (n < 0 || (size_t)n >= outsz) {
+    out[0] = '\0';
+    return false;
+  }
+  return true;
+}
+
+static bool sysdiag_is_acl_capability_probe(uint64_t num, int64_t err,
+                                           const struct syscall_regs *regs,
+                                           const char *name) {
+  /* KIO probes ACLs both with a size query and with an allocated buffer.
+   * Unsupported ACL reads are expected until storage/enforcement exists.
+   * Keep writes and reads of other namespaces visible; do not advertise
+   * ACL support by changing EOPNOTSUPP into ENODATA or fabricated data. */
+  return err == -95 && num >= 191 && num <= 193 && regs &&
+         (strcmp(name, "system.posix_acl_access") == 0 ||
+          strcmp(name, "system.posix_acl_default") == 0);
+}
+
+static bool sysdiag_is_sddm_theme_write_probe(uint64_t num, int64_t err,
+                                             const struct thread *t,
+                                             const struct syscall_regs *regs) {
+  /* Qt queries writability while reading icon-theme metadata. Restrict this
+   * exception to the observed greeter, exact theme and plain W_OK query;
+   * do not hide real open/write failures or unrelated permission denials. */
+  if (num != 21 || err != -13 || !t || !regs || regs->rsi != 2 ||
+      strcmp(t->comm, "sddm-greeter-qt") != 0)
+    return false;
+  char path[96];
+  long len = strncpy_from_user(path, (const char *)regs->rdi, sizeof(path));
+  if (len < 0 || (size_t)len >= sizeof(path)) return false;
+  return strcmp(path, "/usr/share/icons/breeze/index.theme") == 0;
+}
+
+static bool sysdiag_is_firefox_userns_probe(uint64_t num, int64_t err,
+                                           const struct thread *t,
+                                           const struct syscall_regs *regs) {
+  /* Mozilla's CanCreateUserNamespace forks only to test kernel support.
+   * Keep sandbox launches and other clone failures severe. */
+  return num == 56 && err == -1 && t && regs &&
+         strcmp(t->comm, "firefox") == 0 &&
+         regs->rdi == (CLONE_NEWUSER | 17 /* SIGCHLD */) &&
+         !regs->rsi && !regs->rdx && !regs->r10 && !regs->r8;
+}
+
 void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
                                   struct thread *t,
                                   const struct syscall_regs *regs) {
@@ -691,7 +771,24 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
   uint64_t now_ms = lapic_timer_get_ms();
   bool first_time = false;
   bool severe = sysdiag_is_severe_syscall_error(syscall_num, error_code, regs);
+  /* The access handler supplies resolved inode/type evidence. Keep normal
+   * negative execute probes counted, but avoid alarming live warnings.
+   * Check the ABI mode too: aggregation may mix probes and real denials. */
+  bool nonexec_probe = t && t->last_access_nonexec_probe;
+  if (t) t->last_access_nonexec_probe = false;
+  if (nonexec_probe && error_code == -13 && regs &&
+      ((syscall_num == 21 && regs->rsi == 1) ||
+       ((syscall_num == 269 || syscall_num == 439) && regs->rdx == 1)))
+    severe = false;
+  if (sysdiag_is_sddm_theme_write_probe(syscall_num, error_code, t, regs))
+    severe = false;
+  if (sysdiag_is_firefox_userns_probe(syscall_num, error_code, t, regs))
+    severe = false;
   const char *comm = (t && t->comm[0]) ? t->comm : "?";
+  char cap_attr[256];
+  if (sysdiag_capture_xattr_name(syscall_num, regs, cap_attr, sizeof(cap_attr)) &&
+      sysdiag_is_acl_capability_probe(syscall_num, error_code, regs, cap_attr))
+    severe = false;
 
   /* Known-benign probes that Linux also answers with an error: never severe.
    * - getsockopt(SOL_SOCKET, SO_PEERSEC=31) with no LSM (dbus-daemon peer
@@ -767,7 +864,7 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
         g_syscall_errors[i].syscall_num == syscall_num &&
         g_syscall_errors[i].error_code == error_code &&
         strcmp(g_syscall_errors[i].comm, comm) == 0) {
-      key_known = true;
+      key_known = !severe || g_syscall_errors[i].is_severe;
       break;
     }
   }
@@ -792,8 +889,20 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
     }
   }
 
-  if (!entry && g_syscall_error_count < SYSDIAG_MAX_SYSCALL_ERRORS) {
-    entry = &g_syscall_errors[g_syscall_error_count++];
+  if (!entry) {
+    if (g_syscall_error_count < SYSDIAG_MAX_SYSCALL_ERRORS) {
+      entry = &g_syscall_errors[g_syscall_error_count++];
+    } else {
+      /* Startup probes must not permanently hide errors from applications
+       * launched later. Retain recently observed keys in the bounded table. */
+      entry = &g_syscall_errors[0];
+      for (size_t i = 1; i < g_syscall_error_count; i++) {
+        if (g_syscall_errors[i].last_seen_ms < entry->last_seen_ms)
+          entry = &g_syscall_errors[i];
+      }
+      g_syscall_error_evictions++;
+    }
+    memset(entry, 0, sizeof(*entry));
     entry->used = true;
     entry->syscall_num = syscall_num;
     entry->error_code = error_code;
@@ -813,6 +922,16 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
   }
 
   if (entry) {
+    /* Names are not part of the aggregation key. An expected ACL probe must
+     * not hide a later real xattr failure from the same worker. */
+    if (severe && !entry->is_severe) {
+      entry->is_severe = true;
+      first_time = true;
+      if (cap_path[0]) {
+        strncpy(entry->path, cap_path, sizeof(entry->path) - 1);
+        entry->path[sizeof(entry->path) - 1] = '\0';
+      }
+    }
     entry->total_calls++;
     entry->last_seen_ms = now_ms;
     if (t) {
@@ -834,7 +953,15 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
   if (first_time && severe) {
     const char *sname = syscall_get_name(syscall_num);
     const char *ename = sysdiag_lookup_errno_name(error_code);
-    klog_puts(KLOG_CLR_YELLOW "[SYSDIAG] SYSCALL ERROR: " KLOG_CLR_RESET);
+    bool unsupported_namespace = syscall_num == 56 && error_code == -1 &&
+        regs && (regs->rdi & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS |
+                             CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID |
+                             CLONE_NEWNET | CLONE_NEWTIME));
+    bool unsupported_strict_check = syscall_num == 54 && error_code == -92 &&
+        regs && regs->rsi == 270 && regs->rdx == 12;
+    klog_puts(unsupported_namespace
+        ? KLOG_CLR_YELLOW "[SYSDIAG] UNSUPPORTED NAMESPACES: " KLOG_CLR_RESET
+        : KLOG_CLR_YELLOW "[SYSDIAG] SYSCALL ERROR: " KLOG_CLR_RESET);
     klog_puts(sname ? sname : "syscall");
     klog_puts("(#");
     klog_uint64(syscall_num);
@@ -856,6 +983,12 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
       klog_hex64(regs->rsi);
       klog_puts(", ");
       klog_hex64(regs->rdx);
+      klog_puts(", ");
+      klog_hex64(regs->r10);
+      klog_puts(", ");
+      klog_hex64(regs->r8);
+      klog_puts(", ");
+      klog_hex64(regs->r9);
       klog_puts(")");
     }
     klog_puts(" rip=");
@@ -865,6 +998,17 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
       klog_puts(cap_path);
       klog_puts("'");
     }
+    if (cap_attr[0]) {
+      klog_puts(" xattr='");
+      klog_puts(cap_attr);
+      klog_puts("'");
+    }
+    if (unsupported_namespace)
+      klog_puts(" reason='namespace isolation is not implemented'");
+    if (unsupported_strict_check)
+      klog_puts(" option='NETLINK_GET_STRICT_CHK' reason='strict Netlink request validation is not implemented'");
+    if (syscall_num == 9 && error_code == -22 && regs && !regs->rsi)
+      klog_puts(" reason='zero-length mapping requested'");
     klog_puts("\n");
   }
 }
@@ -904,6 +1048,53 @@ static void sd_hex64(uint64_t v) {
     buf[2 + i] = hex[(v >> ((15 - i) * 4)) & 0xF];
   }
   serial_write_sync(buf, 18);
+}
+
+/* Game-client comms run under Mocktail/Wine with generic worker names; match
+ * the distinctive launcher/runtime substrings case-insensitively. */
+static bool sysdiag_comm_is_game(const char *comm) {
+  if (!comm || !comm[0])
+    return false;
+  char low[32];
+  unsigned n = 0;
+  while (n < 31 && comm[n]) {
+    char c = comm[n];
+    low[n] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    n++;
+  }
+  low[n] = '\0';
+  const char *tags[] = {"mocktail", "roblox", "wine", "sober"};
+  for (unsigned k = 0; k < 4; k++) {
+    const char *tag = tags[k];
+    unsigned tl = 0;
+    while (tag[tl]) tl++;
+    if (!tl || tl > n)
+      continue;
+    for (unsigned i = 0; i + tl <= n; i++) {
+      unsigned j = 0;
+      while (j < tl && low[i + j] == tag[j]) j++;
+      if (j == tl)
+        return true;
+    }
+  }
+  return false;
+}
+
+/* Join-stall error set from the audit trail: extent-insert EIO, ENOSPC,
+ * cross-device rename EXDEV, peer timeout, broken pipe. EAGAIN/EINTR and
+ * futex timeouts are ordinary event-loop results and stay out. */
+static bool sysdiag_err_is_join_signature(const sysdiag_syscall_error_t *e) {
+  if (!e || !e->used)
+    return false;
+  int err = (int)-e->error_code;
+  /* Apply exclusions before the game-name shortcut. A timed condition wait
+   * expiring or a nonblocking receive finding no data is normal progress,
+   * even in a game worker. Network ETIMEDOUT remains a useful candidate. */
+  if (err == 11 || err == 4 || (e->syscall_num == 202 && err == 110))
+    return false;
+  if (sysdiag_comm_is_game(e->comm))
+    return true;
+  return err == 5 || err == 28 || err == 18 || err == 110 || err == 32;
 }
 
 void sysdiag_dump_report(void) {
@@ -1051,10 +1242,12 @@ void sysdiag_dump_report(void) {
 
   /* Frequent / Recent Syscall Errors */
   if (g_syscall_error_count > 0) {
-    sd_put("[SYSDIAG] recent / frequent syscall errors (unique: ");
+    sd_put("[SYSDIAG] recent / frequent syscall errors (tracked keys: ");
     sd_dec(g_syscall_error_count);
     sd_put(", total errors: ");
     sd_dec(g_syscall_error_total_calls);
+    sd_put(", evicted keys: ");
+    sd_dec(g_syscall_error_evictions);
     sd_put("):\n");
     for (size_t i = 0; i < g_syscall_error_count; i++) {
       sysdiag_syscall_error_t *e = &g_syscall_errors[i];
@@ -1087,12 +1280,61 @@ void sysdiag_dump_report(void) {
       sd_put(", ");
       sd_hex64(e->last_args[2]);
       sd_put(")");
+      if (e->syscall_num == 45) {
+        sd_put(" recv-flags=");
+        sd_hex64(e->last_args[3]);
+      }
       if (e->path[0]) {
         sd_put(" path='");
         sd_put(e->path);
         sd_put("'");
       }
       sd_put("\n");
+    }
+    /* Join-stall signatures: re-list the entries that matter when a game
+     * client wedges on entry. Game-client comms plus the error codes the
+     * audit trail ties to join (extent EIO, no-space, cross-device rename,
+     * peer timeout) so they are not buried under 128 startup probes.
+     * Normal event-loop results (EAGAIN/EINTR/timeout) are excluded here. */
+    {
+      int sig_n = 0;
+      for (size_t i = 0; i < g_syscall_error_count; i++) {
+        const sysdiag_syscall_error_t *e = &g_syscall_errors[i];
+        if (sysdiag_err_is_join_signature(e))
+          sig_n++;
+      }
+      sd_put("[SYSDIAG] join investigation candidates (game comms + I/O errors; excludes EAGAIN/EINTR/futex timeouts, ");
+      sd_dec((uint64_t)sig_n);
+      sd_put(" matching):\n");
+      if (!sig_n) {
+        sd_put("[SYSDIAG]   (none: no game-client or join-error keys recorded)\n");
+      } else {
+        for (size_t i = 0; i < g_syscall_error_count; i++) {
+          const sysdiag_syscall_error_t *e = &g_syscall_errors[i];
+          if (!sysdiag_err_is_join_signature(e))
+            continue;
+          sd_put("[SYSDIAG]   sig: ");
+          sd_put(e->name);
+          sd_put("(#");
+          sd_dec(e->syscall_num);
+          sd_put(") -> -");
+          sd_dec((uint64_t)-e->error_code);
+          sd_put(" count=");
+          sd_dec(e->total_calls);
+          sd_put(" comm='");
+          sd_put(e->comm[0] ? e->comm : "?");
+          sd_put("' pid=");
+          sd_dec(e->last_tgid);
+          sd_put(" rip=");
+          sd_hex64(e->last_rip);
+          if (e->path[0]) {
+            sd_put(" path='");
+            sd_put(e->path);
+            sd_put("'");
+          }
+          sd_put("\n");
+        }
+      }
     }
   }
 

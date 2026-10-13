@@ -26,6 +26,10 @@ struct drm_gem_object *ascentdrm_gem_object_create(struct drm_device *dev, size_
     obj->cache_mode = DRM_GEM_CACHE_WB;
     __atomic_store_n(&obj->refcount, 1, __ATOMIC_RELAXED);
 
+    /* A new dumb framebuffer can be scanned out before its first repaint.
+     * Clear every mapped page before publishing the object to userspace. */
+    memset(obj->virt_addr, 0, size);
+
     spinlock_acquire(&dev->lock);
     obj->handle = dev->next_gem_handle++;
     list_add_tail(&obj->list, &dev->gem_objects);
@@ -40,8 +44,7 @@ void ascentdrm_gem_object_free(struct drm_device *dev, struct drm_gem_object *ob
     list_del(&obj->list);
     spinlock_release(&dev->lock);
     if (obj->free) { obj->free(dev, obj); return; }
-    pmm_free_blocks((void *)obj->phys_addr, obj->size / 4096);
-    kfree(obj);
+    ascentdrm_gem_release_storage(obj);
 }
 
 struct drm_gem_object *ascentdrm_gem_find_by_handle(struct drm_device *dev, uint32_t handle) {

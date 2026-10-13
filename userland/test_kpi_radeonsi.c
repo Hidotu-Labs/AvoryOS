@@ -25,18 +25,23 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <drm/drm.h>
+#include <drm/drm_mode.h>
+#include <drm/drm_fourcc.h>
+#include <linux/dma-buf.h>
 #include <xf86drm.h>
 
 #define EGL_EGLEXT_PROTOTYPES
@@ -60,6 +65,89 @@ static void fail(const char *what, long detail) {
 }
 
 static void skip(const char *what) { printf("  [SKIP] %s\n", what); }
+static int drm_name_is(const char *path, const char *want);
+static void test_texture_pressure(void);
+static void test_fog_uniforms(void);
+static void test_amd_export_readback(EGLDisplay dpy, struct gbm_device *gbm);
+
+/* Render into a buffer owned by the visible virtual display, exactly the
+ * sharing direction used when DRI3 offloads an application to AMDGPU. */
+static void test_prime_offload(EGLDisplay dpy) {
+    struct drm_mode_create_dumb dumb = {.width = 64, .height = 64, .bpp = 32};
+    struct drm_mode_destroy_dumb destroy = {0};
+    struct drm_mode_map_dumb map = {0};
+    int card = -1, fd = -1;
+    void *pixels = MAP_FAILED;
+    EGLImageKHR image = EGL_NO_IMAGE_KHR;
+    GLuint texture = 0, fbo = 0;
+    GLint previous_fbo = 0;
+    PFNEGLCREATEIMAGEKHRPROC create_image = (void *)eglGetProcAddress("eglCreateImageKHR");
+    PFNEGLDESTROYIMAGEKHRPROC destroy_image = (void *)eglGetProcAddress("eglDestroyImageKHR");
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind_image = (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    const char *extensions = eglQueryString(dpy, EGL_EXTENSIONS);
+    if (!create_image || !destroy_image || !bind_image || !extensions ||
+        !strstr(extensions, "EGL_EXT_image_dma_buf_import")) {
+        fail("PRIME offload requires EGL dma-buf image import", 0);
+        return;
+    }
+    card = drm_name_is("/dev/dri/card0", "ascentdrm");
+    if (card < 0) { fail("PRIME visible card0 is unavailable", errno); goto out; }
+    if (ioctl(card, DRM_IOCTL_MODE_CREATE_DUMB, &dumb)) {
+        fail("PRIME create display-owned dumb buffer", errno); goto out;
+    }
+    destroy.handle = dumb.handle;
+    map.handle = dumb.handle;
+    if (ioctl(card, DRM_IOCTL_MODE_MAP_DUMB, &map)) {
+        fail("PRIME map display-owned buffer", errno); goto out;
+    }
+    pixels = mmap(NULL, dumb.size, PROT_READ | PROT_WRITE, MAP_SHARED, card, map.offset);
+    if (pixels == MAP_FAILED || drmPrimeHandleToFD(card, dumb.handle, DRM_CLOEXEC | DRM_RDWR, &fd)) {
+        fail("PRIME export display buffer", errno); goto out;
+    }
+    EGLint attrs[] = {
+        EGL_WIDTH, 64, EGL_HEIGHT, 64,
+        EGL_LINUX_DRM_FOURCC_EXT, GBM_FORMAT_ARGB8888,
+        EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, dumb.pitch, EGL_NONE
+    };
+    image = create_image(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+    if (image == EGL_NO_IMAGE_KHR) {
+        fail("PRIME AMD imports virtual display dma-buf", eglGetError()); goto out;
+    }
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    bind_image(GL_TEXTURE_2D, image);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        fail("PRIME imported buffer is renderable", 0); goto out;
+    }
+    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glFinish();
+    if (glGetError() != GL_NO_ERROR) { fail("PRIME AMD rendering", 0); goto out; }
+    struct dma_buf_sync sync = {.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
+    if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync)) {
+        fail("PRIME wait for AMD writes", errno); goto out;
+    }
+    uint32_t pixel = *(volatile uint32_t *)((uint8_t *)pixels + 32 * dumb.pitch + 32 * 4);
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) || pixel != 0xff00ff00u)
+        fail("PRIME AMD pixels visible in virtual display buffer", pixel);
+    else
+        pass("PRIME AMD renders into the virtual display's shared buffer");
+out:
+    if (fbo) { glBindFramebuffer(GL_FRAMEBUFFER, previous_fbo); glDeleteFramebuffers(1, &fbo); }
+    if (texture) glDeleteTextures(1, &texture);
+    if (image != EGL_NO_IMAGE_KHR) destroy_image(dpy, image);
+    if (fd >= 0) close(fd);
+    if (pixels != MAP_FAILED) munmap(pixels, dumb.size);
+    if (destroy.handle) ioctl(card, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
+    if (card >= 0) close(card);
+}
 
 /* ── render-node discovery ──────────────────────────────────────────────── */
 
@@ -388,7 +476,8 @@ int main(void) {
     /* Alpine's Mesa DRI drivers live under /usr/lib/xorg/modules/dri while
      * Mesa's default search path is /usr/lib/dri; without the override the
      * EGL/GBM loader finds no radeonsi and silently falls back to llvmpipe. */
-    setenv("LIBGL_DRIVERS_PATH", "/usr/lib/xorg/modules/dri", 0);
+    setenv("LIBGL_DRIVERS_PATH", access("/usr/lib/dri", F_OK) == 0
+              ? "/usr/lib/dri" : "/usr/lib/xorg/modules/dri", 0);
     /* Show the loader's own diagnostics when a DRI driver cannot be loaded. */
     setenv("LIBGL_DEBUG", "verbose", 0);
 
@@ -583,6 +672,13 @@ int main(void) {
             fail("frame timing produced no frames", 0);
     }
 
+    test_prime_offload(dpy);
+    if (getenv("AVORY_GPU_TEXTURE_STRESS")) {
+        test_texture_pressure();
+        test_fog_uniforms();
+        test_amd_export_readback(dpy, gbm);
+    }
+
     /* 6. dma-buf round trip through EGL (PRIME path) */
     {
         const char *exts = eglQueryString(dpy, EGL_EXTENSIONS);
@@ -617,6 +713,19 @@ int main(void) {
         if (dmabuf_fd < 0) {
             fail("gbm_bo_get_fd", errno);
             goto out;
+        }
+        {
+            struct stat st;
+            off_t size = lseek(dmabuf_fd, 0, SEEK_END);
+            uint64_t minimum = (uint64_t)gbm_bo_get_stride(bo) *
+                               gbm_bo_get_height(bo);
+            if (size <= 0 || (uint64_t)size < minimum ||
+                fstat(dmabuf_fd, &st) || st.st_size != size ||
+                lseek(dmabuf_fd, 0, SEEK_SET) != 0) {
+                fail("AMD dma-buf size discovery for Xorg/Mesa import", errno);
+                goto out;
+            }
+            pass("AMD dma-buf fstat/SEEK_END report its allocation size");
         }
         {
             uint64_t modifier = gbm_bo_get_modifier(bo);
@@ -690,4 +799,435 @@ out:
     }
     printf("=== ALL TESTS PASSED ===\n");
     return 0;
+}
+
+/* Exercise allocation/eviction and sampled texture data independently of
+ * Xorg, KWin and PRIME scanout. 768 MiB exceeds this APU's 512 MiB VRAM;
+ * every output pixel has a CPU oracle, including after updating reused BOs.
+ * Opt-in so ordinary boot diagnostics remain small. */
+static uint32_t texture_pixel(unsigned x, unsigned y, unsigned seed) {
+    unsigned r = (x * 13u + y * 7u + seed * 31u) & 255u;
+    unsigned g = ((x >> 3) * 19u + y * 11u + seed * 47u) & 255u;
+    unsigned b = (x * 3u + (y >> 2) * 23u + seed * 61u) & 255u;
+    return r | (g << 8) | (b << 16) | 0xff000000u;
+}
+
+static void test_texture_pressure(void) {
+    enum { SIDE = 2048, OUT = 512, COUNT = 48, ROUNDS = 4 };
+    GLuint textures[COUNT] = {0}, output = 0, fbo = 0, vbo = 0;
+    GLuint snapshots[COUNT] = {0}, snapshot_fbos[COUNT] = {0};
+    GLuint vs = 0, fs = 0, program = 0;
+    GLint saved_fb = 0, saved_program = 0, saved_buffer = 0;
+    uint32_t *source = malloc((size_t)SIDE * SIDE * 4);
+    uint32_t *result = malloc((size_t)OUT * OUT * 4);
+    static const GLfloat quad[] = {-1,-1, 1,-1, -1,1, 1,1};
+    unsigned checked = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &saved_fb);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &saved_program);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &saved_buffer);
+    if (!source || !result) { fail("texture pressure CPU allocation", ENOMEM); goto out; }
+    vs = compile_shader(GL_VERTEX_SHADER,
+        "attribute vec2 pos; void main(){gl_Position=vec4(pos,0.0,1.0);}");
+    fs = compile_shader(GL_FRAGMENT_SHADER,
+        "precision highp float; uniform sampler2D tex;"
+        "void main(){gl_FragColor=texture2D(tex,gl_FragCoord.xy/512.0);}");
+    if (!vs || !fs) goto out;
+    program = glCreateProgram();
+    glAttachShader(program, vs); glAttachShader(program, fs);
+    glBindAttribLocation(program, 0, "pos"); glLinkProgram(program);
+    GLint linked = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked) { fail("texture pressure program link", 0); goto out; }
+    glUseProgram(program);
+    glUniform1i(glGetUniformLocation(program, "tex"), 0);
+    glGenBuffers(1, &vbo); glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glDisable(GL_BLEND); glDisable(GL_DITHER); glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glActiveTexture(GL_TEXTURE0);
+    glGenTextures(1, &output); glBindTexture(GL_TEXTURE_2D, output);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, OUT, OUT, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glGenFramebuffers(1, &fbo); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, output, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        fail("texture pressure framebuffer", 0); goto out;
+    }
+    glViewport(0, 0, OUT, OUT);
+    glGenTextures(COUNT, textures);
+    printf("  [INFO] texture pressure: %u MiB, %u textures, %u rounds\n",
+           COUNT * SIDE * SIDE * 4u / (1024u * 1024u), COUNT, ROUNDS);
+    fflush(stdout);
+    for (unsigned i = 0; i < COUNT; i++) {
+        for (unsigned y = 0; y < SIDE; y++)
+            for (unsigned x = 0; x < SIDE; x++) source[y * SIDE + x] = texture_pixel(x, y, i);
+        glBindTexture(GL_TEXTURE_2D, textures[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SIDE, SIDE, 0, GL_RGBA, GL_UNSIGNED_BYTE, source);
+        GLenum err = glGetError();
+        if (err) { printf("  [DIAG] upload texture %u GL error=0x%x\n", i, err); fail("texture allocation/upload", 0); goto out; }
+    }
+    for (unsigned round = 0; round < ROUNDS; round++) {
+        for (unsigned j = 0; j < COUNT; j++) {
+            unsigned i = (31u * j + round) % COUNT;
+            unsigned seed = i + round * COUNT;
+            glBindTexture(GL_TEXTURE_2D, textures[i]);
+            if (round) {
+                for (unsigned y = 0; y < SIDE; y++)
+                    for (unsigned x = 0; x < SIDE; x++) source[y * SIDE + x] = texture_pixel(x, y, seed);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, SIDE, SIDE, GL_RGBA, GL_UNSIGNED_BYTE, source);
+            }
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glReadPixels(0, 0, OUT, OUT, GL_RGBA, GL_UNSIGNED_BYTE, result);
+            GLenum err = glGetError();
+            if (err) { printf("  [DIAG] round %u texture %u GL error=0x%x\n", round, i, err); fail("texture render/readback", 0); goto out; }
+            for (unsigned y = 0; y < OUT; y++) {
+                for (unsigned x = 0; x < OUT; x++) {
+                    uint32_t expected = texture_pixel(4u*x+2u, 4u*y+2u, seed);
+                    uint32_t actual = result[y * OUT + x];
+                    if (actual != expected) {
+                        printf("  [DIAG] GPU corruption: round=%u texture=%u pixel=(%u,%u) expected=%08x actual=%08x\n",
+                               round, i, x, y, expected, actual);
+                        fail("GPU texture pixels differ before PRIME presentation", 0); goto out;
+                    }
+                }
+            }
+            checked++;
+        }
+        printf("  [INFO] texture pressure round %u: all pixels match\n", round);
+        fflush(stdout);
+    }
+    /* Queue a complete draw/update burst before reading anything back.
+     * Replacing each source after its draw stresses GPU/CPU reuse ordering;
+     * snapshots must retain the old image even after all sources changed. */
+    glGenTextures(COUNT, snapshots);
+    glGenFramebuffers(COUNT, snapshot_fbos);
+    for (unsigned i = 0; i < COUNT; i++) {
+        glBindTexture(GL_TEXTURE_2D, snapshots[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, OUT, OUT, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, snapshot_fbos[i]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, snapshots[i], 0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            fail("queued texture snapshot framebuffer", 0); goto out;
+        }
+        glBindTexture(GL_TEXTURE_2D, textures[i]);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        for (unsigned y = 0; y < SIDE; y++)
+            for (unsigned x = 0; x < SIDE; x++) source[y * SIDE + x] = texture_pixel(x, y, i + ROUNDS * COUNT);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, SIDE, SIDE, GL_RGBA, GL_UNSIGNED_BYTE, source);
+    }
+    for (unsigned i = 0; i < COUNT; i++) {
+        glBindFramebuffer(GL_FRAMEBUFFER, snapshot_fbos[i]);
+        glReadPixels(0, 0, OUT, OUT, GL_RGBA, GL_UNSIGNED_BYTE, result);
+        if (glGetError()) { fail("queued texture snapshot readback", 0); goto out; }
+        for (unsigned y = 0; y < OUT; y++) {
+            for (unsigned x = 0; x < OUT; x++) {
+                uint32_t expected = texture_pixel(4u*x+2u, 4u*y+2u, i + (ROUNDS - 1) * COUNT);
+                uint32_t actual = result[y * OUT + x];
+                if (actual != expected) {
+                    printf("  [DIAG] queued GPU corruption: texture=%u pixel=(%u,%u) expected=%08x actual=%08x\n", i, x, y, expected, actual);
+                    fail("queued draw/source reuse differs before PRIME presentation", 0); goto out;
+                }
+            }
+        }
+        checked++;
+    }
+    printf("  [INFO] checked %u frames, %u pixels (including queued draw/reuse)\n", checked, checked * OUT * OUT);
+    pass("texture pressure allocation/reuse/render/readback integrity");
+out:
+    glBindFramebuffer(GL_FRAMEBUFFER, saved_fb);
+    glUseProgram(saved_program); glBindBuffer(GL_ARRAY_BUFFER, saved_buffer);
+    glDeleteTextures(COUNT, textures);
+    glDeleteTextures(COUNT, snapshots);
+    glDeleteFramebuffers(COUNT, snapshot_fbos);
+    if (output) glDeleteTextures(1, &output);
+    if (fbo) glDeleteFramebuffers(1, &fbo);
+    if (vbo) glDeleteBuffers(1, &vbo);
+    if (program) glDeleteProgram(program);
+    if (vs) glDeleteShader(vs);
+    if (fs) glDeleteShader(fs);
+    free(source); free(result);
+    fflush(stdout);
+}
+
+/* Fog-toggle readback oracle (tunnel minimal repro).
+ * Same geometry/texture with fog OFF vs EXP2 fog ON; per-draw uniform churn
+ * like tunnel's per-block state changes. glFinish + glReadPixels on the same
+ * frame decides render/GPU-input fault (readback corrupt, Outcome A) vs
+ * display-only (readback clean, Outcome B). Tolerance covers shader
+ * precision; large deviations print DIAG like the pressure test. */
+static void test_fog_uniforms(void) {
+    enum { SIDE = 256, OUT = 256, DRAWS = 64 };
+    GLuint texture = 0, output = 0, fbo = 0, vbo = 0;
+    GLuint vs = 0, fs_plain = 0, fs_fog = 0, prog_plain = 0, prog_fog = 0;
+    GLint saved_fb = 0, saved_program = 0, saved_buffer = 0;
+    uint32_t *source = malloc((size_t)SIDE * SIDE * 4);
+    uint32_t *result = malloc((size_t)OUT * OUT * 4);
+    static const GLfloat quad[] = {-1,-1, 1,-1, -1,1, 1,1};
+    unsigned fog_bad = 0, plain_bad = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &saved_fb);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &saved_program);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &saved_buffer);
+    if (!source || !result) { fail("fog diagnostic CPU allocation", ENOMEM); goto out; }
+    for (unsigned y = 0; y < SIDE; y++)
+        for (unsigned x = 0; x < SIDE; x++) source[y * SIDE + x] = texture_pixel(x, y, 7);
+    vs = compile_shader(GL_VERTEX_SHADER,
+        "attribute vec2 pos; varying vec2 uv; varying float depth;"
+        "uniform float uDepthOff;"
+        "void main(){uv=pos*0.5+0.5; depth=(pos.x+pos.y)*0.25+0.5+uDepthOff;"
+        "gl_Position=vec4(pos,0.0,1.0);}");
+    fs_plain = compile_shader(GL_FRAGMENT_SHADER,
+        "precision highp float; varying vec2 uv; varying float depth; uniform sampler2D tex;"
+        "void main(){gl_FragColor=texture2D(tex,uv);}");
+    fs_fog = compile_shader(GL_FRAGMENT_SHADER,
+        "precision highp float; varying vec2 uv; varying float depth; uniform sampler2D tex;"
+        "uniform vec3 fogColor; uniform float fogDensity;"
+        "void main(){vec4 t=texture2D(tex,uv); float d=depth*49.0+1.0;"
+        "float f=exp(-pow(fogDensity*d,2.0)); gl_FragColor=vec4(mix(fogColor,t.rgb,clamp(f,0.0,1.0)),1.0);}");
+    if (!vs || !fs_plain || !fs_fog) goto out;
+    prog_plain = glCreateProgram();
+    glAttachShader(prog_plain, vs); glAttachShader(prog_plain, fs_plain);
+    glBindAttribLocation(prog_plain, 0, "pos"); glLinkProgram(prog_plain);
+    prog_fog = glCreateProgram();
+    glAttachShader(prog_fog, vs); glAttachShader(prog_fog, fs_fog);
+    glBindAttribLocation(prog_fog, 0, "pos"); glLinkProgram(prog_fog);
+    GLint ok = 0;
+    glGetProgramiv(prog_plain, GL_LINK_STATUS, &ok);
+    if (!ok) { fail("fog diagnostic plain link", 0); goto out; }
+    glGetProgramiv(prog_fog, GL_LINK_STATUS, &ok);
+    if (!ok) { fail("fog diagnostic fog link", 0); goto out; }
+    glGenBuffers(1, &vbo); glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glDisable(GL_BLEND); glDisable(GL_DITHER); glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glGenTextures(1, &texture); glBindTexture(GL_TEXTURE_2D, texture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SIDE, SIDE, 0, GL_RGBA, GL_UNSIGNED_BYTE, source);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (glGetError()) { fail("fog diagnostic texture upload", 0); goto out; }
+    glGenTextures(1, &output); glBindTexture(GL_TEXTURE_2D, output);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, OUT, OUT, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glGenFramebuffers(1, &fbo); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, output, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        fail("fog diagnostic framebuffer", 0); goto out;
+    }
+    glViewport(0, 0, OUT, OUT);
+    glActiveTexture(GL_TEXTURE0);
+    printf("  [INFO] fog toggle: %u draws each, %ux%u, EXP2 density 0.06 gray 0.7\n", DRAWS, OUT, OUT);
+    fflush(stdout);
+    for (unsigned round = 0; round < 2; round++) {
+        bool fog = round == 1;
+        GLuint prog = fog ? prog_fog : prog_plain;
+        glUseProgram(prog);
+        glUniform1i(glGetUniformLocation(prog, "tex"), 0);
+        GLint depth_loc = glGetUniformLocation(prog, "uDepthOff");
+        GLint color_loc = fog ? glGetUniformLocation(prog, "fogColor") : -1;
+        GLint density_loc = fog ? glGetUniformLocation(prog, "fogDensity") : -1;
+        for (unsigned draw = 0; draw < DRAWS; draw++) {
+            float off = (draw % 8) * 0.002f;
+            if (depth_loc >= 0) glUniform1f(depth_loc, off);
+            if (fog) {
+                if (color_loc >= 0) glUniform3f(color_loc, 0.7f, 0.7f, 0.7f);
+                if (density_loc >= 0) glUniform1f(density_loc, 0.06f);
+            }
+            glBindTexture(GL_TEXTURE_2D, texture);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glFinish();
+            glReadPixels(0, 0, OUT, OUT, GL_RGBA, GL_UNSIGNED_BYTE, result);
+            if (glGetError()) {
+                printf("  [DIAG] fog=%d draw %u GL error=0x%x\n", fog, draw, glGetError());
+                fail("fog diagnostic render/readback", 0); goto out;
+            }
+            for (unsigned y = 0; y < OUT; y++) {
+                for (unsigned x = 0; x < OUT; x++) {
+                    float u = ((float)x + 0.5f) / OUT, v = ((float)y + 0.5f) / OUT;
+                    unsigned tx = (unsigned)(u * SIDE), ty = (unsigned)(v * SIDE);
+                    if (tx >= SIDE) tx = SIDE - 1;
+                    if (ty >= SIDE) ty = SIDE - 1;
+                    uint32_t base = texture_pixel(tx, ty, 7);
+                    uint32_t actual = result[y * OUT + x];
+                    if (!fog) {
+                        if (actual != base) {
+                            if (plain_bad < 5)
+                                printf("  [DIAG] fog=0 draw=%u pixel=(%u,%u) expected=%08x actual=%08x\n",
+                                       draw, x, y, base, actual);
+                            plain_bad++;
+                        }
+                    } else {
+                        float depth = ((float)(2 * x + 1) / (2 * OUT) * 0.5f +
+                                       (float)(2 * y + 1) / (2 * OUT) * 0.5f) + off;
+                        float d = depth * 49.0f + 1.0f;
+                        float f = expf(-powf(0.06f * d, 2.0f));
+                        if (f < 0) f = 0; if (f > 1) f = 1;
+                        float br = (base & 255) / 255.0f, bg = ((base >> 8) & 255) / 255.0f,
+                              bb = ((base >> 16) & 255) / 255.0f;
+                        unsigned er = (unsigned)(179 + (br * 255 - 179) * f + 0.5f);
+                        unsigned eg = (unsigned)(179 + (bg * 255 - 179) * f + 0.5f);
+                        unsigned eb = (unsigned)(179 + (bb * 255 - 179) * f + 0.5f);
+                        unsigned ar = actual & 255, ag = (actual >> 8) & 255, ab = (actual >> 16) & 255;
+                        unsigned err = (ar > er ? ar - er : er - ar) +
+                                       (ag > eg ? ag - eg : eg - ag) +
+                                       (ab > eb ? ab - eb : eb - ab);
+                        if (err > 12) {
+                            if (fog_bad < 8)
+                                printf("  [DIAG] fog=1 draw=%u pixel=(%u,%u) expected~%02x%02x%02x actual=%08x err=%u\n",
+                                       draw, x, y, er, eg, eb, actual, err);
+                            fog_bad++;
+                        }
+                    }
+                }
+            }
+        }
+        printf("  [INFO] fog=%d: %u bad pixels over %u draws\n", fog, fog ? fog_bad : plain_bad, DRAWS);
+        fflush(stdout);
+    }
+    if (plain_bad == 0 && fog_bad == 0)
+        pass("fog toggle readback matches oracle (render path clean)");
+    else if (plain_bad == 0 && fog_bad > 0)
+        fail("fog-ON readback differs; fog-OFF clean (fog uniform/shader-variant path)", fog_bad);
+    else
+        fail("readback differs even without fog (base texture path)", plain_bad);
+out:
+    glBindFramebuffer(GL_FRAMEBUFFER, saved_fb);
+    glUseProgram(saved_program); glBindBuffer(GL_ARRAY_BUFFER, saved_buffer);
+    if (texture) glDeleteTextures(1, &texture);
+    if (output) glDeleteTextures(1, &output);
+    if (fbo) glDeleteFramebuffers(1, &fbo);
+    if (vbo) glDeleteBuffers(1, &vbo);
+    if (prog_plain) glDeleteProgram(prog_plain);
+    if (prog_fog) glDeleteProgram(prog_fog);
+    if (vs) glDeleteShader(vs);
+    if (fs_plain) glDeleteShader(fs_plain);
+    if (fs_fog) glDeleteShader(fs_fog);
+    free(source); free(result);
+    fflush(stdout);
+}
+
+/* Reverse sharing direction: AMD allocates/renders; native DRM imports and
+ * CPU-maps exactly that dma-buf. Compare GPU readback and native CPU aliases
+ * against an independent tiled pattern before any host display transfer. */
+static void test_amd_export_readback(EGLDisplay dpy, struct gbm_device *gbm) {
+    enum { SIDE = 512, TILE = 128, FRAMES = 64 };
+    int card = -1, fd = -1;
+    uint32_t handle = 0, pitch = 0;
+    struct gbm_bo *bo = NULL;
+    EGLImageKHR image = EGL_NO_IMAGE_KHR;
+    GLuint texture = 0, fbo = 0;
+    GLint old_fb = 0;
+    void *cpu = MAP_FAILED;
+    size_t bytes = 0;
+    uint32_t *readback = malloc(SIDE * SIDE * 4);
+    PFNEGLCREATEIMAGEKHRPROC create_image = (void *)eglGetProcAddress("eglCreateImageKHR");
+    PFNEGLDESTROYIMAGEKHRPROC destroy_image = (void *)eglGetProcAddress("eglDestroyImageKHR");
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind_image = (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_fb);
+    if (!readback || !gbm || !create_image || !destroy_image || !bind_image) {
+        fail("AMD export diagnostic setup", 0); goto out;
+    }
+    card = drm_name_is("/dev/dri/card0", "ascentdrm");
+    if (card < 0) {
+        fail("AMD export diagnostic native display node", errno); goto out;
+    }
+    const uint64_t linear = DRM_FORMAT_MOD_LINEAR;
+    bo = gbm_bo_create_with_modifiers2(gbm, SIDE, SIDE, GBM_FORMAT_ABGR8888,
+                       &linear, 1, GBM_BO_USE_RENDERING);
+    if (!bo) {
+        fail("AMD export diagnostic linear buffer", errno); goto out;
+    }
+    printf("  [INFO] AMD export buffer modifier: 0x%llx\n",
+           (unsigned long long)gbm_bo_get_modifier(bo));
+    if (gbm_bo_get_modifier(bo) != DRM_FORMAT_MOD_LINEAR) {
+        fail("AMD export diagnostic unexpected modifier", 0); goto out;
+    }
+    pitch = gbm_bo_get_stride(bo);
+    bytes = (size_t)pitch * SIDE;
+    fd = gbm_bo_get_fd(bo);
+    if (fd < 0 || drmPrimeFDToHandle(card, fd, &handle)) {
+        fail("native display imports AMD-produced dma-buf", errno); goto out;
+    }
+    struct drm_mode_map_dumb map = {.handle = handle};
+    if (ioctl(card, DRM_IOCTL_MODE_MAP_DUMB, &map)) {
+        fail("native display AMD import mmap token", errno); goto out;
+    }
+    cpu = mmap(NULL, bytes, PROT_READ, MAP_SHARED, card, map.offset);
+    if (cpu == MAP_FAILED) { fail("native display AMD import CPU mapping", errno); goto out; }
+    EGLint attrs[] = { EGL_WIDTH, SIDE, EGL_HEIGHT, SIDE,
+        EGL_LINUX_DRM_FOURCC_EXT, GBM_FORMAT_ABGR8888,
+        EGL_DMA_BUF_PLANE0_FD_EXT, fd, EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)pitch, EGL_NONE };
+    image = create_image(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+    if (image == EGL_NO_IMAGE_KHR) { fail("AMD export render image", eglGetError()); goto out; }
+    glGenTextures(1, &texture); glBindTexture(GL_TEXTURE_2D, texture);
+    bind_image(GL_TEXTURE_2D, image);
+    glGenFramebuffers(1, &fbo); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        fail("AMD export render framebuffer", 0); goto out;
+    }
+    glViewport(0, 0, SIDE, SIDE);
+    glDisable(GL_DITHER); glEnable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    for (unsigned frame = 0; frame < FRAMES; frame++) {
+        uint32_t colors[16];
+        for (unsigned y = 0; y < 4; y++) {
+            for (unsigned x = 0; x < 4; x++) {
+                unsigned i = y * 4 + x;
+                colors[i] = texture_pixel(x, y, frame);
+                uint32_t c = colors[i];
+                glScissor(x*TILE, y*TILE, TILE, TILE);
+                glClearColor((c&255)/255.0f, ((c>>8)&255)/255.0f,
+                             ((c>>16)&255)/255.0f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+            }
+        }
+        glReadPixels(0, 0, SIDE, SIDE, GL_RGBA, GL_UNSIGNED_BYTE, readback);
+        if (glGetError()) { fail("AMD export GPU readback", 0); goto out; }
+        struct dma_buf_sync sync = {.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
+        if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync)) { fail("AMD export CPU access", errno); goto out; }
+        bool mismatch = false;
+        for (unsigned y = 0; y < SIDE && !mismatch; y++) {
+            for (unsigned x = 0; x < SIDE; x++) {
+                uint32_t expected = colors[(y/TILE)*4+x/TILE];
+                uint32_t gpu_pixel = readback[y*SIDE+x];
+                uint32_t cpu_pixel = *(volatile uint32_t *)((uint8_t *)cpu + y*pitch + x*4);
+                if (expected != gpu_pixel || expected != cpu_pixel) {
+                    printf("  [DIAG] AMD export frame=%u pixel=(%u,%u) expected=%08x gpu=%08x native_cpu=%08x\n",
+                           frame,x,y,expected,gpu_pixel,cpu_pixel);
+                    mismatch = true; break;
+                }
+            }
+        }
+        sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+        if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync)) { fail("AMD export end CPU access", errno); goto out; }
+        if (mismatch) { fail("AMD rendering/native import alias integrity", 0); goto out; }
+    }
+    pass("AMD-produced PRIME buffer: 64 frames, GPU/native CPU pixels match");
+out:
+    glDisable(GL_SCISSOR_TEST); glBindFramebuffer(GL_FRAMEBUFFER, old_fb);
+    if (fbo) glDeleteFramebuffers(1, &fbo);
+    if (texture) glDeleteTextures(1, &texture);
+    if (image != EGL_NO_IMAGE_KHR) destroy_image(dpy,image);
+    if (cpu != MAP_FAILED) munmap(cpu,bytes);
+    if (handle) { struct drm_gem_close close_arg={.handle=handle}; ioctl(card,DRM_IOCTL_GEM_CLOSE,&close_arg); }
+    if (fd >= 0) close(fd);
+    if (bo) gbm_bo_destroy(bo);
+    if (card >= 0) close(card);
+    free(readback); fflush(stdout);
 }

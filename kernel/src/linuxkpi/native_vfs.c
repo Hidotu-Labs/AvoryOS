@@ -12,6 +12,7 @@
 #include "fs/vfs.h"
 #include "lib/string.h"
 #include "mm/heap.h"
+#include "syscalls/sys_io_shared.h"
 
 #include <linuxkpi/native_vfs.h>
 
@@ -51,6 +52,29 @@ static int kpi_node_poll(vfs_node_t *node, int events) {
 
 static void kpi_node_close(vfs_node_t *node) {
   linuxkpi_file_close(node);
+}
+
+_Bool asc_vfs_node_is_linux_file(void *node) {
+  vfs_node_t *n = node;
+  return n && n->close == kpi_node_close && n->mmap == kpi_node_mmap;
+}
+
+_Bool asc_vfs_node_nonblocking(void *node) {
+  return node && (((vfs_node_t *)node)->flags & FS_NONBLOCK);
+}
+
+void asc_vfs_node_set_nonblocking(void *node, _Bool enabled) {
+  if (!node)
+    return;
+  if (enabled)
+    ((vfs_node_t *)node)->flags |= FS_NONBLOCK;
+  else
+    ((vfs_node_t *)node)->flags &= ~FS_NONBLOCK;
+}
+
+void asc_vfs_node_set_size(void *node, __UINT64_TYPE__ size) {
+  if (node)
+    ((vfs_node_t *)node)->length = size;
 }
 
 /* ── node allocation ────────────────────────────────────────────────────── */
@@ -423,14 +447,55 @@ void asc_vfs_fd_install(int fd, void *node, unsigned int flags) {
 }
 
 void asc_vfs_fd_release_reserved(int fd) {
+  fd_release_reserved(sched_get_current(), fd);
+}
+
+/* Reserve storage before publishing a Linux file descriptor: fd_install()
+ * cannot fail after get_unused_fd_flags() has succeeded. Each installation
+ * owns a distinct VFS wrapper and the caller's transferred Linux file ref. */
+int asc_vfs_file_fd_alloc(unsigned int flags) {
   struct thread *t = sched_get_current();
-
-  if (!t || !t->files || fd < 0 || fd >= MAX_FDS)
-    return;
-
+  if (!t || !t->files)
+    return -9;
+  vfs_node_t *node = asc_vfs_anon_node();
+  if (!node)
+    return -12;
+  int fd = asc_vfs_fd_alloc(flags);
+  if (fd < 0) {
+    vfs_close(node);
+    return -24;
+  }
   spinlock_acquire(&t->files->lock);
-  if (t->fds[fd] == KPI_FD_RESERVED)
-    t->fds[fd] = NULL;
+  t->files->reserved_nodes[fd] = node;
+  t->fd_flags[fd] = flags & KPI_O_CLOEXEC ? KPI_FD_FLAGS_CLOEXEC_BIT : 0;
+  spinlock_release(&t->files->lock);
+  return fd;
+}
+
+void asc_vfs_file_fd_install(int fd, void *owner) {
+  struct thread *t = sched_get_current();
+  vfs_node_t *source = owner;
+  if (!t || !t->files || fd < 0 || fd >= MAX_FDS || !source)
+    return;
+  spinlock_acquire(&t->files->lock);
+  vfs_node_t *node = t->files->reserved_nodes[fd];
+  if (t->fds[fd] != KPI_FD_RESERVED || !node) {
+    spinlock_release(&t->files->lock);
+    return;
+  }
+  node->device = source->device;
+  node->flags = source->flags;
+  node->length = source->length;
+  node->mask = source->mask;
+  node->inode = source->inode;
+  node->wait_queue = source->wait_queue;
+  node->mmap_shared_only = source->mmap_shared_only;
+  node->mmap_private_pmm_refs = source->mmap_private_pmm_refs;
+  memcpy(node->name, source->name, sizeof(node->name));
+  t->files->reserved_nodes[fd] = NULL;
+  t->fd_offsets[fd] = 0;
+  /* CLOEXEC belongs to the reservation, not struct file::f_flags. */
+  t->fds[fd] = node;
   spinlock_release(&t->files->lock);
 }
 
@@ -445,4 +510,40 @@ void *asc_vfs_fd_lookup(int fd) {
   if (!node || node == KPI_FD_RESERVED)
     return NULL;
   return node;
+}
+
+void *asc_vfs_fd_get_node(int fd) {
+  struct thread *t = sched_get_current();
+  vfs_node_t *node;
+  if (!t || !t->files || fd < 0 || fd >= MAX_FDS)
+    return NULL;
+  spinlock_acquire(&t->files->lock);
+  node = t->fds[fd];
+  if (node && node != KPI_FD_RESERVED)
+    vfs_node_ref(node);
+  else
+    node = NULL;
+  spinlock_release(&t->files->lock);
+  return node;
+}
+
+int asc_vfs_fd_close(int fd) {
+  struct thread *t = sched_get_current();
+  vfs_node_t *node;
+  if (!t || !t->files || fd < 0 || fd >= MAX_FDS)
+    return -9;
+  spinlock_acquire(&t->files->lock);
+  node = t->fds[fd];
+  if (!node || node == KPI_FD_RESERVED) {
+    spinlock_release(&t->files->lock);
+    return -9;
+  }
+  t->fds[fd] = NULL;
+  t->fd_offsets[fd] = 0;
+  t->fd_flags[fd] = 0;
+  if ((uint32_t)fd < t->files->next_fd)
+    t->files->next_fd = fd;
+  spinlock_release(&t->files->lock);
+  vfs_close(node);
+  return 0;
 }

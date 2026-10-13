@@ -3,9 +3,11 @@
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
 #include "../cpu/gdt.h"
+#include "../cpu/fpu.h"
 #include "../cpu/msr.h"
 #include "../drivers/storage/nvme.h"
 #include "../drivers/timer/rtc.h"
+#include "../hal/hal.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
 #include "../mm/pcid.h"
@@ -22,6 +24,9 @@
 #define TSC_PROBES_ENABLE
 #include "../lib/tsc.h"
 #include <stdint.h>
+#ifdef LINUXKPI_LINUX_IMPORTED
+#include <linuxkpi/native_pci.h>
+#endif
 
 // Wake waiters after CLONE_CHILD_CLEARTID/set_tid_address exit cleanup.
 uint64_t futex_wake_user(uint32_t *uaddr, uint32_t count);
@@ -365,7 +370,92 @@ static uint64_t sys_pidfd_getfd(uint64_t pidfd, uint64_t targetfd,
 
 // exit / exit_group (shared)
 void process_do_exit(uint64_t status) __attribute__((noreturn));
+
+/* Real-vfork rendezvous release (see struct thread::vfork_done). The child's
+ * exec success and _exit paths call this; sched_reap_thread() calls it as a
+ * backstop so a child killed any other way (SIGKILL via terminate) cannot
+ * leave the parent blocked forever. The flag is set before the wakeup and the
+ * child's VFORK mark cleared, so repeats and races are harmless. */
+void vfork_release_parent(struct thread *child) {
+  if (!child || !(child->clone_flags & CLONE_VFORK))
+    return;
+  struct thread *parent = child->parent;
+  if (parent) {
+    /* Pair completion with the waiter's check-and-block under its runqueue
+     * lock. Publishing the flag and inspecting state without that handshake
+     * can miss a parent that is just about to sleep. Started threads remain
+     * on their owning CPU (sched_wakeup uses the same queue_lock). */
+    struct cpu_info *cpu = cpu_get_info(parent->cpu_index);
+    spinlock_acquire(&cpu->queue_lock);
+    parent->vfork_release_tsc = rdtsc_fence();
+    __atomic_store_n(&parent->vfork_done, true, __ATOMIC_RELEASE);
+    bool wake = parent->state == THREAD_BLOCKED;
+    spinlock_release(&cpu->queue_lock);
+    /* sched_wakeup takes queue_lock itself; never call it while holding it. */
+    if (wake) {
+      sched_wakeup(parent);
+      /* The same-CPU child should give the waiting launcher a scheduling
+       * opportunity at syscall exit, even when normal wakeup fairness would
+       * let the child keep its slice. No context switch while holding locks. */
+      if (cpu == cpu_get_current() && cpu->current_thread == child)
+        __atomic_store_n(&child->need_resched, true, __ATOMIC_RELEASE);
+    }
+  }
+  child->clone_flags &= ~CLONE_VFORK;
+}
+
+static void vfork_wait_for_child(struct thread *parent) {
+  TSC_BEGIN(vfork_wait);
+  uint64_t released_at = 0;
+  for (;;) {
+    struct cpu_info *cpu = cpu_get_current();
+    spinlock_acquire(&cpu->queue_lock);
+    if (__atomic_load_n(&parent->vfork_done, __ATOMIC_ACQUIRE)) {
+      released_at = parent->vfork_release_tsc;
+      spinlock_release(&cpu->queue_lock);
+      break;
+    }
+    parent->state = THREAD_BLOCKED;
+    spinlock_release(&cpu->queue_lock);
+    /* A completion after unlock makes us runnable before yield, or wakes us
+     * after the switch. Spurious signal wakeups simply repeat the handshake. */
+    sched_yield();
+  }
+  parent->vfork_child = 0;
+  uint64_t resumed_at = rdtsc_fence();
+  TSC_END(vfork_wait);
+  /* Separate scheduling/wakeup latency from time spent waiting for the
+   * child to finish. Clamp defensively if cross-CPU TSCs are not aligned. */
+  if (released_at && resumed_at >= released_at) {
+    int slot = tsc_probe_register("vfork_resume");
+    tsc_probe_record(slot, resumed_at - released_at);
+  }
+
+  /* Borrowing children skip their exec dump; show completed rendezvous
+   * samples from the parent. This is elapsed time, not CPU time. */
+  static uint32_t waits;
+  uint32_t n = __atomic_add_fetch(&waits, 1, __ATOMIC_RELAXED);
+  if (n <= 4 || n == 16 || n == 64)
+    tsc_probe_dump();
+}
+static void process_clear_child_tid(struct thread *current) {
+  uint32_t *tidptr = (uint32_t *)current->tid_address;
+  current->tid_address = NULL;
+  if (!tidptr)
+    return;
+  uint32_t zero = 0;
+  /* Exit also runs from a user exception, where the syscall's coarse SMAP
+   * window is absent. The address may have been unmapped since registration;
+   * a guarded user copy handles both that race and demand/CoW faults. */
+  if (vmm_is_user_addr_range_writable((uint64_t)tidptr, sizeof(zero)) &&
+      copy_to_user(tidptr, &zero, sizeof(zero)) == 0)
+    futex_wake_user(tidptr, 1);
+}
+
 void process_do_exit(uint64_t status) {
+  /* Fatal user exceptions enter with IF clear. Cleanup may wait for I/O or
+   * IPIs and must run with the same interrupt state as ordinary sys_exit. */
+  hal_irq_enable();
   struct thread *current = sched_get_current();
   if (!current) {
     while (1)
@@ -381,14 +471,7 @@ void process_do_exit(uint64_t status) {
   // into musl's a_crash (HLT) on impossible owner state.
   if (current && current->robust_list)
     robust_handle_death(current);
-  if (current && current->tid_address) {
-    uint32_t *tidptr = (uint32_t *)current->tid_address;
-    if (vmm_is_user_addr_range_writable((uint64_t)tidptr, sizeof(*tidptr))) {
-      __atomic_store_n(tidptr, 0, __ATOMIC_RELEASE);
-      futex_wake_user(tidptr, 1);
-    }
-    current->tid_address = NULL;
-  }
+  process_clear_child_tid(current);
 
   if (current)
     sched_reparent_children(current);
@@ -526,14 +609,10 @@ void process_do_exit(uint64_t status) {
         sched_queue_reap(current);
     }
 
-    /* A vfork parent is blocked inside sys_clone_internal(), before it can
-     * enter wait4().  Publish the zombie before releasing it so an immediate
-     * waitpid() can observe and reap this child. */
-    if (current->clone_flags & CLONE_VFORK) {
-      if (current->parent && current->parent->state == THREAD_BLOCKED)
-        sched_wakeup(current->parent);
-      current->clone_flags &= ~CLONE_VFORK;
-    }
+    /* A vfork parent is blocked in sys_vfork(), before it can enter wait4().
+     * Publish the zombie before releasing it so an immediate waitpid() can
+     * observe and reap this child. */
+    vfork_release_parent(current);
 
     if (parent_to_wake) {
       klog_debug_puts("[EXITDBG] waking parent\n");
@@ -1073,7 +1152,39 @@ static void exec_close_cloexec(struct thread *t) {
 // sys_execve
 #include "../lib/tsc.h"
 
+/* Keep normal Wine launches quiet. Explicit WINEDEBUG settings still win. */
+static bool exec_wine_debug_env(const char *path, char ***envp, int *envc) {
+  const char *name = strrchr(path, '/');
+  name = name ? name + 1 : path;
+  if (strcmp(name, "wine") && strcmp(name, "wine64") &&
+      strcmp(name, "wine-preloader") && strcmp(name, "wine64-preloader"))
+    return true;
+  for (int i = 0; i < *envc; i++)
+    if (strncmp((*envp)[i], "WINEDEBUG=", 10) == 0) return true;
+  const char *setting = "WINEDEBUG=-all";
+  size_t setting_size = strlen(setting) + 1;
+  char **expanded = kmalloc(((size_t)*envc + 2) * sizeof(*expanded));
+  if (!expanded) return false;
+  char *value = kmalloc(setting_size);
+  if (!value) { kfree(expanded); return false; }
+  memcpy(value, setting, setting_size);
+  memcpy(expanded, *envp, (size_t)*envc * sizeof(*expanded));
+  expanded[*envc] = value;
+  expanded[*envc + 1] = NULL;
+  kfree(*envp);
+  *envp = expanded;
+  (*envc)++;
+  return true;
+}
+
+static const char *exec_vector_entry(const char **vector, int index,
+                                      bool compat32) {
+  return compat32 ? (const char *)(uintptr_t)((const uint32_t *)vector)[index]
+                  : vector[index];
+}
+
 static uint64_t sys_execve(struct syscall_regs *regs) {
+  bool compat32 = regs->user_cs == 0x1b;
   const char **user_argv = (const char **)regs->rsi;
   const char **user_envp = (const char **)regs->rdx;
   const char *user_path = (const char *)regs->rdi;
@@ -1092,7 +1203,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   TSC_BEGIN(execve_arg_copy);
   int argc = 0;
   if (user_argv)
-    while (user_argv[argc])
+    while (exec_vector_entry(user_argv, argc, compat32))
       argc++;
   char **k_argv = kmalloc((argc + 1) * sizeof(char *));
   if (!k_argv) {
@@ -1100,15 +1211,15 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
     return (uint64_t)-12;
   }
   for (int i = 0; i < argc; i++) {
-    size_t len = strlen(user_argv[i]);
+    size_t len = strlen(exec_vector_entry(user_argv, i, compat32));
     k_argv[i] = kmalloc(len + 1);
-    memcpy(k_argv[i], user_argv[i], len + 1);
+    memcpy(k_argv[i], exec_vector_entry(user_argv, i, compat32), len + 1);
   }
   k_argv[argc] = NULL;
 
   int envc = 0;
   if (user_envp)
-    while (user_envp[envc])
+    while (exec_vector_entry(user_envp, envc, compat32))
       envc++;
   char **k_envp = kmalloc((envc + 1) * sizeof(char *));
   if (!k_envp) {
@@ -1119,11 +1230,19 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
     return (uint64_t)-12;
   }
   for (int i = 0; i < envc; i++) {
-    size_t len = strlen(user_envp[i]);
+    size_t len = strlen(exec_vector_entry(user_envp, i, compat32));
     k_envp[i] = kmalloc(len + 1);
-    memcpy(k_envp[i], user_envp[i], len + 1);
+    memcpy(k_envp[i], exec_vector_entry(user_envp, i, compat32), len + 1);
   }
   k_envp[envc] = NULL;
+  if (!exec_wine_debug_env(path, &k_envp, &envc)) {
+    kfree(path);
+    for (int i = 0; i < argc; i++) kfree(k_argv[i]);
+    kfree(k_argv);
+    for (int i = 0; i < envc; i++) kfree(k_envp[i]);
+    kfree(k_envp);
+    return (uint64_t)-12;
+  }
   TSC_END(execve_arg_copy);
 
   // Shebang (#!) script interpretation loop (up to 4 levels of recursion)
@@ -1268,6 +1387,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   uint64_t old_brk_base = old_mm->brk_base;
   uint64_t old_brk_current = old_mm->brk_current;
   uint64_t old_mmap_next_addr = old_mm->mmap_next_addr;
+  bool old_compat32 = old_mm->compat32;
   bool shared_mm = false;
 
   /* Pre-allocate the replacement address space.  Dropping the shared reference
@@ -1364,6 +1484,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       current->mm->brk_base = old_brk_base;
       current->mm->brk_current = old_brk_current;
       current->mm->mmap_next_addr = old_mmap_next_addr;
+      current->mm->compat32 = old_compat32;
     }
     kfree(path);
     for (int i = 0; i < argc; i++)
@@ -1388,6 +1509,14 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
   current->fs_base = 0;
   current->gs_base = 0;
+
+  /* exec replaces the mappings backing a fork-inherited alternate stack.
+   * Keeping its registration makes SA_ONSTACK handlers target the old image
+   * and can kill a process while delivering a recoverable Wasm SIGILL). */
+  current->ss_sp = 0;
+  current->ss_size = 0;
+  current->ss_flags = SS_DISABLE;
+  syscall_user_dispatch_configure(current, 0, 0, 0, 0);
 
   // Reset custom signal handlers to SIG_DFL after exec; preserve SIG_IGN (POSIX requirement).
   for (int i = 0; i < 64; i++) {
@@ -1415,22 +1544,23 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       (const char **)k_envp, &elf_info);
   TSC_END(execve_stack);
 
+  /* Parent-side vfork_wait already dumps completed samples. Avoid rendering
+   * a duplicate exec table while the borrowing child still holds it asleep. */
+  bool borrowed_vfork = (current->clone_flags & CLONE_VFORK) != 0;
+  /* Successful exec starts with architectural FPU defaults. */
+  fpu_reset_current();
+
+  // ENOEXEC fallbacks above retain the original address space and keep waiting.
+  vfork_release_parent(current);
+
   /* Probes are cumulative (fork stats must survive to be averaged), so print
    * the first few launches; fork_probe_maybe_dump() covers later activity. */
   {
     static uint32_t exec_probe_dumps;
-    if (exec_probe_dumps < 4) {
+    if (!borrowed_vfork && exec_probe_dumps < 4) {
       exec_probe_dumps++;
       tsc_probe_dump();
     }
-  }
-
-  // Do not release a vfork parent until exec has actually succeeded. The
-  // child needs the shared address space intact to handle ENOEXEC fallbacks.
-  if (current->clone_flags & CLONE_VFORK) {
-    if (current->parent && current->parent->state == THREAD_BLOCKED)
-      sched_wakeup(current->parent);
-    current->clone_flags &= ~CLONE_VFORK;
   }
 
   uint64_t actual_entry =
@@ -1480,12 +1610,17 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   // Map the vsyscall page into the new address space
   vmm_map_vsyscall_page((uint64_t *)current->cr3);
 
-  // Free the old address space (from fork) now that the new one is loaded.
-  // We've already switched CR3, so this is safe.
-  // We only free it if it was NOT shared (i.e. not a vfork/thread exec).
+  // Hand the old address space (from fork) to background teardown now that
+  // the new one is loaded.  We've already switched CR3, so no CPU can be
+  // walking these tables.  Queued nodes drain on idle CPUs (bounded by the
+  // reap-queue safety net), so execve no longer pays the ~60 us page-table
+  // walk inline.  The queue steals old_vmas (re-initing it), making the
+  // destroy below a no-op in the queued case; on OOM it falls back to the
+  // inline free internally.  Shared mm (vfork/thread exec) has nothing to
+  // free: old_vmas there is an empty placeholder.
   if (old_cr3 != 0 && !shared_mm) {
     TSC_BEGIN(exec_free_old);
-    vmm_free_user_pages_vma(old_cr3, &old_vmas);
+    vmm_queue_free_user_pages_vma(old_cr3, &old_vmas);
     TSC_END(exec_free_old);
   }
   // Now destroy the old VMA tree nodes
@@ -1531,6 +1666,8 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   regs->r13 = 0;
   regs->r14 = 0;
   regs->r15 = 0;
+  regs->user_cs = elf_info.compat32 ? 0x1b : 0x2b;
+  regs->user_rcx = regs->user_rsi = regs->user_rdi = 0;
   regs->rflags = 0x202; // IF | reserved bit 1
 
   return 0;
@@ -1572,6 +1709,23 @@ static void fork_probe_maybe_dump(void) {
   uint32_t n = __atomic_add_fetch(&forks, 1, __ATOMIC_RELAXED);
   if (n == 16 || n == 64)
     tsc_probe_dump();
+  /* Zero-pool hit rate next to the TSC table: boot is pool-cold by
+   * construction (no idle time during the exec storm), steady state should
+   * show hits climbing once idle refills. Every 64th fork, additive. */
+  if ((n % 64) == 0) {
+    uint64_t hits = 0, misses = 0, refilled = 0;
+    size_t cached = 0;
+    pmm_zero_pool_stats(&hits, &misses, &refilled, &cached);
+    klog_puts("[PMM] zero-pool hits=");
+    klog_uint64(hits);
+    klog_puts(" misses=");
+    klog_uint64(misses);
+    klog_puts(" refilled=");
+    klog_uint64(refilled);
+    klog_puts(" cached=");
+    klog_uint64((uint64_t)cached);
+    klog_puts("\n");
+  }
 }
 
 // sys_fork (raw handler — receives full register frame)
@@ -1624,6 +1778,7 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   child_mm->brk_base = parent->mm->brk_base;
   child_mm->brk_current = parent->mm->brk_current;
   child_mm->mmap_next_addr = parent->mm->mmap_next_addr;
+    child_mm->compat32 = parent->mm->compat32;
   child_mm->ref_count = 1;
   child_mm->pcid = pcid_alloc();
   spinlock_init(&child_mm->lock);
@@ -1732,6 +1887,7 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   // Keep the return value independent of the child allocation in case it exits
   // quickly after being scheduled.
   uint32_t child_tid = child->tid;
+  fpu_copy_thread(child, parent);
   sched_enqueue_thread(child, NULL);
 
   // 9. Return child PID to parent
@@ -1809,10 +1965,16 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   uint64_t child_cr3 = parent->cr3;
   struct mm_struct *child_mm = parent->mm;
   bool vfork = (flags & CLONE_VFORK) != 0;
-  // If CLONE_VFORK is requested, allocate a private COW address space so the child
-  // cannot clobber the parent's memory/stack. This eliminates deadlocks and
-  // lock inversion with sibling threads in multithreaded processes (e.g. plasmashell).
-  bool private_mm = !(flags & CLONE_VM) || vfork;
+  /* CLONE_VFORK borrows the address space (Linux vfork semantics, same as
+   * sys_vfork): the child shares mm/CR3 and the caller blocks until the child
+   * execs or exits. Only the calling thread sleeps; sibling threads keep
+   * running. The child must only call execve or _exit — the standard vfork
+   * contract musl posix_spawn honors. exec() unshares via its shared_mm path;
+   * _exit/kill release via vfork_release_parent() plus mm refcounting, and
+   * the reaper NULLs survivor back-pointers so a reaped parent can't be
+   * touched by a late release. VFORK-without-VM keeps the old private-CoW
+   * clone as a fallback instead of growing a new EINVAL. */
+  bool private_mm = !(flags & CLONE_VM);
 
   if (private_mm) {
     TSC_BEGIN(fork_clone);
@@ -1844,6 +2006,7 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     child_mm->brk_base = parent->mm->brk_base;
     child_mm->brk_current = parent->mm->brk_current;
     child_mm->mmap_next_addr = parent->mm->mmap_next_addr;
+    child_mm->compat32 = parent->mm->compat32;
     child_mm->ref_count = 1;
     child_mm->pcid = pcid_alloc();
     spinlock_init(&child_mm->lock);
@@ -1976,7 +2139,21 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   /* Runqueue publication is the final creation step. */
   /* Snapshot the result before making the child runnable. */
   uint32_t child_tid = child->tid;
+  if (vfork) {
+    /* Publish the rendezvous before the child is runnable: like sys_vfork's
+     * child, it may exec/exit on another CPU immediately after enqueue and
+     * must observe valid state. Release comes from the child's exec/_exit
+     * (or the reap backstop for kills). */
+    parent->vfork_child = child_tid;
+    parent->vfork_release_tsc = 0;
+    __atomic_store_n(&parent->vfork_done, false, __ATOMIC_RELEASE);
+  }
+  fpu_copy_thread(child, parent);
   sched_enqueue_thread(child, target_cpu);
+
+  if (vfork) {
+    vfork_wait_for_child(parent);
+  }
 
   return child_tid;
 #undef PIDFD_UNRESERVE
@@ -2000,15 +2177,113 @@ uint64_t sys_clone(struct syscall_regs *regs) {
                             pidfd_slot);
 }
 
-// sys_vfork (syscall 58)
+// sys_vfork (syscall 58) — real vfork semantics, shared with
+// sys_clone_internal()'s CLONE_VFORK path (same borrow + rendezvous).
+//
+// The child borrows the parent's address space (same mm, same CR3, refcounted)
+// and the calling thread blocks until the child execs or exits. Only the
+// calling thread sleeps; sibling threads keep running, matching Linux. The
+// child must only call execve or _exit (never return or touch the stack) —
+// the standard vfork contract, which musl/glibc posix_spawn honor.
+//
 uint64_t sys_vfork(struct syscall_regs *regs) {
-  // POSIX explicitly permits implementing vfork as fork.
-  // In AvoryOS, using shared VM and parent-blocking for vfork in multithreaded
-  // environments (like KDE Plasma 6 / plasmashell) leads to severe lock-inversion,
-  // stack clobbering, and multi-minute stalls.
-  // Using COW fork provides full memory isolation, zero stack contention,
-  // and instant process startup without blocking the parent.
-  return sys_fork(regs);
+  struct thread *parent = sched_get_current();
+  if (!regs || !parent || !parent->mm)
+    return (uint64_t)-22;
+
+  // Child register state: returns 0 in the child, same user stack as parent.
+  struct syscall_regs *child_regs = kmalloc(sizeof(*child_regs));
+  if (!child_regs)
+    return (uint64_t)-12;
+  memcpy(child_regs, regs, sizeof(*child_regs));
+  child_regs->rax = 0;
+
+  struct thread *child =
+      sched_create_kernel_thread(fork_child_entry, NULL, false);
+  if (!child) {
+    kfree(child_regs);
+    return (uint64_t)-12;
+  }
+
+  // Drop the placeholder MM and share the parent's address space instead of
+  // cloning page tables / VMAs (the whole point of vfork).
+  if (child->mm) {
+    if (child->mm->pcid)
+      pcid_free(child->mm->pcid);
+    vma_list_destroy(&child->mm->vmas);
+    kfree(child->mm);
+  }
+  spinlock_acquire(&parent->mm->lock);
+  parent->mm->ref_count++;
+  spinlock_release(&parent->mm->lock);
+  child->mm = parent->mm;
+  child->cr3 = parent->cr3;
+
+  // Configure the child exactly like sys_fork (own fd-table copy, inherited
+  // credentials/handlers/name), so the only behavioral delta is the shared mm.
+  child->is_forked_child = true;
+  child->fork_ctx = child_regs;
+  child->parent = parent;
+  child->cpu_affinity = parent->cpu_affinity;
+  child->priority = parent->static_priority;
+  child->static_priority = parent->static_priority;
+  child->nice_value = parent->nice_value;
+  eevfd_set_nice(&child->se, (int)child->nice_value);
+  child->tgid = child->tid;
+  child->clone_flags = CLONE_VFORK | CLONE_VM | SIGCHLD;
+  for (int i = 0; i < MAX_FDS; i++) {
+    if (parent->fds[i] && parent->fds[i] != FD_RESERVED) {
+      child->fds[i] = parent->fds[i];
+      child->fd_offsets[i] = parent->fd_offsets[i];
+      child->fd_flags[i] = parent->fd_flags[i];
+      if (parent->fd_paths[i]) {
+        child->fd_paths[i] = parent->fd_paths[i];
+        __atomic_add_fetch(&child->fd_paths[i]->ref_count, 1,
+                           __ATOMIC_RELAXED);
+      }
+      vfs_open(child->fds[i]);
+    }
+  }
+  memcpy(child->cwd_path, parent->cwd_path, sizeof(child->cwd_path));
+  // sched_create_kernel_thread() already inherited and referenced the
+  // parent's CWD. Do not take a second, unmatched reference here.
+  child->cwd_node = parent->cwd_node;
+  memcpy(child->signal_handlers, parent->signal_handlers,
+         sizeof(child->signal_handlers));
+  child->fs_base = parent->fs_base;
+  child->gs_base = parent->gs_base;
+  child->umask = parent->umask;
+  child->uid = parent->uid;
+  child->gid = parent->gid;
+  child->euid = parent->euid;
+  child->egid = parent->egid;
+  child->suid = parent->suid;
+  child->sgid = parent->sgid;
+  child->fsuid = parent->fsuid;
+  child->fsgid = parent->fsgid;
+  child->supplementary_group_count = parent->supplementary_group_count;
+  memcpy(child->supplementary_groups, parent->supplementary_groups,
+         sizeof(child->supplementary_groups));
+  child->ctty = parent->ctty;
+  memcpy(child->comm, parent->comm, sizeof(child->comm));
+  child->ss_sp = parent->ss_sp;
+  child->ss_size = parent->ss_size;
+  child->ss_flags = parent->ss_flags;
+#if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
+  child->trace_syscalls = parent->trace_syscalls;
+#endif
+
+  uint32_t child_tid = child->tid;
+  // Publish the rendezvous before the child is runnable: it may exec/exit
+  // on another CPU immediately after enqueue and must observe valid state.
+  parent->vfork_child = child_tid;
+  parent->vfork_release_tsc = 0;
+  __atomic_store_n(&parent->vfork_done, false, __ATOMIC_RELEASE);
+  fpu_copy_thread(child, parent);
+  sched_enqueue_thread(child, NULL);
+
+  vfork_wait_for_child(parent);
+  return child_tid;
 }
 
 struct clone_args {
@@ -2228,6 +2503,9 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     return (uint64_t)-1;
 
   switch (option) {
+  case 59: // PR_SET_SYSCALL_USER_DISPATCH
+    return (uint64_t)syscall_user_dispatch_configure(current, arg2, arg3,
+                                                    arg4, arg5);
   case 1: // PR_SET_PDEATHSIG
     if (arg2 == 0 || (arg2 > 0 && arg2 <= 64)) {
       current->pdeath_signal = (int)arg2;
@@ -3021,12 +3299,18 @@ static uint64_t sys_setitimer(uint64_t which, uint64_t new_value_ptr,
 
   t->it_real_value = value_ms;
   t->it_real_interval = interval_ms;
-  t->it_real_next = value_ms ? now + value_ms : 0;
+  /* Route through the arm/disarm helpers: the tick fast-path skips the
+   * whole itimer scan while active_itimer_count==0, so writing it_real_next
+   * directly (as here before) leaves the timer armed but never delivered -
+   * alarm(2) would never fire. The helpers also maintain
+   * earliest_itimer_deadline and handle re-arm accounting. */
+  if (value_ms)
+    sched_itimer_arm(t, now + value_ms, interval_ms, value_ms);
+  else
+    sched_itimer_disarm(t);
 
   if (old_value_ptr)
     memcpy((void *)old_value_ptr, &old_value, sizeof(old_value));
-  if (t->it_real_next)
-    lapic_timer_rearm_if_earlier(t->it_real_next);
   return 0;
 }
 
@@ -3037,11 +3321,12 @@ static uint64_t sys_alarm(uint64_t seconds, uint64_t a1, uint64_t a2,
   if (!t) return 0;
   uint64_t now = lapic_timer_get_ticks();
   uint64_t remaining = t->it_real_next > now ? (t->it_real_next - now + 999) / 1000 : 0;
-  t->it_real_value = seconds * 1000;
-  t->it_real_interval = 0;
-  t->it_real_next = seconds ? now + seconds * 1000 : 0;
-  if (t->it_real_next)
-    lapic_timer_rearm_if_earlier(t->it_real_next);
+  /* Same accounting as setitimer: bypassing sched_itimer_arm leaves
+   * active_itimer_count at zero and the tick scan never delivers SIGALRM. */
+  if (seconds)
+    sched_itimer_arm(t, now + seconds * 1000, 0, seconds * 1000);
+  else
+    sched_itimer_disarm(t);
   return remaining;
 }
 
@@ -3640,13 +3925,17 @@ static void robust_handle_futex_death(uint64_t futex_uaddr, uint32_t dying_tid) 
     return;
   uint32_t *uaddr = (uint32_t *)futex_uaddr;
   for (;;) {
-    uint32_t cur = __atomic_load_n(uaddr, __ATOMIC_ACQUIRE);
+    uint32_t cur;
+    if (copy_from_user(&cur, uaddr, sizeof(cur)) != 0)
+      return;
     if ((cur & 0x3fffffff) != dying_tid)
       return; // Not owned by the dying thread.
     uint32_t newv = (cur & 0x80000000) | 0x40000000; // keep WAITERS, set OWNER_DIED
     uint32_t expected = cur;
-    if (__atomic_compare_exchange_n(uaddr, &expected, newv, false,
-                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    int exchanged = cmpxchg_user_u32(uaddr, &expected, newv);
+    if (exchanged < 0)
+      return;
+    if (exchanged) {
       futex_wake_user(uaddr, 1);
       return;
     }
@@ -3814,6 +4103,9 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
   case LINUX_REBOOT_CMD_RESTART:
   case LINUX_REBOOT_CMD_RESTART2:
     klog_puts("[REBOOT] System reboot requested via syscall.\n");
+#ifdef LINUXKPI_LINUX_IMPORTED
+    linuxkpi_pci_shutdown();
+#endif
     nvme_shutdown(); /* graceful CC.SHN before resetting the machine */
     acpi_reboot();
     /* noreturn */
@@ -3821,6 +4113,9 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 
   case LINUX_REBOOT_CMD_POWER_OFF:
     klog_puts("[REBOOT] System power-off requested via syscall.\n");
+#ifdef LINUXKPI_LINUX_IMPORTED
+    linuxkpi_pci_shutdown();
+#endif
     nvme_shutdown(); /* graceful CC.SHN before power is removed */
     acpi_poweroff();
     /* noreturn */
@@ -3828,6 +4123,9 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 
   case LINUX_REBOOT_CMD_HALT:
     klog_puts("[REBOOT] System halt requested via syscall.\n");
+#ifdef LINUXKPI_LINUX_IMPORTED
+    linuxkpi_pci_shutdown();
+#endif
     nvme_shutdown();
     hal_irq_disable();
     for (;;) hal_cpu_halt();
@@ -3900,9 +4198,9 @@ static uint64_t sys_swapon(uint64_t path_ptr, uint64_t flags, uint64_t a2,
 // ---------------------------------------------------------------------------
 // sys_capget (125) / sys_capset (126)
 //
-// AvoryOS runs as all-capable root and has no capability enforcement layer.
-// capget reports a full capability set so that tools (e.g. bwrap) which probe
-// capabilities before deciding whether to proceed can see a sane response.
+// AvoryOS uses UID-based permission checks and has no capability enforcement
+// layer. capget reports defined capabilities for root and none for non-root,
+// with Linux's version-negotiation ABI for libraries probing the interface.
 // capset is a silent no-op — we never take capabilities away.
 //
 // Structures mirror the Linux uapi/linux/capability.h layout (version 3 = V3).
@@ -3930,16 +4228,9 @@ static uint64_t sys_capget(uint64_t hdrp_arg, uint64_t datap_arg,
                            uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
   (void)a3; (void)a4; (void)a5; (void)a6;
 
-  struct __user_cap_header *hdrp = (struct __user_cap_header *)hdrp_arg;
-  struct __user_cap_data  *datap = (struct __user_cap_data  *)datap_arg;
-
-  if (!hdrp)
+  uint32_t version;
+  if (copy_from_user(&version, (const void *)hdrp_arg, sizeof(version)) != 0)
     return (uint64_t)-14; // EFAULT
-
-  if (!vmm_is_user_addr_range_valid((uint64_t)hdrp, sizeof(*hdrp)))
-    return (uint64_t)-14; // EFAULT
-
-  uint32_t version = hdrp->version;
   int tocopy = _LINUX_CAPABILITY_U32S_3;
 
   switch (version) {
@@ -3951,27 +4242,54 @@ static uint64_t sys_capget(uint64_t hdrp_arg, uint64_t datap_arg,
     tocopy = _LINUX_CAPABILITY_U32S_3;
     break;
   default:
-    hdrp->version = _LINUX_CAPABILITY_VERSION_3;
-    return (uint64_t)-22; // EINVAL — unsupported version
+    version = _LINUX_CAPABILITY_VERSION_3;
+    if (copy_to_user((void *)hdrp_arg, &version, sizeof(version)) != 0)
+      return (uint64_t)-14;
+    /* libcap discovers the ABI with an unknown version and NULL data.
+     * Linux updates the version and succeeds for precisely this probe. */
+    return datap_arg ? (uint64_t)-22 : 0;
   }
 
-  hdrp->version = _LINUX_CAPABILITY_VERSION_3;
-
-  if (!datap)
+  /* A supported version is not rewritten: v1 still describes one word. */
+  if (!datap_arg)
     return 0;
 
-  if (!vmm_is_user_addr_range_valid((uint64_t)datap,
-                                     sizeof(*datap) * tocopy))
-    return (uint64_t)-14; // EFAULT
+  struct __user_cap_header header;
+  if (copy_from_user(&header, (const void *)hdrp_arg, sizeof(header)) != 0)
+    return (uint64_t)-14;
+  if (header.pid < 0)
+    return (uint64_t)-22;
 
-  // Grant all capabilities in requested words
-  for (int i = 0; i < tocopy; i++) {
-    datap[i].effective   = 0xFFFFFFFFu;
-    datap[i].permitted   = 0xFFFFFFFFu;
-    datap[i].inheritable = 0xFFFFFFFFu;
+  struct thread *current = sched_get_current();
+  if (!current)
+    return (uint64_t)-3;
+  bool root = current->euid == 0;
+  if (header.pid && (uint32_t)header.pid != current->tid) {
+    bool found = false;
+    spinlock_acquire(&tid_lock);
+    for (struct thread *t = global_thread_list; t; t = t->global_next) {
+      if (t->tid == (uint32_t)header.pid) {
+        root = t->euid == 0;
+        found = true;
+        break;
+      }
+    }
+    spinlock_release(&tid_lock);
+    if (!found)
+      return (uint64_t)-3; // ESRCH
   }
 
-  return 0;
+  /* This is the existing UID-based compatibility model, not capability
+   * enforcement. Report only defined capabilities (0..40), and do not
+   * advertise root privileges for a non-root task. */
+  struct __user_cap_data data[2] = {0};
+  for (int i = 0; i < tocopy; i++) {
+    uint32_t bits = root ? (i == 0 ? UINT32_MAX : 0x1FFu) : 0;
+    data[i].effective = bits;
+    data[i].permitted = bits;
+  }
+  return copy_to_user((void *)datap_arg, data, sizeof(data[0]) * tocopy) != 0
+             ? (uint64_t)-14 : 0;
 }
 
 static uint64_t sys_capset(uint64_t hdrp_arg, uint64_t datap_arg,
@@ -4036,7 +4354,7 @@ static uint64_t sys_unshare(uint64_t flags, uint64_t a2, uint64_t a3,
                    CLONE_FILES | CLONE_FS;
 
   if (flags & ~known) {
-    klog_puts("[SYSCALL] unshare: unknown flags=0x");
+    klog_puts("[SYSCALL] unshare: unknown flags=");
     klog_hex64(flags);
     klog_puts(" -> EINVAL\n");
     return (uint64_t)-22; // EINVAL
@@ -4046,15 +4364,14 @@ static uint64_t sys_unshare(uint64_t flags, uint64_t a2, uint64_t a3,
                       CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID |
                       CLONE_NEWNET | CLONE_NEWTIME;
   if (flags & ns_flags) {
-    klog_puts("[SYSCALL] unshare: flags=0x");
+    klog_puts("[SYSCALL] unshare: flags=");
     klog_hex64(flags);
     klog_puts(" -> EPERM (namespaces unsupported, sandbox fallback)\n");
     return (uint64_t)-1; // EPERM
   }
 
-  klog_puts("[SYSCALL] unshare: flags=0x");
-  klog_hex64(flags);
-  klog_puts(" -> OK\n");
+  /* flags==0 (and other non-namespace no-ops) succeed silently: the coverage
+   * stress calls unshare(0) in a loop and per-call success logs are spam. */
   return 0;
 }
 

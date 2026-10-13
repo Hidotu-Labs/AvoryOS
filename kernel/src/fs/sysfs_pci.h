@@ -6,9 +6,11 @@
 
 struct device;
 struct driver;
+struct pci_device;
 
 void sysfs_pci_init(vfs_node_t *pci_bus_dir, vfs_node_t *devices_root);void sysfs_pci_driver_registered(struct driver *driver);
 void sysfs_pci_device_bound(struct device *device);
 void sysfs_pci_device_unbinding(struct device *device);
+void sysfs_pci_linux_driver(struct pci_device *pci, const char *name);
 
 #endif

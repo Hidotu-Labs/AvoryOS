@@ -13,9 +13,20 @@
 #define PCP_CAPACITY 128
 #define PCP_BATCH 32
 
+#define BUDDY_TRACE_SLOTS 64
+struct buddy_trace_event {
+  uint64_t phys;
+  uint64_t caller;
+  size_t order;
+  const char *operation;
+};
+
 struct buddy_zone {
   struct list_head free_list[MAX_ORDER];
   spinlock_t lock;
+  /* Updated under zone.lock; bounded history for corruption reports. */
+  uint64_t trace_seq;
+  struct buddy_trace_event trace[BUDDY_TRACE_SLOTS];
 };
 
 struct buddy_block {
@@ -71,7 +82,7 @@ static inline uint64_t buddy_to_phys(struct buddy_block *block) {
 static inline size_t pmm_get_order(size_t count) {
   size_t order = 0;
   size_t size = 1;
-  while (size < count) {
+  while (size < count && order < MAX_ORDER) {
     size *= 2;
     order++;
   }

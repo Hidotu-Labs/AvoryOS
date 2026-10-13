@@ -22,10 +22,9 @@ static inline bool __mutex_try_acquire(struct mutex *lock) {
 }
 
 static inline bool __mutex_try_acquire_locked(struct mutex *lock) {
-  if (lock->owner)
-    return false;
-  lock->owner = current;
-  return true;
+  /* wait_lock protects the queue, but the fast path does not take it.
+   * A plain owner assignment can overwrite a concurrent fast acquisition. */
+  return __mutex_try_acquire(lock);
 }
 
 void mutex_init(struct mutex *lock) {
@@ -59,16 +58,17 @@ static int __mutex_lock_common(struct mutex *lock, bool interruptible) {
     }
 
     spin_unlock(&lock->wait_lock);
+    linuxkpi_mutex_wait_set(lock);
     linuxkpi_thread_block();
+    linuxkpi_mutex_wait_set(NULL);
     spin_lock(&lock->wait_lock);
 
-    if (lock->owner == current) {
+    if (__atomic_load_n(&lock->owner, __ATOMIC_ACQUIRE) == current) {
       /* Ownership was handed to us by the unlocker. */
       list_del_init(&waiter.list);
       break;
     }
-    if (!lock->owner) {
-      lock->owner = current;
+    if (__mutex_try_acquire_locked(lock)) {
       list_del_init(&waiter.list);
       break;
     }
@@ -107,7 +107,7 @@ void mutex_unlock(struct mutex *lock) {
     next = waiter->task;
     list_del_init(&waiter->list);
   }
-  lock->owner = next;
+  __atomic_store_n(&lock->owner, next, __ATOMIC_RELEASE);
   spin_unlock(&lock->wait_lock);
 
   if (next)
@@ -119,3 +119,9 @@ bool mutex_is_locked(struct mutex *lock) {
 }
 
 void mutex_destroy(struct mutex *lock) { (void)lock; }
+
+void *linuxkpi_mutex_owner_thread(void *opaque) {
+  struct mutex *lock = opaque;
+  struct task_struct *owner = __atomic_load_n(&lock->owner, __ATOMIC_ACQUIRE);
+  return owner ? task_struct_to_thread(owner) : NULL;
+}

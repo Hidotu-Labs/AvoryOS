@@ -6,8 +6,9 @@
  * Read side: preempt_disable() plus a global reader count (linuxkpi/src/rcu.c),
  * the classic non-preemptible RCU shape.  Grace periods are event-driven: the
  * reader that brings the count to zero wakes the waiter, so synchronize_rcu()
- * and the callback kthread complete as soon as the last reader leaves instead
- * of at the next poll.  Callbacks run on a dedicated kthread.
+ * and the callback kthread observe the completed drain even if new readers
+ * enter before a waiter resumes. Callbacks are batched before their grace
+ * period and run on a dedicated kthread.
  *
  * The shared counter still serializes readers across CPUs; sharding it needs
  * a quiescent-state driven grace-period engine and is future work. */
@@ -62,7 +63,7 @@ void __kvfree_call_rcu(struct rcu_head *head, __SIZE_TYPE__ offset);
 #define rcu_access_pointer(p) READ_ONCE(p)
 #define rcu_assign_pointer(p, v)                                              \
   do {                                                                        \
-    WRITE_ONCE((p), (v));                                                     \
+    __atomic_store_n(&(p), (v), __ATOMIC_RELEASE);                             \
   } while (0)
 #define RCU_INIT_POINTER(p, v)                                                \
   do {                                                                        \

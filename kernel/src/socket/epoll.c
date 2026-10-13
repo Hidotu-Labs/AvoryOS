@@ -191,18 +191,18 @@ static uint32_t ep_check_events(epitem_t *epi) {
   uint32_t watch_mask =
       epi->registered_events &
       ~(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLWAKEUP);
-  uint32_t valid = watch_mask | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+  /* Linux reports ERR/HUP unconditionally; RDHUP requires an explicit
+   * subscription, just like IN/OUT. Xorg treats unsolicited bits as an
+   * error and closes the client connection. */
+  uint32_t valid = watch_mask | EPOLLERR | EPOLLHUP;
 
-  /* Fast path: deliver the cached edge from epoll_notify_event() /
-   * epoll_notify_socket() / the rescan instead of calling vfs_poll() (which
-   * reaches into the socket/pipe/device poll callback, taking its lock).
-   * The exchange consumes the mask, so this item is guaranteed to take the
-   * real vfs_poll() path on its next check: a cached edge is trusted exactly
-   * once, and the level-triggered requeue in epoll_wait_impl() therefore
-   * verifies true readiness on the pass after a cached delivery. */
-  uint32_t cached = __atomic_exchange_n(&epi->ready_events, 0, __ATOMIC_ACQUIRE);
-  if (cached)
-    return cached & valid;
+  /* A notification queues a candidate, not a promise that it is still ready.
+   * Another read (or a previous batch delivered to this same waiter) may have
+   * drained a pipe/socket since the notification.  Returning cached POLLIN
+   * here can strand a caller such as wineserver in a blocking read on an
+   * empty request pipe.  Revalidate outside ep->lock for both LT and ET;
+   * edge filtering and wakeups remain in the notification path. */
+  __atomic_exchange_n(&epi->ready_events, 0, __ATOMIC_ACQUIRE);
 
   // Call VFS poll to get current events
   int revents = vfs_poll(epi->node, watch_mask);
@@ -429,7 +429,7 @@ int epoll_ctl_mod(eventpoll_t *ep, int fd, struct epoll_event *event) {
 // epoll_wait Implementation
 
 int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
-                    int timeout_ms) {
+                    int64_t timeout_ms) {
   if (!ep || !events || maxevents <= 0)
     return -22; // EINVAL
 
@@ -446,7 +446,9 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
 
   uint64_t deadline_ticks = 0;
   if (timeout_ms > 0 && timeout_ms != -1) {
-    deadline_ticks = lapic_timer_get_ticks() + (uint64_t)timeout_ms;
+    uint64_t now = lapic_timer_get_ticks();
+    deadline_ticks = (uint64_t)timeout_ms > UINT64_MAX - now
+                         ? UINT64_MAX : now + (uint64_t)timeout_ms;
   }
 
   while (returned == 0) {
@@ -530,9 +532,8 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
           spinlock_acquire(&ep->lock);
           if (!_epi->on_ready_list) {
             _epi->last_events = _ev;
-            /* We polled it microseconds ago: publish the mask so the
-             * delivery in step 2 doesn't poll the same fd a second time. */
-            __atomic_fetch_or(&_epi->ready_events, _ev, __ATOMIC_RELAXED);
+            /* Delivery revalidates readiness: the fd can be drained between
+             * this rescan and collecting the candidate on the next pass. */
             list_add_tail(&_epi->rdllink, &ep->rdllist);
             _epi->on_ready_list = true;
             ep->rdllist_count++;
@@ -668,24 +669,34 @@ eventpoll_t *epoll_from_fd(int fd) {
 
 int epoll_close_fd(int fd) {
   struct thread *t = sched_get_current();
-  if (!t)
+  if (!t || !t->files)
     return -9; // EBADF
 
   if (fd < 0 || fd >= MAX_FDS)
     return -9; // EBADF
 
+  spinlock_acquire(&t->files->lock);
   vfs_node_t *node = t->fds[fd];
-  if (!node)
+  if (!node || node == (vfs_node_t *)-1) { /* an allocation reservation */
+    spinlock_release(&t->files->lock);
     return -9; // EBADF
+  }
 
-  if ((node->flags & FS_TYPE_MASK) != FS_EPOLL)
+  if ((node->flags & FS_TYPE_MASK) != FS_EPOLL) {
+    spinlock_release(&t->files->lock);
     return -22; // EINVAL
+  }
 
   eventpoll_t *ep = (eventpoll_t *)node->device;
 
   // Clear FD
   t->fds[fd] = NULL;
   t->fd_offsets[fd] = 0;
+  t->fd_flags[fd] = 0;
+  fd_path_clear(t, fd);
+  if ((uint32_t)fd < t->files->next_fd)
+    t->files->next_fd = (uint32_t)fd;
+  spinlock_release(&t->files->lock);
 
   // Release epoll reference through VFS close
   if (node) {
@@ -789,13 +800,12 @@ void epoll_notify_event(struct vfs_node *node, uint32_t events) {
       continue;
 
     uint32_t mask =
-        events & (epi->registered_events | EPOLLERR | EPOLLHUP | EPOLLRDHUP);
+        events & (epi->registered_events | EPOLLERR | EPOLLHUP);
     if (!mask)
       continue;
 
-    /* Cache the asserted edge: the waiter will deliver this exact mask
-     * without re-polling the fd.  Fresh by construction - the producer just
-     * changed the state it is reporting. */
+    /* Record the notification and queue a candidate.  The waiter polls the
+     * fd again before delivery because readiness may change meanwhile. */
     __atomic_fetch_or(&epi->ready_events, mask, __ATOMIC_RELAXED);
 
     // ep_add_to_ready_list now handles both adding to the ready list AND
@@ -839,10 +849,10 @@ void epoll_notify_socket(int fd, uint32_t events) {
       continue;
 
     uint32_t mask =
-        events & (epi->registered_events | EPOLLERR | EPOLLHUP | EPOLLRDHUP);
+        events & (epi->registered_events | EPOLLERR | EPOLLHUP);
 
     if (mask) {
-      // Same cached-edge fast path as epoll_notify_event().
+      // Record a candidate notification, as in epoll_notify_event().
       __atomic_fetch_or(&epi->ready_events, mask, __ATOMIC_RELAXED);
       // ep_add_to_ready_list handles both adding to the ready list AND
       // waking up waiters atomically under ep->lock.

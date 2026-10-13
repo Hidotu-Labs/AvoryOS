@@ -118,6 +118,45 @@ int ext2_write_block(ext2_mount_t *mnt, uint32_t block_num,
   return err;
 }
 
+/* Publish and version every member before issuing a bounded contiguous data
+ * transfer. Even colliding readers must detect writes across cache eviction.
+ * Journal ownership serializes filesystem writers, as for write_block(). */
+int ext2_write_blocks(ext2_mount_t *mnt, uint32_t first, uint32_t count,
+                      const void *buffer) {
+  if (!mnt || !buffer || !mnt->dev || !mnt->dev->write_sectors ||
+      !first || !count || count > 32 || !mnt->block_size ||
+      mnt->block_size % 512 || first >= mnt->sb.s_blocks_count ||
+      count > mnt->sb.s_blocks_count - first)
+    return -1;
+  spinlock_acquire(&mnt->cache_lock);
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t idx = (first + i) % EXT2_CACHE_SIZE;
+    mnt->cache[idx].write_seq++;
+    mnt->cache[idx].writes_inflight++;
+    if (!mnt->cache[idx].data)
+      mnt->cache[idx].data = kmalloc(mnt->block_size);
+    if (mnt->cache[idx].data) {
+      mnt->cache[idx].num = first + i;
+      memcpy(mnt->cache[idx].data, (const uint8_t *)buffer +
+             (size_t)i * mnt->block_size, mnt->block_size);
+    }
+  }
+  spinlock_release(&mnt->cache_lock);
+  uint32_t sectors_per_block = mnt->block_size / 512;
+  int err = mnt->dev->write_sectors(mnt->dev,
+      (uint64_t)first * sectors_per_block, count * sectors_per_block, buffer);
+  spinlock_acquire(&mnt->cache_lock);
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t idx = (first + i) % EXT2_CACHE_SIZE;
+    mnt->cache[idx].write_seq++;
+    mnt->cache[idx].writes_inflight--;
+    if (err && mnt->cache[idx].num == first + i)
+      mnt->cache[idx].num = 0;
+  }
+  spinlock_release(&mnt->cache_lock);
+  return err;
+}
+
 int ext2_write_superblock(ext2_mount_t *mnt) {
   uint8_t buf[1024];
   int err = mnt->dev->read_sectors(mnt->dev, 2, 2, buf);

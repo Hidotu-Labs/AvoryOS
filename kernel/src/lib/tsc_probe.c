@@ -8,6 +8,8 @@
 
 #include "tsc.h"
 #include "console/klog.h"
+#include "lib/string.h"
+#include "lock/spinlock.h"
 
 /* ── Calibration ─────────────────────────────────────────────────────────── */
 
@@ -79,12 +81,16 @@ uint64_t tsc_get_mhz(void) {
 
 static tsc_probe_t g_probes[TSC_PROBE_MAX];
 static int         g_probe_count = 0;
+static spinlock_t g_probe_lock = SPINLOCK_INIT;
 
 int tsc_probe_register(const char *name) {
+    spinlock_acquire(&g_probe_lock);
     /* Linear scan — only called once per static site. */
     for (int i = 0; i < g_probe_count; i++) {
-        if (g_probes[i].name == name)
+        if (g_probes[i].name == name) {
+            spinlock_release(&g_probe_lock);
             return i;
+        }
         /* Also compare by string content in case of separate TUs. */
         const char *a = g_probes[i].name;
         const char *b = name;
@@ -92,12 +98,16 @@ int tsc_probe_register(const char *name) {
         while (*a && *b) {
             if (*a++ != *b++) { same = 0; break; }
         }
-        if (same && *a == '\0' && *b == '\0')
+        if (same && *a == '\0' && *b == '\0') {
+            spinlock_release(&g_probe_lock);
             return i;
+        }
     }
 
-    if (g_probe_count >= TSC_PROBE_MAX)
+    if (g_probe_count >= TSC_PROBE_MAX) {
+        spinlock_release(&g_probe_lock);
         return -1;
+    }
 
     int idx = g_probe_count++;
     g_probes[idx].name        = name;
@@ -105,26 +115,35 @@ int tsc_probe_register(const char *name) {
     g_probes[idx].count        = 0;
     g_probes[idx].min_cycles   = (uint64_t)-1;
     g_probes[idx].max_cycles   = 0;
+    spinlock_release(&g_probe_lock);
     return idx;
 }
 
 void tsc_probe_record(int idx, uint64_t cycles) {
-    if (idx < 0 || idx >= g_probe_count)
+    if (idx < 0)
         return;
+    spinlock_acquire(&g_probe_lock);
+    if (idx >= g_probe_count) {
+        spinlock_release(&g_probe_lock);
+        return;
+    }
     tsc_probe_t *p = &g_probes[idx];
     p->total_cycles += cycles;
     p->count++;
     if (cycles < p->min_cycles) p->min_cycles = cycles;
     if (cycles > p->max_cycles) p->max_cycles = cycles;
+    spinlock_release(&g_probe_lock);
 }
 
 void tsc_probe_reset(void) {
+    spinlock_acquire(&g_probe_lock);
     for (int i = 0; i < g_probe_count; i++) {
         g_probes[i].total_cycles = 0;
         g_probes[i].count        = 0;
         g_probes[i].min_cycles   = (uint64_t)-1;
         g_probes[i].max_cycles   = 0;
     }
+    spinlock_release(&g_probe_lock);
 }
 
 /* ── Dump ─────────────────────────────────────────────────────────────────── */
@@ -133,12 +152,12 @@ void tsc_probe_reset(void) {
  * Simple insertion sort so we can print probes ordered by total_cycles
  * descending — the hottest sites appear first.
  */
-static void sort_by_total(int *order, int n) {
+static void sort_by_total(const tsc_probe_t *probes, int *order, int n) {
     for (int i = 1; i < n; i++) {
         int key = order[i];
         int j = i - 1;
         while (j >= 0 &&
-               g_probes[order[j]].total_cycles < g_probes[key].total_cycles) {
+               probes[order[j]].total_cycles < probes[key].total_cycles) {
             order[j + 1] = order[j];
             j--;
         }
@@ -147,49 +166,52 @@ static void sort_by_total(int *order, int n) {
 }
 
 void tsc_probe_dump(void) {
-    if (g_probe_count == 0) {
+    /* Snapshot while records are serialized, then drop the lock before any
+     * formatting or console I/O. Each caller owns its buffers, so simultaneous
+     * dumps cannot overwrite one another or mix counters from different times. */
+    tsc_probe_t probes[TSC_PROBE_MAX];
+    spinlock_acquire(&g_probe_lock);
+    int count = g_probe_count;
+    memcpy(probes, g_probes, (size_t)count * sizeof(*probes));
+    uint64_t mhz = g_tsc_mhz;
+    spinlock_release(&g_probe_lock);
+    if (count == 0) {
         klog_puts("[TSC] No probes recorded.\n");
         return;
     }
 
     int order[TSC_PROBE_MAX];
-    for (int i = 0; i < g_probe_count; i++)
+    for (int i = 0; i < count; i++)
         order[i] = i;
-    sort_by_total(order, g_probe_count);
+    sort_by_total(probes, order, count);
 
-    klog_puts("\n[TSC] ===== Execution Time Summary =====\n");
-    klog_puts("[TSC]  MHz: ");
-    klog_uint64(g_tsc_mhz);
-    klog_puts(" (calibrated)\n");
-    klog_puts("[TSC] -------------------------------------------------------\n");
-    klog_puts("[TSC]  Probe                    count  total(ns)  avg(ns)  min(ns)  max(ns)\n");
-    klog_puts("[TSC] -------------------------------------------------------\n");
-
-    for (int si = 0; si < g_probe_count; si++) {
-        const tsc_probe_t *p = &g_probes[order[si]];
+    /* Bounded names plus five 20-digit numbers fit in 144 bytes per row.
+     * Keep the whole report in one klog write; never hold a logging lock
+     * across formatting, and never emit individual fields or padding bytes. */
+    char report[640 + TSC_PROBE_MAX * 144];
+    size_t used = (size_t)snprintf(report, sizeof(report),
+        "\n[TSC] ===== Execution Time Summary =====\n"
+        "[TSC]  MHz: %llu (calibrated)\n"
+        "[TSC] -------------------------------------------------------\n"
+        "[TSC]  Probe                    count  total(ns)  avg(ns)  min(ns)  max(ns)\n"
+        "[TSC] -------------------------------------------------------\n",
+        (unsigned long long)mhz);
+    for (int si = 0; si < count; si++) {
+        const tsc_probe_t *p = &probes[order[si]];
         if (p->count == 0)
             continue;
-
-        klog_puts("[TSC]  ");
-        const char *n = p->name;
-        int len = 0;
-        while (n[len]) len++;
-        klog_puts(n);
-        for (int k = len; k < 24; k++)
-            klog_putchar(' ');
-        klog_putchar(' ');
-
-        uint64_t total_ns = tsc_cycles_to_ns(p->total_cycles);
-        uint64_t avg_ns   = p->count ? total_ns / p->count : 0;
-        uint64_t min_ns   = tsc_cycles_to_ns(p->min_cycles);
-        uint64_t max_ns   = tsc_cycles_to_ns(p->max_cycles);
-
-        klog_uint64(p->count);   klog_puts("  ");
-        klog_uint64(total_ns);   klog_puts("  ");
-        klog_uint64(avg_ns);     klog_puts("  ");
-        klog_uint64(min_ns);     klog_puts("  ");
-        klog_uint64(max_ns);     klog_putchar('\n');
+        uint64_t total_ns = mhz ? p->total_cycles * 1000ULL / mhz : 0;
+        uint64_t min_ns = mhz ? p->min_cycles * 1000ULL / mhz : 0;
+        uint64_t max_ns = mhz ? p->max_cycles * 1000ULL / mhz : 0;
+        used += (size_t)snprintf(report + used, sizeof(report) - used,
+            "[TSC]  %-24.24s %llu  %llu  %llu  %llu  %llu\n", p->name,
+            (unsigned long long)p->count,
+            (unsigned long long)total_ns,
+            (unsigned long long)(total_ns / p->count),
+            (unsigned long long)min_ns,
+            (unsigned long long)max_ns);
     }
-
-    klog_puts("[TSC] ========================================\n\n");
+    snprintf(report + used, sizeof(report) - used,
+             "[TSC] ========================================\n\n");
+    klog_puts(report);
 }

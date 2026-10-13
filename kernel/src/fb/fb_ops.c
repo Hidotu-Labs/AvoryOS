@@ -260,8 +260,10 @@ int fb_dev_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) {
         return 0;
     }
     case VT_GETMODE:
-    case VT_SETMODE:
     case VT_GETSTATE:
+        /* The syscall fallback supplies the console query structures. */
+        return -25;
+    case VT_SETMODE:
     case VT_RELDISP:
     case VT_ACTIVATE:
     case VT_WAITACTIVE:

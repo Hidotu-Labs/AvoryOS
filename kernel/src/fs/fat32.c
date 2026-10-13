@@ -1062,8 +1062,8 @@ static struct dirent *fat32_readdir_impl(vfs_node_t *node, uint32_t index) {
   }
 
   struct dirent *dirent = NULL;
-  static struct dirent dre;
-  memset(&dre, 0, sizeof(dre));
+  struct dirent *dre = vfs_readdir_buffer();
+  memset(dre, 0, sizeof(*dre));
   uint32_t current_index = 0;
 
   while (true) {
@@ -1093,7 +1093,7 @@ static struct dirent *fat32_readdir_impl(vfs_node_t *node, uint32_t index) {
     }
 
     if (current_index == index) {
-      dirent = &dre;
+      dirent = dre;
       {
         // Decode LFN if present
         char lfn_name[256] = {0};
@@ -1137,6 +1137,75 @@ static struct dirent *fat32_readdir_impl(vfs_node_t *node, uint32_t index) {
 
   dir_iter_free(&iter);
   return dirent;
+}
+
+/* Return one on-disk alias pair using the same indexed cursor as readdir.
+ * Local result storage avoids the legacy readdir static-buffer race. */
+int fat32_read_aliases(vfs_node_t *node, uint32_t index, bool short_only,
+                       struct fat32_ioctl_dirent result[2]) {
+  if (!node || node->readdir != fat32_readdir_impl)
+    return -25; /* ENOTTY: only FAT directories have stored short aliases */
+  fat32_mount_t *mnt = node->device;
+  if (!mnt)
+    return -5;
+  dir_iter_t iter;
+  if (dir_iter_init(&iter, mnt, node->impl ? node->impl : mnt->root_cluster))
+    return -5;
+  memset(result, 0, sizeof(*result) * 2);
+  uint32_t ordinal = 0;
+  int ret = 0;
+  fat32_dir_entry_t *entry;
+  while ((entry = dir_iter_next(&iter))) {
+    if (is_lfn_entry(entry)) {
+      fat32_lfn_entry_t *lfn = (void *)entry;
+      unsigned seq = lfn->seq & 0x1f;
+      if (seq && seq <= 20) {
+        iter.lfn_entries[seq - 1] = *lfn;
+        if (lfn->seq & FAT32_LFN_LAST_ENTRY)
+          iter.lfn_count = seq;
+      }
+      continue;
+    }
+    if (entry->attr & FAT32_ATTR_VOLUME_ID) {
+      iter.lfn_count = 0;
+      continue;
+    }
+    if (ordinal++ == index) {
+      unsigned len = 0;
+      for (unsigned i = 0; i < 8 && entry->name[i] != ' '; i++)
+        result[0].name[len++] = entry->name[i];
+      if (entry->name[8] != ' ') {
+        result[0].name[len++] = '.';
+        for (unsigned i = 8; i < 11 && entry->name[i] != ' '; i++)
+          result[0].name[len++] = entry->name[i];
+      }
+      /* FAT encodes an initial 0xe5 byte as 0x05 to avoid the deletion marker. */
+      if ((unsigned char)result[0].name[0] == 0x05)
+        result[0].name[0] = (char)0xe5;
+      result[0].reclen = len;
+      result[0].offset = (uint64_t)index + 1;
+      result[0].ino = entry->cluster_low | ((uint32_t)entry->cluster_high << 16);
+      if (!short_only && iter.lfn_count) {
+        /* The legacy decoder can emit all 20*13 UTF-16 slots from a
+         * malformed chain. Keep that scratch space outside the ioctl ABI,
+         * and ignore invalid/checksum-failed names rather than overflowing. */
+        char decoded[20 * 13 + 1] = {0};
+        int length = decode_lfn(iter.lfn_entries, iter.lfn_count, decoded,
+                                 entry->name);
+        if (length > 0 && length < (int)sizeof(result[1].name)) {
+          memcpy(result[1].name, decoded, (size_t)length + 1);
+          result[1].reclen = (uint16_t)length;
+          result[1].offset = result[0].offset;
+          result[1].ino = result[0].ino;
+        }
+      }
+      ret = 1;
+      break;
+    }
+    iter.lfn_count = 0;
+  }
+  dir_iter_free(&iter);
+  return ret;
 }
 
 // Find a file in a directory

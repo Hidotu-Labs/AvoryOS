@@ -1429,6 +1429,7 @@ void pty_register_devices(void) {
 #endif
   strcpy(ptmx_node->name, "ptmx");
   ptmx_node->flags = FS_CHARDEV;
+  ptmx_node->inode = (5U << 8) | 2U;
   ptmx_node->mask = 0666;
   ptmx_node->read = ptmx_read;
   ptmx_node->write = ptmx_write;

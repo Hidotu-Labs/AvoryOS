@@ -4,6 +4,8 @@
 #include <stdint.h>
 
 #include "cpu/features.h"
+#include "cpu/fpu.h"
+#include "sched/sched.h"
 #include "hal/hal.h"
 #include "linuxkpi/fpu.h"
 #include "smp/cpu.h"
@@ -64,6 +66,10 @@ void kernel_fpu_begin_mask(unsigned int kfpu_mask) {
 }
 
 void kernel_fpu_begin(void) {
+  /* Pin execution before selecting per-CPU storage. A timer can otherwise
+   * migrate us between the CPU lookup and IRQ masking, saving registers into
+   * another CPU's area and leaving end() unable to find the active section. */
+  hal_irq_state_t flags = hal_irq_save();
   uint32_t cpu = fpu_cpu_index();
 
   if (fpu_section_active[cpu]) {
@@ -71,7 +77,8 @@ void kernel_fpu_begin(void) {
     return;
   }
 
-  fpu_irq_flags[cpu] = hal_irq_save();
+  fpu_irq_flags[cpu] = flags;
+  fpu_ensure_loaded(sched_get_current());
   fpu_save_state(fpu_save_area[cpu]);
   fpu_nesting[cpu] = 1;
   fpu_section_active[cpu] = true;

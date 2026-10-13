@@ -31,7 +31,7 @@ Commands
     scripts/vfio-gpu-fb.py restore          # replay the snapshot
     scripts/vfio-gpu-fb.py ensure           # check; snapshot or replay
 
-`make run-c4` runs `ensure` (`VFIO_FB_ENSURE=0` to skip).  A VFIO access
+Run `ensure` explicitly if framebuffer register recovery is needed. A VFIO access
 failure is not fatal: it prints a warning and exits 0 so a run is never
 blocked by tooling problems.  An unprogrammed device with no snapshot exits
 non-zero with instructions -- better than a 20-minute boot into an imported

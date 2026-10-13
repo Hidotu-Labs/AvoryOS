@@ -4,6 +4,7 @@
 #include "drivers/manager/device.h"
 #include "drivers/pci/pcie.h"
 #include "io/io.h"
+#include "lock/spinlock.h"
 #include "lib/string.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
@@ -14,20 +15,30 @@ static struct bus_type pci_bus = {.name = "pci"};
 
 struct bus_type *asc_pci_bus_type(void) { return &pci_bus; }
 
-// PCI Config Space Access
+/* Keep the requested transaction width: PCI status registers contain
+ * write-one-to-clear bits, so widening a byte/word write into a dword RMW
+ * changes neighboring registers. CF8/CFC also share one address latch across
+ * CPUs and IRQ handlers; hold the native IRQ-saving lock for each transfer.
+ */
+static spinlock_t pci_config_lock = SPINLOCK_INIT;
+
+static uint32_t pci_config_address(uint8_t bus, uint8_t slot, uint8_t func,
+                                   uint16_t offset) {
+  return (1u << 31) | ((uint32_t)bus << 16) | ((uint32_t)slot << 11) |
+         ((uint32_t)func << 8) | (offset & 0xFC);
+}
 
 uint32_t pci_config_read32(uint8_t bus, uint8_t slot, uint8_t func,
                            uint16_t offset) {
-  if (pcie_available(bus)) {
+  if (pcie_available(bus))
     return pcie_config_read32(bus, slot, func, offset);
-  }
-  if (offset > 255)
+  if (offset > 255 || slot >= 32 || func >= 8 || (offset & 3))
     return 0xFFFFFFFF;
-  uint32_t address = (1u << 31) | ((uint32_t)bus << 16) |
-                     ((uint32_t)slot << 11) | ((uint32_t)func << 8) |
-                     (offset & 0xFC);
-  outl(PCI_CONFIG_ADDRESS, address);
-  return inl(PCI_CONFIG_DATA);
+  spinlock_acquire(&pci_config_lock);
+  outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, slot, func, offset));
+  uint32_t value = inl(PCI_CONFIG_DATA);
+  spinlock_release(&pci_config_lock);
+  return value;
 }
 
 void pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func,
@@ -36,45 +47,66 @@ void pci_config_write32(uint8_t bus, uint8_t slot, uint8_t func,
     pcie_config_write32(bus, slot, func, offset, value);
     return;
   }
-  if (offset > 255)
+  if (offset > 255 || slot >= 32 || func >= 8 || (offset & 3))
     return;
-  uint32_t address = (1u << 31) | ((uint32_t)bus << 16) |
-                     ((uint32_t)slot << 11) | ((uint32_t)func << 8) |
-                     (offset & 0xFC);
-  outl(PCI_CONFIG_ADDRESS, address);
+  spinlock_acquire(&pci_config_lock);
+  outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, slot, func, offset));
   outl(PCI_CONFIG_DATA, value);
+  spinlock_release(&pci_config_lock);
 }
 
 uint16_t pci_config_read16(uint8_t bus, uint8_t slot, uint8_t func,
                            uint16_t offset) {
-  uint32_t val = pci_config_read32(bus, slot, func, offset & 0xFFFC);
-  return (uint16_t)(val >> ((offset & 2) * 8));
+  if (pcie_available(bus))
+    return pcie_config_read16(bus, slot, func, offset);
+  if (offset > 255 || slot >= 32 || func >= 8 || (offset & 1))
+    return 0xFFFF;
+  spinlock_acquire(&pci_config_lock);
+  outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, slot, func, offset));
+  uint16_t value = inw(PCI_CONFIG_DATA + (offset & 2));
+  spinlock_release(&pci_config_lock);
+  return value;
 }
 
 void pci_config_write16(uint8_t bus, uint8_t slot, uint8_t func,
                         uint16_t offset, uint16_t value) {
-  uint32_t val = pci_config_read32(bus, slot, func, offset & 0xFFFC);
-  uint32_t mask = 0xFFFFu << ((offset & 2) * 8);
-  val &= ~mask;
-  val |= (uint32_t)value << ((offset & 2) * 8);
-  pci_config_write32(bus, slot, func, offset & 0xFFFC, val);
+  if (pcie_available(bus)) {
+    pcie_config_write16(bus, slot, func, offset, value);
+    return;
+  }
+  if (offset > 255 || slot >= 32 || func >= 8 || (offset & 1))
+    return;
+  spinlock_acquire(&pci_config_lock);
+  outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, slot, func, offset));
+  outw(PCI_CONFIG_DATA + (offset & 2), value);
+  spinlock_release(&pci_config_lock);
 }
 
-/* Byte config access rides the 32-bit path so PCIe ECAM offsets above 0xFF
- * keep working (the CF8 path rejects them, ECAM does not). */
 uint8_t pci_config_read8(uint8_t bus, uint8_t slot, uint8_t func,
-                         uint16_t offset) {
-  uint32_t val = pci_config_read32(bus, slot, func, offset & 0xFFFC);
-  return (uint8_t)(val >> ((offset & 3) * 8));
+                           uint16_t offset) {
+  if (pcie_available(bus))
+    return pcie_config_read8(bus, slot, func, offset);
+  if (offset > 255 || slot >= 32 || func >= 8)
+    return 0xFF;
+  spinlock_acquire(&pci_config_lock);
+  outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, slot, func, offset));
+  uint8_t value = inb(PCI_CONFIG_DATA + (offset & 3));
+  spinlock_release(&pci_config_lock);
+  return value;
 }
 
 void pci_config_write8(uint8_t bus, uint8_t slot, uint8_t func,
-                       uint16_t offset, uint8_t value) {
-  uint32_t val = pci_config_read32(bus, slot, func, offset & 0xFFFC);
-  uint32_t mask = 0xFFu << ((offset & 3) * 8);
-  val &= ~mask;
-  val |= (uint32_t)value << ((offset & 3) * 8);
-  pci_config_write32(bus, slot, func, offset & 0xFFFC, val);
+                        uint16_t offset, uint8_t value) {
+  if (pcie_available(bus)) {
+    pcie_config_write8(bus, slot, func, offset, value);
+    return;
+  }
+  if (offset > 255 || slot >= 32 || func >= 8)
+    return;
+  spinlock_acquire(&pci_config_lock);
+  outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, slot, func, offset));
+  outb(PCI_CONFIG_DATA + (offset & 3), value);
+  spinlock_release(&pci_config_lock);
 }
 
 // Helpers

@@ -9,6 +9,7 @@
 #include "cpu/tsc.h"
 #include "fs/ramfs.h"
 #include "fs/vfs.h"
+#include "fs/ext3/ext3.h"
 #include "lib/string.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
@@ -21,6 +22,7 @@
 #include "smp/cpu.h"
 #include "syscalls/syscall.h"
 #include <stdint.h>
+#include <linuxkpi/gpu_diag.h>
 
 #define PROC_SUPER_MAGIC 0x9fa0
 
@@ -28,6 +30,7 @@ static int procfs_statfs(vfs_node_t *node, struct statfs_buf *buf) {
   (void)node;
   if (!buf)
     return -1;
+  memset(buf, 0, sizeof(*buf));
   buf->f_type = PROC_SUPER_MAGIC;
   buf->f_bsize = 4096;
   buf->f_blocks = 0;
@@ -41,6 +44,14 @@ static int procfs_statfs(vfs_node_t *node, struct statfs_buf *buf) {
   buf->f_frsize = 4096;
   buf->f_flags = 0;
   return 0;
+}
+
+/* Process trees are created on demand without being grafted under the proc
+ * root. Set the filesystem handler before ramfs directory construction so
+ * every dynamic directory, file and symlink retains procfs identity. */
+static void procfs_node_init(vfs_node_t *node) {
+  vfs_node_init(node);
+  node->statfs = procfs_statfs;
 }
 
 uint32_t procfs_meminfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
@@ -60,6 +71,9 @@ uint32_t procfs_meminfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       "MemAvailable:   %llu kB\n"
       "Buffers:        0 kB\n"
       "Cached:         %llu kB\n"
+      "Slab:           0 kB\n"
+      "SwapTotal:      0 kB\n"
+      "SwapFree:       0 kB\n"
       "MemUsable:      %llu kB\n",
       (unsigned long long)total_kb,
       (unsigned long long)free_kb,
@@ -655,40 +669,133 @@ uint32_t procfs_diskstats_read(vfs_node_t *node, uint32_t offset,
   return size;
 }
 
+static int procfs_latency_line(char *buf, size_t cap, const char *kind,
+                                const char *device,
+                                const struct storage_latency *s) {
+  return scnprintf(buf, cap,
+      "%s %s count=%llu total_ms=%llu max_ms=%llu errors=%llu "
+      "buckets=%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+      kind, device, (unsigned long long)s->count,
+      (unsigned long long)s->total_ms, (unsigned long long)s->max_ms,
+      (unsigned long long)s->errors,
+      (unsigned long long)s->buckets[0], (unsigned long long)s->buckets[1],
+      (unsigned long long)s->buckets[2], (unsigned long long)s->buckets[3],
+      (unsigned long long)s->buckets[4], (unsigned long long)s->buckets[5],
+      (unsigned long long)s->buckets[6], (unsigned long long)s->buckets[7]);
+}
+
+static uint32_t procfs_storage_perf_read(vfs_node_t *node, uint32_t offset,
+                                        uint32_t size, uint8_t *buffer) {
+  const size_t cap = 32768;
+  char *buf = kmalloc(cap);
+  if (!buf) return 0;
+  size_t pos = scnprintf(buf, cap,
+      "# storage_perf v1 cumulative; latency buckets ms: <1,<2,<4,<8,<16,<32,<64,>=64\n"
+      "# hw_*: NVMe submitted commands/bytes, including retries; namespace only\n");
+  for (int i = 0; i < block_count() && pos < cap - 1024; i++) {
+    struct block_device *dev = block_get(i);
+    if (!dev) continue;
+    pos += scnprintf(buf + pos, cap - pos,
+        "io %s reads=%llu read_sectors=%llu writes=%llu write_sectors=%llu "
+        "hw_reads=%llu hw_read_bytes=%llu hw_writes=%llu hw_write_bytes=%llu hw_errors=%llu\n",
+        dev->name,
+        (unsigned long long)__atomic_load_n(&dev->stat_reads, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&dev->stat_read_sectors, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&dev->stat_writes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&dev->stat_write_sectors, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&dev->hw_reads, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&dev->hw_read_bytes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&dev->hw_writes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&dev->hw_write_bytes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&dev->hw_errors, __ATOMIC_RELAXED));
+    struct storage_latency flush;
+    storage_latency_snapshot(&dev->hw_flush, &flush);
+    pos += procfs_latency_line(buf + pos, cap - pos, "nvme_flush", dev->name, &flush);
+  }
+  for (unsigned i = 0; i < 8 && pos < cap - 1024; i++) {
+    struct block_device *dev;
+    struct storage_latency wait, hold;
+    if (!ext3_perf_snapshot(i, &dev, &wait, &hold)) continue;
+    const char *name = dev ? dev->name : "unknown";
+    pos += procfs_latency_line(buf + pos, cap - pos, "journal_wait", name, &wait);
+    pos += procfs_latency_line(buf + pos, cap - pos, "journal_hold", name, &hold);
+  }
+  node->length = pos;
+  if (offset >= pos) { kfree(buf); return 0; }
+  if (size > pos - offset) size = pos - offset;
+  memcpy(buffer, buf + offset, size);
+  kfree(buf);
+  return size;
+}
+
+#define PROCFS_MAX_MOUNTS 32
+#define PROCFS_MOUNTS_BUFSZ 8192
+#define PROCFS_MOUNTINFO_BUFSZ 8192
+
+/* Canonicalize a mount-table source for libmount/Solid/UDisks matching.
+ * Bare kernel names ("nvme0n1p1") never match UDisks' "/dev/..." Device
+ * property, so the mount gets no Size/MountPoints and Plasma Disk Usage
+ * stays at 0 B. Returns `src` unchanged for pseudo filesystems, otherwise
+ * rewrites known block devices to their /dev/ path in `out`. */
+static const char *procfs_mount_src(const char *src, char *out,
+                                    size_t out_sz) {
+  if (!src || !src[0])
+    return "none";
+  if (src[0] == '/' || strcmp(src, "none") == 0 ||
+      strcmp(src, "tmpfs") == 0 || strcmp(src, "proc") == 0 ||
+      strcmp(src, "sysfs") == 0 || strcmp(src, "devtmpfs") == 0 ||
+      strcmp(src, "devpts") == 0 || strcmp(src, "cgroup") == 0 ||
+      strcmp(src, "cgroup2") == 0)
+    return src;
+  if (block_get_by_name(src) != NULL) {
+    snprintf(out, out_sz, "/dev/%s", src);
+    return out;
+  }
+  return src;
+}
+
 uint32_t procfs_mounts_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                             uint8_t *buffer) {
-  char *buf = kmalloc(2048);
+  const size_t cap = PROCFS_MOUNTS_BUFSZ;
+  char *buf = kmalloc(cap);
   if (!buf)
     return 0;
 
-  vfs_mount_info_t mounts[16];
-  int count = vfs_get_mounts(mounts, 16);
-  int pos = 0;
+  /* Heap-allocate: 32 mounts do not fit the kernel stack. */
+  vfs_mount_info_t *mounts =
+      kmalloc(sizeof(vfs_mount_info_t) * PROCFS_MAX_MOUNTS);
+  if (!mounts) {
+    kfree(buf);
+    return 0;
+  }
+  int count = vfs_get_mounts(mounts, PROCFS_MAX_MOUNTS);
+  size_t pos = 0;
 
   for (int i = 0; i < count; i++) {
     /* libmount/Solid/UDisks match the source string against the UDisks
      * Device property ("/dev/nvme0n1p1"). A bare "nvme0n1p1" never matches,
      * so the mount gets no Size/MountPoints and Plasma Disk Usage stays at
      * 0 B. Emit the /dev/ path whenever the name is a known block device. */
-    const char *src = mounts[i].dev_name[0] ? mounts[i].dev_name : "none";
+    const char *rawsrc =
+        mounts[i].dev_name[0] ? mounts[i].dev_name : "none";
     char srcbuf[80];
-    if (src[0] != '/' && strcmp(src, "none") != 0 &&
-        strcmp(src, "tmpfs") != 0 && strcmp(src, "proc") != 0 &&
-        strcmp(src, "sysfs") != 0 && strcmp(src, "devtmpfs") != 0 &&
-        strcmp(src, "devpts") != 0 && strcmp(src, "cgroup") != 0 &&
-        strcmp(src, "cgroup2") != 0 &&
-        block_get_by_name(src) != NULL) {
-      snprintf(srcbuf, sizeof(srcbuf), "/dev/%s", src);
-      src = srcbuf;
-    }
-    pos += snprintf(buf + pos, 2048 - pos,
+    const char *src = procfs_mount_src(rawsrc, srcbuf, sizeof(srcbuf));
+    int w = snprintf(buf + pos, cap - pos,
         "%s %s %s rw,relatime 0 0\n",
         src, mounts[i].mountpoint, mounts[i].fs_type);
+    if (w < 0 || (size_t)w >= cap - pos)
+      break;
+    pos += (size_t)w;
   }
 
-  if (count == 0)
-    pos += snprintf(buf, 2048, "none / ext4 rw,relatime 0 0\n");
+  if (count == 0 && pos < cap - 64) {
+    int w = snprintf(buf + pos, cap - pos,
+                     "none / ext4 rw,relatime 0 0\n");
+    if (w > 0 && (size_t)w < cap - pos)
+      pos += (size_t)w;
+  }
 
+  kfree(mounts);
   node->length = (uint32_t)pos;
   if (offset >= (uint32_t)pos) {
     kfree(buf);
@@ -938,6 +1045,15 @@ uint32_t procfs_usb_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                          uint8_t *buffer) {
   (void)node;
   return usb_diag_read(offset, size, buffer);
+}
+
+static uint32_t procfs_gpu_debug_read(vfs_node_t *node, uint32_t offset,
+                                     uint32_t size, uint8_t *buffer) {
+  (void)node; return gpu_diag_read(offset,size,buffer);
+}
+static uint32_t procfs_gpu_debug_write(vfs_node_t *node, uint32_t offset,
+                                      uint32_t size, uint8_t *buffer) {
+  (void)node; (void)offset; return gpu_diag_control(size,buffer);
 }
 
 /* /proc/usb_mouse, /proc/usb_xhci — short per-subsystem views so a single
@@ -1715,7 +1831,7 @@ static vfs_node_t *procfs_pid_fd_finddir(vfs_node_t *node, char *name) {
   vfs_node_t *link = kmalloc(sizeof(vfs_node_t));
   if (!link)
     return NULL;
-  vfs_node_init(link);
+  procfs_node_init(link);
   strcpy(link->name, name);
   link->flags = FS_SYMLINK;
   link->mask = 0777;
@@ -1727,29 +1843,29 @@ static vfs_node_t *procfs_pid_fd_finddir(vfs_node_t *node, char *name) {
 static struct dirent *procfs_pid_fd_readdir(vfs_node_t *node, uint32_t index) {
   uint32_t pid = node->impl;
 
-  static struct dirent d;
-  memset(&d, 0, sizeof(d));
+  struct dirent *d = vfs_readdir_buffer();
+  memset(d, 0, sizeof(*d));
 
   if (index == 0) {
-    strcpy(d.name, ".");
-    d.ino = node->inode;
-    d.d_type = DT_DIR;
-    return &d;
+    strcpy(d->name, ".");
+    d->ino = node->inode;
+    d->d_type = DT_DIR;
+    return d;
   }
   if (index == 1) {
-    strcpy(d.name, "..");
-    d.ino = node->inode;
-    d.d_type = DT_DIR;
-    return &d;
+    strcpy(d->name, "..");
+    d->ino = node->inode;
+    d->d_type = DT_DIR;
+    return d;
   }
 
   uint32_t fd;
   if (!sched_get_nth_open_fd(pid, index - 2, &fd))
     return NULL;
-  snprintf(d.name, sizeof(d.name), "%u", fd);
-  d.ino = (pid << 16) | fd;
-  d.d_type = DT_LNK; // /proc/<pid>/fd/N entries are symlinks
-  return &d;
+  snprintf(d->name, sizeof(d->name), "%u", fd);
+  d->ino = (pid << 16) | fd;
+  d->d_type = DT_LNK; // /proc/<pid>/fd/N entries are symlinks
+  return d;
 }
 
 // /proc/<pid>/fdinfo/ support
@@ -1810,7 +1926,7 @@ static vfs_node_t *procfs_pid_fdinfo_finddir(vfs_node_t *node, char *name) {
   vfs_node_t *finfo = kmalloc(sizeof(vfs_node_t));
   if (!finfo)
     return NULL;
-  vfs_node_init(finfo);
+  procfs_node_init(finfo);
   strcpy(finfo->name, name);
   finfo->flags = FS_FILE;
   finfo->mask = 0444;
@@ -1823,29 +1939,29 @@ static vfs_node_t *procfs_pid_fdinfo_finddir(vfs_node_t *node, char *name) {
 static struct dirent *procfs_pid_fdinfo_readdir(vfs_node_t *node, uint32_t index) {
   uint32_t pid = node->impl;
 
-  static struct dirent d;
-  memset(&d, 0, sizeof(d));
+  struct dirent *d = vfs_readdir_buffer();
+  memset(d, 0, sizeof(*d));
 
   if (index == 0) {
-    strcpy(d.name, ".");
-    d.ino = node->inode;
-    d.d_type = DT_DIR;
-    return &d;
+    strcpy(d->name, ".");
+    d->ino = node->inode;
+    d->d_type = DT_DIR;
+    return d;
   }
   if (index == 1) {
-    strcpy(d.name, "..");
-    d.ino = node->inode;
-    d.d_type = DT_DIR;
-    return &d;
+    strcpy(d->name, "..");
+    d->ino = node->inode;
+    d->d_type = DT_DIR;
+    return d;
   }
 
   uint32_t fd;
   if (!sched_get_nth_open_fd(pid, index - 2, &fd))
     return NULL;
-  snprintf(d.name, sizeof(d.name), "%u", fd);
-  d.ino = (pid << 16) | fd;
-  d.d_type = DT_REG;
-  return &d;
+  snprintf(d->name, sizeof(d->name), "%u", fd);
+  d->ino = (pid << 16) | fd;
+  d->d_type = DT_REG;
+  return d;
 }
 
 // /proc/<pid>/ns/ support
@@ -1904,7 +2020,7 @@ static vfs_node_t *procfs_pid_ns_finddir(vfs_node_t *node, char *name) {
     vfs_node_t *entry = kmalloc(sizeof(vfs_node_t));
     if (!entry)
       return NULL;
-    vfs_node_init(entry);
+    procfs_node_init(entry);
     strncpy(entry->name, name, sizeof(entry->name) - 1);
     entry->flags = FS_FILE;
     entry->mask = 0444;
@@ -1918,29 +2034,29 @@ static vfs_node_t *procfs_pid_ns_finddir(vfs_node_t *node, char *name) {
 }
 
 static struct dirent *procfs_pid_ns_readdir(vfs_node_t *node, uint32_t index) {
-  static struct dirent d;
-  memset(&d, 0, sizeof(d));
+  struct dirent *d = vfs_readdir_buffer();
+  memset(d, 0, sizeof(*d));
 
   if (index == 0) {
-    strcpy(d.name, ".");
-    d.ino = node->inode;
-    d.d_type = DT_DIR;
-    return &d;
+    strcpy(d->name, ".");
+    d->ino = node->inode;
+    d->d_type = DT_DIR;
+    return d;
   }
   if (index == 1) {
-    strcpy(d.name, "..");
-    d.ino = node->inode;
-    d.d_type = DT_DIR;
-    return &d;
+    strcpy(d->name, "..");
+    d->ino = node->inode;
+    d->d_type = DT_DIR;
+    return d;
   }
 
   uint32_t i = index - 2;
   if (i >= PROCFS_NS_ENTRY_COUNT)
     return NULL;
-  strncpy(d.name, procfs_ns_entries[i].name, sizeof(d.name) - 1);
-  d.ino = procfs_ns_entries[i].inode;
-  d.d_type = DT_REG;
-  return &d;
+  strncpy(d->name, procfs_ns_entries[i].name, sizeof(d->name) - 1);
+  d->ino = procfs_ns_entries[i].inode;
+  d->d_type = DT_REG;
+  return d;
 }
 
 // Synthesise a /proc/<pid>/ directory node on demand
@@ -2038,15 +2154,22 @@ static int procfs_pid_root_readlink(vfs_node_t *node, char *buf, uint32_t size) 
 static uint32_t procfs_pid_mountinfo_read(vfs_node_t *node, uint32_t offset,
                                           uint32_t size, uint8_t *buffer) {
   (void)node;
-  char *buf = kmalloc(4096);
+  const size_t cap = PROCFS_MOUNTINFO_BUFSZ;
+  char *buf = kmalloc(cap);
   if (!buf)
     return 0;
 
-  vfs_mount_info_t mounts[16];
-  int count = vfs_get_mounts(mounts, 16);
-  int pos = 0;
+  /* Heap-allocate: 32 mounts do not fit the kernel stack. */
+  vfs_mount_info_t *mounts =
+      kmalloc(sizeof(vfs_mount_info_t) * PROCFS_MAX_MOUNTS);
+  if (!mounts) {
+    kfree(buf);
+    return 0;
+  }
+  int count = vfs_get_mounts(mounts, PROCFS_MAX_MOUNTS);
+  size_t pos = 0;
 
-  for (int i = 0; i < count && pos < 3800; i++) {
+  for (int i = 0; i < count && pos < cap - 256; i++) {
     const char *mnt = mounts[i].mountpoint[0] ? mounts[i].mountpoint : "/";
     const char *rawdev = mounts[i].dev_name[0] ? mounts[i].dev_name : "none";
     const char *fst = mounts[i].fs_type[0] ? mounts[i].fs_type : "auto";
@@ -2057,26 +2180,91 @@ static uint32_t procfs_pid_mountinfo_read(vfs_node_t *node, uint32_t offset,
      * MountPoints. Devno must be the real block major:minor for the same
      * reason; pseudo filesystems keep 0:N like Linux. */
     char srcbuf[80];
-    const char *dev = rawdev;
+    const char *dev = procfs_mount_src(rawdev, srcbuf, sizeof(srcbuf));
     uint32_t major = 0, minor = (uint32_t)(i + 1);
     struct block_device *bd = NULL;
     if (rawdev[0] != '/' && strcmp(rawdev, "none") != 0)
       bd = block_get_by_name(rawdev);
     if (bd) {
-      snprintf(srcbuf, sizeof(srcbuf), "/dev/%s", bd->name);
-      dev = srcbuf;
+      /* procfs_mount_src already rewrote dev to /dev/<name> when bd exists. */
       major = bd->linux_major;
       minor = bd->linux_minor;
     }
     /* id parent major:minor root mountpoint opts optional - fstype src super */
-    pos += snprintf(buf + pos, 4096 - pos,
-        "%d %d %u:%u %s %s rw,relatime - %s %s rw\n",
-        i + 18, 1, major, minor, root, mnt, fst, dev);
+    int w = snprintf(buf + pos, cap - pos,
+        "%llu %d %u:%u %s %s rw,relatime - %s %s rw\n",
+        (unsigned long long)mounts[i].mount_id, 1, major, minor, root, mnt, fst, dev);
+    if (w < 0 || (size_t)w >= cap - pos)
+      break;
+    pos += (size_t)w;
   }
 
-  if (count == 0)
-    pos += snprintf(buf, 4096, "18 1 0:1 / / rw,relatime - ext4 none rw\n");
+  if (count == 0 && pos < cap - 128) {
+    int w = snprintf(buf + pos, cap - pos,
+                     "1 1 0:1 / / rw,relatime - ext4 none rw\n");
+    if (w > 0 && (size_t)w < cap - pos)
+      pos += (size_t)w;
+  }
 
+  kfree(mounts);
+  if (offset >= (uint32_t)pos) {
+    kfree(buf);
+    return 0;
+  }
+  if (offset + size > (uint32_t)pos)
+    size = (uint32_t)pos - offset;
+  memcpy(buffer, buf + offset, size);
+  kfree(buf);
+  return size;
+}
+
+/* /proc/<pid>/mountstats — Linux exposes this alongside mountinfo; tools
+ * that poll per-mount I/O (nfsiostat-style monitors, some Qt storage
+ * probes) open it unconditionally and fall into error paths on ENOENT.
+ * Emit the standard "device ... mounted on ... with fstype ..." line per
+ * mount so parsers see a Linux-shaped file. Usage numbers come from
+ * statfs; this file stays strictly compatible. */
+static uint32_t procfs_pid_mountstats_read(vfs_node_t *node, uint32_t offset,
+                                           uint32_t size, uint8_t *buffer) {
+  (void)node;
+  const size_t cap = PROCFS_MOUNTINFO_BUFSZ;
+  char *buf = kmalloc(cap);
+  if (!buf)
+    return 0;
+
+  /* Heap-allocate: 32 mounts do not fit the kernel stack. */
+  vfs_mount_info_t *mounts =
+      kmalloc(sizeof(vfs_mount_info_t) * PROCFS_MAX_MOUNTS);
+  if (!mounts) {
+    kfree(buf);
+    return 0;
+  }
+  int count = vfs_get_mounts(mounts, PROCFS_MAX_MOUNTS);
+  size_t pos = 0;
+
+  for (int i = 0; i < count && pos < cap - 256; i++) {
+    const char *mnt = mounts[i].mountpoint[0] ? mounts[i].mountpoint : "/";
+    const char *fst = mounts[i].fs_type[0] ? mounts[i].fs_type : "auto";
+    const char *rawsrc =
+        mounts[i].dev_name[0] ? mounts[i].dev_name : "none";
+    char srcbuf[80];
+    const char *src = procfs_mount_src(rawsrc, srcbuf, sizeof(srcbuf));
+    int w = snprintf(buf + pos, cap - pos,
+        "device %s mounted on %s with fstype %s\n",
+        src, mnt, fst);
+    if (w < 0 || (size_t)w >= cap - pos)
+      break;
+    pos += (size_t)w;
+  }
+
+  if (count == 0 && pos < cap - 64) {
+    int w = snprintf(buf + pos, cap - pos,
+                     "device none mounted on / with fstype ext4\n");
+    if (w > 0 && (size_t)w < cap - pos)
+      pos += (size_t)w;
+  }
+
+  kfree(mounts);
   if (offset >= (uint32_t)pos) {
     kfree(buf);
     return 0;
@@ -2115,7 +2303,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   vfs_node_t *dir = kmalloc(sizeof(vfs_node_t));
   if (!dir)
     return NULL;
-  vfs_node_init(dir);
+  procfs_node_init(dir);
   snprintf(dir->name, sizeof(dir->name), "%u", pid);
   dir->flags = FS_DIRECTORY; // not FS_PERSISTENT — ephemeral
   dir->mask = 0555;
@@ -2127,7 +2315,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // stat
   vfs_node_t *stat_node = kmalloc(sizeof(vfs_node_t));
   if (stat_node) {
-    vfs_node_init(stat_node);
+    procfs_node_init(stat_node);
     strcpy(stat_node->name, "stat");
     stat_node->flags = FS_FILE;
     stat_node->mask = 0444;
@@ -2140,7 +2328,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // status
   vfs_node_t *status_node = kmalloc(sizeof(vfs_node_t));
   if (status_node) {
-    vfs_node_init(status_node);
+    procfs_node_init(status_node);
     strcpy(status_node->name, "status");
     status_node->flags = FS_FILE;
     status_node->mask = 0444;
@@ -2155,7 +2343,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // spinning call without needing a SYSCALL_LOG rebuild.
   vfs_node_t *syscall_node = kmalloc(sizeof(vfs_node_t));
   if (syscall_node) {
-    vfs_node_init(syscall_node);
+    procfs_node_init(syscall_node);
     strcpy(syscall_node->name, "syscall");
     syscall_node->flags = FS_FILE;
     syscall_node->mask = 0444;
@@ -2168,7 +2356,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // cmdline
   vfs_node_t *cmdline_node = kmalloc(sizeof(vfs_node_t));
   if (cmdline_node) {
-    vfs_node_init(cmdline_node);
+    procfs_node_init(cmdline_node);
     strcpy(cmdline_node->name, "cmdline");
     cmdline_node->flags = FS_FILE;
     cmdline_node->mask = 0444;
@@ -2181,7 +2369,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // comm — what pgrep/pkill match without -f (distinct from cmdline)
   vfs_node_t *comm_node = kmalloc(sizeof(vfs_node_t));
   if (comm_node) {
-    vfs_node_init(comm_node);
+    procfs_node_init(comm_node);
     strcpy(comm_node->name, "comm");
     comm_node->flags = FS_FILE;
     comm_node->mask = 0444;
@@ -2194,7 +2382,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // cgroup — hybrid v1+v2 lines (elogind daemon + sessions)
   vfs_node_t *cgroup_node = kmalloc(sizeof(vfs_node_t));
   if (cgroup_node) {
-    vfs_node_init(cgroup_node);
+    procfs_node_init(cgroup_node);
     strcpy(cgroup_node->name, "cgroup");
     cgroup_node->flags = FS_FILE;
     cgroup_node->mask = 0444;
@@ -2207,7 +2395,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // statm — memory usage in pages (VIRT/RES for htop)
   vfs_node_t *statm_node = kmalloc(sizeof(vfs_node_t));
   if (statm_node) {
-    vfs_node_init(statm_node);
+    procfs_node_init(statm_node);
     strcpy(statm_node->name, "statm");
     statm_node->flags = FS_FILE;
     statm_node->mask = 0444;
@@ -2220,7 +2408,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // io — I/O stats stub (htop 3.x tries to open this)
   vfs_node_t *io_node = kmalloc(sizeof(vfs_node_t));
   if (io_node) {
-    vfs_node_init(io_node);
+    procfs_node_init(io_node);
     strcpy(io_node->name, "io");
     io_node->flags = FS_FILE;
     io_node->mask = 0444;
@@ -2233,7 +2421,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // setgroups — used by bwrap/flatpak/containers before mapping IDs
   vfs_node_t *setgroups_node = kmalloc(sizeof(vfs_node_t));
   if (setgroups_node) {
-    vfs_node_init(setgroups_node);
+    procfs_node_init(setgroups_node);
     strcpy(setgroups_node->name, "setgroups");
     setgroups_node->flags = FS_FILE;
     setgroups_node->mask = 0644;
@@ -2247,7 +2435,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // uid_map — UID mapping for user namespaces
   vfs_node_t *uid_map_node = kmalloc(sizeof(vfs_node_t));
   if (uid_map_node) {
-    vfs_node_init(uid_map_node);
+    procfs_node_init(uid_map_node);
     strcpy(uid_map_node->name, "uid_map");
     uid_map_node->flags = FS_FILE;
     uid_map_node->mask = 0644;
@@ -2261,7 +2449,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // gid_map — GID mapping for user namespaces
   vfs_node_t *gid_map_node = kmalloc(sizeof(vfs_node_t));
   if (gid_map_node) {
-    vfs_node_init(gid_map_node);
+    procfs_node_init(gid_map_node);
     strcpy(gid_map_node->name, "gid_map");
     gid_map_node->flags = FS_FILE;
     gid_map_node->mask = 0644;
@@ -2272,10 +2460,24 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     ramfs_mount_node(dir, gid_map_node);
   }
 
+  /* No OOM victim-selection policy is implemented yet. Expose the neutral
+   * score so memory monitors can probe it without a missing-file loop. */
+  vfs_node_t *score_node = kmalloc(sizeof(vfs_node_t));
+  if (score_node) {
+    procfs_node_init(score_node);
+    strcpy(score_node->name, "oom_score");
+    score_node->flags = FS_FILE;
+    score_node->mask = 0444;
+    score_node->impl = pid;
+    score_node->length = 2;
+    score_node->read = procfs_pid_oom_score_adj_read;
+    ramfs_mount_node(dir, score_node);
+  }
+
   // oom_score_adj — process OOM killer score adjustment
   vfs_node_t *oom_node = kmalloc(sizeof(vfs_node_t));
   if (oom_node) {
-    vfs_node_init(oom_node);
+    procfs_node_init(oom_node);
     strcpy(oom_node->name, "oom_score_adj");
     oom_node->flags = FS_FILE;
     oom_node->mask = 0644;
@@ -2289,7 +2491,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // auxv — ELF auxiliary vector
   vfs_node_t *auxv_node = kmalloc(sizeof(vfs_node_t));
   if (auxv_node) {
-    vfs_node_init(auxv_node);
+    procfs_node_init(auxv_node);
     strcpy(auxv_node->name, "auxv");
     auxv_node->flags = FS_FILE;
     auxv_node->mask = 0444;
@@ -2302,7 +2504,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // maps — memory regions / VMAs
   vfs_node_t *maps_node = kmalloc(sizeof(vfs_node_t));
   if (maps_node) {
-    vfs_node_init(maps_node);
+    procfs_node_init(maps_node);
     strcpy(maps_node->name, "maps");
     maps_node->flags = FS_FILE;
     maps_node->mask = 0444;
@@ -2315,7 +2517,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // numa_maps — per-node NUMA page distribution
   vfs_node_t *numa_maps_node = kmalloc(sizeof(vfs_node_t));
   if (numa_maps_node) {
-    vfs_node_init(numa_maps_node);
+    procfs_node_init(numa_maps_node);
     strcpy(numa_maps_node->name, "numa_maps");
     numa_maps_node->flags = FS_FILE;
     numa_maps_node->mask = 0444;
@@ -2329,25 +2531,40 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // /proc/self is a symlink to /proc/<pid>, so this serves both.
   vfs_node_t *mountinfo_node = kmalloc(sizeof(vfs_node_t));
   if (mountinfo_node) {
-    vfs_node_init(mountinfo_node);
+    procfs_node_init(mountinfo_node);
     strcpy(mountinfo_node->name, "mountinfo");
     mountinfo_node->flags = FS_FILE;
     mountinfo_node->mask = 0444;
     mountinfo_node->impl = pid;
-    mountinfo_node->length = 4096;
+    mountinfo_node->length = 8192;
     mountinfo_node->read = procfs_pid_mountinfo_read;
     ramfs_mount_node(dir, mountinfo_node);
+  }
+
+  // mountstats — Linux exposes /proc/self/mountstats alongside mountinfo.
+  // Per-mount I/O monitors open it unconditionally; without it they take
+  // ENOENT error paths and report no disks.
+  vfs_node_t *mountstats_node = kmalloc(sizeof(vfs_node_t));
+  if (mountstats_node) {
+    procfs_node_init(mountstats_node);
+    strcpy(mountstats_node->name, "mountstats");
+    mountstats_node->flags = FS_FILE;
+    mountstats_node->mask = 0444;
+    mountstats_node->impl = pid;
+    mountstats_node->length = 8192;
+    mountstats_node->read = procfs_pid_mountstats_read;
+    ramfs_mount_node(dir, mountstats_node);
   }
 
   // mounts — same table as global /proc/mounts, per-pid alias
   vfs_node_t *pid_mounts_node = kmalloc(sizeof(vfs_node_t));
   if (pid_mounts_node) {
-    vfs_node_init(pid_mounts_node);
+    procfs_node_init(pid_mounts_node);
     strcpy(pid_mounts_node->name, "mounts");
     pid_mounts_node->flags = FS_FILE;
     pid_mounts_node->mask = 0444;
     pid_mounts_node->impl = pid;
-    pid_mounts_node->length = 2048;
+    pid_mounts_node->length = 8192;
     pid_mounts_node->read = procfs_mounts_read;
     ramfs_mount_node(dir, pid_mounts_node);
   }
@@ -2355,7 +2572,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // fd directory
   vfs_node_t *fd_dir = kmalloc(sizeof(vfs_node_t));
   if (fd_dir) {
-    vfs_node_init(fd_dir);
+    procfs_node_init(fd_dir);
     strcpy(fd_dir->name, "fd");
     fd_dir->flags = FS_DIRECTORY | FS_DENTRY_NOCACHE;
     fd_dir->mask = 0555;
@@ -2368,7 +2585,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // fdinfo directory
   vfs_node_t *fdinfo_dir = kmalloc(sizeof(vfs_node_t));
   if (fdinfo_dir) {
-    vfs_node_init(fdinfo_dir);
+    procfs_node_init(fdinfo_dir);
     strcpy(fdinfo_dir->name, "fdinfo");
     fdinfo_dir->flags = FS_DIRECTORY | FS_DENTRY_NOCACHE;
     fdinfo_dir->mask = 0555;
@@ -2383,7 +2600,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // launcher dies with "open /proc/<pid>/ns failed" before it can fall back.
   vfs_node_t *ns_dir = kmalloc(sizeof(vfs_node_t));
   if (ns_dir) {
-    vfs_node_init(ns_dir);
+    procfs_node_init(ns_dir);
     strcpy(ns_dir->name, "ns");
     ns_dir->flags = FS_DIRECTORY | FS_DENTRY_NOCACHE;
     ns_dir->mask = 0555;
@@ -2397,7 +2614,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // On Linux this mirrors /proc/<pid>/stat for the main thread.
   vfs_node_t *task_dir = kmalloc(sizeof(vfs_node_t));
   if (task_dir) {
-    vfs_node_init(task_dir);
+    procfs_node_init(task_dir);
     strcpy(task_dir->name, "task");
     task_dir->flags = FS_DIRECTORY;
     task_dir->mask = 0555;
@@ -2408,7 +2625,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     // task/<pid>/ sub-directory
     vfs_node_t *tid_dir = kmalloc(sizeof(vfs_node_t));
     if (tid_dir) {
-      vfs_node_init(tid_dir);
+      procfs_node_init(tid_dir);
       snprintf(tid_dir->name, sizeof(tid_dir->name), "%u", pid);
       tid_dir->flags = FS_DIRECTORY;
       tid_dir->mask = 0555;
@@ -2419,7 +2636,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
       // task/<pid>/stat  — same content as /proc/<pid>/stat
       vfs_node_t *tstat_node = kmalloc(sizeof(vfs_node_t));
       if (tstat_node) {
-        vfs_node_init(tstat_node);
+        procfs_node_init(tstat_node);
         strcpy(tstat_node->name, "stat");
         tstat_node->flags = FS_FILE;
         tstat_node->mask = 0444;
@@ -2438,7 +2655,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // exe symlink — /proc/<pid>/exe
   vfs_node_t *exe_link = kmalloc(sizeof(vfs_node_t));
   if (exe_link) {
-    vfs_node_init(exe_link);
+    procfs_node_init(exe_link);
     strcpy(exe_link->name, "exe");
     exe_link->flags = FS_SYMLINK;
     exe_link->mask = 0777;
@@ -2450,7 +2667,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // cwd symlink — /proc/<pid>/cwd
   vfs_node_t *cwd_link = kmalloc(sizeof(vfs_node_t));
   if (cwd_link) {
-    vfs_node_init(cwd_link);
+    procfs_node_init(cwd_link);
     strcpy(cwd_link->name, "cwd");
     cwd_link->flags = FS_SYMLINK;
     cwd_link->mask = 0777;
@@ -2462,7 +2679,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   // root symlink — /proc/<pid>/root
   vfs_node_t *root_link = kmalloc(sizeof(vfs_node_t));
   if (root_link) {
-    vfs_node_init(root_link);
+    procfs_node_init(root_link);
     strcpy(root_link->name, "root");
     root_link->flags = FS_SYMLINK;
     root_link->mask = 0777;
@@ -2563,23 +2780,22 @@ static int procfs_self_readlink(vfs_node_t *node, char *buf, uint32_t size) {
 //   2..N+1   → static ramfs children (all nodes mounted in procfs_root)
 //   N+2 ..   → live PID entries (one per thread in global_thread_list)
 
-static struct dirent procfs_dent; // single static buffer (safe: no preemption
-                                  // between readdir calls in getdents64 loop)
 
 static struct dirent *procfs_root_readdir(vfs_node_t *node, uint32_t index) {
-  memset(&procfs_dent, 0, sizeof(procfs_dent));
+  struct dirent *procfs_dent = vfs_readdir_buffer();
+  memset(procfs_dent, 0, sizeof(*procfs_dent));
 
   if (index == 0) {
-    strcpy(procfs_dent.name, ".");
-    procfs_dent.ino = node->inode;
-    procfs_dent.d_type = DT_DIR;
-    return &procfs_dent;
+    strcpy(procfs_dent->name, ".");
+    procfs_dent->ino = node->inode;
+    procfs_dent->d_type = DT_DIR;
+    return procfs_dent;
   }
   if (index == 1) {
-    strcpy(procfs_dent.name, "..");
-    procfs_dent.ino = node->inode;
-    procfs_dent.d_type = DT_DIR;
-    return &procfs_dent;
+    strcpy(procfs_dent->name, "..");
+    procfs_dent->ino = node->inode;
+    procfs_dent->d_type = DT_DIR;
+    return procfs_dent;
   }
 
   // Walk the ramfs child list
@@ -2599,10 +2815,10 @@ static struct dirent *procfs_root_readdir(vfs_node_t *node, uint32_t index) {
   for (uint32_t i = 0; i < static_idx && curr; i++)
     curr = curr->next;
   if (curr) {
-    strcpy(procfs_dent.name, curr->node->name);
-    procfs_dent.ino = curr->node->inode;
-    procfs_dent.d_type = vfs_dtype(curr->node->flags);
-    return &procfs_dent;
+    strcpy(procfs_dent->name, curr->node->name);
+    procfs_dent->ino = curr->node->inode;
+    procfs_dent->d_type = vfs_dtype(curr->node->flags);
+    return procfs_dent;
   }
 
   // Count total static children
@@ -2614,10 +2830,10 @@ static struct dirent *procfs_root_readdir(vfs_node_t *node, uint32_t index) {
   uint32_t pid;
   if (!sched_get_nth_thread_tid(static_idx - num_static, &pid))
     return NULL;
-  snprintf(procfs_dent.name, sizeof(procfs_dent.name), "%u", pid);
-  procfs_dent.ino = 0x10000 + pid;
-  procfs_dent.d_type = DT_DIR;
-  return &procfs_dent;
+  snprintf(procfs_dent->name, sizeof(procfs_dent->name), "%u", pid);
+  procfs_dent->ino = 0x10000 + pid;
+  procfs_dent->d_type = DT_DIR;
+  return procfs_dent;
 }
 
 // Custom finddir for /proc
@@ -2627,7 +2843,7 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, char *name) {
     vfs_node_t *self_link = kmalloc(sizeof(vfs_node_t));
     if (!self_link)
       return NULL;
-    vfs_node_init(self_link);
+    procfs_node_init(self_link);
     strcpy(self_link->name, "self");
     self_link->flags = FS_SYMLINK;
     self_link->mask = 0777;
@@ -2638,7 +2854,7 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, char *name) {
     vfs_node_t *tself_link = kmalloc(sizeof(vfs_node_t));
     if (!tself_link)
       return NULL;
-    vfs_node_init(tself_link);
+    procfs_node_init(tself_link);
     strcpy(tself_link->name, "thread-self");
     tself_link->flags = FS_SYMLINK;
     tself_link->mask = 0777;
@@ -2700,7 +2916,7 @@ void procfs_init(void) {
   if (proc_dir) {
     // Stage a new virtual root for procfs
     vfs_node_t *procfs_root = kmalloc(sizeof(vfs_node_t));
-    vfs_node_init(procfs_root);
+    procfs_node_init(procfs_root);
     strcpy(procfs_root->name, "proc");
     procfs_root->flags = FS_DIRECTORY;
     procfs_root->mask = 0555;
@@ -2714,9 +2930,23 @@ void procfs_init(void) {
     vfs_close(proc_dir);
 
     // Add /proc/meminfo
+    vfs_node_t *gpu_debug_node=kmalloc(sizeof(vfs_node_t));
+    if (gpu_debug_node) {
+      procfs_node_init(gpu_debug_node);
+      strncpy(gpu_debug_node->name,"gpu_debug",127);
+      gpu_debug_node->flags=FS_FILE|FS_PERSISTENT;
+      gpu_debug_node->mask=0600;
+      gpu_debug_node->read=procfs_gpu_debug_read;
+      gpu_debug_node->write=procfs_gpu_debug_write;
+      gpu_debug_node->length=512*1024;
+      ramfs_mount_node(procfs_root,gpu_debug_node);
+      klog_puts("[GPUDBG] native recorder active; /proc/gpu_debug (1 metadata, 2 pixel checks, dump freezes to serial)\n");
+    }
+
+    // Add /proc/meminfo
     vfs_node_t *meminfo_node = kmalloc(sizeof(vfs_node_t));
     if (meminfo_node) {
-      vfs_node_init(meminfo_node);
+      procfs_node_init(meminfo_node);
       strncpy(meminfo_node->name, "meminfo", 127);
       meminfo_node->flags = FS_FILE | FS_PERSISTENT;
       meminfo_node->mask = 0444; // Read-only
@@ -2730,7 +2960,7 @@ void procfs_init(void) {
     // memory-pressure monitor opens it unconditionally; htop/btop read it.
     vfs_node_t *zoneinfo_node = kmalloc(sizeof(vfs_node_t));
     if (zoneinfo_node) {
-      vfs_node_init(zoneinfo_node);
+      procfs_node_init(zoneinfo_node);
       strncpy(zoneinfo_node->name, "zoneinfo", 127);
       zoneinfo_node->flags = FS_FILE | FS_PERSISTENT;
       zoneinfo_node->mask = 0444;
@@ -2743,7 +2973,7 @@ void procfs_init(void) {
     // Add /proc/numainfo — NUMA topology and per-node memory/CPU statistics
     vfs_node_t *numainfo_node = kmalloc(sizeof(vfs_node_t));
     if (numainfo_node) {
-      vfs_node_init(numainfo_node);
+      procfs_node_init(numainfo_node);
       strncpy(numainfo_node->name, "numainfo", 127);
       numainfo_node->flags = FS_FILE | FS_PERSISTENT;
       numainfo_node->mask = 0444;
@@ -2758,7 +2988,7 @@ void procfs_init(void) {
     // log readable after the machine is up.
     vfs_node_t *klog_node = kmalloc(sizeof(vfs_node_t));
     if (klog_node) {
-      vfs_node_init(klog_node);
+      procfs_node_init(klog_node);
       strncpy(klog_node->name, "klog", 127);
       klog_node->flags = FS_FILE | FS_PERSISTENT;
       klog_node->mask = 0444;
@@ -2771,7 +3001,7 @@ void procfs_init(void) {
     // userspace exec, so driver bring-up lines survive userland log spam.
     vfs_node_t *bootlog_node = kmalloc(sizeof(vfs_node_t));
     if (bootlog_node) {
-      vfs_node_init(bootlog_node);
+      procfs_node_init(bootlog_node);
       strncpy(bootlog_node->name, "bootlog", 127);
       bootlog_node->flags = FS_FILE | FS_PERSISTENT;
       bootlog_node->mask = 0444;
@@ -2785,7 +3015,7 @@ void procfs_init(void) {
     // serial capture can still show why a mouse was not claimed.
     vfs_node_t *usb_node = kmalloc(sizeof(vfs_node_t));
     if (usb_node) {
-      vfs_node_init(usb_node);
+      procfs_node_init(usb_node);
       strncpy(usb_node->name, "usb", 127);
       usb_node->flags = FS_FILE | FS_PERSISTENT;
       usb_node->mask = 0444;
@@ -2798,7 +3028,7 @@ void procfs_init(void) {
     // state, so one `cat` on a screen without scrollback is enough.
     vfs_node_t *usb_mouse_node = kmalloc(sizeof(vfs_node_t));
     if (usb_mouse_node) {
-      vfs_node_init(usb_mouse_node);
+      procfs_node_init(usb_mouse_node);
       strncpy(usb_mouse_node->name, "usb_mouse", 127);
       usb_mouse_node->flags = FS_FILE | FS_PERSISTENT;
       usb_mouse_node->mask = 0444;
@@ -2809,7 +3039,7 @@ void procfs_init(void) {
 
     vfs_node_t *usb_xhci_node = kmalloc(sizeof(vfs_node_t));
     if (usb_xhci_node) {
-      vfs_node_init(usb_xhci_node);
+      procfs_node_init(usb_xhci_node);
       strncpy(usb_xhci_node->name, "usb_xhci", 127);
       usb_xhci_node->flags = FS_FILE | FS_PERSISTENT;
       usb_xhci_node->mask = 0444;
@@ -2821,7 +3051,7 @@ void procfs_init(void) {
     // Add /proc/usb_debug: runtime switch for the verbose USB transfer trace.
     vfs_node_t *usb_debug_node = kmalloc(sizeof(vfs_node_t));
     if (usb_debug_node) {
-      vfs_node_init(usb_debug_node);
+      procfs_node_init(usb_debug_node);
       strncpy(usb_debug_node->name, "usb_debug", 127);
       usb_debug_node->flags = FS_FILE | FS_PERSISTENT;
       usb_debug_node->mask = 0644;
@@ -2834,7 +3064,7 @@ void procfs_init(void) {
     // Add /proc/drmstats
     vfs_node_t *drmstats_node = kmalloc(sizeof(vfs_node_t));
     if (drmstats_node) {
-      vfs_node_init(drmstats_node);
+      procfs_node_init(drmstats_node);
       strncpy(drmstats_node->name, "drmstats", 127);
       drmstats_node->flags = FS_FILE | FS_PERSISTENT;
       drmstats_node->mask = 0444;
@@ -2846,7 +3076,7 @@ void procfs_init(void) {
     // Add /proc/tlbstats: what TLB invalidation costs (mm/tlb_shootdown.c)
     vfs_node_t *tlbstats_node = kmalloc(sizeof(vfs_node_t));
     if (tlbstats_node) {
-      vfs_node_init(tlbstats_node);
+      procfs_node_init(tlbstats_node);
       strncpy(tlbstats_node->name, "tlbstats", 127);
       tlbstats_node->flags = FS_FILE | FS_PERSISTENT;
       tlbstats_node->mask = 0444;
@@ -2858,7 +3088,7 @@ void procfs_init(void) {
     // Add /proc/cpuinfo
     vfs_node_t *cpuinfo_node = kmalloc(sizeof(vfs_node_t));
     if (cpuinfo_node) {
-      vfs_node_init(cpuinfo_node);
+      procfs_node_init(cpuinfo_node);
       strncpy(cpuinfo_node->name, "cpuinfo", 127);
       cpuinfo_node->flags = FS_FILE | FS_PERSISTENT;
       cpuinfo_node->mask = 0444; // Read-only
@@ -2871,7 +3101,7 @@ void procfs_init(void) {
     // Add /proc/partitions
     vfs_node_t *part_node = kmalloc(sizeof(vfs_node_t));
     if (part_node) {
-      vfs_node_init(part_node);
+      procfs_node_init(part_node);
       strncpy(part_node->name, "partitions", 127);
       part_node->flags = FS_FILE | FS_PERSISTENT;
       part_node->mask = 0444; // Read-only
@@ -2881,11 +3111,22 @@ void procfs_init(void) {
       ramfs_mount_node(procfs_root, part_node);
     }
 
+    vfs_node_t *storage_perf_node = kmalloc(sizeof(vfs_node_t));
+    if (storage_perf_node) {
+      procfs_node_init(storage_perf_node);
+      strncpy(storage_perf_node->name, "storage_perf", 127);
+      storage_perf_node->flags = FS_FILE | FS_PERSISTENT;
+      storage_perf_node->mask = 0444;
+      storage_perf_node->read = procfs_storage_perf_read;
+      storage_perf_node->length = 32768;
+      ramfs_mount_node(procfs_root, storage_perf_node);
+    }
+
     // Add /proc/diskstats (see procfs_diskstats_read: real names, zero
     // counters until the block layer tracks I/O stats)
     vfs_node_t *diskstats_node = kmalloc(sizeof(vfs_node_t));
     if (diskstats_node) {
-      vfs_node_init(diskstats_node);
+      procfs_node_init(diskstats_node);
       strncpy(diskstats_node->name, "diskstats", 127);
       diskstats_node->flags = FS_FILE | FS_PERSISTENT;
       diskstats_node->mask = 0444;
@@ -2898,18 +3139,19 @@ void procfs_init(void) {
     // Add /proc/mounts
     vfs_node_t *mounts_node = kmalloc(sizeof(vfs_node_t));
     if (mounts_node) {
-      vfs_node_init(mounts_node);
+      procfs_node_init(mounts_node);
       strncpy(mounts_node->name, "mounts", 127);
       mounts_node->flags = FS_FILE | FS_PERSISTENT;
       mounts_node->mask = 0444;
       mounts_node->read = procfs_mounts_read;
+      mounts_node->length = 8192;
       ramfs_mount_node(procfs_root, mounts_node);
     }
 
     // Add /proc/uptime
     vfs_node_t *uptime_node = kmalloc(sizeof(vfs_node_t));
     if (uptime_node) {
-      vfs_node_init(uptime_node);
+      procfs_node_init(uptime_node);
       strncpy(uptime_node->name, "uptime", 127);
       uptime_node->flags = FS_FILE | FS_PERSISTENT;
       uptime_node->mask = 0444;
@@ -2920,7 +3162,7 @@ void procfs_init(void) {
     // Add /proc/stat
     vfs_node_t *static_node = kmalloc(sizeof(vfs_node_t));
     if (static_node) {
-      vfs_node_init(static_node);
+      procfs_node_init(static_node);
       strncpy(static_node->name, "stat", 127);
       static_node->flags = FS_FILE | FS_PERSISTENT;
       static_node->mask = 0444;
@@ -2931,7 +3173,7 @@ void procfs_init(void) {
     // Add /proc/sched_debug
     vfs_node_t *sched_node = kmalloc(sizeof(vfs_node_t));
     if (sched_node) {
-      vfs_node_init(sched_node);
+      procfs_node_init(sched_node);
       strncpy(sched_node->name, "sched_debug", 127);
       sched_node->flags = FS_FILE | FS_PERSISTENT;
       sched_node->mask = 0444;
@@ -2942,7 +3184,7 @@ void procfs_init(void) {
     // Add /proc/sysdiag
     vfs_node_t *sysdiag_node = kmalloc(sizeof(vfs_node_t));
     if (sysdiag_node) {
-      vfs_node_init(sysdiag_node);
+      procfs_node_init(sysdiag_node);
       strncpy(sysdiag_node->name, "sysdiag", 127);
       sysdiag_node->flags = FS_FILE | FS_PERSISTENT;
       sysdiag_node->mask = 0444;
@@ -2953,7 +3195,7 @@ void procfs_init(void) {
     // Add /proc/loadavg
     vfs_node_t *loadavg_node = kmalloc(sizeof(vfs_node_t));
     if (loadavg_node) {
-      vfs_node_init(loadavg_node);
+      procfs_node_init(loadavg_node);
       strncpy(loadavg_node->name, "loadavg", 127);
       loadavg_node->flags = FS_FILE | FS_PERSISTENT;
       loadavg_node->mask = 0444;
@@ -2964,7 +3206,7 @@ void procfs_init(void) {
     // Add /proc/heapinfo
     vfs_node_t *heapinfo_node = kmalloc(sizeof(vfs_node_t));
     if (heapinfo_node) {
-      vfs_node_init(heapinfo_node);
+      procfs_node_init(heapinfo_node);
       strncpy(heapinfo_node->name, "heapinfo", 127);
       heapinfo_node->flags = FS_FILE | FS_PERSISTENT;
       heapinfo_node->mask = 0444;
@@ -2975,7 +3217,7 @@ void procfs_init(void) {
     // Add /proc/cmdline
     vfs_node_t *cmdline_node = kmalloc(sizeof(vfs_node_t));
     if (cmdline_node) {
-      vfs_node_init(cmdline_node);
+      procfs_node_init(cmdline_node);
       strncpy(cmdline_node->name, "cmdline", 127);
       cmdline_node->flags = FS_FILE | FS_PERSISTENT;
       cmdline_node->mask = 0444;
@@ -2986,7 +3228,7 @@ void procfs_init(void) {
     // Add /proc/version
     vfs_node_t *version_node = kmalloc(sizeof(vfs_node_t));
     if (version_node) {
-      vfs_node_init(version_node);
+      procfs_node_init(version_node);
       strncpy(version_node->name, "version", 127);
       version_node->flags = FS_FILE | FS_PERSISTENT;
       version_node->mask = 0444;
@@ -2998,7 +3240,7 @@ void procfs_init(void) {
     // Add /proc/filesystems
     vfs_node_t *filesystems_node = kmalloc(sizeof(vfs_node_t));
     if (filesystems_node) {
-      vfs_node_init(filesystems_node);
+      procfs_node_init(filesystems_node);
       strncpy(filesystems_node->name, "filesystems", 127);
       filesystems_node->flags = FS_FILE | FS_PERSISTENT;
       filesystems_node->mask = 0444;
@@ -3014,7 +3256,7 @@ void procfs_init(void) {
                                         uint8_t *);
     vfs_node_t *cgroups_node = kmalloc(sizeof(vfs_node_t));
     if (cgroups_node) {
-      vfs_node_init(cgroups_node);
+      procfs_node_init(cgroups_node);
       strncpy(cgroups_node->name, "cgroups", 127);
       cgroups_node->flags = FS_FILE | FS_PERSISTENT;
       cgroups_node->mask = 0444;
@@ -3323,7 +3565,7 @@ void procfs_net_init(vfs_node_t *procfs_root) {
     // Create the /proc/net directory node
     vfs_node_t *net_dir = kmalloc(sizeof(vfs_node_t));
     if (!net_dir) return;
-    vfs_node_init(net_dir);
+    procfs_node_init(net_dir);
     strcpy(net_dir->name, "net");
     net_dir->flags = FS_DIRECTORY | FS_PERSISTENT;
     net_dir->mask  = 0555;
@@ -3334,7 +3576,7 @@ void procfs_net_init(vfs_node_t *procfs_root) {
     do {                                                       \
         vfs_node_t *_n = kmalloc(sizeof(vfs_node_t));         \
         if (_n) {                                              \
-            vfs_node_init(_n);                                 \
+            procfs_node_init(_n);                                 \
             strncpy(_n->name, fname, 127);                     \
             _n->flags  = FS_FILE | FS_PERSISTENT;              \
             _n->mask   = 0444;                                 \
@@ -3529,7 +3771,7 @@ static uint32_t procfs_sys_max_map_count_read(vfs_node_t *node, uint32_t offset,
 static vfs_node_t *procfs_create_dir_node(const char *name) {
     vfs_node_t *dir = kmalloc(sizeof(vfs_node_t));
     if (!dir) return NULL;
-    vfs_node_init(dir);
+    procfs_node_init(dir);
     strncpy(dir->name, name, 127);
     dir->flags = FS_DIRECTORY | FS_PERSISTENT;
     dir->mask  = 0555;
@@ -3540,7 +3782,7 @@ static vfs_node_t *procfs_create_dir_node(const char *name) {
 static void procfs_add_file_node(vfs_node_t *parent, const char *name, read_type_t rfunc, uint32_t len) {
     vfs_node_t *n = kmalloc(sizeof(vfs_node_t));
     if (!n) return;
-    vfs_node_init(n);
+    procfs_node_init(n);
     strncpy(n->name, name, 127);
     n->flags = FS_FILE | FS_PERSISTENT;
     n->mask = 0444;

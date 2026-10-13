@@ -384,8 +384,10 @@ static void kpi_pci_probe_device(struct pci_driver *drv,
 
   pdev->driver = drv;
   pdev->dev.driver = &drv->driver;
-  if (!drv->probe)
+  if (!drv->probe) {
+    linuxkpi_pci_native_driver(pdev->sysdata, drv->name);
     return;
+  }
 
   ret = drv->probe(pdev, id);
   if (!strcmp(drv->name, "amdgpu")) {
@@ -403,6 +405,7 @@ static void kpi_pci_probe_device(struct pci_driver *drv,
   /* Driver-level sysfs groups appear on a successful bind and disappear on
    * unbind, like the upstream driver core. */
   device_add_groups(&pdev->dev, drv->driver.dev_groups);
+  linuxkpi_pci_native_driver(pdev->sysdata, drv->name);
 }
 
 int __pci_register_driver(struct pci_driver *drv, struct module *owner,
@@ -435,6 +438,28 @@ int __pci_register_driver(struct pci_driver *drv, struct module *owner,
   return 0;
 }
 
+/* Native shutdown runs while interrupts and scheduler waits still work.
+ * Failed probes are unbound and must never receive a shutdown callback. */
+void linuxkpi_pci_shutdown(void) {
+  static int started;
+  int i;
+
+  if (__atomic_exchange_n(&started, 1, __ATOMIC_ACQ_REL))
+    return;
+  for (i = kpi_dev_count - 1; i >= 0; i--) {
+    struct pci_dev *pdev = kpi_devs[i];
+    struct pci_driver *drv = pdev ? pdev->driver : NULL;
+
+    if (!drv || !drv->shutdown)
+      continue;
+    klogf("[KERNEL] LinuxKPI: shutting down pci %s %s\n",
+          drv->name, pci_name(pdev));
+    drv->shutdown(pdev);
+    klogf("[KERNEL] LinuxKPI: pci %s %s shutdown complete\n",
+          drv->name, pci_name(pdev));
+  }
+}
+
 void pci_unregister_driver(struct pci_driver *drv) {
   struct kpi_pci_driver *node, *tmp;
   int i;
@@ -454,6 +479,7 @@ void pci_unregister_driver(struct pci_driver *drv) {
       device_remove_groups(&pdev->dev, drv->driver.dev_groups);
       if (drv->remove)
         drv->remove(pdev);
+      linuxkpi_pci_native_driver(pdev->sysdata, NULL);
       pdev->driver = NULL;
       pdev->dev.driver = NULL;
     }

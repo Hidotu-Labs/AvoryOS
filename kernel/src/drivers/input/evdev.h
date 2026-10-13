@@ -229,6 +229,7 @@ typedef struct evdev_device {
   volatile uint32_t tail;
   uint8_t key_state[(KEY_MAX_EV + 8) / 8];
   uint8_t led_state;    // EV_LED state written by userspace (Xorg kbd driver)
+  int32_t abs_value[2]; // Current normalized ABS_X/ABS_Y for EVIOCGABS
 
   wait_queue_t wait;    // For blocking reads / poll
   spinlock_t lock;      // Protects head/tail and ring buffer

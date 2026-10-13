@@ -24,7 +24,8 @@ static void spinlock_release(spinlock_t *s) {
   __atomic_store_n(&s->locked, 0, __ATOMIC_RELEASE);
 }
 static bool user_buffer;
-static bool is_user_ptr(uint64_t p) { (void)p; return user_buffer; }
+static uintptr_t user_start, user_end;
+static bool is_user_ptr(uint64_t p) { return user_buffer && p >= user_start && p < user_end; }
 unsigned long copy_from_user(void *, const void *, unsigned long);
 unsigned long copy_to_user(void *, const void *, unsigned long);
 unsigned long clear_user(void *, unsigned long);
@@ -48,9 +49,18 @@ static _Thread_local unsigned depth;
 static int fail_start, fail_stop, fail_alloc, fail_map, fail_set, fail_read,
            fail_write, fail_inode_read, fail_inode_write, fail_scratch;
 static long copy_limit = -1;
+static bool fault_neighbor;
+static unsigned copy_calls, max_copy, allocations;
 
-void *kmalloc(size_t n) { return fail_scratch ? NULL : malloc(n); }
-void kfree(void *p) { free(p); }
+void *kmalloc(size_t n) {
+  void *p = fail_scratch ? NULL : malloc(n);
+  if (p) __atomic_add_fetch(&allocations, 1, __ATOMIC_RELAXED);
+  return p;
+}
+void kfree(void *p) {
+  if (p) __atomic_sub_fetch(&allocations, 1, __ATOMIC_RELAXED);
+  free(p);
+}
 uint32_t ext2_current_time(void) { return 42; }
 int ext3_journal_start(ext2_mount_t *mnt) {
   assert(mnt == &mount);
@@ -125,6 +135,15 @@ int ext2_write_block(ext2_mount_t *mnt, uint32_t block, const void *in) {
   return 0;
 }
 unsigned long copy_from_user(void *out, const void *in, unsigned long n) {
+  /* Simulate fault-time file work: journal acquisition must be possible. */
+  assert(!depth);
+  copy_calls++;
+  if (n > max_copy) max_copy = n;
+  if (fault_neighbor) {
+    vfs_node_t neighbor = {.device = &mount, .inode = 1};
+    unsigned char byte = 0x77;
+    assert(ext2_write_impl(&neighbor, images[1].i_size, 1, &byte) == 1);
+  }
   unsigned long copied = copy_limit < 0 ? n : (unsigned long)copy_limit;
   if (copied > n) copied = n;
   memcpy(out, in, copied);
@@ -133,7 +152,8 @@ unsigned long copy_from_user(void *out, const void *in, unsigned long n) {
 }
 static vfs_node_t node;
 static void reset(void) {
-  assert(!depth);
+  assert(!depth && !allocations);
+  fault_neighbor = false; copy_calls = max_copy = 0;
   memset(&mount, 0, sizeof(mount));
   memset(images, 0, sizeof(images));
   memset(disk, 0xcc, sizeof(disk));
@@ -150,7 +170,7 @@ static void reset(void) {
   copy_limit = -1;
 }
 static void check_unlocked(void) {
-  assert(!depth);
+  assert(!depth && !allocations);
   assert(pthread_mutex_trylock(&tx_lock) == 0);
   pthread_mutex_unlock(&tx_lock);
 }
@@ -166,6 +186,7 @@ static void *neighbor_writer(void *arg) {
 }
 int main(void) {
   unsigned char buffer[33 * BS];
+  user_start = (uintptr_t)buffer; user_end = user_start + sizeof(buffer);
   memset(buffer, 0x55, sizeof(buffer));
   reset();
   assert(ext2_write_impl(&node, 0, 4096, buffer) == 4096);
@@ -207,9 +228,26 @@ int main(void) {
   user_buffer = true;
   copy_limit = 0;
   assert(ext2_write_impl(&node, 0, BS, buffer) == (uint32_t)-14);
-  for (unsigned i = 0; i < BS; i++) assert(disk[1][i] == 0);
+  assert(next_block == 1 && !images[0].i_block[0] && !inode_reads && !data_writes);
   check_unlocked();
-  puts("PASS zero-byte user fault initializes newly mapped sparse block");
+  puts("PASS zero-byte user fault leaves sparse mapping untouched");
+
+  reset();
+  user_buffer = true;
+  fault_neighbor = true;
+  assert(ext2_write_impl(&node, 17, sizeof(buffer), buffer) == sizeof(buffer));
+  assert(copy_calls == 2 && max_copy == 32 * BS - 17);
+  assert(images[0].i_size == sizeof(buffer) + 17 && images[1].i_size == 2);
+  assert(commits == 4 && !allocations);
+  check_unlocked();
+  puts("PASS fault-time neighboring writes progress between bounded user batches");
+
+  reset();
+  user_buffer = true;
+  copy_limit = 32 * BS + 100;
+  assert(ext2_write_impl(&node, 0, sizeof(buffer), buffer) == 32 * BS + 100);
+  assert(images[0].i_size == 32 * BS + 100 && !allocations);
+  puts("PASS partial fault in second staged batch returns committed prefix");
 
   for (unsigned failure = 0; failure < 9; failure++) {
     reset();
@@ -224,7 +262,8 @@ int main(void) {
     *faults[failure] = 1;
     uint32_t expected = failure == 7 ? (uint32_t)-28
                        : failure == 8 ? (uint32_t)-12 : (uint32_t)-5;
-    assert(ext2_write_impl(&node, 0, BS, buffer) == expected);
+    assert(ext2_write_impl(&node, failure == 4 ? 1 : 0,
+                           failure == 4 ? BS - 1 : BS, buffer) == expected);
     check_unlocked();
   }
   puts("PASS start/stop/mapping/inode/read/write/allocation failures return errors and release ownership");

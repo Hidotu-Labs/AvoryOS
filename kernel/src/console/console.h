@@ -17,6 +17,8 @@ void console_write_batch(const char *buf, size_t len);
 // false when the console is busy, so log paths that may run in a fault or
 // hang context can fall back to serial instead of deadlocking on the lock.
 bool console_write_batch_try(const char *buf, size_t len);
+/* Screen-only copy of a record already written to serial by klog. */
+bool console_write_screen_batch_try(const char *buf, size_t len);
 
 void console_clear(void);
 void console_set_cursor_visible(bool visible);

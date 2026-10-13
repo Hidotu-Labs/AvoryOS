@@ -32,6 +32,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -87,7 +88,22 @@ static void test_fd_mmap(int dev) {
     }
     pass("ioctl(ALLOC) returned a dma-buf fd");
 
-    p = map_fd(fd, pages, MAP_SHARED);
+    struct stat st;
+    off_t reported_size = lseek(fd, 0, SEEK_END);
+    if (fstat(fd, &st) == 0 && st.st_size == (off_t)size &&
+        reported_size == (off_t)size && lseek(fd, 0, SEEK_SET) == 0)
+        pass("dma-buf fstat/SEEK_END expose the allocation size (Mesa import)");
+    else {
+        fail("dma-buf fstat/SEEK_END expose the allocation size (Mesa import)", 0);
+        close(fd);
+        return;
+    }
+
+    /* Mesa's software KMS importer discovers its mmap length with SEEK_END. */
+    p = mmap(NULL, (size_t)reported_size, PROT_READ | PROT_WRITE,
+             MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED)
+        p = NULL;
     if (!p) {
         fail("mmap(dma-buf fd)", errno);
         close(fd);

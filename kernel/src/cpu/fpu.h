@@ -2,22 +2,19 @@
 #define CPU_FPU_H
 
 #include "../cpu/isr.h"
-
 struct thread;
 
-// Initialize FPU management subsystem and register Exception 7 (#NM) handler
 void fpu_init(void);
-
-// Exception 7 (#NM - Device Not Available) handler for Lazy FPU switching
+void fpu_init_cpu(void);
+void fpu_init_thread(struct thread *t);
 void fpu_nm_handler(struct registers *regs);
-
-// Ensure the FPU state for thread `t` is fully loaded in hardware.
-// Accepts const thread* since we only read the fpu_state buffer here,
-// but we do update cpu->fpu_owner so cast to non-const internally.
+/* Local CPU, IRQs masked; call before publishing the arriving thread. */
+void fpu_on_context_switch(void);
+/* Only the current thread may be loaded; serializes ownership with IRQs. */
 void fpu_ensure_loaded(const struct thread *t);
-
-// Forget any cached FPU ownership for thread `t` (called on thread teardown)
+void fpu_copy_thread(struct thread *child, const struct thread *parent);
+void fpu_reset_current(void);
+/* Teardown is allowed only once a thread is off-CPU. */
 void fpu_forget_thread(struct thread *t);
 
 #endif
-

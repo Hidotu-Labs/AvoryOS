@@ -5,9 +5,9 @@
  * thread's kpi_data) with the Linux threadfn/data and the cooperative stop
  * flag.  The block pointer is also cached in the task shadow (kpi_control),
  * so kthread_stop() can still find it after the native thread exited and was
- * reaped; kthread_stop() frees the block.  A self-exiting thread that nobody
- * stops leaves its (small) block and shadow behind - the documented
- * behaviour for kernel threads the boot never joins. */
+ * reaped. The native thread and the creator own separate task references;
+ * stop() releases creator ownership, while internal self-retiring services
+ * detach it before starting. The last reference frees the block and shadow. */
 
 #include <linux/completion.h>
 #include <linux/err.h>
@@ -28,8 +28,7 @@ struct kpi_kthread {
   void *data;
   volatile int should_stop;
   struct completion exited;
-  /* Native thread pointer while the thread runs; set when the trampoline
-   * starts and cleared before it completes `exited`, so kthread_stop() can
+  /* Native thread pointer from suspended creation through execution; cleared before it completes `exited`, so kthread_stop() can
    * wake only a live thread and never races the reaper that frees it.
    * Guarded by `lock`. */
   void *native;
@@ -105,8 +104,17 @@ struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),
    * kthread_stop() resolves the control block through this field, so it
    * survives the native thread. */
   struct task_struct *task = linuxkpi_task_for_thread(thread);
-  if (task)
-    task->kpi_control = k;
+  if (!task) {
+    linuxkpi_kthread_cancel_create(thread);
+    kfree(k);
+    return ERR_PTR(-ENOMEM);
+  }
+  task->kpi_control = k;
+  linuxkpi_task_get(task); /* creator owns a reference until stop/detach */
+  /* stop() must also wake a thread that has not entered its trampoline. */
+  spin_lock(&k->lock);
+  k->native = thread;
+  spin_unlock(&k->lock);
   return task;
 }
 
@@ -138,10 +146,16 @@ int kthread_stop(struct task_struct *task) {
   spin_unlock(&k->lock);
 
   wait_for_completion(&k->exited);
-  kfree(k);
-  if (task)
-    task->kpi_control = NULL;
+  /* The native owner protects the completion until the trampoline has
+   * returned and been reaped. Final shadow release frees the control. */
+  linuxkpi_task_put(task);
   return 0;
+}
+
+void kthread_detach(struct task_struct *task) {
+  /* For internal idle-exit services: the native reference owns execution.
+   * The published service pointer is borrowed and cleared before return. */
+  linuxkpi_task_put(task);
 }
 
 bool kthread_should_stop(void) {
@@ -184,19 +198,22 @@ static bool kthread_worker_idle(struct kthread_worker *worker) {
  * kthread_queue_work() after the work is linked, under worker->lock so a
  * concurrently retiring worker either sees the work or leaves task NULL. */
 static void kthread_worker_spawn(struct kthread_worker *worker) {
-  spin_lock(&worker->lock);
+  unsigned long flags;
+  spin_lock_irqsave(&worker->lock, flags);
   if (!worker->task) {
     struct task_struct *t =
         kthread_create(kthread_worker_fn, worker, "%s", worker->name);
     if (!IS_ERR(t)) {
       worker->task = t;
+      kthread_detach(t);
       wake_up_process(t);
     }
   }
-  spin_unlock(&worker->lock);
+  spin_unlock_irqrestore(&worker->lock, flags);
 }
 
 int kthread_worker_fn(void *worker_ptr) {
+  unsigned long flags;
   struct kthread_worker *worker = worker_ptr;
   struct kthread_work *work;
 
@@ -206,32 +223,32 @@ int kthread_worker_fn(void *worker_ptr) {
                                  !list_empty(&worker->work_list),
                              msecs_to_jiffies(KPI_SERVICE_IDLE_MS));
 
-    spin_lock(&worker->lock);
+    spin_lock_irqsave(&worker->lock, flags);
     if (worker->should_stop && list_empty(&worker->work_list)) {
       worker->task = NULL;
-      spin_unlock(&worker->lock);
+      spin_unlock_irqrestore(&worker->lock, flags);
       break;
     }
     if (list_empty(&worker->work_list)) {
       /* Idle timeout with nothing queued: retire; the next
        * kthread_queue_work() spawns a replacement. */
       worker->task = NULL;
-      spin_unlock(&worker->lock);
+      spin_unlock_irqrestore(&worker->lock, flags);
       return 0;
     }
     work = list_first_entry(&worker->work_list, struct kthread_work, node);
     list_del_init(&work->node);
     worker->current_work = work;
-    spin_unlock(&worker->lock);
+    spin_unlock_irqrestore(&worker->lock, flags);
 
     work->func(work);
 
     /* Mark it done before the completion so flush_work() cannot observe a
      * completed completion with queued still set. */
-    spin_lock(&worker->lock);
+    spin_lock_irqsave(&worker->lock, flags);
     work->queued = 0;
     worker->current_work = NULL;
-    spin_unlock(&worker->lock);
+    spin_unlock_irqrestore(&worker->lock, flags);
     complete(&work->done);
     wake_up(&worker->wait_idle);
   }
@@ -240,10 +257,11 @@ int kthread_worker_fn(void *worker_ptr) {
 
 bool kthread_queue_work(struct kthread_worker *worker,
                         struct kthread_work *work) {
+  unsigned long flags;
   bool ret = false;
   bool spawn;
 
-  spin_lock(&worker->lock);
+  spin_lock_irqsave(&worker->lock, flags);
   if (!work->queued) {
     work->queued = 1;
     work->worker = worker;
@@ -252,7 +270,7 @@ bool kthread_queue_work(struct kthread_worker *worker,
     ret = true;
   }
   spawn = (worker->task == NULL);
-  spin_unlock(&worker->lock);
+  spin_unlock_irqrestore(&worker->lock, flags);
 
   if (spawn)
     kthread_worker_spawn(worker);
@@ -272,19 +290,20 @@ void kthread_flush_worker(struct kthread_worker *worker) {
 }
 
 bool kthread_cancel_work_sync(struct kthread_work *work) {
+  unsigned long flags;
   struct kthread_worker *worker = work->worker;
   bool canceled = false;
 
   if (!worker)
     return false;
 
-  spin_lock(&worker->lock);
+  spin_lock_irqsave(&worker->lock, flags);
   if (work->queued && !list_empty(&work->node)) {
     list_del_init(&work->node);
     work->queued = 0;
     canceled = true;
   }
-  spin_unlock(&worker->lock);
+  spin_unlock_irqrestore(&worker->lock, flags);
 
   if (!canceled && work->queued)
     wait_for_completion(&work->done);
@@ -339,6 +358,7 @@ struct kthread_worker *kthread_create_worker(unsigned int flags,
 }
 
 void kthread_destroy_worker(struct kthread_worker *worker) {
+  unsigned long flags;
   struct task_struct *task;
 
   if (!worker)
@@ -346,11 +366,11 @@ void kthread_destroy_worker(struct kthread_worker *worker) {
 
   /* Stop first and detach the task so a concurrent queue cannot mistake the
    * retiring worker for a live one. */
-  spin_lock(&worker->lock);
+  spin_lock_irqsave(&worker->lock, flags);
   worker->should_stop = 1;
-  task = worker->task;
+  task = linuxkpi_task_get(worker->task);
   worker->task = NULL;
-  spin_unlock(&worker->lock);
+  spin_unlock_irqrestore(&worker->lock, flags);
 
   if (task)
     kthread_stop(task);

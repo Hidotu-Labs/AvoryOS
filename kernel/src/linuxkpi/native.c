@@ -4,6 +4,9 @@
 #include "hal/hal.h"
 #include "smp/cpu.h"
 #include "lib/tsc.h"
+#include "mm/tlb_shootdown.h"
+
+void linuxkpi_tlb_poll(void) { tlb_shootdown_poll(); }
 
 int linuxkpi_cpu_id(void) {
   struct cpu_info *ci = cpu_get_current();

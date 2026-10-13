@@ -4,6 +4,8 @@
 #include "../drivers/pty.h"
 #include "../font/font.h"
 #include "../fs/vfs.h"
+#include "../fs/fat32.h"
+#include "arch/uaccess.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
 #include "../mm/vmm.h"
@@ -45,6 +47,8 @@ static uint32_t ioctl_node_hash(const char *name) {
 
 static const char *ioctl_request_name(uint32_t request) {
   switch (request) {
+  case 0x82307201: return "VFAT_IOCTL_READDIR_BOTH";
+  case 0x82307202: return "VFAT_IOCTL_READDIR_SHORT";
   case 0x0301: return "HDIO_GETGEO";
   case 0x540B: return "TCFLSH";
   case 0x80086601: return "FS_IOC_GETFLAGS";
@@ -60,6 +64,7 @@ static const char *ioctl_request_name(uint32_t request) {
   case 0x1268: return "BLKSSZGET";
   case 0x1272:
   case 0x80081272: return "BLKGETSIZE64";
+  case 0x8910: return "SIOCGIFNAME";
   case 0x8912: return "SIOCGIFCONF";
   case 0x8915: return "SIOCGIFADDR";
   case 0x8933: return "SIOCGIFINDEX";
@@ -219,10 +224,9 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
   if (arg > USER_ADDR_MAX)
     return (uint64_t)-14;
 
-  if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd]))
+  vfs_node_t *node __attribute__((cleanup(fd_node_put))) = fd_node_get(t, fd);
+  if (!node)
     return (uint64_t)-9;
-
-  vfs_node_t *node = t->fds[fd];
   ioctl_node = node;
 #if IOCTL_DEBUG_LOGGING
     klog_puts("[SYSCALL] ioctl: node name=");
@@ -257,6 +261,21 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
 
   uint64_t ret = 0;
   switch ((uint32_t)request) {
+  case 0x82307201: // VFAT_IOCTL_READDIR_BOTH
+  case 0x82307202: { // VFAT_IOCTL_READDIR_SHORT
+    struct fat32_ioctl_dirent entries[2];
+    if (t->fd_offsets[fd] > UINT32_MAX)
+      return (uint64_t)-22;
+    int result = fat32_read_aliases(node, (uint32_t)t->fd_offsets[fd],
+                                    (uint32_t)request == 0x82307202, entries);
+    if (result < 0)
+      return (uint64_t)result;
+    if (!arg || copy_to_user((void *)arg, entries, sizeof(entries)))
+      return (uint64_t)-14;
+    if (result > 0)
+      t->fd_offsets[fd]++;
+    return (uint64_t)result;
+  }
   case TIOCGWINSZ: {
     struct winsize *ws = (struct winsize *)arg;
     if (!ws || !vmm_is_user_addr_range_valid(arg, sizeof(struct winsize))) {
@@ -408,38 +427,24 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     break;
   }
   case VT_OPENQRY: {
-    int *vt = (int *)arg;
-    if (!vt) {
-      ret = (uint64_t)-14;
-      break;
-    }
-    *vt = 1;
-    ret = 0;
+    int vt = 1;
+    ret = (!arg || copy_to_user((void *)arg, &vt, sizeof(vt)))
+              ? (uint64_t)-14 : 0;
     break;
   }
   case VT_GETMODE: {
-    struct vt_mode *vtm = (struct vt_mode *)arg;
-    if (!vtm) {
-      ret = (uint64_t)-14;
-      break;
-    }
-    memset(vtm, 0, sizeof(struct vt_mode));
-    ret = 0;
+    struct vt_mode vtm = {0};
+    ret = (!arg || copy_to_user((void *)arg, &vtm, sizeof(vtm)))
+              ? (uint64_t)-14 : 0;
     break;
   }
   case VT_SETMODE:
     ret = 0;
     break;
   case VT_GETSTATE: {
-    struct vt_stat *vts = (struct vt_stat *)arg;
-    if (!vts) {
-      ret = (uint64_t)-14;
-      break;
-    }
-    memset(vts, 0, sizeof(struct vt_stat));
-    vts->v_active = 1;
-    vts->v_state = 0x02;
-    ret = 0;
+    struct vt_stat vts = {.v_active = 1, .v_state = 0x02};
+    ret = (!arg || copy_to_user((void *)arg, &vts, sizeof(vts)))
+              ? (uint64_t)-14 : 0;
     break;
   }
   case VT_RELDISP:
@@ -741,7 +746,7 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     break;
   }
 
-  if (ret == (uint64_t)-25)
+  if (ret == (uint64_t)-25 && (uint32_t)request != 0)
     ioctl_log_unhandled(t, fd, (uint32_t)request, arg, ioctl_node,
                         ioctl_handler_called);
 

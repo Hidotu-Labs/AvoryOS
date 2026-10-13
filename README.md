@@ -143,16 +143,10 @@ make run-minimal
 
 ### LinuxKPI & DRM Testing
 
-Test the LinuxKPI layer, DRM subsystem, and PCI devices:
+Run AMDGPU with VFIO and PRIME presentation:
 
 ```bash
-# Canary device validation (bochs-display + edu)
-make run-linuxdrm
-
-# AMDGPU / VFIO PCIe GPU passthrough (work in progress)
-make run-c4    # Headless amdgpu bring-up
-make run-c6    # KMS / DCN display bring-up
-make run-c7    # Experimental Mesa radeonsi 3D session
+make run-c7-prime  # AMD radeonsi rendering displayed in the QEMU window
 ```
 
 ---

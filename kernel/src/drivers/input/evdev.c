@@ -13,6 +13,7 @@
 // EVIOCGBIT, EVIOCGABS).
 
 #include "drivers/input/evdev.h"
+#include "drivers/input/mouse.h"
 #include "../../apic/lapic_timer.h"
 #include "../../console/klog.h"
 #include "../../drivers/timer/rtc.h"
@@ -66,6 +67,8 @@ void evdev_push_event(evdev_device_t *dev, uint16_t type, uint16_t code,
   ev->type = type;
   ev->code = code;
   ev->value = value;
+  if (type == EV_ABS && code <= ABS_Y)
+    dev->abs_value[code] = value;
   dev->head = next;
   spinlock_release_restore(&dev->lock, flags);
 
@@ -323,6 +326,8 @@ static int evdev_vfs_ioctl(struct vfs_node *node, uint32_t request,
       return -14;
     uint32_t len = (request >> 16) & 0x3FFF;
     memset(buf, 0, len);
+    if (dev->type == EVDEV_MOUSE && mouse_has_absolute_axes() && len)
+      set_bit(buf, 0); /* INPUT_PROP_POINTER: absolute desktop pointer */
     return 0;
   }
 
@@ -359,15 +364,17 @@ static int evdev_vfs_ioctl(struct vfs_node *node, uint32_t request,
     struct input_absinfo *abs = (struct input_absinfo *)arg;
     if (!abs) return -14;
     memset(abs, 0, sizeof(struct input_absinfo));
-    // For mouse, we don't really have absolute axes, but let's report something
-    // reasonable if asked for ABS_X/ABS_Y
     uint8_t axis = request & 0x3F;
-    if (axis == ABS_X || axis == ABS_Y) {
+    if (dev->type == EVDEV_MOUSE && mouse_has_absolute_axes() &&
+        (axis == ABS_X || axis == ABS_Y)) {
         abs->minimum = 0;
         abs->maximum = 32767;
-        abs->resolution = 1;
+        spinlock_acquire(&dev->lock);
+        abs->value = dev->abs_value[axis];
+        spinlock_release(&dev->lock);
+        return 0;
     }
-    return 0;
+    return -22;
   }
 
   // EVIOCGREP = 0x80084503, EVIOCSREP = 0x40084503
@@ -413,6 +420,9 @@ static int evdev_vfs_ioctl(struct vfs_node *node, uint32_t request,
         set_bit(buf, EV_KEY);
       if (dev->type == EVDEV_MOUSE && EV_REL / 8 < (int)len)
         set_bit(buf, EV_REL);
+      if (dev->type == EVDEV_MOUSE && mouse_has_absolute_axes() &&
+          EV_ABS / 8 < (int)len)
+        set_bit(buf, EV_ABS);
       if (dev->type == EVDEV_KEYBOARD && EV_LED / 8 < (int)len)
         set_bit(buf, EV_LED);
       return 0;
@@ -438,9 +448,9 @@ static int evdev_vfs_ioctl(struct vfs_node *node, uint32_t request,
 
     if (ev_type == EV_REL) {
       if (dev->type == EVDEV_MOUSE) {
-        if (REL_X / 8 < (int)len)
+        if (!mouse_has_absolute_axes() && REL_X / 8 < (int)len)
           set_bit(buf, REL_X);
-        if (REL_Y / 8 < (int)len)
+        if (!mouse_has_absolute_axes() && REL_Y / 8 < (int)len)
           set_bit(buf, REL_Y);
         if (REL_WHEEL / 8 < (int)len)
           set_bit(buf, REL_WHEEL);
@@ -451,9 +461,9 @@ static int evdev_vfs_ioctl(struct vfs_node *node, uint32_t request,
     }
 
     if (ev_type == EV_ABS) {
-      if (dev->type == EVDEV_MOUSE) {
-        set_bit(buf, ABS_X);
-        set_bit(buf, ABS_Y);
+      if (dev->type == EVDEV_MOUSE && mouse_has_absolute_axes()) {
+        if (ABS_X / 8 < (int)len) set_bit(buf, ABS_X);
+        if (ABS_Y / 8 < (int)len) set_bit(buf, ABS_Y);
       }
       return 0;
     }
@@ -471,31 +481,6 @@ static int evdev_vfs_ioctl(struct vfs_node *node, uint32_t request,
     }
 
     // Other event types: return zero-filled
-    return 0;
-  }
-
-  // EVIOCGABS(axis) = 0x8018_4540 | axis
-  if ((request & 0xC0FFFF00) == 0x80184500 && ((request & 0xFF) >= 0x40)) {
-    uint32_t abs_axis = (request & 0xFF) - 0x40;
-    struct input_absinfo *abs = (struct input_absinfo *)arg;
-    if (!abs)
-      return -14;
-
-    memset(abs, 0, sizeof(*abs));
-    if (dev->type == EVDEV_MOUSE) {
-      if (abs_axis == ABS_X) {
-        abs->minimum = 0;
-        abs->maximum = (int32_t)fb_get_width() - 1;
-        abs->value = 0;
-        return 0;
-      }
-      if (abs_axis == ABS_Y) {
-        abs->minimum = 0;
-        abs->maximum = (int32_t)fb_get_height() - 1;
-        abs->value = 0;
-        return 0;
-      }
-    }
     return 0;
   }
 

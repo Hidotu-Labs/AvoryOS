@@ -1,4 +1,5 @@
 #include "syscall.h"
+#include "../apic/lapic_timer.h"
 #include "sysdiag.h"
 #include "../console/klog.h"
 #include "../cpu/ktrack.h"
@@ -465,6 +466,11 @@ static inline void record_syscall_error(struct thread *t, uint64_t syscall_num, 
 
 void syscall_dispatcher(struct syscall_regs *regs) {
   struct thread *t = sched_get_current();
+  /* Foreign syscall numbers and argument ABIs must be intercepted before
+   * looking up Linux handlers or recording missing Linux syscalls. */
+  if (t && t->syscall_dispatch_enabled &&
+      syscall_user_dispatch_intercept(t, regs))
+    return;
   if (t) {
     __atomic_store_n(&t->in_syscall, true, __ATOMIC_RELAXED);
     t->last_syscall_num = regs->rax;
@@ -474,6 +480,10 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     t->last_syscall_args[3] = regs->r10;
     t->last_syscall_args[4] = regs->r8;
     t->last_syscall_args[5] = regs->r9;
+    t->last_syscall_user_rip = regs->rip;
+    t->last_syscall_user_rsp = regs->rsp;
+    if (regs->rax == 0 || regs->rax == 1 || regs->rax == 17 || regs->rax == 18)
+      t->last_io_started_ms = lapic_timer_get_ticks();
     t->last_subsystem = KSUBSYS_SYSCALL;
     t->last_kernel_file = "syscall.c";
     t->last_kernel_line = __LINE__;
@@ -481,6 +491,7 @@ void syscall_dispatcher(struct syscall_regs *regs) {
   }
 
   uint64_t syscall_num = regs->rax;
+  uint64_t syscall_return_ip = regs->rip;
 
   if (regs->rax >= MAX_SYSCALL) {
     log_unimplemented_syscall(regs, t);
@@ -513,8 +524,13 @@ void syscall_dispatcher(struct syscall_regs *regs) {
       }
       rseq_update_cpu_id(t);
       rseq_maybe_abort(t, &regs->rip);
-      __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
+    if (syscall_restart_error(regs->rax) ||
+        (t && (t->pending_signals & ~t->signal_mask)))
+      signal_finish_syscall(regs, syscall_num == SYS_RT_SIGRETURN ? UINT64_MAX : syscall_num,
+                             syscall_return_ip);
+    if (t)
+      __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     return;
   }
 
@@ -567,8 +583,10 @@ void syscall_dispatcher(struct syscall_regs *regs) {
 
   /* Signal frame conversion copies the complete register set. Keep it off the
    * syscall hot path unless this thread can actually deliver a signal. */
-  if (t && (t->pending_signals & ~t->signal_mask))
-    signal_deliver_syscall(regs);
+  if (syscall_restart_error(regs->rax) ||
+      (t && (t->pending_signals & ~t->signal_mask)))
+    signal_finish_syscall(regs, syscall_num == SYS_RT_SIGRETURN ? UINT64_MAX : syscall_num,
+                           syscall_return_ip);
   if (t)
     __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
 }

@@ -4,6 +4,7 @@
 #include "drivers/storage/block.h"
 #include "fs/vfs.h"
 #include "lock/spinlock.h"
+#include "sched/wait.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -144,6 +145,14 @@ typedef struct {
   uint32_t journal_blocks;
   uint32_t blocks_in_trans;
   rawspinlock_t lock;
+  wait_queue_t waiters;
+  struct storage_latency perf_wait, perf_hold;
+  uint64_t started_ms;
+  uint64_t owner_ip;
+  uint64_t metadata_submitted;
+  uint64_t metadata_unchanged;
+  char owner_comm[16];
+  const char *phase;
 } ext3_journal_state_t;
 
 #define EXT2_CACHE_SIZE 2048

@@ -1,4 +1,5 @@
 #include "drm.h"
+#include <linuxkpi/native_prime.h>
 #include "drivers/gpu/virtio_gpu/virtio_gpu.h"
 #include "../../../apic/lapic_timer.h"
 #include "../../../console/klog.h"
@@ -121,8 +122,6 @@ extern void ascentdrm_file_gem_release(struct drm_file *file, uint32_t handle);
 extern void ascentdrm_file_send_event(struct drm_file *file,
                                 struct drm_event_vblank *ev,
                                 struct vfs_node *node);
-extern int ascentdrm_prime_export(struct drm_gem_object *obj);
-extern struct drm_gem_object *ascentdrm_prime_import(int prime_fd);
 
 /* drm_fb.c */
 extern int ascentdrm_ioctl_addfb2(struct drm_file *file, struct drm_device *dev,
@@ -1010,22 +1009,78 @@ static void drm_commit_damage(struct drm_device *dev,
   spinlock_release(&dev->lock);
 }
 
-static void drm_sync_cursor_backend(struct drm_device *dev, uint32_t flags) {
-  if (!g_ascent_drm_cursor_fn || !dev) return;
-  uint32_t crtc_id=0,width=0,height=0,pitch=0;int32_t x=0,y=0,hot_x=0,hot_y=0;
-  struct drm_gem_object *gem=NULL;
+static void drm_sync_cursor_backend(struct drm_device *dev, uint32_t flags,
+                                    uint32_t target_crtc) {
+  if (!g_ascent_drm_cursor_fn || !dev)
+    return;
+  struct cursor_state {
+    uint32_t crtc_id, width, height, pitch;
+    int32_t x, y, hot_x, hot_y;
+    struct drm_gem_object *gem;
+  } states[VIRTIO_GPU_MAX_SCANOUTS] = {0};
+  uint32_t count = 0;
   spinlock_acquire(&dev->lock);
   struct drm_mode_object *obj;
   list_for_each_entry(obj, &dev->kms_objects, list) {
-    if (obj->type != DRM_MODE_OBJECT_CRTC) continue;
-    struct drm_crtc *crtc=(struct drm_crtc *)obj;struct drm_plane *cursor=crtc->cursor;
-    crtc_id=crtc->base.id;
-    if(cursor){x=cursor->crtc_x;y=cursor->crtc_y;hot_x=cursor->hotspot_x;hot_y=cursor->hotspot_y;
-      width=cursor->crtc_w;height=cursor->crtc_h;if(cursor->fb){gem=cursor->fb->gem_obj;pitch=cursor->fb->pitch;if(!width)width=cursor->fb->width;if(!height)height=cursor->fb->height;}}
-    break;
+    if (obj->type != DRM_MODE_OBJECT_CRTC ||
+        (target_crtc && obj->id != target_crtc))
+      continue;
+    if (count == VIRTIO_GPU_MAX_SCANOUTS)
+      break;
+    struct drm_crtc *crtc = (struct drm_crtc *)obj;
+    struct drm_plane *cursor = crtc->cursor;
+    struct cursor_state *state = &states[count++];
+    state->crtc_id = obj->id;
+    if (!cursor)
+      continue;
+    state->x = cursor->crtc_x;
+    state->y = cursor->crtc_y;
+    state->hot_x = cursor->hotspot_x;
+    state->hot_y = cursor->hotspot_y;
+    state->width = cursor->crtc_w;
+    state->height = cursor->crtc_h;
+    if (cursor->fb) {
+      state->gem = cursor->fb->gem_obj;
+      state->pitch = cursor->fb->pitch;
+      if (!state->width) state->width = cursor->fb->width;
+      if (!state->height) state->height = cursor->fb->height;
+      if (state->gem) ascentdrm_gem_get(state->gem);
+    }
   }
   spinlock_release(&dev->lock);
-  if(crtc_id)g_ascent_drm_cursor_fn(crtc_id,gem,width,height,pitch,x,y,hot_x,hot_y,flags);
+  for (uint32_t i = 0; i < count; i++) {
+    struct cursor_state *state = &states[i];
+    g_ascent_drm_cursor_fn(state->crtc_id, state->gem, state->width,
+                          state->height, state->pitch, state->x, state->y,
+                          state->hot_x, state->hot_y, flags);
+    if (state->gem && ascentdrm_gem_put_last(state->gem))
+      ascentdrm_gem_object_free(state->gem->dev, state->gem);
+  }
+}
+
+void ascentdrm_cursor_reset(struct drm_device *dev) {
+  struct drm_framebuffer *old[VIRTIO_GPU_MAX_SCANOUTS] = {0};
+  uint32_t count = 0;
+  spinlock_acquire(&dev->lock);
+  struct drm_mode_object *obj;
+  list_for_each_entry(obj, &dev->kms_objects, list) {
+    if (obj->type != DRM_MODE_OBJECT_CRTC)
+      continue;
+    struct drm_crtc *crtc = (struct drm_crtc *)obj;
+    if (crtc->cursor) crtc->cursor->fb = NULL;
+    if (crtc->legacy_cursor_fb && count < VIRTIO_GPU_MAX_SCANOUTS) {
+      old[count++] = crtc->legacy_cursor_fb;
+      crtc->legacy_cursor_fb = NULL;
+    }
+  }
+  spinlock_release(&dev->lock);
+  drm_sync_cursor_backend(dev, DRM_MODE_CURSOR_BO, 0);
+  for (uint32_t i = 0; i < count; i++) {
+    struct drm_gem_object *gem = old[i]->gem_obj;
+    if (gem && ascentdrm_gem_put_last(gem))
+      ascentdrm_gem_object_free(gem->dev, gem);
+    kfree(old[i]);
+  }
 }
 
 static void drm_commit_cursor_damage(struct drm_device *dev,
@@ -1052,6 +1107,94 @@ static void drm_commit_cursor_damage(struct drm_device *dev,
 
   if (count)
     drm_commit_damage(dev, clips, count, 0);
+}
+
+int ascentdrm_ioctl_legacy_cursor(struct drm_file *file, struct drm_device *dev,
+                             const struct drm_mode_cursor2 *cur) {
+  uint32_t flags = cur->flags;
+  struct drm_framebuffer *new_fb = NULL, *old_fb = NULL;
+  struct drm_clip_rect old_damage = {0}, new_damage = {0};
+  bool have_old_damage, have_new_damage;
+  int ret = 0;
+
+  if (!flags || (flags & ~(DRM_MODE_CURSOR_BO | DRM_MODE_CURSOR_MOVE)))
+    return -22;
+  /* The fallback console blitter can compose cursors itself. An external
+   * scanout backend must explicitly provide cursor support: accepting an
+   * invisible cursor prevents Xorg from falling back to software rendering. */
+  if (g_ascent_drm_commit_damage_fn && !g_ascent_drm_cursor_fn)
+    return -6; /* ENXIO: no hardware cursor */
+  if ((flags & DRM_MODE_CURSOR_BO) && cur->handle) {
+    if (!cur->width || !cur->height || cur->width > 64 || cur->height > 64 ||
+        cur->hot_x < 0 || cur->hot_y < 0 ||
+        (uint32_t)cur->hot_x >= cur->width || (uint32_t)cur->hot_y >= cur->height)
+      return -22;
+    struct drm_gem_object *gem = ascentdrm_file_gem_lookup_get(file, cur->handle);
+    if (!gem)
+      return -2;
+    if (!gem->virt_addr || (uint64_t)cur->width * cur->height * 4 > gem->size) {
+      ret = -22;
+    } else {
+      new_fb = kcalloc(1, sizeof(*new_fb));
+      if (!new_fb) ret = -12;
+    }
+    if (ret) {
+      if (ascentdrm_gem_put_last(gem)) ascentdrm_gem_object_free(gem->dev, gem);
+      return ret;
+    }
+    new_fb->width = cur->width;
+    new_fb->height = cur->height;
+    new_fb->pitch = cur->width * 4;
+    new_fb->bpp = 32;
+    new_fb->pixel_format = 0x34325241; /* ARGB8888 */
+    new_fb->gem_obj = gem; /* retain the reference until replace/hide */
+  }
+
+  spinlock_acquire(&dev->lock);
+  struct drm_mode_object *obj = drm_mode_object_find(dev, cur->crtc_id);
+  if (!obj || obj->type != DRM_MODE_OBJECT_CRTC) {
+    ret = -2;
+    goto unlock;
+  }
+  struct drm_crtc *crtc = (struct drm_crtc *)obj;
+  struct drm_plane *cursor = crtc->cursor;
+  if (!cursor) {
+    ret = -6;
+    goto unlock;
+  }
+  have_old_damage = drm_cursor_damage_rect(cursor, &old_damage);
+  if (flags & DRM_MODE_CURSOR_MOVE) {
+    cursor->crtc_x = cur->x;
+    cursor->crtc_y = cur->y;
+  }
+  if (flags & DRM_MODE_CURSOR_BO) {
+    old_fb = crtc->legacy_cursor_fb;
+    crtc->legacy_cursor_fb = new_fb;
+    cursor->fb = new_fb;
+    cursor->crtc_w = new_fb ? new_fb->width : 0;
+    cursor->crtc_h = new_fb ? new_fb->height : 0;
+    cursor->src_x = cursor->src_y = 0;
+    cursor->src_w = cursor->crtc_w << 16;
+    cursor->src_h = cursor->crtc_h << 16;
+    cursor->hotspot_x = cur->hot_x;
+    cursor->hotspot_y = cur->hot_y;
+  }
+  have_new_damage = drm_cursor_damage_rect(cursor, &new_damage);
+unlock:
+  spinlock_release(&dev->lock);
+  if (!ret) {
+    drm_sync_cursor_backend(dev, flags, cur->crtc_id);
+    drm_commit_cursor_damage(dev, &old_damage, have_old_damage,
+                             &new_damage, have_new_damage);
+  } else {
+    old_fb = new_fb;
+  }
+  if (old_fb) {
+    struct drm_gem_object *gem = old_fb->gem_obj;
+    if (ascentdrm_gem_put_last(gem)) ascentdrm_gem_object_free(gem->dev, gem);
+    kfree(old_fb);
+  }
+  return ret;
 }
 
 static void drm_commit_heads(struct drm_device *dev,const struct drm_clip_rect *clips,uint32_t count){uint32_t ids[16],n=0;spinlock_acquire(&dev->lock);struct drm_mode_object *o;list_for_each_entry(o,&dev->kms_objects,list)if(o->type==DRM_MODE_OBJECT_CRTC&&((struct drm_crtc*)o)->fb&&n<16)ids[n++]=o->id;spinlock_release(&dev->lock);for(uint32_t i=0;i<n;i++)drm_commit_damage(dev,clips,count,ids[i]);}
@@ -1296,18 +1439,25 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   case DRM_IOCTL_GET_UNIQUE: {
     klog_debug_puts("[DRM] GET_UNIQUE ioctl\n");
     struct drm_unique *u = (struct drm_unique *)arg;
-    static const char busid[] = "platform:ascentdrm:0";
+    char busid[32];
+    const struct pci_device *pci = virtio_gpu_pci_device();
+    if (pci)
+      snprintf(busid, sizeof(busid), "pci:0000:%02x:%02x.%u",
+               pci->bus, pci->slot, pci->func);
+    else
+      strcpy(busid, "platform:ascentdrm:0");
+    size_t busid_len = strlen(busid);
     size_t unique_len = u->unique_len;
 
     if (u->unique && unique_len > 0) {
       size_t copy =
-          (sizeof(busid) - 1 < unique_len) ? sizeof(busid) - 1 : unique_len;
+          (busid_len < unique_len) ? busid_len : unique_len;
       memcpy(u->unique, busid, copy);
       if (copy < unique_len)
         u->unique[copy] = '\0';
     }
 
-    u->unique_len = sizeof(busid) - 1;
+    u->unique_len = busid_len;
     return 0;
   }
   case DRM_IOCTL_SET_VERSION: {
@@ -1336,7 +1486,11 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       cap->value = 0;
       break;
     case DRM_CAP_PRIME:
+#ifdef LINUXKPI_LINUX_IMPORTED
       cap->value = 3;
+#else
+      cap->value = 0;
+#endif
       break; /* (IMPORT | EXPORT) */
     case DRM_CAP_TIMESTAMP_MONOTONIC:
       cap->value = 1;
@@ -1535,7 +1689,9 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     struct drm_gem_object *obj = ascentdrm_file_gem_lookup(file, m->handle);
     if (!obj)
       return -2; /* ENOENT */
-    m->offset = obj->phys_addr | 0x1000000000000000ULL;
+    m->offset = obj->prime_buffer
+        ? 0x2000000000000000ULL | ((uint64_t)obj->handle << 32)
+        : obj->phys_addr | 0x1000000000000000ULL;
     return 0;
   }
   case DRM_IOCTL_MODE_DESTROY_DUMB: {
@@ -2040,7 +2196,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
 #if DRM_DEBUG_LOGGING
       klog_debug_puts("[DRM] ATOMIC commit triggering drm_commit\n");
 #endif
-      drm_sync_cursor_backend(dev, 0);
+      drm_sync_cursor_backend(dev, 0, 0);
       drm_console_takeover();
       drm_commit_atomic(dev);
     }
@@ -2077,28 +2233,25 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   /* ── GEM PRIME / DMA-buf ─────────────────────────────────────────── */
   case DRM_IOCTL_PRIME_HANDLE_TO_FD: {
     struct drm_prime_handle *p = (struct drm_prime_handle *)arg;
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(*p)))
+      return -14;
     struct drm_gem_object *obj = ascentdrm_file_gem_lookup_get(file, p->handle);
     if (!obj)
       return -2; /* ENOENT */
-    int prime_fd = ascentdrm_prime_export(obj);
+    int prime_fd = ascentdrm_prime_export(obj, p->flags);
     /* Drop the lookup reference; the exported fd holds its own. */
     if (ascentdrm_gem_put_last(obj))
       ascentdrm_gem_object_free(dev, obj);
     if (prime_fd < 0)
-      return -1; /* generic error for now */
+      return prime_fd;
     p->fd = prime_fd;
     return 0;
   }
   case DRM_IOCTL_PRIME_FD_TO_HANDLE: {
     struct drm_prime_handle *p = (struct drm_prime_handle *)arg;
-    struct drm_gem_object *obj = ascentdrm_prime_import(p->fd);
-    if (!obj)
-      return -2; /* ENOENT */
-    uint32_t local_h = ascentdrm_file_gem_register(file, obj);
-    if (!local_h)
-      return -12; /* ENOMEM */
-    p->handle = local_h;
-    return 0;
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(*p)))
+      return -14;
+    return ascentdrm_prime_import(file, p->fd, &p->handle);
   }
 
   case DRM_IOCTL_WAIT_VBLANK: {
@@ -2221,187 +2374,15 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
 
   case DRM_IOCTL_MODE_CURSOR: {
     struct drm_mode_cursor *cur = (struct drm_mode_cursor *)arg;
-
-#if DRM_DEBUG_LOGGING
-    klog_debug_puts("[DRM] MODE_CURSOR flags=0x");
-    klog_debug_hex32(cur->flags);
-    klog_debug_puts(" handle=");
-    klog_debug_uint64(cur->handle);
-    klog_debug_puts(" x=");
-    klog_debug_uint64((uint32_t)cur->x);
-    klog_debug_puts(" y=");
-    klog_debug_uint64((uint32_t)cur->y);
-    klog_debug_puts(" w=");
-    klog_debug_uint64(cur->width);
-    klog_debug_puts(" h=");
-    klog_debug_uint64(cur->height);
-    klog_debug_puts("\n");
-#endif
-
-    struct drm_clip_rect old_damage = {0}, new_damage = {0};
-    bool have_old_damage = false, have_new_damage = false;
-    spinlock_acquire(&dev->lock);
-
-    struct drm_mode_object *obj;
-    list_for_each_entry(obj, &dev->kms_objects, list) {
-      if (obj->type != DRM_MODE_OBJECT_CRTC)
-        continue;
-
-      struct drm_crtc *crtc = (struct drm_crtc *)obj;
-      struct drm_plane *cursor = crtc->cursor;
-
-      if (!cursor)
-        continue;
-
-      have_old_damage = drm_cursor_damage_rect(cursor, &old_damage);
-      uint32_t flags =
-          cur->flags ? cur->flags : (DRM_MODE_CURSOR_BO | DRM_MODE_CURSOR_MOVE);
-
-      if (flags & DRM_MODE_CURSOR_MOVE) {
-        cursor->crtc_x = cur->x;
-        cursor->crtc_y = cur->y;
-      }
-
-      if (flags & DRM_MODE_CURSOR_BO) {
-        if (cur->width)
-          cursor->crtc_w = cur->width;
-        if (cur->height)
-          cursor->crtc_h = cur->height;
-        cursor->src_x = 0;
-        cursor->src_y = 0;
-        cursor->src_w = cursor->crtc_w << 16;
-        cursor->src_h = cursor->crtc_h << 16;
-        cursor->hotspot_x = 0;
-        cursor->hotspot_y = 0;
-
-        if (cur->handle == 0) {
-          cursor->fb = NULL;
-          break;
-        }
-
-        struct drm_gem_object *gem = ascentdrm_file_gem_lookup(file, cur->handle);
-        if (!gem) {
-          spinlock_release(&dev->lock);
-          klog_debug_puts("[DRM] MODE_CURSOR invalid GEM handle\n");
-          return -2; /* ENOENT */
-        }
-
-        static struct drm_framebuffer legacy_cursor_fb;
-        memset(&legacy_cursor_fb, 0, sizeof(legacy_cursor_fb));
-
-        legacy_cursor_fb.width = cur->width ? cur->width : 64;
-        legacy_cursor_fb.height = cur->height ? cur->height : 64;
-        legacy_cursor_fb.pitch = legacy_cursor_fb.width * 4;
-        legacy_cursor_fb.bpp = 32;
-        legacy_cursor_fb.gem_obj = gem;
-
-        cursor->fb = &legacy_cursor_fb;
-      }
-      have_new_damage = drm_cursor_damage_rect(cursor, &new_damage);
-      break;
-    }
-
-    spinlock_release(&dev->lock);
-    drm_sync_cursor_backend(dev, cur->flags ? cur->flags :
-                            (DRM_MODE_CURSOR_BO | DRM_MODE_CURSOR_MOVE));
-    drm_commit_cursor_damage(dev, &old_damage, have_old_damage,
-                             &new_damage, have_new_damage);
-    return 0;
+    struct drm_mode_cursor2 cur2 = {
+        .flags = cur->flags, .crtc_id = cur->crtc_id,
+        .x = cur->x, .y = cur->y, .width = cur->width,
+        .height = cur->height, .handle = cur->handle,
+    };
+    return ascentdrm_ioctl_legacy_cursor(file, dev, &cur2);
   }
-
-  case DRM_IOCTL_MODE_CURSOR2: {
-    struct drm_mode_cursor2 *cur = (struct drm_mode_cursor2 *)arg;
-
-#if DRM_DEBUG_LOGGING
-    klog_debug_puts("[DRM] MODE_CURSOR2 flags=0x");
-    klog_debug_hex32(cur->flags);
-    klog_debug_puts(" handle=");
-    klog_debug_uint64(cur->handle);
-    klog_debug_puts(" x=");
-    klog_debug_uint64((uint32_t)cur->x);
-    klog_debug_puts(" y=");
-    klog_debug_uint64((uint32_t)cur->y);
-    klog_debug_puts(" w=");
-    klog_debug_uint64(cur->width);
-    klog_debug_puts(" h=");
-    klog_debug_uint64(cur->height);
-    klog_debug_puts(" hot=");
-    klog_debug_uint64((uint32_t)cur->hot_x);
-    klog_debug_puts(",");
-    klog_debug_uint64((uint32_t)cur->hot_y);
-    klog_debug_puts("\n");
-#endif
-
-    struct drm_clip_rect old_damage = {0}, new_damage = {0};
-    bool have_old_damage = false, have_new_damage = false;
-    spinlock_acquire(&dev->lock);
-
-    struct drm_mode_object *obj;
-    list_for_each_entry(obj, &dev->kms_objects, list) {
-      if (obj->type != DRM_MODE_OBJECT_CRTC)
-        continue;
-
-      struct drm_crtc *crtc = (struct drm_crtc *)obj;
-      struct drm_plane *cursor = crtc->cursor;
-
-      if (!cursor)
-        continue;
-
-      have_old_damage = drm_cursor_damage_rect(cursor, &old_damage);
-      uint32_t flags =
-          cur->flags ? cur->flags : (DRM_MODE_CURSOR_BO | DRM_MODE_CURSOR_MOVE);
-
-      if (flags & DRM_MODE_CURSOR_MOVE) {
-        cursor->crtc_x = cur->x;
-        cursor->crtc_y = cur->y;
-      }
-
-      if (flags & DRM_MODE_CURSOR_BO) {
-        if (cur->width)
-          cursor->crtc_w = cur->width;
-        if (cur->height)
-          cursor->crtc_h = cur->height;
-        cursor->src_x = 0;
-        cursor->src_y = 0;
-        cursor->src_w = cursor->crtc_w << 16;
-        cursor->src_h = cursor->crtc_h << 16;
-        cursor->hotspot_x = cur->hot_x;
-        cursor->hotspot_y = cur->hot_y;
-
-        if (cur->handle == 0) {
-          cursor->fb = NULL;
-          break;
-        }
-
-        struct drm_gem_object *gem = ascentdrm_file_gem_lookup(file, cur->handle);
-        if (!gem) {
-          spinlock_release(&dev->lock);
-          klog_debug_puts("[DRM] MODE_CURSOR2 invalid GEM handle\n");
-          return -2; /* ENOENT */
-        }
-
-        static struct drm_framebuffer legacy_cursor2_fb;
-        memset(&legacy_cursor2_fb, 0, sizeof(legacy_cursor2_fb));
-
-        legacy_cursor2_fb.width = cur->width ? cur->width : 64;
-        legacy_cursor2_fb.height = cur->height ? cur->height : 64;
-        legacy_cursor2_fb.pitch = legacy_cursor2_fb.width * 4;
-        legacy_cursor2_fb.bpp = 32;
-        legacy_cursor2_fb.gem_obj = gem;
-
-        cursor->fb = &legacy_cursor2_fb;
-      }
-      have_new_damage = drm_cursor_damage_rect(cursor, &new_damage);
-      break;
-    }
-
-    spinlock_release(&dev->lock);
-    drm_sync_cursor_backend(dev, cur->flags ? cur->flags :
-                            (DRM_MODE_CURSOR_BO | DRM_MODE_CURSOR_MOVE));
-    drm_commit_cursor_damage(dev, &old_damage, have_old_damage,
-                             &new_damage, have_new_damage);
-    return 0;
-  }
+  case DRM_IOCTL_MODE_CURSOR2:
+    return ascentdrm_ioctl_legacy_cursor(file, dev, (struct drm_mode_cursor2 *)arg);
 
   case DRM_IOCTL_MODE_GETGAMMA:
   case DRM_IOCTL_MODE_SETGAMMA:
@@ -2424,6 +2405,31 @@ static uint64_t drm_vfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
   struct drm_file *file = node_to_file(node);
   if (!file || length == 0)
     return (uint64_t)-1;
+  if (offset & 0x2000000000000000ULL) {
+#ifdef LINUXKPI_LINUX_IMPORTED
+    uint32_t global_handle = (uint32_t)((offset & ~0x2000000000000000ULL) >> 32);
+    struct drm_gem_object *obj = NULL;
+    spinlock_acquire(&file->lock);
+    for (uint32_t i = 1; i < DRM_MAX_HANDLES_PER_FILE; i++) {
+      if (file->handles[i] && file->handles[i]->prime_buffer &&
+          file->handles[i]->handle == global_handle) {
+        obj = file->handles[i];
+        ascentdrm_gem_get(obj);
+        break;
+      }
+    }
+    spinlock_release(&file->lock);
+    if (!obj)
+      return (uint64_t)-1;
+    uint64_t result = linuxkpi_prime_mmap(obj->prime_buffer, addr, length,
+                                         prot, flags, (uint32_t)offset);
+    if (ascentdrm_gem_put_last(obj))
+      ascentdrm_gem_object_free(obj->dev, obj);
+    return result;
+#else
+    return (uint64_t)-1;
+#endif
+  }
   if ((offset & 0x1000000000000000ULL) == 0)
     return (uint64_t)-1;
   uint64_t phys = offset & ~0x1000000000000000ULL;
@@ -2509,9 +2515,19 @@ static uint32_t drm_read(struct vfs_node *node, uint32_t offset,
   if (!file)
     return 0;
 
+  if (!length)
+    return 0;
   spinlock_acquire(&file->lock);
   while (list_empty(&file->event_queue)) {
+    if (node->flags & FS_NONBLOCK) {
+      spinlock_release(&file->lock);
+      return (uint32_t)-11; /* EAGAIN, not EOF or a blocking wait */
+    }
     struct thread *current = sched_get_current();
+    if (current && thread_has_pending_signal(current)) {
+      spinlock_release(&file->lock);
+      return (uint32_t)-4; /* EINTR */
+    }
     wait_queue_entry_t entry = {.thread = current, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
     if (current)
       current->state = THREAD_BLOCKED;
@@ -2561,21 +2577,21 @@ static vfs_node_t drm_card_metadata_node;
 static vfs_node_t *drm_open_instance(vfs_node_t *metadata);
 
 static struct dirent *drm_dri_readdir(vfs_node_t *dir, uint32_t index) {
-  static struct dirent entry;
+  struct dirent *entry = vfs_readdir_buffer();
 
-  memset(&entry, 0, sizeof(entry));
+  memset(entry, 0, sizeof(*entry));
   if (index == 0) {
-    strcpy(entry.name, ".");
-    entry.ino = dir->inode;
-    entry.d_type = DT_DIR;
+    strcpy(entry->name, ".");
+    entry->ino = dir->inode;
+    entry->d_type = DT_DIR;
   } else if (index == 1) {
-    strcpy(entry.name, "..");
-    entry.ino = dir->inode;
-    entry.d_type = DT_DIR;
+    strcpy(entry->name, "..");
+    entry->ino = dir->inode;
+    entry->d_type = DT_DIR;
   } else if (index == 2) {
-    strcpy(entry.name, "card0");
-    entry.ino = (226U << 8) | 0U;
-    entry.d_type = DT_CHR;
+    strcpy(entry->name, "card0");
+    entry->ino = (226U << 8) | 0U;
+    entry->d_type = DT_CHR;
   } else {
     /* Minors registered by the imported DRM core (dri/card1,
      * dri/renderD128, ...) live in the LinuxKPI dynamic devnode registry. */
@@ -2583,13 +2599,13 @@ static struct dirent *drm_dri_readdir(vfs_node_t *dir, uint32_t index) {
     const char *name = asc_vfs_devnode_name_at("dri", index - 3, &rdev);
     if (!name)
       return NULL;
-    strncpy(entry.name, name, sizeof(entry.name) - 1);
-    entry.name[sizeof(entry.name) - 1] = '\0';
-    entry.ino = rdev;
-    entry.d_type = DT_CHR;
+    strncpy(entry->name, name, sizeof(entry->name) - 1);
+    entry->name[sizeof(entry->name) - 1] = '\0';
+    entry->ino = rdev;
+    entry->d_type = DT_CHR;
   }
 
-  return &entry;
+  return entry;
 }
 
 static vfs_node_t *drm_dri_finddir(vfs_node_t *dir, char *name) {

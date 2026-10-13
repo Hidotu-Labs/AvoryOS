@@ -5,6 +5,7 @@ global copy_to_user
 global clear_user
 global strncpy_from_user
 global strnlen_user
+global cmpxchg_user_u32
 
 extern cpu_has_smap_flag
 
@@ -25,6 +26,29 @@ section .text
 %macro USER_ACCESS_END 0
     popfq
 %endmacro
+
+; Atomic robust-futex update, including an SMAP window and fault fixup.
+; rdi=user word, rsi=kernel expected word, edx=desired word.
+cmpxchg_user_u32:
+    USER_ACCESS_BEGIN
+    mov rax, rdi
+    add rax, 4
+    jc cxu_fault
+    mov r8, 0x800000000000
+    cmp rax, r8
+    ja cxu_fault
+    mov eax, [rsi]
+cxu_atomic_insn:
+    lock cmpxchg [rdi], edx
+    sete cl
+    mov [rsi], eax
+    movzx eax, cl
+    USER_ACCESS_END
+    ret
+cxu_fault:
+    mov eax, -14
+    USER_ACCESS_END
+    ret
 
 ; -----------------------------------------------------------------------------
 ; unsigned long copy_from_user(void *to, const void *from, unsigned long n)
@@ -359,6 +383,7 @@ sl_fixup_landing:
 ; Exception Fixup Table
 ; -----------------------------------------------------------------------------
 section __ex_table progbits alloc noexec nowrite
+    dq cxu_atomic_insn, cxu_fault
     dq cfu_copy_insn, cfu_fixup_landing
     dq ctu_copy_insn, ctu_fixup_landing
     dq cu_clear_insn, cu_fixup_landing

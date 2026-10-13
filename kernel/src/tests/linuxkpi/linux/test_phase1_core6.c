@@ -30,6 +30,8 @@
 
 static struct ww_class ww_cls;
 static DEFINE_WW_MUTEX(ww_lock, &ww_cls);
+#define WW_TEST_THREADS 8
+#define WW_TEST_LOOPS 300
 
 struct ww_test {
   volatile int counter;
@@ -41,7 +43,7 @@ static int ww_thread(void *arg) {
   struct ww_acquire_ctx ctx;
 
   ww_acquire_init(&ctx, &ww_cls);
-  for (int i = 0; i < 300; i++) {
+  for (int i = 0; i < WW_TEST_LOOPS; i++) {
     ww_mutex_lock(&ww_lock, &ctx);
     t->counter++;
     ww_mutex_unlock(&ww_lock);
@@ -58,23 +60,56 @@ static bool test_ww_mutex(void) {
   t.counter = 0;
   t.done = 0;
 
-  struct task_struct *a = kthread_run(ww_thread, &t, "kpi/ww1");
-  struct task_struct *b = kthread_run(ww_thread, &t, "kpi/ww2");
-  if (IS_ERR(a) || IS_ERR(b))
-    return false;
+  struct task_struct *workers[WW_TEST_THREADS];
+  for (int i = 0; i < WW_TEST_THREADS; i++) {
+    workers[i] = kthread_run(ww_thread, &t, "kpi/ww");
+    if (IS_ERR(workers[i])) {
+      for (int j = 0; j < i; j++)
+        kthread_stop(workers[j]);
+      return false;
+    }
+  }
 
   unsigned long deadline = jiffies + msecs_to_jiffies(5000);
-  while (__atomic_load_n(&t.done, __ATOMIC_ACQUIRE) < 2 &&
+  while (__atomic_load_n(&t.done, __ATOMIC_ACQUIRE) < WW_TEST_THREADS &&
          time_before(jiffies, deadline))
     msleep(1);
 
-  bool ok = __atomic_load_n(&t.done, __ATOMIC_ACQUIRE) == 2 && t.counter == 600;
-  kthread_stop(a);
-  kthread_stop(b);
+  bool ok = __atomic_load_n(&t.done, __ATOMIC_ACQUIRE) == WW_TEST_THREADS &&
+            t.counter == WW_TEST_THREADS * WW_TEST_LOOPS;
+  for (int i = 0; i < WW_TEST_THREADS; i++)
+    kthread_stop(workers[i]);
   return ok;
 }
 
 /* ── ww_mutex: multi-lock ordered acquisition (TTM/amdgpu BO style) ─────── */
+
+static bool test_ww_context_accounting(void) {
+  DEFINE_WD_CLASS(cls);
+  struct ww_mutex a, b;
+  struct ww_acquire_ctx ctx;
+  bool ok;
+  ww_mutex_init(&a, &cls);
+  ww_mutex_init(&b, &cls);
+  ww_acquire_init(&ctx, &cls);
+  if (ww_mutex_lock(&a, &ctx))
+    return false;
+  ok = ctx.acquired == 1 && ww_mutex_lock(&a, &ctx) == -EALREADY &&
+       ww_mutex_trylock(&a, &ctx) == 0;
+  if (!ww_mutex_trylock(&b, &ctx)) {
+    ww_mutex_unlock(&a);
+    return false;
+  }
+  ok = ok && ctx.acquired == 2;
+  ww_mutex_unlock(&b);
+  ok = ok && ctx.acquired == 1;
+  ww_mutex_unlock(&a);
+  ok = ok && ctx.acquired == 0;
+  ww_acquire_fini(&ctx);
+  ww_mutex_destroy(&a);
+  ww_mutex_destroy(&b);
+  return ok;
+}
 
 #define WW_BO_LOCKS 4
 static struct ww_class ww_multi_cls;
@@ -88,30 +123,40 @@ struct ww_multi_test {
 
 static int ww_multi_thread(void *arg) {
   struct ww_multi_test *t = arg;
-  struct ww_acquire_ctx ctx;
 
-  ww_acquire_init(&ctx, &ww_multi_cls);
   for (int i = 0; i < 150; i++) {
-    int n = 0;
+    int tries = 0;
+    bool done = false;
 
-    /* Every thread acquires in the same global lock order - the invariant
-     * TTM/amdgpu keep when reserving a BO set.  Wounding is not implemented
-     * in this LinuxKPI (see linux/ww_mutex.h), so the order is what makes
-     * multi-lock acquisition deadlock-free; this stress proves the ordered
-     * pattern works under real contention. */
-    for (int k = 0; k < WW_BO_LOCKS; k++) {
-      if (ww_mutex_lock(&ww_multi[k], &ctx) == 0)
-        n++;
-      else
+    /* Real TTM pattern: fresh ticket per attempt; -EDEADLK means a younger
+     * ticket hit an older holder, so drop everything and retry. Older
+     * tickets block. This exercises the LinuxKPI wait-die backoff that
+     * keeps Minecraft multi-BO reservations from stalling ~1 s. */
+    while (!done && tries++ < 1000) {
+      struct ww_acquire_ctx ctx;
+      int n = 0, r = 0;
+
+      ww_acquire_init(&ctx, &ww_multi_cls);
+      for (int k = 0; k < WW_BO_LOCKS; k++) {
+        r = ww_mutex_lock(&ww_multi[k], &ctx);
+        if (r == 0)
+          n++;
+        else
+          break;
+      }
+      for (int k = n - 1; k >= 0; k--)
+        ww_mutex_unlock(&ww_multi[k]);
+      ww_acquire_fini(&ctx);
+      if (n == WW_BO_LOCKS && r == 0)
+        done = true;
+      else if (r != -EDEADLK && r != 0 && r != -EALREADY)
         break;
     }
-    for (int k = n - 1; k >= 0; k--)
-      ww_mutex_unlock(&ww_multi[k]);
-    if (n != WW_BO_LOCKS)
+    if (!done)
       __atomic_store_n(&t->bad, 1, __ATOMIC_RELEASE);
     __atomic_add_fetch(&t->iterations, 1, __ATOMIC_RELEASE);
   }
-  ww_acquire_done(&ctx);
+  ww_acquire_done(NULL);
   __atomic_add_fetch(&t->done, 1, __ATOMIC_RELEASE);
   return 0;
 }
@@ -158,7 +203,8 @@ static int rwsem_reader_thread(void *arg) {
   (void)arg;
   for (int i = 0; i < 200; i++) {
     down_read(&core_rwsem);
-    rwsem_readers_sum++;
+    /* Read locks allow both readers to update this counter concurrently. */
+    __atomic_add_fetch(&rwsem_readers_sum, 1, __ATOMIC_RELAXED);
     up_read(&core_rwsem);
   }
   __atomic_add_fetch(&rwsem_threads_done, 1, __ATOMIC_RELEASE);
@@ -476,6 +522,7 @@ void linuxkpi_test_phase1_core(void) {
     bool (*fn)(void);
   } tests[] = {
       {"ww_mutex", test_ww_mutex},
+      {"ww_mutex context accounting", test_ww_context_accounting},
       {"ww_mutex multi-lock ordered", test_ww_mutex_multi},
       {"rwsem", test_rwsem},
       {"semaphore", test_semaphore},
@@ -490,6 +537,7 @@ void linuxkpi_test_phase1_core(void) {
   klog_puts("[LINUXKPI] Phase 1 chunk-6 core self-test\n");
 
   for (unsigned i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
+    klogf("[ RUN   ] LinuxKPI: %s\n", tests[i].name);
     if (tests[i].fn())
       klogf("[  OK  ] LinuxKPI: %s correct\n", tests[i].name);
     else

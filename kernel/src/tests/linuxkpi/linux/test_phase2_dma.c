@@ -109,7 +109,7 @@ static bool test_dma_sgtable(void) {
     goto out;
   }
 
-  if (dma_map_sgtable(NULL, &sgt, DMA_BIDIRECTIONAL, 0) <= 0) {
+  if (dma_map_sgtable(NULL, &sgt, DMA_BIDIRECTIONAL, 0)) {
     ok = false;
     goto out;
   }

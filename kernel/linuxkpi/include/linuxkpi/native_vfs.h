@@ -91,9 +91,19 @@ void asc_vfs_kernel_close(void *node);
  * O_CLOEXEC from `flags`; asc_vfs_fd_release_reserved cancels a reservation;
  * asc_vfs_fd_lookup returns the node without taking a reference. */
 int asc_vfs_fd_alloc(unsigned int flags);
+/* Preallocated, independent descriptor wrappers for Linux struct file. */
+int asc_vfs_file_fd_alloc(unsigned int flags);
+void asc_vfs_file_fd_install(int fd, void *owner);
 void asc_vfs_fd_install(int fd, void *node, unsigned int flags);
 void asc_vfs_fd_release_reserved(int fd);
 void *asc_vfs_fd_lookup(int fd);
+/* Referenced lookup; release with asc_vfs_node_unref(). */
+void *asc_vfs_fd_get_node(int fd);
+_Bool asc_vfs_node_is_linux_file(void *node);
+_Bool asc_vfs_node_nonblocking(void *node);
+void asc_vfs_node_set_nonblocking(void *node, _Bool enabled);
+int asc_vfs_fd_close(int fd);
+void asc_vfs_node_set_size(void *node, __UINT64_TYPE__ size);
 
 /* ── Linux side (file.c) ────────────────────────────────────────────────── */
 

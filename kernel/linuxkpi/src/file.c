@@ -9,11 +9,10 @@
  *   - `struct file::f_count` is the only owner.  anon_inode_getfile() returns
  *     with f_count == 1; fd_install() transfers that reference to the fd;
  *     close/fget/fput adjust it; f_op->release() runs at zero.
- *   - The native node exists from file creation to last close; it holds the
- *     file pointer in `device`.  Closing the last fd calls node->close, which
- *     drops the fd's file reference.  A file kept alive by get_file() after
- *     the fd is gone outlives its node, so nothing may dereference
- *     f_asc_node afterwards (fget() can no longer find the fd anyway).
+ *   - f_asc_node is the file's private native owner node and lasts until
+ *     f_count reaches zero. Each fd_install gets its own preallocated VFS
+ *     wrapper; its last close drops the transferred file reference. Closing
+ *     an export must not detach the owner node of a still-live dma-buf.
  *   - Pseudo-fs objects (inode/dentry) are Avory shims; the dentry's
  *     d_op->d_release runs once when the file is released, which is how
  *     dma-buf gets its dmabuf_release callback. */
@@ -36,8 +35,20 @@
 #include <linux/log2.h>
 
 #include <linuxkpi/native_vfs.h>
+#include <linuxkpi/native_prime.h>
 #include <linuxkpi/native_sched.h>
 #include <linuxkpi/log.h>
+#include <linuxkpi/gpu_diag.h>
+#include <linux/uaccess.h>
+#include <drm/drm_file.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_ioctl.h>
+#include <uapi/drm/amdgpu_drm.h>
+
+/* AMDGPU wraps drm_ioctl; observing its public entry point does not modify
+ * vendor code. Weak linkage also permits builds without that driver. */
+extern long amdgpu_drm_ioctl(struct file *, unsigned int, unsigned long)
+    __attribute__((weak));
 
 /* ── struct file lifetime ───────────────────────────────────────────────── */
 
@@ -66,6 +77,7 @@ static struct file *kpi_file_alloc(const char *name,
   file->f_asc_node = node;
 
   asc_vfs_node_set_device(node, file);
+  asc_vfs_node_set_nonblocking(node, flags & O_NONBLOCK);
   asc_vfs_node_set_name(node, name ? name : "anon");
 
   /* One native wait queue per file backs poll(2): poll_wait()/wake_up() in the
@@ -83,9 +95,8 @@ static void kpi_file_free(struct file *file) {
   if (file->f_op && file->f_op->release)
     file->f_op->release(inode, file);
 
-  /* Kernel-internal files (no fd) own their native node for their whole
-   * lifetime: there is no vfs_close() on an fd to drop it, so do it here.
-   * fd-installed files had f_asc_node cleared by linuxkpi_file_close(). */
+  /* The private owner survives descriptor exports and is released only
+   * when the Linux file itself reaches its last reference. */
   if (file->f_asc_node) {
     asc_vfs_node_release_kernel(file->f_asc_node);
     file->f_asc_node = NULL;
@@ -127,7 +138,7 @@ void fput_many(struct file *file, unsigned int refs) {
 /* ── fd table ───────────────────────────────────────────────────────────── */
 
 int get_unused_fd_flags(unsigned int flags) {
-  return asc_vfs_fd_alloc(flags);
+  return asc_vfs_file_fd_alloc(flags);
 }
 
 void put_unused_fd(unsigned int fd) { asc_vfs_fd_release_reserved((int)fd); }
@@ -135,19 +146,27 @@ void put_unused_fd(unsigned int fd) { asc_vfs_fd_release_reserved((int)fd); }
 void fd_install(unsigned int fd, struct file *file) {
   if (!file)
     return;
-  asc_vfs_fd_install((int)fd, file->f_asc_node, file->f_flags);
+  /* Upstream dma_buf_getfile() records the allocation in inode->i_size.
+   * Native fstat/lseek use the VFS node instead; leaving its length zero
+   * makes Mesa's KMS importer request mmap(..., 0, ...) and reject the
+   * DRI3 pixmap even though the AMD buffer itself is valid. */
+  if (file->f_inode)
+    asc_vfs_node_set_size(file->f_asc_node, file->f_inode->i_size);
+  asc_vfs_file_fd_install((int)fd, file->f_asc_node);
 }
 
 struct file *fget(unsigned int fd) {
-  void *node = asc_vfs_fd_lookup((int)fd);
+  void *node = asc_vfs_fd_get_node((int)fd);
   struct file *file;
 
   if (!node)
     return NULL;
-  file = asc_vfs_node_device(node);
-  if (!file)
-    return NULL;
-  return get_file(file);
+  /* Native DRM nodes carry a native drm_file in ->device, not struct file. */
+  file = asc_vfs_node_is_linux_file(node) ? asc_vfs_node_device(node) : NULL;
+  if (file)
+    get_file(file);
+  asc_vfs_node_unref(node);
+  return file;
 }
 
 struct file *fget_raw(unsigned int fd) { return fget(fd); }
@@ -166,10 +185,7 @@ void fdput(struct fd fd) {
 }
 
 int close_fd(unsigned int fd) {
-  /* Not used by the current import set; the native sys_close path owns fd
-   * teardown. */
-  (void)fd;
-  return -EINVAL;
+  return asc_vfs_fd_close((int)fd);
 }
 
 /* 32-bit compat ioctls: this kernel has no compat entry points, so forward
@@ -461,7 +477,35 @@ int linuxkpi_file_ioctl(void *node, unsigned int request, unsigned long arg) {
 
   if (!file || !file->f_op || !file->f_op->unlocked_ioctl)
     return -ENOTTY;
-  return (int)file->f_op->unlocked_ioctl(file, request, arg);
+  bool trace=gpu_diag_level() && ((request>>8)&255)=='d';
+  bool cs=false;
+  union drm_amdgpu_cs input;
+  unsigned long long start=trace ? linuxkpi_monotonic_ms() : 0;
+  if (trace && request==DRM_IOCTL_AMDGPU_CS &&
+      (file->f_op->unlocked_ioctl==drm_ioctl ||
+       (amdgpu_drm_ioctl && file->f_op->unlocked_ioctl==amdgpu_drm_ioctl))) {
+    struct drm_file *df=file->private_data;
+    cs=df && df->minor && df->minor->dev && df->minor->dev->driver &&
+       !strcmp(df->minor->dev->driver->name,"amdgpu") &&
+       !copy_from_user(&input,(void __user *)arg,sizeof input);
+    if (cs) gpu_diag_record(GPU_DIAG_CS_IN,file,input.in.ctx_id,input.in.bo_list_handle,
+                            input.in.num_chunks,input.in.flags,0);
+  }
+  int ret=(int)file->f_op->unlocked_ioctl(file,request,arg);
+  if (trace) gpu_diag_record(GPU_DIAG_IOCTL,file,request,arg,
+                             linuxkpi_monotonic_ms()-start,0,ret);
+  if (trace && ret < 0) {
+    if (request == DRM_IOCTL_AMDGPU_GEM_CREATE)
+      gpu_diag_prime_error(GPU_PRIME_SOURCE_ALLOC, file, request, 0, ret);
+    else if (request == DRM_IOCTL_PRIME_HANDLE_TO_FD)
+      gpu_diag_prime_error(GPU_PRIME_SOURCE_EXPORT, file, request, 0, ret);
+  }
+  if (cs && !ret) {
+    union drm_amdgpu_cs output;
+    if (!copy_from_user(&output,(void __user *)arg,sizeof output))
+      gpu_diag_record(GPU_DIAG_CS_OUT,file,input.in.ctx_id,output.out.handle,0,0,0);
+  }
+  return ret;
 }
 
 static unsigned int kpi_poll_mask_to_native(unsigned int mask) {
@@ -508,8 +552,15 @@ unsigned int linuxkpi_file_read(void *node, unsigned int offset,
   (void)offset;
   if (!file || !file->f_op || !file->f_op->read)
     return 0;
+  /* F_SETFL updates the native open file. DRM's read loop checks the Linux
+   * file flags: leaving those at O_RDWR can park Xorg while draining events
+   * from a descriptor it explicitly made nonblocking. */
+  if (asc_vfs_node_nonblocking(node))
+    file->f_flags |= O_NONBLOCK;
+  else
+    file->f_flags &= ~O_NONBLOCK;
   ret = file->f_op->read(file, (char __user *)buffer, size, &file->f_pos);
-  return ret < 0 ? 0 : (unsigned int)ret;
+  return (unsigned int)ret;
 }
 
 unsigned int linuxkpi_file_write(void *node, unsigned int offset,
@@ -531,6 +582,12 @@ struct kpi_mmap_bridge {
   struct vm_area_struct vma;
   int refs;
   bool closed;
+  /* mremap rebase vs sleeping driver fault (TTM waits on dma-fence):
+   * triple (vm_start, vm_end, vm_pgoff) must be consistent. Seqcount:
+   * rebase marks odd, writes fields, marks even; fault rejects + zaps if
+   * the sequence moved across the driver call, so a torn pgoff never backs
+   * a texture page (sparse purple/green texels until refault). */
+  volatile unsigned seq;
 };
 
 void linuxkpi_vma_ref(void *w) {
@@ -576,9 +633,13 @@ void linuxkpi_vma_rebase(void *w, unsigned long start, unsigned long end,
 
   if (!b)
     return;
+  __atomic_add_fetch(&b->seq, 1, __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
   b->vma.vm_start = start;
   b->vma.vm_end = end;
   b->vma.vm_pgoff = pgoff >> PAGE_SHIFT;
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  __atomic_add_fetch(&b->seq, 1, __ATOMIC_RELEASE);
 }
 
 /* Address-space matching for unmap_mapping_range(): the VMA's file mapping
@@ -612,7 +673,13 @@ static unsigned long kpi_prot_to_vm_flags(uint64_t prot, uint64_t flags) {
 unsigned long linuxkpi_file_mmap(void *node, unsigned long addr,
                                  unsigned long length, unsigned long prot,
                                  unsigned long flags, unsigned long offset) {
-  struct file *file = kpi_node_file(node);
+  return linuxkpi_file_mmap_file(kpi_node_file(node), addr, length, prot, flags, offset);
+}
+
+unsigned long linuxkpi_file_mmap_file(void *opaque_file, unsigned long addr,
+                                      unsigned long length, unsigned long prot,
+                                      unsigned long flags, unsigned long offset) {
+  struct file *file = opaque_file;
   struct kpi_mmap_bridge *bridge;
   int ret;
 
@@ -649,7 +716,8 @@ void linuxkpi_file_close(void *node) {
   if (file) {
     /* vfs_close() is tearing the node down: the file must not release it
      * again when its own refcount reaches zero. */
-    file->f_asc_node = NULL;
+    if (file->f_asc_node == node)
+      file->f_asc_node = NULL;
     fput(file);
   }
 }
@@ -663,12 +731,25 @@ int linuxkpi_vma_fault(void *w, unsigned long addr, unsigned long error) {
   struct kpi_mmap_bridge *b = w;
   struct vm_fault vmf;
   unsigned long aligned;
-  int ret;
+  unsigned seq0, seq1;
+  int spins, ret;
+  extern void zap_vma_ptes(struct vm_area_struct *vma, unsigned long address,
+                           unsigned long size);
 
   if (!b)
     return KPI_VM_FAULT_REJECT;
   if (!b->vma.vm_ops || !b->vma.vm_ops->fault)
     return KPI_VM_FAULT_REJECT;
+
+  /* Wait out a concurrent rebase (3 stores, no sleep) so the triple below
+   * is consistent. Bounded: a stuck writer must not hang the fault. */
+  for (spins = 0; spins < 10000; spins++) {
+    seq0 = __atomic_load_n(&b->seq, __ATOMIC_ACQUIRE);
+    if (!(seq0 & 1))
+      break;
+    __asm__ volatile("pause");
+  }
+  seq0 = __atomic_load_n(&b->seq, __ATOMIC_ACQUIRE);
 
   /* Linux's handle_mm_fault() passes a page-aligned address to
    * vm_ops->fault(); hardware CR2 carries the exact faulting offset.  A
@@ -687,7 +768,17 @@ int linuxkpi_vma_fault(void *w, unsigned long addr, unsigned long error) {
   vmf.flags = (error & 0x2) ? FAULT_FLAG_WRITE : 0;
 
   ret = b->vma.vm_ops->fault(&vmf);
+  gpu_diag_record(GPU_DIAG_FAULT,b,aligned,vmf.pgoff,seq0,error,ret);
   if (ret & (VM_FAULT_ERROR))
     return KPI_VM_FAULT_REJECT;
+  /* The driver slept (TTM dma-fence wait) with IRQs open; a concurrent
+   * mremap rebase in that window leaves a PTE for the wrong texture page
+   * behind (sparse purple/green texels until a later refault corrects it).
+   * Drop that translation and refault with the new triple instead. */
+  seq1 = __atomic_load_n(&b->seq, __ATOMIC_ACQUIRE);
+  if (seq0 != seq1) {
+    zap_vma_ptes(&b->vma, aligned, PAGE_SIZE);
+    return KPI_VM_FAULT_REJECT;
+  }
   return KPI_VM_FAULT_HANDLED;
 }

@@ -1,5 +1,8 @@
 # Phase 6 — amdgpu bring-up: chunked execution plan
 
+Historical plan: the `run-linuxdrm` and C4–C7 test launchers are retired.
+Use `make run-c7-prime` for current AMDGPU sessions.
+
 Audience: the agent that picks up Phase 6.  Paste the project SHARED CONTEXT
 with this file.  Written 2026-09-13 after auditing P0–P5 at commit `2d5a0c0`
 (tag `p6-baseline`), QEMU 11.1.0, host GPU `0000:0e:00.0` = `1002:164e`

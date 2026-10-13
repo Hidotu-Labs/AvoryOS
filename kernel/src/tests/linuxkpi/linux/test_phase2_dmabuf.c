@@ -416,7 +416,7 @@ static bool test_dma_buf_fd(void) {
 
   /* Closing the fd drops the last reference and runs dma_buf_release ->
    * ops->release (which frees bo's pages). */
-  fput(dmabuf->file);
+  close_fd(fd);
   return ok;
 }
 
@@ -456,7 +456,7 @@ static bool test_sync_file(void) {
     ok = false;
 
   /* fput runs sync_file_release, which drops the fence. */
-  fput(sf->file);
+  close_fd(fd);
   return ok;
 }
 

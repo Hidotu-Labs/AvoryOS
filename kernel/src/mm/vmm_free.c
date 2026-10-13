@@ -16,7 +16,8 @@ static void reclaim_unmapped_file_cache(struct vma *v) {
   reclaim_unmapped_file_cache(v->right);
   if (v->file_node) {
     vfs_node_t *node = (vfs_node_t *)v->file_node;
-    if (vfs_node_is_alive(node) && (node->flags & FS_PAGE_CACHE))
+    if (vfs_node_is_alive(node) &&
+        ((node->flags & FS_PAGE_CACHE) || (v->flags & MAP_PAGECACHE)))
       vfs_cache_clear_unused(node);
   }
 }

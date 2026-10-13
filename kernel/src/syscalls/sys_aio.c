@@ -890,14 +890,14 @@ static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,
 
     int fd_read = alloc_fd(t);
     if (fd_read < 0) return (uint64_t)-24;
-    t->fds[fd_read] = (void *)-1;
 
     int fd_write = alloc_fd(t);
-    if (fd_write < 0) { t->fds[fd_read] = NULL; return (uint64_t)-24; }
+    if (fd_write < 0) { fd_release_reserved(t, fd_read); return (uint64_t)-24; }
 
     pipe_ctx_t *ctx = kmalloc(sizeof(pipe_ctx_t));
     if (!ctx) {
-        t->fds[fd_read] = t->fds[fd_write] = NULL;
+        fd_release_reserved(t, fd_read);
+        fd_release_reserved(t, fd_write);
         return (uint64_t)-12;
     }
     memset(ctx, 0, sizeof(pipe_ctx_t));
@@ -916,7 +916,8 @@ static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,
         if (read_node) kfree(read_node);
         if (write_node) kfree(write_node);
         kfree(ctx);
-        t->fds[fd_read] = t->fds[fd_write] = NULL;
+        fd_release_reserved(t, fd_read);
+        fd_release_reserved(t, fd_write);
         return (uint64_t)-12;
     }
     read_end->ctx = write_end->ctx = ctx;
@@ -1225,8 +1226,11 @@ static void memfd_close(vfs_node_t *node) {
 
 static uint64_t memfd_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
                             uint64_t prot, uint64_t flags, uint64_t offset) {
-    (void)flags;
     if (!node || !node->device) return (uint64_t)-1;
+    if (!length || (offset & (PAGE_SIZE - 1)) || offset > UINT32_MAX ||
+        length > (UINT32_MAX & ~(uint64_t)(PAGE_SIZE - 1)) - offset)
+        return (uint64_t)-22;
+    bool private_mapping = (flags & 3) == MAP_PRIVATE;
 
     ramfs_file_t *file = (ramfs_file_t *)node->device;
     uint64_t hhdm      = pmm_get_hhdm_offset();
@@ -1237,8 +1241,6 @@ static uint64_t memfd_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
         if (new_cap < 4096) new_cap = 4096;
         new_cap = (new_cap + 0xFFF) & ~0xFFFU;
 
-        uint32_t old_cap = file->capacity;
-        uint8_t old_is_pmm = file->data_is_pmm;
         void *phys = pmm_alloc_pages(new_cap / PAGE_SIZE);
         if (!phys) return (uint64_t)-12;
         uint8_t *new_data = (uint8_t *)((uint64_t)phys + hhdm);
@@ -1248,17 +1250,6 @@ static uint64_t memfd_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
             memcpy(new_data, file->data, copy_len);
             ramfs_free_file_data(file);
         }
-        klog_debug_puts("[MEMFD_MMAP] backing -> PMM ptr=");
-        klog_debug_hex64((uint64_t)new_data);
-        klog_debug_puts(" old_cap=");
-        klog_debug_uint64(old_cap);
-        klog_debug_puts(" old_pmm=");
-        klog_debug_uint64(old_is_pmm);
-        klog_debug_puts(" new_cap=");
-        klog_debug_uint64(new_cap);
-        klog_debug_puts(" needed=");
-        klog_debug_uint64(needed);
-        klog_debug_puts("\n");
         file->data     = new_data;
         file->capacity = new_cap;
         file->data_is_pmm = 1;
@@ -1273,20 +1264,28 @@ static uint64_t memfd_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
     uint64_t vaddr  = addr ? addr : mm_alloc_mmap_region(length);
     if (vaddr == 0) return (uint64_t)-12;
 
-    uint64_t page_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_USER;
+    uint64_t page_flags = PAGE_FLAG_PRESENT;
+    if (prot) page_flags |= PAGE_FLAG_USER;
     if (prot & 0x2) page_flags |= PAGE_FLAG_RW;
     if (!(prot & 0x4)) page_flags |= PAGE_FLAG_NX;
+    /* Private views share the live backing frame until the first write.
+     * Reading through the generic VFS cache creates a detached snapshot:
+     * Wine's session view then misses objects published by wineserver. */
+    if (private_mapping)
+        page_flags = (page_flags & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
 
     for (uint64_t off = 0; off < length; off += 0x1000) {
         uint64_t data_off = offset + off;
         if (data_off >= file->capacity) break;
         uint64_t kva  = (uint64_t)(file->data + data_off);
         uint64_t phys = kva - hhdm;
+        /* Private PTEs own references that teardown/CoW will release.
+         * Shared mappings retain the file's ownership convention. */
+        if (private_mapping)
+            pmm_incref((void *)phys);
         vmm_map_page(pml4, vaddr + off, phys, page_flags);
     }
 
-    klog_debug_puts("[MEMFD_MMAP] mapped "); klog_debug_uint64(length);
-    klog_debug_puts(" bytes at ");           klog_debug_uint64(vaddr); klog_debug_puts("\n");
     return vaddr;
 }
 
@@ -1330,6 +1329,8 @@ static uint64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags_arg,
     node->truncate  = ramfs_truncate;
     node->fallocate = ramfs_fallocate;
     node->mmap      = memfd_mmap;
+    node->mmap_shared_only = false;
+    node->mmap_private_pmm_refs = true;
     node->close     = memfd_close;
 
     t->fds[fd]        = node;

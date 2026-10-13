@@ -1,7 +1,265 @@
+## Native PRIME frame publication (2026-10-12)
+
+The user could not reopen Minecraft for an active-scene comparison and asked
+to proceed with the native PRIME change. The paused capture below does not
+identify the cause of the visible transient pixels.
+
+Single-output VirtIO PRIME now uses two host 2D resources sharing the existing
+CPU staging allocation. Each frame uploads the full snapshot into the resource
+which is not selected, waits for the transfer response, then selects and flushes
+that complete image. Previously PRIME repeatedly transferred damage into the
+currently displayed host image and batched selection before checking transfer
+success. The extra host image avoids modifying the selected resource during
+upload; no additional AMD BO or guest staging allocation is required.
+
+Failed transfers do not select their target. Failed selection retains the old
+selection. If flush fails after selection, the tracked selected resource still
+matches the host, so the following upload targets the other image. Failed
+presentation clears the queued-selection marker, including on the existing
+non-PRIME/multi-output path, so consumed damage forces a full refresh next time.
+Both resources are detached and released before staging storage is freed, and
+partial creation retains GEM cleanup ownership. Resource IDs now use atomic
+increments across console, cursor and GEM allocation paths.
+
+`test_prime_frame_publication.py` executes the native publisher for 300 frames
+with a display reader during upload, cropped scanout and injected transfer,
+selection and flush failures. It checks complete front frames and full retries;
+an in-place destination fails the negative control. `test_prime_resource_pair.py`
+checks paired backing, alternate-resource removal and cleanup after all four
+creation/attachment failure points. PRIME snapshot/lifetime, page/shmem lifetime
+and cache-alias regressions also pass. This is a tested publication change, not
+proof that the original Minecraft flicker is resolved; the active GPU workload
+could not be reproduced in this session. AMDGPU and userspace are unchanged.
+
+## Native page and PRIME scanout lifetimes (2026-10-12)
+
+The user retested this kernel and still observed transient Minecraft pixels.
+The lifetime fixes below therefore do not resolve that symptom. A read-only
+capture of the running VM's native PRIME source and shadow found exact pixel
+matches in every stable sample; the two differing samples changed during the
+read. The user then clarified that pausing Minecraft had stopped the flicker
+during capture, so those samples do not exercise the reported failure.
+Evidence is in `build/logs/prime-live-capture/`. The affected running scene
+still needs to be sampled before attributing corruption to rendering or PRIME.
+
+`scripts/prime-capture.py` locates the matching guest kernel in QEMU RAM, walks
+its page tables, identifies the native scanout, and saves source/shadow PNGs
+and a JSON comparison. It never pauses or writes VM memory. Running it needs
+explicit permission to read potentially sensitive guest RAM and local sudo
+authentication. It currently supports one 4 GiB Q35 RAM allocation and the
+current native DRM structure ABI; the ELF must match the running kernel.
+`--delay 5 --frames 64` allows resuming Minecraft before capture. Differences
+in changing frames are not themselves evidence of corruption. The active-scene
+capture was requested separately in `build/logs/prime-live-active/`.
+
+The current Minecraft session logged two AMDGPU command-submission allocation
+failures followed by SIGABRT in Java and Xorg. This does not identify which
+allocation failed, nor prove that these failures caused the intermittent pixels.
+
+LinuxKPI's final `put_page()` decremented to zero and then called
+`__free_pages()`, which decremented again and never freed the physical block.
+Both entry points now consume one reference and share a final-release helper.
+The page-reference boot test previously sampled free memory after allocation,
+so it incorrectly accepted that leak; its baseline is now before allocation.
+
+The shmem store also returned its cache-owned page without a caller reference.
+Reads now retain a separate reference, lookup/publication and truncation are
+serialized, and insertion cannot replace a concurrent winner. Truncation drops
+the cache reference while outstanding readers retain storage. This preserves
+DRM GEM and TTM swapout/swapin ownership with the corrected final release.
+
+The VirtIO PRIME commit previously kept an unreferenced live framebuffer
+pointer after dropping the KMS lock and then waited for GPU fences. It now
+copies framebuffer metadata and retains its GEM under that lock, releases the
+reference on each exit, and keeps the buffer alive through copying/upload.
+Framebuffer removal clears matching CRTC/plane pointers under the same lock.
+The existing reservation-based snapshot synchronization remains in place.
+AMDGPU source and userspace renderer configuration were not changed.
+
+`test_kpi_shmem_lifetime.py` exercises final/compound releases, 16 concurrent
+readers, 500 TTM-style swap cycles, retained readers across truncation and
+allocation-error cleanup. All physical allocations are reclaimed. Its original
+double-decrement and missing-reference controls fail. The new actual-kernel
+shmem boot check passes 32 read/put/read/truncate cycles.
+`test_prime_scanout_lifetime.py` runs the native commit and framebuffer removal,
+removes a framebuffer during its fence wait, compares all copied pixel bytes,
+and checks success/error/async exits and KMS detachment. Missing-reference and
+stale-pointer controls fail. Existing PRIME snapshot, cache-alias, GEM
+initialization, PFN-bound and PCI transaction regressions also pass.
+
+The rebuilt main ISO boots two CPUs with a private disk overlay and no physical
+GPU. Page-reference, shmem lifetime and TTM tests pass; TTM's 256-cycle PMM
+delta is zero. The boot also reports the previously observed vkms one-page PMM
+drift and sysfs 133-page PMM discrepancy; this is not an all-tests-clean boot.
+Evidence: `build/logs/gpu-lifetime-{iso,smoke,smoke-host}.log`.
+The physical GPU and Minecraft presentation were not exercised in this check,
+so resolution of the original flicker and allocation failures remains unverified.
+The main disk was not edited; the updated kernel is in `avoryos-x86_64.iso`.
+
+## Native imported PCI shutdown (2026-10-11)
+
+The user reported a whole-host reboot during the GPU investigation. The previous
+host journal contains no recorded panic, machine check or orderly shutdown at
+its end; that failure remains unexplained. No shared PCI-bus reset was forced.
+
+Native reboot/power-off/halt previously skipped imported PCI shutdown entirely.
+`linuxkpi_pci_shutdown` now dispatches bound drivers in reverse enumeration order,
+once, before NVMe shutdown/ACPI/interrupt disable. Failed probes are unbound and
+are skipped. The existing AMDGPU callback suspends IP blocks for passthrough;
+the imported driver source is unchanged. A compiled regression checks callback
+ordering, missing/unbound devices, recursive/repeated dispatch and syscall hooks.
+
+The kernel and PRIME ISO build. A private cold boot initialized amdgpu 3.54,
+completed its shutdown callback (display IRQ suspend and PSP TMR release), and
+powered off with the host still running. The following private boot initialized
+AMDGPU without the earlier PSP/AUTOLOAD_RLC/KIQ failures and shut down cleanly.
+A second successive warm boot also initialized and shut down cleanly.
+This validates the missing lifecycle hook, not a universal Raphael reset or
+proof of the host reboot's cause. Evidence: gpu-{cold,warm-shutdown}-serial.log,
+gpu-shutdown-{build,iso}.log and host-before-reboot-{kernel,tail}.log under build/logs.
+
+## Native MMIO ordering audit (2026-10-11)
+
+The native `asm/io.h` overlay used C volatile loads/stores without compiler
+memory barriers for ordinary MMIO. GCC can erase a preceding normal-memory
+publication or reuse a pre-completion load across these accesses; a compiled
+regression demonstrates this on the previous header. Ordinary accessors now
+match the imported x86 Linux `mov` + memory-clobber contract at all widths.
+Relaxed/raw accessors retain their separate weaker contract. WC hardware
+ordering still uses the driver's explicit `wmb`/`mb`, as upstream does.
+
+`test_kpi_mmio_ordering.py` checks exact access widths, publication/completion
+ordering in optimized code, and rejects the old header as a negative control.
+The kernel builds and existing PRIME snapshot, cache-alias and dma-buf export
+regressions pass. Private GPU texture checks pass; this audit does not yet prove
+that MMIO ordering caused the intermittent Minecraft bright pixels.
+
+The opt-in `AVORY_GPU_TEXTURE_STRESS=1 test_kpi_radeonsi` diagnostic allocates
+48 patterned RGBA textures (768 MiB), samples them to a 512-square framebuffer,
+updates/reuses the allocations and verifies every readback pixel over four
+rounds plus a queued draw/reuse burst (240 frames, 62,914,560 pixels). Both the
+previous kernel and the corrected kernel pass this workload. It isolates AMD
+rendering from desktop compositors and PRIME scanout. The reverse AMD-produced
+buffer/native-display import diagnostic now explicitly requests the linear
+modifier without the incompatible legacy LINEAR usage flag. It renders 64
+patterned frames into an AMD GBM buffer, imports/maps that buffer on ascentdrm,
+and compares GPU readback and the native CPU mapping against the pixel oracle.
+All 16,777,216 pixels match; the complete diagnostic exits zero. Evidence:
+build/logs/gpu-export-{texture-pressure,result}.log and
+gpu-warm2-shutdown-serial.log. Minecraft's intermittent dots remain unreproduced;
+neither passing these checks nor the proven MMIO defect establishes their cause.
+The main PRIME ISO contains both native fixes. disk.img is unchanged; the test
+init and expanded diagnostic were installed only on the private test disk.
+
 # LinuxKPI progress
 
 Living status log for the LinuxKPI/amdgpu project.  Update after every working
 session so the next agent can resume without re-deriving state.
+
+## Native TTM cache modes for radeonsi (2026-10-11)
+
+Minecraft-only transient pixels persisted after the PRIME snapshot fix. The
+native x86 page-cache APIs were no-ops: TTM selected write-combined GTT and
+AMDGPU could consequently omit GPU snooping, while CPU pages stayed WB. The
+mmap bridge also ignored driver protections and treated every VM_IO mapping
+(including GTT RAM) as PCD-only. vmap aliases always used WB.
+
+TTM WC/UC/WB transitions now flush cache lines and drain stores, remap the
+HHDM through the native VMM's SMP invalidation path, and record effective
+cache bits in existing struct-page padding (the descriptor remains 64 bytes).
+WC uses native PAT entry 7. mmap/vmap RAM aliases use the page's effective
+type; BAR mappings retain the driver's explicit protection. Array conversion
+validates input first and rolls back preceding pages if a mapping fails.
+The imported driver sources remain unchanged.
+
+The host cache-alias regression passes; old functions fail its negative
+control. An eight-CPU boot passes real WC/UC/WB alias visibility and TTM
+tests. After two familiar warm-GPU initialization failures (PSP create-ring,
+then AUTOLOAD_RLC/KIQ), a private VFIO boot initializes amdgpu 3.54, reports
+accelerated radeonsi via GLX, presents XFCE/glxgears, and passes three complete
+test_kpi_radeonsi suites. Minecraft 1.16.5's animated title scene and world
+selection menu render cleanly in the captured frames. The private timed test
+ended before entering the selected world, so the user's exact intermittent
+in-world corruption has not been independently reproduced or ruled out.
+
+Evidence: build/logs/minecraft-cache-{build,regression,negative-control,
+boot-serial,serial,glxinfo,gears,game,radeonsi-1,radeonsi-2,radeonsi-3}.log;
+game-screen.png and world-menu.png capture the visible game. The main kernel
+ISO is rebuilt. disk.img needs no changes; temporary init/scripts existed only
+in the private test disk. The approved production VM and private VMs are stopped.
+
+## Native PRIME frame snapshot synchronization (2026-10-11)
+
+Intermittent pixels were reported under Minecraft and Mesa demos. Native
+VirtIO copies imported AMD buffers into a contiguous shadow before uploading
+it to QEMU. Its mapping mutex serialized CPU consumers, but
+`dma_buf_begin_cpu_access` only waited for a snapshot of existing GPU write
+fences; it did not prevent a new GPU submission from changing the buffer
+halfway through the copy.
+
+The native bridge now acquires the buffer reservation after the exporter
+begin callback, rechecks write fences while reserved, and retains that lock
+through the synchronous copy/upload. End releases it before the exporter
+end callback. Begin/lock/wait failures unwind the mapping mutex and CPU
+access correctly. This follows the dma-buf rule that exporter CPU callbacks
+must run without the reservation lock held. Imported driver sources and
+userspace renderer configuration are unchanged.
+
+`test_prime_cpu_snapshot.py` reproduces a mixed frame with the old functions
+and passes 100 concurrent submit/copy interleavings with the new functions.
+It also checks a write fence inserted between exporter begin and reservation
+acquisition, resumed submissions after end, and all failure paths. The private 8-CPU VM initialized AMDGPU and ran glxgears concurrently with
+three successful radeonsi GPU render/readback and PRIME import/export runs.
+The QEMU screenshot in this private harness remained black, so visible
+artifact elimination was not established; the exact Minecraft artifacts
+have not been independently reproduced. The production ISO was rebuilt.
+
+## Native X11 readiness and descriptor lifetime (2026-10-11)
+
+The reproduced Breeze Dark/Light Global Theme failure was a LinuxKPI
+file-lifetime bug. Closing the first AMD dma-buf export detached its native
+owner node even while the Linux file remained referenced. Re-export then
+returned a reserved, unpublished descriptor. Xorg's DRI3 `sendmsg` failed
+with `EBADF` on the attached fd and closed KWin's X11 connection; KWin exited
+with code 1 through Xlib's I/O error handler.
+
+The owner node now survives until the Linux file's final reference. Each
+`fd_install` publishes a separate native wrapper owning the transferred file
+reference, including overlapping exports. Wrapper allocation happens before
+`get_unused_fd_flags` succeeds because `fd_install` cannot report allocation
+failure. Cancelled reservations and final table teardown free unused wrappers.
+The native PRIME export path already creates separate wrappers and retains
+its existing behavior.
+
+Additional native ABI/lifetime faults were corrected during tracing. AF_UNIX
+`poll` returned unrequested `POLLRDNORM`/`POLLWRNORM` bits, which libxcb rejects.
+Readiness is now masked by requested events plus unconditional
+`POLLERR | POLLHUP | POLLNVAL`; epoll reports `EPOLLRDHUP` only when subscribed.
+Xorg also dereferenced `FD_RESERVED` in `socket_from_fd`, faulting at address
+`0x93`. Lookup now validates under the file-table lock and pins both socket
+and VFS node. Socket syscalls and vector writes release those references on
+every return; `mmap` and `ioctl` similarly pin their descriptors. Imported
+AMDGPU, Mesa, Xorg and KWin sources are unchanged.
+
+Host regressions exercise 100 repeated and overlapping dma-buf exports,
+SCM/dup wrapper lifetime, reservation cancellation, allocation failure and
+fd exhaustion, alongside readiness masks, stale epoll candidates, concurrent
+close and socket cleanup. Removing the poll mask fails its negative control.
+The traced PRIME VM initialized AMDGPU/radeonsi, completed six alternating
+Breeze Dark/Light changes with the same KWin PID and no DRI3 sendmsg failures.
+An untraced run also completed six switches with the same KWin PID. The
+private harness showed a black presentation screen; the user subsequently
+reported ten normal runs without that symptom, so it was not established as
+a production PRIME defect.
+
+## Test tooling cleanup (2026-10-11)
+
+`run-c4`, `run-c5`, `run-c6`, `run-c7`, `run-linuxdrm` and the C4/C6
+watchdogs were retired; use `make run-c7-prime`
+for AMD rendering in the QEMU window. References below describe historical
+milestones. Obsolete generated VM disks, ISOs, frame captures and temporary
+host runners were removed; current test sources and final validation logs
+remain available.
 
 ## Phase 0 — scaffolding (in progress)
 
@@ -2108,3 +2366,511 @@ Landed so far:
 - Native symbols that collide with imported libraries must be renamed before
   importing those libraries (known: `lib/rbtree.c`, `lib/radix-tree.c` vs
   `kernel/src/lib/rbtree.c` and `radix_tree.c`).
+## PRIME captured mouse input (2026-10-11)
+
+`run-c7-prime` now supplies `usb-mouse` instead of `usb-tablet`. The native
+USB HID parser and evdev path already support relative movement; an absolute
+tablet cannot provide continuous relative input for Minecraft/GLFW camera
+capture. `run-vfio` retains the tablet default through `VFIO_POINTER`, which
+also permits explicit command-line overrides. No kernel or guest wrapper
+change is needed for this device selection.
+
+An isolated QEMU guest with the native kernel advertised REL_X/REL_Y and no
+ABS_X/ABS_Y. QMP injected +3200/-3200 horizontal and +1600/-1600 vertical units
+through the USB mouse; evdev delivered the exact totals with no absolute
+events, including movement beyond display bounds. The existing VirtIO cursor
+hide/queue saturation regression also passes (its host mock now supplies
+`tlb_shootdown_poll`). Minecraft itself was not exercised in this test.
+Evidence: `build/logs/prime-mouse-serial.log` and
+`build/logs/prime-mouse-make.log`. Restarting the VM picks up the new device;
+neither `disk.img` nor the kernel ISO needs rebuilding.
+Follow-up (superseded): forcing `GTK_SHOW_CURSOR=on` restored visibility but
+caused a duplicate/offset host cursor. The native VirtIO cursor capability now
+requires absolute input; an external scanout without a cursor backend returns
+ENXIO for legacy cursor ioctls, allowing Xorg to select software cursors. PRIME
+uses `GTK_SHOW_CURSOR=off` again. An eight-CPU VFIO boot initialized AMDGPU,
+passed the cursor fallback/lifetime regression and three radeonsi/PRIME runs.
+The cursor is visible in the captured framebuffer on XFCE and Minecraft
+menus, disappears during in-world camera capture, and returns on pause/death.
+Relative camera turns work. Evidence: `build/logs/minecraft-cursor-gameplay.png`,
+`minecraft-cursor-pause.png` and `minecraft-cursor-xfce-*.log`. Intermittent
+bright Minecraft pixels have not been reproduced; this is not a rendering
+corruption fix. Plasma comparison is in progress.
+## Native DMA cache ownership (2026-10-12)
+
+The second recording (`2026-10-12 18-13-14.mp4`) accompanies a user
+retest in which the flicker persists. The preceding two-resource PRIME
+publication change did not resolve the reported symptom. This recording
+contains active Minecraft rendering; the matching running-session log has
+no GPU fault or ring timeout. Neither observation locates the pixel
+corruption within the rendering/display pipeline. The earlier RAM capture
+was paused and remains insufficient to diagnose the active failure.
+
+A separate native memory defect was found in `mm/dma_alloc.c`: allocation
+retyped the direct mapping WB -> UC before its cache flush, and free
+returned UC-mapped RAM to the PMM. Ordinary anonymous/GEM/LinuxKPI pages
+could then reuse that RAM with WB aliases. Native DMA now invalidates cache
+lines before a transition, changes the shared kernel direct map through the
+VMM's TLB invalidation path, and restores WB before releasing the complete
+rounded allocation. Page-only release and partial/metadata allocation
+failures also restore WB. A failed restore retains the affected allocation
+instead of publishing incompatible RAM to the PMM. No AMDGPU source changes
+were made for this repair.
+
+`test_native_dma_cache_lifetime.py` exercises 100 allocation/reuse cycles,
+rounded extents, single-page release, partial mapping/metadata failures,
+and failed-restore quarantine. Both missing restoration and missing
+pre-transition invalidation fail its negative controls; the original source
+fails the ordering check. The actual kernel boot test checks UC ownership
+and WB restoration in real page tables. It passed in the two-CPU QEMU boot
+logged in `build/logs/native-dma-cache-smoke.log`, along with PRIME sharing,
+page/shmem lifetimes and the TTM loop (PMM delta zero). Existing sysfs PMM
+baseline failure remains; this NVMe-only test has no SATA/ATA devices.
+
+The main ISO was rebuilt and its extracted kernel compared equal to the
+stripped current ELF. This fixes a demonstrated kernel cache-lifetime bug;
+the relationship to visible Minecraft corruption is still unverified.
+
+### Follow-up: coherent DMA and remote cache invalidations
+
+The user reports that the first native DMA cache repair removed most of
+the visible corruption, with some flicker remaining. This is evidence of
+an effect in the reported workload, not proof that all residual artifacts
+have the same cause.
+
+The allocator's DMA-wide spinlock masked interrupts across cache changes.
+The VMM consequently invalidated only the local CPU and deferred remote
+acknowledgements, while allocation/release still published the frames.
+The initial boot test inspected page tables and did not exercise this
+remote-translation gap.
+
+Native x86 DMA RAM now stays coherent WB by default, matching the LinuxKPI
+DMA allocator. No cache transition occurs for ordinary allocations, including
+NVMe PRP allocations under an outer IRQ-masking lock. PMM/heap locking already
+serializes allocation, so the redundant DMA-wide lock has been removed.
+Native user-driver DMA mmap uses WB to match its allocation; MMIO mapping
+keeps its existing UC protection. Explicit `DMA_FLAG_NOCACHE` allocation
+requires interrupts enabled and completes remote invalidation before returning
+the buffer. Its release restores WB and waits for completion; an IRQ-masked
+release parks the frames in the VMM's deferred-free queue until acknowledgement.
+
+The host regression now models local and remote cache translations, runs
+coherent allocations with interrupts both enabled and masked, executes the
+actual user-driver DMA mmap branch, and checks delayed full-buffer/single-page
+release, rollback and quarantine. Premature reuse, missing cache invalidation,
+and a UC user alias of WB DMA RAM each fail a negative control. The preceding
+allocator also fails this regression. The boot test additionally requires
+remote IPIs for UC transitions on SMP and verifies that an IRQ-masked release
+retains its PMM reference until deferred work drains.
+
+`build/logs/native-dma-coherent-smoke2.log` records a two-CPU boot passing that
+test, page/shmem lifetimes, PRIME sharing and TTM's 256-iteration loop with PMM
+delta zero. The first smoke run reported semaphore/wait-bit failures; both
+passed on the second run. Those tests assert at least ten jiffies elapsed
+after launching a waker that sleeps fifteen milliseconds, so scheduling can
+affect that condition; the first failures are not silently counted as passes.
+Existing vkms/sysfs PMM drift checks still fail. SATA/ATA are absent in this
+NVMe-only VM. The rebuilt main ISO's kernel matches the stripped current ELF.
+Residual Minecraft artifacts still require a workload retest after reboot.
+
+### GPU submission hang: interrupt-safe service and worker locks
+
+The subsequent `p6-c7-prime.log` reports CPU 1 (`Xorg:cs0`, in ioctl) missing
+timer ticks and not answering an interrupt probe, followed by SDMA fallback
+fence activity and an SDMA timeout/reset. VMM, shootdown and VirtIO spotlight
+locks are free. The CPU stack scan prints oldest frames and contains stale
+entries; it is not a live unwind of the stopped CPU. LinuxKPI spin waits are
+not named in that report, so it does not establish the exact held queue lock.
+
+An interrupt self-deadlock was found in the paths that GPU submission and
+completion share: service task/generation state, workqueue state and
+`kthread_worker` state used plain spinlocks. GPU hard IRQ handlers can call
+`mod_timer`, release a fence through `call_rcu`, and enqueue work. If the IRQ
+interrupts a process holding the matching queue/service lock on that CPU,
+the handler spins with interrupts off and the interrupted holder cannot
+resume. The log's stopped CPU and later GPU timeout are consistent with this
+defect; the original log cannot distinguish which queue experienced it.
+
+Those internal lock sites now use `spin_lock_irqsave`/`spin_unlock_irqrestore`
+on both producer and worker/retirement/cancellation sides. Callback execution,
+completion waits and thread joins remain outside the locks. The generic Linux
+plain-spinlock API retains its existing semantics. No AMDGPU source changes
+were introduced.
+
+`scripts/tests/test_kpi_irq_queue_locks.py` compiles the actual LinuxKPI spinlock
+overlay and service/producer/spawn/cancel functions. It injects an IRQ
+immediately after acquisition, defers delivery when masked, and checks exact
+IRQ/preemption restoration and retained queue work over 1,800 cases. Restoring
+plain locks independently in each of the three queue types reproduces the
+same-CPU interrupt lock cycle. Requeue/flush, mutex contention, prepared-fence
+wake, TLB lock-poll and coherent-DMA regressions also pass.
+
+`build/logs/gpu-irq-queue-smoke4.log` records a two-CPU boot with a private qcow2
+overlay over the older test image, with hardware GPU disabled. Real timer,
+workqueue, RCU, spinlock, semaphore/wait-bit, tasklet, scheduler/fence, PRIME
+and DMA tests pass, and no hang report appears. The pre-existing sysfs PMM
+accounting failure remains; SATA/ATA are absent. The main ISO's extracted
+kernel matches the stripped build ELF. Reproducing the original GPU workload
+after loading the new kernel remains necessary to confirm that specific hang
+is resolved.
+
+### Remaining Minecraft texture-edge shimmer
+
+The user reports Mesa demos now look clean and the remaining Minecraft
+pixels occur mostly along foliage, grass, water and distant texture edges.
+`scripts/setup-minecraft.sh` was still generating a launcher that overwrote
+`options.txt` every launch with `mipmapLevels:0`. This disables Minecraft's
+distant texture filtering and is a strong match for the reported edge
+shimmer, although a visual retest is still needed. The software GL profile
+also forced llvmpipe's `no_linear,no_mipmap` flags.
+
+The user explicitly requests Minecraft's own defaults, with no launcher
+preset. The launcher therefore no longer creates or edits `options.txt` and
+performs no forced mipmap migration. Minecraft owns default generation and
+subsequent settings persistence. Forced llvmpipe filtering/thread/dithering
+tuning and the forced `vblank_mode=0` override were removed. The generated
+staged launcher was refreshed and syntax checked. Executing the actual
+launcher against a dummy Java entry point verified hardware and software
+paths, byte-for-byte preservation of existing settings, no generated options
+file for a fresh profile, and no injected filtering/VSync overrides.
+
+This is permanent launcher configuration cleanup, not a native kernel repair.
+The preceding DMA and interrupt-lock correctness repairs are native fixes;
+the remaining Minecraft symptom still needs a visual retest. The launcher
+has not been injected into the running guest's disk. After installing it,
+renaming the old preset `options.txt` while Minecraft is closed lets the game
+regenerate its own defaults and retains the old file as a backup.
+
+### Native VirtIO/PRIME publication and shared VMAP table lifetime
+
+The user subsequently observed residual pixels in Mesa demos as well as
+Minecraft. Launcher filtering cleanup does not establish their cause. A deeper
+native display audit found three independent VirtIO correctness defects and a
+shared kernel VMAP lifetime defect reproduced with a real PRIME import.
+
+* Per-import CPU locks serialized each staging allocation, but commits for
+  different GEMs could interleave their transfer, SET_SCANOUT acknowledgement,
+  and `head_resource` update. A delayed presenter could overwrite the recorded
+  front resource after another GEM was selected. Its successor could then
+  transfer into the currently displayed host image. A task-context presentation
+  gate now covers snapshot selection through publication, including native
+  asynchronous submission, console restoration, hotplug detachment and GEM
+  scanout detachment. Fence/vblank waits do not retain an IRQ spinlock through
+  this gate; completion handling never takes it. Last GEM puts occur after
+  releasing the gate so teardown cannot acquire it recursively.
+* Synchronous command/batch timeouts cleared `command_busy` before VirtIO
+  returned the submitted descriptors. Subsequent requests could overwrite DMA
+  pages that the host still owned. Outstanding command IDs/batch masks now
+  retain those pages until completion, including partial batches. Worker drains
+  and retries reap late acknowledgements. PRIME commits also avoid rewriting
+  staging while a timed-out transfer can still read it. Responses validate fence
+  flags/IDs and lengths. An uncertain SET_SCANOUT selection is detached before
+  the next inactive-image upload; cleanup also handles an unknown selection.
+* Async completion ran under `gpu_poll_lock` but called `vblank_wait_next`
+  after releasing only its inner presentation lock. That scheduled with the
+  control-queue IRQ spinlock still held. Events now remain in their slots until
+  the worker claims them outside both locks, in completion order. Pending event
+  slots cannot be recycled and synchronous reaping wakes the event worker.
+* `vmm_free_empty_tables` reclaimed a kernel PDPT when its last VMAP mapping
+  disappeared. Process PML4s shallow-copy that pointer; removing the kernel
+  entry neither updates existing process roots nor safely releases their table.
+  Empty shared kernel PDPTs now retain their identity, while lower child tables
+  and all empty user tables remain reclaimable. LinuxKPI VMAP initialization
+  prepares writable shared parent entries and removes its temporary zero-page
+  leaves, so later mappings work in process roots cloned while a slot was empty
+  without exposing a writable global-zero-page alias.
+
+The actual native commit/publisher regression forces 300 cross-GEM ACK
+interleavings. Removing the gate reproduces front-state disagreement and a
+visible-image upload. Actual command functions pass 100 cycles of delayed
+single/batch replies, partial submission, malformed responses, quarantine and
+safe retries; restoring either old timeout path fails. Actual async functions
+pass 1,600 ordered event completions with assertions against sleeping under an
+IRQ lock; restoring callback vblank pacing fails. Actual native table reclamation
+passes 100 map/unmap cycles with two copied process roots, and the actual VMAP
+initializer prepares all 64 slots. Restoring kernel PDPT reclamation fails on
+the first teardown. Existing snapshot, resource-pair, lifetime, DMA and
+interrupt-queue regressions also pass.
+
+`scripts/tests/test_prime_qemu_scanout.py` builds a private minimal root disk
+and boots the main ISO's kernel under two-CPU TCG with hardware AMDGPU disabled.
+It opens real native DRM and LinuxKPI dma-buf devices, imports two buffers,
+creates legacy framebuffers, and runs two threads performing 400 page flips
+and 400 damage commits. QMP screendump checks every pixel of a final 1280x800
+pattern against its source. Before the shared table repair, the first SETCRTC
+panicked in the PRIME staging memcpy: CR2=0xffffc00000000000, the process's
+PML4 entry 384 was absent. The log is preserved as
+`build/logs/virtio-prime-wire-before-shared-vmap.log`. After the repair the
+same test passes, and the QEMU host image matches all 1,024,000 pixels.
+
+These are native kernel/LinuxKPI fixes with no new AMDGPU vendor patches or
+application presets. The final ISO passed the real pixel test after the VMAP
+initialization change as well, and its extracted kernel matches the stripped
+build ELF. The existing sysfs PMM accounting failure remains in the isolated
+boot; firmware tests report missing files because this minimal disk omits the
+AMDGPU firmware and disables the hardware driver. The test uses native test dma-bufs rather than the passed AMD
+GPU; a Minecraft/Mesa workload retest after reboot is still required to verify
+all of the user's original artifacts have disappeared.
+
+
+### Native display backend replacement after residual artifacts persisted
+
+The user tested the preceding ISO and reported residual artifacts, then supplied
+a report describing clean Minecraft F2 screenshots and fog-dependent Mesa
+tunnel corruption. Those screenshots favor investigating presentation but are
+not synchronized proof of its location. The VirtIO DRM presentation backend
+was replaced with one scanout-owned immutable-image engine for native and PRIME
+sources. Details, ownership rules, limitations and test commands are recorded
+in `docs/virtio-scanout-rewrite.md`.
+
+The replacement removes per-GEM host-resource ownership and the separate
+asynchronous native in-place publisher. Each output owns two independent DMA
+backings and host images; producer reservations cover copying only. Crop, pitch
+and ADDFB2 offset handling are shared. Resize, partial initialization, host
+response failures and late unrefs retain memory until confirmed safe, with
+worker housekeeping and bounded allocation after unsuccessful cleanup. Existing
+single-output PRIME full-frame coalescing is preserved. No imported AMDGPU/Mesa
+source or application settings were changed.
+
+Actual engine, native gate, snapshot/lifetime and command-ownership regressions
+pass, including negative controls, address/undefined-behavior/leak sanitizers,
+cache/DMA and shared VMAP tests. The final ISO's private two-CPU TCG test
+alternated a padded, offset PRIME ADDFB2 framebuffer with a native dumb ADDFB
+framebuffer: 400 flips and 400 damage commits completed, and 70 active host
+frames plus the final 1280x800 frame matched every expected pixel. The ISO
+kernel matches the stripped current ELF. Synthetic presentation tests do not
+verify the original hardware Minecraft/tunnel artifact or its performance;
+those require a workload retest after loading this replacement.
+
+## Native GPU transaction-lock audit (2026-10-12)
+
+The graphics audit reproduced native ww_mutex first-lock/backoff errors:
+first-lock contention could return EDEADLK, acquired counts never decreased,
+and ownership/context checks were separate from the eventual sleeping acquire.
+The replacement serializes the owner and context with the queue, distinguishes
+wait-die from wound-wait, and wakes blocked wounded holders. The old source
+fails the first-lock regression; 20 stress runs passed 40,000 opposite-order
+transactions across both algorithms. Native boot confirmed the WW contention,
+context accounting and ordered multi-BO tests. The rebuilt ISO completed 400
+flips and 400 damage commits in a private two-CPU TCG VM; 89 active host frames
+and the final 1,024,000 pixels matched. The minimal fixture still reports its
+known absent firmware/ATA devices and pre-existing sysfs PMM drift.
+
+No Mesa or vendor AMDGPU patch from this audit is retained or installed. The
+user's VM and disk image were left untouched. This is a verified native lock
+fix, not proof that the remaining Minecraft artifacts are resolved. See
+[the audit](linuxkpi-gpu-lock-audit.md).
+
+## WW free-owner requeue deadlock correction (2026-10-13)
+
+The user's KVM boot showed both WW workers blocked with the shared lock's
+owner equal to zero. The replacement could insert an older reacquirer ahead
+of a woken younger waiter and sleep without rechecking that the mutex was
+free. Rechecking after insertion fixes that race. A deterministic regression
+rejects the captured pre-fix implementation and passes the correction.
+Twelve stress runs also pass 288,000 rapid eight-thread reacquisitions and
+24,000 opposite-order pairs. The rebuilt ISO's private eight-CPU KVM boot
+passes the eight-worker WW test, context accounting, ordered multi-BO tests,
+and the rest of chunk 6. PRIME presentation completes 400 flips and 400 damage
+commits with 47 active frames and the final 1,024,000 pixels verified. No
+Mesa/AMDGPU change, guest-disk write, or user-VM restart was performed.
+
+## Native GPU flight recorder (2026-10-13)
+
+Remaining Minecraft/Mesa corruption is not resolved by the WW fixes. A native
+`/proc/gpu_debug` recorder now captures DRM ioctl/CS metadata, driver faults,
+cache transitions and actual direct-map attributes, PRIME import/access/fence
+records, copy geometry and presentation IDs. Mode 2 adds 64 source/staging/source
+hash comparisons under the existing snapshot reservation. Mode 1 records
+metadata; dump freezes the buffer to the serial log. Cumulative counters and
+32 retained anomalies preserve evidence after the 2,048-entry ring wraps.
+Instrumentation can change timing/ordering and must not be treated as a fix.
+
+The actual recorder passes concurrent wrap/freeze/chunked-read/hash/retained-
+anomaly tests. The actual ioctl bridge test covers AMDGPU's drm_ioctl wrapper,
+including invalid userspace arguments and disabled logging. Eight-CPU private
+KVM validation completes 400 flips and 400 damage commits, 64 pixel checks and
+1,007 cache checks with zero mismatch; 76 active host frames and the final
+1,024,000 pixels match. No vendor source, game setting, running VM or guest
+disk image was changed. An affected-workload capture is required before
+attributing or claiming to fix the artifact; see
+[capture instructions and record semantics](gpu-flight-recorder.md).
+
+### 2026-10-13: affected-workload recorder interpretation and export repair
+
+The user confirmed Minecraft flicker continued during the capture. Its
+cumulative counters show 6,835 decoded successful CS exits, 64 stable matching
+CPU copies, 5,836 matching cache inspections, and no retained anomalies.
+This does not establish correct shader execution or host display contents.
+The FAULT=256 rows represent VM_FAULT_NOPAGE, not an error.
+
+The serial capture retained only 393 complete rows from a 2,048-entry ring and
+lacked the export end marker. Explicit native export now paces its output
+against serial backlog, queues whole lines, and drains the final output, with
+a 30-second bound for a stalled UART. The frozen proc report remains readable.
+The 64 pixel checks are retained outside the general ring; successful hashes
+previously vanished under normal ioctl traffic. The guest helper saves a file
+before exporting to serial. No Mesa, AMDGPU, or Minecraft settings changes
+were made, and these are diagnostic repairs, not a claimed pixel fix.
+
+The actual recorder regression covers concurrent writers, wrap, exact export
+larger than the 128 KiB serial queue, retained samples, and a stalled serial
+export. An eight-CPU KVM native fixture passed 400 flips and 400 damage commits,
+73 active host frames and the final 1,024,000 pixels. Its complete 2,048 event
+rows and 64 retained samples were checked. No physical AMD/VFIO was attached.
+
+`make gpu-diagnostics` reproducibly builds/packages the offscreen constant
+oracle against the original staged Mesa and provides a transfer bundle without
+rebuilding disk.img. The rebuilt binary passed all 16 software batches in the
+staged rootfs; the physical AMD test remains outstanding. See
+`docs/gpu-flight-recorder.md` for transfer/capture steps and limitations.
+
+### 2026-10-13: native RCU callback lifetime fix
+
+The real AMD asynchronous-constant oracle passed with the recorder disabled,
+while the user reports llvmpipe clean and RadeonSI corruption. The native audit
+found RCU collecting callback batches after their grace period, allowing a
+late callback to destroy an object while a newer reader still references it.
+The captured old implementation fails deterministic regressions for that
+premature callback and for missing a completed drain when new readers enter.
+AMDGPU fence and BO-list destruction and generic dma-resv fence lists use RCU.
+This is a proven native lifetime defect, not a reproduced Minecraft pixel.
+
+Native RCU now isolates FIFO batches before their grace period, records reader
+count/drain generation in one atomic word, counts concurrent waiters, and
+tracks queued/completed batch counts for rcu_barrier. The overlay publishes
+rcu_assign_pointer with release ordering. No Mesa or AMDGPU vendor source or
+game settings were edited. A boot marker identifies the corrected code.
+
+Twenty actual-code host runs passed ASan/UBSan with 160,000 callback frees and
+2,400,000 reader sections. The native 512-object/two-reader lifetime test passed
+on both eight-CPU and one-CPU KVM boots, with bounded reader work and no early
+retirement. Both private fixtures passed 400 flips and 400 damage commits and
+complete recorder exports. These fixtures attach no physical AMD GPU. The
+pre-existing intermittent vkms one-page PMM drift remains visible in the log.
+
+See `docs/linuxkpi-rcu-lifetime.md`. The rebuilt ISO needs affected-workload
+validation before claiming the remaining RadeonSI pixel corruption fixed.
+
+### 2026-10-13: remaining artifact and automatic pipeline oracle
+
+The user still sees pixels after the RCU correction. The affected log confirms
+the new RCU kernel and passing native lifetime test; RCU was a separate real
+defect, not a verified cause of this artifact. The simple constant test passed
+on AMD, but omitted explicit UBO/storage reads and texture/mip/fog workloads.
+
+`test_gpu_pipeline.c` adds exact texture/reuse/alpha/mip checks, a trilinear/EXP2
+fog oracle, and explicit UBO trials under preceding compute work. Uniform and
+divergent storage reads from the same object, CPU source data and the earlier
+compute output are checked separately. Reused/fresh buffers have a serial
+control; pending-fence observations and inconclusive overlap are reported.
+The original Mesa passes the software harness on Linux and on AvoryOS KVM.
+
+The user cannot execute another guest command. `gpu-pipeline-boot.py` prepares
+a private root/ISO and init runner so host-side collection requires no guest
+interaction. Software automatic boot passed. The user then authorized one
+physical AMD boot. It failed during PSP ring creation before registering an
+AMD render node; the automatic probe reported `checks did not run`, exit=2.
+The host stayed running and the runner terminated its own private QEMU.
+No hardware retry, forced reset or rebinding was performed.
+
+The printed IP error `-22` is the generic conversion in imported
+`psp_hw_init()`, not the original return from ring creation. The selected
+MP0 13.0.5 ring path uses `psp_wait_for()`, which returns `-ETIME` on timeout;
+linked-kernel disassembly confirms this. The log lacks the actual PSP response
+register, so a warm-state failure remains a hypothesis. Hardware pipeline
+results and a verified pixel fix remain outstanding. Evidence is saved in
+`build/logs/gpu-pipeline-native-amd.log` and
+`build/gpu-pipeline-boot/hardware-{serial,host}.log`. No vendor patches, game
+settings or further speculative kernel fix were applied. See
+`docs/gpu-pipeline-oracle.md`.
+
+### 2026-10-13: native completion token/publication audit
+
+The requested bounded hardware retry passed PSP/SMU/DMUB initialization but
+failed the KIQ ring test with `-110` before exposing an AMD render node. The
+user requested continuing the native audit without another GPU boot. Both
+physical failure logs are preserved under `build/gpu-pipeline-boot/attempt-*`.
+The diagnostic runner now requests native guest power-off instead of stopping
+QEMU immediately after its result marker; software validation confirms normal
+driver/NVMe shutdown and QEMU exit. No additional physical boot is performed.
+
+The native completion audit found three proven defects: separate unlocked
+ready check/locked decrement permits two consumers of one token and underflow
+to permanent completion; publication unlocks before notification finishes,
+allowing a waiter to release the object before the producer's final queue
+access; and a ready zero-time wait incorrectly reports timeout without
+consuming its token. The native `kthread_stop()` immediately frees its control
+object after its exited completion, and DRM scheduler entity teardown uses
+completion publication too. This establishes API/lifetime relevance, not the
+cause of the remaining Minecraft/Mesa artifact.
+
+Completion waits now check and consume under one queue lock, queue blocked
+waiters at the tail, and release that lock only around native scheduling.
+Producers keep publication and notification under that same lock. Zero-time
+ready waits return success; pending signals and complete_all/reinitialization
+retain Linux completion semantics. Captured old code fails three targeted
+regressions. Corrected actual completion/waitqueue code passes ASan/UBSan,
+all implemented wait APIs and eight waiters consuming 32,000 signals.
+
+The new zero-time and two-reader/one-token native completion tests pass on
+one-CPU and eight-CPU KVM boots. Their presentation fixtures complete 400
+flips and 400 damage updates each, with matching host frames and final pixels.
+An eight-CPU software-only pipeline boot also passes and shuts down normally.
+The ISO is rebuilt with the original hardware/PRIME flags. No vendor source,
+Minecraft preferences or installed disk was changed. Physical RadeonSI pixel
+validation remains outstanding. See `docs/linuxkpi-completion-lifetime.md`.
+
+### 2026-10-13: black desktop and shared-pixmap failure evidence
+
+The new black-screen report is from a boot with successful AMDGPU DRM
+registration and RadeonSI/glamor initialization. A bounded read-only reader
+extracted the running guest's Xorg log/configuration without writing its disk
+or stopping the VM. Xorg reports `randr: failed to create shared pixmap` twice
+after GPU initialization. That identifies a source allocation/sharing failure
+but omits the kernel errno and whether the exporter or native importer failed.
+AMD `No FB bound`/zero-stream output alone is not proof of probe failure in
+the profile where VirtIO presents the shared AMD desktop.
+
+The user could not reach a guest console to dump the existing recorder. Native
+PRIME setup now records failures at source GEM allocation/export, FD/size
+validation, exporter attach/pin, SG/CPU mapping, unsupported I/O memory, object
+and GEM handle allocation. Failed IMPORT records are retained after ring wrap;
+the first 16 errors print stage/errno/size/thread directly to the host serial
+log. Normal successful imports retain their behavior. This is a diagnostic
+correction, not a claimed black-screen or Minecraft pixel fix.
+
+Actual-code fault-injection tests pass ASan/UBSan with balanced cleanup at all
+mapping stages. Recorder tests verify retention/line bounds and disabled
+logging, and source ioctl tests verify invalid-argument handling. The rebuilt
+ISO passes an eight-CPU KVM native fixture (400 flips/400 damage commits and
+matching active/final host pixels), including automatic printing of its
+intentional invalid-FD error. No physical GPU boot, vendor/Xorg patch, game
+setting or installed disk write is performed. See
+`docs/drm-black-screen-sharing.md` and `docs/gpu-flight-recorder.md`.
+
+### 2026-10-13: PRIME interruption exposed missing native syscall restart
+
+The next affected black-screen log records two native PRIME attachment
+failures with `stage=5 error=-512 tid=109` (Xorg). ERESTARTSYS was escaping
+the native syscall dispatcher as errno 512. Libdrm retries EINTR/EAGAIN, so
+this violated the syscall ABI and could abort desktop sharing after successful
+AMDGPU/glamor initialization.
+
+Native signal-frame construction now applies SA_RESTART and Linux's
+ERESTARTSYS/ERESTARTNOINTR/ERESTARTNOHAND return policies before saving the
+context. Ordinary and raw syscall exits use the correction; original arguments
+are preserved, sigreturn restoration is excluded, and redirected rseq/fault
+instruction pointers are not rewound. Unimplemented restart blocks and
+compat32 replay normalize internal results to EINTR.
+
+An actual-code ASan/UBSan regression passes and the captured pre-fix conversion
+fails. A native static test uses an interruptible real LinuxKPI dma-fence ioctl
+and SIGUSR1 to validate EINTR, SA_RESTART and blocked-signal behavior, including
+the saved handler RAX. All cases pass on one-CPU and eight-CPU KVM boots without
+a physical GPU or the user's disk. Existing thread-directed signal and syscall
+user-dispatch regressions pass. The main ISO is rebuilt with this native fix.
+
+This fixes a demonstrated native ABI defect. Physical AMD desktop recovery and
+Minecraft artifacts remain unverified. Details, upstream references and
+repeatable tests are in `docs/drm-black-screen-sharing.md`.

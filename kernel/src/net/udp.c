@@ -381,6 +381,16 @@ void udp_deliver(uint32_t src_ip, uint16_t src_port,
         return;
     }
 
+    if (s->deliver) {
+        s->deliver(s, src_ip, src_port, payload, length);
+        spinlock_acquire(&table_lock);
+        s->refs--;
+        if (s->refs == 0 && s->reap)
+            free_locked(s);
+        spinlock_release(&table_lock);
+        return;
+    }
+
     size_t copy = length > UDP_PAYLOAD_MAX ? UDP_PAYLOAD_MAX : length;
     bool wake = false;
     spinlock_acquire(&s->lock);

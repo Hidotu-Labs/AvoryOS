@@ -41,7 +41,7 @@ Commands:
 scripts/linux-import.sh          # fetch/refresh the pinned v6.6.* subset
 make -C kernel                   # build (import optional)
 make                             # kernel + ISO + disk.img
-make run-linuxdrm SERIAL=file:build/logs/p5.log DISPLAY_OPT='-display none'
+make run-c7-prime
 make run-vfio KERNEL_CMDLINE=kpi_vfio_test=1 SERIAL=file:build/logs/p5-vfio.log \
      VFIO_EXTRA='-device edu'
 ```

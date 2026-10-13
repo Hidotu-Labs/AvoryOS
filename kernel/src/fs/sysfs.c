@@ -52,6 +52,29 @@ static vfs_node_t *gpu_dpms_nodes[VIRTIO_GPU_MAX_SCANOUTS];
 
 // Helpers
 
+static const struct pci_device *sysfs_display_pci(bool amd) {
+  const struct pci_device *native = virtio_gpu_pci_device();
+  const struct pci_device *first = NULL;
+  for (uint32_t i = 0; i < pci_get_device_count(); i++) {
+    struct pci_device *pd = asc_pci_get_device(i);
+    if (!pd || pd->class_code != 0x03)
+      continue;
+    if (!first)
+      first = pd;
+    if (amd && pd->vendor_id == 0x1002)
+      return pd;
+  }
+  return native ? native : first;
+}
+
+static void sysfs_display_address(char *buf, size_t size,
+                                  const struct pci_device *pci) {
+  if (pci)
+    snprintf(buf, size, "0000:%02x:%02x.%u", pci->bus, pci->slot, pci->func);
+  else
+    snprintf(buf, size, "0000:00:01.0");
+}
+
 static void u32_to_hex(uint32_t val, char *buf, int width) {
   const char *hex = "0123456789abcdef";
   buf[width] = '\0';
@@ -213,10 +236,14 @@ static void sysfs_populate_block(vfs_node_t *block_class_dir) {
     sysfs_mkfile(bdir, "ro", "0\n");
 
     // uevent: what udev/libblkid parse to identify a block device.
+    // Partitions must advertise DEVTYPE=partition (not disk) or UDisks2
+    // treats every partition as a whole disk with no filesystem, and the
+    // Disk Usage widget finds no mountable volume (Total 0 B).
     char uevent[160];
     snprintf(uevent, sizeof(uevent),
-             "MAJOR=%u\nMINOR=%u\nDEVNAME=%s\nDEVTYPE=disk\n",
-             bd->linux_major, bd->linux_minor, bd->name);
+             "MAJOR=%u\nMINOR=%u\nDEVNAME=%s\nDEVTYPE=%s\n",
+             bd->linux_major, bd->linux_minor, bd->name,
+             block_is_partition(bd) ? "partition" : "disk");
     sysfs_mkfile(bdir, "uevent", uevent);
 
     // stat: 11 space-separated counters (reads, merges, sectors, ms, ...).
@@ -485,6 +512,9 @@ void sysfs_init(void) {
   vfs_node_t *sys_dir = vfs_finddir(fs_root, "sys");
   if (!sys_dir && fs_root->mkdir) {
     fs_root->mkdir(fs_root, "sys", 0755);
+    /* The first lookup may have cached ENOENT. Publish the newly created
+     * mountpoint before looking it up again. */
+    vfs_dentry_invalidate(fs_root, "sys");
     sys_dir = vfs_finddir(fs_root, "sys");
   }
   if (!sys_dir) {
@@ -516,7 +546,7 @@ void sysfs_init(void) {
     if (userns_dir) {
       vfs_node_t *params_dir = sysfs_mkdir(userns_dir, "parameters");
       if (params_dir) {
-        sysfs_mkfile(params_dir, "enable", "Y\n");
+        sysfs_mkfile(params_dir, "enable", "N\n");
       }
     }
   }
@@ -562,30 +592,11 @@ void sysfs_init(void) {
   // Find the display controller (PCI class 0x03)
   vfs_node_t *drm_class = sysfs_mkdir(class_dir, "drm");
   {
-    char pci_addr[20] = "0000:00:01.0"; // fallback
-    uint32_t pci_count = pci_get_device_count();
-    for (uint32_t i = 0; i < pci_count; i++) {
-      struct pci_device *pd = asc_pci_get_device(i);
-      if (pd && pd->class_code == 0x03) {
-        char tmp[4];
-        pci_addr[0] = '0';
-        pci_addr[1] = '0';
-        pci_addr[2] = '0';
-        pci_addr[3] = '0';
-        pci_addr[4] = ':';
-        u32_to_hex(pd->bus, tmp, 2);
-        pci_addr[5] = tmp[0];
-        pci_addr[6] = tmp[1];
-        pci_addr[7] = ':';
-        u32_to_hex(pd->slot, tmp, 2);
-        pci_addr[8] = tmp[0];
-        pci_addr[9] = tmp[1];
-        pci_addr[10] = '.';
-        pci_addr[11] = '0' + (pd->func & 7);
-        pci_addr[12] = '\0';
-        break;
-      }
-    }
+    const struct pci_device *native_pci = sysfs_display_pci(false);
+    const struct pci_device *amd_pci = sysfs_display_pci(true);
+    char pci_addr[20], amd_addr[20];
+    sysfs_display_address(pci_addr, sizeof(pci_addr), native_pci);
+    sysfs_display_address(amd_addr, sizeof(amd_addr), amd_pci);
     // Build symlink target as a relative path from /sys/class/drm/card0.
     // wlroots calls readlink() and then resolves the result relative to the
     // symlink's parent directory (/sys/class/drm/), so we must use a relative
@@ -611,7 +622,7 @@ void sysfs_init(void) {
      * uevent file's DEVNAME. */
     char sl_target2[128];
     strcpy(sl_target2, "../../devices/pci0000:00/");
-    strcat(sl_target2, pci_addr);
+    strcat(sl_target2, amd_addr);
     strcat(sl_target2, "/drm/card2");
     sysfs_symlink(drm_class, "card2", sl_target2);
 
@@ -621,7 +632,7 @@ void sysfs_init(void) {
      * GPU and falls back to llvmpipe. */
     char sl_target3[128];
     strcpy(sl_target3, "../../devices/pci0000:00/");
-    strcat(sl_target3, pci_addr);
+    strcat(sl_target3, amd_addr);
     strcat(sl_target3, "/drm/renderD129");
     sysfs_symlink(drm_class, "renderD129", sl_target3);
 
@@ -655,8 +666,24 @@ void sysfs_init(void) {
     sysfs_symlink(card0_dir, "subsystem", "../../../../../class/drm");
     sysfs_symlink(card0_dir, "device", "../..");
 
-    /* Phase 6 C7: card2 (amdgpu) fake device, mirrored from card0. */
-    vfs_node_t *card2_dir = sysfs_mkdir(drm_dev, "card2");
+    vfs_node_t *native_render = sysfs_mkdir(drm_dev, "renderD128");
+    sysfs_mkfile(native_render, "dev", "226:128\n");
+    sysfs_mkfile(native_render, "uevent",
+                 "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\n"
+                 "DEVTYPE=drm_minor\nSUBSYSTEM=drm\n");
+    sysfs_symlink(native_render, "subsystem", "../../../../../class/drm");
+    sysfs_symlink(native_render, "device", "../..");
+    char native_render_target[128];
+    snprintf(native_render_target, sizeof(native_render_target),
+             "../../devices/pci0000:00/%s/drm/renderD128", pci_addr);
+    sysfs_symlink(drm_class, "renderD128", native_render_target);
+
+    /* Native card0 belongs to VirtIO; AMD's nodes belong to its own PCI
+     * parent. Sharing the first display-class parent made udev/Xorg identify
+     * the virtual display as AMD whenever AMD appeared first on the bus. */
+    vfs_node_t *amd_dev = sysfs_mkdir(pci_seg, amd_addr);
+    vfs_node_t *amd_drm = sysfs_mkdir(amd_dev, "drm");
+    vfs_node_t *card2_dir = sysfs_mkdir(amd_drm, "card2");
     sysfs_mkfile(card2_dir, "dev", "226:2\n");
     sysfs_mkfile(card2_dir, "uevent",
                  "MAJOR=226\nMINOR=2\nDEVNAME=dri/card2\n"
@@ -665,7 +692,7 @@ void sysfs_init(void) {
     sysfs_symlink(card2_dir, "device", "../..");
 
     /* renderD129 (amdgpu render node, DRM minor 129). */
-    vfs_node_t *render_dir = sysfs_mkdir(drm_dev, "renderD129");
+    vfs_node_t *render_dir = sysfs_mkdir(amd_drm, "renderD129");
     sysfs_mkfile(render_dir, "dev", "226:129\n");
     sysfs_mkfile(render_dir, "uevent",
                  "MAJOR=226\nMINOR=129\nDEVNAME=dri/renderD129\n"
@@ -676,7 +703,12 @@ void sysfs_init(void) {
     // containers. Giving either a uevent file makes libudev treat it as a
     // device, but neither has a subsystem; Xorg then dereferences a NULL
     // subsystem while walking from card0 to its PCI parent.
-    char gpu_uevent[128],ue_vid[5],ue_did[5];uint32_t uvid=0,udid=0;for(uint32_t ui=0;ui<pci_get_device_count();ui++){struct pci_device *upd=asc_pci_get_device(ui);if(upd&&upd->class_code==0x03){uvid=upd->vendor_id;udid=upd->device_id;break;}}u32_to_hex(uvid,ue_vid,4);u32_to_hex(udid,ue_did,4);strcpy(gpu_uevent,"DRIVER=virtio-pci\nPCI_ID=");strcat(gpu_uevent,ue_vid);strcat(gpu_uevent,":");strcat(gpu_uevent,ue_did);strcat(gpu_uevent,"\nSUBSYSTEM=pci\n");sysfs_mkfile(gpu_dev,"uevent",gpu_uevent);
+    char gpu_uevent[128];
+    snprintf(gpu_uevent, sizeof(gpu_uevent),
+             "DRIVER=virtio-pci\nPCI_ID=%04x:%04x\nPCI_SLOT_NAME=%s\nSUBSYSTEM=pci\n",
+             native_pci ? native_pci->vendor_id : 0x1234,
+             native_pci ? native_pci->device_id : 0x1111, pci_addr);
+    sysfs_mkfile(gpu_dev, "uevent", gpu_uevent);
     sysfs_symlink(gpu_dev, "subsystem", "../../../bus/pci");
 
     // Mesa reads vendor/device/class from /sys/dev/char/226:0/device/vendor
@@ -689,7 +721,7 @@ void sysfs_init(void) {
       uint32_t pci_cnt = pci_get_device_count();
       for (uint32_t ii = 0; ii < pci_cnt; ii++) {
         struct pci_device *gpd = asc_pci_get_device(ii);
-        if (gpd && gpd->class_code == 0x03) {
+        if (gpd && gpd == native_pci) {
           vid = gpd->vendor_id;
           did = gpd->device_id;
           cls = ((uint32_t)gpd->class_code << 16) |
@@ -747,7 +779,7 @@ void sysfs_init(void) {
     strcpy(sysfs_gpu_connector_devpath, sysfs_gpu_devpath);
     strcat(sysfs_gpu_connector_devpath, "/card0-HDMI-A-1");
     strcpy(sysfs_gpu2_devpath, "/devices/pci0000:00/");
-    strcat(sysfs_gpu2_devpath, pci_addr);
+    strcat(sysfs_gpu2_devpath, amd_addr);
     strcat(sysfs_gpu2_devpath, "/drm/card2");
 
     // Add devices/ directory under drm_class so that
@@ -771,13 +803,13 @@ void sysfs_init(void) {
       /* Phase 6 C7: same for amdgpu's card2 and render node. */
       char card2_rel[128];
       strcpy(card2_rel, "../../../devices/pci0000:00/");
-      strcat(card2_rel, pci_addr);
+      strcat(card2_rel, amd_addr);
       strcat(card2_rel, "/drm/card2");
       sysfs_symlink(drm_devices_dir, "card2", card2_rel);
 
       char render_rel[128];
       strcpy(render_rel, "../../../devices/pci0000:00/");
-      strcat(render_rel, pci_addr);
+      strcat(render_rel, amd_addr);
       strcat(render_rel, "/drm/renderD129");
       sysfs_symlink(drm_devices_dir, "renderD129", render_rel);
     }
@@ -939,53 +971,21 @@ void sysfs_init(void) {
   }
   vfs_node_t *char_dir = sysfs_mkdir(dev_dir, "char");
   {
-    // Find the GPU PCI address (same logic as above)
-    char pci_addr2[20] = "0000:00:01.0";
-    uint32_t pci_count2 = pci_get_device_count();
-    for (uint32_t i = 0; i < pci_count2; i++) {
-      struct pci_device *pd = asc_pci_get_device(i);
-      if (pd && pd->class_code == 0x03) {
-        char tmp2[4];
-        pci_addr2[0] = '0';
-        pci_addr2[1] = '0';
-        pci_addr2[2] = '0';
-        pci_addr2[3] = '0';
-        pci_addr2[4] = ':';
-        u32_to_hex(pd->bus, tmp2, 2);
-        pci_addr2[5] = tmp2[0];
-        pci_addr2[6] = tmp2[1];
-        pci_addr2[7] = ':';
-        u32_to_hex(pd->slot, tmp2, 2);
-        pci_addr2[8] = tmp2[0];
-        pci_addr2[9] = tmp2[1];
-        pci_addr2[10] = '.';
-        pci_addr2[11] = '0' + (pd->func & 7);
-        pci_addr2[12] = '\0';
-        break;
-      }
-    }
-    // /sys/dev/char/226:0 -> symlink to the PCI device directory
-    // Relative from /sys/dev/char/226:0/ :
-    // ../../devices/pci0000:00/<addr>/drm/card0
-    char dev_target[128];
-    strcpy(dev_target, "../../devices/pci0000:00/");
-    strcat(dev_target, pci_addr2);
-    strcat(dev_target, "/drm/card0");
+    char dev_target[160];
+    snprintf(dev_target, sizeof(dev_target), "../..%s", sysfs_gpu_devpath);
     sysfs_symlink(char_dir, "226:0", dev_target);
-
-    /* Phase 6 C7: amdgpu's card2 and renderD129 char devices.  libdrm's
-     * drmGetDevice2() starts from /sys/dev/char/<major>:<minor>. */
-    char dev_target2[128];
-    strcpy(dev_target2, "../../devices/pci0000:00/");
-    strcat(dev_target2, pci_addr2);
-    strcat(dev_target2, "/drm/card2");
-    sysfs_symlink(char_dir, "226:2", dev_target2);
-
-    char dev_target3[128];
-    strcpy(dev_target3, "../../devices/pci0000:00/");
-    strcat(dev_target3, pci_addr2);
-    strcat(dev_target3, "/drm/renderD129");
-    sysfs_symlink(char_dir, "226:129", dev_target3);
+    snprintf(dev_target, sizeof(dev_target), "../..%s", sysfs_gpu2_devpath);
+    sysfs_symlink(char_dir, "226:2", dev_target);
+    char amd_addr[20];
+    sysfs_display_address(amd_addr, sizeof(amd_addr), sysfs_display_pci(true));
+    snprintf(dev_target, sizeof(dev_target),
+             "../../devices/pci0000:00/%s/drm/renderD129", amd_addr);
+    sysfs_symlink(char_dir, "226:129", dev_target);
+    char native_addr[20];
+    sysfs_display_address(native_addr, sizeof(native_addr), sysfs_display_pci(false));
+    snprintf(dev_target, sizeof(dev_target),
+             "../../devices/pci0000:00/%s/drm/renderD128", native_addr);
+    sysfs_symlink(char_dir, "226:128", dev_target);
   }
 
   // Input char devices: /sys/dev/char/13:64 -> symlink to virtual device

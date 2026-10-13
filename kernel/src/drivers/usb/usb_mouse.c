@@ -120,6 +120,7 @@ struct hid_mouse_field {
   uint8_t bit_size;     // Field width in bits
   bool is_signed;       // Logical minimum was negative
   bool is_absolute;     // X/Y are absolute (touchpad-style) values
+  int32_t logical_min, logical_max;
 };
 
 struct hid_mouse_report {
@@ -278,6 +279,8 @@ static void hid_parse_input(struct hid_parser *p, struct hid_mouse_layout *l,
           f->is_signed = p->logical_min < 0;
           f->is_absolute = (kind == HID_FIELD_X || kind == HID_FIELD_Y) &&
                            !relative;
+          f->logical_min = p->logical_min;
+          f->logical_max = p->logical_max;
         } else {
           /* Dropping a field silently would turn a 16-button receiver into a
            * pointer that can never move; count it so the probe can say so. */
@@ -368,7 +371,8 @@ static bool hid_parse_mouse_layout(const uint8_t *desc, uint32_t len,
         p.logical_min = hid_sign_extend(value, size);
         break;
       case 2:
-        p.logical_max = hid_sign_extend(value, size);
+        p.logical_max = p.logical_min < 0 ? hid_sign_extend(value, size)
+                                        : (int32_t)value;
         break;
       case 7:
         p.report_size = value;
@@ -570,6 +574,7 @@ struct usb_mouse_event {
 };
 
 struct usb_mouse_state {
+  bool absolute_pointer;
   struct usb_device *dev;
   struct uhci_controller *hc; // Non-NULL only for UHCI-backed devices
   uint8_t ep_addr;            // Endpoint address (direction bit + number)
@@ -701,7 +706,20 @@ struct hid_mouse_delta {
   int32_t pan;
   uint32_t buttons;
   bool valid;
+  bool absolute_x, absolute_y;
+  int32_t x, y;
 };
+
+static int32_t hid_absolute_coord(int32_t value,
+                                  const struct hid_mouse_field *field) {
+  int64_t range = (int64_t)field->logical_max - field->logical_min;
+  if (range <= 0)
+    return 0;
+  int64_t offset = (int64_t)value - field->logical_min;
+  if (offset < 0) offset = 0;
+  if (offset > range) offset = range;
+  return (int32_t)(offset * 32767 / range);
+}
 
 // Extract one report's fields into a delta.  Returns false when the transfer
 // is not the mouse report (unknown report ID) or is too short to hold it.
@@ -814,6 +832,8 @@ static bool usb_mouse_parse_report(struct usb_mouse_state *ms,
     switch (f->kind) {
     case HID_FIELD_X:
       if (f->is_absolute) {
+        out->absolute_x = true;
+        out->x = hid_absolute_coord(value, f);
         if (ms->abs_x_valid)
           out->dx += value - ms->abs_x;
         ms->abs_x = value;
@@ -824,6 +844,8 @@ static bool usb_mouse_parse_report(struct usb_mouse_state *ms,
       break;
     case HID_FIELD_Y:
       if (f->is_absolute) {
+        out->absolute_y = true;
+        out->y = hid_absolute_coord(value, f);
         if (ms->abs_y_valid)
           out->dy += value - ms->abs_y;
         ms->abs_y = value;
@@ -868,8 +890,12 @@ static void usb_mouse_decode(struct usb_mouse_state *ms, const uint8_t *buf,
     usb_debug_hexdump("[USB-MOUSE]   raw", buf, len, 16);
   }
 
-  mouse_apply_report(delta.dx, delta.dy, delta.wheel, delta.pan,
-                     delta.buttons);
+  if (delta.absolute_x && delta.absolute_y)
+    mouse_apply_absolute_report(delta.x, delta.y, delta.wheel, delta.pan,
+                                delta.buttons);
+  else
+    mouse_apply_report(delta.dx, delta.dy, delta.wheel, delta.pan,
+                       delta.buttons);
 }
 
 // UHCI interrupt transfer setup
@@ -1437,6 +1463,24 @@ bool usb_mouse_probe(struct usb_device *dev) {
   ms->get_protocol_value = protocol_value;
   ms->set_idle_result = (uint32_t)set_idle_result;
   ms->active = true;
+  /* Publish capabilities at attachment, even before the first movement.
+   * Converting tablet positions into relative deltas makes Xorg accelerate
+   * them and creates a host/guest cursor feedback loop in QEMU GTK. */
+  for (uint8_t r = 0; r < HID_MAX_REPORTS; r++) {
+    bool abs_x = false, abs_y = false;
+    for (uint8_t f = 0; f < layout.reports[r].field_count; f++) {
+      const struct hid_mouse_field *field = &layout.reports[r].fields[f];
+      if (!field->is_absolute || field->logical_max <= field->logical_min)
+        continue;
+      abs_x |= field->kind == HID_FIELD_X;
+      abs_y |= field->kind == HID_FIELD_Y;
+    }
+    if (abs_x && abs_y) {
+      ms->absolute_pointer = true;
+      mouse_configure_absolute(true);
+      break;
+    }
+  }
 
   klog_puts("[USB-MOUSE] GET_REPORT(input) ");
   if (get_report_result < 0) {
@@ -1556,6 +1600,10 @@ void usb_mouse_disconnect(struct usb_device *dev) {
     ms->dev = NULL;
     klog_puts("[USB-MOUSE] Mouse detached\n");
   }
+  bool absolute = false;
+  for (int i = 0; i < mouse_count; i++)
+    absolute |= mice[i].active && mice[i].absolute_pointer;
+  mouse_configure_absolute(absolute);
 }
 
 // Polling

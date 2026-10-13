@@ -27,8 +27,8 @@
 #define KPI_VMAP_BASE 0xFFFFC00000000000ULL
 #define KPI_VMAP_END 0xFFFFE00000000000ULL
 
-/* Pre-populate tables across the whole window: one entry per 512 GB PML4
- * slot.  Walking the window at init costs a few hundred page-table frames. */
+/* Pre-populate a stable writable PDPT across the whole window: one entry
+ * per 512 GB PML4 slot. Empty child tables can be reclaimed after setup. */
 #define KPI_VMAP_PREPOP_STRIDE 0x8000000000ULL /* 512 GB */
 #define KPI_VMAP_PREPOP_ENTRIES 64ULL
 
@@ -167,7 +167,7 @@ static void *vmap_do_alloc(unsigned long size, struct page **given_pages,
     for (i = 0; i < nr_pages; i++) {
       if (!vmap_map_page(area->start + i * PAGE_SIZE,
                          page_to_phys(given_pages[i]),
-                         map_flags)) {
+                         linuxkpi_page_cache_flags(page_to_phys(given_pages[i])))) {
         while (i-- > 0)
           vmap_unmap_page(area->start + i * PAGE_SIZE);
         goto fail_area;
@@ -545,7 +545,6 @@ void linuxkpi_vmalloc_init(void) {
 
   if (vmap_ready)
     return;
-  vmap_ready = true;
 
   zero_phys = asc_pmm_get_zero_page_phys();
   if (!zero_phys)
@@ -555,7 +554,15 @@ void linuxkpi_vmalloc_init(void) {
     uint64_t va = KPI_VMAP_BASE + i * KPI_VMAP_PREPOP_STRIDE;
     if (va >= KPI_VMAP_END)
       break;
-    asc_vmm_map_page(asc_vmm_get_kernel_pml4(), va, zero_phys,
-                     ASC_PAGE_PRESENT | ASC_PAGE_NX);
+    /* Clone paths copy the PML4 flags as well as the PDPT pointer. Prepare
+     * RW now so later writable mappings work in roots cloned while this
+     * slot was empty. Remove the temporary leaf immediately: an unallocated
+     * VMAP address must not expose a writable alias of the global zero page.
+     * Native reclamation retains the shared kernel PDPT even when empty. */
+    if (!asc_vmm_map_page(asc_vmm_get_kernel_pml4(), va, zero_phys,
+                          ASC_PAGE_PRESENT | ASC_PAGE_RW | ASC_PAGE_NX))
+      return;
+    asc_vmm_unmap_page(asc_vmm_get_kernel_pml4(), va);
   }
+  vmap_ready = true;
 }

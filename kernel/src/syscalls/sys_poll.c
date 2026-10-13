@@ -37,6 +37,10 @@ static int poll_check_fds(struct pollfd *fds, uint64_t nfds, struct thread *t) {
       continue;
     }
     int ret = vfs_poll(t->fds[fd], fds[i].events);
+    /* poll handlers may describe every currently ready direction. Only
+     * ERR/HUP/NVAL bypass the caller's interest mask. */
+    if (ret > 0)
+      ret &= (unsigned short)fds[i].events | POLLERR | POLLHUP | POLLNVAL;
     if (ret < 0) {
       fds[i].revents = POLLNVAL;
       ready++;
@@ -125,6 +129,12 @@ static uint64_t do_poll(struct pollfd *fds, uint64_t nfds,
 
     size_t wq_count = 0;
     size_t valid_fds = 0;
+    /* A timer must not park us before the wake entries and fallback deadline
+     * exist. Producers may still race registration; the readiness recheck
+     * below catches events that arrived before their entry was linked. */
+    hal_irq_state_t irq_flags = hal_irq_save();
+    uint64_t safety_at = lapic_timer_get_ticks() + POLL_SAFETY_NET_MS;
+    t->wakeup_ticks = deadline < safety_at ? deadline : safety_at;
     t->state = THREAD_BLOCKED;
     for (uint64_t i = 0; i < nfds; i++) {
       int fd = fds[i].fd;
@@ -144,12 +154,7 @@ static uint64_t do_poll(struct pollfd *fds, uint64_t nfds,
       }
     }
 
-    uint64_t safety_at = lapic_timer_get_ticks() + POLL_SAFETY_NET_MS;
-    if (deadline != (uint64_t)-1) {
-      t->wakeup_ticks = (deadline < safety_at) ? deadline : safety_at;
-    } else {
-      t->wakeup_ticks = safety_at;
-    }
+    hal_irq_restore(irq_flags);
 
     ready = poll_check_fds(fds, nfds, t);
     if (ready > 0) {
@@ -193,17 +198,10 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms,
   (void)a5;
 
   struct thread *t = sched_get_current();
-  if (nfds == 0) {
-    if (timeout_ms > 0 && timeout_ms != (uint64_t)-1) {
-      t->state = THREAD_SLEEPING;
-      uint64_t wait = (timeout_ms == (uint64_t)-1) ? 10 : timeout_ms;
-      if (wait == 0)
-        wait = 1;
-      t->wakeup_ticks = lapic_timer_get_ticks() + wait;
-      sched_yield();
-    }
-    return 0;
-  }
+  /* A zero-fd poll is a signal-interruptible sleep, including an infinite
+   * timeout. Use the same deadline and wake handling as other polls. */
+  if (nfds == 0)
+    return do_poll(NULL, 0, timeout_ms);
   if (!is_user_ptr(fds_ptr) ||
       !vmm_is_user_addr_range_valid(fds_ptr, nfds * sizeof(struct pollfd)))
     return (uint64_t)-14;

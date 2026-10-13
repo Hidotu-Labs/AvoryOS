@@ -67,6 +67,7 @@ int interrupt_vector_alloc(isr_t handler) {
   if (!handler) return -1;
   /* 0x60..0xDF avoids exceptions, legacy IRQs, timer/IPIs and spurious. */
   for (uint16_t vector = 0x60; vector <= 0xDF; vector++) {
+    if (vector == 0x80) continue; /* Linux i386 software syscall gate */
     if (!__atomic_test_and_set(&allocated_device_vectors[vector],
                                __ATOMIC_ACQ_REL)) {
       interrupt_handlers[vector] = handler;
@@ -692,7 +693,7 @@ void isr_report_user_fault(struct registers *regs, int sig,
     }
 
     if (has_custom_handler) {
-      if (is_sync) {
+      if (is_sync && KLOG_VERBOSE) {
         /* Rate-limit: the handler-crash loop used to spam this line
          * thousands of times (same tid/rip/addr). Dedup identical faults
          * and sample the rest. last_report_* is shared with the DFL path
@@ -789,6 +790,11 @@ void isr_report_user_fault(struct registers *regs, int sig,
               klog_puts(sc_name ? sc_name : "unknown");
               klog_puts(" ("); klog_uint64(current->last_syscall_num); klog_puts(") -> ");
               klog_int64(current->last_syscall_ret); klog_puts("\n");
+              klog_puts("  args:");
+              for (int i = 0; i < 6; i++) {
+                klog_puts(" "); klog_hex64(current->last_syscall_args[i]);
+              }
+              klog_puts("\n");
               klog_puts("EXE: "); klog_puts(current->exe_path[0] ? current->exe_path : "?"); klog_puts("\n");
             }
           } else if (seen == 9) {
@@ -1381,6 +1387,10 @@ static void isr_dispatch(struct registers *regs) {
 }
 
 void isr_handler(struct registers *regs) {
+  if (regs->int_no == 0x80) {
+    syscall_compat_dispatch(regs);
+    return; /* Software syscall: no controller EOI or hardirq accounting. */
+  }
   int is_hw_irq = (regs->int_no >= 32);
 
   /* Track hardirq context for LinuxKPI's in_interrupt().  CPU exceptions are

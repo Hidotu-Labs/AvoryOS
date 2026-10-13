@@ -448,6 +448,8 @@ struct drm_crtc {
   struct drm_plane *primary;
   struct drm_plane *cursor;
   struct drm_framebuffer *fb;
+  /* Legacy cursor state belongs to this CRTC and owns its GEM reference. */
+  struct drm_framebuffer *legacy_cursor_fb;
 };
 
 /* Upper bound on the DIRTYFB clip rectangles retained per framebuffer.
@@ -464,6 +466,10 @@ struct drm_framebuffer {
   uint32_t pitch, bpp;
   uint32_t pixel_format; /* DRM_FORMAT_* fourcc; important for cursor alpha */
   struct drm_gem_object *gem_obj;
+
+  /* Byte offset of plane zero within the source GEM. Host scanout backing
+   * is owned by the backend, so this belongs to the framebuffer layout. */
+  uint32_t backing_offset;
 
   /* Legacy DIRTYFB damage retained until this buffer is next scanned out.
    * A new framebuffer is always uploaded in full once; afterwards a producer
@@ -599,14 +605,15 @@ struct drm_mode_fb_cmd2 {
 };
 
 /* ── GEM PRIME / DMA-buf ─────────────────────────────────────────────────── */
-#define DRM_IOCTL_PRIME_HANDLE_TO_FD 0xC008642D
-#define DRM_IOCTL_PRIME_FD_TO_HANDLE 0xC008642E
+#define DRM_IOCTL_PRIME_HANDLE_TO_FD 0xC00C642D
+#define DRM_IOCTL_PRIME_FD_TO_HANDLE 0xC00C642E
 
 struct drm_prime_handle {
   uint32_t handle;
   uint32_t flags;
   int32_t fd;
 };
+_Static_assert(sizeof(struct drm_prime_handle) == 12, "drm_prime_handle ABI size");
 
 /* ── Per-file (per-client) DRM state ─────────────────────────────────────── */
 #define DRM_MAX_HANDLES_PER_FILE 256
@@ -701,6 +708,9 @@ struct drm_gem_object {
   uint64_t (*get_page_phys)(struct drm_gem_object *obj, uint32_t page);
   void (*free)(struct drm_device *dev, struct drm_gem_object *obj);
   void *driver_private;
+  void *prime_buffer; /* referenced Linux dma_buf for a foreign GEM import */
+  void *prime_mapping; /* pinned attachment + CPU mapping */
+  void *prime_reservation; /* shared implicit fences for native exports */
 };
 
 typedef void (*drm_commit_damage_fn_t)(struct drm_device *dev,
@@ -727,12 +737,20 @@ uint32_t ascentdrm_crtc_scanout_id(uint32_t crtc_id);
 void ascentdrm_ensure_outputs(struct drm_device *dev, uint32_t count);
 void ascentdrm_update_output_state(struct drm_device *dev, uint32_t scanout, bool connected);
 void ascentdrm_register_cursor_backend(drm_cursor_fn_t cursor);
+void ascentdrm_cursor_reset(struct drm_device *dev);
+int ascentdrm_ioctl_legacy_cursor(struct drm_file *file, struct drm_device *dev,
+                                  const struct drm_mode_cursor2 *cur);
 void ascentdrm_register_scanout_backend(drm_create_dumb_fn_t create_dumb,
                                   drm_commit_damage_fn_t commit_damage,
                                   drm_get_modes_fn_t get_modes,
                                   drm_pageflip_fn_t pageflip);
 struct drm_gem_object *ascentdrm_gem_object_create(struct drm_device *dev, size_t size);
 void ascentdrm_gem_object_free(struct drm_device *dev, struct drm_gem_object *obj);
+void ascentdrm_gem_release_storage(struct drm_gem_object *obj);
+int ascentdrm_prime_export(struct drm_gem_object *obj, unsigned int flags);
+int ascentdrm_prime_import(struct drm_file *file, int fd, uint32_t *handle);
+int ascentdrm_gem_begin_cpu(struct drm_gem_object *obj);
+void ascentdrm_gem_end_cpu(struct drm_gem_object *obj);
 struct drm_gem_object *ascentdrm_gem_find_by_handle_get(struct drm_device *dev, uint32_t handle);
 /* Atomic lifetime helpers (implemented in drm_gem.c). get() adds one
  * reference; put() drops one and returns true exactly once, when the last

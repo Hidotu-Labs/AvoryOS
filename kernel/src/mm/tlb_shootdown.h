@@ -29,6 +29,8 @@ void tlb_shootdown_all(void);
 struct registers;
 void tlb_shootdown_handle_ipi_regs(struct registers *regs);
 void tlb_shootdown_handle_ipi(void);
+/* Service a pending local invalidation from an IRQ-masked lock wait. */
+void tlb_shootdown_poll(void);
 
 /* Cost counters, exported for /proc/tlb_stats.
  *

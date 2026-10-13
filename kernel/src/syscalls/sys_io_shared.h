@@ -35,6 +35,7 @@
  * is what QProcess opens for a child's working directory. */
 #define __O_TMPFILE 0x400000
 #define O_PATH 0x200000
+#define O_NOFOLLOW 0x20000
 #define O_TMPFILE (__O_TMPFILE | O_DIRECTORY)
 
 /* FD_CLOEXEC packed into fd_flags[] above the status-flag range */
@@ -47,6 +48,26 @@
 
 static inline bool fd_is_valid_node(const vfs_node_t *node) {
   return node != NULL && node != FD_RESERVED;
+}
+
+/* Pin a published descriptor before leaving the file-table lock. Blocking
+ * handlers may run after another thread closes or replaces the fd. */
+static inline vfs_node_t *fd_node_get(struct thread *t, uint64_t fd) {
+  if (!t || !t->files || fd >= MAX_FDS)
+    return NULL;
+  spinlock_acquire(&t->files->lock);
+  vfs_node_t *node = t->fds[fd];
+  if (fd_is_valid_node(node))
+    vfs_node_ref(node);
+  else
+    node = NULL;
+  spinlock_release(&t->files->lock);
+  return node;
+}
+
+static inline void fd_node_put(vfs_node_t **node) {
+  if (*node)
+    vfs_close(*node);
 }
 
 #define FD_CLOEXEC 1
@@ -118,10 +139,13 @@ struct statx {
   uint32_t stx_rdev_minor;
   uint32_t stx_dev_major;
   uint32_t stx_dev_minor;
-  uint64_t __spare2[14];
+  uint64_t stx_mnt_id;
+  uint64_t __spare2[13];
 };
 
 #define STATX_TYPE 0x0001U
+#define STATX_MNT_ID 0x1000U
+#define STATX_MNT_ID_UNIQUE 0x4000U
 #define STATX_MODE 0x0002U
 #define STATX_NLINK 0x0004U
 #define STATX_UID 0x0008U
@@ -282,6 +306,7 @@ extern struct termios console_termios;
 // FD helpers (defined in sys_fd.c, used everywhere)
 // ---------------------------------------------------------------------------
 int alloc_fd(struct thread *t);
+void fd_release_reserved(struct thread *t, int fd);
 int alloc_fd_from(struct thread *t, int from);
 uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags, uint64_t mode);
 

@@ -1,4 +1,5 @@
 #include "mm/pmm_internal.h"
+#include "mm/numa.h"
 #include "console/klog.h"
 #include "hal/hal.h"
 #include "lib/string.h"
@@ -96,7 +97,6 @@ void pmm_reclaim_bootloader(uint64_t kernel_phys_base) {
   klog_puts("[PMM] Reclaiming unprotected bootloader pages...\n");
 
   hal_irq_state_t flags = hal_irq_save();
-  spinlock_acquire(&b_zone.lock);
 
   for (size_t b = 0; b < pmm_bitmap_size; b++) {
     if (temp_bitmap[b]) {
@@ -125,6 +125,9 @@ void pmm_reclaim_bootloader(uint64_t kernel_phys_base) {
               uint64_t n_pages = 1ULL << (order + 1);
               if (n_pages > remaining || (phys % (n_pages * PAGE_SIZE)) != 0)
                 break;
+              if (numa_phys_to_node(phys) !=
+                  numa_phys_to_node(phys + n_pages * PAGE_SIZE - 1))
+                break;
               order++;
             }
 
@@ -133,7 +136,11 @@ void pmm_reclaim_bootloader(uint64_t kernel_phys_base) {
             pmm_bitmap_set_range(pmm_managed_bitmap, base_pfn, p_count);
             memset(&pmm_refcounts[base_pfn - pmm_lowest_page], 0,
                    p_count * sizeof(uint16_t));
-            buddy_free_internal(&b_zone, phys, order);
+            struct numa_node *node = numa_get_node(numa_phys_to_node(phys));
+            spinlock_acquire(&node->zone.lock);
+            buddy_free_internal(&node->zone, phys, order);
+            node->usable_memory += p_count * PAGE_SIZE;
+            spinlock_release(&node->zone.lock);
             pmm_usable_memory += p_count * PAGE_SIZE;
             p += p_count;
           }
@@ -143,7 +150,6 @@ void pmm_reclaim_bootloader(uint64_t kernel_phys_base) {
   }
 
   pmm_internal_memmap = NULL;
-  spinlock_release(&b_zone.lock);
   hal_irq_restore(flags);
 
   klog_puts("[PMM] Bootloader memory reclaimed. Usable RAM now: ");

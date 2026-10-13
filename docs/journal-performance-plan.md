@@ -25,8 +25,10 @@ improvement requires more than 90% of the original runtime to be removable.
 ## Findings in the current working tree
 
 - `ext3_journal_start()` uses one owner and lock per mount. Other writers
-  repeatedly yield until the owner finishes the operation and its commit.
-- `ext3_journal_block()` synchronously writes every submitted metadata image
+  now sleep on a wait queue until the owner finishes the operation and its
+  commit. Slow-owner logs expose hold time, phase and the outer call site.
+- `ext3_journal_block()` skips full images already present in the coherent
+  home cache with no in-flight write, and synchronously writes changed metadata images
   to the journal and its home block. Repeated changes to the same block get
   additional tags and additional writes; there is no transaction write-set.
 - Immediate home writes were introduced to prevent stale allocator reads

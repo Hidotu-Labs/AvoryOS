@@ -46,6 +46,8 @@
  * 0 when not (and -EINVAL for a non-user address).  Lets the test observe
  * the PTE invalidations unmap_mapping_range() performs. */
 #define KPI_DMABUF_IOC_PTE_PRESENT _IOWR(KPI_DMABUF_MAGIC, 0x0b, unsigned long)
+/* Same fence wait as WAIT, but interruptible; validates syscall restart. */
+#define KPI_DMABUF_IOC_WAIT_INTR _IOW(KPI_DMABUF_MAGIC, 0x0c, int)
 
 #define KPI_DMABUF_MAX_PAGES 4096 /* 16 MiB per BO */
 

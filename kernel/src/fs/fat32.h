@@ -137,6 +137,16 @@ typedef struct {
   vfs_node_t *root_node;        // VFS node for root directory
 } fat32_mount_t;
 
+/* Native x86_64 VFAT directory ioctl ABI. Names are lengths, not record sizes. */
+struct fat32_ioctl_dirent {
+  uint64_t ino, offset;
+  uint16_t reclen;
+  char name[256];
+};
+_Static_assert(sizeof(struct fat32_ioctl_dirent) == 280, "VFAT dirent ABI");
+int fat32_read_aliases(vfs_node_t *node, uint32_t index, bool short_only,
+                       struct fat32_ioctl_dirent result[2]);
+
 // Public API
 
 // Mount a FAT32 filesystem from the given block device onto the given VFS node.

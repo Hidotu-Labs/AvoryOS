@@ -351,7 +351,7 @@ static long kpi_dmabuf_ioctl_sync_fd(struct kpi_dmabuf_state *st) {
   return fd;
 }
 
-static long kpi_dmabuf_ioctl_wait(unsigned long arg) {
+static long kpi_dmabuf_ioctl_wait(unsigned long arg, bool interruptible) {
   struct dma_fence *fence = sync_file_get_fence((int)arg);
   long ret;
 
@@ -359,7 +359,7 @@ static long kpi_dmabuf_ioctl_wait(unsigned long arg) {
     return -EINVAL;
 
   /* 6.6 timeout is in jiffies; 10 s at HZ=1000. */
-  ret = dma_fence_wait_timeout(fence, false, 10 * 1000);
+  ret = dma_fence_wait_timeout(fence, interruptible, 10 * 1000);
   dma_fence_put(fence);
   return ret < 0 ? ret : 0;
 }
@@ -395,7 +395,9 @@ static long kpi_dmabuf_dev_ioctl(struct file *file, unsigned int cmd,
     dma_fence_signal(st->fence);
     return 0;
   case KPI_DMABUF_IOC_WAIT:
-    return kpi_dmabuf_ioctl_wait(arg);
+    return kpi_dmabuf_ioctl_wait(arg, false);
+  case KPI_DMABUF_IOC_WAIT_INTR:
+    return kpi_dmabuf_ioctl_wait(arg, true);
   case KPI_DMABUF_IOC_PMM_FREE:
     /* Includes PCP-cached pages: the plain buddy count visibly drops after
      * heavy churn even when nothing leaked. */

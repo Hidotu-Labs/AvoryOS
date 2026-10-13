@@ -37,10 +37,13 @@
 #include "../apic/lapic.h"
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
+#include "../lib/string.h"
 #include "../cpu/isr.h"
 #include "../drivers/serial.h"
 #include "../hal/hal.h"
 #include "../lib/tsc.h"
+#include "../mm/pmm.h"
+#include "../mm/vmm.h"
 #include "../sched/sched.h"
 #include "../smp/cpu.h"
 #include "spinlock.h"
@@ -53,6 +56,19 @@ uint64_t tlb_shootdown_caller_info(int slot, uint64_t *ip, uint64_t *total,
 /* The kernel image is linked at this base; anything at or above it is kernel
  * code, which is the filter the stack scans use to spot return addresses. */
 #define KERNEL_IMAGE_BASE 0xFFFFFFFF80000000ULL
+extern char __kernel_text_start[], __kernel_text_end[];
+#include "fs/ext4/ext4.h"
+
+static ext3_journal_state_t *lockdiag_root_journal(void) {
+  /* Root directories have no regular-file read callback. Identify their
+   * mount through statfs instead of requiring ext4_read_impl. */
+  if (!fs_root || !fs_root->device ||
+      (fs_root->statfs != ext4_statfs_impl &&
+       fs_root->statfs != ext2_statfs_impl))
+    return NULL;
+  ext2_mount_t *mnt = fs_root->device;
+  return &mnt->journal;
+}
 
 /* NOTE on units: tsc_get_mhz() returns *megahertz*, i.e. TSC ticks per
  * MICROSECOND, so one millisecond is mhz * 1000 ticks.  mm/tlb_shootdown.c
@@ -63,8 +79,8 @@ uint64_t tlb_shootdown_caller_info(int slot, uint64_t *ip, uint64_t *total,
 extern spinlock_t tid_lock;            /* sched/sched_thread.c */
 extern struct thread *global_thread_list; /* sched/sched_thread.c */
 
-/* syscalls/sys_futex.c: per-bucket wake traffic, used to tell an idle worker
- * pool apart from a wakeup that was actually lost. */
+/* Bucket-wide wake traffic; collisions and normal no-waiter wakes mean these
+ * totals alone cannot establish that a particular thread lost a wakeup. */
 uint64_t futex_bucket_stats(uint32_t bucket, uint64_t *wakes,
                             uint64_t *no_match);
 
@@ -79,6 +95,7 @@ uint32_t serial_pending_bytes(void);
 
 static lockdiag_spot_t g_spots[LOCKDIAG_SPOT_COUNT] = {
     [LOCKDIAG_SPOT_VMM] = {.name = "vmm_lock"},
+    [LOCKDIAG_SPOT_SHOOTDOWN] = {.name = "shootdown_lock"},
     [LOCKDIAG_SPOT_GPU_POLL] = {.name = "gpu_poll_lock"},
     [LOCKDIAG_SPOT_GPU_PRESENT] = {.name = "gpu_present_lock"},
     [LOCKDIAG_SPOT_GPU_CURSOR] = {.name = "gpu_cursor_lock"},
@@ -548,7 +565,8 @@ static void dump_stack(uint64_t low, uint64_t high, int max_entries) {
   for (uint64_t a = top; a >= low && shown < max_entries; a -= 8) {
     uint64_t v = *(const volatile uint64_t *)a;
     /* Below the image base is data or stale stack litter, never a frame. */
-    if (v >= KERNEL_IMAGE_BASE) {
+    if (v >= (uint64_t)__kernel_text_start &&
+        v < (uint64_t)__kernel_text_end) {
       ld_str(" ");
       ld_hex(v);
       shown++;
@@ -558,6 +576,249 @@ static void dump_stack(uint64_t low, uint64_t high, int max_entries) {
   }
   if (!shown)
     ld_str(" (none)");
+}
+
+/* Suspended threads have a saved RSP: start there, not at the oldest
+ * syscall frames at the top of the stack. Only print actual text addresses. */
+static void dump_parked_stack(const struct thread *t) {
+  if (!t->stack_base || t->stack_size < 8 || t->rsp < t->stack_base ||
+      t->rsp >= t->stack_base + t->stack_size)
+    return;
+  ld_str("\n[LOCKDIAG]   parked-stack (newest first):");
+  unsigned shown = 0;
+  uint64_t high = t->stack_base + t->stack_size - 8;
+  for (uint64_t a = (t->rsp + 7) & ~7ULL; a <= high && shown < 16; a += 8) {
+    uint64_t v = *(const volatile uint64_t *)a;
+    if (v >= (uint64_t)__kernel_text_start && v < (uint64_t)__kernel_text_end) {
+      ld_str(" "); ld_hex(v); shown++;
+    }
+  }
+  if (!shown) ld_str(" (none)");
+}
+
+#define LOCKDIAG_USER_FRAMES 16
+#define LOCKDIAG_USER_SCAN_WORDS 256
+struct lockdiag_user_frame {
+  uint64_t ip, offset, slot;
+  char module[48];
+};
+struct lockdiag_user_wait {
+  uint64_t rsp;
+  struct lockdiag_user_frame frames[LOCKDIAG_USER_FRAMES];
+  unsigned count, word_count;
+  uint32_t words[4];
+};
+
+/* Never switch CR3, fault in a page or acquire vmm_lock in the reporter.
+ * mm->lock is held by the collector to stabilize VMAs; a raw, RAM-checked
+ * walk reads the parked process rather than the reporting CPU's mappings.
+ * A concurrent COW can still make a sample stale: this is diagnostic only. */
+static bool lockdiag_user_read(const struct thread *t, uint64_t addr,
+                               void *out, unsigned bytes) {
+  if (!addr || addr > 0x00007FFFFFFFFFFFULL ||
+      (bytes != 4 && bytes != 8) || (addr & (bytes - 1)))
+    return false;
+  struct vma *v = vma_find(&t->mm->vmas, addr);
+  if (!v || !(v->prot & 1) || v->end - addr < bytes)
+    return false;
+  uint64_t entries[4] = {0};
+  uint64_t phys = vmm_debug_walk(t->cr3, addr, entries);
+  if (!phys || !pmm_is_managed(phys & ~0xFFFULL))
+    return false;
+  for (unsigned i = 0; i < 4; i++) {
+    if (!(entries[i] & PAGE_FLAG_USER))
+      return false;
+    if ((i == 1 || i == 2) && (entries[i] & PAGE_FLAG_PS))
+      break;
+  }
+  const void *src = (const void *)(uintptr_t)(phys + pmm_get_hhdm_offset());
+  if (bytes == 4)
+    *(uint32_t *)out = *(const volatile uint32_t *)src;
+  else
+    *(uint64_t *)out = *(const volatile uint64_t *)src;
+  return true;
+}
+
+static void lockdiag_user_add_frame(const struct thread *t,
+                                    struct lockdiag_user_wait *sample,
+                                    uint64_t ip, uint64_t slot) {
+  if (!ip || ip > 0x00007FFFFFFFFFFFULL ||
+      sample->count >= LOCKDIAG_USER_FRAMES)
+    return;
+  struct vma *v = vma_find(&t->mm->vmas, ip);
+  if (!v || !(v->prot & 4))
+    return;
+  for (unsigned i = 0; i < sample->count; i++)
+    if (sample->frames[i].ip == ip)
+      return;
+  struct lockdiag_user_frame *f = &sample->frames[sample->count++];
+  f->ip = ip;
+  f->slot = slot;
+  f->offset = ip - v->start + v->offset;
+  vfs_node_t *node = v->file_node;
+  const char *name = vfs_node_is_alive(node) ? node->name : "<anonymous>";
+  unsigned i = 0;
+  for (; i + 1 < sizeof(f->module) && name[i]; i++) {
+    char c = name[i];
+    f->module[i] = c >= 0x20 && c < 0x7F ? c : '?';
+  }
+  f->module[i] = '\0';
+}
+
+/* tid_lock pins the thread and its mm. Only try the mm lock: a hung owner
+ * must never hang the reporter. Snapshot into fixed storage, then drop it
+ * before slow serial output. No application state is modified. */
+static bool lockdiag_collect_user_wait(const struct thread *t,
+                                       struct lockdiag_user_wait *sample) {
+  sample->count = sample->word_count = 0;
+  sample->rsp = t->last_syscall_user_rsp;
+  if (!t->mm || !t->cr3 || !t->in_syscall ||
+      t->state != THREAD_BLOCKED || !spinlock_try_acquire(&t->mm->lock))
+    return false;
+  lockdiag_user_add_frame(t, sample, t->last_syscall_user_rip, 0);
+  uint64_t sp = sample->rsp;
+  if (sp && sp <= 0x00007FFFFFFFFFFFULL) {
+    sp = (sp + 7) & ~7ULL;
+    for (unsigned i = 0; i < LOCKDIAG_USER_SCAN_WORDS &&
+                         sample->count < LOCKDIAG_USER_FRAMES; i++) {
+      uint64_t ip;
+      if (!lockdiag_user_read(t, sp + i * 8ULL, &ip, 8))
+        break;
+      lockdiag_user_add_frame(t, sample, ip, sp + i * 8ULL);
+    }
+  }
+  if (t->in_futex_wait) {
+    uint64_t addr = t->last_syscall_args[0];
+    for (unsigned i = 0; i < 4; i++) {
+      if (!lockdiag_user_read(t, addr + i * 4ULL, &sample->words[i], 4))
+        break;
+      sample->word_count++;
+    }
+  }
+  spinlock_release(&t->mm->lock);
+  return true;
+}
+
+static void dump_user_wait(const struct thread *t) {
+  struct lockdiag_user_wait sample;
+  if (!lockdiag_collect_user_wait(t, &sample)) {
+    ld_str("\n[LOCKDIAG]   user-wait: unavailable (not parked in syscall or mm busy)");
+    return;
+  }
+  ld_str("\n[LOCKDIAG]   user-wait rsp="); ld_hex(sample.rsp);
+  if (sample.word_count) {
+    ld_str(" futex-words (sampled, starting at uaddr)=");
+    for (unsigned i = 0; i < sample.word_count; i++) {
+      if (i) ld_str(",");
+      ld_hex(sample.words[i]);
+    }
+  }
+  ld_str("\n[LOCKDIAG]   user-code candidates (stack scan, not an unwind):");
+  for (unsigned i = 0; i < sample.count; i++) {
+    const struct lockdiag_user_frame *f = &sample.frames[i];
+    ld_str("\n[LOCKDIAG]     "); ld_hex(f->ip);
+    ld_str(" "); ld_str(f->module);
+    ld_str(" file+"); ld_hex(f->offset);
+    ld_str(" stack-slot="); ld_hex(f->slot);
+  }
+  if (!sample.count) ld_str(" (none mapped executable)");
+}
+
+/* Bounded sanitized path print for the poll snapshot (written by the owner
+ * thread in its own syscall context; a concurrent update can only tear one
+ * entry, so cap the scan and replace non-printables). */
+static void ld_poll_path(const char *p) {
+  ld_str(" path='");
+  if (p) {
+    for (int i = 0; i < 47 && p[i]; i++) {
+      char c = p[i];
+      char out = (c >= 0x20 && c < 0x7F) ? c : '?';
+      serial_write_sync(&out, 1);
+    }
+  }
+  ld_str("'");
+}
+
+/* Poll snapshot for a blocked poll/ppoll/epoll waiter: which fds it sleeps
+ * on. Join stalls park Main in futex while workers park in poll/recv; the
+ * fd + path names which peer or pipe never became ready. */
+static void dump_poll_wait(const struct thread *t) {
+  uint64_t nfds = t->last_poll_nfds;
+  if (!nfds)
+    return;
+  ld_str(" [poll nfds=");
+  ld_dec(nfds > 64 ? 64 : nfds);
+  unsigned n = nfds > 4 ? 4 : (unsigned)nfds;
+  for (unsigned i = 0; i < n; i++) {
+    ld_str(" fd");
+    ld_dec(i);
+    ld_str("=");
+    if (t->last_poll_fds[i] < 0)
+      ld_str("-");
+    else
+      ld_dec((uint64_t)(int64_t)t->last_poll_fds[i]);
+    ld_str(" ev=");
+    ld_hex((uint64_t)(uint16_t)t->last_poll_events[i]);
+    ld_poll_path(t->last_poll_paths[i]);
+  }
+  if (nfds > n) {
+    ld_str(" ... +");
+    ld_dec(nfds - n);
+    ld_str(" more");
+  }
+  ld_str("]");
+}
+
+/* FD + byte-count for blocked read/write-family syscalls: identifies which
+ * cache/log file a join worker is stuck writing (ext4/journal/NVMe path). */
+static void dump_fd_wait(const struct thread *t) {
+  uint64_t n = t->last_syscall_num;
+  if (n != 0 && n != 1 && n != 17 && n != 18)
+    return; /* read, write, pread64, pwrite64 */
+  uint64_t fd = t->last_syscall_args[0] & 0xFFFFFFFFULL;
+  char path[128] = {0};
+  uint64_t inode = 0;
+  uint64_t fd_flags = 0, node_flags = 0;
+  bool sampled = false;
+  if (fd < MAX_FDS && t->files && spinlock_try_acquire(&t->files->lock)) {
+    vfs_node_t *node = t->files->fds[fd];
+    if (vfs_node_is_alive(node)) {
+      inode = node->inode;
+      fd_flags = t->files->fd_flags[fd];
+      node_flags = node->flags;
+      const char *name = t->files->fd_paths[fd] &&
+                          t->files->fd_paths[fd]->value[0] ?
+                          t->files->fd_paths[fd]->value : node->name;
+      unsigned i = 0;
+      for (; i + 1 < sizeof(path) && name[i]; i++) {
+        char c = name[i];
+        path[i] = c >= 0x20 && c < 0x7F ? c : '?';
+      }
+      path[i] = '\0';
+      sampled = true;
+    }
+    spinlock_release(&t->files->lock);
+  }
+  ld_str(" [fd=");
+  ld_dec(fd);
+  ld_str(" count=");
+  ld_dec(t->last_syscall_args[2]);
+  if (t->in_syscall) {
+    uint64_t now = lapic_timer_get_ms();
+    ld_str(" syscall_ms=");
+    ld_dec(now > t->last_io_started_ms ? now - t->last_io_started_ms : 0);
+  }
+  if (n == 17 || n == 18) {
+    ld_str(" offset="); ld_dec(t->last_syscall_args[3]);
+  }
+  if (sampled) {
+    ld_str(" inode="); ld_dec(inode);
+    ld_str(" path='"); ld_str(path); ld_str("'");
+    ld_str(" fd_flags="); ld_hex(fd_flags);
+    ld_str(" node_flags="); ld_hex(node_flags);
+    ld_str(" (sampled)");
+  }
+  ld_str("]");
 }
 
 static void dump_thread(const struct thread *t) {
@@ -807,11 +1068,78 @@ void lockdiag_dump_all(const char *reason) {
   int dead_shown = 0, dead_total = 0;
   if (spinlock_try_acquire(&tid_lock)) {
     ld_str("\n[LOCKDIAG] blocked / waiting threads (event loops, I/O, sleep):");
+    uint32_t focus_tgid = 0;
+    uint32_t journal_owner = 0;
+    /* A blocked regular write can hold the journal and stall an entire
+     * application. Include that application's futex workers before unrelated
+     * desktop event loops, and expose the active root journal owner. */
+    ext3_journal_state_t *j = lockdiag_root_journal();
+    if (j) {
+      journal_owner = __atomic_load_n(&j->owner_tid, __ATOMIC_RELAXED);
+      ld_str("\n[LOCKDIAG] root journal: active="); ld_dec(j->active);
+      ld_str(" owner="); ld_dec(journal_owner);
+      ld_str(" comm="); ld_comm(j->owner_comm);
+      ld_str(" depth="); ld_dec(j->depth);
+      ld_str(" blocks="); ld_dec(j->blocks_in_trans);
+      ld_str(" phase="); ld_str(j->phase ? j->phase : "unknown");
+      ld_str(" owner_ip="); ld_hex(j->owner_ip);
+      ld_str(" hold_ms=");
+      ld_dec(j->active ? lapic_timer_get_ms() - j->started_ms : 0);
+    }
+    for (const struct thread *t = global_thread_list; t; t = t->global_next) {
+      if (t->state != THREAD_BLOCKED) continue;
+      if (t->tid == journal_owner) { focus_tgid = t->tgid; break; }
+      if (!focus_tgid && (t->last_syscall_num == 1 || t->last_syscall_num == 18))
+        focus_tgid = t->tgid;
+    }
+    /* Game-join stalls rarely sit in the journal owner: Main parks on a
+     * futex while a crowd of workers parks in poll/write behind it, and the
+     * journal may be held by an unrelated daemon (Firefox SQLite in one
+     * capture). Track the tgid with the most BLOCKED threads as a second
+     * focus so the whole client group prints first with full detail. */
+    uint32_t busy_tgid = 0;
+    uint64_t busy_count = 0;
+    {
+      uint32_t tgids[16];
+      uint64_t counts[16];
+      unsigned n = 0;
+      for (const struct thread *t = global_thread_list; t; t = t->global_next) {
+        if (t->state != THREAD_BLOCKED && t->state != THREAD_SLEEPING)
+          continue;
+        unsigned k = n;
+        for (unsigned i = 0; i < n; i++) {
+          if (tgids[i] == t->tgid) { k = i; break; }
+        }
+        if (k == n) {
+          if (n >= 16) continue;
+          tgids[n] = t->tgid;
+          counts[n] = 1;
+          n++;
+        } else {
+          counts[k]++;
+        }
+      }
+      for (unsigned i = 0; i < n; i++) {
+        if (counts[i] > busy_count) {
+          busy_count = counts[i];
+          busy_tgid = tgids[i];
+        }
+      }
+    }
+    if (busy_tgid && busy_tgid != focus_tgid) {
+      ld_str("\n[LOCKDIAG] busiest blocked group: tgid=");
+      ld_dec(busy_tgid);
+      ld_str(" threads=");
+      ld_dec(busy_count);
+      ld_str(" (game-join focus: Main + workers print first)");
+    }
+    for (int pass = 0; pass < 3; pass++) {
     for (const struct thread *t = global_thread_list; t; t = t->global_next) {
       /* A thread that died while holding a lock leaves it held forever, and it
        * will never appear in the blocked list: the lock spotlight above is what
        * names the holder, this is what says whether the holder still exists. */
       if (t->state == THREAD_DEAD || t->state == THREAD_ZOMBIE) {
+        if (pass != 0) continue;
         dead_total++;
         if (dead_shown < 8) {
           ld_str("\n[LOCKDIAG]   [zombie/exited] tid=");
@@ -851,8 +1179,18 @@ void lockdiag_dump_all(const char *reason) {
       }
       if (t->state != THREAD_BLOCKED && t->state != THREAD_SLEEPING)
         continue;
+      bool focused = t->kpi_data || (focus_tgid && t->tgid == focus_tgid) ||
+                     (busy_tgid && t->tgid == busy_tgid) ||
+                     strncmp(t->comm, "Xorg", 4) == 0 ||
+                     strncmp(t->comm, "glxgears", 8) == 0 ||
+                     strncmp(t->comm, "xfce4-ab", 8) == 0 ||
+                     strncmp(t->comm, "wine", 4) == 0;
+      if ((pass == 0 && !focused) ||
+          (pass == 1 && (focused || t->in_futex_wait)) ||
+          (pass == 2 && (focused || !t->in_futex_wait)))
+        continue;
       blocked_total++;
-      if (shown >= 24)
+      if (shown >= 128)
         continue;
       shown++;
       ld_str("\n[LOCKDIAG]   tid=");
@@ -863,6 +1201,27 @@ void lockdiag_dump_all(const char *reason) {
       ld_comm(t->comm);
       ld_str(" ");
       ld_str(state_name(t->state));
+#ifdef LINUXKPI_LINUX_IMPORTED
+      if (t->kpi_wait_mutex) {
+        extern void *linuxkpi_mutex_owner_thread(void *mutex);
+        const struct thread *owner = linuxkpi_mutex_owner_thread(t->kpi_wait_mutex);
+        ld_str(" [kpi mutex="); ld_hex((uint64_t)t->kpi_wait_mutex);
+        ld_str(" owner="); ld_dec(owner ? owner->tid : 0);
+        if (owner) {
+          ld_str("/"); ld_comm(owner->comm);
+          ld_str(" state="); ld_str(state_name(owner->state));
+        }
+        ld_str("]");
+      }
+#endif
+      if (t->kpi_wait_prepared || t->kpi_timeout_active ||
+          strncmp(t->comm, "Xorg", 4) == 0) {
+        ld_str(" [kpi prepared="); ld_dec(t->kpi_wait_prepared);
+        ld_str(" timeout="); ld_dec(t->kpi_timeout_active);
+        ld_str(" wake="); ld_dec(t->kpi_wake_pending);
+        ld_str(" block-wake="); ld_dec(t->kpi_block_pending);
+        ld_str("]");
+      }
       if (t->last_syscall_num) {
         const char *sn = syscall_get_name(t->last_syscall_num);
         ld_str(" in ");
@@ -878,24 +1237,55 @@ void lockdiag_dump_all(const char *reason) {
         ld_str(" ");
         ld_str(t->last_kernel_func);
       }
+      uint64_t parked_ms = 0;
+      if (t->blocked_since_ms) {
+        uint64_t now_ms = lapic_timer_get_ms();
+        parked_ms = now_ms > t->blocked_since_ms ? now_ms - t->blocked_since_ms : 0;
+      }
       if (t->in_futex_wait) {
         uint64_t wk = 0, nm = 0;
         futex_bucket_stats(t->futex_bucket, &wk, &nm);
+        ld_str(" [uaddr="); ld_hex(t->last_syscall_args[0]);
+        ld_str(" op="); ld_hex(t->last_syscall_args[1]);
+        ld_str(" expected="); ld_hex(t->last_syscall_args[2]);
+        ld_str("]");
         ld_str(" [futex bucket=");
         ld_dec(t->futex_bucket);
         ld_str(" wakes=");
         ld_dec(wk);
-        ld_str(" consumed=");
+        ld_str(" no-match=");
         ld_dec(nm);
         if (t->blocked_since_ms) {
-          uint64_t now_ms = lapic_timer_get_ms();
           ld_str(" parked=");
-          ld_dec(now_ms > t->blocked_since_ms ? now_ms - t->blocked_since_ms
-                                              : 0);
+          ld_dec(parked_ms);
           ld_str("ms");
         }
         ld_str("]");
+      } else {
+        /* Non-futex waits never set blocked_since_ms; their deadline is
+         * still diagnostic (infinite = -1/0, timed = uptime ms). */
+        dump_poll_wait(t);
+        dump_fd_wait(t);
       }
+      ld_str(" cpu="); ld_dec(t->cpu_index);
+      ld_str(" wake_at_ms="); ld_dec(t->wakeup_ticks);
+      if (t->wakeup_ticks && t->wakeup_ticks != (uint64_t)-1) {
+        uint64_t now_ms = lapic_timer_get_ms();
+        if (now_ms > t->wakeup_ticks) {
+          ld_str(" OVERDUE+");
+          ld_dec(now_ms - t->wakeup_ticks);
+          ld_str("ms");
+        }
+      }
+      /* Focused groups always get stacks. Unfocused futex waiters are the
+       * noisiest entries, so only long-parked ones (>10 s, e.g. a wedged
+       * Main) pay for the scan; every other waiter type always does. */
+      if (!t->in_futex_wait || focused || parked_ms > 10000)
+        dump_parked_stack(t);
+      if (focused && t->mm &&
+          (!t->in_futex_wait || parked_ms > 10000))
+        dump_user_wait(t);
+    }
     }
     spinlock_release(&tid_lock);
     ld_str("\n[LOCKDIAG]   ");

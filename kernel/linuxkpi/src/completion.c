@@ -4,28 +4,16 @@
 
 #define UINT_MAX_DONE (~0U)
 
-static inline void completion_account(struct completion *x) {
-  unsigned long flags;
-
-  spin_lock_irqsave(&x->wait.lock, flags);
-  if (x->done != UINT_MAX_DONE)
-    x->done--;
-  spin_unlock_irqrestore(&x->wait.lock, flags);
-}
-
-static inline bool completion_done_locked(struct completion *x) {
-  return __atomic_load_n(&x->done, __ATOMIC_ACQUIRE) != 0;
-}
-
 void complete(struct completion *x) {
   unsigned long flags;
 
   spin_lock_irqsave(&x->wait.lock, flags);
   if (x->done != UINT_MAX_DONE)
     x->done++;
+  /* A consumer may release the object as soon as its wait returns. Keep
+   * token publication and the last access to the queue under one lock. */
+  __kpi_wake_up_locked(&x->wait, 1, 0);
   spin_unlock_irqrestore(&x->wait.lock, flags);
-
-  __kpi_wake_up(&x->wait, 1, 0);
 }
 
 void complete_all(struct completion *x) {
@@ -33,59 +21,75 @@ void complete_all(struct completion *x) {
 
   spin_lock_irqsave(&x->wait.lock, flags);
   x->done = UINT_MAX_DONE;
+  __kpi_wake_up_locked(&x->wait, 0, 0);
   spin_unlock_irqrestore(&x->wait.lock, flags);
+}
 
-  __kpi_wake_up(&x->wait, 0, 0);
+/* Observe and consume the token under the same lock. An unlocked ready
+ * check followed by a later decrement permits two waiters to consume one
+ * token and turn zero into UINT_MAX (a false permanent completion).
+ * Queue insertion and wait-state publication also share the producer lock;
+ * only the native scheduler wait runs with that lock/IRQ state released. */
+static long completion_wait_common(struct completion *x, long timeout,
+                                   int state) {
+  struct wait_queue_entry wait;
+  unsigned long flags;
+  bool waited = false;
+
+  init_wait_entry(&wait, WQ_FLAG_EXCLUSIVE);
+  spin_lock_irqsave(&x->wait.lock, flags);
+  while (!x->done) {
+    if (___wait_is_interruptible(state) && signal_pending(current)) {
+      timeout = -ERESTARTSYS;
+      break;
+    }
+    if (!timeout)
+      break;
+    if (list_empty(&wait.entry))
+      list_add_tail(&wait.entry, &x->wait.head);
+    set_current_state(state);
+    waited = true;
+    spin_unlock_irqrestore(&x->wait.lock, flags);
+    timeout = schedule_timeout(timeout);
+    spin_lock_irqsave(&x->wait.lock, flags);
+  }
+
+  list_del_init(&wait.entry);
+  if (waited)
+    __set_current_state(TASK_RUNNING);
+  if (x->done) {
+    if (x->done != UINT_MAX_DONE)
+      x->done--;
+    if (!timeout)
+      timeout = 1;
+  }
+  spin_unlock_irqrestore(&x->wait.lock, flags);
+  return timeout;
 }
 
 void wait_for_completion(struct completion *x) {
-  if (!completion_done_locked(x))
-    wait_event(x->wait, completion_done_locked(x));
-  completion_account(x);
+  (void)completion_wait_common(x, MAX_SCHEDULE_TIMEOUT, TASK_UNINTERRUPTIBLE);
 }
 
 long wait_for_completion_interruptible(struct completion *x) {
-  if (!completion_done_locked(x)) {
-    long ret = wait_event_interruptible(x->wait, completion_done_locked(x));
-    if (ret)
-      return ret;
-  }
-  completion_account(x);
-  return 0;
+  long ret = completion_wait_common(x, MAX_SCHEDULE_TIMEOUT, TASK_INTERRUPTIBLE);
+  return ret < 0 ? ret : 0;
 }
 
 long wait_for_completion_killable(struct completion *x) {
-  if (!completion_done_locked(x)) {
-    long ret = wait_event_killable(x->wait, completion_done_locked(x));
-    if (ret)
-      return ret;
-  }
-  completion_account(x);
-  return 0;
+  long ret = completion_wait_common(x, MAX_SCHEDULE_TIMEOUT, TASK_KILLABLE);
+  return ret < 0 ? ret : 0;
 }
 
 unsigned long wait_for_completion_timeout(struct completion *x,
                                           unsigned long timeout) {
-  unsigned long ret = timeout;
-
-  if (!completion_done_locked(x))
-    ret = (unsigned long)wait_event_timeout(x->wait, completion_done_locked(x),
-                                            timeout);
-  if (ret > 0)
-    completion_account(x);
-  return ret;
+  return (unsigned long)completion_wait_common(x, (long)timeout,
+                                               TASK_UNINTERRUPTIBLE);
 }
 
 long wait_for_completion_interruptible_timeout(struct completion *x,
                                                unsigned long timeout) {
-  long ret = (long)timeout;
-
-  if (!completion_done_locked(x))
-    ret = wait_event_interruptible_timeout(x->wait, completion_done_locked(x),
-                                           timeout);
-  if (ret > 0)
-    completion_account(x);
-  return ret;
+  return completion_wait_common(x, (long)timeout, TASK_INTERRUPTIBLE);
 }
 
 bool try_wait_for_completion(struct completion *x) {
@@ -104,5 +108,11 @@ bool try_wait_for_completion(struct completion *x) {
 }
 
 bool completion_done(struct completion *x) {
-  return completion_done_locked(x);
+  unsigned long flags;
+  bool ret;
+
+  spin_lock_irqsave(&x->wait.lock, flags);
+  ret = x->done != 0;
+  spin_unlock_irqrestore(&x->wait.lock, flags);
+  return ret;
 }

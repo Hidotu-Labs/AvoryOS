@@ -16,6 +16,10 @@
 #define PAGE_FLAG_PAT ((uint64_t)1 << 7)
 #define PAGE_FLAG_PS ((uint64_t)1 << 7)
 #define PAGE_FLAG_COW ((uint64_t)1 << 9)
+/* Native fault-path provenance: an unmodified, full file-cache page that a
+ * fork child may reconstruct from its VMA. Clear on any private write/copy.
+ * This is not the hardware dirty bit (private copies can be clean again). */
+#define PAGE_FLAG_REFAULT ((uint64_t)1 << 10)
 #define PAGE_FLAG_NX ((uint64_t)1 << 63)
 
 // Mask to extract the physical address from a page table entry.
@@ -122,6 +126,9 @@ uint64_t vmm_user_resident_bytes(uint64_t cr3);
 // translated physical address, or 0 when the address is not mapped.
 uint64_t vmm_debug_walk(uint64_t pml4_phys, uint64_t virtual_addr,
                         uint64_t entries[4]);
+/* Diagnostic cache bits normalized to 4 KiB PAT encoding; UINT64_MAX when
+ * unmapped. Reads under vmm_lock and never changes mappings. */
+uint64_t vmm_debug_cache_flags(uint64_t *pml4, uint64_t virtual_addr);
 
 // Prints the walk above with serial_write_sync(): no locks, safe from an
 // interrupt context that may have interrupted the klog path.
@@ -137,7 +144,8 @@ uint64_t vmm_clone_user_mappings(uint64_t *src_pml4_phys);
 
 // Clone user-space page mappings with VMA awareness.
 // Shared mappings (MAP_SHARED) share physical pages between parent and child.
-// Private mappings (MAP_PRIVATE) get deep-copied (child gets its own pages).
+// Private pages use CoW; unmodified full native file-cache pages are omitted
+// from the child page tables and reconstructed by its ordinary fault path.
 // Returns the *physical* address of the new PML4, or 0 on failure.
 struct vma_list;
 uint64_t vmm_clone_user_mappings_vma(uint64_t *src_pml4_phys,

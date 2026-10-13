@@ -4,10 +4,15 @@
  * bridge.  Runs in a kthread (see linuxkpi/src/boot_tests.c). */
 
 #include <linux/gfp.h>
+#include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/page-flags.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/shmem_fs.h>
+#include <linux/vmalloc.h>
+#include <asm/set_memory.h>
 
 #include <linuxkpi/log.h>
 #include <linuxkpi/native_mm.h>
@@ -39,7 +44,7 @@ static bool p2_page_roundtrip_pfn(unsigned long pfn, uint64_t hhdm) {
 }
 
 static bool test_page_roundtrip(void) {
-  uint64_t total = asc_pmm_get_total_memory();
+  uint64_t total = asc_pmm_get_managed_memory_end();
   uint64_t hhdm = asc_pmm_get_hhdm_offset();
   unsigned long last_pfn = (unsigned long)(total >> PAGE_SHIFT);
 
@@ -138,8 +143,8 @@ static bool test_page_orders(void) {
 /* ── refcount torture ───────────────────────────────────────────────────── */
 
 static bool test_page_refcount(void) {
-  struct page *page = alloc_page(GFP_KERNEL);
   unsigned long before = asc_pmm_get_free_pages();
+  struct page *page = alloc_page(GFP_KERNEL);
 
   if (!page)
     return false;
@@ -240,6 +245,78 @@ static bool test_page_leak_invariant(void) {
 
 /* ── aggregator ─────────────────────────────────────────────────────────── */
 
+/* Exercise real PAT mappings and alias visibility, not just the descriptor. */
+static bool test_page_cache_types(void) {
+  struct page *head = alloc_pages(GFP_KERNEL | __GFP_ZERO, 1);
+  if (!head)
+    return false;
+  struct page *pages[2] = {head, pfn_to_page(page_to_pfn(head) + 1)};
+  bool ok = set_pages_array_wc(pages, 2) == 0;
+  unsigned long wc = ASC_PAGE_PAT | ASC_PAGE_PCD | ASC_PAGE_PWT;
+  for (unsigned int i = 0; i < 2; i++)
+    ok = ok && linuxkpi_page_cache_flags(page_to_phys(pages[i])) == wc;
+  unsigned char *alias = vmap(pages, 2, VM_MAP, PAGE_KERNEL);
+  if (alias) {
+    unsigned char *direct = page_address(head);
+    direct[0] = 0xa5;
+    direct[PAGE_SIZE] = 0x5a;
+    __asm__ volatile("mfence" ::: "memory");
+    ok = ok && alias[0] == 0xa5 && alias[PAGE_SIZE] == 0x5a;
+    alias[1] = 0x33;
+    __asm__ volatile("mfence" ::: "memory");
+    ok = ok && direct[1] == 0x33;
+    vunmap(alias);
+  } else {
+    ok = false;
+  }
+  ok = set_pages_array_uc(pages, 2) == 0 && ok;
+  for (unsigned int i = 0; i < 2; i++)
+    ok = ok && linuxkpi_page_cache_flags(page_to_phys(pages[i])) ==
+                 (ASC_PAGE_PCD | ASC_PAGE_PWT);
+  ok = set_pages_wb(head, 2) == 0 && ok;
+  for (unsigned int i = 0; i < 2; i++)
+    ok = ok && linuxkpi_page_cache_flags(page_to_phys(pages[i])) == 0;
+  __free_pages(head, 1);
+  return ok;
+}
+
+/* TTM puts each swap page after copying, then reads it again during swapin.
+ * A truncate must drop only the cache reference, retaining a live reader. */
+static bool test_shmem_page_lifetime(void) {
+  struct file *file = shmem_file_setup("kpi-page-lifetime", PAGE_SIZE, 0);
+  bool ok = true;
+
+  if (IS_ERR(file))
+    return false;
+  for (unsigned int i = 0; i < 32 && ok; i++) {
+    struct page *page = shmem_read_mapping_page_gfp(file->f_mapping, 0,
+                                                   GFP_KERNEL);
+    if (IS_ERR(page)) {
+      ok = false;
+      break;
+    }
+    ok = page_count(page) == 2;
+    ((unsigned char *)page_address(page))[37] = (unsigned char)i;
+    put_page(page);
+    ok = ok && page_count(page) == 1;
+    struct page *again = shmem_read_mapping_page_gfp(file->f_mapping, 0,
+                                                    GFP_KERNEL);
+    if (IS_ERR(again)) {
+      ok = false;
+      break;
+    }
+    ok = ok && again == page && page_count(again) == 2 &&
+         ((unsigned char *)page_address(again))[37] == (unsigned char)i;
+    shmem_truncate_range(file->f_inode, 0, -1);
+    ok = ok && page_count(again) == 1 && !again->mapping &&
+         ((unsigned char *)page_address(again))[37] == (unsigned char)i;
+    put_page(again);
+    ok = ok && page_count(again) == 0;
+  }
+  fput(file);
+  return ok;
+}
+
 void linuxkpi_test_phase2_page(void) {
   static const struct {
     const char *name;
@@ -248,8 +325,10 @@ void linuxkpi_test_phase2_page(void) {
       {"page pfn/address roundtrip", test_page_roundtrip},
       {"page order alloc/free", test_page_orders},
       {"page refcount", test_page_refcount},
+      {"shmem reader/truncate lifetime", test_shmem_page_lifetime},
       {"alloc_pages_exact/DMA32", test_page_exact},
       {"split_page", test_page_split},
+      {"page WC/UC/WB aliases", test_page_cache_types},
       {"page free-count invariant", test_page_leak_invariant},
   };
 

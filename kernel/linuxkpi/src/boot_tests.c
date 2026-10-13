@@ -28,6 +28,8 @@ extern void linuxkpi_test_phase2_page(void);
 extern void linuxkpi_test_phase2_vmalloc(void);
 extern void linuxkpi_test_phase2_dma(void);
 extern void linuxkpi_test_phase2_dmabuf(void);
+extern void ascentdrm_prime_selftest(void);
+extern void ascentdrm_cursor_selftest(void);
 extern void linuxkpi_test_phase2_ttm_prep(void);
 extern void linuxkpi_test_phase3_drm(void);
 extern void linuxkpi_test_phase3_drm_modeset(void);
@@ -63,6 +65,8 @@ static int linuxkpi_boot_tests_thread(void *arg) {
   linuxkpi_test_phase2_vmalloc();
   linuxkpi_test_phase2_dma();
   linuxkpi_test_phase2_dmabuf();
+  ascentdrm_prime_selftest();
+  ascentdrm_cursor_selftest();
   linuxkpi_test_phase2_ttm_prep();
   linuxkpi_test_phase3_drm();
   linuxkpi_test_phase3_drm_modeset();

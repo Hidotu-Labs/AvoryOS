@@ -11,6 +11,10 @@
 #include "apic/lapic_timer.h"
 #include <stdbool.h>
 
+/* Data runs only; metadata keeps the single-block journal path. */
+int ext2_write_blocks(ext2_mount_t *mnt, uint32_t first, uint32_t count,
+                      const void *buffer);
+
 int  ext2_write_superblock(ext2_mount_t *mnt);
 int  ext2_write_bgdt(ext2_mount_t *mnt);
 
@@ -47,11 +51,21 @@ vfs_node_t  *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
 
 uint32_t ext2_current_time(void);
 
+/* Fault user pages before entering a filesystem transaction. The callback
+ * writes kernel memory and releases its transaction before returning. */
+uint32_t ext2_write_staged(vfs_node_t *node, uint32_t offset, uint32_t size,
+                           uint8_t *buffer,
+                           uint32_t (*write_kernel)(vfs_node_t *, uint32_t,
+                                                    uint32_t, uint8_t *));
+
 int              ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
                                     uint32_t child_inode_num, const char *name,
                                     uint8_t file_type);
 int              ext2_remove_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
                                        const char *name);
+int              ext2_replace_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
+                                        const char *name, uint32_t child_inode_num,
+                                        uint8_t file_type);
 bool             ext2_dir_is_empty(ext2_mount_t *mnt, uint32_t inode_num);
 
 struct dirent   *ext2_readdir_impl(vfs_node_t *node, uint32_t index);
@@ -64,6 +78,8 @@ uint32_t ext2_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
 uint32_t ext2_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
                          uint8_t *buffer);
 int      ext2_truncate_impl(vfs_node_t *node, uint32_t new_len);
+int      ext2_fallocate_impl(vfs_node_t *node, int mode, uint32_t offset,
+                              uint32_t len);
 uint64_t ext2_mmap_impl(vfs_node_t *node, uint64_t addr, uint64_t length,
                         uint64_t prot, uint64_t flags, uint64_t offset);
 
@@ -72,6 +88,8 @@ int ext2_rmdir_impl(vfs_node_t *node, char *name);
 int ext2_readlink_impl(vfs_node_t *node, char *buf, uint32_t size);
 int ext2_symlink_impl(vfs_node_t *node, char *name, char *target);
 int ext2_rename_impl(vfs_node_t *node, char *old_name, char *new_name);
+int ext2_rename_cross(vfs_node_t *old_parent, char *old_name,
+                      vfs_node_t *new_parent, char *new_name);
 int ext2_chmod_impl(vfs_node_t *node, uint16_t permission);
 int ext2_chown_impl(vfs_node_t *node, uint32_t uid, uint32_t gid);
 int ext2_utime_impl(vfs_node_t *node, uint32_t atime, uint32_t mtime);

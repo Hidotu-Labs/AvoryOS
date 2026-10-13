@@ -3,7 +3,7 @@
 
 /* AvoryOS overlay for <asm/io.h>.
  *
- * x86 MMIO accessors are plain volatile loads/stores; port I/O goes through
+ * x86 MMIO accessors use ordered volatile assembly; port I/O goes through
  * the native HAL (kernel/src/arch/x86_64/hal.c).  This overlay exists so that
  * every upstream header which includes <asm/io.h> (asm/pci.h, clocksource.h,
  * scatterlist.h, ...) sees the same definitions as the <linux/io.h> overlay
@@ -16,51 +16,58 @@
 
 /* ── MMIO ───────────────────────────────────────────────────────────────── */
 
-static inline u8 readb(const volatile void __iomem *addr) {
-  return *(const volatile u8 *)addr;
+/* Match the x86 Linux accessor contract: ordinary MMIO accesses are
+ * compiler barriers for normal memory too. Volatile C alone permits the
+ * compiler to eliminate/reorder GPU descriptor stores across a doorbell,
+ * or reuse stale normal-memory data after observing device completion.
+ * Hardware WC draining remains the caller's explicit wmb()/mb() duty. */
+#define KPI_MMIO_READ(name, size, type, reg, barrier) \
+static inline type name(const volatile void __iomem *addr) { \
+    type value; \
+    __asm__ volatile("mov" size " %1,%0" : reg(value) \
+                     : "m" (*(const volatile type *)addr) barrier); \
+    return value; \
 }
-static inline u16 readw(const volatile void __iomem *addr) {
-  return *(const volatile u16 *)addr;
+#define KPI_MMIO_WRITE(name, size, type, reg, barrier) \
+static inline void name(type value, volatile void __iomem *addr) { \
+    __asm__ volatile("mov" size " %0,%1" : : reg(value), \
+                     "m" (*(volatile type *)addr) barrier); \
 }
-static inline u32 readl(const volatile void __iomem *addr) {
-  return *(const volatile u32 *)addr;
-}
-static inline u64 readq(const volatile void __iomem *addr) {
-  return *(const volatile u64 *)addr;
-}
+KPI_MMIO_READ(readb, "b", u8, "=q", : "memory")
+KPI_MMIO_READ(readw, "w", u16, "=r", : "memory")
+KPI_MMIO_READ(readl, "l", u32, "=r", : "memory")
+KPI_MMIO_READ(readq, "q", u64, "=r", : "memory")
+KPI_MMIO_WRITE(writeb, "b", u8, "q", : "memory")
+KPI_MMIO_WRITE(writew, "w", u16, "r", : "memory")
+KPI_MMIO_WRITE(writel, "l", u32, "r", : "memory")
+KPI_MMIO_WRITE(writeq, "q", u64, "r", : "memory")
 
-static inline void writeb(u8 value, volatile void __iomem *addr) {
-  *(volatile u8 *)addr = value;
-}
-static inline void writew(u16 value, volatile void __iomem *addr) {
-  *(volatile u16 *)addr = value;
-}
-static inline void writel(u32 value, volatile void __iomem *addr) {
-  *(volatile u32 *)addr = value;
-}
-static inline void writeq(u64 value, volatile void __iomem *addr) {
-  *(volatile u64 *)addr = value;
-}
-
-/* Relaxed variants are identical here (volatile accesses are ordered enough
- * for the strongly-ordered x86 MMIO model). */
-#define readb_relaxed readb
-#define readw_relaxed readw
-#define readl_relaxed readl
-#define readq_relaxed readq
-#define writeb_relaxed writeb
-#define writew_relaxed writew
-#define writel_relaxed writel
-#define writeq_relaxed writeq
-
-#define __raw_readb readb
-#define __raw_readw readw
-#define __raw_readl readl
-#define __raw_readq readq
-#define __raw_writeb writeb
-#define __raw_writew writew
-#define __raw_writel writel
-#define __raw_writeq writeq
+KPI_MMIO_READ(__readb, "b", u8, "=q", )
+KPI_MMIO_READ(__readw, "w", u16, "=r", )
+KPI_MMIO_READ(__readl, "l", u32, "=r", )
+KPI_MMIO_READ(__readq, "q", u64, "=r", )
+KPI_MMIO_WRITE(__writeb, "b", u8, "q", )
+KPI_MMIO_WRITE(__writew, "w", u16, "r", )
+KPI_MMIO_WRITE(__writel, "l", u32, "r", )
+KPI_MMIO_WRITE(__writeq, "q", u64, "r", )
+#undef KPI_MMIO_READ
+#undef KPI_MMIO_WRITE
+#define readb_relaxed __readb
+#define readw_relaxed __readw
+#define readl_relaxed __readl
+#define readq_relaxed __readq
+#define writeb_relaxed __writeb
+#define writew_relaxed __writew
+#define writel_relaxed __writel
+#define writeq_relaxed __writeq
+#define __raw_readb __readb
+#define __raw_readw __readw
+#define __raw_readl __readl
+#define __raw_readq __readq
+#define __raw_writeb __writeb
+#define __raw_writew __writew
+#define __raw_writel __writel
+#define __raw_writeq __writeq
 
 static inline u8 ioread8(const volatile void __iomem *addr) { return readb(addr); }
 static inline u16 ioread16(const volatile void __iomem *addr) { return readw(addr); }
@@ -69,11 +76,10 @@ static inline void iowrite8(u8 value, volatile void __iomem *addr) { writeb(valu
 static inline void iowrite16(u16 value, volatile void __iomem *addr) { writew(value, addr); }
 static inline void iowrite32(u32 value, volatile void __iomem *addr) { writel(value, addr); }
 
-/* Barrier hooks upstream places around MMIO; no-ops on x86. */
-#define __io_br() do { } while (0)
-#define __io_ar(v) do { } while (0)
-#define __io_bw() do { } while (0)
-#define __io_aw() do { } while (0)
+#define __io_br() __asm__ volatile("" ::: "memory")
+#define __io_ar(v) __asm__ volatile("" ::: "memory")
+#define __io_bw() __asm__ volatile("" ::: "memory")
+#define __io_aw() __asm__ volatile("" ::: "memory")
 
 /* ── port I/O through the native HAL (src/arch/x86_64/hal.c) ────────────── */
 

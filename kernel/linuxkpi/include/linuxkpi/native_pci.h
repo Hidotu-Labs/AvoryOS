@@ -36,11 +36,17 @@ struct linuxkpi_pci_info {
 /* Number of enumerated native devices. */
 int linuxkpi_pci_native_count(void);
 
+/* Suspend bound imported devices before native reboot/power-off. */
+void linuxkpi_pci_shutdown(void);
+
 /* Opaque handle for device `index` (NULL when out of range). */
 void *linuxkpi_pci_native_get(int index);
 
 /* Fill `out` with the device's identity, BARs and sizes. */
 void linuxkpi_pci_native_snapshot(void *handle, struct linuxkpi_pci_info *out);
+
+/* Publish a successful imported driver bind, or clear it on unbind. */
+void linuxkpi_pci_native_driver(void *handle, const char *name);
 
 /* Configuration space access (ECAM offsets above 0xFF are supported on
  * PCIe-capable buses by the native layer). */

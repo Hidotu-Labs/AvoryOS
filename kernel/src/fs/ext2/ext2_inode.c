@@ -78,6 +78,7 @@ vfs_node_t *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
     }
     node->truncate = (mnt->sb.s_feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS)
                          ? ext4_truncate_impl : ext2_truncate_impl;
+    node->fallocate = ext2_fallocate_impl;
     node->mmap     = ext2_mmap_impl;
     node->chmod    = ext2_chmod_impl;
     node->chown    = ext2_chown_impl;

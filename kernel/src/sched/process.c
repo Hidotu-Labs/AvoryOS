@@ -1,6 +1,7 @@
 #include "../console/console.h"
 #include "../console/klog.h"
 #include "../cpu/gdt.h"
+#include "../cpu/fpu.h"
 #include "../cpu/isr.h"
 #include "../cpu/msr.h"
 #include "../fb/framebuffer.h"
@@ -16,42 +17,52 @@
 #include "elf.h"
 #include "sched.h"
 
-/* The exec stack is registered as a VMA but its pages are mapped on demand.
- * The initial stack builder writes through this helper, which backs each
- * touched page with a freshly zeroed frame. */
-static void process_ensure_user_page(uint64_t *pml4, uint64_t va) {
-  uint64_t page = va & ~(PAGE_SIZE - 1);
-  if (vmm_virt_to_phys(pml4, page))
-    return;
+/* The candidate exec address space is private to this builder. Retain the
+ * last page translation across adjacent strings instead of walking all four
+ * page-table levels for every short argument/environment entry. This cache
+ * lives only for this build; untouched stack pages remain demand allocated. */
+struct process_stack_writer {
+  uint64_t *pml4;
+  uint64_t hhdm;
+  uint64_t page_va;
+  uint64_t page_phys;
+};
 
-  void *phys = pmm_alloc();
-  if (!phys)
-    return;
-  if (!vmm_map_page(pml4, page, (uint64_t)phys,
-                    PAGE_FLAG_USER | PAGE_FLAG_RW | PAGE_FLAG_PRESENT)) {
-    pmm_free(phys);
-    return;
-  }
-  memset((void *)((uint64_t)phys + pmm_get_hhdm_offset()), 0, PAGE_SIZE);
-}
-
-static void process_copy_to_user(uint64_t *pml4, uint64_t dest_user_va,
+static void process_copy_to_user(struct process_stack_writer *writer,
+                                 uint64_t dest_user_va,
                                  const void *src_kern_va, size_t size) {
-  uint64_t hhdm = pmm_get_hhdm_offset();
   size_t done = 0;
   while (done < size) {
     uint64_t va = dest_user_va + done;
-    uint64_t offset = va % PAGE_SIZE;
-    uint32_t to_copy = PAGE_SIZE - offset;
+    uint64_t page = va & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t offset = va & (PAGE_SIZE - 1);
+    size_t to_copy = PAGE_SIZE - offset;
     if (to_copy > size - done)
       to_copy = size - done;
 
-    process_ensure_user_page(pml4, va);
-    uint64_t phys = vmm_virt_to_phys(pml4, va);
-    if (phys != 0) {
-      memcpy((void *)(phys + hhdm), (const uint8_t *)src_kern_va + done,
-             to_copy);
+    if (!writer->page_phys || writer->page_va != page) {
+      uint64_t phys = vmm_virt_to_phys(writer->pml4, page);
+      if (!phys) {
+        void *new_phys = pmm_alloc_zeroed_page();
+        bool zeroed = (new_phys != NULL);
+        if (!new_phys)
+          new_phys = pmm_alloc();
+        if (!new_phys)
+          return;
+        if (!zeroed)
+          memset((void *)((uint64_t)new_phys + writer->hhdm), 0, PAGE_SIZE);
+        if (!vmm_map_page(writer->pml4, page, (uint64_t)new_phys,
+                          PAGE_FLAG_USER | PAGE_FLAG_RW | PAGE_FLAG_PRESENT)) {
+          pmm_free(new_phys);
+          return;
+        }
+        phys = (uint64_t)new_phys;
+      }
+      writer->page_va = page;
+      writer->page_phys = phys;
     }
+    memcpy((void *)(writer->page_phys + offset + writer->hhdm),
+           (const uint8_t *)src_kern_va + done, to_copy);
     done += to_copy;
   }
 }
@@ -67,34 +78,47 @@ extern void mm_reset_mmap_state(struct thread *t);
 // Inline assembly to perform sysret transition.
 // Note: sysret loads CS from STAR MSR and SS from STAR MSR + 8.
 // We must clear unnecessary registers to prevent info leaks.
+// Set `proc_dump` on the kernel cmdline to re-enable the exec hexdumps below.
+// They cost ~10us per serial character (~1ms+ per exec) and sit inside the
+// execve_stack probe, so they are off by default. Follows the existing
+// `strstr(kernel_boot_cmdline, ...)` pattern used for vfs_selftest/tlb_bench.
+static bool proc_dump_enabled(void) {
+  extern const char *kernel_boot_cmdline;
+  return kernel_boot_cmdline && strstr(kernel_boot_cmdline, "proc_dump") != NULL;
+}
+
 void process_jump_usermode(uint64_t rip, uint64_t user_rsp, uint64_t pml4) {
   uint64_t hhdm = pmm_get_hhdm_offset();
 
   // DEBUG: Hexdump the entry point
-  uint64_t rip_phys = vmm_virt_to_phys((uint64_t *)pml4, rip);
-  if (rip_phys) {
-    uint8_t *code = (uint8_t *)(rip_phys + hhdm);
-    klog_puts("[PROC] RIP Dump: ");
-    for (int i = 0; i < 128; i++) {
-      uint8_t b = code[i];
-      const char *hex = "0123456789ABCDEF";
-      klog_putchar(hex[(b >> 4) & 0xF]);
-      klog_putchar(hex[b & 0xF]);
-      klog_putchar(' ');
+  if (proc_dump_enabled()) {
+    uint64_t rip_phys = vmm_virt_to_phys((uint64_t *)pml4, rip);
+    if (rip_phys) {
+      uint8_t *code = (uint8_t *)(rip_phys + hhdm);
+      klog_puts("[PROC] RIP Dump: ");
+      for (int i = 0; i < 128; i++) {
+        uint8_t b = code[i];
+        const char *hex = "0123456789ABCDEF";
+        klog_putchar(hex[(b >> 4) & 0xF]);
+        klog_putchar(hex[b & 0xF]);
+        klog_putchar(' ');
+      }
+      klog_puts("\n");
     }
-    klog_puts("\n");
   }
 
   // DEBUG: Hexdump the stack
-  uint64_t rsp_phys = vmm_virt_to_phys((uint64_t *)pml4, user_rsp);
-  if (rsp_phys) {
-    uint64_t *stack = (uint64_t *)(rsp_phys + hhdm);
-    klog_puts("[PROC] RSP Dump: ");
-    for (int i = 0; i < 32; i++) {
-      klog_uint64(stack[i]);
-      klog_putchar(' ');
+  if (proc_dump_enabled()) {
+    uint64_t rsp_phys = vmm_virt_to_phys((uint64_t *)pml4, user_rsp);
+    if (rsp_phys) {
+      uint64_t *stack = (uint64_t *)(rsp_phys + hhdm);
+      klog_puts("[PROC] RSP Dump: ");
+      for (int i = 0; i < 32; i++) {
+        klog_uint64(stack[i]);
+        klog_putchar(' ');
+      }
+      klog_puts("\n");
     }
-    klog_puts("\n");
   }
 
   // Reset user TLS to 0
@@ -104,6 +128,14 @@ void process_jump_usermode(uint64_t rip, uint64_t user_rsp, uint64_t pml4) {
   if (cur) {
     cur->fs_base = 0;
     cur->gs_base = 0;
+  }
+
+  if (cur && cur->mm && cur->mm->compat32) {
+    struct syscall_regs frame = { .rip=rip, .rsp=user_rsp, .rflags=0x202,
+                                  .user_cs=0x1b };
+    extern void fork_return_to_userspace(struct syscall_regs *)
+        __attribute__((noreturn));
+    fork_return_to_userspace(&frame);
   }
 
   register uint64_t asm_rip asm("rcx") = rip;
@@ -149,30 +181,31 @@ void process_jump_usermode(uint64_t rip, uint64_t user_rsp, uint64_t pml4) {
 #define ELF_PIE_BASE 0x0000000000400000ULL
 #define ELF_INTERP_BASE 0x0000400000000000ULL
 
-static uint64_t elf_page_flags(uint32_t p_flags) {
-  uint64_t flags = PAGE_FLAG_USER | PAGE_FLAG_PRESENT;
-  if (p_flags & PF_W)
-    flags |= PAGE_FLAG_RW;
-  if (!(p_flags & PF_X))
-    flags |= PAGE_FLAG_NX;
-  return flags;
-}
+// Permissions are applied lazily: do_elf_load() records each PT_LOAD's p_flags
+// as VMA prot, and vmm_fault.c materializes PTE flags (RW/NX) on first fault
+// via dp_build_flags().  There is deliberately no eager page-table rewrite at
+// load.  PT_GNU_RELRO is left writable here; ld.so's later mprotect() tightens
+// it after relocations, which is the standard Linux flow.
 
-static bool __attribute__((unused))
-elf_apply_segment_permissions(uint64_t *pml4, uint64_t start_page,
-                               uint64_t end_page, uint32_t p_flags) {
-  uint64_t final_flags = elf_page_flags(p_flags);
-
-  for (uint64_t page = start_page; page < end_page; page += PAGE_SIZE) {
-    uint64_t phys = vmm_virt_to_phys(pml4, page);
-    if (!phys)
-      continue;
-
-    vmm_unmap_page(pml4, page);
-    if (!vmm_map_page(pml4, page, phys & PAGE_MASK, final_flags))
-      return false;
+static bool elf_read_phdr(vfs_node_t *file, const Elf64_Ehdr *ehdr,
+                           bool compat32, const uint8_t *table, uint16_t index,
+                           Elf64_Phdr *out) {
+  uint8_t raw[sizeof(Elf64_Phdr)];
+  size_t size = compat32 ? sizeof(Elf32_Phdr) : sizeof(Elf64_Phdr);
+  if (table)
+    memcpy(raw, table + (uint32_t)index * ehdr->e_phentsize, size);
+  else if (vfs_read(file, ehdr->e_phoff + (uint64_t)index * ehdr->e_phentsize,
+                    size, raw) != size)
+    return false;
+  if (!compat32) {
+    memcpy(out, raw, sizeof(*out));
+  } else {
+    Elf32_Phdr p;
+    memcpy(&p, raw, sizeof(p));
+    *out = (Elf64_Phdr){ .p_type=p.p_type, .p_flags=p.p_flags,
+        .p_offset=p.p_offset, .p_vaddr=p.p_vaddr, .p_paddr=p.p_paddr,
+        .p_filesz=p.p_filesz, .p_memsz=p.p_memsz, .p_align=p.p_align };
   }
-
   return true;
 }
 
@@ -191,33 +224,37 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
   }
 
   TSC_BEGIN(elf_phdr);
-  // Read the ELF Header
-  Elf64_Ehdr ehdr;
-  if (vfs_read(file, 0, sizeof(Elf64_Ehdr), (uint8_t *)&ehdr) !=
-      sizeof(Elf64_Ehdr)) {
-    TSC_END(elf_phdr);
-    vfs_close(file);
-    return false;
+  // Normalize the ELF32 header; the segment mapper uses 64-bit arithmetic.
+  Elf64_Ehdr ehdr = {0};
+  uint8_t ident[16];
+  if (vfs_read(file, 0, sizeof(ident), ident) != sizeof(ident) ||
+      ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' ||
+      ident[3] != 'F' || (ident[4] != 1 && ident[4] != 2) ||
+      ident[5] != 1 || ident[6] != 1)
+    goto bad_header;
+  bool compat32 = ident[4] == 1;
+  if (compat32) {
+    Elf32_Ehdr e;
+    if (vfs_read(file, 0, sizeof(e), (uint8_t *)&e) != sizeof(e))
+      goto bad_header;
+    memcpy(ehdr.e_ident, e.e_ident, sizeof(e.e_ident));
+    ehdr.e_type = e.e_type; ehdr.e_machine = e.e_machine;
+    ehdr.e_version = e.e_version; ehdr.e_entry = e.e_entry;
+    ehdr.e_phoff = e.e_phoff; ehdr.e_ehsize = e.e_ehsize;
+    ehdr.e_phentsize = e.e_phentsize; ehdr.e_phnum = e.e_phnum;
+  } else if (vfs_read(file, 0, sizeof(ehdr), (uint8_t *)&ehdr) != sizeof(ehdr)) {
+    goto bad_header;
   }
-
-  if (ehdr.e_ident[0] != 0x7f || ehdr.e_ident[1] != 'E' ||
-      ehdr.e_ident[2] != 'L' || ehdr.e_ident[3] != 'F' ||
-      ehdr.e_ident[4] != 2) {
-    TSC_END(elf_phdr);
-    vfs_close(file);
-    return false;
-  }
-  if (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN) {
-    TSC_END(elf_phdr);
-    klog_puts("[PROC] ELF load failed: unsupported ELF type\n");
-    vfs_close(file);
-    return false;
-  }
-
-  uint64_t load_base = requested_base;
-  if (!is_interp && ehdr.e_type == ET_DYN && load_base == 0) {
-    load_base = ELF_PIE_BASE;
-  }
+  size_t phdr_size = compat32 ? sizeof(Elf32_Phdr) : sizeof(Elf64_Phdr);
+  if (ehdr.e_machine != (compat32 ? 3 : 62) || ehdr.e_version != 1 ||
+      ehdr.e_ehsize != (compat32 ? sizeof(Elf32_Ehdr) : sizeof(Elf64_Ehdr)) ||
+      (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN) ||
+      ehdr.e_phnum == 0 || ehdr.e_phnum > 1024 ||
+      ehdr.e_phentsize < phdr_size || ehdr.e_phoff > UINT32_MAX ||
+      ehdr.e_phoff + (uint64_t)ehdr.e_phnum * ehdr.e_phentsize > file->length)
+    goto bad_header;
+  if (compat32 && is_interp)
+    requested_base = ELF32_INTERP_BASE;
 
   // Read the whole program header table in one vfs_read() when the layout is
   // standard.  A typical binary has 10-15 headers, so this replaces that many
@@ -226,7 +263,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
   uint32_t phdr_tab_bytes = (uint32_t)ehdr.e_phnum * ehdr.e_phentsize;
   uint8_t *phdr_tab = NULL;
   if (phdr_tab_bytes > 0 && phdr_tab_bytes <= 64 * 1024 &&
-      ehdr.e_phentsize == sizeof(Elf64_Phdr)) {
+      ehdr.e_phentsize == phdr_size) {
     phdr_tab = kmalloc(phdr_tab_bytes);
     if (phdr_tab &&
         vfs_read(file, ehdr.e_phoff, phdr_tab_bytes, phdr_tab) !=
@@ -237,20 +274,54 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
   }
   TSC_END(elf_phdr);
 
+  uint64_t load_base = requested_base;
+  if (!is_interp && ehdr.e_type == ET_DYN && load_base == 0) {
+    /* ET_DYN without PT_INTERP is a self-loading executable (e.g. Wine's
+     * preloader or ld.so invoked directly).  Keep it in the high loader
+     * region: it may reserve the low address space for the program it loads.
+     * Decide before mapping any PT_LOAD, since PT_INTERP can appear later
+     * in the program header table. */
+    bool has_interp = false;
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+      Elf64_Phdr phdr;
+      if (!elf_read_phdr(file, &ehdr, compat32, phdr_tab, i, &phdr)) {
+        if (phdr_tab) kfree(phdr_tab);
+        vfs_close(file);
+        return false;
+      }
+      if (phdr.p_type == PT_INTERP) {
+        has_interp = true;
+        break;
+      }
+    }
+    load_base = has_interp ? ELF_PIE_BASE :
+                (compat32 ? ELF32_INTERP_BASE : ELF_INTERP_BASE);
+  }
+
   // Single pass over program headers: collect PT_INTERP, PT_PHDR, and
   // process PT_LOAD segments all at once.
   TSC_BEGIN(elf_segments);
   uint64_t phdr_vaddr = 0;
   for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
     Elf64_Phdr phdr;
-    if (phdr_tab) {
-      memcpy(&phdr, phdr_tab + (uint32_t)i * ehdr.e_phentsize,
-             sizeof(Elf64_Phdr));
-    } else {
-      uint32_t offset = ehdr.e_phoff + (i * ehdr.e_phentsize);
-      if (vfs_read(file, offset, sizeof(Elf64_Phdr), (uint8_t *)&phdr) !=
-          sizeof(Elf64_Phdr))
-        continue;
+    if (!elf_read_phdr(file, &ehdr, compat32, phdr_tab, i, &phdr)) {
+      if (phdr_tab) kfree(phdr_tab);
+      vfs_close(file);
+      return false;
+    }
+    uint64_t user_limit = compat32 ? ELF32_USER_LIMIT : 0x800000000000ULL;
+    if (phdr.p_type == PT_LOAD &&
+        (phdr.p_filesz > phdr.p_memsz || phdr.p_offset > UINT32_MAX ||
+         phdr.p_filesz > file->length ||
+         phdr.p_offset > file->length - phdr.p_filesz ||
+         load_base + phdr.p_vaddr < load_base ||
+         load_base + phdr.p_vaddr >= user_limit ||
+         phdr.p_memsz > user_limit - (load_base + phdr.p_vaddr) ||
+         (phdr.p_vaddr & (PAGE_SIZE - 1)) !=
+             (phdr.p_offset & (PAGE_SIZE - 1)))) {
+      if (phdr_tab) kfree(phdr_tab);
+      vfs_close(file);
+      return false;
     }
 
     // Collect interpreter path from PT_INTERP.
@@ -272,6 +343,10 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
       phdr_vaddr = load_base + phdr.p_vaddr + (ehdr.e_phoff - phdr.p_offset);
     }
 
+    // PT_GNU_RELRO / PT_GNU_STACK / PT_TLS carry no loadable bytes.  RELRO in
+    // particular stays writable until ld.so's post-relocation mprotect();
+    // tightening it here would be an eager page-table walk for pages that may
+    // never be faulted in.
     if (phdr.p_type != PT_LOAD)
       continue;
 
@@ -305,14 +380,26 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
         if (phdr.p_flags & PF_X)
           prot |= 0x4;
 
-        vma_add(&current_thread->mm->vmas, start_page, end_page, prot,
-                MAP_PRIVATE, -1, vma_offset, file, vma_file_size);
+        if (vma_add(&current_thread->mm->vmas, start_page, end_page, prot,
+                    MAP_PRIVATE, -1, filesz ? vma_offset : 0,
+                    filesz ? file : NULL, vma_file_size) < 0) {
+          if (phdr_tab) kfree(phdr_tab);
+          vfs_close(file);
+          return false;
+        }
 
         // Queue the PT_LOAD file pages for the async prefetch worker in
         // 256 KB windows.  execve() no longer waits for the whole image: the
         // worker streams the remaining pages while the process starts running,
         // and demand paging fills anything the worker has not reached yet.
-        if (filesz > 0 && file) {
+        // The interpreter (ld.so) is deliberately excluded: its VMAs are
+        // still registered above so faults resolve, but its bytes stay fully
+        // demand-paged.  Boot already precaches ld.so's first 256 KB
+        // (fs/precache.c) which covers the entry fault, fault-time 128 KB
+        // readahead in vmm_fault.c streams the rest on first touch, and
+        // interp runs first anyway so backgrounding its pages only floods
+        // the prefetch queue ahead of the main image it is about to map.
+        if (filesz > 0 && file && !is_interp) {
           const uint32_t prefetch_chunk = 256 * 1024;
           uint32_t start_off = file_offset & ~(PAGE_SIZE - 1);
           uint32_t end_off = (file_offset + filesz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -331,6 +418,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
   TSC_END(elf_segments);
 
   if (out_info) {
+    out_info->compat32 = compat32;
     if (is_interp) {
       out_info->interp_base = load_base;
       out_info->interp_entry = load_base + ehdr.e_entry;
@@ -345,6 +433,11 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
 
   vfs_close(file);
   return true;
+
+bad_header:
+  TSC_END(elf_phdr);
+  vfs_close(file);
+  return false;
 }
 
 bool elf_load(const char *path, uint64_t *pml4, elf_info_t *out_info) {
@@ -368,6 +461,8 @@ bool elf_load(const char *path, uint64_t *pml4, elf_info_t *out_info) {
                      NULL, 0)) {
       return false;
     }
+    if (interp_info.compat32 != main_info.compat32)
+      return false;
     if (out_info) {
       *out_info = main_info;
       out_info->interp_base = interp_info.interp_base;
@@ -382,7 +477,7 @@ bool elf_load(const char *path, uint64_t *pml4, elf_info_t *out_info) {
   // User stack: register the region now, map pages lazily.  The initial stack
   // builder maps whichever pages it writes through process_copy_to_user();
   // faults fill the rest as the program grows its stack (MAP_GROWSDOWN).
-  uint64_t stack_top = ASCENTOS_USER_STACK_TOP;
+  uint64_t stack_top = main_info.compat32 ? ELF32_STACK_TOP : ASCENTOS_USER_STACK_TOP;
   uint64_t stack_size = 4 * PAGE_SIZE;
   uint64_t stack_bottom = stack_top - stack_size;
 
@@ -390,23 +485,23 @@ bool elf_load(const char *path, uint64_t *pml4, elf_info_t *out_info) {
   if (current_thread && current_thread->mm) {
     vma_add(&current_thread->mm->vmas, stack_bottom, stack_top, 0x3,
             0x22 | MAP_GROWSDOWN, -1, 0, NULL, 0);
-    vma_add(&current_thread->mm->vmas, VDSO_USER_BASE,
+    if (!main_info.compat32)
+      vma_add(&current_thread->mm->vmas, VDSO_USER_BASE,
             VDSO_USER_BASE + PAGE_SIZE, 0x5, MAP_PRIVATE | MAP_ANONYMOUS, -1,
             0, NULL, 0);
 
+    current_thread->mm->compat32 = main_info.compat32;
     current_thread->mm->brk_base =
         (current_thread->mm->brk_base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     current_thread->mm->brk_current = current_thread->mm->brk_base;
     mm_reset_mmap_state(current_thread);
   }
 
-  // Pre-fault the entry point code page so context switching into userland does not immediately trigger a page fault
-  if (out_info && out_info->entry) {
-    uint64_t entry_addr = out_info->interp_entry ? out_info->interp_entry : out_info->entry;
-    TSC_BEGIN(elf_entry_fault);
-    vmm_handle_page_fault(entry_addr, 0x4, NULL);
-    TSC_END(elf_entry_fault);
-  }
+  // No entry pre-fault: the first instruction fetch faults naturally and the
+  // fault path (128 KB readahead + CoW/cluster mapping in vmm_fault.c) plus
+  // the async prefetch worker queued above stream the text in.  Faulting here
+  // synchronously would turn every execve into a disk read on the critical
+  // path to save a single fault on return to userspace.
 
   return true;
 }
@@ -427,10 +522,10 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
     envp = default_envp;
   }
 
-  if (!argv) {
-    const char *temp_argv[2] = {path, NULL};
-    argv = temp_argv;
-  }
+  const char *temp_argv[2] = {path, NULL};
+  if (!argv) argv = temp_argv;
+  bool compat32 = elf_info && elf_info->compat32;
+  if (compat32) stack_top = ELF32_STACK_TOP;
 
   int argc = 0;
   int envc = 0;
@@ -454,11 +549,11 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
   string_bytes += 16 + 8 + 64;
 
   // 2. Determine number of stack entries (argc, argv ptrs, envp ptrs, auxv
-  // pairs) Auxv entries (19 real pairs + 1 NULL pair)
+  // pairs) Auxv entries (18 real pairs + 1 NULL pair)
   size_t auxv_pairs = elf_info ? 19 : 1;
   size_t stack_entry_count =
       1 + (size_t)argc + 1 + (size_t)envc + 1 + auxv_pairs * 2;
-  size_t pointer_bytes = stack_entry_count * sizeof(uint64_t);
+  size_t pointer_bytes = stack_entry_count * (compat32 ? sizeof(uint32_t) : sizeof(uint64_t));
 
   // 3. Layout the areas from high to low address:
   // [stack_top]
@@ -477,17 +572,21 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
 
   uint64_t final_sp = pointer_area_bottom;
 
-  // 4. Copy strings to the Strings Area and collect their addresses
-  uint64_t *argv_ptrs = kmalloc((argc > 0 ? argc : 1) * sizeof(uint64_t));
-  uint64_t *envp_ptrs = kmalloc((envc > 0 ? envc : 1) * sizeof(uint64_t));
-  if (!argv_ptrs || !envp_ptrs) {
-    if (argv_ptrs)
-      kfree(argv_ptrs);
-    if (envp_ptrs)
-      kfree(envp_ptrs);
+  /* Most launches fit their pointer table in 1 KiB. Larger argv/envp
+   * tables use one allocation. Fill argv/envp addresses directly into their
+   * final slots, eliminating two temporary arrays and their heap traffic. */
+  TSC_BEGIN(exec_stack_alloc);
+  uint64_t local_entries[128];
+  uint64_t *stack_entries = local_entries;
+  if (stack_entry_count > sizeof(local_entries) / sizeof(local_entries[0]))
+    stack_entries = kmalloc(stack_entry_count * sizeof(uint64_t));
+  TSC_END(exec_stack_alloc);
+  if (!stack_entries)
     return 0;
-  }
+  struct process_stack_writer writer = {
+      .pml4 = vmm_get_active_pml4(), .hhdm = pmm_get_hhdm_offset()};
 
+  TSC_BEGIN(exec_stack_strings);
   uint64_t current_string = string_area_bottom;
   /* Mirror the argv strings into a kernel-side blob while they are being
    * written to the user stack, so /proc/<pid>/cmdline can report the real
@@ -499,9 +598,9 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
   char cmdline_buf[sizeof(((struct mm_struct *)0)->saved_cmdline)];
   bool     cmdline_fits = true;
   for (int i = 0; i < argc; i++) {
-    argv_ptrs[i] = current_string;
+    stack_entries[1 + i] = current_string;
     size_t len = strlen(argv[i]) + 1;
-    process_copy_to_user(vmm_get_active_pml4(), current_string, argv[i], len);
+    process_copy_to_user(&writer, current_string, argv[i], len);
     current_string += len;
     argv_bytes += len;
     /* Stop at the first argument that does not fit, so the blob is always a
@@ -514,9 +613,9 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
     cmdline_len += (uint32_t)len;
   }
   for (int i = 0; i < envc; i++) {
-    envp_ptrs[i] = current_string;
+    stack_entries[argc + 2 + i] = current_string;
     size_t len = strlen(envp[i]) + 1;
-    process_copy_to_user(vmm_get_active_pml4(), current_string, envp[i], len);
+    process_copy_to_user(&writer, current_string, envp[i], len);
     current_string += len;
   }
 
@@ -527,32 +626,24 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
     uint8_t rnd[16];
     for (int i = 0; i < 16; i++)
       rnd[i] = (uint8_t)(i * 7 + 0xA5);
-    process_copy_to_user(vmm_get_active_pml4(), current_string, rnd, 16);
+    process_copy_to_user(&writer, current_string, rnd, 16);
     current_string += 16;
   }
 
   // AT_PLATFORM string ("x86_64")
   current_string = (current_string + 15) & ~15ULL;
   uint64_t at_platform_addr = current_string;
-  process_copy_to_user(vmm_get_active_pml4(), at_platform_addr, "x86_64", 7);
+  process_copy_to_user(&writer, at_platform_addr,
+                       compat32 ? "i686" : "x86_64", compat32 ? 5 : 7);
   current_string += 8;
 
-  // 5. Build the Pointers/Auxv Area
-  uint64_t *stack_entries = kmalloc(stack_entry_count * sizeof(uint64_t));
-  if (!stack_entries) {
-    kfree(argv_ptrs);
-    kfree(envp_ptrs);
-    return 0;
-  }
+  TSC_END(exec_stack_strings);
 
-  int idx = 0;
-  stack_entries[idx++] = (uint64_t)argc;
-  for (int i = 0; i < argc; i++)
-    stack_entries[idx++] = argv_ptrs[i];
-  stack_entries[idx++] = 0; // end argv
-  for (int i = 0; i < envc; i++)
-    stack_entries[idx++] = envp_ptrs[i];
-  stack_entries[idx++] = 0; // end envp
+  // 5. Complete the Pointers/Auxv Area; string addresses are already in place.
+  stack_entries[0] = (uint64_t)argc;
+  stack_entries[argc + 1] = 0;
+  stack_entries[argc + envc + 2] = 0;
+  int idx = argc + envc + 3;
 
   if (elf_info) {
     stack_entries[idx++] = AT_PAGESZ;
@@ -588,9 +679,9 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
     stack_entries[idx++] = AT_CLKTCK;
     stack_entries[idx++] = 100;
     stack_entries[idx++] = AT_SYSINFO_EHDR;
-    stack_entries[idx++] = VDSO_USER_BASE;
+    stack_entries[idx++] = compat32 ? 0 : VDSO_USER_BASE;
     stack_entries[idx++] = AT_EXECFN;
-    stack_entries[idx++] = argv_ptrs[0];
+    stack_entries[idx++] = argc > 0 ? stack_entries[1] : 0;
   }
   stack_entries[idx++] = AT_NULL;
   stack_entries[idx++] = 0;
@@ -598,7 +689,7 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
   struct thread *cur = sched_get_current();
   if (cur && cur->mm) {
     size_t aux_start = 1 + argc + 1 + envc + 1;
-    size_t aux_entries = (idx > aux_start) ? (idx - aux_start) : 0;
+    size_t aux_entries = ((size_t)idx > aux_start) ? ((size_t)idx - aux_start) : 0;
     if (aux_entries > 64)
       aux_entries = 64;
     for (size_t i = 0; i < aux_entries; i++) {
@@ -617,15 +708,27 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
   }
 
   // 6. Copy Pointers/Auxv to user space at final_sp
-  process_copy_to_user(vmm_get_active_pml4(), final_sp, stack_entries,
-                       idx * sizeof(uint64_t));
+  TSC_BEGIN(exec_stack_pointers);
+  if (compat32) {
+    // Compact only after the kernel-side /proc auxv snapshot is recorded.
+    uint32_t *words = (uint32_t *)stack_entries;
+    for (int i = 0; i < idx; i++) words[i] = (uint32_t)stack_entries[i];
+    process_copy_to_user(&writer, final_sp, words,
+                         idx * sizeof(uint32_t));
+  } else {
+    process_copy_to_user(&writer, final_sp, stack_entries,
+                         idx * sizeof(uint64_t));
+  }
 
-  /* This dump sits inside the execve_stack probe.  Serial console output
-   * costs ~10us per character, so printing it on every exec made each one
-   * pay ~1ms here (measured floor: 941us).  First few launches only. */
+  TSC_END(exec_stack_pointers);
+
+  /* Debug dump, gated behind `proc_dump` on the kernel cmdline: serial
+   * output costs ~10us per character, so printing it on every exec made each
+   * one pay ~1ms here (measured floor: 941us). Previously first-4-launches
+   * only, which still taxed every boot; now off unless asked for. */
   {
     static uint32_t stack_dumps;
-    if (stack_dumps < 4) {
+    if (proc_dump_enabled() && stack_dumps < 4) {
       stack_dumps++;
       klog_puts("[PROC] Stack built:\n");
       klog_puts("  argc=");
@@ -638,9 +741,8 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
     }
   }
 
-  kfree(argv_ptrs);
-  kfree(envp_ptrs);
-  kfree(stack_entries);
+  if (stack_entries != local_entries)
+    kfree(stack_entries);
 
   return final_sp;
 }
@@ -658,6 +760,7 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
 static void process_fixup_libc_auxv(const char *path, uint64_t *pml4,
                                     uint64_t user_sp,
                                     const elf_info_t *elf_info) {
+  if (elf_info && elf_info->compat32) return;
   uint64_t hhdm = pmm_get_hhdm_offset();
   uint64_t load_base = elf_info ? elf_info->load_base : 0;
   vfs_node_t *file = vfs_resolve_path(path);
@@ -886,6 +989,7 @@ bool process_exec_argv(const char **argv) {
   // Issue the jump to userspace (does not return normally)
   uint64_t actual_entry =
       elf_info.interp_base ? elf_info.interp_entry : elf_info.entry;
+  fpu_reset_current();
   process_jump_usermode(actual_entry, user_rsp, (uint64_t)pml4);
   return true;
 }

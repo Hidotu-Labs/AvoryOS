@@ -2,7 +2,9 @@
 # scripts/setup-minecraft.sh -- Stage Minecraft 1.16.5 into AvoryOS
 #
 # Prerequisites:
-#   1. Run ./scripts/setup-arch.sh first  (provides Alpine rootfs, disk.img, OpenJDK 17)
+#   1. Run ./scripts/setup-arch.sh first (provides the Arch Linux rootfs and disk.img).
+#      glibc, OpenJDK 17, OpenAL, Mesa and the X11 client libraries are taken
+#      from that Arch rootfs, installed via pacman when missing.
 #   2. Network access on the first run: the client JAR is downloaded from the
 #      mcversions.net link, libraries/assets from Mojang (includes all 2,336
 #      OGG sound files of asset index 1.16)
@@ -48,7 +50,7 @@ done
 # Sanity checks
 # ─────────────────────────────────────────────────────────────────────────────
 [ ! -d "${ROOTFS_DIR}/etc" ] && {
-    echo "[!] Alpine rootfs not found. Run ./scripts/setup-arch.sh first."
+    echo "[!] Arch Linux rootfs not found. Run ./scripts/setup-arch.sh first."
     exit 1
 }
 [ ! -f "${DISK_IMG}" ] && {
@@ -57,53 +59,74 @@ done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Locate or install OpenJDK 17 in rootfs
+# Ensure glibc + libraries from the Arch Linux rootfs (install if missing)
 # ─────────────────────────────────────────────────────────────────────────────
-ALPINE_BRANCH="v3.21"
-APK_CACHE="${BUILD_DIR}"
+# Same pacman backend as scripts/setup-arch.sh: upstream Arch repos only
+# (x86-64 baseline, so binaries run under QEMU's default CPU). Signatures
+# off (https transport); no keyring needed in target.
+PACMAN_CONF="${BUILD_DIR}/pacman-avory.conf"
+PACMAN_CACHE="${BUILD_DIR}/paccache"
 
-install_apk_mc() {
+pacman_run_mc() {
+    mkdir -p "${ROOTFS_DIR}/var/lib/pacman"
+    unshare -rm pacman --config "${PACMAN_CONF}" --root "${ROOTFS_DIR}" \
+        --cachedir "${PACMAN_CACHE}" --noconfirm \
+        --assume-installed ntsync-autoload "$@"
+}
+
+pacman_sync_once_mc() {
+    if [ ! -f "${BUILD_DIR}/.pacman-sync" ]; then
+        pacman_run_mc -Sy
+        touch "${BUILD_DIR}/.pacman-sync"
+    fi
+}
+
+# Install an Arch package into the rootfs if not already present.
+ensure_pkg_mc() {
     local PKG_NAME="$1"
-    local REPO="$2"
-    local BRANCH="${3:-${ALPINE_BRANCH}}"
-    local PKG_MARKER="${ROOTFS_DIR}/etc/avoryos-pkg/${BRANCH}-${REPO}-${PKG_NAME}"
-
-    if [ -f "${PKG_MARKER}" ]; then
+    if pacman --config "${PACMAN_CONF}" --root "${ROOTFS_DIR}" -Q "${PKG_NAME}" >/dev/null 2>&1; then
         return 0
     fi
-
-    echo "[*] Installing ${PKG_NAME} from ${REPO} (${BRANCH})..."
-
-    local ESCAPED
-    ESCAPED=$(printf '%s' "${PKG_NAME}" | sed 's/\./\\./g;s/+/\\+/g')
-    local APK_FILENAME
-    APK_FILENAME=$(curl -sL "https://dl-cdn.alpinelinux.org/alpine/${BRANCH}/${REPO}/x86_64/" \
-        | grep -oP ">${ESCAPED}-[0-9][^<]*\.apk<" | sed 's/>//;s/<//' | sort -V | tail -n 1)
-
-    [ -z "${APK_FILENAME}" ] && {
-        echo "[!] Could not find package ${PKG_NAME} in ${REPO} (${BRANCH})" >&2
-        return 1
-    }
-
-    local APK_URL="https://dl-cdn.alpinelinux.org/alpine/${BRANCH}/${REPO}/x86_64/${APK_FILENAME}"
-    if [ ! -f "${APK_CACHE}/${APK_FILENAME}" ]; then
-        echo "    Downloading ${APK_URL}..."
-        curl -L "${APK_URL}" -o "${APK_CACHE}/${APK_FILENAME}"
-    fi
-
-    tar --ignore-zeros -xzf "${APK_CACHE}/${APK_FILENAME}" -C "${ROOTFS_DIR}" \
-        --warning=no-unknown-keyword 2>/dev/null || true
-
-    mkdir -p "${ROOTFS_DIR}/etc/avoryos-pkg"
-    touch "${PKG_MARKER}"
+    echo "[*] Installing ${PKG_NAME} into Arch rootfs..."
+    pacman_sync_once_mc
+    pacman_run_mc -S "${PKG_NAME}"
 }
+
+# Repair glibc version skew if present: an older setup redirected the system
+# loader at the 2.43 copy in /opt/avory-glibc while /usr/lib ships 2.44.
+# Mixing the two breaks every dlopen (undefined symbol: __pointer_chk_guard),
+# which is exactly how Minecraft's libglfw.so fails to load.
+for _glibc_link in "${ROOTFS_DIR}/usr/lib/libc.so.6" "${ROOTFS_DIR}/usr/lib/ld-linux-x86-64.so.2"; do
+    if [ -L "${_glibc_link}" ]; then
+        echo "[!] ${_glibc_link} is a stray symlink; reinstalling Arch glibc for a coherent tree..."
+        pacman_sync_once_mc
+        pacman_run_mc -S glibc
+        break
+    fi
+done
+
+# glibc itself plus everything Minecraft 1.16.5 (LWJGL 3/GLFW via OpenJDK 17)
+# loads at runtime. Each is installed only if missing from the rootfs.
+ensure_pkg_mc "glibc"
+ensure_pkg_mc "jre17-openjdk-headless"
+ensure_pkg_mc "jre17-openjdk"
+ensure_pkg_mc "openal"
+ensure_pkg_mc "mesa"
+# Minecraft 1.16.5 uses LWJGL 3/GLFW, which dlopen()s these X11 client
+# libraries at window-creation time.
+ensure_pkg_mc "libx11"
+ensure_pkg_mc "libxext"
+ensure_pkg_mc "libxi"
+ensure_pkg_mc "libxrandr"
+ensure_pkg_mc "libxcursor"
+ensure_pkg_mc "libxinerama"
+ensure_pkg_mc "libxxf86vm"
 
 find_java() {
     JAVA_HOME_ROOTFS=""
     for cand in \
         "${ROOTFS_DIR}/usr/lib/jvm/java-17-openjdk" \
-        "${ROOTFS_DIR}/usr/lib/jvm/java-17" \
-        "${ROOTFS_DIR}/usr/lib/jvm/default-jvm"; do
+        "${ROOTFS_DIR}/usr/lib/jvm/default-runtime"; do
         if [ -d "${cand}" ]; then
             JAVA_HOME_ROOTFS="${cand}"
             return 0
@@ -116,69 +139,17 @@ find_java() {
 }
 
 find_java
-if [ -z "${JAVA_HOME_ROOTFS}" ]; then
-    echo "[*] OpenJDK 17 not found in rootfs. Installing now..."
-    install_apk_mc "mesa-gl" "main"
-    install_apk_mc "mesa-glapi" "main"
-    install_apk_mc "mesa-gles" "main"
-    install_apk_mc "mesa-egl" "main"
-    install_apk_mc "freeglut" "community"
-    install_apk_mc "jemalloc" "main"
-    install_apk_mc "java-common"            "community"
-    install_apk_mc "openjdk17-jre-headless" "community"
-    install_apk_mc "openjdk17-jre"          "community"
-    install_apk_mc "java-cacerts"           "community"
-    find_java
-fi
 
 [ -z "${JAVA_HOME_ROOTFS}" ] && {
-    echo "[!] Failed to find or install OpenJDK 17. Aborting." >&2
+    echo "[!] Failed to find OpenJDK 17 in the Arch rootfs. Aborting." >&2
     exit 1
 }
 
 JAVA_HOME_GUEST="${JAVA_HOME_ROOTFS#"${ROOTFS_DIR}"}"
-echo "[+] Using JDK: ${JAVA_HOME_GUEST}"
-
-# Minecraft's bundled OpenAL is an old glibc build. Ensure a musl-native
-# OpenAL Soft is present even when Java was already installed by setup-alpine.
-# Dependencies are not resolved automatically, so install the library package
-# explicitly before the optional OpenAL utilities package.
-install_apk_mc "openal-soft-libs" "community"
-install_apk_mc "openal-soft" "community"
-
-# Minecraft 1.16.5 uses LWJGL 3/GLFW, which dlopen()s these X11 client
-# libraries at window-creation time. Install them explicitly: dependencies
-# are not resolved automatically.
-install_apk_mc "libx11"       "main"
-install_apk_mc "libxext"      "main"
-install_apk_mc "libxi"        "main"
-install_apk_mc "libxrandr"    "main"
-install_apk_mc "libxcursor"   "main"
-install_apk_mc "libxinerama"  "main"
-install_apk_mc "libxxf86vm"   "main"
-
-# All JVM internal .so files use RPATH=$ORIGIN/../lib which AvoryOS's musl
-# doesn't reliably resolve. Copy every .so from the JVM lib dir into /usr/lib/
-# so musl's hardcoded search path always finds them.
-echo "[*] Copying JVM internal libraries to /usr/lib/..."
-find "${JAVA_HOME_ROOTFS}/lib" -name '*.so' -exec cp -f {} "${ROOTFS_DIR}/usr/lib/" \;
-JVM_LIBS_COUNT=$(find "${JAVA_HOME_ROOTFS}/lib" -name '*.so' | wc -l)
-echo "[+] Copied ${JVM_LIBS_COUNT} JVM .so files → /usr/lib/"
-
-# libjli.so looks for jvm.cfg relative to its own location.
-# Since it's now in /usr/lib/, copy jvm.cfg there too.
-cp -f "${JAVA_HOME_ROOTFS}/lib/jvm.cfg" "${ROOTFS_DIR}/usr/lib/jvm.cfg"
-echo "[+] Copied jvm.cfg → /usr/lib/"
-
-# jvm.cfg references '-server KNOWN', so libjvm.so must also be in /usr/lib/.
-cp -f "${JAVA_HOME_ROOTFS}/lib/server/libjvm.so" "${ROOTFS_DIR}/usr/lib/libjvm.so"
-echo "[+] Copied server/libjvm.so → /usr/lib/"
-
-# libjli.so resolves the server JVM at $libdir/server/libjvm.so relative to
-# its own location (/usr/lib/), so create /usr/lib/server/ as well.
-mkdir -p "${ROOTFS_DIR}/usr/lib/server"
-cp -f "${JAVA_HOME_ROOTFS}/lib/server/libjvm.so" "${ROOTFS_DIR}/usr/lib/server/libjvm.so"
-echo "[+] Copied server/libjvm.so → /usr/lib/server/"
+echo "[+] Using JDK from Arch rootfs: ${JAVA_HOME_GUEST} ($(pacman --config "${PACMAN_CONF}" --root "${ROOTFS_DIR}" -Q glibc 2>/dev/null | awk '{print $1" "$2}'))"
+# NOTE: no musl-era fixups here. The Arch tree is glibc, so the JVM's own
+# RPATH/$ORIGIN layout, Mojang's glibc-built LWJGL natives and the bundled
+# OpenAL all resolve natively — no .so copying into /usr/lib, no compat shim.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Download Minecraft 1.16.5 libraries + Linux natives
@@ -366,22 +337,18 @@ while IFS= read -r nat_jar; do
     unzip -oj "${nat_jar}" "*.so" -d "${MC_NATIVES_ROOTFS}" 2>/dev/null || true
 done < "${NATIVES_LIST}"
 
-# LWJGL bundles its own glibc-built OpenAL. Replace it with Alpine's
-# musl-native OpenAL Soft (LWJGL 3 probes libopenal.so.1/libopenal.so and
-# must find the musl build under every one of those names).
+# LWJGL bundles its own OpenAL; prefer the Arch rootfs glibc build instead
+# (same libc family, so no symbol mismatch). LWJGL 3 probes
+# libopenal.so.1/libopenal.so, which must resolve under each of those names.
 SYSTEM_OPENAL="${ROOTFS_DIR}/usr/lib/libopenal.so.1"
 if [ ! -f "${SYSTEM_OPENAL}" ]; then
-    echo "[!] Alpine OpenAL Soft library was not installed at /usr/lib/libopenal.so.1" >&2
-    exit 1
-fi
-if readelf --version-info "${SYSTEM_OPENAL}" 2>/dev/null | grep -q 'GLIBC_'; then
-    echo "[!] Refusing to stage a glibc OpenAL library in the musl rootfs." >&2
+    echo "[!] Arch OpenAL library missing at /usr/lib/libopenal.so.1 despite ensure_pkg_mc openal" >&2
     exit 1
 fi
 for openal_name in libopenal.so libopenal.so.1 libopenal64.so; do
     cp -Lf "${SYSTEM_OPENAL}" "${MC_NATIVES_ROOTFS}/${openal_name}"
 done
-echo "[+] Replaced bundled OpenAL with Alpine's musl-native OpenAL Soft"
+echo "[+] Replaced bundled OpenAL with Arch's glibc OpenAL Soft"
 
 # Copy all library JARs into rootfs
 cp -f "${LIBS_DIR}"/*.jar "${MC_LIBS_ROOTFS}/" 2>/dev/null || true
@@ -494,80 +461,9 @@ mkdir -p "${MC_ASSETS_ROOTFS}"
 cp -a "${ASSETS_BUILD_DIR}/." "${MC_ASSETS_ROOTFS}/"
 echo "[+] Staged Minecraft assets (all OGG sounds included) → /opt/minecraft/assets/"
 
-# Mojang's LWJGL natives reference glibc fortify entry points that musl does
-# not export. Without them, lazy PLT calls jump into an unrebased trampoline
-# (e.g. 0x86ae); with RTLD_NOW, loading fails with "symbol not found". Provide
-# bounds-checked musl wrappers and force immediate relocation for dlopen'd DSOs.
-NATIVE_COMPAT_SRC="${BUILD_DIR}/native-compat.c"
-NATIVE_COMPAT_LIB="${ROOTFS_DIR}/usr/lib/libavory-native-compat.so"
-MUSL_CC="${MUSL_CC:-x86_64-linux-musl-gcc}"
-if ! command -v "${MUSL_CC}" >/dev/null 2>&1; then
-    echo "[!] ${MUSL_CC} is required to build the native compatibility shim." >&2
-    exit 1
-fi
-cat > "${NATIVE_COMPAT_SRC}" <<'NATIVE_COMPAT_EOF'
-#define _GNU_SOURCE
-#include <dlfcn.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-typedef void *(*dlopen_fn)(const char *, int);
-static dlopen_fn next_dlopen;
-
-__attribute__((constructor))
-static void resolve_dlopen(void) {
-    next_dlopen = (dlopen_fn)dlsym(RTLD_NEXT, "dlopen");
-}
-
-void *dlopen(const char *path, int mode) {
-    if (!next_dlopen)
-        next_dlopen = (dlopen_fn)dlsym(RTLD_NEXT, "dlopen");
-    if (!next_dlopen)
-        return NULL;
-    return next_dlopen(path, (mode & ~RTLD_LAZY) | RTLD_NOW);
-}
-
-int __vsnprintf_chk(char *dst, size_t size, int flag, size_t dst_size,
-                    const char *format, va_list args) {
-    (void)flag;
-    if (size > dst_size)
-        abort();
-    return vsnprintf(dst, size, format, args);
-}
-
-int __snprintf_chk(char *dst, size_t size, int flag, size_t dst_size,
-                   const char *format, ...) {
-    va_list args;
-    va_start(args, format);
-    int result = __vsnprintf_chk(dst, size, flag, dst_size, format, args);
-    va_end(args);
-    return result;
-}
-
-int __vfprintf_chk(FILE *stream, int flag, const char *format, va_list args) {
-    (void)flag;
-    return vfprintf(stream, format, args);
-}
-
-int __fprintf_chk(FILE *stream, int flag, const char *format, ...) {
-    va_list args;
-    va_start(args, format);
-    int result = __vfprintf_chk(stream, flag, format, args);
-    va_end(args);
-    return result;
-}
-
-void *__memmove_chk(void *dst, const void *src, size_t size, size_t dst_size) {
-    if (size > dst_size)
-        abort();
-    return memmove(dst, src, size);
-}
-NATIVE_COMPAT_EOF
-"${MUSL_CC}" -shared -fPIC -O2 -Wl,-z,now \
-    -o "${NATIVE_COMPAT_LIB}" "${NATIVE_COMPAT_SRC}" -ldl
-echo "[+] Built native compatibility shim → /usr/lib/libavory-native-compat.so"
+# No native compatibility shim: the Arch rootfs is glibc, so Mojang's
+# glibc-built LWJGL natives (including fortify __*_chk entry points and
+# lazy PLT relocations) resolve against the rootfs libc directly.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Stage minecraft.jar
@@ -623,15 +519,31 @@ cat > "${ROOTFS_DIR}/usr/bin/minecraft" << LAUNCHER_EOF
 
 export DISPLAY="\${DISPLAY:-:0}"
 
-# Software GL (Max Performance llvmpipe)
-export LIBGL_ALWAYS_SOFTWARE=1
-export GALLIUM_DRIVER=llvmpipe
-export LP_NUM_THREADS="\${LP_NUM_THREADS:-4}"
-export LP_PERF=no_linear,no_mipmap
-export MESA_NO_DITHER=1
-export vblank_mode=0
-export MESA_SHADER_CACHE_DISABLE=true
-export MESA_GLSL_CACHE_DISABLE=true
+# Hardware GL by default: on 'make run-c7-prime' (VFIO AMD passthrough) Mesa
+# loads radeonsi for the AMD render node and Xorg glamor is accelerated; on a
+# plain 'make run' (virtio-vga only) Mesa falls back to llvmpipe automatically.
+# The old launcher forced llvmpipe unconditionally, which is why F3 always
+# showed "llvmpipe" even when radeonsi was available.
+# Opt out: MC_SOFTWARE_GL=1 minecraft  (force llvmpipe)
+# Optional overrides: MC_GALLIUM_DRIVER / MC_DRI_PRIME passthrough.
+unset LIBGL_ALWAYS_SOFTWARE
+unset GALLIUM_DRIVER
+if [ "\${MC_SOFTWARE_GL:-0}" = "1" ]; then
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
+fi
+if [ -n "\${MC_GALLIUM_DRIVER:-}" ]; then
+    export GALLIUM_DRIVER="\${MC_GALLIUM_DRIVER}"
+fi
+if [ -n "\${MC_DRI_PRIME:-}" ]; then
+    export DRI_PRIME="\${MC_DRI_PRIME}"
+fi
+# Keep the Mesa shader cache enabled for hardware drivers (the old launcher
+# disabled it as llvmpipe tuning); only disable via MC_NO_SHADER_CACHE=1.
+if [ "\${MC_NO_SHADER_CACHE:-0}" = "1" ]; then
+    export MESA_SHADER_CACHE_DISABLE=true
+    export MESA_GLSL_CACHE_DISABLE=true
+fi
 # Minecraft 1.16.5 renders via Blaze3D, which needs OpenGL 3.2 core / GLSL 150.
 # Do not pin MESA_GL_VERSION_OVERRIDE or MESA_GLSL_VERSION_OVERRIDE here:
 # llvmpipe already advertises OpenGL 4.5, and forcing 2.1/120 breaks shaders.
@@ -642,12 +554,9 @@ export ALSOFT_DRIVERS="\${ALSOFT_DRIVERS:-oss}"
 
 JAVA_HOME="${JAVA_HOME_GUEST}"
 export PATH="\${JAVA_HOME}/bin:\${PATH}"
-# The natives directory must be first: musl resolves bare sonames such as
-# libopenal.so through LD_LIBRARY_PATH when LWJGL/GLFW dlopen() them.
-export LD_LIBRARY_PATH="/opt/minecraft/natives:\${JAVA_HOME}/lib:\${JAVA_HOME}/lib/server:/usr/lib:/lib:\${LD_LIBRARY_PATH:-}"
-
-MC_PRELOAD="/usr/lib/libavory-native-compat.so"
-[ -f /usr/lib/libjemalloc.so.2 ] && MC_PRELOAD="\${MC_PRELOAD}:/usr/lib/libjemalloc.so.2"
+# The natives directory must be first: the loader resolves bare sonames such
+# as libopenal.so through LD_LIBRARY_PATH when LWJGL/GLFW dlopen() them.
+export LD_LIBRARY_PATH="/opt/minecraft/natives:\${JAVA_HOME}/lib:\${JAVA_HOME}/lib/server:/usr/lib:\${LD_LIBRARY_PATH:-}"
 
 MC_USER="\${MC_USER:-${MC_USERNAME}}"
 MC_RAM="\${MC_RAM:-1024m}"
@@ -660,68 +569,12 @@ for jar in /opt/minecraft/libs/*.jar; do
     MC_CP="\${MC_CP}:\${jar}"
 done
 
-# Write 1.16.5-compatible options.txt (sound enabled); unknown keys are
-# ignored by the game, so only well-known keys are written here.
-cat > "\${MC_HOME}/options.txt" << 'OPT_EOF'
-invertYMouse:false
-mouseSensitivity:0.5
-fov:0.0
-gamma:1.0
-renderDistance:2
-guiScale:0
-particles:2
-bobView:false
-anaglyph3d:false
-clouds:0
-fancyGraphics:true
-ambientocclusion:false
-useVbo:true
-mipmapLevels:0
-entityShadows:false
-showCape:false
-difficulty:1
-resourcePacks:[]
-lang:en_us
-chatVisibility:0
-chatColors:true
-chatLinks:false
-chatLinksPrompt:false
-chatOpacity:1.0
-snooperEnabled:false
-fullscreen:false
-enableVsync:false
-hideServerAddress:false
-advancedItemTooltips:false
-pauseOnLostFocus:true
-touchscreen:false
-overrideWidth:0
-overrideHeight:0
-heldItemTooltips:true
-chatHeightFocused:1.0
-chatHeightUnfocused:0.44366196
-chatScale:1.0
-chatWidth:1.0
-autoJump:false
-forceUnicodeFont:false
-soundCategory_master:1.0
-soundCategory_music:0.5
-soundCategory_record:1.0
-soundCategory_weather:1.0
-soundCategory_block:1.0
-soundCategory_hostile:1.0
-soundCategory_neutral:1.0
-soundCategory_player:1.0
-soundCategory_ambient:1.0
-soundCategory_voice:1.0
-OPT_EOF
+# Let Minecraft create options.txt with its own defaults and save changes
+# made in the game. The launcher must not write presets or edit preferences.
 
-echo "[minecraft] Starting Minecraft ${MC_VERSION} as '\${MC_USER}' (Heap: \${MC_RAM}, Max FPS Profile)..."
-# Resolve all PLT entries while loading. AvoryOS's current runtime loader can
-# leave lazy JUMP_SLOT trampolines in dlopen'd libraries such as OpenAL
-# unrebased (for example, jumping to 0x86ae instead of base+0x86ae).
-LD_BIND_NOW=1 \
-LD_PRELOAD="\${MC_PRELOAD}\${LD_PRELOAD:+:\$LD_PRELOAD}" \
-MALLOC_CONF="background_thread:false,dirty_decay_ms:5000,muzzy_decay_ms:5000" \
+echo "[minecraft] Starting Minecraft ${MC_VERSION} as '\${MC_USER}' (Heap: \${MC_RAM})..."
+# glibc resolves Mojang's natives directly: no LD_PRELOAD shim, no
+# LD_BIND_NOW override, no jemalloc MALLOC_CONF.
 exec "\${JAVA_HOME}/bin/java" \
     -server \
     -Xms256m -Xmx"\${MC_RAM}" \
@@ -848,6 +701,9 @@ echo "╔═══════════════════════�
 echo "║  [SUCCESS] Minecraft 1.16.5 is ready in AvoryOS!                 ║"
 echo "╠══════════════════════════════════════════════════════════════════╣"
 echo "║  Boot AvoryOS → open a terminal → type:  minecraft               ║"
+echo "║  radeonsi needs the VFIO GPU boot:  make run-c7-prime             ║"
+echo "║  (plain 'make run' has no GPU, so Mesa falls back to llvmpipe)    ║"
+echo "║  Force software GL:  MC_SOFTWARE_GL=1 minecraft                   ║"
 echo "║  Custom username:  MC_USER=YourName minecraft                    ║"
 echo "║  Custom RAM:       MC_RAM=1536m minecraft                        ║"
 echo "║  Assets incl. 2,336 OGG sounds staged in /opt/minecraft/assets   ║"

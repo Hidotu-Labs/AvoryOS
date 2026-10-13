@@ -24,6 +24,10 @@ static bool prev_left = false, prev_right = false, prev_middle = false;
 static bool prev_side = false, prev_extra = false;
 static uint8_t mouse_cycle = 0;
 static uint8_t mouse_packet[3];
+static bool mouse_absolute;
+
+void mouse_configure_absolute(bool enabled) { mouse_absolute = enabled; }
+bool mouse_has_absolute_axes(void) { return mouse_absolute; }
 
 static int mouse_wait(uint8_t type) {
   uint32_t timeout = 100000;
@@ -115,8 +119,8 @@ static void mouse_callback(struct registers *regs) {
   }
 }
 
-void mouse_apply_report(int32_t dx, int32_t dy, int32_t wheel, int32_t hwheel,
-                        uint32_t buttons) {
+static void mouse_apply(int32_t dx, int32_t dy, int32_t wheel, int32_t hwheel,
+                        uint32_t buttons, bool absolute) {
   static uint32_t apply_logs;
   apply_logs++;
   if (apply_logs <= 32 || (apply_logs & 0x3FFU) == 0)
@@ -126,11 +130,15 @@ void mouse_apply_report(int32_t dx, int32_t dy, int32_t wheel, int32_t hwheel,
              global_mouse_state.y);
 
   // Update the shared absolute state (the PS/2 and USB paths both feed it).
-  global_mouse_state.x += dx;
-  global_mouse_state.y += dy;
-
   uint32_t width = fb_get_width();
   uint32_t height = fb_get_height();
+  if (absolute) {
+    global_mouse_state.x = (int64_t)dx * (width ? width - 1 : 0) / 32767;
+    global_mouse_state.y = (int64_t)dy * (height ? height - 1 : 0) / 32767;
+  } else if (!mouse_absolute) {
+    global_mouse_state.x += dx;
+    global_mouse_state.y += dy;
+  }
 
   if (global_mouse_state.x < 0)
     global_mouse_state.x = 0;
@@ -155,12 +163,18 @@ void mouse_apply_report(int32_t dx, int32_t dy, int32_t wheel, int32_t hwheel,
   // transitions; SYN_REPORT terminates one report batch.
   evdev_device_t *mdev = evdev_get_mouse();
   if (mdev) {
-    bool changed = dx != 0 || dy != 0 || wheel != 0 || hwheel != 0;
+    bool changed = absolute || wheel != 0 || hwheel != 0;
 
-    if (dx != 0)
-      evdev_push_event(mdev, EV_REL, REL_X, dx);
-    if (dy != 0)
-      evdev_push_event(mdev, EV_REL, REL_Y, dy);
+    if (absolute) {
+      evdev_push_event(mdev, EV_ABS, ABS_X, dx);
+      evdev_push_event(mdev, EV_ABS, ABS_Y, dy);
+    } else if (!mouse_absolute) {
+      changed |= dx != 0 || dy != 0;
+      if (dx != 0)
+        evdev_push_event(mdev, EV_REL, REL_X, dx);
+      if (dy != 0)
+        evdev_push_event(mdev, EV_REL, REL_Y, dy);
+    }
     if (wheel != 0)
       evdev_push_event(mdev, EV_REL, REL_WHEEL, wheel);
     if (hwheel != 0)
@@ -186,6 +200,16 @@ void mouse_apply_report(int32_t dx, int32_t dy, int32_t wheel, int32_t hwheel,
     if (changed)
       evdev_sync(mdev);
   }
+}
+
+void mouse_apply_report(int32_t dx, int32_t dy, int32_t wheel, int32_t hwheel,
+                        uint32_t buttons) {
+  mouse_apply(dx, dy, wheel, hwheel, buttons, false);
+}
+
+void mouse_apply_absolute_report(int32_t x, int32_t y, int32_t wheel,
+                                 int32_t hwheel, uint32_t buttons) {
+  mouse_apply(x, y, wheel, hwheel, buttons, true);
 }
 
 void mouse_init(void) {

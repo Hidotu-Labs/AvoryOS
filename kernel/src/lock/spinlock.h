@@ -31,7 +31,8 @@
 // answer a TLB shootdown IPI, otherwise a shootdown initiator waits for an
 // acknowledgement that can never be sent.  See the note in
 // mm/tlb_shootdown.c.  A caller that already masked interrupts keeps them
-// masked (the flags are saved, not forced).
+// masked (the flags are saved, not forced), and services published local
+// shootdowns directly while waiting, without opening an interrupt window.
 //
 // Trade-off: there is no FIFO fairness, so a heavily contended lock can keep a
 // waiter waiting.  That is the same trade Linux's spin_lock() makes, and it
@@ -54,6 +55,9 @@ static inline void spinlock_init(spinlock_t *lock) {
  * interrupt window while it spins.  (hal.h exposes no predicate for a saved
  * state, and re-reading RFLAGS would race the save itself.) */
 #define SPINLOCK_RFLAGS_IF (1ULL << 9)
+
+/* Lock-free local TLB service; never enables IRQs or schedules the waiter. */
+void tlb_shootdown_poll(void);
 
 /* Acquire with interrupts masked from before the atomic that wins the lock.
  *
@@ -87,8 +91,10 @@ static inline void spinlock_acquire(spinlock_t *lock) {
           __asm__ volatile("pause" ::: "memory");
         hal_irq_disable();
       } else {
-        while (__atomic_load_n(&lock->locked, __ATOMIC_RELAXED))
+        while (__atomic_load_n(&lock->locked, __ATOMIC_RELAXED)) {
+          tlb_shootdown_poll();
           __asm__ volatile("pause" ::: "memory");
+        }
       }
     }
     LOCKDIAG_SPIN_END(lock);
@@ -124,8 +130,10 @@ static inline void spinlock_acquire_save(spinlock_t *lock, uint64_t *flags) {
           __asm__ volatile("pause" ::: "memory");
         hal_irq_disable();
       } else {
-        while (__atomic_load_n(&lock->locked, __ATOMIC_RELAXED))
+        while (__atomic_load_n(&lock->locked, __ATOMIC_RELAXED)) {
+          tlb_shootdown_poll();
           __asm__ volatile("pause" ::: "memory");
+        }
       }
     }
     LOCKDIAG_SPIN_END(lock);
@@ -192,8 +200,10 @@ static inline void rawspinlock_acquire(rawspinlock_t *lock) {
                        0)) {
     LOCKDIAG_SPIN_BEGIN(lock);
     while (__atomic_test_and_set(&lock->locked, __ATOMIC_ACQUIRE)) {
-      while (__atomic_load_n(&lock->locked, __ATOMIC_RELAXED))
+      while (__atomic_load_n(&lock->locked, __ATOMIC_RELAXED)) {
+        tlb_shootdown_poll();
         __asm__ volatile("pause" ::: "memory");
+      }
     }
     LOCKDIAG_SPIN_END(lock);
   }

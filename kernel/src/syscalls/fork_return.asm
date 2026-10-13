@@ -25,6 +25,9 @@ fork_return_to_userspace:
     mov  es, ax
     pop  rax
 
+    cmp qword [rax + 128], 0x1b
+    je .compat_iret
+
     ; Restore GPRs (except rdi and rax which we handle last)
     mov rsi, [rax + 8]
     mov rdx, [rax + 16]
@@ -63,3 +66,30 @@ fork_return_to_userspace:
 
     ; Return to user mode
     o64 sysret
+
+.compat_iret:
+    ; Compatibility mode cannot return through SYSRETQ. Keep the interrupt
+    ; frame on the kernel stack until IRETQ switches both privilege and mode.
+    cli
+    push qword 0x23
+    push qword [rax + 120]
+    push qword [rax + 112]
+    push qword 0x1b
+    push qword [rax + 104]
+    mov r15, [rax + 96]
+    mov r14, [rax + 88]
+    mov r13, [rax + 80]
+    mov r12, [rax + 72]
+    xor r11d, r11d
+    xor r10d, r10d
+    xor r9d, r9d
+    xor r8d, r8d
+    mov rbp, [rax + 64]
+    mov rbx, [rax + 56]
+    mov rdx, [rax + 16]
+    mov rcx, [rax + 136]
+    mov rsi, [rax + 144]
+    mov rdi, [rax + 152]
+    mov rax, [rax + 48]
+    swapgs
+    iretq

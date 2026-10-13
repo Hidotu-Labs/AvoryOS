@@ -142,6 +142,34 @@ static long p4s_probe_ret;
 static struct task_struct *p4s_probe_peer;
 static struct completion p4s_probe_ready;
 
+/* Force a fence-style wake between preparing the wait and entering timeout.
+ * A no-op set_current_state loses this notification and sleeps two seconds. */
+static int p4s_prepared_timeout_worker(void *arg) {
+  (void)arg;
+  set_current_state(TASK_INTERRUPTIBLE);
+  wake_up_process(current);
+  p4s_probe_ret = schedule_timeout(msecs_to_jiffies(2000));
+  __set_current_state(TASK_RUNNING);
+  complete(&p4s_probe_done);
+  return 0;
+}
+
+static void p4s_test_prepared_timeout_probe(void) {
+  init_completion(&p4s_probe_done);
+  p4s_probe_ret = -1;
+  struct task_struct *t = kthread_run(p4s_prepared_timeout_worker, NULL,
+                                     "p4s-prewait");
+  if (IS_ERR(t)) {
+    p4s_fail("prepared timeout probe thread", PTR_ERR(t));
+    return;
+  }
+  if (wait_for_completion_timeout(&p4s_probe_done, msecs_to_jiffies(3000)) &&
+      p4s_probe_ret > msecs_to_jiffies(1900))
+    p4s_ok("prepared wait: fence wake before schedule_timeout retained");
+  else
+    p4s_fail("prepared timeout lost wake", p4s_probe_ret);
+}
+
 static int p4s_probe_timeout_worker(void *arg) {
   (void)arg;
   p4s_probe_peer = current;
@@ -454,6 +482,7 @@ void linuxkpi_test_phase4_sched(void) {
   klog_puts("[LINUXKPI] Phase 4 drm_sched self-test\n");
 
   p4s_test_timeout_probe();
+  p4s_test_prepared_timeout_probe();
   p4s_test_wakeup_probe();
   p4s_test_basic();
   if (!p4s_broken) {

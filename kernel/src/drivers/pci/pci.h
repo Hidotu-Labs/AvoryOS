@@ -29,6 +29,8 @@ struct pci_device {
   uint64_t bar_size[6];
   uint8_t irq_line;
   struct device *kernel_device;
+  /* Imported PCI drivers bind through LinuxKPI, outside the native manager. */
+  const char *linux_driver_name;
 };
 
 // Read/write PCI configuration space

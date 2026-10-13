@@ -163,6 +163,7 @@ echo "[*] Installing runtime to ${RUNTIME_INSTALL_DIR}..."
 ${SUDO} rm -rf "${BUNDLE_ROOT}"
 ${SUDO} mkdir -p "${BUNDLE_ROOT}"
 ${SUDO} cp -a "${APP_DIR}/." "${BUNDLE_ROOT}/"
+${SUDO} cp "${ROOT_DIR}/scripts/mocktail-session.sh" "${BUNDLE_ROOT}/avory-session.sh"
 
 # WebKitGTK 6.0 in the standalone Mocktail bundle looks up its helper
 # processes and injected bundle under the compiled-in namespace path. Normally
@@ -290,6 +291,9 @@ if [[ ! "${ACTIVE_PAYLOAD}" =~ ^[0-9]+-[0-9a-f]{40}$ ]] || \
     exit 1
 fi
 
+python3 "${ROOT_DIR}/scripts/verify-mocktail-payload.py" \
+    "${HOST_DATA_DIR}/mocktail/${ACTIVE_PAYLOAD_PATH}"
+
 # Stage only the selected payload. Inactive updater candidates can be
 # read-only (or partially downloaded), and are neither needed by the guest nor
 # safe to remove from the updater's cache. The disk image keeps its Android
@@ -307,24 +311,11 @@ if [ -d "${DATA_ROOT}/android/data/files/appData/LocalStorage" ] && \
         "${DATA_ROOT}/android/data/files/appData/localStorage"
 fi
 
-# Pre-cache the NotoSansCJK fallback font so Roblox never downloads it.
-for pdir in "${DATA_ROOT}/payloads"/*; do
-    if [ -d "${pdir}/assets" ]; then
-        FONT_DST="${pdir}/assets/fonts/NotoSansCJK-Regular.otf"
-        JSON_DST="${pdir}/assets/content/fonts/families/NotoSansCJKFallback.json"
-        if [ ! -f "${FONT_DST}" ]; then
-            echo "[*] Downloading NotoSansCJK font (asset 123924484074402) on host..."
-            LOC=$(curl -s "https://assetdelivery.roblox.com/v2/asset?id=123924484074402" | grep -o '"location":"[^"]*"' | cut -d'"' -f4 || true)
-            if [ -n "${LOC}" ]; then
-                curl -sL "${LOC}" | gzip -dc > "${FONT_DST}" 2>/dev/null || true
-            fi
-        fi
-        if [ -f "${FONT_DST}" ] && [ -f "${JSON_DST}" ]; then
-            sed -i 's|"rbxassetid://123924484074402"|"rbxasset://fonts/NotoSansCJK-Regular.otf"|g' "${JSON_DST}"
-            echo "[+] Pre-cached NotoSansCJK font into payload: ${FONT_DST}"
-        fi
-    fi
-done
+# Keep the verified payload byte-for-byte intact. Adding a font or rewriting
+# its family JSON invalidates the updater's asset count and tree digest.
+# Downloaded fonts belong to the runtime's writable cache instead.
+python3 "${ROOT_DIR}/scripts/verify-mocktail-payload.py" \
+    "${DATA_ROOT}/${ACTIVE_PAYLOAD_PATH}"
 
 # Ensure glibc DNS resolver libraries and resolv.conf exist in the rootfs
 # (the bundled glibc also ships libnss_*, this keeps the system paths valid).
@@ -420,30 +411,19 @@ else
 MESA_VENDOR_EOF
 fi
 echo "[*] Installing glibc loader links in the rootfs..."
-${SUDO} rm -f "${ROOTFS_DIR}/lib/ld-linux-x86-64.so.2" "${ROOTFS_DIR}/lib/libc.so.6"
-${SUDO} ln -s /opt/avory-glibc/lib/ld-linux-x86-64.so.2 "${ROOTFS_DIR}/lib/ld-linux-x86-64.so.2"
-${SUDO} ln -s /opt/avory-glibc/lib/libc.so.6 "${ROOTFS_DIR}/lib/libc.so.6"
-${SUDO} touch "${ROOTFS_DIR}/etc/avory-glibc-runtime"
-
-# Mocktail asks for ~5 MB guardless pthread stacks, but its Main thread needs
-# ~5 MB + a few KB at startup and dies with SIGSEGV in __libc_ns_samename.
-# The kernel cannot resize an app-sized stack, so ship a tiny LD_PRELOAD shim
-# (glibc-linked) that clamps thread stacks to >= 8 MB + 4 KB guard. Larger
-# stacks and explicit mappings pass through untouched.
-echo "[*] Building pthread stack-clamp shim..."
-GLIBC_CC="${ROOT_DIR}/toolchain/x86_64-linux-glibc/bin/x86_64-buildroot-linux-gnu-gcc"
-GLIBC_SYSROOT_DIR="${ROOT_DIR}/toolchain/glibc-sysroot"
-if [ ! -x "${GLIBC_CC}" ]; then
-    echo "[!] glibc toolchain missing at ${GLIBC_CC}. Run ./scripts/glibc-toolchain.sh first."
-    exit 1
+# On Arch-glibc trees /usr/lib already ships a coherent glibc (loader, libc
+# and siblings from one pacman package). Redirecting the system loader at the
+# older 2.43 copy in /opt/avory-glibc mixes two glibc versions in one process
+# and breaks every dlopen (undefined symbol: __pointer_chk_guard). Only create
+# these links when the tree has no pacman-owned glibc (musl-era layout).
+if [ -f "${ROOTFS_DIR}/usr/lib/libc.so.6" ] && [ ! -L "${ROOTFS_DIR}/usr/lib/libc.so.6" ]; then
+    echo "[*] Arch glibc already provides /usr/lib/libc.so.6; leaving the coherent tree untouched."
+else
+    ${SUDO} rm -f "${ROOTFS_DIR}/lib/ld-linux-x86-64.so.2" "${ROOTFS_DIR}/lib/libc.so.6"
+    ${SUDO} ln -s /opt/avory-glibc/lib/ld-linux-x86-64.so.2 "${ROOTFS_DIR}/lib/ld-linux-x86-64.so.2"
+    ${SUDO} ln -s /opt/avory-glibc/lib/libc.so.6 "${ROOTFS_DIR}/lib/libc.so.6"
 fi
-"${GLIBC_CC}" -shared -fPIC -O2 -Wall -Wextra -fno-stack-protector \
-    --sysroot="${GLIBC_SYSROOT_DIR}" \
-    "${ROOT_DIR}/scripts/mocktail-stack-shim.c" \
-    -o "${MOCKTAIL_BUILD_DIR}/mocktail-stack-shim.so" -ldl
-${SUDO} cp -f "${MOCKTAIL_BUILD_DIR}/mocktail-stack-shim.so" \
-    "${ROOTFS_DIR}/opt/avory-glibc/lib/mocktail-stack-shim.so"
-echo "[+] Installed stack-clamp shim to /opt/avory-glibc/lib"
+${SUDO} touch "${ROOTFS_DIR}/etc/avory-glibc-runtime"
 
 # The upstream 1.0.3 preflight equates the shell's libc with the host ABI.
 # Avory now has a real glibc loader and libraries for glibc applications, even
@@ -555,13 +535,13 @@ export MOCKTAIL_DISABLE_FAILURE_DIALOG=1
 # Avory does not implement mount namespaces; avoid the bundle's bwrap wrapper,
 # which otherwise tries mount(NULL, "/", MS_SLAVE|MS_REC) and aborts.
 export MOCKTAIL_SKIP_NAMESPACE_CHECK=1
+# WebKit also starts its own bwrap D-Bus proxy independently of that check.
+# Its sandbox requires namespaces Avory does not implement; disable it only
+# for this application and its helpers. Explicit 0 restores WebKit's sandbox.
+export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS="${WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS:-1}"
 # Keep the glibc app isolated from Avory's musl-linked /usr/lib libraries.
 # Required host-side compatibility libraries are staged into this private dir.
 export LD_LIBRARY_PATH="/opt/avory-glibc/lib"
-# Widen mocktail's undersized pthread stacks (5 MB guardless overflows in its
-# Main thread). The shim only raises stacks below 8 MB / guards below 4 KB.
-# Disable with MOCKTAIL_STACK_SHIM_OFF=1.
-export LD_PRELOAD="/opt/avory-glibc/lib/mocktail-stack-shim.so${LD_PRELOAD:+:$LD_PRELOAD}"
 
 # Roblox currently spells this directory `localStorage`, while the staged
 # Android data tree from the payload uses `LocalStorage`. Linux paths are
@@ -574,19 +554,13 @@ else
     mkdir -p "${ANDROID_APPDATA}/localStorage"
 fi
 
-# AvoryOS: a killed Mocktail run can leave its external-launch socket behind.
-ENDPOINT_DIR="/tmp/mocktail-$(id -u 2>/dev/null || echo 0)"
-if ! pgrep -f "mocktail" >/dev/null 2>&1; then
-    rm -rf "${ENDPOINT_DIR}" 2>/dev/null || true
-    find "${MOCKTAIL_DATA_ROOT}" -name "*.lock" -delete 2>/dev/null || true
-fi
-
 # Windowing and software OpenGL.
 export DISPLAY="${DISPLAY:-:0}"
 export SDL_VIDEODRIVER=x11
-# Let SDL3 select the real system audio backend (ALSA/PulseAudio/PipeWire).
-# Clear inherited overrides so Mocktail cannot accidentally get the dummy
-# backend from a shell or desktop launcher environment.
+# PipeWire audio-device setup can deadlock Roblox's join on Avory. The dummy
+# backend has been verified to join successfully; it is silent. Preserve an
+# explicit SDL3 selection (or translate the older spelling) for audio tests.
+export SDL_AUDIO_DRIVER="${SDL_AUDIO_DRIVER:-${SDL_AUDIODRIVER:-dummy}}"
 unset SDL_AUDIODRIVER
 export LIBGL_ALWAYS_SOFTWARE=1
 export GALLIUM_DRIVER=llvmpipe
@@ -607,10 +581,23 @@ export SDL_MOUSE_DEFAULT_SYSTEM_CURSOR=0
 # Do not inherit verbose SDL diagnostics from the shell or desktop session.
 unset SDL_LOGGING SDL_EVENT_LOGGING
 
-export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME:-/root}/.config}"
-export XDG_DATA_HOME="${XDG_DATA_HOME:-${HOME:-/root}/.local/share}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME:-/root}/.cache}"
-export XDG_STATE_HOME="${XDG_STATE_HOME:-${HOME:-/root}/.local/state}"
+# Root's guest HOME can be /; avoid generating // paths in that session.
+MOCKTAIL_HOME="${HOME:-/root}"
+MOCKTAIL_HOME="${MOCKTAIL_HOME%/}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${MOCKTAIL_HOME}/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${MOCKTAIL_HOME}/.local/share}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${MOCKTAIL_HOME}/.cache}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-${MOCKTAIL_HOME}/.local/state}"
+export MOCKTAIL_CACHE_ROOT="${MOCKTAIL_CACHE_ROOT:-${XDG_CACHE_HOME%/}/mocktail}"
+
+# Prepare parents with the guest shell before the native runtime's C++
+# filesystem setup. The Android runtime cache is prepared by the session
+# helper after recovery, because it may have just been moved to a backup.
+if ! mkdir -p "$XDG_CONFIG_HOME/mocktail" "$XDG_STATE_HOME/mocktail" \
+    "$XDG_DATA_HOME" "$MOCKTAIL_CACHE_ROOT"; then
+    echo '[mocktail] Cannot prepare configuration/state/cache directories.' >&2
+    exit 1
+fi
 
 # Default to the software OpenGL backend unless the user picked one.
 has_graphics=0
@@ -623,14 +610,15 @@ if [ "$has_graphics" -eq 0 ]; then
     set -- --graphics opengl "$@"
 fi
 
+. "$APPDIR/avory-session.sh"
 if [ -x "$APPDIR/AppRun" ]; then
-    exec "$APPDIR/AppRun" "$@"
+    mocktail_session "$APPDIR/AppRun" "$@"
 elif [ -x "$APPDIR/bin/mocktail" ]; then
-    exec "$APPDIR/bin/mocktail" "$@"
+    mocktail_session "$APPDIR/bin/mocktail" "$@"
 elif [ -x "$APPDIR/lib/ld-linux-x86-64.so.2" ] && [ -x "$APPDIR/shared/bin/mocktail" ]; then
-    exec "$APPDIR/lib/ld-linux-x86-64.so.2" --library-path "$APPDIR/lib:$APPDIR/lib/mocktail" "$APPDIR/shared/bin/mocktail" "$@"
+    mocktail_session "$APPDIR/lib/ld-linux-x86-64.so.2" --library-path "$APPDIR/lib:$APPDIR/lib/mocktail" "$APPDIR/shared/bin/mocktail" "$@"
 else
-    exec "$APPDIR/shared/bin/mocktail" "$@"
+    mocktail_session "$APPDIR/shared/bin/mocktail" "$@"
 fi
 LAUNCHER_EOF
 
@@ -724,9 +712,12 @@ fi
 # rm_rf command is missing from some e2fsprogs builds, so this is best-effort:
 # the small files are unlinked in a separate command file (missing files must
 # not fail the main batch) and a failed tree removal only leaves disk usage.
-"${DEBUGFS_BIN}" -w -R "rm_rf /opt/mocktail/usr" "${PART_IMG}" >/dev/null 2>&1 || true
-"${DEBUGFS_BIN}" -w -R "rm_rf /opt/mocktail-continuous" "${PART_IMG}" >/dev/null 2>&1 || true
-"${DEBUGFS_BIN}" -w -R "rm_rf /opt/mocktail-1.0.4" "${PART_IMG}" >/dev/null 2>&1 || true
+# The selected runtime has already been populated above. Never remove it
+# while retiring an older install (notably when selecting 1.0.4 itself).
+for stale_runtime in /opt/mocktail/usr /opt/mocktail-continuous /opt/mocktail-1.0.4; do
+    [ "${stale_runtime}" = "${RUNTIME_INSTALL_DIR}" ] && continue
+    "${DEBUGFS_BIN}" -w -R "rm_rf ${stale_runtime}" "${PART_IMG}" >/dev/null 2>&1 || true
+done
 LEGACY_CMDS="$(mktemp)"
 {
     echo "cd /"
@@ -740,10 +731,19 @@ LEGACY_CMDS="$(mktemp)"
     echo "rm /usr/bin/mocktail104"
     echo "rm /usr/bin/mocktail-1.0.4"
     echo "rm /usr/lib/libGLX.so.1"
-    echo "rm /lib/ld-linux-x86-64.so.2"
-    echo "symlink /lib/ld-linux-x86-64.so.2 /opt/avory-glibc/lib/ld-linux-x86-64.so.2"
-    echo "rm /lib/libc.so.6"
-    echo "symlink /lib/libc.so.6 /opt/avory-glibc/lib/libc.so.6"
+    # On Arch-glibc trees /lib holds coherent 2.44 copies (see
+    # image-runtime.py --copy-compat) and every guest binary uses them via
+    # /lib64 + /usr/lib. Pointing /lib at the older /opt/avory-glibc copy
+    # reintroduces two-glibc skew image-wide, so only do it for musl-era
+    # trees without a pacman-owned /usr/lib/libc.so.6.
+    if [ -f "${ROOTFS_DIR}/usr/lib/libc.so.6" ] && [ ! -L "${ROOTFS_DIR}/usr/lib/libc.so.6" ]; then
+        echo "# Arch glibc owns /usr/lib: keeping coherent /lib runtime, no /opt/avory-glibc loader links."
+    else
+        echo "rm /lib/ld-linux-x86-64.so.2"
+        echo "symlink /lib/ld-linux-x86-64.so.2 /opt/avory-glibc/lib/ld-linux-x86-64.so.2"
+        echo "rm /lib/libc.so.6"
+        echo "symlink /lib/libc.so.6 /opt/avory-glibc/lib/libc.so.6"
+    fi
 } > "${LEGACY_CMDS}"
 "${DEBUGFS_BIN}" -w -f "${LEGACY_CMDS}" "${PART_IMG}" >/dev/null 2>&1 || true
 rm -f "${LEGACY_CMDS}"

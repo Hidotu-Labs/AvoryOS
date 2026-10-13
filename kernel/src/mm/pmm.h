@@ -21,6 +21,18 @@ void pmm_pcp_drain_local(void);
 void pmm_pcp_drain_all(void);
 size_t pmm_pcp_total_cached(void);
 
+// Pre-zeroed page pool (pmm_pcp.c): idle CPUs zero frames in the background;
+// fault paths pop an already-zeroed frame (refcount 1) with no memset.
+// NULL when empty — callers must fall back to alloc+zero inline. Only for
+// pages that are actually wanted zeroed and carry no NUMA bind policy.
+void *pmm_alloc_zeroed_page(void);
+bool pmm_zero_pool_needs_refill(void);
+void pmm_zero_pool_refill(uint32_t max_pages);
+void pmm_zero_pool_drain_all(void);
+size_t pmm_zero_pool_total_cached(void);
+void pmm_zero_pool_stats(uint64_t *hits, uint64_t *misses, uint64_t *refilled,
+                         size_t *cached);
+
 // New Buddy Allocator API
 void *pmm_alloc_page(void); // Allocate single page
 void *pmm_alloc_pages(
@@ -80,6 +92,8 @@ uint64_t pmm_get_usable_memory(void);
 
 // Return total generic memory in bytes
 uint64_t pmm_get_total_memory(void);
+// Exclusive physical bound of managed RAM, including holes in its address map.
+uint64_t pmm_get_managed_memory_end(void);
 
 // Expose the HHDM base
 uint64_t pmm_get_hhdm_offset(void);

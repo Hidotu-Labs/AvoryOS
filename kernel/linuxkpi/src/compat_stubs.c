@@ -319,8 +319,3 @@ void add_taint(unsigned flag, enum lockdep_ok lockdep_ok) {
 void orderly_poweroff(bool force) { (void)force; }
 
 void emergency_restart(void) {}
-
-/* Task shadows live until their thread exits (no thread-exit hook yet), so
- * the refcount-0 path is a no-op rather than a free. */
-struct task_struct;
-void __put_task_struct(struct task_struct *t) { (void)t; }

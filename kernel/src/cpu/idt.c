@@ -153,6 +153,8 @@ void idt_init(void) {
   for (uint16_t vector = 51; vector < 255; vector++)
     idt_set_gate((uint8_t)vector,
                  (uint64_t)isr_dynamic_stub_table[vector - 51], sel, flags);
+  idt_set_gate(0x80, (uint64_t)isr_dynamic_stub_table[0x80 - 51],
+               sel, user_flags);
 
   // LAPIC spurious interrupt vector
   idt_set_gate(255, (uint64_t)isr255, sel, flags);

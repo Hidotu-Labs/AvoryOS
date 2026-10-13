@@ -3,6 +3,7 @@
 #include "../cpu/isr.h"
 #include "../mm/vmm.h"
 #include "../mm/pmm.h"
+#include "../hal/hal.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -171,14 +172,26 @@ void lapic_init(uint64_t base_phys) {
 }
 
 void lapic_write_icr(uint32_t apic_id, uint32_t icr_low) {
+  /* The xAPIC ICR is one per CPU, not one per caller. Keep a timer/IRQ
+   * sender from replacing ICR_HIGH between our destination and command writes.
+   * Also finish the previous delivery before reusing the ICR: a shootdown
+   * burst must deliver every target's request before waiting for its ack.
+   * x2APIC uses one MSR write and has no delivery-status polling requirement. */
+  hal_irq_state_t flags = hal_irq_save();
   if (lapic_x2apic) {
-    // x2APIC: one 64-bit MSR write; destination ID lives in bits 63:32.
     lapic_wrmsr(x2apic_msr(LAPIC_ICR_LOW),
                 ((uint64_t)apic_id << 32) | (uint64_t)icr_low);
-    return;
+  } else {
+    /* Panic NMIs already use a bounded idle wait in lapic_send_nmi(). Do
+     * not turn that last-resort diagnostic into an unbounded hardware wait. */
+    if ((icr_low & (7u << 8)) != LAPIC_ICR_NMI) {
+      while (lapic_read(LAPIC_ICR_LOW) & LAPIC_ICR_PENDING)
+        hal_cpu_relax();
+    }
+    lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
+    lapic_write(LAPIC_ICR_LOW, icr_low);
   }
-  lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
-  lapic_write(LAPIC_ICR_LOW, icr_low);
+  hal_irq_restore(flags);
 }
 
 uint32_t lapic_read_icr(void) {
@@ -199,11 +212,7 @@ void lapic_send_ipi_all_but_self(uint8_t vector) {
   if (!lapic_base) return;
   uint32_t icr_low =
       LAPIC_ICR_FIXED | LAPIC_ICR_EDGE | LAPIC_ICR_DEST_ALL_BUT_SELF | vector;
-  if (lapic_x2apic) {
-    lapic_wrmsr(x2apic_msr(LAPIC_ICR_LOW), icr_low);
-    return;
-  }
-  lapic_write(LAPIC_ICR_LOW, icr_low);
+  lapic_write_icr(0, icr_low);
 }
 
 /* A panic-stop NMI reaches one online CPU even when it has interrupts

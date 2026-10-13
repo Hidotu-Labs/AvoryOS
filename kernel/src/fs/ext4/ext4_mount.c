@@ -138,27 +138,41 @@ uint32_t ext4_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_
     return bytes_read;
 }
 
-uint32_t ext4_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+static uint32_t ext4_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
     ext2_mount_t *mnt = (ext2_mount_t *)node->device;
     if (!mnt || !buffer)
         return (uint32_t)-14;
     if (size == 0)
         return 0;
+    if (size > UINT32_MAX - offset)
+        return (uint32_t)-27;
 
     ext2_inode_t inode;
-    if (ext2_read_inode(mnt, node->inode, &inode)) return (uint32_t)-5;
-    if (!ext4_inode_has_extents(&inode))
-        return ext2_write_impl(node, offset, size, buffer);
-
     uint8_t *block_buf = kmalloc(mnt->block_size);
     if (!block_buf) return (uint32_t)-12;
     if (ext3_journal_start(mnt) != 0) {
         kfree(block_buf);
         return (uint32_t)-5;
     }
+    /* Every inode snapshot belongs to the transaction that will publish it.
+     * Taking it before journal ownership loses another writer's mappings. */
+    mnt->journal.phase = "write-inode-read";
+    if (ext2_read_inode(mnt, node->inode, &inode)) {
+        ext3_journal_stop(mnt);
+        kfree(block_buf);
+        return (uint32_t)-5;
+    }
+    if (!ext4_inode_has_extents(&inode)) {
+        ext3_journal_stop(mnt);
+        kfree(block_buf);
+        return ext2_write_impl(node, offset, size, buffer);
+    }
 
     uint32_t bytes_written = 0;
     uint32_t blocks_in_batch = 0;
+    int error = 0;
+    bool transaction_active = true;
+    bool inode_valid = true;
     while (bytes_written < size) {
         if (blocks_in_batch >= 32) {
             if (offset + bytes_written > inode.i_size)
@@ -166,11 +180,25 @@ uint32_t ext4_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8
             uint32_t now = ext2_current_time();
             inode.i_mtime = now;
             inode.i_ctime = now;
-            ext2_write_inode(mnt, node->inode, &inode);
-            node->length = inode.i_size;
-            ext3_journal_stop(mnt);
-            if (ext3_journal_start(mnt) != 0)
+            mnt->journal.phase = "write-inode-update";
+            if (ext2_write_inode(mnt, node->inode, &inode)) {
+                error = 5;
                 break;
+            }
+            node->length = inode.i_size;
+            transaction_active = false;
+            if (ext3_journal_stop(mnt) || ext3_journal_start(mnt)) {
+                error = 5;
+                break;
+            }
+            transaction_active = true;
+            inode_valid = false;
+            mnt->journal.phase = "write-inode-read";
+            if (ext2_read_inode(mnt, node->inode, &inode)) {
+                error = 5;
+                break;
+            }
+            inode_valid = true;
             blocks_in_batch = 0;
         }
 
@@ -180,6 +208,7 @@ uint32_t ext4_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8
         uint32_t count = mnt->block_size - in_block;
         if (count > size - bytes_written) count = size - bytes_written;
 
+        mnt->journal.phase = "write-mapping";
         uint32_t disk_block = ext4_get_block_num(mnt, &inode, logical);
         if (!disk_block) {
             uint64_t allocated = 0;
@@ -188,8 +217,11 @@ uint32_t ext4_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8
             if (blocks_needed > 32) blocks_needed = 32;
             if (blocks_needed < 1) blocks_needed = 1;
 
-            if (ext4_alloc_extent(mnt, &inode, node->inode, logical, blocks_needed,
-                                  &allocated) != 0) {
+            int allocation_error = ext4_alloc_extent(mnt, &inode, node->inode,
+                                                      logical, blocks_needed,
+                                                      &allocated);
+            if (allocation_error) {
+                error = allocation_error == -28 ? 28 : 5;
                 klog_puts("[EXT4] extent allocation failed inode=");
                 klog_uint64(node->inode);
                 klog_puts(" logical=");
@@ -202,27 +234,41 @@ uint32_t ext4_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8
             disk_block = (uint32_t)allocated;
             memset(block_buf, 0, mnt->block_size);
         } else if (in_block || count < mnt->block_size) {
-            if (ext2_read_block(mnt, disk_block, block_buf) != 0)
-                break;
-        }
-
-        if (is_user_ptr((uint64_t)buffer)) {
-            unsigned long uncopied = copy_from_user(block_buf + in_block, buffer + bytes_written, count);
-            if (uncopied > 0) {
-                bytes_written += (count - (uint32_t)uncopied);
-                ext2_write_block(mnt, disk_block, block_buf);
-                if (bytes_written == 0) {
-                    ext2_write_inode(mnt, node->inode, &inode);
-                    ext3_journal_stop(mnt);
-                    kfree(block_buf);
-                    return (uint32_t)-14;
-                }
+            mnt->journal.phase = "write-data-read";
+            if (ext2_read_block(mnt, disk_block, block_buf) != 0) {
+                error = 5;
                 break;
             }
-        } else {
-            memcpy(block_buf + in_block, buffer + bytes_written, count);
         }
+
+        /* The staged source is kernel memory. Batch only complete blocks
+         * within one verified extent and the current transaction budget. */
+        if (!in_block && count == mnt->block_size) {
+            uint32_t run = 0;
+            uint32_t mapped = ext4_get_extent_run(mnt, &inode, logical, &run);
+            uint32_t wanted = (size - bytes_written) / mnt->block_size;
+            uint32_t budget = 32 - blocks_in_batch;
+            if (run > wanted) run = wanted;
+            if (run > budget) run = budget;
+            if (mapped != disk_block || !run) {
+                error = 5;
+                break;
+            }
+            mnt->journal.phase = "write-data-run";
+            if (ext2_write_blocks(mnt, disk_block, run,
+                                   buffer + bytes_written) != 0) {
+                error = 5;
+                break;
+            }
+            bytes_written += run * mnt->block_size;
+            blocks_in_batch += run;
+            continue;
+        }
+
+        memcpy(block_buf + in_block, buffer + bytes_written, count);
+        mnt->journal.phase = "write-data";
         if (ext2_write_block(mnt, disk_block, block_buf) != 0) {
+            error = 5;
             klog_puts("[EXT4] data write failed inode=");
             klog_uint64(node->inode);
             klog_puts(" logical=");
@@ -236,23 +282,26 @@ uint32_t ext4_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8
         blocks_in_batch++;
     }
 
-    if (bytes_written == 0) {
-        ext2_write_inode(mnt, node->inode, &inode);
-        ext3_journal_stop(mnt);
-        kfree(block_buf);
-        return (uint32_t)-28; /* ENOSPC: never return 0 for len!=0 */
-    }
-
-    if (offset + bytes_written > inode.i_size)
+    if (bytes_written && offset + bytes_written > inode.i_size)
         inode.i_size = offset + bytes_written;
     uint32_t now = ext2_current_time();
     inode.i_mtime = now;
     inode.i_ctime = now;
-    ext2_write_inode(mnt, node->inode, &inode);
-    ext3_journal_stop(mnt);
-    node->length = inode.i_size;
+    if (transaction_active) {
+        mnt->journal.phase = "write-inode-update";
+        if (inode_valid && ext2_write_inode(mnt, node->inode, &inode)) error = 5;
+        if (ext3_journal_stop(mnt)) error = 5;
+        if (error != 5) node->length = inode.i_size;
+    }
     kfree(block_buf);
+    if (error == 5 || !bytes_written)
+        return (uint32_t)-(error ? error : 5);
     return bytes_written;
+}
+
+uint32_t ext4_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
+                         uint8_t *buffer) {
+    return ext2_write_staged(node, offset, size, buffer, ext4_write_kernel);
 }
 
 int ext4_create_impl(vfs_node_t *node, char *name, uint16_t permission) {

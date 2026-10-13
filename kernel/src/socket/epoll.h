@@ -71,12 +71,9 @@ typedef struct epitem {
   
   // Edge-triggered state tracking
   uint32_t last_events;        // Last known event state (for ET mode)
-  /* One-shot cached edge: the event mask that was actually true when
-   * epoll_notify_event()/epoll_notify_socket() queued this item on the ready
-   * list (or when the in-wait rescan found it).  ep_check_events() consumes
-   * it with an atomic exchange instead of re-polling the fd, then falls back
-   * to a real vfs_poll() on every subsequent check - a stale mask is trusted
-   * at most once, which keeps level-triggered requeue verification honest. */
+  /* Notification mask recorded when producers queue this item.  Consumed
+   * by ep_check_events(), which always polls current readiness before
+   * delivery: a notification can outlive the data that caused it. */
   uint32_t ready_events;
   bool on_ready_list;          // Currently on ready list
   bool oneshot;                // One-shot mode active
@@ -134,7 +131,7 @@ int epoll_ctl_del(eventpoll_t *ep, int fd);
 int epoll_ctl_mod(eventpoll_t *ep, int fd, struct epoll_event *event);
 
 int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, 
-                    int maxevents, int timeout_ms);
+                    int maxevents, int64_t timeout_ms);
 
 // Epoll FD Management
 int epoll_alloc_fd(eventpoll_t *ep);

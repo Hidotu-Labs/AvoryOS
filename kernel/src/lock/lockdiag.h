@@ -96,6 +96,7 @@ typedef enum {
   LOCKDIAG_SPOT_GPU_PRESENT,  /* drivers/gpu/virtio_gpu: gpu_present_lock */
   LOCKDIAG_SPOT_GPU_CURSOR,   /* drivers/gpu/virtio_gpu: gpu_cursor_lock */
   LOCKDIAG_SPOT_GPU_SHAPE,    /* drivers/gpu/virtio_gpu: gpu_cursor_shape_lock */
+  LOCKDIAG_SPOT_SHOOTDOWN,   /* mm/tlb_shootdown.c: shootdown_lock */
   LOCKDIAG_SPOT_COUNT
 } lockdiag_spot_t_id;
 

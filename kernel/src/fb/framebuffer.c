@@ -238,8 +238,11 @@ static int console_dev_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) 
     }
     case VT_OPENQRY:
     case VT_GETMODE:
-    case VT_SETMODE:
     case VT_GETSTATE:
+        /* Let sys_ioctl fill the query output. Returning success here
+         * without writing VT_OPENQRY leaves Xorg with no usable VT. */
+        return -25;
+    case VT_SETMODE:
     case VT_ACTIVATE:
     case VT_WAITACTIVE:
     case VT_RELDISP:
@@ -303,10 +306,11 @@ vfs_node_t *fb_lookup_device(const char *name) {
         return &console_vfs_node;
     }
     if (strcmp(name, "tty0") == 0 || strcmp(name, "/dev/tty0") == 0 ||
-        strcmp(name, "dev/tty0") == 0 || strcmp(name, "tty") == 0 ||
-        strcmp(name, "/dev/tty") == 0 || strcmp(name, "dev/tty") == 0) {
-        return &console_vfs_node;
-    }
+        strcmp(name, "dev/tty0") == 0)
+        return &tty0_vfs_node;
+    if (strcmp(name, "tty") == 0 || strcmp(name, "/dev/tty") == 0 ||
+        strcmp(name, "dev/tty") == 0)
+        return &tty_vfs_node;
 
     if (strcmp(name, "fb0") == 0 || strcmp(name, "fb") == 0 ||
         strcmp(name, "framebuffer") == 0 || strcmp(name, "/dev/fb0") == 0 ||
@@ -555,6 +559,7 @@ void fb_register_vfs(void) {
     vfs_node_init(&fb_vfs_node);
     strncpy(fb_vfs_node.name, "fb0", 127);
     fb_vfs_node.flags = FS_CHARDEV | FS_PERSISTENT;
+    fb_vfs_node.inode = 29U << 8;
     fb_vfs_node.mask = 0666;
     fb_vfs_node.length = (uint32_t)fb_global.screen_size;
     fb_vfs_node.read = fb_dev_read;
@@ -568,6 +573,7 @@ void fb_register_vfs(void) {
     vfs_node_init(&fb_alias_node);
     strncpy(fb_alias_node.name, "fb", 127);
     fb_alias_node.flags = FS_CHARDEV | FS_PERSISTENT;
+    fb_alias_node.inode = 29U << 8;
     fb_alias_node.mask = 0666;
     fb_alias_node.length = (uint32_t)fb_global.screen_size;
     fb_alias_node.read = fb_dev_read;
@@ -586,6 +592,9 @@ void fb_register_vfs(void) {
     vfs_node_init(&console_vfs_node);
     strncpy(console_vfs_node.name, "console", 127);
     console_vfs_node.flags = FS_CHARDEV | FS_PERSISTENT;
+    /* fill_kstat uses a character node's inode as its Linux dev_t.
+     * Wine disables all diagnostics if stderr has /dev/null's rdev. */
+    console_vfs_node.inode = (5U << 8) | 1U;
     console_vfs_node.mask = 0666;
     console_vfs_node.read = console_dev_read;
     console_vfs_node.write = console_dev_write;
@@ -601,6 +610,7 @@ void fb_register_vfs(void) {
     vfs_node_init(&tty0_vfs_node);
     strncpy(tty0_vfs_node.name, "tty0", 127);
     tty0_vfs_node.flags = FS_CHARDEV | FS_PERSISTENT;
+    tty0_vfs_node.inode = 4U << 8;
     tty0_vfs_node.mask = 0666;
     tty0_vfs_node.read = console_dev_read;
     tty0_vfs_node.write = console_dev_write;
@@ -613,6 +623,7 @@ void fb_register_vfs(void) {
     vfs_node_init(&tty_vfs_node);
     strncpy(tty_vfs_node.name, "tty", 127);
     tty_vfs_node.flags = FS_CHARDEV | FS_PERSISTENT;
+    tty_vfs_node.inode = 5U << 8;
     tty_vfs_node.mask = 0666;
     tty_vfs_node.read = console_dev_read;
     tty_vfs_node.write = console_dev_write;

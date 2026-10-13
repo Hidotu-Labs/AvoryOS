@@ -59,6 +59,7 @@ struct page {
   atomic_t _refcount;    /* Allocation reference count (authoritative for    */
                          /* pages handed out through the Linux API)          */
   atomic_t _mapcount;    /* Number of PTEs referencing the page              */
+  unsigned int cache_flags; /* Native HHDM PTE cache bits; shared by aliases. */
   /* Second cache line word doubles as the compound bookkeeping exactly like
    * upstream: a page is either on an LRU list or a compound head/tail. */
   union {

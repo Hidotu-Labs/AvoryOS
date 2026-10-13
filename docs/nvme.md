@@ -259,3 +259,9 @@ warnings that are unrelated to this driver.
 | `scripts/nvme/create-nvme-test.sh` | builds the minimal test root image |
 | `scripts/nvme/nvme-stress.sh` | single-config QEMU boot + host verification |
 | `scripts/nvme/nvme-phase7.sh` | Phase 7 acceptance suites and matrix |
+
+## Standalone runner cleanup (2026-10-11)
+
+The unused `run-nvme-test` Make target was removed. The NVMe driver, normal
+NVMe boot targets, and the stress/Phase 7 suites remain available. Their
+shared test-image builders and regression sources are retained.

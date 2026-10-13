@@ -3,9 +3,11 @@
 #include "../lib/string.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
+#include "../sched/sched.h"
 #include "arch/uaccess.h"
 
 static uint32_t next_inode = 1;
+static uint32_t ramfs_bad_free_reports;
 
 #define RAMFS_MAGIC 0x858458f6
 
@@ -38,7 +40,26 @@ void ramfs_free_file_data(ramfs_file_t *file) {
 
   if (file->data_is_pmm) {
     uint64_t hhdm = pmm_get_hhdm_offset();
-    size_t pages = (file->capacity + 4095) / 4096;
+    size_t pages = ((uint64_t)file->capacity + 4095) / 4096;
+    uint64_t phys = (uint64_t)file->data - hhdm;
+    for (size_t i = 0; i < pages; i++) {
+      if (pmm_get_ref((void *)(phys + i * 4096)) != 0)
+        continue;
+      if (__atomic_add_fetch(&ramfs_bad_free_reports, 1,
+                             __ATOMIC_RELAXED) <= 8) {
+        struct thread *t = sched_get_current();
+        klog_puts("[RAMFS] backing ownership lost before free phys=");
+        klog_hex64(phys);
+        klog_puts(" capacity="); klog_uint64(file->capacity);
+        klog_puts(" zero_ref_page="); klog_uint64(i);
+        klog_puts(" caller=");
+        klog_hex64((uint64_t)__builtin_return_address(0));
+        klog_puts(" tid="); klog_uint64(t ? t->tid : 0);
+        klog_puts(" comm="); klog_puts(t ? t->comm : "?");
+        klog_puts("\n");
+      }
+      break;
+    }
     klog_ramfs_free(file->data, file->capacity, true, pages);
     pmm_free_pages((void *)((uint64_t)file->data - hhdm), pages);
   } else {
@@ -273,27 +294,27 @@ static struct dirent *ramfs_readdir(vfs_node_t *node, uint32_t index) {
     return 0;
   ramfs_dir_t *dir = (ramfs_dir_t *)node->device;
 
-  static struct dirent d;
-  memset(&d, 0, sizeof(struct dirent));
+  struct dirent *d = vfs_readdir_buffer();
+  memset(d, 0, sizeof(struct dirent));
 
   if (index == 0) {
-    strcpy(d.name, ".");
-    d.ino = node->inode;
-    d.d_type = DT_DIR;
-    return &d;
+    strcpy(d->name, ".");
+    d->ino = node->inode;
+    d->d_type = DT_DIR;
+    return d;
   }
   if (index == 1) {
-    strcpy(d.name, "..");
-    d.ino = node->inode;
-    d.d_type = DT_DIR;
-    return &d;
+    strcpy(d->name, "..");
+    d->ino = node->inode;
+    d->d_type = DT_DIR;
+    return d;
   }
 
   index -= 2;
   /* Resume from the cursor for sequential getdents; otherwise rescan.  The
    * walk runs under the index lock - entries behind the cursor can be
    * unlinked (and their wrappers freed) at any time - and the dirent is
-   * filled while still locked. */
+   * filled while still locked-> */
   vfs_dirindex_lock(dir);
   child_node_t *cursor = dir->cursor;
   uint32_t cursor_index = dir->cursor_index;
@@ -309,14 +330,14 @@ static struct dirent *ramfs_readdir(vfs_node_t *node, uint32_t index) {
   dir->cursor_index = index;
 
   if (curr) {
-    strcpy(d.name, curr->node->name);
-    d.ino = curr->node->inode;
-    d.d_type = vfs_dtype(curr->node->flags);
+    strcpy(d->name, curr->node->name);
+    d->ino = curr->node->inode;
+    d->d_type = vfs_dtype(curr->node->flags);
   }
   vfs_dirindex_unlock(dir);
 
   if (curr)
-    return &d;
+    return d;
 
   return 0; // End of directory
 }
@@ -361,7 +382,7 @@ static vfs_node_t *ramfs_make_node(char *name, uint16_t perm, uint32_t type) {
   n->uid = 0;
   n->gid = 0;
   n->flags = type | FS_PERSISTENT;
-  n->inode = next_inode++;
+  n->inode = __atomic_fetch_add(&next_inode, 1, __ATOMIC_RELAXED);
   n->length = 0;
   n->impl = 0;
   n->ptr = 0;
@@ -571,11 +592,11 @@ static int ramfs_unlink(vfs_node_t *node, char *name) {
   vfs_dirindex_detach_locked(dir, curr);
   vfs_dirindex_unlock(dir);
 
-  /* Descriptors and mappings may still reference the node: retire it and
-   * let the last close release the file data and the node itself.  Both run
-   * outside the index lock - retire can tear down payloads and take other
-   * locks, which must not happen under an IRQ-masked section. */
-  vfs_node_retire(curr->node);
+  /* Descriptors and mappings may still reference the node: mark deleted and
+   * drop the directory's ownership reference; the last close releases the
+   * file data and the node itself. Both run outside the index lock. */
+  curr->node->flags |= FS_DELETED;
+  vfs_close(curr->node);
   kfree(curr);
   return 0;
 }
@@ -605,7 +626,8 @@ static int ramfs_rmdir(vfs_node_t *node, char *name) {
   if (!empty)
     return -1;
 
-  vfs_node_retire(curr->node);
+  curr->node->flags |= FS_DELETED;
+  vfs_close(curr->node);
   kfree(curr);
   return 0;
 }
@@ -673,6 +695,14 @@ void ramfs_mount_node(vfs_node_t *root, vfs_node_t *node) {
   if (vfs_dirindex_finddir(root, node->name) != NULL)
     return;
 
+  /* Hand-built pseudo-filesystem nodes need real inode identities too.
+   * libudev's path walk compares inode/mount pairs to detect directory
+   * boundaries; zero for every sysfs directory collapses that walk. */
+  uint32_t type = node->flags & FS_TYPE_MASK;
+  if (!node->inode && (type == FS_DIRECTORY || type == FS_FILE ||
+                      type == FS_SYMLINK))
+    node->inode = __atomic_fetch_add(&next_inode, 1, __ATOMIC_RELAXED);
+
   /* statfs is filesystem-level, but the VFS dispatches it per-node. Children
    * attached here are usually hand-built (procfs/sysfs leaves, /dev nodes)
    * with no handler of their own, so statfs() on e.g. /proc/meminfo fell
@@ -690,6 +720,8 @@ void ramfs_mount_node(vfs_node_t *root, vfs_node_t *node) {
 void ramfs_mount_on(vfs_node_t *node) {
   if (!node)
     return;
+  if (!node->inode)
+    node->inode = __atomic_fetch_add(&next_inode, 1, __ATOMIC_RELAXED);
 
   // Initialize a ramfs directory structure
   ramfs_dir_t *dir = kmalloc(sizeof(ramfs_dir_t));

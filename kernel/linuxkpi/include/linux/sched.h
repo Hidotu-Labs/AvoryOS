@@ -63,7 +63,7 @@ struct task_struct {
   struct thread_struct thread;
   /* mm/oom/reclaim surface amdgpu touches (amdgpu_gem.c reads current->mm).
    * There is no Linux mm, so mm/active_mm stay NULL and reclaim_state is a
-   * placeholder; usage is initialized so refcount helpers do not underflow. */
+   * placeholder; usage accounts for native, creator and imported ownership. */
   struct mm_struct *mm;
   struct mm_struct *active_mm;
   struct reclaim_state *reclaim_state;
@@ -75,6 +75,10 @@ struct task_struct {
    * its kpi_thread back-pointer was dropped (see linuxkpi_thread_exiting). */
   void *kpi_control;
 };
+
+/* Explicit shadow ownership used by native exit and detached workers. */
+struct task_struct *linuxkpi_task_get(struct task_struct *task);
+void linuxkpi_task_put(struct task_struct *task);
 
 /* Process flags stock headers reference; only the one amdgpu uses is defined
  * (upstream sched.h has the full PF_* set). */
@@ -158,11 +162,11 @@ static inline void get_task_comm(char *buf, struct task_struct *p) {
 
 #define MAX_SCHEDULE_TIMEOUT LONG_MAX
 
-/* State changes are implicit in the sleep helpers (the task model is not
- * exported yet); keep the API shape so upstream code compiles. */
+/* Publish the wait before upstream checks its condition/registers a fence
+ * callback. A wake in that interval must survive until schedule_timeout. */
 #define set_current_state(state_value)                                        \
   do {                                                                        \
-    (void)(state_value);                                                      \
+    linuxkpi_set_current_state(state_value);                                  \
   } while (0)
 #define __set_current_state(state_value) set_current_state(state_value)
 

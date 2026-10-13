@@ -5,10 +5,9 @@
  * line, but the preempt_disable() already required for correctness means the
  * lock/unlock pair is a full barrier and the semantics stay simple.
  *
- * A grace period used to poll that count every millisecond; it is now
- * event-driven - the reader that brings the count to zero wakes the waiter -
- * which removes the up-to-1 ms completion latency (and the starvation window
- * when readers keep re-entering: the poller could keep missing the gap).
+ * The counter and zero-transition generation share one atomic word. A grace
+ * period remembers that generation and waits for it to change: new readers
+ * cannot hide a completed drain or extend an already completed grace period.
  *
  * Callbacks are drained by a dedicated kthread after a grace period.
  *
@@ -30,28 +29,36 @@
 #include <linuxkpi/native_sched.h>
 #include <linuxkpi/service.h>
 
-static volatile int rcu_readers;
-static volatile int rcu_busy;
+/* Low 32 bits: reader nesting count; high 32: completed all-reader drains.
+ * Updating both together avoids reporting an old zero transition after a
+ * new reader has entered. x86-64 implements the RMWs without helper locks. */
+static uint64_t rcu_state;
 static struct rcu_head *rcu_callbacks;
+static struct rcu_head *rcu_callbacks_tail;
+static uint64_t rcu_enqueued, rcu_completed;
 static DEFINE_SPINLOCK(rcu_lock);
 static struct wait_queue_head rcu_wait;
 static struct wait_queue_head rcu_barrier_wait;
 static struct kpi_service rcu_svc;
 
-/* Set while a grace period is waiting for the reader count to reach zero.
- * The last reader to leave wakes it instead of a poller noticing at the next
- * millisecond tick; the flag keeps the read-side fast path free of waitqueue
- * traffic when nobody is waiting. */
-static volatile int rcu_gp_waiting;
+/* A count, not a flag: one concurrent synchronize_rcu() must not disable the
+ * wakeup needed by a different waiter. */
+static unsigned int rcu_gp_waiters;
 
 void __kpi_rcu_read_lock(void) {
   preempt_disable();
-  __atomic_add_fetch(&rcu_readers, 1, __ATOMIC_ACQ_REL);
+  __atomic_add_fetch(&rcu_state, 1, __ATOMIC_SEQ_CST);
 }
 
 void __kpi_rcu_read_unlock(void) {
-  if (__atomic_sub_fetch(&rcu_readers, 1, __ATOMIC_ACQ_REL) == 0 &&
-      __atomic_load_n(&rcu_gp_waiting, __ATOMIC_ACQUIRE))
+  uint64_t before=__atomic_load_n(&rcu_state,__ATOMIC_RELAXED), after;
+  do {
+    after=before-1;
+    if ((uint32_t)before==1) after+=1ULL<<32;
+  } while (!__atomic_compare_exchange_n(&rcu_state,&before,after,true,
+                                        __ATOMIC_SEQ_CST,__ATOMIC_RELAXED));
+  if ((uint32_t)before==1 &&
+      __atomic_load_n(&rcu_gp_waiters, __ATOMIC_SEQ_CST))
     __kpi_wake_up(&rcu_wait, 0, 0);
   preempt_enable();
 }
@@ -63,22 +70,24 @@ int rcu_read_lock_bh_held(void) { return 1; }
 int rcu_read_lock_sched_held(void) { return 1; }
 int rcu_read_lock_any_held(void) { return 1; }
 
-/* Wait for the read side to drain.  The wait is event-driven: the reader that
- * brings the count to zero wakes us, so a grace period cannot be delayed by
- * up to a poll interval.  The exchange publishes "someone is waiting" as a
- * full barrier, which pairs with the reader's counter RMW: if the reader's
- * zero transition happens after that exchange it sees the waitqueue and
- * wakes us, and if it happens before, the condition check below already
- * observes zero and does not sleep.  Polling is gone either way. */
+static bool rcu_grace_done(uint64_t snapshot) {
+  uint64_t now=__atomic_load_n(&rcu_state,__ATOMIC_SEQ_CST);
+  return !(uint32_t)now || (now>>32)!=(snapshot>>32);
+}
+
+/* The waiter publication and reader drain are fully ordered. If the drain
+ * misses the waiter count, the condition still sees its changed generation.
+ * A later reader need not end for this grace period to finish. */
 static void rcu_wait_grace_period(void) {
-  if (__atomic_load_n(&rcu_readers, __ATOMIC_ACQUIRE) == 0) {
+  uint64_t snapshot=__atomic_load_n(&rcu_state,__ATOMIC_SEQ_CST);
+  if (!(uint32_t)snapshot) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     return;
   }
 
-  __atomic_exchange_n(&rcu_gp_waiting, 1, __ATOMIC_ACQ_REL);
-  wait_event(rcu_wait, __atomic_load_n(&rcu_readers, __ATOMIC_ACQUIRE) == 0);
-  __atomic_store_n(&rcu_gp_waiting, 0, __ATOMIC_RELEASE);
+  __atomic_add_fetch(&rcu_gp_waiters,1,__ATOMIC_SEQ_CST);
+  wait_event(rcu_wait, rcu_grace_done(snapshot));
+  __atomic_sub_fetch(&rcu_gp_waiters,1,__ATOMIC_SEQ_CST);
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
@@ -92,25 +101,25 @@ void call_rcu(struct rcu_head *head, rcu_callback_t func) {
   head->func = func;
 
   spin_lock_irqsave(&rcu_lock, flags);
-  head->next = rcu_callbacks;
-  rcu_callbacks = head;
+  head->next = NULL;
+  if (rcu_callbacks_tail) rcu_callbacks_tail->next=head;
+  else WRITE_ONCE(rcu_callbacks,head);
+  rcu_callbacks_tail=head;
+  rcu_enqueued++;
   spin_unlock_irqrestore(&rcu_lock, flags);
 
   kpi_service_kick(&rcu_svc, true);
 }
 
 void rcu_barrier(void) {
-  while (__atomic_load_n(&rcu_busy, __ATOMIC_ACQUIRE) ||
-         __atomic_load_n(&rcu_readers, __ATOMIC_ACQUIRE) != 0 ||
-         rcu_callbacks != NULL) {
-    /* Let any in-flight callback batch finish. */
-    synchronize_rcu();
-    if (__atomic_load_n(&rcu_busy, __ATOMIC_ACQUIRE))
-      wait_event(rcu_barrier_wait,
-                 !__atomic_load_n(&rcu_busy, __ATOMIC_ACQUIRE));
-    if (rcu_callbacks == NULL)
-      break;
-  }
+  unsigned long flags;
+  spin_lock_irqsave(&rcu_lock,flags);
+  uint64_t target=rcu_enqueued;
+  spin_unlock_irqrestore(&rcu_lock,flags);
+  /* Includes a batch already detached and waiting on its grace period. New
+   * callbacks queued after this snapshot need not delay the barrier. */
+  wait_event(rcu_barrier_wait,
+             __atomic_load_n(&rcu_completed,__ATOMIC_ACQUIRE)>=target);
 }
 
 static int rcu_kthread(void *arg) {
@@ -120,7 +129,7 @@ static int rcu_kthread(void *arg) {
     unsigned int gen = kpi_service_gen(&rcu_svc);
 
     (void)wait_event_timeout(rcu_wait,
-                             kthread_should_stop() || rcu_callbacks != NULL,
+                             kthread_should_stop() || READ_ONCE(rcu_callbacks) != NULL,
                              msecs_to_jiffies(KPI_SERVICE_IDLE_MS));
 
     if (kthread_should_stop()) {
@@ -128,24 +137,26 @@ static int rcu_kthread(void *arg) {
       return 0;
     }
 
-    if (!rcu_callbacks) {
+    if (!READ_ONCE(rcu_callbacks)) {
       if (kpi_service_retire(&rcu_svc, gen))
         return 0;
       continue;
     }
 
-    rcu_wait_grace_period();
-
     unsigned long flags;
     spin_lock_irqsave(&rcu_lock, flags);
     struct rcu_head *head = rcu_callbacks;
-    rcu_callbacks = NULL;
-    if (head)
-      __atomic_store_n(&rcu_busy, 1, __ATOMIC_RELEASE);
+    uint64_t batch_end=rcu_enqueued;
+    WRITE_ONCE(rcu_callbacks,NULL);
+    rcu_callbacks_tail=NULL;
     spin_unlock_irqrestore(&rcu_lock, flags);
 
     if (!head)
       continue;
+
+    /* Isolate the batch BEFORE starting its grace period. Collecting it
+     * afterward also collects callbacks whose readers were never waited for. */
+    rcu_wait_grace_period();
 
     while (head) {
       struct rcu_head *next = head->next;
@@ -153,7 +164,7 @@ static int rcu_kthread(void *arg) {
       head = next;
     }
 
-    __atomic_store_n(&rcu_busy, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&rcu_completed,batch_end,__ATOMIC_RELEASE);
     __kpi_wake_up(&rcu_barrier_wait, 0, 0);
   }
 }
@@ -162,6 +173,7 @@ void linuxkpi_rcu_init(void) {
   init_waitqueue_head(&rcu_wait);
   init_waitqueue_head(&rcu_barrier_wait);
   kpi_service_init(&rcu_svc, "rcu_kpi", rcu_kthread, NULL);
+  klogf("[KPI-RCU] isolated callback batches, drain generations and release publication active\n");
 }
 
 /* kfree_rcu support: remember the object behind an embedded rcu_head. */

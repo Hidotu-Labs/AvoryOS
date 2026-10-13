@@ -320,9 +320,13 @@ int unix_create(socket_t *sock, int protocol) {
 
   struct thread *owner = sched_get_current();
   if (owner) {
+    _Static_assert(MAX_SUPPLEMENTARY_GROUPS <= 32, "Unix credential group storage");
     usk->owner_pid = owner->tgid;
     usk->owner_uid = owner->euid;
     usk->owner_gid = owner->egid;
+    usk->owner_group_count = owner->supplementary_group_count;
+    memcpy(usk->owner_groups, owner->supplementary_groups,
+           usk->owner_group_count * sizeof(uint32_t));
   }
 
   usk->parent           = sock;
@@ -434,9 +438,9 @@ void unix_destroy(socket_t *sock) {
   while (scm_msg) {
     unix_scm_msg_t *next = scm_msg->next;
     for (int i = 0; i < scm_msg->count; i++) {
-      if (scm_msg->nodes[i]) {
-        vfs_close(scm_msg->nodes[i]);
-        scm_msg->nodes[i] = NULL;
+      if (scm_msg->fds[i].node) {
+        vfs_close(scm_msg->fds[i].node);
+        scm_msg->fds[i].node = NULL;
       }
     }
     kfree(scm_msg);
@@ -450,9 +454,9 @@ void unix_destroy(socket_t *sock) {
     unix_packet_t *next = pkt->next;
     if (pkt->scm) {
       for (int i = 0; i < pkt->scm->count; i++) {
-        if (pkt->scm->nodes[i]) {
-          vfs_close(pkt->scm->nodes[i]);
-          pkt->scm->nodes[i] = NULL;
+        if (pkt->scm->fds[i].node) {
+          vfs_close(pkt->scm->fds[i].node);
+          pkt->scm->fds[i].node = NULL;
         }
       }
       kfree(pkt->scm);

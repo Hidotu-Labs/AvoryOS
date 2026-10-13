@@ -2,6 +2,7 @@ global syscall_entry
 extern syscall_dispatcher
 extern console_puts
 extern cpu_has_smap_flag
+extern fork_return_to_userspace
 
 section .text
 
@@ -20,6 +21,10 @@ syscall_entry:
 
     mov rsp, gs:[24]
 
+    push rdi           ; Original user RDI (compat return shadow)
+    push rsi           ; Original user RSI
+    push rcx           ; Original user RCX
+    push qword 0x2b    ; Return code segment, changed by execve for ELF32
     push qword gs:[368] ; User RSP
     push r11           ; User RFLAGS
     push rcx           ; User RIP
@@ -82,6 +87,9 @@ syscall_entry:
     test rax, rax
     jnz .sigreturn_iret
 
+    cmp qword [rbp + 128], 0x1b
+    je .compat_iret
+
     mov rsp, rbp
 
     pop rdi
@@ -108,6 +116,10 @@ syscall_entry:
 
     ; Return to user mode safely
     o64 sysret
+
+.compat_iret:
+    mov rdi, rbp
+    jmp fork_return_to_userspace
 
 .sigreturn_iret:
     cli
@@ -139,4 +151,3 @@ syscall_entry:
 
     swapgs
     iretq
-

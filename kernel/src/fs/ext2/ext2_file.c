@@ -127,7 +127,62 @@ int ext2_truncate_impl(vfs_node_t *node, uint32_t new_len) {
  * policy; this does not turn the journal into a data journal. */
 #define EXT2_WRITE_BATCH_BLOCKS 32
 
-uint32_t ext2_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
+uint32_t ext2_write_staged(vfs_node_t *node, uint32_t offset, uint32_t size,
+                         uint8_t *buffer,
+                         uint32_t (*write_kernel)(vfs_node_t *, uint32_t,
+                                                  uint32_t, uint8_t *)) {
+  ext2_mount_t *mnt = node ? (ext2_mount_t *)node->device : NULL;
+  if (!mnt || !buffer)
+    return (uint32_t)-14;
+  if (!size)
+    return 0;
+  if (size > UINT32_MAX - offset)
+    return (uint32_t)-27;
+  if (!is_user_ptr((uint64_t)buffer))
+    return write_kernel(node, offset, size, buffer);
+
+  /* Faults can need reclaim or file I/O. Never hold the mount-wide journal
+   * while copying user memory: other writers must be able to progress.
+   * Reuse bounded scratch space rather than copying/pinning the whole write. */
+  uint32_t capacity = mnt->block_size * EXT2_WRITE_BATCH_BLOCKS;
+  if (!mnt->block_size || capacity / EXT2_WRITE_BATCH_BLOCKS != mnt->block_size)
+    return (uint32_t)-5;
+  if (capacity > size)
+    capacity = size;
+  uint8_t *staged = kmalloc(capacity);
+  if (!staged)
+    return (uint32_t)-12;
+  uint32_t total = 0;
+  uint32_t result = 0;
+  while (total < size) {
+    uint32_t count = mnt->block_size * EXT2_WRITE_BATCH_BLOCKS -
+                     (offset + total) % mnt->block_size;
+    if (count > size - total)
+      count = size - total;
+    unsigned long uncopied = copy_from_user(staged, buffer + total, count);
+    if (uncopied > count)
+      uncopied = count;
+    uint32_t copied = count - (uint32_t)uncopied;
+    if (!copied) {
+      result = total ? total : (uint32_t)-14;
+      break;
+    }
+    uint32_t written = write_kernel(node, offset + total, copied, staged);
+    if (written >= (uint32_t)-4095) {
+      /* A commit/I/O failure must not masquerade as a successful prefix. */
+      result = written == (uint32_t)-5 || !total ? written : total;
+      break;
+    }
+    total += written;
+    result = total;
+    if (written < copied || uncopied)
+      break;
+  }
+  kfree(staged);
+  return result;
+}
+
+static uint32_t ext2_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t size,
                          uint8_t *buffer) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt || !buffer)
@@ -142,7 +197,6 @@ uint32_t ext2_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
     return (uint32_t)-12;
   uint32_t bytes_written = 0;
   int error = 0;
-  bool is_user = is_user_ptr((uint64_t)buffer);
 
   while (bytes_written < size && !error) {
     /* Acquire before reading the inode, not merely before publishing it:
@@ -154,6 +208,7 @@ uint32_t ext2_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
     ext2_inode_t inode;
     uint32_t batch_start = bytes_written;
     bool mapping_changed = false;
+    mnt->journal.phase = "write-inode-read";
     if (ext2_read_inode(mnt, node->inode, &inode)) {
       error = 5;
     } else {
@@ -167,8 +222,8 @@ uint32_t ext2_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
         if (to_write > size - bytes_written)
           to_write = size - bytes_written;
 
+        mnt->journal.phase = "write-mapping";
         uint32_t disk_block;
-        bool allocated = false;
         if (ext2_get_block_num_checked(mnt, &inode, logical_block, &disk_block)) {
           error = 5;
           break;
@@ -188,41 +243,21 @@ uint32_t ext2_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
           }
           inode.i_blocks += mnt->block_size / 512;
           memset(block_buf, 0, mnt->block_size);
-          allocated = true;
-        } else if (is_user || offset_in_block || to_write < mnt->block_size) {
-          /* A partial user fault on a full-block overwrite must retain the
-           * existing suffix rather than writing uninitialized scratch bytes. */
+        } else if (offset_in_block || to_write < mnt->block_size) {
+          mnt->journal.phase = "write-data-read";
           if (ext2_read_block(mnt, disk_block, block_buf)) {
             error = 5;
             break;
           }
         }
 
-        uint32_t copied = to_write;
-        if (is_user) {
-          unsigned long uncopied = copy_from_user(
-              block_buf + offset_in_block, buffer + bytes_written, to_write);
-          if (uncopied > to_write) {
-            error = 14;
-            break;
-          }
-          copied -= (uint32_t)uncopied;
-          if (uncopied)
-            error = 14;
-        } else {
-          memcpy(block_buf + offset_in_block, buffer + bytes_written, to_write);
-        }
-        /* A new block installed into a sparse existing file must be zeroed
-         * even if the user copy faults before copying its first byte. */
-        if (copied || allocated) {
-          if (ext2_write_block(mnt, disk_block, block_buf)) {
-            error = 5;
-            break;
-          }
-          bytes_written += copied;
-        }
-        if (error)
+        memcpy(block_buf + offset_in_block, buffer + bytes_written, to_write);
+        mnt->journal.phase = "write-data";
+        if (ext2_write_block(mnt, disk_block, block_buf)) {
+          error = 5;
           break;
+        }
+        bytes_written += to_write;
       }
 
       if (bytes_written > batch_start || mapping_changed) {
@@ -233,11 +268,12 @@ uint32_t ext2_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
           inode.i_mtime = now;
           inode.i_ctime = now;
         }
+        mnt->journal.phase = "write-inode-update";
         if (ext2_write_inode(mnt, node->inode, &inode))
           error = 5;
       }
     }
-    /* Always release ownership, including read, allocation, user-copy, and
+    /* Always release ownership, including read, allocation, and
      * inode errors. The existing journal cannot roll back prior home writes. */
     if (ext3_journal_stop(mnt))
       error = 5;
@@ -249,11 +285,16 @@ uint32_t ext2_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
   }
 
   kfree(block_buf);
-  /* User faults and exhaustion retain traditional short-write behavior;
+  /* Exhaustion retains traditional short-write behavior;
    * failed metadata or commit I/O must never masquerade as byte success. */
   if (error == 5 || !bytes_written)
     return (uint32_t)-(error ? error : 28);
   return bytes_written;
+}
+
+uint32_t ext2_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
+                        uint8_t *buffer) {
+  return ext2_write_staged(node, offset, size, buffer, ext2_write_kernel);
 }
 
 #define EXT2_MAP_FIXED 0x10
@@ -427,6 +468,90 @@ int ext2_rename_impl(vfs_node_t *node, char *old_name, char *new_name) {
   int result = ext2_rename_in_transaction(node, old_name, new_name);
   int stop_result = ext3_journal_stop(mnt);
   return result != 0 ? result : stop_result;
+}
+
+/* Cache downloads move regular files between staging and final directories.
+ * Keep source inode/link count intact and serialize both directory mutations
+ * in one transaction. Directory moves require '..' and parent-link updates
+ * and are deliberately rejected until those semantics are implemented. */
+int ext2_rename_cross(vfs_node_t *old_parent, char *old_name,
+                      vfs_node_t *new_parent, char *new_name) {
+  if (!old_parent || !new_parent || !old_parent->device ||
+      old_parent->device != new_parent->device)
+    return -18;
+  if (old_parent->inode == new_parent->inode)
+    return ext2_rename_impl(old_parent, old_name, new_name);
+  if ((old_parent->flags & FS_TYPE_MASK) != FS_DIRECTORY ||
+      (new_parent->flags & FS_TYPE_MASK) != FS_DIRECTORY)
+    return -20;
+  ext2_mount_t *mnt = old_parent->device;
+  if (ext3_journal_start(mnt))
+    return -5;
+  int result = -2;
+  vfs_node_t *source = ext2_finddir_impl(old_parent, old_name);
+  vfs_node_t *dest = NULL;
+  if (!source)
+    goto out;
+  uint32_t type = source->flags & FS_TYPE_MASK;
+  if (type != FS_FILE && type != FS_SYMLINK) {
+    result = -95;
+    goto out;
+  }
+  dest = ext2_finddir_impl(new_parent, new_name);
+  if (dest && (dest->flags & FS_TYPE_MASK) == FS_DIRECTORY) {
+    result = -21;
+    goto out;
+  }
+  if (dest && (dest->flags & FS_TYPE_MASK) != FS_FILE &&
+      (dest->flags & FS_TYPE_MASK) != FS_SYMLINK) {
+    result = -95;
+    goto out;
+  }
+  if (dest && source->inode == dest->inode) {
+    result = 0;
+    goto out;
+  }
+  ext2_inode_t replaced_inode;
+  if (dest && ext2_read_inode(mnt, dest->inode, &replaced_inode)) {
+    result = -5;
+    goto out;
+  }
+  uint8_t dtype = type == FS_SYMLINK ? EXT2_FT_SYMLINK : EXT2_FT_REG_FILE;
+  result = dest ? ext2_replace_dir_entry(mnt, new_parent->inode, new_name,
+                                         source->inode, dtype)
+                : ext2_add_dir_entry(mnt, new_parent->inode, source->inode,
+                                      new_name, dtype);
+  if (result) {
+    result = -5;
+    goto out;
+  }
+  if (ext2_remove_dir_entry(mnt, old_parent->inode, old_name)) {
+    /* Preserve the original destination if source removal fails. Rollback
+     * can itself fail on device I/O; never report success in either case. */
+    if (dest) {
+      uint8_t old_dtype = (dest->flags & FS_TYPE_MASK) == FS_SYMLINK
+                             ? EXT2_FT_SYMLINK : EXT2_FT_REG_FILE;
+      ext2_replace_dir_entry(mnt, new_parent->inode, new_name,
+                             dest->inode, old_dtype);
+    } else {
+      ext2_remove_dir_entry(mnt, new_parent->inode, new_name);
+    }
+    result = -5;
+    goto out;
+  }
+  if (dest) {
+    if (replaced_inode.i_links_count)
+      replaced_inode.i_links_count--;
+    if (!replaced_inode.i_links_count)
+      replaced_inode.i_dtime = ext2_current_time();
+    if (ext2_write_inode(mnt, dest->inode, &replaced_inode))
+      result = -5;
+  }
+out:
+  kfree(dest);
+  kfree(source);
+  int stop_result = ext3_journal_stop(mnt);
+  return result ? result : (stop_result ? -5 : 0);
 }
 
 int ext2_chmod_impl(vfs_node_t *node, uint16_t permission) {

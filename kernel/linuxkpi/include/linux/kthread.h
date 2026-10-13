@@ -65,6 +65,8 @@ struct task_struct *kthread_run_on_cpu(int (*threadfn)(void *data), void *data,
                                        unsigned int cpu, const char *namefmt);
 
 int kthread_stop(struct task_struct *k);
+/* Relinquish creator ownership for an internal self-retiring worker. */
+void kthread_detach(struct task_struct *k);
 bool kthread_should_stop(void);
 void kthread_bind(struct task_struct *k, unsigned int cpu);
 

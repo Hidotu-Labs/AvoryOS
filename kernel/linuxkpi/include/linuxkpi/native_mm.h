@@ -47,6 +47,8 @@ extern __UINT64_TYPE__ asc_pmm_get_hhdm_offset(void)
     __asm__("pmm_get_hhdm_offset");
 extern __UINT64_TYPE__ asc_pmm_get_total_memory(void)
     __asm__("pmm_get_total_memory");
+extern __UINT64_TYPE__ asc_pmm_get_managed_memory_end(void)
+    __asm__("pmm_get_managed_memory_end");
 extern _Bool asc_pmm_is_managed(__UINT64_TYPE__ phys) __asm__("pmm_is_managed");
 extern __UINT64_TYPE__ asc_pmm_get_zero_page_phys(void)
     __asm__("pmm_get_zero_page_phys");
@@ -92,6 +94,10 @@ extern void vma_unmap_mapping_range(void *mapping,
 #define ASC_PAGE_PCD 0x010ULL
 #define ASC_PAGE_PAT 0x080ULL /* bit 7 at the PTE level (PS on PD entries) */
 #define ASC_PAGE_NX 0x8000000000000000ULL
+
+/* Cache bits of a managed RAM page's direct mapping. TTM owns cache-mode
+ * transitions; mmap/vmap aliases must use the same effective type. */
+extern unsigned long linuxkpi_page_cache_flags(__UINT64_TYPE__ phys);
 
 static inline void asc_invlpg(__UINT64_TYPE__ va) {
   __asm__ volatile("invlpg (%0)" ::"r"(va) : "memory");

@@ -28,8 +28,8 @@ struct dirent *ext2_readdir_impl(vfs_node_t *node, uint32_t index) {
     return NULL;
   }
 
-  static struct dirent d;
-  memset(&d, 0, sizeof(d));
+  struct dirent *d = vfs_readdir_buffer();
+  memset(d, 0, sizeof(*d));
 
   uint8_t *block_buf = kmalloc(mnt->block_size);
   if (!block_buf) {
@@ -71,15 +71,15 @@ struct dirent *ext2_readdir_impl(vfs_node_t *node, uint32_t index) {
         uint32_t name_len = entry->name_len;
         if (name_len > 127)
           name_len = 127;
-        memcpy(d.name, entry->name, name_len);
-        d.name[name_len] = '\0';
-        d.ino = entry->inode;
-        d.d_type = ext2_dirent_dtype(entry->file_type);
+        memcpy(d->name, entry->name, name_len);
+        d->name[name_len] = '\0';
+        d->ino = entry->inode;
+        d->d_type = ext2_dirent_dtype(entry->file_type);
         node->readdir_cursor_index = index + 1;
         node->readdir_cursor_offset = byte_pos + entry->rec_len;
         kfree(block_buf);
         spinlock_release(&node->readdir_cursor_lock);
-        return &d;
+        return d;
       }
       entry_idx++;
     }
@@ -239,9 +239,9 @@ int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
 
       uint32_t disk_block =
           ext2_get_block_num(mnt, &dir_inode, byte_pos / mnt->block_size);
-      ext3_journal_block(mnt, disk_block, block_buf);
+      int result = ext3_journal_block(mnt, disk_block, block_buf);
       kfree(block_buf);
-      return 0;
+      return result;
     }
 
     byte_pos += entry->rec_len;
@@ -278,11 +278,12 @@ int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
   new_entry->file_type = file_type;
   memcpy(new_entry->name, name, name_len);
 
-  ext3_journal_block(mnt, new_block, block_buf);
-  ext2_write_inode(mnt, dir_inode_num, &dir_inode);
+  int result = ext3_journal_block(mnt, new_block, block_buf);
+  if (!result)
+    result = ext2_write_inode(mnt, dir_inode_num, &dir_inode);
 
   kfree(block_buf);
-  return 0;
+  return result;
 }
 
 int ext2_remove_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
@@ -338,9 +339,9 @@ int ext2_remove_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
         }
         uint32_t disk_block = ext2_get_block_num(
             mnt, &dir_inode, current_block_start / mnt->block_size);
-        ext3_journal_block(mnt, disk_block, block_buf);
+        int result = ext3_journal_block(mnt, disk_block, block_buf);
         kfree(block_buf);
-        return 0;
+        return result;
       }
     }
 
@@ -351,6 +352,55 @@ int ext2_remove_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
 
   kfree(block_buf);
   return -1;
+}
+
+/* Replace an existing name without allocating or temporarily unlinking its
+ * inode. Linear scanning also works for indexed directories: HTree index
+ * blocks contain fake empty dirents and the real names live in leaf blocks. */
+int ext2_replace_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
+                           const char *name, uint32_t child_inode_num,
+                           uint8_t file_type) {
+  ext2_inode_t inode;
+  if (ext2_read_inode(mnt, dir_inode_num, &inode))
+    return -5;
+  uint8_t *buf = kmalloc(mnt->block_size);
+  if (!buf)
+    return -12;
+  size_t name_len = strlen(name);
+  int result = -2;
+  for (uint32_t pos = 0; pos < inode.i_size; pos += mnt->block_size) {
+    uint32_t block = 0;
+    int mapping_error = 0;
+    if (inode.i_flags & EXT4_EXTENTS_FL)
+      block = ext4_get_block_num(mnt, &inode, pos / mnt->block_size);
+    else
+      mapping_error = ext2_get_block_num_checked(
+          mnt, &inode, pos / mnt->block_size, &block);
+    if (mapping_error || !block || ext2_read_block(mnt, block, buf)) {
+      result = -5;
+      break;
+    }
+    for (uint32_t offset = 0; offset < mnt->block_size;) {
+      ext2_dirent_t *entry = (ext2_dirent_t *)(buf + offset);
+      if (mnt->block_size - offset < 8 || entry->rec_len < 8 ||
+          (entry->rec_len & 3) || entry->rec_len > mnt->block_size - offset ||
+          entry->name_len > entry->rec_len - 8) {
+        result = -5;
+        goto out;
+      }
+      if (entry->inode && entry->name_len == name_len &&
+          !memcmp(entry->name, name, name_len)) {
+        entry->inode = child_inode_num;
+        entry->file_type = file_type;
+        result = ext3_journal_block(mnt, block, buf) ? -5 : 0;
+        goto out;
+      }
+      offset += entry->rec_len;
+    }
+  }
+out:
+  kfree(buf);
+  return result;
 }
 
 bool ext2_dir_is_empty(ext2_mount_t *mnt, uint32_t inode_num) {

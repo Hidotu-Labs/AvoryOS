@@ -69,6 +69,7 @@ bool vfs_may_remove(vfs_node_t *parent, vfs_node_t *target) {
 }
 
 typedef struct vfs_mount_entry {
+  uint64_t mount_id;
   vfs_node_t *mountpoint;
   vfs_node_t *target;
   char dev_name[64];
@@ -82,6 +83,7 @@ typedef struct vfs_mount_entry {
 } vfs_mount_entry_t;
 
 static vfs_mount_entry_t *vfs_mount_list = NULL;
+static uint64_t vfs_next_mount_id = 18;
 
 /* Bounded 4-way dentry cache. Positive entries own a child reference;
  * positive and negative entries both own a parent reference. */
@@ -112,6 +114,45 @@ typedef struct vfs_dentry_cache_bucket {
 } vfs_dentry_cache_bucket_t;
 
 static vfs_dentry_cache_bucket_t vfs_dentry_cache[VFS_DENTRY_BUCKETS];
+
+/* Find cold cache pages beyond the allocating process's mapped files. Cache
+ * entries already own the child references; pin under their bucket lock and
+ * reclaim outside it. Never wait for a bucket held by the OOM caller. */
+size_t vfs_dentry_reclaim_pages(size_t target) {
+  static uint32_t cursor, active;
+  if (!target || __atomic_exchange_n(&active, 1, __ATOMIC_ACQUIRE))
+    return 0;
+  size_t reclaimed = 0;
+  for (uint32_t scanned = 0;
+       scanned < VFS_DENTRY_BUCKETS && reclaimed < target; scanned++) {
+    uint32_t slot = __atomic_fetch_add(&cursor, 1, __ATOMIC_RELAXED) &
+                    VFS_DENTRY_BUCKET_MASK;
+    vfs_dentry_cache_bucket_t *bucket = &vfs_dentry_cache[slot];
+    if (!spinlock_try_acquire(&bucket->lock))
+      continue;
+    vfs_node_t *nodes[VFS_DENTRY_WAYS];
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < VFS_DENTRY_WAYS; i++) {
+      vfs_node_t *node = bucket->entries[i].child;
+      if (!bucket->entries[i].valid || !node ||
+          (node->flags & FS_TYPE_MASK) != FS_FILE)
+        continue;
+      bool duplicate = false;
+      for (uint32_t j = 0; j < count; j++)
+        if (nodes[j] == node) duplicate = true;
+      if (!duplicate && vfs_node_tryref(node))
+        nodes[count++] = node;
+    }
+    spinlock_release(&bucket->lock);
+    for (uint32_t i = 0; i < count; i++) {
+      if (reclaimed < target)
+        reclaimed += vfs_cache_reclaim(nodes[i], target - reclaimed);
+      vfs_close(nodes[i]);
+    }
+  }
+  __atomic_store_n(&active, 0, __ATOMIC_RELEASE);
+  return reclaimed;
+}
 
 static uint32_t vfs_dentry_hash(vfs_node_t *parent, const char *name) {
   uint64_t hash = ((uint64_t)(uintptr_t)parent >> 4) ^ 1469598103934665603ULL;
@@ -518,7 +559,7 @@ static void vfs_dentry_bucket_invalidate(vfs_node_t *parent, const char *name) {
 }
 
 /* Drop the exact (dir, path) fast-path resolution, if present. */
-static void vfs_path_cache_drop(vfs_node_t *dir, const char *path) {
+void vfs_path_cache_drop(vfs_node_t *dir, const char *path) {
   size_t len_sz = strlen(path);
   if (len_sz >= 256)
     return;
@@ -647,15 +688,19 @@ static void vfs_path_cache_invalidate_name_scan(vfs_node_t *parent,
 
 void vfs_dentry_invalidate(vfs_node_t *parent, const char *name) {
   /* With a concrete parent and name, the dentry cache needs only the single
-   * bucket holding (parent, name), and the path cache only needs a record in
-   * the invalidation log - each entry rechecks it lazily on its next lookup.
-   * A NULL argument means "everything", which genuinely does need the full
-   * table scan (e.g. unmounts). */
+   * bucket holding (parent, name). The path cache gets a log record so all
+   * aliases (absolute paths, subpaths) fail closed on next lookup, plus an
+   * O(1) exact drop of (parent, name) so unlinked single-component temp
+   * files (openat/fchmodat via dirfd) release their pinned node+pages
+   * immediately instead of lingering until eviction. A NULL argument means
+   * "everything", which genuinely does need the full table scan. */
   if (parent && name) {
     if (vfs_path_invalidation_force_scan)
       vfs_path_cache_invalidate_name_scan(parent, name);
-    else
+    else {
       vfs_path_invalidate_record(name);
+      vfs_path_cache_drop(parent, name);
+    }
     vfs_dentry_bucket_invalidate(parent, name);
     return;
   }
@@ -757,7 +802,8 @@ uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
 
   if (node->write) {
     uint32_t written = node->write(node, offset, size, buffer);
-    if (written && (node->flags & FS_PAGE_CACHE))
+    if (written && written <= size &&
+        ((node->flags & FS_PAGE_CACHE) || node->mmap_shared_only))
       vfs_cache_update_or_invalidate(node, offset, written, buffer);
     return written;
   }
@@ -832,6 +878,13 @@ void vfs_node_retire(vfs_node_t *node) {
   kfree(node);
 }
 
+struct dirent *vfs_readdir_buffer(void) {
+  struct thread *t = sched_get_current();
+  /* Before the scheduler starts, filesystem setup runs on the boot CPU. */
+  static struct dirent boot_result;
+  return t ? &t->readdir_result : &boot_result;
+}
+
 struct dirent *vfs_readdir(vfs_node_t *node, uint32_t index) {
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->readdir) {
     return node->readdir(node, index);
@@ -843,6 +896,8 @@ vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->finddir) {
     bool negative;
     vfs_node_t *cached = vfs_dentry_lookup(node, name, &negative);
+    if (cached && !cached->mount_id)
+      cached->mount_id = node->mount_id ? node->mount_id : 1;
     if (cached || negative)
       return cached;
 
@@ -851,6 +906,8 @@ vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
       vfs_dentry_insert(node, name, NULL);
       return 0;
     }
+    if (!res->mount_id)
+      res->mount_id = node->mount_id ? node->mount_id : 1;
 
     /* Follow mounts transitively.  Mounts can stack (the kernel mounts a
      * ramfs at /run, then localmount mounts a tmpfs over it), and the visible
@@ -982,6 +1039,39 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
                      vfs_node_t *new_parent, char *new_name) {
   if (!old_parent || !new_parent || !old_name || !new_name)
     return -22; // EINVAL
+  /* ext2/ext4 lookup can return separate VFS handles for the same directory.
+   * Pointer inequality does not imply a cross-directory move. Compare the
+   * backend, mount and inode before falling back to cross-directory support. */
+  extern int ext2_rename_impl(vfs_node_t *, char *, char *);
+  if (old_parent->rename == ext2_rename_impl &&
+      new_parent->rename == ext2_rename_impl && old_parent->device &&
+      old_parent->device == new_parent->device &&
+      old_parent->inode == new_parent->inode) {
+    vfs_dentry_invalidate(new_parent, new_name);
+    int rc = vfs_rename(old_parent, old_name, new_name);
+    vfs_dentry_invalidate(new_parent, new_name);
+    return rc;
+  }
+  if (old_parent->rename == ext2_rename_impl &&
+      new_parent->rename == ext2_rename_impl && old_parent->device &&
+      old_parent->device == new_parent->device) {
+    extern int ext2_rename_cross(vfs_node_t *, char *, vfs_node_t *, char *);
+    /* Pin the cached objects before invalidation, just as vfs_rename does.
+     * Looking them up afterwards creates fresh inode aliases and can reclaim
+     * the replacement while the original object still has open descriptors. */
+    vfs_node_t *source = vfs_finddir(old_parent, old_name);
+    vfs_node_t *replaced = vfs_finddir(new_parent, new_name);
+    vfs_dentry_invalidate(old_parent, old_name);
+    vfs_dentry_invalidate(new_parent, new_name);
+    int rc = ext2_rename_cross(old_parent, old_name, new_parent, new_name);
+    vfs_dentry_invalidate(old_parent, old_name);
+    vfs_dentry_invalidate(new_parent, new_name);
+    if (!rc && replaced && (!source || source->inode != replaced->inode))
+      vfs_node_retire(replaced);
+    if (replaced) vfs_close(replaced);
+    if (source) vfs_close(source);
+    return rc;
+  }
   vfs_dentry_invalidate(old_parent, old_name);
   vfs_dentry_invalidate(new_parent, new_name);
   /* Route on the parents' op table: tmpfs_rename_cross re-validates that
@@ -1024,7 +1114,7 @@ int vfs_mknod(vfs_node_t *node, char *name, uint16_t permission, uint32_t flags,
 int vfs_truncate(vfs_node_t *node, uint32_t size) {
   if (node && node->truncate) {
     int result = node->truncate(node, size);
-    if (!result && (node->flags & FS_PAGE_CACHE))
+    if (!result && ((node->flags & FS_PAGE_CACHE) || node->mmap_shared_only))
       vfs_cache_clear(node);
     return result;
   }
@@ -1032,33 +1122,20 @@ int vfs_truncate(vfs_node_t *node, uint32_t size) {
 }
 
 int vfs_fallocate(vfs_node_t *node, int mode, uint32_t offset, uint32_t len) {
-  if (node && node->fallocate) {
+  if (!node || (node->flags & FS_TYPE_MASK) != FS_FILE)
+    return -22;
+  if (!len)
+    return -22;
+  if (len > UINT32_MAX - offset)
+    return -27;
+  if (node->fallocate)
     return node->fallocate(node, mode, offset, len);
-  }
-  if (node && (node->flags & FS_TYPE_MASK) == FS_FILE) {
-    // Mode 0: standard allocation (posix_fallocate)
-    // Mode 1: FALLOC_FL_KEEP_SIZE (allocate space without extending file size)
-    if (mode == 0 || mode == 0x01) {
-      uint32_t required = offset + len;
-      if (required > node->length) {
-        if (mode == 0) {
-          if (node->truncate)
-            return node->truncate(node, required);
-          node->length = required;
-        } else {
-          // KEEP_SIZE: ensure underlying space without altering node->length
-          if (node->truncate) {
-            uint32_t old_len = node->length;
-            int r = node->truncate(node, required);
-            node->length = old_len;
-            return r;
-          }
-        }
-      }
-      return 0;
-    }
-  }
-  return -1;
+
+  /* Resizing is not allocation: truncate may create only holes, and restoring
+   * node->length after KEEP_SIZE leaves the on-disk inode enlarged. Let callers
+   * use their unsupported-preallocation fallback until the backend can reserve
+   * blocks without changing existing bytes or the persistent file size. */
+  return -95; // EOPNOTSUPP
 }
 
 int vfs_poll(vfs_node_t *node, int events) {
@@ -1119,15 +1196,16 @@ static vfs_node_t *vfs_lookup_cached_path(vfs_node_t *base_dir, const char *path
     }
     comp[i] = '\0';
 
-    if (strcmp(comp, ".") == 0)
-      continue;
-
-    /* Permission check on directory */
-    if (!vfs_access(current, 1)) {
+    /* Only directories can contain another path component. */
+    if ((current->flags & FS_TYPE_MASK) != FS_DIRECTORY ||
+        !vfs_access(current, 1)) {
       if (current_ref)
         vfs_close(current_ref);
       return NULL;
     }
+
+    if (strcmp(comp, ".") == 0)
+      continue;
 
     bool negative = false;
     vfs_node_t *next = vfs_dentry_lookup(current, comp, &negative);
@@ -1249,6 +1327,9 @@ vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
     }
     comp[i] = '\0';
 
+    if ((current->flags & FS_TYPE_MASK) != FS_DIRECTORY)
+      goto fail;
+
     if (strcmp(comp, "..") == 0) {
       if (stack_top >= 0) {
         vfs_close(current);
@@ -1361,9 +1442,9 @@ fail:
   for (int j = 0; j <= stack_top; j++)
     vfs_close(parent_stack[j]);
   vfs_close(current);
-  if (path && (strncmp(path, "/proc/", 6) == 0 || strncmp(path, "/sys/", 5) == 0)) {
-    sysdiag_record_missing_fs_node(path, sched_get_current(), -2, "lookup");
-  }
+  /* This label handles invalid traversal, permissions and symlink failures,
+   * not a missing node. Probing version/connector_id beneath a regular DRM
+   * version file must not be reported as an unimplemented sysfs attribute. */
   return 0;
 }
 
@@ -1401,6 +1482,8 @@ int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
     return -1;
   entry->mountpoint = mountpoint;
   entry->target = target;
+  entry->mount_id = __atomic_fetch_add(&vfs_next_mount_id, 1, __ATOMIC_RELAXED);
+  target->mount_id = entry->mount_id;
   strncpy(entry->dev_name, dev_name ? dev_name : "none", 63);
   strncpy(entry->fs_type, fs_type ? fs_type : "unknown", 31);
   entry->dev_name[63] = '\0';
@@ -1459,6 +1542,7 @@ int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count) {
     }
 
     if (!found) {
+      buffer[count].mount_id = fs_root->mount_id ? fs_root->mount_id : 1;
       strcpy(buffer[count].mountpoint, "/");
       strcpy(buffer[count].target, "/");
       strcpy(buffer[count].dev_name, "none");
@@ -1469,6 +1553,7 @@ int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count) {
 
   vfs_mount_entry_t *curr = vfs_mount_list;
   while (curr && count < max_count) {
+    buffer[count].mount_id = curr->mount_id;
     /* Use the recorded mountpoint path, not the node's name: userspace
      * (OpenRC's mountinfo, findmnt, ...) matches full paths. */
     strncpy(buffer[count].mountpoint,

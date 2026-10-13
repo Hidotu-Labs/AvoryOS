@@ -11,6 +11,7 @@
 #include "../mm/tlb_shootdown.h"
 #include "../sched/sched.h"
 #include "syscall.h"
+#include "sys_io_shared.h"
 #include "arch/uaccess.h"
 #include "../console/klog.h"
 #include <stdint.h>
@@ -32,8 +33,7 @@ extern void __kpi_preempt_enable(void);
 #define MAP_ANONYMOUS 0x20
 #define MAP_FIXED_NOREPLACE 0x100000 /* Linux: fail with EEXIST if range busy */
 #define MAP_HUGETLB 0x40000         /* Linux user-space: request huge pages */
-/* Linux user-space: pthread stack hint. Stored verbatim in vma.flags (see
- * vma.h); used here only to trace stack-size intent. */
+/* Linux user-space pthread stack hint, stored verbatim in vma.flags. */
 #define MAP_STACK 0x20000
 /* Kernel-internal MAP_HUGEPAGE — must match vma.h */
 #define MAP_HUGEPAGE 0x200000000ULL /* enable 2MB demand paging for this VMA */
@@ -45,26 +45,6 @@ extern void __kpi_preempt_enable(void);
 #define E_NOMEM ((uint64_t)-12)
 #define E_BADF ((uint64_t)-9)
 #define E_EXIST ((uint64_t)-17)
-
-// Stack-intent tracing for the mocktail guard investigation: log what
-// userspace actually requests for pthread stacks (MAP_STACK) and guards
-// (mprotect PROT_NONE). Rate-limited; allocation-free.
-#define MM_STACK_LOG_CAP 48
-static volatile uint64_t mm_stack_mmap_logs;
-static volatile uint64_t mm_guard_mprotect_logs;
-
-static void mm_log_stack_mmap(uint64_t vaddr, uint64_t len, uint64_t prot) {
-  if (__atomic_add_fetch(&mm_stack_mmap_logs, 1, __ATOMIC_RELAXED) >
-      MM_STACK_LOG_CAP)
-    return;
-  klog_puts("[MM] MAP_STACK mmap len=");
-  klog_uint64(len);
-  klog_puts(" -> ");
-  klog_hex64(vaddr);
-  klog_puts(" prot=");
-  klog_hex64(prot);
-  klog_puts("\n");
-}
 
 // Helpers
 
@@ -94,8 +74,12 @@ static uint64_t build_page_flags(uint64_t prot) {
 }
 
 // Anonymous mapping
-#define MMAP_REGION_BASE 0x7F0000000000ULL
-#define MMAP_REGION_LIMIT 0x7FF000000000ULL
+static bool mm_compat32(void) {
+  struct thread *t = sched_get_current();
+  return t && t->mm && t->mm->compat32;
+}
+#define MMAP_REGION_BASE (mm_compat32() ? 0x40000000ULL : 0x7F0000000000ULL)
+#define MMAP_REGION_LIMIT (mm_compat32() ? 0xB0000000ULL : 0x7FF000000000ULL)
 
 // INTERNAL HELPERS
 
@@ -148,10 +132,16 @@ static bool range_page_is_ours(struct thread *t, uint64_t va, bool mm_locked) {
   return ours;
 }
 
-/* Does this VA fall in a generic file-mapping VMA whose PTEs hold a PMM
- * reference to their page-cache frame?  Those references must be dropped on
- * unmap (pmm_free_page() is pmm_decref()).  Driver-mapped frames (GEM,
- * framebuffer, tmpfs) are owned by their backing object and are left alone. */
+/* Generic cache views and private memfd views own a reference per PTE.
+ * Shared device views retain the backing object's ownership convention. */
+static bool vma_has_file_page_refs(struct vma *v) {
+  if (!v)
+    return false;
+  vfs_node_t *node = (vfs_node_t *)v->file_node;
+  return (v->flags & MAP_PAGECACHE) ||
+         ((v->flags & MAP_PRIVATE) && node && node->mmap_private_pmm_refs);
+}
+
 static bool range_page_is_pagecache(struct thread *t, uint64_t va,
                                     bool mm_locked) {
   if (!t || !t->mm)
@@ -160,11 +150,11 @@ static bool range_page_is_pagecache(struct thread *t, uint64_t va,
   bool ours;
   if (mm_locked) {
     struct vma *v = vma_find(&t->mm->vmas, va);
-    ours = v && (v->flags & MAP_PAGECACHE);
+    ours = vma_has_file_page_refs(v);
   } else {
     spinlock_acquire(&t->mm->lock);
     struct vma *v = vma_find(&t->mm->vmas, va);
-    ours = v && (v->flags & MAP_PAGECACHE);
+    ours = vma_has_file_page_refs(v);
     spinlock_release(&t->mm->lock);
   }
   return ours;
@@ -228,7 +218,7 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
         cv_end = cv->end;
         ours = (cv->fd == -1 && (cv->flags & MAP_PRIVATE) &&
                 (cv->flags & MAP_ANONYMOUS));
-        pagecache = (cv->flags & MAP_PAGECACHE) != 0;
+        pagecache = vma_has_file_page_refs(cv);
       } else {
         // Gap: unmap without freeing; re-evaluate on the next page. Gaps
         // are rare in teardown ranges, so one lookup per gap page is fine.
@@ -429,8 +419,13 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
 
   // Determine virtual address
   uint64_t aligned_len = PAGE_ALIGN_UP(length);
+  if (aligned_len == 0 || aligned_len - 1 > USER_ADDR_MAX)
+    return E_NOMEM;
   struct thread *current_thread = sched_get_current();
 
+  if (mm_compat32() &&
+      (addr >= 0xC0000000ULL || aligned_len > 0xC0000000ULL - addr))
+    return E_NOMEM;
 
   uint64_t *pml4 = vmm_get_active_pml4();
   uint64_t vaddr = 0;
@@ -444,8 +439,8 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
     if (addr == 0 || (addr & (PAGE_SIZE - 1))) {
       return E_INVAL;
     }
-    if (!is_user_pointer(addr) || !is_user_pointer(addr + aligned_len - 1)) {
-      return E_INVAL;
+    if (!is_user_pointer(addr) || aligned_len - 1 > USER_ADDR_MAX - addr) {
+      return E_NOMEM;
     }
     vaddr = addr;
 
@@ -463,6 +458,23 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
       teardown_range(pml4, current_thread, vaddr, aligned_len, true,
                      "MAP_FIXED teardown");
       vma_remove(&current_thread->mm->vmas, vaddr, vaddr + aligned_len);
+      if (flags & MAP_ANONYMOUS) {
+        /* Install fixed anonymous mappings atomically with the overlap check
+         * and teardown.  The VMA itself reserves the range; moving the normal
+         * mmap cursor here would discard every free gap below a high fixed
+         * reservation (Wine reserves the top of user space this way). */
+        uint64_t vma_flags = flags;
+        if (flags & MAP_HUGETLB)
+          vma_flags |= MAP_HUGEPAGE;
+        int result = vma_add(&current_thread->mm->vmas, vaddr,
+                             vaddr + aligned_len, prot, vma_flags,
+                             -1, 0, NULL, 0);
+        spinlock_release(&current_thread->mm->lock);
+        vmm_drain_deferred_work();
+        if (result < 0)
+          return E_NOMEM;
+        return vaddr;
+      }
       /* Keep non-fixed mmap reservations above this range while a
        * file-backed MAP_FIXED operation finishes outside mm->lock. */
       if (vaddr < MMAP_REGION_LIMIT &&
@@ -520,8 +532,6 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
         current_thread->mm->mmap_next_addr =
             MAX(current_thread->mm->mmap_next_addr, vaddr + aligned_len);
         spinlock_release(&current_thread->mm->lock);
-        if (flags & MAP_STACK)
-          mm_log_stack_mmap(vaddr, aligned_len, prot);
         return vaddr;
       }
 
@@ -547,16 +557,17 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
 
   // File-backed mapping
   if (!(flags & MAP_ANONYMOUS) && (int64_t)fd != -1) {
-    if (!current_thread || fd >= MAX_FDS || !current_thread->fds[fd]) {
+    vfs_node_t *node __attribute__((cleanup(fd_node_put))) =
+        fd_node_get(current_thread, fd);
+    if (!node)
       return E_BADF;
-    }
-    vfs_node_t *node = current_thread->fds[fd];
 
-    if (node->mmap) {
+    if (node->mmap &&
+        !(node->mmap_shared_only && ((flags & 0x3) == MAP_PRIVATE))) {
       // Pass MAP_FIXED to internal handler to ensure it respects our vaddr
       uint64_t result =
           node->mmap(node, vaddr, length, prot, flags | MAP_FIXED, offset);
-      if (result == MAP_FAILED || result == (uint64_t)-1) {
+      if (result >= (uint64_t)-4095) {
         /* A failed Linux f_op->mmap must not leave a pending bridge wrapper. */
         extern void *linuxkpi_vma_take_pending(void) __attribute__((weak));
         extern void linuxkpi_vma_unref(void *) __attribute__((weak));
@@ -565,7 +576,7 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
           if (stale)
             linuxkpi_vma_unref(stale);
         }
-        return E_NOMEM;
+        return result == MAP_FAILED ? E_NOMEM : result;
       }
 
       if (current_thread && current_thread->mm) {
@@ -652,8 +663,6 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
     spinlock_release(&current_thread->mm->lock);
   }
 
-  if (flags & MAP_STACK)
-    mm_log_stack_mmap(vaddr, aligned_len, prot);
   return vaddr;
 }
 
@@ -746,7 +755,8 @@ static uint64_t sys_brk(uint64_t addr, uint64_t a1, uint64_t a2, uint64_t a3,
   }
 
   // Check bounds.
-  if (!is_user_pointer(addr)) {
+  if (!is_user_pointer(addr) ||
+      (current->mm->compat32 && addr >= 0xC0000000ULL)) {
     uint64_t ret = current->mm->brk_current;
     spinlock_release(&current->mm->lock);
     return ret;
@@ -819,15 +829,7 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
   if (!current || !current->mm)
     return E_INVAL;
 
-  if (prot == PROT_NONE &&
-      __atomic_add_fetch(&mm_guard_mprotect_logs, 1, __ATOMIC_RELAXED) <=
-          MM_STACK_LOG_CAP) {
-    klog_puts("[MM] mprotect PROT_NONE addr=");
-    klog_hex64(addr);
-    klog_puts(" len=");
-    klog_uint64(aligned_len);
-    klog_puts("\n");
-  }
+
 
   uint64_t end = addr + aligned_len;
   for (uint64_t batch_start = addr; batch_start < end;) {
@@ -1554,7 +1556,17 @@ static uint64_t sys_mbind(uint64_t addr, uint64_t len, uint64_t mode_raw,
 
 // Public API
 
+/* Write-watch via userfaultfd needs a fault-event fd and UFFDIO operations.
+ * Keep the optional probe explicitly unsupported until those exist; Wine
+ * uses its normal memory protection path when this returns ENOSYS. */
+static uint64_t sys_userfaultfd(uint64_t flags, uint64_t a1, uint64_t a2,
+                                uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)flags; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+  return (uint64_t)-38;
+}
+
 void syscall_register_mm(void) {
+  syscall_register(SYS_USERFAULTFD, sys_userfaultfd);
   syscall_register(SYS_MMAP, sys_mmap);
   syscall_register(SYS_MUNMAP, sys_munmap);
   syscall_register(SYS_MREMAP, sys_mremap);

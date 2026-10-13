@@ -18,6 +18,7 @@
 #include "mm/vmm.h"
 #include "sched/sched.h"
 #include "sched/wait.h"
+#include "fs/vfs.h"
 #include "smp/cpu.h"
 
 #include <stdbool.h>
@@ -1507,17 +1508,22 @@ static int nvme_io_wait(struct nvme_controller *ctrl, struct nvme_iovq *vq,
       continue;
     }
 
-    /* Block first, then link: a completion that lands between linking and the
-     * blocked-store must not be overwritten by it. */
+    /* Publish the deadline and wake entry without letting a local timer
+     * park us halfway through registration. Recheck after linking to catch
+     * a completion that preceded registration. */
+    hal_irq_state_t irq_flags = hal_irq_save();
+    self->wakeup_ticks = lapic_timer_get_ticks() + 10;
     self->state = THREAD_BLOCKED;
     ctrl->wait_blocks++;
     wait_queue_add(&vq->cid_wq[cid], &wqe);
     if (__atomic_load_n(&vq->cid_result[cid], __ATOMIC_ACQUIRE) != 0) {
       self->state = THREAD_RUNNING;
+      self->wakeup_ticks = 0;
+      hal_irq_restore(irq_flags);
       wait_queue_remove(&vq->cid_wq[cid], &wqe);
       continue;
     }
-    self->wakeup_ticks = lapic_timer_get_ticks() + 10;
+    hal_irq_restore(irq_flags);
     sched_yield();
     self->wakeup_ticks = 0;
     self->state = THREAD_RUNNING;
@@ -1755,7 +1761,14 @@ static int nvme_io_direct_once(struct nvme_controller *ctrl,
     return -2;
   }
 
-  return nvme_io_wait(ctrl, vq, (uint32_t)cid, generation);
+  struct block_device *dev = &ns->blkdev;
+  __atomic_add_fetch(write ? &dev->hw_writes : &dev->hw_reads, 1,
+                     __ATOMIC_RELAXED);
+  __atomic_add_fetch(write ? &dev->hw_write_bytes : &dev->hw_read_bytes,
+                     bytes, __ATOMIC_RELAXED);
+  int rc = nvme_io_wait(ctrl, vq, (uint32_t)cid, generation);
+  if (rc) __atomic_add_fetch(&dev->hw_errors, 1, __ATOMIC_RELAXED);
+  return rc;
 }
 
 /* Re-issue a command after a reset when the build enables recovery. */
@@ -1781,14 +1794,26 @@ static int nvme_io_bounce(struct nvme_controller *ctrl,
                           bool user_ptr, uint32_t chunk_bytes, bool fua) {
   uint32_t pages = (chunk_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
   void *bounce_phys = pmm_alloc_pages(pages);
+  if (!bounce_phys && nvme_may_block()) {
+    /* Reclaim clean cache pages, then drain PCP pages
+     * into buddy lists so a contiguous scratch allocation can use them. */
+    mm_file_cache_reclaim(pages < 32 ? 32 : pages);
+    pmm_pcp_drain_all();
+    bounce_phys = pmm_alloc_pages(pages);
+  }
   if (!bounce_phys) {
-    klogf("[NVMe] %s bounce allocation failed (%u bytes)\n", ctrl->name,
-          chunk_bytes);
+    static uint32_t bounce_alloc_failures;
+    uint32_t failures =
+        __atomic_add_fetch(&bounce_alloc_failures, 1, __ATOMIC_RELAXED);
+    if (failures <= 8 || (failures & (failures - 1)) == 0)
+      klogf("[NVMe] %s bounce allocation failed (%u bytes), failures=%u\n",
+            ctrl->name, chunk_bytes, failures);
     return -1;
   }
   uint8_t *bounce =
       (uint8_t *)((uint64_t)bounce_phys + pmm_get_hhdm_offset());
   int rc = 0;
+  bool dma_safe = true;
 
   /* Zero first: neither a device short-read nor a partially filled write path
    * may expose stale allocator contents through the bounce page. */
@@ -1803,8 +1828,12 @@ static int nvme_io_bounce(struct nvme_controller *ctrl,
     }
   }
 
-  if (rc == 0)
+  if (rc == 0) {
     rc = nvme_io_direct(ctrl, ns, slba, nlb, (uint64_t)bounce, write, fua);
+    /* -1 is a pre-submit error or a consumed command completion. Only a
+     * transport failure (-2) can leave the device owning this buffer. */
+    dma_safe = rc != -2;
+  }
 
   if (rc == 0 && !write) {
     if (user_ptr) {
@@ -1816,13 +1845,14 @@ static int nvme_io_bounce(struct nvme_controller *ctrl,
   }
 
   /*
-   * Free the bounce once no command can still be writing to it.  A fail-stop
-   * clears CC.EN and waits for CSTS.RDY=0 before returning, which sets
+   * Free the bounce once no command can still be writing to it. Copy faults,
+   * PRP-build failures and completed error statuses must not leak the page.
+   * A fail-stop clears CC.EN and waits for CSTS.RDY=0 before returning, which sets
    * dma_quiesced; only a controller that refused to stop keeps the page (a
    * bounded leak beats a device writing into recycled memory).  On success
    * the completion itself is the evidence that the transfer is over.
    */
-  if (rc == 0 || ctrl->dma_quiesced)
+  if (dma_safe || ctrl->dma_quiesced)
     pmm_free_pages(bounce_phys, pages);
   return rc;
 }
@@ -1852,6 +1882,8 @@ static void nvme_rmw_lock(struct nvme_namespace *ns) {
 
     struct thread *self = sched_get_current();
     wait_queue_entry_t wqe = {.thread = self, .next = NULL};
+    hal_irq_state_t irq_flags = hal_irq_save();
+    self->wakeup_ticks = lapic_timer_get_ticks() + 10;
     self->state = THREAD_BLOCKED;
     wait_queue_add(&ns->rmw_wq, &wqe);
     /* Re-check after linking: a release raced between the first test and the
@@ -1861,8 +1893,12 @@ static void nvme_rmw_lock(struct nvme_namespace *ns) {
     if (got)
       ns->rmw_held = true;
     spinlock_release(&ns->rmw_state);
+    if (got) {
+      self->state = THREAD_RUNNING;
+      self->wakeup_ticks = 0;
+    }
+    hal_irq_restore(irq_flags);
     if (!got) {
-      self->wakeup_ticks = lapic_timer_get_ticks() + 10;
       sched_yield();
       self->wakeup_ticks = 0;
     }
@@ -2077,7 +2113,11 @@ static int nvme_flush_once(struct nvme_controller *ctrl,
       nvme_free_cid(vq, (uint32_t)cid);
     return -2;
   }
-  return nvme_io_wait(ctrl, vq, (uint32_t)cid, generation);
+  uint64_t start_ms = lapic_timer_get_ms();
+  int rc = nvme_io_wait(ctrl, vq, (uint32_t)cid, generation);
+  storage_latency_record(&ns->blkdev.hw_flush,
+                          lapic_timer_get_ms() - start_ms, rc != 0);
+  return rc;
 }
 
 static int nvme_ns_flush(struct block_device *dev) {

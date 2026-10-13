@@ -24,6 +24,7 @@ struct mm_struct {
   uint64_t brk_base;       // Base of the heap
   uint64_t brk_current;    // Current end of the heap
   uint64_t mmap_next_addr; // Bump-pointer for anonymous mmap
+  bool compat32;          // Address space uses the Linux i386 ABI
   int ref_count;           // Reference count for sharing across threads
   uint16_t pcid;           // Hardware PCID tag (0 = kernel/unassigned)
   spinlock_t lock;         // Lock for thread-safe MM state updates
@@ -73,6 +74,8 @@ struct fd_path {
  * code can continue to use t->fds[n] while observing one common table.
  */
 struct fd_table {
+  /* Unpublished Linux file wrappers, allocated before fd_install(). */
+  struct vfs_node *reserved_nodes[MAX_FDS];
   vfs_node_t *fds[MAX_FDS];
   uint64_t fd_offsets[MAX_FDS];
   uint64_t fd_flags[MAX_FDS];
@@ -128,6 +131,7 @@ struct fd_table {
 #define SA_SIGINFO 0x00000004
 #define SA_NOCLDWAIT 0x00000002
 #define SA_ONSTACK 0x08000000
+#define SA_RESTART 0x10000000
 #define SA_RESTORER 0x04000000
 #define SA_NODEFER 0x40000000
 
@@ -180,17 +184,21 @@ struct thread {
   uint64_t wakeup_ticks;
   /* KPI timeout-sleep rendezvous; see linuxkpi_schedule_timeout_ms().
    * kpi_wake_pending is armed by linuxkpi_wake_thread() only while
-   * kpi_timeout_active is set, so wakes that target waitqueue/kthread-start
+   * kpi_timeout_active or kpi_wait_prepared is set, so a fence wake between
+   * set_current_state() and schedule_timeout() is retained. Unprepared
+   * wakes that target waitqueue/kthread-start
    * sleeps (which do not use schedule_timeout) cannot leak into a later
    * timeout and turn it into an early return. */
   bool kpi_wake_pending;
   bool kpi_timeout_active;
+  bool kpi_wait_prepared;
   /* KPI plain-block rendezvous (linuxkpi_thread_block()).  Armed by every
    * linuxkpi_wake_thread() call and consumed under the run-queue lock before
    * a thread publishes THREAD_BLOCKED, so a wake that races the condition
    * check of a wait_event()/schedule() loop is not dropped by sched_wakeup()
    * seeing THREAD_RUNNING.  A stale flag only causes one spurious wakeup. */
   bool kpi_block_pending;
+  void *kpi_wait_mutex; /* Opaque Linux mutex, for on-demand owner diagnostics. */
   struct thread *deadline_next; // Per-CPU ordered timeout queue link
   bool deadline_queued;
   struct fd_table *files;
@@ -256,6 +264,8 @@ struct thread {
   // Signal state
   struct k_sigaction signal_handlers[64];
   uint64_t pending_signals;
+  /* Subset queued to this task, rather than mirrored process-wide. */
+  uint64_t thread_directed_signals;
   uint32_t signal_sender_pid[64];
   int32_t signal_sender_code[64]; /* SI_USER or SI_TKILL for queued signals */
   int pdeath_signal;
@@ -274,6 +284,15 @@ struct thread {
   uint64_t last_report_addr;
   int last_report_sig;
   struct registers sigreturn_regs; // Safe kernel-side register store for IRETQ restoration
+
+  /* Per-thread Linux syscall user dispatch; never inherited by fork/clone. */
+  bool syscall_dispatch_enabled;
+  uint64_t syscall_dispatch_offset;
+  uint64_t syscall_dispatch_length;
+  uint64_t syscall_dispatch_selector;
+  bool syscall_dispatch_sigsys;
+  uint64_t syscall_dispatch_call_addr;
+  int32_t syscall_dispatch_number;
 
   // Alternate signal stack (sigaltstack)
   uint64_t ss_sp;   // Base of alternate signal stack
@@ -314,6 +333,8 @@ struct thread {
   uint32_t last_kernel_line;
   const char *last_kernel_func;
   int64_t last_error_code;
+  /* Set only by access() after resolving a regular file without execute bits. */
+  bool last_access_nonexec_probe;
   uint64_t last_syscall_num;
   uint64_t last_syscall_args[6];
   int64_t last_syscall_ret;
@@ -377,6 +398,27 @@ struct thread {
   uint64_t rseq_addr;
   uint32_t rseq_len;
   uint32_t rseq_sig;
+
+  /* User entry coordinates for bounded hang-report stack scans. Keep these
+   * at the end: syscall/context-switch assembly pins earlier field offsets. */
+  uint64_t last_syscall_user_rip;
+  uint64_t last_syscall_user_rsp;
+  uint64_t last_io_started_ms;
+
+  /* Real vfork rendezvous. vfork_child is the borrowing child's tid while
+   * this thread is blocked in sys_vfork (0 otherwise); vfork_done is set by
+   * the child on exec/_exit - or by the reaper if the child dies any other
+   * way - before the parent is woken. The parent loops on the flag so a
+   * signal-induced spurious wakeup cannot resume it while the child still
+   * borrows its address space. Appended at the end like the fields above. */
+  uint32_t vfork_child;
+  bool vfork_done;
+  /* TSC at completion, published with vfork_done under the runqueue lock. */
+  uint64_t vfork_release_tsc;
+
+  /* readdir callbacks return borrowed storage until the next call by this
+   * thread. A filesystem-global buffer races with other CPUs and preemption. */
+  struct dirent readdir_result;
 };
 
 /*
@@ -418,6 +460,12 @@ void sched_init(void);
 void sched_run_phase1_test(void);
 void sched_wakeup(struct thread *t);
 void sched_yield(void);
+
+/* Releases a thread blocked in sys_vfork once its borrowing child is gone
+ * (exec success, _exit, or kill/reap backstop). Sets the parent's completion
+ * flag before waking so a waiter that races the release observes it. Safe to
+ * call for any thread: non-vfork children are ignored. */
+void vfork_release_parent(struct thread *child);
 
 struct cpu_info;
 struct thread *sched_create_kernel_thread(void (*entry_point)(void),

@@ -167,8 +167,10 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
                            uint64_t mask, uint64_t statxbuf_ptr, uint64_t a5) {
     (void)a5; (void)mask;
     const char *path = (const char *)path_ptr;
-    struct statx *stx = (struct statx *)statxbuf_ptr;
-    if (!stx || !is_user_ptr((uint64_t)stx)) return (uint64_t)-14;
+    if (!path_ptr) return (uint64_t)-14; /* NULL pathname: EFAULT like Linux */
+    if (!statxbuf_ptr ||
+        !vmm_is_user_addr_range_valid(statxbuf_ptr, sizeof(struct statx)))
+        return (uint64_t)-14;
 
     struct thread *t = sched_get_current();
     if (!t) return (uint64_t)-1;
@@ -176,21 +178,53 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
     vfs_node_t *node = NULL;
     bool node_owned = false;
     vfs_node_t *base_owned = NULL;
-    if (path && path[0] != '\0') {
-        vfs_node_t *base_dir = fs_root;
-        if (path[0] != '/') {
-            if ((int)dirfd == AT_FDCWD) {
-                base_dir = vfs_resolve_path_at(fs_root, t->cwd_path);
-                if (!base_dir) base_dir = fs_root;
-                else base_owned = base_dir;
-            } else {
-                if ((int)dirfd < 0 || (int)dirfd >= MAX_FDS || !t->fds[dirfd])
-                    return (uint64_t)-9;
-                base_dir = t->fds[dirfd];
-            }
+    /* Fault-safe empty check: a user string running into an unmapped page
+     * still yields its valid prefix via strncpy_from_user. */
+    char kpath_head[1];
+    if (strncpy_from_user(kpath_head, path, 1) < 0)
+        return (uint64_t)-14;
+    if (kpath_head[0] != '\0') {
+        /* Copy the full pathname into a kernel buffer so the VFS walk below
+         * never dereferences user memory directly. */
+        char kpath[512];
+        long klen = strncpy_from_user(kpath, path, (long)sizeof(kpath));
+        if (klen < 0)
+            return (uint64_t)-14;
+        if ((size_t)klen >= sizeof(kpath))
+            return (uint64_t)-36; /* ENAMETOOLONG */
+        kpath[sizeof(kpath) - 1] = '\0';
+        const char *kpathp = kpath;
+        /* Dynamic /dev nodes (ptmx, pts/N, dri/card0) are not in the VFS
+         * tree: mirror newfstatat's fb_lookup_device fast path so statx on
+         * /dev/pts/N agrees with fstatat instead of ENOENT. */
+        if (strncmp(kpath, "/dev/", 5) == 0) {
+            node = fb_lookup_device(kpath + 5);
+            node_owned = false; /* fb node: no extra ref to drop */
         }
-        node = vfs_resolve_path_at(base_dir, path);
-        node_owned = node != NULL;
+        if (!node) {
+            vfs_node_t *base_dir = fs_root;
+            if (kpathp[0] != '/') {
+                if ((int)dirfd == AT_FDCWD) {
+                    base_dir = vfs_resolve_path_at(fs_root, t->cwd_path);
+                    if (!base_dir) base_dir = fs_root;
+                    else base_owned = base_dir;
+                } else {
+                    if ((int)dirfd < 0 || (int)dirfd >= MAX_FDS || !t->fds[dirfd]) {
+                        if (base_owned) vfs_close(base_owned);
+                        return (uint64_t)-9;
+                    }
+                    base_dir = t->fds[dirfd];
+                }
+            }
+            if ((flags & AT_SYMLINK_NOFOLLOW) && kpathp[0] != '/') {
+                node = vfs_resolve_symlink_node(base_dir, kpathp);
+            } else if ((flags & AT_SYMLINK_NOFOLLOW) && kpathp[0] == '/') {
+                node = vfs_resolve_symlink_node(fs_root, kpathp);
+            } else {
+                node = vfs_resolve_path_at(base_dir, kpathp);
+            }
+            node_owned = node != NULL;
+        }
     } else {
         if (flags & AT_EMPTY_PATH) {
             if ((int)dirfd == AT_FDCWD) {
@@ -203,7 +237,10 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
                 node = t->fds[dirfd];
             }
         } else {
-            return (uint64_t)-14;
+            /* Empty string without AT_EMPTY_PATH: ENOENT like Linux, not
+             * EFAULT (which is reserved for a NULL pointer). */
+            if (base_owned) vfs_close(base_owned);
+            return (uint64_t)-2;
         }
     }
     if (!node) {
@@ -211,12 +248,22 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
         return (uint64_t)-2;
     }
 
-    memset(stx, 0, sizeof(struct statx));
-    stx->stx_mask    = STATX_BASIC_STATS;
-    stx->stx_blksize = 4096;
-    stx->stx_nlink   = 1;
-    stx->stx_uid     = node->uid;
-    stx->stx_gid     = node->gid;
+    /* Build the result in kernel memory, then copy it out: direct stores to
+     * the user buffer fault without extable cover on some paths. */
+    struct statx kstx;
+    memset(&kstx, 0, sizeof(kstx));
+    kstx.stx_mask    = STATX_BASIC_STATS;
+    /* libudev's path canonicalization requires mount identity. IDs are
+     * never reused, so the same VFS identity also satisfies UNIQUE. */
+    kstx.stx_mnt_id = node->mount_id ? node->mount_id : 1;
+    if (mask & STATX_MNT_ID_UNIQUE)
+        kstx.stx_mask |= STATX_MNT_ID_UNIQUE;
+    else
+        kstx.stx_mask |= STATX_MNT_ID;
+    kstx.stx_blksize = 4096;
+    kstx.stx_nlink   = 1;
+    kstx.stx_uid     = node->uid;
+    kstx.stx_gid     = node->gid;
 
     uint32_t mode = node->mask & 07777;
     switch (node->flags & FS_TYPE_MASK) {
@@ -227,21 +274,25 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
     case FS_SYMLINK:   mode |= 0120000; break;
     default:           mode |= 0100000; break;
     }
-    stx->stx_mode   = (uint16_t)mode;
-    stx->stx_ino    = node->inode;
-    stx->stx_size   = node->length;
-    stx->stx_blocks = (node->length + 511) / 512;
-    stx->stx_atime.tv_sec = (int64_t)node->atime;
-    stx->stx_mtime.tv_sec = (int64_t)node->mtime;
-    stx->stx_ctime.tv_sec = (int64_t)node->ctime;
+    kstx.stx_mode   = (uint16_t)mode;
+    kstx.stx_ino    = node->inode;
+    kstx.stx_size   = node->length;
+    kstx.stx_blocks = (node->length + 511) / 512;
+    kstx.stx_atime.tv_sec = (int64_t)node->atime;
+    kstx.stx_mtime.tv_sec = (int64_t)node->mtime;
+    kstx.stx_ctime.tv_sec = (int64_t)node->ctime;
     /* Device numbers for Qt's mount matching (see fill_kstat): block devices
      * report their own number as rdev, files on block filesystems report
      * their filesystem's number as dev. */
-    if ((node->flags & FS_TYPE_MASK) == FS_BLOCKDEV && node->device) {
+    if ((node->flags & FS_TYPE_MASK) == FS_CHARDEV) {
+        kstx.stx_rdev_major = (node->inode >> 8) & 0xfffU;
+        kstx.stx_rdev_minor = (node->inode & 0xffU) |
+                             ((node->inode >> 12) & 0xfff00U);
+    } else if ((node->flags & FS_TYPE_MASK) == FS_BLOCKDEV && node->device) {
         struct block_device *bd = (struct block_device *)node->device;
         if (bd && (bd->linux_major || bd->linux_minor)) {
-            stx->stx_rdev_major = bd->linux_major;
-            stx->stx_rdev_minor = bd->linux_minor;
+            kstx.stx_rdev_major = bd->linux_major;
+            kstx.stx_rdev_minor = bd->linux_minor;
         }
     } else if (((node->flags & FS_TYPE_MASK) == FS_FILE ||
                 (node->flags & FS_TYPE_MASK) == FS_DIRECTORY) &&
@@ -251,12 +302,14 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
                 node->statfs == fat32_statfs_impl)) {
         struct block_device *bd = *(struct block_device **)node->device;
         if (bd && (bd->linux_major || bd->linux_minor)) {
-            stx->stx_dev_major = bd->linux_major;
-            stx->stx_dev_minor = bd->linux_minor;
+            kstx.stx_dev_major = bd->linux_major;
+            kstx.stx_dev_minor = bd->linux_minor;
         }
     }
     if (node_owned) vfs_close(node);
     if (base_owned) vfs_close(base_owned);
+    if (copy_to_user((void *)statxbuf_ptr, &kstx, sizeof(kstx)) != 0)
+        return (uint64_t)-14;
     return 0;
 }
 
@@ -472,21 +525,39 @@ static int64_t statfs_handle_missing(vfs_node_t *node, struct statfs_buf *buf) {
 static uint64_t sys_statfs(uint64_t path_ptr, uint64_t buf_ptr, uint64_t a3,
                             uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    if (!path_ptr || !buf_ptr ||
-        !is_user_ptr(path_ptr) || !is_user_ptr(buf_ptr))
+    if (!path_ptr || !buf_ptr || !is_user_ptr(path_ptr))
+        return (uint64_t)-14;
+    if (!vmm_is_user_addr_range_valid(buf_ptr, sizeof(struct statfs_buf)))
         return (uint64_t)-14;
 
-    struct statfs_buf *buf = (struct statfs_buf *)buf_ptr;
-    vfs_node_t *node = vfs_resolve_path((const char *)path_ptr);
+    /* Copy the pathname into kernel memory first: the VFS walk below
+     * (strlen/strstr per component) must never dereference user memory
+     * directly, and the result must be built in a kernel buffer and
+     * copied out (see sys_statx) — direct stores to the user buffer
+     * fault without extable cover on some paths, which is exactly how
+     * Qt's QStorageInfo (statvfs → statfs) ended up with Total 0 B. */
+    char kpath[512];
+    long klen = strncpy_from_user(kpath, (const char *)path_ptr,
+                                  (long)sizeof(kpath));
+    if (klen < 0)
+        return (uint64_t)-14;
+    if ((size_t)klen >= sizeof(kpath))
+        return (uint64_t)-36; /* ENAMETOOLONG */
+    kpath[sizeof(kpath) - 1] = '\0';
+
+    vfs_node_t *node = vfs_resolve_path(kpath);
     if (!node) return (uint64_t)-2;
 
-    int ret = vfs_statfs(node, buf);
-    if (ret != 0) {
-        int64_t missing = statfs_handle_missing(node, buf);
-        vfs_close(node);
-        return (uint64_t)missing;
-    }
+    struct statfs_buf kbuf;
+    memset(&kbuf, 0, sizeof(kbuf));
+    int ret = vfs_statfs(node, &kbuf);
+    if (ret != 0)
+        ret = (int)statfs_handle_missing(node, &kbuf);
     vfs_close(node);
+    if (ret != 0)
+        return (uint64_t)ret;
+    if (copy_to_user((void *)buf_ptr, &kbuf, sizeof(kbuf)) != 0)
+        return (uint64_t)-14;
     return 0;
 }
 
@@ -495,15 +566,20 @@ static uint64_t sys_fstatfs(uint64_t fd, uint64_t buf_ptr, uint64_t a3,
     (void)a3; (void)a4; (void)a5; (void)a6;
     struct thread *t = sched_get_current();
     if (!t || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
-    if (!buf_ptr || !is_user_ptr(buf_ptr))  return (uint64_t)-14;
+    if (!buf_ptr ||
+        !vmm_is_user_addr_range_valid(buf_ptr, sizeof(struct statfs_buf)))
+        return (uint64_t)-14;
 
-    struct statfs_buf *buf  = (struct statfs_buf *)buf_ptr;
     vfs_node_t        *node = t->fds[fd];
-    int ret = vfs_statfs(node, buf);
-    if (ret != 0) {
-        int64_t missing = statfs_handle_missing(node, buf);
-        return (uint64_t)missing;
-    }
+    struct statfs_buf kbuf;
+    memset(&kbuf, 0, sizeof(kbuf));
+    int ret = vfs_statfs(node, &kbuf);
+    if (ret != 0)
+        ret = (int)statfs_handle_missing(node, &kbuf);
+    if (ret != 0)
+        return (uint64_t)ret;
+    if (copy_to_user((void *)buf_ptr, &kbuf, sizeof(kbuf)) != 0)
+        return (uint64_t)-14;
     return 0;
 }
 

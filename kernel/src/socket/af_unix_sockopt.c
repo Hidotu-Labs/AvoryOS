@@ -193,28 +193,26 @@ int unix_getsockopt_impl(socket_t *sock, int level, int optname,
   }
 
   case 59: { // SO_PEERGROUPS
-    uint32_t peer_pid = 0;
+    uint32_t groups[32], count;
     spinlock_acquire(&sock->lock);
     if (usk->peer) {
-      peer_pid = usk->peer->owner_pid;
+      unix_cache_peer_groups(usk, usk->peer);
     } else if (usk->was_connected && usk->peer_cred_valid) {
-      peer_pid = (uint32_t)usk->peer_cred_pid;
+      // Use the cached connection credentials after disconnect.
     } else {
       spinlock_release(&sock->lock);
       return -107; // ENOTCONN
     }
+    count = usk->peer_group_count;
+    memcpy(groups, usk->peer_groups, count * sizeof(uint32_t));
     spinlock_release(&sock->lock);
-
-    struct thread *peer_thread = sched_get_thread_by_tid(peer_pid);
-    uint32_t count = peer_thread ? peer_thread->supplementary_group_count : 0;
     int needed_bytes = (int)(count * sizeof(uint32_t));
     if (*optlen < needed_bytes) {
       *optlen = needed_bytes;
       return -34; // ERANGE
     }
-    if (count > 0 && peer_thread) {
-      memcpy(optval, peer_thread->supplementary_groups, needed_bytes);
-    }
+    if (count > 0 && copy_to_user(optval, groups, needed_bytes) != 0)
+      return -14;
     *optlen = needed_bytes;
     return 0;
   }

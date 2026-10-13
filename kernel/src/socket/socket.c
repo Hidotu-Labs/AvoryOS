@@ -100,31 +100,50 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
     return -14;
 
   struct avory_ifreq64 ifr;
-  memcpy(&ifr, (const void *)arg, sizeof(ifr));
+  if (copy_from_user(&ifr, (const void *)arg, sizeof(ifr)) != 0)
+    return -14;
   struct net_device *dev = net_device_default();
-  if (!dev || !dev->registered || !socket_ifreq_name_is(ifr.name, dev->name))
+  bool loopback = socket_ifreq_name_is(ifr.name, "lo");
+
+  if (request == 0x8910) { /* SIOCGIFNAME: input is an index, not a name. */
+    int32_t ifindex;
+    memcpy(&ifindex, &ifr.family, sizeof(ifindex));
+    const char *name;
+    if (ifindex == 1)
+      name = "lo";
+    else if (ifindex == 2 && dev && dev->registered)
+      name = dev->name;
+    else
+      return -19; /* ENODEV */
+    memset(ifr.name, 0, sizeof(ifr.name));
+    strncpy(ifr.name, name, sizeof(ifr.name) - 1);
+    return copy_to_user((void *)arg, &ifr, sizeof(ifr)) ? -14 : 0;
+  }
+
+  if (!loopback && (!dev || !dev->registered ||
+                    !socket_ifreq_name_is(ifr.name, dev->name)))
     return -19; /* ENODEV */
 
   if (request == 0x8915) { /* SIOCGIFADDR */
     const struct ipv4_config *cfg = ipv4_get_config();
-    if (!cfg || !cfg->address)
+    uint32_t address = loopback ? 0x7f000001U : (cfg ? cfg->address : 0);
+    if (!address)
       return -99; /* EADDRNOTAVAIL */
     memset(&ifr.family, 0, sizeof(ifr) - 16);
     ifr.family = 2; /* AF_INET */
-    ifr.address_data[2] = (uint8_t)(cfg->address >> 24);
-    ifr.address_data[3] = (uint8_t)(cfg->address >> 16);
-    ifr.address_data[4] = (uint8_t)(cfg->address >> 8);
-    ifr.address_data[5] = (uint8_t)cfg->address;
+    ifr.address_data[2] = (uint8_t)(address >> 24);
+    ifr.address_data[3] = (uint8_t)(address >> 16);
+    ifr.address_data[4] = (uint8_t)(address >> 8);
+    ifr.address_data[5] = (uint8_t)address;
   } else if (request == 0x8933) { /* SIOCGIFINDEX */
-    uint32_t ifindex = 2; /* route netlink reports the default device as 2 */
+    uint32_t ifindex = loopback ? 1 : 2; /* Match route netlink. */
     memset(&ifr.family, 0, sizeof(ifr) - 16);
     memcpy(&ifr.family, &ifindex, sizeof(ifindex));
   } else {
     return -25;
   }
 
-  memcpy((void *)arg, &ifr, sizeof(ifr));
-  return 0;
+  return copy_to_user((void *)arg, &ifr, sizeof(ifr)) ? -14 : 0;
 }
 
 // Socket Family Registry
@@ -594,10 +613,12 @@ int socket_create_pair(int domain, int type, int protocol, socket_t *sv[2]) {
     usk0->peer_cred_uid = usk1->owner_uid;
     usk0->peer_cred_gid = usk1->owner_gid;
     usk0->peer_cred_valid = true;
+    unix_cache_peer_groups(usk0, usk1);
     usk1->peer_cred_pid = usk0->owner_pid;
     usk1->peer_cred_uid = usk0->owner_uid;
     usk1->peer_cred_gid = usk0->owner_gid;
     usk1->peer_cred_valid = true;
+    unix_cache_peer_groups(usk1, usk0);
   }
 
   sv[0] = sock0;
@@ -620,6 +641,7 @@ int socket_alloc_fd(socket_t *sock) {
   // Create VFS node for socket
   vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
   if (!node) {
+    fd_release_reserved(t, fd);
     return -12; // ENOMEM
   }
 
@@ -658,47 +680,59 @@ int socket_alloc_fd(socket_t *sock) {
   return fd;
 }
 
+/* Return an owned socket reference. Descriptor reservation is not a file,
+ * and closing/replacing a descriptor must not free a socket during lookup. */
 socket_t *socket_from_fd(int fd) {
   struct thread *t = sched_get_current();
-  if (!t)
+  if (!t || !t->files || fd < 0 || fd >= MAX_FDS)
     return NULL;
 
-  if (fd < 0 || fd >= MAX_FDS)
-    return NULL;
-
+  spinlock_acquire(&t->files->lock);
   vfs_node_t *node = t->fds[fd];
-  if (!node)
-    return NULL;
+  socket_t *sock = NULL;
+  if (fd_is_valid_node(node) &&
+      (node->flags & FS_TYPE_MASK) == FS_SOCKET) {
+    socket_t *candidate = (socket_t *)node->device;
+    if (socket_try_get(candidate)) {
+      vfs_node_ref(node);
+      sock = candidate;
+    }
+  }
+  spinlock_release(&t->files->lock);
+  return sock;
+}
 
-  if ((node->flags & FS_TYPE_MASK) != FS_SOCKET)
-    return NULL;
-
-  return (socket_t *)node->device;
+void socket_fd_put(socket_t *sock) {
+  if (!sock)
+    return;
+  /* The node protects poll/notification hooks until this syscall finishes;
+   * the socket reference keeps sock alive while the final node close runs. */
+  vfs_close(sock->node);
+  socket_put(sock);
 }
 
 int socket_close_fd(int fd) {
   struct thread *t = sched_get_current();
-  if (!t)
-    return -9; // EBADF
-
-  if (fd < 0 || fd >= MAX_FDS)
-    return -9; // EBADF
-
+  if (!t || !t->files || fd < 0 || fd >= MAX_FDS)
+    return -9;
+  spinlock_acquire(&t->files->lock);
   vfs_node_t *node = t->fds[fd];
-  if (!node)
-    return -9; // EBADF
-
-  if ((node->flags & FS_TYPE_MASK) != FS_SOCKET)
-    return -22; // EINVAL
-
-  // Clear FD
+  if (!fd_is_valid_node(node)) {
+    spinlock_release(&t->files->lock);
+    return -9;
+  }
+  if ((node->flags & FS_TYPE_MASK) != FS_SOCKET) {
+    spinlock_release(&t->files->lock);
+    return -22;
+  }
   t->fds[fd] = NULL;
   t->fd_offsets[fd] = 0;
-
-  // vfs_close drops the fd-table reference (refcount 1→0), which triggers
-  // socket_vfs_close → socket_put → socket_destroy when refcount hits 0.
+  t->fd_flags[fd] = 0;
+  fd_path_clear(t, fd);
+  if ((uint32_t)fd < t->files->next_fd)
+    t->files->next_fd = (uint32_t)fd;
+  spinlock_release(&t->files->lock);
   vfs_close(node);
-
   return 0;
 }
 
@@ -858,7 +892,7 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     socket_put(sock);
     return ret;
   }
-  if (request == 0x8915 || request == 0x8933) {
+  if (request == 0x8910 || request == 0x8915 || request == 0x8933) {
     int ret = socket_ioctl_ifreq(request, arg);
     socket_put(sock);
     return ret;

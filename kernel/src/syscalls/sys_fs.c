@@ -29,6 +29,14 @@
 
 vfs_node_t *vfs_resolve_symlink_node(vfs_node_t *base, const char *path) {
     if (!path || !path[0]) return NULL;
+    /* Dot components denote directories, not literal ramfs entries. */
+    size_t path_len = strlen(path);
+    const char *final = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/') final = p + 1;
+    if (!strcmp(final, ".") || !strcmp(final, "..") ||
+        (path_len && path[path_len - 1] == '/'))
+        return vfs_resolve_path_at(base ? base : fs_root, path);
 
     const char *last_slash = NULL;
     for (const char *p = path; *p; p++)
@@ -451,6 +459,14 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
     vfs_close(victim);
     int result = (flags & AT_REMOVEDIR) ? vfs_rmdir(parent, file_name)
                                         : vfs_unlink(parent, file_name);
+    if (result == 0) {
+        /* Release the exact (base_dir, path) fast-path entry as well. The VFS
+         * layer already dropped (parent, file_name); this covers the aliased
+         * key used when the path was resolved (absolute "/tmp/x" via fs_root
+         * or multi-component "a/b" via base_dir), so the deleted node+pages
+         * are freed immediately instead of lingering until eviction. */
+        vfs_path_cache_drop(base_dir, path);
+    }
     if (parent_owned) vfs_close(parent);
     if (base_owned) vfs_close(base_owned);
     TSC_END(unlink_op);
@@ -483,20 +499,21 @@ static uint64_t sys_unlink(uint64_t pathname_ptr, uint64_t a1, uint64_t a2,
         return (uint64_t)-13;
     }
 
-    struct thread *t = sched_get_current();
-    if (t) {
-        for (int i = 0; i < MAX_FDS; i++) {
-            if (t->fds[i] == target) {
-                t->fds[i] = NULL;
-                t->fd_offsets[i] = 0;
-            }
-        }
-    }
     unix_unbind_by_path(path);
-    /* The finddir reference must be dropped before the backend unlink: ramfs
-     * and tmpfs kfree() the node outright, not via the refcount. */
+    /* Unlink removes a name, never an open descriptor. Backends retain the
+     * node until its descriptor/mapping references have all been released. */
     vfs_close(target);
     int rc = vfs_unlink(parent, name) == 0 ? 0 : (uint64_t)-1;
+    if (rc == 0) {
+        /* Drop the full-path fast-path entry too (absolute "/tmp/x" via
+         * fs_root or relative via cwd). The VFS layer already dropped
+         * (parent, name). */
+        struct thread *dt = sched_get_current();
+        vfs_node_t *drop_dir = fs_root;
+        if (path[0] != '/' && dt && dt->cwd_node)
+            drop_dir = dt->cwd_node;
+        vfs_path_cache_drop(drop_dir, path);
+    }
     vfs_close(parent);
     return rc;
 }
@@ -529,6 +546,13 @@ static uint64_t sys_rmdir(uint64_t pathname_ptr, uint64_t a1, uint64_t a2,
     /* Drop the check reference first: the backend frees the node on rmdir. */
     vfs_close(target);
     int rc = vfs_rmdir(parent, name) == 0 ? 0 : (uint64_t)-1;
+    if (rc == 0) {
+        struct thread *dt = sched_get_current();
+        vfs_node_t *drop_dir = fs_root;
+        if (path[0] != '/' && dt && dt->cwd_node)
+            drop_dir = dt->cwd_node;
+        vfs_path_cache_drop(drop_dir, path);
+    }
     vfs_close(parent);
     return rc;
 }
@@ -576,16 +600,33 @@ static uint64_t sys_rename(uint64_t oldpath_ptr, uint64_t newpath_ptr,
      * mounts allocate from the same counter). */
     if (old_parent == new_parent) {
         int rc = vfs_rename(old_parent, old_name, new_name);
+        if (rc == 0) {
+            struct thread *dt = sched_get_current();
+            vfs_node_t *drop_old = fs_root, *drop_new = fs_root;
+            if (oldpath[0] != '/' && dt && dt->cwd_node) drop_old = dt->cwd_node;
+            if (newpath[0] != '/' && dt && dt->cwd_node) drop_new = dt->cwd_node;
+            vfs_path_cache_drop(drop_old, oldpath);
+            if (drop_new != drop_old || strcmp(oldpath, newpath) != 0)
+                vfs_path_cache_drop(drop_new, newpath);
+        }
         vfs_close(old_node);
         vfs_close(old_parent);
         vfs_close(new_parent);
         return rc < 0 ? (uint64_t)rc : 0;
     }
-    /* Different directories: try a same-filesystem move (tmpfs backs /tmp,
-     * where Qt's QLocalServer renames its greeter socket into place).
-     * Anything else keeps the historical EXDEV. */
+    /* Different directories: the VFS dispatches same-filesystem moves to
+     * tmpfs or the ext2/ext4 regular-file backend. */
     {
         int rc = vfs_rename_cross(old_parent, old_name, new_parent, new_name);
+        if (rc == 0) {
+            struct thread *dt = sched_get_current();
+            vfs_node_t *drop_old = fs_root, *drop_new = fs_root;
+            if (oldpath[0] != '/' && dt && dt->cwd_node) drop_old = dt->cwd_node;
+            if (newpath[0] != '/' && dt && dt->cwd_node) drop_new = dt->cwd_node;
+            vfs_path_cache_drop(drop_old, oldpath);
+            if (drop_new != drop_old || strcmp(oldpath, newpath) != 0)
+                vfs_path_cache_drop(drop_new, newpath);
+        }
         vfs_close(old_node);
         vfs_close(old_parent);
         vfs_close(new_parent);
@@ -704,6 +745,11 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
      * numbers alone cannot prove two resolutions share a filesystem). */
     if (old_parent == new_parent) {
         int rc = vfs_rename(old_parent, old_bn, new_bn);
+        if (rc == 0) {
+            vfs_path_cache_drop(old_base, oldname);
+            if (new_base != old_base || strcmp(oldname, newname) != 0)
+                vfs_path_cache_drop(new_base, newname);
+        }
         vfs_close(old_node);
         if (old_parent_owned) vfs_close(old_parent);
         if (new_parent_owned) vfs_close(new_parent);
@@ -715,6 +761,11 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
      * supports it, EXDEV otherwise (see sys_rename). */
     {
         int rc = vfs_rename_cross(old_parent, old_bn, new_parent, new_bn);
+        if (rc == 0) {
+            vfs_path_cache_drop(old_base, oldname);
+            if (new_base != old_base || strcmp(oldname, newname) != 0)
+                vfs_path_cache_drop(new_base, newname);
+        }
         vfs_close(old_node);
         if (old_parent_owned) vfs_close(old_parent);
         if (new_parent_owned) vfs_close(new_parent);
@@ -907,6 +958,13 @@ static uint64_t sys_readlinkat(uint64_t dirfd, uint64_t pathname_ptr,
     if (!t || (int)dirfd < 0 || (int)dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd]))
         return (uint64_t)-9; // EBADF
     vfs_node_t *base = t->fds[dirfd];
+    /* Linux readlinkat(fd, "", ...) reads an O_PATH|O_NOFOLLOW link.
+     * libudev uses this while canonicalizing /sys/class aliases. */
+    if (path[0] == '\0') {
+        if ((base->flags & FS_TYPE_MASK) != FS_SYMLINK)
+            return (uint64_t)-22;
+        return (uint64_t)vfs_readlink(base, buf, (uint32_t)bufsiz);
+    }
     if ((base->flags & FS_TYPE_MASK) != FS_DIRECTORY)
         return (uint64_t)-20; // ENOTDIR
     return do_sys_readlink_at(base, path, buf, bufsiz);
@@ -1404,6 +1462,8 @@ static uint64_t sys_fchownat(uint64_t dirfd, uint64_t pathname_ptr,
 
 static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
                                int flags) {
+    struct thread *t = sched_get_current();
+    if (t) t->last_access_nonexec_probe = false;
     // faccessat2 accepts only these flag bits (access/faccessat pass 0);
     // anything else is EINVAL, matching Linux.
     if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH))
@@ -1414,7 +1474,6 @@ static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
     // IDs; for setuid processes this is a known minor deviation (behavior
     // matches EACCESS). Non-setuid processes are unaffected (ids equal).
 
-    struct thread *t = sched_get_current();
     vfs_node_t *node  = NULL;
     bool node_owned = false;
     vfs_node_t *base_owned = NULL;
@@ -1476,6 +1535,13 @@ static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
         return (uint64_t)-22;
     }
     if (mode && !vfs_access(node, (uint32_t)mode)) {
+        /* A negative executable-file query is normal Qt metadata collection.
+         * Tag only a resolved regular file with no execute bits, never a
+         * directory search denial or a read/write failure. Diagnostics must
+         * not resolve paths again to infer this after releasing the node. */
+        if (t && mode == 1 && (node->flags & FS_TYPE_MASK) == FS_FILE &&
+            !(node->mask & 0111))
+            t->last_access_nonexec_probe = true;
         if (node_owned) vfs_close(node);
         if (base_owned) vfs_close(base_owned);
         return (uint64_t)-13;
@@ -1525,8 +1591,6 @@ static uint64_t sys_fchdir(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4,
         if (t->cwd_node) vfs_close(t->cwd_node);
         t->cwd_node = t->fds[fd];
         vfs_open(t->cwd_node);
-        klog_puts("[FCHDIR] Changed cwd to: "); klog_puts(t->cwd_path);
-        klog_puts(" via fd="); klog_uint64(fd); klog_puts("\n");
         return 0;
     }
     return (uint64_t)-9;

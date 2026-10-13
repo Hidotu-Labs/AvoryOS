@@ -24,6 +24,8 @@
 #define SIG_BLOCK 0
 #define SIG_UNBLOCK 1
 #define X86_64_RED_ZONE_SIZE 128
+#define UC_SIGCONTEXT_SS 0x2
+#define UC_STRICT_RESTORE_SS 0x4
 
 // Forward declarations
 static bool on_sig_stack(struct thread *t, uint64_t sp);
@@ -42,6 +44,11 @@ struct kernel_siginfo {
     struct {
       uint64_t si_addr;
     } _sigfault;
+    struct {
+      uint64_t si_call_addr;
+      int32_t si_syscall;
+      uint32_t si_arch;
+    } _sigsys;
     uint8_t data[112];
   };
 } __attribute__((packed));
@@ -77,6 +84,10 @@ struct sigframe {
 
 _Static_assert(sizeof(struct kernel_siginfo) == 128,
                "x86_64 siginfo ABI size");
+_Static_assert(offsetof(struct kernel_siginfo, _sigsys.si_call_addr) == 16 &&
+               offsetof(struct kernel_siginfo, _sigsys.si_syscall) == 24 &&
+               offsetof(struct kernel_siginfo, _sigsys.si_arch) == 28,
+               "x86_64 SIGSYS siginfo ABI offsets");
 _Static_assert(offsetof(struct sigframe, ucontext) == 312,
                "x86_64 signal frame ucontext offset");
 
@@ -107,7 +118,11 @@ static void restore_signal_context(struct registers *regs,
   regs->cs = ((cs & 3) == 3 && cs != 0) ? cs : 0x2B;
   regs->err_code = g[19];
   regs->int_no = g[20];
-  regs->ss = 0x23;
+  uint16_t ss = (uint16_t)(g[18] >> 48);
+  /* Legacy contexts can leave SS unset. Strict contexts must retain an
+   * invalid selector so sigreturn rejects it before attempting IRETQ. */
+  regs->ss = (ss == 0x23 || (uc->uc_flags & UC_STRICT_RESTORE_SS) ||
+              regs->cs != 0x2B) ? ss : 0x23;
 }
 
 static void fill_signal_context(struct sigframe *frame, int sig,
@@ -149,6 +164,12 @@ static void fill_signal_context(struct sigframe *frame, int sig,
     uint64_t fault_address = frame->regs.rip;
     info->si_code = 1;
     info->_sigfault.si_addr = fault_address;
+  } else if (sig == SIGSYS && current->syscall_dispatch_sigsys) {
+    info->si_code = 2; /* SYS_USER_DISPATCH */
+    info->_sigsys.si_call_addr = current->syscall_dispatch_call_addr;
+    info->_sigsys.si_syscall = current->syscall_dispatch_number;
+    info->_sigsys.si_arch = 0xC000003E; /* AUDIT_ARCH_X86_64 */
+    current->syscall_dispatch_sigsys = false;
   }
 
   uc->uc_stack.ss_sp = current->ss_sp;
@@ -174,7 +195,15 @@ static void fill_signal_context(struct sigframe *frame, int sig,
   g[15] = frame->regs.rsp;
   g[16] = frame->regs.rip;
   g[17] = frame->regs.rflags;
-  g[18] = frame->regs.cs;
+  /* Linux REG_CSGSFS packs four 16-bit selectors: CS, GS, FS, SS.
+   * Wine tests saved SS to distinguish native faults from 16-bit faults. */
+  uint16_t fs, gs;
+  __asm__ volatile("movw %%fs, %0; movw %%gs, %1" : "=r"(fs), "=r"(gs));
+  g[18] = (uint16_t)frame->regs.cs | ((uint64_t)gs << 16) |
+          ((uint64_t)fs << 32) | ((uint64_t)(uint16_t)frame->regs.ss << 48);
+  uc->uc_flags = UC_SIGCONTEXT_SS;
+  if (frame->regs.cs == 0x2B)
+    uc->uc_flags |= UC_STRICT_RESTORE_SS;
   g[19] = frame->regs.err_code;
   g[20] = frame->regs.int_no;
   uint64_t saved_mask = current->has_saved_signal_mask ? current->saved_signal_mask : current->signal_mask;
@@ -262,6 +291,7 @@ static int sigtimedwait_dequeue(struct thread *t, uint64_t mask,
       continue;
     int sig = i + 1;
     t->pending_signals &= ~(1ULL << i);
+    t->thread_directed_signals &= ~(1ULL << i);
     if (info) {
       memset(info, 0, sizeof(*info));
       info->si_signo = sig;
@@ -515,7 +545,7 @@ static uint64_t sys_rt_sigreturn(struct syscall_regs *sregs) {
       ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
   current->fault_regs_valid = false;
   current->fault_addr = 0;
- if ((current->sigreturn_regs.cs & 3) != 3 || (current->sigreturn_regs.ss & 3) != 3 ||
+ if ((current->sigreturn_regs.cs & 3) != 3 || current->sigreturn_regs.ss != 0x23 ||
       current->sigreturn_regs.rip >= 0x0000800000000000ULL ||
       current->sigreturn_regs.rsp >= 0x0000800000000000ULL) {
     klog_puts("[SIGNAL] sigreturn: invalid user context rip=");
@@ -563,7 +593,25 @@ static bool signal_default_is_ignore(int sig) {
   return sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH;
 }
 
-void signal_deliver(struct registers *regs) {
+/* tid_lock held. Process signals are mirrored on siblings and consumed once;
+ * tgkill/tkill signals belong to each recipient independently. In particular,
+ * glibc's setxid barrier sends SIGSETXID to every worker and waits for all of
+ * them: consuming one worker's signal must not discard the others' copies. */
+static void signal_dequeue_locked(struct thread *current, uint64_t bit) {
+  if (current->thread_directed_signals & bit) {
+    current->pending_signals &= ~bit;
+    current->thread_directed_signals &= ~bit;
+    return;
+  }
+  extern struct thread *global_thread_list;
+  for (struct thread *t = global_thread_list; t; t = t->global_next) {
+    if (t->tgid == current->tgid && !(t->thread_directed_signals & bit))
+      t->pending_signals &= ~bit;
+  }
+}
+
+static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number,
+                                  uint64_t syscall_return_ip) {
   struct thread *current = sched_get_current();
   if (!current)
     return;
@@ -574,11 +622,13 @@ void signal_deliver(struct registers *regs) {
     return;
 
   uint64_t pending = current->pending_signals & ~current->signal_mask;
-  if (!pending)
+  if (!pending) {
+    syscall_restart_return(regs, syscall_number, syscall_return_ip, false, 0);
     return;
+  }
 
-  int sig = 0;
-  for (int i = 0; i < 64; i++) {
+  int sig = current->syscall_dispatch_sigsys ? SIGSYS : 0;
+  for (int i = 0; !sig && i < 64; i++) {
     if (pending & (1ULL << i)) {
       sig = i + 1;
       break;
@@ -591,25 +641,33 @@ void signal_deliver(struct registers *regs) {
    * at syscall exit. Restore the original exception frame before building a
    * signal frame or reporting the default action. */
   if ((sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE) &&
-      current->fault_regs_valid)
+      current->fault_regs_valid) {
     *regs = current->fault_regs;
+    syscall_number = UINT64_MAX; /* this frame belongs to the original fault */
+  }
 
   uint64_t bit = (1ULL << (sig - 1));
-  extern struct thread *global_thread_list;
-  extern spinlock_t tid_lock;
-  uint32_t capacity = __atomic_load_n(&global_thread_count, __ATOMIC_ACQUIRE);
-  struct thread **notify = capacity ? kmalloc(capacity * sizeof(*notify)) : NULL;
-  if (capacity && !notify)
-    return;
-  uint32_t notify_count = 0;
-  spinlock_acquire(&tid_lock);
-  for (struct thread *t = global_thread_list; t; t = t->global_next) {
-    if (t->tgid == current->tgid) {
-      t->pending_signals &= ~bit;
-    }
+  if (current->syscall_dispatch_sigsys) {
+    /* Dispatch is synchronous and thread-directed, even if other ordinary
+     * signals are pending or siblings also have SIGSYS queued. */
+    current->pending_signals &= ~bit;
+    current->thread_directed_signals &= ~bit;
+  } else {
+    extern struct thread *global_thread_list;
+    extern spinlock_t tid_lock;
+    spinlock_acquire(&tid_lock);
+    signal_dequeue_locked(current, bit);
+    spinlock_release(&tid_lock);
   }
-  spinlock_release(&tid_lock);
   struct k_sigaction *sa = &current->signal_handlers[sig - 1];
+
+  /* Adjust the saved user context before constructing a signal frame. A
+   * handler returning through sigreturn then either re-executes SYSCALL or
+   * resumes its caller with EINTR, according to its SA_RESTART policy. */
+  bool handler = sa->sa_handler != (void *)SIG_IGN &&
+                 sa->sa_handler != (void *)SIG_DFL;
+  syscall_restart_return(regs, syscall_number, syscall_return_ip,
+                         handler, sa->sa_flags);
 
   if (sa->sa_handler == (void *)SIG_IGN)
     return;
@@ -623,19 +681,10 @@ void signal_deliver(struct registers *regs) {
     // without being killed when it reads from the controlling terminal.
     if (sig == 21 || sig == 22 || sig == 32 || sig == 33)
       return;
-    klog_puts("[SIGNAL] Default action (terminate) for sig ");
-    klog_uint64(sig);
-    klog_puts(" comm=");
-    klog_puts(current->comm);
-    klog_puts(" tid=");
-    klog_uint64(current->tid);
-    klog_puts(" rip=");
-    klog_uint64(regs->rip);
-    klog_puts(" rsp=");
-    klog_uint64(regs->rsp);
-    klog_puts(" rax=");
-    klog_uint64(regs->rax);
-    klog_puts("\n");
+    klogf("[SIGNAL] Default action (terminate) for sig %llu comm=%s tid=%u rip=%llu rsp=%llu rax=%llu\n",
+          (unsigned long long)sig, current->comm, current->tid,
+          (unsigned long long)regs->rip, (unsigned long long)regs->rsp,
+          (unsigned long long)regs->rax);
 
     // Print full registers, backtrace, and memory inspection only for fatal crash signals
     if (sig == SIGQUIT || sig == SIGILL || sig == SIGTRAP || sig == SIGABRT ||
@@ -654,17 +703,14 @@ void signal_deliver(struct registers *regs) {
   }
 
   // Determine which stack to deliver the signal on
-  uint64_t rsp;
-  if ((sa->sa_flags & SA_ONSTACK) && !(current->ss_flags & SS_DISABLE) &&
-      !on_sig_stack(current, regs->rsp)) {
+  bool using_altstack = on_sig_stack(current, regs->rsp);
+  uint64_t rsp = regs->rsp;
+  if ((sa->sa_flags & SA_ONSTACK) && current->ss_size &&
+      !(current->ss_flags & SS_DISABLE) &&
+      !using_altstack) {
     // Switch to the alternate signal stack (top = base + size)
-    if (current->ss_size >= sizeof(struct sigframe) + X86_64_RED_ZONE_SIZE + 64) {
-      rsp = current->ss_sp + current->ss_size;
-    } else {
-      rsp = regs->rsp;
-    }
-  } else {
-    rsp = regs->rsp;
+    rsp = current->ss_sp + current->ss_size;
+    using_altstack = true;
   }
 
   /*
@@ -677,14 +723,25 @@ void signal_deliver(struct registers *regs) {
   rsp -= sizeof(struct sigframe);
   rsp &= ~0xFULL; // 16-byte align for SysV ABI
 
-  if (current->ss_sp && on_sig_stack(current, current->ss_sp + current->ss_size - 1) &&
-      rsp < current->ss_sp) {
+  /* Check only a frame actually using the alternate stack, including its
+   * return address. A normal pthread stack may be below the registered
+   * alternate stack; that address ordering is not an overflow. Nested
+   * handlers still need this check even without SA_ONSTACK. */
+  if (using_altstack && (rsp < 8 || !on_sig_stack(current, rsp - 8))) {
     klog_puts("[SIGNAL] Altstack underflow during delivery\n");
     process_do_exit(11);
   }
 
   if (!vmm_is_user_addr_range_writable(rsp, sizeof(struct sigframe))) {
-    klog_puts("[SIGNAL] Stack overflow/invalid during delivery\n");
+    klogf("[SIGNAL] Stack overflow/invalid during delivery sig=%d tid=%u "
+          "frame=%#llx size=%llu interrupted_rsp=%#llx alt=%d "
+          "ss_sp=%#llx ss_size=%llu ss_flags=%#x sa_flags=%#llx\n",
+          sig, current->tid, (unsigned long long)rsp,
+          (unsigned long long)sizeof(struct sigframe),
+          (unsigned long long)regs->rsp, using_altstack,
+          (unsigned long long)current->ss_sp,
+          (unsigned long long)current->ss_size, (unsigned)current->ss_flags,
+          (unsigned long long)sa->sa_flags);
     process_do_exit(11); // SIGSEGV
   }
 
@@ -728,7 +785,21 @@ void signal_deliver(struct registers *regs) {
 }
 
 // Helper to deliver from syscall context
-void signal_deliver_syscall(struct syscall_regs *sregs) {
+void signal_deliver(struct registers *regs) {
+  signal_deliver_frame(regs, UINT64_MAX, 0);
+}
+
+static void signal_syscall_return(struct syscall_regs *sregs, uint64_t number,
+                                   uint64_t return_ip) {
+  /* int 0x80 delivers default actions using its original interrupt frame.
+   * i386 custom signal frames are not implemented yet. */
+  if (sregs->user_cs == 0x1b) {
+    /* Compat translation does not retain the original i386 syscall number.
+     * It cannot replay an int 0x80 here; do not expose restart codes. */
+    if (number != UINT64_MAX && syscall_restart_error(sregs->rax))
+      sregs->rax = (uint64_t)-4;
+    return;
+  }
   struct registers regs = {0};
   regs.rdi = sregs->rdi;
   regs.rsi = sregs->rsi;
@@ -745,11 +816,13 @@ void signal_deliver_syscall(struct syscall_regs *sregs) {
   regs.r15 = sregs->r15;
   regs.rip = sregs->rip;
   regs.rflags = sregs->rflags;
+  regs.rcx = sregs->rip; /* Architectural SYSCALL clobbers */
+  regs.r11 = sregs->rflags;
   regs.rsp = sregs->rsp;
   regs.cs = 0x2B;
   regs.ss = 0x23; // Standard user segments
 
-  signal_deliver(&regs);
+  signal_deliver_frame(&regs, number, return_ip);
 
   // Sync back
   sregs->rdi = regs.rdi;
@@ -768,6 +841,15 @@ void signal_deliver_syscall(struct syscall_regs *sregs) {
   sregs->rip = regs.rip;
   sregs->rflags = regs.rflags;
   sregs->rsp = regs.rsp;
+}
+
+void signal_deliver_syscall(struct syscall_regs *sregs) {
+  signal_syscall_return(sregs, UINT64_MAX, 0);
+}
+
+void signal_finish_syscall(struct syscall_regs *sregs, uint64_t number,
+                            uint64_t return_ip) {
+  signal_syscall_return(sregs, number, return_ip);
 }
 
 // tgkill, sigaltstack, and helpers
@@ -794,34 +876,58 @@ static uint64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig,
   if ((int64_t)tgid <= 0 || (int64_t)tid <= 0)
     return (uint64_t)-22; // EINVAL
 
-  // Find the target thread by tid
-  struct thread *target = sched_get_thread_by_tid((uint32_t)tid);
-  if (!target)
-    return (uint64_t)-3; // ESRCH — no such thread
-
-  // Validate that the target thread belongs to the specified thread group
-  if (target->tgid != (uint32_t)tgid)
-    return (uint64_t)-3; // ESRCH — tid exists but not in this tgid
-
-  // Signal 0 is used for existence check only — don't deliver
-  if (sig == 0)
-    return 0;
-
-  // Queue the signal on the target thread
+  extern struct thread *global_thread_list;
+  extern spinlock_t tid_lock;
   struct thread *sender = sched_get_current();
   uint32_t sender_pid = sender ? (sender->tgid ? sender->tgid : sender->tid) : 0;
-  if (sig == SIGKILL) {
-    klog_puts("[SIGNAL] tgkill sender=");
-    klog_uint64(sender ? sender->tid : 0);
-    klog_puts(" target=");
-    klog_uint64(target->tid);
-    klog_puts(" tgid=");
-    klog_uint64(target->tgid);
-    klog_puts("\n");
+  uint32_t sender_tid = sender ? sender->tid : 0;
+
+  /* Lookup + queue under tid_lock, wake after releasing it. The old code used
+   * sched_get_thread_by_tid() (lock, unlock, then dereference) and queued
+   * without any lock: the target could be reaped in between (UAF) and a
+   * concurrent delivery could lose the bit. */
+  spinlock_acquire(&tid_lock);
+  struct thread *target = NULL;
+  for (struct thread *t = global_thread_list; t; t = t->global_next) {
+    if (t->tid == (uint32_t)tid) {
+      target = t;
+      break;
+    }
   }
+  if (!target) {
+    spinlock_release(&tid_lock);
+    return (uint64_t)-3; // ESRCH — no such thread
+  }
+
+  // Validate that the target thread belongs to the specified thread group
+  if (target->tgid != (uint32_t)tgid) {
+    spinlock_release(&tid_lock);
+    return (uint64_t)-3; // ESRCH — tid exists but not in this tgid
+  }
+
+  // Signal 0 is used for existence check only — don't deliver
+  if (sig == 0) {
+    spinlock_release(&tid_lock);
+    return 0;
+  }
+
   target->pending_signals |= (1ULL << (sig - 1));
+  target->thread_directed_signals |= (1ULL << (sig - 1));
   target->signal_sender_pid[sig - 1] = sender_pid;
   target->signal_sender_code[sig - 1] = -6; /* SI_TKILL */
+  spinlock_release(&tid_lock);
+
+  /* Log without tid_lock held (see sys_kill). */
+
+  if (sig == SIGKILL) {
+    klog_puts("[SIGNAL] tgkill sender=");
+    klog_uint64(sender_tid);
+    klog_puts(" target=");
+    klog_uint64((uint32_t)tid);
+    klog_puts(" tgid=");
+    klog_uint64((uint32_t)tgid);
+    klog_puts("\n");
+  }
   signal_notify_thread(target, (int)sig);
 
   return 0;
@@ -910,11 +1016,29 @@ static uint64_t __attribute__((unused)) sys_sigprocmask(uint64_t how, uint64_t s
 void signal_send(struct thread *t, int sig) {
   if (!t || sig <= 0 || sig > 64)
     return;
+  extern struct thread *global_thread_list;
+  extern spinlock_t tid_lock;
   struct thread *sender = sched_get_current();
   uint32_t sender_pid = sender ? (sender->tgid ? sender->tgid : sender->tid) : 0;
+  /* Queue under tid_lock after verifying the target is still linked, then
+   * wake after releasing it (same order as sys_kill/pidfd_send_signal). */
+  spinlock_acquire(&tid_lock);
+  bool linked = false;
+  for (struct thread *it = global_thread_list; it; it = it->global_next) {
+    if (it == t) {
+      linked = true;
+      break;
+    }
+  }
+  if (!linked) {
+    spinlock_release(&tid_lock);
+    return;
+  }
   t->pending_signals |= (1ULL << (sig - 1));
+  t->thread_directed_signals |= (1ULL << (sig - 1));
   t->signal_sender_pid[sig - 1] = sender_pid;
   t->signal_sender_code[sig - 1] = 0; /* SI_USER */
+  spinlock_release(&tid_lock);
   signal_notify_thread(t, sig);
 }
 
@@ -1096,33 +1220,48 @@ static uint64_t sys_kill(uint64_t pid_val, uint64_t sig, uint64_t a2,
 
   extern struct thread *global_thread_list;
   extern spinlock_t tid_lock;
+  extern uint32_t global_thread_count;
+  uint32_t sender_pid = current ? (current->tgid ? current->tgid : current->tid) : 0;
+  if (sig == SIGKILL) {
+    klogf("[SIGNAL] sys_kill sender=%u target=%lld sig=%llu\n",
+          sender_pid, (long long)pid, (unsigned long long)sig);
+  }
+  /* Queue under tid_lock, notify after releasing it. Waking a thread takes
+   * runqueue/wait-queue/epoll locks; holding tid_lock across the wakeup
+   * inverts the lock order used everywhere else (snapshot-then-wake in
+   * signal_send_pgid/signal_notify_parent_exit/posix_timer_tick) and hangs
+   * the caller when another CPU holds one of those locks. */
+  uint32_t capacity = __atomic_load_n(&global_thread_count, __ATOMIC_ACQUIRE);
+  struct thread **notify = capacity ? kmalloc(capacity * sizeof(*notify)) : NULL;
+  if (capacity && !notify)
+    return (uint64_t)-12; // -ENOMEM
+  uint32_t notify_count = 0;
+  bool found = false;
+  bool perm_fail = false;
   spinlock_acquire(&tid_lock);
   struct thread *t = global_thread_list;
-  bool found = false;
-  uint32_t sender_pid = current ? (current->tgid ? current->tgid : current->tid) : 0;
-  klog_puts("[SIGNAL] sys_kill sender=");
-  klog_uint64(sender_pid);
-  klog_puts(" target=");
-  klog_uint64(pid);
-  klog_puts(" sig=");
-  klog_uint64(sig);
-  klog_puts("\n");
   while (t) {
     if (t->tgid == (uint32_t)pid || t->tid == (uint32_t)pid) {
       if (current && current->euid != 0 && current->uid != t->uid &&
           current->euid != t->uid) {
-        spinlock_release(&tid_lock);
-        return (uint64_t)-1;
+        perm_fail = true;
+        break;
       }
       found = true;
       t->pending_signals |= (1ULL << (sig - 1));
       t->signal_sender_pid[sig - 1] = sender_pid;
       t->signal_sender_code[sig - 1] = 0; /* SI_USER */
-      signal_notify_thread(t, (int)sig);
+      if (notify_count < capacity)
+        notify[notify_count++] = t;
     }
     t = t->global_next;
   }
   spinlock_release(&tid_lock);
+  for (uint32_t i = 0; i < notify_count; i++)
+    signal_notify_thread(notify[i], (int)sig);
+  kfree(notify);
+  if (perm_fail)
+    return (uint64_t)-1; // -EPERM
   return found ? 0 : (uint64_t)-3;
 }
 
@@ -1162,8 +1301,9 @@ static uint64_t get_pending_signals_tgid(struct thread *curr, uint64_t mask) {
   spinlock_acquire(&tid_lock);
   struct thread *t = global_thread_list;
   while (t) {
-    if (t->tgid == curr->tgid && (t->pending_signals & mask)) {
-      pending = t->pending_signals & mask;
+    if (t->tgid == curr->tgid &&
+        (t->pending_signals & ~t->thread_directed_signals & mask)) {
+      pending = t->pending_signals & ~t->thread_directed_signals & mask;
       break;
     }
     t = t->global_next;
@@ -1180,9 +1320,18 @@ static bool consume_signal_tgid(struct thread *curr, int sig, uint32_t *out_send
   extern struct thread *global_thread_list;
   extern spinlock_t tid_lock;
   spinlock_acquire(&tid_lock);
+  if (curr->pending_signals & curr->thread_directed_signals & bit) {
+    sender = curr->signal_sender_pid[sig - 1];
+    signal_dequeue_locked(curr, bit);
+    spinlock_release(&tid_lock);
+    if (out_sender_pid)
+      *out_sender_pid = sender;
+    return true;
+  }
   struct thread *t = global_thread_list;
   while (t) {
-    if (t->tgid == curr->tgid && (t->pending_signals & bit)) {
+    if (t->tgid == curr->tgid &&
+        (t->pending_signals & ~t->thread_directed_signals & bit)) {
       t->pending_signals &= ~bit;
       if (!sender && t->signal_sender_pid[sig - 1]) {
         sender = t->signal_sender_pid[sig - 1];
@@ -1421,18 +1570,33 @@ static uint64_t sys_tkill(uint64_t tid, uint64_t sig, uint64_t a2, uint64_t a3,
   if (sig == 0)
     return 0;
 
-  struct thread *target = sched_get_thread_by_tid((uint32_t)tid);
-  if (!target) {
-    /* Fallback: deliver to current thread (single-threaded process) */
-    target = sched_get_current();
-    if (!target)
-      return (uint64_t)-3; /* ESRCH */
-  }
+  extern struct thread *global_thread_list;
+  extern spinlock_t tid_lock;
   struct thread *sender = sched_get_current();
   uint32_t sender_pid = sender ? (sender->tgid ? sender->tgid : sender->tid) : 0;
+
+  spinlock_acquire(&tid_lock);
+  struct thread *target = NULL;
+  for (struct thread *t = global_thread_list; t; t = t->global_next) {
+    if (t->tid == (uint32_t)tid) {
+      target = t;
+      break;
+    }
+  }
+  if (!target) {
+    /* Fallback: deliver to current thread (single-threaded process).
+     * Current is stable (it is running), so queueing it is safe. */
+    target = sender;
+    if (!target) {
+      spinlock_release(&tid_lock);
+      return (uint64_t)-3; /* ESRCH */
+    }
+  }
   target->pending_signals |= (1ULL << (sig - 1));
+  target->thread_directed_signals |= (1ULL << (sig - 1));
   target->signal_sender_pid[sig - 1] = sender_pid;
   target->signal_sender_code[sig - 1] = -6; /* SI_TKILL */
+  spinlock_release(&tid_lock);
   signal_notify_thread(target, (int)sig);
   return 0;
 }

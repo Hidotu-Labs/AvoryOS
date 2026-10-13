@@ -185,6 +185,7 @@ struct statfs_buf {
 typedef int (*statfs_type_t)(struct vfs_node *, struct statfs_buf *buf);
 
 typedef struct vfs_node {
+  uint64_t mount_id; // Stable VFS mount identity, inherited during lookup
   char name[128];
   uint32_t mask; // Permissions
   uint32_t uid;
@@ -220,6 +221,12 @@ typedef struct vfs_node {
   chown_type_t chown;
   truncate_type_t truncate;
   mmap_type_t mmap; // Device-specific mmap handler
+  /* A direct backing-buffer handler cannot supply private CoW ownership.
+   * Route private mappings through the regular file page-cache fault path. */
+  bool mmap_shared_only;
+  /* Direct private mappings take one PMM reference per PTE, including CoW
+   * copies. munmap must release these just like generic file-cache views. */
+  bool mmap_private_pmm_refs;
   poll_type_t poll; // Device-specific poll handler
   statfs_type_t statfs;
   ioctl_type_t ioctl; // Device-specific ioctl handler
@@ -304,6 +311,7 @@ static inline bool vfs_node_unref(vfs_node_t *node) {
   return __atomic_sub_fetch(&node->refcount, 1, __ATOMIC_ACQ_REL) == 0;
 }
 struct dirent *vfs_readdir(vfs_node_t *node, uint32_t index);
+struct dirent *vfs_readdir_buffer(void);
 vfs_node_t *vfs_finddir(vfs_node_t *node, char *name);
 void vfs_dentry_invalidate(vfs_node_t *parent, const char *name);
 // For successful create/mkdir/mknod/symlink of a previously free name: cheap
@@ -311,6 +319,7 @@ void vfs_dentry_invalidate(vfs_node_t *parent, const char *name);
 void vfs_dentry_invalidate_created(vfs_node_t *parent, const char *name);
 vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path);
 vfs_node_t *vfs_resolve_path(const char *path);
+void vfs_path_cache_drop(vfs_node_t *dir, const char *path);
 int vfs_create(vfs_node_t *node, char *name, uint16_t permission);
 int vfs_mkdir(vfs_node_t *node, char *name, uint16_t permission);
 int vfs_unlink(vfs_node_t *node, char *name);
@@ -319,7 +328,7 @@ int vfs_readlink(vfs_node_t *node, char *buf, uint32_t size);
 int vfs_symlink(vfs_node_t *node, char *name, char *target);
 int vfs_rename(vfs_node_t *node, char *old_name, char *new_name);
 /* Cross-directory rename of a leaf node within one filesystem instance
- * (tmpfs only for now; anything else answers -EXDEV).  Returns 0 or a
+ * (tmpfs and ext2/ext4 regular files/symlinks). Returns 0 or a
  * negative errno. */
 int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
                      vfs_node_t *new_parent, char *new_name);
@@ -361,6 +370,7 @@ int vfs_removexattr(vfs_node_t *node, const char *name);
 void vfs_xattr_clear(vfs_node_t *node);
 
 typedef struct vfs_mount_info {
+  uint64_t mount_id;
   char mountpoint[128];
   char target[128];
   char dev_name[64];
@@ -387,6 +397,7 @@ size_t vfs_cache_reclaim(vfs_node_t *node, size_t target);
 // OOM hook for mm (see heap.c heap_oom_reclaim): reclaim up to `target`
 // clean unmapped pages from the current process's mapped files.
 size_t mm_file_cache_reclaim(size_t target);
+size_t vfs_dentry_reclaim_pages(size_t target);
 vfs_page_t *vfs_cache_get_or_create(vfs_node_t *node, uint32_t offset);
 void vfs_cache_put(vfs_node_t *node, vfs_page_t *page);
 bool vfs_cache_phase3_stress_test(void);

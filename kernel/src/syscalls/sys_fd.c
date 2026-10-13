@@ -31,39 +31,75 @@
 // FD allocation helpers
 // ---------------------------------------------------------------------------
 
+/* lock held. The hint accelerates allocation, but is not proof of exhaustion:
+ * a legacy release path may have left a reusable descriptor below it. */
+static int fd_find_free_locked(struct thread *t, int from) {
+  uint32_t hint = t->files->next_fd;
+  if (hint > MAX_FDS)
+    hint = MAX_FDS;
+  int start = from > (int)hint ? from : (int)hint;
+  for (int i = start; i < MAX_FDS; i++)
+    if (!t->fds[i])
+      return i;
+  for (int i = from; i < (int)hint; i++) {
+    if (!t->fds[i]) {
+      t->files->next_fd = 0;
+      return i;
+    }
+  }
+  return -1;
+}
+
+
+
 int alloc_fd(struct thread *t) {
   if (!t || !t->files)
     return -1;
   spinlock_acquire(&t->files->lock);
-  for (int i = (int)t->files->next_fd; i < MAX_FDS; i++) {
-    if (t->fds[i] == NULL) {
-      t->fds[i] = FD_RESERVED;
-      t->files->next_fd = (uint32_t)i + 1;
-      spinlock_release(&t->files->lock);
-      return i;
-    }
+  int fd = fd_find_free_locked(t, 0);
+  if (fd >= 0) {
+    t->fds[fd] = FD_RESERVED;
+    t->files->next_fd = (uint32_t)fd + 1;
   }
   spinlock_release(&t->files->lock);
-  return -1;
+  return fd;
 }
 
 int alloc_fd_from(struct thread *t, int from) {
   if (!t || !t->files || from < 0 || from >= MAX_FDS)
     return -1;
   spinlock_acquire(&t->files->lock);
-  int start = from;
-  if ((uint32_t)start < t->files->next_fd)
-    start = (int)t->files->next_fd;
-  for (int i = start; i < MAX_FDS; i++) {
-    if (t->fds[i] == NULL) {
-      t->fds[i] = FD_RESERVED;
-      t->files->next_fd = (uint32_t)i + 1;
-      spinlock_release(&t->files->lock);
-      return i;
-    }
+  int fd = fd_find_free_locked(t, from);
+  if (fd >= 0) {
+    t->fds[fd] = FD_RESERVED;
+    /* A minimum-fd allocation must not hide free slots below it. */
+    if ((uint32_t)fd == t->files->next_fd)
+      t->files->next_fd = (uint32_t)fd + 1;
   }
   spinlock_release(&t->files->lock);
-  return -1;
+  return fd;
+}
+
+/* Undo an open/socket/pipe reservation without leaving the free-slot hint
+ * past the released descriptor. Failure paths must not manufacture EMFILE. */
+void fd_release_reserved(struct thread *t, int fd) {
+  if (!t || !t->files || fd < 0 || fd >= MAX_FDS)
+    return;
+  vfs_node_t *reserved = NULL;
+  spinlock_acquire(&t->files->lock);
+  if (t->fds[fd] == FD_RESERVED) {
+    reserved = t->files->reserved_nodes[fd];
+    t->files->reserved_nodes[fd] = NULL;
+    t->fds[fd] = NULL;
+    t->fd_offsets[fd] = 0;
+    t->fd_flags[fd] = 0;
+    fd_path_clear(t, fd);
+    if ((uint32_t)fd < t->files->next_fd)
+      t->files->next_fd = (uint32_t)fd;
+  }
+  spinlock_release(&t->files->lock);
+  if (reserved)
+    vfs_close(reserved);
 }
 
 /* Pin the node while an fd operation runs. CLONE_FILES threads can close and
@@ -222,6 +258,39 @@ static void open_log_result(const char *kpath, int64_t ret)
 }
 #endif
 
+/* Collapse empty and dot components in the saved pathname. Wine repeatedly
+ * opens "." and returns through fchdir; retaining every /./ eventually
+ * overflowed the pathname even though it still named the same directory.
+ * Keep "..": eliminating it lexically would change symlink semantics. */
+static bool fd_make_path(char *out, size_t size, const char *base,
+                         const char *path) {
+  if (size < 2)
+    return false;
+  size_t used = 1;
+  out[0] = '/';
+  for (int part = 0; part < 2; part++) {
+    const char *p = part == 0 ? (path[0] == '/' ? NULL : base) : path;
+    if (!p)
+      continue;
+    while (*p) {
+      while (*p == '/') p++;
+      const char *start = p;
+      while (*p && *p != '/') p++;
+      size_t len = (size_t)(p - start);
+      if (!len || (len == 1 && start[0] == '.'))
+        continue;
+      size_t separator = used > 1 ? 1 : 0;
+      if (len >= size - used - separator)
+        return false;
+      if (separator) out[used++] = '/';
+      memcpy(out + used, start, len);
+      used += len;
+    }
+  }
+  out[used] = '\0';
+  return true;
+}
+
 uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
                             uint64_t mode) {
   if (!path)
@@ -299,6 +368,8 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
       node = ascentdrm_create_client_node();
       if (!node)
         return (uint64_t)-12;
+      if (flags & O_NONBLOCK)
+        node->flags |= FS_NONBLOCK;
     }
 
     if (strcmp(dev_path, "ptmx") == 0) {
@@ -316,6 +387,7 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
       vfs_node_init(node);
       strcpy(node->name, "ptmx");
       node->flags = FS_CHARDEV;
+      node->inode = (128U << 8) | (uint32_t)pty_index;
       node->mask = 0666;
       node->read = ptmx_read;
       node->write = ptmx_write;
@@ -357,6 +429,7 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
       vfs_node_init(node);
       strcpy(node->name, dev_path);
       node->flags = FS_CHARDEV;
+      node->inode = (136U << 8) | (uint32_t)pty_index;
       node->mask = 0620;
       node->uid = t->euid;
       node->gid = t->egid;
@@ -394,7 +467,7 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
 
   if (!node) {
     uint64_t proc_fd;
-    if (parse_proc_self_fd_path(path, &proc_fd)) {
+    if (!(flags & O_NOFOLLOW) && parse_proc_self_fd_path(path, &proc_fd)) {
       node = fd_pin_node(t, proc_fd, NULL, NULL);
       if (!node)
         return (uint64_t)-2; // ENOENT: no such open descriptor
@@ -405,8 +478,31 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
   }
 
   if (!node) {
-    node = vfs_resolve_path_at(base_dir, path);
+    /* The VFS component stack starts at base_dir. To walk above an open
+     * directory, seed it with that descriptor's saved absolute path. */
+    char parent_walk[512];
+    const char *lookup_path = path;
+    vfs_node_t *lookup_base = base_dir;
+    if (path[0] != '/' && (!strcmp(path, "..") || !strncmp(path, "../", 3))) {
+      spinlock_acquire(&t->files->lock);
+      const char *start = dirfd == AT_FDCWD ? t->cwd_path : fd_path_value(t, dirfd);
+      bool ok = fd_make_path(parent_walk, sizeof(parent_walk), start, path);
+      spinlock_release(&t->files->lock);
+      if (!ok) return (uint64_t)-36;
+      lookup_path = parent_walk;
+      lookup_base = fs_root;
+    }
+    node = (flags & O_NOFOLLOW)
+               ? vfs_resolve_symlink_node(lookup_base, lookup_path)
+               : vfs_resolve_path_at(lookup_base, lookup_path);
     node_owned = node != NULL;
+  }
+
+  if (node && (node->flags & FS_TYPE_MASK) == FS_SYMLINK &&
+      (flags & O_NOFOLLOW) && !(flags & O_PATH) &&
+      (flags & (O_CREAT | O_EXCL)) != (O_CREAT | O_EXCL)) {
+    if (node_owned) vfs_close(node);
+    return (uint64_t)-40; // ELOOP: only O_PATH can open the link itself
   }
 
   if (!node) {
@@ -533,6 +629,8 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
       return (uint64_t)-12;
     }
     node_owned = false; // fresh per-open node owns no resolver reference
+    if (flags & O_NONBLOCK)
+      node->flags |= FS_NONBLOCK;
   } else if (ascentdrm_is_card_node(node)) {
     vfs_node_t *prev = node;
     node = ascentdrm_create_client_node();
@@ -541,6 +639,8 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
       return (uint64_t)-12;
     }
     node_owned = false; // fresh client node owns no resolver reference
+    if (flags & O_NONBLOCK)
+      node->flags |= FS_NONBLOCK;
   }
 
   /* Linux fails open(file, O_DIRECTORY) with ENOTDIR here, so musl opendir()
@@ -552,6 +652,18 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
   }
 
 open_done:
+  char full_path[256];
+  spinlock_acquire(&t->files->lock);
+  const char *base_path = t->cwd_path;
+  if (path[0] != '/' && dirfd != AT_FDCWD && dirfd >= 0 && dirfd < MAX_FDS)
+    base_path = fd_path_value(t, dirfd);
+  bool path_ok = fd_make_path(full_path, sizeof(full_path), base_path, path);
+  spinlock_release(&t->files->lock);
+  if (!path_ok) {
+    if (node_owned) vfs_close(node);
+    return (uint64_t)-36; // ENAMETOOLONG: never retain a truncated pathname
+  }
+
   fd = alloc_fd(t);
   if (fd < 0) {
     if (node_owned) vfs_close(node);
@@ -560,11 +672,19 @@ open_done:
 
   vfs_open(node);
   if (node_owned) vfs_close(node); // descriptor holds its own reference now
-  t->fds[fd] = node;
+  spinlock_acquire(&t->files->lock);
   t->fd_offsets[fd] = 0;
   t->fd_flags[fd] = flags & ~(uint64_t)O_CLOEXEC;
   if (flags & O_CLOEXEC)
     t->fd_flags[fd] |= FD_FLAGS_CLOEXEC_BIT;
+  if (!fd_path_set(t, fd, full_path)) {
+    spinlock_release(&t->files->lock);
+    fd_release_reserved(t, fd);
+    vfs_close(node);
+    return (uint64_t)-12;
+  }
+  t->fds[fd] = node; /* publish only after offset, flags and path are installed */
+  spinlock_release(&t->files->lock);
   if (strcmp(node->name, "ptmx") == 0) {
     klog_puts(" fd=");
     klog_uint64((uint64_t)fd);
@@ -573,24 +693,6 @@ open_done:
     klog_puts("\n");
   }
 
-  char full_path[256];
-  if (path[0] == '/') {
-    strncpy(full_path, path, sizeof(full_path) - 1);
-    full_path[sizeof(full_path) - 1] = '\0';
-  } else {
-    full_path[0] = '\0';
-    if (t->cwd_path[0] && strcmp(t->cwd_path, "/") != 0) {
-      strncpy(full_path, t->cwd_path, sizeof(full_path) - 1);
-      full_path[sizeof(full_path) - 1] = '\0';
-      strncat(full_path, "/", sizeof(full_path) - strlen(full_path) - 1);
-      strncat(full_path, path, sizeof(full_path) - strlen(full_path) - 1);
-    } else {
-      strcpy(full_path, "/");
-      strncat(full_path, path, sizeof(full_path) - 2);
-    }
-    full_path[sizeof(full_path) - 1] = '\0';
-  }
-  fd_path_set(t, fd, full_path);
 
   return fd;
 }
@@ -649,12 +751,18 @@ static uint64_t sys_close(uint64_t fd, uint64_t a1, uint64_t a2, uint64_t a3,
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
-  if (!t || fd >= MAX_FDS || !t->fds[fd])
+  if (!t || !t->files || fd >= MAX_FDS)
     return (uint64_t)-9;
 
   spinlock_acquire(&t->files->lock);
   vfs_node_t *node = t->fds[fd];
+  if (!fd_is_valid_node(node)) {
+    spinlock_release(&t->files->lock);
+    return (uint64_t)-9;
+  }
   t->fds[fd] = NULL;
+  t->fd_offsets[fd] = 0;
+  t->fd_flags[fd] = 0;
   fd_path_clear(t, (int)fd);
   if (fd < t->files->next_fd)
     t->files->next_fd = (uint32_t)fd;
@@ -720,6 +828,64 @@ static uint64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags,
 // dup / dup2
 // ---------------------------------------------------------------------------
 
+/* Reserve the destination and pin the source in the same critical section.
+ * A CLONE_FILES sibling may otherwise close the source between validation and
+ * copying it, leaving a successful dup with a NULL destination (Firefox's
+ * FileDescriptor constructor can assert when F_DUPFD_CLOEXEC sees EBADF).
+ * VFS callbacks and final closes run outside the file-table lock. */
+static int64_t fd_duplicate(struct thread *t, uint64_t oldfd,
+                            uint64_t target, bool fixed, bool cloexec) {
+  if (!t || !t->files || oldfd >= MAX_FDS)
+    return -9;
+  spinlock_acquire(&t->files->lock);
+  vfs_node_t *node = t->fds[oldfd];
+  if (!fd_is_valid_node(node)) {
+    spinlock_release(&t->files->lock);
+    return -9;
+  }
+  if (target >= MAX_FDS) {
+    spinlock_release(&t->files->lock);
+    return fixed ? -9 : -22;
+  }
+  if (fixed && oldfd == target) {
+    spinlock_release(&t->files->lock);
+    return (int64_t)target;
+  }
+  if (fixed && t->fds[target] == FD_RESERVED) {
+    spinlock_release(&t->files->lock);
+    return -16; // EBUSY: another open/dup is installing this descriptor
+  }
+  if (!fixed) {
+    int free_fd = fd_find_free_locked(t, (int)target);
+    if (free_fd < 0) {
+      spinlock_release(&t->files->lock);
+      return -24;
+    }
+    target = (uint32_t)free_fd;
+  }
+
+  vfs_node_t *previous = t->fds[target];
+  vfs_node_ref(node); // temporary pin until the destination owns its reference
+  t->fds[target] = FD_RESERVED;
+  t->fd_offsets[target] = t->fd_offsets[oldfd];
+  t->fd_flags[target] = t->fd_flags[oldfd] & ~(uint64_t)FD_FLAGS_CLOEXEC_BIT;
+  if (cloexec)
+    t->fd_flags[target] |= FD_FLAGS_CLOEXEC_BIT;
+  fd_path_dup(t, (int)target, (int)oldfd);
+  if (target == t->files->next_fd)
+    t->files->next_fd++;
+  spinlock_release(&t->files->lock);
+
+  vfs_open(node);
+  spinlock_acquire(&t->files->lock);
+  t->fds[target] = node;
+  spinlock_release(&t->files->lock);
+  vfs_close(node); // release temporary pin
+  if (previous)
+    vfs_close(previous);
+  return (int64_t)target;
+}
+
 static uint64_t sys_dup(uint64_t oldfd, uint64_t a1, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5) {
   (void)a1;
@@ -727,20 +893,7 @@ static uint64_t sys_dup(uint64_t oldfd, uint64_t a1, uint64_t a2, uint64_t a3,
   (void)a3;
   (void)a4;
   (void)a5;
-  struct thread *t = sched_get_current();
-  if (!t || oldfd >= MAX_FDS || !t->fds[oldfd])
-    return (uint64_t)-9;
-
-  int newfd = alloc_fd(t);
-  if (newfd < 0)
-    return (uint64_t)-24;
-
-  t->fds[newfd] = t->fds[oldfd];
-  t->fd_offsets[newfd] = t->fd_offsets[oldfd];
-  t->fd_flags[newfd] = t->fd_flags[oldfd] & ~(uint64_t)FD_FLAGS_CLOEXEC_BIT;
-  fd_path_dup(t, newfd, (int)oldfd);
-  vfs_open(t->fds[newfd]);
-  return newfd;
+  return (uint64_t)fd_duplicate(sched_get_current(), oldfd, 0, false, false);
 }
 
 static uint64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t a2,
@@ -749,20 +902,7 @@ static uint64_t sys_dup2(uint64_t oldfd, uint64_t newfd, uint64_t a2,
   (void)a3;
   (void)a4;
   (void)a5;
-  struct thread *t = sched_get_current();
-  if (!t || oldfd >= MAX_FDS || newfd >= MAX_FDS || !t->fds[oldfd])
-    return (uint64_t)-9;
-  if (oldfd == newfd)
-    return newfd;
-  if (t->fds[newfd])
-    vfs_close(t->fds[newfd]);
-
-  t->fds[newfd] = t->fds[oldfd];
-  t->fd_offsets[newfd] = t->fd_offsets[oldfd];
-  t->fd_flags[newfd] = t->fd_flags[oldfd] & ~(uint64_t)FD_FLAGS_CLOEXEC_BIT;
-  fd_path_dup(t, (int)newfd, (int)oldfd);
-  vfs_open(t->fds[newfd]);
-  return newfd;
+  return (uint64_t)fd_duplicate(sched_get_current(), oldfd, newfd, true, false);
 }
 
 static uint64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags,
@@ -770,34 +910,17 @@ static uint64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags,
   (void)a3;
   (void)a4;
   (void)a5;
-  if (flags & ~(uint64_t)O_CLOEXEC)
-    return (uint64_t)-22; // EINVAL: only O_CLOEXEC is valid
-  struct thread *t = sched_get_current();
-  if (!t || oldfd >= MAX_FDS || newfd >= MAX_FDS || !t->fds[oldfd] ||
-      t->fds[oldfd] == FD_RESERVED)
-    return (uint64_t)-9; // EBADF
-  if (oldfd == newfd)
-    return (uint64_t)-22; // EINVAL: Linux dup3 rejects oldfd==newfd
-  vfs_node_t *old_node = t->fds[oldfd];
-  vfs_node_t *prev = t->fds[newfd];
-  if (prev && prev != FD_RESERVED)
-    vfs_close(prev);
-  else if (prev == FD_RESERVED)
-    prev = NULL;
-
-  t->fds[newfd] = old_node;
-  t->fd_offsets[newfd] = t->fd_offsets[oldfd];
-  t->fd_flags[newfd] = t->fd_flags[oldfd] & ~(uint64_t)FD_FLAGS_CLOEXEC_BIT;
-  if (flags & O_CLOEXEC)
-    t->fd_flags[newfd] |= FD_FLAGS_CLOEXEC_BIT;
-  fd_path_dup(t, (int)newfd, (int)oldfd);
-  vfs_open(old_node);
-  return newfd;
+  if ((flags & ~(uint64_t)O_CLOEXEC) || oldfd == newfd)
+    return (uint64_t)-22;
+  return (uint64_t)fd_duplicate(sched_get_current(), oldfd, newfd, true,
+                                 (flags & O_CLOEXEC) != 0);
 }
 
 // ---------------------------------------------------------------------------
 // read / write helpers
 // ---------------------------------------------------------------------------
+
+
 
 static void trace_userspace_debug_write(struct thread *t, int fd,
                                         const void *buf, size_t count) {
@@ -1099,9 +1222,9 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
   /* A socket writev is one send operation.  Splitting it into write calls can
    * interleave vector fragments with another writer and corrupt protocols. */
   socket_t *sock = socket_from_fd((int)fd);
-  if (sock && socket_try_get(sock)) {
+  if (sock) {
     if (sock->closing) {
-      socket_put(sock);
+      socket_fd_put(sock);
       if (payload) kfree(payload);
       fd_release_kvec(kernel_iov, stack_kvec);
       fd_release_iov(iov, stack_iov);
@@ -1113,7 +1236,7 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     ssize_t ret = sock->ops && sock->ops->sendmsg
                       ? sock->ops->sendmsg(sock, &msg, 0)
                       : -95;
-    socket_put(sock);
+    socket_fd_put(sock);
     if (payload) kfree(payload);
     fd_release_kvec(kernel_iov, stack_kvec);
     fd_release_iov(iov, stack_iov);
@@ -1576,24 +1699,13 @@ static uint64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a3,
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
+  if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC)
+    return (uint64_t)fd_duplicate(t, fd, (uint64_t)(int64_t)(int)arg,
+                                   false, cmd == F_DUPFD_CLOEXEC);
   if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd]))
     return (uint64_t)-9; // EBADF
 
   switch (cmd) {
-  case F_DUPFD:
-  case F_DUPFD_CLOEXEC: {
-    int newfd = alloc_fd_from(t, (int)arg);
-    if (newfd < 0)
-      return (uint64_t)-24;
-    t->fds[newfd] = t->fds[fd];
-    t->fd_offsets[newfd] = t->fd_offsets[fd];
-    t->fd_flags[newfd] = t->fd_flags[fd] & ~(uint64_t)FD_FLAGS_CLOEXEC_BIT;
-    if (cmd == F_DUPFD_CLOEXEC)
-      t->fd_flags[newfd] |= FD_FLAGS_CLOEXEC_BIT;
-    fd_path_dup(t, newfd, (int)fd);
-    vfs_open(t->fds[newfd]);
-    return (uint64_t)newfd;
-  }
   case F_GETFD: {
     uint64_t dflags = 0;
     if (t->fd_flags[fd] & FD_FLAGS_CLOEXEC_BIT)
@@ -1721,6 +1833,10 @@ static uint64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t a2,
     vfs_close(node);
     return (uint64_t)-1;
   }
+  if (length > UINT32_MAX) {
+    vfs_close(node);
+    return (uint64_t)-27; // EFBIG: VFS sizes are currently 32-bit
+  }
   int result = vfs_truncate(node, (uint32_t)length);
   vfs_close(node);
   return result == 0 ? 0 : (uint64_t)-1;
@@ -1749,6 +1865,20 @@ static uint64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
     return (uint64_t)-22;
   }
 
+  /* Validate before narrowing: large downloads must not wrap their reservation
+   * or silently resize to the low 32 bits of the requested length. */
+  if (!len || (int64_t)offset < 0 || (int64_t)len < 0) {
+    vfs_close(node);
+    return (uint64_t)-22;
+  }
+  if (mode & ~(uint64_t)0x01) {
+    vfs_close(node);
+    return (uint64_t)-95;
+  }
+  if (offset > UINT32_MAX || len > UINT32_MAX - offset) {
+    vfs_close(node);
+    return (uint64_t)-27;
+  }
   int ret = vfs_fallocate(node, (int)mode, (uint32_t)offset, (uint32_t)len);
   vfs_close(node);
   if (ret != 0)

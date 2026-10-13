@@ -30,6 +30,8 @@ static inline bool is_user_ptr(uint64_t ptr) {
 unsigned long copy_from_user(void *to, const void *from, unsigned long n);
 unsigned long copy_to_user(void *to, const void *from, unsigned long n);
 unsigned long clear_user(void *to, unsigned long n);
+/* 1: exchanged, 0: mismatch (updates expected), -14: bad user address. */
+int cmpxchg_user_u32(uint32_t *addr, uint32_t *expected, uint32_t desired);
 long strncpy_from_user(char *dst, const char *src, long count);
 long strnlen_user(const char *src, long maxlen);
 

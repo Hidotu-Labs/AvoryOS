@@ -29,4 +29,11 @@ void mouse_register_vfs(void);
 void mouse_apply_report(int32_t dx, int32_t dy, int32_t wheel, int32_t hwheel,
                         uint32_t buttons);
 
+/* Absolute HID pointers use a stable 0..32767 evdev range. Configure at
+ * probe time, before Xorg queries the device's axis capabilities. */
+void mouse_configure_absolute(bool enabled);
+bool mouse_has_absolute_axes(void);
+void mouse_apply_absolute_report(int32_t x, int32_t y, int32_t wheel,
+                                 int32_t hwheel, uint32_t buttons);
+
 #endif

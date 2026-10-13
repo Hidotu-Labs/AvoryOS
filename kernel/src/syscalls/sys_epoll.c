@@ -10,9 +10,10 @@
 #include "../socket/epoll.h"
 #include "syscall.h"
 #include <stdint.h>
+#include "arch/uaccess.h"
 
 // Helper: Validate user pointer
-static bool is_user_ptr(uint64_t ptr) {
+static bool epoll_user_ptr(uint64_t ptr) {
   // User-space addresses are in lower half of address space
   return ptr < 0x0000800000000000ULL && ptr != 0;
 }
@@ -107,7 +108,7 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
   // Handle operation
   switch (op) {
   case EPOLL_CTL_ADD: {
-    if (!is_user_ptr(event_ptr)) {
+    if (!epoll_user_ptr(event_ptr)) {
       return (uint64_t)-14; // EFAULT
     }
 
@@ -122,7 +123,7 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
   }
 
   case EPOLL_CTL_MOD: {
-    if (!is_user_ptr(event_ptr)) {
+    if (!epoll_user_ptr(event_ptr)) {
       return (uint64_t)-14; // EFAULT
     }
 
@@ -150,7 +151,7 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
   }
 
   // Validate parameters
-  if (!is_user_ptr(events_ptr)) {
+  if (!epoll_user_ptr(events_ptr)) {
     return (uint64_t)-14; // EFAULT
   }
 
@@ -165,60 +166,65 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
   return (uint64_t)ret;
 }
 
-// sys_epoll_pwait: Wait for events with signal mask
-static uint64_t sys_epoll_pwait(uint64_t epfd, uint64_t events_ptr,
-                                uint64_t maxevents, uint64_t timeout_ms,
-                                uint64_t sigmask_ptr, uint64_t a5) {
-  (void)a5;
-
-  // Get epoll instance
+/* Shared pwait path: Linux uses an eight-byte kernel signal set on x86_64. */
+static uint64_t epoll_pwait_common(uint64_t epfd, uint64_t events_ptr,
+                                    uint64_t maxevents, int64_t timeout_ms,
+                                    uint64_t sigmask_ptr, uint64_t sigsetsize) {
   eventpoll_t *ep = epoll_from_fd((int)epfd);
-  if (!ep) {
-    return (uint64_t)-9; // EBADF
-  }
-
-  // Validate parameters
-  if (!is_user_ptr(events_ptr)) {
-    return (uint64_t)-14; // EFAULT
-  }
-
-  if ((int)maxevents <= 0) {
-    return (uint64_t)-22; // EINVAL
-  }
+  if (!ep)
+    return (uint64_t)-9;
+  if (!epoll_user_ptr(events_ptr))
+    return (uint64_t)-14;
+  if ((int)maxevents <= 0)
+    return (uint64_t)-22;
 
   struct thread *current = sched_get_current();
-  uint64_t old_mask = 0;
-
-  // Apply signal mask if provided
-  if (sigmask_ptr && is_user_ptr(sigmask_ptr)) {
-    uint64_t new_mask = *(uint64_t *)sigmask_ptr;
-
-    // Save old mask and apply new mask atomically
+  uint64_t old_mask = 0, new_mask = 0;
+  if (sigmask_ptr) {
+    if (sigsetsize != sizeof(new_mask))
+      return (uint64_t)-22;
+    if (!current || !epoll_user_ptr(sigmask_ptr) ||
+        copy_from_user(&new_mask, (void *)sigmask_ptr, sizeof(new_mask)))
+      return (uint64_t)-14;
+    new_mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
     old_mask = current->signal_mask;
     current->signal_mask = new_mask;
   }
-
-  struct epoll_event *events = (struct epoll_event *)events_ptr;
-
-  // Call implementation
-  int ret = epoll_wait_impl(ep, events, (int)maxevents, (int)timeout_ms);
-
-  // Linux returns EINTR if an unmasked signal became pending during the wait,
-  // even when events are also ready. do_poll/epoll_wait_impl already checks
-  // thread_has_pending_signal, but pwait swapped the mask, so re-check here
-  // against the temporary mask before restoring.
-  if (current) {
-    uint64_t pending = current->pending_signals & ~current->signal_mask;
-    if (pending)
-      ret = -4; // EINTR
-  }
-
-  // Restore old signal mask if we changed it
-  if (sigmask_ptr && is_user_ptr(sigmask_ptr)) {
+  int ret = epoll_wait_impl(ep, (struct epoll_event *)events_ptr,
+                            (int)maxevents, timeout_ms);
+  if (sigmask_ptr)
     current->signal_mask = old_mask;
-  }
-
   return (uint64_t)ret;
+}
+
+static uint64_t sys_epoll_pwait(uint64_t epfd, uint64_t events_ptr,
+                                uint64_t maxevents, uint64_t timeout_ms,
+                                uint64_t sigmask_ptr, uint64_t sigsetsize) {
+  int timeout = (int)timeout_ms;
+  return epoll_pwait_common(epfd, events_ptr, maxevents,
+                            timeout < 0 ? -1 : timeout,
+                            sigmask_ptr, sigsetsize);
+}
+
+/* epoll_pwait2 supplies a relative signed timespec, NULL means infinite.
+ * The scheduler clock has millisecond resolution; round up, never expire early. */
+static uint64_t sys_epoll_pwait2(uint64_t epfd, uint64_t events_ptr,
+                                 uint64_t maxevents, uint64_t timeout_ptr,
+                                 uint64_t sigmask_ptr, uint64_t sigsetsize) {
+  int64_t timeout_ms = -1;
+  if (timeout_ptr) {
+    struct { int64_t sec, nsec; } timeout;
+    if (!epoll_user_ptr(timeout_ptr) ||
+        copy_from_user(&timeout, (void *)timeout_ptr, sizeof(timeout)))
+      return (uint64_t)-14;
+    if (timeout.sec < 0 || timeout.nsec < 0 || timeout.nsec >= 1000000000)
+      return (uint64_t)-22;
+    int64_t fraction = (timeout.nsec + 999999) / 1000000;
+    timeout_ms = timeout.sec > (INT64_MAX - fraction) / 1000
+                     ? INT64_MAX : timeout.sec * 1000 + fraction;
+  }
+  return epoll_pwait_common(epfd, events_ptr, maxevents, timeout_ms,
+                            sigmask_ptr, sigsetsize);
 }
 
 // Register epoll syscalls
@@ -228,6 +234,7 @@ void syscall_register_epoll(void) {
   syscall_register(SYS_EPOLL_CTL, sys_epoll_ctl);
   syscall_register(SYS_EPOLL_WAIT, sys_epoll_wait);
   syscall_register(SYS_EPOLL_PWAIT, sys_epoll_pwait);
+  syscall_register(SYS_EPOLL_PWAIT2, sys_epoll_pwait2);
 
   klog_puts("[OK] Epoll syscalls registered\n");
 }

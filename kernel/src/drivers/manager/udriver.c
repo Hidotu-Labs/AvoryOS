@@ -1316,7 +1316,7 @@ static uint64_t driverctl_mmap(vfs_node_t *node, uint64_t address,
     if (dma_inner > available || aligned_length > available - dma_inner)
       return (uint64_t)-1;
     uint64_t page_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_USER |
-                          PAGE_FLAG_PWT | PAGE_FLAG_PCD | PAGE_FLAG_NX;
+                          PAGE_FLAG_NX;
     if (prot & 2U)
       page_flags |= PAGE_FLAG_RW;
     uint64_t mapped = 0;

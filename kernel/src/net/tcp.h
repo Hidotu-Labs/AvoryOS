@@ -57,6 +57,7 @@ struct tcp_tcb {
   bool used;
   enum tcp_state state;
   uint8_t address_family;       /* 4 or 6; 0 until bound/connected */
+  bool ipv6_dualstack;          /* IPv6 wildcard listener also accepts IPv4 */
 
   uint32_t local_ip, remote_ip;
   uint16_t local_port, remote_port;

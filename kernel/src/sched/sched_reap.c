@@ -119,6 +119,14 @@ void sched_reap_thread(struct thread *t) {
 
   futex_remove_thread_waiters(t);
   wait_queue_cleanup_thread(t);
+  /* A thread killed mid-write may own a journal transaction (kill -9 of a
+   * game group while a worker holds it). The wait-queue cleanup above cannot
+   * release the transaction lock, so without this the mount wedges forever
+   * and every later writer spins on 5 s warnings. */
+  {
+    extern void ext3_journal_release_owner(uint32_t tid);
+    ext3_journal_release_owner(t->tid);
+  }
 
   /* The reap-queue claimant checked terminal state and detached the thread
    * from its runqueue while holding the owning CPU's queue_lock. */
@@ -227,11 +235,20 @@ void sched_reap_thread(struct thread *t) {
     t->mm = NULL;
   }
 
+  /* Backstop: a vfork child killed without going through _exit/exec (SIGKILL
+   * via terminate) must still release its blocked parent. The exit/exec
+   * paths already called this; repeats are harmless no-ops. */
+  vfork_release_parent(t);
   /* HHDM-backed stack pages need no page-table unmap during release. */
   thread_stack_release(t->stack_base);
   /* Clear any per-CPU fpu_owner references pointing at this thread
      before the struct is freed, to avoid stale pointer dereferences. */
   fpu_forget_thread(t);
+  /* Both user and kernel threads reach this off-CPU lifetime boundary.
+   * Keep the shadow through the trampoline and all native cleanup above. */
+  extern void linuxkpi_thread_exiting(void *thread) __attribute__((weak));
+  if (linuxkpi_thread_exiting)
+    linuxkpi_thread_exiting(t);
   kfree(t);
 
   klog_debug_puts("[REAP] Done\n");

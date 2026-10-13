@@ -3,8 +3,6 @@ global thread_stub
 
 section .text
 
-extern cpu_has_xsave_flag
-extern cpu_xsave_mask
 
 ; void switch_context(struct thread *old_t, struct thread *new_t)
 ; rdi = pointer to old thread struct
@@ -24,20 +22,6 @@ switch_context:
     push r14
     push r15
 
-    ; Save FPU/XSAVE state (at offset 64 in struct thread)
-    cmp byte [rel cpu_has_xsave_flag], 0
-    je .save_fxsave
-
-    mov rax, [rel cpu_xsave_mask]
-    mov rdx, rax
-    shr rdx, 32
-    xsave64 [rdi + 64]
-    jmp .fpu_saved
-
-.save_fxsave:
-    fxsave64 [rdi + 64]
-
-.fpu_saved:
     ; Save current stack pointer into old_t->rsp (offset 0)
     mov [rdi], rsp
 
@@ -48,20 +32,6 @@ switch_context:
     ; stack hazard here; a resumed C frame may hold a stale CPU pointer.
     mov qword [gs:376], 0
 
-    ; Restore FPU/XSAVE state from new thread (at offset 64 in struct thread)
-    cmp byte [rel cpu_has_xsave_flag], 0
-    je .restore_fxrstor
-
-    mov rax, [rel cpu_xsave_mask]
-    mov rdx, rax
-    shr rdx, 32
-    xrstor64 [rsi + 64]
-    jmp .fpu_restored
-
-.restore_fxrstor:
-    fxrstor64 [rsi + 64]
-
-.fpu_restored:
     ; Pop callee-saved registers for the arriving thread
     pop r15
     pop r14

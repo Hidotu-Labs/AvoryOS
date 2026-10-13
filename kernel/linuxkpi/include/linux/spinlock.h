@@ -25,10 +25,15 @@
 #define DEFINE_SPINLOCK(x) spinlock_t x = __SPIN_LOCK_UNLOCKED(x)
 #define DEFINE_RAW_SPINLOCK(x) raw_spinlock_t x = __RAW_SPIN_LOCK_UNLOCKED(x)
 
+/* Native local invalidation service for IRQ-masked lock contention. */
+void linuxkpi_tlb_poll(void);
+
 static __always_inline void __kpi_spin_acquire(volatile unsigned int *locked) {
   while (__atomic_exchange_n(locked, 1u, __ATOMIC_ACQUIRE)) {
-    while (__atomic_load_n(locked, __ATOMIC_RELAXED))
+    while (__atomic_load_n(locked, __ATOMIC_RELAXED)) {
+      linuxkpi_tlb_poll();
       __asm__ volatile("pause" ::: "memory");
+    }
   }
 }
 

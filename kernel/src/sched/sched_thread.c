@@ -11,7 +11,7 @@
 #include "../mm/pcid.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
-#include "../cpu/features.h"
+#include "../cpu/fpu.h"
 #include "../smp/cpu.h"
 
 uint32_t next_tid = 1;
@@ -23,6 +23,7 @@ uint32_t global_thread_count = 0;
 
 extern void thread_stub(void); // Defined in switch.asm
 extern void signal_send(struct thread *t, int sig);
+extern void signal_notify_thread(struct thread *t, int sig);
 
 void *thread_stack_alloc(void) {
   void *phys = pmm_alloc_pages(THREAD_STACK_SIZE / PAGE_SIZE);
@@ -44,13 +45,6 @@ static void thread_exit(void) {
   struct thread *t = cpu ? cpu->current_thread : NULL;
 
   if (t) {
-    /* Let the LinuxKPI bridge detach its task shadow from this thread while
-     * the native struct is still valid (kthread_stop() may resolve the
-     * shadow after the thread is gone). */
-    extern void linuxkpi_thread_exiting(void *thread) __attribute__((weak));
-    if (linuxkpi_thread_exiting)
-      linuxkpi_thread_exiting(t);
-
     /* Hand the thread to the reaper the same way a detached user thread
      * does: mark it DEAD and queue it, then switch away.  The reaper frees
      * the kernel stack, mm, fd table and struct thread once this context is
@@ -173,23 +167,7 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
 
   t->rsp = stack_top;
 
-  // Initialize FPU/XSAVE state
-  memset(t->fpu_state, 0, sizeof(t->fpu_state));
-
-  static uint8_t fpu_init_done = 0;
-  static uint8_t initial_fpu_state[4096] __attribute__((aligned(64)));
-  if (!fpu_init_done) {
-    memset(initial_fpu_state, 0, sizeof(initial_fpu_state));
-    if (cpu_has_xsave()) {
-      uint64_t mask = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE);
-      uint32_t eax = (uint32_t)mask, edx = (uint32_t)(mask >> 32);
-      __asm__ volatile("fninit; xsave64 %0" : "=m"(initial_fpu_state) : "a"(eax), "d"(edx));
-    } else {
-      __asm__ volatile("fninit; fxsave64 %0" : "=m"(initial_fpu_state));
-    }
-    fpu_init_done = 1;
-  }
-  memcpy(t->fpu_state, initial_fpu_state, sizeof(t->fpu_state));
+  fpu_init_thread(t);
 
   /* Publish only after all allocations and context initialization succeed. */
   spinlock_acquire(&tid_lock);
@@ -532,6 +510,12 @@ void sched_reparent_children(struct thread *parent) {
   }
 
   struct thread *to_reap = NULL;
+  /* pdeath_signal targets queued under tid_lock, woken after releasing it:
+   * waking takes runqueue/wait-queue locks and must never run with tid_lock
+   * held (sys_kill hung this way). Stack cap is ample: one entry per child. */
+  struct thread *pdeath_notify[64];
+  int pdeath_sig[64];
+  uint32_t pdeath_count = 0;
   struct thread *child = parent->children;
   while (child) {
     struct thread *next_sibling = child->sibling_next;
@@ -547,7 +531,14 @@ void sched_reparent_children(struct thread *parent) {
       continue;
     }
     if (child->pdeath_signal > 0 && child->pdeath_signal <= 64) {
-      signal_send(child, child->pdeath_signal);
+      int psig = child->pdeath_signal;
+      child->pending_signals |= (1ULL << (psig - 1));
+      /* Sender unknown here; preserve SI_USER-style info. */
+      if (pdeath_count < 64) {
+        pdeath_notify[pdeath_count] = child;
+        pdeath_sig[pdeath_count] = psig;
+        pdeath_count++;
+      }
     }
     child->parent = adopter;
     if (adopter) {
@@ -560,6 +551,9 @@ void sched_reparent_children(struct thread *parent) {
   }
   parent->children = NULL;
   spinlock_release(&tid_lock);
+
+  for (uint32_t i = 0; i < pdeath_count; i++)
+    signal_notify_thread(pdeath_notify[i], pdeath_sig[i]);
 
   while (to_reap) {
     struct thread *victim = to_reap;

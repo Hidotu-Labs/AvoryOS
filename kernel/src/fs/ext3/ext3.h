@@ -55,6 +55,17 @@ typedef struct {
 
 void ext3_init_journal(ext2_mount_t *mnt);
 
+/* Abort any journal transaction owned by a dead thread and wake its waiters.
+ * Called from the thread reaper, the one place every dead thread passes
+ * through while off-CPU. Without this, SIGKILLing a process group while a
+ * member holds a journal transaction wedges the mount forever: waiters loop
+ * on try_acquire with 5 s warnings and even SIGKILL cannot free them. */
+void ext3_journal_release_owner(uint32_t tid);
+
+bool ext3_perf_snapshot(unsigned index, struct block_device **dev,
+                         struct storage_latency *wait,
+                         struct storage_latency *hold);
+
 int ext3_journal_start(ext2_mount_t *mnt);
 int ext3_journal_stop(ext2_mount_t *mnt);
 int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data);

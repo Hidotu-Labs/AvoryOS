@@ -1,204 +1,163 @@
-// AvoryOS Lazy FPU Context Switch Benchmark
-// Tests correctness and measures the speedup from lazy FPU state management.
-//
-// Strategy:
-//   1. Correctness: spawn threads that do floating-point work, verify results.
-//   2. Benchmark A: measure context-switch cost via futex ping-pong for
-//      threads that do NOT use FPU (should be cheaper with lazy FPU).
-//   3. Benchmark B: measure context-switch cost for threads that DO use FPU
-//      (triggers #NM on first use; subsequent switches are still lazy).
-
+#define _GNU_SOURCE
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <math.h>
+#include <sched.h>
+#include <time.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
 
-// ---- TSC helpers ----
-static inline uint64_t rdtsc(void) {
-    uint32_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((uint64_t)hi << 32) | lo;
+/* Raw syscalls keep libc (which may use SIMD) outside measured loops. */
+static inline long raw6(long n, long a, long b, long c, long d, long e, long f) {
+    register long r10 __asm__("r10") = d;
+    register long r8 __asm__("r8") = e;
+    register long r9 __asm__("r9") = f;
+    long ret;
+    __asm__ volatile("syscall" : "=a"(ret) : "a"(n), "D"(a), "S"(b), "d"(c),
+                     "r"(r10), "r"(r8), "r"(r9) : "rcx", "r11", "memory");
+    return ret;
 }
 
-static volatile uint64_t g_tsc_khz = 0;
-static void calibrate_tsc(void) {
-    // vDSO data block at 0xFFFFFFFFFF600E00
-    volatile uint64_t *vdso_data = (volatile uint64_t *)0xFFFFFFFFFF600E00ULL;
-    uint64_t khz = vdso_data[1]; // tsc_khz at offset +0x08
-    if (khz > 100000 && khz < 10000000)
-        g_tsc_khz = khz;
-    else
-        g_tsc_khz = 3000000; // 3 GHz fallback
+static int has_avx;
+static int avx_enabled(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    if ((c & ((1u << 27) | (1u << 28))) != ((1u << 27) | (1u << 28))) return 0;
+    __asm__ volatile("xgetbv" : "=a"(a), "=d"(d) : "c"(0));
+    return (a & 6) == 6;
 }
 
-static double tsc_to_ns(uint64_t cycles) {
-    return (double)cycles * 1000.0 / (double)g_tsc_khz;
-}
-
-// ---- Correctness test: FPU across thread switches ----
-#define FPU_THREADS 4
-#define FPU_ITERS   100000
-
-static volatile double g_fpu_results[FPU_THREADS];
-
-static void *fpu_worker(void *arg) {
-    int id = (int)(uintptr_t)arg;
-    double acc = (double)(id + 1);
-    // Spin doing FP work so we definitely own the FPU across many switches
-    for (int i = 0; i < FPU_ITERS; i++) {
-        acc = acc * 1.0000001 + 0.000001;
+/* Keep sentinels live across a syscall in one asm block, so neither the
+ * compiler nor the ABI's caller-saved XMM convention can spoil the test. */
+static long probe(long syscall_nr, long arg, const uint64_t *seed, uint64_t *out) {
+    long ret;
+    if (has_avx) {
+        __asm__ volatile("vmovdqu (%2), %%ymm15; fldl 32(%2); syscall; "
+                         "fstpl 32(%3); vmovdqu %%ymm15, (%3); vzeroupper"
+                         : "=a"(ret) : "a"(syscall_nr), "r"(seed), "r"(out), "D"(arg)
+                         : "rcx", "r11", "ymm15", "st", "memory");
+    } else {
+        __asm__ volatile("movdqu (%2), %%xmm15; fldl 32(%2); syscall; "
+                         "fstpl 32(%3); movdqu %%xmm15, (%3)"
+                         : "=a"(ret) : "a"(syscall_nr), "r"(seed), "r"(out), "D"(arg)
+                         : "rcx", "r11", "xmm15", "st", "memory");
     }
-    g_fpu_results[id] = acc;
-    return NULL;
+    return ret;
 }
-
-static int test_fpu_correctness(void) {
-    printf("\n[1] FPU Correctness Across Thread Switches:\n");
-    pthread_t threads[FPU_THREADS];
-    for (int i = 0; i < FPU_THREADS; i++)
-        pthread_create(&threads[i], NULL, fpu_worker, (void *)(uintptr_t)i);
-    for (int i = 0; i < FPU_THREADS; i++)
-        pthread_join(threads[i], NULL);
-
-    int ok = 1;
-    for (int i = 0; i < FPU_THREADS; i++) {
-        double val = g_fpu_results[i];
-        if (val < 1.0 || val > 1e20) { ok = 0; break; }
-    }
-    printf("    FPU thread results: %.6f, %.6f, %.6f, %.6f\n",
-           g_fpu_results[0], g_fpu_results[1], g_fpu_results[2], g_fpu_results[3]);
-    if (ok)
-        printf("    [PASS] All FPU results are sane!\n");
-    else
-        printf("    [FAIL] FPU corruption detected!\n");
-    return ok;
+static int matches(const uint64_t *a, const uint64_t *b) {
+    return !memcmp(a, b, has_avx ? 32 : 16) && a[4] == b[4];
 }
-
-// ---- Benchmark: futex ping-pong ----
-#define PINGPONG_ROUNDS 20000
-
-static volatile int g_futex_a = 0;
-static volatile int g_futex_b = 0;
-static volatile uint64_t g_switch_cycles_nofpu = 0;
-static volatile uint64_t g_switch_cycles_fpu   = 0;
-
-static long futex_wait(volatile int *addr, int val) {
-    return syscall(SYS_futex, addr, FUTEX_WAIT, val, NULL, NULL, 0);
-}
-static long futex_wake(volatile int *addr) {
-    return syscall(SYS_futex, addr, FUTEX_WAKE, 1, NULL, NULL, 0);
-}
-
-// "No FPU" pong thread: just integer work
-static void *pong_nofpu(void *arg) {
-    (void)arg;
-    for (int i = 0; i < PINGPONG_ROUNDS; i++) {
-        while (g_futex_a != 1)
-            futex_wait(&g_futex_a, 0);
-        g_futex_a = 0;
-        g_futex_b = 1;
-        futex_wake(&g_futex_b);
+static void *correctness_worker(void *arg) {
+    uint64_t id = (uintptr_t)arg;
+    uint64_t seed[5] = {id + 1, id + 2, id + 3, id + 4, 0x3ff0000000000000ULL};
+    uint64_t out[5];
+    for (int i = 0; i < 2000; i++) {
+        probe(SYS_sched_yield, 0, seed, out);
+        if (!matches(seed, out)) return (void *)1;
     }
     return NULL;
 }
-
-// "FPU" pong thread: does a small SSE dot product each round
-static void *pong_fpu(void *arg) {
-    (void)arg;
-    double x = 1.0;
-    for (int i = 0; i < PINGPONG_ROUNDS; i++) {
-        while (g_futex_a != 1)
-            futex_wait(&g_futex_a, 0);
-        g_futex_a = 0;
-        // Touch FPU so #NM fires on first use then stays loaded
-        x = x * 1.000001 + 0.000001;
-        g_futex_b = 1;
-        futex_wake(&g_futex_b);
-    }
-    // Prevent optimizer from removing the FPU work
-    if (x < 0.0) printf("x=%f\n", x);
-    return NULL;
+static void signal_clobber(int sig) {
+    (void)sig;
+    __asm__ volatile("pxor %%xmm15, %%xmm15; fldz; fstp %%st(0)" ::: "xmm15", "st");
 }
-
-static void bench_pingpong(int use_fpu, uint64_t *out_cycles) {
-    g_futex_a = 0;
-    g_futex_b = 0;
-
-    pthread_t pong;
-    if (use_fpu)
-        pthread_create(&pong, NULL, pong_fpu, NULL);
-    else
-        pthread_create(&pong, NULL, pong_nofpu, NULL);
-
-    uint64_t t0 = rdtsc();
-    double px = 1.0;
-    for (int i = 0; i < PINGPONG_ROUNDS; i++) {
-        g_futex_a = 1;
-        futex_wake(&g_futex_a);
-        while (g_futex_b != 1)
-            futex_wait(&g_futex_b, 0);
-        g_futex_b = 0;
-        if (use_fpu) {
-            // Ping thread also uses FPU
-            px = px * 1.000001 + 0.000001;
+static int correctness(void) {
+    for (int round = 0; round < 3; round++) {
+        pthread_t threads[4];
+        for (int i = 0; i < 4; i++)
+            if (pthread_create(&threads[i], NULL, correctness_worker, (void *)(uintptr_t)(i + round * 4))) return 0;
+        for (int i = 0; i < 4; i++) {
+            void *result;
+            if (pthread_join(threads[i], &result) || result) return 0;
         }
     }
-    uint64_t t1 = rdtsc();
-    *out_cycles = t1 - t0;
-    if (use_fpu && px < 0.0) printf("px=%f\n", px);
-
-    pthread_join(pong, NULL);
+    uint64_t seed[5] = {11, 22, 33, 44, 0x4000000000000000ULL}, out[5];
+    long pid = probe(SYS_fork, 0, seed, out);
+    if (pid < 0) return 0;
+    if (!pid) _exit(matches(seed, out) ? 0 : 1);
+    int status;
+    if (!matches(seed, out) || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status)) return 0;
+    struct sigaction sa = {.sa_handler = signal_clobber};
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGUSR1, &sa, NULL)) return 0;
+    /* Queue while blocked, then unblock via raw syscall with state live. */
+    sigset_t set;
+    sigemptyset(&set); sigaddset(&set, SIGUSR1);
+    if (sigprocmask(SIG_BLOCK, &set, NULL) || raise(SIGUSR1)) return 0;
+    uint64_t mask = 1ULL << (SIGUSR1 - 1);
+    long ret;
+    register long r10 __asm__("r10") = 8;
+    __asm__ volatile("movdqu (%2), %%xmm15; fldl 32(%2); syscall; "
+                     "fstpl 32(%3); movdqu %%xmm15, (%3)"
+                     : "=a"(ret) : "a"((long)SYS_rt_sigprocmask), "r"(seed), "r"(out),
+                       "D"((long)SIG_UNBLOCK), "S"(&mask), "d"(0L), "r"(r10)
+                     : "rcx", "r11", "xmm15", "st", "memory");
+    return ret == 0 && !memcmp(seed, out, 16) && seed[4] == out[4];
 }
 
-int main(void) {
-    printf("====================================================\n");
-    printf("AvoryOS Lazy FPU Context Switch Benchmark\n");
-    printf("====================================================\n");
-
-    calibrate_tsc();
-    printf("\n[INFO] TSC frequency: %llu MHz\n",
-           (unsigned long long)(g_tsc_khz / 1000));
-
-    // 1. Correctness
-    int ok = test_fpu_correctness();
-    if (!ok) {
-        printf("\n[ABORT] Correctness failure — not running benchmarks.\n");
-        return 1;
+#define ROUNDS 20000
+static int turn;
+static void wait_turn(int want) {
+    int value;
+    while ((value = __atomic_load_n(&turn, __ATOMIC_ACQUIRE)) != want)
+        raw6(SYS_futex, (long)&turn, FUTEX_WAIT_PRIVATE, value, 0, 0, 0);
+}
+static void handoff(int next) {
+    __atomic_store_n(&turn, next, __ATOMIC_RELEASE);
+    raw6(SYS_futex, (long)&turn, FUTEX_WAKE_PRIVATE, 1, 0, 0, 0);
+}
+static void touch_fpu(void) {
+    __asm__ volatile("pxor %%xmm15, %%xmm15" ::: "xmm15");
+}
+static void *pong_integer(void *arg) {
+    (void)arg;
+    for (int i = 0; i < ROUNDS; i++) { wait_turn(1); handoff(0); }
+    return NULL;
+}
+static void *pong_fpu(void *arg) {
+    (void)arg;
+    for (int i = 0; i < ROUNDS; i++) { wait_turn(1); touch_fpu(); handoff(0); }
+    return NULL;
+}
+static uint64_t ns(const struct timespec *t) { return (uint64_t)t->tv_sec * 1000000000 + t->tv_nsec; }
+static uint64_t benchmark(int use_fpu) {
+    pthread_t thread;
+    struct timespec start, end;
+    turn = 0;
+    if (pthread_create(&thread, NULL, use_fpu ? pong_fpu : pong_integer, NULL)) exit(1);
+    raw6(SYS_clock_gettime, CLOCK_MONOTONIC, (long)&start, 0, 0, 0, 0);
+    for (int i = 0; i < ROUNDS; i++) {
+        if (use_fpu) touch_fpu();
+        handoff(1); wait_turn(0);
     }
-
-    // 2. Benchmark: integer-only threads (no FPU, lazy FPU skips fxsave/fxrstor entirely)
-    printf("\n[2] Benchmarking ping-pong context switches (no FPU, %d rounds)...\n",
-           PINGPONG_ROUNDS);
-    uint64_t cyc_nofpu;
-    bench_pingpong(0, &cyc_nofpu);
-    double ns_nofpu = tsc_to_ns(cyc_nofpu) / (PINGPONG_ROUNDS * 2.0);
-    printf("    No-FPU switches:  %llu cycles total  (%.1f ns/switch)\n",
-           (unsigned long long)cyc_nofpu, ns_nofpu);
-
-    // 3. Benchmark: FPU threads (triggers #NM once per ownership change, then cached)
-    printf("\n[3] Benchmarking ping-pong context switches (WITH FPU, %d rounds)...\n",
-           PINGPONG_ROUNDS);
-    uint64_t cyc_fpu;
-    bench_pingpong(1, &cyc_fpu);
-    double ns_fpu = tsc_to_ns(cyc_fpu) / (PINGPONG_ROUNDS * 2.0);
-    printf("    FPU switches:     %llu cycles total  (%.1f ns/switch)\n",
-           (unsigned long long)cyc_fpu, ns_fpu);
-
-    // 4. Summary
-    printf("\n====================================================\n");
-    printf("RESULTS SUMMARY:\n");
-    printf("  Integer-only threads:  %.1f ns / context switch\n", ns_nofpu);
-    printf("  FPU-using threads:     %.1f ns / context switch\n", ns_fpu);
-    printf("\n  (With eager FPU, BOTH would pay fxsave+fxrstor per switch)\n");
-    printf("  (With lazy FPU,  integer threads pay ZERO FPU save/restore)\n");
-    printf("====================================================\n");
-    printf("LAZY FPU BENCHMARK COMPLETED SUCCESSFULLY!\n");
-    printf("====================================================\n");
-
+    raw6(SYS_clock_gettime, CLOCK_MONOTONIC, (long)&end, 0, 0, 0, 0);
+    if (pthread_join(thread, NULL)) exit(1);
+    return ns(&end) - ns(&start);
+}
+int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    has_avx = avx_enabled();
+    puts("Lazy FPU: correctness across available CPUs");
+    if (!correctness()) { puts("FAIL: SMP register preservation/fork/signal"); return 1; }
+    cpu_set_t allowed, one;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed)) { perror("getaffinity"); return 1; }
+    int cpu;
+    for (cpu = 0; cpu < CPU_SETSIZE && !CPU_ISSET(cpu, &allowed); cpu++);
+    if (cpu == CPU_SETSIZE) return 1;
+    CPU_ZERO(&one); CPU_SET(cpu, &one);
+    if (sched_setaffinity(0, sizeof(one), &one)) { perror("setaffinity"); return 1; }
+    has_avx = avx_enabled();
+    printf("Lazy FPU: CPU %d, x87/SSE%s correctness\n", cpu, has_avx ? "/AVX" : "");
+    if (!correctness()) { puts("FAIL: register preservation/fork/signal"); return 1; }
+    puts("PASS: yields, ownership collisions, thread teardown, fork, signal return");
+    uint64_t integer = benchmark(0), fpu = benchmark(1);
+    printf("%d rounds on one CPU: integer %llu ns/handoff, SIMD %llu ns/handoff\n",
+           ROUNDS, (unsigned long long)(integer / (2 * ROUNDS)), (unsigned long long)(fpu / (2 * ROUNDS)));
+    puts("Includes futex and scheduling overhead; compare identical eager/lazy builds.");
     return 0;
 }

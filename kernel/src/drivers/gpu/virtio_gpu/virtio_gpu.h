@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 struct drm_file;
+struct drm_gem_object;
 struct vfs_node;
 #define VIRTIO_GPU_MAX_MODES 32
 struct virtio_gpu_mode {
@@ -64,6 +65,9 @@ struct virtio_gpu_device {
 
 bool virtio_gpu_init(void);
 bool virtio_gpu_is_initialized(void);
+const struct pci_device *virtio_gpu_pci_device(void);
+int virtio_gpu_prepare_prime_fb(struct drm_gem_object *obj, uint32_t width,
+                                uint32_t height, uint32_t pitch, uint32_t offset);
 bool virtio_gpu_get_display_info(struct virtio_gpu_resp_display_info *out);
 bool virtio_gpu_phase2_stress_test(uint32_t iterations);
 bool virtio_gpu_phase3_init_scanout(void);

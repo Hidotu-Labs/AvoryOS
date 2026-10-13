@@ -7,6 +7,7 @@
 #include "console/debug.h"
 #include "console/klog.h"
 #include "cpu/features.h"
+#include "cpu/fpu.h"
 #include "cpu/gdt.h"
 #include "cpu/idt.h"
 #include "cpu/tsc.h"
@@ -172,6 +173,7 @@ void ap_main(void) {
 
   // 3. Load the IDT for this core (reuse the BSP's already-built table)
   idt_load();
+  fpu_init_cpu();
 
   // 3.5. Program this core's SYSCALL/SYSRET MSRs.  They are per-CPU: without
   // this, a user thread scheduled here executes `syscall` with EFER.SCE clear
@@ -220,11 +222,16 @@ void ap_main(void) {
     bool defer_pending = vmm_defer_pending() != 0;
     if (defer_pending)
       vmm_defer_drain(VMM_DEFER_IDLE_NODES);
+    /* Pre-zero pool refill on otherwise-dead CPU time (see BSP idle loop):
+     * fault paths pop zeroed frames instead of paying memset. */
+    bool zero_refill = pmm_zero_pool_needs_refill();
+    if (zero_refill)
+      pmm_zero_pool_refill(8);
     /* Slow tick at 2 s: lockdiag flags a CPU hung after 3 s
      * (LOCKDIAG_HUNG_CPU_MS), so 2 s still reports promptly while halving
      * idle wakeups vs the old 1 s. */
     lapic_timer_rearm_if_earlier(lapic_timer_get_ms() +
-                                 (defer_pending ? 1 : 2000));
+                                 ((defer_pending || zero_refill) ? 1 : 2000));
     hal_cpu_halt();
   }
 }

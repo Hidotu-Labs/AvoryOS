@@ -16,6 +16,9 @@
 #include "../mm/vmm.h"
 #include "../sched/sched.h"
 #include "syscall.h"
+#include "../include/arch/uaccess.h"
+#include "../drivers/timer/rtc.h"
+#include "../apic/lapic_timer.h"
 #define TSC_PROBES_ENABLE
 #include "../lib/tsc.h"
 
@@ -39,8 +42,15 @@ struct shm_segment {
   uint32_t creator_pid; // PID of creator
   uint32_t creator_uid;
   uint32_t creator_gid;
+  uint32_t owner_uid;
+  uint32_t owner_gid;
   uint32_t last_pid;    // PID of last shmat/shmdt
+  uint64_t attach_time, detach_time, change_time;
 };
+
+static uint64_t shm_now(void) {
+  return rtc_get_boot_timestamp() + lapic_timer_get_ms() / 1000;
+}
 
 // Global State
 
@@ -183,6 +193,11 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg, uint64_t a3,
   seg->nattch = 0;
   seg->perm_mode = (uint32_t)(shmflg & 0x1FF); // Low 9 bits = permissions
   seg->creator_pid = 0;
+  seg->creator_uid = 0;
+  seg->creator_gid = 0;
+  seg->last_pid = 0;
+  seg->attach_time = seg->detach_time = 0;
+  seg->change_time = shm_now();
 
   struct thread *t = sched_get_current();
   if (t) {
@@ -190,6 +205,8 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg, uint64_t a3,
     seg->creator_uid = t->euid;
     seg->creator_gid = t->egid;
   }
+  seg->owner_uid = seg->creator_uid;
+  seg->owner_gid = seg->creator_gid;
 
   uint32_t id = seg->shmid;
 
@@ -233,8 +250,10 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
   uint32_t requested = (shmflg & SHM_RDONLY) ? 4 : 6;
   if (t->euid != 0) {
     uint32_t allowed = seg->perm_mode & 7;
-    if (t->euid == seg->creator_uid) allowed = (seg->perm_mode >> 6) & 7;
-    else if (vfs_in_group(seg->creator_gid)) allowed = (seg->perm_mode >> 3) & 7;
+    if (t->euid == seg->owner_uid || t->euid == seg->creator_uid)
+      allowed = (seg->perm_mode >> 6) & 7;
+    else if (vfs_in_group(seg->owner_gid) || vfs_in_group(seg->creator_gid))
+      allowed = (seg->perm_mode >> 3) & 7;
     if ((allowed & requested) != requested) {
       spinlock_release(&shm_lock);
       return -13;
@@ -311,6 +330,7 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
   }
 
   seg->nattch++;
+  seg->attach_time = shm_now();
   seg->last_pid = t->tid;
 
   spinlock_release(&shm_lock);
@@ -389,6 +409,7 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t a1, uint64_t a2, uint64_t a3,
   if (seg) {
     if (seg->nattch > 0)
       seg->nattch--;
+    seg->detach_time = shm_now();
     seg->last_pid = t->tid;
 
     // If marked for destruction and no more attaches, free the segment
@@ -403,17 +424,60 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t a1, uint64_t a2, uint64_t a3,
 
 // sys_shmctl
 
+/* Linux x86_64 IPC_INFO and SHM_INFO layouts. All pages are resident: this
+ * implementation has no swapping, so the swap counters remain zero. */
+struct shm_limits {
+  uint64_t shmmax, shmmin, shmmni, shmseg, shmall;
+  uint64_t unused[4];
+};
+
+struct shm_usage {
+  int32_t used_ids;
+  uint32_t pad;
+  uint64_t shm_tot, shm_rss, shm_swp, swap_attempts, swap_successes;
+};
+
 int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf, uint64_t a3,
                    uint64_t a4, uint64_t a5) {
   (void)a3;
   (void)a4;
   (void)a5;
 
+  cmd &= ~0x100ULL; // IPC_64: native x86_64 always uses the 64-bit layout
+  struct shmid_ds input;
+  if (cmd == 1 /* IPC_SET */ &&
+      copy_from_user(&input, (const void *)buf, sizeof(input)) != 0)
+    return -14;
+
   spinlock_acquire(&shm_lock);
 
+  if (cmd == 3 /* IPC_INFO */ || cmd == 14 /* SHM_INFO */) {
+    struct shm_limits limits = {
+      .shmmax = SHM_MAX_SIZE, .shmmin = 1,
+      .shmmni = SHM_MAX_SEGMENTS, .shmseg = SHM_MAX_SEGMENTS,
+      .shmall = (uint64_t)SHM_MAX_SEGMENTS * MAX_SHM_PAGES
+    };
+    struct shm_usage usage = {0};
+    int highest = 0;
+    for (int i = 0; i < SHM_MAX_SEGMENTS; i++) {
+      if (shm_table[i].active) {
+        highest = i;
+        usage.used_ids++;
+        usage.shm_tot += shm_table[i].num_pages;
+      }
+    }
+    usage.shm_rss = usage.shm_tot;
+    spinlock_release(&shm_lock);
+    const void *out = cmd == 3 ? (const void *)&limits : (const void *)&usage;
+    size_t len = cmd == 3 ? sizeof(limits) : sizeof(usage);
+    return copy_to_user((void *)buf, out, len) != 0 ? -14 : highest;
+  }
+
   struct shm_segment *seg = NULL;
+  bool by_index = cmd == 13 /* SHM_STAT */ || cmd == 15 /* SHM_STAT_ANY */;
   for (int i = 0; i < SHM_MAX_SEGMENTS; i++) {
-    if (shm_table[i].active && shm_table[i].shmid == (uint32_t)shmid) {
+    if (shm_table[i].active &&
+        (by_index ? (uint64_t)i == shmid : shm_table[i].shmid == shmid)) {
       seg = &shm_table[i];
       break;
     }
@@ -424,11 +488,20 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf, uint64_t a3,
     return -22; // EINVAL
   }
 
-  if (cmd == IPC_RMID) {
+  if (cmd == IPC_RMID || cmd == 1 /* IPC_SET */) {
     struct thread *caller = sched_get_current();
-    if (!caller || (caller->euid != 0 && caller->euid != seg->creator_uid)) {
+    if (!caller || (caller->euid != 0 && caller->euid != seg->creator_uid &&
+                    caller->euid != seg->owner_uid)) {
       spinlock_release(&shm_lock);
       return -1;
+    }
+    if (cmd == 1) {
+      seg->owner_uid = input.shm_perm.uid;
+      seg->owner_gid = input.shm_perm.gid;
+      seg->perm_mode = input.shm_perm.mode & 0777;
+      seg->change_time = shm_now();
+      spinlock_release(&shm_lock);
+      return 0;
     }
     if (seg->nattch == 0) {
       // No attaches — free immediately
@@ -441,22 +514,36 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf, uint64_t a3,
     return 0;
   }
 
-  if (cmd == IPC_STAT && buf != 0) {
-    struct shmid_ds *ds = (struct shmid_ds *)buf;
-    memset(ds, 0, sizeof(struct shmid_ds));
-
-    ds->shm_perm.__key = seg->key;
-    ds->shm_perm.uid = seg->creator_uid;
-    ds->shm_perm.gid = seg->creator_gid;
-    ds->shm_perm.mode = seg->perm_mode;
-
-    ds->shm_segsz = PAGE_ALIGN_UP(seg->size);
-    ds->shm_nattch = seg->nattch;
-    ds->shm_cpid = seg->creator_pid;
-    ds->shm_lpid = seg->last_pid;
-
+  if (cmd == IPC_STAT || by_index) {
+    struct thread *caller = sched_get_current();
+    if (!caller) { spinlock_release(&shm_lock); return -1; }
+    uint32_t allowed = seg->perm_mode & 7;
+    if (caller->euid == seg->owner_uid || caller->euid == seg->creator_uid)
+      allowed = (seg->perm_mode >> 6) & 7;
+    else if (vfs_in_group(seg->owner_gid) || vfs_in_group(seg->creator_gid))
+      allowed = (seg->perm_mode >> 3) & 7;
+    if (cmd != 15 && caller->euid != 0 && !(allowed & 4)) {
+      spinlock_release(&shm_lock);
+      return -13;
+    }
+    struct shmid_ds ds = {0};
+    ds.shm_perm.__key = seg->key;
+    ds.shm_perm.uid = seg->owner_uid;
+    ds.shm_perm.gid = seg->owner_gid;
+    ds.shm_perm.cuid = seg->creator_uid;
+    ds.shm_perm.cgid = seg->creator_gid;
+    ds.shm_perm.mode = seg->perm_mode | (seg->marked_destroy ? 01000 : 0);
+    ds.shm_segsz = seg->size;
+    ds.shm_atime = seg->attach_time;
+    ds.shm_dtime = seg->detach_time;
+    ds.shm_ctime = seg->change_time;
+    ds.shm_nattch = seg->nattch;
+    ds.shm_cpid = seg->creator_pid;
+    ds.shm_lpid = seg->last_pid;
+    uint32_t id = seg->shmid;
     spinlock_release(&shm_lock);
-    return 0;
+    return copy_to_user((void *)buf, &ds, sizeof(ds)) != 0 ? -14 :
+           (by_index ? (int64_t)id : 0);
   }
 
   spinlock_release(&shm_lock);

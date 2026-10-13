@@ -121,8 +121,8 @@ Update this file in the same change that introduces or closes a gap.
   `ktime_get_mono_fast_ns`/`ktime_get_real_seconds`,
   `request_firmware_direct`, `rb_first_postorder`/`rb_next_postorder`
   (native rbtree), `add_taint`/`system_state`/`orderly_poweroff`/
-  `emergency_restart`, `__put_task_struct` (no-op; shadows live until a
-  thread-exit hook exists).
+  `emergency_restart`, `__put_task_struct` (releases a zero-reference task
+  shadow and its kthread control block).
 - **Shapes added to overlays**: `struct page::pgmap`, `struct folio::swap`,
   `struct dev_pm_domain`, `kobj_type`/`kset` + `kobject_init/add/set_name`,
   `kset_register/unregister/create_and_add`, `struct sysfs_ops`,
@@ -510,7 +510,8 @@ prerequisites and the hardware-bring-up findings.
   a 1000-iteration BO create/map/free loop with a native PMM free-page
   invariant.  The bad-CS/fence-timeout recovery path stays in C8 (it needs
   the reset paths).  Hardware evidence lands in the C5 progress entry; the
-  `run-c5` target boots it interactively from a cold GPU.
+  retired `run-c5` target booted it interactively from a cold GPU; current
+  sessions use `make run-c7-prime`.
 
 ### C6 — 6e: KMS/DCN
 
@@ -555,7 +556,7 @@ prerequisites and the hardware-bring-up findings.
   DRM debugfs (`CONFIG_DEBUG_FS` is off) and the sysfs `status` force alone
   is refused by `amdgpu_dm_connector_funcs_force()` without an EDID.  The
   parameter defaults to 0, so gate-off and normal boots restore the C6
-  behavior exactly.  `run-c7` bakes it; a physical monitor takes precedence
+  behavior exactly. The retired `run-c7` target enabled it; a physical monitor takes precedence
   automatically (`dcn physical ...`, no override needed).
 - **Session DRM selection is a guest helper, not static config.**
   `/bin/drm-pick.sh` prints the card a session should use: amdgpu's node by
@@ -1265,13 +1266,15 @@ divergences for its chunk; the Phase 5 exit matrix in
 - **`ww_mutex_trylock()` returns 1/0, not 0/-EBUSY** (see the corrected
   Phase 3 entry above).  Found by the first C2 boot: TTM's
   `WARN_ON(!dma_resv_trylock())` fired on every successful trylock.
-- **Page cache-mode API is inert** (`linuxkpi/src/x86_stubs.c`): TTM calls
+- **Page cache-mode API implemented (2026-10-11)** (`linuxkpi/src/x86_stubs.c`): TTM calls
   `set_pages_wb()`, `set_pages_array_uc()`, `set_pages_array_wc()`,
   `set_pages_array_wb()`, `cachemode2protval()` and `pgprot_writecombine()`.
-  All RAM is HHDM write-back and AvoryOS has no PAT/MTRR programming, so the
-  cache flips are accepted and ignored; `cachemode2protval()` returns the
-  correct x86 PAT bits (so the pgprot values are well formed) but the kmap
-  paths that consume them are plain HHDM lookups.  `clear_page_orig/rep/erms`
+  Transitions now drain stores, flush the page's CPU cache lines, update the
+  HHDM through the native VMM's SMP shootdown path and record its effective
+  cache bits. WC uses native PAT entry 7. RAM mmap/vmap aliases inherit the
+  page's type; VM_IO alone no longer makes ordinary GTT RAM uncached. BAR
+  mappings retain the driver's explicit cache protection. Failed array
+  transitions restore preceding pages. `clear_page_orig/rep/erms`
   are `memset()` over the HHDM (`clear_page()` in stock x86 `page_64.h`
   references them through the alternatives machinery).
 - **`struct page::private` is `unsigned long`**, matching upstream (it was
@@ -1295,8 +1298,9 @@ divergences for its chunk; the Phase 5 exit matrix in
   Workqueue workers are created on demand and retire after 5 s idle
   (`KPI_SERVICE_IDLE_MS`), so an unused queue shows no `kworker/*` thread;
   `kworker/vkms_co` and the `card1-crtc0` vblank worker follow the same
-  retire/respawn rule.  Workers that self-retire leave their task shadow and
-  kthread control block retained (the documented self-exit behaviour).
+  retire/respawn rule. Internal self-retiring workers relinquish creator
+  ownership; native reaping releases their remaining reference and control
+  block. Destruction takes a temporary reference under the publication lock.
 - **`struct mm_struct` is still a placeholder** but now carries `pgd`,
   `init_mm` is a zeroed instance, and `swp_entry_t`/`enum fault_flag` are
   defined in the `mm_types.h` overlay because stock `<linux/pgtable.h>` needs
@@ -1382,14 +1386,11 @@ divergences for its chunk; the Phase 5 exit matrix in
   returns -ENODEV.
 - **`struct task_struct` is a per-thread shadow** (`linuxkpi/src/task.c`) with
   `kpi_thread` first; `task_tgid()` returns an opaque token built from the
-  native tgid, not a `struct pid`.  The native exit path now calls
-  `linuxkpi_thread_exiting()`, which clears `kpi_thread` before the reaper can
-  free the thread; the shadow object itself is still deliberately retained for
-  kernel threads so a later `kthread_stop()` can resolve `kpi_control` (the
-  shadow with no control block, e.g. for user threads, is leaked too - freeing
-  it needs reference counting against imported code that stores task
-  pointers).  `kthread_stop()` must keep working after the thread has exited
-  and been reaped; this is the hook that makes that safe.
+  native tgid, not a `struct pid`. Native reaping clears the back-pointer
+  and releases the native owner's reference for both user and kernel tasks.
+  A kthread creator holds a separate reference until stop/detach, so stopping
+  after native reaping remains safe. Imported get/put references keep a
+  detached shadow alive. The final put frees its control block and shadow.
 - **Initcalls run in a kthread with a bounded wait**
   (`linuxkpi/src/initcalls.c`): the walker itself stays native
   (`kernel/src/linuxkpi/init.c`), but it is invoked from a `kpi/initcalls`
@@ -1411,24 +1412,19 @@ divergences for its chunk; the Phase 5 exit matrix in
   bare `call __sw_hweight*` with an empty clobber list and relies on the
   upstream register-preserving convention; a C implementation silently
   corrupts live caller registers.
-- **ww_mutex cannot wound** (`linuxkpi/src/ww_mutex.c`): recursive
-  acquisition with the same acquire context returns `-EALREADY` (as
-  upstream, which DRM's `modeset_lock()` treats as success), but multi-lock
-  acquire sequences still cannot back off under contention; they rely on the
-  plain mutex FIFO.  **Correction (C2, 2026-09-12):** `ww_mutex_trylock()`
-  must return `1` on success and `0` when busy, not `0`/`-EBUSY`: upstream
-  `kernel/locking/mutex.c` and the bool casts in `<linux/dma-resv.h>` /
-  `drm_modeset_lock.c` all rely on the truthy convention.  The Phase 3
-  "0/-EBUSY convention" note was wrong and caused
-  `WARN_ON(!dma_resv_trylock())` to fire in TTM's BO init.
-  **P6 C5 decision (2026-09-13):** wounding stays unimplemented for now.
-  TTM/amdgpu reserve BO sets in a global order, so the ordered path is the
-  one that runs; a runtime WARN cannot tell that safe contention from a real
-  cycle without wait tracking, so the assumption is documented here and
-  exercised by the three-thread ordered multi-lock stress in
-  `test_phase1_core6.c` (`ww_mutex multi-lock ordered`).  If a future
-  workload acquires ww locks in conflicting orders, implement wound/wait
-  before trusting it (C8 owns the error-injection side).
+- **Native ww_mutex transaction locks** (`linuxkpi/src/ww_mutex.c`,
+  2026-10-12 correction): wound-wait and wait-die now have distinct classes,
+  stamp-ordered waiters, balanced held-lock counts and atomic owner/context
+  publication under the queue lock. A transaction's first contested lock
+  waits rather than returning `-EDEADLK`; a wounded holder already blocked
+  on another BO is woken to back off. Opposite-order transactions and slow
+  retries retaining the same ticket are exercised in
+  `scripts/tests/test_kpi_ww_mutex.py`. Recursive acquisition still returns
+  `-EALREADY`, and trylock retains the corrected `1`/`0` convention.
+  The former C5 assumption that BO sets are always acquired in a global
+  order is insufficient for arbitrary userspace workloads. Priority
+  inheritance and lockdep remain unsupported. See
+  [the native audit](linuxkpi-gpu-lock-audit.md) for evidence and limits.
 - **rbtree augmented internals are an excerpt** (`linuxkpi/src/rbtree_aug.c`,
   verbatim upstream `lib/rbtree.c`): native `kernel/src/lib/rbtree.c` still
   owns the base `rb_*` API; importing upstream `lib/rbtree.c` requires

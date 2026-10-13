@@ -391,23 +391,23 @@ static int netlink_setsockopt(socket_t *sock, int level, int optname,
     return -22;
   netlink_sock_t *nsk = (netlink_sock_t *)sock->sk;
 
-  klog_puts("[NETLINK] setsockopt: level=");
-  klog_uint64((uint64_t)level);
-  klog_puts(" optname=");
-  klog_uint64((uint64_t)optname);
-  klog_puts("\n");
 
   if (level == SOL_NETLINK) {
     switch (optname) {
+    case NETLINK_EXT_ACK: {
+      int enabled;
+      if (optlen < (int)sizeof(enabled)) return -22;
+      if (copy_from_user(&enabled, optval, sizeof(enabled))) return -14;
+      nsk->ext_ack = enabled != 0;
+      return 0;
+    }
     case NETLINK_ADD_MEMBERSHIP: {
       if (optlen < (int)sizeof(int))
         return -22;
       int group = *(const int *)optval;
-      klog_puts("[NETLINK] setsockopt: ADD_MEMBERSHIP group=");
-      klog_uint64((uint64_t)group);
-      klog_puts("\n");
 
-      uint32_t group_mask = (1 << (group - 1));
+      if (group < 1 || group > 32) return -22;
+      uint32_t group_mask = (1u << (group - 1));
       nsk->groups |= group_mask;
 
       if (group == 1) { // 1 is often the uevent group
@@ -419,22 +419,30 @@ static int netlink_setsockopt(socket_t *sock, int level, int optname,
       if (optlen < (int)sizeof(int))
         return -22;
       int group = *(const int *)optval;
-      uint32_t group_mask = (1 << (group - 1));
+      if (group < 1 || group > 32) return -22;
+      uint32_t group_mask = (1u << (group - 1));
       nsk->groups &= ~group_mask;
       return 0;
     }
     }
   } else if (level == SOL_SOCKET) {
     switch (optname) {
+    case SO_KEEPALIVE: {
+      int enabled;
+      if (optlen < (int)sizeof(enabled)) return -22;
+      if (copy_from_user(&enabled, optval, sizeof(enabled))) return -14;
+      nsk->keepalive = enabled != 0;
+      return 0;
+    }
     case SO_PASSCRED:
-      klog_puts("[NETLINK] setsockopt: SO_PASSCRED\n");
+
       if (optlen >= (int)sizeof(int))
         nsk->passcred = (*(const int *)optval != 0);
       else
         nsk->passcred = true;
       return 0;
     case 26: // SO_ATTACH_FILTER
-      klog_puts("[NETLINK] setsockopt: SO_ATTACH_FILTER\n");
+
       return 0; // Stub success
     case 2:     // SO_REUSEADDR
       return 0;
@@ -451,12 +459,27 @@ static int netlink_setsockopt(socket_t *sock, int level, int optname,
 
 static int netlink_getsockopt(socket_t *sock, int level, int optname,
                               void *optval, int *optlen) {
-  (void)sock;
-  (void)optval;
-  (void)optlen;
-  (void)level;
-  (void)optname;
-  return -92; // ENOPROTOOPT
+  if (!sock || !sock->sk) return -22;
+  netlink_sock_t *nsk = (netlink_sock_t *)sock->sk;
+  int value;
+  if (level == SOL_NETLINK && optname == NETLINK_EXT_ACK) {
+    value = nsk->ext_ack;
+  } else if (level == SOL_SOCKET) {
+    switch (optname) {
+    case SO_KEEPALIVE: value = nsk->keepalive; break;
+    case SO_PASSCRED: value = nsk->passcred; break;
+    default: return -92;
+    }
+  } else {
+    return -92;
+  }
+  int len;
+  if (copy_from_user(&len, optlen, sizeof(len))) return -14;
+  if (len < 0) return -22;
+  if (len > (int)sizeof(value)) len = sizeof(value);
+  if (len && copy_to_user(optval, &value, len)) return -14;
+  if (copy_to_user(optlen, &len, sizeof(len))) return -14;
+  return 0;
 }
 
 static ssize_t netlink_recvfrom(socket_t *sock, void *buf, size_t len,

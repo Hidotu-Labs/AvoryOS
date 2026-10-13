@@ -5,6 +5,7 @@
 #include "fs/ramfs.h"
 #include "lib/string.h"
 #include "mm/heap.h"
+#include <linuxkpi/native_sysfs.h>
 
 #define PCI_SYSFS_MAX_DEVICES PCI_MAX_DEVICES
 
@@ -229,6 +230,7 @@ static int pci_show(void *opaque, char *buf, size_t size) {
                     "PCI_SUBSYS_ID=%04X:%04X\n"
                     "PCI_SLOT_NAME=%04X:%02X:%02X.%u\n"
                     "MODALIAS=pci:v0000%04Xd0000%04Xsv%08Xsd%08Xbc%02Xsc%02Xi%02X\n",
+                    pci->linux_driver_name ? pci->linux_driver_name :
                     pci->kernel_device && pci->kernel_device->driver
                         ? pci->kernel_device->driver->name
                         : "",
@@ -322,6 +324,38 @@ static void add_driver_links(struct pci_device *pci, struct driver *driver) {
   pci_symlink(ddir, "driver", target);
   snprintf(target, sizeof(target),
            "../../../../devices/pci0000:00/%s", pci->kernel_device->name);
+  pci_symlink(drvdir, pci->kernel_device->name, target);
+}
+
+void sysfs_pci_linux_driver(struct pci_device *pci, const char *name) {
+  if (!pci || !pci->kernel_device)
+    return;
+  vfs_node_t *ddir = device_dir(pci);
+  const char *old = pci->linux_driver_name;
+  if (old && pci_drivers_dir) {
+    vfs_node_t *old_dir = vfs_finddir(pci_drivers_dir, (char *)old);
+    asc_sysfs_remove(old_dir, pci->kernel_device->name);
+    asc_sysfs_remove(ddir, "driver");
+  }
+  pci->linux_driver_name = name;
+  if (!name) {
+    if (pci->kernel_device->driver)
+      add_driver_links(pci, pci->kernel_device->driver);
+    return;
+  }
+  if (!ddir || !pci_drivers_dir)
+    return;
+  vfs_node_t *drvdir = pci_mkdir(pci_drivers_dir, name);
+  if (!drvdir)
+    return;
+  /* libudev obtains the bound driver from this link, not just DRIVER= in
+   * uevent. OutputClass MatchDriver needs both identities to agree. */
+  asc_sysfs_remove(ddir, "driver");
+  char target[160];
+  snprintf(target, sizeof(target), "../../../bus/pci/drivers/%s", name);
+  pci_symlink(ddir, "driver", target);
+  snprintf(target, sizeof(target), "../../../../devices/pci0000:00/%s",
+           pci->kernel_device->name);
   pci_symlink(drvdir, pci->kernel_device->name, target);
 }
 

@@ -179,6 +179,12 @@ void tlb_shootdown_handle_ipi_regs(struct registers *regs) {
     if (id >= MAX_CPUS)
         return;
 
+    /* A lock waiter may already have serviced this request with IRQs masked.
+     * A delayed IPI must not flush or acknowledge an unpublished next request.
+     * Both paths execute with IRQs masked on this CPU. */
+    if (!__atomic_load_n(&cpu_shootdown_ack[id], __ATOMIC_ACQUIRE))
+        return;
+
     uint64_t entry_tsc = rdtsc();
     uint64_t active_cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(active_cr3));
@@ -345,6 +351,20 @@ void tlb_shootdown_handle_ipi_regs(struct registers *regs) {
 
 void tlb_shootdown_handle_ipi(void) {
     tlb_shootdown_handle_ipi_regs(NULL);
+}
+
+void tlb_shootdown_poll(void) {
+    /* An IRQ-masked lock waiter cannot receive its shootdown IPI. The sender
+     * can hold an outer lock that this waiter needs, so waiting for that lock
+     * without first acknowledging creates a cycle. Only service the local
+     * published request: no locks, allocation, scheduling or IRQ enable here.
+     * The normal handler performs the invalidation before its release ack. */
+    if (hal_irq_enabled())
+        return;
+    struct cpu_info *self = cpu_get_current();
+    if (self && self->cpu_id < MAX_CPUS &&
+        __atomic_load_n(&cpu_shootdown_ack[self->cpu_id], __ATOMIC_ACQUIRE))
+        tlb_shootdown_handle_ipi_regs(NULL);
 }
 
 static void tlb_shootdown_isr(struct registers *regs) {
@@ -827,6 +847,32 @@ bool tlb_flush_deferred_drain(void) {
 static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
                         uint64_t caller_ip) {
     uint32_t cpu_count = cpu_get_count();
+    /* A caller with interrupts masked cannot wait for acknowledgements.  A
+     * target that is itself in an interrupt-masked section (the page-fault
+     * gate enters with IF=0 and its handler runs under it) cannot receive the
+     * shootdown IPI until it unmasks IRQs. Lock waiters poll requests, but
+     * arbitrary critical sections need not poll: the initiator could
+     * spin here forever while the target spins behind a lock this path never
+     * releases.  Invalidate locally - which is what this CPU needs before it
+     * re-executes the faulting access - and record the remote part for the
+     * next drain that can wait (see tlb_flush_deferred_drain()). */
+    if (!hal_irq_enabled()) {
+        local_flush(addr, pcid);
+        if (tlb_self_slot() >= 0) {
+            if (addr == TLB_SHOOTDOWN_ALL)
+                tlb_flush_deferred_all();
+            else
+                tlb_flush_deferred(addr, pml4_base);
+        }
+        return;
+    }
+
+    spinlock_acquire(&shootdown_lock);
+    lockdiag_spot_take(LOCKDIAG_SPOT_SHOOTDOWN, 0, caller_ip);
+
+    /* Lock contention can open interrupts and reschedule the initiator.
+     * Select self and targets only once the winning acquire has masked IRQs;
+     * do not carry CPU-local identity or remote CR3 observations across it. */
     struct cpu_info *self = cpu_get_current();
 
     /* Freeze the target set before anything is published: the predicate reads
@@ -844,29 +890,10 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
 
     if (targets == 0) {
         local_flush(addr, pcid);
+        lockdiag_spot_drop(LOCKDIAG_SPOT_SHOOTDOWN);
+        spinlock_release(&shootdown_lock);
         return;
     }
-
-    /* A caller with interrupts masked cannot wait for acknowledgements.  A
-     * target that is itself in an interrupt-masked section (the page-fault
-     * gate enters with IF=0 and its handler runs under it) can never run the
-     * shootdown IPI handler, so the ack cannot arrive: the initiator would
-     * spin here forever while the target spins behind a lock this path never
-     * releases.  Invalidate locally - which is what this CPU needs before it
-     * re-executes the faulting access - and record the remote part for the
-     * next drain that can wait (see tlb_flush_deferred_drain()). */
-    if (!hal_irq_enabled()) {
-        local_flush(addr, pcid);
-        if (tlb_self_slot() >= 0) {
-            if (addr == TLB_SHOOTDOWN_ALL)
-                tlb_flush_deferred_all();
-            else
-                tlb_flush_deferred(addr, pml4_base);
-        }
-        return;
-    }
-
-    spinlock_acquire(&shootdown_lock);
 
     LOCKDIAG_STAT(shootdowns, 1);
     tlb_stat_add(&tlb_stats.shootdowns, 1);
@@ -1158,6 +1185,7 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
         }
     }
 
+    lockdiag_spot_drop(LOCKDIAG_SPOT_SHOOTDOWN);
     spinlock_release(&shootdown_lock);
 }
 

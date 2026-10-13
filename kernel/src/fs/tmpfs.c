@@ -377,18 +377,9 @@ static int tmpfs_fallocate(vfs_node_t *node, int mode, uint32_t offset, uint32_t
 }
 
 /*
- * Shared mmap of a tmpfs file.
- *
- * The frames of a tmpfs file belong to the file, exactly like the storage
- * behind a memfd or a GEM dumb buffer.  vmm_free_user_pages() only skips
- * pmm_free_page() for VMAs that carry MAP_SHARED, because the backing object -
- * not the mapping - owns the frame.  Serving a *private* mapping of these
- * frames would therefore hand live tmpfs storage back to the page allocator
- * when the mapping's owner exits, so private mappings are refused instead of
- * quietly accepted; they already fail with EINVAL today because tmpfs had no
- * mmap handler at all.  Everything that needs this path maps shared:
- * shm_open()+ftruncate()+mmap() (POSIX shm), X11 MIT-SHM, Qt QSharedMemory and
- * Mesa's shared cache files.
+ * Shared mmap maps the tmpfs-owned frames directly. Private mappings use the
+ * generic file page-cache path (mmap_shared_only below), which owns separate
+ * cache frames and handles copy-on-write without freeing live tmpfs storage.
  *
  * Callers must supply a concrete address (sys_mmap resolves one and sets
  * MAP_FIXED before calling any node->mmap, and the mremap/grow paths do too).
@@ -562,20 +553,20 @@ static struct dirent *tmpfs_readdir(vfs_node_t *node, uint32_t index) {
     if (!node || !node->device)
         return NULL;
 
-    static struct dirent d;
-    memset(&d, 0, sizeof(struct dirent));
+    struct dirent *d = vfs_readdir_buffer();
+    memset(d, 0, sizeof(struct dirent));
 
     if (index == 0) {
-        strcpy(d.name, ".");
-        d.ino = node->inode;
-        d.d_type = DT_DIR;
-        return &d;
+        strcpy(d->name, ".");
+        d->ino = node->inode;
+        d->d_type = DT_DIR;
+        return d;
     }
     if (index == 1) {
-        strcpy(d.name, "..");
-        d.ino = node->inode;
-        d.d_type = DT_DIR;
-        return &d;
+        strcpy(d->name, "..");
+        d->ino = node->inode;
+        d->d_type = DT_DIR;
+        return d;
     }
 
     index -= 2;
@@ -583,7 +574,7 @@ static struct dirent *tmpfs_readdir(vfs_node_t *node, uint32_t index) {
 
     /* getdents walks indices in sequence.  Resuming from the per-directory
      * cursor makes each step O(1); anything else (random access, two readers
-     * interleaving) safely falls back to a scan from the head.  The walk and
+     * interleaving) safely falls back to a scan from the head->  The walk and
      * the dirent fill run under the index lock: entries behind the cursor
      * can be unlinked (wrappers freed) at any moment. */
     vfs_dirindex_lock(&dir->di);
@@ -601,15 +592,15 @@ static struct dirent *tmpfs_readdir(vfs_node_t *node, uint32_t index) {
     dir->di.cursor_index = index;
 
     if (curr) {
-        strncpy(d.name, curr->node->name, 127);
-        d.name[127] = '\0';
-        d.ino = curr->node->inode;
-        d.d_type = vfs_dtype(curr->node->flags);
+        strncpy(d->name, curr->node->name, 127);
+        d->name[127] = '\0';
+        d->ino = curr->node->inode;
+        d->d_type = vfs_dtype(curr->node->flags);
     }
     vfs_dirindex_unlock(&dir->di);
 
     if (curr)
-        return &d;
+        return d;
     return NULL;
 }
 
@@ -721,6 +712,7 @@ static vfs_node_t *tmpfs_make_node(tmpfs_sb_t *sb, const char *name,
         n->truncate = tmpfs_truncate;
         n->fallocate = tmpfs_fallocate;
         n->mmap     = tmpfs_mmap;
+        n->mmap_shared_only = true;
     } else if (type == FS_DIRECTORY) {
         tmpfs_dir_t *d = kmalloc(sizeof(tmpfs_dir_t));
         if (!d) {
@@ -940,8 +932,10 @@ static int tmpfs_rmdir(vfs_node_t *node, char *name) {
     if (sb)
         tmpfs_free_inode(sb);
     /* Same deferred teardown as unlink: an open directory descriptor
-     * keeps the node (and its child list) alive. */
-    vfs_node_retire(curr->node);
+     * keeps the node (and its child list) alive. Drop the directory's
+     * ownership reference; the last close releases payload + node. */
+    curr->node->flags |= FS_DELETED;
+    vfs_close(curr->node);
     kfree(curr);
     return 0;
 }

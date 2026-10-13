@@ -2,6 +2,7 @@
 #include "../../../mm/heap.h"
 #include "../../../lib/string.h"
 #include "drm.h"
+#include "../virtio_gpu/virtio_gpu.h"
 
 extern struct drm_gem_object *ascentdrm_gem_find_by_handle(struct drm_device *dev, uint32_t handle);
 extern void ascentdrm_obj_add_prop(struct drm_mode_object *obj, uint32_t prop_id, uint64_t default_val);
@@ -134,6 +135,26 @@ struct drm_framebuffer *ascentdrm_framebuffer_create(struct drm_device *dev, str
     struct drm_gem_object *gem_obj = ascentdrm_gem_find_by_handle_get(dev, cmd->handle);
     if (!gem_obj) return NULL;
 
+    /* Xorg's modesetting PRIME output sink uses legacy ADDFB for its
+     * imported pixmap. Prepare the host-visible scanout backing here too,
+     * before exposing a framebuffer that the VirtIO device cannot upload. */
+    if (gem_obj->prime_buffer && virtio_gpu_is_initialized()) {
+        int ret = -22;
+        if (cmd->bpp == 32 && cmd->depth == 24) {
+            ret = ascentdrm_gem_begin_cpu(gem_obj);
+            if (!ret) {
+                ret = virtio_gpu_prepare_prime_fb(gem_obj, cmd->width,
+                                                  cmd->height, cmd->pitch, 0);
+                ascentdrm_gem_end_cpu(gem_obj);
+            }
+        }
+        if (ret) {
+            if (ascentdrm_gem_put_last(gem_obj))
+                ascentdrm_gem_object_free(dev, gem_obj);
+            return NULL;
+        }
+    }
+
     struct drm_framebuffer *fb = kmalloc(sizeof(struct drm_framebuffer));
     if (!fb) {
         if (ascentdrm_gem_put_last(gem_obj))
@@ -165,6 +186,19 @@ struct drm_framebuffer *ascentdrm_framebuffer_create(struct drm_device *dev, str
 void ascentdrm_framebuffer_free(struct drm_device *dev, struct drm_framebuffer *fb) {
     spinlock_acquire(&dev->lock);
     list_del(&fb->base.list);
+    /* KMS objects must never retain a framebuffer that is being deleted. */
+    struct drm_mode_object *obj;
+    list_for_each_entry(obj, &dev->kms_objects, list) {
+        if (obj->type == DRM_MODE_OBJECT_CRTC) {
+            struct drm_crtc *crtc = (struct drm_crtc *)obj;
+            if (crtc->fb == fb)
+                crtc->fb = NULL;
+        } else if (obj->type == DRM_MODE_OBJECT_PLANE) {
+            struct drm_plane *plane = (struct drm_plane *)obj;
+            if (plane->fb == fb)
+                plane->fb = NULL;
+        }
+    }
     spinlock_release(&dev->lock);
 
     if (fb->gem_obj) {

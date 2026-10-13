@@ -106,22 +106,44 @@ static struct vma *find_vma_cached(struct vma_list *vmas, uint64_t vaddr,
   return found;
 }
 
+/* Only native, full file-cache pages carry REFAULT. Neither a clear hardware
+ * dirty bit nor a file-backed VMA proves this: private copies retain their
+ * contents across fork even after mprotect makes them read-only. */
+static bool fork_can_refault(uint64_t pte, struct vma *vma, uint64_t vaddr) {
+  if (!(pte & PAGE_FLAG_REFAULT) || (pte & PAGE_FLAG_RW) || !vma ||
+      !(vma->flags & MAP_PRIVATE) ||
+      (vma->flags & (MAP_SHARED | MAP_ANONYMOUS | MAP_SYSV_SHM)) ||
+      !vma->file_node || vma->linux_vma || (vma->offset & 0xFFFULL))
+    return false;
+  uint64_t page_offset = vaddr - vma->start;
+  uint64_t file_size = vma->file_size ? vma->file_size : vma->end - vma->start;
+  return page_offset < file_size && file_size - page_offset >= 4096;
+}
+
+static bool clone_alloc_table(uint64_t **table_phys) {
+  if (*table_phys)
+    return true;
+  *table_phys = pmm_alloc();
+  if (!*table_phys)
+    return false;
+  memset(PHYS_TO_VIRT((uint64_t)*table_phys), 0, 4096);
+  return true;
+}
+
 static bool clone_table_vma(uint64_t *src_table_phys, int level,
                             size_t start, size_t end,
                             struct vma_list *vmas, uint64_t base_addr,
                             size_t *cow_count, struct vma **vma_cache,
                             uint64_t **new_table_out) {
   *new_table_out = NULL;
-  void *new_table_phys = pmm_alloc();
-  if (!new_table_phys)
+  /* Leaf tables are allocated only for the first retained PTE. A table of
+   * entirely reconstructible file pages costs no child table or frame refs. */
+  if (level != 1 && !clone_alloc_table(new_table_out))
     return false;
 
-  uint64_t *new_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)new_table_phys);
-  *new_table_out = (uint64_t *)new_table_phys;
+  uint64_t *new_virt = *new_table_out
+                           ? PHYS_TO_VIRT((uint64_t)*new_table_out) : NULL;
   uint64_t *src_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)src_table_phys);
-
-  for (size_t i = 0; i < 512; i++)
-    new_virt[i] = 0;
 
   for (size_t i = start; i < end; i++) {
     if (!(src_virt[i] & PAGE_FLAG_PRESENT))
@@ -174,6 +196,13 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
       struct vma *pvma = find_vma_cached(vmas, page_vaddr, vma_cache);
       bool shared = pvma && (pvma->flags & MAP_SHARED);
 
+      if (phys != vmm_get_vsyscall_page_phys() &&
+          fork_can_refault(src_virt[i], pvma, page_vaddr))
+        continue;
+      if (!clone_alloc_table(new_table_out))
+        return false;
+      new_virt = PHYS_TO_VIRT((uint64_t)*new_table_out);
+
       if (phys == vmm_get_vsyscall_page_phys() || shared) {
         // Shared/vDSO: alias the physical frame.  Page-cache-backed shared
         // mappings carry one PMM reference per PTE, so the child's copy needs
@@ -203,9 +232,10 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
       bool child_ok = clone_table_vma(
           child_src_phys, level - 1, 0, 512, vmas, child_base, cow_count,
           vma_cache, &child_new_phys);
-      if (child_new_phys)
+      if (child_new_phys) {
         new_virt[i] = ((uint64_t)child_new_phys & PAGE_MASK) |
                       (src_virt[i] & ~PAGE_MASK);
+      }
       if (!child_ok)
         return false;
     }
@@ -341,27 +371,39 @@ uint64_t vmm_clone_user_mappings_vma(uint64_t *src_pml4_phys,
 
 
 uint64_t *vmm_create_pml4(void) {
-  vmm_lock_acquire();
-
+  // Lock-free: the new table is invisible to every other CPU until the caller
+  // switches CR3 to it, so there is nothing to serialize against.  Taking
+  // vmm_lock here used to cost 40-60 us per execve (TSC execve_pml4_create):
+  // not the sub-microsecond alloc+copy, but spinning behind the fault storm
+  // on other cores plus the deferred-shootdown drain vmm_lock_release()
+  // performs.  pmm_alloc() is independently thread-safe (the fault path
+  // allocates outside vmm_lock too).
+  //
+  // The kernel half (256..511) is copied with atomic loads.  Each entry read
+  // is a single 8-byte load, so a concurrent kernel-half writer (which always
+  // holds vmm_lock) cannot tear an entry; at worst this snapshot misses a
+  // mapping installed concurrently.  In practice the kernel half is stable
+  // after boot (fb_map_wc() runs before APs/userland exist), and every
+  // runtime driver mapping goes through process VMAs, not the kernel half.
   void *new_pml4_phys = pmm_alloc();
-  if (!new_pml4_phys) {
-    vmm_lock_release();
+  if (!new_pml4_phys)
     return NULL;
-  }
 
   uint64_t *new_pml4_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)new_pml4_phys);
-  uint64_t *src_pml4_virt =
-      (uint64_t *)PHYS_TO_VIRT((uint64_t)vmm_get_kernel_pml4());
 
   // Blank user half.
   for (size_t i = 0; i < 256; i++)
     new_pml4_virt[i] = 0;
 
   // Shared kernel half.
+  uint64_t *src_pml4_virt =
+      (uint64_t *)PHYS_TO_VIRT((uint64_t)vmm_get_kernel_pml4());
+  if (!src_pml4_virt) {
+    pmm_free(new_pml4_phys);
+    return NULL;
+  }
   for (size_t i = 256; i < 512; i++)
-    new_pml4_virt[i] = src_pml4_virt[i];
-
-  vmm_lock_release();
+    new_pml4_virt[i] = __atomic_load_n(&src_pml4_virt[i], __ATOMIC_ACQUIRE);
 
   return (uint64_t *)new_pml4_phys;
 }

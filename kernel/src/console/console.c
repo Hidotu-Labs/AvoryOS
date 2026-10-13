@@ -48,6 +48,8 @@ static void console_render_char(uint32_t cp);
  * serial line rate.  Escape sequences are still never forwarded. */
 static char serial_mirror_buf[128];
 static size_t serial_mirror_len = 0;
+/* Protected by console_lock; klog already emitted its complete serial record. */
+static bool serial_mirror_enabled = true;
 
 static void console_serial_flush(void) {
   if (!serial_mirror_len)
@@ -1253,9 +1255,11 @@ static void console_putchar_unlocked(char c) {
   // Always forward raw bytes to serial (serial terminals handle UTF-8 natively).
   // Buffered until the batch ends: one burst instead of one port access per
   // character on the hot path.
-  if (serial_mirror_len == sizeof(serial_mirror_buf))
-    console_serial_flush();
-  serial_mirror_buf[serial_mirror_len++] = c;
+  if (serial_mirror_enabled) {
+    if (serial_mirror_len == sizeof(serial_mirror_buf))
+      console_serial_flush();
+    serial_mirror_buf[serial_mirror_len++] = c;
+  }
 
   // UTF-8 multi-byte decoding
   // Continuation byte (10xxxxxx)
@@ -1481,6 +1485,19 @@ bool console_write_batch_try(const char *buf, size_t len) {
   if (!spinlock_try_acquire(&console_lock))
     return false;
   console_write_batch_locked(buf, len);
+  spinlock_release(&console_lock);
+  return true;
+}
+
+bool console_write_screen_batch_try(const char *buf, size_t len) {
+  if (!console_initialized || fb_get_kd_mode() == KD_GRAPHICS)
+    return false;
+  if (!spinlock_try_acquire(&console_lock))
+    return false;
+  console_serial_flush();
+  serial_mirror_enabled = false;
+  console_write_batch_locked(buf, len);
+  serial_mirror_enabled = true;
   spinlock_release(&console_lock);
   return true;
 }

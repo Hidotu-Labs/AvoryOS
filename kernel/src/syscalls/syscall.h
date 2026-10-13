@@ -211,6 +211,8 @@
 #define SYS_SYNC_FILE_RANGE 277
 #define SYS_UTIMENSAT 280
 #define SYS_EPOLL_PWAIT 281
+#define SYS_EPOLL_PWAIT2 441
+#define SYS_USERFAULTFD 323
 #define SYS_SIGNALFD 282
 #define SYS_TIMERFD_CREATE 283
 #define SYS_FALLOCATE 285
@@ -342,7 +344,15 @@ bool syscall_log_allowed(const struct thread *t);
 struct syscall_regs {
   uint64_t rdi, rsi, rdx, r10, r8, r9, rax, rbx, rbp, r12, r13, r14, r15;
   uint64_t rip, rflags, rsp;
+  uint64_t user_cs, user_rcx, user_rsi, user_rdi;
 } __attribute__((packed));
+_Static_assert(__builtin_offsetof(struct syscall_regs, user_cs) == 128,
+               "syscall entry / fork return CS offset");
+_Static_assert(__builtin_offsetof(struct syscall_regs, user_rdi) == 152,
+               "compat IRET return register offset");
+
+struct registers;
+void syscall_compat_dispatch(struct registers *regs);
 
 // Standard handler: receives the 6 argument registers, returns result in rax.
 typedef uint64_t (*syscall_handler_t)(uint64_t, uint64_t, uint64_t, uint64_t,
@@ -362,6 +372,17 @@ void syscall_register_mm(void);
 void syscall_register_arch(void);
 void syscall_register_signal(void);
 void signal_deliver_syscall(struct syscall_regs *regs);
+void signal_finish_syscall(struct syscall_regs *regs, uint64_t number,
+                            uint64_t return_ip);
+bool syscall_restart_error(uint64_t result);
+void syscall_restart_return(struct registers *regs, uint64_t number,
+                             uint64_t return_ip, bool handler,
+                             uint64_t action_flags);
+struct thread;
+int syscall_user_dispatch_configure(struct thread *t, uint64_t mode,
+                                    uint64_t offset, uint64_t length,
+                                    uint64_t selector);
+bool syscall_user_dispatch_intercept(struct thread *t, struct syscall_regs *regs);
 void syscall_register_media(void);
 void syscall_register_socket(void);
 void syscall_register_epoll(void);

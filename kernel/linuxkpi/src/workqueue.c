@@ -19,7 +19,7 @@
 struct workqueue_struct {
   char *name;
   struct list_head pending;
-  spinlock_t lock;
+  spinlock_t lock; /* Queue/retirement state is shared with hard IRQ producers. */
   struct wait_queue_head more_work;
   struct wait_queue_head flush_wait;
   unsigned int active; /* queued + running */
@@ -43,6 +43,7 @@ struct workqueue_struct *system_power_efficient_wq;
 struct workqueue_struct *system_freezable_wq;
 
 static int worker_fn(void *arg) {
+  unsigned long flags;
   struct wq_worker *wa = arg;
   struct workqueue_struct *wq = wa->wq;
   int idx = wa->idx;
@@ -66,7 +67,7 @@ static int worker_fn(void *arg) {
        * or respawns one. */
       bool idle;
 
-      spin_lock(&wq->lock);
+      spin_lock_irqsave(&wq->lock, flags);
       idle = list_empty(&wq->pending) &&
              __atomic_load_n(&wq->gen, __ATOMIC_ACQUIRE) == gen;
       if (idle) {
@@ -74,46 +75,55 @@ static int worker_fn(void *arg) {
         if (wq->nr_workers)
           wq->nr_workers--;
       }
-      spin_unlock(&wq->lock);
+      spin_unlock_irqrestore(&wq->lock, flags);
 
       if (idle)
         return 0; /* the next queue_work() creates a replacement */
       continue;
     }
 
-    LIST_HEAD(batch);
-
-    spin_lock(&wq->lock);
-    list_splice_init(&wq->pending, &batch);
-    spin_unlock(&wq->lock);
-
-    while (!list_empty(&batch)) {
-      struct work_struct *work =
-          list_first_entry(&batch, struct work_struct, entry);
-      list_del_init(&work->entry);
-
-      __atomic_store_n(&work->running, 1, __ATOMIC_RELEASE);
-      work->func(work);
-      __atomic_store_n(&work->running, 0, __ATOMIC_RELEASE);
-
-      spin_lock(&wq->lock);
-      work->pending = 0;
-      wq->active--;
-      bool wake = (wq->active == 0);
-      spin_unlock(&wq->lock);
-
-      if (wake)
-        __kpi_wake_up(&wq->flush_wait, 0, 0);
+    /* Pending means queued, not executing. Clear it before the callback so
+     * an interrupt or the callback itself can request a subsequent run. Keep
+     * running set under the same lock so another worker cannot execute the
+     * requeued item concurrently. Never move entries to an unlocked batch:
+     * cancellation must own the queue lock when unlinking them. */
+    struct work_struct *work = NULL;
+    spin_lock_irqsave(&wq->lock, flags);
+    struct work_struct *candidate;
+    list_for_each_entry(candidate, &wq->pending, entry) {
+      if (!candidate->running) {
+        work = candidate;
+        list_del_init(&work->entry);
+        __atomic_store_n(&work->running, 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&work->pending, 0, __ATOMIC_RELEASE);
+        break;
+      }
     }
+    spin_unlock_irqrestore(&wq->lock, flags);
+    if (!work) {
+      /* Every queued item is still executing on another worker. */
+      msleep(1);
+      continue;
+    }
+
+    work->func(work);
+
+    spin_lock_irqsave(&wq->lock, flags);
+    __atomic_store_n(&work->running, 0, __ATOMIC_RELEASE);
+    wq->active--;
+    spin_unlock_irqrestore(&wq->lock, flags);
+
+    __kpi_wake_up(&wq->flush_wait, 0, 0);
+    __kpi_wake_up(&wq->more_work, 1, 0);
   }
 
-  spin_lock(&wq->lock);
+  spin_lock_irqsave(&wq->lock, flags);
   if (wq->workers[idx]) {
     wq->workers[idx] = NULL;
     if (wq->nr_workers)
       wq->nr_workers--;
   }
-  spin_unlock(&wq->lock);
+  spin_unlock_irqrestore(&wq->lock, flags);
   return 0;
 }
 
@@ -121,7 +131,8 @@ static int worker_fn(void *arg) {
  * enqueued; runs under the queue lock so a worker retiring concurrently
  * either observes the new work or leaves its slot empty for us. */
 static void wq_ensure_worker(struct workqueue_struct *wq) {
-  spin_lock(&wq->lock);
+  unsigned long flags;
+  spin_lock_irqsave(&wq->lock, flags);
 
   if (wq->nr_workers > 0) {
     /* Spawn extra help only when the queued+running work outnumbers the
@@ -129,7 +140,7 @@ static void wq_ensure_worker(struct workqueue_struct *wq) {
     bool need_more = wq->active > wq->nr_workers &&
                      wq->nr_workers < (unsigned int)wq->max_workers;
     if (!need_more) {
-      spin_unlock(&wq->lock);
+      spin_unlock_irqrestore(&wq->lock, flags);
       return;
     }
   }
@@ -142,13 +153,13 @@ static void wq_ensure_worker(struct workqueue_struct *wq) {
     }
   }
   if (idx < 0) {
-    spin_unlock(&wq->lock);
+    spin_unlock_irqrestore(&wq->lock, flags);
     return;
   }
 
   struct wq_worker *wa = kmalloc(sizeof(*wa), GFP_KERNEL);
   if (!wa) {
-    spin_unlock(&wq->lock);
+    spin_unlock_irqrestore(&wq->lock, flags);
     return;
   }
   wa->wq = wq;
@@ -160,18 +171,20 @@ static void wq_ensure_worker(struct workqueue_struct *wq) {
     kfree(wa);
   } else {
     wq->workers[idx] = t;
+    kthread_detach(t);
     wq->nr_workers++;
     wake_up_process(t);
   }
 
-  spin_unlock(&wq->lock);
+  spin_unlock_irqrestore(&wq->lock, flags);
 }
 
 static bool __queue_work(struct workqueue_struct *wq, struct work_struct *work) {
-  spin_lock(&wq->lock);
+  unsigned long flags;
+  spin_lock_irqsave(&wq->lock, flags);
 
   if (work->pending) {
-    spin_unlock(&wq->lock);
+    spin_unlock_irqrestore(&wq->lock, flags);
     return false;
   }
 
@@ -181,7 +194,7 @@ static bool __queue_work(struct workqueue_struct *wq, struct work_struct *work) 
   wq->gen++;
   list_add_tail(&work->entry, &wq->pending);
 
-  spin_unlock(&wq->lock);
+  spin_unlock_irqrestore(&wq->lock, flags);
 
   __kpi_wake_up(&wq->more_work, 1, 0);
   wq_ensure_worker(wq);
@@ -213,9 +226,11 @@ bool flush_work(struct work_struct *work) {
   if (!wq)
     return false;
 
-  while (__atomic_load_n(&work->pending, __ATOMIC_ACQUIRE))
+  while (__atomic_load_n(&work->pending, __ATOMIC_ACQUIRE) ||
+         __atomic_load_n(&work->running, __ATOMIC_ACQUIRE))
     wait_event(wq->flush_wait,
-               !__atomic_load_n(&work->pending, __ATOMIC_ACQUIRE));
+               !__atomic_load_n(&work->pending, __ATOMIC_ACQUIRE) &&
+               !__atomic_load_n(&work->running, __ATOMIC_ACQUIRE));
 
   return true;
 }
@@ -238,20 +253,21 @@ void drain_workqueue(struct workqueue_struct *wq) {
 }
 
 bool cancel_work_sync(struct work_struct *work) {
+  unsigned long flags;
   struct workqueue_struct *wq = work->wq;
 
   if (wq) {
-    spin_lock(&wq->lock);
-    if (work->pending && !work->running) {
+    spin_lock_irqsave(&wq->lock, flags);
+    if (work->pending) {
       list_del_init(&work->entry);
       work->pending = 0;
       wq->active--;
       bool wake = (wq->active == 0);
-      spin_unlock(&wq->lock);
+      spin_unlock_irqrestore(&wq->lock, flags);
       if (wake)
         __kpi_wake_up(&wq->flush_wait, 0, 0);
     } else {
-      spin_unlock(&wq->lock);
+      spin_unlock_irqrestore(&wq->lock, flags);
     }
 
     while (__atomic_load_n(&work->running, __ATOMIC_ACQUIRE))
@@ -359,13 +375,14 @@ struct workqueue_struct *alloc_workqueue(const char *fmt, unsigned int flags,
 }
 
 void destroy_workqueue(struct workqueue_struct *wq) {
+  unsigned long flags;
   for (int i = 0; i < KPI_WQ_MAX_WORKERS; i++) {
     struct task_struct *t;
 
-    spin_lock(&wq->lock);
-    t = wq->workers[i];
+    spin_lock_irqsave(&wq->lock, flags);
+    t = linuxkpi_task_get(wq->workers[i]);
     wq->workers[i] = NULL;
-    spin_unlock(&wq->lock);
+    spin_unlock_irqrestore(&wq->lock, flags);
 
     if (t)
       kthread_stop(t);

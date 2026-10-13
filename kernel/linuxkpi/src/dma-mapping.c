@@ -158,7 +158,7 @@ int dma_map_sgtable(struct device *dev, struct sg_table *sgt,
     sg->dma_address = (dma_addr_t)page_to_phys(sg_page(sg)) + sg->offset;
     sg->dma_length = sg->length;
   }
-  return sgt->nents; /* 0 means failure; nents >= 1 on success */
+  return 0; /* dma_map_sgtable uses errno semantics, unlike dma_map_sg. */
 }
 
 void dma_unmap_sgtable(struct device *dev, struct sg_table *sgt,
@@ -184,7 +184,11 @@ void dma_sync_single_for_device(struct device *dev, dma_addr_t addr,
   (void)addr;
   (void)size;
   (void)dir;
-  dma_wmb();
+  /* GTT textures are WC: dma_wmb() is only a compiler barrier on x86
+   * (__dma_wmb()->barrier()), which does not drain WC buffers. A GPU sampling
+   * right after a CPU upload would read stale/green texels until natural
+   * eviction. sfence drains WC and is only a compiler barrier for WB. */
+  __asm__ volatile("sfence" ::: "memory");
 }
 
 void dma_sync_sgtable_for_cpu(struct device *dev, struct sg_table *sgt,
@@ -200,7 +204,9 @@ void dma_sync_sgtable_for_device(struct device *dev, struct sg_table *sgt,
   (void)dev;
   (void)sgt;
   (void)dir;
-  dma_wmb();
+  /* Same WC-drain reason as dma_sync_single_for_device: dma_wmb() alone does
+   * not drain GTT WC buffers before the GPU samples the texture. */
+  __asm__ volatile("sfence" ::: "memory");
 }
 
 int dma_set_mask(struct device *dev, u64 mask) {

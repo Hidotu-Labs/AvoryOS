@@ -102,6 +102,7 @@ void random_register_vfs(void) {
     vfs_node_init(null_node);
     strcpy(null_node->name, "null");
     null_node->flags = FS_CHARDEV | FS_PERSISTENT;
+    null_node->inode = (1U << 8) | 3U;
     null_node->mask = 0666;
     null_node->read = null_read;
     null_node->write = null_write;
@@ -115,6 +116,7 @@ void random_register_vfs(void) {
     vfs_node_init(zero_node);
     strcpy(zero_node->name, "zero");
     zero_node->flags = FS_CHARDEV | FS_PERSISTENT;
+    zero_node->inode = (1U << 8) | 5U;
     zero_node->mask = 0666;
     zero_node->read = zero_read;
     zero_node->write = zero_write;
@@ -129,6 +131,7 @@ void random_register_vfs(void) {
     vfs_node_init(unode);
     strcpy(unode->name, "urandom");
     unode->flags = FS_CHARDEV | FS_PERSISTENT;
+    unode->inode = (1U << 8) | 9U;
     unode->mask = 0666;
     unode->read = random_read;
     unode->write = null_write;
@@ -142,6 +145,7 @@ void random_register_vfs(void) {
     vfs_node_init(rnode);
     strcpy(rnode->name, "random");
     rnode->flags = FS_CHARDEV | FS_PERSISTENT;
+    rnode->inode = (1U << 8) | 8U;
     rnode->mask = 0666;
     rnode->read = random_read;
     rnode->write = null_write;

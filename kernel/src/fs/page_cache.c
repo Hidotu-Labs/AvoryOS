@@ -1077,6 +1077,12 @@ void vfs_cache_update_or_invalidate(vfs_node_t *node, uint32_t offset,
   if (!node || !length)
     return;
 
+  bool user = buffer && is_user_ptr((uint64_t)buffer);
+  uint8_t *staged = user ? kmalloc(PAGE_SIZE) : NULL;
+  if (user && !staged) {
+    vfs_cache_invalidate_range(node, offset, length);
+    return;
+  }
   uint32_t written = 0;
   while (written < length) {
     uint32_t cur_offset = offset + written;
@@ -1085,6 +1091,14 @@ void vfs_cache_update_or_invalidate(vfs_node_t *node, uint32_t offset,
     if (to_copy > length - written)
       to_copy = length - written;
 
+    /* A user fault can reclaim this very node's cache. Fault before taking
+     * pages_lock, otherwise reclaim recursively waits on our own lock. */
+    if (user && copy_from_user(staged, buffer + written, to_copy)) {
+      vfs_cache_invalidate_range(node, cur_offset, to_copy);
+      written += to_copy;
+      continue;
+    }
+    const uint8_t *source = user ? staged : (buffer ? buffer + written : NULL);
     spinlock_acquire(&node->pages_lock);
     vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(cur_offset));
     if (page && !page_value_valid(page)) {
@@ -1103,12 +1117,8 @@ void vfs_cache_update_or_invalidate(vfs_node_t *node, uint32_t offset,
     } else if (page && page->frame_phys && !vfs_page_is_evicted(page)) {
       if (page->uptodate) {
         void *page_virt = PHYS_TO_VIRT(page->frame_phys);
-        if (buffer) {
-          if (is_user_ptr((uint64_t)buffer))
-            copy_from_user((uint8_t *)page_virt + page_offset, buffer + written, to_copy);
-          else
-            memcpy((uint8_t *)page_virt + page_offset, buffer + written, to_copy);
-        }
+        if (source)
+          memcpy((uint8_t *)page_virt + page_offset, source, to_copy);
         page->last_used = cache_stamp();
       } else {
         cache_remove_range(node, cache_key(cur_offset), cache_key(cur_offset), false);
@@ -1118,6 +1128,7 @@ void vfs_cache_update_or_invalidate(vfs_node_t *node, uint32_t offset,
 
     written += to_copy;
   }
+  kfree(staged);
 }
 
 static void cache_destroy_value(void *value) {
@@ -1179,7 +1190,8 @@ size_t vfs_cache_reclaim(vfs_node_t *node, size_t target) {
   if (!node || !target)
     return 0;
   size_t reclaimed = 0;
-  spinlock_acquire(&node->pages_lock);
+  if (!spinlock_try_acquire(&node->pages_lock))
+    return 0;
   while (reclaimed < target) {
     struct reclaim_search search = {0};
     asc_radix_tree_for_each(&node->pages, find_reclaimable, &search);
@@ -1217,9 +1229,9 @@ size_t mm_file_cache_reclaim(size_t target) {
 #define MM_RECLAIM_MAX_NODES 32u
   struct thread *t = sched_get_current();
   if (!t || !t->mm)
-    return 0;
+    return vfs_dentry_reclaim_pages(target);
   if (!spinlock_try_acquire(&t->mm->lock))
-    return 0;
+    return vfs_dentry_reclaim_pages(target);
 
   vfs_node_t *nodes[MM_RECLAIM_MAX_NODES];
   uint32_t n = 0;
@@ -1247,7 +1259,7 @@ size_t mm_file_cache_reclaim(size_t target) {
     vfs_node_t *node = (vfs_node_t *)v->file_node;
     if (!node || n >= MM_RECLAIM_MAX_NODES)
       continue;
-    if (!vfs_node_is_alive(node) || !(node->flags & FS_PAGE_CACHE))
+    if (!vfs_node_is_alive(node) || !((node->flags & FS_PAGE_CACHE) || (v->flags & MAP_PAGECACHE)))
       continue;
     bool dup = false;
     for (uint32_t i = 0; i < n; i++) {
@@ -1265,10 +1277,14 @@ size_t mm_file_cache_reclaim(size_t target) {
   spinlock_release(&t->mm->lock);
 
   size_t reclaimed = 0;
-  for (uint32_t i = 0; i < n && reclaimed < target; i++) {
-    reclaimed += vfs_cache_reclaim(nodes[i], target - reclaimed);
+  for (uint32_t i = 0; i < n; i++) {
+    if (reclaimed < target)
+      reclaimed += vfs_cache_reclaim(nodes[i], target - reclaimed);
+    /* Every collected node is pinned, including those beyond the target. */
     vfs_close(nodes[i]);
   }
+  if (reclaimed < target)
+    reclaimed += vfs_dentry_reclaim_pages(target - reclaimed);
   return reclaimed;
 #undef MM_RECLAIM_MAX_NODES
 }

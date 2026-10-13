@@ -1,4 +1,5 @@
 #include "ext3.h"
+#include "hal/hal.h"
 #include "fs/ext2/ext2_internal.h"
 #include "console/klog.h"
 #include "lib/string.h"
@@ -12,6 +13,78 @@ static int ext3_recover_journal(ext2_mount_t *mnt, jbd_superblock_t *jsb,
 
 static ext3_journal_state_t *ext3_journal_state(ext2_mount_t *mnt) {
   return &mnt->journal;
+}
+
+/* Every journaled mount, so a dead owner can be reclaimed without a global
+ * mount-list walk. Populated by ext3_init_journal (mount time, one entry per
+ * mount); release path only reads. */
+#define JOURNAL_MOUNT_MAX 8
+static ext2_mount_t *g_journal_mounts[JOURNAL_MOUNT_MAX];
+static unsigned g_journal_mount_count;
+
+static void journal_register_mount(ext2_mount_t *mnt) {
+  for (unsigned i = 0; i < g_journal_mount_count; i++) {
+    if (g_journal_mounts[i] == mnt)
+      return;
+  }
+  unsigned slot = __atomic_fetch_add(&g_journal_mount_count, 1, __ATOMIC_RELAXED);
+  if (slot < JOURNAL_MOUNT_MAX)
+    __atomic_store_n(&g_journal_mounts[slot], mnt, __ATOMIC_RELEASE);
+}
+
+/* Cumulative independent atomic samples: no journal lock or I/O on read. */
+bool ext3_perf_snapshot(unsigned index, struct block_device **dev,
+                         struct storage_latency *wait,
+                         struct storage_latency *hold) {
+  if (index >= JOURNAL_MOUNT_MAX || index >=
+      __atomic_load_n(&g_journal_mount_count, __ATOMIC_ACQUIRE))
+    return false;
+  ext2_mount_t *mnt = __atomic_load_n(&g_journal_mounts[index], __ATOMIC_ACQUIRE);
+  if (!mnt) return false;
+  *dev = mnt->dev;
+  storage_latency_snapshot(&mnt->journal.perf_wait, wait);
+  storage_latency_snapshot(&mnt->journal.perf_hold, hold);
+  return true;
+}
+
+/* Abort a transaction whose owner will never finish it. The 4 KB the dead
+ * writer staged is discarded; the filesystem stays consistent and live
+ * waiters proceed. */
+void ext3_journal_release_owner(uint32_t tid) {
+  if (!tid)
+    return;
+  unsigned n = __atomic_load_n(&g_journal_mount_count, __ATOMIC_ACQUIRE);
+  if (n > JOURNAL_MOUNT_MAX)
+    n = JOURNAL_MOUNT_MAX;
+  for (unsigned i = 0; i < n; i++) {
+    ext2_mount_t *mnt = __atomic_load_n(&g_journal_mounts[i], __ATOMIC_ACQUIRE);
+    if (!mnt)
+      continue;
+    ext3_journal_state_t *trans = &mnt->journal;
+    if (!__atomic_load_n(&trans->active, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&trans->owner_tid, __ATOMIC_RELAXED) != tid)
+      continue;
+    /* Owner recorded but lock free means it finished concurrently; take and
+     * return avoids stealing a new owner's lock. */
+    if (rawspinlock_try_acquire(&trans->lock)) {
+      rawspinlock_release(&trans->lock);
+      continue;
+    }
+    klogf("[JBD2] owner tid=%u died holding the transaction, aborting "
+          "(depth=%u blocks=%u phase=%s)\n",
+          tid, trans->depth, trans->blocks_in_trans,
+          trans->phase ? trans->phase : "unknown");
+    storage_latency_record(&trans->perf_hold,
+        lapic_timer_get_ms() - trans->started_ms, true);
+    trans->phase = "aborted-owner-died";
+    __atomic_store_n(&trans->active, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&trans->owner_tid, 0, __ATOMIC_RELAXED);
+    trans->depth = 0;
+    trans->blocks_in_trans = 0;
+    trans->io_failed = true;
+    rawspinlock_release(&trans->lock);
+    wait_queue_wake_all(&trans->waiters);
+  }
 }
 
 /* Called only with the transaction lock held. Recovery uses uncached
@@ -32,16 +105,27 @@ static uint32_t ext3_journal_phys(ext2_mount_t *mnt, uint32_t logical) {
 }
 
 static int ext3_finish_transaction(ext3_journal_state_t *trans, int result) {
-  trans->active = false;
-  trans->owner_tid = 0;
+  storage_latency_record(&trans->perf_hold,
+      lapic_timer_get_ms() - trans->started_ms, result != 0);
+  trans->phase = "idle";
+  __atomic_store_n(&trans->active, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&trans->owner_tid, 0, __ATOMIC_RELAXED);
   trans->depth = 0;
   rawspinlock_release(&trans->lock);
+  wait_queue_wake_all(&trans->waiters);
   return result;
 }
 
 void ext3_init_journal(ext2_mount_t *mnt) {
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
   rawspinlock_init(&trans->lock);
+  wait_queue_init(&trans->waiters);
+  memset(&trans->perf_wait, 0, sizeof(trans->perf_wait));
+  memset(&trans->perf_hold, 0, sizeof(trans->perf_hold));
+  trans->started_ms = trans->owner_ip = 0;
+  trans->metadata_submitted = trans->metadata_unchanged = 0;
+  trans->owner_comm[0] = 0;
+  trans->phase = "idle";
   trans->active = false;
   trans->owner_tid = 0;
   trans->depth = 0;
@@ -51,6 +135,7 @@ void ext3_init_journal(ext2_mount_t *mnt) {
   if (!(mnt->sb.s_feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL)) {
     return;
   }
+  journal_register_mount(mnt);
 
   uint32_t journal_ino = mnt->sb.s_journal_inum;
   if (journal_ino == 0) {
@@ -130,7 +215,8 @@ int ext3_journal_start(ext2_mount_t *mnt) {
 
   struct thread *current = sched_get_current();
   uint32_t tid = current ? current->tid : 0;
-  if (trans->active && trans->owner_tid == tid) {
+  if (__atomic_load_n(&trans->active, __ATOMIC_ACQUIRE) &&
+      __atomic_load_n(&trans->owner_tid, __ATOMIC_RELAXED) == tid) {
     trans->depth++;
     return 0;
   }
@@ -142,15 +228,64 @@ int ext3_journal_start(ext2_mount_t *mnt) {
   uint64_t wait_start = lapic_timer_get_ms();
   bool warned = false;
   while (!rawspinlock_try_acquire(&trans->lock)) {
-    if (!warned && lapic_timer_get_ms() - wait_start > 5000) {
-      klogf("[JBD2] transaction wait tid=%u owner=%u active=%u depth=%u blocks=%u\n",
-            tid, trans->owner_tid, trans->active, trans->depth, trans->blocks_in_trans);
+    if (!warned && lapic_timer_get_ms() - wait_start >= 5000) {
+      klogf("[JBD2] transaction wait tid=%u owner=%u comm='%s' active=%u "
+            "depth=%u blocks=%u hold_ms=%llu phase=%s owner_ip=%llx "
+            "submitted=%llu unchanged=%llu\n",
+            tid, trans->owner_tid, trans->owner_comm, trans->active,
+            trans->depth, trans->blocks_in_trans,
+            (unsigned long long)(lapic_timer_get_ms() - trans->started_ms),
+            trans->phase ? trans->phase : "unknown",
+            (unsigned long long)trans->owner_ip,
+            (unsigned long long)trans->metadata_submitted,
+            (unsigned long long)trans->metadata_unchanged);
       warned = true;
     }
-    sched_yield();
+    if (!current) {
+      sched_yield(); /* early boot has no scheduler thread to park */
+      continue;
+    }
+    wait_queue_entry_t entry = {.thread = current};
+    /* Publish blocked state before registering, then retry the lock. An
+     * unlock before registration is caught by the retry; an unlock after it
+     * wakes this entry. Neither can be overwritten by a late BLOCKED store. */
+    /* Do not let a timer park us before the wake entry is linked. */
+    hal_irq_state_t irq_flags = hal_irq_save();
+    current->wakeup_ticks = lapic_timer_get_ticks() + 5000;
+    current->state = THREAD_BLOCKED;
+    wait_queue_add(&trans->waiters, &entry);
+    bool acquired = rawspinlock_try_acquire(&trans->lock);
+    if (acquired) {
+      current->wakeup_ticks = 0;
+      current->state = THREAD_RUNNING;
+    }
+    hal_irq_restore(irq_flags);
+    if (!acquired)
+      sched_yield();
+    current->wakeup_ticks = 0;
+    current->state = THREAD_RUNNING;
+    wait_queue_remove(&trans->waiters, &entry);
+    if (acquired)
+      break;
+    /* A SIGKILLed waiter must die even while the journal is wedged (e.g.
+     * owner died before the reaper reclaims it). Otherwise kill -9 loops
+     * forever on the 5 s safety wake and shutdown hangs with it. */
+    if (thread_has_pending_signal(current)) {
+      storage_latency_record(&trans->perf_wait,
+          lapic_timer_get_ms() - wait_start, true);
+      return -4;
+    } /* EINTR */
   }
-  trans->active = true;
-  trans->owner_tid = tid;
+  storage_latency_record(&trans->perf_wait,
+      lapic_timer_get_ms() - wait_start, false);
+  __atomic_store_n(&trans->owner_tid, tid, __ATOMIC_RELAXED);
+  trans->started_ms = lapic_timer_get_ms();
+  trans->owner_ip = (uint64_t)__builtin_return_address(0);
+  trans->phase = "operation";
+  memset(trans->owner_comm, 0, sizeof(trans->owner_comm));
+  if (current)
+    memcpy(trans->owner_comm, current->comm, sizeof(trans->owner_comm) - 1);
+  __atomic_store_n(&trans->active, true, __ATOMIC_RELEASE);
   trans->depth = 1;
   trans->blocks_in_trans = 0;
   trans->io_failed = false;
@@ -175,8 +310,32 @@ int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data) {
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
   if (!trans->active)
     return ext2_write_block(mnt, block_nr, data);
-  if (trans->io_failed)
+  struct thread *current = sched_get_current();
+  uint32_t tid = current ? current->tid : 0;
+  if (__atomic_load_n(&trans->owner_tid, __ATOMIC_RELAXED) != tid ||
+      trans->io_failed)
     return -1;
+
+  if (block_nr == 0) {
+    trans->io_failed = true;
+    return -1;
+  }
+  const char *previous_phase = trans->phase;
+  trans->metadata_submitted++;
+  /* A completed coherent cache image equal to this metadata needs no new
+   * journal or home write. In-flight writes and cache collisions are never
+   * evidence of an unchanged disk block. Keep the normal journal-before-home
+   * sequence for every actual change. */
+  uint32_t idx = block_nr % EXT2_CACHE_SIZE;
+  spinlock_acquire(&mnt->cache_lock);
+  bool unchanged = mnt->cache[idx].num == block_nr &&
+                   mnt->cache[idx].data && !mnt->cache[idx].writes_inflight &&
+                   memcmp(mnt->cache[idx].data, data, mnt->block_size) == 0;
+  spinlock_release(&mnt->cache_lock);
+  if (unchanged) {
+    trans->metadata_unchanged++;
+    return 0;
+  }
 
   uint32_t tag_offset = sizeof(jbd_header_t) + (trans->blocks_in_trans *
                                                 sizeof(jbd_block_tag_t));
@@ -202,6 +361,7 @@ int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data) {
     tag->t_flags |= __builtin_bswap32(JBD_FLAG_ESCAPE);
   }
 
+  trans->phase = "journal-payload";
   if (!phys_pos || ext2_write_block(mnt, phys_pos, safe_data) != 0) {
     trans->io_failed = true;
     return -1;
@@ -215,12 +375,14 @@ int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data) {
    * record is still written first and is replayable on recovery.
    * ext2_write_block publishes the cache image and tracks overlapping misses.
    */
+  trans->phase = "metadata-home";
   if (ext2_write_block(mnt, block_nr, data) != 0) {
     trans->io_failed = true;
     return -1;
   }
 
   trans->blocks_in_trans++;
+  trans->phase = previous_phase;
   return 0;
 }
 
@@ -234,11 +396,16 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
       return ext2_flush_metadata(mnt);
     return 0;
   }
+  struct thread *current = sched_get_current();
+  uint32_t tid = current ? current->tid : 0;
+  if (__atomic_load_n(&trans->owner_tid, __ATOMIC_RELAXED) != tid)
+    return -1;
   if (trans->depth > 1) {
     trans->depth--;
     return 0;
   }
 
+  trans->phase = "commit";
   /* All group-descriptor and superblock changes made by this transaction are
    * written once, before the descriptor is finalised, so recovery replays
    * them together with the bitmap blocks. */

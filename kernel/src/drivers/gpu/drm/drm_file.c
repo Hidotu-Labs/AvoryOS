@@ -131,6 +131,7 @@ void ascentdrm_file_free(struct drm_file *file) {
   /* Redraw text into the GOP fb first, then re-present it: restore copies
    * GOP -> native scanout, so order matters. */
   if (last_client) {
+    ascentdrm_cursor_reset(dev);
     fb_set_kd_mode(0); /* KD_TEXT, redraws console */
     virtio_gpu_restore_console_scanout();
   }
@@ -288,121 +289,4 @@ void ascentdrm_file_send_event(struct drm_file *file, struct drm_event_vblank *e
   extern void epoll_notify_event(struct vfs_node * node, uint32_t events);
   if (node)
     epoll_notify_event(node, 0x0001 /* POLLIN */);
-}
-
-/* ── PRIME VFS node (anonymous buffer fd) ────────────────────────────────── */
-
-static uint32_t prime_read(struct vfs_node *node, uint32_t offset,
-                           uint32_t length, uint8_t *buf) {
-  /* Reading a prime fd copies raw pixel data — useful for testing */
-  struct drm_gem_object *obj = (struct drm_gem_object *)node->device;
-  if (!obj || !obj->virt_addr)
-    return 0;
-  if (offset >= obj->size)
-    return 0;
-  if (offset + length > obj->size)
-    length = obj->size - offset;
-  memcpy(buf, (uint8_t *)obj->virt_addr + offset, length);
-  return length;
-}
-
-static uint64_t prime_mmap(struct vfs_node *node, uint64_t addr,
-                           uint64_t length, uint64_t prot, uint64_t flags,
-                           uint64_t offset) {
-  (void)prot;
-  (void)flags;
-  struct drm_gem_object *obj = (struct drm_gem_object *)node->device;
-  if (!obj || !addr || !length || (addr & 4095) || (offset & 4095) ||
-      offset > obj->size || length > obj->size - offset)
-    return (uint64_t)-1;
-
-  uint64_t page_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_USER | PAGE_FLAG_RW;
-  if (obj->cache_mode == DRM_GEM_CACHE_WC)
-    page_flags |= PAGE_FLAG_PWT | PAGE_FLAG_PCD | PAGE_FLAG_PAT;
-
-  uint64_t *pml4 = vmm_get_active_pml4();
-  uint32_t pages = (uint32_t)((length + 4095) / 4096);
-  for (uint32_t i = 0; i < pages; i++) {
-    uint64_t object_offset = offset + (uint64_t)i * 4096;
-    uint64_t phys = obj->get_page_phys
-        ? obj->get_page_phys(obj, (uint32_t)(object_offset / 4096))
-        : obj->phys_addr + object_offset;
-    if (!phys || !vmm_map_page(pml4, addr + (uint64_t)i * 4096, phys,
-                               page_flags))
-      return (uint64_t)-1;
-  }
-  return addr;
-}
-
-static void prime_close(struct vfs_node *node) {
-  /* When the prime fd is closed, drop the gem refcount */
-  struct drm_gem_object *obj = (struct drm_gem_object *)node->device;
-  if (obj) {
-    if (ascentdrm_gem_put_last(obj) && obj->dev)
-      ascentdrm_gem_object_free(obj->dev, obj);
-  }
-  klog_puts("[DRM] PRIME fd closed\n");
-}
-
-/*
- * drm_prime_export — create an anonymous fd for a gem object.
- * Returns the new fd number, or -1 on failure.
- */
-int ascentdrm_prime_export(struct drm_gem_object *obj) {
-  struct thread *t = sched_get_current();
-  if (!t)
-    return -1;
-
-  int fd = alloc_fd(t);
-  if (fd < 0)
-    return -1;
-
-  vfs_node_t *prime_node = kmalloc(sizeof(vfs_node_t));
-  if (!prime_node)
-    return -1;
-
-  vfs_node_init(prime_node);
-  strcpy(prime_node->name, "prime_buf");
-  prime_node->flags = FS_CHARDEV; /* non-persistent: freed on last close */
-  prime_node->mask = 0600;
-  prime_node->length =
-      obj->size > UINT32_MAX ? UINT32_MAX : (uint32_t)obj->size;
-  prime_node->device = obj;
-  prime_node->read = prime_read;
-  prime_node->mmap = prime_mmap;
-  prime_node->close = prime_close;
-  prime_node->refcount = 1;
-
-  ascentdrm_gem_get(obj); /* prime fd holds a reference */
-
-  t->fds[fd] = prime_node;
-  t->fd_offsets[fd] = 0;
-
-  klog_puts("[DRM] PRIME exported gem handle=");
-  klog_uint64(obj->handle);
-  klog_puts(" as fd=");
-  klog_uint64(fd);
-  klog_puts("\n");
-
-  return fd;
-}
-
-/*
- * drm_prime_import — given a prime fd, return the gem object it wraps.
- * Returns NULL if the fd is not a prime node.
- */
-struct drm_gem_object *ascentdrm_prime_import(int prime_fd) {
-  struct thread *t = sched_get_current();
-  if (!t || prime_fd < 0 || prime_fd >= MAX_FDS)
-    return NULL;
-
-  vfs_node_t *node = t->fds[prime_fd];
-  if (!node)
-    return NULL;
-
-  /* Identify prime nodes by their read function pointer */
-  if (node->read != prime_read)
-    return NULL;
-
-  return (struct drm_gem_object *)node->device;
 }

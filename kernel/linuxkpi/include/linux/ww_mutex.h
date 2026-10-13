@@ -1,24 +1,17 @@
 #ifndef __AVORY_LINUXKPI_WW_MUTEX_H
 #define __AVORY_LINUXKPI_WW_MUTEX_H
 
-/* Minimal Linux <linux/ww_mutex.h> overlay.
- *
- * ww_mutex is the wound/wait mutex used by DRM modeset and dma_resv to avoid
- * ABBA deadlocks.  This implementation is a plain sleeping mutex with the
- * acquire-context stamps recorded; wounding is NOT implemented, so a
- * multi-lock acquire sequence is deadlock-free only when every caller
- * acquires in one global order - the invariant TTM/amdgpu keep when
- * reserving a BO set.  A runtime WARN cannot distinguish that safe ordered
- * contention from a real cycle without wait tracking, so the ordering
- * assumption is documented (P6 C5 gap log) and exercised by the ordered
- * multi-lock stress in test_phase1_core6.c instead.
- * Implementation: linuxkpi/src/ww_mutex.c. */
+/* Native sleeping transaction locks for DRM modeset and dma_resv.
+ * Ownership, context publication and waiter ordering share base.wait_lock.
+ * DEFINE_WW_CLASS selects wound-wait; DEFINE_WD_CLASS selects wait-die.
+ * Priority inheritance and lockdep remain unsupported. */
 
 #include <linux/mutex.h>
 #include <linux/sched.h>
 
 struct ww_class {
   unsigned long stamp;
+  bool is_wait_die;
 };
 
 struct ww_acquire_ctx {
@@ -34,7 +27,7 @@ struct ww_mutex {
   struct ww_acquire_ctx *ctx;
 };
 
-#define DEFINE_WW_CLASS(name) struct ww_class name = {0}
+#define DEFINE_WW_CLASS(name) struct ww_class name = {0, false}
 #define DEFINE_WW_MUTEX(name, class)                                          \
   struct ww_mutex name = {                                                    \
     .base = __MUTEX_INITIALIZER(name.base),                                   \
@@ -43,8 +36,7 @@ struct ww_mutex {
 
 void ww_mutex_init(struct ww_mutex *lock, struct ww_class *ww_class);
 
-/* A ww_class with no lockdep state. */
-#define DEFINE_WD_CLASS(name) struct ww_class name = {0}
+#define DEFINE_WD_CLASS(name) struct ww_class name = {0, true}
 
 void ww_mutex_destroy(struct ww_mutex *lock);
 

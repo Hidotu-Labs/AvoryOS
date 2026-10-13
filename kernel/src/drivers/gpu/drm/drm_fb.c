@@ -12,6 +12,7 @@
  */
 
 #include "drm.h"
+#include "drivers/gpu/virtio_gpu/virtio_gpu.h"
 #include "../../../console/klog.h"
 #include "../../../mm/heap.h"
 #include "../../../lib/string.h"
@@ -102,6 +103,11 @@ static int drm_fb_validate(struct drm_file *file,
         }
     }
 
+    /* Scanout reads linear bytes; silently treating a tiled AMD modifier as
+     * linear would corrupt offloaded frames. */
+    if ((cmd->flags & 2) && cmd->modifier[0] != DRM_FORMAT_MOD_LINEAR)
+        return -1;
+
     /* Modifier sanity: we support LINEAR and INVALID (opaque/driver-specific) */
     for (int p = 0; p < info->num_planes; p++) {
         uint64_t mod = cmd->modifier[p];
@@ -140,6 +146,27 @@ struct drm_framebuffer *ascentdrm_framebuffer_create_full(struct drm_file *file,
     if (drm_fb_validate(file, cmd, info) != 0)
         return NULL;
 
+    struct drm_gem_object *prime = ascentdrm_file_gem_lookup_get(file, cmd->handles[0]);
+    if (!prime)
+        return NULL;
+    int prime_ret = 0;
+    if (prime->prime_buffer && virtio_gpu_is_initialized()) {
+        if (info->num_planes != 1 || cmd->pixel_format != 0x34325258)
+            prime_ret = -22;
+        else {
+            prime_ret = ascentdrm_gem_begin_cpu(prime);
+            if (!prime_ret) {
+                prime_ret = virtio_gpu_prepare_prime_fb(prime, cmd->width, cmd->height,
+                                                    cmd->pitches[0], cmd->offsets[0]);
+                ascentdrm_gem_end_cpu(prime);
+            }
+        }
+    }
+    if (ascentdrm_gem_put_last(prime))
+        ascentdrm_gem_object_free(dev, prime);
+    if (prime_ret)
+        return NULL;
+
     struct drm_framebuffer_full *fb = kmalloc(sizeof(struct drm_framebuffer_full));
     if (!fb) return NULL;
     memset(fb, 0, sizeof(struct drm_framebuffer_full));
@@ -156,6 +183,7 @@ struct drm_framebuffer *ascentdrm_framebuffer_create_full(struct drm_file *file,
     /* Legacy compat: derive bpp from format info */
     fb->base_fb.bpp = info->cpp[0] * 8;
     fb->base_fb.pitch = cmd->pitches[0];
+    fb->base_fb.backing_offset = cmd->offsets[0];
     fb->bpp   = fb->base_fb.bpp;
     fb->pitch = fb->base_fb.pitch;
 

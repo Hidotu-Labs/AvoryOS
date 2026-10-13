@@ -19,6 +19,8 @@ uint32_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
     uint8_t *bufs[5] = {NULL, NULL, NULL, NULL, NULL};
     int depth_idx = 0;
     uint32_t result = 0;
+    uint32_t hole_limit = UINT32_MAX - logical_block;
+    if (!hole_limit) hole_limit = 1;
 
     ext4_extent_header_t *hdr = (ext4_extent_header_t *)inode->i_block;
     void *entries = (uint8_t *)inode->i_block + sizeof(ext4_extent_header_t);
@@ -52,7 +54,7 @@ uint32_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
                 }
             }
             if (out_run_len)
-                *out_run_len = 1;
+                *out_run_len = hole_limit;
             goto done;
         } else {
             ext4_extent_idx_t *idxs = (ext4_extent_idx_t *)entries;
@@ -60,7 +62,13 @@ uint32_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
             for (uint16_t i = 0; i < hdr->eh_entries; i++) {
                 if (idxs[i].ei_block <= logical_block)
                     best = &idxs[i];
+                else if (idxs[i].ei_block - logical_block < hole_limit)
+                    hole_limit = idxs[i].ei_block - logical_block;
             }
+            /* A hole before the first index must still descend to discover
+             * the first mapped extent rather than assuming a new empty tree. */
+            if (!best && hdr->eh_entries)
+                best = &idxs[0];
             if (!best || depth_idx >= 4)
                 goto done;
 
@@ -655,6 +663,17 @@ int ext4_alloc_extent(ext2_mount_t *mnt, ext2_inode_t *inode,
     if (ext3_journal_start(mnt) != 0)
         return -1;
 
+    /* A reservation must end at the next logical extent, even when enough
+     * physical blocks are free. Sparse cache/database writes otherwise ask
+     * insert to overlap the mapping on the far side of the hole. */
+    uint32_t hole_blocks;
+    if (ext4_get_extent_run(mnt, inode, logical_block, &hole_blocks)) {
+        ext3_journal_stop(mnt);
+        return -5;
+    }
+    if (num_blocks > hole_blocks)
+        num_blocks = hole_blocks;
+
     uint32_t goal = 0;
     if (logical_block > 0) {
         uint32_t prev_phys = ext4_get_block_num(mnt, inode, logical_block - 1);
@@ -678,6 +697,7 @@ int ext4_alloc_extent(ext2_mount_t *mnt, ext2_inode_t *inode,
 
     if (count == 0) {
         if (!fail_reason) fail_reason = 2;
+        result = -28;
         goto done;
     }
 
@@ -685,6 +705,7 @@ int ext4_alloc_extent(ext2_mount_t *mnt, ext2_inode_t *inode,
                                         first, (uint16_t)count);
     if (insert_err != 0) {
         fail_reason = 3; /* Extent tree insert failed */
+        result = -5;
         goto done;
     }
 

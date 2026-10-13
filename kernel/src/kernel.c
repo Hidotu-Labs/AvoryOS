@@ -600,6 +600,8 @@ void kmain_high_half(void) {
   /* ── Per-CPU Page Allocator (PCP) self-test ── */
   extern void test_pmm_pcp(void);
   test_pmm_pcp();
+  extern void test_dma_cache(void);
+  test_dma_cache();
 
   /* `tlb_bench=1` measures the single-page shootdown path once the APs are
    * online and can answer IPIs.  Run after the APs' own boot prints so the
@@ -947,8 +949,14 @@ mount_fail:
     bool defer_pending = vmm_defer_pending() != 0;
     if (defer_pending)
       vmm_defer_drain(VMM_DEFER_IDLE_NODES);
+    /* Pre-zero pool refill on otherwise-dead CPU time: keeps the 1 ms tick
+     * while the local pool is low (same trick as the teardown backlog above)
+     * so fault paths find zeroed frames without paying memset. */
+    bool zero_refill = pmm_zero_pool_needs_refill();
+    if (zero_refill)
+      pmm_zero_pool_refill(8);
     uint64_t idle_ms =
-        (serial_pending_bytes() || defer_pending) ? 1 : 2000;
+        (serial_pending_bytes() || defer_pending || zero_refill) ? 1 : 2000;
     lapic_timer_rearm_if_earlier(lapic_timer_get_ms() + idle_ms);
     hal_cpu_halt();
   }

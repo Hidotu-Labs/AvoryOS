@@ -45,6 +45,13 @@ XDG_PICTURES_DIR="$HOME/Pictures"
 XDG_VIDEOS_DIR="$HOME/Videos"
 USER_DIRS_EOF
     fi
+    if [ "$desktop_home" = "${ROOTFS_DIR}" ]; then
+        # Qt expands $HOME literally: HOME=/ plus /Desktop becomes
+        # //Desktop, and QUrl interprets that as file://desktop (no path).
+        # Normalize root's paths, including defaults left by older images.
+        sed -i 's#="\$HOME/#="/#; s#="//#="/#' \
+            "$desktop_home/.config/user-dirs.dirs"
+    fi
 done
 
 # Enable KWin compositing by default. KWIN_COMPOSE can still be overridden for
@@ -137,20 +144,57 @@ if [ -z "$HOME" ] || [ "$HOME" = "/" ]; then
     mkdir -p /.config /.cache /.local/share /.local/state /tmp 2>/dev/null || true
     chmod 0755 /.config /.cache /.local/share /.local/state 2>/dev/null || true
 else
-    mkdir -p "$HOME/.config" "$HOME/.cache" "$HOME/.local/share" "$HOME/.local/state" 2>/dev/null || true
+    export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+    export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+    export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+    export XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+    mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" 2>/dev/null || true
 fi
 
 # Initialize newly created accounts before Qt/KIO reads their desktop path.
 if command -v xdg-user-dirs-update >/dev/null 2>&1; then
     xdg-user-dirs-update 2>/dev/null || true
 fi
+# The updater may serialize /Desktop back to $HOME/Desktop. Root's HOME=/
+# needs absolute paths before Plasma's desktop:/ worker converts them to URLs.
+if [ "$HOME" = / ] && [ -f "$XDG_CONFIG_HOME/user-dirs.dirs" ]; then
+    # This is optional configuration repair. Under set -e an in-place edit
+    # failure (permissions, read-only config or filesystem error) otherwise
+    # exits the session wrapper and sends SDDM straight back to the greeter.
+    if ! sed -i 's#="\$HOME/#="/#; s#="//#="/#' \
+        "$XDG_CONFIG_HOME/user-dirs.dirs"; then
+        echo "[startplasma] Could not normalize XDG user directories; continuing session startup." >&2
+    fi
+fi
 export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 export XDG_CONFIG_DIRS="${XDG_CONFIG_DIRS:-/etc/xdg}"
+
+# The PRIME display is configured by avory-prime-display. KScreen otherwise
+# treats the synthetic AMD HDMI sink as a second monitor and enables it.
+# A session-only KConfig default keeps that startup module from replacing the
+# virtual-output layout; native single-GPU sessions keep normal KScreen policy.
+if command -v xrandr >/dev/null 2>&1 &&
+   xrandr --query 2>/dev/null | awk '$2 == "connected" && $1 ~ /^HDMI-[0-9]+-[0-9]+$/ {found=1} END {exit !found}'; then
+    prime_config="$XDG_RUNTIME_DIR/avory-prime-config"
+    if mkdir -p "$prime_config" &&
+       printf '[Module-kscreen]\nautoload[$i]=false\n' > "$prime_config/kded5rc"; then
+        export XDG_CONFIG_DIRS="$prime_config:$XDG_CONFIG_DIRS"
+    fi
+    if command -v avory-prime-display >/dev/null 2>&1; then
+        avory-prime-display || true
+    fi
+fi
 
 # This wrapper starts an X11 session. Give Qt and D-Bus-activated helpers
 # (notably ksecretd) the same platform and the packaged Qt6 plugin directory.
 # Do not set QT_PLUGIN_PATH globally: Qt5 applications have their own plugins.
 export XDG_SESSION_TYPE=x11
+export XDG_CURRENT_DESKTOP=KDE
+export XDG_SESSION_DESKTOP=KDE
+# The real Plasma launcher sets KDE_FULL_SESSION once startup is underway.
+# plasma-workspace supplies plasma-applications.menu, not applications.menu.
+# Select it before both D-Bus activation and the service-cache rebuild.
+export XDG_MENU_PREFIX=plasma-
 export QT_QPA_PLATFORM=xcb
 if [ -f /usr/lib/qt6/plugins/platforms/libqxcb.so ]; then
     export QT_QPA_PLATFORM_PLUGIN_PATH=/usr/lib/qt6/plugins/platforms
@@ -181,8 +225,9 @@ fi
 
 # Build the per-user KDE service registry after package/image changes. This
 # discovers KIO workers and application launchers without a systemd user unit.
+# Discard an empty registry produced by earlier wrappers without a menu prefix.
 if command -v kbuildsycoca6 >/dev/null 2>&1; then
-    kbuildsycoca6 2>/dev/null || true
+    kbuildsycoca6 --noincremental || true
 fi
 
 # 5b. PipeWire session instance (per-user; the rcS boot instance is

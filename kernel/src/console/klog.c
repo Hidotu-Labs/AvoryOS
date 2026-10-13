@@ -210,13 +210,21 @@ static inline void klog_write_dispatch(const char *s, size_t len) {
   /* Keep a persistent copy for /proc/klog before anything can drop it. */
   klog_ring_append(s, len);
 
+  /* Enqueue each record under one serial lock before drawing its screen copy.
+   * The console's 128-byte mirror batches would otherwise split long reports
+   * and allow another CPU's output to interrupt them. */
+  /* Never use serial_write's direct-UART contention fallback for ordinary
+   * records: it bypasses the queue and splices bytes into another CPU's log.
+   * Queue the complete record and drain a bounded burst instead. */
+  serial_write_async(s, len);
+
   /* After console_init() the console owns the screen and keeps its own
    * cursor.  Route the screen copy through it so the boot log stays visible
-   * on the framebuffer (console_write_batch_try also mirrors to serial).
+   * on the framebuffer without emitting a second serial copy.
    * If the console is busy, fall back to serial-only rather than block: this
    * path runs from fault and hang diagnostics too. */
   if (__builtin_expect(screen_logging_enabled && console_sink_enabled, 0)) {
-    if (console_write_batch_try(s, len)) {
+    if (console_write_screen_batch_try(s, len)) {
       /* A completed line is a debug checkpoint: push it to the front buffer
        * now so a hang on the next statement cannot leave the screen showing
        * an older frame that cuts the line in half. */
@@ -224,11 +232,8 @@ static inline void klog_write_dispatch(const char *s, size_t len) {
         console_tick();
       return;
     }
-    serial_write(s, len);
     return;
   }
-
-  serial_write(s, len);
 
   if (__builtin_expect(screen_logging_enabled, 0)) {
     /* trylock: if this CPU already holds klog_lock (a fault inside the screen

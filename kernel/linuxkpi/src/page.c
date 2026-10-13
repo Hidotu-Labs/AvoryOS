@@ -26,7 +26,10 @@
 #include <linux/log2.h>
 #include <linux/spinlock.h>
 
+#include <linuxkpi/log.h>
 #include <linuxkpi/native_mm.h>
+
+extern unsigned long linuxkpi_shrink_reclaim(gfp_t gfp, unsigned long needed);
 
 #define SECTION_SHIFT 27 /* 128 MB */
 #define PAGES_PER_SECTION (1UL << (SECTION_SHIFT - PAGE_SHIFT))
@@ -138,7 +141,9 @@ bool __virt_addr_valid(unsigned long kaddr) {
 /* ------------------------------------------------------------------------- */
 
 void linuxkpi_page_init(void) {
-  uint64_t total = asc_pmm_get_total_memory();
+  /* PFNs describe physical addresses, not the sum of RAM region sizes.
+   * PCI holes can put valid RAM above total_ram (Q35 puts RAM above 4 GiB). */
+  uint64_t total = asc_pmm_get_managed_memory_end();
   uint64_t hhdm = asc_pmm_get_hhdm_offset();
   unsigned long sections = SECTIONS_FOR(total);
   size_t bytes = sections * sizeof(struct page *);
@@ -159,6 +164,7 @@ void linuxkpi_page_init(void) {
   max_pfn = total >> PAGE_SHIFT;
   physmem_end = total;
   page_model_ready = true;
+  klogf("[KPI] texture fixes active: WC-sfence/shrink-reclaim/ww-backoff/fault-seq\n");
 
   /* Section maps are allocated lazily by pfn_to_page() the first time a page
    * in that section is handed out, so a 4 GiB machine pays only for the
@@ -231,8 +237,33 @@ struct page *alloc_pages(gfp_t gfp_mask, unsigned int order) {
   else
     phys = (uint64_t)asc_pmm_alloc_pages(count);
 
-  if (!phys)
+  if (!phys) {
+    /* Minecraft texture churn pins freed GTT pages in TTM's pool while PMM
+     * fragments: drain pool caches once (LinuxKPI-only, no amdgpu change)
+     * before failing the BO. Without this, high-order texture allocs fail
+     * and Mesa samples green/empty placeholders until a later retry. */
+    if (!(gfp_mask & __GFP_NORETRY)) {
+      linuxkpi_shrink_reclaim(gfp_mask, count);
+      if (gfp_mask & __GFP_DMA32)
+        phys = (uint64_t)asc_pmm_alloc_pages_range(count, 0, 0x100000000ULL);
+      else
+        phys = (uint64_t)asc_pmm_alloc_pages(count);
+    }
+  }
+  if (!phys) {
+    static unsigned long fails;
+    unsigned long n = __atomic_add_fetch(&fails, 1, __ATOMIC_RELAXED);
+    /* Rate-limit: first 8 failures carry order/gfp/free pages so the next
+     * green-flash run correlates symptom to allocator pressure. */
+    if (n <= 8) {
+      klogf("[KPI-PAGE] alloc_pages order=%u count=%lu gfp=0x%x DMA32=%d "
+            "failed (fail #%lu, free=%lu)\n",
+            order, (unsigned long)count, (unsigned)gfp_mask,
+            !!(gfp_mask & __GFP_DMA32), n,
+            (unsigned long)asc_pmm_get_free_pages());
+    }
     return NULL;
+  }
 
   page = pfn_to_page(phys >> PAGE_SHIFT);
   if (!page) {
@@ -262,16 +293,9 @@ struct page *alloc_pages_node(int nid, gfp_t gfp_mask, unsigned int order) {
   return alloc_pages(gfp_mask, order);
 }
 
-void __free_pages(struct page *page, unsigned int order) {
-  struct page *head;
+/* The final reference has already been consumed by the caller. */
+static void page_release_block(struct page *head, unsigned int order) {
   void *phys;
-
-  if (!page)
-    return;
-
-  head = compound_head(page);
-  if (!atomic_dec_and_test(&head->_refcount))
-    return; /* still referenced */
 
   head->mapping = NULL;
   head->private = 0;
@@ -282,11 +306,21 @@ void __free_pages(struct page *page, unsigned int order) {
   asc_pmm_free_pages(phys, 1UL << order);
 }
 
+void __free_pages(struct page *page, unsigned int order) {
+  struct page *head;
+
+  if (!page)
+    return;
+  head = compound_head(page);
+  if (atomic_dec_and_test(&head->_refcount))
+    page_release_block(head, order);
+}
+
 void put_page(struct page *page) {
   struct page *head = compound_head(page);
 
   if (atomic_dec_and_test(&head->_refcount))
-    __free_pages(head, compound_order(head));
+    page_release_block(head, compound_order(head));
 }
 
 void put_pages_list(struct list_head *pages) {
@@ -301,7 +335,11 @@ void put_pages_list(struct list_head *pages) {
 void free_pages(unsigned long addr, unsigned int order) {
   if (addr == 0)
     return;
-  __free_pages(pfn_to_page(addr >> PAGE_SHIFT), order);
+  /* __get_free_pages() returns the HHDM virtual address, not a PFN.
+   * Shifting that address directly produces an out-of-range descriptor and
+   * silently drops the free (notably KFD signal/CWSR backing allocations). */
+  __free_pages(phys_to_page((phys_addr_t)(addr - asc_pmm_get_hhdm_offset())),
+               order);
 }
 
 void split_page(struct page *page, unsigned int order) {

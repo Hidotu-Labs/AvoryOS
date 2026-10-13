@@ -4,8 +4,8 @@
  * its address_space with shmem_read_folio_gfp() and keeps them until
  * shmem_truncate_range().  AvoryOS has no tmpfs-in-the-Linux-VFS yet, so this
  * implements exactly that contract over the imported xarray and the native
- * PMM: pages are order-0, zeroed, and owned by the mapping (one reference,
- * released by put_page()/truncate).
+ * PMM: pages are order-0 and zeroed. The mapping owns one reference and
+ * every successful read returns a separate caller reference.
  *
  * The file returned by shmem_file_setup() is a bridged kernel-internal file
  * (no fd); drm_gem_object_release() fputs() it, and the file release hook
@@ -18,16 +18,21 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
+#include <linux/mutex.h>
 #include <linux/shmem_fs.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/xarray.h>
 
+/* Keep lookup + get_page atomic against removal, and publish a newly
+ * allocated page only once. A mutex allows allocation to sleep. */
+static DEFINE_MUTEX(shmem_page_lock);
+
 static void shmem_free_page(struct page *page) {
   if (!page)
     return;
   page->mapping = NULL;
-  __free_pages(page, 0);
+  put_page(page);
 }
 
 /* Frees every page in [start, end] (page indices) and returns the count.
@@ -42,6 +47,7 @@ static unsigned long shmem_truncate_pages(struct address_space *mapping,
   if (!mapping || start > end)
     return 0;
 
+  mutex_lock(&shmem_page_lock);
   while ((page = xa_find(&mapping->i_pages, &index, end, XA_PRESENT))) {
     if (xa_erase(&mapping->i_pages, index) == page) {
       shmem_free_page(page);
@@ -57,6 +63,7 @@ static unsigned long shmem_truncate_pages(struct address_space *mapping,
     else
       atomic_long_set(&mapping->nrpages, 0);
   }
+  mutex_unlock(&shmem_page_lock);
   return freed;
 }
 
@@ -78,34 +85,36 @@ unsigned long invalidate_mapping_pages(struct address_space *mapping,
 struct folio *shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index,
                                    gfp_t gfp) {
   struct page *page;
-  void *old;
+  int ret;
 
   if (!mapping)
     return ERR_PTR(-EINVAL);
 
+  mutex_lock(&shmem_page_lock);
   page = xa_load(&mapping->i_pages, index);
-  if (page)
+  if (page) {
+    get_page(page);
+    mutex_unlock(&shmem_page_lock);
     return page_folio(page);
+  }
 
   page = alloc_pages(gfp | __GFP_ZERO, 0);
-  if (!page)
+  if (!page) {
+    mutex_unlock(&shmem_page_lock);
     return ERR_PTR(-ENOMEM);
+  }
   page->mapping = mapping;
   page->index = index;
 
-  old = xa_store(&mapping->i_pages, index, page, GFP_KERNEL);
-  if (xa_is_err(old)) {
-    long err = xa_err(old);
+  ret = xa_insert(&mapping->i_pages, index, page, GFP_KERNEL);
+  if (ret) {
     shmem_free_page(page);
-    return ERR_PTR(err);
+    mutex_unlock(&shmem_page_lock);
+    return ERR_PTR(ret);
   }
-  if (old) {
-    /* Lost a race: keep the page already in the cache. */
-    shmem_free_page(page);
-    page = old;
-  } else {
-    atomic_long_inc(&mapping->nrpages);
-  }
+  atomic_long_inc(&mapping->nrpages);
+  get_page(page);
+  mutex_unlock(&shmem_page_lock);
   return page_folio(page);
 }
 

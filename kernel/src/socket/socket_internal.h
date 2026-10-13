@@ -20,11 +20,21 @@ extern spinlock_t socket_table_lock;
 // ────────────────────────────────────── This is the family-specific data
 // pointed to by socket->sk for AF_UNIX
 
+/* SCM_RIGHTS must retain the metadata needed by directory operations and
+ * file status queries, not just the VFS node. Paths are snapshots in the
+ * sender's namespace (AvoryOS currently has one global filesystem root). */
+typedef struct unix_scm_fd {
+  struct vfs_node *node;
+  uint64_t offset;
+  uint64_t flags;
+  char path[256];
+} unix_scm_fd_t;
+
 typedef struct unix_scm_msg {
   struct unix_scm_msg *next;
   size_t stream_offset;     // Stream byte offset where this SCM was sent
   int count;                // Number of FDs in this message
-  struct vfs_node *nodes[]; // Dynamically allocated array of vfs_node_t*
+  unix_scm_fd_t fds[];
 } unix_scm_msg_t;
 
 // Packet struct for SOCK_SEQPACKET and SOCK_DGRAM
@@ -53,6 +63,8 @@ typedef struct unix_sock {
   struct unix_sock *peer;     // Connected peer
   struct unix_sock *listener; // Listening socket we're connecting to
   uint32_t owner_pid;
+  uint32_t owner_group_count;
+  uint32_t owner_groups[32];
   uint32_t owner_uid;
   uint32_t owner_gid;
   int backlog;                // Listen backlog
@@ -97,6 +109,8 @@ typedef struct unix_sock {
   // FreezeDetector SIGABRT). Updated on every successful live query plus at
   // link/accept time; returned when the peer is gone but was connected.
   uint32_t peer_cred_pid;
+  uint32_t peer_group_count;
+  uint32_t peer_groups[32];
   uint32_t peer_cred_uid;
   uint32_t peer_cred_gid;
   bool peer_cred_valid;
@@ -118,6 +132,15 @@ typedef struct unix_sock {
   int scm_cred_uid;
   int scm_cred_gid;
 } unix_sock_t;
+
+/* Keep supplementary credentials independent of the peer task's lifetime
+ * and later setgroups() calls, just like the UID/GID connection snapshot. */
+static inline void unix_cache_peer_groups(unix_sock_t *sock,
+                                          const unix_sock_t *peer) {
+  sock->peer_group_count = peer->owner_group_count;
+  for (uint32_t i = 0; i < sock->peer_group_count; i++)
+    sock->peer_groups[i] = peer->owner_groups[i];
+}
 
 // Socket Buffer (sk_buff-like structure)
 
@@ -147,6 +170,8 @@ typedef struct netlink_sock {
   int protocol;
   uint32_t groups;
   uintptr_t portid;
+  bool keepalive;           // SOL_SOCKET state; no TCP timers on Netlink
+  bool ext_ack;             // Optional extended ACK metadata requested
   bool passcred;            // SO_PASSCRED — attach SCM_CREDENTIALS in recvmsg
   sk_buff_head_t recv_queue;
   struct list_head list;

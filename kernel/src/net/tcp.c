@@ -295,6 +295,11 @@ static struct tcp_tcb *find_listener_locked(uint16_t port, uint8_t family)
             continue;
         if (t->address_family == family)
             return t;
+        if (family == 4 && t->address_family == 6 && t->ipv6_dualstack) {
+            static const uint8_t any[16];
+            if (!memcmp(t->local_ip6, any, sizeof(any)))
+                return t;
+        }
     }
     return NULL;
 }
@@ -2157,6 +2162,13 @@ void tcp_timer_tick(uint64_t now)
     struct tcp_tcb *t = start;
     int scanned = 0;
     while (t && scanned < scan_limit) {
+        /* Every branch, including the no-deadline and SYN paths below,
+         * must stop when the work budget fills. Otherwise early continues
+         * bypass cursor advancement and busy head entries starve the rest. */
+        if (nw >= TCP_TIMER_WORK_MAX) {
+            timer_cursor = t;
+            break;
+        }
         /* Count every visited TCB, including branches that continue early.
          * Otherwise a connection without an expired deadline can circle back
          * to start forever while holding the TCP lock with interrupts off. */

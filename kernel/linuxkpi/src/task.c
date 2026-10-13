@@ -1,15 +1,7 @@
-/* Per-thread Linux task_struct shadow.
- *
- * `current` (and task_struct pointers handed out by kthread_create()) point at
- * one of these.  The objects are allocated lazily by native_sched.c through
- * the weak linuxkpi_task_shadow_new() hook.  The native exit path
- * (linuxkpi_thread_exiting()) clears kpi_thread so stale handles cannot reach
- * the freed native thread, but the shadow object itself is retained: a
- * kthread control block lives in it (kpi_control) and kthread_stop() may run
- * after the thread has been reaped.  Shadows with no control block (user
- * threads, plain kernel threads) are still leaked with their thread; freeing
- * them needs reference counting against imported code that stores task
- * pointers, recorded in docs/linuxkpi-gaps.md. */
+/* Per-thread Linux task shadow. The native thread owns its initial reference.
+ * Imported get_task_struct users and joined kthreads hold separate references;
+ * native exit detaches the back-pointer and drops only the native reference.
+ * The last holder releases the shadow and its kthread control block. */
 
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -28,12 +20,35 @@ void *linuxkpi_task_shadow_new(void *thread) {
   tsk->pid = (pid_t)linuxkpi_thread_pid(thread);
   tsk->tgid = (pid_t)linuxkpi_thread_tgid(thread);
   linuxkpi_thread_comm(thread, tsk->comm, sizeof(tsk->comm));
-  /* Kernel-thread shadows are not refcounted yet; start at 1 so imported
-   * refcount helpers (get_task_struct/put_task_struct) cannot underflow. */
+  /* Initial reference belongs to the native thread. */
   refcount_set(&tsk->usage, 1);
   /* No shared signal_struct yet: each thread is its own group leader.  The
    * only consumer is drm_sched's per-user submission tracking, which keys on
    * group_leader identity and compares it against itself. */
   tsk->group_leader = tsk;
   return tsk;
+}
+
+void __put_task_struct(struct task_struct *tsk) {
+  /* No native thread can still use the completion/control block at the
+   * final put: reaping drops its reference only after it is off-CPU. */
+  kfree(tsk->kpi_control);
+  kfree(tsk);
+}
+
+struct task_struct *linuxkpi_task_get(struct task_struct *tsk) {
+  if (tsk)
+    refcount_inc(&tsk->usage);
+  return tsk;
+}
+
+void linuxkpi_task_put(struct task_struct *tsk) {
+  if (tsk && refcount_dec_and_test(&tsk->usage))
+    __put_task_struct(tsk);
+}
+
+void linuxkpi_task_shadow_release(void *shadow) {
+  struct task_struct *tsk = shadow;
+  WRITE_ONCE(tsk->kpi_thread, NULL);
+  linuxkpi_task_put(tsk);
 }

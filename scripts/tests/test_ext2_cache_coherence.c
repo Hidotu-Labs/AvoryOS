@@ -138,6 +138,7 @@ int main(void) {
                              .write_sectors = device_write};
   mount.dev = &dev;
   mount.block_size = 1024;
+  mount.sb.s_blocks_count = 10000;
   spinlock_init(&mount.cache_lock);
   pthread_t thread;
   assert(!pthread_create(&thread, NULL, held_reader, NULL));
@@ -147,7 +148,7 @@ int main(void) {
   pthread_mutex_unlock(&disk_lock);
   unsigned char newer[1024], collision[1024];
   memset(newer, 0x22, sizeof(newer));
-  assert(ext2_write_block(&mount, block_a, newer) == 0);
+  assert(ext2_write_blocks(&mount, block_a, 1, newer) == 0);
   assert(ext2_read_block(&mount, block_a + EXT2_CACHE_SIZE, collision) == 0);
   assert(mount.cache[block_a % EXT2_CACHE_SIZE].num ==
          block_a + EXT2_CACHE_SIZE);

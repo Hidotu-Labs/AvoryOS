@@ -13,9 +13,17 @@ void *linuxkpi_current_thread(void);
 /* Create and enqueue a kernel thread with an argument.  Returns the opaque
  * thread handle, or 0 on failure.  `name` is truncated to 15 characters. */
 void *linuxkpi_kthread_create(void (*fn)(void *), void *arg, const char *name);
+/* Dispose a suspended creation that could not allocate its Linux shadow. */
+void linuxkpi_kthread_cancel_create(void *thread);
 
 /* Block the calling thread with no timeout; woken by linuxkpi_wake_thread(). */
 void linuxkpi_thread_block(void);
+
+/* Arm/disarm a Linux condition wait before checking its condition.
+ * State zero is TASK_RUNNING; other states prepare a subsequent sleep. */
+void linuxkpi_set_current_state(int state);
+void linuxkpi_mutex_wait_set(void *mutex);
+void *linuxkpi_mutex_owner_thread(void *mutex);
 
 /* Block the calling thread for up to `ms` milliseconds.
  * Returns 1 if woken early and 0 if the timeout expired. */
@@ -63,10 +71,9 @@ void *linuxkpi_current_task(void);
 void *linuxkpi_task_for_thread(void *thread);
 void *linuxkpi_task_thread(void *task);
 
-/* Called by the native kernel-thread exit path (thread_exit) before the
- * thread can be reaped.  Drops the task shadow's back-pointer to the native
- * thread so stale task_struct handles cannot reach freed memory; the shadow
- * object itself stays allocated for the thread's (now dead) lifetime. */
+/* Called at native reaping, after the thread is off-CPU. Detaches the
+ * shadow and releases the native owner's reference; external holders keep
+ * the shadow alive with a NULL native back-pointer. */
 void linuxkpi_thread_exiting(void *thread);
 unsigned long linuxkpi_thread_tgid(void *thread);
 unsigned long linuxkpi_thread_pid(void *thread);

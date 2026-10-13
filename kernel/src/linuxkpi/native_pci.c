@@ -8,11 +8,16 @@
 #include "linuxkpi/native_pci.h"
 
 #include "drivers/pci/pci.h"
+#include "fs/sysfs_pci.h"
 #include "lib/string.h"
 
 #include <stdint.h>
 
 int linuxkpi_pci_native_count(void) { return (int)pci_get_device_count(); }
+
+void linuxkpi_pci_native_driver(void *handle, const char *name) {
+  sysfs_pci_linux_driver(handle, name);
+}
 
 void *linuxkpi_pci_native_get(int index) {
   if (index < 0)

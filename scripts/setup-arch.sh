@@ -46,8 +46,12 @@ printf '%s\n' "${ALPINE_BRANCH}" > "${ROOTFS_DIR}/etc/avoryos-alpine-branch"
 
 pacman_run() {
     mkdir -p "${ROOTFS_DIR}/var/lib/pacman"
+    # Wine's Linux-only ntsync autoload helper pulls in NTSYNC-MODULE (and
+    # an Arch kernel). AvoryOS uses its own kernel; omit the helper and let
+    # Wine use its userspace synchronization fallback instead.
     unshare -rm pacman --config "${PACMAN_CONF}" --root "${ROOTFS_DIR}" \
-        --cachedir "${PACMAN_CACHE}" --noconfirm "$@"
+        --cachedir "${PACMAN_CACHE}" --noconfirm \
+        --assume-installed ntsync-autoload "$@"
 }
 
 pacman_sync_once() {
@@ -90,6 +94,13 @@ done
 
 install_apk "st" "community"
 install_apk "feh" "community"
+# Arch's Wine uses WoW64: 32-bit Windows apps run with the x86-64 runtime,
+# without multilib Linux packages. Include the optional .NET/HTML runtimes
+# in the image so Wine does not need to download them on first use.
+install_apk "wine" "community"
+install_apk "wine-mono" "community"
+install_apk "wine-gecko" "community"
+install_apk "xorg-xrandr" "community"
 install_apk "xclock" "community" "edge"
 install_apk "libxft" "main"
 install_apk "libxft-dev" "main"
@@ -704,6 +715,13 @@ install_apk "kidletime" "community"
 install_apk "kjobwidgets" "community"
 install_apk "kio" "community"
 install_apk "kio-extras" "community"
+# Optional KIO helpers are not installed by pacman's dependency resolver:
+# admin:// access, AppImage thumbnails and the info:// worker's Perl runtime.
+# These extend file browsing; root's malformed desktop URL is handled by
+# configure-accounts.sh through normalized XDG user-directory paths.
+install_apk "kio-admin" "community"
+install_apk "libappimage" "community"
+install_apk "perl" "main"
 install_apk "knewstuff" "community"
 install_apk "kpackage" "community"
 install_apk "kparts" "community"
@@ -802,6 +820,13 @@ install_apk "plasma-workspace-libs" "community"
 install_apk "plasma-workspace-wallpapers" "community"
 install_apk "plasma-workspace-x11" "community"
 install_apk "plasma-desktop" "community"
+# Plasma 6's notification server, tray applet and settings module ship in
+# plasma-workspace. knotifications and libnotify (notify-send) are installed
+# above; knotifyconfig supplies KDE app notification settings. Keep sounds
+# explicit too, since install_apk skips packages already present in the tree.
+install_apk "knotifyconfig" "community"
+install_apk "ocean-sound-theme" "community"
+install_apk "sound-theme-freedesktop" "community"
 # Optional Plasma applications/backends are not pulled in by plasma-desktop.
 # Discover needs PackageKit's Qt6 backend for the Arch repository view;
 # pacman resolves its daemon, libalpm, polkit and Qt dependencies together.
@@ -830,7 +855,6 @@ install_apk "libplasma" "community"
 install_apk "musl-fts" "main"
 install_apk "lmdb" "main"
 install_apk "dolphin" "community"
-install_apk "knotifyconfig" "community"
 install_apk "attica" "community"
 install_apk "syndication" "community"
 install_apk "konsole" "community"
@@ -1122,53 +1146,23 @@ if [ -f "${ROOT_DIR}/userland/avory-login.elf" ]; then
     chmod +x "${ROOTFS_DIR}/bin/avory-login"
 fi
 
-# Xorg screen/input config. Without a Device section Xorg falls back to
-# autoconfiguration, which needs full udev enumeration that this kernel only
-# fakes — the result is a silent stall after the config-dir line. This is the
-# same static config that worked before the strip: modesetting on card0 with
-# glamor, explicit evdev keyboard/pointer, no hotplug.
+# Native GPU selection and output sharing are configured in Xorg itself.
 mkdir -p "${ROOTFS_DIR}/etc/X11/xorg.conf.d"
-cat > "${ROOTFS_DIR}/etc/X11/xorg.conf.d/10-modesetting.conf" <<'EOF'
-Section "ServerLayout"
-    Identifier  "AvoryLayout"
-    Screen      0 "Screen0" 0 0
-    InputDevice "Keyboard0" "CoreKeyboard"
-    InputDevice "Mouse0" "CorePointer"
-    Option      "AutoAddDevices" "false"
-EndSection
-
-Section "Device"
-    Identifier  "Card0"
-    Driver      "modesetting"
-    Option      "AccelMethod" "glamor"
-    Option      "SWcursor" "true"
-EndSection
-
-Section "Screen"
-    Identifier  "Screen0"
-    Device      "Card0"
-EndSection
-
-Section "InputDevice"
-    Identifier  "Keyboard0"
-    Driver      "evdev"
-    Option      "Device" "/dev/input/event0"
-    Option      "CoreKeyboard" "true"
-EndSection
-
-Section "InputDevice"
-    Identifier  "Mouse0"
-    Driver      "evdev"
-    Option      "Device" "/dev/input/event1"
-    Option      "CorePointer" "true"
-EndSection
-EOF
+install -m 0644 "${ROOT_DIR}/config/xorg/10-native.conf" \
+    "${ROOTFS_DIR}/etc/X11/xorg.conf.d/10-modesetting.conf"
 # SDDM display manager defaults, baked into the image so bare `sddm`
 # behaves like the /bin/startx.sh path (which regenerates the same files
 # at boot). Without /etc/sddm.conf SDDM hides uid<1000 (no root login);
 # without permissive PAM the stock Arch sddm* services can fail the
 # greeter session on AvoryOS (no systemd/logind, no shadow).
 mkdir -p "${ROOTFS_DIR}/etc/sddm.conf.d" "${ROOTFS_DIR}/etc/pam.d"
+install -m 0644 "${ROOT_DIR}/config/xorg/20-output.conf" \
+    "${ROOTFS_DIR}/etc/sddm.conf.d/20-output.conf"
+install -m 0755 "${ROOT_DIR}/config/xorg/avory-prime-display.sh" \
+    "${ROOTFS_DIR}/usr/bin/avory-prime-display"
+mkdir -p "${ROOTFS_DIR}/etc/X11/xinit/xinitrc.d"
+install -m 0755 "${ROOT_DIR}/config/xorg/45-prime-output.sh" \
+    "${ROOTFS_DIR}/etc/X11/xinit/xinitrc.d/45-prime-output.sh"
 cat > "${ROOTFS_DIR}/etc/sddm.conf" <<'EOF'
 [General]
 DisplayServer=x11
@@ -1187,7 +1181,7 @@ ServerPath=/usr/bin/Xorg
 ServerArguments=-noreset -nolisten tcp -ac
 SessionCommand=/usr/share/sddm/scripts/Xsession
 SessionDir=/usr/share/xsessions
-DisplayCommand=/usr/share/sddm/scripts/Xsetup
+DisplayCommand=/usr/bin/avory-prime-display
 DisplayStopCommand=/usr/share/sddm/scripts/Xstop
 XauthPath=/usr/bin/xauth
 EnableHiDPI=true
@@ -1248,6 +1242,10 @@ tty1::respawn:/bin/avory-login
 ::shutdown:/bin/umount -a -r 2>/dev/null
 ::ctrlaltdel:/sbin/reboot
 EOF
+# /etc/mtab -> /proc/self/mounts: df, mount, libmount and Qt's QStorageInfo
+# fall back to it when mountinfo is unavailable; without it they report 0 B.
+rm -f "${ROOTFS_DIR}/etc/mtab" 2>/dev/null || true
+ln -sf /proc/self/mounts "${ROOTFS_DIR}/etc/mtab" 2>/dev/null || true
 
 # gdk-pixbuf loader registry: generated below by gdk-pixbuf-query-loaders
 # (without it every themed-icon load fails: xfce4-panel dies at startup

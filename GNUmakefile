@@ -8,10 +8,13 @@ ARCH := x86_64
 # AUDIO_LATENCY/AUDIO_BUFLEN if the host audio crackles on a loaded machine.
 AUDIO_LATENCY ?= 50000
 AUDIO_BUFLEN ?= 100000
+# An absolute tablet keeps GTK from warping the host pointer on DRM cursor
+# moves or hiding it under a relative-mouse grab.
+# Grab only the keyboard on hover so desktop shortcuts reach the guest.
 QEMUFLAGS := -m 4G \
 	-vga none \
 	-device virtio-vga,xres=1280,yres=800 \
-	-display gtk,zoom-to-fit=off
+	-display gtk,zoom-to-fit=off,grab-on-hover=on
 
 override IMAGE_NAME := avoryos-$(ARCH)
 
@@ -244,7 +247,7 @@ run: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
-		-device usb-mouse,bus=xhci.0 \
+		-device usb-tablet,bus=xhci.0 \
 		$(QEMUFLAGS)
 run-tcg: run-x86_64
 
@@ -276,156 +279,72 @@ run-numa: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
-		-device usb-mouse,bus=xhci.0 \
+		-device usb-tablet,bus=xhci.0 \
 		$(QEMUFLAGS)
 
 
-# ── LinuxKPI DRM canary (Phase 4+) ──────────────────────────────────────────
-#
-# `make run` plus the emulated devices the LinuxKPI PCI/DRM chunks validate
-# against: `edu` (1234:11e8, Phase 4 C4) and `bochs-display` (1234:1111, the
-# TTM canary, Phase 4 C5).  bochs-display is a secondary, non-VGA display, so
-# it coexists with virtio-vga and does not touch the native GOP path.
-# `make run` is deliberately untouched (the PCI suite logs SKIP there).
-# Headless evidence capture:
-#
-#   make run-linuxdrm SERIAL=file:build/logs/p4-c4.log DISPLAY_OPT=-display none
-#
-# (override QEMU_MEM=... for smaller machines).
+# Shared QEMU settings for interactive and VFIO launchers.
 SERIAL ?= stdio
-DISPLAY_OPT ?= -display gtk,zoom-to-fit=off
+# GTK cursor visibility can be overridden per boot. The guest draws its own
+# framebuffer cursor when using a relative pointer.
+GTK_SHOW_CURSOR ?= off
+DISPLAY_OPT ?= -display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=$(GTK_SHOW_CURSOR)
 QEMU_MEM ?= -m 4G
 
-.PHONY: run-linuxdrm
-run-linuxdrm: edk2-ovmf $(IMAGE_NAME).iso disk.img
-	qemu-system-$(ARCH) \
-		-M q35,pcspk-audiodev=snd0 \
-		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso \
-		-drive file=disk.img,format=raw,if=none,id=nvme0 \
-		-device nvme,serial=avoryos0,drive=nvme0 \
-		-cpu host -enable-kvm \
-		-smp $(RUN_SMP) \
-		-serial $(SERIAL) \
-		$(QEMU_MEM) \
-		-vga none \
-		-device virtio-vga,xres=1280,yres=800 \
-		-device bochs-display \
-		$(DISPLAY_OPT) \
-		-device edu \
-		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
-		-device rtl8139,netdev=net0 \
-		-netdev user,id=net0 \
-		-device intel-hda -device hda-duplex,audiodev=snd0 \
-		-device qemu-xhci,id=xhci \
-		-device usb-kbd,bus=xhci.0 \
-		-device usb-mouse,bus=xhci.0
-
-# ── VFIO passthrough (Phase 0+) ──────────────────────────────────────────────
-#
-# Boots AvoryOS with a host GPU passed through to QEMU.  The guest sees the
-# real device; once the imported Linux amdgpu driver exists, it binds to it.
-# Display output goes to the passed-through GPU's physical connectors, so this
-# target is headless from QEMU's point of view and the serial line is the
-# console.  An emulated std VGA remains so OVMF/Limine still get a GOP
-# framebuffer for the native kernel console.
-#
-#   scripts/vfio-vbios.sh 0000:0e:00.0    # host: extract VBIOS into build/vfio/
-#   make run-vfio
-#
-# Override with VFIO_BDF=... VFIO_MEM=... VFIO_ROM=... QEMUFLAGS='...'.
 VFIO_BDF ?= 0000:0e:00.0
 VFIO_MEM ?= 4G
+VFIO_SMP ?= 8
 VFIO_ROM ?= build/vfio/vbios.rom
 # Extra QEMU -device arguments for a run-vfio boot, e.g.
 #   make run-vfio VFIO_EXTRA='-device edu'
 VFIO_EXTRA ?=
+# Absolute pointing for ordinary VFIO desktops; PRIME games need relative motion.
+VFIO_POINTER ?= usb-tablet
 # Extra raw QEMU arguments for a run-vfio boot, e.g. to capture the exceptions
 # around a silent triple-fault reset (the VM stops at the fault instead of
 # rebooting):
-#   make run-c7 QEMU_EXTRA='-no-reboot -d int,cpu_reset,guest_errors -D build/logs/p6-c7-qemu.log'
+#   make run-c7-prime QEMU_EXTRA='-no-reboot -d int,cpu_reset,guest_errors -D build/logs/prime-qemu.log'
 QEMU_EXTRA ?=
 VFIO_COMMA := ,
 VFIO_ROM_OPT = $(if $(wildcard $(VFIO_ROM)),$(VFIO_COMMA)romfile=$(VFIO_ROM),)
 
 .PHONY: run-vfio
+run-vfio: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
 run-vfio: edk2-ovmf $(IMAGE_NAME).iso disk.img
 	qemu-system-$(ARCH) \
 		-M q35 \
 		-m $(VFIO_MEM) \
 		-cpu host -enable-kvm \
-		-smp 4 \
+		-smp $(VFIO_SMP) \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
 		-drive file=disk.img,format=raw,if=none,id=nvme0 \
 		-device nvme,serial=avoryos0,drive=nvme0 \
-		-device vfio-pci,host=$(VFIO_BDF),rombar=1$(VFIO_ROM_OPT) \
+		-device vfio-pci,host=$(VFIO_BDF),addr=03.0,rombar=1$(VFIO_ROM_OPT) \
+		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
+		-device intel-hda -device hda-duplex,audiodev=snd0 \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0 \
+		-device $(VFIO_POINTER),bus=xhci.0 \
 		$(DISPLAY_OPT) \
 		-serial $(SERIAL) \
 		$(VFIO_EXTRA) \
 		$(QEMU_EXTRA) \
 		$(QEMUFLAGS)
 
-# Phase 6 C4: headless amdgpu bring-up.  `amdgpu.dc=0` skips the dm ip block
-# (DCN display bring-up is minutes-slow in this environment and only needed at
-# C6); the serial log lands in build/logs/p6-c4.log.  drm.debug=0x1 enables the
-# DRM_UT_CORE channel only: it carries the per-ring `ib test on %s succeeded`
-# lines (success is otherwise silent), which the C4 evidence needs.
-# `amdgpu.ppfeaturemask=0xfff73fff` clears PP_GFXOFF_MASK (0x8000) from the
-# default 0xfff7bfff: GFX power gating loses the MEC/KIQ HQD programming on
-# this guest (doorbells dropped, ring test flaky), and C4 does not need GFXOFF.
-.PHONY: run-c4
-run-c4: KERNEL_CMDLINE = kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.dc=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x1
-run-c4: SERIAL = file:build/logs/p6-c4.log
-run-c4: DISPLAY_OPT = -display none
-run-c4: VFIO_EXTRA = -device edu
-# Drop the default gtk display from QEMUFLAGS; keep virtio-vga (the default
-# std VGA trips the P4 bochs canary).  Command-line QEMUFLAGS still wins.
-run-c4: QEMUFLAGS = -vga none -device virtio-vga,xres=1280,yres=800
-run-c4: run-vfio
-
-# Phase 6 C5: amdgpu queues/VM/BOs/CS.  Same bring-up command line as C4
-# (headless IP set, no DCN) but interactive: the GTK window is where
-# bin/test_kpi_amdgpu is run after login, while the serial log lands in
-# build/logs/p6-c5.log.  Start from a cold GPU (`make reset-gpu` or a host
-# reboot; see docs/amdgpu-testing.md).
-.PHONY: run-c5
-run-c5: KERNEL_CMDLINE = kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.dc=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x1
-run-c5: SERIAL = file:build/logs/p6-c5.log
-run-c5: VFIO_EXTRA = -device edu
-run-c5: QEMUFLAGS = -vga none -device virtio-vga,xres=1280,yres=800
-run-c5: run-vfio
-
-# Phase 6 C6: KMS/DCN bring-up.  Same as C5 but with the dm ip block enabled
-# (`amdgpu.dc` stays at its default 1) so DMUB, DCN 3.1.5 and the connectors
-# come up.  Interactive by default (GTK + virtio-vga desktop) so modetest /
-# bin/test_kpi_amdgpu can run after login; `DISPLAY_OPT='-display none'`
-# overrides for a headless capture.
-# drm.debug=0x4 is the KMS channel only.  The C4/C5 targets use 0x1 (CORE):
-# that logs every DRM ioctl (`drm_ioctl()` -> drm_dbg_core()) and the boot
-# suites' GEM loops turn it into thousands of lines.  CORE also carries the
-# per-ring `ib test on %s succeeded` DRM_DEBUG evidence; when that is wanted,
-# boot with KERNEL_CMDLINE='... drm.debug=0x5'.  Add 0x10 (ATOMIC) for commit
-# state debugging.
-.PHONY: run-c6
-run-c6: KERNEL_CMDLINE = kpi_amdgpu=1 amdgpu.runpm=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x4
-run-c6: SERIAL = file:build/logs/p6-c6.log
-run-c6: VFIO_EXTRA = -device edu
-run-c6: QEMUFLAGS = -vga none -device virtio-vga,xres=1280,yres=800
-run-c6: run-vfio
-
-# Phase 6 C7: Mesa radeonsi 3D + accelerated Xorg/Wayland sessions.  Same as
-# C6 plus `kpi_emu_sink=1`: the DCN self-test keeps its EDID-override emulated
-# sink in place, so Xorg / Weston / KWin can start on amdgpu's card even
-# though no physical monitor is attached to the passed iGPU (the QEMU window
-# stays the native card0 desktop).  Interactive by default; override
-# DISPLAY_OPT='-display none' for a headless capture to build/logs/p6-c7.log.
-.PHONY: run-c7
-run-c7: KERNEL_CMDLINE = kpi_amdgpu=1 kpi_emu_sink=1 amdgpu.runpm=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x4
-run-c7: SERIAL = file:build/logs/p6-c7.log
-run-c7: VFIO_EXTRA = -device edu
-run-c7: QEMUFLAGS = -vga none -device virtio-vga,xres=1280,yres=800
-run-c7: run-vfio
+# One-monitor VFIO mode: Xorg prefers AMD for its primary renderer and
+# shares the desktop with the VirtIO output GPU. Keep Display Core enabled:
+# modesetting needs AMD KMS resources even without a connected monitor.
+.PHONY: run-c7-prime
+run-c7-prime: KERNEL_CMDLINE = kpi_amdgpu=1 kpi_prime_offload=1 amdgpu.runpm=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x4
+run-c7-prime: SERIAL = chardev:prime-diag
+run-c7-prime: VFIO_SMP = 8
+# GLFW cursor capture/raw motion requires a relative device, not a tablet.
+run-c7-prime: VFIO_POINTER = usb-mouse
+run-c7-prime: GTK_SHOW_CURSOR = off
+run-c7-prime: VFIO_EXTRA = -device edu -chardev socket,id=prime-diag,path=build/logs/p6-c7-prime-serial.sock,server=on,wait=off,logfile=build/logs/p6-c7-prime.log -device rtl8139,netdev=net0,addr=08.0 -netdev user,id=net0
+run-c7-prime: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
+run-c7-prime: run-vfio
 
 # Cold-start the passed GPU on the host before a C4+ boot.  QEMU/VFIO does not
 # reset the device on VM exit, and the guest driver's bring-up sequence assumes
@@ -490,35 +409,12 @@ run-minimal: edk2-ovmf $(MINIMAL_ISO)
 		-netdev user,id=net0 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
-		-device usb-mouse,bus=xhci.0 \
+		-device usb-tablet,bus=xhci.0 \
 		$(QEMUFLAGS)
 
 .PHONY: clean-minimal
 clean-minimal:
 	rm -rf build/minimal $(MINIMAL_ISO)
-
-.PHONY: run-x86_64
-# Default interactive target on a machine without /dev/kvm: TCG, no KVM flag,
-# root filesystem on an NVMe namespace.  run-sata-tcg keeps the old IDE/ATA
-# layout for comparison.  Use QEMUFLAGS='-smp N' for SMP tests.
-run-x86_64: edk2-ovmf $(IMAGE_NAME).iso disk.img
-	qemu-system-$(ARCH) \
-		-M q35,pcspk-audiodev=snd0 \
-		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso \
-		-drive file=disk.img,format=raw,if=none,id=nvme0 \
-		-device nvme,serial=avoryos0,drive=nvme0 \
-		-smp $(RUN_SMP) \
-		-serial stdio \
-		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
-		-device rtl8139,netdev=net0 \
-		-netdev user,id=net0 \
-		-device intel-hda -device hda-duplex,audiodev=snd0 \
-		-device qemu-xhci,id=xhci \
-		-device usb-kbd,bus=xhci.0 \
-		-device usb-mouse,bus=xhci.0 \
-		$(QEMUFLAGS)
-
 
 # Legacy SATA/IDE root disk (the pre-NVMe run layout), kept for AHCI/ATA
 # regression and A/B comparisons.  run-sata is KVM, run-sata-tcg is TCG.
@@ -538,93 +434,8 @@ run-sata: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
-		-device usb-mouse,bus=xhci.0 \
+		-device usb-tablet,bus=xhci.0 \
 		$(QEMUFLAGS)
-
-run-sata-tcg: edk2-ovmf $(IMAGE_NAME).iso disk.img
-	qemu-system-$(ARCH) \
-		-M q35,pcspk-audiodev=snd0 \
-		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso \
-		-drive file=disk.img,format=raw,if=none,id=disk0 -device ide-hd,drive=disk0,bus=ide.0 \
-		-smp 4 \
-		-serial stdio \
-		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
-		-device rtl8139,netdev=net0 \
-		-netdev user,id=net0 \
-		-device intel-hda -device hda-duplex,audiodev=snd0 \
-		-device qemu-xhci,id=xhci \
-		-device usb-kbd,bus=xhci.0 \
-		-device usb-mouse,bus=xhci.0 \
-		$(QEMUFLAGS)
-
-		
-
-# ── NVMe ────────────────────────────────────────────────────────────────────
-
-# run-nvme / run-nvme-tcg predate the switch of the interactive targets to
-# NVMe; they are aliases now.
-.PHONY: run-nvme run-nvme-tcg
-run-nvme: run
-run-nvme-tcg: run-tcg
-
-# Headless test image: minimal root on AHCI plus a blank NVMe scratch disk.
-# The image runs /bin/nvme_test auto at boot and powers off; the host-side
-# orchestrator is scripts/nvme/nvme-stress.sh.
-.PHONY: run-nvme-test
-run-nvme-test: edk2-ovmf $(IMAGE_NAME).iso nvme_test.img nvme_scratch.img
-	@mkdir -p build/nvme
-	qemu-system-$(ARCH) \
-		-M q35 \
-		-m 4G \
-		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso \
-		-drive file=nvme_test.img,format=raw,if=none,id=root0 \
-		-device ide-hd,drive=root0,bus=ide.0 \
-		-drive file=nvme_scratch.img,format=raw,if=none,id=nvme0 \
-		-device nvme,serial=avoryos-test,drive=nvme0 \
-		$(if $(wildcard /dev/kvm),-cpu host -enable-kvm) \
-		-smp 4 \
-		-display none \
-		-serial file:build/nvme/run-nvme-test.log
-
-nvme_test.img: scripts/nvme/create-nvme-test.sh userland/nvme_test.elf userland/nvme_bench.elf userland/avoryd.elf userland/shutdown.elf
-	./scripts/nvme/create-nvme-test.sh
-
-nvme_scratch.img: nvme_test.img
-	@test -f $@ || ./scripts/nvme/create-nvme-test.sh
-
-# Phase 7 acceptance & hardening suites (scripts/nvme/nvme-phase7.sh).  These build
-# and boot QEMU many times; PHASE7_ARGS forwards extra runner flags, e.g.
-#   make nvme-phase7 PHASE7_ARGS="--quick"
-#   make nvme-phase7-matrix PHASE7_ARGS="--only=accel=tcg --limit=8"
-#   make nvme-phase7-dry            # prints the 72-cell matrix and commands
-.PHONY: nvme-phase7 nvme-phase7-quick nvme-phase7-dry nvme-phase7-matrix
-nvme-phase7:
-	./scripts/nvme/nvme-phase7.sh all $(PHASE7_ARGS)
-nvme-phase7-quick:
-	./scripts/nvme/nvme-phase7.sh --quick all $(PHASE7_ARGS)
-nvme-phase7-dry:
-	./scripts/nvme/nvme-phase7.sh --dry-run all $(PHASE7_ARGS)
-nvme-phase7-matrix:
-	./scripts/nvme/nvme-phase7.sh matrix $(PHASE7_ARGS)
-
-.PHONY: run-net
-# Headless KVM boot for network benchmarks.  The guest reaches host-side
-# test servers (scripts/nettest-server.py) at 10.0.2.2 under user networking.
-run-net: edk2-ovmf $(IMAGE_NAME).iso disk.img
-	qemu-system-$(ARCH) \
-		-M q35 \
-		-m 4G \
-		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso \
-		-drive file=disk.img,format=raw,if=none,id=disk0 -device ide-hd,drive=disk0,bus=ide.0 \
-		-cpu host -enable-kvm \
-		-smp 4 \
-		-serial mon:stdio \
-		-display none \
-		-device rtl8139,netdev=net0 \
-		-netdev user,id=net0
 
 .PHONY: run-bios
 run-bios: $(IMAGE_NAME).iso disk.img
@@ -679,7 +490,7 @@ run-fat32: edk2-ovmf $(IMAGE_NAME).iso fat32_test.img
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
-		-device usb-mouse,bus=xhci.0 \
+		-device usb-tablet,bus=xhci.0 \
 		$(QEMUFLAGS)
 
 AetherDE/x11-wm/AetherWM: AetherDE/x11-wm/main.c AetherDE/x11-wm/render.c AetherDE/x11-wm/input.c AetherDE/x11-wm/frames.c AetherDE/x11-wm/wm.h AetherDE/x11-wm/stb_image.h $(ALPINE_STAMP) $(MUSL_LIBC)
@@ -809,7 +620,7 @@ AetherDE/demo-client/aether-window: AetherDE/demo-client/main.c $(ALPINE_STAMP) 
 # Create a 5GB ext4 disk image with sample files for testing
 # Deterministic 4 KB firmware blob read by the Phase 5 firmware self-test
 # (byte i = (i * 7 + 3) & 0xff).  Staged into the rootfs /lib/firmware below.
-build/test_fw.bin: GNUmakefile
+build/test_fw.bin:
 	@mkdir -p build
 	@python3 -c 'import sys; open(sys.argv[1], "wb").write(bytes(((i * 7 + 3) & 0xff) for i in range(4096)))' $@
 
@@ -823,10 +634,32 @@ build/firmware/.stamp: scripts/linux-firmware-install.sh scripts/linux/firmware-
 	LINUX_FIRMWARE_REF='$(LINUX_FIRMWARE_REF)' scripts/linux-firmware-install.sh
 	@touch $@
 
-disk.img: GNUmakefile userland/winoptions userland/icewm-menu $(ALPINE_STAMP)
+disk.img: userland/winoptions userland/icewm-menu $(ALPINE_STAMP)
 disk.img: scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh userland/avory-login.elf userland/avory-installer.elf
 disk.img:  userland/dns_lookup.elf userland/nettest.elf
 disk.img: userland/test_clone_futex.elf
+# Fixed 12 GiB image by default (override per build with
+# `make disk.img DISK_SIZE_MIB=<MiB>`). Leave room for filesystem metadata
+# and tools added after the rootfs overlay.
+DISK_SIZE_MIB ?= 12288
+
+disk.img: scripts/populate-ext2-dir.sh
+# Keep the VFIO desktop profile even when disk.img is rebuilt independently
+# of a run target. Non-passthrough images can use XORG_PROFILE=native.
+XORG_PROFILE ?= amdgpu
+XORG_CONFIG = $(if $(filter amdgpu,$(XORG_PROFILE)),config/xorg/10-modesetting.conf,config/xorg/10-native.conf)
+
+# Pick a profile when populating a disk. Changing launch targets does not
+# switch profiles; the default remains amdgpu for standalone builds too.
+# To install the non-passthrough profile, rebuild with XORG_PROFILE=native.
+disk.img: config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/20-output.conf scripts/image-runtime.py
+disk.img: config/xorg/avory-prime-display.sh config/xorg/45-prime-output.sh
+disk.img: scripts/image-firmware-install.sh
+disk.img: userland/test_signal_stack.elf
+disk.img: userland/test_user_dispatch.elf
+disk.img: userland/test_syscompat.elf
+disk.img: userland/test_tlb_stress.elf
+disk.img: userland/test_futex_clock.elf
 disk.img: userland/test_futex_pi.elf
 disk.img: userland/test_unix_sockets.elf
 disk.img: userland/test_syscall_speed.elf
@@ -842,6 +675,7 @@ disk.img: userland/test_ticket_lock.elf
 disk.img: userland/test_fb_perf.elf
 disk.img: userland/test_vdso_bench.elf
 disk.img: userland/test_lazy_fpu.elf
+disk.img: userland/test_elf32.elf
 disk.img: userland/test_heap_smp.elf
 disk.img: userland/test_dcache.elf
 disk.img: userland/test_tmpfile.elf
@@ -854,7 +688,7 @@ disk.img: userland/test_kpi_dmabuf.elf
 disk.img: userland/test_kpi_drm.elf
 disk.img: userland/test_kpi_bochs.elf
 disk.img: userland/test_kpi_amdgpu.elf
-disk.img: userland/test_kpi_radeonsi.elf
+disk.img: userland/test_kpi_radeonsi.elf userland/radeonsi_vram_leak.elf
 disk.img: build/test_fw.bin build/firmware/.stamp
 disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 
@@ -862,19 +696,28 @@ disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 disk.img: $(BASH_STAMP) $(COREUTILS_STAMP) $(ALPINE_STAMP) $(QUAKE2_BUNDLE_FILES)
 disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/about.elf userland/hello_glibc.elf userland/booter.elf userland/reboot.elf userland/shutdown.elf userland/apm.elf userland/test_cpp.elf  userland/kilo.elf  userland/ls.elf userland/lspci.elf userland/lsblk.elf userland/readelf.elf userland/pong.elf userland/raycast.elf userland/asplay.elf userland/kria.elf userland/doom.elf userland/doom_x11.elf userland/gtk3_test.elf userland/qt5_test.elf userland/sdl3_test.elf userland/tglgears_fb.elf userland/tglgears_drm.elf userland/tglhello_drm.elf userland/test_mem_stress.elf userland/classicube.elf userland/terrain.png userland/texpacks/classicube.zip initrd/startx.sh initrd/startw.sh initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh AetherDE/x11-wm/AetherWM AetherDE/aether-dock/aether-dock AetherDE/aether-panel/aether-panel AetherDE/wayland-compositor/aether-compositor AetherDE/demo-client/aether-window AetherDE/scripts/sax11.sh AetherDE/scripts/sawayland.sh userland/avoryd.elf $(AVORYD_CONFIG_FILES)
 	@echo "Creating partitioned disk image (GPT)..."
+	@if ls -l /proc/[0-9]*/fd/* 2>/dev/null | grep -q "disk.img"; then \
+		echo "Refusing: disk.img is open by a running process (QEMU?). Stop the VM before rebuilding the disk image; rebuilding it in place corrupts the guest's filesystem." >&2; \
+		exit 1; \
+	fi
+	@if _rootfs_mb=$$(du -sm build/alpine/rootfs 2>/dev/null | cut -f1); \
+		[ -n "$$_rootfs_mb" ] && [ "$$_rootfs_mb" -gt "$$(( $(DISK_SIZE_MIB) - 1024 ))" ]; then \
+		echo "Refusing: rootfs ($${_rootfs_mb}MiB) exceeds $(DISK_SIZE_MIB)MiB minus 1GiB metadata headroom; rebuild with DISK_SIZE_MIB=<MiB>." >&2; \
+		exit 1; \
+	fi
 	@if [ -L ./part.img ]; then \
 		old_loop=$$(readlink ./part.img); \
 		case "$$old_loop" in /dev/loop*) losetup -d "$$old_loop" >/dev/null 2>&1 || true;; esac; \
 	fi
 	rm -f ./part.img
-	truncate -s 6144M disk.img
-	printf 'label: gpt\nstart=2048, size=12578816, type=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709, name="rootfs"\n' | sfdisk disk.img >/dev/null 2>&1 || (parted -s disk.img mklabel gpt && parted -s disk.img mkpart rootfs ext4 1MiB 6143MiB)
-	@if loop=$$(losetup --find --show --offset 1048576 --sizelimit 6440353792 disk.img 2>/dev/null); then \
+	truncate -s $(DISK_SIZE_MIB)M disk.img
+	printf 'label: gpt\nstart=2048, size=%s, type=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709, name="rootfs"\n' $$(( ($(DISK_SIZE_MIB) - 2) * 2048 )) | sfdisk disk.img >/dev/null 2>&1 || (parted -s disk.img mklabel gpt && parted -s disk.img mkpart rootfs ext4 1MiB $$(( $(DISK_SIZE_MIB) - 1 ))MiB)
+	@if loop=$$(losetup --find --show --offset 1048576 --sizelimit $$(( ($(DISK_SIZE_MIB) - 2) * 1048576 )) disk.img 2>/dev/null); then \
 		ln -s "$$loop" ./part.img; \
 		echo "Using partition loop device $$loop (formatting in place)"; \
 	else \
 		echo "Loop device unavailable; using sparse temporary partition image"; \
-		truncate -s 6142M ./part.img; \
+		truncate -s $$(( $(DISK_SIZE_MIB) - 2 ))M ./part.img; \
 	fi
 	@echo "Creating root filesystem (ext4)..."
 	mkfs.ext4 -F -b 1024 -I 128 \
@@ -1037,6 +880,16 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/test_mem_stress.elf bin/test_mem_stress"; \
 		echo "rm bin/test_clone_futex"; \
 		echo "write userland/test_clone_futex.elf bin/test_clone_futex"; \
+		echo "rm bin/test_signal_stack"; \
+		echo "write userland/test_signal_stack.elf bin/test_signal_stack"; \
+		echo "rm bin/test_user_dispatch"; \
+		echo "write userland/test_user_dispatch.elf bin/test_user_dispatch"; \
+		echo "rm bin/test_tlb_stress"; \
+		echo "write userland/test_tlb_stress.elf bin/test_tlb_stress"; \
+		echo "rm bin/test_futex_clock"; \
+		echo "write userland/test_futex_clock.elf bin/test_futex_clock"; \
+		echo "rm bin/test_syscompat"; \
+		echo "write userland/test_syscompat.elf bin/test_syscompat"; \
 		echo "rm bin/test_futex_pi"; \
 		echo "write userland/test_futex_pi.elf bin/test_futex_pi"; \
 		echo "rm bin/test_unix_sockets"; \
@@ -1053,6 +906,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/test_kpi_amdgpu.elf bin/test_kpi_amdgpu"; \
 		echo "rm bin/test_kpi_radeonsi"; \
 		echo "write userland/test_kpi_radeonsi.elf bin/test_kpi_radeonsi"; \
+		echo "rm bin/radeonsi_vram_leak.elf"; \
+		echo "write userland/radeonsi_vram_leak.elf bin/radeonsi_vram_leak.elf"; \
 		echo "rm bin/test_child_notify"; \
 		echo "write userland/test_child_notify.elf bin/test_child_notify"; \
 		echo "rm bin/test_pty_master"; \
@@ -1083,6 +938,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/test_vdso_bench.elf bin/test_vdso_bench"; \
 		echo "rm bin/test_lazy_fpu"; \
 		echo "write userland/test_lazy_fpu.elf bin/test_lazy_fpu"; \
+		echo "rm bin/test_elf32"; \
+		echo "write userland/test_elf32.elf bin/test_elf32"; \
 		echo "rm bin/test_heap_smp"; \
 		echo "write userland/test_heap_smp.elf bin/test_heap_smp"; \
 		echo "rm bin/test_dcache"; \
@@ -1128,27 +985,21 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 	fi
 	@if [ -d build/alpine/rootfs ]; then \
 		echo "Populating Arch Linux rootfs into disk image..."; \
+		mkdir -p build/alpine/rootfs/etc/X11/xorg.conf.d; \
+		install -m 0644 $(XORG_CONFIG) build/alpine/rootfs/etc/X11/xorg.conf.d/10-modesetting.conf; \
+		install -m 0755 config/xorg/avory-prime-display.sh build/alpine/rootfs/usr/bin/avory-prime-display; \
+		mkdir -p build/alpine/rootfs/etc/X11/xinit/xinitrc.d; \
+		install -m 0755 config/xorg/45-prime-output.sh build/alpine/rootfs/etc/X11/xinit/xinitrc.d/45-prime-output.sh; \
+		mkdir -p build/alpine/rootfs/etc/sddm.conf.d; \
+		install -m 0644 config/xorg/20-output.conf build/alpine/rootfs/etc/sddm.conf.d/20-output.conf; \
+		if [ -f build/alpine/rootfs/etc/sddm.conf ]; then \
+			sed -i 's|^DisplayCommand=.*$$|DisplayCommand=/usr/bin/avory-prime-display|' build/alpine/rootfs/etc/sddm.conf; \
+		fi; \
 		./scripts/configure-accounts.sh build/alpine/rootfs; \
 		./scripts/populate-ext2-dir.sh ./part.img build/alpine/rootfs /; \
 	fi
-	@_dbg=debugfs; if [ -x /run/host/usr/bin/debugfs ]; then _dbg=/run/host/usr/bin/debugfs; fi; \
-	echo "Verifying image libc matches build tree..."; \
-	_img_ver=$$("$$_dbg" -R "dump usr/lib/libc.so.6 /tmp/avoryos-img-libc-check" ./part.img 2>/dev/null && strings -a /tmp/avoryos-img-libc-check 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
-	rm -f /tmp/avoryos-img-libc-check; \
-	_tree_ver=$$(strings -a build/alpine/rootfs/usr/lib/libc.so.6 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
-	if [ "$$_img_ver" != "$$_tree_ver" ] || [ "$$_img_ver" = "MISSING" ]; then \
-		echo "ERROR: image libc ($$_img_ver) != tree libc ($$_tree_ver): refusing mixed-libc image" >&2; \
-		echo "ERROR: full clean rebuild required (interrupted populates leave stale libs)" >&2; \
-		exit 1; \
-	fi; \
-	echo "Verifying image loader matches build tree..."; \
-	_img_ld=$$("$$_dbg" -R "dump usr/lib/ld-linux-x86-64.so.2 /tmp/avoryos-img-ld-check" ./part.img 2>/dev/null && strings -a /tmp/avoryos-img-ld-check 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
-	rm -f /tmp/avoryos-img-ld-check; \
-	_tree_ld=$$(strings -a build/alpine/rootfs/usr/lib/ld-linux-x86-64.so.2 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
-	if [ "$$_img_ld" != "$$_tree_ld" ] || [ "$$_img_ld" = "MISSING" ]; then \
-		echo "ERROR: image loader ($$_img_ld) != tree loader ($$_tree_ld): refusing mixed-libc image" >&2; \
-		exit 1; \
-	fi
+	@python3 scripts/image-runtime.py ./part.img build/alpine/rootfs \
+		/usr/lib/libc.so.6 /usr/lib/ld-linux-x86-64.so.2
 	# The Arch rootfs also has a stale bin/startx.sh.  Restore these
 	# AvoryOS-owned files after the overlay, otherwise XFCE runs startxfce4
 	# and opens its failsafe-session error dialog.
@@ -1219,7 +1070,7 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field opt/butterscotch/butterscotch mode 0100755"; \
 		echo "set_inode_field usr/bin/butterscotch mode 0100755"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
-	@echo "Installing Arch glibc into /lib and /lib64 (no symlinks)..."
+	@echo "Installing staged glibc into /lib and /lib64 (no symlinks)..."
 	@# The guest kernel does not resolve the usrmerge symlinks for the
 	@# interpreter path (/lib64/ld-linux... -> usr/lib/...): with /lib64 as
 	@# a symlink, exec of /bin/sh fails with
@@ -1228,7 +1079,7 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 	@# then fails every dynamic binary with
 	@#   undefined symbol: __pointer_chk_guard, version GLIBC_PRIVATE
 	@# (Arch glibc is 2.44: libc UNDs it, ld.so defines it; 2.43 has neither).
-	@# So keep /lib and /lib64 as real dirs holding the SAME Arch 2.44 libs
+	@# So keep /lib and /lib64 as real dirs holding the staged runtime libs
 	@# as /usr/lib. No version skew, no symlink dependency.
 	@{ \
 		echo "cd /"; \
@@ -1241,25 +1092,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "mkdir lib"; \
 		echo "mkdir lib64"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
-	@debugfs -w -R "write build/alpine/rootfs/usr/lib/ld-linux-x86-64.so.2 lib/ld-linux-x86-64.so.2" ./part.img >/dev/null 2>&1 || true; \
-	debugfs -w -R "write build/alpine/rootfs/usr/lib/libc.so.6 lib/libc.so.6" ./part.img >/dev/null 2>&1 || true; \
-	debugfs -w -R "write build/alpine/rootfs/usr/lib/libm.so.6 lib/libm.so.6" ./part.img >/dev/null 2>&1 || true; \
-	debugfs -w -R "write build/alpine/rootfs/usr/lib/ld-linux-x86-64.so.2 lib64/ld-linux-x86-64.so.2" ./part.img >/dev/null 2>&1 || true; \
-	debugfs -w -R "write build/alpine/rootfs/usr/lib/libc.so.6 lib64/libc.so.6" ./part.img >/dev/null 2>&1 || true; \
-	debugfs -w -R "write build/alpine/rootfs/usr/lib/libm.so.6 lib64/libm.so.6" ./part.img >/dev/null 2>&1 || true; \
-	if [ -f build/alpine/rootfs/usr/lib/musl/lib/libc.so ]; then \
-		debugfs -w -R "write build/alpine/rootfs/usr/lib/musl/lib/libc.so lib/ld-musl-x86_64.so.1" ./part.img >/dev/null 2>&1 || true; \
-	fi
-	@_dbg=debugfs; if [ -x /run/host/usr/bin/debugfs ]; then _dbg=/run/host/usr/bin/debugfs; fi; \
-	echo "Verifying image loader matches build tree..."; \
-	_img_ld=$$("$$_dbg" -R "dump lib64/ld-linux-x86-64.so.2 /tmp/avoryos-img-ld-check" ./part.img 2>/dev/null && strings -a /tmp/avoryos-img-ld-check 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
-	rm -f /tmp/avoryos-img-ld-check; \
-	_tree_ld=$$(strings -a build/alpine/rootfs/usr/lib/ld-linux-x86-64.so.2 2>/dev/null | grep -m1 "stable release version" || echo MISSING); \
-	if [ "$$_img_ld" != "$$_tree_ld" ] || [ "$$_img_ld" = "MISSING" ]; then \
-		echo "ERROR: image /lib64 loader ($$_img_ld) != tree loader ($$_tree_ld)" >&2; \
-		exit 1; \
-	fi; \
-	echo "glibc compat dirs OK (/lib, /lib64 hold Arch 2.44 libs)";
+	@python3 scripts/image-runtime.py ./part.img build/alpine/rootfs --copy-compat
+	@bash scripts/image-firmware-install.sh ./part.img
 	@echo "Populating root filesystem with additional tools..."
 
 	@if [ -d build/tcc-glibc-install/opt/tcc ]; then \
@@ -1428,6 +1262,7 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field bin/test_fb_perf mode 0100755"; \
 		echo "set_inode_field bin/test_vdso_bench mode 0100755"; \
 		echo "set_inode_field bin/test_lazy_fpu mode 0100755"; \
+		echo "set_inode_field bin/test_elf32 mode 0100755"; \
 		echo "set_inode_field bin/test_heap_smp mode 0100755"; \
 		echo "set_inode_field bin/test_dcache mode 0100755"; \
 		echo "set_inode_field bin/test_tmpfile mode 0100755"; \
@@ -1436,6 +1271,7 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field bin/test_kpi_bochs mode 0100755"; \
 		echo "set_inode_field bin/test_kpi_amdgpu mode 0100755"; \
 		echo "set_inode_field bin/test_kpi_radeonsi mode 0100755"; \
+		echo "set_inode_field bin/radeonsi_vram_leak.elf mode 0100755"; \
 		echo "set_inode_field bin/test_child_notify mode 0100755"; \
 		echo "set_inode_field bin/test_pty_master mode 0100755"; \
 		echo "set_inode_field bin/test_uaccess_bench mode 0100755"; \
@@ -1480,11 +1316,6 @@ setup:
 	chmod +x bootstrap.sh
 	./bootstrap.sh
 
-# Kernel build flags (SYSCALL_LOG, KLOG_RING_KB, ...) are ordinary make
-# variables and reach the sub-make through MAKEFLAGS, so a tracing image is
-# built by prefixing any kernel-dependent target:
-#   make SYSCALL_LOG=browser KLOG_RING_KB=8192 avoryos-x86_64.iso
-#   make SYSCALL_LOG=browser run
 .PHONY: kernel
 kernel: setup
 	$(MAKE) -C kernel
@@ -1520,7 +1351,7 @@ $(IMAGE_NAME).iso: limine/limine kernel limine.conf build/kernel_cmdline.stamp
 		limine.conf > iso_root/boot/limine/limine.conf
 	@if [ -n '$(KERNEL_CMDLINE)' ]; then \
 		awk -v c='$(KERNEL_CMDLINE)' \
-			'{print} /^\/AvoryOS/ && !done {print "    cmdline: " c; done=1}' \
+			'/^\// {if (target && !added) print "    cmdline: " c; target=0; if (!selected && /^\/AvoryOS/) {target=1; selected=1}} target && /^[[:space:]]*cmdline:/ {if (!added) print "    cmdline: " c; added=1; next} {print} END {if (target && !added) print "    cmdline: " c}' \
 			iso_root/boot/limine/limine.conf > iso_root/boot/limine/limine.conf.tmp; \
 		mv iso_root/boot/limine/limine.conf.tmp iso_root/boot/limine/limine.conf; \
 	fi
@@ -1777,6 +1608,26 @@ userland/test_futex_pi.elf: userland/test_futex_pi.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
 		userland/test_futex_pi.c -o userland/test_futex_pi.elf -lpthread -lm
 
+userland/test_signal_stack.elf: userland/test_signal_stack.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/test_signal_stack.c -o userland/test_signal_stack.elf -lpthread
+
+userland/test_user_dispatch.elf: userland/test_user_dispatch.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/test_user_dispatch.c -o userland/test_user_dispatch.elf
+
+userland/test_futex_clock.elf: userland/test_futex_clock.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/test_futex_clock.c -o userland/test_futex_clock.elf
+
+userland/test_tlb_stress.elf: userland/test_tlb_stress.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/test_tlb_stress.c -o userland/test_tlb_stress.elf -lpthread
+
+userland/test_syscompat.elf: userland/test_syscompat.c $(MUSL_LIBC)
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		userland/test_syscompat.c -o userland/test_syscompat.elf
+
 userland/test_unix_sockets.elf: userland/test_unix_sockets.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
 		userland/test_unix_sockets.c -o userland/test_unix_sockets.elf
@@ -1793,6 +1644,13 @@ userland/test_kpi_dmabuf.elf: userland/test_kpi_dmabuf.c $(MUSL_LIBC) \
 		-I$(CURDIR)/kernel/linuxkpi/include \
 		userland/test_kpi_dmabuf.c -o userland/test_kpi_dmabuf.elf -lpthread
 
+# Native syscall restart regression using interruptible LinuxKPI fence waits.
+userland/test_syscall_restart.elf: userland/test_syscall_restart.c $(MUSL_LIBC) \
+		kernel/linuxkpi/include/uapi/kpi_dmabuf.h
+	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+		-I$(CURDIR)/kernel/linuxkpi/include \
+		userland/test_syscall_restart.c -o userland/test_syscall_restart.elf
+
 # Phase 6 C5 amdgpu test: raw-ioctl GEM/PRIME/CTX/VM/BO_LIST, an SDMA copy
 # through AMDGPU_CS + WAIT_CS, and a 1k BO churn loop with a PMM invariant.
 userland/test_kpi_amdgpu.elf: userland/test_kpi_amdgpu.c $(MUSL_LIBC) \
@@ -1803,23 +1661,103 @@ userland/test_kpi_amdgpu.elf: userland/test_kpi_amdgpu.c $(MUSL_LIBC) \
 
 # Phase 6 C7 radeonsi test: headless GBM/EGL/GLES on amdgpu's render node.
 # Unlike the raw-ioctl suites this one must be dynamically linked: it uses the
-# Alpine rootfs Mesa/GBM/EGL shared libraries (static Mesa is not packaged),
-# so it links the musl loader the guest already has at
-# /lib/ld-musl-x86_64.so.1.  It asserts the renderer string is radeonsi,
+# rootfs Mesa/GBM/EGL shared libraries (static Mesa is not packaged),
+# so it uses the guest glibc loader. It asserts the renderer is radeonsi,
 # renders timed frames (fps) and round-trips a dma-buf through EGL.
-userland/test_kpi_radeonsi.elf: userland/test_kpi_radeonsi.c $(MUSL_SYSROOT)/lib/libc.so \
+userland/test_kpi_radeonsi.elf: userland/test_kpi_radeonsi.c $(GLIBC_STAMP) \
 		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) -O2 -Wall -Wextra \
-		-fno-stack-protector \
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		-I$(ALPINE_SYSROOT)/usr/include \
 		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
 		userland/test_kpi_radeonsi.c -o userland/test_kpi_radeonsi.elf \
-		-L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-		-lEGL -lgbm -lGLESv2 -ldrm \
-		-Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
+		-lEGL -lgbm -lGLESv2 -ldrm -lm \
+		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
 		-Wl,-rpath,/usr/lib \
 		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
 		-Wl,--allow-shlib-undefined
+
+# Bounded memory-lifetime diagnostic using the guest Mesa runtime.
+userland/radeonsi_vram_leak.elf: userland/radeonsi_vram_leak.c $(GLIBC_STAMP) \
+		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
+		-I$(ALPINE_SYSROOT)/usr/include \
+		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
+		$< -o $@ \
+		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
+		-lEGL -lgbm -lGLESv2 -ldrm \
+		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+		-Wl,-rpath,/usr/lib \
+		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
+		-Wl,--allow-shlib-undefined
+
+# Offscreen asynchronous shader-constant oracle. Uses the original guest Mesa
+# runtime; building this diagnostic neither rebuilds Mesa nor updates disk.img.
+userland/test_gpu_constants.elf: userland/test_gpu_constants.c $(GLIBC_STAMP) \
+		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
+		-I$(ALPINE_SYSROOT)/usr/include \
+		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
+		userland/test_gpu_constants.c -o $@ \
+		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
+		-lEGL -lgbm -lGLESv2 -ldrm -lm \
+		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+		-Wl,-rpath,/usr/lib \
+		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
+		-Wl,--allow-shlib-undefined
+
+userland/test_gpu_pipeline.elf: userland/test_gpu_pipeline.c $(GLIBC_STAMP) \
+		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
+		-I$(ALPINE_SYSROOT)/usr/include \
+		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
+		userland/test_gpu_pipeline.c -o $@ \
+		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
+		-lEGL -lgbm -lGLESv2 -ldrm -lm \
+		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+		-Wl,-rpath,/usr/lib \
+		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
+		-Wl,--allow-shlib-undefined
+
+# Same CPU oracles through desktop OpenGL; GLES controls remain available.
+userland/test_gpu_pipeline_gl.elf: userland/test_gpu_pipeline.c $(GLIBC_STAMP) \
+		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -DPIPELINE_DESKTOP \
+		-I$(ALPINE_SYSROOT)/usr/include \
+		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
+		userland/test_gpu_pipeline.c -o $@ \
+		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
+		-lEGL -lgbm -lGL -ldrm -lm \
+		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+		-Wl,-rpath,/usr/lib \
+		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
+		-Wl,--allow-shlib-undefined
+
+# Depth/stencil/reuse/MSAA oracle independent of presentation.
+userland/test_gpu_depth.elf: userland/test_gpu_depth.c $(GLIBC_STAMP) \
+		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
+		-I$(ALPINE_SYSROOT)/usr/include \
+		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
+		userland/test_gpu_depth.c -o $@ \
+		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
+		-lEGL -lgbm -lGL -ldrm -lm \
+		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+		-Wl,-rpath,/usr/lib \
+		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
+		-Wl,--allow-shlib-undefined
+
+.PHONY: gpu-diagnostics
+gpu-diagnostics: userland/test_gpu_depth.elf userland/test_gpu_constants.elf userland/test_gpu_pipeline.elf userland/test_gpu_pipeline_gl.elf userland/radeonsi_vram_leak.elf
+	mkdir -p build/gpu-diagnostics
+	install -m 0755 userland/test_gpu_depth.elf build/gpu-diagnostics/test_gpu_depth
+	install -m 0755 userland/test_gpu_constants.elf build/gpu-diagnostics/test_gpu_constants
+	install -m 0755 userland/test_gpu_pipeline.elf build/gpu-diagnostics/test_gpu_pipeline
+	install -m 0755 userland/test_gpu_pipeline_gl.elf build/gpu-diagnostics/test_gpu_pipeline_gl
+	install -m 0755 userland/radeonsi_vram_leak.elf build/gpu-diagnostics/radeonsi_vram_leak.elf
+	install -m 0755 scripts/gpu-debug-capture.sh build/gpu-diagnostics/gpu-debug-capture
+	@echo 'Diagnostics ready. Serve to the QEMU guest with:'
+	@echo 'python3 -m http.server 9007 --bind 127.0.0.1 --directory build/gpu-diagnostics'
 
 # Phase 3 LinuxKPI DRM test: vkms dumb-buffer GEM mmap/write, renderD128
 # sanity and a modetest-lite atomic enable/disable.  Uses the musl sysroot's
@@ -1893,6 +1831,11 @@ userland/test_fb_perf.elf: userland/test_fb_perf.c $(MUSL_LIBC)
 userland/test_vdso_bench.elf: userland/test_vdso_bench.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
 		userland/test_vdso_bench.c -o userland/test_vdso_bench.elf
+
+userland/test_elf32.elf: userland/test_elf32.asm
+	mkdir -p build
+	nasm -f elf32 $< -o build/test_elf32.o
+	ld -m elf_i386 -static -z max-page-size=0x1000 -o $@ build/test_elf32.o
 
 userland/test_lazy_fpu.elf: userland/test_lazy_fpu.c $(MUSL_LIBC)
 	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \

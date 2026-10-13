@@ -118,6 +118,33 @@ void *linuxkpi_kthread_create(void (*fn)(void *), void *arg, const char *name) {
   return t;
 }
 
+void linuxkpi_kthread_cancel_create(void *thread) {
+  struct thread *t = thread;
+  if (!t)
+    return;
+  /* The caller has never woken this thread: kpi_data is still the boot
+   * record, rather than the argument installed by the trampoline. */
+  kfree(t->kpi_data);
+  t->kpi_data = NULL;
+  sched_terminate_thread(t->tid);
+}
+
+void linuxkpi_set_current_state(int state) {
+  struct thread *t = sched_get_current();
+  if (!t)
+    return;
+  /* Upstream performs this before checking the wait condition. Clear an old
+   * notification first, then publish the new wait; a wake before publication
+   * is observed by that condition check, while a later wake arms the flag. */
+  if (state) {
+    __atomic_store_n(&t->kpi_wake_pending, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&t->kpi_wait_prepared, true, __ATOMIC_SEQ_CST);
+  } else {
+    __atomic_store_n(&t->kpi_wait_prepared, false, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&t->kpi_wake_pending, false, __ATOMIC_RELEASE);
+  }
+}
+
 void linuxkpi_thread_block(void) {
   struct thread *t = sched_get_current();
   if (!t)
@@ -148,6 +175,12 @@ void linuxkpi_thread_block(void) {
    * to enqueue a running thread for a later wake. */
   if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING)
     t->state = THREAD_RUNNING;
+}
+
+void linuxkpi_mutex_wait_set(void *mutex) {
+  struct thread *t = sched_get_current();
+  if (t)
+    __atomic_store_n(&t->kpi_wait_mutex, mutex, __ATOMIC_RELEASE);
 }
 
 int linuxkpi_schedule_timeout_ms(unsigned long ms) {
@@ -239,7 +272,8 @@ void linuxkpi_wake_thread(void *thread) {
   /* Remember the timeout wake even if the target is still running; see the
    * field comment in sched.h.  Only timeout sleeps consume it, so waitqueue
    * and kthread-start wakes stay out of the way. */
-  if (__atomic_load_n(&t->kpi_timeout_active, __ATOMIC_ACQUIRE))
+  if (__atomic_load_n(&t->kpi_timeout_active, __ATOMIC_ACQUIRE) ||
+      __atomic_load_n(&t->kpi_wait_prepared, __ATOMIC_SEQ_CST))
     __atomic_store_n(&t->kpi_wake_pending, true, __ATOMIC_RELEASE);
 
   /* sched_wakeup() ignores idle threads: they are the per-CPU fallback task
@@ -295,6 +329,7 @@ void linuxkpi_thread_comm(void *thread, char *buf, unsigned long size) {
 /* The shadow allocator is implemented on the Linux side (task.c), which knows
  * the struct task_struct layout; weak so this file stays native-only. */
 extern void *linuxkpi_task_shadow_new(void *thread) __attribute__((weak));
+extern void linuxkpi_task_shadow_release(void *shadow) __attribute__((weak));
 
 static void *task_for_thread_locked(struct thread *t) {
   if (!t)
@@ -324,12 +359,13 @@ void linuxkpi_thread_exiting(void *thread) {
   if (!t || !t->kpi_task)
     return;
 
-  /* Drop the shadow's back-pointer before the reaper frees this thread:
-   * a later wake_up_process()/kthread_stop() that still holds the shadow
-   * must not resolve a freed native thread.  The shadow object itself is
-   * retained (the kthread control block lives in it), see
-   * docs/linuxkpi-gaps.md. */
-  *(void **)t->kpi_task = NULL;
+  void *shadow = t->kpi_task;
+  t->kpi_task = NULL;
+  if (linuxkpi_task_shadow_release)
+    linuxkpi_task_shadow_release(shadow);
+  else
+    *(void **)shadow = NULL;
+
 }
 
 unsigned long long linuxkpi_monotonic_ms(void) { return lapic_timer_get_ms(); }

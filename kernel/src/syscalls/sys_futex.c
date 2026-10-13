@@ -94,6 +94,7 @@ struct futex_key {
 
 struct futex_waiter {
   struct futex_key key;
+  uint32_t bucket;       // Atomic publication when requeue moves this waiter
   struct thread *thread; // Blocked thread
   uint32_t bitset;
   bool pi;               // Waiting in FUTEX_LOCK_PI, not FUTEX_WAIT
@@ -106,10 +107,8 @@ static struct {
   struct futex_waiter *head;
 } futex_hash[FUTEX_HASH_SIZE];
 
-/* Per-bucket wake traffic, so the hang report can tell an idle worker pool
- * apart from a lost wakeup: a parked thread whose bucket has never seen a wake
- * attempt is waiting for work; one whose bucket saw a wake that matched
- * nothing is the bug.  futex_bucket_stats() below reads these. */
+/* Per-bucket wake traffic is context, not proof of a lost wake: unrelated
+ * futex keys collide, and wakes without a registered waiter are normal. */
 static volatile uint64_t futex_bucket_wakes[FUTEX_HASH_SIZE];
 static volatile uint64_t futex_bucket_nomatch[FUTEX_HASH_SIZE];
 
@@ -144,6 +143,30 @@ static inline uint32_t futex_hash_key(struct futex_key key) {
 
 static inline bool futex_key_equal(struct futex_key a, struct futex_key b) {
   return a.space == b.space && a.address == b.address;
+}
+
+/* Caller holds the bucket lock. New arrivals must not jump ahead of already
+ * parked waiters: a LIFO list lets a busy mutex repeatedly wake recent
+ * arrivals while an older client/render/cache thread waits indefinitely. */
+static void futex_enqueue(uint32_t bucket, struct futex_waiter *waiter) {
+  struct futex_waiter **tail = &futex_hash[bucket].head;
+  while (*tail)
+    tail = &(*tail)->next;
+  waiter->next = NULL;
+  *tail = waiter;
+}
+
+/* Timeout/signal cleanup races requeue. Reading key then locking its hash
+ * can lock the old bucket after requeue moved the stack-owned waiter. Retry
+ * until the acquired lock protects the waiter's published bucket. */
+static uint32_t futex_lock_waiter(struct futex_waiter *waiter) {
+  for (;;) {
+    uint32_t bucket = __atomic_load_n(&waiter->bucket, __ATOMIC_ACQUIRE);
+    spinlock_acquire(&futex_hash[bucket].lock);
+    if (bucket == __atomic_load_n(&waiter->bucket, __ATOMIC_ACQUIRE))
+      return bucket;
+    spinlock_release(&futex_hash[bucket].lock);
+  }
 }
 
 // Remove every waiter owned by a thread that is about to be reaped. Futex
@@ -208,9 +231,33 @@ static inline int futex_get_key(uint32_t *uaddr, bool private,
 // Returns 0 on success (woken by FUTEX_WAKE).
 // Returns -EAGAIN if *uaddr != val at time of check.
 // Returns -ETIMEDOUT if timeout expired.
+/* Convert userspace clock deadlines into the scheduler's uptime clock.
+ * Realtime absolute futex waits must subtract the boot epoch first. */
+extern uint64_t rtc_get_boot_timestamp(void);
+static int futex_wait_deadline(const uint64_t *ts, bool absolute,
+                               bool realtime, uint64_t now,
+                               uint64_t *deadline) {
+  uint64_t sec = ts[0], nsec = ts[1];
+  if ((int64_t)sec < 0 || nsec >= 1000000000ULL)
+    return -EINVAL;
+  uint64_t fraction = (nsec + 999999ULL) / 1000000ULL;
+  uint64_t target = sec > (UINT64_MAX - fraction) / 1000ULL
+                        ? UINT64_MAX : sec * 1000ULL + fraction;
+  if (absolute && realtime) {
+    uint64_t epoch = rtc_get_boot_timestamp() * 1000ULL;
+    target = target > epoch ? target - epoch : 0;
+  }
+  if (absolute) {
+    *deadline = target;
+  } else {
+    *deadline = target > UINT64_MAX - now ? UINT64_MAX : now + target;
+  }
+  return 0;
+}
+
 static uint64_t futex_wait(uint32_t *uaddr, uint32_t val,
                            const uint64_t *timeout_ts, bool private,
-                           bool is_abs, uint32_t bitset) {
+                           bool is_abs, bool realtime, uint32_t bitset) {
   struct futex_key key;
   int error = futex_get_key(uaddr, private, &key);
   if (error)
@@ -222,6 +269,7 @@ static uint64_t futex_wait(uint32_t *uaddr, uint32_t val,
   // function and only return after being woken (the stack frame stays valid).
   struct futex_waiter waiter;
   waiter.key = key;
+  waiter.bucket = bucket;
   waiter.thread = sched_get_current();
   waiter.bitset = bitset;
   waiter.pi = false;
@@ -255,43 +303,29 @@ static uint64_t futex_wait(uint32_t *uaddr, uint32_t val,
     return (uint64_t)(-(int64_t)ETIMEDOUT);
   }
 
-  // Enqueue the waiter
-  waiter.next = futex_hash[bucket].head;
-  futex_hash[bucket].head = &waiter;
-
+  uint64_t wait_deadline = 0;
   // Set up the thread for blocking
   waiter.thread->state = THREAD_BLOCKED;
 
-  // If a timeout was specified, compute deadline in LAPIC ticks
+  // Deadlines are always uptime milliseconds, regardless of caller clock.
+  waiter.thread->wakeup_ticks = 0;
   if (timeout_ts) {
-    uint64_t sec = timeout_ts[0];
-    uint64_t nsec = timeout_ts[1];
-    uint64_t target_ms = sec * 1000 + nsec / 1000000;
-    uint64_t now_ms = lapic_timer_get_ticks();
-    uint64_t timeout_ms = 0;
-    if (is_abs) {
-      if (target_ms > now_ms)
-        timeout_ms = target_ms - now_ms;
-      else
-        timeout_ms = 0;
-    } else {
-      timeout_ms = target_ms;
-    }
-
-    if (timeout_ms == 0 && nsec > 0 && !is_abs)
-      timeout_ms = 1; // Minimum 1ms granularity
-
-    if (timeout_ms > 0) {
-      waiter.thread->wakeup_ticks = now_ms + timeout_ms;
-    } else if (is_abs && target_ms <= now_ms) {
-      // Immediate timeout!
+    uint64_t now_ms = lapic_timer_get_ticks(), deadline;
+    int timeout_error = futex_wait_deadline(timeout_ts, is_abs, realtime,
+                                           now_ms, &deadline);
+    if (timeout_error || deadline <= now_ms) {
       waiter.thread->state = THREAD_RUNNING;
-      futex_hash[bucket].head = waiter.next;
       spinlock_release(&futex_hash[bucket].lock);
+      if (timeout_error)
+        return (uint64_t)(int64_t)timeout_error;
       LOCKDIAG_STAT(futex_timeouts, 1);
       return (uint64_t)(-(int64_t)ETIMEDOUT);
     }
+    wait_deadline = deadline;
+    waiter.thread->wakeup_ticks = deadline;
   }
+
+  futex_enqueue(bucket, &waiter);
 
   /* Publish the park for the hang report before dropping the bucket lock: a
    * lost wakeup is only distinguishable from an idle worker pool if the report
@@ -305,6 +339,7 @@ static uint64_t futex_wait(uint32_t *uaddr, uint32_t val,
 
   spinlock_release(&futex_hash[bucket].lock);
 
+park_again:
   // Yield the CPU — we'll be rescheduled when woken by FUTEX_WAKE or timeout
   if (waiter.thread->state == THREAD_BLOCKED)
     sched_yield();
@@ -315,14 +350,26 @@ static uint64_t futex_wait(uint32_t *uaddr, uint32_t val,
 
   // We're back!  Remove ourselves from the hash bucket
   // The waiter might have been requeued to a different bucket.
-  uint32_t final_bucket = futex_hash_key(waiter.key);
-  spinlock_acquire(&futex_hash[final_bucket].lock);
+  uint32_t final_bucket = futex_lock_waiter(&waiter);
 
   bool was_woken = true;
   // Remove waiter from the list (may already have been removed by wake)
   struct futex_waiter **pp = &futex_hash[final_bucket].head;
   while (*pp) {
     if (*pp == &waiter) {
+      /* An unrelated/spurious scheduler wake is not a timeout. Keep the
+       * registered waiter and re-arm under its bucket lock until the actual
+       * clock deadline, a matching futex wake, or a signal. */
+      if (timeout_ts && lapic_timer_get_ticks() < wait_deadline &&
+          !thread_has_pending_signal(waiter.thread)) {
+        waiter.thread->wakeup_ticks = wait_deadline;
+        waiter.thread->state = THREAD_BLOCKED;
+        waiter.thread->in_futex_wait = true;
+        waiter.thread->blocked_since_ms = lapic_timer_get_ticks();
+        waiter.thread->futex_bucket = final_bucket;
+        spinlock_release(&futex_hash[final_bucket].lock);
+        goto park_again;
+      }
       *pp = waiter.next;
       was_woken = false; // We were still in the list, so we were NOT woken by FUTEX_WAKE!
       break;
@@ -367,7 +414,10 @@ static inline uint64_t futex_wake_key(struct futex_key key, uint32_t val, uint32
         pp = &w->next;
         continue;
       }
-      if (w->thread && w->thread->state == THREAD_BLOCKED) {
+      if (w->thread) {
+        /* The registered waiter consumes the wake even if a deadline or
+         * signal already made its thread runnable. Counting only BLOCKED
+         * threads can consume more than val waiters or report a false zero. */
         sched_wakeup(w->thread);
         woken++;
         LOCKDIAG_STAT(futex_wakes, 1);
@@ -444,7 +494,7 @@ static uint64_t futex_requeue(uint32_t *uaddr1, uint32_t val, uint32_t val2,
     if (futex_key_equal(w->key, key1)) {
       if (total_woken < val) {
         // Wake this thread
-        if (w->thread && w->thread->state == THREAD_BLOCKED) {
+        if (w->thread) {
           sched_wakeup(w->thread);
           total_woken++;
         }
@@ -454,8 +504,8 @@ static uint64_t futex_requeue(uint32_t *uaddr1, uint32_t val, uint32_t val2,
         // Requeue: move to bucket2
         *pp = w->next; // Remove from bucket1
         w->key = key2;
-        w->next = futex_hash[bucket2].head;
-        futex_hash[bucket2].head = w;
+        futex_enqueue(bucket2, w);
+        __atomic_store_n(&w->bucket, bucket2, __ATOMIC_RELEASE);
         if (w->thread)
           w->thread->futex_bucket = bucket2; // keep the hang report's key in sync
         total_requeued++;
@@ -523,7 +573,7 @@ static uint64_t futex_cmp_requeue(uint32_t *uaddr1, uint32_t val, uint32_t val2,
     struct futex_waiter *w = *pp;
     if (futex_key_equal(w->key, key1)) {
       if (total_woken < val) {
-        if (w->thread && w->thread->state == THREAD_BLOCKED) {
+        if (w->thread) {
           sched_wakeup(w->thread);
           total_woken++;
         }
@@ -531,8 +581,10 @@ static uint64_t futex_cmp_requeue(uint32_t *uaddr1, uint32_t val, uint32_t val2,
       } else if (total_requeued < val2) {
         *pp = w->next;
         w->key = key2;
-        w->next = futex_hash[bucket2].head;
-        futex_hash[bucket2].head = w;
+        futex_enqueue(bucket2, w);
+        __atomic_store_n(&w->bucket, bucket2, __ATOMIC_RELEASE);
+        if (w->thread)
+          w->thread->futex_bucket = bucket2;
         total_requeued++;
       } else {
         pp = &w->next;
@@ -756,6 +808,7 @@ retry:
 
   struct futex_waiter waiter;
   waiter.key = key;
+  waiter.bucket = futex_hash_key(key);
   waiter.thread = self;
   waiter.bitset = FUTEX_BITSET_MATCH_ANY;
   waiter.pi = true;
@@ -814,8 +867,7 @@ retry:
 
   /* Remove ourselves if unlock did not already do so, then check whether the
    * lock was handed over. */
-  uint32_t final_bucket = futex_hash_key(waiter.key);
-  spinlock_acquire(&futex_hash[final_bucket].lock);
+  uint32_t final_bucket = futex_lock_waiter(&waiter);
   struct futex_waiter **pp = &futex_hash[final_bucket].head;
   while (*pp) {
     if (*pp == &waiter) {
@@ -911,7 +963,8 @@ static uint64_t sys_futex(uint64_t uaddr_val, uint64_t op_val, uint64_t val_arg,
     const uint64_t *timeout =
         timeout_ptr ? (const uint64_t *)timeout_ptr : NULL;
     bool is_abs = (op_val & FUTEX_CLOCK_REALTIME) != 0;
-    return futex_wait(uaddr, val, timeout, private, is_abs, FUTEX_BITSET_MATCH_ANY);
+    return futex_wait(uaddr, val, timeout, private, is_abs,
+                      (op_val & FUTEX_CLOCK_REALTIME) != 0, FUTEX_BITSET_MATCH_ANY);
   }
 
   case FUTEX_WAIT_BITSET: {
@@ -920,7 +973,8 @@ static uint64_t sys_futex(uint64_t uaddr_val, uint64_t op_val, uint64_t val_arg,
     const uint64_t *timeout =
         timeout_ptr ? (const uint64_t *)timeout_ptr : NULL;
     bool is_abs = true; // FUTEX_WAIT_BITSET timeout is absolute
-    return futex_wait(uaddr, val, timeout, private, is_abs, (uint32_t)val3);
+    return futex_wait(uaddr, val, timeout, private, is_abs,
+                      (op_val & FUTEX_CLOCK_REALTIME) != 0, (uint32_t)val3);
   }
 
   case FUTEX_WAKE: {
@@ -953,8 +1007,9 @@ static uint64_t sys_futex(uint64_t uaddr_val, uint64_t op_val, uint64_t val_arg,
   case FUTEX_WAIT_REQUEUE_PI: {
     const uint64_t *timeout =
         timeout_ptr ? (const uint64_t *)timeout_ptr : NULL;
-    bool is_abs = (op_val & FUTEX_CLOCK_REALTIME) != 0;
-    return futex_wait(uaddr, val, timeout, private, is_abs, FUTEX_BITSET_MATCH_ANY);
+    bool is_abs = true; // requeue wait uses an absolute deadline
+    return futex_wait(uaddr, val, timeout, private, is_abs,
+                      (op_val & FUTEX_CLOCK_REALTIME) != 0, FUTEX_BITSET_MATCH_ANY);
   }
 
   case FUTEX_WAKE_OP:

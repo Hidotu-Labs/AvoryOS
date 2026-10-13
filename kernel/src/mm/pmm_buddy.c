@@ -6,6 +6,20 @@ struct buddy_zone b_zone;
 
 static volatile uint64_t buddy_corruption_reports;
 
+static void buddy_trace(struct buddy_zone *zone, uint64_t phys, size_t order,
+                         const char *operation, void *caller) {
+  struct buddy_trace_event *event =
+      &zone->trace[zone->trace_seq++ % BUDDY_TRACE_SLOTS];
+  *event = (struct buddy_trace_event){phys, (uint64_t)caller, order, operation};
+}
+
+static bool buddy_link_readable(const struct list_head *node,
+                                const struct list_head *head) {
+  return node == head ||
+         (((uint64_t)node & (PAGE_SIZE - 1)) == 0 &&
+          pmm_kernel_ptr_is_managed(node));
+}
+
 void buddy_report_corruption(const char *what, size_t order,
                             const struct list_head *node) {
   uint64_t n =
@@ -17,6 +31,8 @@ void buddy_report_corruption(const char *what, size_t order,
     klog_uint64(order);
     klog_puts("] node=");
     klog_hex64((uint64_t)node);
+    klog_puts(" caller=");
+    klog_hex64((uint64_t)__builtin_return_address(0));
     klog_puts(" - cutting the list at the last good link\n");
   }
 }
@@ -58,6 +74,8 @@ static void buddy_report_node_detail(const struct buddy_zone *zone,
                                      const struct list_head *node,
                                      size_t order) {
   const struct buddy_block *block = (const struct buddy_block *)node;
+  if (__atomic_load_n(&buddy_corruption_reports, __ATOMIC_RELAXED) > 8)
+    return;
   klog_puts(" reason=");
   klog_puts(buddy_node_bad_reason(zone, node, order));
   if (pmm_kernel_ptr_is_managed(node)) {
@@ -75,6 +93,33 @@ static void buddy_report_node_detail(const struct buddy_zone *zone,
       klog_puts(" refcount=");
       klog_uint64(__atomic_load_n(&pmm_refcounts[pfn - pmm_lowest_page],
                                   __ATOMIC_RELAXED));
+    }
+    const struct list_head *head = &zone->free_list[order];
+    klog_puts(" zone="); klog_hex64((uint64_t)zone);
+    klog_puts(" head.next="); klog_hex64((uint64_t)head->next);
+    klog_puts(" head.prev="); klog_hex64((uint64_t)head->prev);
+    if (buddy_link_readable(block->node.next, head)) {
+      klog_puts(" next.prev=");
+      klog_hex64((uint64_t)block->node.next->prev);
+    }
+    if (buddy_link_readable(block->node.prev, head)) {
+      klog_puts(" prev.next=");
+      klog_hex64((uint64_t)block->node.prev->next);
+    }
+    uint64_t phys = (uint64_t)node - pmm_physical_memory_offset;
+    uint64_t first = zone->trace_seq > BUDDY_TRACE_SLOTS
+                         ? zone->trace_seq - BUDDY_TRACE_SLOTS : 0;
+    for (uint64_t seq = first; seq < zone->trace_seq; seq++) {
+      const struct buddy_trace_event *event =
+          &zone->trace[seq % BUDDY_TRACE_SLOTS];
+      uint64_t size = PAGE_SIZE << event->order;
+      if (phys < event->phys || phys - event->phys >= size)
+        continue;
+      klog_puts("\n [PMM-HISTORY] seq="); klog_uint64(seq);
+      klog_puts(" op="); klog_puts(event->operation);
+      klog_puts(" phys="); klog_hex64(event->phys);
+      klog_puts(" order="); klog_uint64(event->order);
+      klog_puts(" caller="); klog_hex64(event->caller);
     }
   }
 }
@@ -100,9 +145,9 @@ static bool buddy_zone_node_valid(const struct buddy_zone *zone,
 
   uint64_t next = (uint64_t)block->node.next;
   uint64_t prev = (uint64_t)block->node.prev;
-  if (next != (uint64_t)head && !pmm_kernel_ptr_is_managed((void *)next))
+  if (!buddy_link_readable((void *)next, head))
     return false;
-  if (prev != (uint64_t)head && !pmm_kernel_ptr_is_managed((void *)prev))
+  if (!buddy_link_readable((void *)prev, head))
     return false;
 
   return block->node.next->prev == node && block->node.prev->next == node;
@@ -114,12 +159,13 @@ bool buddy_node_valid(const struct list_head *node, size_t order) {
 
 static bool buddy_list_nonempty(struct buddy_zone *zone, size_t order) {
   struct list_head *head = &zone->free_list[order];
+  uint64_t steps = 0;
 
   for (;;) {
     struct list_head *first = head->next;
     if (first == head)
       return false;
-    if (buddy_zone_node_valid(zone, first, order))
+    if (++steps <= pmm_page_count && buddy_zone_node_valid(zone, first, order))
       return true;
 
     buddy_report_corruption("first link", order, first);
@@ -127,7 +173,8 @@ static bool buddy_list_nonempty(struct buddy_zone *zone, size_t order) {
     klog_puts("\n");
     if (pmm_kernel_ptr_is_managed(first)) {
       struct list_head *next = first->next;
-      if (next != head && pmm_kernel_ptr_is_managed(next)) {
+      if (steps < pmm_page_count && next != first && next != head &&
+          buddy_link_readable(next, head)) {
         head->next = next;
         next->prev = head;
         continue;
@@ -172,6 +219,7 @@ void buddy_zone_init(struct buddy_zone *zone) {
     INIT_LIST_HEAD(&zone->free_list[i]);
   }
   spinlock_init(&zone->lock);
+  zone->trace_seq = 0;
 }
 
 __attribute__((optimize("O3"))) void buddy_free_internal(struct buddy_zone *zone,
@@ -185,6 +233,7 @@ __attribute__((optimize("O3"))) void buddy_free_internal(struct buddy_zone *zone
   }
 
   pmm_bitmap_clear_range(pmm_bitmap, pfn, (1ULL << order));
+  buddy_trace(zone, phys, order, "free", __builtin_return_address(0));
 
   while (order < MAX_ORDER - 1) {
     uint64_t buddy_pfn = pfn ^ (1ULL << order);
@@ -203,6 +252,8 @@ __attribute__((optimize("O3"))) void buddy_free_internal(struct buddy_zone *zone
       list_del(&buddy->node);
       pfn = (pfn < buddy_pfn) ? pfn : buddy_pfn;
       order++;
+      buddy_trace(zone, pfn * PAGE_SIZE, order, "merge",
+                   __builtin_return_address(0));
     } else {
       break;
     }
@@ -240,6 +291,8 @@ __attribute__((optimize("O3"))) void *buddy_alloc_internal(struct buddy_zone *zo
   list_del(&block->node);
 
   uint64_t pfn = buddy_to_phys(block) / PAGE_SIZE;
+  buddy_trace(zone, pfn * PAGE_SIZE, cur_order, "allocate",
+               __builtin_return_address(0));
 
   while (cur_order > order) {
     cur_order--;
@@ -274,6 +327,8 @@ void *buddy_alloc_page_locked(struct buddy_zone *zone) {
     return NULL;
 
   uint64_t pfn = buddy_to_phys(block) / PAGE_SIZE;
+  buddy_trace(zone, pfn * PAGE_SIZE, cur_order, "pcp-refill",
+               __builtin_return_address(0));
 
   while (cur_order > 0) {
     cur_order--;
@@ -326,6 +381,8 @@ void *buddy_alloc_pages_range(struct buddy_zone *zone, size_t count,
     if (found_block) {
       list_del(&found_block->node);
       uint64_t pfn = buddy_to_phys(found_block) / PAGE_SIZE;
+      buddy_trace(zone, pfn * PAGE_SIZE, cur_order, "allocate-range",
+                   __builtin_return_address(0));
       uint64_t target_pfn = target_phys / PAGE_SIZE;
 
       while (cur_order > order) {

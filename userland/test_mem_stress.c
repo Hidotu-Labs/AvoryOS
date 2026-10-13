@@ -244,17 +244,38 @@ static int prime_mmap_vfs_caches(void) {
 }
 
 static int prime_wait4_caches(void) {
+  /* Warm the exact shapes the FORK test uses: a bare fork is not enough.
+   * The first fork+mmap+open iteration grows the VMA-node and file slabs
+   * by a page that the heap intentionally retains for reuse, which the
+   * zero-tolerance check would otherwise report as a 4 kB leak. */
   pid_t pid = fork();
   if (pid < 0)
     return -1;
-  if (pid == 0)
+  if (pid == 0) {
+    void *p = mmap(NULL, 1024 * 1024, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p != MAP_FAILED)
+      memset(p, 0xBB, 1024 * 1024);
+    int fd = open("/tmp/child_stress", O_CREAT | O_RDWR, 0666);
+    if (fd >= 0) {
+      write(fd, "child", 5);
+      close(fd);
+    }
     _exit(0);
+  }
 
   int status;
   pid_t result = waitpid(pid, &status, WNOHANG);
   if (result == 0)
     result = waitpid(pid, &status, 0);
-  return result == pid ? 0 : -1;
+  if (result != pid)
+    return -1;
+  unlink("/tmp/child_stress");
+  for (int i = 0; i < 8; i++) {
+    sched_yield();
+    usleep(1000);
+  }
+  return 0;
 }
 
 static void run_registered_syscall_coverage(int iterations);
@@ -795,7 +816,10 @@ void test_fork_stress() {
       int fd = open("/tmp/child_stress", O_CREAT | O_RDWR, 0666);
       if (fd != -1)
         write(fd, "child", 5);
-      exit(0);
+      /* _exit: do not flush the parent's duplicated stdio buffers, and
+       * leave fd/mapping open so process_do_exit/reap must tear them
+       * down (that is what this test measures). */
+      _exit(0);
     } else if (pid > 0) {
       int status;
       waitpid(pid, &status, 0);
@@ -804,6 +828,15 @@ void test_fork_stress() {
     if (i % 25 == 0) {
       DEBUGLOG("FORK iteration %d complete\n", i);
     }
+  }
+  /* fork+wait4 queues the child's address-space teardown for an idle CPU
+   * (vmm_queue_free_mm) instead of paying it inside wait4. Give the reaper
+   * and the deferred-mm drain a few scheduling cycles before the PMM sample
+   * in check_leak, same as the CLONE test below. Otherwise the last child's
+   * still-queued page-table page reads as a 4 kB "leak". */
+  for (int i = 0; i < 8; i++) {
+    sched_yield();
+    usleep(1000);
   }
   DEBUGLOG("FORK/EXIT stress test PASSED\n");
 }
@@ -1607,6 +1640,8 @@ void test_sched_stress() {
   cpu_set_t mask;
   CPU_ZERO(&mask);
   CPU_SET(0, &mask);
+  cpu_set_t original_mask;
+  int have_mask = sched_getaffinity(0, sizeof(original_mask), &original_mask) == 0;
 
   for (int i = 0; i < NUM_ITERATIONS * 5; i++) {
     sched_yield();
@@ -1619,6 +1654,10 @@ void test_sched_stress() {
     sched_get_priority_max(SCHED_OTHER);
     sched_get_priority_min(SCHED_OTHER);
     if (i % 100 == 0) DEBUGLOG("SCHED iteration %d complete\n", i);
+  }
+  if (have_mask && sched_setaffinity(0, sizeof(original_mask), &original_mask) != 0) {
+    perror("restore scheduler affinity");
+    exit(1);
   }
   DEBUGLOG("SCHED stress test PASSED\n");
 }
@@ -1777,6 +1816,15 @@ void test_vfork_stress() {
       waitpid(pid, &st, 0);
     }
     if (i % 10 == 0) DEBUGLOG("VFORK iteration %d complete\n", i);
+  }
+  /* Same deferred address-space teardown as fork (vfork is implemented as a
+   * private COW fork): the child's mm is queued for idle-CPU drain instead
+   * of being freed inside waitpid. This tight loop outruns the 1 ms idle
+   * drain, so yield/sleep a few cycles before the PMM sample, as the FORK
+   * and CLONE tests do. */
+  for (int i = 0; i < 8; i++) {
+    sched_yield();
+    usleep(1000);
   }
   DEBUGLOG("VFORK stress test PASSED\n");
 }
@@ -2399,18 +2447,73 @@ void check_leak(const char *test_name, long *last_mem) {
 
   long diff = *last_mem - current_mem;
   if (diff > 0) {
-    printf("  [!] %s: LEAKED %ld kB\n", test_name, diff);
-  } else if (diff < 0) {
-    printf("  [ok] %s: Reclaimed %ld kB\n", test_name, -diff);
-  } else {
-    printf("  [ok] %s: No leak\n", test_name);
+    printf("  [!] %s: RETAINED %ld kB (single MemFree sample; use --focus to classify)\n", test_name, diff);
   }
   *last_mem = current_mem;
 }
 
+/* Preserve immediate and delayed samples, without a cache allowance that
+ * could conceal genuine per-round retention. */
+static void leak_settle(void) {
+  for (int i = 0; i < 10; i++) {
+    sched_yield();
+    usleep(20000);
+  }
+}
+
+static int run_leak_focus(int argc, char **argv) {
+  const char *name = NULL;
+  unsigned rounds = 6;
+  for (int a = 1; a < argc; a++) {
+    if (a + 1 >= argc) return -1;
+    if (!strcmp(argv[a], "--focus")) name = argv[++a];
+    else if (!strcmp(argv[a], "--rounds")) {
+      char *end;
+      const char *value = argv[++a];
+      errno = 0;
+      unsigned long n = strtoul(value, &end, 10);
+      if (errno || !*value || *end || n < 1 || n > 100) return -1;
+      rounds = n;
+    } else return -1;
+  }
+  void (*workload)(void) = NULL;
+  if (!name) return -1;
+  if (!strcmp(name, "wait4")) workload = test_wait4_stress;
+  else if (!strcmp(name, "sched")) workload = test_sched_stress;
+  else if (!strcmp(name, "clone")) workload = test_clone_futex_stress;
+  else if (!strcmp(name, "accept4")) workload = test_accept4_stress;
+  else if (!strcmp(name, "unix-stream")) workload = test_unix_stream_stress;
+  else if (!strcmp(name, "process-attrs")) workload = test_process_attrs_stress;
+  else return -1;
+
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  printf("FOCUS %s: one warm-up, %u measured rounds, 200 ms cleanup wait\n", name, rounds);
+  workload();
+  leak_settle();
+  long baseline = get_free_mem_kb(), previous = baseline;
+  if (baseline < 0) return 2;
+  printf("BASELINE free_kb=%ld\n", baseline);
+  for (unsigned round = 1; round <= rounds; round++) {
+    workload();
+    long immediate = get_free_mem_kb();
+    leak_settle();
+    long settled = get_free_mem_kb();
+    if (immediate < 0 || settled < 0) return 2;
+    printf("ROUND %u free_immediate_kb=%ld free_settled_kb=%ld retained_since_previous_kb=%ld retained_since_baseline_kb=%ld\n",
+           round, immediate, settled, previous - settled, baseline - settled);
+    previous = settled;
+  }
+  printf("FOCUS completed: inspect repeated retention with background workloads controlled.\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
-  (void)argc;
-  (void)argv;
+  if (argc > 1) {
+    int result = run_leak_focus(argc, argv);
+    if (result >= 0) return result;
+    fprintf(stderr, "Usage: %s [--focus wait4|sched|clone|accept4|unix-stream|process-attrs --rounds 1..100]\n", argv[0]);
+    return 2;
+  }
 
   printf("=== Userland Leak Detection Stress Test ===\n");
 

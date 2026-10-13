@@ -14,24 +14,32 @@
 #include <linux/string.h>
 
 #include <linuxkpi/native_mm.h>
+#include <linuxkpi/gpu_diag.h>
 
-/* Page-table flag derived from the Linux VMA.  Normal RAM mappings are
- * write-back; VM_IO/VM_PFNMAP mappings ask for uncached like the native
- * framebuffer mappings do. */
-static unsigned long kpi_vma_pte_flags(struct vm_area_struct *vma) {
+/* VM_IO also describes TTM's ordinary GTT RAM. Match the direct mapping for
+ * RAM; honor the driver's cache protection for BAR mappings. */
+static unsigned long kpi_vma_pte_flags(struct vm_area_struct *vma,
+                                      uint64_t phys, pgprot_t prot) {
   unsigned long flags = ASC_PAGE_USER;
 
   if (vma->vm_flags & VM_WRITE)
     flags |= ASC_PAGE_RW;
   if (!(vma->vm_flags & VM_EXEC))
     flags |= ASC_PAGE_NX;
-  if (vma->vm_flags & VM_IO)
-    flags |= ASC_PAGE_PCD;
+  if (asc_pmm_is_managed(phys))
+    flags |= linuxkpi_page_cache_flags(phys);
+  else {
+    unsigned long cache = pgprot_val(prot) &
+                           (ASC_PAGE_PAT | ASC_PAGE_PCD | ASC_PAGE_PWT);
+    if (!cache && (vma->vm_flags & VM_IO))
+      cache = ASC_PAGE_PCD | ASC_PAGE_PWT;
+    flags |= cache;
+  }
   return flags;
 }
 
 static int kpi_map_phys(uint64_t addr, uint64_t phys, unsigned long size,
-                        unsigned long pte_flags) {
+                        struct vm_area_struct *vma, pgprot_t prot) {
   __UINT64_TYPE__ *pml4 = asc_vmm_get_active_pml4();
 
   if (!pml4)
@@ -39,8 +47,13 @@ static int kpi_map_phys(uint64_t addr, uint64_t phys, unsigned long size,
 
   size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
   for (unsigned long off = 0; off < size; off += PAGE_SIZE) {
-    if (!asc_vmm_map_page(pml4, addr + off, phys + off, pte_flags))
+    unsigned long flags=kpi_vma_pte_flags(vma,phys+off,prot);
+    if (asc_pmm_is_managed(phys+off))
+      gpu_diag_cache_check(vma,phys+off,flags&(ASC_PAGE_PAT|ASC_PAGE_PCD|ASC_PAGE_PWT));
+    if (!asc_vmm_map_page(pml4, addr + off, phys + off,
+                          flags))
       return -ENOMEM;
+    gpu_diag_record(GPU_DIAG_MAP,vma,addr+off,phys+off,flags,pgprot_val(prot),0);
     /* A stale translation may exist from an earlier vma in this spot. */
     asc_invlpg(addr + off);
   }
@@ -50,15 +63,13 @@ static int kpi_map_phys(uint64_t addr, uint64_t phys, unsigned long size,
 int remap_pfn_range_notrack(struct vm_area_struct *vma, unsigned long addr,
                             unsigned long pfn, unsigned long size,
                             pgprot_t prot) {
-  (void)prot;
-
   if (addr < vma->vm_start || addr + size > vma->vm_end)
     return -EINVAL;
   if (addr & ~PAGE_MASK)
     return -EINVAL;
 
   return kpi_map_phys(addr, (uint64_t)pfn << PAGE_SHIFT, size,
-                      kpi_vma_pte_flags(vma));
+                      vma, prot);
 }
 
 int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
@@ -72,7 +83,7 @@ int vm_insert_page(struct vm_area_struct *vma, unsigned long addr,
     return -EINVAL;
   get_page(page);
   return kpi_map_phys(addr, page_to_phys(page), PAGE_SIZE,
-                      kpi_vma_pte_flags(vma));
+                      vma, vma->vm_page_prot);
 }
 
 vm_fault_t vmf_insert_page(struct vm_fault *vmf, struct page *page) {
@@ -85,11 +96,10 @@ vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr,
                                unsigned long pfn, pgprot_t prot) {
   int ret;
 
-  (void)prot;
   if (addr < vma->vm_start || addr + PAGE_SIZE > vma->vm_end)
     return VM_FAULT_SIGBUS;
   ret = kpi_map_phys(addr, (uint64_t)pfn << PAGE_SHIFT, PAGE_SIZE,
-                     kpi_vma_pte_flags(vma));
+                     vma, prot);
   return ret ? VM_FAULT_SIGBUS : VM_FAULT_NOPAGE;
 }
 

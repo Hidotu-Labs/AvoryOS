@@ -58,6 +58,16 @@ static uint64_t dp_build_flags(uint64_t prot) {
   return flags;
 }
 
+/* True when a pre-zeroed pool page may back this fault: no NUMA bind policy
+ * on the VMA and none on the current thread (pool pages are node-agnostic,
+ * refilled from the local node). */
+static inline bool vmm_zero_pool_usable(int vma_policy) {
+  if (vma_policy != MPOL_DEFAULT)
+    return false;
+  struct thread *cur = sched_get_current();
+  return !cur || cur->numa_policy.mode == MPOL_DEFAULT;
+}
+
 static inline void *vmm_alloc_page_numa(int vma_numa_policy, uint64_t vma_numa_nodemask,
                                         int vma_numa_preferred_node, uint64_t vaddr) {
   struct thread *current = sched_get_current();
@@ -193,7 +203,8 @@ static void vmm_map_cow_cluster(uint64_t *pml4, uint64_t cr2,
       continue;
     }
 
-    uint64_t flags = (dp_build_flags(nv->prot) & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
+    uint64_t flags = (dp_build_flags(nv->prot) & ~PAGE_FLAG_RW) |
+                     PAGE_FLAG_COW | PAGE_FLAG_REFAULT;
     if (!vmm_map_page_if_unmapped(pml4, batch[i].vpage, batch[i].phys, flags))
       pmm_decref((void *)batch[i].phys);
   }
@@ -316,15 +327,22 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       uint64_t old_phys = *pte & PAGE_MASK;
 
       if (old_phys == pmm_get_zero_page_phys()) {
-        void *new_phys = vmm_alloc_page_numa(0, 0, 0, virt);
-        if (!new_phys)
-          WALK_REJECT("CoW break of the shared zero page: PMM out of "
-                      "memory", old_phys, 0);
+        // Prefer an idle-zeroed frame; fall back to alloc+zero inline.
+        void *new_phys = vmm_zero_pool_usable(MPOL_DEFAULT)
+                             ? pmm_alloc_zeroed_page()
+                             : NULL;
+        if (!new_phys) {
+          new_phys = vmm_alloc_page_numa(0, 0, 0, virt);
+          if (!new_phys)
+            WALK_REJECT("CoW break of the shared zero page: PMM out of "
+                        "memory", old_phys, 0);
 
-        page_zero(PHYS_TO_VIRT((uint64_t)new_phys));
+          page_zero(PHYS_TO_VIRT((uint64_t)new_phys));
+        }
 
         *pte = ((uint64_t)new_phys & PAGE_MASK) |
-               (*pte & ~PAGE_MASK & ~PAGE_FLAG_COW) | PAGE_FLAG_RW;
+               (*pte & ~PAGE_MASK & ~(PAGE_FLAG_COW | PAGE_FLAG_REFAULT)) |
+               PAGE_FLAG_RW;
         pml4[(virt >> 39) & 511] |= (PAGE_FLAG_RW | PAGE_FLAG_USER);
         pdpt[(virt >> 30) & 511] |= (PAGE_FLAG_RW | PAGE_FLAG_USER);
         pd[(virt >> 21) & 511] |= (PAGE_FLAG_RW | PAGE_FLAG_USER);
@@ -344,12 +362,13 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
         page_copy(PHYS_TO_VIRT((uint64_t)new_phys), PHYS_TO_VIRT(old_phys));
 
         *pte = ((uint64_t)new_phys & PAGE_MASK) |
-               (*pte & ~PAGE_MASK & ~PAGE_FLAG_COW) | PAGE_FLAG_RW;
+               (*pte & ~PAGE_MASK & ~(PAGE_FLAG_COW | PAGE_FLAG_REFAULT)) |
+               PAGE_FLAG_RW;
         // Released after the flush below, not here.
         cow_old_phys = old_phys;
       } else {
         // Sole owner — just make it writable in place.
-        *pte &= ~PAGE_FLAG_COW;
+        *pte &= ~(PAGE_FLAG_COW | PAGE_FLAG_REFAULT);
         *pte |= PAGE_FLAG_RW;
       }
 
@@ -679,6 +698,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 
   void *frame = NULL;
   bool cow_mapping = false;
+  bool refault_mapping = false;
   vfs_node_t *node = (vfs_node_t *)vma_file_node;
   if (node && (node->flags & FS_TYPE_MASK) == FS_FILE) {
     uint64_t page_offset = (cr2 & ~0xFFFULL) - vma_start;
@@ -686,11 +706,15 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 
     if (page_offset >= eff_file_size) {
       // 1. Pure BSS page (past eff_file_size) — allocate zero-filled page
-      frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
-      if (!frame)
-        return PF_REJECT("PMM out of memory for a BSS page", page_offset,
-                         eff_file_size);
-      page_zero(PHYS_TO_VIRT((uint64_t)frame));
+      frame = vmm_zero_pool_usable(vma_numa_policy) ? pmm_alloc_zeroed_page()
+                                                    : NULL;
+      if (!frame) {
+        frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
+        if (!frame)
+          return PF_REJECT("PMM out of memory for a BSS page", page_offset,
+                           eff_file_size);
+        page_zero(PHYS_TO_VIRT((uint64_t)frame));
+      }
     } else if ((vma_flags & MAP_PRIVATE) && (vma_prot & PROT_WRITE)) {
       // 2. Private Writable file mapping (e.g. ELF .data / .got / partial BSS)
       //
@@ -732,6 +756,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
         frame = (void *)cached->frame_phys;
         pmm_incref(frame);
         cow_mapping = true;
+        refault_mapping = true;
       } else {
         // The page is about to be dirtied (or is the partial tail of the
         // segment): take the private zero-filled copy now.
@@ -785,6 +810,8 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       if (cached && cached->frame_phys) {
         frame = (void *)cached->frame_phys;
         pmm_incref(frame);
+        refault_mapping = (vma_flags & MAP_PRIVATE) &&
+                          page_offset + PAGE_SIZE <= eff_file_size;
         vfs_cache_put(node, cached);
       } else {
         if (cached)
@@ -850,6 +877,13 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
             (uint32_t)(nv->offset + nv_page_off) ==
                 (uint32_t)(vma_offset + (batch[bi].vpage - vma_start));
         uint64_t page_flags = ok ? dp_build_flags(nv->prot) : 0;
+        /* The fault started in a read-only VMA, but mprotect may have made
+         * this neighbour writable while the file cache was being filled.
+         * Private mappings must never expose a writable cache frame: retain
+         * CoW using the permissions revalidated under mm->lock. */
+        if (ok && (nv->flags & MAP_PRIVATE))
+          page_flags = (page_flags & ~PAGE_FLAG_RW) |
+                       PAGE_FLAG_COW | PAGE_FLAG_REFAULT;
         // Drop the mm->lock around the PTE install would reopen the race;
         // mm->lock -> vmm_lock is the established order, so keep both.
         // vmm_map_page_if_unmapped() takes vmm_lock internally.
@@ -970,13 +1004,23 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 #undef FAULT_AROUND_PAGES
 
     // 4 KB fallback (always correct, also handles non-huge VMAs).
-    frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
+    // Prefer an idle-zeroed frame; fall back to alloc+zero inline.
+    bool pre_zeroed = false;
+    frame = vmm_zero_pool_usable(vma_numa_policy) ? pmm_alloc_zeroed_page()
+                                                  : NULL;
+    if (frame) {
+      pre_zeroed = true;
+    } else {
+      frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
+    }
 
     if (!frame) {
       // Reclaim before giving up: deferred frees may be parked on the drain
-      // queue and clean file-cache pages are droppable. Failing here kills a
-      // userspace thread, so one bounded recovery pass is worth it.
+      // queue and clean file-cache pages are droppable. The zero pool is
+      // drained too — its frames are the cheapest reclaimable pages. Failing
+      // here kills a userspace thread, so one bounded recovery pass is worth it.
       vmm_drain_deferred_work();
+      pmm_zero_pool_drain_all();
       mm_file_cache_reclaim(64);
       frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
     }
@@ -1010,7 +1054,8 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       return PF_REJECT("PMM out of memory while demand paging a 4KB page",
                        vma_start, vma_end);
     }
-    page_zero(PHYS_TO_VIRT((uint64_t)frame));
+    if (!pre_zeroed)
+      page_zero(PHYS_TO_VIRT((uint64_t)frame));
   }
 
 
@@ -1053,6 +1098,8 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
   uint64_t flags = dp_build_flags(vma_prot);
   if (cow_mapping)
     flags = (flags & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
+  if (refault_mapping)
+    flags |= PAGE_FLAG_REFAULT;
   uint64_t vpage = cr2 & ~0xFFFULL;
   bool mapped = vmm_map_page_if_unmapped((uint64_t *)target_cr3, vpage,
                                          (uint64_t)frame, flags);

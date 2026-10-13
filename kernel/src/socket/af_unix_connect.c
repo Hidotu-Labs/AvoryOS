@@ -14,11 +14,19 @@ int unix_listen_impl(socket_t *sock, int backlog) {
 
   spinlock_acquire(&sock->lock);
 
-  usk->is_listener    = true;
-  usk->backlog        = (backlog > 0) ? backlog : 128;
-  usk->accept_queue_len = 0;
-  usk->accept_next    = NULL;
-  sock->state         = SS_LISTENING;
+  if (sock->state == SS_CONNECTED) {
+    spinlock_release(&sock->lock);
+    return -22;
+  }
+  /* listen() may update a live listener's backlog. Its pending sockets
+   * remain owned by the accept queue and must still be accepted/destroyed. */
+  if (!usk->is_listener) {
+    usk->accept_queue_len = 0;
+    usk->accept_next = NULL;
+  }
+  usk->is_listener = true;
+  usk->backlog = (backlog > 0) ? backlog : 128;
+  sock->state = SS_LISTENING;
 
   spinlock_release(&sock->lock);
 
@@ -141,10 +149,12 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
   usk->peer_cred_uid = server_usk->owner_uid;
   usk->peer_cred_gid = server_usk->owner_gid;
   usk->peer_cred_valid = true;
+  unix_cache_peer_groups(usk, server_usk);
   server_usk->peer_cred_pid = usk->owner_pid;
   server_usk->peer_cred_uid = usk->owner_uid;
   server_usk->peer_cred_gid = usk->owner_gid;
   server_usk->peer_cred_valid = true;
+  unix_cache_peer_groups(server_usk, usk);
 
   spinlock_acquire(&listener_sock->lock);
 
@@ -257,6 +267,9 @@ int unix_accept_impl(socket_t *sock, socket_t **newsock) {
     new_usk->owner_pid = current_thread->tgid;
     new_usk->owner_uid = current_thread->euid;
     new_usk->owner_gid = current_thread->egid;
+    new_usk->owner_group_count = current_thread->supplementary_group_count;
+    memcpy(new_usk->owner_groups, current_thread->supplementary_groups,
+           new_usk->owner_group_count * sizeof(uint32_t));
   }
   // Refresh the client side's disconnect cache now that the daemon owns the
   // accepted socket (at connect time its owner was still the connector).
@@ -267,10 +280,12 @@ int unix_accept_impl(socket_t *sock, socket_t **newsock) {
       client_usk->peer_cred_uid = new_usk->owner_uid;
       client_usk->peer_cred_gid = new_usk->owner_gid;
       client_usk->peer_cred_valid = true;
+      unix_cache_peer_groups(client_usk, new_usk);
       new_usk->peer_cred_pid = client_usk->owner_pid;
       new_usk->peer_cred_uid = client_usk->owner_uid;
       new_usk->peer_cred_gid = client_usk->owner_gid;
       new_usk->peer_cred_valid = true;
+      unix_cache_peer_groups(new_usk, client_usk);
     }
   }
 

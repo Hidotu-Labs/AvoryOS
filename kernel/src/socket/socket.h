@@ -39,6 +39,7 @@ struct sockaddr_nl {
 };
 
 #define SOL_NETLINK 270
+#define NETLINK_EXT_ACK 11
 #define NETLINK_ADD_MEMBERSHIP 1
 #define NETLINK_DROP_MEMBERSHIP 2
 
@@ -293,7 +294,9 @@ int socket_create_pair(int domain, int type, int protocol, socket_t *sv[2]);
 
 // Socket FD Management
 int socket_alloc_fd(socket_t *sock);
+/* Caller owns a descriptor reference and must socket_fd_put() it. */
 socket_t *socket_from_fd(int fd);
+void socket_fd_put(socket_t *sock);
 int socket_close_fd(int fd);
 
 // Family Registration

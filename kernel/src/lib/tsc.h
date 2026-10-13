@@ -70,7 +70,7 @@ static inline uint64_t tsc_cycles_to_ns(uint64_t cycles) {
 /* ── Named probe API ─────────────────────────────────────────────────────── */
 
 /* Maximum number of distinct probe sites.  Increase if needed. */
-#define TSC_PROBE_MAX 32
+#define TSC_PROBE_MAX 40
 
 /* Probe slot — updated atomically on x86 for non-SMP "good enough" stats. */
 typedef struct {

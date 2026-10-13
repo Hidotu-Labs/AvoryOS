@@ -46,10 +46,58 @@ static void rawspinlock_release(rawspinlock_t *s) {
 #endif
 #undef sched_yield
 
-void kernel_sched_yield(void) { sched_yield(); }
-static _Thread_local struct thread owner = {.tid = 1};
+static _Thread_local struct thread owner = {.tid = 1, .state = THREAD_RUNNING};
+static pthread_mutex_t wait_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t wait_cond = PTHREAD_COND_INITIALIZER;
+static unsigned slept;
+static _Thread_local bool irq_enabled = true;
+hal_irq_state_t hal_irq_save(void) { bool old = irq_enabled; irq_enabled = false; return old; }
+void hal_irq_restore(hal_irq_state_t flags) { irq_enabled = flags; }
+static ext2_mount_t *release_on_add;
+void kernel_sched_yield(void) {
+  assert(irq_enabled);
+  pthread_mutex_lock(&wait_mutex);
+  while (owner.state == THREAD_BLOCKED) {
+    slept++;
+    pthread_cond_broadcast(&wait_cond);
+    pthread_cond_wait(&wait_cond, &wait_mutex);
+  }
+  pthread_mutex_unlock(&wait_mutex);
+  sched_yield();
+}
+void wait_queue_init(wait_queue_t *q) { memset(q, 0, sizeof(*q)); }
+void wait_queue_add(wait_queue_t *q, wait_queue_entry_t *e) {
+  pthread_mutex_lock(&wait_mutex);
+  e->wq = q; e->next = q->head; q->head = e;
+  pthread_mutex_unlock(&wait_mutex);
+  if (release_on_add) {
+    ext2_mount_t *mnt = release_on_add;
+    release_on_add = NULL;
+    uint32_t saved = owner.tid;
+    owner.tid = mnt->journal.owner_tid;
+    assert(ext3_journal_stop(mnt) == 0);
+    owner.tid = saved;
+  }
+}
+void wait_queue_remove(wait_queue_t *q, wait_queue_entry_t *e) {
+  pthread_mutex_lock(&wait_mutex);
+  wait_queue_entry_t **p = &q->head;
+  while (*p && *p != e) p = &(*p)->next;
+  if (*p) *p = e->next;
+  e->wq = NULL;
+  pthread_mutex_unlock(&wait_mutex);
+}
+void wait_queue_wake_all(wait_queue_t *q) {
+  pthread_mutex_lock(&wait_mutex);
+  for (wait_queue_entry_t *e = q->head; e; e = e->next)
+    e->thread->state = THREAD_RUNNING;
+  pthread_cond_broadcast(&wait_cond);
+  pthread_mutex_unlock(&wait_mutex);
+}
 struct thread *sched_get_current(void) { return &owner; }
-uint64_t lapic_timer_get_ms(void) { return 0; }
+static _Thread_local uint64_t test_clock_ms;
+uint64_t lapic_timer_get_ms(void) { return test_clock_ms; }
+uint64_t lapic_timer_get_ticks(void) { return 0; }
 void klogf(const char *fmt, ...) { (void)fmt; }
 static unsigned allocations;
 static int fail_allocation;
@@ -103,6 +151,15 @@ static void *transaction_worker(void *opaque) {
   return NULL;
 }
 
+static void *blocked_worker(void *opaque) {
+  ext2_mount_t *mnt = opaque;
+  owner.tid = 2;
+  owner.state = THREAD_RUNNING;
+  assert(ext3_journal_start(mnt) == 0);
+  assert(ext3_journal_stop(mnt) == 0);
+  return NULL;
+}
+
 int main(void) {
   ext2_mount_t *mnt = calloc(1, sizeof(*mnt));
   assert(mnt);
@@ -112,7 +169,11 @@ int main(void) {
   mnt->sb.s_feature_compat = EXT3_FEATURE_COMPAT_HAS_JOURNAL;
   mnt->journal.sequence = 42;
   assert(ext3_journal_start(mnt) == 0);
+  test_clock_ms = 7;
   assert(ext3_journal_stop(mnt) == 0);
+  assert(mnt->journal.perf_wait.count == 1 && mnt->journal.perf_wait.total_ms == 0);
+  assert(mnt->journal.perf_hold.count == 1 && mnt->journal.perf_hold.total_ms == 7 && mnt->journal.perf_hold.max_ms == 7 && mnt->journal.perf_hold.buckets[3] == 1);
+  test_clock_ms = 0;
   assert(writes == 0 && reads == 0 && mnt->journal.sequence == 42);
   assert(!mnt->journal.active && !mnt->journal.lock.locked &&
          !mnt->journal.depth);
@@ -123,7 +184,8 @@ int main(void) {
   assert(ext3_journal_stop(mnt) == 0 && mnt->journal.depth == 1);
   assert(ext3_journal_stop(mnt) == 0 && !mnt->journal.lock.locked &&
          writes == 0);
-  puts("PASS nested empty transactions preserve owner until outer stop");
+  assert(mnt->journal.perf_wait.count == 2 && mnt->journal.perf_hold.count == 2);
+  puts("PASS nested empty transactions preserve owner until outer stop; latency counts outer transactions only");
   assert(ext3_journal_start(mnt) == 0);
   unsigned char buf[1024] = {1};
   assert(ext3_journal_block(mnt, 7, buf) == 0 && writes == 2);
@@ -136,6 +198,7 @@ int main(void) {
   flush_error = -1;
   assert(ext3_journal_stop(mnt) == -1 && !mnt->journal.active &&
          !mnt->journal.lock.locked);
+  assert(mnt->journal.perf_hold.errors == 1);
   flush_error = 0;
   assert(ext3_journal_start(mnt) == 0 && ext3_journal_stop(mnt) == 0);
   puts("PASS metadata flush failure releases ownership and permits the next "
@@ -162,6 +225,68 @@ int main(void) {
   assert(__builtin_bswap32(((jbd_superblock_t *)write_images[4])->s_start) == 1);
   assert(((jbd_superblock_t *)write_images[5])->s_start == 0);
   puts("PASS warm transaction: zero scratch allocations/mapping calls; same six writes and payloads");
+
+  /* Complete cached metadata can skip redundant I/O, but neither an active
+   * write nor a direct-map collision can stand in for the requested block. */
+  mnt->cache[7].num = 7;
+  mnt->cache[7].data = buf;
+  writes = reads = 0;
+  seq = mnt->journal.sequence;
+  assert(ext3_journal_start(mnt) == 0);
+  assert(ext3_journal_block(mnt, 7, buf) == 0);
+  assert(ext3_journal_stop(mnt) == 0 && writes == 0 && reads == 0);
+  assert(mnt->journal.sequence == seq && mnt->journal.metadata_unchanged == 1);
+  unsigned char changed[1024] = {2};
+  assert(ext3_journal_start(mnt) == 0);
+  assert(ext3_journal_block(mnt, 7, changed) == 0);
+  assert(ext3_journal_stop(mnt) == 0 && writes == 6);
+  writes = reads = 0;
+  mnt->cache[0].data = buf;
+  assert(ext3_journal_start(mnt) == 0);
+  assert(ext3_journal_block(mnt, 0, buf) == -1);
+  assert(ext3_journal_stop(mnt) == -1 && writes == 0);
+  mnt->cache[0].data = NULL;
+  mnt->cache[7].writes_inflight = 1;
+  assert(ext3_journal_start(mnt) == 0);
+  assert(ext3_journal_block(mnt, 7, buf) == 0);
+  assert(ext3_journal_stop(mnt) == 0 && writes == 6);
+  mnt->cache[7].writes_inflight = 0;
+  mnt->cache[7].num = 7 + EXT2_CACHE_SIZE;
+  writes = reads = 0;
+  assert(ext3_journal_start(mnt) == 0);
+  assert(ext3_journal_block(mnt, 7, buf) == 0);
+  assert(ext3_journal_stop(mnt) == 0 && writes == 6);
+  mnt->cache[7].data = NULL;
+  puts("PASS unchanged metadata skips six writes; in-flight/colliding images retain journaling");
+
+  assert(ext3_journal_start(mnt) == 0);
+  owner.tid = 2;
+  assert(ext3_journal_stop(mnt) == -1 && mnt->journal.active);
+  assert(ext3_journal_block(mnt, 7, buf) == -1);
+  release_on_add = mnt;
+  unsigned before_sleep = slept;
+  assert(ext3_journal_start(mnt) == 0);
+  assert(slept == before_sleep && !mnt->journal.waiters.head);
+  assert(ext3_journal_stop(mnt) == 0);
+  owner.tid = 1;
+  puts("PASS unlock during waiter registration is rechecked; non-owner cannot stop transaction");
+
+  for (unsigned fail_owner = 0; fail_owner < 2; fail_owner++) {
+    assert(ext3_journal_start(mnt) == 0);
+    pthread_t blocked;
+    pthread_mutex_lock(&wait_mutex);
+    before_sleep = slept;
+    pthread_mutex_unlock(&wait_mutex);
+    assert(pthread_create(&blocked, NULL, blocked_worker, mnt) == 0);
+    pthread_mutex_lock(&wait_mutex);
+    while (slept == before_sleep) pthread_cond_wait(&wait_cond, &wait_mutex);
+    pthread_mutex_unlock(&wait_mutex);
+    mnt->journal.io_failed = fail_owner;
+    assert(ext3_journal_stop(mnt) == (fail_owner ? -1 : 0));
+    assert(pthread_join(blocked, NULL) == 0);
+    assert(!mnt->journal.waiters.head && !mnt->journal.lock.locked);
+  }
+  puts("PASS contended writers sleep and wake after both successful and failed owner completion");
 
   /* Cache collisions never return the other logical block's mapping. */
   assert(ext3_journal_start(mnt) == 0);

@@ -122,6 +122,10 @@ void sched_release_files(struct thread *t) {
     return;
 
   for (int i = 0; i < MAX_FDS; i++) {
+    if (files->reserved_nodes[i]) {
+      vfs_close(files->reserved_nodes[i]);
+      files->reserved_nodes[i] = NULL;
+    }
     if (files->fds[i] && files->fds[i] != (vfs_node_t *)-1) {
       vfs_node_t *node = files->fds[i];
       if (t->is_forked_child) {

@@ -34,6 +34,10 @@ struct udp_socket {
     bool     used;
     bool     bound;
     bool     connected;
+    /* Optional family adapter; delivery retains a socket reference. */
+    void (*deliver)(struct udp_socket *, uint32_t, uint16_t,
+                    const uint8_t *, uint16_t);
+    void *deliver_context;
     spinlock_t lock;            /* protects the receive queue and options */
 
     uint32_t local_ip;

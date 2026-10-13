@@ -1,5 +1,8 @@
 # Phase 5 — chunked execution plan
 
+Historical plan: the `run-linuxdrm` and C4–C7 test launchers are retired.
+Use `make run-c7-prime` for current AMDGPU sessions.
+
 Audience: the agent that picks up Phase 5.  Paste the project SHARED CONTEXT
 with this file.  Written 2026-09-12 after auditing P0–P4 at commit `4e7dd65`
 plus the C5 working tree (bochs canary), QEMU 11.1.0, host GPU

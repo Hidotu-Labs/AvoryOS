@@ -36,6 +36,22 @@ if [ ! -d "$SRC_DIR" ]; then
   exit 1
 fi
 
+# Host ownership is flattened by the package installer's user namespace.
+# Recover the rules directory's declared root:polkitd ownership from target
+# accounts, rather than host IDs or a hard-coded daemon GID. Validate before
+# any image mutation. Do not give the daemon permission to replace rules.
+POLKIT_RULES_GID=""
+if [ -z "$DST_DIR" ] && [ -d "$SRC_DIR/etc/polkit-1/rules.d" ]; then
+    if [ ! -f "$SRC_DIR/etc/group" ]; then
+        echo "Missing target /etc/group for polkit rules ownership" >&2
+        exit 1
+    fi
+    POLKIT_RULES_GID=$(awk -F: '$1 == "polkitd" {print $3; exit}' "$SRC_DIR/etc/group")
+    case "$POLKIT_RULES_GID" in
+        ''|*[!0-9]*) echo "Missing or invalid target polkitd GID" >&2; exit 1 ;;
+    esac
+fi
+
 CMDS_FILE=$(mktemp)
 
 # Resolve debugfs binary early so the stale-file wipe below can use it.
@@ -109,6 +125,11 @@ done
     # 0402755 instead of 042755).
     full_mode=$(printf "0%o" $((8#40000 + 8#$mode)))
     echo "set_inode_field $DST_DIR/$rel_path mode $full_mode" >> "$CMDS_FILE"
+    if [ "$rel_path" = "etc/polkit-1/rules.d" ] && [ -n "$POLKIT_RULES_GID" ]; then
+      echo "set_inode_field /$rel_path uid 0" >> "$CMDS_FILE"
+      echo "set_inode_field /$rel_path gid $POLKIT_RULES_GID" >> "$CMDS_FILE"
+      echo "set_inode_field /$rel_path mode 040750" >> "$CMDS_FILE"
+    fi
   done
 
   # Then write files and symlinks (static archives are build-only, like
@@ -160,13 +181,19 @@ if [ -x /run/host/usr/bin/debugfs ]; then
   DEBUGFS_BIN=/run/host/usr/bin/debugfs
 fi
 
-# Execute commands in a single debugfs call.
-# Existing-directory diagnostics are expected during incremental population,
-# so suppress batch output while still treating a debugfs process failure as fatal.
-if ! "$DEBUGFS_BIN" -w -f "$CMDS_FILE" "$IMG_PATH" > /dev/null 2>&1; then
+# debugfs can exit successfully after individual writes fail. Keep its batch
+# diagnostics and reject space/allocation/write failures explicitly.
+BATCH_LOG=$(mktemp)
+if ! "$DEBUGFS_BIN" -w -f "$CMDS_FILE" "$IMG_PATH" > "$BATCH_LOG" 2>&1; then
   echo "Failed to populate ext2 image with $DEBUGFS_BIN" >&2
-  rm -f "$CMDS_FILE"
+  tail -20 "$BATCH_LOG" >&2
+  rm -f "$CMDS_FILE" "$BATCH_LOG"
+  exit 1
+fi
+if grep -Ei 'could not allocate|no space left|could not write|short write' "$BATCH_LOG" >&2; then
+  echo "Image population failed: enlarge DISK_SIZE_MIB and rebuild disk.img" >&2
+  rm -f "$CMDS_FILE" "$BATCH_LOG"
   exit 1
 fi
 
-rm -f "$CMDS_FILE"
+rm -f "$CMDS_FILE" "$BATCH_LOG"

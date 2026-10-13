@@ -506,3 +506,47 @@ structural optimization, collect transaction wait/hold and drain-path timings
 and perform an A/B comparison from equivalent fresh guest/image states.
 Keep the I/O error fixes distinct when comparing mapping/buffer reuse so
 performance experiments do not discard error reporting.
+
+## Contended transaction waits and unchanged metadata (2026-10-07)
+
+Journal contenders now park on a per-mount wait queue rather than remaining
+runnable in a repeated yield loop. With local interrupts masked, the thread
+publishes BLOCKED before joining that queue and retries acquisition after
+registration, closing the unlock /
+registration lost-wakeup window. Successful commits and all failure exits wake
+the queue. A five-second deadline preserves slow-owner diagnostics. Nesting
+remains restricted to the owner; another thread cannot submit metadata or stop
+its transaction. Metadata mutation is still serialized per mount.
+
+A journaled metadata submission now checks the coherent home-block cache under
+its cache lock. If the full image already matches and no write is in flight,
+there is no change to log or write again. Cache collisions, missing images,
+changed bytes, and in-flight writes retain the existing journal-before-home
+path. This does not defer changed metadata or introduce asynchronous commits.
+One modeled redundant one-block transaction eliminates its previous six device
+writes and superblock read; this is an I/O-count result, not a Mocktail speedup.
+
+The slow-wait line now includes the owner's comm, hold time, outer start call
+site, phase (operation, journal-payload, metadata-home, commit), and cumulative
+metadata submitted / unchanged counts. `blocks=0` means no metadata has been
+recorded yet; it does not prove that a journal commit is the stalled operation.
+
+The expanded actual-source `test_ext3_empty_commit.c` passes sanitizer checks
+for sleeping waiters, successful/failed-owner wakeups, unlock during registration,
+non-owner rejection, unchanged versus changed/in-flight/colliding images,
+nesting, concurrent writers, and existing allocation/I/O failures. The cache,
+metadata-writeback, allocation-run, and plain-write suites also pass. Use the
+compiler command above, changing the source to `test_ext3_empty_commit.c`.
+
+Guest validation uses a disposable eight-CPU QEMU TCG image and a temporary
+kernel with the unrelated LinuxKPI boot suite omitted. The production ISO
+retains that suite. A fresh ext3 NVMe fixture with allocated files passes eight
+concurrent workers performing 240 writes, fsyncs, and verified readbacks. This
+checks journal and scheduler integration, not crash recovery or throughput.
+
+An ext4 fixture fails temporary-directory creation with both the original and
+modified journal implementation; an ext3 ramdisk fixture encounters the same
+failure before benchmark phases begin. Fresh sparse-file fixtures also fail
+allocation with ENOSPC under both versions. These fixtures cannot establish
+a regression or speedup from this change. Full ext4/Mocktail throughput and
+tail-latency measurement on the normal guest remains required.

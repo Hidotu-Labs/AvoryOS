@@ -3,6 +3,78 @@
 #include "../syscalls/sys_io_shared.h"
 #include "arch/uaccess.h"
 
+/* Pin and snapshot under the sender's file-table lock. A CLONE_FILES
+ * sibling can close/reuse the descriptor while sendmsg is in progress. */
+static bool unix_scm_capture_fd(struct thread *sender, int fd,
+                                unix_scm_fd_t *saved) {
+  if (!sender || !sender->files || fd < 0 || fd >= MAX_FDS)
+    return false;
+  spinlock_acquire(&sender->files->lock);
+  vfs_node_t *node = sender->fds[fd];
+  if (!fd_is_valid_node(node)) {
+    spinlock_release(&sender->files->lock);
+    return false;
+  }
+  vfs_node_ref(node);
+  saved->node = node;
+  saved->offset = sender->fd_offsets[fd];
+  saved->flags = sender->fd_flags[fd] & ~(uint64_t)FD_FLAGS_CLOEXEC_BIT;
+  const char *path = fd_path_value(sender, fd);
+  saved->path[0] = '\0';
+  if (path) {
+    strncpy(saved->path, path, sizeof(saved->path) - 1);
+    saved->path[sizeof(saved->path) - 1] = '\0';
+  }
+  spinlock_release(&sender->files->lock);
+  vfs_open(node); /* queued message owns this open reference */
+  vfs_close(node); /* release the snapshot's temporary pin */
+  return true;
+}
+
+static int unix_scm_install_fd(struct thread *receiver,
+                               unix_scm_fd_t *saved, int flags) {
+  int fd = alloc_fd(receiver);
+  if (fd < 0)
+    return fd;
+  spinlock_acquire(&receiver->files->lock);
+  receiver->fd_offsets[fd] = saved->offset;
+  receiver->fd_flags[fd] = saved->flags |
+      ((flags & MSG_CMSG_CLOEXEC) ? FD_FLAGS_CLOEXEC_BIT : 0);
+  if (!fd_path_set(receiver, fd, saved->path)) {
+    spinlock_release(&receiver->files->lock);
+    fd_release_reserved(receiver, fd);
+    return -12;
+  }
+  receiver->fds[fd] = saved->node; /* publish after all metadata */
+  spinlock_release(&receiver->files->lock);
+  return fd;
+}
+
+static void unix_scm_free_msg(unix_scm_msg_t *msg) {
+  for (int i = 0; i < msg->count; i++) {
+    if (msg->fds[i].node)
+      vfs_close(msg->fds[i].node);
+  }
+  kfree(msg);
+}
+
+/* bytes_read names the next unread byte. Reaching the first byte carrying
+ * SCM does not consume it; only a read past that byte discards its rights. */
+static void unix_discard_consumed_scm(unix_sock_t *usk) {
+  while (usk->scm_queue_head &&
+         usk->bytes_read > usk->scm_queue_head->stream_offset) {
+    unix_scm_msg_t *discard = usk->scm_queue_head;
+    for (int i = 0; i < discard->count; i++) {
+      if (discard->fds[i].node)
+        vfs_close(discard->fds[i].node);
+    }
+    usk->scm_queue_head = discard->next;
+    if (!usk->scm_queue_head)
+      usk->scm_queue_tail = NULL;
+    kfree(discard);
+  }
+}
+
 static bool unix_user_range_valid(uint64_t addr, size_t len) {
   if (!addr)
     return false;
@@ -498,7 +570,7 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
 
       if (pkt->scm) {
         for (int i = 0; i < pkt->scm->count; i++) {
-          if (pkt->scm->nodes[i]) vfs_close(pkt->scm->nodes[i]);
+          if (pkt->scm->fds[i].node) vfs_close(pkt->scm->fds[i].node);
         }
         kfree(pkt->scm);
       }
@@ -635,16 +707,7 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
       usk->bytes_read += to_copy;
       usk->scm_cred_pending = false;
 
-      // Close and discard any bypassed SCM messages from unread stream offsets
-      while (usk->scm_queue_head && usk->bytes_read >= usk->scm_queue_head->stream_offset) {
-        unix_scm_msg_t *discard = usk->scm_queue_head;
-        for (int i = 0; i < discard->count; i++) {
-          if (discard->nodes[i]) vfs_close(discard->nodes[i]);
-        }
-        usk->scm_queue_head = discard->next;
-        if (!usk->scm_queue_head) usk->scm_queue_tail = NULL;
-        kfree(discard);
-      }
+      unix_discard_consumed_scm(usk);
     }
 
     spinlock_release(&usk->recv_lock);
@@ -831,7 +894,12 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     }
 
     if (total_fds > 0) {
-      scm_item = kmalloc(sizeof(unix_scm_msg_t) + total_fds * sizeof(vfs_node_t *));
+      scm_item = kmalloc(sizeof(unix_scm_msg_t) + total_fds * sizeof(unix_scm_fd_t));
+      if (!scm_item) {
+        spinlock_release(&peer->recv_lock);
+        socket_put(peer_sock);
+        return -12;
+      }
       if (scm_item) {
         scm_item->next = NULL;
         scm_item->stream_offset = 0;
@@ -849,11 +917,13 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
               if (scm_item->count >= total_fds)
                 break;
               int fd = fds[i];
-              if (fd >= 0 && fd < MAX_FDS && current->fds[fd]) {
-                vfs_node_t *node = current->fds[fd];
-                vfs_open(node);
-                scm_item->nodes[scm_item->count++] = node;
+              if (!unix_scm_capture_fd(current, fd, &scm_item->fds[scm_item->count])) {
+                spinlock_release(&peer->recv_lock);
+                unix_scm_free_msg(scm_item);
+                socket_put(peer_sock);
+                return -9;
               }
+              scm_item->count++;
             }
           }
           cmsg = CMSG_NXTHDR(msg, cmsg);
@@ -870,7 +940,7 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     if (!pkt) {
       if (scm_item) {
         for (int i = 0; i < scm_item->count; i++) {
-          if (scm_item->nodes[i]) vfs_close(scm_item->nodes[i]);
+          if (scm_item->fds[i].node) vfs_close(scm_item->fds[i].node);
         }
         kfree(scm_item);
       }
@@ -1008,7 +1078,13 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   }
 
   if (total_fds > 0) {
-    unix_scm_msg_t *scm_item = kmalloc(sizeof(unix_scm_msg_t) + total_fds * sizeof(vfs_node_t *));
+    unix_scm_msg_t *scm_item = kmalloc(sizeof(unix_scm_msg_t) + total_fds * sizeof(unix_scm_fd_t));
+    if (!scm_item) {
+      spinlock_release(&peer_sock->lock);
+      spinlock_release(&peer->recv_lock);
+      socket_put(peer_sock);
+      return -12;
+    }
     if (scm_item) {
       scm_item->next = NULL;
       scm_item->stream_offset = peer->bytes_written;
@@ -1027,11 +1103,14 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
             if (scm_item->count >= total_fds)
               break;
             int fd = fds[i];
-            if (fd >= 0 && fd < MAX_FDS && current->fds[fd]) {
-              vfs_node_t *node = current->fds[fd];
-              vfs_open(node);
-              scm_item->nodes[scm_item->count++] = node;
+            if (!unix_scm_capture_fd(current, fd, &scm_item->fds[scm_item->count])) {
+              spinlock_release(&peer_sock->lock);
+              spinlock_release(&peer->recv_lock);
+              unix_scm_free_msg(scm_item);
+              socket_put(peer_sock);
+              return -9;
             }
+            scm_item->count++;
           }
         }
         cmsg = CMSG_NXTHDR(msg, cmsg);
@@ -1297,19 +1376,16 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
 
         int actual_count = 0;
         for (int i = 0; i < max_fds; i++) {
-          vfs_node_t *node = head->nodes[i];
+          vfs_node_t *node = head->fds[i].node;
           if (!node)
             continue;
-          int new_fd = alloc_fd(current);
+          int new_fd = unix_scm_install_fd(current, &head->fds[i], flags);
           if (new_fd >= 0) {
-            current->fds[new_fd] = node;
-            current->fd_offsets[new_fd] = 0;
-            current->fd_flags[new_fd] = (flags & MSG_CMSG_CLOEXEC) ? FD_FLAGS_CLOEXEC_BIT : 0;
             fds[actual_count++] = new_fd;
           } else {
             vfs_close(node);
           }
-          head->nodes[i] = NULL;
+          head->fds[i].node = NULL;
         }
 
         cmsg->cmsg_len = CMSG_LEN(actual_count * sizeof(int));
@@ -1318,18 +1394,18 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         if (actual_count < head->count) {
           msg->msg_flags |= MSG_CTRUNC;
           for (int i = actual_count; i < head->count; i++) {
-            if (head->nodes[i]) {
-              vfs_close(head->nodes[i]);
-              head->nodes[i] = NULL;
+            if (head->fds[i].node) {
+              vfs_close(head->fds[i].node);
+              head->fds[i].node = NULL;
             }
           }
         }
       } else if (have_control) {
         msg->msg_flags |= MSG_CTRUNC;
         for (int i = 0; i < head->count; i++) {
-          if (head->nodes[i]) {
-            vfs_close(head->nodes[i]);
-            head->nodes[i] = NULL;
+          if (head->fds[i].node) {
+            vfs_close(head->fds[i].node);
+            head->fds[i].node = NULL;
           }
         }
       }
@@ -1360,9 +1436,9 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
 
       if (pkt->scm) {
         for (int i = 0; i < pkt->scm->count; i++) {
-          if (pkt->scm->nodes[i]) {
-            vfs_close(pkt->scm->nodes[i]);
-            pkt->scm->nodes[i] = NULL;
+          if (pkt->scm->fds[i].node) {
+            vfs_close(pkt->scm->fds[i].node);
+            pkt->scm->fds[i].node = NULL;
           }
         }
         kfree(pkt->scm);
@@ -1516,9 +1592,9 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       if (!have_control) {
         msg->msg_flags |= MSG_CTRUNC;
         for (int i = 0; i < head->count; i++) {
-          if (head->nodes[i]) {
-            vfs_close(head->nodes[i]);
-            head->nodes[i] = NULL;
+          if (head->fds[i].node) {
+            vfs_close(head->fds[i].node);
+            head->fds[i].node = NULL;
           }
         }
         usk->scm_queue_head = head->next;
@@ -1541,19 +1617,16 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
 
         int actual_count = 0;
         for (int i = 0; i < max_fds; i++) {
-          vfs_node_t *node = head->nodes[i];
+          vfs_node_t *node = head->fds[i].node;
           if (!node)
             continue;
-          int new_fd = alloc_fd(current);
+          int new_fd = unix_scm_install_fd(current, &head->fds[i], flags);
           if (new_fd >= 0) {
-            current->fds[new_fd] = node;
-            current->fd_offsets[new_fd] = 0;
-            current->fd_flags[new_fd] = (flags & MSG_CMSG_CLOEXEC) ? FD_FLAGS_CLOEXEC_BIT : 0;
             fds[actual_count++] = new_fd;
           } else {
             vfs_close(node);
           }
-          head->nodes[i] = NULL;
+          head->fds[i].node = NULL;
         }
 
         cmsg->cmsg_len = CMSG_LEN(actual_count * sizeof(int));
@@ -1562,9 +1635,9 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         if (actual_count < head->count) {
           msg->msg_flags |= MSG_CTRUNC;
           for (int i = actual_count; i < head->count; i++) {
-            if (head->nodes[i]) {
-              vfs_close(head->nodes[i]);
-              head->nodes[i] = NULL;
+            if (head->fds[i].node) {
+              vfs_close(head->fds[i].node);
+              head->fds[i].node = NULL;
             }
           }
         }
@@ -1576,9 +1649,9 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       } else {
         msg->msg_flags |= MSG_CTRUNC;
         for (int i = 0; i < head->count; i++) {
-          if (head->nodes[i]) {
-            vfs_close(head->nodes[i]);
-            head->nodes[i] = NULL;
+          if (head->fds[i].node) {
+            vfs_close(head->fds[i].node);
+            head->fds[i].node = NULL;
           }
         }
         usk->scm_queue_head = head->next;

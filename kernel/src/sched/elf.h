@@ -2,8 +2,24 @@
 #define ELF_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define ELF_MAGIC 0x464C457F
+#define ELF32_STACK_TOP 0xBFFFE000ULL
+#define ELF32_INTERP_BASE 0x70000000ULL
+#define ELF32_USER_LIMIT 0xC0000000ULL
+
+typedef struct {
+  uint8_t e_ident[16];
+  uint16_t e_type, e_machine;
+  uint32_t e_version, e_entry, e_phoff, e_shoff, e_flags;
+  uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
+} __attribute__((packed)) Elf32_Ehdr;
+
+typedef struct {
+  uint32_t p_type, p_offset, p_vaddr, p_paddr;
+  uint32_t p_filesz, p_memsz, p_flags, p_align;
+} __attribute__((packed)) Elf32_Phdr;
 
 typedef struct {
   uint8_t e_ident[16];
@@ -43,6 +59,9 @@ typedef struct {
 #define PT_SHLIB 5
 #define PT_PHDR 6
 #define PT_TLS 7
+#define PT_GNU_EH_FRAME 0x6474e550
+#define PT_GNU_STACK 0x6474e551
+#define PT_GNU_RELRO 0x6474e552
 
 #define PF_X 1
 #define PF_W 2
@@ -78,6 +97,7 @@ typedef struct {
   uint16_t phnum;        // e_phnum
   uint64_t interp_base;  // Base address of interpreter
   uint64_t interp_entry; // Entry point of interpreter
+  bool compat32;        // i386 executable and initial stack ABI
 } elf_info_t;
 
 #endif

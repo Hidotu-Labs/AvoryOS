@@ -23,6 +23,7 @@
 extern void switch_context(struct thread *old_t, struct thread *new_t);
 extern void tss_set_rsp0(uint64_t rsp0);
 extern void signal_send(struct thread *, int);
+extern void signal_notify_thread(struct thread *t, int sig);
 
 static void ipi_reschedule_handler(struct registers *regs) {
   (void)regs;
@@ -298,6 +299,7 @@ void sched_init(void) {
     idle_thread->stack_size = CPU_STACK_SIZE;
     idle_thread->stack_base = cpu->stack_top - CPU_STACK_SIZE;
     idle_thread->parent = NULL;
+    fpu_init_thread(idle_thread);
 
     spinlock_acquire(&tid_lock);
     idle_thread->global_next = global_thread_list;
@@ -310,6 +312,7 @@ void sched_init(void) {
       idle_thread->cpu_affinity = ~0ULL;
     spinlock_release(&tid_lock);
   }
+  fpu_init_cpu();
 }
 
 /* Threads may keep a suspended sched_schedule() continuation on their kernel
@@ -520,6 +523,7 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
     next_t->state = THREAD_RUNNING;
     __atomic_store_n(&next_t->has_started, true, __ATOMIC_RELEASE);
     __atomic_store_n(&cpu->switching_from, prev, __ATOMIC_RELEASE);
+    fpu_on_context_switch();
     cpu->current_thread = next_t;
 
     cpu->stack_top = (next_t->stack_base + next_t->stack_size) & ~0xFULL;
@@ -706,13 +710,24 @@ __attribute__((optimize("O3"))) void sched_tick(struct registers *regs) {
         uint64_t earliest = __atomic_load_n(&earliest_itimer_deadline, __ATOMIC_RELAXED);
         if (earliest == 0 || now >= earliest) {
           extern spinlock_t tid_lock;
+          /* Same snapshot-then-wake order as posix_timer_tick/signal_send_pgid:
+           * queue the bit under tid_lock, wake after releasing it. Waking
+           * takes runqueue/wait-queue locks and must never run with tid_lock
+           * held (sys_kill hung this way). No kmalloc in tick context. */
+          struct thread *itimer_notify[64];
+          uint32_t itimer_notify_count = 0;
           spinlock_acquire(&tid_lock);
           uint64_t next_earliest = 0;
           struct thread *t = global_thread_list;
           while (t) {
             if (t->it_real_next) {
               if (now >= t->it_real_next) {
-                signal_send(t, SIGALRM);
+                uint64_t bit = 1ULL << (SIGALRM - 1);
+                t->pending_signals |= bit;
+                /* signal_send() records sender as current; in tick context
+                 * there is no sender, keep any existing SI_USER info. */
+                if (itimer_notify_count < 64)
+                  itimer_notify[itimer_notify_count++] = t;
                 if (t->it_real_interval) {
                   t->it_real_next = now + t->it_real_interval;
                   lapic_timer_rearm_if_earlier(t->it_real_next);
@@ -732,6 +747,8 @@ __attribute__((optimize("O3"))) void sched_tick(struct registers *regs) {
           }
           __atomic_store_n(&earliest_itimer_deadline, next_earliest, __ATOMIC_RELAXED);
           spinlock_release(&tid_lock);
+          for (uint32_t k = 0; k < itimer_notify_count; k++)
+            signal_notify_thread(itimer_notify[k], SIGALRM);
         }
       }
     }
@@ -931,8 +948,9 @@ bool sched_prepare_thread_reap(struct thread *t) {
 __attribute__((optimize("O3"))) void sched_wakeup(struct thread *t) {
   if (!t || t->is_idle || t->state == THREAD_DEAD || t->state == THREAD_ZOMBIE)
     return;
-  if (t->state == THREAD_READY || t->state == THREAD_RUNNING)
-    return; // Already runnable, nothing to do
+  /* The blocked-state publication and wake decision must share queue_lock.
+   * A runnable check here races a waiter which already consumed its wake
+   * flag but has not yet stored BLOCKED/SLEEPING under that lock. */
 
   hal_irq_state_t rflags = hal_irq_save();
 

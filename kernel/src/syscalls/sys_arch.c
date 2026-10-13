@@ -38,9 +38,8 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a2,
   switch (code) {
   case ARCH_SET_FS:
     if (!is_canonical_user_addr(addr)) {
-      klog_puts("[ARCH_PRCTL] Reject non-canonical SET_FS = ");
-      klog_uint64(addr);
-      klog_puts("\n");
+      klogf("[ARCH_PRCTL] Reject non-canonical SET_FS = %llu\n",
+            (unsigned long long)addr);
       return (uint64_t)-22; // -EINVAL
     }
     wrmsr(IA32_FS_BASE, addr);
@@ -57,17 +56,12 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a2,
       static uint32_t setfs_dumps;
       if (setfs_dumps < 4) {
         setfs_dumps++;
-        klog_puts("[ARCH_PRCTL] SET_FS = ");
-        klog_uint64(addr);
-        klog_puts(" (MSR readback=");
-        klog_hex64(rdmsr(IA32_FS_BASE));
-        klog_puts(", thread->fs_base=");
-        {
-          extern struct thread *sched_get_current(void);
-          struct thread *cur2 = sched_get_current();
-          klog_hex64(cur2 ? cur2->fs_base : 0);
-        }
-        klog_puts(")\n");
+        struct thread *cur2 = sched_get_current();
+        klogf("[ARCH_PRCTL] SET_FS = %llu (MSR readback=0x%016llX, "
+              "thread->fs_base=0x%016llX)\n",
+              (unsigned long long)addr,
+              (unsigned long long)rdmsr(IA32_FS_BASE),
+              (unsigned long long)(cur2 ? cur2->fs_base : 0));
       }
     }
     return 0;
@@ -97,9 +91,6 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a2,
       if (cur)
         cur->gs_base = addr;
     }
-    klog_puts("[ARCH_PRCTL] SET_GS = ");
-    klog_uint64(addr);
-    klog_puts("\n");
     return 0;
 
   case ARCH_GET_GS:

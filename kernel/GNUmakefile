@@ -262,6 +262,21 @@ ifneq ($(linux-obj-y),)
     # the real Linux headers.  See the pattern rules below.
     KPI_SRCFILES := $(shell find -L linuxkpi/src -type f -name '*.c' 2>/dev/null | LC_ALL=C sort)
     KPI_OBJ := $(addprefix obj-$(ARCH)/,$(KPI_SRCFILES:.c=.c.o))
+    # AvoryOS owns the AMD userspace allocation entry point. Keep the
+    # imported implementation pristine and compile it under its bridge name.
+    ifeq ($(KPI_AMDGPU),1)
+    obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c.o: override LINUX_CPPFLAGS += -Damdgpu_gem_create_ioctl=linuxkpi_amdgpu_gem_create_ioctl
+    obj-$(ARCH)/linuxkpi/src/amdgpu_memory.c.o: override LINUX_CPPFLAGS += \
+        -DAVORYOS_AMDGPU_MEMORY_POLICY \
+        -Ilinux/drivers/gpu/drm/amd/amdgpu \
+        -Ilinux/drivers/gpu/drm/amd/include \
+        -Ilinux/drivers/gpu/drm/amd/pm/inc \
+        -Ilinux/drivers/gpu/drm/amd/display \
+        -Ilinux/drivers/gpu/drm/amd/display/include \
+        -Ilinux/drivers/gpu/drm/amd/display/modules/inc \
+        -Ilinux/drivers/gpu/drm/amd/display/dc \
+        -Ilinux/drivers/gpu/drm/amd/display/amdgpu_dm
+    endif
     LINUX_TEST_SRCFILES := $(shell find -L src/tests/linuxkpi/linux -type f -name '*.c' 2>/dev/null | LC_ALL=C sort)
     LINUX_TEST_OBJ := $(addprefix obj-$(ARCH)/,$(LINUX_TEST_SRCFILES:.c=.c.o))
 endif

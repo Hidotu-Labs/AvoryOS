@@ -25,6 +25,34 @@ struct partition_meta {
     uint8_t partition_type;     /* enum partition_type */
 };
 
+/* Millisecond elapsed-time samples; buckets: <1, <2, <4, <8, <16,
+ * <32, <64, >=64 ms. Counts include failures, totals overlap across CPUs. */
+struct storage_latency {
+    uint64_t count, total_ms, max_ms, errors, buckets[8];
+};
+static inline void storage_latency_record(struct storage_latency *s,
+                                          uint64_t ms, bool failed) {
+    __atomic_add_fetch(&s->count, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&s->total_ms, ms, __ATOMIC_RELAXED);
+    if (failed) __atomic_add_fetch(&s->errors, 1, __ATOMIC_RELAXED);
+    uint64_t old = __atomic_load_n(&s->max_ms, __ATOMIC_RELAXED);
+    while (old < ms && !__atomic_compare_exchange_n(&s->max_ms, &old, ms,
+             false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    unsigned bucket = 0;
+    while (bucket < 7 && ms >= (1ULL << bucket)) bucket++;
+    __atomic_add_fetch(&s->buckets[bucket], 1, __ATOMIC_RELAXED);
+}
+
+static inline void storage_latency_snapshot(const struct storage_latency *s,
+                                            struct storage_latency *out) {
+    out->count = __atomic_load_n(&s->count, __ATOMIC_RELAXED);
+    out->total_ms = __atomic_load_n(&s->total_ms, __ATOMIC_RELAXED);
+    out->max_ms = __atomic_load_n(&s->max_ms, __ATOMIC_RELAXED);
+    out->errors = __atomic_load_n(&s->errors, __ATOMIC_RELAXED);
+    for (unsigned i = 0; i < 8; i++)
+        out->buckets[i] = __atomic_load_n(&s->buckets[i], __ATOMIC_RELAXED);
+}
+
 struct block_device {
     char name[16];              // e.g. "ata0", "ata1"
     uint32_t sector_size;       // Usually 512
@@ -59,6 +87,11 @@ struct block_device {
     uint64_t stat_read_sectors; // 512B sectors read
     uint64_t stat_writes;       // completed write operations
     uint64_t stat_write_sectors;// 512B sectors written
+
+    /* Actual submitted NVMe commands, including retries and failures.
+     * Namespace-only: partition forwarding does not double-count these. */
+    uint64_t hw_reads, hw_writes, hw_read_bytes, hw_write_bytes, hw_errors;
+    struct storage_latency hw_flush;
 
     // Partition metadata (if this device is a partition)
     char partuuid[37];          // Null-terminated PARTUUID string

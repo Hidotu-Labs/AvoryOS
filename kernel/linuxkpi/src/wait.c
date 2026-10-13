@@ -51,10 +51,10 @@ void prepare_to_wait(wait_queue_head_t *q, struct wait_queue_entry *wq_entry,
                      int state) {
   unsigned long flags;
 
-  (void)state;
   spin_lock_irqsave(&q->lock, flags);
   if (list_empty(&wq_entry->entry))
     list_add(&wq_entry->entry, &q->head);
+  set_current_state(state);
   spin_unlock_irqrestore(&q->lock, flags);
 }
 
@@ -65,6 +65,7 @@ int prepare_to_wait_event(wait_queue_head_t *q,
   spin_lock_irqsave(&q->lock, flags);
   if (list_empty(&wq_entry->entry))
     list_add(&wq_entry->entry, &q->head);
+  set_current_state(state);
   spin_unlock_irqrestore(&q->lock, flags);
 
   if (___wait_is_interruptible(state) && signal_pending(current))
@@ -74,6 +75,8 @@ int prepare_to_wait_event(wait_queue_head_t *q,
 
 void finish_wait(wait_queue_head_t *q, struct wait_queue_entry *wq_entry) {
   unsigned long flags;
+
+  __set_current_state(TASK_RUNNING);
 
   spin_lock_irqsave(&q->lock, flags);
   list_del_init(&wq_entry->entry);
