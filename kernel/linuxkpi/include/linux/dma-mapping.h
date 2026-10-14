@@ -74,7 +74,6 @@ u64 dma_get_required_mask(struct device *dev);
 size_t dma_max_mapping_size(struct device *dev);
 
 static inline int dma_coerce_mask_and_coherent(struct device *dev, u64 mask) {
-  dev->coherent_dma_mask = mask;
   return dma_set_mask_and_coherent(dev, mask);
 }
 
@@ -124,10 +123,8 @@ static inline void dma_unmap_page(struct device *dev, dma_addr_t addr,
   dma_unmap_page_attrs(dev, addr, size, dir, 0);
 }
 
-static inline int dma_map_sg(struct device *dev, struct scatterlist *sg,
-                             int nents, enum dma_data_direction dir) {
-  return nents;
-}
+int dma_map_sg(struct device *dev, struct scatterlist *sg,
+                int nents, enum dma_data_direction dir);
 
 static inline void dma_unmap_sg(struct device *dev, struct scatterlist *sg,
                                 int nents, enum dma_data_direction dir) {
@@ -144,6 +141,7 @@ static inline void dma_sync_sg_for_cpu(struct device *dev,
   (void)sg;
   (void)nents;
   (void)dir;
+  dma_mb();
 }
 
 static inline void dma_sync_sg_for_device(struct device *dev,
@@ -153,6 +151,7 @@ static inline void dma_sync_sg_for_device(struct device *dev,
   (void)sg;
   (void)nents;
   (void)dir;
+  __asm__ volatile("sfence" ::: "memory");
 }
 
 #endif /* __AVORY_LINUXKPI_DMA_MAPPING_H */

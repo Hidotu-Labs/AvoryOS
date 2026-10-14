@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess,tempfile,sys
 root=Path(__file__).resolve().parents[2]
 x=(root/'kernel/linuxkpi/src/x86_stubs.c').read_text()
-x=x[x.index('unsigned long cachemode2protval('):x.index('/* Uniprocessor percpu')]
+x=x[x.index('unsigned long cachemode2protval('):x.index('/* Strong override')]
 m=(root/'kernel/linuxkpi/src/mmap.c').read_text()
 m=m[m.index('static unsigned long kpi_vma_pte_flags('):m.index('\nvoid zap_vma_ptes(')]
 if len(sys.argv)>1:

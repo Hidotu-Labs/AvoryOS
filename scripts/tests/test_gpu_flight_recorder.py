@@ -50,6 +50,14 @@ static void command(const char *s){assert(gpu_diag_control(strlen(s),(void*)s)==
 static void *writer(void *arg){thread.tid=(uintptr_t)arg;for(int i=0;i<1000;i++)gpu_diag_record(GPU_DIAG_IOCTL,(void*)0xffff800000001900ULL,0xffffc00000000000ULL+i,0x7fffeffff000ULL,0x8000000000000006ULL,0xffff800012345678ULL,0);return NULL;}
 int main(void){
  command("1\n");
+ gpu_diag_record(GPU_DIAG_DMA_MAP,NULL,1,1,4096,0,0);assert(resource_count==0);
+ command("3");assert(gpu_diag_resource_enabled());
+ for(int i=0;i<2000;i++)gpu_diag_record(GPU_DIAG_DMA_MAP,(void*)(uintptr_t)i,i,i,4096,0,0);
+ assert(resource_count==1024&&!resource_left&&!gpu_diag_resource_enabled());
+ for(int i=0;i<3000;i++)gpu_diag_record(GPU_DIAG_IOCTL,NULL,0,0,0,0,0);
+ command("freeze");unsigned rn=gpu_diag_read(0,sizeof(text)-1,(void*)text);text[rn]=0;
+ assert(strstr(text,"resource_events=1024 resource_budget_left=0")&&strstr(text,"retained resource events")&&strstr(text,"DMA_MAP"));
+ command("1\n");
  for(int i=0;i<18;i++)gpu_diag_prime_error(GPU_PRIME_CPU_MAP,NULL,0,4096,-12);
  assert(prime_error_lines==18 && strstr(serial_text,"PRIME stage=7 detail=0x0 size=4096 error=-12 tid=12"));
  unsigned lines=0;char *cursor=serial_text;

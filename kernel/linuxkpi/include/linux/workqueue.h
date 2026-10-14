@@ -24,7 +24,7 @@ struct work_struct {
   struct list_head entry;
   work_func_t func;
   volatile int pending;
-  volatile int running;
+  volatile int running; /* Reserved; execution is tracked by the worker pool. */
   struct workqueue_struct *wq;
 };
 
@@ -78,6 +78,7 @@ static inline struct work_struct *current_work(void) { return NULL; }
 struct delayed_work {
   struct work_struct work;
   struct timer_list timer;
+  int canceling; /* Blocks callback rearm while sync cancellation drains work. */
 };
 
 void delayed_work_timer_fn(struct timer_list *t);
@@ -89,6 +90,7 @@ static inline struct delayed_work *to_delayed_work(struct work_struct *work) {
 #define INIT_DELAYED_WORK(_work, _func)                                       \
   do {                                                                        \
     INIT_WORK(&(_work)->work, (_func));                                       \
+    (_work)->canceling = 0;                                                   \
     timer_setup(&(_work)->timer, delayed_work_timer_fn, 0);                   \
   } while (0)
 #define INIT_DEFERRABLE_WORK(_work, _func) INIT_DELAYED_WORK(_work, _func)

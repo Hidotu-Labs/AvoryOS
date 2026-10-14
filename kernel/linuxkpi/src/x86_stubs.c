@@ -147,6 +147,17 @@ int set_pages_array_wb(struct page **pages, int count) {
   return kpi_set_pages_cache(pages, count, 0);
 }
 
+/* Strong override of the weak no-op in link_stubs.c. drm_cache.c calls this
+ * when X86_FEATURE_CLFLUSH is unavailable; returning success without flushing
+ * would leave CPU-written BO contents invisible to the GPU (stale texels).
+ * wbinvd writes back and invalidates the local caches. Upstream broadcasts
+ * via IPI; single-CPU execution here is a documented limitation, strictly
+ * better than a silent no-op. */
+int wbinvd_on_all_cpus(void) {
+  __asm__ volatile("wbinvd" ::: "memory");
+  return 0;
+}
+
 DEFINE_PER_CPU(struct cpuinfo_x86, cpu_info);
 
 /* ── boot CPU feature record ──────────────────────────────────────────────
@@ -191,6 +202,16 @@ void linuxkpi_x86_cpu_init(void) {
     kpi_cpuid(1, 0, &eax, &ebx, &ecx, &edx);
     boot_cpu_data.x86_capability[0] = edx;
     boot_cpu_data.x86_capability[4] = ecx;
+    /* arch/x86/kernel/cpu/common.c: EBX[15:8] * 8. drm_cache.c strides
+     * drm_clflush_page() by this value; zero would hang its page loop, so
+     * fall back to 64 (all x86_64 CPUs have a 64-byte line). */
+    {
+      u32 clflush = ((ebx >> 8) & 0xffu) * 8u;
+      if (!clflush)
+        clflush = 64;
+      boot_cpu_data.x86_clflush_size = (u16)clflush;
+      boot_cpu_data.x86_cache_alignment = (int)clflush;
+    }
   }
   if (max_leaf >= 7) {
     kpi_cpuid(7, 0, &eax, &ebx, &ecx, &edx);

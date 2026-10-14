@@ -13,16 +13,20 @@
 #include <linux/slab.h>
 #include <linux/log2.h>
 #include <linux/string.h>
+#include <linuxkpi/gpu_diag.h>
 
-/* Physical address behind a kernel virtual address, including vmalloc'd
- * buffers (which are physically contiguous only if size <= one page). */
+/* Identity DMA still has to fit the device's address mask. No bounce
+ * buffers/IOMMU translation exist: report failure instead of truncation. */
+static bool kpi_dma_range_ok(dma_addr_t addr, size_t size, u64 mask) {
+  return size && addr != DMA_MAPPING_ERROR && addr <= mask &&
+         size - 1 <= mask - addr;
+}
+
 static dma_addr_t kpi_dma_phys(const void *ptr) {
-  if (is_vmalloc_addr(ptr)) {
-    struct page *page = vmalloc_to_page(ptr);
-    if (!page)
-      return DMA_MAPPING_ERROR;
-    return page_to_phys(page) + offset_in_page(ptr);
-  }
+  /* dma_map_single requires directly mapped, physically contiguous memory;
+   * vmalloc buffers must use page/SG mapping instead. */
+  if (!ptr || is_vmalloc_addr(ptr))
+    return DMA_MAPPING_ERROR;
   return (dma_addr_t)(unsigned long)__pa(ptr);
 }
 
@@ -41,6 +45,8 @@ void *dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *dma_handle,
     return ZERO_SIZE_PTR;
   }
 
+  if (size > ~(size_t)0 - (PAGE_SIZE - 1))
+    return NULL;
   pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
   order = get_order(pages << PAGE_SHIFT);
 
@@ -51,6 +57,11 @@ void *dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *dma_handle,
   if (!page)
     return NULL;
 
+  if (!kpi_dma_range_ok(page_to_phys(page), size,
+                        dev ? dev->coherent_dma_mask : DMA_BIT_MASK(64))) {
+    __free_pages(page, order);
+    return NULL;
+  }
   if (dma_handle)
     *dma_handle = page_to_phys(page);
   return page_address(page);
@@ -93,8 +104,15 @@ dma_addr_t dma_map_page_attrs(struct device *dev, struct page *page,
   (void)dev;
   (void)dir;
   (void)attrs;
-  (void)size;
-  return (dma_addr_t)page_to_phys(page) + offset;
+  if (!page || offset > DMA_MAPPING_ERROR - page_to_phys(page))
+    return DMA_MAPPING_ERROR;
+  dma_addr_t addr = (dma_addr_t)page_to_phys(page) + offset;
+  dma_addr_t mapped = kpi_dma_range_ok(addr, size, dev ? dev->dma_mask : DMA_BIT_MASK(64))
+                          ? addr : DMA_MAPPING_ERROR;
+  if (gpu_diag_resource_enabled())
+    gpu_diag_record(GPU_DIAG_DMA_MAP, page, addr, mapped, size, offset,
+                    mapped == DMA_MAPPING_ERROR ? -EIO : 0);
+  return mapped;
 }
 
 void dma_unmap_page_attrs(struct device *dev, dma_addr_t addr, size_t size,
@@ -113,7 +131,9 @@ dma_addr_t dma_map_single_attrs(struct device *dev, void *ptr, size_t size,
   (void)size;
   (void)dir;
   (void)attrs;
-  return kpi_dma_phys(ptr);
+  dma_addr_t addr = kpi_dma_phys(ptr);
+  return kpi_dma_range_ok(addr, size, dev ? dev->dma_mask : DMA_BIT_MASK(64))
+             ? addr : DMA_MAPPING_ERROR;
 }
 
 /* Resource mapping is identity too (no IOMMU): amdgpu_vram_mgr maps VRAM
@@ -125,7 +145,8 @@ dma_addr_t dma_map_resource(struct device *dev, phys_addr_t phys_addr,
   (void)size;
   (void)dir;
   (void)attrs;
-  return (dma_addr_t)phys_addr;
+  return kpi_dma_range_ok(phys_addr, size, dev ? dev->dma_mask : DMA_BIT_MASK(64))
+             ? (dma_addr_t)phys_addr : DMA_MAPPING_ERROR;
 }
 
 void dma_unmap_resource(struct device *dev, dma_addr_t addr, size_t size,
@@ -146,19 +167,37 @@ void dma_unmap_single_attrs(struct device *dev, dma_addr_t addr, size_t size,
   (void)attrs;
 }
 
-int dma_map_sgtable(struct device *dev, struct sg_table *sgt,
-                    enum dma_data_direction dir, unsigned long attrs) {
+int dma_map_sg(struct device *dev, struct scatterlist *sgl, int nents,
+               enum dma_data_direction dir) {
   struct scatterlist *sg;
   int i;
-
-  (void)dev;
-  (void)dir;
-
-  for_each_sgtable_sg(sgt, sg, i) {
-    sg->dma_address = (dma_addr_t)page_to_phys(sg_page(sg)) + sg->offset;
+  if (!sgl || nents <= 0)
+    return 0;
+  for_each_sg(sgl, sg, nents, i) {
+    dma_addr_t addr = dma_map_page_attrs(dev, sg_page(sg), sg->offset,
+                                         sg->length, dir, 0);
+    if (addr == DMA_MAPPING_ERROR) {
+      for_each_sg(sgl, sg, nents, i) {
+        sg->dma_address = DMA_MAPPING_ERROR;
+        sg->dma_length = 0;
+      }
+      return 0;
+    }
+    sg->dma_address = addr;
     sg->dma_length = sg->length;
   }
-  return 0; /* dma_map_sgtable uses errno semantics, unlike dma_map_sg. */
+  return nents;
+}
+
+int dma_map_sgtable(struct device *dev, struct sg_table *sgt,
+                    enum dma_data_direction dir, unsigned long attrs) {
+  int mapped;
+  (void)attrs;
+  if (!sgt || !sgt->sgl || !sgt->orig_nents)
+    return -EINVAL;
+  mapped = dma_map_sg(dev, sgt->sgl, sgt->orig_nents, dir);
+  sgt->nents = mapped;
+  return mapped ? 0 : -EIO;
 }
 
 void dma_unmap_sgtable(struct device *dev, struct sg_table *sgt,
@@ -219,7 +258,7 @@ int dma_set_mask(struct device *dev, u64 mask) {
 }
 
 int dma_set_coherent_mask(struct device *dev, u64 mask) {
-  if (!dev)
+  if (!dev || mask < 0xFFFFFFFFULL)
     return -EIO;
   dev->coherent_dma_mask = mask;
   return 0;

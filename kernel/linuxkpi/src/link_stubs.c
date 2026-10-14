@@ -89,9 +89,13 @@ __attribute__((weak)) int set_pages_array_wc(struct page **pages,
 __attribute__((weak)) int wbinvd_on_all_cpus(void) { return 0; }
 
 /* Kbuild initializes this from the boot CPU; a zeroed record is enough for
- * the cache-line macros imported code uses. */
+ * the cache-line macros imported code uses.  Default the flush stride to 64
+ * so early drm_clflush_pages() callers before linuxkpi_x86_cpu_init() cannot
+ * observe a zero step (which would hang in the page loop); the init below
+ * replaces it with the CPUID value. */
 struct cpuinfo_x86 boot_cpu_data = {
     .x86_cache_alignment = 64,
+    .x86_clflush_size = 64,
 };
 
 unsigned long __default_kernel_pte_mask = ~0UL;

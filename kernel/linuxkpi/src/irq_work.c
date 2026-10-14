@@ -5,6 +5,7 @@
  * re-entered" contract; callbacks are serialized. */
 
 #include <linux/irq_work.h>
+#include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -16,13 +17,18 @@
 static DEFINE_SPINLOCK(irq_work_lock);
 static struct irq_work *irq_work_head;
 static struct irq_work *irq_work_tail;
+/* Currently executing work, for irq_work_sync(). Stored separately from the
+ * work object so the kthread never touches a callback that freed itself
+ * (the test callbacks free immediately; in-kernel fence-array completion
+ * defers via kfree_rcu, but the same rule keeps both safe). */
+static struct irq_work *irq_work_current;
 static struct wait_queue_head irq_work_wait;
 static struct kpi_service irq_work_svc;
 
 void init_irq_work(struct irq_work *work, void (*func)(struct irq_work *)) {
   work->next = NULL;
   work->func = func;
-  work->queued = 0;
+  __atomic_store_n(&work->queued, 0, __ATOMIC_RELEASE);
 }
 
 bool irq_work_queue(struct irq_work *work) {
@@ -32,11 +38,11 @@ bool irq_work_queue(struct irq_work *work) {
     return false;
 
   spin_lock_irqsave(&irq_work_lock, flags);
-  if (work->queued) {
+  if (__atomic_load_n(&work->queued, __ATOMIC_ACQUIRE)) {
     spin_unlock_irqrestore(&irq_work_lock, flags);
     return false;
   }
-  work->queued = 1;
+  __atomic_store_n(&work->queued, 1, __ATOMIC_RELEASE);
   work->next = NULL;
   if (irq_work_tail) {
     irq_work_tail->next = work;
@@ -82,24 +88,44 @@ static int irq_work_kthread(void *arg) {
         irq_work_tail = NULL;
       work->next = NULL;
       /* Drop the pending claim before execution, as Linux irq_work does.
-       * Fence-chain callbacks can requeue this same object while executing.
-       * Fence-array completion can drop its final reference and free it via
-       * RCU on another CPU: task context does not provide an IRQ's implicit
-       * RCU protection, so do not touch the object after calling its func. */
-      work->queued = 0;
+       * Fence-chain callbacks can requeue this same object while executing;
+       * a requeue sets queued again and is picked up on a later pass.
+       * Publish the running instance separately: the callback may free its
+       * own object (test callbacks do immediately; fence-array completion
+       * defers via kfree_rcu), so never touch *work after func() returns. */
+      __atomic_store_n(&work->queued, 0, __ATOMIC_RELEASE);
+      __atomic_store_n(&irq_work_current, work, __ATOMIC_RELEASE);
     }
     func = work ? work->func : NULL;
     spin_unlock_irqrestore(&irq_work_lock, flags);
 
     if (func)
       func(work);
+    if (work) {
+      spin_lock_irqsave(&irq_work_lock, flags);
+      /* Clears only the side record, never the (possibly freed) object. */
+      __atomic_store_n(&irq_work_current, NULL, __ATOMIC_RELEASE);
+      spin_unlock_irqrestore(&irq_work_lock, flags);
+    }
   }
 }
 
 void irq_work_sync(struct irq_work *work) {
-  /* Not used by the current import set.  A correct implementation needs a
-   * per-work completion; assert instead of pretending. */
-  (void)work;
+  unsigned long flags;
+  bool busy;
+  if (!work)
+    return;
+  /* Queue -> running and callback requeue -> completion must be observed
+   * as one snapshot. Separate loads can miss a requeue made by a callback
+   * between the queued load and the current load. The caller must keep the
+   * object alive and exclude new external producers before teardown. */
+  do {
+    spin_lock_irqsave(&irq_work_lock, flags);
+    busy = work->queued || irq_work_current == work;
+    spin_unlock_irqrestore(&irq_work_lock, flags);
+    if (busy)
+      msleep(1);
+  } while (busy);
 }
 
 void linuxkpi_irq_work_init(void) {

@@ -36,6 +36,9 @@ struct linuxkpi_pci_info {
 /* Number of enumerated native devices. */
 int linuxkpi_pci_native_count(void);
 
+/* Accessible config bytes: 4096 for ECAM, 256 for CF8/CFC. */
+int linuxkpi_pci_config_size(void *handle);
+
 /* Suspend bound imported devices before native reboot/power-off. */
 void linuxkpi_pci_shutdown(void);
 

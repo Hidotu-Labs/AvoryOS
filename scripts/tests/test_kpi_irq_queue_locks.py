@@ -14,7 +14,7 @@ spin_types=strip_includes((root/'kernel/linuxkpi/include/linux/spinlock_types.h'
 spin=strip_includes((root/'kernel/linuxkpi/include/linux/spinlock.h').read_text())
 service=strip_includes((root/'kernel/linuxkpi/src/service.c').read_text())
 wq=(root/'kernel/linuxkpi/src/workqueue.c').read_text()
-wq='\n'.join(function(wq,x) for x in ['static void wq_ensure_worker(', 'static bool __queue_work(', 'bool cancel_work_sync('])
+wq='\n'.join(function(wq,x) for x in ['static bool kpi_work_running(', 'static void wq_ensure_worker(', 'static bool __queue_work(', 'bool cancel_work_sync('])
 kt=(root/'kernel/linuxkpi/src/kthread.c').read_text()
 kt='\n'.join(function(kt,x) for x in ['static void kthread_worker_spawn(', 'bool kthread_queue_work(', 'bool kthread_cancel_work_sync('])
 pre=r'''
@@ -60,6 +60,7 @@ shim=r'''
 #define kfree free
 #define kmalloc(n,g) malloc(n)
 #define wait_event(w,c) assert(c)
+#define msleep(n) ((void)(n))
 struct list_head{struct list_head *next,*prev;};
 #define container_of(p,t,m) ((t*)((char*)(p)-offsetof(t,m)))
 #define list_first_entry(h,t,m) container_of((h)->next,t,m)
@@ -82,7 +83,7 @@ static void __kpi_wake_up(struct wait_queue_head *w,int n,int k){(void)w;(void)n
 static void wake_up(struct wait_queue_head *w){(void)w;}
 struct workqueue_struct;
 struct work_struct{struct list_head entry;void(*func)(struct work_struct*);int pending,running;struct workqueue_struct *wq;};
-struct workqueue_struct{char *name;struct list_head pending;spinlock_t lock;struct wait_queue_head more_work,flush_wait;unsigned active,gen;int max_workers;unsigned nr_workers;struct task_struct *workers[4];};
+struct workqueue_struct{char *name;struct list_head pending;spinlock_t lock;struct wait_queue_head more_work,flush_wait;unsigned active,gen;int max_workers;unsigned nr_workers;struct task_struct *workers[4];struct work_struct *current_work[4];};
 struct wq_worker{struct workqueue_struct *wq;int idx;};
 struct kthread_worker;
 struct kthread_work{struct list_head node;void(*func)(struct kthread_work*);struct kthread_worker *worker;struct completion done;int queued;};

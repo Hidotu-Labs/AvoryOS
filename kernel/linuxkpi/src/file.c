@@ -750,6 +750,8 @@ int linuxkpi_vma_fault(void *w, unsigned long addr, unsigned long error) {
     __asm__ volatile("pause");
   }
   seq0 = __atomic_load_n(&b->seq, __ATOMIC_ACQUIRE);
+  if (seq0 & 1)
+    return KPI_VM_FAULT_REJECT; /* never consume an unfinished rebase */
 
   /* Linux's handle_mm_fault() passes a page-aligned address to
    * vm_ops->fault(); hardware CR2 carries the exact faulting offset.  A
@@ -769,6 +771,9 @@ int linuxkpi_vma_fault(void *w, unsigned long addr, unsigned long error) {
 
   ret = b->vma.vm_ops->fault(&vmf);
   gpu_diag_record(GPU_DIAG_FAULT,b,aligned,vmf.pgoff,seq0,error,ret);
+  if (gpu_diag_resource_enabled())
+    gpu_diag_record(GPU_DIAG_CPU_VMA, b, (uintptr_t)b->vma.vm_private_data,
+                    aligned, vmf.pgoff, error, ret);
   if (ret & (VM_FAULT_ERROR))
     return KPI_VM_FAULT_REJECT;
   /* The driver slept (TTM dma-fence wait) with IRQs open; a concurrent

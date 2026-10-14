@@ -20,28 +20,46 @@ struct gpu_diag_entry {
 static struct gpu_diag_entry entries[GPU_DIAG_CAPACITY];
 static struct gpu_diag_entry anomalies[32];
 static struct gpu_diag_entry pixel_checks[64];
+static struct gpu_diag_entry resource_checks[1024];
+static unsigned int resource_left;
+static uint64_t resource_count;
 static spinlock_t diag_lock = {0};
 static unsigned int level = 1, samples;
 static unsigned int prime_error_lines;
-static uint64_t sequence, seen[GPU_DIAG_CACHE_CHECK + 1], changed, mismatch;
+static uint64_t sequence, seen[GPU_DIAG_MAX + 1], changed, mismatch;
 static uint64_t cache_bad, anomaly_count;
 static const char *const names[] = {"?", "IOCTL", "CS_IN", "CS_OUT", "CACHE",
   "MAP", "FAULT", "IMPORT", "CPU_BEGIN", "CPU_END", "FENCE", "COPY_LAYOUT",
-  "COPY_CHECK", "PRESENT", "CACHE_CHECK"};
+  "COPY_CHECK", "PRESENT", "CACHE_CHECK", "BO_HANDLE", "BO_BACKING", "VM_BIND",
+  "VM_UPDATE", "PAGE_BIND", "DMA_MAP", "PAGE_ALLOC", "PAGE_FREE",
+  "FENCE_EMIT", "FENCE_SIGNAL", "RESV_FENCE", "VM_OFFSET", "CPU_VMA"};
 
 unsigned int gpu_diag_level(void) { return __atomic_load_n(&level, __ATOMIC_RELAXED); }
+int gpu_diag_resource_enabled(void) {
+  return gpu_diag_level() == 3 &&
+         __atomic_load_n(&resource_left, __ATOMIC_RELAXED) != 0;
+}
 void gpu_diag_record(unsigned int kind, const void *object, uint64_t a, uint64_t b,
                      uint64_t c, uint64_t d, long result) {
-  if (!gpu_diag_level() || !kind || kind > GPU_DIAG_CACHE_CHECK) return;
+  if (!gpu_diag_level() || !kind || kind > GPU_DIAG_MAX) return;
   struct thread *t = sched_get_current();
   struct gpu_diag_entry e = {.ms=lapic_timer_get_ms(), .object=(uintptr_t)object,
     .a=a, .b=b, .c=c, .d=d, .result=result, .kind=kind, .tid=t ? t->tid : 0};
   spinlock_acquire(&diag_lock);
   /* A freeze racing this producer must remain a freeze. */
   if (level) {
+    if (kind >= GPU_DIAG_BO_HANDLE) {
+      if (level != 3 || !resource_left) {
+        spinlock_release(&diag_lock);
+        return;
+      }
+      __atomic_sub_fetch(&resource_left, 1, __ATOMIC_RELAXED);
+    }
     e.seq = ++sequence;
     entries[(e.seq-1) % GPU_DIAG_CAPACITY] = e;
     seen[kind]++;
+    if (kind >= GPU_DIAG_BO_HANDLE)
+      resource_checks[resource_count++ % 1024] = e;
     if (kind == GPU_DIAG_COPY_CHECK) {
       pixel_checks[(seen[kind]-1)%64] = e;
       changed += !!(result & 1);
@@ -98,20 +116,25 @@ static void emit(unsigned int offset, unsigned int size, unsigned char *out,
 }
 unsigned int gpu_diag_read(unsigned int offset, unsigned int size, unsigned char *buffer) {
   if (!size || !buffer) return 0;
-  char line[280]; uint64_t position=0, end, counts[GPU_DIAG_CACHE_CHECK+1], unstable, bad;
-  unsigned int copied=0, mode, remaining;
+  char line[280]; uint64_t position=0, end, counts[GPU_DIAG_MAX+1], unstable, bad;
+  unsigned int copied=0, mode, remaining, resource_remaining;
+  uint64_t resource_end;
   uint64_t wrong_cache, pinned;
   spinlock_acquire(&diag_lock);
   end=sequence; mode=level; remaining=__atomic_load_n(&samples,__ATOMIC_RELAXED); unstable=changed; bad=mismatch;
   memcpy(counts, seen, sizeof counts);
   wrong_cache=cache_bad; pinned=anomaly_count;
+  resource_end=resource_count; resource_remaining=resource_left;
   spinlock_release(&diag_lock);
   snprintf(line,sizeof line,"GPUDBG v1 mode=%u samples_left=%u events=%llu overwritten=%llu source_changed=%llu stable_copy_mismatch=%llu cache_mismatch=%llu anomalies=%llu\n",
     mode,remaining,(unsigned long long)end,(unsigned long long)(end>GPU_DIAG_CAPACITY?end-GPU_DIAG_CAPACITY:0),
     (unsigned long long)unstable,(unsigned long long)bad,(unsigned long long)wrong_cache,(unsigned long long)pinned);
   emit(offset,size,buffer,&position,&copied,line);
-  emit(offset,size,buffer,&position,&copied,"commands: 1=reset metadata; 2=reset metadata+64 pixel checks; freeze=retain; dump=freeze+serial; 0=stop; clear=reset stopped\n");
-  for (unsigned int k=1; k<=GPU_DIAG_CACHE_CHECK; k++) {
+  emit(offset,size,buffer,&position,&copied,"commands: 1=reset metadata; 2=reset metadata+64 pixel checks; 3=reset metadata+1024 resource events; freeze=retain; dump=freeze+serial; 0=stop; clear=reset stopped\n");
+  snprintf(line,sizeof line,"resource_events=%llu resource_budget_left=%u (mode 3 only; retained before ring overwrite)\n",
+           (unsigned long long)resource_end,resource_remaining);
+  emit(offset,size,buffer,&position,&copied,line);
+  for (unsigned int k=1; k<=GPU_DIAG_MAX; k++) {
     snprintf(line,sizeof line,"count %s=%llu\n",names[k],(unsigned long long)counts[k]);
     emit(offset,size,buffer,&position,&copied,line);
   }
@@ -126,6 +149,16 @@ unsigned int gpu_diag_read(unsigned int offset, unsigned int size, unsigned char
     spinlock_acquire(&diag_lock);e=pixel_checks[i%64];spinlock_release(&diag_lock);
     snprintf(line,sizeof line,"sample %llu %llu %u COPY_CHECK %llx %llx %llx %llx %llx %ld\n",
       (unsigned long long)e.seq,(unsigned long long)e.ms,e.tid,
+      (unsigned long long)e.object,(unsigned long long)e.a,(unsigned long long)e.b,
+      (unsigned long long)e.c,(unsigned long long)e.d,e.result);
+    emit(offset,size,buffer,&position,&copied,line);
+  }
+  emit(offset,size,buffer,&position,&copied,"retained resource events (budget 1024):\n");
+  for (uint64_t i=0; i<resource_end && copied<size; i++) {
+    struct gpu_diag_entry e;
+    spinlock_acquire(&diag_lock);e=resource_checks[i%1024];spinlock_release(&diag_lock);
+    snprintf(line,sizeof line,"resource %llu %llu %u %s %llx %llx %llx %llx %llx %ld\n",
+      (unsigned long long)e.seq,(unsigned long long)e.ms,e.tid,names[e.kind],
       (unsigned long long)e.object,(unsigned long long)e.a,(unsigned long long)e.b,
       (unsigned long long)e.c,(unsigned long long)e.d,e.result);
     emit(offset,size,buffer,&position,&copied,line);
@@ -195,14 +228,17 @@ unsigned int gpu_diag_control(unsigned int size, const unsigned char *buffer) {
   if (!strcmp(cmd,"dump")) { gpu_diag_dump(); return original_size; }
   if (!strcmp(cmd,"1")) { next=1; reset=true; }
   else if (!strcmp(cmd,"2")) { next=2; reset=true; }
+  else if (!strcmp(cmd,"3")) { next=3; reset=true; }
   else if (!strcmp(cmd,"clear")) reset=true;
   else if (strcmp(cmd,"0") && strcmp(cmd,"freeze")) return 0;
   spinlock_acquire(&diag_lock);
-  if (reset) { sequence=changed=mismatch=cache_bad=anomaly_count=0; memset(entries,0,sizeof entries); memset(seen,0,sizeof seen); memset(anomalies,0,sizeof anomalies); memset(pixel_checks,0,sizeof pixel_checks); }
+  if (reset) { sequence=changed=mismatch=cache_bad=anomaly_count=resource_count=0; memset(entries,0,sizeof entries); memset(seen,0,sizeof seen); memset(anomalies,0,sizeof anomalies); memset(pixel_checks,0,sizeof pixel_checks); memset(resource_checks,0,sizeof resource_checks); }
   __atomic_store_n(&samples,next==2?64:0,__ATOMIC_RELAXED);
+  if (reset)
+    __atomic_store_n(&resource_left,next==3?1024:0,__ATOMIC_RELAXED);
   __atomic_store_n(&level,next,__ATOMIC_RELAXED);
   spinlock_release(&diag_lock);
-  klog_puts(next==2?"[GPUDBG] armed 64 pixel checks (changes timing)\n":
+  klog_puts(next==3?"[GPUDBG] armed 1024 resource events (changes timing)\n":next==2?"[GPUDBG] armed 64 pixel checks (changes timing)\n":
             next==1?"[GPUDBG] recording metadata\n":"[GPUDBG] recording frozen/stopped\n");
   return original_size;
 }

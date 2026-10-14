@@ -56,7 +56,7 @@ void si_meminfo(struct sysinfo *val);        /* linuxkpi/src/mm_extra.c */
 /* Upstream takes enum fault_flag; struct vm_fault::flags is unsigned int in
  * both trees, so keep the wider type to avoid implicit-conversion warnings. */
 static inline bool fault_flag_allow_retry_first(unsigned int flags) {
-  return (flags & FAULT_FLAG_ALLOW_RETRY) && (flags & FAULT_FLAG_TRIED);
+  return (flags & FAULT_FLAG_ALLOW_RETRY) && !(flags & FAULT_FLAG_TRIED);
 }
 
 /* Upstream helper used by page iterators; the mem_map is flat here. */
@@ -223,21 +223,24 @@ void vma_set_file(struct vm_area_struct *vma, struct file *file);
 
 typedef int vm_fault_t;
 
-#define VM_FAULT_RETRY 0x000001
+/* Match Linux 6.6 enum vm_fault_reason. These are a bitmask, not errno. */
+#define VM_FAULT_OOM 0x000001
+#define VM_FAULT_SIGBUS 0x000002
+#define VM_FAULT_MAJOR 0x000004
+#define VM_FAULT_HWPOISON 0x000010
+#define VM_FAULT_HWPOISON_LARGE 0x000020
+#define VM_FAULT_SIGSEGV 0x000040
 #define VM_FAULT_NOPAGE 0x000100
 #define VM_FAULT_LOCKED 0x000200
-#define VM_FAULT_SIGBUS 0x000004
-#define VM_FAULT_SIGSEGV 0x000008
-#define VM_FAULT_OOM 0x000002
-#define VM_FAULT_WRITE 0x000010
-#define VM_FAULT_HWPOISON 0x001000
-#define VM_FAULT_FALLBACK 0x008000
-#define VM_FAULT_DONE_COW 0x010000
-#define VM_FAULT_NEEDDSYNC 0x020000
-#define VM_FAULT_COMPLETED 0x040000
+#define VM_FAULT_RETRY 0x000400
+#define VM_FAULT_FALLBACK 0x000800
+#define VM_FAULT_DONE_COW 0x001000
+#define VM_FAULT_NEEDDSYNC 0x002000
+#define VM_FAULT_COMPLETED 0x004000
+#define VM_FAULT_HINDEX_MASK 0x0f0000
 #define VM_FAULT_ERROR                                                        \
   (VM_FAULT_OOM | VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV | VM_FAULT_HWPOISON |   \
-   VM_FAULT_FALLBACK)
+   VM_FAULT_HWPOISON_LARGE | VM_FAULT_FALLBACK)
 
 #define FAULT_FLAG_WRITE 0x00000001
 #define FAULT_FLAG_RETRY_NOWAIT 0x00000008

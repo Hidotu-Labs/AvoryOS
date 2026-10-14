@@ -694,3 +694,12 @@ runners were removed after validation. Earlier evidence paths above are
 historical and may no longer exist. Final `prime-owned-memory` logs and its
 greeter screenshot, plus `prime-tlb` validation logs, are retained. The live
 `p6-c7-prime.log`, main disk and boot ISO are not cleanup targets.
+
+### Rendering corruption audit (2026-10-13)
+
+See [the rendering corruption investigation](radeonsi-corruption-investigation.md)
+for confirmed driver-fault and sequence contract fixes, mode-3 bounded resource
+tracing, and exact guest validation commands. `make gpu-diagnostics` packages the
+new fog-free `test_gpu_corruption` pixel oracle. Host regressions and llvmpipe
+controls pass; Minecraft and RadeonSI rendering remain unvalidated on the new
+kernel. Build the ISO before the next user-controlled hardware boot.

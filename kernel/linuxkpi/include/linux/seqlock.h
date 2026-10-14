@@ -15,7 +15,13 @@ static inline void seqlock_init(seqlock_t *sl) {
 }
 
 static inline unsigned int read_seqbegin(const seqlock_t *sl) {
-  return __atomic_load_n(&sl->sequence, __ATOMIC_ACQUIRE);
+  unsigned int seq;
+  do {
+    seq = __atomic_load_n(&sl->sequence, __ATOMIC_ACQUIRE);
+    if (seq & 1)
+      __asm__ volatile("pause" ::: "memory");
+  } while (seq & 1);
+  return seq;
 }
 
 static inline bool read_seqretry(const seqlock_t *sl, unsigned int start) {
@@ -64,7 +70,13 @@ static inline void write_seqcount_end(seqcount_t *s) {
   __atomic_store_n(&s->sequence, seq + 1, __ATOMIC_RELAXED);
 }
 static inline unsigned int read_seqcount_begin(const seqcount_t *s) {
-  return __atomic_load_n(&s->sequence, __ATOMIC_ACQUIRE);
+  unsigned int seq;
+  do {
+    seq = __atomic_load_n(&s->sequence, __ATOMIC_ACQUIRE);
+    if (seq & 1)
+      __asm__ volatile("pause" ::: "memory");
+  } while (seq & 1);
+  return seq;
 }
 static inline bool read_seqcount_retry(const seqcount_t *s,
                                        unsigned int start) {

@@ -8,6 +8,8 @@
 #ifdef AVORYOS_AMDGPU_MEMORY_POLICY
 #include "amdgpu.h"
 #include "amdgpu_gem.h"
+#include "amdgpu_object.h"
+#include <linuxkpi/gpu_diag.h>
 
 extern int linuxkpi_amdgpu_gem_create_ioctl(struct drm_device *dev, void *data,
                                           struct drm_file *file);
@@ -16,6 +18,7 @@ int amdgpu_gem_create_ioctl(struct drm_device *dev, void *data,
                             struct drm_file *file) {
     struct amdgpu_device *adev = drm_to_adev(dev);
     union drm_amdgpu_gem_create *args = data;
+    u64 domains = args->in.domains;
     u64 requested_flags = args->in.domain_flags;
     int ret;
 
@@ -32,6 +35,14 @@ int amdgpu_gem_create_ioctl(struct drm_device *dev, void *data,
     ret = linuxkpi_amdgpu_gem_create_ioctl(dev, data, file);
     /* Only the handle occupies the output union; preserve the caller's
      * unused input flags in the rest of the returned argument copy. */
+    if (!ret && gpu_diag_resource_enabled()) {
+        struct drm_gem_object *obj = drm_gem_object_lookup(file, args->out.handle);
+        if (obj) {
+            gpu_diag_record(GPU_DIAG_BO_HANDLE, gem_to_amdgpu_bo(obj),
+                            (uintptr_t)file, args->out.handle, obj->size, domains, 0);
+            drm_gem_object_put(obj);
+        }
+    }
     args->in.domain_flags = requested_flags;
     return ret;
 }

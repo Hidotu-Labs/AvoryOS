@@ -612,6 +612,11 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       return 0;
     }
     vma_linux_put(vma_linux);
+    /* A driver-owned VMA has no generic backing. Falling through here can
+     * map fresh anonymous RAM after a GEM/TTM fault failed, so CPU uploads
+     * and GPU accesses silently refer to different physical pages. */
+    return PF_REJECT("driver rejected the fault in its own mapping", cr2,
+                     (uint64_t)(int64_t)driver_fault_result);
   }
 
   if (!vma) {

@@ -27,6 +27,7 @@
 #include <linux/spinlock.h>
 
 #include <linuxkpi/log.h>
+#include <linuxkpi/gpu_diag.h>
 #include <linuxkpi/native_mm.h>
 
 extern unsigned long linuxkpi_shrink_reclaim(gfp_t gfp, unsigned long needed);
@@ -285,6 +286,9 @@ struct page *alloc_pages(gfp_t gfp_mask, unsigned int order) {
   if (gfp_mask & __GFP_ZERO)
     __builtin_memset(page_address(head), 0, count << PAGE_SHIFT);
 
+  if (gpu_diag_resource_enabled())
+    gpu_diag_record(GPU_DIAG_PAGE_ALLOC, head, phys, count,
+                    gfp_mask, atomic_read(&head->_refcount), 0);
   return head;
 }
 
@@ -303,6 +307,10 @@ static void page_release_block(struct page *head, unsigned int order) {
   head->compound_order = 0;
 
   phys = (void *)((uint64_t)head->pfn << PAGE_SHIFT);
+  if (gpu_diag_resource_enabled())
+    gpu_diag_record(GPU_DIAG_PAGE_FREE, head, (uint64_t)phys,
+                    1UL << order, head->cache_flags,
+                    atomic_read(&head->_refcount), 0);
   asc_pmm_free_pages(phys, 1UL << order);
 }
 

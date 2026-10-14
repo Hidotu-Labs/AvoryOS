@@ -253,15 +253,11 @@ Update this file in the same change that introduces or closes a gap.
   failed -22`) after ~200 s of fence polling.  The fix is
   `linuxkpi_x86_cpu_init()` called from `kernel/src/kernel.c` before the
   initcalls; words 0/1/4/6/9 mirror `arch/x86/kernel/cpu/common.c`.
-- **Initcall timeout vs. a long amdgpu probe**: the 30 s wait
-  (`linuxkpi/src/initcalls.c`) elapsed while the broken PSP path spun, so the
-  boot tests ran concurrently with amdgpu's probe: the Phase 5 VFIO suite
-  failed `pci_alloc_irq_vectors(1) (-16)` (amdgpu owned the vectors) and the
-  failed probe's teardown logged 16 `amdgpu_irq.c:621` imported WARNs.  With
-  the CPU-feature fix the probe works but still takes minutes, so the wait is
-  now 10 minutes with a "still running" line every 30 s and a completion
-  timing line; the suites must not start while amdgpu owns the device.
-  Re-tune downward once C4 init timing is known.
+- **Initcalls remain a boot dependency barrier** (`linuxkpi/src/initcalls.c`):
+  the former ten-minute deadline allowed boot tests to race an unfinished
+  probe. The walker now waits until completion, logging progress every 30 s,
+  and joins its thread. A wedged probe can hold boot indefinitely; no safe
+  hardware-resource cancellation exists. See [the stability audit](linuxkpi-stability-audit.md).
 - **The generated firmware manifest was invisible to the LinuxKPI compile**:
   `-I ../build/firmware` was added to the global `CPPFLAGS`, but
   `src/tests/linuxkpi/linux/*.c` and `linuxkpi/src/*.c` are compiled with
@@ -739,16 +735,15 @@ divergences for its chunk; the Phase 5 exit matrix in
 
 ### C1 — full Linux PCI API (non-IRQ)
 
-- **Saved config state is standard config space only**
-  (`linuxkpi/src/pci.c`): `pci_save_state()` snapshots the 16 dwords at
-  0x00..0x3F and `pci_restore_state()` writes them back;
-  `pci_store_saved_state()`/`pci_load_saved_state()` copy that software
-  snapshot (upstream semantics: loading does not touch hardware; call
-  `pci_restore_state()` to program it).  Upstream also saves PCIe/PCIx/LTR/
-  DPC/AER/PTM/VC capability state, which amdgpu's reset path uses on real
-  hardware; implementing that needs the capability save/restore machinery
-  from drivers/pci/pci.c and the `pci_cap_saved_state` hlist.  Phase 6 reset
-  testing will show whether the reduced form is enough under VFIO.
+- **PCI state recovery is endpoint-only and deliberately limited**
+  (`linuxkpi/src/pci.c`): snapshots include the standard header, PCIe device
+  controls and MSI routing/address/data/mask. Restore disables decoding and
+  bus mastering, restores BARs and supported controls, then uses a word write
+  for Command. It does not replay Status, IDs, reserved registers or FLR.
+  Store/load includes capability state; load is software-only. Active MSI-X
+  and bridge snapshots return `-ENOTSUPP`; MSI-X table, PCIe link/slot/root
+  controls and extended capability recovery remain unsupported. This is not
+  a complete Linux PCI reset/resume implementation.
 - **Expansion ROM BAR is sized and assigned on demand**
   (`linuxkpi/src/pci.c:pci_map_rom`): upstream maps the resource decoded at
   boot and calls `pci_assign_resource()` when unassigned.  AvoryOS sizes the
@@ -796,11 +791,15 @@ divergences for its chunk; the Phase 5 exit matrix in
   handler must not call `request_irq()`/`free_irq()`/`disable_irq()` on its
   own IRQ (deadlock).  amdgpu's IH handler only schedules work, so this is
   safe for P6; revisit if a driver needs more.
-- **`IRQF_ONESHOT` does not mask in hardware**
-  (`linuxkpi/src/irq.c`): `disable_irq()` runs the per-vector mask callback
-  (MSI/MSI-X only); legacy INTx has no mask callback, so a disabled INTx
-  action only drops interrupts in the dispatcher until the device is
-  acknowledged.  Documented for drivers that rely on ONESHOT masking.
+- **ONESHOT masks supported native MSI/MSI-X vectors**
+  (`linuxkpi/src/irq.c`): pending/running thread counts cover synchronization
+  and keep ONESHOT masked until all associated callbacks finish. Explicit
+  disable nesting prevents premature unmasking. ONESHOT registration without
+  a supported mask callback fails with `-ENOTSUPP`; legacy INTx has no native
+  hardware mask operation and disabled INTx dispatch remains software-gated.
+  `synchronize_hardirq()` drains hard dispatch without waiting for threads,
+  returning false when threaded callbacks are queued/running. `free_irq()`
+  unlinks under the descriptor lock and drains queued/running work before free.
 - **Threaded handlers use the system workqueue**
   (`linuxkpi/src/irq.c`): `request_threaded_irq()` queues `thread_fn` with
   `schedule_work()` instead of a dedicated per-IRQ kthread.  The thread
@@ -962,10 +961,14 @@ divergences for its chunk; the Phase 5 exit matrix in
   no-ops** (`linuxkpi/src/device.c`, `linuxkpi/src/kobject.c`): there is no
   device reference count or release-on-last-put; devices live as long as
   their owner.  Unchanged from P3 and documented for the P6 compile.
-- **PCI power helpers do bookkeeping only** (`linuxkpi/src/pci.c`):
-  `pci_set_power_state()` records `current_state` and returns 0,
-  `pci_choose_state()` answers `PCI_D3hot`, `pci_wake_from_d3()` is a no-op.
-  No PMCSR writes, ASPM, or D-state transitions until Phase 8.
+- **PCI power transitions are unsupported** (`linuxkpi/src/pci.c`):
+  wrapper construction reads PMCSR where available. `pci_set_power_state()`
+  succeeds only for the cached current state; other valid requests return
+  `-ENOTSUPP` without changing state or hardware. Enabling a D3/unknown
+  function also fails instead of inventing D0. `pci_choose_state()` returns
+  D0 and enabling wake-from-D3 fails. No PMCSR, bridge or platform power-domain
+  writes are performed. `CONFIG_PM` being absent does not make physical
+  PCI D-state transitions valid software bookkeeping.
 - **Driver `dev_groups` attach on bind, detach on unbind**
   (`linuxkpi/src/pci.c`): the direct probe registry calls
   `device_add_groups()` after a successful probe and
@@ -1488,3 +1491,21 @@ divergences for its chunk; the Phase 5 exit matrix in
   mapping flags and takes a page reference, while `remap_pfn_range()` does not
   (pfn mappings stay the exporter's responsibility).  page_mkwrite/COW and
   `VM_PFNMAP`-style tracking (`vm_normal_page`) are not modeled.
+
+### Stability audit follow-up (2026-10-13)
+
+`irq_work_sync()` samples queued/running state under the existing queue lock;
+callback self-requeue and final-reference self-free remain supported. Owners
+must exclude external producers and keep an object alive while synchronizing.
+Identity DMA validates address-mask ranges, populates SG DMA fields, reports
+mapping failures and rejects vmalloc inputs to `dma_map_single()`. No bounce
+buffers or IOMMU translation are implemented.
+
+Work flush samples pending/running under the queue lock. Synchronous cancellation
+rechecks callback requeue; delayed flush drains the timer and executes its work.
+Nonblocking delayed cancellation removes already queued work as well as its timer.
+Timer expiry-list removal and running publication share the timer lock;
+synchronous cancellation checks callback rearm and hrtimer restart completion.
+Atomic-context `hrtimer_cancel()` still cannot promise synchronous drain; owners
+must not free the object after that path without a later process-context drain.
+See [the audit and validation report](linuxkpi-stability-audit.md).

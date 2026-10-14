@@ -6,8 +6,8 @@ delay=${1:-5}
 seconds=${2:-15}
 mode=${3:-1}
 output=${4:-/tmp/gpu-debug-capture.log}
-case "$delay:$seconds:$mode" in *[!0-9:]*|'') echo "usage: $0 [delay=5] [seconds=15] [mode=1|2] [output=/tmp/gpu-debug-capture.log]" >&2; exit 2;; esac
-case "$mode" in 1|2) ;; *) echo "mode must be 1 (metadata) or 2 (+64 pixel checks)" >&2; exit 2;; esac
+case "$delay:$seconds:$mode" in *[!0-9:]*|'') echo "usage: $0 [delay=5] [seconds=15] [mode=1|2|3] [output=/tmp/gpu-debug-capture.log]" >&2; exit 2;; esac
+case "$mode" in 1|2|3) ;; *) echo "mode must be 1 (metadata), 2 (+64 PRIME pixel checks), or 3 (+1024 resource events)" >&2; exit 2;; esac
 [ -w /proc/gpu_debug ] || { echo "Boot the diagnostic ISO and run as root (/proc/gpu_debug required)." >&2; exit 1; }
 echo "Switch back to the affected program and keep it running; recording begins in $delay seconds."
 sleep "$delay"

@@ -1733,6 +1733,20 @@ userland/test_gpu_pipeline_gl.elf: userland/test_gpu_pipeline.c $(GLIBC_STAMP) \
 		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
 		-Wl,--allow-shlib-undefined
 
+# Fog-independent framebuffer oracle with bounded PNG mismatch captures.
+userland/test_gpu_corruption.elf: userland/test_gpu_corruption.c $(GLIBC_STAMP) \
+		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
+		-I$(ALPINE_SYSROOT)/usr/include \
+		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
+		userland/test_gpu_corruption.c -o $@ \
+		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
+		-lEGL -lgbm -lGL -ldrm -lz \
+		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+		-Wl,-rpath,/usr/lib \
+		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
+		-Wl,--allow-shlib-undefined
+
 # Depth/stencil/reuse/MSAA oracle independent of presentation.
 userland/test_gpu_depth.elf: userland/test_gpu_depth.c $(GLIBC_STAMP) \
 		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
@@ -1748,8 +1762,9 @@ userland/test_gpu_depth.elf: userland/test_gpu_depth.c $(GLIBC_STAMP) \
 		-Wl,--allow-shlib-undefined
 
 .PHONY: gpu-diagnostics
-gpu-diagnostics: userland/test_gpu_depth.elf userland/test_gpu_constants.elf userland/test_gpu_pipeline.elf userland/test_gpu_pipeline_gl.elf userland/radeonsi_vram_leak.elf
+gpu-diagnostics: userland/test_gpu_corruption.elf userland/test_gpu_depth.elf userland/test_gpu_constants.elf userland/test_gpu_pipeline.elf userland/test_gpu_pipeline_gl.elf userland/radeonsi_vram_leak.elf
 	mkdir -p build/gpu-diagnostics
+	install -m 0755 userland/test_gpu_corruption.elf build/gpu-diagnostics/test_gpu_corruption
 	install -m 0755 userland/test_gpu_depth.elf build/gpu-diagnostics/test_gpu_depth
 	install -m 0755 userland/test_gpu_constants.elf build/gpu-diagnostics/test_gpu_constants
 	install -m 0755 userland/test_gpu_pipeline.elf build/gpu-diagnostics/test_gpu_pipeline

@@ -6,6 +6,7 @@
  * block on the exclusivity of the timer lock; they run outside it. */
 
 #include <linux/hrtimer.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/jiffies.h>
 #include <linux/kthread.h>
@@ -96,11 +97,20 @@ int del_timer(struct timer_list *timer) {
 }
 
 int del_timer_sync(struct timer_list *timer) {
-  int ret = del_timer(timer);
-
-  while (__atomic_load_n(&timer->running, __ATOMIC_ACQUIRE))
-    wait_event(timer_done_wq,
-               !__atomic_load_n(&timer->running, __ATOMIC_ACQUIRE));
+  unsigned long flags;
+  int ret = 0;
+  bool running;
+  do {
+    spin_lock_irqsave(&timer_lock, flags);
+    if (timer_pending(timer)) {
+      list_del_init(&timer->entry);
+      ret = 1;
+    }
+    running = timer->running;
+    spin_unlock_irqrestore(&timer_lock, flags);
+    if (running)
+      msleep(1);
+  } while (running);
   return ret;
 }
 
@@ -168,7 +178,9 @@ int hrtimer_try_to_cancel(struct hrtimer *timer) {
   int ret = 0;
 
   spin_lock_irqsave(&timer_lock, flags);
-  if (timer->queued) {
+  if (timer->running) {
+    ret = -1;
+  } else if (timer->queued) {
     list_del_init(&timer->node.node);
     timer->queued = 0;
     ret = 1;
@@ -200,11 +212,22 @@ int hrtimer_cancel(struct hrtimer *timer) {
     return hrtimer_try_to_cancel(timer);
   }
 
-  ret = hrtimer_try_to_cancel(timer);
-
-  while (__atomic_load_n(&timer->running, __ATOMIC_ACQUIRE))
-    wait_event(timer_done_wq,
-               !__atomic_load_n(&timer->running, __ATOMIC_ACQUIRE));
+  unsigned long flags;
+  bool running;
+  ret = 0;
+  do {
+    spin_lock_irqsave(&timer_lock, flags);
+    timer->cancel_pending = 1;
+    if (timer->queued) {
+      list_del_init(&timer->node.node);
+      timer->queued = 0;
+      ret = 1;
+    }
+    running = timer->running;
+    spin_unlock_irqrestore(&timer_lock, flags);
+    if (running)
+      msleep(1);
+  } while (running);
   return ret;
 }
 
@@ -304,37 +327,50 @@ static int timer_kthread(void *arg) {
     }
     spin_unlock_irqrestore(&timer_lock, flags);
 
-    while (!list_empty(&expired_timers)) {
+    for (;;) {
+      spin_lock_irqsave(&timer_lock, flags);
+      if (list_empty(&expired_timers)) {
+        spin_unlock_irqrestore(&timer_lock, flags);
+        break;
+      }
       struct timer_list *t =
           list_first_entry(&expired_timers, struct timer_list, entry);
       list_del_init(&t->entry);
 
       __atomic_store_n(&t->running, 1, __ATOMIC_RELEASE);
+      spin_unlock_irqrestore(&timer_lock, flags);
       t->function(t);
+      spin_lock_irqsave(&timer_lock, flags);
       __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
+      spin_unlock_irqrestore(&timer_lock, flags);
       __kpi_wake_up(&timer_done_wq, 0, 0);
     }
 
-    while (!list_empty(&expired_hrtimers)) {
+    for (;;) {
+      spin_lock_irqsave(&timer_lock, flags);
+      if (list_empty(&expired_hrtimers)) {
+        spin_unlock_irqrestore(&timer_lock, flags);
+        break;
+      }
       struct hrtimer *h =
           list_first_entry(&expired_hrtimers, struct hrtimer, node.node);
       list_del_init(&h->node.node);
       h->queued = 0;
 
       __atomic_store_n(&h->running, 1, __ATOMIC_RELEASE);
+      spin_unlock_irqrestore(&timer_lock, flags);
       enum hrtimer_restart restart = h->function(h);
-      __atomic_store_n(&h->running, 0, __ATOMIC_RELEASE);
+      spin_lock_irqsave(&timer_lock, flags);
 
       if (restart == HRTIMER_RESTART) {
         ktime_t when = h->node.expires;
         bool requeue = false;
 
-        spin_lock_irqsave(&timer_lock, flags);
         if (h->cancel_pending) {
           /* hrtimer_cancel() ran in atomic context while this callback was
            * in flight; do not restart. */
           h->cancel_pending = 0;
-        } else {
+        } else if (!h->queued) {
           if (when <= ktime_get())
             when = ktime_get() + 1000000; /* 1 ms floor */
 
@@ -343,11 +379,12 @@ static int timer_kthread(void *arg) {
           h->queued = 1;
           requeue = true;
         }
-        spin_unlock_irqrestore(&timer_lock, flags);
         if (requeue)
           timer_signal_change();
       }
 
+      __atomic_store_n(&h->running, 0, __ATOMIC_RELEASE);
+      spin_unlock_irqrestore(&timer_lock, flags);
       __kpi_wake_up(&timer_done_wq, 0, 0);
     }
 

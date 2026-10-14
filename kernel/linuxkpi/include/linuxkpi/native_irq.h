@@ -42,4 +42,7 @@ int linuxkpi_native_pci_irq_vector(void *state, unsigned int index);
 void linuxkpi_native_pci_irq_mask(void *state, unsigned int index, int masked);
 void linuxkpi_native_pci_irq_release(void *state);
 
+/* Legacy INTx currently has no native line-mask operation. */
+int linuxkpi_native_pci_irq_can_mask(void *state);
+
 #endif /* LINUXKPI_NATIVE_IRQ_H */

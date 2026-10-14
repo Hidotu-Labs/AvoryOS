@@ -21,6 +21,8 @@ pre = r'''
 #include <sched.h>
 #define PAGE_SHIFT 12
 #define PAGE_SIZE 4096
+#define gpu_diag_resource_enabled() 0
+#define gpu_diag_record(...) ((void)0)
 #define GFP_KERNEL 0
 #define __GFP_ZERO 1
 #define XA_PRESENT 0

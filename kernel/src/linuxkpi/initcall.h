@@ -31,7 +31,7 @@ typedef int (*linuxkpi_initcall_fn_t)(void);
  * boot reaches this through linuxkpi_run_initcalls(). */
 void linuxkpi_run_initcalls_inline(void);
 
-/* Run every registered initcall in a kernel thread and wait (bounded) for it
+/* Run every registered initcall in a kernel thread and wait for it
  * to finish.  Call once, late in boot, after the native services imported
  * drivers may depend on (console, heap, VMM, timers, scheduler, PCI, VFS) are
  * up.  Linux runs level-6 module_init in kernel_init's thread, and drivers may

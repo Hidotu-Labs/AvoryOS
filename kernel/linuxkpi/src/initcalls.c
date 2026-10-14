@@ -35,7 +35,6 @@ void linuxkpi_run_initcalls(void) {
   struct task_struct *task;
   unsigned long long start, elapsed;
   unsigned int waited_ms = 0;
-  bool completed = false;
 
   init_completion(&initcalls_done);
   start = linuxkpi_monotonic_ms();
@@ -49,36 +48,20 @@ void linuxkpi_run_initcalls(void) {
     return;
   }
 
-  /* Bounded wait (this shim's jiffy is 1 ms): a wedged driver must not hold
-   * up the rest of the boot forever, but the timeout is reported loudly.
-   * 10 minutes because a single amdgpu probe legitimately runs minutes on
-   * the passed-through GPU (PSP firmware loads, SMU/DMUB handshakes, DCN
-   * register bring-up in this emulation); running the suites while it is
-   * still probing makes them fight over the device (P6 C4: the VFIO suite
-   * lost its MSI vectors with -EBUSY).  Progress is logged every 30 s so a
-   * long-but-working probe is distinguishable from a wedge. */
-  while (waited_ms < 600000) {
-    if (wait_for_completion_timeout(&initcalls_done, 2000) > 0) {
-      completed = true;
+  /* Keep the boot dependency barrier even after a slow/wedged probe. No
+   * safe cancellation exists while the driver may own hardware resources. */
+  for (;;) {
+    if (wait_for_completion_timeout(&initcalls_done, 2000) > 0)
       break;
-    }
     waited_ms += 2000;
     if ((waited_ms % 30000) == 0)
-      klogf("[INFO] LinuxKPI: initcalls still running (%u s)\n",
+      klogf("[INFO] LinuxKPI: initcalls still running (%u s); boot waiting\n",
             waited_ms / 1000);
   }
 
   elapsed = linuxkpi_monotonic_ms() - start;
-  if (completed) {
-    klogf("[INFO] LinuxKPI: initcalls completed in %lu.%03lu s\n",
-          (unsigned long)(elapsed / 1000),
-          (unsigned long)(elapsed % 1000));
-    /* Join the walker thread so its kthread control block is freed now; the
-     * native thread itself is reaped by thread_exit().  A timed-out walker
-     * may still be probing, so it is left alone. */
-    kthread_stop(task);
-  } else {
-    klogf("[WARN] LinuxKPI: initcalls timed out after %lu s\n",
-          (unsigned long)(elapsed / 1000));
-  }
+  klogf("[INFO] LinuxKPI: initcalls completed in %lu.%03lu s\n",
+        (unsigned long)(elapsed / 1000),
+        (unsigned long)(elapsed % 1000));
+  kthread_stop(task);
 }

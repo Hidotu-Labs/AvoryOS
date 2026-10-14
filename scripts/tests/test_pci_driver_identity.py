@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Imported PCI binding must be discoverable by libudev and Xorg OutputClass."""
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 
@@ -8,6 +9,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def extract(path, signature):
     source = (ROOT / path).read_text()
+    if os.environ.get('KPI_PCI_PROBE_BASELINE') and path == 'kernel/linuxkpi/src/pci.c':
+        source = Path(os.environ['KPI_PCI_PROBE_BASELINE']).read_text()
     start = source.index(signature)
     end = source.index('{', start) + 1
     depth = 1
@@ -20,9 +23,10 @@ common = '#include <assert.h>\n#include <stdbool.h>\n#include <stdio.h>\n#includ
 probe = common + r'''
 struct pci_device_id {int unused;};
 struct pci_dev;
-struct pci_driver {const char *name; int (*probe)(struct pci_dev *, const struct pci_device_id *); struct {void *dev_groups;} driver;};
-struct pci_dev {struct pci_driver *driver; struct {void *driver;} dev; void *sysdata;};
+struct pci_driver {const char *name; int (*probe)(struct pci_dev *, const struct pci_device_id *);void (*remove)(struct pci_dev*); struct {void *dev_groups;} driver;};
+struct pci_dev {struct pci_driver *driver; struct {void *driver;int resources;} dev;void *driver_data; void *sysdata;};
 static bool matches=true, kpi_amdgpu_probed;
+static int released;
 static int probe_result, kpi_amdgpu_probe_result, published, groups;
 static const char *published_name;
 static struct pci_device_id id;
@@ -31,11 +35,25 @@ static const char *pci_name(struct pci_dev *p){(void)p;return "0000:00:03.0";}
 static void device_add_groups(void *d,void *g){(void)d;(void)g;groups++;}
 static void linuxkpi_pci_native_driver(void *handle,const char *name){assert(handle==(void *)123);published++;published_name=name;}
 #define klogf(...) ((void)printf(__VA_ARGS__))
-static int do_probe(struct pci_dev *p,const struct pci_device_id *i){(void)p;(void)i;return probe_result;}
+static void __attribute__((unused)) devres_release_all(void *d){struct pci_dev*p=(void*)((char*)d-__builtin_offsetof(struct pci_dev,dev));released+=p->dev.resources;p->dev.resources=0;}
+static void __attribute__((unused)) pci_set_drvdata(struct pci_dev*p,void *data){p->driver_data=data;}
+static int do_probe(struct pci_dev *p,const struct pci_device_id *i){(void)i;p->dev.resources++;p->driver_data=(void*)456;return probe_result;}
 '''
 # Retain the real probe function; only its collaborators are mocked.
 probe = probe.replace('struct pci_driver {const char *name;', 'struct pci_driver {void *id_table; const char *name;')
 probe += extract('kernel/linuxkpi/src/pci.c', 'static void kpi_pci_probe_device(')
+probe += r'''
+struct kpi_pci_driver {struct pci_driver *drv;int node;};
+static struct kpi_pci_driver registration;
+static int __attribute__((unused)) kpi_pci_drivers;static int removed;
+static struct pci_dev **kpi_devs;static int kpi_dev_count;
+#define list_for_each_entry_safe(n,t,h,m) for(n=&registration,t=NULL;(void)(t),(n);n=NULL)
+#define list_del(p) ((void)(p))
+#define kfree(p) ((void)(p))
+static void device_remove_groups(void*d,void*g){(void)d;(void)g;}
+static void do_remove(struct pci_dev*p){assert(p->driver&&p->dev.resources==1&&p->driver_data);removed++;}
+'''
+probe += extract('kernel/linuxkpi/src/pci.c', 'void pci_unregister_driver(')
 probe += r'''
 int main(void){
  struct pci_driver d={.name="amdgpu",.probe=do_probe};
@@ -43,13 +61,20 @@ int main(void){
  matches=false;kpi_pci_probe_device(&d,&p);assert(!p.driver&&!published&&!groups);
  matches=true;probe_result=-5;kpi_pci_probe_device(&d,&p);
  assert(!p.driver&&!p.dev.driver&&!published&&!groups&&kpi_amdgpu_probe_result==-5);
+ assert(released==1&&!p.dev.resources&&!p.driver_data);
  probe_result=0;kpi_pci_probe_device(&d,&p);
  assert(p.driver==&d&&p.dev.driver==&d.driver&&published==1&&groups==1);
  assert(!strcmp(published_name,"amdgpu")&&kpi_amdgpu_probed);
+ assert(p.dev.resources==1&&p.driver_data==(void*)456&&released==1);
  kpi_pci_probe_device(&d,&p);assert(published==1);
+ struct pci_dev other={0};struct pci_dev *devices[]={&p,&other};
+ kpi_devs=devices;kpi_dev_count=2;registration.drv=&d;d.remove=do_remove;
+ pci_unregister_driver(&d);
+ assert(removed==1&&released==2&&!p.dev.resources&&!p.driver_data&&!p.driver&&!p.dev.driver);
+ assert(published==2&&!published_name);
  p.driver=NULL;p.dev.driver=NULL;d.probe=NULL;kpi_pci_probe_device(&d,&p);
- assert(published==2&&p.driver==&d);
- puts("PASS: unmatched/failed probes publish no binding; successful binds publish the actual driver");
+ assert(published==3&&p.driver==&d);
+ puts("PASS: failed probes release managed resources and drvdata; unmatched/failed probes publish no binding; successful binds publish the actual driver; unregister drains resources after remove");
 }
 '''
 identity = common + r'''

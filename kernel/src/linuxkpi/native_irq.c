@@ -99,3 +99,8 @@ void linuxkpi_native_pci_irq_release(void *state) {
   pci_irq_release(irq);
   kfree(irq);
 }
+
+int linuxkpi_native_pci_irq_can_mask(void *state) {
+  struct pci_irq *irq = state;
+  return irq && (irq->mode == PCI_IRQ_MSI || irq->mode == PCI_IRQ_MSIX);
+}

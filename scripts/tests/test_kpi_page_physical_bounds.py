@@ -19,6 +19,7 @@ code=r'''
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#define klogf(...) ((void)0)
 #define PAGE_SHIFT 12
 #define PAGE_SIZE (1UL << PAGE_SHIFT)
 #define SECTION_SHIFT 27

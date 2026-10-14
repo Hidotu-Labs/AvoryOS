@@ -9,6 +9,10 @@ with tempfile.TemporaryDirectory(prefix='avory-amdgpu-policy-') as tmp:
     (p/'amdgpu.h').write_text('''#include <stdbool.h>
 #include <stdint.h>
 typedef uint64_t u64;
+struct drm_gem_object {u64 size;};
+static inline struct drm_gem_object *drm_gem_object_lookup(void *f,unsigned h){(void)f;(void)h;return 0;}
+static inline void drm_gem_object_put(struct drm_gem_object *p){(void)p;}
+#define gem_to_amdgpu_bo(p) (p)
 struct drm_device { int unused; };
 struct drm_file { int unused; };
 struct amdgpu_device { struct drm_device dev; struct { bool buffer_funcs_enabled; } mman; };
@@ -21,6 +25,9 @@ union drm_amdgpu_gem_create {
 };
 ''')
     (p/'amdgpu_gem.h').write_text('')
+    (p/'amdgpu_object.h').write_text('')
+    (p/'linuxkpi').mkdir()
+    (p/'linuxkpi/gpu_diag.h').write_text('#define gpu_diag_resource_enabled() 0\n#define gpu_diag_record(k,o,a,b,c,d,r) ((void)(o),(void)(a),(void)(b),(void)(c),(void)(d),(void)(r))\n')
     (p/'test.c').write_text('''#include "amdgpu.h"
 #include <assert.h>
 int amdgpu_gem_create_ioctl(struct drm_device *, void *, struct drm_file *);

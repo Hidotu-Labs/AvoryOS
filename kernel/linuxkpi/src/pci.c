@@ -14,11 +14,10 @@
  *     the id table (no driver_register(), no deferred probe, no dynids).
  *   - real I/O-port address translation: I/O BARs expose their raw port
  *     address and request_region() keeps only a conflict registry.
- *   - saved state beyond config space 0x00..0x3F: upstream also saves
- *     PCIe/PCIx/LTR/DPC/AER/PTM/VC capability state; ROM BAR assignment is a
+ *   - capability recovery beyond PCIe device controls and MSI routing;
+ *     active MSI-X and bridge snapshots fail explicitly. ROM BAR assignment is a
  *     shim-local low-MMIO scanner instead of pci_assign_resource()/bridge
  *     windows, and there is no IORESOURCE_ROM_SHADOW handling.
- *   - MSI/MSI-X allocation (arrives with Phase 5 C2).
  *
  * The root bus/device scaffolding exists so `pci_dev.bus`, `dev.archdata`,
  * and the `kobj.parent` chain DRM's sysfs links expect are all non-NULL. */
@@ -242,7 +241,8 @@ static struct pci_dev *kpi_pci_dev_new(void *handle) {
   pdev->multifunction = (info.header_type & 0x80) ? 1 : 0;
   pdev->irq = info.irq_line;
   pdev->pin = info.irq_pin;
-  pdev->current_state = PCI_D0;
+  pdev->current_state = PCI_UNKNOWN;
+  pdev->cfg_size = linuxkpi_pci_config_size(handle);
   pdev->error_state = pci_channel_io_normal;
   atomic_set(&pdev->enable_cnt, 0);
   spin_lock_init(&pdev->pcie_cap_lock);
@@ -290,6 +290,15 @@ static struct pci_dev *kpi_pci_dev_new(void *handle) {
       i++; /* skip the high dword of a 64-bit BAR */
   }
 
+  pdev->pm_cap = pci_find_capability(pdev, PCI_CAP_ID_PM);
+  if (pdev->pm_cap) {
+    u16 pmcsr;
+    if (!pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmcsr) &&
+        pmcsr != 0xffff)
+      pdev->current_state = pmcsr & PCI_PM_CTRL_STATE_MASK;
+  } else {
+    pdev->current_state = PCI_D0; /* no PM capability: always powered */
+  }
   pdev->pcie_cap = pci_find_capability(pdev, PCI_CAP_ID_EXP);
   pdev->msi_cap = pci_find_capability(pdev, PCI_CAP_ID_MSI);
   pdev->msix_cap = pci_find_capability(pdev, PCI_CAP_ID_MSIX);
@@ -397,6 +406,10 @@ static void kpi_pci_probe_device(struct pci_driver *drv,
   if (ret) {
     klogf("[KERNEL] LinuxKPI: pci %s probe %s failed: %d\n", drv->name,
           pci_name(pdev), ret);
+    /* Permanent PCI wrappers never reach device_unregister(). Match the
+     * driver core's failed-probe unwind here, including managed DRM/IRQs. */
+    devres_release_all(&pdev->dev);
+    pci_set_drvdata(pdev, NULL);
     pdev->driver = NULL;
     pdev->dev.driver = NULL;
     return;
@@ -479,6 +492,8 @@ void pci_unregister_driver(struct pci_driver *drv) {
       device_remove_groups(&pdev->dev, drv->driver.dev_groups);
       if (drv->remove)
         drv->remove(pdev);
+      devres_release_all(&pdev->dev);
+      pci_set_drvdata(pdev, NULL);
       linuxkpi_pci_native_driver(pdev->sysdata, NULL);
       pdev->driver = NULL;
       pdev->dev.driver = NULL;
@@ -496,7 +511,10 @@ struct pci_driver *pci_dev_driver(const struct pci_dev *dev) {
 /* ── configuration space / capabilities ─────────────────────────────────── */
 
 static bool kpi_pci_cfg_ok(const struct pci_dev *dev, int where, int width) {
-  return dev && dev->sysdata && where >= 0 && where + width <= 4096;
+  /* Native CF8/CFC accesses only cover 256 bytes. Do not report success
+   * for dropped writes, misaligned accesses, or overflowed offsets. */
+  return dev && dev->sysdata && where >= 0 &&
+         where <= dev->cfg_size - width && !(where & (width - 1));
 }
 
 int pci_read_config_byte(const struct pci_dev *dev, int where, u8 *val) {
@@ -688,6 +706,9 @@ static int kpi_pci_do_enable(struct pci_dev *dev, bool want_io, bool want_mem) {
 
   if (!dev)
     return -EINVAL;
+  /* Command decoding cannot power up a D3/unknown function. */
+  if (dev->current_state != PCI_D0)
+    return -ENOTSUPP;
 
   if (want_io)
     set |= PCI_COMMAND_IO;
@@ -702,7 +723,6 @@ static int kpi_pci_do_enable(struct pci_dev *dev, bool want_io, bool want_mem) {
     linuxkpi_pci_command_update(dev->sysdata, set, clear);
 
   atomic_inc(&dev->enable_cnt);
-  dev->current_state = PCI_D0;
   return 0;
 }
 
@@ -730,32 +750,34 @@ int pci_reenable_device(struct pci_dev *dev) {
 
 /* ── power management (inert bookkeeping, Phase 5 C5) ───────────────────── */
 
-/* No PM core exists (CONFIG_PM unset): pci_set_power_state() records the
- * requested state so drivers see a consistent current_state, but performs no
- * hardware transition.  pci_choose_state() answers D3hot for any request and
- * pci_wake_from_d3() accepts the enable flag without touching the PMCSR. */
+/* No platform/PCI PM transition implementation exists. Keep the observed
+ * state intact and reject requests that would require touching hardware. */
 int pci_set_power_state(struct pci_dev *dev, pci_power_t state) {
-  if (!dev)
+  if (!dev || state < PCI_D0 || state > PCI_D3cold)
     return -EINVAL;
-  dev->current_state = state;
-  return 0;
+  if (state == dev->current_state)
+    return 0;
+  return -ENOTSUPP;
 }
 
 pci_power_t pci_choose_state(struct pci_dev *dev, pm_message_t state) {
   (void)dev;
   (void)state;
-  return PCI_D3hot;
+  return PCI_D0;
 }
 
 int pci_wake_from_d3(struct pci_dev *dev, bool enable) {
-  (void)enable;
   if (!dev)
     return -EINVAL;
-  return 0;
+  return enable ? -ENOTSUPP : 0;
 }
 
 void pci_disable_device(struct pci_dev *dev) {
   if (!dev)
+    return;
+  /* Failed probe paths may disable an already disabled device. Linux treats
+   * that as a no-op; never underflow the enable nesting count. */
+  if (atomic_read(&dev->enable_cnt) <= 0)
     return;
   if (atomic_dec_and_test(&dev->enable_cnt)) {
     linuxkpi_pci_set_bus_mastering(dev->sysdata, 0);
@@ -765,7 +787,9 @@ void pci_disable_device(struct pci_dev *dev) {
 }
 
 static void kpi_pcim_disable_action(void *data) {
-  pci_disable_device((struct pci_dev *)data);
+  struct pci_dev *pdev = data;
+  pci_disable_device(pdev);
+  pdev->is_managed = 0;
 }
 
 int pcim_enable_device(struct pci_dev *pdev) {
@@ -776,10 +800,10 @@ int pcim_enable_device(struct pci_dev *pdev) {
   if (pdev->is_managed)
     return 0;
 
-  ret = devm_add_action(&pdev->dev, kpi_pcim_disable_action, pdev);
+  ret = pci_enable_device(pdev);
   if (ret)
     return ret;
-  ret = pci_enable_device(pdev);
+  ret = devm_add_action_or_reset(&pdev->dev, kpi_pcim_disable_action, pdev);
   if (ret)
     return ret;
   pdev->is_managed = 1;
@@ -1191,7 +1215,8 @@ int pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
     st->irq[i] = (unsigned int)irq;
     st->vecs[i].native = st->native;
     st->vecs[i].index = i;
-    linuxkpi_irq_register_mask(st->irq[i], kpi_pci_irq_mask_cb, &st->vecs[i]);
+    if (linuxkpi_native_pci_irq_can_mask(st->native))
+      linuxkpi_irq_register_mask(st->irq[i], kpi_pci_irq_mask_cb, &st->vecs[i]);
   }
   return count;
 }
@@ -1245,54 +1270,169 @@ void pci_free_irq_vectors(struct pci_dev *dev) {
 
 /* ── configuration state save/restore (Phase 5 C1) ──────────────────────── */
 
-/* Standard config space only (16 dwords); upstream also saves PCIe/PCIx/
- * LTR/DPC/AER/PTM/VC capability state, which this shim does not model. */
+/* Endpoint-only restore: never replay status, IDs or bridge controls. Save
+ * PCIe device controls and MSI routing explicitly. MSI-X table restore and
+ * extended capability recovery are not implemented; active MSI-X snapshots
+ * fail rather than claiming to cover state we cannot restore. */
 struct pci_saved_state {
   u32 config_space[16];
+  u16 pcie_cap, pcie_version, devctl, devctl2;
+  u16 msi_cap, msi_flags, msi_data;
+  u32 msi_address, msi_address_hi, msi_mask;
 };
 
+struct kpi_pci_saved_caps {
+  struct hlist_node node;
+  struct pci_saved_state state;
+};
+
+static struct kpi_pci_saved_caps *kpi_pci_saved_caps(struct pci_dev *dev) {
+  if (hlist_empty(&dev->saved_cap_space))
+    return NULL;
+  return hlist_entry(dev->saved_cap_space.first,
+                     struct kpi_pci_saved_caps, node);
+}
+
 int pci_save_state(struct pci_dev *dev) {
+  struct kpi_pci_saved_caps *caps;
+  struct pci_saved_state state = {0};
+  u16 flags;
   int i;
 
   if (!dev)
     return -EINVAL;
-  for (i = 0; i < 16; i++)
-    pci_read_config_dword(dev, i * 4, &dev->saved_config_space[i]);
+  dev->state_saved = false;
+  if (dev->hdr_type != PCI_HEADER_TYPE_NORMAL)
+    return -ENOTSUPP;
+  if (dev->msix_cap) {
+    if (pci_read_config_word(dev, dev->msix_cap + PCI_MSIX_FLAGS, &flags))
+      return -EIO;
+    if (flags & PCI_MSIX_FLAGS_ENABLE)
+      return -ENOTSUPP;
+  }
+  for (i = 0; i < 16; i++) {
+    if (pci_read_config_dword(dev, i * 4, &state.config_space[i]))
+      return -EIO;
+  }
+  state.pcie_cap = dev->pcie_cap;
+  if (state.pcie_cap) {
+    if (pci_read_config_word(dev, state.pcie_cap + PCI_EXP_FLAGS, &flags) ||
+        pci_read_config_word(dev, state.pcie_cap + PCI_EXP_DEVCTL, &state.devctl))
+      return -EIO;
+    state.pcie_version = flags & PCI_EXP_FLAGS_VERS;
+    /* Bit 15 triggers FLR on endpoints; never replay a reset request. */
+    state.devctl &= ~PCI_EXP_DEVCTL_BCR_FLR;
+    if (state.pcie_version > 1 &&
+        pci_read_config_word(dev, state.pcie_cap + PCI_EXP_DEVCTL2, &state.devctl2))
+      return -EIO;
+  }
+  state.msi_cap = dev->msi_cap;
+  if (state.msi_cap) {
+    int cap = state.msi_cap;
+    if (pci_read_config_word(dev, cap + PCI_MSI_FLAGS, &state.msi_flags) ||
+        pci_read_config_dword(dev, cap + PCI_MSI_ADDRESS_LO, &state.msi_address))
+      return -EIO;
+    bool wide = state.msi_flags & PCI_MSI_FLAGS_64BIT;
+    if ((wide && pci_read_config_dword(dev, cap + PCI_MSI_ADDRESS_HI, &state.msi_address_hi)) ||
+        pci_read_config_word(dev, cap + (wide ? PCI_MSI_DATA_64 : PCI_MSI_DATA_32), &state.msi_data))
+      return -EIO;
+    if ((state.msi_flags & PCI_MSI_FLAGS_MASKBIT) &&
+        pci_read_config_dword(dev, cap + (wide ? PCI_MSI_MASK_64 : PCI_MSI_MASK_32), &state.msi_mask))
+      return -EIO;
+  }
+  caps = kpi_pci_saved_caps(dev);
+  if (!caps) {
+    caps = kzalloc(sizeof(*caps), GFP_KERNEL);
+    if (!caps)
+      return -ENOMEM;
+    hlist_add_head(&caps->node, &dev->saved_cap_space);
+  }
+  caps->state = state;
+  memcpy(dev->saved_config_space, state.config_space, sizeof(state.config_space));
   dev->state_saved = true;
   return 0;
 }
 
 void pci_restore_state(struct pci_dev *dev) {
+  struct kpi_pci_saved_caps *caps;
+  struct pci_saved_state *state;
+  u16 command;
   int i;
 
   if (!dev || !dev->state_saved)
     return;
-  for (i = 0; i < 16; i++)
-    pci_write_config_dword(dev, i * 4, dev->saved_config_space[i]);
+  caps = kpi_pci_saved_caps(dev);
+  if (!caps)
+    return;
+  state = &caps->state;
+  if (pci_read_config_word(dev, PCI_COMMAND, &command)) {
+    klog_puts("[WARN] LinuxKPI: PCI restore command read failed\n");
+    return;
+  }
+  /* Disable DMA and decoding until BARs and interrupt routing are valid. */
+  pci_write_config_word(dev, PCI_COMMAND,
+                        command & ~(PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER));
+  for (i = 0; i < 6; i++)
+    pci_write_config_dword(dev, PCI_BASE_ADDRESS_0 + i * 4, state->config_space[4 + i]);
+  pci_write_config_dword(dev, PCI_ROM_ADDRESS, state->config_space[12]);
+  pci_write_config_byte(dev, PCI_CACHE_LINE_SIZE, state->config_space[3] & 0xff);
+  pci_write_config_byte(dev, PCI_LATENCY_TIMER, (state->config_space[3] >> 8) & 0xff);
+  pci_write_config_byte(dev, PCI_INTERRUPT_LINE, state->config_space[15] & 0xff);
+  if (state->pcie_cap) {
+    pci_write_config_word(dev, state->pcie_cap + PCI_EXP_DEVCTL, state->devctl);
+    if (state->pcie_version > 1)
+      pci_write_config_word(dev, state->pcie_cap + PCI_EXP_DEVCTL2, state->devctl2);
+  }
+  if (state->msi_cap) {
+    int cap = state->msi_cap;
+    bool wide = state->msi_flags & PCI_MSI_FLAGS_64BIT;
+    pci_write_config_word(dev, cap + PCI_MSI_FLAGS, state->msi_flags & ~PCI_MSI_FLAGS_ENABLE);
+    pci_write_config_dword(dev, cap + PCI_MSI_ADDRESS_LO, state->msi_address);
+    if (wide)
+      pci_write_config_dword(dev, cap + PCI_MSI_ADDRESS_HI, state->msi_address_hi);
+    pci_write_config_word(dev, cap + (wide ? PCI_MSI_DATA_64 : PCI_MSI_DATA_32), state->msi_data);
+    if (state->msi_flags & PCI_MSI_FLAGS_MASKBIT)
+      pci_write_config_dword(dev, cap + (wide ? PCI_MSI_MASK_64 : PCI_MSI_MASK_32), state->msi_mask);
+    pci_write_config_word(dev, cap + PCI_MSI_FLAGS, state->msi_flags);
+  }
+  /* Narrow write avoids clearing the adjacent W1C PCI_STATUS register. */
+  pci_write_config_word(dev, PCI_COMMAND, state->config_space[1] & 0xffff);
   dev->state_saved = false;
 }
 
 struct pci_saved_state *pci_store_saved_state(struct pci_dev *dev) {
+  struct kpi_pci_saved_caps *caps;
   struct pci_saved_state *state;
-
   if (!dev || !dev->state_saved)
     return NULL;
-  state = kzalloc(sizeof(*state), GFP_KERNEL);
-  if (!state)
+  caps = kpi_pci_saved_caps(dev);
+  if (!caps)
     return NULL;
-  memcpy(state->config_space, dev->saved_config_space,
-         sizeof(state->config_space));
+  state = kzalloc(sizeof(*state), GFP_KERNEL);
+  if (state)
+    *state = caps->state;
   return state;
 }
 
 int pci_load_saved_state(struct pci_dev *dev, struct pci_saved_state *state) {
+  struct kpi_pci_saved_caps *caps;
   if (!dev)
     return -EINVAL;
   dev->state_saved = false;
   if (!state)
     return 0;
-  memcpy(dev->saved_config_space, state->config_space,
-         sizeof(state->config_space));
+  if (dev->hdr_type != PCI_HEADER_TYPE_NORMAL ||
+      state->pcie_cap != dev->pcie_cap || state->msi_cap != dev->msi_cap)
+    return -EINVAL;
+  caps = kpi_pci_saved_caps(dev);
+  if (!caps) {
+    caps = kzalloc(sizeof(*caps), GFP_KERNEL);
+    if (!caps)
+      return -ENOMEM;
+    hlist_add_head(&caps->node, &dev->saved_cap_space);
+  }
+  caps->state = *state;
+  memcpy(dev->saved_config_space, state->config_space, sizeof(state->config_space));
   dev->state_saved = true;
   return 0;
 }

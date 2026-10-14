@@ -6,7 +6,12 @@ enum gpu_diag_kind {
   GPU_DIAG_CACHE, GPU_DIAG_MAP, GPU_DIAG_FAULT,
   GPU_DIAG_IMPORT, GPU_DIAG_CPU_BEGIN, GPU_DIAG_CPU_END,
   GPU_DIAG_FENCE, GPU_DIAG_COPY_LAYOUT, GPU_DIAG_COPY_CHECK,
-  GPU_DIAG_PRESENT, GPU_DIAG_CACHE_CHECK
+  GPU_DIAG_PRESENT, GPU_DIAG_CACHE_CHECK,
+  GPU_DIAG_BO_HANDLE, GPU_DIAG_BO_BACKING, GPU_DIAG_VM_BIND,
+  GPU_DIAG_VM_UPDATE, GPU_DIAG_PAGE_BIND, GPU_DIAG_DMA_MAP,
+  GPU_DIAG_PAGE_ALLOC, GPU_DIAG_PAGE_FREE, GPU_DIAG_FENCE_EMIT,
+  GPU_DIAG_FENCE_SIGNAL, GPU_DIAG_RESV_FENCE, GPU_DIAG_VM_OFFSET, GPU_DIAG_CPU_VMA,
+  GPU_DIAG_MAX = GPU_DIAG_CPU_VMA
 };
 enum gpu_diag_prime_stage {
   GPU_PRIME_SOURCE_ALLOC = 1, GPU_PRIME_SOURCE_EXPORT,
@@ -18,6 +23,7 @@ void gpu_diag_prime_error(unsigned int stage, const void *object,
                           __UINT64_TYPE__ detail, __UINT64_TYPE__ size,
                           long result);
 unsigned int gpu_diag_level(void);
+int gpu_diag_resource_enabled(void);
 void gpu_diag_record(unsigned int kind, const void *object,
                      __UINT64_TYPE__ a, __UINT64_TYPE__ b, __UINT64_TYPE__ c,
                      __UINT64_TYPE__ d, long result);
