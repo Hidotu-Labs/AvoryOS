@@ -24,6 +24,37 @@ phase; its last completed step, loaded ISO/kernel identity and diagnostic trace
 are still unknown. Reading `/sys/fs/pstore` was denied by host permissions, so
 no firmware/kernel persistent crash record was retrieved.
 
+## Clarified retry sequence and read-only follow-up
+
+The user runs `make run-c7-prime`, closes QEMU when initialization fails,
+then runs the same target again. Some subsequent initializations reboot the
+whole host. This is a VFIO release/reopen sequence, not evidence of a cold GPU.
+The target does not invoke the separate `reset-gpu` shell helper.
+
+Read-only inspection: QEMU reports 11.1.0, host kernel 6.18.42-1-cachyos-lts;
+GPU `0e:00.0` is bound to vfio-pci with `reset_method=bus`, group 24. Functions
+.1/.2/.3/.4/.6 share bridge `00:08.1`, are owned by host audio/CCP/xHCI drivers,
+and have separate groups 25–29. Bus-only availability does not prove a bus reset
+was issued or accepted. No reset, bind/unbind, power or bridge write was done.
+
+The [upstream Linux 6.18 VFIO core](https://raw.githubusercontent.com/torvalds/linux/v6.18/drivers/vfio/pci/vfio_pci_core.c)
+attempts reset on enable and has reset/power handling on disable/close. The
+[QEMU VFIO PCI implementation](https://raw.githubusercontent.com/qemu/qemu/master/hw/vfio/pci.c)
+has device-reset and hot-reset paths. These are primary-source contract
+comparisons, not verification of every patch in the installed CachyOS/QEMU
+binaries. They contradict the former blanket statement that QEMU/VFIO does
+not reset when closing a VM. Comments and the old automatic retry/reset
+recommendations were corrected; reset-helper execution logic is unchanged.
+
+Raphael GC 10.3.6 uses `nv_common` (`amdgpu_discovery.c:1645`), and discovery
+sets `AMD_IS_APU` (`amdgpu_discovery.c:2396/2400`). Its
+`nv_need_reset_on_init()` (`nv.c:543`) returns false for APUs, skipping the
+conditional generic reset at `amdgpu_device.c:3827` on a correctly identified
+Raphael. This does not disable PSP/SMU firmware initialization or other reset
+paths and does not exclude a host-side reset/power problem. The last available
+serial snapshot records completed initialization, so it does not identify the
+failed boot's last stage. Host-reset attribution remains an unverified hypothesis.
+
 ## Scope and ownership
 
 The starting tree contained substantial uncommitted work, including fixes in

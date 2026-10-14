@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # vfio-reset-gpu.sh -- reset a passed-through GPU on the host between runs.
 #
-# QEMU/VFIO does not reset the device when a VM exits.  A guest that loaded
-# amdgpu (or was killed while the PSP/RLC was running) hands a warm,
-# half-initialized GPU to the next boot: the PSP can answer AUTOLOAD_RLC with
-# TEE_ERROR_BUSY, and the KIQ HQD can come up with stale or cleared doorbell
-# state, making the GFX ring tests fail with -110 for no code reason.  The
-# driver's bring-up sequence is written for a cold device.
+# Closing/reopening QEMU can exercise VFIO reset and power-management paths.
+# A completed reset request is not evidence of a physical cold start. A guest
+# killed during PSP/RLC initialization can leave state that the next probe does
+# not recover; the failed stage and actual host reset path need evidence.
+#
+# Raphael exposes bus-only reset and shares a bridge with host-owned functions.
+# This helper performs host writes when explicitly invoked. Do not invoke it
+# automatically to retry initialization or to investigate the recurring host
+# reboot. See docs/amdgpu-testing.md for the current unresolved incident.
 #
 # Reset must be attempted while the device is still bound to vfio-pci.
 # Unbinding first can put the function into D3cold, after which it no longer
@@ -101,4 +104,4 @@ if [ ! -e "$DEV/driver" ]; then
     exit 1
 fi
 
-echo "vfio-reset-gpu: $BDF is cold and bound to vfio-pci; start the guest now"
+echo "vfio-reset-gpu: $BDF reset request completed and is bound to vfio-pci; cold state is not verified"

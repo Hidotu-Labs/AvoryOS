@@ -129,50 +129,34 @@ longer a symlink to `/usr/lib`.
   This fixes a demonstrated PCI implementation bug, but does not establish
   the cause of the reported host reboot. The temporary PSP BUSY rejection
   patch was removed; firmware response handling remains upstream behavior.
-- **Warm GPU state between runs.**  QEMU does not reset the passed-through
-  iGPU when a VM exits.  A run that got as far as loading PSP SOS and was
-  then killed leaves the PSP running; the next `make run-vfio` can fail
-  early with `PSP create ring failed!` / probe `-22` because the bootloader
-  handshake no longer answers.  The device exposes only the `bus` reset
-  method (`/sys/.../reset_method` = `bus`; no FLR/PM), so try in order:
-  1. just retry the boot -- a failed PSP handshake followed by the driver's
-     `psp_ring_destroy()` teardown has unstuck it before (fail -> success
-     across two consecutive runs);
-  2. function reset **while the device is still bound** (unbinding first can
-     put it into D3cold, after which config space is gone and every reset
-     method returns `-ENOTTY`):
-     ```sh
-     cat /sys/bus/pci/devices/0000:0e:00.0/reset_method   # reports "bus"
-     sudo sh -c 'echo 1 > /sys/bus/pci/devices/0000:0e:00.0/reset'
-     ```
-     On this box the write fails with `Inappropriate ioctl for device`: the
-     `reset_method=bus` probe passes, but `0e:00.0` shares bus `0x0e` with
-     five other functions (HD audio, PSP/CCP, two xHCI USB controllers, more
-     audio), and the kernel refuses a parent-bus reset of a shared bus.
-     **Do not force a secondary-bus reset of `00:08.1` with `setpci`** - it
-     would reset those USB controllers as well.  On this machine a host
-     reboot is therefore the only safe way to cold-start the GPU; use
-     `make reset-gpu` to at least re-bind vfio-pci (it reports the actual
-     reset capability and never leaves the function orphaned).
-  3. reboot the host.
-  Once amdgpu is bound, prefer a clean guest shutdown over killing QEMU.
-  Clean power-off is preferable, but is not a guaranteed cold reset.
-  The native reboot/power-off/halt path now dispatches bound imported PCI
-  drivers' shutdown callbacks before storage shutdown and ACPI. AMDGPU's
-  existing callback suspends its IP blocks and unloads firmware state for
-  passthrough shutdown; previously it was never called. A private boot on
-  2026-10-11 completed this callback and the following boot initialized AMDGPU
-  successfully. Forced QEMU termination bypasses guest shutdown. These checks
-  do not prove a fix for the reported host reboot: the previous host journal
-  ended without a recorded panic or orderly shutdown.
-  The guest-side `pci_reset_function()` is
-  still a `-ENOTSUPP` stub (P5 C1
-  gap), so the driver's own recovery path cannot reset the device yet.
-  `make reset-gpu` (`sudo scripts/vfio-reset-gpu.sh [BDF]`) automates step 2,
-  but cannot reset this shared-bus GPU when the host refuses that reset. The driver's
-  bring-up sequence assumes a cold device, and a warm one shows up as
-  `AUTOLOAD_RLC` answering `TEE_ERROR_BUSY` or the KIQ HQD coming back with
-  cleared doorbell state (`dbctl=0`) and a `-110` ring test.
+- **Restarting QEMU does not establish a cold GPU.** On 2026-10-14 the user
+  reported that initialization sometimes fails, then closing QEMU and invoking
+  `make run-c7-prime` again can be followed by a whole-host reboot during the
+  next GPU initialization. Pixel artifacts also returned after an initially
+  clean run. Treat both symptoms as unresolved and pause physical retries.
+  `run-c7-prime` invokes `run-vfio` with `0000:0e:00.0`; it does not call the
+  separate `reset-gpu` recipe. Host VFIO open/close and QEMU device reset can
+  exercise reset and power paths. A completed reset request or a new VM is
+  not proof that all GPU/PSP/SMU state is cold. The earlier statement that
+  QEMU/VFIO never resets on exit was incorrect.
+  Read-only inspection confirmed `reset_method=bus`, driver `vfio-pci`, IOMMU
+  group 24, and the shared upstream bridge `00:08.1` with host-owned audio,
+  CCP and xHCI functions in groups 25–29. This does not establish that a bus
+  reset actually ran: host ownership checks may reject it. Do not force a
+  shared-bridge reset or use `make reset-gpu` as an automatic retry step.
+  The helper performs host writes and is a separate explicitly authorized
+  experiment, not a diagnosis or a guaranteed cold-start solution.
+  The native guest shutdown path dispatches imported PCI shutdown callbacks;
+  forced QEMU termination bypasses those guest callbacks. A clean shutdown
+  still does not establish safe hardware reinitialization.
+  The imported Raphael path is `nv_common` (GC 10.3.6), and discovery sets
+  `AMD_IS_APU`. Its `nv_need_reset_on_init()` returns false for APUs, so the
+  generic reset-on-init conditional is skipped for correctly discovered
+  Raphael. PSP/SMU/IP initialization and other recovery paths remain active.
+  This narrows one guest call path; it does not rule out firmware effects,
+  host VFIO reset, or another host failure. The guest's generic
+  `pci_reset_function()` remains unsupported rather than performing SBR.
+  See [the updated stability audit](linuxkpi-stability-audit-2026-10-14.md).
 - **Use `make run-c7-prime` for AMDGPU sessions.** Display Core remains
   enabled for the AMD primary renderer and VirtIO output. The former C4/C5
   launchers used `amdgpu.dc=0` for early driver bring-up and are retired.

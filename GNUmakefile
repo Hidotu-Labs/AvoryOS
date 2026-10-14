@@ -346,11 +346,12 @@ run-c7-prime: VFIO_EXTRA = -device edu -chardev socket,id=prime-diag,path=build/
 run-c7-prime: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
 run-c7-prime: run-vfio
 
-# Cold-start the passed GPU on the host before a C4+ boot.  QEMU/VFIO does not
-# reset the device on VM exit, and the guest driver's bring-up sequence assumes
-# a cold device (a warm one can answer AUTOLOAD_RLC with TEE_ERROR_BUSY or come
-# up with cleared KIQ doorbell state).  Needs root; see
-# scripts/vfio-reset-gpu.sh and docs/amdgpu-testing.md.
+# Separate, explicitly invoked host reset helper. run-c7-prime does not call
+# it. Closing/reopening QEMU can exercise VFIO reset and power paths; neither
+# a VM restart nor a successful reset request guarantees cold GPU state.
+# The Raphael GPU has bus-only reset and shares its bridge with host devices.
+# Do not use reset-gpu as an automatic init-retry step; see the incident notes
+# in docs/amdgpu-testing.md. No host reset/power experiment is authorized here.
 .PHONY: reset-gpu
 reset-gpu:
 	sudo scripts/vfio-reset-gpu.sh $(VFIO_BDF)
