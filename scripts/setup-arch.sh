@@ -821,12 +821,23 @@ install_apk "plasma-workspace-wallpapers" "community"
 install_apk "plasma-workspace-x11" "community"
 install_apk "plasma-desktop" "community"
 # Plasma 6's notification server, tray applet and settings module ship in
-# plasma-workspace. knotifications and libnotify (notify-send) are installed
-# above; knotifyconfig supplies KDE app notification settings. Keep sounds
-# explicit too, since install_apk skips packages already present in the tree.
+# plasma-workspace (org.kde.plasma.Notifications.service -> plasma_waitforname,
+# owned by plasmashell at session start). knotifications and libnotify
+# (notify-send) are installed above; knotifyconfig supplies KDE app
+# notification settings. Keep sounds explicit too, since install_apk skips
+# packages already present in the tree.
 install_apk "knotifyconfig" "community"
 install_apk "ocean-sound-theme" "community"
 install_apk "sound-theme-freedesktop" "community"
+# xfce4-notifyd (installed above for XFCE sessions) ships a competing
+# org.freedesktop.Notifications D-Bus activator. With both files present the
+# bus races and Plasma reports "Notification service not available /
+# provided by Xfce Notify Daemon". Mask the XFCE activator so D-Bus
+# activation resolves to plasma_waitforname and plasmashell owns the name.
+# XFCE sessions are unaffected: xfce4-notifyd still autostarts there via
+# /etc/xdg/autostart/xfce4-notifyd.desktop (OnlyShowIn=XFCE) and owns the
+# name by running, without needing D-Bus activation.
+rm -f "${ROOTFS_DIR}/usr/share/dbus-1/services/org.xfce.xfce4-notifyd.Notifications.service"
 # Optional Plasma applications/backends are not pulled in by plasma-desktop.
 # Discover needs PackageKit's Qt6 backend for the Arch repository view;
 # pacman resolves its daemon, libalpm, polkit and Qt dependencies together.
@@ -1137,6 +1148,13 @@ E:MAJOR=13
 E:MINOR=65
 TAGS=:seat:uaccess:
 UDEV
+
+# Select the Xorg profile for this boot's GPU topology before any display
+# manager runs: an image baked for VFIO otherwise leaves Xorg pointed at a
+# nonexistent card2 on plain `make run` boots and the server dies instantly.
+if [ -x /usr/bin/avory-xorg-profile ]; then
+    /usr/bin/avory-xorg-profile
+fi
 EOF
 chmod +x "${ROOTFS_DIR}/sbin/avory-early-init"
 
@@ -1146,10 +1164,20 @@ if [ -f "${ROOT_DIR}/userland/avory-login.elf" ]; then
     chmod +x "${ROOTFS_DIR}/bin/avory-login"
 fi
 
-# Native GPU selection and output sharing are configured in Xorg itself.
-mkdir -p "${ROOTFS_DIR}/etc/X11/xorg.conf.d"
+# Both Xorg profiles ship in the image; /sbin/avory-early-init selects the
+# one matching the boot's PCI topology (amdgpu passthrough vs native
+# card0), so bare `sddm` works with or without VFIO. The default copy is
+# the safe native layout; the disk-image step reapplies the build-time
+# XORG_PROFILE choice for boots where detection is inconclusive.
+mkdir -p "${ROOTFS_DIR}/etc/X11/xorg.conf.d" "${ROOTFS_DIR}/usr/share/avory-xorg"
+install -m 0644 "${ROOT_DIR}/config/xorg/10-modesetting.conf" \
+    "${ROOTFS_DIR}/usr/share/avory-xorg/10-modesetting-amdgpu.conf"
+install -m 0644 "${ROOT_DIR}/config/xorg/10-native.conf" \
+    "${ROOTFS_DIR}/usr/share/avory-xorg/10-modesetting-native.conf"
 install -m 0644 "${ROOT_DIR}/config/xorg/10-native.conf" \
     "${ROOTFS_DIR}/etc/X11/xorg.conf.d/10-modesetting.conf"
+install -m 0755 "${ROOT_DIR}/config/xorg/avory-xorg-profile.sh" \
+    "${ROOTFS_DIR}/usr/bin/avory-xorg-profile"
 # SDDM display manager defaults, baked into the image so bare `sddm`
 # behaves like the /bin/startx.sh path (which regenerates the same files
 # at boot). Without /etc/sddm.conf SDDM hides uid<1000 (no root login);

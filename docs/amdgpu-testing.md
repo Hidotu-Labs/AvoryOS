@@ -4,6 +4,27 @@ How to run, capture and compare the Raphael iGPU under VFIO on this host, and
 what is already known about the device.  Written at the Phase 5 closeout
 (2026-09-13) so a Phase 6 agent can reproduce every step.
 
+## Current abrupt-exit recovery work (2026-10-14)
+
+Raphael PF passthrough now defaults to the combined MODE2 initialization reset
+and checked PSP ring replacement. These hooks are scoped in LinuxKPI; imported
+AMDGPU sources were preserved. X-close and Ctrl-C/reopen physical pairs passed
+with both explicitly enabled. Default-policy validation and limitations are
+recorded in [combined recovery evidence](amdgpu-combined-recovery-2026-10-14.md).
+This does not establish production reliability or fix earlier pixel/FPS reports.
+
+`make run-c7-prime` enables both. For the original behavior, disable both:
+
+```sh
+make run-c7-prime KPI_AMDGPU_MODE2_RESET=0 KPI_AMDGPU_PSP_REINIT=0
+```
+
+Recovery parameters are `kpi_amdgpu_mode2_reset` and `kpi_amdgpu_psp_reinit`.
+The bounded physical runner only starts hardware guests with `--run`; use
+`python3 scripts/amdgpu-xclose-recovery.py --run --driver-defaults` to check
+native defaults, or add `--close-mode sigint` for Ctrl-C. Each run starts at
+most two physical guests and does not retry a failed initialization.
+
 ## Host facts
 
 | Fact | Value |
@@ -228,15 +249,15 @@ output GPU for the QEMU window. Both VFIO PCI slots are fixed: AMD at
 primary modesetting device needs KMS resources, even with no physical AMD
 monitor. The PRIME target defaults to 8 vCPUs (`VFIO_SMP=N` overrides this).
 
-The configuration lives in `config/xorg/10-modesetting.conf`. Disk builds
-default to this AMD-primary profile, including standalone `make disk.img`
-and `make all`, so rebuilding outside a VFIO launch cannot restore card0 as
-the renderer. Use `XORG_PROFILE=native` explicitly when building a disk for
-a desktop without passthrough; this selects `config/xorg/10-native.conf`.
-Switching launch targets reuses the existing
-disk and its installed configuration; it does not repopulate the disk to switch
-profiles. Set `XORG_PROFILE=amdgpu` or `XORG_PROFILE=native` when explicitly
-rebuilding the disk to change that configuration. The native PCI bridge publishes imported driver
+The configuration lives in `config/xorg/10-modesetting.conf`. Both profiles
+ship in every image (`/usr/share/avory-xorg/`), and `/sbin/avory-early-init`
+selects the one matching the boot's PCI topology via
+`/usr/bin/avory-xorg-profile`: the AMD-primary layout when a passed-through
+AMD VGA is present, else the native card0 software-rendering layout
+(`config/xorg/10-native.conf`, llvmpipe for GL clients). Switching launch
+targets therefore never needs a rebuild. `XORG_PROFILE=amdgpu|native` only
+sets the baked default for boots where detection is inconclusive, and
+`AVORY_XORG_PROFILE` overrides detection at boot. The native PCI bridge publishes imported driver
 bindings in sysfs so libudev can identify AMD. Xorg's AutoBindGPU associates
 the virtual output provider. `/usr/bin/avory-prime-display` explicitly connects
 RandR Sink Output providers to the Source Output provider, then enables the

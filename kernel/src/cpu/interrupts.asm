@@ -103,13 +103,10 @@ isr_common_stub:
     ;   [rsp+16] = rip      (CPU)
     ;   [rsp+24] = cs       (CPU)
     ;   [rsp+32] = rflags   (CPU)
-    ;   --- ring-3 only (CPU only saves RSP/SS on privilege change): ---
-    ;   [rsp+40] = rsp      (user, CPU)
-    ;   [rsp+48] = ss       (user, CPU)
-    ;
-    ; NOTE: for ring-0 exceptions [rsp+40] and [rsp+48] are NOT pushed by CPU.
-    ; The struct registers rsp/ss fields will contain garbage in that case.
-    ; The fault reporter reconstructs the pre-fault ring-0 RSP from this frame.
+    ;   [rsp+40] = rsp      (interrupted stack, CPU)
+    ;   [rsp+48] = ss       (CPU)
+    ; In 64-bit mode SS:RSP are pushed even without a privilege change.
+    ; The saved RSP also preserves the pointer before interrupt alignment.
 
     ; The kernel is entirely responsible for the direction flag: memset and
     ; memcpy here are REP strings, so an interrupted context with RFLAGS.DF=1

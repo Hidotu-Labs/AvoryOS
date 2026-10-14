@@ -146,6 +146,7 @@ static const struct attribute_group *p5d_groups[] = {
 
 static int p5d_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
   pm_message_t msg = {.event = 0};
+  pci_power_t observed = pdev->current_state;
 
   (void)id;
   p5d_probes++;
@@ -159,11 +160,14 @@ static int p5d_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
   pm_runtime_put_sync(&pdev->dev);
   pm_runtime_disable(&pdev->dev);
 
-  if (pci_set_power_state(pdev, PCI_D3hot) == 0 &&
-      pdev->current_state == PCI_D3hot &&
-      pci_set_power_state(pdev, PCI_D0) == 0 &&
-      pci_choose_state(pdev, msg) == PCI_D3hot &&
-      pci_wake_from_d3(pdev, true) == 0)
+  /* The compatibility layer must not pretend an unsupported physical PM
+   * transition succeeded. The original test expected inert bookkeeping. */
+  if (pci_set_power_state(pdev, PCI_D3hot) == -ENOTSUPP &&
+      pdev->current_state == observed &&
+      pci_set_power_state(pdev, observed) == 0 &&
+      pci_choose_state(pdev, msg) == PCI_D0 &&
+      pci_wake_from_d3(pdev, true) == -ENOTSUPP &&
+      pci_wake_from_d3(pdev, false) == 0)
     p5d_power_ok = 1;
   return 0;
 }
@@ -210,6 +214,86 @@ static int p5d_read_path(const char *path, char *buf, int buflen) {
 
 /* ── suite ──────────────────────────────────────────────────────────────── */
 
+static int p5d_release_order[16], p5d_release_count;
+
+static void p5d_action_record(void *data) {
+  if (p5d_release_count < 16)
+    p5d_release_order[p5d_release_count++] = (int)(long)data;
+}
+
+static void p5d_resource_record(struct device *dev, void *data) {
+  (void)dev;
+  p5d_action_record((void *)(long)*(int *)data);
+}
+
+static int p5d_add_resource(struct device *dev, int value) {
+  int *res = devres_alloc(p5d_resource_record, sizeof(*res), GFP_KERNEL);
+  if (!res)
+    return -ENOMEM;
+  *res = value;
+  devres_add(dev, res);
+  return 0;
+}
+
+static void p5d_test_devres(void) {
+  struct device dev = {0}, other = {0};
+  void *outer, *inner;
+  device_initialize(&dev);
+  device_initialize(&other);
+  p5d_release_count = 0;
+  if (p5d_add_resource(&dev, 1) ||
+      devm_add_action(&dev, p5d_action_record, (void *)2) ||
+      p5d_add_resource(&dev, 3) ||
+      devm_add_action(&dev, p5d_action_record, (void *)4)) {
+    p5d_fail("devres mixed alloc", -ENOMEM);
+    goto out;
+  }
+  devres_release_all(&dev);
+  if (p5d_release_count == 4 && p5d_release_order[0] == 4 &&
+      p5d_release_order[1] == 3 && p5d_release_order[2] == 2 &&
+      p5d_release_order[3] == 1)
+    p5d_ok("devres mixed action/resource LIFO");
+  else
+    p5d_fail("devres mixed action/resource order", p5d_release_count);
+
+  p5d_release_count = 0;
+  if (devm_add_action(&dev, p5d_action_record, (void *)0) ||
+      p5d_add_resource(&other, 9))
+    goto alloc_fail;
+  outer = devres_open_group(&dev, NULL, GFP_KERNEL);
+  if (!outer || p5d_add_resource(&dev, 1))
+    goto alloc_fail;
+  inner = devres_open_group(&dev, NULL, GFP_KERNEL);
+  if (!inner || devm_add_action(&dev, p5d_action_record, (void *)2))
+    goto alloc_fail;
+  devres_close_group(&dev, inner);
+  if (p5d_add_resource(&dev, 3))
+    goto alloc_fail;
+  devres_close_group(&dev, outer);
+  if (devm_add_action(&dev, p5d_action_record, (void *)4))
+    goto alloc_fail;
+  devres_release_group(&dev, outer);
+  if (outer != inner && p5d_release_count == 3 &&
+      p5d_release_order[0] == 3 && p5d_release_order[1] == 2 &&
+      p5d_release_order[2] == 1)
+    p5d_ok("devres nested closed group bounds and device isolation");
+  else
+    p5d_fail("devres nested closed group bounds", p5d_release_count);
+  devres_release_all(&dev);
+  devres_release_all(&other);
+  if (p5d_release_count == 6 && p5d_release_order[3] == 4 &&
+      p5d_release_order[4] == 0 && p5d_release_order[5] == 9)
+    p5d_ok("devres resources outside group survive until detach");
+  else
+    p5d_fail("devres resources outside group", p5d_release_count);
+  return;
+alloc_fail:
+  p5d_fail("devres group alloc", -ENOMEM);
+out:
+  devres_release_all(&dev);
+  devres_release_all(&other);
+}
+
 void linuxkpi_test_phase5_devmodel(void) {
   struct pci_dev *edu;
   char path[80], buf[48];
@@ -222,6 +306,7 @@ void linuxkpi_test_phase5_devmodel(void) {
   p5d_power_ok = 0;
   p5d_probed = NULL;
   klog_puts("[LINUXKPI] Phase 5 devmodel self-test\n");
+  p5d_test_devres();
 
   edu = pci_get_device(P5D_VENDOR, P5D_DEVICE, NULL);
   if (!edu) {
@@ -247,7 +332,7 @@ void linuxkpi_test_phase5_devmodel(void) {
     p5d_fail("dev_pm_ops", 0);
 
   if (p5d_power_ok)
-    p5d_ok("pci_set_power_state/choose_state/wake_from_d3");
+    p5d_ok("PCI PM rejects unsupported transitions without faking state");
   else
     p5d_fail("pci power state", 0);
 

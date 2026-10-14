@@ -1,6 +1,7 @@
 
 #include "../arch/x86_64/extable.h"
 #include "../console/klog.h"
+#include "../cpu/kpf_dump.h"
 #include "../fs/vfs.h"
 #include "../hal/hal.h"
 #include "../lib/string.h"
@@ -654,6 +655,8 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
         return PF_REJECT("kernel read of a user address at a guarded (extable) "
                          "instruction", cr2, regs->rip);
       }
+      /* Capture the unguarded fault before ordinary logging can take locks. */
+      kpf_dump_thread_fault(regs, cr2);
       klog_puts("[VMM] kernel access faulted on user address cr2=");
       klog_hex64(cr2);
       klog_puts(" rip=");

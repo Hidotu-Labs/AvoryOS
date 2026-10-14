@@ -9,6 +9,10 @@
 // panic screen is written directly to the cached framebuffer scanout.
 void kpf_dump_page_fault(struct registers *regs, uint64_t cr2);
 
+// Capture an unguarded kernel access before the pager terminates its thread.
+// This does not consume the fatal-panic report guard or change fault handling.
+void kpf_dump_thread_fault(struct registers *regs, uint64_t cr2);
+
 // Compact lock-free register and control-state record for #DF. It avoids page
 // walks, thread lookups, and the ordinary panic/console machinery.
 void kpf_dump_double_fault(struct registers *regs);

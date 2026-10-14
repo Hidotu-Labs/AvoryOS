@@ -230,7 +230,14 @@ all: $(IMAGE_NAME).iso
 # configuration without KVM.  The arch-specific run-x86_64 target remains the
 # TCG implementation behind run-tcg.
 RUN_SMP ?= 8
+# Same cursor set as run-c7-prime: a relative mouse plus a hidden host
+# cursor (DISPLAY_OPT defaults to show-cursor=off), so the guest draws its
+# own software cursor into the scanout. Override per boot with
+# RUN_POINTER=usb-tablet and GTK_SHOW_CURSOR=on for the absolute-tablet
+# host cursor instead.
+RUN_POINTER ?= usb-mouse
 .PHONY: run run-tcg
+run: QEMUFLAGS = -m 4G -vga none -device virtio-vga,xres=1280,yres=800
 run: edk2-ovmf $(IMAGE_NAME).iso disk.img
 	qemu-system-$(ARCH) \
 		-M q35,pcspk-audiodev=snd0 \
@@ -247,7 +254,8 @@ run: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
-		-device usb-tablet,bus=xhci.0 \
+		-device $(RUN_POINTER),bus=xhci.0 \
+		$(DISPLAY_OPT) \
 		$(QEMUFLAGS)
 run-tcg: run-x86_64
 
@@ -311,7 +319,7 @@ VFIO_ROM_OPT = $(if $(wildcard $(VFIO_ROM)),$(VFIO_COMMA)romfile=$(VFIO_ROM),)
 .PHONY: run-vfio
 run-vfio: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
 run-vfio: edk2-ovmf $(IMAGE_NAME).iso disk.img
-	qemu-system-$(ARCH) \
+	$(VFIO_LAUNCHER) qemu-system-$(ARCH) \
 		-M q35 \
 		-m $(VFIO_MEM) \
 		-cpu host -enable-kvm \
@@ -336,13 +344,18 @@ run-vfio: edk2-ovmf $(IMAGE_NAME).iso disk.img
 # shares the desktop with the VirtIO output GPU. Keep Display Core enabled:
 # modesetting needs AMD KMS resources even without a connected monitor.
 .PHONY: run-c7-prime
-run-c7-prime: KERNEL_CMDLINE = kpi_amdgpu=1 kpi_prime_offload=1 amdgpu.runpm=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x4
+# Raphael recovery uses MODE2 together with checked PSP ring replacement.
+# Both remain explicitly disableable for investigation.
+KPI_AMDGPU_MODE2_RESET ?= 1
+KPI_AMDGPU_PSP_REINIT ?= 1
+run-c7-prime: KERNEL_CMDLINE = kpi_amdgpu=1 kpi_prime_offload=1 kpi_amdgpu_mode2_reset=$(KPI_AMDGPU_MODE2_RESET) kpi_amdgpu_psp_reinit=$(KPI_AMDGPU_PSP_REINIT) amdgpu.runpm=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x4
 run-c7-prime: SERIAL = chardev:prime-diag
 run-c7-prime: VFIO_SMP = 8
 # GLFW cursor capture/raw motion requires a relative device, not a tablet.
 run-c7-prime: VFIO_POINTER = usb-mouse
 run-c7-prime: GTK_SHOW_CURSOR = off
-run-c7-prime: VFIO_EXTRA = -device edu -chardev socket,id=prime-diag,path=build/logs/p6-c7-prime-serial.sock,server=on,wait=off,logfile=build/logs/p6-c7-prime.log -device rtl8139,netdev=net0,addr=08.0 -netdev user,id=net0
+run-c7-prime: VFIO_LAUNCHER = python3 scripts/qemu-prime-log.py --
+run-c7-prime: VFIO_EXTRA = -device edu -chardev socket,id=prime-diag,path=build/logs/p6-c7-prime-serial.sock,server=on,wait=off,logfile=build/logs/p6-c7-prime.log,logappend=on -device rtl8139,netdev=net0,addr=08.0 -netdev user,id=net0
 run-c7-prime: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
 run-c7-prime: run-vfio
 
@@ -645,16 +658,17 @@ disk.img: userland/test_clone_futex.elf
 DISK_SIZE_MIB ?= 12288
 
 disk.img: scripts/populate-ext2-dir.sh
-# Keep the VFIO desktop profile even when disk.img is rebuilt independently
-# of a run target. Non-passthrough images can use XORG_PROFILE=native.
+# Both Xorg profiles ship in every image; /sbin/avory-early-init selects the
+# one matching the boot's PCI topology (amdgpu passthrough vs native card0),
+# so bare `sddm` works with or without VFIO. XORG_PROFILE only sets the
+# baked default for boots where detection is inconclusive.
 XORG_PROFILE ?= amdgpu
 XORG_CONFIG = $(if $(filter amdgpu,$(XORG_PROFILE)),config/xorg/10-modesetting.conf,config/xorg/10-native.conf)
 
-# Pick a profile when populating a disk. Changing launch targets does not
-# switch profiles; the default remains amdgpu for standalone builds too.
-# To install the non-passthrough profile, rebuild with XORG_PROFILE=native.
+# Pick a profile when populating a disk. Switching launch targets never
+# needs a rebuild: early init re-selects the profile on every boot.
 disk.img: config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/20-output.conf scripts/image-runtime.py
-disk.img: config/xorg/avory-prime-display.sh config/xorg/45-prime-output.sh
+disk.img: config/xorg/avory-prime-display.sh config/xorg/45-prime-output.sh config/xorg/avory-xorg-profile.sh
 disk.img: scripts/image-firmware-install.sh
 disk.img: userland/test_signal_stack.elf
 disk.img: userland/test_user_dispatch.elf
@@ -987,8 +1001,19 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 	@if [ -d build/alpine/rootfs ]; then \
 		echo "Populating Arch Linux rootfs into disk image..."; \
 		mkdir -p build/alpine/rootfs/etc/X11/xorg.conf.d; \
+		mkdir -p build/alpine/rootfs/usr/share/avory-xorg; \
+		install -m 0644 config/xorg/10-modesetting.conf build/alpine/rootfs/usr/share/avory-xorg/10-modesetting-amdgpu.conf; \
+		install -m 0644 config/xorg/10-native.conf build/alpine/rootfs/usr/share/avory-xorg/10-modesetting-native.conf; \
 		install -m 0644 $(XORG_CONFIG) build/alpine/rootfs/etc/X11/xorg.conf.d/10-modesetting.conf; \
+		install -m 0755 config/xorg/avory-xorg-profile.sh build/alpine/rootfs/usr/bin/avory-xorg-profile; \
 		install -m 0755 config/xorg/avory-prime-display.sh build/alpine/rootfs/usr/bin/avory-prime-display; \
+		if [ -f build/alpine/rootfs/sbin/avory-early-init ]; then \
+			grep -q 'avory-xorg-profile' build/alpine/rootfs/sbin/avory-early-init || \
+				echo '/usr/bin/avory-xorg-profile 2>/dev/null || true' >> build/alpine/rootfs/sbin/avory-early-init; \
+		else \
+			{ echo '#!/bin/sh'; echo '/usr/bin/avory-xorg-profile 2>/dev/null || true'; } > build/alpine/rootfs/sbin/avory-early-init; \
+			chmod +x build/alpine/rootfs/sbin/avory-early-init; \
+		fi; \
 		mkdir -p build/alpine/rootfs/etc/X11/xinit/xinitrc.d; \
 		install -m 0755 config/xorg/45-prime-output.sh build/alpine/rootfs/etc/X11/xinit/xinitrc.d/45-prime-output.sh; \
 		mkdir -p build/alpine/rootfs/etc/sddm.conf.d; \
@@ -1772,6 +1797,7 @@ gpu-diagnostics: userland/test_gpu_corruption.elf userland/test_gpu_depth.elf us
 	install -m 0755 userland/test_gpu_pipeline_gl.elf build/gpu-diagnostics/test_gpu_pipeline_gl
 	install -m 0755 userland/radeonsi_vram_leak.elf build/gpu-diagnostics/radeonsi_vram_leak.elf
 	install -m 0755 scripts/gpu-debug-capture.sh build/gpu-diagnostics/gpu-debug-capture
+	install -m 0755 scripts/gpu-first-boot-capture.sh build/gpu-diagnostics/gpu-first-boot-capture.sh
 	@echo 'Diagnostics ready. Serve to the QEMU guest with:'
 	@echo 'python3 -m http.server 9007 --bind 127.0.0.1 --directory build/gpu-diagnostics'
 

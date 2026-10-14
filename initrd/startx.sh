@@ -49,6 +49,58 @@ if [ "$DRM_CARD" != "/dev/dri/card0" ]; then
         KMS_BUSID_LINE='    BusID       "PCI:0:3:0"'
     fi
 fi
+# ── Renderer selection: llvmpipe fallback when no radeonsi ───────────────
+# A plain `make run` boot has no VFIO GPU, so drm-pick.sh returns card0
+# and there is no radeonsi render node. Forcing glamor there makes Xorg
+# fail to open. Fall back to software rendering in that case: GL clients
+# (KWin, Qt, ...) use Mesa llvmpipe via the environment, and the
+# modesetting driver uses shadowfb (AccelMethod "none") instead of glamor.
+# ASCENT_RENDERER overrides the choice: auto (default), gpu/radeonsi,
+# llvmpipe/gl, pixman/sw.
+if [ -d /usr/lib/xorg/modules/dri ]; then
+    case ":${LIBGL_DRIVERS_PATH:-}:" in
+        *:/usr/lib/xorg/modules/dri:*) ;;
+        *)
+            LIBGL_DRIVERS_PATH="/usr/lib/xorg/modules/dri${LIBGL_DRIVERS_PATH:+:$LIBGL_DRIVERS_PATH}"
+            export LIBGL_DRIVERS_PATH
+            ;;
+    esac
+fi
+_has_radeonsi_lib=0
+for _d in /usr/lib/xorg/modules/dri/radeonsi_dri.so /usr/lib/dri/radeonsi_dri.so; do
+    if [ -e "$_d" ]; then
+        _has_radeonsi_lib=1
+        break
+    fi
+done
+unset _d
+ACCEL_METHOD="glamor"
+case "${ASCENT_RENDERER:-auto}" in
+    gpu|radeonsi)
+        ACCEL_METHOD="glamor"
+        unset LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER
+        ;;
+    llvmpipe|gl|pixman|sw|soft|software)
+        ACCEL_METHOD="none"
+        export LIBGL_ALWAYS_SOFTWARE=1
+        export GALLIUM_DRIVER=llvmpipe
+        ;;
+    auto|*)
+        if [ "${ASCENT_RENDERER:-auto}" != "auto" ]; then
+            echo "[startx] Unknown ASCENT_RENDERER='${ASCENT_RENDERER}' (expected: auto, gpu, llvmpipe, pixman)" >&2
+        fi
+        if [ "$DRM_CARD" = "/dev/dri/card0" ] || [ "$_has_radeonsi_lib" -eq 0 ]; then
+            ACCEL_METHOD="none"
+            export LIBGL_ALWAYS_SOFTWARE=1
+            export GALLIUM_DRIVER=llvmpipe
+        else
+            ACCEL_METHOD="glamor"
+            unset LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER
+        fi
+        ;;
+esac
+unset _has_radeonsi_lib
+echo "[startx] renderer: AccelMethod=$ACCEL_METHOD GALLIUM_DRIVER=${GALLIUM_DRIVER:-<unset>} LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE:-<unset>}"
 mkdir -p /etc/X11/xorg.conf.d
 cat > /etc/X11/xorg.conf.d/10-modesetting.conf <<EOF
 Section "ServerLayout"
@@ -62,7 +114,7 @@ EndSection
 Section "Device"
     Identifier  "Card0"
     Driver      "modesetting"
-    Option      "AccelMethod" "glamor"
+    Option      "AccelMethod" "$ACCEL_METHOD"
 $KMSDEV_OPT
 $KMS_BUSID_LINE
     Option      "SWcursor" "true"
@@ -159,6 +211,20 @@ if command -v dbus-daemon >/dev/null 2>&1; then
 fi
 
 chmod 1777 /tmp /tmp/.X11-unix 2>/dev/null || true
+
+# ── Pre-flight diagnostics ──────────────────────────────────────────────
+# SDDM hides Xorg's own log ("Failed to read display number from pipe"),
+# so print the inputs to Xorg startup here where a console screenshot
+# captures them. The server log itself lands in /var/log/Xorg.0.log.
+echo "[startx] ── preflight ──"
+cat /etc/X11/xorg.conf.d/10-modesetting.conf
+echo "[startx] dri: $(ls /dev/dri 2>/dev/null || echo MISSING)"
+echo "[startx] input: $(ls /dev/input 2>/dev/null || echo MISSING)"
+_PREFLIGHT_XORG="/usr/libexec/Xorg"
+[ -x "$_PREFLIGHT_XORG" ] || _PREFLIGHT_XORG="/usr/bin/Xorg"
+"$_PREFLIGHT_XORG" -version 2>&1 | head -2 || true
+unset _PREFLIGHT_XORG
+echo "[startx] ── end preflight ──"
 
 # ── Launch SDDM ───────────────────────────────────────────────────────────
 if command -v sddm >/dev/null 2>&1; then

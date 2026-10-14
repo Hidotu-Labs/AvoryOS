@@ -269,13 +269,18 @@ ifneq ($(linux-obj-y),)
     # imported implementation pristine and compile it under its bridge name.
     ifeq ($(KPI_AMDGPU),1)
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c.o: override LINUX_CPPFLAGS += -Damdgpu_gem_create_ioctl=linuxkpi_amdgpu_gem_create_ioctl
+    # Release kernel doorbells while the TTM managers still own their BO.
+    obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c.o: override LINUX_CPPFLAGS += -Damdgpu_ttm_fini=linuxkpi_original_amdgpu_ttm_fini
+    obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c.o: override LINUX_CPPFLAGS += -Damdgpu_ib_schedule=linuxkpi_original_amdgpu_ib_schedule
+    obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c.o: override LINUX_CPPFLAGS += -include linuxkpi/include/linuxkpi/amdgpu_init_reset.h
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c.o: override LINUX_CPPFLAGS += -Damdgpu_gem_va_ioctl=linuxkpi_original_amdgpu_gem_va_ioctl
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c.o: override LINUX_CPPFLAGS += -Damdgpu_vm_bo_update=linuxkpi_original_amdgpu_vm_bo_update -Dtrace_amdgpu_vm_bo_update=trace_linuxkpi_original_amdgpu_vm_bo_update
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c.o: override LINUX_CPPFLAGS += -Damdgpu_fence_emit=linuxkpi_original_amdgpu_fence_emit
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c.o: override LINUX_CPPFLAGS += -Dpsp_wait_for=linuxkpi_original_psp_wait_for
+    obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c.o: override LINUX_CPPFLAGS += -include linuxkpi/include/linuxkpi/psp_ring_trace.h
     obj-$(ARCH)/linux/drivers/dma-buf/dma-fence.c.o: override LINUX_CPPFLAGS += -Ddma_fence_signal=linuxkpi_original_dma_fence_signal
     obj-$(ARCH)/linux/drivers/dma-buf/dma-resv.c.o: override LINUX_CPPFLAGS += -Ddma_resv_add_fence=linuxkpi_original_dma_resv_add_fence
-    obj-$(ARCH)/linuxkpi/src/amdgpu_memory.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_trace.c.o: override LINUX_CPPFLAGS += \
+    obj-$(ARCH)/linuxkpi/src/amdgpu_memory.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_trace.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_teardown.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_init_reset.c.o obj-$(ARCH)/linuxkpi/src/psp_submit_trace.c.o obj-$(ARCH)/linuxkpi/src/psp_completion_trace.c.o obj-$(ARCH)/linuxkpi/src/psp_reinit.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_ib_visibility.c.o: override LINUX_CPPFLAGS += \
         -DAVORYOS_AMDGPU_MEMORY_POLICY \
         -Ilinux/drivers/gpu/drm/amd/amdgpu \
         -Ilinux/drivers/gpu/drm/amd/include \

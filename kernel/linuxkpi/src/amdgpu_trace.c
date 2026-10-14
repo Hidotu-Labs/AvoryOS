@@ -39,6 +39,20 @@ int psp_wait_for(struct psp_context *psp, uint32_t reg_index,
   return ret;
 }
 
+int linuxkpi_psp_ring_create(struct psp_context *psp,
+                            enum psp_ring_type ring_type) {
+  int ret;
+  /* Read software-owned setup only. No additional register access, commands,
+   * buffer changes, retries, or alteration of the family's return value. */
+  klogf("[INFO] LinuxKPI: PSP ring-create enter type=%u gpu=%llx size=%u "
+        "timeout_us=%u\n", (unsigned)ring_type,
+        (unsigned long long)psp->km_ring.ring_mem_mc_addr,
+        psp->km_ring.ring_size, psp->adev->usec_timeout);
+  ret = psp->funcs->ring_create(psp, ring_type);
+  klogf("[INFO] LinuxKPI: PSP ring-create exit ret=%d\n", ret);
+  return ret;
+}
+
 int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data, struct drm_file *file) {
   struct drm_amdgpu_gem_va *args = data;
   /* This is the DRM core's kernel argument copy, not an unchecked user ptr. */

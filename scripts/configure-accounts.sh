@@ -259,6 +259,11 @@ REAL_BIN="/usr/bin/startplasma-x11-bin"
 if [ ! -x "$REAL_BIN" ]; then
     REAL_BIN="/usr/bin/startplasma-x11.real"
 fi
+# A stray xfce4-notifyd (D-Bus-activated before plasmashell claimed
+# org.freedesktop.Notifications, or leftover from an XFCE session) makes
+# Plasma show "Notification service not available / provided by Xfce Notify
+# Daemon". Reclaim the name for plasmashell; never fail the login.
+pkill -x xfce4-notifyd 2>/dev/null || true
 exec "$REAL_BIN" "$@"
 WRAPPER_EOF
     chmod 0755 "${ROOTFS_DIR}/usr/bin/startplasma-x11"

@@ -488,8 +488,7 @@ static void dump_machine_state(struct registers *regs, uint64_t cr2,
   out_lit(((regs->rflags >> 10) & 1) ? "1 (REP strings run backwards!)" : "0");
   out_lit("\n[KPF] interrupted RSP=");
   out_hex(live_rsp);
-  out_lit((regs->cs & 3) ? " (saved by CPU on privilege change)\n"
-                         : " (reconstructed from the ring-0 interrupt frame)\n");
+  out_lit(" (saved by CPU in the 64-bit interrupt frame)\n");
 
   out_lit("[KPF] CR0=");
   out_hex(cr0);
@@ -510,8 +509,8 @@ static void dump_machine_state(struct registers *regs, uint64_t cr2,
   out_lit("]\n");
 
   if (!(regs->cs & 0x3) && cr2 <= USER_SPACE_LIMIT)
-    out_lit("[KPF] NOTE: kernel code touched a user address - SMAP violation or "
-            "a missing copy_to/from_user guard\n");
+    out_lit("[KPF] NOTE: kernel accessed a low address; check pointer ownership "
+            "and user-copy guards\n");
 
   out_lit("[KPF] REGISTERS:\n[KPF]   RAX=");
   out_hex(regs->rax);
@@ -639,6 +638,27 @@ static void dump_pager_verdict(uint64_t cr2) {
 
 // Entry points
 
+void kpf_dump_thread_fault(struct registers *regs, uint64_t cr2) {
+  static unsigned reporting;
+  if (!regs || __atomic_exchange_n(&reporting, 1, __ATOMIC_ACQ_REL))
+    return;
+
+  uint64_t live_rsp = regs->rsp;
+  /* Peers keep running on this thread-exit path. Serial output may interleave;
+   * the existing synchronous writer and translated reads avoid allocating or
+   * acquiring logger locks. Leave the independent fatal report guard alone.
+   */
+  out_lit("\n[KPF] THREAD FAULT: unguarded kernel access; terminating thread\n");
+  dump_error_code(regs->err_code);
+  dump_machine_state(regs, cr2, live_rsp);
+  dump_thread_context();
+  dump_code_at_rip(regs->rip);
+  dump_stack_scan(live_rsp, readable_current_thread());
+  dump_rbp_chain(regs->rbp);
+  out_lit("[KPF] thread fault report complete\n");
+  __atomic_store_n(&reporting, 0, __ATOMIC_RELEASE);
+}
+
 void kpf_dump_page_fault(struct registers *regs, uint64_t cr2) {
   if (!regs)
     return;
@@ -661,12 +681,10 @@ void kpf_dump_page_fault(struct registers *regs, uint64_t cr2) {
     return;
   }
 
-  /* On same-privilege exceptions, the CPU pushes only RIP/CS/RFLAGS. The
-   * rsp slot immediately after that frame therefore marks the interrupted
-   * stack pointer. Capturing RSP here would scan this reporter's own frames. */
-  uint64_t live_rsp = (regs->cs & 3)
-                          ? regs->rsp
-                          : (uint64_t)(uintptr_t)&regs->rsp;
+  /* In 64-bit mode the CPU saves SS:RSP even without a privilege change.
+   * Taking the address of the saved slot would scan the interrupt frame,
+   * not the interrupted stack (and also fails when an IST stack is used). */
+  uint64_t live_rsp = regs->rsp;
 
   out_lit("\n[KPF] +----------------------------------------------------------"
           "------------------+\n");
@@ -778,8 +796,7 @@ void kpf_dump_exception(const char *reason, struct registers *regs) {
 
   uint64_t live_rsp;
   uint64_t cr2 = 0;
-  live_rsp = (regs->cs & 3) ? regs->rsp
-                            : (uint64_t)(uintptr_t)&regs->rsp;
+  live_rsp = regs->rsp;
   __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
 
   out_lit("\n[KPF] +----------------------------------------------------------"

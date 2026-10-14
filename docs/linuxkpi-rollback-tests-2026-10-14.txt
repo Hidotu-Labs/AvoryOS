@@ -1,0 +1,160 @@
+CPU regressions after rollback, fault reporting and devres corrections — 2026-10-14
+
+PASS test_kpi_completion.py
+PASS: zero-time waits claim available completion and return success
+PASS: two competing waiters consume exactly one completion token
+PASS: single/all completion wakeups run under the lifetime lock
+PASS: all wait APIs, signals, timeout, complete_all and counted tokens
+PASS: eight waiters consume 32000 signals with no early/lost credits
+
+PASS test_kpi_dma_fence_irq_work.py
+PASS: 2000 imported fence-array completions drop final reference safely under actual irq_work (ASan/UBSan)
+
+PASS test_kpi_dma_masks.py
+PASS: high RAM, range overflow, mask rejection, vmalloc rejection, SG address/length population and failure rollback
+
+PASS test_kpi_gpu_coherency.py
+PASS: x86 clflush default+CPUID, wbinvd flush, irq_work queue/drain/sync without post-callback writes
+
+PASS test_kpi_gpu_kernel_correctness.py
+PASS: 2000 virtual frees, high RAM, 2000 nested FPU sections, migration exclusion, register and IRQ restoration
+PASS: both original defects fail the regression
+
+PASS test_kpi_init_lifecycle.py
+PASS: initcalls remain a boot barrier beyond 600s, join after completion, creation failure is reported, stray completion cannot open boot, and aborted worker is reported while boot remains blocked
+
+PASS test_kpi_irq_queue_locks.py
+PASS: 1800 same-CPU IRQ injections; service/queue/spawn/retire/cancel preserve IRQ state and published work
+PASS: service plain lock reproduces the interrupt self-deadlock
+PASS: workqueue plain lock reproduces the interrupt self-deadlock
+PASS: kthread worker plain lock reproduces the interrupt self-deadlock
+
+PASS test_kpi_irq_sync.py
+PASS: threaded sync, hardirq contract, ONESHOT/disable masking, shared rejection, 300 concurrent dispatch/free iterations
+
+PASS test_kpi_irq_work_lifetime.py
+PASS: fixed runs 1000 self-free and 2000 self-requeue callbacks under ASan/UBSan
+PASS: old post-callback write rejects the old callback lifetime violation
+
+PASS test_kpi_irq_work_sync.py
+PASS: irq_work_sync waits through pending, running and self-requeued callbacks
+
+PASS test_kpi_mmio_ordering.py
+PASS: native MMIO widths and normal-memory publication/completion ordering
+
+PASS test_kpi_mutex_contention.py
+PASS: 96000 contended acquisitions preserve single ownership and drain every waiter
+
+PASS test_kpi_page_physical_bounds.py
+PASS: sparse PFN metadata covers high RAM across PCI holes and rejects addresses above managed RAM
+
+PASS test_kpi_pci_power.py
+PASS: unsupported D0/D3 transitions/wake fail without changing current_state
+
+PASS test_kpi_pci_shutdown.py
+PASS: bound devices shut down once, in reverse order, before native power/reset
+
+PASS test_kpi_pci_state.py
+PASS: W1C/readonly protection, BAR-before-command, 32/64-bit MSI snapshot round-trip, FLR exclusion, read failure, MSI-X/bridge rejection
+
+PASS test_kpi_percpu_storage.py
+PASS: 64 initialized CPU copies, actual AMD FPU cross-CPU entries, actual IDR preload isolation and pin lifetime, IRQ restoration
+PASS: shared per-CPU storage and no-op local locks both fail the same regression
+
+PASS test_kpi_preempt_cpu_pin.py
+PASS: 2000 CPU-lookup migration injections, nested pinning and IRQ restoration
+PASS: original unprotected CPU lookup reproduces migration before pinning
+
+PASS test_kpi_prepared_wait.py
+PASS: fence wake before timeout, wake after park, stale wake isolation and wait cleanup
+
+PASS test_kpi_rcu_lifetime.py
+PASS: native RCU late-callback lifetime, completed-drain retention, concurrent waiters, callback barrier, 8000 callbacks and 120000 reader sections
+
+PASS test_kpi_shmem_lifetime.py
+PASS: final put/free, compound refs, 16 concurrent shmem readers, 500 TTM-style swap cycles, truncate with live readers, error cleanup; all pages reclaimed
+PASS: original double-decrement and missing caller-reference controls fail
+
+PASS test_kpi_task_lifetime.py
+PASS: counted task/control ownership; 1000 exits and 4000 stop/detach lifecycles, OOM cancellation, 2000 wakes, 9002 allocations, zero live allocations
+PASS: original no-op final task put fails the counted-allocation regression
+
+PASS test_kpi_timer_teardown.py
+PASS: expired batch cancellation, running timer rearm drain, hrtimer restart/cancel and try-cancel active contract
+PASS: former del_timer_sync fails the callback-rearm regression
+
+PASS test_kpi_vmap_lifetime.py
+PASS: real VMAP and I/O teardown retain reservations through concurrent allocation; offsets cannot overlap; page-table failure unwinds
+PASS: original I/O teardown race fails the same regression
+
+PASS test_kpi_workqueue_requeue.py
+PASS: 1000 callback self-frees under ASan/UBSan, requeue serialization, flush/cancel, cancellation across self-requeue, armed delayed flush, queued delayed cancellation and running delayed rearm drain and queue destruction drain
+
+PASS test_kpi_ww_mutex.py
+PASS: free-owner requeue, 24000 rapid 8-thread reacquisitions, first-lock contention, balanced BO refs, 2000 ABBA transactions, blocked-holder wound, slow retries, duplicate/trylock/signal semantics
+
+PASS test_linuxkpi_cache_aliases.py
+PASS: TTM WC/UC/WB, RAM/BAR mmap aliases and failed-transition rollback
+
+PASS test_linuxkpi_file_exports.py
+PASS: repeated/overlapping DMA-buffer exports, transfer lifetime, reservation cancellation, OOM and exhaustion
+
+PASS test_native_dma_cache_lifetime.py
+PASS: coherent DMA under masked IRQs, completed UC transitions, delayed remote TLBs, page/free/rollback/quarantine and overflow
+PASS: reuse before remote acknowledgement fails the negative control
+PASS: missing pre-transition invalidation fails the negative control
+PASS: UC user alias of coherent DMA RAM fails the negative control
+
+PASS test_pci_config_transactions.py
+PASS: native byte/word/dword widths, neighboring W1C status, extended ECAM and concurrent CF8 transactions; old implementation fails
+
+PASS test_amdgpu_memory_policy.py
+PASS: native AMD allocation policy, upstream error/handle forwarding, caller flags and disabled-driver build
+
+PASS test_drm_gem_initialization.py
+PASS: recycled GEM pages and mapping padding cleared before publication; failed allocations unpublished
+
+PASS test_kpi_pci_access_lifecycle.py
+PASS: config bounds/alignment/overflow and managed enable failure/cleanup/nesting
+
+PASS test_kpi_driver_fault_result.py
+PASS: rejected driver faults cannot fabricate CPU backing; success and concurrent unmap release the bridge exactly once
+PASS: former device-fault fallback fails the CPU/GPU backing regression
+
+PASS test_kpi_fault_contract.py
+PASS: Linux 6.6 fault masks and retry only on the first allowed attempt
+PASS: former inverted first-retry predicate fails the regression
+
+PASS test_kpi_seqcount.py
+PASS: seqcount/seqlock readers reject in-progress writers and retry completed changes
+PASS: former odd-sequence reader fails the regression
+
+PASS test_gpu_resource_hooks.py
+PASS: PSP wait failures preserve original result and report status with one read; VM/BO/DMA/fence identities, original failures forwarded, optional tracing disabled, no post-signal dereference under ASan/UBSan
+
+PASS test_gpu_flight_recorder.py
+PASS: GPU recorder concurrency, retained samples, 128 KiB serial backpressure, bounded stalled export, chunked reads and pixel hashes
+
+PASS test_gpu_corruption_oracle.py
+PASS: mixed normalized 100 llvmpipe frames (6553600 exact pixel checks), zero mismatches
+PASS: texture normalized 50 llvmpipe frames (3276800 exact pixel checks), zero mismatches
+PASS: stream normalized 50 llvmpipe frames (3276800 exact pixel checks), zero mismatches
+PASS: mixed integer 100 llvmpipe frames (6553600 exact pixel checks), zero mismatches
+PASS: texture integer 50 llvmpipe frames (3276800 exact pixel checks), zero mismatches
+PASS: stream integer 50 llvmpipe frames (3276800 exact pixel checks), zero mismatches
+PASS: test-only injected readback mismatch returns failure, correct frame CSV and valid top-down actual/expected PNG pair
+PASS: unavailable AMDGPU hardware returns an explicit unexecuted-test error
+
+PASS test_pci_driver_identity.py
+[KERNEL] LinuxKPI: pci amdgpu probe 0000:00:03.0 failed: -5
+PASS: failed probes release managed resources and drvdata; unmatched/failed probes publish no binding; successful binds publish the actual driver; unregister drains resources after remove
+PASS: libudev driver link, reciprocal device link, unbind removal and rebind
+
+PASS test_kpi_ttm_eviction.py
+PASS: imported uninitialized empty-manager result fails the same regression
+PASS: empty and occupied TTM managers, move fence drain, error propagation and lock/ref balance
+
+PASS test_kpi_devres.py
+PASS: actual devres mixed LIFO, latest action removal, nested/closed/crossing groups, isolation, reentrant registration, allocation failure and 8000 concurrent releases (ASan/UBSan)
+
+Result: 42/42 passed

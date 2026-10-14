@@ -47,7 +47,7 @@ def run(argv):
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
-def prepare():
+def prepare(extra_root_setup=None, kernel_cmdline=None):
     disk = OUT / 'root.img'
     for proc in Path('/proc').iterdir():
         if not proc.name.isdigit():
@@ -68,6 +68,8 @@ def prepare():
     (OUT / 'init.c').write_text(INIT)
     run([ROOT / 'toolchain/x86_64-linux-musl/bin/x86_64-linux-musl-gcc',
          '-O2', '-static', OUT / 'init.c', '-o', root / 'bin/probe-init'])
+    if extra_root_setup is not None:
+        extra_root_setup(root)
     with disk.open('wb') as stream:
         stream.truncate(128 * 1024**2)
     run(['mke2fs', '-q', '-t', 'ext2', '-F', '-d', root, disk])
@@ -82,7 +84,7 @@ def prepare():
     (boot / 'boot/limine/limine.conf').write_text(
         'timeout: 0\n/Restart regression\n    protocol: limine\n'
         '    path: boot():/boot/kernel\n'
-        '    cmdline: kpi_amdgpu=0 init=/bin/probe-init\n'
+        f'    cmdline: {kernel_cmdline or "kpi_amdgpu=0 init=/bin/probe-init"}\n'
         '    resolution: 1280x800\n')
     iso = OUT / 'boot.iso'
     run(['xorriso', '-as', 'mkisofs', '-R', '-r', '-J', '-b',
@@ -94,7 +96,8 @@ def prepare():
     return disk, iso
 
 
-def boot_test(cpus, disk, iso):
+def boot_test(cpus, disk, iso, extra_qemu_args=(), launch_prefix=(),
+              append_serial=False):
     serial = OUT / f'kvm{cpus}-serial.log'
     host = OUT / f'kvm{cpus}-host.log'
     serial.unlink(missing_ok=True)
@@ -106,6 +109,13 @@ def boot_test(cpus, disk, iso):
            'nvme,serial=restart-probe,drive=probe', '-vga', 'none', '-device',
            'virtio-vga,addr=06.0,xres=1280,yres=800', '-display', 'none',
            '-serial', f'file:{serial}', '-monitor', 'none', '-no-reboot']
+    cmd.extend(extra_qemu_args)
+    if append_serial:
+        cmd[cmd.index('-serial') + 1] = 'chardev:probe-log'
+        cmd.extend(['-chardev',
+                    f'socket,id=probe-log,path={OUT}/serial.sock,server=on,wait=off,'
+                    f'logfile={serial},logappend=on'])
+    cmd = [str(arg) for arg in launch_prefix] + cmd
     with host.open('wb') as output:
         process = subprocess.Popen(cmd, stdout=output, stderr=output)
         try:

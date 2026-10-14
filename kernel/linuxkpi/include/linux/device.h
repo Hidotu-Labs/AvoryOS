@@ -26,6 +26,7 @@
 #include <linux/pm.h>
 #include <linux/ratelimit.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
@@ -93,11 +94,9 @@ struct device {
   struct device_dma_parameters dma_parms;
   bool removable; /* dev_is_removable() consumers (stock device.h) */
   struct list_head devres_head;
+  spinlock_t devres_lock;
   struct list_head kpi_list; /* global created-device list (device_destroy) */
   char kpi_name[48];
-  /* devres group marks (linuxkpi/src/device.c); NULL when no group is open */
-  void *kpi_group_node_mark;
-  void *kpi_group_alloc_mark;
 };
 
 /* Defined here (not in driver.h) because upstream <linux/device.h> provides

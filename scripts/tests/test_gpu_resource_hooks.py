@@ -20,8 +20,12 @@ enum dma_resv_usage{DMA_RESV_USAGE_KERNEL,DMA_RESV_USAGE_WRITE};
 struct page{u64 phys;int _refcount;};
 struct ttm_tt{struct page **pages;u64 *dma_address;unsigned long num_pages;};
 struct ttm_resource{unsigned mem_type;};
-struct amdgpu_device{int dummy;};
-struct psp_context{struct amdgpu_device *adev;};
+struct amdgpu_device{unsigned usec_timeout;};
+enum psp_ring_type{PSP_RING_TYPE__KM=2};
+struct psp_context;
+struct psp_funcs{int (*ring_create)(struct psp_context*,enum psp_ring_type);};
+struct psp_ring{u64 ring_mem_mc_addr;unsigned ring_size;};
+struct psp_context{struct amdgpu_device *adev;struct psp_ring km_ring;const struct psp_funcs *funcs;};
 static int psp_result;static unsigned psp_calls,status_reads,diagnostics;
 static uint32_t psp_read(uint32_t reg){assert(reg==0x40);status_reads++;return 0xdead;}
 #define RREG32(reg) ((void)adev,psp_read(reg))

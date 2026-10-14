@@ -42,6 +42,7 @@ void dev_set_drvdata(struct device *dev, void *data) {
 
 void device_initialize(struct device *dev) {
   INIT_LIST_HEAD(&dev->devres_head);
+  spin_lock_init(&dev->devres_lock);
   INIT_LIST_HEAD(&dev->kpi_list);
 }
 
@@ -252,27 +253,48 @@ struct devres_node {
   struct list_head entry;
   void *data;
   void (*release)(void *);
+  dr_release_t resource_release;
+  struct device *owner;
+  enum { DEVRES_ACTION, DEVRES_RESOURCE, DEVRES_GROUP_OPEN,
+         DEVRES_GROUP_CLOSE } kind;
+  bool selected;
 };
 
 /* devres_alloc()/devres_add() internal API used by imported helpers (e.g.
  * devm_kasprintf_strarray in string_helpers.c).  The record wraps the
  * caller's data and is released together with the device. */
 struct devres_alloc_rec {
-  struct list_head list;
-  struct device *dev;
-  dr_release_t release;
-  char data[];
+  struct devres_node node;
+  char data[] __aligned(ARCH_KMALLOC_MINALIGN);
 };
 
-static LIST_HEAD(devres_alloc_list);
+struct devres_group {
+  struct devres_node open, close;
+  void *id;
+};
+
+static void devres_ensure(struct device *dev) {
+  /* Legacy zeroed wrappers initialize before publication. Normal devices
+   * initialize this list and lock together in device_initialize(). */
+  if (!dev->devres_head.next) {
+    INIT_LIST_HEAD(&dev->devres_head);
+    spin_lock_init(&dev->devres_lock);
+  }
+}
 
 void *devres_alloc(dr_release_t release, size_t size, gfp_t gfp) {
-  struct devres_alloc_rec *rec = kmalloc(sizeof(*rec) + size, gfp);
+  struct devres_alloc_rec *rec;
+
+  if (size > (size_t)-1 - sizeof(*rec))
+    return NULL;
+  rec = kzalloc(sizeof(*rec) + size, gfp);
 
   if (!rec)
     return NULL;
-  rec->dev = NULL;
-  rec->release = release;
+  INIT_LIST_HEAD(&rec->node.entry);
+  rec->node.kind = DEVRES_RESOURCE;
+  rec->node.data = rec->data;
+  rec->node.resource_release = release;
   return rec->data;
 }
 
@@ -280,8 +302,13 @@ void devres_add(struct device *dev, void *res) {
   struct devres_alloc_rec *rec =
       container_of(res, struct devres_alloc_rec, data);
 
-  rec->dev = dev;
-  list_add_tail(&rec->list, &devres_alloc_list);
+  unsigned long flags;
+  devres_ensure(dev);
+  spin_lock_irqsave(&dev->devres_lock, flags);
+  BUG_ON(!list_empty(&rec->node.entry));
+  rec->node.owner = dev;
+  list_add_tail(&rec->node.entry, &dev->devres_head);
+  spin_unlock_irqrestore(&dev->devres_lock, flags);
 }
 
 void devres_free(void *res) {
@@ -290,32 +317,30 @@ void devres_free(void *res) {
   if (!res)
     return;
   rec = container_of(res, struct devres_alloc_rec, data);
-  if (rec->dev)
-    list_del(&rec->list);
+  /* Attached resources belong to the device and cannot be freed here. */
+  BUG_ON(!list_empty(&rec->node.entry));
   kfree(rec);
-}
-
-static void devres_ensure(struct device *dev) {
-  if (!dev->devres_head.next)
-    INIT_LIST_HEAD(&dev->devres_head);
 }
 
 static void __kpi_kfree_action(void *p) { kfree(p); }
 
 int devm_add_action(struct device *dev, void (*action)(void *), void *data) {
   struct devres_node *node;
+  unsigned long flags;
 
   if (!dev)
     return -EINVAL;
 
-  node = kmalloc(sizeof(*node), GFP_KERNEL);
+  node = kzalloc(sizeof(*node), GFP_KERNEL);
   if (!node)
     return -ENOMEM;
 
   node->data = data;
   node->release = action;
   devres_ensure(dev);
+  spin_lock_irqsave(&dev->devres_lock, flags);
   list_add_tail(&node->entry, &dev->devres_head);
+  spin_unlock_irqrestore(&dev->devres_lock, flags);
   return 0;
 }
 
@@ -331,108 +356,155 @@ int devm_add_action_or_reset(struct device *dev, void (*action)(void *),
 void devm_remove_action(struct device *dev, void (*action)(void *),
                         void *data) {
   struct devres_node *node;
+  struct devres_node *found = NULL;
+  unsigned long flags;
 
   if (!dev || !dev->devres_head.next)
     return;
 
-  list_for_each_entry(node, &dev->devres_head, entry) {
-    if (node->release == action && node->data == data) {
-      list_del(&node->entry);
-      kfree(node);
-      return;
+  spin_lock_irqsave(&dev->devres_lock, flags);
+  list_for_each_entry_reverse(node, &dev->devres_head, entry) {
+    if (node->kind == DEVRES_ACTION && node->release == action &&
+        node->data == data) {
+      list_del_init(&node->entry);
+      found = node;
+      break;
     }
   }
+  spin_unlock_irqrestore(&dev->devres_lock, flags);
+  kfree(found);
 }
 
 /* ── devres groups ──────────────────────────────────────────────────────── */
 
 void *devres_open_group(struct device *dev, void *id, gfp_t gfp) {
-  (void)gfp;
+  struct devres_group *group;
+  unsigned long flags;
 
   if (!dev)
     return NULL;
+  group = kzalloc(sizeof(*group), gfp);
+  if (!group)
+    return NULL;
+  INIT_LIST_HEAD(&group->open.entry);
+  INIT_LIST_HEAD(&group->close.entry);
+  group->open.kind = DEVRES_GROUP_OPEN;
+  group->close.kind = DEVRES_GROUP_CLOSE;
+  group->open.data = group->close.data = group;
+  group->id = id ? id : group;
   devres_ensure(dev);
-  dev->kpi_group_node_mark =
-      dev->devres_head.prev == &dev->devres_head
-          ? NULL
-          : (void *)dev->devres_head.prev;
-  dev->kpi_group_alloc_mark =
-      list_empty(&devres_alloc_list) ? NULL : (void *)devres_alloc_list.prev;
-  return id ? id : dev;
+  spin_lock_irqsave(&dev->devres_lock, flags);
+  list_add_tail(&group->open.entry, &dev->devres_head);
+  spin_unlock_irqrestore(&dev->devres_lock, flags);
+  return group->id;
+}
+
+/* Caller holds devres_lock. NULL selects the latest still-open group. */
+static struct devres_group *devres_find_group(struct device *dev, void *id) {
+  struct devres_node *node;
+  list_for_each_entry_reverse(node, &dev->devres_head, entry) {
+    struct devres_group *group;
+    if (node->kind != DEVRES_GROUP_OPEN)
+      continue;
+    group = node->data;
+    if ((id && group->id == id) ||
+        (!id && list_empty(&group->close.entry)))
+      return group;
+  }
+  return NULL;
 }
 
 void devres_close_group(struct device *dev, void *id) {
-  (void)dev;
-  (void)id;
+  struct devres_group *group;
+  unsigned long flags;
+  if (!dev || !dev->devres_head.next)
+    return;
+  spin_lock_irqsave(&dev->devres_lock, flags);
+  group = devres_find_group(dev, id);
+  if (group && list_empty(&group->close.entry))
+    list_add_tail(&group->close.entry, &dev->devres_head);
+  else
+    WARN_ON(1);
+  spin_unlock_irqrestore(&dev->devres_lock, flags);
+}
+
+/* All nodes are already detached. Callbacks may sleep, remove actions, or
+ * register another resource without taking devres_lock recursively. */
+static void devres_release_nodes(struct list_head *todo) {
+  while (!list_empty(todo)) {
+    struct devres_node *node = list_last_entry(todo, struct devres_node, entry);
+    list_del_init(&node->entry);
+    if (node->kind == DEVRES_GROUP_CLOSE)
+      continue;
+    if (node->kind == DEVRES_GROUP_OPEN) {
+      kfree(node->data);
+      continue;
+    }
+    if (node->kind == DEVRES_RESOURCE) {
+      if (node->resource_release)
+        node->resource_release(node->owner, node->data);
+    } else if (node->release) {
+      node->release(node->data);
+    }
+    /* Raw records embed their node as the first member. */
+    kfree(node);
+  }
 }
 
 void devres_release_group(struct device *dev, void *id) {
+  struct devres_group *group;
   struct devres_node *node;
-  struct devres_alloc_rec *rec;
-  struct list_head *pos;
-  struct list_head *start;
-
-  (void)id;
+  struct list_head *pos, *end;
+  unsigned long flags;
+  LIST_HEAD(todo);
   if (!dev || !dev->devres_head.next)
     return;
-
-  start = dev->kpi_group_node_mark
-              ? (struct list_head *)dev->kpi_group_node_mark
-              : &dev->devres_head;
-  for (pos = dev->devres_head.prev; pos != &dev->devres_head && pos != start;) {
-    struct list_head *prev = pos->prev;
-
+  spin_lock_irqsave(&dev->devres_lock, flags);
+  group = devres_find_group(dev, id);
+  if (!group) {
+    if (!list_empty(&dev->devres_head))
+      WARN_ON(1);
+    spin_unlock_irqrestore(&dev->devres_lock, flags);
+    return;
+  }
+  end = list_empty(&group->close.entry) ? &dev->devres_head
+                                      : group->close.entry.next;
+  for (pos = &group->open.entry; pos != end; pos = pos->next)
+    list_entry(pos, struct devres_node, entry)->selected = true;
+  /* Remove group markers only when both boundaries are inside this range
+   * (or an open group has no closing boundary yet). Crossing groups survive.
+   */
+  for (pos = &group->open.entry; pos != end;) {
+    struct list_head *next = pos->next;
+    bool take = true;
     node = list_entry(pos, struct devres_node, entry);
-    list_del(pos);
-    if (node->release)
-      node->release(node->data);
-    kfree(node);
-    pos = prev;
-  }
-
-  start = dev->kpi_group_alloc_mark
-              ? (struct list_head *)dev->kpi_group_alloc_mark
-              : &devres_alloc_list;
-  for (pos = devres_alloc_list.prev; pos != &devres_alloc_list && pos != start;) {
-    struct list_head *prev = pos->prev;
-
-    rec = list_entry(pos, struct devres_alloc_rec, list);
-    if (rec->dev == dev) {
-      list_del(pos);
-      if (rec->release)
-        rec->release(dev, rec->data);
-      kfree(rec);
+    if (node->kind == DEVRES_GROUP_OPEN || node->kind == DEVRES_GROUP_CLOSE) {
+      struct devres_group *g = node->data;
+      struct devres_node *pair = node->kind == DEVRES_GROUP_OPEN ? &g->close
+                                                               : &g->open;
+      take = pair->selected || list_empty(&pair->entry);
     }
-    pos = prev;
+    if (take)
+      list_move_tail(pos, &todo);
+    pos = next;
   }
-
-  dev->kpi_group_node_mark = NULL;
-  dev->kpi_group_alloc_mark = NULL;
+  list_for_each_entry(node, &dev->devres_head, entry)
+    node->selected = false;
+  list_for_each_entry(node, &todo, entry)
+    node->selected = false;
+  spin_unlock_irqrestore(&dev->devres_lock, flags);
+  devres_release_nodes(&todo);
 }
 
 void devres_release_all(struct device *dev) {
-  struct devres_alloc_rec *rec, *rtmp;
-
-  /* Devres resources are released in reverse registration order (LIFO), so
-   * later actions can still use earlier ones. */
-  while (dev && dev->devres_head.next && !list_empty(&dev->devres_head)) {
-    struct devres_node *node =
-        list_last_entry(&dev->devres_head, struct devres_node, entry);
-
-    list_del(&node->entry);
-    if (node->release)
-      node->release(node->data);
-    kfree(node);
-  }
-
-  list_for_each_entry_safe(rec, rtmp, &devres_alloc_list, list) {
-    if (rec->dev == dev) {
-      list_del(&rec->list);
-      if (rec->release)
-        rec->release(dev, rec->data);
-      kfree(rec);
-    }
-  }
+  unsigned long flags;
+  LIST_HEAD(todo);
+  if (!dev || !dev->devres_head.next)
+    return;
+  spin_lock_irqsave(&dev->devres_lock, flags);
+  list_splice_init(&dev->devres_head, &todo);
+  spin_unlock_irqrestore(&dev->devres_lock, flags);
+  devres_release_nodes(&todo);
 }
 
 /* ── devm_request_irq / devm_free_irq ───────────────────────────────────── */
@@ -479,22 +551,30 @@ int devm_request_irq(struct device *dev, unsigned int irq,
 
 void devm_free_irq(struct device *dev, unsigned int irq, void *dev_id) {
   struct devres_node *node, *tmp;
+  struct kpi_devm_irq *found = NULL;
+  struct devres_node *removed = NULL;
+  unsigned long flags;
 
   if (!dev || !dev->devres_head.next)
     return;
+  spin_lock_irqsave(&dev->devres_lock, flags);
   list_for_each_entry_safe(node, tmp, &dev->devres_head, entry) {
     struct kpi_devm_irq *w;
 
-    if (node->release != kpi_devm_irq_release)
+    if (node->kind != DEVRES_ACTION || node->release != kpi_devm_irq_release)
       continue;
     w = node->data;
     if (!w || w->irq != irq || w->dev_id != dev_id)
       continue;
-    list_del(&node->entry);
-    kfree(node);
-    free_irq(irq, dev_id);
-    kfree(w);
-    return;
+    list_del_init(&node->entry);
+    removed = node;
+    found = w;
+    break;
+  }
+  spin_unlock_irqrestore(&dev->devres_lock, flags);
+  if (found) {
+    kfree(removed);
+    kpi_devm_irq_release(found);
   }
 }
 
@@ -565,17 +645,7 @@ char *devm_kasprintf(struct device *dev, gfp_t gfp, const char *fmt, ...) {
 }
 
 void devm_kfree(struct device *dev, const void *p) {
-  struct devres_node *node;
-
-  if (dev && dev->devres_head.next) {
-    list_for_each_entry(node, &dev->devres_head, entry) {
-      if (node->data == p && node->release == __kpi_kfree_action) {
-        list_del(&node->entry);
-        kfree(node);
-        break;
-      }
-    }
-  }
+  devm_remove_action(dev, __kpi_kfree_action, (void *)p);
   kfree(p);
 }
 

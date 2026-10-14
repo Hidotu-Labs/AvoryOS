@@ -247,6 +247,7 @@ static struct pci_dev *kpi_pci_dev_new(void *handle) {
   atomic_set(&pdev->enable_cnt, 0);
   spin_lock_init(&pdev->pcie_cap_lock);
 
+  device_initialize(&pdev->dev);
   pdev->dev.bus = &pci_bus_type;
   pdev->dev.parent = &kpi_root_bus.dev;
   pdev->dev.release = kpi_pci_dev_release;

@@ -381,8 +381,8 @@ void linuxkpi_test_phase5_sysfs(void) {
   if (asc_pmm_get_free_pages() + 2 >= pmm_before)
     p5s_ok("sysfs lifecycle PMM stable");
   else
-    klogf("[FAIL] LinuxKPI: sysfs PMM baseline=%lu final=%lu\n", pmm_before,
-          asc_pmm_get_free_pages());
+    p5s_fail("lifecycle PMM pages lost",
+             pmm_before - asc_pmm_get_free_pages());
 
   if (asc_vfs_kernel_open(P5S_DEV_DIR "/p5s_ro") == NULL)
     p5s_ok("device_del removed the class device directory");

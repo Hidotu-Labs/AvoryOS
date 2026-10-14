@@ -732,6 +732,7 @@ void ramfs_mount_on(vfs_node_t *node) {
 
   // Transform the existing node into a ramfs directory
   node->device = dir;
+  node->destroy = ramfs_destroy_node;
   node->flags = (node->flags & ~0x07) | FS_DIRECTORY | FS_PERSISTENT;
 
   node->read = 0;

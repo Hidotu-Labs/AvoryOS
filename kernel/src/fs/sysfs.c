@@ -105,8 +105,12 @@ static void u64_to_dec(uint64_t val, char *buf) {
 // Create a directory under parent and return the new node.
 static vfs_node_t *sysfs_mkdir(vfs_node_t *parent, const char *name) {
   vfs_node_t *existing = parent ? vfs_finddir(parent, (char *)name) : NULL;
-  if (existing && (existing->flags & FS_TYPE_MASK) == FS_DIRECTORY)
-    return existing;
+  if (existing) {
+    bool is_dir = (existing->flags & FS_TYPE_MASK) == FS_DIRECTORY;
+    /* Return a borrowed tree handle, matching the newly created case. */
+    vfs_close(existing);
+    return is_dir ? existing : NULL;
+  }
 
   vfs_node_t *dir = kmalloc(sizeof(vfs_node_t));
   if (!dir)
@@ -1276,6 +1280,7 @@ static void sysfs_remove_children(vfs_node_t *dir) {
       } else {
         sysfs_remove_file_child(dir, child);
       }
+      vfs_close(child);
       removed = true;
       break; /* enumeration shifted; restart from the first entry */
     }
@@ -1299,6 +1304,15 @@ void asc_sysfs_remove(void *dir, const char *name) {
   } else {
     sysfs_remove_file_child(d, child);
   }
+  vfs_close(child);
+}
+
+static bool sysfs_child_exists(vfs_node_t *dir, const char *name) {
+  vfs_node_t *child = vfs_finddir(dir, (char *)name);
+  if (!child)
+    return false;
+  vfs_close(child);
+  return true;
 }
 
 int asc_sysfs_attr_file(void *dir, const char *name, unsigned int mode,
@@ -1313,7 +1327,7 @@ int asc_sysfs_attr_file(void *dir, const char *name, unsigned int mode,
 
   if (!d || !name || !*name)
     return -22; /* EINVAL */
-  if (vfs_finddir(d, (char *)name))
+  if (sysfs_child_exists(d, name))
     return -17; /* EEXIST */
 
   attr = kmalloc(sizeof(*attr));
@@ -1356,7 +1370,7 @@ int asc_sysfs_bin_file(void *dir, const char *name, unsigned int mode,
 
   if (!d || !name || !*name)
     return -22; /* EINVAL */
-  if (vfs_finddir(d, (char *)name))
+  if (sysfs_child_exists(d, name))
     return -17; /* EEXIST */
 
   bin = kmalloc(sizeof(*bin));

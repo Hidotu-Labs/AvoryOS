@@ -253,6 +253,10 @@ static void init_thread_entry(void) {
   char custom_init[128] = {0};
   if (kernel_boot_cmdline) {
     const char *p = strstr(kernel_boot_cmdline, "init=");
+    /* Match a complete argument key, not e.g. kpi_amdgpu_psp_reinit=1. */
+    while (p && p != kernel_boot_cmdline &&
+           p[-1] != ' ' && p[-1] != '\t' && p[-1] != '\r' && p[-1] != '\n')
+      p = strstr(p + 1, "init=");
     if (p) {
       p += 5;
       size_t i = 0;
