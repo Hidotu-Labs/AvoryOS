@@ -11,6 +11,7 @@ shim=r'''
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <linuxkpi/gpu_diag.h>
 typedef uint64_t u64;
 struct drm_device{int dummy;};struct drm_file{int dummy;};
@@ -19,7 +20,19 @@ enum dma_resv_usage{DMA_RESV_USAGE_KERNEL,DMA_RESV_USAGE_WRITE};
 struct page{u64 phys;int _refcount;};
 struct ttm_tt{struct page **pages;u64 *dma_address;unsigned long num_pages;};
 struct ttm_resource{unsigned mem_type;};
-struct amdgpu_device{int dummy;};struct amdgpu_ring{int dummy;};struct amdgpu_job{int dummy;};
+struct amdgpu_device{int dummy;};
+struct psp_context{struct amdgpu_device *adev;};
+static int psp_result;static unsigned psp_calls,status_reads,diagnostics;
+static uint32_t psp_read(uint32_t reg){assert(reg==0x40);status_reads++;return 0xdead;}
+#define RREG32(reg) ((void)adev,psp_read(reg))
+static void klogf(const char*fmt,...){
+ assert(fmt);va_list a;va_start(a,fmt);
+ assert(va_arg(a,unsigned)==0x40);assert(va_arg(a,unsigned)==0x80000000);
+ assert(va_arg(a,unsigned)==0x8000ffff);assert(va_arg(a,unsigned)==0xdead);
+ assert(va_arg(a,int)==0);assert(va_arg(a,int)==-62);va_end(a);diagnostics++;
+}
+int linuxkpi_original_psp_wait_for(struct psp_context*p,uint32_t reg,uint32_t val,uint32_t mask,bool changed){assert(p&&reg==0x40&&val==0x80000000&&mask==0x8000ffff&&!changed);psp_calls++;return psp_result;}
+struct amdgpu_ring{int dummy;};struct amdgpu_job{int dummy;};
 struct amdgpu_bo{struct{struct{u64 size;struct dma_resv *resv;}base;struct ttm_tt *ttm;struct ttm_resource *resource;}tbo;};
 struct amdgpu_bo_va{struct{struct amdgpu_bo *bo;void *vm;}base;struct dma_fence *last_pt_update;};
 struct drm_amdgpu_gem_va{uint32_t handle,operation;u64 va_address,map_size,flags,offset_in_bo;};
@@ -54,7 +67,11 @@ int main(void){
  assert(kind[9]==GPU_DIAG_FENCE_SIGNAL&&values[9][2]==1);
  assert(dma_fence_signal(NULL)==-22&&events==10&&calls==6);
  enabled=false;assert(amdgpu_gem_va_ioctl(&dev,&args,&file)==-5);assert(events==10&&calls==7);
- puts("PASS: VM/BO/DMA/fence identities, original failures forwarded, optional tracing disabled, no post-signal dereference under ASan/UBSan");
+ struct psp_context psp={&adev};
+ assert(!psp_wait_for(&psp,0x40,0x80000000,0x8000ffff,false)&&psp_calls==1&&!status_reads&&!diagnostics);
+ psp_result=-62;assert(psp_wait_for(&psp,0x40,0x80000000,0x8000ffff,false)==-62);
+ assert(psp_calls==2&&status_reads==1&&diagnostics==1);
+ puts("PASS: PSP wait failures preserve original result and report status with one read; VM/BO/DMA/fence identities, original failures forwarded, optional tracing disabled, no post-signal dereference under ASan/UBSan");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='gpu-resource-hooks-') as tmp:

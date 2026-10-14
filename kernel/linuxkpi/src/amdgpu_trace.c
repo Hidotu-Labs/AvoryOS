@@ -11,12 +11,33 @@
 #include <linux/mm.h>
 #include <drm/ttm/ttm_tt.h>
 #include <linuxkpi/gpu_diag.h>
+#include <linuxkpi/log.h>
 
 extern int linuxkpi_original_amdgpu_gem_va_ioctl(struct drm_device *, void *, struct drm_file *);
 extern int linuxkpi_original_amdgpu_vm_bo_update(struct amdgpu_device *, struct amdgpu_bo_va *, bool);
 extern int linuxkpi_original_amdgpu_fence_emit(struct amdgpu_ring *, struct dma_fence **, struct amdgpu_job *, unsigned);
 extern int linuxkpi_original_dma_fence_signal(struct dma_fence *);
 extern void linuxkpi_original_dma_resv_add_fence(struct dma_resv *, struct dma_fence *, enum dma_resv_usage);
+
+extern int linuxkpi_original_psp_wait_for(struct psp_context *, uint32_t,
+                                         uint32_t, uint32_t, bool);
+
+/* The upstream hw_init path converts PSP failures to -EINVAL. Preserve the
+ * original wait result, but expose the failed handshake before that conversion.
+ * One status read after failure; never retry commands or write PSP registers. */
+int psp_wait_for(struct psp_context *psp, uint32_t reg_index,
+                  uint32_t reg_val, uint32_t mask, bool check_changed) {
+  int ret = linuxkpi_original_psp_wait_for(psp, reg_index, reg_val, mask,
+                                          check_changed);
+  if (ret) {
+    struct amdgpu_device *adev = psp->adev;
+    uint32_t observed = RREG32(reg_index);
+    klogf("[ERROR] LinuxKPI: PSP wait failed reg=%x expected=%x mask=%x "
+          "observed-after-failure=%x changed=%u ret=%d\n",
+          reg_index, reg_val, mask, observed, check_changed, ret);
+  }
+  return ret;
+}
 
 int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data, struct drm_file *file) {
   struct drm_amdgpu_gem_va *args = data;

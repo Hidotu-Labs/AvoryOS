@@ -55,6 +55,49 @@ paths and does not exclude a host-side reset/power problem. The last available
 serial snapshot records completed initialization, so it does not identify the
 failed boot's last stage. Host-reset attribution remains an unverified hypothesis.
 
+## Supplied failed-init log and shutdown distinction
+
+The user subsequently supplied a failed-init log after closing QEMU with the
+window X and reopening, and reported (with explicit uncertainty) that shutdown
+inside AvoryOS followed by reopening initializes successfully without the host
+reboot or Minecraft/tunnel artifacts. This is a useful correlation, not a
+validated hardware test matrix. The normalized supplied log is preserved in
+[the failure evidence](amdgpu-psp-init-failure-2026-10-14.txt).
+
+- CONFIRMED FAILURE: the first reported fatal step is PSP ring creation
+  (`amdgpu_psp.c:2179/2181`); PSP hw_init returns -22, then top-level IP init
+  fails and the driver tears down. Missing firmware is not established by this
+  log: it reaches ring creation, rather than reporting a missing firmware file.
+- CONFIRMED FAILURE: repeated `amdgpu_irq.c:621` warnings and unclean TTM memory
+  managers occur during teardown after the PSP failure. They are subsequent
+  failures, not evidence that IRQ registration originally caused PSP failure.
+- CONFIRMED FAILURE: the initcall thread faults on a kernel access to 0x60 at
+  RIP 0xffffffff801ab4b2. HIGH-CONFIDENCE LOCATION: the current ELF maps that RIP
+  to `ttm_resource_move_to_lru_tail()` (`ttm_resource.c:165`) through inlined
+  list_move_tail/list_add_tail. Its instruction reads an LRU list entry through
+  the manager pointer, consistent with a missing/invalid manager during BO
+  cleanup. Two earlier logged initcall addresses also match current ELF symbols;
+  full loaded-kernel identity and register/stack evidence are still needed.
+  Do not patch imported TTM or suppress this dereference without determining
+  the ownership/order failure.
+- POSSIBLE ISSUE: boot/session startup is logged after the initcall-thread
+  fault without a normal initcalls-completed message in the supplied excerpt.
+  This requires a separate lifecycle check; the excerpt does not establish why
+  the barrier was bypassed or whether the loaded image matches the fixed source.
+- UNVERIFIED HYPOTHESIS: forced QEMU close bypasses guest IP suspension and
+  leaves firmware/device state that interferes with the next PSP ring handshake.
+  Host VFIO close/open may also reset or change power state. None of these
+  observations specifically attributes the physical host reboot.
+
+Orderly guest power-off calls `linuxkpi_pci_shutdown()` from `sys_process.c:4117`,
+which invokes the bound driver's `amdgpu_pci_shutdown()` (`amdgpu_drv.c:2296`).
+That callback suspends GPU IP blocks; the upstream shutdown behavior is documented
+in the [Linux driver source](https://raw.githubusercontent.com/torvalds/linux/v6.6/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c).
+Closing the host window cannot run this guest syscall path after the VM process
+ends. This explains a concrete behavioral difference, but is not a guaranteed
+hardware cold reset. No additional passthrough test, reset or power setting
+change was performed while investigating the supplied log.
+
 ## Scope and ownership
 
 The starting tree contained substantial uncommitted work, including fixes in

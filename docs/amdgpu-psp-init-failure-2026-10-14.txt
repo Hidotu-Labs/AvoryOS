@@ -1,0 +1,163 @@
+[DRM] Registered /dev/dri/card0 (per-client mode)
+[FB] Linux fbdev subsystem initialized: 1280x800 @ 32bpp, pitch=5120 bytes
+[VFS-FILLTEST] checking 131072 bytes of libc.so.6 (direct backend reads vs readahead window)
+[VFS-FILLTEST] PASS 131072 bytes identical
+[VFS] Registering 'mouse' in /dev
+[VFS] Registering 'null' in /dev
+[VFS] Registering 'zero' in /dev
+[VFS] Registering 'urandom' in /dev
+[VFS] Registering 'random' in /dev
+[VFS] Registering 'ptmx' in /dev
+[VFS] Registering 'watchdog' in /dev
+[VFS] Registering 'watchdog0' in /dev
+[  OK  ] Watchdog driver initialized (/dev/watchdog, /dev/watchdog0, default=60s)
+[VFS] Registering 'rfkill' in /dev
+[  OK  ] rfkill core initialized (/dev/rfkill)
+[GPUDBG] native recorder active; /proc/gpu_debug (1 metadata, 2 pixel checks, dump freezes to serial)
+[LINUXKPI] Phase 0 self-test
+[  OK  ] LinuxKPI: upstream lib/math/div64.c linked, result correct
+[  OK  ] LinuxKPI: kernel_fpu_begin/end restores XSAVE state
+[SLAB] Created cache 'radix_tree_node': obj_size=576 aligned=576 per_slab=7
+[KPI] texture fixes active: WC-sfence/shrink-reclaim/ww-backoff/fault-seq
+[KPI-RCU] isolated callback batches, drain generations and release publication active
+[INFO] LinuxKPI: boot CPU features: X86_FEATURE_HYPERVISOR set (passthrough detection works)
+[LINUXKPI] cmdline: kpi_amdgpu=1 kpi_prime_offload=1 amdgpu.runpm=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x4
+[KERNEL] LinuxKPI: PCI 11 wrapper(s) over 11 native device(s)
+[KERNEL] LinuxKPI: running 12 initcall(s)...
+[KERNEL] LinuxKPI: initcall #0 @ 0xFFFFFFFF8063B13A
+[KERNEL] LinuxKPI: initcall #1 @ 0xFFFFFFFF80127A60
+[LINUXKPI] initcall demo (Phase 0) running
+[KERNEL] LinuxKPI: initcall #2 @ 0xFFFFFFFF8063B0B6
+[VFS] Registering 'kpi_dmabuf' in /dev
+[  OK  ] LinuxKPI: /dev/kpi_dmabuf ready
+[KERNEL] LinuxKPI: initcall #3 @ 0xFFFFFFFF8063B17C
+[KERNEL] LinuxKPI: initcall #4 @ 0xFFFFFFFF8063B1E8
+[DRM] Registered /dev/dri/renderD128
+[drm] Initialized vgem 1.0.0 20120112 for vgem.-1 on minor 0
+[KERNEL] LinuxKPI: initcall #5 @ 0xFFFFFFFF8063B2B6
+[DRM] Registered /dev/dri/card1
+(vkms.-1) [drm:0xffffffff8018f2f1] [CONNECTOR:38:Virtual-1] generating connector hotplug event
+
+(vkms.-1) [drm:0xffffffff8018f2f1] [CONNECTOR:45:Writeback-1] generating connector hotplug event
+
+[drm] Initialized vkms 1.0.0 20180514 for vkms.-1 on minor 1
+[KERNEL] LinuxKPI: initcall #6 @ 0xFFFFFFFF8063B49C
+[KERNEL] LinuxKPI: initcall #7 @ 0xFFFFFFFF8063B4AA
+[SLAB] Created cache 'drm_sched_fence': obj_size=176 aligned=176 per_slab=22
+[KERNEL] LinuxKPI: initcall #8 @ 0xFFFFFFFF8063B4D8
+[KERNEL] LinuxKPI: initcall #9 @ 0xFFFFFFFF8063B50E
+[SLAB] Created cache 'drm_buddy_block': obj_size=72 aligned=72 per_slab=56
+[KERNEL] LinuxKPI: initcall #10 @ 0xFFFFFFFF8063B53C
+[SLAB] Created cache 'amdgpu_sync': obj_size=24 aligned=24 per_slab=128
+[SLAB] Created cache 'amdgpu_fence': obj_size=80 aligned=80 per_slab=50
+[drm] amdgpu kernel modesetting enabled.
+[drm] initializing kernel modesetting (IP DISCOVERY 0x1002:0x164E 0x1002:0x164E 0xC6).
+[drm] register mmio base: 0x80900000
+[drm] register mmio size: 524288
+[drm] add ip block number 0 <nv_common>
+[drm] add ip block number 1 <gmc_v10_0>
+[drm] add ip block number 2 <navi10_ih>
+[drm] add ip block number 3 <psp>
+[drm] add ip block number 4 <smu>
+[drm] add ip block number 5 <dm>
+[drm] add ip block number 6 <gfx_v10_0>
+[drm] add ip block number 7 <sdma_v5_2>
+[drm] add ip block number 8 <vcn_v3_0>
+[drm] add ip block number 9 <jpeg_v3_0>
+[drm] BIOS signature incorrect 10 10
+(0000:00:03.0) Fetched VBIOS from ROM BAR
+
+amdgpu: ATOM BIOS: 102-RAPHAEL-008
+[drm] VCN(0) decode is enabled in VM mode
+[drm] VCN(0) encode is enabled in VM mode
+[drm] JPEG decode is enabled in VM mode
+(0000:00:03.0) Trusted Memory Zone (TMZ) feature disabled as experimental (default)
+
+(0000:00:03.0) ASPM: no upstream PCIe link for 0000:00:03.0
+
+[drm] vm size is 262144 GB, 4 levels, block size is 9-bit, fragment size is 9-bit
+(0000:00:03.0) VRAM: 512M 0x000000F400000000 - 0x000000F41FFFFFFF (512M used)
+
+(0000:00:03.0) GART: 1024M 0x0000000000000000 - 0x000000003FFFFFFF
+
+(0000:00:03.0) AGP: 267419648M 0x000000F800000000 - 0x0000FFFFFFFFFFFF
+
+[drm] Detected VRAM RAM=512M, BAR=256M
+[drm] RAM width 64bits DDR5
+[drm] amdgpu: 512M of VRAM memory ready
+[drm] amdgpu: 2048M of GTT memory ready.
+[drm] GART: num cpu pages 262144, num gpu pages 262144
+[drm] PCIE GART of 1024M enabled (table at 0x000000F400000000).
+(0000:00:03.0) using MSI/MSI-X.
+
+(0000:00:03.0) PSP runtime database doesn't exist
+
+(0000:00:03.0) PSP runtime database doesn't exist
+
+(0000:00:03.0) memory training is not supported!
+
+(0000:00:03.0) Memory training is not supported.
+
+[drm] Loading DMUB firmware via PSP: version=0x05003300
+(0000:00:03.0) mec queue bitmap weight=8
+
+[drm] use_doorbell being set to: [true]
+[drm] Found VCN firmware Version ENC: 1.33 DEC: 4 VEP: 0 Revision: 15
+(0000:00:03.0) Will use PSP to load VCN firmware
+
+(0000:00:03.0) PSP create ring failed!
+
+(0000:00:03.0) PSP firmware loading failed
+
+[drm:0xffffffff801b7e95] *ERROR* hw_init of IP block <psp> failed -22
+(0000:00:03.0) amdgpu_device_ip_init failed
+
+(0000:00:03.0) Fatal error during GPU init
+
+(0000:00:03.0) amdgpu: finishing device.
+
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c:621 (imported WARN)
+[KERNEL] LinuxKPI: pci amdgpu probe 0000:00:03.0 failed: -22
+[USB-MOUSE] recovery 1/4: no reports after 4291 ms, clearing endpoint halt ep=0x81
+[XHCI] EP0 TD failed before status: completion=6 attempt=1
+[XHCI] EP0 TD failed before status: completion=6 attempt=2
+[XHCI] EP0 TD failed before status: completion=6 attempt=3
+[USB-MOUSE] recovery 1/4: CLEAR_FEATURE(HALT) -> -1
+[USB-MOUSE] recovery 2/4: reopening interrupt pipe ep=0x81
+[XHCI] Interrupt endpoint state=1
+[XHCI] Interrupt endpoint configured
+[USB-MOUSE] recovery 2/4: reopen -> ok
+WARNING: at linux/drivers/gpu/drm/drm_buddy.c:192 (imported WARN)
+WARNING: at linux/drivers/gpu/drm/drm_buddy.c:196 (imported WARN)
+Memory manager not clean during takedown.
+WARNING: at linux/drivers/gpu/drm/drm_mm.c:999 (imported WARN)
+[drm] amdgpu: ttm finalized
+[VMM] kernel access faulted on user address cr2=0x0000000000000060 rip=0xFFFFFFFF801AB4B2 tid=2 comm='kpi/initcalls' err=0x0000000000000000
+[NET] rx worker assigned cpu=0
+[NET] rx worker assigned cpu=1
+[NET] rx workers started
+[  OK  ] Init thread started
+[TEST] Running NUMA Subsystem Self-Test...
+[  OK  ] test_numa: all checks passed (nodes=1 mode=UMA)
+[precache] Dynamic linker pre-cached: 384 pages (1536 KiB)
+[  OK  ] Console cleared, starting session...
+[PROC] Executing main session: /sbin/init
+[PROC] ELF mapped successfully. Jumping to Ring 3 (RIP: 4291460)
+[ARCH_PRCTL] SET_FS = 5497528 (MSR readback=0x000000000053E2B8, thread->fs_base=0x000000000053E2B8)
+
+starting pid 7, tty '': '/etc/init.d/rcS'
