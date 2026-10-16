@@ -1,5 +1,6 @@
 // Memory Management Syscalls: mmap, munmap, brk
 #include "../fs/vfs.h"
+#include "../fs/mount_namespace.h"
 #include "../lib/string.h"
 #include "../mm/pmm.h"
 #include "../mm/numa.h"
@@ -381,12 +382,31 @@ static void teardown_range(uint64_t *pml4, struct thread *t, uint64_t base,
 }
 
 
+/* Release the placeholder VMA sys_mmap installs when it has to reuse an
+ * interior arena gap: the file-backed handler runs after mm->lock is
+ * dropped, so the gap is published as a PROT_NONE VMA until the real one
+ * replaces it.  Every failure path must give the range back, or a rejected
+ * mmap would strand address space below the monotonic cursor. */
+static void mmap_gap_release(struct mm_struct *mm, uint64_t start,
+                             uint64_t length) {
+  if (!mm || !length)
+    return;
+  spinlock_acquire(&mm->lock);
+  vma_remove(&mm->vmas, start, start + length);
+  spinlock_release(&mm->lock);
+}
+
 // sys_mmap
 // Linux ABI: mmap(addr, length, prot, flags, fd, offset)
 //   rdi=addr  rsi=length  rdx=prot  r10=flags  r8=fd  r9=offset
 uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
                   uint64_t fd, uint64_t offset) {
-  (void)offset;
+  /* Linux's fd lookup consumes an unsigned int. Syscall registers can retain
+   * unrelated high bits: Chromium's shared-memory mapper passes an FDPair in
+   * a 64-bit register and forwards its low int to libc without clearing the
+   * other descriptor in the upper half. Rejecting that raw value as >=
+   * MAX_FDS turns valid shared-memory mappings into EBADF. */
+  fd = (uint32_t)fd;
 
   /*
     klog_puts("[MMAP] addr=");
@@ -429,6 +449,9 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
 
   uint64_t *pml4 = vmm_get_active_pml4();
   uint64_t vaddr = 0;
+  /* True while an interior arena gap is held by a placeholder VMA (see the
+   * file-backed fallback below). */
+  bool gap_reserved = false;
 
   bool fixed_noreplace = (flags & MAP_FIXED_NOREPLACE) != 0;
   bool fixed = (flags & MAP_FIXED) != 0;
@@ -504,10 +527,18 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
       uint64_t search_base = MAX(MMAP_REGION_BASE,
                                  current_thread->mm->mmap_next_addr);
 
-      // Try addr as a hint if provided and aligned
+      /* Anonymous hints can name any free user range. V8's aligned cages
+       * deliberately use addresses below the usual high mmap arena; rejecting
+       * those hints forces needless over-allocation and trimming. Only the
+       * file-backed path needs the high-water constraint while its handler
+       * runs outside mm->lock. */
+      bool anonymous = (flags & MAP_ANONYMOUS) != 0;
+      uint64_t hint_floor = anonymous ? 0x10000ULL : search_base;
+      uint64_t hint_limit = anonymous && !mm_compat32()
+                                ? USER_ADDR_MAX + 1ULL : MMAP_REGION_LIMIT;
       if (addr != 0 && (addr & (PAGE_SIZE - 1)) == 0 &&
-          is_user_pointer(addr) && is_user_pointer(addr + aligned_len - 1) &&
-          addr >= search_base && addr + aligned_len <= MMAP_REGION_LIMIT) {
+          addr >= hint_floor && addr < hint_limit &&
+          aligned_len <= hint_limit - addr) {
         if (!vma_find_overlap(&current_thread->mm->vmas, addr, addr + aligned_len)) {
           vaddr = addr;
         }
@@ -518,8 +549,40 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
                              search_base, MMAP_REGION_LIMIT);
       }
 
-      if (vaddr && vaddr + aligned_len <= MMAP_REGION_LIMIT &&
-          (flags & MAP_ANONYMOUS)) {
+      /* The usual high arena is less than 1 TiB wide. V8 reserves a sandbox
+       * plus guard regions larger than that with PROT_NONE; reserve a free
+       * lower canonical gap instead. Anonymous VMAs are installed under this
+       * lock, so another mapper cannot take the fallback range in between. */
+      if (!vaddr && !mm_compat32() && (flags & MAP_ANONYMOUS)) {
+        uint64_t low_base = MAX(0x100000000ULL,
+                                PAGE_ALIGN_UP(current_thread->mm->brk_current));
+        vaddr = vma_find_gap(&current_thread->mm->vmas, aligned_len,
+                             low_base, MMAP_REGION_BASE);
+        if (vaddr && (vaddr >= MMAP_REGION_BASE ||
+                      aligned_len > MMAP_REGION_BASE - vaddr))
+          vaddr = 0;
+      }
+
+      /* The bump cursor only moves forward, so a region munmap released --
+       * or any failed file-backed mmap that reserved space it never
+       * installed -- is otherwise lost forever.  Once the arena above the
+       * cursor cannot fit the request, reuse an interior gap: publish a
+       * placeholder VMA so the range stays reserved while the file-backed
+       * handler runs outside mm->lock.  The real VMA replaces the
+       * placeholder below; failure paths call mmap_gap_release(). */
+      if (!vaddr && !anonymous) {
+        vaddr = vma_find_gap(&current_thread->mm->vmas, aligned_len,
+                             MMAP_REGION_BASE, MMAP_REGION_LIMIT);
+        if (vaddr &&
+            vma_add(&current_thread->mm->vmas, vaddr, vaddr + aligned_len,
+                    PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, NULL, 0) == 0)
+          gap_reserved = true;
+        else
+          vaddr = 0;
+      }
+
+      if (vaddr && vaddr <= USER_ADDR_MAX &&
+          aligned_len - 1 <= USER_ADDR_MAX - vaddr && anonymous) {
         uint64_t vma_flags = flags;
         if (flags & MAP_HUGETLB)
           vma_flags |= MAP_HUGEPAGE;
@@ -529,19 +592,33 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
           spinlock_release(&current_thread->mm->lock);
           return E_NOMEM;
         }
-        current_thread->mm->mmap_next_addr =
-            MAX(current_thread->mm->mmap_next_addr, vaddr + aligned_len);
+        /* Low hints and reservations above the default arena must not push
+         * its ordinary allocation cursor out of bounds. */
+        if (vaddr >= MMAP_REGION_BASE &&
+            vaddr + aligned_len <= MMAP_REGION_LIMIT)
+          current_thread->mm->mmap_next_addr =
+              MAX(current_thread->mm->mmap_next_addr, vaddr + aligned_len);
         spinlock_release(&current_thread->mm->lock);
         return vaddr;
       }
 
-      if (!vaddr || vaddr + aligned_len > MMAP_REGION_LIMIT)
+      if (vaddr && vaddr + aligned_len <= MMAP_REGION_LIMIT) {
+        /* A reserved interior gap already fits and must not move the cursor
+         * past itself, or the fallback's whole point is lost. */
+        if (!gap_reserved)
+          /* Reserve file-backed ranges before releasing mm->lock.  A failed
+           * mmap may leave a harmless hole in this monotonic allocation
+           * cursor. */
+          current_thread->mm->mmap_next_addr =
+              MAX(current_thread->mm->mmap_next_addr, vaddr + aligned_len);
+      } else {
+        /* Defensive: a reserved gap cannot fail this bound. */
+        if (gap_reserved) {
+          vma_remove(&current_thread->mm->vmas, vaddr, vaddr + aligned_len);
+          gap_reserved = false;
+        }
         vaddr = 0;
-      else
-        /* Reserve file-backed ranges before releasing mm->lock.  A failed
-         * mmap may leave a harmless hole in this monotonic allocation cursor. */
-        current_thread->mm->mmap_next_addr =
-            MAX(current_thread->mm->mmap_next_addr, vaddr + aligned_len);
+      }
       spinlock_release(&current_thread->mm->lock);
     }
 
@@ -559,9 +636,21 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
   if (!(flags & MAP_ANONYMOUS) && (int64_t)fd != -1) {
     vfs_node_t *node __attribute__((cleanup(fd_node_put))) =
         fd_node_get(current_thread, fd);
-    if (!node)
+    if (!node) {
+      if (gap_reserved)
+        mmap_gap_release(current_thread->mm, vaddr, aligned_len);
       return E_BADF;
+    }
 
+    uint64_t permissions = 0;
+    if ((flags & 3) == MAP_SHARED && vfs_mount_readonly(node))
+      permissions |= MAP_DENY_SHARED_WRITE;
+    if (vfs_mount_flags(node) & 8) permissions |= MAP_DENY_EXEC;
+    if (((prot & PROT_WRITE) && (permissions & MAP_DENY_SHARED_WRITE)) ||
+        ((prot & PROT_EXEC) && (permissions & MAP_DENY_EXEC))) {
+      if (gap_reserved) mmap_gap_release(current_thread->mm, vaddr, aligned_len);
+      return (uint64_t)-13;
+    }
     if (node->mmap &&
         !(node->mmap_shared_only && ((flags & 0x3) == MAP_PRIVATE))) {
       // Pass MAP_FIXED to internal handler to ensure it respects our vaddr
@@ -576,14 +665,18 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
           if (stale)
             linuxkpi_vma_unref(stale);
         }
+        if (gap_reserved)
+          mmap_gap_release(current_thread->mm, vaddr, aligned_len);
         return result == MAP_FAILED ? E_NOMEM : result;
       }
 
       if (current_thread && current_thread->mm) {
         spinlock_acquire(&current_thread->mm->lock);
+        if (gap_reserved)
+          vma_remove(&current_thread->mm->vmas, vaddr, vaddr + aligned_len);
         int vma_idx =
             vma_add(&current_thread->mm->vmas, result, result + aligned_len, prot,
-                    flags, (int)fd, offset, node, 0);
+                    flags | permissions, (int)fd, offset, node, 0);
         spinlock_release(&current_thread->mm->lock);
         if (vma_idx < 0) {
           extern void *linuxkpi_vma_take_pending(void) __attribute__((weak));
@@ -623,17 +716,25 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
      * VMA page-cache path.  The fault handler already serves these (shared and
      * private, read-only and writable), so this is what makes file mmap work
      * for SQLite WAL, QFile::map, and friends. */
-    if ((node->flags & FS_TYPE_MASK) != FS_FILE)
+    if ((node->flags & FS_TYPE_MASK) != FS_FILE) {
+      if (gap_reserved)
+        mmap_gap_release(current_thread->mm, vaddr, aligned_len);
       return E_INVAL;
-    if (offset & (PAGE_SIZE - 1))
+    }
+    if (offset & (PAGE_SIZE - 1)) {
+      if (gap_reserved)
+        mmap_gap_release(current_thread->mm, vaddr, aligned_len);
       return E_INVAL;
+    }
     if (!current_thread->mm)
       return E_NOMEM;
 
     spinlock_acquire(&current_thread->mm->lock);
+    if (gap_reserved)
+      vma_remove(&current_thread->mm->vmas, vaddr, vaddr + aligned_len);
     int vma_idx = vma_add(&current_thread->mm->vmas, vaddr,
                           vaddr + aligned_len, prot,
-                          flags | MAP_PAGECACHE, (int)fd, offset, node, 0);
+                          flags | MAP_PAGECACHE | permissions, (int)fd, offset, node, 0);
     spinlock_release(&current_thread->mm->lock);
     if (vma_idx < 0)
       return E_NOMEM;
@@ -642,6 +743,8 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
 
   // Reject non-anonymous mappings with no fd
   if (!(flags & MAP_ANONYMOUS)) {
+    if (gap_reserved)
+      mmap_gap_release(current_thread->mm, vaddr, aligned_len);
     return E_BADF;
   }
 
@@ -832,6 +935,18 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
 
 
   uint64_t end = addr + aligned_len;
+  spinlock_acquire(&current->mm->lock);
+  for (uint64_t cursor = addr; cursor < end;) {
+    struct vma *area = vma_find(&current->mm->vmas, cursor);
+    if (!area) { spinlock_release(&current->mm->lock); return E_NOMEM; }
+    if (((prot & PROT_WRITE) && (area->flags & MAP_DENY_SHARED_WRITE)) ||
+        ((prot & PROT_EXEC) && (area->flags & MAP_DENY_EXEC))) {
+      spinlock_release(&current->mm->lock);
+      return (uint64_t)-13;
+    }
+    cursor = area->end;
+  }
+  spinlock_release(&current->mm->lock);
   for (uint64_t batch_start = addr; batch_start < end;) {
     uint64_t batch_end = batch_start +
         (uint64_t)MPROTECT_BATCH_PAGES * PAGE_SIZE;
@@ -839,6 +954,18 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
       batch_end = end;
 
     spinlock_acquire(&current->mm->lock);
+    /* Another thread can replace mappings between batches. Recheck while
+     * holding the same lock that protects the PTE update below. */
+    for (uint64_t cursor = batch_start; cursor < batch_end;) {
+      struct vma *area = vma_find(&current->mm->vmas, cursor);
+      if (!area) { spinlock_release(&current->mm->lock); return E_NOMEM; }
+      if (((prot & PROT_WRITE) && (area->flags & MAP_DENY_SHARED_WRITE)) ||
+          ((prot & PROT_EXEC) && (area->flags & MAP_DENY_EXEC))) {
+        spinlock_release(&current->mm->lock);
+        return (uint64_t)-13;
+      }
+      cursor = area->end;
+    }
     vmm_lock_acquire();
     bool ok = true;
     bool touched = false;
@@ -856,9 +983,17 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
         new_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_NX;
       } else if (prot & PROT_WRITE) {
         struct vma *v = vma_find(&current->mm->vmas, va);
-        if (PAGE_ALIGN_DOWN(phys) == pmm_get_zero_page_phys() ||
-            (v && (v->flags & MAP_PRIVATE) && v->file_node != NULL)) {
-          // Shared page-cache and zero-page frames stay read-only until COW.
+        uint64_t frame = PAGE_ALIGN_DOWN(phys);
+        bool private_view = v && (v->flags & MAP_PRIVATE);
+        bool shared_private_frame = private_view && pmm_is_managed(frame) &&
+                                    pmm_get_ref((void *)frame) > 1;
+        if (frame == pmm_get_zero_page_phys() || shared_private_frame ||
+            (private_view && v->file_node != NULL)) {
+          /* Anonymous pages shared with a fork child need CoW too. Merely
+           * making them writable here lets either process overwrite the
+           * other's allocator state without taking a copy-on-write fault.
+           * Recheck references even after a prior PROT_NONE/READ transition,
+           * which may have removed the PTE's old CoW marker. */
           new_flags = (new_flags & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
         }
       }

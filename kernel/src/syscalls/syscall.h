@@ -13,6 +13,7 @@
 
 #define SYS_READ 0
 #define SYS_WRITE 1
+#define SYS_CREAT 85
 #define SYS_OPEN 2
 #define SYS_CLOSE 3
 #define SYS_STAT 4
@@ -29,6 +30,8 @@
 #define SYS_RT_SIGRETURN 15
 #define SYS_RT_SIGSUSPEND 130
 #define SYS_RT_SIGTIMEDWAIT 128
+#define SYS_RT_SIGQUEUEINFO 129
+#define SYS_RT_TGSIGQUEUEINFO 297
 #define SYS_PAUSE 34
 #define SYS_IOCTL 16
 #define SYS_PREAD64 17
@@ -141,6 +144,9 @@
 #define SYS_RT_SIGPENDING 127
 #define SYS_SIGALTSTACK 131
 #define SYS_UTIME 132
+#define SYS_LANDLOCK_CREATE_RULESET 444
+#define SYS_LANDLOCK_ADD_RULE 445
+#define SYS_LANDLOCK_RESTRICT_SELF 446
 #define SYS_SECCOMP 317
 #define SYS_STATFS 137
 #define SYS_GETDENTS 78
@@ -171,6 +177,8 @@
 #define SYS_FUTEX 202
 #define SYS_SCHED_SETAFFINITY 203
 #define SYS_SCHED_GETAFFINITY 204
+#define SYS_SCHED_SETATTR 314
+#define SYS_SCHED_GETATTR 315
 #define SYS_EPOLL_CREATE 213
 #define SYS_GETDENTS64 217
 #define SYS_SET_TID_ADDRESS 218
@@ -251,6 +259,7 @@
 #define SYS_DELETE_MODULE 176
 #define SYS_UMOUNT2 166
 #define SYS_SETHOSTNAME 170
+#define SYS_SETDOMAINNAME 171
 #define SYS_REBOOT 169
 #define SYS_UPTIME 399
 #define SYS_PIDFD_OPEN 434
@@ -275,6 +284,13 @@
 #define SYS_FSMOUNT     432
 #define SYS_FSPICK      433
 #define SYS_MOUNT_SETATTR 442
+
+/* io_uring (425..427): functional implementation in sys_io_uring.c
+ * (PMM-backed SQ/CQ rings shared via mmap, synchronous execution on
+ * io_uring_enter). Unsupported opcodes fail per-CQE with -EINVAL. */
+#define SYS_IO_URING_SETUP    425
+#define SYS_IO_URING_ENTER    426
+#define SYS_IO_URING_REGISTER 427
 
 /* Extended attributes (188..199) */
 #define SYS_SETXATTR      188

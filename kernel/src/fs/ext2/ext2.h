@@ -126,6 +126,33 @@ typedef struct {
 
 #define EXT3_JOURNAL_MAP_SLOTS 64
 
+/* Host tests include this header directly; keep the lock/type dependencies
+ * implicit through ext2.h's own includes. Journal descriptor tag capacity is
+ * (block_size - header) / tag = 126 at 1 KiB. A transaction whose write-set
+ * exceeds one descriptor uses consecutive descriptor/payload groups, capped
+ * at EXT3_JOURNAL_SEG_MAX groups before it aborts instead of writing home
+ * blocks unjournaled. */
+#define EXT3_JOURNAL_SEG_MAX 8
+#define EXT3_TXN_CHUNK_ENTRIES 32
+
+/* One unique metadata block staged by the active transaction. `image` is the
+ * latest full-block content for that block; `payload_pos`/`desc_pos` are
+ * logical journal block indexes assigned when the block first appeared. */
+typedef struct {
+  uint32_t block;
+  uint32_t payload_pos;
+  uint32_t desc_pos;
+  uint8_t *image;
+} ext3_txn_entry_t;
+
+/* Appended-only chunks: readers (ext3_journal_read_staged) walk them under
+ * cache_lock while the owner links new chunks, so nothing may move. */
+typedef struct ext3_txn_chunk {
+  struct ext3_txn_chunk *next;
+  uint32_t count;
+  ext3_txn_entry_t entries[EXT3_TXN_CHUNK_ENTRIES];
+} ext3_txn_chunk_t;
+
 typedef struct {
   bool active;
   bool io_failed;
@@ -137,6 +164,12 @@ typedef struct {
   uint8_t *desc_block_buf;
   uint8_t *commit_block_buf;
   uint8_t *super_block_buf;
+  /* Write-set of the active transaction, guarded by the mount's cache_lock.
+   * txn_head/txn_tail/count are written by the owner only; readers copy the
+   * image of a matching block. */
+  ext3_txn_chunk_t *txn_head;
+  ext3_txn_chunk_t *txn_tail;
+  uint32_t txn_count;
   /* The journal inode's allocation is fixed for the lifetime of this mount.
    * Cache only mappings, never mutable journal contents. Keys are logical+1
    * so a zero-initialized slot is empty. Collisions just remap on demand. */
@@ -145,6 +178,11 @@ typedef struct {
   uint32_t journal_blocks;
   uint32_t blocks_in_trans;
   rawspinlock_t lock;
+  /* Fair ownership handoff under lock: the finishing owner keeps `lock`
+   * held and grants it to the oldest waiter through granted_tid, so a fresh
+   * writer cannot acquire ahead of a queued one. */
+  rawspinlock_t sched_lock;
+  uint32_t granted_tid;
   wait_queue_t waiters;
   struct storage_latency perf_wait, perf_hold;
   uint64_t started_ms;

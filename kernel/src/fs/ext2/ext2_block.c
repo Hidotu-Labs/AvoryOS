@@ -14,11 +14,39 @@ uint32_t ext2_current_time(void) {
   return (uint32_t)(rtc_get_boot_timestamp() + lapic_timer_get_ms() / 1000);
 }
 
+/* Cache storage is optional, and remains installed for the mount's lifetime.
+ * Allocate outside cache_lock: kmalloc may reclaim file pages and take other
+ * filesystem locks. Holding an IRQ-masking spinlock across that can freeze
+ * readers and the journal owner together. Recheck for a competing installer. */
+static void ext2_cache_prepare(ext2_mount_t *mnt, uint32_t idx) {
+  spinlock_acquire(&mnt->cache_lock);
+  bool ready = mnt->cache[idx].data != NULL;
+  spinlock_release(&mnt->cache_lock);
+  if (ready)
+    return;
+  uint8_t *data = kmalloc(mnt->block_size);
+  if (!data)
+    return;
+  spinlock_acquire(&mnt->cache_lock);
+  if (!mnt->cache[idx].data) {
+    mnt->cache[idx].data = data;
+    data = NULL;
+  }
+  spinlock_release(&mnt->cache_lock);
+  kfree(data);
+}
+
 int ext2_read_block(ext2_mount_t *mnt, uint32_t block_num, void *buffer) {
   if (block_num == 0) {
     memset(buffer, 0, mnt->block_size);
     return 0;
   }
+
+  /* The active journal transaction keeps the latest metadata image in memory
+   * until its commit checkpoint; read-modify-write sequences must see that
+   * image even though the home block still holds the pre-transaction copy. */
+  if (ext3_journal_read_staged(mnt, block_num, buffer))
+    return 0;
 
   uint32_t idx = block_num % EXT2_CACHE_SIZE;
 read_retry:
@@ -59,6 +87,7 @@ read_retry:
     return err;
   }
 
+  ext2_cache_prepare(mnt, idx);
   spinlock_acquire(&mnt->cache_lock);
   if (mnt->cache[idx].data && mnt->cache[idx].num == block_num) {
     /* A writer populated this block while the device read was in flight.
@@ -76,8 +105,6 @@ read_retry:
     /* This is a direct-mapped cache.  An occupied slot belonging to another
      * block must be replaced; retaining it makes later writes to that block
      * invisible to the cache and can return stale extent metadata. */
-    if (!mnt->cache[idx].data)
-      mnt->cache[idx].data = kmalloc(mnt->block_size);
     if (mnt->cache[idx].data) {
       mnt->cache[idx].num = block_num;
       memcpy(mnt->cache[idx].data, buffer, mnt->block_size);
@@ -88,17 +115,21 @@ read_retry:
   return 0;
 }
 
-int ext2_write_block(ext2_mount_t *mnt, uint32_t block_num,
-                     const void *buffer) {
+/* An optional phase pointer belongs to the owning journal transaction. It
+ * exposes which part of the home write is stalled without a new mount layout. */
+int ext2_write_block_traced(ext2_mount_t *mnt, uint32_t block_num,
+                            const void *buffer, const char **phase,
+                            const char *const stages[4]) {
   if (block_num == 0)
     return -1;
 
   uint32_t idx = block_num % EXT2_CACHE_SIZE;
+  if (phase) *phase = stages[0];
+  ext2_cache_prepare(mnt, idx);
+  if (phase) *phase = stages[1];
   spinlock_acquire(&mnt->cache_lock);
   mnt->cache[idx].write_seq++;
   mnt->cache[idx].writes_inflight++;
-  if (!mnt->cache[idx].data)
-    mnt->cache[idx].data = kmalloc(mnt->block_size);
   if (mnt->cache[idx].data) {
     mnt->cache[idx].num = block_num;
     memcpy(mnt->cache[idx].data, buffer, mnt->block_size);
@@ -108,7 +139,9 @@ int ext2_write_block(ext2_mount_t *mnt, uint32_t block_num,
   uint64_t byte_offset = (uint64_t)block_num * mnt->block_size;
   uint64_t lba         = byte_offset / 512;
   uint32_t sectors     = mnt->block_size / 512;
+  if (phase) *phase = stages[2];
   int err = mnt->dev->write_sectors(mnt->dev, lba, sectors, buffer);
+  if (phase) *phase = stages[3];
   spinlock_acquire(&mnt->cache_lock);
   mnt->cache[idx].write_seq++;
   mnt->cache[idx].writes_inflight--;
@@ -116,6 +149,19 @@ int ext2_write_block(ext2_mount_t *mnt, uint32_t block_num,
     mnt->cache[idx].num = 0;
   spinlock_release(&mnt->cache_lock);
   return err;
+}
+
+int ext2_write_block_phase(ext2_mount_t *mnt, uint32_t block_num,
+                           const void *buffer, const char **phase) {
+  static const char *const stages[4] = {
+      "metadata-home-cache-alloc", "metadata-home-cache-publish",
+      "metadata-home-io", "metadata-home-cache-finish"};
+  return ext2_write_block_traced(mnt, block_num, buffer, phase, stages);
+}
+
+int ext2_write_block(ext2_mount_t *mnt, uint32_t block_num,
+                     const void *buffer) {
+  return ext2_write_block_phase(mnt, block_num, buffer, NULL);
 }
 
 /* Publish and version every member before issuing a bounded contiguous data
@@ -128,13 +174,13 @@ int ext2_write_blocks(ext2_mount_t *mnt, uint32_t first, uint32_t count,
       mnt->block_size % 512 || first >= mnt->sb.s_blocks_count ||
       count > mnt->sb.s_blocks_count - first)
     return -1;
+  for (uint32_t i = 0; i < count; i++)
+    ext2_cache_prepare(mnt, (first + i) % EXT2_CACHE_SIZE);
   spinlock_acquire(&mnt->cache_lock);
   for (uint32_t i = 0; i < count; i++) {
     uint32_t idx = (first + i) % EXT2_CACHE_SIZE;
     mnt->cache[idx].write_seq++;
     mnt->cache[idx].writes_inflight++;
-    if (!mnt->cache[idx].data)
-      mnt->cache[idx].data = kmalloc(mnt->block_size);
     if (mnt->cache[idx].data) {
       mnt->cache[idx].num = first + i;
       memcpy(mnt->cache[idx].data, (const uint8_t *)buffer +
@@ -155,6 +201,65 @@ int ext2_write_blocks(ext2_mount_t *mnt, uint32_t first, uint32_t count,
   }
   spinlock_release(&mnt->cache_lock);
   return err;
+}
+
+/* Scattered variant of ext2_write_blocks(): every member is an independent
+ * full block, staged through one device batch when the driver supports it.
+ * The same cache publication/versioning contract applies, per block.  Members
+ * must name distinct blocks: batching does not order completions. */
+#define EXT2_BLOCK_BATCH_MAX 32u
+
+int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
+                            uint32_t count) {
+  if (!mnt || !entries || !count || count > EXT2_BLOCK_BATCH_MAX ||
+      !mnt->dev || !mnt->dev->write_sectors || !mnt->block_size ||
+      mnt->block_size % 512)
+    return -1;
+  uint32_t sectors_per_block = mnt->block_size / 512;
+
+  struct block_io_req reqs[EXT2_BLOCK_BATCH_MAX];
+  for (uint32_t i = 0; i < count; i++) {
+    entries[i].result = -1;
+    if (!entries[i].buffer || entries[i].block_num == 0 ||
+        entries[i].block_num >= mnt->sb.s_blocks_count)
+      return -1;
+    ext2_cache_prepare(mnt, entries[i].block_num % EXT2_CACHE_SIZE);
+    reqs[i].lba = (uint64_t)entries[i].block_num * sectors_per_block;
+    reqs[i].count = sectors_per_block;
+    reqs[i].buf = (void *)entries[i].buffer;
+    reqs[i].result = -1;
+  }
+
+  spinlock_acquire(&mnt->cache_lock);
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t idx = entries[i].block_num % EXT2_CACHE_SIZE;
+    mnt->cache[idx].write_seq++;
+    mnt->cache[idx].writes_inflight++;
+    if (mnt->cache[idx].data) {
+      mnt->cache[idx].num = entries[i].block_num;
+      memcpy(mnt->cache[idx].data, entries[i].buffer, mnt->block_size);
+    }
+  }
+  spinlock_release(&mnt->cache_lock);
+
+  block_write_batch(mnt->dev, reqs, count);
+
+  spinlock_acquire(&mnt->cache_lock);
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t idx = entries[i].block_num % EXT2_CACHE_SIZE;
+    bool failed = reqs[i].result != 0;
+    entries[i].result = failed ? -1 : 0;
+    mnt->cache[idx].write_seq++;
+    mnt->cache[idx].writes_inflight--;
+    if (failed && mnt->cache[idx].num == entries[i].block_num)
+      mnt->cache[idx].num = 0;
+  }
+  spinlock_release(&mnt->cache_lock);
+
+  for (uint32_t i = 0; i < count; i++)
+    if (entries[i].result != 0)
+      return -1;
+  return 0;
 }
 
 int ext2_write_superblock(ext2_mount_t *mnt) {

@@ -12,5 +12,6 @@ void sysfs_pci_init(vfs_node_t *pci_bus_dir, vfs_node_t *devices_root);void sysf
 void sysfs_pci_device_bound(struct device *device);
 void sysfs_pci_device_unbinding(struct device *device);
 void sysfs_pci_linux_driver(struct pci_device *pci, const char *name);
+vfs_node_t *sysfs_pci_device_node(struct pci_device *pci);
 
 #endif

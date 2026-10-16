@@ -42,9 +42,19 @@ void ramfs_free_file_data(ramfs_file_t *file) {
     uint64_t hhdm = pmm_get_hhdm_offset();
     size_t pages = ((uint64_t)file->capacity + 4095) / 4096;
     uint64_t phys = (uint64_t)file->data - hhdm;
+
+    /* Pages whose reference already reached zero were returned to the PMM by
+     * another owner (concurrent resize, stale device pointer, double close).
+     * Releasing the whole rounded block anyway decremented pages that no
+     * longer belong to this file - and once such a frame was recycled,
+     * pmm_free_pages() walked its new owner's reference down to zero and
+     * handed a live page back to the buddy allocator.  Report the ownership
+     * loss, then release only the pages this file still owns. */
+    bool ownership_lost = false;
     for (size_t i = 0; i < pages; i++) {
       if (pmm_get_ref((void *)(phys + i * 4096)) != 0)
         continue;
+      ownership_lost = true;
       if (__atomic_add_fetch(&ramfs_bad_free_reports, 1,
                              __ATOMIC_RELAXED) <= 8) {
         struct thread *t = sched_get_current();
@@ -58,10 +68,22 @@ void ramfs_free_file_data(ramfs_file_t *file) {
         klog_puts(" comm="); klog_puts(t ? t->comm : "?");
         klog_puts("\n");
       }
-      break;
     }
+
     klog_ramfs_free(file->data, file->capacity, true, pages);
-    pmm_free_pages((void *)((uint64_t)file->data - hhdm), pages);
+
+    if (!ownership_lost) {
+      pmm_free_pages((void *)phys, pages);
+    } else {
+      for (size_t i = 0; i < pages; i++) {
+        void *page = (void *)(phys + i * 4096);
+        /* Re-check: the reference may have dropped between the scan and the
+         * release.  pmm_decref() refuses a zero reference and skips frames
+         * already on the buddy free list. */
+        if (pmm_get_ref(page) != 0)
+          pmm_decref(page);
+      }
+    }
   } else {
     klog_ramfs_free(file->data, file->capacity, false, 0);
     kfree(file->data);
@@ -208,7 +230,7 @@ uint32_t ramfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
 }
 
 int ramfs_truncate(vfs_node_t *node, uint32_t new_len) {
-  if (!node || node->flags != FS_FILE || !node->device)
+  if (!node || (node->flags & FS_TYPE_MASK) != FS_FILE || !node->device)
     return -1;
 
   ramfs_file_t *file = (ramfs_file_t *)node->device;
@@ -225,7 +247,7 @@ int ramfs_truncate(vfs_node_t *node, uint32_t new_len) {
     uint8_t new_is_pmm = 0;
     uint8_t *new_data = ramfs_alloc_buffer(file, new_len, &new_cap, &new_is_pmm);
     if (!new_data)
-      return -1; // ENOMEM
+      return -12; // ENOMEM: -1 would surface as EPERM in userspace
     if (file->data) {
       uint32_t copy_len = node->length < file->capacity ? node->length : file->capacity;
       memcpy(new_data, file->data, copy_len);
@@ -265,7 +287,7 @@ int ramfs_fallocate(vfs_node_t *node, int mode, uint32_t offset, uint32_t len) {
     uint8_t new_is_pmm = 0;
     uint8_t *new_data = ramfs_alloc_buffer(file, needed, &new_cap, &new_is_pmm);
     if (!new_data)
-      return -1;
+      return -12; // ENOMEM: -1 would surface as EPERM in userspace
     if (file->data) {
       uint32_t copy_len = node->length < file->capacity ? node->length : file->capacity;
       memcpy(new_data, file->data, copy_len);

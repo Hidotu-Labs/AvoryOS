@@ -2,6 +2,11 @@
 #define TSC_PROBES_ENABLE
 #include "../lib/tsc.h"
 #include "sched_internal.h"
+#include "namespace.h"
+#include "seccomp.h"
+#include "pid_namespace.h"
+#include "net_namespace.h"
+#include "../fs/mount_namespace.h"
 #include "../lib/string.h"
 #include "wait.h"
 #include "hal/hal.h"
@@ -10,6 +15,7 @@
 #include "../cpu/fpu.h"
 #include "../fs/procfs.h"
 #include "../fs/vfs.h"
+#include "../socket/epoll.h"
 #include "../lock/spinlock.h"
 #include "../mm/heap.h"
 #include "../mm/pcid.h"
@@ -119,6 +125,7 @@ void sched_reap_thread(struct thread *t) {
 
   futex_remove_thread_waiters(t);
   wait_queue_cleanup_thread(t);
+  epoll_release_thread(t);
   /* A thread killed mid-write may own a journal transaction (kill -9 of a
    * game group while a worker holds it). The wait-queue cleanup above cannot
    * release the transaction lock, so without this the mount wedges forever
@@ -209,6 +216,12 @@ void sched_reap_thread(struct thread *t) {
   // Normally released by process_do_exit(); retain this as a safety net for
   // kernel-thread and abnormal teardown paths.
   sched_release_files(t);
+  uts_namespace_release(t);
+  ipc_namespace_release(t);
+  pid_namespace_release(t);
+  net_namespace_release(t);
+  vfs_namespace_release(t);
+  seccomp_release_task(t);
   if (t->cwd_node) {
     vfs_close(t->cwd_node);
     t->cwd_node = NULL;
@@ -249,6 +262,7 @@ void sched_reap_thread(struct thread *t) {
   extern void linuxkpi_thread_exiting(void *thread) __attribute__((weak));
   if (linuxkpi_thread_exiting)
     linuxkpi_thread_exiting(t);
+  signal_release_queued_info(t);
   kfree(t);
 
   klog_debug_puts("[REAP] Done\n");
@@ -308,6 +322,7 @@ void sched_terminate_thread_group(struct thread *current) {
   if (leader && leader != current) {
     leader->reap_remove_runqueue = true;
     leader->exit_status = current->exit_status ? current->exit_status : 0;
+    leader->termination_signal = current->termination_signal;
 
     struct thread *parent = leader->parent;
     int exit_signal = (int)(leader->clone_flags & 0xff);

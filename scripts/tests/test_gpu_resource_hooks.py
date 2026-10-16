@@ -13,7 +13,7 @@ shim=r'''
 #include <stdio.h>
 #include <stdarg.h>
 #include <linuxkpi/gpu_diag.h>
-typedef uint64_t u64;
+typedef uint64_t u64;typedef uint32_t u32;
 struct drm_device{int dummy;};struct drm_file{int dummy;};
 struct dma_fence{u64 context,seqno;};struct dma_resv{int dummy;};
 enum dma_resv_usage{DMA_RESV_USAGE_KERNEL,DMA_RESV_USAGE_WRITE};
@@ -21,6 +21,10 @@ struct page{u64 phys;int _refcount;};
 struct ttm_tt{struct page **pages;u64 *dma_address;unsigned long num_pages;};
 struct ttm_resource{unsigned mem_type;};
 struct amdgpu_device{unsigned usec_timeout;};
+struct amdgpu_task_info{unsigned tgid,pid;};
+static unsigned task_lookups,vm_failures;
+void amdgpu_vm_get_task_info(struct amdgpu_device*d,u32 pasid,struct amdgpu_task_info*i){assert(d&&pasid==32768);task_lookups++;i->tgid=131;i->pid=132;}
+void gpu_diag_vm_failure(const void*d,unsigned pasid,unsigned tgid,unsigned pid){assert(d&&pasid==32768&&tgid==131&&pid==132&&task_lookups==vm_failures+1);vm_failures++;}
 enum psp_ring_type{PSP_RING_TYPE__KM=2};
 struct psp_context;
 struct psp_funcs{int (*ring_create)(struct psp_context*,enum psp_ring_type);};
@@ -60,6 +64,7 @@ int main(void){
  struct ttm_tt tt={pages,dma,2};struct ttm_resource resource={1};struct dma_resv resv;
  struct amdgpu_bo bo={.tbo={.base={8192,&resv},.ttm=&tt,.resource=&resource}};
  struct amdgpu_bo_va va={.base={&bo,(void*)0x1234}};struct amdgpu_device adev;
+ struct amdgpu_task_info ti={0};linuxkpi_amdgpu_vm_fault_info(&adev,32768,&ti);assert(task_lookups==1&&vm_failures==1&&ti.tgid==131&&ti.pid==132);
  assert(amdgpu_vm_bo_update(&adev,&va,true)==-12&&calls==2&&events==6);
  assert(kind[2]==GPU_DIAG_BO_BACKING&&objects[2]==&bo);
  assert(kind[3]==GPU_DIAG_PAGE_BIND&&values[3][1]==p[0].phys&&values[3][2]==dma[0]);
@@ -82,3 +87,10 @@ with tempfile.TemporaryDirectory(prefix='gpu-resource-hooks-') as tmp:
  p=Path(tmp);(p/'test.c').write_text(shim+s+main)
  subprocess.run(['cc','-std=gnu11','-O1','-g','-DAVORYOS_AMDGPU_MEMORY_POLICY','-fsanitize=address,undefined','-I'+str(root/'kernel/linuxkpi/include'),str(p/'test.c'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True,timeout=10)
+
+# The diagnostic wrapper is limited to the fault/timeout reporters; the
+# upstream VM lookup definition and other callers keep their original symbol.
+makefile=(root/'kernel/GNUmakefile').read_text()
+redirect=[line for line in makefile.splitlines() if '-Damdgpu_vm_get_task_info=' in line]
+assert len(redirect)==1 and 'gmc_v10_0.c.o' in redirect[0] and 'amdgpu_job.c.o' in redirect[0]
+assert 'amdgpu_vm.c.o' not in redirect[0]

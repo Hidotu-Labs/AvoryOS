@@ -33,6 +33,33 @@ def sync_json(path, data):
     os.close(directory)
 
 
+class GuestGpuExit:
+    """Record observed guest callbacks, not a claim of hardware reset success."""
+    def __init__(self):
+        self.partial = b''
+        self.initialized = False
+        self.shutdown_started = False
+        self.shutdown_completed = False
+
+    def observe(self, chunk):
+        lines = (self.partial + chunk).split(b'\n')
+        self.partial = lines.pop()[-4096:]
+        for line in lines:
+            if b'[drm] Initialized amdgpu ' in line:
+                # A guest reboot can initialize the device again in one run.
+                self.initialized = True
+                self.shutdown_started = self.shutdown_completed = False
+            if b'LinuxKPI: shutting down pci amdgpu ' in line:
+                self.shutdown_started = True
+            if b'LinuxKPI: pci amdgpu ' in line and b' shutdown complete' in line:
+                self.shutdown_completed = True
+
+    def snapshot(self):
+        return {'amdgpu_initialized': self.initialized,
+                'amdgpu_shutdown_started': self.shutdown_started,
+                'amdgpu_shutdown_callback_completed': self.shutdown_completed}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-root', type=Path, default=ROOT / 'build/logs/prime-runs')
@@ -74,6 +101,7 @@ def main():
             reader.seek(offset)
             process = None
             cancelled = None
+            gpu_exit = GuestGpuExit()
 
             def forward(signum, _frame):
                 nonlocal cancelled
@@ -83,6 +111,7 @@ def main():
 
             def copy_serial():
                 while chunk := reader.read(65536):
+                    gpu_exit.observe(chunk)
                     copied.write(chunk)
                     os.fsync(copied.fileno())
                     os.fsync(serial.fileno())
@@ -90,6 +119,9 @@ def main():
             signal.signal(signal.SIGTERM, forward)
             signal.signal(signal.SIGINT, forward)
             print(f'QEMU launch evidence: {run}', flush=True)
+            if any('gtk' in option and 'window-close=off' in option for option in command):
+                print('GPU passthrough: use Shutdown inside the guest to close the VM. '
+                      'The window X button is disabled so AMDGPU can shut down first.', flush=True)
             try:
                 # Flush the launch marker before opening a passed device.
                 copy_serial()
@@ -119,8 +151,13 @@ def main():
                         if process.poll() is not None and not selector.get_map():
                             break
                 metadata.update(status='exited', returncode=process.returncode,
-                                ended_utc=datetime.now(timezone.utc).isoformat())
+                                ended_utc=datetime.now(timezone.utc).isoformat(),
+                                **gpu_exit.snapshot())
                 sync_json(run / 'launch.json', metadata)
+                if gpu_exit.initialized and not gpu_exit.shutdown_completed:
+                    print('QEMU exited without an observed guest AMDGPU shutdown callback; '
+                          'the GPU may retain state and fail the next initialization. '
+                          'Use Shutdown inside the guest on future sessions.', file=sys.stderr, flush=True)
                 process.stderr.close()
                 return process.returncode if process.returncode >= 0 else 128 - process.returncode
             finally:

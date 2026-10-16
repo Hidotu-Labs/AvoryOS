@@ -1,4 +1,5 @@
 #include "vfs.h"
+#include "mount_namespace.h"
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
 #include "../mm/heap.h"
@@ -45,6 +46,8 @@ static xattr_entry_t *xattr_find_locked(xattr_entry_t *head,
 
 int vfs_setxattr(vfs_node_t *node, const char *name, const void *value,
                  uint32_t size, int flags) {
+  if (vfs_mount_readonly(node)) return -30;
+  node = vfs_backing_node(node);
   if (!node || !name || (!value && size != 0))
     return -XATTR_EINVAL;
   size_t name_len = strlen(name);
@@ -117,6 +120,7 @@ int vfs_setxattr(vfs_node_t *node, const char *name, const void *value,
 
 int vfs_getxattr(vfs_node_t *node, const char *name, void *value,
                  uint32_t size) {
+  node = vfs_backing_node(node);
   if (!node || !name)
     return -XATTR_EINVAL;
   if (!xattr_namespace_ok(name))
@@ -145,6 +149,7 @@ int vfs_getxattr(vfs_node_t *node, const char *name, void *value,
 }
 
 int vfs_listxattr(vfs_node_t *node, char *list, uint32_t size) {
+  node = vfs_backing_node(node);
   if (!node)
     return -XATTR_EINVAL;
 
@@ -171,6 +176,8 @@ int vfs_listxattr(vfs_node_t *node, char *list, uint32_t size) {
 }
 
 int vfs_removexattr(vfs_node_t *node, const char *name) {
+  if (vfs_mount_readonly(node)) return -30;
+  node = vfs_backing_node(node);
   if (!node || !name)
     return -XATTR_EINVAL;
   if (!xattr_namespace_ok(name))

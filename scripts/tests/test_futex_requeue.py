@@ -18,9 +18,12 @@ def function(signature):
 
 prefix = r'''
 #include <assert.h>
+#include <pthread.h>
+#include <semaphore.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #define EFAULT 14
 #define EAGAIN 11
@@ -33,27 +36,44 @@ prefix = r'''
 #define FUTEX_HASH_SIZE 256
 #define FUTEX_BITSET_MATCH_ANY UINT32_MAX
 #define LOCKDIAG_STAT(...) ((void)0)
+/* pthread.h declares the POSIX sched_yield(); the kernel stub below shadows it
+ * for the extracted code, so route the calls through a distinct name. */
+#define sched_yield sched_yield_stub
 typedef struct {bool held;} spinlock_t;
+typedef int hal_irq_state_t;
 struct thread {int state; uint64_t wakeup_ticks,blocked_since_ms;
-bool in_futex_wait,blocked_reported; unsigned futex_bucket;};
+bool in_futex_wait,blocked_reported; unsigned futex_bucket;
+uint32_t futex_wake_claims;};
 static struct thread self;
 static uint64_t now;
-static int mode, yields, wake_calls;
-static bool cleanup_race, use_cmp;
+static int mode, yields, wake_calls, locks_held;
+static uint64_t bucket_acquires;
+static bool cleanup_race, use_cmp, gate_wake;
+static sem_t wake_entered, wake_release;
 static uint32_t words[256], *from, *to;
 static void before_lock(spinlock_t *lock);
+static hal_irq_state_t hal_irq_save(void){return 0;}
+static void hal_irq_restore(hal_irq_state_t flags){(void)flags;}
+static void tlb_shootdown_poll(void){}
 static void spinlock_acquire(spinlock_t *lock) {
- before_lock(lock); assert(!lock->held);lock->held=true;
+ before_lock(lock); assert(!lock->held);lock->held=true;locks_held++;
+ __atomic_add_fetch(&bucket_acquires,1,__ATOMIC_RELAXED);
 }
-static void spinlock_release(spinlock_t *lock) {assert(lock->held);lock->held=false;}
+static void spinlock_release(spinlock_t *lock) {assert(lock->held);lock->held=false;locks_held--;}
+static void spinlock_acquire_save(spinlock_t *lock, uint64_t *flags) {*flags=0;spinlock_acquire(lock);}
+static void spinlock_release_restore(spinlock_t *lock, uint64_t flags) {(void)flags;spinlock_release(lock);}
 static struct thread *sched_get_current(void){return &self;}
 static uint64_t lapic_timer_get_ticks(void){return now;}
 static uint64_t rtc_get_boot_timestamp(void){return 0;}
 static bool thread_has_pending_signal(struct thread *t){(void)t;return false;}
-static void sched_wakeup(struct thread *t){wake_calls++;if(t->state==THREAD_BLOCKED)t->state=THREAD_READY;}
+static void sched_wakeup(struct thread *t){wake_calls++;
+ assert(locks_held==0);          /* deferred: delivered outside every bucket lock */
+ assert(t->futex_wake_claims==1);/* claimed before the lock was dropped */
+ if(gate_wake){sem_post(&wake_entered);sem_wait(&wake_release);}
+ if(t->state==THREAD_BLOCKED)t->state=THREAD_READY;}
 static void futex_bucket_note(unsigned bucket,bool woke){(void)bucket;(void)woke;}
 static void fair_yield(void);
-static void sched_yield(void){
+static void sched_yield_stub(void){
  yields++;
  if(mode==3){fair_yield();self.state=THREAD_RUNNING;}
  else if(mode==1){now=self.wakeup_ticks;self.state=THREAD_RUNNING;cleanup_race=true;}
@@ -63,6 +83,11 @@ static void sched_yield(void){
 start = source.index('struct futex_key {')
 end = source.index('/* Per-bucket wake traffic', start)
 code = prefix + source[start:end]
+# Deferred-wake helpers verbatim: the claim, the deliver loop and the bucket
+# lock pair whose saved-flags form is what keeps a claim from being preempted.
+hbegin = source.index('#define FUTEX_WAKE_BATCH')
+hend = source.index('static int futex_initialized', hbegin)
+code += source[hbegin:hend]
 code += function('static inline uint32_t futex_hash_key(')
 code += function('static inline bool futex_key_equal(')
 if 'static void futex_enqueue(' in source:
@@ -79,6 +104,8 @@ code += function('static uint64_t futex_wait(')
 code += function('static inline uint64_t futex_wake_key(')
 code += function('static uint64_t futex_requeue(')
 code += function('static uint64_t futex_cmp_requeue(')
+code += 'static int futex_initialized = 1;\n'
+code += function('void futex_remove_thread_waiters(')
 code += r'''
 static struct futex_key key(uint32_t *word){struct futex_key k;futex_get_key(word,true,&k);return k;}
 static struct thread fair_old;
@@ -98,11 +125,60 @@ static void before_lock(spinlock_t *lock){
 }
 static void reset(void){memset(futex_hash,0,sizeof(futex_hash));memset(&self,0,sizeof(self));
  self.state=THREAD_RUNNING;now=0;yields=0;wake_calls=0;cleanup_race=false;}
+/* The claim protocol the deferred wake relies on: a reaper that scans while a
+ * waker holds a claim on the victim must not finish (nor may anything free the
+ * victim) until the wake is delivered; a reaper that unlinks the waiter first
+ * leaves no claim and the wake then finds nothing. */
+static int reap_done;
+static void *reaper_thread(void *arg){
+ futex_remove_thread_waiters((struct thread *)arg);
+ __atomic_store_n(&reap_done,1,__ATOMIC_RELEASE);
+ return NULL;
+}
+static void *waker_thread(void *arg){(void)arg;futex_wake_key(key(from),1,UINT32_MAX);return NULL;}
+static void reap_scenario(void){
+ unsigned b=futex_hash_key(key(from));
+ reset();
+ struct thread victim={.state=THREAD_BLOCKED};
+ struct futex_waiter w={.key=key(from),.bucket=b,.thread=&victim,.bitset=UINT32_MAX};
+ futex_hash[b].head=&w;
+ gate_wake=true;__atomic_store_n(&reap_done,0,__ATOMIC_RELAXED);
+ assert(!sem_init(&wake_entered,0,0) && !sem_init(&wake_release,0,0));
+ pthread_t waker;assert(!pthread_create(&waker,NULL,waker_thread,NULL));
+ assert(!sem_wait(&wake_entered));
+ /* The waker unlinked the waiter and claimed the thread; the wake is parked
+  * inside the claimed window, outside every bucket lock. */
+ assert(victim.futex_wake_claims==1 && !futex_hash[b].head);
+ uint64_t before=__atomic_load_n(&bucket_acquires,__ATOMIC_RELAXED);
+ pthread_t reaper;assert(!pthread_create(&reaper,NULL,reaper_thread,&victim));
+ /* Wait for the reaper's 256-bucket scan to complete (bounded so a stalled
+  * scan fails the test instead of hanging it). */
+ for(int spin=0;__atomic_load_n(&bucket_acquires,__ATOMIC_RELAXED)<before+FUTEX_HASH_SIZE;spin++){
+  if(spin>200000000){fprintf(stderr,"reaper scan did not finish\n");abort();}
+  __asm__ volatile("pause" ::: "memory");
+ }
+ assert(!__atomic_load_n(&reap_done,__ATOMIC_ACQUIRE)); /* blocked on the outstanding claim */
+ sem_post(&wake_release);
+ pthread_join(waker,NULL);pthread_join(reaper,NULL);
+ assert(__atomic_load_n(&reap_done,__ATOMIC_ACQUIRE) && victim.futex_wake_claims==0 && wake_calls==1);
+ sem_destroy(&wake_entered);sem_destroy(&wake_release);
+ /* Reaper first: the waiter is unlinked before any waker sees it, so no claim
+  * exists and the wake has nothing to find. */
+ gate_wake=false;reset();
+ struct thread dead={.state=THREAD_BLOCKED};
+ struct futex_waiter dw={.key=key(from),.bucket=b,.thread=&dead,.bitset=UINT32_MAX};
+ futex_hash[b].head=&dw;
+ futex_remove_thread_waiters(&dead);
+ assert(!futex_hash[b].head && dead.futex_wake_claims==0);
+ assert(futex_wake_key(key(from),1,UINT32_MAX)==0 && wake_calls==0);
+}
 int main(int argc,char **argv){
  (void)argc;
  bool wake_only=argv[1] && !strcmp(argv[1],"wake");
  from=&words[0];to=&words[1];
  while(futex_hash_key(key(from))==futex_hash_key(key(to)))to++;
+ reap_scenario();
+ puts("PASS: a deferred-wake claim keeps the reaper from finishing until sched_wakeup() lands");
  if(!wake_only) {
  for(int cmp=0;cmp<2;cmp++){
   reset();mode=1;use_cmp=cmp;uint64_t ts[2]={0,10000000};
@@ -155,7 +231,7 @@ int main(int argc,char **argv){
 with tempfile.TemporaryDirectory() as tmp:
     path = Path(tmp)
     (path / 'test.c').write_text(code)
-    subprocess.run(['cc', '-O1', '-g', '-fsanitize=address,undefined',
+    subprocess.run(['cc', '-O1', '-g', '-pthread', '-fsanitize=address,undefined',
                     str(path / 'test.c'), '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test'), os.environ.get('FUTEX_CASE', 'all')], check=True,
                    env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=0'})

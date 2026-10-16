@@ -1,0 +1,17 @@
+diff --git a/libs/connectionicon.cpp b/libs/connectionicon.cpp
+index 61318b1..6927e85 100644
+--- a/libs/connectionicon.cpp
++++ b/libs/connectionicon.cpp
+@@ -327,9 +327,9 @@ void ConnectionIcon::setIcons()
+             } else if (type == NetworkManager::ConnectionSettings::WireGuard) {
+                 connection = activeConnection;
+             } else if (type == NetworkManager::ConnectionSettings::Wired) {
+-                if (connection
+-                    && (connection->type() != NetworkManager::ConnectionSettings::Vpn //
+-                        || connection->type() != NetworkManager::ConnectionSettings::WireGuard)) {
++                if (!connection
++                    || (connection->type() != NetworkManager::ConnectionSettings::Vpn
++                        && connection->type() != NetworkManager::ConnectionSettings::WireGuard)) {
+                     connection = activeConnection;
+                 }
+             } else if (type == NetworkManager::ConnectionSettings::Wireless) {

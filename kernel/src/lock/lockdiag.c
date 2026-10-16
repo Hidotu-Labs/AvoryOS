@@ -1085,6 +1085,55 @@ void lockdiag_dump_all(const char *reason) {
       ld_str(" owner_ip="); ld_hex(j->owner_ip);
       ld_str(" hold_ms=");
       ld_dec(j->active ? lapic_timer_get_ms() - j->started_ms : 0);
+      ld_str(" granted=");
+      ld_dec(__atomic_load_n(&j->granted_tid, __ATOMIC_ACQUIRE));
+      /* A completion may have made the owner READY without it being
+       * dispatched. The blocked-only listing below would omit precisely
+       * that case, leaving a scheduler delay looking like device latency. */
+      for (const struct thread *t = global_thread_list; t; t = t->global_next) {
+        if (!journal_owner || t->tid != journal_owner)
+          continue;
+        ld_str("\n[LOCKDIAG] journal owner task: ");
+        dump_thread(t);
+        ld_str(" cpu="); ld_dec(t->cpu_index);
+        ld_str(" on_cpu=");
+        ld_dec(__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE));
+        ld_str(" on_rq="); ld_dec(t->se.on_rq);
+        ld_str(" ready_since_ms="); ld_dec(t->ready_since_ms);
+        ld_str(" wake_at_ms="); ld_dec(t->wakeup_ticks);
+        ld_str(" deadline_queued="); ld_dec(t->deadline_queued);
+        uint64_t ready_at = __atomic_load_n(&t->ready_since_ms, __ATOMIC_RELAXED);
+        uint64_t sampled_ms = lapic_timer_get_ms();
+        ld_str(" ready_wait_ms=");
+        ld_dec(ready_at && sampled_ms >= ready_at ? sampled_ms - ready_at : 0);
+        ld_str(" vruntime="); ld_dec(t->se.vruntime);
+        ld_str(" vdeadline="); ld_dec(t->se.deadline);
+        ld_str(" slice_ns="); ld_dec(t->se.slice_ns);
+        struct cpu_info *owner_cpu = cpu_get_info(t->cpu_index);
+        /* Diagnostic snapshots only: taking queue_lock here can deadlock a
+         * report requested by a scheduler/lock stall. These fields need not
+         * describe the same instant; the next report can show progress. */
+        if (owner_cpu) {
+          ld_str("\n[LOCKDIAG] journal owner cpu: queued=");
+          ld_dec(owner_cpu->eevfd.nr_running);
+          ld_str(" vtime="); ld_dec(owner_cpu->eevfd.vtime);
+          ld_str(" timer_at_ms="); ld_dec(owner_cpu->timer_deadline_ms);
+          ld_str(" quantum_at_ms="); ld_dec(owner_cpu->quantum_deadline_ms);
+          const struct thread *running =
+              __atomic_load_n(&owner_cpu->current_thread, __ATOMIC_ACQUIRE);
+          if (running) {
+            ld_str(" current_tid="); ld_dec(running->tid);
+            ld_str(" need_resched="); ld_dec(running->need_resched);
+            ld_str(" vruntime="); ld_dec(running->se.vruntime);
+            ld_str(" vdeadline="); ld_dec(running->se.deadline);
+          }
+        }
+        if (!__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE) &&
+            (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING ||
+             t->state == THREAD_READY))
+          dump_parked_stack(t);
+        break;
+      }
     }
     for (const struct thread *t = global_thread_list; t; t = t->global_next) {
       if (t->state != THREAD_BLOCKED) continue;

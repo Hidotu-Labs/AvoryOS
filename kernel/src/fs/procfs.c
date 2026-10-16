@@ -1,3 +1,7 @@
+#include "../sched/capability.h"
+#include "../sched/net_namespace.h"
+#include "../sched/pid_namespace.h"
+#include "inotify_limits.h"
 #include "fs/procfs.h"
 #include "console/klog.h"
 #include "apic/lapic_timer.h"
@@ -19,6 +23,7 @@
 #include "mm/vmm_internal.h"
 #include "mm/tlb_shootdown.h"
 #include "sched/sched.h"
+#include "sched/namespace.h"
 #include "smp/cpu.h"
 #include "syscalls/syscall.h"
 #include <stdint.h>
@@ -728,9 +733,9 @@ static uint32_t procfs_storage_perf_read(vfs_node_t *node, uint32_t offset,
   return size;
 }
 
-#define PROCFS_MAX_MOUNTS 32
-#define PROCFS_MOUNTS_BUFSZ 8192
-#define PROCFS_MOUNTINFO_BUFSZ 8192
+#define PROCFS_MAX_MOUNTS 256
+#define PROCFS_MOUNTS_BUFSZ 65536
+#define PROCFS_MOUNTINFO_BUFSZ 65536
 
 /* Canonicalize a mount-table source for libmount/Solid/UDisks matching.
  * Bare kernel names ("nvme0n1p1") never match UDisks' "/dev/..." Device
@@ -754,6 +759,12 @@ static const char *procfs_mount_src(const char *src, char *out,
   return src;
 }
 
+static void procfs_mount_options(uint64_t flags, char options[80]) {
+  snprintf(options, 80, "%s%s%s%s,relatime", flags & 1 ? "ro" : "rw",
+           flags & 2 ? ",nosuid" : "", flags & 4 ? ",nodev" : "",
+           flags & 8 ? ",noexec" : "");
+}
+
 uint32_t procfs_mounts_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                             uint8_t *buffer) {
   const size_t cap = PROCFS_MOUNTS_BUFSZ;
@@ -761,14 +772,15 @@ uint32_t procfs_mounts_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   if (!buf)
     return 0;
 
-  /* Heap-allocate: 32 mounts do not fit the kernel stack. */
+  /* Heap-allocate the namespace mount table to keep it off the stack. */
   vfs_mount_info_t *mounts =
       kmalloc(sizeof(vfs_mount_info_t) * PROCFS_MAX_MOUNTS);
   if (!mounts) {
     kfree(buf);
     return 0;
   }
-  int count = vfs_get_mounts(mounts, PROCFS_MAX_MOUNTS);
+  int count = node->impl ? sched_get_mount_snapshot(node->impl, mounts, PROCFS_MAX_MOUNTS)
+                         : vfs_get_mounts(mounts, PROCFS_MAX_MOUNTS);
   size_t pos = 0;
 
   for (int i = 0; i < count; i++) {
@@ -780,9 +792,10 @@ uint32_t procfs_mounts_read(vfs_node_t *node, uint32_t offset, uint32_t size,
         mounts[i].dev_name[0] ? mounts[i].dev_name : "none";
     char srcbuf[80];
     const char *src = procfs_mount_src(rawsrc, srcbuf, sizeof(srcbuf));
+    char options[80]; procfs_mount_options(mounts[i].flags, options);
     int w = snprintf(buf + pos, cap - pos,
-        "%s %s %s rw,relatime 0 0\n",
-        src, mounts[i].mountpoint, mounts[i].fs_type);
+        "%s %s %s %s 0 0\n",
+        src, mounts[i].mountpoint, mounts[i].fs_type, options);
     if (w < 0 || (size_t)w >= cap - pos)
       break;
     pos += (size_t)w;
@@ -1152,8 +1165,20 @@ static char thread_state_char(thread_state_t s) {
 }
 
 // /proc/<pid>/stat
+static bool procfs_pid_visible(uint32_t pid) {
+  return pid_namespace_visible(sched_get_current(), pid) != 0;
+}
+static bool procfs_pid_ptrace_access(uint32_t pid) {
+  struct thread *current = sched_get_current();
+  struct sched_thread_snapshot target;
+  if (!current || !procfs_pid_visible(pid) ||
+      !sched_get_thread_snapshot(pid, &target)) return false;
+  return target.tgid == current->tgid || capability_has(current, CAP_SYS_PTRACE);
+}
+
 static uint32_t procfs_pid_stat_read(vfs_node_t *node, uint32_t offset,
                                      uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   uint32_t pid = node->impl;
   struct sched_thread_snapshot t;
   if (!sched_get_thread_snapshot(pid, &t))
@@ -1176,12 +1201,12 @@ static uint32_t procfs_pid_stat_read(vfs_node_t *node, uint32_t offset,
       "0 0 20 0 1 0 %llu "
       "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 %u "
       "0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-      pid,
+      pid_namespace_visible(sched_get_current(), pid),
       t.comm[0] ? t.comm : "unknown",
       thread_state_char(t.state),
-      t.parent_tid,
-      t.pgid,
-      t.pgid,
+      pid_namespace_visible(sched_get_current(), t.parent_tid),
+      pid_namespace_visible(sched_get_current(), t.pgid),
+      pid_namespace_visible(sched_get_current(), t.pgid),
       (unsigned long long)user_jiffies,
       (unsigned long long)system_jiffies,
       (unsigned long long)start_ticks,
@@ -1201,6 +1226,7 @@ static uint32_t procfs_pid_stat_read(vfs_node_t *node, uint32_t offset,
 // a stable number with an instant error return is the spin.
 static uint32_t procfs_pid_syscall_read(vfs_node_t *node, uint32_t offset,
                                         uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_ptrace_access(node->impl)) return 0;
   uint32_t pid = node->impl;
   struct sched_thread_snapshot t;
   if (!sched_get_thread_snapshot(pid, &t))
@@ -1265,12 +1291,13 @@ static uint32_t procfs_pid_syscall_read(vfs_node_t *node, uint32_t offset,
 // /proc/<pid>/status
 static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
                                        uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   uint32_t pid = node->impl;
   struct sched_thread_snapshot t;
   if (!sched_get_thread_snapshot(pid, &t))
     return 0;
 
-  char *buf = kmalloc(768);
+  char *buf = kmalloc(1024);
   if (!buf)
     return 0;
 
@@ -1281,7 +1308,7 @@ static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
   uint64_t virt_kb = virt_bytes / 1024;
   uint64_t rss_kb  = res_bytes / 1024;
 
-  int len = snprintf(buf, 768,
+  int len = snprintf(buf, 1024,
       "Name:\t%s\n"
       "State:\t%c\n"
       "Tgid:\t%u\n"
@@ -1289,17 +1316,25 @@ static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
       "PPid:\t%u\n"
       "Uid:\t%u\t%u\t%u\t%u\n"
       "Gid:\t%u\t%u\t%u\t%u\n"
-      "Threads:\t1\n"
+      "Threads:\t%u\n"
       "VmSize:\t%llu kB\n"
-      "VmRSS:\t%llu kB\n",
+      "VmRSS:\t%llu kB\n"
+      "CapInh:\t%016llx\nCapPrm:\t%016llx\nCapEff:\t%016llx\n"
+      "CapBnd:\t%016llx\nCapAmb:\t%016llx\n"
+      "NoNewPrivs:\t%u\nSeccomp:\t%u\n",
       t.comm[0] ? t.comm : "unknown",
       thread_state_char(t.state),
-      pid, pid,
-      t.parent_tid,
+      pid_namespace_visible(sched_get_current(), t.tgid ? t.tgid : t.tid),
+      pid_namespace_visible(sched_get_current(), t.tid),
+      pid_namespace_visible(sched_get_current(), t.parent_tid),
       t.uid, t.euid, t.suid, t.uid,
       t.gid, t.egid, t.sgid, t.gid,
+      sched_get_group_threads(t.tgid ? t.tgid : t.tid, 0, NULL),
       (unsigned long long)virt_kb,
-      (unsigned long long)rss_kb);
+      (unsigned long long)rss_kb,
+      (unsigned long long)t.cap_inheritable, (unsigned long long)t.cap_permitted,
+      (unsigned long long)t.cap_effective, (unsigned long long)t.cap_bounding,
+      (unsigned long long)t.cap_ambient, t.no_new_privs ? 1u : 0u, t.seccomp_mode);
 
   node->length = (uint32_t)len;
   if (offset >= (uint32_t)len) {
@@ -1325,6 +1360,7 @@ static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
  */
 static uint32_t procfs_pid_cmdline_read(vfs_node_t *node, uint32_t offset,
                                         uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   uint32_t pid = node->impl;
 
   size_t total = sched_thread_cmdline_size(pid);
@@ -1361,6 +1397,7 @@ static uint32_t procfs_pid_cmdline_read(vfs_node_t *node, uint32_t offset,
  * matches. All at root "/". */
 static uint32_t procfs_pid_cgroup_read(vfs_node_t *node, uint32_t offset,
                                        uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   static const char cgroup_line[] = "2:cpu,memory,pids,systemd,elogind,openrc,name=elogind,name=systemd:/\n"
                                     "0::/\n";
   uint32_t len = (uint32_t)(sizeof(cgroup_line) - 1);
@@ -1377,6 +1414,7 @@ static uint32_t procfs_pid_cgroup_read(vfs_node_t *node, uint32_t offset,
 
 static uint32_t procfs_pid_comm_read(vfs_node_t *node, uint32_t offset,
                                      uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   uint32_t pid = node->impl;
   struct sched_thread_snapshot t;
   if (!sched_get_thread_snapshot(pid, &t))
@@ -1401,6 +1439,7 @@ static uint32_t procfs_pid_comm_read(vfs_node_t *node, uint32_t offset,
 // /proc/<pid>/statm — memory in pages
 static uint32_t procfs_pid_statm_read(vfs_node_t *node, uint32_t offset,
                                       uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   uint32_t pid = node->impl;
   struct sched_thread_snapshot t;
   if (!sched_get_thread_snapshot(pid, &t))
@@ -1436,6 +1475,7 @@ static uint32_t procfs_pid_statm_read(vfs_node_t *node, uint32_t offset,
 // htop 3.x reads this for I/O accounting. Stub with zeros.
 static uint32_t procfs_pid_io_read(vfs_node_t *node, uint32_t offset,
                                    uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   (void)node;
   const char *io = "rchar: 0\n"
                    "wchar: 0\n"
@@ -1456,6 +1496,7 @@ static uint32_t procfs_pid_io_read(vfs_node_t *node, uint32_t offset,
 // /proc/<pid>/auxv
 static uint32_t procfs_pid_auxv_read(vfs_node_t *node, uint32_t offset,
                                      uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_ptrace_access(node->impl)) return 0;
   uint32_t pid = node->impl;
   return (uint32_t)sched_read_thread_auxv(pid, offset, size, buffer);
 }
@@ -1463,6 +1504,7 @@ static uint32_t procfs_pid_auxv_read(vfs_node_t *node, uint32_t offset,
 // /proc/<pid>/setgroups (used by bwrap, podman, flatpak, unshare)
 static uint32_t procfs_pid_setgroups_read(vfs_node_t *node, uint32_t offset,
                                           uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   (void)node;
   const char *val = "allow\n";
   uint32_t len = 6;
@@ -1481,6 +1523,7 @@ static uint32_t procfs_pid_setgroups_write(vfs_node_t *node, uint32_t offset,
 // /proc/<pid>/uid_map and gid_map (used by bwrap, podman, flatpak)
 static uint32_t procfs_pid_id_map_read(vfs_node_t *node, uint32_t offset,
                                        uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   (void)node;
   const char *val = "         0          0 4294967295\n";
   uint32_t len = 34;
@@ -1499,6 +1542,7 @@ static uint32_t procfs_pid_id_map_write(vfs_node_t *node, uint32_t offset,
 // /proc/<pid>/oom_score_adj
 static uint32_t procfs_pid_oom_score_adj_read(vfs_node_t *node, uint32_t offset,
                                               uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   (void)node;
   const char *val = "0\n";
   uint32_t len = 2;
@@ -1529,6 +1573,7 @@ static void procfs_vma_collect(struct vma *node, struct vma **arr, int *count, i
 // /proc/<pid>/maps
 static uint32_t procfs_pid_maps_read(vfs_node_t *node, uint32_t offset,
                                      uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_ptrace_access(node->impl)) return 0;
   uint32_t pid = node->impl;
   struct thread *t = sched_get_thread_by_tid(pid);
   if (!t || !t->mm)
@@ -1679,6 +1724,7 @@ static uint32_t procfs_pid_maps_read(vfs_node_t *node, uint32_t offset,
 // /proc/<pid>/numa_maps
 static uint32_t procfs_pid_numa_maps_read(vfs_node_t *node, uint32_t offset,
                                           uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_ptrace_access(node->impl)) return 0;
   uint32_t pid = node->impl;
   struct thread *t = sched_get_thread_by_tid(pid);
   if (!t || !t->mm)
@@ -1798,9 +1844,9 @@ static uint32_t procfs_pid_numa_maps_read(vfs_node_t *node, uint32_t offset,
 
 static int procfs_pid_fd_link_readlink(vfs_node_t *node, char *buf,
                                        uint32_t size) {
-  uint32_t pid_fd = node->impl;
-  uint32_t pid = pid_fd >> 16;
-  uint32_t fd = pid_fd & 0xFFFF;
+  if (!procfs_pid_ptrace_access((uint32_t)node->inode)) return -13;
+  uint32_t pid = (uint32_t)node->inode;
+  uint32_t fd = node->impl;
 
   char path[256];
   if (!sched_get_fd_path_snapshot(pid, fd, path, sizeof(path)))
@@ -1813,7 +1859,12 @@ static int procfs_pid_fd_link_readlink(vfs_node_t *node, char *buf,
   return (int)len;
 }
 
+static vfs_node_t *procfs_pid_fd_link_get_link(vfs_node_t *node) {
+  return sched_get_fd_node_snapshot((uint32_t)node->inode, node->impl);
+}
+
 static vfs_node_t *procfs_pid_fd_finddir(vfs_node_t *node, char *name) {
+  if (!procfs_pid_ptrace_access(node->impl)) return NULL;
   uint32_t pid = node->impl;
   if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
     vfs_open(node);
@@ -1835,12 +1886,15 @@ static vfs_node_t *procfs_pid_fd_finddir(vfs_node_t *node, char *name) {
   strcpy(link->name, name);
   link->flags = FS_SYMLINK;
   link->mask = 0777;
-  link->impl = (pid << 16) | (fd & 0xFFFF);
+  link->inode = pid;
+  link->impl = fd;
   link->readlink = procfs_pid_fd_link_readlink;
+  link->get_link = procfs_pid_fd_link_get_link;
   return link;
 }
 
 static struct dirent *procfs_pid_fd_readdir(vfs_node_t *node, uint32_t index) {
+  if (!procfs_pid_ptrace_access(node->impl)) return NULL;
   uint32_t pid = node->impl;
 
   struct dirent *d = vfs_readdir_buffer();
@@ -1874,9 +1928,9 @@ static struct dirent *procfs_pid_fd_readdir(vfs_node_t *node, uint32_t index) {
 
 static uint32_t procfs_pid_fdinfo_read(vfs_node_t *node, uint32_t offset,
                                        uint32_t size, uint8_t *buffer) {
-  uint32_t pid_fd = node->impl;
-  uint32_t pid = pid_fd >> 16;
-  uint32_t fd = pid_fd & 0xFFFF;
+  if (!procfs_pid_ptrace_access((uint32_t)node->inode)) return 0;
+  uint32_t pid = (uint32_t)node->inode;
+  uint32_t fd = node->impl;
 
   uint64_t file_offset = 0;
   uint32_t flags = 0;
@@ -1893,7 +1947,7 @@ static uint32_t procfs_pid_fdinfo_read(vfs_node_t *node, uint32_t offset,
   if (is_pidfd) {
     pos = snprintf(out, sizeof(out),
                    "pos:\t%llu\nflags:\t0%o\nmnt_id:\t9\nino:\t%u\nPid:\t%u\nNSpid:\t%u\n",
-                   (unsigned long long)file_offset, flags, ino, target_pid, target_pid);
+                   (unsigned long long)file_offset, flags, ino, pid_namespace_visible(sched_get_current(), target_pid), pid_namespace_visible(sched_get_current(), target_pid));
   } else {
     pos = snprintf(out, sizeof(out),
                    "pos:\t%llu\nflags:\t0%o\nmnt_id:\t9\nino:\t%u\n",
@@ -1909,6 +1963,7 @@ static uint32_t procfs_pid_fdinfo_read(vfs_node_t *node, uint32_t offset,
 }
 
 static vfs_node_t *procfs_pid_fdinfo_finddir(vfs_node_t *node, char *name) {
+  if (!procfs_pid_ptrace_access(node->impl)) return NULL;
   uint32_t pid = node->impl;
   if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
     vfs_open(node);
@@ -1930,13 +1985,15 @@ static vfs_node_t *procfs_pid_fdinfo_finddir(vfs_node_t *node, char *name) {
   strcpy(finfo->name, name);
   finfo->flags = FS_FILE;
   finfo->mask = 0444;
-  finfo->impl = (pid << 16) | (fd & 0xFFFF);
+  finfo->inode = pid;
+  finfo->impl = fd;
   finfo->length = 128;
   finfo->read = procfs_pid_fdinfo_read;
   return finfo;
 }
 
 static struct dirent *procfs_pid_fdinfo_readdir(vfs_node_t *node, uint32_t index) {
+  if (!procfs_pid_ptrace_access(node->impl)) return NULL;
   uint32_t pid = node->impl;
 
   struct dirent *d = vfs_readdir_buffer();
@@ -1968,8 +2025,9 @@ static struct dirent *procfs_pid_fdinfo_readdir(vfs_node_t *node, uint32_t index
 //
 // bwrap (and with it WebKitGTK's sandbox setup) opens /proc/<pid>/ns as a
 // directory and fstatat()s the entries to read namespace IDs before it starts
-// a sandbox; container runtimes do the same.  AvoryOS has a single instance of
-// each namespace, but the files have to exist and carry a stable inode number,
+// a sandbox; container runtimes do the same. UTS identity follows the task;
+// other namespaces still have a single initial instance and cannot be cloned.
+// The files have to exist and carry a stable inode number,
 // because that number is how namespace identity is compared.  The entries are
 // regular files rather than Linux's magic symlinks: the stat must succeed, and
 // there is no meaningful target path to follow.
@@ -1993,7 +2051,7 @@ static uint32_t procfs_pid_ns_read(vfs_node_t *node, uint32_t offset,
 
   char text[48];
   int len = snprintf(text, sizeof(text), "%s:[%u]",
-                     procfs_ns_entries[idx].name, procfs_ns_entries[idx].inode);
+                     procfs_ns_entries[idx].name, node->inode);
   if (len <= 0)
     return 0;
 
@@ -2008,6 +2066,7 @@ static uint32_t procfs_pid_ns_read(vfs_node_t *node, uint32_t offset,
 }
 
 static vfs_node_t *procfs_pid_ns_finddir(vfs_node_t *node, char *name) {
+  if (!procfs_pid_visible(node->impl)) return NULL;
   if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
     vfs_open(node);
     return node;
@@ -2025,6 +2084,15 @@ static vfs_node_t *procfs_pid_ns_finddir(vfs_node_t *node, char *name) {
     entry->flags = FS_FILE;
     entry->mask = 0444;
     entry->inode = procfs_ns_entries[i].inode;
+    if (strcmp(name, "uts") == 0 || strcmp(name, "ipc") == 0 || strcmp(name, "pid") == 0 || strcmp(name, "net") == 0 || strcmp(name, "mnt") == 0) {
+      struct sched_thread_snapshot snapshot;
+      if (!sched_get_thread_snapshot(node->impl, &snapshot)) {
+        vfs_close(entry);
+        return NULL;
+      }
+      entry->inode = strcmp(name, "uts") == 0 ? snapshot.uts_namespace_id :
+                     strcmp(name, "ipc") == 0 ? snapshot.ipc_namespace_id : strcmp(name, "pid") == 0 ? snapshot.pid_namespace_id : strcmp(name, "net") == 0 ? snapshot.net_namespace_id : snapshot.mount_namespace_id;
+    }
     entry->impl = i;
     entry->length = 32;
     entry->read = procfs_pid_ns_read;
@@ -2034,6 +2102,7 @@ static vfs_node_t *procfs_pid_ns_finddir(vfs_node_t *node, char *name) {
 }
 
 static struct dirent *procfs_pid_ns_readdir(vfs_node_t *node, uint32_t index) {
+  if (!procfs_pid_visible(node->impl)) return NULL;
   struct dirent *d = vfs_readdir_buffer();
   memset(d, 0, sizeof(*d));
 
@@ -2055,6 +2124,13 @@ static struct dirent *procfs_pid_ns_readdir(vfs_node_t *node, uint32_t index) {
     return NULL;
   strncpy(d->name, procfs_ns_entries[i].name, sizeof(d->name) - 1);
   d->ino = procfs_ns_entries[i].inode;
+  if (strcmp(procfs_ns_entries[i].name, "uts") == 0 ||
+      strcmp(procfs_ns_entries[i].name, "ipc") == 0 || strcmp(procfs_ns_entries[i].name, "pid") == 0 || strcmp(procfs_ns_entries[i].name, "net") == 0 || strcmp(procfs_ns_entries[i].name, "mnt") == 0) {
+    struct sched_thread_snapshot snapshot;
+    if (!sched_get_thread_snapshot(node->impl, &snapshot)) return NULL;
+    d->ino = strcmp(procfs_ns_entries[i].name, "uts") == 0 ? snapshot.uts_namespace_id :
+             strcmp(procfs_ns_entries[i].name, "ipc") == 0 ? snapshot.ipc_namespace_id : strcmp(procfs_ns_entries[i].name, "pid") == 0 ? snapshot.pid_namespace_id : strcmp(procfs_ns_entries[i].name, "net") == 0 ? snapshot.net_namespace_id : snapshot.mount_namespace_id;
+  }
   d->d_type = DT_REG;
   return d;
 }
@@ -2073,6 +2149,7 @@ static spinlock_t procfs_pid_cache_lock = SPINLOCK_INIT;
 /* Dynamic PID trees own one reference to every contained node. Unlike the
  * normal persistent ramfs nodes, lookups need a separate caller reference. */
 static vfs_node_t *procfs_pid_ramfs_finddir(vfs_node_t *node, char *name) {
+  if (!node || !procfs_pid_visible(node->impl)) return NULL;
   if (!node || !node->device)
     return NULL;
   if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
@@ -2107,6 +2184,7 @@ static void procfs_pid_dir_close(vfs_node_t *node) {
 }
 
 static int procfs_pid_exe_readlink(vfs_node_t *node, char *buf, uint32_t size) {
+  if (!procfs_pid_ptrace_access(node->impl)) return -13;
   uint32_t pid = node->impl;
   struct sched_thread_snapshot snapshot;
   if (!sched_get_thread_snapshot(pid, &snapshot))
@@ -2120,6 +2198,7 @@ static int procfs_pid_exe_readlink(vfs_node_t *node, char *buf, uint32_t size) {
 }
 
 static int procfs_pid_cwd_readlink(vfs_node_t *node, char *buf, uint32_t size) {
+  if (!procfs_pid_ptrace_access(node->impl)) return -13;
   uint32_t pid = node->impl;
   struct sched_thread_snapshot snapshot;
   if (!sched_get_thread_snapshot(pid, &snapshot))
@@ -2137,6 +2216,7 @@ static int procfs_pid_cwd_readlink(vfs_node_t *node, char *buf, uint32_t size) {
 // is always "/". Needed by pipewire (peer-root checks via /proc/<pid>/root),
 // containers, and anything resolving fds across processes.
 static int procfs_pid_root_readlink(vfs_node_t *node, char *buf, uint32_t size) {
+  if (!procfs_pid_ptrace_access(node->impl)) return -13;
   uint32_t pid = node->impl;
   struct sched_thread_snapshot snapshot;
   if (!sched_get_thread_snapshot(pid, &snapshot))
@@ -2153,20 +2233,21 @@ static int procfs_pid_root_readlink(vfs_node_t *node, char *buf, uint32_t size) 
  * mountinfo-format lines from the same table as /proc/mounts. */
 static uint32_t procfs_pid_mountinfo_read(vfs_node_t *node, uint32_t offset,
                                           uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   (void)node;
   const size_t cap = PROCFS_MOUNTINFO_BUFSZ;
   char *buf = kmalloc(cap);
   if (!buf)
     return 0;
 
-  /* Heap-allocate: 32 mounts do not fit the kernel stack. */
+  /* Heap-allocate the namespace mount table to keep it off the stack. */
   vfs_mount_info_t *mounts =
       kmalloc(sizeof(vfs_mount_info_t) * PROCFS_MAX_MOUNTS);
   if (!mounts) {
     kfree(buf);
     return 0;
   }
-  int count = vfs_get_mounts(mounts, PROCFS_MAX_MOUNTS);
+  int count = sched_get_mount_snapshot(node->impl, mounts, PROCFS_MAX_MOUNTS);
   size_t pos = 0;
 
   for (int i = 0; i < count && pos < cap - 256; i++) {
@@ -2191,9 +2272,12 @@ static uint32_t procfs_pid_mountinfo_read(vfs_node_t *node, uint32_t offset,
       minor = bd->linux_minor;
     }
     /* id parent major:minor root mountpoint opts optional - fstype src super */
+    char options[80]; procfs_mount_options(mounts[i].flags, options);
     int w = snprintf(buf + pos, cap - pos,
-        "%llu %d %u:%u %s %s rw,relatime - %s %s rw\n",
-        (unsigned long long)mounts[i].mount_id, 1, major, minor, root, mnt, fst, dev);
+        "%llu %llu %u:%u %s %s %s - %s %s %s\n",
+        (unsigned long long)mounts[i].mount_id,
+        (unsigned long long)mounts[i].parent_id, major, minor, root, mnt, options, fst, dev,
+        mounts[i].flags & 1 ? "ro" : "rw");
     if (w < 0 || (size_t)w >= cap - pos)
       break;
     pos += (size_t)w;
@@ -2226,20 +2310,21 @@ static uint32_t procfs_pid_mountinfo_read(vfs_node_t *node, uint32_t offset,
  * statfs; this file stays strictly compatible. */
 static uint32_t procfs_pid_mountstats_read(vfs_node_t *node, uint32_t offset,
                                            uint32_t size, uint8_t *buffer) {
+  if (!procfs_pid_visible(node->impl)) return 0;
   (void)node;
   const size_t cap = PROCFS_MOUNTINFO_BUFSZ;
   char *buf = kmalloc(cap);
   if (!buf)
     return 0;
 
-  /* Heap-allocate: 32 mounts do not fit the kernel stack. */
+  /* Heap-allocate the namespace mount table to keep it off the stack. */
   vfs_mount_info_t *mounts =
       kmalloc(sizeof(vfs_mount_info_t) * PROCFS_MAX_MOUNTS);
   if (!mounts) {
     kfree(buf);
     return 0;
   }
-  int count = vfs_get_mounts(mounts, PROCFS_MAX_MOUNTS);
+  int count = sched_get_mount_snapshot(node->impl, mounts, PROCFS_MAX_MOUNTS);
   size_t pos = 0;
 
   for (int i = 0; i < count && pos < cap - 256; i++) {
@@ -2282,8 +2367,8 @@ static int procfs_thread_self_readlink(vfs_node_t *node, char *buf, uint32_t siz
   if (!t)
     return -1;
   char link_str[32];
-  uint32_t tgid = t->tgid ? t->tgid : t->tid;
-  snprintf(link_str, sizeof(link_str), "%u/task/%u", tgid, t->tid);
+  uint32_t tgid = pid_namespace_visible(t, t->tgid ? t->tgid : t->tid);
+  snprintf(link_str, sizeof(link_str), "%u/task/%u", tgid, pid_namespace_tid(t, t));
   uint32_t len = (uint32_t)strlen(link_str);
   if (len > size)
     len = size;
@@ -2299,6 +2384,73 @@ static void procfs_make_pid_ramfs_ephemeral(vfs_node_t *dir) {
   dir->close = procfs_pid_dir_close;
 }
 
+/* Linux's task directory has two base links plus one per live thread.
+ * Chromium uses this count to check that sandbox setup is single-threaded.
+ * Both lookup and readdir must stay live even through an already-open fd. */
+static uint32_t procfs_task_nlink(vfs_node_t *node) {
+  return 2 + sched_get_group_threads(node->impl, 0, NULL);
+}
+
+static struct dirent *procfs_task_readdir(vfs_node_t *node, uint32_t index) {
+  struct dirent *dent = vfs_readdir_buffer();
+  memset(dent, 0, sizeof(*dent));
+  dent->d_type = DT_DIR;
+  if (index < 2) {
+    strcpy(dent->name, index ? ".." : ".");
+    dent->ino = node->inode;
+  } else {
+    uint32_t tid;
+    sched_get_group_threads(node->impl, index - 2, &tid);
+    if (!tid) return NULL;
+    snprintf(dent->name, sizeof(dent->name), "%u", pid_namespace_visible(sched_get_current(), tid));
+    dent->ino = 0x10000 + tid;
+  }
+  return dent;
+}
+
+static vfs_node_t *procfs_task_finddir(vfs_node_t *node, char *name) {
+  uint32_t tid = pid_namespace_global(sched_get_current(), str_to_pid(name));
+  struct sched_thread_snapshot snap;
+  if (!tid || !sched_get_thread_snapshot(tid, &snap) ||
+      (snap.tgid ? snap.tgid : snap.tid) != node->impl ||
+      snap.state == THREAD_DEAD || snap.state == THREAD_ZOMBIE)
+    return NULL;
+
+  vfs_node_t *dir = kmalloc(sizeof(*dir));
+  if (!dir) return NULL;
+  procfs_node_init(dir);
+  snprintf(dir->name, sizeof(dir->name), "%u", tid);
+  dir->flags = FS_DIRECTORY;
+  dir->mask = 0555;
+  ramfs_mount_on(dir);
+  dir->impl = tid;
+  procfs_make_pid_ramfs_ephemeral(dir);
+  dir->flags |= FS_DENTRY_NOCACHE;
+  vfs_node_t *stat = kmalloc(sizeof(*stat));
+  if (stat) {
+    procfs_node_init(stat);
+    strcpy(stat->name, "stat");
+    stat->flags = FS_FILE;
+    stat->mask = 0444;
+    stat->impl = tid;
+    stat->length = 128;
+    stat->read = procfs_pid_stat_read;
+    ramfs_mount_node(dir, stat);
+  }
+  vfs_node_t *status = kmalloc(sizeof(*status));
+  if (status) {
+    procfs_node_init(status);
+    strcpy(status->name, "status");
+    status->flags = FS_FILE;
+    status->mask = 0444;
+    status->impl = tid;
+    status->length = 768;
+    status->read = procfs_pid_status_read;
+    ramfs_mount_node(dir, status);
+  }
+  return dir;
+}
+
 static vfs_node_t *make_pid_dir(uint32_t pid) {
   vfs_node_t *dir = kmalloc(sizeof(vfs_node_t));
   if (!dir)
@@ -2309,6 +2461,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
   dir->mask = 0555;
   dir->inode = 0x10000 + pid;
   ramfs_mount_on(dir);
+  dir->impl = pid;
   procfs_make_pid_ramfs_ephemeral(dir);
   dir->flags |= FS_DENTRY_NOCACHE;
 
@@ -2536,7 +2689,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     mountinfo_node->flags = FS_FILE;
     mountinfo_node->mask = 0444;
     mountinfo_node->impl = pid;
-    mountinfo_node->length = 8192;
+    mountinfo_node->length = 65536;
     mountinfo_node->read = procfs_pid_mountinfo_read;
     ramfs_mount_node(dir, mountinfo_node);
   }
@@ -2551,7 +2704,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     mountstats_node->flags = FS_FILE;
     mountstats_node->mask = 0444;
     mountstats_node->impl = pid;
-    mountstats_node->length = 8192;
+    mountstats_node->length = 65536;
     mountstats_node->read = procfs_pid_mountstats_read;
     ramfs_mount_node(dir, mountstats_node);
   }
@@ -2564,7 +2717,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     pid_mounts_node->flags = FS_FILE;
     pid_mounts_node->mask = 0444;
     pid_mounts_node->impl = pid;
-    pid_mounts_node->length = 8192;
+    pid_mounts_node->length = 65536;
     pid_mounts_node->read = procfs_mounts_read;
     ramfs_mount_node(dir, pid_mounts_node);
   }
@@ -2610,8 +2763,7 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     ramfs_mount_node(dir, ns_dir);
   }
 
-  // task/<pid>/ directory — htop opens task/<pid>/stat to read per-thread stat.
-  // On Linux this mirrors /proc/<pid>/stat for the main thread.
+  // task/<tid>/ entries follow live thread-group membership.
   vfs_node_t *task_dir = kmalloc(sizeof(vfs_node_t));
   if (task_dir) {
     procfs_node_init(task_dir);
@@ -2622,32 +2774,12 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     procfs_make_pid_ramfs_ephemeral(task_dir);
     task_dir->flags |= FS_DENTRY_NOCACHE;
 
-    // task/<pid>/ sub-directory
-    vfs_node_t *tid_dir = kmalloc(sizeof(vfs_node_t));
-    if (tid_dir) {
-      procfs_node_init(tid_dir);
-      snprintf(tid_dir->name, sizeof(tid_dir->name), "%u", pid);
-      tid_dir->flags = FS_DIRECTORY;
-      tid_dir->mask = 0555;
-      ramfs_mount_on(tid_dir);
-      procfs_make_pid_ramfs_ephemeral(tid_dir);
-      tid_dir->flags |= FS_DENTRY_NOCACHE;
-
-      // task/<pid>/stat  — same content as /proc/<pid>/stat
-      vfs_node_t *tstat_node = kmalloc(sizeof(vfs_node_t));
-      if (tstat_node) {
-        procfs_node_init(tstat_node);
-        strcpy(tstat_node->name, "stat");
-        tstat_node->flags = FS_FILE;
-        tstat_node->mask = 0444;
-        tstat_node->impl = pid;
-        tstat_node->length = 128;
-        tstat_node->read = procfs_pid_stat_read;
-        ramfs_mount_node(tid_dir, tstat_node);
-      }
-
-      ramfs_mount_node(task_dir, tid_dir);
-    }
+    struct sched_thread_snapshot snap;
+    task_dir->impl = sched_get_thread_snapshot(pid, &snap) && snap.tgid
+                         ? snap.tgid : pid;
+    task_dir->get_nlink = procfs_task_nlink;
+    task_dir->readdir = procfs_task_readdir;
+    task_dir->finddir = procfs_task_finddir;
 
     ramfs_mount_node(dir, task_dir);
   }
@@ -2763,7 +2895,7 @@ static int procfs_self_readlink(vfs_node_t *node, char *buf, uint32_t size) {
   if (!t)
     return -1;
   char pid_str[16];
-  uint32_t pid = t->tgid ? t->tgid : t->tid;
+  uint32_t pid = pid_namespace_visible(t, t->tgid ? t->tgid : t->tid);
   snprintf(pid_str, sizeof(pid_str), "%u", pid);
   uint32_t len = (uint32_t)strlen(pid_str);
   if (len > size)
@@ -2828,9 +2960,9 @@ static struct dirent *procfs_root_readdir(vfs_node_t *node, uint32_t index) {
 
   // PID entries
   uint32_t pid;
-  if (!sched_get_nth_thread_tid(static_idx - num_static, &pid))
+  if (!pid_namespace_nth(sched_get_current(), static_idx - num_static, &pid))
     return NULL;
-  snprintf(procfs_dent->name, sizeof(procfs_dent->name), "%u", pid);
+  snprintf(procfs_dent->name, sizeof(procfs_dent->name), "%u", pid_namespace_visible(sched_get_current(), pid));
   procfs_dent->ino = 0x10000 + pid;
   procfs_dent->d_type = DT_DIR;
   return procfs_dent;
@@ -2887,7 +3019,7 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, char *name) {
   }
 
   // Check if it's a numeric PID
-  uint32_t pid = str_to_pid(name);
+  uint32_t pid = pid_namespace_global(sched_get_current(), str_to_pid(name));
   if (pid == 0)
     return NULL;
 
@@ -3144,7 +3276,7 @@ void procfs_init(void) {
       mounts_node->flags = FS_FILE | FS_PERSISTENT;
       mounts_node->mask = 0444;
       mounts_node->read = procfs_mounts_read;
-      mounts_node->length = 8192;
+      mounts_node->length = 65536;
       ramfs_mount_node(procfs_root, mounts_node);
     }
 
@@ -3339,8 +3471,20 @@ static uint8_t tcp_state_to_linux(uint8_t s) {
 //      lo:      0       0    0    0 ...
 //    eth0:   1234      10    0    0 ...
 
+static uint32_t procfs_private_net_read(vfs_node_t *node, uint32_t offset,
+                                         uint32_t size, uint8_t *buffer,
+                                         const char *data) {
+  uint32_t length = (uint32_t)strlen(data);
+  node->length = length;
+  if (offset >= length) return 0;
+  if (size > length - offset) size = length - offset;
+  memcpy(buffer, data + offset, size); return size;
+}
+
 static uint32_t procfs_net_dev_read(vfs_node_t *node, uint32_t offset,
                                     uint32_t size, uint8_t *buffer) {
+    if (sched_get_current() && sched_get_current()->net_ns)
+      return procfs_private_net_read(node, offset, size, buffer, "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    lo: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
     char *buf = kmalloc(2048);
     if (!buf) return 0;
 
@@ -3383,6 +3527,8 @@ static uint32_t procfs_net_dev_read(vfs_node_t *node, uint32_t offset,
 
 static uint32_t procfs_net_tcp_read(vfs_node_t *node, uint32_t offset,
                                     uint32_t size, uint8_t *buffer) {
+    if (sched_get_current() && sched_get_current()->net_ns)
+      return procfs_private_net_read(node, offset, size, buffer, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n");
     struct tcp_entry_snapshot *snaps = kmalloc(sizeof(struct tcp_entry_snapshot) * TCP_MAX_CONNECTIONS);
     if (!snaps) return 0;
     int n = tcp_get_snapshot(snaps, TCP_MAX_CONNECTIONS);
@@ -3425,6 +3571,8 @@ static uint32_t procfs_net_tcp_read(vfs_node_t *node, uint32_t offset,
 
 static uint32_t procfs_net_udp_read(vfs_node_t *node, uint32_t offset,
                                     uint32_t size, uint8_t *buffer) {
+    if (sched_get_current() && sched_get_current()->net_ns)
+      return procfs_private_net_read(node, offset, size, buffer, "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n");
     struct udp_entry_snapshot *snaps =
         kmalloc(sizeof(struct udp_entry_snapshot) * UDP_MAX_SOCKETS);
     if (!snaps) return 0;
@@ -3467,6 +3615,8 @@ static uint32_t procfs_net_udp_read(vfs_node_t *node, uint32_t offset,
 
 static uint32_t procfs_net_route_read(vfs_node_t *node, uint32_t offset,
                                       uint32_t size, uint8_t *buffer) {
+    if (sched_get_current() && sched_get_current()->net_ns)
+      return procfs_private_net_read(node, offset, size, buffer, "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n");
     char buf[512];
 
     int pos = snprintf(buf, sizeof(buf),
@@ -3505,6 +3655,8 @@ static uint32_t procfs_net_route_read(vfs_node_t *node, uint32_t offset,
 
 static uint32_t procfs_net_if_inet6_read(vfs_node_t *node, uint32_t offset,
                                          uint32_t size, uint8_t *buffer) {
+    if (sched_get_current() && sched_get_current()->net_ns)
+      return procfs_private_net_read(node, offset, size, buffer, "");
     (void)node;
     // Loopback ::1 only
     const char *data =
@@ -3520,6 +3672,8 @@ static uint32_t procfs_net_if_inet6_read(vfs_node_t *node, uint32_t offset,
 
 static uint32_t procfs_net_sockstat_read(vfs_node_t *node, uint32_t offset,
                                          uint32_t size, uint8_t *buffer) {
+    if (sched_get_current() && sched_get_current()->net_ns)
+      return procfs_private_net_read(node, offset, size, buffer, "sockets: used 0\nTCP: inuse 0 orphan 0 tw 0 alloc 0 mem 0\nUDP: inuse 0 mem 0\nRAW: inuse 0\nFRAG: inuse 0 memory 0\n");
     struct tcp_entry_snapshot *tcp_snaps = kmalloc(sizeof(struct tcp_entry_snapshot) * TCP_MAX_CONNECTIONS);
     int tcp_n = 0;
     if (tcp_snaps) {
@@ -3642,10 +3796,12 @@ static uint32_t procfs_sys_hostname_read(vfs_node_t *node, uint32_t offset,
                                          uint32_t size, uint8_t *buffer) {
     (void)node;
     klog_puts("[PROCFS] read /proc/sys/kernel/hostname\n");
-    const char *val = "AvoryOS\n";
-    uint32_t len = 8;
+    char val[67], domain[65];
+    uts_namespace_read(sched_get_current(), val, domain);
+    uint32_t len = (uint32_t)strlen(val);
+    val[len++] = '\n';
     if (offset >= len) return 0;
-    if (offset + size > len) size = len - offset;
+    if (size > len - offset) size = len - offset;
     memcpy(buffer, val + offset, size);
     return size;
 }
@@ -3744,6 +3900,16 @@ static uint32_t procfs_sys_file_max_read(vfs_node_t *node, uint32_t offset,
     return size;
 }
 
+static uint32_t procfs_sys_inotify_limit_read(vfs_node_t *node, uint32_t offset,
+                                               uint32_t size, uint8_t *buffer) {
+    char value[24];
+    uint32_t len = snprintf(value, sizeof(value), "%u\n", node->impl);
+    if (offset >= len) return 0;
+    if (size > len - offset) size = len - offset;
+    memcpy(buffer, value + offset, size);
+    return size;
+}
+
 static uint32_t procfs_sys_mount_max_read(vfs_node_t *node, uint32_t offset,
                                           uint32_t size, uint8_t *buffer) {
     (void)node;
@@ -3823,6 +3989,24 @@ void procfs_sys_init(vfs_node_t *procfs_root) {
     if (fs_dir) {
         procfs_add_file_node(fs_dir, "file-max",  procfs_sys_file_max_read, 16);
         procfs_add_file_node(fs_dir, "mount-max", procfs_sys_mount_max_read, 16);
+        vfs_node_t *inotify_dir = procfs_create_dir_node("inotify");
+        if (inotify_dir) {
+            const char *names[] = {"max_user_watches", "max_user_instances"};
+            const uint32_t limits[] = {MAX_INOTIFY_WATCHES, MAX_INOTIFY_INSTANCES};
+            for (unsigned i = 0; i < 2; i++) {
+                vfs_node_t *n = kmalloc(sizeof(*n));
+                if (!n) continue;
+                procfs_node_init(n);
+                strcpy(n->name, names[i]);
+                n->flags = FS_FILE | FS_PERSISTENT;
+                n->mask = 0444;
+                n->impl = limits[i];
+                n->length = 16;
+                n->read = procfs_sys_inotify_limit_read;
+                ramfs_mount_node(inotify_dir, n);
+            }
+            ramfs_mount_node(fs_dir, inotify_dir);
+        }
         ramfs_mount_node(sys_dir, fs_dir);
     }
 

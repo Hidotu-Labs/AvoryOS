@@ -159,17 +159,47 @@ size_t vfs_cache_page_count(void) {
   return (size_t)__atomic_load_n(&vfs_cached_pages, __ATOMIC_RELAXED);
 }
 
+static void cache_page_reclaim(struct vfs_rcu_head *head) {
+  vfs_page_t *page =
+      (vfs_page_t *)((uint8_t *)head - __builtin_offsetof(vfs_page_t, rcu));
+  pmm_free_page((void *)page->frame_phys);
+  kfree(page);
+}
+
 static void cache_page_release(vfs_page_t *page) {
   /* A page can only be released once.  The live marker catches a second
-   * release (kfree() overwrites the object) before the heap sees a double
-   * free, which would let two owners hand out the same chunk. */
+   * release before the heap sees a double free, which would let two owners
+   * hand out the same chunk. */
   if (page->magic != VFS_PAGE_MAGIC) {
     cache_report_invalid_value(page);
     return;
   }
-  pmm_free_page((void *)page->frame_phys);
+  /* The marker goes away now, so a stale pointer handed to vfs_cache_put()
+   * is still caught; the frame and the object itself wait for a grace
+   * period, because a lockless vfs_cache_lookup() may still be about to
+   * tryref this page (the cleared marker plus the eviction bit then reject
+   * it).  This is the only path that recycles either allocation. */
   page->magic = 0;
-  kfree(page);
+  vfs_rcu_defer(&page->rcu, cache_page_reclaim);
+}
+
+/* Deferred-free hook for node->pages: collapsing a branch unlinks a radix
+ * node and then frees it, but a lockless lookup may still be walking it.
+ * Departing nodes are queued through the node's radix_tree_defer_slot (its
+ * first two words) and freed on the drainer thread after a grace period.
+ * node->pages always uses the default kmalloc allocator (asc_radix_tree_init
+ * in vfs_node_init), so the reclaim is a plain kfree. */
+static void vfs_pc_tree_node_reclaim(struct vfs_rcu_head *head) {
+  kfree(head);
+}
+
+static void vfs_pc_tree_node_defer(void *node, void *context) {
+  (void)context;
+  vfs_rcu_defer((struct vfs_rcu_head *)node, vfs_pc_tree_node_reclaim);
+}
+
+void vfs_page_cache_tree_init(struct radix_tree *tree) {
+  asc_radix_tree_set_deferred_free(tree, vfs_pc_tree_node_defer, NULL);
 }
 
 bool vfs_cache_page_valid(const vfs_page_t *page) {
@@ -186,9 +216,7 @@ static void cache_drop_invalid_locked(vfs_node_t *node, uint32_t offset,
   __atomic_sub_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
 }
 
-vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
-  if (!node)
-    return NULL;
+static vfs_page_t *vfs_cache_lookup_locked(vfs_node_t *node, uint32_t offset) {
   spinlock_acquire(&node->pages_lock);
   vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
   if (page && !page_value_fast(page)) {
@@ -201,6 +229,57 @@ vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
   }
   spinlock_release(&node->pages_lock);
   return page;
+}
+
+/* Bench-only switch: force the old locked form so vfs_bench=1 can measure the
+ * lockless path against it back to back.  Never set outside the benchmark. */
+static bool vfs_cache_lookup_force_locked;
+
+/* Attempts before a lockless lookup gives up and takes the lock.  A writer
+ * keeps the tree sequence unstable for the span of one mutation, so a second
+ * try almost always wins; the bound keeps a pathological writer from holding
+ * interrupts off here indefinitely. */
+#define VFS_CACHE_LOOKUP_LOCKLESS_TRIES 3
+
+vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
+  if (!node)
+    return NULL;
+  if (vfs_cache_lookup_force_locked || !vfs_rcu_ready())
+    return vfs_cache_lookup_locked(node, offset);
+
+  /* Lockless read of the radix tree.  asc_radix_tree_lookup_lockless()
+   * validates a seqlock around the traversal, so a returned page was
+   * published for the whole read; tree nodes and pages are freed only after
+   * a grace period (fs/vfs_rcu.h), which is what makes the raw pointer safe
+   * to touch here.  The section runs with interrupts off so the drainer's
+   * barrier cannot acknowledge this CPU while a raw pointer is held; the
+   * transient reference the reader takes inside it keeps the page alive
+   * after the section ends.  vfs_page_tryref() refuses a page whose eviction
+   * raced the lookup, and an invalid leaf falls back to the locked path,
+   * which owns its cleanup. */
+  uint64_t key = cache_key(offset);
+  for (uint32_t attempt = 0; attempt < VFS_CACHE_LOOKUP_LOCKLESS_TRIES;
+       attempt++) {
+    hal_irq_state_t flags = hal_irq_save();
+
+    bool stable = false;
+    vfs_page_t *page =
+        asc_radix_tree_lookup_lockless(&node->pages, key, &stable);
+    bool live = stable && page &&
+                page_value_fast(page) && vfs_page_tryref(page);
+    hal_irq_restore(flags);
+
+    if (!stable)
+      continue; /* writer crossed the traversal: retry, then serialize */
+    if (!page)
+      return NULL; /* stable miss */
+    if (!live)
+      return vfs_cache_lookup_locked(node, offset); /* invalid or evicted */
+    /* We hold a reference now, so the stamp is safe outside the section. */
+    page->last_used = cache_stamp();
+    return page;
+  }
+  return vfs_cache_lookup_locked(node, offset);
 }
 
 void vfs_cache_put(vfs_node_t *node, vfs_page_t *page) {
@@ -1158,32 +1237,41 @@ void vfs_cache_clear_unused(vfs_node_t *node) {
   spinlock_release(&node->pages_lock);
 }
 
-struct reclaim_search {
-  uint64_t key;
-  uint64_t stamp;
-  uint64_t invalid_key;
-  bool found;
-  bool invalid;
+/* Reclaim and sync used to restart the radix-tree walk from the root for
+ * every page they handled: a file with D dirty (or cold) pages paid O(D^2)
+ * leaf visits, and sync called node->write once per 4 KiB page, so ext2/ext4
+ * committed one journal transaction per page - their internal batching only
+ * pays off for a longer call.  Both now collect up to CACHE_BATCH candidates
+ * per walk and process the batch as a unit: sync coalesces runs of adjacent
+ * dirty pages into single node->write calls (the gather copy is noise next
+ * to the journalled transaction it saves), reclaim drops the whole batch
+ * under the one lock hold.  Each walk stays bounded, so no pages_lock hold
+ * (with interrupts masked) grows with the file size. */
+
+struct reclaim_batch {
+  uint64_t keys[CACHE_BATCH];
+  uint32_t count;
+  uint64_t invalid_keys[CACHE_BATCH];
+  uint32_t invalid_count;
 };
 
-static bool find_reclaimable(uint64_t key, void *value, void *opaque) {
-  struct reclaim_search *search = opaque;
+static bool collect_reclaimable(uint64_t key, void *value, void *opaque) {
+  struct reclaim_batch *batch = opaque;
   vfs_page_t *page = value;
   if (!page_value_valid(page)) {
     cache_report_invalid_value(value);
-    search->invalid = true;
-    search->invalid_key = key;
-    return false;
+    batch->invalid_keys[batch->invalid_count++] = key;
+    return batch->count + batch->invalid_count < CACHE_BATCH;
   }
+  /* Ineligible pages do not end the walk: the batch passes over mapped,
+   * dirty and in-flight pages looking for clean ones.  The old per-walk
+   * least-recently-used pick is dropped for the bounded walk; reclaim only
+   * needs clean unmapped pages, and their content is on disk. */
   if (vfs_page_ref_count(page) || page->dirty || page->loading ||
       page->writeback || pmm_get_ref((void *)page->frame_phys) != 1)
     return true;
-  if (!search->found || page->last_used < search->stamp) {
-    search->found = true;
-    search->key = key;
-    search->stamp = page->last_used;
-  }
-  return true;
+  batch->keys[batch->count++] = key;
+  return batch->count + batch->invalid_count < CACHE_BATCH;
 }
 
 size_t vfs_cache_reclaim(vfs_node_t *node, size_t target) {
@@ -1193,24 +1281,33 @@ size_t vfs_cache_reclaim(vfs_node_t *node, size_t target) {
   if (!spinlock_try_acquire(&node->pages_lock))
     return 0;
   while (reclaimed < target) {
-    struct reclaim_search search = {0};
-    asc_radix_tree_for_each(&node->pages, find_reclaimable, &search);
-    if (search.invalid) {
-      if (asc_radix_tree_delete(&node->pages, search.invalid_key))
+    struct reclaim_batch batch = {0};
+    asc_radix_tree_for_each(&node->pages, collect_reclaimable, &batch);
+    /* Invalid leaves are opaque garbage: unlink them, but never pass them to
+     * vfs_page_evict() or free.  Leaving them in the tree makes every later
+     * scan report the same corruption indefinitely. */
+    uint32_t invalid_deleted = 0;
+    for (uint32_t i = 0; i < batch.invalid_count; i++) {
+      if (asc_radix_tree_delete(&node->pages, batch.invalid_keys[i])) {
         __atomic_sub_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
-      else
-        break;
-      continue;
+        invalid_deleted++;
+      }
     }
-    if (!search.found)
+    uint32_t deleted = 0;
+    for (uint32_t i = 0; i < batch.count && reclaimed < target; i++) {
+      bool releasable = false;
+      vfs_page_t *page = cache_delete_locked(node, batch.keys[i], &releasable);
+      if (!page)
+        continue;
+      if (releasable)
+        cache_page_release(page);
+      reclaimed++;
+      deleted++;
+    }
+    /* A walk that removed nothing - no candidate deleted, no invalid leaf
+     * unlinked - has exhausted what this tree can give, so stop. */
+    if (!deleted && !invalid_deleted)
       break;
-    bool releasable = false;
-    vfs_page_t *page = cache_delete_locked(node, search.key, &releasable);
-    if (!page)
-      continue;
-    if (releasable)
-      cache_page_release(page);
-    reclaimed++;
   }
   spinlock_release(&node->pages_lock);
   return reclaimed;
@@ -1306,70 +1403,202 @@ void vfs_cache_mark_dirty(vfs_node_t *node, uint32_t offset) {
   spinlock_release(&node->pages_lock);
 }
 
-struct dirty_search {
-  vfs_page_t *page;
-  uint64_t dirty_seq;
-  uint64_t invalid_key;
-  bool invalid;
+/* One collected batch of dirty pages.  Sync walks the tree once per batch
+ * instead of once per page; see the block comment above reclaim_batch. */
+struct dirty_batch {
+  vfs_page_t *pages[CACHE_BATCH];
+  uint64_t seqs[CACHE_BATCH];
+  uint32_t count;
+  uint64_t invalid_keys[CACHE_BATCH];
+  uint32_t invalid_count;
 };
 
-static bool find_dirty(uint64_t key, void *value, void *opaque) {
-  struct dirty_search *search = opaque;
+/* Write-call size for one coalesced run.  ext2/ext4 close one journal
+ * transaction per 32 data blocks, so a 32-page call is exactly that at 4 KiB
+ * blocks; readahead stages at the same bound, keeping the contiguous
+ * allocation at 128 KiB. */
+#define CACHE_SYNC_RUN_PAGES 32u
+
+static bool collect_dirty(uint64_t key, void *value, void *opaque) {
+  struct dirty_batch *batch = opaque;
   vfs_page_t *page = value;
   if (!page_value_valid(page)) {
     cache_report_invalid_value(value);
-    search->invalid = true;
-    search->invalid_key = key;
-    return false;
+    batch->invalid_keys[batch->invalid_count++] = key;
+    return batch->count + batch->invalid_count < CACHE_BATCH;
   }
   if (!page->dirty || page->loading || page->writeback)
     return true;
+  /* Pinned and flagged until the flush clears them, so a concurrent sync
+   * skips this page instead of writing the same frame twice.  dirty_seq
+   * lets the flush leave the page dirty when a mapping modified it while
+   * the write was in flight. */
   page->writeback = true;
   vfs_page_get(page);
-  search->page = page;
-  search->dirty_seq = page->dirty_seq;
-  return false;
+  batch->pages[batch->count] = page;
+  batch->seqs[batch->count] = page->dirty_seq;
+  batch->count++;
+  return batch->count + batch->invalid_count < CACHE_BATCH;
+}
+
+/* Bytes of `page` a write may cover; zero for a page wholly past EOF. */
+static uint32_t cache_page_writable(const vfs_node_t *node,
+                                    const vfs_page_t *page) {
+  if (node->length <= page->offset)
+    return 0;
+  uint32_t available = node->length - page->offset;
+  return available > PAGE_SIZE ? PAGE_SIZE : available;
+}
+
+/* Retire one written chunk of the batch.  `written_end` is the byte offset
+ * one past the data the filesystem reports on disk (0 on a failed call); a
+ * page wholly at or below it is clean, and a page past EOF needs no write.
+ * A page a mapping marked dirty again while the call was in flight stays
+ * dirty for the next sync. */
+static void cache_sync_run_finish(vfs_node_t *node, struct dirty_batch *batch,
+                                  uint32_t first, uint32_t count,
+                                  uint64_t written_end) {
+  spinlock_acquire(&node->pages_lock);
+  for (uint32_t j = 0; j < count; j++) {
+    vfs_page_t *page = batch->pages[first + j];
+    uint32_t amount = cache_page_writable(node, page);
+    bool done = amount == 0 ||
+                (uint64_t)page->offset + amount <= written_end;
+    if (done && page->dirty_seq == batch->seqs[first + j])
+      page->dirty = false;
+    page->writeback = false;
+  }
+  spinlock_release(&node->pages_lock);
+}
+
+/* Flush a collected batch, coalescing runs of adjacent pages into single
+ * node->write calls.  Stops at the first call the filesystem does not fully
+ * accept: pages that call did not cover stay dirty for a later sync, pages
+ * after it stay dirty and untouched.  Returns true when the whole batch was
+ * retired. */
+static bool cache_sync_batch(vfs_node_t *node, struct dirty_batch *batch) {
+  uint32_t i = 0;       /* first page of the current run */
+  uint32_t flushed = 0; /* pages [0, flushed) no longer hold writeback */
+  bool ok = true;
+  while (i < batch->count) {
+    uint32_t run_offset = batch->pages[i]->offset;
+    uint32_t run = 1;
+    while (i + run < batch->count &&
+           batch->pages[i + run]->offset == run_offset + run * PAGE_SIZE)
+      run++;
+    uint64_t run_end = (uint64_t)run_offset + (uint64_t)run * PAGE_SIZE;
+    if (run_end > node->length)
+      run_end = node->length;
+
+    uint32_t chunk = 0;
+    bool failed = false;
+    while (chunk < run) {
+      /* One write call stages at most CACHE_SYNC_RUN_PAGES adjacent pages. */
+      uint32_t n = run - chunk;
+      if (n > CACHE_SYNC_RUN_PAGES)
+        n = CACHE_SYNC_RUN_PAGES;
+      uint32_t first_off = run_offset + chunk * PAGE_SIZE;
+      uint32_t want = run_end > first_off ? (uint32_t)(run_end - first_off) : 0;
+      if (want > n * PAGE_SIZE)
+        want = n * PAGE_SIZE;
+
+      /* A multi-page chunk bounces through one contiguous allocation: the
+       * filesystem callback takes a linear buffer, and the gather copy is
+       * far cheaper than the extra journal transactions per page. */
+      void *staging = (want && n > 1) ? pmm_alloc_pages(n) : NULL;
+      bool complete;
+      if (staging) {
+        uint8_t *stage = PHYS_TO_VIRT((uint64_t)staging);
+        uint32_t done = 0;
+        while (done < want) {
+          uint32_t part = want - done;
+          if (part > PAGE_SIZE)
+            part = PAGE_SIZE;
+          memcpy(stage + done,
+                 PHYS_TO_VIRT(batch->pages[i + chunk + done / PAGE_SIZE]
+                                  ->frame_phys),
+                 part);
+          done += part;
+        }
+        uint32_t written = node->write(node, first_off, want, stage);
+        pmm_free_pages(staging, n);
+        complete = written == want;
+        cache_sync_run_finish(node, batch, i + chunk, n,
+                              complete
+                                  ? (uint64_t)first_off + want
+                                  : (uint64_t)first_off +
+                                        (written < want ? written : 0));
+      } else {
+        /* One page, or no contiguous staging: write each page from its own
+         * frame, never worse than the pre-batching behavior. */
+        uint64_t written_end = first_off;
+        uint32_t j = 0;
+        for (; j < n; j++) {
+          vfs_page_t *page = batch->pages[i + chunk + j];
+          uint32_t amount = cache_page_writable(node, page);
+          uint32_t written =
+              amount ? node->write(node, page->offset, amount,
+                                   PHYS_TO_VIRT(page->frame_phys))
+                     : 0;
+          if (written != amount) {
+            if (written < amount)
+              written_end = (uint64_t)page->offset + written;
+            break;
+          }
+          written_end = (uint64_t)page->offset + amount;
+        }
+        complete = j == n;
+        cache_sync_run_finish(node, batch, i + chunk, n, written_end);
+      }
+      flushed = i + chunk + n;
+      chunk += n;
+      if (!complete) {
+        failed = true;
+        ok = false;
+        break;
+      }
+    }
+    if (failed)
+      break;
+    i += run;
+  }
+  if (flushed < batch->count) {
+    /* Pages after the failed chunk were never retired: leave them dirty but
+     * out of writeback so a later sync can pick them up. */
+    spinlock_acquire(&node->pages_lock);
+    for (uint32_t j = flushed; j < batch->count; j++)
+      batch->pages[j]->writeback = false;
+    spinlock_release(&node->pages_lock);
+  }
+  for (uint32_t j = 0; j < batch->count; j++)
+    vfs_cache_put(node, batch->pages[j]);
+  return ok;
 }
 
 void vfs_cache_sync(vfs_node_t *node) {
   if (!node || !node->write)
     return;
   while (1) {
-    struct dirty_search search = {0};
+    struct dirty_batch batch = {0};
     spinlock_acquire(&node->pages_lock);
-    asc_radix_tree_for_each(&node->pages, find_dirty, &search);
-    bool invalid_removed = false;
-    if (search.invalid) {
-      invalid_removed = asc_radix_tree_delete(&node->pages,
-                                               search.invalid_key) != NULL;
-      if (invalid_removed)
+    asc_radix_tree_for_each(&node->pages, collect_dirty, &batch);
+    /* Invalid leaves are unlinked under the same hold, as in reclaim; they
+     * cannot be passed to node->write or vfs_cache_put. */
+    uint32_t invalid_deleted = 0;
+    for (uint32_t i = 0; i < batch.invalid_count; i++) {
+      if (asc_radix_tree_delete(&node->pages, batch.invalid_keys[i])) {
         __atomic_sub_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
+        invalid_deleted++;
+      }
     }
     spinlock_release(&node->pages_lock);
-    if (search.invalid) {
-      if (invalid_removed)
-        continue;
-      else
+
+    if (batch.count) {
+      if (!cache_sync_batch(node, &batch))
         break;
+      continue;
     }
-    if (!search.page)
-      break;
-    uint32_t available = node->length > search.page->offset
-                             ? node->length - search.page->offset
-                             : 0;
-    uint32_t amount = available > PAGE_SIZE ? PAGE_SIZE : available;
-    uint32_t written = amount ? node->write(
-                                    node, search.page->offset, amount,
-                                    PHYS_TO_VIRT(search.page->frame_phys))
-                              : 0;
-    spinlock_acquire(&node->pages_lock);
-    if (written == amount && search.page->dirty_seq == search.dirty_seq)
-      search.page->dirty = false;
-    search.page->writeback = false;
-    bool failed = written != amount;
-    spinlock_release(&node->pages_lock);
-    vfs_cache_put(node, search.page);
-    if (failed)
+    if (!invalid_deleted)
       break;
   }
 }
@@ -1806,6 +2035,104 @@ bool vfs_cache_ref_selftest(void) {
          vfs_cache_page_count() == cached_before;
 }
 
+/* `vfs_selftest=1`: the lockless page lookup, the tryref protocol that keeps
+ * an eviction racing the lookup from reviving a released page, and the
+ * deferred reclamation of both pages and radix nodes.  Deterministic: the
+ * race window is simulated by invalidating a page while holding the only
+ * transient reference. */
+bool vfs_cache_lockless_selftest(void) {
+  bool pass = true;
+  size_t cached_before = vfs_cache_page_count();
+  vfs_node_t node;
+  vfs_node_init(&node);
+  node.flags = FS_FILE | FS_PAGE_CACHE;
+  node.length = 128 * PAGE_SIZE;
+
+  /* 1. Both forms agree on a cached page; each hit owns one reference. */
+  void *frame = pmm_alloc_page();
+  if (!frame) {
+    vfs_cache_clear(&node);
+    return false;
+  }
+  vfs_page_t *page = vfs_cache_insert(&node, 0, (uint64_t)frame);
+  if (!page) {
+    pmm_free_page(frame);
+    vfs_cache_clear(&node);
+    return false;
+  }
+  vfs_cache_put(&node, page);
+
+  vfs_page_t *lockless_hit = vfs_cache_lookup(&node, 0);
+  vfs_cache_lookup_force_locked = true;
+  vfs_page_t *locked_hit = vfs_cache_lookup(&node, 0);
+  vfs_cache_lookup_force_locked = false;
+  if (!lockless_hit || lockless_hit != locked_hit ||
+      vfs_page_ref_count(lockless_hit) != 2)
+    pass = false;
+  if (locked_hit)
+    vfs_cache_put(&node, locked_hit);
+  if (lockless_hit)
+    vfs_cache_put(&node, lockless_hit);
+
+  /* 2. A stable miss on an empty region returns NULL. */
+  vfs_page_t *miss = vfs_cache_lookup(&node, 64 * PAGE_SIZE);
+  if (miss) {
+    pass = false;
+    vfs_cache_put(&node, miss);
+  }
+
+  /* 3. A deep leaf (multi-level tree) is found locklessly too. */
+  uint32_t sparse_offset = 100 * PAGE_SIZE;
+  void *sparse_frame = pmm_alloc_page();
+  if (!sparse_frame) {
+    pass = false;
+  } else {
+    vfs_page_t *sparse = vfs_cache_insert(&node, sparse_offset,
+                                          (uint64_t)sparse_frame);
+    if (!sparse) {
+      pmm_free_page(sparse_frame);
+      pass = false;
+    } else {
+      vfs_cache_put(&node, sparse);
+      vfs_page_t *sparse_hit = vfs_cache_lookup(&node, sparse_offset);
+      if (sparse_hit != sparse)
+        pass = false;
+      if (sparse_hit)
+        vfs_cache_put(&node, sparse_hit);
+    }
+  }
+
+  /* 4. tryref protocol: an evicted page with a live reference must refuse
+   *    new references - that is what stops a lockless reader from reviving a
+   *    release the eviction already granted. */
+  vfs_page_t *held = vfs_cache_lookup(&node, 0);
+  if (!held) {
+    pass = false;
+  } else {
+    vfs_cache_invalidate(&node, 0);
+    uint32_t refs_before = held->refs;
+    if (vfs_page_tryref(held) || held->refs != refs_before ||
+        !vfs_page_is_evicted(held) || vfs_page_ref_count(held) != 1)
+      pass = false;
+    /* The final put enqueues the release; the page is gone from the tree
+     * either way, and the eviction above collapsed its branch node. */
+    vfs_cache_put(&node, held);
+  }
+
+  /* 5. Reclaim: the deferred release from step 4 (and every radix node the
+   *    eviction unlinked) must run on synchronize(), leaving the tree valid. */
+  uint64_t freed_before = vfs_rcu_freed_count();
+  vfs_rcu_synchronize();
+  if (vfs_rcu_freed_count() <= freed_before || vfs_rcu_queued_count() != 0 ||
+      !asc_radix_tree_validate(&node.pages))
+    pass = false;
+
+  vfs_cache_clear(&node);
+  vfs_rcu_synchronize();
+  return pass && asc_radix_tree_validate(&node.pages) &&
+         vfs_cache_page_count() == cached_before;
+}
+
 static void vfs_cache_bench_report(const char *name, uint64_t ops,
                                    uint64_t cycles) {
   uint64_t ns = tsc_cycles_to_ns(cycles);
@@ -1925,7 +2252,7 @@ static void vfs_pc_bench_print_x100(uint64_t x100) {
   klog_uint64(frac);
 }
 
-static void vfs_pc_bench_run_phase(const char *name,
+static void vfs_pc_bench_run_phase(const char *name, bool force_locked,
                                    vfs_node_t *const nodes[VFS_PC_BENCH_CPUS],
                                    const uint32_t offsets[VFS_PC_BENCH_CPUS],
                                    uint64_t single_cycles) {
@@ -1933,6 +2260,7 @@ static void vfs_pc_bench_run_phase(const char *name,
       vfs_pc_bench_worker0, vfs_pc_bench_worker1, vfs_pc_bench_worker2};
   uint32_t started = 0;
 
+  vfs_cache_lookup_force_locked = force_locked;
   __atomic_store_n(&vfs_pc_bench_go, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&vfs_pc_bench_done, 0, __ATOMIC_RELEASE);
 
@@ -1949,8 +2277,10 @@ static void vfs_pc_bench_run_phase(const char *name,
       break;
     started++;
   }
-  if (!started)
+  if (!started) {
+    vfs_cache_lookup_force_locked = false;
     return;
+  }
 
   __atomic_store_n(&vfs_pc_bench_go, 1, __ATOMIC_RELEASE);
 
@@ -1975,7 +2305,9 @@ static void vfs_pc_bench_run_phase(const char *name,
 
   ops += (uint64_t)started * VFS_PC_BENCH_ITERS;
   uint64_t per_op = ops ? cycles / ops : 0;
+  vfs_cache_lookup_force_locked = false;
   klog_puts("[VFS-BENCH] ");
+  klog_puts(force_locked ? "locked   " : "lockless ");
   klog_puts(name);
   klog_puts(": ");
   klog_uint64(ops);
@@ -1990,7 +2322,8 @@ static void vfs_pc_bench_run_phase(const char *name,
   }
 }
 
-static void vfs_pc_bench_scaling(uint64_t single_cycles) {
+static void vfs_pc_bench_scaling(uint64_t single_cycles,
+                                 uint64_t single_locked_cycles) {
   if (cpu_get_count() < 2) {
     klog_puts("[VFS-BENCH] multi-cpu lookup+put skipped: single CPU\n");
     return;
@@ -2048,12 +2381,21 @@ static void vfs_pc_bench_scaling(uint64_t single_cycles) {
 
   klog_puts("[VFS-BENCH] multi-cpu lookup+put (single-cpu ");
   klog_uint64(single_cycles);
-  klog_puts(" cycles/op)\n");
-  vfs_pc_bench_run_phase("4cpu same page  ", same_page, same_page_off,
+  klog_puts(" lockless / ");
+  klog_uint64(single_locked_cycles);
+  klog_puts(" locked cycles/op)\n");
+  vfs_pc_bench_run_phase("4cpu same page  ", false, same_page, same_page_off,
                          single_cycles);
-  vfs_pc_bench_run_phase("4cpu spread page", spread, spread_off, single_cycles);
-  vfs_pc_bench_run_phase("4cpu per node  ", per_node, per_node_off,
+  vfs_pc_bench_run_phase("4cpu same page  ", true, same_page, same_page_off,
+                         single_locked_cycles);
+  vfs_pc_bench_run_phase("4cpu spread page", false, spread, spread_off,
                          single_cycles);
+  vfs_pc_bench_run_phase("4cpu spread page", true, spread, spread_off,
+                         single_locked_cycles);
+  vfs_pc_bench_run_phase("4cpu per node  ", false, per_node, per_node_off,
+                         single_cycles);
+  vfs_pc_bench_run_phase("4cpu per node  ", true, per_node, per_node_off,
+                         single_locked_cycles);
 
 cleanup:
   if (shared_ready)
@@ -2220,7 +2562,8 @@ void vfs_cache_bench(void) {
   }
   vfs_cache_put(&node, page);
 
-  /* New form: lookup plus the lock-free packed put. */
+  /* New form: the lookup validates a seqlock and tryrefs without touching
+   * pages_lock; the put stays the lock-free packed drop. */
   uint64_t ops = 0;
   uint64_t t0 = rdtsc_fence();
   for (uint64_t i = 0; i < iters; i++) {
@@ -2230,23 +2573,26 @@ void vfs_cache_bench(void) {
     vfs_cache_put(&node, p);
     ops++;
   }
-  uint64_t atomic_cycles = rdtsc_fence() - t0;
-  vfs_cache_bench_report("lookup+put atomic ", ops, atomic_cycles);
-  uint64_t single_cycles = ops ? atomic_cycles / ops : 0;
+  uint64_t lockless_cycles = rdtsc_fence() - t0;
+  vfs_cache_bench_report("lookup+put lockless", ops, lockless_cycles);
+  uint64_t single_cycles = ops ? lockless_cycles / ops : 0;
 
-  /* Old form: the put side took the page lock with interrupts masked. */
+  /* Old form: every lookup took the node's page lock with interrupts
+   * masked, for the same working set. */
+  vfs_cache_lookup_force_locked = true;
   ops = 0;
   t0 = rdtsc_fence();
   for (uint64_t i = 0; i < iters; i++) {
     vfs_page_t *p = vfs_cache_lookup(&node, 0);
     if (!p)
       break;
-    spinlock_acquire(&node.pages_lock);
-    __atomic_sub_fetch(&p->refs, 1, __ATOMIC_ACQ_REL);
-    spinlock_release(&node.pages_lock);
+    vfs_cache_put(&node, p);
     ops++;
   }
-  vfs_cache_bench_report("lookup+put locked ", ops, rdtsc_fence() - t0);
+  uint64_t locked_cycles = rdtsc_fence() - t0;
+  vfs_cache_lookup_force_locked = false;
+  vfs_cache_bench_report("lookup+put locked  ", ops, locked_cycles);
+  uint64_t single_locked_cycles = ops ? locked_cycles / ops : 0;
 
   /* Stamp pair: one global atomic cache line vs the per-CPU counter. */
   uint64_t global_clock = 0;
@@ -2262,7 +2608,7 @@ void vfs_cache_bench(void) {
 
   vfs_cache_readahead_bench();
 
-  vfs_pc_bench_scaling(single_cycles);
+  vfs_pc_bench_scaling(single_cycles, single_locked_cycles);
 
   vfs_cache_clear(&node);
 }

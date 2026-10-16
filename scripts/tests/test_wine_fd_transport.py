@@ -36,13 +36,14 @@ code = r'''
 typedef struct { bool held; } spinlock_t;
 typedef struct { unsigned flags; int refs; } vfs_node_t;
 struct fd_table { spinlock_t lock; uint32_t next_fd; vfs_node_t *reserved_nodes[MAX_FDS]; };
+struct fd_table_storage {struct fd_table table; uint64_t description_ids[MAX_FDS];};
 struct thread {
  struct fd_table *files;
  vfs_node_t *fds[MAX_FDS], *cwd_node;
  uint64_t fd_offsets[MAX_FDS], fd_flags[MAX_FDS];
  char paths[MAX_FDS][256], cwd_path[256];
 };
-typedef struct {vfs_node_t *node; uint64_t offset, flags; char path[256];} unix_scm_fd_t;
+typedef struct {vfs_node_t *node; uint64_t offset, flags; char path[256]; uint64_t description_id;} unix_scm_fd_t;
 typedef struct unix_scm_msg {struct unix_scm_msg *next; size_t stream_offset; int count; unix_scm_fd_t fds[];} unix_scm_msg_t;
 typedef struct {size_t bytes_read; unix_scm_msg_t *scm_queue_head, *scm_queue_tail;} unix_sock_t;
 static struct thread *current;
@@ -60,6 +61,9 @@ static struct thread *sched_get_current(void) {return current;}
 static bool vfs_access(vfs_node_t *n,int mask) {(void)n;(void)mask;return true;}
 static void kfree(void *p) {free(p);}
 '''
+code += 'static uint64_t next_description_id;\n'
+for name in ('uint64_t fd_description_id_locked(', 'void fd_description_set_locked('):
+    code += function('kernel/src/sched/sched_files.c', name)
 for name in ('static bool fd_make_path(', 'static int fd_find_free_locked(', 'int alloc_fd(', 'int alloc_fd_from(', 'void fd_release_reserved('):
     code += function('kernel/src/syscalls/sys_fd.c', name)
 for name in ('static bool unix_scm_capture_fd(', 'static int unix_scm_install_fd(', 'static void unix_discard_consumed_scm('):
@@ -79,7 +83,9 @@ int main(void) {
  assert(fd_make_path(path,sizeof(path),"/symlink","../file"));
  assert(!strcmp(path,"/symlink/../file"));
  assert(!fd_make_path(path,4,"/abcd","file"));
- struct fd_table ta={0},tb={0};
+ struct fd_table_storage sa={0},sb={0};
+ #define ta sa.table
+ #define tb sb.table
  struct thread a={.files=&ta}, b={.files=&tb};
  vfs_node_t dir={.flags=FS_DIRECTORY,.refs=1};
  a.fds[3]=&dir; a.fd_offsets[3]=123;
@@ -88,10 +94,17 @@ int main(void) {
  unix_scm_fd_t saved;
  assert(unix_scm_capture_fd(&a,3,&saved));
  assert(dir.refs==2 && saved.flags==O_NONBLOCK && saved.offset==123);
+ uint64_t original_id=fd_description_id_locked(&a,3);
+ assert(saved.description_id==original_id);
  /* Sender may close immediately: queued reference and path survive. */
  a.fds[3]=NULL; a.paths[3][0]=0; vfs_close(&dir);
  int fd=unix_scm_install_fd(&b,&saved,MSG_CMSG_CLOEXEC);
  assert(fd==0 && b.fds[fd]==&dir && dir.refs==1);
+ assert(fd_description_id_locked(&b,fd)==original_id);
+ /* Reuse sender slot for an independent open of the very same node. */
+ assert(alloc_fd_from(&a,3)==3);a.fds[3]=&dir;vfs_node_ref(&dir);
+ assert(fd_description_id_locked(&a,3)!=original_id);
+ a.fds[3]=NULL;vfs_close(&dir);
  assert(b.fd_flags[fd]==(O_NONBLOCK|FD_FLAGS_CLOEXEC_BIT));
  assert(b.fd_offsets[fd]==123 && !strcmp(b.paths[fd],saved.path));
  current=&b;
@@ -105,13 +118,14 @@ int main(void) {
  vfs_node_ref(&dir);
  fd=unix_scm_install_fd(&b,&saved,0);
  assert(fd==1 && b.fd_flags[fd]==O_NONBLOCK && !b.paths[fd][0]);
+ assert(fd_description_id_locked(&b,fd)==original_id);
  /* Path allocation failure rolls back reservation and free-slot hint. */
  unsigned before=tb.next_fd;
  path_oom=true;
  assert(unix_scm_install_fd(&b,&saved,0)==-12 && tb.next_fd==before && !b.fds[before]);
  path_oom=false;
  /* High minimum allocation must leave lower unused slots available. */
- memset(&a,0,sizeof(a)); memset(&ta,0,sizeof(ta)); a.files=&ta;
+ memset(&a,0,sizeof(a)); memset(&sa,0,sizeof(sa)); a.files=&ta;
  assert(alloc_fd_from(&a,MAX_FDS-1)==MAX_FDS-1 && ta.next_fd==0);
  assert(alloc_fd(&a)==0);
  fd_release_reserved(&a,0);

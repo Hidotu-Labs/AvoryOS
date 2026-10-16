@@ -25,6 +25,7 @@ enum { CPU_STATUS_OFFLINE,CPU_STATUS_ONLINE };
 struct sched_entity { bool on_rq; };
 struct thread {
  bool is_idle,has_started,deadline_queued,on_runqueue,need_resched;
+ bool on_cpu;
  bool kpi_block_pending,kpi_timeout_active,kpi_wait_prepared,kpi_wake_pending;
  int state;uint32_t cpu_index;uint64_t cpu_affinity,wakeup_ticks,ready_since_ms;
  struct sched_entity se;
@@ -41,7 +42,8 @@ static hal_irq_state_t hal_irq_save(void) { atomic_store(&entered,true);return 0
 static void hal_irq_restore(hal_irq_state_t f) { (void)f; }
 static struct cpu_info *cpu_get_current(void) { return &cpus[1]; }
 static struct cpu_info *cpu_get_info(unsigned n) { return n<2?&cpus[n]:NULL; }
-static unsigned cpu_get_count(void) { return 2; }
+static unsigned scan_count;
+static unsigned cpu_get_count(void) { scan_count++; return 2; }
 static struct cpu_info *cpu_get_bsp(void) { return &cpus[0]; }
 #define spinlock_acquire pthread_mutex_lock
 #define spinlock_release pthread_mutex_unlock
@@ -52,17 +54,17 @@ static bool eevfd_check_preempt(int *q,struct sched_entity *a,struct sched_entit
 static bool lapic_is_ready(void) { return false; }
 static void lapic_send_ipi(unsigned a,unsigned b) { (void)a;(void)b; }
 static void lapic_timer_rearm_if_earlier(uint64_t a) { (void)a; }
-static uint64_t lapic_timer_get_ms(void) { return 0; }
+static uint64_t lapic_timer_get_ms(void) { return 1234; }
 static void sched_enqueue_thread(struct thread *t,struct cpu_info *c) { (void)t;(void)c; }
 '''
 code += extract('kernel/src/sched/sched.c','__attribute__((optimize("O3"))) void sched_wakeup(')
 code += extract('kernel/src/linuxkpi/native_sched.c','void linuxkpi_wake_thread(')
 code += r'''
 static void *wake(void *p) { linuxkpi_wake_thread(p);atomic_store(&done,true);return NULL; }
-static void run_boundary(bool still_current,bool timed) {
- target=(struct thread){.state=THREAD_RUNNING,.has_started=true,.cpu_index=0,.cpu_affinity=3,.kpi_wait_prepared=true,.kpi_timeout_active=timed};
+static void run_boundary(bool still_current,bool timed,bool on_cpu) {
+ target=(struct thread){.state=THREAD_RUNNING,.has_started=true,.on_cpu=on_cpu,.cpu_index=0,.cpu_affinity=3,.kpi_wait_prepared=true,.kpi_timeout_active=timed};
  cpus[0].current_thread=still_current?&target:&idle;
- atomic_store(&entered,false);atomic_store(&done,false);
+ atomic_store(&entered,false);atomic_store(&done,false);scan_count=0;
  pthread_mutex_lock(&cpus[0].queue_lock);
  /* This is the waiter's final flag check while holding queue_lock. */
  assert(!atomic_exchange((_Atomic bool*)&target.kpi_block_pending,false));
@@ -72,16 +74,27 @@ static void run_boundary(bool still_current,bool timed) {
  target.state=timed?THREAD_SLEEPING:THREAD_BLOCKED;
  pthread_mutex_unlock(&cpus[0].queue_lock);
  pthread_join(t,NULL);
+ /* on_cpu gates the all-CPU scan; the chosen target must be the same CPU 0
+  * the scan finds (still_current) or the recorded cpu_index (switched out). */
+ assert(scan_count==(on_cpu?1u:0u));
  assert(target.state==(still_current?THREAD_RUNNING:THREAD_READY));
+ assert(target.ready_since_ms==(still_current?0:1234));
  assert(target.kpi_block_pending && target.kpi_wake_pending);
  if(!still_current)assert(target.se.on_rq);
 }
 int main(void) {
  for(int i=0;i<2;i++) { cpus[i].status=CPU_STATUS_ONLINE;cpus[i].cpu_id=cpus[i].apic_id=i;pthread_mutex_init(&cpus[i].queue_lock,NULL); }
  idle.is_idle=true;
- run_boundary(true,false);run_boundary(true,true);
- run_boundary(false,false);run_boundary(false,true);
- puts("PASS: wake serialized with BLOCKED/SLEEPING publication, both current and switched-out waiters");
+ for(int c=0;c<2;c++)for(int t=0;t<2;t++)for(int f=0;f<2;f++)run_boundary(c,t,f);
+ /* A deadline may have linked a blocked waiter before the wake arrives.
+  * Its existing wait age survives, and a duplicate READY wake preserves it. */
+ target=(struct thread){.state=THREAD_BLOCKED,.has_started=true,.cpu_index=0,.cpu_affinity=3,.ready_since_ms=900,.se={.on_rq=true}};
+ cpus[0].current_thread=&idle;
+ sched_wakeup(&target);
+ assert(target.state==THREAD_READY && target.ready_since_ms==900);
+ sched_wakeup(&target);
+ assert(target.ready_since_ms==900);
+ puts("PASS: wake serialized with BLOCKED/SLEEPING publication for current and switched-out waiters, scan gated by on_cpu");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='avory-wake-publication-') as tmp:

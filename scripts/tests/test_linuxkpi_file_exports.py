@@ -57,6 +57,8 @@ static void vfs_close(vfs_node_t *n){
 }
 static void vfs_node_ref(vfs_node_t *n){assert(n && n!=FD_RESERVED && n->refs>0);n->refs++;}
 static void asc_vfs_node_unref(void *n){vfs_close(n);}
+static bool fd_is_valid_node(vfs_node_t *n){return n && n!=FD_RESERVED;}
+static uint64_t fd_description_id_locked(struct thread *t,int fd){(void)t;(void)fd;assert(!"Linux wrapper query must use the struct file");return 0;}
 static bool asc_vfs_node_is_linux_file(void *n){return n && ((vfs_node_t*)n)->device;}
 static void *asc_vfs_anon_node(void){
  if(oom)return NULL;
@@ -79,6 +81,7 @@ code += extract('kernel/linuxkpi/src/file.c', 'void fput(')
 code += extract('kernel/linuxkpi/src/file.c', 'static struct file *kpi_node_file(')
 code += extract('kernel/linuxkpi/src/file.c', 'void linuxkpi_file_close(')
 code += extract('kernel/src/syscalls/sys_fd.c', 'void fd_release_reserved(')
+code += extract('kernel/src/syscalls/sys_fd.c', 'static int64_t fd_query_description(')
 for signature in ['int asc_vfs_fd_alloc(', 'void asc_vfs_fd_release_reserved(',
                   'int asc_vfs_file_fd_alloc(', 'void asc_vfs_file_fd_install(',
                   'void *asc_vfs_fd_get_node(']:
@@ -103,12 +106,20 @@ int main(void){
    assert(self.fd_flags[a]==KPI_FD_FLAGS_CLOEXEC_BIT);
    int b=export(&f,0);assert(self.fds[b]!=wrapper && f.f_count==3);
    assert(self.fd_flags[b]==0);
+   assert(fd_query_description(&self,a,b)==1 && fd_query_description(&self,b,a)==1);
    assert(fget(a)==&f && f.f_count==4);fput(&f);assert(f.f_count==3);
    /* dup/SCM_RIGHTS pins the wrapper, retaining its transferred file ref. */
    wrapper->refs++;close_export(a);assert(f.f_count==3);
    close_export(b);assert(f.f_count==2 && f.f_asc_node==owner);
    vfs_close(wrapper);assert(f.f_count==1 && f.f_asc_node==owner && live_nodes==1);
  }
+ struct file independent={.f_count=1,.f_inode=&ino};
+ independent.f_asc_node=asc_vfs_anon_node();
+ ((vfs_node_t *)independent.f_asc_node)->device=&independent;
+ int first=export(&f,0),second=export(&independent,0);
+ assert(fd_query_description(&self,first,second)==0);
+ close_export(first);close_export(second);fput(&independent);
+ assert(live_nodes==1);
  unsigned before=live_nodes;oom=true;
  assert(get_unused_fd_flags(0)==-12 && live_nodes==before);oom=false;
  int reserved[MAX_FDS];
@@ -116,12 +127,12 @@ int main(void){
  assert(live_nodes==1+MAX_FDS && get_unused_fd_flags(0)==-24 && live_nodes==1+MAX_FDS);
  for(int i=0;i<MAX_FDS;i++)put_unused_fd(reserved[i]);
  assert(live_nodes==1 && f.f_count==1);
- fput(&f);assert(releases==1 && live_nodes==0);
- puts("PASS: repeated/overlapping DMA-buffer exports, transfer lifetime, reservation cancellation, OOM and exhaustion");
+ fput(&f);assert(releases==2 && live_nodes==0);
+ puts("PASS: Linux file identity across repeated/independent DMA-buffer exports, transfer lifetime, cancellation, OOM and exhaustion");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='avory-file-exports-') as tmp:
     source=Path(tmp)/'test.c'; binary=Path(tmp)/'test'
     source.write_text(code)
-    subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror',str(source),'-o',str(binary)],check=True)
+    subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(source),'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True)

@@ -23,9 +23,16 @@ typedef struct wait_queue {
 
 void wait_queue_init(wait_queue_t *wq);
 void wait_queue_add(wait_queue_t *wq, wait_queue_entry_t *entry);
+void wait_queue_add_tail(wait_queue_t *wq, wait_queue_entry_t *entry);
 void wait_queue_remove(wait_queue_t *wq, wait_queue_entry_t *entry);
 void wait_queue_cleanup_thread(struct thread *t);
 void wait_queue_wake_all(wait_queue_t *wq);
 void wait_queue_wake_one(wait_queue_t *wq);
+
+/* Publish ownership and wake the oldest live waiter while its queue lock
+ * still protects the thread from cleanup/reaping. publish must not sleep or
+ * acquire this queue's lock. Returns false when no live waiter exists. */
+bool wait_queue_handoff(wait_queue_t *wq,
+                        void (*publish)(struct thread *, void *), void *arg);
 
 #endif

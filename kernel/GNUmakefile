@@ -153,6 +153,9 @@ endif
 #                            self-tests (scratch media only)
 #   NVME_FUA=1               issue every block write with FUA
 #   NVME_RESET_RECOVERY=1    reset + retry an I/O command after a timeout
+#   NVME_BATCH_IO=1          advertise block read_batch/write_batch ops so a
+#                            single submitter can pipeline up to
+#                            NVME_BATCH_WAVE_MAX commands per wait
 ifeq ($(NVME_SELFTEST_DATA),1)
 override CPPFLAGS += -DNVME_SELFTEST_DATA=1
 endif
@@ -161,6 +164,9 @@ override CPPFLAGS += -DNVME_FUA=1
 endif
 ifeq ($(NVME_RESET_RECOVERY),1)
 override CPPFLAGS += -DNVME_RESET_RECOVERY=1
+endif
+ifeq ($(NVME_BATCH_IO),1)
+override CPPFLAGS += -DNVME_BATCH_IO=1
 endif
 
 ifeq ($(ARCH),x86_64)
@@ -274,9 +280,12 @@ ifneq ($(linux-obj-y),)
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c.o: override LINUX_CPPFLAGS += -Damdgpu_ib_schedule=linuxkpi_original_amdgpu_ib_schedule
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c.o: override LINUX_CPPFLAGS += -include linuxkpi/include/linuxkpi/amdgpu_init_reset.h
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c.o: override LINUX_CPPFLAGS += -Damdgpu_gem_va_ioctl=linuxkpi_original_amdgpu_gem_va_ioctl
+    obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c.o obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c.o: override LINUX_CPPFLAGS += -Damdgpu_vm_get_task_info=linuxkpi_amdgpu_vm_fault_info
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c.o: override LINUX_CPPFLAGS += -Damdgpu_vm_bo_update=linuxkpi_original_amdgpu_vm_bo_update -Dtrace_amdgpu_vm_bo_update=trace_linuxkpi_original_amdgpu_vm_bo_update
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c.o: override LINUX_CPPFLAGS += -Damdgpu_fence_emit=linuxkpi_original_amdgpu_fence_emit
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c.o: override LINUX_CPPFLAGS += -Dpsp_wait_for=linuxkpi_original_psp_wait_for
+    obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c.o: override LINUX_CPPFLAGS += -Damdgpu_device_ip_set_powergating_state=linuxkpi_original_amdgpu_device_ip_set_powergating_state
+    obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c.o: override LINUX_CPPFLAGS += -Damdgpu_vcn_dec_ring_test_ring=linuxkpi_original_amdgpu_vcn_dec_ring_test_ring
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c.o: override LINUX_CPPFLAGS += -include linuxkpi/include/linuxkpi/psp_ring_trace.h
     obj-$(ARCH)/linux/drivers/dma-buf/dma-fence.c.o: override LINUX_CPPFLAGS += -Ddma_fence_signal=linuxkpi_original_dma_fence_signal
     obj-$(ARCH)/linux/drivers/dma-buf/dma-resv.c.o: override LINUX_CPPFLAGS += -Ddma_resv_add_fence=linuxkpi_original_dma_resv_add_fence

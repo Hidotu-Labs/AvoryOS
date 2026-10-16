@@ -15,6 +15,7 @@
 #include "../mm/vma.h"
 #include "../mm/vmm.h"
 #include "../sched/sched.h"
+#include "../sched/namespace.h"
 #include "syscall.h"
 #include "../include/arch/uaccess.h"
 #include "../drivers/timer/rtc.h"
@@ -32,6 +33,7 @@
 struct shm_segment {
   bool active;          // Slot in use
   bool marked_destroy;  // Marked for deletion (IPC_RMID)
+  uint32_t namespace_id;
   uint32_t key;         // IPC key (0 = IPC_PRIVATE)
   uint32_t shmid;       // Unique segment ID
   uint64_t size;        // Segment size (bytes)
@@ -106,8 +108,10 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg, uint64_t a3,
   // If key != IPC_PRIVATE, search for existing segment
   if (key != IPC_PRIVATE) {
     for (int i = 0; i < SHM_MAX_SEGMENTS; i++) {
-      if (shm_table[i].active && shm_table[i].key == (uint32_t)key) {
-        if (shmflg & IPC_EXCL) {
+      if (shm_table[i].active && !shm_table[i].marked_destroy &&
+          shm_table[i].namespace_id == ipc_namespace_id(sched_get_current()) &&
+          shm_table[i].key == (uint32_t)key) {
+        if ((shmflg & IPC_CREAT) && (shmflg & IPC_EXCL)) {
           spinlock_release(&shm_lock);
           return -17; // EEXIST
         }
@@ -159,6 +163,8 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg, uint64_t a3,
     return -28; // ENOSPC
   }
 
+  if (shm_next_id > 0x7FFFFFFFU) { spinlock_release(&shm_lock); return -28; }
+
   // Allocate physical pages
   uint32_t num_pages = (uint32_t)(PAGE_ALIGN_UP(size) / PAGE_SIZE);
   if (num_pages > MAX_SHM_PAGES) {
@@ -183,6 +189,7 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg, uint64_t a3,
 
   // Initialize segment
   struct shm_segment *seg = &shm_table[slot];
+  seg->namespace_id = ipc_namespace_id(sched_get_current());
   seg->active = true;
   seg->marked_destroy = false;
   seg->key = (uint32_t)key;
@@ -230,7 +237,9 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
   // Find segment by ID
   struct shm_segment *seg = NULL;
   for (int i = 0; i < SHM_MAX_SEGMENTS; i++) {
-    if (shm_table[i].active && shm_table[i].shmid == (uint32_t)shmid) {
+    if (shm_table[i].active &&
+        shm_table[i].namespace_id == ipc_namespace_id(sched_get_current()) &&
+        shm_table[i].shmid == (uint32_t)shmid) {
       seg = &shm_table[i];
       break;
     }
@@ -460,7 +469,8 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf, uint64_t a3,
     struct shm_usage usage = {0};
     int highest = 0;
     for (int i = 0; i < SHM_MAX_SEGMENTS; i++) {
-      if (shm_table[i].active) {
+      if (shm_table[i].active &&
+          shm_table[i].namespace_id == ipc_namespace_id(sched_get_current())) {
         highest = i;
         usage.used_ids++;
         usage.shm_tot += shm_table[i].num_pages;
@@ -477,6 +487,7 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf, uint64_t a3,
   bool by_index = cmd == 13 /* SHM_STAT */ || cmd == 15 /* SHM_STAT_ANY */;
   for (int i = 0; i < SHM_MAX_SEGMENTS; i++) {
     if (shm_table[i].active &&
+        shm_table[i].namespace_id == ipc_namespace_id(sched_get_current()) &&
         (by_index ? (uint64_t)i == shmid : shm_table[i].shmid == shmid)) {
       seg = &shm_table[i];
       break;
@@ -597,4 +608,18 @@ void syscall_register_shm(void) {
   syscall_register(SYS_SHMCTL, (syscall_handler_t)sys_shmctl);
   klog_puts("[SHM] Syscalls registered (shmget=29, shmat=30, shmctl=31, "
             "shmdt=67).\n");
+}
+
+/* Last task reference to this IPC namespace has gone. Unpublish IDs/keys and
+ * release their ownership refs. Mappings retain independent PMM references. */
+void shm_namespace_destroy(uint32_t id) {
+  spinlock_acquire(&shm_lock);
+  for (int i = 0; i < SHM_MAX_SEGMENTS; i++) {
+    struct shm_segment *seg = &shm_table[i];
+    if (seg->active && seg->namespace_id == id) {
+      seg->nattch = 0;
+      shm_destroy_segment(seg);
+    }
+  }
+  spinlock_release(&shm_lock);
 }

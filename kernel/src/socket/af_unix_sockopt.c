@@ -408,6 +408,14 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
   case 59: // SO_PEERGROUPS
     return -92; // ENOPROTOOPT
 
+  case 2:  // SO_REUSEADDR
+  case 15: // SO_REUSEPORT
+    /* Deliberately unsupported on AF_UNIX, same as Linux (ENOPROTOOPT).
+     * GLib/GVFS sets these unconditionally before bind and handles the
+     * error; keep the errno but skip the WARN so desktop startup stays
+     * quiet. */
+    return -92; // ENOPROTOOPT
+
   default:
     klog_puts("[WARN] unix_setsockopt: unknown optname ");
     klog_uint64(optname);

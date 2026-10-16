@@ -246,7 +246,8 @@ static bool arp_resolve(uint32_t ip, uint8_t mac[6]) {
 }
 
 static void handle_arp(const uint8_t *payload, size_t length) {
-  if (length < sizeof(struct arp_packet))
+  struct net_device *dev = net_device_default();
+  if (!dev || length < sizeof(struct arp_packet))
     return;
   const struct arp_packet *packet = (const struct arp_packet *)payload;
   if (be16(packet->hardware_type) != ARP_HTYPE_ETHERNET ||
@@ -256,7 +257,7 @@ static void handle_arp(const uint8_t *payload, size_t length) {
   uint32_t sender_ip = get_ip(packet->sender_ip);
   uint32_t target_ip = get_ip(packet->target_ip);
   if (sender_ip == config.address &&
-      !mac_equal(packet->sender_mac, net_device_default()->mac)) {
+      !mac_equal(packet->sender_mac, dev->mac)) {
     address_conflict = true;
     return;
   }
@@ -533,6 +534,10 @@ static void ethernet_receive(struct net_packet *packet) {
   struct net_device *dev = packet->device;
   if (!dev || (uintptr_t)dev < 0xFFFF800000000000ULL)
     dev = net_device_default();
+  /* Protocol configuration and routes are currently global. Traffic from a
+   * secondary NIC must not update the default interface's ARP/DHCP/NDP state. */
+  if (dev != net_device_default())
+    return;
   if (!dev)
     return;
   if (!mac_equal(header->destination, dev->mac) &&

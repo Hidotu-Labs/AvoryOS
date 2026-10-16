@@ -47,6 +47,26 @@ void klogf(const char *fmt, ...) { (void)fmt; }
 static int allocation_failure;
 void *kmalloc(size_t n) { return allocation_failure ? NULL : malloc(n); }
 void kfree(void *p) { free(p); }
+/* Mirrors drivers/storage/block.c, which this test does not link: use the
+ * device's pipelined op when present, otherwise run the members through the
+ * ordered single-request fallback. */
+int block_write_batch(struct block_device *dev, struct block_io_req *reqs,
+                      unsigned n) {
+  if (!dev || !reqs || n == 0)
+    return -1;
+  if (dev->write_batch)
+    return dev->write_batch(dev, reqs, n);
+  int worst = 0;
+  for (unsigned i = 0; i < n; i++) {
+    reqs[i].result = dev->write_sectors
+                         ? dev->write_sectors(dev, reqs[i].lba, reqs[i].count,
+                                              reqs[i].buf)
+                         : -1;
+    if (reqs[i].result < worst)
+      worst = reqs[i].result;
+  }
+  return worst;
+}
 int ext3_journal_start(ext2_mount_t *mnt) {
   (void)mnt;
   return 0;
@@ -84,6 +104,13 @@ int ext3_journal_block(ext2_mount_t *mnt, uint32_t block, const void *buf) {
     ext2_mark_group_dirty(mnt, 64);
   }
   return block == (uint32_t)fail_block ? -1 : 0;
+}
+bool ext3_journal_read_staged(ext2_mount_t *mnt, uint32_t block,
+                              void *buf) {
+  (void)mnt;
+  (void)block;
+  (void)buf;
+  return false;
 }
 static void reset_writes(void) {
   writes = 0;

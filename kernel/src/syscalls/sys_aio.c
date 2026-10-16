@@ -22,6 +22,7 @@
 // ---------------------------------------------------------------------------
 
 inotify_instance_t inotify_instances[MAX_INOTIFY_INSTANCES];
+static spinlock_t inotify_pool_lock = SPINLOCK_INIT;
 uint32_t next_instance_id = 1;
 uint32_t next_watch_id    = 1;
 
@@ -234,38 +235,42 @@ static void timerfd_unregister(timerfd_ctx_t *ctx) {
 void timerfd_tick(void) {
     if (__atomic_load_n(&timerfd_active_count, __ATOMIC_RELAXED) == 0)
         return;
-
-    extern uint64_t lapic_timer_get_ms(void);
-    extern void epoll_notify_event(struct vfs_node *node, uint32_t events);
-    uint64_t now = lapic_timer_get_ms();
-
-    if (!spinlock_try_acquire(&timerfd_table_lock)) return;
-
+    uint64_t now = lapic_timer_get_ms(), next = 0;
+    /* Every timer IRQ consumes the LAPIC's one-shot arm, even if it was a
+     * scheduler deadline earlier than this timerfd. Retain the earliest
+     * outstanding expiry on every tick, not only when a timer expires. */
+    if (!spinlock_try_acquire(&timerfd_table_lock)) {
+        lapic_timer_rearm_if_earlier(now + 1);
+        return;
+    }
     for (int i = 0; i < TIMERFD_MAX; i++) {
         timerfd_ctx_t *ctx = timerfd_table[i];
-        if (!ctx || ctx->expire_ms == 0) continue;
-        if (now >= ctx->expire_ms) {
-            if (!spinlock_try_acquire(&ctx->lock)) continue;
-            ctx->expirations++;
+        if (!ctx) continue;
+        if (!spinlock_try_acquire(&ctx->lock)) {
+            if (!next || now + 1 < next) next = now + 1;
+            continue;
+        }
+        bool expired = ctx->expire_ms && now >= ctx->expire_ms;
+        if (expired) {
+            uint64_t count = 1;
             if (ctx->interval_sec || ctx->interval_nsec) {
                 uint64_t iv = ctx->interval_sec * 1000 + ctx->interval_nsec / 1000000;
-                if (iv == 0) iv = 1;
-                ctx->expire_ms = now + iv;
-                lapic_timer_rearm_if_earlier(ctx->expire_ms);
-            } else {
-                ctx->expire_ms = 0;
-            }
-            if (ctx->node) {
-                vfs_node_t *node = ctx->node;
-                spinlock_release(&ctx->lock);
-                epoll_notify_event(node, 0x0001);
-                wait_queue_wake_all(&ctx->wq);
-            } else {
-                spinlock_release(&ctx->lock);
-            }
+                if (!iv) iv = 1;
+                count += (now - ctx->expire_ms) / iv;
+                ctx->expire_ms += count * iv;
+            } else ctx->expire_ms = 0;
+            ctx->expirations += count;
+        }
+        if (ctx->expire_ms && (!next || ctx->expire_ms < next)) next = ctx->expire_ms;
+        vfs_node_t *node = ctx->node;
+        spinlock_release(&ctx->lock);
+        if (expired && node) {
+            epoll_notify_event(node, POLLIN);
+            wait_queue_wake_all(&ctx->wq);
         }
     }
     spinlock_release(&timerfd_table_lock);
+    if (next) lapic_timer_rearm_if_earlier(next);
 }
 
 static uint32_t timerfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
@@ -964,138 +969,244 @@ static uint64_t sys_pipe(uint64_t pipefd_ptr, uint64_t a1, uint64_t a2,
 // inotify
 // ---------------------------------------------------------------------------
 
+static bool inotify_same_target(vfs_node_t *a, vfs_node_t *b) {
+    return a == b || (a && b && a->inode && a->inode == b->inode &&
+           a->mount_id == b->mount_id && a->device == b->device && a->read == b->read);
+}
+
+/* Called with instance->lock held. Keep one queue slot for overflow. */
+static void inotify_enqueue(inotify_instance_t *instance, int32_t wd,
+                             uint32_t mask, const char *name, uint32_t cookie) {
+    uint32_t count = (instance->queue_tail + INOTIFY_QUEUE_SIZE - instance->queue_head) % INOTIFY_QUEUE_SIZE;
+    if (count >= INOTIFY_QUEUE_SIZE - 2) {
+        if (instance->overflow) return;
+        wd = -1; mask = IN_Q_OVERFLOW; name = NULL; cookie = 0;
+        instance->overflow = true;
+    }
+    struct avory_inotify_event *event = &instance->event_queue[instance->queue_tail];
+    memset(event, 0, sizeof(*event));
+    event->wd = wd; event->mask = mask; event->cookie = cookie;
+    if (name) {
+        size_t len = strlen(name);
+        if (len > 255) len = 255;
+        memcpy(event->name, name, len);
+        event->len = (len + 1 + 15) & ~15U;
+    }
+    instance->queue_tail = (instance->queue_tail + 1) % INOTIFY_QUEUE_SIZE;
+}
+
+uint32_t inotify_move_cookie(void) {
+    static uint32_t cookie;
+    uint32_t value = __atomic_add_fetch(&cookie, 1, __ATOMIC_RELAXED);
+    return value ? value : __atomic_add_fetch(&cookie, 1, __ATOMIC_RELAXED);
+}
+
+void inotify_notify(vfs_node_t *target, uint32_t mask, const char *name, uint32_t cookie) {
+    if (!target) return;
+    for (unsigned i = 0; i < MAX_INOTIFY_INSTANCES; i++) {
+        if (!__atomic_load_n(&inotify_instances[i].instance_id, __ATOMIC_ACQUIRE)) continue;
+        vfs_node_t *release[MAX_INOTIFY_WATCHES];
+        unsigned nr_release = 0;
+        spinlock_acquire(&inotify_pool_lock);
+        inotify_instance_t *instance = &inotify_instances[i];
+        if (!instance->instance_id) { spinlock_release(&inotify_pool_lock); continue; }
+        spinlock_acquire(&instance->lock);
+        bool queued = false;
+        for (unsigned w = 0; w < instance->num_watches;) {
+            inotify_watch_t *watch = &instance->watches[w];
+            if (!inotify_same_target(watch->target, target)) { w++; continue; }
+            bool matched = (watch->mask & mask & IN_ALL_EVENTS) != 0;
+            if (matched) {
+                inotify_enqueue(instance, watch->wd, mask, name, cookie);
+                queued = true;
+            }
+            if ((mask & IN_DELETE_SELF) || (matched && (watch->mask & IN_ONESHOT))) {
+                inotify_enqueue(instance, watch->wd, IN_IGNORED, NULL, 0);
+                queued = true;
+                release[nr_release++] = watch->target;
+                instance->watches[w] = instance->watches[--instance->num_watches];
+            } else w++;
+        }
+        spinlock_release(&instance->lock);
+        if (queued) {
+            wait_queue_wake_all(&instance->wq);
+            if (instance->node) epoll_notify_event(instance->node, POLLIN);
+        }
+        spinlock_release(&inotify_pool_lock);
+        for (unsigned n = 0; n < nr_release; n++) vfs_close(release[n]);
+    }
+}
+
 static void inotify_close(vfs_node_t *node) {
     if (!node || !node->device) return;
-    inotify_instance_t *instance = (inotify_instance_t *)node->device;
-    /* Wake parked readers before the slot goes away; they re-validate the
-     * instance id on wake and fail cleanly instead of sleeping forever. */
-    wait_queue_wake_all(&instance->wq);
-    memset(instance, 0, sizeof(*instance));
-    node->device = NULL;
-}
-
-/* Level-triggered readiness: readable only while queued events exist.
- * Previously the node had no poll callback at all, so the fd behaved
- * according to its type default instead of its queue state. */
-static int inotify_poll(vfs_node_t *node, int events) {
-    inotify_instance_t *instance =
-        (inotify_instance_t *)(node ? node->device : NULL);
-    if (!instance) return 0;
-    int revents = 0;
+    inotify_instance_t *instance = node->device;
+    vfs_node_t *release[MAX_INOTIFY_WATCHES];
+    spinlock_acquire(&inotify_pool_lock);
     spinlock_acquire(&instance->lock);
-    if (instance->queue_head != instance->queue_tail)
-        revents |= POLLIN;
+    unsigned count = instance->num_watches;
+    for (unsigned i = 0; i < count; i++) release[i] = instance->watches[i].target;
+    __atomic_store_n(&instance->instance_id, 0, __ATOMIC_RELEASE);
+    instance->num_watches = instance->queue_head = instance->queue_tail = 0;
+    instance->node = NULL;
+    node->device = NULL;
     spinlock_release(&instance->lock);
-    return revents & events;
+    spinlock_release(&inotify_pool_lock);
+    wait_queue_wake_all(&instance->wq);
+    for (unsigned i = 0; i < count; i++) vfs_close(release[i]);
 }
 
-/* Blocking read. No producer enqueues events yet, so the queue is empty and
- * this parks (or returns -EAGAIN on O_NONBLOCK) instead of returning 0.
- * Returning 0 means EOF to userspace: glib treats an inotify EOF as a dead
- * descriptor, drops it and re-creates it, which is a 100% single-threaded
- * poll/read spin for every GFileMonitor client (wireplumber included). */
+static int inotify_ioctl(vfs_node_t *node, uint32_t request, uint64_t arg) {
+    if (request != 0x541b) return -25; /* FIONREAD */
+    inotify_instance_t *instance = node ? node->device : NULL;
+    if (!instance) return -9;
+    int bytes = 0;
+    spinlock_acquire(&instance->lock);
+    for (unsigned i = instance->queue_head; i != instance->queue_tail;
+         i = (i + 1) % INOTIFY_QUEUE_SIZE)
+        bytes += 16 + instance->event_queue[i].len;
+    spinlock_release(&instance->lock);
+    /* Report serialized record sizes, including name padding. Do not consume
+     * events or copy to user memory while holding the queue lock. */
+    return copy_to_user((void *)arg, &bytes, sizeof(bytes)) ? -14 : 0;
+}
+
+static int inotify_poll(vfs_node_t *node, int events) {
+    inotify_instance_t *instance = node ? node->device : NULL;
+    if (!instance) return 0;
+    spinlock_acquire(&instance->lock);
+    bool ready = instance->queue_head != instance->queue_tail;
+    spinlock_release(&instance->lock);
+    return ready ? (POLLIN & events) : 0;
+}
+
 static uint32_t inotify_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                              uint8_t *buffer) {
     (void)offset;
-    (void)buffer;
-    inotify_instance_t *instance =
-        (inotify_instance_t *)(node ? node->device : NULL);
-    if (!instance) return (uint32_t)-22;
-    if (size < 16) return (uint32_t)-22; /* sizeof(struct inotify_event) */
-
+    inotify_instance_t *instance = node ? node->device : NULL;
+    if (!instance) return (uint32_t)-9;
+    if (size < 16) return (uint32_t)-22;
     struct thread *t = sched_get_current();
     int fd = -1;
-    if (t) {
-        for (int i = 0; i < MAX_FDS; i++) {
-            if (t->fds[i] == node) { fd = i; break; }
-        }
-    }
-
+    if (t) for (int i = 0; i < MAX_FDS; i++) if (t->fds[i] == node) { fd = i; break; }
+    uint32_t capacity = size < sizeof(instance->event_queue) ? size : sizeof(instance->event_queue);
+    uint8_t *staging = kmalloc(capacity);
+    if (!staging) return (uint32_t)-12;
     spinlock_acquire(&instance->lock);
     for (;;) {
-        if (instance->instance_id == 0) {
-            spinlock_release(&instance->lock);
-            return (uint32_t)-9; /* closed under us */
+        if (!instance->instance_id) {
+            spinlock_release(&instance->lock); kfree(staging); return (uint32_t)-9;
         }
-        if (instance->queue_head != instance->queue_tail) {
-            // No VFS producer decodes events yet: drop the stale markers and
-            // keep blocking instead of returning a fake 16-byte event with
-            // uninitialized userspace memory (glib would cache garbage).
-            instance->queue_head = instance->queue_tail;
-            // Fall through to blocking/EAGAIN handling below.
+        if (instance->queue_head != instance->queue_tail) break;
+        if (!t || (fd >= 0 && (t->fd_flags[fd] & O_NONBLOCK))) {
+            spinlock_release(&instance->lock); kfree(staging); return (uint32_t)-11;
         }
-        if (instance->queue_head == instance->queue_tail) {
-            if (fd != -1 && t && (t->fd_flags[fd] & O_NONBLOCK)) {
-                spinlock_release(&instance->lock);
-                return (uint32_t)-11; /* EAGAIN */
-            }
-            if (!t) {
-                spinlock_release(&instance->lock);
-                return (uint32_t)-11;
-            }
-            wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL,
-                                        .thread_next = NULL, .thread_prev = NULL};
-            t->state = THREAD_BLOCKED;
-            wait_queue_add(&instance->wq, &entry);
-            spinlock_release(&instance->lock);
-            sched_yield();
-            t->state = THREAD_RUNNING;
-            wait_queue_remove(&instance->wq, &entry);
-            if (thread_has_pending_signal(t))
-                return (uint32_t)-4; /* EINTR */
-            spinlock_acquire(&instance->lock);
-            continue;
-        }
+        wait_queue_entry_t entry = {.thread = t};
+        t->state = THREAD_BLOCKED;
+        wait_queue_add(&instance->wq, &entry);
         spinlock_release(&instance->lock);
-        return (uint32_t)-11;
+        sched_yield();
+        t->state = THREAD_RUNNING;
+        wait_queue_remove(&instance->wq, &entry);
+        if (thread_has_pending_signal(t)) { kfree(staging); return (uint32_t)-4; }
+        spinlock_acquire(&instance->lock);
     }
+    uint32_t written = 0;
+    while (instance->queue_head != instance->queue_tail) {
+        struct avory_inotify_event *event = &instance->event_queue[instance->queue_head];
+        uint32_t length = 16 + event->len;
+        if (length > capacity - written) break;
+        memcpy(staging + written, event, length);
+        written += length;
+        if (event->mask & IN_Q_OVERFLOW) instance->overflow = false;
+        instance->queue_head = (instance->queue_head + 1) % INOTIFY_QUEUE_SIZE;
+    }
+    spinlock_release(&instance->lock);
+    uint32_t result = written;
+    if (!written) result = (uint32_t)-22;
+    else if (is_user_ptr((uint64_t)buffer)) {
+        if (copy_to_user(buffer, staging, written)) result = (uint32_t)-14;
+    } else memcpy(buffer, staging, written);
+    kfree(staging);
+    return result;
 }
 
-static uint64_t sys_inotify_init(uint64_t a1, uint64_t a2, uint64_t a3,
-                                  uint64_t a4, uint64_t a5, uint64_t a6) {
-    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+static vfs_node_t *inotify_pin_fd(struct thread *t, uint64_t fd) {
+    if (!t || !t->files || fd >= MAX_FDS) return NULL;
+    spinlock_acquire(&t->files->lock);
+    vfs_node_t *node = t->fds[fd];
+    if (!node || node == FD_RESERVED || node->read != inotify_read) node = NULL;
+    else vfs_node_ref(node);
+    spinlock_release(&t->files->lock);
+    return node;
+}
+
+static uint64_t inotify_create(uint64_t flags) {
     struct thread *t = sched_get_current();
     if (!t) return (uint64_t)-1;
 
+    /* Reserve the fd and allocate the node before claiming a pool slot.
+     * Failed allocations must not permanently consume inotify instances. */
+    int fd = alloc_fd(t);
+    if (fd < 0) return (uint64_t)-24;
+    vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
+    if (!node) {
+        fd_release_reserved(t, fd);
+        return (uint64_t)-12;
+    }
     inotify_instance_t *instance = NULL;
+    spinlock_acquire(&inotify_pool_lock);
     for (int i = 0; i < MAX_INOTIFY_INSTANCES; i++) {
         if (inotify_instances[i].instance_id == 0) {
             instance = &inotify_instances[i]; break;
         }
     }
-    if (!instance) return (uint64_t)-23;
-
-    instance->instance_id = next_instance_id++;
-    instance->num_watches = 0;
-    instance->queue_head  = instance->queue_tail = 0;
+    if (!instance) {
+        spinlock_release(&inotify_pool_lock);
+        kfree(node);
+        fd_release_reserved(t, fd);
+        return (uint64_t)-23;
+    }
+    memset(instance, 0, sizeof(*instance));
+    /* Zero is the free-slot marker, including after ID wraparound. */
+    if (!next_instance_id) next_instance_id = 1;
+    uint32_t id = next_instance_id++;
     spinlock_init(&instance->lock);
     wait_queue_init(&instance->wq);
+    __atomic_store_n(&instance->instance_id, id, __ATOMIC_RELEASE);
+    spinlock_release(&inotify_pool_lock);
 
-    int fd = alloc_fd(t);
-    if (fd < 0) return (uint64_t)-24;
-
-    vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
-    if (!node) return (uint64_t)-12;
     vfs_node_init(node);
     node->flags = FS_CHARDEV;
     node->mask  = 0600;
     node->impl  = instance->instance_id;
     node->device = instance;
+    instance->node = node;
     node->close = inotify_close;
     node->poll = inotify_poll;
     node->read = inotify_read;
+    node->ioctl = inotify_ioctl;
     node->wait_queue = &instance->wq;
     node->name[0] = '\0';
     strcat(node->name, "inotify");
 
-    t->fds[fd]        = node;
+    spinlock_acquire(&t->files->lock);
     t->fd_offsets[fd] = 0;
+    t->fd_flags[fd] = (flags & O_NONBLOCK) |
+                     ((flags & O_CLOEXEC) ? FD_FLAGS_CLOEXEC_BIT : 0);
+    t->fds[fd] = node;
     fd_path_set(t, fd, "inotify");
+    spinlock_release(&t->files->lock);
 
     klog_debug_puts("[INOTIFY_INIT] Created instance ");
     klog_debug_uint64(instance->instance_id);
     klog_debug_puts(" with fd="); klog_debug_uint64(fd); klog_debug_puts("\n");
     return fd;
+}
+
+static uint64_t sys_inotify_init(uint64_t a1, uint64_t a2, uint64_t a3,
+                                  uint64_t a4, uint64_t a5, uint64_t a6) {
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    return inotify_create(0);
 }
 
 static uint64_t sys_inotify_init1(uint64_t flags, uint64_t a2, uint64_t a3,
@@ -1104,108 +1215,98 @@ static uint64_t sys_inotify_init1(uint64_t flags, uint64_t a2, uint64_t a3,
     /* IN_NONBLOCK and IN_CLOEXEC are defined to be O_NONBLOCK and O_CLOEXEC. */
     if (flags & ~(uint64_t)(O_CLOEXEC | O_NONBLOCK))
         return (uint64_t)-22; // EINVAL
-    uint64_t fd = sys_inotify_init(0, 0, 0, 0, 0, 0);
-    if ((int64_t)fd >= 0 && fd < MAX_FDS) {
-        struct thread *t = sched_get_current();
-        if (t && (flags & O_NONBLOCK)) t->fd_flags[fd] |= O_NONBLOCK;
-        if (t && (flags & O_CLOEXEC))
-            t->fd_flags[fd] |= FD_FLAGS_CLOEXEC_BIT;
-    }
-    return fd;
+    /* Set close-on-exec before publishing the fd: a concurrent fork/exec
+     * must not inherit an instance requested with IN_CLOEXEC. */
+    return inotify_create(flags);
 }
 
 static uint64_t sys_inotify_add_watch(uint64_t fd, uint64_t pathname,
-                                       uint64_t mask, uint64_t a4,
+                                       uint64_t mask_arg, uint64_t a4,
                                        uint64_t a5, uint64_t a6) {
     (void)a4; (void)a5; (void)a6;
     struct thread *t = sched_get_current();
-    if (!t) return (uint64_t)-1;
-    if (!pathname || !is_user_ptr(pathname)) return (uint64_t)-14;
-    if (fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
-
-    vfs_node_t *node = t->fds[fd];
-    if (strcmp(node->name, "inotify") != 0) return (uint64_t)-22;
-
-    uint32_t instance_id = node->impl;
-    inotify_instance_t *instance = NULL;
-    for (int i = 0; i < MAX_INOTIFY_INSTANCES; i++) {
-        if (inotify_instances[i].instance_id == instance_id) {
-            instance = &inotify_instances[i]; break;
+    vfs_node_t *node = inotify_pin_fd(t, fd);
+    if (!node) return (uint64_t)-9;
+    uint32_t mask = (uint32_t)mask_arg;
+    int64_t result = -22;
+    vfs_node_t *target = NULL;
+    char path[4096];
+    if (!(mask & IN_ALL_EVENTS) || ((mask & IN_MASK_ADD) && (mask & IN_MASK_CREATE))) goto out;
+    long len = strncpy_from_user(path, (const char *)pathname, sizeof(path));
+    if (len < 0) { result = -14; goto out; }
+    if (len >= (long)sizeof(path)) { result = -36; goto out; }
+    if (!len) { result = -2; goto out; }
+    vfs_node_t *base = t->cwd_node ? t->cwd_node : fs_root;
+    while (len > 1 && path[len - 1] == '/') path[--len] = 0;
+    if ((mask & IN_DONT_FOLLOW) && strcmp(path, "/")) {
+        char *last = strrchr(path, '/');
+        vfs_node_t *parent;
+        const char *name;
+        if (last) {
+            name = last + 1;
+            *last = 0;
+            parent = vfs_resolve_path_at(base, last == path ? "/" : path);
+        } else {
+            name = path; parent = base; vfs_node_ref(parent);
         }
+        if (parent) { target = vfs_finddir(parent, (char *)name); vfs_close(parent); }
+    } else target = vfs_resolve_path_at(base, path);
+    if (!target) { result = -2; goto out; }
+    if ((mask & IN_ONLYDIR) && (target->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
+        result = -20; goto out;
     }
-    if (!instance) return (uint64_t)-22;
-    if (instance->num_watches >= MAX_INOTIFY_WATCHES) return (uint64_t)-23;
-
-    const char *path = (const char *)pathname;
-    for (uint32_t i = 0; i < instance->num_watches; i++) {
-        if (strcmp(instance->watches[i].path, path) == 0) {
-            instance->watches[i].mask = (uint32_t)mask;
-            klog_debug_puts("[INOTIFY_ADD_WATCH] Updated watch for path: ");
-            klog_debug_puts(path); klog_debug_puts("\n");
-            return instance->watches[i].wd;
+    if (!vfs_access(target, 4)) { result = -13; goto out; }
+    inotify_instance_t *instance = node->device;
+    spinlock_acquire(&instance->lock);
+    for (unsigned i = 0; i < instance->num_watches; i++) {
+        inotify_watch_t *watch = &instance->watches[i];
+        if (!inotify_same_target(watch->target, target)) continue;
+        if (mask & IN_MASK_CREATE) result = -17;
+        else {
+            watch->mask = (mask & IN_MASK_ADD) ? watch->mask | mask : mask;
+            result = watch->wd;
         }
+        goto unlock;
     }
-
-    inotify_watch_t *watch = &instance->watches[instance->num_watches];
-    watch->wd         = next_watch_id++;
-    watch->mask       = (uint32_t)mask;
-    watch->event_mask = 0;
-    strncpy(watch->path, path, sizeof(watch->path) - 1);
-    watch->path[sizeof(watch->path) - 1] = '\0';
-    instance->num_watches++;
-
-    klog_debug_puts("[INOTIFY_ADD_WATCH] Added watch wd="); klog_debug_uint64(watch->wd);
-    klog_debug_puts(" for path: "); klog_debug_puts(path);
-    klog_debug_puts(" in instance "); klog_debug_uint64(instance_id); klog_debug_puts("\n");
-    return watch->wd;
+    if (instance->num_watches == MAX_INOTIFY_WATCHES) { result = -28; goto unlock; }
+    inotify_watch_t *watch = &instance->watches[instance->num_watches++];
+    uint32_t wd = __atomic_add_fetch(&next_watch_id, 1, __ATOMIC_RELAXED) & 0x7fffffff;
+    if (!wd) wd = __atomic_add_fetch(&next_watch_id, 1, __ATOMIC_RELAXED) & 0x7fffffff;
+    watch->wd = wd; watch->mask = mask; watch->target = target;
+    target = NULL; /* watch owns the resolver's reference */
+    result = wd;
+unlock:
+    spinlock_release(&instance->lock);
+out:
+    if (target) vfs_close(target);
+    vfs_close(node);
+    return (uint64_t)result;
 }
 
-// ---------------------------------------------------------------------------
-// inotify_rm_watch
-// ---------------------------------------------------------------------------
-
-static uint64_t sys_inotify_rm_watch(uint64_t fd_val, uint64_t wd_val,
+static uint64_t sys_inotify_rm_watch(uint64_t fd, uint64_t wd,
                                       uint64_t a3, uint64_t a4,
                                       uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
     struct thread *t = sched_get_current();
-    if (!t) return (uint64_t)-1;
-
-    int fd = (int)fd_val;
-    if (fd < 0 || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9; // EBADF
-
-    vfs_node_t *node = t->fds[fd];
-    if (strcmp(node->name, "inotify") != 0) return (uint64_t)-22; // EINVAL
-
-    uint32_t instance_id = node->impl;
-    inotify_instance_t *instance = NULL;
-    for (int i = 0; i < MAX_INOTIFY_INSTANCES; i++) {
-        if (inotify_instances[i].instance_id == instance_id) {
-            instance = &inotify_instances[i]; break;
-        }
+    vfs_node_t *node = inotify_pin_fd(t, fd), *release = NULL;
+    if (!node) return (uint64_t)-9;
+    inotify_instance_t *instance = node->device;
+    spinlock_acquire(&instance->lock);
+    for (unsigned i = 0; i < instance->num_watches; i++) {
+        if (instance->watches[i].wd != (uint32_t)wd) continue;
+        release = instance->watches[i].target;
+        inotify_enqueue(instance, wd, IN_IGNORED, NULL, 0);
+        instance->watches[i] = instance->watches[--instance->num_watches];
+        break;
     }
-    if (!instance) return (uint64_t)-22; // EINVAL
-
-    uint32_t target_wd = (uint32_t)wd_val;
-    int found_idx = -1;
-    for (uint32_t i = 0; i < instance->num_watches; i++) {
-        if (instance->watches[i].wd == target_wd) {
-            found_idx = (int)i;
-            break;
-        }
+    spinlock_release(&instance->lock);
+    if (release) {
+        wait_queue_wake_all(&instance->wq);
+        epoll_notify_event(node, POLLIN);
+        vfs_close(release);
     }
-    if (found_idx < 0) return (uint64_t)-22; // EINVAL
-
-    for (uint32_t i = (uint32_t)found_idx; i + 1 < instance->num_watches; i++)
-        instance->watches[i] = instance->watches[i + 1];
-    instance->num_watches--;
-
-    klog_debug_puts("[INOTIFY_RM_WATCH] Removed watch wd=");
-    klog_debug_uint64(target_wd);
-    klog_debug_puts(" in instance ");
-    klog_debug_uint64(instance_id);
-    klog_debug_puts("\n");
-    return 0;
+    vfs_close(node);
+    return release ? 0 : (uint64_t)-22;
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,10 +1443,6 @@ static uint64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags_arg,
 
     return (uint64_t)fd;
 }
-
-// ---------------------------------------------------------------------------
-// Registration
-// ---------------------------------------------------------------------------
 
 void syscall_register_aio(void) {
     syscall_register(SYS_EVENTFD2,         sys_eventfd2);

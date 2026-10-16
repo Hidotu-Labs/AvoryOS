@@ -12,7 +12,7 @@
 #
 # Typical session (two terminals):
 #   term A: ./scripts/netbench.sh server tcp-sink 9000
-#   term B: make run-net
+#   term B: make run RUN_NIC=e1000
 #   guest:  nettest tcp-source 10.0.2.2 9000 10
 #
 # Results are saved manually; keep a build/netbench/ directory for baselines.
@@ -66,7 +66,7 @@ run)
     trap 'kill $srv_pid 2>/dev/null || true' EXIT
     sleep 0.3
     echo "host server started (pid $srv_pid), booting QEMU..."
-    make -C "$ROOT_DIR" run-net
+    make -C "$ROOT_DIR" "${RUN_TARGET:-run}" "RUN_NIC=${RUN_NIC:-rtl8139}"
     ;;
 *)
     usage

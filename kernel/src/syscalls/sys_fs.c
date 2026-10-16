@@ -15,6 +15,10 @@
 #include "../lib/tsc.h"
 #include <stdint.h>
 
+#include "../fs/mount_namespace.h"
+#include "../sched/capability.h"
+#define fs_root vfs_task_root()
+
 #define AT_REMOVEDIR        0x200
 #define AT_SYMLINK_NOFOLLOW 0x100  /* fchmodat2 / fstatat: do not follow symlinks */
 #define AT_SYMLINK_FOLLOW   0x400  /* linkat: follow symlinks on old path */
@@ -1079,7 +1083,7 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
 
     if ((flags & AT_EMPTY_PATH) && oldpath[0] == '\0') {
         // Use the fd referred to by olddirfd directly as the source.
-        if ((int64_t)olddirfd == AT_FDCWD) {
+        if ((int32_t)olddirfd == AT_FDCWD) {
             src = t ? t->cwd_node : fs_root;
         } else if (olddirfd < MAX_FDS && t && fd_is_valid_node(t->fds[olddirfd])) {
             src = t->fds[olddirfd];
@@ -1091,7 +1095,7 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
         vfs_node_t *old_base;
         if (oldpath[0] == '/') {
             old_base = fs_root;
-        } else if ((int64_t)olddirfd == AT_FDCWD) {
+        } else if ((int32_t)olddirfd == AT_FDCWD) {
             old_base = (t && t->cwd_node) ? t->cwd_node : fs_root;
         } else if (olddirfd < MAX_FDS && t && fd_is_valid_node(t->fds[olddirfd])) {
             old_base = t->fds[olddirfd];
@@ -1120,7 +1124,7 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
     vfs_node_t *new_base;
     if (newpath[0] == '/') {
         new_base = fs_root;
-    } else if ((int64_t)newdirfd == AT_FDCWD) {
+    } else if ((int32_t)newdirfd == AT_FDCWD) {
         new_base = (t && t->cwd_node) ? t->cwd_node : fs_root;
     } else if (newdirfd < MAX_FDS && t && fd_is_valid_node(t->fds[newdirfd])) {
         new_base = t->fds[newdirfd];
@@ -1247,7 +1251,7 @@ static uint64_t sys_chmod(uint64_t pathname_ptr, uint64_t mode, uint64_t a2,
         if (base_owned) vfs_close(base_owned);
         return (uint64_t)-2;
     }
-    if (t && t->euid != 0 && t->fsuid != node->uid) {
+    if (t && !capability_has(t, CAP_FOWNER) && t->fsuid != node->uid) {
         vfs_close(node);
         if (base_owned) vfs_close(base_owned);
         return (uint64_t)-1;
@@ -1258,61 +1262,87 @@ static uint64_t sys_chmod(uint64_t pathname_ptr, uint64_t mode, uint64_t a2,
     return rc;
 }
 
+/* Return an owned node for metadata operations. Empty paths address the fd
+ * itself (including O_PATH handles); nofollow applies only to the final link. */
+static vfs_node_t *metadata_node_at(int dirfd, const char *path, unsigned flags,
+                                    int *error) {
+    struct thread *t = sched_get_current();
+    if (!path) { *error = -14; return NULL; }
+    if (!path[0] && !(flags & AT_EMPTY_PATH)) {
+        *error = -2;
+        return NULL;
+    }
+    vfs_node_t *base;
+    if (path[0] == '/' || dirfd == AT_FDCWD) {
+        base = path[0] == '/' ? fs_root
+               : (t && t->cwd_node ? t->cwd_node : fs_root);
+        vfs_node_ref(base);
+    } else {
+        base = fd_node_get(t, (uint64_t)(unsigned)dirfd);
+        if (!base) { *error = -9; return NULL; }
+    }
+    if (!path[0]) return base;
+    if ((base->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
+        vfs_close(base);
+        *error = -20;
+        return NULL;
+    }
+    vfs_node_t *node = (flags & AT_SYMLINK_NOFOLLOW)
+        ? vfs_resolve_symlink_node(base, path)
+        : vfs_resolve_path_at(base, path);
+    vfs_close(base);
+    if (!node) *error = -2;
+    return node;
+}
+
+static uint64_t chown_node(vfs_node_t *node, uint32_t owner, uint32_t group) {
+    struct thread *t = sched_get_current();
+    uint32_t uid = owner == UINT32_MAX ? node->uid : owner;
+    uint32_t gid = group == UINT32_MAX ? node->gid : group;
+    if (t && !capability_has(t, CAP_CHOWN) &&
+        (t->fsuid != node->uid || uid != node->uid || !vfs_in_group(gid)))
+        return (uint64_t)-1;
+    if ((uid != node->uid || gid != node->gid) && (node->mask & 06000) &&
+        (node->flags & FS_TYPE_MASK) != FS_SYMLINK)
+        if (vfs_chmod(node, (uint16_t)(node->mask & ~06000)) != 0)
+            return (uint64_t)-1;
+    return vfs_chown(node, uid, gid) == 0 ? 0 : (uint64_t)-1;
+}
+
+static uint64_t do_chownat(int dirfd, const char *path, uint32_t owner,
+                            uint32_t group, unsigned flags) {
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) return (uint64_t)-22;
+    int error = 0;
+    vfs_node_t *node = metadata_node_at(dirfd, path, flags, &error);
+    if (!node) return (uint64_t)error;
+    uint64_t result = chown_node(node, owner, group);
+    vfs_close(node);
+    return result;
+}
+
 static uint64_t sys_chown(uint64_t pathname_ptr, uint64_t owner,
                            uint64_t group, uint64_t a3, uint64_t a4,
                            uint64_t a5) {
     (void)a3; (void)a4; (void)a5;
-    const char *path = (const char *)pathname_ptr;
-    if (!path) return (uint64_t)-14;
-    struct thread *t = sched_get_current();
-    vfs_node_t *base  = fs_root;
-    vfs_node_t *base_owned = NULL;
-    if (t && path[0] != '/' && t->cwd_path[0]) {
-        base = vfs_resolve_path_at(fs_root, t->cwd_path);
-        if (!base) base = fs_root;
-        else base_owned = base;
-    }
-    vfs_node_t *node = vfs_resolve_path_at(base, path);
-    if (!node) {
-        if (base_owned) vfs_close(base_owned);
-        return (uint64_t)-2;
-    }
-    uint32_t uid = (owner == (uint64_t)-1) ? node->uid : (uint32_t)owner;
-    uint32_t gid = (group == (uint64_t)-1) ? node->gid : (uint32_t)group;
-    if (t && t->euid != 0) {
-        if (t->fsuid != node->uid || uid != node->uid || !vfs_in_group(gid)) {
-            vfs_close(node);
-            if (base_owned) vfs_close(base_owned);
-            return (uint64_t)-1;
-        }
-    }
-    if (uid != node->uid || gid != node->gid) node->mask &= ~06000;
-    int rc = vfs_chown(node, uid, gid) == 0 ? 0 : (uint64_t)-1;
-    vfs_close(node);
-    if (base_owned) vfs_close(base_owned);
-    return rc;
+    return do_chownat(AT_FDCWD, (const char *)pathname_ptr, owner, group, 0);
 }
 
 static uint64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group,
                             uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a3; (void)a4; (void)a5;
-    struct thread *t = sched_get_current();
-    if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
-    vfs_node_t *node = t->fds[fd];
-    uint32_t uid = (owner == (uint64_t)-1) ? node->uid : (uint32_t)owner;
-    uint32_t gid = (group == (uint64_t)-1) ? node->gid : (uint32_t)group;
-    if (t->euid != 0 &&
-        (t->fsuid != node->uid || uid != node->uid || !vfs_in_group(gid)))
-        return (uint64_t)-1;
-    if (uid != node->uid || gid != node->gid)
-        vfs_chmod(node, (uint16_t)(node->mask & ~06000));
-    return vfs_chown(node, uid, gid) == 0 ? 0 : (uint64_t)-1;
+    vfs_node_t *node = fd_node_get(sched_get_current(), fd);
+    if (!node) return (uint64_t)-9;
+    uint64_t result = chown_node(node, owner, group);
+    vfs_close(node);
+    return result;
 }
 
 static uint64_t sys_lchown(uint64_t pathname_ptr, uint64_t owner,
                             uint64_t group, uint64_t a3, uint64_t a4,
                             uint64_t a5) {
-    return sys_chown(pathname_ptr, owner, group, a3, a4, a5);
+    (void)a3; (void)a4; (void)a5;
+    return do_chownat(AT_FDCWD, (const char *)pathname_ptr, owner, group,
+                      AT_SYMLINK_NOFOLLOW);
 }
 
 static uint64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t a2,
@@ -1320,7 +1350,7 @@ static uint64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t a2,
     (void)a2; (void)a3; (void)a4; (void)a5;
     struct thread *t = sched_get_current();
     if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
-    if (t->euid != 0 && t->fsuid != t->fds[fd]->uid) return (uint64_t)-1;
+    if (!capability_has(t, CAP_FOWNER) && t->fsuid != t->fds[fd]->uid) return (uint64_t)-1;
     if (vfs_chmod(t->fds[fd], (uint16_t)mode) != 0) return (uint64_t)-1;
     return 0;
 }
@@ -1351,7 +1381,7 @@ static uint64_t sys_fchmodat(uint64_t dirfd, uint64_t pathname_ptr,
         if (base_owned) vfs_close(base_owned);
         return (uint64_t)-2;
     }
-    if (t && t->euid != 0 && t->fsuid != node->uid) {
+    if (t && !capability_has(t, CAP_FOWNER) && t->fsuid != node->uid) {
         vfs_close(node);
         if (base_owned) vfs_close(base_owned);
         return (uint64_t)-1;
@@ -1370,90 +1400,30 @@ static uint64_t sys_fchmodat2(uint64_t dirfd, uint64_t pathname_ptr,
                                uint64_t mode, uint64_t flags,
                                uint64_t a4, uint64_t a5) {
     (void)a4; (void)a5;
-    const char *path = (const char *)pathname_ptr;
-    if (!path) return (uint64_t)-14; // EFAULT
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) return (uint64_t)-22;
+    int error = 0;
+    vfs_node_t *node = metadata_node_at((int)dirfd,
+        (const char *)pathname_ptr, (unsigned)flags, &error);
+    if (!node) return (uint64_t)error;
     struct thread *t = sched_get_current();
-    vfs_node_t *base = fs_root;
-    vfs_node_t *base_owned = NULL;
-    if (path[0] != '/') {
-        if ((int)dirfd == AT_FDCWD) {
-            if (t && t->cwd_path[0]) {
-                base = vfs_resolve_path_at(fs_root, t->cwd_path);
-                if (!base) base = fs_root;
-                else base_owned = base;
-            }
-        } else {
-            if (dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd])) return (uint64_t)-9; // EBADF
-            base = t->fds[dirfd];
-        }
-    }
-    // If AT_SYMLINK_NOFOLLOW, resolve without following the final symlink component.
-    vfs_node_t *node;
-    if (flags & AT_SYMLINK_NOFOLLOW)
-        node = vfs_resolve_symlink_node(base, path);
+    uint64_t result;
+    if ((node->flags & FS_TYPE_MASK) == FS_SYMLINK)
+        result = (uint64_t)-95; // Linux does not change symlink permissions.
+    else if (t && !capability_has(t, CAP_FOWNER) && t->fsuid != node->uid)
+        result = (uint64_t)-1;
     else
-        node = vfs_resolve_path_at(base, path);
-    if (!node) {
-        if (base_owned) vfs_close(base_owned);
-        return (uint64_t)-2; // ENOENT
-    }
-    // Symlink nodes themselves have no permission bits on most filesystems;
-    // return EOPNOTSUPP (95) when the caller requests nofollow on a symlink.
-    if ((flags & AT_SYMLINK_NOFOLLOW) && (node->flags & FS_SYMLINK)) {
-        vfs_close(node);
-        if (base_owned) vfs_close(base_owned);
-        return (uint64_t)-95; // EOPNOTSUPP
-    }
-    if (t && t->euid != 0 && t->fsuid != node->uid) {
-        vfs_close(node);
-        if (base_owned) vfs_close(base_owned);
-        return (uint64_t)-1; // EPERM
-    }
-    int rc = vfs_chmod(node, (uint16_t)mode) == 0 ? 0 : (uint64_t)-1;
+        result = vfs_chmod(node, (uint16_t)mode) == 0 ? 0 : (uint64_t)-1;
     vfs_close(node);
-    if (base_owned) vfs_close(base_owned);
-    return rc;
+    return result;
 }
 
 static uint64_t sys_fchownat(uint64_t dirfd, uint64_t pathname_ptr,
                               uint64_t owner, uint64_t group, uint64_t flags,
                               uint64_t a5) {
-    (void)flags; (void)a5;
-    const char *path = (const char *)pathname_ptr;
-    if (!path) return (uint64_t)-14;
-    struct thread *t = sched_get_current();
-    vfs_node_t *base  = fs_root;
-    vfs_node_t *base_owned = NULL;
-    if (path[0] != '/') {
-        if ((int)dirfd == AT_FDCWD) {
-            if (t && t->cwd_path[0]) {
-                base = vfs_resolve_path_at(fs_root, t->cwd_path);
-                if (!base) base = fs_root;
-                else base_owned = base;
-            }
-        } else {
-            if (dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd])) return (uint64_t)-9;
-            base = t->fds[dirfd];
-        }
-    }
-    vfs_node_t *node = vfs_resolve_path_at(base, path);
-    if (!node) {
-        if (base_owned) vfs_close(base_owned);
-        return (uint64_t)-2;
-    }
-    uint32_t uid = (owner == (uint64_t)-1) ? node->uid : (uint32_t)owner;
-    uint32_t gid = (group == (uint64_t)-1) ? node->gid : (uint32_t)group;
-    if (t && t->euid != 0 &&
-        (t->fsuid != node->uid || uid != node->uid || !vfs_in_group(gid))) {
-        vfs_close(node);
-        if (base_owned) vfs_close(base_owned);
-        return (uint64_t)-1;
-    }
-    if (uid != node->uid || gid != node->gid) node->mask &= ~06000;
-    int rc = vfs_chown(node, uid, gid) == 0 ? 0 : (uint64_t)-1;
-    vfs_close(node);
-    if (base_owned) vfs_close(base_owned);
-    return rc;
+    (void)a5;
+    if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) return (uint64_t)-22;
+    return do_chownat((int)dirfd, (const char *)pathname_ptr, owner, group,
+                      (unsigned)flags);
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,29 +1567,28 @@ static uint64_t sys_fchdir(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4,
 }
 
 // ---------------------------------------------------------------------------
-// chroot: change the process root directory.
-// Full namei validation (EFAULT/ENOENT/ENOTDIR) is performed, but the actual
-// confinement is not implemented: pathname resolution is anchored at the
-// global fs_root with no per-thread root slot, so plumbing a private root
-// through every resolver is future work.  Returns EPERM for a valid
-// directory rather than pretending confinement happened.
+// chroot: change the task root used by every absolute and symlink lookup.
 // ---------------------------------------------------------------------------
 
 static uint64_t sys_chroot(uint64_t path_ptr, uint64_t a1, uint64_t a2,
                            uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
     if (!path_ptr) return (uint64_t)-14; // EFAULT
-    const char *path = (const char *)path_ptr;
-    if (!is_user_range(path, 1)) return (uint64_t)-14;
-    size_t len = strlen(path);
+    char path[512];
+    if (!is_user_range((void *)path_ptr, 1)) return (uint64_t)-14;
+    long copied = strncpy_from_user(path, (void *)path_ptr, sizeof(path));
+    if (copied < 0) return (uint64_t)-14;
+    if ((uint64_t)copied >= sizeof(path)) return (uint64_t)-36;
+    size_t len = (size_t)copied;
     if (len == 0) return (uint64_t)-2; // ENOENT
     if (len >= 4096) return (uint64_t)-36; // ENAMETOOLONG
-    vfs_node_t *node = vfs_resolve_path(path);
-    if (!node) return (uint64_t)-2; // ENOENT
-    bool is_dir = (node->flags & FS_TYPE_MASK) == FS_DIRECTORY;
+    struct thread *task = sched_get_current();
+    if (!capability_has(task, CAP_SYS_CHROOT)) return (uint64_t)-1;
+    vfs_node_t *node = vfs_resolve_path_at(task && task->cwd_node ? task->cwd_node : fs_root, path);
+    if (!node) return (uint64_t)-2;
+    int result = (node->flags & FS_TYPE_MASK) == FS_DIRECTORY ? vfs_namespace_chroot(node) : -20;
     vfs_close(node);
-    if (!is_dir) return (uint64_t)-20; // ENOTDIR
-    return 0; // Success for sandboxed runtimes (bwrap, flatpak)
+    return (uint64_t)result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,23 +1598,27 @@ static uint64_t sys_pivot_root(uint64_t new_root_ptr, uint64_t put_old_ptr,
                                uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
     if (!new_root_ptr || !put_old_ptr) return (uint64_t)-14; // EFAULT
-    const char *new_root = (const char *)new_root_ptr;
-    const char *put_old = (const char *)put_old_ptr;
-    if (!is_user_range(new_root, 1) || !is_user_range(put_old, 1)) return (uint64_t)-14;
+    char new_root[512], put_old[512];
+    if (!is_user_range((void *)new_root_ptr, 1) || !is_user_range((void *)put_old_ptr, 1)) return (uint64_t)-14;
+    long n = strncpy_from_user(new_root, (void *)new_root_ptr, sizeof(new_root));
+    if (n < 0) return (uint64_t)-14;
+    if ((uint64_t)n >= sizeof(new_root)) return (uint64_t)-36;
+    n = strncpy_from_user(put_old, (void *)put_old_ptr, sizeof(put_old));
+    if (n < 0) return (uint64_t)-14;
+    if ((uint64_t)n >= sizeof(put_old)) return (uint64_t)-36;
 
-    vfs_node_t *n_node = vfs_resolve_path(new_root);
+    struct thread *task = sched_get_current();
+    if (!capability_has(task, CAP_SYS_ADMIN)) return (uint64_t)-1;
+    vfs_node_t *base = task && task->cwd_node ? task->cwd_node : fs_root;
+    vfs_node_t *n_node = vfs_resolve_path_at(base, new_root);
     if (!n_node) return (uint64_t)-2;
-    bool n_dir = (n_node->flags & FS_TYPE_MASK) == FS_DIRECTORY;
-    vfs_close(n_node);
-    if (!n_dir) return (uint64_t)-20;
-
-    vfs_node_t *o_node = vfs_resolve_path(put_old);
-    if (!o_node) return (uint64_t)-2;
-    bool o_dir = (o_node->flags & FS_TYPE_MASK) == FS_DIRECTORY;
-    vfs_close(o_node);
-    if (!o_dir) return (uint64_t)-20;
-
-    return 0;
+    vfs_node_t *o_node = vfs_resolve_path_at(base, put_old);
+    if (!o_node) { vfs_close(n_node); return (uint64_t)-2; }
+    int result = ((n_node->flags & FS_TYPE_MASK) != FS_DIRECTORY ||
+                  (o_node->flags & FS_TYPE_MASK) != FS_DIRECTORY) ? -20
+                   : vfs_namespace_pivot(n_node, o_node);
+    vfs_close(n_node); vfs_close(o_node);
+    return (uint64_t)result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,8 +1645,13 @@ struct sys_utimbuf {
 
 static int vfs_set_node_times(vfs_node_t *node, uint32_t atime, uint32_t mtime) {
     if (!node) return -1;
+    if (vfs_mount_readonly(node)) return -30;
+    struct thread *task = sched_get_current();
+    if (task && task->fsuid != node->uid && !capability_has(task, CAP_FOWNER) && !vfs_access(node, 2)) return -13;
     node->atime = atime;
     node->mtime = mtime;
+    node = vfs_backing_node(node);
+    node->atime = atime; node->mtime = mtime;
 
     extern int ext2_statfs_impl(vfs_node_t *, struct statfs_buf *);
     extern int ext4_statfs_impl(vfs_node_t *, struct statfs_buf *);
@@ -1756,9 +1734,9 @@ static uint64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
         }
     }
 
-    vfs_set_node_times(node, atime, mtime);
+    int result = vfs_set_node_times(node, atime, mtime);
     vfs_close(node);
-    return 0;
+    return (uint64_t)result;
 }
 
 static uint64_t sys_futimesat(uint64_t dirfd, uint64_t pathname, uint64_t times,
@@ -1967,7 +1945,6 @@ void syscall_register_fs(void) {
     syscall_register(SYS_FSCONFIG,    sys_nosys_mount_api);
     syscall_register(SYS_FSMOUNT,     sys_nosys_mount_api);
     syscall_register(SYS_FSPICK,      sys_nosys_mount_api);
-    syscall_register(SYS_MOUNT_SETATTR, sys_nosys_mount_api);
     syscall_register(SYS_QUOTACTL,    sys_quotactl);
     syscall_register(SYS_QUOTACTL_FD, sys_quotactl_fd);
 }

@@ -11,13 +11,14 @@
 #include "../sched/sched.h"
 #include "../sched/wait.h"
 #include "socket.h"
+#include "arch/uaccess.h"
 #include <stdint.h>
 
 // Global Epoll Instance Table and Memory Pools
 static eventpoll_t *epoll_table[EPOLL_MAX_INSTANCES];
 static eventpoll_t epoll_pool[EPOLL_MAX_INSTANCES];
-static vfs_node_t epoll_vfs_pool[EPOLL_MAX_INSTANCES];
-static uint64_t epoll_free_bitmap = ~0ULL; // 1 = free, 0 = in use
+#define EPOLL_BITMAP_WORDS ((EPOLL_MAX_INSTANCES + 63) / 64)
+static uint64_t epoll_free_bitmap[EPOLL_BITMAP_WORDS]; // 1 = free
 static spinlock_t epoll_table_lock = SPINLOCK_INIT;
 
 /* Fallback full rescan of the watched set.  Event discovery is driven by
@@ -31,14 +32,20 @@ static spinlock_t epoll_table_lock = SPINLOCK_INIT;
 
 static int epoll_table_alloc(void) {
   spinlock_acquire(&epoll_table_lock);
-  if (epoll_free_bitmap == 0) {
+  for (unsigned word = 0; word < EPOLL_BITMAP_WORDS; word++) {
+    uint64_t free = epoll_free_bitmap[word];
+    if (!free)
+      continue;
+    int bit = __builtin_ctzll(free);
+    int idx = (int)(word * 64) + bit;
+    if (idx >= EPOLL_MAX_INSTANCES)
+      break;
+    epoll_free_bitmap[word] &= ~(1ULL << bit);
     spinlock_release(&epoll_table_lock);
-    return -1; // Table full
+    return idx;
   }
-  int idx = __builtin_ctzll(epoll_free_bitmap);
-  epoll_free_bitmap &= ~(1ULL << idx);
   spinlock_release(&epoll_table_lock);
-  return idx;
+  return -1; // Table full
 }
 
 static void epoll_table_free(int idx) {
@@ -47,7 +54,7 @@ static void epoll_table_free(int idx) {
 
   spinlock_acquire(&epoll_table_lock);
   epoll_table[idx] = NULL;
-  epoll_free_bitmap |= (1ULL << idx);
+  epoll_free_bitmap[idx / 64] |= (1ULL << (idx % 64));
   spinlock_release(&epoll_table_lock);
 }
 
@@ -63,13 +70,44 @@ static epitem_t *epitem_alloc(void) {
   INIT_LIST_HEAD(&epi->fllink);
   INIT_LIST_HEAD(&epi->ep_node_link);
   spinlock_init(&epi->lock);
+  epi->refcount = 1;
   return epi;
 }
 
 static void epitem_free(epitem_t *epi) {
   if (!epi)
     return;
-  kfree(epi);
+  if (__atomic_sub_fetch(&epi->refcount, 1, __ATOMIC_ACQ_REL) == 0) {
+    vfs_close(epi->node);
+    kfree(epi);
+  }
+}
+
+/* Snapshot pins survive dropping ep->lock for driver polling. The reaper
+ * releases them too if a killed thread never returns from its syscall. */
+static void epitem_pin(epitem_t *epi, unsigned slot) {
+  struct thread *t = sched_get_current();
+  __atomic_add_fetch(&epi->refcount, 1, __ATOMIC_RELAXED);
+  t->active_epoll_items[slot] = epi;
+}
+
+static void epitem_unpin(unsigned slot) {
+  struct thread *t = sched_get_current();
+  epitem_t *epi = t->active_epoll_items[slot];
+  t->active_epoll_items[slot] = NULL;
+  epitem_free(epi);
+}
+
+void epoll_release_thread(struct thread *t) {
+  if (!t) return;
+  for (unsigned i = 0; i < 64; i++) {
+    epitem_t *epi = t->active_epoll_items[i];
+    t->active_epoll_items[i] = NULL;
+    epitem_free(epi);
+  }
+  vfs_node_t *node = t->active_epoll_node;
+  t->active_epoll_node = NULL;
+  vfs_close(node);
 }
 
 // Epoll Instance Creation/Destruction
@@ -114,7 +152,9 @@ eventpoll_t *epoll_create(void) {
   spinlock_init(&ep->lock);
   ep->refcount = 1;
 
+  spinlock_acquire(&epoll_table_lock);
   epoll_table[idx] = ep;
+  spinlock_release(&epoll_table_lock);
 
   return ep;
 }
@@ -142,18 +182,18 @@ void epoll_destroy(eventpoll_t *ep) {
     for (int i = 0; i < hi; i++) {
       epitem_t *epi = ep->items[i];
       if (epi) {
+        spinlock_acquire(&epi->node->ep_lock);
+        spinlock_acquire(&ep->lock);
+        epi->removed = true;
         if (epi->on_ready_list) {
           list_del(&epi->rdllink);
           epi->on_ready_list = false;
         }
-        if (epi->node) {
-          spinlock_acquire(&epi->node->ep_lock);
-          list_del(&epi->ep_node_link);
-          spinlock_release(&epi->node->ep_lock);
-          vfs_close(epi->node);
-        }
-        epitem_free(epi);
+        list_del(&epi->ep_node_link);
         ep->items[i] = NULL;
+        spinlock_release(&ep->lock);
+        spinlock_release(&epi->node->ep_lock);
+        epitem_free(epi);
       }
     }
     ep->item_count = 0;
@@ -187,10 +227,16 @@ static uint32_t ep_check_events(epitem_t *epi) {
   if (!epi || !epi->node)
     return 0;
 
+  spinlock_acquire(&epi->ep->lock);
+  if (epi->removed || epi->oneshot_disabled) {
+    spinlock_release(&epi->ep->lock);
+    return 0;
+  }
   // Get the registered events, excluding modifier flags
   uint32_t watch_mask =
       epi->registered_events &
       ~(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLWAKEUP);
+  spinlock_release(&epi->ep->lock);
   /* Linux reports ERR/HUP unconditionally; RDHUP requires an explicit
    * subscription, just like IN/OUT. Xorg treats unsolicited bits as an
    * error and closes the client connection. */
@@ -216,6 +262,10 @@ static uint32_t ep_check_events(epitem_t *epi) {
 static void ep_add_to_ready_list(eventpoll_t *ep, epitem_t *epi) {
   spinlock_acquire(&ep->lock);
 
+  if (epi->removed || epi->oneshot_disabled) {
+    spinlock_release(&ep->lock);
+    return;
+  }
   bool was_empty = (ep->rdllist_count == 0);
   if (!epi->on_ready_list) {
     list_add_tail(&epi->rdllink, &ep->rdllist);
@@ -244,185 +294,99 @@ static void ep_add_to_ready_list(eventpoll_t *ep, epitem_t *epi) {
   }
 }
 
-// Helper: Remove item from ready list
-
-static void ep_remove_from_ready_list(eventpoll_t *ep, epitem_t *epi) {
-  if (!epi->on_ready_list)
-    return;
-
+// Membership changes use node->ep_lock -> ep->lock, matching notifiers.
+int epoll_ctl_del(eventpoll_t *ep, int fd) {
+  if (!ep) return -22;
+  if (fd < 0 || fd >= EPOLL_MAX_WATCHED) return -9;
   spinlock_acquire(&ep->lock);
-
-  if (epi->on_ready_list) {
-    list_del(&epi->rdllink);
-    epi->on_ready_list = false;
-    ep->rdllist_count--;
-  }
-
+  epitem_t *epi = ep->items[fd];
+  if (epi) epitem_pin(epi, 0);
   spinlock_release(&ep->lock);
-}
-
-// epoll_ctl Operations
-
-int epoll_ctl_add(eventpoll_t *ep, int fd, struct epoll_event *event) {
-  if (!ep || !event)
-    return -22; // EINVAL
-
-  if (fd < 0 || fd >= EPOLL_MAX_WATCHED)
-    return -9; // EBADF
-
-  // Get current thread and VFS node for FD
-  struct thread *t = sched_get_current();
-  if (!t)
-    return -1;
-
-  if (fd >= MAX_FDS || !t->fds[fd]) {
-    return -9; // EBADF
-  }
-
-  vfs_node_t *node = t->fds[fd];
-
-  // Check if already registered for the same node
-  if (ep->items[fd]) {
-    epitem_t *old = ep->items[fd];
-    if (old->node == node) {
-      return -17; // EEXIST - same socket already registered
-    }
-    // Different node - fd was reused, remove stale item
-    ep_remove_from_ready_list(ep, old);
-    if (old->node) {
-      spinlock_acquire(&old->node->ep_lock);
-      list_del(&old->ep_node_link);
-      spinlock_release(&old->node->ep_lock);
-    }
-    spinlock_acquire(&ep->lock);
+  if (!epi) return -2;
+  spinlock_acquire(&epi->node->ep_lock);
+  spinlock_acquire(&ep->lock);
+  bool owned = ep->items[fd] == epi && !epi->removed;
+  if (owned) {
+    epi->removed = true;
     ep->items[fd] = NULL;
     ep->item_count--;
-    spinlock_release(&ep->lock);
-    vfs_close(old->node);
-    epitem_free(old);
+    if (epi->on_ready_list) {
+      list_del(&epi->rdllink);
+      epi->on_ready_list = false;
+      ep->rdllist_count--;
+    }
+    list_del(&epi->ep_node_link);
   }
+  spinlock_release(&ep->lock);
+  spinlock_release(&epi->node->ep_lock);
+  if (owned) epitem_free(epi); // drop table ownership, then our snapshot
+  epitem_unpin(0);
+  return owned ? 0 : -2;
+}
 
-  // Create epitem
+int epoll_ctl_add(eventpoll_t *ep, int fd, struct epoll_event *event) {
+  if (!ep || !event) return -22;
+  struct thread *t = sched_get_current();
+  if (!t || fd < 0 || fd >= MAX_FDS || fd >= EPOLL_MAX_WATCHED) return -9;
+  spinlock_acquire(&t->files->lock);
+  vfs_node_t *node = t->fds[fd];
+  if (node && node != (vfs_node_t *)-1) vfs_node_ref(node);
+  else node = NULL;
+  spinlock_release(&t->files->lock);
+  if (!node) return -9;
+  if (node == ep->vfs_node) { vfs_close(node); return -22; }
   epitem_t *epi = epitem_alloc();
-  if (!epi) {
-    return -12; // ENOMEM
-  }
-
-  epi->fd = fd;
+  if (!epi) { vfs_close(node); return -12; }
   epi->node = node;
-  epi->event = *event;
+  epi->fd = fd;
   epi->ep = ep;
-  epi->last_events = 0;
-  epi->on_ready_list = false;
+  epi->event = *event;
   epi->oneshot = (event->events & EPOLLONESHOT) != 0;
-  epi->oneshot_disabled = false;
   epi->exclusive = (event->events & EPOLLEXCLUSIVE) != 0;
   epi->registered_events = event->events;
 
-  // Keep the watched object alive until DEL or epoll destruction.
-  vfs_open(node);
-
-  // Add to epoll instance
+  // Preserve the existing array's fd-reuse replacement behavior.
   spinlock_acquire(&ep->lock);
+  bool stale = ep->items[fd] && ep->items[fd]->node != node;
+  spinlock_release(&ep->lock);
+  if (stale) epoll_ctl_del(ep, fd);
+
+  spinlock_acquire(&node->ep_lock);
+  spinlock_acquire(&ep->lock);
+  if (ep->items[fd]) {
+    spinlock_release(&ep->lock);
+    spinlock_release(&node->ep_lock);
+    epitem_free(epi);
+    return -17;
+  }
   ep->items[fd] = epi;
   ep->item_count++;
-  if (fd >= ep->items_high)
-    ep->items_high = fd + 1;
-  spinlock_release(&ep->lock);
-
-  // Fast notification link
-  spinlock_acquire(&node->ep_lock);
-  if (node->ep_watchers.next == NULL) {
-    INIT_LIST_HEAD(&node->ep_watchers);
-  }
+  if (fd >= ep->items_high) ep->items_high = fd + 1;
   list_add_tail(&epi->ep_node_link, &node->ep_watchers);
-  spinlock_release(&node->ep_lock);
-
-  // Check for immediate events. For level-triggered mode this is the normal
-  // path. For edge-triggered mode, Linux also fires an initial synthetic edge
-  // on EPOLL_CTL_ADD if the fd already has data — without this, any data
-  // queued before the fd was added to epoll would be silently lost.
-  uint32_t cur_events = ep_check_events(epi);
-  if (cur_events) {
-    epi->last_events = cur_events;
-    ep_add_to_ready_list(ep, epi);
-  }
-
-  return 0;
-}
-
-int epoll_ctl_del(eventpoll_t *ep, int fd) {
-  if (!ep)
-    return -22; // EINVAL
-
-  if (fd < 0 || fd >= EPOLL_MAX_WATCHED)
-    return -9; // EBADF
-
-  epitem_t *epi = ep->items[fd];
-  if (!epi)
-    return -2; // ENOENT
-
-  // Remove from ready list if present
-  ep_remove_from_ready_list(ep, epi);
-
-  // Remove from epoll instance
-  spinlock_acquire(&ep->lock);
-  ep->items[fd] = NULL;
-  ep->item_count--;
+  epitem_pin(epi, 0);
   spinlock_release(&ep->lock);
-
-  // Unlink from node
-  if (epi->node) {
-    spinlock_acquire(&epi->node->ep_lock);
-    list_del(&epi->ep_node_link);
-    spinlock_release(&epi->node->ep_lock);
-  }
-
-  // Release the watched object reference, then free the item.
-  vfs_close(epi->node);
-  epitem_free(epi);
-
+  spinlock_release(&node->ep_lock);
+  if (ep_check_events(epi)) ep_add_to_ready_list(ep, epi);
+  epitem_unpin(0);
   return 0;
 }
 
 int epoll_ctl_mod(eventpoll_t *ep, int fd, struct epoll_event *event) {
-  if (!ep || !event)
-    return -22; // EINVAL
-
-  if (fd < 0 || fd >= EPOLL_MAX_WATCHED)
-    return -9; // EBADF
-
+  if (!ep || !event) return -22;
+  if (fd < 0 || fd >= EPOLL_MAX_WATCHED) return -9;
+  spinlock_acquire(&ep->lock);
   epitem_t *epi = ep->items[fd];
-  if (!epi)
-    return -2; // ENOENT
-
-  // Update event mask
-  spinlock_acquire(&epi->lock);
+  if (!epi) { spinlock_release(&ep->lock); return -2; }
+  epitem_pin(epi, 0);
   epi->event = *event;
-  /* Drop any cached edge from before the MOD: the registered mask is about
-   * to change, so the ep_check_events() below must poll under the new mask
-   * instead of consuming a mask computed against the old one. */
-  __atomic_store_n(&epi->ready_events, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&epi->ready_events, 0, __ATOMIC_RELAXED);
   epi->oneshot = (event->events & EPOLLONESHOT) != 0;
   epi->exclusive = (event->events & EPOLLEXCLUSIVE) != 0;
-  epi->registered_events = event->events; // Always update registered_events
-
-  // Reset oneshot disabled state when re-arming via EPOLL_CTL_MOD
-  if (epi->oneshot) {
-    epi->oneshot_disabled = false;
-  }
-  spinlock_release(&epi->lock);
-
-  // Remove from ready list and re-check
-  ep_remove_from_ready_list(ep, epi);
-
-  // Re-check events
-  uint32_t events = ep_check_events(epi);
-  if (events) {
-    epi->last_events = events;
-    ep_add_to_ready_list(ep, epi);
-  }
-
+  epi->registered_events = event->events;
+  epi->oneshot_disabled = false;
+  spinlock_release(&ep->lock);
+  if (ep_check_events(epi)) ep_add_to_ready_list(ep, epi);
+  epitem_unpin(0);
   return 0;
 }
 
@@ -462,11 +426,10 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
     int cand_count = 0;
 
     spinlock_acquire(&ep->lock);
-    struct list_head *pos, *n;
-    list_for_each_safe(pos, n, &ep->rdllist) {
-      if (cand_count >= 64 || cand_count >= maxevents)
-        break;
-      epitem_t *epi = list_entry(pos, epitem_t, rdllink);
+    while (!list_empty(&ep->rdllist) && cand_count < 64 &&
+           cand_count < maxevents) {
+      epitem_t *epi = list_first_entry(&ep->rdllist, epitem_t, rdllink);
+      epitem_pin(epi, cand_count);
       list_del(&epi->rdllink);
       epi->on_ready_list = false;
       ep->rdllist_count--;
@@ -481,10 +444,13 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
         continue;
 
       uint32_t current_events = ep_check_events(epi);
-      if (current_events && returned < maxevents) {
-        events[returned].events = current_events;
-        events[returned].data.u64 = epi->event.data.u64;
-        returned++;
+      spinlock_acquire(&ep->lock);
+      struct epoll_event result = epi->event;
+      current_events &= epi->registered_events | EPOLLERR | EPOLLHUP;
+      bool deliver = !epi->removed && !epi->oneshot_disabled && current_events;
+      bool requeue = false;
+      if (deliver && returned < maxevents) {
+        result.events = current_events;
 
         if (epi->event.events & EPOLLET) {
           epi->last_events = current_events &
@@ -495,16 +461,27 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
            * the data stays unread.  This is the level-triggered re-report path
            * now that the full rescan in step 4 is rate-limited.  Called from
            * outside ep->lock; the helper takes it and wakes co-waiters. */
-          ep_add_to_ready_list(ep, epi);
+          requeue = true;
         }
         if (epi->oneshot) {
           epi->oneshot_disabled = true;
           epi->registered_events = 0;
         }
       }
+      spinlock_release(&ep->lock);
+      if (deliver) {
+        if (copy_to_user(&events[returned], &result, sizeof(result))) {
+          returned = -14;
+          for (int j = i; j < cand_count; j++) epitem_unpin(j);
+          break;
+        }
+        returned++;
+      }
+      if (requeue) ep_add_to_ready_list(ep, epi);
+      epitem_unpin(i);
     }
 
-    if (returned > 0)
+    if (returned != 0)
       break;
 
     // 3. Immediate return on non-blocking poll
@@ -522,24 +499,16 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
         scan_now >= __atomic_load_n(&ep->next_scan_ticks, __ATOMIC_RELAXED)) {
       int items_high = __atomic_load_n(&ep->items_high, __ATOMIC_RELAXED);
       for (int _i = 0; _i < items_high; _i++) {
+        spinlock_acquire(&ep->lock);
         epitem_t *_epi = ep->items[_i];
-        if (!_epi || _epi->on_ready_list)
-          continue;
-        if (_epi->oneshot && _epi->oneshot_disabled)
-          continue;
-        uint32_t _ev = ep_check_events(_epi);
-        if (_ev) {
-          spinlock_acquire(&ep->lock);
-          if (!_epi->on_ready_list) {
-            _epi->last_events = _ev;
-            /* Delivery revalidates readiness: the fd can be drained between
-             * this rescan and collecting the candidate on the next pass. */
-            list_add_tail(&_epi->rdllink, &ep->rdllist);
-            _epi->on_ready_list = true;
-            ep->rdllist_count++;
-          }
+        if (!_epi || _epi->on_ready_list || _epi->oneshot_disabled) {
           spinlock_release(&ep->lock);
+          continue;
         }
+        epitem_pin(_epi, 0);
+        spinlock_release(&ep->lock);
+        if (ep_check_events(_epi)) ep_add_to_ready_list(ep, _epi);
+        epitem_unpin(0);
       }
       __atomic_store_n(&ep->next_scan_ticks, scan_now + EPOLL_RESCAN_INTERVAL_MS,
                        __ATOMIC_RELAXED);
@@ -612,7 +581,7 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
 
 // Epoll FD Management
 
-int epoll_alloc_fd(eventpoll_t *ep) {
+int epoll_alloc_fd(eventpoll_t *ep, uint64_t flags) {
   struct thread *t = sched_get_current();
   if (!t)
     return -1;
@@ -621,30 +590,35 @@ int epoll_alloc_fd(eventpoll_t *ep) {
   if (fd < 0)
     return -24; // EMFILE
 
-  int idx = (int)(ep - epoll_pool);
-  vfs_node_t *node = &epoll_vfs_pool[idx];
-
-  // Fast initialize pre-allocated VFS node
-  node->name[0] = '\0';
-  node->flags = FS_EPOLL | FS_PERSISTENT;
+  /* vfs_close still accesses the node after its close callback returns the
+   * epoll slot to the pool. Give each incarnation its own node. */
+  vfs_node_t *node = kmalloc(sizeof(*node));
+  if (!node) {
+    fd_release_reserved(t, fd);
+    return -12;
+  }
+  vfs_node_init(node);
+  node->flags = FS_EPOLL;
   node->inode = (uint32_t)(uint64_t)ep;
   node->device = ep;
   node->wait_queue = &ep->wq;
-  node->refcount = 1;
-  INIT_LIST_HEAD(&node->ep_watchers);
-  spinlock_init(&node->ep_lock);
 
   // Set epoll VFS operations
   node->read = epoll_vfs_read;
   node->write = epoll_vfs_write;
-  node->open = epoll_vfs_open;
+  /* One epoll reference belongs to the node. dup/fork share VFS refs;
+   * adding an epoll ref on each open leaks it at the last VFS close. */
   node->close = epoll_vfs_close;
   node->poll = epoll_vfs_poll;
 
   ep->fd = fd;
   ep->vfs_node = node; // Store for nested epoll propagation
-  t->fds[fd] = node;
+  spinlock_acquire(&t->files->lock);
   t->fd_offsets[fd] = 0;
+  t->fd_flags[fd] = (flags & EPOLL_CLOEXEC) ? (1ULL << 24) : 0;
+  t->fds[fd] = node;
+  fd_path_set(t, fd, "anon_inode:[eventpoll]");
+  spinlock_release(&t->files->lock);
 
   return fd;
 }
@@ -657,13 +631,16 @@ eventpoll_t *epoll_from_fd(int fd) {
   if (fd < 0 || fd >= MAX_FDS)
     return NULL;
 
+  spinlock_acquire(&t->files->lock);
   vfs_node_t *node = t->fds[fd];
-  if (!node)
+  if (!node || node == (vfs_node_t *)-1 ||
+      (node->flags & FS_TYPE_MASK) != FS_EPOLL) {
+    spinlock_release(&t->files->lock);
     return NULL;
-
-  if ((node->flags & FS_TYPE_MASK) != FS_EPOLL)
-    return NULL;
-
+  }
+  vfs_node_ref(node);
+  t->active_epoll_node = node;
+  spinlock_release(&t->files->lock);
   return (eventpoll_t *)node->device;
 }
 
@@ -687,8 +664,6 @@ int epoll_close_fd(int fd) {
     return -22; // EINVAL
   }
 
-  eventpoll_t *ep = (eventpoll_t *)node->device;
-
   // Clear FD
   t->fds[fd] = NULL;
   t->fd_offsets[fd] = 0;
@@ -701,11 +676,6 @@ int epoll_close_fd(int fd) {
   // Release epoll reference through VFS close
   if (node) {
     vfs_close(node);
-  }
-
-  // Release the initial reference from epoll_create()
-  if (ep) {
-    epoll_put(ep);
   }
 
   return 0;
@@ -733,20 +703,16 @@ uint32_t epoll_vfs_write(struct vfs_node *node, uint32_t offset, uint32_t size,
   return 0;
 }
 
-void epoll_vfs_open(struct vfs_node *node) {
-  if (!node)
-    return;
-  eventpoll_t *ep = (eventpoll_t *)node->device;
-  if (ep)
-    epoll_get(ep);
-}
-
 void epoll_vfs_close(struct vfs_node *node) {
   if (!node)
     return;
   eventpoll_t *ep = (eventpoll_t *)node->device;
-  if (ep)
+  node->device = NULL;
+  node->wait_queue = NULL;
+  if (ep) {
+    ep->vfs_node = NULL;
     epoll_put(ep);
+  }
 }
 
 int epoll_vfs_poll(struct vfs_node *node, int events) {
@@ -828,35 +794,33 @@ void epoll_notify_socket(int fd, uint32_t events) {
 
   /* Walk only live instances: the free-bitmap marks in-use slots (1 = free),
    * so a system with a handful of epoll instances open does a handful of
-   * iterations instead of unconditionally probing all 64.  The bitmap and
+   * iterations instead of probing every slot.  The bitmap and
    * epoll_table[] are read racily, exactly as the old loop did - a slot
    * missed in this instant is covered by epoll_wait's rate-limited rescan. */
-  uint64_t live = ~__atomic_load_n(&epoll_free_bitmap, __ATOMIC_RELAXED);
-  while (live) {
-    int i = __builtin_ctzll(live);
-    live &= live - 1;
-    eventpoll_t *ep = epoll_table[i];
-    if (!ep)
-      continue;
-
-    // Find epitem for this FD
-    epitem_t *epi = ep->items[fd];
-    if (!epi)
-      continue;
-
-    // Skip disabled oneshot items
-    if (epi->oneshot && epi->oneshot_disabled)
-      continue;
-
-    uint32_t mask =
-        events & (epi->registered_events | EPOLLERR | EPOLLHUP);
-
-    if (mask) {
-      // Record a candidate notification, as in epoll_notify_event().
-      __atomic_fetch_or(&epi->ready_events, mask, __ATOMIC_RELAXED);
-      // ep_add_to_ready_list handles both adding to the ready list AND
-      // waking up waiters atomically under ep->lock.
-      ep_add_to_ready_list(ep, epi);
+  for (unsigned word = 0; word < EPOLL_BITMAP_WORDS; word++) {
+    uint64_t live = ~__atomic_load_n(&epoll_free_bitmap[word], __ATOMIC_RELAXED);
+    while (live) {
+      int i = (int)(word * 64) + __builtin_ctzll(live);
+      live &= live - 1;
+      if (i >= EPOLL_MAX_INSTANCES)
+        continue;
+      spinlock_acquire(&epoll_table_lock);
+      eventpoll_t *ep = epoll_table[i];
+      uint64_t refs = ep ? __atomic_load_n(&ep->refcount, __ATOMIC_RELAXED) : 0;
+      while (refs && !__atomic_compare_exchange_n(&ep->refcount, &refs, refs + 1,
+                 false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {}
+      spinlock_release(&epoll_table_lock);
+      if (!refs) continue; // destruction already owns this slot
+      spinlock_acquire(&ep->lock);
+      epitem_t *epi = ep->items[fd];
+      if (epi) __atomic_add_fetch(&epi->refcount, 1, __ATOMIC_RELAXED);
+      spinlock_release(&ep->lock);
+      if (epi) {
+        __atomic_fetch_or(&epi->ready_events, events, __ATOMIC_RELAXED);
+        ep_add_to_ready_list(ep, epi);
+        epitem_free(epi);
+      }
+      epoll_put(ep);
     }
   }
 }
@@ -866,8 +830,7 @@ void epoll_notify_socket(int fd, uint32_t events) {
 void epoll_init(void) {
   memset(epoll_table, 0, sizeof(epoll_table));
   memset(epoll_pool, 0, sizeof(epoll_pool));
-  memset(epoll_vfs_pool, 0, sizeof(epoll_vfs_pool));
-  epoll_free_bitmap = ~0ULL;
+  memset(epoll_free_bitmap, 0xff, sizeof(epoll_free_bitmap));
   spinlock_init(&epoll_table_lock);
 
   klog_puts("[OK] Epoll subsystem initialized (max instances: ");

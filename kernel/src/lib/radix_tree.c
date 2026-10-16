@@ -8,6 +8,9 @@
 #define RADIX_EINVAL 22
 
 struct asc_radix_tree_node {
+  /* First two words: the deferred-free slot documented in radix_tree.h.
+   * First so a hook can queue the node by its address. */
+  struct radix_tree_defer_slot defer;
   void *slots[RADIX_TREE_SLOTS];
   uint8_t count;
 };
@@ -33,6 +36,12 @@ static struct asc_radix_tree_node *radix_node_alloc(struct radix_tree *tree) {
 
 static void radix_node_free(struct radix_tree *tree,
                             struct asc_radix_tree_node *node) {
+  if (tree->deferred_free) {
+    /* The node is already unlinked, but a lockless reader may still be
+     * traversing it; the hook keeps its memory alive until a grace period. */
+    tree->deferred_free(node, tree->deferred_free_context);
+    return;
+  }
   tree->allocator.free(node, tree->allocator.context);
 }
 
@@ -66,6 +75,20 @@ static void radix_reset_corrupt_tree(struct radix_tree *tree) {
   tree->height = 0;
   tree->entries = 0;
   tree->nodes = 0;
+}
+
+/* Mutation critical section.  tree->seq is odd for exactly the span in which
+ * published fields may change: a lockless reader that observes an even seq on
+ * both sides of its traversal knows no mutation overlapped it, because every
+ * mutation's begin/end bumps run under the same tree->lock. */
+static inline void radix_mut_lock(struct radix_tree *tree) {
+  spinlock_acquire(&tree->lock);
+  __atomic_add_fetch(&tree->seq, 1, __ATOMIC_RELEASE);
+}
+
+static inline void radix_mut_unlock(struct radix_tree *tree) {
+  __atomic_add_fetch(&tree->seq, 1, __ATOMIC_RELEASE);
+  spinlock_release(&tree->lock);
 }
 
 void asc_radix_tree_init_with_allocator(
@@ -110,6 +133,59 @@ void *asc_radix_tree_lookup(const struct radix_tree *tree, uint64_t index) {
   return value;
 }
 
+void asc_radix_tree_set_deferred_free(struct radix_tree *tree,
+                                      void (*free_fn)(void *node,
+                                                      void *context),
+                                      void *context) {
+  if (!tree)
+    return;
+  tree->deferred_free = free_fn;
+  tree->deferred_free_context = context;
+}
+
+void *asc_radix_tree_lookup_lockless(const struct radix_tree *tree,
+                                     uint64_t index, bool *stable) {
+  *stable = false;
+  if (!tree)
+    return NULL;
+
+  uint32_t s1 = __atomic_load_n(&tree->seq, __ATOMIC_ACQUIRE);
+  if (s1 & 1u) /* A mutation is in flight. */
+    return NULL;
+
+  const struct asc_radix_tree_node *node =
+      __atomic_load_n(&tree->root, __ATOMIC_ACQUIRE);
+  uint8_t height = __atomic_load_n(&tree->height, __ATOMIC_ACQUIRE);
+  void *value = NULL;
+
+  if (node && (height == 0 || height > RADIX_TREE_MAX_HEIGHT ||
+               !radix_ptr_is_node(node))) {
+    /* Corrupt geometry: only the locked path may reset it. */
+    return NULL;
+  }
+  /* The same walk as radix_lookup_locked(), minus the lock; deferred node
+   * reclamation keeps every pointer a stale traversal can reach alive until
+   * the reader's grace period ends. */
+  if (node && radix_required_height(index) <= height) {
+    for (uint8_t level = height - 1; level > 0; level--) {
+      node = __atomic_load_n(&node->slots[radix_slot(index, level)],
+                             __ATOMIC_RELAXED);
+      if (!radix_ptr_is_node(node)) {
+        node = NULL;
+        break;
+      }
+    }
+    if (node)
+      value = __atomic_load_n(&node->slots[radix_slot(index, 0)],
+                              __ATOMIC_RELAXED);
+  }
+
+  if (s1 != __atomic_load_n(&tree->seq, __ATOMIC_ACQUIRE))
+    return NULL;
+  *stable = true;
+  return value;
+}
+
 static void radix_free_allocated(struct radix_tree *tree,
                                  struct asc_radix_tree_node **nodes,
                                  unsigned count) {
@@ -120,11 +196,11 @@ static void radix_free_allocated(struct radix_tree *tree,
 int asc_radix_tree_insert(struct radix_tree *tree, uint64_t index, void *value) {
   if (!tree || !value)
     return -RADIX_EINVAL;
-  spinlock_acquire(&tree->lock);
+  radix_mut_lock(tree);
   if (tree->root && !radix_ptr_is_node(tree->root))
     radix_reset_corrupt_tree(tree);
   if (radix_lookup_locked(tree, index)) {
-    spinlock_release(&tree->lock);
+    radix_mut_unlock(tree);
     return -RADIX_EEXIST;
   }
 
@@ -161,7 +237,7 @@ int asc_radix_tree_insert(struct radix_tree *tree, uint64_t index, void *value) 
       node->slots[slot] = value;
       node->count++;
       tree->entries++;
-      spinlock_release(&tree->lock);
+      radix_mut_unlock(tree);
       return 0;
     }
   }
@@ -171,7 +247,7 @@ int asc_radix_tree_insert(struct radix_tree *tree, uint64_t index, void *value) 
     fresh[fresh_count] = radix_node_alloc(tree);
     if (!fresh[fresh_count]) {
       radix_free_allocated(tree, fresh, fresh_count);
-      spinlock_release(&tree->lock);
+      radix_mut_unlock(tree);
       return -RADIX_ENOMEM;
     }
   }
@@ -223,24 +299,24 @@ int asc_radix_tree_insert(struct radix_tree *tree, uint64_t index, void *value) 
   }
   tree->nodes += total;
   tree->entries++;
-  spinlock_release(&tree->lock);
+  radix_mut_unlock(tree);
   return 0;
 }
 
 void *asc_radix_tree_replace(struct radix_tree *tree, uint64_t index, void *value) {
   if (!tree || !value)
     return NULL;
-  spinlock_acquire(&tree->lock);
+  radix_mut_lock(tree);
   if (!radix_ptr_is_node(tree->root) ||
       radix_required_height(index) > tree->height) {
-    spinlock_release(&tree->lock);
+    radix_mut_unlock(tree);
     return NULL;
   }
   struct asc_radix_tree_node *node = tree->root;
   for (uint8_t level = tree->height - 1; level > 0; level--) {
     node = node->slots[radix_slot(index, level)];
     if (!radix_ptr_is_node(node)) {
-      spinlock_release(&tree->lock);
+      radix_mut_unlock(tree);
       return NULL;
     }
   }
@@ -248,19 +324,19 @@ void *asc_radix_tree_replace(struct radix_tree *tree, uint64_t index, void *valu
   void *old = node->slots[slot];
   if (old)
     node->slots[slot] = value;
-  spinlock_release(&tree->lock);
+  radix_mut_unlock(tree);
   return old;
 }
 
 void *asc_radix_tree_delete(struct radix_tree *tree, uint64_t index) {
   if (!tree)
     return NULL;
-  spinlock_acquire(&tree->lock);
+  radix_mut_lock(tree);
   if (tree->root && !radix_ptr_is_node(tree->root))
     radix_reset_corrupt_tree(tree);
   if (!radix_ptr_is_node(tree->root) ||
       radix_required_height(index) > tree->height) {
-    spinlock_release(&tree->lock);
+    radix_mut_unlock(tree);
     return NULL;
   }
   struct asc_radix_tree_node *path[RADIX_TREE_MAX_HEIGHT];
@@ -272,7 +348,7 @@ void *asc_radix_tree_delete(struct radix_tree *tree, uint64_t index) {
     slots[level] = slot;
     node = node->slots[slot];
     if (!radix_ptr_is_node(node)) {
-      spinlock_release(&tree->lock);
+      radix_mut_unlock(tree);
       return NULL;
     }
     path[level - 1] = node;
@@ -280,7 +356,7 @@ void *asc_radix_tree_delete(struct radix_tree *tree, uint64_t index) {
   unsigned leaf_slot = radix_slot(index, 0);
   void *old = node->slots[leaf_slot];
   if (!old) {
-    spinlock_release(&tree->lock);
+    radix_mut_unlock(tree);
     return NULL;
   }
   node->slots[leaf_slot] = NULL;
@@ -309,7 +385,7 @@ void *asc_radix_tree_delete(struct radix_tree *tree, uint64_t index) {
     tree->height = 0;
     tree->nodes--;
   }
-  spinlock_release(&tree->lock);
+  radix_mut_unlock(tree);
   return old;
 }
 
@@ -335,7 +411,7 @@ void asc_radix_tree_destroy(struct radix_tree *tree,
                         void (*release)(void *value)) {
   if (!tree)
     return;
-  spinlock_acquire(&tree->lock);
+  radix_mut_lock(tree);
   if (tree->root && !radix_ptr_is_node(tree->root))
     radix_reset_corrupt_tree(tree);
   if (tree->root)
@@ -344,7 +420,7 @@ void asc_radix_tree_destroy(struct radix_tree *tree,
   tree->height = 0;
   tree->nodes = 0;
   tree->entries = 0;
-  spinlock_release(&tree->lock);
+  radix_mut_unlock(tree);
 }
 
 static bool radix_iter_node(struct asc_radix_tree_node *node, uint8_t level,

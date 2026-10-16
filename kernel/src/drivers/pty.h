@@ -47,6 +47,8 @@
 struct vfs_node;
 
 typedef struct pty_pair {
+  void *devpts_instance; /* NULL for the initial /dev/pts instance. */
+  uint32_t devpts_uid, devpts_gid;
   int index;            // PTY index (0-15)
   bool allocated;       // Is this pair in use?
   bool locked;          // Is slave locked (cannot be opened)?
@@ -125,5 +127,6 @@ bool pty_slave_can_read(pty_pair_t *pty);
 
 // Register /dev/ptmx and /dev/pts directory
 void pty_register_devices(void);
+struct vfs_node *devpts_create_root(void);
 
 #endif

@@ -56,6 +56,7 @@ typedef struct tmpfs_sb {
 void        tmpfs_mount_at(const char *path);
 void        tmpfs_mount_at_sized(const char *path, uint64_t max_bytes, uint64_t max_inodes);
 vfs_node_t *tmpfs_create_root(tmpfs_sb_t *sb);
+vfs_node_t *tmpfs_create_private_root(void);
 
 /* Cross-directory rename within a single tmpfs instance (both parents must
  * be directories of the same mount).  Directories themselves are refused

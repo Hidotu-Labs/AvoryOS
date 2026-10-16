@@ -19,6 +19,64 @@ extern int linuxkpi_original_amdgpu_fence_emit(struct amdgpu_ring *, struct dma_
 extern int linuxkpi_original_dma_fence_signal(struct dma_fence *);
 extern void linuxkpi_original_dma_resv_add_fence(struct dma_resv *, struct dma_fence *, enum dma_resv_usage);
 
+extern int linuxkpi_original_amdgpu_device_ip_set_powergating_state(
+    void *, enum amd_ip_block_type, enum amd_powergating_state);
+extern int linuxkpi_original_amdgpu_vcn_dec_ring_test_ring(struct amdgpu_ring *);
+
+/* Only observe the existing Raphael PF startup path. In particular, do not
+ * sample new media MMIO registers while their accessibility is uncertain. */
+static bool vcn_startup_trace_device(struct amdgpu_device *adev) {
+  return adev && adev->pdev && !adev->no_hw_access &&
+         adev->pdev->vendor == 0x1002 && adev->pdev->device == 0x164e &&
+         (adev->flags & AMD_IS_APU) && amdgpu_passthrough(adev) &&
+         !amdgpu_sriov_vf(adev);
+}
+
+static unsigned vcn_power_trace_count;
+
+int amdgpu_device_ip_set_powergating_state(
+    void *dev, enum amd_ip_block_type type, enum amd_powergating_state state) {
+  struct amdgpu_device *adev = dev;
+  bool trace = type == AMD_IP_BLOCK_TYPE_VCN &&
+               vcn_startup_trace_device(adev) &&
+               __atomic_fetch_add(&vcn_power_trace_count, 1, __ATOMIC_RELAXED) < 16;
+  unsigned before = trace ? adev->vcn.cur_state : 0;
+  int ret = linuxkpi_original_amdgpu_device_ip_set_powergating_state(dev, type, state);
+  if (trace)
+    klogf("[INFO] LinuxKPI: VCN power request=%u before=%u after=%u "
+          "dpm=%u indirect=%u pg_flags=%llx ret=%d\n",
+          (unsigned)state, before, (unsigned)adev->vcn.cur_state,
+          adev->pm.dpm_enabled, adev->vcn.indirect_sram,
+          (unsigned long long)adev->pg_flags, ret);
+  return ret;
+}
+
+int amdgpu_vcn_dec_ring_test_ring(struct amdgpu_ring *ring) {
+  struct amdgpu_device *adev = ring->adev;
+  bool trace = vcn_startup_trace_device(adev);
+  if (trace)
+    klogf("[INFO] LinuxKPI: VCN decode test enter me=%u gpu=%llx bytes=%u "
+          "doorbell=%u index=%u wptr=%llu power=%u timeout_us=%u\n",
+          ring->me, (unsigned long long)ring->gpu_addr, ring->ring_size,
+          ring->use_doorbell, ring->doorbell_index,
+          (unsigned long long)ring->wptr, (unsigned)adev->vcn.cur_state,
+          adev->usec_timeout);
+  int ret = linuxkpi_original_amdgpu_vcn_dec_ring_test_ring(ring);
+  if (trace)
+    klogf("[INFO] LinuxKPI: VCN decode test exit me=%u wptr=%llu "
+          "power=%u ret=%d\n", ring->me, (unsigned long long)ring->wptr,
+          (unsigned)adev->vcn.cur_state, ret);
+  return ret;
+}
+
+/* Only gmc_v10_0.c and amdgpu_job.c redirect their failure-report lookup
+ * here. Preserve the upstream task lookup and then retain the opt-in capture. */
+void linuxkpi_amdgpu_vm_fault_info(struct amdgpu_device *adev, u32 pasid,
+                                   struct amdgpu_task_info *info) {
+  amdgpu_vm_get_task_info(adev, pasid, info);
+  gpu_diag_vm_failure(adev, pasid, info->tgid, info->pid);
+}
+
 extern int linuxkpi_original_psp_wait_for(struct psp_context *, uint32_t,
                                          uint32_t, uint32_t, bool);
 

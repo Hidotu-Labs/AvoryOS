@@ -206,6 +206,21 @@ if [ -d /usr/lib/xorg/modules/dri ]; then
 fi
 export KWIN_COMPOSE="${KWIN_COMPOSE:-O2}"
 
+# rcS starts root's audio graph in /run/pipewire. Keep the desktop runtime
+# separate, but point native and PulseAudio clients at those existing sockets.
+# Export before D-Bus activation so activated services inherit the same paths.
+if [ "$USER_ID" = 0 ]; then
+    export PIPEWIRE_RUNTIME_DIR=/run/pipewire
+    # WebKitGTK 2.54's bindPulse() asserts on a nonempty unix: PULSE_SERVER
+    # (CStringView::fromUTF8 is passed a span without its NUL terminator).
+    # libpulse supports a runtime directory directly and still uses native.
+    export PULSE_RUNTIME_PATH=/run/pipewire/pulse
+    # Remove the default inherited from an older session wrapper on re-entry.
+    if [ "${PULSE_SERVER:-}" = unix:/run/pipewire/pulse/native ]; then
+        unset PULSE_SERVER
+    fi
+fi
+
 # 5. D-Bus session bus management
 if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
     mkdir -p /run/dbus /var/run/dbus 2>/dev/null || true
@@ -230,27 +245,32 @@ if command -v kbuildsycoca6 >/dev/null 2>&1; then
     kbuildsycoca6 --noincremental || true
 fi
 
-# 5b. PipeWire session instance (per-user; the rcS boot instance is
-# root-owned at /run/pipewire and is not visible here). Start one only if
-# nothing is listening in this session's runtime dir; never fail the login.
-if command -v pipewire >/dev/null 2>&1 && [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
-    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup pipewire >>"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
-        sleep 0.5
-    done
-fi
-if [ -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
-    if command -v wireplumber >/dev/null 2>&1; then
-        if command -v pidof >/dev/null 2>&1; then
-            # Background only the daemon. `pidof ... || command &` would
-            # background the entire list in a temporary shell; that shell
-            # can exit after this wrapper execs Plasma and remain unreaped.
-            if ! pidof wireplumber >/dev/null 2>&1; then
+# 5b. Non-root sessions need their own audio graph; root uses rcS above.
+if [ "$USER_ID" != 0 ]; then
+    session_pipewire_started=0
+    if command -v pipewire >/dev/null 2>&1 && [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
+        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup pipewire >>"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
+        session_pipewire_started=1
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
+            sleep 0.5
+        done
+    fi
+    if [ -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
+        if command -v wireplumber >/dev/null 2>&1; then
+            if command -v pidof >/dev/null 2>&1; then
+                # Background only the daemon. `pidof ... || command &` would
+                # background the entire list in a temporary shell; that shell
+                # can exit after this wrapper execs Plasma and remain unreaped.
+                if [ "$session_pipewire_started" = 1 ] || ! pidof wireplumber >/dev/null 2>&1; then
+                    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup wireplumber >>"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
+                fi
+            else
                 XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup wireplumber >>"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
             fi
-        else
-            XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup wireplumber >>"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
+        fi
+        if command -v pipewire-pulse >/dev/null 2>&1 && [ ! -S "$XDG_RUNTIME_DIR/pulse/native" ]; then
+            nohup pipewire-pulse >>"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
         fi
     fi
 fi

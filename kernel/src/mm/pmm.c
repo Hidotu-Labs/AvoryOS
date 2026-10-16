@@ -296,6 +296,10 @@ __attribute__((optimize("O3"))) void *pmm_alloc_huge_page(void) {
 }
 
 __attribute__((optimize("O3"))) void pmm_free_pages(void *ptr, size_t count) {
+  /* Callers re-releasing a frame report here; kept local so source-slicing
+   * test harnesses that extract this function compile standalone. */
+  static volatile uint64_t buddy_double_free_skips;
+
   if (!ptr || count == 0 || (uint64_t)ptr == pmm_zero_page_phys)
     return;
 
@@ -331,8 +335,27 @@ __attribute__((optimize("O3"))) void pmm_free_pages(void *ptr, size_t count) {
     /* Mixed/shared blocks must release every last-reference page, even if
      * another page remains shared or was already released. Buddy coalescing
      * rebuilds the larger block when its final constituent becomes free. */
-    if (pmm_put_ref(phys, __builtin_return_address(0)))
-      buddy_free_internal(&n->zone, phys, 0);
+    if (!pmm_put_ref(phys, __builtin_return_address(0)))
+      continue;
+    /* Mirror pmm_decref(): never link a page that is already on the buddy
+     * free list.  put_ref can only reach zero for such a page if the
+     * reference count and the allocation bitmap disagree - the frame was
+     * released through another path - and linking it again would hand it
+     * to a second owner. */
+    if (!pmm_bitmap_test(pmm_bitmap, pfn + i - pmm_lowest_page)) {
+      uint64_t skips =
+          __atomic_add_fetch(&buddy_double_free_skips, 1, __ATOMIC_RELAXED);
+      if (skips <= 8) {
+        klog_puts(KLOG_CLR_RED
+                  "[PMM] WARN: free of already-free page " KLOG_CLR_RESET);
+        klog_hex64(phys);
+        klog_puts(" caller=");
+        klog_hex64((uint64_t)__builtin_return_address(0));
+        klog_puts(" - ignored\n");
+      }
+      continue;
+    }
+    buddy_free_internal(&n->zone, phys, 0);
   }
 
   spinlock_release(&n->zone.lock);

@@ -103,4 +103,15 @@ static inline void asc_invlpg(__UINT64_TYPE__ va) {
   __asm__ volatile("invlpg (%0)" ::"r"(va) : "memory");
 }
 
+/* kernel/src/mm/pmm_pcp.c: return frames parked in the per-CPU and
+ * pre-zeroed pools to the buddy free lists.  LinuxKPI page allocations
+ * bypass the PCP, so a KPI allocation can fail while pmm_get_free_pages()
+ * still counts parked frames as free. */
+extern void asc_pmm_drain_cached_frames(void) __asm__("pmm_pcp_drain_all");
+
+/* kernel/src/fs/page_cache.c: drop up to `target` clean file-cache pages
+ * (weak: mm/LinuxKPI layers must not hard-depend on fs being linked). */
+extern __SIZE_TYPE__ asc_mm_file_cache_reclaim(__SIZE_TYPE__ target)
+    __asm__("mm_file_cache_reclaim") __attribute__((weak));
+
 #endif /* LINUXKPI_NATIVE_MM_H */

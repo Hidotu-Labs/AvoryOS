@@ -348,7 +348,7 @@ arch_name() {
         libpulse|libpulse-mainloop-glib) echo libpulse;;
         alsa-lib) echo alsa-lib;;
         alsa-plugins) echo alsa-plugins;;
-        pulseaudio-utils) echo DROP;;
+        pulseaudio-utils) echo libpulse;;
         pulseaudio-qt) echo pulseaudio-qt;;
         avahi-libs) echo avahi;;
         bluez|bluez-libs) echo bluez;;
@@ -523,7 +523,9 @@ arch_name() {
         frameworkintegration) echo frameworkintegration;;
         qqc2-desktop-style) echo qqc2-desktop-style;;
         kpipewire) echo kpipewire;;
-        pipewire|pipewire-libs|pipewire-pulse|pipewire-alsa|pipewire-tools) echo pipewire;;
+        pipewire|pipewire-pulse|pipewire-alsa) echo "$1";;
+        pipewire-libs) echo libpipewire;;
+        pipewire-tools) echo pipewire;;
         wireplumber|wireplumber-libs) echo wireplumber;;
         avahi-libs) echo avahi;;
         bluez-libs) echo bluez-libs;;
@@ -543,8 +545,6 @@ arch_name() {
         lz4-libs) echo lz4;;
         mesa-gbm) echo mesa;;
         solid-libs) echo solid;;
-        wireplumber-libs) echo wireplumber;;
-        pipewire-libs|pipewire-tools) echo pipewire;;
         serd-libs) echo serd;;
         sord-libs) echo sord;;
         zix-libs) echo zix;;

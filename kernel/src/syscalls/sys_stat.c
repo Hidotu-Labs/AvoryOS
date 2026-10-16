@@ -27,7 +27,7 @@ extern int fat32_statfs_impl(vfs_node_t *, struct statfs_buf *);
 void fill_kstat(struct kstat *ks, vfs_node_t *node) {
     ks->st_dev   = 0;
     ks->st_ino   = (uint64_t)node->inode;
-    ks->st_nlink = 1;
+    ks->st_nlink = node->get_nlink ? node->get_nlink(node) : 1;
 
     uint32_t mode = node->mask & 07777;
     switch (node->flags & FS_TYPE_MASK) {
@@ -261,7 +261,7 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
     else
         kstx.stx_mask |= STATX_MNT_ID;
     kstx.stx_blksize = 4096;
-    kstx.stx_nlink   = 1;
+    kstx.stx_nlink   = node->get_nlink ? node->get_nlink(node) : 1;
     kstx.stx_uid     = node->uid;
     kstx.stx_gid     = node->gid;
 

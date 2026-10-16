@@ -4,6 +4,7 @@
 #include "../lib/list.h"
 #include "../lib/radix_tree.h"
 #include "../lock/spinlock.h"
+#include "vfs_rcu.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -30,6 +31,8 @@
  * still reference the node.  vfs_close() destroys the device payload through
  * ->destroy and frees the node when the last reference drops. */
 #define FS_DELETED 0x200
+/* Filesystem-owned ephemeral root: destroy payload on its final reference. */
+#define FS_AUTODESTROY 0x400
 #define FS_TYPE_MASK 0x0F
 
 /* Live-object markers.  A node or cached page that has been freed has its
@@ -62,6 +65,11 @@ typedef struct vfs_page {
   uint32_t refs;         // Packed: transient count | VFS_PAGE_EVICTED
   uint64_t last_used;    // Access stamp used for cache reclaim (per-CPU order)
   uint64_t dirty_seq;    // Detects modifications racing with writeback
+  /* Deferred-free link (fs/vfs_rcu.c): a lockless vfs_cache_lookup() may have
+   * observed this page in the radix tree and be about to take a reference
+   * when the last put releases it, so the object and its frame are handed to
+   * the grace-period queue instead of being freed inline. */
+  struct vfs_rcu_head rcu;
 } vfs_page_t;
 
 /* Transient-reference word.  The low 31 bits count transient users (the tree
@@ -73,6 +81,9 @@ typedef struct vfs_page {
  *    means this put owned the last reference of an already-evicted page.
  *  - vfs_page_evict() marks the page evicted after it left the tree; a result
  *    of 0 means it was removed while no transient user held it.
+ *  - vfs_page_tryref() (the lockless lookup path) adds a transient ref only
+ *    while the marker is clear, so it can never revive an evicted page whose
+ *    release already observed zero users.
  *
  * Packing both into one word is what lets a plain ref drop stay lock-free:
  * two racing owners cannot both observe "zero + marker", so exactly one of
@@ -103,6 +114,21 @@ static inline bool vfs_page_put(vfs_page_t *page) {
  * must free it.  Must be called exactly once per page, after tree removal. */
 static inline bool vfs_page_evict(vfs_page_t *page) {
   return __atomic_fetch_or(&page->refs, VFS_PAGE_EVICTED, __ATOMIC_ACQ_REL) == 0;
+}
+
+/* Try to take a transient ref without reviving an evicted page.  Returns false
+ * when the page is already evicted (its release is in flight), which is the
+ * state a lockless vfs_cache_lookup() can observe after losing the race to
+ * vfs_cache_invalidate().  Mirrors vfs_node_tryref(). */
+static inline bool vfs_page_tryref(vfs_page_t *page) {
+  uint32_t refs = __atomic_load_n(&page->refs, __ATOMIC_RELAXED);
+  for (;;) {
+    if (refs & VFS_PAGE_EVICTED)
+      return false;
+    if (__atomic_compare_exchange_n(&page->refs, &refs, refs + 1, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+      return true;
+  }
 }
 
 struct dirent {
@@ -185,6 +211,8 @@ struct statfs_buf {
 typedef int (*statfs_type_t)(struct vfs_node *, struct statfs_buf *buf);
 
 typedef struct vfs_node {
+  struct vfs_node *view_backing; /* Namespace path view; callbacks use the backing inode. */
+  struct vfs_node *view_parent; /* Owned path ancestry, not the backing inode parent. */
   uint64_t mount_id; // Stable VFS mount identity, inherited during lookup
   char name[128];
   uint32_t mask; // Permissions
@@ -215,6 +243,7 @@ typedef struct vfs_node {
   unlink_type_t unlink;
   rmdir_type_t rmdir;
   readlink_type_t readlink;
+  struct vfs_node *(*get_link)(struct vfs_node *); /* Owned proc magic-link target. */
   symlink_type_t symlink;
   rename_type_t rename;
   chmod_type_t chmod;
@@ -229,6 +258,7 @@ typedef struct vfs_node {
   bool mmap_private_pmm_refs;
   poll_type_t poll; // Device-specific poll handler
   statfs_type_t statfs;
+  uint32_t (*get_nlink)(struct vfs_node *); // Optional dynamic link count
   ioctl_type_t ioctl; // Device-specific ioctl handler
   fallocate_type_t fallocate;
   void *wait_queue; // Pointer to wait_queue_t for poll() wakeups
@@ -259,6 +289,13 @@ typedef struct vfs_node {
   uint32_t readdir_cursor_index;
   uint32_t readdir_cursor_offset;
   spinlock_t readdir_cursor_lock;
+
+  /* Deferred-reclamation link (fs/vfs_rcu.c).  Valid only while the node sits
+   * on the free queue after its last reference dropped; overwritten by the
+   * next queueing and never read once the node is gone.  Keeping the link in
+   * the node avoids an allocation on the last-close path, which must not fail.
+   */
+  struct vfs_rcu_head rcu;
 } vfs_node_t;
 
 extern vfs_node_t *fs_root;
@@ -371,6 +408,8 @@ void vfs_xattr_clear(vfs_node_t *node);
 
 typedef struct vfs_mount_info {
   uint64_t mount_id;
+  uint64_t parent_id;
+  uint64_t flags;
   char mountpoint[128];
   char target[128];
   char dev_name[64];
@@ -381,6 +420,9 @@ int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count);
 
 // Page Cache API
 bool vfs_cache_page_valid(const vfs_page_t *page);
+/* Install the deferred-node-reclamation hook on a page cache tree.  Called
+ * once per node from vfs_node_init(), before the tree is shared. */
+void vfs_page_cache_tree_init(struct radix_tree *tree);
 vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset);
 vfs_page_t *vfs_cache_insert(vfs_node_t *node, uint32_t offset, uint64_t frame);
 size_t vfs_cache_page_count(void);
@@ -422,6 +464,9 @@ void vfs_cache_fill_selftest(void);
 void vfs_procfs_selftest(void);
 void vfs_bench_maybe_run(void);
 bool vfs_cache_ref_selftest(void);
+/* `vfs_selftest=1`: the lockless page lookup and its deferred reclamation,
+ * including the eviction race the tryref protocol exists for. */
+bool vfs_cache_lockless_selftest(void);
 void vfs_cache_bench(void);
 
 #endif

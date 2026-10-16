@@ -4,7 +4,7 @@
 
 static int unix_bind_abstract(unix_sock_t *usk, struct sockaddr_un *sun,
                               int addrlen) {
-  if (unix_find_socket_by_addr(sun, addrlen))
+  if (unix_find_socket_by_addr(usk->parent, sun, addrlen))
     return -EADDRINUSE;
 
   size_t copy = (size_t)addrlen < sizeof(usk->addr) ? (size_t)addrlen : sizeof(usk->addr);
@@ -23,7 +23,7 @@ static int unix_bind_abstract(unix_sock_t *usk, struct sockaddr_un *sun,
 }
 
 static int unix_bind_fs(unix_sock_t *usk, struct sockaddr_un *sun, int addrlen) {
-  if (unix_find_socket_by_addr(sun, addrlen)) {
+  if (unix_find_socket_by_addr(usk->parent, sun, addrlen)) {
     klog_puts("[WARN] unix_bind_fs: address already in internal bound list\n");
     return -EADDRINUSE;
   }
@@ -70,7 +70,7 @@ static int unix_bind_fs(unix_sock_t *usk, struct sockaddr_un *sun, int addrlen) 
 
   vfs_node_t *existing = vfs_finddir(parent, name);
   if (existing) {
-    if (!unix_find_socket_by_addr(sun, addrlen)) {
+    if (!unix_find_socket_by_addr(usk->parent, sun, addrlen)) {
       // Stale socket file – unlink and recreate
       klog_puts("[INFO] unix_bind_fs: unlinking stale socket node: ");
       klog_puts(sun->sun_path);

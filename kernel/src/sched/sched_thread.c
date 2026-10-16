@@ -1,10 +1,17 @@
+#include "../fs/mount_namespace.h"
+#include "pid_namespace.h"
+#include "net_namespace.h"
+#include "capability.h"
+#include "seccomp.h"
 #include "sched.h"
 #include "sched_internal.h"
+#include "namespace.h"
 #include "hal/hal.h"
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
 #include "../fs/procfs.h"
 #include "../fs/vfs.h"
+#include "../fs/mount_namespace.h"
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
 #include "../mm/heap.h"
@@ -69,6 +76,7 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
     return NULL;
 
   memset(t, 0, sizeof(struct thread));
+  spinlock_init(&t->namespace_lock);
   t->start_time_ms = lapic_timer_get_ms();
   if (t->start_time_ms == 0)
     t->start_time_ms = 1;
@@ -238,6 +246,19 @@ bool sched_get_thread_snapshot(uint32_t tid,
   snapshot->runtime_system_ms =
       __atomic_load_n(&t->runtime_system_ms, __ATOMIC_RELAXED);
   snapshot->start_time_ms = t->start_time_ms;
+  snapshot->uts_namespace_id = uts_namespace_id(t);
+  snapshot->ipc_namespace_id = ipc_namespace_id(t);
+  snapshot->pid_namespace_id = pid_namespace_id(t);
+  snapshot->net_namespace_id = net_namespace_id(t);
+  snapshot->mount_namespace_id = vfs_namespace_id(t);
+  (void)capability_has(t, 0);
+  snapshot->cap_inheritable = t->cap_inheritable;
+  snapshot->cap_permitted = t->cap_permitted;
+  snapshot->cap_effective = t->cap_effective;
+  snapshot->cap_bounding = t->cap_bounding;
+  snapshot->cap_ambient = t->cap_ambient;
+  snapshot->no_new_privs = __atomic_load_n(&t->no_new_privs, __ATOMIC_ACQUIRE);
+  snapshot->seccomp_mode = seccomp_mode(t);
   snapshot->uid = t->uid;
   snapshot->gid = t->gid;
   snapshot->euid = t->euid;
@@ -416,6 +437,21 @@ bool sched_get_nth_thread_tid(uint32_t index, uint32_t *tid) {
   return t != NULL;
 }
 
+uint32_t sched_get_group_threads(uint32_t tgid, uint32_t index, uint32_t *tid) {
+  uint32_t count = 0;
+  if (tid) *tid = 0;
+  spinlock_acquire(&tid_lock);
+  for (struct thread *t = global_thread_list; t; t = t->global_next) {
+    if ((t->tgid ? t->tgid : t->tid) != tgid ||
+        t->state == THREAD_DEAD || t->state == THREAD_ZOMBIE)
+      continue;
+    if (tid && count == index) *tid = t->tid;
+    count++;
+  }
+  spinlock_release(&tid_lock);
+  return count;
+}
+
 uint16_t sched_get_thread_count(void) {
   /* Count is maintained at insert/unlink time - no list walk, no tid_lock
    * (the walk was half of sys_sysinfo's 1.5us). */
@@ -502,6 +538,15 @@ void sched_reparent_children(struct thread *parent) {
     }
   }
 
+  /* Reparent within the active PID namespace. An orphan must never escape
+   * to a process outside its visible ancestry while its namespace init lives. */
+  if (!adopter && parent->pid_ns) {
+    for (struct thread *candidate = global_thread_list; candidate; candidate = candidate->global_next)
+      if (candidate != parent && pid_namespace_tid(parent, candidate) == 1 &&
+          candidate->state != THREAD_DEAD && candidate->state != THREAD_ZOMBIE) {
+        adopter = candidate; break;
+      }
+  }
   // Orphans from a terminating process go to the BSP idle task as init.
   if (!adopter) {
     adopter = global_thread_list;
@@ -561,4 +606,13 @@ void sched_reparent_children(struct thread *parent) {
     victim->sibling_next = NULL;
     sched_queue_reap(victim);
   }
+}
+
+int sched_get_mount_snapshot(uint32_t tid, vfs_mount_info_t *mounts, int count) {
+  spinlock_acquire(&tid_lock);
+  struct thread *target = find_thread_by_tid_locked(tid);
+  int result = target && pid_namespace_tid(sched_get_current(), target)
+                 ? vfs_get_mounts_task(target, mounts, count) : 0;
+  spinlock_release(&tid_lock);
+  return result;
 }

@@ -70,21 +70,22 @@ static void sched_account_cpu_time_locked(struct cpu_info *cpu, uint64_t now_ms)
   }
 }
 
-/* Timed waits are rare compared with scheduler entries. Keep insertion O(n)
- * and make the yield/timer hot path O(1) by maintaining the earliest deadline
- * at the head. All helpers require cpu->queue_lock. */
+/* Timed waiters live in a per-CPU red-black tree ordered by wakeup_ticks, so
+ * parking a poll/nanosleep and waking a sleeper are O(log n) under queue_lock
+ * instead of walking a sorted list of every sleeper on the CPU. The cached
+ * leftmost node is the earliest deadline, which keeps timer arming and expiry
+ * O(1) for the common no-op case. All helpers require cpu->queue_lock. */
 void sched_deadline_remove_locked(struct cpu_info *cpu,
                                   struct thread *t) {
   if (!t->deadline_queued)
     return;
 
-  struct thread **link = &cpu->deadline_head;
-  while (*link && *link != t)
-    link = &(*link)->deadline_next;
-  if (*link == t)
-    *link = t->deadline_next;
-
-  t->deadline_next = NULL;
+  if (cpu->deadline_leftmost == &t->deadline_node)
+    cpu->deadline_leftmost = rb_next(&t->deadline_node);
+  rb_erase(&t->deadline_node, &cpu->deadline_tree);
+  t->deadline_node.__rb_parent_color = 0;
+  t->deadline_node.rb_left = NULL;
+  t->deadline_node.rb_right = NULL;
   t->deadline_queued = false;
 }
 
@@ -95,20 +96,36 @@ void sched_deadline_insert_locked(struct cpu_info *cpu,
   if (t->deadline_queued)
     sched_deadline_remove_locked(cpu, t);
 
-  struct thread **link = &cpu->deadline_head;
-  while (*link && (*link)->wakeup_ticks <= t->wakeup_ticks)
-    link = &(*link)->deadline_next;
-  t->deadline_next = *link;
-  *link = t;
+  struct rb_node **link = &cpu->deadline_tree.rb_node;
+  struct rb_node *parent = NULL;
+  bool leftmost = true;
+  while (*link) {
+    parent = *link;
+    struct thread *owner = rb_entry(parent, struct thread, deadline_node);
+    if (t->wakeup_ticks < owner->wakeup_ticks) {
+      link = &parent->rb_left;
+    } else {
+      /* Equal deadlines go right; membership is tracked per thread, not by
+       * key lookup, so duplicates need no tie-breaker. */
+      link = &parent->rb_right;
+      leftmost = false;
+    }
+  }
+
+  rb_link_node(&t->deadline_node, parent, link);
+  rb_insert_color(&t->deadline_node, &cpu->deadline_tree);
+  if (leftmost || !cpu->deadline_leftmost)
+    cpu->deadline_leftmost = &t->deadline_node;
   t->deadline_queued = true;
 }
 
 void sched_deadline_expire_locked(struct cpu_info *cpu, uint64_t now) {
-  while (cpu->deadline_head && cpu->deadline_head->wakeup_ticks <= now) {
-    struct thread *t = cpu->deadline_head;
-    cpu->deadline_head = t->deadline_next;
-    t->deadline_next = NULL;
-    t->deadline_queued = false;
+  while (cpu->deadline_leftmost &&
+         rb_entry(cpu->deadline_leftmost, struct thread,
+                  deadline_node)->wakeup_ticks <= now) {
+    struct thread *t =
+        rb_entry(cpu->deadline_leftmost, struct thread, deadline_node);
+    sched_deadline_remove_locked(cpu, t);
 
     if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {
       bool still_current = cpu->current_thread == t;
@@ -150,9 +167,13 @@ void sched_arm_next_deadline(struct cpu_info *cpu,
   } else {
     cpu->quantum_deadline_ms = 0;
   }
-  if (cpu->deadline_head &&
-      (!deadline || cpu->deadline_head->wakeup_ticks < deadline))
-    deadline = cpu->deadline_head->wakeup_ticks;
+  if (cpu->deadline_leftmost) {
+    uint64_t earliest =
+        rb_entry(cpu->deadline_leftmost, struct thread, deadline_node)
+            ->wakeup_ticks;
+    if (!deadline || earliest < deadline)
+      deadline = earliest;
+  }
   if (deadline) lapic_timer_rearm_if_earlier(deadline);
 }
 
@@ -250,7 +271,8 @@ void sched_init(void) {
 
     spinlock_init(&cpu->queue_lock);
     eevfd_rq_init(&cpu->eevfd);
-    cpu->deadline_head = NULL;
+    cpu->deadline_tree.rb_node = NULL;
+    cpu->deadline_leftmost = NULL;
     cpu->stats_user_ms = 0;
     cpu->stats_system_ms = 0;
     cpu->stats_idle_ms = 0;
@@ -307,6 +329,7 @@ void sched_init(void) {
     __atomic_add_fetch(&global_thread_count, 1, __ATOMIC_RELAXED);
     cpu->idle_thread = idle_thread;
     cpu->current_thread = idle_thread;
+    __atomic_store_n(&idle_thread->on_cpu, true, __ATOMIC_RELEASE);
     idle_thread->cpu_affinity = (1ULL << count) - 1;
     if (count == 64)
       idle_thread->cpu_affinity = ~0ULL;
@@ -522,6 +545,12 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
     }
     next_t->state = THREAD_RUNNING;
     __atomic_store_n(&next_t->has_started, true, __ATOMIC_RELEASE);
+    /* Wake-fast-path bookkeeping: the incoming thread may be found as the
+     * current thread from now on, and the outgoing one no longer can.  Both
+     * are cleared/set here, in the dispatcher, because a first dispatch enters
+     * thread_stub and never returns through the scheduler epilogue below. */
+    __atomic_store_n(&next_t->on_cpu, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&prev->on_cpu, false, __ATOMIC_RELEASE);
     __atomic_store_n(&cpu->switching_from, prev, __ATOMIC_RELEASE);
     fpu_on_context_switch();
     cpu->current_thread = next_t;
@@ -819,7 +848,9 @@ bool sched_validate_runqueues(struct cpu_info *cpu) {
   return valid;
 }
 
-bool sched_set_priority(struct thread *t, uint8_t priority, int8_t nice_value) {
+static bool sched_update_priority(struct thread *t, uint8_t priority,
+                                  int8_t nice_value, int policy,
+                                  uint8_t rt_priority, bool reset_on_fork) {
   if (!t || t->is_idle) return false;
   struct cpu_info *cpu = cpu_get_info(t->cpu_index);
   if (!cpu || cpu->status == CPU_STATUS_OFFLINE) return false;
@@ -828,16 +859,37 @@ bool sched_set_priority(struct thread *t, uint8_t priority, int8_t nice_value) {
   t->static_priority = priority;
   t->priority = priority;
   t->nice_value = nice_value;
-  if (t->se.on_rq) {
+  bool queued = t->se.on_rq;
+  if (queued)
     eevfd_dequeue_entity(&cpu->eevfd, &t->se);
-    eevfd_set_nice(&t->se, (int)nice_value);
-    eevfd_enqueue_entity(&cpu->eevfd, &t->se);
-  } else {
-    eevfd_set_nice(&t->se, (int)nice_value);
+  if (policy >= 0) {
+    t->sched_policy = (uint8_t)policy;
+    t->sched_rt_priority = rt_priority;
+    t->sched_reset_on_fork = reset_on_fork;
+    t->se.custom_slice = false;
   }
+  eevfd_set_nice(&t->se, (int)nice_value);
+  if (policy == 1 || policy == 2)
+    eevfd_set_slice(&t->se, EEVFD_LATENCY_SLICE_NS);
+  else if (policy == 3)
+    eevfd_set_slice(&t->se, EEVFD_BATCH_SLICE_NS);
+  else if (policy == 5)
+    eevfd_set_slice(&t->se, EEVFD_MAX_SLICE_NS);
+  if (queued)
+    eevfd_enqueue_entity(&cpu->eevfd, &t->se);
   spinlock_release(&cpu->queue_lock);
   hal_irq_restore(flags);
   return true;
+}
+
+bool sched_set_priority(struct thread *t, uint8_t priority, int8_t nice_value) {
+  return sched_update_priority(t, priority, nice_value, -1, 0, false);
+}
+
+bool sched_set_attributes(struct thread *t, uint8_t priority, int8_t nice_value,
+                          uint8_t policy, uint8_t rt_priority, bool reset_on_fork) {
+  return sched_update_priority(t, priority, nice_value, policy, rt_priority,
+                               reset_on_fork);
 }
 
 void sched_print_tasks(void) {
@@ -965,16 +1017,24 @@ __attribute__((optimize("O3"))) void sched_wakeup(struct thread *t) {
    * sched_schedule() keeps a local `cpu` pointer across switch_context(); if
    * this continuation resumes on a different CPU it will update the wrong
    * runqueue and can corrupt scheduler state. The current_thread and
-   * switching_from scan also handles a wake racing the initial dispatch. */
-  uint32_t count = cpu_get_count();
-  for (uint32_t i = 0; i < count; i++) {
-    struct cpu_info *c = cpu_get_info(i);
-    if (!c || c->status == CPU_STATUS_OFFLINE)
-      continue;
-    if (__atomic_load_n(&c->current_thread, __ATOMIC_ACQUIRE) == t ||
-        __atomic_load_n(&c->switching_from, __ATOMIC_ACQUIRE) == t) {
-      target = c;
-      break;
+   * switching_from scan also handles a wake racing the initial dispatch.
+   *
+   * on_cpu gates the scan: it is set only while a thread is published as some
+   * CPU's current thread, so a false value proves the recorded cpu_index still
+   * owns every scheduler structure of this thread and the scan can be skipped.
+   * A racing stale true only costs the scan; the state decision below stays
+   * under the target's queue_lock either way. */
+  if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) {
+    uint32_t count = cpu_get_count();
+    for (uint32_t i = 0; i < count; i++) {
+      struct cpu_info *c = cpu_get_info(i);
+      if (!c || c->status == CPU_STATUS_OFFLINE)
+        continue;
+      if (__atomic_load_n(&c->current_thread, __ATOMIC_ACQUIRE) == t ||
+          __atomic_load_n(&c->switching_from, __ATOMIC_ACQUIRE) == t) {
+        target = c;
+        break;
+      }
     }
   }
 
@@ -1016,6 +1076,12 @@ __attribute__((optimize("O3"))) void sched_wakeup(struct thread *t) {
       sched_deadline_remove_locked(target, t);
       t->state = still_current ? THREAD_RUNNING : THREAD_READY;
       t->wakeup_ticks = 0;
+      /* Timestamp the transition, including a waiter already linked by a
+       * racing deadline expiry. Repeated wakeups must not erase its age. */
+      if (still_current)
+        t->ready_since_ms = 0;
+      else if (!t->ready_since_ms)
+        t->ready_since_ms = lapic_timer_get_ms();
       if (!still_current && !t->se.on_rq) {
         /* Publish the target only once the enqueue is serialized under its
          * queue_lock; a stale/racy cpu_index makes the deadline and removal
@@ -1042,8 +1108,6 @@ __attribute__((optimize("O3"))) void sched_wakeup(struct thread *t) {
             __atomic_store_n(&running->need_resched, true, __ATOMIC_RELEASE);
           rearm_local = true;
         }
-      } else {
-        t->ready_since_ms = 0;
       }
     }
     spinlock_release(&target->queue_lock);

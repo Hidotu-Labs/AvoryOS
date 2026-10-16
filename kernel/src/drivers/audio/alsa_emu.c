@@ -10,6 +10,7 @@
 #include "../../mm/heap.h"
 #include "../../mm/pmm.h"
 #include "../../mm/vmm.h"
+#include "lock/spinlock.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -354,6 +355,7 @@ static int alsa_pcm_state = 0; // 0 = OPEN, 1 = SETUP, 2 = PREPARED, 3 = RUNNING
 static uint64_t alsa_appl_ptr = 0;
 static uint64_t alsa_hw_ptr = 0;
 static uint64_t alsa_avail_min = 1;
+static uint64_t alsa_start_threshold = 1;
 // Playback buffer the client negotiated in HW_PARAMS, in frames.  It bounds
 // both the driver queue and the avail figures reported back to alsa-lib.
 static uint64_t alsa_buffer_frames = 0;
@@ -363,6 +365,7 @@ static uint64_t alsa_buffer_frames = 0;
 // that data into the HDA ring.
 static bool alsa_access_mmap = false;
 static uint64_t alsa_mmap_consumed = 0;
+static spinlock_t alsa_pump_lock = SPINLOCK_INIT;
 
 // alsa-lib passes 0/1 by value for some _IOW('A', …, int) PCM ioctls (e.g. PAUSE).
 static int alsa_ioctl_get_int(uint64_t arg, int *out) {
@@ -690,6 +693,21 @@ static void alsa_set_interval(struct snd_interval *it, uint32_t val) {
     it->empty = 0;
 }
 
+/* Refine by intersection, retaining open endpoints. An impossible request
+ * must remain impossible so alsa-lib can choose its software converters. */
+static bool alsa_refine_interval(struct snd_interval *it, uint32_t min, uint32_t max) {
+    if (it->empty) return false;
+    if (it->min < min) { it->min = min; it->openmin = 0; }
+    if (it->max > max) { it->max = max; it->openmax = 0; }
+    it->integer = 1;
+    if (it->min > it->max ||
+        (it->min == it->max && (it->openmin || it->openmax))) {
+        it->empty = 1;
+        return false;
+    }
+    return true;
+}
+
 static uint8_t alsa_format_to_bits(uint32_t fmt_mask) {
     if (!fmt_mask) {
         return 16;
@@ -780,12 +798,21 @@ static uint64_t alsa_avail_frames(void) {
     return buffer_frames - used;
 }
 
+/* PipeWire deliberately sets LONG_MAX and explicitly starts after priming.
+ * A write into PREPARED must not start the hardware behind its back. */
+static void alsa_start_if_ready(void) {
+    if (alsa_pcm_state == 2 && alsa_appl_ptr >= alsa_start_threshold) {
+        if (hda_is_present()) hda_start_playback();
+        alsa_pcm_state = 3;
+    }
+}
+
 // Move newly written mmap frames from alsa_dma_buf into the HDA ring.  In
 // MMAP access mode nothing issues a write ioctl, so the kernel has to observe
 // the shared write pointer itself; this runs from the HDA interrupt (tick
 // callback) and from the query ioctls.  hda_queue_pcm() handles its own IRQ
 // masking and never blocks.
-static void alsa_mmap_pump(void) {
+static void alsa_mmap_pump_locked(void) {
     if (!alsa_access_mmap || !hda_is_present() || !alsa_dma_buf_virt ||
         !alsa_buffer_frames) {
         return;
@@ -828,8 +855,16 @@ static void alsa_mmap_pump(void) {
         pending -= done;
     }
 
-    alsa_pcm_state = 3; // SNDRV_PCM_STATE_RUNNING
+    alsa_start_if_ready();
     alsa_publish_hw_ptr();
+}
+
+static void alsa_mmap_pump(void) {
+    /* A query on another CPU must not submit the same mmap frames as the
+     * completion callback. IRQs stay masked until consumed is published. */
+    spinlock_acquire(&alsa_pump_lock);
+    alsa_mmap_pump_locked();
+    spinlock_release(&alsa_pump_lock);
 }
 
 static void alsa_tick(void) {
@@ -837,137 +872,77 @@ static void alsa_tick(void) {
     alsa_publish_hw_ptr();
 }
 
-// Keep period/buffer/periods and derived byte/time fields consistent.
-// alsa-lib rejects HW_PARAMS when buffer_size is not an exact multiple of
-// period_size even if both intervals were individually refined to min==max.
-static void alsa_reconcile_hw_params(struct snd_pcm_hw_params *params, bool commit) {
-    struct snd_interval *sample_bits = &params->intervals[0];
-    struct snd_interval *frame_bits  = &params->intervals[1];
-    struct snd_interval *channels    = &params->intervals[2];
-    struct snd_interval *rate        = &params->intervals[3];
-    struct snd_interval *period_time = &params->intervals[4];
-    struct snd_interval *period_size = &params->intervals[5];
-    struct snd_interval *period_bytes= &params->intervals[6];
-    struct snd_interval *periods_it  = &params->intervals[7];
-    struct snd_interval *buffer_time = &params->intervals[8];
-    struct snd_interval *buffer_size = &params->intervals[9];
-    struct snd_interval *buffer_bytes= &params->intervals[10];
+/* HW_REFINE intersects constraints; it must never pick a default period or
+ * replace an exact buffer. Rate plugins use the negotiated period ratio to
+ * map input frames to hardware frames, so changing it in HW_PARAMS drops
+ * samples even when the rate fields themselves are correct. */
+static uint32_t alsa_div_ceil(uint64_t n, uint32_t d) {
+    return (uint32_t)((n + d - 1) / d);
+}
 
-    uint8_t bits = alsa_format_to_bits(params->masks[1].bits[0]);
+static int alsa_reconcile_hw_params(struct snd_pcm_hw_params *p, bool commit) {
+    struct snd_interval *it = p->intervals;
+    uint32_t formats = p->masks[1].bits[0];
+    uint32_t min_bits = (formats & (1U << 2)) ? 16 : 32;
+    uint32_t max_bits = (formats & (1U << 10)) ? 32 : 16;
+#define NARROW(i, lo, hi) do { \
+    if (!alsa_refine_interval(&it[i], (lo), (hi))) return -22; \
+} while (0)
+    NARROW(0, min_bits, max_bits);
+    NARROW(2, 2, 2);
+    NARROW(3, 48000, 48000);
+    for (unsigned pass = 0; pass < 32; pass++) {
+        struct snd_interval before[12];
+        memcpy(before, it, sizeof(before));
+        uint32_t min_frame = it[0].min / 8 * 2;
+        uint32_t max_frame = it[0].max / 8 * 2;
+        NARROW(1, min_frame * 8, max_frame * 8);
+        NARROW(5, alsa_div_ceil(it[6].min, max_frame), it[6].max / min_frame);
+        NARROW(9, alsa_div_ceil(it[10].min, max_frame), it[10].max / min_frame);
+        NARROW(6, it[5].min * min_frame, it[5].max * max_frame);
+        NARROW(10, it[9].min * min_frame, it[9].max * max_frame);
+        NARROW(4, (uint64_t)it[5].min * 1000000 / 48000,
+                  alsa_div_ceil((uint64_t)it[5].max * 1000000, 48000));
+        NARROW(8, (uint64_t)it[9].min * 1000000 / 48000,
+                  alsa_div_ceil((uint64_t)it[9].max * 1000000, 48000));
+        NARROW(5, alsa_div_ceil((uint64_t)it[4].min * 48000, 1000000),
+                  alsa_div_ceil(((uint64_t)it[4].max + 1) * 48000, 1000000) - 1);
+        NARROW(9, alsa_div_ceil((uint64_t)it[8].min * 48000, 1000000),
+                  alsa_div_ceil(((uint64_t)it[8].max + 1) * 48000, 1000000) - 1);
+        NARROW(9, it[5].min * it[7].min, it[5].max * it[7].max);
+        NARROW(5, alsa_div_ceil(it[9].min, it[7].max), it[9].max / it[7].min);
+        NARROW(7, alsa_div_ceil(it[9].min, it[5].max), it[9].max / it[5].min);
+        if (!memcmp(before, it, sizeof(before))) break;
+    }
+    if (!commit) return 0;
 
-    // Single global HDA format: concurrent Firefox streams (VOD 48k stereo +
-    // notification/live 44.1k or mono) share one DAC. Reprogramming per-stream
-    // corrupts the other stream's timing and cubeb errors the VOD. Force 48k
-    // stereo here; cubeb resamples/upmixes in software.
-    uint32_t ch = 2;
-    uint32_t r = 48000;
-
-    uint32_t frame_bytes = ((uint32_t)bits / 8U) * ch;
-    if (frame_bytes == 0) {
-        frame_bytes = 4;
+    uint32_t bits = alsa_format_to_bits(formats);
+    uint32_t frame_bytes = bits / 8 * 2;
+    NARROW(0, bits, bits);
+    NARROW(1, frame_bytes * 8, frame_bytes * 8);
+    uint32_t period = it[5].min + !!it[5].openmin;
+    NARROW(5, period, period);
+    if (alsa_reconcile_hw_params(p, false)) return -22;
+    uint32_t periods;
+    if (alsa_interval_exact(&it[9])) {
+        if (it[9].min % period) return -22;
+        periods = it[9].min / period;
+    } else {
+        periods = it[7].min + !!it[7].openmin;
+        if (periods < 4 && it[7].max >= 4) periods = 4;
     }
-    uint32_t max_buf_frames = ALSA_DMA_BUF_SIZE / frame_bytes;
-
-    uint32_t psize = 0;
-    if (!period_size->empty) {
-        if (period_size->min == period_size->max && period_size->min >= 16) {
-            psize = period_size->min;
-        } else if (period_size->min >= 16 && period_size->min <= 65536) {
-            psize = period_size->min;
-        } else if (period_size->max >= 16 && period_size->max <= 65536) {
-            psize = period_size->max;
-        }
-    }
-    if (psize == 0 && !period_time->empty && period_time->min != 0 && r != 0) {
-        psize = (uint32_t)((uint64_t)period_time->min * r / 1000000ULL);
-    }
-    if (psize < 64) {
-        psize = 1024;
-    }
-    if (psize > 16384) {
-        psize = 16384;
-    }
-    if (psize > max_buf_frames / 2) {
-        psize = max_buf_frames / 2;
-    }
-
-    uint32_t bsize = 0;
-    uint32_t nperiods = 4;
-    if (!periods_it->empty && periods_it->min == periods_it->max && periods_it->min >= 2) {
-        nperiods = periods_it->min;
-    }
-
-    if (!buffer_size->empty) {
-        if (buffer_size->min == buffer_size->max && buffer_size->min >= psize) {
-            bsize = buffer_size->min;
-        } else if (buffer_size->max >= psize * 2 && buffer_size->max <= max_buf_frames) {
-            bsize = buffer_size->max;
-        } else if (buffer_size->min > psize && buffer_size->min <= max_buf_frames) {
-            bsize = buffer_size->min;
-        }
-    }
-    if (bsize == 0 && !buffer_time->empty && buffer_time->min != 0 && r != 0) {
-        bsize = (uint32_t)((uint64_t)buffer_time->min * r / 1000000ULL);
-    }
-    if (bsize == 0) {
-        bsize = psize * nperiods;
-    }
-
-    nperiods = bsize / psize;
-    if (nperiods < 2) {
-        nperiods = 2;
-    }
-    bsize = psize * nperiods;
-    if (bsize > max_buf_frames) {
-        nperiods = max_buf_frames / psize;
-        if (nperiods < 2) {
-            psize = max_buf_frames / 4;
-            if (psize < 64) {
-                psize = 64;
-            }
-            nperiods = max_buf_frames / psize;
-            if (nperiods < 2) {
-                nperiods = 2;
-            }
-        }
-        bsize = psize * nperiods;
-    }
-
-    uint32_t ptime = (r != 0) ? (uint32_t)((uint64_t)psize * 1000000ULL / r) : 0;
-    uint32_t pbytes = psize * frame_bytes;
-    uint32_t btime = (r != 0) ? (uint32_t)((uint64_t)bsize * 1000000ULL / r) : 0;
-    uint32_t bbytes = bsize * frame_bytes;
-    uint32_t fb = frame_bytes * 8;
-
-    bool period_exact = alsa_interval_exact(period_size);
-    bool buffer_exact = alsa_interval_exact(buffer_size);
-    bool periods_exact = alsa_interval_exact(periods_it);
-    bool ring_locked = period_exact || buffer_exact || periods_exact;
-
-    if (!commit && !ring_locked) {
-        return;
-    }
-
-    if (commit || alsa_interval_exact(sample_bits)) {
-        alsa_set_interval(sample_bits, bits);
-    }
-    if (commit || alsa_interval_exact(frame_bits)) {
-        alsa_set_interval(frame_bits, fb);
-    }
-    if (!channels->empty && (commit || alsa_interval_exact(channels))) {
-        alsa_set_interval(channels, ch);
-    }
-    if (!rate->empty && (commit || alsa_interval_exact(rate))) {
-        alsa_set_interval(rate, r);
-    }
-    alsa_set_interval(period_size, psize);
-    alsa_set_interval(period_time, ptime);
-    alsa_set_interval(period_bytes, pbytes);
-    alsa_set_interval(periods_it, nperiods);
-    alsa_set_interval(buffer_size, bsize);
-    alsa_set_interval(buffer_time, btime);
-    alsa_set_interval(buffer_bytes, bbytes);
-    alsa_set_interval(&params->intervals[11], 0);
+    NARROW(7, periods, periods);
+    uint32_t buffer = period * periods;
+    NARROW(9, buffer, buffer);
+    NARROW(6, period * frame_bytes, period * frame_bytes);
+    NARROW(10, buffer * frame_bytes, buffer * frame_bytes);
+    /* Time fields may round up or down by a microsecond; retain the exact
+     * endpoint selected by alsa-lib instead of replacing its geometry. */
+    if (alsa_reconcile_hw_params(p, false)) return -22;
+    if (!alsa_interval_exact(&it[4])) alsa_set_interval(&it[4], it[4].min);
+    if (!alsa_interval_exact(&it[8])) alsa_set_interval(&it[8], it[8].min);
+#undef NARROW
+    return 0;
 }
 
 // ALSA PCM Node Callbacks
@@ -1013,42 +988,16 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         uint32_t supported_format = alsa_supported_formats();
         uint32_t supported_subformat = (1U << 0);
 
-        if (params->masks[0].bits[0]) {
-            params->masks[0].bits[0] &= supported_access;
-            if (!params->masks[0].bits[0]) params->masks[0].bits[0] = supported_access;
-        } else {
-            params->masks[0].bits[0] = supported_access;
+        uint32_t supported[3] = {supported_access, supported_format, supported_subformat};
+        for (unsigned m = 0; m < 3; m++) {
+            params->masks[m].bits[0] &= supported[m];
+            for (unsigned b = 1; b < 8; b++) params->masks[m].bits[b] = 0;
+            if (!params->masks[m].bits[0]) return -22;
         }
-        for (int b = 1; b < 8; b++) params->masks[0].bits[b] = 0;
-
-        if (params->masks[1].bits[0]) {
-            params->masks[1].bits[0] &= supported_format;
-            if (!params->masks[1].bits[0]) params->masks[1].bits[0] = (1U << 2);
-        } else {
-            params->masks[1].bits[0] = supported_format;
-        }
-        for (int b = 1; b < 8; b++) params->masks[1].bits[b] = 0;
-
-        if (params->masks[2].bits[0]) {
-            params->masks[2].bits[0] &= supported_subformat;
-            if (!params->masks[2].bits[0]) params->masks[2].bits[0] = (1U << 0);
-        } else {
-            params->masks[2].bits[0] = supported_subformat;
-        }
-        for (int b = 1; b < 8; b++) params->masks[2].bits[b] = 0;
 
         #define REFINE_INTERVAL(idx, hw_min, hw_max) do { \
             struct snd_interval *it = &params->intervals[idx]; \
-            uint32_t _hmin = (uint32_t)(hw_min); \
-            uint32_t _hmax = (uint32_t)(hw_max); \
-            if (it->empty) { \
-                it->min = _hmin; it->max = _hmax; it->empty = 0; \
-            } else { \
-                if (it->min < _hmin) it->min = _hmin; \
-                if (it->max == 0 || it->max > _hmax) it->max = _hmax; \
-                if (it->min > it->max) it->min = it->max; \
-            } \
-            it->openmin = 0; it->openmax = 0; it->integer = 1; \
+            if (!alsa_refine_interval(it, (hw_min), (hw_max))) return -22; \
         } while (0)
 
         REFINE_INTERVAL(0, 8, 32);          // SAMPLE_BITS
@@ -1072,7 +1021,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         params->cmask = params->rmask ? params->rmask : 0xFFFFFFFF;
         params->rmask = 0;
 
-        alsa_reconcile_hw_params(params, false);
+        if (alsa_reconcile_hw_params(params, false)) return -22;
 
         if (alsa_interval_exact(&params->intervals[3])) {
             params->rate_num = params->intervals[3].min;
@@ -1088,6 +1037,12 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
     if (request == SNDRV_PCM_IOCTL_HW_PARAMS) {
         struct snd_pcm_hw_params *params = (struct snd_pcm_hw_params *)arg;
         if (!params) return -14;
+
+        /* Validate the requested constraints before programming hardware.
+         * Never silently turn e.g. exact 32 kHz into 48 kHz: the caller would
+         * then send samples at the wrong playback rate. */
+        int refine = alsa_pcm_ioctl_internal(node, SNDRV_PCM_IOCTL_HW_REFINE, arg);
+        if (refine) return refine;
 
         // 1. Collapse ACCESS to a single bit
         uint32_t chosen_access = (1U << 3); // RW_INTERLEAVED
@@ -1113,7 +1068,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         params->masks[2].bits[0] = (1U << 0);
         for (int b = 1; b < 8; b++) params->masks[2].bits[b] = 0;
 
-        alsa_reconcile_hw_params(params, true);
+        if (alsa_reconcile_hw_params(params, true)) return -22;
 
         alsa_bits = alsa_format_to_bits(params->masks[1].bits[0]);
         alsa_channels = (uint8_t)params->intervals[2].min;
@@ -1183,6 +1138,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
             sw->avail_min = 1;
         }
         alsa_avail_min = sw->avail_min;
+        alsa_start_threshold = sw->start_threshold;
         if (alsa_control_page_virt) {
             ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->avail_min = sw->avail_min;
         }
@@ -1248,6 +1204,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
     if (request == SNDRV_PCM_IOCTL_PREPARE) {
         if (hda_is_present()) {
             hda_reset_stream();
+            hda_set_autostart(false);
         }
         alsa_pcm_state = 2; // SNDRV_PCM_STATE_PREPARED
         alsa_appl_ptr = 0;
@@ -1322,6 +1279,10 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
     }
 
     if (request == SNDRV_PCM_IOCTL_DRAIN) {
+        if (alsa_pcm_state == 2 && alsa_appl_ptr) {
+            if (hda_is_present()) hda_start_playback();
+            alsa_pcm_state = 3;
+        }
         if (alsa_pcm_state == 3 /* RUNNING */) {
             alsa_pcm_state = 5; // SNDRV_PCM_STATE_DRAINING
             if (alsa_status_page_virt) {
@@ -1358,9 +1319,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         struct snd_xferi *xferi = (struct snd_xferi *)arg;
         if (!xferi || !xferi->buf) return -14;
 
-        if (alsa_pcm_state == 4 /* SNDRV_PCM_STATE_XRUN */ || alsa_pcm_state == 2 /* SNDRV_PCM_STATE_PREPARED */) {
-            alsa_pcm_state = 3; // SNDRV_PCM_STATE_RUNNING
-        }
+        if (alsa_pcm_state == 4 /* SNDRV_PCM_STATE_XRUN */) return -32;
 
         uint32_t frame_size = (alsa_bits / 8) * alsa_channels;
         if (frame_size == 0) frame_size = 4;
@@ -1379,7 +1338,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         uint64_t frames_written = (written / frame_size);
         xferi->result = frames_written;
         alsa_appl_ptr += frames_written;
-        alsa_pcm_state = 3; // SNDRV_PCM_STATE_RUNNING
+        alsa_start_if_ready();
         if (alsa_control_page_virt) {
             ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = alsa_appl_ptr;
         }
@@ -1526,6 +1485,7 @@ static uint32_t alsa_pcm_write(struct vfs_node *node, uint32_t offset,
         }
     }
     alsa_appl_ptr += written / alsa_frame_bytes();
+    alsa_start_if_ready();
     alsa_publish_hw_ptr();
     return written;
 }

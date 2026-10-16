@@ -119,8 +119,8 @@ static inline void __add_wait_queue_entry_tail(wait_queue_head_t *wq_head,
   (!__builtin_constant_p(state) ||                                            \
    ((state) & (TASK_INTERRUPTIBLE | TASK_WAKEKILL)))
 
-/* Exits the ___wait_event loop on timeout as well as on the condition; skips
- * the condition evaluation when the timeout already expired. */
+/* Match Linux: a satisfied condition at expiry returns one, and an expired
+ * unsatisfied wait returns zero without entering the wait queue. */
 #define ___wait_cond_timeout(condition)                                       \
   ({                                                                          \
     bool __cond = (condition);                                                \
@@ -155,14 +155,27 @@ static inline void __add_wait_queue_entry_tail(wait_queue_head_t *wq_head,
 
 #define wait_event(wq_head, condition)                                        \
   do {                                                                        \
-    (void)__wait_event(wq_head, condition);                                   \
+    if (!(condition))                                                         \
+      (void)__wait_event(wq_head, condition);                                 \
   } while (0)
 
 #define wait_event_interruptible(wq_head, condition)                          \
-  ___wait_event(wq_head, condition, TASK_INTERRUPTIBLE, 0, 0, schedule())
+  ({                                                                          \
+    int __ret = 0;                                                            \
+    if (!(condition))                                                         \
+      __ret = ___wait_event(wq_head, condition, TASK_INTERRUPTIBLE, 0, 0,     \
+                           schedule());                                      \
+    __ret;                                                                    \
+  })
 
 #define wait_event_killable(wq_head, condition)                               \
-  ___wait_event(wq_head, condition, TASK_KILLABLE, 0, 0, schedule())
+  ({                                                                          \
+    int __ret = 0;                                                            \
+    if (!(condition))                                                         \
+      __ret = ___wait_event(wq_head, condition, TASK_KILLABLE, 0, 0,           \
+                           schedule());                                      \
+    __ret;                                                                    \
+  })
 
 /* The _lock_irq variants drop the caller's lock around schedule() and
  * re-acquire it; AvoryOS notes the lock but does not reorder it because the
@@ -187,7 +200,7 @@ static inline void __add_wait_queue_entry_tail(wait_queue_head_t *wq_head,
 #define wait_event_timeout(wq_head, condition, timeout)                       \
   ({                                                                          \
     long __ret = (long)(timeout);                                             \
-    if (!(condition))                                                         \
+    if (!___wait_cond_timeout(condition))                                     \
       __ret = __wait_event_timeout(wq_head, condition, timeout);              \
     __ret;                                                                    \
   })
@@ -199,7 +212,7 @@ static inline void __add_wait_queue_entry_tail(wait_queue_head_t *wq_head,
 #define wait_event_interruptible_timeout(wq_head, condition, timeout)         \
   ({                                                                          \
     long __ret = (long)(timeout);                                             \
-    if (!(condition))                                                         \
+    if (!___wait_cond_timeout(condition))                                     \
       __ret = __wait_event_interruptible_timeout(wq_head, condition, timeout);\
     __ret;                                                                    \
   })

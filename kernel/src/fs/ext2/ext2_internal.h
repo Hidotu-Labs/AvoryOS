@@ -11,9 +11,32 @@
 #include "apic/lapic_timer.h"
 #include <stdbool.h>
 
+/* Optional owner-only diagnostic phase for synchronous metadata home writes. */
+int ext2_write_block_phase(ext2_mount_t *mnt, uint32_t block_num,
+                           const void *buffer, const char **phase);
+/* Caller supplies four static labels: allocation, cache publication, device
+ * I/O and cache completion. The labels must outlive the transaction. */
+int ext2_write_block_traced(ext2_mount_t *mnt, uint32_t block_num,
+                            const void *buffer, const char **phase,
+                            const char *const stages[4]);
+
 /* Data runs only; metadata keeps the single-block journal path. */
 int ext2_write_blocks(ext2_mount_t *mnt, uint32_t first, uint32_t count,
                       const void *buffer);
+
+/* Scattered metadata writes.  Each member is one full, distinct block and the
+ * members may complete out of order; the driver's pipelined batch is used when
+ * available, otherwise the single-block path runs in order.  `result` is
+ * filled per entry: 0 success, -1 failure.  Returns 0 when every member
+ * reached the device, -1 otherwise. */
+typedef struct {
+  uint32_t block_num;
+  const void *buffer;
+  int result;
+} ext2_block_write_t;
+
+int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
+                            uint32_t count);
 
 int  ext2_write_superblock(ext2_mount_t *mnt);
 int  ext2_write_bgdt(ext2_mount_t *mnt);

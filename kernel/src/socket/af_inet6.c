@@ -448,7 +448,7 @@ static int inet6_accept(socket_t *sock, socket_t **out) {
   if (!s->tcp || !out) return -22;
   struct tcp_tcb *child = tcp_accept(s->tcp, socket_is_nonblocking(sock));
   if (!child) return socket_is_nonblocking(sock) ? -11 : -4;
-  socket_t *ns = socket_create(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+  socket_t *ns = socket_create_in_namespace(AF_INET6, SOCK_STREAM, IPPROTO_TCP, sock->net_ns);
   if (!ns) { tcp_abort(child); return -12; }
   struct inet6_sock *n = ns->sk;
   tcp_free(n->tcp);

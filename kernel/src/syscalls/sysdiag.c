@@ -9,6 +9,7 @@
 #include "../fs/vfs.h"
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
+#include "../mm/vma.h"
 #include "../sched/sched.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -53,6 +54,9 @@ static const char *sysdiag_lookup_ioctl_name(uint32_t req) {
   case 0x541D: return "TIOCCONS";
   case 0x5421: return "FIONBIO";
   case 0x5422: return "TIOCNOTTY";
+  case 0x5420: return "TIOCPKT";
+  case 0x80045430: return "TIOCGPTN";
+  case 0x40045431: return "TIOCSPTLCK";
   case 0x5430: return "TIOCPKT";
   case 0x5431: return "TIOCGPTN";
   case 0x5432: return "TIOCSPTLCK";
@@ -92,6 +96,7 @@ static const char *sysdiag_lookup_ioctl_name(uint32_t req) {
   case 0x891B: return "SIOCGIFNETMASK";
   case 0x8927: return "SIOCGIFHWADDR";
   case 0x8933: return "SIOCGIFINDEX";
+  case 0x8B07: return "SIOCGIWMODE";
 
   /* DRM */
   case 0xC0106400: return "DRM_IOCTL_VERSION";
@@ -340,6 +345,23 @@ void sysdiag_record_missing_ioctl(uint64_t fd, uint32_t request, uint64_t arg,
       (strcmp(node->name, "event0") == 0 || strcmp(node->name, "event1") == 0)) {
     return;
   }
+
+  /* F2FS capability probing is expected to fail on regular non-F2FS files. */
+  if (request == 0x8004F50C && node &&
+      (node->flags & FS_TYPE_MASK) == FS_FILE)
+    return;
+
+  /* TIOCGPTN on a non-PTY descriptor: ENOTTY is the correct Linux answer
+   * (isatty-style PTY detection by Electron/Chromium on stdio and log
+   * files). Only PTY master nodes implement it; anything else reaching
+   * here is a benign probe, not an unhandled ioctl. */
+  if (request == 0x80045430)
+    return;
+
+  /* Wireless-extension probes (e.g. kdeconnectd SIOCGIWMODE on sockets).
+   * No wireless hardware exists here; failure is expected. */
+  if ((request & 0xFF00) == 0x8B00)
+    return;
 
   uint64_t now_ms = lapic_timer_get_ms();
   bool first_time = false;
@@ -638,8 +660,9 @@ static void sysdiag_capture_error_path(uint64_t num,
     if (regs->r10 & 0x20 /* MAP_ANONYMOUS */)
       return;
     struct thread *t = sched_get_current();
-    if (t && regs->r8 < MAX_FDS)
-      sched_get_fd_path_snapshot(t->tid, (uint32_t)regs->r8, out, outsz);
+    uint32_t fd = (uint32_t)regs->r8; /* mmap consumes only the low int. */
+    if (t && fd < MAX_FDS)
+      sched_get_fd_path_snapshot(t->tid, fd, out, outsz);
     return;
   }
   case 2:  // open
@@ -763,6 +786,27 @@ static bool sysdiag_is_firefox_userns_probe(uint64_t num, int64_t err,
          !regs->rsi && !regs->rdx && !regs->r10 && !regs->r8;
 }
 
+static bool sysdiag_is_readonly_rlimit_probe(uint64_t num, int64_t err,
+                                            struct thread *t,
+                                            const struct syscall_regs *regs) {
+  /* Chromium CheckMemoryReadOnly() calls getrlimit(RLIMIT_NPROC) on the
+   * start of a protected page and requires EFAULT. glibc uses prlimit64.
+   * Require mapping evidence as well as the ABI shape: a NULL/unmapped
+   * buffer or a failure copying to writable memory remains a real error. */
+  if (num != 302 || err != -14 || !t || !t->mm || !regs ||
+      (uint32_t)regs->rdi != 0 || (uint32_t)regs->rsi != 6 || regs->rdx ||
+      !regs->r10 || (regs->r10 & 4095) || regs->r10 > USER_SPACE_LIMIT - 15)
+    return false;
+
+  spinlock_acquire(&t->mm->lock);
+  struct vma *v = vma_find(&t->mm->vmas, regs->r10);
+  bool readonly = v && (v->prot & 1 /* PROT_READ */) &&
+                  !(v->prot & 2 /* PROT_WRITE */) &&
+                  v->end - regs->r10 >= 16 /* struct rlimit64 */;
+  spinlock_release(&t->mm->lock);
+  return readonly;
+}
+
 void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
                                   struct thread *t,
                                   const struct syscall_regs *regs) {
@@ -784,6 +828,8 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
     severe = false;
   if (sysdiag_is_firefox_userns_probe(syscall_num, error_code, t, regs))
     severe = false;
+  if (sysdiag_is_readonly_rlimit_probe(syscall_num, error_code, t, regs))
+    severe = false;
   const char *comm = (t && t->comm[0]) ? t->comm : "?";
   char cap_attr[256];
   if (sysdiag_capture_xattr_name(syscall_num, regs, cap_attr, sizeof(cap_attr)) &&
@@ -797,7 +843,21 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
    *   intentionally returns ENOTTY and sysdiag_record_missing_ioctl already
    *   filters it — this quiets the generic error line as well). */
   if (severe && regs && t) {
-    if (syscall_num == 55 /* getsockopt */ && error_code == -92 &&
+    if (syscall_num == 444 /* landlock_create_ruleset */ && error_code == -38 &&
+        !regs->rdi && !regs->rsi && (uint32_t)regs->rdx == 1) {
+      /* Explicit unsupported ABI-version query, not failed enforcement. */
+      severe = false;
+    } else if (syscall_num == 55 && error_code == -92 &&
+               (int)regs->rsi == 6 && (int)regs->rdx == 11 /* TCP_INFO */) {
+      /* Optional TCP statistics are not implemented by our network stack. */
+      severe = false;
+    } else if (syscall_num == 16 && error_code == -25 &&
+               (uint32_t)regs->rsi == 0x8004F50C) {
+      vfs_node_t *probe = fd_node_get(t, (uint32_t)regs->rdi);
+      if (probe && (probe->flags & FS_TYPE_MASK) == FS_FILE)
+        severe = false; /* F2FS_IOC_GET_FEATURES on a non-F2FS file. */
+      fd_node_put(&probe);
+    } else if (syscall_num == 55 /* getsockopt */ && error_code == -92 &&
         regs->rsi == 1 /* SOL_SOCKET */ &&
         (regs->rdx == 31 /* SO_PEERSEC */ || regs->rdx == 59 /* SO_PEERGROUPS */ ||
          regs->rdx == 77 /* SO_PEERPIDFD */)) {
@@ -851,6 +911,32 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
                 syscall_num == 442 /* mount_setattr */)) {
       /* New mount API: deliberate stubs (no fs-context support yet).
        * libmount falls back to legacy mount(2) on ENOSYS. */
+      severe = false;
+    } else if (error_code == -38 /* ENOSYS */ &&
+               (syscall_num == 425 /* io_uring_setup */ ||
+                syscall_num == 426 /* io_uring_enter */ ||
+                syscall_num == 427 /* io_uring_register */)) {
+      /* io_uring setup rejects feature requests the sync executor does
+       * not provide (SQPOLL/IOPOLL and friends); callers fall back,
+       * same as a Linux kernel without that configuration. */
+      severe = false;
+    } else if (syscall_num == 16 /* ioctl */ && error_code == -25 &&
+               (uint32_t)regs->rsi == 0x80045430 /* TIOCGPTN */) {
+      /* PTY-number probe on a non-PTY descriptor (Electron stdio/log
+       * isatty check). Linux also answers ENOTTY here; only a PTY
+       * master implements TIOCGPTN. */
+      severe = false;
+    } else if (syscall_num == 16 /* ioctl */ && error_code == -25 &&
+               (((uint32_t)regs->rsi & 0xFF00) == 0x8B00)) {
+      /* Wireless-extension probe (kdeconnectd SIOCGIWMODE): no wireless
+       * hardware exists, so ENOTTY is the expected answer. */
+      severe = false;
+    } else if (syscall_num == 54 /* setsockopt */ && error_code == -92 &&
+               regs->rsi == 1 /* SOL_SOCKET */ &&
+               (regs->rdx == 2 /* SO_REUSEADDR */ ||
+                regs->rdx == 15 /* SO_REUSEPORT */)) {
+      /* Unsupported on AF_UNIX, same as Linux; GLib/GVFS probes these
+       * unconditionally and handles ENOPROTOOPT. */
       severe = false;
     }
   }
@@ -954,9 +1040,7 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
     const char *sname = syscall_get_name(syscall_num);
     const char *ename = sysdiag_lookup_errno_name(error_code);
     bool unsupported_namespace = syscall_num == 56 && error_code == -1 &&
-        regs && (regs->rdi & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS |
-                             CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID |
-                             CLONE_NEWNET | CLONE_NEWTIME));
+        regs && (regs->rdi & (CLONE_NEWCGROUP | CLONE_NEWUSER | CLONE_NEWTIME));
     bool unsupported_strict_check = syscall_num == 54 && error_code == -92 &&
         regs && regs->rsi == 270 && regs->rdx == 12;
     klog_puts(unsupported_namespace
@@ -1004,7 +1088,7 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
       klog_puts("'");
     }
     if (unsupported_namespace)
-      klog_puts(" reason='namespace isolation is not implemented'");
+      klog_puts(" reason='requested namespace isolation is not implemented'");
     if (unsupported_strict_check)
       klog_puts(" option='NETLINK_GET_STRICT_CHK' reason='strict Netlink request validation is not implemented'");
     if (syscall_num == 9 && error_code == -22 && regs && !regs->rsi)

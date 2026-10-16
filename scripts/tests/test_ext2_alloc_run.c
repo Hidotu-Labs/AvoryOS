@@ -46,6 +46,26 @@ void klogf(const char *fmt, ...) { (void)fmt; }
 void klog_puts(const char *text) { (void)text; }
 void klog_uint64(uint64_t value) { (void)value; }
 int block_flush(struct block_device *dev) { (void)dev; return 0; }
+/* Mirrors drivers/storage/block.c, which this test does not link: use the
+ * device's pipelined op when present, otherwise run the members through the
+ * ordered single-request fallback. */
+int block_write_batch(struct block_device *dev, struct block_io_req *reqs,
+                      unsigned n) {
+  if (!dev || !reqs || n == 0)
+    return -1;
+  if (dev->write_batch)
+    return dev->write_batch(dev, reqs, n);
+  int worst = 0;
+  for (unsigned i = 0; i < n; i++) {
+    reqs[i].result = dev->write_sectors
+                         ? dev->write_sectors(dev, reqs[i].lba, reqs[i].count,
+                                              reqs[i].buf)
+                         : -1;
+    if (reqs[i].result < worst)
+      worst = reqs[i].result;
+  }
+  return worst;
+}
 void *kcalloc(size_t count, size_t size) { return calloc(count, size); }
 static int fail_alloc, fail_read = -1, fail_write = -1, fail_start, fail_stop;
 void *kmalloc(size_t n) { return fail_alloc ? NULL : malloc(n); }
@@ -86,6 +106,13 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
 int ext3_journal_block(ext2_mount_t *mnt, uint32_t block, const void *buf) {
   submissions++;
   return ext2_write_block(mnt, block, buf);
+}
+bool ext3_journal_read_staged(ext2_mount_t *mnt, uint32_t block,
+                              void *buf) {
+  (void)mnt;
+  (void)block;
+  (void)buf;
+  return false;
 }
 static ext2_mount_t *make_mount(void) {
   ext2_mount_t *mnt = calloc(1, sizeof(*mnt));

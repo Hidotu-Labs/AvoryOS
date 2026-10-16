@@ -11,7 +11,8 @@ enum gpu_diag_kind {
   GPU_DIAG_VM_UPDATE, GPU_DIAG_PAGE_BIND, GPU_DIAG_DMA_MAP,
   GPU_DIAG_PAGE_ALLOC, GPU_DIAG_PAGE_FREE, GPU_DIAG_FENCE_EMIT,
   GPU_DIAG_FENCE_SIGNAL, GPU_DIAG_RESV_FENCE, GPU_DIAG_VM_OFFSET, GPU_DIAG_CPU_VMA,
-  GPU_DIAG_MAX = GPU_DIAG_CPU_VMA
+  GPU_DIAG_VM_FAILURE,
+  GPU_DIAG_MAX = GPU_DIAG_VM_FAILURE
 };
 enum gpu_diag_prime_stage {
   GPU_PRIME_SOURCE_ALLOC = 1, GPU_PRIME_SOURCE_EXPORT,
@@ -24,6 +25,9 @@ void gpu_diag_prime_error(unsigned int stage, const void *object,
                           long result);
 unsigned int gpu_diag_level(void);
 int gpu_diag_resource_enabled(void);
+/* IRQ-safe: mode 4 retains the first reported GPUVM fault/timeout. */
+void gpu_diag_vm_failure(const void *device, unsigned int pasid,
+                          unsigned int tgid, unsigned int pid);
 void gpu_diag_record(unsigned int kind, const void *object,
                      __UINT64_TYPE__ a, __UINT64_TYPE__ b, __UINT64_TYPE__ c,
                      __UINT64_TYPE__ d, long result);

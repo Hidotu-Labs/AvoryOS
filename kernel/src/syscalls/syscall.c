@@ -6,6 +6,9 @@
 #include "../cpu/msr.h"
 #include "../lib/string.h"
 #include "../sched/sched.h"
+#include "../sched/seccomp.h"
+#include "../smp/cpu.h"
+#include "arch/uaccess.h"
 #include <stdint.h>
 
 extern void syscall_entry(void);
@@ -458,10 +461,39 @@ static void log_unimplemented_syscall(struct syscall_regs *regs, struct thread *
   }
 }
 
+static bool mmap_failure_is_address_probe(const uint64_t args[6]) {
+  /* Wine get_host_addr_space_limit() tries descending powers of two with
+   * a one-page PROT_NONE anonymous MAP_FIXED_NOREPLACE reservation. These
+   * addresses must fail above our canonical user range; they are not OOM.
+   * Match the request, not the process name, and leave real reservations
+   * (including valid-address ENOMEM) in the diagnostic reporting budget. */
+  uint64_t addr = args[0];
+  return addr > USER_SPACE_LIMIT && !(addr & (addr - 1)) &&
+         args[1] == 4096 && args[2] == 0 &&
+         (args[3] == 0x100022 || args[3] == 0x104022) &&
+         (uint32_t)args[4] == UINT32_MAX && args[5] == 0;
+}
+
 static inline void record_syscall_error(struct thread *t, uint64_t syscall_num, int64_t err) {
   if (!t) return;
   t->last_error_code = err;
   t->last_error_syscall_num = syscall_num;
+  if (syscall_num == SYS_MMAP && err == -12 &&
+      !mmap_failure_is_address_probe(t->last_syscall_args)) {
+    /* Preserve the failing reservation in the log before rt_sigreturn or a
+     * crash handler replaces last_syscall_args. Bound retries globally. */
+    static uint32_t mmap_failure_reports;
+    if (__atomic_fetch_add(&mmap_failure_reports, 1, __ATOMIC_RELAXED) < 16)
+      klogf("[MMAP-FAIL] tid=%u comm=%s addr=0x%llx len=0x%llx prot=0x%llx flags=0x%llx fd=0x%llx off=0x%llx cursor=0x%llx\n",
+            t->tid, t->comm,
+            (unsigned long long)t->last_syscall_args[0],
+            (unsigned long long)t->last_syscall_args[1],
+            (unsigned long long)t->last_syscall_args[2],
+            (unsigned long long)t->last_syscall_args[3],
+            (unsigned long long)t->last_syscall_args[4],
+            (unsigned long long)t->last_syscall_args[5],
+            (unsigned long long)(t->mm ? t->mm->mmap_next_addr : 0));
+  }
 }
 
 void syscall_dispatcher(struct syscall_regs *regs) {
@@ -492,6 +524,13 @@ void syscall_dispatcher(struct syscall_regs *regs) {
 
   uint64_t syscall_num = regs->rax;
   uint64_t syscall_return_ip = regs->rip;
+
+  if (t && !t->seccomp_compat_dispatch && seccomp_mode(t)) {
+    uint64_t args[6] = {regs->rdi, regs->rsi, regs->rdx,
+                         regs->r10, regs->r8, regs->r9};
+    if (!seccomp_syscall(t, regs, (uint32_t)syscall_num, 0xC000003E, args))
+      goto finish_filtered;
+  }
 
   if (regs->rax >= MAX_SYSCALL) {
     log_unimplemented_syscall(regs, t);
@@ -527,10 +566,17 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     }
     if (syscall_restart_error(regs->rax) ||
         (t && (t->pending_signals & ~t->signal_mask)))
-      signal_finish_syscall(regs, syscall_num == SYS_RT_SIGRETURN ? UINT64_MAX : syscall_num,
-                             syscall_return_ip);
+      signal_finish_syscall(regs, syscall_num, syscall_return_ip);
     if (t)
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
+    if (t && syscall_num == SYS_RT_SIGRETURN) {
+      /* No scheduling or signal delivery may follow publication: a fatal
+       * pending signal can switch to an unrelated task on this CPU. Keep
+       * its syscall return from consuming the dead task's register frame. */
+      __asm__ volatile("cli" ::: "memory");
+      cpu_get_current()->sigreturn_frame = (uint64_t)&t->sigreturn_regs;
+      __asm__ volatile("" ::: "memory");
+    }
     return;
   }
 
@@ -559,6 +605,7 @@ void syscall_dispatcher(struct syscall_regs *regs) {
   log_syscall_error(syscall_num, t, (int64_t)regs->rax);
 #endif
 
+finish_filtered:
   if (t) {
     t->last_syscall_ret = (int64_t)regs->rax;
     if ((int64_t)regs->rax < 0 && (int64_t)regs->rax >= -4095) {

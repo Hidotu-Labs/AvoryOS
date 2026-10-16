@@ -50,8 +50,10 @@ struct cpu_info {
   uint64_t sigreturn_frame;
 #define MAX_TIMER_HEAP_SIZE 1024
 
-  // Timed sleepers ordered by wakeup_ticks. Protected by queue_lock.
-  struct thread *deadline_head;
+  // Timed sleepers ordered by wakeup_ticks; the cached leftmost node is the
+  // earliest deadline. Protected by queue_lock.
+  struct rb_root deadline_tree;
+  struct rb_node *deadline_leftmost;
   struct thread *runqueue_tails[32]; // Tails; placed after assembly ABI fields
   uint64_t next_aging_scan_ms;      // Next per-thread aging pass
   struct thread *timer_heap[MAX_TIMER_HEAP_SIZE];

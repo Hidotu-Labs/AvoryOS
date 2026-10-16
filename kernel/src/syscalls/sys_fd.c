@@ -26,6 +26,7 @@
 #include "../drivers/storage/block.h"
 #include "arch/uaccess.h"
 #include <stdint.h>
+#include <linuxkpi/native_vfs.h>
 
 // ---------------------------------------------------------------------------
 // FD allocation helpers
@@ -58,6 +59,7 @@ int alloc_fd(struct thread *t) {
   spinlock_acquire(&t->files->lock);
   int fd = fd_find_free_locked(t, 0);
   if (fd >= 0) {
+    fd_description_set_locked(t, fd, 0);
     t->fds[fd] = FD_RESERVED;
     t->files->next_fd = (uint32_t)fd + 1;
   }
@@ -71,6 +73,7 @@ int alloc_fd_from(struct thread *t, int from) {
   spinlock_acquire(&t->files->lock);
   int fd = fd_find_free_locked(t, from);
   if (fd >= 0) {
+    fd_description_set_locked(t, fd, 0);
     t->fds[fd] = FD_RESERVED;
     /* A minimum-fd allocation must not hide free slots below it. */
     if ((uint32_t)fd == t->files->next_fd)
@@ -141,6 +144,10 @@ static void fd_advance_offset(struct thread *t, uint64_t fd,
  * Wayland/file pattern) stay on the caller's stack; larger ones use the
  * heap. Pair with fd_release_iov(). Returns 0 on success, -12 on allocation
  * failure, -14 on a bad user pointer. */
+#include "../fs/mount_namespace.h"
+#include "../sched/capability.h"
+#define fs_root vfs_task_root()
+
 #define FD_IOV_STACK_MAX 16u
 
 static int fd_snap_iov(uint64_t iov_u, uint64_t iovcnt,
@@ -363,7 +370,7 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
   else if (strncmp(path, "dev/", 4) == 0)
     dev_path = path + 4;
 
-  if (dev_path) {
+  if (dev_path && !vfs_namespace_active() && fs_root == vfs_backing_node(fs_root)) {
     if (strcmp(dev_path, "dri/card0") == 0) {
       node = ascentdrm_create_client_node();
       if (!node)
@@ -420,7 +427,7 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
         return (uint64_t)-2;
 
       pty_pair_t *pty = pty_get_pair(pty_index);
-      if (!pty || pty->locked)
+      if (!pty || pty->devpts_instance || pty->locked)
         return (uint64_t)-2;
 
       node = kmalloc(sizeof(vfs_node_t));
@@ -467,7 +474,7 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
 
   if (!node) {
     uint64_t proc_fd;
-    if (!(flags & O_NOFOLLOW) && parse_proc_self_fd_path(path, &proc_fd)) {
+    if (!t->namei_resolve_flags && !(flags & O_NOFOLLOW) && parse_proc_self_fd_path(path, &proc_fd)) {
       node = fd_pin_node(t, proc_fd, NULL, NULL);
       if (!node)
         return (uint64_t)-2; // ENOENT: no such open descriptor
@@ -483,7 +490,7 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     char parent_walk[512];
     const char *lookup_path = path;
     vfs_node_t *lookup_base = base_dir;
-    if (path[0] != '/' && (!strcmp(path, "..") || !strncmp(path, "../", 3))) {
+    if (!vfs_namespace_active() && path[0] != '/' && (!strcmp(path, "..") || !strncmp(path, "../", 3))) {
       spinlock_acquire(&t->files->lock);
       const char *start = dirfd == AT_FDCWD ? t->cwd_path : fd_path_value(t, dirfd);
       bool ok = fd_make_path(parent_walk, sizeof(parent_walk), start, path);
@@ -558,9 +565,10 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
       }
 
       mode &= ~t->umask;
-      if (vfs_create(parent, file_name, (uint16_t)mode) != 0) {
+      int create_result = vfs_create(parent, file_name, (uint16_t)mode);
+      if (create_result != 0) {
         if (parent_owned) vfs_close(parent);
-        return (uint64_t)-17;
+        return (uint64_t)(create_result < 0 ? create_result : -17);
       }
 
       node = vfs_finddir(parent, file_name);
@@ -580,6 +588,11 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     return (uint64_t)-17; // EEXIST
   }
 
+  if (!(flags & O_PATH) && (vfs_mount_flags(node) & 4) &&
+      ((node->flags & FS_TYPE_MASK) == FS_CHARDEV || (node->flags & FS_TYPE_MASK) == FS_BLOCKDEV)) {
+    if (node_owned) vfs_close(node);
+    return (uint64_t)-13;
+  }
   uint32_t requested = 0;
   /* O_PATH handles carry no I/O rights: Linux skips the file's own permission
    * check at open (path-component search checks still applied during the
@@ -588,6 +601,10 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     if ((flags & O_ACCMODE) == O_RDONLY) requested = 4;
     else if ((flags & O_ACCMODE) == O_WRONLY) requested = 2;
     else if ((flags & O_ACCMODE) == O_RDWR) requested = 6;
+  }
+  if ((requested & 2) && vfs_mount_readonly(node)) {
+    if (node_owned) vfs_close(node);
+    return (uint64_t)-30;
   }
   if (requested && !vfs_access(node, requested)) {
     if (node_owned) vfs_close(node);
@@ -657,7 +674,9 @@ open_done:
   const char *base_path = t->cwd_path;
   if (path[0] != '/' && dirfd != AT_FDCWD && dirfd >= 0 && dirfd < MAX_FDS)
     base_path = fd_path_value(t, dirfd);
-  bool path_ok = fd_make_path(full_path, sizeof(full_path), base_path, path);
+  bool path_ok = vfs_namespace_active() && node->view_backing
+      ? vfs_namespace_node_path(node, full_path, sizeof(full_path))
+      : fd_make_path(full_path, sizeof(full_path), base_path, path);
   spinlock_release(&t->files->lock);
   if (!path_ok) {
     if (node_owned) vfs_close(node);
@@ -695,6 +714,98 @@ open_done:
 
 
   return fd;
+}
+
+/* Linux open_how v0. Restrict the complete walk, including absolute
+ * symlink targets and fd-relative '..', instead of checking path spelling. */
+static uint64_t sys_mount_setattr(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
+                                  uint64_t attr_ptr, uint64_t size, uint64_t a5) {
+  (void)a5;
+  struct thread *task=sched_get_current();
+  if(!capability_has(task,CAP_SYS_ADMIN))return (uint64_t)-1;
+  if(flags&~(0x100ULL|0x1000ULL|0x8000ULL))return (uint64_t)-22;
+  struct {uint64_t set,clear,propagation,userns_fd;} attr;
+  if(size<sizeof(attr))return (uint64_t)-22;
+  if(size>4096)return (uint64_t)-7;
+  if(!is_user_range((void*)attr_ptr,size)||copy_from_user(&attr,(void*)attr_ptr,sizeof(attr)))return (uint64_t)-14;
+  for(uint64_t i=sizeof(attr);i<size;i++){unsigned char extra;if(copy_from_user(&extra,(void*)(attr_ptr+i),1))return (uint64_t)-14;if(extra)return (uint64_t)-7;}
+  if((attr.set|attr.clear)&~15ULL)return (uint64_t)-95;
+  if(attr.propagation&&attr.propagation!=(1<<18)&&attr.propagation!=(1<<19))return (uint64_t)-95;
+  char path[512];if(!is_user_range((void*)path_ptr,1))return (uint64_t)-14;
+  long len=strncpy_from_user(path,(void*)path_ptr,sizeof(path));if(len<0)return (uint64_t)-14;if((uint64_t)len>=sizeof(path))return (uint64_t)-36;
+  if(!len&&!(flags&0x1000))return (uint64_t)-2;
+  vfs_node_t *base=(int)dirfd==AT_FDCWD?(task->cwd_node?task->cwd_node:fs_root):fd_pin_node(task,dirfd,NULL,NULL);
+  if(!base)return (uint64_t)-9;
+  vfs_node_t *point;
+  if(!len){point=base;vfs_open(point);}
+  else point=(flags&0x100)?vfs_resolve_symlink_node(base,path):vfs_resolve_path_at(base,path);
+  if((int)dirfd!=AT_FDCWD)vfs_close(base);
+  if(!point)return (uint64_t)-2;
+  int result=vfs_namespace_setattr(point,attr.set,attr.clear,(flags&0x8000)!=0);
+  vfs_close(point);return (uint64_t)result;
+}
+
+static uint64_t sys_openat2(uint64_t dirfd, uint64_t path_ptr, uint64_t how_ptr,
+                            uint64_t size, uint64_t a4, uint64_t a5) {
+  (void)a4; (void)a5;
+  struct { uint64_t flags, mode, resolve; } how;
+  if (size < sizeof(how)) return (uint64_t)-22;
+  if (size > 4096) return (uint64_t)-7;
+  if (!is_user_range((void *)how_ptr, size) || copy_from_user(&how, (void *)how_ptr, sizeof(how))) return (uint64_t)-14;
+  for (uint64_t i = sizeof(how); i < size; i++) {
+    unsigned char extra;
+    if (copy_from_user(&extra, (void *)(how_ptr+i), 1)) return (uint64_t)-14;
+    if (extra) return (uint64_t)-7;
+  }
+  if ((how.resolve & ~0x3fULL) || ((how.resolve & 0x18) == 0x18)) return (uint64_t)-22;
+  if (how.resolve & 0x20) return (uint64_t)-11; /* RESOLVE_CACHED: caller can retry. */
+  if (how.flags & ~0x7fffffULL) return (uint64_t)-22;
+  if ((how.flags & O_ACCMODE) == O_ACCMODE || (how.mode & ~07777ULL)) return (uint64_t)-22;
+  if (how.mode && !(how.flags & (O_CREAT | __O_TMPFILE))) return (uint64_t)-22;
+  if ((how.flags & O_PATH) && (how.flags & ~(uint64_t)(O_PATH | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW))) return (uint64_t)-22;
+  char path[512];
+  if (!is_user_range((void *)path_ptr, 1)) return (uint64_t)-14;
+  long n = strncpy_from_user(path, (void *)path_ptr, sizeof(path));
+  if (n < 0) return (uint64_t)-14;
+  if ((uint64_t)n >= sizeof(path)) return (uint64_t)-36;
+  struct thread *task = sched_get_current();
+  if (!task) return (uint64_t)-1;
+  if (!how.resolve) return sys_open_path((int)dirfd, path, how.flags, how.mode);
+  vfs_node_t *anchor = NULL;
+  if (how.resolve & 0x18) {
+    vfs_node_t *base = (int)dirfd == AT_FDCWD ? (task->cwd_node ? task->cwd_node : fs_root) : fd_pin_node(task, dirfd, NULL, NULL);
+    if (!base) return (uint64_t)-9;
+    if ((base->flags & FS_TYPE_MASK) != FS_DIRECTORY) { if ((int)dirfd != AT_FDCWD) vfs_close(base); return (uint64_t)-20; }
+    anchor = vfs_namespace_root_view(base);
+    if ((int)dirfd != AT_FDCWD) vfs_close(base);
+    if (!anchor) return (uint64_t)-12;
+  }
+  struct mount_namespace *temporary = vfs_namespace_lookup_copy(task);
+  if (!temporary) { if (anchor) vfs_close(anchor); return (uint64_t)-12; }
+  spinlock_acquire(&task->namespace_lock);
+  struct mount_namespace *saved_ns = task->mount_ns;
+  vfs_node_t *saved_root = task->fs_root_node;
+  uint64_t saved_policy = task->namei_resolve_flags;
+  int saved_error = task->namei_error;
+  vfs_node_t *saved_path_root = task->namei_path_root;
+  task->namei_path_root = vfs_task_root();
+  task->mount_ns = temporary;
+  task->fs_root_node = anchor ? anchor : vfs_task_root();
+  task->namei_resolve_flags = how.resolve;
+  task->namei_error = 0;
+  spinlock_release(&task->namespace_lock);
+  int64_t result = (int64_t)sys_open_path((int)dirfd, path, how.flags, how.mode);
+  if (result < 0 && task->namei_error) result = task->namei_error;
+  spinlock_acquire(&task->namespace_lock);
+  task->mount_ns = saved_ns;
+  task->fs_root_node = saved_root;
+  task->namei_resolve_flags = saved_policy;
+  task->namei_error = saved_error;
+  task->namei_path_root = saved_path_root;
+  spinlock_release(&task->namespace_lock);
+  vfs_namespace_put(temporary);
+  if (anchor) vfs_close(anchor);
+  return (uint64_t)result;
 }
 
 static uint64_t sys_openat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
@@ -737,6 +848,13 @@ static uint64_t sys_open(uint64_t path_ptr, uint64_t flags, uint64_t mode,
   (void)a4;
   (void)a5;
   return sys_openat(AT_FDCWD, path_ptr, flags, mode, 0, 0);
+}
+
+/* Legacy x86-64 creat(path, mode) is open with these exact flags. */
+static uint64_t sys_creat(uint64_t path, uint64_t mode, uint64_t a2,
+                          uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a2; (void)a3; (void)a4; (void)a5;
+  return sys_openat(AT_FDCWD, path, O_WRONLY | O_CREAT | O_TRUNC, mode, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +984,8 @@ static int64_t fd_duplicate(struct thread *t, uint64_t oldfd,
 
   vfs_node_t *previous = t->fds[target];
   vfs_node_ref(node); // temporary pin until the destination owns its reference
+  fd_description_set_locked(t, (int)target,
+                            fd_description_id_locked(t, (int)oldfd));
   t->fds[target] = FD_RESERVED;
   t->fd_offsets[target] = t->fd_offsets[oldfd];
   t->fd_flags[target] = t->fd_flags[oldfd] & ~(uint64_t)FD_FLAGS_CLOEXEC_BIT;
@@ -1693,12 +1813,38 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
 // fcntl
 // ---------------------------------------------------------------------------
 
+/* Resolve both descriptors under one lock: CLONE_FILES close/reuse cannot
+ * change either slot between validation and the identity comparison. */
+static int64_t fd_query_description(struct thread *t, uint64_t fd, int other) {
+  if (!t || !t->files || fd >= MAX_FDS || other < 0 || other >= MAX_FDS)
+    return -9; // EBADF
+  spinlock_acquire(&t->files->lock);
+  int64_t result = -9;
+  vfs_node_t *left = t->fds[fd], *right = t->fds[other];
+  if (fd_is_valid_node(left) && fd_is_valid_node(right)) {
+    /* fd_install() may export one Linux struct file through distinct native
+     * wrappers. Its device pointer is the real description in that case. */
+    bool left_linux = asc_vfs_node_is_linux_file(left);
+    bool right_linux = asc_vfs_node_is_linux_file(right);
+    if (left_linux || right_linux)
+      result = left_linux && right_linux && left->device &&
+               left->device == right->device;
+    else
+      result = fd_description_id_locked(t, (int)fd) ==
+               fd_description_id_locked(t, other);
+  }
+  spinlock_release(&t->files->lock);
+  return result;
+}
+
 static uint64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a3,
                           uint64_t a4, uint64_t a5) {
   (void)a3;
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
+  if ((uint32_t)cmd == F_DUPFD_QUERY)
+    return (uint64_t)fd_query_description(t, (uint32_t)fd, (int)arg);
   if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC)
     return (uint64_t)fd_duplicate(t, fd, (uint64_t)(int64_t)(int)arg,
                                    false, cmd == F_DUPFD_CLOEXEC);
@@ -1839,7 +1985,12 @@ static uint64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t a2,
   }
   int result = vfs_truncate(node, (uint32_t)length);
   vfs_close(node);
-  return result == 0 ? 0 : (uint64_t)-1;
+  if (result == 0)
+    return 0;
+  /* Backends report negative errno values (e.g. -ENOMEM when the resize
+   * cannot allocate under memory pressure); collapsing every failure to
+   * -EPERM hid the real cause from applications. */
+  return result < 0 ? (uint64_t)result : (uint64_t)-1;
 }
 
 static uint64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
@@ -2188,50 +2339,88 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
     (void)data_ptr;
     (void)a5;
 
-    const char *source = (const char *)source_ptr;
-    const char *target = (const char *)target_ptr;
-    const char *fstype = (const char *)fstype_ptr;
+    /* Legacy libc mount magic occupies the propagation-bit range. Linux
+     * strips MS_MGC_VAL before interpreting modern mount flags. */
+    if ((flags & 0xffff0000ULL) == 0xc0ed0000ULL) flags &= 0xffffULL;
 
-    if (!target)
-        return (uint64_t)-14;
-
-    /* Linux MS_REMOUNT = 0x20 */
-    if (flags & 0x20) {
-        vfs_node_t *mountpoint = vfs_resolve_path(target);
-        if (mountpoint) {
-            vfs_close(mountpoint);
-            return 0;
-        }
-        return (uint64_t)-2;
+    char source_buf[512], target_buf[512], type_buf[64];
+    const char *source = NULL, *target = target_buf, *fstype = NULL;
+    if (!target_ptr || !is_user_range((void *)target_ptr, 1)) return (uint64_t)-14;
+    long n = strncpy_from_user(target_buf, (void *)target_ptr, sizeof(target_buf));
+    if (n < 0) return (uint64_t)-14;
+    if ((uint64_t)n >= sizeof(target_buf)) return (uint64_t)-36;
+    if (source_ptr) {
+        if (!is_user_range((void *)source_ptr, 1)) return (uint64_t)-14;
+        n = strncpy_from_user(source_buf, (void *)source_ptr, sizeof(source_buf));
+        if (n < 0) return (uint64_t)-14;
+        if ((uint64_t)n >= sizeof(source_buf)) return (uint64_t)-36;
+        source = source_buf;
+    }
+    if (fstype_ptr) {
+        if (!is_user_range((void *)fstype_ptr, 1)) return (uint64_t)-14;
+        n = strncpy_from_user(type_buf, (void *)fstype_ptr, sizeof(type_buf));
+        if (n < 0) return (uint64_t)-14;
+        if ((uint64_t)n >= sizeof(type_buf)) return (uint64_t)-36;
+        fstype = type_buf;
     }
 
-    /* Linux mount propagation changes:
-     * MS_SHARED = 1<<20, MS_SLAVE = 1<<19, MS_PRIVATE = 1<<18, MS_UNBINDABLE = 1<<17
-     * Often used by bwrap (e.g. mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)).
-     */
-    if (flags & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20))) {
-        vfs_node_t *mountpoint = vfs_resolve_path(target);
-        if (mountpoint) {
-            vfs_close(mountpoint);
-            return 0;
+    struct thread *task = sched_get_current();
+    if (!capability_has(task, CAP_SYS_ADMIN)) return (uint64_t)-1;
+    vfs_node_t *base = task && task->cwd_node ? task->cwd_node : fs_root;
+    /* Namespace mount operations resolve relative to the actual directory
+     * handle: after pivot_root the saved textual cwd is deliberately stale. */
+    if (vfs_namespace_active()) {
+        vfs_node_t *point = vfs_resolve_path_at(base, target);
+        if (!point) return (uint64_t)-2;
+        int result = -95;
+        if (flags & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20))) {
+            /* Tables are private by construction. Shared propagation needs
+             * peer groups; reject that request rather than pretend to share. */
+            result = (flags & ((1 << 17) | (1 << 20))) ? -95 : 0;
+        } else if (flags & 0x20) {
+            result = vfs_namespace_remount(point, flags);
+        } else if (flags & 0x2000) {
+            vfs_node_t *src = source ? vfs_resolve_path_at(base, source) : NULL;
+            result = src ? vfs_namespace_move(src, point) : -2;
+            if (src) vfs_close(src);
+        } else if (flags & 0x1000) {
+            vfs_node_t *src = source ? vfs_resolve_path_at(base, source) : NULL;
+            if (!src) result = source ? -2 : -14;
+            else {
+                result = vfs_namespace_mount(point, src, source, "bind", target, flags);
+                vfs_close(src);
+            }
+        } else if (fstype && (!strcmp(fstype, "tmpfs") || !strcmp(fstype, "ramfs"))) {
+            if ((point->flags & FS_TYPE_MASK) != FS_DIRECTORY) result = -20;
+            else {
+                vfs_node_t *root = tmpfs_create_private_root();
+                if (!root) result = -12;
+                else {
+                    result = vfs_namespace_mount(point, root, source, fstype, target, flags);
+                    vfs_close(root);
+                }
+            }
+        } else if (fstype && !strcmp(fstype, "devpts")) {
+            vfs_node_t *root = devpts_create_root();
+            result = root ? vfs_namespace_mount(point, root, source, "devpts", target, flags) : -12;
+            if (root) vfs_close(root);
+        } else if (fstype && !strcmp(fstype, "proc")) {
+            vfs_node_t *root = vfs_initial_filesystem("proc");
+            result = root ? vfs_namespace_mount(point, root, source, "proc", target, flags) : -19;
+            if (root) vfs_close(root);
         }
-        return (uint64_t)-2;
+        vfs_close(point);
+        return (uint64_t)result;
     }
-
-    /* Linux MS_BIND = 0x1000 */
+    /* Initial-namespace propagation remains private; unsupported mutations
+     * are rejected rather than silently claiming isolation or read-only. */
+    if (flags & ((1 << 18) | (1 << 19))) return 0;
+    if (flags & (0x20 | (1 << 17) | (1 << 20))) return (uint64_t)-95;
     if (flags & 0x1000) {
-        if (!source)
-            return (uint64_t)-14;
-        vfs_node_t *src_node = vfs_resolve_path(source);
-        if (!src_node)
-            return (uint64_t)-2;
-        vfs_node_t *target_node = vfs_resolve_path(target);
-        if (!target_node) {
-            vfs_close(src_node);
-            return (uint64_t)-2;
-        }
-        vfs_mount_ex(target_node, src_node, source, "bind", target);
-        return 0;
+        vfs_node_t *src = source ? vfs_resolve_path_at(base, source) : NULL;
+        vfs_node_t *point = vfs_resolve_path_at(base, target);
+        if (!src || !point) { if (src) vfs_close(src); if (point) vfs_close(point); return (uint64_t)-2; }
+        return vfs_mount_ex(point, src, source, "bind", target);
     }
 
     /* Pseudo-filesystems handling */
@@ -2298,8 +2487,8 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
         dev_name = source + 5;
 
     struct block_device *dev = NULL;
-    int n = block_count();
-    for (int i = 0; i < n; i++) {
+    int device_count = block_count();
+    for (int i = 0; i < device_count; i++) {
         struct block_device *d = block_get(i);
         if (d && strcmp(d->name, dev_name) == 0) {
             dev = d;
@@ -2370,19 +2559,19 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
 
 static uint64_t sys_umount2(uint64_t target_ptr, uint64_t flags,
                             uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
-    (void)flags;
-    (void)a3;
-    (void)a4;
-    (void)a5;
-    (void)a6;
-    const char *target = (const char *)target_ptr;
-    if (!target)
-        return (uint64_t)-14;
-    vfs_node_t *mountpoint = vfs_resolve_path(target);
-    if (!mountpoint)
-        return (uint64_t)-2;
-    vfs_close(mountpoint);
-    return 0;
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct thread *task = sched_get_current();
+    if (!capability_has(task, CAP_SYS_ADMIN)) return (uint64_t)-1;
+    char path[512];
+    if (!target_ptr || !is_user_range((void *)target_ptr, 1)) return (uint64_t)-14;
+    long n = strncpy_from_user(path, (void *)target_ptr, sizeof(path));
+    if (n < 0) return (uint64_t)-14;
+    if ((uint64_t)n >= sizeof(path)) return (uint64_t)-36;
+    vfs_node_t *point = vfs_resolve_path_at(task && task->cwd_node ? task->cwd_node : fs_root, path);
+    if (!point) return (uint64_t)-2;
+    int result = vfs_namespace_active() ? vfs_namespace_umount(point, (unsigned)flags) : -95;
+    vfs_close(point);
+    return (uint64_t)result;
 }
 
 void syscall_register_fd(void) {
@@ -2395,7 +2584,10 @@ void syscall_register_fd(void) {
   syscall_register(SYS_PREADV, sys_preadv);
   syscall_register(SYS_PWRITEV, sys_pwritev);
   syscall_register(SYS_OPEN, sys_open);
+  syscall_register(SYS_CREAT, sys_creat);
   syscall_register(SYS_OPENAT, sys_openat);
+  syscall_register(437, sys_openat2);
+  syscall_register(442, sys_mount_setattr);
   syscall_register(SYS_CLOSE, sys_close);
   syscall_register(SYS_CLOSE_RANGE, sys_close_range);
   syscall_register(SYS_DUP, sys_dup);

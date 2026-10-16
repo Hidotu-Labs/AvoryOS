@@ -1,4 +1,5 @@
 #include "fs/sysfs_pci.h"
+#include "fs/sysfs.h"
 #include "console/klog.h"
 #include "drivers/manager/device.h"
 #include "drivers/pci/pci.h"
@@ -305,6 +306,10 @@ static vfs_node_t *device_dir(struct pci_device *pci) {
   return NULL;
 }
 
+vfs_node_t *sysfs_pci_device_node(struct pci_device *pci) {
+  return pci ? device_dir(pci) : NULL;
+}
+
 static void remove_driver_links(struct pci_device *pci, struct driver *driver) {
   vfs_node_t *ddir = device_dir(pci);
   vfs_node_t *drvdir = driver_dir(driver);
@@ -396,8 +401,10 @@ static void add_pci_attribute(vfs_node_t *dir, const char *name, uint16_t mode,
                               struct pci_device *pci,
                               enum pci_attr_kind kind, bool writable) {
   struct pci_attr_context *ctx = new_pci_context(pci, kind);
-  if (ctx)
-    pci_attr(dir, name, mode, pci_show, writable ? pci_store : NULL, ctx);
+  if (ctx) {
+    vfs_node_t *node = pci_attr(dir, name, mode, pci_show, writable ? pci_store : NULL, ctx);
+    if (kind == PCI_ATTR_UEVENT) sysfs_enable_uevent(node, dir);
+  }
 }
 
 static bool add_driver_directory(struct driver *driver, void *unused) {

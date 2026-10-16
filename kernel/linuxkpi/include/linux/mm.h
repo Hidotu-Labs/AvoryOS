@@ -59,7 +59,9 @@ static inline bool fault_flag_allow_retry_first(unsigned int flags) {
   return (flags & FAULT_FLAG_ALLOW_RETRY) && !(flags & FAULT_FLAG_TRIED);
 }
 
-/* Upstream helper used by page iterators; the mem_map is flat here. */
+/* Upstream helper used by page iterators (SG walks, folios).  The mem_map
+ * arena makes descriptors of consecutive PFNs adjacent, so upstream pointer
+ * arithmetic stays correct. */
 #ifndef nth_page
 #define nth_page(page, n) ((page) + (n))
 #endif

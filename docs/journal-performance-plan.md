@@ -187,6 +187,38 @@ file checksums, bitmap/inode allocation consistency, and absence of duplicate
 allocation. Use offline Linux/e2fsprogs inspection on disposable copies for
 format compatibility. Re-run the same benchmark suite only after these pass.
 
+## Update (2026-10-15): write-set, multi-descriptor commits and FIFO handoff
+
+Stage 1 prerequisites are implemented and covered by actual-source host tests:
+per-transaction write-set staging with dedup (identical restages write once),
+commits spanning up to `EXT3_JOURNAL_SEG_MAX` descriptor groups instead of the
+unjournaled-home fallback at the 126-tag limit, FIFO ownership handoff without
+barging, and validate-before-replay recovery. See
+`journal-writeset-fairness.md`. This removes the per-metadata double write and
+the unbounded unjournaled fallback; it does not add group commit. Stage 2
+(transaction handles/credits, batching window, background commit and
+checkpoint workers, circular log with head/tail and wraparound) remains the
+next step, and its acceptance criteria are unchanged.
+
+## Update (2026-10-16): pipelined device I/O behind `NVME_BATCH_IO`
+
+First slice of the Stage 3 pipelined-submission item, without adding group
+commit or touching Stage 2. The block layer gained an optional
+`read_batch`/`write_batch` API (`struct block_io_req`), and the ext3 commit
+gathers payload and metadata-home writes into batches of up to 16 blocks so
+one submitter waits once per batch instead of once per block. Built with
+`NVME_BATCH_IO=1`, the NVMe driver submits waves of up to 16 independent
+commands back to back and reaps them against one shared deadline; other
+devices and kernels without the knob run the same members through the old
+ordered single-request loop. Every batch is fully waited before the next
+commit step starts, so the ordering barriers
+(payload→descriptor→commit→super-publish→home→super-clear) and FUA/flush
+semantics are unchanged. Actual-source host tests cover the batch wait,
+per-member verdicts, and the batched commit loops; see
+`storage-write-batching.md`. This is a mechanism, not a measured speedup:
+guest throughput comparison against the unbatched build still has to be run,
+and the knob stays until it is.
+
 ## Primary references
 
 - [Linux ext4 journal format and fast commits](https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html).

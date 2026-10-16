@@ -1,13 +1,26 @@
 /* Linux page model for AvoryOS.
  *
  * Implements the Linux page API described in <linux/mm.h> over the native
- * buddy allocator (kernel/src/mm/pmm.c) with a sparse mem_map:
+ * buddy allocator (kernel/src/mm/pmm.c) with a virtually contiguous mem_map:
  *
- *   - Physical memory is divided into 128 MB sections.  Each section owns a
- *     lazily allocated array of `struct page` (2 MB for 32768 pages at 64
- *     bytes each, one order-9 buddy allocation).
+ *   - Descriptors live in a reserved VA arena based at vmemmap_base (the
+ *     start of the VMAP window; linuxkpi_vmalloc_init() starts first-fit
+ *     above it).  pfn_to_page() is pure arena arithmetic, and the
+ *     descriptors of any block are adjacent, so upstream code that walks
+ *     `page + n` or `++page` across a multi-page block stays correct.
+ *   - The physical backing stays lazy and order-0: the first pfn_to_page()
+ *     of a 64-descriptor chunk allocates one order-0 page and maps it into
+ *     the chunk's arena slot.  That keeps the allocation budget the chunked
+ *     layout was introduced for (the old layout demanded one order-9 (2 MB)
+ *     buddy block per newly touched 128 MB section; under desktop
+ *     fragmentation that allocation failed, made pfn_to_page() return NULL,
+ *     and forced alloc_pages() to free the frame it had just obtained — the
+ *     2026-10-16 TTM/PRIME -ENOMEM capture).  Contiguous VA without
+ *     contiguous physical backing supplies both properties at once: no raw
+ *     pointer walk can leave a block, and no metadata allocation is ever
+ *     high-order.
  *   - `struct page::pfn` is stored in the descriptor, so page_to_pfn() needs
- *     no section arithmetic.
+ *     no arena arithmetic.
  *   - `_refcount` is authoritative for pages handed to Linux code.  Pages
  *     allocated here are never touched by the native CoW/refcount paths, and
  *     the native PMM reference (1) is dropped exactly once, when the Linux
@@ -32,9 +45,24 @@
 
 extern unsigned long linuxkpi_shrink_reclaim(gfp_t gfp, unsigned long needed);
 
-#define SECTION_SHIFT 27 /* 128 MB */
+#define SECTION_SHIFT 27 /* 128 MB: descriptor-arena extent granularity */
 #define PAGES_PER_SECTION (1UL << (SECTION_SHIFT - PAGE_SHIFT))
 #define SECTIONS_FOR(phys) (((phys) >> SECTION_SHIFT) + 2)
+
+/* Physical descriptor storage is chunked so every allocation is order-0: one
+ * 4 KB buddy page holds CHUNK_PAGES descriptors (64 at 64 bytes each) and is
+ * mapped at its arena slot, so descriptor arrays are contiguous in VA while
+ * the backing pages stay order-0.  The static asserts keep a future
+ * descriptor-size change from silently breaking the arena page math. */
+#define CHUNK_PAGES (PAGE_SIZE / sizeof(struct page))
+#define CHUNK_BYTES (CHUNK_PAGES * sizeof(struct page))
+#define CHUNKS_PER_SECTION (PAGES_PER_SECTION / CHUNK_PAGES)
+_Static_assert(PAGE_SIZE % sizeof(struct page) == 0,
+               "descriptors must tile a page");
+_Static_assert(PAGES_PER_SECTION % CHUNK_PAGES == 0,
+               "descriptor chunks must tile a section");
+_Static_assert(CHUNK_BYTES == PAGE_SIZE,
+               "one descriptor chunk must be one arena page");
 
 #define VMAP_WINDOW_BASE 0xFFFFC00000000000ULL
 #define VMAP_WINDOW_END 0xFFFFE00000000000ULL
@@ -46,12 +74,15 @@ unsigned long max_pfn;
 unsigned long page_offset_base = 0xFFFF800000000000UL;
 unsigned long phys_base;
 unsigned long vmalloc_base = VMAP_WINDOW_BASE;
-unsigned long vmemmap_base;
+unsigned long vmemmap_base;          /* descriptor arena base (set at init) */
+unsigned long linuxkpi_vmemmap_size; /* arena bytes; read by vmalloc.c */
 unsigned long physmem_end;
 
-static struct page **mem_section;
-static unsigned long mem_section_count;
-static DEFINE_SPINLOCK(page_section_lock);
+/* One bit per descriptor chunk, set once the chunk page is mapped and its
+ * descriptors are initialized; the pfn_to_page() fast path tests it without
+ * the lock. */
+static uint64_t *page_chunk_present;
+static DEFINE_SPINLOCK(page_chunk_lock);
 
 static bool page_model_ready;
 
@@ -59,49 +90,77 @@ static bool page_model_ready;
 /* mem_map                                                                    */
 /* ------------------------------------------------------------------------- */
 
-static struct page *page_section_alloc(unsigned long section) {
-  unsigned long flags;
-  struct page *map;
+/* Descriptor address for a PFN: the arena is contiguous by construction, so
+ * this arithmetic is the whole lookup. */
+static struct page *page_arena(unsigned long pfn) {
+  return (struct page *)(uintptr_t)(vmemmap_base +
+                                    (uint64_t)pfn * sizeof(struct page));
+}
 
-  spin_lock_irqsave(&page_section_lock, flags);
-  map = mem_section[section];
-  if (!map) {
-    size_t bytes = PAGES_PER_SECTION * sizeof(struct page);
-    size_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-    uint64_t phys = (uint64_t)asc_pmm_alloc_pages(pages);
+/* Mapping state of one descriptor chunk: the fast path in pfn_to_page()
+ * pairs its acquire load with the release OR in page_chunk_publish() after
+ * the descriptors and the PTE are in place. */
+static inline bool page_chunk_mapped(unsigned long chunk) {
+  return (__atomic_load_n(&page_chunk_present[chunk / 64], __ATOMIC_ACQUIRE) &
+          (1ULL << (chunk % 64))) != 0;
+}
+
+static inline void page_chunk_publish(unsigned long chunk) {
+  __atomic_fetch_or(&page_chunk_present[chunk / 64], 1ULL << (chunk % 64),
+                    __ATOMIC_RELEASE);
+}
+
+/* Chunk slow path: one order-0 page of zeroed, pre-initialized descriptors,
+ * mapped at its arena slot.  Publishing the fully built chunk keeps the
+ * lock-free fast path safe. */
+static struct page *page_chunk_alloc(unsigned long chunk) {
+  unsigned long flags;
+
+  if (__builtin_expect(page_chunk_mapped(chunk), 1))
+    return page_arena(chunk * CHUNK_PAGES);
+
+  spin_lock_irqsave(&page_chunk_lock, flags);
+  if (!page_chunk_mapped(chunk)) {
+    uint64_t phys = (uint64_t)asc_pmm_alloc_pages(1);
 
     if (phys) {
-      map = (struct page *)(phys + asc_pmm_get_hhdm_offset());
-      __builtin_memset(map, 0, bytes);
-      for (unsigned long i = 0; i < PAGES_PER_SECTION; i++) {
-        map[i].pfn = section * PAGES_PER_SECTION + i;
-        atomic_set(&map[i]._refcount, 0);
-        atomic_set(&map[i]._mapcount, -1);
+      unsigned long first = chunk * CHUNK_PAGES;
+      struct page *base = page_arena(first);
+
+      /* Map first and initialize through the arena address: the page is
+       * never written through another alias, and it stays unpublished until
+       * the bitmap bit is set.  A never-mapped VA has no stale TLB entry,
+       * so no flush is needed. */
+      if (asc_vmm_map_page(asc_vmm_get_kernel_pml4(), (uint64_t)base, phys,
+                           ASC_PAGE_PRESENT | ASC_PAGE_RW | ASC_PAGE_NX)) {
+        __builtin_memset(base, 0, CHUNK_BYTES);
+        for (unsigned long i = 0; i < CHUNK_PAGES; i++) {
+          base[i].pfn = (unsigned int)(first + i);
+          atomic_set(&base[i]._refcount, 0);
+          atomic_set(&base[i]._mapcount, -1);
+        }
+        page_chunk_publish(chunk);
+      } else {
+        asc_pmm_free_pages((void *)phys, 1);
       }
-      __atomic_store_n(&mem_section[section], map, __ATOMIC_RELEASE);
     }
   }
-  spin_unlock_irqrestore(&page_section_lock, flags);
-  return map;
+  spin_unlock_irqrestore(&page_chunk_lock, flags);
+  return page_chunk_mapped(chunk) ? page_arena(chunk * CHUNK_PAGES) : NULL;
 }
 
 struct page *pfn_to_page(unsigned long pfn) {
-  unsigned long section;
+  unsigned long chunk;
 
   if (!page_model_ready || pfn >= max_pfn)
     return NULL;
 
-  section = pfn >> (SECTION_SHIFT - PAGE_SHIFT);
-  if (section >= mem_section_count)
-    return NULL;
-
-  struct page *map = __atomic_load_n(&mem_section[section], __ATOMIC_ACQUIRE);
-  if (!map)
-    map = page_section_alloc(section);
-  if (!map)
-    return NULL;
-
-  return &map[pfn & (PAGES_PER_SECTION - 1)];
+  chunk = pfn / CHUNK_PAGES;
+  if (__builtin_expect(!page_chunk_mapped(chunk), 0)) {
+    if (!page_chunk_alloc(chunk))
+      return NULL;
+  }
+  return page_arena(pfn);
 }
 
 unsigned long page_to_pfn(const struct page *page) { return page->pfn; }
@@ -147,34 +206,45 @@ void linuxkpi_page_init(void) {
   uint64_t total = asc_pmm_get_managed_memory_end();
   uint64_t hhdm = asc_pmm_get_hhdm_offset();
   unsigned long sections = SECTIONS_FOR(total);
-  size_t bytes = sections * sizeof(struct page *);
-  size_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+  unsigned long chunks = sections * CHUNKS_PER_SECTION;
+  size_t bytes = sections * PAGES_PER_SECTION * sizeof(struct page);
+  size_t bits = (chunks + 7) / 8;
+  size_t pages = (bits + PAGE_SIZE - 1) / PAGE_SIZE;
   uint64_t phys;
 
   if (page_model_ready)
     return;
 
+  /* The arena must fit the reserved VA region the vmap window starts with. */
+  if (bytes > VMAP_WINDOW_END - VMAP_WINDOW_BASE)
+    return;
+
+  /* The present bitmap is the only eager metadata: one bit per 64
+   * descriptors, so one order-0 page covers 8 GiB of RAM. */
   phys = (uint64_t)asc_pmm_alloc_pages(pages);
   if (!phys)
     return;
 
-  mem_section = (struct page **)(phys + hhdm);
-  __builtin_memset(mem_section, 0, bytes);
-  mem_section_count = sections;
+  page_chunk_present = (uint64_t *)(phys + hhdm);
+  __builtin_memset(page_chunk_present, 0, pages * PAGE_SIZE);
+
   page_offset_base = hhdm;
   max_pfn = total >> PAGE_SHIFT;
   physmem_end = total;
+  vmemmap_base = VMAP_WINDOW_BASE;
+  linuxkpi_vmemmap_size = bytes;
   page_model_ready = true;
   klogf("[KPI] texture fixes active: WC-sfence/shrink-reclaim/ww-backoff/fault-seq\n");
 
-  /* Section maps are allocated lazily by pfn_to_page() the first time a page
-   * in that section is handed out, so a 4 GiB machine pays only for the
-   * sections that actually carry Linux-managed pages (a 128 MB section costs
-   * 2 MB at 64 bytes per page).  The eager alternative built all 34 sections
-   * (~68 MiB) at boot even though the boot-time desktop touches a handful;
-   * see the "~150 MB used after the KPI tests" report.  Driver tests that
-   * track PMM free-page deltas warm up before sampling, which absorbs the
-   * one-time map allocation of a newly touched section. */
+  /* Chunk pages are allocated and mapped lazily by pfn_to_page() the first
+   * time a page in that 64-descriptor chunk is handed out, so a 4 GiB
+   * machine pays only for the PFNs that actually carry Linux-managed pages
+   * (a fully touched 128 MB section costs 2 MB of descriptors, in order-0
+   * pieces).  The eager alternative built all 34 sections (~68 MiB) at boot
+   * even though the boot-time desktop touches a handful; see the "~150 MB
+   * used after the KPI tests" report.  Driver tests that track PMM free-page
+   * deltas warm up before sampling, which absorbs the one-time chunk
+   * allocation of a newly touched range. */
 }
 
 /* ------------------------------------------------------------------------- */
@@ -182,12 +252,10 @@ void linuxkpi_page_init(void) {
 /* ------------------------------------------------------------------------- */
 
 static void page_set_order(struct page *head, unsigned int order) {
-  struct page *p = head;
-
   for (unsigned int i = 0; i < order; i++) {
     unsigned long nr = 1UL << i;
     for (unsigned long j = 0; j < nr; j++) {
-      struct page *tail = &p[(1UL << i) + j];
+      struct page *tail = head + (1UL << i) + j;
       tail->compound_head = head;
       __SetPageTail(tail);
       atomic_set(&tail->_refcount, 0);
@@ -212,7 +280,7 @@ static void page_set_order_plain(struct page *head, unsigned int order) {
   unsigned long count = 1UL << order;
 
   for (unsigned long i = 0; i < count; i++) {
-    struct page *p = &head[i];
+    struct page *p = head + i;
 
     __ClearPageTail(p);
     __ClearPageHead(p);
@@ -238,18 +306,38 @@ struct page *alloc_pages(gfp_t gfp_mask, unsigned int order) {
   else
     phys = (uint64_t)asc_pmm_alloc_pages(count);
 
-  if (!phys) {
-    /* Minecraft texture churn pins freed GTT pages in TTM's pool while PMM
-     * fragments: drain pool caches once (LinuxKPI-only, no amdgpu change)
-     * before failing the BO. Without this, high-order texture allocs fail
-     * and Mesa samples green/empty placeholders until a later retry. */
+  if (!phys && (gfp_mask & __GFP_DIRECT_RECLAIM)) {
+    /* Pressure relief before failing the allocation. Pools that can hold
+     * pages a fresh allocation cannot see:
+     *   - native frames parked in the PCP/pre-zeroed pools, which LinuxKPI
+     *     allocations bypass (returning them lets free buddies merge into
+     *     the contiguous run a high-order request needs),
+     *   - shrinker-registered caches (TTM keeps freed GTT pages; the
+     *     Minecraft texture-churn case from the original shrinker change),
+     *   - clean file-cache pages: under a full desktop (Xorg+KDE+Firefox)
+     *     the PMM can be empty while megabytes of droppable cache remain.
+     * A failed allocation reaches userspace as -ENOMEM (amdgpu rejects the
+     * command submission and Mesa aborts the client), so run one bounded
+     * relief pass and retry once. The cheap frame drain runs even for
+     * __GFP_NORETRY callers: TTM's high-order pool refills set
+     * NORETRY|RETRY_MAYFAIL and walk down through lower orders, and merged
+     * parked frames are what makes those retries succeed. The sleeping
+     * shrinker/file-cache reclaim stays limited to callers that permit
+     * reclaim, and callers that forbid it outright (GFP_ATOMIC/GFP_NOWAIT
+     * clear __GFP_DIRECT_RECLAIM) get no relief at all. */
+    asc_pmm_drain_cached_frames();
     if (!(gfp_mask & __GFP_NORETRY)) {
+      unsigned long target = count < 64 ? 64 : count;
+      if (target > 512)
+        target = 512;
       linuxkpi_shrink_reclaim(gfp_mask, count);
-      if (gfp_mask & __GFP_DMA32)
-        phys = (uint64_t)asc_pmm_alloc_pages_range(count, 0, 0x100000000ULL);
-      else
-        phys = (uint64_t)asc_pmm_alloc_pages(count);
+      if (asc_mm_file_cache_reclaim)
+        asc_mm_file_cache_reclaim(target);
     }
+    if (gfp_mask & __GFP_DMA32)
+      phys = (uint64_t)asc_pmm_alloc_pages_range(count, 0, 0x100000000ULL);
+    else
+      phys = (uint64_t)asc_pmm_alloc_pages(count);
   }
   if (!phys) {
     static unsigned long fails;
@@ -266,7 +354,25 @@ struct page *alloc_pages(gfp_t gfp_mask, unsigned int order) {
     return NULL;
   }
 
-  page = pfn_to_page(phys >> PAGE_SHIFT);
+  /* Raw descriptor walks below (and in callers such as TTM) require every
+   * chunk of this block to be backed, not just the head's chunk.  Reserve
+   * the whole range before changing any allocation metadata. */
+  unsigned long first = phys >> PAGE_SHIFT;
+  if (!page_model_ready || first >= max_pfn || count > max_pfn - first) {
+    asc_pmm_free_pages((void *)phys, count);
+    return NULL;
+  }
+  unsigned long last_chunk = (first + count - 1) / CHUNK_PAGES;
+  for (unsigned long chunk = first / CHUNK_PAGES; chunk <= last_chunk; chunk++) {
+    if (!page_chunk_alloc(chunk)) {
+      /* Published chunks are shared, permanent mem_map storage.  Keep them
+       * for later lookups, but return the entire data block on failure. */
+      asc_pmm_free_pages((void *)phys, count);
+      return NULL;
+    }
+  }
+
+  page = pfn_to_page(first);
   if (!page) {
     asc_pmm_free_pages((void *)phys, count);
     return NULL;
@@ -358,7 +464,7 @@ void split_page(struct page *page, unsigned int order) {
   head->compound_order = 0;
 
   for (unsigned long i = 0; i < count; i++) {
-    struct page *p = &head[i];
+    struct page *p = head + i;
     __ClearPageTail(p);
     p->compound_head = p;
     atomic_set(&p->_refcount, 1);

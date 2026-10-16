@@ -1,3 +1,4 @@
+#include "../sched/capability.h"
 // Process Syscalls: fork, getpid, exit
 #include "../acpi/acpi.h"
 #include "../apic/lapic_timer.h"
@@ -6,6 +7,7 @@
 #include "../cpu/fpu.h"
 #include "../cpu/msr.h"
 #include "../drivers/storage/nvme.h"
+#include "../drivers/net/e1000.h"
 #include "../drivers/timer/rtc.h"
 #include "../hal/hal.h"
 #include "../lib/string.h"
@@ -16,6 +18,11 @@
 #include "../mm/vmm.h"
 
 #include "../sched/sched.h"
+#include "../sched/namespace.h"
+#include "../sched/pid_namespace.h"
+#include "../sched/seccomp.h"
+#include "../sched/net_namespace.h"
+#include "../fs/mount_namespace.h"
 #include "../sched/wait.h"
 #include "../smp/cpu.h"
 #include "sys_io_shared.h"
@@ -24,6 +31,7 @@
 #define TSC_PROBES_ENABLE
 #include "../lib/tsc.h"
 #include <stdint.h>
+#include <stddef.h>
 #ifdef LINUXKPI_LINUX_IMPORTED
 #include <linuxkpi/native_pci.h>
 #endif
@@ -39,6 +47,46 @@ static uint8_t nice_to_sched_priority(int nice);
 #define PR_SET_NAME 15
 #define PR_GET_NAME 16
 #define MMAP_REGION_BASE 0x7F0000000000ULL
+
+static void process_mount_cleanup(struct mount_namespace **ns) { vfs_namespace_put(*ns); }
+static int process_namespace_inherit(struct thread *child, struct thread *parent,
+                                      struct mount_namespace *mount,
+                                      struct pid_namespace *pid, uint64_t flags) {
+  int err = pid_namespace_inherit(child, parent, pid, (flags & CLONE_THREAD) != 0);
+  if (err) return err;
+  net_namespace_inherit(child, parent);
+  vfs_namespace_clone(child, parent, false);
+  if (mount) vfs_namespace_install(child, mount);
+  if (child->pid_ns && pid_namespace_tid(child, child) == 1)
+    child->pgid = child->sid = child->tid;
+  return 0;
+}
+
+/* Called before publishing a new userspace child, for fork/clone/vfork alike. */
+static void process_inherit_scheduler(struct thread *child,
+                                       const struct thread *parent) {
+  int nice = parent->nice_value;
+  uint8_t policy = parent->sched_policy;
+  uint8_t rt_priority = parent->sched_rt_priority;
+  if (parent->sched_reset_on_fork) {
+    if (policy == 1 || policy == 2) {
+      policy = 0;
+      rt_priority = 0;
+    }
+    if (nice < 0)
+      nice = 0;
+  }
+  child->priority = nice_to_sched_priority(nice);
+  child->static_priority = child->priority;
+  child->nice_value = (int8_t)nice;
+  child->sched_policy = policy;
+  child->sched_rt_priority = rt_priority;
+  child->sched_reset_on_fork = false;
+  child->se.custom_slice = false;
+  eevfd_set_nice(&child->se, nice);
+  if (parent->se.custom_slice && policy == parent->sched_policy)
+    eevfd_set_slice(&child->se, parent->se.slice_ns);
+}
 
 // Path Normalization
 static void path_normalize(const char *base, const char *rel, char *out) {
@@ -168,6 +216,53 @@ static void pidfd_close(vfs_node_t *node) {
   }
 }
 
+/* Linux's extensible PIDFD_GET_INFO ABI. Only advertise fields that this
+ * kernel can supply; namespace/cgroup and retained exit data are unsupported. */
+struct avory_pidfd_info {
+  uint64_t mask, cgroupid;
+  uint32_t pid, tgid, ppid;
+  uint32_t ruid, rgid, euid, egid, suid, sgid, fsuid, fsgid;
+  int32_t exit_code;
+  uint32_t coredump_mask, coredump_signal, coredump_code, coredump_pad;
+  uint64_t supported_mask;
+};
+_Static_assert(sizeof(struct avory_pidfd_info) == 88, "pidfd_info ABI");
+
+static int pidfd_ioctl(vfs_node_t *node, uint32_t request, uint64_t arg) {
+  if ((request & 0xc000ffffU) != 0xc000ff0bU) return -25;
+  unsigned size = (request >> 16) & 0x3fff;
+  if (size < 64 || !arg) return -22;
+  uint64_t requested;
+  if (copy_from_user(&requested, (void *)arg, sizeof(requested))) return -14;
+  struct pidfd_ctx *ctx = node ? node->device : NULL;
+  if (!ctx) return -9;
+  struct avory_pidfd_info info = {0};
+  spinlock_acquire(&tid_lock);
+  for (struct thread *task = global_thread_list; task; task = task->global_next) {
+    if (task->tid != ctx->pid || task->tgid != task->tid) continue;
+    info.mask = 3; /* PIDFD_INFO_PID | PIDFD_INFO_CREDS */
+    info.pid = task->tid; info.tgid = task->tgid;
+    /* Match getppid's visible PID-1 convention for the initial session. */
+    info.ppid = task->is_main_session || !task->parent ? 0 :
+                (task->parent->is_main_session ? 1 : task->parent->tgid);
+    info.ruid = task->uid; info.rgid = task->gid;
+    info.euid = task->euid; info.egid = task->egid;
+    info.suid = task->suid; info.sgid = task->sgid;
+    info.fsuid = task->fsuid; info.fsgid = task->fsgid;
+    break;
+  }
+  spinlock_release(&tid_lock);
+  if (!info.mask) return -3;
+  if ((requested & (1ULL << 5)) && size >= sizeof(info)) {
+    info.mask |= 1ULL << 5;
+    info.supported_mask = 3 | (1ULL << 5);
+  }
+  unsigned count = size < sizeof(info) ? size : sizeof(info);
+  if (copy_to_user((void *)arg, &info, count)) return -14;
+  if (size > count && clear_user((void *)(arg + count), size - count)) return -14;
+  return 0;
+}
+
 /* A pidfd is recognised by its poll handler.  Without this check any descriptor
  * whose node happens to carry a ->device (a pty, a drm client, ...) would be
  * read as a struct pidfd_ctx by waitid(P_PIDFD), turning a stray file descriptor
@@ -204,6 +299,7 @@ static int64_t pidfd_reserve(struct thread *t, int *out_fd, vfs_node_t **out_nod
   node->mask = 0600;
   node->device = ctx;
   node->poll = pidfd_poll;
+  node->ioctl = pidfd_ioctl;
   node->close = pidfd_close;
   /* So that poll()/ppoll() on the descriptor is woken by an exit instead of
    * only noticing it the next time the poll loop happens to re-scan. */
@@ -257,8 +353,9 @@ static uint64_t sys_pidfd_open(uint64_t pid, uint64_t flags, uint64_t a2,
   const uint64_t PIDFD_NONBLOCK = 0x800;
   if (pid == 0 || pid > UINT32_MAX || (flags & ~PIDFD_NONBLOCK))
     return (uint64_t)-22;
+  pid = pid_namespace_global(sched_get_current(), (uint32_t)pid);
   bool exited = false;
-  if (!pidfd_task_state((uint32_t)pid, &exited)) return (uint64_t)-3;
+  if (!pid || !pidfd_task_state((uint32_t)pid, &exited)) return (uint64_t)-3;
   return pidfd_install(sched_get_current(), (uint32_t)pid, flags);
 }
 
@@ -297,10 +394,14 @@ static uint64_t sys_pidfd_send_signal(uint64_t pidfd, uint64_t sig,
     spinlock_release(&tid_lock);
     return (uint64_t)-3; // ESRCH
   }
-  if (current->euid != 0 && current->uid != target->uid &&
+  if (!capability_has(current, CAP_KILL) && current->uid != target->uid &&
       current->euid != target->uid) {
     spinlock_release(&tid_lock);
     return (uint64_t)-1; // EPERM
+  }
+  if (!pid_namespace_signal_allowed(current, target, (int)sig)) {
+    spinlock_release(&tid_lock);
+    return 0;
   }
   uint32_t sender_pid = current->tgid ? current->tgid : current->tid;
   target->pending_signals |= (1ULL << (sig - 1));
@@ -341,7 +442,15 @@ static uint64_t sys_pidfd_getfd(uint64_t pidfd, uint64_t targetfd,
     spinlock_release(&tid_lock);
     return (uint64_t)-3;
   }
-  if (!target->fds || targetfd >= MAX_FDS) {
+  if (!capability_has(current, CAP_SYS_PTRACE) &&
+      (current->euid != target->uid || current->euid != target->euid ||
+       current->euid != target->suid || current->egid != target->gid ||
+       current->egid != target->egid || current->egid != target->sgid ||
+       (target->cap_permitted & ~current->cap_permitted))) {
+    spinlock_release(&tid_lock);
+    return (uint64_t)-1;
+  }
+  if (!target->files || !target->fds || targetfd >= MAX_FDS) {
     spinlock_release(&tid_lock);
     return (uint64_t)-9;
   }
@@ -352,19 +461,25 @@ static uint64_t sys_pidfd_getfd(uint64_t pidfd, uint64_t targetfd,
     spinlock_release(&tid_lock);
     return (uint64_t)-9;
   }
-  vfs_open(node);
+  uint64_t description_id = fd_description_id_locked(target, (int)targetfd);
+  uint64_t offset = target->fd_offsets[targetfd];
+  uint64_t status = target->fd_flags[targetfd] | FD_FLAGS_CLOEXEC_BIT;
+  vfs_node_ref(node);
   spinlock_release(&target->files->lock);
   spinlock_release(&tid_lock);
+  vfs_open(node);
+  vfs_close(node); // release temporary pin
   int new_fd = alloc_fd(current);
   if (new_fd < 0) {
     vfs_close(node);
     return (uint64_t)-24; // EMFILE
   }
   spinlock_acquire(&current->files->lock);
+  current->fd_offsets[new_fd] = offset;
+  current->fd_flags[new_fd] = status;
+  fd_description_set_locked(current, new_fd, description_id);
   current->fds[new_fd] = node;
   spinlock_release(&current->files->lock);
-  current->fd_offsets[new_fd] = 0;
-  current->fd_flags[new_fd] = 0;
   return (uint64_t)new_fd;
 }
 
@@ -473,8 +588,10 @@ void process_do_exit(uint64_t status) {
     robust_handle_death(current);
   process_clear_child_tid(current);
 
-  if (current)
+  if (current) {
+    pid_namespace_exit(current);
     sched_reparent_children(current);
+  }
 
   if (current && !current->is_main_session) {
     klog_debug_puts("\n[SYSCALL] Process exited with status: ");
@@ -683,7 +800,7 @@ static uint64_t sys_set_tid_address(uint64_t tidptr, uint64_t a1, uint64_t a2,
   current->tid_address = (uint64_t *)tidptr;
 
   // Return the current thread's ID
-  return current->tid;
+  return pid_namespace_tid(current, current);
 }
 
 static uint64_t sys_gettid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
@@ -698,7 +815,7 @@ static uint64_t sys_gettid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
   struct thread *current = sched_get_current();
   if (current && current->is_main_session)
     return 1;
-  return current ? current->tid : 0;
+  return current ? pid_namespace_tid(current, current) : 0;
 }
 
 static uint64_t sys_getpid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
@@ -714,7 +831,7 @@ static uint64_t sys_getpid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
   if (current) {
     if (current->is_main_session)
       return 1;
-    return current->tgid;
+    return pid_namespace_visible(current, current->tgid);
   }
   return 0;
 }
@@ -762,7 +879,7 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t a1, uint64_t a2,
 
   // Validate the directory exists!
   // Note: we want an absolute lookup here
-  vfs_node_t *node = vfs_resolve_path_at(fs_root, new_path);
+  vfs_node_t *node = vfs_resolve_path_at(current->cwd_node, path);
   if (!node)
     return (uint64_t)-2; // ENOENT
 
@@ -825,13 +942,13 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
         if (target_pid == -1) {
           matches = true;
         } else if (target_pid > 0) {
-          if (t->tid == (uint32_t)target_pid || t->tgid == (uint32_t)target_pid)
+          if (pid_namespace_tid(current, t) == (uint32_t)target_pid)
             matches = true;
         } else if (target_pid == 0) {
           if (t->pgid == current->pgid)
             matches = true;
         } else { // target_pid < -1
-          if (t->pgid == (uint32_t)(-target_pid))
+          if (pid_namespace_visible_locked(current, t->pgid) == (uint32_t)(-target_pid))
             matches = true;
         }
 
@@ -875,9 +992,10 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
     if (zombie) {
       if (wstatus_ptr != 0) {
         int *wstatus = (int *)wstatus_ptr;
-        *wstatus = (zombie->exit_status & 0xFF) << 8;
+        *wstatus = zombie->termination_signal ? zombie->termination_signal :
+                   (zombie->exit_status & 0xFF) << 8;
       }
-      uint32_t reaped_pid = zombie->tid;
+      uint32_t reaped_pid = pid_namespace_tid(current, zombie);
 
       // Destruction must wait until the exiting child has switched off its
       // kernel stack.  On SMP the awakened parent can run concurrently with
@@ -993,8 +1111,8 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
         bool matches = false;
         switch (idtype) {
         case P_ALL:   matches = true; break;
-        case P_PID:   matches = (t->tid == id || t->tgid == id); break;
-        case P_PGID:  matches = (t->pgid == id); break;
+        case P_PID:   matches = (pid_namespace_tid(current, t) == id); break;
+        case P_PGID:  matches = (id ? pid_namespace_visible_locked(current, t->pgid) == id : t->pgid == current->pgid); break;
         case P_PIDFD: matches = (t->tid == target_pid || t->tgid == target_pid); break;
         default:
           spinlock_release(&tid_lock);
@@ -1057,10 +1175,11 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
         struct k_siginfo_child *si = (struct k_siginfo_child *)infop_ptr;
         si->si_signo  = 17; /* SIGCHLD */
         si->si_errno  = 0;
-        si->si_code   = CLD_EXITED;
-        si->si_pid    = (uint32_t)zombie->tid;
+        si->si_code   = zombie->termination_signal ? 2 /* CLD_KILLED */ : CLD_EXITED;
+        si->si_pid    = pid_namespace_tid(current, zombie);
         si->si_uid    = (uint32_t)zombie->uid;
-        si->si_status = zombie->exit_status & 0xFF;
+        si->si_status = zombie->termination_signal ? zombie->termination_signal :
+                        zombie->exit_status & 0xFF;
         si->_pad0     = 0;
         si->_pad1     = 0;
       }
@@ -1192,13 +1311,26 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   if (!user_path)
     return (uint64_t)-14; // EFAULT
 
-  // 1. Copy everything to kernel memory BEFORE switching CR3
-  // We need to copy the path, the argv array, and the envp array
-  size_t path_len = strlen(user_path);
-  char *path = kmalloc(path_len + 1);
-  if (!path)
-    return (uint64_t)-12;
-  memcpy(path, user_path, path_len + 1);
+  // Snapshot the pathname before inspecting self-exec aliases or switching CR3.
+  char *path = kmalloc(4096);
+  if (!path) return (uint64_t)-12;
+  long path_len = strncpy_from_user(path, user_path, 4096);
+  if (path_len < 0 || path_len >= 4096) {
+    kfree(path);
+    return path_len < 0 ? (uint64_t)-14 : (uint64_t)-36;
+  }
+
+  /* Recording the alias itself as exe_path would make /proc/self/exe point
+   * back to itself after exec, breaking the next Chromium service launch. */
+  struct thread *exec_caller = sched_get_current();
+  if (!strcmp(path, "/proc/self/exe") ||
+      !strcmp(path, "/proc/thread-self/exe")) {
+    if (!exec_caller || !exec_caller->exe_path[0]) {
+      kfree(path);
+      return (uint64_t)-2; // ENOENT
+    }
+    strcpy(path, exec_caller->exe_path);
+  }
 
   TSC_BEGIN(execve_arg_copy);
   int argc = 0;
@@ -1249,6 +1381,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   struct thread *exec_thread = sched_get_current();
   int shebang_depth = 0;
   uint32_t exec_mode = 0, exec_uid = 0, exec_gid = 0;
+  uint64_t exec_mount_flags = 0;
 
   while (shebang_depth < 4) {
     vfs_node_t *exec_base = (path[0] == '/') ? fs_root :
@@ -1276,6 +1409,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       return (uint64_t)(-exec_err);
     }
     exec_mode = exec_node->mask;
+    exec_mount_flags = vfs_mount_flags(exec_node);
     exec_uid = exec_node->uid;
     exec_gid = exec_node->gid;
 
@@ -1502,10 +1636,12 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
   exec_close_cloexec(current);
 
-  if (exec_mode & 04000)
+  uint32_t old_exec_euid = current->euid;
+  if ((exec_mode & 04000) && !current->no_new_privs && !(exec_mount_flags & 2))
     current->euid = current->suid = current->fsuid = exec_uid;
-  if (exec_mode & 02000)
+  if ((exec_mode & 02000) && !current->no_new_privs && !(exec_mount_flags & 2))
     current->egid = current->sgid = current->fsgid = exec_gid;
+  capability_exec(current, old_exec_euid);
 
   current->fs_base = 0;
   current->gs_base = 0;
@@ -1524,9 +1660,8 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       memset(&current->signal_handlers[i], 0, sizeof(struct k_sigaction));
     }
   }
-  current->pending_signals = 0;
-  memset(current->signal_sender_pid, 0, sizeof(current->signal_sender_pid));
-  memset(current->signal_sender_code, 0, sizeof(current->signal_sender_code));
+  /* exec preserves pending signals, including full queued siginfo payloads.
+   * Dispositions change above, but delivery belongs to the new image. */
 
   // The old address space is gone, so any robust list registered in it is too.
   current->robust_list = 0;
@@ -1697,6 +1832,12 @@ static void fork_child_entry(void) {
   wrmsr(IA32_KERNEL_GS_BASE, self->gs_base);
   wrmsr(IA32_FS_BASE, self->fs_base);
 
+  if (self->child_set_tid) {
+    uint32_t visible_tid = pid_namespace_tid(self, self);
+    copy_to_user((void *)self->child_set_tid, &visible_tid, sizeof(visible_tid));
+    self->child_set_tid = 0;
+  }
+
   // Jump to userspace — this never returns
   fork_return_to_userspace(child_regs);
 }
@@ -1820,10 +1961,9 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   child->fork_ctx = child_regs;
   child->parent = parent;
   child->cpu_affinity = parent->cpu_affinity;
-  child->priority = parent->static_priority;
-  child->static_priority = parent->static_priority;
-  child->nice_value = parent->nice_value;
-  eevfd_set_nice(&child->se, (int)child->nice_value);
+  process_inherit_scheduler(child, parent);
+  uts_namespace_inherit(child, parent);
+  ipc_namespace_inherit(child, parent);
   child->tgid = child->tid; // Fork creates a new process (new thread group)
   /* Linux implements fork() as a clone whose exit signal is SIGCHLD, and the
    * parent is notified through it.  Keep that visible here so the notification
@@ -1833,20 +1973,7 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   // 6. Copy file descriptors from parent to child (with reference counting)
   TSC_BEGIN(fork_fds);
   if (parent) {
-    for (int i = 0; i < MAX_FDS; i++) {
-      if (parent->fds[i] && parent->fds[i] != FD_RESERVED) {
-        child->fds[i] = parent->fds[i];
-        child->fd_offsets[i] = parent->fd_offsets[i];
-        child->fd_flags[i] = parent->fd_flags[i];
-        if (parent->fd_paths[i]) {
-          child->fd_paths[i] = parent->fd_paths[i];
-          __atomic_add_fetch(&child->fd_paths[i]->ref_count, 1,
-                             __ATOMIC_RELAXED);
-        }
-        // Increment reference count for each inherited FD
-        vfs_open(child->fds[i]);
-      }
-    }
+    sched_copy_files(child, parent);
     memcpy(child->cwd_path, parent->cwd_path, sizeof(child->cwd_path));
     // sched_create_kernel_thread() already inherited and referenced the
     // parent's CWD. Do not take a second, unmatched reference here.
@@ -1871,6 +1998,7 @@ uint64_t sys_fork(struct syscall_regs *regs) {
 
     // Inherit comm name — forked child keeps the parent's name until exec
     memcpy(child->comm, parent->comm, sizeof(child->comm));
+    memcpy(child->exe_path, parent->exe_path, sizeof(child->exe_path));
 
     // Inherit alternate signal stack
     child->ss_sp = parent->ss_sp;
@@ -1886,7 +2014,11 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   // 8. Enqueue child only after its address space and inherited state are set.
   // Keep the return value independent of the child allocation in case it exits
   // quickly after being scheduled.
-  uint32_t child_tid = child->tid;
+  int ns_error = process_namespace_inherit(child, parent, NULL, NULL, 0);
+  if (ns_error) { sched_reap_thread(child); return (uint64_t)ns_error; }
+  uint32_t child_tid = pid_namespace_tid(parent, child);
+  capability_inherit(child, parent);
+  seccomp_inherit(child, parent);
   fpu_copy_thread(child, parent);
   sched_enqueue_thread(child, NULL);
 
@@ -1907,13 +2039,43 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     return (uint64_t)-22;
   if ((flags & CLONE_THREAD) && !(flags & CLONE_SIGHAND))
     return (uint64_t)-22;
-  /* No namespace isolation on AvoryOS: reject namespace flags with EPERM
-   * (matches unshare handling) so bwrap/glycin probes detect "sandbox
-   * unavailable" and fall back instead of half-isolating. pthreads never
-   * pass these flags. */
-  if (flags & (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC |
-               CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWTIME))
+  /* Reject combined sandbox requests until every requested namespace exists.
+   * In particular, accepting NEWNS with a global mount table is not safe. */
+  if (flags & (CLONE_NEWCGROUP | CLONE_NEWUSER | CLONE_NEWTIME))
     return (uint64_t)-1; // EPERM
+  if ((flags & CLONE_NEWIPC) && (flags & CLONE_SYSVSEM)) return (uint64_t)-22;
+  if ((flags & CLONE_NEWPID) && (flags & (CLONE_THREAD | CLONE_PARENT))) return (uint64_t)-22;
+  if ((flags & CLONE_NEWNS) && (flags & CLONE_FS)) return (uint64_t)-22;
+  if ((flags & (CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET)) &&
+      !capability_has(parent, CAP_SYS_ADMIN))
+    return (uint64_t)-1;
+  struct uts_namespace *new_uts
+      __attribute__((cleanup(uts_namespace_cleanup))) = NULL;
+  if (flags & CLONE_NEWUTS) {
+    new_uts = uts_namespace_copy(parent);
+    if (!new_uts) return (uint64_t)-12;
+  }
+  struct ipc_namespace *new_ipc
+      __attribute__((cleanup(ipc_namespace_cleanup))) = NULL;
+  if (flags & CLONE_NEWIPC) {
+    new_ipc = ipc_namespace_create();
+    if (!new_ipc) return (uint64_t)-12;
+  }
+  struct mount_namespace *new_mount __attribute__((cleanup(process_mount_cleanup))) = NULL;
+  struct pid_namespace *new_pid __attribute__((cleanup(pid_namespace_cleanup))) = NULL;
+  if (flags & CLONE_NEWNS) {
+    new_mount = vfs_namespace_prepare(parent);
+    if (!new_mount) return (uint64_t)-12;
+  }
+  if (flags & CLONE_NEWPID) {
+    new_pid = pid_namespace_create(parent);
+    if (!new_pid) return (uint64_t)-12;
+  }
+  struct net_namespace *new_net __attribute__((cleanup(net_namespace_cleanup))) = NULL;
+  if (flags & CLONE_NEWNET) {
+    new_net = net_namespace_create();
+    if (!new_net) return (uint64_t)-12;
+  }
   if ((flags & CLONE_VM) && !(flags & CLONE_VFORK) && child_stack == 0)
     return (uint64_t)-22;
   if ((flags & CLONE_PARENT_SETTID) &&
@@ -2050,16 +2212,24 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   child->fork_ctx = child_regs;
   child->parent = parent;
   child->cpu_affinity = parent->cpu_affinity;
-  child->priority = parent->static_priority;
-  child->static_priority = parent->static_priority;
-  child->nice_value = parent->nice_value;
-  eevfd_set_nice(&child->se, (int)child->nice_value);
+  process_inherit_scheduler(child, parent);
+  uts_namespace_inherit(child, parent);
+  ipc_namespace_inherit(child, parent);
   child->clone_flags = flags;
+  if (new_ipc) {
+    ipc_namespace_install(child, new_ipc);
+    new_ipc = NULL;
+  }
+  if (new_uts) {
+    uts_namespace_install(child, new_uts);
+    new_uts = NULL;
+  }
   child->tgid = (flags & CLONE_THREAD) ? parent->tgid : child->tid;
   child->fs_base = (flags & CLONE_SETTLS) ? newtls : parent->fs_base;
   child->gs_base = parent->gs_base;
   child->tid_address =
       (flags & CLONE_CHILD_CLEARTID) ? (uint64_t *)ctid : NULL;
+  child->child_set_tid = (flags & CLONE_CHILD_SETTID) ? ctid : 0;
   // A new task starts from the parent's robust list, exactly like Linux; a
   // fresh thread installs its own through set_robust_list(2).
   child->robust_list = parent->robust_list;
@@ -2077,22 +2247,7 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   if (flags & CLONE_FILES) {
     sched_share_files(child, parent);
   } else {
-    for (int i = 0; i < MAX_FDS; i++) {
-      /* FD_RESERVED is a descriptor another thread of this process is in the
-       * middle of allocating (including the pidfd reserved for CLONE_PIDFD
-       * below); it is not a file, and it must not reach the child. */
-      if (!parent->fds[i] || parent->fds[i] == FD_RESERVED)
-        continue;
-      child->fds[i] = parent->fds[i];
-      child->fd_offsets[i] = parent->fd_offsets[i];
-      child->fd_flags[i] = parent->fd_flags[i];
-      if (parent->fd_paths[i]) {
-        child->fd_paths[i] = parent->fd_paths[i];
-        __atomic_add_fetch(&child->fd_paths[i]->ref_count, 1,
-                           __ATOMIC_RELAXED);
-      }
-      vfs_open(child->fds[i]);
-    }
+    sched_copy_files(child, parent);
   }
 
   memcpy(child->cwd_path, parent->cwd_path, sizeof(child->cwd_path));
@@ -2120,14 +2275,20 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     child->ss_flags = parent->ss_flags;
   }
   memcpy(child->comm, parent->comm, sizeof(child->comm));
+  memcpy(child->exe_path, parent->exe_path, sizeof(child->exe_path));
 #if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
   child->trace_syscalls = parent->trace_syscalls;
 #endif
 
+  int ns_error = process_namespace_inherit(child, parent, new_mount, new_pid, flags);
+  if (ns_error) { PIDFD_UNRESERVE(); sched_reap_thread(child); return (uint64_t)ns_error; }
+  new_mount = NULL;
+  if (new_net) { net_namespace_install(child, new_net); new_net = NULL; }
+  uint32_t visible_child_tid = pid_namespace_tid(parent, child);
   if (flags & CLONE_PARENT_SETTID)
-    __atomic_store_n((uint32_t *)ptid, child->tid, __ATOMIC_RELEASE);
+    __atomic_store_n((uint32_t *)ptid, visible_child_tid, __ATOMIC_RELEASE);
   if ((flags & CLONE_CHILD_SETTID) && (flags & CLONE_VM))
-    __atomic_store_n((uint32_t *)ctid, child->tid, __ATOMIC_RELEASE);
+    __atomic_store_n((uint32_t *)ctid, pid_namespace_tid(child, child), __ATOMIC_RELEASE);
   if (pidfd_fd >= 0) {
     /* The child has copied the descriptor table by now, so the pidfd is only
      * the parent's.  Publish it before the child runs: the whole point of a
@@ -2148,6 +2309,8 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     parent->vfork_release_tsc = 0;
     __atomic_store_n(&parent->vfork_done, false, __ATOMIC_RELEASE);
   }
+  capability_inherit(child, parent);
+  seccomp_inherit(child, parent);
   fpu_copy_thread(child, parent);
   sched_enqueue_thread(child, target_cpu);
 
@@ -2155,7 +2318,7 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     vfork_wait_for_child(parent);
   }
 
-  return child_tid;
+  return visible_child_tid;
 #undef PIDFD_UNRESERVE
 }
 // sys_clone (syscall 56)
@@ -2225,25 +2388,12 @@ uint64_t sys_vfork(struct syscall_regs *regs) {
   child->fork_ctx = child_regs;
   child->parent = parent;
   child->cpu_affinity = parent->cpu_affinity;
-  child->priority = parent->static_priority;
-  child->static_priority = parent->static_priority;
-  child->nice_value = parent->nice_value;
-  eevfd_set_nice(&child->se, (int)child->nice_value);
+  process_inherit_scheduler(child, parent);
+  uts_namespace_inherit(child, parent);
+  ipc_namespace_inherit(child, parent);
   child->tgid = child->tid;
   child->clone_flags = CLONE_VFORK | CLONE_VM | SIGCHLD;
-  for (int i = 0; i < MAX_FDS; i++) {
-    if (parent->fds[i] && parent->fds[i] != FD_RESERVED) {
-      child->fds[i] = parent->fds[i];
-      child->fd_offsets[i] = parent->fd_offsets[i];
-      child->fd_flags[i] = parent->fd_flags[i];
-      if (parent->fd_paths[i]) {
-        child->fd_paths[i] = parent->fd_paths[i];
-        __atomic_add_fetch(&child->fd_paths[i]->ref_count, 1,
-                           __ATOMIC_RELAXED);
-      }
-      vfs_open(child->fds[i]);
-    }
-  }
+  sched_copy_files(child, parent);
   memcpy(child->cwd_path, parent->cwd_path, sizeof(child->cwd_path));
   // sched_create_kernel_thread() already inherited and referenced the
   // parent's CWD. Do not take a second, unmatched reference here.
@@ -2266,6 +2416,7 @@ uint64_t sys_vfork(struct syscall_regs *regs) {
          sizeof(child->supplementary_groups));
   child->ctty = parent->ctty;
   memcpy(child->comm, parent->comm, sizeof(child->comm));
+  memcpy(child->exe_path, parent->exe_path, sizeof(child->exe_path));
   child->ss_sp = parent->ss_sp;
   child->ss_size = parent->ss_size;
   child->ss_flags = parent->ss_flags;
@@ -2273,17 +2424,22 @@ uint64_t sys_vfork(struct syscall_regs *regs) {
   child->trace_syscalls = parent->trace_syscalls;
 #endif
 
+  int ns_error = process_namespace_inherit(child, parent, NULL, NULL, 0);
+  if (ns_error) { sched_reap_thread(child); return (uint64_t)ns_error; }
+  uint32_t visible_child_tid = pid_namespace_tid(parent, child);
   uint32_t child_tid = child->tid;
   // Publish the rendezvous before the child is runnable: it may exec/exit
   // on another CPU immediately after enqueue and must observe valid state.
   parent->vfork_child = child_tid;
   parent->vfork_release_tsc = 0;
   __atomic_store_n(&parent->vfork_done, false, __ATOMIC_RELEASE);
+  capability_inherit(child, parent);
+  seccomp_inherit(child, parent);
   fpu_copy_thread(child, parent);
   sched_enqueue_thread(child, NULL);
 
   vfork_wait_for_child(parent);
-  return child_tid;
+  return visible_child_tid;
 }
 
 struct clone_args {
@@ -2348,11 +2504,20 @@ struct sysinfo {
   uint64_t totalswap;
   uint64_t freeswap;
   uint16_t procs;
+  uint16_t pad;
+  /* Natural x86-64 alignment places totalhigh at 88, not 82. */
   uint64_t totalhigh;
   uint64_t freehigh;
   uint32_t mem_unit;
-  char _f[8]; // padding to 112 bytes (Linux ABI)
-} __attribute__((packed));
+};
+
+_Static_assert(sizeof(struct sysinfo) == 112, "x86-64 sysinfo ABI size");
+_Static_assert(offsetof(struct sysinfo, totalram) == 32 &&
+               offsetof(struct sysinfo, procs) == 80 &&
+               offsetof(struct sysinfo, totalhigh) == 88 &&
+               offsetof(struct sysinfo, freehigh) == 96 &&
+               offsetof(struct sysinfo, mem_unit) == 104,
+               "x86-64 sysinfo ABI offsets");
 
 static uint64_t sys_sysinfo(uint64_t info_ptr, uint64_t a1, uint64_t a2,
                             uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -2361,24 +2526,18 @@ static uint64_t sys_sysinfo(uint64_t info_ptr, uint64_t a1, uint64_t a2,
   (void)a3;
   (void)a4;
   (void)a5;
-  struct sysinfo *info = (struct sysinfo *)info_ptr;
-  if (!info)
+  struct sysinfo info;
+  /* Initialize ABI padding too. In the packed layout mem_unit occupied byte
+   * 98, leaving libc's byte-104 read uninitialized and corrupting RAM sizes
+   * returned by sysconf(_SC_PHYS_PAGES). */
+  memset(&info, 0, sizeof(info));
+  info.uptime = (int64_t)(lapic_timer_get_ms() / 1000);
+  info.totalram = pmm_get_total_memory();
+  info.freeram = (uint64_t)pmm_get_free_pages() * PAGE_SIZE;
+  info.procs = sched_get_thread_count();
+  info.mem_unit = 1;
+  if (copy_to_user((void *)info_ptr, &info, sizeof(info)) != 0)
     return (uint64_t)-14; // EFAULT
-
-  info->uptime = (int64_t)(lapic_timer_get_ms() / 1000);
-  info->loads[0] = 0;
-  info->loads[1] = 0;
-  info->loads[2] = 0;
-  info->totalram = pmm_get_total_memory();
-  info->freeram = (uint64_t)pmm_get_free_pages() * PAGE_SIZE;
-  info->sharedram = 0;
-  info->bufferram = 0;
-  info->totalswap = 0;
-  info->freeswap = 0;
-  info->procs = sched_get_thread_count();
-  info->totalhigh = 0;
-  info->freehigh = 0;
-  info->mem_unit = 1;
   return 0;
 }
 
@@ -2394,15 +2553,9 @@ struct utsname {
 
 /* System hostname: set by sethostname(2), reported back through uname(2).
  * OpenRC's `hostname` service fails the whole boot runlevel without it. */
-static char system_nodename[65] = "AvoryOS";
+/* Hostname and domain belong to the calling thread's UTS namespace. */
 
-static uint64_t sys_sethostname(uint64_t name_ptr, uint64_t len, uint64_t a2,
-                                uint64_t a3, uint64_t a4, uint64_t a5) {
-  (void)a2;
-  (void)a3;
-  (void)a4;
-  (void)a5;
-
+static uint64_t process_set_utsname(uint64_t name_ptr, uint64_t len, int domain) {
   if (len > 64)
     return (uint64_t)-22; // EINVAL: Linux caps the hostname at 64 bytes
   if (len && !name_ptr)
@@ -2413,8 +2566,19 @@ static uint64_t sys_sethostname(uint64_t name_ptr, uint64_t len, uint64_t a2,
     return (uint64_t)-14;
   tmp[len] = '\0';
 
-  memcpy(system_nodename, tmp, len + 1);
-  return 0;
+  return (uint64_t)uts_namespace_set(sched_get_current(), tmp, len, domain);
+}
+
+static uint64_t sys_sethostname(uint64_t name_ptr, uint64_t len, uint64_t a2,
+                                uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a2; (void)a3; (void)a4; (void)a5;
+  return process_set_utsname(name_ptr, len, 0);
+}
+
+static uint64_t sys_setdomainname(uint64_t name_ptr, uint64_t len, uint64_t a2,
+                                  uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a2; (void)a3; (void)a4; (void)a5;
+  return process_set_utsname(name_ptr, len, 1);
 }
 
 static uint64_t sys_uname(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
@@ -2424,12 +2588,13 @@ static uint64_t sys_uname(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
   (void)a3;
   (void)a4;
   (void)a5;
-  struct utsname *buf = (struct utsname *)buf_ptr;
-  if (!buf)
+  struct utsname result = {0};
+  struct utsname *buf = &result;
+  if (!buf_ptr)
     return (uint64_t)-14; // EFAULT
 
   strcpy(buf->sysname, "Ascension");
-  strcpy(buf->nodename, system_nodename);
+  uts_namespace_read(sched_get_current(), buf->nodename, buf->domainname);
   strcpy(buf->release, "2.5.0 Beta");
 
   /* Reading the RTC costs tens of microseconds of CMOS port I/O, which used
@@ -2450,9 +2615,7 @@ static uint64_t sys_uname(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
   strcpy(buf->version, cached_version);
 
   strcpy(buf->machine, "x86_64");
-  strcpy(buf->domainname, "localhost");
-
-  return 0;
+  return copy_to_user((void *)buf_ptr, &result, sizeof(result)) ? (uint64_t)-14 : 0;
 }
 
 // sys_getcpu(unsigned *cpu, unsigned *node, struct getcpu_cache *tcache)
@@ -2540,24 +2703,8 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     strncpy(out, current->comm, 16);
     return 0;
   }
-  case 7: // PR_GET_KEEPCAPS
-    return 0;
-  case 8: // PR_SET_KEEPCAPS
-    return 0;
-  case 23: // PR_CAPBSET_READ
-    // Return 1 if capability is in bounding set (all caps 0..40 present),
-    // or -EINVAL (-22) if capability is invalid (> 40).
-    if (arg2 <= 40)
-      return 1;
-    return (uint64_t)-22;
-  case 24: // PR_CAPBSET_DROP
-    if (arg2 <= 40)
-      return 0;
-    return (uint64_t)-22;
-  case 27: // PR_GET_SECUREBITS
-    return 0;
-  case 28: // PR_SET_SECUREBITS
-    return 0;
+  case 7: case 8: case 23: case 24: case 27: case 28:
+    return capability_prctl(current, option, arg2, arg3, arg4, arg5);
   case 13: // PR_GET_TIMING
     return 0;
   case 14: // PR_SET_TIMING
@@ -2571,9 +2718,10 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
   case 20: // PR_SET_ENDIAN
     return (arg2 == 1) ? 0 : (uint64_t)-22;
   case 21: // PR_GET_SECCOMP
-    return 0;
+    return seccomp_mode(current);
   case 22: // PR_SET_SECCOMP
-    return 0;
+    if (arg2 != 2) return (uint64_t)-22;
+    return (uint64_t)seccomp_control(1, 0, arg3);
   case 25: // PR_GET_TSC
     if (arg2 && vmm_is_user_addr_range_writable(arg2, sizeof(int))) {
       *(int *)arg2 = 1; // PR_TSC_ENABLE
@@ -2605,29 +2753,18 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     }
     return (uint64_t)-14;
   case 38: // PR_SET_NO_NEW_PRIVS
+    if (arg2 != 1 || arg3 || arg4 || arg5) return (uint64_t)-22;
+    __atomic_store_n(&current->no_new_privs, true, __ATOMIC_RELEASE);
     return 0;
   case 39: // PR_GET_NO_NEW_PRIVS
-    return 0;
+    if (arg2 || arg3 || arg4 || arg5) return (uint64_t)-22;
+    return __atomic_load_n(&current->no_new_privs, __ATOMIC_ACQUIRE);
   case 41: // PR_SET_THP_DISABLE
     return 0;
   case 42: // PR_GET_THP_DISABLE
     return 0;
-  case 47: // PR_CAP_AMBIENT
-    switch (arg2) {
-    case 1: // PR_CAP_AMBIENT_IS_SET
-      if (arg3 <= 40)
-        return 0;
-      return (uint64_t)-22;
-    case 2: // PR_CAP_AMBIENT_RAISE
-    case 3: // PR_CAP_AMBIENT_LOWER
-      if (arg3 <= 40)
-        return 0;
-      return (uint64_t)-22;
-    case 4: // PR_CAP_AMBIENT_CLEAR_ALL
-      return 0;
-    default:
-      return (uint64_t)-22;
-    }
+  case 47:
+    return capability_prctl(current, option, arg2, arg3, arg4, arg5);
   case 40: // PR_GET_TID_ADDRESS
     if (arg2 && vmm_is_user_addr_range_writable(arg2, sizeof(uint64_t))) {
       *(uint64_t *)arg2 = (uint64_t)current->tid_address;
@@ -2796,7 +2933,8 @@ static uint64_t sys_setresuid(struct syscall_regs *regs) {
   uint32_t suid = (uint32_t)regs->rdx;
   struct thread *t = sched_get_current();
   if (!t) return (uint64_t)-1;
-  if (t->euid != 0) {
+  uint32_t old_uid = t->uid, old_euid = t->euid, old_suid = t->suid;
+  if (!capability_has(t, CAP_SETUID)) {
     if (ruid != UINT32_MAX && ruid != t->uid && ruid != t->euid && ruid != t->suid) return (uint64_t)-1;
     if (euid != UINT32_MAX && euid != t->uid && euid != t->euid && euid != t->suid) return (uint64_t)-1;
     if (suid != UINT32_MAX && suid != t->uid && suid != t->euid && suid != t->suid) return (uint64_t)-1;
@@ -2805,6 +2943,7 @@ static uint64_t sys_setresuid(struct syscall_regs *regs) {
   if (euid != UINT32_MAX) t->euid = euid;
   if (suid != UINT32_MAX) t->suid = suid;
   t->fsuid = t->euid;
+  capability_uid_changed(t, old_uid, old_euid, old_suid);
   return 0;
 }
 
@@ -2814,7 +2953,7 @@ static uint64_t sys_setresgid(struct syscall_regs *regs) {
   uint32_t sgid = (uint32_t)regs->rdx;
   struct thread *t = sched_get_current();
   if (!t) return (uint64_t)-1;
-  if (t->euid != 0) {
+  if (!capability_has(t, CAP_SETGID)) {
     if (rgid != UINT32_MAX && rgid != t->gid && rgid != t->egid && rgid != t->sgid) return (uint64_t)-1;
     if (egid != UINT32_MAX && egid != t->gid && egid != t->egid && egid != t->sgid) return (uint64_t)-1;
     if (sgid != UINT32_MAX && sgid != t->gid && sgid != t->egid && sgid != t->sgid) return (uint64_t)-1;
@@ -2832,13 +2971,15 @@ static uint64_t sys_setuid(struct syscall_regs *regs) {
   struct thread *t = sched_get_current();
   if (!t)
     return (uint64_t)-1;
-  if (t->euid == 0) {
+  uint32_t old_uid = t->uid, old_euid = t->euid, old_suid = t->suid;
+  if (capability_has(t, CAP_SETUID)) {
     t->uid = t->euid = t->suid = t->fsuid = uid;
   } else if (uid == t->uid || uid == t->suid) {
     t->euid = t->fsuid = uid;
   } else {
     return (uint64_t)-1;
   }
+  capability_uid_changed(t, old_uid, old_euid, old_suid);
   return 0;
 }
 
@@ -2848,7 +2989,7 @@ static uint64_t sys_setgid(struct syscall_regs *regs) {
   struct thread *t = sched_get_current();
   if (!t)
     return (uint64_t)-1;
-  if (t->euid == 0) {
+  if (capability_has(t, CAP_SETGID)) {
     t->gid = t->egid = t->sgid = t->fsgid = gid;
   } else if (gid == t->gid || gid == t->sgid) {
     t->egid = t->fsgid = gid;
@@ -2865,8 +3006,9 @@ static uint64_t sys_setreuid(struct syscall_regs *regs) {
   struct thread *t = sched_get_current();
   if (!t)
     return (uint64_t)-1;
+  uint32_t old_uid = t->uid, old_euid = t->euid, old_suid = t->suid;
 
-  if (t->euid != 0) {
+  if (!capability_has(t, CAP_SETUID)) {
     if (ruid != UINT32_MAX && ruid != t->uid && ruid != t->euid)
       return (uint64_t)-1;
     if (euid != UINT32_MAX && euid != t->uid && euid != t->euid && euid != t->suid)
@@ -2883,6 +3025,7 @@ static uint64_t sys_setreuid(struct syscall_regs *regs) {
     t->suid = t->euid;
   }
   t->fsuid = t->euid;
+  capability_uid_changed(t, old_uid, old_euid, old_suid);
   return 0;
 }
 
@@ -2894,7 +3037,7 @@ static uint64_t sys_setregid(struct syscall_regs *regs) {
   if (!t)
     return (uint64_t)-1;
 
-  if (t->euid != 0) {
+  if (!capability_has(t, CAP_SETGID)) {
     if (rgid != UINT32_MAX && rgid != t->gid && rgid != t->egid)
       return (uint64_t)-1;
     if (egid != UINT32_MAX && egid != t->gid && egid != t->egid && egid != t->sgid)
@@ -2922,7 +3065,7 @@ static uint64_t sys_setfsuid(struct syscall_regs *regs) {
     return (uint64_t)-1;
   // Return the previous fsuid value
   uint32_t old_fsuid = t->fsuid;
-  if (t->euid == 0 || fsuid == t->uid || fsuid == t->euid ||
+  if (capability_has(t, CAP_SETUID) || fsuid == t->uid || fsuid == t->euid ||
       fsuid == t->suid || fsuid == t->fsuid)
     t->fsuid = fsuid;
   return old_fsuid;
@@ -2936,7 +3079,7 @@ static uint64_t sys_setfsgid(struct syscall_regs *regs) {
     return (uint64_t)-1;
   // Return the previous fsgid value
   uint32_t old_fsgid = t->fsgid;
-  if (t->euid == 0 || fsgid == t->gid || fsgid == t->egid ||
+  if (capability_has(t, CAP_SETGID) || fsgid == t->gid || fsgid == t->egid ||
       fsgid == t->sgid || fsgid == t->fsgid)
     t->fsgid = fsgid;
   return old_fsgid;
@@ -2960,7 +3103,7 @@ static uint64_t sys_setgroups(struct syscall_regs *regs) {
   uint32_t size = (uint32_t)regs->rdi;
   const uint32_t *list = (const uint32_t *)regs->rsi;
   struct thread *t = sched_get_current();
-  if (!t || t->euid != 0) return (uint64_t)-1;
+  if (!t || !capability_has(t, CAP_SETGID)) return (uint64_t)-1;
   if (size > MAX_SUPPLEMENTARY_GROUPS) return (uint64_t)-22;
   if (size && (!list || !vmm_is_user_addr_range_valid((uint64_t)list,
       size * sizeof(uint32_t)))) return (uint64_t)-14;
@@ -2973,16 +3116,11 @@ static uint64_t sys_setgroups(struct syscall_regs *regs) {
 static uint64_t sys_getppid(struct syscall_regs *regs) {
   (void)regs;
   struct thread *t = sched_get_current();
-  if (!t)
-    return 0;
-  if (t->is_main_session)
-    return 0;
-  if (t->parent) {
-    if (t->parent->is_main_session)
-      return 1;
-    return t->parent->tgid;
-  }
-  return 0;
+  if (!t) return 0;
+  spinlock_acquire(&tid_lock);
+  uint32_t pid = t->parent ? pid_namespace_visible_locked(t, t->parent->tgid) : 0;
+  spinlock_release(&tid_lock);
+  return pid;
 }
 
 // sys_setpgid
@@ -2991,6 +3129,8 @@ static uint64_t sys_setpgid(struct syscall_regs *regs) {
   uint32_t pgid = (uint32_t)regs->rsi;
   struct thread *current = sched_get_current();
   struct thread *target = NULL;
+  if (pid) { pid = pid_namespace_global(current, pid); if (!pid) return (uint64_t)-3; }
+  if (pgid) { pgid = pid_namespace_global(current, pgid); if (!pgid) return (uint64_t)-1; }
 
   if (pid == 0) {
     target = current;
@@ -3030,11 +3170,11 @@ static uint64_t sys_getpgid(uint64_t pid, uint64_t a1, uint64_t a2, uint64_t a3,
   (void)a5;
   struct thread *current = sched_get_current();
   if (pid == 0)
-    return current->pgid;
-  struct thread *target = sched_get_thread_by_tid((uint32_t)pid);
+    return pid_namespace_visible(current, current->pgid);
+  struct thread *target = sched_get_thread_by_tid(pid_namespace_global(current, (uint32_t)pid));
   if (!target)
     return (uint64_t)-3; // ESRCH
-  return target->pgid;
+  return pid_namespace_visible(current, target->pgid);
 }
 
 static uint64_t sys_getsid(uint64_t pid, uint64_t a1, uint64_t a2, uint64_t a3,
@@ -3048,11 +3188,11 @@ static uint64_t sys_getsid(uint64_t pid, uint64_t a1, uint64_t a2, uint64_t a3,
   if (!current)
     return (uint64_t)-3; // ESRCH
   if (pid == 0)
-    return (uint64_t)(current->sid ? current->sid : (current->tgid ? current->tgid : 1));
-  struct thread *target = sched_get_thread_by_tid((uint32_t)pid);
+    return pid_namespace_visible(current, current->sid ? current->sid : current->tgid);
+  struct thread *target = sched_get_thread_by_tid(pid_namespace_global(current, (uint32_t)pid));
   if (!target)
     return (uint64_t)-3; // ESRCH
-  return (uint64_t)(target->sid ? target->sid : (target->tgid ? target->tgid : 1));
+  return pid_namespace_visible(current, target->sid ? target->sid : target->tgid);
 }
 
 // sys_getpgrp
@@ -3061,7 +3201,7 @@ static uint64_t sys_getpgrp(struct syscall_regs *regs) {
   struct thread *t = sched_get_current();
   if (!t)
     return 0;
-  return t->pgid;
+  return pid_namespace_visible(t, t->pgid);
 }
 
 // sys_rseq: restartable sequences (Linux rseq(2) ABI).
@@ -3228,7 +3368,7 @@ static uint64_t sys_setsid(struct syscall_regs *regs) {
 
   klog_debugf("[SETSID] New session created: %llu\n", (unsigned long long)current->sid);
 
-  return (uint64_t)current->sid;
+  return pid_namespace_visible(current, current->sid);
 }
 
 struct kernel_timeval {
@@ -3410,86 +3550,70 @@ struct rlimit {
 
 #define RLIM_INFINITY ((uint64_t)-1)
 
-static uint64_t sys_getrlimit(uint64_t resource, uint64_t rlim_ptr, uint64_t a2,
-                              uint64_t a3, uint64_t a4, uint64_t a5) {
-  (void)a2;
-  (void)a3;
-  (void)a4;
-  (void)a5;
-  struct rlimit *r = (struct rlimit *)rlim_ptr;
-  if (!r)
-    return (uint64_t)-14; // EFAULT
-
-  // Simple stubs: everything is infinite for now
-  r->rlim_cur = RLIM_INFINITY;
-  r->rlim_max = RLIM_INFINITY;
-
-  // Some apps specifically check RLIMIT_NOFILE
-  if (resource == 7) { // RLIMIT_NOFILE
-    r->rlim_cur = MAX_FDS;
-    r->rlim_max = MAX_FDS;
-  } else if (resource == 4) { // RLIMIT_CORE (default 0 on Linux)
-    r->rlim_cur = 0;
-    r->rlim_max = RLIM_INFINITY;
-  } else if (resource == 3) { // RLIMIT_STACK (default 8MB on Linux)
-    r->rlim_cur = 8 * 1024 * 1024;
-    r->rlim_max = 8 * 1024 * 1024;
+/* The effective limits are still fixed, but every ABI transfer must use
+ * fault-safe user copies: Chromium can pass buffers protected with mprotect. */
+static struct rlimit resource_limit_value(uint32_t resource) {
+  struct rlimit limit = {RLIM_INFINITY, RLIM_INFINITY};
+  if (resource == 7) { /* RLIMIT_NOFILE */
+    limit.rlim_cur = limit.rlim_max = MAX_FDS;
+  } else if (resource == 4) { /* RLIMIT_CORE */
+    limit.rlim_cur = 0;
+  } else if (resource == 3) { /* RLIMIT_STACK */
+    limit.rlim_cur = limit.rlim_max = 8 * 1024 * 1024;
   }
+  return limit;
+}
 
-  return 0;
+static int resource_limit_read(uint64_t user, struct rlimit *limit) {
+  if (copy_from_user(limit, (const void *)user, sizeof(*limit)) != 0)
+    return -14;
+  return limit->rlim_cur > limit->rlim_max ? -22 : 0;
+}
+
+static uint64_t sys_getrlimit(uint64_t resource_arg, uint64_t rlim_ptr,
+                              uint64_t a2, uint64_t a3, uint64_t a4,
+                              uint64_t a5) {
+  (void)a2; (void)a3; (void)a4; (void)a5;
+  uint32_t resource = (uint32_t)resource_arg;
+  if (resource >= 16) return (uint64_t)-22;
+  struct rlimit limit = resource_limit_value(resource);
+  return copy_to_user((void *)rlim_ptr, &limit, sizeof(limit)) != 0
+             ? (uint64_t)-14 : 0;
 }
 
 static uint64_t sys_prlimit64(struct syscall_regs *regs) {
   uint32_t pid = (uint32_t)regs->rdi;
   uint32_t resource = (uint32_t)regs->rsi;
-  struct rlimit *new_limit = (struct rlimit *)regs->rdx;
-  struct rlimit *old_limit = (struct rlimit *)regs->r10;
-
+  if (resource >= 16) return (uint64_t)-22;
+  struct rlimit requested;
+  if (regs->rdx) {
+    int error = resource_limit_read(regs->rdx, &requested);
+    if (error) return (uint64_t)(int64_t)error;
+  }
   if (pid != 0) {
-    struct thread *t = sched_get_thread_by_tid(pid);
-    if (!t)
-      return (uint64_t)-3; // ESRCH
-    if (t != sched_get_current())
-      return (uint64_t)-1; // EPERM (only self for now)
+    struct thread *current = sched_get_current();
+    struct sched_thread_snapshot target;
+    if (!sched_get_thread_snapshot(pid_namespace_global(sched_get_current(), pid), &target)) return (uint64_t)-3;
+    if (!current || (target.tgid ? target.tgid : target.tid) !=
+                        (current->tgid ? current->tgid : current->tid))
+      return (uint64_t)-1; /* Other processes remain unsupported. */
   }
-
-  if (old_limit) {
-    old_limit->rlim_cur = RLIM_INFINITY;
-    old_limit->rlim_max = RLIM_INFINITY;
-    if (resource == 7) { // RLIMIT_NOFILE
-      old_limit->rlim_cur = MAX_FDS;
-      old_limit->rlim_max = MAX_FDS;
-    } else if (resource == 4) { // RLIMIT_CORE
-      old_limit->rlim_cur = 0;
-      old_limit->rlim_max = RLIM_INFINITY;
-    } else if (resource == 3) { // RLIMIT_STACK (default 8MB on Linux)
-      old_limit->rlim_cur = 8 * 1024 * 1024;
-      old_limit->rlim_max = 8 * 1024 * 1024;
-    }
+  if (regs->r10) {
+    struct rlimit previous = resource_limit_value(resource);
+    if (copy_to_user((void *)regs->r10, &previous, sizeof(previous)) != 0)
+      return (uint64_t)-14;
   }
-
-  if (new_limit) {
-    // No enforcement yet (except the fixed-size fd table for NOFILE).
-    // Report success so glibc/Firefox raise-probes (e.g. to 4096) do not
-    // fail; the effective limit stays MAX_FDS as reported above.
-  }
-
+  /* Preserve the existing fixed-limit policy for valid setter requests. */
   return 0;
 }
 
-static uint64_t sys_setrlimit(uint64_t resource, uint64_t rlim_ptr, uint64_t a2,
-                              uint64_t a3, uint64_t a4, uint64_t a5) {
-  (void)a2;
-  (void)a3;
-  (void)a4;
-  (void)a5;
-  if (resource > 16)
-    return (uint64_t)-22; // EINVAL
-  if (!rlim_ptr)
-    return (uint64_t)-14; // EFAULT
-  // Same policy as prlimit64: accept (clamp to MAX_FDS for NOFILE
-  // implicitly by ignoring) so setrlimit(RLIMIT_NOFILE, 4096) probes succeed.
-  return 0;
+static uint64_t sys_setrlimit(uint64_t resource_arg, uint64_t rlim_ptr,
+                              uint64_t a2, uint64_t a3, uint64_t a4,
+                              uint64_t a5) {
+  (void)a2; (void)a3; (void)a4; (void)a5;
+  if ((uint32_t)resource_arg >= 16) return (uint64_t)-22;
+  struct rlimit requested;
+  return (uint64_t)(int64_t)resource_limit_read(rlim_ptr, &requested);
 }
 
 static uint64_t sys_membarrier(uint64_t cmd, uint64_t flags, uint64_t a2,
@@ -3530,7 +3654,7 @@ static uint64_t sys_sched_setaffinity(uint64_t pid, uint64_t len,
 
   struct thread *current = sched_get_current();
   struct thread *target =
-      pid == 0 ? current : sched_get_thread_by_tid((uint32_t)pid);
+      pid == 0 ? current : sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)pid));
   if (!target)
     return (uint64_t)-3; // ESRCH
 
@@ -3567,7 +3691,7 @@ static uint64_t sys_sched_getaffinity(uint64_t pid, uint64_t len,
 
   struct thread *current = sched_get_current();
   struct thread *target =
-      pid == 0 ? current : sched_get_thread_by_tid((uint32_t)pid);
+      pid == 0 ? current : sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)pid));
   if (!target)
     return (uint64_t)-3; // ESRCH
 
@@ -3599,54 +3723,149 @@ static uint64_t sys_sched_getaffinity(uint64_t pid, uint64_t len,
   return copy_bytes;
 }
 
-static uint64_t sys_sched_setparam(uint64_t pid, uint64_t param_ptr,
-                                   uint64_t a2, uint64_t a3, uint64_t a4,
-                                   uint64_t a5) {
-  (void)a2;
-  (void)a3;
-  (void)a4;
-  (void)a5;
-
-  struct thread *current = sched_get_current();
-  struct thread *target =
-      pid == 0 ? current : sched_get_thread_by_tid((uint32_t)pid);
-  if (!target)
-    return (uint64_t)-3; // ESRCH
-  if (current->euid != 0 && current->uid != target->uid &&
-      current->euid != target->uid) return (uint64_t)-1;
-
-  if (!param_ptr || !vmm_is_user_addr_range_valid(param_ptr, sizeof(int)))
-    return (uint64_t)-14; // EFAULT
-
-  int sched_priority = *(int *)param_ptr;
-  if (sched_priority != 0)
-    return (uint64_t)-22; // SCHED_OTHER requires priority zero
-  return 0;
-}
-
-static uint64_t sys_sched_getparam(uint64_t pid, uint64_t param_ptr,
-                                   uint64_t a2, uint64_t a3, uint64_t a4,
-                                   uint64_t a5) {
-  (void)pid;
-  (void)a2;
-  (void)a3;
-  (void)a4;
-  (void)a5;
-
-  if (!param_ptr || !vmm_is_user_addr_range_valid(param_ptr, sizeof(int))) {
-    return (uint64_t)-14; // EFAULT
-  }
-
-  // struct sched_param { int sched_priority; };
-  *(int *)param_ptr = 0;
-  return 0;
-}
-
 #define SCHED_OTHER 0
 #define SCHED_FIFO  1
 #define SCHED_RR    2
 #define SCHED_BATCH 3
 #define SCHED_IDLE  5
+#define SCHED_FLAG_RESET_ON_FORK 1ULL
+#define SCHED_FLAG_KEEP_POLICY 8ULL
+#define SCHED_FLAG_KEEP_PARAMS 16ULL
+#define SCHED_FLAG_UTIL_CLAMP 96ULL
+
+/* FIFO/RR retain the existing EEVDF compatibility mapping, not RT guarantees. */
+static uint64_t process_set_scheduler(struct thread *current,
+                                       struct thread *target, uint32_t policy,
+                                       int nice, uint32_t priority, bool reset) {
+  if (!target)
+    return (uint64_t)-3;
+  if (policy != SCHED_OTHER && policy != SCHED_BATCH && policy != SCHED_IDLE &&
+      policy != SCHED_FIFO && policy != SCHED_RR)
+    return policy == 6 ? (uint64_t)-95 : (uint64_t)-22;
+  bool rt = policy == SCHED_FIFO || policy == SCHED_RR;
+  if ((rt && (priority < 1 || priority > 99)) || (!rt && priority))
+    return (uint64_t)-22;
+  if (nice < -20) nice = -20;
+  if (nice > 19) nice = 19;
+  if (!current || (!capability_has(current, CAP_SYS_NICE) &&
+      ((current->euid != target->uid && current->euid != target->euid) || rt ||
+       nice < target->nice_value || (target->sched_reset_on_fork && !reset))))
+    return (uint64_t)-1;
+  if (rt) {
+    nice = -20 + (99 - priority) / 10;
+    if (nice > -10) nice = -10;
+  } else if (policy == SCHED_IDLE) {
+    nice = 19;
+  }
+  return sched_set_attributes(target, nice_to_sched_priority(nice), (int8_t)nice,
+                               (uint8_t)policy, (uint8_t)priority, reset)
+             ? 0 : (uint64_t)-3;
+}
+
+static uint64_t sys_sched_setparam(uint64_t pid, uint64_t param_ptr,
+                                   uint64_t a2, uint64_t a3, uint64_t a4,
+                                   uint64_t a5) {
+  (void)a2; (void)a3; (void)a4; (void)a5;
+  if ((int32_t)pid < 0 || !param_ptr) return (uint64_t)-22;
+  int priority;
+  if (copy_from_user(&priority, (void *)param_ptr, sizeof(priority)))
+    return (uint64_t)-14;
+  struct thread *current = sched_get_current();
+  struct thread *target = pid == 0 ? current : sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)pid));
+  if (!target) return (uint64_t)-3;
+  return process_set_scheduler(current, target, target->sched_policy,
+                                target->nice_value, (uint32_t)priority,
+                                target->sched_reset_on_fork);
+}
+
+static uint64_t sys_sched_getparam(uint64_t pid, uint64_t param_ptr,
+                                   uint64_t a2, uint64_t a3, uint64_t a4,
+                                   uint64_t a5) {
+  (void)a2; (void)a3; (void)a4; (void)a5;
+  if ((int32_t)pid < 0 || !param_ptr) return (uint64_t)-22;
+  struct thread *target = pid == 0 ? sched_get_current() :
+      sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)pid));
+  if (!target) return (uint64_t)-3;
+  int priority = target->sched_rt_priority;
+  return copy_to_user((void *)param_ptr, &priority, sizeof(priority))
+             ? (uint64_t)-14 : 0;
+}
+
+/* Linux version 0 is 48 bytes; version 1 adds utilization bounds. */
+struct linux_sched_attr {
+  uint32_t size, policy;
+  uint64_t flags;
+  int32_t nice;
+  uint32_t priority;
+  uint64_t runtime, deadline, period;
+  uint32_t util_min, util_max;
+};
+_Static_assert(sizeof(struct linux_sched_attr) == 56, "sched_attr ABI");
+
+static uint64_t sys_sched_setattr(uint64_t pid, uint64_t attr_ptr,
+                                  uint64_t flags, uint64_t a3,
+                                  uint64_t a4, uint64_t a5) {
+  (void)a3; (void)a4; (void)a5;
+  if ((int32_t)pid < 0 || !attr_ptr || (uint32_t)flags)
+    return (uint64_t)-22;
+  uint32_t size;
+  if (copy_from_user(&size, (void *)attr_ptr, sizeof(size)))
+    return (uint64_t)-14;
+  if (!size) size = 48;
+  if (size < 48 || size > 4096) goto bad_size;
+  struct linux_sched_attr attr = {0};
+  size_t bytes = size < sizeof(attr) ? size : sizeof(attr);
+  if (copy_from_user(&attr, (void *)attr_ptr, bytes)) return (uint64_t)-14;
+  /* Future extensions may be accepted only if all unknown bytes are zero. */
+  for (size_t off = sizeof(attr); off < size;) {
+    uint8_t tail[64];
+    size_t n = size - off;
+    if (n > sizeof(tail)) n = sizeof(tail);
+    if (copy_from_user(tail, (void *)(attr_ptr + off), n)) return (uint64_t)-14;
+    for (size_t i = 0; i < n; i++) if (tail[i]) goto bad_size;
+    off += n;
+  }
+  if ((int32_t)attr.policy < 0 || (attr.flags & ~127ULL))
+    return (uint64_t)-22;
+  if ((attr.flags & SCHED_FLAG_UTIL_CLAMP) && size < sizeof(attr))
+    return (uint64_t)-22;
+  /* No utilization governor or deadline admission control exists yet. */
+  if (attr.flags & (2ULL | 4ULL | SCHED_FLAG_UTIL_CLAMP)) return (uint64_t)-95;
+  struct thread *current = sched_get_current();
+  struct thread *target = pid == 0 ? current : sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)pid));
+  if (!target) return (uint64_t)-3;
+  if (attr.flags & SCHED_FLAG_KEEP_POLICY) attr.policy = target->sched_policy;
+  if (attr.flags & SCHED_FLAG_KEEP_PARAMS) {
+    attr.nice = target->nice_value;
+    attr.priority = target->sched_rt_priority;
+  }
+  return process_set_scheduler(current, target, attr.policy, attr.nice,
+                                attr.priority,
+                                (attr.flags & SCHED_FLAG_RESET_ON_FORK) != 0);
+ bad_size:
+  size = sizeof(struct linux_sched_attr);
+  if (copy_to_user((void *)attr_ptr, &size, sizeof(size))) return (uint64_t)-14;
+  return (uint64_t)-7;
+}
+
+static uint64_t sys_sched_getattr(uint64_t pid, uint64_t attr_ptr,
+                                  uint64_t size_arg, uint64_t flags,
+                                  uint64_t a4, uint64_t a5) {
+  (void)a4; (void)a5;
+  uint32_t size = (uint32_t)size_arg;
+  if ((int32_t)pid < 0 || !attr_ptr || (uint32_t)flags || size < 48 || size > 4096)
+    return (uint64_t)-22;
+  struct thread *target = pid == 0 ? sched_get_current() :
+      sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)pid));
+  if (!target) return (uint64_t)-3;
+  struct linux_sched_attr attr = {0};
+  attr.size = size < sizeof(attr) ? size : sizeof(attr);
+  attr.policy = target->sched_policy;
+  attr.nice = target->nice_value;
+  attr.priority = target->sched_rt_priority;
+  attr.flags = target->sched_reset_on_fork ? SCHED_FLAG_RESET_ON_FORK : 0;
+  return copy_to_user((void *)attr_ptr, &attr, attr.size) ? (uint64_t)-14 : 0;
+}
 
 static uint64_t sys_sched_get_priority_max(uint64_t policy, uint64_t a1,
                                            uint64_t a2, uint64_t a3,
@@ -3695,7 +3914,7 @@ static uint64_t sys_sched_rr_get_interval(uint64_t pid, uint64_t tp_ptr,
 
   struct thread *current = sched_get_current();
   struct thread *target =
-      pid == 0 ? current : sched_get_thread_by_tid((uint32_t)pid);
+      pid == 0 ? current : sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)pid));
   if (!target)
     return (uint64_t)-3; // ESRCH
   (void)current;
@@ -3749,76 +3968,35 @@ static uint64_t sys_sched_getscheduler(uint64_t pid, uint64_t a1, uint64_t a2,
   (void)a4;
   (void)a5;
 
+  if ((int32_t)pid < 0) return (uint64_t)-22;
+
   struct thread *current = sched_get_current();
   struct thread *target =
-      pid == 0 ? current : sched_get_thread_by_tid((uint32_t)pid);
+      pid == 0 ? current : sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)pid));
   if (!target)
     return (uint64_t)-3; // ESRCH
 
-  if (target->nice_value <= -10)
-    return SCHED_RR;
-  if (target->nice_value >= 10)
-    return SCHED_BATCH;
-  return SCHED_OTHER;
+  return target->sched_policy | (target->sched_reset_on_fork ? 0x40000000U : 0);
+
 }
 
 // sys_sched_setscheduler (syscall 144)
 // Sets the scheduling policy and parameters for a process.
-// Maps real-time (SCHED_FIFO/SCHED_RR) to highest interactive priority,
-// and SCHED_BATCH to longer throughput slices.
+// Shares the attribute syscall's validation, policy state and EEVDF mapping.
 static uint64_t sys_sched_setscheduler(uint64_t pid, uint64_t policy,
                                        uint64_t param_ptr, uint64_t a3,
                                        uint64_t a4, uint64_t a5) {
-  (void)a3;
-  (void)a4;
-  (void)a5;
-
+  (void)a3; (void)a4; (void)a5;
+  if ((int32_t)pid < 0 || !param_ptr) return (uint64_t)-22;
+  int priority;
+  if (copy_from_user(&priority, (void *)param_ptr, sizeof(priority)))
+    return (uint64_t)-14;
   struct thread *current = sched_get_current();
-  struct thread *target =
-      pid == 0 ? current : sched_get_thread_by_tid((uint32_t)pid);
-  if (!target)
-    return (uint64_t)-3; // ESRCH
-
-  if (current->euid != 0 && current->uid != target->uid &&
-      current->euid != target->uid)
-    return (uint64_t)-1; // EPERM
-
-  if (!param_ptr || !vmm_is_user_addr_range_valid(param_ptr, sizeof(int)))
-    return (uint64_t)-14; // EFAULT
-
-  int sched_priority = *(int *)param_ptr;
-  uint64_t clean_policy = policy & ~0x40000000ULL; // Mask SCHED_RESET_ON_FORK
-
-  if (clean_policy == SCHED_FIFO || clean_policy == SCHED_RR) {
-    if (sched_priority < 1 || sched_priority > 99)
-      return (uint64_t)-22; // EINVAL
-    // Map RT priority (1..99) to highest interactive priority (nice -20..-10)
-    int nice = -20 + (99 - sched_priority) / 10;
-    if (nice < -20) nice = -20;
-    if (nice > -10) nice = -10;
-    sched_set_priority(target, nice_to_sched_priority(nice), (int8_t)nice);
-    eevfd_set_slice(&target->se, EEVFD_LATENCY_SLICE_NS);
-    return 0;
-  } else if (clean_policy == SCHED_BATCH) {
-    if (sched_priority != 0) return (uint64_t)-22;
-    int nice = 5;
-    sched_set_priority(target, nice_to_sched_priority(nice), (int8_t)nice);
-    eevfd_set_slice(&target->se, EEVFD_BATCH_SLICE_NS);
-    return 0;
-  } else if (clean_policy == SCHED_IDLE) {
-    if (sched_priority != 0) return (uint64_t)-22;
-    int nice = 19;
-    sched_set_priority(target, nice_to_sched_priority(nice), (int8_t)nice);
-    eevfd_set_slice(&target->se, EEVFD_MAX_SLICE_NS);
-    return 0;
-  } else if (clean_policy == SCHED_OTHER) {
-    if (sched_priority != 0)
-      return (uint64_t)-22; // EINVAL
-    sched_set_priority(target, nice_to_sched_priority(0), 0);
-    return 0;
-  }
-
-  return (uint64_t)-22; // EINVAL
+  struct thread *target = pid == 0 ? current : sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)pid));
+  if (!target) return (uint64_t)-3;
+  return process_set_scheduler(current, target, (uint32_t)policy & ~0x40000000U,
+                                target->nice_value, (uint32_t)priority,
+                                ((uint32_t)policy & 0x40000000U) != 0);
 }
 
 // sys_setpriority (syscall 141)
@@ -3838,11 +4016,11 @@ static uint64_t sys_setpriority(uint64_t which, uint64_t who, uint64_t prio,
   if (nice > 19) nice = 19;
   struct thread *current = sched_get_current();
   struct thread *target = who == 0 ? current :
-      sched_get_thread_by_tid((uint32_t)who);
+      sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)who));
   if (!target) return (uint64_t)-3;
-  if (current->euid != 0 && current->uid != target->uid &&
+  if (!capability_has(current, CAP_SYS_NICE) && current->uid != target->uid &&
       current->euid != target->uid) return (uint64_t)-1;
-  if (nice < target->nice_value && current->euid != 0)
+  if (nice < target->nice_value && !capability_has(current, CAP_SYS_NICE))
     return (uint64_t)-13;
   if (!sched_set_priority(target, nice_to_sched_priority(nice), (int8_t)nice))
     return (uint64_t)-3;
@@ -3861,7 +4039,7 @@ static uint64_t sys_getpriority(uint64_t which, uint64_t who, uint64_t a2,
   if (which != PRIO_PROCESS) return (uint64_t)-22;
   struct thread *current = sched_get_current();
   struct thread *target = who == 0 ? current :
-      sched_get_thread_by_tid((uint32_t)who);
+      sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)who));
   if (!target) return (uint64_t)-3;
   return (uint64_t)(20 - target->nice_value);
 }
@@ -3892,12 +4070,12 @@ static uint64_t sys_ioprio_set(uint64_t which, uint64_t who, uint64_t ioprio,
     return (uint64_t)-22;
   struct thread *current = sched_get_current();
   if (which == IOPRIO_WHO_PROCESS && who != 0) {
-    struct thread *target = sched_get_thread_by_tid((uint32_t)who);
+    struct thread *target = sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)who));
     if (!target) return (uint64_t)-3;
-    if (current && current->euid != 0 && current->uid != target->uid &&
+    if (current && !capability_has(current, CAP_SYS_NICE) && current->uid != target->uid &&
         current->euid != target->uid) return (uint64_t)-1;
   }
-  if (cls == IOPRIO_CLASS_RT && current && current->euid != 0)
+  if (cls == IOPRIO_CLASS_RT && current && !capability_has(current, CAP_SYS_NICE))
     return (uint64_t)-1; // RT I/O class needs privilege, as on Linux
   return 0;
 }
@@ -3908,7 +4086,7 @@ static uint64_t sys_ioprio_get(uint64_t which, uint64_t who, uint64_t a2,
   if (which < IOPRIO_WHO_PROCESS || which > IOPRIO_WHO_USER)
     return (uint64_t)-22;
   if (which == IOPRIO_WHO_PROCESS && who != 0 &&
-      !sched_get_thread_by_tid((uint32_t)who))
+      !sched_get_thread_by_tid(pid_namespace_global(sched_get_current(), (uint32_t)who)))
     return (uint64_t)-3;
   return (uint64_t)IOPRIO_DEFAULT_PRIO;
 }
@@ -4044,10 +4222,10 @@ static uint64_t sys_get_robust_list(uint64_t pid_val, uint64_t head_ptr,
   } else {
     // A tid, not a tgid: robust lists are per thread.
     for (struct thread *t = global_thread_list; t; t = t->global_next) {
-      if (t->tid != (uint32_t)pid)
+      if (pid_namespace_tid(current, t) != (uint32_t)pid)
         continue;
       // Linux asks for ptrace_may_access(); same owner is the closest match.
-      if (current->euid != 0 && t->uid != current->uid &&
+      if (!capability_has(current, CAP_SYS_PTRACE) && t->uid != current->uid &&
           t->euid != current->euid)
         break;
       head = t->robust_list;
@@ -4092,6 +4270,8 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
   (void)a4;
   (void)a5;
 
+  if (!capability_has(sched_get_current(), 22)) return (uint64_t)-1;
+
   // Both magic values must match (as on Linux)
   if (magic1 != LINUX_REBOOT_MAGIC1)
     return (uint64_t)-22; // EINVAL
@@ -4106,6 +4286,7 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 #ifdef LINUXKPI_LINUX_IMPORTED
     linuxkpi_pci_shutdown();
 #endif
+    e1000_shutdown();
     nvme_shutdown(); /* graceful CC.SHN before resetting the machine */
     acpi_reboot();
     /* noreturn */
@@ -4116,6 +4297,7 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 #ifdef LINUXKPI_LINUX_IMPORTED
     linuxkpi_pci_shutdown();
 #endif
+    e1000_shutdown();
     nvme_shutdown(); /* graceful CC.SHN before power is removed */
     acpi_poweroff();
     /* noreturn */
@@ -4126,6 +4308,7 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 #ifdef LINUXKPI_LINUX_IMPORTED
     linuxkpi_pci_shutdown();
 #endif
+    e1000_shutdown();
     nvme_shutdown();
     hal_irq_disable();
     for (;;) hal_cpu_halt();
@@ -4196,128 +4379,17 @@ static uint64_t sys_swapon(uint64_t path_ptr, uint64_t flags, uint64_t a2,
 }
 
 // ---------------------------------------------------------------------------
-// sys_capget (125) / sys_capset (126)
-//
-// AvoryOS uses UID-based permission checks and has no capability enforcement
-// layer. capget reports defined capabilities for root and none for non-root,
-// with Linux's version-negotiation ABI for libraries probing the interface.
-// capset is a silent no-op — we never take capabilities away.
-//
-// Structures mirror the Linux uapi/linux/capability.h layout (version 3 = V3).
-// ---------------------------------------------------------------------------
-
-#define _LINUX_CAPABILITY_VERSION_1 0x19980330
-#define _LINUX_CAPABILITY_U32S_1    1
-#define _LINUX_CAPABILITY_VERSION_2 0x20071026
-#define _LINUX_CAPABILITY_U32S_2    2
-#define _LINUX_CAPABILITY_VERSION_3 0x20080522
-#define _LINUX_CAPABILITY_U32S_3    2
-
-struct __user_cap_header {
-  uint32_t version;
-  int pid;
-};
-
-struct __user_cap_data {
-  uint32_t effective;
-  uint32_t permitted;
-  uint32_t inheritable;
-};
-
-static uint64_t sys_capget(uint64_t hdrp_arg, uint64_t datap_arg,
-                           uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
-  (void)a3; (void)a4; (void)a5; (void)a6;
-
-  uint32_t version;
-  if (copy_from_user(&version, (const void *)hdrp_arg, sizeof(version)) != 0)
-    return (uint64_t)-14; // EFAULT
-  int tocopy = _LINUX_CAPABILITY_U32S_3;
-
-  switch (version) {
-  case _LINUX_CAPABILITY_VERSION_1:
-    tocopy = _LINUX_CAPABILITY_U32S_1;
-    break;
-  case _LINUX_CAPABILITY_VERSION_2:
-  case _LINUX_CAPABILITY_VERSION_3:
-    tocopy = _LINUX_CAPABILITY_U32S_3;
-    break;
-  default:
-    version = _LINUX_CAPABILITY_VERSION_3;
-    if (copy_to_user((void *)hdrp_arg, &version, sizeof(version)) != 0)
-      return (uint64_t)-14;
-    /* libcap discovers the ABI with an unknown version and NULL data.
-     * Linux updates the version and succeeds for precisely this probe. */
-    return datap_arg ? (uint64_t)-22 : 0;
-  }
-
-  /* A supported version is not rewritten: v1 still describes one word. */
-  if (!datap_arg)
-    return 0;
-
-  struct __user_cap_header header;
-  if (copy_from_user(&header, (const void *)hdrp_arg, sizeof(header)) != 0)
-    return (uint64_t)-14;
-  if (header.pid < 0)
-    return (uint64_t)-22;
-
-  struct thread *current = sched_get_current();
-  if (!current)
-    return (uint64_t)-3;
-  bool root = current->euid == 0;
-  if (header.pid && (uint32_t)header.pid != current->tid) {
-    bool found = false;
-    spinlock_acquire(&tid_lock);
-    for (struct thread *t = global_thread_list; t; t = t->global_next) {
-      if (t->tid == (uint32_t)header.pid) {
-        root = t->euid == 0;
-        found = true;
-        break;
-      }
-    }
-    spinlock_release(&tid_lock);
-    if (!found)
-      return (uint64_t)-3; // ESRCH
-  }
-
-  /* This is the existing UID-based compatibility model, not capability
-   * enforcement. Report only defined capabilities (0..40), and do not
-   * advertise root privileges for a non-root task. */
-  struct __user_cap_data data[2] = {0};
-  for (int i = 0; i < tocopy; i++) {
-    uint32_t bits = root ? (i == 0 ? UINT32_MAX : 0x1FFu) : 0;
-    data[i].effective = bits;
-    data[i].permitted = bits;
-  }
-  return copy_to_user((void *)datap_arg, data, sizeof(data[0]) * tocopy) != 0
-             ? (uint64_t)-14 : 0;
+// Capability operations use per-thread credentials and enforce irreversible drops.
+static uint64_t sys_capget(uint64_t h, uint64_t d, uint64_t a, uint64_t b, uint64_t c, uint64_t e) {
+  (void)a; (void)b; (void)c; (void)e; return capability_get(h, d);
+}
+static uint64_t sys_capset(uint64_t h, uint64_t d, uint64_t a, uint64_t b, uint64_t c, uint64_t e) {
+  (void)a; (void)b; (void)c; (void)e; return capability_set(h, d);
 }
 
-static uint64_t sys_capset(uint64_t hdrp_arg, uint64_t datap_arg,
-                           uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
-  (void)hdrp_arg; (void)datap_arg;
-  (void)a3; (void)a4; (void)a5; (void)a6;
-  // No capability enforcement — accept unconditionally.
-  return 0;
-}
-
-// ---------------------------------------------------------------------------
 // sys_seccomp (317)
 //
-// AvoryOS has no BPF interpreter or seccomp infrastructure.  We implement the
-// minimum needed for bwrap and WebKitGTK to proceed:
-//
-//   SECCOMP_SET_MODE_STRICT (op=0) — genuinely can't be supported without
-//     signal delivery changes; return EINVAL so callers fall back gracefully.
-//
-//   SECCOMP_SET_MODE_FILTER (op=1) — silently accept and return success.
-//     The supplied BPF program is ignored; all syscalls remain permitted.
-//     bwrap passes SECCOMP_SET_MODE_FILTER before exec-ing the sandboxed
-//     binary.  Returning 0 lets it continue; the "sandbox" is a no-op on
-//     AvoryOS, which is acceptable given that we already disabled bwrap's
-//     user-namespace isolation via WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS.
-//
-//   SECCOMP_GET_ACTION_AVAIL (op=2) — return EINVAL; not supported.
-//   Everything else                 — return EINVAL.
+// Verified classic-BPF filter installation and feature discovery.
 // ---------------------------------------------------------------------------
 
 #define SECCOMP_SET_MODE_STRICT    0
@@ -4326,25 +4398,19 @@ static uint64_t sys_capset(uint64_t hdrp_arg, uint64_t datap_arg,
 
 static uint64_t sys_seccomp(uint64_t op, uint64_t flags, uint64_t uargs,
                              uint64_t a4, uint64_t a5, uint64_t a6) {
-  (void)flags; (void)uargs; (void)a4; (void)a5; (void)a6;
-
-  switch (op) {
-  case SECCOMP_SET_MODE_FILTER:
-    // Accept the filter program without actually installing it.
-    return 0;
-
-  case SECCOMP_SET_MODE_STRICT:
-  case SECCOMP_GET_ACTION_AVAIL:
-  default:
-    return (uint64_t)-22; // EINVAL
-  }
+  (void)a4; (void)a5; (void)a6;
+  return (uint64_t)seccomp_control((uint32_t)op, (uint32_t)flags, uargs);
 }
 
-// sys_unshare (272)
-// AvoryOS has no namespace isolation: fail namespace flags with EPERM so
-// sandbox tools (bwrap/glycin/WebKit) fall back to unsandboxed execution
-// instead of entering a half-sandbox that fails hard later (glycin exit 1
-// -> libwnck base abort). Matches Linux with userns disabled.
+/* Explicit unsupported Landlock ABI, including version queries. Never
+ * advertise an ABI version or return success without enforcing the rules. */
+static uint64_t sys_landlock_unsupported(uint64_t a0, uint64_t a1, uint64_t a2,
+                                        uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+  return (uint64_t)-38; /* ENOSYS */
+}
+
+// Namespace preparation is transactional: commit only after all allocations succeed.
 static uint64_t sys_unshare(uint64_t flags, uint64_t a2, uint64_t a3,
                             uint64_t a4, uint64_t a5, uint64_t a6) {
   (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
@@ -4352,26 +4418,28 @@ static uint64_t sys_unshare(uint64_t flags, uint64_t a2, uint64_t a3,
                    CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID |
                    CLONE_NEWNET | CLONE_NEWTIME | CLONE_SYSVSEM |
                    CLONE_FILES | CLONE_FS;
-
-  if (flags & ~known) {
-    klog_puts("[SYSCALL] unshare: unknown flags=");
-    klog_hex64(flags);
-    klog_puts(" -> EINVAL\n");
-    return (uint64_t)-22; // EINVAL
-  }
-
-  uint64_t ns_flags = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS |
-                      CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID |
-                      CLONE_NEWNET | CLONE_NEWTIME;
-  if (flags & ns_flags) {
-    klog_puts("[SYSCALL] unshare: flags=");
-    klog_hex64(flags);
-    klog_puts(" -> EPERM (namespaces unsupported, sandbox fallback)\n");
-    return (uint64_t)-1; // EPERM
-  }
-
-  /* flags==0 (and other non-namespace no-ops) succeed silently: the coverage
-   * stress calls unshare(0) in a loop and per-call success logs are spam. */
+  if (flags & ~known) return (uint64_t)-22;
+  if (flags & (CLONE_FILES | CLONE_FS | CLONE_SYSVSEM)) return (uint64_t)-95;
+  if (flags & (CLONE_NEWCGROUP | CLONE_NEWUSER | CLONE_NEWTIME))
+    return (uint64_t)-1;
+  if (!flags) return 0;
+  struct thread *current = sched_get_current();
+  if (!capability_has(current, CAP_SYS_ADMIN)) return (uint64_t)-1;
+  struct uts_namespace *uts __attribute__((cleanup(uts_namespace_cleanup))) = NULL;
+  struct ipc_namespace *ipc __attribute__((cleanup(ipc_namespace_cleanup))) = NULL;
+  struct mount_namespace *mount __attribute__((cleanup(process_mount_cleanup))) = NULL;
+  struct pid_namespace *pid __attribute__((cleanup(pid_namespace_cleanup))) = NULL;
+  struct net_namespace *net __attribute__((cleanup(net_namespace_cleanup))) = NULL;
+  if (flags & CLONE_NEWNET) { net = net_namespace_create(); if (!net) return (uint64_t)-12; }
+  if (flags & CLONE_NEWUTS) { uts = uts_namespace_copy(current); if (!uts) return (uint64_t)-12; }
+  if (flags & CLONE_NEWIPC) { ipc = ipc_namespace_create(); if (!ipc) return (uint64_t)-12; }
+  if (flags & CLONE_NEWNS) { mount = vfs_namespace_prepare(current); if (!mount) return (uint64_t)-12; }
+  if (flags & CLONE_NEWPID) { pid = pid_namespace_create(current); if (!pid) return (uint64_t)-12; }
+  if (net) { net_namespace_install(current, net); net = NULL; }
+  if (uts) { uts_namespace_install(current, uts); uts = NULL; }
+  if (ipc) { ipc_namespace_install(current, ipc); ipc = NULL; }
+  if (mount) { vfs_namespace_install(current, mount); mount = NULL; }
+  if (pid) { pid_namespace_unshare(current, pid); pid = NULL; }
   return 0;
 }
 
@@ -4386,6 +4454,7 @@ void syscall_register_process(void) {
   syscall_register(SYS_WAITID, sys_waitid);
   syscall_register(SYS_UNAME, sys_uname);
   syscall_register(SYS_SETHOSTNAME, sys_sethostname);
+  syscall_register(SYS_SETDOMAINNAME, sys_setdomainname);
   syscall_register(SYS_SYSINFO, sys_sysinfo);
   syscall_register(SYS_UPTIME, sys_uptime);
   syscall_register(SYS_GETCWD, sys_getcwd);
@@ -4432,6 +4501,8 @@ void syscall_register_process(void) {
   syscall_register(SYS_SCHED_SETAFFINITY, sys_sched_setaffinity);
   syscall_register(SYS_SCHED_GETPARAM, sys_sched_getparam);
   syscall_register(SYS_SCHED_SETPARAM, sys_sched_setparam);
+  syscall_register(SYS_SCHED_SETATTR, sys_sched_setattr);
+  syscall_register(SYS_SCHED_GETATTR, sys_sched_getattr);
   syscall_register(SYS_SCHED_GET_PRIORITY_MAX, sys_sched_get_priority_max);
   syscall_register(SYS_SCHED_GET_PRIORITY_MIN, sys_sched_get_priority_min);
   syscall_register(SYS_SCHED_RR_GET_INTERVAL, sys_sched_rr_get_interval);
@@ -4455,5 +4526,8 @@ void syscall_register_process(void) {
   syscall_register(SYS_CAPGET, sys_capget);
   syscall_register(SYS_CAPSET, sys_capset);
   syscall_register(SYS_SECCOMP, sys_seccomp);
+  syscall_register(SYS_LANDLOCK_CREATE_RULESET, sys_landlock_unsupported);
+  syscall_register(SYS_LANDLOCK_ADD_RULE, sys_landlock_unsupported);
+  syscall_register(SYS_LANDLOCK_RESTRICT_SELF, sys_landlock_unsupported);
   syscall_register(SYS_UNSHARE, sys_unshare);
 }

@@ -199,7 +199,7 @@ struct thread {
    * seeing THREAD_RUNNING.  A stale flag only causes one spurious wakeup. */
   bool kpi_block_pending;
   void *kpi_wait_mutex; /* Opaque Linux mutex, for on-demand owner diagnostics. */
-  struct thread *deadline_next; // Per-CPU ordered timeout queue link
+  struct rb_node deadline_node; // Linkage in the per-CPU deadline tree
   bool deadline_queued;
   struct fd_table *files;
   vfs_node_t **fds;
@@ -238,6 +238,30 @@ struct thread {
   bool reap_remove_runqueue;   // Remote exit_group victim still needs unlink
   char cwd_path[256];          // Current working directory
   vfs_node_t *cwd_node;        // Current working directory VFS node
+  spinlock_t namespace_lock;
+  struct uts_namespace *uts_ns;
+  struct ipc_namespace *ipc_ns;
+  struct pid_namespace *pid_ns;
+  struct pid_namespace *pid_children_ns;
+  uint32_t namespace_pids[32];
+  uint64_t namei_resolve_flags; /* Scoped openat2 policy; never inherited. */
+  int namei_error;
+  vfs_node_t *namei_path_root; /* Borrowed original root for scoped openat2 d_path. */
+  struct mount_namespace *mount_ns;
+  vfs_node_t *fs_root_node;
+  struct seccomp_filter *seccomp_filter;
+  bool no_new_privs;
+  bool caps_initialized;
+  uint64_t cap_effective, cap_permitted, cap_inheritable;
+  uint64_t cap_bounding, cap_ambient;
+  uint32_t securebits;
+  struct net_namespace *net_ns;
+  bool seccomp_compat_dispatch;
+  bool seccomp_sigsys;
+  uint16_t seccomp_trap_data;
+  uint32_t seccomp_trap_arch;
+  uint8_t termination_signal;
+  uint64_t child_set_tid;
   struct mm_struct *mm;        // Shared memory management state
   uint64_t fs_base;            // User FS_BASE (TLS) — inherited across fork
   uint64_t gs_base;            // User GS_BASE (TLS) — inherited across fork
@@ -266,6 +290,7 @@ struct thread {
   uint64_t pending_signals;
   /* Subset queued to this task, rather than mirrored process-wide. */
   uint64_t thread_directed_signals;
+  struct queued_siginfo *queued_siginfo; /* Full user-supplied siginfo, tid_lock. */
   uint32_t signal_sender_pid[64];
   int32_t signal_sender_code[64]; /* SI_USER or SI_TKILL for queued signals */
   int pdeath_signal;
@@ -302,6 +327,8 @@ struct thread {
   // Active wait queue entries registered by this thread
   spinlock_t wait_entries_lock;
   struct wait_queue_entry *wait_entries_head;
+  struct vfs_node *active_epoll_node;
+  struct epitem *active_epoll_items[64];
 
   // Embedded wait queue entry for safe blocking across context switches
   // Using stack-allocated entries is unsafe because the stack frame becomes
@@ -312,9 +339,17 @@ struct thread {
   struct sched_entity se;  // EEVFD scheduling entity
   uint32_t cpu_index;      // Index of CPU this thread is enqueued on
   bool has_started;        // True once dispatched; its scheduler stack is CPU-local
+  /* True from the moment the dispatcher publishes the thread as its CPU's
+   * current thread until that CPU commits to switching away from it.  A false
+   * value proves no CPU holds it and sched_wakeup() can skip the all-CPU
+   * current_thread/switching_from scan.  A stale true only costs the scan. */
+  volatile bool on_cpu;
   uint8_t priority;        // Current dynamic priority (0-31)
   uint8_t static_priority; // Base priority
   int8_t nice_value;       // Userspace nice value (-20..19)
+  uint8_t sched_policy;    // Linux policy, independent of nice value
+  uint8_t sched_rt_priority; // Compatibility FIFO/RR priority (1..99)
+  bool sched_reset_on_fork;
   uint64_t time_slice;     // Remaining ticks in current quantum
   uint64_t
       runtime_total; // Total CPU time consumed (in LAPIC ticks, 1 tick = 1ms)
@@ -356,6 +391,12 @@ struct thread {
   bool in_futex_wait;
   bool blocked_reported; // already named once by the stuck-waiter warning
   uint32_t futex_bucket; // futex_hash bucket, 0xFFFFFFFF when not waiting
+  /* Deferred futex wake ownership count (sys_futex.c).  A waker unlinks one of
+   * this thread's waiters under a bucket lock, claims the thread, and delivers
+   * sched_wakeup() after dropping the lock; the reaper waits for this to reach
+   * zero in futex_remove_thread_waiters() before releasing the stack that
+   * hosted the unlinked waiter. */
+  uint32_t futex_wake_claims;
 
   /* LinuxKPI use only (kernel/src/linuxkpi/native_sched.c): start argument
    * for kernel threads.  Appended at the end: assembly pins offsets earlier
@@ -426,6 +467,14 @@ struct thread {
  * tid_lock is unsafe because the reaper may free it immediately.
  */
 struct sched_thread_snapshot {
+  uint32_t uts_namespace_id;
+  uint32_t ipc_namespace_id;
+  uint32_t pid_namespace_id;
+  uint32_t net_namespace_id;
+  uint32_t mount_namespace_id;
+  uint64_t cap_inheritable, cap_permitted, cap_effective, cap_bounding, cap_ambient;
+  uint32_t seccomp_mode;
+  bool no_new_privs;
   uint32_t tid;
   uint32_t tgid;
   uint32_t parent_tid;
@@ -450,6 +499,11 @@ struct sched_thread_snapshot {
   char exe_path[256];
   char cwd_path[256];
 };
+
+/* File-table lock held (or private unpublished table); identity is per open. */
+uint64_t fd_description_id_locked(struct thread *t, int fd);
+void fd_description_set_locked(struct thread *t, int fd, uint64_t id);
+void sched_copy_files(struct thread *child, struct thread *parent);
 
 bool fd_path_set(struct thread *t, int fd, const char *path);
 void fd_path_dup(struct thread *t, int dst, int src);
@@ -497,6 +551,8 @@ struct thread *sched_get_current(void);
 // Load balancing / dispatching
 void sched_enqueue_thread(struct thread *t, struct cpu_info *explicit_cpu);
 bool sched_set_priority(struct thread *t, uint8_t priority, int8_t nice_value);
+bool sched_set_attributes(struct thread *t, uint8_t priority, int8_t nice_value,
+                          uint8_t policy, uint8_t rt_priority, bool reset_on_fork);
 bool sched_validate_runqueues(struct cpu_info *cpu);
 
 // Task management for shell
@@ -524,8 +580,12 @@ size_t sched_read_thread_cmdline(uint32_t tid, uint32_t offset, uint32_t size,
                                  uint8_t *buffer);
 /* Total readable length of that snapshot, or 0 if there is none. */
 size_t sched_thread_cmdline_size(uint32_t tid);
+int sched_get_mount_snapshot(uint32_t tid, vfs_mount_info_t *mounts, int count);
 bool sched_get_nth_thread_tid(uint32_t index, uint32_t *tid);
+/* Live members only; copy IDs/count under tid_lock without exposing pointers. */
+uint32_t sched_get_group_threads(uint32_t tgid, uint32_t index, uint32_t *tid);
 bool sched_get_nth_open_fd(uint32_t tid, uint32_t index, uint32_t *fd);
+vfs_node_t *sched_get_fd_node_snapshot(uint32_t tid, uint32_t fd);
 bool sched_get_fd_path_snapshot(uint32_t tid, uint32_t fd, char *path,
                                 size_t path_size);
 bool sched_get_fd_info_snapshot(uint32_t tid, uint32_t fd, uint64_t *out_pos,
@@ -533,6 +593,7 @@ bool sched_get_fd_info_snapshot(uint32_t tid, uint32_t fd, uint64_t *out_pos,
                                 bool *out_is_pidfd, uint32_t *out_target_pid);
 
 // Reap a zombie thread (remove from runqueue, free resources)
+void signal_release_queued_info(struct thread *t);
 void sched_reap_thread(struct thread *t);
 void sched_queue_reap(struct thread *t);
 void sched_queue_reap_and_wait(struct thread *t);
@@ -567,6 +628,7 @@ void sched_reparent_children(struct thread *parent);
 void sched_reap_orphaned_zombies(void);
 
 int alloc_fd(struct thread *t);
+void fd_release_reserved(struct thread *t, int fd);
 
 /*
  * Returns true if the calling thread has an actionable unmasked signal.
@@ -588,9 +650,10 @@ static inline bool thread_has_pending_signal(struct thread *t) {
     unsigned sig = index + 1;
     /* Keep default-ignore signals pending for signalfd, but do not turn a
      * pidfd/event-loop wake into EINTR merely because the same child exit
-     * also queued an unhandled SIGCHLD. Match signal_deliver's ignore list. */
+     * also queued an unhandled SIGCHLD. Default SIGCONT likewise has no
+     * handler to interrupt a running thread. Match signal_deliver's list. */
     if (action->sa_handler == (void *)SIG_DFL &&
-        (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH))
+        (sig == SIGCHLD || sig == SIGURG || sig == SIGWINCH || sig == SIGCONT))
       continue;
     return true;
   }

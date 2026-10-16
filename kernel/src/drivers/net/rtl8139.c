@@ -39,6 +39,19 @@ struct rtl8139 {
   bool initialized;
 };
 static struct rtl8139 rtl;
+static void release_dma(void);
+static void stop(struct net_device *netdev);
+
+static bool start(struct net_device *netdev) {
+  if (netdev != &rtl.netdev)
+    return false;
+  if (rtl8139_phase2_init() && rtl8139_phase3_init())
+    return true;
+  stop(netdev);
+  pci_set_bus_mastering(rtl.pci, false);
+  release_dma();
+  return false;
+}
 
 static int rtl8139_dm_probe(struct device *dev) {
   return rtl.initialized && rtl.pci && rtl.pci->kernel_device == dev ? 0 : -1;
@@ -80,9 +93,10 @@ static void stop(struct net_device *netdev) {
   pci_config_write16(dev->pci->bus, dev->pci->slot, dev->pci->func, 0x04,
                      command | (1u << 10));
   dev->initialized = false;
+  netdev->started = false;
 }
 static const struct net_device_ops ops = {
-    .transmit = rtl8139_transmit, .link_up = link_up, .stop = stop};
+    .start = start, .transmit = rtl8139_transmit, .link_up = link_up, .stop = stop};
 static void disable_hardware(void) {
   if (!rtl.pci)
     return;
@@ -165,14 +179,16 @@ bool rtl8139_phase1_init(void) {
   for (uint32_t i = 0; i < TX_COUNT; i++)
     outl(rtl.io + RTL_TSAD0 + i * 4,
          (uint32_t)(uint64_t)rtl.tx_phys + i * TX_BUFFER_SIZE);
-  strcpy(rtl.netdev.name, "eth0");
   rtl.netdev.mtu = NET_MTU_ETHERNET;
+  rtl.netdev.persistent = true;
   rtl.netdev.ops = &ops;
+  rtl.netdev.pci = rtl.pci;
   rtl.netdev.driver_private = &rtl;
   rtl.initialized = true;
   if (net_device_register(&rtl.netdev)) {
     klog_puts("[RTL8139] initialization failed: registration\n");
     stop(&rtl.netdev);
+    pci_set_bus_mastering(rtl.pci, false);
     release_dma();
     return false;
   }
@@ -183,11 +199,13 @@ bool rtl8139_phase1_init(void) {
       rtl.pci->kernel_device->driver != &rtl8139_dm_driver) {
     klog_puts("[RTL8139] initialization failed: device-model ownership\n");
     stop(&rtl.netdev);
+    net_device_unregister(&rtl.netdev);
+    pci_set_bus_mastering(rtl.pci, false);
     release_dma();
     return false;
   }
   sysfs_pci_device_bound(rtl.pci->kernel_device);
-  klog_puts("[RTL8139] eth0 registered; RX/TX/INTx remain disabled\n");
+  klogf("[RTL8139] %s registered; RX/TX/INTx remain disabled\n", rtl.netdev.name);
   return true;
 }
 

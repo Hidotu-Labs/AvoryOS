@@ -4,6 +4,7 @@
 // address-lookup helpers used by the rest of the subsystem.
 
 #include "af_unix_internal.h"
+#include "../fs/mount_namespace.h"
 
 // ── Global registry ───────────────────────────────────────────────────────────
 
@@ -39,9 +40,38 @@ static unix_sock_t *af_unix_sock_ref(unix_sock_t *usk) {
   return usk;
 }
 
+/* Resolve filesystem socket names before consulting the registry. A pathname
+ * string is not an identity across different root/mount views. Disk-backed
+ * socket inodes keep their filesystem device pointer, not a socket_t payload. */
+static unix_sock_t *unix_find_filesystem_socket(struct sockaddr_un *addr, bool pin) {
+  struct thread *task = sched_get_current();
+  vfs_node_t *base = task && task->cwd_node ? task->cwd_node : fs_root;
+  vfs_node_t *node = vfs_resolve_path_at(base, addr->sun_path);
+  if (!node) return NULL;
+  vfs_node_t *backing = vfs_backing_node(node);
+  unix_sock_t *found = NULL;
+  if ((node->flags & FS_TYPE_MASK) == FS_SOCKET) {
+    spinlock_acquire(&unix_bound_lock);
+    struct list_head *entry;
+    list_for_each(entry, &unix_bound_list) {
+      unix_sock_t *candidate = list_entry(entry, unix_sock_t, bind_node);
+      vfs_node_t *bound = vfs_backing_node(candidate->bound_vnode);
+      if (!bound || candidate->is_abstract) continue;
+      if (bound == backing || (bound->inode && bound->inode == backing->inode &&
+                               bound->device == backing->device)) {
+        found = pin ? af_unix_sock_ref(candidate) : candidate;
+        break;
+      }
+    }
+    spinlock_release(&unix_bound_lock);
+  }
+  vfs_close(node);
+  return found;
+}
+
 // ── Lookup ────────────────────────────────────────────────────────────────────
 
-unix_sock_t *unix_find_socket_by_addr(struct sockaddr_un *addr, int addrlen) {
+unix_sock_t *unix_find_socket_by_addr(socket_t *owner, struct sockaddr_un *addr, int addrlen) {
   if (!addr)
     return NULL;
 
@@ -56,6 +86,7 @@ unix_sock_t *unix_find_socket_by_addr(struct sockaddr_un *addr, int addrlen) {
       continue;
 
     if (usk->addr.sun_path[0] == '\0') {
+      if (usk->parent->net_ns != owner->net_ns) continue;
       // Abstract socket: match exact length and bytes
       if (usk->addr_len != addrlen)
         continue;
@@ -64,42 +95,18 @@ unix_sock_t *unix_find_socket_by_addr(struct sockaddr_un *addr, int addrlen) {
         spinlock_release(&unix_bound_lock);
         return usk;
       }
-    } else {
-      // Filesystem socket: compare path strings
-      if (strcmp(usk->addr.sun_path, addr->sun_path) == 0) {
-        spinlock_release(&unix_bound_lock);
-        return usk;
-      }
     }
   }
 
   spinlock_release(&unix_bound_lock);
 
-  // Fallback: Resolve via VFS for filesystem sockets
-  if (addr->sun_path[0] != '\0') {
-    struct thread *current_th = sched_get_current();
-    vfs_node_t *base = (current_th && current_th->cwd_node) ? current_th->cwd_node : fs_root;
-    vfs_node_t *node = vfs_resolve_path_at(base, addr->sun_path);
-    if (!node && addr->sun_path[0] == '/') {
-      node = vfs_resolve_path(addr->sun_path);
-    }
-    unix_sock_t *found = NULL;
-    if (node && ((node->flags & FS_TYPE_MASK) == FS_SOCKET) && node->device) {
-      socket_t *sock = (socket_t *)node->device;
-      unix_sock_t *usk = sock ? (unix_sock_t *)sock->sk : NULL;
-      if (af_unix_sock_live(usk, &sock))
-        found = usk;
-    }
-    if (node)
-      vfs_close(node);
-    if (found)
-      return found;
-  }
+  if (addr->sun_path[0] != '\0')
+    return unix_find_filesystem_socket(addr, false);
 
   return NULL;
 }
 
-unix_sock_t *unix_find_socket_by_addr_ref(struct sockaddr_un *addr, int addrlen) {
+unix_sock_t *unix_find_socket_by_addr_ref(socket_t *owner, struct sockaddr_un *addr, int addrlen) {
   if (!addr)
     return NULL;
 
@@ -115,12 +122,11 @@ unix_sock_t *unix_find_socket_by_addr_ref(struct sockaddr_un *addr, int addrlen)
       continue;
 
     if (usk->addr.sun_path[0] == '\0') {
+      if (usk->parent->net_ns != owner->net_ns) continue;
       if (usk->addr_len == addrlen &&
           memcmp(usk->addr.sun_path, addr->sun_path,
                  addrlen - offsetof(struct sockaddr_un, sun_path)) == 0)
         match = true;
-    } else if (strcmp(usk->addr.sun_path, addr->sun_path) == 0) {
-      match = true;
     }
 
     if (match) {
@@ -135,24 +141,8 @@ unix_sock_t *unix_find_socket_by_addr_ref(struct sockaddr_un *addr, int addrlen)
 
   spinlock_release(&unix_bound_lock);
 
-  // Fallback: Resolve via VFS for filesystem sockets
-  if (addr->sun_path[0] != '\0') {
-    struct thread *current_th = sched_get_current();
-    vfs_node_t *base = (current_th && current_th->cwd_node) ? current_th->cwd_node : fs_root;
-    vfs_node_t *node = vfs_resolve_path_at(base, addr->sun_path);
-    if (!node && addr->sun_path[0] == '/') {
-      node = vfs_resolve_path(addr->sun_path);
-    }
-    unix_sock_t *found = NULL;
-    if (node && ((node->flags & FS_TYPE_MASK) == FS_SOCKET) && node->device) {
-      socket_t *sock = (socket_t *)node->device;
-      unix_sock_t *usk = sock ? (unix_sock_t *)sock->sk : NULL;
-      found = af_unix_sock_ref(usk);
-    }
-    if (node)
-      vfs_close(node);
-    return found;
-  }
+  if (addr->sun_path[0] != '\0')
+    return unix_find_filesystem_socket(addr, true);
 
   return NULL;
 }

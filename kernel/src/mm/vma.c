@@ -696,6 +696,11 @@ static void inorder_gather(struct vma *node, struct vma **array, int *index) {
 
 uint64_t vma_find_gap(struct vma_list *list, uint64_t length,
                       uint64_t base_addr, uint64_t limit_addr) {
+  /* Every returned gap, including an interior gap, must fit the caller's
+   * arena. A first-fit above limit used to mask exhaustion and prevent mmap
+   * from trying its lower-address fallback. Subtraction avoids wraparound. */
+  if (!length || base_addr >= limit_addr || length > limit_addr - base_addr)
+    return 0;
   if (list->count == 0) {
     if (base_addr + length <= limit_addr)
       return base_addr;
@@ -730,7 +735,8 @@ uint64_t vma_find_gap(struct vma_list *list, uint64_t length,
 
     if (arr[i]->start > current) {
       uint64_t gap = arr[i]->start - current;
-      if (gap >= length) {
+      if (gap >= length && current < limit_addr &&
+          length <= limit_addr - current) {
         gap_start = current;
         break;
       }
@@ -744,7 +750,7 @@ uint64_t vma_find_gap(struct vma_list *list, uint64_t length,
   if (gap_start != 0)
     return gap_start;
 
-  if (current + length <= limit_addr)
+  if (current < limit_addr && length <= limit_addr - current)
     return current;
 
   return 0;

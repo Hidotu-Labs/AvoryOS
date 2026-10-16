@@ -28,6 +28,7 @@ typedef struct unix_scm_fd {
   uint64_t offset;
   uint64_t flags;
   char path[256];
+  uint64_t description_id;
 } unix_scm_fd_t;
 
 typedef struct unix_scm_msg {
@@ -154,6 +155,8 @@ typedef struct sk_buff {
   // Metadata for recvfrom
   uint32_t src_ip;
   uint16_t src_port;
+  // Netlink source identity is per datagram, including multicast group.
+  uint32_t nl_portid, nl_groups, nl_pid, nl_uid, nl_gid;
 } sk_buff_t;
 
 // Socket Buffer Queue

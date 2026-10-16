@@ -27,6 +27,9 @@ pre=r'''
 #define SA_RESTART 0x10000000
 struct registers {uint64_t rdi,rsi,rdx,r10,r8,r9,rax,rbx,rbp,r12,r13,r14,r15,rip,rflags,rcx,r11,rsp,cs,ss;};
 struct syscall_regs {uint64_t rdi,rsi,rdx,r10,r8,r9,rax,rbx,rbp,r12,r13,r14,r15,rip,rflags,rsp,user_cs,user_rcx,user_rsi,user_rdi;};
+#define SYS_RT_SIGRETURN 15
+struct thread {struct registers sigreturn_regs;};
+static struct thread *sched_get_current(void){return NULL;}
 '''
 mock=r'''
 static bool has_handler;

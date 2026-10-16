@@ -148,17 +148,23 @@ static bool local_address(const uint8_t address[16]) {
 
 static void send_na(const uint8_t destination[16], const uint8_t mac[6],
                     const uint8_t target[16]) {
+  struct net_device *dev = net_device_default();
+  if (!dev)
+    return;
   uint8_t na[32];
   memset(na, 0, sizeof(na));
   na[0] = ICMP6_NA;
   na[4] = 0x60; /* solicited + override */
   memcpy(na + 8, target, 16);
   na[24] = 2; na[25] = 1;
-  memcpy(na + 26, net_device_default()->mac, 6);
+  memcpy(na + 26, dev->mac, 6);
   ipv6_send_to(target, destination, mac, IPV6_NEXT_ICMP, na, sizeof(na));
 }
 
 static bool resolve_neighbor(const uint8_t target[16], uint8_t mac[6]) {
+  struct net_device *dev = net_device_default();
+  if (!dev)
+    return false;
   if (addr_multicast(target)) {
     multicast_mac(target, mac);
     return true;
@@ -176,7 +182,7 @@ static bool resolve_neighbor(const uint8_t target[16], uint8_t mac[6]) {
   ns[0] = ICMP6_NS;
   memcpy(ns + 8, target, 16);
   ns[24] = 1; ns[25] = 1;
-  memcpy(ns + 26, net_device_default()->mac, 6);
+  memcpy(ns + 26, dev->mac, 6);
   for (int attempt = 0; attempt < 3; attempt++) {
     ipv6_send_to(config.link_local, solicited, multicast, IPV6_NEXT_ICMP,
                  ns, sizeof(ns));
@@ -290,6 +296,9 @@ void ipv6_receive(const uint8_t source_mac[6], const uint8_t *packet,
 }
 
 static void send_router_solicitation(void) {
+  struct net_device *dev = net_device_default();
+  if (!dev)
+    return;
   static const uint8_t all_routers[16] =
       {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2};
   uint8_t mac[6], rs[16];
@@ -297,7 +306,7 @@ static void send_router_solicitation(void) {
   memset(rs, 0, sizeof(rs));
   rs[0] = ICMP6_RS;
   rs[8] = 1; rs[9] = 1;
-  memcpy(rs + 10, net_device_default()->mac, 6);
+  memcpy(rs + 10, dev->mac, 6);
   ipv6_send_to(config.link_local, all_routers, mac, IPV6_NEXT_ICMP,
                rs, sizeof(rs));
 }

@@ -60,7 +60,7 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
 
   struct sockaddr_un *sun = (struct sockaddr_un *)addr;
 
-  unix_sock_t *dusk = unix_find_socket_by_addr_ref(sun, addrlen);
+  unix_sock_t *dusk = unix_find_socket_by_addr_ref(sock, sun, addrlen);
   if (!dusk) {
     bool is_benign = (sun->sun_path[0] != '\0') &&
       (strcmp(sun->sun_path, "/dev/log") == 0 ||
@@ -125,7 +125,7 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
   // Create the server-side socket early so the peer link is established
   // before accept() is called.
   socket_t *server_sock =
-      socket_create(sock->domain, sock->type, sock->protocol);
+      socket_create_in_namespace(sock->domain, sock->type, sock->protocol, listener_sock->net_ns);
   if (!server_sock) {
     socket_put(listener_sock);
     KTRACK_ERR(KSUBSYS_AF_UNIX, -12);

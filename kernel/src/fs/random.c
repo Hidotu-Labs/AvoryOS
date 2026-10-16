@@ -63,6 +63,12 @@ static uint32_t zero_write(struct vfs_node *node, uint32_t offset,
   return size;
 }
 
+static uint32_t full_write(struct vfs_node *node, uint32_t offset,
+                            uint32_t size, uint8_t *buffer) {
+  (void)node; (void)offset; (void)buffer;
+  return size ? (uint32_t)-28 : 0; /* ENOSPC */
+}
+
 static int zero_poll(struct vfs_node *node, int events) {
   (void)node;
   return events & (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM);
@@ -123,6 +129,20 @@ void random_register_vfs(void) {
     zero_node->poll = zero_poll;
     zero_node->mmap = zero_mmap;
     fb_register_device_node("zero", zero_node);
+  }
+
+  // /dev/full: reads zeroes and reports ENOSPC for every nonempty write.
+  vfs_node_t *full_node = kmalloc(sizeof(vfs_node_t));
+  if (full_node) {
+    vfs_node_init(full_node);
+    strcpy(full_node->name, "full");
+    full_node->flags = FS_CHARDEV | FS_PERSISTENT;
+    full_node->inode = (1U << 8) | 7U;
+    full_node->mask = 0666;
+    full_node->read = zero_read;
+    full_node->write = full_write;
+    full_node->poll = zero_poll;
+    fb_register_device_node("full", full_node);
   }
 
   // /dev/urandom

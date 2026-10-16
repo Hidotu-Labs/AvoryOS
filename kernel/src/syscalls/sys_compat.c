@@ -10,6 +10,7 @@ extern void syscall_dispatcher(struct syscall_regs *regs);
 #include "../lib/string.h"
 #include "../console/klog.h"
 #include "../sched/elf.h"
+#include "../sched/seccomp.h"
 
 static int compat_syscall_number(uint32_t number) {
   switch (number) {
@@ -140,11 +141,23 @@ static int compat_prepare(struct registers *r, struct syscall_regs *s) {
 }
 
 void syscall_compat_dispatch(struct registers *regs) {
-  if (regs->cs != 0x1b) { regs->rax=(uint32_t)-38; return; }
   user_access_begin();
   hal_irq_enable();
   struct syscall_regs native;
   uint32_t number = regs->rax;
+  struct thread *task = sched_get_current();
+  struct syscall_regs filtered = {.rax = number, .rip = regs->rip};
+  uint64_t args[6] = {(uint32_t)regs->rbx, (uint32_t)regs->rcx,
+      (uint32_t)regs->rdx, (uint32_t)regs->rsi, (uint32_t)regs->rdi,
+      (uint32_t)regs->rbp};
+  if (!seccomp_syscall(task, &filtered, number, 0x40000003, args)) {
+    regs->rax = (uint32_t)filtered.rax;
+    goto compat_finished;
+  }
+  if (regs->cs != 0x1b) {
+    regs->rax = (uint32_t)-38;
+    goto compat_finished;
+  }
   int err = compat_prepare(regs, &native);
   if (err) {
     regs->rax=(uint32_t)err;
@@ -154,7 +167,9 @@ void syscall_compat_dispatch(struct registers *regs) {
             number, (unsigned long long)regs->rip);
   } else {
     bool exec = native.rax == SYS_EXECVE;
+    if (task) task->seccomp_compat_dispatch = true;
     syscall_dispatcher(&native);
+    if (task) task->seccomp_compat_dispatch = false;
     if (exec && native.rax == 0) {
       /* exec can change both ABI and address space. Return to the new image
        * through this interrupt's IRETQ, including a new CS and stack. */
@@ -164,6 +179,7 @@ void syscall_compat_dispatch(struct registers *regs) {
       regs->rax=(uint32_t)native.rax;
     }
   }
+compat_finished:;
   struct thread *t = sched_get_current();
   if (t) __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
   /* Only default signal actions can be installed by this initial i386 ABI. */

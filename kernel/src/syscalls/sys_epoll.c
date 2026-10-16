@@ -12,6 +12,13 @@
 #include <stdint.h>
 #include "arch/uaccess.h"
 
+/* A syscall snapshot pins the VFS node across close/reuse and driver polls.
+ * Forced exit uses the same release in the reaper after wait-queue cleanup. */
+static void epoll_syscall_put(eventpoll_t **ep) {
+  (void)ep;
+  epoll_release_thread(sched_get_current());
+}
+
 // Helper: Validate user pointer
 static bool epoll_user_ptr(uint64_t ptr) {
   // User-space addresses are in lower half of address space
@@ -27,8 +34,9 @@ static uint64_t sys_epoll_create(uint64_t size, uint64_t a1, uint64_t a2,
   (void)a4;
   (void)a5;
 
-  // size is ignored (historical parameter)
-  (void)size;
+  // The historical API still requires a positive size.
+  if ((int)size <= 0)
+    return (uint64_t)-22;
 
   // Create epoll instance
   eventpoll_t *ep = epoll_create();
@@ -37,17 +45,14 @@ static uint64_t sys_epoll_create(uint64_t size, uint64_t a1, uint64_t a2,
   }
 
   // Allocate FD
-  int fd = epoll_alloc_fd(ep);
+  int fd = epoll_alloc_fd(ep, 0);
   if (fd < 0) {
     epoll_put(ep);
-    return (uint64_t)-24; // EMFILE
+    return (uint64_t)(int64_t)fd;
   }
 
   return (uint64_t)fd;
 }
-
-/* FD_FLAGS_CLOEXEC_BIT must match the definition in sys_io.c */
-#define EPOLL_FD_FLAGS_CLOEXEC_BIT (1u << 24)
 
 // sys_epoll_create1: Create epoll instance with flags
 static uint64_t sys_epoll_create1(uint64_t flags, uint64_t a1, uint64_t a2,
@@ -70,19 +75,10 @@ static uint64_t sys_epoll_create1(uint64_t flags, uint64_t a1, uint64_t a2,
   }
 
   // Allocate FD
-  int fd = epoll_alloc_fd(ep);
+  int fd = epoll_alloc_fd(ep, flags);
   if (fd < 0) {
     epoll_put(ep);
-    return (uint64_t)-24; // EMFILE
-  }
-
-  // Apply EPOLL_CLOEXEC: set FD_CLOEXEC on the file descriptor.
-  // We use the same bit (bit 24) that sys_io.c uses for FD_FLAGS_CLOEXEC_BIT.
-  if (flags & EPOLL_CLOEXEC) {
-    struct thread *t = sched_get_current();
-    if (t && fd < MAX_FDS) {
-      t->fd_flags[fd] |= EPOLL_FD_FLAGS_CLOEXEC_BIT;
-    }
+    return (uint64_t)(int64_t)fd;
   }
 
   return (uint64_t)fd;
@@ -95,7 +91,7 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
   (void)a5;
 
   // Get epoll instance
-  eventpoll_t *ep = epoll_from_fd((int)epfd);
+  eventpoll_t *ep __attribute__((cleanup(epoll_syscall_put))) = epoll_from_fd((int)epfd);
   if (!ep) {
     return (uint64_t)-9; // EBADF
   }
@@ -112,8 +108,9 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
       return (uint64_t)-14; // EFAULT
     }
 
-    struct epoll_event *event = (struct epoll_event *)event_ptr;
-    int ret = epoll_ctl_add(ep, (int)fd, event);
+    struct epoll_event event;
+    if (copy_from_user(&event, (void *)event_ptr, sizeof(event))) return (uint64_t)-14;
+    int ret = epoll_ctl_add(ep, (int)fd, &event);
     return (uint64_t)ret;
   }
 
@@ -127,8 +124,9 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd,
       return (uint64_t)-14; // EFAULT
     }
 
-    struct epoll_event *event = (struct epoll_event *)event_ptr;
-    int ret = epoll_ctl_mod(ep, (int)fd, event);
+    struct epoll_event event;
+    if (copy_from_user(&event, (void *)event_ptr, sizeof(event))) return (uint64_t)-14;
+    int ret = epoll_ctl_mod(ep, (int)fd, &event);
     return (uint64_t)ret;
   }
 
@@ -145,7 +143,7 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
   (void)a5;
 
   // Get epoll instance
-  eventpoll_t *ep = epoll_from_fd((int)epfd);
+  eventpoll_t *ep __attribute__((cleanup(epoll_syscall_put))) = epoll_from_fd((int)epfd);
   if (!ep) {
     return (uint64_t)-9; // EBADF
   }
@@ -170,7 +168,7 @@ static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events_ptr,
 static uint64_t epoll_pwait_common(uint64_t epfd, uint64_t events_ptr,
                                     uint64_t maxevents, int64_t timeout_ms,
                                     uint64_t sigmask_ptr, uint64_t sigsetsize) {
-  eventpoll_t *ep = epoll_from_fd((int)epfd);
+  eventpoll_t *ep __attribute__((cleanup(epoll_syscall_put))) = epoll_from_fd((int)epfd);
   if (!ep)
     return (uint64_t)-9;
   if (!epoll_user_ptr(events_ptr))

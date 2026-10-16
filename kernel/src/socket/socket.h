@@ -241,6 +241,7 @@ typedef struct sock_ops {
 
 // Socket Structure
 typedef struct socket {
+  struct net_namespace *net_ns;
   int domain;            // AF_UNIX or AF_NETLINK
   int type;              // SOCK_STREAM, SOCK_DGRAM, etc.
   int protocol;          // Protocol (usually 0)
@@ -272,6 +273,7 @@ void socket_init(void);
 
 // Socket Creation/ Destruction
 socket_t *socket_create(int domain, int type, int protocol);
+socket_t *socket_create_in_namespace(int domain, int type, int protocol, struct net_namespace *net_ns);
 void socket_destroy(socket_t *sock);
 void socket_get(socket_t *sock); // Increment reference count
 bool socket_try_get(socket_t *sock); // Increment unless already destroying

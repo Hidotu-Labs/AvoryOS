@@ -365,7 +365,7 @@ static int tmpfs_fallocate(vfs_node_t *node, int mode, uint32_t offset, uint32_t
         uint32_t last_page  = (needed - 1) / PAGE_SIZE;
         for (uint32_t i = first_page; i <= last_page; i++) {
             if (!tmpfs_get_or_alloc_page(file, i))
-                return -1;
+                return -12; // ENOMEM: -1 would surface as EPERM in userspace
         }
         return 0;
     }
@@ -460,7 +460,7 @@ static int tmpfs_truncate(vfs_node_t *node, uint32_t new_len) {
         uint32_t last_new_page  = (new_len - 1) / PAGE_SIZE;
         for (uint32_t i = first_new_page; i <= last_new_page; i++) {
             if (!tmpfs_get_or_alloc_page(file, i))
-                return -1;
+                return -12; // ENOMEM: -1 would surface as EPERM in userspace
         }
         uint32_t zero_start = old_len % PAGE_SIZE;
         if (zero_start != 0) {
@@ -1056,6 +1056,45 @@ vfs_node_t *tmpfs_create_root(tmpfs_sb_t *sb) {
     if (!root)
         return NULL;
     tmpfs_wire_dir_ops(root);
+    return root;
+}
+
+/* A namespace root is pinned by every open path view below it. When the
+ * final mount, FD and mapping drops it, retire the directory-owned inode tree
+ * and return its data pages rather than leaving persistent boot tmpfs nodes. */
+static void tmpfs_retire_private_children(vfs_node_t *node) {
+    if ((node->flags & FS_TYPE_MASK) != FS_DIRECTORY || !node->device) return;
+    tmpfs_dir_t *dir = node->device;
+    for (;;) {
+        vfs_dirindex_lock(&dir->di);
+        tmpfs_child_t *child = dir->di.children;
+        if (child) vfs_dirindex_detach_locked(&dir->di, child);
+        vfs_dirindex_unlock(&dir->di);
+        if (!child) break;
+        tmpfs_retire_private_children(child->node);
+        child->node->flags |= FS_DELETED;
+        vfs_close(child->node);
+        kfree(child);
+    }
+}
+static void tmpfs_destroy_private_root(vfs_node_t *node) {
+    tmpfs_sb_t *sb = tmpfs_sb_from_node(node);
+    tmpfs_retire_private_children(node);
+    tmpfs_destroy_node(node);
+    kfree(sb);
+}
+vfs_node_t *tmpfs_create_private_root(void) {
+    tmpfs_sb_t *sb = kmalloc(sizeof(*sb));
+    if (!sb) return NULL;
+    memset(sb, 0, sizeof(*sb));
+    sb->max_bytes = TMPFS_DEFAULT_MAX_BYTES;
+    sb->max_inodes = TMPFS_DEFAULT_MAX_INODES;
+    spinlock_init(&sb->lock);
+    vfs_node_t *root = tmpfs_create_root(sb);
+    if (!root) { kfree(sb); return NULL; }
+    root->flags = (root->flags & ~FS_PERSISTENT) | FS_AUTODESTROY;
+    root->destroy = tmpfs_destroy_private_root;
+    root->mask = 0755;
     return root;
 }
 

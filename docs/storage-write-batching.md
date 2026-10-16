@@ -21,6 +21,44 @@ Roblox join improvement. Small writes and fragmented extents gain less. The
 NVMe driver may split runs according to transfer limits or perform partial-LBA
 read-modify-write, so actual command counts must be measured separately.
 
+## Pipelined block I/O batches
+
+Batching runs removes submission calls but still waited for each device request
+individually, so one submitter kept only one NVMe command in flight. The block
+layer now has an optional pipelined API: `struct block_io_req` carries a
+member's LBA, sector count, buffer, and result, and a driver should fill one
+entry per member on a `read_batch`/`write_batch` call. Members must be
+independent and disjoint; completions may be observed out of order. When a
+device does not implement the slots, `block_read_batch()`/`block_write_batch()`
+run the same members through `read_sectors`/`write_sectors` in order, and
+partition devices split batches at partition bounds, translate LBAs, and
+forward each valid run to the whole-disk batch call. So callers (ext3/ext4
+commit, ext2 write paths) can batch unconditionally and still get the old
+ordered single-request loop on any other device.
+
+The NVMe implementation arrives with `NVME_BATCH_IO=1`.
+`nvme_batch_submit()` walks the batch: a *fast* member (whole logical blocks,
+kernel buffer, within the transfer cap) joins a wave of up to
+`NVME_BATCH_WAVE_MAX` (16) commands, all submitted back to back before
+`nvme_io_wait_many()` reaps the wave against one shared deadline and one
+per-queue batch wake queue. Members that need the full path, CID-table
+refills, and transport retries fall back to the existing `nvme_io()` while no
+batched command is outstanding. `nvme_io_range()` chunking inside one large
+request uses the same wave submission. Per-member results are 0, -1 (I/O or
+pre-submit), or -2 (transport), and every member is reaped before the call
+returns.
+
+Journal commit payload and home-checkpoint writes are gathered the same way:
+`ext3_commit_io_batch()`/`ext3_commit_home_batch()` submit up to
+`EXT3_COMMIT_WRITE_BATCH` (16) staged blocks and wait once. The ordering
+barriers are untouched: each batch is fully waited before the next commit step
+starts (payload→descriptor→commit→super-publish→home→super-clear), the
+superblock read-modify-write and FUA/flush semantics are unchanged, and a
+failed home batch still retires the log while reporting its first failed block
+(in write-set order) exactly as before. The knob gates only NVMe batch-op
+registration; ext3 uses the generic helper unconditionally, so a kernel built
+without the knob runs the same commit, just one request at a time.
+
 ## Counters
 
 Read `/proc/storage_perf` inside AvoryOS after booting the rebuilt kernel.
@@ -95,6 +133,10 @@ python3 scripts/tests/test_procfs_statfs.py
 
 The existing C `test_ext2_cache_coherence.c` and `test_ext3_empty_commit.c`
 harnesses additionally verify a cache collision across a batched write and
-journal latency/nesting/error accounting. Kernel and production ISO builds
-pass. These host tests do not establish guest performance, real-device recovery,
-or a Roblox join-time percentage; those measurements remain pending.
+journal latency/nesting/error accounting; the other ext2 harnesses mock the
+batched write path. `test_nvme_wait_registration.py` now covers the batch wait
+as well: every CID is reaped, per-member verdicts are kept, one deadline and
+one batch wake queue are shared. Kernel and production ISO builds pass in both
+knob configurations. These host tests do not establish guest performance,
+real-device recovery, or a Roblox join-time percentage; those measurements
+remain pending.

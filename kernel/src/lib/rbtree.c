@@ -10,7 +10,10 @@ static inline void __rb_rotate_left(struct rb_node *node, struct rb_root *root,
         rb_set_parent(right->rb_left, node);
 
     right->rb_left = node;
-    rb_set_parent_color(right, parent, rb_color(node));
+    /* Rebalancing owns the colors. A rotation only changes links: copying
+     * node's color here undoes the caller's preceding recoloring (including
+     * DRM's rb_insert_color_cached/rb_erase_cached paths via LinuxKPI). */
+    rb_set_parent(right, parent);
 
     if (parent) {
         if (node == parent->rb_left)
@@ -21,7 +24,7 @@ static inline void __rb_rotate_left(struct rb_node *node, struct rb_root *root,
         root->rb_node = right;
     }
 
-    rb_set_parent_color(node, right, RB_RED);
+    rb_set_parent(node, right);
 
     if (augment_cb) {
         augment_cb(node);
@@ -39,7 +42,7 @@ static inline void __rb_rotate_right(struct rb_node *node, struct rb_root *root,
         rb_set_parent(left->rb_right, node);
 
     left->rb_right = node;
-    rb_set_parent_color(left, parent, rb_color(node));
+    rb_set_parent(left, parent);
 
     if (parent) {
         if (node == parent->rb_right)
@@ -50,7 +53,7 @@ static inline void __rb_rotate_right(struct rb_node *node, struct rb_root *root,
         root->rb_node = left;
     }
 
-    rb_set_parent_color(node, left, RB_RED);
+    rb_set_parent(node, left);
 
     if (augment_cb) {
         augment_cb(node);

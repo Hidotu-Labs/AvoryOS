@@ -6,6 +6,11 @@
  * vmap() references caller-owned pages, and ioremap() maps a physical range.
  * Everything is mapped into the kernel PML4.
  *
+ * The start of the window is reserved for the LinuxKPI mem_map arena
+ * (kernel/linuxkpi/src/page.c): linuxkpi_page_init() sizes and publishes it,
+ * and linuxkpi_vmalloc_init() lifts the first-fit floor just above it so
+ * vmap areas never overlap the descriptor arena.
+ *
  * Process address spaces clone the kernel half of the PML4, so the window's
  * top-level entries are pre-populated by linuxkpi_vmalloc_init() before any
  * user process exists.  A kernel mapping created after a process was cloned
@@ -23,6 +28,11 @@
 #include <linux/string.h>
 
 #include <linuxkpi/native_mm.h>
+
+/* kernel/linuxkpi/src/page.c: mem_map arena the window starts with, and its
+ * size; linuxkpi_vmalloc_init() skips both before the first-fit allocator
+ * can hand any of it out. */
+extern unsigned long vmemmap_base, linuxkpi_vmemmap_size;
 
 #define KPI_VMAP_BASE 0xFFFFC00000000000ULL
 #define KPI_VMAP_END 0xFFFFE00000000000ULL
@@ -52,6 +62,10 @@ static struct vmap_area vmap_head = {
 
 static DEFINE_SPINLOCK(vmap_lock);
 static bool vmap_ready;
+
+/* First address the first-fit allocator may use; raised past the mem_map
+ * arena by linuxkpi_vmalloc_init() (page init runs first). */
+static uint64_t vmap_floor = KPI_VMAP_BASE;
 
 /* ── address allocator ──────────────────────────────────────────────────── */
 
@@ -83,9 +97,9 @@ static void vmap_area_remove_locked(struct vmap_area *area) {
   area->next->prev = area->prev;
 }
 
-/* First fit in [KPI_VMAP_BASE, KPI_VMAP_END). */
+/* First fit in [vmap_floor, KPI_VMAP_END). */
 static uint64_t vmap_area_reserve_locked(size_t size) {
-  uint64_t cursor = KPI_VMAP_BASE;
+  uint64_t cursor = vmap_floor;
   struct vmap_area *pos = vmap_head.next;
 
   size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
@@ -563,6 +577,18 @@ void linuxkpi_vmalloc_init(void) {
                           ASC_PAGE_PRESENT | ASC_PAGE_RW | ASC_PAGE_NX))
       return;
     asc_vmm_unmap_page(asc_vmm_get_kernel_pml4(), va);
+  }
+
+  /* Reserve the mem_map arena at the start of the window.  page init runs
+   * before this and publishes the arena extent; without the floor the first
+   * vmap area would land on top of the descriptor pages.  An arena larger
+   * than the window is rejected by page init already, so a size that does
+   * not fit here leaves the floor unchanged. */
+  if (linuxkpi_vmemmap_size) {
+    uint64_t arena_end = (uint64_t)vmemmap_base + linuxkpi_vmemmap_size;
+
+    if (arena_end > vmap_floor && arena_end <= KPI_VMAP_END)
+      vmap_floor = arena_end;
   }
   vmap_ready = true;
 }

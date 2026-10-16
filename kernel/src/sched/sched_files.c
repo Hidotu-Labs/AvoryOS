@@ -1,3 +1,5 @@
+#include "capability.h"
+#include "pid_namespace.h"
 #include "sched.h"
 #include "sched_internal.h"
 #include "../console/klog.h"
@@ -6,11 +8,37 @@
 #include "../lock/spinlock.h"
 #include "../mm/heap.h"
 
+/* Keep fd_table/thread/VFS layouts unchanged: identity storage belongs to the
+ * allocation containing the table, and is freed by its existing last put. */
+struct fd_table_storage {
+  struct fd_table table;
+  uint64_t description_ids[MAX_FDS];
+};
+static uint64_t next_description_id;
+
+/* Caller holds files->lock. Zero means a new, as-yet-unobserved description.
+ * IDs survive dup/fork/SCM_RIGHTS without pointers or extra lifetime references. */
+uint64_t fd_description_id_locked(struct thread *t, int fd) {
+  struct fd_table_storage *storage = (struct fd_table_storage *)t->files;
+  uint64_t *id = &storage->description_ids[fd];
+  if (!*id) {
+    do {
+      *id = __atomic_add_fetch(&next_description_id, 1, __ATOMIC_RELAXED);
+    } while (!*id);
+  }
+  return *id;
+}
+
+void fd_description_set_locked(struct thread *t, int fd, uint64_t id) {
+  struct fd_table_storage *storage = (struct fd_table_storage *)t->files;
+  storage->description_ids[fd] = id;
+}
+
 static struct fd_table *fd_table_create(void) {
-  struct fd_table *files = kmalloc(sizeof(struct fd_table));
+  struct fd_table *files = kmalloc(sizeof(struct fd_table_storage));
   if (!files)
     return NULL;
-  memset(files, 0, sizeof(struct fd_table));
+  memset(files, 0, sizeof(struct fd_table_storage));
   files->ref_count = 1;
   spinlock_init(&files->lock);
   return files;
@@ -160,6 +188,31 @@ void sched_share_files(struct thread *child, struct thread *parent) {
   thread_set_files(child, parent->files);
 }
 
+/* The child has a private, empty table and is not runnable yet. Snapshot each
+ * descriptor, including its identity, while close/reuse is excluded. */
+void sched_copy_files(struct thread *child, struct thread *parent) {
+  for (int fd = 0; fd < MAX_FDS; fd++) {
+    spinlock_acquire(&parent->files->lock);
+    vfs_node_t *node = parent->fds[fd];
+    if (!node || node == (vfs_node_t *)-1) {
+      spinlock_release(&parent->files->lock);
+      continue;
+    }
+    vfs_node_ref(node);
+    child->fds[fd] = node;
+    child->fd_offsets[fd] = parent->fd_offsets[fd];
+    child->fd_flags[fd] = parent->fd_flags[fd];
+    fd_description_set_locked(child, fd, fd_description_id_locked(parent, fd));
+    struct fd_path *path = parent->fd_paths[fd];
+    if (path)
+      __atomic_add_fetch(&path->ref_count, 1, __ATOMIC_RELAXED);
+    child->fd_paths[fd] = path;
+    spinlock_release(&parent->files->lock);
+    vfs_open(node);
+    vfs_close(node); /* release snapshot pin after child owns the open */
+  }
+}
+
 bool sched_get_nth_open_fd(uint32_t tid, uint32_t index, uint32_t *fd) {
   if (!fd)
     return false;
@@ -280,3 +333,24 @@ bool sched_get_fd_info_snapshot(uint32_t tid, uint32_t fd, uint64_t *out_pos,
   return found;
 }
 
+
+/* Proc magic links hold a vnode reference, independent of descriptor lifetime.
+ * Resolve only visible tasks, and require ptrace authority for another process. */
+vfs_node_t *sched_get_fd_node_snapshot(uint32_t tid, uint32_t fd) {
+  if (fd >= MAX_FDS) return NULL;
+  struct thread *current = sched_get_current();
+  spinlock_acquire(&tid_lock);
+  struct thread *t = find_thread_by_tid_locked(tid);
+  if (!t || !current || !pid_namespace_tid(current, t) || !t->files ||
+      (t->tgid != current->tgid && !capability_has(current, CAP_SYS_PTRACE))) {
+    spinlock_release(&tid_lock); return NULL;
+  }
+  spinlock_acquire(&t->files->lock);
+  vfs_node_t *node = t->fds[fd];
+  if (node == (vfs_node_t *)-1) node = NULL;
+  if (node) vfs_node_ref(node);
+  spinlock_release(&t->files->lock);
+  spinlock_release(&tid_lock);
+  if (node && node->open) node->open(node);
+  return node;
+}

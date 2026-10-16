@@ -48,7 +48,19 @@ static uint64_t vmm_debug_cache_flags(uint64_t *p,uint64_t a){(void)p;(void)a;re
 static char text[512*1024],small[512*1024];
 static void command(const char *s){assert(gpu_diag_control(strlen(s),(void*)s)==strlen(s));}
 static void *writer(void *arg){thread.tid=(uintptr_t)arg;for(int i=0;i<1000;i++)gpu_diag_record(GPU_DIAG_IOCTL,(void*)0xffff800000001900ULL,0xffffc00000000000ULL+i,0x7fffeffff000ULL,0x8000000000000006ULL,0xffff800012345678ULL,0);return NULL;}
+static void *fault_writer(void *arg){
+ thread.tid=(uintptr_t)arg;
+ for(int i=0;i<2000;i++)gpu_diag_record(GPU_DIAG_DMA_MAP,NULL,i,i,4096,0,0);
+ gpu_diag_vm_failure((void*)0x1234,32768,131,132);return NULL;
+}
 int main(void){
+ command("4");pthread_t racers[8];
+ for(int i=0;i<8;i++)pthread_create(&racers[i],NULL,fault_writer,(void*)(uintptr_t)i);
+ for(int i=0;i<8;i++)pthread_join(racers[i],NULL);
+ assert(!gpu_diag_level()&&seen[GPU_DIAG_VM_FAILURE]==1&&anomaly_count==1);
+ assert(resource_count>=2000&&resource_count<=16000&&sequence==resource_count+1);
+ uint64_t frozen=sequence;gpu_diag_vm_failure(NULL,0,0,0);
+ gpu_diag_record(GPU_DIAG_DMA_MAP,NULL,0,0,0,0,0);assert(sequence==frozen);
  command("1\n");
  gpu_diag_record(GPU_DIAG_DMA_MAP,NULL,1,1,4096,0,0);assert(resource_count==0);
  command("3");assert(gpu_diag_resource_enabled());
@@ -57,6 +69,22 @@ int main(void){
  for(int i=0;i<3000;i++)gpu_diag_record(GPU_DIAG_IOCTL,NULL,0,0,0,0,0);
  command("freeze");unsigned rn=gpu_diag_read(0,sizeof(text)-1,(void*)text);text[rn]=0;
  assert(strstr(text,"resource_events=1024 resource_budget_left=0")&&strstr(text,"retained resource events")&&strstr(text,"DMA_MAP"));
+ command("4");assert(gpu_diag_resource_enabled());
+ for(int i=0;i<3000;i++)gpu_diag_record(GPU_DIAG_DMA_MAP,NULL,i,i,4096,0,0);
+ assert(resource_count==3000&&!resource_left&&gpu_diag_resource_enabled());
+ gpu_diag_vm_failure((void*)0x1234,32768,131,132);
+ assert(!gpu_diag_level()&&!gpu_diag_resource_enabled()&&sequence==3001);
+ gpu_diag_vm_failure((void*)0x5678,42,1,2);
+ gpu_diag_record(GPU_DIAG_IOCTL,NULL,0,0,0,0,0);assert(sequence==3001);
+ rn=gpu_diag_read(0,sizeof(text)-1,(void*)text);text[rn]=0;
+ assert(strstr(text,"count VM_FAILURE=1")&&strstr(text,"resource_events=3000"));
+ assert(strstr(text,"resource 1977 ")&&!strstr(text,"resource 1976 "));
+ assert(strstr(text,"resource 3000 ")&&strstr(text,"VM_FAILURE 1234 8000 83 84 0 0"));
+ unsigned resources=0;char *rc=text;
+ while((rc=strstr(rc,"\nresource "))){resources++;rc++;}assert(resources==1024);
+ /* Failure reports do not freeze normal metadata or budgeted captures. */
+ command("3");gpu_diag_vm_failure(NULL,1,2,3);assert(gpu_diag_level()==3&&!sequence);
+ command("1");gpu_diag_vm_failure(NULL,1,2,3);assert(gpu_diag_level()==1&&!sequence);
  command("1\n");
  for(int i=0;i<18;i++)gpu_diag_prime_error(GPU_PRIME_CPU_MAP,NULL,0,4096,-12);
  assert(prime_error_lines==18 && strstr(serial_text,"PRIME stage=7 detail=0x0 size=4096 error=-12 tid=12"));

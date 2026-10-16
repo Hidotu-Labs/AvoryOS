@@ -1151,6 +1151,7 @@ void isr_report_user_fault(struct registers *regs, int sig,
       // Simple Userland Backtrace (RBP-based)
       klog_puts("USER BACKTRACE (RBP):\n");
       uint64_t curr_rbp = regs->rbp;
+      unsigned abort_pointer_dumps = 0;
       for (int i = 0; i < 16; i++) {
           if (curr_rbp < 0x1000 || curr_rbp >= 0x0000800000000000ULL) break;
           uint64_t old_rbp_kaddr, ret_addr_kaddr;
@@ -1166,6 +1167,34 @@ void isr_report_user_fault(struct registers *regs, int sig,
           klog_puts("  #"); klog_uint64(i); klog_puts(": "); klog_hex64(ret_addr);
           klog_resolve_fault_address(current, ret_addr);
           klog_puts("\n");
+
+          /* abort() clobbers the allocator's argument registers. Preserve
+           * bounded caller locals so a heap-corruption report can identify
+           * the rejected chunk and arena, rather than only the abort site.
+           * Read existing translations only; diagnostics must not fault in
+           * arbitrary userspace memory. */
+          if (sig == 6 && i < 6) {
+              for (unsigned slot = 1; slot <= 8; slot++) {
+                  uint64_t saddr = curr_rbp - slot * sizeof(uint64_t);
+                  uint64_t kaddr;
+                  if (saddr < regs->rsp ||
+                      !klog_user_kaddr(pml4, saddr, &kaddr))
+                      continue;
+                  uint64_t val = *(uint64_t *)kaddr;
+                  klog_puts("    local["); klog_hex64(saddr);
+                  klog_puts("] = "); klog_hex64(val);
+                  klog_puts("\n");
+                  struct vma *pv = current->mm
+                      ? vma_find(&current->mm->vmas, val) : NULL;
+                  if (abort_pointer_dumps < 8 && pv && !pv->file_node &&
+                      (pv->prot & 2) && !(pv->flags & MAP_STACK) &&
+                      val >= pv->start + 16 && !(val & 15)) {
+                      klog_dump_ptr(current, "caller data", val);
+                      klog_dump_ptr(current, "preceding bytes", val - 16);
+                      abort_pointer_dumps++;
+                  }
+              }
+          }
           
           if (next_rbp <= curr_rbp) break; // Avoid infinite loops
           curr_rbp = next_rbp;

@@ -11,6 +11,7 @@
 #include <linux/list.h>
 #include <linux/list_sort.h>
 #include <linux/math.h>
+#include <linux/rbtree.h>
 
 #include <linuxkpi/log.h>
 
@@ -77,6 +78,71 @@ static bool test_list_sort(void) {
   return expected == 9;
 }
 
+/* These inlines use imported Linux layouts but link to native rb_*.
+ * Five ordered inserts used to break color invariants at a non-root rotation.
+ * Check every mutation so a later balancing operation cannot hide the defect. */
+struct rb_test_elem {
+  struct rb_node node;
+  unsigned int key;
+};
+
+static bool rb_test_less(struct rb_node *a, const struct rb_node *b) {
+  return rb_entry(a, struct rb_test_elem, node)->key <
+         rb_entry(b, struct rb_test_elem, node)->key;
+}
+
+static int rb_test_black_height(struct rb_node *node, struct rb_node *parent,
+                                 unsigned int depth) {
+  if (!node)
+    return 1;
+  if (depth >= 32 || rb_parent(node) != parent)
+    return 0;
+  bool black = node->__rb_parent_color & 1UL;
+  if (!black && ((node->rb_left && !(node->rb_left->__rb_parent_color & 1UL)) ||
+                 (node->rb_right && !(node->rb_right->__rb_parent_color & 1UL))))
+    return 0;
+  int left = rb_test_black_height(node->rb_left, node, depth + 1);
+  int right = rb_test_black_height(node->rb_right, node, depth + 1);
+  return left && left == right ? left + black : 0;
+}
+
+static bool rb_test_valid(struct rb_root_cached *root, unsigned int expected) {
+  struct rb_node *node = root->rb_root.rb_node;
+  if ((node && !(node->__rb_parent_color & 1UL)) ||
+      !rb_test_black_height(node, NULL, 0) ||
+      rb_first_cached(root) != rb_first(&root->rb_root))
+    return false;
+  unsigned int count = 0, previous = 0;
+  for (node = rb_first_cached(root); node; node = rb_next(node)) {
+    unsigned int key = rb_entry(node, struct rb_test_elem, node)->key;
+    if (count >= expected || (count && key <= previous))
+      return false;
+    previous = key;
+    count++;
+  }
+  return count == expected;
+}
+
+static bool test_rbtree_native_bridge(void) {
+  struct rb_test_elem elems[32];
+  struct rb_root_cached root = RB_ROOT_CACHED;
+
+  for (unsigned int i = 0; i < ARRAY_SIZE(elems); i++) {
+    elems[i].key = i;
+    rb_add_cached(&elems[i].node, &root, rb_test_less);
+    if (!rb_test_valid(&root, i + 1))
+      return false;
+  }
+  for (unsigned int i = 0; i < ARRAY_SIZE(elems); i++) {
+    /* Odd stride visits each node once, including two-child erasures. */
+    unsigned int index = (i * 13) % ARRAY_SIZE(elems);
+    rb_erase_cached(&elems[index].node, &root);
+    if (!rb_test_valid(&root, ARRAY_SIZE(elems) - i - 1))
+      return false;
+  }
+  return RB_EMPTY_ROOT(&root.rb_root);
+}
+
 void linuxkpi_test_phase1_libs(void) {
   static const struct {
     const char *name;
@@ -86,6 +152,7 @@ void linuxkpi_test_phase1_libs(void) {
       {"int_sqrt", test_int_sqrt},
       {"find_bit", test_find_bits},
       {"list_sort", test_list_sort},
+      {"rbtree native bridge", test_rbtree_native_bridge},
   };
 
   klog_puts("[LINUXKPI] Phase 1 library import self-test\n");

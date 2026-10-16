@@ -3,7 +3,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+struct vfs_node;
 void sysfs_init(void);
+void sysfs_enable_uevent(struct vfs_node *node, struct vfs_node *parent);
 void sysfs_populate_network(void);
 void sysfs_gpu_update_connector(uint32_t scanout, bool connected, const char *modes);
 

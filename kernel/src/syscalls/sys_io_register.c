@@ -12,6 +12,7 @@ void syscall_register_ioctl(void);
 void syscall_register_stat(void);
 void syscall_register_fs(void);
 void syscall_register_aio(void);
+void syscall_register_io_uring(void);
 void syscall_register_random(void);
 void syscall_register_xattr(void);
 
@@ -22,6 +23,7 @@ void syscall_register_io(void) {
     syscall_register_stat();
     syscall_register_fs();
     syscall_register_aio();
+    syscall_register_io_uring();
     syscall_register_random();
     syscall_register_xattr();
 

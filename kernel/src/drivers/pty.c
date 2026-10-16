@@ -191,7 +191,9 @@ int pty_alloc_pair(void) {
   for (int i = 0; i < PTY_MAX_PAIRS; i++) {
     int idx = (pty_next_index + i) % PTY_MAX_PAIRS;
     if (!pty_pool[idx].allocated) {
-      pty_pool[idx].allocated = true;
+      bool expected = false;
+      if (!__atomic_compare_exchange_n(&pty_pool[idx].allocated, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
+      pty_pool[idx].devpts_instance = NULL;
       pty_pool[idx].locked = false;
       pty_pool[idx].master_open = true;
       pty_pool[idx].packet_mode = false;

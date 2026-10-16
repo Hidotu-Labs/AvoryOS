@@ -45,6 +45,40 @@ void wait_queue_add(wait_queue_t *wq, wait_queue_entry_t *entry) {
   }
 }
 
+/* FIFO append for queues whose wakeups must respect arrival order (journal
+ * ownership handoff): wait_queue_wake_one takes from the head, and
+ * wait_queue_handoff hands the head entry to its owner. Without an ordered
+ * append a fresh arrival landing at the head could jump a long queue. */
+void wait_queue_add_tail(wait_queue_t *wq, wait_queue_entry_t *entry) {
+  if (!wq || !entry)
+    return;
+
+  entry->wq = wq;
+  struct thread *t = entry->thread;
+
+  LOCKDIAG_WQ_LOCK(wq);
+  entry->next = NULL;
+  wait_queue_entry_t **pp = &wq->head;
+  while (*pp) {
+    if (!wq_entry_ptr_sane(*pp))
+      break; /* corrupt list: append at the last plausible node */
+    pp = &(*pp)->next;
+  }
+  *pp = entry;
+  LOCKDIAG_WQ_UNLOCK(wq);
+  LOCKDIAG_STAT(wq_adds, 1);
+
+  if (t) {
+    spinlock_acquire(&t->wait_entries_lock);
+    entry->thread_next = t->wait_entries_head;
+    entry->thread_prev = NULL;
+    if (t->wait_entries_head)
+      t->wait_entries_head->thread_prev = entry;
+    t->wait_entries_head = entry;
+    spinlock_release(&t->wait_entries_lock);
+  }
+}
+
 void wait_queue_remove(wait_queue_t *wq, wait_queue_entry_t *entry) {
   if (!entry)
     return;
@@ -194,4 +228,43 @@ void wait_queue_wake_one(wait_queue_t *wq) {
 
   LOCKDIAG_WQ_UNLOCK(wq);
   hal_irq_restore(rflags);
+}
+
+bool wait_queue_handoff(wait_queue_t *wq,
+                        void (*publish)(struct thread *, void *), void *arg) {
+  if (!wq || !publish)
+    return false;
+
+  hal_irq_state_t rflags = hal_irq_save();
+  LOCKDIAG_WQ_LOCK(wq);
+
+  /* Keep selection, publication and wake protected against both local
+   * preemption and remote cleanup. Returning a detached thread pointer lets
+   * the reaper free it before the caller publishes ownership or wakes it. */
+  bool result = false;
+  wait_queue_entry_t **pp = &wq->head;
+  while (*pp) {
+    wait_queue_entry_t *curr = *pp;
+    if (!wq_entry_ptr_sane(curr))
+      break; /* corrupt/dangling list: stop rather than fault the kernel */
+    struct thread *t = curr->thread;
+    if (t && t->state != THREAD_DEAD && t->state != THREAD_ZOMBIE) {
+      *pp = curr->next;
+      curr->next = NULL;
+      publish(t, arg);
+      t->wakeup_ticks = 0;
+      sched_wakeup(t);
+      /* Leave the back-pointer intact until the last use of t: cleanup
+       * must still take this lock if it finds the detached entry through
+       * the thread's entry list while publication/wake is in progress. */
+      curr->wq = NULL;
+      result = true;
+      break;
+    }
+    pp = &curr->next;
+  }
+
+  LOCKDIAG_WQ_UNLOCK(wq);
+  hal_irq_restore(rflags);
+  return result;
 }

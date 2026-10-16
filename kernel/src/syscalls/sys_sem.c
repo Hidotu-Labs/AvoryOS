@@ -5,6 +5,7 @@
 #include "../lock/spinlock.h"
 #include "../mm/heap.h"
 #include "../sched/sched.h"
+#include "../sched/namespace.h"
 #include "syscall.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -70,6 +71,7 @@ struct sem_val {
 struct sem_set {
     bool active;
     bool marked_destroy;
+    uint32_t namespace_id;
     uint32_t key;
     uint32_t semid;
     uint16_t nsems;
@@ -104,7 +106,9 @@ int64_t sys_semget(uint64_t key, uint64_t nsems, uint64_t semflg, uint64_t a3, u
     // If key != IPC_PRIVATE (0), check if set already exists
     if (key != 0) {
         for (int i = 0; i < SEM_MAX_SETS; i++) {
-            if (sem_table[i].active && sem_table[i].key == (uint32_t)key) {
+            if (sem_table[i].active &&
+                sem_table[i].namespace_id == ipc_namespace_id(sched_get_current()) &&
+                sem_table[i].key == (uint32_t)key) {
                 if ((semflg & IPC_CREAT) && (semflg & IPC_EXCL)) {
                     spinlock_release(&sem_lock);
                     return -17; // EEXIST
@@ -145,8 +149,10 @@ int64_t sys_semget(uint64_t key, uint64_t nsems, uint64_t semflg, uint64_t a3, u
         return -28; // ENOSPC
     }
 
+    if (sem_next_id > 0x7FFFFFFFU) { spinlock_release(&sem_lock); return -28; }
     struct sem_set *set = &sem_table[slot];
     memset(set, 0, sizeof(*set));
+    set->namespace_id = ipc_namespace_id(sched_get_current());
     set->active = true;
     set->key = (uint32_t)key;
     set->semid = sem_next_id++;
@@ -177,7 +183,9 @@ int64_t sys_semtimedop(uint64_t semid, uint64_t sops_addr, uint64_t nsops, uint6
 
     struct sem_set *set = NULL;
     for (int i = 0; i < SEM_MAX_SETS; i++) {
-        if (sem_table[i].active && sem_table[i].semid == (uint32_t)semid) {
+        if (sem_table[i].active &&
+            sem_table[i].namespace_id == ipc_namespace_id(sched_get_current()) &&
+            sem_table[i].semid == (uint32_t)semid) {
             set = &sem_table[i];
             break;
         }
@@ -257,7 +265,8 @@ int64_t sys_semtimedop(uint64_t semid, uint64_t sops_addr, uint64_t nsops, uint6
         spinlock_acquire(&sem_lock);
 
         // Recheck if set was destroyed while waiting
-        if (!set->active) {
+        if (!set->active || set->semid != (uint32_t)semid ||
+            set->namespace_id != ipc_namespace_id(sched_get_current())) {
             spinlock_release(&sem_lock);
             return -43; // EIDRM
         }
@@ -275,7 +284,9 @@ int64_t sys_semctl(uint64_t semid, uint64_t semnum, uint64_t cmd, uint64_t arg, 
 
     struct sem_set *set = NULL;
     for (int i = 0; i < SEM_MAX_SETS; i++) {
-        if (sem_table[i].active && sem_table[i].semid == (uint32_t)semid) {
+        if (sem_table[i].active &&
+            sem_table[i].namespace_id == ipc_namespace_id(sched_get_current()) &&
+            sem_table[i].semid == (uint32_t)semid) {
             set = &sem_table[i];
             break;
         }
@@ -386,4 +397,12 @@ void syscall_register_sem(void) {
     syscall_register(66, (syscall_handler_t)sys_semctl);
     syscall_register(220, (syscall_handler_t)sys_semtimedop);
     klog_puts("[SEM] Syscalls registered (semget=64, semop=65, semctl=66, semtimedop=220).\n");
+}
+
+void sem_namespace_destroy(uint32_t id) {
+    spinlock_acquire(&sem_lock);
+    for (int i = 0; i < SEM_MAX_SETS; i++)
+        if (sem_table[i].active && sem_table[i].namespace_id == id)
+            sem_table[i].active = false;
+    spinlock_release(&sem_lock);
 }

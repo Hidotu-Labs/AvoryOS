@@ -17,6 +17,7 @@ static bool unix_scm_capture_fd(struct thread *sender, int fd,
   }
   vfs_node_ref(node);
   saved->node = node;
+  saved->description_id = fd_description_id_locked(sender, fd);
   saved->offset = sender->fd_offsets[fd];
   saved->flags = sender->fd_flags[fd] & ~(uint64_t)FD_FLAGS_CLOEXEC_BIT;
   const char *path = fd_path_value(sender, fd);
@@ -45,6 +46,7 @@ static int unix_scm_install_fd(struct thread *receiver,
     fd_release_reserved(receiver, fd);
     return -12;
   }
+  fd_description_set_locked(receiver, fd, saved->description_id);
   receiver->fds[fd] = saved->node; /* publish after all metadata */
   spinlock_release(&receiver->files->lock);
   return fd;
@@ -805,7 +807,7 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   if (!peer_sock || !peer) {
     if (msg->msg_name && msg->msg_namelen >= sizeof(sa_family_t)) {
       struct sockaddr_un *sun = (struct sockaddr_un *)msg->msg_name;
-      unix_sock_t *dusk = unix_find_socket_by_addr_ref(sun, msg->msg_namelen);
+      unix_sock_t *dusk = unix_find_socket_by_addr_ref(sock, sun, msg->msg_namelen);
       if (dusk) {
         if (dusk->is_syslog_sink) {
           if (dusk->parent)

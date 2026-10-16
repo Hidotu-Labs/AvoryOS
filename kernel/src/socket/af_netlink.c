@@ -1,3 +1,5 @@
+#include "../sched/net_namespace.h"
+#include "../sched/capability.h"
 #include "af_netlink.h"
 #include "../console/klog.h"
 #include "../fs/sysfs.h"
@@ -16,7 +18,10 @@
 
 static struct list_head netlink_sockets;
 static spinlock_t netlink_lock;
-static uint64_t uevent_seqnum = 1;
+static uint64_t uevent_seqnum;
+uint64_t netlink_uevent_next_seqnum(void) {
+  return __atomic_add_fetch(&uevent_seqnum, 1, __ATOMIC_RELAXED);
+}
 
 struct nlmsghdr_min {
   uint32_t nlmsg_len;
@@ -38,6 +43,9 @@ struct nlmsghdr_min {
 #define IFLA_ADDRESS 1
 #define IFLA_IFNAME 3
 #define IFLA_MTU 4
+#define IFLA_OPERSTATE 16
+#define IFLA_STATS64 23
+#define IFLA_CARRIER 33
 #define IFA_ADDRESS 1
 #define IFA_LOCAL 2
 #define IFA_LABEL 3
@@ -54,6 +62,9 @@ struct nlmsghdr_min {
 #define IFF_LOOPBACK 0x8
 #define IFF_RUNNING 0x40
 #define IFF_MULTICAST 0x1000
+#define IFF_LOWER_UP 0x10000
+#define ARPHRD_ETHER 1
+#define ARPHRD_LOOPBACK 772
 #define NL_ALIGN(n) (((n) + 3U) & ~3U)
 
 struct ifinfomsg_min {
@@ -69,6 +80,18 @@ struct rtmsg_min {
   uint32_t rtm_flags;
 };
 struct rtattr_min { uint16_t len, type; };
+
+/* Linux rtnl_link_stats64 order, including fields not tracked by our driver. */
+struct rtnl_link_stats64_min {
+  uint64_t rx_packets, tx_packets, rx_bytes, tx_bytes;
+  uint64_t rx_errors, tx_errors, rx_dropped, tx_dropped;
+  uint64_t multicast, collisions;
+  uint64_t rx_length_errors, rx_over_errors, rx_crc_errors, rx_frame_errors;
+  uint64_t rx_fifo_errors, rx_missed_errors;
+  uint64_t tx_aborted_errors, tx_carrier_errors, tx_fifo_errors;
+  uint64_t tx_heartbeat_errors, tx_window_errors;
+  uint64_t rx_compressed, tx_compressed, rx_nohandler, rx_otherhost_dropped;
+};
 
 static size_t route_attr(uint8_t *msg, size_t pos, size_t cap, uint16_t type,
                          const void *data, size_t len) {
@@ -99,19 +122,53 @@ static void ipv4_bytes(uint8_t out[4], uint32_t ip) {
   out[0] = ip >> 24; out[1] = ip >> 16; out[2] = ip >> 8; out[3] = ip;
 }
 
-static int route_link(netlink_sock_t *nsk, uint32_t seq, uint32_t pid,
-                      const struct net_device *dev) {
-  uint8_t msg[128]; memset(msg, 0, sizeof(msg));
+static size_t route_build_link(uint8_t msg[512], uint32_t seq, uint32_t pid,
+                               uint16_t flags, const struct net_device *dev) {
+  memset(msg, 0, 512);
   struct nlmsghdr_min *h = (struct nlmsghdr_min *)msg;
   struct ifinfomsg_min *i = (struct ifinfomsg_min *)(h + 1);
-  h->nlmsg_type = RTM_NEWLINK; h->nlmsg_flags = NLM_F_MULTI; h->nlmsg_seq = seq; h->nlmsg_pid = pid;
-  i->index = 2; i->flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
+  h->nlmsg_type = RTM_NEWLINK; h->nlmsg_flags = flags; h->nlmsg_seq = seq; h->nlmsg_pid = pid;
+  i->type = ARPHRD_ETHER;
+  uint8_t carrier = dev->ops && dev->ops->link_up && dev->ops->link_up((struct net_device *)dev);
+  i->index = 2; i->flags = IFF_UP | IFF_BROADCAST | IFF_MULTICAST;
+  if (carrier)
+    i->flags |= IFF_RUNNING | IFF_LOWER_UP;
   i->change = 0xffffffffU;
   size_t pos = sizeof(*h) + sizeof(*i);
-  pos = route_attr(msg, pos, sizeof(msg), IFLA_IFNAME, dev->name, strlen(dev->name) + 1);
-  pos = route_attr(msg, pos, sizeof(msg), IFLA_MTU, &dev->mtu, sizeof(dev->mtu));
-  pos = route_attr(msg, pos, sizeof(msg), IFLA_ADDRESS, dev->mac, 6);
-  h->nlmsg_len = pos; return route_queue(nsk, msg, pos);
+  pos = route_attr(msg, pos, 512, IFLA_IFNAME, dev->name, strlen(dev->name) + 1);
+  uint32_t mtu = dev->mtu; /* IFLA_MTU is u32 even though the NIC stores u16. */
+  pos = route_attr(msg, pos, 512, IFLA_MTU, &mtu, sizeof(mtu));
+  pos = route_attr(msg, pos, 512, IFLA_ADDRESS, dev->mac, 6);
+  pos = route_attr(msg, pos, 512, IFLA_CARRIER, &carrier, sizeof(carrier));
+  uint8_t operstate = carrier ? 6 /* IF_OPER_UP */ : 2 /* IF_OPER_DOWN */;
+  pos = route_attr(msg, pos, 512, IFLA_OPERSTATE, &operstate, sizeof(operstate));
+  struct rtnl_link_stats64_min stats = {0};
+  /* Take fresh counters for every request. NetworkManager polls these to
+   * publish Device.Statistics; sysfs's boot-time snapshot cannot serve it. */
+#define COPY_STAT(field) stats.field = __atomic_load_n(&dev->stats.field, __ATOMIC_RELAXED)
+  COPY_STAT(rx_packets); COPY_STAT(tx_packets);
+  COPY_STAT(rx_bytes); COPY_STAT(tx_bytes);
+  COPY_STAT(rx_errors); COPY_STAT(tx_errors);
+  COPY_STAT(rx_dropped); COPY_STAT(tx_dropped);
+#undef COPY_STAT
+  pos = route_attr(msg, pos, 512, IFLA_STATS64, &stats, sizeof(stats));
+  h->nlmsg_len = pos; return pos;
+}
+
+static int route_link(netlink_sock_t *nsk, uint32_t seq, uint32_t pid,
+                      const struct net_device *dev) {
+  uint8_t msg[512];
+  size_t len = route_build_link(msg, seq, pid, NLM_F_MULTI, dev);
+  return route_queue(nsk, msg, len);
+}
+
+void netlink_notify_link(struct net_device *dev) {
+  /* Routing/netlink currently exports only the one configured default NIC. */
+  if (!dev || dev != net_device_default() || !dev->registered)
+    return;
+  uint8_t msg[512];
+  size_t len = route_build_link(msg, 0, 0, 0, dev);
+  netlink_broadcast(NETLINK_ROUTE, 1 /* RTMGRP_LINK */, msg, len);
 }
 
 static int route_address(netlink_sock_t *nsk, uint32_t seq, uint32_t pid, const char *name,
@@ -135,7 +192,8 @@ static int route_loopback_link(netlink_sock_t *nsk, uint32_t seq, uint32_t pid) 
   struct nlmsghdr_min *h = (struct nlmsghdr_min *)msg;
   struct ifinfomsg_min *i = (struct ifinfomsg_min *)(h + 1);
   h->nlmsg_type = RTM_NEWLINK; h->nlmsg_flags = NLM_F_MULTI; h->nlmsg_seq = seq; h->nlmsg_pid = pid;
-  i->index = 1; i->flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+  i->type = ARPHRD_LOOPBACK;
+  i->index = 1; i->flags = nsk->parent->net_ns ? __atomic_load_n(&nsk->parent->net_ns->loopback_flags, __ATOMIC_ACQUIRE) : IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
   i->change = 0xffffffffU;
   size_t pos = sizeof(*h) + sizeof(*i);
   pos = route_attr(msg, pos, sizeof(msg), IFLA_IFNAME, "lo", 3);
@@ -199,128 +257,18 @@ static size_t ue_append(char *buf, size_t pos, const char *str) {
   return pos + len + 1;
 }
 
-static void netlink_push_fake_uevent(socket_t *sock) {
-  klog_puts("[NETLINK] push_fake_uevent start\n");
-  if (!sock || !sock->sk)
-    return;
-  netlink_sock_t *nsk = (netlink_sock_t *)sock->sk;
-
-  // Devices to notify: DRM card0, connector, DRM card2 (amdgpu, Phase 6 C7),
-  // Keyboard, Mouse, HDA sound card0/controlC0/pcmC0D0p (stable ALSA
-  // enumeration so hardware.audio monitor blocks instead of rescanning).
-  const char *devpaths[] = {sysfs_gpu_devpath, sysfs_gpu_connector_devpath,
-                            sysfs_gpu2_devpath,
-                            "/devices/virtual/input/input0/event0",
-                            "/devices/virtual/input/input1/event1",
-                            "/devices/virtual/sound/card0",
-                            "/devices/virtual/sound/controlC0",
-                            "/devices/virtual/sound/pcmC0D0p"};
-  const char *subsystems[] = {"drm", "drm", "drm", "input", "input",
-                              "sound", "sound", "sound"};
-  const char *devnames[] = {"/dev/dri/card0", "", "/dev/dri/card2",
-                            "/dev/input/event0", "/dev/input/event1",
-                            "/dev/snd/controlC0", "/dev/snd/controlC0",
-                            "/dev/snd/pcmC0D0p"};
-  const char *majors[] = {"226", "", "226", "13", "13",
-                          "116", "116", "116"};
-  const char *minors[] = {"0", "", "2", "64", "65",
-                          "0", "0", "24"};
-
-  for (int i = 0; i < 8; i++) {
-    char uevent_buf[512];
-    memset(uevent_buf, 0, sizeof(uevent_buf));
-    size_t pos = 0;
-
-    char tmp[256];
-    strcpy(tmp, "add@");
-    strcat(tmp, devpaths[i]);
-    pos = ue_append(uevent_buf, pos, tmp);
-
-    pos = ue_append(uevent_buf, pos, "ACTION=add");
-
-    strcpy(tmp, "DEVPATH=");
-    strcat(tmp, devpaths[i]);
-    pos = ue_append(uevent_buf, pos, tmp);
-
-    strcpy(tmp, "SUBSYSTEM=");
-    strcat(tmp, subsystems[i]);
-    pos = ue_append(uevent_buf, pos, tmp);
-
-    if (devnames[i][0]) {
-      strcpy(tmp, "DEVNAME=");
-      strcat(tmp, devnames[i]);
-      pos = ue_append(uevent_buf, pos, tmp);
-    }
-
-    if (majors[i][0]) {
-      strcpy(tmp, "MAJOR=");
-      strcat(tmp, majors[i]);
-      pos = ue_append(uevent_buf, pos, tmp);
-    }
-
-    if (minors[i][0]) {
-      strcpy(tmp, "MINOR=");
-      strcat(tmp, minors[i]);
-      pos = ue_append(uevent_buf, pos, tmp);
-    }
-
-    if (i == 1) {
-      pos = ue_append(uevent_buf, pos, "DEVTYPE=drm_connector");
-      pos = ue_append(uevent_buf, pos, "HOTPLUG=1");
-      pos = ue_append(uevent_buf, pos, "CONNECTOR=HDMI-A-1");
-    }
-
-    char seq_buf[32];
-    strcpy(seq_buf, "SEQNUM=");
-    char tmp_dec[20];
-    uint64_t current_seq;
-    spinlock_acquire(&netlink_lock);
-    current_seq = uevent_seqnum++;
-    spinlock_release(&netlink_lock);
-
-    // Simple u64 to dec (shared with sysfs but local for now or use a shared
-    // helper)
-    char *p = tmp_dec + 19;
-    *p = '\0';
-    uint64_t val = current_seq;
-    if (val == 0)
-      *--p = '0';
-    else {
-      while (val > 0) {
-        *--p = '0' + (val % 10);
-        val /= 10;
-      }
-    }
-    strcat(seq_buf, p);
-    pos = ue_append(uevent_buf, pos, seq_buf);
-
-    klog_puts("[NETLINK] Pushing fake uevent for ");
-    klog_puts(devpaths[i]);
-    klog_puts("\n");
-
-    sk_buff_t *skb = alloc_skb(pos);
-    if (skb) {
-      memcpy(skb->data, uevent_buf, pos);
-      skb->len = pos;
-      skb_queue_tail(&nsk->recv_queue, skb);
-    }
-  }
-
-  socket_wake(sock);
-  if (sock->node)
-    epoll_notify_event(sock->node, EPOLLIN);
-}
 
 void netlink_broadcast(int protocol, uint32_t group, const void *data,
                        size_t len) {
   spinlock_acquire(&netlink_lock);
   netlink_sock_t *nsk;
   list_for_each_entry(nsk, &netlink_sockets, list) {
-    if (nsk->protocol == protocol && (nsk->groups & group)) {
+    if (!nsk->parent->net_ns && nsk->protocol == protocol && (nsk->groups & group)) {
       sk_buff_t *skb = alloc_skb(len);
       if (skb) {
         memcpy(skb->data, data, len);
         skb->len = len;
+        skb->nl_groups = group;
         skb_queue_tail(&nsk->recv_queue, skb);
         socket_wake(nsk->parent);
         if (nsk->parent->node)
@@ -331,8 +279,24 @@ void netlink_broadcast(int protocol, uint32_t group, const void *data,
   spinlock_release(&netlink_lock);
 }
 
-void netlink_broadcast_drm_hotplug(const char *devpath,uint32_t connector){
- char buf[512],tmp[192],num[12];size_t pos=0;memset(buf,0,sizeof(buf));strcpy(tmp,"change@");strcat(tmp,devpath);pos=ue_append(buf,pos,tmp);pos=ue_append(buf,pos,"ACTION=change");strcpy(tmp,"DEVPATH=");strcat(tmp,devpath);pos=ue_append(buf,pos,tmp);pos=ue_append(buf,pos,"SUBSYSTEM=drm");pos=ue_append(buf,pos,"DEVTYPE=drm_connector");pos=ue_append(buf,pos,"HOTPLUG=1");char *p=num+sizeof(num);*--p=0;uint32_t v=connector;if(!v)*--p=48;while(v){*--p=(char)(48+v%10);v/=10;}strcpy(tmp,"CONNECTOR=HDMI-A-");strcat(tmp,p);pos=ue_append(buf,pos,tmp);netlink_broadcast(15,1,buf,pos);
+void netlink_broadcast_drm_hotplug(const char *devpath, uint32_t connector) {
+  if (!devpath || strlen(devpath) > 160) return;
+  char event[512], field[192];
+  size_t pos = 0;
+  snprintf(field, sizeof(field), "change@%s", devpath);
+  pos = ue_append(event, pos, field);
+  pos = ue_append(event, pos, "ACTION=change");
+  snprintf(field, sizeof(field), "DEVPATH=%s", devpath);
+  pos = ue_append(event, pos, field);
+  pos = ue_append(event, pos, "SUBSYSTEM=drm");
+  pos = ue_append(event, pos, "DEVTYPE=drm_connector");
+  pos = ue_append(event, pos, "HOTPLUG=1");
+  snprintf(field, sizeof(field), "CONNECTOR=HDMI-A-%u", connector);
+  pos = ue_append(event, pos, field);
+  snprintf(field, sizeof(field), "SEQNUM=%llu",
+           (unsigned long long)netlink_uevent_next_seqnum());
+  pos = ue_append(event, pos, field);
+  netlink_broadcast(NETLINK_KOBJECT_UEVENT, 1, event, pos);
 }
 
 // AF_NETLINK Operations
@@ -345,13 +309,26 @@ static int netlink_bind(socket_t *sock, struct sockaddr *addr, int addrlen) {
     return -97; // EAFNOSUPPORT
 
   netlink_sock_t *nsk = (netlink_sock_t *)sock->sk;
-  nsk->groups = nl->nl_groups;
-  if (nl->nl_pid == 0) {
-    struct thread *t = sched_get_current();
-    nsk->portid = (t) ? t->tid : 1;
-  } else {
-    nsk->portid = nl->nl_pid;
+  static uint32_t next_auto_portid = UINT32_MAX;
+  struct thread *t = sched_get_current();
+  uint32_t candidate = nl->nl_pid ? nl->nl_pid :
+      nsk->portid ? (uint32_t)nsk->portid : t ? (t->tgid ? t->tgid : t->tid) : 1;
+  spinlock_acquire(&netlink_lock);
+  for (;;) {
+    bool collision = false;
+    netlink_sock_t *other;
+    list_for_each_entry(other, &netlink_sockets, list) {
+      if (other != nsk && other->parent->net_ns == sock->net_ns && other->protocol == nsk->protocol &&
+          other->portid == candidate) { collision = true; break; }
+    }
+    if (!collision) break;
+    if (nl->nl_pid) { spinlock_release(&netlink_lock); return -98; }
+    candidate = next_auto_portid--;
+    if (!candidate) { spinlock_release(&netlink_lock); return -98; }
   }
+  nsk->portid = candidate;
+  nsk->groups = nl->nl_groups;
+  spinlock_release(&netlink_lock);
 
   klog_puts("[NETLINK] bind called: port=");
   klog_uint64(nsk->portid);
@@ -359,11 +336,6 @@ static int netlink_bind(socket_t *sock, struct sockaddr *addr, int addrlen) {
   klog_uint64(nsk->groups);
   klog_puts("\n");
 
-  // If udev is binding (portid != 0 or just protocol is uevent), push a fake
-  // uevent to notify it about the DRM card and input devices.
-  if (nsk->protocol == 15) { // NETLINK_KOBJECT_UEVENT
-    netlink_push_fake_uevent(sock);
-  }
 
   return 0;
 }
@@ -410,9 +382,6 @@ static int netlink_setsockopt(socket_t *sock, int level, int optname,
       uint32_t group_mask = (1u << (group - 1));
       nsk->groups |= group_mask;
 
-      if (group == 1) { // 1 is often the uevent group
-        netlink_push_fake_uevent(sock);
-      }
       return 0;
     }
     case NETLINK_DROP_MEMBERSHIP: {
@@ -482,9 +451,10 @@ static int netlink_getsockopt(socket_t *sock, int level, int optname,
   return 0;
 }
 
-static ssize_t netlink_recvfrom(socket_t *sock, void *buf, size_t len,
+struct netlink_sender { uint32_t pid, uid, gid; };
+static ssize_t netlink_recvfrom_full(socket_t *sock, void *buf, size_t len,
                                 int flags, struct sockaddr *src_addr,
-                                int *addrlen) {
+                                int *addrlen, struct netlink_sender *sender) {
   if (!sock || !sock->sk)
     return -22;
   netlink_sock_t *nsk = (netlink_sock_t *)sock->sk;
@@ -545,19 +515,27 @@ static ssize_t netlink_recvfrom(socket_t *sock, void *buf, size_t len,
     struct sockaddr_nl nl;
     memset(&nl, 0, sizeof(nl));
     nl.nl_family = AF_NETLINK;
-    nl.nl_pid = 0; // From kernel
-    nl.nl_groups = 0;
+    nl.nl_pid = skb->nl_portid;
+    nl.nl_groups = skb->nl_groups;
 
     int copy_len = (*addrlen < (int)sizeof(nl)) ? *addrlen : (int)sizeof(nl);
     memcpy(src_addr, &nl, copy_len);
     *addrlen = sizeof(nl);
   }
 
+  if (sender) {
+    sender->pid = skb->nl_pid; sender->uid = skb->nl_uid; sender->gid = skb->nl_gid;
+  }
   ssize_t ret = (flags & MSG_TRUNC) ? (ssize_t)skb->len : (ssize_t)to_copy;
   if (!(flags & MSG_PEEK)) {
     free_skb(skb);
   }
   return ret;
+}
+
+static ssize_t netlink_recvfrom(socket_t *sock, void *buf, size_t len,
+                                int flags, struct sockaddr *src_addr, int *addrlen) {
+  return netlink_recvfrom_full(sock, buf, len, flags, src_addr, addrlen, NULL);
 }
 
 static ssize_t netlink_recv(socket_t *sock, void *buf, size_t len, int flags) {
@@ -579,6 +557,44 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
   if (!nsk)
     return -22; // EINVAL
 
+  if (nsk->protocol == NETLINK_KOBJECT_UEVENT) {
+    if (!dest_addr || addrlen < (int)sizeof(struct sockaddr_nl)) return -89;
+    struct sockaddr_nl dest;
+    memcpy(&dest, dest_addr, sizeof(dest));
+    if (dest.nl_family != AF_NETLINK) return -22;
+    struct thread *current = sched_get_current();
+    // Group 1 is exclusively kernel events. Only root may publish processed
+    // udev events to group 2; listeners receive the actual sender credentials.
+    if ((dest.nl_groups & 1) || (dest.nl_groups && (!current || !capability_has(current, CAP_NET_ADMIN))))
+      return -1;
+    if (!len || len > 1024 * 1024) return -90;
+    void *payload = kmalloc(len);
+    if (!payload) return -12;
+    if (is_user_ptr((uint64_t)buf)) {
+      if (copy_from_user(payload, buf, len)) { kfree(payload); return -14; }
+    } else memcpy(payload, buf, len);
+    spinlock_acquire(&netlink_lock);
+    netlink_sock_t *receiver;
+    list_for_each_entry(receiver, &netlink_sockets, list) {
+      if (receiver->parent->net_ns != sock->net_ns || receiver->protocol != nsk->protocol || receiver == nsk) continue;
+      if (dest.nl_groups ? !(receiver->groups & dest.nl_groups) :
+                           receiver->portid != dest.nl_pid) continue;
+      sk_buff_t *skb = alloc_skb(len);
+      if (!skb) continue;
+      memcpy(skb->data, payload, len); skb->len = len;
+      skb->nl_portid = nsk->portid; skb->nl_groups = dest.nl_groups;
+      skb->nl_pid = current ? current->tgid : 0;
+      skb->nl_uid = current ? current->euid : 0;
+      skb->nl_gid = current ? current->egid : 0;
+      skb_queue_tail(&receiver->recv_queue, skb);
+      socket_wake(receiver->parent);
+      if (receiver->parent->node) epoll_notify_event(receiver->parent->node, EPOLLIN);
+    }
+    spinlock_release(&netlink_lock);
+    kfree(payload);
+    return len;
+  }
+
   /* Complete route dump requests with an empty multipart result.  This is a
    * valid netlink transaction and lets getifaddrs(3) return an empty list
    * until RTM_NEWLINK/RTM_NEWADDR records are implemented. */
@@ -595,16 +611,65 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
     }
 
     uint32_t reply_pid = nsk->portid ? (uint32_t)nsk->portid : request.nlmsg_pid;
-    struct net_device *dev = net_device_default();
-    const struct ipv4_config *cfg = ipv4_get_config();
-    const struct ipv6_config *cfg6 = ipv6_get_config();
+    struct net_device *dev = sock->net_ns ? NULL : net_device_default();
+    const struct ipv4_config *cfg = sock->net_ns ? NULL : ipv4_get_config();
+    const struct ipv6_config *cfg6 = sock->net_ns ? NULL : ipv6_get_config();
+    if (sock->net_ns && (request.nlmsg_type == RTM_NEWLINK || request.nlmsg_type == RTM_NEWADDR)) {
+      struct { struct nlmsghdr_min hdr; int32_t error; struct nlmsghdr_min request; } ack = {0};
+      ack.hdr.nlmsg_len = sizeof(ack); ack.hdr.nlmsg_type = 2;
+      ack.hdr.nlmsg_seq = request.nlmsg_seq; ack.hdr.nlmsg_pid = reply_pid; ack.request = request;
+      ack.error = -22;
+      uint8_t payload[256];
+      if (!capability_has(sched_get_current(), CAP_NET_ADMIN)) ack.error = -1;
+      else if (request.nlmsg_len <= len && request.nlmsg_len <= sizeof(payload) && request.nlmsg_len >= sizeof(request)) {
+        int fault = 0;
+        if (is_user_ptr((uint64_t)buf)) fault = copy_from_user(payload, buf, request.nlmsg_len);
+        else memcpy(payload, buf, request.nlmsg_len);
+        if (fault) ack.error = -14;
+        else if (request.nlmsg_type == RTM_NEWLINK && request.nlmsg_len >= sizeof(request) + sizeof(struct ifinfomsg_min)) {
+          struct ifinfomsg_min info; memcpy(&info, payload + sizeof(request), sizeof(info));
+          if (info.index != 1) ack.error = -19;
+          else if (info.change & ~IFF_UP) ack.error = -95;
+          else {
+            uint32_t flags = __atomic_load_n(&sock->net_ns->loopback_flags, __ATOMIC_ACQUIRE);
+            flags = (flags & ~(info.change & IFF_UP)) | (info.flags & info.change & IFF_UP) | IFF_LOOPBACK;
+            if (flags & IFF_UP) flags |= IFF_RUNNING;
+            else flags &= ~IFF_RUNNING;
+            __atomic_store_n(&sock->net_ns->loopback_flags, flags, __ATOMIC_RELEASE); ack.error = 0;
+          }
+        } else if (request.nlmsg_type == RTM_NEWADDR && request.nlmsg_len >= sizeof(request) + sizeof(struct ifaddrmsg_min)) {
+          struct ifaddrmsg_min info; memcpy(&info, payload + sizeof(request), sizeof(info));
+          if (info.index != 1) ack.error = -19;
+          else if (info.family == 2 && info.prefixlen == 8) {
+            uint32_t address = 0; bool invalid = false;
+            for (size_t off = sizeof(request) + sizeof(info); off + 4 <= request.nlmsg_len;) {
+              struct rtattr_min attr; memcpy(&attr, payload + off, sizeof(attr));
+              if (attr.len < 4 || off + attr.len > request.nlmsg_len) { invalid = true; break; }
+              if (attr.type == IFA_LOCAL || attr.type == IFA_ADDRESS) {
+                if (attr.len != 8 || memcmp(payload + off + 4, "\177\0\0\1", 4)) invalid = true;
+                else address = 0x7f000001;
+              }
+              off += NL_ALIGN(attr.len);
+            }
+            if (!invalid && address) {
+              if ((request.nlmsg_flags & 0x200) && sock->net_ns->loopback_address) ack.error = -17;
+              else { __atomic_store_n(&sock->net_ns->loopback_address, address, __ATOMIC_RELEASE); ack.error = 0; }
+            }
+          }
+        }
+      }
+      if (route_queue(nsk, &ack, sizeof(ack))) return -12;
+      socket_wake(sock); if (sock->node) epoll_notify_event(sock->node, EPOLLIN);
+      return len;
+    }
     int route_ret = 0;
     if (request.nlmsg_type == RTM_GETLINK) {
       route_ret = route_loopback_link(nsk, request.nlmsg_seq, reply_pid);
       if (route_ret == 0 && dev)
         route_ret = route_link(nsk, request.nlmsg_seq, reply_pid, dev);
     } else if (request.nlmsg_type == RTM_GETADDR) {
-      route_ret = route_loopback_addr(nsk, request.nlmsg_seq, reply_pid);
+      if (!sock->net_ns || sock->net_ns->loopback_address)
+        route_ret = route_loopback_addr(nsk, request.nlmsg_seq, reply_pid);
       if (route_ret == 0 && dev && cfg && cfg->address)
         route_ret = route_address(nsk, request.nlmsg_seq, reply_pid, dev->name,
                                   cfg->address, cfg->netmask);
@@ -654,14 +719,14 @@ static ssize_t netlink_recvmsg(socket_t *sock, struct msghdr *msg, int flags) {
 
   // For now, only support single iovec
   struct iovec *iov = &msg->msg_iov[0];
-  ssize_t ret = netlink_recvfrom(sock, iov->iov_base, iov->iov_len, flags,
+  struct netlink_sender sender = {0};
+  ssize_t ret = netlink_recvfrom_full(sock, iov->iov_base, iov->iov_len, flags,
                                  (struct sockaddr *)msg->msg_name,
-                                 (int *)&msg->msg_namelen);
+                                 (int *)&msg->msg_namelen, &sender);
 
   // Populate SCM_CREDENTIALS ancillary data when SO_PASSCRED is set.
-  // libudev validates ucred.pid == 0 (kernel sender) and silently drops
-  // messages that lack credentials, so this is required for Weston to
-  // consume the uevent payloads pushed at bind time.
+  // Kernel events have pid 0. Processed udev events carry the sending
+  // worker's credentials; libudev authenticates these before consuming them.
   if (ret > 0 && nsk && nsk->passcred && msg->msg_control &&
       msg->msg_controllen >= CMSG_SPACE(sizeof(struct ucred_nl))) {
     struct cmsghdr *cmsg = (struct cmsghdr *)msg->msg_control;
@@ -670,9 +735,9 @@ static ssize_t netlink_recvmsg(socket_t *sock, struct msghdr *msg, int flags) {
     cmsg->cmsg_type = SCM_CREDENTIALS;
 
     struct ucred_nl *cred = (struct ucred_nl *)CMSG_DATA(cmsg);
-    cred->pid = 0; // 0 = from kernel
-    cred->uid = 0;
-    cred->gid = 0;
+    cred->pid = sender.pid;
+    cred->uid = sender.uid;
+    cred->gid = sender.gid;
 
     msg->msg_controllen = CMSG_SPACE(sizeof(struct ucred_nl));
   } else {

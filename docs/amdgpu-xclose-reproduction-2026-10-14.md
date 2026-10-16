@@ -79,3 +79,20 @@ No further launch is authorized by this approval. No recovery command was added
 or tested. The existing earlier failure after VCN publication and the repeated
 host reboot remain separate unresolved observations; this sequence reproduced
 the immediate next-boot PSP-ring failure without pursuing repeated retries.
+
+## Status update, 2026-10-15
+
+The X-close is not the trigger of the next-boot initialization failures under
+the current defaults. The user verified on 2026-10-15 that closing through the
+GTK X button does not cause the next boot to fail initialization. This trial's
+reproduced failure is scoped to its configuration: MODE2 was explicitly
+disabled in both guests, so it captured the unrecovered retained state, not
+the default recovery-enabled path. The default path is covered by
+[combined recovery](amdgpu-combined-recovery-2026-10-14.md), whose X-close and
+Ctrl-C reopens passed with both automatic recovery steps enabled.
+
+Initialization failures are still observed in some sessions (2026-10-15
+streaks: 10:37-10:56, 11:09-11:10, 11:25, 11:34-11:35). The sessions before
+those streaks include both desktop memory-exhaustion aborts and clean exits;
+no trigger for the remaining failures is established. Do not attribute a
+retained-state failure to the X-close without checking the actual sequence.

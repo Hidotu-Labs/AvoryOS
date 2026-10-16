@@ -66,6 +66,11 @@ static void buddy_free_internal(struct buddy_zone *z,uint64_t phys,size_t order)
   setbit(pfn,false);frees[pfn-1]++;
  }
 }
+/* pmm_pcp.c slice needs these before their definitions. */
+void pmm_zero_pool_drain_all(void);
+size_t pmm_zero_pool_total_cached(void);
+static size_t pmm_get_hhdm_offset(void) { return 0; }
+static void page_zero(void *p) { memset(p,0,PAGE_SIZE); }
 static void pmm_pcp_drain_all(void);
 '''
 # Functions are nonstatic in the actual implementation.
@@ -73,6 +78,7 @@ prefix=prefix.replace('static void pmm_pcp_drain_all(void);','void pmm_pcp_drain
 tests = r'''
 static void *put(void *ptr) { pmm_decref(ptr); return NULL; }
 static void own(unsigned pfn,unsigned ref) { refs[pfn-1]=ref;setbit(pfn,true); }
+static void own_free(unsigned pfn,unsigned ref) { refs[pfn-1]=ref;setbit(pfn,false); }
 int main(void) {
  spinlock_init(&node.zone.lock);node.online=true;
  node.fallback_order[0]=0;node.fallback_order[1]=-1;
@@ -97,6 +103,17 @@ int main(void) {
  pmm_free_pages((void *)(72*PAGE_SIZE),4);
  assert(refs[71]==0 && refs[72]==0 && refs[73]==0 && refs[74]==1);
  assert(frees[71]==1 && frees[73]==1 && frees[74]==0);
+ // Refcount/bitmap disagreement (frame released through another path but a
+ // stale owner still holds a count): put_ref reaching zero must not link the
+ // frame into the buddy lists again. The model's buddy_free_internal rejects
+ // a bitmap-clear free, so the old unconditional free aborts here.
+ own(96,1);own_free(97,1);
+ pmm_free_pages((void *)(96*PAGE_SIZE),2);
+ assert(refs[95]==0 && frees[95]==1);
+ assert(refs[96]==0 && frees[96]==0);
+ own_free(98,1);
+ pmm_free_pages((void *)(98*PAGE_SIZE),1);
+ assert(refs[97]==0 && frees[97]==0);
  own(80,1);pmm_free_pages((void *)(80*PAGE_SIZE+1),4);assert(refs[79]==1);
  pmm_free_pages((void *)(255*PAGE_SIZE),4);assert(refs[79]==1);
  own(90,UINT16_MAX);pmm_decref((void *)(90*PAGE_SIZE));

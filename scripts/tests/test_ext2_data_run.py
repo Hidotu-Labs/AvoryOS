@@ -24,6 +24,7 @@ static void spinlock_acquire(void *p){(void)p;assert(!locked);locked=1;}
 static void spinlock_release(void *p){(void)p;assert(locked);locked=0;}
 static bool oom;
 static void *kmalloc(size_t n){return oom?NULL:malloc(n);}
+static void kfree(void *p){free(p);}
 struct block_device {int (*write_sectors)(struct block_device *,uint64_t,uint32_t,const void *);};
 typedef struct {unsigned block_size;struct {unsigned s_blocks_count;} sb;struct block_device *dev;unsigned cache_lock;struct {unsigned num,writes_inflight;uint64_t write_seq;unsigned char *data;} cache[EXT2_CACHE_SIZE];} ext2_mount_t;
 static ext2_mount_t mount;
@@ -35,7 +36,7 @@ static int write_run(struct block_device *dev,uint64_t lba,uint32_t count,const 
  for(unsigned i=0;i<blocks;i++){unsigned idx=(first_block+i)%EXT2_CACHE_SIZE;assert(mount.cache[idx].writes_inflight==1);if(!oom){assert(mount.cache[idx].num==first_block+i);assert(!memcmp(mount.cache[idx].data,(const unsigned char *)buf+i*mount.block_size,mount.block_size));}}
  if(failed)return -1;memcpy(image,buf,(size_t)blocks*mount.block_size);return 0;
 }
-'''+header[a:b]+extract('kernel/src/fs/ext2/ext2_block.c','int ext2_write_blocks(')+r'''
+'''+header[a:b]+extract('kernel/src/fs/ext2/ext2_block.c','static void ext2_cache_prepare(')+extract('kernel/src/fs/ext2/ext2_block.c','int ext2_write_blocks(')+r'''
 static struct storage_latency latency;
 static void *samples(void *arg){(void)arg;for(unsigned i=0;i<10000;i++)storage_latency_record(&latency,8,i%2);return NULL;}
 int main(void){

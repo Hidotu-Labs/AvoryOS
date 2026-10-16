@@ -25,6 +25,8 @@
  * a PMM reference to page-cache frames that teardown must drop.  System V shm
  * and driver mmaps (DRM, fb, tmpfs) own their frames and must not set it. */
 #define MAP_PAGECACHE 0x400000000ULL
+#define MAP_DENY_SHARED_WRITE 0x800000000ULL
+#define MAP_DENY_EXEC 0x1000000000ULL
 
 // VMA structure - internally represents an AVL Interval Tree Node
 struct vma {

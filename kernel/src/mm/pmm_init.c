@@ -156,6 +156,7 @@ void pmm_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
 
         struct buddy_block *block = virt_to_buddy(phys);
         block->order = order;
+        block->magic = n->zone.magic;
         list_add_tail(&block->node, &n->zone.free_list[order]);
 
         n->usable_memory += (1ULL << order) * PAGE_SIZE;

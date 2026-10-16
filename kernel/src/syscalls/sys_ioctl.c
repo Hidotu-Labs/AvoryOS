@@ -51,10 +51,15 @@ static const char *ioctl_request_name(uint32_t request) {
   case 0x82307202: return "VFAT_IOCTL_READDIR_SHORT";
   case 0x0301: return "HDIO_GETGEO";
   case 0x540B: return "TCFLSH";
+  case 0x8004F50C: return "F2FS_IOC_GET_FEATURES";
   case 0x80086601: return "FS_IOC_GETFLAGS";
   case 0x40086602: return "FS_IOC_SETFLAGS";
   case 0x5414: return "TIOCSWINSZ";
   case 0x541B: return "FIONREAD/TIOCINQ";
+  case 0xC058FF0B: return "PIDFD_GET_INFO";
+  case 0x80280215: return "FDGETFDCSTAT";
+  case 0x5331: return "CDROM_GET_CAPABILITY";
+  case 0x5395: return "CDROM_LAST_WRITTEN";
   case 0x541D: return "TIOCCONS";
   case 0x5456: return "TIOCGLCKTRMIOS";
   case 0x5457: return "TIOCSLCKTRMIOS";
@@ -68,6 +73,10 @@ static const char *ioctl_request_name(uint32_t request) {
   case 0x8912: return "SIOCGIFCONF";
   case 0x8915: return "SIOCGIFADDR";
   case 0x8933: return "SIOCGIFINDEX";
+  case 0x8B07: return "SIOCGIWMODE";
+  case 0x80045430: return "TIOCGPTN";
+  case 0x40045431: return "TIOCSPTLCK";
+  case 0x80045432: return "TIOCGPTLCK";
   case 0xC0186449: return "DRM_IOCTL_VIRTGPU_GET_CAPS";
   case 0xC0106443: return "DRM_IOCTL_VIRTGPU_GETPARAM";
   case 0xC01064C7: return "DRM_IOCTL_MODE_LIST_LESSEES";
@@ -128,6 +137,24 @@ static void ioctl_log_unhandled(struct thread *thread, uint64_t fd,
       (node->flags & FS_TYPE_MASK) == FS_CHARDEV &&
       (strcmp(node->name, "event0") == 0 ||
        strcmp(node->name, "event1") == 0))
+    return;
+
+  /* SQLite probes F2FS atomic-write support on ordinary database files.
+   * ENOTTY is the correct answer on our non-F2FS filesystems. */
+  if (request == 0x8004F50C && node &&
+      (node->flags & FS_TYPE_MASK) == FS_FILE)
+    return;
+
+  /* TIOCGPTN on a non-PTY descriptor (Electron stdio/log isatty probe).
+   * Only PTY masters implement it; ENOTTY elsewhere is correct Linux
+   * behavior, not an unhandled ioctl. */
+  if (request == 0x80045430)
+    return;
+
+  /* Wireless-extension probes (kdeconnectd checks SIOCGIWMODE on its
+   * sockets). This machine has no wireless hardware, so failure is the
+   * expected answer, not an unhandled ioctl. */
+  if ((request & 0xFF00) == 0x8B00)
     return;
 
   uint64_t calls = 0;

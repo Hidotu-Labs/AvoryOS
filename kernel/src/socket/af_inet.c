@@ -205,7 +205,7 @@ static int inet_accept(socket_t *sock, socket_t **out) {
     bool nb = socket_is_nonblocking(sock);
     struct tcp_tcb *child = tcp_accept(isk->tcp, nb);
     if (!child) return nb ? -11 : -4;
-    socket_t *ns = socket_create(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    socket_t *ns = socket_create_in_namespace(AF_INET, SOCK_STREAM, IPPROTO_TCP, sock->net_ns);
     if (!ns) { tcp_abort(child); return -12; }
     inet_sock_t *nisk = ns->sk;
     if (nisk->tcp) tcp_free(nisk->tcp);

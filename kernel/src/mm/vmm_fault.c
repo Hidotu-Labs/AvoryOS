@@ -1,4 +1,5 @@
 
+#include "../apic/lapic_timer.h"
 #include "../arch/x86_64/extable.h"
 #include "../console/klog.h"
 #include "../cpu/kpf_dump.h"
@@ -138,6 +139,58 @@ static inline void *vmm_alloc_huge_page_numa(int vma_numa_policy, uint64_t vma_n
   return phys;
 }
 
+/* ---- Demand-fault low watermark ------------------------------------------
+ *
+ * Reclaim used to start only after a fault allocation had already failed,
+ * so a burst could drive the buddy allocator to exactly zero and the fault
+ * that arrived with nothing free killed a process even though megabytes of
+ * clean cache were still droppable (2026-10-16 capture: two [VMM] OOM
+ * demand-page kills with free_pages=0 and free_pages=40).  When free pages
+ * dip below this watermark the next user fault drops clean cache first, so
+ * the allocator keeps a small reclaimable headroom while a Firefox/KDE
+ * burst runs instead of first hitting zero.
+ *
+ * Rate-limited: pmm_get_free_pages() walks the free lists, and one reclaim
+ * pass every 250 ms is plenty to track a demand-fault burst.  Parked PCP
+ * and zero-pool frames are returned unconditionally - cache reclaim cannot
+ * see them, and merging them restores the high-order blocks that a TTM or
+ * huge-page allocation needs. */
+#define VMM_FAULT_WATERMARK_PAGES 2048u /* 8 MB */
+#define VMM_FAULT_RECLAIM_INTERVAL_MS 250u
+#define VMM_FAULT_RECLAIM_MAX_PAGES 4096u
+
+/* Escalated-pressure hooks.  The generic heap and the LinuxKPI shrinker
+ * registry are linked into this image; weak declarations keep the mm layer
+ * independently linkable (same pattern as heap_slab.c's file-cache hook). */
+extern void heap_oom_reclaim(void) __attribute__((weak));
+extern unsigned long linuxkpi_shrink_reclaim(unsigned int gfp,
+                                             unsigned long needed)
+    __attribute__((weak));
+
+static volatile uint64_t vmm_fault_reclaim_next_ms;
+
+static void vmm_fault_watermark_reclaim(void) {
+  uint64_t now = lapic_timer_get_ms();
+  uint64_t next = __atomic_load_n(&vmm_fault_reclaim_next_ms, __ATOMIC_RELAXED);
+
+  if (now < next)
+    return;
+  if (!__atomic_compare_exchange_n(&vmm_fault_reclaim_next_ms, &next,
+                                   now + VMM_FAULT_RECLAIM_INTERVAL_MS, false,
+                                   __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+    return;
+
+  size_t free_pages = pmm_get_free_pages();
+  if (free_pages >= VMM_FAULT_WATERMARK_PAGES)
+    return;
+
+  size_t target = VMM_FAULT_WATERMARK_PAGES - free_pages;
+  if (target > VMM_FAULT_RECLAIM_MAX_PAGES)
+    target = VMM_FAULT_RECLAIM_MAX_PAGES;
+  pmm_pcp_drain_all();
+  mm_file_cache_reclaim(target);
+}
+
 /* Map already-cached neighbours of a freshly faulted private file page in one
  * pass, the way the shared/read-only path clusters its 128 KB window.  Every
  * page is installed read-only with the CoW bit, so the first write still
@@ -246,6 +299,11 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     __asm__ volatile("mov %%cr3, %0" : "=r"(target_cr3));
     target_cr3 &= 0xFFFFFFFFFFFFF000ULL;
   }
+
+  /* User demand paging keeps its own headroom: drop clean cache before the
+   * allocator reaches zero (see vmm_fault_watermark_reclaim()). */
+  if (user_mode)
+    vmm_fault_watermark_reclaim();
 
   if (present_bit && write_fault) {
     uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(target_cr3);
@@ -931,7 +989,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     //   4. PMM can hand us a 2 MB-aligned physical block (order-9 buddy)
     //
     // If any condition fails we fall through to the ordinary 4 KB path.
-    if (vma_flags & MAP_HUGEPAGE) {
+    if ((vma_flags & MAP_HUGEPAGE) && (vma_flags & MAP_ANONYMOUS)) {
 #define HUGE_PAGE_SIZE (2ULL * 1024 * 1024)
       uint64_t hp_base = cr2 & ~(HUGE_PAGE_SIZE - 1ULL); // 2 MB-align down
       if (hp_base >= vma_start && hp_base + HUGE_PAGE_SIZE <= vma_end) {
@@ -940,15 +998,29 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
           // Zero the entire 2 MB frame.
           page_zero_huge((void *)((uint64_t)huge_phys + pmm_get_hhdm_offset()));
 
-          uint64_t hp_flags = dp_build_flags(vma_prot);
-          if (vmm_map_huge_page((uint64_t *)target_cr3, hp_base,
-                                (uint64_t)huge_phys, hp_flags)) {
+          /* Allocation/zeroing ran without mm->lock. Revalidate before
+           * publishing, just like the ordinary 4 KB fault path: a peer may
+           * have replaced this range with a file or driver mapping. */
+          spinlock_acquire(&current->mm->lock);
+          struct vma *w = vma_find(&current->mm->vmas, cr2);
+          bool valid = w && (w->flags & MAP_ANONYMOUS) &&
+                       (w->flags & MAP_HUGEPAGE) && !w->file_node &&
+                       !w->linux_vma && w->prot == vma_prot &&
+                       w->flags == vma_flags && hp_base >= w->start &&
+                       hp_base + HUGE_PAGE_SIZE <= w->end;
+          bool installed = valid &&
+              vmm_map_huge_page((uint64_t *)target_cr3, hp_base,
+                                (uint64_t)huge_phys, dp_build_flags(w->prot));
+          spinlock_release(&current->mm->lock);
+          if (installed) {
             // Success — the whole 2 MB region is now mapped.
             return 0;
           }
           // Map failed (e.g. OOM for intermediate page table) — free and
           // fall through to the 4 KB path below.
           pmm_free_pages(huge_phys, 512);
+          if (!valid)
+            return 0; // Retry against the replacement VMA.
         }
         // PMM OOM for 2 MB block — fall through to 4 KB allocation.
       }
@@ -970,10 +1042,10 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     // the same VMA. Zero pages consume no frames, so over-mapping is free —
     // and every eliminated fault saves the whole fixed cost.
 #define FAULT_AROUND_PAGES 16
-    if (!write_fault && (vma_flags & MAP_PRIVATE)) {
+    if (!write_fault && (vma_flags & MAP_PRIVATE) &&
+        (vma_flags & MAP_ANONYMOUS)) {
       uint64_t zp = pmm_get_zero_page_phys();
       if (zp) {
-        uint64_t flags = (dp_build_flags(vma_prot) & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
         uint64_t fault_page = cr2 & ~0xFFFULL;
         /* One lock hold per 16 pages, not one per page: the per-page
          * vmm_lock round-trip (CLI/STI + MFENCE + drain attempt) was
@@ -983,7 +1055,11 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
          * munmap/mprotect cannot leave zero pages outside the VMA. */
         spinlock_acquire(&current->mm->lock);
         struct vma *w = vma_find(&current->mm->vmas, fault_page);
-        if (w && (w->flags & MAP_PRIVATE)) {
+        if (w && (w->flags & MAP_PRIVATE) &&
+            (w->flags & MAP_ANONYMOUS) && !w->file_node && !w->linux_vma &&
+            w->prot == vma_prot && w->flags == vma_flags) {
+          uint64_t flags =
+              (dp_build_flags(w->prot) & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
           uint64_t win_end = fault_page + (uint64_t)FAULT_AROUND_PAGES * PAGE_SIZE;
           if (win_end < fault_page || win_end > w->end)
             win_end = w->end;
@@ -1001,12 +1077,9 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
           return 0;
         }
         spinlock_release(&current->mm->lock);
-        if (vmm_map_page_if_unmapped((uint64_t *)target_cr3, fault_page, zp, flags)) {
-          return 0; // Zero page mapped! No physical allocation or zeroing needed.
-        }
-        if (vmm_virt_to_phys((uint64_t *)target_cr3, fault_page) != 0) {
-          return 0; // Concurrently mapped by another thread
-        }
+        /* Never fall back to an unlocked install using the old VMA's
+         * permissions. Retry the instruction against its current mapping. */
+        return 0;
       }
     }
 #undef FAULT_AROUND_PAGES
@@ -1024,12 +1097,33 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 
     if (!frame) {
       // Reclaim before giving up: deferred frees may be parked on the drain
-      // queue and clean file-cache pages are droppable. The zero pool is
-      // drained too — its frames are the cheapest reclaimable pages. Failing
-      // here kills a userspace thread, so one bounded recovery pass is worth it.
+      // queue and clean file-cache pages are droppable. pmm_pcp_drain_all()
+      // returns the zero pool plus every CPU's parked frames to the buddy
+      // lists — a fault allocation can otherwise fail while those frames
+      // still count as free. Failing here kills a userspace thread, so one
+      // bounded recovery pass is worth it.
       vmm_drain_deferred_work();
-      pmm_zero_pool_drain_all();
+      pmm_pcp_drain_all();
       mm_file_cache_reclaim(64);
+      frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
+    }
+
+    if (!frame) {
+      /* Escalated pass: the first pass only returns parked frames and the
+       * current mm's file cache. Under desktop pressure the bulk of the
+       * reclaimable memory sits elsewhere (TTM/driver pools, empty kernel
+       * slabs, files no longer mapped in this mm), so ask every subsystem
+       * that can hand pages back before declaring OOM. IRQs are opened
+       * around the reclaim: none of it runs from a nested hard-IRQ fault,
+       * and shrinkers may wait on locks held by interrupt handlers. */
+      bool irq_state = pf_enable_irqs_for_wait();
+      if (heap_oom_reclaim)
+        heap_oom_reclaim();
+      if (linuxkpi_shrink_reclaim)
+        linuxkpi_shrink_reclaim(0, 512);
+      mm_file_cache_reclaim(2048);
+      pmm_pcp_drain_all();
+      pf_restore_irqs_after_wait(irq_state);
       frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
     }
 
@@ -1056,6 +1150,14 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
             (current && current->comm[0]) ? current->comm : "?",
             user_mode ? "user" : "kernel");
       if (user_mode) {
+        /* Kill the whole process, not just the faulting thread. A lone dead
+         * thread leaves every lock it held and every sibling in an
+         * undefined state (2026-10-16: a dead KDE TaskController thread and
+         * a Firefox content process kept running around the corpse), and
+         * the address space's memory is not released until a thread that
+         * does not exist finishes exiting. This matches the fatal-signal
+         * default action and Linux's fault-path OOM handling. */
+        sched_terminate_thread_group(current);
         sched_terminate_thread(current->tid);
         return 0;
       }

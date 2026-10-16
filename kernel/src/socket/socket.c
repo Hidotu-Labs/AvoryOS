@@ -1,3 +1,5 @@
+#include "../sched/net_namespace.h"
+#include "../sched/capability.h"
 // Socket Subsystem Core Implementation
 
 // socket creation and FD management
@@ -194,6 +196,7 @@ sk_buff_t *alloc_skb(size_t size) {
   if (!skb)
     return NULL;
 
+  memset(skb, 0, sizeof(*skb));
   skb->data = kmalloc(size);
   if (!skb->data) {
     kfree(skb);
@@ -300,6 +303,11 @@ void socket_wake(socket_t *sock) {
 // Socket Creation/Destruction
 
 socket_t *socket_create(int domain, int type, int protocol) {
+  struct thread *owner = sched_get_current();
+  return socket_create_in_namespace(domain, type, protocol, owner ? owner->net_ns : NULL);
+}
+socket_t *socket_create_in_namespace(int domain, int type, int protocol, struct net_namespace *net_ns) {
+  if (net_ns && domain == AF_QIPCRTR) return NULL;
   // Validate domain
   if (domain != AF_UNIX && domain != AF_INET && domain != AF_INET6 &&
       domain != AF_NETLINK && domain != AF_QIPCRTR) {
@@ -328,6 +336,7 @@ socket_t *socket_create(int domain, int type, int protocol) {
 
   // Initialize socket
   memset(sock, 0, sizeof(socket_t));
+  sock->net_ns = net_namespace_get(net_ns);
   sock->domain = domain;
   sock->type = type & ~SOCK_NONBLOCK & ~SOCK_CLOEXEC; // Strip flags
   sock->protocol = protocol;
@@ -351,6 +360,7 @@ socket_t *socket_create(int domain, int type, int protocol) {
   // Allocate socket table slot
   int idx = socket_table_alloc();
   if (idx < 0) {
+    net_namespace_put(sock->net_ns);
     kfree(sock);
     klog_puts("[ERR] socket: socket table full\n");
     return NULL;
@@ -364,11 +374,16 @@ socket_t *socket_create(int domain, int type, int protocol) {
 
   // Create family-specific socket
   net_family_t *family = sock_lookup_family(domain);
-  if (family && family->create) {
+  if (sock->net_ns && (domain == AF_INET || domain == AF_INET6)) {
+    /* No physical devices or routes exist in this namespace. Transport
+     * endpoints must never be inserted into the initial namespace stack. */
+    sock->ops = NULL;
+  } else if (family && family->create) {
     int ret = family->create(sock, protocol);
     if (ret < 0) {
       socket_table_free(idx);
       sock->wait_queue = NULL; // embedded storage, nothing to free
+      net_namespace_put(sock->net_ns);
       kfree(sock);
       return NULL;
     }
@@ -430,6 +445,7 @@ void socket_destroy(socket_t *sock) {
     }
   }
 
+  net_namespace_put(sock->net_ns);
   kfree(sock);
 }
 
@@ -468,6 +484,8 @@ int socket_bind(socket_t *sock, struct sockaddr *addr, int addrlen) {
   if (!sock || !addr)
     return -22; // EINVAL
 
+  if (sock->net_ns && (sock->domain == AF_INET || sock->domain == AF_INET6)) return -101;
+
   if (!sock->ops || !sock->ops->bind)
     return -95; // EOPNOTSUPP
 
@@ -477,6 +495,8 @@ int socket_bind(socket_t *sock, struct sockaddr *addr, int addrlen) {
 int socket_connect(socket_t *sock, struct sockaddr *addr, int addrlen) {
   if (!sock || !addr)
     return -22; // EINVAL
+
+  if (sock->net_ns && (sock->domain == AF_INET || sock->domain == AF_INET6)) return -101;
 
   if (!sock->ops || !sock->ops->connect)
     return -95; // EOPNOTSUPP
@@ -488,6 +508,8 @@ int socket_listen(socket_t *sock, int backlog) {
   if (!sock)
     return -22; // EINVAL
 
+  if (sock->net_ns && (sock->domain == AF_INET || sock->domain == AF_INET6)) return -101;
+
   if (!sock->ops || !sock->ops->listen)
     return -95; // EOPNOTSUPP
 
@@ -498,6 +520,8 @@ int socket_accept(socket_t *sock, socket_t **newsock) {
   if (!sock || !newsock)
     return -22; // EINVAL
 
+  if (sock->net_ns && (sock->domain == AF_INET || sock->domain == AF_INET6)) return -101;
+
   if (!sock->ops || !sock->ops->accept)
     return -95; // EOPNOTSUPP
 
@@ -507,6 +531,8 @@ int socket_accept(socket_t *sock, socket_t **newsock) {
 ssize_t socket_send(socket_t *sock, const void *buf, size_t len, int flags) {
   if (!sock || !buf)
     return -22; // EINVAL
+
+  if (sock->net_ns && (sock->domain == AF_INET || sock->domain == AF_INET6)) return -101;
 
   if (!sock->ops || !sock->ops->send)
     return -95; // EOPNOTSUPP
@@ -520,6 +546,8 @@ ssize_t socket_recv(socket_t *sock, void *buf, size_t len, int flags) {
 
   if (!sock || !buf)
     return -22; // EINVAL
+
+  if (sock->net_ns && (sock->domain == AF_INET || sock->domain == AF_INET6)) return -101;
 
   if (!sock->ops || !sock->ops->recv)
     return -95; // EOPNOTSUPP
@@ -535,6 +563,8 @@ ssize_t socket_sendto(socket_t *sock, const void *buf, size_t len, int flags,
   if (!sock || !buf)
     return -22;
 
+  if (sock->net_ns && (sock->domain == AF_INET || sock->domain == AF_INET6)) return -101;
+
   if (!sock->ops || !sock->ops->sendto)
     return -95;
 
@@ -548,6 +578,8 @@ ssize_t socket_recvfrom(socket_t *sock, void *buf, size_t len, int flags,
 
   if (!sock || !buf)
     return -22;
+
+  if (sock->net_ns && (sock->domain == AF_INET || sock->domain == AF_INET6)) return -101;
 
   if (!sock->ops || !sock->ops->recvfrom)
     return -95;
@@ -882,6 +914,47 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   if (sock->closing) {
     socket_put(sock);
     return -9;
+  }
+
+  if (sock->net_ns && (request >= 0x8910 && request <= 0x89ff)) {
+    int ret = -19;
+    if (request == 0x8912) {
+      struct avory_ifconf64 conf;
+      if (copy_from_user(&conf, (void *)arg, sizeof(conf))) ret = -14;
+      else {
+        if (conf.length < 0) ret = -22;
+        else {
+          bool configured = sock->net_ns->loopback_address != 0;
+          struct avory_ifreq64 loop = {0}; memcpy(loop.name, "lo", 3);
+          loop.family = 2; loop.address_data[2] = 127; loop.address_data[5] = 1;
+          if (!conf.buffer) conf.length = configured ? sizeof(loop) : 0;
+          else if (configured && conf.length >= (int)sizeof(loop)) {
+            ret = copy_to_user((void *)conf.buffer, &loop, sizeof(loop)) ? -14 : 0;
+            conf.length = ret ? 0 : sizeof(loop);
+          } else conf.length = 0;
+          if (ret != -14) ret = copy_to_user((void *)arg, &conf, sizeof(conf)) ? -14 : 0;
+        }
+      }
+    } else {
+      struct avory_ifreq64 req;
+      if (copy_from_user(&req, (void *)arg, sizeof(req))) ret = -14;
+      else if ((request == 0x8910 && req.family == 1 && req.address_data[0] == 0 && req.address_data[1] == 0) ||
+               socket_ifreq_name_is(req.name, "lo")) {
+        ret = 0;
+        if (request == 0x8910) { memset(req.name, 0, 16); memcpy(req.name, "lo", 3); }
+        else if (request == 0x8933) { uint32_t index = 1; memcpy(&req.family, &index, 4); }
+        else if (request == 0x8913) req.family = sock->net_ns->loopback_flags;
+        else if (request == 0x8914) {
+          if (!capability_has(sched_get_current(), CAP_NET_ADMIN)) ret = -1;
+          else __atomic_store_n(&sock->net_ns->loopback_flags, (uint32_t)(req.family & 1) | 8, __ATOMIC_RELEASE);
+        } else if (request == 0x8915 && sock->net_ns->loopback_address) {
+          memset(&req.family, 0, sizeof(req) - 16); req.family = 2;
+          req.address_data[2] = 127; req.address_data[5] = 1;
+        } else ret = request == 0x8915 ? -99 : -25;
+        if (!ret && copy_to_user((void *)arg, &req, sizeof(req))) ret = -14;
+      }
+    }
+    socket_put(sock); return ret;
   }
 
   /* SIOCGIFCONF is a socket ioctl used by libc and clients to enumerate

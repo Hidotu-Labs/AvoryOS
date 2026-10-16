@@ -94,7 +94,7 @@ vfs_prefix = r'''
 #define FS_PAGE_CACHE 8
 #define FS_DENTRY_NOCACHE 16
 struct thread{unsigned euid;};
-typedef struct vfs_node{unsigned flags,mask;char name[16];uint32_t (*write)(struct vfs_node*,uint32_t,uint32_t,uint8_t*);}vfs_node_t;
+typedef struct vfs_node{unsigned flags,mask;bool mmap_shared_only;char name[16];uint32_t (*write)(struct vfs_node*,uint32_t,uint32_t,uint8_t*);}vfs_node_t;
 static struct thread current;
 static unsigned updates;
 static uint32_t answer;

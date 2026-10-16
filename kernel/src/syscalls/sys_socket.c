@@ -1,3 +1,4 @@
+#include "../sched/capability.h"
 // Socket Syscalls: socket, socketpair, bind, connect, listen, accept, etc.
 
 #include "../console/klog.h"
@@ -85,6 +86,11 @@ static uint64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol,
   int dom = (int)domain;
   int typ = (int)type;
   int proto = (int)protocol;
+  if (sched_get_current() && sched_get_current()->net_ns && dom == AF_QIPCRTR)
+    return (uint64_t)-EAFNOSUPPORT;
+  if ((dom == AF_INET || dom == AF_INET6) &&
+      ((typ & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) == SOCK_RAW) &&
+      !capability_has(sched_get_current(), CAP_NET_RAW)) return (uint64_t)-1;
 
   /* There is no audit subsystem yet. Linux-PAM treats EPROTONOSUPPORT
    * from audit_open() as auditing unavailable and preserves the PAM result.
@@ -136,6 +142,11 @@ static uint64_t sys_socketpair(uint64_t domain, uint64_t type,
   int dom = (int)domain;
   int typ = (int)type;
   int proto = (int)protocol;
+  if (sched_get_current() && sched_get_current()->net_ns && dom == AF_QIPCRTR)
+    return (uint64_t)-EAFNOSUPPORT;
+  if ((dom == AF_INET || dom == AF_INET6) &&
+      ((typ & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) == SOCK_RAW) &&
+      !capability_has(sched_get_current(), CAP_NET_RAW)) return (uint64_t)-1;
 
   // Validate sv pointer
   if (!is_user_ptr(sv_ptr) || (sv_ptr & 3)) {

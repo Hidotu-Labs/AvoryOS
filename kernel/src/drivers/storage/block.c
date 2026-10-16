@@ -118,6 +118,78 @@ static int partition_flush(struct block_device *dev) {
   return block_flush(wrap->parent);
 }
 
+/* Pipelined partition forwarding.  Each valid member's LBA moves by the
+ * partition start and then the run goes through the parent's batch op (or its
+ * single-request fallback).  Invalid members fail on their own and split the
+ * forwarded runs, so the parent never sees a request outside the partition. */
+static bool partition_batch_member_valid(const struct block_device *dev,
+                                         const struct block_io_req *req) {
+  return req->buf && req->count != 0 && req->lba < dev->total_sectors &&
+         (uint64_t)req->count <= dev->total_sectors - req->lba;
+}
+
+static int partition_read_batch(struct block_device *dev,
+                                struct block_io_req *reqs, unsigned n) {
+  struct partition_wrapper *wrap = (struct partition_wrapper *)dev->driver_data;
+  if (!wrap || !wrap->parent || !wrap->parent->read_sectors || !reqs || n == 0)
+    return -1;
+  int worst = 0;
+  unsigned i = 0;
+  while (i < n) {
+    if (!partition_batch_member_valid(dev, &reqs[i])) {
+      reqs[i].result = -1;
+      if (worst > -1)
+        worst = -1;
+      i++;
+      continue;
+    }
+    unsigned j = i;
+    while (j < n && partition_batch_member_valid(dev, &reqs[j])) {
+      reqs[j].lba += wrap->start_lba;
+      j++;
+    }
+    int rc = block_read_batch(wrap->parent, &reqs[i], j - i);
+    for (unsigned k = i; k < j; k++)
+      if (reqs[k].result == 0)
+        block_stat_read(dev, reqs[k].count);
+    if (rc < worst)
+      worst = rc;
+    i = j;
+  }
+  return worst;
+}
+
+static int partition_write_batch(struct block_device *dev,
+                                 struct block_io_req *reqs, unsigned n) {
+  struct partition_wrapper *wrap = (struct partition_wrapper *)dev->driver_data;
+  if (!wrap || !wrap->parent || !wrap->parent->write_sectors || !reqs || n == 0)
+    return -1;
+  int worst = 0;
+  unsigned i = 0;
+  while (i < n) {
+    if (!partition_batch_member_valid(dev, &reqs[i])) {
+      reqs[i].result = -1;
+      if (worst > -1)
+        worst = -1;
+      i++;
+      continue;
+    }
+    unsigned j = i;
+    while (j < n && partition_batch_member_valid(dev, &reqs[j])) {
+      reqs[j].lba += wrap->start_lba;
+      j++;
+    }
+    int rc = block_write_batch(wrap->parent, &reqs[i], j - i);
+    for (unsigned k = i; k < j; k++)
+      if (reqs[k].result == 0)
+        block_stat_write(dev, reqs[k].count);
+    if (rc < worst)
+      worst = rc;
+    i = j;
+  }
+  return worst;
+}
+
 /* NVMe namespace names ("nvme0n1") take a "p" before the partition index so
  * nvme0n1p2 cannot be confused with namespace 12; other disks keep the
  * historical "sda1" spelling. */
@@ -180,6 +252,10 @@ int block_add_partition_ex(struct block_device *parent, int part_index,
     pdev->write_sectors_fua = partition_write_fua;
   if (parent->flush)
     pdev->flush = partition_flush;
+  if (parent->read_sectors)
+    pdev->read_batch = partition_read_batch;
+  if (parent->write_sectors)
+    pdev->write_batch = partition_write_batch;
   pdev->driver_data = wrap;
 
   if (meta) {
@@ -504,6 +580,44 @@ int block_write_fua(struct block_device *dev, uint64_t lba, uint32_t count,
   if (!dev->write_sectors || dev->write_sectors(dev, lba, count, buf) != 0)
     return -1;
   return block_flush(dev);
+}
+
+/* Most severe member result: 0 when every member succeeded, -1 on any member
+ * error, -2 when a transport failure left no verdict for some member. */
+static int block_batch_result(const struct block_io_req *reqs, unsigned n) {
+  int worst = 0;
+  for (unsigned i = 0; i < n; i++)
+    if (reqs[i].result < worst)
+      worst = reqs[i].result;
+  return worst;
+}
+
+int block_read_batch(struct block_device *dev, struct block_io_req *reqs,
+                     unsigned n) {
+  if (!dev || !reqs || n == 0)
+    return -1;
+  if (dev->read_batch)
+    return dev->read_batch(dev, reqs, n);
+  for (unsigned i = 0; i < n; i++)
+    reqs[i].result = dev->read_sectors
+                         ? dev->read_sectors(dev, reqs[i].lba, reqs[i].count,
+                                             reqs[i].buf)
+                         : -1;
+  return block_batch_result(reqs, n);
+}
+
+int block_write_batch(struct block_device *dev, struct block_io_req *reqs,
+                      unsigned n) {
+  if (!dev || !reqs || n == 0)
+    return -1;
+  if (dev->write_batch)
+    return dev->write_batch(dev, reqs, n);
+  for (unsigned i = 0; i < n; i++)
+    reqs[i].result = dev->write_sectors
+                         ? dev->write_sectors(dev, reqs[i].lba, reqs[i].count,
+                                              reqs[i].buf)
+                         : -1;
+  return block_batch_result(reqs, n);
 }
 
 void block_repopulate_devices(void) {

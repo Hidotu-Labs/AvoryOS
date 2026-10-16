@@ -262,6 +262,15 @@ availability before changing policies. High-order TTM allocations deliberately
 use NORETRY and fall back to smaller orders; those fallbacks must not be
 mistaken for independent allocation leaks.
 
+Follow-up, 2026-10-15: the allocation-failure and reclaim gaps behind this
+crash class are addressed in
+[memory pressure cleanup](memory-pressure-cleanup.md) (LinuxKPI failure
+relief with parked-frame drains and bounded file-cache reclaim, plus
+free-list tags for the reboot-time dropped frees). The high-order TTM
+fallbacks were confirmed to carry `__GFP_NORETRY|__GFP_RETRY_MAYFAIL` and
+now get a cheap parked-frame drain before their order fallback continues. A
+repeat of the real workload at 4 GiB is the acceptance test.
+
 ## Pixels persist after the lifetime fixes
 
 The user reports the pixel artifacts still occur on the updated kernel. The

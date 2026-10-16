@@ -298,6 +298,9 @@ install_apk "jansson" "main"
 install_apk "vlc-libs" "community"
 install_apk "vlc" "community"
 install_apk "vlc-qt" "community"
+# Arch splits the FFmpeg decoder out of VLC's base package. FFmpeg libraries
+# alone do not provide VLC's H.264/HEVC decoder plugin.
+install_apk "vlc-plugin-ffmpeg" "community"
 install_apk "ffmpeg-libs" "community"
 install_apk "ffmpeg4-libavcodec" "community"
 install_apk "ffmpeg4-libavformat" "community"
@@ -772,6 +775,8 @@ install_apk "qqc2-breeze-style" "community"
 install_apk "kirigami-libs" "community"
 install_apk "kirigami" "community"
 install_apk "kirigami-addons" "community"
+# systemd supplies udevd/udevadm; it does not replace BusyBox PID 1.
+install_apk "systemd" "community"
 install_apk "pipewire" "community"
 install_apk "kpipewire" "community"
 install_apk "pipewire-libs" "community"
@@ -801,6 +806,7 @@ wireplumber.profiles = {
   }
 }
 EOF
+install -m 0644 "${ROOT_DIR}/config/wireplumber/20-avoryos-hda.conf" "${ROOTFS_DIR}/etc/wireplumber/wireplumber.conf.d/20-avoryos-hda.conf"
 install_apk "pulseaudio-utils" "community"
 install_apk "pulseaudio-qt" "community"
 install_apk "avahi-libs" "main"
@@ -855,6 +861,13 @@ install_apk "plasma-disks" "community"
 install_apk "plasma-firewall" "community"
 install_apk "plasma-integration" "community"
 install_apk "plasma-nm" "community"
+# Preserve the tested external-wired tray fix when rebuilding this image.
+# The overlay is produced by build-plasma-network-icon.sh for this exact version.
+NETWORK_ICON_FIX="${ROOT_DIR}/build/plasma-network-icon/overlay/usr/lib/libplasmanm_internal.so"
+if [ -f "$NETWORK_ICON_FIX" ] && [ -d "${ROOTFS_DIR}/var/lib/pacman/local/plasma-nm-6.7.5-1" ]; then
+    install -m755 "$NETWORK_ICON_FIX" "${ROOTFS_DIR}/usr/lib/libplasmanm_internal.so"
+fi
+unset NETWORK_ICON_FIX
 install_apk "plasma-pa" "community"
 install_apk "plasma-systemmonitor" "community"
 install_apk "plasma-vault" "community"
@@ -987,6 +1000,33 @@ install_apk "plymouth-openrc-plugin" "community" "edge" || true
 echo "[*] Configuring accounts and session wrappers..."
 "${ROOT_DIR}/scripts/configure-accounts.sh" "${ROOTFS_DIR}"
 
+# VLC: keep the packaged launcher, bypass its root refusal, and install
+# the shared CLI/desktop wrapper with an explicit plugin search path.
+if [ -f "${ROOTFS_DIR}/usr/bin/vlc" ]; then
+    (
+        vlc_dir="${ROOTFS_DIR}/usr/bin"
+        vlc_wrapper="${ROOT_DIR}/config/vlc/vlc.sh"
+        vlc_source="${vlc_dir}/vlc"
+        if cmp -s "${vlc_source}" "${vlc_wrapper}"; then
+            vlc_source="${vlc_dir}/vlc.distrib"
+        fi
+        # This exact Arch launcher tests geteuid() and branches to its
+        # root refusal at 0x108d. Reject other builds before modifying files.
+        vlc_digest=$(sha256sum "${vlc_source}")
+        if [ "${vlc_digest%% *}" != "8e08d98bb6107ab211e87fdad3cee7dc5dc37497a58529a77ab14d263d9bd521" ]; then
+            echo "Unrecognized VLC launcher; inspect its root check before updating this patch" >&2
+            exit 1
+        fi
+        if [ "${vlc_source}" != "${vlc_dir}/vlc.distrib" ]; then
+            install -m 0755 "${vlc_source}" "${vlc_dir}/vlc.distrib"
+        fi
+        install -m 0755 "${vlc_dir}/vlc.distrib" "${vlc_dir}/vlc.bin"
+        printf '\220\220\220\220\220\220' | dd of="${vlc_dir}/vlc.bin" bs=1 seek=4237 conv=notrunc status=none
+        install -m 0755 "${vlc_wrapper}" "${vlc_dir}/vlc"
+        echo "[*] Installed VLC wrapper, plugin path, and root-capable launcher"
+    )
+fi
+
 # --- Minimal boot contract (busybox init, no OpenRC on Arch) ---
 # /sbin/init is busybox; it runs /etc/init.d/rcS once, then respawns the
 # console login. No service manager, no dependency graph to satisfy.
@@ -994,7 +1034,8 @@ mkdir -p "${ROOTFS_DIR}/etc/init.d"
 cat <<'EOF' > "${ROOTFS_DIR}/etc/init.d/rcS"
 #!/bin/sh
 # AvoryOS boot (busybox init rcS; OpenRC is unavailable on Arch official
-# repos, so this script is the service manager: fsck -> dbus -> pipewire,
+# repos, so this script is the service manager: fsck -> dbus -> udev ->
+# NetworkManager -> pipewire,
 # each guarded so a missing binary or empty config never fails the boot.
 # Status lines mimic OpenRC's ` * Starting foo ... [ ok ]` format (plain
 # text, no ANSI colors, so the serial log stays clean).
@@ -1011,7 +1052,7 @@ chmod 1777 /tmp 2>/dev/null || true
 if [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ]; then eend 0; else eend 1; fi
 
 ebegin "Setting hostname"
-hostname AvoryOS 2>/dev/null; eend $?
+/usr/bin/busybox hostname AvoryOS 2>/dev/null; eend $?
 
 if [ -x /sbin/avory-early-init ]; then
     ebegin "Running early init"
@@ -1040,6 +1081,53 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.5
 done
 if [ -S /run/dbus/system_bus_socket ]; then eend 0; else eend 1; fi
+# udev processes coldplug events before audio discovers hardware. It runs
+# independently of systemd PID 1; BusyBox init remains the service manager.
+ebegin "Starting device manager"
+UDEV_OK=1
+if [ -x /usr/lib/systemd/systemd-udevd ] && command -v udevadm >/dev/null 2>&1; then
+    mkdir -p /run/udev
+    /usr/lib/systemd/systemd-udevd --daemon --resolve-names=never >>/var/log/udev.log 2>&1
+    if udevadm control --timeout=5 --ping >>/var/log/udev.log 2>&1; then
+        UDEV_OK=0
+    fi
+fi
+eend "$UDEV_OK"
+if [ "$UDEV_OK" -eq 0 ]; then
+    ebegin "Enumerating devices"
+    if udevadm trigger --type=subsystems --action=add >>/var/log/udev.log 2>&1 &&
+       udevadm trigger --type=devices --action=add >>/var/log/udev.log 2>&1; then
+        eend 0
+    else
+        eend 1
+    fi
+    ebegin "Waiting for device events"
+    udevadm settle --timeout=10 >>/var/log/udev.log 2>&1; eend $?
+fi
+
+# NetworkManager is a system service; start it once after D-Bus and coldplug.
+ebegin "Starting NetworkManager"
+NM_OK=1
+if command -v NetworkManager >/dev/null 2>&1; then
+    mkdir -p /run/NetworkManager /var/lib/NetworkManager
+    if [ -S /run/dbus/system_bus_socket ]; then
+        if ! pidof NetworkManager >/dev/null 2>&1; then
+            nohup NetworkManager --no-daemon >>/var/log/NetworkManager.log 2>&1 &
+        fi
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            if LC_ALL=C nmcli --wait 1 -t -f RUNNING general 2>/dev/null | grep -qx running; then
+                NM_OK=0
+                break
+            fi
+            sleep 0.5
+        done
+    fi
+    eend "$NM_OK"
+else
+    eskip
+fi
+unset NM_OK
+
 # --- pipewire system instance (root-owned; user sessions start their own
 # copy in the startplasma-x11 wrapper if none is listening) ---
 ebegin "Starting PipeWire"
@@ -1075,10 +1163,14 @@ if command -v pipewire >/dev/null 2>&1; then
         fi
         ebegin "Starting PipeWire PulseAudio bridge"
         if command -v pipewire-pulse >/dev/null 2>&1; then
-            if [ ! -S "$PIPE_RUNTIME/pipewire-pulse" ]; then
+            if [ ! -S "$PIPE_RUNTIME/pulse/native" ]; then
                 XDG_RUNTIME_DIR="$PIPE_RUNTIME" nohup pipewire-pulse >>/var/log/pipewire.log 2>&1 &
             fi
-            eend 0
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+                [ -S "$PIPE_RUNTIME/pulse/native" ] && break
+                sleep 0.5
+            done
+            if [ -S "$PIPE_RUNTIME/pulse/native" ]; then eend 0; else eend 1; fi
         else
             eskip
         fi
@@ -1091,63 +1183,10 @@ echo " * Entering runlevel: default"
 EOF
 chmod +x "${ROOTFS_DIR}/etc/init.d/rcS"
 
-# Early init: seed /run/udev/data so libudev sees the already-initialized
-# display and input hardware (seat/uaccess tags for Xorg and libinput).
+# Early init selects the Xorg profile; udev owns the device database.
 cat <<'EOF' > "${ROOTFS_DIR}/sbin/avory-early-init"
 #!/bin/sh
-# Early initialization for AvoryOS before OpenRC
-mkdir -p /run/udev/data /run/plymouth /var/log
-
-# Tell libudev that display and input hardware is already initialized
-cat <<'UDEV' > /run/udev/data/c226:0
-E:DEVNAME=/dev/dri/card0
-E:SUBSYSTEM=drm
-E:MAJOR=226
-E:MINOR=0
-TAGS=:seat:uaccess:
-UDEV
-cat <<'UDEV' > /run/udev/data/c226:2
-E:DEVNAME=/dev/dri/card2
-E:SUBSYSTEM=drm
-E:MAJOR=226
-E:MINOR=2
-TAGS=:seat:uaccess:
-UDEV
-cat <<'UDEV' > /run/udev/data/c226:128
-E:DEVNAME=/dev/dri/renderD128
-E:SUBSYSTEM=drm
-E:MAJOR=226
-E:MINOR=128
-TAGS=:seat:uaccess:
-UDEV
-cat <<'UDEV' > /run/udev/data/c226:129
-E:DEVNAME=/dev/dri/renderD129
-E:SUBSYSTEM=drm
-E:MAJOR=226
-E:MINOR=129
-TAGS=:seat:uaccess:
-UDEV
-cat <<'UDEV' > /run/udev/data/c29:0
-E:DEVNAME=/dev/fb0
-E:SUBSYSTEM=graphics
-E:MAJOR=29
-E:MINOR=0
-TAGS=:seat:uaccess:
-UDEV
-cat <<'UDEV' > /run/udev/data/c13:64
-E:DEVNAME=/dev/input/event0
-E:SUBSYSTEM=input
-E:MAJOR=13
-E:MINOR=64
-TAGS=:seat:uaccess:
-UDEV
-cat <<'UDEV' > /run/udev/data/c13:65
-E:DEVNAME=/dev/input/event1
-E:SUBSYSTEM=input
-E:MAJOR=13
-E:MINOR=65
-TAGS=:seat:uaccess:
-UDEV
+mkdir -p /run/plymouth /var/log
 
 # Select the Xorg profile for this boot's GPU topology before any display
 # manager runs: an image baked for VFIO otherwise leaves Xorg pointed at a
@@ -1303,6 +1342,25 @@ fi
 
 # PackageKit uses the target's pacman configuration and keyring, not the
 # host-side bootstrap configuration (which disables signature checking).
+# pacman-mirrorlist ships every server commented out. Keep any configured
+# mirrors, but seed the guest's list when none are enabled: otherwise
+# PackageKit reports "No more mirrors available" for every installation.
+if ! grep -Eq '^[[:space:]]*Server[[:space:]]*=' "${ROOTFS_DIR}/etc/pacman.d/mirrorlist"; then
+    echo "[*] Enabling target Arch package mirrors..."
+    cat >> "${ROOTFS_DIR}/etc/pacman.d/mirrorlist" <<'EOF'
+
+# AvoryOS defaults for Discover/PackageKit and pacman (HTTPS only).
+Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
+Server = https://fastly.mirror.pkgbuild.com/$repo/os/$arch
+EOF
+fi
+# Pacman's downloader otherwise fails on landlock_create_ruleset (ENOSYS).
+# AvoryOS has no Landlock implementation; disable only that sandbox layer.
+# PackageKit's alpm backend ignores this option and does not set DownloadUser.
+if ! grep -Eq '^[[:space:]]*DisableSandboxFilesystem([[:space:]]|$)' "${ROOTFS_DIR}/etc/pacman.conf"; then
+    sed -i '/^\[options\]$/a\# AvoryOS does not implement Linux Landlock.\nDisableSandboxFilesystem' \
+        "${ROOTFS_DIR}/etc/pacman.conf"
+fi
 if [ -x "${ROOTFS_DIR}/usr/bin/pacman-key" ]; then
     echo "[*] Initializing target Arch package signing keys..."
     if ! target_run /usr/bin/pacman-key --init || \

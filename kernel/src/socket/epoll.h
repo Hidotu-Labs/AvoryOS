@@ -48,7 +48,7 @@ struct epoll_event {
 #define EPOLL_CLOEXEC 0x80000  // O_CLOEXEC (1 << 19)
 
 // Maximum epoll settings
-#define EPOLL_MAX_INSTANCES  64    // Max epoll instances system-wide
+#define EPOLL_MAX_INSTANCES  512   // Max epoll instances system-wide
 #define EPOLL_MAX_WATCHED    4096  // Max FDs per epoll instance
 #define EPOLL_MAX_EVENTS     128   // Max events returned per epoll_wait
 
@@ -79,6 +79,8 @@ typedef struct epitem {
   bool oneshot;                // One-shot mode active
   bool oneshot_disabled;        // One-shot has fired, needs re-arm
   bool exclusive;              // Exclusive wake-up mode
+  bool removed;               // Protected by parent epoll lock
+  uint32_t refcount;           // Table owner plus in-flight poll snapshots
   
   // Store original events for oneshot re-arming
   uint32_t registered_events;  // Original event mask registered
@@ -124,6 +126,8 @@ eventpoll_t *epoll_create(void);
 void epoll_destroy(eventpoll_t *ep);
 void epoll_get(eventpoll_t *ep);
 void epoll_put(eventpoll_t *ep);
+struct thread;
+void epoll_release_thread(struct thread *t);
 
 // Epoll Operations
 int epoll_ctl_add(eventpoll_t *ep, int fd, struct epoll_event *event);
@@ -134,7 +138,7 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events,
                     int maxevents, int64_t timeout_ms);
 
 // Epoll FD Management
-int epoll_alloc_fd(eventpoll_t *ep);
+int epoll_alloc_fd(eventpoll_t *ep, uint64_t flags);
 eventpoll_t *epoll_from_fd(int fd);
 int epoll_close_fd(int fd);
 
@@ -143,7 +147,6 @@ uint32_t epoll_vfs_read(struct vfs_node *node, uint32_t offset,
                         uint32_t size, uint8_t *buffer);
 uint32_t epoll_vfs_write(struct vfs_node *node, uint32_t offset, 
                          uint32_t size, uint8_t *buffer);
-void epoll_vfs_open(struct vfs_node *node);
 void epoll_vfs_close(struct vfs_node *node);
 int epoll_vfs_poll(struct vfs_node *node, int events);
 

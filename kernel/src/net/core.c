@@ -65,6 +65,12 @@ static bool push_locked(struct net_packet *p) {
   return true;
 }
 
+static bool packet_current(const struct net_packet *packet) {
+  struct net_device *dev = packet->device;
+  return dev && __atomic_load_n(&dev->registered, __ATOMIC_ACQUIRE) &&
+         packet->generation == __atomic_load_n(&dev->generation, __ATOMIC_ACQUIRE);
+}
+
 static void net_worker(void) {
   struct thread *self = sched_get_current();
   /* Heap, not stack: a waker on another CPU walks worker_wait until it takes
@@ -98,7 +104,7 @@ static void net_worker(void) {
         break;
 
       for (size_t i = 0; i < count; i++) {
-        if (rx_handler)
+        if (rx_handler && packet_current(batch[i]))
           rx_handler(batch[i]);
       }
     }
@@ -163,6 +169,7 @@ bool net_rx_submit_irq(struct net_device *dev, const void *frame, size_t len) {
     return false;
   }
   p->device = dev;
+  p->generation = __atomic_load_n(&dev->generation, __ATOMIC_ACQUIRE);
   p->length = (uint16_t)len;
   memcpy(p->data, frame, len);
   bool was_empty = (head == tail);
@@ -191,8 +198,22 @@ bool net_rx_submit_irq(struct net_device *dev, const void *frame, size_t len) {
 
 int net_device_register(struct net_device *dev) {
   if (!ready || !dev || !dev->ops || !dev->ops->link_up || !dev->ops->stop ||
-      dev->registered || !dev->name[0])
+      dev->registered)
     return -1;
+  /* Empty names request the first free ethN. Explicit user-driver names keep
+   * their existing duplicate-name checks. */
+  if (!dev->name[0]) {
+    for (unsigned i = 0; i < NET_DEVICE_MAX; i++) {
+      char name[sizeof(dev->name)];
+      snprintf(name, sizeof(name), "eth%u", i);
+      if (!net_device_find(name)) {
+        strcpy(dev->name, name);
+        break;
+      }
+    }
+    if (!dev->name[0])
+      return -1;
+  }
   int free_slot = -1;
   for (int i = 0; i < NET_DEVICE_MAX; i++) {
     if (devices[i] && strcmp(devices[i]->name, dev->name) == 0)
@@ -211,6 +232,25 @@ int net_device_register(struct net_device *dev) {
   return 0;
 }
 
+bool net_devices_start(void) {
+  default_device = NULL;
+  for (unsigned i = 0; i < NET_DEVICE_MAX; i++) {
+    struct net_device *dev = devices[i];
+    if (!dev)
+      continue;
+    if (!dev->started && dev->ops->start && !dev->ops->start(dev)) {
+      klogf("[NET] %s activation failed\n", dev->name);
+      dev->ops->stop(dev);
+      net_device_unregister(dev);
+      continue;
+    }
+    dev->started = true;
+    if (!default_device)
+      default_device = dev;
+  }
+  return default_device != NULL;
+}
+
 int net_device_unregister(struct net_device *dev) {
   if (!dev || !dev->registered)
     return -1;
@@ -226,10 +266,20 @@ int net_device_unregister(struct net_device *dev) {
       }
   }
   dev->registered = false;
+  __atomic_add_fetch(&dev->generation, 1, __ATOMIC_RELEASE);
+  dev->started = false;
   return 0;
 }
 
 struct net_device *net_device_default(void) { return default_device; }
+
+bool net_device_set_default(const char *name) {
+  struct net_device *dev = net_device_find(name);
+  if (!dev || !dev->started)
+    return false;
+  default_device = dev;
+  return true;
+}
 
 struct net_device *net_device_find(const char *name) {
   if (!name)
@@ -325,6 +375,12 @@ void net_print_stats(const struct net_device *dev) {
   klog_uint64(dev->stats.rx_overflows);
   klog_puts(" txunderrun=");
   klog_uint64(dev->stats.tx_underruns);
+  klog_puts(" txtimeout=");
+  klog_uint64(dev->stats.tx_timeouts);
+  klog_puts(" recovered=");
+  klog_uint64(dev->stats.recoveries);
+  klog_puts(" recoveryfail=");
+  klog_uint64(dev->stats.recovery_failures);
   klog_puts("\n");
 }
 

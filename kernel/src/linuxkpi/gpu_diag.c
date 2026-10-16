@@ -32,12 +32,13 @@ static const char *const names[] = {"?", "IOCTL", "CS_IN", "CS_OUT", "CACHE",
   "MAP", "FAULT", "IMPORT", "CPU_BEGIN", "CPU_END", "FENCE", "COPY_LAYOUT",
   "COPY_CHECK", "PRESENT", "CACHE_CHECK", "BO_HANDLE", "BO_BACKING", "VM_BIND",
   "VM_UPDATE", "PAGE_BIND", "DMA_MAP", "PAGE_ALLOC", "PAGE_FREE",
-  "FENCE_EMIT", "FENCE_SIGNAL", "RESV_FENCE", "VM_OFFSET", "CPU_VMA"};
+  "FENCE_EMIT", "FENCE_SIGNAL", "RESV_FENCE", "VM_OFFSET", "CPU_VMA", "VM_FAILURE"};
 
 unsigned int gpu_diag_level(void) { return __atomic_load_n(&level, __ATOMIC_RELAXED); }
 int gpu_diag_resource_enabled(void) {
-  return gpu_diag_level() == 3 &&
-         __atomic_load_n(&resource_left, __ATOMIC_RELAXED) != 0;
+  unsigned int mode = gpu_diag_level();
+  return mode == 4 || (mode == 3 &&
+         __atomic_load_n(&resource_left, __ATOMIC_RELAXED) != 0);
 }
 void gpu_diag_record(unsigned int kind, const void *object, uint64_t a, uint64_t b,
                      uint64_t c, uint64_t d, long result) {
@@ -48,17 +49,18 @@ void gpu_diag_record(unsigned int kind, const void *object, uint64_t a, uint64_t
   spinlock_acquire(&diag_lock);
   /* A freeze racing this producer must remain a freeze. */
   if (level) {
-    if (kind >= GPU_DIAG_BO_HANDLE) {
-      if (level != 3 || !resource_left) {
+    if (kind >= GPU_DIAG_BO_HANDLE && kind <= GPU_DIAG_CPU_VMA) {
+      if (level != 4 && (level != 3 || !resource_left)) {
         spinlock_release(&diag_lock);
         return;
       }
-      __atomic_sub_fetch(&resource_left, 1, __ATOMIC_RELAXED);
+      if (level == 3)
+        __atomic_sub_fetch(&resource_left, 1, __ATOMIC_RELAXED);
     }
     e.seq = ++sequence;
     entries[(e.seq-1) % GPU_DIAG_CAPACITY] = e;
     seen[kind]++;
-    if (kind >= GPU_DIAG_BO_HANDLE)
+    if (kind >= GPU_DIAG_BO_HANDLE && kind <= GPU_DIAG_CPU_VMA)
       resource_checks[resource_count++ % 1024] = e;
     if (kind == GPU_DIAG_COPY_CHECK) {
       pixel_checks[(seen[kind]-1)%64] = e;
@@ -70,6 +72,25 @@ void gpu_diag_record(unsigned int kind, const void *object, uint64_t a, uint64_t
         (kind==GPU_DIAG_CACHE_CHECK && result) ||
         ((kind==GPU_DIAG_IMPORT || kind==GPU_DIAG_CPU_BEGIN || kind==GPU_DIAG_CPU_END || kind==GPU_DIAG_PRESENT) && result<0))
       anomalies[anomaly_count++%32]=e;
+  }
+  spinlock_release(&diag_lock);
+}
+/* Called from the existing fault/timeout reporting path, after its task-info
+ * lookup. No allocation, printing, driver locks, waits or GPU access here.
+ * Publish the trigger and freeze under the same lock as every producer. */
+void gpu_diag_vm_failure(const void *device, unsigned int pasid,
+                          unsigned int tgid, unsigned int pid) {
+  if (gpu_diag_level() != 4) return;
+  struct thread *t = sched_get_current();
+  struct gpu_diag_entry e = {.ms=lapic_timer_get_ms(), .object=(uintptr_t)device,
+    .a=pasid, .b=tgid, .c=pid, .kind=GPU_DIAG_VM_FAILURE, .tid=t ? t->tid : 0};
+  spinlock_acquire(&diag_lock);
+  if (level == 4) {
+    e.seq = ++sequence;
+    entries[(e.seq-1) % GPU_DIAG_CAPACITY] = e;
+    seen[e.kind]++;
+    anomalies[anomaly_count++ % 32] = e;
+    __atomic_store_n(&level, 0, __ATOMIC_RELAXED);
   }
   spinlock_release(&diag_lock);
 }
@@ -130,8 +151,8 @@ unsigned int gpu_diag_read(unsigned int offset, unsigned int size, unsigned char
     mode,remaining,(unsigned long long)end,(unsigned long long)(end>GPU_DIAG_CAPACITY?end-GPU_DIAG_CAPACITY:0),
     (unsigned long long)unstable,(unsigned long long)bad,(unsigned long long)wrong_cache,(unsigned long long)pinned);
   emit(offset,size,buffer,&position,&copied,line);
-  emit(offset,size,buffer,&position,&copied,"commands: 1=reset metadata; 2=reset metadata+64 pixel checks; 3=reset metadata+1024 resource events; freeze=retain; dump=freeze+serial; 0=stop; clear=reset stopped\n");
-  snprintf(line,sizeof line,"resource_events=%llu resource_budget_left=%u (mode 3 only; retained before ring overwrite)\n",
+  emit(offset,size,buffer,&position,&copied,"commands: 1=reset metadata; 2=reset metadata+64 pixel checks; 3=reset metadata+1024 resource events; 4=rolling resources+freeze on VM failure; freeze=retain; dump=freeze+serial; 0=stop; clear=reset stopped\n");
+  snprintf(line,sizeof line,"resource_events=%llu resource_budget_left=%u (mode 3 budget; mode 4 retains last 1024)\n",
            (unsigned long long)resource_end,resource_remaining);
   emit(offset,size,buffer,&position,&copied,line);
   for (unsigned int k=1; k<=GPU_DIAG_MAX; k++) {
@@ -153,8 +174,9 @@ unsigned int gpu_diag_read(unsigned int offset, unsigned int size, unsigned char
       (unsigned long long)e.c,(unsigned long long)e.d,e.result);
     emit(offset,size,buffer,&position,&copied,line);
   }
-  emit(offset,size,buffer,&position,&copied,"retained resource events (budget 1024):\n");
-  for (uint64_t i=0; i<resource_end && copied<size; i++) {
+  emit(offset,size,buffer,&position,&copied,"retained resource events (last 1024):\n");
+  uint64_t resource_first=resource_end>1024?resource_end-1024:0;
+  for (uint64_t i=resource_first; i<resource_end && copied<size; i++) {
     struct gpu_diag_entry e;
     spinlock_acquire(&diag_lock);e=resource_checks[i%1024];spinlock_release(&diag_lock);
     snprintf(line,sizeof line,"resource %llu %llu %u %s %llx %llx %llx %llx %llx %ld\n",
@@ -229,6 +251,7 @@ unsigned int gpu_diag_control(unsigned int size, const unsigned char *buffer) {
   if (!strcmp(cmd,"1")) { next=1; reset=true; }
   else if (!strcmp(cmd,"2")) { next=2; reset=true; }
   else if (!strcmp(cmd,"3")) { next=3; reset=true; }
+  else if (!strcmp(cmd,"4")) { next=4; reset=true; }
   else if (!strcmp(cmd,"clear")) reset=true;
   else if (strcmp(cmd,"0") && strcmp(cmd,"freeze")) return 0;
   spinlock_acquire(&diag_lock);
@@ -238,7 +261,7 @@ unsigned int gpu_diag_control(unsigned int size, const unsigned char *buffer) {
     __atomic_store_n(&resource_left,next==3?1024:0,__ATOMIC_RELAXED);
   __atomic_store_n(&level,next,__ATOMIC_RELAXED);
   spinlock_release(&diag_lock);
-  klog_puts(next==3?"[GPUDBG] armed 1024 resource events (changes timing)\n":next==2?"[GPUDBG] armed 64 pixel checks (changes timing)\n":
+  klog_puts(next==4?"[GPUDBG] rolling resources; freezes on GPUVM fault/timeout (changes timing)\n":next==3?"[GPUDBG] armed 1024 resource events (changes timing)\n":next==2?"[GPUDBG] armed 64 pixel checks (changes timing)\n":
             next==1?"[GPUDBG] recording metadata\n":"[GPUDBG] recording frozen/stopped\n");
   return original_size;
 }

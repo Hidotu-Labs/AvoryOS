@@ -1,12 +1,19 @@
 #include "vfs.h"
+#include "mount_namespace.h"
+#include "../sched/capability.h"
+#include "vfs_rcu.h"
 #include "dirindex.h"
+#include "inotify.h"
 #include "../console/klog.h"
+#include "../cpu/tsc.h"
 #include "../lib/string.h"
 #include "../lib/tsc.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include "../sched/sched.h"
+#include "../smp/cpu.h"
 #include "../syscalls/sysdiag.h"
+#include "hal/hal.h"
 
 #define PHYS_TO_VIRT(p) ((void *)((uint64_t)(p) + pmm_get_hhdm_offset()))
 
@@ -23,6 +30,8 @@ bool vfs_in_group(uint32_t gid) {
 
 bool vfs_access(vfs_node_t *node, uint32_t requested) {
   if (!node) return false;
+  if ((requested & 1) && (node->flags & FS_TYPE_MASK) != FS_DIRECTORY &&
+      (vfs_mount_flags(node) & 8)) return false;
   /* Fast path: every class grants `requested` (common for 0755/0777 dirs on
    * a path walk). No thread lookup, no supplementary-group loop. */
   uint32_t o = (node->mask >> 6) & 7;
@@ -35,7 +44,8 @@ bool vfs_access(vfs_node_t *node, uint32_t requested) {
     return true;
   }
   struct thread *t = sched_get_current();
-  if (!t || t->euid == 0) {
+  if (!t || capability_has(t, CAP_DAC_OVERRIDE) ||
+      (!(requested & 2) && capability_has(t, CAP_DAC_READ_SEARCH))) {
     if ((requested & 1) && !(node->mask & 0111) &&
         (node->flags & FS_TYPE_MASK) != FS_DIRECTORY) return false;
     return true;
@@ -61,7 +71,7 @@ static bool vfs_path_has_dotdot(const char *path) {
 
 bool vfs_may_remove(vfs_node_t *parent, vfs_node_t *target) {
   struct thread *t = sched_get_current();
-  if (!t || t->euid == 0) return true;
+  if (!t || capability_has(t, CAP_FOWNER)) return true;
   if (!vfs_access(parent, 3)) return false;
   if ((parent->mask & 01000) && t->fsuid != parent->uid &&
       (!target || t->fsuid != target->uid)) return false;
@@ -163,8 +173,13 @@ static uint32_t vfs_dentry_hash(vfs_node_t *parent, const char *name) {
   return (uint32_t)(hash ^ (hash >> 32));
 }
 
-static vfs_node_t *vfs_dentry_lookup(vfs_node_t *parent, const char *name,
-                                     bool *negative) {
+/* Bench-only switch: when set, lookups take the pre-RCU locked path so
+ * `vfs_bench=1` can run the old and new forms of the same lookup back to
+ * back.  Never set outside the benchmark. */
+static bool vfs_dentry_lookup_force_locked;
+
+static vfs_node_t *vfs_dentry_lookup_locked(vfs_node_t *parent, const char *name,
+                                            bool *negative) {
   *negative = false;
   if (!parent || !name || (parent->flags & FS_DENTRY_NOCACHE))
     return NULL;
@@ -178,10 +193,6 @@ static vfs_node_t *vfs_dentry_lookup(vfs_node_t *parent, const char *name,
   uint32_t slot = hash & VFS_DENTRY_BUCKET_MASK;
   vfs_dentry_cache_bucket_t *bucket = &vfs_dentry_cache[slot];
 
-  /* The cache owns a node reference only while the entry remains installed.
-   * Take the caller's reference under the same lock that protects eviction.
-   * A sequence recheck cannot make tryref on an already freed node safe;
-   * lockless readers would require deferred reclamation of nodes as well. */
   spinlock_acquire(&bucket->lock);
   for (uint32_t i = 0; i < VFS_DENTRY_WAYS; i++) {
     vfs_dentry_cache_entry_t *entry = &bucket->entries[i];
@@ -198,6 +209,83 @@ static vfs_node_t *vfs_dentry_lookup(vfs_node_t *parent, const char *name,
   }
   spinlock_release(&bucket->lock);
   return NULL;
+}
+
+static vfs_node_t *vfs_dentry_lookup(vfs_node_t *parent, const char *name,
+                                     bool *negative) {
+  *negative = false;
+  if (!parent || !name || (parent->flags & FS_DENTRY_NOCACHE))
+    return NULL;
+
+  size_t len_sz = strlen(name);
+  if (len_sz >= 128)
+    return NULL;
+
+  if (vfs_dentry_lookup_force_locked || !vfs_rcu_ready())
+    return vfs_dentry_lookup_locked(parent, name, negative);
+
+  uint16_t len = (uint16_t)len_sz;
+  uint32_t hash = vfs_dentry_hash(parent, name);
+  vfs_dentry_cache_bucket_t *bucket =
+      &vfs_dentry_cache[hash & VFS_DENTRY_BUCKET_MASK];
+
+  /* Lockless seqlock read.  Writers mutate entries with `seq` odd and bump it
+   * again when done, so a scan that starts and ends on the same even value
+   * crossed no writer and the fields it saw are consistent.  The scan never
+   * dereferences `child`; the pointer is only handed to tryref, which is safe
+   * because a node's last kfree() is deferred until a grace period has passed
+   * (fs/vfs_rcu.h).  The whole section runs with interrupts off so an IPI
+   * cannot be acknowledged while a raw pointer is held - that is the property
+   * the drainer's barrier relies on. */
+  vfs_node_t *result = NULL;
+  int action = 0; /* 0 = locked fallback, 1 = miss, 2 = negative, 3 = node */
+  hal_irq_state_t flags = hal_irq_save();
+  for (uint32_t attempt = 0; attempt < 2 && action == 0; attempt++) {
+    uint32_t s1 = __atomic_load_n(&bucket->seq, __ATOMIC_ACQUIRE);
+    if (s1 & 1)
+      break; /* writer in flight: let the locked path serialize */
+
+    uint32_t state = 0; /* 0 miss, 1 positive, 2 negative */
+    for (uint32_t i = 0; i < VFS_DENTRY_WAYS; i++) {
+      vfs_dentry_cache_entry_t *entry = &bucket->entries[i];
+      if (!__atomic_load_n(&entry->valid, __ATOMIC_RELAXED))
+        continue;
+      if (__atomic_load_n(&entry->hash, __ATOMIC_RELAXED) != hash)
+        continue;
+      if (__atomic_load_n(&entry->parent, __ATOMIC_RELAXED) != parent)
+        continue;
+      uint16_t entry_len = __atomic_load_n(&entry->name_len, __ATOMIC_RELAXED);
+      if (entry_len != len)
+        continue;
+      if (memcmp(entry->name, name, len) != 0)
+        continue;
+      result = __atomic_load_n(&entry->child, __ATOMIC_RELAXED);
+      state = result ? 1u : 2u;
+      break;
+    }
+    if (__atomic_load_n(&bucket->seq, __ATOMIC_ACQUIRE) != s1)
+      continue; /* crossed a writer: retry once, then fall back under the lock */
+    if (state == 0)
+      action = 1;
+    else if (state == 2)
+      action = 2;
+    else if (vfs_node_tryref(result))
+      action = 3;
+    /* tryref failed: the entry's reference dropped while scanning.  The
+     * entry was invalidated concurrently; the locked lookup re-checks it and
+     * either refinds it or reports the miss. */
+  }
+  hal_irq_restore(flags);
+
+  if (action == 3)
+    return result;
+  if (action == 1)
+    return NULL;
+  if (action == 2) {
+    *negative = true;
+    return NULL;
+  }
+  return vfs_dentry_lookup_locked(parent, name, negative);
 }
 
 static void vfs_dentry_insert(vfs_node_t *parent, const char *name,
@@ -400,7 +488,12 @@ static uint32_t vfs_path_hash(vfs_node_t *dir, const char *path) {
   return (uint32_t)(hash ^ (hash >> 32));
 }
 
-static vfs_node_t *vfs_path_cache_lookup(vfs_node_t *dir, const char *path) {
+/* Bench-only switch: same purpose as vfs_dentry_lookup_force_locked, for the
+ * full-path cache.  Never set outside the benchmark. */
+static bool vfs_path_lookup_force_locked;
+
+static vfs_node_t *vfs_path_cache_lookup_locked(vfs_node_t *dir,
+                                                const char *path) {
   if (!dir || !path)
     return NULL;
 
@@ -414,8 +507,9 @@ static vfs_node_t *vfs_path_cache_lookup(vfs_node_t *dir, const char *path) {
   vfs_path_cache_bucket_t *bucket = &vfs_path_cache[slot];
 
   /* Pin the cached node while eviction is excluded, as in dentry lookup.
-   * Nodes are freed immediately on last close; there is no RCU grace period
-   * to protect an unlocked pointer between lookup and reference acquisition. */
+   * The lockless fast path below relies on the invalidation generation; this
+   * one may replay the log under the bucket lock, which also retires an entry
+   * a removal has overtaken. */
   vfs_node_t *stale_node = NULL;
   vfs_node_t *stale_dir = NULL;
 
@@ -452,6 +546,80 @@ static vfs_node_t *vfs_path_cache_lookup(vfs_node_t *dir, const char *path) {
   if (stale_dir)
     vfs_close(stale_dir);
   return NULL;
+}
+
+static vfs_node_t *vfs_path_cache_lookup(vfs_node_t *dir, const char *path) {
+  if (!dir || !path)
+    return NULL;
+
+  size_t len_sz = strlen(path);
+  if (len_sz >= 256)
+    return NULL;
+
+  if (vfs_path_lookup_force_locked || !vfs_rcu_ready())
+    return vfs_path_cache_lookup_locked(dir, path);
+
+  uint16_t len = (uint16_t)len_sz;
+  uint32_t hash = vfs_path_hash(dir, path);
+  vfs_path_cache_bucket_t *bucket =
+      &vfs_path_cache[hash & VFS_PATH_CACHE_BUCKET_MASK];
+
+  /* Same seqlock read as the dentry cache, plus the invalidation-generation
+   * test: only entries already validated against every recorded invalidation
+   * are served locklessly (see vfs_path_entry_validate_locked for the replay
+   * rules).  A stale entry falls back to the locked path, which replays the
+   * log and re-stamps the generation, so an invalidation costs one locked
+   * lookup per cache entry, not a permanent loss of the fast path. */
+  vfs_node_t *result = NULL;
+  int action = 0; /* 0 = locked fallback, 1 = miss, 3 = node */
+  hal_irq_state_t flags = hal_irq_save();
+  for (uint32_t attempt = 0; attempt < 2 && action == 0; attempt++) {
+    uint32_t s1 = __atomic_load_n(&bucket->seq, __ATOMIC_ACQUIRE);
+    if (s1 & 1)
+      break;
+
+    bool found = false;
+    uint64_t entry_gen = 0;
+    for (uint32_t i = 0; i < VFS_PATH_CACHE_WAYS; i++) {
+      vfs_path_cache_entry_t *entry = &bucket->entries[i];
+      if (!__atomic_load_n(&entry->valid, __ATOMIC_RELAXED))
+        continue;
+      if (__atomic_load_n(&entry->hash, __ATOMIC_RELAXED) != hash)
+        continue;
+      if (__atomic_load_n(&entry->dir, __ATOMIC_RELAXED) != dir)
+        continue;
+      uint16_t entry_len = __atomic_load_n(&entry->path_len, __ATOMIC_RELAXED);
+      if (entry_len != len)
+        continue;
+      if (memcmp(entry->path, path, len) != 0)
+        continue;
+      result = __atomic_load_n(&entry->node, __ATOMIC_RELAXED);
+      entry_gen = __atomic_load_n(&entry->gen, __ATOMIC_RELAXED);
+      found = true;
+      break;
+    }
+    if (__atomic_load_n(&bucket->seq, __ATOMIC_ACQUIRE) != s1)
+      continue;
+    if (!found) {
+      action = 1;
+      break;
+    }
+    /* An entry that predates the current generation needs the log replay the
+     * locked path performs (and may be retired by it).  Reading the generation
+     * after the scan only makes the fallback more eager. */
+    if (entry_gen != __atomic_load_n(&vfs_path_inval_gen, __ATOMIC_ACQUIRE))
+      break;
+    if (result && vfs_node_tryref(result))
+      action = 3;
+    break; /* entry dropped while scanning: the locked path re-checks */
+  }
+  hal_irq_restore(flags);
+
+  if (action == 3)
+    return result;
+  if (action == 1)
+    return NULL;
+  return vfs_path_cache_lookup_locked(dir, path);
 }
 
 static void vfs_path_cache_insert(vfs_node_t *dir, const char *path, vfs_node_t *node) {
@@ -830,6 +998,13 @@ void vfs_close(vfs_node_t *node) {
   void *wq = node->wait_queue;
 
   if (vfs_node_unref(node)) {
+    /* A namespace view's close drops its backing inode and parent path. The
+     * last parent can destroy an ephemeral filesystem, so flush the view's
+     * mapping cache while those references still keep the backing alive. */
+    if (node->view_backing) {
+      vfs_cache_sync(node);
+      vfs_cache_clear(node);
+    }
     if (node->close) {
       node->close(node);
     }
@@ -839,14 +1014,16 @@ void vfs_close(vfs_node_t *node) {
     node->ep_watchers.prev = NULL;
     /* A node whose name was removed while descriptors still referenced it:
      * the last close releases the filesystem-private payload exactly once. */
-    if ((node->flags & FS_DELETED) && node->destroy) {
+    if ((node->flags & (FS_DELETED | FS_AUTODESTROY)) && node->destroy) {
       node->destroy(node);
       node->destroy = NULL;
     }
     if (!(node->flags & FS_PERSISTENT) || (node->flags & FS_DELETED)) {
       node->magic = 0;
       vfs_xattr_clear(node);
-      kfree(node);
+      /* The last kfree is deferred: lockless cache readers may still hold this
+       * pointer between an entry scan and their tryref (fs/vfs_rcu.h). */
+      vfs_rcu_defer_free(node);
     }
     return;
   }
@@ -875,7 +1052,8 @@ void vfs_node_retire(vfs_node_t *node) {
   }
   node->magic = 0;
   vfs_xattr_clear(node);
-  kfree(node);
+  /* See vfs_close(): the final free waits for a grace period. */
+  vfs_rcu_defer_free(node);
 }
 
 struct dirent *vfs_readdir_buffer(void) {
@@ -893,6 +1071,10 @@ struct dirent *vfs_readdir(vfs_node_t *node, uint32_t index) {
 }
 
 vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
+  if (node && (node->view_backing || vfs_namespace_active())) {
+    if (node == fs_root) node = vfs_task_root();
+    return vfs_namespace_finddir(node, name);
+  }
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->finddir) {
     bool negative;
     vfs_node_t *cached = vfs_dentry_lookup(node, name, &negative);
@@ -949,8 +1131,10 @@ vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
 int vfs_create(vfs_node_t *node, char *name, uint16_t permission) {
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->create) {
     int result = node->create(node, name, permission);
-    if (result == 0)
+    if (result == 0) {
       vfs_dentry_invalidate_created(node, name);
+      inotify_notify(node, IN_CREATE, name, 0);
+    }
     return result;
   }
   return -1;
@@ -959,8 +1143,10 @@ int vfs_create(vfs_node_t *node, char *name, uint16_t permission) {
 int vfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->mkdir) {
     int result = node->mkdir(node, name, permission);
-    if (result == 0)
+    if (result == 0) {
       vfs_dentry_invalidate_created(node, name);
+      inotify_notify(node, IN_CREATE | IN_ISDIR, name, 0);
+    }
     return result;
   }
   return -1;
@@ -974,8 +1160,13 @@ int vfs_unlink(vfs_node_t *node, char *name) {
     vfs_node_t *target = vfs_finddir(node, name);
     vfs_dentry_invalidate(node, name);
     int result = node->unlink(node, name);
-    if (result == 0 && target)
-      vfs_node_retire(target);
+    if (result == 0) {
+      inotify_notify(node, IN_DELETE, name, 0);
+      if (target) {
+        inotify_notify(target, IN_DELETE_SELF, NULL, 0);
+        vfs_node_retire(target);
+      }
+    }
     if (target)
       vfs_close(target);
     return result;
@@ -985,8 +1176,15 @@ int vfs_unlink(vfs_node_t *node, char *name) {
 
 int vfs_rmdir(vfs_node_t *node, char *name) {
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->rmdir) {
+    vfs_node_t *target = vfs_finddir(node, name);
     vfs_dentry_invalidate(node, name);
-    return node->rmdir(node, name);
+    int rc = node->rmdir(node, name);
+    if (!rc) {
+      inotify_notify(node, IN_DELETE | IN_ISDIR, name, 0);
+      if (target) inotify_notify(target, IN_DELETE_SELF | IN_ISDIR, NULL, 0);
+    }
+    if (target) vfs_close(target);
+    return rc;
   }
   return -1;
 }
@@ -1001,11 +1199,26 @@ int vfs_readlink(vfs_node_t *node, char *buf, uint32_t size) {
 int vfs_symlink(vfs_node_t *node, char *name, char *target) {
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->symlink) {
     int result = node->symlink(node, name, target);
-    if (result == 0)
+    if (result == 0) {
       vfs_dentry_invalidate_created(node, name);
+      inotify_notify(node, IN_CREATE, name, 0);
+    }
     return result;
   }
   return -1;
+}
+
+static void vfs_notify_move(vfs_node_t *old_parent, const char *old_name,
+                             vfs_node_t *new_parent, const char *new_name,
+                             vfs_node_t *source, vfs_node_t *replaced) {
+  if (!source || source == replaced || (source->inode && replaced &&
+      source->inode == replaced->inode && source->device == replaced->device)) return;
+  uint32_t cookie = inotify_move_cookie();
+  uint32_t flags = (source->flags & FS_TYPE_MASK) == FS_DIRECTORY ? IN_ISDIR : 0;
+  inotify_notify(old_parent, IN_MOVED_FROM | flags, old_name, cookie);
+  inotify_notify(new_parent, IN_MOVED_TO | flags, new_name, cookie);
+  inotify_notify(source, IN_MOVE_SELF | flags, NULL, 0);
+  if (replaced) inotify_notify(replaced, IN_DELETE_SELF, NULL, 0);
 }
 
 int vfs_rename(vfs_node_t *node, char *old_name, char *new_name) {
@@ -1024,6 +1237,7 @@ int vfs_rename(vfs_node_t *node, char *old_name, char *new_name) {
     }
     bool same_inode = source && replaced && source->device == replaced->device &&
                       source->inode == replaced->inode;
+    if (result == 0) vfs_notify_move(node, old_name, node, new_name, source, replaced);
     if (result == 0 && replaced && !same_inode)
       vfs_node_retire(replaced);
     if (replaced)
@@ -1066,20 +1280,31 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
     int rc = ext2_rename_cross(old_parent, old_name, new_parent, new_name);
     vfs_dentry_invalidate(old_parent, old_name);
     vfs_dentry_invalidate(new_parent, new_name);
+    if (!rc) vfs_notify_move(old_parent, old_name, new_parent, new_name, source, replaced);
     if (!rc && replaced && (!source || source->inode != replaced->inode))
       vfs_node_retire(replaced);
     if (replaced) vfs_close(replaced);
     if (source) vfs_close(source);
     return rc;
   }
-  vfs_dentry_invalidate(old_parent, old_name);
-  vfs_dentry_invalidate(new_parent, new_name);
   /* Route on the parents' op table: tmpfs_rename_cross re-validates that
    * both parents really are tmpfs directories of one mount and answers
    * EXDEV for anything else, so other backends keep their old behaviour. */
   if (old_parent->rename && old_parent->rename == new_parent->rename) {
     extern int tmpfs_rename_cross(vfs_node_t *, char *, vfs_node_t *, char *);
+    vfs_node_t *source = vfs_finddir(old_parent, old_name);
+    vfs_node_t *replaced = vfs_finddir(new_parent, new_name);
+    /* Pin event targets before invalidating. In particular, looking up an
+     * absent destination records a negative dentry; it must not survive a
+     * successful move (Qt renames its login socket into place this way). */
+    vfs_dentry_invalidate(old_parent, old_name);
+    vfs_dentry_invalidate(new_parent, new_name);
     int rc = tmpfs_rename_cross(old_parent, old_name, new_parent, new_name);
+    vfs_dentry_invalidate(old_parent, old_name);
+    vfs_dentry_invalidate(new_parent, new_name);
+    if (!rc) vfs_notify_move(old_parent, old_name, new_parent, new_name, source, replaced);
+    if (source) vfs_close(source);
+    if (replaced) vfs_close(replaced);
     if (rc != -18)
       return rc;
   }
@@ -1104,8 +1329,10 @@ int vfs_mknod(vfs_node_t *node, char *name, uint16_t permission, uint32_t flags,
               void *device) {
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->mknod) {
     int result = node->mknod(node, name, permission, flags, device);
-    if (result == 0)
+    if (result == 0) {
       vfs_dentry_invalidate_created(node, name);
+      inotify_notify(node, IN_CREATE, name, 0);
+    }
     return result;
   }
   return -1;
@@ -1151,6 +1378,48 @@ int vfs_poll(vfs_node_t *node, int events) {
 
 #define MAX_SYMLINK_DEPTH 8
 
+/* Bench-only switch: drop the speculative walk's proved prefix so the
+ * fallback re-walks it (the pre-handoff behavior).  Never set outside the
+ * `vfs_bench=1` cold-leaf A/B. */
+static bool vfs_resolve_force_restart;
+
+/* Result of a stopped speculative walk (see vfs_lookup_cached_path): the
+ * deepest node the walk proved reachable and the first component of the
+ * original path it did not resolve.  `node` carries one reference; the
+ * general walk adopts it as its current directory.  `synthetic` reports that
+ * the proved prefix crossed an FS_DENTRY_NOCACHE node (only reachable
+ * through a mount redirect), so the general walk keeps suppressing the
+ * full-path cache insert. */
+struct vfs_walk_resume {
+  vfs_node_t *node;
+  const char *path;
+  bool synthetic;
+};
+
+/* Hand the walk's position to the resume record and return NULL: the
+ * reference the walk holds (current_ref) transfers to the record, or the
+ * unreferenced base directory is pinned for it.  With no record the walk
+ * closes what it held, exactly as before. */
+static vfs_node_t *vfs_cached_walk_abort(struct vfs_walk_resume *resume,
+                                         vfs_node_t *current,
+                                         vfs_node_t *current_ref,
+                                         const char *resume_path,
+                                         bool synthetic) {
+  if (resume) {
+    if (current_ref) {
+      resume->node = current_ref;
+    } else {
+      vfs_open(current);
+      resume->node = current;
+    }
+    resume->path = resume_path;
+    resume->synthetic = synthetic;
+  } else if (current_ref) {
+    vfs_close(current_ref);
+  }
+  return NULL;
+}
+
 /*
  * Speculative cached path walker.
  *
@@ -1160,8 +1429,19 @@ int vfs_poll(vfs_node_t *node, int events) {
  *
  * If any component is a symlink, relative '..', negative cache entry, or cache miss,
  * it returns NULL, cleanly falling back to the standard refcounted walk.
+ * On such a stop the deepest proved prefix is left in `resume` (when
+ * non-NULL) together with the first unresolved component, so the fallback
+ * continues from there: "parent directories hot, leaf not cached" is the
+ * common open() shape, and re-walking the prefix takes its bucket locks
+ * twice.  `resume->path` points into the caller's `path` string.
  */
-static vfs_node_t *vfs_lookup_cached_path(vfs_node_t *base_dir, const char *path) {
+static vfs_node_t *vfs_lookup_cached_path(vfs_node_t *base_dir, const char *path,
+                                          struct vfs_walk_resume *resume) {
+  if (resume) {
+    resume->node = NULL;
+    resume->path = NULL;
+    resume->synthetic = false;
+  }
   if (!base_dir || !path || !path[0])
     return NULL;
 
@@ -1182,6 +1462,7 @@ static vfs_node_t *vfs_lookup_cached_path(vfs_node_t *base_dir, const char *path
 
   vfs_node_t *current = base_dir;
   vfs_node_t *current_ref = NULL; // Non-NULL if current holds a refcount we acquired
+  bool synthetic = false;
 
   while (*p) {
     while (*p == '/')
@@ -1189,6 +1470,7 @@ static vfs_node_t *vfs_lookup_cached_path(vfs_node_t *base_dir, const char *path
     if (*p == '\0')
       break;
 
+    const char *comp_start = p;
     char comp[128];
     int i = 0;
     while (*p && *p != '/' && i < 127) {
@@ -1198,11 +1480,9 @@ static vfs_node_t *vfs_lookup_cached_path(vfs_node_t *base_dir, const char *path
 
     /* Only directories can contain another path component. */
     if ((current->flags & FS_TYPE_MASK) != FS_DIRECTORY ||
-        !vfs_access(current, 1)) {
-      if (current_ref)
-        vfs_close(current_ref);
-      return NULL;
-    }
+        !vfs_access(current, 1))
+      return vfs_cached_walk_abort(resume, current, current_ref, comp_start,
+                                   synthetic);
 
     if (strcmp(comp, ".") == 0)
       continue;
@@ -1211,18 +1491,16 @@ static vfs_node_t *vfs_lookup_cached_path(vfs_node_t *base_dir, const char *path
     vfs_node_t *next = vfs_dentry_lookup(current, comp, &negative);
     if (!next || negative) {
       /* Cache miss or negative hit: abort cached walk and fallback. */
-      if (current_ref)
-        vfs_close(current_ref);
-      return NULL;
+      return vfs_cached_walk_abort(resume, current, current_ref, comp_start,
+                                   synthetic);
     }
 
     /* If symlink or synthetic node (procfs etc), abort cached walk. */
     if (((next->flags & FS_TYPE_MASK) == FS_SYMLINK) ||
         (next->flags & FS_DENTRY_NOCACHE)) {
       vfs_close(next);
-      if (current_ref)
-        vfs_close(current_ref);
-      return NULL;
+      return vfs_cached_walk_abort(resume, current, current_ref, comp_start,
+                                   synthetic);
     }
 
     /* Lockless mountpoint traversal */
@@ -1248,6 +1526,11 @@ static vfs_node_t *vfs_lookup_cached_path(vfs_node_t *base_dir, const char *path
         return NULL;
       }
       next = m_next;
+      /* A mount target may be a generated (procfs-style) container even
+       * when the mountpoint itself was cacheable; a walk that travels
+       * through one must keep suppressing the full-path cache insert. */
+      if (next->flags & FS_DENTRY_NOCACHE)
+        synthetic = true;
     }
 
     /* Advance: release previous intermediate reference if held */
@@ -1261,6 +1544,8 @@ static vfs_node_t *vfs_lookup_cached_path(vfs_node_t *base_dir, const char *path
 }
 
 vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
+  if (vfs_namespace_active() || vfs_task_root() != fs_root)
+    return vfs_namespace_resolve(dir == fs_root ? vfs_task_root() : dir, path);
   if (!path || !path[0] || !fs_root)
     return 0;
 
@@ -1276,7 +1561,8 @@ vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
   }
 
   // 2. Speculative cached walk across path components, with owned references.
-  vfs_node_t *cached_node = vfs_lookup_cached_path(effective_dir, path);
+  struct vfs_walk_resume resume = {0};
+  vfs_node_t *cached_node = vfs_lookup_cached_path(effective_dir, path, &resume);
   if (cached_node) {
     if ((effective_dir->flags & FS_DENTRY_NOCACHE) == 0 &&
         (cached_node->flags & FS_DENTRY_NOCACHE) == 0 &&
@@ -1285,28 +1571,51 @@ vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
     }
     return cached_node;
   }
+  /* Bench-only switch: discard the proved prefix so the fallback re-walks
+   * it, which is what every resolution used to do.  Never set outside the
+   * cold-leaf A/B. */
+  if (vfs_resolve_force_restart && resume.node) {
+    vfs_close(resume.node);
+    resume.node = NULL;
+  }
 
   char path_buf[512];
-  strncpy(path_buf, path, 511);
-  path_buf[511] = '\0';
-
-  vfs_node_t *current = effective_dir;
-  vfs_open(current); // Reference for 'current'
-
-  int symlink_depth = 0;
-  /* Set when this walk descends through (or starts in) a node marked
-   * FS_DENTRY_NOCACHE: a synthetic container whose children are generated
-   * per lookup and disappear with their task (procfs' /proc root and its
-   * per-task pid dirs, drm's dynamic nodes).  Such a result is not a pure
-   * function of the path string, so it must never enter the full-path
-   * cache — see the insert at the end of this function. */
-  bool synthetic_descent =
-      (effective_dir->flags & FS_DENTRY_NOCACHE) != 0;
-  char *p = path_buf;
+  vfs_node_t *current;
+  bool resumed = resume.node != NULL;
+  bool synthetic_descent;
+  char *p;
+  int symlink_depth;
+  int stack_top; // -1 is an empty stack
 
 #define VFS_PARENT_STACK_DEPTH 32
   vfs_node_t *parent_stack[VFS_PARENT_STACK_DEPTH];
-  int stack_top = -1; // Stack is empty initially
+
+reset_walk:
+  strncpy(path_buf, resumed ? resume.path : path, 511);
+  path_buf[511] = '\0';
+
+  if (resumed) {
+    /* Continue from the node the speculative walk proved instead of
+     * re-walking the prefix: adopt the walk's reference as 'current'.  The
+     * prefix's ancestors are not on the parent stack, so a later '..' must
+     * restart the walk (see the '..' case below). */
+    current = resume.node;
+    synthetic_descent = resume.synthetic ||
+                        (current->flags & FS_DENTRY_NOCACHE) != 0;
+  } else {
+    current = effective_dir;
+    vfs_open(current); // Reference for 'current'
+    /* Set when this walk descends through (or starts in) a node marked
+     * FS_DENTRY_NOCACHE: a synthetic container whose children are generated
+     * per lookup and disappear with their task (procfs' /proc root and its
+     * per-task pid dirs, drm's dynamic nodes).  Such a result is not a pure
+     * function of the path string, so it must never enter the full-path
+     * cache — see the insert at the end of this function. */
+    synthetic_descent = (effective_dir->flags & FS_DENTRY_NOCACHE) != 0;
+  }
+  p = path_buf;
+  symlink_depth = 0;
+  stack_top = -1;
 
   if (path_buf[0] == '/') {
     while (*p == '/')
@@ -1336,6 +1645,18 @@ vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
         current = parent_stack[stack_top];
         stack_top--;
         // Ownership transferred from stack to 'current'
+        continue;
+      }
+      if (resumed) {
+        /* This '..' climbs past the resumed prefix, whose ancestors are not
+         * on the stack.  Only a relative symlink target can put it here (a
+         * path with a literal '..' never takes the speculative walk), so
+         * redo this resolution from the top once: the restart builds the
+         * full parent stack and is exactly the pre-handoff behavior. */
+        vfs_close(current);
+        resume.node = NULL;
+        resumed = false;
+        goto reset_walk;
       }
       continue;
     }
@@ -1396,6 +1717,10 @@ vfs_node_t *vfs_resolve_path_at(vfs_node_t *dir, const char *path) {
         vfs_open(current);
         while (*p == '/')
           p++;
+        /* Back at the root with an empty stack, the missing ancestors of a
+         * resumed walk no longer matter: '..' from here is the root's own
+         * parent, which the '..' case handles without a restart. */
+        resumed = false;
       }
       continue;
     }
@@ -1459,6 +1784,7 @@ void vfs_node_init(vfs_node_t *node) {
   INIT_LIST_HEAD(&node->ep_watchers);
   spinlock_init(&node->ep_lock);
   asc_radix_tree_init(&node->pages);
+  vfs_page_cache_tree_init(&node->pages);
   spinlock_init(&node->pages_lock);
   spinlock_init(&node->readdir_cursor_lock);
   node->refcount = 1;
@@ -1476,6 +1802,8 @@ int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
                  const char *path) {
   if (!target)
     return -1;
+  if (vfs_namespace_active())
+    return vfs_namespace_mount(mountpoint, target, dev_name, fs_type, path, 0);
 
   vfs_mount_entry_t *entry = kmalloc(sizeof(vfs_mount_entry_t));
   if (!entry)
@@ -1513,6 +1841,21 @@ int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
   return 0;
 }
 
+vfs_node_t *vfs_initial_filesystem(const char *type) {
+  for (vfs_mount_entry_t *m = vfs_mount_list; m; m = m->next)
+    if (!strcmp(m->fs_type, type)) { vfs_open(m->target); return m->target; }
+  return NULL;
+}
+
+int vfs_initial_mounts_copy(struct mount_namespace *ns) {
+  for (vfs_mount_entry_t *m = vfs_mount_list; m; m = m->next) {
+    int r = vfs_namespace_seed(ns, m->mountpoint, m->target, m->mount_id,
+                                m->dev_name, m->fs_type, m->path);
+    if (r) return r;
+  }
+  return 0;
+}
+
 int vfs_mount(vfs_node_t *mountpoint, vfs_node_t *target) {
   return vfs_mount_ex(mountpoint, target, "none", "unknown", NULL);
 }
@@ -1525,6 +1868,11 @@ int vfs_statfs(vfs_node_t *node, void *buf) {
 }
 
 int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count) {
+  if (vfs_namespace_active()) return vfs_namespace_mounts(buffer, max_count);
+  return vfs_initial_mounts_get(buffer, max_count);
+}
+
+int vfs_initial_mounts_get(vfs_mount_info_t *buffer, int max_count) {
   int count = 0;
 
   // Add root if it exists
@@ -1543,6 +1891,8 @@ int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count) {
 
     if (!found) {
       buffer[count].mount_id = fs_root->mount_id ? fs_root->mount_id : 1;
+      buffer[count].parent_id = buffer[count].mount_id;
+      buffer[count].flags = 0;
       strcpy(buffer[count].mountpoint, "/");
       strcpy(buffer[count].target, "/");
       strcpy(buffer[count].dev_name, "none");
@@ -1554,6 +1904,8 @@ int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count) {
   vfs_mount_entry_t *curr = vfs_mount_list;
   while (curr && count < max_count) {
     buffer[count].mount_id = curr->mount_id;
+    buffer[count].parent_id = fs_root && fs_root->mount_id ? fs_root->mount_id : 1;
+    buffer[count].flags = 0;
     /* Use the recorded mountpoint path, not the node's name: userspace
      * (OpenRC's mountinfo, findmnt, ...) matches full paths. */
     strncpy(buffer[count].mountpoint,
@@ -1649,6 +2001,230 @@ static void vfs_bench_make_path(char *buf, uint32_t index) {
   buf[pos] = '\0';
 }
 
+/* ── Speculative-prefix handoff (`vfs_selftest=1` / `vfs_bench=1`) ──────────
+ *
+ * vfs_lookup_cached_path() proves a path prefix through the dentry cache and
+ * stops at the first component it cannot serve; the general walk then
+ * continues from that node instead of re-walking the prefix.  The fixtures
+ * below are synthetic directories served by an on-demand finddir(), so no
+ * backend has to exist and the tests can pick exactly where a walk stops.
+ * (Also used by vfs_cold_leaf_bench() further down.) */
+
+#define VFS_MOCK_MAX_NODES 8u
+#define VFS_MOCK_MAX_CHILDREN 4u
+
+struct vfs_mock_node {
+  vfs_node_t *node;
+  const char *link_target;
+  struct {
+    const char *name;
+    vfs_node_t *child;
+  } children[VFS_MOCK_MAX_CHILDREN];
+  uint32_t count;
+};
+
+static struct vfs_mock_node vfs_mock_table[VFS_MOCK_MAX_NODES];
+static uint32_t vfs_mock_used;
+
+static vfs_node_t *vfs_mock_finddir(vfs_node_t *dir, char *name) {
+  struct vfs_mock_node *mock = dir->device;
+  if (!mock)
+    return NULL;
+  for (uint32_t i = 0; i < mock->count; i++) {
+    if (strcmp(mock->children[i].name, name) == 0) {
+      vfs_open(mock->children[i].child);
+      return mock->children[i].child;
+    }
+  }
+  return NULL;
+}
+
+static int vfs_mock_readlink(vfs_node_t *node, char *buf, uint32_t size) {
+  struct vfs_mock_node *mock = node->device;
+  if (!mock || !mock->link_target || !size)
+    return -1;
+  uint32_t len = (uint32_t)strlen(mock->link_target);
+  if (len >= size)
+    len = size - 1;
+  memcpy(buf, mock->link_target, len);
+  buf[len] = '\0';
+  return (int)len;
+}
+
+static vfs_node_t *vfs_mock_add(const char *name, uint32_t flags,
+                                uint32_t mask) {
+  if (vfs_mock_used >= VFS_MOCK_MAX_NODES)
+    return NULL;
+  vfs_node_t *node = vfs_probe_node_create(name);
+  if (!node)
+    return NULL;
+  struct vfs_mock_node *mock = &vfs_mock_table[vfs_mock_used++];
+  memset(mock, 0, sizeof(*mock));
+  mock->node = node;
+  node->flags = flags;
+  node->mask = mask;
+  node->device = mock;
+  uint32_t type = flags & FS_TYPE_MASK;
+  if (type == FS_DIRECTORY)
+    node->finddir = vfs_mock_finddir;
+  else if (type == FS_SYMLINK)
+    node->readlink = vfs_mock_readlink;
+  return node;
+}
+
+static void vfs_mock_link(vfs_node_t *parent, const char *name,
+                          vfs_node_t *child) {
+  struct vfs_mock_node *mock = parent->device;
+  if (mock && mock->count < VFS_MOCK_MAX_CHILDREN) {
+    mock->children[mock->count].name = name;
+    mock->children[mock->count].child = child;
+    mock->count++;
+  }
+}
+
+/* Release the fixture: flush the path cache, invalidate every dentry entry a
+ * walk may have installed, then drop the nodes' creation references. */
+static void vfs_mock_release(vfs_node_t *root) {
+  if (!root)
+    return;
+  struct vfs_mock_node *mock = root->device;
+  vfs_path_cache_invalidate();
+  if (mock) {
+    for (uint32_t i = 0; i < mock->count; i++) {
+      vfs_dentry_invalidate(root, mock->children[i].name);
+      vfs_mock_release(mock->children[i].child);
+    }
+  }
+  vfs_close(root);
+  vfs_mock_used = 0;
+}
+
+/* Close whatever the fixture created after a partial setup failure. */
+static void vfs_mock_release_all(void) {
+  for (uint32_t i = 0; i < vfs_mock_used; i++)
+    vfs_close(vfs_mock_table[i].node);
+  vfs_mock_used = 0;
+}
+
+static bool vfs_prefix_resume_selftest(void) {
+  if (!fs_root)
+    return false;
+
+  uint32_t failures_before = vfs_selftest_failures;
+
+  /* 1. Cold leaf behind a hot prefix: the walk must stop at the leaf and
+   *    hand the parent back, both resolution forms must agree, and the
+   *    resumed walk must still cache the full path. */
+  vfs_node_t *base = vfs_mock_add("presume_base", FS_DIRECTORY, 0755);
+  vfs_node_t *d1 = vfs_mock_add("presume_d1", FS_DIRECTORY, 0755);
+  vfs_node_t *d2 = vfs_mock_add("presume_d2", FS_DIRECTORY, 0755);
+  vfs_node_t *leaf = vfs_mock_add("presume_leaf", FS_FILE, 0644);
+  if (!base || !d1 || !d2 || !leaf) {
+    vfs_mock_release_all();
+    return false;
+  }
+  vfs_mock_link(base, "presume_d1", d1);
+  vfs_mock_link(d1, "presume_d2", d2);
+  vfs_mock_link(d2, "presume_leaf", leaf);
+
+  const char cold_path[] = "presume_d1/presume_d2/presume_leaf";
+  vfs_node_t *warm = vfs_resolve_path_at(base, cold_path);
+  vfs_selftest_expect(warm == leaf, "resume fixture resolves before the test");
+  if (warm)
+    vfs_close(warm);
+
+  /* Keep the prefix hot in the dentry cache, make the leaf cold. */
+  vfs_path_cache_invalidate();
+  vfs_dentry_invalidate(d2, "presume_leaf");
+
+  struct vfs_walk_resume probe = {0};
+  vfs_node_t *partial = vfs_lookup_cached_path(base, cold_path, &probe);
+  vfs_selftest_expect(partial == NULL && probe.node == d2 &&
+                          probe.path && strcmp(probe.path, "presume_leaf") == 0,
+                      "cold leaf stops the walk and hands back the prefix");
+  if (probe.node)
+    vfs_close(probe.node);
+
+  vfs_dentry_invalidate(d2, "presume_leaf");
+  vfs_node_t *resumed_hit = vfs_resolve_path_at(base, cold_path);
+
+  vfs_node_t *pc_hit =
+      resumed_hit == leaf ? vfs_path_cache_lookup(base, cold_path) : NULL;
+  vfs_selftest_expect(pc_hit == leaf,
+                      "resumed walk still caches the full path");
+  if (pc_hit)
+    vfs_close(pc_hit);
+
+  vfs_path_cache_invalidate();
+  vfs_dentry_invalidate(d2, "presume_leaf");
+  vfs_resolve_force_restart = true;
+  vfs_node_t *restart_hit = vfs_resolve_path_at(base, cold_path);
+  vfs_resolve_force_restart = false;
+
+  vfs_selftest_expect(resumed_hit == leaf && restart_hit == leaf,
+                      "resumed and restart walks agree on a cold leaf");
+  if (resumed_hit)
+    vfs_close(resumed_hit);
+  if (restart_hit)
+    vfs_close(restart_hit);
+
+  vfs_mock_release(base);
+
+  /* 2. A relative symlink target with '..' must climb past the resume point.
+   *    Only the restart from the top can do that (the ancestors are not on
+   *    the stack), and it must still produce the ordinary walk's result. */
+  vfs_node_t *sbase = vfs_mock_add("presume_sbase", FS_DIRECTORY, 0755);
+  vfs_node_t *s1 = vfs_mock_add("presume_s1", FS_DIRECTORY, 0755);
+  vfs_node_t *s2 = vfs_mock_add("presume_s2", FS_DIRECTORY, 0755);
+  vfs_node_t *link = vfs_mock_add("presume_link", FS_SYMLINK, 0777);
+  vfs_node_t *target = vfs_mock_add("presume_target", FS_FILE, 0644);
+  if (!sbase || !s1 || !s2 || !link || !target) {
+    vfs_mock_release_all();
+    return false;
+  }
+  vfs_mock_link(sbase, "presume_s1", s1);
+  vfs_mock_link(sbase, "presume_s2", s2);
+  vfs_mock_link(s1, "presume_link", link);
+  vfs_mock_link(s2, "presume_target", target);
+  ((struct vfs_mock_node *)link->device)->link_target =
+      "../presume_s2/presume_target";
+
+  const char link_path[] = "presume_s1/presume_link";
+  vfs_node_t *warm_link = vfs_resolve_path_at(sbase, link_path);
+  vfs_selftest_expect(warm_link == target,
+                      "symlink fixture resolves through '..' before the test");
+  if (warm_link)
+    vfs_close(warm_link);
+
+  vfs_path_cache_invalidate();
+  struct vfs_walk_resume lprobe = {0};
+  vfs_node_t *lpartial = vfs_lookup_cached_path(sbase, link_path, &lprobe);
+  vfs_selftest_expect(lpartial == NULL && lprobe.node == s1 &&
+                          lprobe.path && strcmp(lprobe.path, "presume_link") == 0,
+                      "symlink stops the walk and hands back the prefix");
+  if (lprobe.node)
+    vfs_close(lprobe.node);
+
+  vfs_node_t *resumed_link = vfs_resolve_path_at(sbase, link_path);
+  vfs_selftest_expect(resumed_link == target,
+                      "resumed walk climbs '..' past the prefix");
+  if (resumed_link)
+    vfs_close(resumed_link);
+
+  vfs_path_cache_invalidate();
+  vfs_resolve_force_restart = true;
+  vfs_node_t *restart_link = vfs_resolve_path_at(sbase, link_path);
+  vfs_resolve_force_restart = false;
+  vfs_selftest_expect(restart_link == target,
+                      "forced restart agrees on the symlink path");
+  if (restart_link)
+    vfs_close(restart_link);
+
+  vfs_mock_release(sbase);
+
+  return vfs_selftest_failures == failures_before;
+}
+
 static bool vfs_path_cache_selftest(void) {
   if (!fs_root)
     return false;
@@ -1733,6 +2309,107 @@ static bool vfs_path_cache_selftest(void) {
   return vfs_selftest_failures == 0;
 }
 
+/* `vfs_selftest=1`: the lockless lookup paths and the deferred reclamation
+ * they depend on.  Every lookup that has two forms is run once lockless and
+ * once with the pre-RCU locked path forced; both must agree. */
+static bool vfs_lockless_selftest(void) {
+  if (!fs_root)
+    return false;
+
+  uint32_t failures_before = vfs_selftest_failures;
+  vfs_selftest_expect(vfs_rcu_ready(),
+                      "deferred node reclamation engine is active");
+
+  vfs_node_t *parent = vfs_probe_node_create("vfsrcu_parent");
+  vfs_node_t *child = vfs_probe_node_create("vfsrcu_child");
+  if (!parent || !child) {
+    vfs_close(parent);
+    vfs_close(child);
+    return false;
+  }
+  parent->flags = FS_DIRECTORY;
+
+  static const char name[] = "vfsrcu_entry";
+
+  /* Positive hit: both forms must find the child. */
+  vfs_dentry_insert(parent, name, child);
+  for (uint32_t mode = 0; mode < 2; mode++) {
+    vfs_dentry_lookup_force_locked = mode != 0;
+    bool negative = false;
+    vfs_node_t *hit = vfs_dentry_lookup(parent, name, &negative);
+    vfs_selftest_expect(hit == child && !negative,
+                        mode ? "locked dentry lookup hits"
+                             : "lockless dentry lookup hits");
+    if (hit)
+      vfs_close(hit);
+  }
+  vfs_dentry_lookup_force_locked = false;
+
+  /* Stable miss, then a cached negative entry, then invalidation. */
+  bool negative = false;
+  vfs_node_t *hit = vfs_dentry_lookup(parent, "vfsrcu_absent", &negative);
+  vfs_selftest_expect(!hit && !negative,
+                      "lockless dentry miss is not negative");
+
+  vfs_dentry_insert(parent, "vfsrcu_absent", NULL);
+  negative = false;
+  hit = vfs_dentry_lookup(parent, "vfsrcu_absent", &negative);
+  vfs_selftest_expect(!hit && negative, "lockless dentry negative entry");
+
+  vfs_dentry_invalidate(parent, name);
+  negative = false;
+  hit = vfs_dentry_lookup(parent, name, &negative);
+  vfs_selftest_expect(!hit && !negative,
+                      "lockless dentry invalidate drops the entry");
+  if (hit)
+    vfs_close(hit);
+
+  /* Full-path cache: the same agreement, plus generation invalidation. */
+  static const char path[] = "/vfsrcu_selftest";
+  vfs_path_cache_insert(fs_root, path, child);
+  for (uint32_t mode = 0; mode < 2; mode++) {
+    vfs_path_lookup_force_locked = mode != 0;
+    vfs_node_t *phit = vfs_path_cache_lookup(fs_root, path);
+    vfs_selftest_expect(phit == child, mode ? "locked path lookup hits"
+                                            : "lockless path lookup hits");
+    if (phit)
+      vfs_close(phit);
+  }
+  vfs_path_lookup_force_locked = false;
+
+  vfs_path_invalidate_record("vfsrcu_selftest");
+  hit = vfs_path_cache_lookup(fs_root, path);
+  vfs_selftest_expect(!hit, "lockless path lookup drops invalidated entry");
+  if (hit)
+    vfs_close(hit);
+  vfs_path_cache_drop(fs_root, path);
+
+  /* Deferred free: every victim is inserted, invalidated and closed, so the
+   * last close enqueues it; the nodes must only be reclaimed after a grace
+   * period, exactly once each. */
+  uint64_t freed_before = vfs_rcu_freed_count();
+  const uint32_t freed_cycles = 64;
+  for (uint32_t i = 0; i < freed_cycles; i++) {
+    vfs_node_t *victim = vfs_probe_node_create("vfsrcu_victim");
+    if (!victim)
+      break;
+    vfs_dentry_insert(parent, "vfsrcu_victim", victim);
+    vfs_dentry_invalidate(parent, "vfsrcu_victim");
+    vfs_close(victim);
+  }
+  vfs_rcu_synchronize();
+  uint64_t freed_after = vfs_rcu_freed_count();
+  vfs_selftest_expect(freed_after >= freed_before + freed_cycles,
+                      "deferred frees reclaim after a grace period");
+  vfs_selftest_expect(vfs_rcu_queued_count() == 0,
+                      "deferred free queue drains");
+
+  vfs_dentry_invalidate(parent, "vfsrcu_absent");
+  vfs_close(child);
+  vfs_close(parent);
+  return vfs_selftest_failures == failures_before;
+}
+
 void vfs_selftest_maybe_run(void) {
   if (!kernel_boot_cmdline || !strstr(kernel_boot_cmdline, "vfs_selftest"))
     return;
@@ -1741,13 +2418,22 @@ void vfs_selftest_maybe_run(void) {
   klog_puts("[VFS-SELFTEST] path cache invalidation + page cache refs\n");
   bool path_ok = vfs_path_cache_selftest();
   bool page_ok = vfs_cache_ref_selftest();
+  bool page_lockless_ok = vfs_cache_lockless_selftest();
   bool dir_ok = vfs_dirindex_selftest();
+  bool lockless_ok = vfs_lockless_selftest();
+  bool prefix_ok = vfs_prefix_resume_selftest();
   klog_puts("[VFS-SELFTEST] path cache: ");
   klog_puts(path_ok ? "PASS" : "FAIL");
   klog_puts(", page cache refs: ");
   klog_puts(page_ok ? "PASS" : "FAIL");
+  klog_puts(", page lockless: ");
+  klog_puts(page_lockless_ok ? "PASS" : "FAIL");
   klog_puts(", dirindex: ");
   klog_puts(dir_ok ? "PASS" : "FAIL");
+  klog_puts(", lockless lookups: ");
+  klog_puts(lockless_ok ? "PASS" : "FAIL");
+  klog_puts(", prefix resume: ");
+  klog_puts(prefix_ok ? "PASS" : "FAIL");
   klog_putchar('\n');
 }
 
@@ -1874,10 +2560,16 @@ static void vfs_path_cache_bench(void) {
   vfs_bench_report("path-inval log-append", VFS_BENCH_ITERS,
                    rdtsc_fence() - t0);
 
-  /* Benchmark path cache lookup */
-  t0 = rdtsc_fence();
+  /* Lookup A/B: identical warm entries, once with the bucket lock forced and
+   * once through the lockless seqlock path.  The delta is the lock. */
+  const uint32_t hit_iters = VFS_BENCH_ITERS * 16;
+  uint64_t locked_cycles;
+  uint64_t lockless_cycles;
   uint64_t hits = 0;
-  for (uint32_t i = 0; i < VFS_BENCH_ITERS; i++) {
+
+  vfs_path_lookup_force_locked = true;
+  uint64_t t_hit = rdtsc_fence();
+  for (uint32_t i = 0; i < hit_iters; i++) {
     char pbuf[64];
     vfs_bench_make_path(pbuf, i % VFS_BENCH_PATHS);
     vfs_node_t *h = vfs_path_cache_lookup(fs_root, pbuf);
@@ -1886,8 +2578,28 @@ static void vfs_path_cache_bench(void) {
       vfs_close(h);
     }
   }
-  vfs_bench_report("cached dcache-hit", VFS_BENCH_ITERS,
-                   rdtsc_fence() - t0);
+  locked_cycles = rdtsc_fence() - t_hit;
+
+  vfs_path_lookup_force_locked = false;
+  t_hit = rdtsc_fence();
+  for (uint32_t i = 0; i < hit_iters; i++) {
+    char pbuf[64];
+    vfs_bench_make_path(pbuf, i % VFS_BENCH_PATHS);
+    vfs_node_t *h = vfs_path_cache_lookup(fs_root, pbuf);
+    if (h) {
+      hits++;
+      vfs_close(h);
+    }
+  }
+  lockless_cycles = rdtsc_fence() - t_hit;
+
+  vfs_bench_report("cached dcache-hit locked  ", hit_iters, locked_cycles);
+  vfs_bench_report("cached dcache-hit lockless", hit_iters, lockless_cycles);
+  if (locked_cycles > lockless_cycles)
+    vfs_bench_report("cached dcache-hit saved   ", hit_iters,
+                     locked_cycles - lockless_cycles);
+  if (!hits)
+    klog_puts("[VFS-BENCH] path-cache A/B found no entries\n");
 
   vfs_path_cache_invalidate();
   for (uint32_t i = 0; i < created; i++)
@@ -1953,6 +2665,312 @@ static bool vfs_path_unlink_bench(void) {
   return true;
 }
 
+/* ── Cold-leaf resolution A/B (`vfs_bench=1`) ───────────────────────────────
+ *
+ * The caching shape that misses both caches: the parent directories are hot
+ * in the dentry cache, the leaf resolves for the first time (or right after
+ * a directory write invalidated it).  The speculative walk proves the
+ * prefix, then stops at the leaf; before prefix handoff the general walk
+ * re-walked every parent bucket.  Both forms here resolve the same path
+ * with the same warm prefix and a freshly invalidated leaf, so the delta is
+ * the duplicated prefix walk.  The fixture is synthetic directories with an
+ * on-demand finddir(), so no backend I/O is in the numbers. */
+
+#define VFS_COLD_LEAF_ITERS 20000u
+
+static void vfs_cold_leaf_bench(void) {
+  vfs_node_t *base = vfs_mock_add("coldbase", FS_DIRECTORY, 0755);
+  vfs_node_t *c1 = vfs_mock_add("c1", FS_DIRECTORY, 0755);
+  vfs_node_t *c2 = vfs_mock_add("c2", FS_DIRECTORY, 0755);
+  vfs_node_t *c3 = vfs_mock_add("c3", FS_DIRECTORY, 0755);
+  vfs_node_t *leaf = vfs_mock_add("leaf", FS_FILE, 0644);
+  if (!base || !c1 || !c2 || !c3 || !leaf) {
+    vfs_mock_release_all();
+    return;
+  }
+  vfs_mock_link(base, "c1", c1);
+  vfs_mock_link(c1, "c2", c2);
+  vfs_mock_link(c2, "c3", c3);
+  vfs_mock_link(c3, "leaf", leaf);
+
+  const char path[] = "c1/c2/c3/leaf";
+  vfs_node_t *warm = vfs_resolve_path_at(base, path);
+  if (warm)
+    vfs_close(warm);
+  if (warm != leaf) {
+    klog_puts("[VFS-BENCH] cold-leaf fixture failed to resolve\n");
+    vfs_mock_release(base);
+    return;
+  }
+
+  uint64_t hits = 0;
+  uint64_t t0 = rdtsc_fence();
+  for (uint32_t i = 0; i < VFS_COLD_LEAF_ITERS; i++) {
+    vfs_dentry_invalidate(c3, "leaf");
+    vfs_node_t *hit = vfs_resolve_path_at(base, path);
+    if (hit) {
+      hits++;
+      vfs_close(hit);
+    }
+  }
+  uint64_t resume_cycles = rdtsc_fence() - t0;
+
+  vfs_resolve_force_restart = true;
+  t0 = rdtsc_fence();
+  for (uint32_t i = 0; i < VFS_COLD_LEAF_ITERS; i++) {
+    vfs_dentry_invalidate(c3, "leaf");
+    vfs_node_t *hit = vfs_resolve_path_at(base, path);
+    if (hit) {
+      hits++;
+      vfs_close(hit);
+    }
+  }
+  uint64_t restart_cycles = rdtsc_fence() - t0;
+  vfs_resolve_force_restart = false;
+
+  if (hits != (uint64_t)VFS_COLD_LEAF_ITERS * 2)
+    klog_puts("[VFS-BENCH] cold-leaf: resolutions failed, numbers not "
+              "comparable\n");
+
+  vfs_bench_report("cold-leaf resume-prefix", VFS_COLD_LEAF_ITERS,
+                   resume_cycles);
+  vfs_bench_report("cold-leaf restart      ", VFS_COLD_LEAF_ITERS,
+                   restart_cycles);
+  if (restart_cycles > resume_cycles)
+    vfs_bench_report("cold-leaf saved        ", VFS_COLD_LEAF_ITERS,
+                     restart_cycles - resume_cycles);
+
+  vfs_mock_release(base);
+}
+
+/* ── Lockless dentry lookup A/B (`vfs_bench=1`) ────────────────────────────
+ *
+ * The dentry cache serves every path component; the change these numbers
+ * measure removed its per-bucket lock from the read side.  The single-CPU
+ * rounds show the lock's own cost on a warm hit.  The multi-CPU phase has
+ * every worker hammer the same bucket - the shared-library case - which is
+ * also where the lock bounced the bucket cacheline between cores; the
+ * stress phase churns that entry (insert/invalidate/free) under the workers
+ * so the deferred-reclamation path runs at full tilt.  Both forms read the
+ * same warm entry, so the delta is the lookup code, not the working set. */
+
+#define VFS_DENTRY_BENCH_ITERS 200000u
+#define VFS_DENTRY_BENCH_THREADS 3u
+#define VFS_DENTRY_BENCH_STRESS_ITERS 200000u
+#define VFS_DENTRY_BENCH_MUTATIONS 2000u
+
+static vfs_node_t *vfs_dentry_bench_parent;
+static vfs_node_t *vfs_dentry_bench_child;
+static const char vfs_dentry_bench_name[] = "vfsbench_lookup";
+static uint32_t vfs_dentry_bench_iters;
+static volatile uint32_t vfs_dentry_bench_go;
+static volatile uint32_t vfs_dentry_bench_done;
+static volatile uint32_t vfs_dentry_bench_hits;
+static volatile uint32_t vfs_dentry_bench_bad;
+
+static void vfs_dentry_bench_worker(void) {
+  while (!__atomic_load_n(&vfs_dentry_bench_go, __ATOMIC_ACQUIRE))
+    sched_yield();
+  uint32_t hits = 0;
+  uint32_t bad = 0;
+  for (uint32_t i = 0; i < vfs_dentry_bench_iters; i++) {
+    bool negative = false;
+    vfs_node_t *hit = vfs_dentry_lookup(
+        vfs_dentry_bench_parent, vfs_dentry_bench_name, &negative);
+    if (hit) {
+      hits++;
+      /* A returned reference must name a live node; a clobbered marker means
+       * the reclamation protocol handed out a freed node. */
+      if (hit->magic != VFS_NODE_MAGIC)
+        bad++;
+      vfs_close(hit);
+    }
+  }
+  __atomic_add_fetch(&vfs_dentry_bench_hits, hits, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&vfs_dentry_bench_bad, bad, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&vfs_dentry_bench_done, 1, __ATOMIC_ACQ_REL);
+}
+
+static void vfs_dentry_bench_worker0(void) { vfs_dentry_bench_worker(); }
+static void vfs_dentry_bench_worker1(void) { vfs_dentry_bench_worker(); }
+static void vfs_dentry_bench_worker2(void) { vfs_dentry_bench_worker(); }
+
+static uint64_t vfs_dentry_bench_single(bool force_locked) {
+  vfs_dentry_lookup_force_locked = force_locked;
+  uint64_t t0 = rdtsc_fence();
+  for (uint32_t i = 0; i < VFS_DENTRY_BENCH_ITERS; i++) {
+    bool negative = false;
+    vfs_node_t *hit = vfs_dentry_lookup(
+        vfs_dentry_bench_parent, vfs_dentry_bench_name, &negative);
+    if (hit)
+      vfs_close(hit);
+  }
+  uint64_t cycles = rdtsc_fence() - t0;
+  vfs_dentry_lookup_force_locked = false;
+  return cycles;
+}
+
+static void vfs_dentry_bench_report(const char *name, uint64_t ops,
+                                    uint64_t cycles, uint64_t single_cycles) {
+  klog_puts("[VFS-BENCH] ");
+  klog_puts(name);
+  klog_puts(": ");
+  klog_uint64(ops);
+  klog_puts(" ops, ");
+  uint64_t per_op = ops ? cycles / ops : 0;
+  klog_uint64(per_op);
+  klog_puts(" cycles/op");
+  if (single_cycles && per_op) {
+    klog_puts(", ");
+    klog_uint64(per_op * 100 / single_cycles);
+    klog_puts("% of 1cpu");
+  }
+  klog_putchar('\n');
+}
+
+/* Start the workers and return how many came up. */
+static uint32_t vfs_dentry_bench_start_workers(uint32_t iters) {
+  static void (*const entries[VFS_DENTRY_BENCH_THREADS])(void) = {
+      vfs_dentry_bench_worker0, vfs_dentry_bench_worker1,
+      vfs_dentry_bench_worker2};
+
+  __atomic_store_n(&vfs_dentry_bench_hits, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&vfs_dentry_bench_bad, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&vfs_dentry_bench_done, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&vfs_dentry_bench_go, 0, __ATOMIC_RELEASE);
+  vfs_dentry_bench_iters = iters;
+
+  uint32_t started = 0;
+  for (uint32_t i = 0; i < VFS_DENTRY_BENCH_THREADS; i++) {
+    /* One worker per AP: a NULL explicit CPU would put them all on the BSP,
+     * which is exactly the serialization these phases exist to expose. */
+    struct cpu_info *target = cpu_get_info(i + 1);
+    if (!target || target->status == CPU_STATUS_OFFLINE)
+      break;
+    if (!sched_create_kernel_thread(entries[i], target, true))
+      break;
+    started++;
+  }
+  if (started)
+    __atomic_store_n(&vfs_dentry_bench_go, 1, __ATOMIC_RELEASE);
+  return started;
+}
+
+static void vfs_dentry_bench_wait_workers(uint32_t started, uint64_t t0) {
+  uint64_t deadline = tsc_get_freq_khz() * 500;
+  while (__atomic_load_n(&vfs_dentry_bench_done, __ATOMIC_ACQUIRE) < started) {
+    if (deadline && rdtsc_fence() - t0 > deadline)
+      break;
+    sched_yield();
+  }
+}
+
+static void vfs_dentry_bench_run_phase(const char *name, bool force_locked,
+                                       uint64_t single_cycles) {
+  vfs_dentry_lookup_force_locked = force_locked;
+  uint32_t started = vfs_dentry_bench_start_workers(VFS_DENTRY_BENCH_ITERS);
+  if (!started) {
+    vfs_dentry_lookup_force_locked = false;
+    return;
+  }
+
+  uint64_t ops = 0;
+  uint64_t t0 = rdtsc_fence();
+  for (uint32_t i = 0; i < VFS_DENTRY_BENCH_ITERS; i++) {
+    bool negative = false;
+    vfs_node_t *hit = vfs_dentry_lookup(
+        vfs_dentry_bench_parent, vfs_dentry_bench_name, &negative);
+    if (hit)
+      vfs_close(hit);
+    ops++;
+  }
+  vfs_dentry_bench_wait_workers(started, t0);
+  uint64_t cycles = rdtsc_fence() - t0;
+  vfs_dentry_lookup_force_locked = false;
+
+  ops += (uint64_t)started * VFS_DENTRY_BENCH_ITERS;
+  vfs_dentry_bench_report(name, ops, cycles, single_cycles);
+}
+
+/* Churn the benchmark entry - fresh node, insert, invalidate, last close -
+ * while the workers read it.  Every hit must name a live node; the deferred
+ * free path is what keeps that true. */
+static void vfs_dentry_bench_stress_phase(void) {
+  uint32_t started =
+      vfs_dentry_bench_start_workers(VFS_DENTRY_BENCH_STRESS_ITERS);
+  if (!started)
+    return;
+
+  uint64_t t0 = rdtsc_fence();
+  uint32_t mutations = 0;
+  for (uint32_t i = 0; i < VFS_DENTRY_BENCH_MUTATIONS; i++) {
+    vfs_node_t *victim = vfs_probe_node_create("vfsbench_lookup");
+    if (!victim)
+      break;
+    vfs_dentry_insert(vfs_dentry_bench_parent, vfs_dentry_bench_name, victim);
+    vfs_dentry_invalidate(vfs_dentry_bench_parent, vfs_dentry_bench_name);
+    vfs_close(victim);
+    mutations++;
+  }
+  vfs_dentry_bench_wait_workers(started, t0);
+  uint64_t cycles = rdtsc_fence() - t0;
+
+  uint64_t hits = __atomic_load_n(&vfs_dentry_bench_hits, __ATOMIC_RELAXED);
+  uint64_t bad = __atomic_load_n(&vfs_dentry_bench_bad, __ATOMIC_RELAXED);
+  klog_puts("[VFS-BENCH] 4cpu stress+churn: ");
+  klog_uint64(mutations);
+  klog_puts(" mutations, ");
+  klog_uint64(hits);
+  klog_puts(" hits, ");
+  klog_uint64(bad);
+  klog_puts(" dead, ");
+  klog_uint64(cycles);
+  klog_puts(" cycles\n");
+}
+
+static void vfs_dentry_lockless_bench(void) {
+  vfs_dentry_bench_parent = vfs_probe_node_create("vfsbench_parent");
+  vfs_dentry_bench_child = vfs_probe_node_create("vfsbench_lookup");
+  if (!vfs_dentry_bench_parent || !vfs_dentry_bench_child) {
+    vfs_close(vfs_dentry_bench_parent);
+    vfs_close(vfs_dentry_bench_child);
+    return;
+  }
+  vfs_dentry_bench_parent->flags = FS_DIRECTORY;
+  vfs_dentry_insert(vfs_dentry_bench_parent, vfs_dentry_bench_name,
+                    vfs_dentry_bench_child);
+
+  /* Warm the entry so both A/B rounds measure the steady state. */
+  for (uint32_t i = 0; i < 64; i++) {
+    bool negative = false;
+    vfs_node_t *hit = vfs_dentry_lookup(
+        vfs_dentry_bench_parent, vfs_dentry_bench_name, &negative);
+    if (hit)
+      vfs_close(hit);
+  }
+
+  uint64_t locked = vfs_dentry_bench_single(true);
+  uint64_t lockless = vfs_dentry_bench_single(false);
+  vfs_bench_report("dentry hit locked  ", VFS_DENTRY_BENCH_ITERS, locked);
+  vfs_bench_report("dentry hit lockless", VFS_DENTRY_BENCH_ITERS, lockless);
+  if (locked > lockless)
+    vfs_bench_report("dentry hit saved   ", VFS_DENTRY_BENCH_ITERS,
+                     locked - lockless);
+
+  if (cpu_get_count() >= 2) {
+    klog_puts("[VFS-BENCH] multi-cpu dentry lookup, same bucket\n");
+    vfs_dentry_bench_run_phase("4cpu dentry locked  ", true, locked);
+    vfs_dentry_bench_run_phase("4cpu dentry lockless", false, lockless);
+    vfs_dentry_bench_stress_phase();
+  } else {
+    klog_puts("[VFS-BENCH] multi-cpu dentry lookup skipped: single CPU\n");
+  }
+
+  vfs_dentry_invalidate(vfs_dentry_bench_parent, vfs_dentry_bench_name);
+  vfs_close(vfs_dentry_bench_child);
+  vfs_close(vfs_dentry_bench_parent);
+}
+
 void vfs_bench_maybe_run(void) {
   if (!kernel_boot_cmdline || !strstr(kernel_boot_cmdline, "vfs_bench"))
     return;
@@ -1961,6 +2979,8 @@ void vfs_bench_maybe_run(void) {
   klog_uint64(VFS_BENCH_PATHS);
   klog_puts(" cached paths)\n");
   vfs_path_cache_bench();
+  vfs_dentry_lockless_bench();
+  vfs_cold_leaf_bench();
   if (!vfs_path_unlink_bench())
     klog_puts("[VFS-BENCH] create+unlink pair skipped: no writable /tmp\n");
   vfs_cache_bench();

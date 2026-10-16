@@ -27,6 +27,7 @@ code=r'''
 #define VFS_DENTRY_BUCKETS 4
 #define VFS_DENTRY_BUCKET_MASK 3
 #define VFS_PAGE_MAGIC 123
+#define CACHE_BATCH 64u
 struct page {uint32_t magic,refs;bool dirty,loading,writeback;uint64_t frame_phys,last_used;};
 typedef struct page vfs_page_t;
 struct tree {vfs_page_t *p[4];};
@@ -62,8 +63,8 @@ static vfs_page_t *cache_delete_locked(vfs_node_t *n,uint64_t k,bool *r){
 static void cache_page_release(vfs_page_t *p){assert(phys_refs[p->frame_phys]==1 && !p->refs && !p->dirty && !p->loading && !p->writeback);phys_refs[p->frame_phys]=0;p->magic=0;released++;}
 '''
 path='kernel/src/fs/page_cache.c'
-code+=extract(path,'struct reclaim_search {')+';\n'
-code+=extract(path,'static bool find_reclaimable(')
+code+=extract(path,'struct reclaim_batch {')+';\n'
+code+=extract(path,'static bool collect_reclaimable(')
 code+=extract(path,'size_t vfs_cache_reclaim(')
 code+=extract('kernel/src/fs/vfs.c','size_t vfs_dentry_reclaim_pages(')
 code+=extract(os.environ.get('VMM_SOURCE','kernel/src/mm/vmm_free.c'),'static void reclaim_unmapped_file_cache(')

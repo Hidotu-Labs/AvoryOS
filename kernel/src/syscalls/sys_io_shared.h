@@ -86,6 +86,7 @@ static inline void fd_node_put(vfs_node_t **node) {
 #define F_SETLK 6
 #define F_SETLKW 7
 #define F_SETOWN 8
+#define F_DUPFD_QUERY 1027
 #define F_DUPFD_CLOEXEC 1030
 
 // ---------------------------------------------------------------------------
@@ -246,38 +247,31 @@ struct oss_count_info {
 // ---------------------------------------------------------------------------
 // inotify
 // ---------------------------------------------------------------------------
-#define MAX_INOTIFY_WATCHES 128
-#define MAX_INOTIFY_INSTANCES 32
+#include "../fs/inotify_limits.h"
 
-#define IN_ACCESS 0x1
-#define IN_MODIFY 0x2
-#define IN_ATTRIB 0x4
-#define IN_CLOSE_WRITE 0x8
-#define IN_CLOSE_NOWRITE 0x10
-#define IN_OPEN 0x20
-#define IN_MOVED_FROM 0x40
-#define IN_MOVED_TO 0x80
-#define IN_CREATE 0x100
-#define IN_DELETE 0x200
-#define IN_DELETE_SELF 0x400
-#define IN_MOVE_SELF 0x800
+#include "../fs/inotify.h"
+#define INOTIFY_QUEUE_SIZE 64
 
 typedef struct {
   uint32_t wd;
-  char path[256];
   uint32_t mask;
-  uint32_t event_mask;
+  vfs_node_t *target;
 } inotify_watch_t;
+
+struct avory_inotify_event {
+  int32_t wd;
+  uint32_t mask, cookie, len;
+  char name[256];
+};
 
 typedef struct {
   uint32_t instance_id;
   inotify_watch_t watches[MAX_INOTIFY_WATCHES];
   uint32_t num_watches;
-  uint64_t event_queue[256];
-  uint32_t queue_head;
-  uint32_t queue_tail;
-  /* Event wait state. Producers are not hooked up yet, so the queue stays
-   * empty and readers park here instead of spinning on EOF. */
+  struct avory_inotify_event event_queue[INOTIFY_QUEUE_SIZE];
+  uint32_t queue_head, queue_tail;
+  bool overflow;
+  vfs_node_t *node;
   wait_queue_t wq;
   spinlock_t lock;
 } inotify_instance_t;

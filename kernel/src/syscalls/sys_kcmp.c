@@ -1,3 +1,5 @@
+#include "../sched/pid_namespace.h"
+#include "../sched/capability.h"
 // kcmp(2) — compare the kernel resources of two tasks.
 //
 // Mesa's os_same_file_description() (radeonsi, virgl, the Wayland WSI) calls
@@ -67,11 +69,11 @@ static uint64_t kcmp_ident(const void *a, const void *b) {
 
 // No ptrace permission model yet; mirror sys_get_robust_list(): the caller may
 // inspect its own task, root may inspect anything, otherwise the owner must
-// match.  The pid namespace is flat, so there is nothing else to check.
+// match. Target IDs are resolved in the caller's PID namespace.
 static bool kcmp_may_access(struct thread *current, struct thread *target) {
   if (target == current)
     return true;
-  if (current->euid == 0)
+  if (capability_has(current, CAP_SYS_PTRACE))
     return true;
   return target->uid == current->uid || target->euid == current->euid;
 }
@@ -164,8 +166,8 @@ static uint64_t sys_kcmp(uint64_t pid1_arg, uint64_t pid2_arg, uint64_t type_arg
 
   spinlock_acquire(&tid_lock);
 
-  struct thread *t1 = find_thread_by_tid_locked(pid1);
-  struct thread *t2 = find_thread_by_tid_locked(pid2);
+  struct thread *t1 = find_thread_by_tid_locked(pid_namespace_global_locked(current, pid1));
+  struct thread *t2 = find_thread_by_tid_locked(pid_namespace_global_locked(current, pid2));
 
   if (!t1 || !t2) {
     ret = (uint64_t)-KCMP_ESRCH;

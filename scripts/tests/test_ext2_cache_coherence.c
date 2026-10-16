@@ -24,12 +24,16 @@ typedef struct {
 } rawspinlock_t;
 #define SPINLOCK_INIT {0}
 #define RAWSPINLOCK_INIT {0}
+static _Thread_local unsigned held_locks;
 static void spinlock_init(spinlock_t *s) { s->locked = 0; }
 static void spinlock_acquire(spinlock_t *s) {
   while (__atomic_exchange_n(&s->locked, 1, __ATOMIC_ACQUIRE)) {
   }
+  held_locks++;
 }
 static void spinlock_release(spinlock_t *s) {
+  assert(held_locks);
+  held_locks--;
   __atomic_store_n(&s->locked, 0, __ATOMIC_RELEASE);
 }
 
@@ -43,8 +47,56 @@ static void spinlock_release(spinlock_t *s) {
 void kernel_sched_yield(void) { sched_yield(); }
 struct thread *sched_get_current(void) { return NULL; }
 void klogf(const char *fmt, ...) { (void)fmt; }
-void *kmalloc(size_t n) { return malloc(n); }
-void kfree(void *p) { free(p); }
+static ext2_mount_t mount;
+static bool fail_alloc, competing_install;
+static const char *observed_phase;
+static const char *const descriptor_stages[4] = {
+    "commit-descriptor-cache-alloc", "commit-descriptor-cache-publish",
+    "commit-descriptor-io", "commit-descriptor-cache-finish"};
+static bool descriptor_trace;
+static unsigned live_allocations;
+void *kmalloc(size_t n) {
+  /* OOM reclaim may take filesystem locks: reproduce same-cache reentry. */
+  assert(!held_locks);
+  if (observed_phase) assert(!strcmp(observed_phase,
+      descriptor_trace ? descriptor_stages[0] : "metadata-home-cache-alloc"));
+  spinlock_acquire(&mount.cache_lock);
+  spinlock_release(&mount.cache_lock);
+  if (competing_install) {
+    competing_install = false;
+    void *winner = malloc(n);
+    assert(winner);
+    spinlock_acquire(&mount.cache_lock);
+    assert(!mount.cache[11 % EXT2_CACHE_SIZE].data);
+    mount.cache[11 % EXT2_CACHE_SIZE].data = winner;
+    spinlock_release(&mount.cache_lock);
+    live_allocations++;
+  }
+  void *p = fail_alloc ? NULL : malloc(n);
+  if (p) live_allocations++;
+  return p;
+}
+void kfree(void *p) { assert(!held_locks); if (p) live_allocations--; free(p); }
+/* Mirrors drivers/storage/block.c, which this test does not link: use the
+ * device's pipelined op when present, otherwise run the members through the
+ * ordered single-request fallback. */
+int block_write_batch(struct block_device *dev, struct block_io_req *reqs,
+                      unsigned n) {
+  if (!dev || !reqs || n == 0)
+    return -1;
+  if (dev->write_batch)
+    return dev->write_batch(dev, reqs, n);
+  int worst = 0;
+  for (unsigned i = 0; i < n; i++) {
+    reqs[i].result = dev->write_sectors
+                         ? dev->write_sectors(dev, reqs[i].lba, reqs[i].count,
+                                              reqs[i].buf)
+                         : -1;
+    if (reqs[i].result < worst)
+      worst = reqs[i].result;
+  }
+  return worst;
+}
 static pthread_mutex_t disk_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t disk_cond = PTHREAD_COND_INITIALIZER;
 static unsigned char disk_image[1024];
@@ -53,7 +105,6 @@ static int inode_phase, fail_start;
 static pthread_mutex_t transaction_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local unsigned transaction_depth;
 static const unsigned block_a = 11;
-static ext2_mount_t mount;
 /* Model the journal's owner/nesting exclusion while testing the real inode
  * RMW functions. The fake device stores full blocks, including neighbors. */
 int ext3_journal_start(ext2_mount_t *mnt) {
@@ -76,6 +127,13 @@ int ext3_journal_block(ext2_mount_t *mnt, uint32_t block, const void *buf) {
   assert(transaction_depth);
   sched_yield();
   return ext2_write_block(mnt, block, buf);
+}
+bool ext3_journal_read_staged(ext2_mount_t *mnt, uint32_t block,
+                              void *buf) {
+  (void)mnt;
+  (void)block;
+  (void)buf;
+  return false;
 }
 static int device_read(struct block_device *dev, uint64_t lba, uint32_t count,
                        void *buf) {
@@ -101,6 +159,8 @@ static int device_write(struct block_device *dev, uint64_t lba, uint32_t count,
                         const void *buf) {
   (void)dev;
   assert(count == 2 && lba / 2 == block_a);
+  if (observed_phase) assert(!strcmp(observed_phase,
+      descriptor_trace ? descriptor_stages[2] : "metadata-home-io"));
   pthread_mutex_lock(&disk_lock);
   if (!fail_write)
     memcpy(disk_image, buf, sizeof(disk_image));
@@ -170,6 +230,51 @@ int main(void) {
     assert(read_result[i] == 0x22);
   puts("PASS failed write: speculative image invalidated and disk contents "
        "reread");
+  unsigned idx = block_a % EXT2_CACHE_SIZE;
+  kfree(mount.cache[idx].data);
+  mount.cache[idx].data = NULL;
+  mount.cache[idx].num = 0;
+  fail_alloc = true;
+  fail_write = 0;
+  assert(!ext2_read_block(&mount, block_a, read_result));
+  assert(!mount.cache[idx].data && read_result[0] == 0x22);
+  memset(newer, 0x55, sizeof(newer));
+  assert(!ext2_write_block(&mount, block_a, newer));
+  assert(!ext2_write_blocks(&mount, block_a, 1, newer));
+  assert(!ext2_read_block(&mount, block_a, read_result));
+  assert(!memcmp(newer, read_result, sizeof(newer)));
+  assert(!mount.cache[idx].data && !mount.cache[idx].writes_inflight);
+  fail_alloc = false;
+  unsigned before = live_allocations;
+  competing_install = true;
+  assert(!ext2_read_block(&mount, block_a, read_result));
+  assert(live_allocations == before + 1 && mount.cache[idx].data);
+  assert(!memcmp(newer, read_result, sizeof(newer)));
+  puts("PASS cache allocation: reclaim reentry, optional allocation failure, "
+       "and competing installer without leaks");
+  observed_phase = "metadata-home";
+  assert(!ext2_write_block_phase(&mount, block_a, newer, &observed_phase));
+  assert(!strcmp(observed_phase, "metadata-home-cache-finish"));
+  fail_write = 1;
+  assert(ext2_write_block_phase(&mount, block_a, newer, &observed_phase) == -1);
+  assert(!strcmp(observed_phase, "metadata-home-cache-finish"));
+  observed_phase = NULL;
+  puts("PASS home-write phases distinguish allocation, device I/O and cache completion");
+  descriptor_trace = true;
+  kfree(mount.cache[idx].data);
+  mount.cache[idx].data = NULL;
+  observed_phase = "commit-descriptor-map";
+  fail_write = 0;
+  assert(!ext2_write_block_traced(&mount, block_a, newer, &observed_phase,
+                                  descriptor_stages));
+  assert(!strcmp(observed_phase, descriptor_stages[3]));
+  fail_write = 1;
+  assert(ext2_write_block_traced(&mount, block_a, newer, &observed_phase,
+                                 descriptor_stages) == -1);
+  assert(!strcmp(observed_phase, descriptor_stages[3]));
+  observed_phase = NULL;
+  descriptor_trace = false;
+  puts("PASS descriptor tracing identifies cache allocation, I/O and error completion");
   ext2_bgd_t group = {.bg_inode_table = block_a};
   mount.bgdt = &group;
   mount.groups_count = 1;
@@ -209,5 +314,6 @@ int main(void) {
   puts("PASS inode error paths: invalid group, failed write and failed start "
        "release ownership");
   for (unsigned i = 0; i < EXT2_CACHE_SIZE; i++)
-    free(mount.cache[i].data);
+    kfree(mount.cache[i].data);
+  assert(!live_allocations);
 }

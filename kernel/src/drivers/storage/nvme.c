@@ -11,6 +11,7 @@
 #include "drivers/storage/block.h"
 #include "hal/hal.h"
 #include "lib/string.h"
+#include "lib/tsc.h"
 #include "lock/spinlock.h"
 #include "mm/dma_alloc.h"
 #include "mm/heap.h"
@@ -30,6 +31,10 @@
 #define NVME_BAR_MIN_SIZE 0x4000u
 
 #define NVME_CID_MAX 64u
+/* Most commands one pipelined submitter keeps in flight.  Bounded so a wave
+ * costs one deadline and one wait-queue registration; also bounded by the CIDs
+ * actually free on the queue. */
+#define NVME_BATCH_WAVE_MAX 16u
 /* lba * 512 (the virtual byte offset in nvme_io) must not wrap, so a namespace
  * whose virtual sector count exceeds this is rejected at Identify time. */
 #define NVME_MAX_SECTORS (UINT64_MAX / 512u)
@@ -69,6 +74,9 @@ struct nvme_iovq {
   uint64_t cid_in_use;
   volatile int cid_result[NVME_CID_MAX];
   wait_queue_t cid_wq[NVME_CID_MAX];
+  /* Pipelined submitters park here; a drain wakes every batch waiter when any
+   * completion landed, and each reaps its own CID set. */
+  wait_queue_t batch_wq;
   struct nvme_prp_pool prp[NVME_CID_MAX];
   uint16_t vector;      /* MSI-X table index feeding this queue */
   uint16_t queue_index; /* 0-based position in ctrl->io[] */
@@ -971,6 +979,17 @@ static int nvme_ns_write(struct block_device *dev, uint64_t lba,
 static int nvme_ns_write_fua(struct block_device *dev, uint64_t lba,
                              uint32_t count, const void *buf);
 static int nvme_ns_flush(struct block_device *dev);
+/* Pipelined submit/wait core; defined after nvme_io() because its fallback
+ * path reuses the full single-request translation. */
+static int nvme_io_batch(struct nvme_controller *ctrl, struct nvme_namespace *ns,
+                         struct block_io_req *reqs, unsigned n, bool write,
+                         bool fua);
+#ifdef NVME_BATCH_IO
+static int nvme_ns_read_batch(struct block_device *dev,
+                              struct block_io_req *reqs, unsigned n);
+static int nvme_ns_write_batch(struct block_device *dev,
+                               struct block_io_req *reqs, unsigned n);
+#endif
 
 static void nvme_register_namespaces(struct nvme_controller *ctrl) {
   for (unsigned i = 0; i < NVME_MAX_NAMESPACES; i++) {
@@ -988,6 +1007,10 @@ static void nvme_register_namespaces(struct nvme_controller *ctrl) {
     ns->blkdev.read_sectors = nvme_ns_read;
     ns->blkdev.write_sectors = nvme_ns_write;
     ns->blkdev.write_sectors_fua = nvme_ns_write_fua;
+#ifdef NVME_BATCH_IO
+    ns->blkdev.read_batch = nvme_ns_read_batch;
+    ns->blkdev.write_batch = nvme_ns_write_batch;
+#endif
     ns->blkdev.flush = nvme_ns_flush;
     ns->blkdev.driver_data = ns;
 
@@ -1248,6 +1271,7 @@ static void nvme_drain_cq(struct nvme_controller *ctrl, struct nvme_iovq *vq,
     return;
 
   spinlock_acquire(&vq->cq_lock);
+  bool woke = false;
   for (;;) {
     volatile nvme_completion_t *cqe = &q->cq[q->head];
     uint16_t status = cqe->status;
@@ -1268,14 +1292,20 @@ static void nvme_drain_cq(struct nvme_controller *ctrl, struct nvme_iovq *vq,
       if (vq->cid_result[cid] == 0)
         vq->cid_result[cid] = verdict;
       spinlock_release(&vq->lock);
-      if (wake)
+      if (wake) {
         wait_queue_wake_all(&vq->cid_wq[cid]);
+        woke = true;
+      }
     }
 
     q->head = (uint16_t)((q->head + 1) % q->depth);
     if (q->head == 0)
       q->phase ^= 1u;
   }
+  /* Batch waiters watch a CID set, not one CID; one wake per drain is enough
+   * for them to re-scan and sort out which members are still outstanding. */
+  if (woke)
+    wait_queue_wake_all(&vq->batch_wq);
   nvme_write32(ctrl, q->cq_db_off, q->head);
   spinlock_release(&vq->cq_lock);
 }
@@ -1412,10 +1442,9 @@ static int nvme_take_verdict(struct nvme_iovq *vq, uint32_t cid) {
 }
 
 /*
- * Whether the caller may sleep.  User I/O syscalls currently run with
- * interrupts masked (IA32_FMASK), so the polled path is the normal one; when
- * a caller has interrupts enabled the waiter may block and be woken from a
- * completion IRQ.  Early boot (nvme_runtime false) simply spins.
+ * Whether the caller may sleep. Syscall dispatch enables interrupts after
+ * switching stacks; callers holding IRQ-masking locks must still poll.
+ * Early boot (nvme_runtime false) simply spins.
  */
 static bool nvme_may_block(void) {
   if (!nvme_runtime)
@@ -1472,6 +1501,13 @@ static int nvme_io_wait(struct nvme_controller *ctrl, struct nvme_iovq *vq,
   bool can_block = nvme_may_block();
   wait_queue_entry_t wqe = {.thread = self, .next = NULL};
   uint64_t deadline = lapic_timer_get_ms() + NVME_TIMEOUT_MS;
+  /* Small synchronous metadata requests often complete just after the first
+   * CQ check, particularly on a VM. Give them a bounded 20 us polling window
+   * before paying a block/wakeup/context-switch for every journal write.
+   * Keep IRQs enabled and never restart the budget after a wakeup. */
+  uint64_t poll_start = rdtsc();
+  uint64_t mhz = tsc_get_mhz();
+  uint64_t poll_cycles = mhz ? mhz * 20 : 100000;
 
   for (;;) {
     /* A reset discarded every outstanding command; this CID's verdict will
@@ -1503,7 +1539,7 @@ static int nvme_io_wait(struct nvme_controller *ctrl, struct nvme_iovq *vq,
       return -2;
     }
 
-    if (!can_block) {
+    if (!can_block || rdtsc() - poll_start < poll_cycles) {
       hal_cpu_relax();
       continue;
     }
@@ -1531,6 +1567,121 @@ static int nvme_io_wait(struct nvme_controller *ctrl, struct nvme_iovq *vq,
   }
 }
 
+/* Reap the verdicts already recorded for a batch.  Clears cid_result[] entries
+ * through nvme_take_verdict(), so a CID is free again the moment its verdict
+ * is consumed. */
+static void nvme_reap_ready(struct nvme_iovq *vq, const uint32_t *cids,
+                            int *verdicts, unsigned n, unsigned *remaining,
+                            bool *status_error) {
+  for (unsigned i = 0; i < n; i++) {
+    if (verdicts[i] != 0)
+      continue;
+    int verdict = nvme_take_verdict(vq, cids[i]);
+    if (verdict) {
+      verdicts[i] = verdict;
+      (*remaining)--;
+      if (verdict < 0)
+        *status_error = true;
+    }
+  }
+}
+
+/*
+ * Wait for several submitted commands at once.  The pipelined path claims
+ * several CIDs and submits them back to back, so this is the one place that
+ * pays the poll window, the deadline and the blocking handoff for the whole
+ * wave.  `verdicts[i]` is filled with 1 (success), -1 (command status error)
+ * or 0 when a transport failure prevented a verdict for cids[i].
+ *
+ * Returns 0 when every command succeeded, -1 when at least one reported a
+ * status error, -2 on a transport failure (controller reset/fatal or the
+ * shared deadline).  On -1 every CID was reaped; on -2 the controller quiesced
+ * or a reset discarded them, so none may still own a buffer.
+ */
+static int nvme_io_wait_many(struct nvme_controller *ctrl, struct nvme_iovq *vq,
+                             const uint32_t *cids, int *verdicts, unsigned n,
+                             uint32_t generation) {
+  for (unsigned i = 0; i < n; i++)
+    verdicts[i] = 0;
+
+  struct thread *self = sched_get_current();
+  bool can_block = nvme_may_block();
+  wait_queue_entry_t wqe = {.thread = self, .next = NULL};
+  uint64_t deadline = lapic_timer_get_ms() + NVME_TIMEOUT_MS;
+  /* Same bounded polling window as the single-command wait: a wave that the
+   * device completes promptly returns without a scheduler handoff. */
+  uint64_t poll_start = rdtsc();
+  uint64_t mhz = tsc_get_mhz();
+  uint64_t poll_cycles = mhz ? mhz * 20 : 100000;
+  unsigned remaining = n;
+  bool status_error = false;
+
+  for (;;) {
+    /* A reset discarded every outstanding command; this wave's verdicts will
+     * never arrive and the new generation owns the queue state. */
+    if (ctrl->generation != generation)
+      return -2;
+
+    nvme_reap_ready(vq, cids, verdicts, n, &remaining, &status_error);
+    if (remaining == 0)
+      return status_error ? -1 : 0;
+
+    nvme_drain_cq(ctrl, vq, true);
+    nvme_reap_ready(vq, cids, verdicts, n, &remaining, &status_error);
+    if (remaining == 0)
+      return status_error ? -1 : 0;
+
+    if (ctrl->failed)
+      return -2;
+
+    if (nvme_read32(ctrl, NVME_REG_CSTS) & NVME_CSTS_CFS) {
+      nvme_fail_stop(ctrl, "I/O CSTS.CFS");
+      return -2;
+    }
+
+    if (lapic_timer_get_ms() >= deadline) {
+      klogf("[NVMe] %s I/O timeout qid=%u outstanding=%u/%u head=%u phase=%u\n",
+            ctrl->name, vq->q.qid, remaining, n, vq->q.head, vq->q.phase);
+      nvme_fail_stop(ctrl, "I/O command timeout");
+      return -2;
+    }
+
+    if (!can_block || rdtsc() - poll_start < poll_cycles) {
+      hal_cpu_relax();
+      continue;
+    }
+
+    /* Same publish/recheck discipline as the single-command wait: park on the
+     * queue's batch wait queue and treat a verdict that landed while linking
+     * as a completion, not a wakeup. */
+    hal_irq_state_t irq_flags = hal_irq_save();
+    self->wakeup_ticks = lapic_timer_get_ticks() + 10;
+    self->state = THREAD_BLOCKED;
+    ctrl->wait_blocks++;
+    wait_queue_add(&vq->batch_wq, &wqe);
+    bool ready = false;
+    for (unsigned i = 0; i < n; i++) {
+      if (verdicts[i] == 0 &&
+          __atomic_load_n(&vq->cid_result[cids[i]], __ATOMIC_ACQUIRE) != 0) {
+        ready = true;
+        break;
+      }
+    }
+    if (ready) {
+      self->state = THREAD_RUNNING;
+      self->wakeup_ticks = 0;
+      hal_irq_restore(irq_flags);
+      wait_queue_remove(&vq->batch_wq, &wqe);
+      continue;
+    }
+    hal_irq_restore(irq_flags);
+    sched_yield();
+    self->wakeup_ticks = 0;
+    self->state = THREAD_RUNNING;
+    wait_queue_remove(&vq->batch_wq, &wqe);
+  }
+}
+
 /*
  * Build PRP1/PRP2 for a kernel virtual buffer.  Only PRP1 may carry an offset:
  * every following page starts at a page boundary, so the PRP list entries are
@@ -1547,7 +1698,7 @@ static bool nvme_build_prp(struct nvme_iovq *vq, uint32_t cid, uint64_t va,
 
   /* Callers cap transfers, but the builder rejects anything oversized by
    * itself so a future caller cannot overflow `entries` or the NLB field. */
-  if (bytes == 0 || bytes > NVME_MAX_TRANSFER)
+  if (bytes == 0 || bytes > NVME_MAX_TRANSFER || (va & 3u))
     return false;
 
   uint64_t first = vmm_virt_to_phys(pml4, va);
@@ -1785,7 +1936,7 @@ static int nvme_io_direct(struct nvme_controller *ctrl,
 
 /*
  * Read/write through a physically contiguous bounce buffer.  Used for user
- * pointers and buffers that are not 512-byte aligned, both of which cannot be
+ * pointers and buffers that are not dword aligned, both of which cannot be
  * handed directly to the device.
  */
 static int nvme_io_bounce(struct nvme_controller *ctrl,
@@ -1954,22 +2105,39 @@ static int nvme_io_partial(struct nvme_namespace *ns, uint64_t plba,
   return rc;
 }
 
-/* Submit `lbas` whole logical blocks, chunked to respect max_transfer. */
+/*
+ * Submit `lbas` whole logical blocks, chunked to respect max_transfer.  The
+ * chunks of one range are independent, so up to NVME_BATCH_WAVE_MAX of them
+ * are pipelined: the device sees several commands in flight instead of one
+ * submit/wait round trip per chunk.  A failed wave stops the range with the
+ * wave's result; the recovery wrapper re-issues the failed members on a fresh
+ * generation.
+ */
 static int nvme_io_range(struct nvme_controller *ctrl,
                          struct nvme_namespace *ns, uint64_t plba,
                          uint64_t lbas, uint8_t *buf, bool write, bool fua) {
   uint32_t max_lbas = ctrl->max_transfer / ns->lba_size;
   if (max_lbas == 0)
     max_lbas = 1;
+  uint32_t sects_per_lba = ns->lba_size / 512u;
 
   while (lbas) {
-    uint32_t chunk = lbas > max_lbas ? max_lbas : (uint32_t)lbas;
-    int rc = nvme_io_direct(ctrl, ns, plba, chunk, (uint64_t)buf, write, fua);
+    struct block_io_req reqs[NVME_BATCH_WAVE_MAX];
+    unsigned n = 0;
+    while (lbas && n < NVME_BATCH_WAVE_MAX) {
+      uint32_t chunk = lbas > max_lbas ? max_lbas : (uint32_t)lbas;
+      reqs[n].lba = plba * sects_per_lba;
+      reqs[n].count = chunk * sects_per_lba;
+      reqs[n].buf = buf;
+      reqs[n].result = -1;
+      plba += chunk;
+      buf += (uint64_t)chunk * ns->lba_size;
+      lbas -= chunk;
+      n++;
+    }
+    int rc = nvme_io_batch(ctrl, ns, reqs, n, write, fua);
     if (rc != 0)
       return rc;
-    plba += chunk;
-    buf += (uint64_t)chunk * ns->lba_size;
-    lbas -= chunk;
   }
   return 0;
 }
@@ -2007,7 +2175,11 @@ static int nvme_io(struct nvme_namespace *ns, uint64_t lba, uint32_t count,
     uint64_t plba = byte_off >> ns->lba_shift;
     uint64_t lbas = total_bytes >> ns->lba_shift;
 
-    if (!user_ptr && ((uint64_t)buf & 0x1FFu) == 0)
+    /* PRP1 permits a dword-aligned offset within its first page. Heap
+     * metadata buffers commonly start at +32, not a sector boundary; their
+     * following pages are already mapped individually by nvme_build_prp().
+     * Avoid allocating/copying a bounce page for every such journal write. */
+    if (!user_ptr && ((uint64_t)buf & 3u) == 0)
       return nvme_io_range(ctrl, ns, plba, lbas, buf, write, fua);
 
     /* User or odd-aligned buffer: stage full logical blocks through the
@@ -2066,6 +2238,200 @@ static int nvme_io(struct nvme_namespace *ns, uint64_t lba, uint32_t count,
   return 0;
 }
 
+/*
+ * A batch member takes the pipelined fast path when one command can describe
+ * it: whole namespace logical blocks, a dword-aligned kernel buffer, and at
+ * most ctrl->max_transfer bytes.  Everything else keeps the full nvme_io()
+ * path (bounce staging, read-modify-write, chunking) as a per-member fallback.
+ */
+static bool nvme_batch_entry_fast(const struct nvme_controller *ctrl,
+                                  const struct nvme_namespace *ns,
+                                  const struct block_io_req *req) {
+  if (!req->buf || req->count == 0)
+    return false;
+  if (req->lba >= ns->total_sectors ||
+      (uint64_t)req->count > ns->total_sectors - req->lba)
+    return false;
+  uint64_t bytes = (uint64_t)req->count * 512u;
+  uint64_t byte_off = req->lba * 512u;
+  if ((byte_off & (ns->lba_size - 1u)) != 0 ||
+      (bytes & (ns->lba_size - 1u)) != 0)
+    return false;
+  if (bytes > ctrl->max_transfer)
+    return false;
+  return !is_user_ptr((uint64_t)req->buf) && ((uint64_t)req->buf & 3u) == 0;
+}
+
+/*
+ * Submit a set of independent block requests and wait for all of them.  Fast
+ * members are gathered into a wave and submitted back to back before the wave
+ * is waited on, so one submitter can keep up to NVME_BATCH_WAVE_MAX commands
+ * on its queue; members needing the full path fall back to nvme_io().
+ *
+ * Every member is reaped before returning (a status error stops the batch, so
+ * unattempted members are marked with the same result).  On return each
+ * request carries 0/-1/-2 and the return value is the most severe member
+ * result.  Members are independent by contract: no completion ordering across
+ * members may be assumed.
+ */
+static int nvme_batch_submit(struct nvme_controller *ctrl,
+                             struct nvme_namespace *ns,
+                             struct block_io_req *reqs, unsigned n, bool write,
+                             bool fua) {
+  if (!ctrl || !ns || !reqs || n == 0)
+    return -1;
+  for (unsigned i = 0; i < n; i++)
+    reqs[i].result = -1;
+
+  if (!ns->present || !ctrl->started || !ctrl->io_ready || ctrl->failed)
+    return -1;
+  struct nvme_iovq *vq = nvme_current_vq(ctrl);
+  if (!vq)
+    return -1;
+
+  uint32_t generation = ctrl->generation;
+  unsigned i = 0;
+  while (i < n) {
+    struct block_io_req *first = &reqs[i];
+    if (!nvme_batch_entry_fast(ctrl, ns, first)) {
+      /* Full single-request path.  It may block and drain completions, but no
+       * command of this batch is outstanding at this point. */
+      int rc = nvme_io(ns, first->lba, first->count, first->buf, write, fua);
+      first->result = rc == 0 ? 0 : (rc == -2 ? -2 : -1);
+      i++;
+      continue;
+    }
+
+    uint32_t cids[NVME_BATCH_WAVE_MAX];
+    unsigned slots[NVME_BATCH_WAVE_MAX];
+    unsigned wave = 0;
+    int wave_rc = 0;
+
+    while (i < n && wave < NVME_BATCH_WAVE_MAX &&
+           nvme_batch_entry_fast(ctrl, ns, &reqs[i])) {
+      struct block_io_req *req = &reqs[i];
+      uint64_t bytes = (uint64_t)req->count * 512u;
+
+      int cid;
+      spinlock_acquire(&vq->lock);
+      cid = nvme_cid_claim_locked(vq);
+      spinlock_release(&vq->lock);
+      if (cid < 0) {
+        if (wave > 0)
+          break; /* reap this wave, then continue where the CID table refills */
+        cid = nvme_alloc_cid(ctrl, vq);
+        if (cid < 0) {
+          req->result = -2;
+          wave_rc = -2;
+          i++;
+          break;
+        }
+      }
+
+      uint64_t prp1 = 0, prp2 = 0;
+      if (!nvme_build_prp(vq, (uint32_t)cid, (uint64_t)req->buf,
+                          (uint32_t)bytes, &prp1, &prp2)) {
+        if (ctrl->generation == generation)
+          nvme_free_cid(vq, (uint32_t)cid);
+        req->result = -1;
+        i++;
+        continue;
+      }
+
+      nvme_command_t cmd;
+      memset(&cmd, 0, sizeof(cmd));
+      cmd.opcode = write ? NVME_CMD_WRITE : NVME_CMD_READ;
+      cmd.nsid = ns->nsid;
+      cmd.prp1 = prp1;
+      cmd.prp2 = prp2;
+      uint64_t plba = (req->lba * 512u) >> ns->lba_shift;
+      uint32_t nlb = (uint32_t)(bytes >> ns->lba_shift);
+      cmd.cdw10 = (uint32_t)(plba & 0xFFFFFFFFu);
+      cmd.cdw11 = (uint32_t)(plba >> 32);
+      cmd.cdw12 = ((nlb - 1u) & 0xFFFFu) |
+                  ((write && fua) ? NVME_RW_FUA : 0u); /* NLB is zero-based */
+
+      if (nvme_sq_submit(ctrl, vq, (uint16_t)cid, &cmd, generation) != 0) {
+        if (ctrl->generation == generation)
+          nvme_free_cid(vq, (uint32_t)cid);
+        req->result = -2;
+        wave_rc = -2;
+        i++;
+        break;
+      }
+
+      struct block_device *dev = &ns->blkdev;
+      __atomic_add_fetch(write ? &dev->hw_writes : &dev->hw_reads, 1,
+                         __ATOMIC_RELAXED);
+      __atomic_add_fetch(write ? &dev->hw_write_bytes : &dev->hw_read_bytes,
+                         bytes, __ATOMIC_RELAXED);
+
+      cids[wave] = (uint32_t)cid;
+      slots[wave] = i;
+      wave++;
+      i++;
+    }
+
+    if (wave) {
+      int verdicts[NVME_BATCH_WAVE_MAX];
+      int rc = nvme_io_wait_many(ctrl, vq, cids, verdicts, wave, generation);
+      for (unsigned k = 0; k < wave; k++) {
+        int verdict = verdicts[k];
+        reqs[slots[k]].result = verdict > 0 ? 0 : (verdict < 0 ? -1 : -2);
+      }
+      if (rc < wave_rc)
+        wave_rc = rc;
+    }
+
+    if (wave_rc != 0) {
+      /* Same stop-at-first-failure contract as the single-request path; the
+       * wave above was reaped, so nothing still owns a caller buffer. */
+      for (; i < n; i++)
+        reqs[i].result = wave_rc;
+      break;
+    }
+  }
+
+  int worst = 0;
+  for (unsigned k = 0; k < n; k++)
+    if (reqs[k].result < worst)
+      worst = reqs[k].result;
+  return worst;
+}
+
+/*
+ * Pipelined entry point with the same reset-recovery contract as
+ * nvme_io_direct(): a transport failure retries the members that did not
+ * succeed on the restarted controller.  Successful members are left alone so
+ * a retry never re-executes device work that already completed.
+ */
+static int nvme_io_batch(struct nvme_controller *ctrl, struct nvme_namespace *ns,
+                         struct block_io_req *reqs, unsigned n, bool write,
+                         bool fua) {
+  int rc = nvme_batch_submit(ctrl, ns, reqs, n, write, fua);
+#ifdef NVME_RESET_RECOVERY
+  if (rc == -2 && nvme_recover(ctrl)) {
+    unsigned i = 0;
+    while (i < n) {
+      if (reqs[i].result == 0) {
+        i++;
+        continue;
+      }
+      unsigned j = i;
+      while (j < n && reqs[j].result != 0)
+        j++;
+      (void)nvme_batch_submit(ctrl, ns, &reqs[i], j - i, write, fua);
+      i = j;
+    }
+    rc = 0;
+    for (i = 0; i < n; i++)
+      if (reqs[i].result < rc)
+        rc = reqs[i].result;
+  }
+#endif
+  return rc;
+}
+
 static int nvme_ns_read(struct block_device *dev, uint64_t lba, uint32_t count,
                         void *buf) {
   struct nvme_namespace *ns = nvme_ns_from_block(dev);
@@ -2092,6 +2458,32 @@ static int nvme_ns_write_fua(struct block_device *dev, uint64_t lba,
     block_stat_write(dev, count);
   return ret;
 }
+
+#ifdef NVME_BATCH_IO
+static int nvme_ns_read_batch(struct block_device *dev,
+                              struct block_io_req *reqs, unsigned n) {
+  struct nvme_namespace *ns = nvme_ns_from_block(dev);
+  if (!ns || !reqs || n == 0)
+    return -1;
+  int rc = nvme_io_batch(ns->ctrl, ns, reqs, n, false, false);
+  for (unsigned i = 0; i < n; i++)
+    if (reqs[i].result == 0)
+      block_stat_read(dev, reqs[i].count);
+  return rc;
+}
+
+static int nvme_ns_write_batch(struct block_device *dev,
+                               struct block_io_req *reqs, unsigned n) {
+  struct nvme_namespace *ns = nvme_ns_from_block(dev);
+  if (!ns || !reqs || n == 0)
+    return -1;
+  int rc = nvme_io_batch(ns->ctrl, ns, reqs, n, true, NVME_FUA_DEFAULT);
+  for (unsigned i = 0; i < n; i++)
+    if (reqs[i].result == 0)
+      block_stat_write(dev, reqs[i].count);
+  return rc;
+}
+#endif /* NVME_BATCH_IO */
 
 static int nvme_flush_once(struct nvme_controller *ctrl,
                            struct nvme_namespace *ns) {

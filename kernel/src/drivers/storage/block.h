@@ -53,6 +53,19 @@ static inline void storage_latency_snapshot(const struct storage_latency *s,
         out->buckets[i] = __atomic_load_n(&s->buckets[i], __ATOMIC_RELAXED);
 }
 
+/* One member of a pipelined block I/O batch.  A batch lets a single submitter
+ * keep several requests on the device queue instead of paying a completion
+ * wait per request.  Members must be independent and disjoint: a driver may
+ * complete them out of order.  `buf` is a kernel buffer that stays valid until
+ * the batch call returns.  `result` is filled by the call: 0 success, -1 I/O
+ * or pre-submit error, -2 transport failure. */
+struct block_io_req {
+    uint64_t lba;       // first sector, in the device's own sector units
+    uint32_t count;     // sectors
+    void *buf;
+    int result;
+};
+
 struct block_device {
     char name[16];              // e.g. "ata0", "ata1"
     uint32_t sector_size;       // Usually 512
@@ -72,6 +85,12 @@ struct block_device {
     // data durable before completing; callers that need that guarantee may
     // prefer it over write_sectors + flush when available.
     int (*write_sectors_fua)(struct block_device *dev, uint64_t lba, uint32_t count, const void *buf);
+    // Optional pipelined variants: submit every member before waiting, so one
+    // submitter can use more than one device queue slot.  Implementations must
+    // fill reqs[i].result for every member; block_read_batch()/block_write_batch()
+    // fall back to one read_sectors/write_sectors call per member when unset.
+    int (*read_batch)(struct block_device *dev, struct block_io_req *reqs, unsigned n);
+    int (*write_batch)(struct block_device *dev, struct block_io_req *reqs, unsigned n);
     int (*flush)(struct block_device *dev);
     void *driver_data;          // Opaque pointer for the specific driver
 
@@ -114,6 +133,16 @@ int block_flush(struct block_device *dev);
 // write followed by a flush. Returns 0 on success, -1 on failure.
 int block_write_fua(struct block_device *dev, uint64_t lba, uint32_t count,
                     const void *buf);
+
+// Pipelined forms: submit the whole batch (or as much of it as the device can
+// hold) before waiting.  They fill every member's `result` and return 0 when
+// all succeeded, -1 on any command status error, -2 when a transport failure
+// left members unfinished.  Devices without batch ops run the members through
+// the single-request path, which keeps the same per-member results.
+int block_read_batch(struct block_device *dev, struct block_io_req *reqs,
+                     unsigned n);
+int block_write_batch(struct block_device *dev, struct block_io_req *reqs,
+                      unsigned n);
 
 // Account one completed I/O on `dev` for /proc/diskstats. `count` is in
 // units of the device's own sector size; statistics are kept in

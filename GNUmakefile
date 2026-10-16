@@ -18,6 +18,10 @@ QEMUFLAGS := -m 4G \
 
 override IMAGE_NAME := avoryos-$(ARCH)
 
+# Boot the existing writable disk without traversing its rebuild prerequisites.
+# A missing disk is built normally; use `make disk.img` to refresh it explicitly.
+RUN_DISK_DEP := $(if $(wildcard disk.img),,disk.img)
+
 AVORYD_CONFIG_FILES := \
 	initrd/avoryd/default.target \
 	initrd/avoryd/services/system-init.service \
@@ -86,12 +90,13 @@ GLIBC_CC := $(GLIBC_TOOLCHAIN_BIN)/x86_64-buildroot-linux-gnu-gcc
 GLIBC_USER_CFLAGS := -O2 -Wall -Wextra -fno-stack-protector \
 	--sysroot=$(GLIBC_SYSROOT)
 
-# Alpine rootfs sysroot (built by scripts/setup-arch.sh)
+# Historical Alpine target names; the rootfs now uses Arch packages.
 ALPINE_SYSROOT := $(CURDIR)/build/alpine/rootfs
 ALPINE_STAMP := $(CURDIR)/build/alpine/.built
 
-$(ALPINE_STAMP): scripts/setup-arch.sh
+$(ALPINE_STAMP): scripts/setup-arch.sh scripts/arch-pkgs.sh scripts/configure-accounts.sh config/vlc/vlc.sh config/wireplumber/20-avoryos-hda.conf
 	@mkdir -p $(dir $(ALPINE_STAMP))
+	@bash scripts/setup-arch.sh
 	@touch $(ALPINE_STAMP)
 
 .PHONY: setup-alpine
@@ -230,6 +235,52 @@ all: $(IMAGE_NAME).iso
 # configuration without KVM.  The arch-specific run-x86_64 target remains the
 # TCG implementation behind run-tcg.
 RUN_SMP ?= 8
+# NIC selection for launchers that explicitly attach networking:
+#   make run RUN_NIC=e1000    # 82540EM networking
+#   make run RUN_NIC=both     # both drivers; RTL8139 is default
+#   make run RUN_NIC=both KERNEL_CMDLINE='net_default=eth1' # use e1000
+#   make run RUN_NIC=none     # no emulated NIC
+RUN_NIC ?= rtl8139
+E1000_TEST_SECONDS ?= 10
+E1000_TEST_SMP ?= 4
+.PHONY: test-e1000
+test-e1000:
+	$(MAKE) -C kernel
+	python3 scripts/tests/test_e1000_probe.py
+	python3 scripts/tests/test_net_device_start.py
+	python3 scripts/tests/test_netlink_link_types.py
+	python3 scripts/tests/test_e1000_probe_boot.py --seconds $(E1000_TEST_SECONDS) --smp $(E1000_TEST_SMP)
+
+# Each guest regression creates its own root image and ISO.
+.PHONY: test-sandbox
+test-sandbox:
+	$(MAKE) -C kernel
+	python3 scripts/tests/test_seccomp_bpf.py
+	python3 scripts/tests/test_uts_namespace.py
+	python3 scripts/tests/test_pid_namespace.py
+	python3 scripts/tests/test_seccomp_boot.py
+	python3 scripts/tests/test_uts_namespace_boot.py
+	python3 scripts/tests/test_ipc_namespace_boot.py
+	python3 scripts/tests/test_pid_namespace_boot.py
+	python3 scripts/tests/test_mount_namespace_boot.py
+	python3 scripts/tests/test_capability_namespace_boot.py
+	python3 scripts/tests/test_bubblewrap_boot.py
+
+ifneq ($(words $(RUN_NIC)),1)
+$(error RUN_NIC must be rtl8139, e1000, both, or none)
+endif
+ifeq ($(filter $(RUN_NIC),rtl8139 e1000 both none),)
+$(error RUN_NIC must be rtl8139, e1000, both, or none)
+endif
+RUN_NIC_ADDR ?=
+NET_COMMA := ,
+RUN_NET_FLAGS = -nic none -device $(if $(filter both,$(RUN_NIC)),rtl8139,$(RUN_NIC)),netdev=net0$(if $(RUN_NIC_ADDR),$(NET_COMMA)addr=$(RUN_NIC_ADDR)) -netdev user,id=net0
+ifeq ($(RUN_NIC),both)
+RUN_NET_FLAGS += -device e1000,netdev=net1 -netdev user,id=net1
+endif
+ifeq ($(RUN_NIC),none)
+RUN_NET_FLAGS = -nic none
+endif
 # Same cursor set as run-c7-prime: a relative mouse plus a hidden host
 # cursor (DISPLAY_OPT defaults to show-cursor=off), so the guest draws its
 # own software cursor into the scanout. Override per boot with
@@ -238,7 +289,7 @@ RUN_SMP ?= 8
 RUN_POINTER ?= usb-mouse
 .PHONY: run run-tcg
 run: QEMUFLAGS = -m 4G -vga none -device virtio-vga,xres=1280,yres=800
-run: edk2-ovmf $(IMAGE_NAME).iso disk.img
+run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 	qemu-system-$(ARCH) \
 		-M q35,pcspk-audiodev=snd0 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
@@ -249,8 +300,7 @@ run: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-smp $(RUN_SMP) \
 		-serial stdio \
 		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
-		-device rtl8139,netdev=net0 \
-		-netdev user,id=net0 \
+		$(RUN_NET_FLAGS) \
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
@@ -264,7 +314,7 @@ run-tcg: run-x86_64
 # Boots AvoryOS with 2 NUMA nodes, 4 vCPUs (2 per node), 4GB RAM (2GB per node),
 # and explicit inter-node distance matrix.
 .PHONY: run-numa
-run-numa: edk2-ovmf $(IMAGE_NAME).iso disk.img
+run-numa: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 	qemu-system-$(ARCH) \
 		-M q35,pcspk-audiodev=snd0 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
@@ -282,8 +332,7 @@ run-numa: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-numa dist,src=1,dst=0,val=21 \
 		-serial stdio \
 		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
-		-device rtl8139,netdev=net0 \
-		-netdev user,id=net0 \
+		$(RUN_NET_FLAGS) \
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
@@ -318,7 +367,7 @@ VFIO_ROM_OPT = $(if $(wildcard $(VFIO_ROM)),$(VFIO_COMMA)romfile=$(VFIO_ROM),)
 
 .PHONY: run-vfio
 run-vfio: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
-run-vfio: edk2-ovmf $(IMAGE_NAME).iso disk.img
+run-vfio: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 	$(VFIO_LAUNCHER) qemu-system-$(ARCH) \
 		-M q35 \
 		-m $(VFIO_MEM) \
@@ -354,8 +403,16 @@ run-c7-prime: VFIO_SMP = 8
 # GLFW cursor capture/raw motion requires a relative device, not a tablet.
 run-c7-prime: VFIO_POINTER = usb-mouse
 run-c7-prime: GTK_SHOW_CURSOR = off
+# GTK's X button calls QMP quit, bypassing the guest PCI shutdown callbacks.
+# After a long active session MODE2/PSP reinit does not reliably recover VCN
+# (see docs/amdgpu-xclose-reproduction-2026-10-14.md), so Shutdown inside the
+# guest remains the safe close. The X button is enabled for convenience; pass
+# GTK_WINDOW_CLOSE=off to disable it again for passthrough PRIME sessions.
+GTK_WINDOW_CLOSE ?= on
+run-c7-prime: DISPLAY_OPT = -display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=$(GTK_SHOW_CURSOR),window-close=$(GTK_WINDOW_CLOSE)
 run-c7-prime: VFIO_LAUNCHER = python3 scripts/qemu-prime-log.py --
-run-c7-prime: VFIO_EXTRA = -device edu -chardev socket,id=prime-diag,path=build/logs/p6-c7-prime-serial.sock,server=on,wait=off,logfile=build/logs/p6-c7-prime.log,logappend=on -device rtl8139,netdev=net0,addr=08.0 -netdev user,id=net0
+run-c7-prime: RUN_NIC_ADDR = 08.0
+run-c7-prime: VFIO_EXTRA = -device edu -chardev socket,id=prime-diag,path=build/logs/p6-c7-prime-serial.sock,server=on,wait=off,logfile=build/logs/p6-c7-prime.log,logappend=on $(RUN_NET_FLAGS)
 run-c7-prime: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
 run-c7-prime: run-vfio
 
@@ -419,8 +476,7 @@ run-minimal: edk2-ovmf $(MINIMAL_ISO)
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(MINIMAL_ISO) \
 		-serial stdio \
-		-device rtl8139,netdev=net0 \
-		-netdev user,id=net0 \
+		$(RUN_NET_FLAGS) \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
 		-device usb-tablet,bus=xhci.0 \
@@ -433,7 +489,7 @@ clean-minimal:
 # Legacy SATA/IDE root disk (the pre-NVMe run layout), kept for AHCI/ATA
 # regression and A/B comparisons.  run-sata is KVM, run-sata-tcg is TCG.
 .PHONY: run-sata run-sata-tcg
-run-sata: edk2-ovmf $(IMAGE_NAME).iso disk.img
+run-sata: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 	qemu-system-$(ARCH) \
 		-M q35,pcspk-audiodev=snd0 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
@@ -443,8 +499,7 @@ run-sata: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		-smp 4 \
 		-serial stdio \
 		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
-		-device rtl8139,netdev=net0 \
-		-netdev user,id=net0 \
+		$(RUN_NET_FLAGS) \
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
@@ -452,7 +507,7 @@ run-sata: edk2-ovmf $(IMAGE_NAME).iso disk.img
 		$(QEMUFLAGS)
 
 .PHONY: run-bios
-run-bios: $(IMAGE_NAME).iso disk.img
+run-bios: $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 	qemu-system-$(ARCH) \
 		-M q35,pcspk-audiodev=snd0 \
 		-cdrom $(IMAGE_NAME).iso \
@@ -468,7 +523,7 @@ run-bios: $(IMAGE_NAME).iso disk.img
 		$(QEMUFLAGS)
 
 .PHONY: run-ata
-run-ata: edk2-ovmf $(IMAGE_NAME).iso disk.img
+run-ata: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 	qemu-system-$(ARCH) \
 		-M pc,pcspk-audiodev=snd0 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \

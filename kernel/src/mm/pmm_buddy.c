@@ -1,6 +1,7 @@
 #include "mm/pmm_internal.h"
 #include "console/klog.h"
 #include "lib/string.h"
+#include "lib/tsc.h"
 
 struct buddy_zone b_zone;
 
@@ -18,6 +19,34 @@ static bool buddy_link_readable(const struct list_head *node,
   return node == head ||
          (((uint64_t)node & (PAGE_SIZE - 1)) == 0 &&
           pmm_kernel_ptr_is_managed(node));
+}
+
+/* Link a block header into a free list.  magic marks the header as "linked
+ * in this boot"; see struct buddy_block in pmm_internal.h. */
+static void buddy_list_link(struct buddy_zone *zone, struct buddy_block *block,
+                            size_t order) {
+  block->order = order;
+  block->magic = zone->magic;
+  list_add_tail(&block->node, &zone->free_list[order]);
+}
+
+/* Unlink a block header from its free list.  Clearing magic guarantees a
+ * recycled header can never pass buddy_zone_node_valid() again, so a stale
+ * header (previous boot, PCP-parked page, or a block recycled through the
+ * allocator) cannot be mistaken for a still-linked block.  That check
+ * guards the double-free detector and the merge path, where a false
+ * positive would list_del() an unlinked node and corrupt the free lists. */
+static void buddy_list_unlink(struct buddy_block *block) {
+  list_del(&block->node);
+  block->magic = 0;
+}
+
+/* A block handed to a caller must not look linked.  In split allocations the
+ * retained half's header is not always rewritten (notably the upper half in
+ * buddy_alloc_pages_range), so a stale "linked" header could otherwise make
+ * the next free of that block look like a double free and drop the page. */
+static void buddy_unmark_returned(uint64_t pfn) {
+  virt_to_buddy(pfn * PAGE_SIZE)->magic = 0;
 }
 
 void buddy_report_corruption(const char *what, size_t order,
@@ -53,6 +82,8 @@ static const char *buddy_node_bad_reason(const struct buddy_zone *zone,
     return "node misaligned for order";
   if (block->order != order)
     return "order field mismatch (header overwritten?)";
+  if (block->magic != zone->magic)
+    return "stale header (magic mismatch; previous boot or orphaned block?)";
 
   uint64_t pfn = (addr - pmm_physical_memory_offset) / PAGE_SIZE;
   if (pfn < pmm_lowest_page || pfn >= pmm_highest_page)
@@ -137,6 +168,8 @@ static bool buddy_zone_node_valid(const struct buddy_zone *zone,
     return false;
   if (block->order != order)
     return false;
+  if (block->magic != zone->magic)
+    return false;
 
   uint64_t pfn = (addr - pmm_physical_memory_offset) / PAGE_SIZE;
   if (pfn < pmm_lowest_page || pfn >= pmm_highest_page ||
@@ -190,7 +223,7 @@ static struct buddy_block *buddy_list_pop(struct buddy_zone *zone, size_t order)
     return NULL;
   struct buddy_block *block =
       list_first_entry(&zone->free_list[order], struct buddy_block, node);
-  list_del(&block->node);
+  buddy_list_unlink(block);
   return block;
 }
 
@@ -220,6 +253,9 @@ void buddy_zone_init(struct buddy_zone *zone) {
   }
   spinlock_init(&zone->lock);
   zone->trace_seq = 0;
+  /* The TSC keeps counting across a guest reboot, so boot N+1 gets a tag
+   * that differs from any header the previous boot left in DRAM. */
+  zone->magic = (uint32_t)rdtsc() | 1u;
 }
 
 __attribute__((optimize("O3"))) void buddy_free_internal(struct buddy_zone *zone,
@@ -249,7 +285,7 @@ __attribute__((optimize("O3"))) void buddy_free_internal(struct buddy_zone *zone
 
     struct buddy_block *buddy = virt_to_buddy(buddy_pfn * PAGE_SIZE);
     if (buddy_zone_node_valid(zone, &buddy->node, order)) {
-      list_del(&buddy->node);
+      buddy_list_unlink(buddy);
       pfn = (pfn < buddy_pfn) ? pfn : buddy_pfn;
       order++;
       buddy_trace(zone, pfn * PAGE_SIZE, order, "merge",
@@ -265,8 +301,7 @@ __attribute__((optimize("O3"))) void buddy_free_internal(struct buddy_zone *zone
                             &block->node);
     return;
   }
-  block->order = order;
-  list_add_tail(&block->node, &zone->free_list[order]);
+  buddy_list_link(zone, block, order);
 }
 
 __attribute__((optimize("O3"))) void *buddy_alloc_internal(struct buddy_zone *zone,
@@ -288,7 +323,7 @@ __attribute__((optimize("O3"))) void *buddy_alloc_internal(struct buddy_zone *zo
 
   struct buddy_block *block =
       list_first_entry(&zone->free_list[cur_order], struct buddy_block, node);
-  list_del(&block->node);
+  buddy_list_unlink(block);
 
   uint64_t pfn = buddy_to_phys(block) / PAGE_SIZE;
   buddy_trace(zone, pfn * PAGE_SIZE, cur_order, "allocate",
@@ -298,8 +333,7 @@ __attribute__((optimize("O3"))) void *buddy_alloc_internal(struct buddy_zone *zo
     cur_order--;
     uint64_t buddy_pfn = pfn + (1ULL << cur_order);
     struct buddy_block *buddy = virt_to_buddy(buddy_pfn * PAGE_SIZE);
-    buddy->order = cur_order;
-    list_add_tail(&buddy->node, &zone->free_list[cur_order]);
+    buddy_list_link(zone, buddy, cur_order);
   }
 
   pmm_bitmap_set_range(pmm_bitmap, pfn, 1ULL << order);
@@ -308,6 +342,7 @@ __attribute__((optimize("O3"))) void *buddy_alloc_internal(struct buddy_zone *zo
     pmm_refcounts[pfn + i - pmm_lowest_page] = 1;
   }
 
+  buddy_unmark_returned(pfn);
   spinlock_release(&zone->lock);
   return (void *)(pfn * PAGE_SIZE);
 }
@@ -334,12 +369,12 @@ void *buddy_alloc_page_locked(struct buddy_zone *zone) {
     cur_order--;
     uint64_t buddy_pfn = pfn + (1ULL << cur_order);
     struct buddy_block *buddy = virt_to_buddy(buddy_pfn * PAGE_SIZE);
-    buddy->order = cur_order;
-    list_add_tail(&buddy->node, &zone->free_list[cur_order]);
+    buddy_list_link(zone, buddy, cur_order);
   }
 
   pmm_bitmap_set_range(pmm_bitmap, pfn, 1);
   pmm_refcounts[pfn - pmm_lowest_page] = 1;
+  buddy_unmark_returned(pfn);
   return (void *)(pfn * PAGE_SIZE);
 }
 
@@ -379,7 +414,7 @@ void *buddy_alloc_pages_range(struct buddy_zone *zone, size_t count,
     }
 
     if (found_block) {
-      list_del(&found_block->node);
+      buddy_list_unlink(found_block);
       uint64_t pfn = buddy_to_phys(found_block) / PAGE_SIZE;
       buddy_trace(zone, pfn * PAGE_SIZE, cur_order, "allocate-range",
                    __builtin_return_address(0));
@@ -396,14 +431,14 @@ void *buddy_alloc_pages_range(struct buddy_zone *zone, size_t count,
           buddy_pfn = pfn + half_pages;
         }
         struct buddy_block *buddy = virt_to_buddy(buddy_pfn * PAGE_SIZE);
-        buddy->order = cur_order;
-        list_add_tail(&buddy->node, &zone->free_list[cur_order]);
+        buddy_list_link(zone, buddy, cur_order);
       }
 
       pmm_bitmap_set_range(pmm_bitmap, pfn, 1ULL << order);
       for (size_t i = 0; i < (1ULL << order); i++)
         pmm_refcounts[pfn + i - pmm_lowest_page] = 1;
 
+      buddy_unmark_returned(pfn);
       spinlock_release(&zone->lock);
       return (void *)(pfn * PAGE_SIZE);
     }

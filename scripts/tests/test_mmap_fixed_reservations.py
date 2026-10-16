@@ -7,7 +7,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 source = (ROOT / 'kernel/src/syscalls/sys_mm.c').read_text()
-mmap = source[source.index('uint64_t sys_mmap('):source.index('\n// sys_munmap')]
+mmap = source[source.index('static void mmap_gap_release('):source.index('\n// sys_munmap')]
 region = source[source.index('static bool mm_compat32('):source.index('// INTERNAL HELPERS')]
 constants = source[source.index('// Linux mmap constants'):source.index('// Helpers')]
 prefix = r'''
@@ -29,15 +29,15 @@ typedef struct node {
   int flags;
   bool mmap_shared_only;
 } vfs_node_t;
-struct mm { int lock; struct vma_list vmas; uint64_t mmap_next_addr; bool compat32; };
-struct thread { struct mm *mm; vfs_node_t *fds[MAX_FDS]; };
+struct mm_struct { int lock; struct vma_list vmas; uint64_t mmap_next_addr, brk_current; bool compat32; };
+struct thread { struct mm_struct *mm; vfs_node_t *fds[MAX_FDS]; };
 static unsigned fd_pins;
 static vfs_node_t *fd_node_get(struct thread *t,uint64_t fd){
  if(!t || fd>=MAX_FDS || !t->fds[fd] || t->fds[fd]==(vfs_node_t*)-1)return NULL;
  fd_pins++;return t->fds[fd];
 }
 static void fd_node_put(vfs_node_t **n){if(*n){assert(fd_pins);fd_pins--;}}
-static struct mm memory;
+static struct mm_struct memory;
 static struct thread thread = { .mm = &memory };
 static struct vma regions[32];
 static int count, teardown_calls, fail_add;
@@ -176,8 +176,10 @@ int main(void) {
   assert(memory.mmap_next_addr == cursor);
   int before = count;
   // Unsupported host-address-space probe: no VMA or cursor side effects.
-  assert(anon(0x8000000000000000ULL, 4096, MAP_FIXED_NOREPLACE) == E_NOMEM);
-  assert(count == before && memory.mmap_next_addr == cursor);
+  for (unsigned bit = 47; bit < 64; bit++) {
+    assert(anon(1ULL << bit, 4096, MAP_FIXED_NOREPLACE) == E_NOMEM);
+    assert(count == before && memory.mmap_next_addr == cursor);
+  }
   assert(anon(0, 0x100000, 0) == cursor); // Wine's view_block_start allocation.
   assert(anon(0, 0x100000, 0) == cursor + 0x100000);
   // A fixed mapping inside the arena must be skipped by the next gap search.
@@ -199,6 +201,63 @@ int main(void) {
   fail_add = 1;
   assert(anon(0x10000, 4096, MAP_FIXED_NOREPLACE) == E_NOMEM);
   assert(memory.mmap_next_addr == after);
+  /* A watermarked arena must not be terminal for file-backed mappings: a gap
+   * released by munmap below the cursor is reusable, the placeholder is
+   * replaced by the real VMA, and failures return the gap. */
+  reset();
+  vfs_node_t plain = {.flags=FS_FILE};
+  thread.fds[3] = &plain;
+  regions[0] = (struct vma){.start=MMAP_REGION_BASE, .end=MMAP_REGION_BASE+0x1000};
+  count = 1;
+  memory.mmap_next_addr = MMAP_REGION_LIMIT;
+  uint64_t reused = sys_mmap(0, 0x1000, 3, MAP_SHARED, 3, 0);
+  assert(reused == MMAP_REGION_BASE + 0x1000);
+  assert(count == 2 && memory.mmap_next_addr == MMAP_REGION_LIMIT);
+  bool saw_plain = false;
+  for (int i = 0; i < count; i++) {
+    if (regions[i].start != reused) continue;
+    saw_plain = true;
+    assert(regions[i].flags & MAP_PAGECACHE);
+    assert(!(regions[i].flags & MAP_ANONYMOUS));
+    assert(regions[i].fd == 3);
+  }
+  assert(saw_plain);
+  puts("PASS: an exhausted arena reuses an interior gap for file-backed mappings");
+  reset();
+  vfs_node_t missing = {.flags=FS_FILE};
+  thread.fds[3] = &missing;
+  regions[0] = (struct vma){.start=MMAP_REGION_BASE, .end=MMAP_REGION_BASE+0x1000};
+  count = 1;
+  memory.mmap_next_addr = MMAP_REGION_LIMIT;
+  assert(sys_mmap(0, 0x1000, 3, MAP_SHARED, 5, 0) == E_BADF);
+  assert(count == 1 && memory.mmap_next_addr == MMAP_REGION_LIMIT);
+  thread.fds[3] = NULL;
+  reset();
+  thread.fds[3] = &memfd;
+  regions[0] = (struct vma){.start=MMAP_REGION_BASE, .end=MMAP_REGION_BASE+0x1000};
+  count = 1;
+  memory.mmap_next_addr = MMAP_REGION_LIMIT;
+  unsigned handlers_before = handler_calls;
+  uint64_t shared = sys_mmap(0, 0x1000, 3, MAP_SHARED, 3, 0);
+  assert(shared == MMAP_REGION_BASE + 0x1000);
+  assert(handler_calls == handlers_before + 1);
+  assert(count == 2 && memory.mmap_next_addr == MMAP_REGION_LIMIT);
+  bool saw_shared = false;
+  for (int i = 0; i < count; i++) {
+    if (regions[i].start != shared) continue;
+    saw_shared = true;
+    assert(!(regions[i].flags & MAP_ANONYMOUS));
+    assert(!(regions[i].flags & MAP_PAGECACHE));
+    assert(regions[i].fd == 3);
+  }
+  assert(saw_shared);
+  /* A handler failure returns the reserved gap instead of stranding it. */
+  handler_error = (uint64_t)-22;
+  assert(sys_mmap(0, 0x1000, 3, MAP_SHARED, 3, 0) == (uint64_t)-22);
+  assert(count == 2);
+  handler_error = 0;
+  thread.fds[3] = NULL;
+  puts("PASS: file-backed arena fallback reserves interior gaps and releases them on failure");
   puts("PASS: Wine high reservations preserve allocation space, fixed overlap/replacement, atomic VMA installation, bounds and failure paths");
 }
 '''

@@ -28,7 +28,8 @@ count alone does not establish a kernel defect.
 - sysfs: invalidate the initial negative lookup after creating `/sys`, so
   boot can mount sysfs even on a filesystem without a preexisting directory.
   The user-namespace enable parameter reports `N`, consistent with clone
-  and unshare rejecting namespace flags. The current source already contains
+  and unshare rejecting user-namespace flags. Standalone UTS namespace support
+  is now implemented; see [namespace status](namespaces.md). The source contains
   the CPU online and cpu_capacity nodes reported missing in the attachment;
   the guest regression verifies that they are readable.
 

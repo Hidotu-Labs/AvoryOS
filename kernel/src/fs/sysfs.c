@@ -15,6 +15,7 @@
 #include "net/ipv4.h"
 #include "net/ipv6.h"
 #include "smp/cpu.h"
+#include "socket/af_netlink.h"
 
 #include <linuxkpi/native_sysfs.h>
 
@@ -160,6 +161,134 @@ static void sysfs_symlink(vfs_node_t *parent, const char *name,
   vfs_dentry_invalidate(parent, name);
 }
 
+
+/* uevent attributes are commands on write, while reads keep device metadata.
+ * udevadm's coldplug and the standard udev rules both rely on this ABI. */
+static vfs_node_t *uevent_root;
+
+static bool sysfs_find_devpath(vfs_node_t *dir, vfs_node_t *target,
+                               char *path, size_t used, unsigned depth) {
+  if (dir == target) return true;
+  if (depth >= 32) return false;
+  for (uint32_t index = 0;; index++) {
+    struct dirent *entry = vfs_readdir(dir, index);
+    if (!entry) break;
+    char name[128];
+    memcpy(name, entry->name, sizeof(name));
+    name[sizeof(name) - 1] = 0;
+    if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
+    size_t len = strlen(name);
+    if (used + len + 2 > 512) continue;
+    vfs_node_t *child = vfs_finddir(dir, name);
+    if (!child) continue;
+    bool found = false;
+    if ((child->flags & FS_TYPE_MASK) == FS_DIRECTORY) {
+      path[used] = '/';
+      memcpy(path + used + 1, name, len + 1);
+      found = sysfs_find_devpath(child, target, path, used + len + 1, depth + 1);
+    }
+    vfs_close(child);
+    if (found) return true;
+    path[used] = 0;
+  }
+  return false;
+}
+
+static bool sysfs_event_field(char *event, size_t *used, const char *field) {
+  size_t len = strlen(field) + 1;
+  if (*used + len > 4096) return false;
+  memcpy(event + *used, field, len);
+  *used += len;
+  return true;
+}
+
+static uint32_t sysfs_uevent_write(vfs_node_t *node, uint32_t offset,
+                                    uint32_t size, uint8_t *buffer) {
+  if (offset || !size || size >= 128) return (uint32_t)-22;
+  uint32_t original_size = size;
+  char command[128];
+  memcpy(command, buffer, size);
+  command[size] = 0;
+  while (size && (command[size-1] == '\n' || command[size-1] == '\r'))
+    command[--size] = 0;
+  uint32_t written = original_size;
+  char *uuid = strchr(command, ' ');
+  if (uuid) {
+    *uuid++ = 0;
+    if (strlen(uuid) != 36) return (uint32_t)-22;
+    for (unsigned i = 0; i < 36; i++) {
+      char c = uuid[i];
+      if (i == 8 || i == 13 || i == 18 || i == 23) {
+        if (c != '-') return (uint32_t)-22;
+      } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                   (c >= 'A' && c <= 'F'))) return (uint32_t)-22;
+    }
+  }
+  const char *actions[] = {"add", "remove", "change", "move", "online", "offline", "bind", "unbind"};
+  bool valid = false;
+  for (unsigned i = 0; i < sizeof(actions)/sizeof(actions[0]); i++)
+    if (!strcmp(command, actions[i])) valid = true;
+  if (!valid) return (uint32_t)-22;
+
+  vfs_node_t *parent = node->ptr;
+  char path[512] = "", subsystem[128] = "";
+  if (!uevent_root || !sysfs_find_devpath(uevent_root, parent, path, 0, 0))
+    return (uint32_t)-2;
+  vfs_node_t *link = vfs_finddir(parent, "subsystem");
+  if (link) {
+    if (link->readlink) {
+      int n = link->readlink(link, subsystem, sizeof(subsystem)-1);
+      if (n > 0) subsystem[n] = 0;
+    }
+    vfs_close(link);
+  }
+  char *sub = strrchr(subsystem, '/');
+  sub = sub ? sub + 1 : subsystem;
+  if (!*sub) return (uint32_t)-22;
+  char *event = kmalloc(4096), *properties = kmalloc(4096);
+  if (!event || !properties) { kfree(event); kfree(properties); return (uint32_t)-12; }
+  uint32_t n = vfs_read(node, 0, 4095, (uint8_t *)properties);
+  if (n > 4095) { kfree(event); kfree(properties); return (uint32_t)-5; }
+  properties[n] = 0;
+  char field[640];
+  size_t used = 0;
+  snprintf(field, sizeof(field), "%s@%s", command, path);
+  bool ok = sysfs_event_field(event, &used, field);
+  snprintf(field, sizeof(field), "ACTION=%s", command);
+  ok = ok && sysfs_event_field(event, &used, field);
+  snprintf(field, sizeof(field), "DEVPATH=%s", path);
+  ok = ok && sysfs_event_field(event, &used, field);
+  snprintf(field, sizeof(field), "SUBSYSTEM=%s", sub);
+  ok = ok && sysfs_event_field(event, &used, field);
+  snprintf(field, sizeof(field), "SEQNUM=%llu", (unsigned long long)netlink_uevent_next_seqnum());
+  ok = ok && sysfs_event_field(event, &used, field);
+  if (uuid) {
+    snprintf(field, sizeof(field), "SYNTH_UUID=%s", uuid);
+    ok = ok && sysfs_event_field(event, &used, field);
+  }
+  char *line = properties;
+  while (*line && ok) {
+    char *end = strchr(line, '\n');
+    if (end) *end = 0;
+    if (strchr(line, '=') && strncmp(line, "SUBSYSTEM=", 10) &&
+        strncmp(line, "DEVPATH=", 8) && strncmp(line, "ACTION=", 7) &&
+        strncmp(line, "SEQNUM=", 7))
+      ok = sysfs_event_field(event, &used, line);
+    if (!end) break;
+    line = end + 1;
+  }
+  if (ok) netlink_broadcast(NETLINK_KOBJECT_UEVENT, 1, event, used);
+  kfree(event); kfree(properties);
+  return ok ? written : (uint32_t)-7;
+}
+
+void sysfs_enable_uevent(vfs_node_t *node, vfs_node_t *parent) {
+  if (!node || !parent) return;
+  node->ptr = parent;
+  node->mask = 0644;
+  node->write = sysfs_uevent_write;
+}
+
 // Create a read-only file under parent with the given content.
 static vfs_node_t *sysfs_mkfile(vfs_node_t *parent, const char *name,
                          const char *content) {
@@ -193,6 +322,7 @@ static vfs_node_t *sysfs_mkfile(vfs_node_t *parent, const char *name,
 
   uint32_t len = (uint32_t)strlen(content);
   vfs_write(f, 0, len, (uint8_t *)content);
+  if (!strcmp(name, "uevent")) sysfs_enable_uevent(f, parent);
   return f;
 }
 
@@ -249,6 +379,7 @@ static void sysfs_populate_block(vfs_node_t *block_class_dir) {
              bd->linux_major, bd->linux_minor, bd->name,
              block_is_partition(bd) ? "partition" : "disk");
     sysfs_mkfile(bdir, "uevent", uevent);
+    sysfs_symlink(bdir, "subsystem", "../../../class/block");
 
     // stat: 11 space-separated counters (reads, merges, sectors, ms, ...).
     // Per-device I/O accounting does not exist yet, so report zeros.
@@ -302,13 +433,61 @@ static void append_dec_line(vfs_node_t *dir, const char *name, uint64_t value) {
   sysfs_mkfile(dir, name, buf);
 }
 
+static int net_counter_show(void *ctx, char *buf, unsigned int size) {
+  return snprintf(buf, size, "%llu\n",
+                  (unsigned long long)__atomic_load_n((uint64_t *)ctx, __ATOMIC_RELAXED));
+}
+
+static int net_carrier_show(void *ctx, char *buf, unsigned int size) {
+  struct net_device *dev = ctx;
+  bool up = dev->registered && dev->ops->link_up(dev);
+  return snprintf(buf, size, "%u\n", up ? 1 : 0);
+}
+
+static int net_operstate_show(void *ctx, char *buf, unsigned int size) {
+  struct net_device *dev = ctx;
+  bool up = dev->registered && dev->ops->link_up(dev);
+  return snprintf(buf, size, "%s\n", up ? "up" : "down");
+}
+
 static void sysfs_populate_net(vfs_node_t *net_class_dir) {
   struct net_device *dev = net_device_default();
   if (!dev)
     return;
-  vfs_node_t *ndir = sysfs_mkdir(net_class_dir, dev->name);
+  vfs_node_t *pci_parent = sysfs_pci_device_node(dev->pci);
+  vfs_node_t *ndir;
+  if (pci_parent) {
+    vfs_node_t *net = sysfs_mkdir(pci_parent, "net");
+    ndir = net ? sysfs_mkdir(net, dev->name) : NULL;
+    char target[160];
+    snprintf(target, sizeof(target),
+             "../../devices/pci0000:00/0000:%02x:%02x.%x/net/%s",
+             dev->pci->bus, dev->pci->slot, dev->pci->func, dev->name);
+    if (ndir) {
+      sysfs_symlink(net_class_dir, dev->name, target);
+      sysfs_symlink(ndir, "subsystem", "../../../../../class/net");
+      sysfs_symlink(ndir, "device", "../..");
+    }
+  } else {
+    ndir = sysfs_mkdir(net_class_dir, dev->name);
+    if (ndir)
+      sysfs_symlink(ndir, "subsystem", "../../net");
+  }
   if (!ndir)
     return;
+
+  char uevent[96];
+  snprintf(uevent, sizeof(uevent), "INTERFACE=%s\nIFINDEX=2\nSUBSYSTEM=net\n", dev->name);
+  sysfs_mkfile(ndir, "uevent", uevent);
+  append_dec_line(ndir, "ifindex", 2);
+  append_dec_line(ndir, "iflink", 2);
+  sysfs_mkfile(ndir, "addr_assign_type", "0\n");
+  /* Only opt-in persistent netdevs can be retained by permanent sysfs files.
+   * User-driver endpoints can disappear with their session; keep snapshots. */
+  if (dev->persistent)
+    asc_sysfs_attr_file(ndir, "carrier", 0444, dev, net_carrier_show, NULL, NULL);
+  else
+    sysfs_mkfile(ndir, "carrier", dev->ops->link_up(dev) ? "1\n" : "0\n");
 
   static const char hex[] = "0123456789abcdef";
   char mac[19];
@@ -319,8 +498,10 @@ static void sysfs_populate_net(vfs_node_t *net_class_dir) {
   }
   mac[18] = '\0';
   sysfs_mkfile(ndir, "address", mac);
-  sysfs_mkfile(ndir, "operstate",
-               dev->ops->link_up(dev) ? "up\n" : "down\n");
+  if (dev->persistent)
+    asc_sysfs_attr_file(ndir, "operstate", 0444, dev, net_operstate_show, NULL, NULL);
+  else
+    sysfs_mkfile(ndir, "operstate", dev->ops->link_up(dev) ? "up\n" : "down\n");
   sysfs_mkfile(ndir, "type", "1\n");
   append_dec_line(ndir, "mtu", dev->mtu);
 
@@ -367,13 +548,20 @@ static void sysfs_populate_net(vfs_node_t *net_class_dir) {
   vfs_node_t *stats = sysfs_mkdir(ndir, "statistics");
   if (!stats)
     return;
-#define NET_STAT(field) append_dec_line(stats, #field, dev->stats.field)
+#define NET_STAT(field) do { \
+  if (dev->persistent) \
+    asc_sysfs_attr_file(stats, #field, 0444, &dev->stats.field, net_counter_show, NULL, NULL); \
+  else \
+    append_dec_line(stats, #field, dev->stats.field); \
+} while (0)
   NET_STAT(rx_packets); NET_STAT(tx_packets);
   NET_STAT(rx_bytes); NET_STAT(tx_bytes);
   NET_STAT(rx_dropped); NET_STAT(tx_dropped);
   NET_STAT(rx_errors); NET_STAT(tx_errors);
   NET_STAT(interrupts); NET_STAT(resets); NET_STAT(queue_full);
   NET_STAT(link_changes); NET_STAT(rx_overflows); NET_STAT(tx_underruns);
+  NET_STAT(tx_timeouts); NET_STAT(recoveries); NET_STAT(recovery_failures);
+  NET_STAT(dma_bytes);
 #undef NET_STAT
 }
 
@@ -404,6 +592,11 @@ static void sysfs_populate_cpus(vfs_node_t *cpu_dir) {
     u64_to_dec(node, nodename + 4);
     sysfs_mkdir(cdir, nodename);
   }
+  /* Highest CPU ID supported by this kernel, independent of online count. */
+  char kernel_max[16];
+  u64_to_dec(MAX_CPUS - 1, kernel_max);
+  strcat(kernel_max, "\n");
+  sysfs_mkfile(cpu_dir, "kernel_max", kernel_max);
   // Also add a 'possible' and 'present' file at the cpu/ level
   char cpumask[16];
   strcpy(cpumask, "0-");
@@ -536,6 +729,7 @@ void sysfs_init(void) {
   strcpy(sysfs_root->name, "sys");
   ramfs_mount_on(sysfs_root);
   sysfs_root->statfs = sysfs_statfs;
+  uevent_root = sysfs_root;
   vfs_mount_ex(sys_dir, sysfs_root, "sysfs", "sysfs", "/sys");
   vfs_close(sys_dir);
 
@@ -821,10 +1015,8 @@ void sysfs_init(void) {
 
   // /sys/devices/virtual/input/input0/event0
   vfs_node_t *virtual_dir = sysfs_mkdir(devices_dir, "virtual");
-  sysfs_mkfile(virtual_dir, "uevent", "SUBSYSTEM=virtual\n");
   sysfs_symlink(virtual_dir, "subsystem", "../../class");
   vfs_node_t *virtual_input_dir = sysfs_mkdir(virtual_dir, "input");
-  sysfs_mkfile(virtual_input_dir, "uevent", "SUBSYSTEM=input\nID_INPUT=1\n");
   sysfs_symlink(virtual_input_dir, "subsystem", "../../../class/input");
   vfs_node_t *input0_dir = sysfs_mkdir(virtual_input_dir, "input0");
   vfs_node_t *event0_dir = sysfs_mkdir(input0_dir, "event0");
@@ -896,42 +1088,32 @@ void sysfs_init(void) {
     sysfs_symlink(input_devices_dir, "event1", "../event1");
   }
 
-  // /sys/class/sound — HDA card0 (major 116, see alsa_emu.c). Without these
-  // nodes the ALSA monitor enumerates zero cards and rescans in a
-  // ppoll(timeout=0) loop (wireplumber 100% CPU); with a stable card0 it
-  // enumerates once then blocks on uevent hotplug like Linux.
+  // ALSA cards are parent devices; only control/PCM children have devnums.
+  // udev's sound rules write ../uevent on controlC0 to initialize its card.
   vfs_node_t *sound_class = sysfs_mkdir(class_dir, "sound");
-  if (sound_class) {
-    vfs_node_t *card0_dir = sysfs_mkdir(sound_class, "card0");
-    if (card0_dir) {
-      sysfs_mkfile(card0_dir, "number", "0\n");
-      sysfs_mkfile(card0_dir, "uevent",
-                   "MAJOR=116\nMINOR=0\nDEVNAME=snd/controlC0\n"
-                   "SUBSYSTEM=sound\nSOUND_CLASS=control\n");
-      sysfs_symlink(card0_dir, "subsystem", "../../class/sound");
-    }
-    vfs_node_t *ctl_dir = sysfs_mkdir(sound_class, "controlC0");
-    if (ctl_dir) {
-      sysfs_mkfile(ctl_dir, "dev", "116:0\n");
-      sysfs_mkfile(ctl_dir, "uevent",
-                   "MAJOR=116\nMINOR=0\nDEVNAME=snd/controlC0\n"
-                   "SUBSYSTEM=sound\n");
-      sysfs_symlink(ctl_dir, "subsystem", "../../class/sound");
-    }
-    vfs_node_t *pcm_dir = sysfs_mkdir(sound_class, "pcmC0D0p");
-    if (pcm_dir) {
-      sysfs_mkfile(pcm_dir, "dev", "116:24\n");
-      sysfs_mkfile(pcm_dir, "uevent",
-                   "MAJOR=116\nMINOR=24\nDEVNAME=snd/pcmC0D0p\n"
-                   "SUBSYSTEM=sound\n");
-      sysfs_symlink(pcm_dir, "subsystem", "../../class/sound");
-    }
-    vfs_node_t *snd_devices_dir = sysfs_mkdir(sound_class, "devices");
-    if (snd_devices_dir) {
-      sysfs_symlink(snd_devices_dir, "card0", "../card0");
-      sysfs_symlink(snd_devices_dir, "controlC0", "../controlC0");
-      sysfs_symlink(snd_devices_dir, "pcmC0D0p", "../pcmC0D0p");
-    }
+  vfs_node_t *sound_virtual = sysfs_mkdir(virtual_dir, "sound");
+  vfs_node_t *sound_card = sysfs_mkdir(sound_virtual, "card0");
+  if (sound_class && sound_card) {
+    sysfs_mkfile(sound_card, "number", "0\n");
+    sysfs_mkfile(sound_card, "id", "HDA\n");
+    sysfs_mkfile(sound_card, "uevent", "SUBSYSTEM=sound\n");
+    sysfs_symlink(sound_card, "subsystem", "../../../../class/sound");
+    vfs_node_t *ctl = sysfs_mkdir(sound_card, "controlC0");
+    sysfs_mkfile(ctl, "dev", "116:0\n");
+    sysfs_mkfile(ctl, "uevent", "MAJOR=116\nMINOR=0\nDEVNAME=snd/controlC0\nSUBSYSTEM=sound\n");
+    sysfs_symlink(ctl, "subsystem", "../../../../../class/sound");
+    vfs_node_t *pcm = sysfs_mkdir(sound_card, "pcmC0D0p");
+    sysfs_mkfile(pcm, "dev", "116:24\n");
+    sysfs_mkfile(pcm, "uevent", "MAJOR=116\nMINOR=24\nDEVNAME=snd/pcmC0D0p\nSUBSYSTEM=sound\n");
+    sysfs_mkfile(pcm, "pcm_class", "generic\n");
+    sysfs_symlink(pcm, "subsystem", "../../../../../class/sound");
+    sysfs_symlink(sound_class, "card0", "../../devices/virtual/sound/card0");
+    sysfs_symlink(sound_class, "controlC0", "../../devices/virtual/sound/card0/controlC0");
+    sysfs_symlink(sound_class, "pcmC0D0p", "../../devices/virtual/sound/card0/pcmC0D0p");
+    vfs_node_t *devices = sysfs_mkdir(sound_class, "devices");
+    sysfs_symlink(devices, "card0", "../../../devices/virtual/sound/card0");
+    sysfs_symlink(devices, "controlC0", "../../../devices/virtual/sound/card0/controlC0");
+    sysfs_symlink(devices, "pcmC0D0p", "../../../devices/virtual/sound/card0/pcmC0D0p");
   }
 
   // /sys/class/tty/tty0/active — elogind manager_connect_console() opens it
@@ -1004,8 +1186,8 @@ void sysfs_init(void) {
 
   // Sound char devices (major 116, see alsa_emu.c): libudev resolves
   // /dev/snd/* back to /sys/class/sound through these.
-  sysfs_symlink(char_dir, "116:0", "../../class/sound/controlC0");
-  sysfs_symlink(char_dir, "116:24", "../../class/sound/pcmC0D0p");
+  sysfs_symlink(char_dir, "116:0", "../../devices/virtual/sound/card0/controlC0");
+  sysfs_symlink(char_dir, "116:24", "../../devices/virtual/sound/card0/pcmC0D0p");
 
   // /sys/subsystem
   // libinput and others expect this to exist for device discovery.
@@ -1042,57 +1224,6 @@ void sysfs_init(void) {
   // yields ENOMEDIUM without further reads. Pre-mount tmpfs here so the first
   // statfs already sees tmpfs; submounts (unified/elogind) stack on top.
   tmpfs_mount_at("/sys/fs/cgroup");
-
-  // /run/udev/data population
-  // libinput often falls back to the udev database if uevent is insufficient.
-  // We ensure /run/udev/data is present and populated with required flags.
-  vfs_node_t *run_dir = vfs_resolve_path("/run");
-  if (!run_dir) {
-    // If /run doesn't exist, create it in root.
-    if (fs_root && fs_root->mkdir) {
-      fs_root->mkdir(fs_root, "run", 0755);
-      run_dir = vfs_resolve_path("/run");
-    }
-  }
-
-  if (run_dir) {
-    vfs_node_t *udev_dir = vfs_finddir(run_dir, "udev");
-    if (!udev_dir)
-      udev_dir = sysfs_mkdir(run_dir, "udev");
-
-    vfs_node_t *data_dir = udev_dir ? vfs_finddir(udev_dir, "data") : NULL;
-    if (!data_dir && udev_dir)
-      data_dir = sysfs_mkdir(udev_dir, "data");
-
-    if (data_dir) {
-      sysfs_mkfile(data_dir, "c13:64",
-                   "P:/devices/virtual/input/input0/event0\n"
-                   "E:ID_INPUT=1\n"
-                   "E:ID_INPUT_KEYBOARD=1\n"
-                   "E:ID_SEAT=seat0\n"
-                   "E:NAME=\"AscentOS Keyboard\"\n");
-      sysfs_mkfile(data_dir, "c13:65",
-                   "P:/devices/virtual/input/input1/event1\n"
-                   "E:ID_INPUT=1\n"
-                   "E:ID_INPUT_MOUSE=1\n"
-                   "E:ID_SEAT=seat0\n"
-                   "E:NAME=\"AscentOS Mouse\"\n");
-      sysfs_mkfile(data_dir, "c116:0",
-                   "P:/class/sound/controlC0\n"
-                   "E:SUBSYSTEM=sound\n"
-                   "E:SOUND_CLASS=control\n"
-                   "E:ID_SEAT=seat0\n");
-      sysfs_mkfile(data_dir, "c116:24",
-                   "P:/class/sound/pcmC0D0p\n"
-                   "E:SUBSYSTEM=sound\n"
-                   "E:ID_SEAT=seat0\n");
-    }
-
-
-    if (data_dir) vfs_close(data_dir);
-    if (udev_dir) vfs_close(udev_dir);
-    vfs_close(run_dir);
-  }
 
   klog_puts("[OK] SysFS initialized at /sys\n");
 }

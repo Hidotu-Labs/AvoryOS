@@ -24,6 +24,13 @@ struct buddy_trace_event {
 struct buddy_zone {
   struct list_head free_list[MAX_ORDER];
   spinlock_t lock;
+  /* Per-boot tag stamped into every linked block header.  RAM survives a
+   * guest reboot, and a stale header from the previous boot can satisfy
+   * the free-list validity heuristic (order + reciprocal links); the
+   * allocator would then treat a first free as a double free and drop the
+   * page (see buddy_free_internal).  A fresh tag makes stale headers fail
+   * the check while headers linked in this boot keep matching. */
+  uint32_t magic;
   /* Updated under zone.lock; bounded history for corruption reports. */
   uint64_t trace_seq;
   struct buddy_trace_event trace[BUDDY_TRACE_SLOTS];
@@ -32,6 +39,8 @@ struct buddy_zone {
 struct buddy_block {
   struct list_head node;
   size_t order;
+  /* zone->magic while this block is linked in a free list; 0 otherwise. */
+  uint32_t magic;
 };
 
 struct pcp_cache {

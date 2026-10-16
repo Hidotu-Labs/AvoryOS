@@ -28,6 +28,7 @@
 #include "drivers/manager/dtb.h"
 #include "drivers/manager/udriver.h"
 #include "drivers/net/rtl8139.h"
+#include "drivers/net/e1000.h"
 #include "drivers/pci/pci.h"
 #include "drivers/serial.h"
 #include "drivers/storage/ahci.h"
@@ -57,6 +58,7 @@
 #include "fs/random.h"
 #include "fs/tmpfs.h"
 #include "fs/vfs.h"
+#include "fs/vfs_rcu.h"
 #include "hal/hal.h"
 #include "io/io.h"
 #include "lib/radix_tree.h"
@@ -203,19 +205,43 @@ void restart_main_session(void) {
     ;
 }
 
-static void init_thread_entry(void) {
+static void network_start(void) {
+  static bool initialized;
+  if (initialized)
+    return;
+  initialized = true;
   net_core_start_worker();
-  if (rtl8139_present()) {
-    if (rtl8139_phase2_init() && rtl8139_phase3_init()) {
-      net_phase4_init();
-      net_phase5_init();
-      net_phase6_init();
-      ipv4_set_tcp_handler(tcp_input_ipv4);
-      net_phase8_init();
-      net_phase11_init();
-      sysfs_populate_network();
+  if (net_devices_start()) {
+    /* The stack currently has one IPv4/IPv6 configuration. Allow either NIC
+     * to carry traffic in mixed-driver boots without changing probe order. */
+    const char *option = strstr(kernel_boot_cmdline, "net_default=");
+    if (option && (option == kernel_boot_cmdline || option[-1] == ' ')) {
+      option += strlen("net_default=");
+      char name[16];
+      size_t i = 0;
+      while (option[i] && option[i] != ' ' && i < sizeof(name) - 1) {
+        name[i] = option[i];
+        i++;
+      }
+      name[i] = 0;
+      if (!net_device_set_default(name))
+        klogf("[NET] requested default %s unavailable; keeping working NIC\n", name);
     }
+    klogf("[NET] default interface: %s\n", net_device_default()->name);
+    net_phase4_init();
+    net_phase5_init();
+    net_phase6_init();
+    ipv4_set_tcp_handler(tcp_input_ipv4);
+    net_phase8_init();
+    net_phase11_init();
+    sysfs_populate_network();
+  } else {
+    klog_puts("[NET] no usable network device; protocol startup skipped\n");
   }
+}
+
+static void init_thread_entry(void) {
+  network_start();
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " Init thread started\n");
 
   /* ── NUMA Subsystem self test ── */
@@ -623,6 +649,11 @@ void kmain_high_half(void) {
   vfs_node_cache =
       kmem_cache_create("vfs_node", sizeof(vfs_node_t), 8, NULL, NULL);
 
+  /* Deferred node reclamation for the lockless dentry/path-cache lookups.
+   * Must be up before any node can be freed: the lookups gate their lockless
+   * fast path on it, and every last-close routes its kfree through it. */
+  vfs_rcu_init();
+
   shm_init();
 
   pci_init();
@@ -898,6 +929,7 @@ mount_fail:
 
   net_core_init();
   rtl8139_phase1_init();
+  e1000_init();
 
 #if LOCKDIAG_SELFTEST
   /* Renders a full hang report on a healthy machine, so the report itself is

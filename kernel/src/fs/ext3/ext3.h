@@ -70,4 +70,10 @@ int ext3_journal_start(ext2_mount_t *mnt);
 int ext3_journal_stop(ext2_mount_t *mnt);
 int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data);
 
+/* True when the active journal transaction holds a newer full-block image of
+ * this filesystem block. Called by ext2_read_block before the home cache and
+ * device so read-modify-write sequences see staged metadata. */
+bool ext3_journal_read_staged(ext2_mount_t *mnt, uint32_t block_nr,
+                              void *buffer);
+
 #endif
