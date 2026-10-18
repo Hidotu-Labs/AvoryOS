@@ -1,5 +1,33 @@
 #include "ext2_internal.h"
 
+ext2_mount_t *ext2_active_mounts = NULL;
+spinlock_t ext2_mounts_lock = SPINLOCK_INIT;
+
+void ext2_register_mount(ext2_mount_t *mnt) {
+  if (!mnt)
+    return;
+  spinlock_acquire(&ext2_mounts_lock);
+  mnt->next = ext2_active_mounts;
+  ext2_active_mounts = mnt;
+  spinlock_release(&ext2_mounts_lock);
+}
+
+void ext2_unregister_mount(ext2_mount_t *mnt) {
+  if (!mnt)
+    return;
+  spinlock_acquire(&ext2_mounts_lock);
+  ext2_mount_t **curr = &ext2_active_mounts;
+  while (*curr) {
+    if (*curr == mnt) {
+      *curr = mnt->next;
+      mnt->next = NULL;
+      break;
+    }
+    curr = &(*curr)->next;
+  }
+  spinlock_release(&ext2_mounts_lock);
+}
+
 ext2_mount_t *ext2_init_mount(struct block_device *dev) {
   uint8_t sb_buf[1024];
   if (dev->read_sectors(dev, 2, 2, sb_buf)) {
@@ -142,6 +170,7 @@ int ext2_mount(struct block_device *dev, vfs_node_t *mountpoint) {
   mountpoint->statfs  = ext2_statfs_impl;
 
   ext3_init_journal(mnt);
+  ext2_register_mount(mnt);
   return 0;
 }
 
@@ -190,6 +219,7 @@ int ext2_mount_root(struct block_device *dev) {
     klog_puts("[WARN] Failed to register ext2 root mount metadata.\n");
 
   ext3_init_journal(mnt);
+  ext2_register_mount(mnt);
 
   klog_puts("[OK] Ext2/3 filesystem mounted as root (/)\n");
   return 0;

@@ -146,7 +146,7 @@ static uint64_t sys_mkdir(uint64_t pathname, uint64_t mode, uint64_t a2,
     const char *path = (const char *)pathname;
     if (!path) return (uint64_t)-14;
 
-    char clean_path[256];
+    char clean_path[512];
     size_t len = strlen(path);
     if (len == 0 || len >= sizeof(clean_path)) return (uint64_t)-14;
     strcpy(clean_path, path);
@@ -157,7 +157,7 @@ static uint64_t sys_mkdir(uint64_t pathname, uint64_t mode, uint64_t a2,
     vfs_node_t *base  = (clean_path[0] == '/') ? fs_root
                        : (t->cwd_node ? t->cwd_node : fs_root);
 
-    char parent_path[256], dir_name[128];
+    char parent_path[512], dir_name[256];
     const char *slash = 0;
     for (const char *p = clean_path; *p; p++)
         if (*p == '/') slash = p;
@@ -209,9 +209,10 @@ static uint64_t sys_mkdir(uint64_t pathname, uint64_t mode, uint64_t a2,
     mode &= ~t->umask;
     if (parent->mask & 02000) mode |= 02000;
 
-    if (vfs_mkdir(parent, dir_name, (uint16_t)mode) != 0) {
+    int mkdir_rc = vfs_mkdir(parent, dir_name, (uint16_t)mode);
+    if (mkdir_rc != 0) {
         if (parent_owned) vfs_close(parent);
-        return (uint64_t)-17;
+        return (uint64_t)(mkdir_rc < 0 ? mkdir_rc : -17);
     }
     vfs_node_t *created = vfs_finddir(parent, dir_name);
     if (created) {
@@ -232,14 +233,21 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
     struct thread *t = sched_get_current();
     if (!t) return (uint64_t)-1;
 
+    char clean_path[512];
+    size_t len = strlen(path);
+    if (len == 0 || len >= sizeof(clean_path)) return (uint64_t)-14;
+    strcpy(clean_path, path);
+    while (len > 1 && clean_path[len - 1] == '/') { clean_path[--len] = '\0'; }
+    if (strcmp(clean_path, "/") == 0) return (uint64_t)-17;
+
     vfs_node_t *base_dir = fs_root;
     vfs_node_t *base_owned = NULL;
-    if (path[0] != '/') {
+    if (clean_path[0] != '/') {
         if ((int64_t)dirfd == AT_FDCWD) {
             base_dir = vfs_resolve_path_at(fs_root, t->cwd_path);
             if (!base_dir) base_dir = fs_root;
             else base_owned = base_dir;
-        } else if (dirfd < MAX_FDS && fd_is_valid_node(t->fds[dirfd])) {
+        } else if (FD_IN_RANGE(t, dirfd) && fd_is_valid_node(t->fds[dirfd])) {
             base_dir = t->fds[dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY)
                 return (uint64_t)-20;
@@ -248,22 +256,17 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
         }
     }
 
-    char parent_path[256], dir_name[128];
-    size_t len = strlen(path);
-    if (len == 0) {
-        if (base_owned) vfs_close(base_owned);
-        return (uint64_t)-14;
-    }
+    char parent_path[512], dir_name[256];
 
     TSC_BEGIN(mkdir_resolve);
     const char *slash = 0;
-    for (const char *p = path; *p; p++)
+    for (const char *p = clean_path; *p; p++)
         if (*p == '/') slash = p;
 
     vfs_node_t *parent = base_dir;
     bool parent_owned = false;
     if (slash) {
-        size_t parent_len = (size_t)(slash - path);
+        size_t parent_len = (size_t)(slash - clean_path);
         if (parent_len == 0) {
             parent = fs_root;
         } else {
@@ -273,7 +276,7 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
                 return (uint64_t)-14;
             }
             for (size_t i = 0; i < parent_len; i++)
-                parent_path[i] = path[i];
+                parent_path[i] = clean_path[i];
             parent_path[parent_len] = '\0';
             parent = vfs_resolve_path_at(base_dir, parent_path);
             parent_owned = parent != NULL;
@@ -292,7 +295,7 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
             TSC_END(mkdir_resolve);
             return (uint64_t)-36; // ENAMETOOLONG
         }
-        strcpy(dir_name, path);
+        strcpy(dir_name, clean_path);
     }
     TSC_END(mkdir_resolve);
 
@@ -323,11 +326,12 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
     }
     mode &= ~t->umask;
     if (parent->mask & 02000) mode |= 02000;
-    if (vfs_mkdir(parent, dir_name, (uint16_t)mode) != 0) {
+    int mkdir_rc = vfs_mkdir(parent, dir_name, (uint16_t)mode);
+    if (mkdir_rc != 0) {
         if (parent_owned) vfs_close(parent);
         if (base_owned) vfs_close(base_owned);
         TSC_END(mkdir_op);
-        return (uint64_t)-17;
+        return (uint64_t)(mkdir_rc < 0 ? mkdir_rc : -17);
     }
     vfs_node_t *created = vfs_finddir(parent, dir_name);
     if (created) {
@@ -362,7 +366,7 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
             base_dir = vfs_resolve_path_at(fs_root, t->cwd_path);
             if (!base_dir) base_dir = fs_root;
             else base_owned = base_dir;
-        } else if (dirfd < MAX_FDS && fd_is_valid_node(t->fds[dirfd])) {
+        } else if (FD_IN_RANGE(t, dirfd) && fd_is_valid_node(t->fds[dirfd])) {
             base_dir = t->fds[dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
                 if (base_owned) vfs_close(base_owned);
@@ -653,7 +657,7 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
     if (oldname[0] != '/') {
         if ((int64_t)olddfd == AT_FDCWD) {
             old_base = (t->cwd_node ? t->cwd_node : fs_root);
-        } else if (olddfd < MAX_FDS && fd_is_valid_node(t->fds[olddfd])) {
+        } else if (FD_IN_RANGE(t, olddfd) && fd_is_valid_node(t->fds[olddfd])) {
             old_base = t->fds[olddfd];
         } else {
             return (uint64_t)-9; // EBADF
@@ -664,7 +668,7 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
     if (newname[0] != '/') {
         if ((int64_t)newdfd == AT_FDCWD) {
             new_base = (t->cwd_node ? t->cwd_node : fs_root);
-        } else if (newdfd < MAX_FDS && fd_is_valid_node(t->fds[newdfd])) {
+        } else if (FD_IN_RANGE(t, newdfd) && fd_is_valid_node(t->fds[newdfd])) {
             new_base = t->fds[newdfd];
         } else {
             return (uint64_t)-9; // EBADF
@@ -888,6 +892,12 @@ static uint64_t sys_mknod(uint64_t pathname_ptr, uint64_t mode, uint64_t dev,
     return rc == 0 ? 0 : (uint64_t)-1;
 }
 
+static uint64_t sys_mknodat(uint64_t dirfd, uint64_t pathname_ptr, uint64_t mode,
+                            uint64_t dev, uint64_t a4, uint64_t a5) {
+    (void)dirfd; (void)a4; (void)a5;
+    return sys_mknod(pathname_ptr, mode, dev, 0, 0, 0);
+}
+
 static uint64_t do_sys_readlink_at(vfs_node_t *base, const char *path,
                                     char *buf, uint64_t bufsiz);
 
@@ -959,7 +969,7 @@ static uint64_t sys_readlinkat(uint64_t dirfd, uint64_t pathname_ptr,
     // Relative to an open directory fd (libudev/libdrm pass device-dir fds
     // with relative names like "subsystem" or "driver").
     struct thread *t = sched_get_current();
-    if (!t || (int)dirfd < 0 || (int)dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd]))
+    if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
         return (uint64_t)-9; // EBADF
     vfs_node_t *base = t->fds[dirfd];
     /* Linux readlinkat(fd, "", ...) reads an O_PATH|O_NOFOLLOW link.
@@ -1085,7 +1095,7 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
         // Use the fd referred to by olddirfd directly as the source.
         if ((int32_t)olddirfd == AT_FDCWD) {
             src = t ? t->cwd_node : fs_root;
-        } else if (olddirfd < MAX_FDS && t && fd_is_valid_node(t->fds[olddirfd])) {
+        } else if (FD_IN_RANGE(t, olddirfd) && fd_is_valid_node(t->fds[olddirfd])) {
             src = t->fds[olddirfd];
         } else {
             return (uint64_t)-9; // EBADF
@@ -1097,7 +1107,7 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
             old_base = fs_root;
         } else if ((int32_t)olddirfd == AT_FDCWD) {
             old_base = (t && t->cwd_node) ? t->cwd_node : fs_root;
-        } else if (olddirfd < MAX_FDS && t && fd_is_valid_node(t->fds[olddirfd])) {
+        } else if (FD_IN_RANGE(t, olddirfd) && fd_is_valid_node(t->fds[olddirfd])) {
             old_base = t->fds[olddirfd];
             if ((old_base->flags & FS_TYPE_MASK) != FS_DIRECTORY)
                 return (uint64_t)-20; // ENOTDIR
@@ -1126,7 +1136,7 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
         new_base = fs_root;
     } else if ((int32_t)newdirfd == AT_FDCWD) {
         new_base = (t && t->cwd_node) ? t->cwd_node : fs_root;
-    } else if (newdirfd < MAX_FDS && t && fd_is_valid_node(t->fds[newdirfd])) {
+    } else if (FD_IN_RANGE(t, newdirfd) && fd_is_valid_node(t->fds[newdirfd])) {
         new_base = t->fds[newdirfd];
         if ((new_base->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
             if (src_owned) vfs_close(src);
@@ -1349,7 +1359,7 @@ static uint64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t a2,
                             uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
     struct thread *t = sched_get_current();
-    if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
+    if (!FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
     if (!capability_has(t, CAP_FOWNER) && t->fsuid != t->fds[fd]->uid) return (uint64_t)-1;
     if (vfs_chmod(t->fds[fd], (uint16_t)mode) != 0) return (uint64_t)-1;
     return 0;
@@ -1372,7 +1382,7 @@ static uint64_t sys_fchmodat(uint64_t dirfd, uint64_t pathname_ptr,
                 else base_owned = base;
             }
         } else {
-            if (dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd])) return (uint64_t)-9;
+            if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd])) return (uint64_t)-9;
             base = t->fds[dirfd];
         }
     }
@@ -1461,7 +1471,7 @@ static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
                 node = fs_root; // borrowed global; must not close
             }
         } else {
-            if (!t || dirfd < 0 || dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd]))
+            if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
                 return (uint64_t)-9; // EBADF
             node = t->fds[dirfd]; // borrowed; must not close
         }
@@ -1483,7 +1493,7 @@ static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
                 else base_owned = base_dir;
             }
         } else {
-            if (dirfd < 0 || dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd]))
+            if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
                 return (uint64_t)-9;
             base_dir = t->fds[dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY)
@@ -1549,8 +1559,7 @@ static uint64_t sys_fchdir(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4,
                             uint64_t a5, uint64_t a6) {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     struct thread *t = sched_get_current();
-    if (!t) return (uint64_t)-1;
-    if (fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
+    if (!FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
     if ((t->fds[fd]->flags & FS_TYPE_MASK) != FS_DIRECTORY) return (uint64_t)-20;
     if (!vfs_access(t->fds[fd], 1)) return (uint64_t)-13;
 
@@ -1662,9 +1671,9 @@ static int vfs_set_node_times(vfs_node_t *node, uint32_t atime, uint32_t mtime) 
     return 0;
 }
 
-static uint64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
-                               uint64_t flags, uint64_t a4, uint64_t a5) {
-    (void)a4; (void)a5;
+static uint64_t do_utimensat_impl(uint64_t dirfd, uint64_t pathname,
+                                  const struct sys_timespec *ts_in,
+                                  bool have_times, uint64_t flags) {
     if (pathname && !is_user_ptr(pathname))
         return (uint64_t)-14; // EFAULT
     const char *path = (const char *)pathname;
@@ -1673,7 +1682,7 @@ static uint64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
     vfs_node_t *base_owned = NULL;
 
     if (!path || path[0] == '\0') {
-        if ((int)dirfd < 0 || (int)dirfd >= MAX_FDS || !t || !fd_is_valid_node(t->fds[dirfd]))
+        if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
             return (uint64_t)-9; // EBADF
         node = t->fds[dirfd];
         vfs_node_ref(node);
@@ -1687,7 +1696,7 @@ static uint64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
                     else base_owned = base;
                 }
             } else {
-                if ((int)dirfd < 0 || (int)dirfd >= MAX_FDS || !t || !fd_is_valid_node(t->fds[dirfd]))
+                if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
                     return (uint64_t)-9; // EBADF
                 base = t->fds[dirfd];
             }
@@ -1709,28 +1718,19 @@ static uint64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
     uint32_t atime = node->atime;
     uint32_t mtime = node->mtime;
 
-    if (!times) {
+    if (!have_times || !ts_in) {
         atime = (uint32_t)now_sec;
         mtime = (uint32_t)now_sec;
     } else {
-        if (!is_user_ptr(times)) {
-            vfs_close(node);
-            return (uint64_t)-14; // EFAULT
-        }
-        struct sys_timespec ts[2];
-        if (copy_from_user(ts, (const void *)times, sizeof(ts)) != 0) {
-            vfs_close(node);
-            return (uint64_t)-14; // EFAULT
-        }
-        if (ts[0].tv_nsec == UTIMENS_NOW) {
+        if (ts_in[0].tv_nsec == UTIMENS_NOW) {
             atime = (uint32_t)now_sec;
-        } else if (ts[0].tv_nsec != UTIMENS_OMIT) {
-            atime = (uint32_t)ts[0].tv_sec;
+        } else if (ts_in[0].tv_nsec != UTIMENS_OMIT) {
+            atime = (uint32_t)ts_in[0].tv_sec;
         }
-        if (ts[1].tv_nsec == UTIMENS_NOW) {
+        if (ts_in[1].tv_nsec == UTIMENS_NOW) {
             mtime = (uint32_t)now_sec;
-        } else if (ts[1].tv_nsec != UTIMENS_OMIT) {
-            mtime = (uint32_t)ts[1].tv_sec;
+        } else if (ts_in[1].tv_nsec != UTIMENS_OMIT) {
+            mtime = (uint32_t)ts_in[1].tv_sec;
         }
     }
 
@@ -1739,23 +1739,36 @@ static uint64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
     return (uint64_t)result;
 }
 
+static uint64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
+                               uint64_t flags, uint64_t a4, uint64_t a5) {
+    (void)a4; (void)a5;
+    if (times) {
+        if (!is_user_ptr(times)) return (uint64_t)-14;
+        struct sys_timespec ts[2];
+        if (copy_from_user(ts, (const void *)times, sizeof(ts)) != 0)
+            return (uint64_t)-14;
+        return do_utimensat_impl(dirfd, pathname, ts, true, flags);
+    }
+    return do_utimensat_impl(dirfd, pathname, NULL, false, flags);
+}
+
 static uint64_t sys_futimesat(uint64_t dirfd, uint64_t pathname, uint64_t times,
                                uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a3; (void)a4; (void)a5;
     if (!pathname) return (uint64_t)-14;
-    struct sys_timespec ts[2];
     if (times) {
         if (!is_user_ptr(times)) return (uint64_t)-14;
         struct sys_timeval tv[2];
         if (copy_from_user(tv, (const void *)times, sizeof(tv)) != 0)
             return (uint64_t)-14;
+        struct sys_timespec ts[2];
         ts[0].tv_sec = tv[0].tv_sec;
         ts[0].tv_nsec = tv[0].tv_usec * 1000;
         ts[1].tv_sec = tv[1].tv_sec;
         ts[1].tv_nsec = tv[1].tv_usec * 1000;
-        return sys_utimensat(dirfd, pathname, (uint64_t)ts, 0, 0, 0);
+        return do_utimensat_impl(dirfd, pathname, ts, true, 0);
     }
-    return sys_utimensat(dirfd, pathname, 0, 0, 0, 0);
+    return do_utimensat_impl(dirfd, pathname, NULL, false, 0);
 }
 
 static uint64_t sys_utimes(uint64_t pathname, uint64_t times, uint64_t a2,
@@ -1869,7 +1882,7 @@ static uint64_t sys_quotactl_fd(uint64_t fd_val, uint64_t cmd_val,
     if (!current)
         return (uint64_t)-9; // EBADF
     int fd = (int)fd_val;
-    if (fd < 0 || fd >= MAX_FDS || !fd_is_valid_node(current->fds[fd]))
+    if (!FD_IN_RANGE(current, fd) || !fd_is_valid_node(current->fds[fd]))
         return (uint64_t)-9; // EBADF
 
     uint32_t cmd = (uint32_t)cmd_val;
@@ -1907,6 +1920,7 @@ void syscall_register_fs(void) {
     syscall_register(SYS_MKDIR,      sys_mkdir);
     syscall_register(SYS_MKDIRAT,    sys_mkdirat);
     syscall_register(SYS_MKNOD,      sys_mknod);
+    syscall_register(SYS_MKNODAT,    sys_mknodat);
     syscall_register(SYS_UNLINK,     sys_unlink);
     syscall_register(SYS_UNLINKAT,   sys_unlinkat);
     syscall_register(SYS_RMDIR,      sys_rmdir);

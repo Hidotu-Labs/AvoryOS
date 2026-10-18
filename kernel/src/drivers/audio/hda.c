@@ -622,28 +622,13 @@ void hda_init(void) {
     uint16_t cmd = pci_config_read16(hda_pci->bus, hda_pci->slot, hda_pci->func, 0x04);
     pci_config_write16(hda_pci->bus, hda_pci->slot, hda_pci->func, 0x04, cmd | 0x0006);
 
-    uint64_t mmio_phys = hda_pci->bar[0] & ~0xFULL;
-    if (((hda_pci->bar[0] >> 1) & 3U) == 2U) {
-        mmio_phys |= ((uint64_t)hda_pci->bar[1] << 32);
-    }
-    if (!mmio_phys) {
-        klog_puts("[HDA] Invalid BAR0 address!\n");
+    void *mapped = pci_map_bar(hda_pci, 0, NULL);
+    if (!mapped) {
+        klog_puts("[HDA] Failed to map BAR0!\n");
         return;
     }
-
+    hda_base = (volatile uint8_t *)mapped;
     uint64_t hhdm = pmm_get_hhdm_offset();
-    uint64_t *pml4 = vmm_get_active_pml4();
-    uint64_t flags = PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_PCD | PAGE_FLAG_PWT;
-
-    for (uint64_t page = (mmio_phys & ~0xFFFULL); page <= ((mmio_phys + 0x4000 - 1) & ~0xFFFULL); page += 4096) {
-        uint64_t virt = page + hhdm;
-        if (!vmm_virt_to_phys(pml4, virt)) {
-            vmm_map_page(pml4, virt, page, flags);
-        }
-        vmm_flush_tlb(virt);
-    }
-
-    hda_base = (volatile uint8_t *)(mmio_phys + hhdm);
 
     // Controller Reset Sequence
     uint32_t gctl = hda_read32(HDA_REG_GCTL);

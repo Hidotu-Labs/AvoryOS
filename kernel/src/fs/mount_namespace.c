@@ -208,6 +208,7 @@ static vfs_node_t *make_view(vfs_node_t *b, vfs_node_t *parent, uint64_t id) {
   n->mmap = b->mmap ? view_mmap : NULL;
   n->mmap_shared_only = b->mmap_shared_only;
   n->mmap_private_pmm_refs = b->mmap_private_pmm_refs;
+  n->mmap_shared_pmm_refs = b->mmap_shared_pmm_refs;
   n->open_instance = b->open_instance ? view_instance : NULL;
   n->get_nlink = view_nlink;
   n->wait_queue = b->wait_queue;
@@ -514,11 +515,20 @@ vfs_node_t *vfs_namespace_resolve(vfs_node_t *dir, const char *path) {
       return NULL;
   } else
     vfs_open(cur);
-  char pending[4096];
-  if (strlen(path) >= sizeof(pending)) {
+  if (strlen(path) >= 4096) {
     vfs_close(cur);
     return NULL;
   }
+  /* The syscall caller and symlink walk already use kernel stack space.
+   * Three PATH_MAX arrays here consumed over 12 KiB of a 16 KiB stack,
+   * corrupting adjacent allocations during ordinary sandbox path lookup. */
+  struct { char pending[4096], link[4096]; } *scratch = kmalloc(sizeof(*scratch));
+  if (!scratch) {
+    if (task) task->namei_error = -12;
+    vfs_close(cur);
+    return NULL;
+  }
+  char *pending = scratch->pending;
   strcpy(pending, path);
   char *p = pending;
   int links = 0;
@@ -570,19 +580,17 @@ vfs_node_t *vfs_namespace_resolve(vfs_node_t *dir, const char *path) {
         cur = target;
         continue;
       }
-      char link[4096];
-      int l = vfs_readlink(n, link, sizeof(link) - 1);
+      char *link = scratch->link;
+      int l = vfs_readlink(n, link, sizeof(scratch->link) - 1);
       vfs_close(n);
       if (l < 0 || ++links > 40)
         goto fail;
       link[l] = 0;
       size_t rest = strlen(p);
-      if ((size_t)l + rest + 1 >= sizeof(pending))
+      if ((size_t)l + rest + 1 >= sizeof(scratch->pending))
         goto fail;
-      char joined[4096];
-      memcpy(joined, link, l);
-      memcpy(joined + l, p, rest + 1);
-      strcpy(pending, joined);
+      memmove(pending + l, p, rest + 1);
+      memcpy(pending, link, l);
       p = pending;
       if (link[0] == '/') {
         if (policy & 8) {
@@ -599,8 +607,10 @@ vfs_node_t *vfs_namespace_resolve(vfs_node_t *dir, const char *path) {
     vfs_close(cur);
     cur = n;
   }
+  kfree(scratch);
   return cur;
 fail:
+  kfree(scratch);
   vfs_close(cur);
   return NULL;
 }
@@ -648,8 +658,9 @@ static bool source_contains(struct mount_namespace *ns, struct mount_link *m,
   return used == 1 || (!strncmp(point, relative, used) &&
                        (point[used] == '/' || point[used] == 0));
 }
-int vfs_namespace_mount(vfs_node_t *p, vfs_node_t *t, const char *s,
-                        const char *f, const char *path, uint64_t flags) {
+static int namespace_mount_tree(vfs_node_t *p, vfs_node_t *t, const char *s,
+                                const char *f, const char *path, uint64_t flags,
+                                uint64_t excluded_mount) {
   struct mount_namespace *ns = current_ns();
   if (!ns)
     return -22;
@@ -685,7 +696,8 @@ int vfs_namespace_mount(vfs_node_t *p, vfs_node_t *t, const char *s,
     struct mount_link *copies = m;
     for (size_t index = 0; index < mapped; index++) {
       for (struct mount_link *q = ns->mounts; q; q = q->next) {
-        if (q->detached || q->parent_id != map[index].old_id)
+        if (q->detached || q->id == excluded_mount ||
+            q->parent_id != map[index].old_id)
           continue;
         bool seen = false;
         for (size_t k = 0; k < mapped; k++)
@@ -749,6 +761,11 @@ int vfs_namespace_mount(vfs_node_t *p, vfs_node_t *t, const char *s,
   }
   spinlock_release(&ns->lock);
   return 0;
+}
+
+int vfs_namespace_mount(vfs_node_t *p, vfs_node_t *t, const char *s,
+                        const char *f, const char *path, uint64_t flags) {
+  return namespace_mount_tree(p, t, s, f, path, flags, 0);
 }
 
 int vfs_namespace_setattr(vfs_node_t *p, uint64_t set, uint64_t clear,
@@ -895,8 +912,12 @@ int vfs_namespace_pivot(vfs_node_t *newroot, vfs_node_t *oldpoint) {
   if (!below)
     return -22;
   vfs_node_t *old = vfs_task_root();
-  int r = vfs_namespace_mount(oldpoint, old, "oldroot", "bind", "/oldroot",
-                              0x1000 | 0x4000);
+  /* Moving new_root out of the old tree exposes its covered mountpoint.
+   * Do not copy it (or its descendants) back into put_old: bubblewrap stages
+   * on /tmp, and retaining that staging mount hides the host runtime files
+   * at /oldroot/tmp. Ordinary recursive bind mounts still copy every mount. */
+  int r = namespace_mount_tree(oldpoint, old, "oldroot", "bind", "/oldroot",
+                               0x1000 | 0x4000, newroot->mount_id);
   if (r)
     return r;
   return vfs_namespace_chroot(newroot);

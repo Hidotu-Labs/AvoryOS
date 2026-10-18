@@ -196,7 +196,7 @@ typedef struct {
 #define EXT2_CACHE_SIZE 2048
 #define EXT2_DIRTY_BGD_MAX 64
 
-typedef struct {
+typedef struct ext2_mount {
   struct block_device *dev;
   ext2_superblock_t sb;
   ext2_bgd_t *bgdt;
@@ -214,6 +214,8 @@ typedef struct {
     uint32_t writes_inflight;
   } cache[EXT2_CACHE_SIZE];
   spinlock_t cache_lock;
+  uint32_t cache_shrink_cursor;
+  struct ext2_mount *next;
   /* Group-descriptor table and superblock counters are mutated in memory by
    * the block/inode allocators.  The on-disk copies are only updated once per
    * journal transaction (ext2_flush_metadata, called from
@@ -234,5 +236,9 @@ int ext2_read_block(ext2_mount_t *mnt, uint32_t block_num, void *buffer);
 int ext2_write_block(ext2_mount_t *mnt, uint32_t block_num, const void *buffer);
 int ext2_read_inode(ext2_mount_t *mnt, uint32_t inode_num, ext2_inode_t *out);
 uint32_t ext2_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode, uint32_t logical_block);
+size_t ext2_buffer_cache_total_kb(void);
+size_t ext2_buffer_cache_shrink(size_t max_buffers);
+void ext2_register_mount(ext2_mount_t *mnt);
+void ext2_unregister_mount(ext2_mount_t *mnt);
 
 #endif

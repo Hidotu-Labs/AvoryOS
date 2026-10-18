@@ -47,7 +47,7 @@ def run(argv):
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
-def prepare(extra_root_setup=None, kernel_cmdline=None):
+def prepare(extra_root_setup=None, kernel_cmdline=None, filesystem="ext2"):
     disk = OUT / 'root.img'
     for proc in Path('/proc').iterdir():
         if not proc.name.isdigit():
@@ -66,13 +66,22 @@ def prepare(extra_root_setup=None, kernel_cmdline=None):
     shutil.copy2(ROOT / 'userland/test_syscall_restart.elf',
                  root / 'bin/test_syscall_restart')
     (OUT / 'init.c').write_text(INIT)
-    run([ROOT / 'toolchain/x86_64-linux-musl/bin/x86_64-linux-musl-gcc',
+    compiler = os.environ.get('AVORY_TEST_CC')
+    if not compiler:
+        local = ROOT / 'toolchain/x86_64-linux-musl/bin/x86_64-linux-musl-gcc'
+        compiler = str(local) if local.is_file() else (
+            shutil.which('x86_64-linux-musl-gcc') or shutil.which('musl-gcc'))
+    if not compiler:
+        raise RuntimeError('native boot tests require a musl compiler; set AVORY_TEST_CC')
+    run([compiler,
          '-O2', '-static', OUT / 'init.c', '-o', root / 'bin/probe-init'])
     if extra_root_setup is not None:
         extra_root_setup(root)
     with disk.open('wb') as stream:
         stream.truncate(128 * 1024**2)
-    run(['mke2fs', '-q', '-t', 'ext2', '-F', '-d', root, disk])
+    if filesystem not in ('ext2', 'ext3', 'ext4'):
+        raise ValueError('unsupported probe filesystem')
+    run(['mke2fs', '-q', '-t', filesystem, '-F', '-d', root, disk])
     boot = OUT / 'iso-root'
     shutil.rmtree(boot, ignore_errors=True)
     run(['xorriso', '-osirrox', 'on', '-indev', ROOT / 'avoryos-x86_64.iso',

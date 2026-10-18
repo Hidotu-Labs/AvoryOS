@@ -1,5 +1,5 @@
 ################################################################
-# Makefile.ascentos — musl cross-compile for AscentOS
+# Makefile.avoryos — glibc cross-compile for AvoryOS
 ################################################################
 
 ifeq ($(V),1)
@@ -8,28 +8,30 @@ else
 	VB=@
 endif
 
-ifneq ($(MUSL_CC),)
-CC = $(MUSL_CC)
-else
-CC = x86_64-linux-musl-gcc
-endif
-MUSL_SYSROOT ?= $(CURDIR)/../toolchain/musl-sysroot
+GLIBC_SYSROOT ?= $(CURDIR)/../toolchain/glibc-sysroot
 ALPINE_SYSROOT ?= $(CURDIR)/../build/alpine/rootfs
+
+ifneq ($(GLIBC_CC),)
+CC = $(GLIBC_CC)
+else
+CC = $(CURDIR)/../toolchain/x86_64-linux-glibc/bin/x86_64-linux-gcc
+endif
 
 DOOM_SRC = ../doomgeneric/doomgeneric
 OBJDIR = build-ascentos
 OUTPUT = doom.elf
 
 COMMON_CFLAGS = -no-pie -O2 -Wall -Wextra -fno-stack-protector \
-	-I$(DOOM_SRC) -I./midiplay-src \
+	-I$(DOOM_SRC) \
 	-DNORMALUNIX -DLINUX -D_DEFAULT_SOURCE -DFEATURE_SOUND
 
-CFLAGS = -static $(COMMON_CFLAGS) -I$(MUSL_SYSROOT)/include -L$(MUSL_SYSROOT)/lib
-LDFLAGS = -Wl,--gc-sections -static
+CFLAGS = $(COMMON_CFLAGS) --sysroot=$(GLIBC_SYSROOT)
+LDFLAGS = -Wl,--gc-sections
 LIBS = -lm -lc
 
 X11_INCLUDES = -I$(ALPINE_SYSROOT)/usr/include
-X11_LDFLAGS = -no-pie -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+X11_LDFLAGS = -no-pie --sysroot=$(ALPINE_SYSROOT) \
+	-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
 	-Wl,-rpath,/usr/lib \
 	-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
 	-L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib
@@ -37,8 +39,7 @@ X11_LIBS = -lX11
 
 ASCENTOS_BACKEND = doomgeneric_ascentos.c
 ASCENTOS_X11_BACKEND = doomgeneric_x11.c
-ASCENTOS_SOUND = i_ascentos_sound_midiplay.c
-MIDIPLAY_LIB = midiplay-src/libmidiplay.a
+ASCENTOS_SOUND = i_ascentos_sound.c
 
 SRC_DOOM_BASE = dummy.o am_map.o doomdef.o doomstat.o dstrings.o d_event.o d_items.o d_iwad.o d_loop.o d_main.o d_mode.o d_net.o f_finale.o f_wipe.o g_game.o hu_lib.o hu_stuff.o info.o i_cdmus.o i_endoom.o i_joystick.o i_scale.o i_system.o i_timer.o memio.o m_argv.o m_bbox.o m_cheat.o m_config.o m_controls.o m_fixed.o m_menu.o m_misc.o m_random.o p_ceilng.o p_doors.o p_enemy.o p_floor.o p_inter.o p_lights.o p_map.o p_maputl.o p_mobj.o p_plats.o p_pspr.o p_saveg.o p_setup.o p_sight.o p_spec.o p_switch.o p_telept.o p_tick.o p_user.o r_bsp.o r_data.o r_draw.o r_main.o r_plane.o r_segs.o r_sky.o r_things.o sha1.o sounds.o statdump.o st_lib.o st_stuff.o s_sound.o tables.o v_video.o wi_stuff.o w_checksum.o w_file.o w_main.o w_wad.o z_zone.o w_file_stdc.o i_input.o i_video.o doomgeneric.o mus2mid.o
 OBJS = $(addprefix $(OBJDIR)/, $(SRC_DOOM_BASE) doomgeneric_ascentos.o i_ascentos_sound.o)
@@ -50,13 +51,13 @@ clean:
 	rm -rf $(OBJDIR)
 	rm -f $(OUTPUT) doom_x11.elf
 
-$(OUTPUT):	$(OBJS) $(MIDIPLAY_LIB)
+$(OUTPUT):	$(OBJS)
 	@echo [Linking $@]
-	$(VB)$(CC) $(CFLAGS) $(LDFLAGS) $(OBJS) $(MIDIPLAY_LIB) -o $(OUTPUT) $(LIBS)
+	$(VB)$(CC) $(CFLAGS) $(LDFLAGS) $(OBJS) -o $(OUTPUT) $(LIBS)
 
-doom_x11.elf:	$(OBJS_X11) $(MIDIPLAY_LIB)
+doom_x11.elf:	$(OBJS_X11)
 	@echo [Linking $@]
-	$(VB)$(CC) -no-pie -O2 $(OBJS_X11) $(MIDIPLAY_LIB) $(X11_LDFLAGS) -o doom_x11.elf $(LIBS) $(X11_LIBS)
+	$(VB)$(CC) -no-pie -O2 $(OBJS_X11) $(X11_LDFLAGS) -o doom_x11.elf $(LIBS) $(X11_LIBS)
 
 $(OBJS) $(OBJS_X11): | $(OBJDIR)
 
@@ -79,10 +80,5 @@ $(OBJDIR)/i_ascentos_sound.o:	$(ASCENTOS_SOUND)
 	@echo [Compiling $<]
 	$(VB)$(CC) $(CFLAGS) -I$(DOOM_SRC) -c $< -o $@
 
-$(MIDIPLAY_LIB):
-	@echo [Building midiplay]
-	$(VB)../scripts/build-midiplay.sh
-
 print:
 	@echo OBJS: $(OBJS)
-

@@ -8,6 +8,7 @@
 #include "../../mm/dma_alloc.h"
 #include "../../mm/pmm.h"
 #include "../../mm/vmm.h"
+#include "../pci/pci.h"
 #include "usb.h"
 #include "usb_kbd.h"
 #include "usb_mouse.h"
@@ -135,20 +136,7 @@ static void xhci_pci_prepare(struct pci_device *pci) {
 }
 
 static bool xhci_map_mmio(uint64_t phys, uint64_t length) {
-  uint64_t first = phys & ~0xFFFULL;
-  uint64_t last = (phys + length - 1) & ~0xFFFULL;
-  uint64_t hhdm = pmm_get_hhdm_offset();
-  uint64_t *pml4 = vmm_get_active_pml4();
-  uint64_t flags = PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_PCD |
-                   PAGE_FLAG_PWT;
-  for (uint64_t page = first; page <= last; page += 4096) {
-    uint64_t virt = page + hhdm;
-    if (!vmm_virt_to_phys(pml4, virt) &&
-        !vmm_map_page(pml4, virt, page, flags))
-      return false;
-    vmm_flush_tlb(virt);
-  }
-  return true;
+  return pci_map_mmio(phys, length) != NULL;
 }
 
 static bool xhci_wait32(volatile void *base, uint32_t offset, uint32_t mask,

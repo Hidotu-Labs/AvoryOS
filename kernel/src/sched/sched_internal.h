@@ -14,9 +14,12 @@ extern spinlock_t tid_lock;
 extern struct thread *global_thread_list;
 extern uint32_t next_tid;
 
-/* Stack allocation */
+/* Stack allocation & lookaside caching */
 void *thread_stack_alloc(void);
 void thread_stack_release(uint64_t stack_base);
+size_t thread_stack_cache_reclaim(size_t max_reclaim);
+size_t kstack_cache_total_cached(void);
+void kstack_cache_init(void);
 
 /* Thread search under tid_lock */
 struct thread *find_thread_by_tid_locked(uint32_t tid);

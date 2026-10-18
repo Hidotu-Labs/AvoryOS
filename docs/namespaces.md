@@ -77,3 +77,7 @@ unit tests alone do not establish that the browser displays a page.
 The utilization-clamp sched_setattr EOPNOTSUPP in the supplied log is a separate,
 nonfatal WebKit feature probe. WebKit retries with RESET_ON_FORK and disables
 further utilization-clamp probes when unsupported; see [scheduler attributes](sched-attr.md).
+
+The later Epiphany abort with a runtime directory under `/tmp` is covered by
+[the pivot-root and descriptor-lifetime fixes](epiphany-dbus-runtime-pivot.md),
+including the remaining limits of full browser verification.

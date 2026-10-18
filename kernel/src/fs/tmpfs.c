@@ -119,7 +119,15 @@ static uint32_t tmpfs_take_pages_locked(tmpfs_file_t *file, uint32_t from,
     return n;
 }
 
+static uint64_t tmpfs_total_allocated_pages = 0;
+
+uint64_t tmpfs_total_pages(void) {
+    return __atomic_load_n(&tmpfs_total_allocated_pages, __ATOMIC_RELAXED);
+}
+
 static void tmpfs_release_pages(tmpfs_page_t **pages, uint32_t n) {
+    if (n > 0)
+        __atomic_sub_fetch(&tmpfs_total_allocated_pages, n, __ATOMIC_RELAXED);
     for (uint32_t i = 0; i < n; i++) {
         tmpfs_page_t *p = pages[i];
         if (p->phys && pmm_is_managed(p->phys))
@@ -202,6 +210,7 @@ static tmpfs_page_t *tmpfs_get_or_alloc_page(tmpfs_file_t *file,
         return existing;
     }
     file->num_pages++;
+    __atomic_add_fetch(&tmpfs_total_allocated_pages, 1, __ATOMIC_RELAXED);
     spinlock_release(&file->lock);
     return np;
 }
@@ -428,8 +437,14 @@ static uint64_t tmpfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
             return (uint64_t)-1;
 
         uint64_t va = addr + i * PAGE_SIZE;
-        if (vmm_map_page_if_unmapped(pml4, va, pg->phys, page_flags))
+        if (vmm_map_page_if_unmapped(pml4, va, pg->phys, page_flags)) {
+            /* This PTE owns its own reference until teardown.  The file's
+             * reference only covers the storage slot, which truncate or node
+             * retirement may release while the mapping is still live. */
+            if (pmm_is_managed(pg->phys))
+                pmm_incref((void *)pg->phys);
             continue;
+        }
 
         /* Already mapped: acceptable only if it is the very same tmpfs frame
          * (a repeated or overlapping remap), never someone else's page. */
@@ -713,6 +728,7 @@ static vfs_node_t *tmpfs_make_node(tmpfs_sb_t *sb, const char *name,
         n->fallocate = tmpfs_fallocate;
         n->mmap     = tmpfs_mmap;
         n->mmap_shared_only = true;
+        n->mmap_shared_pmm_refs = true;
     } else if (type == FS_DIRECTORY) {
         tmpfs_dir_t *d = kmalloc(sizeof(tmpfs_dir_t));
         if (!d) {

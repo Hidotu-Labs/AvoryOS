@@ -1,6 +1,6 @@
 // Futex Syscall (202)
-// Implements FUTEX_WAIT and FUTEX_WAKE using a hash table. Shared futexes use
-// physical addresses; private futexes use (mm, virtual address) identities.
+// Implements FUTEX_WAIT and FUTEX_WAKE using a hash table. Shared mappings use
+// physical addresses; private mappings use (mm, virtual address) identities.
 //
 // Linux futex(2) signature:
 //   long futex(uint32_t *uaddr, int futex_op, uint32_t val,
@@ -265,9 +265,10 @@ void futex_remove_thread_waiters(struct thread *thread) {
   }
 }
 
-/* Build a futex identity. Process-private futexes are only meaningful within
- * one mm, so (mm, uaddr) is sufficient and avoids vmm_virt_to_phys() on every
- * Mesa/LLVM worker wait and wake. Shared futexes retain physical identities. */
+/* The operation's PRIVATE flag is a fast-path promise, not a requirement for
+ * a process-local identity. A private VMA must also use (mm, uaddr) without
+ * that flag: CoW/KSM can replace its physical page while a waiter is parked.
+ * Using the replacement frame as the wake key loses the registered waiter. */
 static inline int futex_get_key(uint32_t *uaddr, bool private,
                                 struct futex_key *key) {
   struct thread *t = sched_get_current();
@@ -288,9 +289,23 @@ static inline int futex_get_key(uint32_t *uaddr, bool private,
     return 0;
   }
 
-  if (!t->cr3)
+  if (!t->cr3 || !t->mm)
     return -EFAULT;
+  spinlock_acquire(&t->mm->lock);
+  struct vma *v = vma_find(&t->mm->vmas, vaddr);
+  if (!v) {
+    spinlock_release(&t->mm->lock);
+    return -EFAULT;
+  }
+  if ((v->flags & MAP_PRIVATE) &&
+      !(v->flags & (MAP_SHARED | MAP_SYSV_SHM))) {
+    key->space = (uint64_t)t->mm;
+    key->address = vaddr;
+    spinlock_release(&t->mm->lock);
+    return 0;
+  }
   uint64_t phys = vmm_virt_to_phys((uint64_t *)t->cr3, vaddr);
+  spinlock_release(&t->mm->lock);
   if (!phys)
     return -EFAULT;
   key->space = 0;

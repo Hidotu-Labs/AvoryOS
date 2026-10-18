@@ -31,7 +31,7 @@ static int poll_check_fds(struct pollfd *fds, uint64_t nfds, struct thread *t) {
     fds[i].revents = 0;
     if (fd < 0)
       continue;
-    if (fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd])) {
+    if (!FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->fds[fd])) {
       fds[i].revents = POLLNVAL;
       ready++;
       continue;
@@ -68,7 +68,7 @@ static uint64_t do_poll(struct pollfd *fds, uint64_t nfds,
         t->last_poll_fds[i] = fd;
         t->last_poll_events[i] = fds[i].events;
         const char *p = "?";
-        if (fd >= 0 && fd < MAX_FDS) {
+        if (FD_IN_RANGE(t, fd)) {
           if (t->fd_paths && t->fd_paths[fd] && t->fd_paths[fd]->value[0])
             p = t->fd_paths[fd]->value;
           else if (t->fds && fd_is_valid_node(t->fds[fd]))
@@ -138,7 +138,7 @@ static uint64_t do_poll(struct pollfd *fds, uint64_t nfds,
     t->state = THREAD_BLOCKED;
     for (uint64_t i = 0; i < nfds; i++) {
       int fd = fds[i].fd;
-      if (fd >= 0 && fd < MAX_FDS && fd_is_valid_node(t->fds[fd])) {
+      if (FD_IN_RANGE(t, fd) && fd_is_valid_node(t->fds[fd])) {
         valid_fds++;
         if (wq_count < max_wq && t->fds[fd]->wait_queue) {
           wait_queue_t *wq = (wait_queue_t *)t->fds[fd]->wait_queue;

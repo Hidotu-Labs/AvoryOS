@@ -1,5 +1,0 @@
-NAME=x11
-DESCRIPTION="Xorg DRM desktop session"
-TYPE=foreground
-ENABLED=no
-COMMAND=/bin/startx.sh

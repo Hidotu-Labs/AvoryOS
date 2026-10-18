@@ -248,10 +248,6 @@ static void init_thread_entry(void) {
   extern void test_numa(void);
   test_numa();
 
-  // Pre-populate the VFS page cache with the dynamic linker and hot shared
-  // libraries so that every subsequent execve() hits warm cache.
-  precache_hot_files();
-
   // Clear console only once when userland starts
   if (!cmdline_has("screenlog")) {
     console_clear();
@@ -930,6 +926,9 @@ mount_fail:
   net_core_init();
   rtl8139_phase1_init();
   e1000_init();
+
+  extern void ksm_init(void);
+  ksm_init();
 
 #if LOCKDIAG_SELFTEST
   /* Renders a full hang report on a healthy machine, so the report itself is

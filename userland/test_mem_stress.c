@@ -41,9 +41,42 @@
 #include <sys/xattr.h>
 #include <sys/sem.h>
 #include <sys/ipc.h>
+#include <sys/times.h>
+#include <utime.h>
+#include <sys/ptrace.h>
 
 #define DEBUGLOG(...) printf(__VA_ARGS__)
 
+#ifndef SYS_pidfd_send_signal
+#define SYS_pidfd_send_signal 424
+#endif
+#ifndef SYS_io_uring_setup
+#define SYS_io_uring_setup 425
+#endif
+#ifndef SYS_io_uring_enter
+#define SYS_io_uring_enter 426
+#endif
+#ifndef SYS_io_uring_register
+#define SYS_io_uring_register 427
+#endif
+#ifndef SYS_open_tree
+#define SYS_open_tree 428
+#endif
+#ifndef SYS_move_mount
+#define SYS_move_mount 429
+#endif
+#ifndef SYS_fsopen
+#define SYS_fsopen 430
+#endif
+#ifndef SYS_fsconfig
+#define SYS_fsconfig 431
+#endif
+#ifndef SYS_fsmount
+#define SYS_fsmount 432
+#endif
+#ifndef SYS_fspick
+#define SYS_fspick 433
+#endif
 #ifndef SYS_pidfd_open
 #define SYS_pidfd_open 434
 #endif
@@ -53,8 +86,32 @@
 #ifndef SYS_close_range
 #define SYS_close_range 436
 #endif
+#ifndef SYS_openat2
+#define SYS_openat2 437
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
 #ifndef SYS_faccessat2
 #define SYS_faccessat2 439
+#endif
+#ifndef SYS_epoll_pwait2
+#define SYS_epoll_pwait2 441
+#endif
+#ifndef SYS_mount_setattr
+#define SYS_mount_setattr 442
+#endif
+#ifndef SYS_quotactl_fd
+#define SYS_quotactl_fd 443
+#endif
+#ifndef SYS_landlock_create_ruleset
+#define SYS_landlock_create_ruleset 444
+#endif
+#ifndef SYS_landlock_add_rule
+#define SYS_landlock_add_rule 445
+#endif
+#ifndef SYS_landlock_restrict_self
+#define SYS_landlock_restrict_self 446
 #endif
 #ifndef SYS_fchmodat2
 #define SYS_fchmodat2 452
@@ -2209,21 +2266,64 @@ static void run_registered_syscall_coverage(int iterations) {
     write(fd, "coverage", 8);
 
     // Descriptor and legacy I/O variants.
-    ioctl(fd, 0, NULL);                 // expected ENOTTY
+    int unread_bytes = 0;
+    ioctl(fd, FIONREAD, &unread_bytes);
     flock(fd, LOCK_EX | LOCK_NB);
     flock(fd, LOCK_UN);
     fdatasync(fd);
     posix_fadvise(fd, 0, 0, POSIX_FADV_NORMAL);
+    readahead(fd, 0, 8);
+    sync_file_range(fd, 0, 0, 0);
     syscall(SYS_faccessat2, AT_FDCWD, path, F_OK, 0);
+
+    // Vectored I/O (preadv / pwritev)
+    char pv_buf[8] = "coverage";
+    struct iovec pv_iov = {.iov_base = pv_buf, .iov_len = sizeof(pv_buf)};
+    pwritev(fd, &pv_iov, 1, 0);
+    preadv(fd, &pv_iov, 1, 0);
 
     // fchmod, fchown, lchown
     fchmod(fd, 0644);
     fchown(fd, 0, 0);
     lchown(path, 0, 0);
 
+    // creat, utime, futimesat
+    char creat_path[64];
+    snprintf(creat_path, sizeof(creat_path), "/tmp/creat_cov_%d.tmp", i);
+    int cfd = creat(creat_path, 0644);
+    if (cfd >= 0) {
+      close(cfd);
+      unlink(creat_path);
+    }
+    utime(path, NULL);
+    struct timeval futv[2] = {{0, 0}, {0, 0}};
+    syscall(SYS_futimesat, AT_FDCWD, path, futv);
+
+    // openat2
+    struct open_how how = {.flags = O_RDONLY, .mode = 0, .resolve = 0};
+    syscall(SYS_openat2, AT_FDCWD, path, &how, sizeof(how));
+
+    // dup, dup3, close_range
     int doomed = dup(fd);
-    if (doomed >= 0)
+    if (doomed >= 0) {
+      int doomed2 = doomed + 1;
+      int d3 = dup3(fd, doomed2, 0);
+      if (d3 >= 0) close(d3);
       syscall(SYS_close_range, (unsigned)doomed, (unsigned)doomed, 0);
+    }
+
+    // Pipe tee
+    int tee_a[2], tee_b[2];
+    if (pipe(tee_a) == 0) {
+      if (pipe(tee_b) == 0) {
+        write(tee_a[1], "t", 1);
+        tee(tee_a[0], tee_b[1], 1, 0);
+        close(tee_b[0]);
+        close(tee_b[1]);
+      }
+      close(tee_a[0]);
+      close(tee_a[1]);
+    }
 
     // Old and new stat/directory ABIs.
     struct statx sx;
@@ -2236,7 +2336,7 @@ static void run_registered_syscall_coverage(int iterations) {
       close(dfd);
     }
 
-    // select/pselect and the original epoll ABI, all nonblocking.
+    // select/pselect and epoll ABI with pwait and pwait2.
     struct timeval zero_tv = {0, 0};
     struct timespec zero_ts = {0, 0};
     select(0, NULL, NULL, NULL, &zero_tv);
@@ -2245,13 +2345,73 @@ static void run_registered_syscall_coverage(int iterations) {
     if (ep >= 0) {
       struct epoll_event event;
       epoll_pwait(ep, &event, 1, 0, NULL);
+      syscall(SYS_epoll_pwait2, ep, &event, 1, &zero_ts, NULL);
       close(ep);
     }
 
-    // clock_getres and clock_nanosleep have distinct syscall entries.
+    // clock_getres, clock_nanosleep, times, time, and POSIX timers
     struct timespec resolution;
     clock_getres(CLOCK_MONOTONIC, &resolution);
     clock_nanosleep(CLOCK_MONOTONIC, 0, &zero_ts, NULL);
+    struct tms tms_val;
+    times(&tms_val);
+    time(NULL);
+
+    timer_t posix_timer;
+    struct sigevent sev;
+    memset(&sev, 0, sizeof(sev));
+    sev.sigev_notify = SIGEV_NONE;
+    if (timer_create(CLOCK_MONOTONIC, &sev, &posix_timer) == 0) {
+      struct itimerspec its = {
+        .it_value = {.tv_sec = 1, .tv_nsec = 0},
+        .it_interval = {.tv_sec = 0, .tv_nsec = 0}
+      };
+      struct itimerspec old_its;
+      timer_settime(posix_timer, 0, &its, &old_its);
+      timer_gettime(posix_timer, &old_its);
+      timer_getoverrun(posix_timer);
+      timer_delete(posix_timer);
+    }
+
+    struct timespec cur_ts;
+    if (clock_gettime(CLOCK_REALTIME, &cur_ts) == 0)
+      clock_settime(CLOCK_REALTIME, &cur_ts);
+    struct timeval cur_tv;
+    if (gettimeofday(&cur_tv, NULL) == 0)
+      settimeofday(&cur_tv, NULL);
+    struct rlimit cur_rl;
+    if (getrlimit(RLIMIT_NOFILE, &cur_rl) == 0)
+      setrlimit(RLIMIT_NOFILE, &cur_rl);
+
+    // Scheduler extensions & priority
+    sched_rr_get_interval(0, &zero_ts);
+    struct {
+      uint32_t size;
+      uint32_t sched_policy;
+      uint64_t sched_flags;
+      int32_t sched_nice;
+      uint32_t sched_priority;
+      uint64_t sched_runtime;
+      uint64_t sched_deadline;
+      uint64_t sched_period;
+    } sa_buf;
+    memset(&sa_buf, 0, sizeof(sa_buf));
+    sa_buf.size = sizeof(sa_buf);
+    if (syscall(SYS_sched_getattr, 0, &sa_buf, sizeof(sa_buf), 0) == 0) {
+      syscall(SYS_sched_setattr, 0, &sa_buf, 0);
+    }
+    int prio = syscall(SYS_ioprio_get, 1 /* IOPRIO_WHO_PROCESS */, 0);
+    if (prio >= 0)
+      syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, prio);
+
+    // NUMA migration & userfaultfd probes
+    unsigned long old_m = 1, new_m = 1;
+    syscall(SYS_migrate_pages, 0, sizeof(unsigned long) * 8, &old_m, &new_m);
+    void *page_ptr = &prio;
+    int status_val = 0;
+    syscall(SYS_move_pages, 0, 1, &page_ptr, NULL, &status_val, 0);
+    int ufd = syscall(SYS_userfaultfd, 0);
+    if (ufd >= 0) close(ufd);
 
     // getrusage
     struct rusage ru;
@@ -2335,8 +2495,28 @@ static void run_registered_syscall_coverage(int iterations) {
     // seccomp
     syscall(SYS_seccomp, 0 /* SECCOMP_SET_MODE_STRICT */, 0, NULL);
 
-    // clone3 (invalid args test returns -EINVAL cleanly)
-    syscall(SYS_clone3, NULL, 0);
+    // clone3
+    struct {
+      uint64_t flags;
+      uint64_t pidfd;
+      uint64_t child_tid;
+      uint64_t parent_tid;
+      uint64_t exit_signal;
+      uint64_t stack;
+      uint64_t stack_size;
+      uint64_t tls;
+      uint64_t set_tid;
+      uint64_t set_tid_size;
+      uint64_t cgroup;
+    } cl_args;
+    memset(&cl_args, 0, sizeof(cl_args));
+    cl_args.exit_signal = SIGCHLD;
+    pid_t c3_pid = syscall(SYS_clone3, &cl_args, sizeof(cl_args));
+    if (c3_pid == 0) {
+      _exit(0);
+    } else if (c3_pid > 0) {
+      waitpid(c3_pid, NULL, 0);
+    }
 
     close(fd);
     unlink(path);
@@ -2354,16 +2534,23 @@ static void run_registered_syscall_coverage(int iterations) {
     shmctl(id, IPC_RMID, NULL);
   }
 
-  // signalfd, sigaltstack, tkill and tgkill.
-  sigset_t mask, oldmask;
+  // signalfd, sigaltstack, tkill, tgkill, sigpending, rt_sigqueueinfo, rt_tgsigqueueinfo
+  sigset_t mask, oldmask, pending;
   sigemptyset(&mask);
   sigaddset(&mask, SIGUSR1);
   sigprocmask(SIG_BLOCK, &mask, &oldmask);
+  sigpending(&pending);
   for (int i = 0; i < iterations; i++) {
     int sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
     if (sfd >= 0) {
       syscall(SYS_tkill, syscall(SYS_gettid), 0);
       syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), 0);
+      siginfo_t sqinfo;
+      memset(&sqinfo, 0, sizeof(sqinfo));
+      sqinfo.si_code = -1; // SI_QUEUE
+      sqinfo.si_signo = 0;
+      syscall(SYS_rt_sigqueueinfo, getpid(), 0, &sqinfo);
+      syscall(SYS_rt_tgsigqueueinfo, getpid(), syscall(SYS_gettid), 0, &sqinfo);
       close(sfd);
     }
   }
@@ -2408,7 +2595,12 @@ static void run_registered_syscall_coverage(int iterations) {
   syscall(SYS_arch_prctl, 0x1003 /* ARCH_GET_FS */, &fsbase);
   syscall(399 /* AscentOS SYS_UPTIME */);
   int pidfd = syscall(SYS_pidfd_open, getpid(), 0);
-  if (pidfd >= 0) close(pidfd);
+  if (pidfd >= 0) {
+    syscall(SYS_pidfd_send_signal, pidfd, 0, NULL, 0);
+    int dup_fd = syscall(SYS_pidfd_getfd, pidfd, 0, 0);
+    if (dup_fd >= 0) close(dup_fd);
+    close(pidfd);
+  }
 
   // Thread-runtime bookkeeping calls are isolated because set_tid_address and
   // robust-list state are intentionally persistent until thread exit.
@@ -2418,6 +2610,7 @@ static void run_registered_syscall_coverage(int iterations) {
     syscall(SYS_set_tid_address, &clear_tid);
     syscall(SYS_set_robust_list, NULL, 0);
     syscall(SYS_rseq, NULL, 0, 0, 0);
+    syscall(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, NULL, NULL);
     syscall(SYS_exit, 0);
     __builtin_unreachable();
   }
@@ -2432,12 +2625,44 @@ static void run_registered_syscall_coverage(int iterations) {
   // Exercise privileged dispatch paths without authorizing an operation.
   syscall(SYS_mount, NULL, NULL, NULL, 0, NULL);
   syscall(SYS_reboot, 0, 0, 0, NULL);
+  syscall(SYS_swapon, "/nonexistent_swap", 0);
+  syscall(SYS_chroot, "/nonexistent");
+  syscall(SYS_pivot_root, "/nonexistent", "/nonexistent");
+  syscall(SYS_setdomainname, "avory", 5);
+  syscall(SYS_init_module, NULL, 0, "");
+  syscall(SYS_delete_module, "nonexistent", 0);
+  syscall(SYS_quotactl, 0, NULL, 0, NULL);
+  syscall(SYS_quotactl_fd, -1, 0, 0, NULL);
+  syscall(SYS_mount_setattr, AT_FDCWD, "/nonexistent", 0, NULL, 0);
+
+  // io_uring subsystem entries
+  syscall(SYS_io_uring_setup, 0, NULL);
+  syscall(SYS_io_uring_enter, -1, 0, 0, 0, NULL, 0);
+  syscall(SYS_io_uring_register, -1, 0, NULL, 0);
+
+  // Mount API stubs
+  syscall(SYS_open_tree, AT_FDCWD, "/nonexistent", 0);
+  syscall(SYS_move_mount, -1, "", -1, "", 0);
+  syscall(SYS_fsopen, "ext4", 0);
+  syscall(SYS_fsconfig, -1, 0, NULL, NULL, 0);
+  syscall(SYS_fsmount, -1, 0, 0);
+  syscall(SYS_fspick, AT_FDCWD, "/nonexistent", 0);
+
+  // Landlock sandbox stubs
+  syscall(SYS_landlock_create_ruleset, NULL, 0, 0);
+  syscall(SYS_landlock_add_rule, -1, 0, NULL, 0);
+  syscall(SYS_landlock_restrict_self, -1, 0);
 
   DEBUGLOG("Registered-syscall coverage stress test PASSED\n");
 }
 
+#include "syscall_tests.h"
+
 void test_registered_syscall_coverage(void) {
-  run_registered_syscall_coverage(NUM_ITERATIONS);
+  int rc = run_all_single_syscall_tests();
+  if (rc != 0) {
+    fprintf(stderr, "WARNING: Some individual syscall tests failed assertions!\n");
+  }
 }
 
 void check_leak(const char *test_name, long *last_mem) {
@@ -2484,6 +2709,10 @@ static int run_leak_focus(int argc, char **argv) {
   else if (!strcmp(name, "accept4")) workload = test_accept4_stress;
   else if (!strcmp(name, "unix-stream")) workload = test_unix_stream_stress;
   else if (!strcmp(name, "process-attrs")) workload = test_process_attrs_stress;
+  else if (!strcmp(name, "mmap")) workload = test_mmap_stress;
+  else if (!strcmp(name, "epoll")) workload = test_epoll_stress;
+  else if (!strcmp(name, "brk")) workload = test_brk_stress;
+  else if (!strcmp(name, "pipe2")) workload = test_pipe2_stress;
   else return -1;
 
   setvbuf(stdout, NULL, _IOLBF, 0);
@@ -2511,7 +2740,7 @@ int main(int argc, char **argv) {
   if (argc > 1) {
     int result = run_leak_focus(argc, argv);
     if (result >= 0) return result;
-    fprintf(stderr, "Usage: %s [--focus wait4|sched|clone|accept4|unix-stream|process-attrs --rounds 1..100]\n", argv[0]);
+    fprintf(stderr, "Usage: %s [--focus wait4|sched|clone|accept4|unix-stream|process-attrs|mmap|epoll|brk|pipe2 --rounds 1..100]\n", argv[0]);
     return 2;
   }
 
@@ -2818,8 +3047,6 @@ int main(int argc, char **argv) {
   if (total_diff > 0) {
     printf("FAIL: Total Memory leak: %ld kB\n", total_diff);
     return 1;
-  } else if (total_diff < 0) {
-    printf("PASS: Memory levels improved. Gained %ld kB.\n", -total_diff);
   } else {
     printf("PASS: No memory leaks detected.\n");
   }

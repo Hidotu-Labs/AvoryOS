@@ -388,28 +388,6 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
           return false;
         }
 
-        // Queue the PT_LOAD file pages for the async prefetch worker in
-        // 256 KB windows.  execve() no longer waits for the whole image: the
-        // worker streams the remaining pages while the process starts running,
-        // and demand paging fills anything the worker has not reached yet.
-        // The interpreter (ld.so) is deliberately excluded: its VMAs are
-        // still registered above so faults resolve, but its bytes stay fully
-        // demand-paged.  Boot already precaches ld.so's first 256 KB
-        // (fs/precache.c) which covers the entry fault, fault-time 128 KB
-        // readahead in vmm_fault.c streams the rest on first touch, and
-        // interp runs first anyway so backgrounding its pages only floods
-        // the prefetch queue ahead of the main image it is about to map.
-        if (filesz > 0 && file && !is_interp) {
-          const uint32_t prefetch_chunk = 256 * 1024;
-          uint32_t start_off = file_offset & ~(PAGE_SIZE - 1);
-          uint32_t end_off = (file_offset + filesz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-          for (uint32_t poff = start_off; poff < end_off; poff += prefetch_chunk) {
-            uint32_t remaining = end_off - poff;
-            vfs_cache_prefetch_async(file, poff, remaining < prefetch_chunk
-                                                     ? remaining
-                                                     : prefetch_chunk);
-          }
-        }
       }
     }
   }
@@ -976,7 +954,7 @@ bool process_exec_argv(const char **argv) {
     fd_path_dup(current_thread, 1, 0);
     fd_path_dup(current_thread, 2, 0);
 
-    for (int i = 3; i < MAX_FDS; i++) {
+    for (uint32_t i = 3; i < current_thread->fd_capacity; i++) {
       current_thread->fds[i] = NULL;
     }
   }

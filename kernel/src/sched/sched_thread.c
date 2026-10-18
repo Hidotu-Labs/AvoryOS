@@ -32,18 +32,206 @@ extern void thread_stub(void); // Defined in switch.asm
 extern void signal_send(struct thread *t, int sig);
 extern void signal_notify_thread(struct thread *t, int sig);
 
+#define KSTACK_CACHE_PER_CPU 2
+#define KSTACK_GLOBAL_POOL_MAX 16
+#define KSTACK_CANARY 0x5AFE57AC05AFE57ACULL
+#define KSTACK_CANARY_WORDS 8
+
+struct kstack_cpu_cache {
+  void *stacks[KSTACK_CACHE_PER_CPU];
+  uint32_t count;
+  spinlock_t lock;
+};
+
+static struct kstack_cpu_cache kstack_cpu_caches[MAX_CPUS];
+static void *kstack_global_pool[KSTACK_GLOBAL_POOL_MAX];
+static uint32_t kstack_global_count = 0;
+static spinlock_t kstack_global_lock = SPINLOCK_INIT;
+
+/* Diagnostic statistics */
+static uint64_t kstack_stat_alloc_cache = 0;
+static uint64_t kstack_stat_alloc_pmm = 0;
+static uint64_t kstack_stat_free_cache = 0;
+static uint64_t kstack_stat_free_pmm = 0;
+static uint64_t kstack_stat_reclaimed = 0;
+
+void kstack_cache_init(void) {
+  for (uint32_t i = 0; i < MAX_CPUS; i++) {
+    kstack_cpu_caches[i].count = 0;
+    spinlock_init(&kstack_cpu_caches[i].lock);
+  }
+  spinlock_init(&kstack_global_lock);
+  kstack_global_count = 0;
+}
+
+size_t kstack_cache_total_cached(void) {
+  size_t total = __atomic_load_n(&kstack_global_count, __ATOMIC_RELAXED);
+  uint32_t count = cpu_get_count();
+  if (count > MAX_CPUS)
+    count = MAX_CPUS;
+  for (uint32_t i = 0; i < count; i++) {
+    total += __atomic_load_n(&kstack_cpu_caches[i].count, __ATOMIC_RELAXED);
+  }
+  return total;
+}
+
+static inline void kstack_arm_canary(void *stack) {
+  uint64_t *canaries = (uint64_t *)stack;
+  for (int i = 0; i < KSTACK_CANARY_WORDS; i++) {
+    canaries[i] = KSTACK_CANARY;
+  }
+}
+
+static inline bool kstack_verify_canary(void *stack) {
+  uint64_t *canaries = (uint64_t *)stack;
+  for (int i = 0; i < KSTACK_CANARY_WORDS; i++) {
+    if (canaries[i] != KSTACK_CANARY)
+      return false;
+  }
+  return true;
+}
+
 void *thread_stack_alloc(void) {
-  void *phys = pmm_alloc_pages(THREAD_STACK_SIZE / PAGE_SIZE);
-  if (!phys)
-    return NULL;
-  return (void *)((uint64_t)phys + pmm_get_hhdm_offset());
+  void *stack = NULL;
+  struct cpu_info *cpu = cpu_get_current();
+
+  /* 1. Fast path: check current CPU's local lookaside cache */
+  if (cpu && cpu->cpu_id < MAX_CPUS) {
+    struct kstack_cpu_cache *pc = &kstack_cpu_caches[cpu->cpu_id];
+    spinlock_acquire(&pc->lock);
+    if (pc->count > 0) {
+      stack = pc->stacks[--pc->count];
+      __atomic_add_fetch(&kstack_stat_alloc_cache, 1, __ATOMIC_RELAXED);
+    }
+    spinlock_release(&pc->lock);
+  }
+
+  /* 2. Secondary path: check global overflow pool */
+  if (!stack && __atomic_load_n(&kstack_global_count, __ATOMIC_RELAXED) > 0) {
+    spinlock_acquire(&kstack_global_lock);
+    if (kstack_global_count > 0) {
+      stack = kstack_global_pool[--kstack_global_count];
+      __atomic_add_fetch(&kstack_stat_alloc_cache, 1, __ATOMIC_RELAXED);
+    }
+    spinlock_release(&kstack_global_lock);
+  }
+
+  /* 3. Slow path: on-demand allocate order-2 physical pages from PMM */
+  if (!stack) {
+    void *phys = pmm_alloc_pages(THREAD_STACK_SIZE / PAGE_SIZE);
+    if (!phys)
+      return NULL;
+    stack = (void *)((uint64_t)phys + pmm_get_hhdm_offset());
+    __atomic_add_fetch(&kstack_stat_alloc_pmm, 1, __ATOMIC_RELAXED);
+  }
+
+  /* Sanitize stack: zero frames and arm bottom canary zone */
+  memset(stack, 0, THREAD_STACK_SIZE);
+  kstack_arm_canary(stack);
+
+  return stack;
 }
 
 void thread_stack_release(uint64_t stack_base) {
   if (!stack_base)
     return;
+
+  void *stack = (void *)stack_base;
+
+  /* Check stack overflow canary zone at the bottom of the stack */
+  if (!kstack_verify_canary(stack)) {
+    klogf("[KSTACK] WARNING: Kernel stack overflow detected on stack %p (canary corrupted)!\n",
+          stack);
+    /* Corrupted stack: do not recycle into cache, free directly to PMM */
+    void *phys = (void *)(stack_base - pmm_get_hhdm_offset());
+    pmm_free_pages(phys, THREAD_STACK_SIZE / PAGE_SIZE);
+    __atomic_add_fetch(&kstack_stat_free_pmm, 1, __ATOMIC_RELAXED);
+    return;
+  }
+
+  struct cpu_info *cpu = cpu_get_current();
+
+  /* 1. Try to cache on current CPU's local lookaside cache */
+  if (cpu && cpu->cpu_id < MAX_CPUS) {
+    struct kstack_cpu_cache *pc = &kstack_cpu_caches[cpu->cpu_id];
+    spinlock_acquire(&pc->lock);
+    if (pc->count < KSTACK_CACHE_PER_CPU) {
+      pc->stacks[pc->count++] = stack;
+      spinlock_release(&pc->lock);
+      __atomic_add_fetch(&kstack_stat_free_cache, 1, __ATOMIC_RELAXED);
+      return;
+    }
+    spinlock_release(&pc->lock);
+  }
+
+  /* 2. Try to cache in global overflow pool */
+  spinlock_acquire(&kstack_global_lock);
+  if (kstack_global_count < KSTACK_GLOBAL_POOL_MAX) {
+    kstack_global_pool[kstack_global_count++] = stack;
+    spinlock_release(&kstack_global_lock);
+    __atomic_add_fetch(&kstack_stat_free_cache, 1, __ATOMIC_RELAXED);
+    return;
+  }
+  spinlock_release(&kstack_global_lock);
+
+  /* 3. Cache full: free back to PMM buddy allocator */
   void *phys = (void *)(stack_base - pmm_get_hhdm_offset());
   pmm_free_pages(phys, THREAD_STACK_SIZE / PAGE_SIZE);
+  __atomic_add_fetch(&kstack_stat_free_pmm, 1, __ATOMIC_RELAXED);
+}
+
+size_t thread_stack_cache_reclaim(size_t max_reclaim) {
+  size_t reclaimed_stacks = 0;
+  if (max_reclaim == 0)
+    max_reclaim = 64;
+
+  /* 1. Drain from global pool first */
+  while (reclaimed_stacks < max_reclaim) {
+    void *stack = NULL;
+    spinlock_acquire(&kstack_global_lock);
+    if (kstack_global_count > 0) {
+      stack = kstack_global_pool[--kstack_global_count];
+    }
+    spinlock_release(&kstack_global_lock);
+
+    if (!stack)
+      break;
+
+    void *phys = (void *)((uint64_t)stack - pmm_get_hhdm_offset());
+    pmm_free_pages(phys, THREAD_STACK_SIZE / PAGE_SIZE);
+    reclaimed_stacks++;
+  }
+
+  /* 2. Drain from per-CPU caches if more reclaim needed */
+  if (reclaimed_stacks < max_reclaim) {
+    uint32_t count = cpu_get_count();
+    if (count > MAX_CPUS)
+      count = MAX_CPUS;
+    for (uint32_t i = 0; i < count && reclaimed_stacks < max_reclaim; i++) {
+      struct kstack_cpu_cache *pc = &kstack_cpu_caches[i];
+      while (reclaimed_stacks < max_reclaim) {
+        void *stack = NULL;
+        spinlock_acquire(&pc->lock);
+        if (pc->count > 0) {
+          stack = pc->stacks[--pc->count];
+        }
+        spinlock_release(&pc->lock);
+
+        if (!stack)
+          break;
+
+        void *phys = (void *)((uint64_t)stack - pmm_get_hhdm_offset());
+        pmm_free_pages(phys, THREAD_STACK_SIZE / PAGE_SIZE);
+        reclaimed_stacks++;
+      }
+    }
+  }
+
+  if (reclaimed_stacks > 0) {
+    __atomic_add_fetch(&kstack_stat_reclaimed, reclaimed_stacks, __ATOMIC_RELAXED);
+  }
+
+  return reclaimed_stacks * (THREAD_STACK_SIZE / PAGE_SIZE);
 }
 
 static void thread_exit(void) {

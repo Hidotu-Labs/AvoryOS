@@ -11,7 +11,8 @@ AUDIO_BUFLEN ?= 100000
 # An absolute tablet keeps GTK from warping the host pointer on DRM cursor
 # moves or hiding it under a relative-mouse grab.
 # Grab only the keyboard on hover so desktop shortcuts reach the guest.
-QEMUFLAGS := -m 4G \
+QEMU_MEM ?= -m 4G
+QEMUFLAGS := $(QEMU_MEM) \
 	-vga none \
 	-device virtio-vga,xres=1280,yres=800 \
 	-display gtk,zoom-to-fit=off,grab-on-hover=on
@@ -25,9 +26,7 @@ RUN_DISK_DEP := $(if $(wildcard disk.img),,disk.img)
 AVORYD_CONFIG_FILES := \
 	initrd/avoryd/default.target \
 	initrd/avoryd/services/system-init.service \
-	initrd/avoryd/services/console.service \
-	initrd/avoryd/services/wayland.service \
-	initrd/avoryd/services/x11.service
+	initrd/avoryd/services/console.service
 
 QUAKE2_BUNDLE_FILES := \
 	userland/quake2/quake2 \
@@ -45,7 +44,7 @@ QUAKE2_STAMP := build/quake2/.built
 $(QUAKE2_BUNDLE_FILES): $(QUAKE2_STAMP)
 
 $(QUAKE2_STAMP): $(ALPINE_STAMP) $(GLIBC_STAMP) scripts/build-quake2.sh \
-		scripts/quake2-sdl2-config.in scripts/quake2-avoryos-evdev.h
+		scripts/quake2-sdl2-config.in
 	./scripts/build-quake2.sh && \
 		mkdir -p $(dir $(QUAKE2_STAMP)) && \
 		touch $(QUAKE2_STAMP)
@@ -72,22 +71,15 @@ HOST_CPPFLAGS :=
 HOST_LDFLAGS :=
 HOST_LIBS :=
 
-# musl static sysroot (see scripts/musl-toolchain.sh). Built automatically for hello_musl / disk.img / run.
-MUSL_TOOLCHAIN_BIN := $(CURDIR)/toolchain/x86_64-linux-musl/bin
-MUSL_SYSROOT := $(CURDIR)/toolchain/musl-sysroot
-MUSL_LIBC := $(MUSL_SYSROOT)/lib/libc.a
-MUSL_CC ?= x86_64-linux-musl-gcc
-MUSL_CXX ?= x86_64-linux-musl-g++
-MUSL_USER_CFLAGS := -static -O2 -Wall -Wextra -fno-stack-protector \
-	-I$(MUSL_SYSROOT)/include -L$(MUSL_SYSROOT)/lib
-MUSL_USER_CXXFLAGS := -static -O2 -Wall -Wextra -fno-stack-protector -fno-exceptions -fno-rtti \
-	-I$(MUSL_SYSROOT)/include -L$(MUSL_SYSROOT)/lib
-
 # glibc toolchain (see scripts/glibc-toolchain.sh)
 GLIBC_TOOLCHAIN_BIN := $(CURDIR)/toolchain/x86_64-linux-glibc/bin
 GLIBC_SYSROOT := $(CURDIR)/toolchain/glibc-sysroot
-GLIBC_CC := $(GLIBC_TOOLCHAIN_BIN)/x86_64-buildroot-linux-gnu-gcc
+GLIBC_STAMP := $(GLIBC_SYSROOT)/lib/libc.so.6
+GLIBC_CC := $(GLIBC_TOOLCHAIN_BIN)/x86_64-linux-gcc
+GLIBC_CXX := $(GLIBC_TOOLCHAIN_BIN)/x86_64-linux-g++
 GLIBC_USER_CFLAGS := -O2 -Wall -Wextra -fno-stack-protector \
+	--sysroot=$(GLIBC_SYSROOT)
+GLIBC_USER_CXXFLAGS := -O2 -Wall -Wextra -fno-stack-protector \
 	--sysroot=$(GLIBC_SYSROOT)
 
 # Historical Alpine target names; the rootfs now uses Arch packages.
@@ -101,9 +93,6 @@ $(ALPINE_STAMP): scripts/setup-arch.sh scripts/arch-pkgs.sh scripts/configure-ac
 
 .PHONY: setup-alpine
 setup-alpine: $(ALPINE_STAMP)
-
-GLIBC_SYSROOT := $(CURDIR)/toolchain/glibc-sysroot
-GLIBC_STAMP := $(GLIBC_SYSROOT)/lib/libc.so.6
 
 $(GLIBC_STAMP): scripts/glibc-toolchain.sh
 	@echo "[*] Setting up glibc toolchain..."
@@ -152,7 +141,7 @@ GTK2_LIBS := \
 	-ljpeg -lmount -lblkid -leconf -lintl -lXrandr -lXinerama \
 	-lgraphite2 -lXcomposite -lXdamage
 GTK2_LDFLAGS := \
-	-Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+	-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
 	-Wl,-rpath,/usr/lib \
 	-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib
 
@@ -184,7 +173,7 @@ GTK3_LIBS := \
 	-lXrandr -lXinerama -lXcomposite -lXdamage \
 	-lfontconfig -lfreetype -lpng16 -lz -lm
 GTK3_LDFLAGS := \
-	-Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+	-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
 	-Wl,-rpath,/usr/lib \
 	-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib
 
@@ -205,26 +194,7 @@ QT5_CXXFLAGS := -fPIC -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_CORE_LIB -DQT_NO_DEBUG
 QT5_LDFLAGS := \
 	-static-libgcc \
 	-Wl,--allow-shlib-undefined \
-	-Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
-	-Wl,-rpath,/usr/lib \
-	-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib
-
-# SDL3 test - include/lib flags
-SDL3_INCLUDES := \
-	-I$(ALPINE_SYSROOT)/usr/include \
-	-I$(ALPINE_SYSROOT)/usr/include/SDL3 \
-	-I$(ALPINE_SYSROOT)/usr/include/SDL3_ttf
-SDL3_LIBS := \
-	-L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-	-lSDL3 -lSDL3_ttf \
-	-lcapstone \
-	-lGL -lEGL \
-	-lm \
-	-lstdc++
-SDL3_LDFLAGS := \
-	-no-pie \
-	-Wl,--allow-shlib-undefined \
-	-Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+	-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
 	-Wl,-rpath,/usr/lib \
 	-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib
 
@@ -251,10 +221,21 @@ test-e1000:
 	python3 scripts/tests/test_netlink_link_types.py
 	python3 scripts/tests/test_e1000_probe_boot.py --seconds $(E1000_TEST_SECONDS) --smp $(E1000_TEST_SMP)
 
+# Priority inversion regression uses its own journaled guest image.
+.PHONY: test-journal-priority
+test-journal-priority:
+	$(MAKE) -C kernel
+	@mkdir -p build/journal-priority
+	python3 scripts/tests/test_sched_priority_ceiling.py
+	cc -std=gnu11 -O1 -g -fsanitize=address,undefined -ffunction-sections -fdata-sections -I kernel/src -I kernel/linuxkpi/include -I kernel/limine-protocol/include scripts/tests/test_ext3_empty_commit.c -Wl,--gc-sections -pthread -o build/journal-priority/test-journal
+	ASAN_OPTIONS=detect_leaks=0 build/journal-priority/test-journal
+	python3 scripts/tests/test_journal_priority_boot.py
+
 # Each guest regression creates its own root image and ISO.
 .PHONY: test-sandbox
 test-sandbox:
 	$(MAKE) -C kernel
+	python3 scripts/tests/test_signalfd_lifetime.py
 	python3 scripts/tests/test_seccomp_bpf.py
 	python3 scripts/tests/test_uts_namespace.py
 	python3 scripts/tests/test_pid_namespace.py
@@ -288,7 +269,7 @@ endif
 # host cursor instead.
 RUN_POINTER ?= usb-mouse
 .PHONY: run run-tcg
-run: QEMUFLAGS = -m 4G -vga none -device virtio-vga,xres=1280,yres=800
+run: QEMUFLAGS = $(QEMU_MEM) -vga none -device virtio-vga,xres=1280,yres=800
 run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 	qemu-system-$(ARCH) \
 		-M q35,pcspk-audiodev=snd0 \
@@ -349,6 +330,7 @@ DISPLAY_OPT ?= -display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=$(GTK_S
 QEMU_MEM ?= -m 4G
 
 VFIO_BDF ?= 0000:0e:00.0
+VFIO_LAUNCHER ?= python3 scripts/vfio_resume_check.py --
 VFIO_MEM ?= 4G
 VFIO_SMP ?= 8
 VFIO_ROM ?= build/vfio/vbios.rom
@@ -562,10 +544,9 @@ run-fat32: edk2-ovmf $(IMAGE_NAME).iso fat32_test.img
 		-device usb-tablet,bus=xhci.0 \
 		$(QEMUFLAGS)
 
-AetherDE/x11-wm/AetherWM: AetherDE/x11-wm/main.c AetherDE/x11-wm/render.c AetherDE/x11-wm/input.c AetherDE/x11-wm/frames.c AetherDE/x11-wm/wm.h AetherDE/x11-wm/stb_image.h $(ALPINE_STAMP) $(MUSL_LIBC)
+AetherDE/x11-wm/AetherWM: AetherDE/x11-wm/main.c AetherDE/x11-wm/render.c AetherDE/x11-wm/input.c AetherDE/x11-wm/frames.c AetherDE/x11-wm/wm.h AetherDE/x11-wm/stb_image.h $(ALPINE_STAMP) $(GLIBC_STAMP)
 	@echo "[*] Compiling AetherDE X11 Window Manager (low-level: Xft+XRender, no Cairo/Pango)..."
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" \
-		$(MUSL_CC) -O2 -Wall -Wextra -march=x86-64 -mtune=generic \
+	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 -Wall -Wextra -march=x86-64 -mtune=generic \
 		-isystem $(ALPINE_SYSROOT)/usr/include \
 		-isystem $(ALPINE_SYSROOT)/usr/include/freetype2 \
 		-IAetherDE/x11-wm \
@@ -580,15 +561,14 @@ AetherDE/x11-wm/AetherWM: AetherDE/x11-wm/main.c AetherDE/x11-wm/render.c Aether
 		-lXft \
 		-lXext \
 		-lfontconfig -lfreetype -lm \
-		-Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
 		-Wl,-rpath,/usr/lib \
 		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib
 
 
-AetherDE/aether-dock/aether-dock: AetherDE/aether-dock/main.c AetherDE/aether-dock/dock.c AetherDE/aether-dock/render_dock.c AetherDE/aether-dock/dock.h $(ALPINE_STAMP) $(MUSL_LIBC)
+AetherDE/aether-dock/aether-dock: AetherDE/aether-dock/main.c AetherDE/aether-dock/dock.c AetherDE/aether-dock/render_dock.c AetherDE/aether-dock/dock.h $(ALPINE_STAMP) $(GLIBC_STAMP)
 	@echo "[*] Compiling AetherDE Dock..."
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" \
-		$(MUSL_CC) -O2 -Wall -Wextra -march=x86-64 -mtune=generic \
+	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 -Wall -Wextra -march=x86-64 -mtune=generic \
 		-I$(ALPINE_SYSROOT)/usr/include \
 		-I$(ALPINE_SYSROOT)/usr/include/gtk-3.0 \
 		-I$(ALPINE_SYSROOT)/usr/include/gdk-pixbuf-2.0 \
@@ -621,15 +601,14 @@ AetherDE/aether-dock/aether-dock: AetherDE/aether-dock/main.c AetherDE/aether-do
 		-lX11 -lXext -lXrender -lXi -lXcursor -lXfixes \
 		-lXrandr -lXinerama -lXcomposite -lXdamage \
 		-lfontconfig -lfreetype -lpng16 -lz -lm \
-		-Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
 		-Wl,-rpath,/usr/lib \
 		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib
 
 
-AetherDE/aether-panel/aether-panel: AetherDE/aether-panel/panel.c $(ALPINE_STAMP) $(MUSL_LIBC)
+AetherDE/aether-panel/aether-panel: AetherDE/aether-panel/panel.c $(ALPINE_STAMP) $(GLIBC_STAMP)
 	@echo "[*] Compiling AetherDE Panel..."
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" \
-		$(MUSL_CC) -O2 -Wall -Wextra \
+	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 -Wall -Wextra \
 		-Wno-format-truncation -Wno-stringop-truncation \
 		-march=x86-64 -mtune=generic \
 		-I$(ALPINE_SYSROOT)/usr/include \
@@ -649,15 +628,14 @@ AetherDE/aether-panel/aether-panel: AetherDE/aether-panel/panel.c $(ALPINE_STAMP
 		-lgobject-2.0 -lglib-2.0 \
 		-lX11 \
 		-lfontconfig -lfreetype -lpng16 -lz -lm \
-		-Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
 		-Wl,-rpath,/usr/lib \
 		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib
 
 
-AetherDE/wayland-compositor/aether-compositor: AetherDE/wayland-compositor/main.c AetherDE/wayland-compositor/render.c AetherDE/wayland-compositor/input.c AetherDE/wayland-compositor/pixel_server.c AetherDE/wayland-compositor/protocols.c AetherDE/wayland-compositor/xdg-shell-protocol.c $(ALPINE_STAMP) $(MUSL_LIBC)
+AetherDE/wayland-compositor/aether-compositor: AetherDE/wayland-compositor/main.c AetherDE/wayland-compositor/render.c AetherDE/wayland-compositor/input.c AetherDE/wayland-compositor/pixel_server.c AetherDE/wayland-compositor/protocols.c AetherDE/wayland-compositor/xdg-shell-protocol.c $(ALPINE_STAMP) $(GLIBC_STAMP)
 	@echo "[*] Compiling AetherDE/wayland-compositor modular source files..."
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" \
-		$(MUSL_CC) -O2 -Wall -march=x86-64 -mtune=generic \
+	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 -Wall -march=x86-64 -mtune=generic \
 		-I$(ALPINE_SYSROOT)/usr/include \
 		-I$(ALPINE_SYSROOT)/usr/include/cairo \
 		-I$(ALPINE_SYSROOT)/usr/include/pixman-1 \
@@ -668,17 +646,16 @@ AetherDE/wayland-compositor/aether-compositor: AetherDE/wayland-compositor/main.
 		AetherDE/wayland-compositor/protocols.c \
 		AetherDE/wayland-compositor/xdg-shell-protocol.c \
 		-L$(ALPINE_SYSROOT)/usr/lib \
-		-Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
 		-Wl,-rpath,/usr/lib \
 		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib \
 		-lwayland-server -lcairo -lpixman-1 -lfontconfig -lfreetype -lpng16 -lz -lm \
 		-o AetherDE/wayland-compositor/aether-compositor
 
 
-AetherDE/demo-client/aether-window: AetherDE/demo-client/main.c $(ALPINE_STAMP) $(MUSL_LIBC)
+AetherDE/demo-client/aether-window: AetherDE/demo-client/main.c $(ALPINE_STAMP) $(GLIBC_STAMP)
 	@echo "[*] Compiling AetherDE GTK3 Wayland Window Client..."
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" \
-		$(MUSL_CC) -O2 -Wall -march=x86-64 -mtune=generic \
+	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 -Wall -march=x86-64 -mtune=generic \
 		AetherDE/demo-client/main.c \
 		-o AetherDE/demo-client/aether-window \
 		$(GTK3_INCLUDES) \
@@ -698,14 +675,14 @@ build/test_fw.bin:
 # (the script's default; override with LINUX_FIRMWARE_REF=).  Point
 # LINUX_FIRMWARE_SRC=/lib/firmware at a distro firmware tree to skip the git
 # checkout for local runs; .zst/.xz members are decompressed during staging.
-LINUX_FIRMWARE_REF ?= 20260910
-build/firmware/.stamp: scripts/linux-firmware-install.sh scripts/linux/firmware-manifest.txt
+LINUX_FIRMWARE_REF ?= 20260916
+build/firmware/.stamp: scripts/linux-firmware-install.sh scripts/linux/firmware-manifest.txt scripts/linux/firmware-sha256-20260916.txt
 	LINUX_FIRMWARE_REF='$(LINUX_FIRMWARE_REF)' scripts/linux-firmware-install.sh
 	@touch $@
 
 disk.img: userland/winoptions userland/icewm-menu $(ALPINE_STAMP)
 disk.img: scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh userland/avory-login.elf userland/avory-installer.elf
-disk.img:  userland/dns_lookup.elf userland/nettest.elf
+disk.img:  userland/dns_lookup.elf
 disk.img: userland/test_clone_futex.elf
 # Fixed 12 GiB image by default (override per build with
 # `make disk.img DISK_SIZE_MIB=<MiB>`). Leave room for filesystem metadata
@@ -764,7 +741,7 @@ disk.img: userland/butterscotch.elf assets/game.unx assets/assets
 
 
 disk.img: $(BASH_STAMP) $(COREUTILS_STAMP) $(ALPINE_STAMP) $(QUAKE2_BUNDLE_FILES)
-disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/about.elf userland/hello_glibc.elf userland/booter.elf userland/reboot.elf userland/shutdown.elf userland/apm.elf userland/test_cpp.elf  userland/kilo.elf  userland/ls.elf userland/lspci.elf userland/lsblk.elf userland/readelf.elf userland/pong.elf userland/raycast.elf userland/asplay.elf userland/kria.elf userland/doom.elf userland/doom_x11.elf userland/gtk3_test.elf userland/qt5_test.elf userland/sdl3_test.elf userland/tglgears_fb.elf userland/tglgears_drm.elf userland/tglhello_drm.elf userland/test_mem_stress.elf userland/classicube.elf userland/terrain.png userland/texpacks/classicube.zip initrd/startx.sh initrd/startw.sh initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh AetherDE/x11-wm/AetherWM AetherDE/aether-dock/aether-dock AetherDE/aether-panel/aether-panel AetherDE/wayland-compositor/aether-compositor AetherDE/demo-client/aether-window AetherDE/scripts/sax11.sh AetherDE/scripts/sawayland.sh userland/avoryd.elf $(AVORYD_CONFIG_FILES)
+disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/about.elf userland/hello_glibc.elf userland/booter.elf userland/reboot.elf userland/shutdown.elf userland/test_cpp.elf  userland/kilo.elf  userland/ls.elf userland/lspci.elf userland/lsblk.elf userland/readelf.elf userland/pong.elf userland/raycast.elf userland/asplay.elf userland/kria.elf userland/doom.elf userland/doom_x11.elf userland/gtk3_test.elf userland/qt5_test.elf userland/test_mem_stress.elf userland/classicube.elf userland/terrain.png userland/texpacks/classicube.zip initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh AetherDE/x11-wm/AetherWM AetherDE/aether-dock/aether-dock AetherDE/aether-panel/aether-panel AetherDE/wayland-compositor/aether-compositor AetherDE/demo-client/aether-window AetherDE/scripts/sax11.sh AetherDE/scripts/sawayland.sh userland/avoryd.elf $(AVORYD_CONFIG_FILES)
 	@echo "Creating partitioned disk image (GPT)..."
 	@if ls -l /proc/[0-9]*/fd/* 2>/dev/null | grep -q "disk.img"; then \
 		echo "Refusing: disk.img is open by a running process (QEMU?). Stop the VM before rebuilding the disk image; rebuilding it in place corrupts the guest's filesystem." >&2; \
@@ -801,9 +778,7 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "mkdir .config"; \
 		echo "mkdir .cache"; \
 		echo "rm bin/startx.sh"; \
-		echo "write initrd/startx.sh bin/startx.sh"; \
 		echo "rm bin/startw.sh"; \
-		echo "write initrd/startw.sh bin/startw.sh"; \
 		echo "rm bin/sax11.sh"; \
 		echo "write AetherDE/scripts/sax11.sh bin/sax11.sh"; \
 		echo "rm bin/sawayland.sh"; \
@@ -833,9 +808,6 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "rm bin/true"; \
 		echo "symlink bin/true /usr/bin/true"; \
 		echo "mkdir etc"; \
-		echo "mkdir etc/apm"; \
-		echo "mkdir etc/apm/cache"; \
-		echo "mkdir etc/apm/installed"; \
 		echo "mkdir etc/avoryd"; \
 		echo "mkdir etc/avoryd/services"; \
 		echo "rm etc/avoryd/default.target"; \
@@ -844,10 +816,6 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write initrd/avoryd/services/system-init.service etc/avoryd/services/system-init.service"; \
 		echo "rm etc/avoryd/services/console.service"; \
 		echo "write initrd/avoryd/services/console.service etc/avoryd/services/console.service"; \
-		echo "rm etc/avoryd/services/wayland.service"; \
-		echo "write initrd/avoryd/services/wayland.service etc/avoryd/services/wayland.service"; \
-		echo "rm etc/avoryd/services/x11.service"; \
-		echo "write initrd/avoryd/services/x11.service etc/avoryd/services/x11.service"; \
 		echo "rm etc/weston.ini"; \
 		echo "write initrd/weston.ini etc/weston.ini"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
@@ -898,8 +866,6 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/reboot.elf bin/reboot"; \
 		echo "rm bin/shutdown"; \
 		echo "write userland/shutdown.elf bin/shutdown"; \
-		echo "rm bin/apm"; \
-		echo "write userland/apm.elf bin/apm"; \
 		echo "rm bin/test_cred"; \
 		echo "write userland/test_cred.elf bin/test_cred"; \
 		echo "rm test.s"; \
@@ -937,15 +903,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/doom.elf bin/doom"; \
 		echo "rm bin/dns_lookup"; \
 		echo "write userland/dns_lookup.elf bin/dns_lookup"; \
-		echo "write userland/nettest.elf bin/nettest"; \
 		echo "rm test.tar"; \
 		echo "write assets/test.tar test.tar"; \
-		echo "rm bin/tglgears"; \
-		echo "write userland/tglgears_fb.elf bin/tglgears"; \
-		echo "rm bin/tglgears_drm"; \
-		echo "write userland/tglgears_drm.elf bin/tglgears_drm"; \
-		echo "rm bin/tglhello_drm"; \
-		echo "write userland/tglhello_drm.elf bin/tglhello_drm"; \
 		echo "rm bin/test_mem_stress"; \
 		echo "write userland/test_mem_stress.elf bin/test_mem_stress"; \
 		echo "rm bin/test_clone_futex"; \
@@ -1046,6 +1005,10 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 	debugfs -w -R "write /tmp/classicube_options.txt options.txt" ./part.img >/dev/null 2>&1 || true
 	rm -f /tmp/classicube_options.txt
 	rm -f /tmp/avoryos_hello.txt /tmp/avoryos_readme.txt
+	# The *.a trim (populate-ext2-dir.sh) is overridden for targeted trees
+	# below: an in-image gcc link needs usr/include, the gcc static libs
+	# (libgcc.a/libstdc++.a have no dynamic counterpart) and glibc's
+	# *_nonshared.a archives, which /usr/lib/libc.so's ld script GROUPs in.
 	@if [ -d build/alpine/rootfs ]; then \
 		mkdir -p build/alpine/rootfs/lib/firmware; \
 		cp -f build/test_fw.bin build/alpine/rootfs/lib/firmware/test_fw.bin; \
@@ -1078,26 +1041,28 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		fi; \
 		./scripts/configure-accounts.sh build/alpine/rootfs; \
 		./scripts/populate-ext2-dir.sh ./part.img build/alpine/rootfs /; \
+		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/alpine/rootfs/usr/include usr/include; \
+		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/alpine/rootfs/usr/lib/gcc/x86_64-pc-linux-gnu usr/lib/gcc/x86_64-pc-linux-gnu; \
+		mkdir -p build/image-toolchain/usr/lib; \
+		cp -a build/alpine/rootfs/usr/lib/*_nonshared.a build/image-toolchain/usr/lib/ 2>/dev/null || true; \
+		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/image-toolchain /; \
 	fi
 	@python3 scripts/image-runtime.py ./part.img build/alpine/rootfs \
 		/usr/lib/libc.so.6 /usr/lib/ld-linux-x86-64.so.2
-	# The Arch rootfs also has a stale bin/startx.sh.  Restore these
-	# AvoryOS-owned files after the overlay, otherwise XFCE runs startxfce4
-	# and opens its failsafe-session error dialog.
+	# The Arch rootfs may still carry a stale bin/startx.sh; drop any copies
+	# of the retired direct-boot scripts and restore the AvoryOS-owned files
+	# after the overlay, otherwise XFCE runs startxfce4 and opens its
+	# failsafe-session error dialog.
 	@{ \
 		echo "cd /"; \
 		echo "rm bin/startx.sh"; \
-		echo "write initrd/startx.sh bin/startx.sh"; \
 		echo "rm bin/startw.sh"; \
-		echo "write initrd/startw.sh bin/startw.sh"; \
 		echo "rm bin/drm-pick.sh"; \
 		echo "write initrd/drm-pick.sh bin/drm-pick.sh"; \
 		echo "rm etc/profile.d/avory-drm.sh"; \
 		echo "write initrd/avory-drm.sh etc/profile.d/avory-drm.sh"; \
 		echo "rm etc/weston.ini"; \
 		echo "write initrd/weston.ini etc/weston.ini"; \
-		echo "set_inode_field bin/startx.sh mode 0100755"; \
-		echo "set_inode_field bin/startw.sh mode 0100755"; \
 		echo "set_inode_field bin/drm-pick.sh mode 0100755"; \
 		echo "set_inode_field etc/profile.d/avory-drm.sh mode 0100644"; \
 		echo "set_inode_field var/lib/sddm mode 040775"; \
@@ -1184,50 +1149,10 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		debugfs -w -R "write build/tcc-glibc-install/opt/tcc/bin/tcc bin/tcc" ./part.img >/dev/null 2>&1 || true; \
 		debugfs -w -R "rm usr/lib/libtcc.so" ./part.img >/dev/null 2>&1 || true; \
 		debugfs -w -R "write build/tcc-glibc-install/opt/tcc/lib/libtcc.so usr/lib/libtcc.so" ./part.img >/dev/null 2>&1 || true; \
-		if [ -f toolchain/musl-sysroot/lib/libc.a ]; then \
-			echo "Installing musl static libs into TCC lib dir for static linking..."; \
-			debugfs -w -R "mkdir opt/tcc/lib/musl" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "rm opt/tcc/lib/musl/libc.a" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "write toolchain/musl-sysroot/lib/libc.a opt/tcc/lib/musl/libc.a" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "rm opt/tcc/lib/musl/libm.a" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "write toolchain/musl-sysroot/lib/libm.a opt/tcc/lib/musl/libm.a" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "rm opt/tcc/lib/musl/libpthread.a" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "write toolchain/musl-sysroot/lib/libpthread.a opt/tcc/lib/musl/libpthread.a" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "rm opt/tcc/lib/musl/crt1.o" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "write toolchain/musl-sysroot/lib/crt1.o opt/tcc/lib/musl/crt1.o" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "rm opt/tcc/lib/musl/crti.o" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "write toolchain/musl-sysroot/lib/crti.o opt/tcc/lib/musl/crti.o" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "rm opt/tcc/lib/musl/crtn.o" ./part.img >/dev/null 2>&1 || true; \
-			debugfs -w -R "write toolchain/musl-sysroot/lib/crtn.o opt/tcc/lib/musl/crtn.o" ./part.img >/dev/null 2>&1 || true; \
-			LIBGCC_DIR=$$(find toolchain/x86_64-linux-musl/lib/gcc/x86_64-linux-musl -name "libgcc.a" -maxdepth 2 2>/dev/null | head -1 | xargs dirname 2>/dev/null); \
-			if [ -n "$$LIBGCC_DIR" ] && [ -f "$$LIBGCC_DIR/libgcc.a" ]; then \
-				echo "Installing libgcc.a and libgcc_eh.a into TCC lib dir..."; \
-				debugfs -w -R "rm opt/tcc/lib/musl/libgcc.a" ./part.img >/dev/null 2>&1 || true; \
-				debugfs -w -R "write $$LIBGCC_DIR/libgcc.a opt/tcc/lib/musl/libgcc.a" ./part.img >/dev/null 2>&1 || true; \
-				if [ -f "$$LIBGCC_DIR/libgcc_eh.a" ]; then \
-					debugfs -w -R "rm opt/tcc/lib/musl/libgcc_eh.a" ./part.img >/dev/null 2>&1 || true; \
-					debugfs -w -R "write $$LIBGCC_DIR/libgcc_eh.a opt/tcc/lib/musl/libgcc_eh.a" ./part.img >/dev/null 2>&1 || true; \
-				fi; \
-			fi; \
-			echo "Installing musl headers into TCC dir for static linking..."; \
-			./scripts/populate-ext2-dir.sh ./part.img toolchain/musl-sysroot/include opt/tcc/lib/tcc/musl-include; \
-		fi; \
-	elif [ -d toolchain/musl-sysroot/opt/tcc ]; then \
-		echo "Installing MUSL TCC into disk image..."; \
-		./scripts/populate-ext2-dir.sh ./part.img toolchain/musl-sysroot/opt/tcc opt/tcc; \
-		debugfs -w -R "write toolchain/musl-sysroot/opt/tcc/bin/tcc bin/tcc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write toolchain/musl-sysroot/lib/libc.a libc.a" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write toolchain/musl-sysroot/lib/crt1.o crt1.o" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write toolchain/musl-sysroot/lib/crti.o crti.o" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write toolchain/musl-sysroot/lib/crtn.o crtn.o" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write toolchain/musl-sysroot/opt/tcc/lib/tcc/libtcc1.a libtcc1.a" ./part.img >/dev/null 2>&1 || true; \
 	fi
 	@if [ -d toolchain/glibc-sysroot/opt/coreutils ]; then \
 		echo "Installing glibc coreutils into disk image..."; \
 		./scripts/populate-ext2-dir.sh ./part.img toolchain/glibc-sysroot/opt/coreutils opt/coreutils; \
-	elif [ -d toolchain/musl-sysroot/opt/coreutils ]; then \
-		echo "Installing musl coreutils into disk image..."; \
-		./scripts/populate-ext2-dir.sh ./part.img toolchain/musl-sysroot/opt/coreutils opt/coreutils; \
 	fi
 	@if [ -d toolchain/glibc-sysroot/opt/bash ]; then \
 		echo "Installing bash into disk image..."; \
@@ -1249,6 +1174,14 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "export SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE" >> /tmp/bashrc; \
 		echo 'export XDG_RUNTIME_DIR="$${XDG_RUNTIME_DIR:-/tmp/runtime-$$(id -u)}"' >> /tmp/bashrc; \
 		echo 'mkdir -p "$$XDG_RUNTIME_DIR" 2>/dev/null && chmod 1777 "$$XDG_RUNTIME_DIR" 2>/dev/null' >> /tmp/bashrc; \
+		echo '# Root HOME is "/" on AvoryOS: join the XDG defaults as ${HOME%/}/... so' >> /tmp/bashrc; \
+		echo '# sessions never export //.cache-style paths (WebKitGTK rejects those).' >> /tmp/bashrc; \
+		echo '_avory_home="$${HOME:-/}"; _avory_home="$${_avory_home%/}"' >> /tmp/bashrc; \
+		echo 'export XDG_CONFIG_HOME="$${XDG_CONFIG_HOME:-$${_avory_home}/.config}"' >> /tmp/bashrc; \
+		echo 'export XDG_CACHE_HOME="$${XDG_CACHE_HOME:-$${_avory_home}/.cache}"' >> /tmp/bashrc; \
+		echo 'export XDG_DATA_HOME="$${XDG_DATA_HOME:-$${_avory_home}/.local/share}"' >> /tmp/bashrc; \
+		echo 'export XDG_STATE_HOME="$${XDG_STATE_HOME:-$${_avory_home}/.local/state}"' >> /tmp/bashrc; \
+		echo 'unset _avory_home' >> /tmp/bashrc; \
 		debugfs -w -R "mkdir etc" ./part.img >/dev/null 2>&1 || true; \
 		echo "nameserver 10.0.2.3" > /tmp/resolv.conf; \
 		echo "127.0.0.1 localhost" > /tmp/hosts; \
@@ -1296,11 +1229,6 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		debugfs -w -R "rm etc/icewm/menu" ./part.img >/dev/null 2>&1 || true; \
 		debugfs -w -R "write userland/icewm-menu etc/icewm/menu" ./part.img >/dev/null 2>&1 || true; \
 	fi
-	@if [ -f toolchain/musl-sysroot/bin/tar ]; then \
-		echo "Installing tar into disk image..."; \
-		debugfs -w -R "rm bin/tar" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write toolchain/musl-sysroot/bin/tar bin/tar" ./part.img >/dev/null 2>&1 || true; \
-	fi
 	@if [ -f userland/doom_x11.elf ]; then \
 		echo "Installing doom_x11 into disk image..."; \
 		debugfs -w -R "rm bin/doom_x11" ./part.img >/dev/null 2>&1 || true; \
@@ -1310,11 +1238,6 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "Installing qt5_test into disk image..."; \
 		debugfs -w -R "rm bin/qt5_test" ./part.img >/dev/null 2>&1 || true; \
 		debugfs -w -R "write userland/qt5_test.elf bin/qt5_test" ./part.img >/dev/null 2>&1 || true; \
-	fi
-	@if [ -f userland/sdl3_test.elf ]; then \
-		echo "Installing sdl3_test into disk image..."; \
-		debugfs -w -R "rm bin/sdl3_test" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write userland/sdl3_test.elf bin/sdl3_test" ./part.img >/dev/null 2>&1 || true; \
 	fi
 
 	@echo "Fixing executable modes for directly injected launchers..."
@@ -1455,140 +1378,109 @@ clean:
 	rm -f $(IMAGE_NAME).iso
 
 .PHONY: clean-all
-clean-all: clean-musl clean-doom clean-coreutils clean-tar clean-apm clean-minimal
+clean-all: clean-doom clean-coreutils clean-minimal
 	$(MAKE) -C kernel clean
 	rm -rf iso_root $(IMAGE_NAME).iso $(IMAGE_NAME).hdd build/alpine
 
 .PHONY: clean-coreutils
 clean-coreutils:
 	rm -rf build/coreutils-9.5
-	rm -rf toolchain/musl-sysroot/opt/coreutils
 	rm -rf toolchain/glibc-sysroot/opt/coreutils
-
-.PHONY: clean-musl
-clean-musl:
-	rm -rf build/musl-1.2.5 build/musl-cross-make
-	rm -rf toolchain/musl-sysroot toolchain/x86_64-linux-musl
-	rm -f userland/hello.elf userland/avoryd.elf  userland/kilo.elf userland/kilo.c  userland/asplay.elf userland/kria.elf userland/ls.elf userland/readelf.elf userland/poll_test.elf
-	rm -rf userland/kria-lang/target
-
-.PHONY: clean-apm
-clean-apm:
-	rm -f userland/apm.elf
 
 .PHONY: clean-disk
 clean-disk:
 	rm -f disk.img
 
 .PHONY: distclean
-distclean: clean-musl clean-doom
+distclean: clean-doom
 	$(MAKE) -C kernel distclean
 	rm -rf iso_root *.iso *.hdd limine edk2-ovmf doomgeneric
 	rm -rf userland/kria-lang
 
 # ── Userland test programs ──────────────────────────────────────────────────
-$(MUSL_LIBC):
-	chmod +x scripts/musl-toolchain.sh
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" ./scripts/musl-toolchain.sh
-
-.PHONY: musl-toolchain
-musl-toolchain: $(MUSL_LIBC)
-
 .PHONY: test-phase6-login
 test-phase6-login:
 	./scripts/test-phase6-login.sh
 
-userland/avoryd.elf: userland/avoryd.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/avoryd.elf: userland/avoryd.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/avoryd.c -o userland/avoryd.elf
 
-userland/avory-login.elf: userland/avory-login.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/avory-login.elf: userland/avory-login.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/avory-login.c -lcrypt -o userland/avory-login.elf
 
-userland/avory-installer.elf: userland/avory-installer.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/avory-installer.elf: userland/avory-installer.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/avory-installer.c -o userland/avory-installer.elf
 
-userland/nvme_test.elf: userland/nvme_test.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/nvme_test.elf: userland/nvme_test.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/nvme_test.c -o userland/nvme_test.elf -lpthread -lm
 
-userland/nvme_bench.elf: userland/nvme_bench.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/nvme_bench.elf: userland/nvme_bench.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/nvme_bench.c -o userland/nvme_bench.elf -lpthread
 
 userland/hello_glibc.elf: userland/hello_glibc.c
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/hello_glibc.c -o userland/hello_glibc.elf
 
-userland/test_cpp.elf: userland/test_cpp.cpp $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CXX) $(MUSL_USER_CXXFLAGS) \
+userland/test_cpp.elf: userland/test_cpp.cpp $(GLIBC_STAMP)
+	$(GLIBC_CXX) $(GLIBC_USER_CXXFLAGS) \
 		userland/test_cpp.cpp -o userland/test_cpp.elf
-
 
 userland/kilo.c:
 	curl -L https://raw.githubusercontent.com/antirez/kilo/master/kilo.c -o userland/kilo.c
 
-userland/kilo.elf: userland/kilo.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/kilo.elf: userland/kilo.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/kilo.c -o userland/kilo.elf
 
-userland/ls.elf: userland/ls.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/ls.elf: userland/ls.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/ls.c -o userland/ls.elf
 
-userland/lspci.elf: userland/lspci.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/lspci.elf: userland/lspci.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/lspci.c -o userland/lspci.elf
 
-userland/lsblk.elf: userland/lsblk.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/lsblk.elf: userland/lsblk.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/lsblk.c -o userland/lsblk.elf
 
-userland/readelf.elf: userland/readelf.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/readelf.elf: userland/readelf.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/readelf.c -o userland/readelf.elf
 
-userland/pong.elf: userland/pong.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/pong.elf: userland/pong.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/pong.c -o userland/pong.elf \
 		-lm
 
-userland/raycast.elf: userland/raycast.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/raycast.elf: userland/raycast.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/raycast.c -lm -o userland/raycast.elf
 
-userland/asplay.elf: userland/asplay.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/asplay.elf: userland/asplay.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/asplay.c -o userland/asplay.elf
 
-userland/booter.elf: userland/booter.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/booter.elf: userland/booter.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/booter.c -o userland/booter.elf
 
-userland/reboot.elf: userland/reboot.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/reboot.elf: userland/reboot.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/reboot.c -o userland/reboot.elf
 
-userland/shutdown.elf: userland/shutdown.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/shutdown.elf: userland/shutdown.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/shutdown.c -o userland/shutdown.elf
 
-# APM package manager
-# apm.c shells out to gzip/tar for APK extraction — no zlib C API is used.
-userland/apm.elf: userland/apm.c $(MUSL_LIBC)
-	@echo "[*] Building APM package manager..."
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
-		userland/apm.c -o userland/apm.elf
-
-userland/dns_lookup.elf: userland/dns_lookup.c userland/dns_resolver.c userland/dns_resolver.h $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/dns_lookup.elf: userland/dns_lookup.c userland/dns_resolver.c userland/dns_resolver.h $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/dns_lookup.c userland/dns_resolver.c -o userland/dns_lookup.elf
-
-userland/nettest.elf: userland/nettest.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
-		userland/nettest.c -o userland/nettest.elf
 
 # Kria programming language (Rust-based, compiled with musl for static linking)
 userland/kria-lang:
@@ -1613,49 +1505,36 @@ doomgeneric:
 	rm -rf doomgeneric
 	git clone https://github.com/ozkl/doomgeneric.git --depth=1
 
-userland/doom.elf userland/doom_x11.elf: doomgeneric $(MUSL_LIBC) $(ALPINE_STAMP)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MAKE) -C userland -f Makefile.avoryos \
-		MUSL_CC="$(MUSL_TOOLCHAIN_BIN)/x86_64-linux-musl-gcc" \
-		MUSL_SYSROOT="$(MUSL_SYSROOT)" \
+userland/doom.elf userland/doom_x11.elf: doomgeneric $(GLIBC_STAMP) $(ALPINE_STAMP)
+	$(MAKE) -C userland -f Makefile.avoryos \
+		GLIBC_CC="$(GLIBC_CC)" \
+		GLIBC_SYSROOT="$(GLIBC_SYSROOT)" \
 		ALPINE_SYSROOT="$(ALPINE_SYSROOT)"
 
 .PHONY: clean-doom
 clean-doom:
 	$(MAKE) -C userland -f Makefile.avoryos clean
 
-userland/gtk_test.elf: userland/gtk_test.c $(ALPINE_STAMP) $(MUSL_LIBC)
+userland/gtk_test.elf: userland/gtk_test.c $(ALPINE_STAMP) $(GLIBC_STAMP)
 	@echo "[*] Compiling userland/gtk_test.c (GTK2) ..."
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" \
-		$(MUSL_TOOLCHAIN_BIN)/x86_64-linux-musl-gcc -O2 \
+	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 \
 		userland/gtk_test.c \
 		-o userland/gtk_test.elf \
 		$(GTK2_INCLUDES) \
 		$(GTK2_LIBS) \
 		$(GTK2_LDFLAGS)
 
-userland/gtk3_test.elf: userland/gtk3_test.c $(ALPINE_STAMP) $(MUSL_LIBC)
+userland/gtk3_test.elf: userland/gtk3_test.c $(ALPINE_STAMP) $(GLIBC_STAMP)
 	@echo "[*] Compiling userland/gtk3_test.c (GTK3) ..."
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" \
-		$(MUSL_TOOLCHAIN_BIN)/x86_64-linux-musl-gcc -O2 \
+	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 \
 		userland/gtk3_test.c \
 		-o userland/gtk3_test.elf \
 		$(GTK3_INCLUDES) \
 		$(GTK3_LIBS) \
 		$(GTK3_LDFLAGS)
 
-userland/sdl3_test.elf: userland/sdl3_test.c $(ALPINE_STAMP) $(MUSL_LIBC)
-	@echo "[*] Compiling userland/sdl3_test.c (SDL3 + OpenGL + libplacebo + Capstone) ..."
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" \
-		$(MUSL_TOOLCHAIN_BIN)/x86_64-linux-musl-gcc -O2 \
-		userland/sdl3_test.c \
-		-o userland/sdl3_test.elf \
-		$(SDL3_INCLUDES) \
-		$(SDL3_LIBS) \
-		$(SDL3_LDFLAGS)
-
-userland/qt5_test.elf: userland/qt5_test.cpp $(ALPINE_STAMP) $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" \
-		$(MUSL_TOOLCHAIN_BIN)/x86_64-linux-musl-g++ -O2 -std=c++14 \
+userland/qt5_test.elf: userland/qt5_test.cpp $(ALPINE_STAMP) $(GLIBC_STAMP)
+	$(GLIBC_CXX) --sysroot=$(ALPINE_SYSROOT) -O2 -std=c++14 \
 		userland/qt5_test.cpp \
 		-o userland/qt5_test.elf \
 		$(QT5_CXXFLAGS) \
@@ -1663,80 +1542,66 @@ userland/qt5_test.elf: userland/qt5_test.cpp $(ALPINE_STAMP) $(MUSL_LIBC)
 		$(QT5_LIBS) \
 		$(QT5_LDFLAGS)
 
-TINYGL_LIB := $(MUSL_SYSROOT)/opt/tinygl/lib/libTinyGL.a
-
-$(TINYGL_LIB): scripts/build-tinygl.sh $(MUSL_LIBC)
-	@echo "[*] Building TinyGL library..."
-	chmod +x scripts/build-tinygl.sh
-	./scripts/build-tinygl.sh
-
-.PHONY: tinygl
-tinygl: $(TINYGL_LIB)
-
-userland/tglgears_fb.elf: userland/tglgears_fb.c $(MUSL_LIBC) $(TINYGL_LIB)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
-		userland/tglgears_fb.c -I$(MUSL_SYSROOT)/opt/tinygl/include -L$(MUSL_SYSROOT)/opt/tinygl/lib -lTinyGL -L$(MUSL_SYSROOT)/lib -lm -o userland/tglgears_fb.elf
-
-userland/test_mem_stress.elf: userland/test_mem_stress.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_mem_stress.elf: userland/test_mem_stress.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_mem_stress.c -o userland/test_mem_stress.elf
 
-userland/test_clone_futex.elf: userland/test_clone_futex.c userland/test_clone_futex_trampoline.S $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_clone_futex.elf: userland/test_clone_futex.c userland/test_clone_futex_trampoline.S $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_clone_futex.c userland/test_clone_futex_trampoline.S -o userland/test_clone_futex.elf
 
-userland/test_futex_pi.elf: userland/test_futex_pi.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_futex_pi.elf: userland/test_futex_pi.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_futex_pi.c -o userland/test_futex_pi.elf -lpthread -lm
 
-userland/test_signal_stack.elf: userland/test_signal_stack.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_signal_stack.elf: userland/test_signal_stack.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_signal_stack.c -o userland/test_signal_stack.elf -lpthread
 
-userland/test_user_dispatch.elf: userland/test_user_dispatch.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_user_dispatch.elf: userland/test_user_dispatch.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_user_dispatch.c -o userland/test_user_dispatch.elf
 
-userland/test_futex_clock.elf: userland/test_futex_clock.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_futex_clock.elf: userland/test_futex_clock.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_futex_clock.c -o userland/test_futex_clock.elf
 
-userland/test_tlb_stress.elf: userland/test_tlb_stress.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_tlb_stress.elf: userland/test_tlb_stress.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_tlb_stress.c -o userland/test_tlb_stress.elf -lpthread
 
-userland/test_syscompat.elf: userland/test_syscompat.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_syscompat.elf: userland/test_syscompat.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_syscompat.c -o userland/test_syscompat.elf
 
-userland/test_unix_sockets.elf: userland/test_unix_sockets.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_unix_sockets.elf: userland/test_unix_sockets.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_unix_sockets.c -o userland/test_unix_sockets.elf
 
-userland/test_tmpfile.elf: userland/test_tmpfile.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_tmpfile.elf: userland/test_tmpfile.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_tmpfile.c -o userland/test_tmpfile.elf
 
 # Phase 2 LinuxKPI /dev/kpi_dmabuf test; shares the device ABI header with the
 # kernel side (kernel/linuxkpi/include/uapi/kpi_dmabuf.h).
-userland/test_kpi_dmabuf.elf: userland/test_kpi_dmabuf.c $(MUSL_LIBC) \
+userland/test_kpi_dmabuf.elf: userland/test_kpi_dmabuf.c $(GLIBC_STAMP) \
 		kernel/linuxkpi/include/uapi/kpi_dmabuf.h
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		-I$(CURDIR)/kernel/linuxkpi/include \
 		userland/test_kpi_dmabuf.c -o userland/test_kpi_dmabuf.elf -lpthread
 
 # Native syscall restart regression using interruptible LinuxKPI fence waits.
-userland/test_syscall_restart.elf: userland/test_syscall_restart.c $(MUSL_LIBC) \
+userland/test_syscall_restart.elf: userland/test_syscall_restart.c $(GLIBC_STAMP) \
 		kernel/linuxkpi/include/uapi/kpi_dmabuf.h
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		-I$(CURDIR)/kernel/linuxkpi/include \
 		userland/test_syscall_restart.c -o userland/test_syscall_restart.elf
 
 # Phase 6 C5 amdgpu test: raw-ioctl GEM/PRIME/CTX/VM/BO_LIST, an SDMA copy
 # through AMDGPU_CS + WAIT_CS, and a 1k BO churn loop with a PMM invariant.
-userland/test_kpi_amdgpu.elf: userland/test_kpi_amdgpu.c $(MUSL_LIBC) \
+userland/test_kpi_amdgpu.elf: userland/test_kpi_amdgpu.c $(GLIBC_STAMP) \
 		kernel/linuxkpi/include/uapi/kpi_dmabuf.h
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		-I$(CURDIR)/kernel/linuxkpi/include \
 		userland/test_kpi_amdgpu.c -o userland/test_kpi_amdgpu.elf
 
@@ -1857,76 +1722,75 @@ gpu-diagnostics: userland/test_gpu_corruption.elf userland/test_gpu_depth.elf us
 	@echo 'python3 -m http.server 9007 --bind 127.0.0.1 --directory build/gpu-diagnostics'
 
 # Phase 3 LinuxKPI DRM test: vkms dumb-buffer GEM mmap/write, renderD128
-# sanity and a modetest-lite atomic enable/disable.  Uses the musl sysroot's
-# Linux UAPI drm headers.
-userland/test_kpi_drm.elf: userland/test_kpi_drm.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+# sanity and a modetest-lite atomic enable/disable.
+userland/test_kpi_drm.elf: userland/test_kpi_drm.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_kpi_drm.c -o userland/test_kpi_drm.elf
 
 # Phase 4 C5 bochs canary: card discovery by DRM version name, dumb-buffer
 # mmap write/read and a full-CRTC atomic enable/disable.
-userland/test_kpi_bochs.elf: userland/test_kpi_bochs.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_kpi_bochs.elf: userland/test_kpi_bochs.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_kpi_bochs.c -o userland/test_kpi_bochs.elf
 
-userland/test_child_notify.elf: userland/test_child_notify.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_child_notify.elf: userland/test_child_notify.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_child_notify.c -o userland/test_child_notify.elf
 
-userland/test_pty_master.elf: userland/test_pty_master.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_pty_master.elf: userland/test_pty_master.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_pty_master.c -o userland/test_pty_master.elf
 
-userland/test_syscall_speed.elf: userland/test_syscall_speed.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_syscall_speed.elf: userland/test_syscall_speed.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_syscall_speed.c -o userland/test_syscall_speed.elf
 
-userland/test_mm_speed.elf: userland/test_mm_speed.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_mm_speed.elf: userland/test_mm_speed.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_mm_speed.c -o userland/test_mm_speed.elf
 
-userland/test_journal_speed.elf: userland/test_journal_speed.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_journal_speed.elf: userland/test_journal_speed.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_journal_speed.c -o userland/test_journal_speed.elf -lpthread
 
-userland/test_syscall_cpu.elf: userland/test_syscall_cpu.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_syscall_cpu.elf: userland/test_syscall_cpu.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_syscall_cpu.c -o userland/test_syscall_cpu.elf
 
-userland/test_blocking_liveness.elf: userland/test_blocking_liveness.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_blocking_liveness.elf: userland/test_blocking_liveness.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_blocking_liveness.c -o userland/test_blocking_liveness.elf -lpthread
 
-userland/test_hugepages.elf: userland/test_hugepages.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_hugepages.elf: userland/test_hugepages.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_hugepages.c -o userland/test_hugepages.elf
 
-userland/test_zero_page.elf: userland/test_zero_page.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_zero_page.elf: userland/test_zero_page.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_zero_page.c -o userland/test_zero_page.elf
 
-userland/test_watchdog.elf: userland/test_watchdog.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_watchdog.elf: userland/test_watchdog.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_watchdog.c -o userland/test_watchdog.elf
 
-userland/test_copy_user.elf: userland/test_copy_user.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_copy_user.elf: userland/test_copy_user.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_copy_user.c -o userland/test_copy_user.elf
 
-userland/test_pcp_pmm.elf: userland/test_pcp_pmm.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_pcp_pmm.elf: userland/test_pcp_pmm.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_pcp_pmm.c -o userland/test_pcp_pmm.elf -lpthread -lm
 
-userland/test_ticket_lock.elf: userland/test_ticket_lock.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_ticket_lock.elf: userland/test_ticket_lock.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_ticket_lock.c -o userland/test_ticket_lock.elf -lpthread -lm
 
-userland/test_fb_perf.elf: userland/test_fb_perf.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_fb_perf.elf: userland/test_fb_perf.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_fb_perf.c -o userland/test_fb_perf.elf -lpthread -lm
 
-userland/test_vdso_bench.elf: userland/test_vdso_bench.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_vdso_bench.elf: userland/test_vdso_bench.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_vdso_bench.c -o userland/test_vdso_bench.elf
 
 userland/test_elf32.elf: userland/test_elf32.asm
@@ -1934,55 +1798,43 @@ userland/test_elf32.elf: userland/test_elf32.asm
 	nasm -f elf32 $< -o build/test_elf32.o
 	ld -m elf_i386 -static -z max-page-size=0x1000 -o $@ build/test_elf32.o
 
-userland/test_lazy_fpu.elf: userland/test_lazy_fpu.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_lazy_fpu.elf: userland/test_lazy_fpu.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_lazy_fpu.c -o userland/test_lazy_fpu.elf -lpthread -lm
 
-userland/test_heap_smp.elf: userland/test_heap_smp.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_heap_smp.elf: userland/test_heap_smp.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_heap_smp.c -o userland/test_heap_smp.elf -lpthread -lm
 
-userland/test_dcache.elf: userland/test_dcache.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_dcache.elf: userland/test_dcache.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_dcache.c -o userland/test_dcache.elf
 
-userland/test_uaccess_bench.elf: userland/test_uaccess_bench.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/test_uaccess_bench.elf: userland/test_uaccess_bench.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_uaccess_bench.c -o userland/test_uaccess_bench.elf
 
-userland/test_readahead.elf: userland/test_readahead.c $(MUSL_LIBC)
+userland/test_readahead.elf: userland/test_readahead.c $(GLIBC_STAMP)
 
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_readahead.c -o userland/test_readahead.elf
 
-userland/proc_bench.elf: userland/proc_bench.c userland/proc_bench_trampoline.S $(MUSL_LIBC)
+userland/proc_bench.elf: userland/proc_bench.c userland/proc_bench_trampoline.S $(GLIBC_STAMP)
 
 
 
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/proc_bench.c userland/proc_bench_trampoline.S -o userland/proc_bench.elf
 
 
-userland/panic_test.elf: userland/panic_test.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
+userland/panic_test.elf: userland/panic_test.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/panic_test.c -o userland/panic_test.elf
 
-userland/fault_mon.elf: userland/fault_mon.c $(MUSL_LIBC)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
-		userland/fault_mon.c -o userland/fault_mon.elf
-
-userland/tglgears_drm.elf: userland/tglgears_drm.c $(MUSL_LIBC) $(TINYGL_LIB)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
-		userland/tglgears_drm.c -I$(MUSL_SYSROOT)/opt/tinygl/include -L$(MUSL_SYSROOT)/opt/tinygl/lib -lTinyGL -lm -o userland/tglgears_drm.elf
-
-userland/tglhello_drm.elf: userland/tglhello_drm.c $(MUSL_LIBC) $(TINYGL_LIB)
-	PATH="$(MUSL_TOOLCHAIN_BIN):$(PATH)" $(MUSL_CC) $(MUSL_USER_CFLAGS) \
-		userland/tglhello_drm.c -I$(MUSL_SYSROOT)/opt/tinygl/include -L$(MUSL_SYSROOT)/opt/tinygl/lib -lTinyGL -lm -o userland/tglhello_drm.elf
-
-userland/classicube.elf: $(ALPINE_STAMP) $(MUSL_LIBC) scripts/build-classicube.sh
+userland/classicube.elf: $(ALPINE_STAMP) $(GLIBC_STAMP) scripts/build-classicube.sh
 	./scripts/build-classicube.sh
 
-userland/about.elf: userland/about.c scripts/build-about.sh $(ALPINE_STAMP) $(MUSL_LIBC)
+userland/about.elf: userland/about.c scripts/build-about.sh $(ALPINE_STAMP) $(GLIBC_STAMP)
 	./scripts/build-about.sh
 
 userland/texpacks/classicube.zip:

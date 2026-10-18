@@ -37,6 +37,7 @@ void fill_kstat(struct kstat *ks, vfs_node_t *node) {
     case FS_BLOCKDEV:  mode |= 0060000; break;
     case FS_SYMLINK:   mode |= 0120000; break;
     case FS_SOCKET:    mode |= 0140000; break;
+    case FS_PIPE:      mode |= 0010000; break;
     default:           mode |= 0100000; break;
     }
     ks->st_mode  = mode;
@@ -153,7 +154,7 @@ static uint64_t sys_fstat(uint64_t fd, uint64_t statbuf_ptr, uint64_t a2,
     if (!ks || !is_user_ptr((uint64_t)ks)) return (uint64_t)-14;
 
     struct thread *t = sched_get_current();
-    if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
+    if (!FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
 
     fill_kstat(ks, t->fds[fd]);
     return 0;
@@ -209,7 +210,7 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
                     if (!base_dir) base_dir = fs_root;
                     else base_owned = base_dir;
                 } else {
-                    if ((int)dirfd < 0 || (int)dirfd >= MAX_FDS || !t->fds[dirfd]) {
+                    if (!FD_IN_RANGE(t, dirfd) || !t->fds[dirfd]) {
                         if (base_owned) vfs_close(base_owned);
                         return (uint64_t)-9;
                     }
@@ -232,7 +233,7 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
                 if (!node) node = fs_root;
                 else node_owned = true;
             } else {
-                if ((int)dirfd < 0 || (int)dirfd >= MAX_FDS || !t->fds[dirfd])
+                if (!FD_IN_RANGE(t, dirfd) || !t->fds[dirfd])
                     return (uint64_t)-9;
                 node = t->fds[dirfd];
             }
@@ -329,7 +330,7 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
     if (!t) return (uint64_t)-1;
 
     if ((flags & AT_EMPTY_PATH) && path && path[0] == '\0') {
-        if ((int)dirfd < 0 || dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd]))
+        if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
             return (uint64_t)-9;
         fill_kstat(ks, t->fds[dirfd]);
         return 0;
@@ -346,7 +347,7 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
                 else base_owned = base_dir;
             }
         } else {
-            if ((int)dirfd < 0 || dirfd >= MAX_FDS || !fd_is_valid_node(t->fds[dirfd]))
+            if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
                 return (uint64_t)-9;
             base_dir = t->fds[dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY)
@@ -399,7 +400,7 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
                                 uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a3; (void)a4; (void)a5;
     struct thread *t = sched_get_current();
-    if (!t || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
+    if (!FD_IN_RANGE(t, fd) || !t->fds[fd]) return (uint64_t)-9;
 
     vfs_node_t *node = t->fds[fd];
     if (t->fd_flags[fd] & O_PATH) return (uint64_t)-9; // EBADF: O_PATH fds are not readable
@@ -442,7 +443,7 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
                               uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a3; (void)a4; (void)a5;
     struct thread *t = sched_get_current();
-    if (!t || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
+    if (!FD_IN_RANGE(t, fd) || !t->fds[fd]) return (uint64_t)-9;
 
     vfs_node_t *node = t->fds[fd];
     if (t->fd_flags[fd] & O_PATH) return (uint64_t)-9; // EBADF: O_PATH fds are not readable
@@ -565,7 +566,7 @@ static uint64_t sys_fstatfs(uint64_t fd, uint64_t buf_ptr, uint64_t a3,
                              uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
     struct thread *t = sched_get_current();
-    if (!t || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
+    if (!FD_IN_RANGE(t, fd) || !t->fds[fd]) return (uint64_t)-9;
     if (!buf_ptr ||
         !vmm_is_user_addr_range_valid(buf_ptr, sizeof(struct statfs_buf)))
         return (uint64_t)-14;

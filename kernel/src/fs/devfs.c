@@ -146,6 +146,14 @@ void devfs_init(void) {
   vfs_symlink(dev_dir, "stdout", "/proc/self/fd/1");
   vfs_symlink(dev_dir, "stderr", "/proc/self/fd/2");
 
+  // Pre-populate /dev/shm for POSIX shared memory and Chromium/Electron
+  vfs_node_t *shm = vfs_finddir(dev_dir, "shm");
+  if (!shm) {
+    vfs_mkdir(dev_dir, "shm", 01777);
+  } else {
+    vfs_close(shm);
+  }
+
   // /dev/kmsg: Linux accepts writes (e.g. "<6>message") into the kernel
   // ring buffer. Without a write handler vfs_write() returns 0 and writev()
   // reports "[WRITEV] zero write ... node=kmsg" + ENOSPC. Pre-register so

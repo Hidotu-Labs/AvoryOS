@@ -306,28 +306,9 @@ static uint64_t nvme_bar0_size(const struct device *dev) {
   return 0;
 }
 
-/* Map the PCI MMIO range at its HHDM slot as uncached, skipping pages that are
- * already mapped.  Mirrors the xHCI mapping approach: never remap a live
- * kernel mapping during early SMP boot. */
+/* Map the PCI MMIO range at its HHDM slot as uncached using pci_map_mmio. */
 static bool nvme_map_mmio(uint64_t phys, uint64_t length) {
-  if (!phys || !length)
-    return false;
-
-  uint64_t first = phys & ~0xFFFULL;
-  uint64_t last = (phys + length - 1) & ~0xFFFULL;
-  uint64_t hhdm = pmm_get_hhdm_offset();
-  uint64_t *pml4 = vmm_get_active_pml4();
-  uint64_t flags =
-      PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_PCD | PAGE_FLAG_PWT;
-
-  for (uint64_t page = first; page <= last; page += PAGE_SIZE) {
-    uint64_t virt = page + hhdm;
-    if (!vmm_virt_to_phys(pml4, virt) &&
-        !vmm_map_page(pml4, virt, page, flags))
-      return false;
-    vmm_flush_tlb(virt);
-  }
-  return true;
+  return pci_map_mmio(phys, length) != NULL;
 }
 
 static struct pci_device *nvme_pci_for_device(struct device *dev) {

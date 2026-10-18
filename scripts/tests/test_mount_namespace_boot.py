@@ -85,11 +85,30 @@ static void pivots(void){
  CHECK(exists("/inside"));CHECK(!exists("/oldroot"));CHECK(!exists("/tmp/mount-source/file"));
  _exit(failures?1:0);
 }
+/* bubblewrap stages its new root on /tmp itself. The old /tmp must
+ * become visible again below put_old, including an existing runtime directory. */
+static void tmp_pivot(void){
+ CHECK(mount("tmpfs","/tmp","tmpfs",0,0)==0);CHECK(chdir("/tmp")==0);
+ CHECK(mkdir("newroot",0755)==0);CHECK(mount("newroot","newroot",0,MS_BIND|MS_REC,0)==0);
+ CHECK(mkdir("oldroot",0755)==0);CHECK(syscall(SYS_pivot_root,"/tmp","oldroot")==0);CHECK(chdir("/")==0);
+ CHECK(exists("/oldroot/tmp/mount-source/file"));
+ CHECK(exists("/oldroot/tmp/runtime-0/webkitgtk/sentinel"));
+ CHECK(!exists("/oldroot/tmp/newroot"));
+ CHECK(mkdir("/newroot/runtime",0755)==0);
+ CHECK(mount("/oldroot/tmp/runtime-0/webkitgtk","/newroot/runtime",0,MS_BIND,0)==0);
+ CHECK(exists("/newroot/runtime/sentinel"));
+ CHECK(umount2("/oldroot",MNT_DETACH)==0);
+ CHECK(exists("/newroot/runtime/sentinel"));
+ _exit(failures?1:0);
+}
 int main(void){setvbuf(stdout,NULL,_IOLBF,0);puts("MOUNT_NAMESPACE_BOOT: START");
  mkdir("/tmp/mount-private",0755);mkdir("/tmp/mount-source",0755);touch("/tmp/mount-private/host");touch("/tmp/mount-source/file");
+ mkdir("/tmp/runtime-0",0700);mkdir("/tmp/runtime-0/webkitgtk",0700);touch("/tmp/runtime-0/webkitgtk/sentinel");
  pid_t p=syscall(SYS_clone,CLONE_NEWNS|SIGCHLD,0,0,0,0);CHECK(p>=0);if(!p)child();if(p>0)wait_ok(p);
  CHECK(exists("/tmp/mount-private/host"));CHECK(!exists("/tmp/mount-private/child"));CHECK(exists("/tmp/mount-source/new"));
  p=syscall(SYS_clone,CLONE_NEWNS|SIGCHLD,0,0,0,0);CHECK(p>=0);if(!p)pivots();if(p>0)wait_ok(p);
+ p=syscall(SYS_clone,CLONE_NEWNS|SIGCHLD,0,0,0,0);CHECK(p>=0);if(!p)tmp_pivot();if(p>0)wait_ok(p);
+ CHECK(exists("/tmp/runtime-0/webkitgtk/sentinel"));
  CHECK(exists("/tmp/mount-private/host"));puts(failures?"MOUNT_NAMESPACE_BOOT: FAIL":"MOUNT_NAMESPACE_BOOT: PASS");
  reboot(RB_POWER_OFF);return failures?1:0;}
 '''

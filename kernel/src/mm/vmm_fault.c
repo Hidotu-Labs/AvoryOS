@@ -16,6 +16,7 @@
 #include "vma.h"
 #include "vmm.h"
 #include "vmm_internal.h"
+#include "shm.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -166,6 +167,12 @@ extern void heap_oom_reclaim(void) __attribute__((weak));
 extern unsigned long linuxkpi_shrink_reclaim(unsigned int gfp,
                                              unsigned long needed)
     __attribute__((weak));
+extern size_t thread_stack_cache_reclaim(size_t max_reclaim)
+    __attribute__((weak));
+extern size_t ext2_buffer_cache_shrink(size_t max_buffers)
+    __attribute__((weak));
+extern size_t pty_shrink_unused_buffers(void)
+    __attribute__((weak));
 
 static volatile uint64_t vmm_fault_reclaim_next_ms;
 
@@ -188,6 +195,12 @@ static void vmm_fault_watermark_reclaim(void) {
   if (target > VMM_FAULT_RECLAIM_MAX_PAGES)
     target = VMM_FAULT_RECLAIM_MAX_PAGES;
   pmm_pcp_drain_all();
+  if (thread_stack_cache_reclaim)
+    thread_stack_cache_reclaim(8);
+  if (ext2_buffer_cache_shrink)
+    ext2_buffer_cache_shrink(16);
+  if (pty_shrink_unused_buffers)
+    pty_shrink_unused_buffers();
   mm_file_cache_reclaim(target);
 }
 
@@ -762,6 +775,41 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     return PF_REJECT("write to a read-only VMA", vma_prot, vma_start);
   }
 
+  // SysV Shared Memory demand-paging
+  if (vma_flags & MAP_SYSV_SHM) {
+    uint32_t shmid = (uint32_t)vma_offset;
+    uint64_t fault_page = cr2 & ~0xFFFULL;
+    uint32_t page_idx = (uint32_t)((fault_page - vma_start) / PAGE_SIZE);
+
+    uint64_t phys = shm_get_or_alloc_page(shmid, page_idx);
+    if (!phys) {
+      vma_linux_put(vma_linux);
+      return PF_REJECT("SHM failed to get or allocate page", vma_start, vma_end);
+    }
+
+    spinlock_acquire(&current->mm->lock);
+    struct vma *recheck = vma_find(&current->mm->vmas, fault_page);
+    if (!recheck || !(recheck->flags & MAP_SYSV_SHM) ||
+        (uint32_t)recheck->offset != shmid ||
+        fault_page < recheck->start || fault_page >= recheck->end) {
+      spinlock_release(&current->mm->lock);
+      pmm_decref((void *)phys);
+      vma_linux_put(vma_linux);
+      return 0; // raced with munmap/shmdt, retry
+    }
+
+    uint64_t page_flags = dp_build_flags(recheck->prot);
+
+    bool installed = vmm_map_page_if_unmapped((uint64_t *)target_cr3,
+                                              fault_page, phys, page_flags);
+    if (!installed) {
+      pmm_decref((void *)phys);
+    }
+    spinlock_release(&current->mm->lock);
+    vma_linux_put(vma_linux);
+    return 0;
+  }
+
   void *frame = NULL;
   bool cow_mapping = false;
   bool refault_mapping = false;
@@ -771,7 +819,43 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     uint64_t eff_file_size = (vma_file_size > 0) ? vma_file_size : (vma_end - vma_start);
 
     if (page_offset >= eff_file_size) {
-      // 1. Pure BSS page (past eff_file_size) — allocate zero-filled page
+      // 1. Pure BSS page (past eff_file_size) — share the global zero page on
+      // read (CoW) instead of allocating a dedicated physical frame.
+      if (!write_fault && (vma_flags & MAP_PRIVATE)) {
+        uint64_t zp = pmm_get_zero_page_phys();
+        if (zp) {
+          uint64_t fault_page = cr2 & ~0xFFFULL;
+          spinlock_acquire(&current->mm->lock);
+          struct vma *w = vma_find(&current->mm->vmas, fault_page);
+          if (w && (w->flags & MAP_PRIVATE) && w->file_node == node &&
+              w->prot == vma_prot && w->flags == vma_flags) {
+            uint64_t flags =
+                (dp_build_flags(w->prot) & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
+            uint64_t win_end = fault_page + 16 * PAGE_SIZE;
+            if (win_end < fault_page || win_end > w->end)
+              win_end = w->end;
+            vmm_lock_acquire();
+            for (uint64_t va2 = fault_page; va2 < win_end; va2 += PAGE_SIZE) {
+              uint64_t po = va2 - w->start;
+              if (po >= eff_file_size &&
+                  !vmm_page_present_nolock((uint64_t *)target_cr3, va2)) {
+                bool changed = false;
+                vmm_map_page_locked((uint64_t *)target_cr3, va2, zp, flags,
+                                    &changed);
+              }
+            }
+            vmm_lock_release();
+            spinlock_release(&current->mm->lock);
+            vma_linux_put(vma_linux);
+            return 0;
+          }
+          spinlock_release(&current->mm->lock);
+          vma_linux_put(vma_linux);
+          return 0;
+        }
+      }
+
+      // Write fault: allocate a dedicated zero-filled page.
       frame = vmm_zero_pool_usable(vma_numa_policy) ? pmm_alloc_zeroed_page()
                                                     : NULL;
       if (!frame) {
@@ -797,11 +881,10 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       uint32_t file_offset = (uint32_t)(vma_offset + page_offset);
       vfs_page_t *cached = vfs_cache_lookup(node, file_offset);
       bool irq_state = pf_enable_irqs_for_wait();
-      if (!cached) {
-        // Clustered 128 KB read-ahead into VFS page cache (32 pages)
-        vfs_cache_readahead(node, file_offset, 128 * 1024);
-      } else {
+      if (cached) {
         vfs_cache_put(node, cached);
+      } else if (node && node->read && (node->flags & FS_TYPE_MASK) == FS_FILE) {
+        (void)vfs_cache_readahead(node, file_offset, 32 * 1024);
       }
       cached = vfs_cache_get_or_create(node, file_offset);
       pf_restore_irqs_after_wait(irq_state);
@@ -843,8 +926,8 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       }
       vfs_cache_put(node, cached);
 
-      // Map the rest of the cached 128 KB window read-only + CoW in one pass so
-      // adjacent .data/.got pages do not each take a separate fault.
+      // Map already-cached neighbours read-only + CoW so adjacent .data/.got
+      // pages do not each take a separate fault.
       if (cow_mapping)
         vmm_map_cow_cluster((uint64_t *)target_cr3, cr2, node, current->mm,
                             vma_start, vma_end, vma_offset, eff_file_size);
@@ -867,8 +950,10 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
           cached = vfs_cache_get_or_create(node, file_offset);
         }
       } else {
-        // Cache miss: clustered 128 KB read-ahead starting at current fault
-        vfs_cache_readahead(node, file_offset, 128 * 1024);
+        /* On-demand readahead: prefetch 32 KB window ahead of cold execution/read fault */
+        if (node && node->read && (node->flags & FS_TYPE_MASK) == FS_FILE) {
+          (void)vfs_cache_readahead(node, file_offset, 32 * 1024);
+        }
         cached = vfs_cache_get_or_create(node, file_offset);
       }
       pf_restore_irqs_after_wait(irq_state);

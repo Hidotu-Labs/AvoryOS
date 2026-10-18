@@ -28,7 +28,10 @@ typedef struct node {
   uint64_t (*mmap)(struct node *, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
   int flags;
   bool mmap_shared_only;
+  bool mmap_shared_pmm_refs;
 } vfs_node_t;
+static bool vfs_mount_readonly(vfs_node_t *n) { (void)n; return false; }
+static uint64_t vfs_mount_flags(vfs_node_t *n) { (void)n; return 0; }
 struct mm_struct { int lock; struct vma_list vmas; uint64_t mmap_next_addr, brk_current; bool compat32; };
 struct thread { struct mm_struct *mm; vfs_node_t *fds[MAX_FDS]; };
 static unsigned fd_pins;
@@ -45,6 +48,10 @@ static void spinlock_acquire(int *lock) { assert(!*lock); *lock = 1; }
 static void spinlock_release(int *lock) { assert(*lock); *lock = 0; }
 static struct thread *sched_get_current(void) { return &thread; }
 ''' + region + r'''
+#undef PROT_NONE
+#undef PROT_READ
+#undef PROT_WRITE
+#undef PROT_EXEC
 static uint64_t *vmm_get_active_pml4(void) { return NULL; }
 static bool is_user_pointer(uint64_t addr) { return addr <= USER_ADDR_MAX; }
 static void teardown_range(uint64_t *pml4, struct thread *t, uint64_t start,
@@ -98,6 +105,10 @@ tmpfs_source = Path(os.environ.get('TMPFS_SOURCE', ROOT / 'kernel/src/fs/tmpfs.c
 start = tmpfs_source.index('        n->mmap     = tmpfs_mmap;')
 end = tmpfs_source.index('    } else if', start)
 tmpfs_setup = tmpfs_source[start:end]
+mmap_helpers = (ROOT / 'kernel/linuxkpi/src/mmap.c').read_text()
+start = mmap_helpers.index('vm_fault_t vmf_insert_pfn_prot(')
+end = mmap_helpers.index('\nvm_fault_t vmf_insert_pfn(', start)
+pfn_insert = mmap_helpers[start:end]
 tests = r'''
 static uint64_t anon(uint64_t addr, uint64_t length, uint64_t flags) {
   uint64_t result = sys_mmap(addr, length, 0, flags|MAP_PRIVATE|MAP_ANONYMOUS,
@@ -121,7 +132,45 @@ static void make_tmpfs_fixture(vfs_node_t *n) {
 ''' + tmpfs_setup + r'''
 #undef tmpfs_mmap
 }
+''' + r'''
+typedef unsigned vm_fault_t;
+typedef uint64_t pgprot_t;
+#define PAGE_SHIFT 12
+#define VM_FAULT_SIGBUS 2
+#define VM_FAULT_NOPAGE 256
+struct vm_area_struct { uint64_t vm_start, vm_end; };
+static unsigned inserted_pages;
+static int kpi_map_phys(uint64_t a, uint64_t p, unsigned long len,
+                       struct vm_area_struct *v, pgprot_t prot) {
+  (void)p; (void)prot;
+  assert(a >= v->vm_start && a + len <= v->vm_end);
+  inserted_pages++; return 0;
+}
+''' + pfn_insert + r'''
+static uint64_t gpu_handler(vfs_node_t *node, uint64_t addr, uint64_t len,
+                            uint64_t prot, uint64_t flags, uint64_t off) {
+  (void)node; (void)prot; (void)flags; (void)off;
+  struct vm_area_struct v = {addr, addr + len};
+  /* Exercise the real insertion bound that TTM uses, including the final
+   * page of a sub-page or non-page-multiple Vulkan upload buffer. */
+  for (uint64_t a = addr; a < addr + len; a += PAGE_SIZE)
+    assert(vmf_insert_pfn_prot(&v, a, 1, 0) == VM_FAULT_NOPAGE);
+  return addr;
+}
 int main(void) {
+  const uint64_t sizes[] = {1, 0x250, 4095, 4096, 4097, 8191, 8192};
+  vfs_node_t gpu = {.mmap=gpu_handler}; thread.fds[3]=&gpu;
+  for (unsigned fixed=0; fixed<2; fixed++) {
+    for (unsigned i=0; i<sizeof(sizes)/sizeof(sizes[0]); i++) {
+      reset(); inserted_pages=0;
+      uint64_t addr=fixed ? 0x20000000 : 0;
+      uint64_t result=sys_mmap(addr,sizes[i],3,MAP_SHARED|(fixed?MAP_FIXED:0),3,0);
+      assert(result < (uint64_t)-4095 && count==1 && !fd_pins && !memory.lock);
+      assert(regions[0].start==result && regions[0].end==result+PAGE_ALIGN_UP(sizes[i]));
+      assert(inserted_pages==PAGE_ALIGN_UP(sizes[i])/PAGE_SIZE);
+    }
+  }
+  puts("PASS: fixed and allocated GPU mmap round byte lengths; real PFN insertion maps every final page");
   reset();
   vfs_node_t tmp; make_tmpfs_fixture(&tmp); thread.fds[3]=&tmp;
   /* Firefox's failed read-only XPI-size request must bypass the shared mapper. */
@@ -268,3 +317,13 @@ with tempfile.TemporaryDirectory() as tmp:
                     '-fsanitize=undefined', '-I', str(ROOT),
                     str(tmp / 'test.c'), '-o', str(tmp / 'test')], check=True)
     subprocess.run([str(tmp / 'test')], check=True)
+    old = mmap.replace('node->mmap(node, vaddr, aligned_len, prot,',
+                       'node->mmap(node, vaddr, length, prot,')
+    assert old != mmap
+    (tmp / 'old.c').write_text(prefix + constants + old + tests)
+    subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+                    '-fsanitize=undefined', '-I', str(ROOT),
+                    str(tmp / 'old.c'), '-o', str(tmp / 'old')], check=True)
+    result = subprocess.run([str(tmp / 'old')], capture_output=True, text=True)
+    assert result.returncode != 0 and 'vmf_insert_pfn_prot' in result.stderr, result.stderr
+    print('PASS: former byte-length driver callback fails final-page PFN insertion')

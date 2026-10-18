@@ -51,8 +51,8 @@ build_tcc() {
     
     cd "tcc-${TCC_VERSION}"
     
-    # Patch tcc.c to show AscentOS instead of Linux in the version string
-    sed -i 's/" Linux"/" AscentOS"/g' tcc.c
+    # Patch tcc.c to show AvoryOS instead of Linux in the version string
+    sed -i 's/" Linux"/" AvoryOS"/g' tcc.c
     
     # Configure for AscentOS (glibc target)
     echo "Configuring TCC for AscentOS (GLIBC) ..."

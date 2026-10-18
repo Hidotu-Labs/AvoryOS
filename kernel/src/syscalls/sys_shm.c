@@ -10,6 +10,7 @@
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
 #include "../mm/pmm.h"
+#include "../mm/heap.h"
 #include "../fs/vfs.h"
 #include "../mm/shm.h"
 #include "../mm/vma.h"
@@ -60,9 +61,6 @@ static spinlock_t shm_lock = SPINLOCK_INIT;
 static struct shm_segment shm_table[SHM_MAX_SEGMENTS];
 static uint32_t shm_next_id = 1;
 
-// Backing storage for phys_pages arrays (static to avoid heap dependency loop)
-static uint64_t shm_page_arrays[SHM_MAX_SEGMENTS][MAX_SHM_PAGES];
-
 /* Called with shm_lock held after the last attachment has gone away. The
  * segment owns the initial reference returned by pmm_alloc_page(); mappings
  * hold additional references of their own. */
@@ -71,10 +69,14 @@ static void shm_destroy_segment(struct shm_segment *seg) {
     return;
 
   for (uint32_t i = 0; i < seg->num_pages; i++) {
-    if (seg->phys_pages[i]) {
+    if (seg->phys_pages && seg->phys_pages[i]) {
       pmm_decref((void *)seg->phys_pages[i]);
       seg->phys_pages[i] = 0;
     }
+  }
+  if (seg->phys_pages) {
+    kfree(seg->phys_pages);
+    seg->phys_pages = NULL;
   }
   seg->active = false;
   seg->marked_destroy = false;
@@ -87,7 +89,6 @@ static void shm_destroy_segment(struct shm_segment *seg) {
 
 void shm_init(void) {
   memset(shm_table, 0, sizeof(shm_table));
-  memset(shm_page_arrays, 0, sizeof(shm_page_arrays));
   shm_next_id = 1;
   klog_puts("[SHM] Shared memory subsystem initialized.\n");
 }
@@ -165,27 +166,19 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg, uint64_t a3,
 
   if (shm_next_id > 0x7FFFFFFFU) { spinlock_release(&shm_lock); return -28; }
 
-  // Allocate physical pages
+  // Allocate physical pages pointer array (demand-paged: frames allocated on fault)
   uint32_t num_pages = (uint32_t)(PAGE_ALIGN_UP(size) / PAGE_SIZE);
-  if (num_pages > MAX_SHM_PAGES) {
+  if (num_pages == 0 || num_pages > (SHM_MAX_SIZE / PAGE_SIZE)) {
     spinlock_release(&shm_lock);
     return -22; // EINVAL
   }
 
-  for (uint32_t i = 0; i < num_pages; i++) {
-    void *page = pmm_alloc_page();
-    if (!page) {
-      // Rollback
-      for (uint32_t j = 0; j < i; j++) {
-        pmm_free_page((void *)shm_page_arrays[slot][j]);
-      }
-      spinlock_release(&shm_lock);
-      return -12; // ENOMEM
-    }
-    // Zero-fill the page via HHDM
-    memset(PHYS_TO_VIRT((uint64_t)page), 0, PAGE_SIZE);
-    shm_page_arrays[slot][i] = (uint64_t)page;
+  uint64_t *pages = kmalloc(num_pages * sizeof(uint64_t));
+  if (!pages) {
+    spinlock_release(&shm_lock);
+    return -12; // ENOMEM
   }
+  memset(pages, 0, num_pages * sizeof(uint64_t));
 
   // Initialize segment
   struct shm_segment *seg = &shm_table[slot];
@@ -196,7 +189,7 @@ int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg, uint64_t a3,
   seg->shmid = shm_next_id++;
   seg->size = size;
   seg->num_pages = num_pages;
-  seg->phys_pages = shm_page_arrays[slot];
+  seg->phys_pages = pages;
   seg->nattch = 0;
   seg->perm_mode = (uint32_t)(shmflg & 0x1FF); // Low 9 bits = permissions
   seg->creator_pid = 0;
@@ -298,41 +291,16 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
     }
   }
 
-  // Map each page of the segment
-  TSC_BEGIN(shmat_map);
-  uint64_t *pml4 = vmm_get_active_pml4();
-  uint64_t flags = PAGE_FLAG_PRESENT | PAGE_FLAG_USER;
-  if (!(shmflg & SHM_RDONLY)) {
-    flags |= PAGE_FLAG_RW;
-  }
-
-  for (uint32_t i = 0; i < seg->num_pages; i++) {
-    uint64_t phys = seg->phys_pages[i];
-    if (!vmm_map_page(pml4, vaddr + i * PAGE_SIZE, phys, flags)) {
-      // Rollback mapped pages
-      for (uint32_t j = 0; j < i; j++) {
-        vmm_unmap_page(pml4, vaddr + j * PAGE_SIZE);
-      }
-      spinlock_release(&shm_lock);
-      return -12; // ENOMEM
-    }
-    // Increment refcount so page isn't freed on process exit
-    pmm_incref((void *)phys);
-  }
-
-  // Register VMA as MAP_SHARED. We avoid MAP_ANONYMOUS because this is backed
-  // by an existing physical segment allocated in shmget.
+  // Register VMA as MAP_SHARED | MAP_SYSV_SHM.
+  // Physical pages are populated on demand in the page fault handler.
+  // We record seg->shmid in vma->offset so shmdt and page fault can look it up.
   uint64_t prot = 0x1; // PROT_READ
   if (!(shmflg & SHM_RDONLY))
     prot |= 0x2; // PROT_WRITE
 
   if (t->mm) {
     if (vma_add(&t->mm->vmas, vaddr, vaddr + aligned_size, prot,
-                MAP_SHARED | MAP_SYSV_SHM, -1, 0, NULL, 0) != 0) {
-      for (uint32_t i = 0; i < seg->num_pages; i++) {
-        vmm_unmap_page(pml4, vaddr + i * PAGE_SIZE);
-        pmm_decref((void *)seg->phys_pages[i]);
-      }
+                MAP_SHARED | MAP_SYSV_SHM, -1, (uint64_t)seg->shmid, NULL, 0) != 0) {
       spinlock_release(&shm_lock);
       return -12; // ENOMEM
     }
@@ -343,8 +311,45 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
   seg->last_pid = t->tid;
 
   spinlock_release(&shm_lock);
-  TSC_END(shmat_map);
   return (int64_t)vaddr;
+}
+
+// Demand-paging helper for page fault handler
+uint64_t shm_get_or_alloc_page(uint32_t shmid, uint32_t page_idx) {
+  spinlock_acquire(&shm_lock);
+
+  struct shm_segment *seg = NULL;
+  for (int i = 0; i < SHM_MAX_SEGMENTS; i++) {
+    if (shm_table[i].active && shm_table[i].shmid == shmid) {
+      seg = &shm_table[i];
+      break;
+    }
+  }
+
+  if (!seg || page_idx >= seg->num_pages || !seg->phys_pages) {
+    spinlock_release(&shm_lock);
+    return 0;
+  }
+
+  uint64_t phys = seg->phys_pages[page_idx];
+  if (!phys) {
+    void *page = pmm_alloc_page();
+    if (!page) {
+      spinlock_release(&shm_lock);
+      return 0;
+    }
+    // Zero-fill the new page via HHDM
+    memset(PHYS_TO_VIRT((uint64_t)page), 0, PAGE_SIZE);
+    phys = (uint64_t)page;
+    seg->phys_pages[page_idx] = phys;
+    // Initial refcount (1) is held by seg->phys_pages
+  }
+
+  // Increment refcount for the calling mapping's PTE
+  pmm_incref((void *)phys);
+
+  spinlock_release(&shm_lock);
+  return phys;
 }
 
 // sys_shmdt
@@ -377,21 +382,15 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t a1, uint64_t a2, uint64_t a3,
     return -22; // EINVAL
 
   uint64_t size = v->end - v->start;
-  uint32_t num_pages = size / PAGE_SIZE;
+  uint32_t num_pages = (uint32_t)(size / PAGE_SIZE);
+  uint32_t shmid = (uint32_t)v->offset;
 
   spinlock_acquire(&shm_lock);
 
-  // Find which segment this belongs to (by matching physical pages)
-  uint64_t *pml4 = vmm_get_active_pml4();
-  uint64_t first_phys = vmm_virt_to_phys(pml4, shmaddr);
-  first_phys &= 0x000FFFFFFFFFF000ULL;
-
+  // Find which segment this belongs to by segment ID
   struct shm_segment *seg = NULL;
   for (int i = 0; i < SHM_MAX_SEGMENTS; i++) {
-    if (!shm_table[i].active)
-      continue;
-    if (shm_table[i].num_pages > 0 &&
-        shm_table[i].phys_pages[0] == first_phys) {
+    if (shm_table[i].active && shm_table[i].shmid == shmid) {
       seg = &shm_table[i];
       break;
     }
@@ -399,6 +398,7 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t a1, uint64_t a2, uint64_t a3,
 
   // Unmap pages and decrement refcounts
   TSC_BEGIN(shmdt_unmap);
+  uint64_t *pml4 = vmm_get_active_pml4();
   for (uint32_t i = 0; i < num_pages; i++) {
     uint64_t va = shmaddr + i * PAGE_SIZE;
     uint64_t phys = vmm_virt_to_phys(pml4, va);
@@ -474,9 +474,14 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf, uint64_t a3,
         highest = i;
         usage.used_ids++;
         usage.shm_tot += shm_table[i].num_pages;
+        if (shm_table[i].phys_pages) {
+          for (uint32_t p = 0; p < shm_table[i].num_pages; p++) {
+            if (shm_table[i].phys_pages[p] != 0)
+              usage.shm_rss++;
+          }
+        }
       }
     }
-    usage.shm_rss = usage.shm_tot;
     spinlock_release(&shm_lock);
     const void *out = cmd == 3 ? (const void *)&limits : (const void *)&usage;
     size_t len = cmd == 3 ? sizeof(limits) : sizeof(usage);
@@ -622,4 +627,20 @@ void shm_namespace_destroy(uint32_t id) {
     }
   }
   spinlock_release(&shm_lock);
+}
+
+uint64_t shm_total_pages(void) {
+  uint64_t total = 0;
+  spinlock_acquire(&shm_lock);
+  for (uint32_t i = 0; i < SHM_MAX_SEGMENTS; i++) {
+    if (shm_table[i].active && shm_table[i].phys_pages) {
+      for (uint32_t p = 0; p < shm_table[i].num_pages; p++) {
+        if (shm_table[i].phys_pages[p] != 0) {
+          total++;
+        }
+      }
+    }
+  }
+  spinlock_release(&shm_lock);
+  return total;
 }

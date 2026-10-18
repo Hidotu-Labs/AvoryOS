@@ -95,6 +95,8 @@ static vfs_node_t *pts_lookup(vfs_node_t *n, char *name) {
       goto fail;
     idx = idx * 10 + *p - '0';
   }
+  if (idx >= PTY_MAX_PAIRS)
+    goto fail;
   pty_pair_t *p = pty_get_pair(idx);
   if (!p || p->devpts_instance != i || p->locked)
     goto fail;
@@ -131,16 +133,29 @@ static struct dirent *pts_readdir(vfs_node_t *n, uint32_t index) {
     return d;
   }
   uint32_t found = 3;
-  for (int i = 0; i < PTY_MAX_PAIRS; i++) {
-    pty_pair_t *p = pty_get_pair(i);
-    if (!p || p->devpts_instance != n->device)
+  int max_idx = pty_get_table_capacity();
+  for (int i = 0; i < max_idx; i++) {
+    if (!pty_is_instance_match(i, n->device))
       continue;
     if (found++ == index) {
+      int val = i;
+      char tmp[16];
       int z = 0;
-      if (i >= 10)
-        d->name[z++] = '0' + i / 10;
-      d->name[z++] = '0' + i % 10;
-      d->name[z] = 0;
+      if (val == 0) {
+        tmp[z++] = '0';
+      } else {
+        char rev[16];
+        int rlen = 0;
+        while (val > 0) {
+          rev[rlen++] = (char)('0' + (val % 10));
+          val /= 10;
+        }
+        while (rlen > 0) {
+          tmp[z++] = rev[--rlen];
+        }
+      }
+      tmp[z] = 0;
+      strcpy(d->name, tmp);
       d->ino = (136u << 8) | i;
       d->d_type = DT_CHR;
       return d;

@@ -14,9 +14,8 @@
 #include "arch/uaccess.h"
 #include <stdint.h>
 
-// Global Epoll Instance Table and Memory Pools
+// Global Epoll Instance Table
 static eventpoll_t *epoll_table[EPOLL_MAX_INSTANCES];
-static eventpoll_t epoll_pool[EPOLL_MAX_INSTANCES];
 #define EPOLL_BITMAP_WORDS ((EPOLL_MAX_INSTANCES + 63) / 64)
 static uint64_t epoll_free_bitmap[EPOLL_BITMAP_WORDS]; // 1 = free
 static spinlock_t epoll_table_lock = SPINLOCK_INIT;
@@ -112,6 +111,32 @@ void epoll_release_thread(struct thread *t) {
 
 // Epoll Instance Creation/Destruction
 
+static bool epoll_expand_items_locked(eventpoll_t *ep, uint32_t needed_fd) {
+  if (needed_fd >= EPOLL_MAX_WATCHED)
+    return false;
+  uint32_t new_cap = ep->items_capacity ? ep->items_capacity * 2 : EPOLL_INITIAL_CAPACITY;
+  while (new_cap <= needed_fd && new_cap < EPOLL_MAX_WATCHED)
+    new_cap *= 2;
+  if (new_cap > EPOLL_MAX_WATCHED)
+    new_cap = EPOLL_MAX_WATCHED;
+  if (needed_fd >= new_cap || new_cap <= ep->items_capacity)
+    return false;
+
+  size_t old_bytes = ep->items_capacity * sizeof(epitem_t *);
+  size_t new_bytes = new_cap * sizeof(epitem_t *);
+  epitem_t **new_items = kmalloc(new_bytes);
+  if (!new_items)
+    return false;
+  memset(new_items, 0, new_bytes);
+  if (ep->items && ep->items_capacity > 0) {
+    memcpy(new_items, ep->items, old_bytes);
+    kfree(ep->items);
+  }
+  ep->items = new_items;
+  ep->items_capacity = new_cap;
+  return true;
+}
+
 eventpoll_t *epoll_create(void) {
   int idx = epoll_table_alloc();
   if (idx < 0) {
@@ -119,26 +144,21 @@ eventpoll_t *epoll_create(void) {
     return NULL;
   }
 
-  eventpoll_t *ep = &epoll_pool[idx];
-
-  /* Slot hygiene, bounded by items_high (#6): epoll_destroy() already freed
-   * and NULLed every item before the slot returned to the bitmap, so after a
-   * normal destroy items_high is 0 and this scans nothing.  The old code
-   * unconditionally touched all EPOLL_MAX_WATCHED (4096) slots on every
-   * single epoll_create() - one full 4096-pointer pass in either branch -
-   * which capped create/destroy-heavy workloads for no benefit. */
-  {
-    int hi = ep->items_high;
-    if (hi > EPOLL_MAX_WATCHED)
-      hi = EPOLL_MAX_WATCHED;
-    for (int i = 0; i < hi; i++) {
-      if (ep->items[i]) {
-        epitem_free(ep->items[i]);
-        ep->items[i] = NULL;
-      }
-    }
-    ep->item_count = 0;
+  eventpoll_t *ep = kmalloc(sizeof(eventpoll_t));
+  if (!ep) {
+    epoll_table_free(idx);
+    return NULL;
   }
+  memset(ep, 0, sizeof(eventpoll_t));
+
+  ep->items = kmalloc(EPOLL_INITIAL_CAPACITY * sizeof(epitem_t *));
+  if (!ep->items) {
+    epoll_table_free(idx);
+    kfree(ep);
+    return NULL;
+  }
+  memset(ep->items, 0, EPOLL_INITIAL_CAPACITY * sizeof(epitem_t *));
+  ep->items_capacity = EPOLL_INITIAL_CAPACITY;
 
   // Fast targeted field initialization
   ep->fd = -1;
@@ -151,6 +171,7 @@ eventpoll_t *epoll_create(void) {
   wait_queue_init(&ep->wq);
   spinlock_init(&ep->lock);
   ep->refcount = 1;
+  ep->table_index = idx;
 
   spinlock_acquire(&epoll_table_lock);
   epoll_table[idx] = ep;
@@ -171,14 +192,11 @@ void epoll_destroy(eventpoll_t *ep) {
   wait_queue_wake_all(&ep->wq);
 
   // Free all watched items and release the VFS references acquired by
-  // EPOLL_CTL_ADD.  Every live item sits at its fd index, and items_high is
-  // (highest fd ever used + 1), so scanning to items_high covers all items
-  // without the old unconditional pass over all 4096 slots - for a typical
-  // low-fd set that is a handful of slots instead of EPOLL_MAX_WATCHED.
-  {
+  // EPOLL_CTL_ADD.
+  if (ep->items) {
     int hi = ep->items_high;
-    if (hi > EPOLL_MAX_WATCHED)
-      hi = EPOLL_MAX_WATCHED;
+    if (hi > (int)ep->items_capacity)
+      hi = (int)ep->items_capacity;
     for (int i = 0; i < hi; i++) {
       epitem_t *epi = ep->items[i];
       if (epi) {
@@ -198,12 +216,16 @@ void epoll_destroy(eventpoll_t *ep) {
     }
     ep->item_count = 0;
     ep->items_high = 0;
+    kfree(ep->items);
+    ep->items = NULL;
+    ep->items_capacity = 0;
   }
 
-  int idx = (int)(ep - epoll_pool);
+  int idx = ep->table_index;
   if (idx >= 0 && idx < EPOLL_MAX_INSTANCES) {
     epoll_table_free(idx);
   }
+  kfree(ep);
 }
 
 void epoll_get(eventpoll_t *ep) {
@@ -299,13 +321,13 @@ int epoll_ctl_del(eventpoll_t *ep, int fd) {
   if (!ep) return -22;
   if (fd < 0 || fd >= EPOLL_MAX_WATCHED) return -9;
   spinlock_acquire(&ep->lock);
-  epitem_t *epi = ep->items[fd];
+  epitem_t *epi = ((uint32_t)fd < ep->items_capacity) ? ep->items[fd] : NULL;
   if (epi) epitem_pin(epi, 0);
   spinlock_release(&ep->lock);
   if (!epi) return -2;
   spinlock_acquire(&epi->node->ep_lock);
   spinlock_acquire(&ep->lock);
-  bool owned = ep->items[fd] == epi && !epi->removed;
+  bool owned = ((uint32_t)fd < ep->items_capacity && ep->items[fd] == epi) && !epi->removed;
   if (owned) {
     epi->removed = true;
     ep->items[fd] = NULL;
@@ -329,6 +351,10 @@ int epoll_ctl_add(eventpoll_t *ep, int fd, struct epoll_event *event) {
   struct thread *t = sched_get_current();
   if (!t || fd < 0 || fd >= MAX_FDS || fd >= EPOLL_MAX_WATCHED) return -9;
   spinlock_acquire(&t->files->lock);
+  if ((uint32_t)fd >= t->files->capacity) {
+    spinlock_release(&t->files->lock);
+    return -9;
+  }
   vfs_node_t *node = t->fds[fd];
   if (node && node != (vfs_node_t *)-1) vfs_node_ref(node);
   else node = NULL;
@@ -347,12 +373,20 @@ int epoll_ctl_add(eventpoll_t *ep, int fd, struct epoll_event *event) {
 
   // Preserve the existing array's fd-reuse replacement behavior.
   spinlock_acquire(&ep->lock);
-  bool stale = ep->items[fd] && ep->items[fd]->node != node;
+  bool stale = ((uint32_t)fd < ep->items_capacity && ep->items[fd]) && ep->items[fd]->node != node;
   spinlock_release(&ep->lock);
   if (stale) epoll_ctl_del(ep, fd);
 
   spinlock_acquire(&node->ep_lock);
   spinlock_acquire(&ep->lock);
+  if ((uint32_t)fd >= ep->items_capacity) {
+    if (!epoll_expand_items_locked(ep, (uint32_t)fd)) {
+      spinlock_release(&ep->lock);
+      spinlock_release(&node->ep_lock);
+      epitem_free(epi);
+      return -12; // ENOMEM
+    }
+  }
   if (ep->items[fd]) {
     spinlock_release(&ep->lock);
     spinlock_release(&node->ep_lock);
@@ -362,6 +396,9 @@ int epoll_ctl_add(eventpoll_t *ep, int fd, struct epoll_event *event) {
   ep->items[fd] = epi;
   ep->item_count++;
   if (fd >= ep->items_high) ep->items_high = fd + 1;
+  if (node->ep_watchers.next == NULL || node->ep_watchers.prev == NULL) {
+    INIT_LIST_HEAD(&node->ep_watchers);
+  }
   list_add_tail(&epi->ep_node_link, &node->ep_watchers);
   epitem_pin(epi, 0);
   spinlock_release(&ep->lock);
@@ -375,7 +412,7 @@ int epoll_ctl_mod(eventpoll_t *ep, int fd, struct epoll_event *event) {
   if (!ep || !event) return -22;
   if (fd < 0 || fd >= EPOLL_MAX_WATCHED) return -9;
   spinlock_acquire(&ep->lock);
-  epitem_t *epi = ep->items[fd];
+  epitem_t *epi = ((uint32_t)fd < ep->items_capacity) ? ep->items[fd] : NULL;
   if (!epi) { spinlock_release(&ep->lock); return -2; }
   epitem_pin(epi, 0);
   epi->event = *event;
@@ -500,7 +537,7 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
       int items_high = __atomic_load_n(&ep->items_high, __ATOMIC_RELAXED);
       for (int _i = 0; _i < items_high; _i++) {
         spinlock_acquire(&ep->lock);
-        epitem_t *_epi = ep->items[_i];
+        epitem_t *_epi = (_i < (int)ep->items_capacity) ? ep->items[_i] : NULL;
         if (!_epi || _epi->on_ready_list || _epi->oneshot_disabled) {
           spinlock_release(&ep->lock);
           continue;
@@ -632,6 +669,10 @@ eventpoll_t *epoll_from_fd(int fd) {
     return NULL;
 
   spinlock_acquire(&t->files->lock);
+  if ((uint32_t)fd >= t->files->capacity) {
+    spinlock_release(&t->files->lock);
+    return NULL;
+  }
   vfs_node_t *node = t->fds[fd];
   if (!node || node == (vfs_node_t *)-1 ||
       (node->flags & FS_TYPE_MASK) != FS_EPOLL) {
@@ -653,6 +694,10 @@ int epoll_close_fd(int fd) {
     return -9; // EBADF
 
   spinlock_acquire(&t->files->lock);
+  if ((uint32_t)fd >= t->files->capacity) {
+    spinlock_release(&t->files->lock);
+    return -9; // EBADF
+  }
   vfs_node_t *node = t->fds[fd];
   if (!node || node == (vfs_node_t *)-1) { /* an allocation reservation */
     spinlock_release(&t->files->lock);
@@ -746,10 +791,16 @@ void epoll_notify_event(struct vfs_node *node, uint32_t events) {
     return;
 
   // Lazy-init check for node notification list
-  if (node->ep_watchers.next == NULL || (uint64_t)node->ep_watchers.next < 0xFFFF800000000000ULL)
+  if (node->ep_watchers.next == NULL || (uint64_t)node->ep_watchers.next < 0xFFFF800000000000ULL ||
+      node->ep_watchers.next == &node->ep_watchers)
     return;
 
   spinlock_acquire(&node->ep_lock);
+  if (node->ep_watchers.next == NULL || (uint64_t)node->ep_watchers.next < 0xFFFF800000000000ULL ||
+      node->ep_watchers.next == &node->ep_watchers) {
+    spinlock_release(&node->ep_lock);
+    return;
+  }
   struct list_head *pos, *n;
   list_for_each_safe(pos, n, &node->ep_watchers) {
     if ((uint64_t)pos < 0xFFFF800000000000ULL)
@@ -812,7 +863,7 @@ void epoll_notify_socket(int fd, uint32_t events) {
       spinlock_release(&epoll_table_lock);
       if (!refs) continue; // destruction already owns this slot
       spinlock_acquire(&ep->lock);
-      epitem_t *epi = ep->items[fd];
+      epitem_t *epi = ((uint32_t)fd < ep->items_capacity) ? ep->items[fd] : NULL;
       if (epi) __atomic_add_fetch(&epi->refcount, 1, __ATOMIC_RELAXED);
       spinlock_release(&ep->lock);
       if (epi) {
@@ -829,7 +880,6 @@ void epoll_notify_socket(int fd, uint32_t events) {
 
 void epoll_init(void) {
   memset(epoll_table, 0, sizeof(epoll_table));
-  memset(epoll_pool, 0, sizeof(epoll_pool));
   memset(epoll_free_bitmap, 0xff, sizeof(epoll_free_bitmap));
   spinlock_init(&epoll_table_lock);
 

@@ -639,10 +639,22 @@ configure_desktop() {
     esac
 
     if [ -n "$XINIT_CMD" ]; then
-        echo "$XINIT_CMD" > "$TARGET_MNT/root/.xinitrc"
+        # Root's home is "/" on AvoryOS. Join the XDG defaults through
+        # "${HOME%/}" so startx sessions never derive //.cache-style paths:
+        # WebKitGTK rejects those sandbox roots and Epiphany aborts on the
+        # critical that follows.
+        XINIT_ENV='_avory_home="${HOME:-/}"
+_avory_home="${_avory_home%/}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${_avory_home}/.config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${_avory_home}/.cache}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${_avory_home}/.local/share}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-${_avory_home}/.local/state}"
+unset _avory_home
+'
+        { printf '#!/bin/sh\n%s%s\n' "$XINIT_ENV" "$XINIT_CMD"; } > "$TARGET_MNT/root/.xinitrc"
         chmod +x "$TARGET_MNT/root/.xinitrc" 2>/dev/null || true
         if [ -n "${NEW_USER:-}" ] && [ -d "$TARGET_MNT/home/$NEW_USER" ]; then
-            echo "$XINIT_CMD" > "$TARGET_MNT/home/$NEW_USER/.xinitrc"
+            { printf '#!/bin/sh\n%s%s\n' "$XINIT_ENV" "$XINIT_CMD"; } > "$TARGET_MNT/home/$NEW_USER/.xinitrc"
             chroot "$TARGET_MNT" chown "$NEW_USER:$NEW_USER" "/home/$NEW_USER/.xinitrc" 2>/dev/null || true
             chmod +x "$TARGET_MNT/home/$NEW_USER/.xinitrc" 2>/dev/null || true
         fi

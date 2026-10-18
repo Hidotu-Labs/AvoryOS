@@ -256,6 +256,11 @@ typedef struct vfs_node {
   /* Direct private mappings take one PMM reference per PTE, including CoW
    * copies. munmap must release these just like generic file-cache views. */
   bool mmap_private_pmm_refs;
+  /* Direct shared mappings also take one PMM reference per PTE.  The backing
+   * storage can be released or moved while a mapping is still live (tmpfs
+   * truncate, memfd growth realloc), so a mapping without its own reference
+   * would keep writable PTEs to a frame the PMM has already re-issued. */
+  bool mmap_shared_pmm_refs;
   poll_type_t poll; // Device-specific poll handler
   statfs_type_t statfs;
   uint32_t (*get_nlink)(struct vfs_node *); // Optional dynamic link count
@@ -284,6 +289,11 @@ typedef struct vfs_node {
 
   struct radix_tree pages; // Cached pages keyed by file page index
   spinlock_t pages_lock;   // Serializes compound cache/value-lifetime changes
+
+  /* Adaptive on-demand readahead tracking */
+  uint32_t ra_prev_offset;
+  uint32_t ra_window;
+  uint32_t ra_seq_hits;
 
   /* Optional sequential readdir cursor used by filesystems with indexed API. */
   uint32_t readdir_cursor_index;

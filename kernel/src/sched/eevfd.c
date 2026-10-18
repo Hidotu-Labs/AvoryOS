@@ -57,14 +57,16 @@ void eevfd_entity_init(struct sched_entity *se, int nice, uint64_t slice_ns) {
     se->prev_sum_exec_ns = 0;
     se->on_rq = false;
     se->custom_slice = (slice_ns != 0);
+    se->critical_depth = 0;
 }
 
 void eevfd_set_nice(struct sched_entity *se, int nice) {
     if (!se)
         return;
     se->nice_value = (int8_t)nice;
-    se->weight = nice_to_weight(nice);
-    se->wmult = nice_to_wmult(nice);
+    int effective = se->critical_depth ? -20 : nice;
+    se->weight = nice_to_weight(effective);
+    se->wmult = nice_to_wmult(effective);
     if (!se->custom_slice)
         se->slice_ns = eevfd_calc_slice_for_nice(nice);
     /* Recalculate deadline */

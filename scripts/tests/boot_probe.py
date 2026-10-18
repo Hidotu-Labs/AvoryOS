@@ -8,7 +8,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 
-def run_probe(name, init, marker, setup=None, cpus=4, timeout=60):
+def run_probe(name, init, marker, setup=None, cpus=4, timeout=60, filesystem="ext2"):
     out = ROOT / 'build' / name
     if out.is_symlink():
         raise RuntimeError('probe output directory is a symlink')
@@ -19,7 +19,7 @@ def run_probe(name, init, marker, setup=None, cpus=4, timeout=60):
     helper.OUT, helper.INIT = out, init
     with (out / '.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        disk, iso = helper.prepare(extra_root_setup=setup)
+        disk, iso = helper.prepare(extra_root_setup=setup, filesystem=filesystem)
         kernel = Path(os.environ.get('AVORY_TEST_KERNEL', str(ROOT / 'kernel/bin-x86_64/kernel')))
         shutil.copy2(kernel, out / 'iso-root/boot/kernel')
         helper.run(['strip', '--strip-all', out / 'iso-root/boot/kernel'])

@@ -76,4 +76,10 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf,
 // Print SHM segment status (for kernel shell)
 void shm_print_status(void);
 
+// Total physical pages held across active SHM segments
+uint64_t shm_total_pages(void);
+
+// Demand-paging helper: returns physical address of faulted page (with refcount incremented for caller)
+uint64_t shm_get_or_alloc_page(uint32_t shmid, uint32_t page_idx);
+
 #endif // SHM_H

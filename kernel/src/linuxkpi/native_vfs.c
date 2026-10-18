@@ -434,7 +434,7 @@ int asc_vfs_fd_alloc(unsigned int flags) {
 void asc_vfs_fd_install(int fd, void *node, unsigned int flags) {
   struct thread *t = sched_get_current();
 
-  if (!t || !t->files || fd < 0 || fd >= MAX_FDS || !node)
+  if (!t || !t->files || fd < 0 || !FD_IN_RANGE(t, (uint32_t)fd) || !node)
     return;
 
   spinlock_acquire(&t->files->lock);
@@ -475,7 +475,7 @@ int asc_vfs_file_fd_alloc(unsigned int flags) {
 void asc_vfs_file_fd_install(int fd, void *owner) {
   struct thread *t = sched_get_current();
   vfs_node_t *source = owner;
-  if (!t || !t->files || fd < 0 || fd >= MAX_FDS || !source)
+  if (!t || !t->files || fd < 0 || !FD_IN_RANGE(t, (uint32_t)fd) || !source)
     return;
   spinlock_acquire(&t->files->lock);
   vfs_node_t *node = t->files->reserved_nodes[fd];
@@ -491,6 +491,7 @@ void asc_vfs_file_fd_install(int fd, void *owner) {
   node->wait_queue = source->wait_queue;
   node->mmap_shared_only = source->mmap_shared_only;
   node->mmap_private_pmm_refs = source->mmap_private_pmm_refs;
+  node->mmap_shared_pmm_refs = source->mmap_shared_pmm_refs;
   memcpy(node->name, source->name, sizeof(node->name));
   t->files->reserved_nodes[fd] = NULL;
   t->fd_offsets[fd] = 0;
@@ -503,7 +504,7 @@ void *asc_vfs_fd_lookup(int fd) {
   struct thread *t = sched_get_current();
   vfs_node_t *node;
 
-  if (!t || !t->files || fd < 0 || fd >= MAX_FDS)
+  if (!t || !t->files || fd < 0 || !FD_IN_RANGE(t, (uint32_t)fd))
     return NULL;
 
   node = t->fds[fd];
@@ -515,7 +516,7 @@ void *asc_vfs_fd_lookup(int fd) {
 void *asc_vfs_fd_get_node(int fd) {
   struct thread *t = sched_get_current();
   vfs_node_t *node;
-  if (!t || !t->files || fd < 0 || fd >= MAX_FDS)
+  if (!t || !t->files || fd < 0 || !FD_IN_RANGE(t, (uint32_t)fd))
     return NULL;
   spinlock_acquire(&t->files->lock);
   node = t->fds[fd];
@@ -530,7 +531,7 @@ void *asc_vfs_fd_get_node(int fd) {
 int asc_vfs_fd_close(int fd) {
   struct thread *t = sched_get_current();
   vfs_node_t *node;
-  if (!t || !t->files || fd < 0 || fd >= MAX_FDS)
+  if (!t || !t->files || fd < 0 || !FD_IN_RANGE(t, (uint32_t)fd))
     return -9;
   spinlock_acquire(&t->files->lock);
   node = t->fds[fd];

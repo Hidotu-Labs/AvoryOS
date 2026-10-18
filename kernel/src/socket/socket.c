@@ -716,7 +716,7 @@ int socket_alloc_fd(socket_t *sock) {
  * and closing/replacing a descriptor must not free a socket during lookup. */
 socket_t *socket_from_fd(int fd) {
   struct thread *t = sched_get_current();
-  if (!t || !t->files || fd < 0 || fd >= MAX_FDS)
+  if (!t || !t->files || fd < 0 || !FD_IN_RANGE(t, (uint32_t)fd))
     return NULL;
 
   spinlock_acquire(&t->files->lock);
@@ -745,7 +745,7 @@ void socket_fd_put(socket_t *sock) {
 
 int socket_close_fd(int fd) {
   struct thread *t = sched_get_current();
-  if (!t || !t->files || fd < 0 || fd >= MAX_FDS)
+  if (!t || !t->files || fd < 0 || !FD_IN_RANGE(t, (uint32_t)fd))
     return -9;
   spinlock_acquire(&t->files->lock);
   vfs_node_t *node = t->fds[fd];

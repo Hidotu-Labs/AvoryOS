@@ -578,6 +578,10 @@ static int32_t ioring_do_close(struct thread *t, ioring_ctx_t *ctx,
   if (fd < 0 || fd >= MAX_FDS || !t || !t->files)
     return -9;
   spinlock_acquire(&t->files->lock);
+  if ((uint32_t)fd >= t->files->capacity) {
+    spinlock_release(&t->files->lock);
+    return -9;
+  }
   vfs_node_t *node = t->fds[fd];
   if (!fd_is_valid_node(node)) {
     spinlock_release(&t->files->lock);

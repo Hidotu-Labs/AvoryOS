@@ -35,7 +35,8 @@ static uint64_t socket_eno_notsock(int fd) {
   bool fd_exists = false;
   if (current && current->files && fd >= 0 && fd < MAX_FDS) {
     spinlock_acquire(&current->files->lock);
-    fd_exists = fd_is_valid_node(current->fds[fd]);
+    if ((uint32_t)fd < current->files->capacity)
+      fd_exists = fd_is_valid_node(current->fds[fd]);
     spinlock_release(&current->files->lock);
   }
   return fd_exists ? (uint64_t)-88 : (uint64_t)-9;
@@ -349,7 +350,7 @@ static uint64_t sys_accept_impl(uint64_t sockfd, uint64_t addr_ptr,
     return (uint64_t)newfd;
   }
 
-  if (t && newfd < MAX_FDS) {
+  if (FD_IN_RANGE(t, newfd)) {
     if (flags & SOCK_CLOEXEC)
       t->fd_flags[newfd] |= SOCKET_FD_FLAGS_CLOEXEC_BIT;
     if (flags & SOCK_NONBLOCK)

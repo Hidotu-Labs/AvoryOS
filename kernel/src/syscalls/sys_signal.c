@@ -1552,7 +1552,7 @@ static uint32_t signalfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     // No signals: honour O_NONBLOCK like eventfd/timerfd do.
     int sig_fd = -1;
     if (t) {
-      for (int i = 0; i < MAX_FDS; i++) {
+      for (uint32_t i = 0; i < t->fd_capacity; i++) {
         if (t->fds[i] == node) {
           sig_fd = i;
           break;
@@ -1604,23 +1604,39 @@ static void signal_notify_signalfds(struct thread *t, int sig) {
   if (!t || sig <= 0 || sig > 64)
     return;
 
-  /* Exit teardown clears the shared descriptor table before every possible
-   * asynchronous signal source (notably ITIMER_REAL) has observed the dead
-   * state.  There can be no signalfd to notify once the table is detached. */
-  if (!t->fds)
-    return;
-
-  // Find all signalfds in this thread and wake them
-  for (int i = 0; i < MAX_FDS; i++) {
-    vfs_node_t *node = t->fds[i];
-    if (fd_is_valid_node(node) && node->read == signalfd_read) {
-      signalfd_ctx_t *ctx = (signalfd_ctx_t *)node->device;
-      if (ctx && (ctx->mask & (1ULL << (sig - 1)))) {
-        // Wake up poll() and read() waiters
-        wait_queue_wake_all(&ctx->wq);
-        // Wake up epoll() waiters
-        epoll_notify_event(node, POLLIN);
+  extern spinlock_t tid_lock;
+  /* Pin matching nodes while both table attachment and descriptor slots are
+   * stable. Exit detaches under tid_lock, and close/dup mutate under files->lock.
+   * Wake outside those locks: epoll and wait queues have their own lock order. */
+  uint32_t next = 0;
+  while (t->files && next < t->files->capacity) {
+    vfs_node_t *notify[16];
+    unsigned count = 0;
+    spinlock_acquire(&tid_lock);
+    struct fd_table *files = t->files;
+    if (!files) {
+      spinlock_release(&tid_lock);
+      return;
+    }
+    spinlock_acquire(&files->lock);
+    for (; next < files->capacity && count < 16; next++) {
+      vfs_node_t *node = files->fds[next];
+      if (fd_is_valid_node(node) && node->read == signalfd_read) {
+        signalfd_ctx_t *ctx = (signalfd_ctx_t *)node->device;
+        if (ctx && (ctx->mask & (1ULL << (sig - 1)))) {
+          vfs_node_ref(node);
+          notify[count++] = node;
+        }
       }
+    }
+    spinlock_release(&files->lock);
+    spinlock_release(&tid_lock);
+    for (unsigned i = 0; i < count; i++) {
+      vfs_node_t *node = notify[i];
+      signalfd_ctx_t *ctx = (signalfd_ctx_t *)node->device;
+      wait_queue_wake_all(&ctx->wq);
+      epoll_notify_event(node, POLLIN);
+      vfs_close(node);
     }
   }
 }
@@ -1664,7 +1680,7 @@ static uint64_t sys_signalfd4(uint64_t fd, uint64_t mask_ptr, uint64_t sizemask,
     mask = *(uint64_t *)mask_ptr;
 
   // If fd != -1, update existing signalfd
-  if ((int64_t)fd >= 0 && fd < MAX_FDS && fd_is_valid_node(t->fds[fd])) {
+  if (FD_IN_RANGE(t, fd) && fd_is_valid_node(t->fds[fd])) {
     vfs_node_t *node = t->fds[fd];
     if (node->read == signalfd_read) {
       signalfd_ctx_t *ctx = (signalfd_ctx_t *)node->device;

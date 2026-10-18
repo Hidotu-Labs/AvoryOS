@@ -3,18 +3,19 @@
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SYSROOT="${ROOT_DIR}/build/alpine/rootfs"
-LOCAL_CC="${ROOT_DIR}/toolchain/x86_64-linux-musl/bin/x86_64-linux-musl-gcc"
+LOCAL_CC="${ROOT_DIR}/toolchain/x86_64-linux-glibc/bin/x86_64-linux-gcc"
 if [ -x "$LOCAL_CC" ]; then
     CC="$LOCAL_CC"
-elif command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
-    CC="x86_64-linux-musl-gcc"
+elif [ -x "${ROOT_DIR}/toolchain/x86_64-linux-glibc/bin/x86_64-buildroot-linux-gnu-gcc" ]; then
+    CC="${ROOT_DIR}/toolchain/x86_64-linux-glibc/bin/x86_64-buildroot-linux-gnu-gcc"
+elif command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
+    CC="x86_64-linux-gnu-gcc"
 else
-    echo "Error: x86_64-linux-musl-gcc not found. Run scripts/musl-toolchain.sh first." >&2
-    exit 1
+    CC="gcc"
 fi
 
 if [ ! -d "$SYSROOT" ]; then
-    echo "Error: Alpine rootfs not found. Run scripts/setup-arch.sh first."
+    echo "Error: Rootfs not found. Run scripts/setup-arch.sh first."
     exit 1
 fi
 
@@ -49,12 +50,12 @@ LIBS=(
 )
 
 echo "[*] Compiling userland/about.c ..."
-if $CC -O2 \
+if $CC --sysroot="${SYSROOT}" -O2 \
     "${ROOT_DIR}/userland/about.c" \
     -o "${ROOT_DIR}/userland/about.elf" \
     "${INCLUDES[@]}" \
     "${LIBS[@]}" \
-    -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+    -Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
     -Wl,-rpath,/usr/lib \
     -Wl,-rpath-link,${SYSROOT}/usr/lib:${SYSROOT}/lib; then
     echo "[SUCCESS] Built userland/about.elf"

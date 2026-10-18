@@ -52,8 +52,8 @@ static uint32_t fifo_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint
         struct thread *t = sched_get_current();
         int fd = -1;
         if (t) {
-            for (int i = 0; i < MAX_FDS; i++) {
-                if (t->fds[i] == node) { fd = i; break; }
+            for (uint32_t i = 0; i < t->fd_capacity; i++) {
+                if (t->fds[i] == node) { fd = (int)i; break; }
             }
         }
         // If no writers remain, an empty FIFO yields EOF (0)
@@ -89,6 +89,7 @@ static uint32_t fifo_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint
     }
 
     vfs_node_t storage = {0};
+    storage.flags = FS_PIPE;
     storage.device = &fifo->ramfs;
     storage.length = fifo->length;
     int32_t ret = (int32_t)ramfs_read(&storage, fifo->read_offset, size, buffer);
@@ -98,6 +99,9 @@ static uint32_t fifo_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint
         if (fifo->read_offset >= fifo->length) {
             fifo->read_offset = 0;
             fifo->length = 0;
+            if (fifo->writers == 0 || fifo->ramfs.data_is_pmm || fifo->ramfs.capacity > 4096) {
+                ramfs_free_file_data(&fifo->ramfs);
+            }
         }
         wnode = fifo->writers > 0 ? fifo->write_node : NULL;
         wait_queue_wake_all(&fifo->data_wq);
@@ -130,8 +134,8 @@ static uint32_t fifo_write(vfs_node_t *node, uint32_t offset, uint32_t size, uin
         struct thread *t = sched_get_current();
         int fd = -1;
         if (t) {
-            for (int i = 0; i < MAX_FDS; i++) {
-                if (t->fds[i] == node) { fd = i; break; }
+            for (uint32_t i = 0; i < t->fd_capacity; i++) {
+                if (t->fds[i] == node) { fd = (int)i; break; }
             }
         }
         if (t && fd != -1 && (t->fd_flags[fd] & O_NONBLOCK)) {
@@ -174,9 +178,13 @@ static uint32_t fifo_write(vfs_node_t *node, uint32_t offset, uint32_t size, uin
         }
         fifo->length = unread;
         fifo->read_offset = 0;
+        if (unread == 0 && (fifo->ramfs.data_is_pmm || fifo->ramfs.capacity > 4096)) {
+            ramfs_free_file_data(&fifo->ramfs);
+        }
     }
 
     vfs_node_t storage = {0};
+    storage.flags = FS_PIPE;
     storage.device = &fifo->ramfs;
     storage.length = fifo->length;
     int32_t ret = (int32_t)ramfs_write(&storage, fifo->length, size, buffer);
@@ -245,7 +253,7 @@ static int fifo_ioctl(vfs_node_t *node, uint32_t request, uint64_t arg) {
         }
         struct thread *t = sched_get_current();
         if (t) {
-            for (int i = 0; i < MAX_FDS; i++) {
+            for (uint32_t i = 0; i < t->fd_capacity; i++) {
                 if (t->fds[i] == node) {
                     if (*val)
                         t->fd_flags[i] |= O_NONBLOCK;
@@ -284,7 +292,10 @@ static void fifo_close(vfs_node_t *node) {
         }
         wait_queue_wake_all(&fifo->data_wq);
         wait_queue_wake_all(&fifo->open_wq);
-        if (fifo->readers == 0 && fifo->writers == 0) {
+        if (fifo->writers == 0 && fifo->length == 0 && fifo->ramfs.data) {
+            fifo->read_offset = 0;
+            ramfs_free_file_data(&fifo->ramfs);
+        } else if (fifo->readers == 0 && fifo->writers == 0) {
             fifo->read_offset = 0;
             fifo->length = 0;
             ramfs_free_file_data(&fifo->ramfs);

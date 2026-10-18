@@ -972,7 +972,7 @@ void isr_report_user_fault(struct registers *regs, int sig,
       if (current->files) {
         klog_puts(KLOG_CLR_CYAN "OPEN DESCRIPTORS (FDS):\n" KLOG_CLR_RESET);
         int fd_count = 0;
-        for (int fd = 0; fd < MAX_FDS && fd_count < 16; fd++) {
+        for (uint32_t fd = 0; fd < current->files->capacity && fd_count < 16; fd++) {
           vfs_node_t *node = current->files->fds[fd];
           if (node) {
             fd_count++;

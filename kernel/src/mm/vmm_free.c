@@ -133,8 +133,11 @@ void vmm_free_user_pages_vma(uint64_t cr3, struct vma_list *vmas) {
                         ((uint64_t)k << 21);
           struct vma *v = vma_find(vmas, va);
           if (v && (v->flags & MAP_SHARED)) {
-            pd_virt[k] = 0;
-            continue; // shared device page — do NOT free
+            vfs_node_t *file = (vfs_node_t *)v->file_node;
+            if (!(file && file->mmap_shared_pmm_refs)) {
+              pd_virt[k] = 0;
+              continue; // shared device page — do NOT free
+            }
           }
           uint64_t huge_phys = pd_virt[k] & PAGE_MASK;
           for (size_t p = 0; p < 512; p++)
@@ -157,6 +160,10 @@ void vmm_free_user_pages_vma(uint64_t cr3, struct vma_list *vmas) {
           uint64_t va = ((uint64_t)i << 39) | ((uint64_t)j << 30) |
                         ((uint64_t)k << 21) | ((uint64_t)l << 12);
           struct vma *v = vma_find(vmas, va);
+          if (v && (v->flags & MAP_SYSV_SHM)) {
+            pmm_free_page((void *)frame);
+            continue;
+          }
 
           if (v && (v->flags & MAP_PAGECACHE)) {
             /* Generic file mapping: this PTE holds a PMM reference to its
@@ -174,8 +181,15 @@ void vmm_free_user_pages_vma(uint64_t cr3, struct vma_list *vmas) {
           }
 
           if (v && (v->flags & MAP_SHARED)) {
-            /* Device-backed shared mappings (memfd/GEM/framebuffer) do not take
-             * a per-PTE PMM reference; their backing object owns the frame. */
+            vfs_node_t *file = (vfs_node_t *)v->file_node;
+            if (!(file && file->mmap_shared_pmm_refs)) {
+              /* Device-backed shared mappings (GEM/framebuffer) do not take a
+               * per-PTE PMM reference; their backing object owns the frame. */
+              continue;
+            }
+            /* Direct file-backed shared view: this PTE owns a reference. */
+            if (pmm_is_managed(frame))
+              pmm_free_page((void *)frame);
             continue;
           }
 

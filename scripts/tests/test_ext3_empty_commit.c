@@ -57,6 +57,9 @@ static pthread_mutex_t wait_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wait_cond = PTHREAD_COND_INITIALIZER;
 static unsigned slept;
 static _Thread_local bool irq_enabled = true;
+static _Thread_local unsigned ceiling_enters, ceiling_exits;
+void sched_critical_enter(void) { ceiling_enters++; }
+void sched_critical_exit(void) { ceiling_exits++; }
 hal_irq_state_t hal_irq_save(void) { bool old = irq_enabled; irq_enabled = false; return old; }
 void hal_irq_restore(hal_irq_state_t flags) { irq_enabled = flags; }
 static ext2_mount_t *release_on_add;
@@ -408,12 +411,15 @@ int main(void) {
          !mnt->journal.depth);
   puts("PASS empty transaction: no journal/device requests or sequence "
        "advancement");
+  unsigned enters_before = ceiling_enters, exits_before = ceiling_exits;
   assert(ext3_journal_start(mnt) == 0);
   assert(ext3_journal_start(mnt) == 0 && mnt->journal.depth == 2);
+  assert(ceiling_enters == enters_before + 1 && ceiling_exits == exits_before);
   assert(ext3_journal_stop(mnt) == 0 && mnt->journal.depth == 1);
   assert(ext3_journal_stop(mnt) == 0 && !mnt->journal.lock.locked &&
          writes == 0);
   assert(mnt->journal.perf_wait.count == 2 && mnt->journal.perf_hold.count == 2);
+  assert(ceiling_enters == enters_before + 1 && ceiling_exits == exits_before + 1);
   puts("PASS nested empty transactions preserve owner until outer stop; latency counts outer transactions only");
   assert(ext3_journal_start(mnt) == 0);
   unsigned char buf[1024] = {1};

@@ -50,8 +50,10 @@ static uint32_t eventfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
 
     struct thread *t = sched_get_current();
     int fd = -1;
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (t->fds[i] == node) { fd = i; break; }
+    if (t) {
+        for (uint32_t i = 0; i < t->fd_capacity; i++) {
+            if (t->fds[i] == node) { fd = (int)i; break; }
+        }
     }
 
     spinlock_acquire(&ctx->lock);
@@ -284,8 +286,10 @@ static uint32_t timerfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     while (ctx->expirations == 0) {
         struct thread *t = sched_get_current();
         int fd = -1;
-        for (int i = 0; i < MAX_FDS; i++) {
-            if (t->fds[i] == node) { fd = i; break; }
+        if (t) {
+            for (uint32_t i = 0; i < t->fd_capacity; i++) {
+                if (t->fds[i] == node) { fd = (int)i; break; }
+            }
         }
         if (fd != -1 && (t->fd_flags[fd] & 0x800)) {
             spinlock_release(&ctx->lock);
@@ -390,7 +394,7 @@ static uint64_t sys_timerfd_settime(uint64_t fd, uint64_t flags_arg,
                                      uint64_t a5) {
     (void)a4; (void)a5;
     struct thread *t = sched_get_current();
-    if (!t || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
+    if (!FD_IN_RANGE(t, fd) || !t->fds[fd]) return (uint64_t)-9;
 
     vfs_node_t    *node = t->fds[fd];
     timerfd_ctx_t *ctx  = (timerfd_ctx_t *)node->device;
@@ -448,7 +452,7 @@ static uint64_t sys_timerfd_gettime(uint64_t fd, uint64_t curr_value_ptr,
                                      uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
     struct thread *t = sched_get_current();
-    if (!t || fd >= MAX_FDS || !t->fds[fd]) return (uint64_t)-9;
+    if (!FD_IN_RANGE(t, fd) || !t->fds[fd]) return (uint64_t)-9;
 
     timerfd_ctx_t *ctx = (timerfd_ctx_t *)t->fds[fd]->device;
     if (!ctx || !curr_value_ptr ||
@@ -509,8 +513,10 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     while (ctx->read_offset >= ctx->length) {
         struct thread *t = sched_get_current();
         int fd = -1;
-        for (int i = 0; i < MAX_FDS; i++) {
-            if (t->fds[i] == node) { fd = i; break; }
+        if (t) {
+            for (uint32_t i = 0; i < t->fd_capacity; i++) {
+                if (t->fds[i] == node) { fd = (int)i; break; }
+            }
         }
         /* EOF takes precedence over O_NONBLOCK/EAGAIN. */
         if (!ctx->writer_open) { spinlock_release(&ctx->lock); return 0; }
@@ -539,6 +545,7 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     }
 
     vfs_node_t storage = {0};
+    storage.flags = FS_PIPE;
     storage.device = &ctx->ramfs;
     storage.length = ctx->length;
     int32_t ret = (int32_t)ramfs_read(&storage, ctx->read_offset, size, buffer);
@@ -548,6 +555,9 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
         if (ctx->read_offset >= ctx->length) {
             ctx->read_offset = 0;
             ctx->length = 0;
+            if (!ctx->writer_open || ctx->ramfs.data_is_pmm || ctx->ramfs.capacity > 4096) {
+                ramfs_free_file_data(&ctx->ramfs);
+            }
         }
         wnode = ctx->writer_open ? ctx->write_node : NULL;
         wait_queue_wake_all(&ctx->wq);
@@ -578,8 +588,10 @@ static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
     while ((ctx->length - ctx->read_offset) >= 65536) {
         struct thread *t = sched_get_current();
         int fd = -1;
-        for (int i = 0; i < MAX_FDS; i++) {
-            if (t->fds[i] == node) { fd = i; break; }
+        if (t) {
+            for (uint32_t i = 0; i < t->fd_capacity; i++) {
+                if (t->fds[i] == node) { fd = (int)i; break; }
+            }
         }
         if (fd != -1 && (t->fd_flags[fd] & 0x800)) {
             spinlock_release(&ctx->lock);
@@ -621,9 +633,13 @@ static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
         }
         ctx->length = unread;
         ctx->read_offset = 0;
+        if (unread == 0 && (ctx->ramfs.data_is_pmm || ctx->ramfs.capacity > 4096)) {
+            ramfs_free_file_data(&ctx->ramfs);
+        }
     }
 
     vfs_node_t storage = {0};
+    storage.flags = FS_PIPE;
     storage.device = &ctx->ramfs;
     storage.length = ctx->length;
     int32_t ret = (int32_t)ramfs_write(&storage, ctx->length, size, buffer);
@@ -674,6 +690,9 @@ static void pipe_close(vfs_node_t *node) {
         ctx->write_node = NULL;
         if (ctx->reader_open && ctx->read_node)
             notify_read = ctx->read_node;
+        if (ctx->length == 0 && ctx->ramfs.data) {
+            ramfs_free_file_data(&ctx->ramfs);
+        }
     } else {
         ctx->reader_open = false;
         ctx->read_node = NULL;
@@ -735,7 +754,7 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
         return (uint64_t)-22; // EINVAL: unknown flag bits
 
     struct thread *t = sched_get_current();
-    if (!t || fd_in >= MAX_FDS || fd_out >= MAX_FDS || !fd_is_valid_node(t->fds[fd_in]) ||
+    if (!FD_IN_RANGE(t, fd_in) || !FD_IN_RANGE(t, fd_out) || !fd_is_valid_node(t->fds[fd_in]) ||
         !fd_is_valid_node(t->fds[fd_out]))
         return (uint64_t)-9; // EBADF
 
@@ -826,6 +845,7 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
         uint32_t chunk = (want - done > TEE_CHUNK) ? TEE_CHUNK
                                                    : (uint32_t)(want - done);
         vfs_node_t in_storage = {0};
+        in_storage.flags = FS_PIPE;
         in_storage.device = &in_ctx->ramfs;
         in_storage.length = in_ctx->length;
         int32_t got = (int32_t)ramfs_read(&in_storage,
@@ -837,6 +857,7 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
             break;
         }
         vfs_node_t out_storage = {0};
+        out_storage.flags = FS_PIPE;
         out_storage.device = &out_ctx->ramfs;
         out_storage.length = out_ctx->length;
         int32_t put = (int32_t)ramfs_write(&out_storage, out_ctx->length,
@@ -1087,7 +1108,7 @@ static uint32_t inotify_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     if (size < 16) return (uint32_t)-22;
     struct thread *t = sched_get_current();
     int fd = -1;
-    if (t) for (int i = 0; i < MAX_FDS; i++) if (t->fds[i] == node) { fd = i; break; }
+    if (t) for (uint32_t i = 0; i < t->fd_capacity; i++) if (t->fds[i] == node) { fd = (int)i; break; }
     uint32_t capacity = size < sizeof(instance->event_queue) ? size : sizeof(instance->event_queue);
     uint8_t *staging = kmalloc(capacity);
     if (!staging) return (uint32_t)-12;
@@ -1133,6 +1154,10 @@ static uint32_t inotify_read(vfs_node_t *node, uint32_t offset, uint32_t size,
 static vfs_node_t *inotify_pin_fd(struct thread *t, uint64_t fd) {
     if (!t || !t->files || fd >= MAX_FDS) return NULL;
     spinlock_acquire(&t->files->lock);
+    if (fd >= t->files->capacity) {
+        spinlock_release(&t->files->lock);
+        return NULL;
+    }
     vfs_node_t *node = t->fds[fd];
     if (!node || node == FD_RESERVED || node->read != inotify_read) node = NULL;
     else vfs_node_ref(node);
@@ -1380,10 +1405,18 @@ static uint64_t memfd_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
         if (data_off >= file->capacity) break;
         uint64_t kva  = (uint64_t)(file->data + data_off);
         uint64_t phys = kva - hhdm;
-        /* Private PTEs own references that teardown/CoW will release.
-         * Shared mappings retain the file's ownership convention. */
-        if (private_mapping)
+        /* Every installed PTE owns a reference.  Private PTEs need it because
+         * teardown/CoW releases it; shared PTEs need it because the file's
+         * storage reference only covers the block itself, and memfd growth
+         * reallocates and releases that block while mappings may still be
+         * live.  Re-mapping the same frame at the same address (mremap grow)
+         * already owns a reference and must not take a second one. */
+        if (private_mapping) {
             pmm_incref((void *)phys);
+        } else if (pmm_is_managed(phys) &&
+                   vmm_virt_to_phys(pml4, vaddr + off) != phys) {
+            pmm_incref((void *)phys);
+        }
         vmm_map_page(pml4, vaddr + off, phys, page_flags);
     }
 
@@ -1432,6 +1465,7 @@ static uint64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags_arg,
     node->mmap      = memfd_mmap;
     node->mmap_shared_only = false;
     node->mmap_private_pmm_refs = true;
+    node->mmap_shared_pmm_refs = true;
     node->close     = memfd_close;
 
     t->fds[fd]        = node;

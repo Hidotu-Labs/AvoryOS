@@ -25,6 +25,7 @@ struct sched_entity {
     int8_t   nice_value;          /* Nice value [-20, 19] */
     bool     on_rq;               /* True if entity is currently in runqueue tree */
     bool     custom_slice;        /* True if userland/thread requested custom slice */
+    uint16_t critical_depth;     /* Nested kernel priority-ceiling scopes. */
 };
 
 typedef struct sched_entity sched_entity_t;

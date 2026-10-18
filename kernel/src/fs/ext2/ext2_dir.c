@@ -123,10 +123,8 @@ vfs_node_t *ext2_finddir_impl(vfs_node_t *node, char *name) {
         result->name[copy_len] = '\0';
       }
       return result;
-    } else if (found_ino == 0) {
-      return NULL;
     }
-    /* found_ino < 0: fallback to linear scan */
+    /* found_ino <= 0: fallback to linear scan */
   }
 
   uint8_t *block_buf = kmalloc(mnt->block_size);
@@ -192,9 +190,12 @@ int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
   ext2_inode_t dir_inode;
   if (ext2_read_inode(mnt, dir_inode_num, &dir_inode))
     return -1;
-  if (dir_inode.i_flags & EXT2_INDEX_FL)
-    return ext4_dx_add_entry(mnt, dir_inode_num, &dir_inode,
-                             child_inode_num, name, file_type);
+  if (dir_inode.i_flags & EXT2_INDEX_FL) {
+    int dx_ret = ext4_dx_add_entry(mnt, dir_inode_num, &dir_inode,
+                                   child_inode_num, name, file_type);
+    if (dx_ret == 0)
+      return 0;
+  }
 
   uint32_t name_len = strlen(name);
   uint32_t needed   = ((8 + name_len) + 3) & ~3u;

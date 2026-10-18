@@ -6,6 +6,15 @@ what is already known about the device.  Written at the Phase 5 closeout
 
 ## Current abrupt-exit recovery work (2026-10-14)
 
+**Post-suspend launch prevention (2026-10-18):** `run-vfio`,
+`run-c7-prime` and the diagnostic launch logger now check the host's suspend
+history before opening a passed-through `1002:164e` device. After resume they
+refuse the launch and request a host reboot. This prevents entering the
+reported host-crashing initialization path through these launchers; it does
+not repair post-resume GPU/firmware state. Other GPUs and software-only QEMU
+guests are unaffected. Direct QEMU invocations bypass this repository check.
+See [post-suspend evidence and limitations](amdgpu-post-suspend-launch-2026-10-18.md).
+
 Raphael PF passthrough now defaults to the combined MODE2 initialization reset
 and checked PSP ring replacement. These hooks are scoped in LinuxKPI; imported
 AMDGPU sources were preserved. X-close and Ctrl-C/reopen physical pairs passed
@@ -297,8 +306,8 @@ glxinfo -B
 glxgears
 ```
 
-The legacy `startx.sh` regenerates its own Xorg configuration; use the distro
-launchers above for this static configuration.
+The retired `startx.sh` regenerated its own Xorg configuration; use the
+distro launchers above for this static configuration.
 
 Xorg's modesetting output sink imports AMD's dma-buf and creates its framebuffer
 with legacy ADDFB. That path must prepare the VirtIO resource and contiguous

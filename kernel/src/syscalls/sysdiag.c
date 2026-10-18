@@ -866,11 +866,16 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
                regs->rsi == 6 /* IPPROTO_TCP / SOL_TCP */ &&
                regs->rdx == 1 /* TCP_NODELAY */) {
       severe = false;
-    } else if (syscall_num == 303 /* name_to_handle_at */ && error_code == -95 /* EOPNOTSUPP */) {
+    } else if ((syscall_num == 303 /* name_to_handle_at */ ||
+                syscall_num == 304 /* open_by_handle_at */) &&
+               error_code == -95 /* EOPNOTSUPP */) {
+      severe = false;
+    } else if (syscall_num == 227 /* clock_settime */ && error_code == -1 /* EPERM */) {
+      /* No RTC write path in AvoryOS. */
       severe = false;
     } else if (syscall_num == 16 /* ioctl */ && error_code == -25 &&
                (uint32_t)regs->rsi == 0x540B /* TCFLSH */ &&
-               regs->rdi < MAX_FDS) {
+               FD_IN_RANGE(t, regs->rdi)) {
       vfs_node_t *node = t->fds[regs->rdi];
       if (fd_is_valid_node(node) && (node->flags & FS_TYPE_MASK) == FS_CHARDEV &&
           (strcmp(node->name, "event0") == 0 ||
@@ -908,9 +913,12 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
                 syscall_num == 431 /* fsconfig */ ||
                 syscall_num == 432 /* fsmount */ ||
                 syscall_num == 433 /* fspick */ ||
-                syscall_num == 442 /* mount_setattr */)) {
-      /* New mount API: deliberate stubs (no fs-context support yet).
-       * libmount falls back to legacy mount(2) on ENOSYS. */
+                syscall_num == 442 /* mount_setattr */ ||
+                syscall_num == 323 /* userfaultfd */ ||
+                syscall_num == 444 /* landlock_create_ruleset */ ||
+                syscall_num == 445 /* landlock_add_rule */ ||
+                syscall_num == 446 /* landlock_restrict_self */)) {
+      /* Deliberate stubs (no fs-context, userfaultfd, or landlock yet). */
       severe = false;
     } else if (error_code == -38 /* ENOSYS */ &&
                (syscall_num == 425 /* io_uring_setup */ ||

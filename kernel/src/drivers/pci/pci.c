@@ -336,12 +336,88 @@ uint8_t asc_pci_find_capability(struct pci_device *dev, uint8_t cap_id) {
   return 0;
 }
 
-static uint64_t pci_bar_phys(struct pci_device *dev, uint8_t bir) {
+uint64_t pci_bar_phys(struct pci_device *dev, uint8_t bir) {
   if (!dev || bir >= 6 || (dev->bar[bir] & 1U)) return 0;
   uint64_t phys = dev->bar[bir] & ~0xFULL;
   if (((dev->bar[bir] >> 1) & 3U) == 2U && bir < 5)
     phys |= (uint64_t)dev->bar[bir + 1] << 32;
   return phys;
+}
+
+void *pci_map_mmio(uint64_t phys, uint64_t length) {
+  if (!phys || !length)
+    return NULL;
+
+  uint64_t hhdm = pmm_get_hhdm_offset();
+  uint64_t first = phys & ~0xFFFULL;
+  uint64_t last = (phys + length - 1) & ~0xFFFULL;
+  uint64_t *pml4 = vmm_get_active_pml4();
+  uint64_t flags = PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_PCD |
+                   PAGE_FLAG_PWT | PAGE_FLAG_NX;
+
+  uint64_t page = first;
+  while (page <= last) {
+    uint64_t virt = page + hhdm;
+    uint64_t remaining = (last - page) + PAGE_SIZE;
+
+    /* 2 MB huge page optimization: if both phys and virt are 2 MB aligned
+     * and at least 2 MB remains, attempt a huge page PDE mapping. */
+    if ((page & 0x1FFFFFULL) == 0 &&
+        (virt & 0x1FFFFFULL) == 0 &&
+        remaining >= 0x200000ULL) {
+      if (vmm_map_huge_page(pml4, virt, page, flags)) {
+        page += 0x200000ULL;
+        continue;
+      }
+    }
+
+    /* 4 KB fallback / boundary mapping */
+    if (!vmm_virt_to_phys(pml4, virt) &&
+        !vmm_map_page(pml4, virt, page, flags)) {
+      klogf("[PCI] Failed to map MMIO page phys=0x%llx virt=0x%llx\n",
+            (unsigned long long)page, (unsigned long long)virt);
+      return NULL;
+    }
+    page += PAGE_SIZE;
+  }
+
+  return (void *)(phys + hhdm);
+}
+
+void *pci_map_bar(struct pci_device *dev, int bar_idx, uint64_t *out_size) {
+  if (!dev || bar_idx < 0 || bar_idx >= 6)
+    return NULL;
+
+  if (dev->bar[bar_idx] & 1U) {
+    /* I/O port BAR, not MMIO */
+    return NULL;
+  }
+
+  uint64_t phys = pci_bar_phys(dev, (uint8_t)bar_idx);
+  if (!phys)
+    return NULL;
+
+  uint64_t size = dev->bar_size[bar_idx];
+  if (!size) {
+    size = pci_probe_bar_size(dev->bus, dev->slot, dev->func, (uint8_t)bar_idx,
+                              dev->bar[bar_idx]);
+    dev->bar_size[bar_idx] = size;
+  }
+
+  if (out_size)
+    *out_size = size;
+
+  if (!size)
+    return NULL;
+
+  /* Cap absurd BAR sizes to prevent unbounded loops */
+  if (size > (1024ULL * 1024 * 1024)) {
+    klogf("[PCI] Refusing unreasonable BAR%d size: 0x%llx\n",
+          bar_idx, (unsigned long long)size);
+    return NULL;
+  }
+
+  return pci_map_mmio(phys, size);
 }
 
 bool pci_msix_init(struct pci_device *dev, struct pci_msix *msix) {
@@ -355,17 +431,9 @@ bool pci_msix_init(struct pci_device *dev, struct pci_msix *msix) {
   uint64_t table_phys = pci_bar_phys(dev, bir) + (table_info & ~7U);
   uint16_t count = (control & 0x7FFU) + 1U;
   if (!table_phys || !count) return false;
-  uint64_t first = table_phys & ~(PAGE_SIZE - 1ULL);
-  uint64_t last = (table_phys + (uint64_t)count * 16U - 1U) & ~(PAGE_SIZE - 1ULL);
+  if (!pci_map_mmio(table_phys, (uint64_t)count * 16U))
+    return false;
   uint64_t hhdm = pmm_get_hhdm_offset();
-  uint64_t *pml4 = vmm_get_active_pml4();
-  uint64_t flags = PAGE_FLAG_PRESENT | PAGE_FLAG_RW | (1ULL << 3) | (1ULL << 4);
-  for (uint64_t page = first; page <= last; page += PAGE_SIZE) {
-    uint64_t virt = page + hhdm;
-    if (!vmm_virt_to_phys(pml4, virt) && !vmm_map_page(pml4, virt, page, flags))
-      return false;
-    vmm_flush_tlb(virt);
-  }
   msix->dev = dev;msix->capability = cap;msix->table_size = count;
   msix->table = (volatile uint32_t *)(table_phys + hhdm);msix->initialized = true;
   /* Function-mask while callers populate entries. */

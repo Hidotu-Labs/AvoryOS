@@ -4,13 +4,15 @@
 #include "../fb/terminal.h"
 #include "../lock/spinlock.h"
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifndef PTY_DEBUG_LOGGING
 #define PTY_DEBUG_LOGGING 0
 #endif
 
-#define PTY_MAX_PAIRS 16
+#define PTY_MAX_PAIRS 4096
+#define PTY_DEFAULT_CAPACITY 64
 #define PTY_BUFFER_SIZE 4096
 
 // Terminal ioctl commands (Linux x86_64 compatible)
@@ -49,7 +51,7 @@ struct vfs_node;
 typedef struct pty_pair {
   void *devpts_instance; /* NULL for the initial /dev/pts instance. */
   uint32_t devpts_uid, devpts_gid;
-  int index;            // PTY index (0-15)
+  int index;            // PTY index
   bool allocated;       // Is this pair in use?
   bool locked;          // Is slave locked (cannot be opened)?
   bool master_open;     // Is the master side open?
@@ -62,14 +64,14 @@ typedef struct pty_pair {
   // sees an instant EOF and shows a blank tab while bash is still starting.
   bool slave_ever_opened;
 
-  // Master → Slave buffer (data written by master, read by slave)
-  uint8_t master_to_slave[PTY_BUFFER_SIZE];
+  // Master → Slave buffer (allocated on demand, data written by master, read by slave)
+  uint8_t *master_to_slave;
   uint32_t m2s_head;          // Write position (master writes here)
   uint32_t m2s_tail;          // Read position (slave reads here)
   uint32_t m2s_newline_count; // Number of newlines in m2s buffer
 
-  // Slave → Master buffer (data written by slave, read by master)
-  uint8_t slave_to_master[PTY_BUFFER_SIZE];
+  // Slave → Master buffer (allocated on demand, data written by slave, read by master)
+  uint8_t *slave_to_master;
   uint32_t s2m_head; // Write position (slave writes here)
   uint32_t s2m_tail; // Read position (master reads here)
 
@@ -97,6 +99,15 @@ int pty_alloc_pair(void);
 
 // Get PTY pair by index
 pty_pair_t *pty_get_pair(int index);
+
+// Get current dynamic capacity of PTY table
+int pty_get_table_capacity(void);
+
+// Safe instance match check for devpts readdir without race
+bool pty_is_instance_match(int index, void *devpts_instance);
+
+// Shrink unused (drained) PTY ring buffers under memory pressure
+size_t pty_shrink_unused_buffers(void);
 
 // VFS operations for master device (/dev/ptmx)
 uint32_t ptmx_read(struct vfs_node *node, uint32_t offset, uint32_t size,

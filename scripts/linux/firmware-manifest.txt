@@ -5,7 +5,7 @@
 # build/firmware/lib/firmware/, which the top-level GNUmakefile installs at
 # /lib/firmware in the disk image (Phase 6 C4).
 #
-# Pinned ref: linux-firmware 20260910 (LINUX_FIRMWARE_REF in the install
+# Pinned ref: linux-firmware 20260916 (LINUX_FIRMWARE_REF in the install
 # script).  Keep this list exact: shipping the whole linux-firmware tree is
 # hundreds of megabytes, and amdgpu only needs its own blobs.  Add names in
 # the same change as the boot that requests them; the Phase 5 firmware

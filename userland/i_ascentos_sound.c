@@ -1,4 +1,4 @@
-// i_ascentos_sound_midiplay.c — AscentOS sound backend for doomgeneric
+// i_ascentos_sound.c — AscentOS sound backend for doomgeneric
 // Cleaned up version supporting only SFX (monster sounds) for now.
 
 #include <fcntl.h>

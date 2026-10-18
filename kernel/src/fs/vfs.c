@@ -982,7 +982,7 @@ uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
 }
 
 void vfs_open(vfs_node_t *node) {
-  if (!node)
+  if (!node || node == (vfs_node_t *)-1)
     return;
   vfs_node_ref(node);
   if (node->open) {
@@ -991,7 +991,7 @@ void vfs_open(vfs_node_t *node) {
 }
 
 void vfs_close(vfs_node_t *node) {
-  if (!node)
+  if (!node || node == (vfs_node_t *)-1)
     return;
 
   bool is_pipe = (node->flags & FS_TYPE_MASK) == FS_PIPE;
@@ -1010,8 +1010,9 @@ void vfs_close(vfs_node_t *node) {
     }
     vfs_cache_sync(node);
     vfs_cache_clear(node);
-    node->ep_watchers.next = NULL;
-    node->ep_watchers.prev = NULL;
+    spinlock_acquire(&node->ep_lock);
+    INIT_LIST_HEAD(&node->ep_watchers);
+    spinlock_release(&node->ep_lock);
     /* A node whose name was removed while descriptors still referenced it:
      * the last close releases the filesystem-private payload exactly once. */
     if ((node->flags & (FS_DELETED | FS_AUTODESTROY)) && node->destroy) {
@@ -1679,6 +1680,24 @@ reset_walk:
       if (++symlink_depth > MAX_SYMLINK_DEPTH) {
         vfs_close(next);
         goto fail;
+      }
+
+      if (next->get_link) {
+        vfs_node_t *target = next->get_link(next);
+        vfs_close(next);
+        if (!target)
+          goto fail;
+        while (*p == '/')
+          p++;
+        if (!*p) {
+          for (int j = 0; j <= stack_top; j++)
+            vfs_close(parent_stack[j]);
+          vfs_close(current);
+          return target;
+        }
+        vfs_close(current);
+        current = target;
+        continue;
       }
 
       char link_target[512];

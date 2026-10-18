@@ -71,73 +71,17 @@ static uint64_t pci_bar_size(struct pci_device *pci, int bar_idx) {
 // of the driver code can use a uniform translation.
 // Returns kernel virtual address, or 0 on failure.
 static uint64_t map_bar(struct pci_device *pci, int bar_idx, uint64_t *out_size) {
-  uint32_t bar_lo = pci->bar[bar_idx];
-
-  if (bar_lo & 1) {
-    // IO BAR — not memory mapped, use port I/O
-    klog_puts("[VIRTIO-PCI] BAR");
-    klog_putchar('0' + bar_idx);
-    klog_puts(" is I/O — skipping\n");
+  void *mapped = pci_map_bar(pci, bar_idx, out_size);
+  if (!mapped)
     return 0;
-  }
-
-  uint64_t phys = bar_lo & 0xFFFFFFF0;
-  int type = (bar_lo >> 1) & 3;
-
-  if (type == 2 && bar_idx < 5) {
-    // 64-bit BAR
-    phys |= ((uint64_t)pci->bar[bar_idx + 1] << 32);
-  }
-
-  uint64_t size = pci_bar_size(pci, bar_idx);
-  if (out_size) *out_size = size;
-
-  if (size == 0 || phys == 0) return 0;
-
-  // VirtIO capability BARs are small. Refuse absurd results so a broken
-  // device or probe can never turn this into an unbounded mapping loop.
-  if (size > (256ULL * 1024 * 1024)) {
-    klog_puts("[VIRTIO-PCI] Refusing unreasonable BAR size: ");
-    klog_hex64(size);
-    klog_puts("\n");
-    return 0;
-  }
-
-  // Map each page of the BAR into kernel address space.
-  // We place it at the HHDM address (phys + hhdm_offset) for consistency,
-  // but since MMIO isn't covered by Limine's HHDM we create the entries
-  // ourselves with PWT+PCD (write-through, cache-disable) for MMIO safety.
-  uint64_t hhdm = pmm_get_hhdm_offset();
-  uint64_t virt_base = phys + hhdm;
-  uint64_t num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-  uint64_t *pml4 = vmm_get_active_pml4();
-
-  // PWT (bit 3) + PCD (bit 4) = uncacheable/write-through for MMIO
-  uint64_t flags = PAGE_FLAG_PRESENT | PAGE_FLAG_RW | (1ULL << 3) | (1ULL << 4);
-
-  for (uint64_t i = 0; i < num_pages; i++) {
-    uint64_t p = phys + i * PAGE_SIZE;
-    uint64_t v = virt_base + i * PAGE_SIZE;
-    if (!vmm_map_page(pml4, v, p, flags)) {
-      klog_puts("[VIRTIO-PCI] FATAL: vmm_map_page failed for BAR\n");
-      return 0;
-    }
-    vmm_flush_tlb(v);
-  }
 
   klog_puts("[VIRTIO-PCI] BAR");
   klog_putchar('0' + bar_idx);
-  klog_puts(" phys=");
-  klog_hex64(phys);
-  klog_puts(" size=");
-  klog_hex32((uint32_t)size);
-  klog_puts(" mapped ");
-  klog_uint64(num_pages);
-  klog_puts(" pages at virt=");
-  klog_hex64(virt_base);
+  klog_puts(" mapped at virt=");
+  klog_hex64((uint64_t)mapped);
   klog_puts("\n");
 
-  return virt_base;
+  return (uint64_t)mapped;
 }
 
 // PCI Capability Walking

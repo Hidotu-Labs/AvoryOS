@@ -481,3 +481,44 @@ uint64_t kmem_cache_total_active(void) {
   spinlock_release(&slab_global_lock);
   return total;
 }
+
+uint64_t kmem_cache_total_slabs(void) {
+  uint64_t total = 0;
+  spinlock_acquire(&slab_global_lock);
+  for (int i = 0; i < SLAB_CACHE_MAX_CACHES; i++) {
+    if (cache_used[i]) {
+      total += cache_pool[i].total_slabs;
+    }
+  }
+  spinlock_release(&slab_global_lock);
+  return total;
+}
+
+uint64_t kmem_cache_free_slabs(void) {
+  uint64_t total = 0;
+  spinlock_acquire(&slab_global_lock);
+  for (int i = 0; i < SLAB_CACHE_MAX_CACHES; i++) {
+    if (cache_used[i]) {
+      for (struct slab_page *s = cache_pool[i].slabs_free; s; s = s->next)
+        total++;
+    }
+  }
+  spinlock_release(&slab_global_lock);
+  return total;
+}
+
+uint64_t slab_total_pages(void) {
+  extern uint64_t heap_slab_total_slabs(void) __attribute__((weak));
+  uint64_t total = kmem_cache_total_slabs();
+  if (heap_slab_total_slabs)
+    total += heap_slab_total_slabs();
+  return total;
+}
+
+uint64_t slab_reclaimable_pages(void) {
+  extern uint64_t heap_slab_free_slabs(void) __attribute__((weak));
+  uint64_t total = kmem_cache_free_slabs();
+  if (heap_slab_free_slabs)
+    total += heap_slab_free_slabs();
+  return total;
+}

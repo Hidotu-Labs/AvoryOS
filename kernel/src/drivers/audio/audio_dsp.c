@@ -195,6 +195,7 @@ void audio_dsp_register_vfs(void) {
     mixer_node->flags = FS_CHARDEV;
     mixer_node->mask = 0666;
     mixer_node->length = 0;
+    mixer_node->write = dsp_vfs_write;
     mixer_node->ioctl = dsp_vfs_ioctl;
     mixer_node->poll = dsp_vfs_poll;
     fb_register_device_node("mixer", mixer_node);

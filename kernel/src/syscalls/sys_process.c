@@ -371,7 +371,7 @@ static uint64_t sys_pidfd_send_signal(uint64_t pidfd, uint64_t sig,
   if (info_ptr && !vmm_is_user_addr_range_valid(info_ptr, 128))
     return (uint64_t)-14; // EFAULT
   struct thread *current = sched_get_current();
-  if (!current || pidfd >= MAX_FDS)
+  if (!FD_IN_RANGE(current, pidfd))
     return (uint64_t)-9; // EBADF
   vfs_node_t *node = current->fds[pidfd];
   struct pidfd_ctx *ctx = pidfd_ctx_of(node);
@@ -421,7 +421,7 @@ static uint64_t sys_pidfd_getfd(uint64_t pidfd, uint64_t targetfd,
   if (flags != 0)
     return (uint64_t)-22;
   struct thread *current = sched_get_current();
-  if (!current || pidfd >= MAX_FDS)
+  if (!FD_IN_RANGE(current, pidfd))
     return (uint64_t)-9;
   vfs_node_t *pnode = current->fds[pidfd];
   struct pidfd_ctx *ctx = pidfd_ctx_of(pnode);
@@ -450,7 +450,7 @@ static uint64_t sys_pidfd_getfd(uint64_t pidfd, uint64_t targetfd,
     spinlock_release(&tid_lock);
     return (uint64_t)-1;
   }
-  if (!target->files || !target->fds || targetfd >= MAX_FDS) {
+  if (!target->files || !target->fds || !FD_IN_RANGE(target, targetfd)) {
     spinlock_release(&tid_lock);
     return (uint64_t)-9;
   }
@@ -1080,7 +1080,7 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
 
   if (idtype == P_PIDFD) {
     struct pidfd_ctx *pctx =
-        (id < MAX_FDS && fd_is_valid_node(current->fds[id])) ? pidfd_ctx_of(current->fds[id]) : NULL;
+        (FD_IN_RANGE(current, id) && fd_is_valid_node(current->fds[id])) ? pidfd_ctx_of(current->fds[id]) : NULL;
     if (!pctx)
       return (uint64_t)-9; // EBADF
     target_pid = pctx->pid;
@@ -1248,18 +1248,26 @@ static void exec_close_cloexec(struct thread *t) {
   if (!t || !t->files)
     return;
 
-  for (int fd = 0; fd < MAX_FDS; fd++) {
+  spinlock_acquire(&t->files->lock);
+  uint32_t cap = t->files->capacity;
+  spinlock_release(&t->files->lock);
+
+  for (uint32_t fd = 0; fd < cap; fd++) {
     spinlock_acquire(&t->files->lock);
-    vfs_node_t *node = t->fds[fd];
-    if (!node || node == FD_RESERVED ||
-        !(t->fd_flags[fd] & FD_FLAGS_CLOEXEC_BIT)) {
+    if (fd >= t->files->capacity) {
+      spinlock_release(&t->files->lock);
+      break;
+    }
+    vfs_node_t *node = t->files->fds[fd];
+    if (!fd_is_valid_node(node) ||
+        !(t->files->fd_flags[fd] & FD_FLAGS_CLOEXEC_BIT)) {
       spinlock_release(&t->files->lock);
       continue;
     }
 
-    t->fds[fd] = NULL;
-    t->fd_offsets[fd] = 0;
-    t->fd_flags[fd] = 0;
+    t->files->fds[fd] = NULL;
+    t->files->fd_offsets[fd] = 0;
+    t->files->fd_flags[fd] = 0;
     fd_path_clear(t, fd);
     if ((uint32_t)fd < t->files->next_fd)
       t->files->next_fd = (uint32_t)fd;
@@ -2534,6 +2542,16 @@ static uint64_t sys_sysinfo(uint64_t info_ptr, uint64_t a1, uint64_t a2,
   info.uptime = (int64_t)(lapic_timer_get_ms() / 1000);
   info.totalram = pmm_get_total_memory();
   info.freeram = (uint64_t)pmm_get_free_pages() * PAGE_SIZE;
+
+  extern uint64_t shm_total_pages(void) __attribute__((weak));
+  extern uint64_t tmpfs_total_pages(void) __attribute__((weak));
+  uint64_t shm_pages = shm_total_pages ? shm_total_pages() : 0;
+  uint64_t tmpfs_pages = tmpfs_total_pages ? tmpfs_total_pages() : 0;
+  info.sharedram = (shm_pages + tmpfs_pages) * PAGE_SIZE;
+
+  extern size_t ext2_buffer_cache_total_kb(void) __attribute__((weak));
+  info.bufferram = ext2_buffer_cache_total_kb ? (uint64_t)ext2_buffer_cache_total_kb() * 1024 : 0;
+
   info.procs = sched_get_thread_count();
   info.mem_unit = 1;
   if (copy_to_user((void *)info_ptr, &info, sizeof(info)) != 0)

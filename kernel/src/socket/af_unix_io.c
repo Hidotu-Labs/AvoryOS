@@ -7,7 +7,7 @@
  * sibling can close/reuse the descriptor while sendmsg is in progress. */
 static bool unix_scm_capture_fd(struct thread *sender, int fd,
                                 unix_scm_fd_t *saved) {
-  if (!sender || !sender->files || fd < 0 || fd >= MAX_FDS)
+  if (!sender || !sender->files || fd < 0 || !FD_IN_RANGE(sender, (uint32_t)fd))
     return false;
   spinlock_acquire(&sender->files->lock);
   vfs_node_t *node = sender->fds[fd];

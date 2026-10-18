@@ -631,19 +631,12 @@ static int probe(struct device *device) {
   set_command(dev, (dev->saved_command | PCI_COMMAND_MEMORY |
                     PCI_COMMAND_INTX_DISABLE) & ~PCI_COMMAND_MASTER);
 
-  uint64_t virt = phys + pmm_get_hhdm_offset();
-  for (uint64_t offset = 0; offset < E1000_MMIO_SIZE; offset += PAGE_SIZE) {
-    /* Reapply UC even when the bootloader already supplied an HHDM mapping.
-     * These shared physical-device mappings persist across unbind/reprobe,
-     * as in other native PCI drivers; no RAM pages are owned by this driver. */
-    if (!vmm_map_page(vmm_get_active_pml4(), virt + offset, phys + offset,
-                       PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_PCD |
-                       PAGE_FLAG_PWT | PAGE_FLAG_NX)) {
-      klogf("[E1000] %s BAR0 mapping failed\n", device->name);
-      goto fail;
-    }
+  void *mapped = pci_map_mmio(phys, E1000_MMIO_SIZE);
+  if (!mapped) {
+    klogf("[E1000] %s BAR0 mapping failed\n", device->name);
+    goto fail;
   }
-  dev->regs = (volatile uint8_t *)virt;
+  dev->regs = (volatile uint8_t *)mapped;
   write32(dev, E1000_IMC, UINT32_MAX);
   write32(dev, E1000_RCTL, 0);
   write32(dev, E1000_TCTL, 0);

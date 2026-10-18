@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from vfio_resume_check import check_raphael_resume
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,11 +65,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-root', type=Path, default=ROOT / 'build/logs/prime-runs')
     parser.add_argument('--serial-log', type=Path, default=ROOT / 'build/logs/p6-c7-prime.log')
+    parser.add_argument('--allow-resumed-raphael', action='store_true',
+                        help='Explicit hardware diagnostic: permit the known host-reboot trigger')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         parser.error('a QEMU command after -- is required')
+    try:
+        resume_check = check_raphael_resume(command, allow_resumed=args.allow_resumed_raphael)
+    except RuntimeError as error:
+        parser.error(str(error))
     args.output_root.mkdir(parents=True, exist_ok=True)
     args.serial_log.parent.mkdir(parents=True, exist_ok=True)
     with (args.serial_log.parent / (args.serial_log.name + '.launch-lock')).open('a') as lock:
@@ -81,6 +88,7 @@ def main():
                                    dir=args.output_root))
         os.chmod(run, 0o700)
         metadata = {'started_utc': now.isoformat(), 'status': 'launching',
+                    'host_resume_check': resume_check,
                     'host_boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                     'serial_log': str(args.serial_log.resolve())}
         if '-cdrom' in command:

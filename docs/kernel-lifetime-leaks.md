@@ -12,6 +12,18 @@ measurement from unreachable allocations.
 
 Two independently verifiable leaks were fixed:
 
+- `sys_brk` shrink unmapped every page of the shrinking range while still
+  holding `mm->lock`, so each per-page safe_unmap_and_free() ran with
+  interrupts masked. In that state tlb_flush_deferred_drain() can only
+  perform local invalidation and must return false, parking (or, once the
+  64-entry per-CPU queues overflow, silently dropping) every faulted-in
+  frame. The focused brk repeat retained exactly the full allocated volume
+  per round (3200 kB = 200 iterations x 16 kB, linear to 32000 kB over ten
+  rounds). The shrink now follows the sys_munmap pattern: reserve the range
+  PROT_NONE against reinstalling faults, unmap in 32-page bounded batches
+  with mm->lock dropped, and call vmm_drain_deferred_work() between batches.
+  Frame freeing goes through teardown_range()'s anonymous-private or
+  page-cache ownership check instead of an unconditional free.
 - Linux task shadows had an initial usage count but no native reference
   release, and `__put_task_struct()` was a no-op. Internal service, workqueue
   and kthread-worker retire/respawn cycles abandoned their task/control
@@ -39,7 +51,8 @@ which retention survives cleanup and whether it accumulates.
 
 `test_mem_stress --focus NAME --rounds 6` now warms that exact workload and
 prints immediate and post-200-ms readings for every round. Supported names:
-`wait4`, `sched`, `clone`, `accept4`, `unix-stream`, `process-attrs`. All readings
+`wait4`, `sched`, `clone`, `accept4`, `unix-stream`, `process-attrs`, `mmap`,
+`epoll`, `brk`, `pipe2`. All readings
 are preserved; there is no cache allowance or best-of selection that could
 hide growth. It prints positive/negative deltas since the previous round and
 baseline. Background allocations can still influence global readings. Normal
@@ -98,3 +111,23 @@ These guest runs show no accumulating leak in the five settled repeat cases.
 They do not certify absence of other kernel leaks or resolution of the
 long-running Minecraft ENOMEM and saved-image corruption. A real-workload
 repeat on the updated kernel remains the check for those symptoms.
+
+## Guest repeat results, 2026-10-17 (mmap, epoll, brk, pipe2)
+
+A full-suite single-sample run flagged RETAINED 376 kB after PIPE2, 3200 kB
+after BRK, 100 kB after EPOLL and 4 kB after MMAP/MUNMAP. Focused repeats
+(`--focus NAME --rounds 10`) classified them. MMAP and EPOLL showed exactly
+zero retention in every settled sample. PIPE2 lost 536 kB once before the
+baseline and stayed flat for all ten rounds: bounded cache growth, not a
+leak, and it needs no fix. BRK retained exactly 3200 kB in every round
+(200 iterations x 16 kB, the full allocated volume), reaching 32000 kB after
+ten rounds; this was the third fixed leak above.
+
+After the batched-drain `sys_brk` fix, the guest brk repeat shows zero
+retention in every settled sample across ten rounds, with rounds 9 and 10
+reading 128 kB and 224 kB FREE rather than retained. The kernel and
+`avoryos-x86_64.iso` were rebuilt with the `run-c7-prime` command line
+preserved (verified inside the ISO's limine.conf), and the disk's
+`/bin/test_mem_stress` was replaced in place via debugfs with the
+focus-mmap/epoll/brk/pipe2 build. Not yet covered: real-workload runs on
+the rebuilt kernel remain the check for the long-standing symptoms above.

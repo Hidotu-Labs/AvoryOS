@@ -69,7 +69,7 @@ void vmm_lock_acquire_at(uint64_t caller_ip) {
  * must not be reused until the invalidations have landed).  Both are parked here
  * and performed from vmm_lock_release(), off the lock.
  * -------------------------------------------------------------------------- */
-#define VMM_PENDING_TABLES 64
+#define VMM_PENDING_TABLES 256
 
 static void *vmm_pending_tables[MAX_CPUS][VMM_PENDING_TABLES];
 static uint32_t vmm_pending_table_count[MAX_CPUS];
@@ -116,9 +116,14 @@ void vmm_defer_frame_free(void *phys, uint16_t pages) {
     vmm_pending_frames[slot][n].phys = phys;
     vmm_pending_frames[slot][n].pages = pages;
     vmm_pending_frame_count[slot] = n + 1;
+    hal_irq_restore(flags);
+    return;
   }
-  /* A full queue intentionally leaks this allocation. */
   hal_irq_restore(flags);
+  if (pages == 1)
+    pmm_free_page(phys);
+  else
+    pmm_free_pages(phys, pages);
 }
 
 static void vmm_drain_pending(void) {
@@ -472,11 +477,17 @@ bool vmm_map_huge_page(uint64_t *pml4, uint64_t virtual_addr,
    * falls back to the 4 KB path instead. A fresh slot needs no TLB
    * invalidation either: no translation for this range could have been
    * cached, mirroring vmm_map_range()'s flush_tlb=false rationale. */
-  if (pd_virt[pd_index] & PAGE_FLAG_PRESENT)
-    goto unlock;
-
-  pd_virt[pd_index] =
+  uint64_t want =
       (physical_addr & PAGE_MASK) | flags | PAGE_FLAG_PRESENT | PAGE_FLAG_PS;
+  if (pd_virt[pd_index] & PAGE_FLAG_PRESENT) {
+    if ((pd_virt[pd_index] & PAGE_FLAG_PS) &&
+        ((pd_virt[pd_index] ^ want) & ~(PAGE_FLAG_A | PAGE_FLAG_D)) == 0) {
+      success = true;
+    }
+    goto unlock;
+  }
+
+  pd_virt[pd_index] = want;
   success = true;
 
 unlock:

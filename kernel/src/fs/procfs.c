@@ -22,6 +22,7 @@
 #include "mm/vmm.h"
 #include "mm/vmm_internal.h"
 #include "mm/tlb_shootdown.h"
+#include "mm/ksm.h"
 #include "sched/sched.h"
 #include "sched/namespace.h"
 #include "smp/cpu.h"
@@ -61,29 +62,109 @@ static void procfs_node_init(vfs_node_t *node) {
 
 uint32_t procfs_meminfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                              uint8_t *buffer) {
-  char buf[512];
+  char buf[1024];
 
   uint64_t total_kb = pmm_get_usable_memory() / 1024;
   uint64_t free_kb  = (uint64_t)pmm_get_free_pages() * 4096 / 1024;
-  uint64_t cached_kb = (uint64_t)vfs_cache_page_count() * 4096 / 1024;
-  uint64_t available_kb = free_kb + cached_kb;
+
+  extern uint64_t shm_total_pages(void) __attribute__((weak));
+  extern uint64_t tmpfs_total_pages(void) __attribute__((weak));
+  uint64_t shm_pages = shm_total_pages ? shm_total_pages() : 0;
+  uint64_t tmpfs_pages = tmpfs_total_pages ? tmpfs_total_pages() : 0;
+  uint64_t shmem_kb = (shm_pages + tmpfs_pages) * 4;
+
+  uint64_t file_cached_kb = (uint64_t)vfs_cache_page_count() * 4096 / 1024;
+  uint64_t cached_kb = file_cached_kb + shmem_kb;
+
+  extern uint32_t global_thread_count;
+  extern size_t kstack_cache_total_cached(void) __attribute__((weak));
+  uint64_t kstack_kb = (uint64_t)global_thread_count * 16;
+  if (kstack_cache_total_cached)
+    kstack_kb += (uint64_t)kstack_cache_total_cached() * 16;
+
+  extern uint64_t slab_total_pages(void) __attribute__((weak));
+  extern uint64_t slab_reclaimable_pages(void) __attribute__((weak));
+  uint64_t slab_kb = slab_total_pages ? slab_total_pages() * 4 : 0;
+  uint64_t sreclaimable_kb = slab_reclaimable_pages ? slab_reclaimable_pages() * 4 : 0;
+  uint64_t sunreclaim_kb = (slab_kb >= sreclaimable_kb) ? (slab_kb - sreclaimable_kb) : 0;
+
+  extern size_t ext2_buffer_cache_total_kb(void) __attribute__((weak));
+  uint64_t buffers_kb = ext2_buffer_cache_total_kb ? (uint64_t)ext2_buffer_cache_total_kb() : 0;
+
+  uint64_t available_kb = free_kb + file_cached_kb + sreclaimable_kb + buffers_kb;
   if (available_kb > total_kb)
     available_kb = total_kb;
+
+  uint64_t active_file_kb = file_cached_kb / 2;
+  uint64_t inactive_file_kb = file_cached_kb - active_file_kb;
+
+  uint64_t used_approx_kb = (total_kb > free_kb) ? (total_kb - free_kb) : 0;
+  uint64_t non_anon_kb = cached_kb + buffers_kb + slab_kb + kstack_kb;
+  uint64_t anon_kb = (used_approx_kb > non_anon_kb) ? (used_approx_kb - non_anon_kb) : 0;
+  uint64_t active_anon_kb = anon_kb / 2;
+  uint64_t inactive_anon_kb = anon_kb - active_anon_kb;
+
+  uint64_t active_kb = active_file_kb + active_anon_kb;
+  uint64_t inactive_kb = inactive_file_kb + inactive_anon_kb;
+
+  struct ksm_stats kst;
+  ksm_get_stats(&kst);
+  uint64_t ksm_shared_kb = kst.pages_shared * 4;
+  uint64_t ksm_sharing_kb = (kst.pages_sharing + kst.zero_pages_merged) * 4;
 
   int len = snprintf(buf, sizeof(buf),
       "MemTotal:       %llu kB\n"
       "MemFree:        %llu kB\n"
       "MemAvailable:   %llu kB\n"
-      "Buffers:        0 kB\n"
+      "Buffers:        %llu kB\n"
       "Cached:         %llu kB\n"
-      "Slab:           0 kB\n"
-      "SwapTotal:      0 kB\n"
-      "SwapFree:       0 kB\n"
+      "SwapCached:            0 kB\n"
+      "Active:         %llu kB\n"
+      "Inactive:       %llu kB\n"
+      "Active(anon):   %llu kB\n"
+      "Inactive(anon): %llu kB\n"
+      "Active(file):   %llu kB\n"
+      "Inactive(file): %llu kB\n"
+      "Unevictable:           0 kB\n"
+      "Mlocked:               0 kB\n"
+      "SwapTotal:             0 kB\n"
+      "SwapFree:              0 kB\n"
+      "Dirty:                 0 kB\n"
+      "Writeback:             0 kB\n"
+      "AnonPages:      %llu kB\n"
+      "Mapped:         %llu kB\n"
+      "Shmem:          %llu kB\n"
+      "KReclaimable:   %llu kB\n"
+      "Slab:           %llu kB\n"
+      "SReclaimable:   %llu kB\n"
+      "SUnreclaim:     %llu kB\n"
+      "KernelStack:    %llu kB\n"
+      "PageTables:     %llu kB\n"
+      "KsmShared:      %llu kB\n"
+      "KsmSharing:     %llu kB\n"
       "MemUsable:      %llu kB\n",
       (unsigned long long)total_kb,
       (unsigned long long)free_kb,
       (unsigned long long)available_kb,
+      (unsigned long long)buffers_kb,
       (unsigned long long)cached_kb,
+      (unsigned long long)active_kb,
+      (unsigned long long)inactive_kb,
+      (unsigned long long)active_anon_kb,
+      (unsigned long long)inactive_anon_kb,
+      (unsigned long long)active_file_kb,
+      (unsigned long long)inactive_file_kb,
+      (unsigned long long)anon_kb,
+      (unsigned long long)(file_cached_kb + shmem_kb),
+      (unsigned long long)shmem_kb,
+      (unsigned long long)sreclaimable_kb,
+      (unsigned long long)slab_kb,
+      (unsigned long long)sreclaimable_kb,
+      (unsigned long long)sunreclaim_kb,
+      (unsigned long long)kstack_kb,
+      (unsigned long long)(global_thread_count * 16),
+      (unsigned long long)ksm_shared_kb,
+      (unsigned long long)ksm_sharing_kb,
       (unsigned long long)total_kb);
 
   node->length = (uint32_t)len;
@@ -1436,6 +1517,24 @@ static uint32_t procfs_pid_comm_read(vfs_node_t *node, uint32_t offset,
   return size;
 }
 
+static uint32_t procfs_pid_comm_write(vfs_node_t *node, uint32_t offset,
+                                      uint32_t size, uint8_t *buffer) {
+  (void)offset;
+  if (!node || !buffer || size == 0) return 0;
+  if (!procfs_pid_visible(node->impl)) return 0;
+  uint32_t pid = (uint32_t)node->impl;
+  struct thread *t = sched_get_thread_by_tid(pid);
+  if (!t) return 0;
+  uint32_t len = size;
+  if (len > 15) len = 15;
+  memcpy(t->comm, buffer, len);
+  while (len > 0 && (t->comm[len - 1] == '\n' || t->comm[len - 1] == '\r')) {
+    len--;
+  }
+  t->comm[len] = '\0';
+  return size;
+}
+
 // /proc/<pid>/statm — memory in pages
 static uint32_t procfs_pid_statm_read(vfs_node_t *node, uint32_t offset,
                                       uint32_t size, uint8_t *buffer) {
@@ -1668,6 +1767,8 @@ static uint32_t procfs_pid_maps_read(vfs_node_t *node, uint32_t offset,
       strcpy(path_buf, "[heap]");
     } else if (s->start == VDSO_USER_BASE) {
       strcpy(path_buf, "[vdso]");
+    } else if (s->flags & MAP_SYSV_SHM) {
+      snprintf(path_buf, sizeof(path_buf), "/SYSV%08x (deleted)", (unsigned)s->offset);
     } else if (s->fd >= 0) {
       if (!sched_get_fd_path_snapshot(pid, (uint32_t)s->fd, path_buf, sizeof(path_buf))) {
         path_buf[0] = '\0';
@@ -2184,7 +2285,7 @@ static void procfs_pid_dir_close(vfs_node_t *node) {
 }
 
 static int procfs_pid_exe_readlink(vfs_node_t *node, char *buf, uint32_t size) {
-  if (!procfs_pid_ptrace_access(node->impl)) return -13;
+  if (!procfs_pid_visible(node->impl)) return -2;
   uint32_t pid = node->impl;
   struct sched_thread_snapshot snapshot;
   if (!sched_get_thread_snapshot(pid, &snapshot))
@@ -2198,7 +2299,7 @@ static int procfs_pid_exe_readlink(vfs_node_t *node, char *buf, uint32_t size) {
 }
 
 static int procfs_pid_cwd_readlink(vfs_node_t *node, char *buf, uint32_t size) {
-  if (!procfs_pid_ptrace_access(node->impl)) return -13;
+  if (!procfs_pid_visible(node->impl)) return -2;
   uint32_t pid = node->impl;
   struct sched_thread_snapshot snapshot;
   if (!sched_get_thread_snapshot(pid, &snapshot))
@@ -2216,7 +2317,7 @@ static int procfs_pid_cwd_readlink(vfs_node_t *node, char *buf, uint32_t size) {
 // is always "/". Needed by pipewire (peer-root checks via /proc/<pid>/root),
 // containers, and anything resolving fds across processes.
 static int procfs_pid_root_readlink(vfs_node_t *node, char *buf, uint32_t size) {
-  if (!procfs_pid_ptrace_access(node->impl)) return -13;
+  if (!procfs_pid_visible(node->impl)) return -2;
   uint32_t pid = node->impl;
   struct sched_thread_snapshot snapshot;
   if (!sched_get_thread_snapshot(pid, &snapshot))
@@ -2525,10 +2626,11 @@ static vfs_node_t *make_pid_dir(uint32_t pid) {
     procfs_node_init(comm_node);
     strcpy(comm_node->name, "comm");
     comm_node->flags = FS_FILE;
-    comm_node->mask = 0444;
+    comm_node->mask = 0644;
     comm_node->impl = pid;
     comm_node->length = 16;
     comm_node->read = procfs_pid_comm_read;
+    comm_node->write = procfs_pid_comm_write;
     ramfs_mount_node(dir, comm_node);
   }
 
@@ -3083,7 +3185,7 @@ void procfs_init(void) {
       meminfo_node->flags = FS_FILE | FS_PERSISTENT;
       meminfo_node->mask = 0444; // Read-only
       meminfo_node->read = procfs_meminfo_read;
-      meminfo_node->length = 512; // Dummy size, redefined on read
+      meminfo_node->length = 1024; // Dummy size, redefined on read
 
       ramfs_mount_node(procfs_root, meminfo_node);
     }
@@ -3934,6 +4036,134 @@ static uint32_t procfs_sys_max_map_count_read(vfs_node_t *node, uint32_t offset,
     return size;
 }
 
+static uint32_t procfs_sys_drop_caches_read(vfs_node_t *node, uint32_t offset,
+                                            uint32_t size, uint8_t *buffer) {
+    (void)node;
+    const char *val = "0\n";
+    uint32_t len = 2;
+    if (offset >= len) return 0;
+    if (offset + size > len) size = len - offset;
+    memcpy(buffer, val + offset, size);
+    return size;
+}
+
+static uint32_t procfs_sys_drop_caches_write(vfs_node_t *node, uint32_t offset,
+                                             uint32_t size, uint8_t *buffer) {
+    (void)node;
+    (void)offset;
+    if (!buffer || size == 0) return 0;
+
+    extern size_t mm_file_cache_reclaim(size_t target) __attribute__((weak));
+    extern size_t vfs_dentry_reclaim_pages(size_t target) __attribute__((weak));
+    extern size_t ext2_buffer_cache_shrink(size_t max_buffers) __attribute__((weak));
+    extern void kmem_cache_shrink_all(void) __attribute__((weak));
+    extern size_t thread_stack_cache_reclaim(size_t max_reclaim) __attribute__((weak));
+    extern void pmm_pcp_drain_all(void) __attribute__((weak));
+
+    char c = (char)buffer[0];
+    if (c == '1' || c == '2' || c == '3') {
+        if (c == '1' || c == '3') {
+            if (mm_file_cache_reclaim)
+                mm_file_cache_reclaim((size_t)-1);
+            if (vfs_dentry_reclaim_pages)
+                vfs_dentry_reclaim_pages((size_t)-1);
+            if (ext2_buffer_cache_shrink) {
+                for (int iter = 0; iter < 16; iter++) {
+                    if (ext2_buffer_cache_shrink(256) == 0)
+                        break;
+                }
+            }
+        }
+        if (c == '2' || c == '3') {
+            if (vfs_dentry_reclaim_pages)
+                vfs_dentry_reclaim_pages((size_t)-1);
+            if (kmem_cache_shrink_all)
+                kmem_cache_shrink_all();
+            if (thread_stack_cache_reclaim)
+                thread_stack_cache_reclaim(64);
+        }
+        if (pmm_pcp_drain_all)
+            pmm_pcp_drain_all();
+        if (c == '3') {
+            ksm_scan_pass();
+        }
+        klog_puts("[PROCFS] drop_caches completed\n");
+    }
+    return size;
+}
+
+static uint32_t procfs_sys_ksm_run_read(vfs_node_t *node, uint32_t offset,
+                                        uint32_t size, uint8_t *buffer) {
+    (void)node;
+    char val[8];
+    snprintf(val, sizeof(val), "%d\n", ksm_is_running() ? 1 : 0);
+    uint32_t len = strlen(val);
+    if (offset >= len) return 0;
+    if (offset + size > len) size = len - offset;
+    memcpy(buffer, val + offset, size);
+    return size;
+}
+
+static uint32_t procfs_sys_ksm_run_write(vfs_node_t *node, uint32_t offset,
+                                         uint32_t size, uint8_t *buffer) {
+    (void)node;
+    (void)offset;
+    if (!buffer || size == 0) return 0;
+    char c = (char)buffer[0];
+    if (c == '1') {
+        ksm_set_running(true);
+        ksm_scan_pass();
+    } else if (c == '0') {
+        ksm_set_running(false);
+    }
+    return size;
+}
+
+static uint32_t procfs_sys_ksm_pages_shared_read(vfs_node_t *node, uint32_t offset,
+                                                 uint32_t size, uint8_t *buffer) {
+    (void)node;
+    struct ksm_stats st;
+    ksm_get_stats(&st);
+    uint64_t val = st.pages_shared;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%llu\n", (unsigned long long)val);
+    uint32_t len = strlen(buf);
+    if (offset >= len) return 0;
+    if (offset + size > len) size = len - offset;
+    memcpy(buffer, buf + offset, size);
+    return size;
+}
+
+static uint32_t procfs_sys_ksm_pages_sharing_read(vfs_node_t *node, uint32_t offset,
+                                                  uint32_t size, uint8_t *buffer) {
+    (void)node;
+    struct ksm_stats st;
+    ksm_get_stats(&st);
+    uint64_t val = st.pages_sharing + st.zero_pages_merged;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%llu\n", (unsigned long long)val);
+    uint32_t len = strlen(buf);
+    if (offset >= len) return 0;
+    if (offset + size > len) size = len - offset;
+    memcpy(buffer, buf + offset, size);
+    return size;
+}
+
+static uint32_t procfs_sys_ksm_zero_pages_merged_read(vfs_node_t *node, uint32_t offset,
+                                                      uint32_t size, uint8_t *buffer) {
+    (void)node;
+    struct ksm_stats st;
+    ksm_get_stats(&st);
+    uint64_t val = st.zero_pages_merged;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%llu\n", (unsigned long long)val);
+    uint32_t len = strlen(buf);
+    if (offset >= len) return 0;
+    if (offset + size > len) size = len - offset;
+    memcpy(buffer, buf + offset, size);
+    return size;
+}
+
 static vfs_node_t *procfs_create_dir_node(const char *name) {
     vfs_node_t *dir = kmalloc(sizeof(vfs_node_t));
     if (!dir) return NULL;
@@ -4014,6 +4244,35 @@ void procfs_sys_init(vfs_node_t *procfs_root) {
     vfs_node_t *vm_dir = procfs_create_dir_node("vm");
     if (vm_dir) {
         procfs_add_file_node(vm_dir, "max_map_count", procfs_sys_max_map_count_read, 16);
+
+        vfs_node_t *dc_node = kmalloc(sizeof(*dc_node));
+        if (dc_node) {
+            procfs_node_init(dc_node);
+            strcpy(dc_node->name, "drop_caches");
+            dc_node->flags = FS_FILE | FS_PERSISTENT;
+            dc_node->mask = 0644;
+            dc_node->length = 4;
+            dc_node->read = procfs_sys_drop_caches_read;
+            dc_node->write = procfs_sys_drop_caches_write;
+            ramfs_mount_node(vm_dir, dc_node);
+        }
+
+        vfs_node_t *ksm_run_node = kmalloc(sizeof(*ksm_run_node));
+        if (ksm_run_node) {
+            procfs_node_init(ksm_run_node);
+            strcpy(ksm_run_node->name, "ksm_run");
+            ksm_run_node->flags = FS_FILE | FS_PERSISTENT;
+            ksm_run_node->mask = 0644;
+            ksm_run_node->length = 4;
+            ksm_run_node->read = procfs_sys_ksm_run_read;
+            ksm_run_node->write = procfs_sys_ksm_run_write;
+            ramfs_mount_node(vm_dir, ksm_run_node);
+        }
+
+        procfs_add_file_node(vm_dir, "ksm_pages_shared", procfs_sys_ksm_pages_shared_read, 16);
+        procfs_add_file_node(vm_dir, "ksm_pages_sharing", procfs_sys_ksm_pages_sharing_read, 16);
+        procfs_add_file_node(vm_dir, "ksm_zero_pages_merged", procfs_sys_ksm_zero_pages_merged_read, 16);
+
         ramfs_mount_node(sys_dir, vm_dir);
     }
 

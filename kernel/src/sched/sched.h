@@ -49,6 +49,7 @@ struct mm_struct {
   uint32_t cmdline_len; // Valid bytes in saved_cmdline (0 = unknown/kernel thread)
   uint64_t arg_start;   // User VA of argv[0] string
   uint64_t arg_end;     // User VA just past the last argv string
+  uint64_t ksm_scan_cursor; // Next VA for a bounded background scan; mm->lock
 };
 
 /*
@@ -61,6 +62,7 @@ struct mm_struct {
 void mm_put(struct mm_struct *mm, uint64_t cr3);
 
 
+#define FD_INITIAL_CAPACITY 32
 #define MAX_FDS 1024
 
 struct fd_path {
@@ -75,13 +77,16 @@ struct fd_path {
  */
 struct fd_table {
   /* Unpublished Linux file wrappers, allocated before fd_install(). */
-  struct vfs_node *reserved_nodes[MAX_FDS];
-  vfs_node_t *fds[MAX_FDS];
-  uint64_t fd_offsets[MAX_FDS];
-  uint64_t fd_flags[MAX_FDS];
-  struct fd_path *fd_paths[MAX_FDS];
+  struct vfs_node **reserved_nodes;
+  vfs_node_t **fds;
+  uint64_t *fd_offsets;
+  uint64_t *fd_flags;
+  struct fd_path **fd_paths;
+  uint64_t *description_ids;
+  void *array_buf;
   /* Lowest descriptor which may be free. Protected by lock. */
   uint32_t next_fd;
+  uint32_t capacity;
   uint32_t ref_count;
   spinlock_t lock;
 };
@@ -206,6 +211,7 @@ struct thread {
   uint64_t *fd_offsets;  // Track seek offset per file descriptor
   uint64_t *fd_flags;    // Track flags (O_NONBLOCK, etc.) for each FD
   struct fd_path **fd_paths; // Shared, reference-counted descriptor paths
+  uint32_t fd_capacity;  // Current allocated capacity of descriptor arrays
   uint64_t cr3;                 // Per-process page table (0 = inherited/kernel)
   bool is_forked_child;         // True for forked children (affects sys_exit)
   bool is_idle;                 // True for idle thread (cannot be terminated)
@@ -504,6 +510,28 @@ struct sched_thread_snapshot {
 uint64_t fd_description_id_locked(struct thread *t, int fd);
 void fd_description_set_locked(struct thread *t, int fd, uint64_t id);
 void sched_copy_files(struct thread *child, struct thread *parent);
+bool fd_table_expand_locked(struct fd_table *files, uint32_t needed_fd);
+
+static inline void sched_sync_files(struct thread *t) {
+  if (t && t->files && t->fd_capacity != t->files->capacity) {
+    t->fds = t->files->fds;
+    t->fd_offsets = t->files->fd_offsets;
+    t->fd_flags = t->files->fd_flags;
+    t->fd_paths = t->files->fd_paths;
+    t->fd_capacity = t->files->capacity;
+  }
+}
+
+static inline bool fd_in_range(struct thread *t, int64_t fd) {
+  if (!t || !t->files || fd < 0)
+    return false;
+  if (t->fd_capacity != t->files->capacity)
+    sched_sync_files(t);
+  return (uint64_t)fd < t->fd_capacity;
+}
+
+#define FD_IN_RANGE(t, fd) fd_in_range((t), (int64_t)(fd))
+#define FD_NODE(t, fd) (FD_IN_RANGE((t), (fd)) ? (t)->fds[(fd)] : NULL)
 
 bool fd_path_set(struct thread *t, int fd, const char *path);
 void fd_path_dup(struct thread *t, int dst, int src);
@@ -513,6 +541,10 @@ const char *fd_path_value(struct thread *t, int fd);
 void sched_init(void);
 void sched_run_phase1_test(void);
 void sched_wakeup(struct thread *t);
+/* Scoped priority protection for sleeping kernel critical sections. User nice,
+ * policy and requested slice remain unchanged. Balance only outer ownership. */
+void sched_critical_enter(void);
+void sched_critical_exit(void);
 void sched_yield(void);
 
 /* Releases a thread blocked in sys_vfork once its borrowing child is gone

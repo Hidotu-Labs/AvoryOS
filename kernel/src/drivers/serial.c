@@ -8,25 +8,41 @@
 
 #define COM1 0x3F8
 
-// Ring buffer for non-blocking serial output (128KB power-of-2 size)
-#define SERIAL_BUF_SIZE 131072
+// Ring buffer for non-blocking serial output (demand-allocated)
+#define SERIAL_BUF_SIZE 65536
 #define SERIAL_BUF_MASK (SERIAL_BUF_SIZE - 1)
 
-static char serial_buf[SERIAL_BUF_SIZE];
+static char *serial_buf = NULL;
 static volatile uint32_t serial_head = 0; // write position
 static volatile uint32_t serial_tail = 0; // read/send position
 
 static spinlock_t serial_lock = SPINLOCK_INIT;
 static volatile bool serial_initialized = false;
+static volatile bool serial_hardware_present = true;
 
-static inline int is_transmit_empty(void) { return inb(COM1 + 5) & 0x20; }
+static inline bool serial_ensure_buf_locked(void) {
+  if (serial_buf)
+    return true;
+  extern bool heap_initialized;
+  if (!heap_initialized)
+    return false;
+  extern void *kmalloc(size_t size);
+  serial_buf = kmalloc(SERIAL_BUF_SIZE);
+  return (serial_buf != NULL);
+}
+
+static inline int is_transmit_empty(void) {
+  if (!serial_hardware_present)
+    return 0;
+  return inb(COM1 + 5) & 0x20;
+}
 
 /* Push a burst with one string I/O instead of one port access per byte: under
  * KVM every OUT is a VM exit, and the console mirror plus klog push thousands
  * of characters through here.  Callers gate each burst on the transmit
  * register so the 16550 FIFO is never overrun. */
 static inline void serial_out_block(const char *buf, uint32_t count) {
-  if (!count)
+  if (!count || !serial_hardware_present)
     return;
   __asm__ volatile("rep outsb"
                    : "+S"(buf), "+c"(count)
@@ -39,6 +55,8 @@ static inline void serial_out_block(const char *buf, uint32_t count) {
  * progress.  Dropping bytes is always better than deadlocking the machine;
  * this is only reached on contention. */
 static inline void serial_try_putbyte(char c) {
+  if (!serial_hardware_present)
+    return;
   if (is_transmit_empty())
     outb(COM1, c);
 }
@@ -65,7 +83,17 @@ void serial_init(void) {
   outb(COM1 + 1, 0x00); //                  (hi byte)
   outb(COM1 + 3, 0x03); // 8 bits, no parity, one stop bit
   outb(COM1 + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
-  outb(COM1 + 4, 0x0B); // IRQs enabled, RTS/DSR set
+
+  /* Hardware presence detection: 16550 loopback test */
+  outb(COM1 + 4, 0x1E); // Set loopback mode
+  outb(COM1 + 0, 0xAE); // Write test byte
+  for (volatile int i = 0; i < 100; i++) {}
+  if (inb(COM1 + 0) != 0xAE) {
+    serial_hardware_present = false;
+  } else {
+    serial_hardware_present = true;
+    outb(COM1 + 4, 0x0B); // IRQs enabled, RTS/DSR set, normal mode
+  }
 
   serial_initialized = true;
 
@@ -97,6 +125,9 @@ void serial_init(void) {
  * THRE check, stopping as soon as the UART stops accepting.  Caller holds
  * serial_lock.  Returns the number of bytes moved. */
 static uint32_t serial_drain_locked(uint32_t budget) {
+  if (!serial_buf || !serial_hardware_present)
+    return 0;
+
   uint32_t tail = serial_tail;
   uint32_t head = serial_head;
   uint32_t moved = 0;
@@ -127,6 +158,8 @@ static uint32_t serial_drain_locked(uint32_t budget) {
 // Enqueue a character into the ring buffer (pure memory operation, 0 port I/O).
 // Must be called while holding serial_lock.
 static inline void serial_enqueue_locked(char c) {
+  if (!serial_ensure_buf_locked())
+    return;
   uint32_t next = (serial_head + 1) & SERIAL_BUF_MASK;
   if (next == serial_tail)
     return; // Buffer full: drop silently without blocking or port I/O
@@ -141,6 +174,8 @@ static inline void serial_enqueue_locked(char c) {
  * mid-sentence on a kernel that is otherwise still running, and is the first
  * thing to rule out when a hang report never appears. */
 uint32_t serial_pending_bytes(void) {
+  if (!serial_buf)
+    return 0;
   uint32_t head = __atomic_load_n(&serial_head, __ATOMIC_RELAXED);
   uint32_t tail = __atomic_load_n(&serial_tail, __ATOMIC_RELAXED);
   return (uint32_t)((head - tail) & SERIAL_BUF_MASK);
@@ -150,6 +185,9 @@ uint32_t serial_pending_bytes(void) {
  * the tick handler into a serial pump.  The idle loop and the console mirror
  * move the bulk; this keeps progress while the BSP is busy. */
 void serial_flush(void) {
+  /* Fast path: 0 pending bytes -> return immediately without taking locks or doing port I/O */
+  if (serial_pending_bytes() == 0)
+    return;
   /* Called from the BSP timer tick: never block, or a contended log lock
    * stops this CPU from taking ticks and the hang detector fires. */
   if (!spinlock_try_acquire(&serial_lock))
@@ -174,6 +212,8 @@ void serial_flush_idle(void) {
 // Synchronously drain the entire ring buffer until empty.
 // Safe for panics and shutdown; includes timeout to prevent infinite hangs.
 void serial_flush_sync(void) {
+  if (!serial_buf || !serial_hardware_present)
+    return;
   if (!spinlock_try_acquire(&serial_lock)) {
     /* Panic on the CPU that holds serial_lock: draining lock-free is the only
      * way out.  Racing another drain can drop bytes; that is fine here. */
@@ -202,7 +242,16 @@ void serial_flush_sync(void) {
 }
 
 void serial_putchar(char c) {
+  if (!serial_hardware_present)
+    return;
   if (!serial_lock_bounded()) {
+    if (c == '\n')
+      serial_try_putbyte('\r');
+    serial_try_putbyte(c);
+    return;
+  }
+  if (!serial_ensure_buf_locked()) {
+    spinlock_release(&serial_lock);
     if (c == '\n')
       serial_try_putbyte('\r');
     serial_try_putbyte(c);
@@ -219,6 +268,8 @@ void serial_putchar(char c) {
  * caller holds serial_lock.  Returns the number of bytes queued; bytes that do
  * not fit are dropped. */
 static uint32_t serial_enqueue_range_locked(const char *data, size_t length) {
+  if (!serial_ensure_buf_locked())
+    return 0;
   uint32_t head = serial_head;
   uint32_t free_space = (serial_tail - head - 1) & SERIAL_BUF_MASK;
   uint32_t queued = 0;
@@ -257,11 +308,16 @@ static uint32_t serial_enqueue_range_locked(const char *data, size_t length) {
  * for the tick.  Overflow is dropped: the framebuffer is the authoritative
  * output, serial is a mirror. */
 void serial_write_async(const char *data, size_t length) {
-  if (!data || length == 0)
+  if (!data || length == 0 || !serial_hardware_present)
     return;
 
   if (!serial_lock_bounded())
     return; // Mirror only: never fall back to direct port I/O.
+
+  if (!serial_ensure_buf_locked()) {
+    spinlock_release(&serial_lock);
+    return;
+  }
 
   serial_enqueue_range_locked(data, length);
   serial_drain_locked(SERIAL_ASYNC_DRAIN_BYTES);
@@ -269,10 +325,20 @@ void serial_write_async(const char *data, size_t length) {
 }
 
 void serial_write(const char *data, size_t length) {
-  if (!data || length == 0)
+  if (!data || length == 0 || !serial_hardware_present)
     return;
 
   if (!serial_lock_bounded()) {
+    for (size_t i = 0; i < length; i++) {
+      if (data[i] == '\n')
+        serial_try_putbyte('\r');
+      serial_try_putbyte(data[i]);
+    }
+    return;
+  }
+
+  if (!serial_ensure_buf_locked()) {
+    spinlock_release(&serial_lock);
     for (size_t i = 0; i < length; i++) {
       if (data[i] == '\n')
         serial_try_putbyte('\r');
@@ -292,6 +358,8 @@ void serial_write(const char *data, size_t length) {
 
 // Direct synchronous write bypassing the ring buffer (ideal for early boot or panic)
 void serial_putchar_sync(char c) {
+  if (!serial_hardware_present)
+    return;
   if (c == '\n')
     serial_putchar_sync('\r');
 
@@ -303,24 +371,32 @@ void serial_putchar_sync(char c) {
 }
 
 void serial_write_sync(const char *data, size_t length) {
-  if (!data || length == 0)
+  if (!data || length == 0 || !serial_hardware_present)
     return;
   for (size_t i = 0; i < length; i++) {
     serial_putchar_sync(data[i]);
   }
 }
 
-int serial_received(void) { return inb(COM1 + 5) & 1; }
+int serial_received(void) {
+  if (!serial_hardware_present)
+    return 0;
+  return inb(COM1 + 5) & 1;
+}
 
 /* Non-blocking read: -1 when nothing is waiting.  Used by the hang-report
  * trigger, which polls from the timer tick and must never stall. */
 int serial_try_get_char(void) {
+  if (!serial_hardware_present)
+    return -1;
   if (!(inb(COM1 + 5) & 1))
     return -1;
   return (int)(uint8_t)inb(COM1);
 }
 
 char serial_get_char(void) {
+  if (!serial_hardware_present)
+    return 0;
   while (serial_received() == 0) {
     __asm__ volatile("pause" ::: "memory");
   }
@@ -355,15 +431,18 @@ extern const char *kernel_boot_cmdline;
 static uint32_t bench_fill(uint32_t bytes) {
   uint32_t n = 0;
 
+  if (!serial_ensure_buf_locked())
+    return 0;
+
   serial_tail = 0;
   serial_head = 0;
-  while (n < bytes) {
+  while (n < bytes && n < SERIAL_BUF_SIZE) {
     uint32_t col = 0;
-    while (col < 63 && n < bytes) {
+    while (col < 63 && n < bytes && n < SERIAL_BUF_SIZE) {
       serial_buf[n++] = '=';
       col++;
     }
-    if (n < bytes)
+    if (n < bytes && n < SERIAL_BUF_SIZE)
       serial_buf[n++] = '\n';
   }
   serial_head = n;

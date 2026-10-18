@@ -12,7 +12,7 @@ set -e
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 BUILD_DIR=${BUILD_DIR:-"$ROOT_DIR/build/classicube"}
-PREFIX=${MUSL_SYSROOT:-"$ROOT_DIR/toolchain/musl-sysroot"}
+PREFIX=${GLIBC_SYSROOT:-"$ROOT_DIR/toolchain/glibc-sysroot"}
 INSTALL_DIR="$ROOT_DIR/userland"
 MESA_ROOT=${MESA_ROOT:-"$ROOT_DIR/build/alpine/rootfs"}
 CLASSICUBE_RENDERER=${CLASSICUBE_RENDERER:-mesa}
@@ -20,17 +20,16 @@ JOBS=$(nproc 2>/dev/null || echo 4)
 REPO_URL="https://github.com/ClassiCube/ClassiCube/archive/refs/heads/master.tar.gz"
 
 find_compiler() {
-    LOCAL_CC="$ROOT_DIR/toolchain/x86_64-linux-musl/bin/x86_64-linux-musl-gcc"
+    LOCAL_CC="$ROOT_DIR/toolchain/x86_64-linux-glibc/bin/x86_64-linux-gcc"
     
     if [ -x "$LOCAL_CC" ]; then
         CC="$LOCAL_CC"
-    elif command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
-        CC="x86_64-linux-musl-gcc"
-    elif command -v musl-gcc >/dev/null 2>&1; then
-        CC="musl-gcc"
+    elif [ -x "$ROOT_DIR/toolchain/x86_64-linux-glibc/bin/x86_64-buildroot-linux-gnu-gcc" ]; then
+        CC="$ROOT_DIR/toolchain/x86_64-linux-glibc/bin/x86_64-buildroot-linux-gnu-gcc"
+    elif command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
+        CC="x86_64-linux-gnu-gcc"
     else
-        echo "Error: No musl compiler found. Run scripts/musl-toolchain.sh first." >&2
-        exit 1
+        CC="gcc"
     fi
     echo "Using CC=$CC"
 }
@@ -117,7 +116,7 @@ build_classicube() {
                     -DCC_BUILD_X11 -DCC_GFX_BACKEND=2 -DCC_BUILD_POSIX \
                     -DCC_BUILD_NOMUSIC -I$MESA_ROOT/usr/include -I$PREFIX/include"
             LDFLAGS="-L$MESA_ROOT/usr/lib -L$MESA_ROOT/lib \
-                     -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+                     -Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
                      -Wl,-rpath,/usr/lib \
                      -Wl,-rpath-link,$MESA_ROOT/usr/lib \
                      -Wl,-rpath-link,$MESA_ROOT/lib -Wl,--allow-shlib-undefined"

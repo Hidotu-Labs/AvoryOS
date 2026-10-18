@@ -1,5 +1,6 @@
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
+#include "../fs/vfs.h"
 #include "pmm.h"
 #include "tlb_shootdown.h"
 #include "vma.h"
@@ -204,10 +205,16 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
       new_virt = PHYS_TO_VIRT((uint64_t)*new_table_out);
 
       if (phys == vmm_get_vsyscall_page_phys() || shared) {
-        // Shared/vDSO: alias the physical frame.  Page-cache-backed shared
-        // mappings carry one PMM reference per PTE, so the child's copy needs
-        // its own; device-backed frames are owned by their backing object.
-        if (shared && (pvma->flags & MAP_PAGECACHE) && pmm_is_managed(phys))
+        // Shared/vDSO: alias the physical frame.  Cache-backed and direct
+        // file-backed shared mappings carry one PMM reference per PTE, so the
+        // child's copy needs its own; device-backed frames are owned by their
+        // backing object.
+        bool shared_refs = shared && (pvma->flags & (MAP_PAGECACHE | MAP_SYSV_SHM));
+        if (shared && !shared_refs) {
+          vfs_node_t *fnode = (vfs_node_t *)pvma->file_node;
+          shared_refs = fnode && fnode->mmap_shared_pmm_refs;
+        }
+        if (shared_refs && pmm_is_managed(phys))
           pmm_incref((void *)phys);
         new_virt[i] = src_virt[i];
       } else {

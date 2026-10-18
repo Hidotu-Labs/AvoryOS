@@ -193,6 +193,12 @@ uint32_t ramfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
     uint32_t req_cap = (offset + size) * 2; // Double the required size
     if (req_cap < 512)
       req_cap = 512;
+    if ((node->flags & FS_TYPE_MASK) == FS_PIPE) {
+      if (req_cap > 65536)
+        req_cap = 65536;
+      if (offset + size > req_cap)
+        req_cap = offset + size;
+    }
 
     uint32_t new_cap = 0;
     uint8_t new_is_pmm = 0;

@@ -1019,3 +1019,57 @@ void ext2_free_all_blocks(ext2_mount_t *mnt, ext2_inode_t *inode) {
   inode->i_blocks = 0;
   inode->i_size   = 0;
 }
+
+extern ext2_mount_t *ext2_active_mounts;
+extern spinlock_t ext2_mounts_lock;
+
+size_t ext2_buffer_cache_total_kb(void) {
+  size_t total_kb = 0;
+  spinlock_acquire(&ext2_mounts_lock);
+  for (ext2_mount_t *m = ext2_active_mounts; m; m = m->next) {
+    uint32_t count = 0;
+    spinlock_acquire(&m->cache_lock);
+    for (uint32_t i = 0; i < EXT2_CACHE_SIZE; i++) {
+      if (m->cache[i].data != NULL)
+        count++;
+    }
+    spinlock_release(&m->cache_lock);
+    total_kb += (size_t)count * (m->block_size / 1024);
+  }
+  spinlock_release(&ext2_mounts_lock);
+  return total_kb;
+}
+
+size_t ext2_buffer_cache_shrink(size_t max_buffers) {
+  if (max_buffers == 0)
+    max_buffers = 64;
+
+  size_t total_freed = 0;
+  uint8_t *batch[32];
+
+  spinlock_acquire(&ext2_mounts_lock);
+  for (ext2_mount_t *m = ext2_active_mounts; m && total_freed < max_buffers; m = m->next) {
+    uint32_t batch_count = 0;
+    spinlock_acquire(&m->cache_lock);
+    uint32_t start = m->cache_shrink_cursor;
+    for (uint32_t step = 0; step < EXT2_CACHE_SIZE && (total_freed + batch_count) < max_buffers && batch_count < 32; step++) {
+      uint32_t idx = (start + step) % EXT2_CACHE_SIZE;
+      if (m->cache[idx].data != NULL && m->cache[idx].writes_inflight == 0) {
+        batch[batch_count++] = m->cache[idx].data;
+        m->cache[idx].data = NULL;
+        m->cache[idx].num = 0;
+        m->cache[idx].write_seq++;
+      }
+    }
+    m->cache_shrink_cursor = (start + max_buffers) % EXT2_CACHE_SIZE;
+    spinlock_release(&m->cache_lock);
+
+    for (uint32_t b = 0; b < batch_count; b++) {
+      kfree(batch[b]);
+      total_freed++;
+    }
+  }
+  spinlock_release(&ext2_mounts_lock);
+
+  return total_freed;
+}

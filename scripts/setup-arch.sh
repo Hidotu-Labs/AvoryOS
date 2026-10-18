@@ -261,9 +261,11 @@ install_apk "weston-terminal" "community"
 install_apk "wayland-protocols" "main"
 install_apk "wayland-dev" "main"
 install_apk "vulkan-loader" "main"
+install_apk "vulkan-tools" "main"
 install_apk "mesa-gl" "main"
 install_apk "mesa-gles" "main"
 install_apk "mesa-vulkan-swrast" "main"
+install_apk "mesa-vulkan-ati" "main"
 install_apk "mesa-demos" "community"
 install_apk "freeglut" "community"
 install_apk "libliftoff" "community"
@@ -1047,8 +1049,9 @@ ebegin "Mounting pseudo-filesystems"
 mount -t proc proc /proc 2>/dev/null; rc1=$?
 mount -t sysfs sysfs /sys 2>/dev/null; rc2=$?
 mount -t devtmpfs dev /dev 2>/dev/null || true
-mkdir -p /run /run/lock /run/mount /var/log /tmp 2>/dev/null
-chmod 1777 /tmp 2>/dev/null || true
+mkdir -p /run /run/lock /run/mount /var/log /tmp /dev/shm 2>/dev/null
+chmod 1777 /tmp /dev/shm 2>/dev/null || true
+mount -t tmpfs -o rw,nosuid,nodev,mode=1777 tmpfs /dev/shm 2>/dev/null || true
 if [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ]; then eend 0; else eend 1; fi
 
 ebegin "Setting hostname"
@@ -1218,8 +1221,9 @@ install -m 0644 "${ROOT_DIR}/config/xorg/10-native.conf" \
 install -m 0755 "${ROOT_DIR}/config/xorg/avory-xorg-profile.sh" \
     "${ROOTFS_DIR}/usr/bin/avory-xorg-profile"
 # SDDM display manager defaults, baked into the image so bare `sddm`
-# behaves like the /bin/startx.sh path (which regenerates the same files
-# at boot). Without /etc/sddm.conf SDDM hides uid<1000 (no root login);
+# starts with a workable root login and output binding without a session
+# launcher regenerating them first. Without /etc/sddm.conf SDDM hides
+# uid<1000 (no root login);
 # without permissive PAM the stock Arch sddm* services can fail the
 # greeter session on AvoryOS (no systemd/logind, no shadow).
 mkdir -p "${ROOTFS_DIR}/etc/sddm.conf.d" "${ROOTFS_DIR}/etc/pam.d"
@@ -1467,17 +1471,26 @@ EOF
     fi
 done
 
-# Weston/XWayland entry point referenced by initrd/weston.ini and
-# initrd/startw.sh. Upstream Arch ships startxfce4, not this name, so
-# provide a small wrapper with sane XDG/GTK defaults for XFCE-on-XWayland.
-if [ ! -e "${ROOTFS_DIR}/usr/bin/start-xfce4-wayland" ]; then
-    echo "[*] Installing start-xfce4-wayland wrapper..."
-    cat > "${ROOTFS_DIR}/usr/bin/start-xfce4-wayland" <<'EOF'
+# Weston/XWayland entry point referenced by initrd/weston.ini. Upstream Arch
+# ships startxfce4, not this name, so provide a small wrapper with sane
+# XDG/GTK defaults for XFCE-on-XWayland.
+# Written unconditionally so incremental rootfs trees pick up changes.
+echo "[*] Installing start-xfce4-wayland wrapper..."
+cat > "${ROOTFS_DIR}/usr/bin/start-xfce4-wayland" <<'EOF'
 #!/bin/sh
 # AvoryOS: launch XFCE4 inside XWayland (Weston) with icon/mime-safe env.
 export XDG_DATA_DIRS="/usr/local/share:/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
-export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+# Root's home is "/" on AvoryOS. Join the XDG defaults through "${HOME%/}"
+# so the session never exports //.config-style paths: WebKitGTK rejects a
+# double leading slash as a sandbox root and Epiphany aborts on the
+# resulting critical (see docs/epiphany-pulse-launch-abort.md).
+_avory_home="${HOME:-/}"
+_avory_home="${_avory_home%/}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${_avory_home}/.config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${_avory_home}/.cache}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${_avory_home}/.local/share}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-${_avory_home}/.local/state}"
+unset _avory_home
 export NO_AT_BRIDGE=1
 export GTK_A11Y=none
 if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && command -v dbus-run-session >/dev/null 2>&1; then
@@ -1486,8 +1499,7 @@ else
     exec startxfce4 "$@"
 fi
 EOF
-    chmod 0755 "${ROOTFS_DIR}/usr/bin/start-xfce4-wayland"
-fi
+chmod 0755 "${ROOTFS_DIR}/usr/bin/start-xfce4-wayland"
 
 # Ensure X11/XFCE startup scripts are executable
 chmod 0755 "${ROOTFS_DIR}/etc/X11/xinit/xinitrc" 2>/dev/null || true
@@ -1501,4 +1513,19 @@ chmod 4755 "${ROOTFS_DIR}/usr/lib/dbus-daemon-launch-helper" 2>/dev/null || true
 # Wrap xfce4-session in dbus-run-session in xinitrc if present
 if [ -f "${ROOTFS_DIR}/etc/xdg/xfce4/xinitrc" ]; then
     sed -i 's/exec \${XFCE4_SESSION_COMPOSITOR:-xfce4-session}/if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] \&\& command -v dbus-run-session >\/dev\/null 2>\&1; then exec dbus-run-session -- \${XFCE4_SESSION_COMPOSITOR:-xfce4-session}; else exec \${XFCE4_SESSION_COMPOSITOR:-xfce4-session}; fi/' "${ROOTFS_DIR}/etc/xdg/xfce4/xinitrc" 2>/dev/null || true
+fi
+
+# Canonicalise the XFCE xinitrc XDG fallbacks. Root's home is "/" on
+# AvoryOS, so the upstream "$HOME/.config"/"$HOME/.cache" defaults become
+# //.config and //.cache. WebKitGTK treats a double leading slash as a
+# disallowed sandbox root and Epiphany aborts on the critical that follows
+# (docs/epiphany-pulse-launch-abort.md). Join through "${HOME%/}" instead.
+if [ -f "${ROOTFS_DIR}/etc/xdg/xfce4/xinitrc" ]; then
+    sed -i \
+        -e 's#XDG_CONFIG_HOME=\$HOME/\.config#XDG_CONFIG_HOME=${HOME%/}/.config#' \
+        -e 's#XDG_CACHE_HOME=\$HOME/\.cache#XDG_CACHE_HOME=${HOME%/}/.cache#' \
+        "${ROOTFS_DIR}/etc/xdg/xfce4/xinitrc" 2>/dev/null || true
+    if grep -q 'XDG_CONFIG_HOME=\$HOME/\.config\|XDG_CACHE_HOME=\$HOME/\.cache' "${ROOTFS_DIR}/etc/xdg/xfce4/xinitrc" 2>/dev/null; then
+        echo "[!] Warning: xfce4 xinitrc still joins XDG defaults with \$HOME; upstream fallback text changed?" >&2
+    fi
 fi

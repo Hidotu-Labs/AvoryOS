@@ -5,7 +5,7 @@
 # Xorg pointing at a nonexistent /dev/dri/card2 (BusID PCI:0:3:0) and the
 # server dies instantly ("Failed to read display number from pipe"). This
 # script copies the matching profile into place so both bare `sddm` and
-# /bin/startx.sh start on the right device:
+# the desktop session start on the right device:
 #   amdgpu — AMD-primary PRIME layout (passed-through AMD VGA present)
 #   native — card0 software rendering (no radeonsi; GL clients use llvmpipe)
 #

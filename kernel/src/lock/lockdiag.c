@@ -780,7 +780,7 @@ static void dump_fd_wait(const struct thread *t) {
   uint64_t inode = 0;
   uint64_t fd_flags = 0, node_flags = 0;
   bool sampled = false;
-  if (fd < MAX_FDS && t->files && spinlock_try_acquire(&t->files->lock)) {
+  if (t->files && fd < t->files->capacity && spinlock_try_acquire(&t->files->lock)) {
     vfs_node_t *node = t->files->fds[fd];
     if (vfs_node_is_alive(node)) {
       inode = node->inode;
@@ -1108,6 +1108,8 @@ void lockdiag_dump_all(const char *reason) {
         ld_dec(ready_at && sampled_ms >= ready_at ? sampled_ms - ready_at : 0);
         ld_str(" vruntime="); ld_dec(t->se.vruntime);
         ld_str(" vdeadline="); ld_dec(t->se.deadline);
+        ld_str(" weight="); ld_dec(t->se.weight);
+        ld_str(" critical_depth="); ld_dec(t->se.critical_depth);
         ld_str(" slice_ns="); ld_dec(t->se.slice_ns);
         struct cpu_info *owner_cpu = cpu_get_info(t->cpu_index);
         /* Diagnostic snapshots only: taking queue_lock here can deadlock a

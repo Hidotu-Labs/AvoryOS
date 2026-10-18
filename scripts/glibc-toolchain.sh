@@ -105,6 +105,15 @@ else
     echo "glibc ${GLIBC_VERSION} already installed. Skipping build."
 fi
 
+# The base Bootlin toolchain ships an include-fixed/pthread.h fixincluded
+# against its original (older) glibc.  After the sysroot upgrade above that
+# shadow header is stale: C++ library headers reach it through
+# <bits/gthr-default.h>, and its old PTHREAD_COND_INITIALIZER no longer
+# matches the sysroot's glibc 2.43 pthread_cond_t layout (breaks e.g.
+# userland/qt5_test.elf with "__gthread_cond_t _M_cond = ..." conversion
+# errors).  Remove it so <pthread.h> resolves to the sysroot's real header.
+rm -f "$OUTPUT_DIR"/lib/gcc/*/*/include-fixed/pthread.h
+
 # Create convenience aliases
 if [ -d "$OUTPUT_DIR/bin" ]; then
     for tool in gcc g++ cpp ar as ld nm objcopy objdump ranlib strip; do

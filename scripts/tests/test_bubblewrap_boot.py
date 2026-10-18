@@ -28,6 +28,7 @@ static int payload(void) {
  CHECK(getpid()>0 && getpid()<10);
  CHECK(access("/host-secret",F_OK)==-1 && errno==ENOENT);
  CHECK(access("/proc/self/status",R_OK)==0);
+ CHECK(access("/run/runtime/sentinel",R_OK)==0);
  CHECK(open("/app/forbidden",O_WRONLY|O_CREAT,0600)==-1 && errno==EROFS);
  int fd=open("/tmp/writable",O_WRONLY|O_CREAT,0600);CHECK(fd>=0);if(fd>=0)close(fd);
  CHECK(prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)==1);
@@ -48,7 +49,8 @@ static void launch(int network) {
  char *args[]={"/usr/bin/bwrap","--unshare-uts","--unshare-ipc","--unshare-pid",
   "--ro-bind","/usr","/usr","--ro-bind","/lib64","/lib64",
   "--ro-bind","/app","/app","--dev","/dev","--proc","/proc",
-  "--tmpfs","/tmp","--dir","/run","--symlink","../run","/var/run",
+  "--tmpfs","/tmp","--dir","/run",
+  "--bind","/tmp/runtime-0/webkitgtk","/run/runtime","--symlink","../run","/var/run",
   "--cap-drop","ALL","--seccomp",number,
   network?"--unshare-net":"--clearenv","--chdir","/",
   "/app/probe","payload",NULL};
@@ -62,7 +64,10 @@ static void launch(int network) {
 int main(int argc,char **argv) {
  setvbuf(stdout,NULL,_IOLBF,0);
  if(argc>1&&!strcmp(argv[1],"payload"))return payload();
- puts("BUBBLEWRAP_BOOT: START");launch(0);launch(1);
+ puts("BUBBLEWRAP_BOOT: START");
+ CHECK(mkdir("/tmp/runtime-0",0700)==0);CHECK(mkdir("/tmp/runtime-0/webkitgtk",0700)==0);
+ int sentinel=open("/tmp/runtime-0/webkitgtk/sentinel",O_WRONLY|O_CREAT,0600);CHECK(sentinel>=0);if(sentinel>=0)close(sentinel);
+ launch(0);launch(1);
  printf("BUBBLEWRAP_BOOT: END failures=%d\n",failures);fflush(NULL);
  reboot(RB_POWER_OFF);for(;;)sleep(60);
 }

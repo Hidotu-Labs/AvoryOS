@@ -47,6 +47,9 @@ extern void kmem_cache_shrink_all(void) __attribute__((weak));
 // Optional file-cache hook: fs can provide a global "free up to target
 // clean pages" helper. mm must not hard-depend on fs, so weak.
 extern size_t mm_file_cache_reclaim(size_t target) __attribute__((weak));
+extern size_t thread_stack_cache_reclaim(size_t max_reclaim) __attribute__((weak));
+extern size_t ext2_buffer_cache_shrink(size_t max_buffers) __attribute__((weak));
+extern size_t pty_shrink_unused_buffers(void) __attribute__((weak));
 
 // Return every completely empty generic slab to PMM. Caller must NOT hold
 // any heap_caches[].lock (we take each one in turn). Returns pages freed.
@@ -76,6 +79,12 @@ void heap_oom_reclaim(void) {
   if (kmem_cache_shrink_all)
     kmem_cache_shrink_all();
   heap_shrink_empty();
+  if (thread_stack_cache_reclaim)
+    thread_stack_cache_reclaim(16);
+  if (ext2_buffer_cache_shrink)
+    ext2_buffer_cache_shrink(32);
+  if (pty_shrink_unused_buffers)
+    pty_shrink_unused_buffers();
   if (mm_file_cache_reclaim)
     mm_file_cache_reclaim(32);
 }
@@ -422,4 +431,28 @@ void heap_slab_get_info(char *buf) {
     strcat(buf, "\n");
     spinlock_release(&c->lock);
   }
+}
+
+uint64_t heap_slab_total_slabs(void) {
+  uint64_t total = 0;
+  for (size_t i = 0; i < CACHE_COUNT; i++) {
+    struct slab_cache *c = &heap_caches[i];
+    spinlock_acquire(&c->lock);
+    for (struct slab *s = c->partial; s; s = s->next) total++;
+    for (struct slab *s = c->full; s; s = s->next) total++;
+    for (struct slab *s = c->free; s; s = s->next) total++;
+    spinlock_release(&c->lock);
+  }
+  return total;
+}
+
+uint64_t heap_slab_free_slabs(void) {
+  uint64_t total = 0;
+  for (size_t i = 0; i < CACHE_COUNT; i++) {
+    struct slab_cache *c = &heap_caches[i];
+    spinlock_acquire(&c->lock);
+    for (struct slab *s = c->free; s; s = s->next) total++;
+    spinlock_release(&c->lock);
+  }
+  return total;
 }

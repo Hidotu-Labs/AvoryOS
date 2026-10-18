@@ -151,7 +151,11 @@ struct drm_framebuffer *ascentdrm_framebuffer_create_full(struct drm_file *file,
         return NULL;
     int prime_ret = 0;
     if (prime->prime_buffer && virtio_gpu_is_initialized()) {
-        if (info->num_planes != 1 || cmd->pixel_format != 0x34325258)
+        /* The VirtIO X8 scanout ignores byte 3, so imported ARGB8888 has
+         * the same B,G,R byte layout as XRGB8888 and is safe to copy. */
+        if (info->num_planes != 1 ||
+            (cmd->pixel_format != 0x34325258 &&
+             cmd->pixel_format != 0x34325241))
             prime_ret = -22;
         else {
             prime_ret = ascentdrm_gem_begin_cpu(prime);

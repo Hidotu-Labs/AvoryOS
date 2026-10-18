@@ -89,6 +89,10 @@ static vfs_node_t *kcmp_fd_node(struct thread *t, uint64_t idx) {
   if (!t || !t->files || fd >= MAX_FDS)
     return NULL;
   spinlock_acquire(&t->files->lock);
+  if (fd >= t->files->capacity) {
+    spinlock_release(&t->files->lock);
+    return NULL;
+  }
   vfs_node_t *node = t->fds[fd];
   spinlock_release(&t->files->lock);
   if (!node || node == FD_RESERVED)
@@ -114,6 +118,10 @@ static uint64_t kcmp_epoll_target(struct thread *t1, struct thread *t2,
    * inspected.  Lock order tid_lock -> files->lock -> ep->lock; nothing takes
    * files->lock while holding ep->lock. */
   spinlock_acquire(&t2->files->lock);
+  if (slot->efd >= t2->files->capacity) {
+    spinlock_release(&t2->files->lock);
+    return (uint64_t)-KCMP_EBADF;
+  }
   vfs_node_t *ep_node = t2->fds[slot->efd];
   if (!ep_node || ep_node == FD_RESERVED) {
     spinlock_release(&t2->files->lock);

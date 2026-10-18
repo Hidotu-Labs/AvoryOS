@@ -100,6 +100,15 @@ ensure_dir_cmds "$DST_DIR"
 # EXCLUDE_IMAGE_PATHS="usr/include" for a fuller image.
 EXCLUDE_IMAGE_PATHS="${EXCLUDE_IMAGE_PATHS:-usr/include usr/share/doc usr/share/man}"
 
+# Static archives (*.a) are excluded trim-wise as well. Exceptions need the
+# pattern, not just the file: gcc's libgcc.a (and libstdc++.a) carry no
+# dynamic counterpart under /usr/lib/gcc/<target>/<ver>/, so a C/C++ link in
+# the image fails with "cannot find -lgcc" when they are dropped. Setting
+# EXCLUDE_IMAGE_STATIC="" copies every archive of the source tree, e.g. for
+# the targeted gcc install copied into the image separately.
+# Dash (no colon) substitution: set-but-empty disables the filter.
+EXCLUDE_IMAGE_STATIC="${EXCLUDE_IMAGE_STATIC-*.a}"
+
 # Assemble find(1) prune primaries from the exclusion list.
 PRUNE_EXPR=""
 for _ex in $EXCLUDE_IMAGE_PATHS; do
@@ -132,11 +141,16 @@ done
     fi
   done
 
-  # Then write files and symlinks (static archives are build-only, like
-  # the excluded include tree above).
+  # Then write files and symlinks (static archives matching
+  # EXCLUDE_IMAGE_STATIC, default "*.a", are build-only like the exclude
+  # list above; EXCLUDE_IMAGE_STATIC="" disables the archive filter).
   # shellcheck disable=SC2086
-  find . \( $PRUNE_EXPR \) -prune -o \( -type f ! -name '*.a' -o -type l \) -print | while IFS= read -r file_path; do
+  find . \( $PRUNE_EXPR \) -prune -o \( -type f -o -type l \) -print | while IFS= read -r file_path; do
     rel_path=${file_path#./}
+    if [ -n "$EXCLUDE_IMAGE_STATIC" ]; then
+      # shellcheck disable=SC2254
+      case "$rel_path" in ${EXCLUDE_IMAGE_STATIC}) continue ;; esac
+    fi
     if [ -L "$file_path" ]; then
       target=$(readlink "$file_path")
       echo "symlink $DST_DIR/$rel_path $target" >> "$CMDS_FILE"

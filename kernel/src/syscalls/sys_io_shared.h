@@ -56,6 +56,10 @@ static inline vfs_node_t *fd_node_get(struct thread *t, uint64_t fd) {
   if (!t || !t->files || fd >= MAX_FDS)
     return NULL;
   spinlock_acquire(&t->files->lock);
+  if (fd >= t->files->capacity) {
+    spinlock_release(&t->files->lock);
+    return NULL;
+  }
   vfs_node_t *node = t->fds[fd];
   if (fd_is_valid_node(node))
     vfs_node_ref(node);

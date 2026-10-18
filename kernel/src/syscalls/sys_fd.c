@@ -35,19 +35,38 @@
 /* lock held. The hint accelerates allocation, but is not proof of exhaustion:
  * a legacy release path may have left a reusable descriptor below it. */
 static int fd_find_free_locked(struct thread *t, int from) {
+  if (from < 0)
+    from = 0;
+  if (from >= MAX_FDS)
+    return -1;
+
+  if ((uint32_t)from >= t->files->capacity) {
+    if (!fd_table_expand_locked(t->files, (uint32_t)from))
+      return -1;
+  }
+
   uint32_t hint = t->files->next_fd;
-  if (hint > MAX_FDS)
-    hint = MAX_FDS;
+  if (hint > t->files->capacity)
+    hint = t->files->capacity;
   int start = from > (int)hint ? from : (int)hint;
-  for (int i = start; i < MAX_FDS; i++)
+  for (uint32_t i = (uint32_t)start; i < t->files->capacity; i++)
     if (!t->fds[i])
-      return i;
-  for (int i = from; i < (int)hint; i++) {
+      return (int)i;
+  for (uint32_t i = (uint32_t)from; i < hint; i++) {
     if (!t->fds[i]) {
       t->files->next_fd = 0;
-      return i;
+      return (int)i;
     }
   }
+
+  /* Expand table on demand if capacity < MAX_FDS */
+  if (t->files->capacity < MAX_FDS) {
+    uint32_t old_cap = t->files->capacity;
+    if (fd_table_expand_locked(t->files, old_cap)) {
+      return (int)old_cap;
+    }
+  }
+
   return -1;
 }
 
@@ -90,7 +109,7 @@ void fd_release_reserved(struct thread *t, int fd) {
     return;
   vfs_node_t *reserved = NULL;
   spinlock_acquire(&t->files->lock);
-  if (t->fds[fd] == FD_RESERVED) {
+  if ((uint32_t)fd < t->files->capacity && t->fds[fd] == FD_RESERVED) {
     reserved = t->files->reserved_nodes[fd];
     t->files->reserved_nodes[fd] = NULL;
     t->fds[fd] = NULL;
@@ -115,6 +134,10 @@ static vfs_node_t *fd_pin_node(struct thread *t, uint64_t fd,
     return NULL;
 
   spinlock_acquire(&t->files->lock);
+  if (fd >= t->files->capacity) {
+    spinlock_release(&t->files->lock);
+    return NULL;
+  }
   vfs_node_t *node = t->files->fds[fd];
   if (!node || node == FD_RESERVED) {
     node = NULL;
@@ -135,7 +158,7 @@ static void fd_advance_offset(struct thread *t, uint64_t fd,
     return;
   spinlock_acquire(&t->files->lock);
   /* A concurrent close may have reused this slot for a different file. */
-  if (t->files->fds[fd] == node)
+  if (fd < t->files->capacity && t->files->fds[fd] == node)
     t->files->fd_offsets[fd] += amount;
   spinlock_release(&t->files->lock);
 }
@@ -354,7 +377,7 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     if (dirfd == AT_FDCWD) {
       base_dir = t->cwd_node ? t->cwd_node : fs_root;
     } else {
-      if (dirfd < 0 || dirfd >= MAX_FDS || !t->fds[dirfd])
+      if (!FD_IN_RANGE(t, dirfd) || !t->fds[dirfd])
         return (uint64_t)-9; // EBADF
       base_dir = t->fds[dirfd];
       if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY)
@@ -484,12 +507,13 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     }
   }
 
+  char parent_walk[512];
+  const char *lookup_path = path;
+  vfs_node_t *lookup_base = base_dir;
+
   if (!node) {
     /* The VFS component stack starts at base_dir. To walk above an open
      * directory, seed it with that descriptor's saved absolute path. */
-    char parent_walk[512];
-    const char *lookup_path = path;
-    vfs_node_t *lookup_base = base_dir;
     if (!vfs_namespace_active() && path[0] != '/' && (!strcmp(path, "..") || !strncmp(path, "../", 3))) {
       spinlock_acquire(&t->files->lock);
       const char *start = dirfd == AT_FDCWD ? t->cwd_path : fd_path_value(t, dirfd);
@@ -516,31 +540,35 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     if (flags & O_CREAT) {
       char parent_path[512];
       char file_name[256];
-      size_t len = strlen(path);
+      size_t len = strlen(lookup_path);
       if (len == 0 || len >= 4096)
         return (uint64_t)-14;
 
       const char *slash = 0;
-      for (const char *p = path; *p; p++)
+      for (const char *p = lookup_path; *p; p++)
         if (*p == '/')
           slash = p;
 
-      vfs_node_t *parent = base_dir;
+      vfs_node_t *parent = lookup_base;
       bool parent_owned = false;
       if (slash) {
-        size_t parent_len = (size_t)(slash - path);
+        size_t parent_len = (size_t)(slash - lookup_path);
         if (parent_len == 0) {
           parent = fs_root;
         } else {
           if (parent_len >= sizeof(parent_path))
             return (uint64_t)-14;
           for (size_t i = 0; i < parent_len; i++)
-            parent_path[i] = path[i];
+            parent_path[i] = lookup_path[i];
           parent_path[parent_len] = '\0';
-          parent = vfs_resolve_path_at(base_dir, parent_path);
+          parent = vfs_resolve_path_at(lookup_base, parent_path);
           parent_owned = parent != NULL;
         }
         size_t file_len = strlen(slash + 1);
+        if (file_len == 0) {
+          if (parent_owned) vfs_close(parent);
+          return (uint64_t)-21; // EISDIR
+        }
         if (file_len >= sizeof(file_name)) {
           if (parent_owned) vfs_close(parent);
           return (uint64_t)-14;
@@ -550,7 +578,7 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
         size_t file_len = len;
         if (file_len >= sizeof(file_name))
           return (uint64_t)-14;
-        strcpy(file_name, path);
+        strcpy(file_name, lookup_path);
       }
 
       if (!parent)
@@ -672,7 +700,7 @@ open_done:
   char full_path[256];
   spinlock_acquire(&t->files->lock);
   const char *base_path = t->cwd_path;
-  if (path[0] != '/' && dirfd != AT_FDCWD && dirfd >= 0 && dirfd < MAX_FDS)
+  if (path[0] != '/' && dirfd != AT_FDCWD && FD_IN_RANGE(t, dirfd))
     base_path = fd_path_value(t, dirfd);
   bool path_ok = vfs_namespace_active() && node->view_backing
       ? vfs_namespace_node_path(node, full_path, sizeof(full_path))
@@ -873,6 +901,10 @@ static uint64_t sys_close(uint64_t fd, uint64_t a1, uint64_t a2, uint64_t a3,
     return (uint64_t)-9;
 
   spinlock_acquire(&t->files->lock);
+  if (fd >= t->files->capacity) {
+    spinlock_release(&t->files->lock);
+    return (uint64_t)-9;
+  }
   vfs_node_t *node = t->fds[fd];
   if (!fd_is_valid_node(node)) {
     spinlock_release(&t->files->lock);
@@ -910,6 +942,11 @@ static uint64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags,
     return 0;
   if (last >= MAX_FDS)
     last = MAX_FDS - 1;
+
+  if (first >= t->files->capacity)
+    return 0;
+  if (last >= t->files->capacity)
+    last = t->files->capacity - 1;
 
   /* File tables are already private for forked children.  CLONE_UNSHARE is
    * accepted here; callers using it only need the range operation itself. */
@@ -956,6 +993,10 @@ static int64_t fd_duplicate(struct thread *t, uint64_t oldfd,
   if (!t || !t->files || oldfd >= MAX_FDS)
     return -9;
   spinlock_acquire(&t->files->lock);
+  if (oldfd >= t->files->capacity) {
+    spinlock_release(&t->files->lock);
+    return -9;
+  }
   vfs_node_t *node = t->fds[oldfd];
   if (!fd_is_valid_node(node)) {
     spinlock_release(&t->files->lock);
@@ -968,6 +1009,12 @@ static int64_t fd_duplicate(struct thread *t, uint64_t oldfd,
   if (fixed && oldfd == target) {
     spinlock_release(&t->files->lock);
     return (int64_t)target;
+  }
+  if (fixed && target >= t->files->capacity) {
+    if (!fd_table_expand_locked(t->files, (uint32_t)target)) {
+      spinlock_release(&t->files->lock);
+      return -24; // EMFILE
+    }
   }
   if (fixed && t->fds[target] == FD_RESERVED) {
     spinlock_release(&t->files->lock);
@@ -1044,7 +1091,7 @@ static uint64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags,
 
 static void trace_userspace_debug_write(struct thread *t, int fd,
                                         const void *buf, size_t count) {
-  if (!t || fd < 0 || fd >= MAX_FDS || !t->fds[fd] || !buf || count == 0)
+  if (!FD_IN_RANGE(t, fd) || !t->fds[fd] || !buf || count == 0)
     return;
 
   /* Only two node names ever match the strcmp()s below.  Running the pair on
@@ -1384,8 +1431,8 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
        * of 0, so reaching here means a backend bug — report ENOSPC so
        * userspace sees "No space left" rather than generic EIO. */
       struct thread *t = sched_get_current();
-      vfs_node_t *wnode = (t && fd < MAX_FDS) ? t->fds[fd] : NULL;
-      uint64_t woff = (t && fd < MAX_FDS) ? t->fd_offsets[fd] : 0;
+      vfs_node_t *wnode = (t && FD_IN_RANGE(t, fd)) ? t->fds[fd] : NULL;
+      uint64_t woff = (t && FD_IN_RANGE(t, fd)) ? t->fd_offsets[fd] : 0;
       klog_puts("[WRITEV] zero write fd=");
       klog_uint64(fd);
       klog_puts(" len=");
@@ -1559,7 +1606,7 @@ static uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd,
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
-  if (!t || out_fd >= MAX_FDS || in_fd >= MAX_FDS || !fd_is_valid_node(t->fds[out_fd]) ||
+  if (!t || !FD_IN_RANGE(t, out_fd) || !FD_IN_RANGE(t, in_fd) || !fd_is_valid_node(t->fds[out_fd]) ||
       !fd_is_valid_node(t->fds[in_fd]))
     return (uint64_t)-9;
 
@@ -1747,7 +1794,7 @@ static uint64_t sys_copy_file_range(uint64_t fd_in, uint64_t off_in,
                                     uint64_t fd_out, uint64_t off_out,
                                     uint64_t len, uint64_t flags) {
   struct thread *t = sched_get_current();
-  if (!t || fd_in >= MAX_FDS || fd_out >= MAX_FDS || !fd_is_valid_node(t->fds[fd_in]) ||
+  if (!t || !FD_IN_RANGE(t, fd_in) || !FD_IN_RANGE(t, fd_out) || !fd_is_valid_node(t->fds[fd_in]) ||
       !fd_is_valid_node(t->fds[fd_out]))
     return (uint64_t)-9;
 
@@ -1760,7 +1807,7 @@ static uint64_t sys_copy_file_range(uint64_t fd_in, uint64_t off_in,
 static uint64_t sys_splice(uint64_t fd_in, uint64_t off_in, uint64_t fd_out,
                            uint64_t off_out, uint64_t len, uint64_t flags) {
   struct thread *t = sched_get_current();
-  if (!t || fd_in >= MAX_FDS || fd_out >= MAX_FDS || !fd_is_valid_node(t->fds[fd_in]) ||
+  if (!t || !FD_IN_RANGE(t, fd_in) || !FD_IN_RANGE(t, fd_out) || !fd_is_valid_node(t->fds[fd_in]) ||
       !fd_is_valid_node(t->fds[fd_out]))
     return (uint64_t)-9;
 
@@ -1789,7 +1836,7 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
-  if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd]))
+  if (!t || !FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->fds[fd]))
     return (uint64_t)-9;
 
   vfs_node_t *node = t->fds[fd];
@@ -1816,7 +1863,7 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
 /* Resolve both descriptors under one lock: CLONE_FILES close/reuse cannot
  * change either slot between validation and the identity comparison. */
 static int64_t fd_query_description(struct thread *t, uint64_t fd, int other) {
-  if (!t || !t->files || fd >= MAX_FDS || other < 0 || other >= MAX_FDS)
+  if (!t || !t->files || !FD_IN_RANGE(t, fd) || other < 0 || !FD_IN_RANGE(t, (uint64_t)other))
     return -9; // EBADF
   spinlock_acquire(&t->files->lock);
   int64_t result = -9;
@@ -1848,7 +1895,7 @@ static uint64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a3,
   if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC)
     return (uint64_t)fd_duplicate(t, fd, (uint64_t)(int64_t)(int)arg,
                                    false, cmd == F_DUPFD_CLOEXEC);
-  if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd]))
+  if (!t || !FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->fds[fd]))
     return (uint64_t)-9; // EBADF
 
   switch (cmd) {
@@ -1965,7 +2012,7 @@ static uint64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t a2,
   vfs_node_t *node = fd_pin_node(t, fd, NULL, NULL);
   if (!node) {
     uintptr_t slot = 0;
-    if (t && t->files && fd < MAX_FDS) {
+    if (t && t->files && FD_IN_RANGE(t, fd)) {
       spinlock_acquire(&t->files->lock);
       slot = (uintptr_t)t->files->fds[fd];
       spinlock_release(&t->files->lock);
@@ -2001,7 +2048,7 @@ static uint64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset,
   vfs_node_t *node = fd_pin_node(t, fd, NULL, NULL);
   if (!node) {
     uintptr_t slot = 0;
-    if (t && t->files && fd < MAX_FDS) {
+    if (t && t->files && FD_IN_RANGE(t, fd)) {
       spinlock_acquire(&t->files->lock);
       slot = (uintptr_t)t->files->fds[fd];
       spinlock_release(&t->files->lock);
@@ -2056,7 +2103,7 @@ static uint64_t sys_fsync(uint64_t fd, uint64_t a1, uint64_t a2, uint64_t a3,
   (void)a4;
   (void)a5;
   struct thread *t = sched_get_current();
-  if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd]))
+  if (!t || !FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->fds[fd]))
     return (uint64_t)-9;
   vfs_cache_sync(t->fds[fd]);
   return 0;
@@ -2084,7 +2131,7 @@ static uint64_t sys_sync_file_range(uint64_t fd, uint64_t offset,
                           SYNC_FILE_RANGE_WAIT_AFTER))
     return (uint64_t)-22; // EINVAL: unknown flag bits
   struct thread *t = sched_get_current();
-  if (!t || fd >= MAX_FDS || !fd_is_valid_node(t->fds[fd]))
+  if (!t || !FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->fds[fd]))
     return (uint64_t)-9; // EBADF
   vfs_cache_sync(t->fds[fd]);
   return 0;

@@ -974,6 +974,27 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   if (size > node->length - offset)
     size = node->length - offset;
 
+  /* Adaptive on-demand readahead window evaluation */
+  uint32_t ra_window = 0;
+  if ((node->flags & FS_TYPE_MASK) == FS_FILE && node->read) {
+    spinlock_acquire(&node->pages_lock);
+    if (offset == node->ra_prev_offset) {
+      /* Sequential access detected: scale up readahead window */
+      node->ra_seq_hits++;
+      if (node->ra_window == 0)
+        node->ra_window = 16 * 1024; /* initial 16 KB (4 pages) */
+      else if (node->ra_seq_hits >= 2 && node->ra_window < 128 * 1024)
+        node->ra_window *= 2;        /* expand up to 128 KB */
+    } else {
+      /* Random seek: collapse window */
+      node->ra_seq_hits = 0;
+      node->ra_window = 0;
+    }
+    node->ra_prev_offset = offset + size;
+    ra_window = node->ra_window;
+    spinlock_release(&node->pages_lock);
+  }
+
   uint32_t done = 0;
   while (done < size) {
     uint32_t current = offset + done;
@@ -984,6 +1005,19 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       count = size - done;
 
     vfs_page_t *page = vfs_cache_lookup(node, page_offset);
+    if (!page && ra_window > 0) {
+      uint32_t ra_bytes = ra_window;
+      if (ra_bytes < size - done)
+        ra_bytes = size - done;
+      (void)vfs_cache_readahead(node, page_offset, ra_bytes);
+      page = vfs_cache_lookup(node, page_offset);
+
+      /* When sequential access is sustained, queue background prefetch
+       * for the upcoming window to overlap CPU processing with disk I/O. */
+      if (node->ra_seq_hits >= 3 && page_offset + ra_bytes < node->length) {
+        vfs_cache_prefetch_async(node, page_offset + ra_bytes, ra_window);
+      }
+    }
     if (page) {
       /* Readahead and the exec-time prefetcher publish a page before its
        * frame is filled (loading=true), and a failed fill can leave a page
@@ -1002,14 +1036,6 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       }
     }
     if (!page) {
-      if (node->length >= 64 * 1024) {
-        uint32_t ra_bytes = 128 * 1024;
-        if (size - done > ra_bytes)
-          ra_bytes = (size - done + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-        if (ra_bytes > 256 * 1024)
-          ra_bytes = 256 * 1024;
-        vfs_cache_readahead(node, page_offset, ra_bytes);
-      }
       page = vfs_cache_get_or_create(node, page_offset);
     }
     if (!page) {

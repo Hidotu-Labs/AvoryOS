@@ -1623,8 +1623,23 @@ static wizard_step_t screen_installing(void) {
     else if (g_desktop_choice == 3) xinit_cmd = "";
 
     if (xinit_cmd[0]) {
+        /* Root's home is "/" on AvoryOS. Join the XDG defaults through
+         * "${HOME%/}" so startx sessions never export //.cache-style paths:
+         * WebKitGTK rejects those as sandbox roots and Epiphany aborts on the
+         * critical that follows (docs/epiphany-pulse-launch-abort.md). */
+        const char *xdg_env =
+            "_avory_home=\"${HOME:-/}\"\n"
+            "_avory_home=\"${_avory_home%/}\"\n"
+            "export XDG_CONFIG_HOME=\"${XDG_CONFIG_HOME:-${_avory_home}/.config}\"\n"
+            "export XDG_CACHE_HOME=\"${XDG_CACHE_HOME:-${_avory_home}/.cache}\"\n"
+            "export XDG_DATA_HOME=\"${XDG_DATA_HOME:-${_avory_home}/.local/share}\"\n"
+            "export XDG_STATE_HOME=\"${XDG_STATE_HOME:-${_avory_home}/.local/state}\"\n"
+            "unset _avory_home\n";
+
         FILE *xinit = fopen(TARGET_MOUNT "/root/.xinitrc", "w");
         if (xinit) {
+            fputs("#!/bin/sh\n", xinit);
+            fputs(xdg_env, xinit);
             fprintf(xinit, "%s\n", xinit_cmd);
             fclose(xinit);
             chmod(TARGET_MOUNT "/root/.xinitrc", 0755);
@@ -1634,6 +1649,8 @@ static wizard_step_t screen_installing(void) {
             snprintf(u_xinit, sizeof(u_xinit), TARGET_MOUNT "/home/%s/.xinitrc", g_username);
             xinit = fopen(u_xinit, "w");
             if (xinit) {
+                fputs("#!/bin/sh\n", xinit);
+                fputs(xdg_env, xinit);
                 fprintf(xinit, "%s\n", xinit_cmd);
                 fclose(xinit);
                 chmod(u_xinit, 0755);

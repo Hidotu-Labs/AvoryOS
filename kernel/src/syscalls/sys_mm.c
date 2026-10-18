@@ -133,14 +133,20 @@ static bool range_page_is_ours(struct thread *t, uint64_t va, bool mm_locked) {
   return ours;
 }
 
-/* Generic cache views and private memfd views own a reference per PTE.
- * Shared device views retain the backing object's ownership convention. */
+/* Generic cache views and direct private/shared views own a reference per
+ * PTE (see the vfs_node flags); device-backed shared views retain the backing
+ * object's ownership convention. */
 static bool vma_has_file_page_refs(struct vma *v) {
   if (!v)
     return false;
+  if (v->flags & (MAP_PAGECACHE | MAP_SYSV_SHM))
+    return true;
   vfs_node_t *node = (vfs_node_t *)v->file_node;
-  return (v->flags & MAP_PAGECACHE) ||
-         ((v->flags & MAP_PRIVATE) && node && node->mmap_private_pmm_refs);
+  if (!node)
+    return false;
+  if (v->flags & MAP_SHARED)
+    return node->mmap_shared_pmm_refs;
+  return (v->flags & MAP_PRIVATE) && node->mmap_private_pmm_refs;
 }
 
 static bool range_page_is_pagecache(struct thread *t, uint64_t va,
@@ -217,9 +223,9 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
       cv = vma_find(&t->mm->vmas, va);
       if (cv) {
         cv_end = cv->end;
-        ours = (cv->fd == -1 && (cv->flags & MAP_PRIVATE) &&
-                (cv->flags & MAP_ANONYMOUS));
-        pagecache = vma_has_file_page_refs(cv);
+        ours = ((cv->flags & MAP_PRIVATE) &&
+                ((cv->flags & MAP_ANONYMOUS) || (cv->fd == -1 && !cv->file_node)));
+        pagecache = vma_has_file_page_refs(cv) || (cv->flags & MAP_PRIVATE);
       } else {
         // Gap: unmap without freeing; re-evaluate on the next page. Gaps
         // are rare in teardown ranges, so one lookup per gap page is fine.
@@ -241,7 +247,7 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
       }
       pt_dirty = true;
       sweep_rep = va;
-      if ((ours || pagecache) && frame != 0) {
+      if ((ours || pagecache) && frame != 0 && pmm_is_managed(frame)) {
         fphys[nf] = frame;
         fnpages[nf] = 1;
         nf++;
@@ -653,9 +659,12 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
     }
     if (node->mmap &&
         !(node->mmap_shared_only && ((flags & 0x3) == MAP_PRIVATE))) {
-      // Pass MAP_FIXED to internal handler to ensure it respects our vaddr
+      /* Drivers receive the same page-rounded interval as the native VMA.
+       * TTM inserts whole pages and rejects a final page beyond vm_end;
+       * passing the byte length here makes small GPU uploads refault forever.
+       * MAP_FIXED ensures the handler respects our selected address. */
       uint64_t result =
-          node->mmap(node, vaddr, length, prot, flags | MAP_FIXED, offset);
+          node->mmap(node, vaddr, aligned_len, prot, flags | MAP_FIXED, offset);
       if (result >= (uint64_t)-4095) {
         /* A failed Linux f_op->mmap must not leave a pending bridge wrapper. */
         extern void *linuxkpi_vma_take_pending(void) __attribute__((weak));
@@ -833,9 +842,12 @@ uint64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t a2, uint64_t a3,
   return 0;
 }
 
-// sys_brk  (unchanged from original — included for completeness)
+// sys_brk
 // Linux ABI: brk(addr)  —  rdi=addr
 // Returns the current/new program break.
+#define BRK_SHRINK_BATCH 32 /* bounded like MUNMAP_BATCH_PAGES: the per-CPU
+                             * deferred frame queues hold 64 entries, so a
+                             * single unbounded sweep would overflow them. */
 static uint64_t sys_brk(uint64_t addr, uint64_t a1, uint64_t a2, uint64_t a3,
                         uint64_t a4, uint64_t a5) {
   (void)a1;
@@ -889,12 +901,35 @@ static uint64_t sys_brk(uint64_t addr, uint64_t a1, uint64_t a2, uint64_t a3,
     uint64_t old_end = PAGE_ALIGN_UP(current->mm->brk_current);
     uint64_t new_end = PAGE_ALIGN_UP(addr);
 
-    for (uint64_t page = new_end; page < old_end; page += PAGE_SIZE) {
-      uint64_t phys = vmm_virt_to_phys(pml4, page);
-      if (phys != 0) {
-        phys = PAGE_ALIGN_DOWN(phys);
-        safe_unmap_and_free(pml4, page, phys, true, "sys_brk shrink");
+    /* Tearing down the shrunk range follows the sys_munmap pattern:
+     * reserve it PROT_NONE so concurrent faults cannot reinstall PTEs, then
+     * unmap in bounded batches with mm->lock dropped and drain the per-CPU
+     * deferred queues between batches.  Unmapping every page under one held
+     * spinlock used to make each drain run with interrupts masked, so remote
+     * acknowledgements never completed and the faulted-in frames stayed
+     * parked (or were dropped from the overflowed 64-entry queues) instead
+     * of being returned to the PMM. */
+    if (new_end < old_end) {
+      spinlock_release(&current->mm->lock);
+
+      spinlock_acquire(&current->mm->lock);
+      vma_mprotect(&current->mm->vmas, new_end, old_end, PROT_NONE);
+      spinlock_release(&current->mm->lock);
+
+      for (uint64_t batch_start = new_end; batch_start < old_end;) {
+        uint64_t batch_end = batch_start + (uint64_t)BRK_SHRINK_BATCH * PAGE_SIZE;
+        if (batch_end < batch_start || batch_end > old_end)
+          batch_end = old_end;
+
+        spinlock_acquire(&current->mm->lock);
+        teardown_range(pml4, current, batch_start, batch_end - batch_start,
+                       true, "sys_brk shrink");
+        spinlock_release(&current->mm->lock);
+        vmm_drain_deferred_work();
+        batch_start = batch_end;
       }
+
+      spinlock_acquire(&current->mm->lock);
     }
 
     vma_remove(&current->mm->vmas, new_end, old_end);
@@ -1359,12 +1394,12 @@ static uint64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice,
 
   spinlock_acquire(&current->mm->lock);
 
-  // MADV_DONTNEED / MADV_REMOVE:
+  // MADV_DONTNEED / MADV_REMOVE / MADV_FREE / MADV_COLD / MADV_PAGEOUT:
   // Discard physical pages in the address range so that subsequent accesses
   // yield fresh zero-filled pages for anonymous mappings, as required by POSIX/Linux.
-  // Note: MADV_FREE is an advisory hint that pages CAN be reclaimed under memory
-  // pressure, but must NOT be immediately discarded if no pressure exists.
-  if (advice == MADV_DONTNEED || advice == MADV_REMOVE) {
+  // Reclaiming pages immediately on MADV_FREE releases heap chunks back to PMM.
+  if (advice == MADV_DONTNEED || advice == MADV_REMOVE || advice == MADV_FREE ||
+      advice == MADV_COLD || advice == MADV_PAGEOUT) {
     uint64_t *pml4 = (uint64_t *)current->cr3;
     if (!pml4)
       pml4 = vmm_get_active_pml4();
@@ -1389,6 +1424,9 @@ static uint64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice,
       vmm_drain_deferred_work();
       b = be;
     }
+    tlb_shootdown_context_for((uint64_t)pml4);
+    tlb_shootdown_poll();
+    vmm_drain_deferred_work();
 #undef MADVISE_BATCH_PAGES
     return 0;
   }

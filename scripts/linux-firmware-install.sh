@@ -29,9 +29,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="${LINUX_FIRMWARE_REPO:-https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git}"
 # Pinned for reproducible builds (the Phase 6 C4 evidence names this ref).
-REF="${LINUX_FIRMWARE_REF:-20260910}"
+REF="${LINUX_FIRMWARE_REF:-20260916}"
 SRC="${LINUX_FIRMWARE_SRC:-$ROOT/build/linux-firmware}"
-DEST="$ROOT/build/firmware/lib/firmware"
+FINAL_DEST="$ROOT/build/firmware/lib/firmware"
 MANIFEST="$ROOT/scripts/linux/firmware-manifest.txt"
 GEN="$ROOT/build/firmware/kpi_fw_manifest.h"
 
@@ -67,9 +67,10 @@ else
     fi
 fi
 
-mkdir -p "$DEST"
+mkdir -p "$ROOT/build/firmware"
+DEST="$(mktemp -d "$ROOT/build/firmware/.stage.XXXXXXXX")"
 staged_list="$(mktemp)"
-trap 'rm -f "$staged_list"' EXIT
+trap 'rm -f "$staged_list"; rm -rf -- "$DEST"' EXIT
 copied=0
 
 # Stage one match.  $1 is the path relative to the source tree (possibly
@@ -119,6 +120,16 @@ for entry in "${entries[@]}"; do
         die "manifest entry matches nothing: $entry"
     fi
 done
+
+# A plain distro tree used to silently bypass the requested pin. Enforce the
+# reviewed Raphael bundle even when LINUX_FIRMWARE_SRC names a non-git tree.
+if [ "$REF" = 20260916 ]; then
+    (cd "$DEST" && sha256sum --check "$ROOT/scripts/linux/firmware-sha256-20260916.txt") ||
+        die "firmware does not match the approved 20260916 bundle; use the pinned source tree"
+fi
+
+mkdir -p "$FINAL_DEST"
+cp -a "$DEST/." "$FINAL_DEST/"
 
 # Emit the C manifest used by the Phase 5 firmware self-test.  zlib.crc32()
 # matches the kernel's crc32_le(~0, p, len) ^ ~0.

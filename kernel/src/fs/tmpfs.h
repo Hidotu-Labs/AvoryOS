@@ -66,4 +66,6 @@ vfs_node_t *tmpfs_create_private_root(void);
 int         tmpfs_rename_cross(vfs_node_t *old_parent, char *old_name,
                                vfs_node_t *new_parent, char *new_name);
 
+uint64_t    tmpfs_total_pages(void);
+
 #endif

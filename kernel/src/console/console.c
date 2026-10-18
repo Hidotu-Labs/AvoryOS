@@ -8,6 +8,7 @@
 #include "klog.h"
 #include "lib/string.h"
 #include "lock/spinlock.h"
+#include "../mm/heap.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -136,14 +137,36 @@ static uint32_t bold_color(uint32_t color) {
 #define HISTORY_MAX 1000
 #define COLS_MAX 512
 
-static console_char_t history[HISTORY_MAX][COLS_MAX];
+static uint32_t max_cols;
+static uint32_t max_rows;
+static console_char_t *history_rows[HISTORY_MAX];
+static console_char_t fallback_row[COLS_MAX];
+
+static inline console_char_t *console_get_history_row(uint32_t row) {
+  row %= HISTORY_MAX;
+  if (!history_rows[row]) {
+    uint32_t cols = (max_cols > 0 && max_cols <= COLS_MAX) ? max_cols : 80;
+    history_rows[row] = kmalloc(cols * sizeof(console_char_t));
+    if (history_rows[row]) {
+      for (uint32_t x = 0; x < cols; x++) {
+        history_rows[row][x].c = 0;
+        history_rows[row][x].fg = FG_COLOR;
+        history_rows[row][x].bg = BG_COLOR;
+        history_rows[row][x].bold = false;
+        history_rows[row][x].underline = false;
+      }
+    } else {
+      return fallback_row;
+    }
+  }
+  return history_rows[row];
+}
+
 static uint32_t history_write_row = 0;
 static uint32_t view_scroll_offset = 0;
 
 static uint32_t cursor_x;
 static uint32_t cursor_y;
-static uint32_t max_cols;
-static uint32_t max_rows;
 static bool cursor_logical_visible = false;
 static bool cursor_phys_on = false;
 static uint64_t last_blink_ms = 0;
@@ -171,7 +194,7 @@ static void console_redraw(void) {
     if (h_row > end_row)
       break;
 
-    console_char_t *cells = history[h_row % HISTORY_MAX];
+    console_char_t *cells = console_get_history_row(h_row);
     uint32_t py = y * FONT_HEIGHT;
 
     for (uint32_t x = 0; x < max_cols; x++) {
@@ -302,6 +325,10 @@ void console_init(struct limine_framebuffer *framebuffer) {
   saved_cursor_y = 0;
   last_printed_cp = ' ';
 
+  for (uint32_t r = 0; r < max_rows; r++) {
+    (void)console_get_history_row(r);
+  }
+
   fb_clear(BG_COLOR);
   console_initialized = true;
   klogf("[CONSOLE] build %s %s (scrollback: Shift+PgUp/PgDn, Shift+Up/Down, "
@@ -318,11 +345,13 @@ static uint32_t console_history_row(uint32_t screen_row) {
 
 static void console_clear_line_from_cursor(void) {
   uint32_t row = console_history_row(cursor_y);
+  console_char_t *cells = console_get_history_row(row);
   for (uint32_t x = cursor_x; x < max_cols; x++) {
-    console_char_t *cell = &history[row][x];
-    cell->c = 0;
-    cell->fg = current_fg;
-    cell->bg = current_bg;
+    cells[x].c = 0;
+    cells[x].fg = current_fg;
+    cells[x].bg = current_bg;
+    cells[x].bold = false;
+    cells[x].underline = false;
   }
   /* Every erased cell shares one background, so paint the whole tail of the
    * row with a single fill: one damage span instead of one per cell. */
@@ -345,7 +374,11 @@ static void console_wipe_history_unlocked(void) {
     fb_set_backbuffer_mode(false);
     fb_clear(BG_COLOR);
   }
-  memset(history, 0, sizeof(history));
+  for (uint32_t i = 0; i < HISTORY_MAX; i++) {
+    if (history_rows[i]) {
+      memset(history_rows[i], 0, max_cols * sizeof(console_char_t));
+    }
+  }
   cursor_x = 0;
   cursor_y = 0;
   view_scroll_offset = 0;
@@ -539,10 +572,13 @@ static void console_process_escape_sequence(void) {
       console_clear_line_from_cursor();
       for (uint32_t y = cursor_y + 1; y < max_rows; y++) {
         uint32_t row = console_history_row(y);
+        console_char_t *cells = console_get_history_row(row);
         for (uint32_t x = 0; x < max_cols; x++) {
-          history[row][x].c = 0;
-          history[row][x].fg = current_fg;
-          history[row][x].bg = current_bg;
+          cells[x].c = 0;
+          cells[x].fg = current_fg;
+          cells[x].bg = current_bg;
+          cells[x].bold = false;
+          cells[x].underline = false;
         }
         if (view_scroll_offset == 0) {
           fb_fill_rect(0, y * FONT_HEIGHT, fb_get_width(), FONT_HEIGHT,
@@ -553,10 +589,13 @@ static void console_process_escape_sequence(void) {
       // Erase from beginning of screen to cursor
       for (uint32_t y = 0; y < cursor_y; y++) {
         uint32_t row = console_history_row(y);
+        console_char_t *cells = console_get_history_row(row);
         for (uint32_t x = 0; x < max_cols; x++) {
-          history[row][x].c = 0;
-          history[row][x].fg = current_fg;
-          history[row][x].bg = current_bg;
+          cells[x].c = 0;
+          cells[x].fg = current_fg;
+          cells[x].bg = current_bg;
+          cells[x].bold = false;
+          cells[x].underline = false;
         }
         if (view_scroll_offset == 0) {
           fb_fill_rect(0, y * FONT_HEIGHT, fb_get_width(), FONT_HEIGHT,
@@ -564,10 +603,13 @@ static void console_process_escape_sequence(void) {
         }
       }
       uint32_t row = console_history_row(cursor_y);
+      console_char_t *cells = console_get_history_row(row);
       for (uint32_t x = 0; x <= cursor_x && x < max_cols; x++) {
-        history[row][x].c = 0;
-        history[row][x].fg = current_fg;
-        history[row][x].bg = current_bg;
+        cells[x].c = 0;
+        cells[x].fg = current_fg;
+        cells[x].bg = current_bg;
+        cells[x].bold = false;
+        cells[x].underline = false;
       }
       if (view_scroll_offset == 0 && cursor_x < max_cols)
         fb_fill_rect(0, cursor_y * FONT_HEIGHT, (cursor_x + 1) * FONT_WIDTH,
@@ -576,10 +618,13 @@ static void console_process_escape_sequence(void) {
       // Erase entire viewport but keep scrollback
       for (uint32_t y = 0; y < max_rows; y++) {
         uint32_t row = console_history_row(y);
+        console_char_t *cells = console_get_history_row(row);
         for (uint32_t x = 0; x < max_cols; x++) {
-          history[row][x].c = 0;
-          history[row][x].fg = current_fg;
-          history[row][x].bg = current_bg;
+          cells[x].c = 0;
+          cells[x].fg = current_fg;
+          cells[x].bg = current_bg;
+          cells[x].bold = false;
+          cells[x].underline = false;
         }
         if (view_scroll_offset == 0) {
           fb_fill_rect(0, y * FONT_HEIGHT, fb_get_width(), FONT_HEIGHT,
@@ -600,10 +645,13 @@ static void console_process_escape_sequence(void) {
     } else if (value == 1) {
       // Erase from beginning of line to cursor
       uint32_t row = console_history_row(cursor_y);
+      console_char_t *cells = console_get_history_row(row);
       for (uint32_t x = 0; x <= cursor_x && x < max_cols; x++) {
-        history[row][x].c = 0;
-        history[row][x].fg = current_fg;
-        history[row][x].bg = current_bg;
+        cells[x].c = 0;
+        cells[x].fg = current_fg;
+        cells[x].bg = current_bg;
+        cells[x].bold = false;
+        cells[x].underline = false;
       }
       if (view_scroll_offset == 0 && cursor_x < max_cols)
         fb_fill_rect(0, cursor_y * FONT_HEIGHT, (cursor_x + 1) * FONT_WIDTH,
@@ -611,10 +659,13 @@ static void console_process_escape_sequence(void) {
     } else if (value == 2) {
       // Erase entire line
       uint32_t row = console_history_row(cursor_y);
+      console_char_t *cells = console_get_history_row(row);
       for (uint32_t x = 0; x < max_cols; x++) {
-        history[row][x].c = 0;
-        history[row][x].fg = current_fg;
-        history[row][x].bg = current_bg;
+        cells[x].c = 0;
+        cells[x].fg = current_fg;
+        cells[x].bg = current_bg;
+        cells[x].bold = false;
+        cells[x].underline = false;
       }
       if (view_scroll_offset == 0)
         fb_fill_rect(0, cursor_y * FONT_HEIGHT, max_cols * FONT_WIDTH,
@@ -815,10 +866,13 @@ static void console_process_escape_sequence(void) {
       scroll_up();
       history_write_row++;
       uint32_t new_row = history_write_row % HISTORY_MAX;
-      for (uint32_t x = 0; x < COLS_MAX; x++) {
-        history[new_row][x].c = 0;
-        history[new_row][x].fg = FG_COLOR;
-        history[new_row][x].bg = BG_COLOR;
+      console_char_t *cells = console_get_history_row(new_row);
+      for (uint32_t x = 0; x < max_cols; x++) {
+        cells[x].c = 0;
+        cells[x].fg = FG_COLOR;
+        cells[x].bg = BG_COLOR;
+        cells[x].bold = false;
+        cells[x].underline = false;
       }
     }
     break;
@@ -828,12 +882,15 @@ static void console_process_escape_sequence(void) {
               // cursor)
     int n = (value > 0) ? value : 1;
     uint32_t row = console_history_row(cursor_y);
+    console_char_t *cells = console_get_history_row(row);
     uint32_t count = 0;
     for (int i = 0; i < n && cursor_x + (uint32_t)i < max_cols; i++) {
       uint32_t cx = cursor_x + (uint32_t)i;
-      history[row][cx].c = 0;
-      history[row][cx].fg = current_fg;
-      history[row][cx].bg = current_bg;
+      cells[cx].c = 0;
+      cells[cx].fg = current_fg;
+      cells[cx].bg = current_bg;
+      cells[cx].bold = false;
+      cells[cx].underline = false;
       count++;
     }
     if (view_scroll_offset == 0 && count)
@@ -854,14 +911,17 @@ static void console_process_escape_sequence(void) {
   case 'P': { // Delete N characters (DCH)
     int n = (value > 0) ? value : 1;
     uint32_t row = console_history_row(cursor_y);
+    console_char_t *cells = console_get_history_row(row);
     uint32_t end = max_cols - (uint32_t)n;
     for (uint32_t x = cursor_x; x < max_cols; x++) {
       if (x + (uint32_t)n < max_cols) {
-        history[row][x] = history[row][x + (uint32_t)n];
+        cells[x] = cells[x + (uint32_t)n];
       } else {
-        history[row][x].c = 0;
-        history[row][x].fg = current_fg;
-        history[row][x].bg = current_bg;
+        cells[x].c = 0;
+        cells[x].fg = current_fg;
+        cells[x].bg = current_bg;
+        cells[x].bold = false;
+        cells[x].underline = false;
       }
     }
     (void)end;
@@ -875,16 +935,19 @@ static void console_process_escape_sequence(void) {
   case '@': { // Insert N blank characters (ICH)
     int n = (value > 0) ? value : 1;
     uint32_t row = console_history_row(cursor_y);
+    console_char_t *cells = console_get_history_row(row);
     for (uint32_t x = max_cols - 1; x >= cursor_x + (uint32_t)n; x--) {
-      history[row][x] = history[row][x - (uint32_t)n];
+      cells[x] = cells[x - (uint32_t)n];
       if (x == cursor_x)
         break;
     }
     for (uint32_t x = cursor_x; x < cursor_x + (uint32_t)n && x < max_cols;
          x++) {
-      history[row][x].c = 0;
-      history[row][x].fg = current_fg;
-      history[row][x].bg = current_bg;
+      cells[x].c = 0;
+      cells[x].fg = current_fg;
+      cells[x].bg = current_bg;
+      cells[x].bold = false;
+      cells[x].underline = false;
     }
     if (view_scroll_offset == 0) {
       for (uint32_t x = cursor_x; x < max_cols; x++)
@@ -909,8 +972,11 @@ static void draw_char_colored(uint32_t c, uint32_t col, uint32_t row,
 }
 
 static void draw_history_char(uint32_t col, uint32_t row) {
+  if (col >= max_cols || row >= max_rows)
+    return;
   uint32_t history_row = console_history_row(row);
-  console_char_t *ch = &history[history_row][col];
+  console_char_t *cells = console_get_history_row(history_row);
+  console_char_t *ch = &cells[col];
 
   uint32_t px = col * FONT_WIDTH;
   uint32_t py = row * FONT_HEIGHT;
@@ -927,7 +993,8 @@ static void draw_cursor_block(uint32_t col, uint32_t row) {
   if (col >= max_cols || row >= max_rows)
     return;
 
-  console_char_t *ch = &history[console_history_row(row)][col];
+  console_char_t *cells = console_get_history_row(console_history_row(row));
+  console_char_t *ch = &cells[col];
   uint32_t cell_fg = ch->fg ? ch->fg : FG_COLOR;
   uint32_t cp = ch->c ? ch->c : ' ';
 
@@ -952,10 +1019,13 @@ static void console_render_char(uint32_t cp) {
           history_write_row++;
           scroll_up();
           uint32_t new_row = history_write_row % HISTORY_MAX;
-          for (uint32_t i = 0; i < COLS_MAX; i++) {
-            history[new_row][i].c = 0;
-            history[new_row][i].fg = current_fg;
-            history[new_row][i].bg = current_bg;
+          console_char_t *cells = console_get_history_row(new_row);
+          for (uint32_t i = 0; i < max_cols; i++) {
+            cells[i].c = 0;
+            cells[i].fg = current_fg;
+            cells[i].bg = current_bg;
+            cells[i].bold = false;
+            cells[i].underline = false;
           }
         } else {
           cursor_y--;
@@ -977,10 +1047,13 @@ static void console_render_char(uint32_t cp) {
     if (at_bottom) {
       history_write_row++;
       uint32_t row = console_history_row(cursor_y);
-      for (uint32_t i = 0; i < COLS_MAX; i++) {
-        history[row][i].c = 0;
-        history[row][i].fg = current_fg;
-        history[row][i].bg = current_bg;
+      console_char_t *cells = console_get_history_row(row);
+      for (uint32_t i = 0; i < max_cols; i++) {
+        cells[i].c = 0;
+        cells[i].fg = current_fg;
+        cells[i].bg = current_bg;
+        cells[i].bold = false;
+        cells[i].underline = false;
       }
 
       if (view_scroll_offset == 0 && cursor_y < max_rows) {
@@ -993,10 +1066,13 @@ static void console_render_char(uint32_t cp) {
       if (view_scroll_offset == 0) {
         scroll_up();
         uint32_t new_row = history_write_row % HISTORY_MAX;
-        for (uint32_t i = 0; i < COLS_MAX; i++) {
-          history[new_row][i].c = 0;
-          history[new_row][i].fg = current_fg;
-          history[new_row][i].bg = current_bg;
+        console_char_t *cells = console_get_history_row(new_row);
+        for (uint32_t i = 0; i < max_cols; i++) {
+          cells[i].c = 0;
+          cells[i].fg = current_fg;
+          cells[i].bg = current_bg;
+          cells[i].bold = false;
+          cells[i].underline = false;
         }
       } else {
         cursor_y--;
@@ -1023,9 +1099,12 @@ static void console_render_char(uint32_t cp) {
     }
 
     uint32_t row = console_history_row(cursor_y);
-    history[row][cursor_x].c = ' ';
-    history[row][cursor_x].fg = FG_COLOR;
-    history[row][cursor_x].bg = BG_COLOR;
+    console_char_t *cells = console_get_history_row(row);
+    cells[cursor_x].c = ' ';
+    cells[cursor_x].fg = FG_COLOR;
+    cells[cursor_x].bg = BG_COLOR;
+    cells[cursor_x].bold = false;
+    cells[cursor_x].underline = false;
 
     if (view_scroll_offset == 0) {
       fb_fill_rect(cursor_x * FONT_WIDTH, cursor_y * FONT_HEIGHT, FONT_WIDTH,
@@ -1050,13 +1129,14 @@ static void console_render_char(uint32_t cp) {
   }
 
   // Store codepoint with current SGR colors
-  if (cursor_x < COLS_MAX) {
+  if (cursor_x < max_cols) {
     uint32_t row = console_history_row(cursor_y);
-    history[row][cursor_x].c = cp;
-    history[row][cursor_x].fg = current_fg;
-    history[row][cursor_x].bg = current_bg;
-    history[row][cursor_x].bold = attr_bold;
-    history[row][cursor_x].underline = attr_underline;
+    console_char_t *cells = console_get_history_row(row);
+    cells[cursor_x].c = cp;
+    cells[cursor_x].fg = current_fg;
+    cells[cursor_x].bg = current_bg;
+    cells[cursor_x].bold = attr_bold;
+    cells[cursor_x].underline = attr_underline;
   }
 
   if (view_scroll_offset == 0) {
@@ -1145,15 +1225,19 @@ static void console_putchar_unlocked(char c) {
             for (uint32_t row = bot; row > scroll_region_top; row--) {
               uint32_t dst = console_history_row(row);
               uint32_t src = console_history_row(row - 1);
-              for (uint32_t x = 0; x < COLS_MAX; x++)
-                history[dst][x] = history[src][x];
+              console_char_t *dst_cells = console_get_history_row(dst);
+              console_char_t *src_cells = console_get_history_row(src);
+              memcpy(dst_cells, src_cells, max_cols * sizeof(console_char_t));
             }
             // Clear the top line
             uint32_t top_row = console_history_row(scroll_region_top);
-            for (uint32_t x = 0; x < COLS_MAX; x++) {
-              history[top_row][x].c = 0;
-              history[top_row][x].fg = FG_COLOR;
-              history[top_row][x].bg = BG_COLOR;
+            console_char_t *top_cells = console_get_history_row(top_row);
+            for (uint32_t x = 0; x < max_cols; x++) {
+              top_cells[x].c = 0;
+              top_cells[x].fg = FG_COLOR;
+              top_cells[x].bg = BG_COLOR;
+              top_cells[x].bold = false;
+              top_cells[x].underline = false;
             }
             console_redraw();
           }

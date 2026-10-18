@@ -29,7 +29,7 @@ static bool user_string_ok(const char *s, long bound) {
 
 static bool xattr_fd_ok(uint64_t fd) {
   struct thread *t = sched_get_current();
-  return t && fd < MAX_FDS && t->fds && fd_is_valid_node(t->fds[fd]);
+  return FD_IN_RANGE(t, fd) && fd_is_valid_node(t->fds[fd]);
 }
 
 /* Resolve `path` to an owned node, honouring the caller's cwd. Returns NULL

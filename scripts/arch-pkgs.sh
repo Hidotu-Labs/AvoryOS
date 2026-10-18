@@ -421,9 +421,11 @@ arch_name() {
         libliftoff) echo libliftoff;;
         libwacom) echo libwacom;;
         vulkan-loader|vulkan-loader-dev) echo vulkan-icd-loader;;
+        vulkan-tools) echo vulkan-tools;;
         mesa|mesa-dev) echo mesa;;
         mesa-demos) echo mesa-demos;;
         mesa-vulkan-swrast) echo vulkan-swrast;;
+        mesa-vulkan-ati|vulkan-radeon) echo vulkan-radeon;;
         mesa-egl|mesa-gl|mesa-gles) echo mesa;;
         freeglut) echo freeglut;;
         libva) echo libva;;

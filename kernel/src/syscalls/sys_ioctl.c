@@ -179,7 +179,7 @@ static void ioctl_log_unhandled(struct thread *thread, uint64_t fd,
     klog_puts(" node_type=");
     klog_uint64(node->flags & FS_TYPE_MASK);
   }
-  if (thread && thread->fd_paths && fd < MAX_FDS && thread->fd_paths[fd]) {
+  if (FD_IN_RANGE(thread, fd) && thread->fd_paths && thread->fd_paths[fd]) {
     klog_puts(" path=");
     klog_puts(thread->fd_paths[fd]->value);
   }
@@ -269,12 +269,23 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
       pty_pair_t *pty = (pty_pair_t *)node->device;
       if (!pty)
         return (uint64_t)-9;
-      char peer_path[16] = "/dev/pts/";
+      char peer_path[32] = "/dev/pts/";
       int index = pty->index;
       size_t pos = 9;
-      if (index >= 10)
-        peer_path[pos++] = (char)(48 + (index / 10));
-      peer_path[pos++] = (char)(48 + (index % 10));
+      if (index == 0) {
+        peer_path[pos++] = '0';
+      } else {
+        char rev[16];
+        int rlen = 0;
+        int tmp = index;
+        while (tmp > 0) {
+          rev[rlen++] = (char)('0' + (tmp % 10));
+          tmp /= 10;
+        }
+        while (rlen > 0) {
+          peer_path[pos++] = rev[--rlen];
+        }
+      }
       peer_path[pos] = 0;
       return sys_open_path(-100, peer_path, arg, 0);
     }
@@ -540,7 +551,7 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     }
     int unread = 0;
     if (ioctl_node && (ioctl_node->flags & FS_TYPE_MASK) == FS_FILE) {
-      uint64_t off = (fd < MAX_FDS) ? t->fd_offsets[fd] : 0;
+      uint64_t off = FD_IN_RANGE(t, fd) ? t->fd_offsets[fd] : 0;
       uint64_t len = ioctl_node->length;
       if (len > off) {
         unread = (int)(len - off);
@@ -578,7 +589,7 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
   }
   case 0x40049409: { // FICLONE / BTRFS_IOC_CLONE
     int src_fd = (int)arg;
-    if (src_fd < 0 || src_fd >= MAX_FDS || !t->fds[src_fd]) {
+    if (!FD_IN_RANGE(t, src_fd) || !t->fds[src_fd]) {
       ret = (uint64_t)-9; // EBADF
       break;
     }
@@ -650,7 +661,7 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
       uint64_t dest_offset;
     } cr;
     memcpy(&cr, (const void *)arg, sizeof(cr));
-    if (cr.src_fd < 0 || cr.src_fd >= MAX_FDS || !t->fds[cr.src_fd]) {
+    if (!FD_IN_RANGE(t, cr.src_fd) || !t->fds[cr.src_fd]) {
       ret = (uint64_t)-9; // EBADF
       break;
     }

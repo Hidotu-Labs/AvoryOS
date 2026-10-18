@@ -861,9 +861,9 @@ static int net_get_state(struct udriver_session *session,
 
 static bool driverctl_is_nonblocking(vfs_node_t *node) {
   struct thread *current = sched_get_current();
-  if (!current)
+  if (!current || !current->files)
     return false;
-  for (int fd = 0; fd < MAX_FDS; fd++)
+  for (uint32_t fd = 0; fd < current->fd_capacity; fd++)
     if (current->fds[fd] == node)
       return (current->fd_flags[fd] & 0x800U) != 0;
   return false;

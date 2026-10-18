@@ -16,9 +16,36 @@
 #include "../syscalls/syscall.h"
 #include "arch/uaccess.h"
 
-// PTY pair pool
-static pty_pair_t pty_pool[PTY_MAX_PAIRS];
+// Dynamic PTY pair table
+static pty_pair_t **pty_table = NULL;
+static int pty_table_capacity = 0;
+static int pty_table_count = 0;
 static int pty_next_index = 0;
+static spinlock_t pty_table_lock = SPINLOCK_INIT;
+
+// On-demand ring buffer allocation helpers
+static inline bool pty_ensure_m2s_buffer(pty_pair_t *pty) {
+  if (pty->master_to_slave)
+    return true;
+  pty->master_to_slave = kmalloc(PTY_BUFFER_SIZE);
+  if (!pty->master_to_slave)
+    return false;
+  pty->m2s_head = 0;
+  pty->m2s_tail = 0;
+  pty->m2s_newline_count = 0;
+  return true;
+}
+
+static inline bool pty_ensure_s2m_buffer(pty_pair_t *pty) {
+  if (pty->slave_to_master)
+    return true;
+  pty->slave_to_master = kmalloc(PTY_BUFFER_SIZE);
+  if (!pty->slave_to_master)
+    return false;
+  pty->s2m_head = 0;
+  pty->s2m_tail = 0;
+  return true;
+}
 
 // Ring buffer helpers
 
@@ -41,6 +68,9 @@ static inline bool ring_full(uint32_t head, uint32_t tail) {
 
 static uint32_t ring_write(uint8_t *buffer, uint32_t *head, uint32_t tail,
                            const uint8_t *data, uint32_t len) {
+  if (!buffer)
+    return 0;
+
   uint32_t free_space = ring_free(*head, tail);
   if (free_space == 0)
     return 0;
@@ -80,6 +110,9 @@ static uint32_t ring_write(uint8_t *buffer, uint32_t *head, uint32_t tail,
 // Read from ring buffer, returns bytes read
 static uint32_t ring_read(uint8_t *buffer, uint32_t head, uint32_t *tail,
                           uint8_t *data, uint32_t len) {
+  if (!buffer)
+    return 0;
+
   uint32_t used = ring_used(head, *tail);
   if (used == 0)
     return 0;
@@ -126,61 +159,17 @@ void pty_init(void) {
     return;
   pty_initialized = true;
 
-  for (int i = 0; i < PTY_MAX_PAIRS; i++) {
-    pty_pool[i].index = i;
-    pty_pool[i].allocated = false;
-    pty_pool[i].locked = false;
-    pty_pool[i].master_open = false;
-    pty_pool[i].packet_mode = false;
-    pty_pool[i].master_node = NULL;
-    pty_pool[i].slave_open_count = 0;
-    pty_pool[i].slave_ever_opened = false;
-    pty_pool[i].m2s_head = 0;
-    pty_pool[i].m2s_tail = 0;
-    pty_pool[i].m2s_newline_count = 0;
-    pty_pool[i].s2m_head = 0;
-    pty_pool[i].s2m_tail = 0;
-    pty_pool[i].pgid = 0;
-    if (!pty_pool[i].master_waitq)
-      pty_pool[i].master_waitq = kmalloc(sizeof(wait_queue_t));
-    if (!pty_pool[i].slave_waitq)
-      pty_pool[i].slave_waitq = kmalloc(sizeof(wait_queue_t));
-    if (!pty_pool[i].slave_write_waitq)
-      pty_pool[i].slave_write_waitq = kmalloc(sizeof(wait_queue_t));
-    if (pty_pool[i].master_waitq)
-      wait_queue_init((wait_queue_t *)pty_pool[i].master_waitq);
-    if (pty_pool[i].slave_waitq)
-      wait_queue_init((wait_queue_t *)pty_pool[i].slave_waitq);
-    if (pty_pool[i].slave_write_waitq)
-      wait_queue_init((wait_queue_t *)pty_pool[i].slave_write_waitq);
-    spinlock_init(&pty_pool[i].lock);
-
-    // Default terminal settings
-    pty_pool[i].termios.c_iflag = 0x00000100; // ICRNL
-    pty_pool[i].termios.c_oflag = 0x00000005; // OPOST | ONLCR
-    pty_pool[i].termios.c_cflag = 0;
-    pty_pool[i].termios.c_lflag = 0x0000000b; // ISIG | ICANON | ECHO
-    pty_pool[i].termios.c_line = 0;
-
-    // POSIX standard control character defaults
-    for (int j = 0; j < NCCS; j++)
-      pty_pool[i].termios.c_cc[j] = 0;
-    pty_pool[i].termios.c_cc[0] = 0x03; // VINTR (Ctrl-C)
-    pty_pool[i].termios.c_cc[1] = 0x1C; // VQUIT (Ctrl-\)
-    pty_pool[i].termios.c_cc[2] = 0x7F; // VERASE (Backspace)
-    pty_pool[i].termios.c_cc[3] = 0x15; // VKILL (Ctrl-U)
-    pty_pool[i].termios.c_cc[4] = 0x04; // VEOF (Ctrl-D)
-
-    // Window size (standard desktop-ish defaults)
-    pty_pool[i].winsize.ws_row = 24;
-    pty_pool[i].winsize.ws_col = 80;
-    pty_pool[i].winsize.ws_xpixel = 80 * 8;
-    pty_pool[i].winsize.ws_ypixel = 24 * 16;
+  spinlock_acquire(&pty_table_lock);
+  if (!pty_table) {
+    pty_table_capacity = PTY_DEFAULT_CAPACITY;
+    pty_table = kmalloc(sizeof(pty_pair_t *) * pty_table_capacity);
+    if (pty_table) {
+      memset(pty_table, 0, sizeof(pty_pair_t *) * pty_table_capacity);
+    } else {
+      pty_table_capacity = 0;
+    }
   }
-
-#if PTY_DEBUG_LOGGING
-  klog_puts("[PTY] Initialized with 16 pairs\n");
-#endif
+  spinlock_release(&pty_table_lock);
 }
 
 // PTY allocation
@@ -188,81 +177,252 @@ void pty_init(void) {
 int pty_alloc_pair(void) {
   pty_init();
 
-  for (int i = 0; i < PTY_MAX_PAIRS; i++) {
-    int idx = (pty_next_index + i) % PTY_MAX_PAIRS;
-    if (!pty_pool[idx].allocated) {
-      bool expected = false;
-      if (!__atomic_compare_exchange_n(&pty_pool[idx].allocated, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
-      pty_pool[idx].devpts_instance = NULL;
-      pty_pool[idx].locked = false;
-      pty_pool[idx].master_open = true;
-      pty_pool[idx].packet_mode = false;
-      pty_pool[idx].master_node = NULL;
-      pty_pool[idx].slave_open_count = 0;
-      pty_pool[idx].slave_ever_opened = false;
-      pty_pool[idx].m2s_head = 0;
-      pty_pool[idx].m2s_tail = 0;
-      pty_pool[idx].m2s_newline_count = 0;
-      pty_pool[idx].s2m_head = 0;
-      pty_pool[idx].s2m_tail = 0;
-      pty_pool[idx].pgid = 0;
-      pty_pool[idx].shared_mmap_frame = NULL;
+  spinlock_acquire(&pty_table_lock);
+  if (!pty_table && pty_table_capacity == 0) {
+    pty_table_capacity = PTY_DEFAULT_CAPACITY;
+    pty_table = kmalloc(sizeof(pty_pair_t *) * pty_table_capacity);
+    if (!pty_table) {
+      spinlock_release(&pty_table_lock);
+      return -1;
+    }
+    memset(pty_table, 0, sizeof(pty_pair_t *) * pty_table_capacity);
+  }
 
-      // Reset terminal settings
-      pty_pool[idx].termios.c_iflag = 0x00000100;
-      pty_pool[idx].termios.c_oflag = 0x00000005;
-      pty_pool[idx].termios.c_cflag = 0;
-      pty_pool[idx].termios.c_lflag = 0x0000000b;
-
-      if (!pty_pool[idx].master_waitq)
-        pty_pool[idx].master_waitq = kmalloc(sizeof(wait_queue_t));
-      if (!pty_pool[idx].slave_waitq)
-        pty_pool[idx].slave_waitq = kmalloc(sizeof(wait_queue_t));
-      if (!pty_pool[idx].slave_write_waitq)
-        pty_pool[idx].slave_write_waitq = kmalloc(sizeof(wait_queue_t));
-
-      if (pty_pool[idx].master_waitq)
-        wait_queue_init((wait_queue_t *)pty_pool[idx].master_waitq);
-      if (pty_pool[idx].slave_waitq)
-        wait_queue_init((wait_queue_t *)pty_pool[idx].slave_waitq);
-      if (pty_pool[idx].slave_write_waitq)
-        wait_queue_init((wait_queue_t *)pty_pool[idx].slave_write_waitq);
-
-      spinlock_init(&pty_pool[idx].lock);
-
-      pty_next_index = (idx + 1) % PTY_MAX_PAIRS;
-
-#if PTY_DEBUG_LOGGING
-      klog_puts("[PTY] Allocated PTY pair ");
-      klog_uint64(idx);
-      klog_puts("\n");
-#endif
-
-      return idx;
+  int idx = -1;
+  for (int i = 0; i < pty_table_capacity; i++) {
+    int candidate = (pty_next_index + i) % pty_table_capacity;
+    if (pty_table[candidate] == NULL) {
+      idx = candidate;
+      break;
     }
   }
 
+  // Expand table dynamically if capacity exhausted
+  if (idx == -1 && pty_table_capacity < PTY_MAX_PAIRS) {
+    int new_cap = pty_table_capacity * 2;
+    if (new_cap > PTY_MAX_PAIRS)
+      new_cap = PTY_MAX_PAIRS;
+    pty_pair_t **new_table = kmalloc(sizeof(pty_pair_t *) * new_cap);
+    if (new_table) {
+      memset(new_table, 0, sizeof(pty_pair_t *) * new_cap);
+      memcpy(new_table, pty_table, sizeof(pty_pair_t *) * pty_table_capacity);
+      idx = pty_table_capacity;
+      kfree(pty_table);
+      pty_table = new_table;
+      pty_table_capacity = new_cap;
+    }
+  }
+
+  if (idx == -1) {
+    spinlock_release(&pty_table_lock);
+    return -1; // ENOSPC
+  }
+
+  pty_pair_t *pty = kmalloc(sizeof(pty_pair_t));
+  if (!pty) {
+    spinlock_release(&pty_table_lock);
+    return -1;
+  }
+  memset(pty, 0, sizeof(pty_pair_t));
+
+  pty->master_waitq = kmalloc(sizeof(wait_queue_t));
+  pty->slave_waitq = kmalloc(sizeof(wait_queue_t));
+  pty->slave_write_waitq = kmalloc(sizeof(wait_queue_t));
+  if (!pty->master_waitq || !pty->slave_waitq || !pty->slave_write_waitq) {
+    if (pty->master_waitq) kfree(pty->master_waitq);
+    if (pty->slave_waitq) kfree(pty->slave_waitq);
+    if (pty->slave_write_waitq) kfree(pty->slave_write_waitq);
+    kfree(pty);
+    spinlock_release(&pty_table_lock);
+    return -1;
+  }
+
+  wait_queue_init((wait_queue_t *)pty->master_waitq);
+  wait_queue_init((wait_queue_t *)pty->slave_waitq);
+  wait_queue_init((wait_queue_t *)pty->slave_write_waitq);
+  spinlock_init(&pty->lock);
+
+  pty->index = idx;
+  pty->allocated = true;
+  pty->master_open = true;
+  pty->master_node = NULL;
+  pty->slave_open_count = 0;
+  pty->slave_ever_opened = false;
+  pty->devpts_instance = NULL;
+  pty->locked = false;
+  pty->packet_mode = false;
+  pty->pgid = 0;
+  pty->shared_mmap_frame = NULL;
+
+  // On-demand ring buffers start unallocated (NULL)
+  pty->master_to_slave = NULL;
+  pty->slave_to_master = NULL;
+  pty->m2s_head = 0;
+  pty->m2s_tail = 0;
+  pty->m2s_newline_count = 0;
+  pty->s2m_head = 0;
+  pty->s2m_tail = 0;
+
+  // Default terminal settings
+  pty->termios.c_iflag = 0x00000100; // ICRNL
+  pty->termios.c_oflag = 0x00000005; // OPOST | ONLCR
+  pty->termios.c_cflag = 0;
+  pty->termios.c_lflag = 0x0000000b; // ISIG | ICANON | ECHO
+  pty->termios.c_line = 0;
+
+  for (int j = 0; j < NCCS; j++)
+    pty->termios.c_cc[j] = 0;
+  pty->termios.c_cc[0] = 0x03; // VINTR (Ctrl-C)
+  pty->termios.c_cc[1] = 0x1C; // VQUIT (Ctrl-\)
+  pty->termios.c_cc[2] = 0x7F; // VERASE (Backspace)
+  pty->termios.c_cc[3] = 0x15; // VKILL (Ctrl-U)
+  pty->termios.c_cc[4] = 0x04; // VEOF (Ctrl-D)
+
+  pty->winsize.ws_row = 24;
+  pty->winsize.ws_col = 80;
+  pty->winsize.ws_xpixel = 80 * 8;
+  pty->winsize.ws_ypixel = 24 * 16;
+
+  pty_table[idx] = pty;
+  pty_table_count++;
+  pty_next_index = (idx + 1) % pty_table_capacity;
+
+  spinlock_release(&pty_table_lock);
+
 #if PTY_DEBUG_LOGGING
-  klog_puts("[PTY] No free PTY pairs\n");
+  klog_puts("[PTY] Allocated dynamic PTY pair ");
+  klog_uint64(idx);
+  klog_puts("\n");
 #endif
-  return -1; // ENOSPC
+
+  return idx;
 }
 
 pty_pair_t *pty_get_pair(int index) {
-  if (index < 0 || index >= PTY_MAX_PAIRS)
+  if (index < 0)
     return NULL;
-  if (!pty_pool[index].allocated)
+  spinlock_acquire(&pty_table_lock);
+  if (index >= pty_table_capacity || !pty_table) {
+    spinlock_release(&pty_table_lock);
     return NULL;
-  return &pty_pool[index];
+  }
+  pty_pair_t *pty = pty_table[index];
+  if (pty && !pty->allocated)
+    pty = NULL;
+  spinlock_release(&pty_table_lock);
+  return pty;
+}
+
+int pty_get_table_capacity(void) {
+  spinlock_acquire(&pty_table_lock);
+  int cap = pty_table_capacity;
+  spinlock_release(&pty_table_lock);
+  return cap;
+}
+
+bool pty_is_instance_match(int index, void *devpts_instance) {
+  bool match = false;
+  spinlock_acquire(&pty_table_lock);
+  if (index >= 0 && index < pty_table_capacity && pty_table && pty_table[index]) {
+    if (pty_table[index]->allocated && pty_table[index]->devpts_instance == devpts_instance) {
+      match = true;
+    }
+  }
+  spinlock_release(&pty_table_lock);
+  return match;
+}
+
+static void pty_destroy_locked(pty_pair_t *pty) {
+  int idx = pty->index;
+
+  // Unlink from global table
+  spinlock_acquire(&pty_table_lock);
+  if (idx >= 0 && idx < pty_table_capacity && pty_table && pty_table[idx] == pty) {
+    pty_table[idx] = NULL;
+    pty_table_count--;
+  }
+  spinlock_release(&pty_table_lock);
+
+  // Free on-demand ring buffers
+  if (pty->master_to_slave) {
+    kfree(pty->master_to_slave);
+    pty->master_to_slave = NULL;
+  }
+  if (pty->slave_to_master) {
+    kfree(pty->slave_to_master);
+    pty->slave_to_master = NULL;
+  }
+
+  // Free shared mmap frame
+  if (pty->shared_mmap_frame) {
+    pmm_free_page(pty->shared_mmap_frame);
+    pty->shared_mmap_frame = NULL;
+  }
+
+  // Free wait queues
+  void *mwq = pty->master_waitq;
+  void *swq = pty->slave_waitq;
+  void *swwq = pty->slave_write_waitq;
+  pty->master_waitq = NULL;
+  pty->slave_waitq = NULL;
+  pty->slave_write_waitq = NULL;
+
+  if (mwq) kfree(mwq);
+  if (swq) kfree(swq);
+  if (swwq) kfree(swwq);
+
+  spinlock_release(&pty->lock);
+  kfree(pty);
+}
+
+size_t pty_shrink_unused_buffers(void) {
+  size_t reclaimed_bytes = 0;
+  spinlock_acquire(&pty_table_lock);
+  if (!pty_table) {
+    spinlock_release(&pty_table_lock);
+    return 0;
+  }
+
+  for (int i = 0; i < pty_table_capacity; i++) {
+    pty_pair_t *pty = pty_table[i];
+    if (!pty || !pty->allocated)
+      continue;
+
+    if (spinlock_try_acquire(&pty->lock)) {
+      if (pty->master_to_slave && ring_empty(pty->m2s_head, pty->m2s_tail)) {
+        kfree(pty->master_to_slave);
+        pty->master_to_slave = NULL;
+        pty->m2s_head = 0;
+        pty->m2s_tail = 0;
+        pty->m2s_newline_count = 0;
+        reclaimed_bytes += PTY_BUFFER_SIZE;
+      }
+      if (pty->slave_to_master && ring_empty(pty->s2m_head, pty->s2m_tail)) {
+        kfree(pty->slave_to_master);
+        pty->slave_to_master = NULL;
+        pty->s2m_head = 0;
+        pty->s2m_tail = 0;
+        reclaimed_bytes += PTY_BUFFER_SIZE;
+      }
+      spinlock_release(&pty->lock);
+    }
+  }
+
+  spinlock_release(&pty_table_lock);
+  return reclaimed_bytes;
 }
 
 // Data availability checks
 
 bool pty_master_can_read(pty_pair_t *pty) {
+  if (!pty || !pty->slave_to_master)
+    return false;
   return !ring_empty(pty->s2m_head, pty->s2m_tail);
 }
 
 bool pty_slave_can_read(pty_pair_t *pty) {
+  if (!pty || !pty->master_to_slave)
+    return false;
   if (ring_empty(pty->m2s_head, pty->m2s_tail)) {
     return false;
   }
@@ -287,7 +447,7 @@ uint32_t ptmx_read(struct vfs_node *node, uint32_t offset, uint32_t size,
 
   spinlock_acquire(&pty->lock);
   // Master reads from slave→master buffer
-  while (ring_empty(pty->s2m_head, pty->s2m_tail)) {
+  while (!pty->slave_to_master || ring_empty(pty->s2m_head, pty->s2m_tail)) {
     if (pty->slave_open_count == 0 && pty->slave_ever_opened) {
       spinlock_release(&pty->lock);
       return 0; // EOF: slaves opened then all closed (hangup)
@@ -298,7 +458,7 @@ uint32_t ptmx_read(struct vfs_node *node, uint32_t offset, uint32_t size,
     struct thread *current = sched_get_current();
     bool is_nonblock = (node->flags & FS_NONBLOCK) != 0;
     if (!is_nonblock && current) {
-      for (int fd = 0; fd < MAX_FDS; fd++) {
+      for (uint32_t fd = 0; fd < current->fd_capacity; fd++) {
         if (current->fds[fd] == node && (current->fd_flags[fd] & 0x800)) {
           is_nonblock = true;
           break;
@@ -317,7 +477,7 @@ uint32_t ptmx_read(struct vfs_node *node, uint32_t offset, uint32_t size,
     wait_queue_add((wait_queue_t *)pty->master_waitq, &entry);
 
     // Last second check while BLOCKED
-    if (!ring_empty(pty->s2m_head, pty->s2m_tail) ||
+    if ((pty->slave_to_master && !ring_empty(pty->s2m_head, pty->s2m_tail)) ||
         (pty->slave_open_count == 0 && pty->slave_ever_opened)) {
       entry.thread->state = THREAD_RUNNING;
       spinlock_release(&pty->lock);
@@ -331,14 +491,16 @@ uint32_t ptmx_read(struct vfs_node *node, uint32_t offset, uint32_t size,
     entry.thread->state = THREAD_RUNNING;
   }
 
-  uint32_t read;
-  if (pty->packet_mode && size > 0) {
-    buffer[0] = 0; /* TIOCPKT_DATA */
-    read = 1 + ring_read(pty->slave_to_master, pty->s2m_head,
-                         &pty->s2m_tail, buffer + 1, size - 1);
-  } else {
-    read = ring_read(pty->slave_to_master, pty->s2m_head, &pty->s2m_tail,
-                     buffer, size);
+  uint32_t read = 0;
+  if (pty->slave_to_master) {
+    if (pty->packet_mode && size > 0) {
+      buffer[0] = 0; /* TIOCPKT_DATA */
+      read = 1 + ring_read(pty->slave_to_master, pty->s2m_head,
+                           &pty->s2m_tail, buffer + 1, size - 1);
+    } else {
+      read = ring_read(pty->slave_to_master, pty->s2m_head, &pty->s2m_tail,
+                       buffer, size);
+    }
   }
 
   // Wake up any writers waiting for buffer space
@@ -416,6 +578,10 @@ uint32_t ptmx_write(struct vfs_node *node, uint32_t offset, uint32_t size,
         }
       }
     }
+    if (!pty_ensure_m2s_buffer(pty)) {
+      spinlock_release(&pty->lock);
+      return 0;
+    }
     written = ring_write(pty->master_to_slave, &pty->m2s_head, pty->m2s_tail,
                          buffer, size);
     if (written > 0)
@@ -460,22 +626,27 @@ uint32_t ptmx_write(struct vfs_node *node, uint32_t offset, uint32_t size,
 
       // Support for canonical mode backspace (VERASE)
       if ((pty->termios.c_lflag & ICANON) && c == pty->termios.c_cc[2]) {
-        if (!ring_empty(pty->m2s_head, pty->m2s_tail)) {
+        if (pty->master_to_slave && !ring_empty(pty->m2s_head, pty->m2s_tail)) {
           uint32_t prev =
               (pty->m2s_head + PTY_BUFFER_SIZE - 1) % PTY_BUFFER_SIZE;
           if (pty->master_to_slave[prev] != '\n') {
             pty->m2s_head = prev;
             written++;
             if (pty->termios.c_lflag & ECHO) {
-              uint8_t bs[] = "\b \b";
-              ring_write(pty->slave_to_master, &pty->s2m_head, pty->s2m_tail,
-                         bs, 3);
-              wake_master = true;
+              if (pty_ensure_s2m_buffer(pty)) {
+                uint8_t bs[] = "\b \b";
+                ring_write(pty->slave_to_master, &pty->s2m_head, pty->s2m_tail,
+                           bs, 3);
+                wake_master = true;
+              }
             }
           }
         }
         continue;
       }
+
+      if (!pty_ensure_m2s_buffer(pty))
+        break;
 
       uint32_t n = ring_write(pty->master_to_slave, &pty->m2s_head,
                               pty->m2s_tail, &c, 1);
@@ -488,19 +659,21 @@ uint32_t ptmx_write(struct vfs_node *node, uint32_t offset, uint32_t size,
         }
 
         if (pty->termios.c_lflag & ECHO) {
-          if (c == '\n' && (pty->termios.c_oflag & ONLCR)) {
-            uint8_t cr = '\r';
-            ring_write(pty->slave_to_master, &pty->s2m_head, pty->s2m_tail, &cr,
-                       1);
-          }
+          if (pty_ensure_s2m_buffer(pty)) {
+            if (c == '\n' && (pty->termios.c_oflag & ONLCR)) {
+              uint8_t cr = '\r';
+              ring_write(pty->slave_to_master, &pty->s2m_head, pty->s2m_tail, &cr,
+                         1);
+            }
 #if PTY_DEBUG_LOGGING
-          klog_puts("[PTY] ptmx_write: echoing char 0x");
-          klog_hex64(c);
-          klog_puts(" to s2m buffer\n");
+            klog_puts("[PTY] ptmx_write: echoing char 0x");
+            klog_hex64(c);
+            klog_puts(" to s2m buffer\n");
 #endif
-          ring_write(pty->slave_to_master, &pty->s2m_head, pty->s2m_tail, &c,
-                     1);
-          wake_master = true;
+            ring_write(pty->slave_to_master, &pty->s2m_head, pty->s2m_tail, &c,
+                       1);
+            wake_master = true;
+          }
         }
       } else {
         break;
@@ -541,23 +714,30 @@ uint32_t ptmx_write(struct vfs_node *node, uint32_t offset, uint32_t size,
  * commands.  A canonical slave only ever yields whole lines, and packet mode
  * costs the master one status byte per read.  Caller holds pty->lock. */
 static uint32_t pty_bytes_pending(pty_pair_t *pty, bool to_master) {
-  uint32_t used = to_master ? ring_used(pty->s2m_head, pty->s2m_tail)
-                            : ring_used(pty->m2s_head, pty->m2s_tail);
-
-  if (!to_master && (pty->termios.c_lflag & ICANON)) {
-    if (pty->m2s_newline_count == 0)
+  if (to_master) {
+    if (!pty->slave_to_master || ring_empty(pty->s2m_head, pty->s2m_tail))
       return 0;
-    for (uint32_t i = 0; i < used; i++) {
-      uint32_t at = (pty->m2s_tail + i) % PTY_BUFFER_SIZE;
-      if (pty->master_to_slave[at] == '\n') {
-        used = i + 1;
-        break;
+    uint32_t used = ring_used(pty->s2m_head, pty->s2m_tail);
+    if (pty->packet_mode)
+      used += 1; // the packet header read() prepends
+    return used;
+  } else {
+    if (!pty->master_to_slave || ring_empty(pty->m2s_head, pty->m2s_tail))
+      return 0;
+    uint32_t used = ring_used(pty->m2s_head, pty->m2s_tail);
+    if (pty->termios.c_lflag & ICANON) {
+      if (pty->m2s_newline_count == 0)
+        return 0;
+      for (uint32_t i = 0; i < used; i++) {
+        uint32_t at = (pty->m2s_tail + i) % PTY_BUFFER_SIZE;
+        if (pty->master_to_slave[at] == '\n') {
+          used = i + 1;
+          break;
+        }
       }
     }
-  } else if (to_master && pty->packet_mode) {
-    used += 1; // the packet header read() prepends
+    return used;
   }
-  return used;
 }
 
 int ptmx_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
@@ -713,8 +893,15 @@ int ptmx_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     if (arg > TCIOFLUSH) {
       ret = -22; // EINVAL
     } else {
-      if (arg == TCIFLUSH || arg == TCIOFLUSH)
+      if (arg == TCIFLUSH || arg == TCIOFLUSH) {
         pty->s2m_tail = pty->s2m_head;
+        if (pty->slave_to_master) {
+          kfree(pty->slave_to_master);
+          pty->slave_to_master = NULL;
+          pty->s2m_head = 0;
+          pty->s2m_tail = 0;
+        }
+      }
       ret = 0;
     }
     break;
@@ -777,6 +964,7 @@ void ptmx_close(struct vfs_node *node) {
   if (!pty)
     return;
 
+  bool should_destroy = false;
   spinlock_acquire(&pty->lock);
   pty->master_node = NULL;
 
@@ -786,6 +974,7 @@ void ptmx_close(struct vfs_node *node) {
   if (pty->slave_open_count == 0) {
     pty->master_open = false;
     pty->allocated = false;
+    should_destroy = true;
 #if PTY_DEBUG_LOGGING
     klog_puts("[PTY] Deallocated PTY pair ");
     klog_uint64((uint64_t)pty->index);
@@ -805,7 +994,11 @@ void ptmx_close(struct vfs_node *node) {
     wait_queue_wake_all((wait_queue_t *)pty->slave_waitq);
   }
 
-  spinlock_release(&pty->lock);
+  if (should_destroy) {
+    pty_destroy_locked(pty);
+  } else {
+    spinlock_release(&pty->lock);
+  }
 }
 
 // /dev/pts/N (slave) VFS operations
@@ -828,7 +1021,7 @@ uint32_t pty_slave_read(struct vfs_node *node, uint32_t offset, uint32_t size,
   // Slave reads from master→slave buffer
   while (1) {
     bool can_read = false;
-    bool empty = ring_empty(pty->m2s_head, pty->m2s_tail);
+    bool empty = !pty->master_to_slave || ring_empty(pty->m2s_head, pty->m2s_tail);
 #if PTY_DEBUG_LOGGING
     klog_puts("[PTY] slave_read: ring_empty=");
     klog_uint64(empty ? 1 : 0);
@@ -864,7 +1057,7 @@ uint32_t pty_slave_read(struct vfs_node *node, uint32_t offset, uint32_t size,
     struct thread *current = sched_get_current();
     bool is_nonblock = (node->flags & FS_NONBLOCK) != 0;
     if (!is_nonblock && current) {
-      for (int fd = 0; fd < MAX_FDS; fd++) {
+      for (uint32_t fd = 0; fd < current->fd_capacity; fd++) {
         if (current->fds[fd] == node && (current->fd_flags[fd] & 0x800)) {
           is_nonblock = true;
           break;
@@ -887,7 +1080,7 @@ uint32_t pty_slave_read(struct vfs_node *node, uint32_t offset, uint32_t size,
 
     // Check availability again while BLOCKED
     bool recheck_can_read = false;
-    if (!ring_empty(pty->m2s_head, pty->m2s_tail)) {
+    if (pty->master_to_slave && !ring_empty(pty->m2s_head, pty->m2s_tail)) {
       if (!(pty->termios.c_lflag & ICANON) || pty->m2s_newline_count > 0) {
         recheck_can_read = true;
       }
@@ -910,20 +1103,22 @@ uint32_t pty_slave_read(struct vfs_node *node, uint32_t offset, uint32_t size,
   }
 
   uint32_t read = 0;
-  if (pty->termios.c_lflag & ICANON) {
-    // Read up to newline or size
-    while (read < size && !ring_empty(pty->m2s_head, pty->m2s_tail)) {
-      uint8_t c = pty->master_to_slave[pty->m2s_tail];
-      buffer[read++] = c;
-      pty->m2s_tail = (pty->m2s_tail + 1) % PTY_BUFFER_SIZE;
-      if (c == '\n') {
-        pty->m2s_newline_count--;
-        break;
+  if (pty->master_to_slave) {
+    if (pty->termios.c_lflag & ICANON) {
+      // Read up to newline or size
+      while (read < size && !ring_empty(pty->m2s_head, pty->m2s_tail)) {
+        uint8_t c = pty->master_to_slave[pty->m2s_tail];
+        buffer[read++] = c;
+        pty->m2s_tail = (pty->m2s_tail + 1) % PTY_BUFFER_SIZE;
+        if (c == '\n') {
+          pty->m2s_newline_count--;
+          break;
+        }
       }
+    } else {
+      read = ring_read(pty->master_to_slave, pty->m2s_head, &pty->m2s_tail,
+                       buffer, size);
     }
-  } else {
-    read = ring_read(pty->master_to_slave, pty->m2s_head, &pty->m2s_tail,
-                     buffer, size);
   }
 
   spinlock_release(&pty->lock);
@@ -981,7 +1176,7 @@ uint32_t pty_slave_write(struct vfs_node *node, uint32_t offset, uint32_t size,
       struct thread *current = sched_get_current();
       bool is_nonblock = (node->flags & FS_NONBLOCK) != 0;
       if (!is_nonblock && current) {
-        for (int fd = 0; fd < MAX_FDS; fd++) {
+        for (uint32_t fd = 0; fd < current->fd_capacity; fd++) {
           if (current->fds[fd] == node && (current->fd_flags[fd] & 0x800)) {
             is_nonblock = true;
             break;
@@ -1031,6 +1226,11 @@ uint32_t pty_slave_write(struct vfs_node *node, uint32_t offset, uint32_t size,
         spinlock_release(&pty->lock);
         continue;
       }
+    }
+
+    if (!pty_ensure_s2m_buffer(pty)) {
+      spinlock_release(&pty->lock);
+      return total_written > 0 ? total_written : (uint32_t)-12; /* ENOMEM */
     }
 
     if (do_opost && do_onlcr) {
@@ -1089,6 +1289,8 @@ uint32_t pty_slave_write(struct vfs_node *node, uint32_t offset, uint32_t size,
 // Rescan buffer for newlines (used when switching to canonical mode)
 static void pty_rescan_newlines(pty_pair_t *pty) {
   pty->m2s_newline_count = 0;
+  if (!pty->master_to_slave)
+    return;
   uint32_t curr = pty->m2s_tail;
   while (curr != pty->m2s_head) {
     if (pty->master_to_slave[curr] == '\n') {
@@ -1257,8 +1459,16 @@ int pty_slave_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     if (arg > TCIOFLUSH) {
       ret = -22; // EINVAL
     } else {
-      if (arg == TCIFLUSH || arg == TCIOFLUSH)
+      if (arg == TCIFLUSH || arg == TCIOFLUSH) {
         pty->m2s_tail = pty->m2s_head;
+        pty->m2s_newline_count = 0;
+        if (pty->master_to_slave) {
+          kfree(pty->master_to_slave);
+          pty->master_to_slave = NULL;
+          pty->m2s_head = 0;
+          pty->m2s_tail = 0;
+        }
+      }
       ret = 0;
     }
     break;
@@ -1352,8 +1562,10 @@ void pty_slave_close(struct vfs_node *node) {
   }
 
   // If master is already closed and this was the last slave, deallocate
+  bool should_destroy = false;
   if (!pty->master_open && pty->slave_open_count == 0) {
     pty->allocated = false;
+    should_destroy = true;
 #if PTY_DEBUG_LOGGING
     klog_puts("[PTY] Deallocated PTY pair ");
     klog_uint64((uint64_t)pty->index);
@@ -1361,7 +1573,11 @@ void pty_slave_close(struct vfs_node *node) {
 #endif
   }
 
-  spinlock_release(&pty->lock);
+  if (should_destroy) {
+    pty_destroy_locked(pty);
+  } else {
+    spinlock_release(&pty->lock);
+  }
 }
 
 uint64_t ptmx_mmap(struct vfs_node *node, uint64_t addr, uint64_t length,

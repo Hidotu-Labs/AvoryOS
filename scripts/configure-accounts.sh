@@ -290,7 +290,7 @@ WRAPPER_EOF
 fi
 
 # No wrapper for kwin_x11: it runs as the real binary. Compositing mode comes
-# from the environment (KWIN_COMPOSE exported by .xinitrc / startx.sh /
+# from the environment (KWIN_COMPOSE exported by .xinitrc / the
 # startplasma-x11 wrapper) and kwinrc, so no per-binary shim is needed.
 # Unwrap any previous build's shim so a stale wrapper cannot survive a rebuild
 # (install_apk skips re-extracting kwin once its marker exists).

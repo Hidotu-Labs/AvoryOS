@@ -505,6 +505,7 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     return;
   if (t) {
     __atomic_store_n(&t->in_syscall, true, __ATOMIC_RELAXED);
+    sched_sync_files(t);
     t->last_syscall_num = regs->rax;
     t->last_syscall_args[0] = regs->rdi;
     t->last_syscall_args[1] = regs->rsi;

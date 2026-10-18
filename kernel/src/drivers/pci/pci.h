@@ -76,6 +76,20 @@ uint32_t pci_get_device_count(void);
 // Get device by index
 struct pci_device *asc_pci_get_device(uint32_t index);
 
+// Get the 64-bit physical base address of a PCI BAR
+uint64_t pci_bar_phys(struct pci_device *dev, uint8_t bir);
+
+// Map an MMIO physical address range into kernel virtual address space (at phys + hhdm).
+// Automatically uses 2 MB huge pages for 2 MB-aligned ranges to optimize page table
+// footprint and TLB efficiency. Returns virtual address or NULL on failure.
+void *pci_map_mmio(uint64_t phys, uint64_t length);
+
+// Map a device's PCI BAR into kernel virtual address space.
+// Automatically retrieves probed size (or sizes it) and maps using 2 MB huge pages
+// where possible. If out_size is non-NULL, stores the BAR size.
+// Returns kernel virtual address, or NULL on failure.
+void *pci_map_bar(struct pci_device *dev, int bar_idx, uint64_t *out_size);
+
 #define PCI_CAP_ID_MSI  0x05
 #define PCI_CAP_ID_MSIX 0x11
 #define PCI_MSIX_VECTOR_MASK 1U

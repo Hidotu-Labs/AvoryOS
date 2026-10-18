@@ -261,6 +261,8 @@ static struct cpu_info *sched_least_loaded_cpu(uint64_t affinity,
 }
 
 void sched_init(void) {
+  kstack_cache_init();
+
   // We expect this to be called after cpu_init() which populates the CPU list
   uint32_t count = cpu_get_count();
 
@@ -641,6 +643,42 @@ __attribute__((optimize("O3"))) void sched_yield(void) {
 __attribute__((optimize("O3"))) void sched_yield_user(void) {
   sched_schedule(true);
 }
+
+/* Priority-ceiling protocol for kernel locks that may sleep with ownership.
+ * Keep a resumed owner dispatchable even when userland marked it nice 19 and
+ * its home CPU runs a nice -20 task. Started continuations remain CPU-local. */
+static void sched_critical_change(bool enter) {
+  struct cpu_info *cpu = cpu_get_current();
+  struct thread *t = cpu ? cpu->current_thread : NULL;
+  if (!t || t->is_idle)
+    return;
+  hal_irq_state_t flags = hal_irq_save();
+  spinlock_acquire(&cpu->queue_lock);
+  struct sched_entity *se = &t->se;
+  eevfd_update_curr(&cpu->eevfd, lapic_timer_get_ns());
+  bool change = false;
+  if (enter) {
+    if (se->critical_depth != UINT16_MAX)
+      change = se->critical_depth++ == 0;
+  } else if (se->critical_depth) {
+    change = --se->critical_depth == 0;
+  }
+  if (change) {
+    bool queued = se->on_rq;
+    if (queued) eevfd_dequeue_entity(&cpu->eevfd, se);
+    /* Rebase into the new weight domain without carrying user-priority debt
+     * into the protected section or manufacturing credit when it ends. */
+    se->vruntime = cpu->eevfd.vtime;
+    se->lag = 0;
+    eevfd_set_nice(se, se->nice_value);
+    if (queued) eevfd_enqueue_entity(&cpu->eevfd, se);
+  }
+  spinlock_release(&cpu->queue_lock);
+  hal_irq_restore(flags);
+}
+
+void sched_critical_enter(void) { sched_critical_change(true); }
+void sched_critical_exit(void) { sched_critical_change(false); }
 
 /*
  * Deferred preemption point.

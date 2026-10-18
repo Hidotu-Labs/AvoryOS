@@ -59,7 +59,6 @@ fetch_source() {
 
 patch_source() {
     main_c="$SOURCE_DIR/src/backends/unix/main.c"
-    input_c="$SOURCE_DIR/src/client/input/sdl2.c"
     if grep -q '^#ifndef __HAIKU__$' "$main_c"; then
         sed -i 's/^#ifndef __HAIKU__$/#if !defined(__HAIKU__) \&\& !defined(ASCENTOS)/' "$main_c"
     fi
@@ -67,42 +66,6 @@ patch_source() {
         echo "Error: could not apply the AscentOS root-session patch to $main_c" >&2
         exit 1
     fi
-    cp "$ROOT_DIR/scripts/quake2-avoryos-evdev.h" "$SOURCE_DIR/src/client/input/ascentos_evdev.h"
-    if ! grep -q 'ASCENTOS_EVDEV_KEYBOARD' "$input_c"; then
-        sed -i '/#include "\.\.\/header\/client.h"/a\
-\
-#ifdef ASCENTOS\
-#define ASCENTOS_EVDEV_KEYBOARD 1\
-#include "ascentos_evdev.h"\
-#endif' "$input_c"
-        sed -i '/IN_Update(void)/,/^{/{/^{/a\
-#ifdef ASCENTOS_EVDEV_KEYBOARD\
-\tAscentOS_KeyboardUpdate();\
-#endif
-}' "$input_c"
-        sed -i '/SDL_StartTextInput();/a\
-\
-#ifdef ASCENTOS_EVDEV_KEYBOARD\
-\tAscentOS_KeyboardInit();\
-#endif' "$input_c"
-        sed -i '/Com_Printf("Shutting down input\\.\\n");/a\
-\
-#ifdef ASCENTOS_EVDEV_KEYBOARD\
-\tAscentOS_KeyboardShutdown();\
-#endif' "$input_c"
-    fi
-    if ! grep -q 'AscentOS_KeyboardShutdown();' "$input_c"; then
-        sed -i '/IN_Shutdown(void)/,/IN_Controller_Shutdown(false);/{/IN_Controller_Shutdown(false);/i\
-#ifdef ASCENTOS_EVDEV_KEYBOARD\
-\tAscentOS_KeyboardShutdown();\
-#endif\
-
-}' "$input_c"
-    fi
-    grep -q 'AscentOS_KeyboardUpdate();' "$input_c" || {
-        echo "Error: could not apply AscentOS keyboard patch" >&2
-        exit 1
-    }
 }
 
 build_engine() {

@@ -9,9 +9,14 @@
 #include "sched/wait.h"
 #include "smp/cpu.h"
 
-static struct net_packet pool[NET_PACKET_POOL_SIZE];
-static bool used[NET_PACKET_POOL_SIZE];
-static struct net_packet *queue[NET_PACKET_POOL_SIZE];
+#define NET_PACKET_HOT_CAPACITY 64
+#define NET_QUEUE_CAPACITY 1024
+#define NET_PACKET_MAX 4096
+
+static struct net_packet *hot_pool[NET_PACKET_HOT_CAPACITY];
+static uint32_t hot_count = 0;
+static uint32_t active_packets = 0;
+static struct net_packet *queue[NET_QUEUE_CAPACITY];
 static uint32_t head, tail;
 static spinlock_t lock = SPINLOCK_INIT;
 static wait_queue_t worker_wait;
@@ -20,44 +25,38 @@ static struct net_device *devices[NET_DEVICE_MAX];
 static net_rx_handler_t rx_handler;
 static bool ready;
 
-static uint32_t free_stack[NET_PACKET_POOL_SIZE];
-static uint32_t free_top = 0;
-static bool pool_inited = false;
-
-static void init_pool_locked(void) {
-  if (pool_inited) return;
-  for (uint32_t i = 0; i < NET_PACKET_POOL_SIZE; i++) {
-    free_stack[i] = i;
-  }
-  free_top = NET_PACKET_POOL_SIZE;
-  pool_inited = true;
-}
-
 static struct net_packet *alloc_locked(void) {
-  if (__builtin_expect(!pool_inited, 0))
-    init_pool_locked();
-  if (free_top > 0) {
-    uint32_t idx = free_stack[--free_top];
-    used[idx] = true;
-    pool[idx].device = NULL;
-    pool[idx].length = 0;
-    return &pool[idx];
+  if (hot_count > 0) {
+    struct net_packet *p = hot_pool[--hot_count];
+    p->device = NULL;
+    p->length = 0;
+    return p;
   }
-  return NULL;
+  if (active_packets >= NET_PACKET_MAX)
+    return NULL;
+  struct net_packet *p = kmalloc(sizeof(struct net_packet));
+  if (p) {
+    active_packets++;
+    p->device = NULL;
+    p->length = 0;
+  }
+  return p;
 }
+
 static void free_locked(struct net_packet *p) {
-  if (p >= pool && p < pool + NET_PACKET_POOL_SIZE) {
-    if (free_top < NET_PACKET_POOL_SIZE) {
-      uint32_t idx = (uint32_t)(p - pool);
-      if (used[idx]) {
-        used[idx] = false;
-        free_stack[free_top++] = idx;
-      }
-    }
+  if (!p)
+    return;
+  if (hot_count < NET_PACKET_HOT_CAPACITY) {
+    hot_pool[hot_count++] = p;
+  } else {
+    if (active_packets > 0)
+      active_packets--;
+    kfree(p);
   }
 }
+
 static bool push_locked(struct net_packet *p) {
-  uint32_t next = (head + 1) % NET_PACKET_POOL_SIZE;
+  uint32_t next = (head + 1) % NET_QUEUE_CAPACITY;
   if (next == tail)
     return false;
   queue[head] = p;
@@ -96,7 +95,7 @@ static void net_worker(void) {
       count = 0;
       while (count < 128 && tail != head) {
         batch[count++] = queue[tail];
-        tail = (tail + 1) % NET_PACKET_POOL_SIZE;
+        tail = (tail + 1) % NET_QUEUE_CAPACITY;
       }
       spinlock_release(&lock);
 
@@ -295,7 +294,8 @@ net_rx_handler_t net_get_rx_handler(void) { return rx_handler; }
 void net_core_init(void) {
   spinlock_init(&lock);
   wait_queue_init(&worker_wait);
-  memset(used, 0, sizeof(used));
+  hot_count = 0;
+  active_packets = 0;
   memset(devices, 0, sizeof(devices));
   default_device = NULL;
   head = tail = 0;
@@ -385,13 +385,10 @@ void net_print_stats(const struct net_device *dev) {
 }
 
 void net_queue_snapshot(uint32_t *queued, uint32_t *in_use) {
-  uint32_t allocated = 0;
   spinlock_acquire(&lock);
-  for (uint32_t i = 0; i < NET_PACKET_POOL_SIZE; i++)
-    allocated += used[i] ? 1u : 0u;
   if (queued)
-    *queued = (head + NET_PACKET_POOL_SIZE - tail) % NET_PACKET_POOL_SIZE;
+    *queued = (head + NET_QUEUE_CAPACITY - tail) % NET_QUEUE_CAPACITY;
   if (in_use)
-    *in_use = allocated;
+    *in_use = active_packets;
   spinlock_release(&lock);
 }

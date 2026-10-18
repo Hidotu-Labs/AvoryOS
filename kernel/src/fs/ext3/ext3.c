@@ -234,6 +234,7 @@ static int ext3_finish_transaction(ext2_mount_t *mnt,
   trans->phase = "handoff-pending";
   ext3_grant_next(trans);
   hal_irq_restore(irq_flags);
+  sched_critical_exit();
   return result;
 }
 
@@ -346,6 +347,11 @@ int ext3_journal_start(ext2_mount_t *mnt) {
     return 0;
   }
 
+  /* Protect acquisition too: FIFO handoff reserves the mount for a woken
+   * waiter before it resumes to consume the grant. A low-priority recipient
+   * must not strand that reservation behind unrelated foreground work. */
+  sched_critical_enter();
+
   /*
    * Only one thread may own the transaction at a time; it holds ownership
    * from this call until the matching stop().  Waiters queue in arrival
@@ -436,6 +442,7 @@ int ext3_journal_start(ext2_mount_t *mnt) {
       hal_irq_restore(handoff_flags);
       storage_latency_record(&trans->perf_wait,
           lapic_timer_get_ms() - wait_start, true);
+      sched_critical_exit();
       return -4;
     } /* EINTR */
   }

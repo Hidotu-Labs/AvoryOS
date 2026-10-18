@@ -47,7 +47,7 @@ struct epoll_event {
 // epoll_create1 Flags
 #define EPOLL_CLOEXEC 0x80000  // O_CLOEXEC (1 << 19)
 
-// Maximum epoll settings
+#define EPOLL_INITIAL_CAPACITY 64
 #define EPOLL_MAX_INSTANCES  512   // Max epoll instances system-wide
 #define EPOLL_MAX_WATCHED    4096  // Max FDs per epoll instance
 #define EPOLL_MAX_EVENTS     128   // Max events returned per epoll_wait
@@ -93,8 +93,9 @@ typedef struct eventpoll {
   int fd;                      // FD of this epoll instance
   struct vfs_node *vfs_node;   // VFS node for this epoll fd (for nested epoll)
 
-  // Watched FDs - simple array for O(1) lookup
-  epitem_t *items[EPOLL_MAX_WATCHED];
+  // Watched FDs - dynamic array for O(1) lookup
+  epitem_t **items;
+  uint32_t items_capacity;
   int item_count;
   /* Highest fd index ever used + 1.  Only grows while the instance is alive,
    * so the missed-wakeup rescan in epoll_wait_impl() can walk this instead of
@@ -116,6 +117,7 @@ typedef struct eventpoll {
   
   // Reference count
   uint64_t refcount;
+  int table_index;             // Index in epoll_table[]
 } eventpoll_t;
 
 // Epoll Subsystem Initialization

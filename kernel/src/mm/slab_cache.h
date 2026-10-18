@@ -96,6 +96,12 @@ void kmem_cache_print_all(void);
 // Get number of active objects across all caches
 uint64_t kmem_cache_total_active(void);
 
+// Get total and free slab pages across all caches
+uint64_t kmem_cache_total_slabs(void);
+uint64_t kmem_cache_free_slabs(void);
+uint64_t slab_total_pages(void);
+uint64_t slab_reclaimable_pages(void);
+
 // Pre-built Kernel Object Caches
 
 // These are initialized by slab_cache_init() and used throughout the kernel.

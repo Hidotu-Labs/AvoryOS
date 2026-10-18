@@ -39,7 +39,7 @@ uint32_t ext2_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
       char hit_path[64] = {0};
       if (ct && ct->files) {
         spinlock_acquire(&ct->files->lock);
-        for (int fd = 0; fd < MAX_FDS; fd++) {
+        for (uint32_t fd = 0; fd < ct->files->capacity; fd++) {
           if (ct->files->fds[fd] == node) {
             hit_fd = fd;
             struct fd_path *fp = ct->files->fd_paths[fd];

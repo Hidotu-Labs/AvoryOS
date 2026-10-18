@@ -28,6 +28,7 @@ typedef int spinlock_t;
 #include "kernel/src/mm/vmm.h"
 #undef vmm_lock_acquire
 #include "kernel/src/mm/vma.h"
+typedef struct vfs_node { bool mmap_shared_pmm_refs; } vfs_node_t;
 #define PAGE_SIZE 4096
 #define PHYS_TO_VIRT(p) ((void *)((uint64_t)(p) + pmm_get_hhdm_offset()))
 #define MPOL_DEFAULT 0

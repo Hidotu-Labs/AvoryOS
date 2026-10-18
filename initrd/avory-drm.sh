@@ -1,8 +1,8 @@
 # /etc/profile.d/avory-drm.sh — prefer amdgpu for GPU-accelerated sessions.
 #
-# KWin (Wayland) selects its DRM device from KWIN_DRM_DEVICES; Xorg reads the
-# kmsdev option that startx.sh writes, and startw.sh passes --drm-device to
-# Weston.  This covers the Plasma Wayland session started from a login shell:
+# KWin (Wayland) selects its DRM device from KWIN_DRM_DEVICES; the Xorg
+# profile reads the same card choice through this environment.  This covers
+# the Plasma Wayland session started from a login shell:
 # when /bin/drm-pick.sh has an amdgpu card that can drive a display (monitor
 # or the C7 emulated sink), KWin renders and outputs on it; otherwise the
 # variable stays unset and KWin keeps the native card0.

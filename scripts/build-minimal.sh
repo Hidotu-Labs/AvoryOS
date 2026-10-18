@@ -303,6 +303,16 @@ EOF
     cat > "${ROOTFS_DIR}/root/.xinitrc" <<'EOF'
 #!/bin/sh
 # AvoryOS Minimal X11 session: IceWM.
+# Root's home is "/" on AvoryOS: join the XDG defaults through "${HOME%/}"
+# so the session never exports //.cache-style paths (WebKitGTK rejects those
+# sandbox roots; Epiphany aborts on the resulting critical).
+_avory_home="${HOME:-/}"
+_avory_home="${_avory_home%/}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${_avory_home}/.config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${_avory_home}/.cache}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${_avory_home}/.local/share}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-${_avory_home}/.local/state}"
+unset _avory_home
 if [ -f /etc/X11/xinit/Xresources ]; then
     xrdb -merge /etc/X11/xinit/Xresources 2>/dev/null || true
 fi

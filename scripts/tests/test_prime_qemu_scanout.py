@@ -65,7 +65,8 @@ int main(void){
   }
   for(unsigned y=0;y<H;y++)for(unsigned x=0;x<W;x++)((uint32_t*)((unsigned char*)pixels[b]+y*pitches[b]))[x]=pattern(b,x,y);
   if(!b){
-   struct drm_mode_fb_cmd2 fb={.width=W,.height=H,.pixel_format=0x34325258};
+    /* ARGB shares the XRGB byte layout; VirtIO ignores its alpha byte. */
+    struct drm_mode_fb_cmd2 fb={.width=W,.height=H,.pixel_format=0x34325241};
    fb.handles[0]=handle;fb.pitches[0]=pitches[b];fb.offsets[0]=offset;
    check(ioctl(card,0xC06864B8,&fb)==0,"ADDFB2");fbs[b]=fb.fb_id;
   }else{
