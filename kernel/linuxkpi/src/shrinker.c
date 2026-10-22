@@ -13,41 +13,60 @@
 #include <linux/list.h>
 #include <linux/shrinker.h>
 #include <linux/spinlock.h>
+#include <linux/slab.h>
+#include <linux/wait.h>
+#include <linux/version.h>
 #include <linuxkpi/log.h>
 
 #define KPI_SHRINKER_MAX 32
 static struct shrinker *kpi_shrinkers[KPI_SHRINKER_MAX];
 static DEFINE_SPINLOCK(kpi_shrinker_lock);
+static unsigned int kpi_shrinker_users[KPI_SHRINKER_MAX];
+static bool kpi_shrinker_retiring[KPI_SHRINKER_MAX];
+static DECLARE_WAIT_QUEUE_HEAD(kpi_shrinker_idle);
 
-static void kpi_shrinker_add(struct shrinker *s) {
+static bool kpi_shrinker_add(struct shrinker *s) {
   unsigned long flags;
   if (!s)
-    return;
+    return false;
+  bool added = false;
   spin_lock_irqsave(&kpi_shrinker_lock, flags);
   for (int i = 0; i < KPI_SHRINKER_MAX; i++) {
     if (kpi_shrinkers[i] == s) {
       spin_unlock_irqrestore(&kpi_shrinker_lock, flags);
-      return;
+      return true;
     }
   }
   for (int i = 0; i < KPI_SHRINKER_MAX; i++) {
     if (!kpi_shrinkers[i]) {
       kpi_shrinkers[i] = s;
+      added = true;
       break;
     }
   }
   spin_unlock_irqrestore(&kpi_shrinker_lock, flags);
+  return added;
 }
 
+/* Entries stay occupied until every snapshotted callback drops its pin. */
 static void kpi_shrinker_del(struct shrinker *s) {
   unsigned long flags;
-  if (!s)
-    return;
+  int slot = -1;
   spin_lock_irqsave(&kpi_shrinker_lock, flags);
   for (int i = 0; i < KPI_SHRINKER_MAX; i++) {
-    if (kpi_shrinkers[i] == s)
-      kpi_shrinkers[i] = NULL;
+    if (kpi_shrinkers[i] == s) {
+      slot = i;
+      kpi_shrinker_retiring[i] = true;
+      break;
+    }
   }
+  spin_unlock_irqrestore(&kpi_shrinker_lock, flags);
+  if (slot < 0)
+    return;
+  wait_event(kpi_shrinker_idle, READ_ONCE(kpi_shrinker_users[slot]) == 0);
+  spin_lock_irqsave(&kpi_shrinker_lock, flags);
+  kpi_shrinkers[slot] = NULL;
+  kpi_shrinker_retiring[slot] = false;
   spin_unlock_irqrestore(&kpi_shrinker_lock, flags);
 }
 
@@ -56,37 +75,45 @@ static void kpi_shrinker_del(struct shrinker *s) {
  * locking applies. Safe in sleeping (GFP_KERNEL) context only. */
 unsigned long linuxkpi_shrink_reclaim(gfp_t gfp, unsigned long needed) {
   struct shrinker *snap[KPI_SHRINKER_MAX];
+  int slots[KPI_SHRINKER_MAX];
   int n = 0;
   unsigned long freed = 0;
   unsigned long flags;
 
   spin_lock_irqsave(&kpi_shrinker_lock, flags);
   for (int i = 0; i < KPI_SHRINKER_MAX && n < KPI_SHRINKER_MAX; i++) {
-    if (kpi_shrinkers[i])
+    if (kpi_shrinkers[i] && !kpi_shrinker_retiring[i]) {
+      slots[n] = i;
+      kpi_shrinker_users[i]++;
       snap[n++] = kpi_shrinkers[i];
+    }
   }
   spin_unlock_irqrestore(&kpi_shrinker_lock, flags);
 
-  for (int i = 0; i < n && freed < needed; i++) {
+  for (int i = 0; i < n; i++) {
     struct shrinker *s = snap[i];
     struct shrink_control sc = {0};
     unsigned long avail, got;
 
-    if (!s->count_objects || !s->scan_objects)
-      continue;
+    if (freed >= needed || !s->count_objects || !s->scan_objects)
+      goto put;
     sc.gfp_mask = gfp;
     sc.nid = 0;
     sc.nr_to_scan = 0;
     sc.nr_scanned = 0;
     avail = s->count_objects(s, &sc);
     if (avail == SHRINK_EMPTY || avail == SHRINK_STOP || avail == 0)
-      continue;
+      goto put;
     sc.nr_to_scan = avail < (needed - freed) ? avail : (needed - freed);
     sc.nr_scanned = sc.nr_to_scan;
     got = s->scan_objects(s, &sc);
-    if (got == SHRINK_STOP || got == SHRINK_EMPTY)
-      continue;
-    freed += got;
+    if (got != SHRINK_STOP && got != SHRINK_EMPTY)
+      freed += got;
+put:
+    spin_lock_irqsave(&kpi_shrinker_lock, flags);
+    kpi_shrinker_users[slots[i]]--;
+    wake_up_all(&kpi_shrinker_idle);
+    spin_unlock_irqrestore(&kpi_shrinker_lock, flags);
   }
   return freed;
 }
@@ -102,8 +129,8 @@ int prealloc_shrinker(struct shrinker *shrinker, const char *fmt, ...) {
 void register_shrinker_prepared(struct shrinker *shrinker) {
   if (!shrinker)
     return;
-  shrinker->flags |= SHRINKER_REGISTERED;
-  kpi_shrinker_add(shrinker);
+  if (kpi_shrinker_add(shrinker))
+    shrinker->flags |= SHRINKER_REGISTERED;
 }
 
 int register_shrinker(struct shrinker *shrinker, const char *fmt, ...) {
@@ -111,8 +138,9 @@ int register_shrinker(struct shrinker *shrinker, const char *fmt, ...) {
   if (!shrinker)
     return -EINVAL;
   INIT_LIST_HEAD(&shrinker->list);
+  if (!kpi_shrinker_add(shrinker))
+    return -ENOSPC;
   shrinker->flags |= SHRINKER_REGISTERED;
-  kpi_shrinker_add(shrinker);
   return 0;
 }
 
@@ -130,4 +158,40 @@ void free_prealloced_shrinker(struct shrinker *shrinker) {
   shrinker->flags &= ~SHRINKER_REGISTERED;
 }
 
-void synchronize_shrinkers(void) {}
+static bool kpi_shrinkers_idle(void) {
+  for (int i = 0; i < KPI_SHRINKER_MAX; i++)
+    if (READ_ONCE(kpi_shrinker_users[i]))
+      return false;
+  return true;
+}
+
+void synchronize_shrinkers(void) {
+  wait_event(kpi_shrinker_idle, kpi_shrinkers_idle());
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+struct shrinker *shrinker_alloc(unsigned int flags, const char *fmt, ...) {
+  (void)fmt;
+  struct shrinker *s = kzalloc(sizeof(*s), GFP_KERNEL);
+  if (!s)
+    return NULL;
+  s->flags = flags | SHRINKER_ALLOCATED;
+  INIT_LIST_HEAD(&s->list);
+  refcount_set(&s->refcount, 1);
+  init_completion(&s->done);
+  return s;
+}
+
+void shrinker_register(struct shrinker *s) {
+  if (register_shrinker(s, NULL))
+    klogf("[WARN] LinuxKPI: shrinker registry full; registration failed\n");
+}
+
+void shrinker_free(struct shrinker *s) {
+  if (!s)
+    return;
+  unregister_shrinker(s);
+  if (s->flags & SHRINKER_ALLOCATED)
+    kfree(s);
+}
+#endif

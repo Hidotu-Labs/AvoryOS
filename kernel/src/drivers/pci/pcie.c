@@ -37,6 +37,8 @@ static void print_uint32(uint32_t num) {
 
 void pcie_init(void) {
     mcfg = acpi_get_mcfg();
+    if (mcfg && mcfg->header.length < sizeof(struct acpi_mcfg))
+        mcfg = NULL;
     if (mcfg) {
         struct device *sys_node = device_find_by_path("/sys");
         struct device *pci_root = device_find_by_path("/sys/pci");
@@ -54,8 +56,9 @@ void pcie_init(void) {
             struct device *seg_dev = device_find_by_path("/sys/pci/seg0");
             if (!seg_dev)
                 seg_dev = device_create(pci_root, seg_name);
-            device_add_resource(seg_dev, RES_MEM, "ecam", entry->base_address, 
-                                entry->base_address + ((entry->end_bus_number - entry->start_bus_number + 1) << 20));
+            device_add_resource(seg_dev, RES_MEM, "ecam",
+                                entry->base_address + ((uint64_t)entry->start_bus_number << 20),
+                                entry->base_address + (((uint64_t)entry->end_bus_number + 1) << 20));
             
             console_puts("     Segment ");
             print_uint32(entry->pci_segment_group_number);
@@ -72,79 +75,75 @@ void pcie_init(void) {
     }
 }
 
-bool pcie_available(uint8_t bus) {
-    if (!mcfg) return false;
-
-    size_t entries = (mcfg->header.length - sizeof(struct acpi_mcfg)) / sizeof(struct acpi_mcfg_entry);
-    for (size_t i = 0; i < entries; i++) {
-        if (bus >= mcfg->entries[i].start_bus_number && bus <= mcfg->entries[i].end_bus_number) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void *pcie_get_config_addr(uint8_t bus, uint8_t slot, uint8_t func,
-                                  uint16_t offset) {
-    if (!mcfg || slot >= 32 || func >= 8 || offset >= 4096)
+static struct acpi_mcfg_entry *pcie_find_mcfg(uint8_t bus) {
+    if (!mcfg || mcfg->header.length < sizeof(struct acpi_mcfg))
         return NULL;
 
-    size_t entries =
-        (mcfg->header.length - sizeof(struct acpi_mcfg)) /
-        sizeof(struct acpi_mcfg_entry);
-    for (size_t i = 0; i < entries; i++) {
-        struct acpi_mcfg_entry *entry = &mcfg->entries[i];
-        if (entry->pci_segment_group_number != 0 ||
-            bus < entry->start_bus_number || bus > entry->end_bus_number)
-            continue;
-
-        /* ECAM bus offsets are relative to this allocation's start bus, not
-         * absolute PCI bus numbers. Using bus<<20 breaks firmware which splits
-         * segment zero into multiple MCFG allocations. */
-        uint64_t addr = entry->base_address;
-        addr += (uint64_t)(bus - entry->start_bus_number) << 20;
-        addr += (uint64_t)slot << 15;
-        addr += (uint64_t)func << 12;
-        addr += offset;
-        return (void *)(addr + pmm_get_hhdm_offset());
+    size_t entries = (mcfg->header.length - sizeof(struct acpi_mcfg)) / sizeof(struct acpi_mcfg_entry);
+    for (size_t index = 0; index < entries; index++) {
+        struct acpi_mcfg_entry *entry = &mcfg->entries[index];
+        if (entry->pci_segment_group_number == 0 &&
+            bus >= entry->start_bus_number && bus <= entry->end_bus_number)
+            return entry;
     }
     return NULL;
 }
 
+bool pcie_available(uint8_t bus) {
+    return pcie_find_mcfg(bus) != NULL;
+}
+
+static void *pcie_get_config_addr(uint8_t bus, uint8_t slot, uint8_t func,
+                                  uint16_t offset, unsigned int width) {
+    if (slot >= 32 || func >= 8 || offset > 4096 - width ||
+        (offset & (width - 1)))
+        return NULL;
+
+    struct acpi_mcfg_entry *entry = pcie_find_mcfg(bus);
+    if (!entry)
+        return NULL;
+    uint64_t addr = entry->base_address;
+    addr += (uint64_t)bus << 20;
+    addr += (uint64_t)slot << 15;
+    addr += (uint64_t)func << 12;
+    addr += offset;
+    return (void *)(addr + pmm_get_hhdm_offset());
+}
+
 uint32_t pcie_config_read32(uint8_t bus, uint8_t slot, uint8_t func, uint16_t offset) {
-    void *addr = pcie_get_config_addr(bus, slot, func, offset);
+    void *addr = pcie_get_config_addr(bus, slot, func, offset, 4);
     if (!addr) return 0xFFFFFFFF;
     return *(volatile uint32_t *)addr;
 }
 
 void pcie_config_write32(uint8_t bus, uint8_t slot, uint8_t func, uint16_t offset, uint32_t value) {
-    void *addr = pcie_get_config_addr(bus, slot, func, offset);
+    void *addr = pcie_get_config_addr(bus, slot, func, offset, 4);
     if (addr) {
         *(volatile uint32_t *)addr = value;
     }
 }
 
 uint16_t pcie_config_read16(uint8_t bus, uint8_t slot, uint8_t func, uint16_t offset) {
-    void *addr = pcie_get_config_addr(bus, slot, func, offset);
+    void *addr = pcie_get_config_addr(bus, slot, func, offset, 2);
     if (!addr) return 0xFFFF;
     return *(volatile uint16_t *)addr;
 }
 
 void pcie_config_write16(uint8_t bus, uint8_t slot, uint8_t func, uint16_t offset, uint16_t value) {
-    void *addr = pcie_get_config_addr(bus, slot, func, offset);
+    void *addr = pcie_get_config_addr(bus, slot, func, offset, 2);
     if (addr) {
         *(volatile uint16_t *)addr = value;
     }
 }
 
 uint8_t pcie_config_read8(uint8_t bus, uint8_t slot, uint8_t func, uint16_t offset) {
-    void *addr = pcie_get_config_addr(bus, slot, func, offset);
+    void *addr = pcie_get_config_addr(bus, slot, func, offset, 1);
     if (!addr) return 0xFF;
     return *(volatile uint8_t *)addr;
 }
 
 void pcie_config_write8(uint8_t bus, uint8_t slot, uint8_t func, uint16_t offset, uint8_t value) {
-    void *addr = pcie_get_config_addr(bus, slot, func, offset);
+    void *addr = pcie_get_config_addr(bus, slot, func, offset, 1);
     if (addr) {
         *(volatile uint8_t *)addr = value;
     }

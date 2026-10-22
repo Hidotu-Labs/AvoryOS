@@ -1,0 +1,30 @@
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -4581,6 +4581,2 @@
+ 
+-	drm_atomic_private_obj_init(adev_to_drm(adev),
+-				    &adev->dm.atomic_obj,
+-				    &state->base,
+-				    &dm_atomic_state_funcs);
+ 
+@@ -4607,2 +4603,8 @@
+ 	}
++
++	/* Publish ownership only after every fallible setup step succeeds. */
++	drm_atomic_private_obj_init(adev_to_drm(adev),
++				    &adev->dm.atomic_obj,
++				    &state->base,
++				    &dm_atomic_state_funcs);
+ 
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -4733,7 +4733,8 @@
+ 	if (adev->mode_info.mode_config_initialized) {
+ 		if (!drm_drv_uses_atomic_modeset(adev_to_drm(adev)))
+ 			drm_helper_force_disable_all(adev_to_drm(adev));
+-		else
++		else if (!amdgpu_device_has_dc_support(adev) || adev->dm.dc)
++			/* Failed DM init may already have destroyed Display Core. */
+ 			drm_atomic_helper_shutdown(adev_to_drm(adev));
+ 	}
+ 	amdgpu_fence_driver_hw_fini(adev);

@@ -135,3 +135,8 @@ __attribute__((weak)) int amdgpu_xcp_drm_dev_alloc(struct drm_device **ddev) {
   (void)ddev;
   return -ENODEV;
 }
+
+__attribute__((weak)) void amdgpu_xcp_drm_dev_free(struct drm_device *ddev) {
+  /* The matching unsupported allocator never creates an XCP DRM device. */
+  (void)ddev;
+}

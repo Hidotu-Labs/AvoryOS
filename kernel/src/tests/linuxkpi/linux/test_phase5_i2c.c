@@ -231,11 +231,24 @@ static void p5c4_build_edid(u8 *e) {
   edid->width_cm = 16;
   edid->height_cm = 10;
   edid->gamma = 120;
-  edid->extensions = 1;
+  edid->extensions = 0; /* This fixture contains only the base block. */
 
   for (i = 0; i < EDID_LENGTH - 1; i++)
     sum += e[i];
   e[EDID_LENGTH - 1] = (u8)(0 - sum);
+}
+
+/* The modern public validator takes an explicitly bounded EDID object. */
+static bool p5c4_edid_valid(u8 *block, bool *corrupt) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+  const struct drm_edid *edid = drm_edid_alloc(block, EDID_LENGTH);
+  bool valid = edid && drm_edid_valid(edid);
+  drm_edid_free(edid);
+  *corrupt = !valid;
+  return valid;
+#else
+  return drm_edid_block_valid(block, 0, false, corrupt);
+#endif
 }
 
 /* ── suite ──────────────────────────────────────────────────────────────── */
@@ -533,9 +546,9 @@ void linuxkpi_test_phase5_i2c(void) {
     memset(block, 0, sizeof(block));
     ret = i2c_transfer(&p5c4_ddc.adap, msgs, 2);
     if (ret == 2 && p5c4_ddc.xfers == 1 && p5c4_ddc.reads == 1 &&
-        p5c4_ddc.bad_addr == 0 && drm_edid_block_valid(block, 0, false, &corrupt) &&
+        p5c4_ddc.bad_addr == 0 && p5c4_edid_valid(block, &corrupt) &&
         !corrupt)
-      p5c4_ok("DDC 2-message read validates via drm_edid_block_valid");
+      p5c4_ok("DDC 2-message read validates via imported EDID helper");
     else
       p5c4_fail("DDC base block", ret);
 

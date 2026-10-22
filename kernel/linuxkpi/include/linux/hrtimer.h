@@ -51,8 +51,16 @@ struct hrtimer {
 
 #define hrtimer_cb_get_time(timer) ktime_get()
 
+int schedule_hrtimeout(ktime_t *expires, const enum hrtimer_mode mode);
+
 void hrtimer_init(struct hrtimer *timer, clockid_t which_clock,
                   enum hrtimer_mode mode);
+static inline void hrtimer_setup(struct hrtimer *timer,
+    enum hrtimer_restart (*function)(struct hrtimer *), clockid_t clock,
+    enum hrtimer_mode mode) {
+  hrtimer_init(timer, clock, mode);
+  timer->function = function;
+}
 int hrtimer_start(struct hrtimer *timer, ktime_t tim,
                   const enum hrtimer_mode mode);
 int hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,

@@ -25,6 +25,7 @@
 #include <linux/delay.h>
 
 #include <linux/device.h>
+#include <linuxkpi/probe_diag.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/io.h>
@@ -34,6 +35,10 @@
 #include <linux/list.h>
 #include <linux/moduleparam.h>
 #include <linux/pci.h>
+#include <linux/version.h>
+#ifndef PCI_IRQ_LEGACY
+#define PCI_IRQ_LEGACY PCI_IRQ_INTX
+#endif
 #include <linux/slab.h>
 #include <linux/string.h>
 
@@ -44,11 +49,15 @@
 
 /* ── bus / root scaffolding ─────────────────────────────────────────────── */
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+const
+#endif
 struct bus_type pci_bus_type = {
     .name = "pci",
 };
 
 static struct pci_bus kpi_root_bus;
+static struct pci_bus *kpi_pci_buses[256];
 static bool kpi_pci_scanned;
 
 /* Wrappers in native enumeration order.  They are never freed; see the file
@@ -74,6 +83,35 @@ static bool kpi_amdgpu = true;
 module_param(kpi_amdgpu, bool, 0);
 
 bool linuxkpi_pci_amdgpu_gate(void) { return kpi_amdgpu; }
+
+/* Nouveau is an independent opt-in. A canonical guest BDF is mandatory;
+ * an empty or malformed selector never means "all NVIDIA devices". */
+static bool kpi_nouveau;
+static bool kpi_nouveau_probed;
+static bool kpi_nouveau_probe_cleanup_test;
+module_param(kpi_nouveau_probe_cleanup_test, bool, 0);
+/* Orderly shutdown removes Nouveau through its normal PCI remove path so DRM
+ * and GSP teardown run before native power-off. */
+static bool kpi_nouveau_remove_on_shutdown;
+static char kpi_nouveau_bdf[32];
+module_param(kpi_nouveau, bool, 0);
+module_param(kpi_nouveau_remove_on_shutdown, bool, 0);
+module_param_string(kpi_nouveau_bdf, kpi_nouveau_bdf, sizeof(kpi_nouveau_bdf), 0);
+
+bool linuxkpi_pci_nouveau_gate(void) { return kpi_nouveau; }
+bool linuxkpi_pci_nouveau_probe_attempted(void) { return kpi_nouveau_probed; }
+
+static bool kpi_nouveau_probe_allowed(const struct pci_dev *pdev) {
+  struct linuxkpi_pci_info info;
+  char bdf[16];
+  if (!kpi_nouveau || !pdev || !pdev->sysdata || !kpi_nouveau_bdf[0] ||
+      pdev->vendor != 0x10de || (pdev->class >> 16) != 0x03)
+    return false;
+  linuxkpi_pci_native_snapshot(pdev->sysdata, &info);
+  /* LinuxKPI's bus wrappers are flattened; use the real native BDF. */
+  snprintf(bdf, sizeof(bdf), "0000:%02x:%02x.%u", info.bus, info.slot, info.func);
+  return !strcmp(kpi_nouveau_bdf, bdf);
+}
 
 /* Test support for test_phase6_link: amdgpu's probe fails while firmware and
  * rings are still missing (C4), and the driver core unbinds the device on
@@ -207,6 +245,10 @@ static void kpi_pci_root_init(void) {
   kpi_root_bus.number = 0;
   INIT_LIST_HEAD(&kpi_root_bus.devices);
   INIT_LIST_HEAD(&kpi_root_bus.resources);
+  INIT_LIST_HEAD(&kpi_root_bus.children);
+  INIT_LIST_HEAD(&kpi_root_bus.slots);
+  INIT_LIST_HEAD(&kpi_root_bus.node);
+  kpi_pci_buses[0] = &kpi_root_bus;
 
   device_initialize(&kpi_root_bus.dev);
   dev_set_name(&kpi_root_bus.dev, "pci0000:00");
@@ -215,6 +257,70 @@ static void kpi_pci_root_init(void) {
   /* Not device_add()ed (the native sysfs tree owns /sys/pci), but the kobject
    * must be named/non-NULL for child parents and sysfs links. */
   kpi_root_bus.dev.kobj.name = kpi_root_bus.dev.init_name;
+}
+
+static struct pci_bus *kpi_pci_bus_get(u8 number) {
+  struct pci_bus *bus = kpi_pci_buses[number];
+
+  if (bus)
+    return bus;
+  bus = kzalloc(sizeof(*bus), GFP_KERNEL);
+  if (!bus)
+    return NULL;
+  bus->number = number;
+  INIT_LIST_HEAD(&bus->devices);
+  INIT_LIST_HEAD(&bus->resources);
+  INIT_LIST_HEAD(&bus->children);
+  INIT_LIST_HEAD(&bus->slots);
+  INIT_LIST_HEAD(&bus->node);
+  device_initialize(&bus->dev);
+  dev_set_name(&bus->dev, "pci0000:%02x", number);
+  bus->dev.bus = &pci_bus_type;
+  bus->dev.release = kpi_pci_dev_release;
+  bus->dev.kobj.name = bus->dev.init_name;
+  kpi_pci_buses[number] = bus;
+  return bus;
+}
+
+static void kpi_pci_link_buses(void) {
+  for (int index = 0; index < kpi_dev_count; index++) {
+    struct pci_dev *bridge = kpi_devs[index];
+    struct pci_bus *child, *ancestor;
+    bool cycle = false;
+    u8 primary, secondary;
+
+    if (bridge->hdr_type != PCI_HEADER_TYPE_BRIDGE ||
+        pci_read_config_byte(bridge, PCI_PRIMARY_BUS, &primary) ||
+        pci_read_config_byte(bridge, PCI_SECONDARY_BUS, &secondary) ||
+        primary != bridge->bus->number || !secondary || secondary == primary)
+      continue;
+    child = kpi_pci_bus_get(secondary);
+    if (!child || child->self)
+      continue;
+    for (ancestor = bridge->bus; ancestor; ancestor = ancestor->parent) {
+      if (ancestor == child) {
+        cycle = true;
+        break;
+      }
+    }
+    if (cycle)
+      continue;
+    child->parent = bridge->bus;
+    child->primary = primary;
+    child->self = bridge;
+    child->bridge = &bridge->dev;
+    child->dev.parent = &bridge->dev;
+    child->dev.kobj.parent = &bridge->dev.kobj;
+    bridge->subordinate = child;
+    list_add_tail(&child->node, &bridge->bus->children);
+  }
+  for (int index = 0; index < kpi_dev_count; index++) {
+    struct pci_dev *pdev = kpi_devs[index];
+
+    pdev->dev.parent = pdev->bus->self ? &pdev->bus->self->dev
+                                       : &pdev->bus->dev;
+    pdev->dev.kobj.parent = &pdev->dev.parent->kobj;
+  }
 }
 
 static struct pci_dev *kpi_pci_dev_new(void *handle) {
@@ -228,7 +334,11 @@ static struct pci_dev *kpi_pci_dev_new(void *handle) {
     return NULL;
 
   pdev->sysdata = handle;
-  pdev->bus = &kpi_root_bus;
+  pdev->bus = kpi_pci_bus_get(info.bus);
+  if (!pdev->bus) {
+    kfree(pdev);
+    return NULL;
+  }
   pdev->devfn = (unsigned int)((info.slot << 3) | (info.func & 0x7));
   pdev->vendor = info.vendor_id;
   pdev->device = info.device_id;
@@ -249,7 +359,7 @@ static struct pci_dev *kpi_pci_dev_new(void *handle) {
 
   device_initialize(&pdev->dev);
   pdev->dev.bus = &pci_bus_type;
-  pdev->dev.parent = &kpi_root_bus.dev;
+  pdev->dev.parent = &pdev->bus->dev;
   pdev->dev.release = kpi_pci_dev_release;
   pdev->dev.dma_mask = 0xFFFFFFFFULL;
   pdev->dev.coherent_dma_mask = 0xFFFFFFFFULL;
@@ -309,6 +419,7 @@ static struct pci_dev *kpi_pci_dev_new(void *handle) {
     pcie_capability_read_word(pdev, PCI_EXP_FLAGS, &flags);
     pdev->pcie_flags_reg = flags;
   }
+  list_add_tail(&pdev->bus_list, &pdev->bus->devices);
   return pdev;
 }
 
@@ -343,6 +454,7 @@ void linuxkpi_pci_scan(void) {
     if (pdev)
       kpi_devs[kpi_dev_count++] = pdev;
   }
+  kpi_pci_link_buses();
 
   klogf("[KERNEL] LinuxKPI: PCI %d wrapper(s) over %d native device(s)\n",
         kpi_dev_count, native_count);
@@ -381,12 +493,56 @@ const struct pci_device_id *pci_match_id(const struct pci_device_id *ids,
   return NULL;
 }
 
+extern bool linuxkpi_nouveau_device_registered(struct pci_dev *) __attribute__((weak));
+
+struct kpi_probe_usage {
+  struct linuxkpi_firmware_usage firmware;
+  unsigned long maps, irqs, queues;
+  int enables;
+};
+
+static void kpi_probe_usage(struct pci_dev *pdev, struct kpi_probe_usage *usage) {
+  linuxkpi_firmware_usage(&usage->firmware);
+  usage->maps = linuxkpi_vmap_live_areas();
+  usage->irqs = linuxkpi_irq_live_actions();
+  usage->queues = linuxkpi_workqueue_live_count();
+  usage->enables = atomic_read(&pdev->enable_cnt);
+}
+
+static void kpi_probe_cleanup_check(struct pci_dev *pdev,
+                                    const struct kpi_probe_usage *before) {
+  struct kpi_probe_usage after;
+  bool clean;
+  kpi_probe_usage(pdev, &after);
+  clean = before->firmware.headers == after.firmware.headers &&
+          before->firmware.buffers == after.firmware.buffers &&
+          before->firmware.bytes == after.firmware.bytes &&
+          before->maps == after.maps && before->irqs == after.irqs &&
+          before->queues == after.queues && before->enables == after.enables &&
+          !pdev->driver && !pdev->dev.driver && !pci_get_drvdata(pdev) &&
+          list_empty(&pdev->dev.devres_head) && !pdev->msi_enabled &&
+          !pdev->msix_enabled && linuxkpi_nouveau_device_registered &&
+          !linuxkpi_nouveau_device_registered(pdev);
+  klogf("[%s] LinuxKPI: nouveau failed-probe cleanup headers=%lu/%lu "
+        "buffers=%lu/%lu bytes=%lu/%lu maps=%lu/%lu IRQ=%lu/%lu "
+        "queues=%lu/%lu enables=%d/%d unbound=%d\n", clean ? "  OK  " : "FAIL",
+        before->firmware.headers, after.firmware.headers,
+        before->firmware.buffers, after.firmware.buffers,
+        before->firmware.bytes, after.firmware.bytes, before->maps, after.maps,
+        before->irqs, after.irqs, before->queues, after.queues,
+        before->enables, after.enables, !pdev->driver);
+}
+
 static void kpi_pci_probe_device(struct pci_driver *drv,
                                  struct pci_dev *pdev) {
   const struct pci_device_id *id;
+  struct kpi_probe_usage before;
+  bool check_cleanup = kpi_nouveau_probe_cleanup_test && !strcmp(drv->name, "nouveau");
   int ret;
 
   if (!pdev || pdev->driver)
+    return;
+  if (!strcmp(drv->name, "nouveau") && !kpi_nouveau_probe_allowed(pdev))
     return;
   id = pci_match_id(drv->id_table, pdev);
   if (!id)
@@ -399,7 +555,21 @@ static void kpi_pci_probe_device(struct pci_driver *drv,
     return;
   }
 
+  if (!strcmp(drv->name, "nouveau")) {
+    kpi_nouveau_probed = true;
+    klogf("[NOUVEAU] probe begin %s vendor=%04x device=%04x irq=%u\n",
+          pci_name(pdev), pdev->vendor, pdev->device, pdev->irq);
+    for (int bar = 0; bar < 6; bar++)
+      klogf("[NOUVEAU] BAR%d start=%llx size=%llx flags=%lx\n", bar,
+            (unsigned long long)pci_resource_start(pdev, bar),
+            (unsigned long long)pci_resource_len(pdev, bar),
+            (unsigned long)pci_resource_flags(pdev, bar));
+  }
+  if (check_cleanup)
+    kpi_probe_usage(pdev, &before);
   ret = drv->probe(pdev, id);
+  if (!strcmp(drv->name, "nouveau"))
+    klogf("[NOUVEAU] probe end %s result=%d\n", pci_name(pdev), ret);
   if (!strcmp(drv->name, "amdgpu")) {
     kpi_amdgpu_probed = true;
     kpi_amdgpu_probe_result = ret;
@@ -413,6 +583,8 @@ static void kpi_pci_probe_device(struct pci_driver *drv,
     pci_set_drvdata(pdev, NULL);
     pdev->driver = NULL;
     pdev->dev.driver = NULL;
+    if (check_cleanup)
+      kpi_probe_cleanup_check(pdev, &before);
     return;
   }
 
@@ -460,6 +632,35 @@ void linuxkpi_pci_shutdown(void) {
 
   if (__atomic_exchange_n(&started, 1, __ATOMIC_ACQ_REL))
     return;
+  if (kpi_nouveau_remove_on_shutdown) {
+    for (i = kpi_dev_count - 1; i >= 0; i--) {
+      struct pci_dev *pdev = kpi_devs[i];
+      struct pci_driver *drv = pdev ? pdev->driver : NULL;
+    uint32_t expected_id, config_before, config_after;
+    uint8_t irq_pin;
+    bool config_ok;
+
+      if (!drv || strcmp(drv->name, "nouveau") ||
+          !kpi_nouveau_probe_allowed(pdev))
+        continue;
+    expected_id = ((uint32_t)pdev->device << 16) | pdev->vendor;
+    config_before = linuxkpi_pci_config_read32(pdev->sysdata, 0x00);
+      klogf("[KERNEL] LinuxKPI: Nouveau shutdown remove begin %s\n",
+            pci_name(pdev));
+      pci_unregister_driver(drv);
+    config_after = linuxkpi_pci_config_read32(pdev->sysdata, 0x00);
+    irq_pin = linuxkpi_pci_config_read8(pdev->sysdata, 0x3d);
+    config_ok = config_before == expected_id &&
+        config_after == expected_id && irq_pin >= 1 && irq_pin <= 4;
+    klogf("[%s] LinuxKPI: Nouveau shutdown PCI pre-handoff %s "
+      "id=%08x->%08x irq_pin=%u\n",
+      config_ok ? "  OK  " : "WARN ", pci_name(pdev), config_before,
+      config_after, irq_pin);
+      klogf("[KERNEL] LinuxKPI: Nouveau shutdown remove complete %s\n",
+            pci_name(pdev));
+      break;
+    }
+  }
   for (i = kpi_dev_count - 1; i >= 0; i--) {
     struct pci_dev *pdev = kpi_devs[i];
     struct pci_driver *drv = pdev ? pdev->driver : NULL;
@@ -570,10 +771,14 @@ u8 pci_find_next_capability(struct pci_dev *dev, u8 pos, int cap) {
   int ttl = 48;
   u16 ent;
 
-  if (!dev)
+  if (!dev || pos < 0x40 || pos > 0xfc ||
+      pci_read_config_byte(dev, pos + 1, &pos) != PCIBIOS_SUCCESSFUL)
     return 0;
-  while (ttl--) {
+  while (ttl-- && pos >= 0x40) {
+    pos &= ~3u;
     if (pci_read_config_word(dev, pos, &ent) != PCIBIOS_SUCCESSFUL)
+      break;
+    if ((ent & 0xff) == 0xff)
       break;
     if ((ent & 0xFF) == cap)
       return pos;
@@ -585,10 +790,14 @@ u8 pci_find_next_capability(struct pci_dev *dev, u8 pos, int cap) {
 }
 
 u16 pci_find_next_ext_capability(struct pci_dev *dev, u16 pos, int cap) {
-  int ttl = 48;
+  int ttl;
+  u16 start = pos;
   u32 header;
 
-  if (!dev || !dev->sysdata)
+  if (!dev || !dev->sysdata || dev->cfg_size <= 0x100)
+    return 0;
+  ttl = (dev->cfg_size - 0x100) / 8;
+  if (pos && (pos < 0x100 || pos & 3))
     return 0;
   if (pos < 0x100)
     pos = 0x100;
@@ -598,9 +807,11 @@ u16 pci_find_next_ext_capability(struct pci_dev *dev, u16 pos, int cap) {
       return 0;
     if (header == 0 || header == 0xFFFFFFFFu)
       return 0;
-    if ((header & 0xFFFF) == (u32)cap)
+    if ((header & 0xFFFF) == (u32)cap && pos != start)
       return pos;
-    pos = (u16)((header >> 16) & 0xFFF);
+    pos = (u16)((header >> 20) & 0xFFC);
+    if (pos < 0x100)
+      break;
   }
   return 0;
 }
@@ -781,9 +992,11 @@ void pci_disable_device(struct pci_dev *dev) {
   if (atomic_read(&dev->enable_cnt) <= 0)
     return;
   if (atomic_dec_and_test(&dev->enable_cnt)) {
+    /* Linux x86 do_pci_disable_device() stops DMA but preserves BAR
+     * decoding. Nouveau's failed-probe path disables before deleting its
+     * DRM/NVKM device; that destructor still needs MMIO register access. */
     linuxkpi_pci_set_bus_mastering(dev->sysdata, 0);
-    linuxkpi_pci_command_update(dev->sysdata, 0,
-                                PCI_COMMAND_MEMORY | PCI_COMMAND_IO);
+    dev->is_busmaster = 0;
   }
 }
 
@@ -1126,6 +1339,8 @@ struct kpi_pci_irq_vec {
 };
 
 struct kpi_pci_irq_state {
+  bool legacy_msi;
+  unsigned int old_irq;
   bool used;
   void *native;
   unsigned int count;
@@ -1266,7 +1481,29 @@ void pci_free_irq_vectors(struct pci_dev *dev) {
   for (i = 0; i < st->count; i++)
     linuxkpi_irq_unregister_mask(st->irq[i]);
   linuxkpi_native_pci_irq_release(st->native);
+  if (st->legacy_msi) {
+    dev->irq = st->old_irq;
+    dev->msi_enabled = 0;
+  }
   memset(st, 0, sizeof(*st));
+}
+
+/* Legacy MSI callers use pdev->irq, unlike pci_irq_vector users. */
+int pci_enable_msi(struct pci_dev *dev) {
+  int result = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI);
+  if (result < 0)
+    return result;
+  int index = kpi_pci_index_of(dev);
+  struct kpi_pci_irq_state *state = &kpi_pci_irqs[index];
+  state->old_irq = dev->irq;
+  state->legacy_msi = true;
+  dev->irq = state->irq[0];
+  dev->msi_enabled = 1;
+  return 0;
+}
+void pci_disable_msi(struct pci_dev *dev) {
+  if (dev && dev->msi_enabled)
+    pci_free_irq_vectors(dev);
 }
 
 /* ── configuration state save/restore (Phase 5 C1) ──────────────────────── */
@@ -1550,11 +1787,19 @@ bool pci_device_is_present(struct pci_dev *pdev) {
   return (id & 0xFFFF) != 0xFFFF;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+int pci_release_resource(struct pci_dev *dev, int resno) {
+#else
 void pci_release_resource(struct pci_dev *dev, int resno) {
+#endif
   struct resource *res;
 
   if (!dev || resno < 0 || resno >= DEVICE_COUNT_RESOURCE)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+    return -EINVAL;
+#else
     return;
+#endif
   res = &dev->resource[resno];
   if (res->parent) {
     __release_region(res->parent, res->start, resource_size(res));
@@ -1563,6 +1808,9 @@ void pci_release_resource(struct pci_dev *dev, int resno) {
   res->start = 0;
   res->end = 0;
   res->flags = 0;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+  return 0;
+#endif
 }
 
 /* ── ROM (size probe + map) ─────────────────────────────────────────────── */

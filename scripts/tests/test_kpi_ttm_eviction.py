@@ -24,15 +24,25 @@ static int locked,evictions,evict_error,waits,wait_error;
 static void spin_lock(int*l){(void)l;assert(!locked++);}
 static void spin_unlock(int*l){(void)l;assert(locked--==1);}
 static int ttm_mem_evict_first(struct ttm_device*b,struct ttm_resource_manager*m,void*p,struct ttm_operation_ctx*c,void*x){
- (void)b;(void)p;(void)x;assert(!locked&&!c->interruptible&&!c->no_wait_gpu&&c->force_alloc);evictions++;
+ (void)b;(void)p;(void)x;assert(!locked&&!c->interruptible&&!c->no_wait_gpu&&c->force_alloc);
  if(evict_error)return evict_error;
- for(int i=0;i<3;i++)if(m->lru[i].entries){m->lru[i].entries--;return 0;}
+ for(int i=0;i<3;i++)if(m->lru[i].entries){m->lru[i].entries--;evictions++;return 0;}
  return -ENOENT;
 }
 static struct dma_fence *dma_fence_get(struct dma_fence*f){assert(locked);if(f)f->refs++;return f;}
 static void dma_fence_put(struct dma_fence*f){assert(!locked&&f->refs>1);f->refs--;}
 static int dma_fence_wait(struct dma_fence*f,bool interruptible){assert(f&&!interruptible&&!locked);waits++;return wait_error;}
 '''
+modern = 'ttm_bo_evict_first(' in old
+if modern:
+ shim += r'''
+static int ttm_bo_evict_first(struct ttm_device*b,struct ttm_resource_manager*m,struct ttm_operation_ctx*c) {
+ return ttm_mem_evict_first(b,m,NULL,c,NULL);
+}
+#define cond_resched() ((void)0)
+'''
+shim += '#define KERNEL_VERSION(a,b,c) (((a)<<16)|((b)<<8)|(c))\n'
+shim += '#define LINUX_VERSION_CODE '+('396288' if modern else '394752')+'\n'
 main=r'''
 int main(void){
  struct ttm_device b={0};struct ttm_resource_manager m={0};
@@ -49,9 +59,13 @@ int main(void){
 '''
 with tempfile.TemporaryDirectory(prefix='kpi-ttm-evict-') as tmp:
  p=Path(tmp)
- for name,source in [('old',old),('fixed',re.sub(r'^#include.*$','',(root/'kernel/linuxkpi/src/ttm_eviction.c').read_text(),flags=re.M))]:
+ shim_source=re.sub(r'^#include.*$','',(root/'kernel/linuxkpi/src/ttm_eviction.c').read_text(),flags=re.M)
+ if modern:
+  sources=[('fixed',old.replace('int ttm_resource_manager_evict_all(', 'int linuxkpi_original_ttm_resource_manager_evict_all(',1)+shim_source)]
+ else:
+  sources=[('old',old),('fixed',shim_source)]
+ for name,source in sources:
   (p/(name+'.c')).write_text(shim+source+main)
-  # Defined poison for automatic variables makes the old empty-manager path deterministic.
   subprocess.run(['cc','-std=gnu11','-O0','-g','-ftrivial-auto-var-init=pattern','-fsanitize=address,undefined',str(p/(name+'.c')),'-o',str(p/name)],check=True)
   r=subprocess.run([str(p/name)],capture_output=True,text=True,timeout=10)
   if name=='old':
@@ -61,3 +75,4 @@ with tempfile.TemporaryDirectory(prefix='kpi-ttm-evict-') as tmp:
   else:
    assert r.returncode==0,r.stdout+r.stderr
    print(r.stdout.strip())
+   if modern: print('PASS: modern shim delegates to the corrected imported eviction algorithm')

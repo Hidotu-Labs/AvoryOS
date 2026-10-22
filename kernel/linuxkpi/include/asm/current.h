@@ -44,5 +44,8 @@ struct pcpu_hot {
 };
 
 extern struct pcpu_hot pcpu_hot;
+/* CONFIG_USE_X86_SEG_SUPPORT stays disabled: no Linux GS-segment alias is
+ * installed. The upstream processor inline still parses its inactive arm. */
+#define const_pcpu_hot pcpu_hot
 
 #endif /* __AVORY_LINUXKPI_ASM_CURRENT_H */

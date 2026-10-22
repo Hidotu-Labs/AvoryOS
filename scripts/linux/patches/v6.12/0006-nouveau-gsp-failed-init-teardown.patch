@@ -1,0 +1,47 @@
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
+@@ -2455,10 +2455,27 @@
+ 	}
+ }
+ 
++/* INIT_DONE failure leaves running=false, so normal fini skips teardown.
++ * Stop the successfully booted firmware and tear down its protected region
++ * before the destructor releases its DMA buffers. RM is not initialized:
++ * do not issue UNLOADING_GUEST_DRIVER or pretend the init succeeded. */
++static void
++r535_gsp_abort_init(struct nvkm_gsp *gsp)
++{
++	int reset, fwsec, unload;
++
++	reset = nvkm_falcon_reset(&gsp->falcon);
++	fwsec = nvkm_gsp_fwsec_sb(gsp);
++	unload = r535_gsp_booter_unload(gsp, 0xff, 0xff);
++	nvkm_info(&gsp->subdev, "init abort: reset=%d fwsec=%d unload=%d\n",
++		  reset, fwsec, unload);
++}
++
+ int
+ r535_gsp_init(struct nvkm_gsp *gsp)
+ {
+ 	u32 mbox0, mbox1;
++	bool started = false;
+ 	int ret;
+ 
+ 	if (!gsp->sr.meta.data) {
+@@ -2475,6 +2492,7 @@
+ 	ret = r535_gsp_booter_load(gsp, mbox0, mbox1);
+ 	if (WARN_ON(ret))
+ 		goto done;
++	started = true;
+ 
+ 	ret = r535_gsp_rpc_poll(gsp, NV_VGPU_MSG_EVENT_GSP_INIT_DONE);
+ 	if (ret)
+@@ -2485,6 +2503,8 @@
+ done:
+ 	if (ret)
+ 		r535_gsp_log_dump(gsp);
++	if (ret && started)
++		r535_gsp_abort_init(gsp);
+ 
+ 	if (gsp->sr.meta.data) {
+ 		nvkm_gsp_mem_dtor(gsp, &gsp->sr.meta);

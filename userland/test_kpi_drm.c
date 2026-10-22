@@ -30,13 +30,16 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_mode.h>
 
+#ifndef CARD_PATH
 #define CARD_PATH "/dev/dri/card1"
+#endif
 #define RENDER_PATH "/dev/dri/renderD128"
 
 #define DUMB_W 128
 #define DUMB_H 128
 
 static int failures;
+static unsigned modeset_checks;
 
 static void pass(const char *what) { printf("  [PASS] %s\n", what); }
 
@@ -460,6 +463,7 @@ static void test_modeset(int fd) {
         fail("atomic enable commit", errno);
         goto out_blob;
     }
+    modeset_checks |= 1;
     pass("atomic enable commit (ALLOW_MODESET)");
 
     pfd.fd = fd;
@@ -469,6 +473,7 @@ static void test_modeset(int fd) {
     } else if (read(fd, &ev, sizeof(ev)) != (ssize_t)sizeof(ev)) {
         fail("read page-flip event", errno);
     } else if (ev.base.type == DRM_EVENT_FLIP_COMPLETE) {
+        modeset_checks |= 2;
         printf("  [PASS] page-flip event via poll/read (seq=%u)\n", ev.sequence);
     } else {
         fail("page-flip event type", 0);
@@ -477,8 +482,10 @@ static void test_modeset(int fd) {
     memset(&vbl, 0, sizeof(vbl));
     vbl.request.type = _DRM_VBLANK_RELATIVE;
     vbl.request.sequence = 1;
-    if (ioctl(fd, DRM_IOCTL_WAIT_VBLANK, &vbl) == 0)
+    if (ioctl(fd, DRM_IOCTL_WAIT_VBLANK, &vbl) == 0) {
+        modeset_checks |= 4;
         pass("WAIT_VBLANK relative 1 returned");
+    }
     else
         fail("WAIT_VBLANK", errno);
 
@@ -501,8 +508,10 @@ static void test_modeset(int fd) {
     values[n++] = 0;
     req_add(&req, plane_id, props, values, n);
 
-    if (atomic_commit(fd, &req, DRM_MODE_ATOMIC_ALLOW_MODESET) == 0)
+    if (atomic_commit(fd, &req, DRM_MODE_ATOMIC_ALLOW_MODESET) == 0) {
+        modeset_checks |= 8;
         pass("atomic disable commit");
+    }
     else
         fail("atomic disable commit", errno);
 
@@ -532,11 +541,16 @@ int main(void) {
 
     fd = open(CARD_PATH, O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-        printf("  [SKIP] %s not present (%s)\n", CARD_PATH, strerror(errno));
+        fail("open target DRM card", errno);
     } else {
         test_gem_mmap(fd);
         test_modeset(fd);
         close(fd);
+        /* Native console ownership can hide serial output during scanout.
+         * Report completed checks after closing the display file. */
+        printf("  modeset checks after close: %#x (expected 0xf)\n", modeset_checks);
+        if (modeset_checks != 15)
+            fail("all modeset stages completed", 0);
     }
 
     printf("\n%s\n", failures ? "=== TESTS FAILED ===" : "=== ALL TESTS PASSED ===");

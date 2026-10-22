@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""kbuild-subset.py -- evaluate the Kbuild subset used by the amdgpu tree.
+"""kbuild-subset.py -- evaluate the selected graphics drivers’ Kbuild files.
 
-The pinned 6.6 Makefiles are the source of truth for which .c files compile,
+The selected baseline Makefiles are the source of truth for which .c files compile,
 which include paths apply and which per-file flags exist.  This script
 evaluates that subset against kernel/linuxkpi/include/generated/autoconf.h
 and writes kernel/linux/Makefile.kbuild, which kernel/GNUmakefile includes
@@ -40,6 +40,8 @@ import sys
 ROOTS = [
     ("drivers/gpu/drm/amd/amdgpu/Makefile",
      "drivers/gpu/drm/amd/amdgpu", "amdgpu-y", "amd"),
+    ("drivers/gpu/drm/nouveau/Kbuild",
+     "drivers/gpu/drm/nouveau", "nouveau-y", "nouveau"),
     ("drivers/gpu/drm/display/Makefile",
      "drivers/gpu/drm/display", "drm_display_helper-y", "display"),
 ]
@@ -55,11 +57,19 @@ KNOWN_OBJECTS = [
     "drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c",
     "drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c",
     "drivers/gpu/drm/amd/display/dc/core/dc.c",
-    "drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.c",
     "drivers/gpu/drm/amd/display/dc/dml/dcn314/dcn314_fpu.c",
     "drivers/gpu/drm/amd/display/dmub/src/dmub_dcn31.c",
+    "drivers/gpu/drm/nouveau/nouveau_drm.c",
+    "drivers/gpu/drm/nouveau/nvif/object.c",
+    "drivers/gpu/drm/nouveau/nvkm/engine/device/base.c",
+    "drivers/gpu/drm/nouveau/dispnv04/disp.c",
+    "drivers/gpu/drm/nouveau/dispnv50/disp.c",
     "drivers/gpu/drm/display/drm_dp_helper.c",
     "drivers/gpu/drm/display/drm_dsc_helper.c",
+]
+KNOWN_OBJECT_ALTERNATIVES = [
+    ("drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.c",
+     "drivers/gpu/drm/amd/display/dc/hwss/dcn31/dcn31_hwseq.c"),
 ]
 
 # Flags the generator drops deliberately.  Warnings are governed by the
@@ -293,6 +303,18 @@ class Evaluator:
         return ""
 
     def call_builtin(self, callee, rest):
+        if callee == "test-lt":
+            args = split_func_args(rest)
+            if len(args) != 2:
+                raise MakeError("$(call test-lt,...) requires two operands")
+            values = [self.expand(arg).strip() for arg in args]
+            # Kbuild's shell test is false for an absent FRAME_WARN value.
+            if not all(values):
+                return ""
+            try:
+                return "y" if int(values[0]) < int(values[1]) else ""
+            except ValueError:
+                raise MakeError("test-lt operands must be integers: %r" % values)
         if callee == "cc-option":
             # Host GCC supports the options these trees probe for.
             return " ".join(split_words(self.expand(rest)))
@@ -473,7 +495,13 @@ class Evaluator:
         raw = (self.expand("$(ccflags-y)") + " "
                + self.expand("$(subdir-ccflags-y)"))
         flags = []
-        for token in split_words(raw):
+        tokens = iter(split_words(raw))
+        for token in tokens:
+            if token in ("-I", "-D"):
+                argument = next(tokens, None)
+                if argument is None:
+                    raise MakeError("missing argument after %s" % token)
+                token += argument
             if token.startswith("-I"):
                 path = token[2:]
                 if os.path.isabs(path):
@@ -497,24 +525,24 @@ class Evaluator:
             self.dropped_flags.append(token)
         return flags
 
-    def collect_per_file_flags(self, base):
+    def collect_per_file_flags(self, base, objects=None):
         rules = []
+        self.per_file_removals = []
         for name in sorted(self.vars):
-            if name.startswith("CFLAGS_REMOVE_"):
-                value = self.expand("$(%s)" % name)
-                if value.strip():
-                    self.unknown.append(
-                        "non-empty %s (ignored)" % name)
-                continue
             if not name.startswith("CFLAGS_"):
                 continue
-            obj = name[len("CFLAGS_"):]
+            remove = name.startswith("CFLAGS_REMOVE_")
+            obj = name[len("CFLAGS_REMOVE_" if remove else "CFLAGS_"):]
             if not obj.endswith(".o"):
                 continue
             path = os.path.normpath(os.path.join(base, obj[:-2] + ".c"))
             path = path.replace(os.sep, "/")
             if path.startswith("../") or os.path.isabs(path):
                 self.unknown.append("CFLAGS_ key escapes the tree: %s" % obj)
+                continue
+            # Kbuild contains flags for unselected and occasionally renamed
+            # objects. They have no effect on this configuration.
+            if objects is not None and path not in objects:
                 continue
             if not os.path.isfile(os.path.join(self.tree, path)):
                 self.unknown.append("CFLAGS_ key has no source: %s" % obj)
@@ -526,7 +554,8 @@ class Evaluator:
             dropped = [t for t in split_words(value) if t not in kept]
             self.dropped_flags.extend(dropped)
             if kept:
-                rules.append((path, " ".join(kept)))
+                (self.per_file_removals if remove else rules).append(
+                    (path, " ".join(kept)))
         return rules
 
 
@@ -564,6 +593,7 @@ def main():
     parser.add_argument("--out", required=True,
                         help="generated Makefile fragment")
     parser.add_argument("--report", help="write a human-readable report here")
+    parser.add_argument("--prefix", help="published tree path relative to kernel/, for staged imports")
     args = parser.parse_args()
 
     tree = os.path.abspath(args.tree)
@@ -573,12 +603,16 @@ def main():
     prefix = os.path.relpath(tree, os.path.dirname(tree))
     if prefix == ".":
         prefix = ""
+    if args.prefix is not None:
+        prefix = args.prefix
 
     all_objects = []
     all_duplicates = []
     include_flags = []
     per_file = []
+    per_file_removals = []
     reports = []
+    groups = {}
 
     for makefile, base, var, label in ROOTS:
         ev = Evaluator(tree)
@@ -589,6 +623,11 @@ def main():
         for name, value in config.items():
             ev.vars[name] = [value, True]
         ev.vars["CONFIG_CC_IS_GCC"] = ["y", True]
+        # Linux 6.12 DML uses architecture-supplied FPU flag variables.
+        # Match our x86 GCC build; remove the corresponding base flags in
+        # the compile recipe rather than capturing CFLAGS before arch setup.
+        ev.vars["CC_FLAGS_FPU"] = ["-msse -msse2 -mhard-float -mpreferred-stack-boundary=3", True]
+        ev.vars["CC_FLAGS_NO_FPU"] = ["-mno-80387 -mno-mmx -mno-sse -mno-sse2", True]
         ev.vars["srctree"] = ["", True]
         ev.vars["src"] = [base, True]
 
@@ -596,9 +635,13 @@ def main():
         if ev.cond_stack:
             raise SystemExit("kbuild-subset: unclosed conditional in %s" % makefile)
         objects, duplicates = ev.collect_objects(var, base)
-        if label == "amd":
-            include_flags = ev.collect_include_flags()
-            per_file = ev.collect_per_file_flags(base)
+        includes = ev.collect_include_flags()
+        flags = ev.collect_per_file_flags(base, objects)
+        removals = ev.per_file_removals
+        groups[label] = (objects, includes, flags, removals)
+        include_flags.extend(includes)
+        per_file.extend(flags)
+        per_file_removals.extend(removals)
         all_objects.extend(objects)
         all_duplicates.extend(duplicates)
         if ev.unknown:
@@ -611,6 +654,9 @@ def main():
                            + " ".join(sorted(set(ev.dropped_flags))))
 
     known_missing = [k for k in KNOWN_OBJECTS if k not in all_objects]
+    known_missing.extend("one of: " + " | ".join(group)
+                         for group in KNOWN_OBJECT_ALTERNATIVES
+                         if not any(path in all_objects for path in group))
     total = len(all_objects)
 
     pin = read_pin(tree)
@@ -652,30 +698,25 @@ def main():
         f.write("# Linux tree: %s\n" % pin_desc)
         f.write("# Config: %s\n" % args.config)
         f.write("#\n")
-        f.write("# amdgpu object list.  Gated by KPI_AMDGPU (default 0 in\n")
-        f.write("# kernel/GNUmakefile) while the Phase 6 C2 compile waves land;\n")
-        f.write("# flip the default when 6a links and boots cleanly.\n")
-        f.write("ifeq ($(KPI_AMDGPU),1)\n")
-        f.write("linux-obj-y += \\\n")
-        for idx, obj in enumerate(all_objects):
-            end = "" if idx == len(all_objects) - 1 else " \\"
-            f.write("    %s%s\n" % (obj, end))
-        f.write("endif\n\n")
-        f.write("# amdgpu include path union (ccflags-y + subdir-ccflags-y,\n")
-        f.write("# matching the single-invocation semantics of the 6.6 Makefiles).\n")
-        f.write("KPI_AMD_INCLUDES := \\\n")
-        for idx, flag in enumerate(include_flags):
-            end = "" if idx == len(include_flags) - 1 else " \\"
-            f.write("    %s%s\n" % (flag, end))
-        f.write("obj-$(ARCH)/linux/drivers/gpu/drm/amd/%.c.o:"
-                " LINUX_CPPFLAGS += $(KPI_AMD_INCLUDES)\n\n")
-        if per_file:
-            f.write("# Per-file CFLAGS_<path> from the 6.6 Makefiles"
-                    " (DML float/SSE, ...).\n")
-            for path, flags in per_file:
-                f.write("obj-$(ARCH)/linux/%s.o: LINUX_CFLAGS += %s\n"
-                        % (path, flags))
-            f.write("\n")
+        for label, (objects, includes, flags, removals) in groups.items():
+            if label == "display":
+                condition = "ifneq ($(filter 1,$(KPI_AMDGPU) $(KPI_NOUVEAU)),)"
+            else:
+                condition = "ifeq ($(KPI_%s),1)" % ("AMDGPU" if label == "amd" else "NOUVEAU")
+            f.write("# %s objects and flags from the selected Kbuild.\n" % label)
+            f.write(condition + "\n")
+            f.write("linux-obj-y += " + " ".join(objects) + "\n")
+            # Includes belong to these exact objects, including objects whose
+            # Kbuild reaches into a sibling directory. Never leak them into
+            # shared DRM or another driver.
+            targets = " ".join("obj-$(ARCH)/linux/%s.o" % obj for obj in objects)
+            if includes:
+                f.write("%s: LINUX_CPPFLAGS += %s\n" % (targets, " ".join(includes)))
+            for path, value in flags:
+                f.write("obj-$(ARCH)/linux/%s.o: LINUX_CFLAGS += %s\n" % (path, value))
+            for path, value in removals:
+                f.write("obj-$(ARCH)/linux/%s.o: LINUX_REMOVE_CFLAGS += %s\n" % (path, value))
+            f.write("endif\n\n")
     print("kbuild-subset: wrote %s (%d objects)" % (args.out, total))
 
 

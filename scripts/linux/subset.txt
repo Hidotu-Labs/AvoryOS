@@ -43,6 +43,9 @@ lib/kstrtox.h
 lib/string_helpers.c
 lib/hexdump.c
 lib/ctype.c
+lib/uuid.c
+# Split from bitmap.c in Linux 6.12; optional for the retained 6.6 profile.
+?lib/bitmap-str.c
 
 # Kbuild generates <generated/timeconst.h> from HZ; the import script derives
 # it from this script instead of hand-writing constants.
@@ -79,6 +82,7 @@ drivers/gpu/drm/scheduler
 # hand-maintained in files.txt.
 drivers/gpu/drm/amd
 drivers/gpu/drm/display
+?drivers/gpu/buddy.c
 
 # Phase 6: i2c-algo-bit, used by amdgpu_i2c.c for DDC/EDID bit-banging.
 drivers/i2c/algos/i2c-algo-bit.c
@@ -86,3 +90,12 @@ drivers/i2c/algos/i2c-algo-bit.c
 # Phase 6 C2: HDMI infoframe packing (drivers/video/hdmi.c) — the DRM HDMI
 # helper and amdgpu's DM link code link against hdmi_*_infoframe_*().
 drivers/video/hdmi.c
+drivers/video/cmdline.c
+
+# Nouveau C2: complete upstream directory; object selection comes from Kbuild.
+drivers/gpu/drm/nouveau
+
+# Nouveau GPU virtual-address range tree and common GPUVM algorithms.
+lib/maple_tree.c
+?drivers/gpu/drm/drm_gpuvm.c
+drivers/gpu/drm/drm_encoder_slave.c

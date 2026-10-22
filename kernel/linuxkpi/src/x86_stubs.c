@@ -153,9 +153,15 @@ int set_pages_array_wb(struct page **pages, int count) {
  * wbinvd writes back and invalidates the local caches. Upstream broadcasts
  * via IPI; single-CPU execution here is a documented limitation, strictly
  * better than a silent no-op. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+void wbinvd_on_all_cpus(void) {
+#else
 int wbinvd_on_all_cpus(void) {
+#endif
   __asm__ volatile("wbinvd" ::: "memory");
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
   return 0;
+#endif
 }
 
 DEFINE_PER_CPU(struct cpuinfo_x86, cpu_info);

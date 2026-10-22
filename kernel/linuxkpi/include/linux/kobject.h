@@ -11,6 +11,7 @@
  * broadcast where possible. */
 
 #include <linux/kernel.h>
+#include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/spinlock_types.h>
 #include <linux/types.h>

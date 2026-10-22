@@ -13,6 +13,13 @@
 #include <linux/types.h>
 #include <linux/gfp.h>
 #include <linux/compiler.h>
+#include <linux/minmax.h>
+#include <linux/version.h>
+#include <linux/cleanup.h>
+#include <linux/err.h>
+
+/* Type-based allocation helper from the selected Linux slab API. */
+#define kzalloc_obj(P, ...) ((typeof(P) *)kzalloc(sizeof(P), default_gfp(__VA_ARGS__)))
 
 #define ZERO_SIZE_PTR ((void *)16)
 #define ZERO_OR_NULL_PTR(x)                                                   \
@@ -126,6 +133,8 @@ static inline void kfree(const void *ptr) { __kpi_kfree(ptr); }
 static inline void kfree_sensitive(const void *ptr) {
   __kpi_kfree_sensitive(ptr);
 }
+DEFINE_FREE(kfree, void *, if (!IS_ERR_OR_NULL(_T)) kfree(_T))
+DEFINE_FREE(kfree_sensitive, void *, if (_T) kfree_sensitive(_T))
 static inline size_t ksize(const void *ptr) { return __kpi_ksize(ptr); }
 
 /* Declared here as well as in <linux/string.h> (which defines it upstream);
@@ -147,13 +156,39 @@ static inline void *__kmalloc_node(size_t size, gfp_t flags, int node) {
 
 /* ── kmem_cache ─────────────────────────────────────────────────────────── */
 
-static inline struct kmem_cache *kmem_cache_create(const char *name,
+static inline struct kmem_cache *kpi_kmem_cache_create_legacy(const char *name,
                                                    unsigned int size,
                                                    unsigned int align,
                                                    slab_flags_t flags,
                                                    void (*ctor)(void *)) {
   return __kpi_kmem_cache_create(name, size, align, flags, ctor);
 }
+
+struct kmem_cache_args {
+  unsigned int align, useroffset, usersize;
+  void (*ctor)(void *);
+  unsigned int sheaf_capacity;
+};
+static inline struct kmem_cache *kpi_kmem_cache_create_args(const char *name,
+    unsigned int size, struct kmem_cache_args *args, slab_flags_t flags) {
+  if (!args)
+    return __kpi_kmem_cache_create(name, size, 0, flags, NULL);
+  return __kpi_kmem_cache_create_usercopy(name, size, args->align, flags,
+      args->useroffset, args->usersize, args->ctor);
+}
+#define kmem_cache_create(name, size, args, ...)                               \
+  _Generic((args), struct kmem_cache_args *: kpi_kmem_cache_create_args,         \
+           void *: kpi_kmem_cache_create_args,                                \
+           default: kpi_kmem_cache_create_legacy)(name, size, args, __VA_ARGS__)
+
+/* Explicit maple-tree reservations. Native caches do not have SLUB's CPU
+ * barns: each sheaf owns a private batch and returns every unused object. */
+struct slab_sheaf;
+struct slab_sheaf *kmem_cache_prefill_sheaf(struct kmem_cache *, gfp_t, unsigned int);
+int kmem_cache_refill_sheaf(struct kmem_cache *, gfp_t, struct slab_sheaf **, unsigned int);
+void kmem_cache_return_sheaf(struct kmem_cache *, gfp_t, struct slab_sheaf *);
+void *kmem_cache_alloc_from_sheaf(struct kmem_cache *, gfp_t, struct slab_sheaf *);
+unsigned int kmem_cache_sheaf_size(struct slab_sheaf *);
 
 static inline struct kmem_cache *kmem_cache_create_usercopy(
     const char *name, unsigned int size, unsigned int align, slab_flags_t flags,
@@ -216,6 +251,14 @@ void *kvcalloc(size_t num, size_t size, gfp_t flags);
 void kvfree(const void *ptr);
 void kvfree_sensitive(const void *ptr, size_t len);
 /* Reallocate a kvmalloc() buffer, growing only (upstream mm/util.c). */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+void *kvrealloc(const void *p, size_t newsize, gfp_t flags);
+#else
 void *kvrealloc(const void *p, size_t oldsize, size_t newsize, gfp_t flags);
+#endif
+
+int kmem_cache_alloc_bulk(struct kmem_cache *cache, gfp_t flags,
+                           size_t count, void **objects);
+void kmem_cache_free_bulk(struct kmem_cache *cache, size_t count, void **objects);
 
 #endif /* __AVORY_LINUXKPI_SLAB_H */

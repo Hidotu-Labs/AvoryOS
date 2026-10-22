@@ -334,6 +334,10 @@ VFIO_LAUNCHER ?= python3 scripts/vfio_resume_check.py --
 VFIO_MEM ?= 4G
 VFIO_SMP ?= 8
 VFIO_ROM ?= build/vfio/vbios.rom
+# Additional properties for the primary function.
+VFIO_DEVICE_EXTRA ?=
+VFIO_GUEST_ADDRESS ?= addr=03.0
+VFIO_PREDEVICES ?=
 # Extra QEMU -device arguments for a run-vfio boot, e.g.
 #   make run-vfio VFIO_EXTRA='-device edu'
 VFIO_EXTRA ?=
@@ -346,20 +350,23 @@ VFIO_POINTER ?= usb-tablet
 QEMU_EXTRA ?=
 VFIO_COMMA := ,
 VFIO_ROM_OPT = $(if $(wildcard $(VFIO_ROM)),$(VFIO_COMMA)romfile=$(VFIO_ROM),)
+RUN_ISO ?= $(IMAGE_NAME).iso
+RUN_ISO_DEP ?= $(RUN_ISO)
 
 .PHONY: run-vfio
 run-vfio: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
-run-vfio: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
+run-vfio: edk2-ovmf $(RUN_ISO_DEP) $(RUN_DISK_DEP)
 	$(VFIO_LAUNCHER) qemu-system-$(ARCH) \
 		-M q35 \
 		-m $(VFIO_MEM) \
 		-cpu host -enable-kvm \
 		-smp $(VFIO_SMP) \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso \
+		-cdrom $(RUN_ISO) \
 		-drive file=disk.img,format=raw,if=none,id=nvme0 \
 		-device nvme,serial=avoryos0,drive=nvme0 \
-		-device vfio-pci,host=$(VFIO_BDF),addr=03.0,rombar=1$(VFIO_ROM_OPT) \
+		$(VFIO_PREDEVICES) \
+		-device vfio-pci,host=$(VFIO_BDF),$(VFIO_GUEST_ADDRESS)$(VFIO_DEVICE_EXTRA),rombar=1$(VFIO_ROM_OPT) \
 		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
 		-device qemu-xhci,id=xhci \
@@ -397,16 +404,6 @@ run-c7-prime: RUN_NIC_ADDR = 08.0
 run-c7-prime: VFIO_EXTRA = -device edu -chardev socket,id=prime-diag,path=build/logs/p6-c7-prime-serial.sock,server=on,wait=off,logfile=build/logs/p6-c7-prime.log,logappend=on $(RUN_NET_FLAGS)
 run-c7-prime: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
 run-c7-prime: run-vfio
-
-# Separate, explicitly invoked host reset helper. run-c7-prime does not call
-# it. Closing/reopening QEMU can exercise VFIO reset and power paths; neither
-# a VM restart nor a successful reset request guarantees cold GPU state.
-# The Raphael GPU has bus-only reset and shares its bridge with host devices.
-# Do not use reset-gpu as an automatic init-retry step; see the incident notes
-# in docs/amdgpu-testing.md. No host reset/power experiment is authorized here.
-.PHONY: reset-gpu
-reset-gpu:
-	sudo scripts/vfio-reset-gpu.sh $(VFIO_BDF)
 
 .PHONY: run-dist
 run-dist: edk2-ovmf avoryos-dist.iso
@@ -701,6 +698,9 @@ XORG_CONFIG = $(if $(filter amdgpu,$(XORG_PROFILE)),config/xorg/10-modesetting.c
 # needs a rebuild: early init re-selects the profile on every boot.
 disk.img: config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/20-output.conf scripts/image-runtime.py
 disk.img: config/xorg/avory-prime-display.sh config/xorg/45-prime-output.sh config/xorg/avory-xorg-profile.sh
+disk.img: config/xorg/10-nouveau.conf config/xorg/avory-nouveau-xorg.sh
+disk.img: config/xorg/44-nouveau-env.sh
+disk.img: userland/drm_identify.elf
 disk.img: scripts/image-firmware-install.sh
 disk.img: userland/test_signal_stack.elf
 disk.img: userland/test_user_dispatch.elf
@@ -1024,6 +1024,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		install -m 0644 config/xorg/10-native.conf build/alpine/rootfs/usr/share/avory-xorg/10-modesetting-native.conf; \
 		install -m 0644 $(XORG_CONFIG) build/alpine/rootfs/etc/X11/xorg.conf.d/10-modesetting.conf; \
 		install -m 0755 config/xorg/avory-xorg-profile.sh build/alpine/rootfs/usr/bin/avory-xorg-profile; \
+		install -m 0755 config/xorg/avory-nouveau-xorg.sh build/alpine/rootfs/usr/bin/avory-nouveau-xorg; \
+		install -m 0644 config/xorg/10-nouveau.conf build/alpine/rootfs/usr/share/avory-xorg/10-modesetting-nouveau.conf; \
 		install -m 0755 config/xorg/avory-prime-display.sh build/alpine/rootfs/usr/bin/avory-prime-display; \
 		if [ -f build/alpine/rootfs/sbin/avory-early-init ]; then \
 			grep -q 'avory-xorg-profile' build/alpine/rootfs/sbin/avory-early-init || \
@@ -1032,7 +1034,9 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 			{ echo '#!/bin/sh'; echo '/usr/bin/avory-xorg-profile 2>/dev/null || true'; } > build/alpine/rootfs/sbin/avory-early-init; \
 			chmod +x build/alpine/rootfs/sbin/avory-early-init; \
 		fi; \
-		mkdir -p build/alpine/rootfs/etc/X11/xinit/xinitrc.d; \
+		mkdir -p build/alpine/rootfs/etc/X11/xinit/xinitrc.d build/alpine/rootfs/etc/profile.d; \
+		install -m 0755 config/xorg/44-nouveau-env.sh build/alpine/rootfs/etc/X11/xinit/xinitrc.d/44-nouveau-env.sh; \
+		install -m 0644 config/xorg/44-nouveau-env.sh build/alpine/rootfs/etc/profile.d/avory-nouveau.sh; \
 		install -m 0755 config/xorg/45-prime-output.sh build/alpine/rootfs/etc/X11/xinit/xinitrc.d/45-prime-output.sh; \
 		mkdir -p build/alpine/rootfs/etc/sddm.conf.d; \
 		install -m 0644 config/xorg/20-output.conf build/alpine/rootfs/etc/sddm.conf.d/20-output.conf; \
@@ -1059,6 +1063,9 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "rm bin/startw.sh"; \
 		echo "rm bin/drm-pick.sh"; \
 		echo "write initrd/drm-pick.sh bin/drm-pick.sh"; \
+		echo "rm bin/drm-identify"; \
+		echo "write userland/drm_identify.elf bin/drm-identify"; \
+		echo "set_inode_field bin/drm-identify mode 0100755"; \
 		echo "rm etc/profile.d/avory-drm.sh"; \
 		echo "write initrd/avory-drm.sh etc/profile.d/avory-drm.sh"; \
 		echo "rm etc/weston.ini"; \
@@ -1322,12 +1329,16 @@ setup:
 
 .PHONY: kernel
 kernel: setup
-	$(MAKE) -C kernel
+	@if ! grep -qx 'tag=v6.18.42' kernel/linux/.pin 2>/dev/null || ! grep -qx 'commit=856a9b51680cbbed1ace1207b29e424a616cff48' kernel/linux/.pin 2>/dev/null; then scripts/linux-import.sh; fi
+	$(MAKE) -C kernel KPI_NOUVEAU=1
+	@mkdir -p build/nouveau-618
+	@cp kernel/bin-x86_64/kernel build/nouveau-618/kernel
+	@ln -sfn ../../kernel/linux build/nouveau-618/linux
 
 # Optional guest kernel command line baked into the ISO (limine `cmdline:`).
 # linuxkpi_param_parse() applies kpi_* module parameters from it, e.g.:
 #   make run-vfio KERNEL_CMDLINE=kpi_vfio_test=1
-KERNEL_CMDLINE ?=
+KERNEL_CMDLINE ?= $(NOUVEAU_618_CMDLINE)
 
 # Make tracks files, not variable values: without this stamp a new
 # KERNEL_CMDLINE would silently reuse the previously baked ISO cmdline.
@@ -1339,12 +1350,12 @@ build/kernel_cmdline.stamp: FORCE
 	@printf '%s' '$(KERNEL_CMDLINE)' > $@.tmp
 	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
 
-$(IMAGE_NAME).iso: limine/limine kernel limine.conf build/kernel_cmdline.stamp
+$(IMAGE_NAME).iso: limine/limine kernel nouveau-618-desktop-firmware limine.conf build/kernel_cmdline.stamp
 	rm -rf iso_root
 	mkdir -p iso_root/boot
-	cp -v kernel/bin-$(ARCH)/kernel iso_root/boot/
-	# Ship a stripped copy.  The build ELF carries ~95 MB of debug info that
-	# addr2line/GDB use against kernel/bin-$(ARCH)/kernel; nothing at runtime
+	cp -v kernel/bin-x86_64/kernel iso_root/boot/kernel
+	# Ship a stripped copy. The candidate ELF retains debug info for symbolization;
+	# nothing at runtime
 	# reads it, and Limine only loads the PT_LOAD segments.  Stripping the
 	# copy keeps the ISO small without losing post-mortem symbolization.
 	strip --strip-all iso_root/boot/kernel
@@ -1370,6 +1381,9 @@ $(IMAGE_NAME).iso: limine/limine kernel limine.conf build/kernel_cmdline.stamp
 		-efi-boot-part --efi-boot-image --protective-msdos-label \
 		iso_root -o $(IMAGE_NAME).iso
 	./limine/limine bios-install $(IMAGE_NAME).iso
+	@mkdir -p build/nouveau-618
+	@sha256sum $(IMAGE_NAME).iso > build/nouveau-618/avoryos-x86_64.iso.sha256
+	@printf '%s\n' '$(KERNEL_CMDLINE)' > build/nouveau-618/desktop-cmdline
 	rm -rf iso_root
 
 .PHONY: clean
@@ -1727,6 +1741,10 @@ userland/test_kpi_drm.elf: userland/test_kpi_drm.c $(GLIBC_STAMP)
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		userland/test_kpi_drm.c -o userland/test_kpi_drm.elf
 
+userland/drm_identify.elf: userland/drm_identify.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -I kernel/linux/include/uapi/drm \
+		userland/drm_identify.c -o userland/drm_identify.elf
+
 # Phase 4 C5 bochs canary: card discovery by DRM version name, dumb-buffer
 # mmap write/read and a full-CRTC atomic enable/disable.
 userland/test_kpi_bochs.elf: userland/test_kpi_bochs.c $(GLIBC_STAMP)
@@ -1847,3 +1865,156 @@ userland/terrain.png: userland/texpacks/classicube.zip
 	cd userland && unzip -o texpacks/classicube.zip terrain.png
 
 .PHONY: all qemu clean
+
+# Nouveau C4 candidates and isolated probe fixtures. No target rebinds PCI.
+NOUVEAU_GPU ?=
+NOUVEAU_CPUS ?= 1
+NOUVEAU_HOST_ON_IGPU ?= 0
+NOUVEAU_READINESS ?= build/nouveau-c4/readiness-handoff-$(NOUVEAU_CPUS)cpu/result.json
+NOUVEAU_ROM ?=
+NOUVEAU_SERIAL_LOG ?=
+NOUVEAU_DISPLAY ?= none
+NOUVEAU_OUT ?= build/nouveau-c4/hardware
+.PHONY: nouveau-c4 nouveau-preflight run-nouveau-software prepare-nouveau run-nouveau
+nouveau-c4:
+	python3 scripts/nouveau-c4-build.py
+nouveau-preflight:
+	python3 scripts/nouveau-boot.py --preflight --gpu '$(NOUVEAU_GPU)'
+run-nouveau-software: nouveau-c4
+	python3 scripts/nouveau-boot.py --software --run --cpus $(NOUVEAU_CPUS) --output-dir build/nouveau-c4/readiness-handoff-$(NOUVEAU_CPUS)cpu
+prepare-nouveau: $(NOUVEAU_OUT)/boot.iso
+
+# Fixture preparation only runs when the candidate kernel changes; otherwise
+# the existing boot.iso/root.img pair is reused as-is.
+$(NOUVEAU_OUT)/boot.iso: build/nouveau-c4/kernel
+	python3 scripts/nouveau-boot.py --gpu '$(NOUVEAU_GPU)' --cpus '$(NOUVEAU_CPUS)' --output-dir '$(NOUVEAU_OUT)' $(if $(NOUVEAU_ROM),--rom '$(NOUVEAU_ROM)',)
+
+# Use the checked runner for exact kernel/firmware readiness, exclusive log
+# ownership, retained per-run host errors and bounded shutdown diagnostics.
+NOUVEAU_FULL_SCREEN ?= off
+
+run-nouveau: build/nouveau-c4/kernel
+	python3 scripts/nouveau-boot.py --run --gpu '$(NOUVEAU_GPU)' --cpus '$(NOUVEAU_CPUS)' \
+		--output-dir '$(NOUVEAU_OUT)' --readiness '$(NOUVEAU_READINESS)' \
+		--display '$(NOUVEAU_DISPLAY)' --full-screen '$(NOUVEAU_FULL_SCREEN)' \
+		$(if $(filter 1,$(NOUVEAU_HOST_ON_IGPU)),--host-on-igpu,) \
+		$(if $(NOUVEAU_ROM),--rom '$(NOUVEAU_ROM)',) \
+		$(if $(NOUVEAU_SERIAL_LOG),--serial-log '$(NOUVEAU_SERIAL_LOG)' --live-serial,) \
+		--qemu-extra '$(QEMU_EXTRA)'
+
+# Legacy 6.12 interactive C4 target. It remains available under the original
+# spelling while the correctly spelled target below boots the isolated 6.18
+# candidate that passed the 570.144 GSP initialization test.
+.PHONY: run-nouevau-c4
+# Finish firmware publication before the normal kernel/ISO prerequisites even
+# with make -j; the kernel includes the generated firmware manifest header.
+.NOTPARALLEL: run-nouevau-c4
+run-nouevau-c4: export KPI_NOUVEAU = 1
+run-nouevau-c4: KERNEL_CMDLINE = init=/sbin/init splash quiet kpi_amdgpu=0 kpi_nouveau=1 kpi_nouveau_bdf=0000:00:03.0 nouveau.modeset=1 nouveau.runpm=0 nouveau.config=NvGspRm=1 nouveau.gsp_kvm_passthrough=1 nouveau.debug=info,gsp=trace drm.debug=0x4
+run-nouevau-c4: VFIO_BDF = 0000:01:00.0
+run-nouevau-c4: VFIO_ROM =
+run-nouevau-c4: VFIO_DEVICE_EXTRA = ,multifunction=on
+run-nouevau-c4: VFIO_LAUNCHER =
+run-nouevau-c4: VFIO_SMP = 8
+run-nouevau-c4: VFIO_POINTER = usb-mouse
+run-nouevau-c4: GTK_SHOW_CURSOR = off
+run-nouevau-c4: DISPLAY_OPT = -display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=$(GTK_SHOW_CURSOR),window-close=$(GTK_WINDOW_CLOSE)
+run-nouevau-c4: SERIAL = chardev:nouveau-diag
+run-nouevau-c4: RUN_NIC_ADDR = 08.0
+run-nouevau-c4: VFIO_EXTRA = -device vfio-pci,host=0000:01:00.1,addr=03.1 -chardev file,id=nouveau-diag,path=build/logs/nouveau-c4.log,append=on $(RUN_NET_FLAGS)
+run-nouevau-c4: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
+run-nouevau-c4: nouveau-desktop-firmware run-vfio
+NOUVEAU_SMP ?= 8
+NOUVEAU_PRESENT_BATCH ?= 1
+NOUVEAU_DEBUG ?= info
+NOUVEAU_DRM_DEBUG ?= 0
+NOUVEAU_GPU_DIAG ?= 0
+NOUVEAU_PERF ?= 1
+NOUVEAU_618_CMDLINE := init=/sbin/init splash quiet kpi_amdgpu=1 kpi_nouveau=1 kpi_nouveau_remove_on_shutdown=1 kpi_nouveau_bdf=0000:01:00.0 nouveau.modeset=1 nouveau.runpm=0 nouveau.config=NvGspRm=1 nouveau.debug=$(NOUVEAU_DEBUG) drm.debug=$(NOUVEAU_DRM_DEBUG) virtio_gpu.present_batch=$(NOUVEAU_PRESENT_BATCH) gpu_diag=$(NOUVEAU_GPU_DIAG) gpu_perf=$(NOUVEAU_PERF)
+
+.PHONY: nouveau-618-desktop-firmware run-nouveau-c4
+nouveau-618-desktop-firmware: kernel $(RUN_DISK_DEP)
+	python3 scripts/nouveau-firmware-stage.py --interface 570.144 --output build/nouveau-618/firmware
+	python3 scripts/image-add-firmware.py disk.img build/nouveau-618/firmware
+
+# The run target uses the normal ISO path but never rebuilds it as a side effect.
+# Full 6.18 / 570.144 interactive boot using the ordinary Limine menu, installed
+# writable desktop disk, display, audio, network, keyboard and mouse. QEMU is
+# launched directly, with serial appended to build/logs/nouveau-c4.log.
+# Keep the C4 guest at eight vCPUs.
+.NOTPARALLEL: run-nouveau-c4
+run-nouveau-c4:
+	@test -f avoryos-x86_64.iso || { echo 'Run make first to build the main Nouveau ISO.' >&2; exit 1; }
+	@test -f build/nouveau-618/avoryos-x86_64.iso.sha256 && sha256sum --check --status build/nouveau-618/avoryos-x86_64.iso.sha256 || { echo 'The main AvoryOS ISO changed; run make to rebuild it.' >&2; exit 1; }
+	@printf '%s\n' '$(NOUVEAU_618_CMDLINE)' | cmp -s - build/nouveau-618/desktop-cmdline || { echo 'The main ISO has different boot options; run make to rebuild it.' >&2; exit 1; }
+	@test -f build/nouveau/desktop-firmware.json || { echo 'Run make to install the Nouveau firmware into the desktop disk.' >&2; exit 1; }
+	@grep -Fq '"lib/firmware/nvidia/ad106/gsp/gsp-570.144.bin"' build/nouveau/desktop-firmware.json || { echo 'The desktop disk is missing the pinned 570.144 firmware; run make.' >&2; exit 1; }
+	@test "$$(cat /sys/bus/pci/devices/0000:01:00.0/vendor)" = 0x10de && test "$$(cat /sys/bus/pci/devices/0000:01:00.0/device)" = 0x2803
+	@test -L /sys/bus/pci/devices/0000:01:00.0/driver && test "$$(basename "$$(readlink -f /sys/bus/pci/devices/0000:01:00.0/driver)")" = vfio-pci || { echo 'RTX 4060 Ti must already be bound to vfio-pci.' >&2; exit 1; }
+	@test "$$(cat /sys/bus/pci/devices/0000:01:00.1/vendor)" = 0x10de && test "$$(cat /sys/bus/pci/devices/0000:01:00.1/device)" = 0x22bd && test -L /sys/bus/pci/devices/0000:01:00.1/driver && test "$$(basename "$$(readlink -f /sys/bus/pci/devices/0000:01:00.1/driver)")" = vfio-pci || { echo 'RTX audio function must already be bound to vfio-pci.' >&2; exit 1; }
+	@pin="$$(od -An -j 61 -N 1 -tu1 /sys/bus/pci/devices/0000:01:00.0/config | tr -d ' ')" && test "$$pin" -ge 1 && test "$$pin" -le 4 || { echo 'RTX PCI configuration is invalid (interrupt pin outside 1..4); stop and fully power-cycle the host before another VFIO attempt.' >&2; exit 1; }
+	@test "$$(cat /sys/bus/pci/devices/0000:01:00.0/boot_vga)" = 0 || { echo 'Select the iGPU as the host display in UEFI first.' >&2; exit 1; }
+	@mkdir -p build/logs
+	$(MAKE) --no-print-directory run-vfio \
+		RUN_ISO=avoryos-x86_64.iso RUN_ISO_DEP= \
+		KERNEL_CMDLINE='$(NOUVEAU_618_CMDLINE)' \
+		VFIO_BDF=0000:01:00.0 VFIO_DEVICE_EXTRA=,multifunction=on VFIO_ROM= \
+		VFIO_GUEST_ADDRESS='bus=nouveau-port,addr=00.0' \
+		VFIO_PREDEVICES='-device pcie-root-port,id=nouveau-port,bus=pcie.0,addr=03.0,chassis=1,hotplug=off,pref64-reserve=32G -global q35-pcihost.pci-hole64-size=64G' \
+		VFIO_LAUNCHER= VFIO_SMP='$(NOUVEAU_SMP)' VFIO_POINTER=usb-mouse RUN_NIC_ADDR=08.0 \
+		SERIAL=chardev:nouveau-c4 \
+		DISPLAY_OPT='-display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=off,window-close=on' \
+		VFIO_EXTRA='-chardev socket,id=nouveau-c4,path=build/logs/nouveau-c4-serial.sock,server=on,wait=off,logfile=build/logs/nouveau-c4.log,logappend=on $(RUN_NET_FLAGS)'
+
+.PHONY: nouveau-firmware
+NOUVEAU_C6_READINESS ?= build/nouveau-c6/readiness-present-final/result.json
+NOUVEAU_C6_OUT ?= build/nouveau-c6/interactive-present
+.PHONY: run-nouveau-c6-prime
+run-nouveau-c6-prime:
+	python3 scripts/nouveau-boot.py --c6-present --run --display gtk \
+		--pcie-root-port --gpu-only --remove-on-shutdown \
+		--gpu 0000:01:00.0 --host-on-igpu --cpus 1 --timeout 240 \
+		--kernel build/nouveau-618/kernel --firmware-dir build/nouveau-618/firmware \
+		--readiness '$(NOUVEAU_C6_READINESS)' --output-dir '$(NOUVEAU_C6_OUT)'
+
+nouveau-firmware:
+	@mkdir -p build/logs
+	python3 scripts/nouveau-firmware-stage.py
+
+NOUVEAU_C6_FLIP_READINESS ?= build/nouveau-c6/readiness-flips-final/result.json
+NOUVEAU_C7_READINESS ?= build/nouveau-c7/bind-wait-candidate/readiness-final/result.json
+NOUVEAU_C7_OUT ?= build/nouveau-c7/interactive-xorg
+.PHONY: run-nouveau-c7-xorg
+run-nouveau-c7-xorg:
+	python3 scripts/nouveau-boot.py --c7-zink --c7-xorg --run --display gtk \
+		--pcie-root-port --gpu-only --remove-on-shutdown \
+		--gpu 0000:01:00.0 --host-on-igpu --cpus 1 --timeout 240 \
+		--kernel build/nouveau-618/kernel --firmware-dir build/nouveau-618/firmware \
+		--readiness '$(NOUVEAU_C7_READINESS)' --output-dir '$(NOUVEAU_C7_OUT)'
+
+NOUVEAU_C6_FLIP_OUT ?= build/nouveau-c6/interactive-flips
+.PHONY: run-nouveau-c6-flips
+run-nouveau-c6-flips:
+	python3 scripts/nouveau-boot.py --c6-flips --run --display gtk \
+		--pcie-root-port --gpu-only --remove-on-shutdown \
+		--gpu 0000:01:00.0 --host-on-igpu --cpus 1 --timeout 240 \
+		--kernel build/nouveau-618/kernel --firmware-dir build/nouveau-618/firmware \
+		--readiness '$(NOUVEAU_C6_FLIP_READINESS)' --output-dir '$(NOUVEAU_C6_FLIP_OUT)'
+
+NOUVEAU_C6_GPU_READINESS ?= build/nouveau-c6/readiness-gpu-present/result.json
+NOUVEAU_C6_GPU_OUT ?= build/nouveau-c6/interactive-gpu-present
+.PHONY: run-nouveau-c6-gpu-prime
+run-nouveau-c6-gpu-prime:
+	python3 scripts/nouveau-boot.py --c6-gpu-present --run --display gtk \
+		--pcie-root-port --gpu-only --remove-on-shutdown \
+		--gpu 0000:01:00.0 --host-on-igpu --cpus 1 --timeout 240 \
+		--kernel build/nouveau-618/kernel --firmware-dir build/nouveau-618/firmware \
+		--readiness '$(NOUVEAU_C6_GPU_READINESS)' --output-dir '$(NOUVEAU_C6_GPU_OUT)'
+
+.PHONY: nouveau-desktop-firmware
+nouveau-desktop-firmware: nouveau-firmware $(RUN_DISK_DEP)
+	python3 scripts/image-add-firmware.py disk.img build/nouveau/firmware
+
+
+build/nouveau-c4/kernel:
+	python3 scripts/nouveau-c4-build.py

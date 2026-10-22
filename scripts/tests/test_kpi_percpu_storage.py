@@ -18,8 +18,8 @@ def function(source, signature):
 
 percpu = (ROOT/'kernel/linuxkpi/src/percpu.c').read_text()
 percpu = re.sub(r'^#include.*\n', '', percpu, flags=re.M)
-radix = (ROOT/'build/linux-src/lib/radix-tree.c').read_text()
-dc = (ROOT/'build/linux-src/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c').read_text()
+radix = (ROOT/'kernel/linux/lib/radix-tree.c').read_text()
+dc = (ROOT/'kernel/linux/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c').read_text()
 header = r'''
 #include <assert.h>
 #include <stdint.h>
@@ -31,6 +31,9 @@ header = r'''
 #define NR_CPUS 8
 #define CONFIG_X86 1
 #define BUG_ON(x) assert(!(x))
+#define WARN_ON_ONCE(x) assert(!(x))
+#define in_task() true
+#define kernel_fpu_available() true
 static unsigned cpu, pins[64], begins[64], ends[64];
 static bool irq = true;
 static int linuxkpi_cpu_id(void) { return cpu; }

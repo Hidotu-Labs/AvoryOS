@@ -249,29 +249,33 @@ static bool test_rwsem(void) {
 /* ── counting semaphore ─────────────────────────────────────────────────── */
 
 static struct semaphore core_sem;
+static int core_sem_published;
 
 static int sem_up_thread(void *arg) {
   struct semaphore *s = arg;
   msleep(15);
+  WRITE_ONCE(core_sem_published, 1);
   up(s);
   return 0;
 }
 
 static bool test_semaphore(void) {
   sema_init(&core_sem, 0);
+  WRITE_ONCE(core_sem_published, 0);
+  if (down_trylock(&core_sem) == 0)
+    return false;
 
   struct task_struct *t = kthread_run(sem_up_thread, &core_sem, "kpi/sem");
   if (IS_ERR(t))
     return false;
 
-  unsigned long start = jiffies;
   int ret = down_interruptible(&core_sem);
-  unsigned long waited = jiffies - start;
 
   kthread_stop(t);
-  return ret == 0 && waited >= 10;
-
-  /* NOTE: down() of an already-zero semaphore succeeds only after up(). */
+  /* The waker may finish before kthread_run() returns on another CPU.
+   * Verify publication and consumption, not elapsed time in the caller. */
+  return ret == 0 && READ_ONCE(core_sem_published) == 1 &&
+         down_trylock(&core_sem) != 0;
 }
 
 /* ── wait_on_bit / wake_up_bit ──────────────────────────────────────────── */

@@ -29,7 +29,8 @@ no firmware/kernel persistent crash record was retrieved.
 The user runs `make run-c7-prime`, closes QEMU when initialization fails,
 then runs the same target again. Some subsequent initializations reboot the
 whole host. This is a VFIO release/reopen sequence, not evidence of a cold GPU.
-The target does not invoke the separate `reset-gpu` shell helper.
+The target relies on normal VFIO/QEMU release and reset behavior; it does not
+perform a separate host reset operation.
 
 Read-only inspection: QEMU reports 11.1.0, host kernel 6.18.42-1-cachyos-lts;
 GPU `0e:00.0` is bound to vfio-pci with `reset_method=bus`, group 24. Functions

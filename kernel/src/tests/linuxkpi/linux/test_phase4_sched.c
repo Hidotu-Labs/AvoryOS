@@ -110,7 +110,11 @@ static enum drm_gpu_sched_stat p4s_timedout_job(
   atomic_inc(&p4s_timedout);
   if (j->timedout_completion)
     complete(j->timedout_completion);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+  return DRM_GPU_SCHED_STAT_RESET;
+#else
   return DRM_GPU_SCHED_STAT_NOMINAL;
+#endif
 }
 
 static void p4s_free_job(struct drm_sched_job *sched_job) {
@@ -268,7 +272,12 @@ static struct p4s_job *p4s_job_new(struct drm_sched_entity *entity,
   j->seq = seq;
   j->never_signal = never_signal;
   j->timedout_completion = timedout_done;
-  if (drm_sched_job_init(&j->job, entity, NULL) != 0) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+  if (drm_sched_job_init(&j->job, entity, 1, NULL, 0) != 0)
+#else
+  if (drm_sched_job_init(&j->job, entity, NULL) != 0)
+#endif
+  {
     kfree(j);
     return NULL;
   }
@@ -297,13 +306,35 @@ static long p4s_push_and_wait(struct drm_sched_entity *entity,
 
 /* ── tests ───────────────────────────────────────────────────────────────── */
 
+/* Keep the behavioral tests identical across the pinned scheduler APIs. */
+static int p4s_sched_init(struct drm_gpu_scheduler *sched,
+                         const struct drm_sched_backend_ops *ops,
+                         unsigned credits, unsigned hang_limit, long timeout,
+                         struct workqueue_struct *timeout_wq, atomic_t *score,
+                         const char *name, struct device *dev) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+  const struct drm_sched_init_args args = {
+    .ops = ops, .num_rqs = DRM_SCHED_PRIORITY_COUNT, .credit_limit = credits,
+    .hang_limit = hang_limit, .timeout = timeout, .timeout_wq = timeout_wq,
+    .score = score, .name = name, .dev = dev,
+  };
+  return drm_sched_init(sched, &args);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+  return drm_sched_init(sched, ops, NULL, DRM_SCHED_PRIORITY_COUNT, credits,
+                        hang_limit, timeout, timeout_wq, score, name, dev);
+#else
+  return drm_sched_init(sched, ops, credits, hang_limit, timeout,
+                        timeout_wq, score, name, dev);
+#endif
+}
+
 static void p4s_test_basic(void) {
-  struct drm_gpu_scheduler sched;
+  struct drm_gpu_scheduler sched = {0};
   struct drm_gpu_scheduler *sched_list[1] = {&sched};
   struct drm_sched_entity entity;
   long ret;
 
-  if (drm_sched_init(&sched, &p4s_ops, 2, 1, msecs_to_jiffies(P4S_TIMEOUT_MS),
+  if (p4s_sched_init(&sched, &p4s_ops, 2, 1, msecs_to_jiffies(P4S_TIMEOUT_MS),
                      system_wq, NULL, "p4s-basic", NULL) != 0) {
     p4s_fail("basic init", 0);
     return;
@@ -332,12 +363,12 @@ static void p4s_test_basic(void) {
 }
 
 static void p4s_test_order(void) {
-  struct drm_gpu_scheduler sched;
+  struct drm_gpu_scheduler sched = {0};
   struct drm_gpu_scheduler *sched_list[2] = {&sched, &sched};
   struct drm_sched_entity ents[2];
   bool bad = false;
 
-  if (drm_sched_init(&sched, &p4s_ops, 4, 1, msecs_to_jiffies(P4S_TIMEOUT_MS),
+  if (p4s_sched_init(&sched, &p4s_ops, 4, 1, msecs_to_jiffies(P4S_TIMEOUT_MS),
                      system_wq, NULL, "p4s-order", NULL) != 0) {
     p4s_fail("order init", 0);
     return;
@@ -376,7 +407,7 @@ static void p4s_test_order(void) {
 }
 
 static void p4s_test_timeout(void) {
-  struct drm_gpu_scheduler sched;
+  struct drm_gpu_scheduler sched = {0};
   struct drm_gpu_scheduler *sched_list[1] = {&sched};
   struct drm_sched_entity entity;
   struct completion timedout_done;
@@ -385,7 +416,7 @@ static void p4s_test_timeout(void) {
   long ret;
   int before = atomic_read(&p4s_timedout);
 
-  if (drm_sched_init(&sched, &p4s_ops, 2, 1, msecs_to_jiffies(P4S_TIMEOUT_MS),
+  if (p4s_sched_init(&sched, &p4s_ops, 2, 1, msecs_to_jiffies(P4S_TIMEOUT_MS),
                      system_wq, NULL, "p4s-timeout", NULL) != 0) {
     p4s_fail("timeout init", 0);
     return;
@@ -429,14 +460,14 @@ static void p4s_test_timeout(void) {
 }
 
 static void p4s_test_stress(void) {
-  struct drm_gpu_scheduler sched;
+  struct drm_gpu_scheduler sched = {0};
   struct drm_gpu_scheduler *sched_list[1] = {&sched};
   struct drm_sched_entity entity;
   int before_freed = atomic_read(&p4s_freed);
   int errs = 0;
   long baseline = 0, final = 0;
 
-  if (drm_sched_init(&sched, &p4s_ops, 4, 1, msecs_to_jiffies(P4S_TIMEOUT_MS),
+  if (p4s_sched_init(&sched, &p4s_ops, 4, 1, msecs_to_jiffies(P4S_TIMEOUT_MS),
                      system_wq, NULL, "p4s-stress", NULL) != 0) {
     p4s_fail("stress init", 0);
     return;

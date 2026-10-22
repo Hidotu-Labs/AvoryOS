@@ -264,6 +264,10 @@ struct thread {
   struct net_namespace *net_ns;
   bool seccomp_compat_dispatch;
   bool seccomp_sigsys;
+  /* Set by the seccomp scrape when a filter is about to answer this syscall
+   * with RET_ERRNO instead of letting the handler run; consumed by SYSDIAG so
+   * recorded syscall "errors" can say which denials came from a filter. */
+  bool seccomp_deny_pending;
   uint16_t seccomp_trap_data;
   uint32_t seccomp_trap_arch;
   uint8_t termination_signal;
@@ -513,7 +517,11 @@ void sched_copy_files(struct thread *child, struct thread *parent);
 bool fd_table_expand_locked(struct fd_table *files, uint32_t needed_fd);
 
 static inline void sched_sync_files(struct thread *t) {
-  if (t && t->files && t->fd_capacity != t->files->capacity) {
+  /* Pointer identity, not just capacity: a concurrent CLONE_FILES expansion
+   * swaps the arrays (and frees the old buffer) under files->lock, so an
+   * equal capacity attribute does not prove the cached pointers are live. */
+  if (t && t->files && (t->fd_capacity != t->files->capacity ||
+                        t->fds != t->files->fds)) {
     t->fds = t->files->fds;
     t->fd_offsets = t->files->fd_offsets;
     t->fd_flags = t->files->fd_flags;

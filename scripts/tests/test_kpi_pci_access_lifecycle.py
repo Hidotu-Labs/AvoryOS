@@ -35,11 +35,13 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;
 #define PCIBIOS_SUCCESSFUL 0
 #define PCI_COMMAND_IO 1
 #define PCI_COMMAND_MEMORY 2
+#define PCI_COMMAND_MASTER 4
 #define atomic_read(p) (*(p))
 #define atomic_dec_and_test(p) (--*(p)==0)
 struct device {int unused;};
-struct pci_dev {struct device dev;void *sysdata;int cfg_size,enable_cnt,is_managed;};
+struct pci_dev {struct device dev;void *sysdata;int cfg_size,enable_cnt,is_managed,is_busmaster;};
 static int accesses,command_writes,enable_error,action_error;
+static unsigned short command=PCI_COMMAND_IO|PCI_COMMAND_MEMORY|PCI_COMMAND_MASTER|0x100;
 static void (*cleanup)(void*);static void *cleanup_data;
 static unsigned char linuxkpi_pci_config_read8(void *d,unsigned short w){(void)d;(void)w;accesses++;return 0xab;}
 static unsigned short linuxkpi_pci_config_read16(void *d,unsigned short w){(void)d;(void)w;accesses++;return 0xabcd;}
@@ -48,8 +50,8 @@ static unsigned int linuxkpi_pci_config_read32(void *d,unsigned short w){(void)d
 write_native(8,unsigned char)
 write_native(16,unsigned short)
 write_native(32,unsigned int)
-static void linuxkpi_pci_set_bus_mastering(void*d,int enabled){(void)d;(void)enabled;command_writes++;}
-static void linuxkpi_pci_command_update(void*d,unsigned short set,unsigned short clear){(void)d;(void)set;(void)clear;command_writes++;}
+static void linuxkpi_pci_set_bus_mastering(void*d,int enabled){(void)d;command=enabled?command|PCI_COMMAND_MASTER:command&~PCI_COMMAND_MASTER;command_writes++;}
+static void linuxkpi_pci_command_update(void*d,unsigned short set,unsigned short clear){(void)d;command=(command&~clear)|set;command_writes++;}
 static int pci_enable_device(struct pci_dev*d){if(enable_error)return enable_error;d->enable_cnt++;return 0;}
 static int devm_add_action(struct device*d,void(*fn)(void*),void *p){(void)d;if(action_error)return action_error;cleanup=fn;cleanup_data=p;return 0;}
 static int devm_add_action_or_reset(struct device*d,void(*fn)(void*),void*p){int r=devm_add_action(d,fn,p);if(r)fn(p);return r;}
@@ -85,17 +87,23 @@ int main(void){
  enable_error=-EIO;assert(pcim_enable_device(&d)==-EIO&&!cleanup&&!d.enable_cnt&&!d.is_managed);
  enable_error=0;action_error=-ENOMEM;
  assert(pcim_enable_device(&d)==-ENOMEM&&!cleanup&&!d.enable_cnt&&!d.is_managed);
- assert(command_writes==2);
+ /* Nouveau disables before deleting its DRM/NVKM device. MMIO must remain
+  * decoded for that destructor; only bus mastering is disabled on x86. */
+ assert(command==(PCI_COMMAND_IO|PCI_COMMAND_MEMORY|0x100));
+ assert(command_writes==1);
  action_error=0;assert(!pcim_enable_device(&d)&&cleanup&&d.enable_cnt==1&&d.is_managed);
  assert(!pcim_enable_device(&d)&&d.enable_cnt==1);
- cleanup(cleanup_data);assert(!d.enable_cnt&&!d.is_managed&&command_writes==4);
- pci_disable_device(&d);assert(!d.enable_cnt&&command_writes==4);
- d.enable_cnt=2;pci_disable_device(&d);assert(d.enable_cnt==1&&command_writes==4);
- pci_disable_device(&d);assert(!d.enable_cnt&&command_writes==6);
+ cleanup(cleanup_data);assert(!d.enable_cnt&&!d.is_managed&&command_writes==2);
+ pci_disable_device(&d);assert(!d.enable_cnt&&command_writes==2);
+ command|=PCI_COMMAND_MASTER;d.is_busmaster=1;
+ d.enable_cnt=2;pci_disable_device(&d);assert(d.enable_cnt==1&&command_writes==2&&d.is_busmaster);
+ assert(command&PCI_COMMAND_MASTER);
+ pci_disable_device(&d);assert(!d.enable_cnt&&command_writes==3&&!d.is_busmaster);
+ assert(command==(PCI_COMMAND_IO|PCI_COMMAND_MEMORY|0x100));
  /* Managed cleanup must allow a later probe to enable the function again. */
  assert(!pcim_enable_device(&d)&&d.enable_cnt==1&&d.is_managed);
- cleanup(cleanup_data);assert(!d.enable_cnt&&!d.is_managed&&command_writes==8);
- puts("PASS: config bounds/alignment/overflow and managed enable failure/cleanup/nesting");
+ cleanup(cleanup_data);assert(!d.enable_cnt&&!d.is_managed&&command_writes==4);
+ puts("PASS: config bounds/alignment/overflow, managed cleanup/nesting, bus master off with MMIO/IO preserved");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='kpi-pci-access-') as tmp:

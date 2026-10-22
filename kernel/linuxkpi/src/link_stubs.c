@@ -9,6 +9,7 @@
 #include <asm/set_memory.h>
 #include <asm/smp.h>
 #include <drm/drm_client.h>
+#include <linux/version.h>
 #include <drm/drm_utils.h>
 #include <linux/component.h>
 #include <linux/device.h>
@@ -31,31 +32,6 @@
 #include <linux/uidgid.h>
 
 #include <linuxkpi/log.h>
-
-/* ── component framework (drm_sysfs typec links) ────────────────────────── */
-
-__attribute__((weak)) int component_add(struct device *dev,
-                                        const struct component_ops *ops) {
-  (void)dev;
-  (void)ops;
-  return 0;
-}
-
-__attribute__((weak)) void component_del(struct device *dev,
-                                         const struct component_ops *ops) {
-  (void)dev;
-  (void)ops;
-}
-
-/* ── drm_client (only referenced by drm_dev_unregister paths) ───────────── */
-
-__attribute__((weak)) void drm_client_dev_unregister(struct drm_device *dev) {
-  (void)dev;
-}
-
-__attribute__((weak)) void drm_client_dev_restore(struct drm_device *dev) {
-  (void)dev;
-}
 
 /* ── panel orientation quirks (no DMI tables here) ──────────────────────── */
 
@@ -86,7 +62,9 @@ __attribute__((weak)) int set_pages_array_wc(struct page **pages,
   return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
 __attribute__((weak)) int wbinvd_on_all_cpus(void) { return 0; }
+#endif
 
 /* Kbuild initializes this from the boot CPU; a zeroed record is enough for
  * the cache-line macros imported code uses.  Default the flush stride to 64
@@ -209,6 +187,7 @@ __attribute__((weak)) struct timespec64 ns_to_timespec64(s64 nsec) {
   return ts;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
 __attribute__((weak)) bool llist_add_batch(struct llist_node *new_first,
                                            struct llist_node *new_last,
                                            struct llist_head *head) {
@@ -222,6 +201,7 @@ __attribute__((weak)) bool llist_add_batch(struct llist_node *new_first,
                                         __ATOMIC_RELAXED));
   return first != NULL;
 }
+#endif
 
 /* __sw_hweight32()/__sw_hweight64() are implemented in
  * kernel/src/arch/x86_64/hweight.asm, not here: imported x86 code calls them
@@ -261,8 +241,3 @@ struct device *hwmon_device_register_with_groups(
 }
 
 void hwmon_device_unregister(struct device *dev) { (void)dev; }
-
-/* Stock drm_client.c hotplug notification; no clients are registered (fbdev
- * emulation is off), so it is a no-op. */
-void drm_client_dev_hotplug(struct drm_device *dev) { (void)dev; }
-

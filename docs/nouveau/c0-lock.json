@@ -1,0 +1,1031 @@
+{
+  "schema_version": 1,
+  "audit_date": "2026-10-18",
+  "timezone": "Europe/Istanbul",
+  "avory_commit": "883a44c9cee338836b15b96db9eb8c5362ed1eec",
+  "scope": "C0 only; no device ownership or active Linux import/config changed",
+  "current_linux_pin": "tag=v6.6.156\ncommit=8b73de7da85fde281a385e0b26eda9bffd3ca477\nimported=2026-09-21T18:34:06Z",
+  "selected": {
+    "linux": {
+      "tag": "v6.12.113",
+      "commit": "7fdb7c1824a1f9979d648d7ae28ac446bcee9c6e",
+      "tag_object": "0f6a69bb2f85d6da4dc81c32685143ee6c255348",
+      "repository": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+      "cache": "build/nouveau-c0/linux-candidate",
+      "status": "selected for C1 migration; not compiled or hardware validated"
+    },
+    "firmware": {
+      "commit": "ab23307cfe7f9366c819025ca3e4778299bc2db2",
+      "ref": "20260916",
+      "gsp_interface": "535.113.01",
+      "license": "LICENSES/LICENCE.nvidia",
+      "files": [
+        {
+          "request": "nvidia/ad106/gsp/booter_load-535.113.01.bin",
+          "canonical_source": "nvidia/ad102/gsp/booter_load-535.113.01.bin",
+          "size": 55928,
+          "sha256": "7d4ef3258da016f5208cfb1b348a9a1d69aaa13c2f8d4ee8c05d66bd05b45cd6",
+          "git_blob": "c1c37183faf197405be61fe79685287f8a649dc1"
+        },
+        {
+          "request": "nvidia/ad106/gsp/booter_unload-535.113.01.bin",
+          "canonical_source": "nvidia/ad102/gsp/booter_unload-535.113.01.bin",
+          "size": 39800,
+          "sha256": "d036dfee0545c36e2194bc555cb268a5e11a6f13b5f66a7dec40838efc6ad87e",
+          "git_blob": "be80931c1399c4c8b30cf044242869a8a9fe308c"
+        },
+        {
+          "request": "nvidia/ad106/gsp/bootloader-535.113.01.bin",
+          "canonical_source": "nvidia/ad102/gsp/bootloader-535.113.01.bin",
+          "size": 32876,
+          "sha256": "044d3a21eff73eb12f22840e5f145d685727f40165b3f2d265cf664753e9ff9c",
+          "git_blob": "70f7f6a2a9224f8ad8290b5964e7d1a2b1f7c19e"
+        },
+        {
+          "request": "nvidia/ad106/gsp/gsp-535.113.01.bin",
+          "canonical_source": "nvidia/ga102/gsp/gsp-535.113.01.bin",
+          "size": 38061600,
+          "sha256": "e30231ec0d317021770e16c81ae2c0553f728d0344248827582f78132c9447d4",
+          "git_blob": "b1546aa4cb1287ff6451175a5cd185bc5a72d039"
+        }
+      ],
+      "status": "bytes extracted for audit; not added to active image"
+    },
+    "userspace": {
+      "mesa_version": "26.2.5",
+      "libdrm_version": "2.4.134-1",
+      "vulkan_loader_version": "1.4.363.0-1",
+      "nvk_arch_package": "1:26.2.5-1",
+      "nvk_package_sha256": "b5f2b6e4519e7068f71c017855d42d606e3ae393d18c50209c16d4bf74f4c87c",
+      "nvk_package_url": "https://geo.mirror.pkgbuild.com/extra/os/x86_64/vulkan-nouveau-1:26.2.5-1-x86_64.pkg.tar.zst",
+      "mesa_source_url": "https://archive.mesa3d.org/mesa-26.2.5.tar.xz",
+      "mesa_source_sha256": "794b3d1729075dae7ebd47c7283b7ca0cdb5dec668f7f11cc0a5d82f6138a0a5",
+      "status": "source/API audited; package unpacked only; align existing Mesa splits before installation; runtime validation pending"
+    }
+  },
+  "hardware": [
+    {
+      "bdf": "0000:01:00.0",
+      "driver": "nvidia",
+      "vendor": "0x10de",
+      "device": "0x2803",
+      "subsystem_vendor": "0x10b0",
+      "subsystem_device": "0xf314",
+      "revision": "0xa1",
+      "boot_vga": "1",
+      "reset_method": "flr bus",
+      "resource": "0x00000000fb000000 0x00000000fbffffff 0x0000000000040200\n0x000000f800000000 0x000000fbffffffff 0x000000000014220c\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x000000fc00000000 0x000000fc01ffffff 0x000000000014220c\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x000000000000f000 0x000000000000f07f 0x0000000000040101\n0x00000000fc000000 0x00000000fc07ffff 0x0000000000046200\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000",
+      "iommu_group": "12",
+      "group_members": [
+        "0000:01:00.0",
+        "0000:01:00.1"
+      ]
+    },
+    {
+      "bdf": "0000:01:00.1",
+      "driver": "snd_hda_intel",
+      "vendor": "0x10de",
+      "device": "0x22bd",
+      "subsystem_vendor": "0x10b0",
+      "subsystem_device": "0xf314",
+      "revision": "0xa1",
+      "resource": "0x00000000fc080000 0x00000000fc083fff 0x0000000000040200\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000",
+      "iommu_group": "12",
+      "group_members": [
+        "0000:01:00.0",
+        "0000:01:00.1"
+      ]
+    },
+    {
+      "bdf": "0000:0e:00.0",
+      "driver": "vfio-pci",
+      "vendor": "0x1002",
+      "device": "0x164e",
+      "subsystem_vendor": "0x1002",
+      "subsystem_device": "0x164e",
+      "revision": "0xc6",
+      "boot_vga": "0",
+      "reset_method": "bus",
+      "resource": "0x000000fc10000000 0x000000fc1fffffff 0x000000000014220c\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x000000fc20000000 0x000000fc201fffff 0x000000000014220c\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x000000000000d000 0x000000000000d0ff 0x0000000000040101\n0x00000000fc500000 0x00000000fc57ffff 0x0000000000040200\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000\n0x0000000000000000 0x0000000000000000 0x0000000000000000",
+      "iommu_group": "24",
+      "group_members": [
+        "0000:0e:00.0"
+      ]
+    }
+  ],
+  "connectors": [
+    {
+      "name": "card1-HDMI-A-1",
+      "status": "disconnected",
+      "modes": []
+    },
+    {
+      "name": "card1-DP-2",
+      "status": "disconnected",
+      "modes": []
+    },
+    {
+      "name": "card1-DP-3",
+      "status": "connected",
+      "modes": [
+        "1920x1080",
+        "1280x720",
+        "1024x768",
+        "800x600",
+        "720x576",
+        "720x480",
+        "640x480"
+      ]
+    },
+    {
+      "name": "card1-DP-1",
+      "status": "disconnected",
+      "modes": []
+    }
+  ],
+  "current_rootfs_packages": {
+    "libdrm": "2.4.134-1",
+    "llvm-libs": "23.1.1-1",
+    "mesa": "1:26.2.4-1",
+    "vulkan-icd-loader": "1.4.363.0-1",
+    "vulkan-mesa-implicit-layers": "1:26.2.4-1",
+    "vulkan-swrast": "1:26.2.4-1",
+    "mesa-demos": "9.0.0-7",
+    "mesa-utils": "9.0.0-7",
+    "vulkan-tools": "1.4.363.0-1",
+    "glibc": "2.44+r50+g1848099f063e-1",
+    "vulkan-radeon": "1:26.2.5-1"
+  },
+  "host_toolchain_and_inventory": {
+    "gpu": {
+      "exit_code": 0,
+      "stdout": "NVIDIA GeForce RTX 4060 Ti, 00000000:01:00.0, 16380 MiB, 95.06.34.00.63, 610.57.04",
+      "stderr": ""
+    },
+    "pci": {
+      "exit_code": 0,
+      "stdout": "01:00.0 VGA compatible controller [0300]: NVIDIA Corporation AD106 [GeForce RTX 4060 Ti] [10de:2803] (rev a1)\n\tSubsystem: CardExpert Technology Device [10b0:f314]\n\tKernel driver in use: nvidia\n\tKernel modules: nouveau, nvidia_drm, nvidia\n01:00.1 Audio device [0403]: NVIDIA Corporation AD106M High Definition Audio Controller [10de:22bd] (rev a1)\n\tSubsystem: CardExpert Technology Device [10b0:f314]\n\tKernel driver in use: snd_hda_intel\n\tKernel modules: snd_hda_intel",
+      "stderr": ""
+    },
+    "host_kernel": {
+      "exit_code": 0,
+      "stdout": "Linux 6.18.42-1-cachyos-lts x86_64 GNU/Linux",
+      "stderr": ""
+    },
+    "gcc": {
+      "exit_code": 0,
+      "stdout": "gcc (GCC) 16.2.1 20260810\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+      "stderr": ""
+    },
+    "clang": {
+      "exit_code": 0,
+      "stdout": "clang version 22.1.8\nTarget: x86_64-pc-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin",
+      "stderr": ""
+    },
+    "rust": {
+      "exit_code": 0,
+      "stdout": "rustc 1.94.1 (e408947bf 2026-03-25)",
+      "stderr": ""
+    },
+    "meson": {
+      "exit_code": 0,
+      "stdout": "1.12.0",
+      "stderr": ""
+    },
+    "bindgen": {
+      "exit_code": 127,
+      "stdout": "",
+      "stderr": "not installed"
+    }
+  },
+  "preserved_artifacts": [
+    {
+      "path": "avoryos-x86_64.iso",
+      "bytes": 13404160,
+      "sha256": "76c2a73aaa4b8f321d9f9b3fd63e75442f9e2c9d32e61689c5152731277b8d3e",
+      "preserved_path": "/home/offihito/AvoryOS/build/nouveau-c0/preserved/avoryos-x86_64.iso"
+    },
+    {
+      "path": "kernel/bin-x86_64/kernel",
+      "bytes": 110129616,
+      "sha256": "27d3e903323a57706ec06e71fa3a4e3c89b5fdf06109eaeaf6a7b2615f8d1144",
+      "preserved_path": "/home/offihito/AvoryOS/build/nouveau-c0/preserved/kernel/bin-x86_64/kernel"
+    },
+    {
+      "path": "kernel/linux/.pin",
+      "bytes": 91,
+      "sha256": "bda6d2656aeb1311edd6e58de1abc4f73aeb2bf6cd2847df23322ef262fceeac",
+      "preserved_path": "/home/offihito/AvoryOS/build/nouveau-c0/preserved/kernel/linux/.pin"
+    },
+    {
+      "path": "kernel/linuxkpi/include/generated/autoconf.h",
+      "bytes": 5798,
+      "sha256": "bc5c1f569bf46ad72ad5a4883f2b0f1e4374fe99597fde64736233be7e806d72",
+      "preserved_path": "/home/offihito/AvoryOS/build/nouveau-c0/preserved/kernel/linuxkpi/include/generated/autoconf.h"
+    },
+    {
+      "path": "scripts/linux/subset.txt",
+      "bytes": 3190,
+      "sha256": "37eb2cc0a8674628c49841f81371f010a846a7d4dd0581caea85b6c3fd400ba1",
+      "preserved_path": "/home/offihito/AvoryOS/build/nouveau-c0/preserved/scripts/linux/subset.txt"
+    },
+    {
+      "path": "scripts/linux/files.txt",
+      "bytes": 5988,
+      "sha256": "266f94155b74678fc0c0dced80d79fc2f23b5bc04185fc99466d09eb973cc0b8",
+      "preserved_path": "/home/offihito/AvoryOS/build/nouveau-c0/preserved/scripts/linux/files.txt"
+    },
+    {
+      "path": "scripts/linux/kbuild-subset.py",
+      "bytes": 26696,
+      "sha256": "4df2ca603a4d22fc9792b3fd4dfb5eff5471b522bafb1c80744191cbb9763122",
+      "preserved_path": "/home/offihito/AvoryOS/build/nouveau-c0/preserved/scripts/linux/kbuild-subset.py"
+    },
+    {
+      "path": "scripts/linux-import.sh",
+      "bytes": 13042,
+      "sha256": "ab13a048e788d36804ffda2e3d5c1e9105e52b123fd8a9769658f2e3c945c823",
+      "preserved_path": "/home/offihito/AvoryOS/build/nouveau-c0/preserved/scripts/linux-import.sh"
+    },
+    {
+      "path": "scripts/linux/firmware-manifest.txt",
+      "bytes": 1558,
+      "sha256": "7314769ef4d3c65e4dbae83fbf2be83000c79e5f0bc2a6a3efce5f4461deab08",
+      "preserved_path": "/home/offihito/AvoryOS/build/nouveau-c0/preserved/scripts/linux/firmware-manifest.txt"
+    },
+    {
+      "path": "disk.img",
+      "bytes": 12884901888,
+      "preserved_path": "/home/offihito/AvoryOS/build/nouveau-c0/preserved/disk.img",
+      "method": "reflink",
+      "sha256": null,
+      "consistency": "not guest-quiesced; captured bytes only"
+    }
+  ],
+  "tests": [
+    {
+      "test": "test_kpi_dma_masks.py",
+      "exit_code": 0,
+      "status": "pass",
+      "log": "build/nouveau-c0/tests/test_kpi_dma_masks.py.log"
+    },
+    {
+      "test": "test_kpi_completion.py",
+      "exit_code": 0,
+      "status": "pass",
+      "log": "build/nouveau-c0/tests/test_kpi_completion.py.log"
+    },
+    {
+      "test": "test_kpi_mmio_ordering.py",
+      "exit_code": 0,
+      "status": "pass",
+      "log": "build/nouveau-c0/tests/test_kpi_mmio_ordering.py.log"
+    },
+    {
+      "test": "test_firmware_bundle_pin.py",
+      "exit_code": 0,
+      "status": "pass",
+      "log": "build/nouveau-c0/tests/test_firmware_bundle_pin.py.log"
+    },
+    {
+      "test": "test_kpi_rcu_lifetime.py",
+      "exit_code": 0,
+      "status": "pass",
+      "log": "build/nouveau-c0/tests/test_kpi_rcu_lifetime.py.log"
+    },
+    {
+      "test": "test_kpi_pci_access_lifecycle.py",
+      "exit_code": 0,
+      "status": "pass",
+      "log": "build/nouveau-c0/tests/test_kpi_pci_access_lifecycle.py.log"
+    },
+    {
+      "test": "test_kpi_ttm_eviction.py",
+      "exit_code": 0,
+      "status": "pass",
+      "log": "build/nouveau-c0/tests/test_kpi_ttm_eviction.py.log"
+    }
+  ],
+  "limitations": [
+    "No Nouveau Linux reference hardware test",
+    "No NVIDIA or AMD physical GPU test in this audit",
+    "Firmware-menu settings and successful reset not verified",
+    "Private software guest self-tests include baseline failures; see baseline-audit.md",
+    "Disk reflink was not captured with guest quiescence"
+  ],
+  "source_comparison": {
+    "old": {
+      "amd": {
+        "objects": 656,
+        "duplicates": [],
+        "unsupported": [],
+        "missing_sources": [],
+        "include_flags": [
+          "-Ilinux/drivers/gpu/drm/amd/include/asic_reg",
+          "-Ilinux/drivers/gpu/drm/amd/include",
+          "-Ilinux/drivers/gpu/drm/amd/amdgpu",
+          "-Ilinux/drivers/gpu/drm/amd/pm/inc",
+          "-Ilinux/drivers/gpu/drm/amd/acp/include",
+          "-Ilinux/drivers/gpu/drm/amd/display",
+          "-Ilinux/drivers/gpu/drm/amd/display/include",
+          "-Ilinux/drivers/gpu/drm/amd/display/modules/inc",
+          "-Ilinux/drivers/gpu/drm/amd/display/dc",
+          "-Ilinux/drivers/gpu/drm/amd/display/amdgpu_dm",
+          "-Ilinux/drivers/gpu/drm/amd/amdkfd",
+          "-Ilinux/drivers/gpu/drm/amd/pm/swsmu",
+          "-Ilinux/drivers/gpu/drm/amd/pm/swsmu/inc",
+          "-Ilinux/drivers/gpu/drm/amd/pm/swsmu/inc/pmfw_if",
+          "-Ilinux/drivers/gpu/drm/amd/pm/swsmu/smu11",
+          "-Ilinux/drivers/gpu/drm/amd/pm/swsmu/smu12",
+          "-Ilinux/drivers/gpu/drm/amd/pm/swsmu/smu13",
+          "-Ilinux/drivers/gpu/drm/amd/pm/powerplay/inc",
+          "-Ilinux/drivers/gpu/drm/amd/pm/powerplay/smumgr",
+          "-Ilinux/drivers/gpu/drm/amd/pm/powerplay/hwmgr",
+          "-Ilinux/drivers/gpu/drm/amd/pm/legacy-dpm",
+          "-Ilinux/drivers/gpu/drm/amd/display/dc/inc",
+          "-Ilinux/drivers/gpu/drm/amd/display/dc/inc/hw",
+          "-Ilinux/drivers/gpu/drm/amd/display/dc/clk_mgr",
+          "-Ilinux/drivers/gpu/drm/amd/display/modules/freesync",
+          "-Ilinux/drivers/gpu/drm/amd/display/modules/color",
+          "-Ilinux/drivers/gpu/drm/amd/display/modules/info_packet",
+          "-Ilinux/drivers/gpu/drm/amd/display/modules/power",
+          "-Ilinux/drivers/gpu/drm/amd/display/dmub/inc",
+          "-Ilinux/drivers/gpu/drm/amd/display/modules/hdcp",
+          "-DBUILD_FEATURE_TIMING_SYNC=0"
+        ],
+        "per_file_rules": 33
+      },
+      "display": {
+        "objects": 8,
+        "duplicates": [],
+        "unsupported": [],
+        "missing_sources": [],
+        "include_flags": [],
+        "per_file_rules": 0
+      },
+      "nouveau": {
+        "objects": 691,
+        "duplicates": [],
+        "unsupported": [],
+        "missing_sources": [],
+        "include_flags": [
+          "-Ilinux/."
+        ],
+        "per_file_rules": 0
+      }
+    },
+    "candidate": {
+      "amd": {
+        "error": "$(call test-lt,...) is not supported",
+        "unsupported": []
+      },
+      "display": {
+        "objects": 8,
+        "duplicates": [],
+        "unsupported": [],
+        "missing_sources": [],
+        "include_flags": [],
+        "per_file_rules": 0
+      },
+      "nouveau": {
+        "objects": 715,
+        "duplicates": [],
+        "unsupported": [],
+        "missing_sources": [],
+        "include_flags": [
+          "-Ilinux/."
+        ],
+        "per_file_rules": 0
+      }
+    },
+    "manual_manifest": {
+      "total": 113,
+      "missing_in_candidate": [],
+      "changed": 78,
+      "sparse_checkout_omissions": [
+        "drivers/i2c/algos/i2c-algo-bit.c",
+        "drivers/video/hdmi.c"
+      ]
+    },
+    "overlay_headers": {
+      "old_upstream_matches": 97,
+      "changed_or_removed": 76,
+      "include_next_changed": 10,
+      "headers": [
+        {
+          "path": "asm-generic/memory_model.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/acpi.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/anon_inodes.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/bottom_half.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/capability.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/completion.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/cpu.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/cpuhotplug.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/crc32.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": true
+        },
+        {
+          "path": "linux/debugfs.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": true
+        },
+        {
+          "path": "linux/delay.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/device.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/dma-mapping.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/fb.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/fdtable.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/file.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/firmware.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": true
+        },
+        {
+          "path": "linux/fs.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/gfp.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/hardirq.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/highmem.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/hrtimer.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/i2c.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/instrumented.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/interrupt.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/io.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/irq_work.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/irqdomain.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": true
+        },
+        {
+          "path": "linux/irqflags.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/irqreturn.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/jiffies.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/kernel.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": true
+        },
+        {
+          "path": "linux/kgdb.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/kmemleak.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/kobject.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/kstrtox.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": true
+        },
+        {
+          "path": "linux/kthread.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/ktime.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/local_lock.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/lockdep.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/mm.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/mm_types.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/mman.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/mmap_lock.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/mmu_notifier.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/mmzone.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": true
+        },
+        {
+          "path": "linux/module.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/moduleparam.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/mount.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/mutex.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/notifier.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/page-flags.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/pagemap.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/pagevec.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/percpu.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/pid.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/pm.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/preempt.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/proc_fs.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": true
+        },
+        {
+          "path": "linux/pseudo_fs.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/ratelimit.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/rcupdate.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/rtc.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": true
+        },
+        {
+          "path": "linux/rwlock.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/rwlock_types.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/rwsem.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/scatterlist.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/sched.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/semaphore.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/seq_file.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/seqlock.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/shmem_fs.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/slab.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/spinlock.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/spinlock_types.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/spinlock_types_raw.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/srcu.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/syscalls.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/sysfs.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/thread_info.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/time.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/timer.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/timerqueue.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/uaccess.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/vmalloc.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/wait.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/wait_bit.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/workqueue.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/ww_mutex.h",
+          "candidate_exists": true,
+          "changed": false,
+          "include_next": false
+        },
+        {
+          "path": "linux/percpu-defs.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/device/bus.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/device/class.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/device/driver.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/regulator/consumer.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/sched/mm.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "linux/sched/signal.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": false
+        },
+        {
+          "path": "drm/display/drm_dp_helper.h",
+          "candidate_exists": true,
+          "changed": true,
+          "include_next": true
+        }
+      ]
+    },
+    "amd_patch_dry_run": {
+      "exit_code": 0,
+      "log": "checking file drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c\nHunk #1 succeeded at 6912 (offset 280 lines).\nHunk #2 succeeded at 7103 (offset 280 lines).\nHunk #3 succeeded at 7272 (offset 280 lines).\n"
+    }
+  },
+  "software_boot_results": [
+    {
+      "profile": "eight CPUs, software harness, audit-only host cc init compiler adapter",
+      "status": "partial",
+      "pipeline_exit": 0,
+      "oracle_failures": 0,
+      "inconclusive_overlap_cases": 2,
+      "boot_suite_failures": [
+        "LinuxKPI semaphore wrong result",
+        "firmware test_fw.bin missing from private fixture"
+      ],
+      "serial_log": "build/nouveau-c0/software-pipeline/software-serial.log",
+      "run_log": "build/nouveau-c0/tests/software-pipeline-hostcc.log"
+    },
+    {
+      "profile": "one CPU, same software ISO and reflink-copied fixture",
+      "status": "fail",
+      "reason": "requested /bin/gpu-probe-init reported missing; no oracle result before 100-second timeout",
+      "serial_log": "build/nouveau-c0/software-pipeline-1cpu/software-serial.log",
+      "run_log": "build/nouveau-c0/tests/software-pipeline-1cpu.log"
+    }
+  ],
+  "gate_decision": {
+    "C0": "audit delivered; exact migration candidate selected",
+    "G0": "source inputs frozen; runtime compatibility unverified",
+    "C1": "not started; preserve baseline failures and resolve reproducible regression harness before claiming migration green"
+  }
+}

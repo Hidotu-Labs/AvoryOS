@@ -4,6 +4,7 @@
  * bridge.  Runs in a kthread (see linuxkpi/src/boot_tests.c). */
 
 #include <linux/gfp.h>
+#include <linux/irqflags.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
@@ -228,19 +229,34 @@ static bool test_page_split(void) {
 /* ── aggregate free-page invariant across many alloc/free cycles ────────── */
 
 static bool test_page_leak_invariant(void) {
-  unsigned long before = asc_pmm_get_free_pages();
+  for (unsigned int iteration = 0; iteration < 256; iteration++) {
+    unsigned int order = iteration % 4;
+    struct page *first = alloc_pages(GFP_KERNEL, order);
+    struct page *second = alloc_pages(GFP_KERNEL | __GFP_ZERO, 1);
+    unsigned long flags, before, after;
+    unsigned long released = (1UL << order) + 2;
 
-  for (int i = 0; i < 256; i++) {
-    struct page *a = alloc_pages(GFP_KERNEL, i % 4);
-    struct page *b = alloc_pages(GFP_KERNEL | __GFP_ZERO, 1);
-
-    if (!a || !b)
+    if (!first || !second) {
+      __free_pages(first, order);
+      __free_pages(second, 1);
       return false;
-    __free_pages(a, i % 4);
-    __free_pages(b, 1);
+    }
+
+    local_irq_save(flags);
+    before = asc_pmm_get_free_pages();
+    __free_pages(first, order);
+    __free_pages(second, 1);
+    after = asc_pmm_get_free_pages();
+    local_irq_restore(flags);
+    if (after != before + released) {
+      klogf("[INFO] LinuxKPI: page free-count order=%u before=%lu "
+            "after=%lu expected=%lu\n", order, before, after,
+            before + released);
+      return false;
+    }
   }
 
-  return asc_pmm_get_free_pages() == before;
+  return true;
 }
 
 /* ── aggregator ─────────────────────────────────────────────────────────── */

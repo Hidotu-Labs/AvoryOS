@@ -12,6 +12,7 @@
  * master_xfer algorithm, call i2c_transfer() and are done. */
 
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/mutex.h>
 #include <linux/stat.h>
 #include <linux/types.h>
@@ -161,9 +162,14 @@ struct i2c_adapter_quirks {
  * @functionality: I2C_FUNC_* flags supported by the adapter
  */
 struct i2c_algorithm {
-  int (*master_xfer)(struct i2c_adapter *adap, struct i2c_msg *msgs, int num);
-  int (*master_xfer_atomic)(struct i2c_adapter *adap, struct i2c_msg *msgs,
-                            int num);
+  union {
+    int (*master_xfer)(struct i2c_adapter *, struct i2c_msg *, int);
+    int (*xfer)(struct i2c_adapter *, struct i2c_msg *, int);
+  };
+  union {
+    int (*master_xfer_atomic)(struct i2c_adapter *, struct i2c_msg *, int);
+    int (*xfer_atomic)(struct i2c_adapter *, struct i2c_msg *, int);
+  };
   int (*smbus_xfer)(struct i2c_adapter *adap, u16 addr, unsigned short flags,
                     char read_write, u8 command, int size,
                     union i2c_smbus_data *data);
@@ -187,6 +193,30 @@ struct i2c_client {
   struct i2c_adapter *adapter;
   struct device dev;
 };
+
+/* Optional client drivers are not bound by the native adapter-only core.
+ * Registration/new-client APIs fail explicitly until that model exists. */
+struct i2c_board_info;
+struct i2c_device_id;
+struct i2c_driver {
+  unsigned int class;
+  int (*probe)(struct i2c_client *);
+  void (*remove)(struct i2c_client *);
+  int (*detect)(struct i2c_client *, struct i2c_board_info *);
+  struct device_driver driver;
+  const struct i2c_device_id *id_table;
+  const unsigned short *address_list;
+};
+#define to_i2c_driver(d) container_of(d, struct i2c_driver, driver)
+#define I2C_MODULE_PREFIX "i2c:"
+#define I2C_BOARD_INFO(name, address) .type = (name), .addr = (address)
+int i2c_register_driver(struct module *, struct i2c_driver *);
+void i2c_del_driver(struct i2c_driver *);
+void i2c_unregister_device(struct i2c_client *);
+
+static inline bool i2c_client_has_driver(struct i2c_client *client) {
+  return !IS_ERR_OR_NULL(client) && client->dev.driver;
+}
 
 /**
  * struct i2c_lock_operations - represent I2C locking operations
@@ -288,6 +318,7 @@ static inline u8 i2c_8bit_addr_from_msg(const struct i2c_msg *msg) {
 
 /* administration */
 int i2c_add_adapter(struct i2c_adapter *adap);
+int devm_i2c_add_adapter(struct device *dev, struct i2c_adapter *adap);
 int i2c_add_numbered_adapter(struct i2c_adapter *adap);
 void i2c_del_adapter(struct i2c_adapter *adap);
 struct i2c_adapter *i2c_get_adapter(int nr);

@@ -144,10 +144,14 @@ static void hal_irq_enable(void) { irq_enabled = true; }
 static void hal_irq_disable(void) { irq_enabled = false; }
 static void hal_irq_restore(uint64_t f) { irq_enabled = !!(f & 512); }
 ''')
-    for variant in ('native', 'save', 'raw', 'linuxkpi'):
-        if variant == 'linuxkpi':
+    for variant in ('native', 'save', 'raw', 'linuxkpi', 'linuxkpi-read',
+                    'linuxkpi-write-reader', 'linuxkpi-write-writer'):
+        if variant.startswith('linuxkpi'):
             h = (root / 'kernel/linuxkpi/include/linux/spinlock.h').read_text()
             h = re.sub(r'#include <linux/.*?>', '', h)
+            if variant != 'linuxkpi':
+                rwlock = (root / 'kernel/linuxkpi/include/linux/rwlock.h').read_text()
+                h += re.sub(r'#include <linux/.*?>', '', rwlock)
             h = '#undef __always_inline\n#define __always_inline inline\n' + h
             h = (root / 'kernel/linuxkpi/include/linux/spinlock_types.h').read_text().replace(
                 '#include <linux/types.h>', '') + h
@@ -165,6 +169,14 @@ static spinlock_t lock;
 static _Thread_local unsigned long flags;
 static void acquire_test_lock(void) { spin_lock_irqsave(&lock, flags); }
 static void release_test_lock(void) { spin_unlock_irqrestore(&lock, flags); }
+'''
+            if variant != 'linuxkpi':
+                operation = 'read' if variant == 'linuxkpi-read' else 'write'
+                wrappers = f'''void linuxkpi_tlb_poll(void) {{ tlb_shootdown_poll(); }}
+static rwlock_t lock;
+static _Thread_local unsigned long flags;
+static void acquire_test_lock(void) {{ {operation}_lock_irqsave(&lock, flags); }}
+static void release_test_lock(void) {{ {operation}_unlock_irqrestore(&lock, flags); }}
 '''
         else:
             h = (root / 'kernel/src/lock/spinlock.h').read_text().replace(
@@ -188,8 +200,10 @@ static void release_test_lock(void) { spinlock_release_restore(&lock, flags); }
 static void acquire_test_lock(void) { spinlock_acquire(&lock); }
 static void release_test_lock(void) { spinlock_release(&lock); }
 '''
-        wrappers += '''static void lock_for_owner(void) { __atomic_store_n(&lock.locked, 1, __ATOMIC_RELEASE); }
-static void unlock_for_owner(void) { __atomic_store_n(&lock.locked, 0, __ATOMIC_RELEASE); }
+        field = 'cnt' if variant.startswith('linuxkpi-') else 'locked'
+        held = -1 if variant in ('linuxkpi-read', 'linuxkpi-write-writer') else 1
+        wrappers += f'''static void lock_for_owner(void) {{ __atomic_store_n(&lock.{field}, {held}, __ATOMIC_RELEASE); }}
+static void unlock_for_owner(void) {{ __atomic_store_n(&lock.{field}, 0, __ATOMIC_RELEASE); }}
 '''
         (p / 'test.c').write_text(preamble + '\n'.join(arrays) + hardware +
                                 handler + h + wrappers + test)
@@ -199,9 +213,11 @@ static void unlock_for_owner(void) { __atomic_store_n(&lock.locked, 0, __ATOMIC_
                         '-I'+tmp, str(p/'test.c'), '-o', str(p/'test')], check=True)
         subprocess.run([str(p/'test')], check=True, timeout=10)
         print(f'PASS: {variant}: IRQ-masked wait cycle, flush-before-ack, PCID paths, delayed IPI')
-        if variant == 'native':
+        if variant in ('native', 'linuxkpi-read', 'linuxkpi-write-reader'):
             # Removing service from the real waiter must recreate the cycle.
             negative = h.replace('tlb_shootdown_poll();', '(void)0;')
+            if variant.startswith('linuxkpi-'):
+                negative = h.replace('linuxkpi_tlb_poll();', '(void)0;')
             (p / 'negative.c').write_text(preamble + '\n'.join(arrays) + hardware +
                                           handler + negative + wrappers + test)
             subprocess.run(['cc', '-O2', '-pthread', '-I'+tmp,

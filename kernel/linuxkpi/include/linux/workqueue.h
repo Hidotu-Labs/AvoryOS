@@ -29,6 +29,7 @@ struct work_struct {
 };
 
 #define work_pending(work) ((work)->pending)
+#define delayed_work_pending(dwork) work_pending(&(dwork)->work)
 #define work_data_bits(work) (0UL)
 
 #define INIT_WORK(_work, _func)                                               \
@@ -48,6 +49,8 @@ struct work_struct {
 #define INIT_WORK_ONSTACK(_work, _func) INIT_WORK(_work, _func)
 #define destroy_work_on_stack(work) do { (void)(work); } while (0)
 
+enum { WQ_MAX_ACTIVE = 512, WQ_UNBOUND_MAX_ACTIVE = 512, WQ_DFL_ACTIVE = 256 };
+
 struct workqueue_struct;
 
 extern struct workqueue_struct *system_wq;
@@ -60,6 +63,12 @@ extern struct workqueue_struct *system_freezable_wq;
 bool queue_work(struct workqueue_struct *wq, struct work_struct *work);
 bool queue_work_on(int cpu, struct workqueue_struct *wq,
                    struct work_struct *work);
+static inline bool queue_work_node(int node, struct workqueue_struct *wq,
+                                   struct work_struct *work) {
+  (void)node; /* Node affinity is a hint; native workers are unbound. */
+  return queue_work(wq, work);
+}
+
 bool schedule_work(struct work_struct *work);
 bool schedule_work_on(int cpu, struct work_struct *work);
 

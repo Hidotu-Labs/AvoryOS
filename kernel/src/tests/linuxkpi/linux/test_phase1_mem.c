@@ -48,13 +48,15 @@ static bool test_slab(void) {
   if (!o1 || !o2) {
     ok = false;
   } else {
+    if (ksize(o1) != 96)
+      ok = false;
     for (int i = 0; i < 96; i++) {
       if (o2[i] != 0)
         ok = false;
     }
   }
 
-  kmem_cache_free(c, o1);
+  kfree(o1);
   kmem_cache_free(c, o2);
   kmem_cache_destroy(c);
   return ok;

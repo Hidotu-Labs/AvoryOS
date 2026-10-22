@@ -1,4 +1,5 @@
 #include "vmm.h"
+#include "../apic/lapic_timer.h"
 #include "../console/klog.h"
 #include "../fs/vfs.h"
 #include "../sched/sched.h"
@@ -245,6 +246,7 @@ struct vmm_defer_node {
 
 static struct vmm_defer_node *vmm_defer_head;
 static unsigned vmm_defer_depth; // guarded by vmm_defer_lock
+static unsigned vmm_defer_active;
 static spinlock_t vmm_defer_lock = SPINLOCK_INIT;
 
 unsigned vmm_defer_pending(void) {
@@ -324,6 +326,7 @@ int vmm_defer_drain(int max_nodes) {
     if (node) {
       vmm_defer_head = node->next;
       vmm_defer_depth--;
+      vmm_defer_active++;
       __atomic_store_n(&vmm_defer_depth, vmm_defer_depth, __ATOMIC_RELEASE);
     }
     spinlock_release(&vmm_defer_lock);
@@ -347,7 +350,27 @@ int vmm_defer_drain(int max_nodes) {
       kfree(node->vmas);
     }
     kfree(node);
+    spinlock_acquire(&vmm_defer_lock);
+    vmm_defer_active--;
+    spinlock_release(&vmm_defer_lock);
     done++;
   }
   return done;
+}
+
+void vmm_defer_sync(void) {
+  for (;;) {
+    vmm_defer_drain(0);
+    spinlock_acquire(&vmm_defer_lock);
+    bool complete = !vmm_defer_head && !vmm_defer_active;
+    spinlock_release(&vmm_defer_lock);
+    if (complete)
+      return;
+    struct thread *self = sched_get_current();
+    self->state = THREAD_SLEEPING;
+    self->wakeup_ticks = lapic_timer_get_ticks() + 1;
+    sched_yield();
+    self->wakeup_ticks = 0;
+    self->state = THREAD_RUNNING;
+  }
 }

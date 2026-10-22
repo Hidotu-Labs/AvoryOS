@@ -23,6 +23,9 @@ code = r'''
 #include <string.h>
 #include <stdint.h>
 #define MAX_FDS 4
+#define KERNEL_VERSION(a,b,c) (((a)<<16)+((b)<<8)+(c))
+#define LINUX_VERSION_CODE KERNEL_VERSION(6,12,113)
+#define FD_IN_RANGE(t,fd) ((uint64_t)(fd)<(t)->files->capacity)
 #define KPI_O_CLOEXEC 0x80000u
 #define KPI_FD_FLAGS_CLOEXEC_BIT (1u<<24)
 #define KPI_FD_RESERVED ((vfs_node_t*)-1)
@@ -30,16 +33,19 @@ code = r'''
 struct file;
 typedef struct vfs_node {
  void *device,*wait_queue; unsigned flags,mask;
- uint64_t length,inode; bool mmap_shared_only,mmap_private_pmm_refs;
+ uint64_t length,inode; bool mmap_shared_only,mmap_private_pmm_refs,mmap_shared_pmm_refs;
  char name[32]; int refs;
 } vfs_node_t;
-struct fd_table {int lock;unsigned next_fd;vfs_node_t *reserved_nodes[MAX_FDS];};
-struct thread {struct fd_table *files;vfs_node_t *fds[MAX_FDS];
+struct fd_table {int lock;unsigned next_fd,capacity;
+ vfs_node_t *reserved_nodes[MAX_FDS],*fds[MAX_FDS];
  uint64_t fd_offsets[MAX_FDS],fd_flags[MAX_FDS];};
+struct thread {struct fd_table *files;vfs_node_t **fds;
+ uint64_t *fd_offsets,*fd_flags;};
 struct inode {uint64_t i_size;};
 struct file {int f_count;unsigned f_flags;void *f_asc_node;struct inode *f_inode;};
-static struct fd_table files;
-static struct thread self={.files=&files};
+static struct fd_table files={.capacity=MAX_FDS};
+static struct thread self={.files=&files,.fds=files.fds,
+ .fd_offsets=files.fd_offsets,.fd_flags=files.fd_flags};
 static unsigned live_nodes,releases;
 static bool oom;
 static struct thread *sched_get_current(void){return &self;}

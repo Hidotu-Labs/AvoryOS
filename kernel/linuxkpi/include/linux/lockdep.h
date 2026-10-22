@@ -8,6 +8,8 @@
 
 #include <linux/types.h>
 
+#define SINGLE_DEPTH_NESTING 1
+
 struct lockdep_map {
   const char *name;
 };

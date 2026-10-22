@@ -5,10 +5,6 @@
  * Boot clones that section for each native CPU before imported code starts.
  * Pointer accessors require a pinned caller; get_cpu_* supplies that pin.
  * Dynamic alloc_percpu/module allocations are not implemented here. */
-#include <linux/compiler.h>
-#include <linux/types.h>
-#include <linux/preempt.h>
-#include <linux/irqflags.h>
 
 unsigned long linuxkpi_percpu_offset(unsigned int cpu);
 unsigned int linuxkpi_percpu_cpu(void);
@@ -21,6 +17,8 @@ unsigned int linuxkpi_percpu_cpu(void);
 #define DEFINE_PER_CPU_SHARED_ALIGNED(type, name) DEFINE_PER_CPU(type, name)
 #define DECLARE_PER_CPU_READ_MOSTLY(type, name) DECLARE_PER_CPU(type, name)
 #define DEFINE_PER_CPU_READ_MOSTLY(type, name) DEFINE_PER_CPU(type, name)
+#define DECLARE_PER_CPU_CACHE_HOT(type, name) DECLARE_PER_CPU(type, name)
+#define DEFINE_PER_CPU_CACHE_HOT(type, name) DEFINE_PER_CPU(type, name)
 #define DECLARE_PER_CPU_FIRST(type, name) DECLARE_PER_CPU(type, name)
 #define DEFINE_PER_CPU_FIRST(type, name) DEFINE_PER_CPU(type, name)
 #define DECLARE_PER_CPU_PAGE_ALIGNED(type, name) extern type name __attribute__((section(".kpi_percpu"), aligned(4096)))
@@ -43,8 +41,8 @@ unsigned int linuxkpi_percpu_cpu(void);
 /* Pin the lookup and operation together, including against interrupt code
  * using the same CPU's value. Remote operations retain Linux's caller-lock
  * requirements; these are deliberately not global atomic operations. */
-#define this_cpu_read(var) ({ unsigned long __kpi_flags; typeof(var) __kpi_value; \
-    local_irq_save(__kpi_flags); __kpi_value = *this_cpu_ptr(&(var)); \
+#define this_cpu_read(var) ({ unsigned long __kpi_flags; \
+    local_irq_save(__kpi_flags); __auto_type __kpi_value = *this_cpu_ptr(&(var)); \
     local_irq_restore(__kpi_flags); __kpi_value; })
 #define __KPI_CPU_UPDATE(var, op, val) do { unsigned long __kpi_flags; \
     local_irq_save(__kpi_flags); *this_cpu_ptr(&(var)) op (val); \
@@ -70,9 +68,17 @@ unsigned int linuxkpi_percpu_cpu(void);
 #define __this_cpu_sub(var, val) raw_cpu_sub(var, val)
 #define __this_cpu_inc(var) raw_cpu_inc(var)
 #define __this_cpu_dec(var) raw_cpu_dec(var)
+#define __this_cpu_inc_return(var) (++*raw_cpu_ptr(&(var)))
+#define __this_cpu_dec_return(var) (--*raw_cpu_ptr(&(var)))
 #define __this_cpu_and(var, val) raw_cpu_and(var, val)
 #define __this_cpu_or(var, val) raw_cpu_or(var, val)
 #define this_cpu_read_stable(var) this_cpu_read(var)
+#define this_cpu_read_const(var) this_cpu_read(var)
+
+#include <linux/compiler.h>
+#include <linux/types.h>
+#include <linux/preempt.h>
+#include <linux/irqflags.h>
 
 #ifdef get_cpu
 #undef get_cpu

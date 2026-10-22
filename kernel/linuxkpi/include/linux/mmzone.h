@@ -10,6 +10,7 @@
  * supplied here as macros.  Macros (guarded, not inlines) so a translation
  * unit that also includes linux/mm.h cannot hit a redefinition. */
 
+#include <linux/llist.h>
 #include_next <linux/mmzone.h>
 
 /* swap.h embeds struct plist_node right after including mmzone.h; upstream

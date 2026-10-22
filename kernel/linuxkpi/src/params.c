@@ -187,35 +187,53 @@ static void token_dispatch(char *token) {
     const char *arg = setup_match(token, s->str);
 
     if (arg) {
-      s->fn((char *)(eq ? val : arg));
+      /* __setup callbacks such as video_setup() retain this pointer.
+       * Linux supplies persistent boot-command-line storage; our token
+       * buffer is on the stack and reused for every argument. */
+      char *saved = kpi_kstrdup(eq ? val : arg);
+      if (saved)
+        s->fn(saved);
       return;
     }
   }
 
-  for (const struct kpi_param *p = __kpi_param_start; p < __kpi_param_end;
-       p++) {
-    if (strcmp(token, p->name) == 0) {
-      param_set_value(p, val);
-      return;
-    }
-  }
-
-  /* Accept the upstream `module.param=value` spelling.  The param table has
-   * no per-module scoping (KBUILD_MODNAME is a single constant for the whole
-   * kernel here), so after an exact miss retry with the suffix following the
-   * last '.'.  Param names must therefore stay unique across the linked
-   * modules; the table is small and audited (drm.debug, amdgpu.runpm, ...).
-   * Phase 6 C3 addition; see docs/linuxkpi-gaps.md. */
   dot = strrchr(token, '.');
-  if (dot && dot[1]) {
-    for (const struct kpi_param *p = __kpi_param_start; p < __kpi_param_end;
-         p++) {
-      if (strcmp(dot + 1, p->name) == 0) {
-        param_set_value(p, val);
+  const struct kpi_param *match = NULL;
+  for (const struct kpi_param *p = __kpi_param_start; p < __kpi_param_end; p++) {
+    bool matches;
+    if (dot) {
+      size_t length = (size_t)(dot - token);
+      matches = strlen(p->module) == length &&
+                !strncmp(token, p->module, length) &&
+                !strcmp(dot + 1, p->name);
+    } else {
+      matches = !strcmp(token, p->name);
+    }
+    if (matches) {
+      if (match) {
+        klogf("[WARN] LinuxKPI: ambiguous parameter %s ignored\n", token);
         return;
+      }
+      match = p;
+    }
+  }
+  /* Preserve legacy module.foo aliases only for parameters whose source
+   * still uses the default namespace. Never redirect a qualified driver
+   * parameter into another driver's typed storage. */
+  if (!match && dot && dot[1]) {
+    for (const struct kpi_param *p = __kpi_param_start; p < __kpi_param_end; p++) {
+      if (!strcmp(p->module, "avoryos") && !strcmp(dot + 1, p->name)) {
+        if (match) {
+          klogf("[WARN] LinuxKPI: ambiguous parameter %s ignored\n", token);
+          return;
+        }
+        match = p;
       }
     }
   }
+  if (match)
+    param_set_value(match, val);
+
 }
 
 void linuxkpi_param_parse(const char *cmdline) {

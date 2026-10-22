@@ -61,6 +61,15 @@ static struct vmap_area vmap_head = {
 };
 
 static DEFINE_SPINLOCK(vmap_lock);
+unsigned long linuxkpi_vmap_live_areas(void) {
+  unsigned long flags, count = 0;
+  struct vmap_area *area;
+  spin_lock_irqsave(&vmap_lock, flags);
+  for (area = vmap_head.next; area != &vmap_head; area = area->next)
+    count++;
+  spin_unlock_irqrestore(&vmap_lock, flags);
+  return count;
+}
 static bool vmap_ready;
 
 /* First address the first-fit allocator may use; raised past the mem_map
@@ -488,7 +497,7 @@ void *kvmalloc_node(size_t size, gfp_t flags, int node) {
   (void)node;
   ret = kmalloc(size, flags);
   if (!ret)
-    ret = vmalloc(size);
+    ret = (flags & __GFP_ZERO) ? vzalloc(size) : vmalloc(size);
   return ret;
 }
 
@@ -535,7 +544,30 @@ void kvfree_sensitive(const void *addr, size_t len) {
 }
 
 /* Upstream mm/util.c: grow-only reallocation of a kvmalloc() buffer. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+void *kvrealloc(const void *p, size_t newsize, gfp_t flags) {
+  size_t oldsize = 0;
+  if (!newsize) {
+    kvfree(p);
+    return ZERO_SIZE_PTR;
+  }
+  if (!ZERO_OR_NULL_PTR(p)) {
+    if (is_vmalloc_addr(p)) {
+      unsigned long irqflags;
+      spin_lock_irqsave(&vmap_lock, irqflags);
+      struct vmap_area *area = vmap_area_find_locked((uint64_t)p);
+      if (area && area->start == (uint64_t)p && area->owns_pages && !area->is_ioremap)
+        oldsize = area->end - area->start;
+      spin_unlock_irqrestore(&vmap_lock, irqflags);
+      if (!oldsize)
+        return NULL;
+    } else {
+      oldsize = ksize(p);
+    }
+  }
+#else
 void *kvrealloc(const void *p, size_t oldsize, size_t newsize, gfp_t flags) {
+#endif
   void *newp;
 
   if (oldsize >= newsize)
@@ -543,7 +575,8 @@ void *kvrealloc(const void *p, size_t oldsize, size_t newsize, gfp_t flags) {
   newp = kvmalloc(newsize, flags);
   if (!newp)
     return NULL;
-  __builtin_memcpy(newp, p, oldsize);
+  if (oldsize)
+    __builtin_memcpy(newp, p, oldsize);
   kvfree(p);
   return newp;
 }

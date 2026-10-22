@@ -43,6 +43,42 @@
 #include <linuxkpi/native_mm.h>
 #include <linuxkpi/native_vfs.h>
 
+/* 6.18 made GEM VRAM pin helpers private. Exercise the same public TTM
+ * reservation/validation/pin contract directly for this allocation canary. */
+static int p4b_vram_pin(struct drm_gem_vram_object *gbo, unsigned long flags) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+  struct ttm_place place = { .mem_type = TTM_PL_VRAM };
+  struct ttm_placement placement = { .num_placement = 1, .placement = &place };
+  struct ttm_operation_ctx ctx = { false, false };
+  int ret;
+  if (flags != DRM_GEM_VRAM_PL_FLAG_VRAM)
+    return -EINVAL;
+  ret = ttm_bo_reserve(&gbo->bo, true, false, NULL);
+  if (ret)
+    return ret;
+  ret = gbo->bo.pin_count ? 0 : ttm_bo_validate(&gbo->bo, &placement, &ctx);
+  if (!ret)
+    ttm_bo_pin(&gbo->bo);
+  ttm_bo_unreserve(&gbo->bo);
+  return ret;
+#else
+  return drm_gem_vram_pin(gbo, flags);
+#endif
+}
+
+static int p4b_vram_unpin(struct drm_gem_vram_object *gbo) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+  int ret = ttm_bo_reserve(&gbo->bo, true, false, NULL);
+  if (ret)
+    return ret;
+  ttm_bo_unpin(&gbo->bo);
+  ttm_bo_unreserve(&gbo->bo);
+  return 0;
+#else
+  return drm_gem_vram_unpin(gbo);
+#endif
+}
+
 /* Scratch user VA.  Layout:
  *   0x000  ioctl argument struct (<= 128 bytes)
  *   0x100  u32 object id arrays
@@ -420,7 +456,7 @@ static int p4b_gem_pass(void *node, struct p4b_scratch *s,
     *(uint32_t *)map.vaddr = 0x5a5a0000u | (uint32_t)i;
     drm_gem_vram_vunmap(gbo, &map);
 
-    if (drm_gem_vram_pin(gbo, DRM_GEM_VRAM_PL_FLAG_VRAM) ||
+    if (p4b_vram_pin(gbo, DRM_GEM_VRAM_PL_FLAG_VRAM) ||
         drm_gem_vram_offset(gbo) < 0) {
       drm_gem_object_put(gem);
       p4b_gem_close(node, s, handle);
@@ -428,12 +464,12 @@ static int p4b_gem_pass(void *node, struct p4b_scratch *s,
     }
     offset = drm_gem_vram_offset(gbo);
     if (offset < 0) {
-      drm_gem_vram_unpin(gbo);
+      p4b_vram_unpin(gbo);
       drm_gem_object_put(gem);
       p4b_gem_close(node, s, handle);
       return -1;
     }
-    drm_gem_vram_unpin(gbo);
+    p4b_vram_unpin(gbo);
     drm_gem_object_put(gem);
     if (p4b_gem_close(node, s, handle))
       return -1;
@@ -472,13 +508,13 @@ static int p4b_gem_loop(void *node, struct p4b_scratch *s, struct drm_file *df,
       return -1;
     }
     gbo = drm_gem_vram_of_gem(gem);
-    if (drm_gem_vram_pin(gbo, DRM_GEM_VRAM_PL_FLAG_VRAM) ||
+    if (p4b_vram_pin(gbo, DRM_GEM_VRAM_PL_FLAG_VRAM) ||
         drm_gem_vram_offset(gbo) < 0) {
       drm_gem_object_put(gem);
       p4b_gem_close(node, s, handle);
       return -1;
     }
-    drm_gem_vram_unpin(gbo);
+    p4b_vram_unpin(gbo);
     drm_gem_object_put(gem);
     if (p4b_gem_close(node, s, handle))
       return -1;

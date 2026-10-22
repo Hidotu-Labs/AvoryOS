@@ -8,6 +8,20 @@
 
 #include <linuxkpi/native_sched.h>
 
+struct task_struct *pid_task(struct pid *pid, enum pid_type type) {
+  struct task_struct *task = current;
+  pid_t nr = pid_nr(pid);
+  /* There is no native RCU task index yet. Report the current task when
+   * its identity matches, and let diagnostic callers print "Unset" for
+   * unresolvable tokens rather than attributing them to another process. */
+  if (!pid || !task)
+    return NULL;
+  if ((type == PIDTYPE_PID && task->pid == nr) ||
+      (type == PIDTYPE_TGID && task->tgid == nr))
+    return task;
+  return NULL;
+}
+
 void *linuxkpi_task_shadow_new(void *thread) {
   struct task_struct *tsk;
 
@@ -34,6 +48,10 @@ void __put_task_struct(struct task_struct *tsk) {
    * final put: reaping drops its reference only after it is off-CPU. */
   kfree(tsk->kpi_control);
   kfree(tsk);
+}
+
+void __put_task_struct_rcu_cb(struct rcu_head *head) {
+  __put_task_struct(container_of(head, struct task_struct, rcu));
 }
 
 struct task_struct *linuxkpi_task_get(struct task_struct *tsk) {

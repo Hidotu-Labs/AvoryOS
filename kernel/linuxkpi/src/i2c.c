@@ -189,3 +189,24 @@ struct i2c_client *i2c_new_client_device(struct i2c_adapter *adap,
   (void)info;
   return ERR_PTR(-ENODEV);
 }
+
+/* No I2C client-driver binding or module loader exists. DDC adapters and
+ * transfers remain supported independently of these optional clients. */
+int i2c_register_driver(struct module *owner, struct i2c_driver *driver) {
+  (void)owner;
+  (void)driver;
+  return -EOPNOTSUPP;
+}
+void i2c_del_driver(struct i2c_driver *driver) { (void)driver; }
+void i2c_unregister_device(struct i2c_client *client) { (void)client; }
+
+static void kpi_i2c_del_adapter_action(void *data) {
+  i2c_del_adapter(data);
+}
+
+int devm_i2c_add_adapter(struct device *dev, struct i2c_adapter *adap) {
+  int ret = i2c_add_adapter(adap);
+  if (ret)
+    return ret;
+  return devm_add_action_or_reset(dev, kpi_i2c_del_adapter_action, adap);
+}

@@ -14,6 +14,12 @@
 #include <linux/kobject.h>
 #include <linux/stringify.h>
 #include <linux/types.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+#define __KPI_BIN_CONST const
+#else
+#define __KPI_BIN_CONST
+#endif
 
 /* Upstream sysfs.h reaches kernfs.h, which brings in <linux/idr.h>; the
  * overlay keeps kernfs opaque, so pull idr.h explicitly.  amdgpu_ctx.h embeds
@@ -36,24 +42,31 @@ struct attribute {
   umode_t mode;
 };
 
+struct kobj_attribute {
+  struct attribute attr;
+  ssize_t (*show)(struct kobject *, struct kobj_attribute *, char *);
+  ssize_t (*store)(struct kobject *, struct kobj_attribute *, const char *, size_t);
+};
+
 struct attribute_group {
   const char *name;
   umode_t (*is_visible)(struct kobject *, struct attribute *, int);
-  umode_t (*is_bin_visible)(struct kobject *, struct bin_attribute *, int);
+  umode_t (*is_bin_visible)(struct kobject *, __KPI_BIN_CONST struct bin_attribute *, int);
   struct attribute **attrs;
-  struct bin_attribute **bin_attrs;
+  __KPI_BIN_CONST struct bin_attribute * __KPI_BIN_CONST *bin_attrs;
   const struct attribute_group **groups;
 };
+int sysfs_update_group(struct kobject *, const struct attribute_group *);
 
 struct bin_attribute {
   struct attribute attr;
   size_t size;
   void *private;
-  ssize_t (*read)(struct file *, struct kobject *, struct bin_attribute *,
+  ssize_t (*read)(struct file *, struct kobject *, __KPI_BIN_CONST struct bin_attribute *,
                   char *, loff_t, size_t);
-  ssize_t (*write)(struct file *, struct kobject *, struct bin_attribute *,
+  ssize_t (*write)(struct file *, struct kobject *, __KPI_BIN_CONST struct bin_attribute *,
                    char *, loff_t, size_t);
-  int (*mmap)(struct file *, struct kobject *, struct bin_attribute *,
+  int (*mmap)(struct file *, struct kobject *, __KPI_BIN_CONST struct bin_attribute *,
               struct vm_area_struct *);
 };
 
@@ -78,6 +91,7 @@ struct device_attribute {
     .attr = {.name = __stringify(_name), .mode = 0644},                       \
     .show = _name##_show, .store = _name##_store,                             \
   }
+#define __ATTR_RW_MODE(_name, _mode) __ATTR(_name, _mode, _name##_show, _name##_store)
 #define __ATTR_WO(_name)                                                      \
   {                                                                           \
     .attr = {.name = __stringify(_name), .mode = 0200},                       \

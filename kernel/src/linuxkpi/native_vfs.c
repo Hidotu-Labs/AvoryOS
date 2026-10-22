@@ -55,8 +55,13 @@ static void kpi_node_close(vfs_node_t *node) {
 }
 
 _Bool asc_vfs_node_is_linux_file(void *node) {
+#ifdef LINUXKPI_LINUX_IMPORTED
   vfs_node_t *n = node;
   return n && n->close == kpi_node_close && n->mmap == kpi_node_mmap;
+#else
+  (void)node;
+  return 0;
+#endif
 }
 
 _Bool asc_vfs_node_nonblocking(void *node) {
@@ -411,6 +416,11 @@ unsigned int asc_vfs_kernel_size(void *node) {
   vfs_node_t *n = node;
 
   return n ? (unsigned int)n->length : 0;
+}
+
+unsigned long long asc_vfs_kernel_size64(void *node) {
+  vfs_node_t *n = node;
+  return n ? (unsigned long long)n->length : 0;
 }
 
 void asc_vfs_kernel_close(void *node) {

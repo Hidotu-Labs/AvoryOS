@@ -1444,6 +1444,11 @@ static void check_serial_trigger(void) {
       n = 0;
       extern void sysdiag_dump_report(void);
       sysdiag_dump_report();
+    } else if (n == 4 && window[0] == 'g' && window[1] == 'p' && window[2] == 'u' &&
+               window[3] == 'p') {
+      n = 0;
+      extern void virtio_gpu_request_perf_dump(void);
+      virtio_gpu_request_perf_dump();
     }
   }
 }

@@ -22,6 +22,10 @@ def make_sysfs(devices):
         d.mkdir()
         (d / 'vendor').write_text(vendor)
         (d / 'class').write_text(cls)
+        if vendor == '0x1002' and cls.startswith('0x03'):
+            driver = tmp / 'bus/pci/drivers/amdgpu'
+            driver.mkdir(parents=True, exist_ok=True)
+            (d / 'driver').symlink_to(driver)
     return tmp
 
 
@@ -64,6 +68,15 @@ AMD_AUDIO = ('0000:00:03.1', '0x1002', '0x040300')
 
 # VFIO topology: passed-through AMD VGA plus VirtIO output -> AMD PRIME layout.
 check([AMD_VGA, VIRTIO], 'amdgpu')
+gated = make_sysfs([AMD_VGA, VIRTIO])
+with tempfile.TemporaryDirectory(prefix='avory-xorg-gated-') as temporary:
+    (gated/'bus/pci/devices'/AMD_VGA[0]/'driver').unlink()
+    alternate = Path(temporary)/'alt'
+    alternate.mkdir()
+    shutil.copy(NATIVE, alternate/'10-modesetting-native.conf')
+    result = run_selector(gated, alternate, Path(temporary)/'selected.conf')
+    assert 'xorg-profile: native' in result.stdout
+shutil.rmtree(gated)
 # Plain `make run` topology: only the std VGA (Bochs) -> native llvmpipe layout.
 check([BOCHS], 'native')
 # AMD audio function alone (stays on the host) must not select the AMD layout.

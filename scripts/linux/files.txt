@@ -39,6 +39,8 @@ lib/kstrtox.c
 lib/string_helpers.c
 lib/hexdump.c
 lib/ctype.c
+lib/uuid.c
+?lib/bitmap-str.c
 
 # Phase 2: DMA-buf/fence/resv/sync_file stack, imported verbatim.  dma-buf.c
 # in 6.6 uses a pseudo filesystem (alloc_file_pseudo/kern_mount), shimmed by
@@ -61,6 +63,8 @@ drivers/gpu/drm/drm_blend.c
 drivers/gpu/drm/drm_bridge.c
 drivers/gpu/drm/drm_cache.c
 drivers/gpu/drm/drm_color_mgmt.c
+drivers/gpu/drm/drm_client.c
+drivers/gpu/drm/drm_client_modeset.c
 drivers/gpu/drm/drm_connector.c
 drivers/gpu/drm/drm_crtc.c
 drivers/gpu/drm/drm_displayid.c
@@ -157,6 +161,7 @@ drivers/gpu/drm/tiny/bochs.c
 # too (drivers/gpu/drm/display/Makefile); do not list it here or the objects
 # link twice.
 drivers/gpu/drm/drm_buddy.c
+?drivers/gpu/buddy.c
 drivers/gpu/drm/drm_exec.c
 drivers/gpu/drm/drm_suballoc.c
 drivers/i2c/algos/i2c-algo-bit.c
@@ -164,3 +169,9 @@ drivers/i2c/algos/i2c-algo-bit.c
 # Phase 6 C2: HDMI infoframe packing, linked by the DRM display helper and
 # amdgpu's DM link code.
 drivers/video/hdmi.c
+drivers/video/cmdline.c
+
+# Nouveau GPU virtual-address range tree and common GPUVM algorithms.
+lib/maple_tree.c
+?drivers/gpu/drm/drm_gpuvm.c
+drivers/gpu/drm/drm_encoder_slave.c

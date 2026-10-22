@@ -11,6 +11,11 @@
  * docs/linuxkpi-gaps.md (P5 C6). */
 
 #include_next <linux/kernel.h>
+#include <linux/minmax.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#include <linux/string_choices.h>
+#endif
 
 void __kpi_might_sleep(const char *file, int line);
 int kpi_might_sleep_warnings(void);

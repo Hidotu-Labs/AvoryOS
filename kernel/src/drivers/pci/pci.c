@@ -320,15 +320,23 @@ void pci_enable_bus_mastering(struct pci_device *dev) {
 }
 
 uint8_t asc_pci_find_capability(struct pci_device *dev, uint8_t cap_id) {
+  if (!dev)
+    return 0;
   uint16_t status = pci_config_read16(dev->bus, dev->slot, dev->func, 0x06);
   if (!(status & (1 << 4)))
     return 0; // Capabilities bit not set
 
-  uint8_t cap_ptr =
-      pci_config_read32(dev->bus, dev->slot, dev->func, 0x34) & 0xFF;
-  while (cap_ptr != 0) {
-    uint32_t cap_reg =
-        pci_config_read32(dev->bus, dev->slot, dev->func, cap_ptr);
+  uint8_t header = dev->header_type & 0x7f;
+  if (header > 2)
+    return 0;
+  uint8_t cap_ptr = pci_config_read8(dev->bus, dev->slot, dev->func,
+                                    header == 2 ? 0x14 : 0x34);
+  for (unsigned int remaining = 48; remaining && cap_ptr >= 0x40; remaining--) {
+    cap_ptr &= ~3u;
+    uint16_t cap_reg =
+        pci_config_read16(dev->bus, dev->slot, dev->func, cap_ptr);
+    if ((cap_reg & 0xff) == 0xff)
+      break;
     if ((cap_reg & 0xFF) == cap_id)
       return cap_ptr;
     cap_ptr = (cap_reg >> 8) & 0xFF;

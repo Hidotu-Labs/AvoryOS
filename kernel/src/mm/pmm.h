@@ -107,6 +107,14 @@ size_t pmm_get_free_pages(void);
 // are still free; soak/leak checks want this total.
 size_t pmm_get_free_pages_including_pcp(void);
 
+// Bounded per-caller alloc/free attribution used by kernel-side leak tests
+// (two separate tables keyed by the exact return address).
+void pmm_site_record_alloc(size_t pages, void *caller);
+void pmm_site_record_free(size_t pages, void *caller);
+void pmm_sites_reset(void);
+void pmm_sites_stop(void);
+void pmm_sites_dump(const char *tag);
+
 // Shared zero page — a single physically-allocated page whose contents are
 // always zero.  Used by the demand-pager for anonymous read faults so that
 // physical frames are not allocated until the process actually writes.

@@ -219,3 +219,87 @@ int platform_irq_count(struct platform_device *pdev) {
   }
   return count;
 }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+#include <linux/device/faux.h>
+
+/* Synchronous native equivalent of the resource-free faux device bus.
+ * Devices own their devres and optional callbacks, just like platform
+ * devices above. There is no asynchronous binding or native hotplug bus. */
+struct kpi_faux_device {
+  struct faux_device faux;
+  const struct faux_device_ops *ops;
+  struct list_head entry;
+  bool probed;
+};
+static DEFINE_MUTEX(kpi_faux_lock);
+static LIST_HEAD(kpi_faux_devices);
+static struct device kpi_faux_root = { .init_name = "faux" };
+static struct bus_type kpi_faux_bus = { .name = "faux" };
+
+static void kpi_faux_release(struct device *dev) {
+  kfree(container_of(dev, struct kpi_faux_device, faux.dev));
+}
+
+void faux_device_destroy(struct faux_device *dev) {
+  struct kpi_faux_device *object;
+  if (!dev)
+    return;
+  object = container_of(dev, struct kpi_faux_device, faux);
+  mutex_lock(&kpi_faux_lock);
+  list_del_init(&object->entry);
+  mutex_unlock(&kpi_faux_lock);
+  if (object->probed && object->ops && object->ops->remove)
+    object->ops->remove(dev);
+  device_unregister(&dev->dev);
+}
+
+struct faux_device *faux_device_create_with_groups(const char *name,
+    struct device *parent, const struct faux_device_ops *ops,
+    const struct attribute_group **groups) {
+  struct kpi_faux_device *object, *other;
+  int ret;
+  if (!name || !*name)
+    return NULL;
+  object = kzalloc(sizeof(*object), GFP_KERNEL);
+  if (!object)
+    return NULL;
+  object->ops = ops;
+  device_initialize(&object->faux.dev);
+  object->faux.dev.release = kpi_faux_release;
+  object->faux.dev.parent = parent ? parent : &kpi_faux_root;
+  object->faux.dev.bus = &kpi_faux_bus;
+  object->faux.dev.groups = groups;
+  if (strlen(name) >= sizeof(object->faux.dev.kpi_name)) {
+    kfree(object);
+    return NULL;
+  }
+  dev_set_name(&object->faux.dev, "%s", name);
+  mutex_lock(&kpi_faux_lock);
+  if (!kpi_faux_root.devres_head.next)
+    device_register(&kpi_faux_root);
+  list_for_each_entry(other, &kpi_faux_devices, entry) {
+    if (!strcmp(dev_name(&other->faux.dev), name)) {
+      mutex_unlock(&kpi_faux_lock);
+      kfree(object);
+      return NULL;
+    }
+  }
+  list_add_tail(&object->entry, &kpi_faux_devices);
+  mutex_unlock(&kpi_faux_lock);
+  ret = device_add(&object->faux.dev);
+  if (!ret && ops && ops->probe)
+    ret = ops->probe(&object->faux);
+  if (ret) {
+    faux_device_destroy(&object->faux);
+    return NULL;
+  }
+  object->probed = true;
+  return &object->faux;
+}
+
+struct faux_device *faux_device_create(const char *name, struct device *parent,
+                                      const struct faux_device_ops *ops) {
+  return faux_device_create_with_groups(name, parent, ops, NULL);
+}
+#endif

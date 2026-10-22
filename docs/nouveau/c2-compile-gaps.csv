@@ -1,0 +1,53 @@
+count,example_source,line,diagnostic
+516,linux/drivers/gpu/drm/nouveau/include/nvkm/core/memory.h,25,field ‘kref’ has incomplete type
+85,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.h,13,field ‘region_mt’ has incomplete type
+56,linux/include/drm/drm_encoder_slave.h,174,field ‘i2c_driver’ has incomplete type
+56,linux/include/drm/drm_encoder_slave.h,207,implicit declaration of function ‘i2c_register_driver’; did you mean ‘pci_register_driver’? [-Wimplicit-function-declaration]
+55,linux/include/drm/drm_encoder_slave.h,216,implicit declaration of function ‘i2c_del_driver’; did you mean ‘i2c_del_adapter’? [-Wimplicit-function-declaration]
+21,linux/drivers/gpu/drm/nouveau/nvkm/subdev/therm/ic.c,59,initializer element is not constant
+4,linux/drivers/gpu/drm/nouveau/nvkm/core/memory.c,104,implicit declaration of function ‘kref_init’; did you mean ‘cr4_init’? [-Wimplicit-function-declaration]
+4,./linux/include/linux/compiler_types.h,484,expression in static assertion is not an integer
+4,linux/drivers/gpu/drm/nouveau/nvkm/core/memory.c,123,implicit declaration of function ‘kref_put’ [-Wimplicit-function-declaration]
+4,linux/drivers/gpu/drm/nouveau/nvkm/core/memory.c,132,implicit declaration of function ‘kref_get’ [-Wimplicit-function-declaration]
+4,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,282,‘mas’ undeclared (first use in this function); did you mean ‘max’?
+3,linux/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c,2474,invalid use of undefined type ‘const struct elf64_hdr’
+3,linux/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c,2478,invalid use of undefined type ‘const struct elf64_shdr’
+3,linux/drivers/gpu/drm/nouveau/nouveau_svm.h,10,field ‘notifier’ has incomplete type
+2,linux/drivers/gpu/drm/nouveau/nvkm/subdev/therm/ic.c,59,implicit declaration of function ‘I2C_BOARD_INFO’ [-Wimplicit-function-declaration]
+2,linux/drivers/gpu/drm/nouveau/nouveau_drm.c,615,‘WQ_MAX_ACTIVE’ undeclared (first use in this function); did you mean ‘RPM_ACTIVE’?
+1,linux/drivers/gpu/drm/nouveau/nvkm/core/firmware.c,86,implicit declaration of function ‘tolower’ [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nvkm/core/firmware.c,208,implicit declaration of function ‘dma_free_noncoherent’; did you mean ‘dma_free_coherent’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nvkm/core/firmware.c,242,implicit declaration of function ‘dma_alloc_noncoherent’; did you mean ‘dma_alloc_coherent’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nvkm/core/firmware.c,242,assignment to ‘u8 *’ {aka ‘unsigned char *’} from ‘int’ makes pointer from integer without a cast [-Wint-conversion]
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/bios/shadowacpi.c,26,unknown type name ‘acpi_handle’; did you mean ‘ihandle’?
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/bios/shadowacpi.c,71,implicit declaration of function ‘acpi_read_bios’; did you mean ‘acpi_read_fast’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/bios/shadowrom.c,77,implicit declaration of function ‘kzalloc_obj’; did you mean ‘kzalloc_node’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/bios/shadowrom.c,77,assignment to ‘struct priv *’ from ‘int’ makes pointer from integer without a cast [-Wint-conversion]
+1,linux/arch/x86/include/asm/page_64_types.h,75,implicit declaration of function ‘test_thread_flag’ [-Wimplicit-function-declaration]
+1,linux/arch/x86/include/asm/page_64_types.h,75,‘TIF_ADDR32’ undeclared (first use in this function)
+1,linux/arch/x86/include/asm/page_64_types.h,70,‘struct task_struct’ has no member named ‘personality’
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c,2319,implicit declaration of function ‘sg_virt’ [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c,2319,assignment to ‘u64 *’ {aka ‘long long unsigned int *’} from ‘int’ makes pointer from integer without a cast [-Wint-conversion]
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c,2477,increment of pointer to an incomplete type ‘const struct elf64_shdr’
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/mmu/vmm.c,1107,implicit declaration of function ‘__mutex_init’; did you mean ‘mutex_init’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/therm/ic.c,37,implicit declaration of function ‘request_module’; did you mean ‘of_request_module’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/therm/ic.c,44,implicit declaration of function ‘to_i2c_driver’; did you mean ‘to_pci_driver’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/therm/ic.c,44,invalid type argument of ‘->’ (have ‘int’)
+1,linux/drivers/gpu/drm/nouveau/nvkm/subdev/therm/ic.c,45,implicit declaration of function ‘i2c_unregister_device’; did you mean ‘pci_unregister_driver’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nouveau_vga.c,107,passing argument 2 of ‘vga_switcheroo_init_domain_pm_ops’ from incompatible pointer type [-Wincompatible-pointer-types]
+1,linux/drivers/gpu/drm/nouveau/nouveau_bo.c,883,‘SINGLE_DEPTH_NESTING’ undeclared (first use in this function)
+1,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,282,implicit declaration of function ‘MA_STATE’; did you mean ‘XA_STATE’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,284,implicit declaration of function ‘mas_walk’ [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,293,implicit declaration of function ‘mas_store_gfp’; did you mean ‘xas_store’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,324,implicit declaration of function ‘mas_erase’; did you mean ‘xa_erase’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,364,implicit declaration of function ‘mas_find’; did you mean ‘xas_find’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,1870,implicit declaration of function ‘mt_init_flags’; did you mean ‘xa_init_flags’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,1870,‘MT_FLAGS_LOCK_EXTERN’ undeclared (first use in this function); did you mean ‘XA_FLAGS_LOCK_IRQ’?
+1,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,1871,implicit declaration of function ‘mt_set_external_lock’ [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,1932,implicit declaration of function ‘mas_for_each’; did you mean ‘xas_for_each’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,1932,expected ‘;’ before ‘{’ token
+1,linux/drivers/gpu/drm/nouveau/nouveau_uvmm.c,1940,implicit declaration of function ‘__mt_destroy’; did you mean ‘ida_destroy’? [-Wimplicit-function-declaration]
+1,linux/include/drm/drm_encoder_slave.h,216,implicit declaration of function ‘i2c_del_driver’; did you mean ‘pci_dev_driver’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/dispnv50/disp.c,643,implicit declaration of function ‘device_link_add’; did you mean ‘fwnode_link_add’? [-Wimplicit-function-declaration]
+1,linux/drivers/gpu/drm/nouveau/dispnv50/disp.c,643,‘DL_FLAG_STATELESS’ undeclared (first use in this function)
+1,linux/drivers/gpu/drm/nouveau/nouveau_fence.c,301,implicit declaration of function ‘schedule_hrtimeout’; did you mean ‘schedule_timeout’? [-Wimplicit-function-declaration]

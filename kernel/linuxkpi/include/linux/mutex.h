@@ -27,6 +27,7 @@ struct mutex {
   struct mutex mutexname = __MUTEX_INITIALIZER(mutexname)
 
 void mutex_init(struct mutex *lock);
+#define __mutex_init(lock, name, key) mutex_init(lock)
 void mutex_lock(struct mutex *lock);
 int mutex_lock_interruptible(struct mutex *lock);
 int mutex_lock_killable(struct mutex *lock);

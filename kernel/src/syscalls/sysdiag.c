@@ -820,6 +820,14 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
    * Check the ABI mode too: aggregation may mix probes and real denials. */
   bool nonexec_probe = t && t->last_access_nonexec_probe;
   if (t) t->last_access_nonexec_probe = false;
+  /* A seccomp RET_ERRNO decision answers the call without running its
+   * handler, so the recorded errno belongs to the application's own filter,
+   * not to any kernel permission check. Consume the per-thread marker here
+   * and carry the attribution through the entry and every report line. */
+  bool via_seccomp = t &&
+      __atomic_exchange_n(&t->seccomp_deny_pending, false, __ATOMIC_ACQ_REL);
+  if (via_seccomp)
+    severe = false;
   if (nonexec_probe && error_code == -13 && regs &&
       ((syscall_num == 21 && regs->rsi == 1) ||
        ((syscall_num == 269 || syscall_num == 439) && regs->rdx == 1)))
@@ -1010,6 +1018,8 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
       entry->path[sizeof(entry->path) - 1] = '\0';
     }
     entry->is_severe = severe;
+    if (via_seccomp)
+      entry->via_seccomp = true;
     entry->first_seen_ms = now_ms;
     entry->total_calls = 0;
     first_time = true;
@@ -1026,6 +1036,8 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
         entry->path[sizeof(entry->path) - 1] = '\0';
       }
     }
+    if (via_seccomp)
+      entry->via_seccomp = true;
     entry->total_calls++;
     entry->last_seen_ms = now_ms;
     if (t) {
@@ -1064,6 +1076,8 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
       klog_puts(ename);
       klog_puts(")");
     }
+    if (via_seccomp)
+      klog_puts(" via seccomp deny (the handler never ran; errno came from the caller's own filter)");
     klog_puts(" called by comm='");
     klog_puts(comm);
     klog_puts("' pid=");
@@ -1357,6 +1371,8 @@ void sysdiag_dump_report(void) {
         sd_put(en);
         sd_put(")");
       }
+      if (e->via_seccomp)
+        sd_put(" via-seccomp-deny");
       sd_put(" count=");
       sd_dec(e->total_calls);
       sd_put(" comm='");
@@ -1632,6 +1648,8 @@ size_t sysdiag_format_report(char *buf, size_t max_size) {
         p = b_write(buf, max_size, p, en);
         p = b_write(buf, max_size, p, ")");
       }
+      if (e->via_seccomp)
+        p = b_write(buf, max_size, p, " via-seccomp-deny");
       p = b_write(buf, max_size, p, " count=");
       p = b_dec(buf, max_size, p, e->total_calls);
       p = b_write(buf, max_size, p, " comm='");

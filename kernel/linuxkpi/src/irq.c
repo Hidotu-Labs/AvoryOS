@@ -53,6 +53,18 @@ struct kpi_irq_desc {
 };
 
 static struct kpi_irq_desc kpi_irq_descs[KPI_IRQ_MAX];
+unsigned long linuxkpi_irq_live_actions(void) {
+  unsigned long count = 0, flags;
+  for (unsigned int irq = 0; irq < KPI_IRQ_MAX; irq++) {
+    struct kpi_irq_action *action;
+    spin_lock_irqsave(&kpi_irq_descs[irq].lock, flags);
+    for (action = kpi_irq_descs[irq].actions; action; action = action->next)
+      count++;
+    count += kpi_irq_descs[irq].threads_active;
+    spin_unlock_irqrestore(&kpi_irq_descs[irq].lock, flags);
+  }
+  return count;
+}
 /* Zero-initialized spinlocks are valid. Never reinitialize a live descriptor
  * during concurrent first registrations. All descriptor state uses this lock. */
 static void kpi_irq_update_mask(struct kpi_irq_desc *d) {
@@ -358,6 +370,14 @@ struct irq_domain *__irq_domain_add(struct fwnode_handle *fwnode,
 }
 
 void irq_domain_remove(struct irq_domain *domain) { (void)domain; }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+/* Same unsupported-domain result as the old __irq_domain_add API. */
+struct irq_domain *irq_domain_instantiate(const struct irq_domain_info *info) {
+  (void)info;
+  return NULL;
+}
+#endif
 
 unsigned int irq_create_mapping_affinity(struct irq_domain *domain,
                                          irq_hw_number_t hwirq,

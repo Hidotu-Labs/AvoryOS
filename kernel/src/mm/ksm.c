@@ -18,9 +18,27 @@
 #define KSM_MM_WORK_BUDGET 256
 #define KSM_MAX_CHAIN_PROBES 16
 
+/* Merge eagerly under memory pressure, slowly in the background otherwise.
+ * Above the watermark deduplication is not urgent, but it should still
+ * happen - duplicates keep accruing and merging them is the point - so the
+ * daemon runs a sparse-pass cadence instead of skipping entirely.  Both
+ * cadences back off when a pass merges nothing. */
+#define KSM_FREE_EAGER_PAGES (32u * 1024u) /* 128 MiB */
+
+/* Aggressive mode, in timer ticks (~1 ms each). */
+#define KSM_EAGER_INTERVAL 1500u
+#define KSM_MAX_EAGER_INTERVAL (KSM_EAGER_INTERVAL * 40u) /* ~60 s */
+
+/* Background mode: slow enough that an application launch very rarely
+ * overlaps a pass, frequent enough that dedup still accrues. */
+#define KSM_IDLE_INTERVAL 15000u /* ~15 s */
+#define KSM_MAX_IDLE_INTERVAL 120000u /* ~2 min */
+
 struct ksm_node {
   uint64_t phys_page;
   uint64_t va;
+  /* Scanned content source when this page merged: 0 = unmerged. */
+  uint64_t replacement;
   uint32_t hash;
   uint32_t next; // 0 = end of list
 };
@@ -188,48 +206,67 @@ uint64_t ksm_scan_pass(void) {
      * No page contents may be read until stale writable mappings are gone. */
     tlb_shootdown_context_for(cr3);
 
+    /* Hash and compare WITHOUT mm->lock.  Contents are stable here: the
+     * frames are frozen (no writable mapping survives the flush above) and
+     * our pin keeps a CoW fault copying to a fresh frame instead of
+     * dirtying the frozen one.  Holding mm->lock across the hashing and
+     * 4 KiB memcmps starved every page fault in this address space - the
+     * fault path takes the same lock - for milliseconds each pass.  The
+     * hash table is scan-local (ksm_scan_active excludes other scanners),
+     * so no other synchronization is needed in this phase. */
+    for (uint32_t idx = first; idx < ksm_node_count; idx++) {
+      struct ksm_node *snapshot = &ksm_node_pool[idx];
+      snapshot->replacement = 0;
+      const uint64_t *words = PHYS_TO_VIRT(snapshot->phys_page);
+      ksm_global_stats.pages_scanned++;
+      if (zero_page_phys && ksm_is_page_zero(words)) {
+        snapshot->replacement = zero_page_phys;
+        ksm_global_stats.zero_pages_merged++;
+        continue;
+      }
+      uint32_t hash = ksm_hash_page(words);
+      snapshot->hash = hash;
+      uint32_t bucket = hash % KSM_BUCKETS;
+      unsigned probes = 0;
+      for (uint32_t curr = ksm_buckets[bucket];
+           curr && probes++ < KSM_MAX_CHAIN_PROBES;
+           curr = ksm_node_pool[curr].next) {
+        struct ksm_node *candidate = &ksm_node_pool[curr];
+        if (candidate->hash == hash && candidate->phys_page != snapshot->phys_page &&
+            memcmp(PHYS_TO_VIRT(candidate->phys_page), words, PAGE_SIZE) == 0) {
+          snapshot->replacement = candidate->phys_page;
+          pmm_incref((void *)snapshot->replacement); /* New mapping's reference. */
+          ksm_global_stats.pages_sharing++;
+          break;
+        }
+      }
+      if (!snapshot->replacement) {
+        /* Unmatched pages - including ones whose PTE will turn out
+         * CoW-broken below, since a pinned frame's contents survive any
+         * break - feed the table as candidates for the rest of this pass. */
+        snapshot->next = ksm_buckets[bucket];
+        ksm_buckets[bucket] = idx;
+        ksm_global_stats.pages_shared++;
+      }
+    }
+
+    /* Apply the decisions: O(1) PTE revalidate + write per page under the
+     * lock, no content hashing or comparisons inside it.  A failed
+     * revalidation means the mm CoW-broke or unmapped the page while the
+     * lock was dropped; replace and insert decisions for it are discarded
+     * (its frozen frame still served as a correct content candidate). */
     spinlock_acquire(&mm->lock);
     for (uint32_t idx = first; idx < ksm_node_count; idx++) {
       struct ksm_node *snapshot = &ksm_node_pool[idx];
       uint64_t phys = snapshot->phys_page;
       uint64_t *pte = vmm_get_pte_ptr((uint64_t *)cr3, snapshot->va);
-      if (!pte || !(*pte & PAGE_FLAG_PRESENT) ||
-          (*pte & PAGE_MASK) != phys || (*pte & PAGE_FLAG_RW))
-        continue; /* Unmapped or CoW-broken while the lock was dropped. */
-
-      const uint64_t *words = PHYS_TO_VIRT(phys);
-      ksm_global_stats.pages_scanned++;
-      uint64_t replacement = 0;
-      if (zero_page_phys && ksm_is_page_zero(words)) {
-        replacement = zero_page_phys;
-        ksm_global_stats.zero_pages_merged++;
-      } else {
-        uint32_t hash = ksm_hash_page(words);
-        uint32_t bucket = hash % KSM_BUCKETS;
-        unsigned probes = 0;
-        for (uint32_t curr = ksm_buckets[bucket];
-             curr && probes++ < KSM_MAX_CHAIN_PROBES;
-             curr = ksm_node_pool[curr].next) {
-          struct ksm_node *candidate = &ksm_node_pool[curr];
-          if (candidate->hash == hash && candidate->phys_page != phys &&
-              memcmp(PHYS_TO_VIRT(candidate->phys_page), words, PAGE_SIZE) == 0) {
-            replacement = candidate->phys_page;
-            pmm_incref((void *)replacement); /* New mapping's reference. */
-            ksm_global_stats.pages_sharing++;
-            break;
-          }
-        }
-        if (!replacement) {
-          snapshot->hash = hash;
-          snapshot->next = ksm_buckets[bucket];
-          ksm_buckets[bucket] = idx;
-          ksm_global_stats.pages_shared++;
-        }
-      }
-      if (replacement) {
-        *pte = replacement | ((*pte & ~PAGE_MASK & ~PAGE_FLAG_RW) | PAGE_FLAG_COW);
-        /* Drop the mapping's reference, retaining the scan pin until every
-         * CPU has acknowledged the replacement below. */
+      bool valid = pte && (*pte & PAGE_FLAG_PRESENT) &&
+                   (*pte & PAGE_MASK) == phys && !(*pte & PAGE_FLAG_RW);
+      if (valid && snapshot->replacement) {
+        *pte = snapshot->replacement |
+               ((*pte & ~PAGE_MASK & ~PAGE_FLAG_RW) | PAGE_FLAG_COW);
+        /* The scan pin on the old frame keeps it alive until the final
+         * shootdown and release below. */
         pmm_free_page((void *)phys);
         freed_pages++;
       }
@@ -267,14 +304,38 @@ uint64_t ksm_scan_pass(void) {
 
 static void ksm_worker(void) {
   struct thread *self = sched_get_current();
+  uint32_t interval = KSM_IDLE_INTERVAL;
+  bool idle_mode = true;
   for (;;) {
-    if (ksm_enabled) {
-      ksm_scan_pass();
+    /* Eager under memory pressure, sparse in the background: both scan,
+     * at different cadences, and each backs off on unproductive passes. */
+    bool low_memory = pmm_get_free_pages() < KSM_FREE_EAGER_PAGES;
+
+    if (low_memory != idle_mode) {
+      idle_mode = low_memory;
+      klog_puts(low_memory
+          ? "[KSM] memory pressure: eager scan mode (1.5 s base, max 60 s)\n"
+          : "[KSM] plenty of RAM: background dedup (15 s base, max 2 min)\n");
+      interval = low_memory ? KSM_EAGER_INTERVAL : KSM_IDLE_INTERVAL;
     }
 
-    /* Sleep 1.5 seconds between passes */
+    if (!ksm_enabled) {
+      interval = low_memory ? KSM_EAGER_INTERVAL : KSM_IDLE_INTERVAL;
+    } else if (low_memory) {
+      if (ksm_scan_pass())
+        interval = KSM_EAGER_INTERVAL; /* Productive: stay at full rate. */
+      else if (interval < KSM_MAX_EAGER_INTERVAL)
+        interval *= 2; /* Nothing to merge: back off. */
+    } else {
+      __atomic_add_fetch(&ksm_global_stats.passes_idle, 1, __ATOMIC_RELAXED);
+      if (ksm_scan_pass())
+        interval = KSM_IDLE_INTERVAL; /* Productive: stay at idle cadence. */
+      else if (interval < KSM_MAX_IDLE_INTERVAL)
+        interval *= 2; /* Nothing to merge: back off. */
+    }
+
     self->state = THREAD_SLEEPING;
-    self->wakeup_ticks = lapic_timer_get_ticks() + 1500;
+    self->wakeup_ticks = lapic_timer_get_ticks() + interval;
     sched_yield();
     self->wakeup_ticks = 0;
     self->state = THREAD_RUNNING;

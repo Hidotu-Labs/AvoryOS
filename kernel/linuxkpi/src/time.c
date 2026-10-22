@@ -4,6 +4,7 @@
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/jiffies.h>
+#include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/sched.h>
 #include <linux/timer.h>
@@ -127,8 +128,36 @@ bool signal_pending(struct task_struct *p) {
   return thread ? linuxkpi_thread_has_pending_signal(thread) : false;
 }
 
+/* Native timed sleeps round up to a millisecond. Preserve hrtimer's
+ * completion versus early-wakeup return value and consume published wakes. */
+int schedule_hrtimeout(ktime_t *expires, const enum hrtimer_mode mode) {
+  int result = -EINTR;
+  if (!expires) {
+    schedule();
+  } else {
+    ktime_t remaining = *expires;
+    if (!(mode & HRTIMER_MODE_REL)) {
+      ktime_t now = ktime_get();
+      remaining = remaining <= now ? 0 : remaining - now;
+    }
+    if (remaining <= 0) {
+      result = 0;
+    } else {
+      unsigned long ms = (unsigned long)((remaining - 1) / NSEC_PER_MSEC + 1);
+      int woken = linuxkpi_schedule_timeout_ms(ms);
+      result = woken ? -EINTR : 0;
+    }
+  }
+  __set_current_state(TASK_RUNNING);
+  return result;
+}
+
 void msleep(unsigned int msecs) {
-  (void)schedule_timeout((long)msecs_to_jiffies(msecs));
+  unsigned long timeout = msecs_to_jiffies(msecs) + 1;
+  /* Linux msleep must cover the requested interval even after an unrelated
+   * wakeup. schedule_timeout itself may legitimately return early. */
+  while (timeout)
+    timeout = schedule_timeout_uninterruptible(timeout);
 }
 
 unsigned long msleep_interruptible(unsigned int msecs) {

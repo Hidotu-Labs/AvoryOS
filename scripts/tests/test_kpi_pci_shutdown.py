@@ -12,13 +12,25 @@ code = r'''
 #include <assert.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
 struct pci_dev;
 struct pci_driver { const char *name; void (*shutdown)(struct pci_dev *); };
-struct pci_dev { struct pci_driver *driver; int id; };
+struct pci_dev { struct pci_driver *driver; int id; uint16_t vendor, device; void *sysdata; };
 static struct pci_dev **kpi_devs;
+static bool kpi_nouveau_remove_on_shutdown;
 static int kpi_dev_count, calls[3], count;
 static const char *pci_name(struct pci_dev *d) { (void)d; return "test"; }
 static void klogf(const char *f, ...) { (void)f; }
+static bool kpi_nouveau_probe_allowed(struct pci_dev *dev) { (void)dev; return false; }
+static void pci_unregister_driver(struct pci_driver *driver) { (void)driver; assert(false); }
+static uint32_t linuxkpi_pci_config_read32(void *data, unsigned short offset) {
+  (void)data; (void)offset; assert(false); return 0;
+}
+static uint8_t linuxkpi_pci_config_read8(void *data, unsigned short offset) {
+  (void)data; (void)offset; assert(false); return 0;
+}
 static void shutdown_cb(struct pci_dev *d) {
   calls[count++] = d->id;
   /* A second caller must not repeat shutdown during a callback. */
@@ -28,7 +40,8 @@ static void shutdown_cb(struct pci_dev *d) {
 '''+source[start:end]+r'''
 int main(void) {
   struct pci_driver bound = { "bound", shutdown_cb }, no_cb = { "no_cb", NULL };
-  struct pci_dev a = { &bound, 1 }, b = { NULL, 2 }, c = { &no_cb, 3 }, d = { &bound, 4 };
+  struct pci_dev a = { .driver=&bound, .id=1 }, b = { .id=2 };
+  struct pci_dev c = { .driver=&no_cb, .id=3 }, d = { .driver=&bound, .id=4 };
   struct pci_dev *devices[] = { &a, &b, NULL, &c, &d };
   kpi_devs = devices; kpi_dev_count = 5;
   linuxkpi_pci_shutdown(); linuxkpi_pci_shutdown();

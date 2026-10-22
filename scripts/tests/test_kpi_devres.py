@@ -85,6 +85,10 @@ int main(void){
  expect((int[]){4,3,2,1},4);
  add_action(&d,1);add_raw(&d,2);add_action(&d,1);
  devm_remove_action(&d,record,(void*)1);devres_release_all(&d);expect((int[]){2,1},2);
+ add_action(&d,5);add_action(&d,6);add_action(&d,5);
+ devm_release_action(&d,record,(void*)5);expect((int[]){5},1);
+ devm_release_action(&d,record,(void*)99);expect(NULL,0);
+ devres_release_all(&d);expect((int[]){6,5},2);
  add_action(&d,0);void*outer=devres_open_group(&d,NULL,0);assert(outer);add_raw(&d,1);
  void*inner=devres_open_group(&d,NULL,0);assert(inner&&inner!=outer);add_action(&d,2);
  devres_close_group(&d,NULL);add_raw(&d,3);devres_close_group(&d,outer);add_action(&d,4);

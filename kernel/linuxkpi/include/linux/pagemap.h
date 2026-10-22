@@ -13,6 +13,33 @@
 #include <linux/mm.h>
 #include <linux/uaccess.h>
 #include <linux/pagevec.h>
+#include <linux/wait_bit.h>
+
+static inline void folio_put(struct folio *folio) { put_page(&folio->page); }
+static inline void folio_lock(struct folio *folio) {
+  wait_on_bit_lock(&linuxkpi_page_flag_bits(&folio->page), PG_locked);
+}
+static inline void folio_unlock(struct folio *folio) {
+  unsigned long *word = &linuxkpi_page_flag_bits(&folio->page);
+  clear_bit_unlock(PG_locked, word);
+  smp_mb__after_atomic();
+  wake_up_bit(word, PG_locked);
+}
+static inline bool folio_mapped(struct folio *folio) {
+  return atomic_read(&folio->page._mapcount) >= 0;
+}
+static inline bool folio_clear_dirty_for_io(struct folio *folio) {
+  return test_and_clear_bit(PG_dirty, &linuxkpi_page_flag_bits(&folio->page));
+}
+static inline void folio_set_reclaim(struct folio *folio) {
+  set_bit(PG_reclaim, &linuxkpi_page_flag_bits(&folio->page));
+}
+static inline void folio_clear_reclaim(struct folio *folio) {
+  clear_bit(PG_reclaim, &linuxkpi_page_flag_bits(&folio->page));
+}
+static inline bool folio_test_writeback(struct folio *folio) {
+  return test_bit(PG_writeback, &linuxkpi_page_flag_bits(&folio->page));
+}
 
 /* Mapping GFP helpers (upstream pagemap.h). */
 static inline gfp_t mapping_gfp_mask(const struct address_space *mapping) {

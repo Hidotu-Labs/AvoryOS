@@ -37,8 +37,9 @@ int rcu_read_lock_any_held(void);
 
 #define rcu_dereference(p) READ_ONCE(p)
 #define rcu_dereference_raw(p) READ_ONCE(p)
-#define rcu_dereference_check(p, c) ((void)(c), READ_ONCE(p))
-#define rcu_dereference_protected(p, c) ((void)(c), (p))
+#define rcu_dereference_check(p, c) READ_ONCE(p)
+/* Like stock !CONFIG_PROVE_RCU, do not evaluate lockdep-only conditions. */
+#define rcu_dereference_protected(p, c) (p)
 /* KCSAN handoff annotation; identity here. */
 #define rcu_pointer_handoff(p) (p)
 

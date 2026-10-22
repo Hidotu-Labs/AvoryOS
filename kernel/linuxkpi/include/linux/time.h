@@ -8,5 +8,6 @@
 #include <linux/types.h>
 #include <linux/time64.h>
 #include <uapi/linux/time.h>
+#include_next <linux/time.h>
 
 #endif /* __AVORY_LINUXKPI_TIME_H */

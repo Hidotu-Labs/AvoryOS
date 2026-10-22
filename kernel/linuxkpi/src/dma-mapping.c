@@ -30,14 +30,12 @@ static dma_addr_t kpi_dma_phys(const void *ptr) {
   return (dma_addr_t)(unsigned long)__pa(ptr);
 }
 
-void *dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *dma_handle,
-                      gfp_t flag, unsigned long attrs) {
+static void *kpi_dma_alloc(size_t size, dma_addr_t *dma_handle,
+                           gfp_t flag, u64 mask) {
   struct page *page;
   unsigned int order;
   size_t pages;
 
-  (void)dev;
-  (void)attrs;
 
   if (!size) {
     if (dma_handle)
@@ -50,7 +48,7 @@ void *dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *dma_handle,
   pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
   order = get_order(pages << PAGE_SHIFT);
 
-  if (dev && dev->coherent_dma_mask && dev->coherent_dma_mask < 0x100000000ULL)
+  if (mask && mask < 0x100000000ULL)
     page = alloc_pages(flag | __GFP_ZERO | GFP_DMA32, order);
   else
     page = alloc_pages(flag | __GFP_ZERO, order);
@@ -58,13 +56,27 @@ void *dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *dma_handle,
     return NULL;
 
   if (!kpi_dma_range_ok(page_to_phys(page), size,
-                        dev ? dev->coherent_dma_mask : DMA_BIT_MASK(64))) {
+                        mask)) {
     __free_pages(page, order);
     return NULL;
   }
   if (dma_handle)
     *dma_handle = page_to_phys(page);
   return page_address(page);
+}
+
+void *dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *handle,
+                      gfp_t flags, unsigned long attrs) {
+  (void)attrs;
+  return kpi_dma_alloc(size, handle, flags,
+                       dev ? dev->coherent_dma_mask : DMA_BIT_MASK(64));
+}
+void *dma_alloc_noncoherent(struct device *dev, size_t size, dma_addr_t *handle,
+    enum dma_data_direction dir, gfp_t flags) {
+  if (dir == DMA_NONE)
+    return NULL;
+  return kpi_dma_alloc(size, handle, flags,
+                       dev ? dev->dma_mask : DMA_BIT_MASK(64));
 }
 
 void *dma_alloc_coherent(struct device *dev, size_t size,
@@ -95,6 +107,12 @@ void dma_free_attrs(struct device *dev, size_t size, void *cpu_addr,
 void dma_free_coherent(struct device *dev, size_t size, void *cpu_addr,
                        dma_addr_t dma_handle) {
   dma_free_attrs(dev, size, cpu_addr, dma_handle, 0);
+}
+
+void dma_free_noncoherent(struct device *dev, size_t size, void *addr,
+    dma_addr_t handle, enum dma_data_direction dir) {
+  (void)dir;
+  dma_free_attrs(dev, size, addr, handle, 0);
 }
 
 dma_addr_t dma_map_page_attrs(struct device *dev, struct page *page,

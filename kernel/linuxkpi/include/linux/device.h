@@ -81,7 +81,7 @@ struct device {
   void *driver_data;
   void (*release)(struct device *dev);
   struct device_driver *driver;
-  struct bus_type *bus;
+  const struct bus_type *bus;
   struct device_node *of_node;
   struct fwnode_handle *fwnode;
   void *platform_data; /* legacy platform bus data (simpledrm) */
@@ -102,8 +102,9 @@ struct device {
 /* Defined here (not in driver.h) because upstream <linux/device.h> provides
  * it through device/driver.h, and both pci.h and driver.h rely on that. */
 struct device_driver {
+  struct module *owner;
   const char *name;
-  struct bus_type *bus;
+  const struct bus_type *bus;
   const struct of_device_id *of_match_table;
   const struct acpi_device_id *acpi_match_table;
   const struct attribute_group **dev_groups;
@@ -276,6 +277,7 @@ void devres_release_group(struct device *dev, void *id);
 int devm_add_action(struct device *dev, void (*action)(void *), void *data);
 int devm_add_action_or_reset(struct device *dev, void (*action)(void *),
                              void *data);
+void devm_release_action(struct device *dev, void (*action)(void *), void *data);
 void devm_remove_action(struct device *dev, void (*action)(void *), void *data);
 
 void *devm_kmalloc(struct device *dev, size_t size, gfp_t gfp);
@@ -342,10 +344,22 @@ static inline void dev_pm_set_driver_flags(struct device *dev, u32 flags) {
       dev_warn(dev, fmt, ##__VA_ARGS__);                                       \
   } while (0)
 #define dev_err_ratelimited(dev, fmt, ...) dev_err(dev, fmt, ##__VA_ARGS__)
+#define dev_warn_ratelimited(dev, fmt, ...) dev_warn(dev, fmt, ##__VA_ARGS__)
 #define dev_dbg_ratelimited(dev, fmt, ...) dev_dbg(dev, fmt, ##__VA_ARGS__)
 
 int device_create_file(struct device *dev, const struct device_attribute *attr);
 void device_remove_file(struct device *dev,
                         const struct device_attribute *attr);
+
+/* Optional audio-component ordering links have no native provider. */
+struct device_link;
+#define DL_FLAG_STATELESS (1U << 0)
+static inline struct device_link *device_link_add(struct device *consumer,
+    struct device *supplier, u32 flags) {
+  (void)consumer; (void)supplier; (void)flags;
+  return NULL;
+}
+
+int dev_err_probe(const struct device *dev, int err, const char *fmt, ...);
 
 #endif /* __AVORY_LINUXKPI_DEVICE_H */

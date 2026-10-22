@@ -1,15 +1,7 @@
-# /etc/profile.d/avory-drm.sh — prefer amdgpu for GPU-accelerated sessions.
-#
-# KWin (Wayland) selects its DRM device from KWIN_DRM_DEVICES; the Xorg
-# profile reads the same card choice through this environment.  This covers
-# the Plasma Wayland session started from a login shell:
-# when /bin/drm-pick.sh has an amdgpu card that can drive a display (monitor
-# or the C7 emulated sink), KWin renders and outputs on it; otherwise the
-# variable stays unset and KWin keeps the native card0.
 if [ -z "${KWIN_DRM_DEVICES:-}" ] && [ -x /bin/drm-pick.sh ]; then
-    _avory_card="$(/bin/drm-pick.sh 2>/dev/null)"
+    _avory_card="$(/bin/drm-pick.sh 2>/dev/null || true)"
     case "$_avory_card" in
-        ""|/dev/dri/card0) ;;
+        "") ;;
         *) KWIN_DRM_DEVICES="$_avory_card"; export KWIN_DRM_DEVICES ;;
     esac
     unset _avory_card

@@ -51,6 +51,8 @@ void kfree(void *ptr) {
   klog_uint64(page_base);
   klog_puts(" magic=");
   klog_uint64(magic_check);
+  klog_puts(" caller=");
+  klog_hex64((uint64_t)__builtin_return_address(0));
   klog_puts("\n");
 }
 

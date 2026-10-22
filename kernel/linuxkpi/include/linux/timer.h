@@ -52,6 +52,8 @@ struct timer_list {
 
 #define from_timer(var, callback_timer, timer_fieldname)                      \
   container_of(callback_timer, typeof(*var), timer_fieldname)
+#define timer_container_of(var, callback_timer, timer_fieldname)              \
+  from_timer(var, callback_timer, timer_fieldname)
 
 void add_timer(struct timer_list *timer);
 void add_timer_on(struct timer_list *timer, int cpu);
@@ -59,6 +61,12 @@ int mod_timer(struct timer_list *timer, unsigned long expires);
 int mod_timer_pending(struct timer_list *timer, unsigned long expires);
 int del_timer(struct timer_list *timer);
 int del_timer_sync(struct timer_list *timer);
+static inline int timer_delete(struct timer_list *timer) {
+  return del_timer(timer);
+}
+static inline int timer_delete_sync(struct timer_list *timer) {
+  return del_timer_sync(timer);
+}
 int timer_shutdown_sync(struct timer_list *timer);
 int timer_pending(const struct timer_list *timer);
 unsigned long round_jiffies(unsigned long j);

@@ -1,6 +1,7 @@
 #include "acpi/acpi.h"
 #include "hal/hal.h"
 #include "console/console.h"
+#include "drivers/serial.h"
 #include "drivers/manager/device.h"
 #include "lib/string.h"
 #include "mm/pmm.h"
@@ -369,6 +370,7 @@ void acpi_poweroff(void) {
     goto hang;
   }
 
+  serial_flush_sync();
   // Write SLP_TYP | SLP_EN to PM1a_CNT (and optionally PM1b_CNT)
   outw((uint16_t)pm1a, (uint16_t)ACPI_S5_SLP_EN_QEMU);
   if (pm1b)

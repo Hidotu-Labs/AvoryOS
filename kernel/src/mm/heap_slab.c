@@ -1,5 +1,6 @@
 #include "mm/heap_internal.h"
 #include "console/console.h"
+#include "console/klog.h"
 #include "lib/string.h"
 #include "mm/pmm.h"
 #include "hal/hal.h"
@@ -13,13 +14,46 @@ struct slab_cache heap_caches[CACHE_COUNT] = {
     {1024, SPINLOCK_INIT, NULL, NULL, NULL},
 };
 
-struct cpu_local_slab heap_cpu_slab_caches[MAX_CPUS][CACHE_COUNT];
+static struct heap_slab_dbg heap_slab_dbg[CACHE_COUNT];
+volatile int heap_slab_dbg_on;
 
 void heap_slab_init(void) {
   for (size_t i = 0; i < CACHE_COUNT; i++) {
     spinlock_init(&heap_caches[i].lock);
   }
-  memset(heap_cpu_slab_caches, 0, sizeof(heap_cpu_slab_caches));
+}
+
+static inline size_t heap_dbg_idx(const struct slab_cache *c) {
+  return (size_t)(c - heap_caches);
+}
+
+void heap_slab_dbg_reset(void) {
+  memset(heap_slab_dbg, 0, sizeof(heap_slab_dbg));
+}
+
+void heap_slab_dbg_dump(const char *tag) {
+  klogf("[INFO] heap slab dbg (%s)\n", tag);
+  klog_puts("[INFO]  size | a_pcpu a_slab a_new | f_park f_slab |  new_pg  "
+            "|  part full free | net live\n");
+  for (size_t i = 0; i < CACHE_COUNT; i++) {
+    struct slab_cache *c = &heap_caches[i];
+    struct heap_slab_dbg *d = &heap_slab_dbg[i];
+    unsigned long allocs = d->alloc_pcpu + d->alloc_slab + d->alloc_new;
+    unsigned long frees = d->free_park + d->free_slab;
+    size_t n_partial = 0, n_full = 0, n_free = 0;
+
+    spinlock_acquire(&c->lock);
+    for (struct slab *s = c->partial; s; s = s->next) n_partial++;
+    for (struct slab *s = c->full; s; s = s->next) n_full++;
+    for (struct slab *s = c->free; s; s = s->next) n_free++;
+    spinlock_release(&c->lock);
+
+    klogf("[INFO]  %4zu | %6lu %6lu %5lu | %6lu %6lu | %8lu | %5zu %4zu "
+          "%4zu | %+ld\n",
+          c->obj_size, d->alloc_pcpu, d->alloc_slab, d->alloc_new,
+          d->free_park, d->free_slab, d->new_slabs, n_partial, n_full,
+          n_free, (long)allocs - (long)frees);
+  }
 }
 
 static struct slab *allocate_new_slab(struct slab_cache *c) {
@@ -38,6 +72,10 @@ static struct slab *allocate_new_slab(struct slab_cache *c) {
     s->total_count = 128; // Limit by bitmap capacity
   s->free_count = s->total_count;
 
+  if (heap_slab_dbg_on)
+    __atomic_add_fetch(
+        &heap_slab_dbg[heap_dbg_idx(c)].new_slabs, 1, __ATOMIC_RELAXED);
+
   return s;
 }
 
@@ -50,6 +88,12 @@ extern size_t mm_file_cache_reclaim(size_t target) __attribute__((weak));
 extern size_t thread_stack_cache_reclaim(size_t max_reclaim) __attribute__((weak));
 extern size_t ext2_buffer_cache_shrink(size_t max_buffers) __attribute__((weak));
 extern size_t pty_shrink_unused_buffers(void) __attribute__((weak));
+
+/* Fully-empty slabs are returned to PMM the moment they empty (in
+ * slab_free_to_cache_locked), so c->free never parks pages and the
+ * allocator's arena stays matched to live demand: a balanced workload
+ * leaves the PMM free count exactly where it started.  heap_shrink_empty
+ * remains for the OOM unwind path and any foreign empty-slabs. */
 
 // Return every completely empty generic slab to PMM. Caller must NOT hold
 // any heap_caches[].lock (we take each one in turn). Returns pages freed.
@@ -91,6 +135,8 @@ void heap_oom_reclaim(void) {
 
 // Allocate a single object from a slab cache (caller must hold c->lock)
 static void *slab_alloc_from_cache_locked(struct slab_cache *c) {
+  size_t di = heap_dbg_idx(c);
+
   for (struct slab *s = c->partial; s; s = s->next) {
     int free_idx = -1;
     for (int i = 0; i < (int)s->total_count; i++) {
@@ -121,11 +167,16 @@ static void *slab_alloc_from_cache_locked(struct slab_cache *c) {
       c->full = s;
     }
 
+    if (heap_slab_dbg_on)
+      __atomic_add_fetch(
+          &heap_slab_dbg[di].alloc_slab, 1, __ATOMIC_RELAXED);
+
     uint8_t *obj_base = (uint8_t *)s + sizeof(struct slab);
     return (void *)(obj_base + (free_idx * c->obj_size));
   }
 
   struct slab *s = NULL;
+  bool fresh_slab = false;
   if (c->free) {
     s = c->free;
     c->free = s->next;
@@ -135,6 +186,7 @@ static void *slab_alloc_from_cache_locked(struct slab_cache *c) {
     s->prev = NULL;
   } else {
     s = allocate_new_slab(c);
+    fresh_slab = true;
     if (!s)
       return NULL;
   }
@@ -187,6 +239,11 @@ static void *slab_alloc_from_cache_locked(struct slab_cache *c) {
     c->full = s;
   }
 
+  if (heap_slab_dbg_on)
+    __atomic_add_fetch(fresh_slab ? &heap_slab_dbg[di].alloc_new
+                                  : &heap_slab_dbg[di].alloc_slab,
+                       1, __ATOMIC_RELAXED);
+
   uint8_t *obj_base = (uint8_t *)s + sizeof(struct slab);
   return (void *)(obj_base + (free_idx * c->obj_size));
 }
@@ -217,7 +274,25 @@ static void slab_free_to_cache_locked(struct slab_cache *c, struct slab *s, void
   BITMAP_CLEAR(s->bitmap, idx);
   s->free_count++;
 
-  if (s->free_count == 1) {
+  if (heap_slab_dbg_on)
+    __atomic_add_fetch(
+        &heap_slab_dbg[heap_dbg_idx(c)].free_slab, 1, __ATOMIC_RELAXED);
+
+  if (s->free_count == s->total_count) {
+    /* The slab's last live slot was just released: unlink it from the
+     * class lists and hand the frame straight back to PMM instead of
+     * parking it on an empty-slab list behind the OOM-only shrink.  A
+     * balanced workload therefore returns every page its bursts pulled,
+     * within the same burst. */
+    if (s->prev)
+      s->prev->next = s->next;
+    else
+      c->partial = s->next;
+    if (s->next)
+      s->next->prev = s->prev;
+
+    pmm_free_page((void *)((uint64_t)s - pmm_get_hhdm_offset()));
+  } else if (s->free_count == 1) {
     if (s->prev)
       s->prev->next = s->next;
     else
@@ -230,21 +305,6 @@ static void slab_free_to_cache_locked(struct slab_cache *c, struct slab *s, void
     if (c->partial)
       c->partial->prev = s;
     c->partial = s;
-  }
-
-  if (s->free_count == s->total_count) {
-    if (s->prev)
-      s->prev->next = s->next;
-    else
-      c->partial = s->next;
-    if (s->next)
-      s->next->prev = s->prev;
-
-    s->next = c->free;
-    s->prev = NULL;
-    if (c->free)
-      c->free->prev = s;
-    c->free = s;
   }
 }
 
@@ -260,24 +320,15 @@ void *heap_slab_alloc(size_t size) {
   if (cache_idx < 0)
     return NULL;
 
+  /* Every object is served from the class's slab lists under the class
+   * lock: the per-CPU park/pop fast path used to strand up to sixteen
+   * "allocated" slots (bitmap still set) in the cache and the refill batch
+   * over-drew slab pages ahead of demand, so warm workloads kept pulling
+   * fresh PMM pages whose boxes stayed parked until the next shrink.
+   * Deterministic slab-list service plus same-epoch empty-page release
+   * keeps the arena quiescence-exact instead. */
   struct slab_cache *c = &heap_caches[cache_idx];
 
-  // Fast-path: Per-CPU local freelist
-  if (heap_initialized) {
-    hal_irq_state_t flags = hal_irq_save();
-    struct cpu_info *cpu = cpu_get_current();
-    if (cpu && cpu->cpu_id < MAX_CPUS) {
-      struct cpu_local_slab *local = &heap_cpu_slab_caches[cpu->cpu_id][cache_idx];
-      if (local->count > 0) {
-        void *obj = local->entries[--local->count];
-        hal_irq_restore(flags);
-        return obj;
-      }
-    }
-    hal_irq_restore(flags);
-  }
-
-  // Slow-path: Fine-grained per-cache lock
   spinlock_acquire(&c->lock);
   void *ptr = slab_alloc_from_cache_locked(c);
   spinlock_release(&c->lock);
@@ -290,23 +341,6 @@ void *heap_slab_alloc(size_t size) {
       return NULL;
   }
 
-  spinlock_acquire(&c->lock);
-  if (ptr && heap_initialized) {
-    hal_irq_state_t flags = hal_irq_save();
-    struct cpu_info *cpu = cpu_get_current();
-    if (cpu && cpu->cpu_id < MAX_CPUS) {
-      struct cpu_local_slab *local = &heap_cpu_slab_caches[cpu->cpu_id][cache_idx];
-      for (int b = 0; b < 4 && local->count < LOCAL_CACHE_CAPACITY; b++) {
-        void *batch_obj = slab_alloc_from_cache_locked(c);
-        if (!batch_obj)
-          break;
-        local->entries[local->count++] = batch_obj;
-      }
-    }
-    hal_irq_restore(flags);
-  }
-  spinlock_release(&c->lock);
-
   return ptr;
 }
 
@@ -315,31 +349,20 @@ bool heap_slab_free(void *ptr, uint64_t page_base) {
   struct slab_cache *c = s->cache;
   int cache_idx = (int)(c - heap_caches);
 
-  if (heap_initialized && cache_idx >= 0 && cache_idx < (int)CACHE_COUNT) {
-    hal_irq_state_t flags = hal_irq_save();
-    struct cpu_info *cpu = cpu_get_current();
-    if (cpu && cpu->cpu_id < MAX_CPUS) {
-      struct cpu_local_slab *local = &heap_cpu_slab_caches[cpu->cpu_id][cache_idx];
-      if (local->count < LOCAL_CACHE_CAPACITY) {
-        for (uint16_t i = 0; i < local->count; i++) {
-          if (local->entries[i] == ptr) {
-            heap_trace_warn_double("in per-CPU freelist!", ptr);
-            hal_irq_restore(flags);
-            return true;
-          }
-        }
-        local->entries[local->count++] = ptr;
-        hal_irq_restore(flags);
-        return true;
-      }
-    }
-    hal_irq_restore(flags);
+  /* Frees are delivered straight to the slab lists: parking a freed slot
+   * in a per-CPU freelist while leaving its bitmap set made the owning
+   * page look live and blocked its release, and it changed the accounting
+   * population between quiescent epochs.  The list path validates and
+   * clears the slot under the class lock. */
+  if (cache_idx >= 0 && cache_idx < (int)CACHE_COUNT) {
+    spinlock_acquire(&c->lock);
+    slab_free_to_cache_locked(c, s, ptr);
+    spinlock_release(&c->lock);
+    return true;
   }
 
-  spinlock_acquire(&c->lock);
-  slab_free_to_cache_locked(c, s, ptr);
-  spinlock_release(&c->lock);
-  return true;
+  console_puts("[WARN] kfree: slab points outside the generic caches!\n");
+  return false;
 }
 
 size_t heap_slab_ksize(const void *ptr, uint64_t page_base) {

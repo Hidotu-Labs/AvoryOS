@@ -11,8 +11,10 @@
  * AML interpreter; `acpi_evaluate_*` remains unavailable by design. */
 
 #include <linux/types.h>
+#include <linux/suspend.h>
 
 struct acpi_device;
+#define ACPI_COMPANION(dev) ((struct acpi_device *)0)
 struct acpi_bus_type;
 struct acpi_buffer;
 struct device;
@@ -22,6 +24,7 @@ struct fwnode_handle;
 struct acpi_driver;
 
 /* ACPICA status shape: 0 is AE_OK, anything else is a failure. */
+typedef void *acpi_handle;
 typedef u32 acpi_status;
 #define AE_OK 0
 #define AE_NOT_FOUND 0x0005

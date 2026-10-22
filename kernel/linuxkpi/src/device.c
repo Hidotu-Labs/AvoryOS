@@ -7,6 +7,7 @@
 #include <linux/errno.h>
 #include <linux/interrupt.h>
 #include <linux/ioport.h>
+#include <linux/kdev_t.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 
@@ -46,6 +47,19 @@ void device_initialize(struct device *dev) {
   INIT_LIST_HEAD(&dev->kpi_list);
 }
 
+static const char *device_pci_ancestor_name(struct device *dev) {
+  for (struct device *parent = dev->parent; parent; parent = parent->parent)
+    if (parent->bus && parent->bus->name &&
+        !strcmp(parent->bus->name, "pci"))
+      return dev_name(parent);
+  return NULL;
+}
+
+static bool device_is_drm_minor(struct device *dev) {
+  return dev->devt && dev->class && dev->class->name &&
+         !strcmp(dev->class->name, "drm");
+}
+
 int device_add(struct device *dev) {
   if (!dev)
     return -EINVAL;
@@ -64,9 +78,16 @@ int device_add(struct device *dev) {
 
     if (!class_dir && dev->class->name)
       class_dir = asc_sysfs_class_dir(dev->class->name);
-    if (class_dir)
+    if (device_is_drm_minor(dev)) {
+      dev->kobj.sd = asc_sysfs_drm_minor_add(
+          class_dir, dev_name(dev), device_pci_ancestor_name(dev),
+          MAJOR(dev->devt), MINOR(dev->devt));
+      if (!dev->kobj.sd)
+        return -ENOMEM;
+    } else if (class_dir) {
       dev->kobj.sd = (struct kernfs_node *)asc_sysfs_device_dir(
           class_dir, dev_name(dev));
+    }
     device_add_groups(dev, dev->groups);
   }
 
@@ -104,7 +125,11 @@ void device_del(struct device *dev) {
 
     if (!class_dir && dev->class->name)
       class_dir = asc_sysfs_class_dir(dev->class->name);
-    if (class_dir)
+    if (device_is_drm_minor(dev))
+      asc_sysfs_drm_minor_remove(class_dir, dev_name(dev),
+                                device_pci_ancestor_name(dev),
+                                MAJOR(dev->devt), MINOR(dev->devt));
+    else if (class_dir)
       asc_sysfs_remove(class_dir, dev_name(dev));
     dev->kobj.sd = NULL;
   }
@@ -353,14 +378,14 @@ int devm_add_action_or_reset(struct device *dev, void (*action)(void *),
   return ret;
 }
 
-void devm_remove_action(struct device *dev, void (*action)(void *),
-                        void *data) {
+static struct devres_node *kpi_devm_take_action(
+    struct device *dev, void (*action)(void *), void *data) {
   struct devres_node *node;
   struct devres_node *found = NULL;
   unsigned long flags;
 
   if (!dev || !dev->devres_head.next)
-    return;
+    return NULL;
 
   spin_lock_irqsave(&dev->devres_lock, flags);
   list_for_each_entry_reverse(node, &dev->devres_head, entry) {
@@ -372,7 +397,19 @@ void devm_remove_action(struct device *dev, void (*action)(void *),
     }
   }
   spin_unlock_irqrestore(&dev->devres_lock, flags);
-  kfree(found);
+  return found;
+}
+
+void devm_remove_action(struct device *dev, void (*action)(void *), void *data) {
+  kfree(kpi_devm_take_action(dev, action, data));
+}
+
+void devm_release_action(struct device *dev, void (*action)(void *), void *data) {
+  struct devres_node *node = kpi_devm_take_action(dev, action, data);
+  if (node) {
+    node->release(node->data);
+    kfree(node);
+  }
 }
 
 /* ── devres groups ──────────────────────────────────────────────────────── */
@@ -737,4 +774,14 @@ void *devm_memremap(struct device *dev, resource_size_t offset, size_t size,
 void devm_memunmap(struct device *dev, void *addr) {
   devm_remove_action(dev, __kpi_devm_memunmap_action, addr);
   memunmap(addr);
+}
+
+/* Match Linux error propagation; deferred-probe storage is not modeled. */
+int dev_err_probe(const struct device *dev, int err, const char *fmt, ...) {
+  va_list args;
+  (void)dev;
+  va_start(args, fmt);
+  vprintk(fmt, args);
+  va_end(args);
+  return err;
 }

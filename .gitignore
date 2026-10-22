@@ -1,5 +1,7 @@
 /build/
 /kernel/linux/
+/kernel/.linux-import.*
+/kernel/.linux-previous.*/
 /kernel/cc-runtime/
 /kernel/limine-protocol/
 /kernel/freestnd-c-hdrs/

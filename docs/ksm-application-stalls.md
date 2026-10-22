@@ -43,6 +43,43 @@ work even on huge sparse mappings or colliding hashes. The prior page pins,
 write-protection flush, mapping revalidation and delayed frame release remain.
 The tradeoff is slower deduplication of large or highly colliding mappings.
 
+## Launch stalls traced to the replacement pass (October 18, follow-up)
+
+The user measured intermittent Firefox launches of up to 30 s against a
+3 s baseline. Two mechanisms in the replacement pass explained the worst
+cases; both are removed.
+
+* `mm->lock` was held across the hashing and 4 KiB memcmp loop, with
+  interrupts masked. The user page-fault path takes the same lock
+  (`vmm_fault.c`), so every fault in the scanned address space - thousands
+  during an application launch - spun behind ksmd for milliseconds per
+  pass, every 1.5 seconds. Content hashing, chain probing and memcmp now
+  run without mm->lock: the frames are frozen, flushed and pinned, so
+  their contents are stable, and the hash table is scan-local
+  (ksm_scan_active excludes concurrent scanners). The lock is held again
+  only for O(1) PTE revalidation and replacement; a decision whose PTE
+  CoW-broke while the lock was dropped is discarded, since the pin routes
+  any concurrent write into a fresh copy. Unmatched pages enter the table
+  in the lockless phase, so within-batch dedup is preserved regardless of
+  later revalidation.
+* Scanning ran every 1.5 seconds unconditionally. The daemon now has two
+  cadences. Under 128 MiB of free memory it scans eagerly (1.5 s base,
+  backing off to 60 s when a pass merges nothing). Above it, dedup still
+  runs because duplicates keep accruing with or without pressure, but at
+  background cadence (15 s base, backing off to 2 min), which rarely
+  overlaps an application launch and keeps the periodic tax small
+  without disabling dedup entirely. Background passes are counted in
+  `passes_idle` and exposed as `/proc/sys/vm/ksm_passes_idle`; the first
+  pass in either mode logs the transition. Full-context shootdowns per
+  frozen mm remain synchronous for flush-completion correctness;
+  do_shootdown skips the IPI entirely when no remote CPU has the address
+  space resident, so their cost is limited to address spaces that are
+  actually running elsewhere.
+
+Explicit passes (`/sys/ksm/run`, `drop_caches=3`) always scan immediately,
+so a manual request bypasses whichever cadence is active. Per-pass merge
+lines still print on actual merges only.
+
 ## Verification and limits
 
 * Actual-source key test reproduces the old frame-dependent unmatched wake,

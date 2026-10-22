@@ -13,9 +13,11 @@
 #include "drivers/input/mouse.h"
 #include "mm/heap.h"
 #include "lib/string.h"
+#include <linuxkpi/gpu_perf.h>
 #include "mm/pmm.h"
 #include "socket/af_netlink.h"
 #include "fs/sysfs.h"
+#include "fs/vfs.h"
 #include <stdint.h>
 #define GPU_CONTROLQ   0
 #define GPU_CURSORQ    1
@@ -50,6 +52,18 @@ static void gpu_scanout_release(void) {
 }
 static wait_queue_t gpu_worker_wait;
 static bool gpu_worker_started;
+static uint32_t gpu_async_flip_state;
+static bool gpu_flip_worker_started;
+static wait_queue_t gpu_flip_wait;
+static struct {
+    struct drm_framebuffer framebuffer;
+    struct drm_file *file;
+    struct vfs_node *node;
+    uint32_t crtc, head;
+    uint64_t cookie;
+    bool event;
+} gpu_async_flip;
+static void virtio_gpu_flip_worker(void);
 static bool gpu_irq_installed;
 enum gpu_irq_mode { GPU_IRQ_POLL, GPU_IRQ_INTX, GPU_IRQ_MSIX };
 static enum gpu_irq_mode gpu_irq_mode;
@@ -58,20 +72,64 @@ static volatile uint32_t gpu_pending_work;
 #define GPU_WORK_CONTROL (1U << 0)
 #define GPU_WORK_CURSOR  (1U << 1)
 #define GPU_WORK_CONFIG  (1U << 2)
+#define GPU_WORK_PERF    (1U << 3)
+void virtio_gpu_request_perf_dump(void) {
+    if (!gpu_worker_started)
+        return;
+    __atomic_fetch_or(&gpu_pending_work, GPU_WORK_PERF, __ATOMIC_RELEASE);
+    wait_queue_wake_all(&gpu_worker_wait);
+}
 static bool gpu_phase8_started, gpu_phase8_reported;
 static uint64_t gpu_phase8_started_ms;
 /* Protected by gpu_poll_lock. A timeout does not return DMA ownership: the
  * host may still read the request or write the response. Keep the shared
  * command pages unavailable until every submitted descriptor is returned. */
 static uint64_t gpu_sync_command_pending;
-static bool handle_sync_completion(void *cookie) {
+#define GPU_BATCH_COMMANDS 3U
+#define GPU_BATCH_SLOT_SIZE 256U
+#define GPU_BATCH_RESP_OFF 128U
+static uint64_t gpu_batch_fences[GPU_BATCH_COMMANDS];
+static uint32_t gpu_batch_pending;
+static bool gpu_batch_waiter, gpu_batch_failed;
+static bool gpu_present_batch_enabled;
+static bool handle_batch_completion(void *cookie, uint32_t used) {
+    for (uint32_t index = 0; index < GPU_BATCH_COMMANDS; index++) {
+        uint32_t bit = 1U << index;
+        if (!(gpu_batch_pending & bit) || cookie != &gpu_batch_fences[index])
+            continue;
+        struct virtio_gpu_ctrl_hdr *response = (void *)((uint8_t *)gpu.present_dma->virt +
+            index * GPU_BATCH_SLOT_SIZE + GPU_BATCH_RESP_OFF);
+        if (used != sizeof(*response) || !(response->flags & VIRTIO_GPU_FLAG_FENCE) ||
+            response->fence_id != gpu_batch_fences[index] ||
+            response->type != VIRTIO_GPU_RESP_OK_NODATA) {
+            gpu_batch_failed = true;
+            if (used == sizeof(*response) && response->type >= VIRTIO_GPU_RESP_ERR_UNSPEC &&
+                response->type <= VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER)
+                gpu.stats.host_errors++;
+            else
+                gpu.stats.invalid_responses++;
+        }
+        gpu_batch_pending &= ~bit;
+        gpu.stats.commands_completed++;
+        if (!gpu_batch_pending && !gpu_batch_waiter)
+            gpu.command_busy = false;
+        return true;
+    }
+    return false;
+}
+static uint32_t gpu_sync_command_used;
+static bool gpu_sync_command_waiter;
+static uint32_t gpu_command_owner;
+static wait_queue_t gpu_command_wait;
+static bool handle_sync_completion(void *cookie, uint32_t used) {
     uintptr_t tag = (uintptr_t)cookie;
     if (gpu_sync_command_pending && tag == gpu_sync_command_pending)
         gpu_sync_command_pending = 0;
     else
         return false;
     gpu.stats.commands_completed++;
-    if (!gpu_sync_command_pending)
+    gpu_sync_command_used = used;
+    if (!gpu_sync_command_waiter)
         gpu.command_busy = false;
     return true;
 }
@@ -79,7 +137,7 @@ static void gpu_reap_control_locked(void) {
     void *cookie;
     uint32_t used;
     while (virtq_poll_complete(&gpu.controlq, &cookie, &used))
-        if (!handle_sync_completion(cookie))
+        if (!handle_batch_completion(cookie, used) && !handle_sync_completion(cookie, used))
             gpu.stats.invalid_responses++;
 }
 static bool gpu_control_ready(void) {
@@ -94,6 +152,41 @@ static bool disable_scanout(uint32_t head);
 static bool response_valid(uint32_t t) {
     return (t >= VIRTIO_GPU_RESP_OK_NODATA && t <= VIRTIO_GPU_RESP_OK_MAP_INFO) ||
            (t >= VIRTIO_GPU_RESP_ERR_UNSPEC && t <= VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+}
+static void gpu_wait_for_control(uint64_t start) {
+    struct thread *self = sched_get_current();
+    if (!gpu_worker_started || !self || !hal_irq_enabled()) {
+        __asm__ volatile("pause");
+        return;
+    }
+    wait_queue_entry_t entry = {.thread = self};
+    uint64_t elapsed = lapic_timer_get_ms() - start;
+    if (elapsed >= GPU_TIMEOUT_MS)
+        return;
+    hal_irq_state_t irq_flags = hal_irq_save();
+    self->wakeup_ticks = lapic_timer_get_ticks() +
+        (gpu_irq_installed ? GPU_TIMEOUT_MS - elapsed : 1);
+    self->state = THREAD_BLOCKED;
+    wait_queue_add(&gpu_command_wait, &entry);
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    bool ready = (!gpu_sync_command_pending && !gpu_batch_pending) ||
+        gpu.controlq.last_used_idx != gpu.controlq.used->idx ||
+        lapic_timer_get_ms() - start >= GPU_TIMEOUT_MS;
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    if (ready) {
+        wait_queue_remove(&gpu_command_wait, &entry);
+        if (self->state == THREAD_BLOCKED)
+            self->state = THREAD_RUNNING;
+        self->wakeup_ticks = 0;
+        hal_irq_restore(irq_flags);
+    } else {
+        hal_irq_restore(irq_flags);
+        sched_yield();
+        wait_queue_remove(&gpu_command_wait, &entry);
+        if (self->state == THREAD_BLOCKED)
+            self->state = THREAD_RUNNING;
+    }
+    self->wakeup_ticks = 0;
 }
 static bool gpu_command_locked(
     const void *req, uint32_t req_len, void *resp, uint32_t resp_len, uint32_t *resp_type) {
@@ -119,17 +212,16 @@ static bool gpu_command_locked(
         return false;
     }
     gpu_sync_command_pending = seq;
+    gpu_sync_command_waiter = true;
+    gpu_sync_command_used = 0;
     gpu.stats.commands_submitted++;
 
     uint64_t start = lapic_timer_get_ms();
     for (;;) {
-        void *cookie = NULL;
-        uint32_t used_len = 0;
-        if (virtq_poll_complete(&gpu.controlq, &cookie, &used_len)) {
-            if ((uintptr_t)cookie != (uintptr_t)seq || !handle_sync_completion(cookie)) {
-                gpu.stats.invalid_responses++;
-                continue;
-            }
+        gpu_reap_control_locked();
+        if (!gpu_sync_command_pending) {
+            uint32_t used_len = gpu_sync_command_used;
+            gpu_sync_command_waiter = false;
             if (used_len < sizeof(struct virtio_gpu_ctrl_hdr) || used_len > resp_len) {
                 gpu.stats.invalid_responses++;
                 gpu.command_busy = false;
@@ -154,16 +246,91 @@ static bool gpu_command_locked(
         }
         if (lapic_timer_get_ms() - start >= GPU_TIMEOUT_MS) {
             gpu.stats.commands_timed_out++;
+            gpu_sync_command_waiter = false;
             return false;
         }
-        __asm__ volatile("pause");
+        LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+        gpu_wait_for_control(start);
+        LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     }
 }
 static bool
 gpu_command(const void *req, uint32_t req_len, void *resp, uint32_t resp_len, uint32_t *resp_type) {
+    while (__atomic_exchange_n(&gpu_command_owner, 1, __ATOMIC_ACQUIRE)) {
+        if (gpu_worker_started && sched_get_current() && hal_irq_enabled())
+            sched_yield();
+        else
+            __asm__ volatile("pause");
+    }
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     bool ok = gpu_command_locked(req, req_len, resp, resp_len, resp_type);
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    __atomic_store_n(&gpu_command_owner, 0, __ATOMIC_RELEASE);
+    return ok;
+}
+static bool gpu_command_batch(const void *const *requests, const uint32_t *lengths,
+                               uint32_t count) {
+    while (__atomic_exchange_n(&gpu_command_owner, 1, __ATOMIC_ACQUIRE)) {
+        if (gpu_worker_started && sched_get_current() && hal_irq_enabled())
+            sched_yield();
+        else
+            __asm__ volatile("pause");
+    }
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    gpu_reap_control_locked();
+    bool ok = false;
+    if (!gpu.initialized || !gpu.present_dma || gpu.command_busy ||
+        !count || count > GPU_BATCH_COMMANDS)
+        goto release;
+    for (uint32_t index = 0; index < count; index++)
+        if (!requests[index] || lengths[index] < sizeof(struct virtio_gpu_ctrl_hdr) ||
+            lengths[index] > GPU_BATCH_RESP_OFF)
+            goto release;
+    gpu.command_busy = true;
+    gpu_batch_waiter = true;
+    gpu_batch_failed = false;
+    uint32_t submitted = 0;
+    for (uint32_t index = 0; index < count; index++) {
+        uint8_t *slot = (uint8_t *)gpu.present_dma->virt + index * GPU_BATCH_SLOT_SIZE;
+        memset(slot, 0, GPU_BATCH_SLOT_SIZE);
+        memcpy(slot, requests[index], lengths[index]);
+        struct virtio_gpu_ctrl_hdr *header = (void *)slot;
+        gpu_batch_fences[index] = __atomic_add_fetch(&gpu.next_fence_id, 1, __ATOMIC_RELAXED);
+        header->flags |= VIRTIO_GPU_FLAG_FENCE;
+        header->fence_id = gpu_batch_fences[index];
+        struct virtq_iov outgoing = {gpu.present_dma->phys + index * GPU_BATCH_SLOT_SIZE, lengths[index]};
+        struct virtq_iov incoming = {gpu.present_dma->phys + index * GPU_BATCH_SLOT_SIZE +
+                                    GPU_BATCH_RESP_OFF, sizeof(*header)};
+        if (virtq_submit_deferred(&gpu.controlq, &outgoing, 1, &incoming, 1,
+                                  &gpu_batch_fences[index]) < 0)
+            break;
+        gpu_batch_pending |= 1U << index;
+        submitted++;
+        gpu.stats.commands_submitted++;
+    }
+    if (submitted)
+        virtq_kick(&gpu.controlq);
+    uint64_t start = lapic_timer_get_ms();
+    for (;;) {
+        gpu_reap_control_locked();
+        if (!gpu_batch_pending) {
+            ok = submitted == count && !gpu_batch_failed;
+            gpu_batch_waiter = false;
+            gpu.command_busy = false;
+            break;
+        }
+        if (lapic_timer_get_ms() - start >= GPU_TIMEOUT_MS) {
+            gpu.stats.commands_timed_out++;
+            gpu_batch_waiter = false;
+            break;
+        }
+        LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+        gpu_wait_for_control(start);
+        LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    }
+release:
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    __atomic_store_n(&gpu_command_owner, 0, __ATOMIC_RELEASE);
     return ok;
 }
 static struct pci_device *find_gpu(void) {
@@ -342,6 +509,8 @@ static void virtio_gpu_irq(struct registers *regs) {
         gpu.stats.config_interrupts++;
     }
     __atomic_fetch_or(&gpu_pending_work, pending, __ATOMIC_RELEASE);
+    if (pending & GPU_WORK_CONTROL)
+        wait_queue_wake_all(&gpu_command_wait);
     wait_queue_wake_one(&gpu_worker_wait);
 }
 
@@ -361,6 +530,8 @@ static void virtio_gpu_msix_irq(struct registers *regs) {
     }
     if (pending)
         __atomic_fetch_or(&gpu_pending_work, pending, __ATOMIC_RELEASE);
+    if (pending & GPU_WORK_CONTROL)
+        wait_queue_wake_all(&gpu_command_wait);
     wait_queue_wake_one(&gpu_worker_wait);
 }
 
@@ -418,6 +589,7 @@ bool virtio_gpu_init(void) {
     spinlock_init(&gpu_poll_lock);
     spinlock_init(&gpu_present_lock);
     wait_queue_init(&gpu_worker_wait);
+    wait_queue_init(&gpu_command_wait);
     struct pci_device *pci = find_gpu();
     if (!pci) {
         klog_puts("[VIRTIO-GPU] Modern PCI device 1af4:1050 not found\n");
@@ -456,6 +628,15 @@ bool virtio_gpu_init(void) {
         return false;
     }
     gpu.initialized = true;
+    extern const char *kernel_boot_cmdline;
+    const char *batch_option = kernel_boot_cmdline ?
+        strstr(kernel_boot_cmdline, "virtio_gpu.present_batch=1") : NULL;
+    size_t batch_length = sizeof("virtio_gpu.present_batch=1") - 1;
+    gpu_present_batch_enabled = batch_option &&
+        (batch_option == kernel_boot_cmdline || batch_option[-1] == ' ') &&
+        (batch_option[batch_length] == 0 || batch_option[batch_length] == ' ');
+    if (gpu_present_batch_enabled)
+        klog_puts("[VIRTIO-GPU] Batched scanout commands enabled; immutable DMA staging retained\n");
     if (!gpu_refresh_displays()) {
         klog_puts("[VIRTIO-GPU] GET_DISPLAY_INFO failed\n");
         virtio_pci_set_failed(&gpu.transport);
@@ -648,12 +829,7 @@ static bool scanout_destroy(uint32_t id, bool counted) {
         gpu.resources_live--;
     return true;
 }
-static bool scanout_select(uint32_t head, uint32_t id, uint32_t width, uint32_t height) {
-    bool ok = id ? set_scanout(head, id, width, height) : disable_scanout(head);
-    if (!ok) {
-        gpu.head_resource[head] = UINT32_MAX;
-        return false;
-    }
+static void scanout_record_selection(uint32_t head, uint32_t id) {
     gpu.head_resource[head] = id;
     gpu.queued_head_resource[head] = id;
     if (head == 0) {
@@ -664,12 +840,65 @@ static bool scanout_select(uint32_t head, uint32_t id, uint32_t width, uint32_t 
     for (uint32_t i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; i++)
         if (gpu.head_resource[i] && gpu.head_resource[i] != UINT32_MAX)
             gpu.owns_scanout = true;
+}
+static bool scanout_select(uint32_t head, uint32_t id, uint32_t width, uint32_t height) {
+    bool ok = id ? set_scanout(head, id, width, height) : disable_scanout(head);
+    if (!ok) {
+        gpu.head_resource[head] = UINT32_MAX;
+        return false;
+    }
+    scanout_record_selection(head, id);
     return true;
+}
+static int scanout_present_batch(uint32_t head, uint32_t id, uint32_t width,
+    uint32_t height, const struct vgpu_scanout_damage *damage, bool transfer, bool select) {
+    if (!gpu_present_batch_enabled)
+        return 0;
+    struct virtio_gpu_transfer_to_host_2d upload = {0};
+    struct virtio_gpu_set_scanout scanout = {0};
+    struct virtio_gpu_resource_flush flush = {0};
+    const void *requests[GPU_BATCH_COMMANDS];
+    uint32_t lengths[GPU_BATCH_COMMANDS];
+    uint32_t count = 0;
+    struct virtio_gpu_rect rect = {damage->x, damage->y, damage->width, damage->height};
+    if (!rect.width || !rect.height)
+        rect = (struct virtio_gpu_rect){0, 0, width, height};
+    if (transfer) {
+        init_hdr(&upload.hdr, VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
+        upload.r = rect;
+        upload.offset = ((uint64_t)rect.y * width + rect.x) * 4;
+        upload.resource_id = id;
+        requests[count] = &upload;
+        lengths[count++] = sizeof(upload);
+    }
+    if (select) {
+        init_hdr(&scanout.hdr, VIRTIO_GPU_CMD_SET_SCANOUT);
+        scanout.r = (struct virtio_gpu_rect){0, 0, width, height};
+        scanout.scanout_id = head;
+        scanout.resource_id = id;
+        requests[count] = &scanout;
+        lengths[count++] = sizeof(scanout);
+    }
+    init_hdr(&flush.hdr, VIRTIO_GPU_CMD_RESOURCE_FLUSH);
+    flush.r = rect;
+    flush.resource_id = id;
+    requests[count] = &flush;
+    lengths[count++] = sizeof(flush);
+    if (!gpu_command_batch(requests, lengths, count)) {
+        if (select)
+            gpu.head_resource[head] = UINT32_MAX;
+        return -1;
+    }
+    if (select)
+        scanout_record_selection(head, id);
+    return 1;
 }
 static const struct vgpu_scanout_ops scanout_ops = {
     .ready = gpu_control_ready, .resource_id = scanout_resource_id,
     .create = create_2d, .attach = attach_backing, .destroy = scanout_destroy,
     .transfer = transfer_2d, .select = scanout_select, .flush = flush_resource,
+    .transfer_rect = transfer_2d_rect, .flush_rect = flush_rect,
+    .present_batch = scanout_present_batch,
 };
 static void draw_pattern(uint32_t frame) {
     uint32_t *p = (uint32_t *)gpu.scanout_dma->virt;
@@ -1032,6 +1261,8 @@ static void virtio_gpu_worker(void) {
             gpu.stats.watchdog_polls++;
         if (pending & GPU_WORK_CONFIG)
             gpu_handle_config_event();
+        if (pending & GPU_WORK_PERF)
+            gpu_perf_dump();
         gpu_drain_completions();
         gpu_collect_scanouts();
         gpu_drain_cursor_completions();
@@ -1063,6 +1294,12 @@ bool virtio_gpu_phase6_start(void) {
         return false;
     strcpy(worker->comm, "virtio-gpu");
     gpu_worker_started = true;
+    wait_queue_init(&gpu_flip_wait);
+    struct thread *presenter = sched_create_kernel_thread(virtio_gpu_flip_worker, NULL, true);
+    if (!presenter)
+        return false;
+    strcpy(presenter->comm, "virtio-present");
+    gpu_flip_worker_started = true;
     if (gpu_irq_mode == GPU_IRQ_MSIX)
         klog_puts("[VIRTIO-GPU] Phase 6: MSI-X control/cursor/config, scanout-owned frame pairs\n");
     else if (gpu_irq_mode == GPU_IRQ_INTX)
@@ -1513,9 +1750,8 @@ static void virtio_gpu_complete_flip(uint32_t head) {
 static void virtio_gpu_commit_damage(struct drm_device *dev,
                                      const struct drm_clip_rect *clips,
                                      uint32_t n, uint32_t target) {
-    (void)clips;
-    (void)n;
     uint32_t head = 0;
+    bool snapshot_committed = false;
     struct virtio_gpu_rect view;
     struct drm_framebuffer snapshot;
     uint64_t entered = __atomic_add_fetch(&gpu_prime_enter_seq, 1, __ATOMIC_ACQ_REL);
@@ -1537,41 +1773,85 @@ static void virtio_gpu_commit_damage(struct drm_device *dev,
         .pitch = fb->pitch, .x = view.x, .y = view.y,
         .view_width = view.width, .view_height = view.height,
     };
+    struct vgpu_scanout_damage damage = {0};
+    bool have_damage = false;
+    if (clips && n && n <= 4096) {
+        uint32_t left = view.width, top = view.height, right = 0, bottom = 0;
+        for (uint32_t index = 0; index < n; index++) {
+            uint32_t x1 = clips[index].x1 > view.x ? clips[index].x1 : view.x;
+            uint32_t y1 = clips[index].y1 > view.y ? clips[index].y1 : view.y;
+            uint32_t x2 = clips[index].x2 < view.x + view.width ? clips[index].x2 : view.x + view.width;
+            uint32_t y2 = clips[index].y2 < view.y + view.height ? clips[index].y2 : view.y + view.height;
+            if (x1 >= x2 || y1 >= y2)
+                continue;
+            x1 -= view.x;
+            y1 -= view.y;
+            x2 -= view.x;
+            y2 -= view.y;
+            if (x1 < left) left = x1;
+            if (y1 < top) top = y1;
+            if (x2 > right) right = x2;
+            if (y2 > bottom) bottom = y2;
+            have_damage = true;
+        }
+        if (have_damage)
+            damage = (struct vgpu_scanout_damage){left, top, right - left, bottom - top};
+    }
     if (!vgpu_scanout_source_valid(&source))
         goto release_gem;
     struct vgpu_scanout_image *image = vgpu_scanout_prepare(&scanout_heads[head],
         &scanout_ops, head, view.width, view.height);
-    if (!image || ascentdrm_gem_begin_cpu(fb->gem_obj))
+    if (!image)
         goto release_gem;
+    uint64_t sync_start = lapic_timer_get_ns();
+    if (ascentdrm_gem_begin_cpu(fb->gem_obj))
+        goto release_gem;
+    uint64_t copy_start = lapic_timer_get_ns();
+    uint64_t sync_ns = copy_start - sync_start;
     /* Only this copy holds the producer reservation. QEMU reads independent,
      * tightly packed staging after the reservation is released. Both native
      * and imported framebuffers use exactly the same publication engine. */
-    bool copied = vgpu_scanout_copy(image, &source);
+    bool copied = vgpu_scanout_copy_damage(&scanout_heads[head], image, &source,
+        fb->base.id, have_damage ? &damage : NULL);
+    uint64_t copy_end = lapic_timer_get_ns();
     ascentdrm_gem_end_cpu(fb->gem_obj);
+    sync_ns += lapic_timer_get_ns() - copy_end;
     if (!copied)
         goto release_gem;
     if (coalesce && __atomic_load_n(&gpu_prime_enter_seq, __ATOMIC_ACQUIRE) != entered)
         goto release_gem;
     uint64_t start = lapic_timer_get_ms();
+    uint64_t present_start = lapic_timer_get_ns();
     bool ok = vgpu_scanout_publish(&scanout_heads[head], &scanout_ops, head, image);
     /* Retry an immutable snapshot once. A flush retry never re-uploads a
      * selected image; a timed-out transfer prevents any retry until returned. */
     if (!ok && gpu_control_ready())
         ok = vgpu_scanout_publish(&scanout_heads[head], &scanout_ops, head, image);
     uint64_t elapsed = lapic_timer_get_ms() - start;
+    uint64_t present_ns = lapic_timer_get_ns() - present_start;
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     gpu.stats.present_batches++;
+    gpu.stats.producer_sync_ns += sync_ns;
+    gpu.stats.snapshot_copy_ns += copy_end - copy_start;
+    gpu.stats.transport_wait_ns += present_ns;
     gpu.stats.present_wait_ms += elapsed;
     if (elapsed > gpu.stats.max_present_wait_ms)
         gpu.stats.max_present_wait_ms = elapsed;
     if (ok) {
+        snapshot_committed = true;
         gpu.stats.frames_presented++;
-        gpu.stats.damage_pixels += (uint64_t)view.width * view.height;
+        gpu.stats.damage_pixels += (uint64_t)image->upload.width * image->upload.height;
+        gpu.stats.scanout_pixels += (uint64_t)view.width * view.height;
+        gpu.stats.compared_pixels += image->compared_pixels;
+        if (!image->upload.width)
+            gpu.stats.unchanged_frames++;
     } else {
         gpu.stats.present_failures++;
     }
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
 release_gem:
+    if (!snapshot_committed && head < VIRTIO_GPU_MAX_SCANOUTS)
+        vgpu_scanout_invalidate(&scanout_heads[head]);
     virtio_gpu_complete_flip(head);
     gpu_scanout_release();
     if (ascentdrm_gem_put_last(fb->gem_obj))
@@ -1581,6 +1861,96 @@ release_scanout:
     virtio_gpu_complete_flip(head);
     gpu_scanout_release();
 }
+static int virtio_gpu_submit_flip(struct drm_file *file, struct vfs_node *node,
+                                  uint32_t crtc, struct drm_framebuffer *framebuffer,
+                                  uint64_t cookie, bool event) {
+    if (!gpu_flip_worker_started || !framebuffer || !framebuffer->gem_obj)
+        return -95;
+    uint32_t head = ascentdrm_crtc_scanout_id(crtc);
+    struct vgpu_scanout_source source = {
+        .pixels = framebuffer->gem_obj->virt_addr, .size = framebuffer->gem_obj->size,
+        .offset = framebuffer->backing_offset, .width = framebuffer->width,
+        .height = framebuffer->height, .pitch = framebuffer->pitch,
+        .view_width = framebuffer->width, .view_height = framebuffer->height,
+    };
+    if (head >= gpu.num_scanouts || head >= VIRTIO_GPU_MAX_SCANOUTS ||
+        framebuffer->bpp != 32 || !vgpu_scanout_source_valid(&source))
+        return -22;
+    uint32_t available = 0;
+    if (!__atomic_compare_exchange_n(&gpu_async_flip_state, &available, 3, false,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return -16;
+    gpu_async_flip.framebuffer = *framebuffer;
+    ascentdrm_gem_get(framebuffer->gem_obj);
+    vfs_node_ref(node);
+    gpu_async_flip.file = file;
+    gpu_async_flip.node = node;
+    gpu_async_flip.crtc = crtc;
+    gpu_async_flip.head = head;
+    gpu_async_flip.cookie = cookie;
+    gpu_async_flip.event = event;
+    __atomic_store_n(&gpu_async_flip_state, 1, __ATOMIC_RELEASE);
+    wait_queue_wake_all(&gpu_flip_wait);
+    return 0;
+}
+
+static void virtio_gpu_flip_worker(void) {
+    struct thread *self = sched_get_current();
+    wait_queue_entry_t entry = {.thread = self};
+    for (;;) {
+        self->state = THREAD_BLOCKED;
+        wait_queue_add(&gpu_flip_wait, &entry);
+        if (__atomic_load_n(&gpu_async_flip_state, __ATOMIC_ACQUIRE) != 1) {
+            self->wakeup_ticks = 0;
+            sched_yield();
+        }
+        wait_queue_remove(&gpu_flip_wait, &entry);
+        self->state = THREAD_RUNNING;
+        if (__atomic_load_n(&gpu_async_flip_state, __ATOMIC_ACQUIRE) != 1)
+            continue;
+        __atomic_store_n(&gpu_async_flip_state, 2, __ATOMIC_RELEASE);
+        struct drm_framebuffer *framebuffer = &gpu_async_flip.framebuffer;
+        struct drm_gem_object *object = framebuffer->gem_obj;
+        struct vgpu_scanout_source source = {
+            .pixels = object->virt_addr, .size = object->size,
+            .offset = framebuffer->backing_offset, .width = framebuffer->width,
+            .height = framebuffer->height, .pitch = framebuffer->pitch,
+            .view_width = framebuffer->width, .view_height = framebuffer->height,
+        };
+        ascentdrm_console_takeover();
+        gpu_scanout_acquire();
+        struct vgpu_scanout_image *image = vgpu_scanout_prepare(
+            &scanout_heads[gpu_async_flip.head], &scanout_ops, gpu_async_flip.head,
+            framebuffer->width, framebuffer->height);
+        bool published = false;
+        if (image && !ascentdrm_gem_begin_cpu(object)) {
+            bool copied = vgpu_scanout_copy(image, &source);
+            ascentdrm_gem_end_cpu(object);
+            if (copied)
+                published = vgpu_scanout_publish(&scanout_heads[gpu_async_flip.head],
+                    &scanout_ops, gpu_async_flip.head, image);
+        }
+        gpu_scanout_release();
+        if (published && gpu_async_flip.event) {
+            vblank_wait_next();
+            struct drm_event_vblank event = {0};
+            event.base.type = DRM_EVENT_FLIP_COMPLETE;
+            event.base.length = sizeof(event);
+            event.user_data = gpu_async_flip.cookie;
+            event.sequence = vblank_sequence();
+            vblank_timestamp(event.sequence, &event.tv_sec, &event.tv_usec);
+            event.crtc_id = gpu_async_flip.crtc;
+            ascentdrm_file_send_event(gpu_async_flip.file, &event, gpu_async_flip.node);
+        }
+        if (!published)
+            klog_puts("[FAIL] VirtIO asynchronous flip publication failed\n");
+        if (ascentdrm_gem_put_last(object))
+            ascentdrm_gem_object_free(gpu_async_flip.file->dev, object);
+        vfs_close(gpu_async_flip.node);
+        __atomic_store_n(&gpu_async_flip_state, 0, __ATOMIC_RELEASE);
+    }
+}
+
 static uint32_t gpu_append_dec(char *buf, uint32_t pos, uint32_t cap, uint32_t v) {
     char t[12];
     uint32_t n = 0;
@@ -1673,6 +2043,7 @@ bool virtio_gpu_phase4_bind_drm(void) {
                                  virtio_gpu_commit_damage,
                                  virtio_gpu_get_modes,
                                  virtio_gpu_queue_flip);
+    ascentdrm_register_async_flip(virtio_gpu_submit_flip);
     klog_puts("[VIRTIO-GPU] Phase 4 DRM/GEM backend bound; GOP retained until first KMS commit\n");
     return true;
 }

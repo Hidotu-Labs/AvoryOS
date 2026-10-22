@@ -147,8 +147,8 @@ bool fd_path_set(struct thread *t, int fd, const char *value) {
     strncpy(path->value, value, sizeof(path->value) - 1);
     path->value[sizeof(path->value) - 1] = '\0';
   }
-  struct fd_path *old = t->fd_paths[fd];
-  t->fd_paths[fd] = path;
+  struct fd_path *old = t->files->fd_paths[fd];
+  t->files->fd_paths[fd] = path;
   fd_path_put(old);
   return true;
 }
@@ -162,26 +162,30 @@ void fd_path_dup(struct thread *t, int dst, int src) {
     if (!fd_table_expand_locked(t->files, (uint32_t)dst))
       return;
   }
-  struct fd_path *path = t->fd_paths[src];
+  /* Authoritative table pointers: a concurrent CLONE_FILES sibling may have
+   * swapped the arrays via fd_table_expand_locked; the per-thread cache
+   * (t->fd_paths) then aliases the freed, recycled old buffer. */
+  struct fd_path *path = t->files->fd_paths[src];
   if (path)
     __atomic_add_fetch(&path->ref_count, 1, __ATOMIC_RELAXED);
-  struct fd_path *old = t->fd_paths[dst];
-  t->fd_paths[dst] = path;
+  struct fd_path *old = t->files->fd_paths[dst];
+  t->files->fd_paths[dst] = path;
   fd_path_put(old);
 }
 
 void fd_path_clear(struct thread *t, int fd) {
   if (!t || !t->files || fd < 0 || (uint32_t)fd >= t->files->capacity)
     return;
-  struct fd_path *old = t->fd_paths[fd];
-  t->fd_paths[fd] = NULL;
+  struct fd_path *old = t->files->fd_paths[fd];
+  t->files->fd_paths[fd] = NULL;
   fd_path_put(old);
 }
 
 const char *fd_path_value(struct thread *t, int fd) {
-  if (!t || !t->files || fd < 0 || (uint32_t)fd >= t->files->capacity || !t->fd_paths[fd])
+  if (!t || !t->files || fd < 0 ||
+      (uint32_t)fd >= t->files->capacity || !t->files->fd_paths[fd])
     return NULL;
-  return t->fd_paths[fd]->value;
+  return t->files->fd_paths[fd]->value;
 }
 
 bool sched_ensure_files(struct thread *t) {

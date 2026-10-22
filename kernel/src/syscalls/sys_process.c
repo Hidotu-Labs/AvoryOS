@@ -4301,6 +4301,7 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
   case LINUX_REBOOT_CMD_RESTART:
   case LINUX_REBOOT_CMD_RESTART2:
     klog_puts("[REBOOT] System reboot requested via syscall.\n");
+    vmm_defer_sync();
 #ifdef LINUXKPI_LINUX_IMPORTED
     linuxkpi_pci_shutdown();
 #endif
@@ -4312,6 +4313,7 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 
   case LINUX_REBOOT_CMD_POWER_OFF:
     klog_puts("[REBOOT] System power-off requested via syscall.\n");
+    vmm_defer_sync();
 #ifdef LINUXKPI_LINUX_IMPORTED
     linuxkpi_pci_shutdown();
 #endif
@@ -4323,6 +4325,7 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 
   case LINUX_REBOOT_CMD_HALT:
     klog_puts("[REBOOT] System halt requested via syscall.\n");
+    vmm_defer_sync();
 #ifdef LINUXKPI_LINUX_IMPORTED
     linuxkpi_pci_shutdown();
 #endif

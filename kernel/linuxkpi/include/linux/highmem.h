@@ -29,6 +29,11 @@ static inline void kunmap(struct page *page) { (void)page; }
 static inline void *kmap_local_page(struct page *page) {
   return page_address(compound_head(page));
 }
+/* Native lowmem mappings already exist in HHDM and require no allocation or
+ * lock, so the panic-safe try form can use the same translation. */
+static inline void *kmap_local_page_try_from_panic(struct page *page) {
+  return kmap_local_page(page);
+}
 static inline void *kmap_local_page_prot(struct page *page, pgprot_t prot) {
   (void)prot;
   return page_address(compound_head(page));

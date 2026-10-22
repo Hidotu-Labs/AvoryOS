@@ -23,6 +23,39 @@ struct linuxkpi_kthread_boot {
  * absent in a kernel built without it. */
 extern void linuxkpi_jiffies_sync(void) __attribute__((weak));
 
+#ifndef LINUXKPI_LINUX_IMPORTED
+/* Native mprotect also pins its deferred TLB queue across the unlock/drain
+ * window. Keep that protection available without the Linux import. */
+static unsigned int native_preempt_counts[MAX_CPUS];
+
+static unsigned int *native_preempt_counter(void) {
+  struct cpu_info *cpu = cpu_get_current();
+  unsigned int id = cpu ? cpu->cpu_id : 0;
+  return &native_preempt_counts[id < MAX_CPUS ? id : 0];
+}
+
+void __kpi_preempt_disable(void) {
+  hal_irq_state_t flags = hal_irq_save();
+  __atomic_add_fetch(native_preempt_counter(), 1, __ATOMIC_ACQ_REL);
+  hal_irq_restore(flags);
+}
+
+void __kpi_preempt_enable(void) {
+  hal_irq_state_t flags = hal_irq_save();
+  unsigned int *count = native_preempt_counter();
+  if (__atomic_load_n(count, __ATOMIC_RELAXED))
+    __atomic_sub_fetch(count, 1, __ATOMIC_ACQ_REL);
+  hal_irq_restore(flags);
+}
+
+bool linuxkpi_preempt_allowed(void) {
+  hal_irq_state_t flags = hal_irq_save();
+  bool allowed = !__atomic_load_n(native_preempt_counter(), __ATOMIC_RELAXED);
+  hal_irq_restore(flags);
+  return allowed;
+}
+#endif
+
 void *linuxkpi_current_thread(void) { return sched_get_current(); }
 
 void linuxkpi_yield(void) { sched_yield(); }

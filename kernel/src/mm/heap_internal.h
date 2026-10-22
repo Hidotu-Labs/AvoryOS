@@ -36,12 +36,6 @@ struct slab_cache {
 };
 
 #define CACHE_COUNT 6
-#define LOCAL_CACHE_CAPACITY 16
-
-struct cpu_local_slab {
-  uint16_t count;
-  void *entries[LOCAL_CACHE_CAPACITY];
-};
 
 struct big_alloc {
   uint64_t magic;
@@ -54,8 +48,22 @@ struct big_alloc {
 extern bool heap_initialized;
 extern spinlock_t heap_vmem_lock;
 extern struct slab_cache heap_caches[CACHE_COUNT];
-extern struct cpu_local_slab heap_cpu_slab_caches[MAX_CPUS][CACHE_COUNT];
 extern struct big_alloc *heap_big_alloc_head;
+
+/* Opt-in per-size-class object diagnostics for self-tests.  Every hook is
+ * guarded by one branch over a cold volatile, so the default allocation
+ * paths keep their exact shape; the counters are diagnostic slop only. */
+struct heap_slab_dbg {
+  unsigned long alloc_pcpu; /* fast-path per-CPU freeslot pops */
+  unsigned long alloc_slab; /* slow-path served by partial/free slabs */
+  unsigned long alloc_new;  /* slow-path backed by a fresh PMM page */
+  unsigned long free_park;  /* parked into the per-CPU cache */
+  unsigned long free_slab;  /* delivered to the slab lists */
+  unsigned long new_slabs;  /* fresh slab pages taken from PMM */
+};
+extern volatile int heap_slab_dbg_on;
+void heap_slab_dbg_reset(void);
+void heap_slab_dbg_dump(const char *tag);
 
 /* Trace & debugging */
 void heap_trace_record(void *ptr, void *caller);

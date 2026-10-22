@@ -8,6 +8,8 @@
  * amdgpu_ucode.c includes firmware.h first, so pull them explicitly and then
  * the stock header.  No other change. */
 
+#include <linux/ctype.h>
+#include <linux/elf.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 

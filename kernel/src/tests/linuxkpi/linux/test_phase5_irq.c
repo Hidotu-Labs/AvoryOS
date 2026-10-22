@@ -19,6 +19,9 @@
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/pci.h>
+#ifndef PCI_IRQ_LEGACY
+#define PCI_IRQ_LEGACY PCI_IRQ_INTX
+#endif
 #include <linux/string.h>
 
 #include <linuxkpi/log.h>
@@ -344,6 +347,38 @@ void linuxkpi_test_phase5_irq(void) {
   } else {
     p5i_fail("stress allocation", ret);
     pci_free_irq_vectors(edu);
+  }
+
+  /* Nouveau uses the legacy MSI API and reads pdev->irq directly. */
+  {
+    unsigned int legacy_irq = edu->irq;
+    int before = p5i_ctx_a.count;
+    ret = pci_enable_msi(edu);
+    if (ret == 0) {
+      if (!edu->msi_enabled || edu->irq != (unsigned int)pci_irq_vector(edu, 0)) {
+        p5i_fail("legacy MSI publishes pdev IRQ", edu->irq);
+      } else {
+        ret = request_irq(edu->irq, p5i_handler, IRQF_SHARED,
+                            "p5irq-legacy-msi", &p5i_ctx_a);
+        if (!ret) {
+          p5i_raise();
+          if (p5i_wait(&p5i_ctx_a.count, before + 1, 100))
+            p5i_ok("legacy MSI pdev IRQ delivers interrupt");
+          else
+            p5i_fail("legacy MSI interrupt missing", p5i_ctx_a.count);
+          free_irq(edu->irq, &p5i_ctx_a);
+        } else {
+          p5i_fail("legacy MSI request_irq", ret);
+        }
+      }
+      pci_disable_msi(edu);
+      if (edu->irq == legacy_irq && !edu->msi_enabled)
+        p5i_ok("legacy MSI disable restores INTx identity");
+      else
+        p5i_fail("legacy MSI disable identity", edu->irq);
+    } else {
+      p5i_fail("legacy MSI allocation", ret);
+    }
   }
 
 out_unmap:

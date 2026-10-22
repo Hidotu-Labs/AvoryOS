@@ -49,4 +49,8 @@ static inline bool rwsem_is_locked(const struct rw_semaphore *sem) {
   return sem->owner != NULL || sem->readers != 0;
 }
 
+static inline bool rwsem_is_contended(const struct rw_semaphore *sem) {
+  return !list_empty_careful(&sem->wait.head);
+}
+
 #endif /* __AVORY_LINUXKPI_RWSEM_H */

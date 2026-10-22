@@ -49,7 +49,11 @@ static bool test_vmalloc_cycles(void) {
     vfree(p);
   }
 
-  return asc_pmm_get_free_pages() == before;
+  unsigned long after = asc_pmm_get_free_pages();
+  if (after != before)
+    klogf("[INFO] LinuxKPI: vmalloc cycles PMM before=%lu after=%lu delta=%ld\n",
+          before, after, (long)before - (long)after);
+  return after == before;
 }
 
 /* ── a large allocation (exercises many PTEs and >1 area) ───────────────── */

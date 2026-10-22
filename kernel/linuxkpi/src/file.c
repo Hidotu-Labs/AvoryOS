@@ -39,6 +39,7 @@
 #include <linuxkpi/native_sched.h>
 #include <linuxkpi/log.h>
 #include <linuxkpi/gpu_diag.h>
+#include <linuxkpi/gpu_perf.h>
 #include <linux/uaccess.h>
 #include <drm/drm_file.h>
 #include <drm/drm_drv.h>
@@ -69,7 +70,11 @@ static struct file *kpi_file_alloc(const char *name,
     return NULL;
   }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+  file_ref_init(&file->f_ref, 1);
+#else
   atomic_set(&file->f_count, 1);
+#endif
   file->f_op = fops;
   file->private_data = priv;
   file->f_flags = flags;
@@ -119,16 +124,45 @@ static void kpi_file_free(struct file *file) {
 
 struct file *get_file(struct file *file) {
   if (file)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+    file_ref_inc(&file->f_ref);
+#else
     atomic_inc(&file->f_count);
+#endif
   return file;
 }
 
 void fput(struct file *file) {
   if (!file)
     return;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+  if (file_ref_put(&file->f_ref))
+#else
   if (atomic_dec_and_test(&file->f_count))
+#endif
     kpi_file_free(file);
 }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+/* Linux v6.18 fs/file.c reference-count slow path. Use the stock file_ref.h
+ * protocol, including its terminal and saturation zones; freeing remains
+ * native and occurs only after a successful final-reference transition. */
+bool __file_ref_put(file_ref_t *ref, unsigned long cnt) {
+  if (likely(cnt == FILE_REF_NOREF)) {
+    if (!atomic_long_try_cmpxchg_release(&ref->refcnt, &cnt, FILE_REF_DEAD))
+      return false;
+    smp_acquire__after_ctrl_dep();
+    return true;
+  }
+  if (WARN_ONCE(cnt >= FILE_REF_RELEASED, "imbalanced file reference put")) {
+    atomic_long_set(&ref->refcnt, FILE_REF_DEAD);
+    return false;
+  }
+  if (cnt > FILE_REF_MAXREF)
+    atomic_long_set(&ref->refcnt, FILE_REF_SATURATED);
+  return false;
+}
+#endif
 
 void fput_many(struct file *file, unsigned int refs) {
   while (refs--)
@@ -491,7 +525,9 @@ int linuxkpi_file_ioctl(void *node, unsigned int request, unsigned long arg) {
     if (cs) gpu_diag_record(GPU_DIAG_CS_IN,file,input.in.ctx_id,input.in.bo_list_handle,
                             input.in.num_chunks,input.in.flags,0);
   }
+  __UINT64_TYPE__ perf_start = gpu_perf_ioctl_start(request);
   int ret=(int)file->f_op->unlocked_ioctl(file,request,arg);
+  gpu_perf_ioctl_finish(request, perf_start, ret);
   if (trace) gpu_diag_record(GPU_DIAG_IOCTL,file,request,arg,
                              linuxkpi_monotonic_ms()-start,0,ret);
   if (trace && ret < 0) {
@@ -684,11 +720,11 @@ unsigned long linuxkpi_file_mmap_file(void *opaque_file, unsigned long addr,
   int ret;
 
   if (!file || !file->f_op || !file->f_op->mmap)
-    return (unsigned long)MAP_FAILED;
+    return (unsigned long)-ENODEV;
 
   bridge = kzalloc(sizeof(*bridge), GFP_KERNEL);
   if (!bridge)
-    return (unsigned long)MAP_FAILED;
+    return (unsigned long)-ENOMEM;
 
   bridge->refs = 1;
   bridge->closed = false;
@@ -703,7 +739,7 @@ unsigned long linuxkpi_file_mmap_file(void *opaque_file, unsigned long addr,
   if (ret) {
     fput(bridge->vma.vm_file);
     kfree(bridge);
-    return (unsigned long)MAP_FAILED;
+    return (unsigned long)(ret < 0 ? ret : -EINVAL);
   }
 
   linuxkpi_vma_set_pending(bridge);

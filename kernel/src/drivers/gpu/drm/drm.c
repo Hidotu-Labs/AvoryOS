@@ -60,6 +60,10 @@ static void drm_console_takeover(void) {
   fb_clear(0x00000000u);
 }
 
+void ascentdrm_console_takeover(void) {
+  drm_console_takeover();
+}
+
 static inline uint64_t drm_read_cycles(void) {
   uint32_t lo, hi;
   __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) : : "memory");
@@ -131,6 +135,11 @@ extern int ascentdrm_ioctl_addfb2(struct drm_file *file, struct drm_device *dev,
 drm_commit_damage_fn_t g_ascent_drm_commit_damage_fn = NULL;
 
 drm_pageflip_fn_t g_ascent_drm_pageflip_fn = NULL;
+static drm_async_flip_fn_t drm_async_flip;
+
+void ascentdrm_register_async_flip(drm_async_flip_fn_t submit) {
+  drm_async_flip = submit;
+}
 
 drm_cursor_fn_t g_ascent_drm_cursor_fn = NULL;
 
@@ -2135,6 +2144,8 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   case DRM_IOCTL_MODE_PAGE_FLIP: {
     struct drm_mode_crtc_page_flip *flip =
         (struct drm_mode_crtc_page_flip *)arg;
+    if (flip->flags & ~DRM_MODE_PAGE_FLIP_EVENT)
+      return -22;
 #if DRM_DEBUG_LOGGING
     klog_debug_puts("[DRM] PAGE_FLIP crtc=");
     klog_debug_uint64(flip->crtc_id);
@@ -2156,6 +2167,18 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       return -1;
     }
     struct drm_crtc *crtc = (struct drm_crtc *)crtc_obj;
+    if (drm_async_flip) {
+      int ret = drm_async_flip(file, node, flip->crtc_id,
+                              (struct drm_framebuffer *)fb_obj,
+                              flip->user_data, (flip->flags & DRM_MODE_PAGE_FLIP_EVENT) != 0);
+      if (!ret) {
+        crtc->fb = (struct drm_framebuffer *)fb_obj;
+        if (g_ascent_drm_set_fb_fn)
+          g_ascent_drm_set_fb_fn(crtc->base.id, crtc->fb);
+      }
+      spinlock_release(&dev->lock);
+      return ret;
+    }
     crtc->fb = (struct drm_framebuffer *)fb_obj;
     if (g_ascent_drm_set_fb_fn)
       g_ascent_drm_set_fb_fn(crtc->base.id, crtc->fb);

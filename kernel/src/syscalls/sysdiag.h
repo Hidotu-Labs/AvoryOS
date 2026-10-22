@@ -88,6 +88,9 @@ typedef struct {
   uint64_t last_seen_ms;
   bool is_severe;
   bool used;
+  /* At least one recorded call on this key was answered by a seccomp
+   * RET_ERRNO decision before dispatch; the handler never ran for it. */
+  bool via_seccomp;
 } sysdiag_syscall_error_t;
 
 void sysdiag_init(void);

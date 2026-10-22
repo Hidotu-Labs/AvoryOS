@@ -22,6 +22,10 @@
 #include <linux/kernel.h>
 #include <asm/vdso/processor.h>
 #include <asm/processor.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#include <asm/topology.h>
+#endif
 #include <uapi/linux/sched.h>
 #include <uapi/linux/signal.h>
 

@@ -1,0 +1,30 @@
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
+@@ -1630,6 +1630,13 @@
+ #endif
+ }
+ 
++/* OpenRM reports both fields for a PCI GPU assigned to a KVM guest.
++ * Keep this explicit: a physical machine must not acquire passthrough
++ * semantics merely because this driver was built for AvoryOS. */
++static bool gsp_kvm_passthrough;
++module_param(gsp_kvm_passthrough, bool, 0400);
++MODULE_PARM_DESC(gsp_kvm_passthrough, "Report KVM PCI passthrough to GSP-RM");
++
+ static int
+ r535_gsp_rpc_set_system_info(struct nvkm_gsp *gsp)
+ {
+@@ -1651,6 +1658,13 @@
+ 	info->maxUserVa = TASK_SIZE;
+ 	info->pciConfigMirrorBase = 0x088000;
+ 	info->pciConfigMirrorSize = 0x001000;
++	if (gsp_kvm_passthrough) {
++		/* OS_HYPERVISOR_KVM in NVIDIA's 535 nv-hypervisor.h enum. */
++		info->hypervisorType = 3;
++		info->bIsPassthru = true;
++	}
++	nvkm_info(&gsp->subdev, "system info: hypervisor=%u passthrough=%u\n",
++		  info->hypervisorType, info->bIsPassthru);
+ 	r535_gsp_acpi_info(gsp, &info->acpiMethodData);
+ 
+ 	return nvkm_gsp_rpc_wr(gsp, info, false);

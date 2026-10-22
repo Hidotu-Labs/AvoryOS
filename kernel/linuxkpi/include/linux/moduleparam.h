@@ -5,7 +5,8 @@
  *
  * Parameters and __setup()/early_param() handlers are collected in the
  * .kpi_params/.kpi_setups sections (see kernel/linker-scripts/x86_64.lds) and
- * applied once at boot from the Limine command line by linuxkpi_param_init()
+ * carry KBUILD_MODNAME namespaces and are applied once at boot from the
+ * Limine command line by linuxkpi_param_init()
  * (linuxkpi/src/params.c).  Arrays and callbacks (module_param_array,
  * module_param_cb) are not provided yet; add them when a driver needs one. */
 
@@ -29,12 +30,17 @@ enum kpi_param_type {
   KPI_PARAM_ullong, /* unsigned long long (amdgpu's 64-bit params) */
 };
 
+#ifndef KBUILD_MODNAME
+#define KBUILD_MODNAME "avoryos"
+#endif
+
 struct kpi_param {
   const char *name;
   void *value;
   unsigned short type;
   unsigned short maxlen; /* for KPI_PARAM_string buffers */
   unsigned int perm;
+  const char *module;
 };
 
 struct kpi_setup {
@@ -49,7 +55,7 @@ struct kpi_setup {
 
 #define module_param_named(name, value, type, perm)                           \
   static const struct kpi_param __kpi_param_##name __kpi_param_section = {    \
-      #name, &(value), KPI_PARAM_##type, 0, (perm)}
+      #name, &(value), KPI_PARAM_##type, 0, (perm), KBUILD_MODNAME}
 
 #define module_param(name, type, perm)                                        \
   module_param_named(name, name, type, perm)
@@ -67,7 +73,7 @@ struct kpi_setup {
 
 #define module_param_string(name, string, len, perm)                          \
   static const struct kpi_param __kpi_param_##name __kpi_param_section = {    \
-      #name, (string), KPI_PARAM_string, (len), (perm)}
+      #name, (string), KPI_PARAM_string, (len), (perm), KBUILD_MODNAME}
 
 /* Descriptions are module metadata; with CONFIG_MODULES=n they expand to
  * nothing, matching upstream's __MODULE_INFO in a static kernel.  Must stay a

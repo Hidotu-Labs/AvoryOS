@@ -10,6 +10,17 @@
 #include <drm/ttm/ttm_bo.h>
 #include <drm/ttm/ttm_device.h>
 #include <drm/ttm/ttm_resource.h>
+#include <linux/version.h>
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+/* Newer upstream eviction no longer has the empty-manager bug. */
+int linuxkpi_original_ttm_resource_manager_evict_all(
+    struct ttm_device *bdev, struct ttm_resource_manager *man);
+int ttm_resource_manager_evict_all(struct ttm_device *bdev,
+                                  struct ttm_resource_manager *man) {
+  return linuxkpi_original_ttm_resource_manager_evict_all(bdev, man);
+}
+#else
 
 int ttm_resource_manager_evict_all(struct ttm_device *bdev,
 				   struct ttm_resource_manager *man)
@@ -56,3 +67,4 @@ int ttm_resource_manager_evict_all(struct ttm_device *bdev,
 
 	return 0;
 }
+#endif

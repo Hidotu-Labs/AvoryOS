@@ -55,6 +55,9 @@ if [ -d "$SRC/.git" ]; then
         git -C "$SRC" fetch --depth 1 origin "$REF"
         git -C "$SRC" checkout --detach FETCH_HEAD
     fi
+    if [ "$(git -C "$SRC" config --get core.sparseCheckout || true)" = true ]; then
+        printf '/%s\n' "${entries[@]#*=}" | git -C "$SRC" sparse-checkout add --stdin
+    fi
 elif [ -d "$SRC" ]; then
     log "using plain firmware tree at $SRC (no git metadata)"
 else
@@ -98,6 +101,8 @@ install_one() {
 }
 
 for entry in "${entries[@]}"; do
+    pattern="${entry#*=}"
+    requested="${entry%%=*}"
     found=0
     # Expand the entry as a glob, accepting compressed members too.  Plain
     # names win when both exist: the plain pass runs first and duplicates
@@ -108,12 +113,15 @@ for entry in "${entries[@]}"; do
             out="$m"
             out="${out%.zst}"
             out="${out%.xz}"
+            if [ "$pattern" != "$entry" ]; then
+                out="$requested"
+            fi
             if grep -qxF "$out" "$staged_list"; then
                 continue
             fi
             install_one "$m" "$out"
             found=$((found + 1))
-        done < <(cd "$SRC" && compgen -G "$entry$suffix" || true)
+        done < <(cd "$SRC" && compgen -G "$pattern$suffix" || true)
     done
 
     if [ "$found" -eq 0 ]; then

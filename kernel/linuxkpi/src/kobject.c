@@ -336,6 +336,30 @@ int sysfs_create_group(struct kobject *kobj,
   return kpi_create_group_at(kobj, dir, grp);
 }
 
+int sysfs_update_group(struct kobject *kobj, const struct attribute_group *grp) {
+  void *dir;
+  int i;
+  if (!kobj || !grp)
+    return -EINVAL;
+  dir = kobj->sd;
+  if (!dir)
+    return 0;
+  if (grp->name) {
+    dir = asc_sysfs_device_dir(dir, grp->name);
+    if (!dir)
+      return -ENOMEM;
+  }
+  /* Remove every old entry, including attributes that became invisible;
+   * creation below reevaluates visibility before publishing replacements. */
+  if (grp->attrs)
+    for (i = 0; grp->attrs[i]; i++)
+      kpi_remove_attr_at(dir, grp->attrs[i]->name);
+  if (grp->bin_attrs)
+    for (i = 0; grp->bin_attrs[i]; i++)
+      kpi_remove_attr_at(dir, grp->bin_attrs[i]->attr.name);
+  return kpi_create_group_at(kobj, dir, grp);
+}
+
 int sysfs_create_groups(struct kobject *kobj,
                         const struct attribute_group **groups) {
   int i;

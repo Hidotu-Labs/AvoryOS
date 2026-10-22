@@ -33,3 +33,8 @@ amdgpu/psp_13_0_5_ta.bin
 amdgpu/sdma_5_2_6.bin
 amdgpu/vcn_3_1_2.bin
 amdgpu/dcn_3_1_5_dmcub.bin
+nvidia/ad106/gsp/gsp-570.144.bin=nvidia/ga102/gsp/gsp-570.144.bin
+nvidia/ad106/gsp/bootloader-570.144.bin=nvidia/ad102/gsp/bootloader-570.144.bin
+nvidia/ad106/gsp/booter_load-570.144.bin=nvidia/ad102/gsp/booter_load-570.144.bin
+nvidia/ad106/gsp/booter_unload-570.144.bin=nvidia/ad102/gsp/booter_unload-570.144.bin
+LICENSES/LICENCE.nvidia

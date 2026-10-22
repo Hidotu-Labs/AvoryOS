@@ -2,6 +2,10 @@
  * the cheap math helpers.  Compiled with the real Linux headers. */
 
 #include <linux/crc32.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+#include <linux/crc32c.h>
+#endif
 #include <linux/idr.h>
 #include <linux/kfifo.h>
 #include <linux/rational.h>
@@ -19,7 +23,11 @@ static bool test_crc32(void) {
   /* CRC-32/ISO-HDLC and CRC-32C check values ("123456789"): the kernel
    * functions are raw (caller supplies init/final xor), so invert here. */
   u32 le = crc32_le(~0u, check, sizeof(check) - 1) ^ ~0u;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+  u32 c = crc32c(~0u, check, sizeof(check) - 1) ^ ~0u;
+#else
   u32 c = __crc32c_le(~0u, check, sizeof(check) - 1) ^ ~0u;
+#endif
 
   return le == 0xCBF43926u && c == 0xE3069283u;
 }

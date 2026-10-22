@@ -17,6 +17,7 @@
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linuxkpi/native_power.h>
 
 /* Upstream declares this in <linux/string.h>; the implementation normally
  * lives in mm/util.c. */
@@ -35,8 +36,15 @@ void *memdup_user_nul(const void __user *src, size_t len) {
 
 /* lib/string.c implementation, needed by sync_file and dma-buf.
  * (strscpy_pad is already provided by the imported lib/string_helpers.c.) */
+#ifdef strscpy
+ssize_t sized_strscpy(char *dest, const char *src, size_t count) {
+#else
 ssize_t strscpy(char *dest, const char *src, size_t count) {
+#endif
   size_t len = 0;
+
+  if (!count)
+    return -E2BIG;
 
   while (len + 1 < count && src[len]) {
     dest[len] = src[len];
@@ -123,6 +131,22 @@ int ___ratelimit(struct ratelimit_state *rs, const char *func) {
   if (!rs->begin)
     rs->begin = jiffies;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+  if (!(rs->flags & RATELIMIT_INITIALIZED) ||
+      time_is_before_jiffies(rs->begin + interval)) {
+    int missed = atomic_xchg(&rs->missed, 0);
+    if (missed && !(rs->flags & RATELIMIT_MSG_ON_RELEASE))
+      printk(KERN_WARNING "%s: %d callbacks suppressed\n", func, missed);
+    rs->begin = jiffies;
+    atomic_set(&rs->rs_n_left, burst);
+    rs->flags |= RATELIMIT_INITIALIZED;
+  }
+  ret = atomic_read(&rs->rs_n_left) > 0;
+  if (ret)
+    atomic_dec(&rs->rs_n_left);
+  else
+    atomic_inc(&rs->missed);
+#else
   if (time_is_before_jiffies(rs->begin + interval)) {
     if (rs->missed && !(rs->flags & RATELIMIT_MSG_ON_RELEASE)) {
       printk(KERN_WARNING "%s: %d callbacks suppressed\n", func, rs->missed);
@@ -138,6 +162,7 @@ int ___ratelimit(struct ratelimit_state *rs, const char *func) {
     rs->missed++;
     ret = 0;
   }
+#endif
 
   raw_spin_unlock_irqrestore(&rs->lock, flags);
   return ret;
@@ -314,8 +339,12 @@ void add_taint(unsigned flag, enum lockdep_ok lockdep_ok) {
   (void)lockdep_ok;
 }
 
-/* No userspace helper and no power management: orderly_poweroff() cannot ask
- * userland to shut down; the native kernel owns reboots. */
-void orderly_poweroff(bool force) { (void)force; }
+/* No userspace helper exists. Fall back to emergency guest power-off, as
+ * required by Nouveau thermal shutdown. Do not recurse into GPU teardown
+ * from a GPU worker. This cannot provide an orderly userspace shutdown. */
+void orderly_poweroff(bool force) {
+  (void)force;
+  asc_emergency_poweroff();
+}
 
-void emergency_restart(void) {}
+void emergency_restart(void) { asc_emergency_restart(); }

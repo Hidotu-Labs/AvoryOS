@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 struct drm_file;
+void virtio_gpu_request_perf_dump(void);
 struct drm_gem_object;
 struct vfs_node;
 #define VIRTIO_GPU_MAX_MODES 32
@@ -27,6 +28,8 @@ struct virtio_gpu_stats {
     uint64_t commands_submitted, commands_completed, commands_timed_out;
     uint64_t host_errors, invalid_responses;
     uint64_t present_batches, frames_presented, damage_pixels;
+    uint64_t scanout_pixels, compared_pixels, unchanged_frames;
+    uint64_t producer_sync_ns, snapshot_copy_ns, transport_wait_ns;
     uint64_t present_wait_ms, max_present_wait_ms, present_failures;
     uint64_t interrupt_mode, interrupts, msix_interrupts, intx_interrupts;
     uint64_t control_interrupts, cursor_interrupts, config_interrupts, watchdog_polls;

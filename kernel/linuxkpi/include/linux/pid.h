@@ -12,6 +12,9 @@
 #include <linux/types.h>
 
 struct pid;
+struct task_struct;
+enum pid_type { PIDTYPE_PID, PIDTYPE_TGID, PIDTYPE_PGID, PIDTYPE_SID, PIDTYPE_MAX };
+struct task_struct *pid_task(struct pid *, enum pid_type);
 
 static inline struct pid *get_pid(struct pid *pid) { return pid; }
 static inline void put_pid(struct pid *pid) { (void)pid; }

@@ -720,6 +720,11 @@ typedef void (*drm_commit_damage_fn_t)(struct drm_device *dev,
 typedef void (*drm_pageflip_fn_t)(struct drm_file *file, struct vfs_node *node,
                                   uint32_t crtc_id, uint32_t fb_id,
                                   uint64_t user_data);
+typedef int (*drm_async_flip_fn_t)(struct drm_file *file, struct vfs_node *node,
+                                  uint32_t crtc_id, struct drm_framebuffer *fb,
+                                  uint64_t user_data, bool event);
+void ascentdrm_register_async_flip(drm_async_flip_fn_t submit);
+void ascentdrm_console_takeover(void);
 typedef int (*drm_create_dumb_fn_t)(struct drm_device *dev, uint32_t width,
                                    uint32_t height, uint32_t bpp,
                                    struct drm_gem_object **obj_out);

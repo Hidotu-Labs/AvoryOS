@@ -10,25 +10,29 @@
 # headers expect it (<generated/autoconf.h>).
 #
 # Usage:
-#   scripts/linux-import.sh                 # use pin, or resolve latest v6.6.*
+#   scripts/linux-import.sh                 # use the checked-in baseline
 #   LINUX_VERSION=v6.6.62 scripts/linux-import.sh
 #   scripts/linux-import.sh --force         # re-copy even if the pin matches
 #
 # Environment:
-#   LINUX_VERSION     tag to import (default: auto; latest v6.6.* stable)
+#   LINUX_VERSION     tag to import (default: scripts/linux/baseline.txt)
 #   LINUX_REPO        git remote (default: kernel.org stable tree)
 #   LINUX_SRC_DIR     clone cache (default: build/linux-src)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LINUX_REPO="${LINUX_REPO:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
-LINUX_VERSION="${LINUX_VERSION:-auto}"
+BASELINE_FILE="$ROOT/scripts/linux/baseline.txt"
+DEFAULT_TAG="$(sed -n 's/^tag=//p' "$BASELINE_FILE")"
+DEFAULT_COMMIT="$(sed -n 's/^commit=//p' "$BASELINE_FILE")"
+LINUX_VERSION="${LINUX_VERSION:-$DEFAULT_TAG}"
 SRC_DIR="${LINUX_SRC_DIR:-$ROOT/build/linux-src}"
 DEST="$ROOT/kernel/linux"
 SUBSET_FILE="$ROOT/scripts/linux/subset.txt"
 FILES_FILE="$ROOT/scripts/linux/files.txt"
 GEN_SRC="$ROOT/kernel/linuxkpi/include/generated"
 FORCE=0
+NOUVEAU_SERIES=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -40,6 +44,9 @@ done
 
 log()  { printf '[linux-import] %s\n' "$*"; }
 die()  { printf '[linux-import] error: %s\n' "$*" >&2; exit 1; }
+
+exec 9>"$ROOT/kernel/.linux-import.lock"
+flock -n 9 || die "another Linux import is active"
 
 # Read "VAR += a b c" entries from a Kbuild fragment (one entry per line; the
 # fragments we consume do not use line continuations for these variables).
@@ -116,14 +123,37 @@ else
     fi
 fi
 COMMIT="$(git -C "$SRC_DIR" rev-parse "$TAG^{commit}")"
+if [ "$TAG" = "$DEFAULT_TAG" ] && [ "$COMMIT" != "$DEFAULT_COMMIT" ]; then
+    die "baseline tag resolved to $COMMIT, expected $DEFAULT_COMMIT"
+fi
 log "commit: $COMMIT"
+if [ "$TAG" = v6.18.42 ]; then
+    [ "$COMMIT" = 856a9b51680cbbed1ace1207b29e424a616cff48 ] || die "6.18.42 source pin mismatch"
+    NOUVEAU_SERIES=1
+fi
+
+# Build a complete import before replacing the active one. Failed Kbuild,
+# generation or manifest validation must leave the last import intact.
+FINAL_DEST="$DEST"
+STAGED_DEST="$(mktemp -d "$ROOT/kernel/.linux-import.XXXXXXXX")"
+cleanup_import() {
+    # Also restore the old tree if interrupted between the two publication
+    # renames. Generation failures never reach this window.
+    if [ -n "${PREVIOUS_DEST:-}" ] && [ ! -e "$FINAL_DEST" ] && [ -e "$PREVIOUS_DEST" ]; then
+        mv "$PREVIOUS_DEST" "$FINAL_DEST"
+    fi
+    rm -rf -- "$STAGED_DEST"
+}
+trap cleanup_import EXIT
+DEST="$STAGED_DEST"
+PIN_FILE="$DEST/.pin"
 
 # ── Copy the subset ──────────────────────────────────────────────────────────
 log "copying subset into kernel/linux/"
-rm -rf "$DEST"
-mkdir -p "$DEST"
 while IFS= read -r path; do
     case "$path" in ''|\#*) continue ;; esac
+    optional=0
+    case "$path" in \?*) optional=1; path="${path#?}" ;; esac
     # Entries may contain shell globs (e.g. drivers/gpu/drm/*.h): copy every
     # match.  A literal path that does not exist is an error.
     matched=0
@@ -131,11 +161,30 @@ while IFS= read -r path; do
         [ -e "$src" ] || continue
         matched=1
         rel="${src#"$SRC_DIR"/}"
+        case "$rel" in
+            lib/crc32.c) rel=lib/crc/crc32-main.c ;;
+            lib/crc32defs.h) rel=lib/crc/crc32defs.h ;;
+            drivers/gpu/drm/tiny/simpledrm.c) rel=drivers/gpu/drm/sysfb/simpledrm.c ;;
+            drivers/gpu/drm/drm_encoder_slave.c) continue ;;
+        esac
         mkdir -p "$DEST/$(dirname "$rel")"
         cp -a "$src" "$DEST/$rel"
     done
-    [ "$matched" -eq 1 ] || die "subset path missing in tree: $path"
+    [ "$matched" -eq 1 ] || [ "$optional" -eq 1 ] || die "subset path missing in tree: $path"
 done < "$SUBSET_FILE"
+
+if [ "$NOUVEAU_SERIES" -eq 1 ]; then
+    for path in drivers/gpu/drm/clients drivers/gpu/drm/sysfb; do
+        [ -d "$SRC_DIR/$path" ] || die "6.18 Nouveau profile path missing: $path"
+        mkdir -p "$DEST/$(dirname "$path")"
+        mkdir -p "$DEST/$path"
+        cp -a "$SRC_DIR/$path"/. "$DEST/$path"/
+    done
+    mkdir -p "$DEST/lib/crc" "$DEST/kernel/time"
+    cp -a "$SRC_DIR/lib/crc"/. "$DEST/lib/crc/"
+    cp -a "$SRC_DIR/kernel/time/timeconv.c" "$DEST/kernel/time/timeconv.c"
+    rm -f "$DEST/drivers/gpu/drm/drm_encoder_slave.c"
+fi
 
 # ── Apply AvoryOS divergence patches ─────────────────────────────────────────
 # kernel/linux/ is a pristine vendor tree.  The few deliberate divergences the
@@ -143,14 +192,41 @@ done < "$SUBSET_FILE"
 # every import so a re-import can never silently lose them.  Debug-only
 # patches stay under scripts/linux/patches/debug/ and are applied by hand.
 PATCH_DIR="$ROOT/scripts/linux/patches"
-for p in "$PATCH_DIR"/*.patch; do
+# Series-specific patches may touch drivers absent from retained baselines.
+# v6.6, for example, predates Nouveau's r535 GSP implementation.
+PATCH_SERIES="$(printf '%s\n' "$TAG" | cut -d. -f1,2)"
+for p in "$PATCH_DIR"/*.patch "$PATCH_DIR/$PATCH_SERIES"/*.patch; do
     [ -e "$p" ] || continue
+    if [ "$NOUVEAU_SERIES" -eq 1 ] && [ "$(dirname "$p")" = "$PATCH_DIR" ]; then
+        continue
+    fi
     log "applying divergence patch: $(basename "$p")"
     patch -p1 -d "$DEST" -s < "$p" || die "divergence patch failed: $p"
 done
 
 # ── Generate Makefile.files from scripts/linux/files.txt ─────────────────────
-mapfile -t srcfiles < <(grep -v '^[[:space:]]*\(#\|$\)' "$FILES_FILE")
+srcfiles=()
+while IFS= read -r f; do
+    case "$f" in ''|\#*) continue ;; esac
+    case "$f" in \?*) f="${f#?}"; [ -f "$SRC_DIR/$f" ] || continue ;; esac
+    if [ "$NOUVEAU_SERIES" -eq 1 ]; then
+        case "$f" in
+            lib/crc32.c) f=lib/crc/crc32-main.c ;;
+            lib/crc32defs.h) f=lib/crc/crc32defs.h ;;
+            drivers/gpu/drm/drm_encoder_slave.c) continue ;;
+        esac
+    fi
+    srcfiles+=("$f")
+done < "$FILES_FILE"
+if [ "$NOUVEAU_SERIES" -eq 1 ]; then
+    for f in drivers/gpu/drm/drm_client_event.c drivers/gpu/drm/sysfb/drm_sysfb.c drivers/gpu/drm/sysfb/drm_sysfb_modeset.c kernel/time/timeconv.c; do
+        [ -f "$DEST/$f" ] && srcfiles+=("$f")
+    done
+    for f in drivers/gpu/drm/drm_vblank_helper.c drivers/gpu/drm/drm_panel_backlight_quirks.c drivers/gpu/drm/vkms/vkms_config.c drivers/gpu/drm/vkms/vkms_connector.c drivers/gpu/drm/ttm/ttm_backup.c; do
+        [ -f "$DEST/$f" ] && srcfiles+=("$f")
+    done
+    srcfiles=($(printf '%s\n' "${srcfiles[@]}" | awk '!seen[$0]++'))
+fi
 [ "${#srcfiles[@]}" -gt 0 ] || die "scripts/linux/files.txt lists no source files"
 for f in "${srcfiles[@]}"; do
     [ -f "$DEST/$f" ] || die "listed source not in imported tree: $f"
@@ -178,6 +254,18 @@ for h in "$GEN_SRC"/*.h; do
     ln -sf "../../../linuxkpi/include/generated/$(basename "$h")" \
         "$DEST/include/generated/$(basename "$h")"
 done
+if [ "$NOUVEAU_SERIES" -eq 1 ]; then
+    cfg="$DEST/include/generated/autoconf.h"
+    rm -f "$cfg"
+    cp "$GEN_SRC/autoconf.h" "$cfg"
+    for option in CONFIG_DRM_CLIENT CONFIG_DRM_CLIENT_LIB CONFIG_DRM_SYSFB_HELPER CONFIG_DRM_DISPLAY_DSC_HELPER; do
+        grep -q "^#define $option " "$cfg" || sed -i "/^#endif/i #define $option 1" "$cfg"
+    done
+    awk -v cfg="$cfg" 'BEGIN { while ((getline line < cfg) > 0) if (match(line, /^#define CONFIG_[A-Za-z0-9_]+ [^ ]+/)) { key=substr(line, 9, index(line, " ")-9); value=substr(line, index(line, " ")+1); print key "=" (value == "1" ? "y" : value) } }' > "$DEST/.config"
+    awk -f "$SRC_DIR/arch/x86/tools/cpufeaturemasks.awk" \
+        "$DEST/arch/x86/include/asm/cpufeatures.h" "$DEST/.config" \
+        > "$DEST/arch/x86/include/generated/asm/cpufeaturemasks.h"
+fi
 # utsrelease.h carries the exact imported tag; write it rather than link it so
 # the checked-in tree does not churn on every import.
 cat > "$DEST/include/generated/utsrelease.h" <<EOF
@@ -245,12 +333,16 @@ fi
 # Build and run the upstream host generator; -I "$DEST/lib" resolves its
 # "../include/generated/autoconf.h" include against the checked-in generated
 # config linked above.
-if [ -f "$DEST/lib/crc32.c" ] && [ -f "$SRC_DIR/lib/gen_crc32table.c" ]; then
+if { [ -f "$DEST/lib/crc32.c" ] || [ -f "$DEST/lib/crc/crc32-main.c" ]; } && [ -f "$SRC_DIR/lib/gen_crc32table.c" ]; then
     tmp_crc="$(mktemp -d)"
-    cc -O2 -I "$DEST/lib" -o "$tmp_crc/gen_crc32table" \
+    cc -O2 -I "$DEST/lib" -I "$DEST/lib/crc" -o "$tmp_crc/gen_crc32table" \
         "$SRC_DIR/lib/gen_crc32table.c" \
         || die "failed to build gen_crc32table"
-    "$tmp_crc/gen_crc32table" > "$DEST/lib/crc32table.h"
+    if [ -d "$DEST/lib/crc" ]; then
+        "$tmp_crc/gen_crc32table" > "$DEST/lib/crc/crc32table.h"
+    else
+        "$tmp_crc/gen_crc32table" > "$DEST/lib/crc32table.h"
+    fi
     rm -rf "$tmp_crc"
     log "generated lib/crc32table.h"
 fi
@@ -270,10 +362,23 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required by kbuild-subset.
 log "generating kernel/linux/Makefile.kbuild from the pinned Kbuild fragments"
 python3 "$ROOT/scripts/linux/kbuild-subset.py" \
     --tree "$DEST" \
-    --config "$GEN_SRC/autoconf.h" \
+    --config "$DEST/include/generated/autoconf.h" \
     --out "$DEST/Makefile.kbuild" \
     --report "$DEST/kbuild-report.txt" \
+    --prefix linux \
     || die "kbuild-subset.py failed"
+
+PREVIOUS_DEST=""
+if [ -e "$FINAL_DEST" ]; then
+    PREVIOUS_DEST="$(mktemp -d "$ROOT/kernel/.linux-previous.XXXXXXXX")"
+    rmdir "$PREVIOUS_DEST"
+    mv "$FINAL_DEST" "$PREVIOUS_DEST"
+fi
+if ! mv "$STAGED_DEST" "$FINAL_DEST"; then
+    [ -z "$PREVIOUS_DEST" ] || mv "$PREVIOUS_DEST" "$FINAL_DEST"
+    die "failed to publish staged import"
+fi
+[ -z "$PREVIOUS_DEST" ] || rm -rf -- "$PREVIOUS_DEST"
 
 log "done: kernel/linux @ $TAG ($COMMIT)"
 log "build the kernel with: make -C kernel"

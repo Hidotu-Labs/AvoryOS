@@ -10,6 +10,7 @@ struct ksm_stats {
   uint64_t zero_pages_merged;  // Zero-filled frames collapsed into zero page
   uint64_t pages_scanned;      // Total pages examined in last pass
   uint64_t scan_cycles;        // Total full scan passes completed
+  uint64_t passes_idle;        // Background passes run while RAM was plentiful
   bool     running;            // Background daemon status
 };
 

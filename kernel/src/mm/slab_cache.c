@@ -104,11 +104,18 @@ kmem_cache_t *kmem_cache_create(const char *name, size_t obj_size,
     return NULL;
   if (alignment == 0)
     alignment = 8;
+  if ((alignment & (alignment - 1)) || alignment > PAGE_SIZE ||
+      obj_size > SIZE_MAX - (alignment - 1))
+    return NULL;
   // Round obj_size up to alignment
   size_t aligned_size = (obj_size + alignment - 1) & ~(alignment - 1);
   // Minimum 16 bytes per object
   if (aligned_size < 16)
     aligned_size = 16;
+  size_t object_offset =
+      (sizeof(struct slab_page) + alignment - 1) & ~(alignment - 1);
+  if (object_offset >= PAGE_SIZE || aligned_size > PAGE_SIZE - object_offset)
+    return NULL;
 
   spinlock_acquire(&slab_global_lock);
 
@@ -141,11 +148,12 @@ kmem_cache_t *kmem_cache_create(const char *name, size_t obj_size,
   c->obj_size = obj_size;
   c->obj_aligned = aligned_size;
   c->alignment = alignment;
+  c->object_offset = object_offset;
   c->ctor = ctor;
   c->dtor = dtor;
 
   // Calculate objects per slab
-  size_t usable = PAGE_SIZE - sizeof(struct slab_page);
+  size_t usable = PAGE_SIZE - object_offset;
   c->objs_per_slab = usable / aligned_size;
   if (c->objs_per_slab > 128)
     c->objs_per_slab = 128;
@@ -286,7 +294,7 @@ void *kmem_cache_alloc(kmem_cache_t *cache) {
     cache->total_allocs++;
     cache->active_objects++;
 
-    uint8_t *obj_base = (uint8_t *)s + sizeof(struct slab_page);
+    uint8_t *obj_base = (uint8_t *)s + cache->object_offset;
     ret_ctor_arg = obj_base + (free_idx * cache->obj_aligned);
     ctor = cache->ctor;
 
@@ -329,7 +337,7 @@ void kmem_cache_free(kmem_cache_t *cache, void *obj) {
   }
 
   // Calculate object index
-  uint64_t object_base = page_base + sizeof(struct slab_page);
+  uint64_t object_base = page_base + cache->object_offset;
   if ((uint64_t)obj < object_base) {
     klog_puts("[SLAB] ERROR: Object points inside slab metadata!\n");
     spinlock_release(&slab_global_lock);
@@ -376,9 +384,21 @@ void kmem_cache_free(kmem_cache_t *cache, void *obj) {
   }
 
   if (s->free_count == s->total_count) {
-    // Completely empty → move to free list
+    // Completely empty → the frame returns to PMM right here.  Parking it
+    // on the free list behind the OOM-only shrink made every page the
+    // cache ever touched a permanent arena page, so any workload measured
+    // between clean states counted those pages as drift.
     slab_unlink(&cache->slabs_partial, s);
-    slab_push(&cache->slabs_free, s);
+    uint64_t *pml4 = vmm_get_active_pml4();
+    uint64_t phys = vmm_virt_to_phys(pml4, (uint64_t)s);
+    if (phys) {
+      pmm_free_page((void *)(phys & 0x000FFFFFFFFFF000ULL));
+      cache->total_slabs--;
+    } else {
+      // Untranslatable: keep bookkeeping consistent via the free list so a
+      // later shrink can revisit it.
+      slab_push(&cache->slabs_free, s);
+    }
   }
 
   spinlock_release(&slab_global_lock);

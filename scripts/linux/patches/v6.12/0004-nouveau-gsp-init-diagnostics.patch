@@ -1,0 +1,64 @@
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c
+@@ -2396,6 +2396,51 @@
+ 	return 0;
+ }
+ 
++/**
++ * r535_gsp_log_dump() -- C4 bring-up diagnostic: dump GSP-RM log tails.
++ *
++ * Called on the init failure path. The log buffers are encoded records, not
++ * plain text, but the put pointers and the raw tail plus hexdump still carry
++ * the last RM activity before a failed boot, and ASCII fragments appear for
++ * many classes of messages. Extensions to decoding use the firmware symbols.
++ */
++static void
++r535_gsp_log_dump(struct nvkm_gsp *gsp)
++{
++	struct nvkm_subdev *subdev = &gsp->subdev;
++	const char *names[] = { "loginit", "logintr", "logrm" };
++	struct nvkm_gsp_mem *logs[] = { &gsp->loginit, &gsp->logintr, &gsp->logrm };
++	const size_t tail = 0x2000; /* bounded: 8 KiB per buffer */
++
++	for (int i = 0; i < ARRAY_SIZE(logs); i++) {
++		struct nvkm_gsp_mem *log = logs[i];
++		u64 put;
++		size_t end, start;
++
++		if (!log->data || log->size < sizeof(u64) + tail)
++			continue;
++
++		put = *(u64 *)log->data;
++		nvkm_error(subdev, "gsp log %s: put=0x%llx size=0x%zx\n",
++			   names[i], put, log->size);
++
++		if (put > log->size)
++			/* corrupted put pointer; assume the buffer is still virgin */
++			put = log->size;
++		if (!put) {
++			nvkm_error(subdev, "gsp log %s: empty - GSP-RM wrote nothing\n",
++				   names[i]);
++			continue;
++		}
++
++		end = min_t(u64, put, log->size - sizeof(u64));
++		start = (end > tail) ? end - tail : 0;
++
++		print_hex_dump(KERN_ERR, "gsp-log", DUMP_PREFIX_OFFSET, 16, 1,
++			       (u8 *)log->data + sizeof(u64) + start, end - start, true);
++	}
++}
++
+ int
+ r535_gsp_init(struct nvkm_gsp *gsp)
+ {
+@@ -2424,6 +2469,9 @@
+ 	gsp->running = true;
+ 
+ done:
++	if (ret)
++		r535_gsp_log_dump(gsp);
++
+ 	if (gsp->sr.meta.data) {
+ 		nvkm_gsp_mem_dtor(gsp, &gsp->sr.meta);
+ 		nvkm_gsp_radix3_dtor(gsp, &gsp->sr.radix3);

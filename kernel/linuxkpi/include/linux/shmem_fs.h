@@ -16,9 +16,18 @@
 #include <linux/types.h>
 
 struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags);
+struct vfsmount;
+struct file *shmem_file_setup_with_mnt(struct vfsmount *, const char *, loff_t,
+                                      unsigned long);
 
 struct folio *shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index,
                                    gfp_t gfp);
+static inline struct folio *shmem_read_folio(struct address_space *mapping,
+                                             pgoff_t index) {
+  return shmem_read_folio_gfp(mapping, index, mapping_gfp_mask(mapping));
+}
+struct swap_iocb;
+int shmem_writeout(struct folio *, struct swap_iocb **, struct list_head *);
 
 /* Stock <linux/shmem_fs.h> declares the page-returning form next to the folio
  * one; TTM's shmem-backed ttm_tt uses it. */

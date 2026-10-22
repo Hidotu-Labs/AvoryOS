@@ -40,6 +40,12 @@ static inline struct page *sg_page(struct scatterlist *sg) {
   return (struct page *)(sg->page_link & ~(SG_CHAIN | SG_END));
 }
 
+/* Pages are directly mapped on native x86; valid for CPU-addressable SGs. */
+void *page_address(const struct page *page);
+static inline void *sg_virt(struct scatterlist *sg) {
+  return (char *)page_address(sg_page(sg)) + sg->offset;
+}
+
 static inline void sg_set_page(struct scatterlist *sg, struct page *page,
                                unsigned int len, unsigned int offset) {
   unsigned long page_link = sg->page_link & (SG_CHAIN | SG_END);

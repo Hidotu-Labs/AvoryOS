@@ -48,12 +48,15 @@ static int fd_find_free_locked(struct thread *t, int from) {
   uint32_t hint = t->files->next_fd;
   if (hint > t->files->capacity)
     hint = t->files->capacity;
+  /* Scan the authoritative table: t->fds may alias the freed buffer of a
+   * concurrent CLONE_FILES expansion (kfree'd kmalloc memory that can be
+   * recycled before this scan). */
   int start = from > (int)hint ? from : (int)hint;
   for (uint32_t i = (uint32_t)start; i < t->files->capacity; i++)
-    if (!t->fds[i])
+    if (!t->files->fds[i])
       return (int)i;
   for (uint32_t i = (uint32_t)from; i < hint; i++) {
-    if (!t->fds[i]) {
+    if (!t->files->fds[i]) {
       t->files->next_fd = 0;
       return (int)i;
     }
@@ -79,7 +82,7 @@ int alloc_fd(struct thread *t) {
   int fd = fd_find_free_locked(t, 0);
   if (fd >= 0) {
     fd_description_set_locked(t, fd, 0);
-    t->fds[fd] = FD_RESERVED;
+    t->files->fds[fd] = FD_RESERVED;
     t->files->next_fd = (uint32_t)fd + 1;
   }
   spinlock_release(&t->files->lock);
@@ -93,7 +96,7 @@ int alloc_fd_from(struct thread *t, int from) {
   int fd = fd_find_free_locked(t, from);
   if (fd >= 0) {
     fd_description_set_locked(t, fd, 0);
-    t->fds[fd] = FD_RESERVED;
+    t->files->fds[fd] = FD_RESERVED;
     /* A minimum-fd allocation must not hide free slots below it. */
     if ((uint32_t)fd == t->files->next_fd)
       t->files->next_fd = (uint32_t)fd + 1;
@@ -109,12 +112,12 @@ void fd_release_reserved(struct thread *t, int fd) {
     return;
   vfs_node_t *reserved = NULL;
   spinlock_acquire(&t->files->lock);
-  if ((uint32_t)fd < t->files->capacity && t->fds[fd] == FD_RESERVED) {
+  if ((uint32_t)fd < t->files->capacity && t->files->fds[fd] == FD_RESERVED) {
     reserved = t->files->reserved_nodes[fd];
     t->files->reserved_nodes[fd] = NULL;
-    t->fds[fd] = NULL;
-    t->fd_offsets[fd] = 0;
-    t->fd_flags[fd] = 0;
+    t->files->fds[fd] = NULL;
+    t->files->fd_offsets[fd] = 0;
+    t->files->fd_flags[fd] = 0;
     fd_path_clear(t, fd);
     if ((uint32_t)fd < t->files->next_fd)
       t->files->next_fd = (uint32_t)fd;

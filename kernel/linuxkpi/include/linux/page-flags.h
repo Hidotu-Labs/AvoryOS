@@ -48,22 +48,22 @@ enum pageflags {
 
 #define TESTPAGEFLAG(uname, lname, policy)                                    \
   static inline int Page##uname(const struct page *page) {                    \
-    return test_bit(PG_##lname, &page->flags);                                \
+    return test_bit(PG_##lname, &linuxkpi_page_flag_bits(page));                                \
   }
 #define SETPAGEFLAG(uname, lname, policy)                                     \
   static inline void SetPage##uname(struct page *page) {                      \
-    set_bit(PG_##lname, &page->flags);                                        \
+    set_bit(PG_##lname, &linuxkpi_page_flag_bits(page));                                        \
   }
 #define CLEARPAGEFLAG(uname, lname, policy)                                   \
   static inline void ClearPage##uname(struct page *page) {                    \
-    clear_bit(PG_##lname, &page->flags);                                      \
+    clear_bit(PG_##lname, &linuxkpi_page_flag_bits(page));                                      \
   }
 #define SET_CLEAR_PAGEFLAGS(uname, lname, policy)                             \
   static inline void __SetPage##uname(struct page *page) {                    \
-    __set_bit(PG_##lname, &page->flags);                                      \
+    __set_bit(PG_##lname, &linuxkpi_page_flag_bits(page));                                      \
   }                                                                           \
   static inline void __ClearPage##uname(struct page *page) {                  \
-    __clear_bit(PG_##lname, &page->flags);                                    \
+    __clear_bit(PG_##lname, &linuxkpi_page_flag_bits(page));                                    \
   }
 
 TESTPAGEFLAG(Locked, locked, PF_NO_TAIL)
@@ -105,27 +105,27 @@ CLEARPAGEFLAG(Unevictable, unevictable, PF_HEAD)
 SET_CLEAR_PAGEFLAGS(Head, head, PF_HEAD)
 
 static inline int PageHead(const struct page *page) {
-  return test_bit(PG_head, (unsigned long *)&page->flags);
+  return test_bit(PG_head, (unsigned long *)&linuxkpi_page_flag_bits(page));
 }
 
 static inline void SetPageHead(struct page *page) {
-  set_bit(PG_head, &page->flags);
+  set_bit(PG_head, &linuxkpi_page_flag_bits(page));
 }
 
 static inline void ClearPageHead(struct page *page) {
-  clear_bit(PG_head, &page->flags);
+  clear_bit(PG_head, &linuxkpi_page_flag_bits(page));
 }
 
 static inline int PageTail(const struct page *page) {
-  return test_bit(PG_tail, (unsigned long *)&page->flags);
+  return test_bit(PG_tail, (unsigned long *)&linuxkpi_page_flag_bits(page));
 }
 
 static inline void __SetPageTail(struct page *page) {
-  __set_bit(PG_tail, &page->flags);
+  __set_bit(PG_tail, &linuxkpi_page_flag_bits(page));
 }
 
 static inline void __ClearPageTail(struct page *page) {
-  __clear_bit(PG_tail, &page->flags);
+  __clear_bit(PG_tail, &linuxkpi_page_flag_bits(page));
 }
 
 static inline struct page *compound_head(struct page *page) {
@@ -205,15 +205,15 @@ static inline pgoff_t folio_index(const struct folio *folio) {
 }
 
 static inline void folio_mark_dirty(struct folio *folio) {
-  set_bit(PG_dirty, &folio->page.flags);
+  set_bit(PG_dirty, &linuxkpi_page_flag_bits(&folio->page));
 }
 
 static inline void folio_mark_accessed(struct folio *folio) {
-  set_bit(PG_referenced, &folio->page.flags);
+  set_bit(PG_referenced, &linuxkpi_page_flag_bits(&folio->page));
 }
 
 static inline bool folio_test_dirty(const struct folio *folio) {
-  return test_bit(PG_dirty, (unsigned long *)&folio->page.flags);
+  return test_bit(PG_dirty, (unsigned long *)&linuxkpi_page_flag_bits(&folio->page));
 }
 
 /* Order-0 folios only: a folio is never "large" in AvoryOS. */

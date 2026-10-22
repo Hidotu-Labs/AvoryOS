@@ -1,3 +1,22 @@
+## Nouveau C7 userspace installation (2026-10-21)
+
+NVK/Zink now passes exact shader pixels and context recreation on AD106.
+The production NVIDIA Xorg selector, glamor/GLX, two full-frame native PRIME
+captures and clean shutdown pass in `build/nouveau-c7/hardware-final/`.
+The selected client path is explicit Kopper/DRI2; DRI3 1.2 is not advertised.
+Shutdown now completes deferred VMA/file releases before PCI removal, including
+in-flight idle-worker cleanup. A sleeping waiter avoids one-CPU starvation.
+The normal disk/ISO are updated with rollback copies. Full installed desktop
+session/restart and resource-baseline qualification remain pending.
+
+NVK and aligned Mesa 26.2.5 splits are installed through the focused
+`setup-arch.sh --nouveau-userspace` path and patched into the existing disk.
+Package payloads, symlinks, recursive ELF dependencies and staged filesystem
+integrity pass offline verification. Original disk and ISO are retained for
+rollback. The desktop ISO uses the C6-qualified kernel for correct sysfs device
+identity. [C7 record](nouveau/c7-userspace.md) contains guest test commands and
+evidence paths. No Vulkan/Zink rendering or accelerated desktop pass is claimed.
+
 ## Native PRIME frame publication (2026-10-12)
 
 The user could not reopen Minecraft for an active-scene comparison and asked
@@ -2874,3 +2893,152 @@ user-dispatch regressions pass. The main ISO is rebuilt with this native fix.
 This fixes a demonstrated native ABI defect. Physical AMD desktop recovery and
 Minecraft artifacts remain unverified. Details, upstream references and
 repeatable tests are in `docs/drm-black-screen-sharing.md`.
+
+### 2026-10-18: Nouveau C0 audit and reproducible input selection
+
+Completed the source/hardware inventory and dependency audit for AD106 through
+LinuxKPI. Selected isolated Linux v6.12.113 (`7fdb7c1824a1`), firmware repository
+commit `ab23307cfe7f` / GSP-RM 535.113.01, and Mesa/NVK/Zink 26.2.5 for the first
+migration. The active import remains v6.6.156; C1 and driver implementation have
+not started. No PCI ownership, reset, firmware-menu or active kernel/config change
+was performed. Kernel/ISO/config inputs and a non-quiesced disk reflink were
+preserved under `build/nouveau-c0/preserved/`.
+
+Read-only inventory confirms a 16 GB RTX 4060 Ti (`10de:2803`, `10b0:f314`),
+VBIOS `95.06.34.00.63`, with its audio function alone in IOMMU group 12. The
+host display still uses NVIDIA; Raphael remains bound to vfio-pci. The main
+rootfs is Arch/glibc despite the historical Alpine path and lacks NVK's ICD.
+
+The Kbuild census selects 715 candidate Nouveau objects, but candidate AMD
+parsing stops at unsupported `test-lt`. Of 113 manually imported translation
+units, 78 changed; 76 of 97 upstream counterparts of overlay headers changed.
+All active AMD source-patch hunks dry-run successfully, without proving runtime
+correctness. The selected GSP blob is 38,061,600 bytes, beyond the loader cap;
+`firmware_request_nowarn` and multi-driver parameter ownership are concrete gaps.
+
+Seven targeted host test programs pass (DMA masks, completion, MMIO ordering,
+firmware pinning, RCU lifetime, PCI access lifecycle and TTM eviction). A private
+eight-CPU software-oracle boot, using an audit-only host-cc adapter for the
+helper's missing musl compiler, reports zero pixel failures and exits cleanly;
+two overlap cases are inconclusive. Its kernel log reports a semaphore self-test
+failure and missing test_fw.bin. A one-CPU variant cannot find its requested
+init and times out. The baseline is therefore not fully green. No physical GPU,
+candidate-kernel or NVK runtime test was performed.
+
+See `docs/nouveau/baseline-audit.md`, `docs/nouveau/c0-lock.json`, the 22-entry
+`docs/nouveau/dependency-ledger.csv` and exact firmware SHA-256 manifest. Raw
+logs, isolated sources and test artifacts are under `build/nouveau-c0/`.
+
+### 2026-10-19: Nouveau C1 shared-baseline migration
+
+C1 sources are integrated with the existing checkout edits and use the checked
+Linux v6.12.113 baseline. Native-only, shared-only and full AMD builds pass;
+explicit 6.6.156 compatibility builds also pass. Private one/eight-CPU
+software and native VirtIO GEM/KMS fixtures provide boot evidence. The full
+AMD candidate is saved separately as `kernel/bin-x86_64/kernel-c1`; the
+current kernel and ISO were not replaced. Physical AMD and full workload
+validation remain pending. Intermittent VKMS PMM accounting failures remain
+visible and are not treated as passing checks. See
+[the C1 migration report](nouveau/c1-migration.md) for the matrix and limits.
+
+### 2026-10-19: C1 hardware smoke result and C2 Nouveau controls
+
+The user reports the migrated AMD desktop, games and glxinfo working after
+`make run-c7-prime`. This supplies C1's physical smoke result; long-session,
+shutdown and earlier workload/reset regressions remain unproven.
+
+C2 imports all of Nouveau and selects 715 sources through upstream Kbuild.
+Independent AMD/Nouveau gates, shared display ownership, scoped include flags,
+parameter namespaces and an opt-in/BDF-restricted PCI probe gate are implemented.
+AMD-only build and strict software boot pass. Nouveau compilation reaches C3
+compatibility gaps and does not yet link. See
+[the C2 report](nouveau/c2-import.md) and its compiler diagnostic ledger.
+
+### 2026-10-19: Nouveau C2 registration and C3 compatibility
+
+C2 now has real guest registration evidence with its default hardware gate
+closed and zero Nouveau probe attempts. C3 compiles/links all 715 Nouveau
+objects, separately or together with AMD, using the selected Linux v6.12.113
+import. Native-only, shared-only, AMD-only and retained 6.6 AMD candidates link.
+
+Imported maple-tree/GPUVM algorithms and targeted reference/range tests replace
+missing dependencies. Native slab first-object alignment was a real maple-node
+guest fault; aligning past metadata fixes it and passes the old-layout negative
+control. DMA allocation mask handling, bulk slab failure unwind, timed waits and
+legacy MSI are implemented and tested. EDU delivers a virtual legacy MSI and
+restores INTx identity. Unsupported optional I2C clients/component binding fail
+explicitly; their presence no longer implies audio/client support.
+
+Native VirtIO GEM/modeset, Nouveau-only and the final both-driver strict
+eight-CPU boots pass. The final combined boot also passes EDU legacy MSI checks.
+One-CPU Nouveau and an earlier both-driver/EDU boot pass the new checks and
+rendering oracle but fail strict validation on the known VKMS one-page PMM
+drift. This remains open. NVIDIA firmware/GSP and hardware initialization are
+C4 work, including inherited thermal shutdown/cache-flush limitations.
+See [the C3 report](nouveau/c3-compatibility.md) and
+`build/nouveau-c3-evidence.json`. Candidate kernels did not replace the active
+kernel or ISO. No physical GPU was assigned or probed.
+
+### 2026-10-19: Nouveau C4 firmware and launch preparation
+
+Implemented a bounded 64 MiB firmware loader with VM-backed large buffers and
+64-bit size checks; pinned AD106 staging materializes all four aliases and ships
+the NVIDIA notice separately from AMD firmware. A private opt-in test verifies
+every byte by CRC through the real guest loader. Native emergency guest power
+actions replace thermal shutdown/restart no-ops; physical behavior is untested.
+
+The dedicated launcher validates the two AD106 functions, groups, host ownership,
+Raphael/UEFI display handoff, CLFLUSH, optional matching NVIDIA ROM and an exact
+kernel/firmware/CPU readiness record. It performs no host rebinding/reset.
+C4 builds use a separate object/profile directory and candidate output. The final
+strict one-CPU NVIDIA-firmware readiness and ordinary eight-CPU AMD-fixture boots
+pass. Earlier VKMS accounting failures remain in the evidence; unsuccessful RCU
+measurement experiments were reverted. No physical GPU probe has occurred.
+
+Hardware handoff is now the next external step. C4 remains open until actual
+GSP/DRM initialization, failure cleanup and shutdown evidence exists. See
+[the C4 report](nouveau/c4-bringup.md) and `build/nouveau-c4/evidence.json`.
+
+### 2026-10-21: Nouveau C5 core closed; warm-loop PMM drift root-caused and fixed
+
+The intermittent VKMS warm-loop global PMM drift (16–49 pages, roughly one
+run in three) was root-caused and fixed in the allocator without touching the
+strict gate or its classification. Three stacked bookkeeping effects, none a
+leak: the per-CPU heap freelist parked freed slots with their slab bitmap
+still set and the slow-path prefetch batch over-drew pages ahead of demand;
+empty slab pages were released only by the OOM-only shrink; and the named
+object caches kept the identical retention. Balanced loop traffic kept
+pulling fresh pages whose boxes stayed parked until the next shrink, so the
+PMM free-count baseline drifted between measured passes. Attribution ran end
+to end on the per-class slab counters and PMM site tables
+(`build/nouveau-c5/tr4-r6`, `tr5-r*`, `fix2-r2`: the whole drift is the
+class-1024 slab arena transient; the exact-zero miss was one
+`kmem_cache_alloc` page).
+
+Fix: `kernel/src/mm/heap_slab.c` serves every object from the class slab
+lists and returns a fully-empty slab frame to PMM at its last free;
+`kernel/src/mm/slab_cache.c` does the same in `kmem_cache_free`; dead
+per-caller attribution hooks were removed while the gated per-class counters
+and site dumps remain as evidence. `test_phase5_sysfs.c` samples its
+lifecycle PMM baseline after `vfs_rcu_synchronize()` — the quiescence
+convention `vfs.c` and `page_cache.c` already use — because the immediate
+sample raced the ~2 ms deferred-node-reclaimer window (site-table evidence:
+loop pulls 189 pages, frees complete in-thread to 147–157 and 191 at
+quiescence in every run; the parked arena had masked this before the
+allocator fix). Tolerances and failure semantics unchanged.
+
+Verification: `build/nouveau-c5/fix4-r1..r8` — eight consecutive strict
+software boots pass; the vkms GEM gate's warm second-pass settled delta is 0
+in all eight and the sysfs lifecycle baseline restores exactly (+0/+1 within
+its unchanged +2-page tolerance). Kernel SHA256
+`c5e8c9fed4ca8610ef038a898b3e38a543e80caa6ff083c14a185c39d49d7780`. Host
+regressions `test_nouveau_memory_oracle.py`, `test_nouveau_copy_oracle.py`
+and `test_kpi_file_mmap_errors.py` pass.
+
+Scope decision (2026-10-21): C5 core — memory, explicit VM, deterministic
+copy/timeline execution — is closed on this basis. Pressure/eviction,
+zeroing-on-reuse, outstanding-work exit and extended stress oracles are
+deferred known gaps, recorded as untested; nobody claims they are satisfied.
+Hardware re-validation of the fixed allocator is pending the next hardware
+session. See [the C5 report](nouveau/c5-memory-execution.md) and
+`build/nouveau-c5/assessment.json`.

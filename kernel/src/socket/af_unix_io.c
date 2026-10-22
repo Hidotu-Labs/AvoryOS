@@ -38,8 +38,13 @@ static int unix_scm_install_fd(struct thread *receiver,
   if (fd < 0)
     return fd;
   spinlock_acquire(&receiver->files->lock);
-  receiver->fd_offsets[fd] = saved->offset;
-  receiver->fd_flags[fd] = saved->flags |
+  /* Authoritative arrays only: the per-thread cached pointers (fd_offsets,
+   * fd_flags, fds) may alias the freed buffer of a concurrent sibling-table
+   * expansion (fd_table_expand_locked); writing through them corrupts the
+   * recycled allocation and fd_path_set then reads garbage on the next
+   * install (observed: fd_path_put on 0x552). */
+  receiver->files->fd_offsets[fd] = saved->offset;
+  receiver->files->fd_flags[fd] = saved->flags |
       ((flags & MSG_CMSG_CLOEXEC) ? FD_FLAGS_CLOEXEC_BIT : 0);
   if (!fd_path_set(receiver, fd, saved->path)) {
     spinlock_release(&receiver->files->lock);
@@ -47,7 +52,7 @@ static int unix_scm_install_fd(struct thread *receiver,
     return -12;
   }
   fd_description_set_locked(receiver, fd, saved->description_id);
-  receiver->fds[fd] = saved->node; /* publish after all metadata */
+  receiver->files->fds[fd] = saved->node; /* publish after all metadata */
   spinlock_release(&receiver->files->lock);
   return fd;
 }

@@ -27,8 +27,16 @@
 #include <linux/atomic.h>
 #include <linux/list.h>
 #include <linux/rbtree.h>
+#include <linux/maple_tree.h>
 #include <linux/rcupdate.h>
 #include <linux/types.h>
+#include <linux/version.h>
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+typedef int __bitwise cydp_t;
+#define CYDP_CLEAR_YOUNG ((__force cydp_t)BIT(0))
+#define CYDP_CLEAR_DIRTY ((__force cydp_t)BIT(1))
+#endif
 
 struct address_space;
 struct file;
@@ -48,8 +56,21 @@ typedef struct {
 /* struct page                                                                */
 /* ------------------------------------------------------------------------- */
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+/* 6.18 gives descriptor flags a distinct type. Keep the native one-word
+ * representation while exposing the upstream .f member to stock headers. */
+typedef struct { unsigned long f; } memdesc_flags_t;
+#define linuxkpi_page_flag_bits(page) ((page)->flags.f)
+#else
+#define linuxkpi_page_flag_bits(page) ((page)->flags)
+#endif
+
 struct page {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+  memdesc_flags_t flags;
+#else
   unsigned long flags;   /* PG_* bits, see <linux/page-flags.h>              */
+#endif
   unsigned int pfn;      /* Avory extension: physical page number.  32-bit  */
                          /* is plenty (max_pfn is ~1M on a 4 GiB machine);  */
                          /* keeping it narrow plus folding pgmap into the   */
@@ -86,7 +107,16 @@ struct page {
  * page-flags.h hide the indirection.  Code never accesses folio fields
  * directly in the current import set (checked), so the layout this simple. */
 struct folio {
-  struct page page;
+  union {
+    struct page page;
+    /* These direct fields alias the same native head page; no second copy
+     * of flags or the device-page metadata is maintained. */
+    struct { typeof(((struct page *)0)->flags) flags; };
+    struct {
+      char __pgmap_prefix[__builtin_offsetof(struct page, pgmap)];
+      struct dev_pagemap *pgmap;
+    };
+  };
   /* Stock swap.h's page_swap_entry() reads folio->swap; there is no swap in
    * AvoryOS, so the field is carried for the inline to type-check. */
   swp_entry_t swap;

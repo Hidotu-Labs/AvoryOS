@@ -9,6 +9,7 @@
  * without CONFIG_MODULES. */
 
 #include <linux/export.h>
+#include <linux/kmod.h>
 #include <linux/init.h>
 #include <linux/moduleparam.h>
 #include <linux/mutex.h>
@@ -17,7 +18,9 @@
 struct module;
 
 #define THIS_MODULE ((struct module *)0)
+#ifndef KBUILD_MODNAME
 #define KBUILD_MODNAME "avoryos"
+#endif
 #define KBUILD_BASENAME "avoryos"
 
 #define MODULE_LICENSE(_license)

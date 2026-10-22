@@ -88,8 +88,10 @@ static void p4t_evict_flags(struct ttm_buffer_object *bo,
   (void)bo;
   placement->num_placement = 1;
   placement->placement = &p4t_sys_place;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
   placement->num_busy_placement = 0;
   placement->busy_placement = NULL;
+#endif
 }
 
 static int p4t_move(struct ttm_buffer_object *bo, bool evict,
@@ -577,7 +579,11 @@ static void p4t_test_init_rollback(void) {
       p4t_fail("rollback release/deferred count", stage);
     if (ttm_resource_manager_usage(ttm_manager_type(&d->bdev, TTM_PL_VRAM)) ||
         ttm_resource_manager_usage(ttm_manager_type(&d->bdev, TTM_PL_SYSTEM)) ||
+        #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+        !list_empty(&d->bdev.unevictable))
+#else
         !list_empty(&d->bdev.pinned))
+#endif
       p4t_fail("rollback live resources after drain", stage);
     ret = ttm_range_man_fini(&d->bdev, TTM_PL_VRAM);
     if (ret)

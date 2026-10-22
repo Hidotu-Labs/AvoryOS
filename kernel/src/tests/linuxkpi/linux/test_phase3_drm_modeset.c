@@ -296,6 +296,63 @@ static int p3m_gem_close(void *node, struct p3m_scratch *s, uint32_t handle) {
   return p3m_ioctl(node, DRM_IOCTL_GEM_CLOSE);
 }
 
+/* PMM free-count trace, bounded and failure-only in output: every measured
+ * pass records one sample per iteration plus a 10 ms-resolution settle
+ * window.  The strict classification (exact post-settle baseline) is
+ * unchanged; a recovered asymmetry dumps the nonzero steps and the allocator
+ * component counters so the straggler can be attributed without a second
+ * build.  The extended settle below is observed only on an already-failed
+ * pass and also leaves the pass/fail outcome untouched. */
+#define P3M_TRACE_CAP (512 + 128)
+
+/* kernel/src/mm/pmm_pcp.c component counters; declared locally because this
+ * canary file includes only DRM/LinuxKPI-style headers. */
+extern size_t pmm_pcp_total_cached(void);
+extern void pmm_zero_pool_stats(uint64_t *hits, uint64_t *misses,
+                                uint64_t *refilled, size_t *cached);
+/* kernel/src/mm/pmm.c per-caller attribution counters (same reason). */
+extern void pmm_sites_reset(void);
+extern void pmm_sites_stop(void);
+extern void pmm_sites_dump(const char *tag);
+/* kernel/src/mm/heap_slab.c per-size-class object counters (same reason). */
+extern volatile int heap_slab_dbg_on;
+extern void heap_slab_dbg_reset(void);
+extern void heap_slab_dbg_dump(const char *tag);
+
+static unsigned long p3m_pmm_trace[P3M_TRACE_CAP];
+static size_t p3m_pmm_trace_len;
+
+static void p3m_pmm_sample(void) {
+  if (p3m_pmm_trace_len < P3M_TRACE_CAP)
+    p3m_pmm_trace[p3m_pmm_trace_len++] = asc_pmm_get_free_pages_total();
+}
+
+static void p3m_pmm_trace_reset(void) {
+  p3m_pmm_trace_len = 0;
+}
+
+static void p3m_pmm_trace_dump(const char *tag) {
+  uint64_t zero_hits, zero_misses, zero_refill;
+  size_t zero_cached;
+
+  klogf("[INFO] LinuxKPI: vkms GEM %s PMM trace n=%zu pcp=%zu "
+        "zero_pool=%zu\n",
+        tag, p3m_pmm_trace_len, pmm_pcp_total_cached(),
+        (pmm_zero_pool_stats(&zero_hits, &zero_misses, &zero_refill,
+                             &zero_cached),
+         zero_cached));
+  for (size_t i = 1; i < p3m_pmm_trace_len; i++) {
+    long delta = (long)p3m_pmm_trace[i] - (long)p3m_pmm_trace[i - 1];
+
+    if (delta)
+      klogf("[INFO] LinuxKPI: vkms GEM %s trace[%zu]=%+ld (free=%lu)\n",
+            tag, i, delta, p3m_pmm_trace[i]);
+  }
+  if (p3m_pmm_trace_len)
+    klogf("[INFO] LinuxKPI: vkms GEM %s trace end free=%lu\n", tag,
+          p3m_pmm_trace[p3m_pmm_trace_len - 1]);
+}
+
 /* One measured pass: `loops` create/map/close cycles with two live buffers
  * each.  Handles must be distinct while both are open; the PMM free-page
  * count is sampled immediately (slab pages may still be in flight) and after
@@ -305,7 +362,9 @@ static int p3m_gem_pass(void *node, struct p3m_scratch *s, int loops,
                         unsigned long *immediate, unsigned long *settled) {
   unsigned long before, after, later;
 
+  p3m_pmm_trace_reset();
   before = asc_pmm_get_free_pages_total();
+  p3m_pmm_sample();
   for (int i = 0; i < loops; i++) {
     uint32_t h1, h2, p1, p2;
 
@@ -318,10 +377,18 @@ static int p3m_gem_pass(void *node, struct p3m_scratch *s, int loops,
       return -1;
     if (p3m_gem_close(node, s, h1) || p3m_gem_close(node, s, h2))
       return -1;
+    p3m_pmm_sample();
   }
   after = asc_pmm_get_free_pages_total();
-  msleep(200);
-  later = asc_pmm_get_free_pages_total();
+  p3m_pmm_sample();
+  /* Same 200 ms settle as before, decomposed into 10 ms steps for the
+   * failure dump; the count remains exactly what the loop measures. */
+  for (unsigned int waited = 10; waited <= 200; waited += 10) {
+    msleep(10);
+    p3m_pmm_sample();
+  }
+  later = p3m_pmm_trace_len ? p3m_pmm_trace[p3m_pmm_trace_len - 1]
+                            : asc_pmm_get_free_pages_total();
   *immediate = before >= after ? before - after : 0;
   *settled = before >= later ? before - later : 0;
   return before == later ? 0 : 1;
@@ -346,17 +413,72 @@ static int p3m_gem_loop(void *node, struct p3m_scratch *s,
       return -1;
   }
 
+  pmm_sites_reset();
+  heap_slab_dbg_on = 1;
+  heap_slab_dbg_reset();
   ret = p3m_gem_pass(node, s, LOOPS, &first_immediate, &first_settled);
-  if (ret < 0)
+  if (ret < 0) {
+    heap_slab_dbg_on = 0;
     return -1;
+  }
+  pmm_sites_dump("pass 1");
+  heap_slab_dbg_dump("pass 1");
+  heap_slab_dbg_reset();
   ret = p3m_gem_pass(node, s, LOOPS, &second_immediate, settled);
-  if (ret < 0)
+  if (ret < 0) {
+    heap_slab_dbg_on = 0;
     return -1;
+  }
+  pmm_sites_dump("pass 2");
+  heap_slab_dbg_dump("pass 2");
+
+  if (ret > 0) {
+    /* Already-failed pass: observe for two more seconds with the same
+     * sampling, then dump the PMM trace and the per-caller alloc/free
+     * counters.  This only adds diagnostics; the drift verdict above stays
+     * exactly as strict as before. */
+    for (unsigned int waited = 0; waited < 2000; waited += 50) {
+      msleep(50);
+      p3m_pmm_sample();
+    }
+    p3m_pmm_trace_dump("drift + extended settle");
+    pmm_sites_dump("gem loop drift");
+    heap_slab_dbg_dump("drift");
+
+    /* Attribution-only decomposition (never affects the verdict above):
+     * short self-balanced sub-loops isolate the create/map/close steps so
+     * a drifting pass can name the class whose slab arena grew. */
+    static const struct {
+      const char *name;
+      bool do_map;
+    } p3m_steps[] = {
+        {"create+close", false},
+        {"create+map+close", true},
+    };
+    for (size_t step = 0;
+         step < sizeof(p3m_steps) / sizeof(p3m_steps[0]); step++) {
+      heap_slab_dbg_reset();
+      for (int i = 0; i < 32; i++) {
+        uint32_t h, p;
+
+        if (p3m_dumb_create(node, s, &h, &p))
+          break;
+        if (p3m_steps[step].do_map && p3m_dumb_map(node, s, h))
+          break;
+        p3m_gem_close(node, s, h);
+      }
+      heap_slab_dbg_dump(p3m_steps[step].name);
+    }
+    heap_slab_dbg_on = 0;
+  }
 
   *immediate = first_immediate;
   klogf("[INFO] LinuxKPI: vkms GEM pass deltas immediate/settled: "
         "first %lu/%lu, second %lu/%lu\n",
         first_immediate, first_settled, second_immediate, *settled);
+  pmm_sites_dump("gem loop end");
+  pmm_sites_stop();
+  heap_slab_dbg_on = 0;
   return ret;
 }
 

@@ -15,6 +15,7 @@
  * Recorded in docs/linuxkpi-gaps.md (P5 C5). */
 
 #include <linux/types.h>
+#include <linux/suspend.h>
 
 struct device;
 

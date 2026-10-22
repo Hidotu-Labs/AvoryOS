@@ -6,6 +6,47 @@ needed it, the current workaround, and what a complete implementation needs.
 
 Update this file in the same change that introduces or closes a gap.
 
+## Nouveau C7 packaging (2026-10-21)
+
+Hardware now verifies NVK identity, exact Zink shader pixels, NVIDIA-primary
+Xorg/glamor/GLX and captured native PRIME presentation. The server exposes DRI3
+1.0, so the qualified session uses explicit Kopper/DRI2, not DRI3 multibuffer.
+Queued/in-flight retired MM references are drained before driver removal;
+the waiter sleeps so an idle drainer can finish on one CPU. Live-client revoke,
+full desktop-session restart/resource baselines and DRI3 1.2 remain unqualified.
+
+The missing main-rootfs NVK ICD/library and mixed Mesa splits are addressed by
+the installed 26.2.5 userspace transaction. Offline package/dependency integrity
+checks pass; render-node discovery, NVK runtime ABI, shader execution, Zink and
+desktop restart/resource lifetime remain open. See the
+[C7 record](nouveau/c7-userspace.md); packaging is not an acceleration result.
+
+## Nouveau C0 audit (2026-10-18; implementation pending)
+
+The [baseline audit](nouveau/baseline-audit.md) and
+[22-entry dependency ledger](nouveau/dependency-ledger.csv) record the first
+AD106 source/API census. These are discovered requirements, not implemented fixes:
+
+- The selected v6.12.113 path needs GSP-RM 535.113.01. Its 38,061,600-byte GSP
+  image exceeds the current 16 MiB firmware-loader cap, and its caller uses
+  `firmware_request_nowarn`, for which no LinuxKPI definition was found.
+- Multi-driver parameter ownership is absent: the build uses one
+  `KBUILD_MODNAME`, and the parser strips a module prefix on retry. Nouveau's
+  short parameter names can collide with already linked drivers.
+- The AMD Kbuild evaluator stops on the candidate's `test-lt` helper; independent
+  Nouveau/shared-helper output and driver-scoped flags remain to implement.
+- Scheduler interfaces, GPUVM/client helper closure and changed overlay/header
+  contracts require a coherent shared migration before enabling Nouveau.
+- The actual main rootfs is Arch/glibc and lacks NVK/its ICD. Its Mesa splits
+  need a pinned consistent version; legacy Alpine naming is not its current ABI.
+
+The baseline software oracle passes on eight CPUs, but its boot log includes a
+semaphore self-test failure and a missing `test_fw.bin` fixture. The one-CPU
+fixture fails to launch its requested init. These are recorded baseline findings;
+C0 did not diagnose or fix them, and no candidate/NVIDIA hardware validation is
+claimed. Detailed status and exact inputs are in
+[the audit lock](nouveau/c0-lock.json).
+
 ## Phase 6 gaps (amdgpu bring-up)
 
 ### C1 — import tree + Kbuild evaluator + helper imports
@@ -1509,3 +1550,44 @@ synchronous cancellation checks callback rearm and hrtimer restart completion.
 Atomic-context `hrtimer_cancel()` still cannot promise synchronous drain; owners
 must not free the object after that path without a later process-context drain.
 See [the audit and validation report](linuxkpi-stability-audit.md).
+
+### 2026-10-19: C1 migration limits
+
+The shared import now selects Linux v6.12.113. C1 closes build/API gaps and
+records software boot evidence; the user subsequently reported passing AMD
+desktop/games/glxinfo smoke testing. C3 physical regression is not yet tested.
+The UUID import alone uses `linuxkpi_guid_bytes` for DisplayPort identifiers;
+its RDRAND/fallback adapter is not a cryptographic random provider. Generic
+`get_random_bytes` remains unresolved for future callers. The firmware loader
+still has its 16 MiB bound. Optional IRQ-domain/XCP integration remains
+unsupported, and intermittent VKMS PMM drift remains
+an open regression signal. See [the C1 report](nouveau/c1-migration.md).
+
+### 2026-10-19: Nouveau C2/C3 compatibility boundary
+
+Nouveau is imported and links alone or with AMD on Linux v6.12.113. Real
+registration with the default probe gate closed is verified. GPUVM/maple-tree,
+DMA allocation masks, bulk slab rollback, legacy MSI and native slab alignment
+have targeted tests. See [the C3 report](nouveau/c3-compatibility.md).
+
+Optional I2C client-driver registration and component binding return
+`-EOPNOTSUPP`; audio links return NULL. SVM/HMM, guest IOMMU translation, runtime
+PM and Linux ACPI integration remain disabled. The inherited local-only
+`wbinvd_on_all_cpus` fallback, no-op `orderly_poweroff`/`emergency_restart`,
+firmware size limit and untested hardware cleanup are explicit C4 audit items.
+No claim of working NVIDIA hardware, thermal shutdown or reset is made.
+
+### 2026-10-19: C4 firmware preparation
+
+The loader now accepts bounded files up to 64 MiB with VM-backed large buffers,
+64-bit length validation, partial-read handling and matching release semantics.
+Private software guests load and CRC-check the pinned 38,061,600-byte AD106 GSP
+image plus its three loaders. This closes the earlier 16 MiB preparation gap;
+strict readiness still reports VKMS page-accounting drift.
+
+`orderly_poweroff`/`emergency_restart` now reach native emergency guest ACPI
+actions, rather than no-ops. There is no orderly userspace helper and emergency
+power-off skips driver cleanup; physical thermal behavior remains untested.
+The incomplete all-CPU WBINVD fallback is unchanged. The first C4 launcher
+requires CLFLUSH, exact reviewed AD106 functions, isolated groups, host display
+handoff and a matching passing readiness record. See [C4](nouveau/c4-bringup.md).

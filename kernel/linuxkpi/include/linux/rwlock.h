@@ -12,6 +12,8 @@
 #include <linux/preempt.h>
 #include <linux/compiler.h>
 
+void linuxkpi_tlb_poll(void);
+
 #define DEFINE_RWLOCK(x) rwlock_t x = __RW_LOCK_UNLOCKED(x)
 
 static inline void rwlock_init(rwlock_t *lock) {
@@ -23,6 +25,7 @@ static __always_inline void __kpi_read_acquire(rwlock_t *lock) {
   for (;;) {
     int cnt = __atomic_load_n(&lock->cnt, __ATOMIC_RELAXED);
     if (cnt < 0) {
+      linuxkpi_tlb_poll();
       __asm__ volatile("pause" ::: "memory");
       continue;
     }
@@ -41,8 +44,10 @@ static __always_inline void __kpi_write_acquire(rwlock_t *lock) {
   while (!__atomic_compare_exchange_n(&lock->cnt, &expected, -1, false,
                                       __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
     expected = 0;
-    while (__atomic_load_n(&lock->cnt, __ATOMIC_RELAXED) != 0)
+    while (__atomic_load_n(&lock->cnt, __ATOMIC_RELAXED) != 0) {
+      linuxkpi_tlb_poll();
       __asm__ volatile("pause" ::: "memory");
+    }
   }
 }
 

@@ -10,6 +10,7 @@
 
 static struct wait_queue_head bit_wqs[KPI_BIT_WQ_BUCKETS];
 static bool bit_wqs_ready;
+static DEFINE_SPINLOCK(bit_wqs_init_lock);
 
 static struct wait_queue_head *bit_wq(void *word) {
   unsigned long hash = ((unsigned long)word >> 3) % KPI_BIT_WQ_BUCKETS;
@@ -19,13 +20,22 @@ static struct wait_queue_head *bit_wq(void *word) {
 static void bit_wqs_init(void) {
   for (int i = 0; i < KPI_BIT_WQ_BUCKETS; i++)
     init_waitqueue_head(&bit_wqs[i]);
-  bit_wqs_ready = true;
+  smp_store_release(&bit_wqs_ready, true);
 }
 
 static struct wait_queue_head *bit_wq_ready(void *word) {
-  if (!bit_wqs_ready)
-    bit_wqs_init();
+  if (!smp_load_acquire(&bit_wqs_ready)) {
+    unsigned long flags;
+    spin_lock_irqsave(&bit_wqs_init_lock, flags);
+    if (!bit_wqs_ready)
+      bit_wqs_init();
+    spin_unlock_irqrestore(&bit_wqs_init_lock, flags);
+  }
   return bit_wq(word);
+}
+
+struct wait_queue_head *__kpi_var_waitqueue(const void *var) {
+  return bit_wq_ready((void *)var);
 }
 
 int wait_on_bit(unsigned long *word, int bit, unsigned int mode) {

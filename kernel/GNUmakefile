@@ -220,12 +220,16 @@ ifneq ($(linux-obj-y),)
     override LINUX_CPPFLAGS := \
         -I linuxkpi/include \
         -I ../build/firmware \
+        -I ../build/nouveau/firmware \
+        -I ../build/nouveau-618/firmware \
         -I linux/arch/x86/include \
         -I linux/arch/x86/include/generated \
         -I linux/include \
         -I linux/arch/x86/include/uapi \
         -I linux/arch/x86/include/generated/uapi \
         -I linux/include/uapi \
+        -I linux/include/generated/uapi \
+        -I linux/lib \
         -I limine-protocol/include \
         -isystem freestnd-c-hdrs/include \
         -D__KERNEL__ \
@@ -258,7 +262,18 @@ ifneq ($(linux-obj-y),)
     # appends to linux-obj-y) but after LINUX_CPPFLAGS/LINUX_CFLAGS (the
     # generated per-target rules append to them at parse time).
     KPI_AMDGPU ?= 1
+    KPI_NOUVEAU ?= 1
+    # Keep parameter namespaces distinct even in a single static kernel.
+    obj-$(ARCH)/linux/drivers/gpu/drm/amd/%.c.o: override LINUX_CPPFLAGS += -UKBUILD_MODNAME -DKBUILD_MODNAME='"amdgpu"'
+    obj-$(ARCH)/linux/drivers/gpu/drm/nouveau/%.c.o: override LINUX_CPPFLAGS += -UKBUILD_MODNAME -DKBUILD_MODNAME='"nouveau"'
+    obj-$(ARCH)/linux/drivers/gpu/drm/drm_print.c.o: override LINUX_CPPFLAGS += -UKBUILD_MODNAME -DKBUILD_MODNAME='"drm"'
     -include linux/Makefile.kbuild
+    ifeq ($(KPI_NOUVEAU),1)
+    obj-$(ARCH)/linux/drivers/gpu/drm/nouveau/nouveau_sched.c.o: override LINUX_CPPFLAGS += -Ddma_fence_wait_timeout=linuxkpi_nouveau_bind_wait_timeout
+    obj-$(ARCH)/linux/drivers/gpu/drm/nouveau/nvkm/engine/device/pci.c.o: override LINUX_CPPFLAGS += -Dnvkm_device_pci_new=linuxkpi_original_nvkm_device_pci_new
+    obj-$(ARCH)/linuxkpi/src/nouveau_probe_unwind.c.o: override LINUX_CPPFLAGS += -DAVORYOS_NOUVEAU_COMPAT -Ilinux/drivers/gpu/drm/nouveau/include/nvkm -Ilinux/drivers/gpu/drm/nouveau/include
+    obj-$(ARCH)/src/tests/linuxkpi/linux/test_nouveau_firmware_failures.c.o: override LINUX_CPPFLAGS += -DAVORYOS_NOUVEAU_COMPAT -Ilinux/drivers/gpu/drm/nouveau/include/nvkm -Ilinux/drivers/gpu/drm/nouveau/include -Ilinux/drivers/gpu/drm/nouveau/nvkm/subdev/gsp
+    endif
 
     override LINUX_OBJ := \
         $(addprefix obj-$(ARCH)/linux/,$(linux-obj-y:.c=.c.o))
@@ -268,6 +283,10 @@ ifneq ($(linux-obj-y),)
     # the real Linux headers.  See the pattern rules below.
     KPI_SRCFILES := $(shell find -L linuxkpi/src -type f -name '*.c' 2>/dev/null | LC_ALL=C sort)
     KPI_OBJ := $(addprefix obj-$(ARCH)/,$(KPI_SRCFILES:.c=.c.o))
+    # UUIDs currently serve DisplayPort identifiers only. Do not export a
+    # weak implementation of Linux cryptographic get_random_bytes().
+    obj-$(ARCH)/linux/lib/uuid.c.o: override LINUX_CPPFLAGS += -Dget_random_bytes=linuxkpi_guid_bytes
+    obj-$(ARCH)/linux/drivers/gpu/drm/drm_syncobj.c.o: override LINUX_CPPFLAGS += -Ddrm_syncobj_timeline_wait_ioctl=linuxkpi_original_drm_syncobj_timeline_wait_ioctl
     # Empty-manager eviction in the pinned import reads an undefined result.
     # LinuxKPI supplies the corrected entry point without editing the import.
     obj-$(ARCH)/linux/drivers/gpu/drm/ttm/ttm_resource.c.o: override LINUX_CPPFLAGS += -Dttm_resource_manager_evict_all=linuxkpi_original_ttm_resource_manager_evict_all
@@ -280,7 +299,7 @@ ifneq ($(linux-obj-y),)
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c.o: override LINUX_CPPFLAGS += -Damdgpu_ib_schedule=linuxkpi_original_amdgpu_ib_schedule
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c.o: override LINUX_CPPFLAGS += -include linuxkpi/include/linuxkpi/amdgpu_init_reset.h
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c.o: override LINUX_CPPFLAGS += -Damdgpu_gem_va_ioctl=linuxkpi_original_amdgpu_gem_va_ioctl
-    obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c.o obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c.o: override LINUX_CPPFLAGS += -Damdgpu_vm_get_task_info=linuxkpi_amdgpu_vm_fault_info
+    obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c.o obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c.o: override LINUX_CPPFLAGS += -Damdgpu_vm_get_task_info=linuxkpi_amdgpu_vm_fault_info -Damdgpu_vm_get_task_info_pasid=linuxkpi_amdgpu_vm_fault_info_pasid
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c.o: override LINUX_CPPFLAGS += -Damdgpu_vm_bo_update=linuxkpi_original_amdgpu_vm_bo_update -Dtrace_amdgpu_vm_bo_update=trace_linuxkpi_original_amdgpu_vm_bo_update
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_fence.c.o: override LINUX_CPPFLAGS += -Damdgpu_fence_emit=linuxkpi_original_amdgpu_fence_emit
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c.o: override LINUX_CPPFLAGS += -Dpsp_wait_for=linuxkpi_original_psp_wait_for
@@ -361,6 +380,18 @@ override HEADER_DEPS += $(LINUX_OBJ:.o=.d) $(KPI_OBJ:.o=.d) $(LINUX_TEST_OBJ:.o=
 .PHONY: all
 all: bin-$(ARCH)/$(OUTPUT)
 
+# Imported headers/layouts and AMD-specific bridge compilation differ between
+# source profiles. Switching a pin or gate must also rebuild native/KPI/test
+# objects, even when the alternate source's timestamps are older.
+LINUX_PROFILE_STAMP := obj-$(ARCH)/.linux-profile
+LINUX_IMPORT_ID := $(shell sed -n '/^tag=/p;/^commit=/p' linux/.pin 2>/dev/null)
+.PHONY: linux-profile-force
+$(LINUX_PROFILE_STAMP): linux-profile-force
+	@mkdir -p "$(dir $@)"
+	@printf '%s\n' '$(LINUX_IMPORT_ID) KPI_AMDGPU=$(KPI_AMDGPU) KPI_NOUVEAU=$(KPI_NOUVEAU) LINUX_IMPORTED=$(if $(linux-obj-y),1,0)' > $@.tmp
+	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm $@.tmp; fi
+$(OBJ) $(LINUX_OBJ): $(LINUX_PROFILE_STAMP)
+
 -include $(HEADER_DEPS)
 
 src/syscalls/vdso.so: src/syscalls/vdso.c src/syscalls/vdso.lds src/syscalls/vdso.version
@@ -382,7 +413,7 @@ obj-$(ARCH)/%.c.o: %.c GNUmakefile
 # above, so make prefers it for obj-$(ARCH)/linux/... targets.
 obj-$(ARCH)/linux/%.c.o: linux/%.c GNUmakefile
 	mkdir -p "$(dir $@)"
-	$(CC) $(CFLAGS) $(LINUX_CPPFLAGS) $(LINUX_CFLAGS) -c $< -o $@
+	$(CC) $(filter-out $(LINUX_REMOVE_CFLAGS),$(CFLAGS)) $(LINUX_CPPFLAGS) $(filter-out $(LINUX_REMOVE_CFLAGS),$(LINUX_CFLAGS)) -c $< -o $@
 
 ifneq ($(linux-obj-y),)
 # AvoryOS LinuxKPI implementations.  They speak the Linux API (real Linux

@@ -83,6 +83,16 @@ void kthread_flush_worker(struct kthread_worker *worker);
 bool kthread_cancel_work_sync(struct kthread_work *work);
 void kthread_destroy_worker(struct kthread_worker *worker);
 int kthread_worker_fn(void *worker_ptr);
+int linuxkpi_kthread_start_worker(struct kthread_worker *worker);
+#define kthread_run_worker(flags, namefmt, ...)                                \
+  ({ struct kthread_worker *__kw =                                             \
+       kthread_create_worker(flags, namefmt, ##__VA_ARGS__);                    \
+     if (!IS_ERR(__kw)) {                                                      \
+       int __ret = linuxkpi_kthread_start_worker(__kw);                         \
+       if (__ret) { kthread_destroy_worker(__kw); __kw = ERR_PTR(__ret); }      \
+     }                                                                        \
+     __kw; })
+
 
 /* And the worker can park itself; no-ops until the scheduler exposes it. */
 int kthread_park(struct task_struct *k);

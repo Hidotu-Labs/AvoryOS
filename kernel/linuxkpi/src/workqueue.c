@@ -15,6 +15,10 @@
 #include <linuxkpi/service.h>
 
 #define KPI_WQ_MAX_WORKERS 4
+static unsigned long workqueue_live_count;
+unsigned long linuxkpi_workqueue_live_count(void) {
+  return __atomic_load_n(&workqueue_live_count, __ATOMIC_ACQUIRE);
+}
 
 struct workqueue_struct {
   char *name;
@@ -414,6 +418,7 @@ struct workqueue_struct *alloc_workqueue(const char *fmt, unsigned int flags,
   /* Workers are created on demand by wq_ensure_worker() and retire after an
    * idle timeout, so an unused queue costs no thread. */
 
+  __atomic_add_fetch(&workqueue_live_count, 1, __ATOMIC_RELEASE);
   return wq;
 }
 
@@ -435,6 +440,7 @@ void destroy_workqueue(struct workqueue_struct *wq) {
   }
   kfree(wq->name);
   kfree(wq);
+  __atomic_sub_fetch(&workqueue_live_count, 1, __ATOMIC_RELEASE);
 }
 
 void linuxkpi_workqueue_init(void) {

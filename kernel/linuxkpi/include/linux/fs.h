@@ -27,6 +27,10 @@
 #include <linux/mutex.h>
 #include <linux/xarray.h>
 #include <uapi/linux/fcntl.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+#include <linux/file_ref.h>
+#endif
 
 struct module;
 struct inode;
@@ -146,8 +150,13 @@ struct dentry_operations {
   char *(*d_dname)(struct dentry *, char *, int);
 };
 
+#ifndef FOP_UNSIGNED_OFFSET
+#define FOP_UNSIGNED_OFFSET (1U << 5)
+#endif
+
 struct file_operations {
   struct module *owner;
+  unsigned int fop_flags;
   loff_t (*llseek)(struct file *, loff_t, int);
   ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);
   ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *);
@@ -174,7 +183,11 @@ struct file {
   struct path f_path;
   unsigned int f_flags;
   fmode_t f_mode;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+  file_ref_t f_ref;
+#else
   atomic_t f_count;
+#endif
   loff_t f_pos;
   struct address_space *f_mapping; /* == file_inode(file)->i_mapping */
   void *f_asc_node; /* native vfs_node_t * (Avory bridge, opaque here) */
@@ -240,6 +253,7 @@ struct file *file_clone_open(struct file *file);
  * construction. */
 #define __I_NEW 3
 #define I_NEW (1 << __I_NEW)
+#define inode_state_wait_address(inode, bit) ((char *)&(inode)->i_state + (bit))
 
 /* Upstream fs.h default file_operations seek; AvoryOS files are seekable
  * through the native layer, so this keeps the stock signature for drivers

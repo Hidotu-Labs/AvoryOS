@@ -29,6 +29,7 @@
 #include "syscalls/syscall.h"
 #include <stdint.h>
 #include <linuxkpi/gpu_diag.h>
+#include <linuxkpi/gpu_perf.h>
 
 #define PROC_SUPER_MAGIC 0x9fa0
 
@@ -274,7 +275,7 @@ static uint32_t procfs_tlbstats_read(vfs_node_t *node, uint32_t offset,
 
 static uint32_t procfs_drmstats_read(vfs_node_t *node, uint32_t offset,
                                      uint32_t size, uint8_t *buffer) {
-  char buf[2048];
+  char buf[4096];
   struct drm_stats stats;
   struct virtio_gpu_stats gpu_stats;
   ascentdrm_stats_snapshot(&stats);
@@ -301,6 +302,9 @@ static uint32_t procfs_drmstats_read(vfs_node_t *node, uint32_t offset,
       "virtio_present_batches: %llu\n"
       "virtio_frames_presented: %llu\n"
       "virtio_damage_pixels: %llu\n"
+      "virtio_scanout_pixels: %llu\n"
+      "virtio_compared_pixels: %llu\n"
+      "virtio_unchanged_frames: %llu\n"
       "virtio_present_wait_ms: %llu\n"
       "virtio_max_present_wait_ms: %llu\n"
       "virtio_present_failures: %llu\n"
@@ -351,6 +355,9 @@ static uint32_t procfs_drmstats_read(vfs_node_t *node, uint32_t offset,
       (unsigned long long)gpu_stats.present_batches,
       (unsigned long long)gpu_stats.frames_presented,
       (unsigned long long)gpu_stats.damage_pixels,
+      (unsigned long long)gpu_stats.scanout_pixels,
+      (unsigned long long)gpu_stats.compared_pixels,
+      (unsigned long long)gpu_stats.unchanged_frames,
       (unsigned long long)gpu_stats.present_wait_ms,
       (unsigned long long)gpu_stats.max_present_wait_ms,
       (unsigned long long)gpu_stats.present_failures,
@@ -3157,6 +3164,8 @@ void procfs_init(void) {
     ramfs_mount_on(procfs_root);
     procfs_root->statfs = procfs_statfs;
 
+    extern const char *kernel_boot_cmdline;
+    gpu_perf_init(kernel_boot_cmdline);
     vfs_open(procfs_root); // Permanent reference for the mount entry
 
     // Apply the mount: anyone looking up 'proc' will now get our virtual root
@@ -3303,7 +3312,7 @@ void procfs_init(void) {
       drmstats_node->flags = FS_FILE | FS_PERSISTENT;
       drmstats_node->mask = 0444;
       drmstats_node->read = procfs_drmstats_read;
-      drmstats_node->length = 2048;
+      drmstats_node->length = 4096;
       ramfs_mount_node(procfs_root, drmstats_node);
     }
 
@@ -4164,6 +4173,22 @@ static uint32_t procfs_sys_ksm_zero_pages_merged_read(vfs_node_t *node, uint32_t
     return size;
 }
 
+/* Background passes run while free RAM exceeded the eager watermark. */
+static uint32_t procfs_sys_ksm_passes_idle_read(vfs_node_t *node, uint32_t offset,
+                                                uint32_t size, uint8_t *buffer) {
+    (void)node;
+    struct ksm_stats st;
+    ksm_get_stats(&st);
+    uint64_t val = st.passes_idle;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%llu\n", (unsigned long long)val);
+    uint32_t len = strlen(buf);
+    if (offset >= len) return 0;
+    if (offset + size > len) size = len - offset;
+    memcpy(buffer, buf + offset, size);
+    return size;
+}
+
 static vfs_node_t *procfs_create_dir_node(const char *name) {
     vfs_node_t *dir = kmalloc(sizeof(vfs_node_t));
     if (!dir) return NULL;
@@ -4272,6 +4297,7 @@ void procfs_sys_init(vfs_node_t *procfs_root) {
         procfs_add_file_node(vm_dir, "ksm_pages_shared", procfs_sys_ksm_pages_shared_read, 16);
         procfs_add_file_node(vm_dir, "ksm_pages_sharing", procfs_sys_ksm_pages_sharing_read, 16);
         procfs_add_file_node(vm_dir, "ksm_zero_pages_merged", procfs_sys_ksm_zero_pages_merged_read, 16);
+        procfs_add_file_node(vm_dir, "ksm_passes_idle", procfs_sys_ksm_passes_idle_read, 16);
 
         ramfs_mount_node(sys_dir, vm_dir);
     }

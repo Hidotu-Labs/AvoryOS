@@ -180,6 +180,7 @@ void vmm_queue_free_user_pages_vma(uint64_t cr3, struct vma_list *vmas);
 void vmm_queue_free_mm(uint64_t cr3, struct mm_struct *mm);
 // Drains up to max_nodes deferred teardowns (all of them when max_nodes <= 0).
 int vmm_defer_drain(int max_nodes);
+void vmm_defer_sync(void);
 // Current backlog depth - O(1), lock-free.
 unsigned vmm_defer_pending(void);
 // sched_process_reap_queue() drains only past this depth, so wait4's own

@@ -18,6 +18,7 @@
 
 #include <linux/compiler.h>
 #include <linux/types.h>
+#include <linux/cleanup.h>
 
 unsigned int __kpi_preempt_count(void);
 void __kpi_preempt_add(int val);
@@ -36,6 +37,7 @@ bool __kpi_in_softirq(void);
 #define preempt_disable_notrace() preempt_disable()
 #define preempt_enable_notrace() preempt_enable()
 #define preempt_enable_no_resched() preempt_enable()
+DEFINE_LOCK_GUARD_0(preempt, preempt_disable(), preempt_enable())
 
 static inline void preempt_count_add(int val) { __kpi_preempt_add(val); }
 static inline void preempt_count_sub(int val) { __kpi_preempt_sub(val); }
@@ -44,6 +46,7 @@ static inline bool in_atomic(void) {
   return preempt_count() != 0 || __kpi_in_interrupt();
 }
 static inline bool in_interrupt(void) { return __kpi_in_interrupt(); }
+static inline bool in_task(void) { return !__kpi_in_interrupt(); }
 static inline bool in_softirq(void) { return __kpi_in_softirq(); }
 static inline bool in_serving_softirq(void) { return __kpi_in_softirq(); }
 

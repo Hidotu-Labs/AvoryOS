@@ -93,6 +93,100 @@ size_t pmm_get_free_pages_including_pcp(void) {
   return pmm_get_free_pages();
 }
 
+/* Bounded per-caller alloc/free counters.  kernel-side tests that measure a
+ * page-level delta over a bounded interval can enable/reset the registry at
+ * pass start, dump it on a nonzero delta, and attribute the retained pages to
+ * allocation (or free) call sites.  Keyed by exact return addresses; a full
+ * registry coalesces into slot 0 so the counter set stays finite. */
+#define PMM_SITE_SLOTS 96
+
+struct pmm_site {
+  void *caller;
+  unsigned long pages;
+};
+
+static struct pmm_site pmm_alloc_sites[PMM_SITE_SLOTS];
+static struct pmm_site pmm_free_sites[PMM_SITE_SLOTS];
+static bool pmm_sites_enabled;
+static spinlock_t pmm_sites_lock = SPINLOCK_INIT;
+
+static struct pmm_site *pmm_site_of(struct pmm_site *table, void *caller) {
+  uintptr_t start = (uintptr_t)caller;
+  struct pmm_site *coalesce = &table[0];
+
+  for (size_t probe = 0; probe < PMM_SITE_SLOTS; probe++) {
+    struct pmm_site *site = &table[(start + probe * 7) % PMM_SITE_SLOTS];
+    if (site->caller == caller)
+      return site;
+  }
+  for (size_t probe = 0; probe < PMM_SITE_SLOTS; probe++) {
+    struct pmm_site *site = &table[(start + probe * 7) % PMM_SITE_SLOTS];
+    if (!site->caller && !site->pages) {
+      site->caller = caller;
+      return site;
+    }
+  }
+  return coalesce;
+}
+
+void pmm_site_record_alloc(size_t pages, void *caller) {
+  if (!pmm_sites_enabled || !caller)
+    return;
+  spinlock_acquire(&pmm_sites_lock);
+  pmm_site_of(pmm_alloc_sites, caller)->pages += pages;
+  spinlock_release(&pmm_sites_lock);
+}
+
+void pmm_site_record_free(size_t pages, void *caller) {
+  if (!pmm_sites_enabled || !caller)
+    return;
+  spinlock_acquire(&pmm_sites_lock);
+  pmm_site_of(pmm_free_sites, caller)->pages += pages;
+  spinlock_release(&pmm_sites_lock);
+}
+
+void pmm_sites_reset(void) {
+  spinlock_acquire(&pmm_sites_lock);
+  for (size_t i = 0; i < PMM_SITE_SLOTS; i++)
+    pmm_alloc_sites[i] = (struct pmm_site){0, 0};
+  for (size_t i = 0; i < PMM_SITE_SLOTS; i++)
+    pmm_free_sites[i] = (struct pmm_site){0, 0};
+  pmm_sites_enabled = true;
+  spinlock_release(&pmm_sites_lock);
+}
+
+void pmm_sites_stop(void) {
+  spinlock_acquire(&pmm_sites_lock);
+  pmm_sites_enabled = false;
+  spinlock_release(&pmm_sites_lock);
+}
+
+void pmm_sites_dump(const char *tag) {
+  klogf("[INFO] PMM site dump (%s)\n", tag);
+  spinlock_acquire(&pmm_sites_lock);
+  for (size_t i = 0; i < PMM_SITE_SLOTS; i++) {
+    struct pmm_site *site = &pmm_alloc_sites[i];
+    if (!site->pages)
+      continue;
+    klog_puts("  alloc=");
+    klog_hex64((uint64_t)site->caller);
+    klog_puts(" pages=");
+    klog_uint64(site->pages);
+    klog_putchar('\n');
+  }
+  for (size_t i = 0; i < PMM_SITE_SLOTS; i++) {
+    struct pmm_site *site = &pmm_free_sites[i];
+    if (!site->pages)
+      continue;
+    klog_puts("  free =");
+    klog_hex64((uint64_t)site->caller);
+    klog_puts(" pages=");
+    klog_uint64(site->pages);
+    klog_putchar('\n');
+  }
+  spinlock_release(&pmm_sites_lock);
+}
+
 bool pmm_is_managed(uint64_t phys) {
   uint64_t pfn = phys / PAGE_SIZE;
   if (pfn < pmm_lowest_page || pfn >= pmm_highest_page || pmm_managed_bitmap == NULL)
@@ -182,8 +276,11 @@ __attribute__((optimize("O3"))) void pmm_decref(void *ptr) {
     return; // already on the buddy free list
   }
 
-  if (pmm_pcp_free_page(ptr))
+  if (pmm_pcp_free_page(ptr)) {
+    if (pmm_sites_enabled)
+      pmm_site_record_free(1, __builtin_return_address(0));
     return;
+  }
 
   int node = numa_phys_to_node((uint64_t)ptr);
   struct numa_node *n = numa_get_node(node);
@@ -191,6 +288,8 @@ __attribute__((optimize("O3"))) void pmm_decref(void *ptr) {
   spinlock_acquire(&n->zone.lock);
   buddy_free_internal(&n->zone, (uint64_t)ptr, 0);
   spinlock_release(&n->zone.lock);
+  if (pmm_sites_enabled)
+    pmm_site_record_free(1, __builtin_return_address(0));
 }
 
 uint16_t pmm_get_ref(void *ptr) {
@@ -242,7 +341,10 @@ __attribute__((optimize("O3"))) void *pmm_alloc_pages(size_t count) {
   int node = (cpu && cpu->cpu_id < MAX_CPUS) ? numa_cpu_to_node(cpu->cpu_id) : 0;
   hal_irq_restore(flags);
 
-  return pmm_alloc_pages_node(count, node);
+  void *res = pmm_alloc_pages_node(count, node);
+  if (res && pmm_sites_enabled)
+    pmm_site_record_alloc(count, __builtin_return_address(0));
+  return res;
 }
 
 void *pmm_alloc_pages_constrained(size_t count, uint64_t max_phys_addr) {
@@ -258,8 +360,11 @@ void *pmm_alloc_pages_range(size_t count, uint64_t min_phys_addr,
 
   struct numa_node *n = numa_get_node(node);
   void *res = buddy_alloc_pages_range(&n->zone, count, min_phys_addr, max_phys_addr);
-  if (res)
+  if (res) {
+    if (pmm_sites_enabled)
+      pmm_site_record_alloc(count, __builtin_return_address(0));
     return res;
+  }
 
   // Try fallback nodes if local node cannot satisfy range
   for (int fb = 0; fb < MAX_NUMA_NODES; fb++) {
@@ -279,8 +384,11 @@ void *pmm_alloc_pages_range(size_t count, uint64_t min_phys_addr,
 
 __attribute__((optimize("O3"))) void *pmm_alloc_page(void) {
   void *page = pmm_pcp_alloc_page();
-  if (page)
+  if (page) {
+    if (pmm_sites_enabled)
+      pmm_site_record_alloc(1, __builtin_return_address(0));
     return page;
+  }
   return pmm_alloc_pages(1);
 }
 
@@ -359,6 +467,8 @@ __attribute__((optimize("O3"))) void pmm_free_pages(void *ptr, size_t count) {
   }
 
   spinlock_release(&n->zone.lock);
+  if (pmm_sites_enabled)
+    pmm_site_record_free(num_pages, __builtin_return_address(0));
 }
 
 void pmm_free_page(void *ptr) { pmm_decref(ptr); }

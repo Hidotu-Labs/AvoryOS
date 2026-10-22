@@ -28,6 +28,8 @@
 #define CONFIG_X86_64 1
 #define CONFIG_64BIT 1
 #define CONFIG_MMU 1
+#define CONFIG_PAGE_SHIFT 12
+#define CONFIG_VIDEO_CMDLINE 1
 #define CONFIG_SMP 1
 
 /* Pointer-sized physical and DMA addresses.  Without these, Linux's types.h
@@ -126,6 +128,12 @@
 #define CONFIG_DRM_DISPLAY_HDCP_HELPER 1
 #define CONFIG_DRM_BUDDY 1
 #define CONFIG_DRM_EXEC 1
+#define CONFIG_DRM_GPUVM 1
+/* Nouveau Kbuild selection/debug constants; the independent build gate
+ * KPI_NOUVEAU defaults off. No platform, SVM, backlight or PM selects. */
+#define CONFIG_DRM_NOUVEAU 1
+#define CONFIG_NOUVEAU_DEBUG 5
+#define CONFIG_NOUVEAU_DEBUG_DEFAULT 3
 #define CONFIG_DRM_SUBALLOC_HELPER 1
 #define CONFIG_I2C_ALGOBIT 1
 

@@ -26,7 +26,7 @@ bool set_page_dirty(struct page *page) {
     return false;
   /* Returns true only when this call transitions the page to dirty, like
    * upstream's TestSetPageDirty contract. */
-  return !test_and_set_bit(PG_dirty, &page->flags);
+  return !test_and_set_bit(PG_dirty, &linuxkpi_page_flag_bits(page));
 }
 
 void mark_page_accessed(struct page *page) { (void)page; }

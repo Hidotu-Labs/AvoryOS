@@ -197,7 +197,8 @@ static bool kthread_worker_idle(struct kthread_worker *worker) {
 /* Create the worker thread for @worker if none is live; called from
  * kthread_queue_work() after the work is linked, under worker->lock so a
  * concurrently retiring worker either sees the work or leaves task NULL. */
-static void kthread_worker_spawn(struct kthread_worker *worker) {
+int linuxkpi_kthread_start_worker(struct kthread_worker *worker) {
+  int ret = 0;
   unsigned long flags;
   spin_lock_irqsave(&worker->lock, flags);
   if (!worker->task) {
@@ -207,9 +208,12 @@ static void kthread_worker_spawn(struct kthread_worker *worker) {
       worker->task = t;
       kthread_detach(t);
       wake_up_process(t);
+    } else {
+      ret = PTR_ERR(t);
     }
   }
   spin_unlock_irqrestore(&worker->lock, flags);
+  return ret;
 }
 
 int kthread_worker_fn(void *worker_ptr) {
@@ -273,7 +277,7 @@ bool kthread_queue_work(struct kthread_worker *worker,
   spin_unlock_irqrestore(&worker->lock, flags);
 
   if (spawn)
-    kthread_worker_spawn(worker);
+    linuxkpi_kthread_start_worker(worker);
 
   if (ret)
     wake_up(&worker->wait);

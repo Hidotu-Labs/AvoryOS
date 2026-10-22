@@ -90,6 +90,31 @@ install_apk() {
     pacman_run -S "${ARCH_NAME}"
 }
 
+if [ "${1:-}" = "--nouveau-userspace" ]; then
+    pacman_sync_once
+    pacman_run -S --needed mesa vulkan-nouveau vulkan-radeon vulkan-swrast \
+        vulkan-mesa-implicit-layers vulkan-icd-loader vulkan-tools mesa-utils
+    install -d "${ROOTFS_DIR}/usr/share/avory-xorg" "${ROOTFS_DIR}/usr/bin"
+    install -m 0644 "${ROOT_DIR}/config/xorg/10-nouveau.conf" \
+        "${ROOTFS_DIR}/usr/share/avory-xorg/10-modesetting-nouveau.conf"
+    install -m 0755 "${ROOT_DIR}/config/xorg/avory-nouveau-xorg.sh" \
+        "${ROOTFS_DIR}/usr/bin/avory-nouveau-xorg"
+    install -m 0755 "${ROOT_DIR}/config/xorg/avory-xorg-profile.sh" \
+        "${ROOTFS_DIR}/usr/bin/avory-xorg-profile"
+    install -d "${ROOTFS_DIR}/etc/X11/xinit/xinitrc.d" "${ROOTFS_DIR}/etc/profile.d"
+    install -m 0755 "${ROOT_DIR}/config/xorg/44-nouveau-env.sh" \
+        "${ROOTFS_DIR}/etc/X11/xinit/xinitrc.d/44-nouveau-env.sh"
+    install -m 0644 "${ROOT_DIR}/config/xorg/44-nouveau-env.sh" \
+        "${ROOTFS_DIR}/etc/profile.d/avory-nouveau.sh"
+    install -d "${ROOTFS_DIR}/etc/sddm.conf.d"
+    install -m 0644 "${ROOT_DIR}/config/xorg/20-output.conf" \
+        "${ROOTFS_DIR}/etc/sddm.conf.d/20-output.conf"
+    exit 0
+elif [ "$#" -ne 0 ]; then
+    echo "Usage: $0 [--nouveau-userspace]" >&2
+    exit 2
+fi
+
 # Bootstrap the target root: filesystem (usrmerge layout, base accounts),
 # glibc, bash (package scriptlets use it), busybox (/bin/sh, /sbin/init) and
 # musl (loader for the prebuilt musl userland binaries like avory-login) plus
@@ -278,6 +303,7 @@ install_apk "mesa-gl" "main"
 install_apk "mesa-gles" "main"
 install_apk "mesa-vulkan-swrast" "main"
 install_apk "mesa-vulkan-ati" "main"
+install_apk "vulkan-nouveau" "main"
 install_apk "mesa-demos" "community"
 install_apk "freeglut" "community"
 install_apk "libliftoff" "community"
@@ -1232,6 +1258,15 @@ install -m 0644 "${ROOT_DIR}/config/xorg/10-native.conf" \
     "${ROOTFS_DIR}/etc/X11/xorg.conf.d/10-modesetting.conf"
 install -m 0755 "${ROOT_DIR}/config/xorg/avory-xorg-profile.sh" \
     "${ROOTFS_DIR}/usr/bin/avory-xorg-profile"
+install -m 0755 "${ROOT_DIR}/config/xorg/avory-nouveau-xorg.sh" \
+    "${ROOTFS_DIR}/usr/bin/avory-nouveau-xorg"
+install -m 0644 "${ROOT_DIR}/config/xorg/10-nouveau.conf" \
+    "${ROOTFS_DIR}/usr/share/avory-xorg/10-modesetting-nouveau.conf"
+install -d "${ROOTFS_DIR}/etc/X11/xinit/xinitrc.d" "${ROOTFS_DIR}/etc/profile.d"
+install -m 0755 "${ROOT_DIR}/config/xorg/44-nouveau-env.sh" \
+    "${ROOTFS_DIR}/etc/X11/xinit/xinitrc.d/44-nouveau-env.sh"
+install -m 0644 "${ROOT_DIR}/config/xorg/44-nouveau-env.sh" \
+    "${ROOTFS_DIR}/etc/profile.d/avory-nouveau.sh"
 # SDDM display manager defaults, baked into the image so bare `sddm`
 # starts with a workable root login and output binding without a session
 # launcher regenerating them first. Without /etc/sddm.conf SDDM hides

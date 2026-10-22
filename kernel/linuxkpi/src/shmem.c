@@ -28,11 +28,32 @@
  * allocated page only once. A mutex allows allocation to sleep. */
 static DEFINE_MUTEX(shmem_page_lock);
 
+struct file *shmem_file_setup_with_mnt(struct vfsmount *mnt, const char *name,
+                                      loff_t size, unsigned long flags) {
+  /* A caller-supplied tmpfs mount needs mount policy and ownership that the
+   * native anonymous page store cannot provide. Default GEM uses NULL. */
+  if (mnt)
+    return ERR_PTR(-EOPNOTSUPP);
+  return shmem_file_setup(name, size, flags);
+}
+
 static void shmem_free_page(struct page *page) {
   if (!page)
     return;
+  folio_lock(page_folio(page));
   page->mapping = NULL;
+  folio_unlock(page_folio(page));
   put_page(page);
+}
+
+int shmem_writeout(struct folio *folio, struct swap_iocb **plug,
+                   struct list_head *list) {
+  (void)plug;
+  (void)list;
+  /* No native swap backend: keep the resident copy dirty and locked. The
+   * caller handles the failure and retains the backup's ownership. */
+  folio_mark_dirty(folio);
+  return -EOPNOTSUPP;
 }
 
 /* Frees every page in [start, end] (page indices) and returns the count.

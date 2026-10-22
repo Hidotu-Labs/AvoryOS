@@ -26,6 +26,7 @@ typedef struct kmem_cache {
     size_t obj_size;        // Size of each object (user-visible)
     size_t obj_aligned;     // obj_size rounded up to alignment
     size_t alignment;       // Minimum alignment for objects
+    size_t object_offset;   // Aligned start after the in-page slab metadata
     uint32_t objs_per_slab; // Number of objects that fit in a slab page
 
     // Slab lists (state machine: free → partial → full)

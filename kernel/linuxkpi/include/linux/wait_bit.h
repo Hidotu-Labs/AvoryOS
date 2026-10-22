@@ -8,6 +8,11 @@
  * the address.  Same API shape as Linux, coarser wakeups. */
 
 #include <linux/types.h>
+#include <linux/wait.h>
+
+struct wait_queue_head *__kpi_var_waitqueue(const void *var);
+#define wait_var_event(var, condition) \
+  wait_event(*__kpi_var_waitqueue(var), condition)
 
 int wait_on_bit(unsigned long *word, int bit, unsigned int mode);
 int wait_on_bit_io(unsigned long *word, int bit, unsigned int mode);

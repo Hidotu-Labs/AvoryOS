@@ -282,6 +282,9 @@ bool seccomp_syscall(struct thread *t, struct syscall_regs *regs,
     uint32_t error = result & 0xffffU;
     if (error > 4095) error = 4095;
     regs->rax = (uint64_t)-(int64_t)error;
+    /* Mark the decision so error reporting can attribute it to the filter:
+     * the syscall handlers never ran and cannot be blamed for this errno. */
+    __atomic_store_n(&t->seccomp_deny_pending, true, __ATOMIC_RELEASE);
     return false;
   }
   case SC_TRAP:

@@ -80,6 +80,7 @@ int asc_vfs_kernel_ioctl(void *node, unsigned int request,
 int asc_vfs_kernel_poll(void *node, int events);
 /* File size (`length`) of a node opened with asc_vfs_kernel_open(). */
 unsigned int asc_vfs_kernel_size(void *node);
+unsigned long long asc_vfs_kernel_size64(void *node);
 unsigned int asc_vfs_kernel_read(void *node, unsigned int offset,
                                  unsigned int size, unsigned char *buffer);
 unsigned int asc_vfs_kernel_write(void *node, unsigned int offset,

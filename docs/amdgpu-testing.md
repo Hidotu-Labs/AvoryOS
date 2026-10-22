@@ -164,8 +164,8 @@ longer a symlink to `/usr/lib`.
   `make run-c7-prime` again can be followed by a whole-host reboot during the
   next GPU initialization. Pixel artifacts also returned after an initially
   clean run. Treat both symptoms as unresolved and pause physical retries.
-  `run-c7-prime` invokes `run-vfio` with `0000:0e:00.0`; it does not call the
-  separate `reset-gpu` recipe. Host VFIO open/close and QEMU device reset can
+  `run-c7-prime` invokes `run-vfio` with `0000:0e:00.0`; it does not perform a
+  separate host reset. Host VFIO open/close and QEMU device reset can
   exercise reset and power paths. A completed reset request or a new VM is
   not proof that all GPU/PSP/SMU state is cold. The earlier statement that
   QEMU/VFIO never resets on exit was incorrect.
@@ -173,9 +173,9 @@ longer a symlink to `/usr/lib`.
   group 24, and the shared upstream bridge `00:08.1` with host-owned audio,
   CCP and xHCI functions in groups 25–29. This does not establish that a bus
   reset actually ran: host ownership checks may reject it. Do not force a
-  shared-bridge reset or use `make reset-gpu` as an automatic retry step.
-  The helper performs host writes and is a separate explicitly authorized
-  experiment, not a diagnosis or a guaranteed cold-start solution.
+  shared-bridge reset. The former host reset helper was removed because a
+  completed reset request did not establish device recovery or cold-start
+  behavior.
   The native guest shutdown path dispatches imported PCI shutdown callbacks;
   forced QEMU termination bypasses those guest callbacks. A clean shutdown
   still does not establish safe hardware reinitialization.

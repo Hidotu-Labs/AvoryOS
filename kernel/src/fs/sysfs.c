@@ -139,10 +139,20 @@ static int sysfs_readlink_cb(vfs_node_t *node, char *buf, uint32_t size) {
 }
 
 // Create a symlink under parent pointing to target.
+static void sysfs_symlink_destroy(vfs_node_t *node) {
+  kfree(node->ptr);
+  node->ptr = NULL;
+}
+
 static void sysfs_symlink(vfs_node_t *parent, const char *name,
                           const char *target) {
-  if (!parent || vfs_finddir(parent, (char *)name))
+  if (!parent)
     return;
+  vfs_node_t *existing = vfs_finddir(parent, (char *)name);
+  if (existing) {
+    vfs_close(existing);
+    return;
+  }
 
   vfs_node_t *sl = kmalloc(sizeof(vfs_node_t));
   if (!sl)
@@ -154,9 +164,13 @@ static void sysfs_symlink(vfs_node_t *parent, const char *name,
   sl->readlink = sysfs_readlink_cb;
   // Store target string — allocate a copy
   char *tgt = kmalloc(strlen(target) + 1);
-  if (tgt)
-    strcpy(tgt, target);
+  if (!tgt) {
+    kfree(sl);
+    return;
+  }
+  strcpy(tgt, target);
   sl->ptr = (vfs_node_t *)tgt; // reuse ptr field for the string
+  sl->destroy = sysfs_symlink_destroy;
   ramfs_mount_node(parent, sl);
   vfs_dentry_invalidate(parent, name);
 }
@@ -791,10 +805,8 @@ void sysfs_init(void) {
   vfs_node_t *drm_class = sysfs_mkdir(class_dir, "drm");
   {
     const struct pci_device *native_pci = sysfs_display_pci(false);
-    const struct pci_device *amd_pci = sysfs_display_pci(true);
-    char pci_addr[20], amd_addr[20];
+    char pci_addr[20];
     sysfs_display_address(pci_addr, sizeof(pci_addr), native_pci);
-    sysfs_display_address(amd_addr, sizeof(amd_addr), amd_pci);
     // Build symlink target as a relative path from /sys/class/drm/card0.
     // wlroots calls readlink() and then resolves the result relative to the
     // symlink's parent directory (/sys/class/drm/), so we must use a relative
@@ -811,28 +823,6 @@ void sysfs_init(void) {
     strcat(conn_sl_target, pci_addr);
     strcat(conn_sl_target, "/drm/card0/card0-HDMI-A-1");
     sysfs_symlink(drm_class, "card0-HDMI-A-1", conn_sl_target);
-
-    /* Phase 6 C7: the imported amdgpu DRM device is card2 (LinuxKPI minor
-     * 2).  Weston's --drm-device and udev resolve a name through
-     * /sys/class/<subsystem>/<sysname> (eudev's subsystem_sysname_dirs), so
-     * the node must exist here or `weston --drm-device=card2` logs "not a
-     * KMS device" and never opens it.  The devnode name comes from the
-     * uevent file's DEVNAME. */
-    char sl_target2[128];
-    strcpy(sl_target2, "../../devices/pci0000:00/");
-    strcat(sl_target2, amd_addr);
-    strcat(sl_target2, "/drm/card2");
-    sysfs_symlink(drm_class, "card2", sl_target2);
-
-    /* amdgpu's render node.  Mesa's loader (loader_get_driver_for_fd ->
-     * drmGetDevice2) resolves it through /sys/dev/char/226:129/device/drm
-     * and the PCI subsystem IDs; without this entry it cannot identify the
-     * GPU and falls back to llvmpipe. */
-    char sl_target3[128];
-    strcpy(sl_target3, "../../devices/pci0000:00/");
-    strcat(sl_target3, amd_addr);
-    strcat(sl_target3, "/drm/renderD129");
-    sysfs_symlink(drm_class, "renderD129", sl_target3);
 
     // Also create the real device directory that the symlink points to
     vfs_node_t *pci_seg = sysfs_mkdir(devices_dir, "pci0000:00");
@@ -864,39 +854,6 @@ void sysfs_init(void) {
     sysfs_symlink(card0_dir, "subsystem", "../../../../../class/drm");
     sysfs_symlink(card0_dir, "device", "../..");
 
-    vfs_node_t *native_render = sysfs_mkdir(drm_dev, "renderD128");
-    sysfs_mkfile(native_render, "dev", "226:128\n");
-    sysfs_mkfile(native_render, "uevent",
-                 "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\n"
-                 "DEVTYPE=drm_minor\nSUBSYSTEM=drm\n");
-    sysfs_symlink(native_render, "subsystem", "../../../../../class/drm");
-    sysfs_symlink(native_render, "device", "../..");
-    char native_render_target[128];
-    snprintf(native_render_target, sizeof(native_render_target),
-             "../../devices/pci0000:00/%s/drm/renderD128", pci_addr);
-    sysfs_symlink(drm_class, "renderD128", native_render_target);
-
-    /* Native card0 belongs to VirtIO; AMD's nodes belong to its own PCI
-     * parent. Sharing the first display-class parent made udev/Xorg identify
-     * the virtual display as AMD whenever AMD appeared first on the bus. */
-    vfs_node_t *amd_dev = sysfs_mkdir(pci_seg, amd_addr);
-    vfs_node_t *amd_drm = sysfs_mkdir(amd_dev, "drm");
-    vfs_node_t *card2_dir = sysfs_mkdir(amd_drm, "card2");
-    sysfs_mkfile(card2_dir, "dev", "226:2\n");
-    sysfs_mkfile(card2_dir, "uevent",
-                 "MAJOR=226\nMINOR=2\nDEVNAME=dri/card2\n"
-                 "DEVTYPE=drm_minor\nSUBSYSTEM=drm\n");
-    sysfs_symlink(card2_dir, "subsystem", "../../../../../class/drm");
-    sysfs_symlink(card2_dir, "device", "../..");
-
-    /* renderD129 (amdgpu render node, DRM minor 129). */
-    vfs_node_t *render_dir = sysfs_mkdir(amd_drm, "renderD129");
-    sysfs_mkfile(render_dir, "dev", "226:129\n");
-    sysfs_mkfile(render_dir, "uevent",
-                 "MAJOR=226\nMINOR=129\nDEVNAME=dri/renderD129\n"
-                 "DEVTYPE=drm_minor\nSUBSYSTEM=drm\n");
-    sysfs_symlink(render_dir, "subsystem", "../../../../../class/drm");
-    sysfs_symlink(render_dir, "device", "../..");
     // Keep the intermediate drm/ and pci0000:00/ directories as plain sysfs
     // containers. Giving either a uevent file makes libudev treat it as a
     // device, but neither has a subsystem; Xorg then dereferences a NULL
@@ -976,9 +933,7 @@ void sysfs_init(void) {
     strcat(sysfs_gpu_devpath, "/drm/card0");
     strcpy(sysfs_gpu_connector_devpath, sysfs_gpu_devpath);
     strcat(sysfs_gpu_connector_devpath, "/card0-HDMI-A-1");
-    strcpy(sysfs_gpu2_devpath, "/devices/pci0000:00/");
-    strcat(sysfs_gpu2_devpath, amd_addr);
-    strcat(sysfs_gpu2_devpath, "/drm/card2");
+
 
     // Add devices/ directory under drm_class so that
     // /sys/subsystem/drm/devices/ enumeration finds card0
@@ -998,18 +953,6 @@ void sysfs_init(void) {
       strcat(conn_rel, "/drm/card0/card0-HDMI-A-1");
       sysfs_symlink(drm_devices_dir, "card0-HDMI-A-1", conn_rel);
 
-      /* Phase 6 C7: same for amdgpu's card2 and render node. */
-      char card2_rel[128];
-      strcpy(card2_rel, "../../../devices/pci0000:00/");
-      strcat(card2_rel, amd_addr);
-      strcat(card2_rel, "/drm/card2");
-      sysfs_symlink(drm_devices_dir, "card2", card2_rel);
-
-      char render_rel[128];
-      strcpy(render_rel, "../../../devices/pci0000:00/");
-      strcat(render_rel, amd_addr);
-      strcat(render_rel, "/drm/renderD129");
-      sysfs_symlink(drm_devices_dir, "renderD129", render_rel);
     }
   }
 
@@ -1160,18 +1103,6 @@ void sysfs_init(void) {
     char dev_target[160];
     snprintf(dev_target, sizeof(dev_target), "../..%s", sysfs_gpu_devpath);
     sysfs_symlink(char_dir, "226:0", dev_target);
-    snprintf(dev_target, sizeof(dev_target), "../..%s", sysfs_gpu2_devpath);
-    sysfs_symlink(char_dir, "226:2", dev_target);
-    char amd_addr[20];
-    sysfs_display_address(amd_addr, sizeof(amd_addr), sysfs_display_pci(true));
-    snprintf(dev_target, sizeof(dev_target),
-             "../../devices/pci0000:00/%s/drm/renderD129", amd_addr);
-    sysfs_symlink(char_dir, "226:129", dev_target);
-    char native_addr[20];
-    sysfs_display_address(native_addr, sizeof(native_addr), sysfs_display_pci(false));
-    snprintf(dev_target, sizeof(dev_target),
-             "../../devices/pci0000:00/%s/drm/renderD128", native_addr);
-    sysfs_symlink(char_dir, "226:128", dev_target);
   }
 
   // Input char devices: /sys/dev/char/13:64 -> symlink to virtual device
@@ -1436,6 +1367,72 @@ void asc_sysfs_remove(void *dir, const char *name) {
     sysfs_remove_file_child(d, child);
   }
   vfs_close(child);
+}
+
+static vfs_node_t *sysfs_drm_minor_parent(const char *pci_bdf) {
+  char path[128];
+  vfs_node_t *parent;
+
+  if (pci_bdf) {
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s", pci_bdf);
+    parent = asc_sysfs_dir_by_path(path);
+  } else {
+    parent = asc_sysfs_dir_by_path("/sys/devices/virtual");
+  }
+  return parent ? sysfs_mkdir(parent, "drm") : NULL;
+}
+
+void *asc_sysfs_drm_minor_add(void *class_dir, const char *name,
+                             const char *pci_bdf, unsigned int major,
+                             unsigned int minor) {
+  vfs_node_t *parent = sysfs_drm_minor_parent(pci_bdf);
+  vfs_node_t *char_dir = asc_sysfs_dir_by_path("/sys/dev/char");
+  vfs_node_t *devices;
+  vfs_node_t *node;
+  char target[192], value[192], number[32];
+
+  if (!class_dir || !parent || !char_dir || !name || !*name)
+    return NULL;
+  node = sysfs_mkdir(parent, name);
+  if (!node)
+    return NULL;
+  snprintf(value, sizeof(value), "%u:%u\n", major, minor);
+  sysfs_mkfile(node, "dev", value);
+  snprintf(value, sizeof(value),
+           "MAJOR=%u\nMINOR=%u\nDEVNAME=dri/%s\nDEVTYPE=drm_minor\nSUBSYSTEM=drm\n",
+           major, minor, name);
+  sysfs_mkfile(node, "uevent", value);
+  sysfs_symlink(node, "subsystem", "/sys/class/drm");
+  if (pci_bdf) {
+    snprintf(target, sizeof(target), "/sys/bus/pci/devices/%s", pci_bdf);
+    sysfs_symlink(node, "device", target);
+    snprintf(target, sizeof(target), "/sys/bus/pci/devices/%s/drm/%s",
+             pci_bdf, name);
+  } else {
+    snprintf(target, sizeof(target), "/sys/devices/virtual/drm/%s", name);
+  }
+  sysfs_symlink(class_dir, name, target);
+  devices = sysfs_mkdir(class_dir, "devices");
+  if (devices)
+    sysfs_symlink(devices, name, target);
+  snprintf(number, sizeof(number), "%u:%u", major, minor);
+  sysfs_symlink(char_dir, number, target);
+  return node;
+}
+
+void asc_sysfs_drm_minor_remove(void *class_dir, const char *name,
+                                const char *pci_bdf, unsigned int major,
+                                unsigned int minor) {
+  vfs_node_t *parent = sysfs_drm_minor_parent(pci_bdf);
+  vfs_node_t *char_dir = asc_sysfs_dir_by_path("/sys/dev/char");
+  vfs_node_t *devices = asc_sysfs_dir_by_path("/sys/class/drm/devices");
+  char number[32];
+
+  snprintf(number, sizeof(number), "%u:%u", major, minor);
+  asc_sysfs_remove(char_dir, number);
+  asc_sysfs_remove(devices, name);
+  asc_sysfs_remove(class_dir, name);
+  asc_sysfs_remove(parent, name);
 }
 
 static bool sysfs_child_exists(vfs_node_t *dir, const char *name) {

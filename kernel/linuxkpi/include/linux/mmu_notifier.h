@@ -10,6 +10,9 @@
 #include <linux/types.h>
 #include <linux/mm_types.h>
 
+/* Layout-only when CONFIG_MMU_NOTIFIER is disabled; no registration API. */
+struct mmu_notifier { const void *ops; struct mm_struct *mm; };
+
 struct mmu_notifier_range {
   struct mm_struct *mm;
   unsigned long start;

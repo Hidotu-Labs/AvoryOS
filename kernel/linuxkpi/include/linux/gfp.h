@@ -27,4 +27,9 @@ static inline bool gfpflags_allow_spinning(const gfp_t gfp_flags) {
  * no zones here, so the value is informational. */
 #define gfp_zone(gfp_flags) (0)
 
+#ifndef default_gfp
+#define __kpi_default_gfp(a, b, ...) b
+#define default_gfp(...) __kpi_default_gfp(, ##__VA_ARGS__, GFP_KERNEL)
+#endif
+
 #endif /* __AVORY_LINUXKPI_GFP_H */
