@@ -23,6 +23,18 @@ ROOTFS_DIR="${BUILD_DIR}/rootfs"
 
 mkdir -p "${BUILD_DIR}" "${PACMAN_CACHE}" "${ROOTFS_DIR}" "${ROOTFS_DIR}/etc"
 
+cat > "${PACMAN_CONF}" <<'EOF'
+[options]
+Architecture = x86_64
+SigLevel = Never
+
+[core]
+Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
+
+[extra]
+Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
+EOF
+
 # One-time migration: a previous Alpine-based tree cannot be overlaid with
 # Arch packages (different libc, different layout). Wipe it once; afterwards
 # pacman tracks state itself and reruns are incremental.
