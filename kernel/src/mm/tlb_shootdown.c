@@ -15,6 +15,7 @@
 #include "../drivers/serial.h"
 #include "../lib/string.h"
 #include "../lib/tsc.h"
+#include "../fs/vfs_rcu.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -1010,8 +1011,10 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
                     shootdown_stuck(self, c, addr);
             }
         }
-        if (!progress)
+        if (!progress) {
+            vfs_rcu_poll();
             hal_cpu_relax();
+        }
     }
 
     uint64_t waited = rdtsc() - wait_start;

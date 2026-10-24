@@ -257,6 +257,12 @@ static bool gpu_command_locked(
 static bool
 gpu_command(const void *req, uint32_t req_len, void *resp, uint32_t resp_len, uint32_t *resp_type) {
     while (__atomic_exchange_n(&gpu_command_owner, 1, __ATOMIC_ACQUIRE)) {
+        /* Console flushing holds its IRQ-saving lock. An earlier command
+         * may have parked on this CPU waiting for a control-queue interrupt;
+         * spinning here would prevent both its wakeup and its resumption.
+         * Atomic callers must retry later instead of waiting for the owner. */
+        if (!hal_irq_enabled())
+            return false;
         if (gpu_worker_started && sched_get_current() && hal_irq_enabled())
             sched_yield();
         else
@@ -271,6 +277,8 @@ gpu_command(const void *req, uint32_t req_len, void *resp, uint32_t resp_len, ui
 static bool gpu_command_batch(const void *const *requests, const uint32_t *lengths,
                                uint32_t count) {
     while (__atomic_exchange_n(&gpu_command_owner, 1, __ATOMIC_ACQUIRE)) {
+        if (!hal_irq_enabled())
+            return false;
         if (gpu_worker_started && sched_get_current() && hal_irq_enabled())
             sched_yield();
         else
@@ -1266,24 +1274,24 @@ static void virtio_gpu_worker(void) {
         gpu_drain_completions();
         gpu_collect_scanouts();
         gpu_drain_cursor_completions();
+        /* A timer must not switch us out after BLOCKED is published but
+         * before the wake entry and fallback deadline exist. Keep the ready
+         * recheck and fast-path cleanup inside the same IRQ-masked window. */
+        hal_irq_state_t irq_flags = hal_irq_save();
+        self->wakeup_ticks = gpu_irq_installed ? 0 : lapic_timer_get_ticks() + 1;
         self->state = THREAD_BLOCKED;
         wait_queue_add(&gpu_worker_wait, &entry);
         if (gpu.controlq.last_used_idx == gpu.controlq.used->idx &&
-            gpu.cursorq.last_used_idx == gpu.cursorq.used->idx && !gpu_pending_work) {
-            self->wakeup_ticks = gpu_irq_installed ? 0 : lapic_timer_get_ticks() + 1;
-        } else {
-            self->state = THREAD_RUNNING;
-            self->wakeup_ticks = 0;
-            wait_queue_remove(&gpu_worker_wait, &entry);
-            if (self->state == THREAD_BLOCKED)
-                self->state = THREAD_RUNNING;
-            continue;
+            gpu.cursorq.last_used_idx == gpu.cursorq.used->idx &&
+            !__atomic_load_n(&gpu_pending_work, __ATOMIC_ACQUIRE)) {
+            hal_irq_restore(irq_flags);
+            sched_yield();
+            irq_flags = hal_irq_save();
         }
-        sched_yield();
         self->wakeup_ticks = 0;
         wait_queue_remove(&gpu_worker_wait, &entry);
-        if (self->state == THREAD_BLOCKED)
-            self->state = THREAD_RUNNING;
+        self->state = THREAD_RUNNING;
+        hal_irq_restore(irq_flags);
     }
 }
 
@@ -1617,8 +1625,16 @@ void virtio_gpu_console_commit(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
                (size_t)cw * 4);
     __asm__ volatile("" ::: "memory");
     uint64_t off = (uint64_t)cy * dst_pitch + (uint64_t)cx * 4;
-    transfer_2d_rect(fbcon_scanout_id, cx, cy, cw, ch, off);
-    flush_rect(fbcon_scanout_id, cx, cy, cw, ch);
+    if (!transfer_2d_rect(fbcon_scanout_id, cx, cy, cw, ch, off) ||
+        !flush_rect(fbcon_scanout_id, cx, cy, cw, ch)) {
+        /* A command owner can be asleep while this IRQ-masked console
+         * flush runs. Keep the damage for the next console commit. */
+        pending_cx = cx;
+        pending_cy = cy;
+        pending_cw = cw;
+        pending_ch = ch;
+        console_commit_pending = true;
+    }
 }
 int virtio_gpu_prepare_prime_fb(struct drm_gem_object *obj, uint32_t width,
                                 uint32_t height, uint32_t pitch, uint32_t offset) {
@@ -1898,14 +1914,20 @@ static void virtio_gpu_flip_worker(void) {
     struct thread *self = sched_get_current();
     wait_queue_entry_t entry = {.thread = self};
     for (;;) {
+        /* Publish the wait atomically with respect to local preemption.
+         * Finish ready-path cleanup before making the CPU preemptible again. */
+        hal_irq_state_t irq_flags = hal_irq_save();
+        self->wakeup_ticks = 0;
         self->state = THREAD_BLOCKED;
         wait_queue_add(&gpu_flip_wait, &entry);
         if (__atomic_load_n(&gpu_async_flip_state, __ATOMIC_ACQUIRE) != 1) {
-            self->wakeup_ticks = 0;
+            hal_irq_restore(irq_flags);
             sched_yield();
+            irq_flags = hal_irq_save();
         }
         wait_queue_remove(&gpu_flip_wait, &entry);
         self->state = THREAD_RUNNING;
+        hal_irq_restore(irq_flags);
         if (__atomic_load_n(&gpu_async_flip_state, __ATOMIC_ACQUIRE) != 1)
             continue;
         __atomic_store_n(&gpu_async_flip_state, 2, __ATOMIC_RELEASE);

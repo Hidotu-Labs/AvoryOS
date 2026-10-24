@@ -1,0 +1,7 @@
+mode-classic=True
+nostalgia-hacks=False
+nostalgia-customblocks=False
+nostalgia-usecpe=False
+nostalgia-servertextures=False
+nostalgia-classictablist=True
+nostalgia-classicoptions=True

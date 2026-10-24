@@ -252,7 +252,7 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
 }
 
 uint64_t vmm_clone_user_mappings(uint64_t *src_pml4_phys) {
-  vmm_lock_acquire();
+  vmm_lock_acquire_for(src_pml4_phys, 0);
 
   void *new_pml4_phys = pmm_alloc();
   if (!new_pml4_phys) {
@@ -291,7 +291,7 @@ uint64_t vmm_clone_user_mappings(uint64_t *src_pml4_phys) {
   uint64_t *kernel_pml4_virt =
       (uint64_t *)PHYS_TO_VIRT((uint64_t)vmm_get_kernel_pml4());
   for (size_t i = 256; i < 512; i++)
-    new_pml4_virt[i] = kernel_pml4_virt[i];
+    new_pml4_virt[i] = __atomic_load_n(&kernel_pml4_virt[i], __ATOMIC_ACQUIRE);
 
   vmm_lock_release();
   return (uint64_t)new_pml4_phys;
@@ -299,7 +299,7 @@ uint64_t vmm_clone_user_mappings(uint64_t *src_pml4_phys) {
 
 uint64_t vmm_clone_user_mappings_vma(uint64_t *src_pml4_phys,
                                      struct vma_list *vmas) {
-  vmm_lock_acquire();
+  vmm_lock_acquire_for(src_pml4_phys, 0);
 
   void *new_pml4_phys = pmm_alloc();
   if (!new_pml4_phys) {
@@ -360,7 +360,7 @@ uint64_t vmm_clone_user_mappings_vma(uint64_t *src_pml4_phys,
   uint64_t *kernel_pml4_virt =
       (uint64_t *)PHYS_TO_VIRT((uint64_t)vmm_get_kernel_pml4());
   for (size_t i = 256; i < 512; i++)
-    new_pml4_virt[i] = kernel_pml4_virt[i];
+    new_pml4_virt[i] = __atomic_load_n(&kernel_pml4_virt[i], __ATOMIC_ACQUIRE);
 
   // If any pages were converted to CoW, invalidate the parent's address-space
   // context once instead of sending thousands of per-page IPIs or flushing

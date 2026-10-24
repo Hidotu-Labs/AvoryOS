@@ -139,29 +139,62 @@ void *memset(void *s, int c, size_t n) {
   return d;
 }
 
+typedef uint64_t __attribute__((__may_alias__, aligned(1))) u64_ua;
+typedef uint32_t __attribute__((__may_alias__, aligned(1))) u32_ua;
+typedef uint16_t __attribute__((__may_alias__, aligned(1))) u16_ua;
+
 void *memcpy(void *dest, const void *src, size_t n) {
   void *d = dest;
-  if (n >= 64 && (((uintptr_t)dest & 7) == ((uintptr_t)src & 7))) {
-    /* Same bulk rationale as memset: 8-byte moves for the aligned middle.
-     * Only valid when both ends share alignment; otherwise fall through to
-     * the byte loop, which handles every case correctly. */
-    while (n && ((uintptr_t)dest & 7)) {
-      *(uint8_t *)dest = *(const uint8_t *)src;
-      dest = (uint8_t *)dest + 1;
-      src = (const uint8_t *)src + 1;
-      n--;
+  uint8_t *dst = (uint8_t *)dest;
+  const uint8_t *s = (const uint8_t *)src;
+
+  if (n < 16) {
+    if (n >= 8) {
+      *(u64_ua *)dst = *(const u64_ua *)s;
+      *(u64_ua *)(dst + n - 8) = *(const u64_ua *)(s + n - 8);
+      return d;
     }
-    size_t q = n / 8;
-    __asm__ volatile("rep movsq"
-                     : "+D"(dest), "+S"(src), "+c"(q)
-                     :
-                     : "memory");
-    n %= 8;
+    if (n >= 4) {
+      *(u32_ua *)dst = *(const u32_ua *)s;
+      *(u32_ua *)(dst + n - 4) = *(const u32_ua *)(s + n - 4);
+      return d;
+    }
+    if (n >= 2) {
+      *(u16_ua *)dst = *(const u16_ua *)s;
+      *(u16_ua *)(dst + n - 2) = *(const u16_ua *)(s + n - 2);
+      return d;
+    }
+    if (n == 1)
+      *dst = *s;
+    return d;
   }
-  __asm__ volatile("rep movsb"
-                   : "+D"(dest), "+S"(src), "+c"(n)
+
+  if (n <= 32) {
+    *(u64_ua *)dst = *(const u64_ua *)s;
+    *(u64_ua *)(dst + 8) = *(const u64_ua *)(s + 8);
+    *(u64_ua *)(dst + n - 16) = *(const u64_ua *)(s + n - 16);
+    *(u64_ua *)(dst + n - 8) = *(const u64_ua *)(s + n - 8);
+    return d;
+  }
+
+  /* Align destination to an 8-byte boundary for bulk 64-bit moves. x86-64
+   * handles unaligned 8-byte source loads in hardware, so even when dest and
+   * src have different alignments mod 8, rep movsq runs at ~8x the speed of
+   * a byte-by-byte rep movsb fallback. */
+  while ((uintptr_t)dst & 7) {
+    *dst++ = *s++;
+    n--;
+  }
+
+  size_t q = n >> 3;
+  __asm__ volatile("rep movsq"
+                   : "+D"(dst), "+S"(s), "+c"(q)
                    :
                    : "memory");
+
+  n &= 7;
+  while (n--)
+    *dst++ = *s++;
   return d;
 }
 
@@ -169,12 +202,9 @@ void *memmove(void *dest, const void *src, size_t n) {
   void *d = dest;
   if (!n || dest == src)
     return dest;
-  if (dest < src) {
-    __asm__ volatile("cld\n\t"
-                     "rep movsb"
-                     : "+D"(dest), "+S"(src), "+c"(n)
-                     :
-                     : "memory");
+  if ((uintptr_t)dest < (uintptr_t)src ||
+      (uintptr_t)dest - (uintptr_t)src >= n) {
+    return memcpy(dest, src, n);
   } else {
     /* Overlapping copy towards higher addresses: copy from the tail.
      *
@@ -186,11 +216,37 @@ void *memmove(void *dest, const void *src, size_t n) {
      * its destination. A 8 MiB console_clear() inside a panic handler turning
      * into a descending zero-fill through read-only .rodata is exactly what
      * hung the machine after an unrelated fault. A plain descending loop keeps
-     * RFLAGS alone. */
-    const uint8_t *s = (const uint8_t *)src;
-    uint8_t *dst = (uint8_t *)dest;
-    for (size_t i = n; i > 0; i--)
-      dst[i - 1] = s[i - 1];
+     * RFLAGS alone.
+     *
+     * When the overlap offset (dest - src) is at least 8 bytes, descending
+     * 32-byte / 8-byte unaligned stores are completely safe and 8x faster
+     * than a byte loop (e.g. console scroll and ring buffer compaction). */
+    const uint8_t *s = (const uint8_t *)src + n;
+    uint8_t *dst = (uint8_t *)dest + n;
+    if ((uintptr_t)dest - (uintptr_t)src >= 8) {
+      while (n >= 32) {
+        uint64_t w0 = *(const u64_ua *)(s - 8);
+        uint64_t w1 = *(const u64_ua *)(s - 16);
+        uint64_t w2 = *(const u64_ua *)(s - 24);
+        uint64_t w3 = *(const u64_ua *)(s - 32);
+        *(u64_ua *)(dst - 8) = w0;
+        *(u64_ua *)(dst - 16) = w1;
+        *(u64_ua *)(dst - 24) = w2;
+        *(u64_ua *)(dst - 32) = w3;
+        s -= 32;
+        dst -= 32;
+        n -= 32;
+      }
+      while (n >= 8) {
+        s -= 8;
+        dst -= 8;
+        *(u64_ua *)dst = *(const u64_ua *)s;
+        n -= 8;
+      }
+    }
+    while (n--) {
+      *--dst = *--s;
+    }
   }
   return d;
 }
@@ -207,7 +263,7 @@ static int memcpy_wc_use_rep(void) {
 
   uint32_t eax = 1, ebx, ecx, edx;
   __asm__ volatile("cpuid"
-                   : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+                   : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
   int use_rep = 0;
   if (ecx & (1U << 31)) {
     /* Running inside a hypervisor (KVM, QEMU TCG, Xen, VMware, Hyper-V).
@@ -218,7 +274,7 @@ static int memcpy_wc_use_rep(void) {
     uint32_t eax7 = 7, ecx7 = 0;
     uint32_t ebx7 = 0, edx7 = 0;
     __asm__ volatile("cpuid"
-                     : "+a"(eax7), "=b"(ebx7), "+c"(ecx7), "=d"(edx7));
+                     : "+a"(eax7), "=b"(ebx7), "+c"(ecx7), "+d"(edx7));
     if (ebx7 & (1U << 9)) {
       use_rep = 1;
     }
@@ -296,6 +352,15 @@ void *memcpy_to_wc(void *dest, const void *src, size_t n) {
 
 int memcmp(const void *s1, const void *s2, size_t n) {
   const unsigned char *p1 = s1, *p2 = s2;
+  while (n >= 8) {
+    uint64_t a = *(const u64_ua *)p1;
+    uint64_t b = *(const u64_ua *)p2;
+    if (a != b)
+      break;
+    p1 += 8;
+    p2 += 8;
+    n -= 8;
+  }
   while (n--) {
     if (*p1 != *p2) {
       return *p1 - *p2;

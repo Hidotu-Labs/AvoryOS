@@ -1,53 +1,14 @@
 # RadeonSI / TTM memory lifetime diagnostic
 
-## Actual tunnel reproduction capture
+## Historical tunnel trace results
 
-The user's X11 `tunnel` screenshot shows small bright green specks in the
-otherwise gray corridor. Mesa demos 9.0.0 `src/demos/tunnel.c` uses immediate
-mode triangle strips, fixed-function EXP2 fog, mipmapped textures and a GLUT
-double-buffered window. It explicitly disables depth testing. The screenshot
-alone does not locate the corruption within this path.
-
-`scripts/capture-tunnel.sh` runs the installed, unchanged demo under apitrace
-for five seconds and uploads its stderr and trace directly. The exit status
-is retained beside them in the guest. This records API calls, not the actual rendered framebuffer; replay
-and pixel comparison are still needed. Tracing may change timing and suppress
-a race. A timed stop (status 124) is expected and apitrace flushes on SIGTERM.
-The helper retains guest files if upload fails.
-
-Host preparation: stage `glxtrace.so` and the helper in
-`build/gpu-diagnostics`, serve that directory on port 9007, and run
-`python3 scripts/receive-tunnel-capture.py`. The receiver binds loopback 9008,
-accepts a log followed by a trace up to 256 MiB, then exits; its deadline is 30 minutes.
-
-The wrapper was built from upstream apitrace commit
-`ceac241a8be6bcbaf2776c601f3c4ae52dea4680` with GUI and tests disabled.
-Host smoke capture parsed successfully: 276 frames, 17,487,819 bytes.
-The first guest capture produced a trace but tar creation failed with ENOSYS.
-The helper now avoids tar; `scripts/send-tunnel-capture.sh` uploads the newest
-existing trace without repeating the capture. Guest analysis remains pending.
-
-The recovered guest trace is valid: 1,154 frames, 72,767,462 bytes. It replayed
-to completion on host NVIDIA hardware and host software rendering. Scanning
-116 snapshots from each replay (one every ten frames) found no pixels whose
-green channel exceeded both red and blue by more than 40. This targeted check
-matches the conspicuous green artifact in the gray tunnel; it does not certify
-every rendered pixel, and unsampled frames remain unchecked. Host headless
-replays emitted an Xlib BadRequest warning but produced the expected corridor
-images and exited successfully.
-
-`scripts/replay-tunnel.sh` reuses the saved guest trace, selects the AMD PCI
-device with `DRI_PRIME=pci-0000_00_03_0`, and
-collects one framebuffer snapshot every ten frames. It uploads concatenated
-PNM images without tar. The staged replay executable prints its actual GL
-renderer/vendor at context initialization (a small local apitrace diagnostic
-change). `scripts/analyze-tunnel-frames.py` validates and scans that stream.
-The first guest replay used the numeric PRIME selector and fell back to
-llvmpipe after a VirtIO DRI3 failure. Its successful exit and snapshots are
-software results, not AMD validation. The helper now checks the renderer
-printed by the actual replay context and rejects a non-RadeonSI replay even
-when the executable exits successfully. AMD guest replay results remain
-pending; tracing/replay/readback can change timing.
+A recovered guest trace contained 1,154 frames (72,767,462 bytes). It replayed
+on host NVIDIA and software renderers. Sampling 116 frames from each replay
+found no conspicuous green pixels in the gray corridor; this did not check every
+pixel or frame. Headless host replay emitted an Xlib warning but produced the
+expected images. The AMD guest replay remains unverified; an earlier guest run
+fell back to llvmpipe after a VirtIO DRI3 failure, so its output was not AMD
+validation. Tracing and replay can change timing.
 
 Build with `make userland/radeonsi_vram_leak.elf`. The executable links the
 same guest EGL, GBM, GLES and libdrm libraries as `test_kpi_radeonsi`; it uses

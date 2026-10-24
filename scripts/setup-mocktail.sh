@@ -23,7 +23,7 @@
 #   MOCKTAIL_FORCE_PAYLOAD=1 ./scripts/setup-mocktail.sh   # force payload restage
 #
 # Prerequisites:
-#   1. Run ./scripts/setup-arch.sh first (installs runtime deps in rootfs)
+#   1. Run ./scripts/setup-rootfs.sh first (installs runtime deps in rootfs)
 #   2. Host system needs: wget or curl, sha256sum, dd, debugfs
 
 set -euo pipefail
@@ -31,7 +31,7 @@ trap 'status=$?; printf "[!] setup-mocktail.sh failed at line %s: %s (exit %s)\\
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DISK_IMG="${ROOT_DIR}/disk.img"
-BUILD_DIR="${ROOT_DIR}/build/alpine"
+BUILD_DIR="${ROOT_DIR}/build/arch"
 ROOTFS_DIR="${BUILD_DIR}/rootfs"
 MOCKTAIL_BUILD_DIR="${BUILD_DIR}/mocktail-build"
 HOST_DATA_DIR="${ROOT_DIR}/build/mocktail-host-data"
@@ -71,7 +71,7 @@ fi
 # Sanity checks
 # ─────────────────────────────────────────────────────────────────────────────
 [ ! -d "${ROOTFS_DIR}/etc" ] && {
-    echo "[!] Alpine rootfs not found. Run ./scripts/setup-arch.sh first."
+    echo "[!] AvoryOS rootfs not found. Run ./scripts/setup-rootfs.sh first."
     exit 1
 }
 [ ! -f "${DISK_IMG}" ] && {
@@ -317,24 +317,16 @@ fi
 python3 "${ROOT_DIR}/scripts/verify-mocktail-payload.py" \
     "${DATA_ROOT}/${ACTIVE_PAYLOAD_PATH}"
 
-# Ensure glibc DNS resolver libraries and resolv.conf exist in the rootfs
-# (the bundled glibc also ships libnss_*, this keeps the system paths valid).
-${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_dns.so.2" "${ROOTFS_DIR}/lib64/" 2>/dev/null || true
-${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_files.so.2" "${ROOTFS_DIR}/lib64/" 2>/dev/null || true
-${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_dns.so.2" "${ROOTFS_DIR}/lib/" 2>/dev/null || true
-${SUDO} cp -f "${ROOT_DIR}/toolchain/glibc-sysroot/lib/libnss_files.so.2" "${ROOTFS_DIR}/lib/" 2>/dev/null || true
-
-# Avory's base runtime is musl. Install the real glibc runtime privately so
-# the glibc-only Mocktail 1.0.3 standalone bundle can run. gcompat's ld-linux
-# and libc.so.6 stubs are not sufficient for this bundle. Musl programs
-# continue to use ld-musl-x86_64.so.1.
-GLIBC_SYSROOT="${ROOT_DIR}/toolchain/glibc-sysroot"
+# Mocktail's standalone bundle needs its own glibc runtime path. Stage the
+# matching runtime from Axon's glibc 2.44 package rather than the compiler's
+# bundled sysroot.
+GLIBC_SYSROOT="${ROOT_DIR}/build/arch/rootfs"
 if [ ! -s "${GLIBC_SYSROOT}/lib/ld-linux-x86-64.so.2" ] || \
    [ ! -s "${GLIBC_SYSROOT}/lib/libc.so.6" ]; then
-    echo "[!] A built x86_64 glibc sysroot is required. Run ./scripts/glibc-toolchain.sh first."
+    echo "[!] The Axon glibc rootfs is required. Run make setup-rootfs first."
     exit 1
 fi
-echo "[*] Installing glibc compatibility runtime alongside musl..."
+echo "[*] Installing Mocktail's private glibc runtime..."
 GLIBC_COMPAT_DIR="${ROOTFS_DIR}/opt/avory-glibc/lib"
 ${SUDO} mkdir -p "${GLIBC_COMPAT_DIR}"
 for glibc_library in "${GLIBC_SYSROOT}"/lib/*.so.*; do
@@ -343,8 +335,8 @@ for glibc_library in "${GLIBC_SYSROOT}"/lib/*.so.*; do
 done
 ${SUDO} cp -a "${GLIBC_SYSROOT}/lib/ld-linux-x86-64.so.2" "${GLIBC_COMPAT_DIR}/ld-linux-x86-64.so.2"
 echo "[*] Staging glibc Mesa/EGL software graphics stack..."
-# Avory's /usr/lib contains musl-linked Mesa libraries and cannot serve the
-# glibc Mocktail process. Stage the build host's glibc Mesa/GLVND stack and
+# The bundled Mesa stack may not match Mocktail's runtime. Stage the build
+# host's glibc Mesa/GLVND stack and
 # software DRI driver privately, including each library's resolved dependency
 # closure. This gives SDL/EGL a usable llvmpipe backend without mixing libc.
 find_host_library() {

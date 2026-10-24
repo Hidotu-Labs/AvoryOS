@@ -52,6 +52,9 @@ static int dma_fence_chain_find_seqno(struct dma_fence **fence,u64 point){
  if(pruned){dma_fence_put(*fence);*fence=NULL;}return 0;
 }
 static bool dma_fence_is_signaled(struct dma_fence *fence){assert(fence==&timeline&&fence->references>1);return fence->signaled;}
+static unsigned timed;
+static uint64_t gpu_perf_syncobj_wait_start(void){return 1;}
+static void gpu_perf_syncobj_wait_finish(uint64_t start,int poll,long result){assert(start==1&&poll==1&&result==-123);timed++;}
 static void gpu_perf_syncobj_ready(void){fast_calls++;}
 int linuxkpi_original_drm_syncobj_timeline_wait_ioctl(struct drm_device *device,void *data,struct drm_file *file){
  (void)device;(void)data;(void)file;assert(object.references==1&&timeline.references==1);slow_calls++;return -123;
@@ -64,7 +67,7 @@ int main(void){
  for(unsigned scenario=0;scenario<11;scenario++)for(unsigned flags=0;flags<16;flags++){
   args=(struct drm_syncobj_timeline_wait){.handles=(uintptr_t)&handle,.points=(uintptr_t)&point,
    .timeout_nsec=0,.count_handles=1,.flags=flags,.first_signaled=99,.deadline_nsec=1234};
-  handle=7;absent=pruned=false;copies=copy_fault=chain_error=slow_calls=fast_calls=0;
+  handle=7;absent=pruned=false;copies=copy_fault=chain_error=slow_calls=fast_calls=timed=0;
   object.references=timeline.references=1;timeline.signaled=true;device.supported=true;
   switch(scenario){
    case 1:timeline.signaled=false;break;
@@ -81,7 +84,7 @@ int main(void){
   bool ready=scenario==0||scenario==3||
              (scenario==1&&(flags&DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE));
   int result=drm_syncobj_timeline_wait_ioctl(&device,&args,&file);
-  assert(result==(ready?0:-123));assert(fast_calls==(ready?1u:0u));assert(slow_calls==(ready?0u:1u));
+  assert(result==(ready?0:-123));assert(fast_calls==(ready?1u:0u));assert(slow_calls==(ready?0u:1u));assert(timed==slow_calls);
   assert(args.first_signaled==(ready?0u:99u));
   assert(object.references==1&&timeline.references==1);
  }

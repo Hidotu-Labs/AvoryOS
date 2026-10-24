@@ -10,7 +10,7 @@ import importlib.util,subprocess,shutil,os,re,time
 ROOT=Path(__file__).resolve().parents[2]
 OUT=ROOT/'build/udev-audio-boot'
 OUT.mkdir(parents=True,exist_ok=True)
-TREE=ROOT/'build/alpine/rootfs'
+TREE=ROOT/'build/arch/rootfs'
 SECONDS=int(os.environ.get('AVORY_AUDIO_SECONDS','2'))
 CAPTURE=os.environ.get('AVORY_AUDIO_CAPTURE')=='1'
 PULSE=os.environ.get('AVORY_AUDIO_PULSE')=='1'

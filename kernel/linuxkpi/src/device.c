@@ -81,6 +81,8 @@ int device_add(struct device *dev) {
     if (device_is_drm_minor(dev)) {
       dev->kobj.sd = asc_sysfs_drm_minor_add(
           class_dir, dev_name(dev), device_pci_ancestor_name(dev),
+          dev->parent && dev->parent->bus ? dev->parent->bus->name : "virtual",
+          dev_name(dev->parent ? dev->parent : dev),
           MAJOR(dev->devt), MINOR(dev->devt));
       if (!dev->kobj.sd)
         return -ENOMEM;
@@ -128,6 +130,8 @@ void device_del(struct device *dev) {
     if (device_is_drm_minor(dev))
       asc_sysfs_drm_minor_remove(class_dir, dev_name(dev),
                                 device_pci_ancestor_name(dev),
+                                dev->parent && dev->parent->bus ? dev->parent->bus->name : "virtual",
+                                dev_name(dev->parent ? dev->parent : dev),
                                 MAJOR(dev->devt), MINOR(dev->devt));
     else if (class_dir)
       asc_sysfs_remove(class_dir, dev_name(dev));

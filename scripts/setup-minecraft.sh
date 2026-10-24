@@ -2,12 +2,11 @@
 # scripts/setup-minecraft.sh -- Stage Minecraft 1.16.5 into AvoryOS
 #
 # Prerequisites:
-#   1. Run ./scripts/setup-arch.sh first (provides the Arch Linux rootfs and disk.img).
-#      glibc, OpenJDK 17, OpenAL, Mesa and the X11 client libraries are taken
-#      from that Arch rootfs, installed via pacman when missing.
-#   2. Network access on the first run: the client JAR is downloaded from the
-#      mcversions.net link, libraries/assets from Mojang (includes all 2,336
-#      OGG sound files of asset index 1.16)
+#   1. Run ./scripts/setup-rootfs.sh first (provides the AvoryOS rootfs and disk.img).
+#      Axon installs glibc, OpenJDK 17, OpenAL, Mesa and the X11 client libraries
+#      into that rootfs when needed.
+#   2. Place the Minecraft 1.16.5 files in assets/minecraft/ before running.
+#      This script stages local files only and does not fetch Minecraft content.
 #
 # Usage:
 #   ./scripts/setup-minecraft.sh [--expand-disk] [--username NAME] [--jar PATH]
@@ -15,24 +14,22 @@
 # Options:
 #   --expand-disk   Grow disk.img to 8 GiB
 #   --username NAME Offline username written into the launcher (default: Player)
-#   --jar PATH      Use a locally saved 1.16.5 client JAR (e.g. downloaded from
-#                   https://mcversions.net/download/1.16.5) instead of fetching it
+#   --jar PATH      Use a locally saved 1.16.5 client JAR instead of
+#                   assets/minecraft/client.jar
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DISK_IMG="${ROOT_DIR}/disk.img"
-BUILD_DIR="${ROOT_DIR}/build/alpine"
+BUILD_DIR="${ROOT_DIR}/build/arch"
 ROOTFS_DIR="${BUILD_DIR}/rootfs"
 POPULATE_SCRIPT="${ROOT_DIR}/scripts/populate-ext2-dir.sh"
+source "${ROOT_DIR}/scripts/axon-common.sh"
 
 MC_VERSION="1.16.5"
-# Client JAR published on mcversions.net (https://mcversions.net/download/1.16.5);
-# piston-data.mojang.com addresses objects by their SHA-1.
-MC_CLIENT_URL="https://piston-data.mojang.com/v1/objects/37fd3c903861eeff3bc24b71eed48f828b5269c8/client.jar"
 MC_CLIENT_SHA1="37fd3c903861eeff3bc24b71eed48f828b5269c8"
 MC_ASSET_INDEX="1.16"
-VERSION_MANIFEST_URL="https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+MC_LOCAL_DIR="${ROOT_DIR}/assets/minecraft"
 
 MC_JAR_OVERRIDE=""
 EXPAND_DISK=0
@@ -50,7 +47,7 @@ done
 # Sanity checks
 # ─────────────────────────────────────────────────────────────────────────────
 [ ! -d "${ROOTFS_DIR}/etc" ] && {
-    echo "[!] Arch Linux rootfs not found. Run ./scripts/setup-arch.sh first."
+    echo "[!] AvoryOS rootfs not found. Run ./scripts/setup-rootfs.sh first."
     exit 1
 }
 [ ! -f "${DISK_IMG}" ] && {
@@ -59,38 +56,9 @@ done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Ensure glibc + libraries from the Arch Linux rootfs (install if missing)
+# Ensure glibc + libraries from the AvoryOS rootfs (install if missing)
 # ─────────────────────────────────────────────────────────────────────────────
-# Same pacman backend as scripts/setup-arch.sh: upstream Arch repos only
-# (x86-64 baseline, so binaries run under QEMU's default CPU). Signatures
-# off (https transport); no keyring needed in target.
-PACMAN_CONF="${BUILD_DIR}/pacman-avory.conf"
-PACMAN_CACHE="${BUILD_DIR}/paccache"
-
-pacman_run_mc() {
-    mkdir -p "${ROOTFS_DIR}/var/lib/pacman"
-    unshare -rm pacman --config "${PACMAN_CONF}" --root "${ROOTFS_DIR}" \
-        --cachedir "${PACMAN_CACHE}" --noconfirm \
-        --assume-installed ntsync-autoload "$@"
-}
-
-pacman_sync_once_mc() {
-    if [ ! -f "${BUILD_DIR}/.pacman-sync" ]; then
-        pacman_run_mc -Sy
-        touch "${BUILD_DIR}/.pacman-sync"
-    fi
-}
-
-# Install an Arch package into the rootfs if not already present.
-ensure_pkg_mc() {
-    local PKG_NAME="$1"
-    if pacman --config "${PACMAN_CONF}" --root "${ROOTFS_DIR}" -Q "${PKG_NAME}" >/dev/null 2>&1; then
-        return 0
-    fi
-    echo "[*] Installing ${PKG_NAME} into Arch rootfs..."
-    pacman_sync_once_mc
-    pacman_run_mc -S "${PKG_NAME}"
-}
+ensure_axon
 
 # Repair glibc version skew if present: an older setup redirected the system
 # loader at the 2.43 copy in /opt/avory-glibc while /usr/lib ships 2.44.
@@ -98,29 +66,19 @@ ensure_pkg_mc() {
 # which is exactly how Minecraft's libglfw.so fails to load.
 for _glibc_link in "${ROOTFS_DIR}/usr/lib/libc.so.6" "${ROOTFS_DIR}/usr/lib/ld-linux-x86-64.so.2"; do
     if [ -L "${_glibc_link}" ]; then
-        echo "[!] ${_glibc_link} is a stray symlink; reinstalling Arch glibc for a coherent tree..."
-        pacman_sync_once_mc
-        pacman_run_mc -S glibc
-        break
+        echo "[!] ${_glibc_link} is a stray symlink. Rebuild the rootfs with 'make setup-rootfs' before staging Minecraft." >&2
+        exit 1
     fi
 done
 
 # glibc itself plus everything Minecraft 1.16.5 (LWJGL 3/GLFW via OpenJDK 17)
 # loads at runtime. Each is installed only if missing from the rootfs.
-ensure_pkg_mc "glibc"
-ensure_pkg_mc "jre17-openjdk-headless"
-ensure_pkg_mc "jre17-openjdk"
-ensure_pkg_mc "openal"
-ensure_pkg_mc "mesa"
 # Minecraft 1.16.5 uses LWJGL 3/GLFW, which dlopen()s these X11 client
 # libraries at window-creation time.
-ensure_pkg_mc "libx11"
-ensure_pkg_mc "libxext"
-ensure_pkg_mc "libxi"
-ensure_pkg_mc "libxrandr"
-ensure_pkg_mc "libxcursor"
-ensure_pkg_mc "libxinerama"
-ensure_pkg_mc "libxxf86vm"
+"${AXON_BIN}" get --root "${ROOTFS_DIR}" --needed --noconfirm --keep-cache \
+    --assume-installed ntsync-autoload \
+    glibc jre17-openjdk-headless jre17-openjdk openal mesa \
+    libx11 libxext libxi libxrandr libxcursor libxinerama libxxf86vm
 
 find_java() {
     JAVA_HOME_ROOTFS=""
@@ -141,22 +99,21 @@ find_java() {
 find_java
 
 [ -z "${JAVA_HOME_ROOTFS}" ] && {
-    echo "[!] Failed to find OpenJDK 17 in the Arch rootfs. Aborting." >&2
+    echo "[!] Failed to find OpenJDK 17 in the AvoryOS rootfs. Aborting." >&2
     exit 1
 }
 
 JAVA_HOME_GUEST="${JAVA_HOME_ROOTFS#"${ROOTFS_DIR}"}"
-echo "[+] Using JDK from Arch rootfs: ${JAVA_HOME_GUEST} ($(pacman --config "${PACMAN_CONF}" --root "${ROOTFS_DIR}" -Q glibc 2>/dev/null | awk '{print $1" "$2}'))"
-# NOTE: no musl-era fixups here. The Arch tree is glibc, so the JVM's own
+echo "[+] Using JDK from AvoryOS rootfs: ${JAVA_HOME_GUEST}"
+# NOTE: no musl-era fixups here. The Axon-provisioned tree is glibc, so the JVM's own
 # RPATH/$ORIGIN layout, Mojang's glibc-built LWJGL natives and the bundled
 # OpenAL all resolve natively — no .so copying into /usr/lib, no compat shim.
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Download Minecraft 1.16.5 libraries + Linux natives
-#    (version metadata from Mojang; client JAR link comes from mcversions.net)
+# 1. Stage locally supplied Minecraft libraries + Linux natives
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "=== [1/4] Fetching Minecraft ${MC_VERSION} libraries ==="
+echo "=== [1/4] Staging local Minecraft ${MC_VERSION} libraries ==="
 
 LIBS_DIR="${BUILD_DIR}/mc1165-libs"
 NATIVES_BUILD_DIR="${BUILD_DIR}/mc1165-natives"
@@ -165,166 +122,24 @@ MC_LIBS_ROOTFS="${ROOTFS_DIR}/opt/minecraft/libs"
 MC_NATIVES_ROOTFS="${ROOTFS_DIR}/opt/minecraft/natives"
 mkdir -p "${LIBS_DIR}" "${NATIVES_BUILD_DIR}" "${MC_LIBS_ROOTFS}" "${MC_NATIVES_ROOTFS}"
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "[!] python3 is required to download Minecraft libraries and assets." >&2
-    exit 1
-fi
-
 # Remove anything staged by an older setup run: leftover LWJGL 2 and
 # log4j 2.0-beta9 JARs from 1.8.9 must not end up on the 1.16.5 classpath.
 rm -f "${MC_LIBS_ROOTFS:?}"/*.jar
 rm -f "${MC_NATIVES_ROOTFS:?}"/*.so
 
-# Helper: download a file if not already cached
-dl() {
-    local url="$1" dest="$2"
-    if [ ! -f "${dest}" ]; then
-        echo "[*] Downloading $(basename "${dest}")..."
-        curl -sSL --retry 3 "${url}" -o "${dest}" || { echo "[!] FAILED: ${url}" >&2; return 1; }
-    fi
-}
-
-# Resolve every classpath JAR and Linux natives JAR from Mojang's own 1.16.5
-# version metadata (same data mcversions.net links against), applying Mojang's
-# OS rules so macOS/Windows-only libraries never reach the classpath.
-echo "[*] Fetching Minecraft ${MC_VERSION} version metadata..."
-python3 - "${MC_VERSION}" "${VERSION_MANIFEST_URL}" "${LIBS_DIR}" \
-    "${NATIVES_BUILD_DIR}" "${NATIVES_LIST}" <<'LIB_DOWNLOADER_EOF'
-import concurrent.futures
-import hashlib
-import json
-import sys
-import time
-import urllib.request
-from pathlib import Path
-
-VERSION, MANIFEST_URL, LIBS_DIR, NATIVES_DIR, NATIVES_LIST = sys.argv[1:6]
-LIBS_DIR = Path(LIBS_DIR)
-NATIVES_DIR = Path(NATIVES_DIR)
-USER_AGENT = {"User-Agent": "AvoryOS-Minecraft-Setup/1"}
-
-
-def fetch(url, retries=3):
-    last_error = None
-    for attempt in range(retries):
-        try:
-            request = urllib.request.Request(url, headers=USER_AGENT)
-            with urllib.request.urlopen(request, timeout=60) as response:
-                return response.read()
-        except Exception as error:
-            last_error = error
-            time.sleep(attempt + 1)
-    raise RuntimeError(f"failed to download {url}: {last_error}")
-
-
-def sha1_hex(data):
-    return hashlib.sha1(data).hexdigest()
-
-
-def rules_allow_linux(library):
-    """Evaluate Mojang's library rules for (linux, x86_64)."""
-    rules = library.get("rules")
-    if not rules:
-        return True
-    allowed = False
-    for rule in rules:
-        os_spec = rule.get("os", {})
-        matches = os_spec.get("name") in (None, "linux")
-        if os_spec.get("arch") not in (None, "amd64", "x86_64"):
-            matches = False  # e.g. {"arch": "x86"} only applies to 32-bit
-        if matches:
-            allowed = rule.get("action", "allow") == "allow"
-    return allowed
-
-
-manifest = json.loads(fetch(MANIFEST_URL))
-entry = next((v for v in manifest["versions"] if v["id"] == VERSION), None)
-if entry is None:
-    raise SystemExit(f"Minecraft {VERSION} is missing from Mojang's version manifest")
-
-metadata_raw = fetch(entry["url"])
-if sha1_hex(metadata_raw) != entry["sha1"]:
-    raise SystemExit(f"SHA-1 mismatch for the {VERSION} version metadata")
-metadata = json.loads(metadata_raw)
-
-# Keyed by destination so repeated coordinates (LWJGL appears several times)
-# are only downloaded once.
-jobs = {}
-native_jars = set()
-for library in metadata["libraries"]:
-    if not rules_allow_linux(library):
-        continue
-    downloads = library.get("downloads", {})
-    artifact = downloads.get("artifact")
-    if artifact is None:
-        # Coordinates without a "downloads" block still live on the Mojang CDN.
-        group, name, version = library["name"].split(":")[:3]
-        rel_path = f"{group.replace('.', '/')}/{name}/{version}/{name}-{version}.jar"
-        artifact = {
-            "path": rel_path,
-            "url": f"https://libraries.minecraft.net/{rel_path}",
-            "sha1": None,
-        }
-    jobs[LIBS_DIR / Path(artifact["path"]).name] = (artifact["url"], artifact.get("sha1"))
-
-    natives_key = library.get("natives", {}).get("linux")
-    if natives_key:
-        classifier = downloads.get("classifiers", {}).get(natives_key)
-        if classifier is None:
-            raise SystemExit(f"{library['name']} declares Linux natives but ships no classifier")
-        dest = NATIVES_DIR / Path(classifier["path"]).name
-        jobs[dest] = (classifier["url"], classifier.get("sha1"))
-        native_jars.add(dest)
-
-
-def is_valid(dest, expected_sha1):
-    if not dest.is_file():
-        return False
-    if expected_sha1 is None:
-        return True
-    return sha1_hex(dest.read_bytes()) == expected_sha1
-
-
-def download(item):
-    dest, (url, expected_sha1) = item
-    if is_valid(dest, expected_sha1):
-        return False
-    data = fetch(url)
-    if expected_sha1 is not None and sha1_hex(data) != expected_sha1:
-        raise SystemExit(f"SHA-1 mismatch downloading {url}")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    temporary = dest.with_name(dest.name + ".tmp")
-    temporary.write_bytes(data)
-    temporary.replace(dest)
-    return True
-
-
-downloaded = 0
-failures = []
-with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
-    futures = [executor.submit(download, item) for item in jobs.items()]
-    for future in concurrent.futures.as_completed(futures):
-        try:
-            was_downloaded = future.result()
-        except Exception as error:
-            failures.append(str(error))
-        else:
-            downloaded += was_downloaded
-
-if failures:
-    for failure in failures:
-        print(f"[!] {failure}", file=sys.stderr)
-    raise SystemExit("Could not download all Minecraft 1.16.5 libraries")
-
-native_jars_sorted = sorted(native_jars)
-Path(NATIVES_LIST).write_text("".join(f"{path}\n" for path in native_jars_sorted))
-
-artifact_count = sum(1 for dest in jobs if dest.parent == LIBS_DIR)
-print(
-    f"[+] {artifact_count} classpath JARs, {len(native_jars)} native JARs "
-    f"({downloaded} downloaded)"
-)
-LIB_DOWNLOADER_EOF
+LOCAL_LIBS_DIR="${MC_LOCAL_DIR}/libs"
+LOCAL_NATIVES_DIR="${MC_LOCAL_DIR}/natives"
+if [ ! -d "${LOCAL_LIBS_DIR}" ] || [ ! -d "${LOCAL_NATIVES_DIR}" ]; then
+    echo "[!] Local libraries/natives missing. Expected ${LOCAL_LIBS_DIR} and ${LOCAL_NATIVES_DIR}." >&2
+    exit 1
+fi
+find "${LOCAL_LIBS_DIR}" -maxdepth 1 -type f -name '*.jar' -exec cp -f {} "${LIBS_DIR}/" \;
+find "${LOCAL_NATIVES_DIR}" -maxdepth 1 -type f -name '*.jar' -exec cp -f {} "${NATIVES_BUILD_DIR}/" \;
+find "${NATIVES_BUILD_DIR}" -maxdepth 1 -type f -name '*.jar' -print | sort > "${NATIVES_LIST}"
+if [ ! -s "${LIBS_DIR}"/*.jar ] 2>/dev/null; then
+    echo "[!] No library JARs found in ${LOCAL_LIBS_DIR}." >&2
+    exit 1
+fi
 
 # ── Extract the Linux natives (LWJGL 3.2.2, GLFW, OpenAL, STB, ...) ─────────
 echo "[*] Extracting Linux native .so files..."
@@ -358,103 +173,18 @@ LIBS_COUNT=$(find "${MC_LIBS_ROOTFS}" -name '*.jar' | wc -l)
 echo "[+] Staged ${LIBS_COUNT} library JARs → /opt/minecraft/libs/"
 echo "[+] Staged ${NATIVES_COUNT} native .so files → /opt/minecraft/natives/"
 
-# The official launcher normally downloads the asset index and hashed object
-# store. This custom launcher bypasses it, so fetch and verify those assets here.
-# Index 1.16 holds 2,615 objects (334 MB) including all 2,336 OGG sounds.
+# Local assets use the official launcher layout: indexes/1.16.json and
+# objects/<first-two-hash-chars>/<sha1>.
 ASSETS_BUILD_DIR="${BUILD_DIR}/mc1165-assets"
 MC_ASSETS_ROOTFS="${ROOTFS_DIR}/opt/minecraft/assets"
-
-echo "[*] Fetching Minecraft ${MC_VERSION} asset index ${MC_ASSET_INDEX} and objects (incl. sounds)..."
-python3 - "${ASSETS_BUILD_DIR}" "${MC_VERSION}" "${MC_ASSET_INDEX}" <<'ASSET_DOWNLOADER_EOF'
-import concurrent.futures
-import hashlib
-import json
-import os
-from pathlib import Path
-import sys
-import time
-import urllib.request
-
-VERSION = sys.argv[2]
-INDEX_ID = sys.argv[3]
-MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
-ASSET_OBJECT_URL = "https://resources.download.minecraft.net/{prefix}/{digest}"
-CACHE = Path(sys.argv[1])
-INDEXES = CACHE / "indexes"
-OBJECTS = CACHE / "objects"
-INDEXES.mkdir(parents=True, exist_ok=True)
-OBJECTS.mkdir(parents=True, exist_ok=True)
-
-
-def fetch(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "AvoryOS-Minecraft-Setup/1"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read()
-
-
-def checked_fetch(url, expected_hash):
-    for attempt in range(3):
-        try:
-            data = fetch(url)
-            actual_hash = hashlib.sha1(data).hexdigest()
-            if actual_hash != expected_hash:
-                raise RuntimeError(f"SHA-1 mismatch: expected {expected_hash}, got {actual_hash}")
-            return data
-        except Exception:
-            if attempt == 2:
-                raise
-            time.sleep(attempt + 1)
-
-
-manifest = json.loads(fetch(MANIFEST_URL))
-try:
-    version_entry = next(entry for entry in manifest["versions"] if entry["id"] == VERSION)
-except StopIteration:
-    raise SystemExit(f"Minecraft {VERSION} is missing from Mojang's version manifest")
-
-version_data = json.loads(checked_fetch(version_entry["url"], version_entry["sha1"]))
-asset_index = version_data["assetIndex"]
-if asset_index["id"] != INDEX_ID:
-    raise SystemExit(f"Expected asset index {INDEX_ID}, got {asset_index['id']}")
-
-index_data = checked_fetch(asset_index["url"], asset_index["sha1"])
-index_path = INDEXES / f"{INDEX_ID}.json"
-index_path.write_bytes(index_data)
-index = json.loads(index_data)
-
-
-def download_object(item):
-    logical_name, metadata = item
-    digest = metadata["hash"]
-    destination = OBJECTS / digest[:2] / digest
-    if destination.is_file():
-        with destination.open("rb") as existing:
-            if hashlib.sha1(existing.read()).hexdigest() == digest:
-                return False
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    data = checked_fetch(ASSET_OBJECT_URL.format(prefix=digest[:2], digest=digest), digest)
-    temporary = destination.with_name(destination.name + ".tmp")
-    temporary.write_bytes(data)
-    os.replace(temporary, destination)
-    return True
-
-
-items = list(index["objects"].items())
-downloaded = 0
-with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
-    futures = [executor.submit(download_object, item) for item in items]
-    for completed, future in enumerate(concurrent.futures.as_completed(futures), 1):
-        if future.result():
-            downloaded += 1
-        if completed % 250 == 0 or completed == len(futures):
-            print(f"    Verified {completed}/{len(futures)} asset objects", flush=True)
-
-sound_count = sum(name.endswith(".ogg") for name in index["objects"])
-print(
-    f"[+] Asset index {INDEX_ID} ready: {len(items)} objects, "
-    f"{sound_count} OGG sounds ({downloaded} downloaded)"
-)
-ASSET_DOWNLOADER_EOF
+if [ ! -f "${MC_LOCAL_DIR}/assets/indexes/${MC_ASSET_INDEX}.json" ] || \
+   [ ! -d "${MC_LOCAL_DIR}/assets/objects" ]; then
+    echo "[!] Local asset index/objects missing. Expected ${MC_LOCAL_DIR}/assets/indexes/${MC_ASSET_INDEX}.json and objects/." >&2
+    exit 1
+fi
+rm -rf "${ASSETS_BUILD_DIR}"
+mkdir -p "${ASSETS_BUILD_DIR}"
+cp -a "${MC_LOCAL_DIR}/assets/." "${ASSETS_BUILD_DIR}/"
 
 rm -rf "${MC_ASSETS_ROOTFS}"
 mkdir -p "${MC_ASSETS_ROOTFS}"
@@ -486,20 +216,12 @@ if [ -n "${MC_JAR_OVERRIDE}" ]; then
         echo "[!] Warning: --jar SHA-1 differs from the official ${MC_VERSION} client JAR; continuing."
 elif jar_is_target "${MC_JAR_CACHE}"; then
     MC_JAR_SRC="${MC_JAR_CACHE}"
-elif jar_is_target "${ROOT_DIR}/assets/minecraft.jar"; then
-    # A previously downloaded 1.16.5 client JAR kept in assets/ (gitignored).
-    cp -f "${ROOT_DIR}/assets/minecraft.jar" "${MC_JAR_CACHE}"
+elif jar_is_target "${MC_LOCAL_DIR}/client.jar"; then
+    cp -f "${MC_LOCAL_DIR}/client.jar" "${MC_JAR_CACHE}"
     MC_JAR_SRC="${MC_JAR_CACHE}"
 else
-    echo "[*] Downloading Minecraft ${MC_VERSION} client JAR (link from mcversions.net)..."
-    rm -f "${MC_JAR_CACHE}"
-    dl "${MC_CLIENT_URL}" "${MC_JAR_CACHE}"
-    jar_is_target "${MC_JAR_CACHE}" || {
-        echo "[!] Client JAR SHA-1 verification failed (expected ${MC_CLIENT_SHA1})." >&2
-        rm -f "${MC_JAR_CACHE}"
-        exit 1
-    }
-    MC_JAR_SRC="${MC_JAR_CACHE}"
+    echo "[!] Minecraft ${MC_VERSION} client JAR not found at ${MC_LOCAL_DIR}/client.jar. Supply it with --jar PATH." >&2
+    exit 1
 fi
 
 mkdir -p "${ROOTFS_DIR}/opt/minecraft"
@@ -519,7 +241,7 @@ cat > "${ROOTFS_DIR}/usr/bin/minecraft" << LAUNCHER_EOF
 
 export DISPLAY="\${DISPLAY:-:0}"
 
-# Hardware GL by default: on 'make run-c7-prime' (VFIO AMD passthrough) Mesa
+# Hardware GL by default: on 'make run-amd-gpu' (VFIO AMD passthrough) Mesa
 # loads radeonsi for the AMD render node and Xorg glamor is accelerated; on a
 # plain 'make run' (virtio-vga only) Mesa falls back to llvmpipe automatically.
 # The old launcher forced llvmpipe unconditionally, which is why F3 always
@@ -701,7 +423,7 @@ echo "╔═══════════════════════�
 echo "║  [SUCCESS] Minecraft 1.16.5 is ready in AvoryOS!                 ║"
 echo "╠══════════════════════════════════════════════════════════════════╣"
 echo "║  Boot AvoryOS → open a terminal → type:  minecraft               ║"
-echo "║  radeonsi needs the VFIO GPU boot:  make run-c7-prime             ║"
+echo "║  radeonsi needs the VFIO GPU boot:  make run-amd-gpu             ║"
 echo "║  (plain 'make run' has no GPU, so Mesa falls back to llvmpipe)    ║"
 echo "║  Force software GL:  MC_SOFTWARE_GL=1 minecraft                   ║"
 echo "║  Custom username:  MC_USER=YourName minecraft                    ║"

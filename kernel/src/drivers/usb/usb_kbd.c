@@ -279,7 +279,7 @@ static void process_modifier(uint8_t old_mods, uint8_t new_mods, uint8_t bit,
     }
   }
 
-  // Push raw scancode event for games like Doom
+  // Push raw scancode events for applications that need keyboard details.
   keyboard_push_scancode(scancode, is_extended, !now);
 
   /* Also feed the hang-report trigger from the modifier transition itself.

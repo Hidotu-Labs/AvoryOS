@@ -448,9 +448,17 @@ struct drm_crtc {
   struct drm_plane *primary;
   struct drm_plane *cursor;
   struct drm_framebuffer *fb;
+  struct drm_mode_modeinfo mode;
+  uint32_t x, y;
+  bool mode_set;
+  bool mode_valid;
   /* Legacy cursor state belongs to this CRTC and owns its GEM reference. */
   struct drm_framebuffer *legacy_cursor_fb;
 };
+
+/* Caller holds the device lock; NULL clears the configured mode. */
+void ascentdrm_crtc_set_mode(struct drm_crtc *crtc,
+                            const struct drm_mode_modeinfo *mode);
 
 /* Upper bound on the DIRTYFB clip rectangles retained per framebuffer.
  * Xorg's damage region is a short list of disjoint rectangles; keeping them

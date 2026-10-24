@@ -69,7 +69,7 @@ and `avoryos-x86_64.iso` build successfully. Evidence:
 - `build/gpuvm-kpi-rbtree-boot/kvm8-serial.log`
 
 An eight-CPU private KVM guest, with no host GPU assigned and its own root disk,
-passes the new bridge check, TTM rollback and DRM scheduler suites. Its native
+passes the new bridge check, TTM lifecycle and DRM scheduler suites. Its native
 syscall regression passes and it powers off normally. That boot also reports a
 sysfs lifecycle PMM-accounting failure (46 pages); it is not counted as an
 entirely clean boot suite. The expected absent SATA/ATA-controller messages

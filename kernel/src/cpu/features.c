@@ -27,6 +27,9 @@ static inline void cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax,
 static uint32_t feat_max_leaf;
 static uint32_t feat_1_ecx;
 static uint32_t feat_7_0_ebx;
+static uint32_t feat_7_0_ecx;
+static uint32_t feat_ext_max_leaf;
+static uint32_t feat_80000001_edx;
 static uint64_t feat_xstate_mask;
 static bool feat_probed;
 
@@ -34,18 +37,33 @@ static void features_probe(void) {
   cpuid(0, 0, &feat_max_leaf, NULL, NULL, NULL);
   cpuid(1, 0, NULL, NULL, &feat_1_ecx, NULL);
   if (feat_max_leaf >= 7)
-    cpuid(7, 0, NULL, &feat_7_0_ebx, NULL, NULL);
+    cpuid(7, 0, NULL, &feat_7_0_ebx, &feat_7_0_ecx, NULL);
   if (feat_max_leaf >= 0xD) {
     uint32_t xstate_lo = 0, xstate_hi = 0;
     cpuid(0xD, 0, &xstate_lo, NULL, NULL, &xstate_hi);
     feat_xstate_mask = ((uint64_t)xstate_hi << 32) | xstate_lo;
   }
+  cpuid(0x80000000U, 0, &feat_ext_max_leaf, NULL, NULL, NULL);
+  if (feat_ext_max_leaf >= 0x80000001U)
+    cpuid(0x80000001U, 0, NULL, NULL, NULL, &feat_80000001_edx);
   __atomic_store_n(&feat_probed, true, __ATOMIC_RELEASE);
 }
 
 static inline void features_ensure_probed(void) {
   if (!__atomic_load_n(&feat_probed, __ATOMIC_ACQUIRE))
     features_probe();
+}
+
+bool cpu_has_rdtscp(void) {
+  features_ensure_probed();
+  return (feat_80000001_edx & (1U << 27)) != 0; // CPUID.80000001H:EDX.RDTSCP[bit 27]
+}
+
+bool cpu_has_rdpid(void) {
+  features_ensure_probed();
+  if (feat_max_leaf < 7)
+    return false;
+  return (feat_7_0_ecx & (1U << 22)) != 0; // CPUID.07H:ECX.RDPID[bit 22]
 }
 
 bool cpu_has_pcid(void) {

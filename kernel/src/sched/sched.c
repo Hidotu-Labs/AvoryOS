@@ -30,8 +30,7 @@ static void ipi_reschedule_handler(struct registers *regs) {
   /* An IPI is a request, not a scheduler entry.  Switching here would
    * suspend the handler before the common ISR path has completed EOI and
    * LinuxKPI irq-exit bookkeeping.  The common ISR epilogue services this
-   * after those steps when returning to user mode or an idle thread; a kernel
-   * thread keeps the request pending until its next safe scheduling point. */
+   * after those steps, including when returning to preemptible kernel code. */
   struct cpu_info *cpu = cpu_get_current();
   struct thread *running = cpu ? cpu->current_thread : NULL;
   if (running)
@@ -340,35 +339,178 @@ void sched_init(void) {
   fpu_init_cpu();
 }
 
-/* Threads may keep a suspended sched_schedule() continuation on their kernel
- * stack, and that continuation retains CPU-local state across switch_context.
- * Until context switching is redesigned to eliminate that dependency, choose
- * a CPU only before a thread's first run; wakeups and later reschedules stay
- * on the owning CPU. */
+/* Lock two runqueues in deterministic cpu_id order to prevent AB-BA deadlocks
+ * across concurrent wakeup migrations, work-stealing, and affinity changes. */
+static inline void sched_lock_two_rq(struct cpu_info *a, struct cpu_info *b) {
+  if (a == b) {
+    if (a)
+      spinlock_acquire(&a->queue_lock);
+    return;
+  }
+  if (!a) {
+    spinlock_acquire(&b->queue_lock);
+    return;
+  }
+  if (!b) {
+    spinlock_acquire(&a->queue_lock);
+    return;
+  }
+  if (a->cpu_id < b->cpu_id) {
+    spinlock_acquire(&a->queue_lock);
+    spinlock_acquire(&b->queue_lock);
+  } else {
+    spinlock_acquire(&b->queue_lock);
+    spinlock_acquire(&a->queue_lock);
+  }
+}
+
+static inline void sched_unlock_two_rq(struct cpu_info *a, struct cpu_info *b) {
+  if (a == b) {
+    if (a)
+      spinlock_release(&a->queue_lock);
+    return;
+  }
+  if (a)
+    spinlock_release(&a->queue_lock);
+  if (b)
+    spinlock_release(&b->queue_lock);
+}
+
+/* Acquire the queue_lock of whichever CPU currently owns `t`, retrying if a
+ * concurrent wakeup or work-steal migrated `t->cpu_index` while we waited. */
+static struct cpu_info *sched_lock_task_rq(struct thread *t,
+                                           hal_irq_state_t *flags_out) {
+  for (;;) {
+    uint32_t idx = __atomic_load_n(&t->cpu_index, __ATOMIC_ACQUIRE);
+    struct cpu_info *cpu = cpu_get_info(idx);
+    if (!cpu || cpu->status == CPU_STATUS_OFFLINE)
+      cpu = cpu_get_bsp();
+    if (!cpu || cpu->status == CPU_STATUS_OFFLINE)
+      return NULL;
+    hal_irq_state_t flags = hal_irq_save();
+    spinlock_acquire(&cpu->queue_lock);
+    if (__atomic_load_n(&t->cpu_index, __ATOMIC_RELAXED) == cpu->cpu_id) {
+      *flags_out = flags;
+      return cpu;
+    }
+    spinlock_release(&cpu->queue_lock);
+    hal_irq_restore(flags);
+  }
+}
+
+/* Pull one runnable, off-CPU task from the busiest runqueue onto `dst_cpu`.
+ * Caller holds NO queue_locks and has interrupts disabled. */
+static bool sched_steal_one_task(struct cpu_info *dst_cpu) {
+  if (!sched_cpu_accepting_work(dst_cpu))
+    return false;
+
+  uint32_t count = cpu_get_count();
+  if (count <= 1)
+    return false;
+
+  struct cpu_info *busiest = NULL;
+  uint32_t max_load = 1; /* Need at least 2 runnable tasks on donor to steal */
+
+  for (uint32_t i = 0; i < count; i++) {
+    struct cpu_info *c = cpu_get_info(i);
+    if (!c || c == dst_cpu || !sched_cpu_accepting_work(c))
+      continue;
+    uint32_t load = sched_runnable_snapshot(c);
+    if (load > max_load) {
+      max_load = load;
+      busiest = c;
+    }
+  }
+
+  if (!busiest)
+    return false;
+
+  sched_lock_two_rq(dst_cpu, busiest);
+
+  bool stolen = false;
+  if (busiest->eevfd.nr_running >= 1 &&
+      __atomic_load_n(&busiest->runnable_count, __ATOMIC_RELAXED) >= 2) {
+    for (struct rb_node *n = rb_first(&busiest->eevfd.tasks_tree); n;
+         n = rb_next(n)) {
+      struct sched_entity *se = rb_entry(n, struct sched_entity, rb_node);
+      struct thread *cand = rb_entry(se, struct thread, se);
+
+      if (cand->is_idle || cand == busiest->current_thread)
+        continue;
+      if (__atomic_load_n(&cand->on_cpu, __ATOMIC_ACQUIRE))
+        continue;
+      if (__atomic_load_n(&cand->state, __ATOMIC_ACQUIRE) != THREAD_READY)
+        continue;
+      if (cand->deadline_queued || cand->se.critical_depth > 0)
+        continue;
+      uint64_t aff = __atomic_load_n(&cand->cpu_affinity, __ATOMIC_RELAXED);
+      if (aff && !(aff & (1ULL << dst_cpu->cpu_id)))
+        continue;
+
+      /* Migrate `cand` from `busiest` to `dst_cpu` */
+      eevfd_dequeue_entity(&busiest->eevfd, &cand->se);
+      cand->on_runqueue = false;
+      if (__atomic_load_n(&busiest->runnable_count, __ATOMIC_RELAXED))
+        __atomic_sub_fetch(&busiest->runnable_count, 1, __ATOMIC_RELEASE);
+
+      __atomic_store_n(&cand->cpu_index, dst_cpu->cpu_id, __ATOMIC_RELEASE);
+      eevfd_migrate_entity(&busiest->eevfd, &dst_cpu->eevfd, &cand->se);
+      eevfd_enqueue_entity(&dst_cpu->eevfd, &cand->se);
+      cand->on_runqueue = true;
+      __atomic_add_fetch(&dst_cpu->runnable_count, 1, __ATOMIC_RELEASE);
+      stolen = true;
+      break;
+    }
+  }
+
+  sched_unlock_two_rq(dst_cpu, busiest);
+  return stolen;
+}
+
+/* Called after releasing runqueue locks, with local IRQs still masked.
+ * A local task-context wake has no IRQ epilogue of its own. Queue a self IPI
+ * so it reaches the same guarded scheduling boundary as a remote wake, rather
+ * than waiting for the one-millisecond timer backstop. */
+static void sched_notify_runnable(struct cpu_info *target) {
+  if (!lapic_is_ready())
+    return;
+  struct cpu_info *self = cpu_get_current();
+  if (target == self) {
+    struct thread *running = self->current_thread;
+    if (running)
+      __atomic_store_n(&running->need_resched, true, __ATOMIC_RELEASE);
+    lapic_timer_rearm_if_earlier(lapic_timer_get_ms() + 1);
+    /* The current hardirq already calls sched_check_resched after EOI and
+     * irq_exit. Avoid an extra interrupt for every fence in an MSI batch. */
+    if (running && running->kpi_irq_depth)
+      return;
+  }
+  lapic_send_ipi(target->apic_id, IPI_VECTOR_RESCHEDULE);
+}
+
 __attribute__((optimize("O3"))) void sched_enqueue_thread(struct thread *t, struct cpu_info *explicit_cpu) {
   if (!t || t->is_idle || t->state == THREAD_DEAD || t->state == THREAD_ZOMBIE)
     return;
 
-  bool has_started =
-      __atomic_load_n(&t->has_started, __ATOMIC_ACQUIRE);
-  /* A started task can have a saved scheduler continuation that still owns
-   * CPU-local state. Keep it on its home CPU even if a caller requests another
-   * target; only never-started tasks may be load-balanced. */
-  struct cpu_info *target_cpu = has_started
-                                    ? cpu_get_info(t->cpu_index)
-                                    : explicit_cpu;
+  uint64_t affinity = __atomic_load_n(&t->cpu_affinity, __ATOMIC_RELAXED);
+  if (!affinity)
+    affinity = ~0ULL;
 
-  if (!has_started && !target_cpu) {
+  struct cpu_info *target_cpu = NULL;
+  if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) {
+    target_cpu = cpu_get_info(__atomic_load_n(&t->cpu_index, __ATOMIC_ACQUIRE));
+  } else if (explicit_cpu && sched_cpu_accepting_work(explicit_cpu) &&
+             (affinity & (1ULL << explicit_cpu->cpu_id))) {
+    target_cpu = explicit_cpu;
+  } else {
     int pref_node = -1;
     if (t->numa_policy.mode != MPOL_DEFAULT) {
       pref_node = mempolicy_select_node(&t->numa_policy, 0);
     }
-    target_cpu = sched_least_loaded_cpu(t->cpu_affinity, pref_node, NULL);
+    target_cpu = sched_least_loaded_cpu(affinity, pref_node, NULL);
   }
 
   if (!sched_cpu_accepting_work(target_cpu)) {
-    if (has_started)
-      return; /* no safe cross-CPU fallback for a suspended continuation */
     target_cpu = cpu_get_bsp();
   }
 
@@ -388,25 +530,15 @@ __attribute__((optimize("O3"))) void sched_enqueue_thread(struct thread *t, stru
   if (t->state == THREAD_READY || t->state == THREAD_RUNNING)
     __atomic_add_fetch(&target_cpu->runnable_count, 1, __ATOMIC_RELEASE);
 
-  t->cpu_index = target_cpu->cpu_id;
+  __atomic_store_n(&t->cpu_index, target_cpu->cpu_id, __ATOMIC_RELEASE);
 
   struct thread *running = target_cpu->current_thread;
   bool kick_cpu = !running || running == target_cpu->idle_thread || running->is_idle ||
                   eevfd_check_preempt(&target_cpu->eevfd, &running->se, &t->se);
   spinlock_release(&target_cpu->queue_lock);
 
-  if (kick_cpu && lapic_is_ready()) {
-    struct cpu_info *self = cpu_get_current();
-    if (target_cpu == self) {
-      /* Prefer an immediate hand-over at the next reschedule point over
-       * waiting a full tick; the rearm stays as the backstop. */
-      if (running)
-        __atomic_store_n(&running->need_resched, true, __ATOMIC_RELEASE);
-      lapic_timer_rearm_if_earlier(lapic_timer_get_ms() + 1);
-    } else {
-      lapic_send_ipi(target_cpu->apic_id, IPI_VECTOR_RESCHEDULE);
-    }
-  }
+  if (kick_cpu)
+    sched_notify_runnable(target_cpu);
 
   /* Restore the caller's interrupt state: some callers (wait-queue wakes from
    * IRQ context) enter with IF=0, and unconditionally enabling here left an
@@ -499,10 +631,30 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
           prev->se.min_deadline = prev->se.deadline;
         }
       }
-      prev->cpu_index = cpu->cpu_id;
+      __atomic_store_n(&prev->cpu_index, cpu->cpu_id, __ATOMIC_RELEASE);
       eevfd_enqueue_entity(&cpu->eevfd, &prev->se);
       prev->on_runqueue = true;
     }
+  }
+
+  /* Work-stealing: if this core has no runnable tasks, try pulling one off-CPU
+   * task from a busy core before falling back to the idle thread.
+   * CRITICAL: Never drop cpu->queue_lock here if `prev` is blocking/sleeping!
+   * A concurrent sched_wakeup(prev) checks prev's state under cpu->queue_lock;
+   * dropping queue_lock while prev->state is THREAD_BLOCKED/SLEEPING but before
+   * cpu->current_thread is switched away would let sched_wakeup() see
+   * still_current == true and set prev->state = THREAD_RUNNING without
+   * enqueuing prev on the runqueue, causing a lost wakeup when sched_schedule
+   * subsequently switches to idle_thread! */
+  if (cpu->eevfd.nr_running == 0 &&
+      (prev->is_idle || prev->state == THREAD_RUNNING ||
+       prev->state == THREAD_READY)) {
+    spinlock_release(&cpu->queue_lock);
+    sched_steal_one_task(cpu);
+    spinlock_acquire(&cpu->queue_lock);
+    now = lapic_timer_get_ms();
+    now_ns = lapic_timer_get_ns();
+    sched_deadline_expire_locked(cpu, now);
   }
 
   // 2. Select earliest eligible virtual deadline task. A remote kill can
@@ -547,12 +699,12 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
     }
     next_t->state = THREAD_RUNNING;
     __atomic_store_n(&next_t->has_started, true, __ATOMIC_RELEASE);
-    /* Wake-fast-path bookkeeping: the incoming thread may be found as the
-     * current thread from now on, and the outgoing one no longer can.  Both
-     * are cleared/set here, in the dispatcher, because a first dispatch enters
-     * thread_stub and never returns through the scheduler epilogue below. */
+    /* Mark next_t on_cpu before releasing queue_lock.  prev->on_cpu and
+     * cpu->switching_from are cleared inside switch_context (switch.asm) ONLY
+     * after prev->rsp is saved and the CPU has switched to next_t->rsp, so
+     * another CPU can never steal or dispatch prev while its stack is still
+     * in use here. */
     __atomic_store_n(&next_t->on_cpu, true, __ATOMIC_RELEASE);
-    __atomic_store_n(&prev->on_cpu, false, __ATOMIC_RELEASE);
     __atomic_store_n(&cpu->switching_from, prev, __ATOMIC_RELEASE);
     fpu_on_context_switch();
     cpu->current_thread = next_t;
@@ -614,17 +766,16 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
         __asm__ volatile("mov %0, %%cr3" ::"r"(cpu->kernel_cr3) : "memory");
       }
     }
-    /* Set TLS base for the incoming thread with hardware FSGSBASE fast-path */
-    if (prev->fs_base != next_t->fs_base) {
-      if (cpu_has_fsgsbase()) {
-        wrfsbase(next_t->fs_base);
-      } else {
-        wrmsr(0xC0000100, next_t->fs_base);
-      }
+    /* Set TLS base for the incoming thread with hardware FSGSBASE fast-path.
+     * Always write on switch because a migrated thread's fs_base/gs_base may
+     * differ from what this CPU last loaded even if prev had the same value
+     * on another core. */
+    if (cpu_has_fsgsbase()) {
+      wrfsbase(next_t->fs_base);
+    } else {
+      wrmsr(0xC0000100, next_t->fs_base);
     }
-    if (prev->gs_base != next_t->gs_base) {
-      wrmsr(0xC0000102, next_t->gs_base);
-    }
+    wrmsr(0xC0000102, next_t->gs_base);
 
     spinlock_release(&cpu->queue_lock);
     switch_context(prev, next_t);
@@ -632,7 +783,6 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
     spinlock_release(&cpu->queue_lock);
   }
 
-  __atomic_store_n(&cpu->switching_from, NULL, __ATOMIC_RELEASE);
   hal_irq_restore(irq_flags);
 }
 
@@ -690,38 +840,38 @@ void sched_critical_exit(void) { sched_critical_change(false); }
  * because switching away here can keep the vector in-service for a long time
  * (see ipi_reschedule_handler).
  *
- * Deliberately narrow: kernel-mode work is preempted at the timer's normal
- * scheduling point.  An idle CPU can take new work immediately, and a user
- * thread can be switched at interrupt/syscall return.  Terminal threads are
- * also switched away immediately so a remote kill cannot leave them running.
- *   - the LAPIC rearm in the wakeup paths is left in place, so a request that
- *     is missed for any reason costs latency, never a lost wakeup.
+ * Kernel callers must be returning to an IRQ-enabled context. Atomic KPI
+ * sections and nested interrupt contexts retain the request until safe.
  */
 __attribute__((optimize("O3"))) void sched_check_resched(bool to_user) {
+  (void)to_user;
+  hal_irq_state_t flags = hal_irq_save();
   struct cpu_info *cpu = cpu_get_current();
   if (!cpu || !cpu->current_thread)
-    return;
+    goto out;
 
   struct thread *t = cpu->current_thread;
   if (!__atomic_load_n(&t->need_resched, __ATOMIC_ACQUIRE))
-    return;
+    goto out;
 
-  /* A terminal thread must leave even if it was interrupted in kernel mode;
-   * blocked/sleeping threads already enter the scheduler through their own
-   * wait path. */
   uint8_t state = __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
   bool terminal = state == THREAD_DEAD || state == THREAD_ZOMBIE;
-  if (!to_user && !t->is_idle && !terminal)
-    return;
   if (state != THREAD_RUNNING && !terminal)
-    return;
+    goto out;
 
-  /* Never re-enter the scheduler from inside a context switch. */
+  /* Even terminal threads cannot abandon a CPU pin or an outer handler. */
+  extern bool linuxkpi_preempt_allowed(void) __attribute__((weak));
+  if (t->kpi_irq_depth || t->kpi_softirq_depth ||
+      (linuxkpi_preempt_allowed && !linuxkpi_preempt_allowed()))
+    goto out;
+
   if (__atomic_load_n(&cpu->switching_from, __ATOMIC_ACQUIRE))
-    return;
+    goto out;
 
   __atomic_store_n(&t->need_resched, false, __ATOMIC_RELEASE);
   sched_yield();
+out:
+  hal_irq_restore(flags);
 }
 
 static uint32_t active_itimer_count = 0;
@@ -833,6 +983,12 @@ __attribute__((optimize("O3"))) void sched_tick(struct registers *regs) {
     }
 
     bool preempt = false;
+    if (curr->is_idle && cpu->eevfd.nr_running == 0) {
+      spinlock_release(&cpu->queue_lock);
+      sched_steal_one_task(cpu);
+      spinlock_acquire(&cpu->queue_lock);
+    }
+
     if (curr->is_idle && cpu->eevfd.nr_running > 0) {
       preempt = true;
     } else if (!curr->is_idle && cpu->eevfd.nr_running > 0) {
@@ -890,10 +1046,9 @@ static bool sched_update_priority(struct thread *t, uint8_t priority,
                                   int8_t nice_value, int policy,
                                   uint8_t rt_priority, bool reset_on_fork) {
   if (!t || t->is_idle) return false;
-  struct cpu_info *cpu = cpu_get_info(t->cpu_index);
-  if (!cpu || cpu->status == CPU_STATUS_OFFLINE) return false;
-  hal_irq_state_t flags = hal_irq_save();
-  spinlock_acquire(&cpu->queue_lock);
+  hal_irq_state_t flags;
+  struct cpu_info *cpu = sched_lock_task_rq(t, &flags);
+  if (!cpu) return false;
   t->static_priority = priority;
   t->priority = priority;
   t->nice_value = nice_value;
@@ -978,9 +1133,9 @@ void sched_print_tasks(void) {
 // Helper: remove thread from its CPU's runqueue.
 void remove_from_runqueue(struct thread *t) {
   if (!t) return;
-  struct cpu_info *cpu_local = cpu_get_info(t->cpu_index);
-  if (!cpu_local || cpu_local->status == CPU_STATUS_OFFLINE) return;
-  spinlock_acquire(&cpu_local->queue_lock);
+  hal_irq_state_t flags;
+  struct cpu_info *cpu_local = sched_lock_task_rq(t, &flags);
+  if (!cpu_local) return;
   sched_deadline_remove_locked(cpu_local, t);
   if (t->se.on_rq) {
     eevfd_dequeue_entity(&cpu_local->eevfd, &t->se);
@@ -992,6 +1147,7 @@ void remove_from_runqueue(struct thread *t) {
     cpu_local->eevfd.curr = NULL;
   }
   spinlock_release(&cpu_local->queue_lock);
+  hal_irq_restore(flags);
 }
 
 /* A lockless "not current" check is not sufficient for reclamation: another
@@ -1004,15 +1160,14 @@ bool sched_prepare_thread_reap(struct thread *t) {
   if (!t || t->is_idle)
     return false;
 
-  struct cpu_info *cpu = cpu_get_info(t->cpu_index);
-  if (!cpu || cpu->status == CPU_STATUS_OFFLINE)
+  hal_irq_state_t irq_flags;
+  struct cpu_info *cpu = sched_lock_task_rq(t, &irq_flags);
+  if (!cpu)
     return false;
-
-  hal_irq_state_t irq_flags = hal_irq_save();
-  spinlock_acquire(&cpu->queue_lock);
 
   uint8_t state = __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
   if ((state != THREAD_DEAD && state != THREAD_ZOMBIE) ||
+      __atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE) ||
       __atomic_load_n(&cpu->current_thread, __ATOMIC_ACQUIRE) == t ||
       __atomic_load_n(&cpu->switching_from, __ATOMIC_ACQUIRE) == t) {
     spinlock_release(&cpu->queue_lock);
@@ -1045,23 +1200,19 @@ __attribute__((optimize("O3"))) void sched_wakeup(struct thread *t) {
   hal_irq_state_t rflags = hal_irq_save();
 
   struct cpu_info *self = cpu_get_current();
-  struct cpu_info *prev_cpu = cpu_get_info(t->cpu_index);
-  struct cpu_info *target = NULL;
-  bool has_started =
-      __atomic_load_n(&t->has_started, __ATOMIC_ACQUIRE);
+  uint32_t prev_idx = __atomic_load_n(&t->cpu_index, __ATOMIC_ACQUIRE);
+  struct cpu_info *prev_cpu = cpu_get_info(prev_idx);
+  if (!sched_cpu_accepting_work(prev_cpu))
+    prev_cpu = cpu_get_bsp();
 
-  /* A thread currently executing, or suspended inside switch_context's
-   * scheduler continuation, must stay on its source CPU.  In particular,
-   * sched_schedule() keeps a local `cpu` pointer across switch_context(); if
-   * this continuation resumes on a different CPU it will update the wrong
-   * runqueue and can corrupt scheduler state. The current_thread and
-   * switching_from scan also handles a wake racing the initial dispatch.
-   *
-   * on_cpu gates the scan: it is set only while a thread is published as some
-   * CPU's current thread, so a false value proves the recorded cpu_index still
-   * owns every scheduler structure of this thread and the scan can be skipped.
-   * A racing stale true only costs the scan; the state decision below stays
-   * under the target's queue_lock either way. */
+  uint64_t affinity = __atomic_load_n(&t->cpu_affinity, __ATOMIC_RELAXED);
+  if (!affinity)
+    affinity = ~0ULL;
+
+  struct cpu_info *target = NULL;
+
+  /* If t is still on a CPU (e.g. wakeup raced the tail of sched_schedule()
+   * before switch_context cleared t->on_cpu), keep it on that CPU. */
   if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) {
     uint32_t count = cpu_get_count();
     for (uint32_t i = 0; i < count; i++) {
@@ -1074,45 +1225,111 @@ __attribute__((optimize("O3"))) void sched_wakeup(struct thread *t) {
         break;
       }
     }
-  }
-
-  if (!target) {
-    target = prev_cpu;
-  }
-
-  if (has_started && (!target || target->status == CPU_STATUS_OFFLINE)) {
-    /* Runtime migration is intentionally disabled until switch_context no
-     * longer resumes CPU-local scheduler continuations. No CPU hotplug path
-     * exists, so this is only a defensive guard against stale ownership. */
-    hal_irq_restore(rflags);
-    return;
-  }
-
-  if (!target || target->status == CPU_STATUS_OFFLINE ||
-      (!has_started && !(t->cpu_affinity & (1ULL << target->cpu_id)))) {
-    if (self && self->status != CPU_STATUS_OFFLINE && (t->cpu_affinity & (1ULL << self->cpu_id))) {
+    if (!target)
+      target = prev_cpu;
+  } else {
+    /* Off-CPU wakeup load balancing:
+     * 1. Keep cache/TLB locality on prev_cpu if it is allowed and either
+     *    completely idle (load == 0) or has no queued tasks waiting behind
+     *    the currently running task (nr_running == 0), or if t holds a
+     *    priority-ceiling kernel lock (critical_depth > 0).
+     * 2. Otherwise, if the waker's own CPU (`self`) is allowed and idle, wake
+     *    locally for warm IPC/pipe cache locality without IPI overhead.
+     * 3. Otherwise, select the least-loaded allowed CPU across the system. */
+    bool prev_allowed = prev_cpu && (affinity & (1ULL << prev_cpu->cpu_id));
+    uint32_t prev_load = prev_allowed ? sched_cpu_load(prev_cpu) : UINT32_MAX;
+    if (prev_allowed &&
+        (t->se.critical_depth > 0 || prev_load == 0 ||
+         (prev_cpu == self && prev_load <= 1) ||
+         prev_cpu->eevfd.nr_running == 0)) {
+      target = prev_cpu;
+    } else if (self && sched_cpu_accepting_work(self) &&
+               (affinity & (1ULL << self->cpu_id)) &&
+               sched_cpu_load(self) == 0) {
       target = self;
     } else {
-      target = cpu_get_bsp();
+      int pref_node = -1;
+      if (t->numa_policy.mode != MPOL_DEFAULT)
+        pref_node = mempolicy_select_node(&t->numa_policy, 0);
+      uint32_t best_load = UINT32_MAX;
+      struct cpu_info *best =
+          sched_least_loaded_cpu(affinity, pref_node, &best_load);
+      if (prev_allowed && best && best != prev_cpu && prev_load <= best_load) {
+        target = prev_cpu;
+      } else {
+        target = best;
+      }
+    }
+  }
+
+  if (!sched_cpu_accepting_work(target)) {
+    if (self && sched_cpu_accepting_work(self) &&
+        (affinity & (1ULL << self->cpu_id))) {
+      target = self;
+    } else {
+      target = prev_cpu ? prev_cpu : cpu_get_bsp();
     }
   }
 
   if (target && target->status != CPU_STATUS_OFFLINE) {
-    bool send_ipi = false;
-    bool rearm_local = false;
+    bool notify = false;
 
-    if (target != prev_cpu && prev_cpu && prev_cpu->status != CPU_STATUS_OFFLINE && t->deadline_queued) {
-      spinlock_acquire(&prev_cpu->queue_lock);
-      sched_deadline_remove_locked(prev_cpu, t);
-      spinlock_release(&prev_cpu->queue_lock);
+    /* Lock both prev_cpu and target in deterministic cpu_id order so we can
+     * safely inspect t->on_cpu, unlink any deadline timer on prev_cpu, and
+     * enqueue on target atomically.  Also verify that if t->on_cpu is true,
+     * prev_cpu is the core actually running/switching t (in case a prior
+     * wakeup migrated t->cpu_index while t was still running on its old core). */
+    for (;;) {
+      uint32_t cur_idx = __atomic_load_n(&t->cpu_index, __ATOMIC_ACQUIRE);
+      prev_cpu = cpu_get_info(cur_idx);
+      if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) {
+        uint32_t count = cpu_get_count();
+        for (uint32_t i = 0; i < count; i++) {
+          struct cpu_info *c = cpu_get_info(i);
+          if (c && c->status != CPU_STATUS_OFFLINE &&
+              (__atomic_load_n(&c->current_thread, __ATOMIC_ACQUIRE) == t ||
+               __atomic_load_n(&c->switching_from, __ATOMIC_ACQUIRE) == t)) {
+            prev_cpu = c;
+            target = c;
+            break;
+          }
+        }
+      }
+      if (!prev_cpu || prev_cpu->status == CPU_STATUS_OFFLINE)
+        prev_cpu = target;
+      sched_lock_two_rq(prev_cpu, target);
+      bool idx_ok = (__atomic_load_n(&t->cpu_index, __ATOMIC_RELAXED) ==
+                     prev_cpu->cpu_id);
+      bool on_prev =
+          (__atomic_load_n(&prev_cpu->current_thread, __ATOMIC_RELAXED) == t ||
+           __atomic_load_n(&prev_cpu->switching_from, __ATOMIC_RELAXED) == t);
+      if (on_prev || (idx_ok && !__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE))) {
+        break;
+      }
+      sched_unlock_two_rq(prev_cpu, target);
     }
 
-    spinlock_acquire(&target->queue_lock);
-    if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
+    /* If t is still on prev_cpu's stack (wakeup raced the outgoing schedule
+     * before switch.asm cleared on_cpu), do not migrate it across CPUs; wake
+     * it in place on prev_cpu instead. */
+    struct cpu_info *dest = target;
+    if (dest != prev_cpu &&
+        (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE) ||
+         __atomic_load_n(&prev_cpu->current_thread, __ATOMIC_ACQUIRE) == t ||
+         __atomic_load_n(&prev_cpu->switching_from, __ATOMIC_ACQUIRE) == t)) {
+      dest = prev_cpu;
+    }
+
+    uint8_t cur_state = __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
+    if (cur_state == THREAD_BLOCKED || cur_state == THREAD_SLEEPING) {
       bool still_current =
-          __atomic_load_n(&target->current_thread, __ATOMIC_ACQUIRE) == t;
-      sched_deadline_remove_locked(target, t);
-      t->state = still_current ? THREAD_RUNNING : THREAD_READY;
+          __atomic_load_n(&dest->current_thread, __ATOMIC_ACQUIRE) == t;
+      sched_deadline_remove_locked(prev_cpu, t);
+      if (dest != prev_cpu)
+        sched_deadline_remove_locked(dest, t);
+      __atomic_store_n(&t->state,
+                       still_current ? THREAD_RUNNING : THREAD_READY,
+                       __ATOMIC_RELEASE);
       t->wakeup_ticks = 0;
       /* Timestamp the transition, including a waiter already linked by a
        * racing deadline expiry. Repeated wakeups must not erase its age. */
@@ -1121,40 +1338,27 @@ __attribute__((optimize("O3"))) void sched_wakeup(struct thread *t) {
       else if (!t->ready_since_ms)
         t->ready_since_ms = lapic_timer_get_ms();
       if (!still_current && !t->se.on_rq) {
-        /* Publish the target only once the enqueue is serialized under its
-         * queue_lock; a stale/racy cpu_index makes the deadline and removal
-         * paths operate on another CPU's list/tree.  The on_rq check refuses
-         * to link an entity that a racing expire/wakeup already enqueued. */
-        t->cpu_index = target->cpu_id;
-        eevfd_place_entity(&target->eevfd, &t->se, false);
-        eevfd_enqueue_entity(&target->eevfd, &t->se);
+        __atomic_store_n(&t->cpu_index, dest->cpu_id, __ATOMIC_RELEASE);
+        if (dest != prev_cpu)
+          eevfd_migrate_entity(&prev_cpu->eevfd, &dest->eevfd, &t->se);
+        else
+          eevfd_place_entity(&dest->eevfd, &t->se, false);
+        eevfd_enqueue_entity(&dest->eevfd, &t->se);
         t->on_runqueue = true;
-        __atomic_add_fetch(&target->runnable_count, 1, __ATOMIC_RELEASE);
+        __atomic_add_fetch(&dest->runnable_count, 1, __ATOMIC_RELEASE);
 
-        struct thread *running = target->current_thread;
-        bool should_kick = !running || running->is_idle || running == target->idle_thread ||
-                           eevfd_check_preempt(&target->eevfd, &running->se, &t->se);
+        struct thread *running = dest->current_thread;
+        bool should_kick =
+            !running || running->is_idle || running == dest->idle_thread ||
+            eevfd_check_preempt(&dest->eevfd, &running->se, &t->se);
 
-        if (target->apic_id != self->apic_id) {
-          if (should_kick)
-            send_ipi = true;
-        } else if (should_kick) {
-          /* Same CPU: ask the running thread to hand over at its next
-           * interrupt/syscall exit instead of waiting up to a full tick.
-           * `running` is never t here (that case is still_current above). */
-          if (running)
-            __atomic_store_n(&running->need_resched, true, __ATOMIC_RELEASE);
-          rearm_local = true;
-        }
+        notify = should_kick;
       }
     }
-    spinlock_release(&target->queue_lock);
+    sched_unlock_two_rq(prev_cpu, target);
 
-    if (send_ipi && lapic_is_ready()) {
-      lapic_send_ipi(target->apic_id, IPI_VECTOR_RESCHEDULE);
-    } else if (rearm_local && lapic_is_ready()) {
-      lapic_timer_rearm_if_earlier(lapic_timer_get_ms() + 1);
-    }
+    if (notify)
+      sched_notify_runnable(dest);
   } else {
     t->state = THREAD_READY;
     t->wakeup_ticks = 0;
@@ -1162,4 +1366,72 @@ __attribute__((optimize("O3"))) void sched_wakeup(struct thread *t) {
   }
 
   hal_irq_restore(rflags);
+}
+
+void sched_enforce_affinity(struct thread *t) {
+  if (!t || t->is_idle)
+    return;
+
+  uint64_t affinity = __atomic_load_n(&t->cpu_affinity, __ATOMIC_ACQUIRE);
+  if (!affinity)
+    return;
+
+  uint32_t cur_idx = __atomic_load_n(&t->cpu_index, __ATOMIC_ACQUIRE);
+  if (affinity & (1ULL << cur_idx))
+    return;
+
+  int pref_node = -1;
+  if (t->numa_policy.mode != MPOL_DEFAULT)
+    pref_node = mempolicy_select_node(&t->numa_policy, 0);
+  struct cpu_info *dest = sched_least_loaded_cpu(affinity, pref_node, NULL);
+  if (!sched_cpu_accepting_work(dest))
+    return;
+
+  hal_irq_state_t flags = hal_irq_save();
+  struct cpu_info *src = cpu_get_info(cur_idx);
+  if (!src || src->status == CPU_STATUS_OFFLINE || src == dest) {
+    hal_irq_restore(flags);
+    return;
+  }
+
+  sched_lock_two_rq(src, dest);
+  bool migrated = false;
+  bool kick_src = false;
+
+  if (__atomic_load_n(&t->cpu_index, __ATOMIC_RELAXED) == src->cpu_id) {
+    if (!__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == THREAD_READY &&
+        t->se.on_rq && !t->deadline_queued) {
+      eevfd_dequeue_entity(&src->eevfd, &t->se);
+      t->on_runqueue = false;
+      if (__atomic_load_n(&src->runnable_count, __ATOMIC_RELAXED))
+        __atomic_sub_fetch(&src->runnable_count, 1, __ATOMIC_RELEASE);
+
+      __atomic_store_n(&t->cpu_index, dest->cpu_id, __ATOMIC_RELEASE);
+      eevfd_migrate_entity(&src->eevfd, &dest->eevfd, &t->se);
+      eevfd_enqueue_entity(&dest->eevfd, &t->se);
+      t->on_runqueue = true;
+      __atomic_add_fetch(&dest->runnable_count, 1, __ATOMIC_RELEASE);
+      migrated = true;
+    } else if (__atomic_load_n(&src->current_thread, __ATOMIC_ACQUIRE) == t) {
+      __atomic_store_n(&t->need_resched, true, __ATOMIC_RELEASE);
+      kick_src = true;
+    }
+  }
+
+  sched_unlock_two_rq(src, dest);
+  hal_irq_restore(flags);
+
+  if (migrated && lapic_is_ready()) {
+    struct cpu_info *self = cpu_get_current();
+    if (dest != self)
+      lapic_send_ipi(dest->apic_id, IPI_VECTOR_RESCHEDULE);
+  } else if (kick_src) {
+    struct cpu_info *self = cpu_get_current();
+    if (src == self) {
+      sched_yield();
+    } else if (lapic_is_ready()) {
+      lapic_send_ipi(src->apic_id, IPI_VECTOR_RESCHEDULE);
+    }
+  }
 }

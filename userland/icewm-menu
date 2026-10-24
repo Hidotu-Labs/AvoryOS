@@ -19,7 +19,6 @@ menu "System" applications-system {
     prog "htop" utilities-system-monitor st -e htop
 }
 menu "Games & Demos" applications-games {
-    prog "DOOM (X11)" applications-games /bin/doom_x11
     prog "ClassiCube" applications-games /bin/classicube
     prog "Pong" applications-games /bin/pong
     prog "Raycaster" applications-games /bin/raycast
@@ -29,7 +28,6 @@ menu "Multimedia" applications-multimedia {
     prog "Audio Player" multimedia-player st -e /bin/asplay /assets/test.wav
 }
 menu "AvoryOS" applications-system {
-    prog "About AvoryOS" help-about /bin/about
     prog "Reboot" system-reboot /bin/reboot
     prog "Shut Down" system-shutdown /bin/shutdown
 }

@@ -51,6 +51,10 @@ static void list_add_tail(struct list_head *p,struct list_head *h) {
 static void list_del_init(struct list_head *p) {
  p->next->prev=p->prev;p->prev->next=p->next;INIT_LIST_HEAD(p);
 }
+#define list_entry(p,t,m) ((t*)((char*)(p)-offsetof(t,m)))
+#define list_for_each_entry_safe(p,n,h,m) \
+ for(p=list_entry((h)->next,__typeof__(*p),m),n=list_entry(p->m.next,__typeof__(*p),m); \
+ &p->m!=(h);p=n,n=list_entry(n->m.next,__typeof__(*n),m))
 #define list_first_entry(h,t,m) ((t*)((char*)(h)->next - offsetof(t,m)))
 typedef struct {pthread_mutex_t mutex;bool held;} spinlock_t;
 static _Thread_local bool wake_requires_lock;
@@ -93,6 +97,11 @@ static void linuxkpi_wake_thread(void *p) {
  pthread_mutex_lock(&t->lock);t->pending=true;pthread_cond_signal(&t->cond);pthread_mutex_unlock(&t->lock);
 }
 static void linuxkpi_wake_poll_queue(void *p) {(void)p;}
+#define DEFINE_SPINLOCK(name) spinlock_t name = {.mutex=PTHREAD_MUTEX_INITIALIZER}
+#define GFP_ATOMIC 0
+static void *kzalloc(size_t n,int flags) {(void)flags;return calloc(1,n);}
+static void kfree(void *p) {free(p);}
+static void asc_vfs_poll_notify(void *node,void *wq) {(void)node;(void)wq;}
 static long schedule_timeout(long timeout) {
  setup_task();pthread_mutex_lock(&task.lock);
  struct timespec end;clock_gettime(CLOCK_REALTIME,&end);

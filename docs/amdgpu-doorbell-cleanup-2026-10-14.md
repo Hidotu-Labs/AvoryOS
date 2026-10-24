@@ -69,10 +69,9 @@ untouched; the imported tree as a whole cannot be described as pristine.
 - Kernel and main ISO builds: PASS. Linked disassembly shows the ordinary
   finalizer calls doorbell cleanup before delegating to the imported finalizer;
   `amdgpu_bo_fini` relocates to the owned entry point.
-- `ttm-rollback-boot.py --cpus 8`: PASS with real TTM, devres, firmware and sysfs
-  self-tests and orderly guest shutdown in private QEMU/KVM. No VFIO device or
-  main disk attached. This boot exercises generic TTM rollback, not the AMDGPU
-  wrapper's hardware failure path.
+- `private GPU-free KVM boot`: PASS with real TTM, devres, firmware and sysfs
+  self-tests and orderly guest shutdown. No VFIO device or main disk attached.
+  This did not exercise the AMDGPU wrapper's hardware failure path.
 - Main ISO kernel was extracted and compared byte-for-byte with the current
   stripped ELF: PASS (SHA-256
   `93fffabb0764d43f0183b2edbdba94450225410f3c2769d46a9fd8a1aee00730`).
@@ -82,7 +81,7 @@ Build logs: `build/logs/amdgpu-doorbell-build.log` and
 `build/logs/amdgpu-doorbell-iso.log`. CPU regression log:
 `build/logs/amdgpu-doorbell-regressions.log`. Private boot results:
 `build/logs/amdgpu-doorbell-rollback.log` and
-`build/ttm-rollback-boot/kvm8-serial.log`.
+private KVM serial evidence.
 
 No physical GPU initialization/reset run was performed. No host bridge, VFIO,
 power or firmware settings were changed. QEMU close/reopen PSP failure, physical

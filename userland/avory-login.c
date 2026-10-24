@@ -63,7 +63,7 @@ static void run_session(const struct passwd *pw) {
     setenv("USER", pw->pw_name, 1);
     setenv("LOGNAME", pw->pw_name, 1);
     setenv("SHELL", shell, 1);
-    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/opt/coreutils/bin:/usr/bin:/sbin:/bin", 1);
+    setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
     setenv("TERM", "xterm-256color", 1);
     setenv("TERM_PROGRAM", "vt", 1);
 

@@ -23,6 +23,10 @@ code = r'''
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+static void gpu_perf_syncobj_park(void *t){(void)t;}
+static void gpu_perf_syncobj_wake(void *t){(void)t;}
+static void gpu_perf_syncobj_resume(void *t){(void)t;}
+
 enum { THREAD_RUNNING, THREAD_SLEEPING, THREAD_BLOCKED };
 struct thread {
  int state;
@@ -37,6 +41,9 @@ static uint64_t ticks;
 static int yields;
 static bool wake_in_yield;
 static struct thread *sched_get_current(void) { return &task; }
+typedef unsigned long hal_irq_state_t;
+static hal_irq_state_t hal_irq_save(void) { return 0; }
+static void hal_irq_restore(hal_irq_state_t flags) { (void)flags; }
 static struct cpu_info *cpu_get_current(void) { return &cpu; }
 static void spinlock_acquire(int *lock) { assert(!*lock); *lock=1; }
 static void spinlock_release(int *lock) { assert(*lock); *lock=0; }
@@ -55,6 +62,7 @@ static void sched_yield(void) {
 }
 '''
 for signature in ('void linuxkpi_set_current_state(',
+                  'void linuxkpi_thread_block(',
                   'int linuxkpi_schedule_timeout_ms(',
                   'void linuxkpi_wake_thread('):
     code += function(signature) + '\n'
@@ -75,11 +83,20 @@ int main(void) {
  wake_in_yield=true;
  assert(linuxkpi_schedule_timeout_ms(2000)==1 && ticks==21);
  linuxkpi_set_current_state(0);
- assert(!task.kpi_wait_prepared && !task.kpi_wake_pending);
+ assert(!task.kpi_wait_prepared && !task.kpi_wake_pending && !task.kpi_block_pending);
  /* Finishing an unslept condition wait discards its unused notification. */
  linuxkpi_set_current_state(1); linuxkpi_wake_thread(&task);
  linuxkpi_set_current_state(0); wake_in_yield=false;
  assert(linuxkpi_schedule_timeout_ms(20)==0 && ticks==41);
+ /* An unprepared wake must not arm a later plain block. */
+ linuxkpi_wake_thread(&task); assert(!task.kpi_block_pending);
+ linuxkpi_set_current_state(1); linuxkpi_wake_thread(&task);
+ int before=yields; linuxkpi_thread_block();
+ assert(yields==before && !task.kpi_block_pending && !task.kpi_wait_prepared);
+ /* Completion of an actual parked wait consumes its wake notification. */
+ linuxkpi_set_current_state(1); wake_in_yield=true;
+ linuxkpi_thread_block();
+ assert(yields==before+1 && !task.kpi_block_pending && !task.kpi_wait_prepared);
  puts("PASS: fence wake before timeout, wake after park, stale wake isolation and wait cleanup");
 }
 '''

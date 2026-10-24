@@ -57,6 +57,8 @@ _Bool linuxkpi_thread_has_pending_signal(void *thread);
 /* The calling thread's thread-group id (== pid for the group leader).  Used
  * to back Linux's task_tgid() for the DRM master checks. */
 unsigned long linuxkpi_current_tgid(void);
+/* One automatic native thread dump per boot for a sustained GPU wait. */
+void linuxkpi_report_stalled_gpu_wait(void);
 
 /* Per-thread Linux task_struct shadow.  `linuxkpi_current_task()` lazily
  * allocates one through the weak linuxkpi_task_shadow_new() hook (defined on

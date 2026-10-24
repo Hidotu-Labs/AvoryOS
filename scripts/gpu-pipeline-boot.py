@@ -20,7 +20,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-TREE = ROOT/'build/alpine/rootfs'
+TREE = ROOT/'build/arch/rootfs'
 OUT = ROOT/'build/gpu-pipeline-boot'
 INIT = r'''
 #include <fcntl.h>

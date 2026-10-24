@@ -29,8 +29,10 @@ switch_context:
     mov rsp, [rsi]
 
     ; The old kernel stack is no longer in use. Clear this actual CPU's
-    ; stack hazard here; a resumed C frame may hold a stale CPU pointer.
+    ; stack hazard and release old_t->on_cpu (offset 16) here so no remote
+    ; CPU can migrate or dispatch old_t before its rsp is saved.
     mov qword [gs:376], 0
+    mov byte [rdi + 16], 0
 
     ; Pop callee-saved registers for the arriving thread
     pop r15

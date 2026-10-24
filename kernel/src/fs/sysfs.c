@@ -1369,7 +1369,9 @@ void asc_sysfs_remove(void *dir, const char *name) {
   vfs_close(child);
 }
 
-static vfs_node_t *sysfs_drm_minor_parent(const char *pci_bdf) {
+static vfs_node_t *sysfs_drm_minor_parent(const char *pci_bdf,
+                                         const char *parent_bus,
+                                         const char *parent_name) {
   char path[128];
   vfs_node_t *parent;
 
@@ -1377,15 +1379,28 @@ static vfs_node_t *sysfs_drm_minor_parent(const char *pci_bdf) {
     snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s", pci_bdf);
     parent = asc_sysfs_dir_by_path(path);
   } else {
-    parent = asc_sysfs_dir_by_path("/sys/devices/virtual");
+    /* Software DRM devices still have a real parent (e.g. faux/vkms or
+     * faux/vgem). Keep each device's minors together, without grouping
+     * unrelated virtual GPUs into one render-device directory. */
+    vfs_node_t *devices = asc_sysfs_dir_by_path("/sys/devices");
+    vfs_node_t *bus = sysfs_mkdir(devices, parent_bus);
+    parent = sysfs_mkdir(bus, parent_name);
+    vfs_node_t *bus_root = asc_sysfs_dir_by_path("/sys/bus");
+    vfs_node_t *bus_dir = sysfs_mkdir(bus_root, parent_bus);
+    vfs_node_t *bus_devices = sysfs_mkdir(bus_dir, "devices");
+    snprintf(path, sizeof(path), "/sys/bus/%s", parent_bus);
+    sysfs_symlink(parent, "subsystem", path);
+    snprintf(path, sizeof(path), "/sys/devices/%s/%s", parent_bus, parent_name);
+    sysfs_symlink(bus_devices, parent_name, path);
   }
   return parent ? sysfs_mkdir(parent, "drm") : NULL;
 }
 
 void *asc_sysfs_drm_minor_add(void *class_dir, const char *name,
-                             const char *pci_bdf, unsigned int major,
+                             const char *pci_bdf, const char *parent_bus,
+                             const char *parent_name, unsigned int major,
                              unsigned int minor) {
-  vfs_node_t *parent = sysfs_drm_minor_parent(pci_bdf);
+  vfs_node_t *parent = sysfs_drm_minor_parent(pci_bdf, parent_bus, parent_name);
   vfs_node_t *char_dir = asc_sysfs_dir_by_path("/sys/dev/char");
   vfs_node_t *devices;
   vfs_node_t *node;
@@ -1409,7 +1424,10 @@ void *asc_sysfs_drm_minor_add(void *class_dir, const char *name,
     snprintf(target, sizeof(target), "/sys/bus/pci/devices/%s/drm/%s",
              pci_bdf, name);
   } else {
-    snprintf(target, sizeof(target), "/sys/devices/virtual/drm/%s", name);
+    snprintf(target, sizeof(target), "/sys/devices/%s/%s", parent_bus, parent_name);
+    sysfs_symlink(node, "device", target);
+    snprintf(target, sizeof(target), "/sys/devices/%s/%s/drm/%s",
+             parent_bus, parent_name, name);
   }
   sysfs_symlink(class_dir, name, target);
   devices = sysfs_mkdir(class_dir, "devices");
@@ -1421,9 +1439,10 @@ void *asc_sysfs_drm_minor_add(void *class_dir, const char *name,
 }
 
 void asc_sysfs_drm_minor_remove(void *class_dir, const char *name,
-                                const char *pci_bdf, unsigned int major,
+                                const char *pci_bdf, const char *parent_bus,
+                                const char *parent_name, unsigned int major,
                                 unsigned int minor) {
-  vfs_node_t *parent = sysfs_drm_minor_parent(pci_bdf);
+  vfs_node_t *parent = sysfs_drm_minor_parent(pci_bdf, parent_bus, parent_name);
   vfs_node_t *char_dir = asc_sysfs_dir_by_path("/sys/dev/char");
   vfs_node_t *devices = asc_sysfs_dir_by_path("/sys/class/drm/devices");
   char number[32];

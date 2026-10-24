@@ -80,6 +80,18 @@ int main(void) {
     check(native+nvidia+amd,'/dev/dri/card4 /dev/dri/renderD129',settings={'ASCENT_DRM_RENDER':'/dev/dri/renderD129'})
     check(vkms,'')
     check('','')
+    check(native+vkms+nvidia,
+          '/dev/dri/card7 /dev/dri/renderD129 nouveau /dev/dri/card2:/dev/dri/card7',mode='--wayland')
+    check(native+vkms+amd,
+          '/dev/dri/card4 /dev/dri/renderD135 amdgpu /dev/dri/card4:/dev/dri/card7',mode='--wayland')
+    check(native+vkms+amd.replace(' 1 ',' 0 '),
+          '/dev/dri/card7 /dev/dri/renderD135 amdgpu /dev/dri/card4:/dev/dri/card7',mode='--wayland')
+    check(native+vkms,
+          '/dev/dri/card7 - - /dev/dri/card7',mode='--wayland')
+    check(native+amd+nvidia,
+          '/dev/dri/card4 /dev/dri/renderD129 nouveau /dev/dri/card2:/dev/dri/card4:/dev/dri/card7',
+          mode='--wayland',settings={'ASCENT_DRM_RENDER':'/dev/dri/renderD129'})
+    check(vkms,'',mode='--wayland')
     check(native+nvidia.replace('/dev/dri/renderD129','-'),'/dev/dri/card7 -')
     check((nvidia+native).replace('card2','card20').replace('card7','card0').replace('renderD129','renderD139'),
           '/dev/dri/card0 /dev/dri/renderD139')
@@ -94,7 +106,25 @@ int main(void) {
     environment.pop('KWIN_DRM_DEVICES',None)
     result = subprocess.run(['sh','-c','. "$1"; printf "%s" "$KWIN_DRM_DEVICES"','sh',str(profile)],
                             env=environment,capture_output=True,text=True,check=True)
-    assert result.stdout == '/dev/dri/card7'
+    assert result.stdout == '/dev/dri/card2:/dev/dri/card7'
+    result = subprocess.run(['sh','-c','. "$1"; printf "%s %s" "$KWIN_RENDER_NODES" "$NOUVEAU_USE_ZINK"','sh',str(profile)],
+                            env={k:v for k,v in environment.items() if k not in ('KWIN_RENDER_NODES','NOUVEAU_USE_ZINK')},
+                            capture_output=True,text=True,check=True)
+    assert result.stdout == '/dev/dri/renderD129 1', result
+    result = subprocess.run(['sh','-c','. "$1"; printf "%s %s" "$KWIN_RENDER_NODES" "$NOUVEAU_USE_ZINK"','sh',str(profile)],
+                            env=dict(environment,KWIN_RENDER_NODES='',NOUVEAU_USE_ZINK='0'),
+                            capture_output=True,text=True,check=True)
+    assert result.stdout == ' 0', result
+    records.write_text(native+vkms+amd.replace(' 1 ',' 0 '))
+    clean = {k:v for k,v in environment.items() if k not in ('KWIN_RENDER_NODES','NOUVEAU_USE_ZINK')}
+    result = subprocess.run(['sh','-c','. "$1"; printf "%s %s %s" "$KWIN_DRM_DEVICES" "$KWIN_RENDER_NODES" "${NOUVEAU_USE_ZINK-unset}"','sh',str(profile)],
+                            env=clean,capture_output=True,text=True,check=True)
+    assert result.stdout == '/dev/dri/card4:/dev/dri/card7 /dev/dri/renderD135 unset', result
+    records.write_text(native+vkms)
+    result = subprocess.run(['sh','-c','. "$1"; printf "%s %s" "$KWIN_DRM_DEVICES" "${KWIN_RENDER_NODES-unset}"','sh',str(profile)],
+                            env=clean,capture_output=True,text=True,check=True)
+    assert result.stdout == '/dev/dri/card7 unset', result
+    records.write_text(native+nvidia)
     xorg = directory/'xorg-profile.sh'
     xorg.write_text((root/'config/xorg/avory-xorg-profile.sh').read_text().replace('/bin/drm-pick.sh',str(selector)))
     alternate = directory/'alternates'

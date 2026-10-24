@@ -1,4 +1,0 @@
-NAME=system-init
-DESCRIPTION="prepare writable runtime directories"
-TYPE=oneshot
-COMMAND=avoryd:runtime-dirs

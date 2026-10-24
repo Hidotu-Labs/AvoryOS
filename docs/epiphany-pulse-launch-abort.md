@@ -131,7 +131,7 @@ The earlier console workaround for an already running session still works:
 env -u PULSE_SERVER PULSE_RUNTIME_PATH=/run/pipewire/pulse XDG_CACHE_HOME=/.cache XDG_CONFIG_HOME=/.config epiphany
 ```
 
-The staged rootfs was refreshed with `make setup-alpine`. The installed
+The staged rootfs was refreshed with `make setup-arch`. The installed
 `disk.img` was patched in place while QEMU was stopped and its filesystem
 reported clean with no journal recovery pending: `/etc/profile`,
 `/etc/bash.bashrc`, `/.bashrc`, `/etc/xdg/xfce4/xinitrc`,
@@ -140,7 +140,7 @@ copy. Read-back matches the
 patched sources byte for byte; the pre-patch files are kept in
 `build/epiphany-abort/disk-pre-xdg-fix/`. Fresh images pick the fix up from
 the sources. The direct-boot `initrd/startw.sh`/`initrd/startx.sh` scripts and
-their disabled avoryd `wayland.service`/`x11.service` files were retired
+their disabled `wayland.service`/`x11.service` files were retired
 afterwards, so fresh images no longer contain them. The live `disk.img` was
 later rebuilt from the sources and verified offline to match (the
 pre-rebuild image is kept at `build/epiphany-abort/disk-pre-reformat.img`).

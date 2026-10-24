@@ -34,6 +34,7 @@ struct vdso_data {
     uint64_t sec_shift;
     uint64_t mult_rem_ns;
     uint64_t mult_rem_us;
+    uint64_t getcpu_mode; /* 0 = syscall fallback, 1 = rdtscp, 2 = rdpid */
 };
 
 static inline const struct vdso_data *get_vdso_data(void) {
@@ -47,6 +48,19 @@ static inline uint64_t rdtsc(void) {
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
+}
+
+static inline uint32_t read_tsc_aux_rdtscp(void) {
+    uint32_t aux;
+    __asm__ volatile("rdtscp" : "=c"(aux) : : "rax", "rdx");
+    return aux;
+}
+
+static inline uint32_t read_tsc_aux_rdpid(void) {
+    uint64_t aux;
+    /* rdpid %rax encoded as F3 0F C7 F8 so any assembler version accepts it */
+    __asm__ volatile(".byte 0xf3, 0x0f, 0xc7, 0xf8" : "=a"(aux));
+    return (uint32_t)aux;
 }
 
 static inline long vdso_syscall2(long nr, long arg1, long arg2) {
@@ -146,8 +160,29 @@ int64_t __vdso_time(int64_t *tloc) {
 
 int64_t time(int64_t *tloc) __attribute__((weak, alias("__vdso_time")));
 
+__attribute__((section(".text.getcpu")))
 long __vdso_getcpu(unsigned *cpu, unsigned *node, void *unused) {
-    return vdso_syscall3(309, (long)cpu, (long)node, (long)unused);
+    (void)unused;
+    const struct vdso_data *data = get_vdso_data();
+    uint64_t mode = data->getcpu_mode;
+    uint32_t aux;
+    if (mode == 2) {
+        aux = read_tsc_aux_rdpid();
+    } else if (mode == 1) {
+        aux = read_tsc_aux_rdtscp();
+    } else {
+        /* Fallback when neither RDPID nor RDTSCP is supported: extract the
+         * per-CPU TSS selector from TR (GDT_TSS_BASE=6, 2 slots per CPU). */
+        uint16_t sel;
+        __asm__ volatile("str %0" : "=r"(sel));
+        uint32_t idx = (uint32_t)(sel >> 3);
+        aux = (idx >= 6U) ? ((idx - 6U) >> 1) : 0U;
+    }
+    if (cpu)
+        *cpu = aux & 0xFFFU;
+    if (node)
+        *node = (aux >> 12) & 0xFFFU;
+    return 0;
 }
 
 long getcpu(unsigned *cpu, unsigned *node, void *unused) __attribute__((weak, alias("__vdso_getcpu")));

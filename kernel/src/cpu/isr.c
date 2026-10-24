@@ -94,6 +94,12 @@ static void send_eoi(struct registers *regs) {
     return;
   if (regs->int_no < 32)
     return;
+  /* lapic_timer_handler (vector 48) acknowledges its LAPIC EOI before calling
+   * sched_tick().  A thread preempted inside sched_tick() may migrate and
+   * resume on another CPU, where a second EOI here would acknowledge the wrong
+   * CPU's in-service vector. */
+  if (regs->int_no == 48)
+    return;
   if (apic_mode) {
     /* x2APIC EOI is an MSR write and does not need the LAPIC HHDM mapping.
      * In xAPIC mode, however, a process PML4 can lack the MMIO slot even
@@ -1436,8 +1442,9 @@ void isr_handler(struct registers *regs) {
     linuxkpi_irq_exit();
 
   /* Complete both the controller EOI and LinuxKPI hardirq accounting before
-   * a reschedule request can switch away from this interrupt frame. */
-  if (is_hw_irq)
+   * a reschedule request can switch away from this interrupt frame. Do not
+   * preempt an interrupted IRQ-masked region (including native spinlocks). */
+  if (is_hw_irq && (regs->rflags & (1ULL << 9)))
     sched_check_resched((regs->cs & 0x3) == 0x3);
 
   /* rseq: an IRQ (e.g. the timer) may have preempted a restartable critical
@@ -1447,7 +1454,7 @@ void isr_handler(struct registers *regs) {
    * and the post-handler resume is covered by the syscall/sigreturn hooks. */
   if ((regs->cs & 0x3) == 0x3) {
     struct thread *rt = sched_get_current();
-    if (rt) {
+    if (rt && __builtin_expect(rt->rseq_addr != 0, 0)) {
       rseq_update_cpu_id(rt);
       rseq_maybe_abort(rt, &regs->rip);
     }

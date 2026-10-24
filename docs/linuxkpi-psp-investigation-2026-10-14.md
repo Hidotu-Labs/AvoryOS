@@ -44,18 +44,12 @@ Imported AMDGPU/TTM sources remain unchanged.
 
 ## Real native VM tests
 
-[ttm-rollback-boot.py](/home/offihito/AvoryOS/scripts/ttm-rollback-boot.py) builds a
-private root disk/ISO and passes no physical devices. It stages the manifest's
-firmware files and boots an emulated EDU device for actual PCI/IRQ tests.
+The private GPU-free KVM harness builds a root disk/ISO and passes no physical
+devices. It stages the manifest firmware and boots an emulated EDU device for
+PCI/IRQ tests.
 
 - 1-CPU and 8-CPU KVM runs passed all enabled native boot suites with no `[FAIL]`
   records, reached the userland regression, and powered off normally.
-- The TTM rollback fixture uses actual imported TTM objects/managers/workers.
-  Failures after 1..4 pinned allocations unwind buffers while managers remain
-  alive. Holding a reservation forces real delayed-delete work; the fixture
-  verifies destruction counts, resource usage and the pinned list after draining.
-  This tests a lifetime requirement, not the PSP firmware protocol or the actual
-  original AMDGPU caller.
 - A separate disposable CPU guest uses GDB to deliberately remove a fake SYSTEM
   manager and set BO priority 2. This produces CR2 `0x60`, RSI zero, RAX `0x20`
   at the manager-LRU instruction. The report includes registers and stack
@@ -69,8 +63,8 @@ firmware files and boots an emulated EDU device for actual PCI/IRQ tests.
   files. Staging the actual 11 manifest files makes their size/CRC tests pass.
   Missing-firmware failures were fixture deficiencies, not a PSP-ring diagnosis.
 
-Native serial evidence is in `build/ttm-rollback-boot/kvm{1,8}-serial.log`; the
-negative control is in `build/ttm-fault-control/kvm8-serial.log`. Build artifacts
+Native serial evidence was retained with the dated investigation; the negative
+control was kept separately. Build artifacts
 and raw hardware evidence are ignored, not committed.
 
 ## PSP evidence boundaries

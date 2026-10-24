@@ -12,9 +12,47 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define VMM_LOCK_SHARDS 64
+
+struct vmm_lock_shard {
+  spinlock_t lock;
+} __attribute__((aligned(64)));
+
+struct vmm_cpu_lock_state {
+  spinlock_t *held_lock;
+  uint64_t caller_ip;
+} __attribute__((aligned(64)));
+
 static spinlock_t vmm_lock = SPINLOCK_INIT;
+static struct vmm_lock_shard vmm_shard_locks[VMM_LOCK_SHARDS];
+static struct vmm_cpu_lock_state vmm_cpu_state[MAX_CPUS];
+static spinlock_t *vmm_early_held_lock = NULL;
 
 spinlock_t *vmm_get_lock(void) { return &vmm_lock; }
+
+static inline spinlock_t *vmm_select_lock(uint64_t *pml4,
+                                          uint64_t virtual_addr) {
+  if (!pml4 || virtual_addr > USER_SPACE_LIMIT)
+    return &vmm_lock;
+  uint64_t raw = (uint64_t)(uintptr_t)pml4;
+  uint64_t hhdm = pmm_get_hhdm_offset();
+  if (hhdm && raw >= hhdm)
+    raw -= hhdm;
+  uint64_t pml4_phys = raw & PAGE_MASK;
+  uint64_t kernel_phys = (uint64_t)(uintptr_t)vmm_get_kernel_pml4() & PAGE_MASK;
+  if (!pml4_phys || pml4_phys == kernel_phys)
+    return &vmm_lock;
+  uint64_t h = pml4_phys >> 12;
+  h ^= h >> 6;
+  return &vmm_shard_locks[h & (VMM_LOCK_SHARDS - 1)].lock;
+}
+
+bool vmm_cpu_holds_lock(uint32_t cpu_id) {
+  if (cpu_id >= MAX_CPUS)
+    return false;
+  return __atomic_load_n(&vmm_cpu_state[cpu_id].held_lock, __ATOMIC_ACQUIRE) !=
+         NULL;
+}
 
 /* True when the virtual range [base, base + size) contains the LAPIC MMIO
  * page as seen through the HHDM.  Used to flag any page-table operation that
@@ -27,36 +65,41 @@ static bool vmm_dbg_range_has_lapic(uint64_t base, uint64_t size) {
 /* --------------------------------------------------------------------------
  * vmm_lock acquisition wrappers
  *
- * vmm_lock is the lock the page fault handler also needs, which makes it the
- * one lock whose holder can stop the entire machine: every other core faults
- * continuously, and a fault handler runs with interrupts masked (the IDT uses
- * interrupt gates), so while it spins here it cannot even take an IPI.
+ * User-space page tables (virtual_addr <= USER_SPACE_LIMIT on a process PML4)
+ * are completely disjoint between distinct PML4 roots, so they are protected
+ * by 64 cacheline-aligned per-PML4 spinlock shards. Shared kernel-space page
+ * tables (virtual_addr > USER_SPACE_LIMIT or kernel_pml4) use the global
+ * vmm_lock.
  *
- * Every acquisition therefore goes through here, where lockdiag can name the
- * holder, how long it has been held and where it was taken from.  Uncontended
- * acquisitions cost no rdtsc and no extra atomic: the try-acquire below *is*
- * the acquisition, and the contended path is the one worth measuring.
- *
- * It is a spinlock_t rather than a rawspinlock for the same reason
- * shootdown_lock is: syscalls run interruptible since C6, so an IRQs-on
- * holder can be preempted by the tick mid-walk and then the next page fault
- * on that CPU - which must reach the page tables through this lock - spins
- * forever on a lock whose owner is not running.  Masking interrupts while
- * the lock is held makes the holder non-preemptible; a waiter that had
- * interrupts enabled still opens them while spinning, so it can answer a
- * TLB shootdown IPI.  A held vmm_lock now delays the acknowledgement of an
- * incoming shootdown until release instead of answering inside the critical
- * section, which is bounded: nothing in a vmm_lock section sleeps or waits
- * on another core.
+ * Masking interrupts while a shard is held makes the holder non-preemptible;
+ * a waiter that had interrupts enabled still opens them while spinning, so it
+ * can answer a TLB shootdown IPI.
  * -------------------------------------------------------------------------- */
-void vmm_lock_acquire_at(uint64_t caller_ip) {
-  if (spinlock_try_acquire(&vmm_lock)) {
-    lockdiag_spot_take(LOCKDIAG_SPOT_VMM, 0, caller_ip);
-    return;
+static int vmm_pending_slot(void);
+
+void vmm_lock_acquire_at_for(uint64_t *pml4, uint64_t virtual_addr,
+                             uint64_t caller_ip) {
+  spinlock_t *lk = vmm_select_lock(pml4, virtual_addr);
+  uint64_t wait_cycles = 0;
+  if (!spinlock_try_acquire(lk)) {
+    uint64_t t0 = rdtsc();
+    spinlock_acquire(lk);
+    wait_cycles = rdtsc() - t0;
   }
-  uint64_t t0 = rdtsc();
-  spinlock_acquire(&vmm_lock);
-  lockdiag_spot_take(LOCKDIAG_SPOT_VMM, rdtsc() - t0, caller_ip);
+  int slot = vmm_pending_slot();
+  if (slot >= 0) {
+    __atomic_store_n(&vmm_cpu_state[slot].held_lock, lk, __ATOMIC_RELEASE);
+    vmm_cpu_state[slot].caller_ip = caller_ip;
+  } else {
+    vmm_early_held_lock = lk;
+  }
+  if (lk == &vmm_lock) {
+    lockdiag_spot_take(LOCKDIAG_SPOT_VMM, wait_cycles, caller_ip);
+  }
+}
+
+void vmm_lock_acquire_at(uint64_t caller_ip) {
+  vmm_lock_acquire_at_for(NULL, KERNEL_SPACE_BASE, caller_ip);
 }
 
 /* --------------------------------------------------------------------------
@@ -171,11 +214,24 @@ static void vmm_drain_pending(void) {
 void vmm_drain_deferred_work(void) { vmm_drain_pending(); }
 
 void vmm_lock_release(void) {
-  lockdiag_spot_drop(LOCKDIAG_SPOT_VMM);
+  int slot = vmm_pending_slot();
+  spinlock_t *lk;
+  if (slot >= 0) {
+    lk = vmm_cpu_state[slot].held_lock;
+    __atomic_store_n(&vmm_cpu_state[slot].held_lock, NULL, __ATOMIC_RELEASE);
+    vmm_cpu_state[slot].caller_ip = 0;
+  } else {
+    lk = vmm_early_held_lock;
+    vmm_early_held_lock = NULL;
+  }
+  if (!lk)
+    lk = &vmm_lock;
+  if (lk == &vmm_lock)
+    lockdiag_spot_drop(LOCKDIAG_SPOT_VMM);
   /* spinlock_release restores the caller's interrupt state before the drain
    * runs, so the deferred shootdowns below execute in exactly the context
    * that would have issued them inline. */
-  spinlock_release(&vmm_lock);
+  spinlock_release(lk);
   vmm_drain_pending();
 }
 
@@ -360,7 +416,7 @@ static uint64_t vmm_leaf_entry_nolock(uint64_t *pml4, uint64_t virtual_addr) {
 
 uint64_t vmm_debug_cache_flags(uint64_t *pml4, uint64_t addr) {
   uint64_t entries[4]={0};
-  vmm_lock_acquire();
+  vmm_lock_acquire_for(pml4, addr);
   vmm_debug_walk((uint64_t)pml4,addr,entries);
   uint64_t leaf=entries[3];
   bool huge=false;
@@ -377,7 +433,7 @@ uint64_t vmm_debug_cache_flags(uint64_t *pml4, uint64_t addr) {
 
 bool vmm_map_page(uint64_t *pml4, uint64_t virtual_addr, uint64_t physical_addr,
                   uint64_t flags) {
-  vmm_lock_acquire();
+  vmm_lock_acquire_for(pml4, virtual_addr);
   /*
    * Only *replacing* a present mapping can leave a stale translation behind.
    * This used to be `replacing || (cpu_get_count() > 1)`, which forced a
@@ -437,7 +493,7 @@ bool vmm_map_page_locked(uint64_t *pml4, uint64_t virtual_addr,
 
 bool vmm_map_page_if_unmapped(uint64_t *pml4, uint64_t virtual_addr,
                              uint64_t physical_addr, uint64_t flags) {
-  vmm_lock_acquire();
+  vmm_lock_acquire_for(pml4, virtual_addr);
   if (vmm_page_present_nolock(pml4, virtual_addr)) {
     vmm_lock_release();
     return false;
@@ -451,7 +507,7 @@ bool vmm_map_page_if_unmapped(uint64_t *pml4, uint64_t virtual_addr,
 
 bool vmm_map_huge_page(uint64_t *pml4, uint64_t virtual_addr,
                        uint64_t physical_addr, uint64_t flags) {
-  vmm_lock_acquire();
+  vmm_lock_acquire_for(pml4, virtual_addr);
   bool success = false;
 
   size_t pml4_index = (virtual_addr >> 39) & 0x1FF;
@@ -518,7 +574,7 @@ bool vmm_map_range(uint64_t *pml4, uint64_t virtual_addr,
   if (pages == 0)
     return true;
 
-  vmm_lock_acquire();
+  vmm_lock_acquire_for(pml4, virtual_addr);
 
   for (size_t i = 0; i < pages; i++) {
     // flush_tlb=false: these are fresh (non-present → present) mappings.
@@ -657,7 +713,7 @@ void vmm_free_empty_tables(uint64_t *pml4, uint64_t virtual_addr) {
 }
 
 void vmm_unmap_page(uint64_t *pml4, uint64_t virtual_addr) {
-  vmm_lock_acquire();
+  vmm_lock_acquire_for(pml4, virtual_addr);
 
   size_t pml4_index = (virtual_addr >> 39) & 0x1FF;
 
@@ -831,7 +887,7 @@ bool vmm_split_huge_page(uint64_t *pml4, uint64_t virtual_addr) {
   bool actually_split = false;
   bool ok = true;
 
-  vmm_lock_acquire();
+  vmm_lock_acquire_for(pml4, virtual_addr);
 
   size_t pml4_index = (virtual_addr >> 39) & 0x1FF;
   size_t pdpt_index = (virtual_addr >> 30) & 0x1FF;

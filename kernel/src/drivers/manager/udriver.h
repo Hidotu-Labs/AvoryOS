@@ -1,7 +1,7 @@
 #ifndef UDRIVER_H
 #define UDRIVER_H
 
-#include "../../../../include/ascent/udriver.h"
+#include "udriver_abi.h"
 #include <stdbool.h>
 #include <stdint.h>
 

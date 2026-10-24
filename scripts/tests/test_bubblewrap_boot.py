@@ -74,7 +74,7 @@ int main(int argc,char **argv) {
 '''
 
 def setup(root):
-    staged = ROOT / 'build/alpine/rootfs'
+    staged = ROOT / 'build/arch/rootfs'
     copied = set()
 
     def copy_elf(path):

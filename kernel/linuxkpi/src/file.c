@@ -85,8 +85,8 @@ static struct file *kpi_file_alloc(const char *name,
   asc_vfs_node_set_nonblocking(node, flags & O_NONBLOCK);
   asc_vfs_node_set_name(node, name ? name : "anon");
 
-  /* One native wait queue per file backs poll(2): poll_wait()/wake_up() in the
-   * Linux fops bridge to it through wait_queue_head::kpi_poll_wq. */
+  /* One native poll wait queue per file; detachable subscriptions connect
+   * Linux wait heads to this queue and each exported node's epoll watchers. */
   file->f_poll_wq = asc_vfs_poll_wq_alloc();
   if (file->f_poll_wq)
     asc_vfs_node_set_wait_queue(node, file->f_poll_wq);
@@ -96,6 +96,8 @@ static struct file *kpi_file_alloc(const char *name,
 static void kpi_file_free(struct file *file) {
   struct dentry *dentry = file->f_path.dentry;
   struct inode *inode = file->f_inode;
+
+  linuxkpi_poll_detach(&file->f_poll_links, NULL);
 
   if (file->f_op && file->f_op->release)
     file->f_op->release(inode, file);
@@ -549,35 +551,37 @@ static unsigned int kpi_poll_mask_to_native(unsigned int mask) {
   return mask & 0xFFFF;
 }
 
-/* poll(2) bridge.  sys_poll() parks the caller on the node's native wait
- * queue and calls node->poll to get the current mask.  A device poll callback
- * (drm_poll) calls poll_wait(), whose qproc records the native queue inside
- * the Linux wait_queue_head, so the device's wake_up() reaches the poller
- * through __kpi_wake_up() -> linuxkpi_wake_poll_queue(). */
+/* Subscribe each polled VFS node, including separate dma-buf exports. The
+ * bridge detaches these before node close or the Linux release callback. */
 struct kpi_poll_table {
   struct poll_table_struct pt;
-  void *node_wq;
+  struct file *owner;
+  void *node;
+  int error;
 };
 
 static void kpi_poll_qproc(struct file *file, wait_queue_head_t *wq,
                            struct poll_table_struct *pt) {
   struct kpi_poll_table *kpt = container_of(pt, struct kpi_poll_table, pt);
-
   (void)file;
-  if (wq && kpt->node_wq)
-    wq->kpi_poll_wq = kpt->node_wq;
+  if (wq && linuxkpi_poll_register(&kpt->owner->f_poll_links, wq,
+                                  kpt->node, kpt->owner->f_poll_wq))
+    kpt->error = 1;
 }
 
 int linuxkpi_file_poll(void *node, int events) {
   struct file *file = kpi_node_file(node);
   struct kpi_poll_table kpt = {0};
 
-  (void)events;
   if (!file || !file->f_op || !file->f_op->poll)
     return 0;
   kpt.pt._qproc = kpi_poll_qproc;
-  kpt.node_wq = file->f_poll_wq;
-  return (int)kpi_poll_mask_to_native(file->f_op->poll(file, &kpt.pt));
+  /* dma_buf_poll uses this mask to arm its fence callbacks. */
+  kpt.pt._key = (unsigned int)events | POLLERR | POLLHUP;
+  kpt.owner = file;
+  kpt.node = node;
+  unsigned int mask = file->f_op->poll(file, &kpt.pt);
+  return (int)kpi_poll_mask_to_native(mask) | (kpt.error ? 0x8 : 0);
 }
 
 unsigned int linuxkpi_file_read(void *node, unsigned int offset,
@@ -750,6 +754,7 @@ void linuxkpi_file_close(void *node) {
   struct file *file = kpi_node_file(node);
 
   if (file) {
+    linuxkpi_poll_detach(&file->f_poll_links, node);
     /* vfs_close() is tearing the node down: the file must not release it
      * again when its own refcount reaches zero. */
     if (file->f_asc_node == node)

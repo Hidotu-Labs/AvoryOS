@@ -15,6 +15,8 @@ bool cpu_has_erms(void);
 bool cpu_has_fsgsbase(void);
 bool cpu_has_smep(void);
 bool cpu_has_smap(void);
+bool cpu_has_rdtscp(void);
+bool cpu_has_rdpid(void);
 extern bool cpu_has_xsave_flag;
 /* XCR0 components enabled by cpu_features_init(); XSAVE/XRSTOR masks must
  * never request bits outside this mask. */

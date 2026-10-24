@@ -126,7 +126,7 @@ the bottleneck or promise an application FPS improvement.
 
 The main `make` build now stages the Nouveau-enabled 6.18 kernel and firmware
 into the standard ISO and desktop disk. After closing QEMU, run `make`, then
-`make run-nouveau-c4` for the manual GPU test.
+`make run-nouveau` for the manual GPU test.
 
 ## Comparison with the AMD PRIME history
 
@@ -182,7 +182,7 @@ GPU performance is for the user's manual test; no 8,000-FPS result is claimed.
 
 Build and launch normally to enable this experiment. For the sequential
 comparison, use `make NOUVEAU_PRESENT_BATCH=0` and then
-`make run-nouveau-c4 NOUVEAU_PRESENT_BATCH=0`. Both commands must use the same
+`make run-nouveau NOUVEAU_PRESENT_BATCH=0`. Both commands must use the same
 option because the launch gate verifies the complete baked command line.
 
 ## Low-logging timing profile

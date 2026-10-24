@@ -391,7 +391,12 @@ void syscall_register_signal(void);
 void signal_deliver_syscall(struct syscall_regs *regs);
 void signal_finish_syscall(struct syscall_regs *regs, uint64_t number,
                             uint64_t return_ip);
-bool syscall_restart_error(uint64_t result);
+static inline bool syscall_restart_error(uint64_t result) {
+  int64_t value = (int64_t)result;
+  if (__builtin_expect((uint64_t)(value + 516) > 4, 1))
+    return false;
+  return value == -512 || value == -513 || value == -514 || value == -516;
+}
 void syscall_restart_return(struct registers *regs, uint64_t number,
                              uint64_t return_ip, bool handler,
                              uint64_t action_flags);

@@ -157,7 +157,14 @@ while IFS= read -r path; do
     # Entries may contain shell globs (e.g. drivers/gpu/drm/*.h): copy every
     # match.  A literal path that does not exist is an error.
     matched=0
-    for src in "$SRC_DIR"/$path; do
+    source_pattern="$path"
+    # Linux 6.18 moved crc32.c into lib/crc/; keep the subset's stable logical
+    # name while accepting both the older flat path and the current location.
+    if [ "$path" = "lib/crc32.c" ] && [ ! -e "$SRC_DIR/$path" ] &&
+       [ -e "$SRC_DIR/lib/crc/crc32-main.c" ]; then
+        source_pattern=lib/crc/crc32-main.c
+    fi
+    for src in "$SRC_DIR"/$source_pattern; do
         [ -e "$src" ] || continue
         matched=1
         rel="${src#"$SRC_DIR"/}"
@@ -214,6 +221,7 @@ while IFS= read -r f; do
             lib/crc32.c) f=lib/crc/crc32-main.c ;;
             lib/crc32defs.h) f=lib/crc/crc32defs.h ;;
             drivers/gpu/drm/drm_encoder_slave.c) continue ;;
+            drivers/gpu/drm/tiny/simpledrm.c) f=drivers/gpu/drm/sysfb/simpledrm.c ;;
         esac
     fi
     srcfiles+=("$f")
@@ -262,6 +270,7 @@ if [ "$NOUVEAU_SERIES" -eq 1 ]; then
         grep -q "^#define $option " "$cfg" || sed -i "/^#endif/i #define $option 1" "$cfg"
     done
     awk -v cfg="$cfg" 'BEGIN { while ((getline line < cfg) > 0) if (match(line, /^#define CONFIG_[A-Za-z0-9_]+ [^ ]+/)) { key=substr(line, 9, index(line, " ")-9); value=substr(line, index(line, " ")+1); print key "=" (value == "1" ? "y" : value) } }' > "$DEST/.config"
+    mkdir -p "$DEST/arch/x86/include/generated/asm"
     awk -f "$SRC_DIR/arch/x86/tools/cpufeaturemasks.awk" \
         "$DEST/arch/x86/include/asm/cpufeatures.h" "$DEST/.config" \
         > "$DEST/arch/x86/include/generated/asm/cpufeaturemasks.h"
@@ -333,10 +342,14 @@ fi
 # Build and run the upstream host generator; -I "$DEST/lib" resolves its
 # "../include/generated/autoconf.h" include against the checked-in generated
 # config linked above.
-if { [ -f "$DEST/lib/crc32.c" ] || [ -f "$DEST/lib/crc/crc32-main.c" ]; } && [ -f "$SRC_DIR/lib/gen_crc32table.c" ]; then
+crc_generator="$SRC_DIR/lib/gen_crc32table.c"
+if [ ! -f "$crc_generator" ] && [ -f "$SRC_DIR/lib/crc/gen_crc32table.c" ]; then
+    crc_generator="$SRC_DIR/lib/crc/gen_crc32table.c"
+fi
+if { [ -f "$DEST/lib/crc32.c" ] || [ -f "$DEST/lib/crc/crc32-main.c" ]; } && [ -f "$crc_generator" ]; then
     tmp_crc="$(mktemp -d)"
     cc -O2 -I "$DEST/lib" -I "$DEST/lib/crc" -o "$tmp_crc/gen_crc32table" \
-        "$SRC_DIR/lib/gen_crc32table.c" \
+        "$crc_generator" \
         || die "failed to build gen_crc32table"
     if [ -d "$DEST/lib/crc" ]; then
         "$tmp_crc/gen_crc32table" > "$DEST/lib/crc/crc32table.h"

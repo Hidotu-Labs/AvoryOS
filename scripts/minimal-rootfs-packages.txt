@@ -1,0 +1,23 @@
+# Packages used by the independent minimal AvoryOS image.
+filesystem
+glibc
+bash
+busybox
+coreutils
+util-linux
+dbus
+xorg-server
+xf86-input-evdev
+xf86-input-libinput
+xorg-xinit
+xorg-xauth
+xorg-xmodmap
+xorg-xrdb
+xorg-xkbcomp
+xkeyboard-config
+xorg-fonts-misc
+ttf-dejavu
+icewm
+xterm
+libdrm
+mesa

@@ -27,14 +27,12 @@ struct wait_queue_entry {
 };
 typedef struct wait_queue_entry wait_queue_entry_t;
 
+struct kpi_poll_link;
 struct wait_queue_head {
   spinlock_t lock;
   struct list_head head;
-  /* Avory: native poll wait queue bridged to the scheduler.  A device's poll
-   * callback calls poll_wait() with this head; the KPI file bridge records
-   * the native queue here so wake_up() also wakes poll(2)/select(2) waiters
-   * registered by the native sys_poll(). */
-  void *kpi_poll_wq;
+  /* Opaque poll subscriptions, protected by the bridge lock in wait.c. */
+  struct kpi_poll_link *kpi_poll_links;
 };
 typedef struct wait_queue_head wait_queue_head_t;
 
@@ -42,7 +40,7 @@ typedef struct wait_queue_head wait_queue_head_t;
 #define WQ_FLAG_WOKEN 0x02
 
 #define ___WAITQUEUE_INITIALIZER(name, tsk)                                   \
-  {0, (void *)(tsk), autoremove_wake_function, LIST_HEAD_INIT((name).entry)}
+  {0, task_struct_to_thread(tsk), default_wake_function, LIST_HEAD_INIT((name).entry)}
 #define DECLARE_WAITQUEUE(name, tsk)                                          \
   struct wait_queue_entry name = ___WAITQUEUE_INITIALIZER(name, tsk)
 
@@ -55,7 +53,7 @@ typedef struct wait_queue_head wait_queue_head_t;
   do {                                                                        \
     spin_lock_init(&(wq)->lock);                                              \
     INIT_LIST_HEAD(&(wq)->head);                                              \
-    (wq)->kpi_poll_wq = NULL;                                                 \
+    (wq)->kpi_poll_links = NULL;                                                 \
   } while (0)
 
 int default_wake_function(struct wait_queue_entry *wq_entry, unsigned mode,
@@ -76,10 +74,12 @@ int __kpi_wake_up(wait_queue_head_t *q, unsigned int nr, int flags);
 int __kpi_wake_up_locked(wait_queue_head_t *q, unsigned int nr, int flags);
 int wake_up_state(struct task_struct *p, unsigned int state);
 
-/* Wake poll(2)/select(2) waiters blocked on a native wait queue that the KPI
- * poll bridge attached to a wait_queue_head (see wait_queue_head::kpi_poll_wq).
- * `native_wq` is an opaque `wait_queue_t *`. */
+/* Native wait-queue wake helper and lifetime-managed poll subscriptions. */
 void linuxkpi_wake_poll_queue(void *native_wq);
+int linuxkpi_poll_register(struct kpi_poll_link **file_links, wait_queue_head_t *q,
+                           void *node, void *native_wq);
+void linuxkpi_poll_detach(struct kpi_poll_link **file_links, void *node);
+void linuxkpi_poll_free(wait_queue_head_t *q);
 #define wake_up(q) __kpi_wake_up((q), 0, 0)
 #define wake_up_nr(q, nr) __kpi_wake_up((q), (nr), 0)
 #define wake_up_all(q) __kpi_wake_up((q), 0, 0)
@@ -94,8 +94,8 @@ void linuxkpi_wake_poll_queue(void *native_wq);
   __kpi_wake_up_locked((q), 0, 0)
 #define wake_up_interruptible_poll(q, mode) __kpi_wake_up((q), 0, 0)
 #define wake_up_poll(q, mode) __kpi_wake_up((q), 0, 0)
-#define wake_up_pollfree(q) __kpi_wake_up((q), 0, 0)
-#define __wake_up_pollfree(q) __kpi_wake_up((q), 0, 0)
+#define wake_up_pollfree(q) linuxkpi_poll_free(q)
+#define __wake_up_pollfree(q) linuxkpi_poll_free(q)
 #define __wake_up(q, mode, nr, key) __kpi_wake_up((q), (nr), 0)
 #define __wake_up_locked(q, mode, nr) __kpi_wake_up_locked((q), (nr), 0)
 #define __wake_up_locked_key(q, mode, key) __kpi_wake_up_locked((q), 0, 0)

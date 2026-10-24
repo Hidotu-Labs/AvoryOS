@@ -78,16 +78,19 @@ time64_t ktime_get_real_seconds(void) {
 
 void schedule(void) { linuxkpi_thread_block(); }
 
-void yield(void) { schedule(); }
+void yield(void) { linuxkpi_yield(); }
 
 long schedule_timeout(long timeout) {
   if (timeout == MAX_SCHEDULE_TIMEOUT) {
     linuxkpi_thread_block();
     return MAX_SCHEDULE_TIMEOUT;
   }
-  if (timeout <= 0)
+  if (timeout <= 0) {
+    __set_current_state(TASK_RUNNING);
     return 0;
+  }
 
+  linuxkpi_jiffies_sync();
   unsigned long start = jiffies;
   int woken = linuxkpi_schedule_timeout_ms((unsigned long)timeout);
   if (!woken)
@@ -161,6 +164,7 @@ void msleep(unsigned int msecs) {
 }
 
 unsigned long msleep_interruptible(unsigned int msecs) {
+  linuxkpi_jiffies_sync();
   unsigned long deadline = jiffies + msecs_to_jiffies(msecs);
 
   while (time_before(jiffies, deadline) && !signal_pending(current)) {

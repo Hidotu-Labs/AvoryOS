@@ -14,7 +14,7 @@
  *       Print the SHA-256 of a device region as
  *       "NVME-HASH: dev=... offset=... bytes=... sha256=...".
  *   auto [--mb=N] [--seconds=S] [--loop=N]
- *       Headless mode used by the avoryd test service: pick a scratch block
+ *       Headless mode used by the NVMe test init launcher: pick a scratch block
  *       device, run the Phase 3 transfer matrix (512 B .. 4 MiB at LBA
  *       0/mid/last plus pseudo-random offsets), multi-threaded passes, a
  *       SHA-256 report and an optional soak loop; print "NVME-TEST: PASS" or

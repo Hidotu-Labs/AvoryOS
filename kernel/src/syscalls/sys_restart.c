@@ -5,11 +5,6 @@
 #include "cpu/isr.h"
 #include "sched/sched.h"
 
-bool syscall_restart_error(uint64_t result) {
-  int64_t value = (int64_t)result;
-  return value == -512 || value == -513 || value == -514 || value == -516;
-}
-
 void syscall_restart_return(struct registers *regs, uint64_t number,
                              uint64_t return_ip, bool handler,
                              uint64_t action_flags) {

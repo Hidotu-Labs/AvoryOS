@@ -32,5 +32,6 @@ uint32_t console_get_rows(void);
 // Flush a deferred backbuffer swap (BSP tick / mode changes).
 void console_tick(void);
 void console_flush_pending_swap(void);
+bool console_has_pending_swap(void);
 
 #endif

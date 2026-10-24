@@ -13,6 +13,33 @@
 
 #include <linuxkpi/native_vfs.h>
 
+/* vrefresh is a userspace convenience field, often zero or stale. KMS
+ * timing comes from the pixel clock (kHz), totals, and scan flags. */
+static uint32_t drm_mode_refresh_hz(const struct drm_mode_modeinfo *mode) {
+  if (!mode->clock || !mode->htotal || !mode->vtotal)
+    return mode->vrefresh;
+  uint64_t numerator = (uint64_t)mode->clock * 1000;
+  uint64_t denominator = (uint64_t)mode->htotal * mode->vtotal;
+  if (mode->flags & (1U << 4)) /* DRM_MODE_FLAG_INTERLACE */
+    numerator *= 2;
+  if (mode->flags & (1U << 5)) /* DRM_MODE_FLAG_DBLSCAN */
+    denominator *= 2;
+  if (mode->vscan > 1)
+    denominator *= mode->vscan;
+  return (uint32_t)((numerator + denominator / 2) / denominator);
+}
+
+void ascentdrm_crtc_set_mode(struct drm_crtc *crtc,
+                            const struct drm_mode_modeinfo *mode) {
+  crtc->mode_set = true;
+  crtc->mode_valid = mode != NULL;
+  if (mode) {
+    crtc->mode = *mode;
+    crtc->mode.vrefresh = drm_mode_refresh_hz(&crtc->mode);
+  } else
+    memset(&crtc->mode, 0, sizeof(crtc->mode));
+}
+
 /* Small UAPI structs used by probes from Mesa's virtio DRM backend and
  * libdrm. Keep these layouts in sync with Linux's x86_64 DRM UAPI. */
 struct drm_virtgpu_getparam_uapi {
@@ -1917,7 +1944,16 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     c->x = 0;
     c->y = 0;
     c->gamma_size = 0;
+    if (crtc->mode_set) {
+      c->x = crtc->x;
+      c->y = crtc->y;
+      c->mode_valid = crtc->mode_valid;
+      c->mode = crtc->mode;
+      spinlock_release(&dev->lock);
+      return 0;
+    }
     c->mode_valid = 1;
+    memset(&c->mode, 0, sizeof(c->mode));
     c->mode.hdisplay = fb_get_width();
     c->mode.hsync_start = c->mode.hdisplay + 8;
     c->mode.hsync_end = c->mode.hdisplay + 16;
@@ -1927,6 +1963,8 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     c->mode.vsync_end = c->mode.vdisplay + 8;
     c->mode.vtotal = c->mode.vdisplay + 12;
     c->mode.vrefresh = 60;
+    c->mode.clock = (uint32_t)((uint64_t)c->mode.htotal *
+                              c->mode.vtotal * c->mode.vrefresh / 1000);
     strcpy(c->mode.name, "Native");
     spinlock_release(&dev->lock);
     return 0;
@@ -2134,8 +2172,11 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       if (g_ascent_drm_set_fb_fn)
         g_ascent_drm_set_fb_fn(crtc->base.id, crtc->fb);
     }
-    if (crtc_cmd->mode_valid && crtc_cmd->mode.vrefresh)
-      vblank_set_refresh_hz(crtc_cmd->mode.vrefresh);
+    crtc->x = crtc_cmd->x;
+    crtc->y = crtc_cmd->y;
+    ascentdrm_crtc_set_mode(crtc, crtc_cmd->mode_valid ? &crtc_cmd->mode : NULL);
+    if (crtc->mode_valid)
+      vblank_set_refresh_hz(crtc->mode.vrefresh);
     spinlock_release(&dev->lock);
     drm_console_takeover();
     drm_commit_flipped_crtc(dev, crtc_cmd->crtc_id);

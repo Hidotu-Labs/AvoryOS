@@ -327,12 +327,6 @@ static void init_thread_entry(void) {
       continue;
     }
 
-    // Secondary fallback: /bin/avoryd
-    const char *sh_argv[] = {"/bin/avoryd", NULL};
-    if (process_exec_argv(sh_argv)) {
-      continue;
-    }
-
     // Fallback: try bash directly if sh failed
     const char *bash_argv[] = {"/bin/bash", NULL};
     if (!process_exec_argv(bash_argv)) {
@@ -372,8 +366,9 @@ void kmain(void) {
   panic_screen_init(fb);
   klog_set_screen_logging(true);
 
-  klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
-                           " AvoryOS Kernel Booting...\n");
+  klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " "
+            AVORY_BUILD_NAME " " AVORY_BUILD_VERSION " build "
+            AVORY_BUILD_TAG " Kernel Booting...\n");
   klog_puts("     HAL architecture: ");
   klog_puts(hal_arch_name());
   klog_puts("\n");
@@ -991,7 +986,10 @@ mount_fail:
     if (zero_refill)
       pmm_zero_pool_refill(8);
     uint64_t idle_ms =
-        (serial_pending_bytes() || defer_pending || zero_refill) ? 1 : 2000;
+        (serial_pending_bytes() || defer_pending || zero_refill ||
+         console_has_pending_swap())
+            ? 1
+            : 16;
     lapic_timer_rearm_if_earlier(lapic_timer_get_ms() + idle_ms);
     hal_cpu_halt();
   }

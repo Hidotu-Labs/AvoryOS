@@ -1123,6 +1123,15 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         cmsg = CMSG_NXTHDR(msg, cmsg);
       }
 
+      /* Validate the rights even for an empty send (bad fds still yield
+       * EBADF), but never queue them without a stream data byte. */
+      if (total_len == 0) {
+        spinlock_release(&peer_sock->lock);
+        spinlock_release(&peer->recv_lock);
+        unix_scm_free_msg(scm_item);
+        socket_put(peer_sock);
+        return 0;
+      }
       if (scm_item->count > 0) {
         if (!peer->scm_queue_tail) {
           peer->scm_queue_head = scm_item;
@@ -1485,7 +1494,8 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         usk->bytes_read >= usk->scm_queue_head->stream_offset)
       break; // Zero-data SCM ready – deliver control without data
 
-    if (sock->closing || (sock->state != SS_CONNECTED && usk->was_connected)) {
+    if (sock->closing || usk->read_shutdown ||
+        (sock->state != SS_CONNECTED && usk->was_connected)) {
       spinlock_release(&usk->recv_lock);
       goto no_data;
     }
@@ -1494,12 +1504,32 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       return -107; // ENOTCONN
     }
 
-    if ((sock->flags & SOCK_NONBLOCK) || (flags & 0x40)) {
+    /* shutdown(SHUT_WR) leaves the peer connected. Once its queued data
+     * has drained, recvmsg must report EOF just like read/recv, rather than
+     * returning EAGAIN or sleeping forever on a Wayland socket. */
+    spinlock_acquire(&sock->lock);
+    bool peer_shut = usk->peer && usk->peer->write_shutdown;
+    spinlock_release(&sock->lock);
+    if (peer_shut) {
+      spinlock_release(&usk->recv_lock);
+      goto no_data;
+    }
+
+    if (sock->error) {
+      spinlock_release(&usk->recv_lock);
+      return -(int)sock->error;
+    }
+    if ((sock->flags & SOCK_NONBLOCK) || (flags & 0x40) ||
+        (rcvtimeo_deadline && lapic_timer_get_ticks() >= rcvtimeo_deadline)) {
       spinlock_release(&usk->recv_lock);
       return -11; // EAGAIN
     }
 
     struct thread *ct = sched_get_current();
+    if (thread_has_pending_signal(ct)) {
+      spinlock_release(&usk->recv_lock);
+      return -4; // EINTR
+    }
     wait_queue_entry_t entry = {.thread = ct, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
     ct->state = THREAD_BLOCKED;
     wait_queue_add(usk->wait, &entry);
@@ -1514,18 +1544,21 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       size_t ravail = (rs > 0) ? (rt - rh + rs) % rs : 0;
       bool scm_ready = usk->scm_queue_head != NULL &&
                        usk->bytes_read >= usk->scm_queue_head->stream_offset;
-      if (ravail > 0 || scm_ready || sock->closing || sock->error) {
+      spinlock_acquire(&sock->lock);
+      bool eof = usk->read_shutdown ||
+          (usk->was_connected && sock->state != SS_CONNECTED) ||
+          (usk->peer && usk->peer->write_shutdown);
+      spinlock_release(&sock->lock);
+      bool interrupted = thread_has_pending_signal(ct);
+      if (ravail > 0 || scm_ready || eof || interrupted ||
+          sock->closing || sock->error) {
         ct->state = THREAD_RUNNING;
         ct->wakeup_ticks = 0;
         spinlock_release(&usk->recv_lock);
         wait_queue_remove(usk->wait, &entry);
         ct->state = THREAD_RUNNING;
-        if (rcvtimeo_deadline != 0 && lapic_timer_get_ticks() >= rcvtimeo_deadline)
-          return -11; // EAGAIN
-        if (sock->closing)
-          goto no_data;
-        if (sock->error)
-          return -(int)sock->error;
+        /* Re-evaluate data and EOF under the locks at the top. In
+         * particular, a shutdown must not discard bytes already queued. */
         continue;
       }
     }
@@ -1536,15 +1569,7 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     ct->state = THREAD_RUNNING;
     ct->wakeup_ticks = 0;
 
-    if (rcvtimeo_deadline != 0 && lapic_timer_get_ticks() >= rcvtimeo_deadline) {
-      return -11; // EAGAIN
-    }
-
-    if (sock->closing)
-      goto no_data;
-
-    if (sock->error)
-      return -(int)sock->error;
+    /* Recheck data, EOF, errors, timeout and signals under the locks. */
   }
 
   // recv_lock held; also acquire sock->lock to dequeue SCM nodes atomically.
@@ -1694,6 +1719,13 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   for (size_t i = 0; i < msg->msg_iovlen; i++) {
     uint8_t *dest = (uint8_t *)msg->msg_iov[i].iov_base;
     size_t   want = msg->msg_iov[i].iov_len;
+
+    /* Empty vectors do not end a scatter/gather read. Wayland uses two
+     * vectors for its receive ring; one can be empty at the wrap boundary.
+     * Returning zero there falsely reports EOF and loses delivered rights. */
+    if (want == 0) {
+      continue;
+    }
 
     size_t head      = usk->recv_buf_head;
     size_t tail      = usk->recv_buf_tail;

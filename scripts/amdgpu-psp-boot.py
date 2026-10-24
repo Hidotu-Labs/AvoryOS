@@ -17,10 +17,10 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('ttm_probe', ROOT / 'scripts/ttm-rollback-boot.py')
-probe = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(probe)
-boot = probe.boot
+spec = importlib.util.spec_from_file_location(
+    'private_boot', ROOT / 'scripts/syscall-restart-boot.py')
+boot = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(boot)
 boot.OUT = ROOT / 'build/amdgpu-psp-boot'
 boot.INIT = r'''
 #include <stdio.h>
@@ -36,6 +36,13 @@ int main(void) {
  for(;;)sleep(60);
 }
 '''
+
+
+def stage_firmware(root):
+    shutil.copytree(ROOT / 'build/firmware/lib/firmware', root / 'lib/firmware',
+                    dirs_exist_ok=True)
+    (root / 'lib/firmware/test_fw.bin').write_bytes(
+        bytes((i * 7 + 3) & 255 for i in range(4096)))
 
 
 def main():
@@ -60,7 +67,7 @@ def main():
                    'amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x4 init=/bin/probe-init')
         if args.software_control:
             cmdline = 'kpi_amdgpu=0 init=/bin/probe-init'
-        disk, iso = boot.prepare(probe.stage_firmware, cmdline)
+        disk, iso = boot.prepare(stage_firmware, cmdline)
         # Test the current build rather than the kernel in a possibly older ISO.
         shutil.copy2(ROOT / 'kernel/bin-x86_64/kernel', boot.OUT / 'iso-root/boot/kernel')
         boot.run(['strip', '--strip-all', boot.OUT / 'iso-root/boot/kernel'])

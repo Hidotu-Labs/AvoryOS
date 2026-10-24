@@ -500,54 +500,53 @@ void syscall_dispatcher(struct syscall_regs *regs) {
   struct thread *t = sched_get_current();
   /* Foreign syscall numbers and argument ABIs must be intercepted before
    * looking up Linux handlers or recording missing Linux syscalls. */
-  if (t && t->syscall_dispatch_enabled &&
+  if (t && __builtin_expect(t->syscall_dispatch_enabled, 0) &&
       syscall_user_dispatch_intercept(t, regs))
     return;
+
+  uint64_t syscall_num = regs->rax;
+  uint64_t syscall_return_ip = regs->rip;
+
   if (t) {
     __atomic_store_n(&t->in_syscall, true, __ATOMIC_RELAXED);
     sched_sync_files(t);
-    t->last_syscall_num = regs->rax;
+    t->last_syscall_num = syscall_num;
     t->last_syscall_args[0] = regs->rdi;
     t->last_syscall_args[1] = regs->rsi;
     t->last_syscall_args[2] = regs->rdx;
     t->last_syscall_args[3] = regs->r10;
     t->last_syscall_args[4] = regs->r8;
     t->last_syscall_args[5] = regs->r9;
-    t->last_syscall_user_rip = regs->rip;
+    t->last_syscall_user_rip = syscall_return_ip;
     t->last_syscall_user_rsp = regs->rsp;
-    if (regs->rax == 0 || regs->rax == 1 || regs->rax == 17 || regs->rax == 18)
+    if (syscall_num <= 1 || syscall_num == 17 || syscall_num == 18)
       t->last_io_started_ms = lapic_timer_get_ticks();
-    t->last_subsystem = KSUBSYS_SYSCALL;
-    t->last_kernel_file = "syscall.c";
-    t->last_kernel_line = __LINE__;
-    t->last_kernel_func = syscall_get_name(regs->rax);
   }
 
-  uint64_t syscall_num = regs->rax;
-  uint64_t syscall_return_ip = regs->rip;
-
-  if (t && !t->seccomp_compat_dispatch && seccomp_mode(t)) {
+  if (t && __builtin_expect(!t->seccomp_compat_dispatch && seccomp_mode(t), 0)) {
     uint64_t args[6] = {regs->rdi, regs->rsi, regs->rdx,
                          regs->r10, regs->r8, regs->r9};
     if (!seccomp_syscall(t, regs, (uint32_t)syscall_num, 0xC000003E, args))
       goto finish_filtered;
   }
 
-  if (regs->rax >= MAX_SYSCALL) {
+  if (__builtin_expect(syscall_num >= MAX_SYSCALL, 0)) {
     log_unimplemented_syscall(regs, t);
     regs->rax = (uint64_t)-38; // ENOSYS
     if (t) {
       t->last_syscall_ret = (int64_t)-38;
       record_syscall_error(t, syscall_num, -38);
-      rseq_update_cpu_id(t);
-      rseq_maybe_abort(t, &regs->rip);
+      if (__builtin_expect(t->rseq_addr != 0, 0)) {
+        rseq_update_cpu_id(t);
+        rseq_maybe_abort(t, &regs->rip);
+      }
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
     return;
   }
 
   // Check raw handlers first (e.g. fork needs the full register frame)
-  if (raw_syscall_table[syscall_num]) {
+  if (__builtin_expect(raw_syscall_table[syscall_num] != NULL, 0)) {
     syscall_raw_handler_t raw_handler = raw_syscall_table[syscall_num];
 #if SYSCALL_LOG
     log_syscall_entry(regs, t);
@@ -558,19 +557,21 @@ void syscall_dispatcher(struct syscall_regs *regs) {
 #endif
     if (t) {
       t->last_syscall_ret = (int64_t)regs->rax;
-      if ((int64_t)regs->rax < 0 && (int64_t)regs->rax >= -4095) {
+      if (__builtin_expect((int64_t)regs->rax < 0 && (int64_t)regs->rax >= -4095, 0)) {
         record_syscall_error(t, syscall_num, (int64_t)regs->rax);
         sysdiag_record_syscall_error(syscall_num, (int64_t)regs->rax, t, regs);
       }
-      rseq_update_cpu_id(t);
-      rseq_maybe_abort(t, &regs->rip);
+      if (__builtin_expect(t->rseq_addr != 0, 0)) {
+        rseq_update_cpu_id(t);
+        rseq_maybe_abort(t, &regs->rip);
+      }
     }
-    if (syscall_restart_error(regs->rax) ||
-        (t && (t->pending_signals & ~t->signal_mask)))
+    if (__builtin_expect(syscall_restart_error(regs->rax) ||
+                         (t && (t->pending_signals & ~t->signal_mask)), 0))
       signal_finish_syscall(regs, syscall_num, syscall_return_ip);
     if (t)
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
-    if (t && syscall_num == SYS_RT_SIGRETURN) {
+    if (t && __builtin_expect(syscall_num == SYS_RT_SIGRETURN, 0)) {
       /* No scheduling or signal delivery may follow publication: a fatal
        * pending signal can switch to an unrelated task on this CPU. Keep
        * its syscall return from consuming the dead task's register frame. */
@@ -581,20 +582,21 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     return;
   }
 
-  if (!syscall_table[syscall_num]) {
+  syscall_handler_t handler = syscall_table[syscall_num];
+  if (__builtin_expect(!handler, 0)) {
     log_unimplemented_syscall(regs, t);
     regs->rax = (uint64_t)-38; // ENOSYS
     if (t) {
       t->last_syscall_ret = (int64_t)-38;
       record_syscall_error(t, syscall_num, -38);
-      rseq_update_cpu_id(t);
-      rseq_maybe_abort(t, &regs->rip);
+      if (__builtin_expect(t->rseq_addr != 0, 0)) {
+        rseq_update_cpu_id(t);
+        rseq_maybe_abort(t, &regs->rip);
+      }
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
     return;
   }
-
-  syscall_handler_t handler = syscall_table[syscall_num];
 
 #if SYSCALL_LOG
   log_syscall_entry(regs, t);
@@ -609,7 +611,7 @@ void syscall_dispatcher(struct syscall_regs *regs) {
 finish_filtered:
   if (t) {
     t->last_syscall_ret = (int64_t)regs->rax;
-    if ((int64_t)regs->rax < 0 && (int64_t)regs->rax >= -4095) {
+    if (__builtin_expect((int64_t)regs->rax < 0 && (int64_t)regs->rax >= -4095, 0)) {
       record_syscall_error(t, syscall_num, (int64_t)regs->rax);
       sysdiag_record_syscall_error(syscall_num, (int64_t)regs->rax, t, regs);
     }
@@ -619,20 +621,21 @@ finish_filtered:
    * sti), so the timer can already preempt; this remains the deterministic
    * point where a syscall that woke a more eligible thread on this CPU - an
    * X11 client writing a request that wakes the server - yields promptly. */
-  sched_check_resched(true);
+  if (t && __builtin_expect(__atomic_load_n(&t->need_resched, __ATOMIC_ACQUIRE), 0))
+    sched_check_resched(true);
 
   /* rseq: publish the current CPU and abort any critical section this
    * syscall (or a preemption during it) interrupted, before signal delivery
    * possibly redirects RIP to a handler. */
-  if (t) {
+  if (t && __builtin_expect(t->rseq_addr != 0, 0)) {
     rseq_update_cpu_id(t);
     rseq_maybe_abort(t, &regs->rip);
   }
 
   /* Signal frame conversion copies the complete register set. Keep it off the
    * syscall hot path unless this thread can actually deliver a signal. */
-  if (syscall_restart_error(regs->rax) ||
-      (t && (t->pending_signals & ~t->signal_mask)))
+  if (__builtin_expect(syscall_restart_error(regs->rax) ||
+                       (t && (t->pending_signals & ~t->signal_mask)), 0))
     signal_finish_syscall(regs, syscall_num == SYS_RT_SIGRETURN ? UINT64_MAX : syscall_num,
                            syscall_return_ip);
   if (t)

@@ -1102,8 +1102,8 @@ vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
      * (inode, device) value, but disk backends (ext2/ext4) hand out a fresh
      * kmalloc'd node per lookup, so the flag lives on only one instance of
      * a mountpoint while matches happen on ephemeral ones. Skipping by flag
-     * hung the boot at /dev/driverctl registration; the scan is ~5 entries
-     * and not worth the fragility. */
+    * hung the boot at /dev/driverctl registration; the scan is ~5 entries
+    * and not worth the fragility. */
     for (int hops = 0; hops < 32; hops++) {
       vfs_node_t *next = NULL;
       vfs_mount_entry_t *curr = vfs_mount_list;

@@ -13,7 +13,7 @@ actual credentials, including root. The patch is guarded by the original
 binary's SHA-256; a different VLC package requires inspecting and updating
 the patch before building an image. Re-running the installer is supported.
 
-The historical `make setup-alpine` target runs `scripts/setup-arch.sh` before
+The `make setup-arch` target runs `scripts/setup-arch.sh` before
 marking the rootfs ready. Changes to the setup script, package mapping,
 account setup, or VLC wrapper invalidate that stamp, so subsequent image
 builds pick up those changes.

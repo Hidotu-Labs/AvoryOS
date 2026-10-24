@@ -9,7 +9,7 @@ INDEX_URL = "https://launchermeta.mojang.com/v1/packages/f6ad102bcaa53b1a58358f1
 BASE_RES_URL = "https://resources.download.minecraft.net"
 
 def main():
-    dest_dir = sys.argv[1] if len(sys.argv) > 1 else "build/alpine/rootfs/opt/minecraft/assets"
+    dest_dir = sys.argv[1] if len(sys.argv) > 1 else "build/arch/rootfs/opt/minecraft/assets"
     indexes_dir = os.path.join(dest_dir, "indexes")
     objects_dir = os.path.join(dest_dir, "objects")
     

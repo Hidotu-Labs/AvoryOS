@@ -58,6 +58,8 @@ static inline void spinlock_init(spinlock_t *lock) {
 
 /* Lock-free local TLB service; never enables IRQs or schedules the waiter. */
 void tlb_shootdown_poll(void);
+/* Lock-free local VFS RCU barrier service; never enables IRQs. */
+void vfs_rcu_poll(void);
 
 /* Acquire with interrupts masked from before the atomic that wins the lock.
  *
@@ -93,6 +95,7 @@ static inline void spinlock_acquire(spinlock_t *lock) {
       } else {
         while (__atomic_load_n(&lock->locked, __ATOMIC_RELAXED)) {
           tlb_shootdown_poll();
+          vfs_rcu_poll();
           __asm__ volatile("pause" ::: "memory");
         }
       }
@@ -132,6 +135,7 @@ static inline void spinlock_acquire_save(spinlock_t *lock, uint64_t *flags) {
       } else {
         while (__atomic_load_n(&lock->locked, __ATOMIC_RELAXED)) {
           tlb_shootdown_poll();
+          vfs_rcu_poll();
           __asm__ volatile("pause" ::: "memory");
         }
       }
@@ -202,6 +206,7 @@ static inline void rawspinlock_acquire(rawspinlock_t *lock) {
     while (__atomic_test_and_set(&lock->locked, __ATOMIC_ACQUIRE)) {
       while (__atomic_load_n(&lock->locked, __ATOMIC_RELAXED)) {
         tlb_shootdown_poll();
+        vfs_rcu_poll();
         __asm__ volatile("pause" ::: "memory");
       }
     }

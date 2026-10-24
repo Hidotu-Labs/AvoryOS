@@ -1,5 +1,7 @@
 #include "console.h"
+#include "../apic/lapic.h"
 #include "../apic/lapic_timer.h"
+#include "../smp/cpu.h"
 #include "../cpu/tsc.h"
 #include "../drivers/input/keyboard.h"
 #include "../drivers/serial.h"
@@ -1458,6 +1460,19 @@ static void console_request_swap(void) {
   }
 
   console_swap_pending = true;
+  if (lapic_is_ready()) {
+    struct cpu_info *bsp = cpu_get_bsp();
+    struct cpu_info *self = cpu_get_current();
+    if (bsp && self == bsp) {
+      lapic_timer_rearm_if_earlier(now + CONSOLE_SWAP_INTERVAL_MS);
+    } else if (bsp) {
+      lapic_send_ipi(bsp->apic_id, IPI_VECTOR_RESCHEDULE);
+    }
+  }
+}
+
+bool console_has_pending_swap(void) {
+  return __atomic_load_n(&console_swap_pending, __ATOMIC_RELAXED);
 }
 
 /* Called from the BSP idle loop (process context) to put a deferred frame on

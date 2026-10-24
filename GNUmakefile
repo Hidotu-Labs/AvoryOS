@@ -19,14 +19,14 @@ QEMUFLAGS := $(QEMU_MEM) \
 
 override IMAGE_NAME := avoryos-$(ARCH)
 
+# Public release identity embedded in the kernel. BUILD_TAG is generated and
+# persisted for each distinct kernel source state by scripts/kernel-build-tag.py.
+BUILD_NAME ?= Ascension
+BUILD_VERSION ?= 3.0.0
+
 # Boot the existing writable disk without traversing its rebuild prerequisites.
 # A missing disk is built normally; use `make disk.img` to refresh it explicitly.
 RUN_DISK_DEP := $(if $(wildcard disk.img),,disk.img)
-
-AVORYD_CONFIG_FILES := \
-	initrd/avoryd/default.target \
-	initrd/avoryd/services/system-init.service \
-	initrd/avoryd/services/console.service
 
 QUAKE2_BUNDLE_FILES := \
 	userland/quake2/quake2 \
@@ -43,27 +43,11 @@ QUAKE2_STAMP := build/quake2/.built
 # unless the outputs are actually missing.
 $(QUAKE2_BUNDLE_FILES): $(QUAKE2_STAMP)
 
-$(QUAKE2_STAMP): $(ALPINE_STAMP) $(GLIBC_STAMP) scripts/build-quake2.sh \
+$(QUAKE2_STAMP): $(ARCH_STAMP) $(GLIBC_STAMP) $(GLIBC_TOOLCHAIN_STAMP) scripts/build-quake2.sh \
 		scripts/quake2-sdl2-config.in
 	./scripts/build-quake2.sh && \
 		mkdir -p $(dir $(QUAKE2_STAMP)) && \
 		touch $(QUAKE2_STAMP)
-
-BUTTERSCOTCH_STAMP := build/butterscotch/.built
-
-$(BUTTERSCOTCH_STAMP): $(ALPINE_STAMP) $(GLIBC_STAMP) scripts/build-butterscotch.sh
-	./scripts/build-butterscotch.sh && \
-		mkdir -p $(dir $(BUTTERSCOTCH_STAMP)) && \
-		touch $(BUTTERSCOTCH_STAMP)
-
-userland/butterscotch.elf: $(BUTTERSCOTCH_STAMP)
-
-.PHONY: butterscotch
-butterscotch: $(BUTTERSCOTCH_STAMP)
-
-.PHONY: clean-butterscotch
-clean-butterscotch:
-	./scripts/build-butterscotch.sh clean
 
 HOST_CC := cc
 HOST_CFLAGS := -g -O2 -pipe
@@ -71,135 +55,52 @@ HOST_CPPFLAGS :=
 HOST_LDFLAGS :=
 HOST_LIBS :=
 
-# glibc toolchain (see scripts/glibc-toolchain.sh)
+# Prebuilt GCC cross-compiler; libc headers and libraries come from Axon's
+# target rootfs (currently glibc 2.44).
 GLIBC_TOOLCHAIN_BIN := $(CURDIR)/toolchain/x86_64-linux-glibc/bin
-GLIBC_SYSROOT := $(CURDIR)/toolchain/glibc-sysroot
-GLIBC_STAMP := $(GLIBC_SYSROOT)/lib/libc.so.6
+ARCH_SYSROOT := $(CURDIR)/build/arch/rootfs
+ARCH_STAMP := $(CURDIR)/build/arch/.built
+GLIBC_SYSROOT := $(ARCH_SYSROOT)
+GLIBC_STAMP := $(ARCH_STAMP)
+GLIBC_TOOLCHAIN_STAMP := $(CURDIR)/build/.glibc-toolchain-ready
 GLIBC_CC := $(GLIBC_TOOLCHAIN_BIN)/x86_64-linux-gcc
 GLIBC_CXX := $(GLIBC_TOOLCHAIN_BIN)/x86_64-linux-g++
 GLIBC_USER_CFLAGS := -O2 -Wall -Wextra -fno-stack-protector \
-	--sysroot=$(GLIBC_SYSROOT)
+	--sysroot=$(GLIBC_SYSROOT) -Wl,-T,$(CURDIR)/config/userland-link.ld
 GLIBC_USER_CXXFLAGS := -O2 -Wall -Wextra -fno-stack-protector \
-	--sysroot=$(GLIBC_SYSROOT)
+	--sysroot=$(GLIBC_SYSROOT) -Wl,-T,$(CURDIR)/config/userland-link.ld
 
-# Historical Alpine target names; the rootfs now uses Arch packages.
-ALPINE_SYSROOT := $(CURDIR)/build/alpine/rootfs
-ALPINE_STAMP := $(CURDIR)/build/alpine/.built
+AXON_PROFILE_FILES := $(wildcard config/xorg/*) config/vlc/vlc.sh \
+	config/wireplumber/20-avoryos-hda.conf userland/avory-account \
+	userland/test_accounts.sh
 
-$(ALPINE_STAMP): scripts/setup-arch.sh scripts/arch-pkgs.sh scripts/configure-accounts.sh config/vlc/vlc.sh config/wireplumber/20-avoryos-hda.conf
-	@mkdir -p $(dir $(ALPINE_STAMP))
-	@bash scripts/setup-arch.sh
-	@touch $(ALPINE_STAMP)
+userland/avory-login.elf: userland/avory-login.c userland/GNUmakefile config/userland-link.ld $(GLIBC_STAMP) $(GLIBC_TOOLCHAIN_STAMP)
+	$(MAKE) -C userland -f GNUmakefile avory-login.elf
 
-.PHONY: setup-alpine
-setup-alpine: $(ALPINE_STAMP)
 
-$(GLIBC_STAMP): scripts/glibc-toolchain.sh
-	@echo "[*] Setting up glibc toolchain..."
+$(ARCH_STAMP): scripts/setup-rootfs.sh scripts/axon-common.sh scripts/configure-axon-mirrors.py \
+		scripts/rootfs-packages.txt $(AXON_PROFILE_FILES) \
+		userland/avory-login.c $(GLIBC_TOOLCHAIN_STAMP)
+	@mkdir -p $(dir $(ARCH_STAMP))
+	@bash scripts/setup-rootfs.sh
+	@touch $(ARCH_STAMP)
+
+.PHONY: setup-rootfs
+setup-rootfs: $(ARCH_STAMP)
+
+
+$(GLIBC_TOOLCHAIN_STAMP): scripts/glibc-toolchain.sh
+	@echo "[*] Setting up the prebuilt GCC cross-compiler..."
 	chmod +x scripts/glibc-toolchain.sh && ./scripts/glibc-toolchain.sh
+	@test -x $(GLIBC_CC)
+	@mkdir -p $(dir $@)
+	@touch $@
 
 .PHONY: glibc-toolchain
-glibc-toolchain: $(GLIBC_STAMP)
-
-BASH_STAMP := $(GLIBC_SYSROOT)/opt/bash/bin/bash
-
-$(BASH_STAMP): $(GLIBC_STAMP) scripts/build-bash.sh
-	@echo "[*] Building GNU Bash..."
-	chmod +x scripts/build-bash.sh && ./scripts/build-bash.sh
-
-.PHONY: bash
-bash: $(BASH_STAMP)
-
-COREUTILS_STAMP := $(GLIBC_SYSROOT)/opt/coreutils/bin/ls
-
-$(COREUTILS_STAMP): $(GLIBC_STAMP) scripts/build-coreutils.sh
-	@echo "[*] Building GNU Coreutils..."
-	chmod +x scripts/build-coreutils.sh && ./scripts/build-coreutils.sh
-
-.PHONY: coreutils
-coreutils: $(COREUTILS_STAMP)
-
-
-# GTK2 test - include/lib flags
-GTK2_INCLUDES := \
-	-I$(ALPINE_SYSROOT)/usr/include/gtk-2.0 \
-	-I$(ALPINE_SYSROOT)/usr/lib/gtk-2.0/include \
-	-I$(ALPINE_SYSROOT)/usr/include/glib-2.0 \
-	-I$(ALPINE_SYSROOT)/usr/lib/glib-2.0/include \
-	-I$(ALPINE_SYSROOT)/usr/include/pango-1.0 \
-	-I$(ALPINE_SYSROOT)/usr/include/harfbuzz \
-	-I$(ALPINE_SYSROOT)/usr/include/cairo \
-	-I$(ALPINE_SYSROOT)/usr/include/gdk-pixbuf-2.0 \
-	-I$(ALPINE_SYSROOT)/usr/include/atk-1.0 \
-	-I$(ALPINE_SYSROOT)/usr/include/pixman-1 \
-	-I$(ALPINE_SYSROOT)/usr/include/freetype2 \
-	-I$(ALPINE_SYSROOT)/usr/include/libpng16
-GTK2_LIBS := \
-	-L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-	-lgtk-x11-2.0 -lgdk-x11-2.0 -lpangocairo-1.0 -lpango-1.0 -latk-1.0 \
-	-lcairo -lgdk_pixbuf-2.0 -lgio-2.0 -lgobject-2.0 -lglib-2.0 \
-	-ljpeg -lmount -lblkid -leconf -lintl -lXrandr -lXinerama \
-	-lgraphite2 -lXcomposite -lXdamage
-GTK2_LDFLAGS := \
-	-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-	-Wl,-rpath,/usr/lib \
-	-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib
-
-# GTK3 test - include/lib flags
-GTK3_INCLUDES := \
-	-I$(ALPINE_SYSROOT)/usr/include \
-	-I$(ALPINE_SYSROOT)/usr/include/gtk-3.0 \
-	-I$(ALPINE_SYSROOT)/usr/include/glib-2.0 \
-	-I$(ALPINE_SYSROOT)/usr/lib/glib-2.0/include \
-	-I$(ALPINE_SYSROOT)/usr/include/pango-1.0 \
-	-I$(ALPINE_SYSROOT)/usr/include/harfbuzz \
-	-I$(ALPINE_SYSROOT)/usr/include/cairo \
-	-I$(ALPINE_SYSROOT)/usr/include/gdk-pixbuf-2.0 \
-	-I$(ALPINE_SYSROOT)/usr/include/atk-1.0 \
-	-I$(ALPINE_SYSROOT)/usr/include/pixman-1 \
-	-I$(ALPINE_SYSROOT)/usr/include/freetype2 \
-	-I$(ALPINE_SYSROOT)/usr/include/libpng16 \
-	-I$(ALPINE_SYSROOT)/usr/include/at-spi2-atk/2.0 \
-	-I$(ALPINE_SYSROOT)/usr/include/at-spi-2.0 \
-	-I$(ALPINE_SYSROOT)/usr/include/dbus-1.0 \
-	-I$(ALPINE_SYSROOT)/usr/lib/dbus-1.0/include \
-	-I$(ALPINE_SYSROOT)/usr/include/epoxy
-GTK3_LIBS := \
-	-L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-	-lgtk-3 -lgdk-3 -lpangocairo-1.0 -lpango-1.0 -latk-1.0 -latk-bridge-2.0 \
-	-lcairo-gobject -lcairo -lgdk_pixbuf-2.0 -lgio-2.0 -lgobject-2.0 -lglib-2.0 \
-	-lepoxy -ldbus-1 -lX11 -lXext -lXrender -lXi -lXcursor -lXfixes \
-	-lwayland-client -lwayland-cursor -lwayland-egl \
-	-lXrandr -lXinerama -lXcomposite -lXdamage \
-	-lfontconfig -lfreetype -lpng16 -lz -lm
-GTK3_LDFLAGS := \
-	-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-	-Wl,-rpath,/usr/lib \
-	-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib
-
-# Qt5 test - include/lib flags
-QT5_INCLUDES := \
-	-I$(ALPINE_SYSROOT)/usr/include/qt \
-	-I$(ALPINE_SYSROOT)/usr/include/qt/QtCore \
-	-I$(ALPINE_SYSROOT)/usr/include/qt/QtGui \
-	-I$(ALPINE_SYSROOT)/usr/include/qt/QtWidgets \
-	-I$(ALPINE_SYSROOT)/usr/include/qt/QtOpenGL \
-	-I$(ALPINE_SYSROOT)/usr/include/qt/QtPrintSupport
-QT5_LIBS := \
-	-L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-	-lQt5Widgets -lQt5Gui -lQt5Core \
-	-lGL -lX11 -lXext -lxcb \
-	-ldl -lm -lz
-QT5_CXXFLAGS := -fPIC -DQT_WIDGETS_LIB -DQT_GUI_LIB -DQT_CORE_LIB -DQT_NO_DEBUG
-QT5_LDFLAGS := \
-	-static-libgcc \
-	-Wl,--allow-shlib-undefined \
-	-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-	-Wl,-rpath,/usr/lib \
-	-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib
+glibc-toolchain: $(GLIBC_TOOLCHAIN_STAMP) $(GLIBC_STAMP)
 
 .PHONY: all
-all: $(IMAGE_NAME).iso
+all: $(IMAGE_NAME).iso disk.img edk2-ovmf
 
 # `make run` boots the NVMe desktop with KVM; `make run-tcg` is the same
 # configuration without KVM.  The arch-specific run-x86_64 target remains the
@@ -211,42 +112,6 @@ RUN_SMP ?= 8
 #   make run RUN_NIC=both KERNEL_CMDLINE='net_default=eth1' # use e1000
 #   make run RUN_NIC=none     # no emulated NIC
 RUN_NIC ?= rtl8139
-E1000_TEST_SECONDS ?= 10
-E1000_TEST_SMP ?= 4
-.PHONY: test-e1000
-test-e1000:
-	$(MAKE) -C kernel
-	python3 scripts/tests/test_e1000_probe.py
-	python3 scripts/tests/test_net_device_start.py
-	python3 scripts/tests/test_netlink_link_types.py
-	python3 scripts/tests/test_e1000_probe_boot.py --seconds $(E1000_TEST_SECONDS) --smp $(E1000_TEST_SMP)
-
-# Priority inversion regression uses its own journaled guest image.
-.PHONY: test-journal-priority
-test-journal-priority:
-	$(MAKE) -C kernel
-	@mkdir -p build/journal-priority
-	python3 scripts/tests/test_sched_priority_ceiling.py
-	cc -std=gnu11 -O1 -g -fsanitize=address,undefined -ffunction-sections -fdata-sections -I kernel/src -I kernel/linuxkpi/include -I kernel/limine-protocol/include scripts/tests/test_ext3_empty_commit.c -Wl,--gc-sections -pthread -o build/journal-priority/test-journal
-	ASAN_OPTIONS=detect_leaks=0 build/journal-priority/test-journal
-	python3 scripts/tests/test_journal_priority_boot.py
-
-# Each guest regression creates its own root image and ISO.
-.PHONY: test-sandbox
-test-sandbox:
-	$(MAKE) -C kernel
-	python3 scripts/tests/test_signalfd_lifetime.py
-	python3 scripts/tests/test_seccomp_bpf.py
-	python3 scripts/tests/test_uts_namespace.py
-	python3 scripts/tests/test_pid_namespace.py
-	python3 scripts/tests/test_seccomp_boot.py
-	python3 scripts/tests/test_uts_namespace_boot.py
-	python3 scripts/tests/test_ipc_namespace_boot.py
-	python3 scripts/tests/test_pid_namespace_boot.py
-	python3 scripts/tests/test_mount_namespace_boot.py
-	python3 scripts/tests/test_capability_namespace_boot.py
-	python3 scripts/tests/test_bubblewrap_boot.py
-
 ifneq ($(words $(RUN_NIC)),1)
 $(error RUN_NIC must be rtl8139, e1000, both, or none)
 endif
@@ -262,7 +127,7 @@ endif
 ifeq ($(RUN_NIC),none)
 RUN_NET_FLAGS = -nic none
 endif
-# Same cursor set as run-c7-prime: a relative mouse plus a hidden host
+# Same cursor set as run-amd-gpu: a relative mouse plus a hidden host
 # cursor (DISPLAY_OPT defaults to show-cursor=off), so the guest draws its
 # own software cursor into the scanout. Override per boot with
 # RUN_POINTER=usb-tablet and GTK_SHOW_CURSOR=on for the absolute-tablet
@@ -346,7 +211,7 @@ VFIO_POINTER ?= usb-tablet
 # Extra raw QEMU arguments for a run-vfio boot, e.g. to capture the exceptions
 # around a silent triple-fault reset (the VM stops at the fault instead of
 # rebooting):
-#   make run-c7-prime QEMU_EXTRA='-no-reboot -d int,cpu_reset,guest_errors -D build/logs/prime-qemu.log'
+#   make run-amd-gpu QEMU_EXTRA='-no-reboot -d int,cpu_reset,guest_errors -D build/logs/prime-qemu.log'
 QEMU_EXTRA ?=
 VFIO_COMMA := ,
 VFIO_ROM_OPT = $(if $(wildcard $(VFIO_ROM)),$(VFIO_COMMA)romfile=$(VFIO_ROM),)
@@ -354,7 +219,7 @@ RUN_ISO ?= $(IMAGE_NAME).iso
 RUN_ISO_DEP ?= $(RUN_ISO)
 
 .PHONY: run-vfio
-run-vfio: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
+run-vfio: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800$(VFIO_VIRTIO_GPU_EXTRA)
 run-vfio: edk2-ovmf $(RUN_ISO_DEP) $(RUN_DISK_DEP)
 	$(VFIO_LAUNCHER) qemu-system-$(ARCH) \
 		-M q35 \
@@ -381,29 +246,27 @@ run-vfio: edk2-ovmf $(RUN_ISO_DEP) $(RUN_DISK_DEP)
 # One-monitor VFIO mode: Xorg prefers AMD for its primary renderer and
 # shares the desktop with the VirtIO output GPU. Keep Display Core enabled:
 # modesetting needs AMD KMS resources even without a connected monitor.
-.PHONY: run-c7-prime
+.PHONY: run-amd-gpu
 # Raphael recovery uses MODE2 together with checked PSP ring replacement.
 # Both remain explicitly disableable for investigation.
 KPI_AMDGPU_MODE2_RESET ?= 1
 KPI_AMDGPU_PSP_REINIT ?= 1
-run-c7-prime: KERNEL_CMDLINE = kpi_amdgpu=1 kpi_prime_offload=1 kpi_amdgpu_mode2_reset=$(KPI_AMDGPU_MODE2_RESET) kpi_amdgpu_psp_reinit=$(KPI_AMDGPU_PSP_REINIT) amdgpu.runpm=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x4
-run-c7-prime: SERIAL = chardev:prime-diag
-run-c7-prime: VFIO_SMP = 8
+run-amd-gpu: KERNEL_CMDLINE = kpi_amdgpu=1 kpi_prime_offload=1 kpi_amdgpu_mode2_reset=$(KPI_AMDGPU_MODE2_RESET) kpi_amdgpu_psp_reinit=$(KPI_AMDGPU_PSP_REINIT) amdgpu.runpm=0 amdgpu.ppfeaturemask=0xfff73fff drm.debug=0x4
+run-amd-gpu: SERIAL = chardev:prime-diag
+run-amd-gpu: VFIO_SMP = 8
 # GLFW cursor capture/raw motion requires a relative device, not a tablet.
-run-c7-prime: VFIO_POINTER = usb-mouse
-run-c7-prime: GTK_SHOW_CURSOR = off
-# GTK's X button calls QMP quit, bypassing the guest PCI shutdown callbacks.
-# After a long active session MODE2/PSP reinit does not reliably recover VCN
-# (see docs/amdgpu-xclose-reproduction-2026-10-14.md), so Shutdown inside the
-# guest remains the safe close. The X button is enabled for convenience; pass
-# GTK_WINDOW_CLOSE=off to disable it again for passthrough PRIME sessions.
+run-amd-gpu: VFIO_POINTER = usb-mouse
+run-amd-gpu: GTK_SHOW_CURSOR = off
+# GTK's X button closes QEMU directly. Recent X-close and Ctrl-C/reopen checks
+# pass with the enabled recovery path; set GTK_WINDOW_CLOSE=off to require a
+# guest shutdown before closing passthrough PRIME sessions.
 GTK_WINDOW_CLOSE ?= on
-run-c7-prime: DISPLAY_OPT = -display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=$(GTK_SHOW_CURSOR),window-close=$(GTK_WINDOW_CLOSE)
-run-c7-prime: VFIO_LAUNCHER = python3 scripts/qemu-prime-log.py --
-run-c7-prime: RUN_NIC_ADDR = 08.0
-run-c7-prime: VFIO_EXTRA = -device edu -chardev socket,id=prime-diag,path=build/logs/p6-c7-prime-serial.sock,server=on,wait=off,logfile=build/logs/p6-c7-prime.log,logappend=on $(RUN_NET_FLAGS)
-run-c7-prime: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
-run-c7-prime: run-vfio
+run-amd-gpu: DISPLAY_OPT = -display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=$(GTK_SHOW_CURSOR),window-close=$(GTK_WINDOW_CLOSE)
+run-amd-gpu: VFIO_LAUNCHER = python3 scripts/qemu-prime-log.py --
+run-amd-gpu: RUN_NIC_ADDR = 08.0
+run-amd-gpu: VFIO_EXTRA = -device edu -chardev socket,id=prime-diag,path=build/logs/p6-amd-gpu-serial.sock,server=on,wait=off,logfile=build/logs/p6-amd-gpu.log,logappend=on $(RUN_NET_FLAGS)
+run-amd-gpu: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
+run-amd-gpu: run-vfio
 
 .PHONY: run-dist
 run-dist: edk2-ovmf avoryos-dist.iso
@@ -419,7 +282,7 @@ avoryos-dist.iso: limine/limine kernel disk.img limine.conf create_dist_usb.sh
 	./create_dist_usb.sh avoryos-dist.iso
 
 # ── Minimal ISO ─────────────────────────────────────────────────────────────
-# bash + GNU coreutils + Xorg + IceWM + OpenRC/D-Bus + st, without the full
+# bash + GNU coreutils + Xorg + IceWM + BusyBox init/D-Bus + xterm, without the full
 # desktop stack.  scripts/build-minimal.sh assembles an independent rootfs and
 # disk image under build/minimal/; create_dist_usb.sh packages it as a
 # self-contained ISO (the disk image is embedded as a Limine module, exactly
@@ -428,7 +291,7 @@ MINIMAL_ISO := avoryos-minimal.iso
 MINIMAL_DISK := build/minimal/disk.img
 MINIMAL_STAMP := build/minimal/rootfs/.avoryos-minimal
 
-$(MINIMAL_STAMP): scripts/build-minimal.sh
+$(MINIMAL_STAMP): scripts/build-minimal.sh scripts/axon-common.sh scripts/minimal-rootfs-packages.txt
 	chmod +x scripts/build-minimal.sh
 	./scripts/build-minimal.sh rootfs
 
@@ -520,6 +383,10 @@ run-ata: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 		$(QEMUFLAGS)
 
 # FAT32 test image for testing the FAT32 driver
+nvme_test.img: scripts/nvme/create-nvme-test.sh userland/nvme_init.elf \
+		userland/shutdown.elf userland/nvme_test.elf userland/nvme_bench.elf
+	./scripts/nvme/create-nvme-test.sh
+
 fat32_test.img:
 	./scripts/create-fat32-test.sh
 
@@ -541,124 +408,64 @@ run-fat32: edk2-ovmf $(IMAGE_NAME).iso fat32_test.img
 		-device usb-tablet,bus=xhci.0 \
 		$(QEMUFLAGS)
 
-AetherDE/x11-wm/AetherWM: AetherDE/x11-wm/main.c AetherDE/x11-wm/render.c AetherDE/x11-wm/input.c AetherDE/x11-wm/frames.c AetherDE/x11-wm/wm.h AetherDE/x11-wm/stb_image.h $(ALPINE_STAMP) $(GLIBC_STAMP)
-	@echo "[*] Compiling AetherDE X11 Window Manager (low-level: Xft+XRender, no Cairo/Pango)..."
-	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 -Wall -Wextra -march=x86-64 -mtune=generic \
-		-isystem $(ALPINE_SYSROOT)/usr/include \
-		-isystem $(ALPINE_SYSROOT)/usr/include/freetype2 \
-		-IAetherDE/x11-wm \
-		AetherDE/x11-wm/main.c \
-		AetherDE/x11-wm/render.c \
-		AetherDE/x11-wm/input.c \
-		AetherDE/x11-wm/frames.c \
-		-o AetherDE/x11-wm/AetherWM \
-		-L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-		-lX11 \
-		-lXrender \
-		-lXft \
-		-lXext \
-		-lfontconfig -lfreetype -lm \
-		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-		-Wl,-rpath,/usr/lib \
-		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib
+USERLAND_DISK_APPS := \
+	userland/asplay.elf \
+	userland/avory-installer.elf \
+	userland/avory-login.elf \
+	userland/booter.elf \
+	userland/classicube.elf \
+	userland/dns_lookup.elf \
+	userland/drm_identify.elf \
+	userland/hello_glibc.elf \
+	userland/kilo.elf \
+	userland/kria.elf \
+	userland/ls.elf \
+	userland/lsblk.elf \
+	userland/lspci.elf \
+	userland/pong.elf \
+	userland/proc_bench.elf \
+	userland/radeonsi_vram_leak.elf \
+	userland/raycast.elf \
+	userland/readelf.elf \
+	userland/reboot.elf \
+	userland/shutdown.elf \
+	userland/test_blocking_liveness.elf \
+	userland/test_child_notify.elf \
+	userland/test_clone_futex.elf \
+	userland/test_copy_user.elf \
+	userland/test_dcache.elf \
+	userland/test_elf32.elf \
+	userland/test_fb_perf.elf \
+	userland/test_futex_clock.elf \
+	userland/test_futex_pi.elf \
+	userland/test_heap_smp.elf \
+	userland/test_hugepages.elf \
+	userland/test_journal_speed.elf \
+	userland/test_kpi_amdgpu.elf \
+	userland/test_kpi_bochs.elf \
+	userland/test_kpi_dmabuf.elf \
+	userland/test_kpi_drm.elf \
+	userland/test_kpi_radeonsi.elf \
+	userland/test_lazy_fpu.elf \
+	userland/test_mem_stress.elf \
+	userland/test_mm_speed.elf \
+	userland/test_pcp_pmm.elf \
+	userland/test_pty_master.elf \
+	userland/test_signal_stack.elf \
+	userland/test_syscall_cpu.elf \
+	userland/test_syscall_speed.elf \
+	userland/test_syscompat.elf \
+	userland/test_ticket_lock.elf \
+	userland/test_tlb_stress.elf \
+	userland/test_tmpfile.elf \
+	userland/test_uaccess_bench.elf \
+	userland/test_unix_sockets.elf \
+	userland/test_user_dispatch.elf \
+	userland/test_vdso_bench.elf \
+	userland/test_watchdog.elf \
+	userland/test_zero_page.elf
 
-
-AetherDE/aether-dock/aether-dock: AetherDE/aether-dock/main.c AetherDE/aether-dock/dock.c AetherDE/aether-dock/render_dock.c AetherDE/aether-dock/dock.h $(ALPINE_STAMP) $(GLIBC_STAMP)
-	@echo "[*] Compiling AetherDE Dock..."
-	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 -Wall -Wextra -march=x86-64 -mtune=generic \
-		-I$(ALPINE_SYSROOT)/usr/include \
-		-I$(ALPINE_SYSROOT)/usr/include/gtk-3.0 \
-		-I$(ALPINE_SYSROOT)/usr/include/gdk-pixbuf-2.0 \
-		-I$(ALPINE_SYSROOT)/usr/include/atk-1.0 \
-		-I$(ALPINE_SYSROOT)/usr/include/at-spi2-atk/2.0 \
-		-I$(ALPINE_SYSROOT)/usr/include/at-spi-2.0 \
-		-I$(ALPINE_SYSROOT)/usr/include/dbus-1.0 \
-		-I$(ALPINE_SYSROOT)/usr/lib/dbus-1.0/include \
-		-I$(ALPINE_SYSROOT)/usr/include/epoxy \
-		-I$(ALPINE_SYSROOT)/usr/include/cairo \
-		-I$(ALPINE_SYSROOT)/usr/include/pango-1.0 \
-		-I$(ALPINE_SYSROOT)/usr/include/glib-2.0 \
-		-I$(ALPINE_SYSROOT)/usr/lib/glib-2.0/include \
-		-I$(ALPINE_SYSROOT)/usr/include/harfbuzz \
-		-I$(ALPINE_SYSROOT)/usr/include/pixman-1 \
-		-I$(ALPINE_SYSROOT)/usr/include/freetype2 \
-		-I$(ALPINE_SYSROOT)/usr/include/libpng16 \
-		AetherDE/aether-dock/main.c \
-		AetherDE/aether-dock/dock.c \
-		AetherDE/aether-dock/render_dock.c \
-		-o AetherDE/aether-dock/aether-dock \
-		-L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-		-lgtk-3 -lgdk-3 \
-		-lgdk_pixbuf-2.0 \
-		-latk-1.0 \
-		-lcairo-gobject -lcairo \
-		-lepoxy \
-		-lpangocairo-1.0 -lpango-1.0 \
-		-lgio-2.0 -lgobject-2.0 -lglib-2.0 \
-		-lX11 -lXext -lXrender -lXi -lXcursor -lXfixes \
-		-lXrandr -lXinerama -lXcomposite -lXdamage \
-		-lfontconfig -lfreetype -lpng16 -lz -lm \
-		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-		-Wl,-rpath,/usr/lib \
-		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib
-
-
-AetherDE/aether-panel/aether-panel: AetherDE/aether-panel/panel.c $(ALPINE_STAMP) $(GLIBC_STAMP)
-	@echo "[*] Compiling AetherDE Panel..."
-	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 -Wall -Wextra \
-		-Wno-format-truncation -Wno-stringop-truncation \
-		-march=x86-64 -mtune=generic \
-		-I$(ALPINE_SYSROOT)/usr/include \
-		-I$(ALPINE_SYSROOT)/usr/include/cairo \
-		-I$(ALPINE_SYSROOT)/usr/include/pango-1.0 \
-		-I$(ALPINE_SYSROOT)/usr/include/glib-2.0 \
-		-I$(ALPINE_SYSROOT)/usr/lib/glib-2.0/include \
-		-I$(ALPINE_SYSROOT)/usr/include/harfbuzz \
-		-I$(ALPINE_SYSROOT)/usr/include/pixman-1 \
-		-I$(ALPINE_SYSROOT)/usr/include/freetype2 \
-		-I$(ALPINE_SYSROOT)/usr/include/libpng16 \
-		AetherDE/aether-panel/panel.c \
-		-o AetherDE/aether-panel/aether-panel \
-		-L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-		-lcairo \
-		-lpangocairo-1.0 -lpango-1.0 \
-		-lgobject-2.0 -lglib-2.0 \
-		-lX11 \
-		-lfontconfig -lfreetype -lpng16 -lz -lm \
-		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-		-Wl,-rpath,/usr/lib \
-		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib
-
-
-AetherDE/wayland-compositor/aether-compositor: AetherDE/wayland-compositor/main.c AetherDE/wayland-compositor/render.c AetherDE/wayland-compositor/input.c AetherDE/wayland-compositor/pixel_server.c AetherDE/wayland-compositor/protocols.c AetherDE/wayland-compositor/xdg-shell-protocol.c $(ALPINE_STAMP) $(GLIBC_STAMP)
-	@echo "[*] Compiling AetherDE/wayland-compositor modular source files..."
-	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 -Wall -march=x86-64 -mtune=generic \
-		-I$(ALPINE_SYSROOT)/usr/include \
-		-I$(ALPINE_SYSROOT)/usr/include/cairo \
-		-I$(ALPINE_SYSROOT)/usr/include/pixman-1 \
-		AetherDE/wayland-compositor/main.c \
-		AetherDE/wayland-compositor/render.c \
-		AetherDE/wayland-compositor/input.c \
-		AetherDE/wayland-compositor/pixel_server.c \
-		AetherDE/wayland-compositor/protocols.c \
-		AetherDE/wayland-compositor/xdg-shell-protocol.c \
-		-L$(ALPINE_SYSROOT)/usr/lib \
-		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-		-Wl,-rpath,/usr/lib \
-		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib \
-		-lwayland-server -lcairo -lpixman-1 -lfontconfig -lfreetype -lpng16 -lz -lm \
-		-o AetherDE/wayland-compositor/aether-compositor
-
-
-AetherDE/demo-client/aether-window: AetherDE/demo-client/main.c $(ALPINE_STAMP) $(GLIBC_STAMP)
-	@echo "[*] Compiling AetherDE GTK3 Wayland Window Client..."
-	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 -Wall -march=x86-64 -mtune=generic \
-		AetherDE/demo-client/main.c \
-		-o AetherDE/demo-client/aether-window \
-		$(GTK3_INCLUDES) \
-		$(GTK3_LIBS) \
-		$(GTK3_LDFLAGS)
-
+disk.img: $(USERLAND_DISK_APPS)
 
 # Create a 5GB ext4 disk image with sample files for testing
 # Deterministic 4 KB firmware blob read by the Phase 5 firmware self-test
@@ -677,16 +484,47 @@ build/firmware/.stamp: scripts/linux-firmware-install.sh scripts/linux/firmware-
 	LINUX_FIRMWARE_REF='$(LINUX_FIRMWARE_REF)' scripts/linux-firmware-install.sh
 	@touch $@
 
-disk.img: userland/winoptions userland/icewm-menu $(ALPINE_STAMP)
-disk.img: scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh userland/avory-login.elf userland/avory-installer.elf
-disk.img:  userland/dns_lookup.elf
-disk.img: userland/test_clone_futex.elf
-# Fixed 12 GiB image by default (override per build with
-# `make disk.img DISK_SIZE_MIB=<MiB>`). Leave room for filesystem metadata
+disk.img: userland/winoptions userland/icewm-menu $(ARCH_STAMP)
+disk.img: scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh
+# Fixed 12 GiB image by default (override during a forced rebuild with
+# `make disk-rebuild DISK_SIZE_MIB=<MiB>`). Leave room for filesystem metadata
 # and tools added after the rootfs overlay.
 DISK_SIZE_MIB ?= 12288
+DISK_PARTITION_CACHE := build/arch/disk-partition.img
+DISK_APP_MANIFEST := build/arch/disk-apps.json
+DISK_NON_APP_DEPS := GNUmakefile \
+	userland/winoptions userland/icewm-menu $(ARCH_STAMP) \
+	scripts/setup-rootfs.sh scripts/axon-common.sh scripts/configure-axon-mirrors.py \
+	scripts/rootfs-packages.txt $(AXON_PROFILE_FILES) userland/avory-login.c \
+	scripts/glibc-toolchain.sh $(GLIBC_TOOLCHAIN_STAMP) \
+	scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh \
+	scripts/populate-ext2-dir.sh scripts/configure-image-root.sh \
+	config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/20-output.conf \
+	scripts/image-runtime.py config/xorg/avory-prime-display.sh \
+	config/xorg/45-prime-output.sh config/xorg/avory-xorg-profile.sh \
+	config/xorg/10-nouveau.conf config/xorg/avory-nouveau-xorg.sh \
+	config/xorg/44-nouveau-env.sh scripts/image-firmware-install.sh \
+	scripts/image-add-firmware.py scripts/incremental-disk-apps.py \
+	scripts/linux-firmware-install.sh scripts/linux/firmware-manifest.txt \
+	scripts/linux/firmware-sha256-20260916.txt build/test_fw.bin build/firmware/.stamp \
+	$(QUAKE2_STAMP) scripts/build-quake2.sh scripts/quake2-sdl2-config.in \
+	$(QUAKE2_BUNDLE_FILES) \
+	assets/boot.wav assets/test.wav assets/jane.mp3 assets/mc9.mp3 \
+	assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png \
+	assets/logo.png assets/linus.gif assets/video.mp4 userland/terrain.png \
+	userland/texpacks/classicube.zip initrd/weston.ini initrd/drm-pick.sh \
+	initrd/avory-drm.sh
 
-disk.img: scripts/populate-ext2-dir.sh
+# Userland app edits update only their installed files in the cached ext4
+# partition. Changes to rootfs/config/assets still take the safe full-build
+# path. A clean checkout also takes the full path to create the cache.
+DISK_REBUILD ?= $(shell \
+	if [ ! -f disk.img ] || [ ! -f $(DISK_PARTITION_CACHE) ] || [ ! -f $(DISK_APP_MANIFEST) ]; then echo 1; exit; fi; \
+	for path in $(DISK_NON_APP_DEPS); do \
+		if [ ! -e "$$path" ] || [ "$$path" -nt disk.img ]; then echo 1; exit; fi; \
+	done; echo 0)
+
+disk.img: scripts/populate-ext2-dir.sh scripts/configure-image-root.sh
 # Both Xorg profiles ship in every image; /sbin/avory-early-init selects the
 # one matching the boot's PCI topology (amdgpu passthrough vs native card0),
 # so bare `sddm` works with or without VFIO. XORG_PROFILE only sets the
@@ -696,58 +534,32 @@ XORG_CONFIG = $(if $(filter amdgpu,$(XORG_PROFILE)),config/xorg/10-modesetting.c
 
 # Pick a profile when populating a disk. Switching launch targets never
 # needs a rebuild: early init re-selects the profile on every boot.
-disk.img: config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/20-output.conf scripts/image-runtime.py
+disk.img: config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/20-output.conf config/kwinoutputconfig.json scripts/image-runtime.py
 disk.img: config/xorg/avory-prime-display.sh config/xorg/45-prime-output.sh config/xorg/avory-xorg-profile.sh
 disk.img: config/xorg/10-nouveau.conf config/xorg/avory-nouveau-xorg.sh
 disk.img: config/xorg/44-nouveau-env.sh
-disk.img: userland/drm_identify.elf
 disk.img: scripts/image-firmware-install.sh
-disk.img: userland/test_signal_stack.elf
-disk.img: userland/test_user_dispatch.elf
-disk.img: userland/test_syscompat.elf
-disk.img: userland/test_tlb_stress.elf
-disk.img: userland/test_futex_clock.elf
-disk.img: userland/test_futex_pi.elf
-disk.img: userland/test_unix_sockets.elf
-disk.img: userland/test_syscall_speed.elf
-disk.img: userland/test_mm_speed.elf
-disk.img: userland/test_journal_speed.elf
-disk.img: userland/test_syscall_cpu.elf
-disk.img: userland/test_blocking_liveness.elf
-disk.img: userland/test_hugepages.elf
-disk.img: userland/test_zero_page.elf
-disk.img: userland/test_copy_user.elf
-disk.img: userland/test_pcp_pmm.elf
-disk.img: userland/test_ticket_lock.elf
-disk.img: userland/test_fb_perf.elf
-disk.img: userland/test_vdso_bench.elf
-disk.img: userland/test_lazy_fpu.elf
-disk.img: userland/test_elf32.elf
-disk.img: userland/test_heap_smp.elf
-disk.img: userland/test_dcache.elf
-disk.img: userland/test_tmpfile.elf
-disk.img: userland/test_child_notify.elf
-disk.img: userland/test_pty_master.elf
-disk.img: userland/test_uaccess_bench.elf
-disk.img: userland/proc_bench.elf
-disk.img: userland/test_watchdog.elf
-disk.img: userland/test_kpi_dmabuf.elf
-disk.img: userland/test_kpi_drm.elf
-disk.img: userland/test_kpi_bochs.elf
-disk.img: userland/test_kpi_amdgpu.elf
-disk.img: userland/test_kpi_radeonsi.elf userland/radeonsi_vram_leak.elf
 disk.img: build/test_fw.bin build/firmware/.stamp
-disk.img: userland/butterscotch.elf assets/game.unx assets/assets
+disk.img: $(ARCH_STAMP) $(QUAKE2_BUNDLE_FILES)
+disk.img: assets/boot.wav assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/terrain.png userland/texpacks/classicube.zip initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh
 
+disk.img: GNUmakefile scripts/incremental-disk-apps.py
 
-disk.img: $(BASH_STAMP) $(COREUTILS_STAMP) $(ALPINE_STAMP) $(QUAKE2_BUNDLE_FILES)
-disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/about.elf userland/hello_glibc.elf userland/booter.elf userland/reboot.elf userland/shutdown.elf userland/test_cpp.elf  userland/kilo.elf  userland/ls.elf userland/lspci.elf userland/lsblk.elf userland/readelf.elf userland/pong.elf userland/raycast.elf userland/asplay.elf userland/kria.elf userland/doom.elf userland/doom_x11.elf userland/gtk3_test.elf userland/qt5_test.elf userland/test_mem_stress.elf userland/classicube.elf userland/terrain.png userland/texpacks/classicube.zip initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh AetherDE/x11-wm/AetherWM AetherDE/aether-dock/aether-dock AetherDE/aether-panel/aether-panel AetherDE/wayland-compositor/aether-compositor AetherDE/demo-client/aether-window AetherDE/scripts/sax11.sh AetherDE/scripts/sawayland.sh userland/avoryd.elf $(AVORYD_CONFIG_FILES)
+.PHONY: disk-rebuild disk-full-force
+disk-full-force:
+
+disk-rebuild:
+	$(MAKE) --no-print-directory DISK_REBUILD=1 disk.img
+
+ifeq ($(DISK_REBUILD),1)
+disk.img: disk-full-force
+
 	@echo "Creating partitioned disk image (GPT)..."
 	@if ls -l /proc/[0-9]*/fd/* 2>/dev/null | grep -q "disk.img"; then \
 		echo "Refusing: disk.img is open by a running process (QEMU?). Stop the VM before rebuilding the disk image; rebuilding it in place corrupts the guest's filesystem." >&2; \
 		exit 1; \
 	fi
-	@if _rootfs_mb=$$(du -sm build/alpine/rootfs 2>/dev/null | cut -f1); \
+	@if _rootfs_mb=$$(du -sm build/arch/rootfs 2>/dev/null | cut -f1); \
 		[ -n "$$_rootfs_mb" ] && [ "$$_rootfs_mb" -gt "$$(( $(DISK_SIZE_MIB) - 1024 ))" ]; then \
 		echo "Refusing: rootfs ($${_rootfs_mb}MiB) exceeds $(DISK_SIZE_MIB)MiB minus 1GiB metadata headroom; rebuild with DISK_SIZE_MIB=<MiB>." >&2; \
 		exit 1; \
@@ -779,22 +591,6 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "mkdir .cache"; \
 		echo "rm bin/startx.sh"; \
 		echo "rm bin/startw.sh"; \
-		echo "rm bin/sax11.sh"; \
-		echo "write AetherDE/scripts/sax11.sh bin/sax11.sh"; \
-		echo "rm bin/sawayland.sh"; \
-		echo "write AetherDE/scripts/sawayland.sh bin/sawayland.sh"; \
-		echo "rm bin/AetherWM"; \
-		echo "write AetherDE/x11-wm/AetherWM bin/AetherWM"; \
-		echo "rm bin/aether-dock"; \
-		echo "write AetherDE/aether-dock/aether-dock bin/aether-dock"; \
-		echo "rm bin/aether-panel"; \
-		echo "write AetherDE/aether-panel/aether-panel bin/aether-panel"; \
-		echo "rm bin/aether-compositor"; \
-		echo "write AetherDE/wayland-compositor/aether-compositor bin/aether-compositor"; \
-		echo "rm bin/aether-window"; \
-		echo "write AetherDE/demo-client/aether-window bin/aether-window"; \
-		echo "rm bin/avoryd"; \
-		echo "write userland/avoryd.elf bin/avoryd"; \
 		echo "rm bin/avory-login"; \
 		echo "write userland/avory-login.elf bin/avory-login"; \
 		echo "rm bin/avory-installer"; \
@@ -808,28 +604,16 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "rm bin/true"; \
 		echo "symlink bin/true /usr/bin/true"; \
 		echo "mkdir etc"; \
-		echo "mkdir etc/avoryd"; \
-		echo "mkdir etc/avoryd/services"; \
-		echo "rm etc/avoryd/default.target"; \
-		echo "write initrd/avoryd/default.target etc/avoryd/default.target"; \
-		echo "rm etc/avoryd/services/system-init.service"; \
-		echo "write initrd/avoryd/services/system-init.service etc/avoryd/services/system-init.service"; \
-		echo "rm etc/avoryd/services/console.service"; \
-		echo "write initrd/avoryd/services/console.service etc/avoryd/services/console.service"; \
 		echo "rm etc/weston.ini"; \
 		echo "write initrd/weston.ini etc/weston.ini"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
-	@if [ -d AetherDE ]; then \
-		echo "Installing AetherDE into disk image (/AetherDE)..."; \
-		./scripts/populate-ext2-dir.sh ./part.img AetherDE AetherDE; \
-	fi
-	@if [ -d toolchain/glibc-sysroot/usr/include ]; then \
+	@if [ -d build/arch/rootfs/usr/include ]; then \
 		echo "Installing GLIBC headers into disk image (opt/glibc/include)..."; \
-		./scripts/populate-ext2-dir.sh ./part.img toolchain/glibc-sysroot/usr/include opt/glibc/include; \
+		./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs/usr/include opt/glibc/include; \
 	fi
-	# NOTE: the toolchain glibc *libs* are deliberately NOT copied anymore.
-	# The userland tree now ships its own glibc (Arch), and overlaying the
-	# older toolchain build on top mixes two glibc versions in /usr/lib,
+	# NOTE: the compiler bundle's glibc *libs* are deliberately NOT copied.
+	# The Axon rootfs supplies glibc 2.44, and overlaying the compiler bundle's
+	# older sysroot on top mixes two glibc versions in /usr/lib,
 	# which breaks every dynamically linked binary (e.g. bash failing on
 	# __pointer_chk_guard). This step only made sense for the old musl tree.
 	@{ \
@@ -838,12 +622,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/netlink_test.elf bin/netlink_test"; \
 		echo "rm bin/kilo"; \
 		echo "write userland/kilo.elf bin/kilo"; \
-		echo "rm bin/about"; \
-		echo "write userland/about.elf bin/about"; \
 		echo "rm bin/hello_glibc"; \
 		echo "write userland/hello_glibc.elf bin/hello_glibc"; \
-		echo "rm bin/test_cpp"; \
-		echo "write userland/test_cpp.elf bin/test_cpp"; \
 		echo "rm bin/ls"; \
 		echo "write userland/ls.elf bin/ls"; \
 		echo "rm bin/lspci"; \
@@ -868,16 +648,12 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/shutdown.elf bin/shutdown"; \
 		echo "rm bin/test_cred"; \
 		echo "write userland/test_cred.elf bin/test_cred"; \
-		echo "rm test.s"; \
-		echo "write userland/test.s test.s"; \
 		echo "rm standalone.s"; \
 		echo "write userland/standalone.s standalone.s"; \
 		echo "rm test.wav"; \
 		echo "write assets/test.wav test.wav"; \
 		echo "rm boot.wav"; \
 		echo "write assets/boot.wav boot.wav"; \
-		echo "rm test.c"; \
-		echo "write userland/test.c test.c"; \
 		echo "rm jane.mp3"; \
 		echo "write assets/jane.mp3 jane.mp3"; \
 		echo "rm mc9.mp3"; \
@@ -895,12 +671,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write assets/linus.gif assets/linus.gif"; \
 		echo "rm assets/video.mp4"; \
 		echo "write assets/video.mp4 assets/video.mp4"; \
-		echo "rm test.krx"; \
-		echo "write userland/kria-lang/test.krx test.krx"; \
 		echo "rm hello.krx"; \
 		echo "write userland/hello.krx hello.krx"; \
-		echo "rm bin/doom"; \
-		echo "write userland/doom.elf bin/doom"; \
 		echo "rm bin/dns_lookup"; \
 		echo "write userland/dns_lookup.elf bin/dns_lookup"; \
 		echo "rm test.tar"; \
@@ -935,8 +707,6 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/test_kpi_amdgpu.elf bin/test_kpi_amdgpu"; \
 		echo "rm bin/test_kpi_radeonsi"; \
 		echo "write userland/test_kpi_radeonsi.elf bin/test_kpi_radeonsi"; \
-		echo "rm bin/radeonsi_vram_leak.elf"; \
-		echo "write userland/radeonsi_vram_leak.elf bin/radeonsi_vram_leak.elf"; \
 		echo "rm bin/test_child_notify"; \
 		echo "write userland/test_child_notify.elf bin/test_child_notify"; \
 		echo "rm bin/test_pty_master"; \
@@ -980,6 +750,8 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "rm bin/test_readahead"; \
 		echo "write userland/test_readahead.elf bin/test_readahead"; \
 		echo "rm bin/proc_bench"; \
+		echo "rm bin/radeonsi_vram_leak.elf"; \
+		echo "write userland/radeonsi_vram_leak.elf bin/radeonsi_vram_leak.elf"; \
 		echo "write userland/proc_bench.elf bin/proc_bench"; \
 		echo "rm bin/classicube"; \
 		echo "write userland/classicube.elf bin/classicube"; \
@@ -1009,49 +781,49 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 	# below: an in-image gcc link needs usr/include, the gcc static libs
 	# (libgcc.a/libstdc++.a have no dynamic counterpart) and glibc's
 	# *_nonshared.a archives, which /usr/lib/libc.so's ld script GROUPs in.
-	@if [ -d build/alpine/rootfs ]; then \
-		mkdir -p build/alpine/rootfs/lib/firmware; \
-		cp -f build/test_fw.bin build/alpine/rootfs/lib/firmware/test_fw.bin; \
+	@if [ -d build/arch/rootfs ]; then \
+		mkdir -p build/arch/rootfs/lib/firmware; \
+		cp -f build/test_fw.bin build/arch/rootfs/lib/firmware/test_fw.bin; \
 		if [ -d build/firmware/lib/firmware ]; then \
-			cp -a build/firmware/lib/firmware/. build/alpine/rootfs/lib/firmware/; \
+			cp -a build/firmware/lib/firmware/. build/arch/rootfs/lib/firmware/; \
 		fi; \
 	fi
-	@if [ -d build/alpine/rootfs ]; then \
+	@if [ -d build/arch/rootfs ]; then \
 		echo "Populating Arch Linux rootfs into disk image..."; \
-		mkdir -p build/alpine/rootfs/etc/X11/xorg.conf.d; \
-		mkdir -p build/alpine/rootfs/usr/share/avory-xorg; \
-		install -m 0644 config/xorg/10-modesetting.conf build/alpine/rootfs/usr/share/avory-xorg/10-modesetting-amdgpu.conf; \
-		install -m 0644 config/xorg/10-native.conf build/alpine/rootfs/usr/share/avory-xorg/10-modesetting-native.conf; \
-		install -m 0644 $(XORG_CONFIG) build/alpine/rootfs/etc/X11/xorg.conf.d/10-modesetting.conf; \
-		install -m 0755 config/xorg/avory-xorg-profile.sh build/alpine/rootfs/usr/bin/avory-xorg-profile; \
-		install -m 0755 config/xorg/avory-nouveau-xorg.sh build/alpine/rootfs/usr/bin/avory-nouveau-xorg; \
-		install -m 0644 config/xorg/10-nouveau.conf build/alpine/rootfs/usr/share/avory-xorg/10-modesetting-nouveau.conf; \
-		install -m 0755 config/xorg/avory-prime-display.sh build/alpine/rootfs/usr/bin/avory-prime-display; \
-		if [ -f build/alpine/rootfs/sbin/avory-early-init ]; then \
-			grep -q 'avory-xorg-profile' build/alpine/rootfs/sbin/avory-early-init || \
-				echo '/usr/bin/avory-xorg-profile 2>/dev/null || true' >> build/alpine/rootfs/sbin/avory-early-init; \
+		mkdir -p build/arch/rootfs/etc/X11/xorg.conf.d; \
+		mkdir -p build/arch/rootfs/usr/share/avory-xorg; \
+		install -m 0644 config/xorg/10-modesetting.conf build/arch/rootfs/usr/share/avory-xorg/10-modesetting-amdgpu.conf; \
+		install -m 0644 config/xorg/10-native.conf build/arch/rootfs/usr/share/avory-xorg/10-modesetting-native.conf; \
+		install -m 0644 $(XORG_CONFIG) build/arch/rootfs/etc/X11/xorg.conf.d/10-modesetting.conf; \
+		install -m 0755 config/xorg/avory-xorg-profile.sh build/arch/rootfs/usr/bin/avory-xorg-profile; \
+		install -m 0755 config/xorg/avory-nouveau-xorg.sh build/arch/rootfs/usr/bin/avory-nouveau-xorg; \
+		install -m 0644 config/xorg/10-nouveau.conf build/arch/rootfs/usr/share/avory-xorg/10-modesetting-nouveau.conf; \
+		install -m 0755 config/xorg/avory-prime-display.sh build/arch/rootfs/usr/bin/avory-prime-display; \
+		if [ -f build/arch/rootfs/sbin/avory-early-init ]; then \
+			grep -q 'avory-xorg-profile' build/arch/rootfs/sbin/avory-early-init || \
+				echo '/usr/bin/avory-xorg-profile 2>/dev/null || true' >> build/arch/rootfs/sbin/avory-early-init; \
 		else \
-			{ echo '#!/bin/sh'; echo '/usr/bin/avory-xorg-profile 2>/dev/null || true'; } > build/alpine/rootfs/sbin/avory-early-init; \
-			chmod +x build/alpine/rootfs/sbin/avory-early-init; \
+			{ echo '#!/bin/sh'; echo '/usr/bin/avory-xorg-profile 2>/dev/null || true'; } > build/arch/rootfs/sbin/avory-early-init; \
+			chmod +x build/arch/rootfs/sbin/avory-early-init; \
 		fi; \
-		mkdir -p build/alpine/rootfs/etc/X11/xinit/xinitrc.d build/alpine/rootfs/etc/profile.d; \
-		install -m 0755 config/xorg/44-nouveau-env.sh build/alpine/rootfs/etc/X11/xinit/xinitrc.d/44-nouveau-env.sh; \
-		install -m 0644 config/xorg/44-nouveau-env.sh build/alpine/rootfs/etc/profile.d/avory-nouveau.sh; \
-		install -m 0755 config/xorg/45-prime-output.sh build/alpine/rootfs/etc/X11/xinit/xinitrc.d/45-prime-output.sh; \
-		mkdir -p build/alpine/rootfs/etc/sddm.conf.d; \
-		install -m 0644 config/xorg/20-output.conf build/alpine/rootfs/etc/sddm.conf.d/20-output.conf; \
-		if [ -f build/alpine/rootfs/etc/sddm.conf ]; then \
-			sed -i 's|^DisplayCommand=.*$$|DisplayCommand=/usr/bin/avory-prime-display|' build/alpine/rootfs/etc/sddm.conf; \
+		mkdir -p build/arch/rootfs/etc/X11/xinit/xinitrc.d build/arch/rootfs/etc/profile.d; \
+		install -m 0755 config/xorg/44-nouveau-env.sh build/arch/rootfs/etc/X11/xinit/xinitrc.d/44-nouveau-env.sh; \
+		install -m 0644 config/xorg/44-nouveau-env.sh build/arch/rootfs/etc/profile.d/avory-nouveau.sh; \
+		install -m 0755 config/xorg/45-prime-output.sh build/arch/rootfs/etc/X11/xinit/xinitrc.d/45-prime-output.sh; \
+		mkdir -p build/arch/rootfs/etc/sddm.conf.d; \
+		install -m 0644 config/xorg/20-output.conf build/arch/rootfs/etc/sddm.conf.d/20-output.conf; \
+		if [ -f build/arch/rootfs/etc/sddm.conf ]; then \
+			sed -i 's|^DisplayCommand=.*$$|DisplayCommand=/usr/bin/avory-prime-display|' build/arch/rootfs/etc/sddm.conf; \
 		fi; \
-		./scripts/configure-accounts.sh build/alpine/rootfs; \
-		./scripts/populate-ext2-dir.sh ./part.img build/alpine/rootfs /; \
-		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/alpine/rootfs/usr/include usr/include; \
-		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/alpine/rootfs/usr/lib/gcc/x86_64-pc-linux-gnu usr/lib/gcc/x86_64-pc-linux-gnu; \
+		./scripts/configure-accounts.sh build/arch/rootfs; \
+		./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs /; \
+		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs/usr/include usr/include; \
+		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs/usr/lib/gcc/x86_64-pc-linux-gnu usr/lib/gcc/x86_64-pc-linux-gnu; \
 		mkdir -p build/image-toolchain/usr/lib; \
-		cp -a build/alpine/rootfs/usr/lib/*_nonshared.a build/image-toolchain/usr/lib/ 2>/dev/null || true; \
+		cp -a build/arch/rootfs/usr/lib/*_nonshared.a build/image-toolchain/usr/lib/ 2>/dev/null || true; \
 		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/image-toolchain /; \
 	fi
-	@python3 scripts/image-runtime.py ./part.img build/alpine/rootfs \
+	@python3 scripts/image-runtime.py ./part.img build/arch/rootfs \
 		/usr/lib/libc.so.6 /usr/lib/ld-linux-x86-64.so.2
 	# The Arch rootfs may still carry a stale bin/startx.sh; drop any copies
 	# of the retired direct-boot scripts and restore the AvoryOS-owned files
@@ -1068,13 +840,18 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field bin/drm-identify mode 0100755"; \
 		echo "rm etc/profile.d/avory-drm.sh"; \
 		echo "write initrd/avory-drm.sh etc/profile.d/avory-drm.sh"; \
+		echo "mkdir etc/xdg/plasma-workspace"; \
+		echo "mkdir etc/xdg/plasma-workspace/env"; \
+		echo "rm etc/xdg/plasma-workspace/env/avory-drm.sh"; \
+		echo "write initrd/avory-drm.sh etc/xdg/plasma-workspace/env/avory-drm.sh"; \
+		echo "set_inode_field etc/xdg/plasma-workspace/env/avory-drm.sh mode 0100644"; \
 		echo "rm etc/weston.ini"; \
 		echo "write initrd/weston.ini etc/weston.ini"; \
 		echo "set_inode_field bin/drm-pick.sh mode 0100755"; \
 		echo "set_inode_field etc/profile.d/avory-drm.sh mode 0100644"; \
 		echo "set_inode_field var/lib/sddm mode 040775"; \
-		_sddm_u=$$(awk -F: '/^sddm:/{print $$3; exit}' build/alpine/rootfs/etc/passwd 2>/dev/null); \
-		_sddm_g=$$(awk -F: '/^sddm:/{print $$3; exit}' build/alpine/rootfs/etc/group 2>/dev/null); \
+		_sddm_u=$$(awk -F: '/^sddm:/{print $$3; exit}' build/arch/rootfs/etc/passwd 2>/dev/null); \
+		_sddm_g=$$(awk -F: '/^sddm:/{print $$3; exit}' build/arch/rootfs/etc/group 2>/dev/null); \
 		[ -n "$$_sddm_u" ] || _sddm_u=642; \
 		[ -n "$$_sddm_g" ] || _sddm_g=642; \
 		echo "set_inode_field var/lib/sddm uid $$_sddm_u"; \
@@ -1102,36 +879,15 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "write userland/quake2/quake2 usr/bin/quake2"; \
 		echo "set_inode_field usr/bin/quake2 mode 0100755"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
-	@echo "Installing Butterscotch + Undertale audio + game.unx into disk image..."
-	@rm -rf /tmp/undertale-audio-unpack
-	@mkdir -p /tmp/undertale-audio-unpack
-	@for gz in assets/assets/*.gz; do \
-		base=$$(basename "$$gz" .gz); \
-		case "$$base" in game.unx) continue ;; esac; \
-		gunzip -c "$$gz" > "/tmp/undertale-audio-unpack/$$base"; \
-	done
-	@cp -f userland/butterscotch.elf /tmp/undertale-audio-unpack/butterscotch
-	@cp -f assets/game.unx /tmp/undertale-audio-unpack/game.unx
-	@./scripts/populate-ext2-dir.sh ./part.img /tmp/undertale-audio-unpack opt/butterscotch
-	@rm -rf /tmp/undertale-audio-unpack
-	@{ \
-		echo "cd /"; \
-		echo "mkdir usr"; \
-		echo "mkdir usr/bin"; \
-		echo "rm usr/bin/butterscotch"; \
-		echo "write userland/butterscotch.elf usr/bin/butterscotch"; \
-		echo "set_inode_field opt/butterscotch/butterscotch mode 0100755"; \
-		echo "set_inode_field usr/bin/butterscotch mode 0100755"; \
-	} | debugfs -w ./part.img >/dev/null 2>&1 || true
 	@echo "Installing staged glibc into /lib and /lib64 (no symlinks)..."
 	@# The guest kernel does not resolve the usrmerge symlinks for the
 	@# interpreter path (/lib64/ld-linux... -> usr/lib/...): with /lib64 as
 	@# a symlink, exec of /bin/sh fails with
 	@#   ELF load failed: File not found: /lib64/ld-linux-x86-64.so.2
-	@# while a real /lib64 dir with the old toolchain glibc 2.43 loads but
+	@# while a real /lib64 dir with a mismatched older glibc loads but
 	@# then fails every dynamic binary with
 	@#   undefined symbol: __pointer_chk_guard, version GLIBC_PRIVATE
-	@# (Arch glibc is 2.44: libc UNDs it, ld.so defines it; 2.43 has neither).
+	@# (Axon's glibc is 2.44: libc UNDs it, ld.so defines it; older glibc does not).
 	@# So keep /lib and /lib64 as real dirs holding the staged runtime libs
 	@# as /usr/lib. No version skew, no symlink dependency.
 	@{ \
@@ -1145,89 +901,10 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "mkdir lib"; \
 		echo "mkdir lib64"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
-	@python3 scripts/image-runtime.py ./part.img build/alpine/rootfs --copy-compat
+	@python3 scripts/image-runtime.py ./part.img build/arch/rootfs --copy-compat
 	@bash scripts/image-firmware-install.sh ./part.img
-	@echo "Populating root filesystem with additional tools..."
-
-	@if [ -d build/tcc-glibc-install/opt/tcc ]; then \
-		echo "Installing GLIBC TCC into disk image..."; \
-		./scripts/populate-ext2-dir.sh ./part.img build/tcc-glibc-install/opt/tcc opt/tcc; \
-		debugfs -w -R "rm bin/tcc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write build/tcc-glibc-install/opt/tcc/bin/tcc bin/tcc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm usr/lib/libtcc.so" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write build/tcc-glibc-install/opt/tcc/lib/libtcc.so usr/lib/libtcc.so" ./part.img >/dev/null 2>&1 || true; \
-	fi
-	@if [ -d toolchain/glibc-sysroot/opt/coreutils ]; then \
-		echo "Installing glibc coreutils into disk image..."; \
-		./scripts/populate-ext2-dir.sh ./part.img toolchain/glibc-sysroot/opt/coreutils opt/coreutils; \
-	fi
-	@if [ -d toolchain/glibc-sysroot/opt/bash ]; then \
-		echo "Installing bash into disk image..."; \
-		debugfs -w -R "mkdir opt" ./part.img >/dev/null 2>&1 || true; \
-		./scripts/populate-ext2-dir.sh ./part.img toolchain/glibc-sysroot/opt/bash opt/bash; \
-		debugfs -w -R "rm bin/bash" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write toolchain/glibc-sysroot/opt/bash/bin/bash bin/bash" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm bin/sh" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write toolchain/glibc-sysroot/opt/bash/bin/bash bin/sh" ./part.img >/dev/null 2>&1 || true; \
-		echo "PS1='\033[0;32mRoot@AvoryOS\033[0m:\w\\$$ '" > /tmp/bashrc; \
-		echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/opt/coreutils/bin:/usr/bin:/sbin:/bin:/opt/bash/bin:/opt/tcc/bin" >> /tmp/bashrc; \
-		echo "HOME=/" >> /tmp/bashrc; \
-		echo "TERM=xterm-256color" >> /tmp/bashrc; \
-		echo 'if [ -n "$$DISPLAY" ]; then unset TERM_PROGRAM TERM_PROGRAM_VERSION; else export TERM_PROGRAM=vt; fi' >> /tmp/bashrc; \
-		echo "export TERM" >> /tmp/bashrc; \
-		echo "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" >> /tmp/bashrc; \
-		echo "SSL_CERT_DIR=/etc/ssl/certs" >> /tmp/bashrc; \
-		echo "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt" >> /tmp/bashrc; \
-		echo "export SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE" >> /tmp/bashrc; \
-		echo 'export XDG_RUNTIME_DIR="$${XDG_RUNTIME_DIR:-/tmp/runtime-$$(id -u)}"' >> /tmp/bashrc; \
-		echo 'mkdir -p "$$XDG_RUNTIME_DIR" 2>/dev/null && chmod 1777 "$$XDG_RUNTIME_DIR" 2>/dev/null' >> /tmp/bashrc; \
-		echo '# Root HOME is "/" on AvoryOS: join the XDG defaults as ${HOME%/}/... so' >> /tmp/bashrc; \
-		echo '# sessions never export //.cache-style paths (WebKitGTK rejects those).' >> /tmp/bashrc; \
-		echo '_avory_home="$${HOME:-/}"; _avory_home="$${_avory_home%/}"' >> /tmp/bashrc; \
-		echo 'export XDG_CONFIG_HOME="$${XDG_CONFIG_HOME:-$${_avory_home}/.config}"' >> /tmp/bashrc; \
-		echo 'export XDG_CACHE_HOME="$${XDG_CACHE_HOME:-$${_avory_home}/.cache}"' >> /tmp/bashrc; \
-		echo 'export XDG_DATA_HOME="$${XDG_DATA_HOME:-$${_avory_home}/.local/share}"' >> /tmp/bashrc; \
-		echo 'export XDG_STATE_HOME="$${XDG_STATE_HOME:-$${_avory_home}/.local/state}"' >> /tmp/bashrc; \
-		echo 'unset _avory_home' >> /tmp/bashrc; \
-		debugfs -w -R "mkdir etc" ./part.img >/dev/null 2>&1 || true; \
-		echo "nameserver 10.0.2.3" > /tmp/resolv.conf; \
-		echo "127.0.0.1 localhost" > /tmp/hosts; \
-		debugfs -w -R "rm etc/resolv.conf" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write /tmp/resolv.conf etc/resolv.conf" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm etc/hosts" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write /tmp/hosts etc/hosts" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "mkdir etc/ssl" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "mkdir etc/ssl/certs" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm etc/ssl/certs/ca-certificates.crt" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write build/alpine/rootfs/etc/ssl/certs/ca-certificates.crt etc/ssl/certs/ca-certificates.crt" ./part.img >/dev/null 2>&1 || true; \
-		echo "NAME=\"AvoryOS\"" > /tmp/os-release; \
-		echo "ID=avoryos" >> /tmp/os-release; \
-		echo "VERSION=\"2.5.0 Beta\"" >> /tmp/os-release; \
-		echo "VERSION_ID=2.5.0-beta" >> /tmp/os-release; \
-		echo "PRETTY_NAME=\"AvoryOS 2.5.0 Beta x86_64\"" >> /tmp/os-release; \
-		echo "HOME_URL=\"https://github.com/Hidotu-Labs/AvoryOS\"" >> /tmp/os-release; \
-		debugfs -w -R "rm etc/os-release" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write /tmp/os-release etc/os-release" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm usr/lib/os-release" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write /tmp/os-release usr/lib/os-release" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm .bashrc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write /tmp/bashrc .bashrc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm etc/profile" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write /tmp/bashrc etc/profile" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm etc/bash.bashrc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write /tmp/bashrc etc/bash.bashrc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "mkdir .config" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "mkdir .config/fastfetch" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "mkdir fastfetch" ./part.img >/dev/null 2>&1 || true; \
-		echo '{"general": {"detectVersion": false}, "logo": {"source": "/fastfetch/logo.txt", "type": "auto"}, "modules": ["title", "separator", "os", "kernel", "uptime", "packages", {"type": "shell", "format": "bash"}, "de", "wm", "terminal", "cursor", "cpu", "gpu", "memory", "swap", "disk", {"type": "localip", "key": "Local IP", "showIpv6": false}, "locale", "break", "colors"]}' > /tmp/ff_config.jsonc; \
-		debugfs -w -R "rm .config/fastfetch/config.jsonc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write /tmp/ff_config.jsonc .config/fastfetch/config.jsonc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm fastfetch/config.jsonc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write /tmp/ff_config.jsonc fastfetch/config.jsonc" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm fastfetch/logo.txt" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write assets/ascii-art.txt fastfetch/logo.txt" ./part.img >/dev/null 2>&1 || true; \
-		rm -f /tmp/bashrc /tmp/resolv.conf /tmp/hosts /tmp/ff_config.jsonc /tmp/os-release; \
-	fi
+	@echo "Applying AvoryOS image defaults..."
+	@bash scripts/configure-image-root.sh ./part.img build/arch/rootfs
 	@if [ -f userland/winoptions ] && [ -f userland/icewm-menu ]; then \
 		echo "Installing IceWM configuration into disk image..."; \
 		debugfs -w -R "mkdir etc/icewm" ./part.img >/dev/null 2>&1 || true; \
@@ -1236,33 +913,11 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		debugfs -w -R "rm etc/icewm/menu" ./part.img >/dev/null 2>&1 || true; \
 		debugfs -w -R "write userland/icewm-menu etc/icewm/menu" ./part.img >/dev/null 2>&1 || true; \
 	fi
-	@if [ -f userland/doom_x11.elf ]; then \
-		echo "Installing doom_x11 into disk image..."; \
-		debugfs -w -R "rm bin/doom_x11" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write userland/doom_x11.elf bin/doom_x11" ./part.img >/dev/null 2>&1 || true; \
-	fi
-	@if [ -f userland/qt5_test.elf ]; then \
-		echo "Installing qt5_test into disk image..."; \
-		debugfs -w -R "rm bin/qt5_test" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write userland/qt5_test.elf bin/qt5_test" ./part.img >/dev/null 2>&1 || true; \
-	fi
-
 	@echo "Fixing executable modes for directly injected launchers..."
 	@{ \
-		echo "rm bin/ls"; \
-		echo "symlink bin/ls /opt/coreutils/bin/ls"; \
-		echo "set_inode_field bin/bash mode 0100755"; \
 		echo "set_inode_field bin/avory-login mode 0100755"; \
 		echo "set_inode_field bin/avory-installer mode 0100755"; \
 		echo "set_inode_field usr/sbin/avory-installer mode 0100755"; \
-		echo "set_inode_field bin/avoryd mode 0100755"; \
-		echo "set_inode_field bin/sax11.sh mode 0100755"; \
-		echo "set_inode_field bin/sawayland.sh mode 0100755"; \
-		echo "set_inode_field bin/AetherWM mode 0100755"; \
-		echo "set_inode_field bin/aether-dock mode 0100755"; \
-		echo "set_inode_field bin/aether-panel mode 0100755"; \
-		echo "set_inode_field bin/aether-compositor mode 0100755"; \
-		echo "set_inode_field bin/aether-window mode 0100755"; \
 		echo "set_inode_field bin/test_cred mode 0100755"; \
 		echo "set_inode_field bin/test_accounts mode 0100755"; \
 		echo "set_inode_field bin/test_hugepages mode 0100755"; \
@@ -1299,15 +954,30 @@ disk.img: assets/boot.wav userland/test.c assets/test.wav assets/jane.mp3 assets
 		echo "set_inode_field .cache mode 040777"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
 
+	@mkdir -p $(dir $(DISK_PARTITION_CACHE))
+	@rm -f $(DISK_PARTITION_CACHE)
 	@if [ -L ./part.img ]; then \
 		loop=$$(readlink ./part.img); \
 		rm -f ./part.img; \
 		losetup -d "$$loop"; \
+		python3 scripts/incremental-disk-apps.py --cache-from-disk \
+			--disk disk.img --partition-cache $(DISK_PARTITION_CACHE); \
 	else \
 		dd if=./part.img of=disk.img bs=1M seek=1 conv=notrunc,sparse; \
-		rm -f ./part.img; \
+		mv ./part.img $(DISK_PARTITION_CACHE); \
 	fi
 	@touch disk.img
+	@python3 scripts/incremental-disk-apps.py --snapshot \
+		--disk disk.img --partition-cache $(DISK_PARTITION_CACHE) \
+		--manifest $(DISK_APP_MANIFEST) --makefile GNUmakefile \
+		--apps $(USERLAND_DISK_APPS)
+else
+disk.img:
+	@python3 scripts/incremental-disk-apps.py --update \
+		--disk disk.img --partition-cache $(DISK_PARTITION_CACHE) \
+		--manifest $(DISK_APP_MANIFEST) --makefile GNUmakefile \
+		--apps $(USERLAND_DISK_APPS)
+endif
 
 edk2-ovmf:
 	curl -L https://github.com/osdev0/edk2-ovmf-nightly/releases/latest/download/edk2-ovmf.tar.gz | gunzip | tar -xf -
@@ -1323,14 +993,16 @@ limine/limine:
 		LIBS="$(HOST_LIBS)"
 
 .PHONY: setup
-setup:
+setup: $(ARCH_STAMP)
 	chmod +x bootstrap.sh
-	./bootstrap.sh
+	AVORY_BOOTSTRAP_SKIP_ROOTFS=1 ./bootstrap.sh
 
 .PHONY: kernel
 kernel: setup
 	@if ! grep -qx 'tag=v6.18.42' kernel/linux/.pin 2>/dev/null || ! grep -qx 'commit=856a9b51680cbbed1ace1207b29e424a616cff48' kernel/linux/.pin 2>/dev/null; then scripts/linux-import.sh; fi
-	$(MAKE) -C kernel KPI_NOUVEAU=1
+	@BUILD_TAG=$$(python3 scripts/kernel-build-tag.py); \
+		$(MAKE) -C kernel KPI_NOUVEAU=1 BUILD_NAME='$(BUILD_NAME)' \
+		BUILD_VERSION='$(BUILD_VERSION)' BUILD_TAG="$$BUILD_TAG"
 	@mkdir -p build/nouveau-618
 	@cp kernel/bin-x86_64/kernel build/nouveau-618/kernel
 	@ln -sfn ../../kernel/linux build/nouveau-618/linux
@@ -1392,559 +1064,79 @@ clean:
 	rm -f $(IMAGE_NAME).iso
 
 .PHONY: clean-all
-clean-all: clean-doom clean-coreutils clean-minimal
+clean-all: clean-minimal
 	$(MAKE) -C kernel clean
-	rm -rf iso_root $(IMAGE_NAME).iso $(IMAGE_NAME).hdd build/alpine
-
-.PHONY: clean-coreutils
-clean-coreutils:
-	rm -rf build/coreutils-9.5
-	rm -rf toolchain/glibc-sysroot/opt/coreutils
+	rm -rf iso_root $(IMAGE_NAME).iso $(IMAGE_NAME).hdd build/arch
 
 .PHONY: clean-disk
 clean-disk:
-	rm -f disk.img
+	rm -f disk.img $(DISK_PARTITION_CACHE) $(DISK_APP_MANIFEST)
 
 .PHONY: distclean
-distclean: clean-doom
+distclean:
 	$(MAKE) -C kernel distclean
-	rm -rf iso_root *.iso *.hdd limine edk2-ovmf doomgeneric
+	rm -rf iso_root *.iso *.hdd limine edk2-ovmf
 	rm -rf userland/kria-lang
 
-# ── Userland test programs ──────────────────────────────────────────────────
-.PHONY: test-phase6-login
+# Userland app build rules live in userland/GNUmakefile.
+.PHONY: userland-build kria gpu-diagnostics test-phase6-login
+userland-build: $(GLIBC_STAMP) $(ARCH_STAMP) $(GLIBC_TOOLCHAIN_STAMP)
+	$(MAKE) -C userland -f GNUmakefile all
+
+kria:
+	$(MAKE) -C userland -f GNUmakefile kria.elf
+
+gpu-diagnostics:
+	$(MAKE) -C userland -f GNUmakefile gpu-diagnostics
+
 test-phase6-login:
 	./scripts/test-phase6-login.sh
 
-userland/avoryd.elf: userland/avoryd.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/avoryd.c -o userland/avoryd.elf
-
-userland/avory-login.elf: userland/avory-login.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/avory-login.c -lcrypt -o userland/avory-login.elf
-
-userland/avory-installer.elf: userland/avory-installer.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/avory-installer.c -o userland/avory-installer.elf
-
-userland/nvme_test.elf: userland/nvme_test.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/nvme_test.c -o userland/nvme_test.elf -lpthread -lm
-
-userland/nvme_bench.elf: userland/nvme_bench.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/nvme_bench.c -o userland/nvme_bench.elf -lpthread
-
-userland/hello_glibc.elf: userland/hello_glibc.c
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/hello_glibc.c -o userland/hello_glibc.elf
-
-userland/test_cpp.elf: userland/test_cpp.cpp $(GLIBC_STAMP)
-	$(GLIBC_CXX) $(GLIBC_USER_CXXFLAGS) \
-		userland/test_cpp.cpp -o userland/test_cpp.elf
-
-userland/kilo.c:
-	curl -L https://raw.githubusercontent.com/antirez/kilo/master/kilo.c -o userland/kilo.c
-
-userland/kilo.elf: userland/kilo.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/kilo.c -o userland/kilo.elf
-
-userland/ls.elf: userland/ls.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/ls.c -o userland/ls.elf
-
-userland/lspci.elf: userland/lspci.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/lspci.c -o userland/lspci.elf
-
-userland/lsblk.elf: userland/lsblk.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/lsblk.c -o userland/lsblk.elf
-
-userland/readelf.elf: userland/readelf.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/readelf.c -o userland/readelf.elf
-
-userland/pong.elf: userland/pong.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/pong.c -o userland/pong.elf \
-		-lm
-
-userland/raycast.elf: userland/raycast.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/raycast.c -lm -o userland/raycast.elf
-
-userland/asplay.elf: userland/asplay.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/asplay.c -o userland/asplay.elf
-
-userland/booter.elf: userland/booter.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/booter.c -o userland/booter.elf
-
-userland/reboot.elf: userland/reboot.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/reboot.c -o userland/reboot.elf
-
-userland/shutdown.elf: userland/shutdown.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/shutdown.c -o userland/shutdown.elf
-
-userland/dns_lookup.elf: userland/dns_lookup.c userland/dns_resolver.c userland/dns_resolver.h $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/dns_lookup.c userland/dns_resolver.c -o userland/dns_lookup.elf
-
-# Kria programming language (Rust-based, compiled with musl for static linking)
-userland/kria-lang:
-	rm -rf userland/kria-lang
-	git clone https://github.com/Piotriox/kria-lang.git userland/kria-lang
-	mkdir -p userland/kria-lang/.cargo
-	echo '[build]' > userland/kria-lang/.cargo/config.toml
-	echo 'target = "x86_64-unknown-linux-musl"' >> userland/kria-lang/.cargo/config.toml
-
-userland/kria.elf: userland/kria-lang
-	cd userland/kria-lang && cargo build --release
-	cp userland/kria-lang/target/x86_64-unknown-linux-musl/release/kria userland/kria.elf
-
-.PHONY: kria
-kria: userland/kria.elf
-
-# ── DOOM (doomgeneric) ──────────────────────────────────────────────────────
-.PHONY: doom
-doom: userland/doom.elf
-
-doomgeneric:
-	rm -rf doomgeneric
-	git clone https://github.com/ozkl/doomgeneric.git --depth=1
-
-userland/doom.elf userland/doom_x11.elf: doomgeneric $(GLIBC_STAMP) $(ALPINE_STAMP)
-	$(MAKE) -C userland -f Makefile.avoryos \
-		GLIBC_CC="$(GLIBC_CC)" \
-		GLIBC_SYSROOT="$(GLIBC_SYSROOT)" \
-		ALPINE_SYSROOT="$(ALPINE_SYSROOT)"
-
-.PHONY: clean-doom
-clean-doom:
-	$(MAKE) -C userland -f Makefile.avoryos clean
-
-userland/gtk_test.elf: userland/gtk_test.c $(ALPINE_STAMP) $(GLIBC_STAMP)
-	@echo "[*] Compiling userland/gtk_test.c (GTK2) ..."
-	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 \
-		userland/gtk_test.c \
-		-o userland/gtk_test.elf \
-		$(GTK2_INCLUDES) \
-		$(GTK2_LIBS) \
-		$(GTK2_LDFLAGS)
-
-userland/gtk3_test.elf: userland/gtk3_test.c $(ALPINE_STAMP) $(GLIBC_STAMP)
-	@echo "[*] Compiling userland/gtk3_test.c (GTK3) ..."
-	$(GLIBC_CC) --sysroot=$(ALPINE_SYSROOT) -O2 \
-		userland/gtk3_test.c \
-		-o userland/gtk3_test.elf \
-		$(GTK3_INCLUDES) \
-		$(GTK3_LIBS) \
-		$(GTK3_LDFLAGS)
-
-userland/qt5_test.elf: userland/qt5_test.cpp $(ALPINE_STAMP) $(GLIBC_STAMP)
-	$(GLIBC_CXX) --sysroot=$(ALPINE_SYSROOT) -O2 -std=c++14 \
-		userland/qt5_test.cpp \
-		-o userland/qt5_test.elf \
-		$(QT5_CXXFLAGS) \
-		$(QT5_INCLUDES) \
-		$(QT5_LIBS) \
-		$(QT5_LDFLAGS)
-
-userland/test_mem_stress.elf: userland/test_mem_stress.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_mem_stress.c -o userland/test_mem_stress.elf
-
-userland/test_clone_futex.elf: userland/test_clone_futex.c userland/test_clone_futex_trampoline.S $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_clone_futex.c userland/test_clone_futex_trampoline.S -o userland/test_clone_futex.elf
-
-userland/test_futex_pi.elf: userland/test_futex_pi.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_futex_pi.c -o userland/test_futex_pi.elf -lpthread -lm
-
-userland/test_signal_stack.elf: userland/test_signal_stack.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_signal_stack.c -o userland/test_signal_stack.elf -lpthread
-
-userland/test_user_dispatch.elf: userland/test_user_dispatch.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_user_dispatch.c -o userland/test_user_dispatch.elf
-
-userland/test_futex_clock.elf: userland/test_futex_clock.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_futex_clock.c -o userland/test_futex_clock.elf
-
-userland/test_tlb_stress.elf: userland/test_tlb_stress.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_tlb_stress.c -o userland/test_tlb_stress.elf -lpthread
-
-userland/test_syscompat.elf: userland/test_syscompat.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_syscompat.c -o userland/test_syscompat.elf
-
-userland/test_unix_sockets.elf: userland/test_unix_sockets.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_unix_sockets.c -o userland/test_unix_sockets.elf
-
-userland/test_tmpfile.elf: userland/test_tmpfile.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_tmpfile.c -o userland/test_tmpfile.elf
-
-# Phase 2 LinuxKPI /dev/kpi_dmabuf test; shares the device ABI header with the
-# kernel side (kernel/linuxkpi/include/uapi/kpi_dmabuf.h).
-userland/test_kpi_dmabuf.elf: userland/test_kpi_dmabuf.c $(GLIBC_STAMP) \
-		kernel/linuxkpi/include/uapi/kpi_dmabuf.h
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		-I$(CURDIR)/kernel/linuxkpi/include \
-		userland/test_kpi_dmabuf.c -o userland/test_kpi_dmabuf.elf -lpthread
-
-# Native syscall restart regression using interruptible LinuxKPI fence waits.
-userland/test_syscall_restart.elf: userland/test_syscall_restart.c $(GLIBC_STAMP) \
-		kernel/linuxkpi/include/uapi/kpi_dmabuf.h
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		-I$(CURDIR)/kernel/linuxkpi/include \
-		userland/test_syscall_restart.c -o userland/test_syscall_restart.elf
-
-# Phase 6 C5 amdgpu test: raw-ioctl GEM/PRIME/CTX/VM/BO_LIST, an SDMA copy
-# through AMDGPU_CS + WAIT_CS, and a 1k BO churn loop with a PMM invariant.
-userland/test_kpi_amdgpu.elf: userland/test_kpi_amdgpu.c $(GLIBC_STAMP) \
-		kernel/linuxkpi/include/uapi/kpi_dmabuf.h
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		-I$(CURDIR)/kernel/linuxkpi/include \
-		userland/test_kpi_amdgpu.c -o userland/test_kpi_amdgpu.elf
-
-# Phase 6 C7 radeonsi test: headless GBM/EGL/GLES on amdgpu's render node.
-# Unlike the raw-ioctl suites this one must be dynamically linked: it uses the
-# rootfs Mesa/GBM/EGL shared libraries (static Mesa is not packaged),
-# so it uses the guest glibc loader. It asserts the renderer is radeonsi,
-# renders timed frames (fps) and round-trips a dma-buf through EGL.
-userland/test_kpi_radeonsi.elf: userland/test_kpi_radeonsi.c $(GLIBC_STAMP) \
-		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		-I$(ALPINE_SYSROOT)/usr/include \
-		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
-		userland/test_kpi_radeonsi.c -o userland/test_kpi_radeonsi.elf \
-		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-		-lEGL -lgbm -lGLESv2 -ldrm -lm \
-		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-		-Wl,-rpath,/usr/lib \
-		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
-		-Wl,--allow-shlib-undefined
-
-# Bounded memory-lifetime diagnostic using the guest Mesa runtime.
-userland/radeonsi_vram_leak.elf: userland/radeonsi_vram_leak.c $(GLIBC_STAMP) \
-		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		-I$(ALPINE_SYSROOT)/usr/include \
-		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
-		$< -o $@ \
-		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-		-lEGL -lgbm -lGLESv2 -ldrm \
-		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-		-Wl,-rpath,/usr/lib \
-		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
-		-Wl,--allow-shlib-undefined
-
-# Offscreen asynchronous shader-constant oracle. Uses the original guest Mesa
-# runtime; building this diagnostic neither rebuilds Mesa nor updates disk.img.
-userland/test_gpu_constants.elf: userland/test_gpu_constants.c $(GLIBC_STAMP) \
-		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		-I$(ALPINE_SYSROOT)/usr/include \
-		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
-		userland/test_gpu_constants.c -o $@ \
-		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-		-lEGL -lgbm -lGLESv2 -ldrm -lm \
-		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-		-Wl,-rpath,/usr/lib \
-		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
-		-Wl,--allow-shlib-undefined
-
-userland/test_gpu_pipeline.elf: userland/test_gpu_pipeline.c $(GLIBC_STAMP) \
-		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		-I$(ALPINE_SYSROOT)/usr/include \
-		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
-		userland/test_gpu_pipeline.c -o $@ \
-		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-		-lEGL -lgbm -lGLESv2 -ldrm -lm \
-		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-		-Wl,-rpath,/usr/lib \
-		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
-		-Wl,--allow-shlib-undefined
-
-# Same CPU oracles through desktop OpenGL; GLES controls remain available.
-userland/test_gpu_pipeline_gl.elf: userland/test_gpu_pipeline.c $(GLIBC_STAMP) \
-		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -DPIPELINE_DESKTOP \
-		-I$(ALPINE_SYSROOT)/usr/include \
-		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
-		userland/test_gpu_pipeline.c -o $@ \
-		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-		-lEGL -lgbm -lGL -ldrm -lm \
-		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-		-Wl,-rpath,/usr/lib \
-		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
-		-Wl,--allow-shlib-undefined
-
-# Fog-independent framebuffer oracle with bounded PNG mismatch captures.
-userland/test_gpu_corruption.elf: userland/test_gpu_corruption.c $(GLIBC_STAMP) \
-		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		-I$(ALPINE_SYSROOT)/usr/include \
-		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
-		userland/test_gpu_corruption.c -o $@ \
-		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-		-lEGL -lgbm -lGL -ldrm -lz \
-		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-		-Wl,-rpath,/usr/lib \
-		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
-		-Wl,--allow-shlib-undefined
-
-# Depth/stencil/reuse/MSAA oracle independent of presentation.
-userland/test_gpu_depth.elf: userland/test_gpu_depth.c $(GLIBC_STAMP) \
-		$(ALPINE_SYSROOT)/usr/lib/libEGL.so
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		-I$(ALPINE_SYSROOT)/usr/include \
-		-I$(ALPINE_SYSROOT)/usr/include/libdrm \
-		userland/test_gpu_depth.c -o $@ \
-		-L$(GLIBC_SYSROOT)/lib -L$(ALPINE_SYSROOT)/usr/lib -L$(ALPINE_SYSROOT)/lib \
-		-lEGL -lgbm -lGL -ldrm -lm \
-		-Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
-		-Wl,-rpath,/usr/lib \
-		-Wl,-rpath-link,$(ALPINE_SYSROOT)/usr/lib:$(ALPINE_SYSROOT)/lib \
-		-Wl,--allow-shlib-undefined
-
-.PHONY: gpu-diagnostics
-gpu-diagnostics: userland/test_gpu_corruption.elf userland/test_gpu_depth.elf userland/test_gpu_constants.elf userland/test_gpu_pipeline.elf userland/test_gpu_pipeline_gl.elf userland/radeonsi_vram_leak.elf
-	mkdir -p build/gpu-diagnostics
-	install -m 0755 userland/test_gpu_corruption.elf build/gpu-diagnostics/test_gpu_corruption
-	install -m 0755 userland/test_gpu_depth.elf build/gpu-diagnostics/test_gpu_depth
-	install -m 0755 userland/test_gpu_constants.elf build/gpu-diagnostics/test_gpu_constants
-	install -m 0755 userland/test_gpu_pipeline.elf build/gpu-diagnostics/test_gpu_pipeline
-	install -m 0755 userland/test_gpu_pipeline_gl.elf build/gpu-diagnostics/test_gpu_pipeline_gl
-	install -m 0755 userland/radeonsi_vram_leak.elf build/gpu-diagnostics/radeonsi_vram_leak.elf
-	install -m 0755 scripts/gpu-debug-capture.sh build/gpu-diagnostics/gpu-debug-capture
-	install -m 0755 scripts/gpu-first-boot-capture.sh build/gpu-diagnostics/gpu-first-boot-capture.sh
-	@echo 'Diagnostics ready. Serve to the QEMU guest with:'
-	@echo 'python3 -m http.server 9007 --bind 127.0.0.1 --directory build/gpu-diagnostics'
-
-# Phase 3 LinuxKPI DRM test: vkms dumb-buffer GEM mmap/write, renderD128
-# sanity and a modetest-lite atomic enable/disable.
-userland/test_kpi_drm.elf: userland/test_kpi_drm.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_kpi_drm.c -o userland/test_kpi_drm.elf
-
-userland/drm_identify.elf: userland/drm_identify.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -I kernel/linux/include/uapi/drm \
-		userland/drm_identify.c -o userland/drm_identify.elf
-
-# Phase 4 C5 bochs canary: card discovery by DRM version name, dumb-buffer
-# mmap write/read and a full-CRTC atomic enable/disable.
-userland/test_kpi_bochs.elf: userland/test_kpi_bochs.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_kpi_bochs.c -o userland/test_kpi_bochs.elf
-
-userland/test_child_notify.elf: userland/test_child_notify.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_child_notify.c -o userland/test_child_notify.elf
-
-userland/test_pty_master.elf: userland/test_pty_master.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_pty_master.c -o userland/test_pty_master.elf
-
-userland/test_syscall_speed.elf: userland/test_syscall_speed.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_syscall_speed.c -o userland/test_syscall_speed.elf
-
-userland/test_mm_speed.elf: userland/test_mm_speed.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_mm_speed.c -o userland/test_mm_speed.elf
-
-userland/test_journal_speed.elf: userland/test_journal_speed.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_journal_speed.c -o userland/test_journal_speed.elf -lpthread
-
-userland/test_syscall_cpu.elf: userland/test_syscall_cpu.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_syscall_cpu.c -o userland/test_syscall_cpu.elf
-
-userland/test_blocking_liveness.elf: userland/test_blocking_liveness.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_blocking_liveness.c -o userland/test_blocking_liveness.elf -lpthread
-
-userland/test_hugepages.elf: userland/test_hugepages.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_hugepages.c -o userland/test_hugepages.elf
-
-userland/test_zero_page.elf: userland/test_zero_page.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_zero_page.c -o userland/test_zero_page.elf
-
-userland/test_watchdog.elf: userland/test_watchdog.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_watchdog.c -o userland/test_watchdog.elf
-
-userland/test_copy_user.elf: userland/test_copy_user.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_copy_user.c -o userland/test_copy_user.elf
-
-userland/test_pcp_pmm.elf: userland/test_pcp_pmm.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_pcp_pmm.c -o userland/test_pcp_pmm.elf -lpthread -lm
-
-userland/test_ticket_lock.elf: userland/test_ticket_lock.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_ticket_lock.c -o userland/test_ticket_lock.elf -lpthread -lm
-
-userland/test_fb_perf.elf: userland/test_fb_perf.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_fb_perf.c -o userland/test_fb_perf.elf -lpthread -lm
-
-userland/test_vdso_bench.elf: userland/test_vdso_bench.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_vdso_bench.c -o userland/test_vdso_bench.elf
-
-userland/test_elf32.elf: userland/test_elf32.asm
-	mkdir -p build
-	nasm -f elf32 $< -o build/test_elf32.o
-	ld -m elf_i386 -static -z max-page-size=0x1000 -o $@ build/test_elf32.o
-
-userland/test_lazy_fpu.elf: userland/test_lazy_fpu.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_lazy_fpu.c -o userland/test_lazy_fpu.elf -lpthread -lm
-
-userland/test_heap_smp.elf: userland/test_heap_smp.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_heap_smp.c -o userland/test_heap_smp.elf -lpthread -lm
-
-userland/test_dcache.elf: userland/test_dcache.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_dcache.c -o userland/test_dcache.elf
-
-userland/test_uaccess_bench.elf: userland/test_uaccess_bench.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_uaccess_bench.c -o userland/test_uaccess_bench.elf
-
-userland/test_readahead.elf: userland/test_readahead.c $(GLIBC_STAMP)
-
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/test_readahead.c -o userland/test_readahead.elf
-
-userland/proc_bench.elf: userland/proc_bench.c userland/proc_bench_trampoline.S $(GLIBC_STAMP)
-
-
-
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/proc_bench.c userland/proc_bench_trampoline.S -o userland/proc_bench.elf
-
-
-userland/panic_test.elf: userland/panic_test.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		userland/panic_test.c -o userland/panic_test.elf
-
-userland/classicube.elf: $(ALPINE_STAMP) $(GLIBC_STAMP) scripts/build-classicube.sh
-	./scripts/build-classicube.sh
-
-userland/about.elf: userland/about.c scripts/build-about.sh $(ALPINE_STAMP) $(GLIBC_STAMP)
-	./scripts/build-about.sh
-
-userland/texpacks/classicube.zip:
-	@echo "ERROR: userland/texpacks/classicube.zip not found."
-	@echo "Please place the original ClassiCube texture pack zip at: userland/texpacks/classicube.zip"
-	@exit 1
-
-userland/terrain.png: userland/texpacks/classicube.zip
-	@echo "Extracting terrain.png from classicube.zip..."
-	cd userland && unzip -o texpacks/classicube.zip terrain.png
+# Root image recipes depend on these paths; delegate each app build to its local
+# userland makefile so callers can keep using `make userland/foo.elf`.
+userland/%.elf: userland/GNUmakefile config/userland-link.ld $(GLIBC_STAMP) $(GLIBC_TOOLCHAIN_STAMP)
+	$(MAKE) -C userland -f GNUmakefile $*.elf
+
+userland/test_kpi_radeonsi.elf userland/radeonsi_vram_leak.elf \
+userland/test_gpu_constants.elf userland/test_gpu_pipeline.elf \
+userland/test_gpu_pipeline_gl.elf userland/test_gpu_corruption.elf \
+userland/test_gpu_depth.elf userland/classicube.elf:
+	$(MAKE) -C userland -f GNUmakefile $(@F)
+
+userland/terrain.png:
+	$(MAKE) -C userland -f GNUmakefile terrain.png
 
 .PHONY: all qemu clean
 
-# Nouveau C4 candidates and isolated probe fixtures. No target rebinds PCI.
-NOUVEAU_GPU ?=
-NOUVEAU_CPUS ?= 1
-NOUVEAU_HOST_ON_IGPU ?= 0
-NOUVEAU_READINESS ?= build/nouveau-c4/readiness-handoff-$(NOUVEAU_CPUS)cpu/result.json
-NOUVEAU_ROM ?=
-NOUVEAU_SERIAL_LOG ?=
-NOUVEAU_DISPLAY ?= none
-NOUVEAU_OUT ?= build/nouveau-c4/hardware
-.PHONY: nouveau-c4 nouveau-preflight run-nouveau-software prepare-nouveau run-nouveau
-nouveau-c4:
-	python3 scripts/nouveau-c4-build.py
-nouveau-preflight:
-	python3 scripts/nouveau-boot.py --preflight --gpu '$(NOUVEAU_GPU)'
-run-nouveau-software: nouveau-c4
-	python3 scripts/nouveau-boot.py --software --run --cpus $(NOUVEAU_CPUS) --output-dir build/nouveau-c4/readiness-handoff-$(NOUVEAU_CPUS)cpu
-prepare-nouveau: $(NOUVEAU_OUT)/boot.iso
-
-# Fixture preparation only runs when the candidate kernel changes; otherwise
-# the existing boot.iso/root.img pair is reused as-is.
-$(NOUVEAU_OUT)/boot.iso: build/nouveau-c4/kernel
-	python3 scripts/nouveau-boot.py --gpu '$(NOUVEAU_GPU)' --cpus '$(NOUVEAU_CPUS)' --output-dir '$(NOUVEAU_OUT)' $(if $(NOUVEAU_ROM),--rom '$(NOUVEAU_ROM)',)
-
-# Use the checked runner for exact kernel/firmware readiness, exclusive log
-# ownership, retained per-run host errors and bounded shutdown diagnostics.
-NOUVEAU_FULL_SCREEN ?= off
-
-run-nouveau: build/nouveau-c4/kernel
-	python3 scripts/nouveau-boot.py --run --gpu '$(NOUVEAU_GPU)' --cpus '$(NOUVEAU_CPUS)' \
-		--output-dir '$(NOUVEAU_OUT)' --readiness '$(NOUVEAU_READINESS)' \
-		--display '$(NOUVEAU_DISPLAY)' --full-screen '$(NOUVEAU_FULL_SCREEN)' \
-		$(if $(filter 1,$(NOUVEAU_HOST_ON_IGPU)),--host-on-igpu,) \
-		$(if $(NOUVEAU_ROM),--rom '$(NOUVEAU_ROM)',) \
-		$(if $(NOUVEAU_SERIAL_LOG),--serial-log '$(NOUVEAU_SERIAL_LOG)' --live-serial,) \
-		--qemu-extra '$(QEMU_EXTRA)'
-
-# Legacy 6.12 interactive C4 target. It remains available under the original
-# spelling while the correctly spelled target below boots the isolated 6.18
-# candidate that passed the 570.144 GSP initialization test.
-.PHONY: run-nouevau-c4
-# Finish firmware publication before the normal kernel/ISO prerequisites even
-# with make -j; the kernel includes the generated firmware manifest header.
-.NOTPARALLEL: run-nouevau-c4
-run-nouevau-c4: export KPI_NOUVEAU = 1
-run-nouevau-c4: KERNEL_CMDLINE = init=/sbin/init splash quiet kpi_amdgpu=0 kpi_nouveau=1 kpi_nouveau_bdf=0000:00:03.0 nouveau.modeset=1 nouveau.runpm=0 nouveau.config=NvGspRm=1 nouveau.gsp_kvm_passthrough=1 nouveau.debug=info,gsp=trace drm.debug=0x4
-run-nouevau-c4: VFIO_BDF = 0000:01:00.0
-run-nouevau-c4: VFIO_ROM =
-run-nouevau-c4: VFIO_DEVICE_EXTRA = ,multifunction=on
-run-nouevau-c4: VFIO_LAUNCHER =
-run-nouevau-c4: VFIO_SMP = 8
-run-nouevau-c4: VFIO_POINTER = usb-mouse
-run-nouevau-c4: GTK_SHOW_CURSOR = off
-run-nouevau-c4: DISPLAY_OPT = -display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=$(GTK_SHOW_CURSOR),window-close=$(GTK_WINDOW_CLOSE)
-run-nouevau-c4: SERIAL = chardev:nouveau-diag
-run-nouevau-c4: RUN_NIC_ADDR = 08.0
-run-nouevau-c4: VFIO_EXTRA = -device vfio-pci,host=0000:01:00.1,addr=03.1 -chardev file,id=nouveau-diag,path=build/logs/nouveau-c4.log,append=on $(RUN_NET_FLAGS)
-run-nouevau-c4: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
-run-nouevau-c4: nouveau-desktop-firmware run-vfio
+# Main Nouveau desktop run target: use the verified 6.18 / 570.144 ISO.
 NOUVEAU_SMP ?= 8
 NOUVEAU_PRESENT_BATCH ?= 1
 NOUVEAU_DEBUG ?= info
 NOUVEAU_DRM_DEBUG ?= 0
 NOUVEAU_GPU_DIAG ?= 0
 NOUVEAU_PERF ?= 1
+# Prefer the 60 Hz display-info mode for the CPU-copy virtual scanout.
+# High-refresh EDID modes add compositor work and reduce uncapped client FPS.
+NOUVEAU_VIRTIO_EDID ?= off
 NOUVEAU_618_CMDLINE := init=/sbin/init splash quiet kpi_amdgpu=1 kpi_nouveau=1 kpi_nouveau_remove_on_shutdown=1 kpi_nouveau_bdf=0000:01:00.0 nouveau.modeset=1 nouveau.runpm=0 nouveau.config=NvGspRm=1 nouveau.debug=$(NOUVEAU_DEBUG) drm.debug=$(NOUVEAU_DRM_DEBUG) virtio_gpu.present_batch=$(NOUVEAU_PRESENT_BATCH) gpu_diag=$(NOUVEAU_GPU_DIAG) gpu_perf=$(NOUVEAU_PERF)
 
-.PHONY: nouveau-618-desktop-firmware run-nouveau-c4
-nouveau-618-desktop-firmware: kernel $(RUN_DISK_DEP)
+.PHONY: nouveau-618-desktop-firmware nouveau-firmware run-nouveau
+nouveau-618-desktop-firmware: kernel disk.img
 	python3 scripts/nouveau-firmware-stage.py --interface 570.144 --output build/nouveau-618/firmware
 	python3 scripts/image-add-firmware.py disk.img build/nouveau-618/firmware
 
-# The run target uses the normal ISO path but never rebuilds it as a side effect.
-# Full 6.18 / 570.144 interactive boot using the ordinary Limine menu, installed
-# writable desktop disk, display, audio, network, keyboard and mouse. QEMU is
-# launched directly, with serial appended to build/logs/nouveau-c4.log.
-# Keep the C4 guest at eight vCPUs.
-.NOTPARALLEL: run-nouveau-c4
-run-nouveau-c4:
+# `make` builds the ISO and desktop firmware first. This target validates the
+# ready-to-boot artifacts and host passthrough setup, then launches the normal
+# installed desktop without rebuilding the ISO as a side effect.
+.NOTPARALLEL: run-nouveau
+run-nouveau:
 	@test -f avoryos-x86_64.iso || { echo 'Run make first to build the main Nouveau ISO.' >&2; exit 1; }
+	@test -f disk.img || { echo 'Run make first to build the Nouveau desktop disk.' >&2; exit 1; }
+	@test ! kernel/bin-x86_64/kernel -nt avoryos-x86_64.iso || { echo 'The boot ISO predates the compiled kernel; run make before launching Nouveau.' >&2; exit 1; }
+	@stale="$$(find kernel/src kernel/linuxkpi -type f -newer avoryos-x86_64.iso -print -quit)"; \
+		if [ -n "$$stale" ] || [ kernel/GNUmakefile -nt avoryos-x86_64.iso ]; then \
+			echo "The boot ISO predates kernel sources ($${stale:-kernel/GNUmakefile}); run make before launching Nouveau." >&2; exit 1; \
+		fi
 	@test -f build/nouveau-618/avoryos-x86_64.iso.sha256 && sha256sum --check --status build/nouveau-618/avoryos-x86_64.iso.sha256 || { echo 'The main AvoryOS ISO changed; run make to rebuild it.' >&2; exit 1; }
 	@printf '%s\n' '$(NOUVEAU_618_CMDLINE)' | cmp -s - build/nouveau-618/desktop-cmdline || { echo 'The main ISO has different boot options; run make to rebuild it.' >&2; exit 1; }
 	@test -f build/nouveau/desktop-firmware.json || { echo 'Run make to install the Nouveau firmware into the desktop disk.' >&2; exit 1; }
@@ -1956,65 +1148,17 @@ run-nouveau-c4:
 	@test "$$(cat /sys/bus/pci/devices/0000:01:00.0/boot_vga)" = 0 || { echo 'Select the iGPU as the host display in UEFI first.' >&2; exit 1; }
 	@mkdir -p build/logs
 	$(MAKE) --no-print-directory run-vfio \
-		RUN_ISO=avoryos-x86_64.iso RUN_ISO_DEP= \
+		RUN_ISO=avoryos-x86_64.iso RUN_ISO_DEP= RUN_DISK_DEP= \
 		KERNEL_CMDLINE='$(NOUVEAU_618_CMDLINE)' \
 		VFIO_BDF=0000:01:00.0 VFIO_DEVICE_EXTRA=,multifunction=on VFIO_ROM= \
 		VFIO_GUEST_ADDRESS='bus=nouveau-port,addr=00.0' \
 		VFIO_PREDEVICES='-device pcie-root-port,id=nouveau-port,bus=pcie.0,addr=03.0,chassis=1,hotplug=off,pref64-reserve=32G -global q35-pcihost.pci-hole64-size=64G' \
 		VFIO_LAUNCHER= VFIO_SMP='$(NOUVEAU_SMP)' VFIO_POINTER=usb-mouse RUN_NIC_ADDR=08.0 \
+		VFIO_VIRTIO_GPU_EXTRA=',edid=$(NOUVEAU_VIRTIO_EDID)' \
 		SERIAL=chardev:nouveau-c4 \
 		DISPLAY_OPT='-display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=off,window-close=on' \
 		VFIO_EXTRA='-chardev socket,id=nouveau-c4,path=build/logs/nouveau-c4-serial.sock,server=on,wait=off,logfile=build/logs/nouveau-c4.log,logappend=on $(RUN_NET_FLAGS)'
 
-.PHONY: nouveau-firmware
-NOUVEAU_C6_READINESS ?= build/nouveau-c6/readiness-present-final/result.json
-NOUVEAU_C6_OUT ?= build/nouveau-c6/interactive-present
-.PHONY: run-nouveau-c6-prime
-run-nouveau-c6-prime:
-	python3 scripts/nouveau-boot.py --c6-present --run --display gtk \
-		--pcie-root-port --gpu-only --remove-on-shutdown \
-		--gpu 0000:01:00.0 --host-on-igpu --cpus 1 --timeout 240 \
-		--kernel build/nouveau-618/kernel --firmware-dir build/nouveau-618/firmware \
-		--readiness '$(NOUVEAU_C6_READINESS)' --output-dir '$(NOUVEAU_C6_OUT)'
-
 nouveau-firmware:
 	@mkdir -p build/logs
 	python3 scripts/nouveau-firmware-stage.py
-
-NOUVEAU_C6_FLIP_READINESS ?= build/nouveau-c6/readiness-flips-final/result.json
-NOUVEAU_C7_READINESS ?= build/nouveau-c7/bind-wait-candidate/readiness-final/result.json
-NOUVEAU_C7_OUT ?= build/nouveau-c7/interactive-xorg
-.PHONY: run-nouveau-c7-xorg
-run-nouveau-c7-xorg:
-	python3 scripts/nouveau-boot.py --c7-zink --c7-xorg --run --display gtk \
-		--pcie-root-port --gpu-only --remove-on-shutdown \
-		--gpu 0000:01:00.0 --host-on-igpu --cpus 1 --timeout 240 \
-		--kernel build/nouveau-618/kernel --firmware-dir build/nouveau-618/firmware \
-		--readiness '$(NOUVEAU_C7_READINESS)' --output-dir '$(NOUVEAU_C7_OUT)'
-
-NOUVEAU_C6_FLIP_OUT ?= build/nouveau-c6/interactive-flips
-.PHONY: run-nouveau-c6-flips
-run-nouveau-c6-flips:
-	python3 scripts/nouveau-boot.py --c6-flips --run --display gtk \
-		--pcie-root-port --gpu-only --remove-on-shutdown \
-		--gpu 0000:01:00.0 --host-on-igpu --cpus 1 --timeout 240 \
-		--kernel build/nouveau-618/kernel --firmware-dir build/nouveau-618/firmware \
-		--readiness '$(NOUVEAU_C6_FLIP_READINESS)' --output-dir '$(NOUVEAU_C6_FLIP_OUT)'
-
-NOUVEAU_C6_GPU_READINESS ?= build/nouveau-c6/readiness-gpu-present/result.json
-NOUVEAU_C6_GPU_OUT ?= build/nouveau-c6/interactive-gpu-present
-.PHONY: run-nouveau-c6-gpu-prime
-run-nouveau-c6-gpu-prime:
-	python3 scripts/nouveau-boot.py --c6-gpu-present --run --display gtk \
-		--pcie-root-port --gpu-only --remove-on-shutdown \
-		--gpu 0000:01:00.0 --host-on-igpu --cpus 1 --timeout 240 \
-		--kernel build/nouveau-618/kernel --firmware-dir build/nouveau-618/firmware \
-		--readiness '$(NOUVEAU_C6_GPU_READINESS)' --output-dir '$(NOUVEAU_C6_GPU_OUT)'
-
-.PHONY: nouveau-desktop-firmware
-nouveau-desktop-firmware: nouveau-firmware $(RUN_DISK_DEP)
-	python3 scripts/image-add-firmware.py disk.img build/nouveau/firmware
-
-
-build/nouveau-c4/kernel:
-	python3 scripts/nouveau-c4-build.py

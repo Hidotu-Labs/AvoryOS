@@ -1,6 +1,7 @@
 // AF_UNIX – Listen / connect / accept
 
 #include "af_unix_internal.h"
+#include "../apic/lapic_timer.h"
 
 static volatile uint32_t unix_missing_destination_logs;
 
@@ -27,6 +28,8 @@ int unix_listen_impl(socket_t *sock, int backlog) {
   usk->is_listener = true;
   usk->backlog = (backlog > 0) ? backlog : 128;
   sock->state = SS_LISTENING;
+  /* A larger backlog can make room for blocked connect() callers. */
+  wait_queue_wake_all(usk->wait);
 
   spinlock_release(&sock->lock);
 
@@ -135,6 +138,51 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
   unix_sock_t *server_usk = (unix_sock_t *)server_sock->sk;
   server_usk->passcred = dusk->passcred;
 
+  int connect_error = 0;
+  uint64_t deadline = usk->sndtimeo_ms > 0
+      ? lapic_timer_get_ticks() + (uint64_t)usk->sndtimeo_ms : 0;
+  spinlock_acquire(&listener_sock->lock);
+  for (;;) {
+    if (listener_sock->closing || listener_sock->state != SS_LISTENING) {
+      connect_error = -111; // ECONNREFUSED
+      goto connect_failed;
+    }
+    if (dusk->accept_queue_len < dusk->backlog)
+      break;
+    if ((sock->flags & SOCK_NONBLOCK) ||
+        (deadline && lapic_timer_get_ticks() >= deadline)) {
+      connect_error = -11; // EAGAIN, not a refusal by a live listener
+      goto connect_failed;
+    }
+    struct thread *current = sched_get_current();
+    if (!current || thread_has_pending_signal(current)) {
+      connect_error = -4; // EINTR
+      goto connect_failed;
+    }
+
+    /* On-demand Xwayland starts after the first client connects. Other
+     * clients must wait while its inherited listening socket fills up.
+     * Register under the listener lock so accept() cannot lose our wake. */
+    wait_queue_entry_t entry = {.thread = current};
+    current->state = THREAD_BLOCKED;
+    wait_queue_add(dusk->wait, &entry);
+    if (deadline) current->wakeup_ticks = deadline;
+    bool interrupted = thread_has_pending_signal(current);
+    if (interrupted) current->state = THREAD_RUNNING;
+    spinlock_release(&listener_sock->lock);
+    if (!interrupted) sched_yield();
+    wait_queue_remove(dusk->wait, &entry);
+    current->state = THREAD_RUNNING;
+    current->wakeup_ticks = 0;
+    spinlock_acquire(&listener_sock->lock);
+    if (thread_has_pending_signal(current)) {
+      connect_error = -4;
+      goto connect_failed;
+    }
+  }
+
+  /* Publish the connection only after reserving an accept-queue slot.
+   * Failed attempts must leave the client's state and peer link untouched. */
   usk->peer        = server_usk;
   server_usk->peer = usk;
 
@@ -155,27 +203,6 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
   server_usk->peer_cred_gid = usk->owner_gid;
   server_usk->peer_cred_valid = true;
   unix_cache_peer_groups(server_usk, usk);
-
-  spinlock_acquire(&listener_sock->lock);
-
-  if (listener_sock->closing || listener_sock->state != SS_LISTENING) {
-    spinlock_release(&listener_sock->lock);
-    usk->peer = NULL;
-    server_usk->peer = NULL;
-    socket_put(server_sock);
-    socket_put(listener_sock);
-    return -111; // ECONNREFUSED
-  }
-
-  if (dusk->accept_queue_len >= dusk->backlog) {
-    spinlock_release(&listener_sock->lock);
-    klog_puts("[WARN] unix_connect: listener backlog full\n");
-    usk->peer        = NULL;
-    server_usk->peer = NULL;
-    socket_put(server_sock);
-    socket_put(listener_sock);
-    return -111; // ECONNREFUSED
-  }
 
   // Enqueue server socket in listener's accept queue
   server_usk->accept_next = NULL;
@@ -207,6 +234,12 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
   spinlock_release(&listener_sock->lock);
   socket_put(listener_sock);
   return 0;
+
+connect_failed:
+  spinlock_release(&listener_sock->lock);
+  socket_put(server_sock);
+  socket_put(listener_sock);
+  return connect_error;
 }
 
 int unix_accept_impl(socket_t *sock, socket_t **newsock) {
@@ -256,6 +289,8 @@ int unix_accept_impl(socket_t *sock, socket_t **newsock) {
   unix_sock_t *new_usk   = usk->accept_next;
   usk->accept_next       = new_usk->accept_next;
   usk->accept_queue_len--;
+  /* connect() waiters sleep on this queue when the backlog is full. */
+  wait_queue_wake_all(usk->wait);
 
   spinlock_release(&sock->lock);
 

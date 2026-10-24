@@ -26,11 +26,13 @@ lib/radix-tree.c
 lib/idr.c
 
 # Phase 1 remaining library imports.  lib/crc32.c needs its private
-# crc32defs.h; linux-import.sh generates the slicing-by-8 crc32table.h.
+# crc32defs.h on older trees; linux-import.sh generates the slicing-by-8
+# crc32table.h. Linux 6.18 moved the implementation under lib/crc/ and
+# no longer ships that legacy private header.
 lib/math/rational.c
 lib/math/reciprocal_div.c
 lib/crc32.c
-lib/crc32defs.h
+?lib/crc32defs.h
 lib/xxhash.c
 lib/kfifo.c
 
@@ -98,4 +100,4 @@ drivers/gpu/drm/nouveau
 # Nouveau GPU virtual-address range tree and common GPUVM algorithms.
 lib/maple_tree.c
 ?drivers/gpu/drm/drm_gpuvm.c
-drivers/gpu/drm/drm_encoder_slave.c
+?drivers/gpu/drm/drm_encoder_slave.c

@@ -31,7 +31,7 @@ C6-qualified private kernel
 correct registered DRM sysfs identities. No kernel source or host GPU policy
 changed in this installation. Host preflight is healthy with no blockers.
 
-Boot on the host with `make run-nouveau-c4`. In the guest terminal:
+Boot on the host with `make run-nouveau`. In the guest terminal:
 
 ```sh
 VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nouveau_icd.json vulkaninfo --summary
@@ -91,7 +91,7 @@ added/updated. The previous disk/ISO are retained under
 `build/nouveau-c7/rollback-before-autodetect/`; the pre-C7 originals remain under
 `build/nouveau-c7/rollback/`.
 
-Boot with `make run-nouveau-c4`, open the normal desktop, and run `glxinfo -B`
+Boot with `make run-nouveau`, open the normal desktop, and run `glxinfo -B`
 without overrides. Require Zink/NVK/RTX 4060 Ti rather than llvmpipe. Full KDE
 session open/close/restart and resource-baseline acceptance remain pending;
 the isolated Xorg test is not a full desktop-session completion claim.
@@ -105,8 +105,8 @@ The launcher had been changed to eight vCPUs, outside the one-vCPU qualification
 `NOUVEAU_SMP` was then defaulted to one; an explicit `NOUVEAU_SMP=8` retained a controlled
 SMP comparison. That change is a diagnostic control, not proof of an SMP fix.
 
-At the owner's subsequent request, the interactive `run-nouveau-c4` target now
-defaults to eight vCPUs. `make run-nouveau-c4 NOUVEAU_SMP=1` retains the diagnostic
+At the owner's subsequent request, the interactive `run-nouveau` target now
+defaults to eight vCPUs. `make run-nouveau NOUVEAU_SMP=1` retains the diagnostic
 fallback. This default change does not extend the one-vCPU hardware qualification
 to eight vCPUs; private readiness/test targets keep their existing CPU counts.
 
@@ -162,7 +162,7 @@ remain evidence for their original scope only. This reproduction still omits
 KDE/KWin and Minecraft; passing it does not reproduce or fix the reported
 desktop channel failure. A kernel change is not justified by these passes.
 
-A full-desktop comparison was subsequently started through `run-nouveau-c4`
+A full-desktop comparison was subsequently started through `run-nouveau`
 with `-snapshot` and a private QMP socket. Its display is black, but the new
 dump shows Xorg in epoll rather than the earlier syncobj wait; no new channel
 kill appears in this capture. This is not yet a reproduction of the original
@@ -225,7 +225,7 @@ regression verifies recovery still works after the logging limit is reached.
 and `build/nouveau-618/kernel`. The old installed ISO, checksum, command line
 and kernel are retained under `bind-wait-candidate/rollback/`. Neither disk.img
 nor host reset/binding/power settings were modified. Post-test host preflight
-is healthy. `make run-nouveau-c4` boots the correction; the interactive C7 target
+is healthy. `make run-nouveau` boots the correction; the interactive C7 target
 now selects its matching software readiness result. Earlier C6/C7 artifacts
 remain scoped to their recorded kernel hashes and must not be relabeled.
 
@@ -291,6 +291,6 @@ directory. Manual Xorg launches from login shells therefore inherit
 A boot reporting `gsp-570.144.bin unavailable`, probe result `-2`, and
 `xorg-profile: native` is missing firmware, not merely an Xorg override.
 Rebuild with `make disk.img`, then boot the qualified Nouveau kernel with
-`make run-nouveau-c4`. Changing the disk does not enable Nouveau in a generic
+`make run-nouveau`. Changing the disk does not enable Nouveau in a generic
 kernel or add a passthrough GPU to a non-VFIO launch. The separate Alpine
 minimal image is not the qualified Arch NVK/Zink desktop stack.

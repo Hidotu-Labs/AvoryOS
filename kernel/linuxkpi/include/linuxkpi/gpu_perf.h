@@ -5,4 +5,9 @@ __UINT64_TYPE__ gpu_perf_ioctl_start(unsigned int request);
 void gpu_perf_ioctl_finish(unsigned int request, __UINT64_TYPE__ start, long result);
 void gpu_perf_dump(void);
 void gpu_perf_syncobj_ready(void);
+__UINT64_TYPE__ gpu_perf_syncobj_wait_start(void);
+void gpu_perf_syncobj_wait_finish(__UINT64_TYPE__ start, int polling, long result);
+void gpu_perf_syncobj_park(void *thread);
+void gpu_perf_syncobj_wake(void *thread);
+void gpu_perf_syncobj_resume(void *thread);
 #endif

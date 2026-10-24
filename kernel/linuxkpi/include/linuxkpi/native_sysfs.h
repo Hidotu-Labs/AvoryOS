@@ -21,10 +21,12 @@ void *asc_sysfs_class_dir(const char *name);
 /* A directory under a class dir (e.g. /sys/class/drm/card1). */
 void *asc_sysfs_device_dir(void *class_dir, const char *dev_name);
 void *asc_sysfs_drm_minor_add(void *class_dir, const char *name,
-                             const char *pci_bdf, unsigned int major,
+                             const char *pci_bdf, const char *parent_bus,
+                             const char *parent_name, unsigned int major,
                              unsigned int minor);
 void asc_sysfs_drm_minor_remove(void *class_dir, const char *name,
-                                const char *pci_bdf, unsigned int major,
+                                const char *pci_bdf, const char *parent_bus,
+                                const char *parent_name, unsigned int major,
                                 unsigned int minor);
 
 /* An existing sysfs directory by absolute path (e.g.

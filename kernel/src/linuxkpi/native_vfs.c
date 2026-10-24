@@ -9,6 +9,7 @@
 #include "sched/sched.h"
 #include "sched/wait.h"
 #include "fs/devfs.h"
+#include "socket/epoll.h"
 #include "fs/vfs.h"
 #include "lib/string.h"
 #include "mm/heap.h"
@@ -310,6 +311,14 @@ void *asc_vfs_poll_wq_alloc(void) {
     return NULL;
   wait_queue_init(wq);
   return wq;
+}
+
+/* Called while the KPI subscription lock excludes node/file teardown.
+ * Queue a candidate; epoll revalidates readiness through the driver's poll. */
+void asc_vfs_poll_notify(void *node, void *wq) {
+  if (wq)
+    wait_queue_wake_all(wq);
+  epoll_notify_event(node, 0xFFFFu);
 }
 
 void asc_vfs_poll_wq_free(void *wq) {

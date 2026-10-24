@@ -5,10 +5,25 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(dirname "$SCRIPT_DIR")
 ROOTFS_DIR=${1:?usage: configure-accounts.sh ROOTFS_DIR}
 
-DEFAULT_SHELL="/bin/sh"
-if [ -f "${ROOTFS_DIR}/opt/bash/bin/bash" ] || [ -f "${ROOT_DIR}/toolchain/glibc-sysroot/opt/bash/bin/bash" ]; then
-    DEFAULT_SHELL="/bin/bash"
+DEFAULT_SHELL="/bin/bash"
+
+# /tmp is mounted fresh at boot, hiding directories from the rootfs image.
+# KWin's Xwayland launcher requires these shared socket directories to exist;
+# rcS calls avory-early-init before starting desktop services. Preserve other
+# early-init hooks and replace this block when provisioning an existing tree.
+mkdir -p "${ROOTFS_DIR}/sbin"
+if [ ! -f "${ROOTFS_DIR}/sbin/avory-early-init" ]; then
+    printf '#!/bin/sh\n' > "${ROOTFS_DIR}/sbin/avory-early-init"
 fi
+sed -i '/^# BEGIN avory desktop sockets$/,/^# END avory desktop sockets$/d' \
+    "${ROOTFS_DIR}/sbin/avory-early-init"
+cat >> "${ROOTFS_DIR}/sbin/avory-early-init" << 'SOCKETS_EOF'
+# BEGIN avory desktop sockets
+mkdir -p /tmp/.X11-unix /tmp/.ICE-unix
+chmod 1777 /tmp/.X11-unix /tmp/.ICE-unix
+# END avory desktop sockets
+SOCKETS_EOF
+chmod 0755 "${ROOTFS_DIR}/sbin/avory-early-init"
 
 mkdir -p "${ROOTFS_DIR}/etc" "${ROOTFS_DIR}/home" "${ROOTFS_DIR}/etc/skel"
 sed -E "s/^([^:]+):x:/\1:!:/" "${ROOTFS_DIR}/etc/passwd" | \
@@ -22,6 +37,8 @@ chmod 0755 "${ROOTFS_DIR}/home"
 rm -rf "${ROOTFS_DIR}/root"
 mkdir -p "${ROOTFS_DIR}/root/.config/alacritty" "${ROOTFS_DIR}/root/.cache" "${ROOTFS_DIR}/root/.local/share"
 mkdir -p "${ROOTFS_DIR}/.config/alacritty" "${ROOTFS_DIR}/.cache" "${ROOTFS_DIR}/.local/share" "${ROOTFS_DIR}/.local/state"
+mkdir -p "${ROOTFS_DIR}/dev/dri"
+chmod 0755 "${ROOTFS_DIR}/dev/dri" 2>/dev/null || true
 chmod 0777 "${ROOTFS_DIR}/.config" "${ROOTFS_DIR}/.cache" "${ROOTFS_DIR}/.local" 2>/dev/null || true
 
 # Folder View defaults to desktop:/, which resolves through the user's XDG
@@ -30,6 +47,11 @@ chmod 0777 "${ROOTFS_DIR}/.config" "${ROOTFS_DIR}/.cache" "${ROOTFS_DIR}/.local"
 for desktop_home in "${ROOTFS_DIR}" "${ROOTFS_DIR}/root" \
     "${ROOTFS_DIR}/home/avory" "${ROOTFS_DIR}/etc/skel"; do
     mkdir -p "$desktop_home/.config"
+    # Seed default output layout so the visible monitor (HDMI-A-1) is enabled
+    # while the headless VKMS test output (Virtual-1) remains disabled.
+    if [ -f "${ROOT_DIR}/config/kwinoutputconfig.json" ]; then
+        cp -f "${ROOT_DIR}/config/kwinoutputconfig.json" "$desktop_home/.config/kwinoutputconfig.json"
+    fi
     for desktop_dir in Desktop Downloads Templates Public Documents Music Pictures Videos; do
         mkdir -p "$desktop_home/$desktop_dir"
     done
@@ -65,10 +87,22 @@ GLCore=false
 GLPlatformInterface=glx
 GLPreferBufferSwap=a
 OpenGLIsUnsafe=false
+
+[Wayland]
+AllowTearing=true
 KWINRC_EOF
 cp -f "${ROOTFS_DIR}/etc/xdg/kwinrc" "${ROOTFS_DIR}/.config/kwinrc"
 cp -f "${ROOTFS_DIR}/etc/xdg/kwinrc" "${ROOTFS_DIR}/root/.config/kwinrc"
 cp -f "${ROOTFS_DIR}/etc/xdg/kwinrc" "${ROOTFS_DIR}/home/avory/.config/kwinrc"
+
+# startplasma-wayland does not source /etc/profile.d. Select the connected
+# display before KWin starts, so its default layout cannot choose only the
+# headless VKMS test output. Plasma sources this directory for direct and
+# display-manager launches; avory-drm.sh preserves explicit GPU overrides.
+mkdir -p "${ROOTFS_DIR}/etc/xdg/plasma-workspace/env"
+cp -f "${ROOT_DIR}/initrd/avory-drm.sh" \
+    "${ROOTFS_DIR}/etc/xdg/plasma-workspace/env/avory-drm.sh"
+chmod 0644 "${ROOTFS_DIR}/etc/xdg/plasma-workspace/env/avory-drm.sh"
 
 # Xfwm4 ships with compositing enabled upstream, but write the channel default
 # explicitly so fresh AvoryOS accounts get the same behavior.
@@ -293,7 +327,7 @@ fi
 # from the environment (KWIN_COMPOSE exported by .xinitrc / the
 # startplasma-x11 wrapper) and kwinrc, so no per-binary shim is needed.
 # Unwrap any previous build's shim so a stale wrapper cannot survive a rebuild
-# (install_apk skips re-extracting kwin once its marker exists).
+# (install_arch skips re-extracting kwin once its marker exists).
 if [ -f "${ROOTFS_DIR}/usr/bin/kwin_x11-bin" ]; then
     if ! file "${ROOTFS_DIR}/usr/bin/kwin_x11-bin" | grep -q "ELF"; then
         echo "[!] kwin_x11-bin is not an ELF binary, leaving wrapper in place" >&2

@@ -163,9 +163,8 @@ def main():
                                 **gpu_exit.snapshot())
                 sync_json(run / 'launch.json', metadata)
                 if gpu_exit.initialized and not gpu_exit.shutdown_completed:
-                    print('QEMU exited without an observed guest AMDGPU shutdown callback; '
-                          'the GPU may retain state and fail the next initialization. '
-                          'Use Shutdown inside the guest on future sessions.', file=sys.stderr, flush=True)
+                    print('QEMU exited without an observed guest AMDGPU shutdown callback.',
+                          file=sys.stderr, flush=True)
                 process.stderr.close()
                 return process.returncode if process.returncode >= 0 else 128 - process.returncode
             finally:

@@ -30,9 +30,15 @@ setup_dep "kernel/cc-runtime" "$CC_RUNTIME_URL"
 setup_dep "kernel/limine-protocol" "$LIMINE_PROTOCOL_URL"
 setup_dep "kernel/freestnd-c-hdrs" "$FREESTND_C_HDRS_URL"
 setup_dep "AetherDE" "$AETHERDE_URL"
-echo "--- Setting up glibc toolchain ---"
+echo "--- Setting up prebuilt GCC cross-compiler ---"
 chmod +x scripts/glibc-toolchain.sh
 ./scripts/glibc-toolchain.sh
 
-echo "All dependencies have been set up."
+if [ "${AVORY_BOOTSTRAP_SKIP_ROOTFS:-0}" != "1" ]; then
+    echo "--- Setting up Axon root filesystem ---"
+    bash scripts/setup-rootfs.sh
+    mkdir -p build/arch
+    touch build/arch/.built
+fi
 
+echo "All dependencies have been set up."

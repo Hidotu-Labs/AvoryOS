@@ -43,7 +43,6 @@ SESSION_FILES = (
     'AetherDE/scripts/sax11.sh',
     'userland/avory-installer.c',
     'scripts/setup-arch.sh',
-    'scripts/avory-installer.sh',
     'scripts/build-minimal.sh',
 )
 
@@ -155,7 +154,7 @@ class SessionXdgEnvTests(unittest.TestCase):
             self.assertEqual(result.stdout, expected)
 
     def test_staged_xfce_xinitrc_is_patched(self):
-        staged = ROOT / 'build/alpine/rootfs/etc/xdg/xfce4/xinitrc'
+        staged = ROOT / 'build/arch/rootfs/etc/xdg/xfce4/xinitrc'
         if not staged.exists():
             self.skipTest('staged rootfs not present')
         text = staged.read_text(errors='replace')
@@ -200,7 +199,7 @@ class SessionXdgEnvTests(unittest.TestCase):
             self.assertEqual(result.stdout, expected)
 
     def test_staged_plasma_launcher_handles_root_home(self):
-        staged = ROOT / 'build/alpine/rootfs/usr/bin/startplasma-x11'
+        staged = ROOT / 'build/arch/rootfs/usr/bin/startplasma-x11'
         if not staged.exists():
             self.skipTest('staged rootfs not present')
         text = staged.read_text(errors='replace')
@@ -243,17 +242,13 @@ class SessionXdgEnvTests(unittest.TestCase):
                          script)
 
     def test_direct_boot_scripts_are_gone(self):
-        for relative in ('initrd/startw.sh', 'initrd/startx.sh',
-                         'initrd/avoryd/services/wayland.service',
-                         'initrd/avoryd/services/x11.service'):
+        for relative in ('initrd/startw.sh', 'initrd/startx.sh'):
             self.assertFalse((ROOT / relative).exists(), relative)
 
     def test_makefile_does_not_restore_direct_boot_scripts(self):
         makefile = (ROOT / 'GNUmakefile').read_text()
         self.assertNotIn('write initrd/startx.sh', makefile)
         self.assertNotIn('write initrd/startw.sh', makefile)
-        self.assertNotIn('write initrd/avoryd/services/x11.service', makefile)
-        self.assertNotIn('write initrd/avoryd/services/wayland.service', makefile)
         # Stale copies from the Arch rootfs must still be removed.
         self.assertIn('echo "rm bin/startx.sh";', makefile)
         self.assertIn('echo "rm bin/startw.sh";', makefile)

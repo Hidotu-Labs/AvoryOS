@@ -98,8 +98,6 @@ typedef struct {
   char target[512];
 } ramfs_symlink_t;
 
-static int ramfs_chmod(vfs_node_t *node, uint16_t permission);
-static int ramfs_chown(vfs_node_t *node, uint32_t uid, uint32_t gid);
 static void ramfs_destroy_node(vfs_node_t *node);
 static int ramfs_symlink(vfs_node_t *node, char *name, char *target);
 static int ramfs_readlink(vfs_node_t *node, char *buf, uint32_t size);
@@ -584,14 +582,14 @@ static int ramfs_symlink(vfs_node_t *node, char *name, char *target) {
   return 0;
 }
 
-static int ramfs_chmod(vfs_node_t *node, uint16_t permission) {
+int ramfs_chmod(vfs_node_t *node, uint16_t permission) {
   if (!node)
     return -1;
   node->mask = permission & 0x0FFF;
   return 0;
 }
 
-static int ramfs_chown(vfs_node_t *node, uint32_t uid, uint32_t gid) {
+int ramfs_chown(vfs_node_t *node, uint32_t uid, uint32_t gid) {
   if (!node)
     return -1;
   node->uid = uid;

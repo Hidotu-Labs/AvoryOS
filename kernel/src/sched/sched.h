@@ -181,6 +181,11 @@ struct thread {
   uint64_t rsp; // Must be first field (offset 0) for optimal assembly
   uint32_t tid;
   uint32_t tgid; // Thread group ID (== tid for group leader)
+  /* True from the moment the dispatcher publishes the thread as its CPU's
+   * current thread until switch_context finishes saving rsp and switches to
+   * the incoming stack. Placed at offset 16 so switch.asm can clear it
+   * atomically after switching off the outgoing stack. */
+  volatile bool on_cpu;
   uint8_t fpu_state[4096] __attribute__((aligned(64))); // Saved XSAVE/FPU state (at offset 64)
   uint64_t stack_base;
   uint64_t stack_size;
@@ -197,11 +202,9 @@ struct thread {
   bool kpi_wake_pending;
   bool kpi_timeout_active;
   bool kpi_wait_prepared;
-  /* KPI plain-block rendezvous (linuxkpi_thread_block()).  Armed by every
-   * linuxkpi_wake_thread() call and consumed under the run-queue lock before
-   * a thread publishes THREAD_BLOCKED, so a wake that races the condition
-   * check of a wait_event()/schedule() loop is not dropped by sched_wakeup()
-   * seeing THREAD_RUNNING.  A stale flag only causes one spurious wakeup. */
+  /* Plain-block notification, scoped to a prepared/active KPI wait and
+   * consumed under queue_lock before publishing THREAD_BLOCKED. Cleared
+   * when a wait is prepared or completed so timed waits cannot poison it. */
   bool kpi_block_pending;
   void *kpi_wait_mutex; /* Opaque Linux mutex, for on-demand owner diagnostics. */
   struct rb_node deadline_node; // Linkage in the per-CPU deadline tree
@@ -348,12 +351,7 @@ struct thread {
   // Scheduling/EEVFD priority state
   struct sched_entity se;  // EEVFD scheduling entity
   uint32_t cpu_index;      // Index of CPU this thread is enqueued on
-  bool has_started;        // True once dispatched; its scheduler stack is CPU-local
-  /* True from the moment the dispatcher publishes the thread as its CPU's
-   * current thread until that CPU commits to switching away from it.  A false
-   * value proves no CPU holds it and sched_wakeup() can skip the all-CPU
-   * current_thread/switching_from scan.  A stale true only costs the scan. */
-  volatile bool on_cpu;
+  bool has_started;        // True once dispatched at least once
   uint8_t priority;        // Current dynamic priority (0-31)
   uint8_t static_priority; // Base priority
   int8_t nice_value;       // Userspace nice value (-20..19)
@@ -449,6 +447,7 @@ struct thread {
   uint64_t rseq_addr;
   uint32_t rseq_len;
   uint32_t rseq_sig;
+  uint32_t rseq_last_cpu_id;
 
   /* User entry coordinates for bounded hang-report stack scans. Keep these
    * at the end: syscall/context-switch assembly pins earlier field offsets. */
@@ -470,7 +469,16 @@ struct thread {
   /* readdir callbacks return borrowed storage until the next call by this
    * thread. A filesystem-global buffer races with other CPUs and preemption. */
   struct dirent readdir_result;
+
+  /* Opt-in syncobj profiling. Appended to preserve assembly-pinned offsets.
+   * wake_ns initially equals park_ns (no notification recorded yet). */
+  uint64_t perf_syncobj_active_ns;
+  uint64_t perf_syncobj_park_ns;
+  uint64_t perf_syncobj_wake_ns;
 };
+
+_Static_assert(offsetof(struct thread, on_cpu) == 16,
+               "update switch.asm on_cpu offset");
 
 /*
  * Stable copy used by procfs. Returning a raw thread pointer after dropping
@@ -572,7 +580,8 @@ void sched_itimer_arm(struct thread *t, uint64_t next_ms, uint64_t interval_ms, 
 void sched_itimer_disarm(struct thread *t);
 
 /* Deferred preemption point for the interrupt and syscall return paths.
- * to_user is true when the caller is about to return to ring 3. */
+ * to_user is true when the caller is about to return to ring 3. Kernel IRQ
+ * callers must check the interrupted frame had IF set before calling. */
 void sched_check_resched(bool to_user);
 
 /* Restartable sequences (rseq(2)): refresh user cpu_id/node_id for the
@@ -590,6 +599,7 @@ struct thread *sched_get_current(void);
 
 // Load balancing / dispatching
 void sched_enqueue_thread(struct thread *t, struct cpu_info *explicit_cpu);
+void sched_enforce_affinity(struct thread *t);
 bool sched_set_priority(struct thread *t, uint8_t priority, int8_t nice_value);
 bool sched_set_attributes(struct thread *t, uint8_t priority, int8_t nice_value,
                           uint8_t policy, uint8_t rt_priority, bool reset_on_fork);

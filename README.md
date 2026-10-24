@@ -1,171 +1,67 @@
 # AvoryOS
 
-![AvoryOS Showcase](assets/showcase.png)
-![AvoryOS Showcase2](assets/showcase2.png)
+AvoryOS is an open-source hobby operating system for x86_64 PCs. It includes a monolithic kernel, a Linux-compatible system call interface, POSIX-oriented userland, networking, and a graphical desktop environment.
 
-**AvoryOS** is an open-source, monolithic hobby operating system kernel for the **x86_64** architecture, written in C and Assembly. It features a rich Linux-compatible system call interface, POSIX userland compatibility, standard **glibc** runtime, native IPv4 & IPv6 networking, a LinuxKPI compatibility subsystem for upstream Linux DRM drivers, and modern desktop environments including KDE Plasma 6, XFCE4, IceWM, and Weston/Wayland.
+![AvoryOS desktop](assets/showcase.png)
+![AvoryOS desktop showcase](assets/showcase2.png)
 
----
+## Features
 
-## Highlights & Features
+- x86_64 kernel with SMP scheduling, virtual memory, and a virtual filesystem
+- Storage support for NVMe, AHCI, IDE, and ramdisk devices
+- IPv4 and IPv6 networking
+- Graphics support through VirtIO-GPU and a LinuxKPI layer for Linux DRM drivers
+- Userland based on glibc and an Arch package root filesystem
+- Desktop sessions including KDE Plasma, XFCE, IceWM, and Weston
 
-- **Kernel Architecture**:
-  - 64-bit higher-half kernel booting via the **Limine bootloader protocol**.
-  - Advanced Physical Memory Management (PMM) with per-CPU page caches and NUMA/node awareness.
-  - Virtual Memory Manager (VMM) supporting 4-level paging, PCID hardware tagging, hugepages, copy-on-write, demand paging, and batched TLB shootdowns.
-  - SMP Preemptive Scheduler with multi-core APIC/IPI support, futexes (including priority inheritance), signals, and POSIX threads.
-  - VFS layer with page cache, dentries, ext2/ext4, ramfs, tmpfs, devtmpfs, procfs, and sysfs.
-  - Userland access optimizations (`fast_copy_user`), vDSO page, and fast syscall handling (`syscall`/`sysret`).
+AMDGPU support is under active development. For stable graphics in QEMU, use the default VirtIO-GPU setup.
 
-- **Hardware, Storage & Driver Support**:
-  - **Storage & Partitioning**:
-    - Full **NVMe** driver (PCIe Gen3/Gen4/Gen5) with namespace discovery and command queueing.
-    - Full **GPT (GUID Partition Table)** partitioning support alongside legacy MBR.
-    - AHCI (SATA), IDE/ATA, and ramdisk boot support.
-  - **Audio**: Intel High Definition Audio (HDA), AC97, and Sound Blaster 16 (`/dev/dsp`).
-  - **Graphics & Input**:
-    - Native `ascentdrm` framebuffer / VirtIO-GPU DRM backend with hardware cursor and display management.
-    - **LinuxKPI Subsystem**: Compatibility layer running unmodified upstream Linux kernel drivers (PCIe VFIO passthrough, DRM/TTM/dma-buf subsystems, and experimental AMDGPU support).
-    > [!NOTE]
-    > **AMDGPU status**: The LinuxKPI amdgpu hardware bring-up and mode-setting pipeline is partially implemented / work-in-progress; hardware 3D rendering with radeonsi remains experimental and half-broken on bare metal/passthrough setups. Stable sessions use the native VirtIO-GPU / GOP framebuffer path or Mesa llvmpipe/pixman software renderers.
-  - Evdev input subsystem supporting PS/2, USB HID keyboards, and mice.
-  - **Networking (IPv4 & IPv6)**:
-    - Realtek RTL8139 NIC driver with an in-kernel network stack.
-    - Dual-stack **IPv4 and IPv6** support: Neighbor Discovery (NDP), ICMPv6, SLAAC link-local/global addressing, and IPv6 UDP/TCP socket layer (`AF_INET6`).
+## Build
 
-- **Userland & Compatibility Ecosystem**:
-  - **Development Toolchains & C Runtimes**:
-    - **glibc**: Dynamic GNU libc runtime and sysroot powering standard Linux binaries.
-    - **GCC (GNU Compiler Collection)**: Full development toolchain (`gcc`, `g++`, `binutils`, `make`) for compiling native C/C++ programs directly on the OS.
-    - **Tiny C Compiler (TCC)**: Fast C99 compiler ported for instant builds.
-  - **Arch Linux Rootfs Integration**: Runs userspace applications directly from a standard Arch Linux package base.
-  - **Desktop Environments & Window Managers**:
-    - **KDE Plasma 6** (KWin on X11 / Wayland) & KDE Frameworks 6 applications (Dolphin, Konsole, Kate, KCalc, etc.).
-    - **XFCE4** and **IceWM** lightweight desktop sessions.
-    - **AetherDE**: Custom native desktop environment (AetherWM, Aether-Dock, Aether-Panel, Wayland compositor).
-    - **Weston** (Wayland display server) with GPU acceleration via Mesa Gallium or software rasterization (pixman / llvmpipe).
-    - **Xorg Server** with modesetting and evdev drivers.
-  - **Ported Applications & Games**:
-    - **Native Minecraft (up to 1.16.5)**: Bundled and staged via OpenJDK 17 with full LWJGL/OpenGL client libraries, textures, and Mojang asset sound indices (`scripts/setup-minecraft.sh`).
-    - **Mocktail (Roblox Client)**: Bundled AppImage runtime and payload integration for Roblox on AvoryOS (`scripts/setup-mocktail.sh`).
-    - **Web Browsers**: **Firefox** (full desktop browser with GTK and WebKit/Gecko support).
-    - **Games & Emulators**: Yamagi Quake II (with demo campaign), DOOM (native fb and X11 backends), ClassiCube (Minecraft classic client), Butterscotch (GameMaker engine).
-    - **Media & Utilities**: VLC media player, cmus, fastfetch, GNU Bash 5.3, GNU Coreutils, and Kria programming language.
+On a Linux host, install the usual build tools and utilities, including Make, a C compiler, NASM, Git, Python 3, `xorriso`, QEMU, and the ext4 and partitioning utilities (`e2fsprogs`, `parted` or `util-linux`).
 
----
+Bootstrap required dependencies and toolchains:
 
-## Prerequisites
-
-To build and run AvoryOS on a Linux host (Ubuntu/Debian, Arch, Fedora, etc.), make sure the following dependencies are installed:
-
-- **Build Tools**: `make`, `gcc` or `clang`, `nasm`, `bison`, `flex`, `patch`
-- **Host Utilities**: `git`, `curl`, `tar`, `gzip`, `bzip2`, `xz-utils`, `python3`, `e2fsprogs` (`mkfs.ext4`, `debugfs`, `e2fsck`, `resize2fs`), `parted` or `util-linux` (`sfdisk`, `losetup`)
-- **ISO Creation**: `xorriso`
-- **Emulation**: `qemu-system-x86_64` (with KVM support recommended)
-
----
-
-## Getting Started
-
-### 1. Bootstrap Dependencies & Toolchains
-
-Run the bootstrap script to pull protocol headers, runtime submodules, and prepare the glibc cross-compilation sysroot:
-
-```bash
+```sh
 ./bootstrap.sh
 ```
 
-### 2. Build the Arch Linux Root Filesystem
+Build the kernel and the default bootable images:
 
-Populate the root filesystem with packages (X11, KDE/XFCE/IceWM, Mesa, GCC toolchain, Firefox, fonts, and core utilities):
-
-```bash
-./scripts/setup-arch.sh
-```
-
-### 3. Build Ported Userland Software & Games
-
-Compile ported software packages into the userland directory:
-
-```bash
-# Core utilities and development tools
-./scripts/build-bash.sh
-./scripts/build-coreutils.sh
-./scripts/build-tcc.sh
-
-# Games & desktop applications
-./scripts/build-quake2.sh
-./scripts/build-classicube.sh
-./scripts/build-butterscotch.sh
-
-# Optional: Stage Minecraft 1.16.5 & Mocktail Roblox client
-./scripts/setup-minecraft.sh
-./scripts/setup-mocktail.sh
-```
-
-### 4. Build Kernel & Disk Image
-
-Build the kernel, generate the ISO, and assemble the partitioned GPT `disk.img` (with NVMe support):
-
-```bash
+```sh
 make
 ```
 
----
+The default target builds the kernel, ISO, GPT disk image, and OVMF firmware. To run the system in QEMU:
 
-## Running in QEMU
+Each kernel source state gets a generated build tag, shown in the boot message and `uname -v`. Rebuilding without kernel or LinuxKPI source changes keeps the same tag; changing those sources generates a new one.
 
-AvoryOS supports multiple run configurations tailored for different hardware acceleration and testing setups:
-
-### Standard Desktop (QEMU with KVM + NVMe)
-
-Boots the default AvoryOS installation with KVM acceleration, NVMe root disk (GPT layout), VirtIO-VGA graphics, Intel HDA sound, and USB tablet/keyboard:
-
-```bash
+```sh
 make run
 ```
 
-*If running without KVM (TCG software emulation):*
-```bash
+`make run` uses KVM. To run with QEMU's software emulation instead:
+
+```sh
 make run-tcg
 ```
 
-### Minimal Image
+For a smaller image, build and run the minimal profile:
 
-To build and test the fast lightweight profile (OpenRC, IceWM, GNU coreutils, Bash, st terminal):
-
-```bash
+```sh
 make minimal-iso
 make run-minimal
 ```
 
-### LinuxKPI & DRM Testing
+## Project layout
 
-Run AMDGPU with VFIO and PRIME presentation:
-
-```bash
-make run-c7-prime  # AMD radeonsi rendering displayed in the QEMU window
-```
-
----
-
-## Project Structure
-
-```
-AvoryOS/
-├── kernel/             # Monolithic kernel source
-│   ├── src/            # Architecture, scheduler, memory, drivers, IPv4/IPv6, and VFS
-│   ├── linuxkpi/       # LinuxKPI compatibility layer & driver bridges
-├── userland/           # Userland applications, utilities, tests, and games
-├── AetherDE/           # Aether Desktop Environment & Wayland compositor
-├── scripts/            # Build automation, toolchain setup, Minecraft/Mocktail setup
-├── docs/               # Architecture, LinuxKPI, NVMe, and AMDGPU documentation
-├── initrd/             # Early boot target configurations, services, and scripts
-└── assets/             # Wallpapers, sound effects, icons, and test assets
-```
-
----
+- `kernel/` — kernel source and LinuxKPI compatibility code
+- `userland/` — userland programs and utilities
+- `initrd/` — early boot configuration and services
+- `scripts/` — build and setup scripts
+- `docs/` — project documentation
+- `assets/` — images and other project assets
 
 ## License
 
-Developed as an open-source hobby operating system for research, fun, and learning. Released under the terms of the project's [LICENSE](LICENSE).
+See [LICENSE](LICENSE).

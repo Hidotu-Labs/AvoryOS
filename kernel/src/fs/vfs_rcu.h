@@ -102,6 +102,9 @@ void vfs_rcu_defer(struct vfs_rcu_head *head,
  * context only (selftest/bench); the drainer uses the same path. */
 void vfs_rcu_synchronize(void);
 
+/* Service a pending deferred-free acknowledgement from an IRQ-masked wait. */
+void vfs_rcu_poll(void);
+
 /* Counters for the selftest and diagnostics. */
 uint64_t vfs_rcu_freed_count(void);
 uint64_t vfs_rcu_queued_count(void);

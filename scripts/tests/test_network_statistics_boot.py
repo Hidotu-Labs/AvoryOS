@@ -8,7 +8,7 @@ NIC=os.environ.get('AVORY_NETWORK_TEST_NIC','rtl8139')
 if NIC not in ('rtl8139','e1000'):raise ValueError('AVORY_NETWORK_TEST_NIC must be rtl8139 or e1000')
 if NIC!='rtl8139':OUT=OUT/NIC
 OUT.mkdir(parents=True,exist_ok=True)
-TREE=ROOT/'build/alpine/rootfs'
+TREE=ROOT/'build/arch/rootfs'
 spec=importlib.util.spec_from_file_location('boot',ROOT/'scripts/syscall-restart-boot.py')
 boot=importlib.util.module_from_spec(spec);spec.loader.exec_module(boot);boot.OUT=OUT
 boot.INIT=r'''

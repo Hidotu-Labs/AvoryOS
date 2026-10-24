@@ -56,6 +56,7 @@ static uint64_t rdtsc(void) { return 1; }
 static bool cpu_has_pcid(void) { return pcid_enabled; }
 static bool cpu_has_invpcid(void) { return invpcid_enabled; }
 static void tlb_stat_add(uint64_t *v, uint64_t n) { *v += n; }
+void vfs_rcu_poll(void) {}
 '''
 hardware = r'''
 static void mock_flush(void) {

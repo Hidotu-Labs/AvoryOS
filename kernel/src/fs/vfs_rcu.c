@@ -82,6 +82,17 @@ static void vfs_rcu_isr(struct registers *regs) {
   __atomic_store_n(&vfs_rcu_ack[cpu->cpu_id], 0, __ATOMIC_RELEASE);
 }
 
+void vfs_rcu_poll(void) {
+  if (hal_irq_enabled())
+    return;
+  struct cpu_info *cpu = cpu_get_current();
+  if (!cpu || cpu->cpu_id >= MAX_CPUS)
+    return;
+  if (!__atomic_load_n(&vfs_rcu_ack[cpu->cpu_id], __ATOMIC_ACQUIRE))
+    return;
+  __atomic_store_n(&vfs_rcu_ack[cpu->cpu_id], 0, __ATOMIC_RELEASE);
+}
+
 /* Detach the whole queue.  Returns NULL when empty. */
 static struct vfs_rcu_head *vfs_rcu_detach(struct vfs_rcu_head **tail_out,
                                            uint32_t *count_out) {

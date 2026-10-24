@@ -31,6 +31,7 @@
  * =========================================================================== */
 
 #include "lockdiag.h"
+#include "../mm/vmm.h"
 
 #if LOCKDIAG
 
@@ -43,7 +44,6 @@
 #include "../hal/hal.h"
 #include "../lib/tsc.h"
 #include "../mm/pmm.h"
-#include "../mm/vmm.h"
 #include "../sched/sched.h"
 #include "../smp/cpu.h"
 #include "spinlock.h"
@@ -177,8 +177,8 @@ bool lockdiag_spot_held_by_self(int id) {
  * core takes its page fault handler through that same lock, so it is waiting
  * for an acknowledgement that core can no longer send. */
 bool lockdiag_self_holds_vmm_lock(uint32_t self_id) {
-  (void)self_id;
-  return lockdiag_spot_held_by_self(LOCKDIAG_SPOT_VMM);
+  return vmm_cpu_holds_lock(self_id) ||
+         lockdiag_spot_held_by_self(LOCKDIAG_SPOT_VMM);
 }
 
 static lockdiag_stats_t g_stats;
@@ -1761,8 +1761,7 @@ uint64_t lockdiag_probe_cpus(uint32_t timeout_ms) {
   return 0;
 }
 bool lockdiag_self_holds_vmm_lock(uint32_t self_id) {
-  (void)self_id;
-  return false;
+  return vmm_cpu_holds_lock(self_id);
 }
 void lockdiag_spot_take(int id, uint64_t wait_cycles, uint64_t ip) {
   (void)id;

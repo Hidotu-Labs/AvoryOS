@@ -10,6 +10,9 @@ owner selected **PRIME to VirtIO** instead of physical NVIDIA scanout after
 the initial inventory. Direct NVIDIA output is not a prerequisite for this
 chosen route and remains explicitly untested.
 
+This is a historical phase record. Its phase-specific interactive Make targets
+have been retired; use `make run-nouveau` for the current installed desktop.
+
 ## First inventory
 
 `userland/test_nouveau_display.c` scans primary nodes rather than assuming a
@@ -148,15 +151,8 @@ The software regression compiles the actual C pixel generator and compares
 its complete output with the independent host generator, injects corrupt
 captures, and tests missing captures/markers and source/ABI readiness changes.
 
-To watch the test after matching readiness has been prepared and the existing
-QEMU has shut down, run on the host:
-
-```sh
-cd /home/offihito/AvoryOS
-make run-nouveau-c6-prime
-```
-
-This opens a **separate diagnostic QEMU**, not the installed desktop. Expect
+The retired `run-nouveau-c6-prime` target opened a **separate diagnostic QEMU**,
+not the installed desktop. It expected
 two changing color-bar frames for ten seconds each, followed by automatic
 shutdown. The terminal must print two `NOUVEAU_C6_CAPTURE: PASS` lines; inspect
 `build/nouveau-c6/interactive-present/result.json` and `capture.json` afterward.
@@ -204,13 +200,8 @@ rejects CPU-only/fence-incomplete markers and mismatched readiness, and
 checks the two user mappings exclude the destination. The existing full-pixel
 corruption/stale-frame tests apply unchanged.
 
-To watch the GPU profile with the other QEMU closed, run on the host:
-
-```sh
-cd /home/offihito/AvoryOS
-make run-nouveau-c6-gpu-prime
-```
-
+The retired `run-nouveau-c6-gpu-prime` target watched the GPU profile with the
+other QEMU closed.
 `NOUVEAU_C6_GPU_READINESS` defaults to
 `build/nouveau-c6/readiness-gpu-present/result.json`; `NOUVEAU_C6_GPU_OUT`
 defaults to `build/nouveau-c6/interactive-gpu-present`. Expect two ten-second
@@ -279,13 +270,8 @@ are not tolerated. Pending-profile compilation/strict-marker tests and the exist
 selection, capture-corruption, PRIME lifetime, devres and boot classifiers pass.
 Historical failed runs remain failed and archived, not relabeled as evidence.
 
-To watch the final qualified private profile with other QEMU instances closed:
-
-```sh
-cd /home/offihito/AvoryOS
-make run-nouveau-c6-flips
-```
-
+The retired `run-nouveau-c6-flips` target watched the final qualified private
+profile with other QEMU instances closed.
 Expect six `NOUVEAU_C6_CAPTURE: PASS` records and clean automatic shutdown.
 Earlier CPU/explicit-wait targets require their own readiness to be regenerated
 after a private kernel change; they cannot reuse a mismatched result.

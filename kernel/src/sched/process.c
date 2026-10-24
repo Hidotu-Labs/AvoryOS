@@ -489,8 +489,7 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
                                      const elf_info_t *elf_info) {
   // Create a default environment if none provided
   const char *default_envp[] = {
-      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:"
-      "/opt/bash/bin:/opt/tcc/bin",
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
       "HOME=/",
       "TERM=xterm-256color",
       "USER=root",

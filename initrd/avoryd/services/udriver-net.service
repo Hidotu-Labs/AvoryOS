@@ -1,6 +1,0 @@
-NAME=udriver-net
-DESCRIPTION=bind an unclaimed RTL8139 through the Linux userspace compatibility layer
-TYPE=background
-COMMAND=/bin/8139too-udrv
-ENABLED=yes
-RESPAWN=no

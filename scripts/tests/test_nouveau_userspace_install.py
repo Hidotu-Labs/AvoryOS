@@ -15,20 +15,19 @@ with tempfile.TemporaryDirectory(prefix='avory-nvk-install-') as temp:
     scripts.mkdir()
     installer = scripts / 'setup-arch.sh'
     installer.write_text(prefix + '\nexit 99\n')
-    (scripts / 'arch-pkgs.sh').write_text('arch_name() { echo "$1"; }\n')
     configurations = directory / 'config/xorg'
     configurations.mkdir(parents=True)
     for name in ('10-nouveau.conf', 'avory-nouveau-xorg.sh', 'avory-xorg-profile.sh', '44-nouveau-env.sh', '20-output.conf'):
         (configurations/name).write_bytes((root/'config/xorg'/name).read_bytes())
-    (directory / 'build/alpine').mkdir(parents=True)
-    (directory / 'build/alpine/.pacman-sync').touch()
+    (directory / 'build/arch').mkdir(parents=True)
+    (directory / 'build/arch/.pacman-sync').touch()
     command = directory / 'unshare'
     command.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$INSTALL_LOG"\n')
     command.chmod(0o755)
     log = directory / 'transaction'
     environment = dict(os.environ, PATH=f'{directory}:{os.environ["PATH"]}', INSTALL_LOG=str(log))
     subprocess.run(['bash', str(installer), '--nouveau-userspace'], env=environment, check=True)
-    rootfs = directory / 'build/alpine/rootfs'
+    rootfs = directory / 'build/arch/rootfs'
     hook = (root/'config/xorg/44-nouveau-env.sh').read_bytes()
     assert (rootfs/'etc/profile.d/avory-nouveau.sh').read_bytes() == hook
     assert (rootfs/'etc/X11/xinit/xinitrc.d/44-nouveau-env.sh').read_bytes() == hook
@@ -53,5 +52,5 @@ with tempfile.TemporaryDirectory(prefix='avory-nvk-install-') as temp:
         assert package in arguments
     assert subprocess.run(['bash', str(installer), '--unknown'], env=environment,
                           capture_output=True).returncode == 2
-assert 'install_apk "vulkan-nouveau" "main"' in source
+assert 'pacman_run -S --needed mesa vulkan-nouveau' in source
 print('PASS: focused NVK/Mesa transaction, cached repo reuse, no desktop bootstrap and default NVK install')

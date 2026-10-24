@@ -57,6 +57,7 @@ static int __mutex_lock_common(struct mutex *lock, bool interruptible) {
       return -ERESTARTSYS;
     }
 
+    set_current_state(interruptible ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
     spin_unlock(&lock->wait_lock);
     linuxkpi_mutex_wait_set(lock);
     linuxkpi_thread_block();

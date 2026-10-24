@@ -1,5 +1,0 @@
-NAME=console
-DESCRIPTION="interactive multi-user login"
-TYPE=foreground
-RESPAWN=yes
-COMMAND=/bin/avory-login

@@ -19,8 +19,10 @@ SECTIONS
   .rodata         : { *(.rodata*) } :text
   .eh_frame_hdr   : { *(.eh_frame_hdr) } :text :eh_frame
   .eh_frame       : { *(.eh_frame) } :text
-  .text           : { *(.text*) } :text
+  .text           : { *(.text) *(.text.__vdso_clock_gettime*) *(.text.__vdso_gettimeofday*) *(.text.__vdso_time*) } :text
   .got            : { *(.got*) } :text
   .got.plt        : { *(.got.plt*) } :text
+  . = 0x800;
+  .text.getcpu    : { *(.text.getcpu) } :text
   /DISCARD/       : { *(.note*) *(.comment*) }
 }

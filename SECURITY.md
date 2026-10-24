@@ -4,11 +4,16 @@
 
 | Version | Supported          | Known Issues                                           |
 | ------- | ------------------ | ------------------------------------------------------ |
-| 2.x     | :warning:          | Unbalanced CPU usage, user faults in certain programs, AMD GPU renderer not working |
-| 1.x     | :x:                | End of support (PTY stopping, memory leaks)           |
+| 3.x     | :construction:     | Under active development                               |
+| 2.x     | :x:                | End of support                                         |
+| 1.x     | :x:                | End of support (PTY stopping, memory leaks)            |
 | < 1.0   | :x:                | End of support                                         |
 
 ## Known Issues
+
+
+### Version 3.x
+- **New version**: Its under development right now.
 
 ### Version 2.x
 - **Unbalanced CPU Usage**: Workload scheduling across SMP cores can become unbalanced under certain multitasking conditions, resulting in uneven core utilization.

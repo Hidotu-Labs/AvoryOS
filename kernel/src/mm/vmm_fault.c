@@ -254,6 +254,7 @@ static void vmm_map_cow_cluster(uint64_t *pml4, uint64_t cr2,
    * mapping behind.  Each page is revalidated against the current VMA so a
    * split, merge or remap cannot alias a frame that belongs elsewhere. */
   spinlock_acquire(&mm->lock);
+  vmm_lock_acquire_for(pml4, 0);
   for (uint32_t i = 0; i < batch_count; i++) {
     struct vma *nv = vma_find(&mm->vmas, batch[i].vpage);
     uint64_t nv_file_size =
@@ -272,9 +273,13 @@ static void vmm_map_cow_cluster(uint64_t *pml4, uint64_t cr2,
 
     uint64_t flags = (dp_build_flags(nv->prot) & ~PAGE_FLAG_RW) |
                      PAGE_FLAG_COW | PAGE_FLAG_REFAULT;
-    if (!vmm_map_page_if_unmapped(pml4, batch[i].vpage, batch[i].phys, flags))
+    bool changed = false;
+    if (vmm_page_present_nolock(pml4, batch[i].vpage) ||
+        !vmm_map_page_locked(pml4, batch[i].vpage, batch[i].phys, flags,
+                             &changed))
       pmm_decref((void *)batch[i].phys);
   }
+  vmm_lock_release();
   spinlock_release(&mm->lock);
 }
 
@@ -329,7 +334,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
      * the vmm_lock section below), so a CoW fault on one CPU could deadlock
      * against an mprotect()/mmap() on another, with neither able to back off. */
     spinlock_acquire(&current->mm->lock);
-    vmm_lock_acquire();
+    vmm_lock_acquire_for((uint64_t *)target_cr3, virt);
 
     /* Every bail-out from the walk below has to unwind the pair again. */
 #define WALK_UNLOCK()                                                          \
@@ -834,7 +839,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
             uint64_t win_end = fault_page + 16 * PAGE_SIZE;
             if (win_end < fault_page || win_end > w->end)
               win_end = w->end;
-            vmm_lock_acquire();
+            vmm_lock_acquire_for((uint64_t *)target_cr3, fault_page);
             for (uint64_t va2 = fault_page; va2 < win_end; va2 += PAGE_SIZE) {
               uint64_t po = va2 - w->start;
               if (po >= eff_file_size &&
@@ -1012,55 +1017,46 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       }
       spinlock_release(&node->pages_lock);
 
-      spinlock_acquire(&current->mm->lock);
-      for (uint32_t bi = 0; bi < batch_count; bi++) {
-        struct vma *nv = vma_find(&current->mm->vmas, batch[bi].vpage);
-        uint64_t nv_file_size =
-            nv ? ((nv->file_size > 0) ? nv->file_size : (nv->end - nv->start)) : 0;
-        uint64_t nv_page_off = (nv && batch[bi].vpage >= nv->start)
-                                   ? (batch[bi].vpage - nv->start)
-                                   : UINT64_MAX;
-        bool ok =
-            nv && (nv->prot & PROT_READ) && batch[bi].vpage >= nv->start &&
-            batch[bi].vpage + PAGE_SIZE <= nv->end &&
-            nv_page_off + PAGE_SIZE <= nv_file_size &&
-            (void *)nv->file_node == (void *)node &&
-            (uint32_t)(nv->offset + nv_page_off) ==
-                (uint32_t)(vma_offset + (batch[bi].vpage - vma_start));
-        uint64_t page_flags = ok ? dp_build_flags(nv->prot) : 0;
-        /* The fault started in a read-only VMA, but mprotect may have made
-         * this neighbour writable while the file cache was being filled.
-         * Private mappings must never expose a writable cache frame: retain
-         * CoW using the permissions revalidated under mm->lock. */
-        if (ok && (nv->flags & MAP_PRIVATE))
-          page_flags = (page_flags & ~PAGE_FLAG_RW) |
-                       PAGE_FLAG_COW | PAGE_FLAG_REFAULT;
-        // Drop the mm->lock around the PTE install would reopen the race;
-        // mm->lock -> vmm_lock is the established order, so keep both.
-        // vmm_map_page_if_unmapped() takes vmm_lock internally.
-        if (!ok) {
-          // Release mm->lock for the decref? decref is lock-free; keep it
-          // simple and decref while holding mm->lock (short, no IPI).
-          pmm_decref((void *)batch[bi].phys);
-          continue;
+      if (batch_count > 0) {
+        spinlock_acquire(&current->mm->lock);
+        vmm_lock_acquire_for((uint64_t *)target_cr3, 0);
+        for (uint32_t bi = 0; bi < batch_count; bi++) {
+          struct vma *nv = vma_find(&current->mm->vmas, batch[bi].vpage);
+          uint64_t nv_file_size =
+              nv ? ((nv->file_size > 0) ? nv->file_size : (nv->end - nv->start)) : 0;
+          uint64_t nv_page_off = (nv && batch[bi].vpage >= nv->start)
+                                     ? (batch[bi].vpage - nv->start)
+                                     : UINT64_MAX;
+          bool ok =
+              nv && (nv->prot & PROT_READ) && batch[bi].vpage >= nv->start &&
+              batch[bi].vpage + PAGE_SIZE <= nv->end &&
+              nv_page_off + PAGE_SIZE <= nv_file_size &&
+              (void *)nv->file_node == (void *)node &&
+              (uint32_t)(nv->offset + nv_page_off) ==
+                  (uint32_t)(vma_offset + (batch[bi].vpage - vma_start));
+          uint64_t page_flags = ok ? dp_build_flags(nv->prot) : 0;
+          /* The fault started in a read-only VMA, but mprotect may have made
+           * this neighbour writable while the file cache was being filled.
+           * Private mappings must never expose a writable cache frame: retain
+           * CoW using the permissions revalidated under mm->lock. */
+          if (ok && (nv->flags & MAP_PRIVATE))
+            page_flags = (page_flags & ~PAGE_FLAG_RW) |
+                         PAGE_FLAG_COW | PAGE_FLAG_REFAULT;
+          if (!ok) {
+            pmm_decref((void *)batch[bi].phys);
+            continue;
+          }
+          bool changed = false;
+          bool installed =
+              !vmm_page_present_nolock((uint64_t *)target_cr3, batch[bi].vpage) &&
+              vmm_map_page_locked((uint64_t *)target_cr3, batch[bi].vpage,
+                                  batch[bi].phys, page_flags, &changed);
+          if (!installed)
+            pmm_decref((void *)batch[bi].phys);
         }
-        // Temporarily release mm->lock? No: map under the same hold so a
-        // concurrent munmap cannot slip in between validation and install.
-        // vmm_map_page_if_unmapped acquires vmm_lock (mm->vmm order).
-        // To avoid nested-lock subtleties, release and re-acquire per page
-        // is worse; keep the hold and call directly.
-        // NOTE: spinlock here is not recursive, but vmm_lock is a separate
-        // lock, so this nesting is the documented order.
-        bool installed;
-        // Unlock annotation: vmm_map_page_if_unmapped may block briefly on
-        // vmm_lock; mm->lock is held as in vmm_map_cow_cluster().
-        installed = vmm_map_page_if_unmapped((uint64_t *)target_cr3,
-                                             batch[bi].vpage, batch[bi].phys,
-                                             page_flags);
-        if (!installed)
-          pmm_decref((void *)batch[bi].phys);
+        vmm_lock_release();
+        spinlock_release(&current->mm->lock);
       }
-      spinlock_release(&current->mm->lock);
     }
 
   } else {
@@ -1148,7 +1144,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
           uint64_t win_end = fault_page + (uint64_t)FAULT_AROUND_PAGES * PAGE_SIZE;
           if (win_end < fault_page || win_end > w->end)
             win_end = w->end;
-          vmm_lock_acquire();
+          vmm_lock_acquire_for((uint64_t *)target_cr3, fault_page);
           for (uint64_t va2 = fault_page; va2 < win_end;
                va2 += PAGE_SIZE) {
             if (!vmm_page_present_nolock((uint64_t *)target_cr3, va2)) {
@@ -1377,6 +1373,10 @@ void vmm_update_vdso_data(void) {
     mult_rem_us = (1000000ULL << 32) / tsc_hz;
   }
 
+  extern bool cpu_has_rdpid(void);
+  extern bool cpu_has_rdtscp(void);
+  uint64_t getcpu_mode = cpu_has_rdpid() ? 2ULL : (cpu_has_rdtscp() ? 1ULL : 0ULL);
+
   uint64_t *data = (uint64_t *)(PHYS_TO_VIRT(vsyscall_page_phys) + 0xE00);
   data[0] = boot_tsc;
   data[1] = khz;
@@ -1386,6 +1386,7 @@ void vmm_update_vdso_data(void) {
   data[5] = (uint64_t)sec_shift;
   data[6] = mult_rem_ns;
   data[7] = mult_rem_us;
+  data[8] = getcpu_mode;
 }
 
 
@@ -1402,8 +1403,8 @@ void vmm_init_vsyscall_page(void) {
 
   // Copy compiled vDSO assembly blob into the page
   size_t blob_len = (size_t)(vdso_blob_end - vdso_blob_start);
-  if (blob_len > 4096)
-    blob_len = 4096;
+  if (blob_len > 0xE00)
+    blob_len = 0xE00;
   memcpy(v, vdso_blob_start, blob_len);
 
   vmm_update_vdso_data();

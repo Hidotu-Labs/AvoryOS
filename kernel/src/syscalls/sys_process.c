@@ -12,6 +12,7 @@
 #include "../hal/hal.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
+#include "../mm/numa.h"
 #include "../mm/pcid.h"
 #include "../mm/pmm.h"
 #include "../mm/vma.h"
@@ -1679,6 +1680,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   current->rseq_addr = 0;
   current->rseq_len = 0;
   current->rseq_sig = 0;
+  current->rseq_last_cpu_id = 0xFFFFFFFFu;
 
   // We are now safely loaded into the new address space!
   TSC_BEGIN(execve_stack);
@@ -2251,6 +2253,7 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   child->rseq_addr = 0;
   child->rseq_len = 0;
   child->rseq_sig = 0;
+  child->rseq_last_cpu_id = 0xFFFFFFFFu;
 
   if (flags & CLONE_FILES) {
     sched_share_files(child, parent);
@@ -2613,20 +2616,16 @@ static uint64_t sys_uname(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
 
   strcpy(buf->sysname, "Ascension");
   uts_namespace_read(sched_get_current(), buf->nodename, buf->domainname);
-  strcpy(buf->release, "2.5.0 Beta");
+  strcpy(buf->release, AVORY_BUILD_VERSION);
 
-  /* Reading the RTC costs tens of microseconds of CMOS port I/O, which used
-   * to dominate this syscall (and gethostname, which is layered on uname).
-   * The date only changes once per second, so rebuild the version string at
-   * most once per second off the cheap monotonic clock.  A lost race merely
-   * repeats an RTC read; the cached bytes are always self-consistent. */
   static char cached_version[80] = "";
   static uint64_t cached_ms = 0;
   uint64_t now_ms = lapic_timer_get_ms();
   if (!cached_version[0] || now_ms - cached_ms >= 1000) {
     char datetime[32];
     rtc_format_datetime(rtc_get_timestamp(), datetime, sizeof(datetime));
-    strcpy(cached_version, "2.5.0 Beta ");
+    strcpy(cached_version, AVORY_BUILD_NAME " " AVORY_BUILD_VERSION
+                             " build " AVORY_BUILD_TAG " ");
     strcat(cached_version, datetime);
     cached_ms = now_ms;
   }
@@ -2648,7 +2647,7 @@ static uint64_t sys_getcpu(uint64_t cpu_ptr, uint64_t node_ptr, uint64_t tcache,
 
   struct cpu_info *ci = cpu_get_current();
   uint32_t cpu_id = ci ? ci->cpu_id : 0;
-  uint32_t node = 0; // single NUMA node
+  uint32_t node = (uint32_t)numa_cpu_to_node(cpu_id);
 
   /* SMAP-safe copies (the old direct stores faulted under SMAP). */
   if (cpu_ptr &&
@@ -3255,16 +3254,18 @@ bool rseq_update_cpu_id(struct thread *t) {
     return true;
   struct cpu_info *cpu = cpu_get_current();
   uint32_t id = cpu ? cpu->cpu_id : 0;
-  uint32_t node = 0;
-  uint32_t mm_cid = 0;
+  if (__builtin_expect(t->rseq_last_cpu_id == id, 1))
+    return true;
+  uint64_t ids = ((uint64_t)id << 32) | id;
+  uint64_t node_mm = 0;
   // Fault-safe: an unmapped/torn-down rseq area just keeps stale values;
   // the next successful update fixes it. Offsets per Linux struct rseq:
   // cpu_id_start@0, cpu_id@4, flags@16, node_id@20, mm_cid@24.
   unsigned long left = 0;
-  left |= copy_to_user((void *)(t->rseq_addr + 0), &id, sizeof(id));
-  left |= copy_to_user((void *)(t->rseq_addr + 4), &id, sizeof(id));
-  left |= copy_to_user((void *)(t->rseq_addr + 20), &node, sizeof(node));
-  left |= copy_to_user((void *)(t->rseq_addr + 24), &mm_cid, sizeof(mm_cid));
+  left |= copy_to_user((void *)(t->rseq_addr + 0), &ids, sizeof(ids));
+  left |= copy_to_user((void *)(t->rseq_addr + 20), &node_mm, sizeof(node_mm));
+  if (left == 0)
+    t->rseq_last_cpu_id = id;
   return left == 0;
 }
 
@@ -3320,6 +3321,7 @@ uint64_t sys_rseq(struct syscall_regs *regs) {
     current->rseq_addr = 0;
     current->rseq_len = 0;
     current->rseq_sig = 0;
+    current->rseq_last_cpu_id = RSEQ_CPU_ID_UNINITIALIZED;
     return 0;
   }
 
@@ -3335,6 +3337,7 @@ uint64_t sys_rseq(struct syscall_regs *regs) {
   current->rseq_addr = addr;
   current->rseq_len = RSEQ_LEN;
   current->rseq_sig = (uint32_t)sig;
+  current->rseq_last_cpu_id = RSEQ_CPU_ID_UNINITIALIZED;
 
   // Publish the initial state so glibc never observes UNINITIALIZED:
   // flags/node/mm_cid zero, cpu ids = current CPU. Every copy is checked:
@@ -3694,7 +3697,8 @@ static uint64_t sys_sched_setaffinity(uint64_t pid, uint64_t len,
   if (!(mask & all_cpus_mask))
     return (uint64_t)-22; // EINVAL
 
-  target->cpu_affinity = mask & all_cpus_mask;
+  __atomic_store_n(&target->cpu_affinity, mask & all_cpus_mask, __ATOMIC_RELEASE);
+  sched_enforce_affinity(target);
   return 0;
 }
 

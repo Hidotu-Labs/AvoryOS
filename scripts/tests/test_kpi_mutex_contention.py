@@ -37,6 +37,11 @@ static void spin_lock(pthread_mutex_t *l) { pthread_mutex_lock(l); }
 static void spin_unlock(pthread_mutex_t *l) { pthread_mutex_unlock(l); }
 static bool signal_pending(struct task_struct *t) { (void)t;return false; }
 static void *task_struct_to_thread(struct task_struct *t) { return t; }
+#define TASK_INTERRUPTIBLE 1
+#define TASK_UNINTERRUPTIBLE 2
+static void set_current_state(int state) {
+ (void)state;pthread_mutex_lock(&task.lock);task.pending=false;pthread_mutex_unlock(&task.lock);
+}
 static void linuxkpi_mutex_wait_set(void *p) { (void)p; }
 static void linuxkpi_thread_block(void) {
  pthread_mutex_lock(&task.lock);

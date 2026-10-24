@@ -1,8 +1,100 @@
 /* LinuxKPI waitqueues.  See linux/wait.h for the contract. */
 
 #include <linux/wait.h>
+#include <linux/slab.h>
+#include <linuxkpi/native_vfs.h>
 
 #include <linuxkpi/native_sched.h>
+
+/* Poll registrations have two owners: a Linux wait head and a polled VFS
+ * node. One IRQ-safe lock protects both lists and serializes notification
+ * against teardown. It never nests a Linux wait-head lock inside it. Native
+ * notification only queues epoll candidates; it must not call driver poll. */
+struct kpi_poll_link {
+  struct kpi_poll_link *queue_next, *file_next;
+  wait_queue_head_t *queue;
+  void *node, *native_wq;
+};
+static DEFINE_SPINLOCK(kpi_poll_lock);
+
+int linuxkpi_poll_register(struct kpi_poll_link **file_links, wait_queue_head_t *q,
+                           void *node, void *native_wq) {
+  struct kpi_poll_link *link, *fresh = NULL;
+  unsigned long flags;
+  for (;;) {
+    spin_lock_irqsave(&kpi_poll_lock, flags);
+    for (link = *file_links; link; link = link->file_next) {
+      if (link->queue == q && link->node == node) {
+        spin_unlock_irqrestore(&kpi_poll_lock, flags);
+        kfree(fresh);
+        return 0;
+      }
+    }
+    if (fresh)
+      break;
+    spin_unlock_irqrestore(&kpi_poll_lock, flags);
+    fresh = kzalloc(sizeof(*fresh), GFP_ATOMIC);
+    if (!fresh)
+      return -ENOMEM;
+  }
+  fresh->queue = q;
+  fresh->node = node;
+  fresh->native_wq = native_wq;
+  fresh->file_next = *file_links;
+  *file_links = fresh;
+  fresh->queue_next = q->kpi_poll_links;
+  q->kpi_poll_links = fresh;
+  spin_unlock_irqrestore(&kpi_poll_lock, flags);
+  return 0;
+}
+
+void linuxkpi_poll_detach(struct kpi_poll_link **file_links, void *node) {
+  unsigned long flags;
+  spin_lock_irqsave(&kpi_poll_lock, flags);
+  struct kpi_poll_link **cursor = file_links;
+  while (*cursor) {
+    struct kpi_poll_link *link = *cursor;
+    if (node && link->node != node) {
+      cursor = &link->file_next;
+      continue;
+    }
+    *cursor = link->file_next;
+    if (link->queue) {
+      struct kpi_poll_link **queued =
+          &link->queue->kpi_poll_links;
+      while (*queued && *queued != link)
+        queued = &(*queued)->queue_next;
+      if (*queued)
+        *queued = link->queue_next;
+    }
+    kfree(link);
+  }
+  spin_unlock_irqrestore(&kpi_poll_lock, flags);
+}
+
+void linuxkpi_poll_free(wait_queue_head_t *q) {
+  unsigned long flags;
+  spin_lock_irqsave(&kpi_poll_lock, flags);
+  struct kpi_poll_link *link = q->kpi_poll_links;
+  q->kpi_poll_links = NULL;
+  while (link) {
+    struct kpi_poll_link *next = link->queue_next;
+    /* The file still owns the allocation; close must no longer touch q. */
+    link->queue = NULL;
+    link->queue_next = NULL;
+    link = next;
+  }
+  spin_unlock_irqrestore(&kpi_poll_lock, flags);
+}
+
+static void kpi_poll_notify(wait_queue_head_t *q) {
+  unsigned long flags;
+  spin_lock_irqsave(&kpi_poll_lock, flags);
+  for (struct kpi_poll_link *link = q->kpi_poll_links; link;
+       link = link->queue_next)
+    asc_vfs_poll_notify(link->node, link->native_wq);
+  spin_unlock_irqrestore(&kpi_poll_lock, flags);
+}
 
 void init_wait_entry(struct wait_queue_entry *wq_entry, int flags) {
   wq_entry->flags = (unsigned int)flags;
@@ -120,13 +212,19 @@ static int __kpi_wake_up_common_locked(wait_queue_head_t *q, unsigned int nr,
                                        int flags) {
   int woken = 0;
 
-  while (!list_empty(&q->head)) {
-    struct wait_queue_entry *wq_entry =
-        list_first_entry(&q->head, struct wait_queue_entry, entry);
-    list_del_init(&wq_entry->entry);
-    wq_entry->func(wq_entry, 0, flags, NULL);
+  struct wait_queue_entry *entry, *next;
+
+  list_for_each_entry_safe(entry, next, &q->head, entry) {
+    unsigned int entry_flags = entry->flags;
+    int ret = entry->func(entry, 0, flags, NULL);
+    if (ret < 0)
+      break;
+    if (!ret)
+      continue;
     woken++;
-    if (nr && (unsigned int)woken >= nr)
+    /* Wake callbacks own removal. Persistent/custom entries must remain
+     * registered, and nonexclusive wakes do not consume the exclusive quota. */
+    if ((entry_flags & WQ_FLAG_EXCLUSIVE) && nr && !--nr)
       break;
   }
 
@@ -134,35 +232,22 @@ static int __kpi_wake_up_common_locked(wait_queue_head_t *q, unsigned int nr,
 }
 
 int __kpi_wake_up_locked(wait_queue_head_t *q, unsigned int nr, int flags) {
-  void *poll_wq = q->kpi_poll_wq;
   int woken = __kpi_wake_up_common_locked(q, nr, flags);
-
-  if (poll_wq)
-    linuxkpi_wake_poll_queue(poll_wq);
-
+  kpi_poll_notify(q);
   return woken;
 }
 
 int __kpi_wake_up(wait_queue_head_t *q, unsigned int nr, int flags) {
   unsigned long irqflags;
-  void *poll_wq;
   int woken;
 
-  /* Wake functions must run under the queue lock.  A waiter that times out or
-   * is interrupted can otherwise finish_wait() and return from the enclosing
-   * wait_event() - reusing its stack-allocated entry - while this loop is
-   * still calling into it.  Entries are unlinked before the call so the walk
-   * stays valid even for wake functions that leave the entry queued. */
+  /* Keep callbacks serialized against finish_wait() and stack-entry reuse. */
   spin_lock_irqsave(&q->lock, irqflags);
-  poll_wq = q->kpi_poll_wq;
   woken = __kpi_wake_up_common_locked(q, nr, flags);
+  /* Match the locked API: the wait-head owner cannot destroy q until this
+   * notification completes, and close cannot free subscribed nodes/queues. */
+  kpi_poll_notify(q);
   spin_unlock_irqrestore(&q->lock, irqflags);
-
-  /* Devices that used poll_wait() on this head have sys_poll() waiters parked
-   * on a native wait queue; wake those too (outside the KPI queue lock). */
-  if (poll_wq)
-    linuxkpi_wake_poll_queue(poll_wq);
-
   return woken;
 }
 

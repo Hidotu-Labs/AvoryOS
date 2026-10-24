@@ -198,7 +198,7 @@ with tempfile.TemporaryDirectory() as tmp:
                     '-fsanitize=undefined', '-I', str(ROOT),
                     str(tmp / 'test.c'), '-o', str(tmp / 'test')], check=True)
     args = [str(tmp / 'test'), str(tmp / 'fixture')]
-    wine = ROOT / 'build/alpine/rootfs/usr/lib/wine/x86_64-unix/wine-preloader'
+    wine = ROOT / 'build/arch/rootfs/usr/lib/wine/x86_64-unix/wine-preloader'
     if wine.exists():
         args.append(str(wine))
         smoke = ROOT / 'userland/test_elf32.elf'

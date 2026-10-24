@@ -1,0 +1,139 @@
+[
+    {
+        "data": [
+            {
+                "abmLevel": 0,
+                "allowDdcCi": true,
+                "allowSdrSoftwareBrightness": true,
+                "autoBrightnessCurve": [
+                    [
+                        0,
+                        1
+                    ]
+                ],
+                "autoRotation": "InTabletMode",
+                "automaticBrightness": false,
+                "brightness": 1,
+                "colorPowerTradeoff": "PreferEfficiency",
+                "colorProfileSource": "sRGB",
+                "connectorName": "HDMI-A-1",
+                "detectedDdcCi": false,
+                "edrPolicy": "always",
+                "hdrColorProfileSource": "EDID",
+                "hdrIccProfilePath": "",
+                "highDynamicRange": false,
+                "iccProfilePath": "",
+                "maxBitsPerColor": 0,
+                "mode": {
+                    "cvt": {
+                        "clock": 175781,
+                        "flags": 0,
+                        "hdisplay": 1280,
+                        "hskew": 0,
+                        "hsyncEnd": 1296,
+                        "hsyncStart": 1288,
+                        "htotal": 1312,
+                        "vdisplay": 800,
+                        "vscan": 0,
+                        "vsyncEnd": 808,
+                        "vsyncStart": 804,
+                        "vtotal": 812
+                    },
+                    "flags": 0
+                },
+                "overscan": 0,
+                "rgbRange": "Automatic",
+                "scale": 1,
+                "sdrBrightness": 200,
+                "sdrGamutWideness": 0,
+                "sharpness": 0,
+                "transform": "Normal",
+                "uuid": "050d2744-f3d4-4635-8a6c-b292df78d983",
+                "vrrPolicy": "Never",
+                "wideColorGamut": false
+            },
+            {
+                "abmLevel": 0,
+                "allowDdcCi": true,
+                "allowSdrSoftwareBrightness": true,
+                "autoBrightnessCurve": [
+                    [
+                        0,
+                        1
+                    ]
+                ],
+                "autoRotation": "InTabletMode",
+                "automaticBrightness": false,
+                "brightness": 1,
+                "colorPowerTradeoff": "PreferEfficiency",
+                "colorProfileSource": "sRGB",
+                "connectorName": "Virtual-1",
+                "detectedDdcCi": false,
+                "edrPolicy": "always",
+                "hdrColorProfileSource": "EDID",
+                "hdrIccProfilePath": "",
+                "highDynamicRange": false,
+                "iccProfilePath": "",
+                "maxBitsPerColor": 0,
+                "mode": {
+                    "cvt": {
+                        "clock": 71000,
+                        "flags": 9,
+                        "hdisplay": 1280,
+                        "hskew": 0,
+                        "hsyncEnd": 1360,
+                        "hsyncStart": 1328,
+                        "htotal": 1440,
+                        "vdisplay": 800,
+                        "vscan": 0,
+                        "vsyncEnd": 809,
+                        "vsyncStart": 803,
+                        "vtotal": 823
+                    },
+                    "flags": 0
+                },
+                "overscan": 0,
+                "rgbRange": "Automatic",
+                "scale": 1,
+                "sdrBrightness": 200,
+                "sdrGamutWideness": 0,
+                "sharpness": 0,
+                "transform": "Normal",
+                "uuid": "651f79dd-8ff3-495f-ae90-ec0bf7f63c98",
+                "vrrPolicy": "Never",
+                "wideColorGamut": false
+            }
+        ],
+        "name": "outputs"
+    },
+    {
+        "data": [
+            {
+                "lidClosed": false,
+                "outputs": [
+                    {
+                        "enabled": false,
+                        "outputIndex": 1,
+                        "position": {
+                            "x": 0,
+                            "y": 0
+                        },
+                        "priority": 0,
+                        "replicationSource": ""
+                    },
+                    {
+                        "enabled": true,
+                        "outputIndex": 0,
+                        "position": {
+                            "x": 0,
+                            "y": 0
+                        },
+                        "priority": 1,
+                        "replicationSource": ""
+                    }
+                ]
+            }
+        ],
+        "name": "setups"
+    }
+]

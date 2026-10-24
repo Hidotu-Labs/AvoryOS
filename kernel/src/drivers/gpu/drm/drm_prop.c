@@ -495,11 +495,17 @@ int ascentdrm_atomic_apply_prop(struct drm_device *dev,
   case DRM_MODE_OBJECT_CRTC: {
     switch (prop_id) {
     case DRM_PROP_ID_ACTIVE:
-      /* ACTIVE=0 means disable CRTC; we just track it */
       break;
-    case DRM_PROP_ID_MODE_ID:
-      /* MODE_ID points to a blob containing drm_mode_modeinfo */
+    case DRM_PROP_ID_MODE_ID: {
+      struct drm_prop_blob *blob = value ? ascentdrm_blob_find(dev, (uint32_t)value) : NULL;
+      if (value && (value > UINT32_MAX || !blob ||
+                    blob->length != sizeof(struct drm_mode_modeinfo)))
+        return -22;
+      struct drm_crtc *crtc = (struct drm_crtc *)obj;
+      ascentdrm_crtc_set_mode(crtc, blob ? blob->data : NULL);
+      crtc->x = crtc->y = 0;
       break;
+    }
     default:
       return -1;
     }
@@ -546,6 +552,17 @@ int ascentdrm_atomic_apply_prop(struct drm_device *dev,
 
   /* Persist the value in the object's property table */
   ascentdrm_obj_set_prop(obj, prop_id, value);
+  if (obj->type == DRM_MODE_OBJECT_CRTC &&
+      (prop_id == DRM_PROP_ID_MODE_ID || prop_id == DRM_PROP_ID_ACTIVE)) {
+    uint64_t active = 0, mode_id = 0;
+    ascentdrm_obj_get_prop(obj, DRM_PROP_ID_ACTIVE, &active);
+    ascentdrm_obj_get_prop(obj, DRM_PROP_ID_MODE_ID, &mode_id);
+    struct drm_crtc *crtc = (struct drm_crtc *)obj;
+    crtc->mode_set = true;
+    crtc->mode_valid = active != 0 && mode_id != 0;
+    if (crtc->mode_valid)
+      vblank_set_refresh_hz(crtc->mode.vrefresh);
+  }
   return 0;
 }
 
@@ -654,6 +671,16 @@ int ascentdrm_ioctl_atomic(struct vfs_node *node, struct drm_file *file,
         event_crtc_id = obj_id;
       if (pid == DRM_PROP_ID_CRTC_ID && val != 0)
         event_crtc_id = (uint32_t)val;
+
+      if (mobj->type == DRM_MODE_OBJECT_CRTC &&
+          pid == DRM_PROP_ID_MODE_ID && val != 0) {
+        struct drm_prop_blob *blob = ascentdrm_blob_find(dev, (uint32_t)val);
+        if (val > UINT32_MAX || !blob ||
+            blob->length != sizeof(struct drm_mode_modeinfo)) {
+          spinlock_release(&dev->lock);
+          return -22;
+        }
+      }
 
       if (!test_only) {
         if (mobj->type == DRM_MODE_OBJECT_PLANE &&

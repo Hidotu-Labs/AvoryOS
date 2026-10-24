@@ -16,8 +16,16 @@ shim = r'''
 #define ERESTARTSYS 512
 #define MAX_SCHEDULE_TIMEOUT LONG_MAX
 static unsigned warning_count;
-#define klogf(...) ((void)warning_count++)
-struct dma_fence { bool signaled; unsigned calls; };
+#define klogf(fmt,...) do { if ((fmt)[1]=='I') warning_count++; else wait_reports++; } while(0)
+struct dma_fence { bool signaled; unsigned calls; unsigned long long context,seqno; unsigned long flags; };
+#define READ_ONCE(x) (x)
+static unsigned long long clock_ms;
+static unsigned timeouts, wait_reports, dumps;
+static void linuxkpi_report_stalled_gpu_wait(void) {dumps++;}
+static unsigned long msecs_to_jiffies(unsigned long ms) {return ms;}
+static unsigned long long linuxkpi_monotonic_ms(void) {return clock_ms;}
+static unsigned long linuxkpi_current_tgid(void) {return 405;}
+
 static bool pending_signal;
 static long next_error;
 static long dma_fence_wait_timeout(struct dma_fence *fence, bool interruptible, long timeout) {
@@ -25,6 +33,7 @@ static long dma_fence_wait_timeout(struct dma_fence *fence, bool interruptible, 
   if (next_error) return next_error;
   if (interruptible && pending_signal) return -ERESTARTSYS;
   assert(timeout > 0);
+  if(timeouts) { assert(!interruptible && timeout==1000);timeouts--;clock_ms+=1000;return 0; }
   fence->signaled = true;
   return timeout;
 }
@@ -57,6 +66,16 @@ int main(void) {
     assert(repeated.signaled && repeated.calls == 2);
   }
   assert(warning_count == 4);
+  /* A lost notification or delayed GPU must not strand the recovery forever
+   * or report mapping success until the fence actually completes. */
+  timeouts=6;clock_ms=0;
+  struct dma_fence delayed={0};
+  assert(linuxkpi_nouveau_bind_wait_timeout(&delayed,true,MAX_SCHEDULE_TIMEOUT)==MAX_SCHEDULE_TIMEOUT);
+  assert(delayed.signaled && delayed.calls==8 && clock_ms==6000 && wait_reports==1 && dumps==1);
+  next_error=-22;struct dma_fence failed={0};
+  assert(linuxkpi_nouveau_bind_wait_timeout(&failed,false,MAX_SCHEDULE_TIMEOUT)==-22);
+  assert(!failed.signaled);
+  (void)linuxkpi_current_tgid;
   puts("PASS: interrupted synchronous Nouveau bind waits for completion; normal, finite and error paths preserved");
 }
 '''

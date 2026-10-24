@@ -13,7 +13,7 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 BUILD_DIR=${BUILD_DIR:-"$ROOT_DIR/build/quake2"}
 SOURCE_DIR="$BUILD_DIR/yquake2"
 OUTPUT_DIR="$ROOT_DIR/userland/quake2"
-ALPINE_ROOTFS=${ALPINE_ROOTFS:-"$ROOT_DIR/build/alpine/rootfs"}
+ARCH_ROOTFS=${ARCH_ROOTFS:-"$ROOT_DIR/build/arch/rootfs"}
 REPO_URL=${YQUAKE2_REPO_URL:-"https://github.com/yquake2/yquake2.git"}
 DEMO_URL=${QUAKE2_DEMO_URL:-"https://ftp.gwdg.de/pub/misc/ftp.idsoftware.com/idstuff/quake2/q2-314-demo-x86.exe"}
 DEMO_SHA256=7ace5a43983f10d6bdc9d9b6e17a1032ba6223118d389bd170df89b945a04a1e
@@ -37,11 +37,11 @@ find_compiler() {
 
 check_dependencies() {
     for file in \
-        "$ALPINE_ROOTFS/usr/include/SDL2/SDL.h" \
-        "$ALPINE_ROOTFS/usr/lib/libSDL2.so" \
-        "$ALPINE_ROOTFS/usr/lib/libz.so"; do
+        "$ARCH_ROOTFS/usr/include/SDL2/SDL.h" \
+        "$ARCH_ROOTFS/usr/lib/libSDL2.so" \
+        "$ARCH_ROOTFS/usr/lib/libz.so"; do
         if [ ! -e "$file" ]; then
-            echo "Error: missing $file; run scripts/setup-arch.sh first." >&2
+            echo "Error: missing $file; run scripts/setup-rootfs.sh first." >&2
             exit 1
         fi
     done
@@ -77,8 +77,8 @@ build_engine() {
     wrapper_dir="$BUILD_DIR/tools"
     mkdir -p "$wrapper_dir"
     sed \
-        -e "s|@INCLUDE@|$ALPINE_ROOTFS/usr/include/SDL2|g" \
-        -e "s|@LIB@|$ALPINE_ROOTFS/usr/lib|g" \
+        -e "s|@INCLUDE@|$ARCH_ROOTFS/usr/include/SDL2|g" \
+        -e "s|@LIB@|$ARCH_ROOTFS/usr/lib|g" \
         "$ROOT_DIR/scripts/quake2-sdl2-config.in" > "$wrapper_dir/sdl2-config"
     chmod +x "$wrapper_dir/sdl2-config"
 
@@ -101,9 +101,9 @@ WITH_RPATH=no
 WITH_SDL3=no
 WITH_SYSTEMWIDE=no
 WITH_XDG=no
-INCLUDE=--sysroot=$ALPINE_ROOTFS -I$ALPINE_ROOTFS/usr/include
-CFLAGS=--sysroot=$ALPINE_ROOTFS -O2 -Wall -pipe -fomit-frame-pointer -fno-stack-protector -DASCENTOS
-LDFLAGS=--sysroot=$ALPINE_ROOTFS -L$ALPINE_ROOTFS/usr/lib -L$ALPINE_ROOTFS/lib -Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 -Wl,-rpath-link,$ALPINE_ROOTFS/usr/lib -Wl,-rpath-link,$ALPINE_ROOTFS/lib -Wl,--allow-shlib-undefined -Wl,-rpath,/usr/lib:/lib
+INCLUDE=--sysroot=$ARCH_ROOTFS -I$ARCH_ROOTFS/usr/include
+CFLAGS=--sysroot=$ARCH_ROOTFS -O2 -Wall -pipe -fomit-frame-pointer -fno-stack-protector -DASCENTOS
+LDFLAGS=--sysroot=$ARCH_ROOTFS -L$ARCH_ROOTFS/usr/lib -L$ARCH_ROOTFS/lib -Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 -Wl,-rpath-link,$ARCH_ROOTFS/usr/lib -Wl,-rpath-link,$ARCH_ROOTFS/lib -Wl,--allow-shlib-undefined -Wl,-rpath,/usr/lib:/lib
 EOF
 
     echo "[*] Building Yamagi Quake II (SDL2 software renderer)..."

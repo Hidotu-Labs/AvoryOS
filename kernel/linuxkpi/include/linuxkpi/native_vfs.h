@@ -69,6 +69,7 @@ const char *asc_vfs_devnode_name_at(const char *dir, unsigned int index,
  * bridge; attach it to a node with asc_vfs_node_set_wait_queue(). */
 void *asc_vfs_poll_wq_alloc(void);
 void asc_vfs_poll_wq_free(void *wq);
+void asc_vfs_poll_notify(void *node, void *wq);
 
 /* Kernel-side (fd-less) open of a native path.  Runs open_instance() like
  * sys_open() and returns the node with one reference, or NULL.  Used by

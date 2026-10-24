@@ -70,6 +70,11 @@ def install(disk, bundle):
                 raise RuntimeError('guest disk changed during firmware installation; leaving it untouched')
             os.chmod(copy,original.st_mode & 0o777)
             copy.replace(disk)
+            partition_cache=ROOT/'build/arch/disk-partition.img'
+            if partition_cache.is_file():
+                cache_tmp=partition_cache.with_name(partition_cache.name+'.tmp')
+                subprocess.run(['cp','--reflink=auto','--sparse=always',str(part),str(cache_tmp)],check=True)
+                cache_tmp.replace(partition_cache)
             identity['inode']=disk.stat().st_ino
             stamp.write_text(json.dumps(identity,indent=2)+'\n')
             print('Pinned Nouveau firmware installed; existing desktop filesystem preserved.')

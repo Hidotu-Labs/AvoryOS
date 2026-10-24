@@ -191,6 +191,7 @@ struct file {
   loff_t f_pos;
   struct address_space *f_mapping; /* == file_inode(file)->i_mapping */
   void *f_asc_node; /* native vfs_node_t * (Avory bridge, opaque here) */
+  struct kpi_poll_link *f_poll_links; /* detachable subscriptions for all exported nodes */
   void *f_poll_wq;  /* native wait_queue_t * backing poll(2) (Avory) */
 };
 

@@ -215,7 +215,7 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
   uint64_t cv_end = base;
   bool ours = false, pagecache = false;
 
-  vmm_lock_acquire();
+  vmm_lock_acquire_for(pml4, base);
   // Flush collected frames + sweep the open PT. Drops and re-takes vmm_lock
   // around the drain (the drain must run off-lock).
   while (va < end) {
@@ -297,7 +297,7 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
         // Re-resolve the VMA interval (split does not touch VMAs, but the
         // lock was dropped and another thread may have edited the tree).
         cv_end = va;
-        vmm_lock_acquire();
+        vmm_lock_acquire_for(pml4, va);
         continue;
       }
     }
@@ -315,7 +315,7 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
       // VMA tree may have changed while mm->lock was... (it wasn't: the
       // caller holds mm->lock throughout. Only vmm_lock was dropped, so
       // the interval cache stays valid.)
-      vmm_lock_acquire();
+      vmm_lock_acquire_for(pml4, va);
     }
   }
   if (pt_dirty)
@@ -1001,7 +1001,7 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
       }
       cursor = area->end;
     }
-    vmm_lock_acquire();
+    vmm_lock_acquire_for(pml4, batch_start);
     bool ok = true;
     bool touched = false;
 
@@ -1469,17 +1469,49 @@ static uint64_t sys_mincore(uint64_t addr, uint64_t len, uint64_t vec_ptr,
   (void)a4; (void)a5; (void)a6;
   if (addr & (PAGE_SIZE - 1))
     return (uint64_t)-22; // EINVAL
+  if (!is_user_pointer(addr) || len > USER_ADDR_MAX - addr + 1)
+    return (uint64_t)-12; // ENOMEM: range outside the user address space
   if (len == 0)
     return 0;
   if (!vec_ptr)
     return (uint64_t)-14; // EFAULT
 
-  size_t pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+  size_t pages = len / PAGE_SIZE + (len % PAGE_SIZE != 0);
   if (!vmm_is_user_addr_range_writable(vec_ptr, pages))
     return (uint64_t)-14; // EFAULT
 
-  // In AvoryOS all allocated user pages are in physical memory (no swap)
-  memset((void *)vec_ptr, 1, pages);
+  struct thread *current = sched_get_current();
+  if (!current || !current->mm)
+    return (uint64_t)-12;
+  uint64_t *pml4 = current->cr3 ? (uint64_t *)current->cr3
+                                : vmm_get_active_pml4();
+
+  /* mincore is also used as a mapping probe (Mesa checks native Wayland
+   * handles this way). Unmapped holes must return ENOMEM, even though there
+   * is no swap. A VMA with a demand-zero page is mapped but not resident.
+   * Build small batches under the MM/page-table locks; copyout can fault and
+   * must happen after releasing both locks. */
+  unsigned char resident[256];
+  for (size_t done = 0; done < pages;) {
+    size_t count = pages - done;
+    if (count > sizeof(resident)) count = sizeof(resident);
+    spinlock_acquire(&current->mm->lock);
+    vmm_lock_acquire_for(pml4, addr + done * PAGE_SIZE);
+    for (size_t i = 0; i < count; i++) {
+      uint64_t page = addr + (done + i) * PAGE_SIZE;
+      if (!vma_find(&current->mm->vmas, page)) {
+        vmm_lock_release();
+        spinlock_release(&current->mm->lock);
+        return (uint64_t)-12; // ENOMEM: at least one page is unmapped
+      }
+      resident[i] = vmm_page_present_nolock(pml4, page) ? 1 : 0;
+    }
+    vmm_lock_release();
+    spinlock_release(&current->mm->lock);
+    if (copy_to_user((void *)(vec_ptr + done), resident, count) != 0)
+      return (uint64_t)-14;
+    done += count;
+  }
   return 0;
 }
 

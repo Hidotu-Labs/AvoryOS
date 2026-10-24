@@ -33,6 +33,14 @@ endif
 CFLAGS := -g -O2 -pipe
 CPPFLAGS :=
 
+# Release identity is supplied by the repository's top-level make invocation.
+BUILD_NAME ?= Ascension
+BUILD_VERSION ?= 3.0.0
+BUILD_TAG ?= dev
+override CPPFLAGS += -DAVORY_BUILD_NAME='"$(BUILD_NAME)"' \
+	-DAVORY_BUILD_VERSION='"$(BUILD_VERSION)"' \
+	-DAVORY_BUILD_TAG='"$(BUILD_TAG)"'
+
 # Syscall tracing.
 #
 #   make SYSCALL_LOG=1         every syscall of every process (very noisy)
@@ -237,6 +245,7 @@ ifneq ($(linux-obj-y),)
         -DKBUILD_BASENAME='"avoryos"' \
         -include linux/include/linux/compiler-version.h \
         -include linux/include/linux/compiler_types.h \
+        -include linux/include/generated/autoconf.h \
         -include linux/include/linux/kconfig.h \
         $(filter -D%,$(CPPFLAGS)) \
         -MMD \
@@ -380,6 +389,13 @@ override HEADER_DEPS += $(LINUX_OBJ:.o=.d) $(KPI_OBJ:.o=.d) $(LINUX_TEST_OBJ:.o=
 .PHONY: all
 all: bin-$(ARCH)/$(OUTPUT)
 
+ifneq ($(linux-obj-y),)
+# Adding an overlay must invalidate objects that previously included the
+# imported header and inlined its unavailable-eventfd stubs. Keep this after
+# all so an individual object does not become the default build target.
+obj-$(ARCH)/linux/drivers/gpu/drm/drm_syncobj.c.o: linuxkpi/include/linux/eventfd.h
+endif
+
 # Imported headers/layouts and AMD-specific bridge compilation differ between
 # source profiles. Switching a pin or gate must also rebuild native/KPI/test
 # objects, even when the alternate source's timestamps are older.
@@ -388,7 +404,7 @@ LINUX_IMPORT_ID := $(shell sed -n '/^tag=/p;/^commit=/p' linux/.pin 2>/dev/null)
 .PHONY: linux-profile-force
 $(LINUX_PROFILE_STAMP): linux-profile-force
 	@mkdir -p "$(dir $@)"
-	@printf '%s\n' '$(LINUX_IMPORT_ID) KPI_AMDGPU=$(KPI_AMDGPU) KPI_NOUVEAU=$(KPI_NOUVEAU) LINUX_IMPORTED=$(if $(linux-obj-y),1,0)' > $@.tmp
+	@printf '%s\n' '$(LINUX_IMPORT_ID) KPI_AMDGPU=$(KPI_AMDGPU) KPI_NOUVEAU=$(KPI_NOUVEAU) LINUX_IMPORTED=$(if $(linux-obj-y),1,0) BUILD_NAME=$(BUILD_NAME) BUILD_VERSION=$(BUILD_VERSION) BUILD_TAG=$(BUILD_TAG)' > $@.tmp
 	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm $@.tmp; fi
 $(OBJ) $(LINUX_OBJ): $(LINUX_PROFILE_STAMP)
 

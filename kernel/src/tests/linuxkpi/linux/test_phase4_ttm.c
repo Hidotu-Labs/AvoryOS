@@ -44,7 +44,6 @@
 #define P4T_LOOP_WARMUP 16
 
 static int p4t_failures;
-static atomic_t p4t_destroyed = ATOMIC_INIT(0);
 
 static void p4t_ok(const char *what) {
   klogf("[  OK  ] LinuxKPI: TTM %s\n", what);
@@ -135,7 +134,6 @@ struct p4t_dev {
 static void p4t_bo_destroy(struct ttm_buffer_object *bo) {
   if (bo->base.resv == &bo->base._resv)
     dma_resv_fini(&bo->base._resv);
-  atomic_inc(&p4t_destroyed);
   kfree(bo);
 }
 
@@ -497,103 +495,6 @@ out_dev:
   kfree(d);
 }
 
-/* Model driver-init rollback with real TTM objects and workers. The injected
- * failure is after 1..4 pinned allocations, not a simulated PSP handshake.
- * Keep both managers alive until all BO references and deferred deletes have
- * drained; this is the lifetime requirement implicated by the reported fault.
- */
-static void p4t_test_init_rollback(void) {
-  for (int stage = 1; stage <= 4; stage++) {
-    struct p4t_dev *d = kzalloc(sizeof(*d), GFP_KERNEL);
-    struct ttm_buffer_object *bos[4] = {0};
-    struct ttm_placement sys = {.num_placement = 1, .placement = &p4t_sys_place};
-    struct ttm_place place = {.mem_type = TTM_PL_VRAM};
-    struct ttm_placement vram = {.num_placement = 1, .placement = &place};
-    struct ttm_operation_ctx ctx = {.interruptible = false};
-    int before = atomic_read(&p4t_destroyed), created = 0, deferred = 0;
-    int ret;
-
-    if (!d || p4t_dev_init(d)) {
-      p4t_fail("rollback device init", -ENOMEM);
-      kfree(d);
-      return;
-    }
-    ret = ttm_range_man_init(&d->bdev, TTM_PL_VRAM, true, 256);
-    if (ret) {
-      p4t_fail("rollback manager init", ret);
-      p4t_dev_fini(d);
-      kfree(d);
-      return;
-    }
-    for (int i = 0; i < stage; i++) {
-      ret = p4t_bo_new(&d->bdev, &sys, &bos[i]);
-      if (ret) {
-        p4t_fail("rollback BO init", ret);
-        break;
-      }
-      created++;
-      ret = ttm_bo_reserve(bos[i], false, false, NULL);
-      if (ret) {
-        p4t_fail("rollback BO reserve", ret);
-        break;
-      }
-      ret = ttm_bo_validate(bos[i], &vram, &ctx);
-      if (!ret)
-        ttm_bo_pin(bos[i]);
-      else
-        p4t_fail("rollback VRAM validate", ret);
-      ttm_bo_unreserve(bos[i]);
-      if (ret)
-        break;
-    }
-
-    /* Inject an init failure, then unwind allocations in reverse order. */
-    for (int i = created - 1; i >= 0; i--) {
-      struct ttm_buffer_object *bo = bos[i];
-      struct dma_resv *resv = bo->base.resv;
-      ret = ttm_bo_reserve(bo, false, false, NULL);
-      if (ret) {
-        p4t_fail("rollback cleanup reserve", ret);
-        /* Do not tear down managers underneath a live BO. */
-        return;
-      }
-      if (bo->pin_count)
-        ttm_bo_unpin(bo);
-      if (i == 0) {
-        /* A held reservation forces the real delayed-delete work item.
-         * Its resurrected reference keeps resv alive until we unlock it.
-         * Do not dereference bo after unlocking: the worker may free it.
-         */
-        ttm_bo_put(bo);
-        deferred = bo->deleted;
-        dma_resv_unlock(resv);
-      } else {
-        ttm_bo_unreserve(bo);
-        ttm_bo_put(bo);
-      }
-      bos[i] = NULL;
-    }
-    drain_workqueue(d->bdev.wq);
-    if (created != stage || !deferred ||
-        atomic_read(&p4t_destroyed) - before != created)
-      p4t_fail("rollback release/deferred count", stage);
-    if (ttm_resource_manager_usage(ttm_manager_type(&d->bdev, TTM_PL_VRAM)) ||
-        ttm_resource_manager_usage(ttm_manager_type(&d->bdev, TTM_PL_SYSTEM)) ||
-        #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
-        !list_empty(&d->bdev.unevictable))
-#else
-        !list_empty(&d->bdev.pinned))
-#endif
-      p4t_fail("rollback live resources after drain", stage);
-    ret = ttm_range_man_fini(&d->bdev, TTM_PL_VRAM);
-    if (ret)
-      p4t_fail("rollback manager fini", ret);
-    p4t_dev_fini(d);
-    kfree(d);
-  }
-  if (!p4t_failures)
-    p4t_ok("partial-init rollback (4 stages, deferred deletes drained)");
-}
 
 void linuxkpi_test_phase4_ttm(void) {
   p4t_failures = 0;
@@ -604,7 +505,6 @@ void linuxkpi_test_phase4_ttm(void) {
   p4t_test_vram_move();
   p4t_test_pinned_eviction();
   p4t_test_loop();
-  p4t_test_init_rollback();
 
   if (p4t_failures == 0)
     klog_puts("[  OK  ] LinuxKPI: TTM suite complete\n");

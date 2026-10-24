@@ -63,13 +63,7 @@ eskip() { echo unexpected-skip; }
 ''' + bridge], env=env, capture_output=True, text=True, check=True)
     assert result.stdout.strip() == 'status=1', result.stdout
 
-for name, expected in [('pipewire-pulse', 'pipewire-pulse'),
-                       ('pipewire-alsa', 'pipewire-alsa'),
-                       ('pipewire-libs', 'libpipewire'),
-                       ('pulseaudio-utils', 'libpulse')]:
-    result = subprocess.check_output(['sh', '-c',
-                                      '. "$1"; arch_name "$2"', 'sh',
-                                      str(ROOT / 'scripts/arch-pkgs.sh'), name], text=True)
-    assert result.strip() == expected, (name, result)
+for package in ('pipewire-pulse', 'pipewire-alsa', 'libpipewire', 'libpulse'):
+    assert f'install_arch "{package}"' in setup, package
 
-print('PASS: root uses rcS audio, bridge readiness is checked, package splits are preserved')
+print('PASS: root uses rcS audio, bridge readiness is checked, Arch package names are explicit')

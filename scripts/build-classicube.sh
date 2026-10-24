@@ -12,9 +12,9 @@ set -e
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 BUILD_DIR=${BUILD_DIR:-"$ROOT_DIR/build/classicube"}
-PREFIX=${GLIBC_SYSROOT:-"$ROOT_DIR/toolchain/glibc-sysroot"}
+PREFIX=${GLIBC_SYSROOT:-"$ROOT_DIR/build/arch/rootfs"}
 INSTALL_DIR="$ROOT_DIR/userland"
-MESA_ROOT=${MESA_ROOT:-"$ROOT_DIR/build/alpine/rootfs"}
+MESA_ROOT=${MESA_ROOT:-"$ROOT_DIR/build/arch/rootfs"}
 CLASSICUBE_RENDERER=${CLASSICUBE_RENDERER:-mesa}
 JOBS=$(nproc 2>/dev/null || echo 4)
 REPO_URL="https://github.com/ClassiCube/ClassiCube/archive/refs/heads/master.tar.gz"
@@ -90,12 +90,12 @@ build_classicube() {
     # - CC_BUILD_CURL: (Disabled for now to simplify, or use wget)
     # - CC_BUILD_NOMUSIC: Disable audio for now to ensure stable first run
     
-    CFLAGS="-O2 -static -fno-stack-protector \
+    CFLAGS="--sysroot=$PREFIX -O2 -static -fno-stack-protector \
             -DCC_BUILD_X11 -DCC_GFX_BACKEND=1 -DCC_BUILD_POSIX \
             -DCC_BUILD_NOMUSIC \
             -I$PREFIX/include"
             
-    LDFLAGS="-static -L$PREFIX/lib"
+    LDFLAGS="--sysroot=$PREFIX -static -L$PREFIX/lib"
     
     # Libraries needed for X11 on AscentOS
     LIBS="-lX11 -lxcb -lXau -lXdmcp -lmd -lm -lc"

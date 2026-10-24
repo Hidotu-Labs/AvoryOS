@@ -1193,9 +1193,9 @@ static wizard_step_t screen_components(void) {
         /* Games & Media */
         tui_cursor(box_y + 7, box_x + 6);
         if (item_idx == 2) {
-            tui_buf_printf("\033[1;37;44m[%c] Ported Games & Media (DOOM, Quake II, Firefox)\033[0m", g_opt_games ? '*' : ' ');
+            tui_buf_printf("\033[1;37;44m[%c] Ported Games & Media (Quake II, Firefox)\033[0m", g_opt_games ? '*' : ' ');
         } else {
-            tui_buf_printf("\033[0;30;47m[%c] Ported Games & Media (DOOM, Quake II, Firefox)\033[0m", g_opt_games ? '*' : ' ');
+            tui_buf_printf("\033[0;30;47m[%c] Ported Games & Media (Quake II, Firefox)\033[0m", g_opt_games ? '*' : ' ');
         }
 
         /* Desktop flavor radio */

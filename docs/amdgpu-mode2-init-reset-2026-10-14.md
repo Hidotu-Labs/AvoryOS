@@ -84,7 +84,7 @@ PSP publication, PSP ring and doorbell-cleanup regressions also pass. Results:
 Kernel and ISO builds pass. Linked symbols include both compatibility hooks
 and the boot parameter descriptor; imported device-init relocations target the
 hooks. The ISO kernel matches the current stripped ELF byte-for-byte.
-The eight-CPU private GPU-free TTM rollback guest also passes and shuts down
+The eight-CPU private GPU-free guest also passes and shuts down
 normally (`build/logs/amdgpu-mode2-software-boot.log`). AMDGPU is disabled in
 that guest, so it does not validate the physical reset.
 Build logs: `build/logs/amdgpu-mode2-build.log` and

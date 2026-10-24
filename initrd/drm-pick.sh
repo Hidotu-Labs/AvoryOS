@@ -1,7 +1,7 @@
 #!/bin/sh
 set -u
 mode="${1:---display}"
-case "$mode" in --display|--render|--pair) ;; *) exit 2 ;; esac
+case "$mode" in --display|--render|--pair|--wayland) ;; *) exit 2 ;; esac
 inventory="$(/bin/drm-identify 2>/dev/null)" || exit 1
 [ -n "$inventory" ] || exit 1
 
@@ -52,6 +52,29 @@ if [ -z "$render" ]; then
     done
 fi
 case "$mode" in
+    --wayland)
+        [ -n "$display" ] || exit 1
+        # KWin needs primary/card nodes for KMS and render nodes for Mesa.
+        # Prefer the selected hardware renderer, retaining the visible sink
+        # and other production GPUs. VKMS/VGEM are test devices, not monitors.
+        printf '%s\n' "$inventory" | awk -v display="$display" -v render="$render" '
+            function add(node) {
+                if (length(node) && !seen[node]++)
+                    devices = devices (length(devices) ? ":" : "") node
+            }
+            { cards[NR]=$1; drivers[NR]=$2 }
+            $5==render && render!="" { render_card=$1; render_driver=$2 }
+            END {
+                if (render_driver=="nouveau" || render_driver=="amdgpu")
+                    add(render_card)
+                add(display)
+                for (i=1; i<=NR; i++)
+                    if (drivers[i]=="nouveau" || drivers[i]=="amdgpu" || drivers[i]=="ascentdrm")
+                        add(cards[i])
+                printf "%s %s %s %s\n", display, length(render) ? render : "-",
+                    length(render_driver) ? render_driver : "-", devices
+            }'
+        ;;
     --display) [ -n "$display" ] && printf '%s\n' "$display" ;;
     --render) [ -n "$render" ] && printf '%s\n' "$render" ;;
     --pair) [ -n "$display" ] && printf '%s %s\n' "$display" "${render:--}" ;;

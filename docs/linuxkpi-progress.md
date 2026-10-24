@@ -304,7 +304,7 @@ remain available.
       `[  OK  ] LinuxKPI: upstream lib/math/div64.c linked, result correct`,
       `[  OK  ] LinuxKPI: kernel_fpu_begin/end restores XSAVE state`,
       `[KERNEL] LinuxKPI: running 1 initcall(s)...` → demo ran → all completed.
-      System reached `/bin/avoryd` and the `AvoryOS login` prompt.
+      System reached the `AvoryOS login` prompt.
       Pinned tree: v6.6.156 (`8b73de7`); `iter_div_u64_rem` is a real symbol in
       the linked image and `.initcall` contains the demo pointer.
 
@@ -2044,8 +2044,7 @@ them).  First increment: the P2 VMA-bridge prerequisite, test-first.
   the next boot (no host reboot needed when runs are powered off, not
   killed); recorded in `docs/amdgpu-testing.md`.
 - **Watch item: one hardware reset at session start did not reproduce.**
-  The first DC-active boot of `p6-c6-fixed2.log` reset right after
-  `[PROC] Executing main session: /bin/avoryd` (no panic, no watchdog).
+  The first DC-active boot of `p6-c6-fixed2.log` reset during main-session startup (no panic, no watchdog).
   After the cold host reboot the same build booted clean with DC active
   (`p6-c6-crash.log`: 0 `[FAIL]`s, i2c suite green, session started,
   login reached), so the reset is intermittent until seen again; the

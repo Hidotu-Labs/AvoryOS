@@ -4,7 +4,7 @@ How to run, capture and compare the Raphael iGPU under VFIO on this host, and
 what is already known about the device.  Written at the Phase 5 closeout
 (2026-09-13) so a Phase 6 agent can reproduce every step.
 
-## Current abrupt-exit recovery work (2026-10-14)
+## Current abrupt-exit recovery status
 
 **Post-suspend launch prevention (2026-10-18):** `run-vfio`,
 `run-c7-prime` and the diagnostic launch logger now check the host's suspend
@@ -15,12 +15,12 @@ not repair post-resume GPU/firmware state. Other GPUs and software-only QEMU
 guests are unaffected. Direct QEMU invocations bypass this repository check.
 See [post-suspend evidence and limitations](amdgpu-post-suspend-launch-2026-10-18.md).
 
-Raphael PF passthrough now defaults to the combined MODE2 initialization reset
-and checked PSP ring replacement. These hooks are scoped in LinuxKPI; imported
+Raphael PF passthrough defaults to the combined MODE2 initialization reset and
+checked PSP ring replacement. These hooks are scoped in LinuxKPI; imported
 AMDGPU sources were preserved. X-close and Ctrl-C/reopen physical pairs passed
-with both explicitly enabled. Default-policy validation and limitations are
-recorded in [combined recovery evidence](amdgpu-combined-recovery-2026-10-14.md).
-This does not establish production reliability or fix earlier pixel/FPS reports.
+with the recovery path enabled. The user reports that X-close and Ctrl-C no
+longer affect the GPU. Historical trial details are in
+[combined recovery evidence](amdgpu-combined-recovery-2026-10-14.md).
 
 `make run-c7-prime` enables both. For the original behavior, disable both:
 
@@ -28,11 +28,8 @@ This does not establish production reliability or fix earlier pixel/FPS reports.
 make run-c7-prime KPI_AMDGPU_MODE2_RESET=0 KPI_AMDGPU_PSP_REINIT=0
 ```
 
-Recovery parameters are `kpi_amdgpu_mode2_reset` and `kpi_amdgpu_psp_reinit`.
-The bounded physical runner only starts hardware guests with `--run`; use
-`python3 scripts/amdgpu-xclose-recovery.py --run --driver-defaults` to check
-native defaults, or add `--close-mode sigint` for Ctrl-C. Each run starts at
-most two physical guests and does not retry a failed initialization.
+Recovery parameters are `kpi_amdgpu_mode2_reset` and
+`kpi_amdgpu_psp_reinit`.
 
 ## Host facts
 

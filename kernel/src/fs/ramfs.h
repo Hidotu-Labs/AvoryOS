@@ -35,6 +35,8 @@ uint32_t ramfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
                      uint8_t *buffer);
 int ramfs_truncate(vfs_node_t *node, uint32_t new_len);
 int ramfs_fallocate(vfs_node_t *node, int mode, uint32_t offset, uint32_t len);
+int ramfs_chmod(vfs_node_t *node, uint16_t permission);
+int ramfs_chown(vfs_node_t *node, uint32_t uid, uint32_t gid);
 void ramfs_free_file_data(ramfs_file_t *file);
 
 #endif

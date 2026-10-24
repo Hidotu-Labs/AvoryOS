@@ -9,6 +9,8 @@
 #include "console/klog.h"
 #include "hal/hal.h"
 #include "lib/string.h"
+#include "lock/lockdiag.h"
+#include <linuxkpi/gpu_perf.h>
 #include "mm/heap.h"
 #include "sched/sched.h"
 #include "sched/wait.h"
@@ -55,6 +57,12 @@ bool linuxkpi_preempt_allowed(void) {
   return allowed;
 }
 #endif
+
+void linuxkpi_report_stalled_gpu_wait(void) {
+  static unsigned int reported;
+  if (!__atomic_exchange_n(&reported, 1, __ATOMIC_ACQ_REL))
+    lockdiag_dump_all("Nouveau synchronous VM_BIND fence stalled for 5 seconds");
+}
 
 void *linuxkpi_current_thread(void) { return sched_get_current(); }
 
@@ -169,6 +177,7 @@ void linuxkpi_set_current_state(int state) {
   /* Upstream performs this before checking the wait condition. Clear an old
    * notification first, then publish the new wait; a wake before publication
    * is observed by that condition check, while a later wake arms the flag. */
+  __atomic_store_n(&t->kpi_block_pending, false, __ATOMIC_RELEASE);
   if (state) {
     __atomic_store_n(&t->kpi_wake_pending, false, __ATOMIC_RELEASE);
     __atomic_store_n(&t->kpi_wait_prepared, true, __ATOMIC_SEQ_CST);
@@ -183,31 +192,47 @@ void linuxkpi_thread_block(void) {
   if (!t)
     return;
 
+  /* TASK_RUNNING schedule() is a yield, not a blocking wait. Mutex callers
+   * publish their wait under wait_lock before reaching this bridge. */
+  if (!__atomic_load_n(&t->kpi_wait_prepared, __ATOMIC_SEQ_CST)) {
+    sched_yield();
+    return;
+  }
+
   /* Same rendezvous as the timeout sleep: publish the blocking decision
    * under the run-queue lock and consume a wake that raced the caller's
    * condition check.  Without this, a waker that runs while this thread is
    * still THREAD_RUNNING is ignored by sched_wakeup() (it only wakes
    * BLOCKED/SLEEPING threads) and the wait would never be satisfied. */
+  hal_irq_state_t irq_flags = hal_irq_save();
   struct cpu_info *cpu = cpu_get_current();
   if (cpu)
     spinlock_acquire(&cpu->queue_lock);
   if (__atomic_exchange_n(&t->kpi_block_pending, false, __ATOMIC_ACQ_REL)) {
     if (cpu)
       spinlock_release(&cpu->queue_lock);
+    hal_irq_restore(irq_flags);
     /* A wake already arrived: the caller re-checks its condition. */
+    linuxkpi_set_current_state(0);
     return;
   }
-  t->state = THREAD_BLOCKED;
+  gpu_perf_syncobj_park(t);
+  __atomic_store_n(&t->state, THREAD_BLOCKED, __ATOMIC_RELEASE);
   if (cpu)
     spinlock_release(&cpu->queue_lock);
+  hal_irq_restore(irq_flags);
 
   sched_yield();
+  gpu_perf_syncobj_resume(t);
+
+  linuxkpi_set_current_state(0);
 
   /* If no wake re-marked us runnable (e.g. the yield resumed us directly),
    * do not stay marked blocked while running; sched_wakeup() would then try
    * to enqueue a running thread for a later wake. */
-  if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING)
-    t->state = THREAD_RUNNING;
+  uint8_t st = __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
+  if (st == THREAD_BLOCKED || st == THREAD_SLEEPING)
+    __atomic_store_n(&t->state, THREAD_RUNNING, __ATOMIC_RELEASE);
 }
 
 void linuxkpi_mutex_wait_set(void *mutex) {
@@ -252,20 +277,25 @@ int linuxkpi_schedule_timeout_ms(unsigned long ms) {
    * sched_wakeup() takes, so either the waker sees THREAD_SLEEPING or this
    * loop sees the pending wake. */
   for (;;) {
+    hal_irq_state_t irq_flags = hal_irq_save();
     struct cpu_info *cpu = cpu_get_current();
     if (cpu)
       spinlock_acquire(&cpu->queue_lock);
     if (__atomic_exchange_n(&t->kpi_wake_pending, false, __ATOMIC_ACQ_REL)) {
       if (cpu)
         spinlock_release(&cpu->queue_lock);
+      hal_irq_restore(irq_flags);
       woken = true;
       break;
     }
-    t->state = THREAD_SLEEPING;
+    gpu_perf_syncobj_park(t);
+    __atomic_store_n(&t->state, THREAD_SLEEPING, __ATOMIC_RELEASE);
     if (cpu)
       spinlock_release(&cpu->queue_lock);
+    hal_irq_restore(irq_flags);
 
     sched_yield();
+    gpu_perf_syncobj_resume(t);
 
     if (!t->wakeup_ticks)
       break;
@@ -277,10 +307,12 @@ int linuxkpi_schedule_timeout_ms(unsigned long ms) {
   t->wakeup_ticks = 0;
   __atomic_store_n(&t->kpi_wake_pending, false, __ATOMIC_RELEASE);
   __atomic_store_n(&t->kpi_timeout_active, false, __ATOMIC_RELEASE);
+  linuxkpi_set_current_state(0);
   /* Timed-out sleeping calls can leave the state as SLEEPING when the idle
    * fallback never switched away; the caller is definitely running now. */
-  if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED)
-    t->state = THREAD_RUNNING;
+  uint8_t st = __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
+  if (st == THREAD_SLEEPING || st == THREAD_BLOCKED)
+    __atomic_store_n(&t->state, THREAD_RUNNING, __ATOMIC_RELEASE);
 
   /* jiffies advances with the native tick, which may not have fired between
    * the last sync and this wakeup (the LAPIC is one-shot and armed at the
@@ -297,17 +329,14 @@ void linuxkpi_wake_thread(void *thread) {
   if (!t)
     return;
 
-  /* Arm the plain-block rendezvous for every wake: a waitqueue wait that is
-   * still running (about to call schedule()) consumes it in
-   * linuxkpi_thread_block() instead of losing the wake in sched_wakeup(). */
-  __atomic_store_n(&t->kpi_block_pending, true, __ATOMIC_RELEASE);
-
-  /* Remember the timeout wake even if the target is still running; see the
-   * field comment in sched.h.  Only timeout sleeps consume it, so waitqueue
-   * and kthread-start wakes stay out of the way. */
+  /* Only a published wait owns a notification. Kthread-start and unrelated
+   * wakes must not leak into a later mutex wait or schedule_timeout(). */
   if (__atomic_load_n(&t->kpi_timeout_active, __ATOMIC_ACQUIRE) ||
-      __atomic_load_n(&t->kpi_wait_prepared, __ATOMIC_SEQ_CST))
+      __atomic_load_n(&t->kpi_wait_prepared, __ATOMIC_SEQ_CST)) {
+    gpu_perf_syncobj_wake(t);
+    __atomic_store_n(&t->kpi_block_pending, true, __ATOMIC_RELEASE);
     __atomic_store_n(&t->kpi_wake_pending, true, __ATOMIC_RELEASE);
+  }
 
   /* sched_wakeup() ignores idle threads: they are the per-CPU fallback task
    * and are never runqueue members.  KPI code can still sleep in the boot

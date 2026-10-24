@@ -64,6 +64,7 @@ static void print_hex32(uint32_t num) {
 // IA32_KERNEL_GS_BASE = 0xC0000102  (swapped in/out by SWAPGS)
 #define MSR_GS_BASE 0xC0000101
 #define MSR_KERNEL_GS_BASE 0xC0000102
+#define MSR_TSC_AUX 0xC0000103
 
 static inline void wrmsr(uint32_t msr, uint64_t value) {
   uint32_t lo = (uint32_t)(value & 0xFFFFFFFF);
@@ -83,10 +84,17 @@ static inline uint64_t rdmsr(uint32_t msr) {
  * make a later-starting AP dereference its still-uninitialized GS base. */
 static volatile bool cpu_gs_installed;
 
-// Set GS base for the current CPU
+// Set GS base and IA32_TSC_AUX (Linux x86-64 ABI: (node_id << 12) | cpu_id)
+// for the current CPU so user-mode RDTSCP/RDPID and __vdso_getcpu work
+// without entering ring 0.
 static void cpu_set_gs_base(struct cpu_info *info) {
   wrmsr(MSR_GS_BASE, (uint64_t)info);
   wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)info);
+  if (info && (cpu_has_rdtscp() || cpu_has_rdpid())) {
+    uint32_t node = (uint32_t)numa_cpu_to_node(info->cpu_id);
+    uint64_t tsc_aux = ((uint64_t)(node & 0xFFFU) << 12) | (info->cpu_id & 0xFFFU);
+    wrmsr(MSR_TSC_AUX, tsc_aux);
+  }
 }
 
 // Allocate a kernel stack (returns HHDM virtual address of top)

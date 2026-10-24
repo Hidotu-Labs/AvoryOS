@@ -15,6 +15,8 @@
 #include "../sched/wait.h"
 #include "syscall.h"
 #include "../socket/epoll.h"
+#include <linuxkpi/native_eventfd.h>
+#include <linuxkpi/native_vfs.h>
 #include <stdint.h>
 
 // ---------------------------------------------------------------------------
@@ -25,6 +27,20 @@ inotify_instance_t inotify_instances[MAX_INOTIFY_INSTANCES];
 static spinlock_t inotify_pool_lock = SPINLOCK_INIT;
 uint32_t next_instance_id = 1;
 uint32_t next_watch_id    = 1;
+
+/* These descriptors live in anon_inodefs, regardless of their vnode type.
+ * In particular, inotify is a character vnode and eventfd/timerfd are file
+ * vnodes, so sys_fstatfs cannot classify them through FS_EPOLL's fallback. */
+static int aio_anon_statfs(vfs_node_t *node, struct statfs_buf *buf) {
+    (void)node;
+    if (!buf) return -14;
+    memset(buf, 0, sizeof(*buf));
+    buf->f_type = 0x09041934; /* ANON_INODE_FS_MAGIC */
+    buf->f_bsize = 4096;
+    buf->f_frsize = 4096;
+    buf->f_namelen = 255;
+    return 0;
+}
 
 // ---------------------------------------------------------------------------
 // eventfd2
@@ -127,8 +143,39 @@ static int eventfd_poll(vfs_node_t *node, int events) {
     spinlock_acquire(&ctx->lock);
     if (ctx->counter > 0)                       revents |= POLLIN;
     if (ctx->counter < 0xfffffffffffffffeULL)    revents |= POLLOUT;
+    if (ctx->counter == UINT64_MAX)             revents |= POLLERR;
     spinlock_release(&ctx->lock);
-    return revents & events;
+    return revents & (events | POLLERR);
+}
+
+int asc_eventfd_get(int fd, void **result) {
+    vfs_node_t *node = asc_vfs_fd_get_node(fd);
+    if (!node)
+        return -9; /* EBADF */
+    if (node->read != eventfd_read || !node->device) {
+        vfs_close(node);
+        return -22; /* EINVAL */
+    }
+    *result = node;
+    return 0;
+}
+
+void asc_eventfd_put(void *node) {
+    vfs_close(node);
+}
+
+void asc_eventfd_signal(void *opaque, unsigned int mask) {
+    vfs_node_t *node = opaque;
+    eventfd_ctx_t *ctx = node->device;
+    spinlock_acquire(&ctx->lock);
+    /* Kernel notifications may saturate the counter; they must never wrap
+     * it to zero and lose readiness. Userspace reads drain the overflow. */
+    if (ctx->counter != UINT64_MAX)
+        ctx->counter++;
+    bool overflow = ctx->counter == UINT64_MAX;
+    spinlock_release(&ctx->lock);
+    wait_queue_wake_all(&ctx->wq);
+    epoll_notify_event(node, POLLIN | mask | (overflow ? POLLERR : 0));
 }
 
 static void eventfd_close(vfs_node_t *node) {
@@ -174,6 +221,7 @@ static uint64_t sys_eventfd2(uint64_t initval, uint64_t flags, uint64_t a2,
     node->write      = eventfd_write;
     node->poll       = eventfd_poll;
     node->close      = eventfd_close;
+    node->statfs     = aio_anon_statfs;
     node->wait_queue = &ctx->wq;
 
     t->fds[fd]        = node;
@@ -368,6 +416,7 @@ static uint64_t sys_timerfd_create(uint64_t clockid, uint64_t flags,
     node->read       = timerfd_read;
     node->poll       = timerfd_poll;
     node->close      = timerfd_close;
+    node->statfs     = aio_anon_statfs;
     node->wait_queue = &ctx->wq;
     ctx->node        = node;
     timerfd_register(ctx);
@@ -1207,6 +1256,7 @@ static uint64_t inotify_create(uint64_t flags) {
     node->device = instance;
     instance->node = node;
     node->close = inotify_close;
+    node->statfs = aio_anon_statfs;
     node->poll = inotify_poll;
     node->read = inotify_read;
     node->ioctl = inotify_ioctl;
@@ -1450,6 +1500,8 @@ static uint64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags_arg,
     node->flags  = FS_FILE;
     node->mask   = 0600;
     node->length = 0;
+    node->uid    = t->fsuid;
+    node->gid    = t->fsgid;
 
     ramfs_file_t *rfile = kmalloc(sizeof(ramfs_file_t));
     if (!rfile) { kfree(node); return (uint64_t)-12; }
@@ -1462,6 +1514,8 @@ static uint64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags_arg,
     node->write     = ramfs_write;
     node->truncate  = ramfs_truncate;
     node->fallocate = ramfs_fallocate;
+    node->chmod     = ramfs_chmod;
+    node->chown     = ramfs_chown;
     node->mmap      = memfd_mmap;
     node->mmap_shared_only = false;
     node->mmap_private_pmm_refs = true;

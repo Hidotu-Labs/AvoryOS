@@ -5,8 +5,12 @@
 #include "smp/cpu.h"
 #include "lib/tsc.h"
 #include "mm/tlb_shootdown.h"
+#include "fs/vfs_rcu.h"
 
-void linuxkpi_tlb_poll(void) { tlb_shootdown_poll(); }
+void linuxkpi_tlb_poll(void) {
+  tlb_shootdown_poll();
+  vfs_rcu_poll();
+}
 
 int linuxkpi_cpu_id(void) {
   struct cpu_info *ci = cpu_get_current();

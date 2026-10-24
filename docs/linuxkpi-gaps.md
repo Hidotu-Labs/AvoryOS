@@ -574,9 +574,7 @@ prerequisites and the hardware-bring-up findings.
   `-EBUSY` and the lookup/verify subtests cascaded.  The suite now scans
   for a free number in `[16, 64)` at run time.
 - **Watch item (2026-09-13): one guest hardware-reset at session start
-  did not reproduce.**  The first DC-active boot reset immediately after
-  `[PROC] Executing main session: /bin/avoryd`, with no panic and no
-  watchdog line (OVMF restarted on the serial stream).  After a cold host
+  did not reproduce.**  The first DC-active boot reset during main-session startup, with no panic and no watchdog line (OVMF restarted on the serial stream).  After a cold host
   reboot the same build booted clean with DC active (0 `[FAIL]`s, session
   started, login reached), so the reset is intermittent until seen again;
   re-run with `-d int,guest_errors,cpu_reset` if it returns.

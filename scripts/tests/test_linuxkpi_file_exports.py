@@ -42,7 +42,7 @@ struct fd_table {int lock;unsigned next_fd,capacity;
 struct thread {struct fd_table *files;vfs_node_t **fds;
  uint64_t *fd_offsets,*fd_flags;};
 struct inode {uint64_t i_size;};
-struct file {int f_count;unsigned f_flags;void *f_asc_node;struct inode *f_inode;};
+struct file {int f_count;unsigned f_flags;void *f_asc_node,*f_poll_links;struct inode *f_inode;};
 static struct fd_table files={.capacity=MAX_FDS};
 static struct thread self={.files=&files,.fds=files.fds,
  .fd_offsets=files.fd_offsets,.fd_flags=files.fd_flags};
@@ -53,6 +53,7 @@ static void spinlock_acquire(int *p){assert(!*p);*p=1;}
 static void spinlock_release(int *p){assert(*p);*p=0;}
 static void atomic_inc(int *p){assert(*p>0);++*p;}
 static bool atomic_dec_and_test(int *p){assert(*p>0);return --*p==0;}
+static void linuxkpi_poll_detach(void **links,void *node) {(void)links;(void)node;}
 static void fput(struct file *);
 static void linuxkpi_file_close(void *);
 static void *asc_vfs_node_device(void *n){return ((vfs_node_t*)n)->device;}

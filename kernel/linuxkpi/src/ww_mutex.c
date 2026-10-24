@@ -144,6 +144,7 @@ static int ww_lock_common(struct ww_mutex *lock, struct ww_acquire_ctx *ctx,
        * may now be first with owner == NULL and no future unlock to wake us. */
       continue;
     }
+    set_current_state(interruptible ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
     spin_unlock_irqrestore(&lock->base.wait_lock, flags);
     linuxkpi_mutex_wait_set(&lock->base);
     linuxkpi_thread_block();

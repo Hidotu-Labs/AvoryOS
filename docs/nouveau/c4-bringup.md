@@ -10,7 +10,7 @@ resource accounting is prepared and remains required before closing C4.
 **2026-10-21 reset update:** GPU-only assignment behind a dedicated root port
 survived two ordinary Ascension shutdowns, active-GSP QEMU closure and a fresh
 Ascension launch afterward, without a host reboot. This configuration is now
-installed in `make run-nouveau-c4`. Physical HDMI audio is not assigned;
+installed in `make run-nouveau`. Physical HDMI audio is not assigned;
 emulated desktop audio remains. The page free-count diagnostic was subsequently
 corrected and passed two strict hardware boots, as recorded below. These
 results do not replace the other outstanding C4 qualifications.
@@ -182,7 +182,7 @@ The three ordinary runs retain strict failure for the known LinuxKPI page
 free-count invariant. The abrupt test observed that failure too. Reset reuse
 passes separately; do not relabel those strict results or close all of C4.
 
-`make run-nouveau-c4` now uses the tested PCIe GPU-only layout with guest
+`make run-nouveau` now uses the tested PCIe GPU-only layout with guest
 `01:00.0`, retaining emulated Intel HDA, networking, keyboard/mouse and the
 installed writable desktop disk. Its matching normal Limine ISO was rebuilt
 from the exact tested kernel and verified by extracting its kernel/command
@@ -327,7 +327,7 @@ and their serial-log destination remain unchanged.
 
 ### Physical retest after host power cycle
 
-The next controlled test used the normal `make run-nouevau-c4` Limine/installed
+The next controlled test used the normal `make run-nouveau` Limine/installed
 desktop path with a one-run command-line override `nouveau.debug=info,gsp=debug`
 instead of `gsp=trace`. No driver code was changed. Both NVIDIA functions had
 valid PCI configuration before launch. GSP again returned `res:0x59 resp:0x59`;
@@ -461,7 +461,7 @@ topology. These are host runtime-power/D3cold policy controls:
 [power/control](https://github.com/torvalds/linux/blob/v6.12/Documentation/ABI/testing/sysfs-devices-power),
 [d3cold_allowed](https://github.com/torvalds/linux/blob/v6.12/Documentation/ABI/testing/sysfs-bus-pci).
 They may prevent automatic host power transitions, but the policy is not a
-`run-nouveau-c4` prerequisite and is not a recovery procedure. The pinned-policy
+`run-nouveau` prerequisite and is not a recovery procedure. The pinned-policy
 control test still lost PCI config access after QEMU exit, so routine C4 runs
 must not require `sudo ... --apply`. The helper remains available for a
 specifically planned power-policy experiment; it never resets or rebinds the
@@ -565,21 +565,11 @@ oracle exit of zero alone does not qualify. The guest must log all four firmware
 CRC successes. The process oracle on hardware must discover a real Nouveau DRM
 card and report its driver/version; it does not submit rendering work.
 
-Reproducible entry points:
+Current entry point:
 
 ```sh
-make nouveau-c4
-make run-nouveau-software NOUVEAU_CPUS=1
-make nouveau-preflight NOUVEAU_GPU=0000:01:00.0
-make prepare-nouveau NOUVEAU_GPU=0000:01:00.0 NOUVEAU_CPUS=1
-# Only after host handoff and a matching passing readiness result:
-make run-nouveau NOUVEAU_GPU=0000:01:00.0 NOUVEAU_CPUS=1 NOUVEAU_HOST_ON_IGPU=1
-```
-
-The legacy spelling remains available for the original 6.12 Limine run:
-
-```sh
-make run-nouevau-c4
+make
+make run-nouveau
 ```
 
 The standard kernel import and build now use the qualified 6.18.42 source;
@@ -590,31 +580,20 @@ separate preparation target is required:
 make
 ```
 
-Then `make run-nouveau-c4` uses `avoryos-x86_64.iso` and checks the prepared files, PCI identities, VFIO
+Then `make run-nouveau` uses `avoryos-x86_64.iso` and checks the prepared files, PCI identities, VFIO
 bindings and iGPU primary display. It launches QEMU
 directly through the regular Limine path with one vCPU, the NVIDIA pair at
 guest `00:03.0/1`, USB keyboard and relative mouse, audio, networking and
 VirtIO output. The run target invokes no Python scripts, diagnostic init or
 automatic oracle shutdown. Serial appends to `build/logs/nouveau-c4.log`.
 
-The main kernel now uses the 6.18.42 import. The C4 Limine entry uses
+The main kernel uses the 6.18.42 import. The Nouveau Limine entry uses
 `init=/sbin/init`, enables only Nouveau's reviewed guest BDF gate, requests GSP
 modesetting, disables runtime PM, and enables native LinuxKPI removal on
-orderly shutdown. The older misspelled target remains a separate legacy
-launcher for historical tests.
+orderly shutdown.
 
-The legacy misspelled target exports `KPI_NOUVEAU=1` while building the active
-kernel. The new 6.18 target uses the isolated candidate build and passes the
-Nouveau probe gate and GSP settings through the C4 Limine entry. Its pinned
-firmware bundle is installed into the existing desktop disk using a private
-reflink/sparse snapshot. Files are verified before atomic publication; existing
-guest files and the GPT are preserved. The installer refuses a visible live
-disk owner and discards work if the disk changes during installation.
-
-The private bounded diagnostic runner remains separately available as
-`make run-nouveau ...` and `make run-nouveau-software ...`; it is not behind the
-interactive C4 aliases. Its readiness checks and historical results apply only
-to those diagnostic commands.
+The former phase-specific and candidate Make targets have been retired. Use
+`make run-nouveau` for the verified 6.18 desktop boot.
 
 The builder writes `kernel-c4`, `build/nouveau-c4/kernel` and its separate
 `kernel/obj-nouveau-c4-x86_64/` object/profile/dependency tree. A relocated Kbuild
@@ -663,7 +642,7 @@ Current standard kernel SHA256:
 ISO SHA256:
 `55c73e2b0de0457ddf1182fbe17c15044c3b26d63fdb7f886a195e5a9e9d9ee2`.
 A full host power-off/power-on is needed to test this build on an accessible
-GPU. The interactive command remains `make run-nouevau-c4`.
+GPU. The interactive command remains `make run-nouveau`.
 
 References: matching NVIDIA [system-info producer](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/535.113.01/src/nvidia/kernel/vgpu/nv/rpc.c),
 [hypervisor enum](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/535.113.01/src/common/sdk/nvidia/inc/nv-hypervisor.h),
@@ -724,7 +703,7 @@ history stays at `build/logs/nouveau-c4.log`.
 After a full host power-off and power-on, with the monitor still on the iGPU:
 
 ```sh
-make run-nouevau-c4
+make run-nouveau
 ```
 
 This consumes the newly qualified candidate. A successful physical GSP probe,

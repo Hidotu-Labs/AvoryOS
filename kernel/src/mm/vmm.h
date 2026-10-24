@@ -250,9 +250,14 @@ spinlock_t *vmm_get_lock(void);
 // the first question any hang report has to answer.  Acquire through these
 // wrappers so lockdiag can answer it.
 void vmm_lock_acquire_at(uint64_t caller_ip);
+void vmm_lock_acquire_at_for(uint64_t *pml4, uint64_t virtual_addr,
+                             uint64_t caller_ip);
 void vmm_lock_release(void);
+bool vmm_cpu_holds_lock(uint32_t cpu_id);
 #define vmm_lock_acquire()                                                     \
   vmm_lock_acquire_at((uint64_t)__builtin_return_address(0))
+#define vmm_lock_acquire_for(pml4, va)                                         \
+  vmm_lock_acquire_at_for((pml4), (va), (uint64_t)__builtin_return_address(0))
 
 // Returns the physical address of the permanent kernel PML4.
 uint64_t *vmm_get_kernel_pml4(void);

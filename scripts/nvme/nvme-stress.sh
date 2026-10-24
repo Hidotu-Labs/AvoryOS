@@ -2,7 +2,7 @@
 # nvme-stress.sh - headless NVMe test harness for AvoryOS.
 #
 # Boots a QEMU configuration with the NVMe test image, waits for the guest to
-# run /bin/nvme_test auto (the avoryd "nvme-test" service), checks the
+# run /bin/nvme_test auto (the guest NVMe test init), checks the
 # NVME-TEST/NVME-SELFTEST markers in the serial log, then verifies the written
 # devices on the host: byte pattern, guest-vs-host SHA-256, 4Kn/512e pair
 # equality and, for the nvme-root and crash configs, e2fsck -fy/-fn of the
@@ -680,7 +680,7 @@ if [ "$CRASH_RUN" = 0 ] && [ "$BENCH" = 0 ]; then
     NVME_TEST_ARGS="${NVME_TEST_ARGS# }"
 fi
 
-# Force a rebuild when the baked service command line changes (soak options,
+# Force a rebuild when the baked test-init command line changes (soak options,
 # topology device lists, crash/bench mode), even though make only tracks files.
 ARGS_STAMP="$LOG_DIR/.nvme-test-args"
 WANT_ARGS="$TEST_CMD|$NVME_TEST_ARGS"

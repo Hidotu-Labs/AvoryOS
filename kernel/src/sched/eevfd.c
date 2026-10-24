@@ -349,6 +349,9 @@ void eevfd_migrate_entity(struct eevfd_rq *src_rq, struct eevfd_rq *dst_rq, stru
         se->vruntime = 0;
     }
 
+    if (se->vruntime < dst_rq->min_vruntime)
+        se->vruntime = dst_rq->min_vruntime;
+
     /* Compute new deadline */
     se->deadline = calc_deadline(se->vruntime, se->slice_ns, se->weight, se->wmult);
     se->min_deadline = se->deadline;
