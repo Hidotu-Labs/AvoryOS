@@ -14,7 +14,7 @@ AvoryOS is an open-source hobby operating system for x86_64 PCs. It includes a m
 - Userland based on glibc and an Arch package root filesystem
 - Desktop sessions including KDE Plasma, XFCE, IceWM, and Weston
 
-AMDGPU support is under active development. For stable graphics in QEMU, use the default VirtIO-GPU setup.
+AMDGPU and NVIDIA support is under active development. For stable graphics in QEMU, use the default make run target.
 
 ## Build
 
