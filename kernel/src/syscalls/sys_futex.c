@@ -13,6 +13,7 @@
 #include "../mm/vmm.h"
 #include "../sched/sched.h"
 #include "syscall.h"
+#include "arch/uaccess.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -82,8 +83,8 @@
 // spinlock.  We key on the physical address so that two processes mapping the
 // same physical page see the same bucket.
 
-#define FUTEX_HASH_BITS 8
-#define FUTEX_HASH_SIZE (1 << FUTEX_HASH_BITS) // 256 buckets
+#define FUTEX_HASH_BITS 10
+#define FUTEX_HASH_SIZE (1 << FUTEX_HASH_BITS) // 1024 buckets
 
 struct futex_key {
   // Zero selects a shared, physical-address key. Private futexes use the
@@ -99,25 +100,30 @@ struct futex_waiter {
   uint32_t bitset;
   bool pi;               // Waiting in FUTEX_LOCK_PI, not FUTEX_WAIT
   bool acquired;         // FUTEX_UNLOCK_PI handed the PI lock over
+  bool queued;           // True while linked in a bucket
   struct futex_waiter *next;
+  struct futex_waiter *prev;
 };
 
-static struct {
+struct futex_bucket {
   spinlock_t lock;
+  volatile uint32_t waiters;
   struct futex_waiter *head;
-} futex_hash[FUTEX_HASH_SIZE];
+  struct futex_waiter *tail;
+  volatile uint64_t wakes;
+  volatile uint64_t nomatch;
+} __attribute__((aligned(64)));
+
+static struct futex_bucket futex_hash[FUTEX_HASH_SIZE];
 
 /* Per-bucket wake traffic is context, not proof of a lost wake: unrelated
  * futex keys collide, and wakes without a registered waiter are normal. */
-static volatile uint64_t futex_bucket_wakes[FUTEX_HASH_SIZE];
-static volatile uint64_t futex_bucket_nomatch[FUTEX_HASH_SIZE];
-
-static void futex_bucket_note(uint32_t bucket, bool woke_anyone) {
+static inline void futex_bucket_note(uint32_t bucket, bool woke_anyone) {
   if (bucket >= FUTEX_HASH_SIZE)
     return;
-  __atomic_add_fetch(&futex_bucket_wakes[bucket], 1, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&futex_hash[bucket].wakes, 1, __ATOMIC_RELAXED);
   if (!woke_anyone)
-    __atomic_add_fetch(&futex_bucket_nomatch[bucket], 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&futex_hash[bucket].nomatch, 1, __ATOMIC_RELAXED);
 }
 
 /* --- Deferred futex wake delivery ----------------------------------------
@@ -189,6 +195,10 @@ static void futex_init_once(void) {
   for (int i = 0; i < FUTEX_HASH_SIZE; i++) {
     spinlock_init(&futex_hash[i].lock);
     futex_hash[i].head = NULL;
+    futex_hash[i].tail = NULL;
+    futex_hash[i].waiters = 0;
+    futex_hash[i].wakes = 0;
+    futex_hash[i].nomatch = 0;
   }
   futex_initialized = 1;
 }
@@ -206,15 +216,39 @@ static inline bool futex_key_equal(struct futex_key a, struct futex_key b) {
   return a.space == b.space && a.address == b.address;
 }
 
-/* Caller holds the bucket lock. New arrivals must not jump ahead of already
- * parked waiters: a LIFO list lets a busy mutex repeatedly wake recent
- * arrivals while an older client/render/cache thread waits indefinitely. */
-static void futex_enqueue(uint32_t bucket, struct futex_waiter *waiter) {
-  struct futex_waiter **tail = &futex_hash[bucket].head;
-  while (*tail)
-    tail = &(*tail)->next;
+/* Caller holds the bucket lock. FIFO queue preserves fairness with O(1) insertion. */
+static inline void futex_enqueue(uint32_t bucket, struct futex_waiter *waiter) {
+  waiter->bucket = bucket;
+  waiter->queued = true;
   waiter->next = NULL;
-  *tail = waiter;
+  waiter->prev = futex_hash[bucket].tail;
+  if (futex_hash[bucket].tail) {
+    futex_hash[bucket].tail->next = waiter;
+  } else {
+    futex_hash[bucket].head = waiter;
+  }
+  futex_hash[bucket].tail = waiter;
+  __atomic_add_fetch(&futex_hash[bucket].waiters, 1, __ATOMIC_SEQ_CST);
+}
+
+/* Caller holds the bucket lock. Dequeues waiter in O(1). */
+static inline void futex_dequeue(uint32_t bucket, struct futex_waiter *waiter) {
+  if (!waiter->queued)
+    return;
+  if (waiter->prev) {
+    waiter->prev->next = waiter->next;
+  } else {
+    futex_hash[bucket].head = waiter->next;
+  }
+  if (waiter->next) {
+    waiter->next->prev = waiter->prev;
+  } else {
+    futex_hash[bucket].tail = waiter->prev;
+  }
+  waiter->prev = NULL;
+  waiter->next = NULL;
+  waiter->queued = false;
+  __atomic_sub_fetch(&futex_hash[bucket].waiters, 1, __ATOMIC_SEQ_CST);
 }
 
 /* Timeout/signal cleanup races requeue. Reading key then locking its hash
@@ -239,15 +273,18 @@ void futex_remove_thread_waiters(struct thread *thread) {
     return;
 
   for (uint32_t bucket = 0; bucket < FUTEX_HASH_SIZE; bucket++) {
+    // Fast path: skip empty buckets locklessly without touching spinlock
+    if (__atomic_load_n(&futex_hash[bucket].waiters, __ATOMIC_RELAXED) == 0)
+      continue;
+
     spinlock_acquire(&futex_hash[bucket].lock);
-    struct futex_waiter **pp = &futex_hash[bucket].head;
-    while (*pp) {
-      struct futex_waiter *waiter = *pp;
-      if (waiter->thread == thread) {
-        *pp = waiter->next;
-      } else {
-        pp = &waiter->next;
+    struct futex_waiter *w = futex_hash[bucket].head;
+    while (w) {
+      struct futex_waiter *next = w->next;
+      if (w->thread == thread) {
+        futex_dequeue(bucket, w);
       }
+      w = next;
     }
     spinlock_release(&futex_hash[bucket].lock);
   }
@@ -278,7 +315,7 @@ static inline int futex_get_key(uint32_t *uaddr, bool private,
   uint64_t vaddr = (uint64_t)uaddr;
   if (__builtin_expect((vaddr & (sizeof(uint32_t) - 1)) != 0, 0))
     return -EINVAL;
-  if (__builtin_expect(!vmm_is_user_addr_range_valid(vaddr, sizeof(uint32_t)), 0))
+  if (__builtin_expect(!is_user_range((const void *)vaddr, sizeof(uint32_t)), 0))
     return -EFAULT;
 
   if (__builtin_expect(private, 1)) {
@@ -362,29 +399,33 @@ static uint64_t futex_wait(uint32_t *uaddr, uint32_t val,
   waiter.bitset = bitset;
   waiter.pi = false;
   waiter.acquired = false;
+  waiter.queued = false;
   waiter.next = NULL;
+  waiter.prev = NULL;
 
   if (!waiter.thread)
     return (uint64_t)(-(int64_t)EFAULT);
 
-  // Critical section: check value + enqueue + block
+  // Critical section: enqueue + check value + block
   spinlock_acquire(&futex_hash[bucket].lock);
 
-  // Re-read the user value while holding the lock to prevent races with
-  // FUTEX_WAKE.  If *uaddr changed since the caller read it we must not
-  // block (Linux returns -EAGAIN).
-  uint32_t current_val = __atomic_load_n(uaddr, __ATOMIC_RELAXED);
+  // Enqueue waiter into bucket with SEQ_CST waiters increment before checking *uaddr
+  futex_enqueue(bucket, &waiter);
+
+  // Re-read user value with SEQ_CST barrier to pair with lockless futex_wake_key check.
+  // If *uaddr changed since caller read it, we must not block (Linux returns -EAGAIN).
+  uint32_t current_val = __atomic_load_n(uaddr, __ATOMIC_SEQ_CST);
   if (current_val != val) {
+    futex_dequeue(bucket, &waiter);
     spinlock_release(&futex_hash[bucket].lock);
     LOCKDIAG_STAT(futex_eagain, 1);
     return (uint64_t)(-(int64_t)EAGAIN);
   }
 
   /* FUTEX_WAIT with a {0,0} relative timeout is a non-blocking value probe on
-   * Linux: the value still matches, so report the timeout instead of parking.
-   * Before this, {0,0} fell through every branch below (timeout_ms stays 0)
-   * and the thread parked forever with no wakeup to blame. */
+   * Linux: the value still matches, so report the timeout instead of parking. */
   if (timeout_ts && !is_abs && timeout_ts[0] == 0 && timeout_ts[1] == 0) {
+    futex_dequeue(bucket, &waiter);
     spinlock_release(&futex_hash[bucket].lock);
     LOCKDIAG_STAT(futex_zero_timeout, 1);
     LOCKDIAG_STAT(futex_timeouts, 1);
@@ -403,6 +444,7 @@ static uint64_t futex_wait(uint32_t *uaddr, uint32_t val,
                                            now_ms, &deadline);
     if (timeout_error || deadline <= now_ms) {
       waiter.thread->state = THREAD_RUNNING;
+      futex_dequeue(bucket, &waiter);
       spinlock_release(&futex_hash[bucket].lock);
       if (timeout_error)
         return (uint64_t)(int64_t)timeout_error;
@@ -412,8 +454,6 @@ static uint64_t futex_wait(uint32_t *uaddr, uint32_t val,
     wait_deadline = deadline;
     waiter.thread->wakeup_ticks = deadline;
   }
-
-  futex_enqueue(bucket, &waiter);
 
   /* Publish the park for the hang report before dropping the bucket lock: a
    * lost wakeup is only distinguishable from an idle worker pool if the report
@@ -441,28 +481,22 @@ park_again:
   uint32_t final_bucket = futex_lock_waiter(&waiter);
 
   bool was_woken = true;
-  // Remove waiter from the list (may already have been removed by wake)
-  struct futex_waiter **pp = &futex_hash[final_bucket].head;
-  while (*pp) {
-    if (*pp == &waiter) {
-      /* An unrelated/spurious scheduler wake is not a timeout. Keep the
-       * registered waiter and re-arm under its bucket lock until the actual
-       * clock deadline, a matching futex wake, or a signal. */
-      if (timeout_ts && lapic_timer_get_ticks() < wait_deadline &&
-          !thread_has_pending_signal(waiter.thread)) {
-        waiter.thread->wakeup_ticks = wait_deadline;
-        waiter.thread->state = THREAD_BLOCKED;
-        waiter.thread->in_futex_wait = true;
-        waiter.thread->blocked_since_ms = lapic_timer_get_ticks();
-        waiter.thread->futex_bucket = final_bucket;
-        spinlock_release(&futex_hash[final_bucket].lock);
-        goto park_again;
-      }
-      *pp = waiter.next;
-      was_woken = false; // We were still in the list, so we were NOT woken by FUTEX_WAKE!
-      break;
+  if (waiter.queued) {
+    /* An unrelated/spurious scheduler wake is not a timeout. Keep the
+     * registered waiter and re-arm under its bucket lock until the actual
+     * clock deadline, a matching futex wake, or a signal. */
+    if (timeout_ts && lapic_timer_get_ticks() < wait_deadline &&
+        !thread_has_pending_signal(waiter.thread)) {
+      waiter.thread->wakeup_ticks = wait_deadline;
+      waiter.thread->state = THREAD_BLOCKED;
+      waiter.thread->in_futex_wait = true;
+      waiter.thread->blocked_since_ms = lapic_timer_get_ticks();
+      waiter.thread->futex_bucket = final_bucket;
+      spinlock_release(&futex_hash[final_bucket].lock);
+      goto park_again;
     }
-    pp = &(*pp)->next;
+    futex_dequeue(final_bucket, &waiter);
+    was_woken = false; // We were still in the list, so we were NOT woken by FUTEX_WAKE!
   }
 
   spinlock_release(&futex_hash[final_bucket].lock);
@@ -482,21 +516,50 @@ park_again:
 }
 
 static inline uint64_t futex_wake_key(struct futex_key key, uint32_t val, uint32_t bitset) {
+  if (__builtin_expect(val == 0, 0))
+    return 0;
+
   uint32_t bucket = futex_hash_key(key);
 
-  /*
-   * The waiter checks the user value and enqueues itself while holding the
-   * bucket lock, so a lockless "is the list empty?" probe is not safe: the
-   * waker can publish its new user value, read the still-empty list, and
-   * return before the waiter (which read the old value just before the
-   * store became visible) enqueues and parks.  That interleaving loses the
-   * wakeup permanently.  Take the lock for every wake instead.
-   *
-   * sched_wakeup() reaches the target CPU's runqueue and may IPI it, so it is
-   * delivered after the bucket lock is dropped (see the deferred wake note
-   * above).  The scan restarts from the head when the batch fills; consumers
-   * are already unlinked, so the remaining waiters are seen exactly once.
-   */
+  // Fast path: if there are no waiters registered on this bucket, return immediately.
+  // Dekker barrier guarantees that if a waiter enqueued, we observe waiters > 0,
+  // or the waiter observed the new user value and aborted with -EAGAIN.
+  if (__builtin_expect(__atomic_load_n(&futex_hash[bucket].waiters, __ATOMIC_SEQ_CST) == 0, 1)) {
+    return 0;
+  }
+
+  /* Fast path: single-waiter wakeup (val == 1 is the dominant case in pthread_mutex_unlock) */
+  if (val == 1) {
+    struct thread *to_wake = NULL;
+    uint64_t lock_flags[2];
+    futex_bucket_acquire(bucket, bucket, lock_flags);
+
+    struct futex_waiter *w = futex_hash[bucket].head;
+    while (w) {
+      if (futex_key_equal(w->key, key) && (w->bitset & bitset) != 0) {
+        if (w->thread) {
+          futex_wake_claim(w->thread);
+          to_wake = w->thread;
+          LOCKDIAG_STAT(futex_wakes, 1);
+        }
+        futex_dequeue(bucket, w);
+        break;
+      }
+      w = w->next;
+    }
+    futex_bucket_release(bucket, bucket, lock_flags);
+
+    if (to_wake) {
+      sched_wakeup(to_wake);
+      __atomic_sub_fetch(&to_wake->futex_wake_claims, 1, __ATOMIC_RELEASE);
+      futex_bucket_note(bucket, true);
+      return 1;
+    }
+    futex_bucket_note(bucket, false);
+    LOCKDIAG_STAT(futex_wake_nomatch, 1);
+    return 0;
+  }
+
   uint32_t woken = 0;
   hal_irq_state_t irq_flags = hal_irq_save();
 
@@ -505,25 +568,24 @@ static inline uint64_t futex_wake_key(struct futex_key key, uint32_t val, uint32
     uint64_t lock_flags[2];
     futex_bucket_acquire(bucket, bucket, lock_flags);
 
-    struct futex_waiter **pp = &futex_hash[bucket].head;
-    while (*pp && batch.count < val - woken &&
+    struct futex_waiter *w = futex_hash[bucket].head;
+    while (w && batch.count < val - woken &&
            batch.count < FUTEX_WAKE_BATCH) {
-      struct futex_waiter *w = *pp;
-      if (!futex_key_equal(w->key, key) || (w->bitset & bitset) == 0) {
-        pp = &w->next;
-        continue;
+      struct futex_waiter *next = w->next;
+      if (futex_key_equal(w->key, key) && (w->bitset & bitset) != 0) {
+        if (w->thread) {
+          /* The registered waiter consumes the wake even if a deadline or
+           * signal already made its thread runnable. Counting only BLOCKED
+           * threads can consume more than val waiters or report a false zero. */
+          futex_wake_claim(w->thread);
+          batch.threads[batch.count++] = w->thread;
+          LOCKDIAG_STAT(futex_wakes, 1);
+        }
+        futex_dequeue(bucket, w);
       }
-      *pp = w->next;
-      if (w->thread) {
-        /* The registered waiter consumes the wake even if a deadline or
-         * signal already made its thread runnable. Counting only BLOCKED
-         * threads can consume more than val waiters or report a false zero. */
-        futex_wake_claim(w->thread);
-        batch.threads[batch.count++] = w->thread;
-        LOCKDIAG_STAT(futex_wakes, 1);
-      }
+      w = next;
     }
-    bool exhausted = (*pp == NULL);
+    bool exhausted = (w == NULL);
     futex_bucket_release(bucket, bucket, lock_flags);
 
     uint32_t delivered = batch.count;
@@ -596,9 +658,9 @@ static uint64_t futex_requeue(uint32_t *uaddr1, uint32_t val, uint32_t val2,
     uint64_t lock_flags[2];
     futex_bucket_acquire(bucket1, bucket2, lock_flags);
 
-    struct futex_waiter **pp = &futex_hash[bucket1].head;
-    while (*pp) {
-      struct futex_waiter *w = *pp;
+    struct futex_waiter *w = futex_hash[bucket1].head;
+    while (w) {
+      struct futex_waiter *next = w->next;
       if (futex_key_equal(w->key, key1)) {
         if (total_woken < val) {
           // Wake this thread (delivered once both bucket locks are dropped)
@@ -608,27 +670,23 @@ static uint64_t futex_requeue(uint32_t *uaddr1, uint32_t val, uint32_t val2,
             total_woken++;
           }
           // Remove from bucket1
-          *pp = w->next;
+          futex_dequeue(bucket1, w);
           if (batch.count == FUTEX_WAKE_BATCH) {
             more = true;
             break;
           }
         } else if (total_requeued < val2) {
           // Requeue: move to bucket2
-          *pp = w->next; // Remove from bucket1
+          futex_dequeue(bucket1, w);
           w->key = key2;
           futex_enqueue(bucket2, w);
           __atomic_store_n(&w->bucket, bucket2, __ATOMIC_RELEASE);
           if (w->thread)
             w->thread->futex_bucket = bucket2; // keep the hang report's key in sync
           total_requeued++;
-        } else {
-          // Limit reached for both waking and requeueing
-          pp = &w->next;
         }
-      } else {
-        pp = &w->next;
       }
+      w = next;
     }
 
     futex_bucket_release(bucket1, bucket2, lock_flags);
@@ -684,9 +742,9 @@ static uint64_t futex_cmp_requeue(uint32_t *uaddr1, uint32_t val, uint32_t val2,
       }
     }
 
-    struct futex_waiter **pp = &futex_hash[bucket1].head;
-    while (*pp) {
-      struct futex_waiter *w = *pp;
+    struct futex_waiter *w = futex_hash[bucket1].head;
+    while (w) {
+      struct futex_waiter *next = w->next;
       if (futex_key_equal(w->key, key1)) {
         if (total_woken < val) {
           if (w->thread) {
@@ -694,25 +752,22 @@ static uint64_t futex_cmp_requeue(uint32_t *uaddr1, uint32_t val, uint32_t val2,
             batch.threads[batch.count++] = w->thread;
             total_woken++;
           }
-          *pp = w->next;
+          futex_dequeue(bucket1, w);
           if (batch.count == FUTEX_WAKE_BATCH) {
             more = true;
             break;
           }
         } else if (total_requeued < val2) {
-          *pp = w->next;
+          futex_dequeue(bucket1, w);
           w->key = key2;
           futex_enqueue(bucket2, w);
           __atomic_store_n(&w->bucket, bucket2, __ATOMIC_RELEASE);
           if (w->thread)
             w->thread->futex_bucket = bucket2;
           total_requeued++;
-        } else {
-          pp = &w->next;
         }
-      } else {
-        pp = &w->next;
       }
+      w = next;
     }
 
     futex_bucket_release(bucket1, bucket2, lock_flags);
@@ -935,7 +990,9 @@ retry:
   waiter.bitset = FUTEX_BITSET_MATCH_ANY;
   waiter.pi = true;
   waiter.acquired = false;
+  waiter.queued = false;
   waiter.next = NULL;
+  waiter.prev = NULL;
 
   uint32_t bucket = futex_hash_key(key);
   spinlock_acquire(&futex_hash[bucket].lock);
@@ -950,10 +1007,7 @@ retry:
   }
 
   /* FIFO hand-over order. */
-  struct futex_waiter **tail = &futex_hash[bucket].head;
-  while (*tail)
-    tail = &(*tail)->next;
-  *tail = &waiter;
+  futex_enqueue(bucket, &waiter);
 
   self->state = THREAD_BLOCKED;
   self->wakeup_ticks = 0;
@@ -962,8 +1016,8 @@ retry:
     uint64_t remaining;
     error = futex_pi_timeout_to_ms(timeout_ts, realtime, &remaining);
     if (error || remaining == 0) {
-      *tail = NULL;
       self->state = THREAD_RUNNING;
+      futex_dequeue(bucket, &waiter);
       spinlock_release(&futex_hash[bucket].lock);
       LOCKDIAG_STAT(futex_timeouts, 1);
       return error ? (uint64_t)(int64_t)error
@@ -990,13 +1044,8 @@ retry:
   /* Remove ourselves if unlock did not already do so, then check whether the
    * lock was handed over. */
   uint32_t final_bucket = futex_lock_waiter(&waiter);
-  struct futex_waiter **pp = &futex_hash[final_bucket].head;
-  while (*pp) {
-    if (*pp == &waiter) {
-      *pp = waiter.next;
-      break;
-    }
-    pp = &(*pp)->next;
+  if (waiter.queued) {
+    futex_dequeue(final_bucket, &waiter);
   }
   bool acquired = waiter.acquired;
   spinlock_release(&futex_hash[final_bucket].lock);
@@ -1033,14 +1082,10 @@ static uint64_t futex_pi_unlock(uint32_t *uaddr, bool private) {
   futex_bucket_acquire(bucket, bucket, lock_flags);
 
   struct futex_waiter *next = NULL;
-  struct futex_waiter **next_link = NULL;
-  for (struct futex_waiter **pp = &futex_hash[bucket].head; *pp;
-       pp = &(*pp)->next) {
-    struct futex_waiter *w = *pp;
+  for (struct futex_waiter *w = futex_hash[bucket].head; w; w = w->next) {
     if (w->pi && w->thread && w->thread->state == THREAD_BLOCKED &&
         futex_key_equal(w->key, key)) {
       next = w;
-      next_link = pp;
       break;
     }
   }
@@ -1053,7 +1098,7 @@ static uint64_t futex_pi_unlock(uint32_t *uaddr, bool private) {
     return 0;
   }
 
-  *next_link = next->next;
+  futex_dequeue(bucket, next);
 
   /* Keep FUTEX_WAITERS set while more blocked waiters remain. */
   uint32_t newv = next->thread->tid;
@@ -1194,9 +1239,9 @@ uint64_t futex_bucket_stats(uint32_t bucket, uint64_t *wakes,
   if (bucket >= FUTEX_HASH_SIZE)
     return 0;
   if (wakes)
-    *wakes = __atomic_load_n(&futex_bucket_wakes[bucket], __ATOMIC_RELAXED);
+    *wakes = __atomic_load_n(&futex_hash[bucket].wakes, __ATOMIC_RELAXED);
   if (no_match)
-    *no_match = __atomic_load_n(&futex_bucket_nomatch[bucket], __ATOMIC_RELAXED);
+    *no_match = __atomic_load_n(&futex_hash[bucket].nomatch, __ATOMIC_RELAXED);
   return 1;
 }
 void syscall_register_futex(void) {

@@ -29,14 +29,14 @@ fi
 if [ -z "$display" ]; then
     emulated=0
     if grep -qw 'kpi_emu_sink=1' /proc/cmdline 2>/dev/null; then emulated=1; fi
-    for driver in amdgpu nouveau ascentdrm; do
+    for driver in amdgpu nouveau virtio_gpu ascentdrm; do
         display="$(printf '%s\n' "$inventory" | awk -v driver="$driver" -v emulated="$emulated" \
             '$2==driver&&($4==1||(driver=="amdgpu"&&emulated==1)) {print $1; exit}')"
         [ -z "$display" ] || break
     done
 fi
 if [ -z "$display" ]; then
-    display="$(printf '%s\n' "$inventory" | awk '$2=="ascentdrm"||($4==1&&$2!="vkms") {print $1; exit}')"
+    display="$(printf '%s\n' "$inventory" | awk '$2=="ascentdrm"||$2=="virtio_gpu"||($4==1&&$2!="vkms") {print $1; exit}')"
 fi
 if [ -n "${ASCENT_DRM_RENDER:-}" ]; then
     render="$(printf '%s\n' "$inventory" | awk -v requested="$ASCENT_DRM_RENDER" '$5==requested&&$5!="-" {print $5; exit}')"
@@ -46,7 +46,7 @@ if [ -z "$render" ] && [ -n "$display" ]; then
     render="$(printf '%s\n' "$inventory" | awk -v display="$display" '$1==display&&$5!="-"&&$2!="vkms" {print $5; exit}')"
 fi
 if [ -z "$render" ]; then
-    for driver in nouveau amdgpu; do
+    for driver in nouveau amdgpu virtio_gpu; do
         render="$(printf '%s\n' "$inventory" | awk -v driver="$driver" '$2==driver&&$5!="-" {print $5; exit}')"
         [ -z "$render" ] || break
     done
@@ -65,11 +65,11 @@ case "$mode" in
             { cards[NR]=$1; drivers[NR]=$2 }
             $5==render && render!="" { render_card=$1; render_driver=$2 }
             END {
-                if (render_driver=="nouveau" || render_driver=="amdgpu")
+                if (render_driver=="nouveau" || render_driver=="amdgpu" || render_driver=="virtio_gpu")
                     add(render_card)
                 add(display)
                 for (i=1; i<=NR; i++)
-                    if (drivers[i]=="nouveau" || drivers[i]=="amdgpu" || drivers[i]=="ascentdrm")
+                    if (drivers[i]=="nouveau" || drivers[i]=="amdgpu" || drivers[i]=="ascentdrm" || drivers[i]=="virtio_gpu")
                         add(cards[i])
                 printf "%s %s %s %s\n", display, length(render) ? render : "-",
                     length(render_driver) ? render_driver : "-", devices

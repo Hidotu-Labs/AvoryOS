@@ -533,16 +533,20 @@ static uint64_t sys_timerfd_gettime(uint64_t fd, uint64_t curr_value_ptr,
 // pipe / pipe2
 // ---------------------------------------------------------------------------
 
+#define PIPE_BUF_SIZE 65536
+#define PIPE_BUF_MASK (PIPE_BUF_SIZE - 1)
+
 typedef struct {
-    ramfs_file_t ramfs;
+    uint8_t     *buffer;
     wait_queue_t wq;
     spinlock_t   lock;
-    uint32_t length;
-    uint32_t read_offset;
-    bool reader_open;
-    bool writer_open;
-    vfs_node_t *read_node;
-    vfs_node_t *write_node;
+    uint32_t     head;
+    uint32_t     tail;
+    uint32_t     count;
+    bool         reader_open;
+    bool         writer_open;
+    vfs_node_t  *read_node;
+    vfs_node_t  *write_node;
 } pipe_ctx_t;
 
 typedef struct {
@@ -559,7 +563,7 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     if (!ctx) return (uint32_t)-9; // EBADF
 
     spinlock_acquire(&ctx->lock);
-    while (ctx->read_offset >= ctx->length) {
+    while (ctx->count == 0) {
         struct thread *t = sched_get_current();
         int fd = -1;
         if (t) {
@@ -575,10 +579,14 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
             spinlock_release(&ctx->lock);
             return (uint32_t)-11;
         }
+        if (t && (t->pending_signals & ~t->signal_mask)) {
+            spinlock_release(&ctx->lock);
+            return (uint32_t)-4; // -EINTR
+        }
         wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
         t->state = THREAD_BLOCKED;
         wait_queue_add(&ctx->wq, &entry);
-        if (ctx->read_offset < ctx->length || !ctx->writer_open) {
+        if (ctx->count > 0 || !ctx->writer_open) {
             t->state = THREAD_RUNNING;
             spinlock_release(&ctx->lock);
             wait_queue_remove(&ctx->wq, &entry);
@@ -593,28 +601,37 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
         spinlock_acquire(&ctx->lock);
     }
 
-    vfs_node_t storage = {0};
-    storage.flags = FS_PIPE;
-    storage.device = &ctx->ramfs;
-    storage.length = ctx->length;
-    int32_t ret = (int32_t)ramfs_read(&storage, ctx->read_offset, size, buffer);
-    vfs_node_t *wnode = NULL;
-    if (ret > 0) {
-        ctx->read_offset += (uint32_t)ret;
-        if (ctx->read_offset >= ctx->length) {
-            ctx->read_offset = 0;
-            ctx->length = 0;
-            if (!ctx->writer_open || ctx->ramfs.data_is_pmm || ctx->ramfs.capacity > 4096) {
-                ramfs_free_file_data(&ctx->ramfs);
-            }
-        }
-        wnode = ctx->writer_open ? ctx->write_node : NULL;
-        wait_queue_wake_all(&ctx->wq);
+    /* O(1) contiguous block read from circular ring buffer */
+    uint32_t to_read = size < ctx->count ? size : ctx->count;
+    uint32_t first_chunk = PIPE_BUF_SIZE - ctx->tail;
+    if (first_chunk > to_read)
+        first_chunk = to_read;
+
+    memcpy(buffer, ctx->buffer + ctx->tail, first_chunk);
+    uint32_t second_chunk = to_read - first_chunk;
+    if (second_chunk > 0) {
+        memcpy(buffer + first_chunk, ctx->buffer, second_chunk);
     }
+
+    ctx->tail = (ctx->tail + to_read) & PIPE_BUF_MASK;
+    ctx->count -= to_read;
+
+    if (ctx->count == 0) {
+        ctx->head = 0;
+        ctx->tail = 0;
+        if (!ctx->writer_open && ctx->buffer) {
+            kfree(ctx->buffer);
+            ctx->buffer = NULL;
+        }
+    }
+
+    vfs_node_t *wnode = ctx->writer_open ? ctx->write_node : NULL;
+    wait_queue_wake_all(&ctx->wq);
     spinlock_release(&ctx->lock);
+
     if (wnode)
         epoll_notify_event(wnode, POLLOUT | POLLWRNORM);
-    return (uint32_t)ret;
+    return to_read;
 }
 
 static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
@@ -634,7 +651,7 @@ static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
     }
 
     // Limit pipe buffer to 64KB
-    while ((ctx->length - ctx->read_offset) >= 65536) {
+    while (ctx->count >= PIPE_BUF_SIZE) {
         struct thread *t = sched_get_current();
         int fd = -1;
         if (t) {
@@ -659,7 +676,7 @@ static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
         wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
         t->state = THREAD_BLOCKED;
         wait_queue_add(&ctx->wq, &entry);
-        if ((ctx->length - ctx->read_offset) < 65536 || !ctx->reader_open) {
+        if (ctx->count < PIPE_BUF_SIZE || !ctx->reader_open) {
             t->state = THREAD_RUNNING;
             spinlock_release(&ctx->lock);
             wait_queue_remove(&ctx->wq, &entry);
@@ -674,35 +691,41 @@ static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
         spinlock_acquire(&ctx->lock);
     }
 
-    // Compact unread data to offset 0
-    if (ctx->read_offset > 0) {
-        uint32_t unread = ctx->length - ctx->read_offset;
-        if (unread > 0 && ctx->ramfs.data) {
-            memmove(ctx->ramfs.data, ctx->ramfs.data + ctx->read_offset, unread);
+    if (!ctx->buffer) {
+        ctx->buffer = kmalloc(PIPE_BUF_SIZE);
+        if (!ctx->buffer) {
+            spinlock_release(&ctx->lock);
+            return (uint32_t)-12; // ENOMEM
         }
-        ctx->length = unread;
-        ctx->read_offset = 0;
-        if (unread == 0 && (ctx->ramfs.data_is_pmm || ctx->ramfs.capacity > 4096)) {
-            ramfs_free_file_data(&ctx->ramfs);
-        }
+        ctx->head = 0;
+        ctx->tail = 0;
+        ctx->count = 0;
     }
 
-    vfs_node_t storage = {0};
-    storage.flags = FS_PIPE;
-    storage.device = &ctx->ramfs;
-    storage.length = ctx->length;
-    int32_t ret = (int32_t)ramfs_write(&storage, ctx->length, size, buffer);
-    if (ret > 0) {
-        ctx->length = storage.length;
-        vfs_node_t *rnode = ctx->reader_open ? ctx->read_node : NULL;
-        spinlock_release(&ctx->lock);
-        wait_queue_wake_all(&ctx->wq);
-        if (rnode)
-            epoll_notify_event(rnode, 0x0001);
-        return (uint32_t)ret;
+    /* O(1) contiguous block write into circular ring buffer */
+    uint32_t avail = PIPE_BUF_SIZE - ctx->count;
+    uint32_t to_write = size < avail ? size : avail;
+
+    uint32_t first_chunk = PIPE_BUF_SIZE - ctx->head;
+    if (first_chunk > to_write)
+        first_chunk = to_write;
+
+    memcpy(ctx->buffer + ctx->head, buffer, first_chunk);
+    uint32_t second_chunk = to_write - first_chunk;
+    if (second_chunk > 0) {
+        memcpy(ctx->buffer, buffer + first_chunk, second_chunk);
     }
+
+    ctx->head = (ctx->head + to_write) & PIPE_BUF_MASK;
+    ctx->count += to_write;
+
+    vfs_node_t *rnode = ctx->reader_open ? ctx->read_node : NULL;
+    wait_queue_wake_all(&ctx->wq);
     spinlock_release(&ctx->lock);
-    return ret < 0 ? (uint32_t)ret : (uint32_t)-28; // -ENOSPC (never 0)
+
+    if (rnode)
+        epoll_notify_event(rnode, 0x0001);
+    return to_write;
 }
 
 static int pipe_poll(vfs_node_t *node, int events) {
@@ -711,20 +734,14 @@ static int pipe_poll(vfs_node_t *node, int events) {
     if (!ctx) return 0;
     int revents = 0;
     spinlock_acquire(&ctx->lock);
-    if (!end->writer && ctx->length > ctx->read_offset) revents |= (POLLIN | POLLRDNORM);
+    if (!end->writer && ctx->count > 0) revents |= (POLLIN | POLLRDNORM);
     if (!end->writer && !ctx->writer_open) {
-        // EOF reads as readable: QProcess::waitForStarted polls POLLIN-only
-        // for the exec-time EOF from its CLOEXEC started-pipe. POLLHUP alone
-        // is filtered out of its check and the 30s wait expires as
-        // "Could not start program '/bin/bash'".
         revents |= (POLLIN | POLLRDNORM | POLLHUP);
     }
     if (end->writer && !ctx->reader_open)               revents |= POLLERR;
-    if (end->writer && ctx->reader_open && (ctx->length - ctx->read_offset) < 65536)
+    if (end->writer && ctx->reader_open && ctx->count < PIPE_BUF_SIZE)
         revents |= (POLLOUT | POLLWRNORM);
     spinlock_release(&ctx->lock);
-    /* poll(2) reports POLLERR and POLLHUP regardless of the requested mask.
-     * A POLLIN-only reader must wake when the final pipe writer closes. */
     return revents & (events | POLLERR | POLLHUP | POLLNVAL);
 }
 
@@ -739,8 +756,9 @@ static void pipe_close(vfs_node_t *node) {
         ctx->write_node = NULL;
         if (ctx->reader_open && ctx->read_node)
             notify_read = ctx->read_node;
-        if (ctx->length == 0 && ctx->ramfs.data) {
-            ramfs_free_file_data(&ctx->ramfs);
+        if (ctx->count == 0 && ctx->buffer) {
+            kfree(ctx->buffer);
+            ctx->buffer = NULL;
         }
     } else {
         ctx->reader_open = false;
@@ -754,7 +772,8 @@ static void pipe_close(vfs_node_t *node) {
     kfree(end);
     node->device = NULL;
     if (free_ctx) {
-        ramfs_free_file_data(&ctx->ramfs);
+        if (ctx->buffer)
+            kfree(ctx->buffer);
         kfree(ctx);
     }
 }
@@ -772,10 +791,7 @@ static int pipe_ioctl(vfs_node_t *node, uint32_t request, uint64_t arg) {
             return -14; // EFAULT
         }
         spinlock_acquire(&ctx->lock);
-        int unread = 0;
-        if (ctx->length > ctx->read_offset) {
-            unread = (int)(ctx->length - ctx->read_offset);
-        }
+        int unread = (int)ctx->count;
         spinlock_release(&ctx->lock);
         *out = unread;
         return 0;
@@ -794,7 +810,6 @@ static int pipe_ioctl(vfs_node_t *node, uint32_t request, uint64_t arg) {
 #define TEE_F_NONBLOCK 0x02
 #define TEE_F_MORE     0x04
 #define TEE_F_GIFT     0x08
-#define TEE_CHUNK      4096
 
 static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
                         uint64_t flags, uint64_t a4, uint64_t a5) {
@@ -811,8 +826,8 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
     vfs_node_t *out_node = t->fds[fd_out];
     /* Both ends must be pipes, opened the right way: the input needs the
      * read side, the output the write side. */
-    if ((in_node->flags & FS_TYPE_MASK) != FS_PIPE ||
-        (out_node->flags & FS_TYPE_MASK) != FS_PIPE || !in_node->read ||
+    if ((in_node->flags & FS_PIPE) != FS_PIPE ||
+        (out_node->flags & FS_PIPE) != FS_PIPE || !in_node->read ||
         !out_node->write)
         return (uint64_t)-22; // EINVAL: not a pipe pair
 
@@ -843,9 +858,7 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
         spinlock_acquire(&first->lock);
         if (second != first)
             spinlock_acquire(&second->lock);
-        uint32_t avail = (in_ctx->length > in_ctx->read_offset)
-                             ? (in_ctx->length - in_ctx->read_offset)
-                             : 0;
+        uint32_t avail = in_ctx->count;
         if (avail > 0)
             break; // locks held, data ready
         bool writer_gone = !in_ctx->writer_open;
@@ -861,7 +874,7 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
         t->state = THREAD_BLOCKED;
         spinlock_acquire(&in_ctx->lock);
         wait_queue_add(&in_ctx->wq, &entry);
-        if (in_ctx->read_offset < in_ctx->length || !in_ctx->writer_open) {
+        if (in_ctx->count > 0 || !in_ctx->writer_open) {
             t->state = THREAD_RUNNING;
             spinlock_release(&in_ctx->lock);
             wait_queue_remove(&in_ctx->wq, &entry);
@@ -874,53 +887,51 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
         wait_queue_remove(&in_ctx->wq, &entry);
     }
 
-    uint8_t *buf = kmalloc(TEE_CHUNK);
-    if (!buf) {
+    if (!out_ctx->buffer) {
+        out_ctx->buffer = kmalloc(PIPE_BUF_SIZE);
+        if (!out_ctx->buffer) {
+            spinlock_release(&second->lock);
+            if (second != first)
+                spinlock_release(&first->lock);
+            return (uint64_t)-12; // ENOMEM
+        }
+        out_ctx->head = 0;
+        out_ctx->tail = 0;
+        out_ctx->count = 0;
+    }
+
+    uint32_t avail_in = in_ctx->count;
+    uint32_t avail_out = PIPE_BUF_SIZE - out_ctx->count;
+    if (avail_out == 0) {
         spinlock_release(&second->lock);
         if (second != first)
             spinlock_release(&first->lock);
-        return (uint64_t)-12;
+        return (uint64_t)-28; // ENOSPC
     }
 
-    /* Duplicate from the input's unread window without advancing it, and
-     * append to the output pipe. */
-    uint64_t want = len;
-    uint32_t avail = in_ctx->length - in_ctx->read_offset;
-    if (want > avail)
-        want = avail;
-    uint64_t done = 0;
-    int64_t err = 0;
-    while (done < want) {
-        uint32_t chunk = (want - done > TEE_CHUNK) ? TEE_CHUNK
-                                                   : (uint32_t)(want - done);
-        vfs_node_t in_storage = {0};
-        in_storage.flags = FS_PIPE;
-        in_storage.device = &in_ctx->ramfs;
-        in_storage.length = in_ctx->length;
-        int32_t got = (int32_t)ramfs_read(&in_storage,
-                                          in_ctx->read_offset + (uint32_t)done,
-                                          chunk, buf);
-        if (got <= 0) {
-            if (done == 0)
-                err = got < 0 ? got : -5; // EIO on a short buffer
-            break;
-        }
-        vfs_node_t out_storage = {0};
-        out_storage.flags = FS_PIPE;
-        out_storage.device = &out_ctx->ramfs;
-        out_storage.length = out_ctx->length;
-        int32_t put = (int32_t)ramfs_write(&out_storage, out_ctx->length,
-                                           (uint32_t)got, buf);
-        if (put <= 0) {
-            if (done == 0)
-                err = put < 0 ? put : -28; // ENOSPC if the sink took nothing
-            break;
-        }
-        out_ctx->length = out_storage.length;
-        done += (uint64_t)put;
-        if (put < got)
-            break;
+    uint32_t to_tee = (uint32_t)len;
+    if (to_tee > avail_in)
+        to_tee = avail_in;
+    if (to_tee > avail_out)
+        to_tee = avail_out;
+
+    uint32_t done = 0;
+    while (done < to_tee) {
+        uint32_t in_pos = (in_ctx->tail + done) & PIPE_BUF_MASK;
+        uint32_t out_pos = (out_ctx->head + done) & PIPE_BUF_MASK;
+        uint32_t in_contig = PIPE_BUF_SIZE - in_pos;
+        uint32_t out_contig = PIPE_BUF_SIZE - out_pos;
+        uint32_t rem = to_tee - done;
+        uint32_t step = rem < in_contig ? rem : in_contig;
+        if (step > out_contig)
+            step = out_contig;
+        memcpy(out_ctx->buffer + out_pos, in_ctx->buffer + in_pos, step);
+        done += step;
     }
+
+    out_ctx->head = (out_ctx->head + done) & PIPE_BUF_MASK;
+    out_ctx->count += done;
+
     vfs_node_t *notify_read =
         (out_ctx->reader_open && out_ctx->read_node) ? out_ctx->read_node
                                                      : NULL;
@@ -928,16 +939,13 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
     spinlock_release(&second->lock);
     if (second != first)
         spinlock_release(&first->lock);
-    kfree(buf);
 
     if (woke_data) {
         wait_queue_wake_all(&out_ctx->wq);
         if (notify_read)
             epoll_notify_event(notify_read, 0x0001); // POLLIN, like pipe_write
     }
-    if (err && done == 0)
-        return (uint64_t)err;
-    return done;
+    return (uint64_t)done;
 }
 
 static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,

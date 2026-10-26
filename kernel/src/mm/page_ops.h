@@ -14,17 +14,21 @@ typedef enum {
 
 /* Low-level architecture assembly routines */
 void page_zero_nt(void *page);
+void page_zero_nt_batch(void **pages, size_t count);
 void page_copy_nt(void *dst, const void *src);
 void page_zero_erms(void *page);
 void page_copy_erms(void *dst, const void *src);
 void page_zero_avx512(void *page);
+void page_zero_avx512_batch(void **pages, size_t count);
 void page_copy_avx512(void *dst, const void *src);
 void page_zero_avx2(void *page);
+void page_zero_avx2_batch(void **pages, size_t count);
 void page_copy_avx2(void *dst, const void *src);
 
 /* Dynamic dispatch function pointers */
 extern void (*page_zero)(void *page);
 extern void (*page_copy)(void *dst, const void *src);
+extern void (*page_zero_batch)(void **pages, size_t count);
 
 /* 2 MB Huge Page operations */
 void page_zero_huge(void *page);

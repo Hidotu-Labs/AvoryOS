@@ -77,7 +77,8 @@ static bool signal_dequeue_locked(struct thread *t,uint64_t b,struct kernel_sigi
 }
 static void syscall_restart_return(struct registers *r,uint64_t n,uint64_t ip,bool h,uint64_t f){(void)r;(void)n;(void)ip;(void)h;(void)f;}
 static bool signal_default_is_ignore(int n){(void)n;return false;}
-#define klogf(...) ((void)0)
+static void test_log(const char *format,...){(void)format;}
+#define klogf test_log
 static void klog_puts(const char *s){(void)s;}
 static void klog_uint64(uint64_t n){(void)n;}
 static int process_core_dump_enabled;
@@ -90,7 +91,10 @@ static int exit_status;
 static void process_do_exit(int code){exit_status=code;longjmp(terminated,1);}
 static bool vmm_is_user_addr_range_writable(uint64_t a,size_t n){(void)a;(void)n;return true;}
 static bool on_sig_stack(struct thread *t,uint64_t sp){return sp>=t->ss_sp && sp-t->ss_sp<t->ss_size;}
-static void fpu_ensure_loaded(struct thread *t){(void)t;}
+static bool replace_action;
+static void fpu_ensure_loaded(struct thread *t){
+ if(replace_action){t->signal_handlers[SIGUSR1-1]=(struct k_sigaction){0};replace_action=false;}
+}
 static bool cpu_has_xsave_flag;
 static uint64_t cpu_xsave_mask;
 uint8_t cpu_has_smap_flag;
@@ -107,7 +111,7 @@ static void fault(int sig,siginfo_t *info,void *ctx){
 '''+function('static void fill_signal_context(')+function('static void signal_frame_terminate(')+function('static void signal_deliver_frame(')+r'''
 static struct registers regs;
 static void reset(uint8_t *frame){
- memset(&task,0,sizeof(task));queued=false;exit_status=0;
+ memset(&task,0,sizeof(task));queued=false;exit_status=0;replace_action=false;
  task.pending_signals=1ULL<<(SIGUSR1-1);task.tid=123;
  task.signal_handlers[SIGUSR1-1]=(struct k_sigaction){.sa_handler=(void*)0x123450,.sa_flags=SA_RESTORER|SA_SIGINFO,.sa_restorer=(void*)0x543210,.sa_mask=4};
  regs=(struct registers){.cs=0x2b,.ss=0x23,.rsp=(uintptr_t)frame+sizeof(struct sigframe)+128,.rip=0x8888,.rax=999};
@@ -127,6 +131,11 @@ int main(void){
  assert(regs.rsp==(uintptr_t)dest-8 && *(uint64_t*)regs.rsp==0x543210);
  assert(regs.rip==0x123450 && regs.rdi==SIGUSR1 && !task.has_saved_signal_mask);
  for(unsigned i=0;i<128;i++)assert(dest[sizeof(*f)+i]==0xa5);
+ assert(task.signal_mask==(4|(1ULL<<(SIGUSR1-1))));
+ /* Simulate a sibling resetting the disposition after handler selection. */
+ reset(dest);replace_action=true;signal_deliver_frame(&regs,UINT64_MAX,0);
+ assert(task.signal_handlers[SIGUSR1-1].sa_handler==NULL);
+ assert(regs.rip==0x123450 && *(uint64_t*)regs.rsp==0x543210);
  assert(task.signal_mask==(4|(1ULL<<(SIGUSR1-1))));
  /* The VMA remains writable, but the first CoW write cannot be resolved. */
  reset(dest);assert(!mprotect(dest,4096,PROT_READ));

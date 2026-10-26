@@ -55,6 +55,43 @@ static inline int list_empty(const struct list_head *head) {
     return !head || head->next == head || !head->next;
 }
 
+static inline void __list_splice(const struct list_head *list,
+                                 struct list_head *prev,
+                                 struct list_head *next) {
+    struct list_head *first = list->next;
+    struct list_head *last = list->prev;
+
+    first->prev = prev;
+    prev->next = first;
+
+    last->next = next;
+    next->prev = last;
+}
+
+static inline void list_splice(const struct list_head *list, struct list_head *head) {
+    if (!list_empty(list))
+        __list_splice(list, head, head->next);
+}
+
+static inline void list_splice_tail(const struct list_head *list, struct list_head *head) {
+    if (!list_empty(list))
+        __list_splice(list, head->prev, head);
+}
+
+static inline void list_splice_init(struct list_head *list, struct list_head *head) {
+    if (!list_empty(list)) {
+        __list_splice(list, head, head->next);
+        INIT_LIST_HEAD(list);
+    }
+}
+
+static inline void list_splice_tail_init(struct list_head *list, struct list_head *head) {
+    if (!list_empty(list)) {
+        __list_splice(list, head->prev, head);
+        INIT_LIST_HEAD(list);
+    }
+}
+
 #define list_entry(ptr, type, member) \
     ((type *)((char *)(ptr) - offsetof(type, member)))
 

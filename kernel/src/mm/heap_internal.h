@@ -50,6 +50,21 @@ extern spinlock_t heap_vmem_lock;
 extern struct slab_cache heap_caches[CACHE_COUNT];
 extern struct big_alloc *heap_big_alloc_head;
 
+#define HEAP_PCPU_CLASSES  4  /* 32, 64, 128, 256 bytes */
+#define HEAP_PCPU_CAPACITY 8  /* Objects per per-CPU magazine */
+#define HEAP_PCPU_BATCH    4  /* Objects moved to/from slab on refill/drain */
+
+struct heap_pcpu_cache {
+  void *entries[HEAP_PCPU_CAPACITY];
+  uint32_t count;
+  volatile uint32_t active;
+  spinlock_t lock;
+} __attribute__((aligned(64)));
+
+extern struct heap_pcpu_cache heap_pcpu_caches[MAX_CPUS][HEAP_PCPU_CLASSES];
+void heap_pcpu_flush_all(void);
+void heap_pcpu_flush_cpu(uint32_t cpu_id);
+
 /* Opt-in per-size-class object diagnostics for self-tests.  Every hook is
  * guarded by one branch over a cold volatile, so the default allocation
  * paths keep their exact shape; the counters are diagnostic slop only. */

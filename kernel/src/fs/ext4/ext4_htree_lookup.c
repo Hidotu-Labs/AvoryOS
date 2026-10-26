@@ -11,7 +11,7 @@ static int search_leaf_block(
     const char *name,
     uint32_t name_length)
 {
-    uint32_t phys_block = ext2_get_block_num(mount, dir_inode, logical_block);
+    uint64_t phys_block = ext2_get_block_num(mount, dir_inode, logical_block);
     if (phys_block == 0 || ext2_read_block(mount, phys_block, buffer) != 0)
         return -1;
 
@@ -57,7 +57,7 @@ int ext4_htree_find_entry(
     /*
      * 1. Read HTree root (logical block 0).
      */
-    uint32_t root_phys = ext2_get_block_num(mount, dir_inode, 0);
+    uint64_t root_phys = ext2_get_block_num(mount, dir_inode, 0);
     if (root_phys == 0 || ext2_read_block(mount, root_phys, root_buffer) != 0)
         goto cleanup;
 
@@ -185,7 +185,7 @@ int ext4_htree_find_entry(
         }
 
         uint32_t node_logical = entries[target_index].block & 0x0fffffffu;
-        uint32_t node_phys = ext2_get_block_num(mount, dir_inode, node_logical);
+        uint64_t node_phys = ext2_get_block_num(mount, dir_inode, node_logical);
         if (node_phys == 0 || ext2_read_block(mount, node_phys, leaf_buffer) != 0) {
             found_inode = -1;
             goto cleanup;

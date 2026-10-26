@@ -81,21 +81,26 @@ uint32_t pid_namespace_tid(struct thread *viewer, struct thread *target) {
 }
 uint32_t pid_namespace_global_locked(struct thread *viewer, uint32_t local) {
   if (!local) return 0;
+  if (!viewer || !viewer->pid_ns) return local;
   for (struct thread *t = global_thread_list; t; t = t->global_next)
     if (pid_namespace_tid(viewer, t) == local) return t->tid;
   return 0;
 }
 uint32_t pid_namespace_visible_locked(struct thread *viewer, uint32_t global) {
+  if (!viewer || !viewer->pid_ns) return global;
   for (struct thread *t = global_thread_list; t; t = t->global_next)
     if (t->tid == global) return pid_namespace_tid(viewer, t);
   return 0;
 }
 uint32_t pid_namespace_global(struct thread *viewer, uint32_t local) {
+  if (!local) return 0;
+  if (!viewer || !viewer->pid_ns) return local;
   spinlock_acquire(&tid_lock);
   uint32_t id = pid_namespace_global_locked(viewer, local);
   spinlock_release(&tid_lock); return id;
 }
 uint32_t pid_namespace_visible(struct thread *viewer, uint32_t global) {
+  if (!viewer || !viewer->pid_ns) return global;
   spinlock_acquire(&tid_lock);
   uint32_t id = pid_namespace_visible_locked(viewer, global);
   spinlock_release(&tid_lock); return id;

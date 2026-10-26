@@ -107,7 +107,8 @@ typedef struct eventpoll {
 
   // Ready list - FDs with events pending
   struct list_head rdllist;    // Ready list head
-  int rdllist_count;           // Number of ready items
+  int rdllist_count;           // Number of ready items (atomic-accessible)
+  uint64_t generation;         // Generation counter incremented on state/ready updates
   
   // Wait queue for blocking in epoll_wait
   wait_queue_t wq;

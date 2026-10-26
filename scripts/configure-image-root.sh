@@ -17,7 +17,11 @@ CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/avory-image-config.XXXXXX")"
 trap 'rm -rf "${CONFIG_DIR}"' EXIT
 
 cat > "${CONFIG_DIR}/bashrc" <<'EOF'
-PS1='\033[0;32mRoot@AvoryOS\033[0m:\w\$ '
+# Keep the prompt entirely printable.  Graphical terminal emulators were
+# accepting Bash history recall but drawing it off-screen with the colored
+# prompt, even though its ANSI spans were marked for Readline.  A plain prompt
+# avoids the width mismatch while retaining the host and working directory.
+PS1='Root@AvoryOS:\w# '
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 HOME=/
 TERM=xterm-256color

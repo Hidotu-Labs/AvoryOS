@@ -33,6 +33,10 @@
 #define FS_DELETED 0x200
 /* Filesystem-owned ephemeral root: destroy payload on its final reference. */
 #define FS_AUTODESTROY 0x400
+/* Filesystem backing is forced read-only because its on-disk feature set
+ * exceeds this driver's writable support. Unlike per-mount MS_RDONLY, this
+ * cannot be cleared by a remount. */
+#define FS_READONLY 0x800
 #define FS_TYPE_MASK 0x0F
 
 /* Live-object markers.  A node or cached page that has been freed has its
@@ -214,6 +218,7 @@ typedef struct vfs_node {
   struct vfs_node *view_backing; /* Namespace path view; callbacks use the backing inode. */
   struct vfs_node *view_parent; /* Owned path ancestry, not the backing inode parent. */
   uint64_t mount_id; // Stable VFS mount identity, inherited during lookup
+  uint64_t filesystem_mount_flags; // Immutable backing RO/NOSUID/NODEV/NOEXEC policy
   char name[128];
   uint32_t mask; // Permissions
   uint32_t uid;
@@ -231,6 +236,9 @@ typedef struct vfs_node {
 
   read_type_t read;
   write_type_t write;
+  /* Optional append operation. Returns the actual end position on success;
+   * disk backends select persistent EOF under their transaction ownership. */
+  uint32_t (*append)(struct vfs_node *, uint32_t, uint8_t *, uint32_t *);
   open_type_t open;
   close_type_t close;
   close_type_t destroy; // Release device payload once a retired node is final
@@ -290,6 +298,11 @@ typedef struct vfs_node {
   struct radix_tree pages; // Cached pages keyed by file page index
   spinlock_t pages_lock;   // Serializes compound cache/value-lifetime changes
 
+  /* Direct Radix Level-1 Leaf Cache for Fast Page Cache Lookup */
+  uint64_t pc_cache_chunk; // Page index >> 6 (identifies 256KB chunk)
+  void *pc_cache_leaf;     // Cached level-1 radix node pointer
+  uint32_t pc_cache_seq;   // Tree mutation seq when cached
+
   /* Adaptive on-demand readahead tracking */
   uint32_t ra_prev_offset;
   uint32_t ra_window;
@@ -318,6 +331,8 @@ uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                   uint8_t *buffer);
 uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
                    uint8_t *buffer);
+uint32_t vfs_append(vfs_node_t *node, uint32_t size, uint8_t *buffer,
+                    uint32_t *end_offset);
 void vfs_open(vfs_node_t *node);
 void vfs_close(vfs_node_t *node);
 
@@ -394,6 +409,7 @@ int vfs_mount(vfs_node_t *mountpoint, vfs_node_t *target);
 int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
                  const char *dev_name, const char *fs_type,
                  const char *path);
+int vfs_initial_unmount(vfs_node_t *root, unsigned flags);
 int vfs_statfs(vfs_node_t *node, void *buf);
 
 /* In-memory extended attributes (fs/xattr.c). Generic per-node store backing

@@ -326,6 +326,10 @@ void sched_init(void) {
 
     spinlock_acquire(&tid_lock);
     idle_thread->global_next = global_thread_list;
+    idle_thread->global_prev = NULL;
+    if (global_thread_list) {
+      global_thread_list->global_prev = idle_thread;
+    }
     global_thread_list = idle_thread;
     __atomic_add_fetch(&global_thread_count, 1, __ATOMIC_RELAXED);
     cpu->idle_thread = idle_thread;

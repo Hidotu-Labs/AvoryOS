@@ -234,6 +234,7 @@ typedef struct evdev_device {
   wait_queue_t wait;    // For blocking reads / poll
   spinlock_t lock;      // Protects head/tail and ring buffer
   vfs_node_t *vfs_node; // The /dev/input/eventN node
+  struct evdev_client *clients; // Independent event cursor for each open file
 } evdev_device_t;
 
 // Public API

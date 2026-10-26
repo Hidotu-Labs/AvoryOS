@@ -740,6 +740,66 @@ static uint32_t pty_bytes_pending(pty_pair_t *pty, bool to_master) {
   }
 }
 
+// Rescan buffer for newlines (used when switching to canonical mode)
+static void pty_rescan_newlines(pty_pair_t *pty) {
+  pty->m2s_newline_count = 0;
+  if (!pty->master_to_slave)
+    return;
+  uint32_t curr = pty->m2s_tail;
+  while (curr != pty->m2s_head) {
+    if (pty->master_to_slave[curr] == '\n') {
+      pty->m2s_newline_count++;
+    }
+    curr = (curr + 1) % PTY_BUFFER_SIZE;
+  }
+}
+
+/* Modern glibc uses termios2 even for tcgetattr/tcsetattr. Handle these
+ * requests on the pair itself: returning ENOTTY here would let sys_ioctl's
+ * console fallback change console_termios while leaving the PTY canonical. */
+static int pty_get_termios(pty_pair_t *pty, uint32_t request, uint64_t arg) {
+  bool extended = request == TCGETS2;
+  size_t size = extended ? sizeof(struct termios2) : sizeof(struct kernel_termios);
+  if (!arg || !vmm_is_user_addr_range_valid(arg, size))
+    return -14;
+
+  struct termios2 value = {0};
+  value.c_iflag = pty->termios.c_iflag;
+  value.c_oflag = pty->termios.c_oflag;
+  value.c_cflag = pty->termios.c_cflag;
+  value.c_lflag = pty->termios.c_lflag;
+  value.c_line = pty->termios.c_line;
+  memcpy(value.c_cc, pty->termios.c_cc, KERNEL_NCCS);
+  value.c_ispeed = pty->termios.__c_ispeed;
+  value.c_ospeed = pty->termios.__c_ospeed;
+  return copy_to_user((void *)arg, &value, size) ? -14 : 0;
+}
+
+static int pty_set_termios(pty_pair_t *pty, uint32_t request, uint64_t arg) {
+  bool extended = request == TCSETS2 || request == TCSETSW2 || request == TCSETSF2;
+  size_t size = extended ? sizeof(struct termios2) : sizeof(struct kernel_termios);
+  if (!arg || !vmm_is_user_addr_range_valid(arg, size))
+    return -14;
+
+  struct termios2 value = {0};
+  if (copy_from_user(&value, (const void *)arg, size))
+    return -14;
+  bool old_icanon = (pty->termios.c_lflag & ICANON) != 0;
+  pty->termios.c_iflag = value.c_iflag;
+  pty->termios.c_oflag = value.c_oflag;
+  pty->termios.c_cflag = value.c_cflag;
+  pty->termios.c_lflag = value.c_lflag;
+  pty->termios.c_line = value.c_line;
+  memcpy(pty->termios.c_cc, value.c_cc, KERNEL_NCCS);
+  if (extended) {
+    pty->termios.__c_ispeed = value.c_ispeed;
+    pty->termios.__c_ospeed = value.c_ospeed;
+  }
+  if (!old_icanon && (pty->termios.c_lflag & ICANON))
+    pty_rescan_newlines(pty);
+  return 0;
+}
+
 int ptmx_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   pty_pair_t *pty = (pty_pair_t *)node->device;
   if (!pty)
@@ -752,39 +812,19 @@ int ptmx_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   spinlock_acquire(&pty->lock);
 
   switch (request) {
-  case TCGETS: {
-    struct kernel_termios *kt = (struct kernel_termios *)arg;
-    if (!kt || !vmm_is_user_addr_range_valid(arg, sizeof(*kt))) {
-      ret = -14;
-    } else {
-      kt->c_iflag = pty->termios.c_iflag;
-      kt->c_oflag = pty->termios.c_oflag;
-      kt->c_cflag = pty->termios.c_cflag;
-      kt->c_lflag = pty->termios.c_lflag;
-      kt->c_line = pty->termios.c_line;
-      memcpy(kt->c_cc, pty->termios.c_cc, KERNEL_NCCS);
-      ret = 0;
-    }
+  case TCGETS:
+  case TCGETS2:
+    ret = pty_get_termios(pty, request, arg);
     break;
-  }
 
   case TCSETS:
   case TCSETSW:
-  case TCSETSF: {
-    const struct kernel_termios *kt = (const struct kernel_termios *)arg;
-    if (!kt || !vmm_is_user_addr_range_valid(arg, sizeof(*kt))) {
-      ret = -14;
-    } else {
-      pty->termios.c_iflag = kt->c_iflag;
-      pty->termios.c_oflag = kt->c_oflag;
-      pty->termios.c_cflag = kt->c_cflag;
-      pty->termios.c_lflag = kt->c_lflag;
-      pty->termios.c_line = kt->c_line;
-      memcpy(pty->termios.c_cc, kt->c_cc, KERNEL_NCCS);
-      ret = 0;
-    }
+  case TCSETSF:
+  case TCSETS2:
+  case TCSETSW2:
+  case TCSETSF2:
+    ret = pty_set_termios(pty, request, arg);
     break;
-  }
 
   case TIOCPKT: {
     const int *enabled = (const int *)arg;
@@ -1286,20 +1326,6 @@ uint32_t pty_slave_write(struct vfs_node *node, uint32_t offset, uint32_t size,
   return total_written;
 }
 
-// Rescan buffer for newlines (used when switching to canonical mode)
-static void pty_rescan_newlines(pty_pair_t *pty) {
-  pty->m2s_newline_count = 0;
-  if (!pty->master_to_slave)
-    return;
-  uint32_t curr = pty->m2s_tail;
-  while (curr != pty->m2s_head) {
-    if (pty->master_to_slave[curr] == '\n') {
-      pty->m2s_newline_count++;
-    }
-    curr = (curr + 1) % PTY_BUFFER_SIZE;
-  }
-}
-
 int pty_slave_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   pty_pair_t *pty = (pty_pair_t *)node->device;
   if (!pty)
@@ -1312,54 +1338,19 @@ int pty_slave_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   spinlock_acquire(&pty->lock);
 
   switch (request) {
-  case TCGETS: {
-    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(struct kernel_termios))) {
-      ret = -14;
-    } else {
-      struct kernel_termios kt;
-      kt.c_iflag = pty->termios.c_iflag;
-      kt.c_oflag = pty->termios.c_oflag;
-      kt.c_cflag = pty->termios.c_cflag;
-      kt.c_lflag = pty->termios.c_lflag;
-      kt.c_line  = pty->termios.c_line;
-      memcpy(kt.c_cc, pty->termios.c_cc, KERNEL_NCCS);
-      memcpy((void *)arg, &kt, sizeof(struct kernel_termios));
-      ret = 0;
-    }
+  case TCGETS:
+  case TCGETS2:
+    ret = pty_get_termios(pty, request, arg);
     break;
-  }
 
   case TCSETS:
   case TCSETSW:
-  case TCSETSF: {
-    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(struct kernel_termios))) {
-      ret = -14;
-    } else {
-      struct kernel_termios kt;
-      memcpy(&kt, (const void *)arg, sizeof(struct kernel_termios));
-      bool old_icanon = (pty->termios.c_lflag & ICANON);
-#if PTY_DEBUG_LOGGING
-      klog_puts("[PTY] slave_ioctl TCSETS: old ICANON=");
-      klog_uint64(old_icanon ? 1 : 0);
-      klog_puts(" new ICANON=");
-      klog_uint64(kt.c_lflag & ICANON ? 1 : 0);
-      klog_puts(" new ECHO=");
-      klog_uint64(kt.c_lflag & ECHO ? 1 : 0);
-      klog_puts("\n");
-#endif
-      pty->termios.c_iflag = kt.c_iflag;
-      pty->termios.c_oflag = kt.c_oflag;
-      pty->termios.c_cflag = kt.c_cflag;
-      pty->termios.c_lflag = kt.c_lflag;
-      pty->termios.c_line  = kt.c_line;
-      memcpy(pty->termios.c_cc, kt.c_cc, KERNEL_NCCS);
-      if (!old_icanon && (pty->termios.c_lflag & ICANON)) {
-        pty_rescan_newlines(pty);
-      }
-      ret = 0;
-    }
+  case TCSETSF:
+  case TCSETS2:
+  case TCSETSW2:
+  case TCSETSF2:
+    ret = pty_set_termios(pty, request, arg);
     break;
-  }
 
   case TIOCGWINSZ: {
     struct winsize *ws = (struct winsize *)arg;

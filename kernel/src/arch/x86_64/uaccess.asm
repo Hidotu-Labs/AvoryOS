@@ -67,13 +67,115 @@ copy_from_user:
     cmp rax, r8
     ja cfu_error_all
 
+    ; Fast path dispatch based on size
+    cmp rdx, 8
+    jb cfu_small
+    je cfu_exact_8
+    cmp rdx, 16
+    je cfu_exact_16
+    cmp rdx, 64
+    jae cfu_bulk
+
+    ; Arbitrary sizes 8 < n < 64: copy 8 bytes at a time
+cfu_qwords:
+cfu_fetch_qword:
+    mov rax, qword [rsi]
+    mov qword [rdi], rax
+    add rsi, 8
+    add rdi, 8
+    sub rdx, 8
+    cmp rdx, 8
+    jae cfu_qwords
+
+cfu_tail:
+    test rdx, rdx
+    jz cfu_success
+
+    test dl, 4
+    jz cfu_tail_no_4
+cfu_fetch_tail_4:
+    mov eax, dword [rsi]
+    mov dword [rdi], eax
+    add rsi, 4
+    add rdi, 4
+    sub rdx, 4
+cfu_tail_no_4:
+    test dl, 2
+    jz cfu_tail_no_2
+cfu_fetch_tail_2:
+    mov ax, word [rsi]
+    mov word [rdi], ax
+    add rsi, 2
+    add rdi, 2
+    sub rdx, 2
+cfu_tail_no_2:
+    test dl, 1
+    jz cfu_success
+cfu_fetch_tail_1:
+    mov al, byte [rsi]
+    mov byte [rdi], al
+cfu_success:
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+cfu_small:
+    cmp rdx, 4
+    je cfu_exact_4
+    cmp rdx, 1
+    je cfu_exact_1
+    cmp rdx, 2
+    je cfu_exact_2
+    jmp cfu_tail
+
+cfu_exact_1:
+cfu_fetch_1:
+    mov al, byte [rsi]
+    mov byte [rdi], al
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+cfu_exact_2:
+cfu_fetch_2:
+    mov ax, word [rsi]
+    mov word [rdi], ax
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+cfu_exact_4:
+cfu_fetch_4:
+    mov eax, dword [rsi]
+    mov dword [rdi], eax
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+cfu_exact_8:
+cfu_fetch_8:
+    mov rax, qword [rsi]
+    mov qword [rdi], rax
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+cfu_exact_16:
+cfu_fetch_16_0:
+    mov rax, qword [rsi]
+    mov qword [rdi], rax
+cfu_fetch_16_1:
+    mov r8, qword [rsi + 8]
+    mov qword [rdi + 8], r8
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+cfu_bulk:
     mov rcx, rdx
     cld
-
 cfu_copy_insn:
     rep movsb
-
-cfu_success:
     xor eax, eax
     USER_ACCESS_END
     ret
@@ -83,9 +185,57 @@ cfu_error_all:
     USER_ACCESS_END
     ret
 
+; Fixup handlers for copy_from_user:
+cfu_fixup_1:
+    mov byte [rdi], 0
+    mov eax, 1
+    USER_ACCESS_END
+    ret
+
+cfu_fixup_2:
+    mov word [rdi], 0
+    mov eax, 2
+    USER_ACCESS_END
+    ret
+
+cfu_fixup_4:
+    mov dword [rdi], 0
+    mov eax, 4
+    USER_ACCESS_END
+    ret
+
+cfu_fixup_8:
+    mov qword [rdi], 0
+    mov eax, 8
+    USER_ACCESS_END
+    ret
+
+cfu_fixup_16_0:
+    mov qword [rdi], 0
+    mov qword [rdi + 8], 0
+    mov eax, 16
+    USER_ACCESS_END
+    ret
+
+cfu_fixup_16_1:
+    mov qword [rdi + 8], 0
+    mov eax, 8
+    USER_ACCESS_END
+    ret
+
+cfu_fixup_rdx:
+    mov rcx, rdx
+    xor eax, eax
+    cld
+    rep stosb
+    mov rax, rdx
+    USER_ACCESS_END
+    ret
+
 cfu_fixup_landing:
     push rcx
     xor eax, eax
+    cld
     rep stosb
     pop rax
     USER_ACCESS_END
@@ -108,18 +258,156 @@ copy_to_user:
     cmp rax, r8
     ja ctu_error_all
 
-    mov rcx, rdx
-    cld
+    ; Fast path dispatch based on size
+    cmp rdx, 8
+    jb ctu_small
+    je ctu_exact_8
+    cmp rdx, 16
+    je ctu_exact_16
+    cmp rdx, 64
+    jae ctu_bulk
 
-ctu_copy_insn:
-    rep movsb
+    ; Arbitrary sizes 8 < n < 64: copy 8 bytes at a time
+ctu_qwords:
+    mov rax, qword [rsi]
+ctu_store_qword:
+    mov qword [rdi], rax
+    add rsi, 8
+    add rdi, 8
+    sub rdx, 8
+    cmp rdx, 8
+    jae ctu_qwords
 
+ctu_tail:
+    test rdx, rdx
+    jz ctu_success
+
+    test dl, 4
+    jz ctu_tail_no_4
+    mov eax, dword [rsi]
+ctu_store_tail_4:
+    mov dword [rdi], eax
+    add rsi, 4
+    add rdi, 4
+    sub rdx, 4
+ctu_tail_no_4:
+    test dl, 2
+    jz ctu_tail_no_2
+    mov ax, word [rsi]
+ctu_store_tail_2:
+    mov word [rdi], ax
+    add rsi, 2
+    add rdi, 2
+    sub rdx, 2
+ctu_tail_no_2:
+    test dl, 1
+    jz ctu_success
+    mov al, byte [rsi]
+ctu_store_tail_1:
+    mov byte [rdi], al
 ctu_success:
     xor eax, eax
     USER_ACCESS_END
     ret
 
+ctu_small:
+    cmp rdx, 4
+    je ctu_exact_4
+    cmp rdx, 1
+    je ctu_exact_1
+    cmp rdx, 2
+    je ctu_exact_2
+    jmp ctu_tail
+
+ctu_exact_1:
+    mov al, byte [rsi]
+ctu_store_1:
+    mov byte [rdi], al
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+ctu_exact_2:
+    mov ax, word [rsi]
+ctu_store_2:
+    mov word [rdi], ax
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+ctu_exact_4:
+    mov eax, dword [rsi]
+ctu_store_4:
+    mov dword [rdi], eax
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+ctu_exact_8:
+    mov rax, qword [rsi]
+ctu_store_8:
+    mov qword [rdi], rax
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+ctu_exact_16:
+    mov rax, qword [rsi]
+    mov r8, qword [rsi + 8]
+ctu_store_16_0:
+    mov qword [rdi], rax
+ctu_store_16_1:
+    mov qword [rdi + 8], r8
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+ctu_bulk:
+    mov rcx, rdx
+    cld
+ctu_copy_insn:
+    rep movsb
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
 ctu_error_all:
+    mov rax, rdx
+    USER_ACCESS_END
+    ret
+
+; Fixup handlers for copy_to_user:
+ctu_fixup_1:
+    mov eax, 1
+    USER_ACCESS_END
+    ret
+
+ctu_fixup_2:
+    mov eax, 2
+    USER_ACCESS_END
+    ret
+
+ctu_fixup_4:
+    mov eax, 4
+    USER_ACCESS_END
+    ret
+
+ctu_fixup_8:
+    mov eax, 8
+    USER_ACCESS_END
+    ret
+
+ctu_fixup_16_0:
+    mov eax, 16
+    USER_ACCESS_END
+    ret
+
+ctu_fixup_16_1:
+    mov eax, 8
+    USER_ACCESS_END
+    ret
+
+ctu_fixup_rdx:
     mov rax, rdx
     USER_ACCESS_END
     ret
@@ -145,19 +433,141 @@ clear_user:
     cmp rax, r8
     ja cu_error_all
 
-    mov rcx, rsi
-    xor eax, eax
-    cld
+    cmp rsi, 8
+    jb cu_small
+    je cu_exact_8
+    cmp rsi, 16
+    je cu_exact_16
+    cmp rsi, 64
+    jae cu_bulk
 
-cu_clear_insn:
-    rep stosb
+cu_qwords:
+cu_store_qword:
+    mov qword [rdi], 0
+    add rdi, 8
+    sub rsi, 8
+    cmp rsi, 8
+    jae cu_qwords
 
+cu_tail:
+    test rsi, rsi
+    jz cu_success
+
+    test sil, 4
+    jz cu_tail_no_4
+cu_store_tail_4:
+    mov dword [rdi], 0
+    add rdi, 4
+    sub rsi, 4
+cu_tail_no_4:
+    test sil, 2
+    jz cu_tail_no_2
+cu_store_tail_2:
+    mov word [rdi], 0
+    add rdi, 2
+    sub rsi, 2
+cu_tail_no_2:
+    test sil, 1
+    jz cu_success
+cu_store_tail_1:
+    mov byte [rdi], 0
 cu_success:
     xor eax, eax
     USER_ACCESS_END
     ret
 
+cu_small:
+    cmp rsi, 4
+    je cu_exact_4
+    cmp rsi, 1
+    je cu_exact_1
+    cmp rsi, 2
+    je cu_exact_2
+    jmp cu_tail
+
+cu_exact_1:
+cu_store_1:
+    mov byte [rdi], 0
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+cu_exact_2:
+cu_store_2:
+    mov word [rdi], 0
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+cu_exact_4:
+cu_store_4:
+    mov dword [rdi], 0
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+cu_exact_8:
+cu_store_8:
+    mov qword [rdi], 0
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+cu_exact_16:
+cu_store_16_0:
+    mov qword [rdi], 0
+cu_store_16_1:
+    mov qword [rdi + 8], 0
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
+cu_bulk:
+    mov rcx, rsi
+    xor eax, eax
+    cld
+cu_clear_insn:
+    rep stosb
+    xor eax, eax
+    USER_ACCESS_END
+    ret
+
 cu_error_all:
+    mov rax, rsi
+    USER_ACCESS_END
+    ret
+
+cu_fixup_1:
+    mov eax, 1
+    USER_ACCESS_END
+    ret
+
+cu_fixup_2:
+    mov eax, 2
+    USER_ACCESS_END
+    ret
+
+cu_fixup_4:
+    mov eax, 4
+    USER_ACCESS_END
+    ret
+
+cu_fixup_8:
+    mov eax, 8
+    USER_ACCESS_END
+    ret
+
+cu_fixup_16_0:
+    mov eax, 16
+    USER_ACCESS_END
+    ret
+
+cu_fixup_16_1:
+    mov eax, 8
+    USER_ACCESS_END
+    ret
+
+cu_fixup_rsi:
     mov rax, rsi
     USER_ACCESS_END
     ret
@@ -384,8 +794,38 @@ sl_fixup_landing:
 ; -----------------------------------------------------------------------------
 section __ex_table progbits alloc noexec nowrite
     dq cxu_atomic_insn, cxu_fault
+    dq cfu_fetch_1, cfu_fixup_1
+    dq cfu_fetch_2, cfu_fixup_2
+    dq cfu_fetch_4, cfu_fixup_4
+    dq cfu_fetch_8, cfu_fixup_8
+    dq cfu_fetch_16_0, cfu_fixup_16_0
+    dq cfu_fetch_16_1, cfu_fixup_16_1
+    dq cfu_fetch_qword, cfu_fixup_rdx
+    dq cfu_fetch_tail_4, cfu_fixup_rdx
+    dq cfu_fetch_tail_2, cfu_fixup_rdx
+    dq cfu_fetch_tail_1, cfu_fixup_rdx
     dq cfu_copy_insn, cfu_fixup_landing
+    dq ctu_store_1, ctu_fixup_1
+    dq ctu_store_2, ctu_fixup_2
+    dq ctu_store_4, ctu_fixup_4
+    dq ctu_store_8, ctu_fixup_8
+    dq ctu_store_16_0, ctu_fixup_16_0
+    dq ctu_store_16_1, ctu_fixup_16_1
+    dq ctu_store_qword, ctu_fixup_rdx
+    dq ctu_store_tail_4, ctu_fixup_rdx
+    dq ctu_store_tail_2, ctu_fixup_rdx
+    dq ctu_store_tail_1, ctu_fixup_rdx
     dq ctu_copy_insn, ctu_fixup_landing
+    dq cu_store_1, cu_fixup_1
+    dq cu_store_2, cu_fixup_2
+    dq cu_store_4, cu_fixup_4
+    dq cu_store_8, cu_fixup_8
+    dq cu_store_16_0, cu_fixup_16_0
+    dq cu_store_16_1, cu_fixup_16_1
+    dq cu_store_qword, cu_fixup_rsi
+    dq cu_store_tail_4, cu_fixup_rsi
+    dq cu_store_tail_2, cu_fixup_rsi
+    dq cu_store_tail_1, cu_fixup_rsi
     dq cu_clear_insn, cu_fixup_landing
     dq sn_align_fetch_insn, sn_fixup_landing
     dq sn_qword_fetch_insn, sn_fixup_landing

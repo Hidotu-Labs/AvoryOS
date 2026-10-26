@@ -16,6 +16,9 @@ void register_interrupt_handler(uint8_t n, isr_t handler);
 int interrupt_vector_alloc(isr_t handler);
 void interrupt_vector_free(uint8_t vector);
 
+/* Number of interrupt deliveries for a CPU and IDT vector. */
+uint64_t isr_get_vector_count(uint32_t cpu_id, uint32_t vector);
+
 void isr_handler(struct registers *regs);
 
 void isr_init_exceptions(void);

@@ -32,7 +32,8 @@ typedef int spinlock_t;
 static int held;
 static bool irq_enabled = true;
 static bool hal_irq_enabled(void) { return irq_enabled && !held; }
-static void spinlock_acquire(spinlock_t *l) { assert(!*l); *l=1; held++; }
+static void on_mm_lock(spinlock_t *l);
+static void spinlock_acquire(spinlock_t *l) { on_mm_lock(l); assert(!*l); *l=1; held++; }
 static void spinlock_release(spinlock_t *l) { assert(*l); *l=0; held--; }
 struct vma { uint64_t start,end; unsigned flags,prot; void *linux_vma,*file_node; struct vma *left,*right; };
 struct mm_struct { uint64_t ksm_scan_cursor; unsigned ref_count; spinlock_t lock; struct {struct vma *root;} vmas; };
@@ -42,7 +43,17 @@ static uint8_t ram[10*PAGE_SIZE];
 static uint16_t refs[10];
 static uint64_t ptes[6];
 static unsigned flushes;
-static bool race_cow;
+static bool race_cow,race_apply;
+static spinlock_t *target_lock;
+static unsigned mm_acquires;
+static void on_mm_lock(spinlock_t *l) {
+ if(l!=target_lock)return;
+ if(++mm_acquires==2&&race_apply){
+  assert(refs[3]==2&&refs[2]==3);
+  refs[3]--;refs[7]=1;ptes[2]=7*PAGE_SIZE|7;
+  memset(ram+7*PAGE_SIZE,0x77,PAGE_SIZE);
+ }
+}
 struct thread *global_thread_list;
 spinlock_t tid_lock;
 static uint64_t pmm_get_zero_page_phys(void) { return 8*PAGE_SIZE; }
@@ -84,8 +95,8 @@ int main(void) {
  struct vma v[6]={0}; struct mm_struct mm={.ref_count=1};
  struct thread t={.mm=&mm,.cr3=4096}; global_thread_list=&t;
  ksm_node_pool=calloc(KSM_MAX_NODES,sizeof(*ksm_node_pool)); assert(ksm_node_pool);
- for (unsigned run=0;run<2;run++) {
-  race_cow=run;flushes=0;memset(refs,0,sizeof(refs));memset(ram,0,sizeof(ram));
+ for (unsigned run=0;run<3;run++) {
+  race_cow=run==1;race_apply=run==2;mm_acquires=0;target_lock=&mm.lock;flushes=0;memset(refs,0,sizeof(refs));memset(ram,0,sizeof(ram));
   for(unsigned i=0;i<6;i++) {
    v[i]=(struct vma){.start=i*PAGE_SIZE,.end=(i+1)*PAGE_SIZE,
     .flags=MAP_PRIVATE|MAP_ANONYMOUS,.prot=PROT_WRITE,.right=i<5?&v[i+1]:NULL};
@@ -94,13 +105,16 @@ int main(void) {
   memset(ram+2*PAGE_SIZE,0x11,2*PAGE_SIZE);
   refs[5]=2;v[5].file_node=&t;refs[8]=65535;mm.vmas.root=v;
   irq_enabled=false;assert(ksm_scan_pass()==0 && flushes==0);irq_enabled=true;
-  assert(ksm_scan_pass()==(race_cow?1:2));assert(flushes==2);
+  assert(ksm_scan_pass()==(race_apply?1:2));assert(flushes==2);
   assert((ptes[0]&PAGE_MASK)==8*PAGE_SIZE && refs[1]==0);
   assert((ptes[3]&PAGE_MASK)==4*PAGE_SIZE && refs[4]==1);
   assert(ram[4*PAGE_SIZE]==0x42 && refs[5]==2 && refs[6]==1);
   if(race_cow) {
    assert((ptes[1]&PAGE_MASK)==7*PAGE_SIZE && refs[7]==1);
-   assert(refs[2]==0 && refs[3]==1);
+   assert(refs[2]==1 && refs[3]==0);
+  } else if(race_apply) {
+   assert((ptes[2]&PAGE_MASK)==7*PAGE_SIZE && refs[7]==1);
+   assert((ptes[1]&PAGE_MASK)==2*PAGE_SIZE && refs[2]==1 && refs[3]==0);
   } else {
    assert((ptes[1]&PAGE_MASK)==(ptes[2]&PAGE_MASK));
    assert(refs[2]==2 && refs[3]==0);
@@ -117,3 +131,9 @@ with tempfile.TemporaryDirectory(prefix='avory-ksm-') as tmp:
     subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-unused-variable',
                     '-fsanitize=address,undefined','-g',str(c),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)
+    mutant=scan.replace('pmm_free_page((void *)snapshot->replacement);', '')
+    assert mutant!=scan
+    c.write_text(prefix+mutant+test)
+    subprocess.run(['cc','-std=gnu11','-Wno-unused-variable',str(c),'-o',str(exe)],check=True)
+    assert subprocess.run([str(exe)],capture_output=True).returncode!=0
+    print('PASS: leaking a cancelled replacement reference fails the CoW race regression')

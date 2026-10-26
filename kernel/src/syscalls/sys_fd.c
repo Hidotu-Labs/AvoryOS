@@ -11,6 +11,7 @@
 #include "../fs/ramfs.h"
 #include "../fs/vfs.h"
 #include "../fs/fifo.h"
+#include "../fs/fuse.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
 #include "../mm/vmm.h"
@@ -48,14 +49,19 @@ static int fd_find_free_locked(struct thread *t, int from) {
   uint32_t hint = t->files->next_fd;
   if (hint > t->files->capacity)
     hint = t->files->capacity;
-  /* Scan the authoritative table: t->fds may alias the freed buffer of a
-   * concurrent CLONE_FILES expansion (kfree'd kmalloc memory that can be
-   * recycled before this scan). */
-  int start = from > (int)hint ? from : (int)hint;
-  for (uint32_t i = (uint32_t)start; i < t->files->capacity; i++)
+  uint32_t start = from > (int)hint ? (uint32_t)from : hint;
+  uint32_t cap = t->files->capacity;
+
+  /* Fast-path: hint points directly to a free slot in the 99% common case! */
+  if (start < cap && !t->files->fds[start]) {
+    return (int)start;
+  }
+
+  for (uint32_t i = start + 1; i < cap; i++) {
     if (!t->files->fds[i])
       return (int)i;
-  for (uint32_t i = (uint32_t)from; i < hint; i++) {
+  }
+  for (uint32_t i = (uint32_t)from; i < start; i++) {
     if (!t->files->fds[i]) {
       t->files->next_fd = 0;
       return (int)i;
@@ -163,6 +169,14 @@ static void fd_advance_offset(struct thread *t, uint64_t fd,
   /* A concurrent close may have reused this slot for a different file. */
   if (fd < t->files->capacity && t->files->fds[fd] == node)
     t->files->fd_offsets[fd] += amount;
+  spinlock_release(&t->files->lock);
+}
+
+static void fd_set_offset(struct thread *t, uint64_t fd,
+                           vfs_node_t *node, uint64_t offset) {
+  spinlock_acquire(&t->files->lock);
+  if (fd < t->files->capacity && t->files->fds[fd] == node)
+    t->files->fd_offsets[fd] = offset;
   spinlock_release(&t->files->lock);
 }
 
@@ -652,8 +666,17 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     return (uint64_t)-21; // EISDIR
   }
 
-  if ((flags & O_TRUNC) && (node->flags & FS_TYPE_MASK) == FS_FILE) {
-    vfs_truncate(node, 0);
+  if ((flags & O_TRUNC) && !(flags & O_PATH) &&
+      (node->flags & FS_TYPE_MASK) == FS_FILE) {
+    if (!(requested & 2)) {
+      if (node_owned) vfs_close(node);
+      return (uint64_t)-13;
+    }
+    int truncate_result = vfs_truncate(node, 0);
+    if (truncate_result != 0) {
+      if (node_owned) vfs_close(node);
+      return (uint64_t)truncate_result;
+    }
     node->length = 0;
   }
 
@@ -676,7 +699,11 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
       if (node_owned) vfs_close(prev);
       return (uint64_t)-12;
     }
-    node_owned = false; // fresh per-open node owns no resolver reference
+    if (node_owned) vfs_close(prev);
+    /* Keep a temporary reference until fd installation. Failure paths
+     * (EMFILE, O_DIRECTORY, bad pathname) must release per-open state too. */
+    vfs_node_ref(node);
+    node_owned = true;
     if (flags & O_NONBLOCK)
       node->flags |= FS_NONBLOCK;
   } else if (ascentdrm_is_card_node(node)) {
@@ -1144,8 +1171,12 @@ static int64_t fd_write(int fd, const void *buf, size_t count) {
   }
 
   trace_userspace_debug_write(t, fd, buf, count);
-  int32_t bytes_written =
-      (int32_t)vfs_write(node, (uint32_t)offset, count, (uint8_t *)buf);
+  bool append = (flags & O_APPEND) &&
+                (node->flags & FS_TYPE_MASK) == FS_FILE;
+  uint32_t end_offset = 0;
+  int32_t bytes_written = append
+      ? (int32_t)vfs_append(node, count, (uint8_t *)buf, &end_offset)
+      : (int32_t)vfs_write(node, (uint32_t)offset, count, (uint8_t *)buf);
   if (bytes_written == -9) {
     static uint32_t bad_write_node_logs;
     if (__atomic_add_fetch(&bad_write_node_logs, 1, __ATOMIC_RELAXED) <= 8)
@@ -1156,8 +1187,12 @@ static int64_t fd_write(int fd, const void *buf, size_t count) {
             __atomic_load_n(&node->refcount, __ATOMIC_RELAXED),
             node->write, node->name);
   }
-  if (bytes_written > 0)
-    fd_advance_offset(t, (uint64_t)fd, node, (uint32_t)bytes_written);
+  if (bytes_written > 0) {
+    if (append)
+      fd_set_offset(t, (uint64_t)fd, node, end_offset);
+    else
+      fd_advance_offset(t, (uint64_t)fd, node, (uint32_t)bytes_written);
+  }
   vfs_close(node);
 
   /* A non-empty write MUST NEVER return 0.
@@ -1253,11 +1288,16 @@ static uint64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
   if (!t || fd >= MAX_FDS)
     return (uint64_t)-9;
 
-  vfs_node_t *node = fd_pin_node(t, fd, NULL, NULL);
+  uint64_t flags = 0;
+  vfs_node_t *node = fd_pin_node(t, fd, NULL, &flags);
   if (!node)
     return (uint64_t)-9;
-  int32_t bytes_written =
-      (int32_t)vfs_write(node, (uint32_t)offset, count, (uint8_t *)buf);
+  /* Linux also honors O_APPEND for pwrite, without changing f_pos. */
+  uint32_t end_offset;
+  int32_t bytes_written = (flags & O_APPEND) &&
+                          (node->flags & FS_TYPE_MASK) == FS_FILE
+      ? (int32_t)vfs_append(node, count, (uint8_t *)buf, &end_offset)
+      : (int32_t)vfs_write(node, (uint32_t)offset, count, (uint8_t *)buf);
   vfs_close(node);
   return (uint64_t)(int64_t)bytes_written;
 }
@@ -1291,6 +1331,40 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
   if (!node) {
     fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
+  }
+
+  if (fuse_is_device(node)) {
+    uint64_t capacity = 0;
+    int64_t result = 0;
+    for (uint64_t i = 0; i < iovcnt; i++) {
+      if (iov[i].iov_len && !is_user_range((void *)iov[i].iov_base, iov[i].iov_len)) {
+        result = -14; break;
+      }
+      if (iov[i].iov_len > UINT64_MAX - capacity) { result = -22; break; }
+      capacity += iov[i].iov_len;
+    }
+    /* A FUSE request is at most the negotiated 64 KiB payload plus header. */
+    if (capacity > 65576) capacity = 65576;
+    uint8_t *packet = !result && capacity ? kmalloc(capacity) : NULL;
+    if (!result && capacity && !packet) result = -12;
+    if (!result && capacity) {
+      result = (int32_t)vfs_read(node, 0, capacity, packet);
+      if (result > 0) {
+        uint64_t copied = 0;
+        for (uint64_t i = 0; i < iovcnt && copied < (uint64_t)result; i++) {
+          uint64_t count = iov[i].iov_len;
+          if (count > (uint64_t)result - copied) count = result - copied;
+          if (copy_to_user((void *)iov[i].iov_base, packet + copied, count)) {
+            /* The message was consumed: abort rather than strand its caller
+             * forever waiting for a daemon that received only a fragment. */
+            fuse_abort_device(node); result = -14; break;
+          }
+          copied += count;
+        }
+      }
+    }
+    kfree(packet); vfs_close(node); fd_release_iov(iov, stack_iov);
+    return (uint64_t)result;
   }
 
   size_t total = 0;
@@ -1412,6 +1486,21 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     fd_release_iov(iov, stack_iov);
     return (uint64_t)ret;
   }
+
+  /* /dev/fuse replies are one framed message. libfuse supplies its header
+   * and body in separate vectors; neither fragment is a valid write alone. */
+  struct thread *writer = sched_get_current();
+  vfs_node_t *packet_node = fd_pin_node(writer, fd, NULL, NULL);
+  if (fuse_is_device(packet_node)) {
+    int32_t written = payload_size > UINT32_MAX ? -22 :
+        (int32_t)vfs_write(packet_node, 0, (uint32_t)payload_size, payload);
+    vfs_close(packet_node);
+    if (payload) kfree(payload);
+    fd_release_kvec(kernel_iov, stack_kvec);
+    fd_release_iov(iov, stack_iov);
+    return (uint64_t)(int64_t)written;
+  }
+  if (packet_node) vfs_close(packet_node);
 
   size_t total = 0;
   for (uint64_t i = 0; i < iovcnt; i++) {
@@ -1562,7 +1651,8 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
   }
-  vfs_node_t *node = fd_pin_node(ct, fd, NULL, NULL);
+  uint64_t flags = 0;
+  vfs_node_t *node = fd_pin_node(ct, fd, NULL, &flags);
   if (!node) {
     fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
@@ -1580,9 +1670,12 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       fd_release_iov(iov, stack_iov);
       return (uint64_t)-14;
     }
-    int32_t bytes_written =
-        (int32_t)vfs_write(node, (uint32_t)(offset + total), len,
-                           (uint8_t *)base);
+    uint32_t end_offset;
+    int32_t bytes_written = (flags & O_APPEND) &&
+                            (node->flags & FS_TYPE_MASK) == FS_FILE
+        ? (int32_t)vfs_append(node, len, (uint8_t *)base, &end_offset)
+        : (int32_t)vfs_write(node, (uint32_t)(offset + total), len,
+                             (uint8_t *)base);
     if (bytes_written < 0) {
       if (total > 0)
         break;
@@ -2417,6 +2510,18 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
     struct thread *task = sched_get_current();
     if (!capability_has(task, CAP_SYS_ADMIN)) return (uint64_t)-1;
     vfs_node_t *base = task && task->cwd_node ? task->cwd_node : fs_root;
+    if (fstype && (!strcmp(fstype, "fuse") || !strncmp(fstype, "fuse.", 5))) {
+        char options[1024];
+        if (!data_ptr) return (uint64_t)-22;
+        long length = strncpy_from_user(options, (void *)data_ptr, sizeof(options));
+        if (length < 0) return (uint64_t)-14;
+        if ((uint64_t)length >= sizeof(options)) return (uint64_t)-36;
+        vfs_node_t *point = vfs_resolve_path_at(base, target);
+        if (!point) return (uint64_t)-2;
+        int result = fuse_mount_at(point, source, fstype, target, flags, options);
+        if (result || vfs_namespace_active()) vfs_close(point);
+        return (uint64_t)result;
+    }
     /* Namespace mount operations resolve relative to the actual directory
      * handle: after pivot_root the saved textual cwd is deliberately stale. */
     if (vfs_namespace_active()) {
@@ -2619,7 +2724,12 @@ static uint64_t sys_umount2(uint64_t target_ptr, uint64_t flags,
     if ((uint64_t)n >= sizeof(path)) return (uint64_t)-36;
     vfs_node_t *point = vfs_resolve_path_at(task && task->cwd_node ? task->cwd_node : fs_root, path);
     if (!point) return (uint64_t)-2;
-    int result = vfs_namespace_active() ? vfs_namespace_umount(point, (unsigned)flags) : -95;
+    int result;
+    if (fuse_is_root(point)) {
+        result = !(flags & 2) && fuse_mount_busy(point) ? -16 :
+            vfs_initial_unmount(point, (unsigned)flags);
+        if (!result) fuse_detach_mount(point);
+    } else result = vfs_namespace_active() ? vfs_namespace_umount(point, (unsigned)flags) : -95;
     vfs_close(point);
     return (uint64_t)result;
 }

@@ -12,6 +12,7 @@
 #include "../../../mm/vmm.h"
 
 #include <linuxkpi/native_vfs.h>
+#include <linuxkpi/native_sysfs.h>
 
 /* vrefresh is a userspace convenience field, often zero or stale. KMS
  * timing comes from the pixel clock (kHz), totals, and scan flags. */
@@ -40,31 +41,12 @@ void ascentdrm_crtc_set_mode(struct drm_crtc *crtc,
     memset(&crtc->mode, 0, sizeof(crtc->mode));
 }
 
-/* Small UAPI structs used by probes from Mesa's virtio DRM backend and
- * libdrm. Keep these layouts in sync with Linux's x86_64 DRM UAPI. */
-struct drm_virtgpu_getparam_uapi {
-  uint64_t param;
-  uint64_t value;
-};
-
-struct drm_virtgpu_get_caps_uapi {
-  uint32_t cap_set_id;
-  uint32_t cap_set_ver;
-  uint64_t addr;
-  uint32_t size;
-  uint32_t pad;
-};
-
 struct drm_mode_list_lessees_uapi {
   uint32_t count_lessees;
   uint32_t pad;
   uint64_t lessees_ptr;
 };
 
-_Static_assert(sizeof(struct drm_virtgpu_getparam_uapi) == 16,
-               "virtgpu getparam UAPI size");
-_Static_assert(sizeof(struct drm_virtgpu_get_caps_uapi) == 24,
-               "virtgpu get_caps UAPI size");
 _Static_assert(sizeof(struct drm_mode_list_lessees_uapi) == 16,
                "DRM list lessees UAPI size");
 
@@ -1386,38 +1368,18 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   klog_debug_puts("\n");
 #endif
 
+  if ((request & 0xff00U) == 0x6400U &&
+      (request & 0xffU) >= 0x41 && (request & 0xffU) <= 0x4b)
+    return virtio_gpu_virgl_ioctl(file, request, arg);
+
+  if (file->is_render && request != DRM_IOCTL_VERSION &&
+      request != DRM_IOCTL_GET_CAP && request != DRM_IOCTL_GET_UNIQUE &&
+      request != DRM_IOCTL_GEM_CLOSE && request != DRM_IOCTL_PRIME_HANDLE_TO_FD &&
+      request != DRM_IOCTL_PRIME_FD_TO_HANDLE)
+    return -13;
+
   switch (request) {
 
-  /* Mesa probes virtio ioctls while identifying the DRM driver. This device
-   * is AscentDRM, not virtio-gpu: report the known optional virtio features
-   * as absent, and reject unknown parameter IDs as Linux drivers do. */
-  case 0xC0106443: { /* DRM_IOCTL_VIRTGPU_GETPARAM */
-    if (!arg || !vmm_is_user_addr_range_valid(
-                    arg, sizeof(struct drm_virtgpu_getparam_uapi)))
-      return -14; /* EFAULT */
-    struct drm_virtgpu_getparam_uapi *p = (void *)arg;
-    switch (p->param) {
-    case 1: /* VIRTGPU_PARAM_3D_FEATURES */
-    case 2: /* VIRTGPU_PARAM_CAPSET_QUERY_FIX */
-    case 3: /* VIRTGPU_PARAM_RESOURCE_BLOB */
-    case 4: /* VIRTGPU_PARAM_HOST_VISIBLE */
-    case 5: /* VIRTGPU_PARAM_CROSS_DEVICE */
-    case 6: /* VIRTGPU_PARAM_CONTEXT_INIT */
-    case 7: /* VIRTGPU_PARAM_SUPPORTED_CAPSET_IDs */
-      p->value = 0;
-      return 0;
-    default:
-      return -22; /* EINVAL */
-    }
-  }
-  case 0xC0186449: { /* DRM_IOCTL_VIRTGPU_GET_CAPS */
-    if (!arg || !vmm_is_user_addr_range_valid(
-                    arg, sizeof(struct drm_virtgpu_get_caps_uapi)))
-      return -14; /* EFAULT */
-    /* AscentDRM has no virtio capability sets. EINVAL is the normal
-     * unsupported-capset response; ENOTTY incorrectly claims no handler. */
-    return -22;
-  }
   case DRM_IOCTL_MODE_LIST_LESSEES: {
     if (!arg || !vmm_is_user_addr_range_valid(
                     arg, sizeof(struct drm_mode_list_lessees_uapi)))
@@ -1437,15 +1399,15 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     klog_debug_puts("[DRM] VERSION ioctl\n");
     struct drm_version *v = (struct drm_version *)arg;
     static const char ascent_name[] = "ascentdrm";
-    const char *name = ascent_name;
+    const char *name = virtio_gpu_virgl_enabled() ? "virtio_gpu" : ascent_name;
     static const char date[] = "20260706";
     static const char desc[] = "AscentOS DRM/KMS";
     size_t name_len = v->name_len;
     size_t date_len = v->date_len;
     size_t desc_len = v->desc_len;
 
-    v->version_major = 1;
-    v->version_minor = 0;
+    v->version_major = virtio_gpu_virgl_enabled() ? 0 : 1;
+    v->version_minor = virtio_gpu_virgl_enabled() ? 1 : 0;
     v->version_patchlevel = 0;
 
     if (v->name && name_len > 0) {
@@ -1501,8 +1463,8 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     struct drm_set_version *sv = (struct drm_set_version *)arg;
     sv->drm_di_major = 1;
     sv->drm_di_minor = 4;
-    sv->drm_dd_major = 1;
-    sv->drm_dd_minor = 0;
+    sv->drm_dd_major = virtio_gpu_virgl_enabled() ? 0 : 1;
+    sv->drm_dd_minor = virtio_gpu_virgl_enabled() ? 1 : 0;
     return 0;
   }
   case DRM_IOCTL_GET_CAP: {
@@ -2474,7 +2436,7 @@ static uint64_t drm_vfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
     uint32_t global_handle = (uint32_t)((offset & ~0x2000000000000000ULL) >> 32);
     struct drm_gem_object *obj = NULL;
     spinlock_acquire(&file->lock);
-    for (uint32_t i = 1; i < DRM_MAX_HANDLES_PER_FILE; i++) {
+    for (uint32_t i = 1; i < file->handle_high_water; i++) {
       if (file->handles[i] && file->handles[i]->prime_buffer &&
           file->handles[i]->handle == global_handle) {
         obj = file->handles[i];
@@ -2504,7 +2466,7 @@ static uint64_t drm_vfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
   uint64_t mapped_offset = 0;
   bool found = false;
   spinlock_acquire(&file->lock);
-  for (uint32_t i = 1; i < DRM_MAX_HANDLES_PER_FILE; i++) {
+  for (uint32_t i = 1; i < file->handle_high_water; i++) {
     struct drm_gem_object *candidate = file->handles[i];
     if (!candidate || phys < candidate->phys_addr)
       continue;
@@ -2638,6 +2600,18 @@ static uint32_t drm_read(struct vfs_node *node, uint32_t offset,
  * drm_file here leaked every scan because no fd existed to release it.
  */
 static vfs_node_t drm_card_metadata_node;
+static int virgl_render_minor = -1;
+static void *drm_render_open(void *metadata) {
+  (void)metadata;
+  vfs_node_t *node = ascentdrm_create_client_node();
+  if (node) {
+    struct drm_file *file = node->device;
+    file->is_master = 0; file->is_render = true;
+    node->inode = (226U << 8) | virgl_render_minor;
+    snprintf(node->name, sizeof(node->name), "renderD%d", virgl_render_minor);
+  }
+  return node;
+}
 static vfs_node_t *drm_open_instance(vfs_node_t *metadata);
 
 static struct dirent *drm_dri_readdir(vfs_node_t *dir, uint32_t index) {
@@ -2789,4 +2763,31 @@ void ascentdrm_register_vfs(void) {
 static vfs_node_t *drm_open_instance(vfs_node_t *metadata) {
   (void)metadata;
   return drm_alloc_client_node();
+}
+
+/* The Linux xarray allocator is initialized after native devfs. Reserve
+ * a render minor only once LinuxKPI bring-up has completed. */
+void ascentdrm_register_render_vfs(void) {
+#ifdef LINUXKPI_LINUX_IMPORTED
+  if (virtio_gpu_virgl_enabled()) {
+    extern int linuxkpi_virgl_render_reserve(void);
+    extern void linuxkpi_virgl_render_release(unsigned int);
+    virgl_render_minor = linuxkpi_virgl_render_reserve();
+    if (virgl_render_minor >= 0) {
+      char name[24];
+      snprintf(name, sizeof(name), "renderD%d", virgl_render_minor);
+      if (asc_vfs_register_devnode_at("dri", name,
+              (226U << 20) | virgl_render_minor, drm_render_open)) {
+        linuxkpi_virgl_render_release(virgl_render_minor);
+        virgl_render_minor = -1;
+      } else {
+        const struct pci_device *pci = virtio_gpu_pci_device();
+        char bdf[24];
+        snprintf(bdf, sizeof(bdf), "0000:%02x:%02x.%u", pci->bus, pci->slot, pci->func);
+        asc_sysfs_drm_minor_add(asc_sysfs_dir_by_path("/sys/class/drm"),
+            name, bdf, NULL, NULL, 226, virgl_render_minor);
+      }
+    }
+  }
+#endif
 }

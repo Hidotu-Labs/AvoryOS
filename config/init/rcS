@@ -1,0 +1,163 @@
+#!/bin/sh
+# AvoryOS boot (busybox init rcS; OpenRC is unavailable on Arch official
+# repos, so this script is the service manager: fsck -> dbus -> udev ->
+# NetworkManager -> pipewire,
+# each guarded so a missing binary or empty config never fails the boot.
+# Status lines mimic OpenRC's ` * Starting foo ... [ ok ]` format (plain
+# text, no ANSI colors, so the serial log stays clean).
+ebegin() { printf ' * %s ...' "$*"; }
+eend() { if [ "${1:-0}" -eq 0 ] 2>/dev/null; then printf ' [ ok ]\n'; else printf ' [ !! ]\n'; fi; return 0; }
+eskip() { printf ' [ skipped ]\n'; return 0; }
+
+ebegin "Mounting pseudo-filesystems"
+mount -t proc proc /proc 2>/dev/null; rc1=$?
+mount -t sysfs sysfs /sys 2>/dev/null; rc2=$?
+mount -t devtmpfs dev /dev 2>/dev/null || true
+mkdir -p /run /run/lock /run/mount /var/log /tmp /dev/shm 2>/dev/null
+chmod 1777 /tmp /dev/shm 2>/dev/null || true
+mount -t tmpfs -o rw,nosuid,nodev,mode=1777 tmpfs /dev/shm 2>/dev/null || true
+if [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ]; then eend 0; else eend 1; fi
+
+ebegin "Setting hostname"
+/usr/bin/busybox hostname AvoryOS 2>/dev/null; eend $?
+
+if [ -x /sbin/avory-early-init ]; then
+    ebegin "Running early init"
+    /sbin/avory-early-init 2>/dev/null; eend $?
+fi
+if [ ! -s /etc/machine-id ]; then
+    echo "b08040a9e7114fea9634b7f94da7e722" > /etc/machine-id
+fi
+ebegin "Checking filesystems"
+if [ -x /sbin/fsck ] && grep -q -v '^[[:space:]]*\(#\|$\)' /etc/fstab 2>/dev/null; then
+    fsck -A -T -a >>/var/log/boot.log 2>&1; eend $?
+else
+    eskip
+fi
+mkdir -p /var/lib/dbus /run/dbus
+[ -e /run/mount/utab ] || : > /run/mount/utab 2>/dev/null || true
+[ -e /var/lib/dbus/machine-id ] || cp -f /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null || true
+command -v dbus-uuidgen >/dev/null 2>&1 && dbus-uuidgen --ensure 2>/dev/null || true
+ebegin "Starting system message bus"
+if command -v dbus-daemon >/dev/null 2>&1 && [ ! -S /run/dbus/system_bus_socket ]; then
+    dbus-daemon --system --fork 2>/dev/null || true
+fi
+# Wait for the system bus so dependents (pipewire, logins) do not race it.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -S /run/dbus/system_bus_socket ] && break
+    sleep 0.5
+done
+if [ -S /run/dbus/system_bus_socket ]; then eend 0; else eend 1; fi
+# udev processes coldplug events before audio discovers hardware. It runs
+# independently of systemd PID 1; BusyBox init remains the service manager.
+ebegin "Starting device manager"
+UDEV_OK=1
+if [ -x /usr/lib/systemd/systemd-udevd ] && command -v udevadm >/dev/null 2>&1; then
+    mkdir -p /run/udev
+    /usr/lib/systemd/systemd-udevd --daemon --resolve-names=never >>/var/log/udev.log 2>&1
+    if udevadm control --timeout=5 --ping >>/var/log/udev.log 2>&1; then
+        UDEV_OK=0
+    fi
+fi
+eend "$UDEV_OK"
+if [ "$UDEV_OK" -eq 0 ]; then
+    ebegin "Enumerating devices"
+    if udevadm trigger --type=subsystems --action=add >>/var/log/udev.log 2>&1 &&
+       udevadm trigger --type=devices --action=add >>/var/log/udev.log 2>&1; then
+        eend 0
+    else
+        eend 1
+    fi
+    ebegin "Waiting for device events"
+    udevadm settle --timeout=10 >>/var/log/udev.log 2>&1; eend $?
+fi
+
+# wlroots compositors use seatd for display/input access without logind.
+ebegin "Starting seat manager"
+SEATD_OK=1
+if [ -x /usr/bin/seatd ]; then
+    if [ ! -S /run/seatd.sock ]; then
+        nohup /usr/bin/seatd -g video >>/var/log/seatd.log 2>&1 &
+    fi
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if [ -S /run/seatd.sock ]; then SEATD_OK=0; break; fi
+        sleep 0.1
+    done
+fi
+eend "$SEATD_OK"
+
+# NetworkManager is a system service; start it once after D-Bus and coldplug.
+ebegin "Starting NetworkManager"
+NM_OK=1
+if command -v NetworkManager >/dev/null 2>&1; then
+    mkdir -p /run/NetworkManager /var/lib/NetworkManager
+    if [ -S /run/dbus/system_bus_socket ]; then
+        if ! pidof NetworkManager >/dev/null 2>&1; then
+            nohup NetworkManager --no-daemon >>/var/log/NetworkManager.log 2>&1 &
+        fi
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            if LC_ALL=C nmcli --wait 1 -t -f RUNNING general 2>/dev/null | grep -qx running; then
+                NM_OK=0
+                break
+            fi
+            sleep 0.5
+        done
+    fi
+    eend "$NM_OK"
+else
+    eskip
+fi
+unset NM_OK
+
+# --- pipewire system instance (root-owned; non-root Plasma sessions start
+# their own copy from the X11 or Wayland launcher if none is listening) ---
+ebegin "Starting PipeWire"
+PIPE_OK=1
+if command -v pipewire >/dev/null 2>&1; then
+    PIPE_RUNTIME=/run/pipewire
+    mkdir -p "$PIPE_RUNTIME" 2>/dev/null || true
+    chmod 0755 "$PIPE_RUNTIME" 2>/dev/null || true
+    if [ ! -S "$PIPE_RUNTIME/pipewire-0" ]; then
+        XDG_RUNTIME_DIR="$PIPE_RUNTIME" nohup pipewire >>/var/log/pipewire.log 2>&1 &
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            [ -S "$PIPE_RUNTIME/pipewire-0" ] && break
+            sleep 0.5
+        done
+    fi
+    [ -S "$PIPE_RUNTIME/pipewire-0" ] && PIPE_OK=0
+    eend "$PIPE_OK"
+    if [ "$PIPE_OK" -eq 0 ]; then
+        ebegin "Starting WirePlumber"
+        if command -v wireplumber >/dev/null 2>&1; then
+            if command -v pidof >/dev/null 2>&1; then
+                # Keep the probe synchronous; background only the daemon,
+                # not an extra shell wrapping the entire `||` list.
+                if ! pidof wireplumber >/dev/null 2>&1; then
+                    XDG_RUNTIME_DIR="$PIPE_RUNTIME" nohup wireplumber >>/var/log/pipewire.log 2>&1 &
+                fi
+            else
+                XDG_RUNTIME_DIR="$PIPE_RUNTIME" nohup wireplumber >>/var/log/pipewire.log 2>&1 &
+            fi
+            eend 0
+        else
+            eskip
+        fi
+        ebegin "Starting PipeWire PulseAudio bridge"
+        if command -v pipewire-pulse >/dev/null 2>&1; then
+            if [ ! -S "$PIPE_RUNTIME/pulse/native" ]; then
+                XDG_RUNTIME_DIR="$PIPE_RUNTIME" nohup pipewire-pulse >>/var/log/pipewire.log 2>&1 &
+            fi
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+                [ -S "$PIPE_RUNTIME/pulse/native" ] && break
+                sleep 0.5
+            done
+            if [ -S "$PIPE_RUNTIME/pulse/native" ]; then eend 0; else eend 1; fi
+        else
+            eskip
+        fi
+    fi
+    unset PIPE_RUNTIME
+else
+    eskip
+fi
+echo " * Entering runlevel: default"

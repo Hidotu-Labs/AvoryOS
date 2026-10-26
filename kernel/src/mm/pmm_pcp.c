@@ -4,6 +4,8 @@
 #include "hal/hal.h"
 #include "console/klog.h"
 #include "smp/cpu.h"
+#include "cpu/features.h"
+#include "linuxkpi/fpu.h"
 
 #define PHYS_TO_VIRT(p) ((void *)((uint64_t)(p) + pmm_get_hhdm_offset()))
 
@@ -13,6 +15,7 @@ static bool pcp_initialized = false;
 void pmm_pcp_init(void) {
   for (uint32_t i = 0; i < MAX_CPUS; i++) {
     pcp_caches[i].count = 0;
+    pcp_caches[i].active = 0;
     spinlock_init(&pcp_caches[i].lock);
   }
   pcp_initialized = true;
@@ -39,6 +42,25 @@ __attribute__((optimize("O3"))) void *pmm_pcp_alloc_page(void) {
   }
 
   struct pcp_cache *pcp = &pcp_caches[cpu->cpu_id];
+
+  /* Fast path: uncontended local hit. No spinlock, no atomic RMW! */
+  if (__builtin_expect(!spinlock_is_locked(&pcp->lock), 1)) {
+    pcp->active = 1;
+    __asm__ volatile("" ::: "memory");
+    if (__builtin_expect(!spinlock_is_locked(&pcp->lock), 1)) {
+      if (pcp->count > 0) {
+        void *page = pcp->pages[--pcp->count];
+        uint64_t pfn = (uint64_t)page / PAGE_SIZE;
+        __atomic_store_n(&pmm_refcounts[pfn - pmm_lowest_page], 1, __ATOMIC_RELEASE);
+        pcp->active = 0;
+        hal_irq_restore(flags);
+        return page;
+      }
+    }
+    pcp->active = 0;
+  }
+
+  /* Slow path: local cache is empty or remote drain is active. */
   spinlock_acquire(&pcp->lock);
   if (pcp->count > 0) {
     void *page = pcp->pages[--pcp->count];
@@ -98,24 +120,6 @@ __attribute__((optimize("O3"))) void *pmm_pcp_alloc_page(void) {
     __atomic_store_n(&pmm_refcounts[pfn - pmm_lowest_page], 1, __ATOMIC_RELEASE);
   }
   spinlock_release(&pcp->lock);
-
-  // Steal from another CPU's cache if local and buddy are empty
-  if (!page) {
-    for (uint32_t i = 0; i < MAX_CPUS; i++) {
-      if (i == cpu->cpu_id)
-        continue;
-      struct pcp_cache *other = &pcp_caches[i];
-      spinlock_acquire(&other->lock);
-      if (other->count > 0) {
-        page = other->pages[--other->count];
-        uint64_t pfn = (uint64_t)page / PAGE_SIZE;
-        __atomic_store_n(&pmm_refcounts[pfn - pmm_lowest_page], 1, __ATOMIC_RELEASE);
-      }
-      spinlock_release(&other->lock);
-      if (page)
-        break;
-    }
-  }
   hal_irq_restore(flags);
   return page;
 }
@@ -132,6 +136,23 @@ __attribute__((optimize("O3"))) bool pmm_pcp_free_page(void *ptr) {
   }
 
   struct pcp_cache *pcp = &pcp_caches[cpu->cpu_id];
+
+  /* Fast path: uncontended local hit. No spinlock, no atomic RMW! */
+  if (__builtin_expect(!spinlock_is_locked(&pcp->lock), 1)) {
+    pcp->active = 1;
+    __asm__ volatile("" ::: "memory");
+    if (__builtin_expect(!spinlock_is_locked(&pcp->lock), 1)) {
+      if (pcp->count < PCP_CAPACITY) {
+        pcp->pages[pcp->count++] = ptr;
+        pcp->active = 0;
+        hal_irq_restore(flags);
+        return true;
+      }
+    }
+    pcp->active = 0;
+  }
+
+  /* Slow path: local cache is full or remote drain is active. */
   spinlock_acquire(&pcp->lock);
   if (pcp->count < PCP_CAPACITY) {
     pcp->pages[pcp->count++] = ptr;
@@ -203,6 +224,9 @@ void pmm_pcp_drain_all(void) {
   for (uint32_t c = 0; c < MAX_CPUS; c++) {
     struct pcp_cache *pcp = &pcp_caches[c];
     spinlock_acquire(&pcp->lock);
+    while (__atomic_load_n(&pcp->active, __ATOMIC_ACQUIRE)) {
+      __asm__ volatile("pause" ::: "memory");
+    }
     uint32_t count = pcp->count;
     void *drain_buf[PCP_CAPACITY];
     for (uint32_t i = 0; i < count; i++) {
@@ -242,8 +266,8 @@ void pmm_pcp_drain_all(void) {
  * where a zeroed frame is actually wanted (never for pages that will be fully
  * overwritten, e.g. CoW copies) and where no NUMA bind policy applies.
  */
-#define ZERO_POOL_CAP 32
-#define ZERO_POOL_REFILL 8
+#define ZERO_POOL_CAP 128
+#define ZERO_POOL_REFILL 32
 
 static void *zero_pool[MAX_CPUS][ZERO_POOL_CAP];
 static uint32_t zero_count[MAX_CPUS];
@@ -275,10 +299,30 @@ void *pmm_alloc_zeroed_page(void) {
   }
 
   void *page = NULL;
-  struct pcp_cache *pcp = &pcp_caches[cpu->cpu_id];
+  uint32_t id = cpu->cpu_id;
+  struct pcp_cache *pcp = &pcp_caches[id];
+
+  if (__builtin_expect(!spinlock_is_locked(&pcp->lock), 1)) {
+    pcp->active = 1;
+    __asm__ volatile("" ::: "memory");
+    if (__builtin_expect(!spinlock_is_locked(&pcp->lock), 1)) {
+      if (zero_count[id] > 0) {
+        page = zero_pool[id][--zero_count[id]];
+        uint64_t pfn = (uint64_t)page / PAGE_SIZE;
+        __atomic_store_n(&pmm_refcounts[pfn - pmm_lowest_page], 1,
+                         __ATOMIC_RELEASE);
+        pcp->active = 0;
+        hal_irq_restore(flags);
+        __atomic_add_fetch(&zero_hits, 1, __ATOMIC_RELAXED);
+        return page;
+      }
+    }
+    pcp->active = 0;
+  }
+
   spinlock_acquire(&pcp->lock);
-  if (zero_count[cpu->cpu_id] > 0) {
-    page = zero_pool[cpu->cpu_id][--zero_count[cpu->cpu_id]];
+  if (zero_count[id] > 0) {
+    page = zero_pool[id][--zero_count[id]];
     uint64_t pfn = (uint64_t)page / PAGE_SIZE;
     __atomic_store_n(&pmm_refcounts[pfn - pmm_lowest_page], 1,
                      __ATOMIC_RELEASE);
@@ -313,28 +357,63 @@ void pmm_zero_pool_refill(uint32_t max_pages) {
     return;
   uint32_t id = cpu->cpu_id;
 
-  for (uint32_t i = 0; i < max_pages; i++) {
-    void *p = pmm_pcp_alloc_page();
-    if (!p)
+  while (max_pages > 0) {
+    uint32_t batch = max_pages > 32 ? 32 : max_pages;
+    void *phys_pages[32];
+    void *virt_pages[32];
+    uint32_t allocated = 0;
+
+    for (uint32_t i = 0; i < batch; i++) {
+      void *p = pmm_pcp_alloc_page();
+      if (!p)
+        break;
+      phys_pages[allocated] = p;
+      virt_pages[allocated] = PHYS_TO_VIRT((uint64_t)p);
+      allocated++;
+    }
+
+    if (allocated == 0)
       return;
-    page_zero(PHYS_TO_VIRT((uint64_t)p));
-    /* Park refcount-0 in the pool, same convention as PCP cached frames. */
-    __atomic_store_n(&pmm_refcounts[(uint64_t)p / PAGE_SIZE - pmm_lowest_page],
-                     0, __ATOMIC_RELEASE);
+
+    /* Zero all allocated frames via hardware streaming non-temporal stores
+     * bypassing CPU caches, draining WC buffers with a single sfence.
+     * Uses AVX2 / AVX-512 non-temporal stores when available with FPU guard. */
+    if (cpu_has_avx2() || cpu_has_avx512()) {
+      kernel_fpu_begin();
+      page_zero_batch(virt_pages, allocated);
+      kernel_fpu_end();
+    } else {
+      page_zero_nt_batch(virt_pages, allocated);
+    }
+
+    for (uint32_t i = 0; i < allocated; i++) {
+      uint64_t pfn = (uint64_t)phys_pages[i] / PAGE_SIZE;
+      __atomic_store_n(&pmm_refcounts[pfn - pmm_lowest_page], 0, __ATOMIC_RELEASE);
+    }
+
     hal_irq_state_t flags = hal_irq_save();
     spinlock_acquire(&pcp_caches[id].lock);
-    bool full = (zero_count[id] >= ZERO_POOL_CAP);
-    if (!full) {
-      zero_pool[id][zero_count[id]++] = p;
-      __atomic_add_fetch(&zero_refilled, 1, __ATOMIC_RELAXED);
+    uint32_t current_count = zero_count[id];
+    uint32_t space = current_count < ZERO_POOL_CAP ? ZERO_POOL_CAP - current_count : 0;
+    uint32_t to_add = allocated < space ? allocated : space;
+
+    for (uint32_t i = 0; i < to_add; i++) {
+      zero_pool[id][current_count + i] = phys_pages[i];
     }
+    zero_count[id] = current_count + to_add;
+    __atomic_add_fetch(&zero_refilled, to_add, __ATOMIC_RELAXED);
     spinlock_release(&pcp_caches[id].lock);
     hal_irq_restore(flags);
-    if (full) {
-      /* Lost the race with another refiller: hand it straight back. */
-      pmm_pcp_free_page(p);
-      return;
+
+    /* If the pool became full during refill, return excess pages to PCP */
+    for (uint32_t i = to_add; i < allocated; i++) {
+      pmm_pcp_free_page(phys_pages[i]);
     }
+
+    if (to_add < allocated)
+      return; /* Pool is completely full */
+
+    max_pages -= allocated;
   }
 }
 
@@ -343,6 +422,9 @@ void pmm_zero_pool_drain_all(void) {
     void *drain_buf[ZERO_POOL_CAP];
     hal_irq_state_t flags = hal_irq_save();
     spinlock_acquire(&pcp_caches[c].lock);
+    while (__atomic_load_n(&pcp_caches[c].active, __ATOMIC_ACQUIRE)) {
+      __asm__ volatile("pause" ::: "memory");
+    }
     uint32_t count = zero_count[c] <= ZERO_POOL_CAP ? zero_count[c] : 0;
     for (uint32_t i = 0; i < count; i++)
       drain_buf[i] = zero_pool[c][i];

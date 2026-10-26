@@ -49,6 +49,7 @@ struct mm_struct {
   uint32_t cmdline_len; // Valid bytes in saved_cmdline (0 = unknown/kernel thread)
   uint64_t arg_start;   // User VA of argv[0] string
   uint64_t arg_end;     // User VA just past the last argv string
+  uint64_t zram_scan_cursor;
   uint64_t ksm_scan_cursor; // Next VA for a bounded background scan; mm->lock
 };
 
@@ -230,6 +231,7 @@ struct thread {
   uint64_t *tid_address;       // Pointer to user-space TID for set_tid_address
   uint64_t robust_list;        // Futex robust-list head from set_robust_list(2)
   struct thread *global_next;  // Used to link all threads together
+  struct thread *global_prev;  // Doubly linked global thread list
   struct thread *rq_next;      // Next thread in circular run queue
   struct thread *rq_prev;      // Previous thread in circular run queue
   bool on_runqueue;            // Protected by owning CPU queue_lock

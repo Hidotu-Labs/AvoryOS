@@ -43,7 +43,9 @@ static struct vgpu_scanout_head scanout_heads[2];static struct vgpu_scanout_ops 
 static struct {unsigned num_scanouts;struct {uint64_t present_batches,present_wait_ms,max_present_wait_ms,frames_presented,damage_pixels,present_failures,scanout_pixels,compared_pixels,unchanged_frames,producer_sync_ns,snapshot_copy_ns,transport_wait_ns;}stats;}gpu;
 static struct drm_framebuffer *remove_on_begin;
 static struct drm_gem_object *live_gem;
-static int begin_error,begins,ends,presents,flips,releases;
+static int begin_error,begins,ends,presents,flips,releases,readback_error;
+static uint32_t virtio_gpu_virgl_resource_id(struct drm_gem_object *g){assert(g==live_gem && g->refcount==2 && !g->freed && !g->dev->lock);return readback_error?1:0;}
+static bool virtio_gpu_present_virgl(uint32_t head,struct drm_framebuffer *fb,const struct virtio_gpu_rect *view){(void)head;(void)fb;(void)view;assert(readback_error);return false;}
 static uint64_t gpu_prime_enter_seq;static uint32_t gpu_prime_waiters;
 static unsigned gpu_scanout_busy;static bool cpu_held,stalled_control;
 static void gpu_scanout_acquire(void){assert(!gpu_scanout_busy);gpu_scanout_busy=1;}
@@ -77,7 +79,7 @@ static bool vgpu_scanout_publish(struct vgpu_scanout_head *h,const struct vgpu_s
 '''
 post=r'''
 int main(void){
- for(int scenario=0;scenario<11;scenario++){
+ for(int scenario=0;scenario<12;scenario++){
   struct drm_device d={0};unsigned char pixels[80];for(unsigned i=0;i<80;i++)pixels[i]=i*3;
   unsigned offset=scenario==4?8:0;memcpy(expected,pixels+offset,64);memset(staging,0,64);
   struct drm_gem_object gem={.dev=&d,.refcount=1,.size=80,.virt_addr=pixels};live_gem=&gem;
@@ -85,7 +87,7 @@ int main(void){
   struct drm_plane plane={.base={.type=DRM_MODE_OBJECT_PLANE},.fb=&f};
   struct drm_crtc crtc={.base={.type=DRM_MODE_OBJECT_CRTC,.id=3},.fb=&f,.primary=&plane};
   d.kms_objects.items[0]=&crtc;d.kms_objects.items[1]=&plane;d.kms_objects.count=2;
-  begins=ends=presents=flips=releases=0;begin_error=0;cpu_held=stalled_control=false;remove_on_begin=NULL;memset(&gpu,0,sizeof gpu);gpu.num_scanouts=1;
+  begins=ends=presents=flips=releases=0;begin_error=readback_error=0;cpu_held=stalled_control=false;remove_on_begin=NULL;memset(&gpu,0,sizeof gpu);gpu.num_scanouts=1;
   observed_partial=false;
   if(scenario==0)remove_on_begin=&f;
   else if(scenario==1){remove_on_begin=&f;begin_error=-5;}
@@ -93,6 +95,7 @@ int main(void){
   else if(scenario==3)f.bpp=16;
   else if(scenario==6)crtc.fb=NULL;
   else if(scenario==7)stalled_control=true;
+  if(scenario==11)readback_error=-5;
   struct drm_clip_rect empty={0},clips[2]={{1,1,2,3},{3,2,8,4}};
   if(scenario==9){plane.src_x=plane.src_y=1<<16;plane.src_w=plane.src_h=2<<16;clips[0]=(struct drm_clip_rect){0,0,2,2};}
   const struct drm_clip_rect *requested=scenario==5?&empty:scenario>=8?clips:NULL;
@@ -104,6 +107,7 @@ int main(void){
   if(scenario==0)assert(presents==1 && ends==1 && gem.freed && releases==1 && !crtc.fb && !plane.fb);
   else if(scenario==1)assert(!presents && !ends && gem.freed && releases==1 && !crtc.fb && !plane.fb);
   else{assert(gem.refcount==1 && !gem.freed);ascentdrm_framebuffer_free(&d,&f);assert(gem.freed && releases==1);}
+  if(scenario==11)assert(!begins && !presents);
   if(scenario==7)assert(!begins && !presents && !memcmp(staging,(unsigned char[64]){0},64));
   assert(!d.lock && !gpu_scanout_busy && !cpu_held && !gpu_poll_lock);
  }

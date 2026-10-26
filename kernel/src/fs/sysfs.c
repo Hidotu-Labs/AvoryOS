@@ -1,3 +1,4 @@
+#include "mm/zram.h"
 #include "fs/sysfs.h"
 #include "fs/sysfs_pci.h"
 #include "fs/tmpfs.h"
@@ -345,6 +346,24 @@ void sysfs_gpu_update_connector(uint32_t scanout,bool connected,const char *mode
 
 // Block class population
 
+static uint32_t zram_attribute_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+  struct zram_stats z; zram_get_stats(&z);
+  char buf[320]; int n;
+  if (!strcmp(node->name, "mm_stat"))
+    n = snprintf(buf, sizeof(buf), "%llu %llu %llu %llu %llu %llu 0 0 0\n",
+       (unsigned long long)(z.stored_pages * 4096), (unsigned long long)z.compressed_bytes,
+       (unsigned long long)z.memory_bytes, (unsigned long long)z.memory_limit,
+       (unsigned long long)z.peak_bytes, (unsigned long long)z.same_pages);
+  else {
+    uint64_t value = !strcmp(node->name, "disksize") ? z.capacity_pages * 4096 :
+                     !strcmp(node->name, "mem_limit") ? z.memory_limit : z.enabled;
+    n = snprintf(buf, sizeof(buf), "%llu\n", (unsigned long long)value);
+  }
+  if (offset >= (uint32_t)n) return 0;
+  if (size > (uint32_t)n - offset) size = n - offset;
+  memcpy(buffer, buf + offset, size); return size;
+}
+
 static void sysfs_populate_block(vfs_node_t *block_class_dir) {
   int count = block_count();
   for (int i = 0; i < count; i++) {
@@ -381,7 +400,15 @@ static void sysfs_populate_block(vfs_node_t *block_class_dir) {
     sysfs_mkfile(bdir, "size", sbuf);
 
     sysfs_mkfile(bdir, "removable", "0\n");
-    sysfs_mkfile(bdir, "ro", "0\n");
+    sysfs_mkfile(bdir, "ro", bd->write_sectors ? "0\n" : "1\n");
+    if (!strcmp(bd->name, "zram0")) {
+      sysfs_mkfile(bdir, "comp_algorithm", "[lz4]\n");
+      const char *attrs[] = {"disksize", "mem_limit", "initstate", "mm_stat"};
+      for (unsigned j = 0; j < 4; j++) {
+        vfs_node_t *attr = sysfs_mkfile(bdir, attrs[j], "");
+        if (attr) attr->read = zram_attribute_read;
+      }
+    }
 
     // uevent: what udev/libblkid parse to identify a block device.
     // Partitions must advertise DEVTYPE=partition (not disk) or UDisks2
@@ -1039,7 +1066,12 @@ void sysfs_init(void) {
   if (sound_class && sound_card) {
     sysfs_mkfile(sound_card, "number", "0\n");
     sysfs_mkfile(sound_card, "id", "HDA\n");
-    sysfs_mkfile(sound_card, "uevent", "SUBSYSTEM=sound\n");
+    /* PipeWire's ALSA monitor ignores cards until SOUND_INITIALIZED is
+     * present. Linux normally gets this property from udev's sound-card
+     * rule after controlC0 arrives; include it on the coldplug card event as
+     * well so discovery does not depend on that sibling-event ordering. */
+    sysfs_mkfile(sound_card, "uevent",
+                 "SUBSYSTEM=sound\nSOUND_INITIALIZED=1\n");
     sysfs_symlink(sound_card, "subsystem", "../../../../class/sound");
     vfs_node_t *ctl = sysfs_mkdir(sound_card, "controlC0");
     sysfs_mkfile(ctl, "dev", "116:0\n");

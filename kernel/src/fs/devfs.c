@@ -1,4 +1,5 @@
 #include "devfs.h"
+#include "fuse.h"
 #include "../console/klog.h"
 #include "../fs/ramfs.h"
 #include "../fs/vfs.h"
@@ -162,4 +163,5 @@ void devfs_init(void) {
                       NULL, NULL, NULL, NULL, 0, 0);
 
   vfs_close(dev_dir);
+  fuse_init();
 }

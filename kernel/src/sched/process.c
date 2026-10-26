@@ -215,7 +215,12 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
                         size_t interp_max_len) {
   (void)pml4;
   struct thread *current_thread = sched_get_current();
-  vfs_node_t *file = vfs_resolve_path(path);
+  /* Relative exec and relative PT_INTERP names use the caller's cwd, just
+   * like the permission/shebang lookup in sys_execve. */
+  vfs_node_t *base = path[0] == '/' ? fs_root :
+      (current_thread && current_thread->cwd_node ? current_thread->cwd_node
+                                                 : fs_root);
+  vfs_node_t *file = vfs_resolve_path_at(base, path);
   if (!file) {
     klog_puts("[PROC] ELF load failed: File not found: ");
     klog_puts(path);

@@ -80,6 +80,8 @@ typedef struct unix_sock {
   size_t recv_buf_size;
   size_t recv_buf_head;
   size_t recv_buf_tail;
+  size_t recv_buf_count;
+  size_t recv_buf_mask;
   spinlock_t recv_lock;
 
   // Packet queue for SOCK_SEQPACKET and SOCK_DGRAM

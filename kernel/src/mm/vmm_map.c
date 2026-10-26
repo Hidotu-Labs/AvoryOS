@@ -1,3 +1,4 @@
+#include "mm/zram.h"
 #include "vmm.h"
 #include "vmm_internal.h"
 #include "../apic/lapic.h"
@@ -361,6 +362,7 @@ static bool vmm_map_page_nolock(uint64_t *pml4, uint64_t virtual_addr,
   }
   pd_virt[pd_index] |= propagate_flags;
 
+  if (zram_pte_slot(pt_virt[pt_index])) return false;
   pt_virt[pt_index] = (physical_addr & PAGE_MASK) | flags | PAGE_FLAG_PRESENT;
 
   if (flush_tlb)
@@ -639,7 +641,7 @@ void vmm_free_empty_tables(uint64_t *pml4, uint64_t virtual_addr) {
 
   bool pt_empty = true;
   for (int i = 0; i < 512; i++) {
-    if (pt_virt[i] & PAGE_FLAG_PRESENT) {
+    if ((pt_virt[i] & PAGE_FLAG_PRESENT) || zram_pte_slot(pt_virt[i])) {
       pt_empty = false;
       break;
     }
@@ -778,9 +780,11 @@ void vmm_unmap_page(uint64_t *pml4, uint64_t virtual_addr) {
   /* Unmapping a hole cannot leave a stale translation behind.  Besides being
    * redundant work, queuing a remote shootdown for every absent page in a
    * sparse munmap range can interrupt every CPU sharing this address space. */
-  if (!(pt_virt[pt_index] & PAGE_FLAG_PRESENT))
+  uint32_t swap_slot = zram_pte_slot(pt_virt[pt_index]);
+  if (!(pt_virt[pt_index] & PAGE_FLAG_PRESENT) && !swap_slot)
     goto unlock;
   pt_virt[pt_index] = 0;
+  if (swap_slot) zram_slot_put(swap_slot);
   tlb_flush_deferred(virtual_addr, (uint64_t)pml4);
 
   if (pml4_index < 256 ||
@@ -839,6 +843,13 @@ vmm_unmap_kind_t vmm_unmap_page_locked(uint64_t *pml4, uint64_t virtual_addr,
 
   uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT(pd_entry & PAGE_MASK);
   uint64_t pte = pt_virt[pt_index];
+  uint32_t swap_slot = zram_pte_slot(pte);
+  if (swap_slot) {
+    pt_virt[pt_index] = 0;
+    zram_slot_put(swap_slot);
+    if (frame_out) *frame_out = 0;
+    return VMM_UNMAP_4K; /* sweep table, but no physical frame to free */
+  }
   if (!(pte & PAGE_FLAG_PRESENT))
     return VMM_UNMAP_HOLE;
   pt_virt[pt_index] = 0;

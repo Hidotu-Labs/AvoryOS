@@ -6,6 +6,7 @@
 #include "../sched/sched.h"
 #include "../socket/socket.h"
 #include "../syscalls/syscall.h"
+#include "../smp/cpu.h"
 #include "apic/lapic.h"
 #include "../apic/lapic_timer.h"
 #include "arch/x86_64/extable.h"
@@ -56,6 +57,14 @@ const char *exception_messages[] = {"Division By Zero",
 static isr_t interrupt_handlers[256] = {0};
 static bool apic_mode = false;
 static bool allocated_device_vectors[256] = {0};
+static uint64_t vector_interrupt_counts[MAX_CPUS][256];
+
+uint64_t isr_get_vector_count(uint32_t cpu_id, uint32_t vector) {
+  if (cpu_id >= MAX_CPUS || vector >= 256)
+    return 0;
+  return __atomic_load_n(&vector_interrupt_counts[cpu_id][vector],
+                         __ATOMIC_RELAXED);
+}
 
 void isr_set_apic_mode(bool enabled) { apic_mode = enabled; }
 
@@ -1426,6 +1435,18 @@ void isr_handler(struct registers *regs) {
     syscall_compat_dispatch(regs);
     return; /* Software syscall: no controller EOI or hardirq accounting. */
   }
+
+  /* Keep per-CPU delivery counts for /proc/interrupts. Count vectors rather
+   * than individual handlers: a shared IRQ is one interrupt delivery even
+   * when several handlers run for it. */
+  if (regs->int_no >= 32 && regs->int_no < 256) {
+    struct cpu_info *cpu = cpu_get_current();
+    uint32_t cpu_id = cpu ? cpu->cpu_id : 0;
+    if (cpu_id < MAX_CPUS)
+      __atomic_fetch_add(&vector_interrupt_counts[cpu_id][regs->int_no], 1,
+                         __ATOMIC_RELAXED);
+  }
+
   int is_hw_irq = (regs->int_no >= 32);
 
   /* Track hardirq context for LinuxKPI's in_interrupt().  CPU exceptions are

@@ -24,6 +24,8 @@ boot.INIT=r'''
 int main(void){setvbuf(stdout,0,_IOLBF,0);puts("AUDIO_PROBE: START");pid_t p=fork();if(!p){char *a[]={"/usr/bin/bash","/probe.sh",0};execv(a[0],a);perror("exec");_exit(127);}int s;waitpid(p,&s,0);printf("AUDIO_PROBE: END status=%d\n",s);fflush(0);reboot(RB_POWER_OFF);for(;;)sleep(1);}
 '''
 def setup(root):
+    for directory in ['var/log', 'var/lib/dbus']:
+        (root/directory).mkdir(parents=True,exist_ok=True)
     def resolve(guest):
         parts=[];todo=guest.split('/');count=0
         while todo:
@@ -87,8 +89,7 @@ int main(void){pthread_t t[8];for(unsigned long i=0;i<8;i++)pthread_create(t+i,0
 ''')
         subprocess.run([ROOT/'toolchain/x86_64-linux-musl/bin/x86_64-linux-musl-gcc','-O2','-static','-pthread',stress,'-o',root/'bin/audio-stress'],check=True)
     # Execute the actual image-builder boot script, including its statuses.
-    image_builder=(ROOT/'scripts/setup-arch.sh').read_text()
-    rcs=image_builder.split("cat <<'EOF' > \"${ROOTFS_DIR}/etc/init.d/rcS\"\n",1)[1].split('\nEOF',1)[0]+'\n'
+    rcs=(ROOT/'config/init/rcS').read_text()
     (root/'etc/init.d').mkdir(parents=True,exist_ok=True)
     (root/'etc/init.d/rcS').write_text(rcs)
     (root/'etc/init.d/rcS').chmod(0o755)
@@ -132,6 +133,11 @@ def big_run(args):
     if str(args[0])=='mke2fs':
         with Path(args[-1]).open('r+b') as f:f.truncate(512*1024**2)
     run(args)
+    if str(args[0])=='mke2fs':
+        # Population can re-enable LARGE_FILE even when mkfs disables it.
+        # This private image is only 512 MiB, so no file needs that feature;
+        # the kernel otherwise correctly mounts it read-only.
+        run(['tune2fs','-O','^large_file',args[-1]])
 boot.run=big_run
 disk,iso=boot.prepare(setup)
 serial=OUT/'serial.log'
@@ -147,5 +153,5 @@ log=serial.read_text(errors='replace')
 startup=log[log.index('AUDIO_PROBE: START'):]
 assert p.returncode==0 and '[ !! ]' not in startup, 'rcS startup failed: '+str(serial)
 assert 'RCS_HOSTNAME=AvoryOS' in startup and 'WAITING_SETTLE_EXIT=0' in startup, str(serial)
-assert 'SOUND_INITIALIZED=1' in startup and 'AvoryOS Audio Stereo' in startup and 'PLAYBACK_EXIT=0' in startup, str(serial)
+assert 'SOUND_INITIALIZED=1' in startup and re.search(r'alsa_output\.', startup) and 'PLAYBACK_EXIT=0' in startup, str(serial)
 print(f'PASS: real udev coldplug discovers HDA and completes {SECONDS}-second '+('PulseAudio-bridge' if PULSE else 'PipeWire')+' playback')

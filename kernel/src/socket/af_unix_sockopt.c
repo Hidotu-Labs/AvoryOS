@@ -250,9 +250,10 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
       return -22;
     int val = *(const int *)optval;
     if (val < 256)       val = 256;
-    if (val > 1024*1024) val = 1024*1024;
+    if (val > 4*1024*1024) val = 4*1024*1024;
+    size_t sz = unix_round_pow2((size_t)val);
 
-    uint8_t *new_buf = kmalloc((size_t)val);
+    uint8_t *new_buf = kmalloc(sz);
     if (!new_buf) {
       klog_puts("[WARN] unix_setsockopt: failed to allocate new recv buffer\n");
       return -12; // ENOMEM
@@ -260,22 +261,22 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
 
     spinlock_acquire(&usk->recv_lock);
     size_t head      = usk->recv_buf_head;
-    size_t tail      = usk->recv_buf_tail;
     size_t old_size  = usk->recv_buf_size;
-    /* A socket that has not allocated its receive ring yet reports size 0;
-     * dividing by it is a hard #DE in the kernel (plasmashell hits this with
-     * SO_RCVBUF right after startup). */
-    size_t available = old_size ? (tail - head + old_size) % old_size : 0;
+    size_t count     = usk->recv_buf_count;
 
-    size_t keep = available < (size_t)val ? available : (size_t)val;
-    unix_ring_consume(usk->recv_buf, old_size, head, new_buf, keep);
+    size_t keep = count < sz ? count : sz;
+    if (usk->recv_buf && keep > 0) {
+      unix_ring_consume(usk->recv_buf, old_size, head, new_buf, keep);
+    }
 
     usk->recv_buf_head = 0;
     usk->recv_buf_tail = keep;
+    usk->recv_buf_count = keep;
     kfree(usk->recv_buf);
     usk->recv_buf      = new_buf;
-    usk->recv_buf_size = (size_t)val;
-    sock->rcvbuf       = val;
+    usk->recv_buf_size = sz;
+    usk->recv_buf_mask = sz - 1;
+    sock->rcvbuf       = (int)sz;
     spinlock_release(&usk->recv_lock);
 
     klog_debug_puts("[OK] unix_setsockopt: SO_RCVBUF set to ");
@@ -317,18 +318,21 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
       return -22;
     int val = *(const int *)optval;
     if (val < 64) val = 64;
+    size_t sz = unix_round_pow2((size_t)val);
 
-    uint8_t *new_buf = kmalloc((size_t)val);
+    uint8_t *new_buf = kmalloc(sz);
     if (!new_buf)
       return -12;
 
     spinlock_acquire(&usk->recv_lock);
     kfree(usk->recv_buf);
     usk->recv_buf      = new_buf;
-    usk->recv_buf_size = (size_t)val;
+    usk->recv_buf_size = sz;
+    usk->recv_buf_mask = sz - 1;
     usk->recv_buf_head = 0;
     usk->recv_buf_tail = 0;
-    sock->rcvbuf       = val;
+    usk->recv_buf_count = 0;
+    sock->rcvbuf       = (int)sz;
     spinlock_release(&usk->recv_lock);
     return 0;
   }

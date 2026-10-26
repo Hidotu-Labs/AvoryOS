@@ -1,0 +1,53 @@
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -2178,10 +2178,11 @@
+    rebind_ubo_and_sampler_locs(sprog, last_shader);
+ 
+    if (!has_feature(feat_gles31_vertex_attrib_binding)) {
+-      if (vs->sel->sinfo.num_inputs) {
+-         sprog->attrib_locs = calloc(vs->sel->sinfo.num_inputs, sizeof(uint32_t));
++      int attribute_count = util_last_bit(vs->sel->sinfo.attrib_input_mask);
++      if (attribute_count) {
++         sprog->attrib_locs = calloc(attribute_count, sizeof(uint32_t));
+          if (sprog->attrib_locs) {
+-            for (int i = 0; i < vs->sel->sinfo.num_inputs; i++) {
++            for (int i = 0; i < attribute_count; i++) {
+                snprintf(name, 32, "in_%d", i);
+                sprog->attrib_locs[i] = glGetAttribLocation(vs_id, name);
+             }
+@@ -5092,10 +5093,8 @@
+       struct vrend_resource *res;
+       GLint loc;
+ 
+-      if (i >= ctx->sub->prog->ss[PIPE_SHADER_VERTEX]->sel->sinfo.num_inputs) {
+-         /* XYZZY: debug this? */
+-         break;
+-      }
++      if (!(ctx->sub->prog->ss[PIPE_SHADER_VERTEX]->sel->sinfo.attrib_input_mask & (1u << i)))
++         continue;
+       res = (struct vrend_resource *)ctx->sub->vbo[vbo_index].base.buffer;
+ 
+       if (!res) {
+@@ -5132,7 +5131,7 @@
+       if (vbo->base.stride == 0) {
+          void *data;
+          /* for 0 stride we are kinda screwed */
+-         data = glMapBufferRange(GL_ARRAY_BUFFER, vbo->base.buffer_offset, ve->nr_chan * sizeof(GLfloat), GL_MAP_READ_BIT);
++         data = glMapBufferRange(GL_ARRAY_BUFFER, vbo->base.buffer_offset + ve->base.src_offset, ve->nr_chan * sizeof(GLfloat), GL_MAP_READ_BIT);
+ 
+          switch (ve->nr_chan) {
+          case 1:
+@@ -7686,6 +7685,13 @@
+ 
+    init_features(gles ? 0 : gl_ver,
+                  gles ? gl_ver : 0);
++
++   /* Optional comparison path. Normal operation keeps the host's vertex
++    * binding feature enabled; allocation failures are fixed in the guest. */
++   if (!gles && debug_get_bool_option("VIRGL_LEGACY_VERTEX_BINDING", false)) {
++      clear_feature(feat_gles31_vertex_attrib_binding);
++      virgl_warn("Using legacy vertex binding for host GL\n");
++   }
+ 
+    if (!vrend_winsys_has_gl_colorspace())
+       clear_feature(feat_srgb_write_control) ;

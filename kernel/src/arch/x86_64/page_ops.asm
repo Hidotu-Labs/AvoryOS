@@ -6,12 +6,15 @@
 ; bypassing L1/L2/L3 caches to prevent cache pollution and eliminate read-for-ownership (RFO).
 
 global page_zero_nt
+global page_zero_nt_batch
 global page_copy_nt
 global page_zero_erms
 global page_copy_erms
 global page_zero_avx512
+global page_zero_avx512_batch
 global page_copy_avx512
 global page_zero_avx2
+global page_zero_avx2_batch
 global page_copy_avx2
 
 section .text
@@ -26,7 +29,7 @@ section .text
 align 64
 page_zero_nt:
     xor eax, eax
-    mov ecx, 32             ; 32 iterations * 128 bytes = 4096 bytes
+    mov ecx, 16             ; 16 iterations * 256 bytes = 4096 bytes
 
 .loop_zero_nt:
     movnti [rdi], rax
@@ -45,11 +48,83 @@ page_zero_nt:
     movnti [rdi + 104], rax
     movnti [rdi + 112], rax
     movnti [rdi + 120], rax
-    add rdi, 128
+    movnti [rdi + 128], rax
+    movnti [rdi + 136], rax
+    movnti [rdi + 144], rax
+    movnti [rdi + 152], rax
+    movnti [rdi + 160], rax
+    movnti [rdi + 168], rax
+    movnti [rdi + 176], rax
+    movnti [rdi + 184], rax
+    movnti [rdi + 192], rax
+    movnti [rdi + 200], rax
+    movnti [rdi + 208], rax
+    movnti [rdi + 216], rax
+    movnti [rdi + 224], rax
+    movnti [rdi + 232], rax
+    movnti [rdi + 240], rax
+    movnti [rdi + 248], rax
+    add rdi, 256
     dec ecx
     jnz .loop_zero_nt
 
     sfence                  ; Drain write-combining buffers
+    ret
+
+; void page_zero_nt_batch(void **pages, size_t count)  ; RDI = pages array, RSI = count
+align 64
+page_zero_nt_batch:
+    test rsi, rsi
+    jz .batch_done
+    xor eax, eax
+
+.batch_page_loop:
+    mov rdx, [rdi]          ; Load page pointer
+    add rdi, 8
+    mov ecx, 16             ; 16 iterations * 256 bytes = 4096 bytes
+
+.batch_zero_loop:
+    movnti [rdx], rax
+    movnti [rdx + 8], rax
+    movnti [rdx + 16], rax
+    movnti [rdx + 24], rax
+    movnti [rdx + 32], rax
+    movnti [rdx + 40], rax
+    movnti [rdx + 48], rax
+    movnti [rdx + 56], rax
+    movnti [rdx + 64], rax
+    movnti [rdx + 72], rax
+    movnti [rdx + 80], rax
+    movnti [rdx + 88], rax
+    movnti [rdx + 96], rax
+    movnti [rdx + 104], rax
+    movnti [rdx + 112], rax
+    movnti [rdx + 120], rax
+    movnti [rdx + 128], rax
+    movnti [rdx + 136], rax
+    movnti [rdx + 144], rax
+    movnti [rdx + 152], rax
+    movnti [rdx + 160], rax
+    movnti [rdx + 168], rax
+    movnti [rdx + 176], rax
+    movnti [rdx + 184], rax
+    movnti [rdx + 192], rax
+    movnti [rdx + 200], rax
+    movnti [rdx + 208], rax
+    movnti [rdx + 216], rax
+    movnti [rdx + 224], rax
+    movnti [rdx + 232], rax
+    movnti [rdx + 240], rax
+    movnti [rdx + 248], rax
+    add rdx, 256
+    dec ecx
+    jnz .batch_zero_loop
+
+    dec rsi
+    jnz .batch_page_loop
+
+    sfence                  ; Drain write-combining buffers once for entire batch
+.batch_done:
     ret
 
 ; void page_copy_nt(void *dst, const void *src)  ; RDI = dst, RSI = src
@@ -131,6 +206,35 @@ page_zero_avx512:
     vzeroupper
     ret
 
+; void page_zero_avx512_batch(void **pages, size_t count)  ; RDI = pages array, RSI = count
+align 64
+page_zero_avx512_batch:
+    test rsi, rsi
+    jz .batch_done
+    vpxord zmm0, zmm0, zmm0
+
+.batch_page_loop:
+    mov rdx, [rdi]          ; Load page pointer
+    add rdi, 8
+    mov ecx, 16             ; 16 iterations * 256 bytes = 4096 bytes
+
+.batch_zero_loop:
+    vmovntdq [rdx], zmm0
+    vmovntdq [rdx + 64], zmm0
+    vmovntdq [rdx + 128], zmm0
+    vmovntdq [rdx + 192], zmm0
+    add rdx, 256
+    dec ecx
+    jnz .batch_zero_loop
+
+    dec rsi
+    jnz .batch_page_loop
+
+    sfence                  ; Drain write-combining buffers once for entire batch
+    vzeroupper
+.batch_done:
+    ret
+
 ; void page_copy_avx512(void *dst, const void *src)  ; RDI = dst, RSI = src
 align 64
 page_copy_avx512:
@@ -166,22 +270,59 @@ page_copy_avx512:
 ; ==============================================================================
 
 ; void page_zero_avx2(void *page)  ; RDI = page (4096 bytes)
-align 32
+align 64
 page_zero_avx2:
     vpxor ymm0, ymm0, ymm0
-    mov ecx, 32             ; 32 iterations * 128 bytes = 4096 bytes
+    mov ecx, 16             ; 16 iterations * 256 bytes = 4096 bytes
 
 .loop:
     vmovntdq [rdi], ymm0
     vmovntdq [rdi + 32], ymm0
     vmovntdq [rdi + 64], ymm0
     vmovntdq [rdi + 96], ymm0
-    add rdi, 128
+    vmovntdq [rdi + 128], ymm0
+    vmovntdq [rdi + 160], ymm0
+    vmovntdq [rdi + 192], ymm0
+    vmovntdq [rdi + 224], ymm0
+    add rdi, 256
     dec ecx
     jnz .loop
 
     sfence
     vzeroupper
+    ret
+
+; void page_zero_avx2_batch(void **pages, size_t count)  ; RDI = pages array, RSI = count
+align 64
+page_zero_avx2_batch:
+    test rsi, rsi
+    jz .batch_done
+    vpxor ymm0, ymm0, ymm0
+
+.batch_page_loop:
+    mov rdx, [rdi]          ; Load page pointer
+    add rdi, 8
+    mov ecx, 16             ; 16 iterations * 256 bytes = 4096 bytes
+
+.batch_zero_loop:
+    vmovntdq [rdx], ymm0
+    vmovntdq [rdx + 32], ymm0
+    vmovntdq [rdx + 64], ymm0
+    vmovntdq [rdx + 96], ymm0
+    vmovntdq [rdx + 128], ymm0
+    vmovntdq [rdx + 160], ymm0
+    vmovntdq [rdx + 192], ymm0
+    vmovntdq [rdx + 224], ymm0
+    add rdx, 256
+    dec ecx
+    jnz .batch_zero_loop
+
+    dec rsi
+    jnz .batch_page_loop
+
+    sfence                  ; Drain write-combining buffers once for entire batch
+    vzeroupper
+.batch_done:
     ret
 
 ; void page_copy_avx2(void *dst, const void *src)  ; RDI = dst, RSI = src

@@ -2,6 +2,7 @@
 #include "apic/lapic_timer.h"
 #include "console/klog.h"
 #include "fs/vfs.h"
+#include "lib/rbtree.h"
 #include "lib/string.h"
 #include "lock/spinlock.h"
 #include "mm/heap.h"
@@ -26,7 +27,10 @@
 #define TCP_PORT_BITMAP_WORDS ((TCP_PORT_COUNT + 31) / 32)
 
 #define TCP_HASH_SIZE 512
-#define TCP_TIMER_WORK_MAX 24
+#define TCP_TIMER_WORK_MAX 24 /* expired TCBs processed per tick */
+#define TCP_TIMER_WORK_PER_TCB 4
+#define TCP_TIMER_WORK_ITEMS (TCP_TIMER_WORK_MAX * TCP_TIMER_WORK_PER_TCB)
+#define TCP_DELAYED_ACK_MS 10
 
 /* Reassembly segment (lazily allocated on out-of-order arrival). */
 struct tcp_ooo_seg {
@@ -50,8 +54,6 @@ enum tcp_work_kind {
   WORK_RETX_FIN,
   WORK_RETX_SYN,
   WORK_PROBE,
-  WORK_OUTPUT,
-  WORK_TIMEOUT,
 };
 
 struct tcp_work {
@@ -69,10 +71,7 @@ static struct tcp_stats stats;
 
 static struct tcp_tcb *hash[TCP_HASH_SIZE];
 static struct tcp_tcb *active_list;
-/* Resume timer scans after the last TCB examined when the bounded work list
- * fills. Without a rotating start point, the head of active_list could keep
- * consuming every work slot and starve later connections indefinitely. */
-static struct tcp_tcb *timer_cursor;
+static struct rb_root timer_tree = RB_ROOT;
 static int active_count;
 
 static uint32_t port_bitmap[TCP_PORT_BITMAP_WORDS];
@@ -85,6 +84,82 @@ static inline bool seq_gt(uint32_t a, uint32_t b) { return (int32_t)(a - b) > 0;
 static inline bool seq_ge(uint32_t a, uint32_t b) { return (int32_t)(a - b) >= 0; }
 
 static void wake(struct tcp_tcb *t);
+
+/* All timer-tree operations run under the TCP lock.  One node per TCB is
+ * keyed by its earliest active deadline, so idle connections cost no work
+ * during a timer tick. */
+static void tcp_timer_remove_locked(struct tcp_tcb *t)
+{
+    if (!t->timer_queued)
+        return;
+    rb_erase(&t->timer_node, &timer_tree);
+    t->timer_queued = false;
+    t->timer_deadline = 0;
+}
+
+static uint64_t tcp_timer_earliest_locked(const struct tcp_tcb *t)
+{
+    uint64_t earliest = t->deadline;
+
+#define TCP_TIMER_MIN(candidate) do { \
+    uint64_t timer_candidate = (candidate); \
+    if (timer_candidate && (!earliest || timer_candidate < earliest)) \
+        earliest = timer_candidate; \
+} while (0)
+
+    if (t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT) {
+        if (t->unacked_packets && t->ack_deadline)
+            TCP_TIMER_MIN(t->ack_deadline);
+        if (t->persist_deadline && t->state == TCP_ESTABLISHED &&
+            seq_lt(t->snd_nxt, t->tx_head))
+            TCP_TIMER_MIN(t->persist_deadline);
+        if (t->keepalive && !t->deadline) {
+            if (t->keepalive_probing)
+                TCP_TIMER_MIN(t->keepalive_deadline);
+            else
+                TCP_TIMER_MIN(t->last_activity + t->keepidle_ms);
+        }
+    }
+#undef TCP_TIMER_MIN
+    return earliest;
+}
+
+static void tcp_timer_refresh_locked(struct tcp_tcb *t)
+{
+    if (!t || !t->used)
+        return;
+
+    if (t->reap || t->state == TCP_CLOSED || t->state == TCP_RESET) {
+        tcp_timer_remove_locked(t);
+        return;
+    }
+
+    uint64_t deadline = tcp_timer_earliest_locked(t);
+    if (t->timer_queued && t->timer_deadline == deadline)
+        return;
+
+    tcp_timer_remove_locked(t);
+    if (!deadline)
+        return;
+
+    struct rb_node **link = &timer_tree.rb_node;
+    struct rb_node *parent = NULL;
+    while (*link) {
+        struct tcp_tcb *other = rb_entry(*link, struct tcp_tcb, timer_node);
+        parent = *link;
+        if (deadline < other->timer_deadline ||
+            (deadline == other->timer_deadline &&
+             (uintptr_t)t < (uintptr_t)other))
+            link = &(*link)->rb_left;
+        else
+            link = &(*link)->rb_right;
+    }
+
+    rb_link_node(&t->timer_node, parent, link);
+    rb_insert_color(&t->timer_node, &timer_tree);
+    t->timer_deadline = deadline;
+    t->timer_queued = true;
+}
 
 static uint16_t g16(const uint8_t *p)
 {
@@ -369,8 +444,7 @@ static void free_tcb_locked(struct tcp_tcb *t)
     if (!t || !t->used)
         return;
 
-    if (timer_cursor == t)
-        timer_cursor = t->list_next ? t->list_next : t->list_prev;
+    tcp_timer_remove_locked(t);
 
     hash_remove_locked(t);
     list_remove_locked(t);
@@ -381,12 +455,17 @@ static void free_tcb_locked(struct tcp_tcb *t)
         t->syn_accounted = false;
     }
 
-    for (struct tcp_tcb *c = active_list; c; c = c->list_next) {
+    for (struct tcp_tcb *c = active_list; c; ) {
+        struct tcp_tcb *next = c->list_next;
         if (c != t && c->listener == t) {
             c->listener = NULL;
             c->reap = true;
             c->syn_accounted = false;
+            tcp_timer_remove_locked(c);
+            if (!c->socket_ref && c->refs == 0)
+                free_tcb_locked(c);
         }
+        c = next;
     }
 
     if (t->accept_queue) {
@@ -453,10 +532,12 @@ void tcp_free(struct tcp_tcb *t)
     spinlock_acquire(&lock);
     if (t->used) {
         t->socket_ref = false;
-        if (t->refs > 0)
+        if (t->refs > 0) {
             t->reap = true;
-        else
+            tcp_timer_remove_locked(t);
+        } else {
             free_tcb_locked(t);
+        }
     }
     spinlock_release(&lock);
 }
@@ -501,6 +582,9 @@ void tcp_abort(struct tcp_tcb *t)
         }
         t->deadline = 0;
         t->reap = true;
+        t->persist_deadline = 0;
+        t->ack_deadline = 0;
+        tcp_timer_refresh_locked(t);
         if (t->refs == 0 && !t->socket_ref)
             free_tcb_locked(t);
     }
@@ -517,6 +601,7 @@ void tcp_attach_socket(struct tcp_tcb *t, void *wait_queue, void *vfs_node)
         t->reap = false;
         t->wait_queue = wait_queue;
         t->vfs_node = vfs_node;
+        tcp_timer_refresh_locked(t);
     }
     spinlock_release(&lock);
 }
@@ -695,10 +780,12 @@ static void tcp_output(struct tcp_tcb *t)
                 seq = t->snd_nxt;
                 t->snd_nxt += 1;
                 t->deadline = now + t->rto_ms;
+                tcp_timer_refresh_locked(t);
                 spinlock_release(&lock);
                 emit_at(t, seq, FIN | ACK, NULL, 0);
                 return;
             }
+            tcp_timer_refresh_locked(t);
             spinlock_release(&lock);
             return;
         }
@@ -739,6 +826,7 @@ static void tcp_output(struct tcp_tcb *t)
         t->persist_deadline = 0;
         if (!t->deadline)
             t->deadline = now + t->rto_ms;
+        tcp_timer_refresh_locked(t);
         spinlock_release(&lock);
 
         emit_at(t, seq, ACK | PSH, segbuf, len);
@@ -762,6 +850,7 @@ static void tcp_retransmit_segment(struct tcp_tcb *t, uint32_t seq)
     ring_copy_out(t, seq, segbuf, len);
     t->retransmit = true;
     t->last_activity = lapic_timer_get_ticks();
+    tcp_timer_refresh_locked(t);
     spinlock_release(&lock);
 
     emit_at(t, seq, ACK | PSH, segbuf, len);
@@ -815,6 +904,7 @@ static void tcp_send_probe(struct tcp_tcb *t)
     }
     seq = t->snd_una - 1;
     t->persist_deadline = lapic_timer_get_ticks() + (uint64_t)t->rto_ms * 2;
+    tcp_timer_refresh_locked(t);
     spinlock_release(&lock);
     emit_at(t, seq, ACK, NULL, 0);
 }
@@ -954,6 +1044,7 @@ int tcp_active_open(struct tcp_tcb *t, uint32_t ip, uint16_t port)
     t->error = 0;
     t->deadline = lapic_timer_get_ticks() + t->rto_ms;
     t->last_activity = lapic_timer_get_ticks();
+    tcp_timer_refresh_locked(t);
     uint32_t seq = t->snd_una;
     spinlock_release(&lock);
 
@@ -1014,6 +1105,7 @@ int tcp_active_open6(struct tcp_tcb *t, const uint8_t ip[16], uint16_t port)
     t->error = 0;
     t->deadline = lapic_timer_get_ticks() + t->rto_ms;
     t->last_activity = lapic_timer_get_ticks();
+    tcp_timer_refresh_locked(t);
     uint32_t seq = t->snd_una;
     spinlock_release(&lock);
 
@@ -1052,6 +1144,7 @@ int tcp_listen(struct tcp_tcb *t, int backlog)
     t->backlog = backlog;
     t->syn_backlog = 0;
     t->state = TCP_LISTEN;
+    tcp_timer_refresh_locked(t);
     spinlock_release(&lock);
     return 0;
 }
@@ -1176,6 +1269,7 @@ int tcp_close(struct tcp_tcb *t)
         t->reap = true;
         t->deadline = 0;
     }
+    tcp_timer_refresh_locked(t);
     spinlock_release(&lock);
 
     if (send_rst)
@@ -1197,6 +1291,7 @@ int tcp_close(struct tcp_tcb *t)
             seq = t->snd_nxt;
             t->snd_nxt += 1;
             t->deadline = lapic_timer_get_ticks() + t->rto_ms;
+            tcp_timer_refresh_locked(t);
             spinlock_release(&lock);
             return emit_at(t, seq, f, NULL, 0);
         }
@@ -1296,6 +1391,7 @@ int tcp_send(struct tcp_tcb *t, const void *buf, size_t len, bool nonblock)
         }
         t->tx_head += (uint32_t)chunk;
         t->last_activity = lapic_timer_get_ticks();
+        tcp_timer_refresh_locked(t);
         spinlock_release(&lock);
 
         copied += chunk;
@@ -1352,9 +1448,11 @@ int tcp_recv(struct tcp_tcb *t, void *buf, size_t len, bool nonblock)
                 (t->unacked_packets > 0 ||
                  (old_space < t->mss && new_space >= t->mss))) {
                 t->unacked_packets = 0;
+                t->ack_deadline = 0;
                 send_ack = true;
             }
 
+            tcp_timer_refresh_locked(t);
             spinlock_release(&lock);
             if (send_ack)
                 emit(t, ACK, NULL, 0);
@@ -1378,8 +1476,11 @@ int tcp_recv(struct tcp_tcb *t, void *buf, size_t len, bool nonblock)
         if ((t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT) &&
             t->unacked_packets > 0) {
             t->unacked_packets = 0;
+            t->ack_deadline = 0;
             send_flush_ack = true;
         }
+
+        tcp_timer_refresh_locked(t);
 
         int err = t->error;
 
@@ -1665,12 +1766,14 @@ static void ack_input_locked(struct tcp_tcb *t, uint32_t ack, uint8_t flags,
             t->deadline = now + t->rto_ms;
             act->retransmit = true;
             act->retx_seq = t->snd_una;
+            act->output = true;
             stats.retransmits++;
             t->retransmits++;
         } else if (t->dup_ack_count > 3 && t->in_recovery) {
             t->cwnd += t->mss;
             if (t->cwnd > TCP_CWND_MAX_BYTES)
                 t->cwnd = TCP_CWND_MAX_BYTES;
+            act->output = true;
         }
     }
 }
@@ -1703,6 +1806,8 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
         t->snd_wnd = new_wnd;
         t->snd_wl1 = seq;
         t->snd_wl2 = ack;
+        if (wnd_grew)
+            act->output = true;
     }
 
     if (flags & RST) {
@@ -1839,6 +1944,9 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
         if ((flags & PSH) || ++t->unacked_packets >= 2 || drained) {
             act->send_ack = true;
             t->unacked_packets = 0;
+            t->ack_deadline = 0;
+        } else if (!t->ack_deadline) {
+            t->ack_deadline = now + TCP_DELAYED_ACK_MS;
         }
         act->output = true;
         wake(t);
@@ -1859,6 +1967,8 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
         if (!t->peer_closed && t->rcv_nxt == seq + (uint32_t)len) {
             t->rcv_nxt++;
             t->peer_closed = true;
+            t->unacked_packets = 0;
+            t->ack_deadline = 0;
 
             if (t->state == TCP_ESTABLISHED) {
                 t->state = TCP_CLOSE_WAIT;
@@ -1965,8 +2075,8 @@ void tcp_input_ipv4(uint32_t s, uint32_t d, const uint8_t *p, size_t len)
         struct tcp_rx_actions act = {0};
         input_locked(t, seq, ack, flags, p + header_len, len - header_len,
                      raw_wnd, &act);
+        tcp_timer_refresh_locked(t);
         spinlock_release(&lock);
-
 
         if (act.send_ack)
             emit(t, ACK, NULL, 0);
@@ -2016,6 +2126,7 @@ void tcp_input_ipv4(uint32_t s, uint32_t d, const uint8_t *p, size_t len)
                 hash_insert_locked(child);
                 lis->syn_backlog++;
                 child->syn_accounted = true;
+                tcp_timer_refresh_locked(child);
 
                 uint32_t tx_seq = child->snd_una;
                 child->refs++;
@@ -2076,6 +2187,7 @@ void tcp_input_ipv6(const uint8_t s[16], const uint8_t d[16],
         struct tcp_rx_actions act = {0};
         input_locked(t, seq, ack, flags, p + header_len, len - header_len,
                      raw_wnd, &act);
+        tcp_timer_refresh_locked(t);
         spinlock_release(&lock);
 
         if (act.send_ack)
@@ -2126,6 +2238,7 @@ void tcp_input_ipv6(const uint8_t s[16], const uint8_t d[16],
                 hash_insert_locked(child);
                 lis->syn_backlog++;
                 child->syn_accounted = true;
+                tcp_timer_refresh_locked(child);
 
                 uint32_t tx_seq = child->snd_una;
                 child->refs++;
@@ -2150,85 +2263,65 @@ void tcp_input_ipv6(const uint8_t s[16], const uint8_t d[16],
 
 void tcp_timer_tick(uint64_t now)
 {
-    struct tcp_work work[TCP_TIMER_WORK_MAX];
+    struct tcp_work work[TCP_TIMER_WORK_ITEMS];
     int nw = 0;
+    int processed = 0;
 
     spinlock_acquire(&lock);
-
-    int scan_limit = active_count;
-    struct tcp_tcb *start = timer_cursor && timer_cursor->used
-                                ? timer_cursor
-                                : active_list;
-    struct tcp_tcb *t = start;
-    int scanned = 0;
-    while (t && scanned < scan_limit) {
-        /* Every branch, including the no-deadline and SYN paths below,
-         * must stop when the work budget fills. Otherwise early continues
-         * bypass cursor advancement and busy head entries starve the rest. */
-        if (nw >= TCP_TIMER_WORK_MAX) {
-            timer_cursor = t;
+    /* Data output is kicked by send, ACK/window updates, close, and relevant
+     * socket options. This worker handles only actual TCP deadlines. */
+    /* Bound lock hold time even when many connections expire together.  Each
+     * TCB can queue at most four independent actions in this pass. */
+    while (processed < TCP_TIMER_WORK_MAX &&
+           nw + TCP_TIMER_WORK_PER_TCB <= TCP_TIMER_WORK_ITEMS) {
+        struct rb_node *node = rb_first(&timer_tree);
+        if (!node)
             break;
-        }
-        /* Count every visited TCB, including branches that continue early.
-         * Otherwise a connection without an expired deadline can circle back
-         * to start forever while holding the TCP lock with interrupts off. */
-        scanned++;
-        struct tcp_tcb *next = t->list_next;
-        if (!next)
-            next = active_list;
-        if (next == t)
-            next = NULL;
-        if (!t->used) {
-            t = next;
+
+        struct tcp_tcb *t = rb_entry(node, struct tcp_tcb, timer_node);
+        if (t->timer_deadline > now)
+            break;
+
+        tcp_timer_remove_locked(t);
+        processed++;
+        if (!t->used)
             continue;
-        }
-
-        if (t->state == TCP_TIME_WAIT && t->deadline && now >= t->deadline) {
-            t->state = TCP_CLOSED;
-            t->deadline = 0;
-            t->reap = true;
-        }
-
-        if (t->state == TCP_FIN_WAIT_2 && t->deadline && now >= t->deadline) {
-            t->state = TCP_CLOSED;
-            t->deadline = 0;
-            t->reap = true;
-        }
 
         if ((t->reap || t->state == TCP_CLOSED || t->state == TCP_RESET) &&
             !t->socket_ref && t->refs == 0) {
             free_tcb_locked(t);
-            t = next;
             continue;
         }
 
-        if ((t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT) &&
-            t->unacked_packets > 0 && nw < TCP_TIMER_WORK_MAX) {
-            /* Leave the ACK pending if this tick's work list is full. The
-             * next timer pass will reach it after earlier entries have been
-             * drained; clearing the counter without queuing lost the ACK. */
-            t->unacked_packets = 0;
-            work[nw].t = t;
-            work[nw].seq = t->snd_nxt;
-            work[nw].kind = WORK_ACK;
-            t->refs++;
-            nw++;
+        if ((t->state == TCP_TIME_WAIT || t->state == TCP_FIN_WAIT_2) &&
+            t->deadline && now >= t->deadline) {
+            t->state = TCP_CLOSED;
+            t->deadline = 0;
+            t->reap = true;
         }
 
-        if (t->keepalive &&
-            (t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT) &&
-            !t->deadline) {
+        if ((t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT) &&
+            t->unacked_packets && t->ack_deadline &&
+            now >= t->ack_deadline) {
+            t->unacked_packets = 0;
+            t->ack_deadline = 0;
+            work[nw++] = (struct tcp_work){
+                .t = t, .seq = t->snd_nxt, .kind = WORK_ACK,
+            };
+            t->refs++;
+        }
+
+        if (t->keepalive && !t->deadline &&
+            (t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT)) {
             if (!t->keepalive_probing) {
-                if (now - t->last_activity >= t->keepidle_ms &&
-                    nw < TCP_TIMER_WORK_MAX) {
+                if (now >= t->last_activity + t->keepidle_ms) {
                     t->keepalive_probing = true;
                     t->keepalive_probes = 1;
                     t->keepalive_deadline = now + t->keepintvl_ms;
-                    work[nw].t = t;
-                    work[nw].seq = 0;
-                    work[nw].kind = WORK_PROBE;
+                    work[nw++] = (struct tcp_work){
+                        .t = t, .seq = 0, .kind = WORK_PROBE,
+                    };
                     t->refs++;
-                    nw++;
                 }
             } else if (now >= t->keepalive_deadline) {
                 if (t->keepalive_probes >= t->keepcnt) {
@@ -2238,143 +2331,96 @@ void tcp_timer_tick(uint64_t now)
                     t->reap = true;
                     stats.timeouts++;
                     wake(t);
-                } else if (nw < TCP_TIMER_WORK_MAX) {
+                } else {
                     t->keepalive_probes++;
                     t->keepalive_deadline = now + t->keepintvl_ms;
-                    work[nw].t = t;
-                    work[nw].seq = 0;
-                    work[nw].kind = WORK_PROBE;
+                    work[nw++] = (struct tcp_work){
+                        .t = t, .seq = 0, .kind = WORK_PROBE,
+                    };
                     t->refs++;
-                    nw++;
                 }
             }
         }
 
         if (t->persist_deadline && now >= t->persist_deadline &&
             t->state == TCP_ESTABLISHED && seq_lt(t->snd_nxt, t->tx_head)) {
-            /* Window is (still) zero: send a 1-byte-before probe so a lost
-             * window update cannot leave the connection stalled forever. */
-            if (nw < TCP_TIMER_WORK_MAX) {
-                work[nw].t = t;
-                work[nw].seq = 0;
-                work[nw].kind = WORK_PROBE;
-                t->refs++;
-                nw++;
-            }
+            /* The probe worker installs the next persist deadline after send. */
+            t->persist_deadline = 0;
+            work[nw++] = (struct tcp_work){
+                .t = t, .seq = 0, .kind = WORK_PROBE,
+            };
+            t->refs++;
         }
 
-        if ((t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT) &&
-            (seq_lt(t->snd_nxt, t->tx_head) || t->fin_pending)) {
-            if (nw < TCP_TIMER_WORK_MAX) {
-                work[nw].t = t;
-                work[nw].seq = 0;
-                work[nw].kind = WORK_OUTPUT;
-                t->refs++;
-                nw++;
-            }
-        }
-
-        if (!t->deadline || now < t->deadline) {
-            t = next;
-            continue;
-        }
-
-        if (t->state == TCP_SYN_SENT || t->state == TCP_SYN_RECEIVED) {
-            if (t->retries >= RETRIES) {
-                t->state = TCP_CLOSED;
-                t->deadline = 0;
-                t->error = 110;
-                t->reap = true;
-                stats.timeouts++;
-                wake(t);
-                if (nw < TCP_TIMER_WORK_MAX) {
-                    work[nw].t = t;
-                    work[nw].seq = 1;
-                    work[nw].kind = WORK_TIMEOUT;
-                    t->refs++;
-                    nw++;
-                }
-            } else if (nw < TCP_TIMER_WORK_MAX) {
-                t->retries++;
-                t->deadline = now + ((uint64_t)t->rto_ms
-                                     << (t->retries > 4 ? 4 : t->retries));
-                stats.retransmits++;
-                t->retransmits++;
-                work[nw].t = t;
-                work[nw].seq = 0;
-                work[nw].kind = WORK_RETX_SYN;
-                t->refs++;
-                nw++;
-            }
-            t = next;
-            continue;
-        }
-
-        if (t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT ||
-            t->state == TCP_FIN_WAIT_1 || t->state == TCP_LAST_ACK) {
-            if (t->snd_una == t->snd_nxt) {
-                t->deadline = 0;
-            } else if (t->retries >= RETRIES) {
-                t->state = TCP_CLOSED;
-                t->deadline = 0;
-                t->error = 110;
-                t->reap = true;
-                stats.timeouts++;
-                wake(t);
-                if (nw < TCP_TIMER_WORK_MAX) {
-                    work[nw].t = t;
-                    work[nw].seq = 0;
-                    work[nw].kind = WORK_TIMEOUT;
-                    t->refs++;
-                    nw++;
-                }
-            } else if (nw < TCP_TIMER_WORK_MAX) {
-                t->retries++;
-                uint64_t backoff =
-                    (uint64_t)t->rto_ms << (t->retries > 4 ? 4 : t->retries);
-                t->deadline = now + backoff;
-                stats.retransmits++;
-                t->retransmits++;
-                t->rtt_pending = false;
-                t->retransmit = true;
-                t->ssthresh = (t->snd_nxt - t->snd_una) / 2;
-                if (t->ssthresh < 2 * t->mss)
-                    t->ssthresh = 2 * t->mss;
-                t->cwnd = t->mss;
-                t->in_recovery = false;
-                t->dup_ack_count = 0;
-                work[nw].t = t;
-                if (t->fin_sent && t->snd_nxt - t->snd_una == 1) {
-                    work[nw].kind = WORK_RETX_FIN;
-                    work[nw].seq = 0;
+        if (t->deadline && now >= t->deadline) {
+            if (t->state == TCP_SYN_SENT || t->state == TCP_SYN_RECEIVED) {
+                if (t->retries >= RETRIES) {
+                    t->state = TCP_CLOSED;
+                    t->deadline = 0;
+                    t->error = 110;
+                    t->reap = true;
+                    stats.timeouts++;
+                    wake(t);
                 } else {
-                    work[nw].kind = WORK_RETX;
-                    work[nw].seq = t->snd_una;
+                    t->retries++;
+                    t->deadline = now + ((uint64_t)t->rto_ms
+                                         << (t->retries > 4 ? 4 : t->retries));
+                    stats.retransmits++;
+                    t->retransmits++;
+                    work[nw++] = (struct tcp_work){
+                        .t = t, .seq = 0, .kind = WORK_RETX_SYN,
+                    };
+                    t->refs++;
                 }
-                t->refs++;
-                nw++;
+            } else if (t->state == TCP_ESTABLISHED ||
+                       t->state == TCP_CLOSE_WAIT ||
+                       t->state == TCP_FIN_WAIT_1 ||
+                       t->state == TCP_LAST_ACK) {
+                if (t->snd_una == t->snd_nxt) {
+                    t->deadline = 0;
+                } else if (t->retries >= RETRIES) {
+                    t->state = TCP_CLOSED;
+                    t->deadline = 0;
+                    t->error = 110;
+                    t->reap = true;
+                    stats.timeouts++;
+                    wake(t);
+                } else {
+                    t->retries++;
+                    uint64_t backoff =
+                        (uint64_t)t->rto_ms << (t->retries > 4 ? 4 : t->retries);
+                    t->deadline = now + backoff;
+                    stats.retransmits++;
+                    t->retransmits++;
+                    t->rtt_pending = false;
+                    t->retransmit = true;
+                    t->ssthresh = (t->snd_nxt - t->snd_una) / 2;
+                    if (t->ssthresh < 2 * t->mss)
+                        t->ssthresh = 2 * t->mss;
+                    t->cwnd = t->mss;
+                    t->in_recovery = false;
+                    t->dup_ack_count = 0;
+                    if (t->fin_sent && t->snd_nxt - t->snd_una == 1) {
+                        work[nw++] = (struct tcp_work){
+                            .t = t, .seq = 0, .kind = WORK_RETX_FIN,
+                        };
+                    } else {
+                        work[nw++] = (struct tcp_work){
+                            .t = t, .seq = t->snd_una, .kind = WORK_RETX,
+                        };
+                    }
+                    t->refs++;
+                }
             }
         }
 
-        t = next;
-        if (nw >= TCP_TIMER_WORK_MAX) {
-            /* The next pass starts at the first connection not considered
-             * this pass, rather than restarting at active_list's head. */
-            timer_cursor = t;
-            break;
-        }
-        if (t == start)
-            break;
-    }
-
-    if (nw < TCP_TIMER_WORK_MAX)
-        timer_cursor = active_list;
-
-    for (t = active_list; t; ) {
-        struct tcp_tcb *next = t->list_next;
-        if (t->used && t->reap && !t->socket_ref && t->refs == 0)
+        if (t->used && (t->reap || t->state == TCP_CLOSED ||
+                        t->state == TCP_RESET) &&
+            !t->socket_ref && t->refs == 0) {
             free_tcb_locked(t);
-        t = next;
+        } else {
+            tcp_timer_refresh_locked(t);
+        }
     }
 
     spinlock_release(&lock);
@@ -2399,11 +2445,6 @@ void tcp_timer_tick(uint64_t now)
         case WORK_PROBE:
             tcp_send_probe(wt);
             break;
-        case WORK_OUTPUT:
-            tcp_output(wt);
-            break;
-        case WORK_TIMEOUT:
-            break;
         }
     }
 
@@ -2413,8 +2454,6 @@ void tcp_timer_tick(uint64_t now)
             struct tcp_tcb *wt = work[i].t;
             if (wt && wt->used)
                 tcb_put_locked(wt);
-            else if (wt && wt->refs > 0)
-                wt->refs--;
         }
         spinlock_release(&lock);
     }
@@ -2512,10 +2551,21 @@ void tcp_set_nodelay(struct tcp_tcb *t, bool enabled)
 {
     if (!t)
         return;
+    bool output = false;
     spinlock_acquire(&lock);
-    if (t->used)
+    if (t->used) {
         t->nodelay = enabled;
+        output = enabled && seq_lt(t->snd_nxt, t->tx_head);
+        if (output)
+            t->refs++;
+    }
     spinlock_release(&lock);
+    if (output) {
+        tcp_output(t);
+        spinlock_acquire(&lock);
+        tcb_put_locked(t);
+        spinlock_release(&lock);
+    }
 }
 
 void tcp_set_keepalive(struct tcp_tcb *t, bool enabled, int idle_s,
@@ -2536,6 +2586,7 @@ void tcp_set_keepalive(struct tcp_tcb *t, bool enabled, int idle_s,
             t->keepalive_probing = false;
             t->keepalive_probes = 0;
         }
+        tcp_timer_refresh_locked(t);
     }
     spinlock_release(&lock);
 }
@@ -2568,10 +2619,21 @@ void tcp_set_mss(struct tcp_tcb *t, uint16_t mss)
         mss = TCP_MIN_MSS;
     if (mss > TCP_MAX_MSS)
         mss = TCP_MAX_MSS;
+    bool output = false;
     spinlock_acquire(&lock);
-    if (t->used)
+    if (t->used) {
         t->mss = mss;
+        output = seq_lt(t->snd_nxt, t->tx_head);
+        if (output)
+            t->refs++;
+    }
     spinlock_release(&lock);
+    if (output) {
+        tcp_output(t);
+        spinlock_acquire(&lock);
+        tcb_put_locked(t);
+        spinlock_release(&lock);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -2662,6 +2724,7 @@ void tcp_init(void)
     memset(&stats, 0, sizeof(stats));
     memset(port_bitmap, 0, sizeof(port_bitmap));
     active_list = NULL;
+    timer_tree.rb_node = NULL;
     active_count = 0;
     next_ephemeral = TCP_PORT_MIN;
     iss_counter = 0x90000000u;

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "lib/rbtree.h"
 
 /*
  * Phase 1: connection scaling.
@@ -67,6 +68,11 @@ struct tcp_tcb {
   uint16_t rcv_wnd, mss;
   uint8_t retries;
   uint64_t deadline;
+  /* Delayed ACK timer; the TCP timer tree stores the earliest active event. */
+  uint64_t ack_deadline;
+  uint64_t timer_deadline;
+  struct rb_node timer_node;
+  bool timer_queued;
 
   /* Receive buffer: heap allocated, resizable through SO_RCVBUF. */
   uint8_t *rx_buffer;

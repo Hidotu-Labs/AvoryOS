@@ -251,7 +251,7 @@ int ext4_htree_add_entry(
     /*
      * Read and validate the HTree root block.
      */
-    uint32_t root_physical_block = ext2_get_block_num(
+    uint64_t root_physical_block = ext2_get_block_num(
         mount,
         directory_inode,
         0
@@ -310,7 +310,7 @@ int ext4_htree_add_entry(
     uint32_t leaf_logical_block =
         entries[target_index].block & 0x0fffffffu;
 
-    uint32_t leaf_physical_block = ext2_get_block_num(
+    uint64_t leaf_physical_block = ext2_get_block_num(
         mount,
         directory_inode,
         leaf_logical_block
@@ -432,8 +432,7 @@ int ext4_htree_add_entry(
             directory_inode_number,
             new_logical_block,
             1,
-            &new_physical_block) != 0 ||
-        new_physical_block > UINT32_MAX) {
+            &new_physical_block) != 0) {
         goto cleanup;
     }
 
@@ -474,7 +473,7 @@ int ext4_htree_add_entry(
     if (result == 0) {
         result = ext3_journal_block(
             mount,
-            (uint32_t)new_physical_block,
+            new_physical_block,
             right_buffer
         );
     }

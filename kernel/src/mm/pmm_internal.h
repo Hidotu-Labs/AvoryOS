@@ -46,8 +46,9 @@ struct buddy_block {
 struct pcp_cache {
   void *pages[PCP_CAPACITY];
   uint32_t count;
+  volatile uint32_t active;
   spinlock_t lock;
-};
+} __attribute__((aligned(64)));
 
 /* Global PMM shared state */
 extern struct buddy_zone b_zone;

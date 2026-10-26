@@ -31,8 +31,8 @@ typedef struct {
 
 uint64_t ext4_extent_get_pblock(ext4_extent_t *ex);
 bool     ext4_inode_has_extents(ext2_inode_t *inode);
-uint32_t ext4_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode, uint32_t logical_block);
-uint32_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
+uint64_t ext4_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode, uint32_t logical_block);
+uint64_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
                              uint32_t logical_block, uint32_t *out_run_len);
 void     ext4_extent_init_inode(ext2_inode_t *inode);
 int      ext4_extent_insert(ext2_mount_t *mnt, ext2_inode_t *inode,

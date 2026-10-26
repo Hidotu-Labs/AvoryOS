@@ -35,6 +35,61 @@ static evdev_device_t kbd_evdev;
 static evdev_device_t mouse_evdev;
 static bool evdev_ready;
 
+typedef struct evdev_client {
+  vfs_node_t node; // First member: VFS frees the complete per-open allocation.
+  uint32_t tail;
+  bool dropped;
+  struct evdev_client *next;
+} evdev_client_t;
+
+static void evdev_client_close(vfs_node_t *node) {
+  evdev_device_t *dev = node->device;
+  evdev_client_t *client = (evdev_client_t *)node;
+  uint64_t flags;
+  spinlock_acquire_save(&dev->lock, &flags);
+  evdev_client_t **link = &dev->clients;
+  while (*link && *link != client)
+    link = &(*link)->next;
+  if (*link)
+    *link = client->next;
+  spinlock_release_restore(&dev->lock, flags);
+}
+
+static evdev_client_t *evdev_client(vfs_node_t *node) {
+  return node->close == evdev_client_close ? (evdev_client_t *)node : NULL;
+}
+
+static vfs_node_t *evdev_open_instance(vfs_node_t *metadata) {
+  evdev_device_t *dev = metadata->device;
+  evdev_client_t *client = kmalloc(sizeof(*client));
+  if (!client)
+    return NULL;
+  memset(client, 0, sizeof(*client));
+  vfs_node_init(&client->node);
+  vfs_node_t *node = &client->node;
+  strcpy(node->name, metadata->name);
+  node->flags = FS_CHARDEV;
+  node->mask = metadata->mask;
+  node->uid = metadata->uid;
+  node->gid = metadata->gid;
+  node->inode = metadata->inode;
+  node->device = dev;
+  node->read = metadata->read;
+  node->write = metadata->write;
+  node->poll = metadata->poll;
+  node->ioctl = metadata->ioctl;
+  node->close = evdev_client_close;
+  node->wait_queue = &dev->wait;
+  node->refcount = 0; // sys_openat acquires the descriptor's first reference.
+  uint64_t flags;
+  spinlock_acquire_save(&dev->lock, &flags);
+  client->tail = dev->head; // An open starts with new events, not stale input.
+  client->next = dev->clients;
+  dev->clients = client;
+  spinlock_release_restore(&dev->lock, flags);
+  return node;
+}
+
 evdev_device_t *evdev_get_keyboard(void) {
   return evdev_ready ? &kbd_evdev : NULL;
 }
@@ -70,6 +125,15 @@ void evdev_push_event(evdev_device_t *dev, uint16_t type, uint16_t code,
   if (type == EV_ABS && code <= ABS_Y)
     dev->abs_value[code] = value;
   dev->head = next;
+  for (evdev_client_t *client = dev->clients; client; client = client->next) {
+    if (next == client->tail) {
+      client->tail = (client->tail + 1) % EVDEV_RING_SIZE;
+      client->dropped = true;
+    }
+    /* The device lock pins the client against final close. epoll only
+     * queues readiness here; it polls the fd after releasing its locks. */
+    epoll_notify_event(&client->node, POLLIN);
+  }
   spinlock_release_restore(&dev->lock, flags);
 
   // Wake any threads blocked on read() or poll()
@@ -123,6 +187,7 @@ static uint32_t evdev_vfs_read(struct vfs_node *node, uint32_t offset,
                                uint32_t size, uint8_t *buffer) {
   (void)offset;
   evdev_device_t *dev = (evdev_device_t *)node->device;
+  evdev_client_t *client = evdev_client(node);
   struct thread *t = sched_get_current();
   if (!dev || !t)
     return 0;
@@ -139,14 +204,24 @@ static uint32_t evdev_vfs_read(struct vfs_node *node, uint32_t offset,
 
   while (1) {
     spinlock_acquire(&dev->lock);
-    if (dev->head != dev->tail) {
+    volatile uint32_t *tail = client ? &client->tail : &dev->tail;
+    if (dev->head != *tail || (client && client->dropped)) {
       // Data available
       uint32_t copied = 0;
       uint32_t max_events = size / sizeof(struct input_event);
-      while (copied < max_events && dev->tail != dev->head) {
+      if (client && client->dropped) {
+        struct input_event dropped = {0};
+        evdev_timestamp(&dropped.time_sec, &dropped.time_usec);
+        dropped.type = EV_SYN;
+        dropped.code = SYN_DROPPED;
+        memcpy(buffer, &dropped, sizeof(dropped));
+        copied++;
+        client->dropped = false;
+      }
+      while (copied < max_events && *tail != dev->head) {
         memcpy(buffer + copied * sizeof(struct input_event),
-               &dev->ring[dev->tail], sizeof(struct input_event));
-        dev->tail = (dev->tail + 1) % EVDEV_RING_SIZE;
+               &dev->ring[*tail], sizeof(struct input_event));
+        *tail = (*tail + 1) % EVDEV_RING_SIZE;
         copied++;
       }
       spinlock_release(&dev->lock);
@@ -168,7 +243,7 @@ static uint32_t evdev_vfs_read(struct vfs_node *node, uint32_t offset,
     // Check one last time while state is BLOCKED and we still hold the lock.
     // If an event comes now, it's either already here (seen by this check)
     // or it's waiting for the lock and will see us as BLOCKED.
-    if (dev->head != dev->tail) {
+    if (dev->head != *tail || (client && client->dropped)) {
       t->state = THREAD_RUNNING;
       spinlock_release(&dev->lock);
     } else {
@@ -185,12 +260,15 @@ static uint32_t evdev_vfs_read(struct vfs_node *node, uint32_t offset,
 // VFS poll callback
 static int evdev_vfs_poll(struct vfs_node *node, int events) {
   evdev_device_t *dev = (evdev_device_t *)node->device;
+  evdev_client_t *client = evdev_client(node);
   if (!dev)
     return 0;
 
   spinlock_acquire(&dev->lock);
   int revents = 0;
-  if ((events & (POLLIN | POLLRDNORM)) && dev->head != dev->tail)
+  uint32_t tail = client ? client->tail : dev->tail;
+  if ((events & (POLLIN | POLLRDNORM)) &&
+      (dev->head != tail || (client && client->dropped)))
     revents |= (POLLIN | POLLRDNORM);
   spinlock_release(&dev->lock);
   return revents;
@@ -573,6 +651,7 @@ static void evdev_create_node(evdev_device_t *dev, const char *node_name, vfs_no
   node->write = evdev_vfs_write;
   node->poll = evdev_vfs_poll;
   node->ioctl = evdev_vfs_ioctl;
+  node->open_instance = evdev_open_instance;
   node->wait_queue = &dev->wait;
 
   dev->vfs_node = node;
@@ -609,6 +688,7 @@ static void evdev_create_node(evdev_device_t *dev, const char *node_name, vfs_no
          mice->write = node->write;
          mice->poll = node->poll;
          mice->ioctl = node->ioctl;
+         mice->open_instance = node->open_instance;
          mice->wait_queue = node->wait_queue;
          mice->inode = node->inode;
          ramfs_mount_node(input_dir, mice);

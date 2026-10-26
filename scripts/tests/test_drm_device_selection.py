@@ -57,6 +57,11 @@ int main(void) {
         result = subprocess.run(['sh',str(selector),mode],env=environment,capture_output=True,text=True)
         assert result.stdout.strip() == expected, (inventory,settings,result.stdout,result.stderr)
         assert result.returncode == (0 if expected else 1), (result.returncode,result.stderr)
+    virgl = '/dev/dri/card3 virtio_gpu pci:0000:00:06.0 1 /dev/dri/renderD137\n'
+    check(virgl+vkms, '/dev/dri/card3 /dev/dri/renderD137')
+    check(virgl+vkms, '/dev/dri/card3 /dev/dri/renderD137 virtio_gpu /dev/dri/card3', mode='--wayland')
+    check(virgl, '/dev/dri/renderD137', mode='--render')
+    check(amd+virgl, '/dev/dri/card4 /dev/dri/renderD135')
     check(native+vkms,'/dev/dri/card7 -')
     check(native,'/dev/dri/card7 -')
     check(native+vkms+nvidia,'/dev/dri/card7 /dev/dri/renderD129')

@@ -104,6 +104,15 @@ cp -f "${ROOT_DIR}/initrd/avory-drm.sh" \
     "${ROOTFS_DIR}/etc/xdg/plasma-workspace/env/avory-drm.sh"
 chmod 0644 "${ROOTFS_DIR}/etc/xdg/plasma-workspace/env/avory-drm.sh"
 
+# Plasma's Wayland desktop entry bypasses startplasma-x11, so route it through
+# the matching audio setup before Plasma starts D-Bus-activated services.
+install -m 0755 "${ROOT_DIR}/config/plasma/avory-plasma-wayland.sh" \
+    "${ROOTFS_DIR}/usr/bin/avory-plasma-wayland"
+PLASMA_WAYLAND_SESSION="${ROOTFS_DIR}/usr/share/wayland-sessions/plasma.desktop"
+if [ -f "$PLASMA_WAYLAND_SESSION" ]; then
+    sed -i 's|^Exec=.*|Exec=/usr/bin/avory-plasma-wayland|' "$PLASMA_WAYLAND_SESSION"
+fi
+
 # Xfwm4 ships with compositing enabled upstream, but write the channel default
 # explicitly so fresh AvoryOS accounts get the same behavior.
 XFWM4_CONFIG_DIR="${ROOTFS_DIR}/etc/xdg/xfce4/xfconf/xfce-perchannel-xml"

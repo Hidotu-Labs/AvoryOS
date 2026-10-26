@@ -791,6 +791,10 @@ void ramfs_mount_at(char *path) {
   if (mountpoint) {
     vfs_node_t *ram_root = kmalloc(sizeof(vfs_node_t));
     vfs_node_init(ram_root);
+    /* A mount hides the covered directory's permissions. New ramfs roots
+     * must be searchable by unprivileged services (notably SDDM probing
+     * /dev/dri); vfs_node_init leaves the mode at zero. */
+    ram_root->mask = 0755;
     char *name = path;
     char *last_slash = 0;
     for (char *p = path; *p; p++)

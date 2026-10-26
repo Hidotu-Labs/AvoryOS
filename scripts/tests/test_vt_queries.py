@@ -30,7 +30,7 @@ code = r'''
 #include <string.h>
 #include "terminal.h"
 struct vfs_node { int unused; };
-struct thread { int pgid; };
+struct thread { int pgid, sid, tgid; struct vfs_node *ctty; };
 struct termios console_termios;
 static int kd_mode, copy_fault;
 static struct thread current = {.pgid = 1};
@@ -64,6 +64,21 @@ static int dispatch(uint32_t request, uint64_t arg) {
 '''
 code += r'''
 int main(void) {
+    struct vfs_node console = {0}, other = {0};
+    current.sid = current.tgid = 42;
+    assert(!console_dev_ioctl(&console, 0x540E, 0));
+    assert(current.ctty == &console);
+    assert(!console_dev_ioctl(&console, 0x540E, 0));
+    assert(console_dev_ioctl(&other, 0x540E, 0) == -1);
+    assert(current.ctty == &console);
+    assert(!console_dev_ioctl(&other, 0x5422, 0));
+    assert(current.ctty == &console);
+    assert(!console_dev_ioctl(&console, 0x5422, 0));
+    assert(!current.ctty);
+    current.sid = 41;
+    assert(console_dev_ioctl(&console, 0x540E, 0) == -1);
+    assert(!current.ctty);
+    current.sid = 42;
     /* Xorg initializes vtno to -1 before querying /dev/tty0. */
     struct { int vt; uint32_t guard; } query = {-1, 0x12345678};
     assert(!dispatch(VT_OPENQRY, (uintptr_t)&query.vt));

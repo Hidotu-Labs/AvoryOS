@@ -60,10 +60,13 @@ struct vma {
   struct vma *right;
 };
 
-// VMA list for a process (now a Tree Root)
+#define VMA_CACHE_SIZE 4
+
+// VMA list for a process (Tree Root with MRU locality cache)
 struct vma_list {
   struct vma *root;
   int count; // Number of active dynamically allocated regions
+  struct vma *cache[VMA_CACHE_SIZE]; // MRU cached VMAs for O(1) locality lookups
 };
 
 // Initialize a VMA list

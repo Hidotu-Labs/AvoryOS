@@ -803,6 +803,9 @@ mount_success:
   devfs_init();
   fault_init();
 
+  extern void zram_init(void);
+  zram_init();
+
   extern void sysfs_init(void);
   sysfs_init();
   udriver_init();
@@ -897,6 +900,7 @@ mount_success:
    * The suites exercise those drivers, so the order matters. */
   linuxkpi_param_init();
   linuxkpi_run_initcalls();
+  ascentdrm_register_render_vfs();
   /* The Phase 1 suites sleep too; they get their own kthread instead of the
    * idle context kmain_high_half runs in. */
   linuxkpi_run_boot_tests();
@@ -984,7 +988,7 @@ mount_fail:
      * so fault paths find zeroed frames without paying memset. */
     bool zero_refill = pmm_zero_pool_needs_refill();
     if (zero_refill)
-      pmm_zero_pool_refill(8);
+      pmm_zero_pool_refill(32);
     uint64_t idle_ms =
         (serial_pending_bytes() || defer_pending || zero_refill ||
          console_has_pending_swap())

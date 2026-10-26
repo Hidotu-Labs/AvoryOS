@@ -89,9 +89,10 @@ knobs, the test tooling, and the Phase 7 hardening audit.
   virtual sectors.  Requests that only partially cover a logical block go
   through a per-namespace read-modify-write page serialized by
   `nvme_rmw_lock()`; fully aligned requests are translated 1:1.
-- With `NVME_BATCH_IO=1`, namespaces additionally advertise
+- With `NVME_BATCH_IO=1` (the default; set `NVME_BATCH_IO=0` to disable),
+  namespaces additionally advertise
   `read_batch`/`write_batch`.  `nvme_batch_submit()` gathers a wave of up to
-  `NVME_BATCH_WAVE_MAX` (16) independent fast members (aligned kernel buffer,
+  `NVME_BATCH_WAVE_MAX` (32) independent fast members (aligned kernel buffer,
   whole logical blocks, within MDTS) and submits their commands back to back
   before any wait; `nvme_io_wait_many()` reaps every wave CID against one
   shared deadline and parks on a dedicated per-queue `batch_wq`, woken once
@@ -124,7 +125,7 @@ knobs, the test tooling, and the Phase 7 hardening audit.
 - `sector_size = 512`, `total_sectors = NSZE * (LBA size / 512)`.
 - `driver_data` points at the namespace; all four block operation slots
   (`read_sectors`, `write_sectors`, `write_sectors_fua`, `flush`) are filled,
-  and `NVME_BATCH_IO=1` adds `read_batch`/`write_batch`.
+  and the default `NVME_BATCH_IO=1` adds `read_batch`/`write_batch`.
 - Block reads/writes bounds-check `lba + count` against `total_sectors` before
   touching the device.
 
@@ -139,7 +140,8 @@ knobs, the test tooling, and the Phase 7 hardening audit.
 | `NVME_SELFTEST_FAULT_TIMEOUT=1` | Wedge one Flush, verify fail-stop (or recovery) |
 | `NVME_SELFTEST_FAULT_INDEX=N` | Restrict the fault-injection test to one controller |
 | `NVME_RESET_RECOVERY=1` | Reset + retry a command after a transport failure |
-| `NVME_BATCH_IO=1` | Advertise `read_batch`/`write_batch`; one submitter can keep up to `NVME_BATCH_WAVE_MAX=16` commands in flight per wait |
+| `NVME_BATCH_IO=1` (default) | Advertise `read_batch`/`write_batch`; one submitter can keep up to `NVME_BATCH_WAVE_MAX=32` commands in flight per wait |
+| `NVME_BATCH_IO=0` | Disable the NVMe batch callbacks |
 | `NVME_FUA=1` | Every block write carries FUA |
 | `NVME_NOIRQ=1` | Never request an interrupt; polled completions |
 | `NVME_DISABLE_MSIX=1` / `NVME_DISABLE_MSI=1` | Skip the respective interrupt mode |

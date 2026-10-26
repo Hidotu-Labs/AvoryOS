@@ -1,0 +1,24 @@
+diff --git a/src/vrend/vrend_shader.c b/src/vrend/vrend_shader.c
+index 6a26fdf..44ddf57 100644
+--- a/src/vrend/vrend_shader.c
++++ b/src/vrend/vrend_shader.c
+@@ -1589,6 +1589,9 @@ iter_declaration(struct tgsi_iterate_context *iter,
+             }
+          }
+          break;
++      case TGSI_SEMANTIC_FOG:
++         /* Fog varying names and component masks are emitted below. */
++         break;
+       default:
+          virgl_warn("Unhandled input semantic: %x\n", ctx->inputs[i].name);
+          break;
+@@ -1854,6 +1857,9 @@ iter_declaration(struct tgsi_iterate_context *iter,
+             }
+          }
+          break;
++      case TGSI_SEMANTIC_FOG:
++         /* Fog varying names and component masks are emitted below. */
++         break;
+       default:
+          virgl_warn("Unhandled output semantic: %x\n", ctx->outputs[i].name);
+          break;

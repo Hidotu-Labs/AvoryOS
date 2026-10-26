@@ -4,6 +4,9 @@
 #include "console/klog.h"
 #include "mm/heap.h"
 
+#define EXT4_MAX_PHYS_BLOCK ((1ULL << 48) - 1)
+#define EXT4_EXTENT_STACK_BUF_MAX 4096
+
 uint64_t ext4_extent_get_pblock(ext4_extent_t *ex) {
     return ((uint64_t)ex->ee_start_hi << 32) | (uint64_t)ex->ee_start_lo;
 }
@@ -12,13 +15,15 @@ bool ext4_inode_has_extents(ext2_inode_t *inode) {
     return (inode->i_flags & EXT4_EXTENTS_FL) != 0;
 }
 
-uint32_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
+uint64_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
                              uint32_t logical_block, uint32_t *out_run_len) {
     if (out_run_len)
         *out_run_len = 1;
-    uint8_t *bufs[5] = {NULL, NULL, NULL, NULL, NULL};
+    uint8_t stack_buf[EXT4_EXTENT_STACK_BUF_MAX] __attribute__((aligned(8)));
+    uint8_t *dyn_buf = NULL;
+    uint8_t *buf = NULL;
     int depth_idx = 0;
-    uint32_t result = 0;
+    uint64_t result = 0;
     uint32_t hole_limit = UINT32_MAX - logical_block;
     if (!hole_limit) hole_limit = 1;
 
@@ -49,7 +54,13 @@ uint32_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
                         goto done;
                     }
                     uint64_t pblock = ext4_extent_get_pblock(ex);
-                    result = (uint32_t)(pblock + offset_in_extent);
+                    if (!pblock || pblock > EXT4_MAX_PHYS_BLOCK ||
+                        pblock >= mnt->blocks_count ||
+                        offset_in_extent >= mnt->blocks_count - pblock) {
+                        result = 0;
+                        goto done;
+                    }
+                    result = pblock + offset_in_extent;
                     goto done;
                 }
             }
@@ -73,11 +84,18 @@ uint32_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
                 goto done;
 
             uint64_t child_phys = ((uint64_t)best->ei_leaf_hi << 32) | best->ei_leaf_lo;
-            uint8_t *buf = kmalloc(mnt->block_size);
-            if (!buf)
-                goto done;
-            bufs[depth_idx++] = buf;
-            if (ext2_read_block(mnt, (uint32_t)child_phys, buf) != 0)
+            if (!buf) {
+                if (mnt->block_size <= sizeof(stack_buf)) {
+                    buf = stack_buf;
+                } else {
+                    dyn_buf = kmalloc(mnt->block_size);
+                    if (!dyn_buf)
+                        goto done;
+                    buf = dyn_buf;
+                }
+            }
+            depth_idx++;
+            if (ext2_read_block(mnt, child_phys, buf) != 0)
                 goto done;
 
             hdr = (ext4_extent_header_t *)buf;
@@ -88,12 +106,12 @@ uint32_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
     }
 
 done:
-    for (int i = 0; i < 5; i++)
-        if (bufs[i]) kfree(bufs[i]);
+    if (dyn_buf)
+        kfree(dyn_buf);
     return result;
 }
 
-uint32_t ext4_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode, uint32_t logical_block) {
+uint64_t ext4_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode, uint32_t logical_block) {
     return ext4_get_extent_run(mnt, inode, logical_block, NULL);
 }
 
@@ -124,20 +142,22 @@ static void ext4_idx_set_pblock(ext4_extent_idx_t *idx, uint64_t phys_block) {
     idx->ei_leaf_hi = (uint16_t)(phys_block >> 32);
 }
 
-static int ext4_extent_write_node(ext2_mount_t *mnt, uint32_t block,
+static int ext4_extent_write_node(ext2_mount_t *mnt, uint64_t block,
                                   void *buffer) {
-    /*
-     * A newly grown extent leaf can be read again before the surrounding
-     * inode update completes. Queueing it only in the journal left that leaf
-     * unreadable to the next write; GNU ld exposes this with sparse output.
-     * Persist the node now, matching the caller's direct inode update.
-     */
+    /* Extent nodes belong to the same transaction as their inode/bitmap
+     * changes. ext2_read_block() consults the staged journal images before
+     * the evictable block cache, so later tree walks see new leaves without
+     * a synchronous home write and device-wide flush for each insertion.
+     * Repeated changes collapse into the transaction's final block image. */
+    if (mnt->journal.active)
+        return ext3_journal_block(mnt, block, buffer);
+
+    /* Unjournaled mounts still need the original synchronous visibility and
+     * durability contract. */
     int result = ext2_write_block(mnt, block, buffer);
     if (result != 0)
         return result;
 
-    /* Extent nodes are immediately traversed by later sparse writes.  Force
-     * visibility before their small direct-mapped cache slot can be evicted. */
     return block_flush(mnt->dev);
 }
 
@@ -203,7 +223,7 @@ static int ext4_extent_insert_leaf_entry(ext4_extent_header_t *hdr,
 
 static int ext4_extent_grow_root(ext2_mount_t *mnt, ext2_inode_t *inode) {
     ext4_extent_header_t *root = (ext4_extent_header_t *)inode->i_block;
-    uint32_t child_block = ext2_alloc_block(mnt);
+    uint64_t child_block = ext2_alloc_block_extent(mnt);
     if (!child_block)
         return -1;
 
@@ -274,9 +294,9 @@ static int ext4_extent_insert_index_entry(ext4_extent_header_t *hdr,
 static int ext4_extent_split_index(ext2_mount_t *mnt,
                                    ext2_inode_t *inode,
                                    ext4_extent_header_t *idx_hdr,
-                                   uint32_t idx_phys,
+                                   uint64_t idx_phys,
                                    uint32_t logical_block,
-                                   uint32_t child_phys) {
+                                   uint64_t child_phys) {
     uint16_t total = idx_hdr->eh_entries + 1;
     ext4_extent_idx_t *all = kmalloc(total * sizeof(*all));
     if (!all)
@@ -293,7 +313,7 @@ static int ext4_extent_split_index(ext2_mount_t *mnt,
     memcpy(&all[pos + 1], &old[pos],
            (idx_hdr->eh_entries - pos) * sizeof(*all));
 
-    uint32_t new_idx_block = ext2_alloc_block_hint(mnt, idx_phys + 1);
+    uint64_t new_idx_block = ext2_alloc_block_extent_hint(mnt, idx_phys + 1);
     uint8_t *new_idx_buf = new_idx_block ? kcalloc(1, mnt->block_size) : NULL;
     if (!new_idx_buf) {
         if (new_idx_block) ext2_free_block(mnt, new_idx_block);
@@ -338,7 +358,7 @@ static int ext4_extent_split_index(ext2_mount_t *mnt,
 static int ext4_extent_add_root_index(ext2_mount_t *mnt,
                                       ext2_inode_t *inode,
                                       uint32_t logical_block,
-                                      uint32_t child_block) {
+                                      uint64_t child_block) {
     ext4_extent_header_t *root = (ext4_extent_header_t *)inode->i_block;
     if (root->eh_entries < root->eh_max) {
         return ext4_extent_insert_index_entry(
@@ -361,7 +381,7 @@ static int ext4_extent_add_root_index(ext2_mount_t *mnt,
     if (!idx_buf)
         return -1;
 
-    if (ext2_read_block(mnt, (uint32_t)idx_phys, idx_buf) != 0) {
+    if (ext2_read_block(mnt, idx_phys, idx_buf) != 0) {
         kfree(idx_buf);
         return -1;
     }
@@ -370,7 +390,7 @@ static int ext4_extent_add_root_index(ext2_mount_t *mnt,
     int res = ext4_extent_insert_index_entry(
         idx_hdr, (ext4_extent_idx_t *)(idx_hdr + 1), logical_block, child_block);
     if (res == 0)
-        res = ext4_extent_write_node(mnt, (uint32_t)idx_phys, idx_buf);
+        res = ext4_extent_write_node(mnt, idx_phys, idx_buf);
 
     kfree(idx_buf);
     return res;
@@ -378,7 +398,7 @@ static int ext4_extent_add_root_index(ext2_mount_t *mnt,
 
 static int ext4_extent_split_leaf(ext2_mount_t *mnt, ext2_inode_t *inode,
                                   ext4_extent_header_t *leaf,
-                                  uint32_t leaf_block, uint32_t logical_block,
+                                  uint64_t leaf_block, uint32_t logical_block,
                                   uint64_t phys_block, uint16_t len) {
     uint16_t total = leaf->eh_entries + 1;
     ext4_extent_t *all = kmalloc(total * sizeof(*all));
@@ -397,7 +417,7 @@ static int ext4_extent_split_leaf(ext2_mount_t *mnt, ext2_inode_t *inode,
     memcpy(&all[pos + 1], &old[pos],
            (leaf->eh_entries - pos) * sizeof(*all));
 
-    uint32_t new_block = ext2_alloc_block_hint(mnt, leaf_block + 1);
+    uint64_t new_block = ext2_alloc_block_extent_hint(mnt, leaf_block + 1);
     uint8_t *new_buf = new_block ? kcalloc(1, mnt->block_size) : NULL;
     if (!new_buf) {
         if (new_block)
@@ -439,7 +459,9 @@ int ext4_extent_insert(ext2_mount_t *mnt, ext2_inode_t *inode,
                        uint32_t inode_num, uint32_t logical_block,
                        uint64_t phys_block, uint16_t len) {
     (void)inode_num;
-    if (!mnt || !inode || !len || len > 0x7FFF || phys_block > UINT32_MAX)
+    if (!mnt || !inode || !len || len > 0x7FFF ||
+        phys_block > EXT4_MAX_PHYS_BLOCK ||
+        (uint64_t)len - 1 > EXT4_MAX_PHYS_BLOCK - phys_block)
         return -1;
     if (!ext4_inode_has_extents(inode))
         ext4_extent_init_inode(inode);
@@ -472,13 +494,13 @@ retry:
         if (!best_root)
             best_root = &root_idxs[0];
         uint64_t idx_phys = ext4_idx_get_pblock(best_root);
-        if (!idx_phys || idx_phys > UINT32_MAX)
+        if (!idx_phys || idx_phys > EXT4_MAX_PHYS_BLOCK)
             return -1;
 
         uint8_t *idx_buf = kmalloc(mnt->block_size);
         if (!idx_buf)
             return -1;
-        if (ext2_read_block(mnt, (uint32_t)idx_phys, idx_buf) != 0) {
+        if (ext2_read_block(mnt, idx_phys, idx_buf) != 0) {
             kfree(idx_buf);
             return -1;
         }
@@ -499,7 +521,7 @@ retry:
         if (!best_mid)
             best_mid = &mid_idxs[0];
         uint64_t leaf_phys = ext4_idx_get_pblock(best_mid);
-        if (!leaf_phys || leaf_phys > UINT32_MAX) {
+        if (!leaf_phys || leaf_phys > EXT4_MAX_PHYS_BLOCK) {
             kfree(idx_buf);
             return -1;
         }
@@ -509,7 +531,7 @@ retry:
             kfree(idx_buf);
             return -1;
         }
-        if (ext2_read_block(mnt, (uint32_t)leaf_phys, leaf_buf) != 0) {
+        if (ext2_read_block(mnt, leaf_phys, leaf_buf) != 0) {
             kfree(leaf_buf);
             kfree(idx_buf);
             return -1;
@@ -525,7 +547,7 @@ retry:
         int result = ext4_extent_insert_leaf_entry(
             leaf, (ext4_extent_t *)(leaf + 1), logical_block, phys_block, len);
         if (result == 0) {
-            result = ext4_extent_write_node(mnt, (uint32_t)leaf_phys, leaf_buf);
+            result = ext4_extent_write_node(mnt, leaf_phys, leaf_buf);
         } else if (result == 1) {
             /* Leaf is full. Split leaf into leaf and new_leaf */
             uint16_t total = leaf->eh_entries + 1;
@@ -547,7 +569,7 @@ retry:
             memcpy(&all[pos + 1], &old[pos],
                    (leaf->eh_entries - pos) * sizeof(*all));
 
-            uint32_t new_block = ext2_alloc_block_hint(mnt, (uint32_t)leaf_phys + 1);
+            uint64_t new_block = ext2_alloc_block_extent_hint(mnt, leaf_phys + 1);
             uint8_t *new_buf = new_block ? kcalloc(1, mnt->block_size) : NULL;
             if (!new_buf) {
                 if (new_block) ext2_free_block(mnt, new_block);
@@ -570,7 +592,7 @@ retry:
             new_hdr->eh_generation = leaf->eh_generation;
             memcpy(new_hdr + 1, &all[left_count], right_count * sizeof(*all));
 
-            result = ext4_extent_write_node(mnt, (uint32_t)leaf_phys, leaf);
+            result = ext4_extent_write_node(mnt, leaf_phys, leaf);
             if (result == 0)
                 result = ext4_extent_write_node(mnt, new_block, new_buf);
 
@@ -579,11 +601,11 @@ retry:
                     idx_hdr, (ext4_extent_idx_t *)(idx_hdr + 1),
                     all[left_count].ee_block, new_block);
                 if (result == 0) {
-                    result = ext4_extent_write_node(mnt, (uint32_t)idx_phys, idx_buf);
+                    result = ext4_extent_write_node(mnt, idx_phys, idx_buf);
                 } else if (result == 1) {
                     /* Intermediate index block is full. Split index block into root */
                     result = ext4_extent_split_index(
-                        mnt, inode, idx_hdr, (uint32_t)idx_phys,
+                        mnt, inode, idx_hdr, idx_phys,
                         all[left_count].ee_block, new_block);
                 }
             }
@@ -611,7 +633,7 @@ retry:
     if (!best)
         best = &idxs[0];
     uint64_t leaf_phys = ext4_idx_get_pblock(best);
-    if (!leaf_phys || leaf_phys > UINT32_MAX) {
+    if (!leaf_phys || leaf_phys > EXT4_MAX_PHYS_BLOCK) {
         return -1;
     }
 
@@ -619,7 +641,7 @@ retry:
     if (!buf) {
         return -1;
     }
-    if (ext2_read_block(mnt, (uint32_t)leaf_phys, buf) != 0) {
+    if (ext2_read_block(mnt, leaf_phys, buf) != 0) {
         kfree(buf);
         return -1;
     }
@@ -644,10 +666,10 @@ retry:
     int result = ext4_extent_insert_leaf_entry(
         leaf, (ext4_extent_t *)(leaf + 1), logical_block, phys_block, len);
     if (result == 0)
-        result = ext4_extent_write_node(mnt, (uint32_t)leaf_phys, buf);
+        result = ext4_extent_write_node(mnt, leaf_phys, buf);
     else if (result == 1)
         result = ext4_extent_split_leaf(mnt, inode, leaf,
-                                        (uint32_t)leaf_phys, logical_block,
+                                        leaf_phys, logical_block,
                                         phys_block, len);
     kfree(buf);
     return result;
@@ -674,9 +696,9 @@ int ext4_alloc_extent(ext2_mount_t *mnt, ext2_inode_t *inode,
     if (num_blocks > hole_blocks)
         num_blocks = hole_blocks;
 
-    uint32_t goal = 0;
+    uint64_t goal = 0;
     if (logical_block > 0) {
-        uint32_t prev_phys = ext4_get_block_num(mnt, inode, logical_block - 1);
+        uint64_t prev_phys = ext4_get_block_num(mnt, inode, logical_block - 1);
         if (prev_phys)
             goal = prev_phys + 1;
     }
@@ -691,7 +713,7 @@ int ext4_alloc_extent(ext2_mount_t *mnt, ext2_inode_t *inode,
      * boundary; the write loop will request the remaining blocks later. */
     uint32_t count = 0;
     int result = -1;
-    uint32_t first = ext2_alloc_run_hint(mnt, goal, num_blocks, &count);
+    uint64_t first = ext2_alloc_run_hint(mnt, goal, num_blocks, &count);
     if (!first)
         count = 0;
 
@@ -723,7 +745,7 @@ done:
         klog_uint64(fail_reason);
         if (fail_reason == 2) {
             klog_puts(" fs_free=");
-            klog_uint64(mnt->sb.s_free_blocks_count);
+            klog_uint64(mnt->free_blocks_count);
         }
         klog_puts("\n");
         for (uint32_t i = 0; i < count; i++)
@@ -758,10 +780,11 @@ static int ext4_extent_free_node(ext2_mount_t *mnt,
         for (uint16_t i = 0; i < hdr->eh_entries; i++) {
             uint16_t len = exts[i].ee_len & 0x7FFF;
             uint64_t phys = ext4_extent_get_pblock(&exts[i]);
-            if (phys > UINT32_MAX)
+            if (!phys || phys > EXT4_MAX_PHYS_BLOCK ||
+                (uint64_t)len - 1 > EXT4_MAX_PHYS_BLOCK - phys)
                 return -1;
             for (uint16_t block = 0; block < len; block++) {
-                if (ext2_free_block(mnt, (uint32_t)phys + block) != 0)
+                if (ext2_free_block(mnt, phys + block) != 0)
                     return -1;
             }
             ext4_extent_unaccount(mnt, inode, len);
@@ -777,14 +800,14 @@ static int ext4_extent_free_node(ext2_mount_t *mnt,
 
     for (uint16_t i = 0; i < hdr->eh_entries; i++) {
         uint64_t phys = ext4_idx_get_pblock(&idxs[i]);
-        if (!phys || phys > UINT32_MAX ||
-            ext2_read_block(mnt, (uint32_t)phys, buf) != 0) {
+        if (!phys || phys > EXT4_MAX_PHYS_BLOCK ||
+            ext2_read_block(mnt, phys, buf) != 0) {
             kfree(buf);
             return -1;
         }
         if (ext4_extent_free_node(mnt, (ext4_extent_header_t *)buf,
                                   inode) != 0 ||
-            ext2_free_block(mnt, (uint32_t)phys) != 0) {
+            ext2_free_block(mnt, phys) != 0) {
             kfree(buf);
             return -1;
         }
@@ -834,11 +857,12 @@ static int ext4_extent_trim_node(ext2_mount_t *mnt,
             }
 
             uint64_t phys = ext4_extent_get_pblock(ex);
-            if (phys > UINT32_MAX)
+            if (!phys || phys > EXT4_MAX_PHYS_BLOCK ||
+                (uint64_t)len - 1 > EXT4_MAX_PHYS_BLOCK - phys)
                 return -1;
             uint16_t free_count = len - free_from;
             for (uint16_t block = free_from; block < len; block++) {
-                if (ext2_free_block(mnt, (uint32_t)phys + block) != 0)
+                if (ext2_free_block(mnt, phys + block) != 0)
                     return -1;
             }
             ext4_extent_unaccount(mnt, inode, free_count);
@@ -864,8 +888,8 @@ static int ext4_extent_trim_node(ext2_mount_t *mnt,
     uint16_t index = 0;
     while (index < hdr->eh_entries) {
         uint64_t phys = ext4_idx_get_pblock(&idxs[index]);
-        if (!phys || phys > UINT32_MAX ||
-            ext2_read_block(mnt, (uint32_t)phys, buf) != 0) {
+        if (!phys || phys > EXT4_MAX_PHYS_BLOCK ||
+            ext2_read_block(mnt, phys, buf) != 0) {
             kfree(buf);
             return -1;
         }
@@ -877,7 +901,7 @@ static int ext4_extent_trim_node(ext2_mount_t *mnt,
         }
 
         if (!child->eh_entries) {
-            if (ext2_free_block(mnt, (uint32_t)phys) != 0) {
+            if (ext2_free_block(mnt, phys) != 0) {
                 kfree(buf);
                 return -1;
             }
@@ -890,7 +914,7 @@ static int ext4_extent_trim_node(ext2_mount_t *mnt,
         }
 
         idxs[index].ei_block = ext4_extent_first_logical(child);
-        if (ext4_extent_write_node(mnt, (uint32_t)phys, buf) != 0) {
+        if (ext4_extent_write_node(mnt, phys, buf) != 0) {
             kfree(buf);
             return -1;
         }
@@ -909,13 +933,13 @@ static int ext4_extent_collapse_root(ext2_mount_t *mnt,
 
     ext4_extent_idx_t *idx = (ext4_extent_idx_t *)(root + 1);
     uint64_t phys = ext4_idx_get_pblock(idx);
-    if (!phys || phys > UINT32_MAX)
+    if (!phys || phys > EXT4_MAX_PHYS_BLOCK)
         return -1;
 
     uint8_t *buf = kmalloc(mnt->block_size);
     if (!buf)
         return -1;
-    if (ext2_read_block(mnt, (uint32_t)phys, buf) != 0) {
+    if (ext2_read_block(mnt, phys, buf) != 0) {
         kfree(buf);
         return -1;
     }
@@ -938,7 +962,7 @@ static int ext4_extent_collapse_root(ext2_mount_t *mnt,
     root->eh_generation = generation;
     memcpy(root + 1, child + 1, entries * sizeof(ext4_extent_t));
 
-    int result = ext2_free_block(mnt, (uint32_t)phys);
+    int result = ext2_free_block(mnt, phys);
     if (result == 0)
         ext4_extent_unaccount(mnt, inode, 1);
     kfree(buf);
@@ -960,7 +984,7 @@ int ext4_extent_truncate(ext2_mount_t *mnt, ext2_inode_t *inode,
     uint32_t keep_blocks = (new_len + mnt->block_size - 1) / mnt->block_size;
     uint32_t tail = new_len % mnt->block_size;
     if (tail) {
-        uint32_t disk_block =
+        uint64_t disk_block =
             ext4_get_block_num(mnt, inode, keep_blocks - 1);
         if (disk_block) {
             uint8_t *buf = kmalloc(mnt->block_size);

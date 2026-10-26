@@ -24,12 +24,18 @@ prefix = r'''
 #define PCP_BATCH 32
 #define KLOG_CLR_RED ""
 #define KLOG_CLR_RESET ""
-typedef pthread_mutex_t spinlock_t;
-static void spinlock_init(spinlock_t *l) { pthread_mutex_init(l, NULL); }
-static void spinlock_acquire(spinlock_t *l) { pthread_mutex_lock(l); }
-static void spinlock_release(spinlock_t *l) { pthread_mutex_unlock(l); }
+typedef struct { volatile uint32_t locked; pthread_mutex_t mtx; } spinlock_t;
+static void spinlock_init(spinlock_t *l) { l->locked = 0; pthread_mutex_init(&l->mtx, NULL); }
+static void spinlock_acquire(spinlock_t *l) { pthread_mutex_lock(&l->mtx); l->locked = 1; }
+static void spinlock_release(spinlock_t *l) { l->locked = 0; pthread_mutex_unlock(&l->mtx); }
+static bool spinlock_is_locked(spinlock_t *l) { return __atomic_load_n(&l->locked, __ATOMIC_RELAXED) != 0; }
 struct buddy_zone { spinlock_t lock; };
-struct pcp_cache { void *pages[PCP_CAPACITY]; uint32_t count; spinlock_t lock; };
+struct pcp_cache { void *pages[PCP_CAPACITY]; uint32_t count; volatile uint32_t active; spinlock_t lock; };
+static bool pmm_sites_enabled __attribute__((unused)) = false;
+static void pmm_site_record_free(unsigned c, void *caller) __attribute__((unused));
+static void pmm_site_record_free(unsigned c, void *caller) { (void)c; (void)caller; }
+static void pmm_site_record_alloc(unsigned c, void *caller) __attribute__((unused));
+static void pmm_site_record_alloc(unsigned c, void *caller) { (void)c; (void)caller; }
 struct numa_node { struct buddy_zone zone; int fallback_order[2]; bool online; };
 struct cpu_info { unsigned cpu_id; };
 static struct cpu_info cpu;

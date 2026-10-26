@@ -234,7 +234,7 @@ void ap_main(void) {
      * fault paths pop zeroed frames instead of paying memset. */
     bool zero_refill = pmm_zero_pool_needs_refill();
     if (zero_refill)
-      pmm_zero_pool_refill(8);
+      pmm_zero_pool_refill(32);
     /* Slow tick at 2 s: lockdiag flags a CPU hung after 3 s
      * (LOCKDIAG_HUNG_CPU_MS), so 2 s still reports promptly while halving
      * idle wakeups vs the old 1 s. */

@@ -6,6 +6,7 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "mm/vmm_internal.h"
+#include "cpu/features.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -58,7 +59,59 @@ void test_page_ops(void) {
     pmm_free_page(p2_phys);
     return;
   }
-  klog_puts("  [PAGE_OPS] page_zero (NT & ERMS) 4KB byte-level verification passed\n");
+
+  // Correctness: page_zero_nt_batch
+  memset(page1, 0x3C, 4096);
+  memset(page2, 0xC3, 4096);
+  void *batch_pages[2] = { page1, page2 };
+  page_zero_nt_batch(batch_pages, 2);
+  for (size_t i = 0; i < 4096; i++) {
+    if (page1[i] != 0 || page2[i] != 0) {
+      zero_ok = false;
+      break;
+    }
+  }
+  if (!zero_ok) {
+    klog_puts(KLOG_CLR_RED "[FAIL] test_page_ops: page_zero_nt_batch failed to zero batch pages\n" KLOG_CLR_RESET);
+    pmm_free_page(p1_phys);
+    pmm_free_page(p2_phys);
+    return;
+  }
+
+  // Correctness: page_zero_avx2 & page_zero_avx2_batch
+  if (cpu_has_avx2()) {
+    memset(page1, 0x5A, 4096);
+    page_zero_avx2(page1);
+    for (size_t i = 0; i < 4096; i++) {
+      if (page1[i] != 0) {
+        zero_ok = false;
+        break;
+      }
+    }
+    if (!zero_ok) {
+      klog_puts(KLOG_CLR_RED "[FAIL] test_page_ops: page_zero_avx2 failed to zero entire 4KB page\n" KLOG_CLR_RESET);
+      pmm_free_page(p1_phys);
+      pmm_free_page(p2_phys);
+      return;
+    }
+
+    memset(page1, 0x3C, 4096);
+    memset(page2, 0xC3, 4096);
+    page_zero_avx2_batch(batch_pages, 2);
+    for (size_t i = 0; i < 4096; i++) {
+      if (page1[i] != 0 || page2[i] != 0) {
+        zero_ok = false;
+        break;
+      }
+    }
+    if (!zero_ok) {
+      klog_puts(KLOG_CLR_RED "[FAIL] test_page_ops: page_zero_avx2_batch failed to zero batch pages\n" KLOG_CLR_RESET);
+      pmm_free_page(p1_phys);
+      pmm_free_page(p2_phys);
+      return;
+    }
+  }
+  klog_puts("  [PAGE_OPS] page_zero (NT, ERMS, Batched NT & AVX2) 4KB byte-level verification passed\n");
 
   // 2. Correctness: page_copy_nt
   for (size_t i = 0; i < 4096; i++) {
@@ -127,6 +180,17 @@ void test_page_ops(void) {
   t1 = rdtsc();
   uint64_t memset_cycles = (t1 - t0) / iters;
 
+  // Benchmark page_zero_avx2
+  uint64_t zero_avx2_cycles = 0;
+  if (cpu_has_avx2()) {
+    t0 = rdtsc();
+    for (uint32_t i = 0; i < iters; i++) {
+      page_zero_avx2(page1);
+    }
+    t1 = rdtsc();
+    zero_avx2_cycles = (t1 - t0) / iters;
+  }
+
   // Benchmark page_copy_nt
   t0 = rdtsc();
   for (uint32_t i = 0; i < iters; i++) {
@@ -157,6 +221,10 @@ void test_page_ops(void) {
   klog_uint64(zero_erms_cycles);
   klog_puts(" cycles | memset: ");
   klog_uint64(memset_cycles);
+  if (cpu_has_avx2()) {
+    klog_puts(" cycles | avx2: ");
+    klog_uint64(zero_avx2_cycles);
+  }
   klog_puts(" cycles\n");
 
   klog_puts("  [BENCH] page_copy_nt: ");

@@ -55,6 +55,9 @@ void asc_radix_tree_init(struct radix_tree *tree);
 void asc_radix_tree_init_with_allocator(struct radix_tree *tree,
                                     const struct asc_radix_tree_allocator *allocator);
 void *asc_radix_tree_lookup(const struct radix_tree *tree, uint64_t index);
+void *asc_radix_tree_lookup_cached(const struct radix_tree *tree, uint64_t index,
+                                   uint64_t *cached_chunk, void **cached_leaf,
+                                   uint32_t *cached_seq);
 
 /* Lockless lookup for trees whose readers run inside an IRQ-off grace period
  * and whose frees are deferred through asc_radix_tree_set_deferred_free().
@@ -64,6 +67,16 @@ void *asc_radix_tree_lookup(const struct radix_tree *tree, uint64_t index);
  * return.  The tree's own lock is not taken. */
 void *asc_radix_tree_lookup_lockless(const struct radix_tree *tree,
                                      uint64_t index, bool *stable);
+
+/* Fast lockless lookup bypassing intermediate tree levels using a cached level-1 node.
+ * If *cached_chunk == (index >> RADIX_TREE_BITS) and *cached_leaf is valid, and the
+ * tree mutation sequence matches *cached_seq, loads the leaf slot directly in O(1).
+ * On miss or sequence change, falls back to full traversal and updates the cache. */
+void *asc_radix_tree_lookup_lockless_cached(const struct radix_tree *tree,
+                                             uint64_t index, bool *stable,
+                                             uint64_t *cached_chunk,
+                                             void **cached_leaf,
+                                             uint32_t *cached_seq);
 
 /* Route every node freed by mutations through `free_fn(node, context)`.
  * Set once after init, before the tree is shared.  The node's first two words

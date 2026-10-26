@@ -1,3 +1,4 @@
+#include "mm/zram.h"
 
 #include "../apic/lapic_timer.h"
 #include "../arch/x86_64/extable.h"
@@ -20,10 +21,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef PROT_NONE
 #define PROT_NONE 0x0
 #define PROT_READ 0x1
 #define PROT_WRITE 0x2
 #define PROT_EXEC 0x4
+#endif
 
 /* Bad user pointers can fault on several worker threads at once.  Printing an
  * entire VMA tree for each one floods and interleaves the serial log; keep a
@@ -322,6 +325,21 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
    * allocator reaches zero (see vmm_fault_watermark_reclaim()). */
   if (user_mode)
     vmm_fault_watermark_reclaim();
+
+  /* Swap faults must precede anonymous zero-fill/fault-around: a
+   * compressed non-present PTE is data, never an empty mapping. */
+  if (user_mode && zram_under_pressure()) {
+    bool irq_state = pf_enable_irqs_for_wait();
+    zram_balance();
+    pf_restore_irqs_after_wait(irq_state);
+  }
+  if (!present_bit) {
+    bool irq_state = pf_enable_irqs_for_wait();
+    int swapped = zram_fault(current->mm, target_cr3, cr2, write_fault, exec_fault);
+    pf_restore_irqs_after_wait(irq_state);
+    if (swapped > 0) return 0;
+    if (swapped < 0) return PF_REJECT("compressed swap fault failed", -swapped, cr2);
+  }
 
   if (present_bit && write_fault) {
     uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(target_cr3);
@@ -887,11 +905,26 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       vfs_page_t *cached = vfs_cache_lookup(node, file_offset);
       bool irq_state = pf_enable_irqs_for_wait();
       if (cached) {
-        vfs_cache_put(node, cached);
-      } else if (node && node->read && (node->flags & FS_TYPE_MASK) == FS_FILE) {
-        (void)vfs_cache_readahead(node, file_offset, 32 * 1024);
+        // Fast path: verify page is ready without redundant lookup cycle
+        bool ready = (!__atomic_load_n(&cached->loading, __ATOMIC_ACQUIRE) &&
+                      cached->uptodate && cached->frame_phys);
+        if (__builtin_expect(!ready, 0)) {
+          spinlock_acquire(&node->pages_lock);
+          ready = (!cached->loading && cached->uptodate && cached->frame_phys);
+          spinlock_release(&node->pages_lock);
+        }
+
+        if (!ready) {
+          vfs_cache_put(node, cached);
+          cached = vfs_cache_get_or_create(node, file_offset);
+        }
+      } else {
+        /* On-demand readahead: prefetch 128 KB window ahead of cold write/read fault */
+        if (node && node->read && (node->flags & FS_TYPE_MASK) == FS_FILE) {
+          (void)vfs_cache_readahead(node, file_offset, 128 * 1024);
+        }
+        cached = vfs_cache_get_or_create(node, file_offset);
       }
-      cached = vfs_cache_get_or_create(node, file_offset);
       pf_restore_irqs_after_wait(irq_state);
 
       if (!cached || !cached->frame_phys) {
@@ -913,7 +946,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
         refault_mapping = true;
       } else {
         // The page is about to be dirtied (or is the partial tail of the
-        // segment): take the private zero-filled copy now.
+        // segment): take the private copy now without redundant zeroing.
         frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
         if (!frame) {
           vfs_cache_put(node, cached);
@@ -921,21 +954,23 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
                            page_offset, eff_file_size);
         }
         void *priv_virt = PHYS_TO_VIRT((uint64_t)frame);
-        page_zero(priv_virt);
-
         uint32_t valid_bytes = 4096;
         if (page_offset + 4096 > eff_file_size)
           valid_bytes = (uint32_t)(eff_file_size - page_offset);
 
-        memcpy(priv_virt, PHYS_TO_VIRT(cached->frame_phys), valid_bytes);
+        if (valid_bytes == PAGE_SIZE) {
+          page_copy(priv_virt, PHYS_TO_VIRT(cached->frame_phys));
+        } else {
+          memcpy(priv_virt, PHYS_TO_VIRT(cached->frame_phys), valid_bytes);
+          memset((uint8_t *)priv_virt + valid_bytes, 0, PAGE_SIZE - valid_bytes);
+        }
       }
       vfs_cache_put(node, cached);
 
       // Map already-cached neighbours read-only + CoW so adjacent .data/.got
-      // pages do not each take a separate fault.
-      if (cow_mapping)
-        vmm_map_cow_cluster((uint64_t *)target_cr3, cr2, node, current->mm,
-                            vma_start, vma_end, vma_offset, eff_file_size);
+      // pages do not each take a separate fault (even on write faults).
+      vmm_map_cow_cluster((uint64_t *)target_cr3, cr2, node, current->mm,
+                          vma_start, vma_end, vma_offset, eff_file_size);
     } else {
       // 3. Shared or Read-Only file mapping (e.g. ELF .text / .rodata)
       //    Use shared VFS page-cache frame directly.
@@ -944,20 +979,22 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       bool irq_state = pf_enable_irqs_for_wait();
       if (cached) {
         // Fast path: verify page is ready without redundant lookup cycle
-        bool ready = false;
-        spinlock_acquire(&node->pages_lock);
-        if (!cached->loading && cached->uptodate && cached->frame_phys)
-          ready = true;
-        spinlock_release(&node->pages_lock);
+        bool ready = (!__atomic_load_n(&cached->loading, __ATOMIC_ACQUIRE) &&
+                      cached->uptodate && cached->frame_phys);
+        if (__builtin_expect(!ready, 0)) {
+          spinlock_acquire(&node->pages_lock);
+          ready = (!cached->loading && cached->uptodate && cached->frame_phys);
+          spinlock_release(&node->pages_lock);
+        }
 
         if (!ready) {
           vfs_cache_put(node, cached);
           cached = vfs_cache_get_or_create(node, file_offset);
         }
       } else {
-        /* On-demand readahead: prefetch 32 KB window ahead of cold execution/read fault */
+        /* On-demand readahead: prefetch 128 KB window ahead of cold execution/read fault */
         if (node && node->read && (node->flags & FS_TYPE_MASK) == FS_FILE) {
-          (void)vfs_cache_readahead(node, file_offset, 32 * 1024);
+          (void)vfs_cache_readahead(node, file_offset, 128 * 1024);
         }
         cached = vfs_cache_get_or_create(node, file_offset);
       }
@@ -979,7 +1016,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
               (node && node->name[0]) ? node->name : "?",
               (current && current->comm[0]) ? current->comm : "?",
               current ? current->tid : 0,
-              regs ? regs->rip : 0);
+              (unsigned long long)(regs ? regs->rip : 0));
         return PF_REJECT("shared/read-only file mapping: page cache could not "
                          "supply the page", file_offset, page_offset);
       }

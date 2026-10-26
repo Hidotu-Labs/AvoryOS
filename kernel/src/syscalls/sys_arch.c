@@ -1,3 +1,4 @@
+#include "mm/zram.h"
 // Architecture Syscalls: arch_prctl
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
@@ -355,8 +356,8 @@ static uint64_t sys_mlock(uint64_t addr, uint64_t len, uint64_t a2, uint64_t a3,
   (void)a3;
   (void)a4;
   (void)a5;
-  // Stub: pretend we locked the memory
-  return 0;
+  // No page-pinning ABI exists yet: never promise locked pages to swap users.
+  return zram_is_enabled() ? (uint64_t)-95 : 0;
 }
 
 static uint64_t sys_munlock(uint64_t addr, uint64_t len, uint64_t a2,
@@ -379,8 +380,8 @@ static uint64_t sys_mlockall(uint64_t flags, uint64_t a1, uint64_t a2,
   (void)a3;
   (void)a4;
   (void)a5;
-  // Stub: pretend we locked all memory
-  return 0;
+  // Memory pinning is not implemented.
+  return zram_is_enabled() ? (uint64_t)-95 : 0;
 }
 
 static uint64_t sys_munlockall(uint64_t a0, uint64_t a1, uint64_t a2,
@@ -403,8 +404,8 @@ static uint64_t sys_mlock2(uint64_t addr, uint64_t len, uint64_t flags,
   (void)a3;
   (void)a4;
   (void)a5;
-  // Stub: pretend we locked the memory with flags
-  return 0;
+  // Memory pinning is not implemented.
+  return zram_is_enabled() ? (uint64_t)-95 : 0;
 }
 
 // membarrier(cmd, flags, cpu_id) - syscall 324

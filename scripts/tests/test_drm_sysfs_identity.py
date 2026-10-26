@@ -49,32 +49,38 @@ static void asc_sysfs_remove(void *opaque,const char *name) {
 checks = r'''
 int main(void) {
   vfs_node_t *class_dir=make("/sys/class/drm");
-  make("/sys/dev/char"); make("/sys/devices/virtual");
+  make("/sys/dev/char"); make("/sys/devices"); make("/sys/bus");
   make("/sys/bus/pci/devices/0000:01:00.0");
   make("/sys/bus/pci/devices/0000:03:00.0");
-  vfs_node_t *render=asc_sysfs_drm_minor_add(class_dir,"renderD131","0000:01:00.0",226,131);
+  vfs_node_t *render=asc_sysfs_drm_minor_add(class_dir,"renderD131","0000:01:00.0",NULL,NULL,226,131);
   assert(render);
   assert(!strcmp(asc_sysfs_dir_by_path("/sys/class/drm/renderD131")->value,
                  "/sys/bus/pci/devices/0000:01:00.0/drm/renderD131"));
   assert(!strcmp(asc_sysfs_dir_by_path("/sys/bus/pci/devices/0000:01:00.0/drm/renderD131/device")->value,
                  "/sys/bus/pci/devices/0000:01:00.0"));
-  assert(asc_sysfs_drm_minor_add(class_dir,"card7","0000:01:00.0",226,7));
-  assert(asc_sysfs_drm_minor_add(class_dir,"card2","0000:03:00.0",226,2));
-  assert(asc_sysfs_drm_minor_add(class_dir,"renderD128",NULL,226,128));
-  assert(!asc_sysfs_dir_by_path("/sys/devices/virtual/drm/renderD128/device"));
+  assert(asc_sysfs_drm_minor_add(class_dir,"card7","0000:01:00.0",NULL,NULL,226,7));
+  assert(asc_sysfs_drm_minor_add(class_dir,"card2","0000:03:00.0",NULL,NULL,226,2));
+  assert(asc_sysfs_drm_minor_add(class_dir,"renderD128",NULL,"faux","vgem",226,128));
+  assert(asc_sysfs_dir_by_path("/sys/devices/faux/vgem/drm/renderD128/device"));
   assert(!strcmp(asc_sysfs_dir_by_path("/sys/dev/char/226:128")->value,
-                 "/sys/devices/virtual/drm/renderD128"));
-  assert(!asc_sysfs_drm_minor_add(class_dir,"card9","0000:09:00.0",226,9));
-  asc_sysfs_drm_minor_remove(class_dir,"renderD131","0000:01:00.0",226,131);
+                 "/sys/devices/faux/vgem/drm/renderD128"));
+  assert(!asc_sysfs_drm_minor_add(class_dir,"card9","0000:09:00.0",NULL,NULL,226,9));
+  asc_sysfs_drm_minor_remove(class_dir,"renderD131","0000:01:00.0",NULL,NULL,226,131);
   assert(!asc_sysfs_dir_by_path("/sys/class/drm/renderD131"));
   assert(!asc_sysfs_dir_by_path("/sys/class/drm/devices/renderD131"));
   assert(!asc_sysfs_dir_by_path("/sys/dev/char/226:131"));
   assert(!asc_sysfs_dir_by_path("/sys/bus/pci/devices/0000:01:00.0/drm/renderD131"));
   assert(asc_sysfs_dir_by_path("/sys/bus/pci/devices/0000:01:00.0/drm/card7"));
   assert(asc_sysfs_dir_by_path("/sys/bus/pci/devices/0000:03:00.0/drm/card2"));
-  assert(asc_sysfs_drm_minor_add(class_dir,"renderD131","0000:03:00.0",226,131));
+  assert(asc_sysfs_drm_minor_add(class_dir,"renderD131","0000:03:00.0",NULL,NULL,226,131));
   assert(!strcmp(asc_sysfs_dir_by_path("/sys/dev/char/226:131")->value,
                  "/sys/bus/pci/devices/0000:03:00.0/drm/renderD131"));
+  make("/sys/bus/pci/devices/0000:00:06.0");
+  assert(asc_sysfs_drm_minor_add(class_dir,"renderD137","0000:00:06.0",NULL,NULL,226,137));
+  assert(!strcmp(asc_sysfs_dir_by_path("/sys/dev/char/226:137")->value,
+                 "/sys/bus/pci/devices/0000:00:06.0/drm/renderD137"));
+  assert(!strcmp(asc_sysfs_dir_by_path("/sys/bus/pci/devices/0000:00:06.0/drm/renderD137/device")->value,
+                 "/sys/bus/pci/devices/0000:00:06.0"));
   puts("PASS: actual PCI parent, shuffled minors, virtual identity, removal and reassignment");
 }
 '''

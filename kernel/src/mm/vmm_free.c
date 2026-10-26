@@ -1,3 +1,4 @@
+#include "mm/zram.h"
 #include "vmm.h"
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
@@ -72,6 +73,11 @@ void vmm_free_user_pages(uint64_t cr3) {
 
         uint64_t vdso_phys = vmm_get_vsyscall_page_phys();
         for (size_t l = 0; l < 512; l++) {
+          if (zram_pte_slot(pt_virt[l])) {
+            zram_slot_put(zram_pte_slot(pt_virt[l]));
+            pt_virt[l] = 0;
+            continue;
+          }
           if (pt_virt[l] & PAGE_FLAG_PRESENT) {
             uint64_t frame = pt_virt[l] & PAGE_MASK;
             if (frame != vdso_phys)
@@ -151,6 +157,11 @@ void vmm_free_user_pages_vma(uint64_t cr3, struct vma_list *vmas) {
         uint64_t *pt_virt = (uint64_t *)(hhdm + pt_phys);
 
         for (size_t l = 0; l < 512; l++) {
+          if (zram_pte_slot(pt_virt[l])) {
+            zram_slot_put(zram_pte_slot(pt_virt[l]));
+            pt_virt[l] = 0;
+            continue;
+          }
           if (!(pt_virt[l] & PAGE_FLAG_PRESENT))
             continue;
 

@@ -69,6 +69,8 @@ static bool reverse_complete;
 static uint64_t clock_ms;
 static uint64_t lapic_timer_get_ms(void){return clock_ms++;}
 static uint64_t lapic_timer_get_ticks(void){return clock_ms;}
+static unsigned gpu_render_pending;
+static bool handle_render_completion(void *cookie,uint32_t used){(void)cookie;(void)used;return false;}
 static bool handle_async_completion(void *cookie,uint32_t used){(void)cookie;(void)used;return false;}
 static void init_hdr(struct virtio_gpu_ctrl_hdr *h,uint32_t t){memset(h,0,sizeof *h);h->type=t;}
 static void verify_owned(void){
@@ -84,7 +86,8 @@ static int submit(struct queue *q,const struct virtq_iov *out,unsigned no,const 
 #define virtq_submit_deferred submit
 static void virtq_kick(struct queue *q){(void)q;assert(gpu_poll_lock);kicks++;}
 static bool virtq_poll_complete(struct queue *q,void **cookie,uint32_t *used){
- (void)q;assert(gpu_poll_lock);verify_owned();if(!nr || !ready)return false;
+ (void)q;assert(gpu_poll_lock);verify_owned();
+ if(!nr || !ready)return false;
  unsigned index=reverse_complete?nr-1:0;
  struct pending p=pending[index];--nr;
  memmove(pending+index,pending+index+1,(nr-index)*sizeof *pending);ready--;

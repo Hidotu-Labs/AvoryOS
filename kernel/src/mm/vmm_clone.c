@@ -1,3 +1,4 @@
+#include "mm/zram.h"
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
 #include "../fs/vfs.h"
@@ -23,6 +24,11 @@ static uint64_t *clone_table(uint64_t *src_table_phys, int level, size_t start,
     new_virt[i] = 0;
 
   for (size_t i = start; i < end; i++) {
+    if (level == 1 && zram_pte_slot(src_virt[i])) {
+      if (!zram_slot_get(zram_pte_slot(src_virt[i]))) return NULL;
+      new_virt[i] = src_virt[i];
+      continue;
+    }
     if (!(src_virt[i] & PAGE_FLAG_PRESENT))
       continue;
     if (!(src_virt[i] & PAGE_FLAG_USER))
@@ -147,6 +153,13 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
   uint64_t *src_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)src_table_phys);
 
   for (size_t i = start; i < end; i++) {
+    if (level == 1 && zram_pte_slot(src_virt[i])) {
+      if (!clone_alloc_table(new_table_out)) return false;
+      new_virt = PHYS_TO_VIRT((uint64_t)*new_table_out);
+      if (!zram_slot_get(zram_pte_slot(src_virt[i]))) return false;
+      new_virt[i] = src_virt[i];
+      continue;
+    }
     if (!(src_virt[i] & PAGE_FLAG_PRESENT))
       continue;
     if (!(src_virt[i] & PAGE_FLAG_USER))

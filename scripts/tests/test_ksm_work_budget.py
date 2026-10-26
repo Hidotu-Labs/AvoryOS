@@ -52,7 +52,10 @@ int main(void) {
  }
  mm.vmas.root=many;assert(!ksm_scan_pass());
  assert(mm.ksm_scan_cursor==KSM_MM_WORK_BUDGET*PAGE_SIZE);
- assert(!ksm_scan_pass() && mm.ksm_scan_cursor==0);
+ for(unsigned n=2;n<=(300+KSM_MM_WORK_BUDGET-1)/KSM_MM_WORK_BUDGET;n++) {
+  assert(!ksm_scan_pass());
+  assert(mm.ksm_scan_cursor==(n*KSM_MM_WORK_BUDGET>=300?0:n*KSM_MM_WORK_BUDGET*PAGE_SIZE));
+ }
  free(ksm_node_pool);
  puts("PASS: one background daemon, bounded sparse/VMA work, cursor progress/wrap, safe empty batches");
 }

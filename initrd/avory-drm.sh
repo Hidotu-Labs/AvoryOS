@@ -7,6 +7,9 @@ EOF
         if [ -z "${KWIN_DRM_DEVICES:-}" ]; then
             export KWIN_DRM_DEVICES="$_avory_cards"
         fi
+        if [ -z "${WLR_DRM_DEVICES:-}" ]; then
+            export WLR_DRM_DEVICES="$_avory_cards"
+        fi
         if [ "${KWIN_RENDER_NODES+x}" != x ] && [ "$_avory_render" != - ]; then
             export KWIN_RENDER_NODES="$_avory_render"
         fi

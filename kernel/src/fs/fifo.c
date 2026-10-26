@@ -1,7 +1,6 @@
 // fifo.c — POSIX Named Pipe (FIFO) Implementation for AvoryOS
 
 #include "fifo.h"
-#include "ramfs.h"
 #include "vfs.h"
 #include "../mm/heap.h"
 #include "../mm/vmm.h"
@@ -15,21 +14,23 @@
 #include "../lib/string.h"
 
 #define FIFO_MAX_BUFFER 65536
+#define FIFO_BUF_MASK   (FIFO_MAX_BUFFER - 1)
 
 typedef struct fifo_ctx {
-    ramfs_file_t ramfs;
+    uint8_t     *buffer;
     wait_queue_t data_wq; // Readers/writers waiting for data/buffer space
     wait_queue_t open_wq; // Waiting for peer in open()
     spinlock_t   lock;
-    uint32_t length;
-    uint32_t read_offset;
-    uint32_t readers;
-    uint32_t writers;
-    uint32_t total_readers;
-    uint32_t total_writers;
-    uint32_t refcount;
-    vfs_node_t *read_node; // For epoll notifications
-    vfs_node_t *write_node; // For epoll notifications
+    uint32_t     head;
+    uint32_t     tail;
+    uint32_t     count;
+    uint32_t     readers;
+    uint32_t     writers;
+    uint32_t     total_readers;
+    uint32_t     total_writers;
+    uint32_t     refcount;
+    vfs_node_t  *read_node; // For epoll notifications
+    vfs_node_t  *write_node; // For epoll notifications
 } fifo_ctx_t;
 
 typedef struct {
@@ -48,7 +49,7 @@ static uint32_t fifo_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint
     fifo_ctx_t *fifo = end->fifo;
 
     spinlock_acquire(&fifo->lock);
-    while (fifo->read_offset >= fifo->length) {
+    while (fifo->count == 0) {
         struct thread *t = sched_get_current();
         int fd = -1;
         if (t) {
@@ -73,7 +74,7 @@ static uint32_t fifo_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint
         wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
         t->state = THREAD_BLOCKED;
         wait_queue_add(&fifo->data_wq, &entry);
-        if (fifo->read_offset < fifo->length || fifo->writers == 0) {
+        if (fifo->count > 0 || fifo->writers == 0) {
             t->state = THREAD_RUNNING;
             spinlock_release(&fifo->lock);
             wait_queue_remove(&fifo->data_wq, &entry);
@@ -88,28 +89,38 @@ static uint32_t fifo_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint
         spinlock_acquire(&fifo->lock);
     }
 
-    vfs_node_t storage = {0};
-    storage.flags = FS_PIPE;
-    storage.device = &fifo->ramfs;
-    storage.length = fifo->length;
-    int32_t ret = (int32_t)ramfs_read(&storage, fifo->read_offset, size, buffer);
-    vfs_node_t *wnode = NULL;
-    if (ret > 0) {
-        fifo->read_offset += (uint32_t)ret;
-        if (fifo->read_offset >= fifo->length) {
-            fifo->read_offset = 0;
-            fifo->length = 0;
-            if (fifo->writers == 0 || fifo->ramfs.data_is_pmm || fifo->ramfs.capacity > 4096) {
-                ramfs_free_file_data(&fifo->ramfs);
-            }
-        }
-        wnode = fifo->writers > 0 ? fifo->write_node : NULL;
-        wait_queue_wake_all(&fifo->data_wq);
+    /* O(1) contiguous block read from circular ring buffer */
+    uint32_t to_read = size < fifo->count ? size : fifo->count;
+    uint32_t first_chunk = FIFO_MAX_BUFFER - fifo->tail;
+    if (first_chunk > to_read)
+        first_chunk = to_read;
+
+    memcpy(buffer, fifo->buffer + fifo->tail, first_chunk);
+    uint32_t second_chunk = to_read - first_chunk;
+    if (second_chunk > 0) {
+        memcpy(buffer + first_chunk, fifo->buffer, second_chunk);
     }
+
+    fifo->tail = (fifo->tail + to_read) & FIFO_BUF_MASK;
+    fifo->count -= to_read;
+
+    if (fifo->count == 0) {
+        fifo->head = 0;
+        fifo->tail = 0;
+        if (fifo->writers == 0 && fifo->buffer) {
+            kfree(fifo->buffer);
+            fifo->buffer = NULL;
+        }
+    }
+
+    vfs_node_t *wnode = fifo->writers > 0 ? fifo->write_node : NULL;
+    if (__builtin_expect(fifo->data_wq.head != NULL, 0))
+        wait_queue_wake_all(&fifo->data_wq);
     spinlock_release(&fifo->lock);
+
     if (wnode)
         epoll_notify_event(wnode, POLLOUT | POLLWRNORM);
-    return (uint32_t)ret;
+    return to_read;
 }
 
 static uint32_t fifo_write(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
@@ -130,7 +141,7 @@ static uint32_t fifo_write(vfs_node_t *node, uint32_t offset, uint32_t size, uin
     }
 
     // Handle buffer capacity limits
-    while ((fifo->length - fifo->read_offset) >= FIFO_MAX_BUFFER) {
+    while (fifo->count >= FIFO_MAX_BUFFER) {
         struct thread *t = sched_get_current();
         int fd = -1;
         if (t) {
@@ -155,7 +166,7 @@ static uint32_t fifo_write(vfs_node_t *node, uint32_t offset, uint32_t size, uin
         wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
         t->state = THREAD_BLOCKED;
         wait_queue_add(&fifo->data_wq, &entry);
-        if ((fifo->length - fifo->read_offset) < FIFO_MAX_BUFFER || fifo->readers == 0) {
+        if (fifo->count < FIFO_MAX_BUFFER || fifo->readers == 0) {
             t->state = THREAD_RUNNING;
             spinlock_release(&fifo->lock);
             wait_queue_remove(&fifo->data_wq, &entry);
@@ -170,35 +181,42 @@ static uint32_t fifo_write(vfs_node_t *node, uint32_t offset, uint32_t size, uin
         spinlock_acquire(&fifo->lock);
     }
 
-    // Compact unread data to offset 0
-    if (fifo->read_offset > 0) {
-        uint32_t unread = fifo->length - fifo->read_offset;
-        if (unread > 0 && fifo->ramfs.data) {
-            memmove(fifo->ramfs.data, fifo->ramfs.data + fifo->read_offset, unread);
+    if (!fifo->buffer) {
+        fifo->buffer = kmalloc(FIFO_MAX_BUFFER);
+        if (!fifo->buffer) {
+            spinlock_release(&fifo->lock);
+            return (uint32_t)-12; // ENOMEM
         }
-        fifo->length = unread;
-        fifo->read_offset = 0;
-        if (unread == 0 && (fifo->ramfs.data_is_pmm || fifo->ramfs.capacity > 4096)) {
-            ramfs_free_file_data(&fifo->ramfs);
-        }
+        fifo->head = 0;
+        fifo->tail = 0;
+        fifo->count = 0;
     }
 
-    vfs_node_t storage = {0};
-    storage.flags = FS_PIPE;
-    storage.device = &fifo->ramfs;
-    storage.length = fifo->length;
-    int32_t ret = (int32_t)ramfs_write(&storage, fifo->length, size, buffer);
-    if (ret > 0) {
-        fifo->length = storage.length;
-        vfs_node_t *rnode = fifo->readers > 0 ? fifo->read_node : NULL;
-        spinlock_release(&fifo->lock);
-        wait_queue_wake_all(&fifo->data_wq);
-        if (rnode)
-            epoll_notify_event(rnode, POLLIN | POLLRDNORM);
-        return (uint32_t)ret;
+    /* O(1) contiguous block write into circular ring buffer */
+    uint32_t avail = FIFO_MAX_BUFFER - fifo->count;
+    uint32_t to_write = size < avail ? size : avail;
+
+    uint32_t first_chunk = FIFO_MAX_BUFFER - fifo->head;
+    if (first_chunk > to_write)
+        first_chunk = to_write;
+
+    memcpy(fifo->buffer + fifo->head, buffer, first_chunk);
+    uint32_t second_chunk = to_write - first_chunk;
+    if (second_chunk > 0) {
+        memcpy(fifo->buffer, buffer + first_chunk, second_chunk);
     }
+
+    fifo->head = (fifo->head + to_write) & FIFO_BUF_MASK;
+    fifo->count += to_write;
+
+    vfs_node_t *rnode = fifo->readers > 0 ? fifo->read_node : NULL;
+    if (__builtin_expect(fifo->data_wq.head != NULL, 0))
+        wait_queue_wake_all(&fifo->data_wq);
     spinlock_release(&fifo->lock);
-    return ret < 0 ? (uint32_t)ret : (uint32_t)-28; // -ENOSPC (never 0)
+
+    if (rnode)
+        epoll_notify_event(rnode, POLLIN | POLLRDNORM);
+    return to_write;
 }
 
 static int fifo_poll(vfs_node_t *node, int events) {
@@ -209,7 +227,7 @@ static int fifo_poll(vfs_node_t *node, int events) {
 
     spinlock_acquire(&fifo->lock);
     if (end->is_reader) {
-        if (fifo->length > fifo->read_offset) revents |= (POLLIN | POLLRDNORM);
+        if (fifo->count > 0) revents |= (POLLIN | POLLRDNORM);
         if (fifo->writers == 0) revents |= (POLLIN | POLLRDNORM | POLLHUP);
     }
     if (end->is_writer) {
@@ -217,9 +235,8 @@ static int fifo_poll(vfs_node_t *node, int events) {
         // Linux reports POLLOUT only while at least one byte fits; always-ready
         // POLLOUT on a full 64KB FIFO makes level-triggered epoll_wait return
         // immediately forever (wireplumber 100% CPU).
-        if (fifo->readers > 0 &&
-            (fifo->length - fifo->read_offset) < FIFO_MAX_BUFFER)
-          revents |= (POLLOUT | POLLWRNORM);
+        if (fifo->readers > 0 && fifo->count < FIFO_MAX_BUFFER)
+            revents |= (POLLOUT | POLLWRNORM);
     }
     spinlock_release(&fifo->lock);
 
@@ -238,10 +255,7 @@ static int fifo_ioctl(vfs_node_t *node, uint32_t request, uint64_t arg) {
             return -14; // EFAULT
         }
         spinlock_acquire(&fifo->lock);
-        int unread = 0;
-        if (fifo->length > fifo->read_offset) {
-            unread = (int)(fifo->length - fifo->read_offset);
-        }
+        int unread = (int)fifo->count;
         spinlock_release(&fifo->lock);
         *out = unread;
         return 0;
@@ -292,13 +306,19 @@ static void fifo_close(vfs_node_t *node) {
         }
         wait_queue_wake_all(&fifo->data_wq);
         wait_queue_wake_all(&fifo->open_wq);
-        if (fifo->writers == 0 && fifo->length == 0 && fifo->ramfs.data) {
-            fifo->read_offset = 0;
-            ramfs_free_file_data(&fifo->ramfs);
+        if (fifo->writers == 0 && fifo->count == 0 && fifo->buffer) {
+            kfree(fifo->buffer);
+            fifo->buffer = NULL;
+            fifo->head = 0;
+            fifo->tail = 0;
         } else if (fifo->readers == 0 && fifo->writers == 0) {
-            fifo->read_offset = 0;
-            fifo->length = 0;
-            ramfs_free_file_data(&fifo->ramfs);
+            if (fifo->buffer) {
+                kfree(fifo->buffer);
+                fifo->buffer = NULL;
+            }
+            fifo->head = 0;
+            fifo->tail = 0;
+            fifo->count = 0;
         }
         spinlock_release(&fifo->lock);
 
@@ -312,7 +332,8 @@ static void fifo_close(vfs_node_t *node) {
         spinlock_release(&fifo_init_lock);
 
         if (free_ctx) {
-            ramfs_free_file_data(&fifo->ramfs);
+            if (fifo->buffer)
+                kfree(fifo->buffer);
             kfree(fifo);
         }
     }
@@ -335,7 +356,8 @@ void fifo_destroy(vfs_node_t *node) {
     spinlock_release(&fifo_init_lock);
 
     if (free_ctx) {
-        ramfs_free_file_data(&fifo->ramfs);
+        if (fifo->buffer)
+            kfree(fifo->buffer);
         kfree(fifo);
     }
 }

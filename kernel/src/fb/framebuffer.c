@@ -129,8 +129,22 @@ static int console_dev_poll(struct vfs_node *node, int events) {
 }
 
 static int console_dev_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) {
-    (void)node;
     switch (cmd) {
+    case 0x540E: { // TIOCSCTTY — attach the session's virtual console
+        struct thread *t = sched_get_current();
+        if (!t)
+            return -3; // ESRCH
+        if (t->sid != t->tgid || (t->ctty && t->ctty != node))
+            return -1; // EPERM: requires a session leader without another ctty
+        t->ctty = node;
+        return 0;
+    }
+    case 0x5422: { // TIOCNOTTY — detach this controlling console
+        struct thread *t = sched_get_current();
+        if (t && t->ctty == node)
+            t->ctty = NULL;
+        return 0;
+    }
     case 0x5413: { // TIOCGWINSZ
         struct winsize *ws = (struct winsize *)arg;
         if (!ws || !vmm_is_user_addr_range_valid(arg, sizeof(struct winsize)))

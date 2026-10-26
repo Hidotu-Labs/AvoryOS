@@ -14,6 +14,10 @@ pre = r'''
 #include <stdio.h>
 #include <string.h>
 #include <setjmp.h>
+typedef unsigned hal_irq_state_t;
+static bool irq_disabled;
+static hal_irq_state_t hal_irq_save(void){unsigned old=irq_disabled;irq_disabled=true;return old;}
+static void hal_irq_restore(hal_irq_state_t old){irq_disabled=old;}
 #define VIRTIO_GPU_MAX_SCANOUTS 16
 #define THREAD_BLOCKED 1
 #define THREAD_RUNNING 2
@@ -36,7 +40,15 @@ static struct { struct drm_framebuffer framebuffer; struct drm_file *file; struc
  unsigned crtc,head; uint64_t cookie; bool event; } gpu_async_flip;
 static struct thread thread;
 static struct vgpu_scanout_image image;
-static int cpu,events,begins,fail_publish,closed;
+static int cpu,events,begins,fail_publish,closed,readback_error;
+static bool reenter;
+static struct drm_gem_object next_object;
+static struct drm_framebuffer next_framebuffer;
+static struct vfs_node next_node;
+static int virtio_gpu_submit_flip(struct drm_file *,struct vfs_node *,unsigned,struct drm_framebuffer *,uint64_t,bool);
+struct virtio_gpu_rect {unsigned x,y,width,height;};
+static unsigned virtio_gpu_virgl_resource_id(struct drm_gem_object *o){assert(o->refs>0 && !cpu && !irq_disabled);return readback_error?1:0;}
+static bool virtio_gpu_present_virgl(unsigned head,struct drm_framebuffer *fb,const struct virtio_gpu_rect *view){(void)head;(void)fb;(void)view;assert(readback_error);return false;}
 static jmp_buf finished;
 static unsigned ascentdrm_crtc_scanout_id(unsigned crtc) { assert(crtc==7); return 0; }
 static bool vgpu_scanout_source_valid(const struct vgpu_scanout_source *s) { return s->width && s->height; }
@@ -52,7 +64,7 @@ static void gpu_scanout_acquire(void) { assert(!cpu); }
 static void gpu_scanout_release(void) { assert(!cpu); }
 static struct vgpu_scanout_image *vgpu_scanout_prepare(int *h,int *ops,unsigned head,unsigned w,unsigned height) {
  (void)h;(void)ops;assert(!head && w==4 && height==4);return &image; }
-static int ascentdrm_gem_begin_cpu(struct drm_gem_object *o) { assert(o->refs>0 && !cpu && !closed);cpu=1;begins++;return 0; }
+static int ascentdrm_gem_begin_cpu(struct drm_gem_object *o) { assert(o->refs>0 && !cpu);cpu=1;begins++;return 0; }
 static bool vgpu_scanout_copy(struct vgpu_scanout_image *i,const struct vgpu_scanout_source *s) { assert(i==&image && s->width==4 && cpu);return true; }
 static void ascentdrm_gem_end_cpu(struct drm_gem_object *o) { (void)o;assert(cpu);cpu=0; }
 static bool vgpu_scanout_publish(int *h,int *ops,unsigned head,struct vgpu_scanout_image *i) {
@@ -61,7 +73,13 @@ static void vblank_wait_next(void) { assert(!cpu); }
 static unsigned vblank_sequence(void) { return 42; }
 static void vblank_timestamp(unsigned seq,unsigned *sec,unsigned *usec) { assert(seq==42);*sec=3;*usec=456; }
 static void ascentdrm_file_send_event(struct drm_file *f,struct drm_event_vblank *e,struct vfs_node *n) {
- (void)f;assert(n->refs==1 && !closed && e->user_data==123 && e->sequence==42 && e->crtc_id==7);events++; }
+ (void)f;assert(n->refs==1 && !closed && e->user_data==123 && e->sequence==42 && e->crtc_id==7);events++;
+ if(reenter){reenter=false;next_object=(struct drm_gem_object){.size=64,.refs=1};next_node=(struct vfs_node){.refs=1};
+ next_framebuffer=(struct drm_framebuffer){.gem_obj=&next_object,.width=4,.height=4,.pitch=16,.bpp=32};
+ assert(virtio_gpu_submit_flip(f,&next_node,7,&next_framebuffer,456,false)==0);
+ next_object.refs--;next_node.refs--;
+ }
+ }
 static bool ascentdrm_gem_put_last(struct drm_gem_object *o) { return --o->refs==0; }
 static void ascentdrm_gem_object_free(struct drm_device *d,struct drm_gem_object *o) { (void)d;assert(!o->refs); }
 static void vfs_close(struct vfs_node *n) { assert(n->refs>0);if (!--n->refs)closed++; }
@@ -70,14 +88,14 @@ static void klog_puts(const char *s) { (void)s;assert(fail_publish); }
 post = r'''
 int main(void) {
  static int scenario;
- for (scenario=0;scenario<3;scenario++) {
+ for (scenario=0;scenario<5;scenario++) {
   static struct drm_device dev;static struct drm_file file;static struct vfs_node node;
   static struct drm_gem_object object;static struct drm_framebuffer framebuffer;
   file=(struct drm_file){.dev=&dev};node=(struct vfs_node){.refs=1};
   object=(struct drm_gem_object){.size=64,.refs=1};
   framebuffer=(struct drm_framebuffer){.gem_obj=&object,.width=4,.height=4,.pitch=16,.bpp=32};
   gpu.num_scanouts=1;gpu_flip_worker_started=true;gpu_async_flip_state=0;
-  cpu=events=begins=closed=0;fail_publish=scenario==2;
+  cpu=events=begins=closed=0;fail_publish=scenario==2||scenario==3;reenter=scenario==4;readback_error=scenario==3?-5:0;
   assert(!virtio_gpu_submit_flip(&file,&node,7,&framebuffer,123,scenario!=1));
   assert(!begins && !events && object.refs==2 && node.refs==2);
   assert(virtio_gpu_submit_flip(&file,&node,7,&framebuffer,456,true)==-16);
@@ -85,9 +103,10 @@ int main(void) {
   vfs_close(&node);assert(node.refs==1 && !closed);
   object.refs--;memset(&framebuffer,0,sizeof framebuffer);
   if (!setjmp(finished)) virtio_gpu_flip_worker();
-  assert(events==(scenario==0) && begins==1 && !object.refs && closed==1 && !gpu_async_flip_state);
+  assert(events==(scenario==0||scenario==4) && begins==(scenario==3?0:scenario==4?2:1) && !object.refs && closed==(scenario==4?2:1) && !gpu_async_flip_state);
+  if(scenario==4)assert(!next_object.refs&&!next_node.refs);
  }
- puts("PASS: actual async queue returns before fence work, EBUSY retains no refs, snapshots survive RMFB/fd close, event lifetime is retained, failed publication emits no success");
+ puts("PASS: actual async queue returns before fence work, EBUSY retains no refs, snapshots survive RMFB/fd close, event lifetime is retained, event-triggered resubmission keeps both jobs intact, failed publication emits no success");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='virtio-async-flip-') as temp:
@@ -95,3 +114,9 @@ with tempfile.TemporaryDirectory(prefix='virtio-async-flip-') as temp:
     (directory/'test.c').write_text(pre+code+post)
     subprocess.run(['cc','-O2','-Wall','-Wextra','-Werror',str(directory/'test.c'),'-o',str(directory/'test')],check=True)
     subprocess.run([str(directory/'test')],check=True)
+    old = code.replace('        __atomic_store_n(&gpu_async_flip_state, 0, __ATOMIC_RELEASE);', '')
+    old = old.replace('        vfs_close(flip.node);', '        vfs_close(flip.node);\n        __atomic_store_n(&gpu_async_flip_state, 0, __ATOMIC_RELEASE);')
+    (directory/'old.c').write_text(pre+old+post)
+    subprocess.run(['cc','-O2',str(directory/'old.c'),'-o',str(directory/'old')],check=True)
+    assert subprocess.run([str(directory/'old')],capture_output=True).returncode != 0
+    print('PASS: restoring event-before-slot-release ordering fails the resubmission regression')

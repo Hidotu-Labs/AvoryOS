@@ -1,14 +1,104 @@
 #include "string.h"
 
+typedef uint64_t __attribute__((__may_alias__, aligned(1))) u64_ua;
+typedef uint32_t __attribute__((__may_alias__, aligned(1))) u32_ua;
+typedef uint16_t __attribute__((__may_alias__, aligned(1))) u16_ua;
+
+#define ONES64  0x0101010101010101ULL
+#define HIGHS64 0x8080808080808080ULL
+
+static inline uint64_t has_zero_byte(uint64_t v) {
+  return (v - ONES64) & ~v & HIGHS64;
+}
+
 int strcmp(const char *s1, const char *s2) {
-  while (*s1 && (*s1 == *s2)) {
+  // Check bytes until s1 is 8-byte aligned or difference/null is reached
+  while (((uintptr_t)s1 & 7) && *s1 && (*s1 == *s2)) {
     s1++;
     s2++;
   }
-  return *(const unsigned char *)s1 - *(const unsigned char *)s2;
+  if (!*s1 || *s1 != *s2) {
+    return *(const unsigned char *)s1 - *(const unsigned char *)s2;
+  }
+
+  while (1) {
+    // If s2 is near the end of a 4KB page, avoid reading past the page boundary
+    if (__builtin_expect((((uintptr_t)s2 & 4095) > 4096 - 8), 0)) {
+      for (int i = 0; i < 8; i++) {
+        if (!*s1 || *s1 != *s2)
+          return *(const unsigned char *)s1 - *(const unsigned char *)s2;
+        s1++;
+        s2++;
+      }
+      continue;
+    }
+
+    uint64_t v1 = *(const uint64_t *)s1;
+    uint64_t v2 = *(const u64_ua *)s2;
+
+    if (v1 != v2) {
+      for (int i = 0; i < 8; i++) {
+        unsigned char c1 = (unsigned char)s1[i];
+        unsigned char c2 = (unsigned char)s2[i];
+        if (c1 != c2 || c1 == 0)
+          return c1 - c2;
+      }
+    }
+
+    if (has_zero_byte(v1)) {
+      return 0; // Matched all the way to null terminator
+    }
+
+    s1 += 8;
+    s2 += 8;
+  }
 }
 
 int strncmp(const char *s1, const char *s2, size_t n) {
+  while (n && ((uintptr_t)s1 & 7) && *s1 && (*s1 == *s2)) {
+    s1++;
+    s2++;
+    n--;
+  }
+  if (n == 0)
+    return 0;
+  if (!*s1 || *s1 != *s2) {
+    return *(const unsigned char *)s1 - *(const unsigned char *)s2;
+  }
+
+  while (n >= 8) {
+    if (__builtin_expect((((uintptr_t)s2 & 4095) > 4096 - 8), 0)) {
+      for (int i = 0; i < 8; i++) {
+        if (!*s1 || *s1 != *s2)
+          return *(const unsigned char *)s1 - *(const unsigned char *)s2;
+        s1++;
+        s2++;
+        n--;
+      }
+      continue;
+    }
+
+    uint64_t v1 = *(const uint64_t *)s1;
+    uint64_t v2 = *(const u64_ua *)s2;
+
+    if (v1 != v2) {
+      for (int i = 0; i < 8; i++) {
+        unsigned char c1 = (unsigned char)s1[i];
+        unsigned char c2 = (unsigned char)s2[i];
+        if (c1 != c2 || c1 == 0)
+          return c1 - c2;
+      }
+    }
+
+    if (has_zero_byte(v1)) {
+      return 0;
+    }
+
+    s1 += 8;
+    s2 += 8;
+    n -= 8;
+  }
+
   while (n && *s1 && (*s1 == *s2)) {
     s1++;
     s2++;
@@ -20,36 +110,135 @@ int strncmp(const char *s1, const char *s2, size_t n) {
 }
 
 size_t strlen(const char *s) {
-  size_t len = 0;
-  while (s[len])
-    len++;
-  return len;
+  const char *orig = s;
+
+  // Align s to 8-byte boundary
+  while ((uintptr_t)s & 7) {
+    if (!*s)
+      return (size_t)(s - orig);
+    s++;
+  }
+
+  const uint64_t *w = (const uint64_t *)s;
+  while (1) {
+    uint64_t v0 = w[0];
+    uint64_t m0 = has_zero_byte(v0);
+    if (m0)
+      return (size_t)((const char *)w - orig) + (__builtin_ctzll(m0) >> 3);
+
+    uint64_t v1 = w[1];
+    uint64_t m1 = has_zero_byte(v1);
+    if (m1)
+      return (size_t)((const char *)(w + 1) - orig) + (__builtin_ctzll(m1) >> 3);
+
+    w += 2;
+  }
 }
 
 char *strcpy(char *dest, const char *src) {
-  char *original_dest = dest;
-  while ((*dest++ = *src++))
-    ;
-  return original_dest;
+  char *orig_dest = dest;
+
+  // Align src to 8-byte boundary
+  while ((uintptr_t)src & 7) {
+    if (!(*dest++ = *src++))
+      return orig_dest;
+  }
+
+  while (1) {
+    uint64_t v = *(const uint64_t *)src;
+    uint64_t z = has_zero_byte(v);
+    if (z) {
+      int len = __builtin_ctzll(z) >> 3;
+      for (int i = 0; i <= len; i++) {
+        dest[i] = src[i];
+      }
+      return orig_dest;
+    }
+    *(u64_ua *)dest = v;
+    src += 8;
+    dest += 8;
+  }
 }
 
 char *strncpy(char *dest, const char *src, size_t n) {
-  size_t i;
-  for (i = 0; i < n && src[i] != '\0'; i++) {
-    dest[i] = src[i];
+  char *orig_dest = dest;
+
+  while (n && ((uintptr_t)src & 7)) {
+    if (!(*dest++ = *src++)) {
+      n--;
+      while (n--)
+        *dest++ = '\0';
+      return orig_dest;
+    }
+    n--;
   }
-  for (; i < n; i++) {
-    dest[i] = '\0';
+
+  while (n >= 8) {
+    uint64_t v = *(const uint64_t *)src;
+    uint64_t z = has_zero_byte(v);
+    if (z) {
+      int len = __builtin_ctzll(z) >> 3;
+      for (int i = 0; i <= len; i++) {
+        dest[i] = src[i];
+      }
+      dest += (len + 1);
+      n -= (len + 1);
+      while (n--)
+        *dest++ = '\0';
+      return orig_dest;
+    }
+    *(u64_ua *)dest = v;
+    src += 8;
+    dest += 8;
+    n -= 8;
   }
-  return dest;
+
+  while (n) {
+    if (!(*dest++ = *src++)) {
+      n--;
+      while (n--)
+        *dest++ = '\0';
+      return orig_dest;
+    }
+    n--;
+  }
+
+  return orig_dest;
 }
 
 char *strchr(const char *s, int c) {
-  do {
-    if (*s == (char)c)
+  uint8_t ch = (uint8_t)c;
+  if (ch == 0)
+    return (char *)s + strlen(s);
+
+  while ((uintptr_t)s & 7) {
+    if (*s == (char)ch)
       return (char *)s;
-  } while (*s++);
-  return 0;
+    if (!*s)
+      return NULL;
+    s++;
+  }
+
+  uint64_t c8 = ch * ONES64;
+  const uint64_t *w = (const uint64_t *)s;
+
+  while (1) {
+    uint64_t v = *w;
+    uint64_t z = has_zero_byte(v);
+    uint64_t match = v ^ c8;
+    uint64_t m = has_zero_byte(match);
+
+    if (z || m) {
+      const char *p = (const char *)w;
+      for (int i = 0; i < 8; i++) {
+        if ((uint8_t)p[i] == ch)
+          return (char *)p + i;
+        if (p[i] == 0)
+          return NULL;
+      }
+    }
+    w++;
+  }
 }
 
 char *strnchrnul(const char *s, size_t count, int c) {
@@ -108,40 +297,95 @@ char *strstr(const char *haystack, const char *needle) {
 
 void *memset(void *s, int c, size_t n) {
   void *d = s;
-  if (n >= 32) {
-    /* Bulk zero/set with 8-byte stores: ~8x fewer loop iterations than
-     * rep stosb under virtualization without ERMS passthrough. This is the
-     * dominant cost in demand-zero fault handling (4 KB per fault, 2 MB per
-     * THP fault) and in every page-table allocation. */
-    uint8_t *p = (uint8_t *)s;
-    uint64_t c8 = (uint8_t)c * 0x0101010101010101ULL;
-    while (n && ((uintptr_t)p & 7)) {
-      *p++ = (uint8_t)c;
-      n--;
+  uint8_t *p = (uint8_t *)s;
+  uint64_t c8 = (uint8_t)c * 0x0101010101010101ULL;
+
+  if (n < 16) {
+    if (n >= 8) {
+      *(u64_ua *)p = c8;
+      *(u64_ua *)(p + n - 8) = c8;
+      return d;
     }
-    uint64_t *pw = (uint64_t *)p;
-    size_t q = n / 8;
-    __asm__ volatile("rep stosq"
-                     : "+D"(pw), "+c"(q)
-                     : "a"(c8)
-                     : "memory");
-    p = (uint8_t *)pw;
-    n %= 8;
-    while (n--) {
-      *p++ = (uint8_t)c;
+    if (n >= 4) {
+      *(u32_ua *)p = (uint32_t)c8;
+      *(u32_ua *)(p + n - 4) = (uint32_t)c8;
+      return d;
     }
+    if (n >= 2) {
+      *(u16_ua *)p = (uint16_t)c8;
+      *(u16_ua *)(p + n - 2) = (uint16_t)c8;
+      return d;
+    }
+    if (n == 1)
+      *p = (uint8_t)c;
     return d;
   }
-  __asm__ volatile("rep stosb"
-                   : "+D"(s), "+c"(n)
-                   : "a"((uint8_t)c)
-                   : "memory");
+
+  if (n <= 32) {
+    *(u64_ua *)p = c8;
+    *(u64_ua *)(p + 8) = c8;
+    *(u64_ua *)(p + n - 16) = c8;
+    *(u64_ua *)(p + n - 8) = c8;
+    return d;
+  }
+
+  if (n <= 64) {
+    *(u64_ua *)p = c8;
+    *(u64_ua *)(p + 8) = c8;
+    *(u64_ua *)(p + 16) = c8;
+    *(u64_ua *)(p + 24) = c8;
+    *(u64_ua *)(p + n - 32) = c8;
+    *(u64_ua *)(p + n - 24) = c8;
+    *(u64_ua *)(p + n - 16) = c8;
+    *(u64_ua *)(p + n - 8) = c8;
+    return d;
+  }
+
+  /* For large blocks, ERMS rep stosb provides hardware-accelerated fills */
+  if (n >= 2048) {
+    size_t cnt = n;
+    __asm__ volatile("rep stosb"
+                     : "+D"(p), "+c"(cnt)
+                     : "a"((uint8_t)c)
+                     : "memory");
+    return d;
+  }
+
+  /* 64 to 2048 bytes: unrolled 64-byte quadword pipeline */
+  while (n >= 64) {
+    *(u64_ua *)(p)      = c8;
+    *(u64_ua *)(p + 8)  = c8;
+    *(u64_ua *)(p + 16) = c8;
+    *(u64_ua *)(p + 24) = c8;
+    *(u64_ua *)(p + 32) = c8;
+    *(u64_ua *)(p + 40) = c8;
+    *(u64_ua *)(p + 48) = c8;
+    *(u64_ua *)(p + 56) = c8;
+    p += 64;
+    n -= 64;
+  }
+
+  while (n >= 8) {
+    *(u64_ua *)p = c8;
+    p += 8;
+    n -= 8;
+  }
+  if (n >= 4) {
+    *(u32_ua *)p = (uint32_t)c8;
+    p += 4;
+    n -= 4;
+  }
+  if (n >= 2) {
+    *(u16_ua *)p = (uint16_t)c8;
+    p += 2;
+    n -= 2;
+  }
+  if (n == 1) {
+    *p = (uint8_t)c;
+  }
+
   return d;
 }
-
-typedef uint64_t __attribute__((__may_alias__, aligned(1))) u64_ua;
-typedef uint32_t __attribute__((__may_alias__, aligned(1))) u32_ua;
-typedef uint16_t __attribute__((__may_alias__, aligned(1))) u16_ua;
 
 void *memcpy(void *dest, const void *src, size_t n) {
   void *d = dest;
@@ -177,24 +421,75 @@ void *memcpy(void *dest, const void *src, size_t n) {
     return d;
   }
 
-  /* Align destination to an 8-byte boundary for bulk 64-bit moves. x86-64
-   * handles unaligned 8-byte source loads in hardware, so even when dest and
-   * src have different alignments mod 8, rep movsq runs at ~8x the speed of
-   * a byte-by-byte rep movsb fallback. */
-  while ((uintptr_t)dst & 7) {
-    *dst++ = *s++;
-    n--;
+  if (n <= 64) {
+    *(u64_ua *)dst = *(const u64_ua *)s;
+    *(u64_ua *)(dst + 8) = *(const u64_ua *)(s + 8);
+    *(u64_ua *)(dst + 16) = *(const u64_ua *)(s + 16);
+    *(u64_ua *)(dst + 24) = *(const u64_ua *)(s + 24);
+    *(u64_ua *)(dst + n - 32) = *(const u64_ua *)(s + n - 32);
+    *(u64_ua *)(dst + n - 24) = *(const u64_ua *)(s + n - 24);
+    *(u64_ua *)(dst + n - 16) = *(const u64_ua *)(s + n - 16);
+    *(u64_ua *)(dst + n - 8) = *(const u64_ua *)(s + n - 8);
+    return d;
   }
 
-  size_t q = n >> 3;
-  __asm__ volatile("rep movsq"
-                   : "+D"(dst), "+S"(s), "+c"(q)
-                   :
-                   : "memory");
+  /* Multi-kilobyte transfers: ERMS rep movsb provides hardware-accelerated moves */
+  if (n >= 2048) {
+    size_t cnt = n;
+    __asm__ volatile("rep movsb"
+                     : "+D"(dst), "+S"(s), "+c"(cnt)
+                     :
+                     : "memory");
+    return d;
+  }
 
-  n &= 7;
-  while (n--)
-    *dst++ = *s++;
+  /* 64 to 2048 bytes: Unrolled 64-byte quadword pipeline (ideal for IPC messages, audio, and Wayland) */
+  while (n >= 64) {
+    u64_ua q0 = *(const u64_ua *)(s);
+    u64_ua q1 = *(const u64_ua *)(s + 8);
+    u64_ua q2 = *(const u64_ua *)(s + 16);
+    u64_ua q3 = *(const u64_ua *)(s + 24);
+    u64_ua q4 = *(const u64_ua *)(s + 32);
+    u64_ua q5 = *(const u64_ua *)(s + 40);
+    u64_ua q6 = *(const u64_ua *)(s + 48);
+    u64_ua q7 = *(const u64_ua *)(s + 56);
+
+    *(u64_ua *)(dst)      = q0;
+    *(u64_ua *)(dst + 8)  = q1;
+    *(u64_ua *)(dst + 16) = q2;
+    *(u64_ua *)(dst + 24) = q3;
+    *(u64_ua *)(dst + 32) = q4;
+    *(u64_ua *)(dst + 40) = q5;
+    *(u64_ua *)(dst + 48) = q6;
+    *(u64_ua *)(dst + 56) = q7;
+
+    s += 64;
+    dst += 64;
+    n -= 64;
+  }
+
+  while (n >= 8) {
+    *(u64_ua *)dst = *(const u64_ua *)s;
+    dst += 8;
+    s += 8;
+    n -= 8;
+  }
+  if (n >= 4) {
+    *(u32_ua *)dst = *(const u32_ua *)s;
+    dst += 4;
+    s += 4;
+    n -= 4;
+  }
+  if (n >= 2) {
+    *(u16_ua *)dst = *(const u16_ua *)s;
+    dst += 2;
+    s += 2;
+    n -= 2;
+  }
+  if (n == 1) {
+    *dst = *s;
+  }
+
   return d;
 }
 

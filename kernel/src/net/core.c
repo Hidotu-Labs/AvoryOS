@@ -4,20 +4,32 @@
 #include "lib/string.h"
 #include "lock/spinlock.h"
 #include "mm/heap.h"
+#include "mm/pmm.h"
 #include "net/tcp.h"
 #include "sched/sched.h"
 #include "sched/wait.h"
 #include "smp/cpu.h"
 
 #define NET_PACKET_HOT_CAPACITY 64
-#define NET_QUEUE_CAPACITY 1024
-#define NET_PACKET_MAX 4096
+/* RX buffers come directly from PMM: unlike kmalloc's OOM fallback, this
+ * never invokes filesystem/cache reclaim from a NIC interrupt. One page owns
+ * both the packet and its intrusive queue link. */
+struct rx_buffer {
+  struct rx_buffer *next;
+  struct net_packet packet;
+};
+_Static_assert(sizeof(struct rx_buffer) <= PAGE_SIZE, "RX buffer fits a page");
 
-static struct net_packet *hot_pool[NET_PACKET_HOT_CAPACITY];
+/* Growth may use 1/8 of free + RX-owned pages. This is a memory-pressure
+ * policy, refreshed by the timer worker, rather than a packet-count ceiling. */
+#define NET_RX_MEMORY_SHARE 8
+
+static struct rx_buffer *hot_pool[NET_PACKET_HOT_CAPACITY];
 static uint32_t hot_count = 0;
 static uint32_t active_packets = 0;
-static struct net_packet *queue[NET_QUEUE_CAPACITY];
-static uint32_t head, tail;
+static uint64_t rx_page_limit;
+static struct rx_buffer *queue_head, *queue_tail;
+static uint32_t queue_depth;
 static spinlock_t lock = SPINLOCK_INIT;
 static wait_queue_t worker_wait;
 static struct net_device *default_device;
@@ -25,43 +37,65 @@ static struct net_device *devices[NET_DEVICE_MAX];
 static net_rx_handler_t rx_handler;
 static bool ready;
 
-static struct net_packet *alloc_locked(void) {
+/* PMM statistics walk free lists, so sample only in thread context and
+ * outside the RX lock. IRQ admission reads the resulting cached budget. */
+static void refresh_rx_budget(void) {
+  uint64_t available = pmm_get_free_pages();
+  spinlock_acquire(&lock);
+  rx_page_limit = (available + active_packets) / NET_RX_MEMORY_SHARE;
+  spinlock_release(&lock);
+}
+
+static struct rx_buffer *alloc_locked(void) {
+  struct rx_buffer *p;
   if (hot_count > 0) {
-    struct net_packet *p = hot_pool[--hot_count];
-    p->device = NULL;
-    p->length = 0;
-    return p;
-  }
-  if (active_packets >= NET_PACKET_MAX)
-    return NULL;
-  struct net_packet *p = kmalloc(sizeof(struct net_packet));
-  if (p) {
+    p = hot_pool[--hot_count];
+  } else {
+    if ((uint64_t)active_packets + 1 > rx_page_limit)
+      return NULL;
+    void *phys = pmm_alloc_page();
+    if (!phys)
+      return NULL;
+    p = (void *)((uintptr_t)phys + pmm_get_hhdm_offset());
     active_packets++;
-    p->device = NULL;
-    p->length = 0;
   }
+  p->next = NULL;
+  p->packet.device = NULL;
+  p->packet.length = 0;
   return p;
 }
 
-static void free_locked(struct net_packet *p) {
+static void free_locked(struct rx_buffer *p) {
   if (!p)
     return;
   if (hot_count < NET_PACKET_HOT_CAPACITY) {
     hot_pool[hot_count++] = p;
   } else {
-    if (active_packets > 0)
-      active_packets--;
-    kfree(p);
+    active_packets--;
+    pmm_free_page((void *)((uintptr_t)p - pmm_get_hhdm_offset()));
   }
 }
 
-static bool push_locked(struct net_packet *p) {
-  uint32_t next = (head + 1) % NET_QUEUE_CAPACITY;
-  if (next == tail)
-    return false;
-  queue[head] = p;
-  head = next;
-  return true;
+static void push_locked(struct rx_buffer *p) {
+  p->next = NULL;
+  if (queue_tail)
+    queue_tail->next = p;
+  else
+    queue_head = p;
+  queue_tail = p;
+  queue_depth++;
+}
+
+static struct rx_buffer *pop_locked(void) {
+  struct rx_buffer *p = queue_head;
+  if (!p)
+    return NULL;
+  queue_head = p->next;
+  if (!queue_head)
+    queue_tail = NULL;
+  p->next = NULL;
+  queue_depth--;
+  return p;
 }
 
 static bool packet_current(const struct net_packet *packet) {
@@ -83,7 +117,7 @@ static void net_worker(void) {
   }
   memset(entry, 0, sizeof(*entry));
   entry->thread = self;
-  struct net_packet *batch[128];
+  struct rx_buffer *batch[128];
   for (;;) {
     size_t count = 0;
     for (;;) {
@@ -93,25 +127,23 @@ static void net_worker(void) {
           free_locked(batch[i]);
       }
       count = 0;
-      while (count < 128 && tail != head) {
-        batch[count++] = queue[tail];
-        tail = (tail + 1) % NET_QUEUE_CAPACITY;
-      }
+      while (count < 128 && queue_head)
+        batch[count++] = pop_locked();
       spinlock_release(&lock);
 
       if (count == 0)
         break;
 
       for (size_t i = 0; i < count; i++) {
-        if (rx_handler && packet_current(batch[i]))
-          rx_handler(batch[i]);
+        if (rx_handler && packet_current(&batch[i]->packet))
+          rx_handler(&batch[i]->packet);
       }
     }
 
     self->state = THREAD_BLOCKED;
     wait_queue_add(&worker_wait, entry);
     spinlock_acquire(&lock);
-    bool empty = (head == tail);
+    bool empty = (queue_head == NULL);
     if (!empty) {
       self->state = THREAD_RUNNING;
     } else {
@@ -134,8 +166,14 @@ static void net_worker(void) {
  * timers on the packet hot path. */
 static void net_timer_worker(void) {
   struct thread *self = sched_get_current();
+  uint64_t last_budget = lapic_timer_get_ticks();
   for (;;) {
-    tcp_timer_tick(lapic_timer_get_ticks());
+    uint64_t now = lapic_timer_get_ticks();
+    if (now - last_budget >= 1000) {
+      refresh_rx_budget();
+      last_budget = now;
+    }
+    tcp_timer_tick(now);
     self->state = THREAD_SLEEPING;
     self->wakeup_ticks = lapic_timer_get_ticks() + 10;
     sched_yield();
@@ -154,37 +192,27 @@ bool net_rx_submit_irq(struct net_device *dev, const void *frame, size_t len) {
   if (!dev)
     return false;
   spinlock_acquire(&lock);
-  struct net_packet *p = alloc_locked();
+  struct rx_buffer *p = alloc_locked();
   if (!p) {
     dev->stats.rx_dropped++;
     dev->stats.queue_full++;
-    spinlock_release(&lock);
-    static uint64_t last_pool_log = 0;
+    /* Serialize rate limiting with queue state; IRQ producers run on SMP. */
+    static uint64_t last_pressure_log;
     uint64_t now = lapic_timer_get_ticks();
-    if (now - last_pool_log >= 1000) {
-      last_pool_log = now;
-      klog_puts("[NET] rx packet pool empty!\n");
-    }
+    bool report = now - last_pressure_log >= 1000;
+    if (report)
+      last_pressure_log = now;
+    spinlock_release(&lock);
+    if (report)
+      klog_puts("[NET] rx dropped: memory pressure\n");
     return false;
   }
-  p->device = dev;
-  p->generation = __atomic_load_n(&dev->generation, __ATOMIC_ACQUIRE);
-  p->length = (uint16_t)len;
-  memcpy(p->data, frame, len);
-  bool was_empty = (head == tail);
-  if (!push_locked(p)) {
-    free_locked(p);
-    dev->stats.rx_dropped++;
-    dev->stats.queue_full++;
-    spinlock_release(&lock);
-    static uint64_t last_qfull_log = 0;
-    uint64_t now = lapic_timer_get_ticks();
-    if (now - last_qfull_log >= 1000) {
-      last_qfull_log = now;
-      klog_puts("[NET] rx queue full!\n");
-    }
-    return false;
-  }
+  p->packet.device = dev;
+  p->packet.generation = __atomic_load_n(&dev->generation, __ATOMIC_ACQUIRE);
+  p->packet.length = (uint16_t)len;
+  memcpy(p->packet.data, frame, len);
+  bool was_empty = (queue_head == NULL);
+  push_locked(p);
   dev->stats.rx_packets++;
   dev->stats.rx_bytes += len;
   spinlock_release(&lock);
@@ -298,7 +326,9 @@ void net_core_init(void) {
   active_packets = 0;
   memset(devices, 0, sizeof(devices));
   default_device = NULL;
-  head = tail = 0;
+  queue_head = queue_tail = NULL;
+  queue_depth = 0;
+  refresh_rx_budget();
   ready = true;
   klog_puts("[NET] core prepared\n");
 }
@@ -387,7 +417,7 @@ void net_print_stats(const struct net_device *dev) {
 void net_queue_snapshot(uint32_t *queued, uint32_t *in_use) {
   spinlock_acquire(&lock);
   if (queued)
-    *queued = (head + NET_QUEUE_CAPACITY - tail) % NET_QUEUE_CAPACITY;
+    *queued = queue_depth;
   if (in_use)
     *in_use = active_packets;
   spinlock_release(&lock);

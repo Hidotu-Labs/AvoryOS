@@ -236,6 +236,7 @@ gcc
 libisl
 binutils
 xfce4-session
+labwc
 xfwm4
 xfdesktop
 xfce4-panel
@@ -598,6 +599,8 @@ plasma-browser-integration
 polkit-kde-agent
 accountsservice
 ksshaskpass
+# Legacy AppImage runtimes load libfuse.so.2; keep FUSE 3 as well.
+fuse2
 fuse3
 kio-fuse
 kdoctools

@@ -128,22 +128,15 @@ static uint64_t sys_lstat(uint64_t path_ptr, uint64_t statbuf_ptr, uint64_t a2,
         return (uint64_t)-14;
 
     struct thread *t = sched_get_current();
-    vfs_node_t *base  = fs_root;
-    vfs_node_t *cwd   = NULL;
-    if (t && path[0] != '/' && t->cwd_path[0]) {
-        cwd = vfs_resolve_path_at(fs_root, t->cwd_path);
-        if (cwd) base = cwd;
-    }
+    vfs_node_t *base  = (t && t->cwd_node && path[0] != '/') ? t->cwd_node : fs_root;
 
     vfs_node_t *node = vfs_resolve_symlink_node(base, path);
     if (!node) {
-        if (cwd) vfs_close(cwd);
         return sys_stat(path_ptr, statbuf_ptr, a2, a3, a4, a5);
     }
 
     fill_kstat(ks, node);
     vfs_close(node);
-    if (cwd) vfs_close(cwd);
     return 0;
 }
 
@@ -206,9 +199,7 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
             vfs_node_t *base_dir = fs_root;
             if (kpathp[0] != '/') {
                 if ((int)dirfd == AT_FDCWD) {
-                    base_dir = vfs_resolve_path_at(fs_root, t->cwd_path);
-                    if (!base_dir) base_dir = fs_root;
-                    else base_owned = base_dir;
+                    base_dir = (t && t->cwd_node) ? t->cwd_node : fs_root;
                 } else {
                     if (!FD_IN_RANGE(t, dirfd) || !t->fds[dirfd]) {
                         if (base_owned) vfs_close(base_owned);
@@ -229,9 +220,11 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
     } else {
         if (flags & AT_EMPTY_PATH) {
             if ((int)dirfd == AT_FDCWD) {
-                node = vfs_resolve_path_at(fs_root, t->cwd_path);
-                if (!node) node = fs_root;
-                else node_owned = true;
+                node = (t && t->cwd_node) ? t->cwd_node : fs_root;
+                if (node) {
+                    vfs_open(node);
+                    node_owned = true;
+                }
             } else {
                 if (!FD_IN_RANGE(t, dirfd) || !t->fds[dirfd])
                     return (uint64_t)-9;
@@ -341,11 +334,7 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
     vfs_node_t *base_owned = NULL;
     if (path[0] != '/') {
         if ((int)dirfd == AT_FDCWD) {
-            if (t->cwd_path[0]) {
-                base_dir = vfs_resolve_path_at(fs_root, t->cwd_path);
-                if (!base_dir) base_dir = fs_root;
-                else base_owned = base_dir;
-            }
+            base_dir = (t && t->cwd_node) ? t->cwd_node : fs_root;
         } else {
             if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
                 return (uint64_t)-9;

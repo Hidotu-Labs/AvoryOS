@@ -290,29 +290,57 @@ void sched_copy_files(struct thread *child, struct thread *parent) {
     spinlock_release(&child->files->lock);
     thread_set_files(child, child->files);
   }
-  child->files->next_fd = parent->files->next_fd;
 
+  vfs_node_t *pinned_nodes[64];
+  int pinned_count = 0;
+  vfs_node_t **dyn_nodes = NULL;
+
+  spinlock_acquire(&parent->files->lock);
+  child->files->next_fd = parent->files->next_fd;
   uint32_t cap = parent->files->capacity;
+
+  int total_open = 0;
   for (uint32_t fd = 0; fd < cap; fd++) {
-    spinlock_acquire(&parent->files->lock);
+    if (parent->fds[fd] && parent->fds[fd] != (vfs_node_t *)-1)
+      total_open++;
+  }
+
+  vfs_node_t **nodes_to_open = pinned_nodes;
+  if (total_open > 64) {
+    dyn_nodes = kmalloc((size_t)total_open * sizeof(vfs_node_t *));
+    if (dyn_nodes)
+      nodes_to_open = dyn_nodes;
+  }
+
+  for (uint32_t fd = 0; fd < cap; fd++) {
     vfs_node_t *node = parent->fds[fd];
-    if (!node || node == (vfs_node_t *)-1) {
-      spinlock_release(&parent->files->lock);
+    if (!node || node == (vfs_node_t *)-1)
       continue;
-    }
+
     vfs_node_ref(node);
     child->files->fds[fd] = node;
     child->files->fd_offsets[fd] = parent->fd_offsets[fd];
     child->files->fd_flags[fd] = parent->fd_flags[fd];
-    fd_description_set_locked(child, fd, fd_description_id_locked(parent, fd));
+    fd_description_set_locked(child, (int)fd, fd_description_id_locked(parent, (int)fd));
     struct fd_path *path = parent->fd_paths[fd];
     if (path)
       __atomic_add_fetch(&path->ref_count, 1, __ATOMIC_RELAXED);
     child->files->fd_paths[fd] = path;
-    spinlock_release(&parent->files->lock);
+
+    if (pinned_count < (dyn_nodes ? total_open : 64)) {
+      nodes_to_open[pinned_count++] = node;
+    }
+  }
+  spinlock_release(&parent->files->lock);
+
+  for (int i = 0; i < pinned_count; i++) {
+    vfs_node_t *node = nodes_to_open[i];
     vfs_open(node);
     vfs_close(node); /* release snapshot pin after child owns the open */
   }
+
+  if (dyn_nodes)
+    kfree(dyn_nodes);
 }
 
 bool sched_get_nth_open_fd(uint32_t tid, uint32_t index, uint32_t *fd) {

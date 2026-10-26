@@ -50,7 +50,8 @@ static int socket_ioctl_ifconf(uint64_t arg) {
     return -14;
 
   struct avory_ifconf64 ifc;
-  memcpy(&ifc, (const void *)arg, sizeof(ifc));
+  if (copy_from_user(&ifc, (const void *)arg, sizeof(ifc)))
+    return -14;
   if (ifc.length < 0)
     return -22;
 
@@ -59,8 +60,14 @@ static int socket_ioctl_ifconf(uint64_t arg) {
   bool have_ipv4 = dev && dev->registered && cfg && cfg->address != 0;
   int written = 0;
 
+  /* Linux accepts a NULL buffer as a size query, regardless of ifc_len.
+   * getifaddrs/JVM callers may pass a nonzero capacity for this first call. */
+  if (!ifc.buffer) {
+    ifc.length = have_ipv4 ? sizeof(struct avory_ifreq64) : 0;
+    return copy_to_user((void *)arg, &ifc, sizeof(ifc)) ? -14 : 0;
+  }
   if (have_ipv4 && ifc.length >= (int32_t)sizeof(struct avory_ifreq64)) {
-    if (!ifc.buffer || !vmm_is_user_addr_range_valid(
+    if (!vmm_is_user_addr_range_valid(
                            ifc.buffer, sizeof(struct avory_ifreq64)))
       return -14;
 
@@ -76,13 +83,13 @@ static int socket_ioctl_ifconf(uint64_t arg) {
     ifr.address_data[3] = (uint8_t)(cfg->address >> 16);
     ifr.address_data[4] = (uint8_t)(cfg->address >> 8);
     ifr.address_data[5] = (uint8_t)cfg->address;
-    memcpy((void *)ifc.buffer, &ifr, sizeof(ifr));
+    if (copy_to_user((void *)ifc.buffer, &ifr, sizeof(ifr)))
+      return -14;
     written = sizeof(ifr);
   }
 
   ifc.length = written;
-  memcpy((void *)arg, &ifc, sizeof(ifc));
-  return 0;
+  return copy_to_user((void *)arg, &ifc, sizeof(ifc)) ? -14 : 0;
 }
 
 static bool socket_ifreq_name_is(const char requested[16], const char *actual) {
@@ -137,6 +144,29 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
     ifr.address_data[3] = (uint8_t)(address >> 16);
     ifr.address_data[4] = (uint8_t)(address >> 8);
     ifr.address_data[5] = (uint8_t)address;
+  } else if (request == 0x8913) { /* SIOCGIFFLAGS: short ifr_flags */
+    uint16_t flags = loopback ? (0x1 | 0x8 | 0x40) : (0x1 | 0x2 | 0x1000);
+    if (!loopback && dev->ops && dev->ops->link_up && dev->ops->link_up(dev))
+      flags |= 0x40; /* IFF_RUNNING */
+    memset(&ifr.family, 0, sizeof(ifr) - 16);
+    memcpy(&ifr.family, &flags, sizeof(flags));
+  } else if (request == 0x8927) { /* SIOCGIFHWADDR */
+    memset(&ifr.family, 0, sizeof(ifr) - 16);
+    ifr.family = loopback ? 772 : 1; /* ARPHRD_LOOPBACK / ARPHRD_ETHER */
+    if (!loopback)
+      memcpy(ifr.address_data, dev->mac, sizeof(dev->mac));
+  } else if (request == 0x891b || request == 0x8919) {
+    /* SIOCGIFNETMASK / SIOCGIFBRDADDR: IPv4 in network byte order. */
+    const struct ipv4_config *cfg = ipv4_get_config();
+    uint32_t mask = loopback ? 0xff000000U : (cfg ? cfg->netmask : 0);
+    if (request == 0x8919)
+      mask = loopback ? 0 : (cfg ? cfg->address | ~cfg->netmask : 0);
+    memset(&ifr.family, 0, sizeof(ifr) - 16);
+    ifr.family = 2;
+    ifr.address_data[2] = (uint8_t)(mask >> 24);
+    ifr.address_data[3] = (uint8_t)(mask >> 16);
+    ifr.address_data[4] = (uint8_t)(mask >> 8);
+    ifr.address_data[5] = (uint8_t)mask;
   } else if (request == 0x8933) { /* SIOCGIFINDEX */
     uint32_t ifindex = loopback ? 1 : 2; /* Match route netlink. */
     memset(&ifr.family, 0, sizeof(ifr) - 16);
@@ -965,7 +995,9 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     socket_put(sock);
     return ret;
   }
-  if (request == 0x8910 || request == 0x8915 || request == 0x8933) {
+  if (request == 0x8910 || request == 0x8913 || request == 0x8915 ||
+      request == 0x8919 || request == 0x891b || request == 0x8927 ||
+      request == 0x8933) {
     int ret = socket_ioctl_ifreq(request, arg);
     socket_put(sock);
     return ret;

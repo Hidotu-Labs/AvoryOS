@@ -161,9 +161,11 @@ endif
 #                            self-tests (scratch media only)
 #   NVME_FUA=1               issue every block write with FUA
 #   NVME_RESET_RECOVERY=1    reset + retry an I/O command after a timeout
+#   NVME_BATCH_IO=0          disable the pipelined block-I/O path
 #   NVME_BATCH_IO=1          advertise block read_batch/write_batch ops so a
 #                            single submitter can pipeline up to
 #                            NVME_BATCH_WAVE_MAX commands per wait
+NVME_BATCH_IO ?= 1
 ifeq ($(NVME_SELFTEST_DATA),1)
 override CPPFLAGS += -DNVME_SELFTEST_DATA=1
 endif
@@ -398,15 +400,39 @@ endif
 
 # Imported headers/layouts and AMD-specific bridge compilation differ between
 # source profiles. Switching a pin or gate must also rebuild native/KPI/test
-# objects, even when the alternate source's timestamps are older.
+# objects, even when the alternate source's timestamps are older.  Keep build
+# identity separate: it is embedded only by kernel.c and sys_process.c, so a
+# new source fingerprint need not invalidate every kernel object.
 LINUX_PROFILE_STAMP := obj-$(ARCH)/.linux-profile
 LINUX_IMPORT_ID := $(shell sed -n '/^tag=/p;/^commit=/p' linux/.pin 2>/dev/null)
 .PHONY: linux-profile-force
 $(LINUX_PROFILE_STAMP): linux-profile-force
 	@mkdir -p "$(dir $@)"
-	@printf '%s\n' '$(LINUX_IMPORT_ID) KPI_AMDGPU=$(KPI_AMDGPU) KPI_NOUVEAU=$(KPI_NOUVEAU) LINUX_IMPORTED=$(if $(linux-obj-y),1,0) BUILD_NAME=$(BUILD_NAME) BUILD_VERSION=$(BUILD_VERSION) BUILD_TAG=$(BUILD_TAG)' > $@.tmp
+	@printf '%s\n' '$(LINUX_IMPORT_ID) KPI_AMDGPU=$(KPI_AMDGPU) KPI_NOUVEAU=$(KPI_NOUVEAU) LINUX_IMPORTED=$(if $(linux-obj-y),1,0)' > $@.tmp
 	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm $@.tmp; fi
 $(OBJ) $(LINUX_OBJ): $(LINUX_PROFILE_STAMP)
+
+# Only these translation units embed the public build identity macros. Keep
+# their dependencies narrow so source edits rebuild changed objects and their
+# header dependents without recompiling the whole kernel.
+BUILD_ID_STAMP := obj-$(ARCH)/.build-identity
+.PHONY: build-id-force
+$(BUILD_ID_STAMP): build-id-force
+	@mkdir -p "$(dir $@)"
+	@printf '%s\n' 'BUILD_NAME=$(BUILD_NAME) BUILD_VERSION=$(BUILD_VERSION) BUILD_TAG=$(BUILD_TAG)' > $@.tmp
+	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm -f $@.tmp; fi
+obj-$(ARCH)/src/kernel.c.o obj-$(ARCH)/src/syscalls/sys_process.c.o: $(BUILD_ID_STAMP)
+
+# NVME_BATCH_IO changes only the NVMe driver's registered block operations.
+# Track it separately so enabling or disabling the path rebuilds that object
+# without invalidating the rest of the kernel.
+NVME_BATCH_STAMP := obj-$(ARCH)/.nvme-batch-io
+.PHONY: nvme-batch-force
+$(NVME_BATCH_STAMP): nvme-batch-force
+	@mkdir -p "$(dir $@)"
+	@printf '%s\n' 'NVME_BATCH_IO=$(NVME_BATCH_IO)' > $@.tmp
+	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm -f $@.tmp; fi
+obj-$(ARCH)/src/drivers/storage/nvme.c.o: $(NVME_BATCH_STAMP)
 
 -include $(HEADER_DEPS)
 

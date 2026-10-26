@@ -33,6 +33,17 @@
 // consuming.  That bound is what makes one conditional subtract enough to
 // wrap, instead of a second divide.
 
+static inline size_t unix_round_pow2(size_t n) {
+  if (n <= 65536)
+    return 65536;
+  if (n >= 4 * 1024 * 1024)
+    return 4 * 1024 * 1024;
+  size_t p = 65536;
+  while (p < n && p < 4 * 1024 * 1024)
+    p <<= 1;
+  return p;
+}
+
 // Append `len` bytes of the linear buffer `src` into `buf` at `tail`.
 static inline size_t unix_ring_append(uint8_t *buf, size_t size, size_t tail,
                                       const uint8_t *src, size_t len) {
@@ -44,8 +55,7 @@ static inline size_t unix_ring_append(uint8_t *buf, size_t size, size_t tail,
   memcpy(buf + tail, src, first);
   if (len > first)
     memcpy(buf, src + first, len - first);
-  tail += len;
-  return tail >= size ? tail - size : tail;
+  return (tail + len) & (size - 1);
 }
 
 // Copy `len` bytes out of `buf` at `head` into the linear buffer `dst`.
@@ -59,8 +69,7 @@ static inline size_t unix_ring_consume(const uint8_t *buf, size_t size, size_t h
   memcpy(dst, buf + head, first);
   if (len > first)
     memcpy(dst + first, buf, len - first);
-  head += len;
-  return head >= size ? head - size : head;
+  return (head + len) & (size - 1);
 }
 
 // ── Bound-socket registry (owned by af_unix_addr.c) ──────────────────────────

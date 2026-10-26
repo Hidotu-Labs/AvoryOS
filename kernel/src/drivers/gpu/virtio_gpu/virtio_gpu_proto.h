@@ -4,6 +4,7 @@
 #define VIRTIO_GPU_PCI_VENDOR_ID         0x1AF4
 #define VIRTIO_GPU_DEVICE_ID             16
 #define VIRTIO_GPU_PCI_DEVICE_ID_MODERN  (0x1040 + VIRTIO_GPU_DEVICE_ID)
+#define VIRTIO_GPU_F_VIRGL               (1ULL << 0)
 #define VIRTIO_GPU_F_EDID                (1ULL << 1)
 #define VIRTIO_GPU_F_RESOURCE_UUID       (1ULL << 2)
 #define VIRTIO_GPU_F_RESOURCE_BLOB       (1ULL << 3)
@@ -23,14 +24,26 @@ enum virtio_gpu_ctrl_type {
     VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D,
     VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING,
     VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING,
+    VIRTIO_GPU_CMD_GET_CAPSET_INFO,
+    VIRTIO_GPU_CMD_GET_CAPSET,
     VIRTIO_GPU_CMD_GET_EDID = 0x010A,
     VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID,
     VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
     VIRTIO_GPU_CMD_SET_SCANOUT_BLOB,
+    VIRTIO_GPU_CMD_CTX_CREATE = 0x0200,
+    VIRTIO_GPU_CMD_CTX_DESTROY,
+    VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+    VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_3D,
+    VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D,
+    VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D,
+    VIRTIO_GPU_CMD_SUBMIT_3D,
     VIRTIO_GPU_CMD_UPDATE_CURSOR = 0x0300,
     VIRTIO_GPU_CMD_MOVE_CURSOR,
     VIRTIO_GPU_RESP_OK_NODATA = 0x1100,
     VIRTIO_GPU_RESP_OK_DISPLAY_INFO,
+    VIRTIO_GPU_RESP_OK_CAPSET_INFO,
+    VIRTIO_GPU_RESP_OK_CAPSET,
     VIRTIO_GPU_RESP_OK_EDID = 0x1104,
     VIRTIO_GPU_RESP_OK_RESOURCE_UUID,
     VIRTIO_GPU_RESP_OK_MAP_INFO,
@@ -115,6 +128,46 @@ struct virtio_gpu_update_cursor {
     struct virtio_gpu_cursor_pos pos;
     uint32_t resource_id, hot_x, hot_y, padding;
 } __attribute__((packed));
+struct virtio_gpu_box { uint32_t x, y, z, w, h, d; };
+struct virtio_gpu_get_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t index, padding;
+};
+struct virtio_gpu_resp_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t id, version, size, padding;
+};
+struct virtio_gpu_get_capset {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t id, version;
+};
+struct virtio_gpu_ctx_create {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t nlen, context_init;
+    char name[64];
+};
+struct virtio_gpu_ctx_resource {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id, padding;
+};
+struct virtio_gpu_resource_create_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id, target, format, bind, width, height, depth;
+    uint32_t array_size, last_level, nr_samples, flags, padding;
+};
+struct virtio_gpu_transfer_host_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_box box;
+    uint64_t offset;
+    uint32_t resource_id, level, stride, layer_stride;
+};
+struct virtio_gpu_cmd_submit {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t size, padding;
+};
+_Static_assert(sizeof(struct virtio_gpu_ctx_create) == 96, "virgl context ABI");
+_Static_assert(sizeof(struct virtio_gpu_resource_create_3d) == 72, "virgl resource ABI");
+_Static_assert(sizeof(struct virtio_gpu_transfer_host_3d) == 72, "virgl transfer ABI");
 _Static_assert(sizeof(struct virtio_gpu_ctrl_hdr) == 24, "virtio-gpu control header ABI");
 _Static_assert(sizeof(struct virtio_gpu_display_one) == 24, "virtio-gpu display entry ABI");
 _Static_assert(sizeof(struct virtio_gpu_resp_display_info) == 408,

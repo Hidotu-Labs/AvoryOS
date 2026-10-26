@@ -168,6 +168,7 @@ eventpoll_t *epoll_create(void) {
   ep->next_scan_ticks = 0; // due immediately: first wait does a full scan
   INIT_LIST_HEAD(&ep->rdllist);
   ep->rdllist_count = 0;
+  ep->generation = 1;
   wait_queue_init(&ep->wq);
   spinlock_init(&ep->lock);
   ep->refcount = 1;
@@ -245,46 +246,47 @@ void epoll_put(eventpoll_t *ep) {
 
 // Helper: Check if FD has events
 
+static inline uint32_t ep_check_events_mask(epitem_t *epi, uint32_t watch_mask) {
+  if (!epi || !epi->node || epi->removed || epi->oneshot_disabled)
+    return 0;
+
+  uint32_t valid = watch_mask | EPOLLERR | EPOLLHUP;
+  __atomic_exchange_n(&epi->ready_events, 0, __ATOMIC_ACQUIRE);
+  int revents = vfs_poll(epi->node, watch_mask);
+  return (uint32_t)revents & valid;
+}
+
 static uint32_t ep_check_events(epitem_t *epi) {
   if (!epi || !epi->node)
     return 0;
 
-  spinlock_acquire(&epi->ep->lock);
-  if (epi->removed || epi->oneshot_disabled) {
-    spinlock_release(&epi->ep->lock);
+  if (__atomic_load_n(&epi->removed, __ATOMIC_ACQUIRE) ||
+      __atomic_load_n(&epi->oneshot_disabled, __ATOMIC_ACQUIRE))
     return 0;
-  }
-  // Get the registered events, excluding modifier flags
+
+  // Get the registered events without acquiring parent ep->lock
+  uint32_t reg = __atomic_load_n(&epi->registered_events, __ATOMIC_ACQUIRE);
   uint32_t watch_mask =
-      epi->registered_events &
-      ~(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLWAKEUP);
-  spinlock_release(&epi->ep->lock);
-  /* Linux reports ERR/HUP unconditionally; RDHUP requires an explicit
-   * subscription, just like IN/OUT. Xorg treats unsolicited bits as an
-   * error and closes the client connection. */
-  uint32_t valid = watch_mask | EPOLLERR | EPOLLHUP;
+      reg & ~(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLWAKEUP);
 
-  /* A notification queues a candidate, not a promise that it is still ready.
-   * Another read (or a previous batch delivered to this same waiter) may have
-   * drained a pipe/socket since the notification.  Returning cached POLLIN
-   * here can strand a caller such as wineserver in a blocking read on an
-   * empty request pipe.  Revalidate outside ep->lock for both LT and ET;
-   * edge filtering and wakeups remain in the notification path. */
-  __atomic_exchange_n(&epi->ready_events, 0, __ATOMIC_ACQUIRE);
-
-  // Call VFS poll to get current events
-  int revents = vfs_poll(epi->node, watch_mask);
-
-  // Mask to only requested events plus error/hangup
-  return (uint32_t)revents & valid;
+  return ep_check_events_mask(epi, watch_mask);
 }
 
 // Helper: Add item to ready list
-
 static void ep_add_to_ready_list(eventpoll_t *ep, epitem_t *epi) {
+  // Lockless fast path: if item is already on ready list and no thread is sleeping
+  // in ep->wq, the notification mask was recorded in epi->ready_events and the active
+  // waiter will pick it up without acquiring ep->lock.
+  if (__atomic_load_n(&epi->on_ready_list, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&ep->wq.head, __ATOMIC_RELAXED) == NULL) {
+      return;
+    }
+  }
+
   spinlock_acquire(&ep->lock);
 
-  if (epi->removed || epi->oneshot_disabled) {
+  if (__atomic_load_n(&epi->removed, __ATOMIC_ACQUIRE) ||
+      __atomic_load_n(&epi->oneshot_disabled, __ATOMIC_ACQUIRE)) {
     spinlock_release(&ep->lock);
     return;
   }
@@ -293,16 +295,19 @@ static void ep_add_to_ready_list(eventpoll_t *ep, epitem_t *epi) {
     list_add_tail(&epi->rdllink, &ep->rdllist);
     epi->on_ready_list = true;
     ep->rdllist_count++;
+    __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
   }
 
   // Wake up waiters while still holding ep->lock.
   // This closes the race: epoll_wait_impl sets THREAD_BLOCKED while holding
   // ep->lock, so if we wake here (also under ep->lock) we are guaranteed to
   // see the correct blocked state and the thread won't miss the wakeup.
-  if (epi->exclusive) {
-    wait_queue_wake_one(&ep->wq);
-  } else {
-    wait_queue_wake_all(&ep->wq);
+  if (__atomic_load_n(&ep->wq.head, __ATOMIC_RELAXED) != NULL) {
+    if (epi->exclusive) {
+      wait_queue_wake_one(&ep->wq);
+    } else {
+      wait_queue_wake_all(&ep->wq);
+    }
   }
 
   spinlock_release(&ep->lock);
@@ -332,6 +337,7 @@ int epoll_ctl_del(eventpoll_t *ep, int fd) {
     epi->removed = true;
     ep->items[fd] = NULL;
     ep->item_count--;
+    __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
     if (epi->on_ready_list) {
       list_del(&epi->rdllink);
       epi->on_ready_list = false;
@@ -396,6 +402,7 @@ int epoll_ctl_add(eventpoll_t *ep, int fd, struct epoll_event *event) {
   ep->items[fd] = epi;
   ep->item_count++;
   if (fd >= ep->items_high) ep->items_high = fd + 1;
+  __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
   if (node->ep_watchers.next == NULL || node->ep_watchers.prev == NULL) {
     INIT_LIST_HEAD(&node->ep_watchers);
   }
@@ -421,6 +428,7 @@ int epoll_ctl_mod(eventpoll_t *ep, int fd, struct epoll_event *event) {
   epi->exclusive = (event->events & EPOLLEXCLUSIVE) != 0;
   epi->registered_events = event->events;
   epi->oneshot_disabled = false;
+  __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
   spinlock_release(&ep->lock);
   if (ep_check_events(epi)) ep_add_to_ready_list(ep, epi);
   epitem_unpin(0);
@@ -433,6 +441,11 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
                     int64_t timeout_ms) {
   if (!ep || !events || maxevents <= 0)
     return -22; // EINVAL
+
+  // Lockless fast path: if non-blocking poll and ready list is empty, return immediately
+  if (timeout_ms == 0 && __atomic_load_n(&ep->rdllist_count, __ATOMIC_ACQUIRE) == 0) {
+    return 0;
+  }
 
   int returned = 0;
   struct thread *current = sched_get_current();
@@ -458,82 +471,128 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
       break;
     }
 
-    // 1. Collect pending items from ready list under ep->lock WITHOUT calling ep_check_events.
-    epitem_t *candidates[64];
+    // 1. Double-buffered ready-list splice:
+    // Splice ready items from ep->rdllist into private local txlist in O(1).
+    // This reduces ep->lock hold duration from O(N) to O(1) and eliminates lock contention.
+    struct list_head txlist;
+    INIT_LIST_HEAD(&txlist);
     int cand_count = 0;
+    epitem_t *candidates[64];
+    uint32_t watch_masks[64];
 
     spinlock_acquire(&ep->lock);
-    while (!list_empty(&ep->rdllist) && cand_count < 64 &&
-           cand_count < maxevents) {
-      epitem_t *epi = list_first_entry(&ep->rdllist, epitem_t, rdllink);
-      epitem_pin(epi, cand_count);
-      list_del(&epi->rdllink);
-      epi->on_ready_list = false;
-      ep->rdllist_count--;
-      candidates[cand_count++] = epi;
+    if (!list_empty(&ep->rdllist)) {
+      list_splice_init(&ep->rdllist, &txlist);
+      ep->rdllist_count = 0;
+      __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
     }
     spinlock_release(&ep->lock);
 
-    // 2. Poll candidates OUTSIDE of ep->lock to eliminate lock-inversion deadlocks.
+    // Extract candidates from private txlist
+    struct list_head *pos, *tmp;
+    list_for_each_safe(pos, tmp, &txlist) {
+      if (cand_count >= 64 || cand_count >= maxevents)
+        break;
+      epitem_t *epi = list_entry(pos, epitem_t, rdllink);
+      epitem_pin(epi, cand_count);
+      watch_masks[cand_count] =
+          epi->registered_events &
+          ~(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLWAKEUP);
+      candidates[cand_count++] = epi;
+    }
+
+    // 2. Poll candidates OUTSIDE of ep->lock to eliminate lock contention & deadlocks.
+    uint32_t polled_events[64];
+    for (int i = 0; i < cand_count; i++) {
+      polled_events[i] = ep_check_events_mask(candidates[i], watch_masks[i]);
+    }
+
+    // 3. Batch process events and filter txlist
+    struct epoll_event event_batch[64];
+    int batch_count = 0;
+
     for (int i = 0; i < cand_count; i++) {
       epitem_t *epi = candidates[i];
       if (!epi)
         continue;
 
-      uint32_t current_events = ep_check_events(epi);
-      spinlock_acquire(&ep->lock);
-      struct epoll_event result = epi->event;
-      current_events &= epi->registered_events | EPOLLERR | EPOLLHUP;
-      bool deliver = !epi->removed && !epi->oneshot_disabled && current_events;
-      bool requeue = false;
-      if (deliver && returned < maxevents) {
-        result.events = current_events;
+      uint32_t current_events = polled_events[i] &
+                               (epi->registered_events | EPOLLERR | EPOLLHUP);
+      bool deliver = !epi->removed && !epi->oneshot_disabled && (current_events != 0);
+
+      if (deliver && (returned + batch_count < maxevents)) {
+        event_batch[batch_count] = epi->event;
+        event_batch[batch_count].events = current_events;
+        batch_count++;
 
         if (epi->event.events & EPOLLET) {
           epi->last_events = current_events &
                              (EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM);
-        } else if (!epi->oneshot) {
-          /* Level-triggered and still ready (we just polled it): put it back
-           * on the ready list so the next epoll_wait returns immediately while
-           * the data stays unread.  This is the level-triggered re-report path
-           * now that the full rescan in step 4 is rate-limited.  Called from
-           * outside ep->lock; the helper takes it and wakes co-waiters. */
-          requeue = true;
-        }
-        if (epi->oneshot) {
+          list_del(&epi->rdllink);
+          epi->on_ready_list = false;
+        } else if (epi->oneshot) {
           epi->oneshot_disabled = true;
           epi->registered_events = 0;
+          list_del(&epi->rdllink);
+          epi->on_ready_list = false;
         }
+        // Level-triggered and still ready: KEEP on txlist!
+      } else {
+        // Not delivered, not ready, or removed: unlink from txlist
+        list_del(&epi->rdllink);
+        epi->on_ready_list = false;
+      }
+    }
+
+    // 4. Batch re-splice remaining level-triggered & unpolled items back to ep->rdllist in O(1)
+    int requeue_count = 0;
+    list_for_each(pos, &txlist) {
+      requeue_count++;
+    }
+
+    bool was_empty = false;
+    if (requeue_count > 0) {
+      spinlock_acquire(&ep->lock);
+      was_empty = (ep->rdllist_count == 0);
+      list_splice_tail_init(&txlist, &ep->rdllist);
+      ep->rdllist_count += requeue_count;
+      __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
+      if (ep->wq.head) {
+        wait_queue_wake_all(&ep->wq);
       }
       spinlock_release(&ep->lock);
-      if (deliver) {
-        if (copy_to_user(&events[returned], &result, sizeof(result))) {
-          returned = -14;
-          for (int j = i; j < cand_count; j++) epitem_unpin(j);
-          break;
-        }
-        returned++;
+
+      if (was_empty && ep->vfs_node) {
+        epoll_notify_event(ep->vfs_node, EPOLLIN);
       }
-      if (requeue) ep_add_to_ready_list(ep, epi);
+    }
+
+    // 5. Zero-allocation bulk copy: stream all ready events to user space in a single copy_to_user call
+    if (batch_count > 0) {
+      if (copy_to_user(&events[returned], event_batch,
+                       batch_count * sizeof(struct epoll_event))) {
+        returned = -14; // -EFAULT
+        for (int j = 0; j < cand_count; j++)
+          epitem_unpin(j);
+        break;
+      }
+      returned += batch_count;
+    }
+
+    for (int i = 0; i < cand_count; i++) {
       epitem_unpin(i);
     }
 
     if (returned != 0)
       break;
 
-    // 3. Immediate return on non-blocking poll
+    // 6. Immediate return on non-blocking poll
     if (timeout_ms == 0)
       break;
 
-    // 4. Rate-limited fallback rescan of every watched item, outside ep->lock.
-    //    Discovery is driven by epoll_notify_event() and level-triggered
-    //    re-reporting by the requeue in step 2, so this no longer runs on
-    //    every pass with an empty ready list: only when due, or always on the
-    //    nonblocking path whose semantics require a full poll.  This bounds
-    //    idle O(watched-fd) scans to one per EPOLL_RESCAN_INTERVAL_MS.
+    // 7. Rate-limited fallback rescan of every watched item, outside ep->lock.
     uint64_t scan_now = lapic_timer_get_ticks();
-    if (timeout_ms == 0 ||
-        scan_now >= __atomic_load_n(&ep->next_scan_ticks, __ATOMIC_RELAXED)) {
+    if (scan_now >= __atomic_load_n(&ep->next_scan_ticks, __ATOMIC_RELAXED)) {
       int items_high = __atomic_load_n(&ep->items_high, __ATOMIC_RELAXED);
       for (int _i = 0; _i < items_high; _i++) {
         spinlock_acquire(&ep->lock);
@@ -551,20 +610,16 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
                        __ATOMIC_RELAXED);
     }
 
-    // 5. Prepare to block under ep->lock
+    // 8. Prepare to block under ep->lock
     spinlock_acquire(&ep->lock);
 
     // If ready list is non-empty, loop back immediately
-    if (!list_empty(&ep->rdllist)) {
+    if (ep->rdllist_count > 0 || !list_empty(&ep->rdllist)) {
       spinlock_release(&ep->lock);
       continue;
     }
 
     current->state = THREAD_BLOCKED;
-    /* Wake for the user deadline or when the next fallback rescan is due,
-     * whichever comes first; without a timeout, only for the rescan.  An
-     * event wake comes from ep_add_to_ready_list(), which clears
-     * wakeup_ticks.  Step 4 just ran, so scan_at is always in the future. */
     uint64_t scan_at = __atomic_load_n(&ep->next_scan_ticks, __ATOMIC_RELAXED);
     if (timeout_ms > 0 && timeout_ms != -1) {
       current->wakeup_ticks =
@@ -576,21 +631,17 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
     }
 
     // Re-check ready list one last time before releasing lock
-    if (!list_empty(&ep->rdllist)) {
+    if (ep->rdllist_count > 0 || !list_empty(&ep->rdllist)) {
       current->state = THREAD_RUNNING;
       current->wakeup_ticks = 0;
       spinlock_release(&ep->lock);
       continue;
     }
 
-    /* Register under ep->lock, after the final check: a concurrent waker also
-     * holds ep->lock, so it either adds to the ready list before this check
-     * (we continue instead of blocking) or sees us in the queue and wakes us. */
     wait_queue_add(&ep->wq, &entry);
-
     spinlock_release(&ep->lock);
 
-    // 6. Yield execution
+    // 9. Yield execution
     sched_yield();
 
     wait_queue_remove(&ep->wq, &entry);
@@ -770,16 +821,14 @@ int epoll_vfs_poll(struct vfs_node *node, int events) {
 
   int revents = 0;
 
-  // Check if ready list has items
-  spinlock_acquire(&ep->lock);
-  if (!list_empty(&ep->rdllist)) {
+  // Lockless check: ready list count and head pointer
+  if (__atomic_load_n(&ep->rdllist_count, __ATOMIC_ACQUIRE) > 0) {
     if (events & POLLIN)
       revents |= POLLIN;
   }
   // Always writable (for poll purposes)
   if (events & POLLOUT)
     revents |= POLLOUT;
-  spinlock_release(&ep->lock);
 
   return revents;
 }

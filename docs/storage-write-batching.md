@@ -36,10 +36,11 @@ forward each valid run to the whole-disk batch call. So callers (ext3/ext4
 commit, ext2 write paths) can batch unconditionally and still get the old
 ordered single-request loop on any other device.
 
-The NVMe implementation arrives with `NVME_BATCH_IO=1`.
+The NVMe implementation is enabled by default with `NVME_BATCH_IO=1` (use
+`NVME_BATCH_IO=0` to disable it).
 `nvme_batch_submit()` walks the batch: a *fast* member (whole logical blocks,
 kernel buffer, within the transfer cap) joins a wave of up to
-`NVME_BATCH_WAVE_MAX` (16) commands, all submitted back to back before
+`NVME_BATCH_WAVE_MAX` (32) commands, all submitted back to back before
 `nvme_io_wait_many()` reaps the wave against one shared deadline and one
 per-queue batch wake queue. Members that need the full path, CID-table
 refills, and transport retries fall back to the existing `nvme_io()` while no
@@ -50,7 +51,7 @@ returns.
 
 Journal commit payload and home-checkpoint writes are gathered the same way:
 `ext3_commit_io_batch()`/`ext3_commit_home_batch()` submit up to
-`EXT3_COMMIT_WRITE_BATCH` (16) staged blocks and wait once. The ordering
+`EXT3_COMMIT_WRITE_BATCH` (32) staged blocks and wait once. The ordering
 barriers are untouched: each batch is fully waited before the next commit step
 starts (payload→descriptor→commit→super-publish→home→super-clear), the
 superblock read-modify-write and FUA/flush semantics are unchanged, and a

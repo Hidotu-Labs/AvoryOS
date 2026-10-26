@@ -1,3 +1,4 @@
+#include "mm/zram.h"
 // Memory Management Syscalls: mmap, munmap, brk
 #include "../fs/vfs.h"
 #include "../fs/mount_namespace.h"
@@ -1325,6 +1326,14 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
   for (uint64_t off = 0; off < aligned_old; off += PAGE_SIZE) {
     uint64_t old_phys = vmm_virt_to_phys(pml4, old_addr + off);
     uint64_t new_phys = vmm_virt_to_phys(pml4, new_addr + off);
+    if (!old_phys && new_phys) {
+      int swapped = zram_copy_swapped(pml4, old_addr + off,
+                        (void *)(PAGE_ALIGN_DOWN(new_phys) + HHDM_OFFSET));
+      if (swapped < 0) {
+        spinlock_release(&current->mm->lock);
+        return E_NOMEM;
+      }
+    }
     if (old_phys && new_phys) {
       void *src = (void *)(PAGE_ALIGN_DOWN(old_phys) + HHDM_OFFSET);
       void *dst = (void *)(PAGE_ALIGN_DOWN(new_phys) + HHDM_OFFSET);
@@ -1392,14 +1401,19 @@ static uint64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice,
   if (!current || !current->mm)
     return 0;
 
+  if (end < addr || aligned_len < len || end - 1 > USER_SPACE_LIMIT) return (uint64_t)-22;
+  if (advice == MADV_COLD) return 0; /* Hint only; never discard contents. */
+  if (advice == MADV_PAGEOUT) {
+    zram_pageout(current->mm, current->cr3, addr, end);
+    return 0;
+  }
   spinlock_acquire(&current->mm->lock);
 
-  // MADV_DONTNEED / MADV_REMOVE / MADV_FREE / MADV_COLD / MADV_PAGEOUT:
+  // MADV_DONTNEED / MADV_REMOVE / MADV_FREE:
   // Discard physical pages in the address range so that subsequent accesses
   // yield fresh zero-filled pages for anonymous mappings, as required by POSIX/Linux.
   // Reclaiming pages immediately on MADV_FREE releases heap chunks back to PMM.
-  if (advice == MADV_DONTNEED || advice == MADV_REMOVE || advice == MADV_FREE ||
-      advice == MADV_COLD || advice == MADV_PAGEOUT) {
+  if (advice == MADV_DONTNEED || advice == MADV_REMOVE || advice == MADV_FREE) {
     uint64_t *pml4 = (uint64_t *)current->cr3;
     if (!pml4)
       pml4 = vmm_get_active_pml4();

@@ -12,16 +12,16 @@
 #include <stdbool.h>
 
 /* Optional owner-only diagnostic phase for synchronous metadata home writes. */
-int ext2_write_block_phase(ext2_mount_t *mnt, uint32_t block_num,
+int ext2_write_block_phase(ext2_mount_t *mnt, uint64_t block_num,
                            const void *buffer, const char **phase);
 /* Caller supplies four static labels: allocation, cache publication, device
  * I/O and cache completion. The labels must outlive the transaction. */
-int ext2_write_block_traced(ext2_mount_t *mnt, uint32_t block_num,
+int ext2_write_block_traced(ext2_mount_t *mnt, uint64_t block_num,
                             const void *buffer, const char **phase,
                             const char *const stages[4]);
 
 /* Data runs only; metadata keeps the single-block journal path. */
-int ext2_write_blocks(ext2_mount_t *mnt, uint32_t first, uint32_t count,
+int ext2_write_blocks(ext2_mount_t *mnt, uint64_t first, uint32_t count,
                       const void *buffer);
 
 /* Scattered metadata writes.  Each member is one full, distinct block and the
@@ -30,7 +30,7 @@ int ext2_write_blocks(ext2_mount_t *mnt, uint32_t first, uint32_t count,
  * filled per entry: 0 success, -1 failure.  Returns 0 when every member
  * reached the device, -1 otherwise. */
 typedef struct {
-  uint32_t block_num;
+  uint64_t block_num;
   const void *buffer;
   int result;
 } ext2_block_write_t;
@@ -40,6 +40,8 @@ int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
 
 int  ext2_write_superblock(ext2_mount_t *mnt);
 int  ext2_write_bgdt(ext2_mount_t *mnt);
+int  ext2_load_bgdt(ext2_mount_t *mnt);
+void ext2_free_bgdt(ext2_mount_t *mnt);
 
 /* Lazy metadata counters: allocators mark the mount dirty, the journal commit
  * (or an explicit flush when no transaction is active) writes bgdt + sb. */
@@ -47,24 +49,28 @@ void ext2_mark_metadata_dirty(ext2_mount_t *mnt);
 void ext2_mark_group_dirty(ext2_mount_t *mnt, uint32_t group);
 int ext2_flush_metadata(ext2_mount_t *mnt);
 
-uint32_t ext2_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode,
+uint64_t ext2_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode,
                             uint32_t logical_block);
 int ext2_get_block_num_checked(ext2_mount_t *mnt, ext2_inode_t *inode,
-                                uint32_t logical_block, uint32_t *disk_block);
+                                uint32_t logical_block, uint64_t *disk_block);
 int      ext2_set_block_num(ext2_mount_t *mnt, ext2_inode_t *inode,
-                            uint32_t logical_block, uint32_t disk_block);
+                            uint32_t logical_block, uint64_t disk_block);
 
-uint32_t ext2_alloc_run_hint(ext2_mount_t *mnt, uint32_t goal,
+uint64_t ext2_alloc_run_hint(ext2_mount_t *mnt, uint64_t goal,
                               uint32_t max_blocks, uint32_t *run_count);
-uint32_t ext2_alloc_block(ext2_mount_t *mnt);
-uint32_t ext2_alloc_block_hint(ext2_mount_t *mnt, uint32_t goal);
+uint64_t ext2_alloc_run_hint_low(ext2_mount_t *mnt, uint64_t goal,
+                                  uint32_t max_blocks, uint32_t *run_count);
+uint64_t ext2_alloc_block(ext2_mount_t *mnt);
+uint64_t ext2_alloc_block_hint(ext2_mount_t *mnt, uint64_t goal);
+uint64_t ext2_alloc_block_extent(ext2_mount_t *mnt);
+uint64_t ext2_alloc_block_extent_hint(ext2_mount_t *mnt, uint64_t goal);
 uint32_t ext2_alloc_inode(ext2_mount_t *mnt);
-int      ext2_free_block(ext2_mount_t *mnt, uint32_t block_num);
+int      ext2_free_block(ext2_mount_t *mnt, uint64_t block_num);
 int      ext2_free_inode(ext2_mount_t *mnt, uint32_t inode_num);
 
-void ext2_free_indirect(ext2_mount_t *mnt, uint32_t indirect_block);
-void ext2_free_dindirect(ext2_mount_t *mnt, uint32_t dindirect_block);
-void ext2_free_tindirect(ext2_mount_t *mnt, uint32_t tindirect_block);
+void ext2_free_indirect(ext2_mount_t *mnt, uint64_t indirect_block);
+void ext2_free_dindirect(ext2_mount_t *mnt, uint64_t dindirect_block);
+void ext2_free_tindirect(ext2_mount_t *mnt, uint64_t tindirect_block);
 void ext2_free_all_blocks(ext2_mount_t *mnt, ext2_inode_t *inode);
 
 int          ext2_write_inode(ext2_mount_t *mnt, uint32_t inode_num,
@@ -100,6 +106,8 @@ uint32_t ext2_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
                         uint8_t *buffer);
 uint32_t ext2_write_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
                          uint8_t *buffer);
+uint32_t ext2_append_impl(vfs_node_t *node, uint32_t size, uint8_t *buffer,
+                          uint32_t *end_offset);
 int      ext2_truncate_impl(vfs_node_t *node, uint32_t new_len);
 int      ext2_fallocate_impl(vfs_node_t *node, int mode, uint32_t offset,
                               uint32_t len);

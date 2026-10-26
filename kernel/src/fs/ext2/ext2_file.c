@@ -1,109 +1,75 @@
 #include "ext2_internal.h"
+#include "fs/ext4/ext4_extent.h"
 #include "mm/vmm.h"
 #include "syscalls/syscall.h"
 #include "arch/uaccess.h"
 #include "sched/sched.h"
 
+/* A failed disk read must never publish the previous scratch block as data. */
 uint32_t ext2_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
                         uint8_t *buffer) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
-    return 0;
-
+    return (uint32_t)-5;
   ext2_inode_t inode;
   if (ext2_read_inode(mnt, node->inode, &inode))
+    return (uint32_t)-5;
+  if (offset >= inode.i_size || !size)
     return 0;
-
-  if (offset >= inode.i_size)
-    return 0;
-  if (offset + size > inode.i_size)
+  if (size > inode.i_size - offset)
     size = inode.i_size - offset;
 
   uint32_t bytes_read = 0;
-  uint8_t *block_buf  = NULL;
+  uint8_t *block_buf = NULL;
   bool is_user = is_user_ptr((uint64_t)buffer);
-
+  int error = 0;
   while (bytes_read < size) {
-    uint32_t current_offset  = offset + bytes_read;
-    uint32_t logical_block   = current_offset / mnt->block_size;
-    uint32_t offset_in_block = current_offset % mnt->block_size;
-    uint32_t to_copy         = mnt->block_size - offset_in_block;
-    if (to_copy > size - bytes_read)
-      to_copy = size - bytes_read;
-
-    uint32_t disk_block = ext2_get_block_num(mnt, &inode, logical_block);
-    if (disk_block != 0 && disk_block >= mnt->sb.s_blocks_count) {
-      union { uint32_t u; char s[4]; } alias = { .u = disk_block };
-      struct thread *ct = sched_get_current();
-      int hit_fd = -1;
-      char hit_path[64] = {0};
-      if (ct && ct->files) {
-        spinlock_acquire(&ct->files->lock);
-        for (uint32_t fd = 0; fd < ct->files->capacity; fd++) {
-          if (ct->files->fds[fd] == node) {
-            hit_fd = fd;
-            struct fd_path *fp = ct->files->fd_paths[fd];
-            if (fp && fp->value[0]) {
-              size_t n = 0;
-              while (n < sizeof(hit_path)-1 && fp->value[n]) {
-                hit_path[n] = fp->value[n];
-                n++;
-              }
-              hit_path[n] = '\0';
-            }
-            break;
-          }
-        }
-        spinlock_release(&ct->files->lock);
-      }
-      klogf("[EXT2] bad block ref: ino=%u logical=%u disk=%u ascii='%c%c%c%c'"
-            " size=%u fd=%d path='%s' comm='%s' tid=%u\n",
-            node->inode, logical_block, disk_block,
-            alias.s[0] >= 32 && alias.s[0] < 127 ? alias.s[0] : '.',
-            alias.s[1] >= 32 && alias.s[1] < 127 ? alias.s[1] : '.',
-            alias.s[2] >= 32 && alias.s[2] < 127 ? alias.s[2] : '.',
-            alias.s[3] >= 32 && alias.s[3] < 127 ? alias.s[3] : '.',
-            inode.i_size, hit_fd, hit_path,
-            (ct && ct->comm[0]) ? ct->comm : "?",
-            ct ? ct->tid : 0);
-      if (is_user)
-        clear_user(buffer + bytes_read, to_copy);
-      else
-        memset(buffer + bytes_read, 0, to_copy);
-    } else if (disk_block == 0) {
-      if (is_user)
-        clear_user(buffer + bytes_read, to_copy);
-      else
-        memset(buffer + bytes_read, 0, to_copy);
-    } else {
-      // Direct zero-copy: if reading a full block directly into kernel memory, read directly into destination
-      if (!is_user && offset_in_block == 0 && to_copy == mnt->block_size) {
-        ext2_read_block(mnt, disk_block, buffer + bytes_read);
-      } else {
-        if (!block_buf) {
-          block_buf = kmalloc(mnt->block_size);
-          if (!block_buf)
-            break;
-        }
-        ext2_read_block(mnt, disk_block, block_buf);
-        if (is_user) {
-          unsigned long uncopied = copy_to_user(buffer + bytes_read, block_buf + offset_in_block, to_copy);
-          if (uncopied > 0) {
-            bytes_read += (to_copy - (uint32_t)uncopied);
-            break;
-          }
-        } else {
-          memcpy(buffer + bytes_read, block_buf + offset_in_block, to_copy);
-        }
-      }
+    uint32_t cur = offset + bytes_read;
+    uint32_t off_in = cur % mnt->block_size;
+    uint32_t count = mnt->block_size - off_in;
+    if (count > size - bytes_read)
+      count = size - bytes_read;
+    uint64_t disk_block;
+    if (ext2_get_block_num_checked(mnt, &inode, cur / mnt->block_size,
+                                   &disk_block)) {
+      error = 5;
+      break;
     }
-
-    bytes_read += to_copy;
+    unsigned long uncopied = 0;
+    if (!disk_block) {
+      if (is_user)
+        uncopied = clear_user(buffer + bytes_read, count);
+      else
+        memset(buffer + bytes_read, 0, count);
+    } else if (!is_user && !off_in && count == mnt->block_size) {
+      if (ext2_read_block(mnt, disk_block, buffer + bytes_read)) {
+        error = 5;
+        break;
+      }
+    } else {
+      if (!block_buf)
+        block_buf = kmalloc(mnt->block_size);
+      if (!block_buf) {
+        error = 12;
+        break;
+      }
+      if (ext2_read_block(mnt, disk_block, block_buf)) {
+        error = 5;
+        break;
+      }
+      if (is_user)
+        uncopied = copy_to_user(buffer + bytes_read, block_buf + off_in, count);
+      else
+        memcpy(buffer + bytes_read, block_buf + off_in, count);
+    }
+    bytes_read += count - (uint32_t)uncopied;
+    if (uncopied) {
+      error = 14;
+      break;
+    }
   }
-
-  if (block_buf)
-    kfree(block_buf);
-  return bytes_read;
+  kfree(block_buf);
+  return bytes_read ? bytes_read : (error ? (uint32_t)-error : 0);
 }
 
 int ext2_truncate_impl(vfs_node_t *node, uint32_t new_len) {
@@ -111,6 +77,8 @@ int ext2_truncate_impl(vfs_node_t *node, uint32_t new_len) {
     return -1;
 
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
+  if (mnt->read_only)
+    return -30;
   ext2_inode_t inode;
   if (ext2_read_inode(mnt, node->inode, &inode) != 0)
     return -1;
@@ -134,6 +102,8 @@ uint32_t ext2_write_staged(vfs_node_t *node, uint32_t offset, uint32_t size,
   ext2_mount_t *mnt = node ? (ext2_mount_t *)node->device : NULL;
   if (!mnt || !buffer)
     return (uint32_t)-14;
+  if (mnt->read_only)
+    return (uint32_t)-30;
   if (!size)
     return 0;
   if (size > UINT32_MAX - offset)
@@ -182,6 +152,57 @@ uint32_t ext2_write_staged(vfs_node_t *node, uint32_t offset, uint32_t size,
   return result;
 }
 
+/* Choose EOF from the inode under journal ownership, serializing against
+ * other writers on journaled mounts. Staging happens first: a user fault may itself need file I/O.
+ * Return a bounded short write so selection, data and publication fit one
+ * existing write batch, even for an unaligned EOF. */
+uint32_t ext2_append_impl(vfs_node_t *node, uint32_t size, uint8_t *buffer,
+                          uint32_t *end_offset) {
+  ext2_mount_t *mnt = node ? (ext2_mount_t *)node->device : NULL;
+  if (!mnt || !buffer || !end_offset)
+    return (uint32_t)-14;
+  if (mnt->read_only)
+    return (uint32_t)-30;
+  if (!size)
+    return 0;
+  uint64_t capacity = (uint64_t)mnt->block_size * (EXT2_WRITE_BATCH_BLOCKS - 1);
+  if (!capacity || capacity > UINT32_MAX)
+    return (uint32_t)-5;
+  if (size > capacity)
+    size = (uint32_t)capacity;
+  bool user = is_user_ptr((uint64_t)buffer);
+  uint8_t *staged = user ? kmalloc(size) : buffer;
+  if (!staged)
+    return (uint32_t)-12;
+  if (user) {
+    unsigned long uncopied = copy_from_user(staged, buffer, size);
+    if (uncopied > size)
+      uncopied = size;
+    size -= (uint32_t)uncopied;
+    if (!size) {
+      kfree(staged);
+      return (uint32_t)-14;
+    }
+  }
+  uint32_t result = (uint32_t)-5;
+  if (ext3_journal_start(mnt) == 0) {
+    ext2_inode_t inode;
+    mnt->journal.phase = "append-inode-read";
+    if (ext2_read_inode(mnt, node->inode, &inode) == 0) {
+      result = vfs_write(node, inode.i_size, size, staged);
+      if (result && result <= size)
+        *end_offset = inode.i_size + result;
+    }
+    if (ext3_journal_stop(mnt)) {
+      vfs_cache_clear(node);
+      result = (uint32_t)-5;
+    }
+  }
+  if (user)
+    kfree(staged);
+  return result;
+}
+
 static uint32_t ext2_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t size,
                          uint8_t *buffer) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
@@ -223,7 +244,7 @@ static uint32_t ext2_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t si
           to_write = size - bytes_written;
 
         mnt->journal.phase = "write-mapping";
-        uint32_t disk_block;
+        uint64_t disk_block;
         if (ext2_get_block_num_checked(mnt, &inode, logical_block, &disk_block)) {
           error = 5;
           break;
@@ -356,6 +377,8 @@ int ext2_symlink_impl(vfs_node_t *node, char *name, char *target) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
+  if (mnt->read_only)
+    return -30;
 
   if (ext2_finddir_impl(node, name) != NULL)
     return -1;
@@ -381,20 +404,58 @@ int ext2_symlink_impl(vfs_node_t *node, char *name, char *target) {
     memcpy((char *)new_inode.i_block, target, target_len);
     new_inode.i_blocks = 0;
   } else {
-    uint32_t data_block = ext2_alloc_block(mnt);
-    if (!data_block)
+    if (target_len > UINT32_MAX - (mnt->block_size - 1))
       return -1;
-
-    new_inode.i_block[0] = data_block;
-    new_inode.i_blocks   = mnt->block_size / 512;
-
-    uint8_t *block_buf = kcalloc(1, mnt->block_size);
+    bool extents = (mnt->sb.s_feature_incompat &
+                    EXT4_FEATURE_INCOMPAT_EXTENTS) != 0;
+    if (extents)
+      ext4_extent_init_inode(&new_inode);
+    uint32_t blocks_needed =
+        (target_len + mnt->block_size - 1) / mnt->block_size;
+    uint8_t *block_buf = kmalloc(mnt->block_size);
     if (!block_buf)
       return -1;
-    memcpy(block_buf, target, target_len);
-    ext2_write_block(mnt, data_block, block_buf);
+
+    uint32_t copied = 0;
+    for (uint32_t logical = 0; logical < blocks_needed; logical++) {
+      uint64_t data_block = 0;
+      if (extents) {
+        if (ext4_alloc_extent(mnt, &new_inode, new_ino, logical, 1,
+                              &data_block) != 0)
+          goto symlink_alloc_failed;
+      } else {
+        data_block = ext2_alloc_block(mnt);
+        if (!data_block ||
+            ext2_set_block_num(mnt, &new_inode, logical, data_block) != 0) {
+          if (data_block)
+            ext2_free_block(mnt, data_block);
+          goto symlink_alloc_failed;
+        }
+        new_inode.i_blocks += mnt->block_size / 512;
+      }
+
+      memset(block_buf, 0, mnt->block_size);
+      uint32_t chunk = target_len - copied;
+      if (chunk > mnt->block_size)
+        chunk = mnt->block_size;
+      memcpy(block_buf, target + copied, chunk);
+      if (ext2_write_block(mnt, data_block, block_buf) != 0)
+        goto symlink_alloc_failed;
+      copied += chunk;
+    }
     kfree(block_buf);
+    goto symlink_blocks_ready;
+
+symlink_alloc_failed:
+    kfree(block_buf);
+    if (extents)
+      ext4_extent_free_all(mnt, &new_inode);
+    else
+      ext2_free_all_blocks(mnt, &new_inode);
+    return -1;
   }
+
+symlink_blocks_ready:
 
   if (ext2_write_inode(mnt, new_ino, &new_inode))
     return -1;
@@ -460,6 +521,8 @@ int ext2_rename_impl(vfs_node_t *node, char *old_name, char *new_name) {
   if (!node || !node->device)
     return -1;
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
+  if (mnt->read_only)
+    return -30;
   /* Both names share directory blocks. Serialize the full read/modify/write
    * sequence, including source lookup, so parallel renames cannot overwrite
    * each other's directory images or join another thread's transaction. */
@@ -485,6 +548,8 @@ int ext2_rename_cross(vfs_node_t *old_parent, char *old_name,
       (new_parent->flags & FS_TYPE_MASK) != FS_DIRECTORY)
     return -20;
   ext2_mount_t *mnt = old_parent->device;
+  if (mnt->read_only)
+    return -30;
   if (ext3_journal_start(mnt))
     return -5;
   int result = -2;
@@ -558,6 +623,8 @@ int ext2_chmod_impl(vfs_node_t *node, uint16_t permission) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
+  if (mnt->read_only)
+    return -30;
   if (ext3_journal_start(mnt) != 0)
     return -1;
 
@@ -583,6 +650,8 @@ int ext2_chown_impl(vfs_node_t *node, uint32_t uid, uint32_t gid) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
+  if (mnt->read_only)
+    return -30;
   if (ext3_journal_start(mnt) != 0)
     return -1;
 
@@ -617,6 +686,8 @@ int ext2_utime_impl(vfs_node_t *node, uint32_t atime, uint32_t mtime) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
+  if (mnt->read_only)
+    return -30;
 
   ext2_inode_t inode;
   if (ext2_read_inode(mnt, node->inode, &inode))
@@ -643,6 +714,8 @@ int ext2_unlink_impl(vfs_node_t *node, char *name) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
+  if (mnt->read_only)
+    return -30;
 
   ext3_journal_start(mnt);
 
@@ -692,6 +765,8 @@ void ext2_destroy_unlinked_node(vfs_node_t *node) {
   if (!node || !node->device || (node->flags & FS_TYPE_MASK) != FS_FILE)
     return;
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
+  if (mnt->read_only)
+    return;
   if (ext3_journal_start(mnt) != 0)
     return;
 
@@ -709,6 +784,8 @@ int ext2_rmdir_impl(vfs_node_t *node, char *name) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
+  if (mnt->read_only)
+    return -30;
 
   if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
     return -1;
@@ -756,8 +833,9 @@ int ext2_rmdir_impl(vfs_node_t *node, char *name) {
   }
 
   uint32_t group = (target_ino - 1) / mnt->inodes_per_group;
-  if (mnt->bgdt[group].bg_used_dirs_count > 0)
-    mnt->bgdt[group].bg_used_dirs_count--;
+  uint32_t used_dirs = ext2_bgd_used_dirs(&mnt->bgdt[group]);
+  if (used_dirs > 0)
+    ext2_bgd_set_used_dirs(&mnt->bgdt[group], used_dirs - 1);
   ext2_mark_group_dirty(mnt, group);
 
   ext3_journal_stop(mnt);
@@ -766,6 +844,10 @@ int ext2_rmdir_impl(vfs_node_t *node, char *name) {
 
 int ext2_mknod_impl(vfs_node_t *node, char *name, uint16_t permission,
                     uint32_t flags, void *device) {
+  if (!node || !node->device)
+    return -1;
+  if (((ext2_mount_t *)node->device)->read_only)
+    return -30;
   if (flags != FS_SOCKET)
     return -1;
 

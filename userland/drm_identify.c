@@ -38,6 +38,17 @@ static int connected(int descriptor) {
     return 0;
 }
 
+static void bus_identity(struct identity *entry) {
+    const char *name = strrchr(entry->node, '/');
+    char link[128], resolved[4096];
+    snprintf(link, sizeof(link), "/sys/class/drm/%s/device", name ? name + 1 : entry->node);
+    if (realpath(link, resolved)) {
+        const char *base = strrchr(resolved, '/');
+        if (base && strlen(base + 1) == 12)
+            snprintf(entry->bus, sizeof(entry->bus), "pci:%s", base + 1);
+    }
+}
+
 static void pair_nodes(struct identity *cards, unsigned int count,
                        const struct identity *renders, unsigned int render_count) {
     for (unsigned int index = 0; index < count; index++) {
@@ -75,12 +86,13 @@ int main(int argc, char **argv) {
         if (descriptor < 0)
             continue;
         if (!identify(descriptor, &entry)) {
-            struct drm_set_version version = {.drm_di_major = 1, .drm_di_minor = 4,
-                .drm_dd_major = -1, .drm_dd_minor = -1};
             struct drm_unique unique = {.unique = entry.bus, .unique_len = sizeof(entry.bus) - 1};
-            ioctl(descriptor, DRM_IOCTL_SET_VERSION, &version);
             if (ioctl(descriptor, DRM_IOCTL_GET_UNIQUE, &unique) || unique.unique_len >= sizeof(entry.bus))
                 entry.bus[0] = 0;
+            /* SET_VERSION requires DRM master and changes device state.
+             * Identity discovery must also work while a compositor owns it. */
+            if (!entry.bus[0])
+                bus_identity(&entry);
             entry.connected = connected(descriptor);
             cards[count++] = entry;
         }
@@ -92,13 +104,7 @@ int main(int argc, char **argv) {
         int descriptor = open(entry.node, O_RDWR | O_CLOEXEC);
         if (descriptor < 0) continue;
         if (!identify(descriptor, &entry)) {
-            char link[128], resolved[4096];
-            snprintf(link, sizeof(link), "/sys/class/drm/renderD%u/device", minor);
-            if (realpath(link, resolved)) {
-                const char *base = strrchr(resolved, '/');
-                if (base && strlen(base + 1) == 12)
-                    snprintf(entry.bus, sizeof(entry.bus), "pci:%s", base + 1);
-            }
+            bus_identity(&entry);
             renders[render_count++] = entry;
         }
         if (verbose)

@@ -151,8 +151,7 @@ static void fill_signal_context(struct sigframe *frame, int sig,
                                 struct thread *current) {
   struct kernel_siginfo *info = &frame->info;
   struct kernel_ucontext *uc = &frame->ucontext;
-  memset(info, 0, sizeof(*info));
-  memset(uc, 0, sizeof(*uc));
+  /* info and uc are already zero-initialized by the caller (staged_frame). */
 
   info->si_signo = sig;
   uint32_t sender_pid = pid_namespace_visible(current, current->signal_sender_pid[sig - 1]);
@@ -282,11 +281,7 @@ static uint64_t sys_rt_sigaction(uint64_t signum, uint64_t act_ptr,
     return (uint64_t)-14; // EFAULT
 
   if (oldact_ptr) {
-    struct k_sigaction old_action;
-    extern spinlock_t tid_lock;
-    spinlock_acquire(&tid_lock);
-    old_action = current->signal_handlers[idx];
-    spinlock_release(&tid_lock);
+    struct k_sigaction old_action = current->signal_handlers[idx];
     if (copy_to_user((void *)oldact_ptr, &old_action,
                      sizeof(old_action)) != 0)
       return (uint64_t)-14; // EFAULT
@@ -295,15 +290,20 @@ static uint64_t sys_rt_sigaction(uint64_t signum, uint64_t act_ptr,
   if (act_ptr) {
     if (signum == SIGKILL || signum == SIGSTOP)
       return (uint64_t)-22;
-    extern struct thread *global_thread_list;
-    extern spinlock_t tid_lock;
-    spinlock_acquire(&tid_lock);
-    for (struct thread *t = global_thread_list; t; t = t->global_next) {
-      if (t->tgid == current->tgid) {
-        t->signal_handlers[idx] = new_action;
+    current->signal_handlers[idx] = new_action;
+    /* If this process shares its VM with sibling threads (CLONE_THREAD/CLONE_VM),
+     * synchronize the handler change across the thread group. */
+    if (current->mm && current->mm->ref_count > 1) {
+      extern struct thread *global_thread_list;
+      extern spinlock_t tid_lock;
+      spinlock_acquire(&tid_lock);
+      for (struct thread *t = global_thread_list; t; t = t->global_next) {
+        if (t != current && t->tgid == current->tgid) {
+          t->signal_handlers[idx] = new_action;
+        }
       }
+      spinlock_release(&tid_lock);
     }
-    spinlock_release(&tid_lock);
   }
   return 0;
 }
@@ -315,17 +315,18 @@ static int sigtimedwait_dequeue(struct thread *t, uint64_t mask,
   if (!pending)
     return 0;
 
-  for (int i = 0; i < 64; i++) {
-    if (!(pending & (1ULL << i)))
-      continue;
+  while (pending) {
+    int i = __builtin_ctzll(pending);
+    uint64_t bit = 1ULL << i;
+    pending &= ~bit;
     int sig = i + 1;
     extern spinlock_t tid_lock;
     spinlock_acquire(&tid_lock);
-    if (!(t->pending_signals & (1ULL << i))) {
+    if (!(t->pending_signals & bit)) {
       spinlock_release(&tid_lock);
       continue;
     }
-    bool supplied = signal_dequeue_locked(t, 1ULL << i, info);
+    bool supplied = signal_dequeue_locked(t, bit, info);
     if (info && !supplied) {
       memset(info, 0, sizeof(*info));
       info->si_signo = sig;
@@ -351,14 +352,15 @@ static uint64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr,
 
   if (sigsetsize != 8)
     return (uint64_t)-22; // EINVAL
-  if (!set_ptr || !vmm_is_user_addr_range_valid(set_ptr, 8))
+  uint64_t mask;
+  if (!set_ptr || !is_user_range((const void *)set_ptr, sizeof(uint64_t)) ||
+      copy_from_user(&mask, (const void *)set_ptr, sizeof(uint64_t)) != 0)
     return (uint64_t)-14; // EFAULT
 
   struct thread *current = sched_get_current();
   if (!current)
     return (uint64_t)-1;
 
-  uint64_t mask = *(uint64_t *)set_ptr;
   mask &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
 
   // Linux rejects sets containing signals that are not blocked in the waiter.
@@ -368,10 +370,12 @@ static uint64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr,
   uint64_t deadline = 0;
   bool have_deadline = false;
   if (timeout_ptr) {
-    if (!vmm_is_user_addr_range_valid(timeout_ptr, 16))
+    uint64_t ts[2];
+    if (!is_user_range((const void *)timeout_ptr, sizeof(ts)) ||
+        copy_from_user(ts, (const void *)timeout_ptr, sizeof(ts)) != 0)
       return (uint64_t)-14; // EFAULT
-    uint64_t sec = ((uint64_t *)timeout_ptr)[0];
-    uint64_t nsec = ((uint64_t *)timeout_ptr)[1];
+    uint64_t sec = ts[0];
+    uint64_t nsec = ts[1];
     if (nsec >= 1000000000ULL)
       return (uint64_t)-22; // EINVAL
     if (sec == 0 && nsec == 0) {
@@ -380,10 +384,9 @@ static uint64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr,
       if (!sig)
         return (uint64_t)-11; // EAGAIN
       if (info_ptr) {
-        if (!vmm_is_user_addr_range_writable(info_ptr,
-                                             sizeof(struct kernel_siginfo)))
+        if (!is_user_range((const void *)info_ptr, sizeof(info)) ||
+            copy_to_user((void *)info_ptr, &info, sizeof(info)) != 0)
           return (uint64_t)-14;
-        memcpy((void *)info_ptr, &info, sizeof(info));
       }
       return (uint64_t)sig;
     }
@@ -401,10 +404,9 @@ static uint64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr,
     int sig = sigtimedwait_dequeue(current, mask, &info);
     if (sig) {
       if (info_ptr) {
-        if (!vmm_is_user_addr_range_writable(info_ptr,
-                                             sizeof(struct kernel_siginfo)))
+        if (!is_user_range((const void *)info_ptr, sizeof(info)) ||
+            copy_to_user((void *)info_ptr, &info, sizeof(info)) != 0)
           return (uint64_t)-14;
-        memcpy((void *)info_ptr, &info, sizeof(info));
       }
       return (uint64_t)sig;
     }
@@ -437,15 +439,17 @@ static uint64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_ptr,
     return (uint64_t)-1;
 
   if (oldset_ptr) {
-    if (!vmm_is_user_addr_range_writable(oldset_ptr, sizeof(uint64_t)))
+    if (!is_user_range((const void *)oldset_ptr, sizeof(uint64_t)) ||
+        copy_to_user((void *)oldset_ptr, &current->signal_mask, sizeof(uint64_t)) != 0)
       return (uint64_t)-14;
-    *(uint64_t *)oldset_ptr = current->signal_mask;
   }
 
   if (set_ptr) {
-    if (!vmm_is_user_addr_range_valid(set_ptr, sizeof(uint64_t)))
+    uint64_t newset;
+    if (!is_user_range((const void *)set_ptr, sizeof(uint64_t)) ||
+        copy_from_user(&newset, (const void *)set_ptr, sizeof(uint64_t)) != 0)
       return (uint64_t)-14;
-    uint64_t newset = *(uint64_t *)set_ptr;
+
     newset &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
 
     switch (how) {
@@ -477,12 +481,14 @@ static uint64_t sys_rt_sigpending(uint64_t set_ptr, uint64_t sigsetsize,
   (void)a5;
   if (sigsetsize != 8)
     return (uint64_t)-22;
-  if (!set_ptr || !vmm_is_user_addr_range_writable(set_ptr, sizeof(uint64_t)))
+  if (!set_ptr)
     return (uint64_t)-14;
   struct thread *current = sched_get_current();
   if (!current)
     return (uint64_t)-1;
-  *(uint64_t *)set_ptr = current->pending_signals;
+  if (!is_user_range((const void *)set_ptr, sizeof(uint64_t)) ||
+      copy_to_user((void *)set_ptr, &current->pending_signals, sizeof(uint64_t)) != 0)
+    return (uint64_t)-14;
   return 0;
 }
 
@@ -496,14 +502,15 @@ static uint64_t sys_rt_sigsuspend(uint64_t unewset, uint64_t sigsetsize,
 
   if (sigsetsize != 8)
     return (uint64_t)-22; // EINVAL
-  if (!unewset || !vmm_is_user_addr_range_valid(unewset, 8))
+  uint64_t newset;
+  if (!unewset || !is_user_range((const void *)unewset, sizeof(uint64_t)) ||
+      copy_from_user(&newset, (const void *)unewset, sizeof(uint64_t)) != 0)
     return (uint64_t)-14; // EFAULT
 
   struct thread *current = sched_get_current();
   if (!current)
     return (uint64_t)-1;
 
-  uint64_t newset = *(uint64_t *)unewset;
   newset &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
 
   current->saved_signal_mask = current->signal_mask;
@@ -660,6 +667,10 @@ static bool signal_dequeue_locked(struct thread *current, uint64_t bit,
     }
     return supplied;
   }
+  if (current->mm && current->mm->ref_count <= 1) {
+    current->pending_signals &= ~bit;
+    return false;
+  }
   extern struct thread *global_thread_list;
   for (struct thread *t = global_thread_list; t; t = t->global_next) {
     if (t->tgid == current->tgid && !(t->thread_directed_signals & bit))
@@ -695,14 +706,9 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
   }
 
   int sig = (current->syscall_dispatch_sigsys || current->seccomp_sigsys) ? SIGSYS : 0;
-  for (int i = 0; !sig && i < 64; i++) {
-    if (pending & (1ULL << i)) {
-      sig = i + 1;
-      break;
-    }
+  if (!sig) {
+    sig = __builtin_ctzll(pending) + 1;
   }
-  if (!sig)
-    return;
 
   struct kernel_siginfo queued_info;
   bool has_queued_info = false;
@@ -728,7 +734,13 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
     syscall_number = UINT64_MAX; /* this frame belongs to the original fault */
   }
 
-  struct k_sigaction *sa = &current->signal_handlers[sig - 1];
+  /* A sibling can reset a group disposition during frame construction.
+   * Keep one action snapshot through handler selection, restorer and mask. */
+  extern spinlock_t tid_lock;
+  spinlock_acquire(&tid_lock);
+  struct k_sigaction action = current->signal_handlers[sig - 1];
+  spinlock_release(&tid_lock);
+  struct k_sigaction *sa = &action;
 
   /* Adjust the saved user context before constructing a signal frame. A
    * handler returning through sigreturn then either re-executes SYSCALL or
@@ -755,8 +767,16 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
     // without being killed when it reads from the controlling terminal.
     if (sig == 21 || sig == 22 || sig == 32 || sig == 33)
       return;
-    klogf("[SIGNAL] Default action (terminate) for sig %llu comm=%s tid=%u rip=%llu rsp=%llu rax=%llu\n",
+    uint32_t sender_pid = current->signal_sender_pid[sig - 1];
+    int32_t sender_code = current->signal_sender_code[sig - 1];
+    if (has_queued_info) {
+      sender_pid = queued_info._kill.si_pid;
+      sender_code = queued_info.si_code;
+    }
+    sender_pid = pid_namespace_visible(current, sender_pid);
+    klogf("[SIGNAL] Default action (terminate) for sig %llu comm=%s tid=%u sender=%u si_code=%d rip=%llu rsp=%llu rax=%llu\n",
           (unsigned long long)sig, current->comm, current->tid,
+          sender_pid, sender_code,
           (unsigned long long)regs->rip, (unsigned long long)regs->rsp,
           (unsigned long long)regs->rax);
 
@@ -1444,6 +1464,11 @@ static uint64_t get_pending_signals_tgid(struct thread *curr, uint64_t mask) {
   if (pending)
     return pending;
 
+  /* If the process has no cloned threads sharing its VM, no other thread
+   * can have pending process signals. */
+  if (curr->mm && curr->mm->ref_count <= 1)
+    return 0;
+
   extern struct thread *global_thread_list;
   extern spinlock_t tid_lock;
   spinlock_acquire(&tid_lock);
@@ -1465,6 +1490,24 @@ static bool consume_signal_tgid(struct thread *curr, int sig, uint32_t *out_send
   uint64_t bit = (1ULL << (sig - 1));
   uint32_t sender = 0;
   bool consumed = false;
+
+  /* Fast-path for single-threaded process: consume without locking global_thread_list */
+  if (curr->mm && curr->mm->ref_count <= 1) {
+    if (curr->pending_signals & bit) {
+      if (curr->thread_directed_signals & bit) {
+        *has_info = signal_dequeue_locked(curr, bit, queued_info);
+      } else {
+        curr->pending_signals &= ~bit;
+        *has_info = false;
+      }
+      sender = curr->signal_sender_pid[sig - 1];
+      curr->signal_sender_pid[sig - 1] = 0;
+      consumed = true;
+    }
+    if (consumed && out_sender_pid)
+      *out_sender_pid = sender;
+    return consumed;
+  }
 
   extern struct thread *global_thread_list;
   extern spinlock_t tid_lock;
@@ -1515,13 +1558,7 @@ static uint32_t signalfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   while (1) {
     uint64_t pending = get_pending_signals_tgid(t, ctx->mask);
     if (pending) {
-      int sig = 0;
-      for (int i = 0; i < 64; i++) {
-        if (pending & (1ULL << i)) {
-          sig = i + 1;
-          break;
-        }
-      }
+      int sig = __builtin_ctzll(pending) + 1;
       uint32_t sender_pid = 0;
       struct kernel_siginfo queued_info;
       bool has_info = false;

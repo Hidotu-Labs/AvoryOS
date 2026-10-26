@@ -13,6 +13,7 @@
 #define EXT2_DIRECT_BLOCKS 12
 #define EXT2_GOOD_OLD_INODE_SIZE 128
 #define EXT2_FEATURE_COMPAT_DIR_INDEX 0x0020
+#define EXT2_FEATURE_INCOMPAT_64BIT 0x0080
 #define EXT2_INDEX_FL 0x00001000
 
 #define EXT2_S_IFREG 0x8000
@@ -81,8 +82,15 @@ typedef struct {
   uint32_t s_first_meta_bg;
   uint32_t s_mkfs_time;
   uint32_t s_jnl_blocks[17];
-  uint8_t s_padding[664];
+  uint32_t s_blocks_count_hi;
+  uint32_t s_r_blocks_count_hi;
+  uint32_t s_free_blocks_count_hi;
+  uint8_t s_padding[676];
 } __attribute__((packed)) ext2_superblock_t;
+_Static_assert(sizeof(ext2_superblock_t) == 1024,
+               "ext4 superblock must occupy exactly 1024 bytes");
+_Static_assert(__builtin_offsetof(ext2_superblock_t, s_blocks_count_hi) == 0x150,
+               "ext4 high block counters must match the on-disk offset");
 
 typedef struct {
   uint32_t bg_block_bitmap;
@@ -91,9 +99,28 @@ typedef struct {
   uint16_t bg_free_blocks_count;
   uint16_t bg_free_inodes_count;
   uint16_t bg_used_dirs_count;
-  uint16_t bg_pad;
-  uint8_t bg_reserved[12];
+  uint16_t bg_flags;
+  uint32_t bg_exclude_bitmap_lo;
+  uint16_t bg_block_bitmap_csum_lo;
+  uint16_t bg_inode_bitmap_csum_lo;
+  uint16_t bg_itable_unused_lo;
+  uint16_t bg_checksum;
+  uint32_t bg_block_bitmap_hi;
+  uint32_t bg_inode_bitmap_hi;
+  uint32_t bg_inode_table_hi;
+  uint16_t bg_free_blocks_count_hi;
+  uint16_t bg_free_inodes_count_hi;
+  uint16_t bg_used_dirs_count_hi;
+  uint16_t bg_itable_unused_hi;
+  uint32_t bg_exclude_bitmap_hi;
+  uint16_t bg_block_bitmap_csum_hi;
+  uint16_t bg_inode_bitmap_csum_hi;
+  uint32_t bg_reserved;
 } __attribute__((packed)) ext2_bgd_t;
+_Static_assert(sizeof(ext2_bgd_t) == 64,
+               "extended ext4 group descriptor must occupy 64 bytes");
+_Static_assert(__builtin_offsetof(ext2_bgd_t, bg_block_bitmap_hi) == 0x20,
+               "ext4 high group fields must match the on-disk offset");
 
 typedef struct {
   uint16_t i_mode;
@@ -139,7 +166,7 @@ typedef struct {
  * latest full-block content for that block; `payload_pos`/`desc_pos` are
  * logical journal block indexes assigned when the block first appeared. */
 typedef struct {
-  uint32_t block;
+  uint64_t block;
   uint32_t payload_pos;
   uint32_t desc_pos;
   uint8_t *image;
@@ -174,8 +201,10 @@ typedef struct {
    * Cache only mappings, never mutable journal contents. Keys are logical+1
    * so a zero-initialized slot is empty. Collisions just remap on demand. */
   uint32_t map_keys[EXT3_JOURNAL_MAP_SLOTS];
-  uint32_t map_blocks[EXT3_JOURNAL_MAP_SLOTS];
+  uint64_t map_blocks[EXT3_JOURNAL_MAP_SLOTS];
   uint32_t journal_blocks;
+  uint32_t journal_features_incompat;
+  uint8_t journal_uuid[16];
   uint32_t blocks_in_trans;
   rawspinlock_t lock;
   /* Fair ownership handoff under lock: the finishing owner keeps `lock`
@@ -200,13 +229,21 @@ typedef struct ext2_mount {
   struct block_device *dev;
   ext2_superblock_t sb;
   ext2_bgd_t *bgdt;
+  uint8_t *bgdt_raw;
+  uint16_t bgdt_desc_size;
+  uint64_t blocks_count;
+  uint64_t free_blocks_count;
+  uint64_t reserved_blocks_count;
   uint32_t block_size;
   uint32_t groups_count;
   uint32_t inodes_per_group;
   uint32_t inode_size;
+  /* Set when a filesystem advertises read-only-compatible features this
+   * driver does not implement. All VFS writes and block writes must reject. */
+  bool read_only;
   vfs_node_t *root_node;
   struct {
-    uint32_t num;
+    uint64_t num;
     uint8_t *data;
     /* Protected by cache_lock. Misses must not install an image read across
      * a write, even if another block has evicted the writer's cache entry. */
@@ -232,10 +269,77 @@ typedef struct ext2_mount {
 int ext2_mount(struct block_device *dev, vfs_node_t *mountpoint);
 int ext2_mount_root(struct block_device *dev);
 int ext2_statfs_impl(vfs_node_t *node, struct statfs_buf *buf);
-int ext2_read_block(ext2_mount_t *mnt, uint32_t block_num, void *buffer);
-int ext2_write_block(ext2_mount_t *mnt, uint32_t block_num, const void *buffer);
+int ext2_read_block(ext2_mount_t *mnt, uint64_t block_num, void *buffer);
+int ext2_write_block(ext2_mount_t *mnt, uint64_t block_num, const void *buffer);
 int ext2_read_inode(ext2_mount_t *mnt, uint32_t inode_num, ext2_inode_t *out);
-uint32_t ext2_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode, uint32_t logical_block);
+uint64_t ext2_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode, uint32_t logical_block);
+
+static inline uint64_t ext2_bgd_block_bitmap(const ext2_bgd_t *bgd) {
+  return ((uint64_t)bgd->bg_block_bitmap_hi << 32) | bgd->bg_block_bitmap;
+}
+static inline uint64_t ext2_bgd_inode_bitmap(const ext2_bgd_t *bgd) {
+  return ((uint64_t)bgd->bg_inode_bitmap_hi << 32) | bgd->bg_inode_bitmap;
+}
+static inline uint64_t ext2_bgd_inode_table(const ext2_bgd_t *bgd) {
+  return ((uint64_t)bgd->bg_inode_table_hi << 32) | bgd->bg_inode_table;
+}
+static inline uint32_t ext2_bgd_free_blocks(const ext2_bgd_t *bgd) {
+  return ((uint32_t)bgd->bg_free_blocks_count_hi << 16) |
+         bgd->bg_free_blocks_count;
+}
+static inline void ext2_bgd_set_free_blocks(ext2_bgd_t *bgd, uint32_t count) {
+  bgd->bg_free_blocks_count = (uint16_t)count;
+  bgd->bg_free_blocks_count_hi = (uint16_t)(count >> 16);
+}
+static inline uint32_t ext2_bgd_free_inodes(const ext2_bgd_t *bgd) {
+  return ((uint32_t)bgd->bg_free_inodes_count_hi << 16) |
+         bgd->bg_free_inodes_count;
+}
+static inline void ext2_bgd_set_free_inodes(ext2_bgd_t *bgd, uint32_t count) {
+  bgd->bg_free_inodes_count = (uint16_t)count;
+  bgd->bg_free_inodes_count_hi = (uint16_t)(count >> 16);
+}
+static inline uint32_t ext2_bgd_used_dirs(const ext2_bgd_t *bgd) {
+  return ((uint32_t)bgd->bg_used_dirs_count_hi << 16) |
+         bgd->bg_used_dirs_count;
+}
+static inline void ext2_bgd_set_used_dirs(ext2_bgd_t *bgd, uint32_t count) {
+  bgd->bg_used_dirs_count = (uint16_t)count;
+  bgd->bg_used_dirs_count_hi = (uint16_t)(count >> 16);
+}
+static inline uint64_t ext2_sb_blocks_count(const ext2_superblock_t *sb) {
+  uint64_t high = (sb->s_feature_incompat & EXT2_FEATURE_INCOMPAT_64BIT)
+                      ? sb->s_blocks_count_hi : 0;
+  return (high << 32) | sb->s_blocks_count;
+}
+static inline uint64_t ext2_sb_free_blocks_count(const ext2_superblock_t *sb) {
+  uint64_t high = (sb->s_feature_incompat & EXT2_FEATURE_INCOMPAT_64BIT)
+                      ? sb->s_free_blocks_count_hi : 0;
+  return (high << 32) | sb->s_free_blocks_count;
+}
+static inline uint64_t ext2_sb_reserved_blocks_count(const ext2_superblock_t *sb) {
+  uint64_t high = (sb->s_feature_incompat & EXT2_FEATURE_INCOMPAT_64BIT)
+                      ? sb->s_r_blocks_count_hi : 0;
+  return (high << 32) | sb->s_r_blocks_count;
+}
+static inline void ext2_sb_set_blocks_count(ext2_superblock_t *sb,
+                                            uint64_t count) {
+  sb->s_blocks_count = (uint32_t)count;
+  if (sb->s_feature_incompat & EXT2_FEATURE_INCOMPAT_64BIT)
+    sb->s_blocks_count_hi = (uint32_t)(count >> 32);
+}
+static inline void ext2_sb_set_free_blocks_count(ext2_superblock_t *sb,
+                                                 uint64_t count) {
+  sb->s_free_blocks_count = (uint32_t)count;
+  if (sb->s_feature_incompat & EXT2_FEATURE_INCOMPAT_64BIT)
+    sb->s_free_blocks_count_hi = (uint32_t)(count >> 32);
+}
+static inline void ext2_sb_set_reserved_blocks_count(ext2_superblock_t *sb,
+                                                     uint64_t count) {
+  sb->s_r_blocks_count = (uint32_t)count;
+  if (sb->s_feature_incompat & EXT2_FEATURE_INCOMPAT_64BIT)
+    sb->s_r_blocks_count_hi = (uint32_t)(count >> 32);
+}
 size_t ext2_buffer_cache_total_kb(void);
 size_t ext2_buffer_cache_shrink(size_t max_buffers);
 void ext2_register_mount(ext2_mount_t *mnt);

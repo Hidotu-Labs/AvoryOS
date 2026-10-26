@@ -5,6 +5,7 @@
 #include "../lib/string.h"
 #include "../lib/tsc.h"
 #include "../mm/heap.h"
+#include "../mm/page_ops.h"
 #include "../mm/pmm.h"
 #include "../sched/sched.h"
 #include "../sched/wait.h"
@@ -218,7 +219,10 @@ static void cache_drop_invalid_locked(vfs_node_t *node, uint32_t offset,
 
 static vfs_page_t *vfs_cache_lookup_locked(vfs_node_t *node, uint32_t offset) {
   spinlock_acquire(&node->pages_lock);
-  vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
+  vfs_page_t *page = asc_radix_tree_lookup_cached(&node->pages, cache_key(offset),
+                                                  &node->pc_cache_chunk,
+                                                  &node->pc_cache_leaf,
+                                                  &node->pc_cache_seq);
   if (page && !page_value_fast(page)) {
     cache_drop_invalid_locked(node, offset, page);
     page = NULL;
@@ -247,16 +251,9 @@ vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
   if (vfs_cache_lookup_force_locked || !vfs_rcu_ready())
     return vfs_cache_lookup_locked(node, offset);
 
-  /* Lockless read of the radix tree.  asc_radix_tree_lookup_lockless()
-   * validates a seqlock around the traversal, so a returned page was
-   * published for the whole read; tree nodes and pages are freed only after
-   * a grace period (fs/vfs_rcu.h), which is what makes the raw pointer safe
-   * to touch here.  The section runs with interrupts off so the drainer's
-   * barrier cannot acknowledge this CPU while a raw pointer is held; the
-   * transient reference the reader takes inside it keeps the page alive
-   * after the section ends.  vfs_page_tryref() refuses a page whose eviction
-   * raced the lookup, and an invalid leaf falls back to the locked path,
-   * which owns its cleanup. */
+  /* Lockless read of the radix tree using direct level-1 leaf cache.
+   * On sequential file reads and demand faults, consecutive pages share the
+   * same 256KB chunk (64 slots), bypassing the 4-level radix traversal. */
   uint64_t key = cache_key(offset);
   for (uint32_t attempt = 0; attempt < VFS_CACHE_LOOKUP_LOCKLESS_TRIES;
        attempt++) {
@@ -264,13 +261,18 @@ vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
 
     bool stable = false;
     vfs_page_t *page =
-        asc_radix_tree_lookup_lockless(&node->pages, key, &stable);
+        asc_radix_tree_lookup_lockless_cached(&node->pages, key, &stable,
+                                              &node->pc_cache_chunk,
+                                              &node->pc_cache_leaf,
+                                              &node->pc_cache_seq);
     bool live = stable && page &&
                 page_value_fast(page) && vfs_page_tryref(page);
     hal_irq_restore(flags);
 
-    if (!stable)
+    if (!stable) {
+      asm volatile("pause");
       continue; /* writer crossed the traversal: retry, then serialize */
+    }
     if (!page)
       return NULL; /* stable miss */
     if (!live)
@@ -537,6 +539,9 @@ retry:
  * scratch chunks before resorting to one page per call; a huge window must
  * never degrade into hundreds of tiny commands.
  *
+ * The VFS read ABI carries negative errno values in uint32_t. Require an
+ * exact byte count: an unsigned error is greater than the request and must
+ * never be clamped to a successful count or published as an uptodate page.
  * Returns the number of pages that were completely filled.  On a short read
  * the caller must drop the remaining pages: caching zeros for a failed
  * transfer would let a process execute garbage.
@@ -564,7 +569,7 @@ static uint32_t vfs_cache_fill_pages_individually(vfs_node_t *node,
     uint32_t to_read = available > PAGE_SIZE ? PAGE_SIZE : available;
     void *frame_virt = PHYS_TO_VIRT(pages[first + done]->frame_phys);
     uint32_t got = to_read ? node->read(node, page_off, to_read, frame_virt) : 0;
-    if (got < to_read) {
+    if (got != to_read) {
       vfs_readahead_warn_short(page_off, got, to_read);
       return done;
     }
@@ -611,9 +616,7 @@ static uint32_t vfs_cache_fill_pages(vfs_node_t *node, uint32_t offset,
         vfs_cache_frames_contiguous(pages, done, chunk)) {
       uint8_t *dest = (uint8_t *)PHYS_TO_VIRT(pages[done]->frame_phys);
       uint32_t got = ask ? node->read(node, chunk_off, ask, dest) : 0;
-      if (got > ask)
-        got = ask;
-      if (got < ask) {
+      if (got != ask) {
         vfs_readahead_warn_short(chunk_off, got, ask);
         return done + vfs_cache_fill_pages_individually(
                           node, offset, pages, done, chunk);
@@ -631,9 +634,7 @@ static uint32_t vfs_cache_fill_pages(vfs_node_t *node, uint32_t offset,
     if (scratch) {
       uint8_t *scratch_virt = (uint8_t *)PHYS_TO_VIRT((uint64_t)scratch);
       uint32_t got = ask ? node->read(node, chunk_off, ask, scratch_virt) : 0;
-      if (got > ask)
-        got = ask;
-      if (got < ask) {
+      if (got != ask) {
         vfs_readahead_warn_short(chunk_off, got, ask);
         pmm_free_pages(scratch, chunk);
         return done + vfs_cache_fill_pages_individually(
@@ -643,8 +644,8 @@ static uint32_t vfs_cache_fill_pages(vfs_node_t *node, uint32_t offset,
         memset(scratch_virt + got, 0, want - got);
 
       for (uint32_t i = 0; i < chunk; i++) {
-        memcpy(PHYS_TO_VIRT(pages[done + i]->frame_phys),
-               scratch_virt + (size_t)i * PAGE_SIZE, PAGE_SIZE);
+        page_copy(PHYS_TO_VIRT(pages[done + i]->frame_phys),
+                  scratch_virt + (size_t)i * PAGE_SIZE);
       }
       pmm_free_pages(scratch, chunk);
       done += chunk;
@@ -657,7 +658,7 @@ static uint32_t vfs_cache_fill_pages(vfs_node_t *node, uint32_t offset,
     uint32_t to_read = avail > PAGE_SIZE ? PAGE_SIZE : avail;
     void *frame_virt = PHYS_TO_VIRT(pages[done]->frame_phys);
     uint32_t read = to_read ? node->read(node, page_off, to_read, frame_virt) : 0;
-    if (read < to_read) {
+    if (read != to_read) {
       vfs_readahead_warn_short(page_off, read, to_read);
       return done;
     }
@@ -699,7 +700,10 @@ uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_byt
     uint32_t page_off = offset + i * PAGE_SIZE;
     if (page_off >= node->length)
       break;
-    vfs_page_t *existing = asc_radix_tree_lookup(&node->pages, cache_key(page_off));
+    vfs_page_t *existing = asc_radix_tree_lookup_cached(&node->pages, cache_key(page_off),
+                                                        &node->pc_cache_chunk,
+                                                        &node->pc_cache_leaf,
+                                                        &node->pc_cache_seq);
     if (existing && !page_value_valid(existing)) {
       cache_drop_invalid_locked(node, page_off, existing);
       existing = NULL;
@@ -1025,11 +1029,13 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
        * hand the caller zeros or stale bytes and turn a transient fill
        * failure into a silent short read.  Confirm readiness the same way
        * the fault path does and let get_or_create() wait/retry instead. */
-      bool ready = false;
-      spinlock_acquire(&node->pages_lock);
-      if (!page->loading && page->uptodate && page->frame_phys)
-        ready = true;
-      spinlock_release(&node->pages_lock);
+      bool ready = (!__atomic_load_n(&page->loading, __ATOMIC_ACQUIRE) &&
+                    page->uptodate && page->frame_phys);
+      if (__builtin_expect(!ready, 0)) {
+        spinlock_acquire(&node->pages_lock);
+        ready = (!page->loading && page->uptodate && page->frame_phys);
+        spinlock_release(&node->pages_lock);
+      }
       if (!ready) {
         vfs_cache_put(node, page);
         page = NULL;

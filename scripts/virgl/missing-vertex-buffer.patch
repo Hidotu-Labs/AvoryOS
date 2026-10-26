@@ -1,0 +1,60 @@
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 4bf88e0..99620b9 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -720,6 +720,7 @@ struct vrend_sub_context {
+    struct pipe_index_buffer ib;
+ 
+    bool vbo_dirty;
++   bool warned_missing_vertex_buffer;
+    bool shader_dirty;
+    bool cs_shader_dirty;
+    bool stencil_state_dirty;
+@@ -3601,7 +3602,9 @@ static void vrend_set_num_vbo_sub(struct vrend_sub_context *sub,
+    int i;
+ 
+    sub->num_vbos = num_vbo;
+-   sub->old_num_vbos = old_num;
++   /* Several SET_VERTEX_BUFFERS commands can precede the next draw. Keep
++    * the highest retired binding until GL has actually consumed the update. */
++   sub->old_num_vbos = MAX2(sub->old_num_vbos, old_num);
+ 
+    if (old_num != num_vbo)
+       sub->vbo_dirty = true;
+@@ -5227,6 +5230,7 @@ static void vrend_draw_bind_vertex_binding(struct vrend_context *ctx,
+             glBindVertexBuffer(i, 0, 0, 0);
+       }
+ 
++      ctx->sub->old_num_vbos = ctx->sub->num_vbos;
+       ctx->sub->vbo_dirty = false;
+    }
+ }
+@@ -5989,6 +5993,28 @@ int vrend_draw_vbo(struct vrend_context *ctx,
+       }
+    }
+ 
++   /* An enabled vertex element with no backing BO becomes a host client
++    * pointer at address zero. Some OpenGL drivers dereference it during an
++    * indexed draw instead of rejecting it. Skip this invalid draw, preserving
++    * the context so a later SET_VERTEX_BUFFERS can restore valid bindings.
++    * Shaders using only vertex ID have no inputs and need no BOs. */
++   if (sub_ctx->ve) {
++      uint32_t inputs = sub_ctx->prog->ss[PIPE_SHADER_VERTEX]->sel->sinfo.attrib_input_mask;
++      for (unsigned i = 0; i < sub_ctx->ve->count; i++) {
++         if (!(inputs & (1u << i)))
++            continue;
++         unsigned binding = sub_ctx->ve->elements[i].base.vertex_buffer_index;
++         if (binding >= (unsigned)sub_ctx->num_vbos ||
++             !sub_ctx->vbo[binding].base.buffer) {
++            if (!sub_ctx->warned_missing_vertex_buffer) {
++               virgl_warn("Skipping draw with an unbound vertex buffer\n");
++               sub_ctx->warned_missing_vertex_buffer = true;
++            }
++            return 0;
++         }
++      }
++   }
++
+    vrend_draw_bind_objects(sub_ctx, program_select_result == PROGRAMM_NEW);
+    vrend_fill_sysval_uniform_block(sub_ctx);
+ 

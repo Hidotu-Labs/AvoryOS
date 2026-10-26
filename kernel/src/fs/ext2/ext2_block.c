@@ -36,7 +36,13 @@ static void ext2_cache_prepare(ext2_mount_t *mnt, uint32_t idx) {
   kfree(data);
 }
 
-int ext2_read_block(ext2_mount_t *mnt, uint32_t block_num, void *buffer) {
+int ext2_read_block(ext2_mount_t *mnt, uint64_t block_num, void *buffer) {
+  if (!mnt || !buffer || !mnt->block_size)
+    return -1;
+  if (ext3_journal_read_staged(mnt, block_num, buffer))
+    return 0;
+  /* Physical block 0 remains the hole/sentinel result used by inode maps.
+   * Metadata may still stage its full image there (the >1 KiB superblock). */
   if (block_num == 0) {
     memset(buffer, 0, mnt->block_size);
     return 0;
@@ -45,10 +51,14 @@ int ext2_read_block(ext2_mount_t *mnt, uint32_t block_num, void *buffer) {
   /* The active journal transaction keeps the latest metadata image in memory
    * until its commit checkpoint; read-modify-write sequences must see that
    * image even though the home block still holds the pre-transaction copy. */
-  if (ext3_journal_read_staged(mnt, block_num, buffer))
-    return 0;
+  uint32_t sectors_per_block = mnt->block_size / 512;
+  if (!sectors_per_block || mnt->block_size % 512 ||
+      block_num >= mnt->blocks_count ||
+      block_num >
+          (UINT64_MAX - (sectors_per_block - 1)) / sectors_per_block)
+    return -1;
 
-  uint32_t idx = block_num % EXT2_CACHE_SIZE;
+  uint32_t idx = (uint32_t)(block_num % EXT2_CACHE_SIZE);
 read_retry:
   spinlock_acquire(&mnt->cache_lock);
   if (mnt->cache[idx].data && mnt->cache[idx].num == block_num) {
@@ -64,23 +74,22 @@ read_retry:
   uint64_t write_seq = mnt->cache[idx].write_seq;
   spinlock_release(&mnt->cache_lock);
 
-  uint64_t byte_offset = (uint64_t)block_num * mnt->block_size;
-  uint64_t lba         = byte_offset / 512;
-  uint32_t sectors     = mnt->block_size / 512;
+  uint64_t lba     = block_num * sectors_per_block;
+  uint32_t sectors = sectors_per_block;
   int err = mnt->dev->read_sectors(mnt->dev, lba, sectors, buffer);
   if (err) {
     static uint32_t err_count;
     if (__atomic_add_fetch(&err_count, 1, __ATOMIC_RELAXED) <= 8) {
-      union { uint32_t u; char s[4]; } alias = { .u = block_num };
+      union { uint32_t u; char s[4]; } alias = { .u = (uint32_t)block_num };
       struct thread *ct = sched_get_current();
-      klogf("[EXT2] block %u read failed: lba=%llu sectors=%u err=%d"
-            " ascii='%c%c%c%c' bs=%u nblocks=%u comm='%s' tid=%u tgid=%u\n",
-            block_num, (unsigned long long)lba, sectors, err,
+      klogf("[EXT2] block %llu read failed: lba=%llu sectors=%u err=%d"
+            " ascii='%c%c%c%c' bs=%u nblocks=%llu comm='%s' tid=%u tgid=%u\n",
+            (unsigned long long)block_num, (unsigned long long)lba, sectors, err,
             alias.s[0] >= 32 && alias.s[0] < 127 ? alias.s[0] : '.',
             alias.s[1] >= 32 && alias.s[1] < 127 ? alias.s[1] : '.',
             alias.s[2] >= 32 && alias.s[2] < 127 ? alias.s[2] : '.',
             alias.s[3] >= 32 && alias.s[3] < 127 ? alias.s[3] : '.',
-            mnt->block_size, mnt->sb.s_blocks_count,
+            mnt->block_size, (unsigned long long)mnt->blocks_count,
             (ct && ct->comm[0]) ? ct->comm : "?",
             ct ? ct->tid : 0, ct ? ct->tgid : 0);
     }
@@ -117,13 +126,19 @@ read_retry:
 
 /* An optional phase pointer belongs to the owning journal transaction. It
  * exposes which part of the home write is stalled without a new mount layout. */
-int ext2_write_block_traced(ext2_mount_t *mnt, uint32_t block_num,
+int ext2_write_block_traced(ext2_mount_t *mnt, uint64_t block_num,
                             const void *buffer, const char **phase,
                             const char *const stages[4]) {
-  if (block_num == 0)
+  if (!mnt || mnt->read_only || !buffer ||
+      !mnt->block_size || block_num >= mnt->blocks_count ||
+      mnt->block_size % 512 || !mnt->dev ||
+      !mnt->dev->write_sectors)
+    return -1;
+  uint32_t sectors = mnt->block_size / 512;
+  if (!sectors || block_num > (UINT64_MAX - (sectors - 1)) / sectors)
     return -1;
 
-  uint32_t idx = block_num % EXT2_CACHE_SIZE;
+  uint32_t idx = (uint32_t)(block_num % EXT2_CACHE_SIZE);
   if (phase) *phase = stages[0];
   ext2_cache_prepare(mnt, idx);
   if (phase) *phase = stages[1];
@@ -136,9 +151,7 @@ int ext2_write_block_traced(ext2_mount_t *mnt, uint32_t block_num,
   }
   spinlock_release(&mnt->cache_lock);
 
-  uint64_t byte_offset = (uint64_t)block_num * mnt->block_size;
-  uint64_t lba         = byte_offset / 512;
-  uint32_t sectors     = mnt->block_size / 512;
+  uint64_t lba = block_num * sectors;
   if (phase) *phase = stages[2];
   int err = mnt->dev->write_sectors(mnt->dev, lba, sectors, buffer);
   if (phase) *phase = stages[3];
@@ -151,7 +164,7 @@ int ext2_write_block_traced(ext2_mount_t *mnt, uint32_t block_num,
   return err;
 }
 
-int ext2_write_block_phase(ext2_mount_t *mnt, uint32_t block_num,
+int ext2_write_block_phase(ext2_mount_t *mnt, uint64_t block_num,
                            const void *buffer, const char **phase) {
   static const char *const stages[4] = {
       "metadata-home-cache-alloc", "metadata-home-cache-publish",
@@ -159,7 +172,7 @@ int ext2_write_block_phase(ext2_mount_t *mnt, uint32_t block_num,
   return ext2_write_block_traced(mnt, block_num, buffer, phase, stages);
 }
 
-int ext2_write_block(ext2_mount_t *mnt, uint32_t block_num,
+int ext2_write_block(ext2_mount_t *mnt, uint64_t block_num,
                      const void *buffer) {
   return ext2_write_block_phase(mnt, block_num, buffer, NULL);
 }
@@ -167,18 +180,24 @@ int ext2_write_block(ext2_mount_t *mnt, uint32_t block_num,
 /* Publish and version every member before issuing a bounded contiguous data
  * transfer. Even colliding readers must detect writes across cache eviction.
  * Journal ownership serializes filesystem writers, as for write_block(). */
-int ext2_write_blocks(ext2_mount_t *mnt, uint32_t first, uint32_t count,
+int ext2_write_blocks(ext2_mount_t *mnt, uint64_t first, uint32_t count,
                       const void *buffer) {
-  if (!mnt || !buffer || !mnt->dev || !mnt->dev->write_sectors ||
+  if (!mnt || mnt->read_only || !buffer || !mnt->dev ||
+      !mnt->dev->write_sectors ||
       !first || !count || count > 32 || !mnt->block_size ||
-      mnt->block_size % 512 || first >= mnt->sb.s_blocks_count ||
-      count > mnt->sb.s_blocks_count - first)
+      mnt->block_size % 512 || first >= mnt->blocks_count ||
+      count > mnt->blocks_count - first)
+    return -1;
+  uint32_t sectors_per_block = mnt->block_size / 512;
+  uint64_t request_sectors = (uint64_t)count * sectors_per_block;
+  if (!sectors_per_block ||
+      first > (UINT64_MAX - (request_sectors - 1)) / sectors_per_block)
     return -1;
   for (uint32_t i = 0; i < count; i++)
-    ext2_cache_prepare(mnt, (first + i) % EXT2_CACHE_SIZE);
+    ext2_cache_prepare(mnt, (uint32_t)((first + i) % EXT2_CACHE_SIZE));
   spinlock_acquire(&mnt->cache_lock);
   for (uint32_t i = 0; i < count; i++) {
-    uint32_t idx = (first + i) % EXT2_CACHE_SIZE;
+    uint32_t idx = (uint32_t)((first + i) % EXT2_CACHE_SIZE);
     mnt->cache[idx].write_seq++;
     mnt->cache[idx].writes_inflight++;
     if (mnt->cache[idx].data) {
@@ -188,12 +207,11 @@ int ext2_write_blocks(ext2_mount_t *mnt, uint32_t first, uint32_t count,
     }
   }
   spinlock_release(&mnt->cache_lock);
-  uint32_t sectors_per_block = mnt->block_size / 512;
   int err = mnt->dev->write_sectors(mnt->dev,
-      (uint64_t)first * sectors_per_block, count * sectors_per_block, buffer);
+      first * sectors_per_block, (uint32_t)request_sectors, buffer);
   spinlock_acquire(&mnt->cache_lock);
   for (uint32_t i = 0; i < count; i++) {
-    uint32_t idx = (first + i) % EXT2_CACHE_SIZE;
+    uint32_t idx = (uint32_t)((first + i) % EXT2_CACHE_SIZE);
     mnt->cache[idx].write_seq++;
     mnt->cache[idx].writes_inflight--;
     if (err && mnt->cache[idx].num == first + i)
@@ -211,7 +229,8 @@ int ext2_write_blocks(ext2_mount_t *mnt, uint32_t first, uint32_t count,
 
 int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
                             uint32_t count) {
-  if (!mnt || !entries || !count || count > EXT2_BLOCK_BATCH_MAX ||
+  if (!mnt || mnt->read_only || !entries || !count ||
+      count > EXT2_BLOCK_BATCH_MAX ||
       !mnt->dev || !mnt->dev->write_sectors || !mnt->block_size ||
       mnt->block_size % 512)
     return -1;
@@ -220,11 +239,13 @@ int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
   struct block_io_req reqs[EXT2_BLOCK_BATCH_MAX];
   for (uint32_t i = 0; i < count; i++) {
     entries[i].result = -1;
-    if (!entries[i].buffer || entries[i].block_num == 0 ||
-        entries[i].block_num >= mnt->sb.s_blocks_count)
+    if (!entries[i].buffer ||
+      entries[i].block_num >= mnt->blocks_count ||
+      entries[i].block_num >
+          (UINT64_MAX - (sectors_per_block - 1)) / sectors_per_block)
       return -1;
-    ext2_cache_prepare(mnt, entries[i].block_num % EXT2_CACHE_SIZE);
-    reqs[i].lba = (uint64_t)entries[i].block_num * sectors_per_block;
+    ext2_cache_prepare(mnt, (uint32_t)(entries[i].block_num % EXT2_CACHE_SIZE));
+    reqs[i].lba = entries[i].block_num * sectors_per_block;
     reqs[i].count = sectors_per_block;
     reqs[i].buf = (void *)entries[i].buffer;
     reqs[i].result = -1;
@@ -232,7 +253,7 @@ int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
 
   spinlock_acquire(&mnt->cache_lock);
   for (uint32_t i = 0; i < count; i++) {
-    uint32_t idx = entries[i].block_num % EXT2_CACHE_SIZE;
+    uint32_t idx = (uint32_t)(entries[i].block_num % EXT2_CACHE_SIZE);
     mnt->cache[idx].write_seq++;
     mnt->cache[idx].writes_inflight++;
     if (mnt->cache[idx].data) {
@@ -246,7 +267,7 @@ int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
 
   spinlock_acquire(&mnt->cache_lock);
   for (uint32_t i = 0; i < count; i++) {
-    uint32_t idx = entries[i].block_num % EXT2_CACHE_SIZE;
+    uint32_t idx = (uint32_t)(entries[i].block_num % EXT2_CACHE_SIZE);
     bool failed = reqs[i].result != 0;
     entries[i].result = failed ? -1 : 0;
     mnt->cache[idx].write_seq++;
@@ -263,25 +284,70 @@ int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
 }
 
 int ext2_write_superblock(ext2_mount_t *mnt) {
-  uint8_t buf[1024];
-  int err = mnt->dev->read_sectors(mnt->dev, 2, 2, buf);
-  if (err)
+  if (!mnt || mnt->read_only)
+    return -30;
+  if (!mnt->dev || !mnt->dev->read_sectors || mnt->block_size < 1024 ||
+      mnt->block_size % 512)
     return -1;
-  memcpy(buf, &mnt->sb, sizeof(ext2_superblock_t));
-  return ext3_journal_block(mnt, 1, buf);
+  uint8_t *buf = kmalloc(mnt->block_size);
+  if (!buf)
+    return -1;
+  uint64_t superblock_block = 1024 / mnt->block_size;
+  uint32_t superblock_offset = 1024 % mnt->block_size;
+  uint32_t sectors_per_block = mnt->block_size / 512;
+  int err;
+  if (superblock_block == 0) {
+    if (ext3_journal_read_staged(mnt, superblock_block, buf)) {
+      err = 0;
+    } else {
+      err = mnt->dev->read_sectors(mnt->dev, 0, sectors_per_block, buf);
+    }
+  } else {
+    err = ext2_read_block(mnt, superblock_block, buf);
+  }
+  if (err) {
+    kfree(buf);
+    return -1;
+  }
+  ext2_sb_set_blocks_count(&mnt->sb, mnt->blocks_count);
+  ext2_sb_set_free_blocks_count(&mnt->sb, mnt->free_blocks_count);
+  ext2_sb_set_reserved_blocks_count(&mnt->sb, mnt->reserved_blocks_count);
+  memcpy(buf + superblock_offset, &mnt->sb, sizeof(ext2_superblock_t));
+  err = ext3_journal_block(mnt, superblock_block, buf);
+  kfree(buf);
+  return err;
+}
+
+static int ext2_sync_bgdt_raw(ext2_mount_t *mnt) {
+  if (!mnt || !mnt->bgdt || !mnt->bgdt_raw || !mnt->bgdt_desc_size)
+    return -1;
+  size_t copy_size = mnt->bgdt_desc_size;
+  if (copy_size > sizeof(ext2_bgd_t))
+    copy_size = sizeof(ext2_bgd_t);
+  for (uint32_t i = 0; i < mnt->groups_count; i++)
+    memcpy(mnt->bgdt_raw + (size_t)i * mnt->bgdt_desc_size,
+           &mnt->bgdt[i], copy_size);
+  return 0;
 }
 
 int ext2_write_bgdt(ext2_mount_t *mnt) {
-  uint32_t bgdt_block    = mnt->sb.s_first_data_block + 1;
-  uint32_t bgdt_size     = mnt->groups_count * sizeof(ext2_bgd_t);
-  uint32_t blocks_needed = (bgdt_size + mnt->block_size - 1) / mnt->block_size;
+  if (!mnt || mnt->read_only)
+    return -30;
+  if (ext2_sync_bgdt_raw(mnt) != 0)
+    return -1;
+  uint64_t bgdt_block = (uint64_t)mnt->sb.s_first_data_block + 1;
+  uint64_t bgdt_size = (uint64_t)mnt->groups_count * mnt->bgdt_desc_size;
+  uint64_t alloc_size = (bgdt_size + mnt->block_size - 1) /
+                        mnt->block_size * mnt->block_size;
+  if (alloc_size > SIZE_MAX || alloc_size / mnt->block_size > UINT32_MAX)
+    return -1;
+  uint32_t blocks_needed = (uint32_t)(alloc_size / mnt->block_size);
 
-  uint8_t *tmp = kmalloc(blocks_needed * mnt->block_size);
+  uint8_t *tmp = kmalloc((size_t)alloc_size);
   if (!tmp)
     return -1;
 
-  memset(tmp, 0, blocks_needed * mnt->block_size);
-  memcpy(tmp, mnt->bgdt, bgdt_size);
+  memcpy(tmp, mnt->bgdt_raw, (size_t)alloc_size);
 
   for (uint32_t i = 0; i < blocks_needed; i++) {
     int err = ext3_journal_block(mnt, bgdt_block + i,
@@ -323,7 +389,8 @@ void ext2_mark_metadata_dirty(ext2_mount_t *mnt) {
 void ext2_mark_group_dirty(ext2_mount_t *mnt, uint32_t group) {
   if (!mnt || group >= mnt->groups_count)
     return;
-  uint32_t block = group * sizeof(ext2_bgd_t) / mnt->block_size;
+  uint32_t block = (uint32_t)((uint64_t)group * mnt->bgdt_desc_size /
+                              mnt->block_size);
   spinlock_acquire(&mnt->cache_lock);
   mnt->metadata_dirty = true;
   if (!mnt->bgdt_all_dirty) {
@@ -344,6 +411,8 @@ void ext2_mark_group_dirty(ext2_mount_t *mnt, uint32_t group) {
 int ext2_flush_metadata(ext2_mount_t *mnt) {
   if (!mnt)
     return -1;
+  if (mnt->read_only)
+    return 0;
   uint32_t dirty[EXT2_DIRTY_BGD_MAX];
   spinlock_acquire(&mnt->cache_lock);
   if (!mnt->metadata_dirty) {
@@ -366,15 +435,18 @@ int ext2_flush_metadata(ext2_mount_t *mnt) {
     if (!buf) {
       result = -1;
     } else {
-      uint32_t size = mnt->groups_count * sizeof(ext2_bgd_t);
-      uint32_t first = mnt->sb.s_first_data_block + 1;
+      if (ext2_sync_bgdt_raw(mnt) != 0) {
+        result = -1;
+      }
+      uint64_t size = (uint64_t)mnt->groups_count * mnt->bgdt_desc_size;
+      uint64_t first = (uint64_t)mnt->sb.s_first_data_block + 1;
       for (uint32_t i = 0; i < count && result == 0; i++) {
-        uint32_t offset = dirty[i] * mnt->block_size;
-        uint32_t bytes = size - offset;
+        uint64_t offset = (uint64_t)dirty[i] * mnt->block_size;
+        uint64_t bytes = size - offset;
         if (bytes > mnt->block_size)
           bytes = mnt->block_size;
         memset(buf, 0, mnt->block_size);
-        memcpy(buf, (uint8_t *)mnt->bgdt + offset, bytes);
+        memcpy(buf, mnt->bgdt_raw + offset, (size_t)bytes);
         result = ext3_journal_block(mnt, first + dirty[i], buf);
       }
       kfree(buf);
@@ -400,7 +472,7 @@ int ext2_read_inode(ext2_mount_t *mnt, uint32_t inode_num,
   if (group >= mnt->groups_count)
     return -1;
 
-  uint32_t inode_table_block    = mnt->bgdt[group].bg_inode_table;
+  uint64_t inode_table_block    = ext2_bgd_inode_table(&mnt->bgdt[group]);
   uint32_t byte_offset_in_table = index * mnt->inode_size;
   uint32_t block_offset         = byte_offset_in_table / mnt->block_size;
   uint32_t offset_within_block  = byte_offset_in_table % mnt->block_size;
@@ -433,7 +505,7 @@ static int ext2_write_inode_in_transaction(ext2_mount_t *mnt, uint32_t inode_num
   if (group >= mnt->groups_count)
     return -1;
 
-  uint32_t inode_table_block    = mnt->bgdt[group].bg_inode_table;
+  uint64_t inode_table_block    = ext2_bgd_inode_table(&mnt->bgdt[group]);
   uint32_t byte_offset_in_table = index * mnt->inode_size;
   uint32_t block_offset         = byte_offset_in_table / mnt->block_size;
   uint32_t offset_within_block  = byte_offset_in_table % mnt->block_size;
@@ -470,26 +542,26 @@ int ext2_write_inode(ext2_mount_t *mnt, uint32_t inode_num,
   return result != 0 ? result : stop_result;
 }
 
-uint32_t ext2_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode,
-                             uint32_t logical_block) {
+uint64_t ext2_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode,
+                            uint32_t logical_block) {
   if (inode->i_flags & EXT4_EXTENTS_FL)
     return ext4_get_block_num(mnt, inode, logical_block);
   uint32_t ptrs_per_block = mnt->block_size / 4;
 
   if (logical_block < EXT2_DIRECT_BLOCKS) {
     uint32_t result = inode->i_block[logical_block];
-    if (result != 0 && result >= mnt->sb.s_blocks_count) {
+    if (result != 0 && result >= mnt->blocks_count) {
       union { uint32_t u; char s[4]; } alias = { .u = result };
       struct thread *ct = sched_get_current();
       klogf("[EXT2] bad direct block: logical=%u result=%u ascii='%c%c%c%c'"
-            " i_block0=%u i_block1=%u nblocks=%u comm='%s' tid=%u\n",
+            " i_block0=%u i_block1=%u nblocks=%llu comm='%s' tid=%u\n",
             logical_block, result,
             alias.s[0] >= 32 && alias.s[0] < 127 ? alias.s[0] : '.',
             alias.s[1] >= 32 && alias.s[1] < 127 ? alias.s[1] : '.',
             alias.s[2] >= 32 && alias.s[2] < 127 ? alias.s[2] : '.',
             alias.s[3] >= 32 && alias.s[3] < 127 ? alias.s[3] : '.',
             inode->i_block[0], inode->i_block[1],
-            mnt->sb.s_blocks_count,
+            (unsigned long long)mnt->blocks_count,
             (ct && ct->comm[0]) ? ct->comm : "?",
             ct ? ct->tid : 0);
     }
@@ -605,7 +677,7 @@ static int ext2_pointer_path(ext2_mount_t *mnt, uint32_t logical,
 /* Unlike the legacy hole-or-error lookup, writes must not allocate a new
  * data block when an existing indirect block could not be read. */
 int ext2_get_block_num_checked(ext2_mount_t *mnt, ext2_inode_t *inode,
-                                uint32_t logical, uint32_t *out) {
+                                uint32_t logical, uint64_t *out) {
   if (!mnt || !inode || !out || (inode->i_flags & EXT4_EXTENTS_FL))
     return -1;
   *out = 0;
@@ -619,13 +691,13 @@ int ext2_get_block_num_checked(ext2_mount_t *mnt, ext2_inode_t *inode,
     return -1;
   int result = 0;
   for (int level = 0; level < depth && block; level++) {
-    if (block >= mnt->sb.s_blocks_count || ext2_read_block(mnt, block, buf) != 0) {
+    if (block >= mnt->blocks_count || ext2_read_block(mnt, block, buf) != 0) {
       result = -1;
       break;
     }
     block = buf[indices[level]];
   }
-  if (block >= mnt->sb.s_blocks_count && block)
+  if (block >= mnt->blocks_count && block)
     result = -1;
   if (!result)
     *out = block;
@@ -634,9 +706,10 @@ int ext2_get_block_num_checked(ext2_mount_t *mnt, ext2_inode_t *inode,
 }
 
 int ext2_set_block_num(ext2_mount_t *mnt, ext2_inode_t *inode,
-                       uint32_t logical, uint32_t disk_block) {
+                       uint32_t logical, uint64_t disk_block) {
   if (!mnt || !inode || (inode->i_flags & EXT4_EXTENTS_FL) ||
-      (disk_block && disk_block >= mnt->sb.s_blocks_count))
+      disk_block > UINT32_MAX ||
+      (disk_block && disk_block >= mnt->blocks_count))
     return -1;
   uint32_t root, indices[3];
   int depth = ext2_pointer_path(mnt, logical, &root, indices);
@@ -661,7 +734,7 @@ int ext2_set_block_num(ext2_mount_t *mnt, ext2_inode_t *inode,
     inode->i_block[root] = block;
   }
   for (int level = 0; level < depth; level++) {
-    if (block >= mnt->sb.s_blocks_count || ext2_read_block(mnt, block, buf) != 0)
+    if (block >= mnt->blocks_count || ext2_read_block(mnt, block, buf) != 0)
       goto done;
     uint32_t index = indices[level];
     if (level == depth - 1) {
@@ -699,27 +772,32 @@ done:
  * the caller and reused across groups.  start_bit is only meaningful for the
  * group containing the allocation goal: it makes the scan wrap within that
  * group so the search still starts near the goal. */
-static uint32_t ext2_alloc_in_group(ext2_mount_t *mnt, uint32_t g,
+static uint64_t ext2_alloc_in_group(ext2_mount_t *mnt, uint32_t g,
                                     uint32_t start_bit, uint8_t *bitmap,
-                                    uint32_t max_blocks, uint32_t *run_count) {
-  if (ext2_read_block(mnt, mnt->bgdt[g].bg_block_bitmap, bitmap) != 0)
+                                    uint32_t max_blocks, uint32_t *run_count,
+                                    bool allow_large_blocks) {
+  if (ext2_read_block(mnt, ext2_bgd_block_bitmap(&mnt->bgdt[g]), bitmap) != 0)
     return 0;
 
   uint32_t blocks_in_group = mnt->sb.s_blocks_per_group;
   if (blocks_in_group > mnt->block_size * 8u)
     return 0;
-  if (g == mnt->groups_count - 1) {
-    /* Block numbers are offset by first_data_block and the last group is
-     * short.  The old formula subtracted only the group offset, which lets
-     * the scan walk one block past the end of the filesystem. */
-    uint32_t group_start =
-        mnt->sb.s_first_data_block + g * mnt->sb.s_blocks_per_group;
-    if (group_start >= mnt->sb.s_blocks_count)
-      return 0;
-    uint32_t remaining = mnt->sb.s_blocks_count - group_start;
-    if (remaining < blocks_in_group)
-      blocks_in_group = remaining;
+  uint64_t alloc_limit = mnt->blocks_count;
+  if (allow_large_blocks &&
+      (mnt->sb.s_feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS)) {
+    if (alloc_limit > (1ULL << 48))
+      alloc_limit = 1ULL << 48;
+  } else if (alloc_limit > (1ULL << 32)) {
+    /* Legacy inode block maps store each physical block in 32 bits. */
+    alloc_limit = 1ULL << 32;
   }
+  uint64_t group_start = (uint64_t)mnt->sb.s_first_data_block +
+                         (uint64_t)g * mnt->sb.s_blocks_per_group;
+  if (group_start >= alloc_limit)
+    return 0;
+  uint64_t remaining = alloc_limit - group_start;
+  if (remaining < blocks_in_group)
+    blocks_in_group = (uint32_t)remaining;
 
   /* Two windows: [start_bit, end) then [0, start_bit).  With start_bit == 0
    * the second pass is empty. */
@@ -743,21 +821,22 @@ static uint32_t ext2_alloc_in_group(ext2_mount_t *mnt, uint32_t g,
         count++;
       for (uint32_t n = 0; n < count; n++)
         bitmap[(b + n) / 8] |= (uint8_t)(1u << ((b + n) % 8));
-      if (ext3_journal_block(mnt, mnt->bgdt[g].bg_block_bitmap, bitmap) != 0)
+      uint64_t bitmap_block = ext2_bgd_block_bitmap(&mnt->bgdt[g]);
+      if (ext3_journal_block(mnt, bitmap_block, bitmap) != 0)
         return 0;
 
-      mnt->bgdt[g].bg_free_blocks_count =
-          mnt->bgdt[g].bg_free_blocks_count > count
-              ? mnt->bgdt[g].bg_free_blocks_count - count : 0;
-      mnt->sb.s_free_blocks_count = mnt->sb.s_free_blocks_count > count
-                                      ? mnt->sb.s_free_blocks_count - count : 0;
+      uint32_t group_free = ext2_bgd_free_blocks(&mnt->bgdt[g]);
+      ext2_bgd_set_free_blocks(&mnt->bgdt[g],
+          group_free > count ? group_free - count : 0);
+      mnt->free_blocks_count = mnt->free_blocks_count > count
+                                   ? mnt->free_blocks_count - count : 0;
       ext2_mark_group_dirty(mnt, g);
 
-      uint32_t allocated_block = mnt->sb.s_first_data_block +
-                                 g * mnt->sb.s_blocks_per_group + b;
+      uint64_t allocated_block = (uint64_t)mnt->sb.s_first_data_block +
+                                 (uint64_t)g * mnt->sb.s_blocks_per_group + b;
       spinlock_acquire(&mnt->cache_lock);
       for (uint32_t n = 0; n < count; n++) {
-        uint32_t c_idx = (allocated_block + n) % EXT2_CACHE_SIZE;
+        uint32_t c_idx = (uint32_t)((allocated_block + n) % EXT2_CACHE_SIZE);
         mnt->cache[c_idx].write_seq++;
         if (mnt->cache[c_idx].num == allocated_block + n)
           mnt->cache[c_idx].num = 0;
@@ -771,8 +850,10 @@ static uint32_t ext2_alloc_in_group(ext2_mount_t *mnt, uint32_t g,
   return 0;
 }
 
-uint32_t ext2_alloc_run_hint(ext2_mount_t *mnt, uint32_t goal,
-                              uint32_t max_blocks, uint32_t *run_count) {
+static uint64_t ext2_alloc_run_hint_limit(ext2_mount_t *mnt, uint64_t goal,
+                                           uint32_t max_blocks,
+                                           uint32_t *run_count,
+                                           bool allow_large_blocks) {
   if (!mnt || !run_count || !max_blocks || !mnt->groups_count)
     return 0;
   *run_count = 0;
@@ -787,26 +868,29 @@ uint32_t ext2_alloc_run_hint(ext2_mount_t *mnt, uint32_t goal,
   uint32_t start_group = 0;
   uint32_t start_bit = 0;
 
-  if (goal >= mnt->sb.s_first_data_block && goal < mnt->sb.s_blocks_count) {
-    uint32_t rel = goal - mnt->sb.s_first_data_block;
-    start_group = rel / mnt->sb.s_blocks_per_group;
-    start_bit = rel % mnt->sb.s_blocks_per_group;
-    if (start_group >= mnt->groups_count) {
+  if (goal >= mnt->sb.s_first_data_block && goal < mnt->blocks_count) {
+    uint64_t rel = goal - mnt->sb.s_first_data_block;
+    uint64_t goal_group = rel / mnt->sb.s_blocks_per_group;
+    start_bit = (uint32_t)(rel % mnt->sb.s_blocks_per_group);
+    if (goal_group >= mnt->groups_count) {
       start_group = 0;
       start_bit = 0;
+    } else {
+      start_group = (uint32_t)goal_group;
     }
   }
 
-  uint32_t allocated = 0;
+  uint64_t allocated = 0;
 
   /* Fast path: trust the in-memory group counters and start at the goal's
    * group. */
   for (uint32_t i = 0; i < mnt->groups_count && !allocated; i++) {
     uint32_t g = (start_group + i) % mnt->groups_count;
-    if (mnt->bgdt[g].bg_free_blocks_count == 0)
+    if (ext2_bgd_free_blocks(&mnt->bgdt[g]) == 0)
       continue;
     allocated = ext2_alloc_in_group(mnt, g, i == 0 ? start_bit : 0, bitmap,
-                                     max_blocks, run_count);
+                                     max_blocks, run_count,
+                                     allow_large_blocks);
   }
 
   /* Slow path: an interrupted write or journal replay can leave a group's
@@ -814,9 +898,10 @@ uint32_t ext2_alloc_run_hint(ext2_mount_t *mnt, uint32_t goal,
    * the counters for those groups and make one full pass so a filesystem with
    * free space can still allocate. */
   for (uint32_t g = 0; g < mnt->groups_count && !allocated; g++) {
-    if (mnt->bgdt[g].bg_free_blocks_count != 0)
+    if (ext2_bgd_free_blocks(&mnt->bgdt[g]) != 0)
       continue; /* already covered by the fast path */
-    allocated = ext2_alloc_in_group(mnt, g, 0, bitmap, max_blocks, run_count);
+    allocated = ext2_alloc_in_group(mnt, g, 0, bitmap, max_blocks, run_count,
+                                     allow_large_blocks);
   }
 
   if (ext3_journal_stop(mnt) != 0) {
@@ -827,16 +912,37 @@ uint32_t ext2_alloc_run_hint(ext2_mount_t *mnt, uint32_t goal,
   return allocated;
 }
 
-uint32_t ext2_alloc_block_hint(ext2_mount_t *mnt, uint32_t goal) {
+uint64_t ext2_alloc_run_hint(ext2_mount_t *mnt, uint64_t goal,
+                              uint32_t max_blocks, uint32_t *run_count) {
+  return ext2_alloc_run_hint_limit(mnt, goal, max_blocks, run_count, true);
+}
+
+uint64_t ext2_alloc_run_hint_low(ext2_mount_t *mnt, uint64_t goal,
+                                  uint32_t max_blocks, uint32_t *run_count) {
+  return ext2_alloc_run_hint_limit(mnt, goal, max_blocks, run_count, false);
+}
+
+uint64_t ext2_alloc_block_hint(ext2_mount_t *mnt, uint64_t goal) {
+  uint32_t count;
+  return ext2_alloc_run_hint_low(mnt, goal, 1, &count);
+}
+
+uint64_t ext2_alloc_block(ext2_mount_t *mnt) {
+  return ext2_alloc_block_hint(mnt, 0);
+}
+
+uint64_t ext2_alloc_block_extent_hint(ext2_mount_t *mnt, uint64_t goal) {
   uint32_t count;
   return ext2_alloc_run_hint(mnt, goal, 1, &count);
 }
 
-uint32_t ext2_alloc_block(ext2_mount_t *mnt) {
-  return ext2_alloc_block_hint(mnt, 0);
+uint64_t ext2_alloc_block_extent(ext2_mount_t *mnt) {
+  return ext2_alloc_block_extent_hint(mnt, 0);
 }
 
 uint32_t ext2_alloc_inode(ext2_mount_t *mnt) {
+  if (!mnt || mnt->read_only)
+    return 0;
   ext3_journal_start(mnt);
   uint8_t *bitmap = kmalloc(mnt->block_size);
   if (!bitmap) {
@@ -845,19 +951,21 @@ uint32_t ext2_alloc_inode(ext2_mount_t *mnt) {
   }
 
   for (uint32_t g = 0; g < mnt->groups_count; g++) {
-    if (mnt->bgdt[g].bg_free_inodes_count == 0)
+    if (ext2_bgd_free_inodes(&mnt->bgdt[g]) == 0)
       continue;
 
-    ext2_read_block(mnt, mnt->bgdt[g].bg_inode_bitmap, bitmap);
+    uint64_t inode_bitmap = ext2_bgd_inode_bitmap(&mnt->bgdt[g]);
+    ext2_read_block(mnt, inode_bitmap, bitmap);
 
     for (uint32_t i = 0; i < mnt->inodes_per_group; i++) {
       uint32_t byte_idx = i / 8;
       uint8_t  bit_mask = 1 << (i % 8);
       if (!(bitmap[byte_idx] & bit_mask)) {
         bitmap[byte_idx] |= bit_mask;
-        ext3_journal_block(mnt, mnt->bgdt[g].bg_inode_bitmap, bitmap);
+        ext3_journal_block(mnt, inode_bitmap, bitmap);
 
-        mnt->bgdt[g].bg_free_inodes_count--;
+        ext2_bgd_set_free_inodes(&mnt->bgdt[g],
+            ext2_bgd_free_inodes(&mnt->bgdt[g]) - 1);
         mnt->sb.s_free_inodes_count--;
         ext2_mark_group_dirty(mnt, g);
 
@@ -873,13 +981,20 @@ uint32_t ext2_alloc_inode(ext2_mount_t *mnt) {
   return 0;
 }
 
-int ext2_free_block(ext2_mount_t *mnt, uint32_t block_num) {
+int ext2_free_block(ext2_mount_t *mnt, uint64_t block_num) {
+  if (!mnt || mnt->read_only)
+    return -30;
   if (block_num == 0)
     return -1;
 
-  uint32_t adjusted = block_num - mnt->sb.s_first_data_block;
-  uint32_t group    = adjusted / mnt->sb.s_blocks_per_group;
-  uint32_t index    = adjusted % mnt->sb.s_blocks_per_group;
+  if (block_num < mnt->sb.s_first_data_block || block_num >= mnt->blocks_count)
+    return -1;
+  uint64_t adjusted = block_num - mnt->sb.s_first_data_block;
+  uint64_t group64  = adjusted / mnt->sb.s_blocks_per_group;
+  if (group64 >= mnt->groups_count)
+    return -1;
+  uint32_t group    = (uint32_t)group64;
+  uint32_t index    = (uint32_t)(adjusted % mnt->sb.s_blocks_per_group);
 
   if (group >= mnt->groups_count)
     return -1;
@@ -888,16 +1003,17 @@ int ext2_free_block(ext2_mount_t *mnt, uint32_t block_num) {
   if (!bitmap)
     return -1;
 
-  ext2_read_block(mnt, mnt->bgdt[group].bg_block_bitmap, bitmap);
+  uint64_t bitmap_block = ext2_bgd_block_bitmap(&mnt->bgdt[group]);
+  ext2_read_block(mnt, bitmap_block, bitmap);
 
   uint32_t byte_idx = index / 8;
   uint8_t  bit_mask = 1 << (index % 8);
   bitmap[byte_idx] &= ~bit_mask;
 
-  ext3_journal_block(mnt, mnt->bgdt[group].bg_block_bitmap, bitmap);
+  ext3_journal_block(mnt, bitmap_block, bitmap);
   kfree(bitmap);
 
-  uint32_t c_idx = block_num % EXT2_CACHE_SIZE;
+  uint32_t c_idx = (uint32_t)(block_num % EXT2_CACHE_SIZE);
   spinlock_acquire(&mnt->cache_lock);
   mnt->cache[c_idx].write_seq++;
   if (mnt->cache[c_idx].num == block_num) {
@@ -905,13 +1021,16 @@ int ext2_free_block(ext2_mount_t *mnt, uint32_t block_num) {
   }
   spinlock_release(&mnt->cache_lock);
 
-  mnt->bgdt[group].bg_free_blocks_count++;
-  mnt->sb.s_free_blocks_count++;
+  ext2_bgd_set_free_blocks(&mnt->bgdt[group],
+      ext2_bgd_free_blocks(&mnt->bgdt[group]) + 1);
+  mnt->free_blocks_count++;
   ext2_mark_group_dirty(mnt, group);
   return 0;
 }
 
 int ext2_free_inode(ext2_mount_t *mnt, uint32_t inode_num) {
+  if (!mnt || mnt->read_only)
+    return -30;
   if (inode_num == 0)
     return -1;
 
@@ -925,22 +1044,24 @@ int ext2_free_inode(ext2_mount_t *mnt, uint32_t inode_num) {
   if (!bitmap)
     return -1;
 
-  ext2_read_block(mnt, mnt->bgdt[group].bg_inode_bitmap, bitmap);
+  uint64_t inode_bitmap = ext2_bgd_inode_bitmap(&mnt->bgdt[group]);
+  ext2_read_block(mnt, inode_bitmap, bitmap);
 
   uint32_t byte_idx = index / 8;
   uint8_t  bit_mask = 1 << (index % 8);
   bitmap[byte_idx] &= ~bit_mask;
 
-  ext3_journal_block(mnt, mnt->bgdt[group].bg_inode_bitmap, bitmap);
+  ext3_journal_block(mnt, inode_bitmap, bitmap);
   kfree(bitmap);
 
-  mnt->bgdt[group].bg_free_inodes_count++;
+  ext2_bgd_set_free_inodes(&mnt->bgdt[group],
+      ext2_bgd_free_inodes(&mnt->bgdt[group]) + 1);
   mnt->sb.s_free_inodes_count++;
   ext2_mark_group_dirty(mnt, group);
   return 0;
 }
 
-void ext2_free_indirect(ext2_mount_t *mnt, uint32_t indirect_block) {
+void ext2_free_indirect(ext2_mount_t *mnt, uint64_t indirect_block) {
   if (indirect_block == 0)
     return;
   uint32_t *ptrs = kmalloc(mnt->block_size);
@@ -956,7 +1077,7 @@ void ext2_free_indirect(ext2_mount_t *mnt, uint32_t indirect_block) {
   ext2_free_block(mnt, indirect_block);
 }
 
-void ext2_free_dindirect(ext2_mount_t *mnt, uint32_t dindirect_block) {
+void ext2_free_dindirect(ext2_mount_t *mnt, uint64_t dindirect_block) {
   if (dindirect_block == 0)
     return;
   uint32_t *ptrs = kmalloc(mnt->block_size);
@@ -972,7 +1093,7 @@ void ext2_free_dindirect(ext2_mount_t *mnt, uint32_t dindirect_block) {
   ext2_free_block(mnt, dindirect_block);
 }
 
-void ext2_free_tindirect(ext2_mount_t *mnt, uint32_t tindirect_block) {
+void ext2_free_tindirect(ext2_mount_t *mnt, uint64_t tindirect_block) {
   if (tindirect_block == 0)
     return;
   uint32_t *ptrs = kmalloc(mnt->block_size);

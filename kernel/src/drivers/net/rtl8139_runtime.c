@@ -183,7 +183,8 @@ static void drain_rx(void) {
   spinlock_acquire(&rx_lock);
   uint16_t io = rtl8139_io_base();
   uint8_t *ring = rx_virt();
-  uint32_t budget = NET_PACKET_POOL_SIZE;
+  /* Bound IRQ work independently of the dynamically allocated RX backlog. */
+  uint32_t budget = 4096;
 
   while (!(inb(io + RTL_CR) & CR_BUFFER_EMPTY) && budget--) {
     uint32_t offset = rx_offset % RX_RING_SIZE;

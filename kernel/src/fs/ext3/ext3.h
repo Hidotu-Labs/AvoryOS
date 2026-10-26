@@ -18,6 +18,9 @@
 #define JBD_FLAG_DELETED 4
 #define JBD_FLAG_LAST_TAG 8
 
+#define JBD_FEATURE_INCOMPAT_REVOKE  0x00000001u
+#define JBD_FEATURE_INCOMPAT_64BIT   0x00000002u
+
 typedef struct {
   uint32_t h_magic;
   uint32_t h_blocktype;
@@ -26,8 +29,16 @@ typedef struct {
 
 typedef struct {
   uint32_t t_blocknr;
-  uint32_t t_flags;
+  uint16_t t_checksum;
+  uint16_t t_flags;
+  uint32_t t_blocknr_high;
 } __attribute__((packed)) jbd_block_tag_t;
+
+typedef struct {
+  uint32_t t_blocknr;
+  uint16_t t_checksum;
+  uint16_t t_flags;
+} __attribute__((packed)) jbd_block_tag_legacy_t;
 
 typedef struct {
   jbd_header_t s_header;
@@ -53,7 +64,7 @@ typedef struct {
   uint8_t s_users[16 * 48];
 } __attribute__((packed)) jbd_superblock_t;
 
-void ext3_init_journal(ext2_mount_t *mnt);
+int ext3_init_journal(ext2_mount_t *mnt);
 
 /* Abort any journal transaction owned by a dead thread and wake its waiters.
  * Called from the thread reaper, the one place every dead thread passes
@@ -68,12 +79,12 @@ bool ext3_perf_snapshot(unsigned index, struct block_device **dev,
 
 int ext3_journal_start(ext2_mount_t *mnt);
 int ext3_journal_stop(ext2_mount_t *mnt);
-int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data);
+int ext3_journal_block(ext2_mount_t *mnt, uint64_t block_nr, const void *data);
 
 /* True when the active journal transaction holds a newer full-block image of
  * this filesystem block. Called by ext2_read_block before the home cache and
  * device so read-modify-write sequences see staged metadata. */
-bool ext3_journal_read_staged(ext2_mount_t *mnt, uint32_t block_nr,
+bool ext3_journal_read_staged(ext2_mount_t *mnt, uint64_t block_nr,
                               void *buffer);
 
 #endif

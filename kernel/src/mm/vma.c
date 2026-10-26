@@ -244,9 +244,17 @@ static struct vma *delete_node(struct vma *node, uint64_t start,
   return node;
 }
 
+static inline void vma_cache_flush(struct vma_list *list) {
+  if (!list)
+    return;
+  for (int i = 0; i < VMA_CACHE_SIZE; i++)
+    list->cache[i] = NULL;
+}
+
 void vma_list_init(struct vma_list *list) {
   list->root = NULL;
   list->count = 0;
+  vma_cache_flush(list);
 }
 
 static void vma_destroy_recursive(struct vma *node) {
@@ -263,6 +271,7 @@ void vma_list_destroy(struct vma_list *list) {
   vma_destroy_recursive(list->root);
   list->root = NULL;
   list->count = 0;
+  vma_cache_flush(list);
 }
 
 int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
@@ -301,6 +310,12 @@ int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
   list->root = insert_node(list->root, new_node);
   list->count++;
 
+  // Prime MRU cache with newly inserted node
+  list->cache[3] = list->cache[2];
+  list->cache[2] = list->cache[1];
+  list->cache[1] = list->cache[0];
+  list->cache[0] = new_node;
+
   TSC_END(vma_add);
   return 0; // Success
 }
@@ -322,6 +337,7 @@ void vma_attach_linux(struct vma_list *list, uint64_t start, void *linux_vma) {
 
 bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
   TSC_BEGIN(vma_remove);
+  vma_cache_flush(list);
   bool overall_removed = false;
   struct vma *v;
 
@@ -519,9 +535,25 @@ static struct vma *vma_find_recursive(struct vma *node, uint64_t addr) {
 }
 
 struct vma *vma_find(struct vma_list *list, uint64_t addr) {
-  if (!list)
+  if (__builtin_expect(!list, 0))
     return NULL;
-  return vma_find_recursive(list->root, addr);
+
+  // Direct MRU Locality Cache: read-only fast path (zero stores on hit)
+  for (int i = 0; i < VMA_CACHE_SIZE; i++) {
+    struct vma *v = list->cache[i];
+    if (v && addr >= v->start && addr < v->end)
+      return v;
+  }
+
+  // Cache miss: walk interval AVL tree
+  struct vma *res = vma_find_recursive(list->root, addr);
+  if (res) {
+    list->cache[3] = list->cache[2];
+    list->cache[2] = list->cache[1];
+    list->cache[1] = list->cache[0];
+    list->cache[0] = res;
+  }
+  return res;
 }
 
 static struct vma *vma_find_overlap_recursive(struct vma *node, uint64_t start,
@@ -570,6 +602,17 @@ static struct vma *vma_find_growdown_recursive(struct vma *node, uint64_t cr2,
 
 struct vma *vma_find_growdown(struct vma_list *list, uint64_t cr2,
                               uint64_t max_limit) {
+  if (__builtin_expect(!list, 0))
+    return NULL;
+
+  for (int i = 0; i < VMA_CACHE_SIZE; i++) {
+    struct vma *v = list->cache[i];
+    if (v && (v->flags & MAP_GROWSDOWN) && cr2 < v->start &&
+        cr2 >= v->start - max_limit) {
+      return v;
+    }
+  }
+
   return vma_find_growdown_recursive(list->root, cr2, max_limit);
 }
 

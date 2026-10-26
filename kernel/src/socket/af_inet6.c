@@ -12,6 +12,7 @@
 #include "socket/epoll.h"
 #include "socket/socket.h"
 #include "socket/socket_internal.h"
+#include "arch/uaccess.h"
 
 #define UDP6_MAX 32
 #define UDP6_QUEUE 16
@@ -570,6 +571,14 @@ static int inet6_getsockopt(socket_t *sock, int level, int option,
                             void *value, int *length) {
   if (!value || !length || *length < (int)sizeof(int)) return -22;
   struct inet6_sock *s = sock->sk;
+  if (level == SOL_SOCKET && option == SO_LINGER) {
+    int linger[2] = {s->linger_seconds >= 0,
+                    s->linger_seconds >= 0 ? s->linger_seconds : 0};
+    int n = *length < (int)sizeof(linger) ? *length : (int)sizeof(linger);
+    if (copy_to_user(value, linger, n)) return -14;
+    *length = n;
+    return 0;
+  }
   int result;
   if (level == SOL_SOCKET && option == SO_ERROR) {
     result = s->tcp ? s->tcp->error : sock->error;

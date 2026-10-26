@@ -5,6 +5,7 @@
 /* Default to safe ERMS implementation before dynamic dispatch probe */
 void (*page_zero)(void *page) = page_zero_erms;
 void (*page_copy)(void *dst, const void *src) = page_copy_erms;
+void (*page_zero_batch)(void **pages, size_t count) = page_zero_nt_batch;
 
 static page_ops_engine_t active_engine = PAGE_OPS_ENGINE_ERMS;
 
@@ -22,29 +23,47 @@ const char *page_ops_engine_name(page_ops_engine_t engine) {
     return "AVX2 Non-Temporal (256-bit YMM / VMOVNTDQ)";
   case PAGE_OPS_ENGINE_ERMS:
   default:
-    return "ERMS / String Operations (REP STOSQ / REP MOVSQ)";
+    return "ERMS L1-Resident Fast Path (REP STOSQ / REP MOVSQ)";
   }
 }
 
 void page_ops_init(void) {
   /*
-   * Kernel page faults, CoW, and demand-zero operations execute in interrupt/
-   * exception context on behalf of user threads. Vector operations (AVX-512/AVX2)
-   * in this path clobber user YMM/ZMM registers and execute VZEROUPPER, destroying
-   * userland process state.
-   *
-   * We use 64-bit MOVNTI non-temporal stores and PREFETCHNTA: this achieves
-   * full L1/L2/L3 cache bypass and eliminates RFO overhead (preserving the 32MB L3
-   * cache on Zen 4 / Ryzen 5 7600) while using only general-purpose registers,
-   * making it 100% interrupt-safe, exception-safe, and zero-FPU-overhead.
+   * Synchronous single-page operations (demand-zero write faults and CoW page
+   * breaks in vmm_fault.c):
+   * When a thread takes a write page fault, it is about to write into that page
+   * immediately. ERMS (rep stosq / rep movsq) runs at full L1 cache speed
+   * (~104 cycles per page) without write-combining buffer draining or sfence stalls,
+   * leaving the zeroed page hot in L1 cache for the faulting thread.
    */
-  page_zero = page_zero_nt;
-  page_copy = page_copy_nt;
-  active_engine = PAGE_OPS_ENGINE_NT;
+  if (cpu_has_erms()) {
+    page_zero = page_zero_erms;
+    page_copy = page_copy_erms;
+    active_engine = PAGE_OPS_ENGINE_ERMS;
+  } else {
+    page_zero = page_zero_nt;
+    page_copy = page_copy_nt;
+    active_engine = PAGE_OPS_ENGINE_NT;
+  }
+
+  /*
+   * Background bulk refill operations (pmm_zero_pool_refill on idle CPUs):
+   * Idle CPUs pre-zero 32-page (128 KB) batches in the background. Using non-temporal
+   * streaming stores (AVX2 / AVX-512 vmovntdq) bypasses the CPU caches completely,
+   * avoiding cache pollution and ensuring userland process working sets in L1/L2/L3
+   * are never evicted by background zeroing.
+   */
+  if (cpu_has_avx512()) {
+    page_zero_batch = page_zero_avx512_batch;
+  } else if (cpu_has_avx2()) {
+    page_zero_batch = page_zero_avx2_batch;
+  } else {
+    page_zero_batch = page_zero_nt_batch;
+  }
 
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " Page Operations Engine: ");
   klog_puts(page_ops_engine_name(active_engine));
-  klog_puts("\n");
+  klog_puts(" (Sync) | AVX2/NT Streaming (Batch Pool)\n");
 }
 
 void page_zero_huge(void *page) {

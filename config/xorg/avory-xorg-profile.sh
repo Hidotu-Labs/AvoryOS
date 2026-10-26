@@ -12,7 +12,7 @@
 #
 # Usage: avory-xorg-profile [sysfs-root] [dest] [alternates-dir]
 # Defaults: /sys, /etc/X11/xorg.conf.d/10-modesetting.conf, /usr/share/avory-xorg
-# AVORY_XORG_PROFILE=amdgpu|nouveau|native overrides detection.
+# AVORY_XORG_PROFILE=amdgpu|nouveau|virgl|native overrides detection.
 # Prints "xorg-profile: <name>" and exits 0 always; never fail the boot.
 
 set -u
@@ -39,7 +39,7 @@ if has_amd_vga; then
     PROFILE="amdgpu"
 fi
 case "${AVORY_XORG_PROFILE:-}" in
-    amdgpu|native|nouveau) PROFILE="$AVORY_XORG_PROFILE" ;;
+    amdgpu|native|nouveau|virgl) PROFILE="$AVORY_XORG_PROFILE" ;;
 esac
 
 SRC="$ALT/10-modesetting-$PROFILE.conf"
@@ -64,12 +64,21 @@ if [ "$PROFILE" = nouveau ] || { [ "$PROFILE" = native ] && [ -z "${AVORY_XORG_P
         SRC="$ALT/10-modesetting-native.conf"
     fi
 fi
+# Identify negotiated virgl through DRM VERSION, not the PCI ID: 2D and 3D
+# virtio devices share an ID, and only a ready rendering backend may use glamor.
+if [ "$PROFILE" = native ] && [ -z "${AVORY_XORG_PROFILE:-}" ]; then
+    identify=${AVORY_DRM_IDENTIFY:-/bin/drm-identify}
+    if [ -x "$identify" ] && "$identify" 2>/dev/null | awk '$2=="virtio_gpu" && $4==1 {found=1} END {exit !found}'; then
+        PROFILE=virgl
+        SRC="$ALT/10-modesetting-virgl.conf"
+    fi
+fi
 if [ ! -f "$SRC" ]; then
     echo "xorg-profile: $PROFILE requested but $SRC missing; keeping $DEST" >&2
     echo "xorg-profile: $PROFILE (unchanged)"
     exit 0
 fi
-if [ "$PROFILE" = native ] && [ -x /bin/drm-pick.sh ]; then
+if { [ "$PROFILE" = native ] || [ "$PROFILE" = virgl ]; } && [ -x /bin/drm-pick.sh ]; then
     selected="$(/bin/drm-pick.sh --display 2>/dev/null || true)"
     case "$selected" in
         /dev/dri/card[0-9]*)

@@ -55,7 +55,11 @@ static void *pmm_alloc_huge_page(void) { return NULL; }
 static void pmm_free(void *ptr) { pmm_decref(ptr); }
 static uint16_t pmm_get_ref(void *ptr) { return lookup(ptr)->refs; }
 static uint64_t pmm_get_zero_page_phys(void) { return 0; }
-static void vmm_lock_acquire(void) {}
+void vmm_lock_acquire_at_for(uint64_t *pml4, uint64_t va, uint64_t caller) {
+  (void)pml4; (void)va; (void)caller;
+}
+static unsigned swap_refs[8];
+static bool zram_slot_get(uint32_t slot) {assert(slot < 8 && swap_refs[slot]); swap_refs[slot]++; return true;}
 void vmm_lock_release(void) {}
 static void tlb_flush_deferred_context(uint64_t cr3) { (void)cr3; flushes++; }
 uint64_t vmm_get_vsyscall_page_phys(void) { return special; }
@@ -69,7 +73,9 @@ static void release_table(uint64_t phys, int level, uint64_t base,
                           struct vma_list *vmas) {
   uint64_t *table = (void *)phys;
   for (unsigned i = 0; i < (level == 4 ? 256u : 512u); i++) {
-    uint64_t entry = table[i]; if (!(entry & PAGE_FLAG_PRESENT)) continue;
+    uint64_t entry = table[i];
+    if (level == 1 && zram_pte_slot(entry)) {assert(swap_refs[zram_pte_slot(entry)]);swap_refs[zram_pte_slot(entry)]--;continue;}
+    if (!(entry & PAGE_FLAG_PRESENT)) continue;
     uint64_t va = base | ((uint64_t)i << (12 + 9 * (level - 1)));
     assert(!(entry & PAGE_FLAG_PS));
     if (level > 1) release_table(entry & PAGE_MASK, level - 1, va, vmas);
@@ -141,6 +147,24 @@ prefix += cow + r'''
 '''
 
 tests = r'''
+static void compressed_fork(void) {
+  reset();struct vma v={.start=0x400000,.end=0x801000,.flags=MAP_PRIVATE|MAP_ANONYMOUS};
+  struct vma_list list={.root=&v};uint64_t *parent=pmm_alloc();
+  map(parent,v.start,0,0);*pte_at((uint64_t)parent,v.start)=zram_pte(3);swap_refs[3]=1;
+  map(parent,0x800000,(uint64_t)pmm_alloc(),PAGE_FLAG_RW);
+  unsigned before=live();
+  uint64_t child=vmm_clone_user_mappings_vma(parent,&list);assert(child&&swap_refs[3]==2);
+  assert(*pte_at(child,v.start)==zram_pte(3));vmm_free_user_pages_vma(child,&list);
+  assert(swap_refs[3]==1&&live()==before);
+  // Fail each table allocation; partially inherited slot refs must unwind.
+  for(unsigned failure=1;failure<=5;failure++){
+    fail_at=attempts+failure;child=vmm_clone_user_mappings_vma(parent,&list);
+    assert(!child&&swap_refs[3]==1&&live()==before);
+  }
+  fail_at=0;
+  child=vmm_clone_user_mappings(parent);assert(child&&swap_refs[3]==2);
+  vmm_free_user_pages_vma(child,&list);assert(swap_refs[3]==1);
+}
 static void all_clean(void) {
   reset();
   struct vma v = file_vma(0x400000, 64 * 4096);
@@ -244,7 +268,7 @@ static void cow_provenance(void) {
   }
 }
 int main(void) {
-  all_clean(); mixed_and_oom(0);
+  compressed_fork(); all_clean(); mixed_and_oom(0);
   for (unsigned fail = 1; fail <= 6; fail++) mixed_and_oom(fail);
   exclusions(); cow_provenance(); reset();
   for (unsigned i = 0; i < used; i++) free(frames[i].ptr);

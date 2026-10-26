@@ -112,3 +112,22 @@ assert 'PCI:0:3:0' in amdgpu_text, amdgpu_text
 assert 'VirtualDisplay' in amdgpu_text, amdgpu_text
 
 print('PASS: Xorg profile auto-selection (VFIO/native/override/missing-alt) and profile invariants')
+
+# A negotiated virtio_gpu renderer enables glamor; a 2D ascentdrm stays native.
+with tempfile.TemporaryDirectory(prefix='avory-virgl-xorg-') as tmp:
+    base = Path(tmp)
+    sysfs = base/'sys'; sysfs.mkdir()
+    alternate = base/'alt'; alternate.mkdir()
+    shutil.copy(NATIVE, alternate/'10-modesetting-native.conf')
+    virgl = ROOT/'config/xorg/10-virgl.conf'
+    shutil.copy(virgl, alternate/'10-modesetting-virgl.conf')
+    identify = base/'identify'
+    identify.write_text('#!/bin/sh\nprintf "%s\\n" "/dev/dri/card0 virtio_gpu pci:0000:00:06.0 1 /dev/dri/renderD137"\n')
+    identify.chmod(0o755)
+    dest = base/'selected.conf'
+    selected = run_selector(sysfs, alternate, dest, {'AVORY_DRM_IDENTIFY': str(identify)})
+    assert 'xorg-profile: virgl' in selected.stdout, selected
+    assert dest.read_bytes() == virgl.read_bytes()
+    assert '"glamor"' in dest.read_text() and '"DRI" "3"' in dest.read_text()
+    assert '"SWcursor" "true"' in dest.read_text()
+print('PASS: negotiated virgl selects glamor/DRI3')

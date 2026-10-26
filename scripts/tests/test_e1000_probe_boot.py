@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boot NIC combinations with the current kernel and private disposable disks.
 
-Requires an existing ISO, musl toolchain, KVM, and the syscall boot helper's
+Requires an existing ISO, musl toolchain, QEMU, and the syscall boot helper's
 dependencies. Does not rebuild disk.img or attach any host PCI devices.
 """
 from pathlib import Path
@@ -24,6 +24,8 @@ spec.loader.exec_module(boot)
 
 INIT = r'''
 #include <arpa/inet.h>
+#include <errno.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
@@ -152,7 +154,13 @@ static void rebind(const char *slot) {
   check(binding(slot)==i,"e1000 binding lifecycle");
  }
 }
+static void child_exited(int signal) {(void)signal;}
 int main(void) {
+ struct sigaction chld={.sa_handler=child_exited,.sa_flags=SA_RESTART};
+ sigemptyset(&chld.sa_mask);
+ if(sigaction(SIGCHLD,&chld,NULL))return 1;
+ /* This probe is PID 1: retain child statuses instead of default init
+  * orphan auto-reaping between successive waits. */
  setvbuf(stdout,NULL,_IOLBF,0);
  puts("NIC_PROBE: START");
  mount("sysfs","/sys","sysfs",0,NULL);
@@ -240,8 +248,11 @@ int main(void) {
    }
    int ok=1;
    for(unsigned i=0;i<4;i++) {
-    int status;
-    if(children[i]<=0 || waitpid(children[i],&status,0)<0 || !WIFEXITED(status) || WEXITSTATUS(status))ok=0;
+    int status=0;pid_t waited;
+    do { waited=waitpid(children[i],&status,0); } while(waited<0 && errno==EINTR);
+    if(children[i]<=0 || waited!=children[i] || !WIFEXITED(status) || WEXITSTATUS(status)) {
+     printf("NIC_WAIT: child=%u pid=%d result=%d status=%d errno=%d\n",i,children[i],waited,status,errno);ok=0;
+    }
    }
    check(ok,"sustained four-stream TCP integrity");
    check(counter("rx_bytes")>before_rx && counter("tx_bytes")>before_tx,"live RX/TX statistics grow");
@@ -290,11 +301,14 @@ def main():
     global OUT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seconds', type=int, default=10, help='seconds of four-stream load per networked boot')
+    parser.add_argument('--accel', choices=('kvm', 'tcg'), default='kvm')
     parser.add_argument('--smp', type=int, choices=(1, 4, 8), default=4)
     parser.add_argument('--case', action='append', choices=('none', 'e1000', 'rtl8139', 'mixed', 'mixed-e1000', 'recovery'))
     args = parser.parse_args()
     if not 0 <= args.seconds <= 300:
         parser.error('--seconds must be between 0 and 300')
+    if args.accel != 'kvm':
+        OUT = OUT / args.accel
     if args.smp != 4:
         OUT = OUT / f'smp{args.smp}'
     OUT.mkdir(parents=True, exist_ok=True)
@@ -358,7 +372,7 @@ def run_cases(port, udp_port, udp6_port, args):
         serial = boot.OUT / 'serial.log'
         qmp_path = boot.OUT / 'qmp.sock'
         qmp_path.unlink(missing_ok=True)
-        cmd = ['qemu-system-x86_64', '-M', 'q35', '-cpu', 'host', '-enable-kvm',
+        cmd = ['qemu-system-x86_64', '-M', 'q35', '-cpu', 'host' if args.accel == 'kvm' else 'max', '-accel', args.accel,
                '-smp', str(args.smp), '-m', '1G', '-drive',
                f'if=pflash,unit=0,format=raw,file={ROOT}/edk2-ovmf/ovmf-code-x86_64.fd,readonly=on',
                '-cdrom', str(iso), '-boot', 'd', '-drive',

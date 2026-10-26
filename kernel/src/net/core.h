@@ -6,7 +6,6 @@
 
 #define NET_MTU_ETHERNET 1500
 #define NET_FRAME_MAX 1518
-#define NET_PACKET_POOL_SIZE 4096
 #define NET_DEVICE_MAX 8
 
 struct net_device;

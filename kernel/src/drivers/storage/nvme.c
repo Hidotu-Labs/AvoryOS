@@ -31,10 +31,11 @@
 #define NVME_BAR_MIN_SIZE 0x4000u
 
 #define NVME_CID_MAX 64u
-/* Most commands one pipelined submitter keeps in flight.  Bounded so a wave
- * costs one deadline and one wait-queue registration; also bounded by the CIDs
- * actually free on the queue. */
-#define NVME_BATCH_WAVE_MAX 16u
+/* Keep half of the maximum 64-entry I/O queue busy per submitter. This gives
+ * large batches enough parallelism to amortize completion waits while leaving
+ * queue capacity for other submitters; the CID table and queue depth bound the
+ * actual number in flight on smaller controllers. */
+#define NVME_BATCH_WAVE_MAX 32u
 /* lba * 512 (the virtual byte offset in nvme_io) must not wrap, so a namespace
  * whose virtual sector count exceeds this is rejected at Identify time. */
 #define NVME_MAX_SECTORS (UINT64_MAX / 512u)

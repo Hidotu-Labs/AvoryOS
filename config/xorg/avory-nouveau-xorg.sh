@@ -5,7 +5,7 @@ template=${2:-/usr/share/avory-xorg/10-modesetting-nouveau.conf}
 inventory=$("$identify") || exit 1
 selection=$(printf '%s\n' "$inventory" | awk '
     $2=="nouveau" && $3 ~ /^pci:/ && $5!="-" {render=$1; renderbus=$3; renders++}
-    $2=="ascentdrm" && $3 ~ /^pci:/ && $4==1 {display=$1; displaybus=$3; displays++}
+    ($2=="ascentdrm" || $2=="virtio_gpu") && $3 ~ /^pci:/ && $4==1 {display=$1; displaybus=$3; displays++}
     END {if(renders==1 && displays==1) print render,renderbus,display,displaybus; else exit 1}') || exit 1
 set -- $selection
 [ "$#" -eq 4 ] || exit 1

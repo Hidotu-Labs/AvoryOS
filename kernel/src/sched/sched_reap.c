@@ -147,19 +147,19 @@ void sched_reap_thread(struct thread *t) {
   uint32_t reap_tgid = t->tgid ? t->tgid : t->tid;
   spinlock_acquire(&tid_lock);
 
-  // 1.5 Remove from global thread list
-  if (global_thread_list == t) {
+  // 1.5 Remove from global thread list in O(1)
+  if (t->global_prev) {
+    t->global_prev->global_next = t->global_next;
+  } else if (global_thread_list == t) {
     global_thread_list = t->global_next;
-    __atomic_sub_fetch(&global_thread_count, 1, __ATOMIC_RELAXED);
-  } else {
-    struct thread *prev_g = global_thread_list;
-    while (prev_g && prev_g->global_next != t)
-      prev_g = prev_g->global_next;
-    if (prev_g) {
-      prev_g->global_next = t->global_next;
-      __atomic_sub_fetch(&global_thread_count, 1, __ATOMIC_RELAXED);
-    }
   }
+  if (t->global_next) {
+    t->global_next->global_prev = t->global_prev;
+  }
+  t->global_prev = NULL;
+  t->global_next = NULL;
+  __atomic_sub_fetch(&global_thread_count, 1, __ATOMIC_RELAXED);
+  sched_free_tid_locked(t->tid);
 
   // 1.75 Remove from parent's children list
   bool parent_is_live = false;

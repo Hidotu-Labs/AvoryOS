@@ -20,7 +20,9 @@
 #define fs_root vfs_task_root()
 
 #define AT_REMOVEDIR        0x200
+#ifndef AT_SYMLINK_NOFOLLOW
 #define AT_SYMLINK_NOFOLLOW 0x100  /* fchmodat2 / fstatat: do not follow symlinks */
+#endif
 #define AT_SYMLINK_FOLLOW   0x400  /* linkat: follow symlinks on old path */
 #define AT_EMPTY_PATH       0x1000 /* linkat: use olddirfd as the source if oldpath is "" */
 /* faccessat2 flag namespace (shares the 0x200 value with AT_REMOVEDIR,
@@ -244,9 +246,7 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
     vfs_node_t *base_owned = NULL;
     if (clean_path[0] != '/') {
         if ((int64_t)dirfd == AT_FDCWD) {
-            base_dir = vfs_resolve_path_at(fs_root, t->cwd_path);
-            if (!base_dir) base_dir = fs_root;
-            else base_owned = base_dir;
+            base_dir = (t && t->cwd_node) ? t->cwd_node : fs_root;
         } else if (FD_IN_RANGE(t, dirfd) && fd_is_valid_node(t->fds[dirfd])) {
             base_dir = t->fds[dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY)
@@ -363,9 +363,7 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
     vfs_node_t *base_owned = NULL;
     if (path[0] != '/') {
         if ((int64_t)dirfd == AT_FDCWD) {
-            base_dir = vfs_resolve_path_at(fs_root, t->cwd_path);
-            if (!base_dir) base_dir = fs_root;
-            else base_owned = base_dir;
+            base_dir = (t && t->cwd_node) ? t->cwd_node : fs_root;
         } else if (FD_IN_RANGE(t, dirfd) && fd_is_valid_node(t->fds[dirfd])) {
             base_dir = t->fds[dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY) {
@@ -920,16 +918,9 @@ static uint64_t sys_readlink(uint64_t pathname_ptr, uint64_t buf_ptr,
     }
 
     struct thread *t = sched_get_current();
-    vfs_node_t *base  = fs_root;
-    vfs_node_t *cwd   = NULL;
-    if (t && path[0] != '/' && t->cwd_path[0]) {
-        cwd = vfs_resolve_path_at(fs_root, t->cwd_path);
-        if (cwd) base = cwd;
-    }
+    vfs_node_t *base  = (t && t->cwd_node && path[0] != '/') ? t->cwd_node : fs_root;
 
-    uint64_t rc = do_sys_readlink_at(base, path, buf, bufsiz);
-    if (cwd) vfs_close(cwd);
-    return rc;
+    return do_sys_readlink_at(base, path, buf, bufsiz);
 }
 
 // Shared resolver for readlink/readlinkat: base is already selected
@@ -1249,13 +1240,8 @@ static uint64_t sys_chmod(uint64_t pathname_ptr, uint64_t mode, uint64_t a2,
     const char *path = (const char *)pathname_ptr;
     if (!path) return (uint64_t)-14;
     struct thread *t = sched_get_current();
-    vfs_node_t *base  = fs_root;
+    vfs_node_t *base  = (t && t->cwd_node && path[0] != '/') ? t->cwd_node : fs_root;
     vfs_node_t *base_owned = NULL;
-    if (t && path[0] != '/' && t->cwd_path[0]) {
-        base = vfs_resolve_path_at(fs_root, t->cwd_path);
-        if (!base) base = fs_root;
-        else base_owned = base;
-    }
     vfs_node_t *node = vfs_resolve_path_at(base, path);
     if (!node) {
         if (base_owned) vfs_close(base_owned);
@@ -1376,11 +1362,7 @@ static uint64_t sys_fchmodat(uint64_t dirfd, uint64_t pathname_ptr,
     vfs_node_t *base_owned = NULL;
     if (path[0] != '/') {
         if ((int)dirfd == AT_FDCWD) {
-            if (t && t->cwd_path[0]) {
-                base = vfs_resolve_path_at(fs_root, t->cwd_path);
-                if (!base) base = fs_root;
-                else base_owned = base;
-            }
+            base = (t && t->cwd_node) ? t->cwd_node : fs_root;
         } else {
             if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd])) return (uint64_t)-9;
             base = t->fds[dirfd];
@@ -1463,13 +1445,7 @@ static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
     // borrowed (fd table / fs_root) except for the resolved-cwd case.
     if ((flags & AT_EMPTY_PATH) && path[0] == '\0') {
         if (dirfd == AT_FDCWD) {
-            if (t && t->cwd_path[0]) {
-                node = vfs_resolve_path_at(fs_root, t->cwd_path);
-                if (!node) return (uint64_t)-2; // ENOENT
-                node_owned = true;
-            } else {
-                node = fs_root; // borrowed global; must not close
-            }
+            node = (t && t->cwd_node) ? t->cwd_node : fs_root;
         } else {
             if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
                 return (uint64_t)-9; // EBADF
@@ -1487,11 +1463,7 @@ static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
     if (!node) {
         vfs_node_t *base_dir = fs_root;
         if (dirfd == AT_FDCWD) {
-            if (t && t->cwd_path[0]) {
-                base_dir = vfs_resolve_path_at(fs_root, t->cwd_path);
-                if (!base_dir) base_dir = fs_root;
-                else base_owned = base_dir;
-            }
+            base_dir = (t && t->cwd_node) ? t->cwd_node : fs_root;
         } else {
             if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
                 return (uint64_t)-9;
@@ -1690,11 +1662,7 @@ static uint64_t do_utimensat_impl(uint64_t dirfd, uint64_t pathname,
         vfs_node_t *base = fs_root;
         if (path[0] != '/') {
             if ((int)dirfd == AT_FDCWD) {
-                if (t && t->cwd_path[0]) {
-                    base = vfs_resolve_path_at(fs_root, t->cwd_path);
-                    if (!base) base = fs_root;
-                    else base_owned = base;
-                }
+                base = (t && t->cwd_node) ? t->cwd_node : fs_root;
             } else {
                 if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
                     return (uint64_t)-9; // EBADF

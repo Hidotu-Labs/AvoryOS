@@ -155,39 +155,48 @@ static void unix_wake_recv_waiters(unix_sock_t *peer) {
     return;
   wait_queue_t *sock_wq =
       peer->parent ? (wait_queue_t *)peer->parent->wait_queue : NULL;
-  wait_queue_wake_all(peer->wait);
-  if (sock_wq && sock_wq != peer->wait)
+  if (peer->wait && __builtin_expect(peer->wait->head != NULL, 0))
+    wait_queue_wake_all(peer->wait);
+  if (sock_wq && sock_wq != peer->wait && __builtin_expect(sock_wq->head != NULL, 0))
     wait_queue_wake_all(sock_wq);
 }
 
 static bool unix_ensure_recv_buf(unix_sock_t *usk, size_t needed) {
   if (!usk) return false;
   if (!usk->recv_buf) {
-    size_t sz = (usk->parent && usk->parent->rcvbuf > 0) ? (size_t)usk->parent->rcvbuf : SOCKET_DEFAULT_RCVBUF;
-    if (needed > 0 && needed + 1 > sz)
-      sz = needed + 4096;
-    if (sz < 65536) sz = 65536;
+    size_t req = (usk->parent && usk->parent->rcvbuf > 0) ? (size_t)usk->parent->rcvbuf : SOCKET_DEFAULT_RCVBUF;
+    if (needed > req)
+      req = needed;
+    size_t sz = unix_round_pow2(req);
     usk->recv_buf = kmalloc(sz);
     if (!usk->recv_buf) return false;
     usk->recv_buf_size = sz;
+    usk->recv_buf_mask = sz - 1;
     usk->recv_buf_head = 0;
     usk->recv_buf_tail = 0;
-  } else if (needed > 0 && needed + 1 > usk->recv_buf_size && usk->recv_buf_size < 4 * 1024 * 1024) {
-    size_t new_sz = usk->recv_buf_size * 2;
-    while (new_sz < needed + 4096 && new_sz < 4 * 1024 * 1024)
-      new_sz *= 2;
+    usk->recv_buf_count = 0;
+  } else if (needed > usk->recv_buf_size && usk->recv_buf_size < 4 * 1024 * 1024) {
+    size_t new_sz = unix_round_pow2(needed);
+    if (new_sz <= usk->recv_buf_size)
+      new_sz = usk->recv_buf_size * 2;
+    if (new_sz > 4 * 1024 * 1024)
+      new_sz = 4 * 1024 * 1024;
     uint8_t *new_buf = kmalloc(new_sz);
     if (new_buf) {
+      size_t count = usk->recv_buf_count;
       size_t head = usk->recv_buf_head;
-      size_t tail = usk->recv_buf_tail;
-      size_t old_size = usk->recv_buf_size;
-      size_t available = (old_size > 0) ? (tail - head + old_size) % old_size : 0;
-      unix_ring_consume(usk->recv_buf, old_size, head, new_buf, available);
+      size_t size = usk->recv_buf_size;
+      size_t first = size - head;
+      if (first > count) first = count;
+      memcpy(new_buf, usk->recv_buf + head, first);
+      if (count > first)
+        memcpy(new_buf + first, usk->recv_buf, count - first);
       kfree(usk->recv_buf);
       usk->recv_buf = new_buf;
       usk->recv_buf_size = new_sz;
+      usk->recv_buf_mask = new_sz - 1;
       usk->recv_buf_head = 0;
-      usk->recv_buf_tail = available;
+      usk->recv_buf_tail = count;
       if (usk->parent)
         usk->parent->rcvbuf = (int)new_sz;
     }
@@ -365,10 +374,9 @@ ssize_t unix_send_impl(socket_t *sock, const void *buf, size_t len, int flags) {
       return -12; // ENOMEM
     }
 
-    size_t head  = peer->recv_buf_head;
-    size_t tail  = peer->recv_buf_tail;
     size_t size  = peer->recv_buf_size;
-    size_t space = (size > 0) ? (head - tail - 1 + size) % size : 0;
+    size_t count = peer->recv_buf_count;
+    size_t space = (size > count) ? (size - count) : 0;
 
     if (space == 0) {
       if (sent > 0) {
@@ -391,10 +399,9 @@ ssize_t unix_send_impl(socket_t *sock, const void *buf, size_t len, int flags) {
         current->wakeup_ticks = sndtimeo_deadline;
       /* Recheck space under recv_lock before parking. */
       {
-        size_t rh = peer->recv_buf_head;
-        size_t rt = peer->recv_buf_tail;
         size_t rs = peer->recv_buf_size;
-        size_t rspace = (rs > 0) ? (rh - rt - 1 + rs) % rs : 0;
+        size_t rc = peer->recv_buf_count;
+        size_t rspace = (rs > rc) ? (rs - rc) : 0;
         if (rspace != 0 || sent > 0 || sock->closing || peer_sock->closing || sock->error) {
           current->state = THREAD_RUNNING;
           current->wakeup_ticks = 0;
@@ -446,15 +453,18 @@ ssize_t unix_send_impl(socket_t *sock, const void *buf, size_t len, int flags) {
 
     size_t to_copy = (len - sent < space) ? len - sent : space;
 
+    size_t tail = peer->recv_buf_tail;
     tail = unix_ring_append(peer->recv_buf, size, tail, src + sent, to_copy);
     peer->recv_buf_tail = tail;
+    peer->recv_buf_count += to_copy;
     sent += to_copy;
     peer->bytes_written += to_copy;
 
-    unix_record_sender_credentials(peer, sched_get_current());
-
     spinlock_release(&peer->recv_lock);
+  }
 
+  if (sent > 0) {
+    unix_record_sender_credentials(peer, sched_get_current());
     unix_wake_recv_waiters(peer);
     unix_notify_epoll(peer->parent, EPOLLIN | EPOLLRDNORM);
   }
@@ -598,11 +608,11 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
     return (ssize_t)to_copy;
   }
 
-  if ((sock->closing || usk->read_shutdown) && usk->recv_buf_head == usk->recv_buf_tail)
+  if ((sock->closing || usk->read_shutdown) && usk->recv_buf_count == 0)
     return 0; // EOF
 
   if (sock->state != SS_CONNECTED &&
-      usk->recv_buf_head == usk->recv_buf_tail) {
+      usk->recv_buf_count == 0) {
     return usk->was_connected ? 0 : -107; // ENOTCONN
   }
 
@@ -613,9 +623,8 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
     spinlock_acquire(&usk->recv_lock);
 
     size_t head      = usk->recv_buf_head;
-    size_t tail      = usk->recv_buf_tail;
     size_t size      = usk->recv_buf_size;
-    size_t available = (size > 0) ? (tail - head + size) % size : 0;
+    size_t available = usk->recv_buf_count;
 
     if (available == 0) {
       if (sock->closing || usk->read_shutdown) {
@@ -662,10 +671,7 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
 
       /* Recheck under recv_lock before parking. */
       {
-        size_t rh = usk->recv_buf_head;
-        size_t rt = usk->recv_buf_tail;
-        size_t rs = usk->recv_buf_size;
-        size_t ravail = (rs > 0) ? (rt - rh + rs) % rs : 0;
+        size_t ravail = usk->recv_buf_count;
         if (ravail != 0 || sock->closing || usk->read_shutdown || sock->error) {
           current->state = THREAD_RUNNING;
           current->wakeup_ticks = 0;
@@ -697,7 +703,7 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
       spinlock_acquire(&sock->lock);
       bool peer_shut_after_wait = (usk->peer && usk->peer->write_shutdown);
       spinlock_release(&sock->lock);
-      if (peer_shut_after_wait && usk->recv_buf_head == usk->recv_buf_tail)
+      if (peer_shut_after_wait && usk->recv_buf_count == 0)
         return (ssize_t)received; // EOF
 
       if (sock->error)
@@ -711,6 +717,11 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
 
     if (!(flags & 0x02)) { // MSG_PEEK
       usk->recv_buf_head = (size > 0) ? next_head : 0;
+      usk->recv_buf_count -= to_copy;
+      if (usk->recv_buf_count == 0) {
+        usk->recv_buf_head = 0;
+        usk->recv_buf_tail = 0;
+      }
       usk->bytes_read += to_copy;
       usk->scm_cred_pending = false;
 
@@ -720,7 +731,7 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
     spinlock_release(&usk->recv_lock);
     received += to_copy;
 
-    if (sock->type == SOCK_DGRAM)
+    if (sock->type == SOCK_DGRAM || !(flags & 0x100))
       break;
   }
 
@@ -1010,10 +1021,9 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   }
 
   while (total_len > 0) {
-    size_t head  = peer->recv_buf_head;
-    size_t tail  = peer->recv_buf_tail;
     size_t size  = peer->recv_buf_size;
-    size_t space = (size > 0) ? (head - tail - 1 + size) % size : 0;
+    size_t count = peer->recv_buf_count;
+    size_t space = (size > count) ? (size - count) : 0;
 
     if (space >= total_len)
       break;
@@ -1032,10 +1042,9 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       /* Recheck under recv_lock: space may have freed between the first
        * check and the add. */
       {
-        size_t rh = peer->recv_buf_head;
-        size_t rt = peer->recv_buf_tail;
         size_t rs = peer->recv_buf_size;
-        size_t rspace = (rs > 0) ? (rh - rt - 1 + rs) % rs : 0;
+        size_t rc = peer->recv_buf_count;
+        size_t rspace = (rs > rc) ? (rs - rc) : 0;
         if (rspace != 0 || sock->closing || peer_sock->closing) {
           ct->state = THREAD_RUNNING;
           spinlock_release(&peer->recv_lock);
@@ -1156,17 +1165,18 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     size_t sent = 0;
 
     while (sent < len) {
-      size_t head  = peer->recv_buf_head;
-      size_t tail  = peer->recv_buf_tail;
       size_t size  = peer->recv_buf_size;
-      size_t space = (size > 0) ? (head - tail - 1 + size) % size : 0;
+      size_t count = peer->recv_buf_count;
+      size_t space = (size > count) ? (size - count) : 0;
 
       if (space == 0)
         break;
 
       size_t to_copy = (len - sent < space) ? len - sent : space;
+      size_t tail = peer->recv_buf_tail;
       tail = unix_ring_append(peer->recv_buf, size, tail, src + sent, to_copy);
       peer->recv_buf_tail = tail;
+      peer->recv_buf_count += to_copy;
       sent += to_copy;
     }
     total_sent += (ssize_t)sent;
@@ -1483,10 +1493,7 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   while (1) {
     spinlock_acquire(&usk->recv_lock);
 
-    size_t head      = usk->recv_buf_head;
-    size_t tail      = usk->recv_buf_tail;
-    size_t size      = usk->recv_buf_size;
-    size_t available = (size > 0) ? (tail - head + size) % size : 0;
+    size_t available = usk->recv_buf_count;
 
     if (available > 0)
       break; // Data ready – recv_lock stays held
@@ -1538,10 +1545,7 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     }
     /* Recheck under recv_lock before parking. */
     {
-      size_t rh = usk->recv_buf_head;
-      size_t rt = usk->recv_buf_tail;
-      size_t rs = usk->recv_buf_size;
-      size_t ravail = (rs > 0) ? (rt - rh + rs) % rs : 0;
+      size_t ravail = usk->recv_buf_count;
       bool scm_ready = usk->scm_queue_head != NULL &&
                        usk->bytes_read >= usk->scm_queue_head->stream_offset;
       spinlock_acquire(&sock->lock);
@@ -1728,9 +1732,8 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     }
 
     size_t head      = usk->recv_buf_head;
-    size_t tail      = usk->recv_buf_tail;
     size_t size      = usk->recv_buf_size;
-    size_t available = (size > 0) ? (tail - head + size) % size : 0;
+    size_t available = usk->recv_buf_count;
 
     if (available == 0 || max_stream_bytes == 0)
       break;
@@ -1746,6 +1749,11 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
 
     if (!(flags & 0x02)) { // MSG_PEEK
       usk->recv_buf_head = (size > 0) ? next_head : 0;
+      usk->recv_buf_count -= to_copy;
+      if (usk->recv_buf_count == 0) {
+        usk->recv_buf_head = 0;
+        usk->recv_buf_tail = 0;
+      }
       usk->bytes_read += to_copy;
     }
 

@@ -124,25 +124,126 @@ void ext3_journal_release_owner(uint32_t tid) {
 
 /* Called only with the transaction lock held. Recovery uses uncached
  * mappings; normal transactions never change the journal inode itself. */
-static uint32_t ext3_journal_phys(ext2_mount_t *mnt, uint32_t logical) {
+static uint64_t ext3_journal_phys(ext2_mount_t *mnt, uint32_t logical) {
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
   if (trans->journal_blocks && logical >= trans->journal_blocks)
     return 0;
   uint32_t slot = logical % EXT3_JOURNAL_MAP_SLOTS;
   if (trans->map_keys[slot] == logical + 1)
     return trans->map_blocks[slot];
-  uint32_t phys = ext2_get_block_num(mnt, &trans->journal_inode, logical);
-  if (!phys || phys >= mnt->sb.s_blocks_count)
+  uint64_t phys = ext2_get_block_num(mnt, &trans->journal_inode, logical);
+  if (!phys || phys >= mnt->blocks_count)
     return 0;
   trans->map_blocks[slot] = phys;
   trans->map_keys[slot] = logical + 1;
   return phys;
 }
 
+static size_t ext3_tag_size(const ext2_mount_t *mnt) {
+  return (mnt->journal.journal_features_incompat &
+          JBD_FEATURE_INCOMPAT_64BIT)
+             ? sizeof(jbd_block_tag_t)
+             : sizeof(jbd_block_tag_legacy_t);
+}
+
 static uint32_t ext3_tag_capacity(const ext2_mount_t *mnt) {
-  if (mnt->block_size <= sizeof(jbd_header_t) + sizeof(jbd_block_tag_t))
+  size_t tag_size = ext3_tag_size(mnt);
+  /* The first tag in each descriptor carries a UUID; subsequent tags use
+   * SAME_UUID and omit it. Reserve that first-tag space when sizing. */
+  if (mnt->block_size <= sizeof(jbd_header_t) + tag_size + 16)
     return 0;
-  return (mnt->block_size - sizeof(jbd_header_t)) / sizeof(jbd_block_tag_t);
+  return (mnt->block_size - sizeof(jbd_header_t) - 16) / tag_size;
+}
+
+static uint32_t ext3_tag_flags(const ext2_mount_t *mnt, const uint8_t *tag) {
+  if (mnt->journal.journal_features_incompat & JBD_FEATURE_INCOMPAT_64BIT) {
+    const jbd_block_tag_t *v2 = (const jbd_block_tag_t *)tag;
+    return __builtin_bswap16(v2->t_flags);
+  }
+  const jbd_block_tag_legacy_t *legacy =
+      (const jbd_block_tag_legacy_t *)tag;
+  return __builtin_bswap16(legacy->t_flags);
+}
+
+static uint64_t ext3_tag_block(const ext2_mount_t *mnt, const uint8_t *tag) {
+  if (mnt->journal.journal_features_incompat & JBD_FEATURE_INCOMPAT_64BIT) {
+    const jbd_block_tag_t *v2 = (const jbd_block_tag_t *)tag;
+    return ((uint64_t)__builtin_bswap32(v2->t_blocknr_high) << 32) |
+           __builtin_bswap32(v2->t_blocknr);
+  }
+  const jbd_block_tag_legacy_t *legacy =
+      (const jbd_block_tag_legacy_t *)tag;
+  return __builtin_bswap32(legacy->t_blocknr);
+}
+
+static bool ext3_descriptor_tag_count(const ext2_mount_t *mnt,
+                                      const uint8_t *desc,
+                                      uint32_t block_size, uint32_t tagcap,
+                                      bool include_uuids,
+                                      uint32_t *out_count,
+                                      uint32_t *out_payload_count) {
+  size_t tag_size = ext3_tag_size(mnt);
+  size_t offset = sizeof(jbd_header_t);
+  uint32_t count = 0;
+  uint32_t payload_count = 0;
+  while (count < tagcap && offset + tag_size <= block_size) {
+    uint32_t flags = ext3_tag_flags(mnt, desc + offset);
+    count++;
+    if (!(flags & JBD_FLAG_DELETED))
+      payload_count++;
+    offset += tag_size;
+    if (include_uuids && !(flags & JBD_FLAG_SAME_UUID))
+      offset += 16;
+    if (offset > block_size)
+      return false;
+    if (flags & JBD_FLAG_LAST_TAG) {
+      *out_count = count;
+      *out_payload_count = payload_count;
+      return count != 0;
+    }
+  }
+  return false;
+}
+
+static bool ext3_descriptor_tag_count_for_log(
+    ext2_mount_t *mnt, const uint8_t *desc, uint32_t block_size,
+    uint32_t tagcap, ext2_inode_t *j_inode, uint32_t log_pos,
+    uint32_t journal_blocks, uint32_t sequence, uint8_t *probe_buf,
+    uint32_t *out_count, uint32_t *out_payload_count,
+    bool *out_include_uuids) {
+  uint32_t candidates[2];
+  uint32_t payload_candidates[2];
+  bool valid[2];
+  valid[0] = ext3_descriptor_tag_count(mnt, desc, block_size, tagcap, true,
+                                       &candidates[0],
+                                       &payload_candidates[0]);
+  valid[1] = ext3_descriptor_tag_count(mnt, desc, block_size, tagcap, false,
+                                       &candidates[1],
+                                       &payload_candidates[1]);
+  for (uint32_t candidate = 0; candidate < 2; candidate++) {
+    if (!valid[candidate] ||
+        payload_candidates[candidate] + 1 > journal_blocks - log_pos)
+      continue;
+    uint32_t next_pos = log_pos + 1 + payload_candidates[candidate];
+    if (next_pos >= journal_blocks)
+      continue;
+    uint64_t next_phys = ext2_get_block_num(mnt, j_inode, next_pos);
+    if (!next_phys || ext2_read_block(mnt, next_phys, probe_buf) != 0)
+      continue;
+    jbd_header_t *next = (jbd_header_t *)probe_buf;
+    uint32_t next_type = __builtin_bswap32(next->h_blocktype);
+    if (__builtin_bswap32(next->h_magic) == EXT3_JOURNAL_MAGIC_NUMBER &&
+        __builtin_bswap32(next->h_sequence) == sequence &&
+        (next_type == JBD_DESCRIPTOR_BLOCK ||
+         next_type == JBD_REVOKE_BLOCK || next_type == JBD_COMMIT_BLOCK)) {
+      *out_count = candidates[candidate];
+      *out_payload_count = payload_candidates[candidate];
+      if (out_include_uuids)
+        *out_include_uuids = candidate == 0;
+      return true;
+    }
+  }
+  return false;
 }
 
 /* Logical journal position of the descriptor block that carries write-set
@@ -238,7 +339,9 @@ static int ext3_finish_transaction(ext2_mount_t *mnt,
   return result;
 }
 
-void ext3_init_journal(ext2_mount_t *mnt) {
+int ext3_init_journal(ext2_mount_t *mnt) {
+  if (!mnt)
+    return -1;
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
   rawspinlock_init(&trans->lock);
   wait_queue_init(&trans->waiters);
@@ -253,44 +356,44 @@ void ext3_init_journal(ext2_mount_t *mnt) {
   trans->depth = 0;
   trans->io_failed = false;
   trans->journal_blocks = 0;
+  trans->journal_features_incompat = 0;
   trans->txn_head = trans->txn_tail = NULL;
   trans->txn_count = 0;
   rawspinlock_init(&trans->sched_lock);
   trans->granted_tid = 0;
   memset(trans->map_keys, 0, sizeof(trans->map_keys));
   if (!(mnt->sb.s_feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL)) {
-    return;
+    return 0;
   }
-  journal_register_mount(mnt);
 
   uint32_t journal_ino = mnt->sb.s_journal_inum;
   if (journal_ino == 0) {
     klog_puts("[EXT3] Journal feature enabled but journal inode is 0\n");
-    return;
+    return -1;
   }
 
   if (ext2_read_inode(mnt, journal_ino, &trans->journal_inode) != 0) {
     klog_puts("[EXT3] Failed to read journal inode\n");
-    return;
+    return -1;
   }
 
-  uint32_t disk_block =
+  uint64_t disk_block =
       ext2_get_block_num(mnt, &trans->journal_inode, 0);
   if (!disk_block) {
     klog_puts("[EXT3] Journal inode has no blocks\n");
-    return;
+    return -1;
   }
 
   uint8_t *buf = kmalloc(mnt->block_size);
   if (!buf) {
     klog_puts("[EXT3] Out of memory for journal read\n");
-    return;
+    return -1;
   }
 
   if (ext2_read_block(mnt, disk_block, buf) != 0) {
     klog_puts("[EXT3] Failed to read journal block\n");
     kfree(buf);
-    return;
+    return -1;
   }
 
   jbd_superblock_t *jsb = (jbd_superblock_t *)buf;
@@ -299,14 +402,21 @@ void ext3_init_journal(ext2_mount_t *mnt) {
   uint32_t type = __builtin_bswap32(jsb->s_header.h_blocktype);
   uint32_t block_size = __builtin_bswap32(jsb->s_blocksize);
   uint32_t incompat = __builtin_bswap32(jsb->s_feature_incompat);
+  const uint32_t supported_journal_incompat =
+      JBD_FEATURE_INCOMPAT_64BIT | JBD_FEATURE_INCOMPAT_REVOKE;
   if (magic != EXT3_JOURNAL_MAGIC_NUMBER ||
       (type != JBD_SUPERBLOCK_V1 && type != JBD_SUPERBLOCK_V2) ||
-      block_size != mnt->block_size || incompat != 0) {
+      block_size != mnt->block_size ||
+      (incompat & ~supported_journal_incompat) != 0 ||
+      ((mnt->sb.s_feature_incompat & EXT2_FEATURE_INCOMPAT_64BIT) &&
+       !(incompat & JBD_FEATURE_INCOMPAT_64BIT))) {
     klog_puts("[JBD2] Unsupported journal format.\n");
     kfree(buf);
-    return;
+    return -1;
   }
 
+  trans->journal_features_incompat = incompat;
+  memcpy(trans->journal_uuid, jsb->s_uuid, sizeof(trans->journal_uuid));
   trans->sequence = __builtin_bswap32(jsb->s_sequence);
   trans->journal_blocks = __builtin_bswap32(jsb->s_maxlen);
   uint32_t start = __builtin_bswap32(jsb->s_start);
@@ -321,20 +431,38 @@ void ext3_init_journal(ext2_mount_t *mnt) {
 
   if (start != 0) {
     klog_puts("[EXT3] Journal requires recovery!\n");
-    if (ext3_recover_journal(mnt, jsb, &trans->journal_inode) == 0) {
-      trans->sequence++;
-      jsb->s_sequence = __builtin_bswap32(trans->sequence);
-      jsb->s_start = 0;
-      ext2_write_block(mnt, disk_block, buf);
+    if (mnt->read_only) {
+      klog_puts("[EXT3] Read-only mount cannot replay a dirty journal.\n");
+      kfree(buf);
+      return -1;
+    }
+    if (ext3_recover_journal(mnt, jsb, &trans->journal_inode) != 0) {
+      klog_puts("[EXT3] Journal recovery failed; refusing mount.\n");
+      kfree(buf);
+      return -1;
+    }
+    trans->sequence++;
+    jsb->s_sequence = __builtin_bswap32(trans->sequence);
+    jsb->s_start = 0;
+    if (ext2_write_block(mnt, disk_block, buf) != 0) {
+      klog_puts("[EXT3] Failed to retire recovered journal.\n");
+      kfree(buf);
+      return -1;
     }
   } else {
     klog_puts("[EXT3] Journal is clean.\n");
   }
 
   kfree(buf);
+  journal_register_mount(mnt);
+  return 0;
 }
 
 int ext3_journal_start(ext2_mount_t *mnt) {
+  if (!mnt)
+    return -1;
+  if (mnt->read_only)
+    return -30;
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
   if (!(mnt->sb.s_feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL))
     return 0;
@@ -471,7 +599,9 @@ int ext3_journal_start(ext2_mount_t *mnt) {
   return 0;
 }
 
-int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data) {
+int ext3_journal_block(ext2_mount_t *mnt, uint64_t block_nr, const void *data) {
+  if (!mnt || mnt->read_only)
+    return -30;
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
   if (!trans->active)
     return ext2_write_block(mnt, block_nr, data);
@@ -481,7 +611,9 @@ int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data) {
       trans->io_failed)
     return -1;
 
-  if (block_nr == 0) {
+  if (block_nr >= mnt->blocks_count ||
+      (block_nr > UINT32_MAX &&
+       !(trans->journal_features_incompat & JBD_FEATURE_INCOMPAT_64BIT))) {
     trans->io_failed = true;
     return -1;
   }
@@ -510,7 +642,7 @@ int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data) {
   /* A completed coherent cache image equal to this metadata needs no new
    * journal or home write. In-flight writes and cache collisions are never
    * evidence of an unchanged disk block. */
-  uint32_t idx = block_nr % EXT2_CACHE_SIZE;
+  uint32_t idx = (uint32_t)(block_nr % EXT2_CACHE_SIZE);
   spinlock_acquire(&mnt->cache_lock);
   bool unchanged = mnt->cache[idx].num == block_nr &&
                    mnt->cache[idx].data && !mnt->cache[idx].writes_inflight &&
@@ -578,9 +710,9 @@ int ext3_journal_block(ext2_mount_t *mnt, uint32_t block_nr, const void *data) {
   return 0;
 }
 
-bool ext3_journal_read_staged(ext2_mount_t *mnt, uint32_t block_nr,
+bool ext3_journal_read_staged(ext2_mount_t *mnt, uint64_t block_nr,
                               void *buffer) {
-  if (!mnt || !mnt->block_size || !block_nr || !buffer)
+  if (!mnt || !mnt->block_size || !buffer)
     return false;
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
   bool found = false;
@@ -607,7 +739,7 @@ bool ext3_journal_read_staged(ext2_mount_t *mnt, uint32_t block_nr,
  * the single-request path in order.  Ordering barriers stay explicit - a
  * batch is always fully waited before the next commit step starts.
  */
-#define EXT3_COMMIT_WRITE_BATCH 16u
+#define EXT3_COMMIT_WRITE_BATCH 32u
 
 /* Write one gathered batch and reset the count.  Returns 0 when every member
  * reached its device block, -1 otherwise. */
@@ -623,7 +755,7 @@ static int ext3_commit_io_batch(ext2_mount_t *mnt, ext2_block_write_t *batch,
 /* Like ext3_commit_io_batch(), but reports the first failed block (in
  * write-set order) so the metadata-home diagnostic keeps its meaning. */
 static int ext3_commit_home_batch(ext2_mount_t *mnt, ext2_block_write_t *batch,
-                                  uint32_t *count, uint32_t *failed_block) {
+                                  uint32_t *count, uint64_t *failed_block) {
   if (*count == 0)
     return 0;
   uint32_t n = *count;
@@ -640,6 +772,10 @@ static int ext3_commit_home_batch(ext2_mount_t *mnt, ext2_block_write_t *batch,
 }
 
 int ext3_journal_stop(ext2_mount_t *mnt) {
+  if (!mnt)
+    return -1;
+  if (mnt->read_only)
+    return -30;
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
   if (!trans->active) {
     /* A mount without a journal has no commit point, so write back the lazy
@@ -675,8 +811,8 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
     return ext3_finish_transaction(mnt, trans, -1);
   uint32_t segments = (n + tagcap - 1) / tagcap;
   uint32_t commit_pos = ext3_payload_pos(n - 1, tagcap) + 1;
-  uint32_t commit_phys = ext3_journal_phys(mnt, commit_pos);
-  uint32_t sb_phys = ext3_journal_phys(mnt, 0);
+  uint64_t commit_phys = ext3_journal_phys(mnt, commit_pos);
+  uint64_t sb_phys = ext3_journal_phys(mnt, 0);
   if (segments > EXT3_JOURNAL_SEG_MAX || !commit_phys || !sb_phys) {
     trans->io_failed = true;
     return ext3_finish_transaction(mnt, trans, -1);
@@ -712,7 +848,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
        chunk = chunk->next) {
     for (uint32_t i = 0; i < chunk->count; i++) {
       ext3_txn_entry_t *entry = &chunk->entries[i];
-      uint32_t phys = ext3_journal_phys(mnt, entry->payload_pos);
+      uint64_t phys = ext3_journal_phys(mnt, entry->payload_pos);
       if (!phys) {
         payload_failed = true;
         break;
@@ -770,6 +906,8 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
     dh->h_sequence = __builtin_bswap32(trans->sequence);
 
     uint32_t in_segment = 0;
+    uint32_t tag_bytes_used = 0;
+    size_t tag_size = ext3_tag_size(mnt);
     while (in_segment < tagcap && index < n) {
       while (chunk && chunk_index == chunk->count) {
         chunk = chunk->next;
@@ -780,20 +918,41 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
         return ext3_finish_transaction(mnt, trans, -1);
       }
       ext3_txn_entry_t *entry = &chunk->entries[chunk_index++];
-      jbd_block_tag_t *tag = (jbd_block_tag_t *)(desc + sizeof(jbd_header_t) +
-          in_segment * sizeof(jbd_block_tag_t));
-      tag->t_blocknr = __builtin_bswap32(entry->block);
-      tag->t_flags = 0;
+      uint8_t *tag_bytes = desc + sizeof(jbd_header_t) +
+          tag_bytes_used;
+      bool first_tag = in_segment == 0;
+      uint32_t flags = first_tag ? 0 : JBD_FLAG_SAME_UUID;
       if (*(const uint32_t *)entry->image ==
           __builtin_bswap32(EXT3_JOURNAL_MAGIC_NUMBER))
-        tag->t_flags |= __builtin_bswap32(JBD_FLAG_ESCAPE);
+        flags |= JBD_FLAG_ESCAPE;
       index++;
       in_segment++;
       if (in_segment == tagcap || index == n)
-        tag->t_flags |= __builtin_bswap32(JBD_FLAG_LAST_TAG);
+        flags |= JBD_FLAG_LAST_TAG;
+      if (mnt->journal.journal_features_incompat &
+          JBD_FEATURE_INCOMPAT_64BIT) {
+        jbd_block_tag_t *tag = (jbd_block_tag_t *)tag_bytes;
+        tag->t_blocknr = __builtin_bswap32((uint32_t)entry->block);
+        tag->t_checksum = 0;
+        tag->t_flags = __builtin_bswap16((uint16_t)flags);
+        tag->t_blocknr_high =
+            __builtin_bswap32((uint32_t)(entry->block >> 32));
+      } else {
+        jbd_block_tag_legacy_t *tag =
+            (jbd_block_tag_legacy_t *)tag_bytes;
+        tag->t_blocknr = __builtin_bswap32((uint32_t)entry->block);
+        tag->t_checksum = 0;
+        tag->t_flags = __builtin_bswap16((uint16_t)flags);
+      }
+      if (first_tag) {
+        memcpy(tag_bytes + tag_size, trans->journal_uuid,
+               sizeof(trans->journal_uuid));
+        tag_bytes_used += 16;
+      }
+      tag_bytes_used += (uint32_t)tag_size;
     }
     trans->phase = "commit-descriptor-map";
-    uint32_t desc_phys = ext3_journal_phys(mnt, ext3_desc_pos(index - 1, tagcap));
+    uint64_t desc_phys = ext3_journal_phys(mnt, ext3_desc_pos(index - 1, tagcap));
     if (!desc_phys || ext2_write_block_traced(mnt, desc_phys, desc,
                             &trans->phase, descriptor_stages) != 0) {
       trans->io_failed = true;
@@ -833,7 +992,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
    * independent, so they are gathered into batches like the payloads; a
    * failure reports the first affected block and still retires the log. */
   bool home_failed = false;
-  uint32_t failed_block = 0;
+  uint64_t failed_block = 0;
   ext2_block_write_t home_batch[EXT3_COMMIT_WRITE_BATCH];
   uint32_t home_batch_count = 0;
   for (chunk = trans->txn_head; chunk && !home_failed; chunk = chunk->next) {
@@ -870,7 +1029,8 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
   trans->sequence++;
   if (home_failed) {
     klogf("[JBD2] home checkpoint failed after commit, journal retired "
-          "block=%u sequence=%u\n", failed_block, trans->sequence - 1);
+          "block=%llu sequence=%u\n",
+          (unsigned long long)failed_block, trans->sequence - 1);
     trans->io_failed = true;
     return ext3_finish_transaction(mnt, trans, -1);
   }
@@ -884,6 +1044,18 @@ static int ext3_recover_journal(ext2_mount_t *mnt, jbd_superblock_t *jsb,
   uint32_t sequence = __builtin_bswap32(jsb->s_sequence);
   uint32_t journal_blocks = __builtin_bswap32(jsb->s_maxlen);
   uint32_t tagcap = ext3_tag_capacity(mnt);
+  size_t tag_size = ext3_tag_size(mnt);
+
+  typedef struct ext3_revoke_entry {
+    struct ext3_revoke_entry *next;
+    uint64_t block;
+    uint32_t sequence;
+  } ext3_revoke_entry_t;
+
+  ext3_revoke_entry_t *revoked = NULL;
+  ext3_revoke_entry_t *revoked_tail = NULL;
+  uint32_t recovered = 0;
+  uint32_t committed_end = start_block;
 
   klog_puts("[EXT3] Starting journal recovery...\n");
 
@@ -899,105 +1071,216 @@ static int ext3_recover_journal(ext2_mount_t *mnt, jbd_superblock_t *jsb,
     return -1;
   }
 
-  /* The writer publishes s_start only after the commit record is durable, so
-   * a transaction found here should be complete. Still validate the whole
-   * record before touching a home block: a partly written descriptor set with
-   * no commit record must be ignored, not replayed. */
+  /* First validate every complete transaction and collect revoke records.
+   * This lets a revoke in a later transaction suppress an older logged image
+   * before any home blocks are changed. */
   uint32_t pos = start_block;
-  uint32_t recovered = 0;
   while (pos < journal_blocks) {
     uint32_t scan = pos;
+    ext3_revoke_entry_t *txn_revoked = NULL;
+    ext3_revoke_entry_t *txn_revoked_tail = NULL;
     bool complete = false;
     for (;;) {
       if (scan >= journal_blocks)
-        goto incomplete;
-      uint32_t phys = ext2_get_block_num(mnt, j_inode, scan);
+        break;
+      uint64_t phys = ext2_get_block_num(mnt, j_inode, scan);
       if (!phys || ext2_read_block(mnt, phys, desc_buf) != 0)
-        goto incomplete;
+        break;
       jbd_header_t *h = (jbd_header_t *)desc_buf;
       if (__builtin_bswap32(h->h_magic) != EXT3_JOURNAL_MAGIC_NUMBER ||
           __builtin_bswap32(h->h_sequence) != sequence)
-        goto incomplete;
+        break;
       uint32_t type = __builtin_bswap32(h->h_blocktype);
       if (type == JBD_COMMIT_BLOCK) {
         complete = true;
         break;
       }
-      if (type != JBD_DESCRIPTOR_BLOCK)
-        goto incomplete;
-      uint32_t tag_count = 0;
-      for (uint32_t off = sizeof(jbd_header_t);
-           off + sizeof(jbd_block_tag_t) <= block_size;
-           off += sizeof(jbd_block_tag_t)) {
-        jbd_block_tag_t *tag = (jbd_block_tag_t *)(desc_buf + off);
-        tag_count++;
-        if (__builtin_bswap32(tag->t_flags) & JBD_FLAG_LAST_TAG)
+      if (type == JBD_DESCRIPTOR_BLOCK) {
+        uint32_t tag_count = 0;
+        uint32_t payload_count = 0;
+        if (!ext3_descriptor_tag_count_for_log(
+                mnt, desc_buf, block_size, tagcap, j_inode, scan,
+                journal_blocks, sequence, data_buf, &tag_count,
+                &payload_count, NULL) ||
+            payload_count + 1 > journal_blocks - scan)
           break;
+        scan += 1 + payload_count;
+        continue;
       }
-      if (!tag_count || tag_count > tagcap)
-        goto incomplete;
-      scan += 1 + tag_count;
-    }
-    if (!complete)
-      goto incomplete;
 
-    /* The commit record exists: replay every descriptor group, then its
-     * payloads, to their home blocks. */
-    uint32_t cursor = pos;
-    while (cursor != scan) {
-      uint32_t desc_phys = ext2_get_block_num(mnt, j_inode, cursor);
-      if (!desc_phys || ext2_read_block(mnt, desc_phys, desc_buf) != 0)
-        goto incomplete;
-      uint32_t next = cursor + 1;
-      for (uint32_t off = sizeof(jbd_header_t);
-           off + sizeof(jbd_block_tag_t) <= block_size;
-           off += sizeof(jbd_block_tag_t)) {
-        jbd_block_tag_t *tag = (jbd_block_tag_t *)(desc_buf + off);
-        uint32_t target_block = __builtin_bswap32(tag->t_blocknr);
-        uint32_t flags = __builtin_bswap32(tag->t_flags);
-
-        uint32_t data_phys = ext2_get_block_num(mnt, j_inode, next);
-        if (!data_phys || ext2_read_block(mnt, data_phys, data_buf) != 0)
-          goto incomplete;
-        next++;
-
-        if (flags & JBD_FLAG_ESCAPE) {
-          uint32_t magic = __builtin_bswap32(EXT3_JOURNAL_MAGIC_NUMBER);
-          memcpy(data_buf, &magic, 4);
+      if (type == JBD_REVOKE_BLOCK &&
+          (mnt->journal.journal_features_incompat &
+           JBD_FEATURE_INCOMPAT_REVOKE)) {
+        uint32_t bytes = __builtin_bswap32(*(uint32_t *)(desc_buf + 12));
+        uint32_t entry_size =
+            (mnt->journal.journal_features_incompat &
+             JBD_FEATURE_INCOMPAT_64BIT) ? 8 : 4;
+        if (bytes < sizeof(jbd_header_t) + sizeof(uint32_t) ||
+            bytes > block_size ||
+            (bytes - sizeof(jbd_header_t) - sizeof(uint32_t)) % entry_size)
+          break;
+        bool bad_revoke = false;
+        for (uint32_t off = sizeof(jbd_header_t) + sizeof(uint32_t);
+             off < bytes; off += entry_size) {
+          uint32_t high_or_low =
+              __builtin_bswap32(*(uint32_t *)(desc_buf + off));
+          uint64_t block = high_or_low;
+          if (entry_size == 8) {
+            uint32_t low =
+                __builtin_bswap32(*(uint32_t *)(desc_buf + off + 4));
+            block = ((uint64_t)high_or_low << 32) | low;
+          }
+          if (block >= mnt->blocks_count) {
+            bad_revoke = true;
+            break;
+          }
+          ext3_revoke_entry_t *entry = kmalloc(sizeof(*entry));
+          if (!entry) {
+            bad_revoke = true;
+            break;
+          }
+          entry->next = NULL;
+          entry->block = block;
+          entry->sequence = sequence;
+          if (txn_revoked_tail)
+            txn_revoked_tail->next = entry;
+          else
+            txn_revoked = entry;
+          txn_revoked_tail = entry;
         }
-
-        klog_puts("       Recovering block: ");
-        klog_uint64(target_block);
-        klog_puts("\n");
-        if (target_block && target_block < mnt->sb.s_blocks_count &&
-            ext2_write_block(mnt, target_block, data_buf) != 0)
-          goto incomplete;
-
-        if (flags & JBD_FLAG_LAST_TAG)
+        if (bad_revoke)
           break;
+        scan++;
+        continue;
       }
-      cursor = next;
+      break;
+    }
+    if (!complete) {
+      while (txn_revoked) {
+        ext3_revoke_entry_t *next = txn_revoked->next;
+        kfree(txn_revoked);
+        txn_revoked = next;
+      }
+      break;
     }
 
+    if (txn_revoked) {
+      if (revoked_tail)
+        revoked_tail->next = txn_revoked;
+      else
+        revoked = txn_revoked;
+      revoked_tail = txn_revoked_tail;
+    }
     recovered++;
     pos = scan + 1;
+    committed_end = pos;
     sequence++;
+  }
+
+  if (!recovered) {
+    kfree(desc_buf);
+    kfree(data_buf);
+    klog_puts("[EXT3] Ignoring incomplete journal transaction.\n");
+    return -1;
+  }
+
+  /* Replay only after the complete committed prefix is known and all revoke
+   * records have been collected. */
+  pos = start_block;
+  sequence = __builtin_bswap32(jsb->s_sequence);
+  while (pos < committed_end) {
+    uint32_t cursor = pos;
+    bool committed = false;
+    while (cursor < committed_end) {
+      uint64_t desc_phys = ext2_get_block_num(mnt, j_inode, cursor);
+      if (!desc_phys || ext2_read_block(mnt, desc_phys, desc_buf) != 0)
+        goto replay_failed;
+      jbd_header_t *h = (jbd_header_t *)desc_buf;
+      if (__builtin_bswap32(h->h_magic) != EXT3_JOURNAL_MAGIC_NUMBER ||
+          __builtin_bswap32(h->h_sequence) != sequence)
+        goto replay_failed;
+      uint32_t type = __builtin_bswap32(h->h_blocktype);
+      if (type == JBD_COMMIT_BLOCK) {
+        cursor++;
+        pos = cursor;
+        sequence++;
+        committed = true;
+        break;
+      }
+      if (type == JBD_REVOKE_BLOCK) {
+        cursor++;
+        continue;
+      }
+      if (type != JBD_DESCRIPTOR_BLOCK)
+        goto replay_failed;
+
+      uint32_t tag_count = 0;
+      uint32_t payload_count = 0;
+      bool include_uuids = false;
+      if (!ext3_descriptor_tag_count_for_log(
+              mnt, desc_buf, block_size, tagcap, j_inode, cursor,
+              journal_blocks, sequence, data_buf, &tag_count,
+              &payload_count, &include_uuids))
+        goto replay_failed;
+      size_t tag_offset = sizeof(jbd_header_t);
+      uint32_t data_cursor = cursor + 1;
+      for (uint32_t i = 0; i < tag_count; i++) {
+        uint8_t *tag = desc_buf + tag_offset;
+        uint32_t flags = ext3_tag_flags(mnt, tag);
+        uint64_t target_block = ext3_tag_block(mnt, tag);
+        if (!(flags & JBD_FLAG_DELETED)) {
+          uint64_t data_phys =
+              ext2_get_block_num(mnt, j_inode, data_cursor++);
+          if (!data_phys || ext2_read_block(mnt, data_phys, data_buf) != 0)
+            goto replay_failed;
+          if (flags & JBD_FLAG_ESCAPE) {
+            uint32_t magic = __builtin_bswap32(EXT3_JOURNAL_MAGIC_NUMBER);
+            memcpy(data_buf, &magic, sizeof(magic));
+          }
+        }
+
+        bool is_revoked = (flags & JBD_FLAG_DELETED) != 0;
+        for (ext3_revoke_entry_t *entry = revoked; entry && !is_revoked;
+             entry = entry->next)
+          is_revoked = entry->block == target_block &&
+                       (int32_t)(entry->sequence - sequence) >= 0;
+        if (target_block >= mnt->blocks_count)
+          goto replay_failed;
+        if (!(flags & JBD_FLAG_DELETED) && !is_revoked) {
+          klog_puts("       Recovering block: ");
+          klog_uint64(target_block);
+          klog_puts("\n");
+          if (ext2_write_block(mnt, target_block, data_buf) != 0)
+            goto replay_failed;
+        }
+        tag_offset += tag_size;
+        if (include_uuids && !(flags & JBD_FLAG_SAME_UUID))
+          tag_offset += 16;
+      }
+      cursor += 1 + payload_count;
+    }
+    if (!committed)
+      goto replay_failed;
   }
 
   klog_puts("[EXT3] Journal recovery complete.\n");
   kfree(desc_buf);
   kfree(data_buf);
-  return recovered ? 0 : -1;
+  while (revoked) {
+    ext3_revoke_entry_t *next = revoked->next;
+    kfree(revoked);
+    revoked = next;
+  }
+  return 0;
 
-incomplete:
+replay_failed:
   kfree(desc_buf);
   kfree(data_buf);
-  if (recovered) {
-    /* Replaying the committed transactions is the goal; the block after the
-     * last commit is stale data from an older log generation. */
-    klog_puts("[EXT3] Journal recovery complete.\n");
-    return 0;
+  while (revoked) {
+    ext3_revoke_entry_t *next = revoked->next;
+    kfree(revoked);
+    revoked = next;
   }
-  klog_puts("[EXT3] Ignoring incomplete journal transaction.\n");
+  klog_puts("[EXT3] Journal recovery failed during replay.\n");
   return -1;
 }

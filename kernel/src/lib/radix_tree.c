@@ -123,12 +123,56 @@ static void *radix_lookup_locked(const struct radix_tree *tree,
   return node->slots[radix_slot(index, 0)];
 }
 
+static void *radix_lookup_locked_cached(const struct radix_tree *tree,
+                                        uint64_t index,
+                                        uint64_t *cached_chunk,
+                                        void **cached_leaf,
+                                        uint32_t *cached_seq) {
+  uint64_t chunk = index >> RADIX_TREE_BITS;
+  unsigned slot = (unsigned)(index & (RADIX_TREE_SLOTS - 1));
+
+  if (cached_chunk && cached_leaf && cached_seq &&
+      *cached_chunk == chunk && *cached_leaf != NULL && *cached_seq == tree->seq) {
+    const struct asc_radix_tree_node *leaf =
+        (const struct asc_radix_tree_node *)*cached_leaf;
+    return leaf->slots[slot];
+  }
+
+  if (!radix_ptr_is_node(tree->root) ||
+      radix_required_height(index) > tree->height)
+    return NULL;
+  const struct asc_radix_tree_node *node = tree->root;
+  for (uint8_t level = tree->height - 1; level > 0; level--) {
+    node = node->slots[radix_slot(index, level)];
+    if (!radix_ptr_is_node(node))
+      return NULL;
+  }
+  if (node && cached_chunk && cached_leaf && cached_seq) {
+    *cached_chunk = chunk;
+    *cached_leaf = (void *)node;
+    *cached_seq = tree->seq;
+  }
+  return node ? node->slots[slot] : NULL;
+}
+
 void *asc_radix_tree_lookup(const struct radix_tree *tree, uint64_t index) {
   if (!tree)
     return NULL;
   struct radix_tree *mutable = (struct radix_tree *)tree;
   spinlock_acquire(&mutable->lock);
   void *value = radix_lookup_locked(tree, index);
+  spinlock_release(&mutable->lock);
+  return value;
+}
+
+void *asc_radix_tree_lookup_cached(const struct radix_tree *tree, uint64_t index,
+                                   uint64_t *cached_chunk, void **cached_leaf,
+                                   uint32_t *cached_seq) {
+  if (!tree)
+    return NULL;
+  struct radix_tree *mutable = (struct radix_tree *)tree;
+  spinlock_acquire(&mutable->lock);
+  void *value = radix_lookup_locked_cached(tree, index, cached_chunk, cached_leaf, cached_seq);
   spinlock_release(&mutable->lock);
   return value;
 }
@@ -178,6 +222,69 @@ void *asc_radix_tree_lookup_lockless(const struct radix_tree *tree,
     if (node)
       value = __atomic_load_n(&node->slots[radix_slot(index, 0)],
                               __ATOMIC_RELAXED);
+  }
+
+  if (s1 != __atomic_load_n(&tree->seq, __ATOMIC_ACQUIRE))
+    return NULL;
+  *stable = true;
+  return value;
+}
+
+void *asc_radix_tree_lookup_lockless_cached(const struct radix_tree *tree,
+                                             uint64_t index, bool *stable,
+                                             uint64_t *cached_chunk,
+                                             void **cached_leaf,
+                                             uint32_t *cached_seq) {
+  *stable = false;
+  if (!tree)
+    return NULL;
+
+  uint32_t s1 = __atomic_load_n(&tree->seq, __ATOMIC_ACQUIRE);
+  if (s1 & 1u) /* A mutation is in flight. */
+    return NULL;
+
+  uint64_t chunk = index >> RADIX_TREE_BITS;
+  unsigned slot = (unsigned)(index & (RADIX_TREE_SLOTS - 1));
+
+  /* Fast path: check if caller has the matching level-1 leaf node cached */
+  if (cached_chunk && cached_leaf && cached_seq &&
+      *cached_chunk == chunk && *cached_leaf != NULL && *cached_seq == s1) {
+    const struct asc_radix_tree_node *leaf =
+        (const struct asc_radix_tree_node *)*cached_leaf;
+    void *val = __atomic_load_n(&leaf->slots[slot], __ATOMIC_RELAXED);
+    if (s1 != __atomic_load_n(&tree->seq, __ATOMIC_ACQUIRE))
+      return NULL;
+    *stable = true;
+    return val;
+  }
+
+  const struct asc_radix_tree_node *node =
+      __atomic_load_n(&tree->root, __ATOMIC_ACQUIRE);
+  uint8_t height = __atomic_load_n(&tree->height, __ATOMIC_ACQUIRE);
+  void *value = NULL;
+
+  if (node && (height == 0 || height > RADIX_TREE_MAX_HEIGHT ||
+               !radix_ptr_is_node(node))) {
+    return NULL;
+  }
+
+  if (node && radix_required_height(index) <= height) {
+    for (uint8_t level = height - 1; level > 0; level--) {
+      node = __atomic_load_n(&node->slots[radix_slot(index, level)],
+                             __ATOMIC_RELAXED);
+      if (!radix_ptr_is_node(node)) {
+        node = NULL;
+        break;
+      }
+    }
+    if (node) {
+      value = __atomic_load_n(&node->slots[slot], __ATOMIC_RELAXED);
+      if (cached_chunk && cached_leaf && cached_seq) {
+        *cached_chunk = chunk;
+        *cached_leaf = (void *)node;
+        *cached_seq = s1;
+      }
+    }
   }
 
   if (s1 != __atomic_load_n(&tree->seq, __ATOMIC_ACQUIRE))

@@ -734,6 +734,48 @@ static uint32_t alsa_frame_bytes(void) {
     return frame_size ? frame_size : 4;
 }
 
+/* Keep the standard ALSA card listing available to tools that consult
+ * /proc/asound/cards before opening the control and PCM character devices. */
+static uint32_t alsa_proc_cards_read(vfs_node_t *node, uint32_t offset,
+                                    uint32_t size, uint8_t *buffer) {
+    (void)node;
+    static const char no_cards[] = "--- no soundcards ---\n";
+    static const char hda_card[] =
+        " 0 [HDA            ]: HDA - AvoryOS HDA Audio\n"
+        "                      AvoryOS QEMU High Definition Audio\n";
+    const char *text = hda_is_present() ? hda_card : no_cards;
+    uint32_t length = (uint32_t)strlen(text);
+    if (offset >= length)
+        return 0;
+    if (size > length - offset)
+        size = length - offset;
+    memcpy(buffer, text + offset, size);
+    return size;
+}
+
+static void alsa_register_proc_cards(void) {
+    vfs_node_t *proc_dir = vfs_resolve_path("/proc");
+    if (!proc_dir)
+        return;
+    if (proc_dir->mkdir)
+        proc_dir->mkdir(proc_dir, "asound", 0555);
+    vfs_close(proc_dir);
+
+    vfs_node_t *asound_dir = vfs_resolve_path("/proc/asound");
+    if (!asound_dir)
+        return;
+    vfs_node_t *cards = kmalloc(sizeof(vfs_node_t));
+    if (cards) {
+        vfs_node_init(cards);
+        strcpy(cards->name, "cards");
+        cards->flags = FS_FILE | FS_PERSISTENT;
+        cards->mask = 0444;
+        cards->read = alsa_proc_cards_read;
+        ramfs_mount_node(asound_dir, cards);
+    }
+    vfs_close(asound_dir);
+}
+
 // Sample formats this emulation can hand to the HDA engine sample-for-sample.
 // HDA DACs have no float format and are little-endian, so those are never
 // advertised, and 32-bit is only offered when the codec reports that it can
@@ -1689,6 +1731,8 @@ void alsa_emu_register_vfs(void) {
     // probe these by name at startup; without them every ELEM_INFO/READ
     // misses with ENOENT.
     alsa_seed_default_mixer();
+
+    alsa_register_proc_cards();
 
     vfs_node_t *snd_dir = NULL;
     vfs_node_t *dev_dir = vfs_resolve_path("/dev");

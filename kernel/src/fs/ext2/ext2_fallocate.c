@@ -16,6 +16,8 @@ int ext2_fallocate_impl(vfs_node_t *node, int mode, uint32_t offset,
     return -27;
 
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
+  if (mnt->read_only)
+    return -30;
   if (!mnt->block_size)
     return -5;
   uint32_t zero_size = mnt->block_size * EXT2_FALLOCATE_BATCH_BLOCKS;
@@ -50,7 +52,7 @@ int ext2_fallocate_impl(vfs_node_t *node, int mode, uint32_t offset,
       for (unsigned operations = 0;
            operations < EXT2_FALLOCATE_BATCH_BLOCKS && budget && logical <= last;
            operations++) {
-        uint32_t block = 0;
+        uint64_t block = 0;
         uint32_t run = 1;
         if (extents)
           block = ext4_get_extent_run(mnt, &inode, logical, &run);
@@ -71,7 +73,7 @@ int ext2_fallocate_impl(vfs_node_t *node, int mode, uint32_t offset,
           uint32_t wanted = last - logical + 1;
           if (wanted > budget) wanted = budget;
           if (wanted > run) wanted = run;
-          uint32_t goal = logical
+          uint64_t goal = logical
               ? ext4_get_block_num(mnt, &inode, logical - 1) : 0;
           if (goal) goal++;
           block = ext2_alloc_run_hint(mnt, goal, wanted, &reserved);

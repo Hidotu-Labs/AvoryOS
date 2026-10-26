@@ -14,6 +14,7 @@
 #include "socket/epoll.h"
 #include "socket/socket.h"
 #include "socket/socket_internal.h"
+#include "arch/uaccess.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -437,6 +438,15 @@ static int inet_getsockopt(socket_t *sock, int level, int optname,
     inet_sock_t *isk = sock->sk;
     if (!isk) return -22;
     if (level == SOL_SOCKET) {
+        if (optname == SO_LINGER) {
+            if (*optlen < 0) return -22;
+            int linger[2] = {isk->linger_seconds >= 0,
+                            isk->linger_seconds >= 0 ? isk->linger_seconds : 0};
+            int length = *optlen < (int)sizeof(linger) ? *optlen : (int)sizeof(linger);
+            if (copy_to_user(optval, linger, length)) return -14;
+            *optlen = length;
+            return 0;
+        }
         if (optname == SO_ERROR && *optlen >= (int)sizeof(int)) {
             int err = 0;
             if (isk->tcp) { err = isk->tcp->error; isk->tcp->error = 0; }

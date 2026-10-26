@@ -27,6 +27,12 @@
 // Using ~0xFFFULL instead of this will preserve the NX bit and cause
 // HHDM address overflow → GPF!
 #define PAGE_MASK 0x000FFFFFFFFFF000ULL
+/* Non-present anonymous compressed swap entry; address bits hold slot ID. */
+#define PAGE_FLAG_SWAP ((uint64_t)1 << 11)
+static inline uint32_t zram_pte_slot(uint64_t pte) {
+  return !(pte & PAGE_FLAG_PRESENT) && (pte & PAGE_FLAG_SWAP) ? (uint32_t)((pte & PAGE_MASK) >> 12) : 0;
+}
+static inline uint64_t zram_pte(uint32_t slot) { return ((uint64_t)slot << 12) | PAGE_FLAG_SWAP; }
 
 // Virtual Memory Layout Definitions
 #define USER_SPACE_BASE 0x0000000000000000ULL

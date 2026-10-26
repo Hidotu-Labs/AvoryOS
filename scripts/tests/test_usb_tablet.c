@@ -11,6 +11,8 @@ extern int puts(const char *);
 bool usb_verbose;
 hal_irq_state_t hal_irq_save(void) { return 0; }
 void hal_irq_restore(hal_irq_state_t flags) { (void)flags; }
+void tlb_shootdown_poll(void) {}
+void vfs_rcu_poll(void) {}
 void lockdiag_spin_begin(const void *p, uint64_t ip) { (void)p; (void)ip; }
 void lockdiag_spin_end(const void *p) { (void)p; }
 void klog_puts(const char *s) { (void)s; }

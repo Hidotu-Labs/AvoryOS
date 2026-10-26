@@ -624,7 +624,8 @@ struct drm_prime_handle {
 _Static_assert(sizeof(struct drm_prime_handle) == 12, "drm_prime_handle ABI size");
 
 /* ── Per-file (per-client) DRM state ─────────────────────────────────────── */
-#define DRM_MAX_HANDLES_PER_FILE 256
+/* Virgl desktops retain hundreds of textures and transient render buffers. */
+#define DRM_MAX_HANDLES_PER_FILE 65536
 
 /*
  * drm_file — allocated once per open() of /dev/dri/card0.
@@ -636,10 +637,11 @@ struct drm_file {
   /* Per-client GEM handle table: maps local handle → global gem object */
   struct drm_gem_object *handles[DRM_MAX_HANDLES_PER_FILE];
   uint32_t next_handle; /* next local handle to assign (1-based) */
+  uint32_t handle_high_water; /* one past the highest populated slot */
 
   /*
    * Legacy hardware FB gem object (handle 0xF0B0).
-   * Stored separately because 0xF0B0 > DRM_MAX_HANDLES_PER_FILE.
+   * Stored separately; normal GEM registration reserves this handle.
    * drm_file_gem_lookup falls back to this when handle == 0xF0B0.
    */
   struct drm_gem_object *hw_fb_gem;
@@ -654,6 +656,8 @@ struct drm_file {
 
   /* Optional per-open state owned by the hardware driver. */
   void *driver_private;
+  uint32_t virgl_context;
+  bool is_render;
 
   spinlock_t lock;
   struct list_head list; /* linked into drm_device.file_list */
@@ -683,6 +687,7 @@ void ascentdrm_init(void);
 vfs_node_t *ascentdrm_create_client_node(void);
 bool ascentdrm_is_card_node(vfs_node_t *node);
 void ascentdrm_register_vfs(void);
+void ascentdrm_register_render_vfs(void);
 void ascentdrm_stats_snapshot(struct drm_stats *out);
 
 void ascentdrm_obj_add_prop(struct drm_mode_object *obj, uint32_t prop_id,
@@ -713,9 +718,13 @@ struct drm_gem_object {
   struct list_head list;
   struct list_head file_list;
   int refcount;
+  /* Native virtio render slot mask, protected by gpu_poll_lock. Shares the
+   * refcount cache line and fills its former alignment padding. */
+  uint32_t virgl_pending_jobs;
   uint64_t (*get_page_phys)(struct drm_gem_object *obj, uint32_t page);
   void (*free)(struct drm_device *dev, struct drm_gem_object *obj);
   void *driver_private;
+  void *virgl_resource; /* native virgl host resource metadata */
   void *prime_buffer; /* referenced Linux dma_buf for a foreign GEM import */
   void *prime_mapping; /* pinned attachment + CPU mapping */
   void *prime_reservation; /* shared implicit fences for native exports */

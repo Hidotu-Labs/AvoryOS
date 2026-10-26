@@ -12,10 +12,10 @@
 #include "../apic/lapic_timer.h"
 
 #define KSM_BUCKETS 16384
-#define KSM_MAX_NODES 32768
+#define KSM_MAX_NODES 4096
 #define KSM_MAX_TARGETS 256
 /* Bound work, including absent PTEs, in each IRQ-masked mm section. */
-#define KSM_MM_WORK_BUDGET 256
+#define KSM_MM_WORK_BUDGET 64
 #define KSM_MAX_CHAIN_PROBES 16
 
 /* Merge eagerly under memory pressure, slowly in the background otherwise.
@@ -46,6 +46,9 @@ struct ksm_node {
 static struct ksm_node *ksm_node_pool = NULL;
 static uint32_t ksm_buckets[KSM_BUCKETS];
 static uint32_t ksm_node_count = 1;
+/* Rotate bounded passes so the same first address spaces do not monopolize
+ * the scan/pin budget. This is an index, never an unreferenced mm pointer. */
+static uint32_t ksm_target_cursor;
 
 static volatile uint32_t ksm_scan_active = 0;
 static struct ksm_stats ksm_global_stats = {0};
@@ -144,9 +147,12 @@ uint64_t ksm_scan_pass(void) {
    * extra reference forces a concurrent CoW fault to copy, even if this was
    * the only mapping.  Keep these pins through the final shootdown: neither
    * old translations nor hash-table entries may outlive their frames. */
-  for (int t_idx = 0; t_idx < ntargets; t_idx++) {
-    struct mm_struct *mm = targets[t_idx].mm;
-    uint64_t cr3 = targets[t_idx].cr3;
+  uint32_t target_start = ntargets ? ksm_target_cursor % ntargets : 0;
+  for (int t_idx = 0; t_idx < ntargets && ksm_node_count < KSM_MAX_NODES; t_idx++) {
+    uint32_t target_idx = (target_start + t_idx) % ntargets;
+    ksm_target_cursor = (target_idx + 1) % ntargets;
+    struct mm_struct *mm = targets[target_idx].mm;
+    uint64_t cr3 = targets[target_idx].cr3;
     uint32_t first = ksm_node_count;
     unsigned work = 0;
     spinlock_acquire(&mm->lock);
@@ -269,6 +275,12 @@ uint64_t ksm_scan_pass(void) {
          * shootdown and release below. */
         pmm_free_page((void *)phys);
         freed_pages++;
+      } else if (snapshot->replacement && snapshot->replacement != zero_page_phys) {
+        /* The comparison reserved a reference for a new mapping. A CoW or
+         * unmap during hashing cancels that mapping, so return its reference.
+         * The candidate's scan pin still protects hash-table readers. */
+        pmm_free_page((void *)snapshot->replacement);
+        snapshot->replacement = 0;
       }
     }
     spinlock_release(&mm->lock);

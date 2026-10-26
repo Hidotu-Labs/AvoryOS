@@ -89,4 +89,22 @@ bool virtio_gpu_phase8_start(void);
 uint32_t virtio_gpu_scanout_count(void);
 bool virtio_gpu_scanout_summary(uint32_t scanout, bool *enabled, char *modes, uint32_t capacity);
 void virtio_gpu_get_stats(struct virtio_gpu_stats *out);
+bool virtio_gpu_control(const void *, uint32_t, void *, uint32_t, uint32_t *);
+bool virtio_gpu_render_submit(const void *, uint32_t, struct drm_gem_object **, uint32_t);
+bool virtio_gpu_render_submit_notify(const void *, uint32_t, struct drm_gem_object **,
+                                    uint32_t, void (*)(void *, int), void *);
+bool virtio_gpu_render_submit_parts(const void *, uint32_t, const void *, uint32_t,
+                                   struct drm_gem_object **, uint32_t,
+                                   void (*)(void *, int), void *);
+bool virtio_gpu_render_queued(void);
+int virtio_gpu_render_wait(struct drm_gem_object **, uint32_t, uint32_t);
+int virtio_gpu_render_wait_bo(struct drm_gem_object *, bool);
+uint32_t virtio_gpu_resource_id(void);
+int virtio_gpu_wait_idle(bool nowait);
+void virtio_gpu_virgl_init(uint64_t features, uint32_t capsets);
+bool virtio_gpu_virgl_enabled(void);
+int virtio_gpu_virgl_ioctl(struct drm_file *, uint32_t request, uint64_t arg);
+void virtio_gpu_virgl_close(struct drm_file *);
+int virtio_gpu_virgl_readback(struct drm_gem_object *);
+uint32_t virtio_gpu_virgl_resource_id(struct drm_gem_object *);
 #endif

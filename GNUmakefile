@@ -127,16 +127,37 @@ endif
 ifeq ($(RUN_NIC),none)
 RUN_NET_FLAGS = -nic none
 endif
-# Same cursor set as run-amd-gpu: a relative mouse plus a hidden host
-# cursor (DISPLAY_OPT defaults to show-cursor=off), so the guest draws its
-# own software cursor into the scanout. Override per boot with
-# RUN_POINTER=usb-tablet and GTK_SHOW_CURSOR=on for the absolute-tablet
-# host cursor instead.
+# Match run-nouveau's xHCI keyboard/relative-mouse setup. Xorg draws its
+# software cursor and the frontend keeps the host cursor hidden. An absolute tablet
+# remains available through RUN_POINTER=usb-tablet.
 RUN_POINTER ?= usb-mouse
+# Virgl requires QEMU's OpenGL device and an OpenGL display backend.
+# RUN_VIRGL=0 keeps a 2D VM available on hosts without virglrenderer/EGL.
+RUN_VIRGL ?= 1
+# Guard invalid vertex-buffer draws before NVIDIA's host OpenGL driver sees
+# them. Built locally; system QEMU and graphics packages are not replaced.
+RUN_VIRGL_HOST_FIX ?= 1
+VIRGL_HOST_LIB := build/virgl-host/lib/libvirglrenderer.so.1
+RUN_VIRGL_FIXED = $(if $(filter 1,$(RUN_VIRGL)),$(filter 1,$(RUN_VIRGL_HOST_FIX)))
+RUN_VIRGL_ENV = $(if $(RUN_VIRGL_FIXED),env LD_LIBRARY_PATH="$(abspath build/virgl-host/lib):$${LD_LIBRARY_PATH:-}")
+$(VIRGL_HOST_LIB): scripts/build-virgl-host.py scripts/virgl/missing-vertex-buffer.patch scripts/virgl/missing-vertex-buffer-v1.patch scripts/virgl/fog-semantic.patch scripts/virgl/nvidia-vertex-binding.patch scripts/virgl/nvidia-vertex-binding-v1.patch
+	python3 scripts/build-virgl-host.py
+.PHONY: virgl-host
+virgl-host: $(VIRGL_HOST_LIB)
+RUN_GPU = $(if $(filter 1,$(RUN_VIRGL)),virtio-vga-gl,virtio-vga)
+RUN_GL = $(if $(filter 1,$(RUN_VIRGL)),on,off)
+# GTK's Wayland GL widget can lose relative input after its pointer grab.
+# SDL preserves host relative reports with the same virgl device and USB mouse.
+RUN_DISPLAY ?= $(if $(filter 1,$(RUN_VIRGL)),sdl,gtk)
+# Preserve complete kernel hang reports independently of terminal scrollback.
+# The stdio backend keeps the interactive serial commands (dump/diag/gpup).
+RUN_SERIAL_LOG ?= build/logs/desktop-serial.log
 .PHONY: run run-tcg
-run: QEMUFLAGS = $(QEMU_MEM) -vga none -device virtio-vga,xres=1280,yres=800
-run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
-	qemu-system-$(ARCH) \
+run: DISPLAY_OPT = -display $(RUN_DISPLAY),gl=$(RUN_GL),show-cursor=$(GTK_SHOW_CURSOR)$(if $(filter gtk,$(RUN_DISPLAY)),$(NET_COMMA)zoom-to-fit=off$(NET_COMMA)grab-on-hover=on)
+run: QEMUFLAGS = $(QEMU_MEM) -vga none -device $(RUN_GPU),xres=1280,yres=800
+run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL_HOST_LIB))
+	@mkdir -p "$(dir $(RUN_SERIAL_LOG))"
+	$(RUN_VIRGL_ENV) qemu-system-$(ARCH) \
 		-M q35,pcspk-audiodev=snd0 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
@@ -144,7 +165,8 @@ run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 		-device nvme,serial=avoryos0,drive=nvme0 \
 		-cpu host -enable-kvm \
 		-smp $(RUN_SMP) \
-		-serial stdio \
+		-chardev stdio,id=desktop-serial,logfile=$(RUN_SERIAL_LOG),logappend=on \
+		-serial chardev:desktop-serial \
 		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
 		$(RUN_NET_FLAGS) \
 		-device intel-hda -device hda-duplex,audiodev=snd0 \
@@ -498,8 +520,10 @@ DISK_NON_APP_DEPS := GNUmakefile \
 	scripts/rootfs-packages.txt $(AXON_PROFILE_FILES) userland/avory-login.c \
 	scripts/glibc-toolchain.sh $(GLIBC_TOOLCHAIN_STAMP) \
 	scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh \
-	scripts/populate-ext2-dir.sh scripts/configure-image-root.sh \
-	config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/20-output.conf \
+	scripts/populate-ext2-dir.sh scripts/configure-image-root.sh config/init/rcS \
+	config/plasma/avory-plasma-wayland.sh \
+	config/weston/avory-weston-session.sh config/weston/weston.desktop \
+	config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/10-virgl.conf config/xorg/20-output.conf \
 	scripts/image-runtime.py config/xorg/avory-prime-display.sh \
 	config/xorg/45-prime-output.sh config/xorg/avory-xorg-profile.sh \
 	config/xorg/10-nouveau.conf config/xorg/avory-nouveau-xorg.sh \
@@ -525,16 +549,16 @@ DISK_REBUILD ?= $(shell \
 	done; echo 0)
 
 disk.img: scripts/populate-ext2-dir.sh scripts/configure-image-root.sh
-# Both Xorg profiles ship in every image; /sbin/avory-early-init selects the
+# All Xorg profiles ship in every image; /sbin/avory-early-init selects the
 # one matching the boot's PCI topology (amdgpu passthrough vs native card0),
 # so bare `sddm` works with or without VFIO. XORG_PROFILE only sets the
 # baked default for boots where detection is inconclusive.
 XORG_PROFILE ?= amdgpu
-XORG_CONFIG = $(if $(filter amdgpu,$(XORG_PROFILE)),config/xorg/10-modesetting.conf,config/xorg/10-native.conf)
+XORG_CONFIG = $(if $(filter amdgpu,$(XORG_PROFILE)),config/xorg/10-modesetting.conf,$(if $(filter virgl,$(XORG_PROFILE)),config/xorg/10-virgl.conf,config/xorg/10-native.conf))
 
 # Pick a profile when populating a disk. Switching launch targets never
 # needs a rebuild: early init re-selects the profile on every boot.
-disk.img: config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/20-output.conf config/kwinoutputconfig.json scripts/image-runtime.py
+disk.img: config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/10-virgl.conf config/xorg/20-output.conf config/kwinoutputconfig.json scripts/image-runtime.py
 disk.img: config/xorg/avory-prime-display.sh config/xorg/45-prime-output.sh config/xorg/avory-xorg-profile.sh
 disk.img: config/xorg/10-nouveau.conf config/xorg/avory-nouveau-xorg.sh
 disk.img: config/xorg/44-nouveau-env.sh
@@ -579,8 +603,10 @@ disk.img: disk-full-force
 		truncate -s $$(( $(DISK_SIZE_MIB) - 2 ))M ./part.img; \
 	fi
 	@echo "Creating root filesystem (ext4)..."
+	# The kernel's VFS uses 32-bit file sizes/offsets; avoid the host default
+	# large_file feature so the generated root stays writable under this kernel.
 	mkfs.ext4 -F -b 1024 -I 128 \
-		-O extent,filetype,has_journal,dir_index,^64bit,^metadata_csum,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^metadata_csum_seed,^orphan_file \
+		-O extent,filetype,has_journal,dir_index,^64bit,^metadata_csum,^flex_bg,^huge_file,^large_file,^dir_nlink,^extra_isize,^metadata_csum_seed,^orphan_file \
 		./part.img
 	@echo "Populating root filesystem..."
 	@{ \
@@ -794,6 +820,7 @@ disk.img: disk-full-force
 		mkdir -p build/arch/rootfs/usr/share/avory-xorg; \
 		install -m 0644 config/xorg/10-modesetting.conf build/arch/rootfs/usr/share/avory-xorg/10-modesetting-amdgpu.conf; \
 		install -m 0644 config/xorg/10-native.conf build/arch/rootfs/usr/share/avory-xorg/10-modesetting-native.conf; \
+		install -m 0644 config/xorg/10-virgl.conf build/arch/rootfs/usr/share/avory-xorg/10-modesetting-virgl.conf; \
 		install -m 0644 $(XORG_CONFIG) build/arch/rootfs/etc/X11/xorg.conf.d/10-modesetting.conf; \
 		install -m 0755 config/xorg/avory-xorg-profile.sh build/arch/rootfs/usr/bin/avory-xorg-profile; \
 		install -m 0755 config/xorg/avory-nouveau-xorg.sh build/arch/rootfs/usr/bin/avory-nouveau-xorg; \
@@ -815,6 +842,9 @@ disk.img: disk-full-force
 		if [ -f build/arch/rootfs/etc/sddm.conf ]; then \
 			sed -i 's|^DisplayCommand=.*$$|DisplayCommand=/usr/bin/avory-prime-display|' build/arch/rootfs/etc/sddm.conf; \
 		fi; \
+		install -m 0755 config/init/rcS build/arch/rootfs/etc/init.d/rcS; \
+		install -m 0755 config/weston/avory-weston-session.sh build/arch/rootfs/usr/bin/avory-weston-session; \
+		install -m 0644 config/weston/weston.desktop build/arch/rootfs/usr/share/wayland-sessions/weston.desktop; \
 		./scripts/configure-accounts.sh build/arch/rootfs; \
 		./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs /; \
 		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs/usr/include usr/include; \

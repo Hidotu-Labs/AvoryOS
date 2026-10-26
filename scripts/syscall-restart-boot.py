@@ -47,7 +47,7 @@ def run(argv):
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
-def prepare(extra_root_setup=None, kernel_cmdline=None, filesystem="ext2"):
+def prepare(extra_root_setup=None, kernel_cmdline=None, filesystem="ext2", disk_mib=128):
     disk = OUT / 'root.img'
     for proc in Path('/proc').iterdir():
         if not proc.name.isdigit():
@@ -63,8 +63,9 @@ def prepare(extra_root_setup=None, kernel_cmdline=None, filesystem="ext2"):
     for name in ('bin', 'sbin', 'dev/dri', 'proc', 'sys', 'run', 'tmp', 'etc',
                  'root', 'usr/bin', 'usr/lib', 'home', 'lib/firmware'):
         (root / name).mkdir(parents=True, exist_ok=True)
-    shutil.copy2(ROOT / 'userland/test_syscall_restart.elf',
-                 root / 'bin/test_syscall_restart')
+    if '/bin/test_syscall_restart' in INIT:
+        shutil.copy2(ROOT / 'userland/test_syscall_restart.elf',
+                     root / 'bin/test_syscall_restart')
     (OUT / 'init.c').write_text(INIT)
     compiler = os.environ.get('AVORY_TEST_CC')
     if not compiler:
@@ -78,7 +79,7 @@ def prepare(extra_root_setup=None, kernel_cmdline=None, filesystem="ext2"):
     if extra_root_setup is not None:
         extra_root_setup(root)
     with disk.open('wb') as stream:
-        stream.truncate(128 * 1024**2)
+        stream.truncate(disk_mib * 1024**2)
     if filesystem not in ('ext2', 'ext3', 'ext4'):
         raise ValueError('unsupported probe filesystem')
     run(['mke2fs', '-q', '-t', filesystem, '-F', '-d', root, disk])

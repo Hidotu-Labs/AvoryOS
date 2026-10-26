@@ -28,6 +28,7 @@ struct drm_file *ascentdrm_file_alloc(struct drm_device *dev) {
   memset(file, 0, sizeof(struct drm_file));
   file->dev = dev;
   file->next_handle = 1;
+  file->handle_high_water = 1;
   spinlock_init(&file->lock);
   INIT_LIST_HEAD(&file->event_queue);
   wait_queue_init(&file->event_wq);
@@ -41,8 +42,8 @@ struct drm_file *ascentdrm_file_alloc(struct drm_device *dev) {
   spinlock_release(&dev->lock);
 
   /*
-   * Pre-register the hardware framebuffer GEM object (handle 0xF0B0) into
-   * this client's handle table under the same handle number.  Legacy
+   * Keep a reference to the hardware framebuffer GEM object (0xF0B0).
+   * This handle is reserved outside normal allocations. Legacy
    * userland (tglgears_drm, drm_bench, etc.) uses 0xF0B0 directly.
    */
   struct drm_gem_object *hw_fb = NULL;
@@ -58,10 +59,8 @@ struct drm_file *ascentdrm_file_alloc(struct drm_device *dev) {
 
   if (hw_fb) {
     /*
-     * 0xF0B0 = 61616 which exceeds DRM_MAX_HANDLES_PER_FILE (256).
-     * We can't slot it directly, so we register it at handle slot 1
-     * and also keep a pointer in a dedicated hw_fb field so MAP_DUMB
-     * can find it by the legacy handle number via the fallback path.
+     * Keep the framebuffer in its dedicated field so MAP_DUMB can find
+     * it by the legacy handle number via the fallback path.
      */
     spinlock_acquire(&file->lock);
     file->hw_fb_gem = hw_fb;
@@ -83,22 +82,31 @@ void ascentdrm_file_free(struct drm_file *file) {
   if (!file)
     return;
   struct drm_device *dev = file->dev;
+  virtio_gpu_virgl_close(file);
 
   /* Release all GEM handles owned by this client. Collect last-refs under
    * the lock and free them after unlock: the refcount itself is atomic, so
    * exactly one closer observes the 1->0 transition even when two files
    * share the object. */
-  struct drm_gem_object *to_free[DRM_MAX_HANDLES_PER_FILE];
-  uint32_t n_free = 0;
-  spinlock_acquire(&file->lock);
-  for (uint32_t i = 0; i < DRM_MAX_HANDLES_PER_FILE; i++) {
-    if (file->handles[i]) {
+  /* Bound stack use independently of the handle-table size. Kernel stacks
+   * are 16 KiB; a pointer array for the full desktop namespace does not fit. */
+  struct drm_gem_object *to_free[32];
+  for (uint32_t first = 0; first < DRM_MAX_HANDLES_PER_FILE; first += 32) {
+    uint32_t n_free = 0;
+    spinlock_acquire(&file->lock);
+    for (uint32_t i = first; i < first + 32 && i < DRM_MAX_HANDLES_PER_FILE; i++) {
       struct drm_gem_object *obj = file->handles[i];
-      file->handles[i] = NULL;
-      if (ascentdrm_gem_put_last(obj) && n_free < DRM_MAX_HANDLES_PER_FILE)
-        to_free[n_free++] = obj;
+      if (obj) {
+        file->handles[i] = NULL;
+        if (ascentdrm_gem_put_last(obj))
+          to_free[n_free++] = obj;
+      }
     }
+    spinlock_release(&file->lock);
+    for (uint32_t i = 0; i < n_free; i++)
+      ascentdrm_gem_object_free(dev, to_free[i]);
   }
+  spinlock_acquire(&file->lock);
   /* Release legacy hw FB reference */
   if (file->hw_fb_gem) {
     __atomic_fetch_sub(&file->hw_fb_gem->refcount, 1, __ATOMIC_ACQ_REL);
@@ -113,9 +121,6 @@ void ascentdrm_file_free(struct drm_file *file) {
     kfree(e);
   }
   spinlock_release(&file->lock);
-
-  for (uint32_t i = 0; i < n_free; i++)
-    ascentdrm_gem_object_free(dev, to_free[i]);
 
   spinlock_acquire(&dev->lock);
   list_del(&file->list);
@@ -152,7 +157,7 @@ uint32_t ascentdrm_file_gem_register(struct drm_file *file,
 
   /* Linux GEM namespaces return the existing handle when the same dma-buf
    * is imported repeatedly into one DRM file. */
-  for (uint32_t h = 1; h < DRM_MAX_HANDLES_PER_FILE; h++) {
+  for (uint32_t h = 1; h < file->handle_high_water; h++) {
     if (file->handles[h] == obj) {
       spinlock_release(&file->lock);
       return h;
@@ -165,8 +170,10 @@ uint32_t ascentdrm_file_gem_register(struct drm_file *file,
     start = 1;
   uint32_t h = start;
   do {
-    if (!file->handles[h]) {
+    if (h != 0xF0B0 && !file->handles[h]) {
       file->handles[h] = obj;
+      if (h >= file->handle_high_water)
+        file->handle_high_water = h + 1;
       ascentdrm_gem_get(obj);
       file->next_handle = h + 1;
       if (file->next_handle >= DRM_MAX_HANDLES_PER_FILE)

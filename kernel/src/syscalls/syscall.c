@@ -7,6 +7,7 @@
 #include "../lib/string.h"
 #include "../sched/sched.h"
 #include "../sched/seccomp.h"
+#include "../sched/pid_namespace.h"
 #include "../smp/cpu.h"
 #include "arch/uaccess.h"
 #include <stdint.h>
@@ -506,6 +507,58 @@ void syscall_dispatcher(struct syscall_regs *regs) {
 
   uint64_t syscall_num = regs->rax;
   uint64_t syscall_return_ip = regs->rip;
+
+#if !SYSCALL_LOG
+  /* Ultra-Fast Path: Trivial read-only process and thread identity queries */
+  if (__builtin_expect(t && !t->syscall_dispatch_enabled &&
+                       !seccomp_mode(t) && !t->rseq_addr &&
+                       !(t->pending_signals & ~t->signal_mask) &&
+                       !__atomic_load_n(&t->need_resched, __ATOMIC_RELAXED), 1)) {
+    switch (syscall_num) {
+      case SYS_GETPID: {
+        uint64_t pid = t->is_main_session ? 1 : (t->pid_ns ? pid_namespace_visible(t, t->tgid ? t->tgid : t->tid) : (t->tgid ? t->tgid : t->tid));
+        regs->rax = pid;
+        t->last_syscall_num = SYS_GETPID;
+        t->last_syscall_ret = pid;
+        return;
+      }
+      case SYS_GETTID: {
+        uint64_t tid = t->is_main_session ? 1 : (t->pid_ns ? pid_namespace_tid(t, t) : t->tid);
+        regs->rax = tid;
+        t->last_syscall_num = SYS_GETTID;
+        t->last_syscall_ret = tid;
+        return;
+      }
+      case SYS_GETUID:
+        regs->rax = t->uid;
+        t->last_syscall_num = SYS_GETUID;
+        t->last_syscall_ret = t->uid;
+        return;
+      case SYS_GETGID:
+        regs->rax = t->gid;
+        t->last_syscall_num = SYS_GETGID;
+        t->last_syscall_ret = t->gid;
+        return;
+      case SYS_GETEUID:
+        regs->rax = t->euid;
+        t->last_syscall_num = SYS_GETEUID;
+        t->last_syscall_ret = t->euid;
+        return;
+      case SYS_GETEGID:
+        regs->rax = t->egid;
+        t->last_syscall_num = SYS_GETEGID;
+        t->last_syscall_ret = t->egid;
+        return;
+      case SYS_GETPPID: {
+        uint64_t ppid = t->parent ? (t->pid_ns ? pid_namespace_visible(t, t->parent->tgid ? t->parent->tgid : t->parent->tid) : (t->parent->tgid ? t->parent->tgid : t->parent->tid)) : 0;
+        regs->rax = ppid;
+        t->last_syscall_num = SYS_GETPPID;
+        t->last_syscall_ret = ppid;
+        return;
+      }
+    }
+  }
+#endif
 
   if (t) {
     __atomic_store_n(&t->in_syscall, true, __ATOMIC_RELAXED);

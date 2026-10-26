@@ -205,13 +205,13 @@ next step, and its acceptance criteria are unchanged.
 First slice of the Stage 3 pipelined-submission item, without adding group
 commit or touching Stage 2. The block layer gained an optional
 `read_batch`/`write_batch` API (`struct block_io_req`), and the ext3 commit
-gathers payload and metadata-home writes into batches of up to 16 blocks so
-one submitter waits once per batch instead of once per block. Built with
-`NVME_BATCH_IO=1`, the NVMe driver submits waves of up to 16 independent
-commands back to back and reaps them against one shared deadline; other
-devices and kernels without the knob run the same members through the old
-ordered single-request loop. Every batch is fully waited before the next
-commit step starts, so the ordering barriers
+gathers payload and metadata-home writes into batches of up to 32 blocks so
+one submitter waits once per batch instead of once per block. With
+`NVME_BATCH_IO=1` (now the default), the NVMe driver submits waves of up to 32
+independent commands back to back and reaps them against one shared deadline;
+other devices and builds with `NVME_BATCH_IO=0` run the same members through
+the old ordered single-request loop. Every batch is fully waited before the
+next commit step starts, so the ordering barriers
 (payload→descriptor→commit→super-publish→home→super-clear) and FUA/flush
 semantics are unchanged. Actual-source host tests cover the batch wait,
 per-member verdicts, and the batched commit loops; see

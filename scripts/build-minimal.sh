@@ -251,12 +251,12 @@ build_disk() {
     log "Rootfs is ${root_mb} MiB / ${entries} entries; building a ${part_mb} MiB ext4 partition..."
 
     # Same on-disk format the kernel is validated against (see GNUmakefile):
-    # 1 KiB blocks, no 64bit/metadata_csum/flex_bg features.
+    # 1 KiB blocks, no 64bit/large_file/metadata_csum/flex_bg features.
     rm -f "$PART_IMG"
     dd if=/dev/zero of="$PART_IMG" bs=1M count="$part_mb" status=none
     mkfs.ext4 -q -F -b 1024 -I 128 \
         -N $(( entries + entries / 4 + 1024 )) \
-        -O extent,filetype,has_journal,dir_index,^64bit,^metadata_csum,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^metadata_csum_seed,^orphan_file \
+        -O extent,filetype,has_journal,dir_index,^64bit,^metadata_csum,^flex_bg,^huge_file,^large_file,^dir_nlink,^extra_isize,^metadata_csum_seed,^orphan_file \
         "$PART_IMG"
     "$POPULATE_SCRIPT" "$PART_IMG" "$ROOTFS_DIR" "/"
 

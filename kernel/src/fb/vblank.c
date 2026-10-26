@@ -91,45 +91,48 @@ int64_t vblank_wait_next(void) {
   /* Sleep on a private queue entry with the scheduler deadline set to the
    * boundary, exactly like the poll() timeout path: no timer IRQ exists to
    * wake us, wakeup_ticks does it. Max sleep is one period (~16ms). */
-  uint64_t deadline_ms = deadline / 1000000ULL;
+  /* Scheduler deadlines are milliseconds. Round up so a wake cannot precede
+   * the boundary (and force repeated sleeps on an already expired deadline). */
+  uint64_t deadline_ms = deadline / 1000000ULL +
+                         (deadline % 1000000ULL != 0);
   wait_queue_entry_t entry;
   entry.thread = t;
   entry.wq = NULL;
   entry.next = NULL;
   entry.thread_next = NULL;
   entry.thread_prev = NULL;
-  bool queued = false;
   int64_t rc = 0;
   for (;;) {
+    /* Publish BLOCKED, the deadline and the queue entry without a local
+     * timer preempting halfway through. Otherwise the scheduler can remove
+     * this thread before it has any deadline or registered wake source. */
+    hal_irq_state_t irq_flags = hal_irq_save();
     if (thread_has_pending_signal(t)) {
       rc = -4; /* EINTR */
+      hal_irq_restore(irq_flags);
       break;
     }
-    if (lapic_timer_get_ns() >= deadline)
+    if (lapic_timer_get_ns() >= deadline) {
+      hal_irq_restore(irq_flags);
       break;
-    if (!queued) {
-      t->state = THREAD_BLOCKED;
-      wait_queue_add(&vblank_wq, &entry);
-      queued = true;
-    } else {
-      t->state = THREAD_BLOCKED;
     }
     t->wakeup_ticks = deadline_ms;
-    /* Re-test after publishing BLOCKED so a wake landing between the first
-     * test and the queue add cannot strand us past the deadline. */
-    if (lapic_timer_get_ns() >= deadline) {
-      t->state = THREAD_RUNNING;
-      t->wakeup_ticks = 0;
-      break;
+    t->state = THREAD_BLOCKED;
+    wait_queue_add(&vblank_wq, &entry);
+    /* A remote signal may have arrived before the entry was registered.
+     * Recheck it as well as the clock before allowing the thread to park. */
+    if (!thread_has_pending_signal(t) && lapic_timer_get_ns() < deadline) {
+      hal_irq_restore(irq_flags);
+      sched_yield();
+      irq_flags = hal_irq_save();
     }
-    sched_yield();
+    /* Finish cleanup before preemption can observe a blocked thread whose
+     * entry has been removed. Re-register on every sleep: wakers detach it. */
     t->state = THREAD_RUNNING;
     t->wakeup_ticks = 0;
-  }
-  if (queued)
     wait_queue_remove(&vblank_wq, &entry);
-  t->state = THREAD_RUNNING;
-  t->wakeup_ticks = 0;
+    hal_irq_restore(irq_flags);
+  }
   return rc;
 }
 

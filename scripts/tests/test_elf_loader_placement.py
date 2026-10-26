@@ -15,6 +15,7 @@ prefix = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "kernel/src/sched/elf.h"
 #define MAP_PRIVATE 2
 #define TSC_BEGIN(x) ((void)0)
@@ -23,13 +24,16 @@ typedef struct { FILE *stream; uint64_t length; } vfs_node_t;
 struct region { uint64_t start, end, prot; void *file; };
 struct vma_list { struct region regions[32]; int count; };
 struct mm { struct vma_list vmas; uint64_t brk_base, brk_current; };
-struct thread { struct mm *mm; };
+struct thread { struct mm *mm; vfs_node_t *cwd_node; };
 static struct mm mm;
-static struct thread thread = { &mm };
+static vfs_node_t root_node, cwd_node;
+static vfs_node_t *fs_root=&root_node;
+static struct thread thread = { .mm=&mm, .cwd_node=&cwd_node };
 static vfs_node_t node;
 static bool fail_alloc;
 static struct thread *sched_get_current(void) { return &thread; }
-static vfs_node_t *vfs_resolve_path(const char *path) {
+static vfs_node_t *vfs_resolve_path_at(vfs_node_t *base, const char *path) {
+  assert(base == (path[0] == '/' ? fs_root : thread.cwd_node ? thread.cwd_node : fs_root));
   node.stream = fopen(path, "rb");
   if (!node.stream) return NULL;
   fseek(node.stream, 0, SEEK_END); node.length=ftell(node.stream);
@@ -42,9 +46,6 @@ static void vfs_close(vfs_node_t *n) { assert(!fclose(n->stream)); }
 static void *kmalloc(size_t n) { return fail_alloc ? NULL : malloc(n); }
 static void kfree(void *p) { free(p); }
 static void klog_puts(const char *s) { (void)s; }
-static void vfs_cache_prefetch_async(vfs_node_t *n, uint32_t off, uint32_t len) {
-  (void)n; (void)off; (void)len;
-}
 static int vma_add(struct vma_list *v, uint64_t start, uint64_t end,
                    uint64_t prot, uint64_t flags, int fd, uint64_t offset,
                    void *file, uint64_t size) {
@@ -188,6 +189,13 @@ int main(int argc, char **argv) {
     assert(info.compat32 && info.load_base==0 && info.entry<ELF32_USER_LIMIT);
     assert(mm.vmas.count>=3);
   }
+  /* The ELF read must resolve against cwd, not the global root. */
+  fixture(argv[1], ET_DYN, false, false);
+  char *oldcwd=getcwd(NULL,0), *dir=strdup(argv[1]);assert(oldcwd&&dir);
+  char *leaf=strrchr(dir,'/');assert(leaf);*leaf++=0;assert(!chdir(dir));
+  check(leaf,0,false,ELF_INTERP_BASE,true);
+  thread.cwd_node=NULL;check(leaf,0,false,ELF_INTERP_BASE,true);
+  thread.cwd_node=&cwd_node;assert(!chdir(oldcwd));free(dir);free(oldcwd);
   puts("PASS: self-loader placement, late PT_INTERP, ET_EXEC, explicit bias, header read fallbacks, Wine image, ELF32 placement/rejection and smoke BSS");
 }
 '''

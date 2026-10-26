@@ -1,3 +1,4 @@
+#include "mm/zram.h"
 #include "../sched/capability.h"
 #include "../sched/net_namespace.h"
 #include "../sched/pid_namespace.h"
@@ -11,6 +12,7 @@
 #include "drivers/timer/rtc.h"
 #include "drivers/usb/usb.h"
 #include "cpu/tsc.h"
+#include "cpu/isr.h"
 #include "fs/ramfs.h"
 #include "fs/vfs.h"
 #include "fs/ext3/ext3.h"
@@ -113,6 +115,7 @@ uint32_t procfs_meminfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   uint64_t ksm_shared_kb = kst.pages_shared * 4;
   uint64_t ksm_sharing_kb = (kst.pages_sharing + kst.zero_pages_merged) * 4;
 
+  struct zram_stats zst; zram_get_stats(&zst);
   int len = snprintf(buf, sizeof(buf),
       "MemTotal:       %llu kB\n"
       "MemFree:        %llu kB\n"
@@ -128,8 +131,8 @@ uint32_t procfs_meminfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       "Inactive(file): %llu kB\n"
       "Unevictable:           0 kB\n"
       "Mlocked:               0 kB\n"
-      "SwapTotal:             0 kB\n"
-      "SwapFree:              0 kB\n"
+      "SwapTotal:      %llu kB\n"
+      "SwapFree:       %llu kB\n"
       "Dirty:                 0 kB\n"
       "Writeback:             0 kB\n"
       "AnonPages:      %llu kB\n"
@@ -155,6 +158,8 @@ uint32_t procfs_meminfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       (unsigned long long)inactive_anon_kb,
       (unsigned long long)active_file_kb,
       (unsigned long long)inactive_file_kb,
+      (unsigned long long)(zst.enabled ? zst.capacity_pages * 4 : 0),
+      (unsigned long long)(zst.enabled ? (zst.capacity_pages - zst.stored_pages) * 4 : 0),
       (unsigned long long)anon_kb,
       (unsigned long long)(file_cached_kb + shmem_kb),
       (unsigned long long)shmem_kb,
@@ -175,6 +180,31 @@ uint32_t procfs_meminfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     size = (uint32_t)len - offset;
   memcpy(buffer, buf + offset, size);
   return size;
+}
+
+static uint32_t procfs_zram_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
+  struct zram_stats z; zram_get_stats(&z);
+  char buf[768]; int len;
+  if (!strcmp(node->name, "swaps")) {
+    len = snprintf(buf, sizeof(buf), "Filename\t\t\tType\t\tSize\t\tUsed\t\tPriority\n");
+    if (z.enabled) len += snprintf(buf + len, sizeof(buf) - len,
+      "/dev/zram0\t\tpartition\t%llu\t\t%llu\t\t100\n",
+      (unsigned long long)(z.capacity_pages * 4), (unsigned long long)(z.stored_pages * 4));
+  } else {
+    len = snprintf(buf, sizeof(buf),
+      "enabled %u\ncapacity_pages %llu\nstored_pages %llu\ncompressed_bytes %llu\n"
+      "memory_bytes %llu\nmemory_limit %llu\npeak_bytes %llu\nsame_pages %llu\n"
+      "rejected_pages %llu\nallocation_failures %llu\nswapouts %llu\nswapins %llu\nscans %llu\npressure_yields %llu\n",
+      z.enabled, (unsigned long long)z.capacity_pages, (unsigned long long)z.stored_pages,
+      (unsigned long long)z.compressed_bytes, (unsigned long long)z.memory_bytes,
+      (unsigned long long)z.memory_limit, (unsigned long long)z.peak_bytes,
+      (unsigned long long)z.same_pages, (unsigned long long)z.rejected_pages,
+      (unsigned long long)z.allocation_failures, (unsigned long long)z.swapouts,
+      (unsigned long long)z.swapins, (unsigned long long)z.scans, (unsigned long long)z.pressure_yields);
+  }
+  if (offset >= (uint32_t)len) return 0;
+  if (size > (uint32_t)len - offset) size = len - offset;
+  memcpy(buffer, buf + offset, size); return size;
 }
 
 /* /proc/zoneinfo — memory zone watermarks and free-page counts. */
@@ -928,6 +958,85 @@ uint32_t procfs_uptime_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   return size;
 }
 
+static uint32_t procfs_interrupts_read(vfs_node_t *node, uint32_t offset,
+                                       uint32_t size, uint8_t *buffer) {
+  uint32_t cpu_count = cpu_get_count();
+  if (cpu_count == 0)
+    cpu_count = 1;
+  if (cpu_count > MAX_CPUS)
+    cpu_count = MAX_CPUS;
+
+  /* Include the legacy IRQ lines even before they have fired. Other vectors
+   * are shown once they have received an interrupt. */
+  bool show_vector[256] = {0};
+  uint32_t row_count = 16;
+  for (uint32_t vector = 32; vector < 48; vector++)
+    show_vector[vector] = true;
+  for (uint32_t vector = 48; vector < 256; vector++) {
+    bool active = false;
+    for (uint32_t cpu = 0; cpu < cpu_count; cpu++) {
+      if (isr_get_vector_count(cpu, vector) != 0) {
+        active = true;
+        break;
+      }
+    }
+    if (active) {
+      show_vector[vector] = true;
+      row_count++;
+    }
+  }
+
+  /* A uint64_t field takes at most 20 digits plus a separator. Allocate from
+   * the number of CPU columns and rows so even a 64-CPU system fits. */
+  size_t capacity = 64 + (size_t)cpu_count * 21 +
+                    (size_t)row_count * ((size_t)cpu_count * 21 + 64);
+  char *text = kmalloc(capacity);
+  if (!text)
+    return 0;
+
+  int pos = snprintf(text, capacity, "    ");
+  for (uint32_t cpu = 0; cpu < cpu_count; cpu++) {
+    char label[16];
+    snprintf(label, sizeof(label), "CPU%u", cpu);
+    pos += snprintf(text + pos, capacity - (size_t)pos, "%21s", label);
+  }
+  pos += snprintf(text + pos, capacity - (size_t)pos, "\n");
+
+  for (uint32_t vector = 32; vector < 256; vector++) {
+    if (!show_vector[vector])
+      continue;
+
+    if (vector < 48) {
+      pos += snprintf(text + pos, capacity - (size_t)pos, "%3u:",
+                      vector - 32);
+    } else {
+      pos += snprintf(text + pos, capacity - (size_t)pos, "%3u:", vector);
+    }
+    for (uint32_t cpu = 0; cpu < cpu_count; cpu++) {
+      pos += snprintf(text + pos, capacity - (size_t)pos, " %20llu",
+                      (unsigned long long)isr_get_vector_count(cpu, vector));
+    }
+    if (vector < 48) {
+      pos += snprintf(text + pos, capacity - (size_t)pos, "  IRQ %u\n",
+                      vector - 32);
+    } else {
+      pos += snprintf(text + pos, capacity - (size_t)pos, "  vector %u\n",
+                      vector);
+    }
+  }
+
+  node->length = (uint32_t)pos;
+  if (offset >= (uint32_t)pos) {
+    kfree(text);
+    return 0;
+  }
+  if (size > (uint32_t)pos - offset)
+    size = (uint32_t)pos - offset;
+  memcpy(buffer, text + offset, size);
+  kfree(text);
+  return size;
+}
+
 uint32_t procfs_stat_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                           uint8_t *buffer) {
   char *buf = kmalloc(2048);
@@ -1089,6 +1198,7 @@ uint32_t procfs_filesystems_read(vfs_node_t *node, uint32_t offset,
       "nodev\tproc\n"
       "nodev\tdevfs\n"
       "nodev\tramfs\n"
+      "nodev\tfuse\n"
       "nodev\tcgroup\n"
       "nodev\tcgroup2\n"
       "\text2\n"
@@ -3341,6 +3451,18 @@ void procfs_init(void) {
       ramfs_mount_node(procfs_root, cpuinfo_node);
     }
 
+    // Add /proc/interrupts: per-CPU interrupt-vector delivery counts.
+    vfs_node_t *interrupts_node = kmalloc(sizeof(vfs_node_t));
+    if (interrupts_node) {
+      procfs_node_init(interrupts_node);
+      strncpy(interrupts_node->name, "interrupts", 127);
+      interrupts_node->flags = FS_FILE | FS_PERSISTENT;
+      interrupts_node->mask = 0444;
+      interrupts_node->read = procfs_interrupts_read;
+      interrupts_node->length = 1024; // Recomputed on read
+      ramfs_mount_node(procfs_root, interrupts_node);
+    }
+
     // Add /proc/partitions
     vfs_node_t *part_node = kmalloc(sizeof(vfs_node_t));
     if (part_node) {
@@ -3444,6 +3566,16 @@ void procfs_init(void) {
       loadavg_node->mask = 0444;
       loadavg_node->read = procfs_loadavg_read;
       ramfs_mount_node(procfs_root, loadavg_node);
+    }
+
+    const char *zram_names[] = {"zram", "swaps"};
+    for (unsigned i = 0; i < 2; i++) {
+      vfs_node_t *zn = kmalloc(sizeof(*zn));
+      if (zn) {
+        procfs_node_init(zn); strcpy(zn->name, zram_names[i]);
+        zn->flags = FS_FILE | FS_PERSISTENT; zn->mask = 0444;
+        zn->read = procfs_zram_read; ramfs_mount_node(procfs_root, zn);
+      }
     }
 
     // Add /proc/heapinfo
@@ -4121,7 +4253,6 @@ static uint32_t procfs_sys_ksm_run_write(vfs_node_t *node, uint32_t offset,
     char c = (char)buffer[0];
     if (c == '1') {
         ksm_set_running(true);
-        ksm_scan_pass();
     } else if (c == '0') {
         ksm_set_running(false);
     }

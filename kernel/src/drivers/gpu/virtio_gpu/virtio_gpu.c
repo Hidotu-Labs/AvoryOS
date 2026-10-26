@@ -23,9 +23,9 @@
 #define GPU_CURSORQ    1
 #define GPU_TIMEOUT_MS 1000
 #define REQ_OFF        0
-#define REQ_CAP        1024
-#define RESP_OFF       2048
-#define RESP_CAP       (PAGE_SIZE - RESP_OFF)
+#define REQ_CAP        (1024U * 1024U + 32U)
+#define RESP_OFF       ((REQ_CAP + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
+#define RESP_CAP       (64U * 1024U)
 static struct virtio_gpu_device gpu;
 static uint32_t fbcon_scanout_id = 0;
 static spinlock_t gpu_poll_lock;
@@ -42,6 +42,31 @@ static uint32_t gpu_scanout_busy;
 static uint64_t gpu_prime_enter_seq;
 static uint32_t gpu_prime_waiters;
 static struct vgpu_scanout_head scanout_heads[VIRTIO_GPU_MAX_SCANOUTS];
+/* Host textures remain pinned until a successful replacement. A failed
+ * SET_SCANOUT can still complete later, so retain uncertain selections too. */
+struct virgl_scanout_ref { struct drm_gem_object *object; struct virgl_scanout_ref *next; };
+static struct virgl_scanout_ref *virgl_scanout_refs[VIRTIO_GPU_MAX_SCANOUTS];
+static bool virgl_scanout_pin(uint32_t head, struct drm_gem_object *object) {
+    for (struct virgl_scanout_ref *p = virgl_scanout_refs[head]; p; p = p->next)
+        if (p->object == object) return true;
+    struct virgl_scanout_ref *p = kmalloc(sizeof(*p));
+    if (!p) return false;
+    ascentdrm_gem_get(object);
+    *p = (struct virgl_scanout_ref){object, virgl_scanout_refs[head]};
+    virgl_scanout_refs[head] = p;
+    return true;
+}
+static void virgl_scanout_replaced(uint32_t head, uint32_t id) {
+    struct virgl_scanout_ref **link = &virgl_scanout_refs[head];
+    while (*link) {
+        struct virgl_scanout_ref *p = *link;
+        if (virtio_gpu_virgl_resource_id(p->object) == id) { link = &p->next; continue; }
+        *link = p->next;
+        if (ascentdrm_gem_put_last(p->object))
+            ascentdrm_gem_object_free(p->object->dev, p->object);
+        kfree(p);
+    }
+}
 static const struct vgpu_scanout_ops scanout_ops;
 static void gpu_scanout_acquire(void) {
     while (__atomic_exchange_n(&gpu_scanout_busy, 1, __ATOMIC_ACQUIRE))
@@ -84,6 +109,60 @@ static uint64_t gpu_phase8_started_ms;
 /* Protected by gpu_poll_lock. A timeout does not return DMA ownership: the
  * host may still read the request or write the response. Keep the shared
  * command pages unavailable until every submitted descriptor is returned. */
+/* Render batches own independent DMA and resource references until their
+ * fenced response is returned. Resource destruction runs outside the IRQ
+ * lock, because it can itself submit a control command. */
+#define GPU_RENDER_JOBS 16U
+_Static_assert(GPU_RENDER_JOBS <= 32, "render slot mask width");
+struct gpu_render_job {
+    dma_buffer_t *dma;
+    struct drm_gem_object **objects;
+    uint32_t count, response_offset, context, state; /* 0 free, 1 submitted, 2 done, 3 reserved, 4 quarantined */
+    uint64_t fence;
+    void (*notify)(void *, int);
+    void *notify_data;
+};
+static struct gpu_render_job gpu_render_jobs[GPU_RENDER_JOBS];
+static uint32_t gpu_render_capacity;
+static uint32_t gpu_render_pending;
+static bool gpu_render_failed;
+static void gpu_render_reclaim(void);
+static void gpu_render_prepare(void) {
+    /* Reserve the maximum packet size before desktop textures fragment the
+     * physical allocator. No render submission allocates contiguous DMA. */
+    uint32_t bytes = ((REQ_CAP + 7U) & ~7U) + sizeof(struct virtio_gpu_ctrl_hdr);
+    for (uint32_t i = 0; i < GPU_RENDER_JOBS; i++) {
+        gpu_render_jobs[i].dma = dma_alloc(bytes, DMA_FLAG_32BIT);
+        if (!gpu_render_jobs[i].dma) break;
+        gpu_render_capacity++;
+    }
+}
+static bool handle_render_completion(void *cookie, uint32_t used) {
+    for (uint32_t i = 0; i < GPU_RENDER_JOBS; i++) {
+        struct gpu_render_job *job = &gpu_render_jobs[i];
+        if (cookie != job || job->state != 1)
+            continue;
+        struct virtio_gpu_ctrl_hdr *reply =
+            (void *)((uint8_t *)job->dma->virt + job->response_offset);
+        bool valid = used == sizeof(*reply) && (reply->flags & VIRTIO_GPU_FLAG_FENCE) &&
+            reply->fence_id == job->fence && reply->type == VIRTIO_GPU_RESP_OK_NODATA;
+        if (!valid) {
+            gpu_render_failed = true;
+            gpu.stats.host_errors++;
+        }
+        /* A returned descriptor without a valid GPU fence does not prove
+         * rendering finished. Quarantine its BO references on device error. */
+        job->state = valid ? 2 : 4;
+        if (valid)
+            for (uint32_t n = 0; n < job->count; n++)
+                job->objects[n]->virgl_pending_jobs &= ~(1U << i);
+        gpu_render_pending--;
+        gpu.stats.commands_completed++;
+        gpu.stats.async_completed++;
+        return true;
+    }
+    return false;
+}
 static uint64_t gpu_sync_command_pending;
 #define GPU_BATCH_COMMANDS 3U
 #define GPU_BATCH_SLOT_SIZE 256U
@@ -137,7 +216,8 @@ static void gpu_reap_control_locked(void) {
     void *cookie;
     uint32_t used;
     while (virtq_poll_complete(&gpu.controlq, &cookie, &used))
-        if (!handle_batch_completion(cookie, used) && !handle_sync_completion(cookie, used))
+        if (!handle_render_completion(cookie, used) &&
+            !handle_batch_completion(cookie, used) && !handle_sync_completion(cookie, used))
             gpu.stats.invalid_responses++;
 }
 static bool gpu_control_ready(void) {
@@ -169,7 +249,7 @@ static void gpu_wait_for_control(uint64_t start) {
     self->state = THREAD_BLOCKED;
     wait_queue_add(&gpu_command_wait, &entry);
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
-    bool ready = (!gpu_sync_command_pending && !gpu_batch_pending) ||
+    bool ready = (!gpu_sync_command_pending && !gpu_batch_pending && !gpu_render_pending) ||
         gpu.controlq.last_used_idx != gpu.controlq.used->idx ||
         lapic_timer_get_ms() - start >= GPU_TIMEOUT_MS;
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
@@ -198,8 +278,8 @@ static bool gpu_command_locked(
         return false;
     gpu.command_busy = true;
     uint8_t *base = (uint8_t *)gpu.command_dma->virt;
-    memset(base + REQ_OFF, 0, REQ_CAP);
-    memset(base + RESP_OFF, 0, RESP_CAP);
+    memset(base + REQ_OFF, 0, req_len);
+    memset(base + RESP_OFF, 0, resp_len);
     memcpy(base + REQ_OFF, req, req_len);
     uint64_t seq = __atomic_add_fetch(&gpu.next_fence_id, 1, __ATOMIC_RELAXED);
     struct virtio_gpu_ctrl_hdr *wire = (struct virtio_gpu_ctrl_hdr *)(base + REQ_OFF);
@@ -609,7 +689,7 @@ bool virtio_gpu_init(void) {
         return false;
     }
     gpu.config = (volatile struct virtio_gpu_config *)gpu.transport.device_cfg;
-    uint64_t wanted = VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID;
+    uint64_t wanted = VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_VIRGL;
     if (!virtio_pci_negotiate(
             &gpu.transport, wanted, VIRTIO_F_VERSION_1, &gpu.negotiated_features)) {
         klog_puts("[VIRTIO-GPU] Feature negotiation failed\n");
@@ -621,13 +701,15 @@ bool virtio_gpu_init(void) {
         virtio_pci_set_failed(&gpu.transport);
         return false;
     }
-    gpu.command_dma = dma_alloc(PAGE_SIZE, DMA_FLAG_32BIT);
+    gpu.command_dma = dma_alloc(RESP_OFF + RESP_CAP, DMA_FLAG_32BIT);
     gpu.present_dma = dma_alloc(PAGE_SIZE, DMA_FLAG_32BIT);
     if (!gpu.command_dma || !gpu.present_dma) {
         klog_puts("[VIRTIO-GPU] Command DMA allocation failed\n");
         virtio_pci_set_failed(&gpu.transport);
         return false;
     }
+    if (gpu.negotiated_features & VIRTIO_GPU_F_VIRGL)
+        gpu_render_prepare();
     virtio_gpu_setup_irq();
     read_config();
     if (!virtio_pci_set_driver_ok(&gpu.transport)) {
@@ -636,6 +718,7 @@ bool virtio_gpu_init(void) {
         return false;
     }
     gpu.initialized = true;
+    virtio_gpu_virgl_init(gpu.negotiated_features, gpu.num_capsets);
     extern const char *kernel_boot_cmdline;
     const char *batch_option = kernel_boot_cmdline ?
         strstr(kernel_boot_cmdline, "virtio_gpu.present_batch=1") : NULL;
@@ -818,7 +901,9 @@ static bool set_scanout(uint32_t scanout, uint32_t id, uint32_t w, uint32_t h) {
     r.r.height = h;
     r.scanout_id = scanout;
     r.resource_id = id;
-    return nodata(&r, sizeof(r));
+    bool ok = nodata(&r, sizeof(r));
+    if (ok) virgl_scanout_replaced(scanout, id);
+    return ok;
 }
 static uint32_t scanout_resource_id(void) {
     return __atomic_add_fetch(&gpu.next_resource_id, 1, __ATOMIC_RELAXED);
@@ -838,6 +923,7 @@ static bool scanout_destroy(uint32_t id, bool counted) {
     return true;
 }
 static void scanout_record_selection(uint32_t head, uint32_t id) {
+    virgl_scanout_replaced(head, id);
     gpu.head_resource[head] = id;
     gpu.queued_head_resource[head] = id;
     if (head == 0) {
@@ -1272,6 +1358,7 @@ static void virtio_gpu_worker(void) {
         if (pending & GPU_WORK_PERF)
             gpu_perf_dump();
         gpu_drain_completions();
+        gpu_render_reclaim();
         gpu_collect_scanouts();
         gpu_drain_cursor_completions();
         /* A timer must not switch us out after BLOCKED is published but
@@ -1329,6 +1416,12 @@ static void virtio_gpu_cursor_update(uint32_t crtc_id,
                                      uint32_t flags) {
     if (!cursor_resource_id)
         return;
+    /* A compositor may render a cursor into a host texture too. Read it
+     * back before acquiring the IRQ-saving shape lock. */
+    if (gem && virtio_gpu_virgl_readback(gem)) {
+        gpu.stats.cursor_failures++;
+        return;
+    }
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_SHAPE, &gpu_cursor_shape_lock);
     cursor_active_head = ascentdrm_crtc_scanout_id(crtc_id);
     if (cursor_active_head >= VIRTIO_GPU_MAX_SCANOUTS)
@@ -1490,7 +1583,9 @@ static bool disable_scanout(uint32_t head) {
     init_hdr(&r.hdr, VIRTIO_GPU_CMD_SET_SCANOUT);
     r.scanout_id = head;
     r.resource_id = 0;
-    return nodata(&r, sizeof(r));
+    bool ok = nodata(&r, sizeof(r));
+    if (ok) virgl_scanout_replaced(head, 0);
+    return ok;
 }
 static void virtio_gpu_restore_console_scanout_locked(void) {
     /* -vga none: no VGA fallback, so disabling leaves "Display output is
@@ -1763,6 +1858,62 @@ static void virtio_gpu_complete_flip(uint32_t head) {
     ev.crtc_id = crtc_id;
     ascentdrm_file_send_event(file, &ev, node);
 }
+/* Virgl scanout is a host GL texture, not its guest transfer backing. Passing
+ * that texture straight to QEMU preserves format/origin metadata and avoids
+ * downloading and re-uploading every desktop frame. */
+static bool virtio_gpu_present_virgl(uint32_t head, struct drm_framebuffer *fb,
+                                     const struct virtio_gpu_rect *view) {
+    static bool announced;
+    static struct virtio_gpu_rect selected_view[VIRTIO_GPU_MAX_SCANOUTS];
+    uint32_t id = virtio_gpu_virgl_resource_id(fb->gem_obj);
+    if (!id || fb->backing_offset || !virgl_scanout_pin(head, fb->gem_obj))
+        return false;
+    /* The frontend blits from a different GL context. Finish this texture's
+     * producer before exposing it, even though other render batches can queue. */
+    if (virtio_gpu_render_wait(&fb->gem_obj, 1, 0))
+        return false;
+    struct vgpu_scanout_head *state = &scanout_heads[head];
+    bool ok;
+    if (state->selection_unknown || state->selected_id != id ||
+        memcmp(&selected_view[head], view, sizeof(*view))) {
+        struct virtio_gpu_set_scanout req = {0};
+        init_hdr(&req.hdr, VIRTIO_GPU_CMD_SET_SCANOUT);
+        req.r = *view;
+        req.scanout_id = head;
+        req.resource_id = id;
+        struct virtio_gpu_resource_flush flush = {0};
+        init_hdr(&flush.hdr, VIRTIO_GPU_CMD_RESOURCE_FLUSH);
+        flush.r = *view;
+        flush.resource_id = id;
+        const void *requests[] = {&req, &flush};
+        uint32_t lengths[] = {sizeof(req), sizeof(flush)};
+        /* Both commands are ordered on controlq. Publish them with one kick
+         * and wait for both fenced replies, rather than parking the caller
+         * between selecting the texture and flushing it to the frontend. */
+        if (!gpu_command_batch(requests, lengths, 2)) {
+            state->selection_unknown = true;
+            return false;
+        }
+        state->selected_id = id;
+        state->selection_unknown = false;
+        selected_view[head] = *view;
+        scanout_record_selection(head, id);
+        ok = true;
+        gpu.stats.present_batches++;
+    } else {
+        ok = flush_rect(id, view->x, view->y, view->width, view->height);
+    }
+    if (ok && !announced) {
+        announced = true;
+        klog_puts("[VIRTIO-GPU] Direct virgl host-texture scanout active\n");
+    }
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    if (ok) gpu.stats.frames_presented++;
+    else gpu.stats.present_failures++;
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    return ok;
+}
+
 static void virtio_gpu_commit_damage(struct drm_device *dev,
                                      const struct drm_clip_rect *clips,
                                      uint32_t n, uint32_t target) {
@@ -1783,6 +1934,10 @@ static void virtio_gpu_commit_damage(struct drm_device *dev,
     if (coalesce && (__atomic_load_n(&gpu_prime_waiters, __ATOMIC_ACQUIRE) ||
         __atomic_load_n(&gpu_prime_enter_seq, __ATOMIC_ACQUIRE) != entered))
         goto release_gem;
+    if (virtio_gpu_virgl_resource_id(fb->gem_obj)) {
+        snapshot_committed = virtio_gpu_present_virgl(head, fb, &view);
+        goto release_gem;
+    }
     struct vgpu_scanout_source source = {
         .pixels = fb->gem_obj->virt_addr, .size = fb->gem_obj->size,
         .offset = fb->backing_offset, .width = fb->width, .height = fb->height,
@@ -1931,7 +2086,10 @@ static void virtio_gpu_flip_worker(void) {
         if (__atomic_load_n(&gpu_async_flip_state, __ATOMIC_ACQUIRE) != 1)
             continue;
         __atomic_store_n(&gpu_async_flip_state, 2, __ATOMIC_RELEASE);
-        struct drm_framebuffer *framebuffer = &gpu_async_flip.framebuffer;
+        /* The next job may be submitted as soon as its predecessor's event
+         * becomes readable on another CPU. Keep all completion ownership local. */
+        __typeof__(gpu_async_flip) flip = gpu_async_flip;
+        struct drm_framebuffer *framebuffer = &flip.framebuffer;
         struct drm_gem_object *object = framebuffer->gem_obj;
         struct vgpu_scanout_source source = {
             .pixels = object->virt_addr, .size = object->size,
@@ -1941,35 +2099,44 @@ static void virtio_gpu_flip_worker(void) {
         };
         ascentdrm_console_takeover();
         gpu_scanout_acquire();
-        struct vgpu_scanout_image *image = vgpu_scanout_prepare(
-            &scanout_heads[gpu_async_flip.head], &scanout_ops, gpu_async_flip.head,
-            framebuffer->width, framebuffer->height);
         bool published = false;
-        if (image && !ascentdrm_gem_begin_cpu(object)) {
-            bool copied = vgpu_scanout_copy(image, &source);
-            ascentdrm_gem_end_cpu(object);
-            if (copied)
-                published = vgpu_scanout_publish(&scanout_heads[gpu_async_flip.head],
-                    &scanout_ops, gpu_async_flip.head, image);
+        if (virtio_gpu_virgl_resource_id(object)) {
+            struct virtio_gpu_rect view = {0, 0, framebuffer->width, framebuffer->height};
+            published = virtio_gpu_present_virgl(flip.head, framebuffer, &view);
+        } else {
+            struct vgpu_scanout_image *image = vgpu_scanout_prepare(
+                &scanout_heads[flip.head], &scanout_ops, flip.head,
+                framebuffer->width, framebuffer->height);
+            if (image && !ascentdrm_gem_begin_cpu(object)) {
+                bool copied = vgpu_scanout_copy(image, &source);
+                ascentdrm_gem_end_cpu(object);
+                if (copied)
+                    published = vgpu_scanout_publish(&scanout_heads[flip.head],
+                        &scanout_ops, flip.head, image);
+            }
         }
         gpu_scanout_release();
-        if (published && gpu_async_flip.event) {
+        struct drm_event_vblank event = {0};
+        if (published && flip.event) {
             vblank_wait_next();
-            struct drm_event_vblank event = {0};
             event.base.type = DRM_EVENT_FLIP_COMPLETE;
             event.base.length = sizeof(event);
-            event.user_data = gpu_async_flip.cookie;
+            event.user_data = flip.cookie;
             event.sequence = vblank_sequence();
             vblank_timestamp(event.sequence, &event.tv_sec, &event.tv_usec);
-            event.crtc_id = gpu_async_flip.crtc;
-            ascentdrm_file_send_event(gpu_async_flip.file, &event, gpu_async_flip.node);
+            event.crtc_id = flip.crtc;
         }
         if (!published)
             klog_puts("[FAIL] VirtIO asynchronous flip publication failed\n");
         if (ascentdrm_gem_put_last(object))
-            ascentdrm_gem_object_free(gpu_async_flip.file->dev, object);
-        vfs_close(gpu_async_flip.node);
+            ascentdrm_gem_object_free(flip.file->dev, object);
+        /* Publish queue availability before waking the event reader. After
+         * this store only the local snapshot may be touched: submission can
+         * already be replacing the global slot on a different CPU. */
         __atomic_store_n(&gpu_async_flip_state, 0, __ATOMIC_RELEASE);
+        if (published && flip.event)
+            ascentdrm_file_send_event(flip.file, &event, flip.node);
+        vfs_close(flip.node);
     }
 }
 
@@ -2112,8 +2279,225 @@ void virtio_gpu_get_stats(struct virtio_gpu_stats *out) {
     if (out) {
         *out = gpu.stats;
         out->interrupt_mode = (uint64_t)gpu_irq_mode;
-        out->frames_in_flight = gpu.command_busy ? 1 : 0;
+        out->frames_in_flight = gpu_render_pending + (gpu.command_busy ? 1U : 0U);
         out->cursor_runtime_ms =
             cursor_phase7_started_ms ? lapic_timer_get_ms() - cursor_phase7_started_ms : 0;
     }
+}
+
+/* Metadata and explicitly waited operations share fenced control DMA with
+ * KMS. Render submissions below retain independent DMA until completion. */
+bool virtio_gpu_control(const void *request, uint32_t request_size,
+                        void *response, uint32_t response_size, uint32_t *type) {
+    return gpu_command(request, request_size, response, response_size, type);
+}
+uint32_t virtio_gpu_resource_id(void) {
+    return __atomic_add_fetch(&gpu.next_resource_id, 1, __ATOMIC_RELAXED);
+}
+
+static int gpu_render_wait_fence(uint64_t target, bool nowait) {
+    uint64_t start = lapic_timer_get_ms();
+    for (;;) {
+        LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+        gpu_reap_control_locked();
+        bool ready = !gpu_sync_command_pending || gpu_sync_command_pending > target;
+        for (uint32_t i = 0; i < GPU_BATCH_COMMANDS; i++)
+            if ((gpu_batch_pending & (1U << i)) && gpu_batch_fences[i] <= target)
+                ready = false;
+        for (uint32_t i = 0; i < GPU_RENDER_JOBS; i++)
+            if (gpu_render_jobs[i].state == 1 && gpu_render_jobs[i].fence <= target)
+                ready = false;
+        bool failed = gpu_render_failed;
+        LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+        if (ready) return failed ? -5 : 0;
+        if (nowait) return -16;
+        if (lapic_timer_get_ms() - start >= GPU_TIMEOUT_MS) return -5;
+        gpu_wait_for_control(start);
+    }
+}
+
+int virtio_gpu_wait_idle(bool nowait) {
+    /* Snapshot the submitted prefix; later clients cannot extend the wait. */
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    uint64_t target = __atomic_load_n(&gpu.next_fence_id, __ATOMIC_RELAXED);
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    return gpu_render_wait_fence(target, nowait);
+}
+
+static int gpu_render_wait_objects(struct drm_gem_object **objects, uint32_t count,
+                                  uint32_t context, bool nowait) {
+    uint64_t target = 0;
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    gpu_reap_control_locked();
+    /* Every active slot owns BO references and one bit in each referenced BO.
+     * Unioning these masks finds exact dependencies without allocation or
+     * scanning the BO arrays of unrelated submissions. Bits are cleared only
+     * after a validated completion, before the slot can be reused. */
+    uint32_t candidates = 0;
+    for (uint32_t i = 0; i < GPU_RENDER_JOBS; i++)
+        if (gpu_render_jobs[i].state == 1 &&
+            (!context || gpu_render_jobs[i].context != context))
+            candidates |= 1U << i;
+    uint32_t pending = 0;
+    /* No foreign producer means there are no BO dependencies to inspect.
+     * Once all candidate slots are covered, later BOs cannot add a wait. */
+    for (uint32_t n = 0; n < count && (pending & candidates) != candidates; n++)
+        pending |= objects[n]->virgl_pending_jobs;
+    for (uint32_t i = 0; i < GPU_RENDER_JOBS; i++) {
+        struct gpu_render_job *job = &gpu_render_jobs[i];
+        if (!(pending & candidates & (1U << i)))
+            continue;
+        if (job->fence > target) target = job->fence;
+    }
+    bool failed = gpu_render_failed;
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    if (failed) return -5;
+    return target ? gpu_render_wait_fence(target, nowait) : 0;
+}
+
+int virtio_gpu_render_wait(struct drm_gem_object **objects, uint32_t count,
+                          uint32_t context) {
+    return gpu_render_wait_objects(objects, count, context, false);
+}
+
+int virtio_gpu_render_wait_bo(struct drm_gem_object *object, bool nowait) {
+    return gpu_render_wait_objects(&object, 1, 0, nowait);
+}
+
+static void gpu_render_reclaim(void) {
+    struct {
+        struct drm_gem_object **objects;
+        uint32_t count;
+        void (*notify)(void *, int);
+        void *data;
+        int error;
+    } completed[GPU_RENDER_JOBS];
+    uint32_t count = 0;
+    /* Claim all completed work in one critical section. Empty scans occur on
+     * every submission and worker pass; they need only one lock acquisition.
+     * Detach cleanup metadata before publishing a free slot, so callbacks or
+     * another CPU may reuse its DMA without changing this cleanup's snapshot. */
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    for (uint32_t i = 0; i < GPU_RENDER_JOBS; i++) {
+        struct gpu_render_job *job = &gpu_render_jobs[i];
+        if (job->state != 2 && !(job->state == 4 && job->notify))
+            continue;
+        bool valid = job->state == 2;
+        completed[count].objects = valid ? job->objects : NULL;
+        completed[count].count = valid ? job->count : 0;
+        completed[count].notify = job->notify;
+        completed[count].data = job->notify_data;
+        completed[count].error = valid ? 0 : -5;
+        count++;
+        job->notify = NULL;
+        job->notify_data = NULL;
+        /* Invalid fences retain their DMA, references and slot in quarantine;
+         * only the error callback is consumed, exactly once. */
+        if (valid) {
+            job->objects = NULL;
+            job->count = 0;
+            job->state = 0;
+        }
+    }
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    for (uint32_t i = 0; i < count; i++) {
+        struct drm_gem_object **objects = completed[i].objects;
+        if (completed[i].notify)
+            completed[i].notify(completed[i].data, completed[i].error);
+        for (uint32_t n = 0; n < completed[i].count; n++)
+            if (ascentdrm_gem_put_last(objects[n]))
+                ascentdrm_gem_object_free(objects[n]->dev, objects[n]);
+        kfree(objects);
+    }
+}
+
+/* On success consumes the caller's reference array, including the references
+ * in it. Failure leaves both owned by the caller. No shared command DMA is
+ * reused while the host can still access it, even if a later wait times out. */
+bool virtio_gpu_render_submit_parts(const void *request, uint32_t request_size,
+                                   const void *payload, uint32_t payload_size,
+                                   struct drm_gem_object **objects, uint32_t count,
+                                   void (*notify)(void *, int), void *notify_data) {
+    if (!gpu_render_capacity || !request ||
+        request_size < sizeof(struct virtio_gpu_ctrl_hdr) || request_size > REQ_CAP ||
+        payload_size > REQ_CAP - request_size || (payload_size && !payload))
+        return false;
+    uint32_t size = request_size + payload_size;
+    uint64_t start = lapic_timer_get_ms();
+    struct gpu_render_job *job = NULL;
+    while (!job) {
+        gpu_drain_completions();
+        gpu_render_reclaim();
+        LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+        for (uint32_t i = 0; i < gpu_render_capacity; i++)
+            if (!gpu_render_jobs[i].state) {
+                job = &gpu_render_jobs[i];
+                job->state = 3;
+                break;
+            }
+        LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+        if (!job) {
+            if (lapic_timer_get_ms() - start >= GPU_TIMEOUT_MS) return false;
+            gpu_wait_for_control(start);
+        }
+    }
+    uint32_t offset = (size + 7U) & ~7U;
+    uint32_t bytes = offset + sizeof(struct virtio_gpu_ctrl_hdr);
+    if (!job->dma || job->dma->size < bytes) goto fail;
+    memcpy(job->dma->virt, request, request_size);
+    if (payload_size)
+        memcpy((uint8_t *)job->dma->virt + request_size, payload, payload_size);
+    memset((uint8_t *)job->dma->virt + offset, 0, sizeof(struct virtio_gpu_ctrl_hdr));
+    struct virtio_gpu_ctrl_hdr *wire = job->dma->virt;
+    wire->flags |= VIRTIO_GPU_FLAG_FENCE;
+    struct virtq_iov out = {job->dma->phys, size};
+    struct virtq_iov in = {job->dma->phys + offset, sizeof(*wire)};
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    /* Fence numbering must follow descriptor submission order, including
+     * synchronous KMS commands sharing this queue. */
+    wire->fence_id = __atomic_add_fetch(&gpu.next_fence_id, 1, __ATOMIC_RELAXED);
+    if (gpu_render_failed || virtq_submit(&gpu.controlq, &out, 1, &in, 1, job) < 0) {
+        LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+        goto fail;
+    }
+    job->objects = objects;
+    job->count = count;
+    job->context = wire->ctx_id;
+    job->fence = wire->fence_id;
+    job->notify = notify;
+    job->notify_data = notify_data;
+    job->response_offset = offset;
+    job->state = 1;
+    uint32_t slot_bit = 1U << (uint32_t)(job - gpu_render_jobs);
+    for (uint32_t n = 0; n < count; n++)
+        objects[n]->virgl_pending_jobs |= slot_bit;
+    gpu_render_pending++;
+    gpu.stats.commands_submitted++;
+    gpu.stats.async_submitted++;
+    uint64_t in_flight = gpu_render_pending + (gpu.command_busy ? 1U : 0U);
+    if (in_flight > gpu.stats.max_frames_in_flight)
+        gpu.stats.max_frames_in_flight = in_flight;
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    return true;
+fail:
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    job->state = 0;
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    return false;
+}
+
+bool virtio_gpu_render_queued(void) {
+    return gpu_render_capacity != 0;
+}
+
+bool virtio_gpu_render_submit_notify(const void *request, uint32_t size,
+                                    struct drm_gem_object **objects, uint32_t count,
+                                    void (*notify)(void *, int), void *notify_data) {
+    return virtio_gpu_render_submit_parts(request, size, NULL, 0, objects, count,
+                                          notify, notify_data);
+}
+
+bool virtio_gpu_render_submit(const void *request, uint32_t size,
+                             struct drm_gem_object **objects, uint32_t count) {
+    return virtio_gpu_render_submit_notify(request, size, objects, count, NULL, NULL);
 }

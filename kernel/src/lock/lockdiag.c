@@ -41,6 +41,7 @@
 #include "../lib/string.h"
 #include "../cpu/isr.h"
 #include "../drivers/serial.h"
+#include "../drivers/gpu/virtio_gpu/virtio_gpu.h"
 #include "../hal/hal.h"
 #include "../lib/tsc.h"
 #include "../mm/pmm.h"
@@ -964,7 +965,13 @@ static void dump_spots(uint64_t now_tsc, uint64_t mhz) {
   }
 }
 
+/* A second CPU reporting while the first prints interleaves every line and
+ * prolongs IRQ-masked stalls. Reports are best-effort; never wait for one. */
+static uint32_t report_active;
+
 void lockdiag_dump_all(const char *reason) {
+  if (__atomic_exchange_n(&report_active, 1, __ATOMIC_ACQUIRE))
+    return;
   uint64_t mhz = tsc_get_mhz();
   uint64_t now = rdtsc();
   uint32_t count = cpu_get_count();
@@ -1000,6 +1007,20 @@ void lockdiag_dump_all(const char *reason) {
 
   dump_spots(now, mhz);
   dump_wq_holds(now, mhz);
+
+  /* Lock-free diagnostic samples, before lengthy task output can perturb
+   * completion latency. Do not take driver locks from a hang report. */
+  struct virtio_gpu_stats gpu_stats;
+  virtio_gpu_get_stats(&gpu_stats);
+  ld_str("\n[LOCKDIAG] GPU progress: submitted="); ld_dec(gpu_stats.commands_submitted);
+  ld_str(" completed="); ld_dec(gpu_stats.commands_completed);
+  ld_str(" in_flight="); ld_dec(gpu_stats.frames_in_flight);
+  ld_str(" interrupts="); ld_dec(gpu_stats.interrupts);
+  ld_str(" timeouts="); ld_dec(gpu_stats.commands_timed_out);
+  ld_str(" host_errors="); ld_dec(gpu_stats.host_errors);
+  ld_str(" invalid_responses="); ld_dec(gpu_stats.invalid_responses);
+  ld_str(" frames="); ld_dec(gpu_stats.frames_presented);
+  ld_str(" present_failures="); ld_dec(gpu_stats.present_failures);
 
   const lockdiag_stats_t *s = &g_stats;
   ld_str("\n[LOCKDIAG] counters: futex waits=");
@@ -1067,7 +1088,23 @@ void lockdiag_dump_all(const char *reason) {
   int shown = 0, blocked_total = 0;
   int dead_shown = 0, dead_total = 0;
   if (spinlock_try_acquire(&tid_lock)) {
-    ld_str("\n[LOCKDIAG] blocked / waiting threads (event loops, I/O, sleep):");
+    ld_str("\n[LOCKDIAG] display tasks and blocked / waiting threads:");
+    /* Reserve the first pass for the compositor and native GPU workers.
+     * A browser can have more than 128 sleeping threads; prioritizing its
+     * journal owner used to exhaust the report before KWin ever appeared.
+     * Match whole display process groups so render/input workers are kept. */
+    uint32_t display_groups[8];
+    unsigned display_group_count = 0;
+    for (const struct thread *t = global_thread_list; t; t = t->global_next) {
+      if (strncmp(t->comm, "kwin", 4) && strncmp(t->comm, "Xorg", 4) &&
+          strncmp(t->comm, "Xwayland", 8) && strncmp(t->comm, "weston", 6))
+        continue;
+      bool found = false;
+      for (unsigned i = 0; i < display_group_count; i++)
+        found |= display_groups[i] == t->tgid;
+      if (!found && display_group_count < 8)
+        display_groups[display_group_count++] = t->tgid;
+    }
     uint32_t focus_tgid = 0;
     uint32_t journal_owner = 0;
     /* A blocked regular write can hold the journal and stall an entire
@@ -1184,7 +1221,7 @@ void lockdiag_dump_all(const char *reason) {
       ld_dec(busy_count);
       ld_str(" (game-join focus: Main + workers print first)");
     }
-    for (int pass = 0; pass < 3; pass++) {
+    for (int pass = 0; pass < 4; pass++) {
     for (const struct thread *t = global_thread_list; t; t = t->global_next) {
       /* A thread that died while holding a lock leaves it held forever, and it
        * will never appear in the blocked list: the lock spotlight above is what
@@ -1228,7 +1265,12 @@ void lockdiag_dump_all(const char *reason) {
         }
         continue;
       }
-      if (t->state != THREAD_BLOCKED && t->state != THREAD_SLEEPING)
+      bool display = strncmp(t->comm, "virtio-gpu", 10) == 0 ||
+                     strncmp(t->comm, "virtio-present", 14) == 0;
+      for (unsigned i = 0; i < display_group_count; i++)
+        display |= t->tgid == display_groups[i];
+      if (t->state != THREAD_BLOCKED && t->state != THREAD_SLEEPING &&
+          !(display && t->state == THREAD_READY))
         continue;
       bool focused = t->kpi_data || (focus_tgid && t->tgid == focus_tgid) ||
                      (busy_tgid && t->tgid == busy_tgid) ||
@@ -1236,9 +1278,10 @@ void lockdiag_dump_all(const char *reason) {
                      strncmp(t->comm, "glxgears", 8) == 0 ||
                      strncmp(t->comm, "xfce4-ab", 8) == 0 ||
                      strncmp(t->comm, "wine", 4) == 0;
-      if ((pass == 0 && !focused) ||
-          (pass == 1 && (focused || t->in_futex_wait)) ||
-          (pass == 2 && (focused || !t->in_futex_wait)))
+      if ((pass == 0 && !display) ||
+          (pass == 1 && (display || !focused)) ||
+          (pass == 2 && (display || focused || t->in_futex_wait)) ||
+          (pass == 3 && (display || focused || !t->in_futex_wait)))
         continue;
       blocked_total++;
       if (shown >= 128)
@@ -1252,6 +1295,14 @@ void lockdiag_dump_all(const char *reason) {
       ld_comm(t->comm);
       ld_str(" ");
       ld_str(state_name(t->state));
+      if (display) {
+        ld_str(" [display on_cpu="); ld_dec(t->on_cpu);
+        ld_str(" on_rq="); ld_dec(t->se.on_rq);
+        ld_str(" ready_since_ms="); ld_dec(t->ready_since_ms);
+        ld_str(" need_resched="); ld_dec(t->need_resched);
+        ld_str(" irq_depth="); ld_dec(t->kpi_irq_depth);
+        ld_str("]");
+      }
 #ifdef LINUXKPI_LINUX_IMPORTED
       if (t->kpi_wait_mutex) {
         extern void *linuxkpi_mutex_owner_thread(void *mutex);
@@ -1374,6 +1425,7 @@ void lockdiag_dump_all(const char *reason) {
   ld_str("\n[LOCKDIAG] addresses are raw: resolve with "
          "addr2line -f -e kernel/bin-x86_64/kernel <addr>  (or nm -n that file "
          "and search); the same ELF the ISO was built from\n");
+  __atomic_store_n(&report_active, 0, __ATOMIC_RELEASE);
 }
 
 /* --- detector ----------------------------------------------------------- */

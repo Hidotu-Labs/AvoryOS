@@ -115,11 +115,7 @@ static int unix_poll(socket_t *sock, int events) {
   if (sock->type == SOCK_SEQPACKET || sock->type == SOCK_DGRAM) {
     has_data = (usk->packet_queue_head != NULL);
   } else {
-    size_t head      = usk->recv_buf_head;
-    size_t tail      = usk->recv_buf_tail;
-    size_t size      = usk->recv_buf_size;
-    size_t available = (size > 0) ? (tail - head + size) % size : 0;
-    has_data = (available > 0);
+    has_data = (usk->recv_buf_count > 0);
     // Zero-payload SCM_RIGHTS still makes recvmsg readable.
     if (!has_data && usk->scm_queue_head != NULL &&
         usk->bytes_read >= usk->scm_queue_head->stream_offset)
@@ -187,11 +183,7 @@ static int unix_poll(socket_t *sock, int events) {
       } else {
         if (spinlock_try_acquire(&peer_usk->recv_lock)) {
           if (peer_usk->recv_buf && peer_usk->recv_buf_size > 0) {
-            size_t head = peer_usk->recv_buf_head;
-            size_t tail = peer_usk->recv_buf_tail;
-            size_t size = peer_usk->recv_buf_size;
-            size_t space = (head - tail - 1 + size) % size;
-            peer_has_space = (space > 0);
+            peer_has_space = (peer_usk->recv_buf_count < peer_usk->recv_buf_size);
           } else {
             peer_has_space = true;
           }
@@ -232,11 +224,7 @@ static int unix_ioctl(socket_t *sock, uint32_t request, uint64_t arg) {
     if (sock->type == SOCK_SEQPACKET || sock->type == SOCK_DGRAM) {
       unread = usk->packet_queue_head ? (int)usk->packet_queue_head->data_len : 0;
     } else {
-      size_t head      = usk->recv_buf_head;
-      size_t tail      = usk->recv_buf_tail;
-      size_t sz        = usk->recv_buf_size;
-      size_t available = (sz > 0) ? (tail - head + sz) % sz : 0;
-      unread = (int)available;
+      unread = (int)usk->recv_buf_count;
     }
     spinlock_release(&usk->recv_lock);
     if (copy_to_user((void *)arg, &unread, sizeof(int)) != 0)
@@ -360,6 +348,8 @@ int unix_create(socket_t *sock, int protocol) {
   usk->recv_buf_size = 0;
   usk->recv_buf_head = 0;
   usk->recv_buf_tail = 0;
+  usk->recv_buf_count = 0;
+  usk->recv_buf_mask = 0;
   spinlock_init(&usk->recv_lock);
 
   // Send buffer (lazy allocation on demand)
@@ -472,6 +462,11 @@ void unix_destroy(socket_t *sock) {
   if (usk->recv_buf) {
     kfree(usk->recv_buf);
     usk->recv_buf = NULL;
+    usk->recv_buf_size = 0;
+    usk->recv_buf_head = 0;
+    usk->recv_buf_tail = 0;
+    usk->recv_buf_count = 0;
+    usk->recv_buf_mask = 0;
   }
 
   if (usk->send_buf) {

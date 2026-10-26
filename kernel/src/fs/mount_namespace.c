@@ -63,19 +63,25 @@ static void sync_view(vfs_node_t *n) {
 }
 uint64_t vfs_mount_flags(vfs_node_t *n) {
   struct mount_namespace *ns = current_ns();
-  if (!ns || !n || !n->view_backing)
-    return false;
   uint64_t flags = 0;
-  spinlock_acquire(&ns->lock);
-  for (struct mount_link *m = ns->mounts; m; m = m->next)
-    if (m->id == n->mount_id) {
-      flags = m->flags;
-      break;
-    }
-  spinlock_release(&ns->lock);
+  if (ns && n && n->view_backing) {
+    spinlock_acquire(&ns->lock);
+    for (struct mount_link *m = ns->mounts; m; m = m->next)
+      if (m->id == n->mount_id) {
+        flags = m->flags;
+        break;
+      }
+    spinlock_release(&ns->lock);
+  }
+  vfs_node_t *backing = vfs_backing_node(n);
+  if (backing) flags |= backing->filesystem_mount_flags & 15;
+  if (backing && (backing->flags & FS_READONLY))
+    flags |= 1;
   return flags;
 }
-bool vfs_mount_readonly(vfs_node_t *n) { return (vfs_mount_flags(n) & 1) != 0; }
+bool vfs_mount_readonly(vfs_node_t *n) {
+  return n && (vfs_mount_flags(n) & 1) != 0;
+}
 static uint32_t view_read(vfs_node_t *n, uint32_t o, uint32_t z, uint8_t *b) {
   uint32_t r = vfs_read(n->view_backing, o, z, b);
   sync_view(n);
@@ -972,7 +978,9 @@ int vfs_get_mounts_task(struct thread *task, vfs_mount_info_t *b, int max) {
       continue;
     b[i].mount_id = m->id;
     b[i].parent_id = m->id == rootid ? rootid : m->parent_id;
-    b[i].flags = m->flags;
+    vfs_node_t *backing = vfs_backing_node(m->target);
+    b[i].flags = m->flags |
+                 ((backing && (backing->flags & FS_READONLY)) ? 1ULL : 0ULL);
     const char *path = m->path;
     if (m->id == rootid)
       path = "/";

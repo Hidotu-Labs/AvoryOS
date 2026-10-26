@@ -52,7 +52,7 @@ echo "[*] Building minimal ext4 root (${ROOT_MIB} MiB)..."
 rm -f "$ROOT_IMG"
 truncate -s "${ROOT_MIB}M" "$ROOT_IMG"
 mkfs.ext4 -q -F -b 1024 -I 128 \
-    -O extent,filetype,has_journal,dir_index,^64bit,^metadata_csum,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^metadata_csum_seed,^orphan_file \
+    -O extent,filetype,has_journal,dir_index,^64bit,^metadata_csum,^flex_bg,^huge_file,^large_file,^dir_nlink,^extra_isize,^metadata_csum_seed,^orphan_file \
     "$ROOT_IMG"
 
 # The init launcher executes this whitespace-separated command as PID 1.

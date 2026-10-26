@@ -410,7 +410,7 @@ static int block_vfs_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) {
     int *out = (int *)arg;
     if (!out || !vmm_is_user_addr_range_valid(arg, sizeof(int)))
       return -14;
-    *out = 0; // Read-write
+    *out = dev->write_sectors ? 0 : 1;
     return 0;
   }
 

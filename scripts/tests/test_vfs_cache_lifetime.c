@@ -33,6 +33,12 @@ static void spinlock_acquire(spinlock_t *s) {
 static void spinlock_release(spinlock_t *s) {
   __atomic_store_n(&s->locked, 0, __ATOMIC_RELEASE);
 }
+static bool spinlock_try_acquire(spinlock_t *s) {
+  return !__atomic_exchange_n(&s->locked, 1, __ATOMIC_ACQUIRE);
+}
+static bool spinlock_is_locked(spinlock_t *s) {
+  return __atomic_load_n(&s->locked, __ATOMIC_RELAXED) != 0;
+}
 #define sched_yield kernel_sched_yield
 #ifdef TEST_VFS_SOURCE
 #include TEST_VFS_SOURCE
@@ -43,9 +49,19 @@ static void spinlock_release(spinlock_t *s) {
 void vfs_cache_sync(vfs_node_t *n) { (void)n; }
 void vfs_cache_clear(vfs_node_t *n) { (void)n; }
 void vfs_xattr_clear(vfs_node_t *n) { (void)n; }
-/* A freed allocation remains inside managed RAM in the kernel as well. */
 bool pmm_kernel_ptr_is_managed(const void *p) { return p != NULL; }
 void wait_queue_wake_all(void *q) { (void)q; }
+uint32_t inotify_move_cookie(void) { return 0; }
+void inotify_notify(vfs_node_t *n, uint32_t m, const char *name, uint32_t cookie) { (void)n;(void)m;(void)name;(void)cookie; }
+bool vfs_mount_readonly(vfs_node_t *n) { (void)n; return false; }
+void kernel_sched_yield(void) { sched_yield(); }
+bool vfs_namespace_active(void) { return false; }
+vfs_node_t *vfs_task_root(void) { return NULL; }
+vfs_node_t *vfs_namespace_finddir(vfs_node_t *dir, char *name) { (void)dir;(void)name; return NULL; }
+bool vfs_rcu_ready(void) { return false; }
+void vfs_rcu_defer_free(vfs_node_t *n) { kfree(n); }
+uint64_t hal_irq_save(void) { return 0; }
+void hal_irq_restore(uint64_t f) { (void)f; }
 static unsigned long allocated_nodes, freed_nodes;
 void kfree(void *p) {
   __atomic_add_fetch(&freed_nodes, 1, __ATOMIC_RELAXED);

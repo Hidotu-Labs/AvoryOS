@@ -19,6 +19,7 @@ void hal_irq_restore(hal_irq_state_t flags) { (void)flags; }
 void hal_irq_enable(void) {}
 void hal_irq_disable(void) {}
 void tlb_shootdown_poll(void) {}
+void vfs_rcu_poll(void) {}
 void lockdiag_spot_take(int id, uint64_t cycles, uint64_t ip) {
     (void)id; (void)cycles; (void)ip;
 }

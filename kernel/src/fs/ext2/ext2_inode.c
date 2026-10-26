@@ -44,9 +44,10 @@ vfs_node_t *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
     static uint32_t invalid_inode_logs;
     if (__atomic_add_fetch(&invalid_inode_logs, 1, __ATOMIC_RELAXED) <= 8)
       klogf("[EXT2-INODE] invalid type inode=%u mode=%x links=%u size=%u "
-            "table=%u bs=%u\n", inode_num, inode->i_mode,
+            "table=%llu bs=%u\n", inode_num, inode->i_mode,
             inode->i_links_count, inode->i_size,
-            mnt->bgdt[(inode_num - 1) / mnt->inodes_per_group].bg_inode_table,
+            (unsigned long long)ext2_bgd_inode_table(
+                &mnt->bgdt[(inode_num - 1) / mnt->inodes_per_group]),
             mnt->block_size);
     kfree(node);
     return NULL;
@@ -79,6 +80,7 @@ vfs_node_t *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
     node->truncate = (mnt->sb.s_feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS)
                          ? ext4_truncate_impl : ext2_truncate_impl;
     node->fallocate = ext2_fallocate_impl;
+    node->append = ext2_append_impl;
     node->mmap     = ext2_mmap_impl;
     node->chmod    = ext2_chmod_impl;
     node->chown    = ext2_chown_impl;
@@ -105,6 +107,9 @@ vfs_node_t *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
     extern int ext4_statfs_impl(vfs_node_t *, struct statfs_buf *);
     node->statfs = ext4_statfs_impl;
   }
+
+  if (mnt->read_only)
+    node->flags |= FS_READONLY;
 
   return node;
 }

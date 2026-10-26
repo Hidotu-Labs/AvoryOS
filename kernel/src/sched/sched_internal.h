@@ -24,6 +24,10 @@ void kstack_cache_init(void);
 /* Thread search under tid_lock */
 struct thread *find_thread_by_tid_locked(uint32_t tid);
 
+/* Fast PID / TID bitmap allocator under tid_lock */
+uint32_t sched_alloc_tid_locked(void);
+void sched_free_tid_locked(uint32_t tid);
+
 /* Thread reaper operations */
 bool sched_thread_off_cpu(struct thread *t);
 void sched_process_reap_queue(struct thread *prev);

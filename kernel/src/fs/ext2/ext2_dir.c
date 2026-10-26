@@ -57,7 +57,7 @@ struct dirent *ext2_readdir_impl(vfs_node_t *node, uint32_t index) {
     uint32_t offset_in_block = byte_pos % mnt->block_size;
 
     if (logical_block != loaded_logical_block) {
-      uint32_t disk_block = ext2_get_block_num(mnt, &inode, logical_block);
+      uint64_t disk_block = ext2_get_block_num(mnt, &inode, logical_block);
       if (disk_block == 0)
         break;
       ext2_read_block(mnt, disk_block, block_buf);
@@ -139,7 +139,7 @@ vfs_node_t *ext2_finddir_impl(vfs_node_t *node, char *name) {
     uint32_t offset_in_block = byte_pos % mnt->block_size;
 
     if (offset_in_block == 0) {
-      uint32_t disk_block =
+      uint64_t disk_block =
           ext2_get_block_num(mnt, &dir_inode, logical_block);
       if (disk_block == 0)
         break;
@@ -212,7 +212,7 @@ int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
     uint32_t offset_in_block = byte_pos % mnt->block_size;
 
     if (offset_in_block == 0) {
-      uint32_t disk_block =
+      uint64_t disk_block =
           ext2_get_block_num(mnt, &dir_inode, logical_block);
       if (disk_block == 0)
         break;
@@ -238,7 +238,7 @@ int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
       new_entry->file_type = file_type;
       memcpy(new_entry->name, name, name_len);
 
-      uint32_t disk_block =
+      uint64_t disk_block =
           ext2_get_block_num(mnt, &dir_inode, byte_pos / mnt->block_size);
       int result = ext3_journal_block(mnt, disk_block, block_buf);
       kfree(block_buf);
@@ -249,15 +249,15 @@ int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
   }
 
   uint32_t logical_block = dir_size / mnt->block_size;
-  uint32_t new_block = 0;
+  uint64_t new_block = 0;
   if (dir_inode.i_flags & EXT4_EXTENTS_FL) {
     uint64_t allocated = 0;
     if (ext4_alloc_extent(mnt, &dir_inode, dir_inode_num, logical_block, 1,
-                          &allocated) != 0 || allocated > UINT32_MAX) {
+                          &allocated) != 0) {
       kfree(block_buf);
       return -1;
     }
-    new_block = (uint32_t)allocated;
+    new_block = allocated;
   } else {
     new_block = ext2_alloc_block(mnt);
     if (!new_block ||
@@ -309,7 +309,7 @@ int ext2_remove_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
     uint32_t offset_in_block = byte_pos % mnt->block_size;
 
     if (offset_in_block == 0) {
-      uint32_t disk_block =
+      uint64_t disk_block =
           ext2_get_block_num(mnt, &dir_inode, logical_block);
       if (disk_block == 0)
         break;
@@ -338,7 +338,7 @@ int ext2_remove_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
         } else {
           entry->inode = 0;
         }
-        uint32_t disk_block = ext2_get_block_num(
+        uint64_t disk_block = ext2_get_block_num(
             mnt, &dir_inode, current_block_start / mnt->block_size);
         int result = ext3_journal_block(mnt, disk_block, block_buf);
         kfree(block_buf);
@@ -370,7 +370,7 @@ int ext2_replace_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
   size_t name_len = strlen(name);
   int result = -2;
   for (uint32_t pos = 0; pos < inode.i_size; pos += mnt->block_size) {
-    uint32_t block = 0;
+    uint64_t block = 0;
     int mapping_error = 0;
     if (inode.i_flags & EXT4_EXTENTS_FL)
       block = ext4_get_block_num(mnt, &inode, pos / mnt->block_size);
@@ -421,7 +421,7 @@ bool ext2_dir_is_empty(ext2_mount_t *mnt, uint32_t inode_num) {
     uint32_t offset_in_block = byte_pos % mnt->block_size;
 
     if (offset_in_block == 0) {
-      uint32_t disk_block = ext2_get_block_num(mnt, &inode, logical_block);
+      uint64_t disk_block = ext2_get_block_num(mnt, &inode, logical_block);
       if (disk_block == 0)
         break;
       ext2_read_block(mnt, disk_block, block_buf);
@@ -452,6 +452,8 @@ int ext2_create_impl(vfs_node_t *node, char *name, uint16_t permission) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
+  if (mnt->read_only)
+    return -30;
 
   /* Keep allocation, inode initialization, and directory insertion atomic. */
   ext3_journal_start(mnt);
@@ -500,6 +502,8 @@ int ext2_mkdir_impl(vfs_node_t *node, char *name, uint16_t permission) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
+  if (mnt->read_only)
+    return -30;
 
   /* Serialize shared inode-table and directory-block read/modify/writes. */
   ext3_journal_start(mnt);
@@ -515,7 +519,10 @@ int ext2_mkdir_impl(vfs_node_t *node, char *name, uint16_t permission) {
     return -1;
   }
 
-  uint32_t data_block = ext2_alloc_block(mnt);
+  bool extents = (mnt->sb.s_feature_incompat &
+                  EXT4_FEATURE_INCOMPAT_EXTENTS) != 0;
+  uint64_t data_block = extents ? ext2_alloc_block_extent(mnt)
+                                : ext2_alloc_block(mnt);
   if (!data_block) {
     ext3_journal_stop(mnt);
     return -1;
@@ -527,19 +534,25 @@ int ext2_mkdir_impl(vfs_node_t *node, char *name, uint16_t permission) {
   new_inode.i_size        = mnt->block_size;
   new_inode.i_links_count = 2;
   new_inode.i_blocks      = mnt->block_size / 512;
-  new_inode.i_block[0]    = data_block;
 
   uint32_t now      = ext2_current_time();
   new_inode.i_atime = now;
   new_inode.i_ctime = now;
   new_inode.i_mtime = now;
 
-  if (mnt->sb.s_feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) {
+  if (extents) {
     ext4_extent_init_inode(&new_inode);
     if (ext4_extent_insert(mnt, &new_inode, new_ino, 0, data_block, 1) != 0) {
       ext3_journal_stop(mnt);
       return -1;
     }
+  } else {
+    if (data_block > UINT32_MAX) {
+      ext2_free_block(mnt, data_block);
+      ext3_journal_stop(mnt);
+      return -1;
+    }
+    new_inode.i_block[0] = (uint32_t)data_block;
   }
 
   uint8_t *block_buf = kcalloc(1, mnt->block_size);
@@ -583,7 +596,8 @@ int ext2_mkdir_impl(vfs_node_t *node, char *name, uint16_t permission) {
   }
 
   uint32_t group = (new_ino - 1) / mnt->inodes_per_group;
-  mnt->bgdt[group].bg_used_dirs_count++;
+  ext2_bgd_set_used_dirs(&mnt->bgdt[group],
+      ext2_bgd_used_dirs(&mnt->bgdt[group]) + 1);
   ext2_mark_group_dirty(mnt, group);
 
   ext3_journal_stop(mnt);

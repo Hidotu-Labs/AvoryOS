@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Weston
+Comment=The reference Wayland server
+Exec=/usr/bin/avory-weston-session
+TryExec=/usr/bin/weston
+Type=Application
+DesktopNames=Weston

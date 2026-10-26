@@ -91,29 +91,146 @@ void test_uaccess(void) {
   // 3. Exception bounds check (-EFAULT on out of range)
   long fault_res = strncpy_from_user(dst_buf, (const char *)0xFFFF800000000000ULL, 64);
   UACCESS_ASSERT(fault_res == -14); // -EFAULT
+  UACCESS_ASSERT(copy_from_user(dst_buf, (const void *)0xFFFF800000000000ULL, 8) == 8);
+  UACCESS_ASSERT(copy_to_user((void *)0xFFFF800000000000ULL, dst_buf, 8) == 8);
+  extern unsigned long clear_user(void *to, unsigned long n);
+  UACCESS_ASSERT(clear_user((void *)0xFFFF800000000000ULL, 8) == 8);
   klog_puts("  [UACCESS] Canonical user space bounds protection verified\n");
 
-  // 4. Performance Benchmark: 10,000 iterations copying a 128-byte path
+  // 4. copy_from_user correctness across sizes 0..128 and alignments 0..7
+  for (int len = 0; len <= 128; len++) {
+    for (int align = 0; align < 8; align++) {
+      uint8_t *user_src = kva + align;
+      const void *src_va = (const void *)(UACCESS_TEST_VA + (uint64_t)align);
+      for (int i = 0; i < len; i++) {
+        user_src[i] = (uint8_t)((i + align) ^ 0x5A);
+      }
+      memset(dst_buf, 0xFF, sizeof(dst_buf));
+      unsigned long uncopied = copy_from_user(dst_buf, src_va, (unsigned long)len);
+      UACCESS_ASSERT(uncopied == 0);
+      if (len > 0) {
+        UACCESS_ASSERT(memcmp(dst_buf, user_src, len) == 0);
+      }
+    }
+  }
+  klog_puts("  [UACCESS] copy_from_user correctness across all sizes/alignments verified (1032 cases)\n");
+
+  // 5. copy_to_user correctness across sizes 0..128 and alignments 0..7
+  char src_buf[512];
+  for (int len = 0; len <= 128; len++) {
+    for (int align = 0; align < 8; align++) {
+      uint8_t *user_dst = kva + align;
+      void *dst_va = (void *)(UACCESS_TEST_VA + (uint64_t)align);
+      memset(kva, 0, PAGE_SIZE);
+      for (int i = 0; i < len; i++) {
+        src_buf[i] = (uint8_t)((i * 3 + align) ^ 0xA5);
+      }
+      unsigned long uncopied = copy_to_user(dst_va, src_buf, (unsigned long)len);
+      UACCESS_ASSERT(uncopied == 0);
+      if (len > 0) {
+        UACCESS_ASSERT(memcmp(user_dst, src_buf, len) == 0);
+      }
+    }
+  }
+  klog_puts("  [UACCESS] copy_to_user correctness across all sizes/alignments verified (1032 cases)\n");
+
+  // 6. clear_user correctness across sizes 0..128 and alignments 0..7
+  for (int len = 0; len <= 128; len++) {
+    for (int align = 0; align < 8; align++) {
+      uint8_t *user_dst = kva + align;
+      void *dst_va = (void *)(UACCESS_TEST_VA + (uint64_t)align);
+      memset(kva, 0xCC, PAGE_SIZE);
+      unsigned long uncopied = clear_user(dst_va, (unsigned long)len);
+      UACCESS_ASSERT(uncopied == 0);
+      for (int i = 0; i < len; i++) {
+        UACCESS_ASSERT(user_dst[i] == 0);
+      }
+      UACCESS_ASSERT(user_dst[len] == 0xCC);
+    }
+  }
+  klog_puts("  [UACCESS] clear_user correctness across all sizes/alignments verified (1032 cases)\n");
+
+  // 7. Performance Benchmarks: 10,000 iterations for small copy sizes
+  const int iterations = 10000;
+  uint32_t val32 = 0x12345678;
+  uint64_t val64 = 0x1122334455667788ULL;
+  struct { uint64_t a, b; } val128 = { 0x1111, 0x2222 };
+  uint8_t buf64[64];
+
+  // 4-byte copy_from_user
+  uint64_t t0 = rdtsc_fence();
+  for (int i = 0; i < iterations; i++) {
+    copy_from_user(&val32, (const void *)UACCESS_TEST_VA, sizeof(val32));
+  }
+  uint64_t t1 = rdtsc_fence();
+  uint64_t cycles_cfu4 = (t1 - t0) / iterations;
+
+  // 4-byte copy_to_user
+  t0 = rdtsc_fence();
+  for (int i = 0; i < iterations; i++) {
+    copy_to_user((void *)UACCESS_TEST_VA, &val32, sizeof(val32));
+  }
+  t1 = rdtsc_fence();
+  uint64_t cycles_ctu4 = (t1 - t0) / iterations;
+
+  // 8-byte copy_from_user
+  t0 = rdtsc_fence();
+  for (int i = 0; i < iterations; i++) {
+    copy_from_user(&val64, (const void *)UACCESS_TEST_VA, sizeof(val64));
+  }
+  t1 = rdtsc_fence();
+  uint64_t cycles_cfu8 = (t1 - t0) / iterations;
+
+  // 8-byte copy_to_user
+  t0 = rdtsc_fence();
+  for (int i = 0; i < iterations; i++) {
+    copy_to_user((void *)UACCESS_TEST_VA, &val64, sizeof(val64));
+  }
+  t1 = rdtsc_fence();
+  uint64_t cycles_ctu8 = (t1 - t0) / iterations;
+
+  // 16-byte copy_from_user
+  t0 = rdtsc_fence();
+  for (int i = 0; i < iterations; i++) {
+    copy_from_user(&val128, (const void *)UACCESS_TEST_VA, sizeof(val128));
+  }
+  t1 = rdtsc_fence();
+  uint64_t cycles_cfu16 = (t1 - t0) / iterations;
+
+  // 64-byte copy_from_user
+  t0 = rdtsc_fence();
+  for (int i = 0; i < iterations; i++) {
+    copy_from_user(buf64, (const void *)UACCESS_TEST_VA, sizeof(buf64));
+  }
+  t1 = rdtsc_fence();
+  uint64_t cycles_cfu64 = (t1 - t0) / iterations;
+
+  klog_puts("  [UACCESS BENCH] copy_from_user:\n");
+  klogf("            4-byte:  %llu cycles/op\n", (unsigned long long)cycles_cfu4);
+  klogf("            8-byte:  %llu cycles/op\n", (unsigned long long)cycles_cfu8);
+  klogf("            16-byte: %llu cycles/op\n", (unsigned long long)cycles_cfu16);
+  klogf("            64-byte: %llu cycles/op\n", (unsigned long long)cycles_cfu64);
+
+  klog_puts("  [UACCESS BENCH] copy_to_user:\n");
+  klogf("            4-byte:  %llu cycles/op\n", (unsigned long long)cycles_ctu4);
+  klogf("            8-byte:  %llu cycles/op\n", (unsigned long long)cycles_ctu8);
+
+  // 8. Path string copy benchmark (128 bytes)
   memset(kva + 256, 'x', 127);
   kva[256 + 127] = '\0';
   char bench_dst[128];
 
-  const int iterations = 10000;
-  uint64_t t0 = rdtsc_fence();
+  t0 = rdtsc_fence();
   for (int i = 0; i < iterations; i++) {
     strncpy_from_user(bench_dst, (const char *)(UACCESS_TEST_VA + 256),
                       sizeof(bench_dst));
   }
-  uint64_t t1 = rdtsc_fence();
+  t1 = rdtsc_fence();
   uint64_t total_cycles = t1 - t0;
   uint64_t avg_cycles = total_cycles / iterations;
 
-  klog_puts("  [UACCESS] 128-byte path copy benchmark (10,000 iterations):\n");
-  klog_puts("            Average copy time: ");
-  klog_uint64(avg_cycles);
-  klog_puts(" cycles/path (");
-  klog_uint64((avg_cycles * 1000) / 128);
-  klog_puts(" millicycles/byte)\n");
+  klogf("  [UACCESS BENCH] 128-byte path strncpy: %llu cycles/path\n",
+        (unsigned long long)avg_cycles);
 
 cleanup:
   if (mapped) {
