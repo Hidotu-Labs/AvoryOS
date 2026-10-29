@@ -4,6 +4,7 @@ import fnmatch
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -128,6 +129,25 @@ def populate(image, source, destination):
                 if stat.S_ISLNK(info.st_mode):
                     emit(f'symlink {path} {quote(os.readlink(host))}')
                 else:
+                    if not os.access(host, os.R_OK):
+                        # Some package payloads are intentionally execute-only
+                        # (for example dbus-daemon-launch-helper). debugfs must
+                        # read the host payload, so stage a temporary readable
+                        # copy while keeping the installed mode unchanged.
+                        staged = Path(temp) / 'payload' / relative
+                        staged.parent.mkdir(parents=True, exist_ok=True)
+                        original_mode = stat.S_IMODE(info.st_mode)
+                        try:
+                            os.chmod(host, original_mode | stat.S_IRUSR)
+                            try:
+                                shutil.copyfile(host, staged)
+                            finally:
+                                os.chmod(host, original_mode)
+                        except OSError as error:
+                            staged.unlink(missing_ok=True)
+                            raise RuntimeError(
+                                f'Cannot stage unreadable file {host}: {error}') from error
+                        host = staged
                     emit(f'rm {path}')
                     emit(f'write {quote(str(host))} {path}')
                     # debugfs write copies the host file's complete mode,

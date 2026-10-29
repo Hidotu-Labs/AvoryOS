@@ -40,6 +40,65 @@ sed -E "s/^([^:]+):x:/\1:!:/" "${ROOTFS_DIR}/etc/passwd" | \
 mv "${ROOTFS_DIR}/etc/passwd.avory-new" "${ROOTFS_DIR}/etc/passwd"
 rm -f "${ROOTFS_DIR}/etc/shadow" "${ROOTFS_DIR}/etc/shadow-" \
       "${ROOTFS_DIR}/etc/gshadow" "${ROOTFS_DIR}/etc/gshadow-"
+
+# Axon's rootfs install does not run systemd-sysusers. Provision the Polkit
+# system account from the package's sysusers rule so its rules directory can
+# retain the intended root:polkitd ownership in the ext4 image.
+POLKIT_RULES_DIR="${ROOTFS_DIR}/etc/polkit-1/rules.d"
+POLKIT_SYSUSERS="${ROOTFS_DIR}/usr/lib/sysusers.d/polkit.conf"
+if [ -d "${POLKIT_RULES_DIR}" ]; then
+    if [ ! -r "${POLKIT_SYSUSERS}" ]; then
+        echo "Missing Polkit sysusers definition: ${POLKIT_SYSUSERS}" >&2
+        exit 1
+    fi
+
+    POLKIT_GID=$(awk '$1 == "g" && $2 == "polkitd" { print $3; exit }' "${POLKIT_SYSUSERS}")
+    POLKIT_USER_SPEC=$(awk '$1 == "u!" && $2 == "polkitd" { print $3; exit }' "${POLKIT_SYSUSERS}")
+    POLKIT_UID=${POLKIT_USER_SPEC%%:*}
+    POLKIT_USER_GROUP=${POLKIT_USER_SPEC#*:}
+    case "${POLKIT_GID}:${POLKIT_UID}" in
+        *[!0-9:]*|:*|*:)
+            echo "Invalid Polkit sysusers definition: ${POLKIT_SYSUSERS}" >&2
+            exit 1
+            ;;
+    esac
+    if [ "${POLKIT_USER_GROUP}" != "polkitd" ]; then
+        echo "Unexpected Polkit primary group '${POLKIT_USER_GROUP}'." >&2
+        exit 1
+    fi
+
+    EXISTING_POLKIT_GID=$(awk -F: '$1 == "polkitd" { print $3; exit }' "${ROOTFS_DIR}/etc/group")
+    if [ -n "${EXISTING_POLKIT_GID}" ]; then
+        if [ "${EXISTING_POLKIT_GID}" != "${POLKIT_GID}" ]; then
+            echo "Polkit group has GID ${EXISTING_POLKIT_GID}; expected ${POLKIT_GID}." >&2
+            exit 1
+        fi
+    else
+        CONFLICTING_GROUP=$(awk -F: -v id="${POLKIT_GID}" '$3 == id { print $1; exit }' "${ROOTFS_DIR}/etc/group")
+        if [ -n "${CONFLICTING_GROUP}" ]; then
+            echo "Polkit GID ${POLKIT_GID} is already used by group ${CONFLICTING_GROUP}." >&2
+            exit 1
+        fi
+        printf 'polkitd:x:%s:\n' "${POLKIT_GID}" >> "${ROOTFS_DIR}/etc/group"
+    fi
+
+    EXISTING_POLKIT_IDS=$(awk -F: '$1 == "polkitd" { print $3 ":" $4; exit }' "${ROOTFS_DIR}/etc/passwd")
+    if [ -n "${EXISTING_POLKIT_IDS}" ]; then
+        if [ "${EXISTING_POLKIT_IDS}" != "${POLKIT_UID}:${POLKIT_GID}" ]; then
+            echo "Polkit user has IDs ${EXISTING_POLKIT_IDS}; expected ${POLKIT_UID}:${POLKIT_GID}." >&2
+            exit 1
+        fi
+    else
+        CONFLICTING_USER=$(awk -F: -v id="${POLKIT_UID}" '$3 == id { print $1; exit }' "${ROOTFS_DIR}/etc/passwd")
+        if [ -n "${CONFLICTING_USER}" ]; then
+            echo "Polkit UID ${POLKIT_UID} is already used by user ${CONFLICTING_USER}." >&2
+            exit 1
+        fi
+        printf 'polkitd:!:%s:%s:User for polkitd:/:/usr/bin/nologin\n' \
+            "${POLKIT_UID}" "${POLKIT_GID}" >> "${ROOTFS_DIR}/etc/passwd"
+    fi
+fi
+
 chmod 0644 "${ROOTFS_DIR}/etc/passwd" "${ROOTFS_DIR}/etc/group"
 chmod 0755 "${ROOTFS_DIR}/home"
 rm -rf "${ROOTFS_DIR}/root"

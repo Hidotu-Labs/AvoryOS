@@ -837,6 +837,7 @@ disk.img: disk-full-force
 		fi; \
 	fi
 	@if [ -d build/arch/rootfs ]; then \
+		set -e; \
 		echo "Populating Arch Linux rootfs into disk image..."; \
 		mkdir -p build/arch/rootfs/etc/X11/xorg.conf.d; \
 		mkdir -p build/arch/rootfs/usr/share/avory-xorg; \
