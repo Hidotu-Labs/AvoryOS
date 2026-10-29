@@ -1,0 +1,13 @@
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -7655,7 +7655,9 @@
+    }
+ 
+    ctx_params.shared = false;
+-   if (flags & VREND_USE_COMPAT_CONTEXT) {
++   if ((flags & VREND_USE_COMPAT_CONTEXT) ||
++       (!(flags & VREND_USE_GLES) &&
++        debug_get_bool_option("VIRGL_HOST_COMPAT_CONTEXT", false))) {
+       ctx_params.compat_ctx = true;
+    }
+ 

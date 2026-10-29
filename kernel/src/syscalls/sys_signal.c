@@ -18,6 +18,7 @@
 #include "../smp/cpu.h"
 #include "../socket/epoll.h"
 #include "sys_io_shared.h"
+#include "sys_ptrace.h"
 #include "syscall.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -699,7 +700,12 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
   if ((regs->cs & 3) != 3)
     return;
 
-  uint64_t pending = current->pending_signals & ~current->signal_mask;
+  /* PTRACE_INTERRUPT creates an event-stop even without a pending Unix
+   * signal. This hook is deliberately before ordinary signal selection. */
+  ptrace_user_return_stop(regs);
+
+  uint64_t unmaskable = (1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1));
+  uint64_t pending = current->pending_signals & (~current->signal_mask | unmaskable);
   if (!pending) {
     syscall_restart_return(regs, syscall_number, syscall_return_ip, false, 0);
     return;
@@ -732,6 +738,47 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
       current->fault_regs_valid) {
     *regs = current->fault_regs;
     syscall_number = UINT64_MAX; /* this frame belongs to the original fault */
+  }
+
+  if (!current->syscall_dispatch_sigsys && !current->seccomp_sigsys) {
+    struct kernel_siginfo trace_info;
+    const struct kernel_siginfo *trace_info_ptr = NULL;
+    if (has_queued_info) {
+      trace_info_ptr = &queued_info;
+    } else {
+      memset(&trace_info, 0, sizeof(trace_info));
+      trace_info.si_signo = sig;
+      uint32_t sender = current->signal_sender_pid[sig - 1];
+      trace_info.si_code = sender ? current->signal_sender_code[sig - 1]
+                                  : 128; /* SI_KERNEL */
+      if (sender) {
+        trace_info._kill.si_pid = pid_namespace_visible(current, sender);
+        trace_info._kill.si_uid = 0;
+      }
+      if (sig == SIGSEGV || sig == SIGBUS)
+        trace_info._sigfault.si_addr = current->fault_addr;
+      if (sig == SIGTRAP && regs->int_no == 3) {
+        trace_info.si_code = 1; /* TRAP_BRKPT */
+        trace_info._sigfault.si_addr = regs->rip ? regs->rip - 1 : 0;
+      } else if (sig == SIGTRAP && regs->int_no == 1) {
+        trace_info.si_code = 2; /* TRAP_TRACE */
+        trace_info._sigfault.si_addr = regs->rip;
+      }
+      trace_info_ptr = &trace_info;
+    }
+    int replacement = ptrace_signal_delivery_stop(
+        regs, sig, trace_info_ptr);
+    if (replacement >= 0) {
+      if (replacement == 0) {
+        /* Suppressing a signal still has to translate internal restart
+         * results before SYSRET; otherwise libc sees a kernel-only errno. */
+        syscall_restart_return(regs, syscall_number, syscall_return_ip,
+                               false, 0);
+        return;
+      }
+      sig = replacement;
+      has_queued_info = false;
+    }
   }
 
   /* A sibling can reset a group disposition during frame construction.
@@ -784,7 +831,13 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
     if (sig == SIGQUIT || sig == SIGILL || sig == SIGTRAP || sig == SIGABRT ||
         sig == SIGFPE || sig == SIGSEGV || sig == SIGBUS || sig == SIGSYS) {
       uint64_t report_addr = current->fault_regs_valid ? current->fault_addr : regs->rip;
-      isr_report_user_fault(regs, sig, report_addr);
+      /* #BP/#DB were already recorded by their exception handlers before
+       * reaching this default-action path. Re-reporting SIGTRAP here duplicates
+       * the fault record and, historically, repeated a large dump with IF=0. */
+      bool trap_already_reported =
+          sig == SIGTRAP && (regs->int_no == 1 || regs->int_no == 3);
+      if (!trap_already_reported)
+        isr_report_user_fault(regs, sig, report_addr);
       if (process_core_dump_enabled) {
         process_dump_core(current, regs, sig);
       }
@@ -1544,11 +1597,8 @@ static uint32_t signalfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                               uint8_t *buffer) {
   (void)offset;
   if (size < sizeof(struct signalfd_siginfo)) {
-    klog_puts("[SIGNALFD] size too small: ");
-    klog_uint64(size);
-    klog_puts(" node=");
-    klog_uint64((uint64_t)node);
-    klog_puts("\n");
+    klogf("[SIGNALFD] size too small: %u node=0x%016llX\n", size,
+          (unsigned long long)(uintptr_t)node);
     return (uint32_t)-22; // EINVAL
   }
 
@@ -1563,11 +1613,8 @@ static uint32_t signalfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       struct kernel_siginfo queued_info;
       bool has_info = false;
       if (sig && consume_signal_tgid(t, sig, &sender_pid, &queued_info, &has_info)) {
-        klog_puts("[SIGNALFD] read sig=");
-        klog_uint64(sig);
-        klog_puts(" from sender_pid=");
-        klog_uint64(sender_pid);
-        klog_puts("\n");
+        klogf("[SIGNALFD] read sig=%d from sender_pid=%u\n", sig,
+              sender_pid);
         struct signalfd_siginfo info;
         memset(&info, 0, sizeof(info));
         info.ssi_signo = sig;
@@ -1813,60 +1860,8 @@ static uint64_t sys_tkill(uint64_t tid, uint64_t sig, uint64_t a2, uint64_t a3,
   return 0;
 }
 
-/* Debugger stop/wait semantics are not implemented. In particular ATTACH
- * must fail without queueing SIGSTOP: claiming success used to send Crashpad
- * into waitid(ECHILD), then kill its target through SIGSTOP's default path. */
-#define PTRACE_TRACEME 0
-#define PTRACE_ATTACH 16
-#define PTRACE_DETACH 17
-static uint64_t sys_ptrace(uint64_t request, uint64_t pid, uint64_t addr,
-                           uint64_t data, uint64_t a4, uint64_t a5) {
-  (void)addr;
-  (void)a4;
-  (void)a5;
-  struct thread *current = sched_get_current();
-  if (!current)
-    return (uint64_t)-1;
-
-  switch (request) {
-  case PTRACE_TRACEME: {
-    /* "Trace me": the parent becomes our tracer from now on. */
-    if (current->tracer_tid)
-      return (uint64_t)-1; // EPERM: already traced
-    current->tracer_tid =
-        current->parent ? current->parent->tid : current->tid;
-    return 0;
-  }
-  case PTRACE_ATTACH:
-    /* EIO: unsupported ptrace request. No tracer relationship or signal is
-     * installed until genuine trace-stop and wait support exist. */
-    return (uint64_t)-5;
-  case PTRACE_DETACH: {
-    struct thread *target = sched_get_thread_by_tid((uint32_t)pid);
-    if (!target)
-      return (uint64_t)-3; // ESRCH
-    if (target->tracer_tid != current->tid)
-      return (uint64_t)-1; // EPERM: not our tracee
-    target->tracer_tid = 0;
-    /* data = signal to inject on detach (0 = none). */
-    if (data != 0) {
-      if (data > 64)
-        return (uint64_t)-22; // EINVAL
-      target->pending_signals |= (1ULL << (data - 1));
-      target->signal_sender_pid[data - 1] =
-          current->tgid ? current->tgid : current->tid;
-      target->signal_sender_code[data - 1] = 0; /* SI_USER */
-      signal_notify_thread(target, (int)data);
-    }
-    return 0;
-  }
-  default:
-    return (uint64_t)-22; // EINVAL: PEEK/POKE/CONT/etc. not implemented
-  }
-}
-
 void syscall_register_signal(void) {
-  syscall_register(SYS_PTRACE, sys_ptrace);
+  syscall_register_ptrace();
   syscall_register(SYS_RT_SIGACTION, sys_rt_sigaction);
   syscall_register(SYS_RT_SIGPROCMASK, sys_rt_sigprocmask);
   syscall_register(SYS_RT_SIGPENDING, sys_rt_sigpending);

@@ -1,9 +1,12 @@
 #include "net/ipv6.h"
 #include "console/klog.h"
+#include "hal/hal.h"
 #include "lib/string.h"
+#include "lock/spinlock.h"
 #include "net/core.h"
 #include "apic/lapic_timer.h"
 #include "sched/sched.h"
+#include "sched/wait.h"
 
 #define ETH_TYPE_IPV6 0x86dd
 #define IPV6_NEXT_ICMP 58
@@ -16,6 +19,7 @@
 #define ICMP6_ECHO_REQUEST 128
 #define ICMP6_ECHO_REPLY 129
 #define NEIGHBOR_COUNT 16
+#define NEIGHBOR_WAIT_BUCKETS 16
 
 struct ipv6_header {
   uint32_t version_flow;
@@ -34,6 +38,8 @@ struct neighbor {
 
 static struct ipv6_config config;
 static struct neighbor neighbors[NEIGHBOR_COUNT];
+static spinlock_t neighbor_lock = SPINLOCK_INIT;
+static wait_queue_t neighbor_wait[NEIGHBOR_WAIT_BUCKETS];
 static uint32_t next_neighbor;
 static void (*udp_handler)(const uint8_t[16], const uint8_t[16],
                            const uint8_t *, size_t);
@@ -92,12 +98,22 @@ static void multicast_mac(const uint8_t address[16], uint8_t mac[6]) {
   memcpy(mac + 2, address + 12, 4);
 }
 
+static wait_queue_t *neighbor_wait_queue(const uint8_t address[16]) {
+  uint32_t hash = 0;
+  for (uint32_t i = 0; i < 16; i++)
+    hash = (hash << 5) - hash + address[i];
+  return &neighbor_wait[hash & (NEIGHBOR_WAIT_BUCKETS - 1)];
+}
+
 static void neighbor_learn(const uint8_t address[16], const uint8_t mac[6]) {
   if (addr_zero(address) || addr_multicast(address))
     return;
+  spinlock_acquire(&neighbor_lock);
   for (uint32_t i = 0; i < NEIGHBOR_COUNT; i++) {
     if (neighbors[i].used && addr_equal(neighbors[i].address, address)) {
       memcpy(neighbors[i].mac, mac, 6);
+      spinlock_release(&neighbor_lock);
+      wait_queue_wake_all(neighbor_wait_queue(address));
       return;
     }
   }
@@ -105,16 +121,22 @@ static void neighbor_learn(const uint8_t address[16], const uint8_t mac[6]) {
   memcpy(n->address, address, 16);
   memcpy(n->mac, mac, 6);
   n->used = true;
+  spinlock_release(&neighbor_lock);
+  wait_queue_wake_all(neighbor_wait_queue(address));
 }
 
 static bool neighbor_lookup(const uint8_t address[16], uint8_t mac[6]) {
+  bool found = false;
+  spinlock_acquire(&neighbor_lock);
   for (uint32_t i = 0; i < NEIGHBOR_COUNT; i++) {
     if (neighbors[i].used && addr_equal(neighbors[i].address, address)) {
       memcpy(mac, neighbors[i].mac, 6);
-      return true;
+      found = true;
+      break;
     }
   }
-  return false;
+  spinlock_release(&neighbor_lock);
+  return found;
 }
 
 static int ipv6_send_to(const uint8_t source[16], const uint8_t destination[16],
@@ -161,6 +183,51 @@ static void send_na(const uint8_t destination[16], const uint8_t mac[6],
   ipv6_send_to(target, destination, mac, IPV6_NEXT_ICMP, na, sizeof(na));
 }
 
+static bool in_net_worker_thread(void) {
+  struct thread *cur = sched_get_current();
+  return cur && strcmp(cur->comm, "net-worker") == 0;
+}
+
+static bool neighbor_wait_for_reply(const uint8_t target[16], uint8_t mac[6],
+                                    uint64_t deadline) {
+  struct thread *self = sched_get_current();
+  if (!self)
+    return neighbor_lookup(target, mac);
+
+  wait_queue_t *wq = neighbor_wait_queue(target);
+  wait_queue_entry_t entry = {.thread = self};
+  for (;;) {
+    if (neighbor_lookup(target, mac))
+      return true;
+    if (lapic_timer_get_ticks() >= deadline)
+      return neighbor_lookup(target, mac);
+
+    /* Enqueue before the cache recheck so an NA/RA cannot be lost between
+     * observing the miss and parking this thread. */
+    hal_irq_state_t flags = hal_irq_save();
+    self->wakeup_ticks = deadline;
+    self->state = THREAD_BLOCKED;
+    wait_queue_add(wq, &entry);
+    bool found = neighbor_lookup(target, mac);
+    if (found) {
+      self->state = THREAD_RUNNING;
+      self->wakeup_ticks = 0;
+    }
+    hal_irq_restore(flags);
+
+    if (!found)
+      sched_yield();
+
+    flags = hal_irq_save();
+    self->state = THREAD_RUNNING;
+    self->wakeup_ticks = 0;
+    wait_queue_remove(wq, &entry);
+    hal_irq_restore(flags);
+    if (found)
+      return true;
+  }
+}
+
 static bool resolve_neighbor(const uint8_t target[16], uint8_t mac[6]) {
   struct net_device *dev = net_device_default();
   if (!dev)
@@ -183,15 +250,17 @@ static bool resolve_neighbor(const uint8_t target[16], uint8_t mac[6]) {
   memcpy(ns + 8, target, 16);
   ns[24] = 1; ns[25] = 1;
   memcpy(ns + 26, dev->mac, 6);
-  for (int attempt = 0; attempt < 3; attempt++) {
+  struct thread *current = sched_get_current();
+  bool can_wait = current && !in_net_worker_thread();
+  int attempts = can_wait ? 3 : 1;
+  for (int attempt = 0; attempt < attempts; attempt++) {
     ipv6_send_to(config.link_local, solicited, multicast, IPV6_NEXT_ICMP,
                  ns, sizeof(ns));
-    uint64_t deadline = lapic_timer_get_ticks() + 500;
-    while (lapic_timer_get_ticks() < deadline) {
-      if (neighbor_lookup(target, mac))
-        return true;
-      sched_yield();
-    }
+    if (!can_wait)
+      return neighbor_lookup(target, mac);
+    if (neighbor_wait_for_reply(target, mac,
+                                lapic_timer_get_ticks() + 500))
+      return true;
   }
   return false;
 }
@@ -316,7 +385,11 @@ bool net_phase11_init(void) {
   if (!dev)
     return false;
   memset(&config, 0, sizeof(config));
+  spinlock_init(&neighbor_lock);
   memset(neighbors, 0, sizeof(neighbors));
+  next_neighbor = 0;
+  for (uint32_t i = 0; i < NEIGHBOR_WAIT_BUCKETS; i++)
+    wait_queue_init(&neighbor_wait[i]);
   config.link_local[0] = 0xfe;
   config.link_local[1] = 0x80;
   config.link_local[8] = dev->mac[0] ^ 0x02;

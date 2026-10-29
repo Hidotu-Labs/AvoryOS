@@ -25,6 +25,7 @@ struct mm_struct {
   uint64_t brk_current;    // Current end of the heap
   uint64_t mmap_next_addr; // Bump-pointer for anonymous mmap
   bool compat32;          // Address space uses the Linux i386 ABI
+  bool mlockall_future;   // Conservatively keep this address space out of zram reclaim
   int ref_count;           // Reference count for sharing across threads
   uint16_t pcid;           // Hardware PCID tag (0 = kernel/unassigned)
   spinlock_t lock;         // Lock for thread-safe MM state updates
@@ -52,6 +53,8 @@ struct mm_struct {
   uint64_t zram_scan_cursor;
   uint64_t ksm_scan_cursor; // Next VA for a bounded background scan; mm->lock
 };
+
+struct syscall_regs;
 
 /*
  * Drop one lifetime reference on an mm (the reference is taken with an atomic
@@ -472,11 +475,30 @@ struct thread {
    * thread. A filesystem-global buffer races with other CPUs and preemption. */
   struct dirent readdir_result;
 
-  /* Opt-in syncobj profiling. Appended to preserve assembly-pinned offsets.
-   * wake_ns initially equals park_ns (no notification recorded yet). */
-  uint64_t perf_syncobj_active_ns;
-  uint64_t perf_syncobj_park_ns;
-  uint64_t perf_syncobj_wake_ns;
+  /* Native Linux ptrace state. The debugger-owned snapshot and live frame
+   * pointers are valid only while ptrace_stopped is true; the target parks
+   * with its kernel stack intact until the tracer resumes or detaches it. */
+  bool ptrace_stopped;
+  bool ptrace_stop_pending;
+  bool ptrace_stop_waited;
+  bool ptrace_exit_waited;
+  bool ptrace_seized;
+  bool ptrace_syscall_trace;
+  bool ptrace_syscall_entry_stop;
+  bool ptrace_syscall_exit_stop;
+  bool ptrace_signal_delivery;
+  uint32_t ptrace_pending_event;
+  uint64_t ptrace_options;
+  uint64_t ptrace_message;
+  uint32_t ptrace_resume_pid;
+  uint64_t ptrace_regs[27]; /* x86-64 struct user_regs_struct */
+  uint8_t ptrace_siginfo[128];
+  uint8_t ptrace_syscall_info[128];
+  int32_t ptrace_stop_signal;
+  int32_t ptrace_stop_event;
+  int32_t ptrace_resume_signal;
+  struct registers *ptrace_live_regs;
+  struct syscall_regs *ptrace_live_syscall_regs;
 };
 
 _Static_assert(offsetof(struct thread, on_cpu) == 16,
@@ -646,7 +668,7 @@ bool sched_get_fd_info_snapshot(uint32_t tid, uint32_t fd, uint64_t *out_pos,
 
 // Reap a zombie thread (remove from runqueue, free resources)
 void signal_release_queued_info(struct thread *t);
-void sched_reap_thread(struct thread *t);
+bool sched_reap_thread(struct thread *t);
 void sched_queue_reap(struct thread *t);
 void sched_queue_reap_and_wait(struct thread *t);
 bool sched_prepare_thread_reap(struct thread *t);
@@ -689,6 +711,7 @@ void fd_release_reserved(struct thread *t, int fd);
  */
 static inline bool thread_has_pending_signal(struct thread *t) {
   if (!t) return false;
+  if (t->ptrace_stop_pending) return true;
   uint64_t unmaskable = (1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1));
   uint64_t pending = t->pending_signals & (~t->signal_mask | unmaskable);
   if (pending & unmaskable)

@@ -358,20 +358,28 @@ static void test_readdir(tmpfs_sb_t *sb) {
     TASSERT(de != NULL);
     TASSERT(strcmp(de->name, ".") == 0);
 
-    de = root->readdir(root, 1);
+    de = root->readdir(root, de->d_off);
     TASSERT(de != NULL);
     TASSERT(strcmp(de->name, "..") == 0);
 
-    int found_a = 0, found_b = 0, found_c = 0;
-    for (uint32_t i = 2; ; i++) {
-        de = root->readdir(root, i);
-        if (!de)
-            break;
-        if (strcmp(de->name, "a.txt") == 0) found_a = 1;
-        if (strcmp(de->name, "b.txt") == 0) found_b = 1;
-        if (strcmp(de->name, "c_dir") == 0) found_c = 1;
-    }
-    TASSERT(found_a && found_b && found_c);
+    uint64_t cookie = de->d_off;
+    de = root->readdir(root, cookie);
+    TASSERT(de != NULL && strcmp(de->name, "c_dir") == 0);
+    cookie = de->d_off;
+    TASSERT(root->rmdir(root, "c_dir") == 0);
+
+    /* Removing the most recently listed child must not shift the open stream
+     * past its remaining siblings. */
+    de = root->readdir(root, cookie);
+    TASSERT(de != NULL && strcmp(de->name, "b.txt") == 0);
+    cookie = de->d_off;
+    TASSERT(root->unlink(root, "b.txt") == 0);
+
+    de = root->readdir(root, cookie);
+    TASSERT(de != NULL && strcmp(de->name, "a.txt") == 0);
+    cookie = de->d_off;
+    de = root->readdir(root, cookie);
+    TASSERT(de == NULL);
 }
 
 static void test_statfs(void) {

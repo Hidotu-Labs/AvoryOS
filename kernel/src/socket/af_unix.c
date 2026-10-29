@@ -534,10 +534,52 @@ static void af_unix_create_sink(const char *path) {
   spinlock_release(&unix_bound_lock);
 }
 
+void unix_diag_describe(socket_t *sock, char *out, size_t outsz) {
+  if (!sock || !sock->sk || !out || outsz < 2)
+    return;
+  unix_sock_t *usk = (unix_sock_t *)sock->sk;
+
+  size_t rb = 0, br = 0, scm_off = 0;
+  bool scm = false, dgram = false;
+  spinlock_acquire(&usk->recv_lock);
+  rb = usk->recv_buf_count;
+  br = usk->bytes_read;
+  scm = usk->scm_queue_head != NULL;
+  if (usk->scm_queue_head)
+    scm_off = usk->scm_queue_head->stream_offset;
+  dgram = usk->packet_queue_head != NULL;
+  spinlock_release(&usk->recv_lock);
+
+  bool peer = false, pw = false, rd = false, wr = false;
+  bool wc = false, lst = false, orphan = false, acc_orphan = false;
+  int pst = -1;
+  spinlock_acquire(&sock->lock);
+  peer = usk->peer != NULL;
+  if (usk->peer) {
+    pw = usk->peer->write_shutdown;
+    if (usk->peer->parent)
+      pst = usk->peer->parent->state;
+  }
+  spinlock_release(&sock->lock);
+  rd = usk->read_shutdown;
+  wr = usk->write_shutdown;
+  wc = usk->was_connected;
+  lst = usk->is_listener;
+  orphan = usk->orphaned;
+  acc_orphan = usk->accepted_orphaned;
+
+  snprintf(out, outsz,
+           " u:rb=%lu br=%lu scm=%d off=%lu dgram=%d peer=%d pw=%d pst=%d "
+           "rd=%d wr=%d wc=%d lst=%d orph=%d aorph=%d",
+           (unsigned long)rb, (unsigned long)br, scm ? 1 : 0,
+           (unsigned long)scm_off, dgram ? 1 : 0, peer ? 1 : 0, pw ? 1 : 0,
+           pst, rd ? 1 : 0, wr ? 1 : 0, wc ? 1 : 0, lst ? 1 : 0,
+           orphan ? 1 : 0, acc_orphan ? 1 : 0);
+}
+
 void af_unix_init(void) {
   INIT_LIST_HEAD(&unix_bound_list);
   spinlock_init(&unix_bound_lock);
-
   sock_register_family(&unix_family);
 
   // Register in-kernel sinks for syslog and systemd journal.

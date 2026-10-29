@@ -20,7 +20,8 @@ static struct drm_gem_object *lookup(struct drm_file*f,uint32_t h){(void)f;asser
 static void put(struct drm_gem_object *o){assert(o==&bo&&bo.refs==2);bo.refs--;}
 int virtio_gpu_virgl_ioctl(struct drm_file *,uint32_t,uint64_t);
 static int virtio_gpu_render_wait_bo(struct drm_gem_object*o,bool nowait){assert(o==&bo&&o->refs==2&&!ioctl_owner);assert(nowait==(result==-16));assert(virtio_gpu_virgl_ioctl(NULL,0xc0086443,0)==123);waits++;return result;}
-static void sched_yield(void){assert(!"WAIT held the metadata gate while sleeping");}
+static int ioctl_gate_acquire(void){assert(!ioctl_owner);ioctl_owner=1;return 0;}
+static void ioctl_gate_release(void){assert(ioctl_owner);ioctl_owner=0;}
 static int ioctl_locked(struct drm_file*f,uint32_t r,uint64_t a){(void)f;(void)r;(void)a;assert(ioctl_owner==1);return 123;}
 '''
 main=r'''

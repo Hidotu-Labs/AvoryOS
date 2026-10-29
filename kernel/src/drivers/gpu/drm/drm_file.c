@@ -82,6 +82,10 @@ void ascentdrm_file_free(struct drm_file *file) {
   if (!file)
     return;
   struct drm_device *dev = file->dev;
+  /* Framebuffers carry an independent reference to their GEM backing. Drop
+   * this file's framebuffer ownership now; active scanout keeps closed ones
+   * alive until a later modeset replaces or disables them. */
+  ascentdrm_framebuffer_close_file(dev, file);
   virtio_gpu_virgl_close(file);
 
   /* Release all GEM handles owned by this client. Collect last-refs under
@@ -139,6 +143,9 @@ void ascentdrm_file_free(struct drm_file *file) {
     ascentdrm_cursor_reset(dev);
     fb_set_kd_mode(0); /* KD_TEXT, redraws console */
     virtio_gpu_restore_console_scanout();
+    /* Console scanout now owns the display again, so no closed userspace FB
+     * needs to remain attached to a CRTC or plane. */
+    ascentdrm_framebuffer_drop_closed_scanout(dev);
   }
 
   klog_debug_puts("[DRM] drm_file freed\n");

@@ -4,7 +4,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define IPI_VECTOR_TLB_SHOOTDOWN 50
+/* Shootdowns must pass ordinary device IRQs in the LAPIC priority scheme.
+ * Device vectors are allocated only through 0xDF, leaving 0xF0 for this
+ * high-priority, lock-free invalidation IPI. */
+#define IPI_VECTOR_TLB_SHOOTDOWN 0xF0
 
 #define TLB_SHOOTDOWN_ALL UINT64_MAX
 #define TLB_SHOOTDOWN_CONTEXT (UINT64_MAX - 1)
@@ -21,6 +24,9 @@ void tlb_shootdown_page(uint64_t addr);
  * you have one.
  */
 void tlb_shootdown_page_for(uint64_t addr, uint64_t pml4);
+/* Same operation when the caller already knows the address space's PCID.
+ * This avoids a conservative all-PCID flush when reclaim runs in another mm. */
+void tlb_shootdown_page_for_pcid(uint64_t addr, uint64_t pml4, uint16_t pcid);
 /* Invalidate every non-global translation for one address space. */
 void tlb_shootdown_context_for(uint64_t pml4);
 

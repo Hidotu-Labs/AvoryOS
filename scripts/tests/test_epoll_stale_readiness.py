@@ -10,7 +10,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--source', type=Path, default=ROOT / 'kernel/src/socket/epoll.c')
 args = parser.parse_args()
 source = args.source.read_text()
-start = source.index('static uint32_t ep_check_events(')
+start = source.index('static inline uint32_t ep_check_events_mask(')
 helper = source[start:source.index('// Helper: Add item to ready list', start)]
 prefix = r'''
 #include <assert.h>
@@ -27,7 +27,7 @@ prefix = r'''
 #define EPOLLONESHOT (1u << 30)
 #define EPOLLET (1u << 31)
 typedef struct { uint32_t current_events; unsigned polls; } node_t;
-typedef struct { node_t *node; uint32_t registered_events,ready_events; } epitem_t;
+typedef struct { node_t *node; uint32_t registered_events,ready_events; uint32_t removed,oneshot_disabled; } epitem_t;
 static int vfs_poll(node_t *node, int watch) {
   assert(!(watch & (EPOLLET|EPOLLONESHOT|EPOLLEXCLUSIVE|EPOLLWAKEUP)));
   node->polls++;

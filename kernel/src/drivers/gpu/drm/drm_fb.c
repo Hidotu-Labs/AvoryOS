@@ -177,6 +177,8 @@ struct drm_framebuffer *ascentdrm_framebuffer_create_full(struct drm_file *file,
 
     fb->base_fb.width = cmd->width;
     fb->base_fb.height = cmd->height;
+    fb->base_fb.owner_file = file;
+    fb->base_fb.is_full = 1;
     fb->base_fb.pixel_format = cmd->pixel_format;
     fb->width        = cmd->width;
     fb->height       = cmd->height;
@@ -226,9 +228,7 @@ void ascentdrm_framebuffer_free_full(struct drm_device *dev,
                                struct drm_framebuffer *fb_base) {
     struct drm_framebuffer_full *fb = (struct drm_framebuffer_full *)fb_base;
 
-    spinlock_acquire(&dev->lock);
-    list_del(&fb->base_fb.base.list);
-    spinlock_release(&dev->lock);
+    ascentdrm_framebuffer_unlink(dev, fb_base);
 
     for (int p = 0; p < DRM_MAX_FB_PLANES; p++) {
         struct drm_gem_object *gem = fb->gem_obj[p];

@@ -564,7 +564,7 @@ static int tmpfs_statfs(vfs_node_t *node, struct statfs_buf *buf) {
     return 0;
 }
 
-static struct dirent *tmpfs_readdir(vfs_node_t *node, uint32_t index) {
+static struct dirent *tmpfs_readdir(vfs_node_t *node, uint64_t index) {
     if (!node || !node->device)
         return NULL;
 
@@ -575,42 +575,43 @@ static struct dirent *tmpfs_readdir(vfs_node_t *node, uint32_t index) {
         strcpy(d->name, ".");
         d->ino = node->inode;
         d->d_type = DT_DIR;
+        d->d_off = 1;
         return d;
     }
     if (index == 1) {
         strcpy(d->name, "..");
         d->ino = node->inode;
         d->d_type = DT_DIR;
+        d->d_off = 2;
         return d;
     }
 
-    index -= 2;
     tmpfs_dir_t   *dir  = (tmpfs_dir_t *)node->device;
 
-    /* getdents walks indices in sequence.  Resuming from the per-directory
-     * cursor makes each step O(1); anything else (random access, two readers
-     * interleaving) safely falls back to a scan from the head->  The walk and
-     * the dirent fill run under the index lock: entries behind the cursor
-     * can be unlinked (wrappers freed) at any moment. */
+    /* Stable cookies let this descriptor resume after siblings are removed.
+     * The pointer cursor keeps sequential reads O(1); stale or interleaved
+     * positions find the next older cookie under the index lock. */
     vfs_dirindex_lock(&dir->di);
     tmpfs_child_t *cursor = dir->di.cursor;
-    uint32_t cursor_index = dir->di.cursor_index;
     tmpfs_child_t *curr;
-    if (cursor && index == cursor_index + 1) {
+    if (index == 2) {
+        curr = dir->di.children;
+    } else if (cursor && index == dir->di.cursor_cookie) {
         curr = cursor->next;
     } else {
         curr = dir->di.children;
-        for (uint32_t i = 0; i < index && curr; i++)
+        while (curr && curr->cookie >= index)
             curr = curr->next;
     }
     dir->di.cursor = curr;
-    dir->di.cursor_index = index;
+    dir->di.cursor_cookie = curr ? curr->cookie : 0;
 
     if (curr) {
         strncpy(d->name, curr->node->name, 127);
         d->name[127] = '\0';
         d->ino = curr->node->inode;
         d->d_type = vfs_dtype(curr->node->flags);
+        d->d_off = curr->cookie;
     }
     vfs_dirindex_unlock(&dir->di);
 

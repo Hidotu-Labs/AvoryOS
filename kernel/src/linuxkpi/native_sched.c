@@ -10,7 +10,6 @@
 #include "hal/hal.h"
 #include "lib/string.h"
 #include "lock/lockdiag.h"
-#include <linuxkpi/gpu_perf.h>
 #include "mm/heap.h"
 #include "sched/sched.h"
 #include "sched/wait.h"
@@ -216,14 +215,12 @@ void linuxkpi_thread_block(void) {
     linuxkpi_set_current_state(0);
     return;
   }
-  gpu_perf_syncobj_park(t);
   __atomic_store_n(&t->state, THREAD_BLOCKED, __ATOMIC_RELEASE);
   if (cpu)
     spinlock_release(&cpu->queue_lock);
   hal_irq_restore(irq_flags);
 
   sched_yield();
-  gpu_perf_syncobj_resume(t);
 
   linuxkpi_set_current_state(0);
 
@@ -288,14 +285,12 @@ int linuxkpi_schedule_timeout_ms(unsigned long ms) {
       woken = true;
       break;
     }
-    gpu_perf_syncobj_park(t);
     __atomic_store_n(&t->state, THREAD_SLEEPING, __ATOMIC_RELEASE);
     if (cpu)
       spinlock_release(&cpu->queue_lock);
     hal_irq_restore(irq_flags);
 
     sched_yield();
-    gpu_perf_syncobj_resume(t);
 
     if (!t->wakeup_ticks)
       break;
@@ -333,7 +328,6 @@ void linuxkpi_wake_thread(void *thread) {
    * wakes must not leak into a later mutex wait or schedule_timeout(). */
   if (__atomic_load_n(&t->kpi_timeout_active, __ATOMIC_ACQUIRE) ||
       __atomic_load_n(&t->kpi_wait_prepared, __ATOMIC_SEQ_CST)) {
-    gpu_perf_syncobj_wake(t);
     __atomic_store_n(&t->kpi_block_pending, true, __ATOMIC_RELEASE);
     __atomic_store_n(&t->kpi_wake_pending, true, __ATOMIC_RELEASE);
   }

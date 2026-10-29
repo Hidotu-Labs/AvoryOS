@@ -35,8 +35,8 @@ assert 'virtio-vga,addr=06.0,xres=1280,yres=800,edid=on' in edid
 
 diagnostic = subprocess.check_output([
     'make', '-n', 'run-nouveau', 'NOUVEAU_DEBUG=info,gsp=debug',
-    'NOUVEAU_DRM_DEBUG=0x4', 'NOUVEAU_GPU_DIAG=1', 'NOUVEAU_PERF=0'],
+    'NOUVEAU_DRM_DEBUG=0x4', 'NOUVEAU_GPU_DIAG=1'],
     cwd=root, text=True)
 assert 'nouveau.debug=info,gsp=debug drm.debug=0x4' in diagnostic
-assert 'gpu_diag=1 gpu_perf=0' in diagnostic
+assert 'gpu_diag=1' in diagnostic
 print('PASS: run-nouveau is the only Nouveau desktop launcher and boots the verified ISO')

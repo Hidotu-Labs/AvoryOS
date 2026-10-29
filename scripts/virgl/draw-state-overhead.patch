@@ -1,0 +1,147 @@
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -348,6 +348,8 @@
+    struct vrend_context *ctx0;
+    struct vrend_context *current_ctx;
+    struct vrend_context *current_hw_ctx;
++   bool program_binding_valid, bound_program_is_pipeline;
++   GLuint bound_program_id;
+ 
+    struct list_head waiting_query_list;
+    struct list_head fence_list;
+@@ -1451,11 +1453,22 @@
+       gltype == GL_TIME_ELAPSED;
+ }
+ 
++static void vrend_make_current(virgl_gl_context context)
++{
++   vrend_state.program_binding_valid = false;
++   vrend_clicbs->make_current(context);
++}
++
+ static void vrend_use_program(struct vrend_linked_shader_program *program)
+ {
+    GLuint id = !program ? 0 :
+                           program->is_pipeline ? program->id.pipeline :
+                                                  program->id.program;
++   bool pipeline = program && program->is_pipeline;
++   if (vrend_state.program_binding_valid &&
++       vrend_state.bound_program_id == id &&
++       vrend_state.bound_program_is_pipeline == pipeline)
++      return;
+    if (program && program->is_pipeline) {
+       glUseProgram(0);
+       glBindProgramPipeline(id);
+@@ -1464,6 +1477,9 @@
+           glBindProgramPipeline(0);
+        glUseProgram(id);
+    }
++   vrend_state.bound_program_id = id;
++   vrend_state.bound_program_is_pipeline = pipeline;
++   vrend_state.program_binding_valid = true;
+ }
+ 
+ static void vrend_depth_test_enable(struct vrend_sub_context *sub_ctx, bool depth_test_enable)
+@@ -2245,6 +2261,8 @@
+ static void vrend_destroy_program(struct vrend_linked_shader_program *ent)
+ {
+    int i;
++   /* Pipeline deletion can clear a binding, and GL names may be reused. */
++   vrend_state.program_binding_valid = false;
+    if (ent->ref_context && ent->ref_context->prog == ent)
+       ent->ref_context->prog = NULL;
+ 
+@@ -2303,7 +2321,7 @@
+ 
+ void vrend_sync_make_current(virgl_gl_context gl_cxt) {
+    GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+-   vrend_clicbs->make_current(gl_cxt);
++   vrend_make_current(gl_cxt);
+    glWaitSync(sync, 0, GL_TIMEOUT_IGNORED);
+    glDeleteSync(sync);
+ }
+@@ -6086,14 +6104,13 @@
+       }
+    }
+ 
+-   if (has_feature(feat_indirect_draw)) {
+-      GLint buf = indirect_res ? indirect_res->gl_id : 0;
+-      glBindBuffer(GL_DRAW_INDIRECT_BUFFER, buf);
+-
+-      if (has_feature(feat_indirect_params)) {
+-         GLint buf = indirect_params_res ? indirect_params_res->gl_id : 0;
+-         glBindBuffer(GL_PARAMETER_BUFFER_ARB, buf);
+-      }
++   /* Direct draws do not read indirect argument bindings. Avoid resetting
++    * these targets for every terrain draw; indirect draws always bind their
++    * validated argument resources, including after transfers change bindings. */
++   if (indirect_res) {
++      glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirect_res->gl_id);
++      if (indirect_params_res)
++         glBindBuffer(GL_PARAMETER_BUFFER_ARB, indirect_params_res->gl_id);
+    }
+ 
+    if (info->vertices_per_patch && has_feature(feat_tessellation))
+@@ -7657,7 +7674,7 @@
+       goto fail;
+    }
+ 
+-   vrend_clicbs->make_current(gl_context);
++   vrend_make_current(gl_context);
+    gl_ver = epoxy_gl_version();
+ 
+    /* enable error output as early as possible */
+@@ -7839,7 +7856,7 @@
+ 
+ static void vrend_destroy_sub_context(struct vrend_sub_context *sub)
+ {
+-   vrend_clicbs->make_current(sub->gl_context);
++   vrend_make_current(sub->gl_context);
+ 
+    if (has_feature(feat_images)) {
+       for (int shader_type = PIPE_SHADER_VERTEX;
+@@ -7970,7 +7987,7 @@
+       vrend_state.current_hw_ctx = NULL;
+    }
+ 
+-   vrend_clicbs->make_current(ctx->sub->gl_context);
++   vrend_make_current(ctx->sub->gl_context);
+    /* reset references on framebuffers */
+    vrend_set_framebuffer_state(ctx, 0, NULL, 0);
+ 
+@@ -11664,7 +11681,7 @@
+ 
+    vrend_state.current_hw_ctx = ctx;
+ 
+-   vrend_clicbs->make_current(ctx->sub->gl_context);
++   vrend_make_current(ctx->sub->gl_context);
+ }
+ 
+ void
+@@ -13207,7 +13224,7 @@
+    ctx_params.compat_ctx = !vrend_state.use_core_profile && !vrend_state.use_gles;
+    sub->gl_context = vrend_clicbs->create_gl_context(0, &ctx_params);
+    sub->parent = ctx;
+-   vrend_clicbs->make_current(sub->gl_context);
++   vrend_make_current(sub->gl_context);
+ 
+    /* enable if vrend_renderer_init function has done it as well */
+    if (has_feature(feat_debug_cb)) {
+@@ -13280,7 +13297,7 @@
+             ctx->sub = ctx->sub0;
+          }
+          vrend_destroy_sub_context(sub);
+-         vrend_clicbs->make_current(ctx->sub->gl_context);
++         vrend_make_current(ctx->sub->gl_context);
+          break;
+       }
+    }
+@@ -13291,7 +13308,7 @@
+    struct vrend_sub_context *sub = vrend_renderer_find_sub_ctx(ctx, sub_ctx_id);
+    if (sub && ctx->sub != sub) {
+       ctx->sub = sub;
+-      vrend_clicbs->make_current(sub->gl_context);
++      vrend_make_current(sub->gl_context);
+    }
+ }
+ 

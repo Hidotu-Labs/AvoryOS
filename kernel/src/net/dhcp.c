@@ -552,7 +552,6 @@ bool dhcp_start(void) {
             klog_puts("[DHCP] Lease obtained\n");
             return true;
         }
-
         wait_ms = wait_ms < DHCP_MAX_TIMEOUT_MS / 2
                   ? wait_ms * 2 : DHCP_MAX_TIMEOUT_MS;
         rx_got_nak = false;

@@ -23,9 +23,6 @@ code = r'''
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-static void gpu_perf_syncobj_park(void *t){(void)t;}
-static void gpu_perf_syncobj_wake(void *t){(void)t;}
-static void gpu_perf_syncobj_resume(void *t){(void)t;}
 
 enum { THREAD_RUNNING, THREAD_SLEEPING, THREAD_BLOCKED };
 struct thread {

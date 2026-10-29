@@ -59,12 +59,14 @@ typedef struct vfs_child {
   struct vfs_child *next;  /* order list: newest first (readdir order) */
   struct vfs_child *prev;  /* makes detach O(1) once the hash found it */
   struct vfs_child *hnext; /* hash bucket chain */
+  uint64_t cookie;         /* Stable readdir position, never reused. */
 } vfs_child_t;
 
 typedef struct vfs_dirindex {
   vfs_child_t *children;      /* order list head, newest first */
   vfs_child_t *cursor;        /* sequential readdir resume point */
-  uint32_t cursor_index;      /* child index the cursor points at */
+  uint64_t cursor_cookie;     /* cookie of the child the cursor points at */
+  uint64_t next_cookie;       /* monotonically assigned insertion cookie */
   vfs_child_t **buckets;      /* chain heads; NULL while the dir is empty */
   uint32_t nbuckets;          /* power of two, 0 while buckets is NULL */
   uint32_t count;             /* children currently indexed */

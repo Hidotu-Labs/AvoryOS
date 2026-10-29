@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import tempfile
 
+from image_copy import copy_image_range
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -95,11 +97,9 @@ def cache_partition(disk: Path, cache: Path):
     os.close(fd)
     temp = Path(temp_name)
     try:
-        subprocess.run([
-            "dd", f"if={disk}", f"of={temp}", "bs=1M",
-            f"skip={offset}", f"count={size}",
-            "iflag=skip_bytes,count_bytes", "conv=sparse", "status=none",
-        ], check=True)
+        with temp.open("r+b") as stream:
+            stream.truncate(size)
+        copy_image_range(disk, temp, offset, 0, size)
         if temp.stat().st_size != size:
             raise RuntimeError("partition cache has the wrong size")
         if ext4_uuid(temp) != ext4_uuid(disk, offset):
@@ -331,6 +331,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--cache-from-disk", action="store_true")
+    mode.add_argument("--install-partition", type=Path)
     mode.add_argument("--snapshot", action="store_true")
     mode.add_argument("--update", action="store_true")
     mode.add_argument("--sync-only", action="store_true")
@@ -347,7 +348,13 @@ def main():
     manifest = args.manifest if args.manifest.is_absolute() else ROOT / args.manifest
     makefile = args.makefile if args.makefile.is_absolute() else ROOT / args.makefile
     try:
-        if args.cache_from_disk:
+        if args.install_partition:
+            ensure_disk_closed(disk)
+            offset, size = partition_info(disk)
+            if args.install_partition.stat().st_size != size:
+                raise RuntimeError("partition image size differs from GPT partition")
+            copy_image_range(args.install_partition, disk, 0, offset, size)
+        elif args.cache_from_disk:
             cache_partition(disk, cache)
         elif args.snapshot:
             snapshot(manifest, makefile, args.apps)

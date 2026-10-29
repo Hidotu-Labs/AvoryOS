@@ -324,7 +324,8 @@ void vklogf(const char *fmt, va_list ap) {
   if (!fmt)
     return;
 
-  char buf[512];
+  /* Keep one complete diagnostic together even when several CPUs log at once. */
+  char buf[1536];
   int len = vsnprintf(buf, sizeof(buf), fmt, ap);
   if (len <= 0)
     return;

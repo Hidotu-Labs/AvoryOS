@@ -1,0 +1,174 @@
+--- a/src/vrend/vrend_decode.c
++++ b/src/vrend/vrend_decode.c
+@@ -22,6 +22,9 @@
+  *
+  **************************************************************************/
+ #include <stdint.h>
++#include <stdlib.h>
++#include <time.h>
++#include <inttypes.h>
+ #include <string.h>
+ #include <stdio.h>
+ #include <errno.h>
+@@ -54,7 +57,14 @@
+ struct vrend_decode_ctx {
+    struct virgl_context base;
+    struct vrend_context *grctx;
++   struct {
++      bool enabled;
++      uint64_t epoch_ns, submit_ns, cpu_ns, switch_ns, error_ns, submissions, bytes;
++      uint64_t calls[VIRGL_MAX_COMMANDS], command_ns[VIRGL_MAX_COMMANDS];
++   } profile;
+ };
++
++static void vrend_profile_report(struct vrend_decode_ctx *ctx, bool force);
+ 
+ static inline uint32_t get_buf_entry(const uint32_t *buf, uint32_t offset)
+ {
+@@ -1666,6 +1676,7 @@
+    TRACE_FUNC();
+    struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
+ 
++   vrend_profile_report(dctx, true);
+    vrend_destroy_context(dctx->grctx);
+    free(dctx);
+ }
+@@ -2046,20 +2057,88 @@
+    }
+ }
+ 
++/* Opt-in wall-clock timings of host API dispatch. These do not wait for GPU
++ * completion or claim to measure GPU execution. No clocks run when disabled. */
++static uint64_t vrend_profile_now(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
++}
++
++static uint64_t vrend_profile_cpu_now(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
++}
++
++static void vrend_profile_report(struct vrend_decode_ctx *ctx, bool force)
++{
++   if (!ctx->profile.enabled || !ctx->profile.submissions)
++      return;
++   uint64_t elapsed = vrend_profile_now() - ctx->profile.epoch_ns;
++   if (!elapsed || (!force && elapsed < 2000000000ULL))
++      return;
++
++   fprintf(stderr, "AVORY_VIRGL_PROFILE ctx=%u window_ms=%.3f submissions=%" PRIu64
++           " bytes=%" PRIu64 " dispatch_ms=%.3f cpu_ms=%.3f context_ms=%.3f gl_error_ms=%.3f\n",
++           ctx->base.ctx_id, elapsed / 1e6, ctx->profile.submissions,
++           ctx->profile.bytes, ctx->profile.submit_ns / 1e6,
++           ctx->profile.cpu_ns / 1e6, ctx->profile.switch_ns / 1e6, ctx->profile.error_ns / 1e6);
++   bool reported[VIRGL_MAX_COMMANDS] = {false};
++   for (unsigned rank = 0; rank < 8; rank++) {
++      unsigned best = VIRGL_MAX_COMMANDS;
++      for (unsigned cmd = 0; cmd < VIRGL_MAX_COMMANDS; cmd++)
++         if (!reported[cmd] && ctx->profile.calls[cmd] &&
++             (best == VIRGL_MAX_COMMANDS ||
++              ctx->profile.command_ns[cmd] > ctx->profile.command_ns[best]))
++            best = cmd;
++      if (best == VIRGL_MAX_COMMANDS)
++         break;
++      reported[best] = true;
++      fprintf(stderr, "AVORY_VIRGL_PROFILE ctx=%u cmd=%s calls=%" PRIu64
++              " api_ms=%.3f\n", ctx->base.ctx_id,
++              vrend_get_comand_name(best), ctx->profile.calls[best],
++              ctx->profile.command_ns[best] / 1e6);
++   }
++   memset(&ctx->profile, 0, sizeof(ctx->profile));
++   ctx->profile.enabled = true;
++   ctx->profile.epoch_ns = vrend_profile_now();
++}
++
++static int vrend_profile_finish(struct vrend_decode_ctx *ctx, int ret,
++                               uint64_t start, uint64_t start_cpu, size_t bytes)
++{
++   if (!ctx->profile.enabled)
++      return ret;
++   ctx->profile.submit_ns += vrend_profile_now() - start;
++   ctx->profile.cpu_ns += vrend_profile_cpu_now() - start_cpu;
++   ctx->profile.submissions++;
++   ctx->profile.bytes += bytes;
++   vrend_profile_report(ctx, false);
++   return ret;
++}
++
+ static int vrend_decode_ctx_submit_cmd(struct virgl_context *ctx,
+                                        const void *buffer,
+                                        size_t size)
+ {
+    TRACE_FUNC();
+    struct vrend_decode_ctx *gdctx = (struct vrend_decode_ctx *)ctx;
++   bool profiling = gdctx->profile.enabled;
++   uint64_t start = profiling ? vrend_profile_now() : 0;
++   uint64_t start_cpu = profiling ? vrend_profile_cpu_now() : 0;
+    bool bret;
+    int ret;
+ 
+ #define TRANSFER_HEADER_SIZE 4096
+ 
+    bret = vrend_hw_switch_context(gdctx->grctx, true);
++   if (profiling)
++      gdctx->profile.switch_ns += vrend_profile_now() - start;
+    if (bret == false)
+-      return EINVAL;
++      return vrend_profile_finish(gdctx, EINVAL, start, start_cpu, size);
+ 
+    if (VREND_DEBUG_ENABLED &&
+        vrend_debug(gdctx->grctx, dbg_dump_cmd_streams) &&
+@@ -2079,7 +2158,7 @@
+       uint32_t cmd = *buf & 0xff;
+ 
+       if (cmd >= VIRGL_MAX_COMMANDS)
+-         return EINVAL;
++         return vrend_profile_finish(gdctx, EINVAL, start, start_cpu, size);
+ 
+       buf_offset += len + 1;
+ 
+@@ -2095,18 +2174,25 @@
+ 
+       TRACE_SCOPE_SLOW(vrend_get_comand_name(cmd));
+ 
++      uint64_t command_start = profiling ? vrend_profile_now() : 0;
+       ret = decode_table[cmd](gdctx->grctx, buf, len);
++      uint64_t error_start = profiling ? vrend_profile_now() : 0;
+       if (!vrend_check_no_error(gdctx->grctx) && !ret)
+          ret = EINVAL;
++      if (profiling) {
++         gdctx->profile.calls[cmd]++;
++         gdctx->profile.command_ns[cmd] += error_start - command_start;
++         gdctx->profile.error_ns += vrend_profile_now() - error_start;
++      }
+       if (ret) {
+          virgl_error("context %d failed to dispatch %s: %d\n",
+                gdctx->base.ctx_id, vrend_get_comand_name(cmd), ret);
+          if (ret == EINVAL)
+             vrend_report_buffer_error(gdctx->grctx, *buf);
+-         return ret;
++         return vrend_profile_finish(gdctx, ret, start, start_cpu, size);
+       }
+    }
+-   return 0;
++   return vrend_profile_finish(gdctx, 0, start, start_cpu, size);
+ }
+ 
+ static int vrend_decode_ctx_get_fencing_fd(UNUSED struct virgl_context *ctx)
+@@ -2139,6 +2225,11 @@
+                                        uint32_t ctx_id)
+ {
+    struct virgl_context *ctx = &dctx->base ;
++   memset(&dctx->profile, 0, sizeof(dctx->profile));
++   const char *profiling = getenv("AVORY_VIRGL_PROFILE");
++   dctx->profile.enabled = profiling && strcmp(profiling, "1") == 0;
++   if (dctx->profile.enabled)
++      dctx->profile.epoch_ns = vrend_profile_now();
+ 
+    for (unsigned i = 0; i < VIRGL_MAX_COMMANDS; ++i)
+       assert(decode_table[i]);

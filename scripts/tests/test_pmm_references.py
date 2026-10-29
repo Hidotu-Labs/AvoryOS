@@ -77,6 +77,14 @@ void pmm_zero_pool_drain_all(void);
 size_t pmm_zero_pool_total_cached(void);
 static size_t pmm_get_hhdm_offset(void) { return 0; }
 static void page_zero(void *p) { memset(p,0,PAGE_SIZE); }
+static bool cpu_has_avx2(void) { return false; }
+static bool cpu_has_avx512(void) { return false; }
+static void kernel_fpu_begin(void) {}
+static void kernel_fpu_end(void) {}
+static void page_zero_batch(void **pages, size_t count) {
+ for(size_t i=0;i<count;i++)page_zero(pages[i]);
+}
+static void page_zero_nt_batch(void **pages, size_t count) { page_zero_batch(pages,count); }
 static void pmm_pcp_drain_all(void);
 '''
 # Functions are nonstatic in the actual implementation.

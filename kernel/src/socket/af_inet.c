@@ -161,11 +161,11 @@ static int inet_connect(socket_t *sock, struct sockaddr *addr, int addrlen) {
         wait_queue_entry_t wqe = { .thread = self, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL };
         while (isk->tcp->state == TCP_SYN_SENT && !isk->tcp->error) {
             if (lapic_timer_get_ticks() >= deadline) break;
-            if (self) {
-                self->state = THREAD_BLOCKED;
-                self->wakeup_ticks = lapic_timer_get_ticks() + 50;
-            }
             wait_queue_add(sock->wait_queue, &wqe);
+            if (self) {
+                self->wakeup_ticks = deadline;
+                self->state = THREAD_BLOCKED;
+            }
             if (isk->tcp->state != TCP_SYN_SENT || isk->tcp->error) {
                 if (self) {
                     self->state = THREAD_RUNNING;
@@ -674,15 +674,25 @@ static int inet_poll(socket_t *sock, int events) {
             break;
         case TCP_FIN_WAIT_1:
         case TCP_FIN_WAIT_2:
+            /* shutdown(SHUT_WR) closes only the write direction.  The peer
+             * may still send data and its FIN, so recv() must not report
+             * readable while the receive queue is empty: a nonblocking read
+             * returns EAGAIN, and level-triggered pollers would spin. */
+            if ((events & POLLIN) && tcp_readable(isk->tcp)) r |= POLLIN;
+            if (isk->tcp->error) r |= POLLERR;
+            break;
         case TCP_LAST_ACK:
         case TCP_TIME_WAIT:
         case TCP_CLOSED:
+            /* Peer FIN has arrived (LAST_ACK/TIME_WAIT) or the TCB has been
+             * closed/timed out.  Pending data stays readable; otherwise the
+             * next recv() returns EOF or the connection error. */
+            if ((events & POLLIN) && tcp_readable(isk->tcp)) r |= POLLIN;
             r |= POLLHUP;
             if (isk->tcp->error) {
                 r |= POLLERR;
                 if (events & POLLOUT) r |= POLLOUT;
             }
-            if (events & POLLIN) r |= POLLIN;
             break;
         default:
             break;
@@ -763,6 +773,33 @@ static net_family_t inet_family = {
     .create = inet_family_create,
     .next   = NULL,
 };
+
+void inet_diag_describe(socket_t *sock, char *out, size_t outsz) {
+  if (!sock || !sock->sk || !out || outsz < 2)
+    return;
+  inet_sock_t *isk = (inet_sock_t *)sock->sk;
+
+  if (isk->tcp) {
+    struct tcp_tcb *t = isk->tcp;
+    snprintf(out, outsz,
+             " inet:tcp st=%d pc=%d err=%d rx=%lu tx=%lu list=%d",
+             t->state, t->peer_closed ? 1 : 0, t->error,
+             (unsigned long)(t->rx_head - t->rx_tail),
+             (unsigned long)(t->tx_head - t->snd_una),
+             t->state == TCP_LISTEN ? 1 : 0);
+  } else if (isk->udp) {
+    struct udp_socket *u = isk->udp;
+    snprintf(out, outsz, " inet:udp used=%d q=%lu depth=%lu conn=%d",
+             u->used ? 1 : 0,
+             (unsigned long)(u->q_head - u->q_tail),
+             (unsigned long)u->rx_depth, u->connected ? 1 : 0);
+  } else if (isk->raw) {
+    snprintf(out, outsz, " inet:raw readable=%d",
+             raw_icmp_readable(isk->raw) ? 1 : 0);
+  } else {
+    snprintf(out, outsz, " inet:none");
+  }
+}
 
 void af_inet_init(void) {
     raw_icmp_init();

@@ -330,11 +330,8 @@ static int netlink_bind(socket_t *sock, struct sockaddr *addr, int addrlen) {
   nsk->groups = nl->nl_groups;
   spinlock_release(&netlink_lock);
 
-  klog_puts("[NETLINK] bind called: port=");
-  klog_uint64(nsk->portid);
-  klog_puts(" groups=");
-  klog_uint64(nsk->groups);
-  klog_puts("\n");
+  klogf("[NETLINK] bind port=%llu groups=%u\n",
+        (unsigned long long)nsk->portid, nsk->groups);
 
 
   return 0;
@@ -549,9 +546,7 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
   (void)flags;
   (void)dest_addr;
   (void)addrlen;
-  klog_puts("[NETLINK] sendto len=");
-  klog_uint64(len);
-  klog_puts("\n");
+  klogf("[NETLINK] sendto len=%llu\n", (unsigned long long)len);
 
   netlink_sock_t *nsk = sock ? (netlink_sock_t *)sock->sk : NULL;
   if (!nsk)
@@ -887,9 +882,7 @@ int netlink_create(socket_t *sock, int protocol) {
   list_add_tail(&nsk->list, &netlink_sockets);
   spinlock_release(&netlink_lock);
 
-  klog_puts("[OK] AF_NETLINK socket created (protocol=");
-  klog_uint64((uint64_t)protocol);
-  klog_puts(")\n");
+  klogf("[OK] AF_NETLINK socket created (protocol=%d)\n", protocol);
 
   return 0;
 }

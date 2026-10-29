@@ -154,10 +154,7 @@ void pmm_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
         int node = numa_phys_to_node(phys);
         struct numa_node *n = numa_get_node(node);
 
-        struct buddy_block *block = virt_to_buddy(phys);
-        block->order = order;
-        block->magic = n->zone.magic;
-        list_add_tail(&block->node, &n->zone.free_list[order]);
+        buddy_zone_seed_block(&n->zone, phys, order);
 
         n->usable_memory += (1ULL << order) * PAGE_SIZE;
         pmm_usable_memory += (1ULL << order) * PAGE_SIZE;

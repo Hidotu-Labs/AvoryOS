@@ -13,7 +13,6 @@
 #include "drivers/input/mouse.h"
 #include "mm/heap.h"
 #include "lib/string.h"
-#include <linuxkpi/gpu_perf.h>
 #include "mm/pmm.h"
 #include "socket/af_netlink.h"
 #include "fs/sysfs.h"
@@ -33,10 +32,10 @@ static spinlock_t gpu_present_lock;
 /* Task-context presentation gate. Native and imported producer GEMs share
  * each head's immutable staging pair, SET_SCANOUT and front-resource state.
  * Acquire before taking a framebuffer snapshot and retain through publication.
- * Yield with the caller's IRQ state unchanged; never hold an IRQ spinlock
- * across reservation/fence or vblank waits. IRQ/completion paths do not take
- * this gate, so they can make progress while a presenter owns it. */
+ * Contending task contexts park on gpu_scanout_wait; IRQ/completion paths do
+ * not take this gate, so they can make progress while a presenter owns it. */
 static uint32_t gpu_scanout_busy;
+static wait_queue_t gpu_scanout_wait;
 /* Preserve full-snapshot coalescing for uncapped single-output PRIME
  * producers. Multi-output commits are never discarded by another head. */
 static uint64_t gpu_prime_enter_seq;
@@ -68,12 +67,70 @@ static void virgl_scanout_replaced(uint32_t head, uint32_t id) {
     }
 }
 static const struct vgpu_scanout_ops scanout_ops;
+static bool gpu_gate_try_acquire(volatile uint32_t *gate) {
+    uint32_t expected = 0;
+    return __atomic_compare_exchange_n(gate, &expected, 1, false,
+                                       __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+
+/* Wait for a task-context gate without keeping the waiter runnable. The
+ * post-enqueue try closes the release-before-park race; release wakes one
+ * waiter after publishing the free state. */
+static void gpu_gate_wait_acquire(volatile uint32_t *gate,
+                                  wait_queue_t *waiters,
+                                  struct thread *self) {
+    wait_queue_entry_t entry = {.thread = self};
+    for (;;) {
+        if (gpu_gate_try_acquire(gate))
+            return;
+
+        hal_irq_state_t flags = hal_irq_save();
+        if (gpu_gate_try_acquire(gate)) {
+            hal_irq_restore(flags);
+            return;
+        }
+
+        self->wakeup_ticks = 0;
+        self->state = THREAD_BLOCKED;
+        wait_queue_add_tail(waiters, &entry);
+        bool acquired = gpu_gate_try_acquire(gate);
+        if (!acquired) {
+            hal_irq_restore(flags);
+            sched_yield();
+            flags = hal_irq_save();
+        }
+        wait_queue_remove(waiters, &entry);
+        self->wakeup_ticks = 0;
+        if (self->state == THREAD_BLOCKED)
+            self->state = THREAD_RUNNING;
+        hal_irq_restore(flags);
+        if (acquired)
+            return;
+    }
+}
+
 static void gpu_scanout_acquire(void) {
-    while (__atomic_exchange_n(&gpu_scanout_busy, 1, __ATOMIC_ACQUIRE))
-        sched_yield();
+    if (gpu_gate_try_acquire(&gpu_scanout_busy))
+        return;
+
+    struct thread *self = sched_get_current();
+    if (self && !self->is_idle && hal_irq_enabled()) {
+        gpu_gate_wait_acquire(&gpu_scanout_busy, &gpu_scanout_wait, self);
+        return;
+    }
+
+    /* Early boot and IRQ-disabled callers cannot park. Preserve their old
+     * progress path; normal graphics task contexts use the wait queue above. */
+    while (!gpu_gate_try_acquire(&gpu_scanout_busy)) {
+        if (hal_irq_enabled())
+            sched_yield();
+        else
+            __asm__ volatile("pause" ::: "memory");
+    }
 }
 static void gpu_scanout_release(void) {
     __atomic_store_n(&gpu_scanout_busy, 0, __ATOMIC_RELEASE);
+    wait_queue_wake_one(&gpu_scanout_wait);
 }
 static wait_queue_t gpu_worker_wait;
 static bool gpu_worker_started;
@@ -97,13 +154,6 @@ static volatile uint32_t gpu_pending_work;
 #define GPU_WORK_CONTROL (1U << 0)
 #define GPU_WORK_CURSOR  (1U << 1)
 #define GPU_WORK_CONFIG  (1U << 2)
-#define GPU_WORK_PERF    (1U << 3)
-void virtio_gpu_request_perf_dump(void) {
-    if (!gpu_worker_started)
-        return;
-    __atomic_fetch_or(&gpu_pending_work, GPU_WORK_PERF, __ATOMIC_RELEASE);
-    wait_queue_wake_all(&gpu_worker_wait);
-}
 static bool gpu_phase8_started, gpu_phase8_reported;
 static uint64_t gpu_phase8_started_ms;
 /* Protected by gpu_poll_lock. A timeout does not return DMA ownership: the
@@ -199,6 +249,7 @@ static bool handle_batch_completion(void *cookie, uint32_t used) {
 static uint32_t gpu_sync_command_used;
 static bool gpu_sync_command_waiter;
 static uint32_t gpu_command_owner;
+static wait_queue_t gpu_command_owner_wait;
 static wait_queue_t gpu_command_wait;
 static bool handle_sync_completion(void *cookie, uint32_t used) {
     uintptr_t tag = (uintptr_t)cookie;
@@ -233,7 +284,7 @@ static bool response_valid(uint32_t t) {
     return (t >= VIRTIO_GPU_RESP_OK_NODATA && t <= VIRTIO_GPU_RESP_OK_MAP_INFO) ||
            (t >= VIRTIO_GPU_RESP_ERR_UNSPEC && t <= VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
 }
-static void gpu_wait_for_control(uint64_t start) {
+static void gpu_wait_for_control_progress(uint64_t start, const uint64_t *completed) {
     struct thread *self = sched_get_current();
     if (!gpu_worker_started || !self || !hal_irq_enabled()) {
         __asm__ volatile("pause");
@@ -249,7 +300,8 @@ static void gpu_wait_for_control(uint64_t start) {
     self->state = THREAD_BLOCKED;
     wait_queue_add(&gpu_command_wait, &entry);
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
-    bool ready = (!gpu_sync_command_pending && !gpu_batch_pending && !gpu_render_pending) ||
+    bool ready = (completed && gpu.stats.commands_completed != *completed) ||
+        (!gpu_sync_command_pending && !gpu_batch_pending && !gpu_render_pending) ||
         gpu.controlq.last_used_idx != gpu.controlq.used->idx ||
         lapic_timer_get_ms() - start >= GPU_TIMEOUT_MS;
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
@@ -267,6 +319,9 @@ static void gpu_wait_for_control(uint64_t start) {
             self->state = THREAD_RUNNING;
     }
     self->wakeup_ticks = 0;
+}
+static void gpu_wait_for_control(uint64_t start) {
+    gpu_wait_for_control_progress(start, NULL);
 }
 static bool gpu_command_locked(
     const void *req, uint32_t req_len, void *resp, uint32_t resp_len, uint32_t *resp_type) {
@@ -336,33 +391,40 @@ static bool gpu_command_locked(
 }
 static bool
 gpu_command(const void *req, uint32_t req_len, void *resp, uint32_t resp_len, uint32_t *resp_type) {
-    while (__atomic_exchange_n(&gpu_command_owner, 1, __ATOMIC_ACQUIRE)) {
+    while (!gpu_gate_try_acquire(&gpu_command_owner)) {
         /* Console flushing holds its IRQ-saving lock. An earlier command
          * may have parked on this CPU waiting for a control-queue interrupt;
          * spinning here would prevent both its wakeup and its resumption.
-         * Atomic callers must retry later instead of waiting for the owner. */
+         * IRQ-masked callers are atomic and must retry later. */
         if (!hal_irq_enabled())
             return false;
-        if (gpu_worker_started && sched_get_current() && hal_irq_enabled())
-            sched_yield();
-        else
-            __asm__ volatile("pause");
+        struct thread *self = sched_get_current();
+        if (self && !self->is_idle) {
+            gpu_gate_wait_acquire(&gpu_command_owner, &gpu_command_owner_wait,
+                                  self);
+            break;
+        }
+        __asm__ volatile("pause" ::: "memory");
     }
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     bool ok = gpu_command_locked(req, req_len, resp, resp_len, resp_type);
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     __atomic_store_n(&gpu_command_owner, 0, __ATOMIC_RELEASE);
+    wait_queue_wake_one(&gpu_command_owner_wait);
     return ok;
 }
 static bool gpu_command_batch(const void *const *requests, const uint32_t *lengths,
                                uint32_t count) {
-    while (__atomic_exchange_n(&gpu_command_owner, 1, __ATOMIC_ACQUIRE)) {
+    while (!gpu_gate_try_acquire(&gpu_command_owner)) {
         if (!hal_irq_enabled())
             return false;
-        if (gpu_worker_started && sched_get_current() && hal_irq_enabled())
-            sched_yield();
-        else
-            __asm__ volatile("pause");
+        struct thread *self = sched_get_current();
+        if (self && !self->is_idle) {
+            gpu_gate_wait_acquire(&gpu_command_owner, &gpu_command_owner_wait,
+                                  self);
+            break;
+        }
+        __asm__ volatile("pause" ::: "memory");
     }
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     gpu_reap_control_locked();
@@ -419,6 +481,7 @@ static bool gpu_command_batch(const void *const *requests, const uint32_t *lengt
 release:
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     __atomic_store_n(&gpu_command_owner, 0, __ATOMIC_RELEASE);
+    wait_queue_wake_one(&gpu_command_owner_wait);
     return ok;
 }
 static struct pci_device *find_gpu(void) {
@@ -676,7 +739,9 @@ bool virtio_gpu_init(void) {
     memset(&gpu, 0, sizeof(gpu));
     spinlock_init(&gpu_poll_lock);
     spinlock_init(&gpu_present_lock);
+    wait_queue_init(&gpu_scanout_wait);
     wait_queue_init(&gpu_worker_wait);
+    wait_queue_init(&gpu_command_owner_wait);
     wait_queue_init(&gpu_command_wait);
     struct pci_device *pci = find_gpu();
     if (!pci) {
@@ -1355,8 +1420,6 @@ static void virtio_gpu_worker(void) {
             gpu.stats.watchdog_polls++;
         if (pending & GPU_WORK_CONFIG)
             gpu_handle_config_event();
-        if (pending & GPU_WORK_PERF)
-            gpu_perf_dump();
         gpu_drain_completions();
         gpu_render_reclaim();
         gpu_collect_scanouts();
@@ -2326,7 +2389,7 @@ int virtio_gpu_wait_idle(bool nowait) {
 
 static int gpu_render_wait_objects(struct drm_gem_object **objects, uint32_t count,
                                   uint32_t context, bool nowait) {
-    uint64_t target = 0;
+    uint64_t fences[GPU_RENDER_JOBS] = {0};
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     gpu_reap_control_locked();
     /* Every active slot owns BO references and one bit in each referenced BO.
@@ -2347,12 +2410,37 @@ static int gpu_render_wait_objects(struct drm_gem_object **objects, uint32_t cou
         struct gpu_render_job *job = &gpu_render_jobs[i];
         if (!(pending & candidates & (1U << i)))
             continue;
-        if (job->fence > target) target = job->fence;
+        fences[i] = job->fence;
     }
+    uint64_t completed;
     bool failed = gpu_render_failed;
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     if (failed) return -5;
-    return target ? gpu_render_wait_fence(target, nowait) : 0;
+    if (!(pending & candidates)) return 0;
+    if (nowait) return -16;
+    uint64_t start = lapic_timer_get_ms();
+    /* A BO wait covers its producers, not an entire device fence prefix.
+     * Snapshot fence identities as well as slots: completion/cleanup can
+     * immediately reuse a slot for unrelated work while this caller sleeps. */
+    for (;;) {
+        LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+        gpu_reap_control_locked();
+        bool ready = true;
+        for (uint32_t i = 0; i < GPU_RENDER_JOBS; i++)
+            if (fences[i] && gpu_render_jobs[i].state == 1 &&
+                gpu_render_jobs[i].fence == fences[i])
+                ready = false;
+        failed = gpu_render_failed;
+        completed = gpu.stats.commands_completed;
+        LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+        if (failed) return -5;
+        if (ready) return 0;
+        if (lapic_timer_get_ms() - start >= GPU_TIMEOUT_MS) return -5;
+        /* A worker may reap the producer before waiter registration while
+         * unrelated jobs remain pending. Detect that progress after enqueue
+         * so this wait cannot sleep until an unrelated job or the watchdog. */
+        gpu_wait_for_control_progress(start, &completed);
+    }
 }
 
 int virtio_gpu_render_wait(struct drm_gem_object **objects, uint32_t count,

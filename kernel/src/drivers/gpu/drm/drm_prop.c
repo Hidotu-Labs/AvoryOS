@@ -159,7 +159,9 @@ int ascentdrm_ioctl_obj_getprops(struct drm_device *dev, uint64_t arg) {
   struct drm_mode_object *mobj = NULL;
   struct drm_mode_object *iter;
   list_for_each_entry(iter, &dev->kms_objects, list) {
-    if (iter->id == req->obj_id) {
+    if (iter->id == req->obj_id &&
+        !(iter->type == DRM_MODE_OBJECT_FB &&
+          ((struct drm_framebuffer *)iter)->destroying)) {
       mobj = iter;
       break;
     }
@@ -377,7 +379,8 @@ int ascentdrm_atomic_apply_prop(struct drm_device *dev,
         struct drm_mode_object *fbobj;
         list_for_each_entry(fbobj, &dev->kms_objects, list) {
           if (fbobj->type == DRM_MODE_OBJECT_FB &&
-              fbobj->id == (uint32_t)value) {
+              fbobj->id == (uint32_t)value &&
+              !((struct drm_framebuffer *)fbobj)->destroying) {
             new_fb = (struct drm_framebuffer *)fbobj;
             break;
           }

@@ -6,8 +6,6 @@
 #include <linuxkpi/native_prime.h>
 #include <linuxkpi/native_vfs.h>
 
-extern struct drm_framebuffer *ascentdrm_framebuffer_create(
-    struct drm_device *dev, struct drm_mode_fb_cmd *cmd);
 extern void ascentdrm_framebuffer_free(struct drm_device *dev,
                                      struct drm_framebuffer *fb);
 

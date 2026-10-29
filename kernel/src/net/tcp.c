@@ -1188,7 +1188,7 @@ struct tcp_tcb *tcp_accept(struct tcp_tcb *t, bool nonblock)
              * otherwise lose its wake (wake sees RUNNING). */
             if (cur) {
                 cur->state = THREAD_BLOCKED;
-                cur->wakeup_ticks = lapic_timer_get_ticks() + 100;
+                cur->wakeup_ticks = 0;
             }
             wait_queue_add(wq, &entry);
             if (t->accept_head != t->accept_tail) {
@@ -1345,7 +1345,7 @@ int tcp_send(struct tcp_tcb *t, const void *buf, size_t len, bool nonblock)
                  * before add + recheck space so an ACK cannot be lost. */
                 if (cur) {
                     cur->state = THREAD_BLOCKED;
-                    cur->wakeup_ticks = lapic_timer_get_ticks() + 50;
+                    cur->wakeup_ticks = 0;
                 }
                 wait_queue_add(wq, &entry);
                 {
@@ -1514,7 +1514,7 @@ int tcp_recv(struct tcp_tcb *t, void *buf, size_t len, bool nonblock)
              * data takes this same lock before waking us. */
             if (cur) {
                 cur->state = THREAD_BLOCKED;
-                cur->wakeup_ticks = lapic_timer_get_ticks() + 100;
+                cur->wakeup_ticks = 0;
             }
             wait_queue_add(wq, &entry);
             if ((t->rx_head - t->rx_tail) != 0 || !t->used || t->peer_closed || t->error) {

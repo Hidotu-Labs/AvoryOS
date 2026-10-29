@@ -185,9 +185,11 @@ static bool sysfs_find_devpath(vfs_node_t *dir, vfs_node_t *target,
                                char *path, size_t used, unsigned depth) {
   if (dir == target) return true;
   if (depth >= 32) return false;
-  for (uint32_t index = 0;; index++) {
-    struct dirent *entry = vfs_readdir(dir, index);
+  uint64_t cookie = 0;
+  for (;;) {
+    struct dirent *entry = vfs_readdir(dir, cookie);
     if (!entry) break;
+    cookie = entry->d_off;
     char name[128];
     memcpy(name, entry->name, sizeof(name));
     name[sizeof(name) - 1] = 0;
@@ -1347,15 +1349,15 @@ static void sysfs_remove_file_child(vfs_node_t *dir, vfs_node_t *child) {
 static void sysfs_remove_children(vfs_node_t *dir) {
   for (;;) {
     bool removed = false;
-    uint32_t index = 0;
+    uint64_t cookie = 0;
     struct dirent *de;
 
-    while ((de = vfs_readdir(dir, index)) != NULL) {
+    while ((de = vfs_readdir(dir, cookie)) != NULL) {
+      cookie = de->d_off;
       char name[128];
       vfs_node_t *child;
 
       if (strcmp(de->name, ".") == 0 || strcmp(de->name, "..") == 0) {
-        index++;
         continue;
       }
       /* Copy before anything can recurse: ramfs_readdir returns a shared
@@ -1365,7 +1367,6 @@ static void sysfs_remove_children(vfs_node_t *dir) {
 
       child = vfs_finddir(dir, name);
       if (!child) {
-        index++;
         continue;
       }
       if ((child->flags & FS_TYPE_MASK) == FS_DIRECTORY) {

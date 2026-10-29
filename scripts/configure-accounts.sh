@@ -7,6 +7,14 @@ ROOTFS_DIR=${1:?usage: configure-accounts.sh ROOTFS_DIR}
 
 DEFAULT_SHELL="/bin/bash"
 
+# AvoryOS uses BusyBox init rather than systemd as PID 1. Replace Arch's
+# timedate1 D-Bus activation entry (which runs /bin/false and delegates to
+# systemd) with direct activation of systemd-timedated. Provision this into the
+# image so boot does not need a shell here-document to rewrite the service.
+mkdir -p "${ROOTFS_DIR}/usr/share/dbus-1/system-services"
+install -m 0644 "${ROOT_DIR}/config/dbus/org.freedesktop.timedate1.service" \
+    "${ROOTFS_DIR}/usr/share/dbus-1/system-services/org.freedesktop.timedate1.service"
+
 # /tmp is mounted fresh at boot, hiding directories from the rootfs image.
 # KWin's Xwayland launcher requires these shared socket directories to exist;
 # rcS calls avory-early-init before starting desktop services. Preserve other

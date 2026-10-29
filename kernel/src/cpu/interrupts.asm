@@ -72,7 +72,7 @@ ISR_NOERRCODE 48
 ; Reschedule IPI vector
 ISR_NOERRCODE 49
 
-; TLB shootdown IPI vector
+; HPET watchdog vector
 ISR_NOERRCODE 50
 
 ; Dynamically allocated MSI/MSI-X device vectors.

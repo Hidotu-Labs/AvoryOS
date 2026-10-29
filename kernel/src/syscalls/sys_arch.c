@@ -1,10 +1,14 @@
-#include "mm/zram.h"
 // Architecture Syscalls: arch_prctl
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
+#include "../cpu/isr.h"
 #include "../cpu/msr.h"
 #include "../drivers/timer/rtc.h"
+#include "../mm/heap.h"
+#include "../mm/pmm.h"
+#include "../mm/vma.h"
 #include "../mm/vmm.h"
+#include "../mm/vmm_internal.h"
 #include "../sched/sched.h"
 #include "syscall.h"
 #include <stdint.h>
@@ -348,40 +352,244 @@ static uint64_t sys_time(uint64_t tloc_ptr, uint64_t a1, uint64_t a2,
   return sec;
 }
 
+#define MCL_CURRENT 1
+#define MCL_FUTURE 2
+#define MLOCK_ONFAULT 1
+
+struct mlock_vma_range {
+  uint64_t start;
+  uint64_t end;
+  uint64_t prot;
+};
+
+static bool mlock_snapshot_vmas(struct vma *v, struct mlock_vma_range *ranges,
+                                size_t capacity, size_t *count) {
+  if (!v)
+    return true;
+  if (!mlock_snapshot_vmas(v->left, ranges, capacity, count))
+    return false;
+  if (*count == capacity)
+    return false;
+  ranges[*count].start = v->start;
+  ranges[*count].end = v->end;
+  ranges[*count].prot = v->prot;
+  (*count)++;
+  return mlock_snapshot_vmas(v->right, ranges, capacity, count);
+}
+
+/* Validate coverage before touching any pages. Linux reports ENOMEM when an
+ * mlock range contains an unmapped hole. */
+static bool mlock_range_mapped(struct mm_struct *mm, uint64_t start,
+                               uint64_t end) {
+  uint64_t cursor = start;
+  while (cursor < end) {
+    struct vma *v = vma_find(&mm->vmas, cursor);
+    if (!v || v->end <= cursor)
+      return false;
+    cursor = v->end < end ? v->end : end;
+  }
+  return true;
+}
+
+static uint64_t mlock_apply_range(struct thread *thread, uint64_t start,
+                                  uint64_t end, bool lock_pages) {
+  if (!thread || !thread->mm)
+    return (uint64_t)-12; // ENOMEM
+  struct mm_struct *mm = thread->mm;
+  uint64_t *pml4 = thread->cr3 ? (uint64_t *)thread->cr3
+                               : vmm_get_active_pml4();
+  if (!mm || !pml4)
+    return (uint64_t)-12; // ENOMEM
+
+  spinlock_acquire(&mm->lock);
+  bool mapped = mlock_range_mapped(mm, start, end);
+  spinlock_release(&mm->lock);
+  if (!mapped)
+    return (uint64_t)-12; // ENOMEM
+
+  if (lock_pages) {
+    struct registers synthetic_regs = {0};
+    /* mlock makes the covered pages resident. Use the ordinary fault path so
+     * demand-zero, file-backed, and compressed pages follow their normal
+     * allocation and swap-in rules. PROT_NONE and LinuxKPI VMAs have no
+     * generic fault path here; their pages are not candidates for zram. */
+    for (uint64_t va = start; va < end; va += PAGE_SIZE) {
+      spinlock_acquire(&mm->lock);
+      struct vma *v = vma_find(&mm->vmas, va);
+      bool covered = v != NULL;
+      bool faultable = v && v->prot && !v->linux_vma;
+      uint64_t prot = v ? v->prot : 0;
+      vmm_lock_acquire_for(pml4, va);
+      uint64_t *leaf = vmm_get_leaf_entry_ptr(pml4, va);
+      bool resident = leaf && (*leaf & PAGE_FLAG_PRESENT);
+      if (resident)
+        *leaf |= PAGE_FLAG_MLOCKED;
+      vmm_lock_release();
+      spinlock_release(&mm->lock);
+      if (!covered)
+        return (uint64_t)-12;
+      uint64_t fault_code = 0x4; // user read, not-present
+      if (!(prot & 0x1)) {
+        if (prot & 0x2)
+          fault_code = 0x6; // user write, not-present
+        else if (prot & 0x4)
+          fault_code = 0x14; // user instruction fetch, not-present
+      }
+      if (faultable && !resident) {
+        bool faulted = false;
+        for (unsigned retry = 0; retry < 3; retry++) {
+          if (vmm_handle_page_fault(va, fault_code, &synthetic_regs) != 0)
+            break;
+          spinlock_acquire(&mm->lock);
+          vmm_lock_acquire_for(pml4, va);
+          leaf = vmm_get_leaf_entry_ptr(pml4, va);
+          if (leaf && (*leaf & PAGE_FLAG_PRESENT)) {
+            *leaf |= PAGE_FLAG_MLOCKED;
+            faulted = true;
+          }
+          vmm_lock_release();
+          spinlock_release(&mm->lock);
+          if (faulted)
+            break;
+        }
+        if (!faulted)
+          return (uint64_t)-12;
+      }
+    }
+  } else {
+    /* Unlocking a range never faults pages in. Clear its markers under the
+     * same lock order used by reclaim, so a racing compressor either sees the
+     * lock or wins before munlock returns. */
+    spinlock_acquire(&mm->lock);
+    if (!mlock_range_mapped(mm, start, end)) {
+      spinlock_release(&mm->lock);
+      return (uint64_t)-12;
+    }
+    for (uint64_t va = start; va < end; va += PAGE_SIZE) {
+      vmm_lock_acquire_for(pml4, va);
+      uint64_t *leaf = vmm_get_leaf_entry_ptr(pml4, va);
+      if (leaf)
+        *leaf &= ~PAGE_FLAG_MLOCKED;
+      vmm_lock_release();
+    }
+    spinlock_release(&mm->lock);
+  }
+  return 0;
+}
+
+static bool mlock_bounds(uint64_t addr, uint64_t len, uint64_t *start,
+                         uint64_t *end) {
+  if (!len) {
+    *start = *end = 0;
+    return true;
+  }
+  if (addr > USER_SPACE_LIMIT || len > USER_SPACE_LIMIT + 1 - addr)
+    return false;
+  uint64_t raw_end = addr + len;
+  *start = addr & ~(PAGE_SIZE - 1ULL);
+  *end = (raw_end + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
+  return *end >= raw_end && *end <= USER_SPACE_LIMIT + 1;
+}
+
 static uint64_t sys_mlock(uint64_t addr, uint64_t len, uint64_t a2, uint64_t a3,
                           uint64_t a4, uint64_t a5) {
-  (void)addr;
-  (void)len;
   (void)a2;
   (void)a3;
   (void)a4;
   (void)a5;
-  // No page-pinning ABI exists yet: never promise locked pages to swap users.
-  return zram_is_enabled() ? (uint64_t)-95 : 0;
+  struct thread *thread = sched_get_current();
+  uint64_t start, end;
+  if (!mlock_bounds(addr, len, &start, &end))
+    return (uint64_t)-12; // ENOMEM
+  return start == end ? 0 : mlock_apply_range(thread, start, end, true);
 }
 
 static uint64_t sys_munlock(uint64_t addr, uint64_t len, uint64_t a2,
                             uint64_t a3, uint64_t a4, uint64_t a5) {
-  (void)addr;
-  (void)len;
   (void)a2;
   (void)a3;
   (void)a4;
   (void)a5;
-  // Stub: pretend we unlocked the memory
-  return 0;
+  struct thread *thread = sched_get_current();
+  uint64_t start, end;
+  if (!mlock_bounds(addr, len, &start, &end))
+    return (uint64_t)-12; // ENOMEM
+  return start == end ? 0 : mlock_apply_range(thread, start, end, false);
 }
 
 static uint64_t sys_mlockall(uint64_t flags, uint64_t a1, uint64_t a2,
                              uint64_t a3, uint64_t a4, uint64_t a5) {
-  (void)flags;
   (void)a1;
   (void)a2;
   (void)a3;
   (void)a4;
   (void)a5;
-  // Memory pinning is not implemented.
-  return zram_is_enabled() ? (uint64_t)-95 : 0;
+  struct thread *thread = sched_get_current();
+  if (!thread || !thread->mm)
+    return (uint64_t)-12;
+  if ((flags & ~(MCL_CURRENT | MCL_FUTURE)) != 0 ||
+      !(flags & (MCL_CURRENT | MCL_FUTURE)))
+    return (uint64_t)-22; // EINVAL
+
+  struct mm_struct *mm = thread->mm;
+  spinlock_acquire(&mm->lock);
+  bool prior_future = mm->mlockall_future;
+  /* Protect against reclaim while MCL_CURRENT pages are faulted in and
+   * marked. zram checks this state under mm->lock. */
+  mm->mlockall_future = true;
+  size_t capacity = (size_t)mm->vmas.count;
+  spinlock_release(&mm->lock);
+
+  if (flags & MCL_CURRENT) {
+    struct mlock_vma_range *ranges = NULL;
+    if (capacity) {
+      if (capacity > SIZE_MAX / sizeof(*ranges)) {
+        spinlock_acquire(&mm->lock);
+        mm->mlockall_future = prior_future;
+        spinlock_release(&mm->lock);
+        return (uint64_t)-12;
+      }
+      ranges = kmalloc(capacity * sizeof(*ranges));
+      if (!ranges) {
+        spinlock_acquire(&mm->lock);
+        mm->mlockall_future = prior_future;
+        spinlock_release(&mm->lock);
+        return (uint64_t)-12;
+      }
+    }
+
+    size_t count = 0;
+    spinlock_acquire(&mm->lock);
+    bool snapshot_ok = mlock_snapshot_vmas(mm->vmas.root, ranges, capacity,
+                                           &count);
+    spinlock_release(&mm->lock);
+    if (!snapshot_ok) {
+      kfree(ranges);
+      spinlock_acquire(&mm->lock);
+      mm->mlockall_future = prior_future;
+      spinlock_release(&mm->lock);
+      return (uint64_t)-12;
+    }
+    for (size_t i = 0; i < count; i++) {
+      if (!ranges[i].prot)
+        continue;
+      uint64_t ret = mlock_apply_range(thread, ranges[i].start,
+                                       ranges[i].end, true);
+      if (ret) {
+        kfree(ranges);
+        spinlock_acquire(&mm->lock);
+        mm->mlockall_future = prior_future;
+        spinlock_release(&mm->lock);
+        return ret;
+      }
+    }
+    kfree(ranges);
+  }
+
+  spinlock_acquire(&mm->lock);
+  mm->mlockall_future = (flags & MCL_FUTURE) != 0;
+  spinlock_release(&mm->lock);
+  return 0;
 }
 
 static uint64_t sys_munlockall(uint64_t a0, uint64_t a1, uint64_t a2,
@@ -392,20 +600,62 @@ static uint64_t sys_munlockall(uint64_t a0, uint64_t a1, uint64_t a2,
   (void)a3;
   (void)a4;
   (void)a5;
-  // Stub: pretend we unlocked all memory
+  struct thread *thread = sched_get_current();
+  if (!thread || !thread->mm)
+    return (uint64_t)-12;
+  struct mm_struct *mm = thread->mm;
+  uint64_t *pml4 = thread->cr3 ? (uint64_t *)thread->cr3
+                               : vmm_get_active_pml4();
+  spinlock_acquire(&mm->lock);
+  mm->mlockall_future = false;
+  vmm_lock_acquire_for(pml4, 0);
+  for (size_t i = 0; i < 256; i++) {
+    if (!(pml4[i] & PAGE_FLAG_PRESENT))
+      continue;
+    uint64_t *pdpt = (uint64_t *)(pmm_get_hhdm_offset() +
+                                  (pml4[i] & PAGE_MASK));
+    for (size_t j = 0; j < 512; j++) {
+      if (!(pdpt[j] & PAGE_FLAG_PRESENT))
+        continue;
+      if (pdpt[j] & PAGE_FLAG_PS) {
+        pdpt[j] &= ~PAGE_FLAG_MLOCKED;
+        continue;
+      }
+      uint64_t *pd = (uint64_t *)(pmm_get_hhdm_offset() +
+                                  (pdpt[j] & PAGE_MASK));
+      for (size_t k = 0; k < 512; k++) {
+        if (!(pd[k] & PAGE_FLAG_PRESENT))
+          continue;
+        if (pd[k] & PAGE_FLAG_PS) {
+          pd[k] &= ~PAGE_FLAG_MLOCKED;
+          continue;
+        }
+        uint64_t *pt = (uint64_t *)(pmm_get_hhdm_offset() +
+                                    (pd[k] & PAGE_MASK));
+        for (size_t l = 0; l < 512; l++)
+          pt[l] &= ~PAGE_FLAG_MLOCKED;
+      }
+    }
+  }
+  vmm_lock_release();
+  spinlock_release(&mm->lock);
   return 0;
 }
 
 static uint64_t sys_mlock2(uint64_t addr, uint64_t len, uint64_t flags,
                            uint64_t a3, uint64_t a4, uint64_t a5) {
-  (void)addr;
-  (void)len;
-  (void)flags;
   (void)a3;
   (void)a4;
   (void)a5;
-  // Memory pinning is not implemented.
-  return zram_is_enabled() ? (uint64_t)-95 : 0;
+  if (flags & ~MLOCK_ONFAULT)
+    return (uint64_t)-22; // EINVAL
+  if (flags & MLOCK_ONFAULT)
+    return (uint64_t)-95; // EOPNOTSUPP until nonresident range metadata exists
+  struct thread *thread = sched_get_current();
+  uint64_t start, end;
+  if (!mlock_bounds(addr, len, &start, &end))
+    return (uint64_t)-12; // ENOMEM
+  return start == end ? 0 : mlock_apply_range(thread, start, end, true);
 }
 
 // membarrier(cmd, flags, cpu_id) - syscall 324

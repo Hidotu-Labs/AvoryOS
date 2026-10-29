@@ -847,6 +847,10 @@ vmm_unmap_kind_t vmm_unmap_page_locked(uint64_t *pml4, uint64_t virtual_addr,
   if (swap_slot) {
     pt_virt[pt_index] = 0;
     zram_slot_put(swap_slot);
+    /* Clearing a software swap PTE changes the address-space translation
+     * state too. Queue it with present-page unmaps so the batch drain below
+     * can invalidate any cached walk before the PTE storage is reused. */
+    tlb_flush_deferred(virtual_addr, (uint64_t)pml4);
     if (frame_out) *frame_out = 0;
     return VMM_UNMAP_4K; /* sweep table, but no physical frame to free */
   }

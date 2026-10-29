@@ -398,7 +398,7 @@ static int readlink(vfs_node_t *node, char *buffer, uint32_t size) {
   if (err > 0) { if ((uint32_t)err > size) err = size; memcpy(buffer, scratch, err); }
   kfree(scratch); return err;
 }
-static struct dirent *readdir(vfs_node_t *node, uint32_t index) {
+static struct dirent *readdir(vfs_node_t *node, uint64_t index) {
   struct fuse_inode *n = inode_data(node);
   if (inode_open(node)) return NULL;
   uint8_t *data = kmalloc(8192);

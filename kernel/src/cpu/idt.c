@@ -146,7 +146,7 @@ void idt_init(void) {
   // Reschedule IPI vector
   idt_set_gate(49, (uint64_t)isr49, sel, flags);
 
-  // TLB shootdown IPI vector
+  // HPET watchdog vector (TLB shootdowns use a higher-priority vector).
   idt_set_gate(50, (uint64_t)isr50, sel, flags);
 
   extern void *isr_dynamic_stub_table[];

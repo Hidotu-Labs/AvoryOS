@@ -302,13 +302,20 @@ ssize_t udp_recvfrom(struct udp_socket *s, void *buf, size_t len,
 
         if (nonblocking) return -11;
         if (timeout_ms > 0 && lapic_timer_get_ticks() >= deadline) return -11;
+        if (self && thread_has_pending_signal(self)) return -4;
 
         if (s->wait_queue) {
             wait_queue_t *wq = (wait_queue_t *)s->wait_queue;
             wait_queue_entry_t entry = { .thread = self, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL };
-            if (self)
-                self->state = THREAD_BLOCKED;
+            /* Link first, then publish the sleep and recheck under the socket
+             * lock. A timer before publication leaves this thread runnable;
+             * a packet before or after publication is found by the recheck or
+             * wakes the registered waiter. */
             wait_queue_add(wq, &entry);
+            if (self) {
+                self->wakeup_ticks = timeout_ms > 0 ? deadline : 0;
+                self->state = THREAD_BLOCKED;
+            }
             spinlock_acquire(&s->lock);
             bool empty = s->q_head == s->q_tail;
             bool alive = s->used;
@@ -329,17 +336,13 @@ ssize_t udp_recvfrom(struct udp_socket *s, void *buf, size_t len,
                 wait_queue_remove(wq, &entry);
                 continue;
             }
-            if (self) {
-                if (timeout_ms > 0)
-                    self->wakeup_ticks = deadline;
-                else
-                    self->wakeup_ticks = lapic_timer_get_ticks() + 100;
-            }
             sched_yield();
-            if (self) self->wakeup_ticks = 0;
+            if (self) {
+                self->wakeup_ticks = 0;
+                if (self->state == THREAD_BLOCKED)
+                    self->state = THREAD_RUNNING;
+            }
             wait_queue_remove(wq, &entry);
-            if (self && self->state == THREAD_BLOCKED)
-                self->state = THREAD_RUNNING;
         } else {
             if (timeout_ms > 0 && self)
                 self->wakeup_ticks = deadline;

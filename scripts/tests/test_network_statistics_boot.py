@@ -5,8 +5,11 @@ import importlib.util, subprocess, shutil, os, re, http.server, threading, hashl
 ROOT=Path(__file__).resolve().parents[2]
 OUT=ROOT/'build/network-statistics-boot'
 NIC=os.environ.get('AVORY_NETWORK_TEST_NIC','rtl8139')
-if NIC not in ('rtl8139','e1000'):raise ValueError('AVORY_NETWORK_TEST_NIC must be rtl8139 or e1000')
+if NIC not in ('rtl8139','e1000','e1000e'):raise ValueError('AVORY_NETWORK_TEST_NIC must be rtl8139, e1000 or e1000e')
+IRQ=os.environ.get('AVORY_NETWORK_TEST_IRQ','auto')
+if IRQ not in ('auto','intx','msi'):raise ValueError('AVORY_NETWORK_TEST_IRQ must be auto, intx or msi')
 if NIC!='rtl8139':OUT=OUT/NIC
+if NIC=='e1000e':OUT=OUT/IRQ
 OUT.mkdir(parents=True,exist_ok=True)
 TREE=ROOT/'build/arch/rootfs'
 spec=importlib.util.spec_from_file_location('boot',ROOT/'scripts/syscall-restart-boot.py')
@@ -75,14 +78,21 @@ def setup(root):
         if (TREE/file).is_file():shutil.copy2(TREE/file,root/file)
     for binary in ['sh','mkdir','sleep','cat','kill','grep','rm','mount','chmod','cp','nohup','pidof','tail','sha256sum']:
         (root/'bin'/binary).symlink_to('/usr/bin/busybox')
-    builder=(ROOT/'scripts/setup-arch.sh').read_text()
-    rc=builder.split("cat <<'EOF' > \"${ROOTFS_DIR}/etc/init.d/rcS\"\n",1)[1].split('\nEOF',1)[0]
-    rc=rc.split('# --- pipewire system instance',1)[0]
+    (root/'var').mkdir(exist_ok=True)
+    rc='''#!/bin/sh
+mkdir -p /run/dbus /run/NetworkManager /var/log /var/lib/dbus /var/lib/NetworkManager
+[ -e /var/lib/dbus/machine-id ] || cp -f /etc/machine-id /var/lib/dbus/machine-id
+if [ ! -S /run/dbus/system_bus_socket ]; then dbus-daemon --system --fork; fi
+NetworkManager --no-daemon >>/var/log/NetworkManager.log 2>&1 &
+sleep 5
+'''
     (root/'rcS').write_text(rc)
     (root/'probe.sh').write_text(PROBE.replace('@HTTP_PORT@',str(server.server_port)))
 PROBE=r'''#!/bin/sh
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export HOME=/root LC_ALL=C PAGER=cat NM_CLI_PAGER=cat
+mount -t tmpfs tmpfs /var 2>/dev/null || true
+mkdir -p /var/log /var/lib/dbus /var/lib/NetworkManager
 sh /rcS
 sleep 2
 nmcli general
@@ -128,7 +138,7 @@ def big_run(args):
         with Path(args[-1]).open('r+b') as f:f.truncate(512*1024**2)
     run(args)
 boot.run=big_run
-disk,iso=boot.prepare(setup)
+disk,iso=boot.prepare(setup,kernel_cmdline=f'kpi_amdgpu=0 init=/bin/probe-init e1000e_irq={IRQ}')
 cmd=['qemu-system-x86_64','-M','q35','-cpu','host','-enable-kvm','-smp','4','-m','1G','-drive',f'if=pflash,unit=0,format=raw,file={ROOT}/edk2-ovmf/ovmf-code-x86_64.fd,readonly=on','-cdrom',str(iso),'-boot','d','-drive',f'file={disk},format=raw,if=none,id=probe','-device','nvme,serial=network-probe,drive=probe','-device',f'{NIC},netdev=n0,addr=08.0','-netdev','user,id=n0','-vga','none','-device','virtio-vga,addr=06.0','-display','none','-serial',f'file:{OUT}/serial.log','-monitor','none','-no-reboot']
 with (OUT/'host.log').open('wb') as host:
     p=subprocess.Popen(cmd,stdout=host,stderr=host)
@@ -136,9 +146,14 @@ with (OUT/'host.log').open('wb') as host:
     finally:
         if p.poll() is None:p.terminate();p.wait(timeout=5)
 log=(OUT/'serial.log').read_text(errors='replace')
-print(log[log.index('NET_PROBE: START'):])
 server.shutdown();server.server_close()
-assert p.returncode==0 and 'NET_PROBE: END status=0' in log
+if p.returncode!=0 or 'NET_PROBE: END status=0' not in log:
+    print(log[log.index('NET_PROBE: START'):])
+    raise AssertionError(f'NetworkManager guest failed; see {OUT}/serial.log')
+assert re.search(r'DEVICE_PATH=/org/freedesktop/NetworkManager/Devices/\d+',log), 'NetworkManager did not discover eth0'
+if NIC=='e1000e':
+    mode='MSI vector' if IRQ in ('auto','msi') else 'INTx IRQ'
+    assert f'E1000E] eth0 RX/TX enabled; {mode}' in log, 'unexpected e1000e interrupt mode'
 assert hashlib.sha256(b'x'*262144).hexdigest()+'  /tmp/network-payload' in log, 'HTTP payload integrity failure'
 samples=re.findall(r"'TxBytes': <uint64 (\d+)>, 'RxBytes': <uint64 (\d+)>",log)
 assert len(samples)==2, 'missing NetworkManager statistics samples'
@@ -146,4 +161,5 @@ before,after=[tuple(map(int,v)) for v in samples]
 assert after[0]>before[0] and after[1]-before[1]>=262144, 'counters did not track download'
 if os.environ.get('AVORY_NETWORK_ICON_PROBE'):assert 'ICON_EXIT=0' in log and 'PRIMARY_EMPTY=1' in log
 if os.environ.get('AVORY_NETWORK_ICON_MODULE_PROBE'):assert 'ICON_BASELINE_EXIT=1' in log and 'ICON_MODULE_EXIT=0' in log
-print(f'PASS: {NIC}: NetworkManager live byte counters, HTTP SHA-256 integrity and optional Plasma external wired icon')
+mode=f' ({IRQ})' if NIC=='e1000e' else ''
+print(f'PASS: {NIC}{mode}: NetworkManager discovery, live byte counters, HTTP SHA-256 integrity and optional Plasma external wired icon')

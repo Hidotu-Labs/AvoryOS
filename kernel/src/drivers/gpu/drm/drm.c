@@ -95,8 +95,9 @@ extern void ascentdrm_gem_object_free(struct drm_device *dev,
 extern struct drm_gem_object *ascentdrm_gem_find_by_handle(struct drm_device *dev,
                                                      uint32_t handle);
 extern void ascentdrm_kms_init(struct drm_device *dev);
-extern struct drm_framebuffer *
-ascentdrm_framebuffer_create(struct drm_device *dev, struct drm_mode_fb_cmd *cmd);
+extern struct drm_framebuffer *ascentdrm_framebuffer_create_for_file(
+    struct drm_file *file, struct drm_device *dev,
+    struct drm_mode_fb_cmd *cmd);
 extern void ascentdrm_framebuffer_free(struct drm_device *dev,
                                  struct drm_framebuffer *fb);
 extern void epoll_notify_event(struct vfs_node *node, uint32_t events);
@@ -187,7 +188,9 @@ static struct drm_mode_object *drm_mode_object_find(struct drm_device *dev,
                                                     uint32_t id) {
   struct drm_mode_object *obj;
   list_for_each_entry(obj, &dev->kms_objects, list) {
-    if (obj->id == id)
+    if (obj->id == id &&
+        !(obj->type == DRM_MODE_OBJECT_FB &&
+          ((struct drm_framebuffer *)obj)->destroying))
       return obj;
   }
   return NULL;
@@ -1724,6 +1727,8 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
           ((uint32_t *)res->encoder_id_ptr)[encoders] = mobj->id;
         encoders++;
       } else if (mobj->type == DRM_MODE_OBJECT_FB) {
+        if (((struct drm_framebuffer *)mobj)->destroying)
+          continue;
         if (res->fb_id_ptr && fbs < res->count_fbs)
           ((uint32_t *)res->fb_id_ptr)[fbs] = mobj->id;
         fbs++;
@@ -2071,7 +2076,8 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     /* Temporarily patch handle to global for drm_framebuffer_create */
     uint32_t saved = cmd->handle;
     cmd->handle = gem->handle;
-    struct drm_framebuffer *fb = ascentdrm_framebuffer_create(dev, cmd);
+    struct drm_framebuffer *fb =
+        ascentdrm_framebuffer_create_for_file(file, dev, cmd);
     cmd->handle = saved;
     if (!fb) {
       klog_debug_puts("[DRM] ADDFB framebuffer create failed\n");
@@ -2093,8 +2099,34 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       spinlock_release(&dev->lock);
       return -1;
     }
+    ((struct drm_framebuffer *)mobj)->destroying = 1;
     spinlock_release(&dev->lock);
     ascentdrm_framebuffer_free(dev, (struct drm_framebuffer *)mobj);
+    return 0;
+  }
+  case DRM_IOCTL_MODE_CLOSEFB: {
+    if (!arg || !vmm_is_user_addr_range_valid(arg,
+                                               sizeof(struct drm_mode_closefb)))
+      return -14; /* EFAULT */
+    struct drm_mode_closefb *closefb = (struct drm_mode_closefb *)arg;
+    if (closefb->pad)
+      return -22; /* EINVAL */
+
+    spinlock_acquire(&dev->lock);
+    struct drm_mode_object *mobj = drm_mode_object_find(dev, closefb->fb_id);
+    if (!mobj || mobj->type != DRM_MODE_OBJECT_FB ||
+        ((struct drm_framebuffer *)mobj)->owner_file != file) {
+      spinlock_release(&dev->lock);
+      return -2; /* ENOENT */
+    }
+    struct drm_framebuffer *fb = (struct drm_framebuffer *)mobj;
+    fb->owner_file = NULL;
+    fb->closed = 1;
+    spinlock_release(&dev->lock);
+
+    /* Keep scanout's framebuffer reference alive; reap it after the next
+     * commit detaches it from every CRTC and plane. */
+    ascentdrm_framebuffer_reap_closed(dev);
     return 0;
   }
   case DRM_IOCTL_MODE_ADDFB2:
@@ -2126,14 +2158,16 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       spinlock_release(&dev->lock);
       return -1;
     }
-    if (crtc_cmd->fb_id && (!fb_obj || fb_obj->type != DRM_MODE_OBJECT_FB))
-      klog_debug_puts("[DRM] SETCRTC warning: fb id not found\n");
-    struct drm_crtc *crtc = (struct drm_crtc *)crtc_obj;
-    if (fb_obj && fb_obj->type == DRM_MODE_OBJECT_FB) {
-      crtc->fb = (struct drm_framebuffer *)fb_obj;
-      if (g_ascent_drm_set_fb_fn)
-        g_ascent_drm_set_fb_fn(crtc->base.id, crtc->fb);
+    if (crtc_cmd->fb_id && (!fb_obj || fb_obj->type != DRM_MODE_OBJECT_FB)) {
+      spinlock_release(&dev->lock);
+      return -2; /* ENOENT */
     }
+    struct drm_crtc *crtc = (struct drm_crtc *)crtc_obj;
+    crtc->fb = fb_obj ? (struct drm_framebuffer *)fb_obj : NULL;
+    if (crtc->primary)
+      crtc->primary->fb = crtc->fb;
+    if (g_ascent_drm_set_fb_fn)
+      g_ascent_drm_set_fb_fn(crtc->base.id, crtc->fb);
     crtc->x = crtc_cmd->x;
     crtc->y = crtc_cmd->y;
     ascentdrm_crtc_set_mode(crtc, crtc_cmd->mode_valid ? &crtc_cmd->mode : NULL);
@@ -2142,6 +2176,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     spinlock_release(&dev->lock);
     drm_console_takeover();
     drm_commit_flipped_crtc(dev, crtc_cmd->crtc_id);
+    ascentdrm_framebuffer_reap_closed(dev);
     return 0;
   }
   case DRM_IOCTL_MODE_PAGE_FLIP: {
@@ -2176,13 +2211,19 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
                               flip->user_data, (flip->flags & DRM_MODE_PAGE_FLIP_EVENT) != 0);
       if (!ret) {
         crtc->fb = (struct drm_framebuffer *)fb_obj;
+        if (crtc->primary)
+          crtc->primary->fb = crtc->fb;
         if (g_ascent_drm_set_fb_fn)
           g_ascent_drm_set_fb_fn(crtc->base.id, crtc->fb);
       }
       spinlock_release(&dev->lock);
+      if (!ret)
+        ascentdrm_framebuffer_reap_closed(dev);
       return ret;
     }
     crtc->fb = (struct drm_framebuffer *)fb_obj;
+    if (crtc->primary)
+      crtc->primary->fb = crtc->fb;
     if (g_ascent_drm_set_fb_fn)
       g_ascent_drm_set_fb_fn(crtc->base.id, crtc->fb);
     if (flip->flags & DRM_MODE_PAGE_FLIP_EVENT) {
@@ -2192,6 +2233,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       spinlock_release(&dev->lock);
       drm_console_takeover();
       drm_commit_flipped_crtc(dev, flip->crtc_id);
+      ascentdrm_framebuffer_reap_closed(dev);
       /* If no virtio hook took ownership, deliver event via legacy path.
        * Pace the event to the next vblank boundary: without this the
        * completion fires the instant the blit finishes and compositors
@@ -2211,6 +2253,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     spinlock_release(&dev->lock);
     drm_console_takeover();
     drm_commit_flipped_crtc(dev, flip->crtc_id);
+    ascentdrm_framebuffer_reap_closed(dev);
     return 0;
   }
 
@@ -2225,6 +2268,7 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       drm_sync_cursor_backend(dev, 0, 0);
       drm_console_takeover();
       drm_commit_atomic(dev);
+      ascentdrm_framebuffer_reap_closed(dev);
     }
     return ret;
   }
@@ -2614,7 +2658,7 @@ static void *drm_render_open(void *metadata) {
 }
 static vfs_node_t *drm_open_instance(vfs_node_t *metadata);
 
-static struct dirent *drm_dri_readdir(vfs_node_t *dir, uint32_t index) {
+static struct dirent *drm_dri_readdir(vfs_node_t *dir, uint64_t index) {
   struct dirent *entry = vfs_readdir_buffer();
 
   memset(entry, 0, sizeof(*entry));

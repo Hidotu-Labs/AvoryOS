@@ -27,6 +27,7 @@
 #include "../sched/wait.h"
 #include "../smp/cpu.h"
 #include "sys_io_shared.h"
+#include "sys_ptrace.h"
 #include "syscall.h"
 #include "sysdiag.h"
 #define TSC_PROBES_ENABLE
@@ -74,6 +75,9 @@ void process_do_exit(uint64_t status) {
       sched_yield();
     }
   }
+  ptrace_tracer_exit(current);
+  current->exit_status = (int)status;
+  ptrace_exit_event(current, (int)status);
   // Robust mutexes held by this thread must be marked OWNER_DIED and woken
   // while the address space is still live; otherwise the next locker spins
   // into musl's a_crash (HLT) on impossible owner state.
@@ -120,7 +124,7 @@ void process_do_exit(uint64_t status) {
     // zombies retains their large struct thread and kernel stack forever.
     // Arrange for the scheduler to reclaim them after this context switches
     // away; ordinary fork/clone processes remain zombies for wait4().
-    if (current->clone_flags & CLONE_THREAD) {
+    if ((current->clone_flags & CLONE_THREAD) && !current->tracer_tid) {
       spinlock_acquire(&tid_lock);
       for (struct thread *t = global_thread_list; t; t = t->global_next) {
         if (t != current && t->tgid == current->tgid && t->tid == current->tgid) {
@@ -168,6 +172,10 @@ void process_do_exit(uint64_t status) {
           }
         }
       }
+      /* A traced task must stay available to its tracer through the exit
+       * wait. Its parent may reap it after the tracer consumes that status. */
+      if (current->tracer_tid)
+        auto_reap = false;
       current->state = auto_reap ? THREAD_DEAD : THREAD_ZOMBIE;
       if (current->parent) {
         uint32_t parent_tgid = current->parent->tgid;
@@ -209,6 +217,7 @@ void process_do_exit(uint64_t status) {
       }
       spinlock_release(&tid_lock);
       klog_debug_puts("[EXITDBG] exit state published\n");
+      ptrace_tracee_exit(current);
       /* Anyone waiting on a pidfd for this process (poll or waitid(P_PIDFD))
        * is woken here to observe its terminal state. */
       pidfd_wake_waiters();

@@ -3,6 +3,7 @@
 #include "sys_io_shared.h"
 #include "syscall.h"
 #include "arch/uaccess.h"
+#include <stdarg.h>
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
 #include "../drivers/serial.h"
@@ -11,6 +12,7 @@
 #include "../lock/spinlock.h"
 #include "../mm/vma.h"
 #include "../sched/sched.h"
+#include "../socket/socket.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -36,6 +38,25 @@ static sysdiag_syscall_error_t g_syscall_errors[SYSDIAG_MAX_SYSCALL_ERRORS];
 static size_t g_syscall_error_count = 0;
 static uint64_t g_syscall_error_total_calls = 0;
 static uint64_t g_syscall_error_evictions = 0;
+
+/* Build variable-length diagnostics first, then dispatch each record once so
+ * fields from simultaneous syscall paths never interleave on the serial log. */
+static void sysdiag_appendf(char *buffer, size_t capacity, size_t *length,
+                            const char *fmt, ...) {
+  if (!buffer || !length || *length >= capacity)
+    return;
+  va_list ap;
+  va_start(ap, fmt);
+  int written = vsnprintf(buffer + *length, capacity - *length, fmt, ap);
+  va_end(ap);
+  if (written < 0)
+    return;
+  size_t remaining = capacity - *length;
+  if ((size_t)written >= remaining)
+    *length = capacity - 1;
+  else
+    *length += (size_t)written;
+}
 
 /* Helper to decode common Linux ioctl request numbers */
 static const char *sysdiag_lookup_ioctl_name(uint32_t req) {
@@ -113,6 +134,7 @@ static const char *sysdiag_lookup_ioctl_name(uint32_t req) {
   case 0xC01064B4: return "DRM_IOCTL_MODE_DESTROY_DUMB";
   case 0xC03864B8: return "DRM_IOCTL_MODE_ATOMIC";
   case 0xC01064C7: return "DRM_IOCTL_MODE_LIST_LESSEES";
+  case 0xC00864D0: return "DRM_IOCTL_MODE_CLOSEFB";
   case 0xC0106443: return "DRM_IOCTL_VIRTGPU_GETPARAM";
   case 0xC0186449: return "DRM_IOCTL_VIRTGPU_GET_CAPS";
 
@@ -322,17 +344,11 @@ void sysdiag_record_missing_syscall(uint64_t syscall_num, struct thread *t,
   spinlock_release(&g_sysdiag_lock);
 
   if (first_time) {
-    klog_puts(KLOG_CLR_YELLOW "[SYSDIAG] MISSING SYSCALL: #" KLOG_CLR_RESET);
-    klog_uint64(syscall_num);
-    klog_puts(" (");
-    klog_puts(name ? name : "unknown");
-    klog_puts(") called by comm='");
-    klog_puts((t && t->comm[0]) ? t->comm : "?");
-    klog_puts("' pid=");
-    klog_uint64(t ? t->tgid : 0);
-    klog_puts(" rip=");
-    klog_hex64(regs ? regs->rip : 0);
-    klog_puts("\n");
+    klogf(KLOG_CLR_YELLOW "[SYSDIAG] MISSING SYSCALL: #" KLOG_CLR_RESET
+          "%llu (%s) called by comm='%s' pid=%u rip=0x%016llX\n",
+          (unsigned long long)syscall_num, name ? name : "unknown",
+          (t && t->comm[0]) ? t->comm : "?", t ? t->tgid : 0,
+          (unsigned long long)(regs ? regs->rip : 0));
   }
 }
 
@@ -410,19 +426,12 @@ void sysdiag_record_missing_ioctl(uint64_t fd, uint32_t request, uint64_t arg,
   if (first_time) {
     char name_buf[48];
     sysdiag_decode_ioctl_name(request, name_buf, sizeof(name_buf));
-    klog_puts(KLOG_CLR_YELLOW "[SYSDIAG] UNHANDLED IOCTL: " KLOG_CLR_RESET);
-    klog_hex32(request);
-    klog_puts(" (");
-    klog_puts(name_buf);
-    klog_puts(") node='");
-    klog_puts(node_name);
-    klog_puts("' comm='");
-    klog_puts((t && t->comm[0]) ? t->comm : "?");
-    klog_puts("' pid=");
-    klog_uint64(t ? t->tgid : 0);
-    klog_puts(" arg=");
-    klog_hex64(arg);
-    klog_puts(handler_called ? " [returned ENOTTY]\n" : " [no handler]\n");
+    klogf(KLOG_CLR_YELLOW "[SYSDIAG] UNHANDLED IOCTL: " KLOG_CLR_RESET
+          "0x%08X (%s) node='%s' comm='%s' pid=%u arg=0x%016llX %s\n",
+          request, name_buf, node_name,
+          (t && t->comm[0]) ? t->comm : "?", t ? t->tgid : 0,
+          (unsigned long long)arg,
+          handler_called ? "[returned ENOTTY]" : "[no handler]");
   }
 }
 
@@ -471,22 +480,11 @@ void sysdiag_record_unimplemented_feature(const char *subsystem,
   spinlock_release(&g_sysdiag_lock);
 
   if (first_time) {
-    klog_puts(KLOG_CLR_YELLOW "[SYSDIAG] UNIMPLEMENTED FEATURE: " KLOG_CLR_RESET);
-    klog_puts(subsystem ? subsystem : "?");
-    klog_puts("::");
-    klog_puts(feature ? feature : "?");
-    klog_puts(" called by comm='");
-    klog_puts((t && t->comm[0]) ? t->comm : "?");
-    klog_puts("' pid=");
-    klog_uint64(t ? t->tgid : 0);
-    klog_puts(" ret=");
-    if (error_code < 0) {
-      klog_puts("-");
-      klog_uint64((uint64_t)-error_code);
-    } else {
-      klog_uint64((uint64_t)error_code);
-    }
-    klog_puts("\n");
+    klogf(KLOG_CLR_YELLOW "[SYSDIAG] UNIMPLEMENTED FEATURE: " KLOG_CLR_RESET
+          "%s::%s called by comm='%s' pid=%u ret=%lld\n",
+          subsystem ? subsystem : "?", feature ? feature : "?",
+          (t && t->comm[0]) ? t->comm : "?", t ? t->tgid : 0,
+          (long long)error_code);
   }
 }
 
@@ -542,28 +540,11 @@ void sysdiag_record_missing_fs_node(const char *path, struct thread *t,
 
   if (first_time) {
     const char *ename = sysdiag_lookup_errno_name(error_code);
-    klog_puts(KLOG_CLR_YELLOW "[SYSDIAG] MISSING PSEUDO-FS: " KLOG_CLR_RESET);
-    klog_puts("op='");
-    klog_puts(op ? op : "?");
-    klog_puts("' path='");
-    klog_puts(path);
-    klog_puts("' comm='");
-    klog_puts(comm);
-    klog_puts("' pid=");
-    klog_uint64(t ? t->tgid : 0);
-    klog_puts(" ret=");
-    if (error_code < 0) {
-      klog_puts("-");
-      klog_uint64((uint64_t)-error_code);
-    } else {
-      klog_uint64((uint64_t)error_code);
-    }
-    if (ename) {
-      klog_puts(" (");
-      klog_puts(ename);
-      klog_puts(")");
-    }
-    klog_puts("\n");
+    klogf(KLOG_CLR_YELLOW "[SYSDIAG] MISSING PSEUDO-FS: " KLOG_CLR_RESET
+          "op='%s' path='%s' comm='%s' pid=%u ret=%lld%s%s%s\n",
+          op ? op : "?", path, comm, t ? t->tgid : 0,
+          (long long)error_code, ename ? " (" : "", ename ? ename : "",
+          ename ? ")" : "");
   }
 }
 
@@ -807,6 +788,33 @@ static bool sysdiag_is_readonly_rlimit_probe(uint64_t num, int64_t err,
   return readonly;
 }
 
+/* Read/write-family syscalls whose EAGAIN names a descriptor that also has a
+ * poll() event.  Return the fd and the readiness bit the call consumed. */
+static bool sysdiag_eagain_fd_event(uint64_t num,
+                                    const struct syscall_regs *regs,
+                                    uint64_t *fd_out, int *events_out) {
+  if (!regs || !fd_out || !events_out)
+    return false;
+  switch (num) {
+  case 0:  /* read */
+  case 17: /* pread64 */
+  case 45: /* recvfrom */
+  case 47: /* recvmsg */
+    *events_out = POLLIN;
+    break;
+  case 1:  /* write */
+  case 18: /* pwrite64 */
+  case 44: /* sendto */
+  case 46: /* sendmsg */
+    *events_out = POLLOUT;
+    break;
+  default:
+    return false;
+  }
+  *fd_out = (uint32_t)regs->rdi;
+  return true;
+}
+
 void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
                                   struct thread *t,
                                   const struct syscall_regs *regs) {
@@ -972,6 +980,55 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
   }
   spinlock_release(&g_sysdiag_lock);
 
+  /* EAGAIN from a descriptor-bearing read/write call: record poll()'s view of
+   * the same fd.  A readiness source that keeps reporting POLLIN/POLLOUT
+   * while the matching syscall keeps returning EAGAIN is exactly the stale
+   * readiness loop that burns a CPU in an event thread.  Sample at most once
+   * per second per (syscall,errno,comm) key so a hot loop stays cheap. */
+  char cap_detail[160] = {0};
+  bool detail_sampled = false;
+  bool poll_claims_ready = false;
+  uint64_t detail_fd = 0;
+  int detail_events = 0;
+  if (error_code == -11 && t &&
+      sysdiag_eagain_fd_event(syscall_num, regs, &detail_fd, &detail_events)) {
+    bool due = true;
+    spinlock_acquire(&g_sysdiag_lock);
+    for (size_t i = 0; i < g_syscall_error_count; i++) {
+      if (g_syscall_errors[i].used &&
+          g_syscall_errors[i].syscall_num == syscall_num &&
+          g_syscall_errors[i].error_code == error_code &&
+          strcmp(g_syscall_errors[i].comm, comm) == 0) {
+        if (now_ms - g_syscall_errors[i].last_detail_ms < 1000)
+          due = false;
+        break;
+      }
+    }
+    spinlock_release(&g_sysdiag_lock);
+
+    if (due) {
+      detail_sampled = true;
+      vfs_node_t *node = fd_node_get(t, detail_fd);
+      if (node) {
+        if ((node->flags & FS_TYPE_MASK) == FS_SOCKET && node->device) {
+          int revents = vfs_poll(node, detail_events) &
+                        (POLLIN | POLLOUT | POLLERR | POLLHUP | POLLNVAL);
+          socket_t *sock = (socket_t *)node->device;
+          char desc[120] = {0};
+          socket_diag_describe(sock, desc, sizeof(desc));
+          if (desc[0]) {
+            snprintf(cap_detail, sizeof(cap_detail),
+                     "fd=%llu ev=0x%x r=0x%x %s",
+                     (unsigned long long)detail_fd, detail_events, revents,
+                     desc);
+            poll_claims_ready = (revents & detail_events) != 0;
+          }
+        }
+        fd_node_put(&node);
+      }
+    }
+  }
+
   // Best-effort pathname, captured at most once per unique key.
   char cap_path[96] = {0};
   if (!key_known && regs)
@@ -1053,6 +1110,13 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
       entry->last_args[4] = regs->r8;
       entry->last_args[5] = regs->r9;
     }
+    if (detail_sampled) {
+      entry->last_detail_ms = now_ms;
+      if (cap_detail[0]) {
+        strncpy(entry->detail, cap_detail, sizeof(entry->detail) - 1);
+        entry->detail[sizeof(entry->detail) - 1] = '\0';
+      }
+    }
   }
   spinlock_release(&g_sysdiag_lock);
 
@@ -1063,59 +1127,45 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
         regs && (regs->rdi & (CLONE_NEWCGROUP | CLONE_NEWUSER | CLONE_NEWTIME));
     bool unsupported_strict_check = syscall_num == 54 && error_code == -92 &&
         regs && regs->rsi == 270 && regs->rdx == 12;
-    klog_puts(unsupported_namespace
-        ? KLOG_CLR_YELLOW "[SYSDIAG] UNSUPPORTED NAMESPACES: " KLOG_CLR_RESET
-        : KLOG_CLR_YELLOW "[SYSDIAG] SYSCALL ERROR: " KLOG_CLR_RESET);
-    klog_puts(sname ? sname : "syscall");
-    klog_puts("(#");
-    klog_uint64(syscall_num);
-    klog_puts(") returned -");
-    klog_uint64((uint64_t)-error_code);
-    if (ename) {
-      klog_puts(" (");
-      klog_puts(ename);
-      klog_puts(")");
-    }
+    char line[1536];
+    size_t line_len = 0;
+    sysdiag_appendf(line, sizeof(line), &line_len, "%s%s(#%llu) returned -%llu",
+        unsupported_namespace
+            ? KLOG_CLR_YELLOW "[SYSDIAG] UNSUPPORTED NAMESPACES: " KLOG_CLR_RESET
+            : KLOG_CLR_YELLOW "[SYSDIAG] SYSCALL ERROR: " KLOG_CLR_RESET,
+        sname ? sname : "syscall", (unsigned long long)syscall_num,
+        (unsigned long long)-error_code);
+    if (ename)
+      sysdiag_appendf(line, sizeof(line), &line_len, " (%s)", ename);
     if (via_seccomp)
-      klog_puts(" via seccomp deny (the handler never ran; errno came from the caller's own filter)");
-    klog_puts(" called by comm='");
-    klog_puts(comm);
-    klog_puts("' pid=");
-    klog_uint64(t ? t->tgid : 0);
+      sysdiag_appendf(line, sizeof(line), &line_len,
+          " via seccomp deny (the handler never ran; errno came from the caller's own filter)");
+    sysdiag_appendf(line, sizeof(line), &line_len, " called by comm='%s' pid=%u",
+                    comm, t ? t->tgid : 0);
     if (regs) {
-      klog_puts(" args=(");
-      klog_hex64(regs->rdi);
-      klog_puts(", ");
-      klog_hex64(regs->rsi);
-      klog_puts(", ");
-      klog_hex64(regs->rdx);
-      klog_puts(", ");
-      klog_hex64(regs->r10);
-      klog_puts(", ");
-      klog_hex64(regs->r8);
-      klog_puts(", ");
-      klog_hex64(regs->r9);
-      klog_puts(")");
+      sysdiag_appendf(line, sizeof(line), &line_len,
+          " args=(0x%016llX, 0x%016llX, 0x%016llX, 0x%016llX, 0x%016llX, 0x%016llX)",
+          (unsigned long long)regs->rdi, (unsigned long long)regs->rsi,
+          (unsigned long long)regs->rdx, (unsigned long long)regs->r10,
+          (unsigned long long)regs->r8, (unsigned long long)regs->r9);
     }
-    klog_puts(" rip=");
-    klog_hex64(regs ? regs->rip : 0);
-    if (cap_path[0]) {
-      klog_puts(" path='");
-      klog_puts(cap_path);
-      klog_puts("'");
-    }
-    if (cap_attr[0]) {
-      klog_puts(" xattr='");
-      klog_puts(cap_attr);
-      klog_puts("'");
-    }
+    sysdiag_appendf(line, sizeof(line), &line_len, " rip=0x%016llX",
+                    (unsigned long long)(regs ? regs->rip : 0));
+    if (cap_path[0])
+      sysdiag_appendf(line, sizeof(line), &line_len, " path='%s'", cap_path);
+    if (cap_attr[0])
+      sysdiag_appendf(line, sizeof(line), &line_len, " xattr='%s'", cap_attr);
     if (unsupported_namespace)
-      klog_puts(" reason='requested namespace isolation is not implemented'");
+      sysdiag_appendf(line, sizeof(line), &line_len,
+                      " reason='requested namespace isolation is not implemented'");
     if (unsupported_strict_check)
-      klog_puts(" option='NETLINK_GET_STRICT_CHK' reason='strict Netlink request validation is not implemented'");
+      sysdiag_appendf(line, sizeof(line), &line_len,
+          " option='NETLINK_GET_STRICT_CHK' reason='strict Netlink request validation is not implemented'");
     if (syscall_num == 9 && error_code == -22 && regs && !regs->rsi)
-      klog_puts(" reason='zero-length mapping requested'");
-    klog_puts("\n");
+      sysdiag_appendf(line, sizeof(line), &line_len,
+                      " reason='zero-length mapping requested'");
+    sysdiag_appendf(line, sizeof(line), &line_len, "\n");
+    klogf("%s", line);
   }
 }
 
@@ -1392,6 +1442,11 @@ void sysdiag_dump_report(void) {
         sd_put(" recv-flags=");
         sd_hex64(e->last_args[3]);
       }
+      if (e->detail[0]) {
+        sd_put(" detail='");
+        sd_put(e->detail);
+        sd_put("'");
+      }
       if (e->path[0]) {
         sd_put(" path='");
         sd_put(e->path);
@@ -1665,6 +1720,11 @@ size_t sysdiag_format_report(char *buf, size_t max_size) {
       p = b_write(buf, max_size, p, ", 0x");
       p = b_hex64(buf, max_size, p, e->last_args[2]);
       p = b_write(buf, max_size, p, ")");
+      if (e->detail[0]) {
+        p = b_write(buf, max_size, p, " detail='");
+        p = b_write(buf, max_size, p, e->detail);
+        p = b_write(buf, max_size, p, "'");
+      }
       if (e->path[0]) {
         p = b_write(buf, max_size, p, " path='");
         p = b_write(buf, max_size, p, e->path);

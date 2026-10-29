@@ -15,7 +15,9 @@ static uint8_t ext2_dirent_dtype(uint8_t file_type) {
   }
 }
 
-struct dirent *ext2_readdir_impl(vfs_node_t *node, uint32_t index) {
+struct dirent *ext2_readdir_impl(vfs_node_t *node, uint64_t cookie) {
+  if (!node || cookie > UINT32_MAX)
+    return NULL;
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return NULL;
@@ -39,17 +41,17 @@ struct dirent *ext2_readdir_impl(vfs_node_t *node, uint32_t index) {
 
   uint32_t dir_size   = inode.i_size;
   uint32_t byte_pos   = 0;
-  uint32_t entry_idx  = 0;
   uint32_t loaded_logical_block = UINT32_MAX;
+  uint32_t generation = __atomic_load_n(&node->readdir_generation,
+                                        __ATOMIC_ACQUIRE);
 
-  /*
-   * getdents asks for monotonically increasing indices. Resume at the byte
-   * following the previous result instead of rescanning the directory from
-   * byte zero. Interleaved or random access safely falls back to a full scan.
-   */
-  if (index != 0 && index == node->readdir_cursor_index) {
+  /* d_off is the byte position after the returned ext4 record. Keep the
+   * sequential fast path while the directory is unchanged; after a mutation,
+   * rescan to the cookie boundary because unlink may have lengthened the
+   * preceding record across the old position. */
+  if (cookie && cookie == node->readdir_cursor_cookie &&
+      generation == node->readdir_cursor_generation) {
     byte_pos = node->readdir_cursor_offset;
-    entry_idx = index;
   }
 
   while (byte_pos < dir_size) {
@@ -66,32 +68,37 @@ struct dirent *ext2_readdir_impl(vfs_node_t *node, uint32_t index) {
 
     ext2_dirent_t *entry = (ext2_dirent_t *)(block_buf + offset_in_block);
 
-    if (entry->inode != 0 && entry->rec_len > 0) {
-      if (entry_idx == index) {
-        uint32_t name_len = entry->name_len;
-        if (name_len > 127)
-          name_len = 127;
-        memcpy(d->name, entry->name, name_len);
-        d->name[name_len] = '\0';
-        d->ino = entry->inode;
-        d->d_type = ext2_dirent_dtype(entry->file_type);
-        node->readdir_cursor_index = index + 1;
-        node->readdir_cursor_offset = byte_pos + entry->rec_len;
-        kfree(block_buf);
-        spinlock_release(&node->readdir_cursor_lock);
-        return d;
-      }
-      entry_idx++;
-    }
-
-    if (entry->rec_len == 0)
+    if (entry->rec_len < 8 ||
+        entry->rec_len > mnt->block_size - offset_in_block ||
+        entry->rec_len > dir_size - byte_pos)
       break;
-    byte_pos += entry->rec_len;
+    if (entry->name_len > entry->rec_len - 8)
+      break;
+    uint32_t next_pos = byte_pos + entry->rec_len;
+
+    if (entry->inode != 0 && byte_pos >= (uint32_t)cookie) {
+      uint32_t name_len = entry->name_len;
+      if (name_len > 127)
+        name_len = 127;
+      memcpy(d->name, entry->name, name_len);
+      d->name[name_len] = '\0';
+      d->ino = entry->inode;
+      d->d_type = ext2_dirent_dtype(entry->file_type);
+      d->d_off = next_pos;
+      node->readdir_cursor_cookie = d->d_off;
+      node->readdir_cursor_offset = next_pos;
+      node->readdir_cursor_generation = generation;
+      kfree(block_buf);
+      spinlock_release(&node->readdir_cursor_lock);
+      return d;
+    }
+    byte_pos = next_pos;
   }
 
   kfree(block_buf);
-  node->readdir_cursor_index = 0;
+  node->readdir_cursor_cookie = 0;
   node->readdir_cursor_offset = 0;
+  node->readdir_cursor_generation = generation;
   spinlock_release(&node->readdir_cursor_lock);
   return NULL;
 }

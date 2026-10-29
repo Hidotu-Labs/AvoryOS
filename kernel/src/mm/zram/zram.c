@@ -16,7 +16,7 @@ static struct block_device device;
 
 static bool eligible(struct vma *v) {
   return v && (v->flags & MAP_PRIVATE) && (v->flags & MAP_ANONYMOUS) &&
-         !(v->flags & (MAP_SHARED | MAP_SYSV_SHM | 0x2000 /* MAP_LOCKED */)) &&
+         !(v->flags & (MAP_SHARED | MAP_SYSV_SHM | MAP_LOCKED)) &&
          v->prot && !v->linux_vma && !v->file_node;
 }
 /* First interval past cursor, including ineligible VMAs. The caller skips
@@ -35,7 +35,7 @@ static struct vma *next_vma(struct vma *v, uint64_t cursor) {
 static uint64_t freeze(struct mm_struct *mm, uint64_t cr3, uint64_t va,
                        bool force) {
   struct vma *v = vma_find(&mm->vmas, va);
-  if (!eligible(v))
+  if (!eligible(v) || mm->mlockall_future)
     return 0;
   uint64_t phys = 0;
   vmm_lock_acquire_for((uint64_t *)cr3, va);
@@ -44,7 +44,8 @@ static uint64_t freeze(struct mm_struct *mm, uint64_t cr3, uint64_t va,
     uint64_t frame = *pte & PAGE_MASK;
     if (!force && (*pte & PAGE_FLAG_A)) {
       *pte &= ~PAGE_FLAG_A;
-    } else if (frame != pmm_get_zero_page_phys() && pmm_is_managed(frame) &&
+    } else if (!(*pte & PAGE_FLAG_MLOCKED) &&
+               frame != pmm_get_zero_page_phys() && pmm_is_managed(frame) &&
                pmm_get_ref((void *)frame) == 1) {
       pmm_incref((void *)frame);
       /* COW authorizes a later write fault. Never add it to an originally
@@ -59,7 +60,9 @@ static uint64_t freeze(struct mm_struct *mm, uint64_t cr3, uint64_t va,
 }
 static bool compress_frozen(struct mm_struct *mm, uint64_t cr3, uint64_t va,
                             uint64_t phys) {
-  tlb_shootdown_context_for(cr3);
+  /* Only this leaf changed. A full address-space flush here evicts unrelated
+   * translations twice for every page compressed during reclaim. */
+  tlb_shootdown_page_for_pcid(va, cr3, mm->pcid);
   uint32_t slot = zram_store_page(PHYS_TO_VIRT(phys));
   bool installed = false;
   if (slot) {
@@ -67,7 +70,8 @@ static bool compress_frozen(struct mm_struct *mm, uint64_t cr3, uint64_t va,
     struct vma *v = vma_find(&mm->vmas, va);
     vmm_lock_acquire_for((uint64_t *)cr3, va);
     uint64_t *pte = vmm_get_pte_ptr((uint64_t *)cr3, va);
-    if (eligible(v) && pte && (*pte & PAGE_FLAG_PRESENT) &&
+    if (eligible(v) && !mm->mlockall_future && pte &&
+        (*pte & PAGE_FLAG_PRESENT) && !(*pte & PAGE_FLAG_MLOCKED) &&
         !(*pte & PAGE_FLAG_RW) && (*pte & PAGE_MASK) == phys &&
         pmm_get_ref((void *)phys) == 2) {
       *pte = zram_pte(slot);
@@ -77,7 +81,7 @@ static bool compress_frozen(struct mm_struct *mm, uint64_t cr3, uint64_t va,
     spinlock_release(&mm->lock);
     if (installed) {
       /* No physical reference is released until stale readers are gone. */
-      tlb_shootdown_context_for(cr3);
+      tlb_shootdown_page_for_pcid(va, cr3, mm->pcid);
       pmm_free_page((void *)phys); /* former mapping */
       __atomic_add_fetch(&swapouts, 1, __ATOMIC_RELAXED);
     } else

@@ -25,6 +25,8 @@
  * ------------------------------------------------------------------------- */
 
 static void local_flush(uint64_t addr, uint16_t pcid);
+static void local_flush_for(uint64_t addr, uint16_t pcid,
+                            uint64_t pml4_base);
 static uint16_t pcid_for_pml4(uint64_t pml4);
 
 /*
@@ -59,10 +61,12 @@ static volatile uint8_t  cpu_shootdown_ack[MAX_CPUS];
  * the one loaded on its own CPU). */
 static volatile uint16_t cpu_shootdown_pcid[MAX_CPUS];
 /* Timing and execution-context snapshots for the current serialized request.
- * The target records entry/ack timestamps on its own CPU; the initiator records
- * the send timestamp immediately before raising the IPI.  These are diagnostic
- * only and are published before the release-store to cpu_shootdown_ack. */
+ * The initiator records both the start and return from the LAPIC send call;
+ * the target records handler entry/ack on its own CPU.  This separates time
+ * spent waiting to reuse the sender's ICR from time waiting for the target to
+ * enter the handler.  These are diagnostic only. */
 static volatile uint64_t cpu_shootdown_sent_tsc[MAX_CPUS];
+static volatile uint64_t cpu_shootdown_issued_tsc[MAX_CPUS];
 static volatile uint64_t cpu_shootdown_entry_tsc[MAX_CPUS];
 static volatile uint64_t cpu_shootdown_ack_tsc[MAX_CPUS];
 static volatile uint64_t cpu_shootdown_seen_cr3[MAX_CPUS];
@@ -128,45 +132,72 @@ static bool cpu_needs_shootdown(struct cpu_info *cpu, struct cpu_info *self,
         (addr > USER_SPACE_LIMIT && addr != TLB_SHOOTDOWN_CONTEXT))
         return true;
 
-    /* With a known PCID, only a CPU currently running that address space
-     * needs an IPI.  An inactive CPU may retain tagged translations, so clear
-     * its scheduler bookkeeping while holding queue_lock.  The scheduler
-     * checks that bit and loads CR3 with flushing semantics before it can run
-     * the address space again.  queue_lock closes the race with the CR3 load:
-     * either we observe it active and send an IPI, or its later switch sees
-     * the cleared bit and flushes locally.  If the lock is busy, target it
-     * conservatively; this keeps shootdown latency independent of runqueue
-     * lock contention and preserves correctness.
-     *
-     * Unknown PCIDs still require a broadcast, because we cannot safely
-     * identify which tagged translations belong to this page-table root. */
-    if (cpu_has_pcid()) {
-        if (pcid == PCID_KERNEL)
-            return true;
+    /* A kernel page-table context is shared by every CPU, so it still needs
+     * the conservative broadcast even when the target is currently idle. */
+    uint64_t root = pml4_base & CR3_ADDR_MASK;
+    if (cpu->kernel_cr3 &&
+        root == (cpu->kernel_cr3 & CR3_ADDR_MASK))
+        return true;
 
-        if (!spinlock_try_acquire(&cpu->queue_lock))
-            return true;
-
-        uint64_t loaded = __atomic_load_n(&cpu->active_cr3, __ATOMIC_ACQUIRE);
-        bool active = loaded != 0 &&
-                      (loaded & CR3_ADDR_MASK) == (pml4_base & CR3_ADDR_MASK) &&
-                      (loaded & CR3_PCID_MASK) == (pcid & CR3_PCID_MASK);
-        if (!active)
+    /* The permanent idle thread cannot be executing a user address space.
+     * The scheduler flushes PCID 0 when it loads the kernel CR3 and clears a
+     * known user's cached-PCID bit here, so its next user CR3 load will flush.
+     * Check this before trying queue_lock: an idle CPU can be inside scheduler
+     * code with interrupts masked, and waiting for its IPI would stall every
+     * synchronous shootdown even though that CPU cannot use this user mapping. */
+    struct thread *published =
+        __atomic_load_n(&cpu->current_thread, __ATOMIC_ACQUIRE);
+    if (published && published == cpu->idle_thread) {
+        if (cpu_has_pcid() && pcid != PCID_KERNEL && pcid <= PCID_MAX)
             cpu_pcid_invalidate(cpu, (uint16_t)pcid);
-
-        spinlock_release(&cpu->queue_lock);
-        return active;
+        return false;
     }
 
-    /* Without PCID every CR3 load flushes the previous address space's
-     * non-global entries, so only a CPU with this exact pml4 in CR3 can have
-     * user translations for it.  Skipping the rest is what makes a
-     * single-threaded process's faults and unmaps IPI-free: before this,
-     * every page invalidation interrupted every other core for nothing. */
-    uint64_t loaded = __atomic_load_n(&cpu->active_cr3, __ATOMIC_ACQUIRE);
-    if (loaded == 0)
-        return true; /* tracking not published yet: be conservative */
-    return (loaded & CR3_ADDR_MASK) == (pml4_base & CR3_ADDR_MASK);
+    /* queue_lock pairs the full current_thread/CR3 check with scheduler
+     * publication for non-idle threads. If it is busy, target conservatively. */
+    if (!spinlock_try_acquire(&cpu->queue_lock))
+        return true;
+
+    struct thread *running = cpu->current_thread;
+    if (!running) {
+        uint64_t loaded = __atomic_load_n(&cpu->active_cr3, __ATOMIC_ACQUIRE);
+        spinlock_release(&cpu->queue_lock);
+        if (cpu_has_pcid())
+            return true; /* CPU state is not published yet: stay conservative */
+        return loaded == 0 || ((loaded & CR3_ADDR_MASK) == root);
+    }
+
+    bool has_user_mm = running && !running->is_idle && running->cr3 != 0;
+    bool running_target = has_user_mm &&
+                          ((running->cr3 & CR3_ADDR_MASK) == root);
+
+    if (cpu_has_pcid()) {
+        if (!has_user_mm) {
+            /* PCID 0 is loaded with flushing semantics on every CR3 switch;
+             * other tags need their cached bit cleared before they run again. */
+            if (pcid != PCID_KERNEL)
+                cpu_pcid_invalidate(cpu, (uint16_t)pcid);
+            spinlock_release(&cpu->queue_lock);
+            return false;
+        }
+
+        if (pcid == PCID_KERNEL) {
+            /* Another user task is running, so it could retain this address
+             * space under an unknown tag.  Keep the safe broadcast. */
+            spinlock_release(&cpu->queue_lock);
+            return true;
+        }
+
+        if (!running_target)
+            cpu_pcid_invalidate(cpu, (uint16_t)pcid);
+        spinlock_release(&cpu->queue_lock);
+        return running_target;
+    }
+
+    /* Without PCID, switching away from a user CR3 flushes its non-global
+     * translations, so inactive kernel/idle or other-process CPUs need no IPI. */
+    spinlock_release(&cpu->queue_lock);
+    return running_target;
 }
 
 #define KERNEL_IMAGE_BASE 0xFFFFFFFF80000000ULL
@@ -217,8 +248,11 @@ void tlb_shootdown_handle_ipi_regs(struct registers *regs) {
         __atomic_store_n(&cpu_shootdown_interrupted_rflags[id], regs->rflags, __ATOMIC_RELAXED);
         __atomic_store_n(&cpu_shootdown_interrupted_rsp[id], regs->rsp, __ATOMIC_RELAXED);
 
-        /* If interrupted in kernel mode, sample up to 4 return addresses from stack */
-        if ((regs->cs & 3) == 0 && regs->rsp >= KERNEL_IMAGE_BASE && regs->rsp < 0xFFFFFFFFFF000000ULL) {
+        /* Kernel stacks may live in the HHDM or VMAP, below the linked image
+         * base. Accept the whole kernel half so slow-ack reports can sample
+         * return addresses from those stacks too. */
+        if ((regs->cs & 3) == 0 && regs->rsp >= KERNEL_SPACE_BASE &&
+            regs->rsp < 0xFFFFFFFFFF000000ULL) {
             uint64_t *sp = (uint64_t *)regs->rsp;
             int found = 0;
             for (int i = 0; i < 16 && found < 4; i++) {
@@ -472,6 +506,7 @@ void tlb_shootdown_init(void) {
         cpu_shootdown_pcid[i] = PCID_KERNEL;
         cpu_shootdown_ack[i]  = 0;
         cpu_shootdown_sent_tsc[i] = 0;
+        cpu_shootdown_issued_tsc[i] = 0;
         cpu_shootdown_entry_tsc[i] = 0;
         cpu_shootdown_ack_tsc[i] = 0;
         cpu_shootdown_seen_cr3[i] = 0;
@@ -570,6 +605,34 @@ static void local_flush(uint64_t addr, uint16_t pcid) {
     }
 
     __asm__ volatile("invlpg (%0)" :: "r"(addr) : "memory");
+}
+
+/* A caller may know the global PCID for an address space that is inactive on
+ * its CPU (zram reclaim is the common case). In that case INVLPG would affect
+ * the caller's current PCID, not the target's cached translation. Use
+ * INVPCID when available; otherwise invalidate this CPU's cache bit so the
+ * scheduler forces a flushing CR3 load before that PCID runs again. */
+static void local_flush_for(uint64_t addr, uint16_t pcid,
+                            uint64_t pml4_base) {
+    if (!cpu_has_pcid() || pcid == PCID_KERNEL || addr > USER_SPACE_LIMIT) {
+        local_flush(addr, pcid);
+        return;
+    }
+
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    bool active = (cr3 & CR3_ADDR_MASK) == (pml4_base & CR3_ADDR_MASK) &&
+                  (cr3 & CR3_PCID_MASK) == pcid;
+    if (active) {
+        local_flush(addr, pcid);
+    } else if (cpu_has_invpcid()) {
+        struct invpcid_desc desc = {0};
+        desc.pcid = pcid;
+        desc.addr = addr;
+        invpcid(INVPCID_TYPE_INDIV_ADDR, &desc);
+    } else {
+        cpu_pcid_invalidate(cpu_get_current(), pcid);
+    }
 }
 
 /* --- who is issuing shootdowns ------------------------------------------
@@ -858,7 +921,7 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
      * re-executes the faulting access - and record the remote part for the
      * next drain that can wait (see tlb_flush_deferred_drain()). */
     if (!hal_irq_enabled()) {
-        local_flush(addr, pcid);
+        local_flush_for(addr, pcid, pml4_base);
         if (tlb_self_slot() >= 0) {
             if (addr == TLB_SHOOTDOWN_ALL)
                 tlb_flush_deferred_all();
@@ -890,7 +953,7 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
     }
 
     if (targets == 0) {
-        local_flush(addr, pcid);
+        local_flush_for(addr, pcid, pml4_base);
         lockdiag_spot_drop(LOCKDIAG_SPOT_SHOOTDOWN);
         spinlock_release(&shootdown_lock);
         return;
@@ -910,6 +973,7 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
         __atomic_store_n(&cpu_shootdown_pcid[c->cpu_id], pcid, __ATOMIC_RELEASE);
         __atomic_store_n(&cpu_shootdown_addr[c->cpu_id], addr, __ATOMIC_RELEASE);
         __atomic_store_n(&cpu_shootdown_sent_tsc[c->cpu_id], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&cpu_shootdown_issued_tsc[c->cpu_id], 0, __ATOMIC_RELAXED);
         __atomic_store_n(&cpu_shootdown_entry_tsc[c->cpu_id], 0, __ATOMIC_RELAXED);
         __atomic_store_n(&cpu_shootdown_ack_tsc[c->cpu_id], 0, __ATOMIC_RELAXED);
         __atomic_store_n(&cpu_shootdown_seen_cr3[c->cpu_id], 0, __ATOMIC_RELAXED);
@@ -918,16 +982,23 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
     }
 
     /* Local flush first - overlaps with IPI delivery latency. */
-    local_flush(addr, pcid);
+    local_flush_for(addr, pcid, pml4_base);
 
     /* Send all IPIs in one burst. */
     for (uint32_t i = 0; i < cpu_count && i < MAX_CPUS; i++) {
         struct cpu_info *c = cpu_get_info(i);
         if (!(target_mask & (1ULL << c->cpu_id)))
             continue;
-        __atomic_store_n(&cpu_shootdown_sent_tsc[c->cpu_id], rdtsc(),
+        uint64_t send_start = rdtsc();
+        __atomic_store_n(&cpu_shootdown_sent_tsc[c->cpu_id], send_start,
                          __ATOMIC_RELAXED);
         lapic_send_ipi(c->apic_id, IPI_VECTOR_TLB_SHOOTDOWN);
+        /* lapic_send_ipi() returns after the ICR command is written.  Record
+         * this separately: in xAPIC mode it can first wait for a previous ICR
+         * delivery to finish, which is sender-side time rather than target
+         * interrupt latency. */
+        __atomic_store_n(&cpu_shootdown_issued_tsc[c->cpu_id], rdtsc(),
+                         __ATOMIC_RELAXED);
     }
 
     /* Rule check, deliberately printed BEFORE the wait instead of only after it
@@ -1073,6 +1144,8 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
                 uint32_t id = c->cpu_id;
                 uint64_t sent = __atomic_load_n(&cpu_shootdown_sent_tsc[id],
                                                 __ATOMIC_RELAXED);
+                uint64_t issued = __atomic_load_n(&cpu_shootdown_issued_tsc[id],
+                                                  __ATOMIC_RELAXED);
                 uint64_t entry = __atomic_load_n(&cpu_shootdown_entry_tsc[id],
                                                  __ATOMIC_RELAXED);
                 uint64_t ack = __atomic_load_n(&cpu_shootdown_ack_tsc[id],
@@ -1086,8 +1159,10 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
                 uint64_t ack_seen = ack_observed_tsc[id];
                 uint64_t ack_us = sent && ack_seen >= sent
                                       ? (ack_seen - sent) / mhz : 0;
-                uint64_t delivery_us = sent && entry >= sent
-                                           ? (entry - sent) / mhz : 0;
+                uint64_t send_us = sent && issued >= sent
+                                       ? (issued - sent) / mhz : 0;
+                uint64_t delivery_us = issued && entry >= issued
+                                           ? (entry - issued) / mhz : 0;
                 uint64_t handler_us = entry && ack >= entry ? (ack - entry) / mhz : 0;
                 uint64_t rtt_us = ack && ack_seen >= ack ? (ack_seen - ack) / mhz : 0;
 
@@ -1102,7 +1177,9 @@ static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
                 sd_dec(c->apic_id);
                 sd_note(" ack_us=");
                 sd_dec(ack_us);
-                sd_note(" (delivery=");
+                sd_note(" (send=");
+                sd_dec(send_us);
+                sd_note("us delivery=");
                 sd_dec(delivery_us);
                 sd_note("us handler=");
                 sd_dec(handler_us);
@@ -1217,6 +1294,17 @@ void tlb_shootdown_page_for(uint64_t addr, uint64_t pml4) {
      * do not know which PCID owns the stale entries: pcid_for_pml4() returns
      * PCID_KERNEL and every target behaves conservatively. */
     do_shootdown(addr, pcid_for_pml4(pml4), pml4 & CR3_ADDR_MASK,
+                 (uint64_t)__builtin_return_address(0));
+}
+
+void tlb_shootdown_page_for_pcid(uint64_t addr, uint64_t pml4,
+                                 uint16_t pcid) {
+    if (!cpu_has_pcid() || pcid == PCID_KERNEL || pcid > PCID_MAX ||
+        addr > USER_SPACE_LIMIT) {
+        tlb_shootdown_page_for(addr, pml4);
+        return;
+    }
+    do_shootdown(addr, pcid, pml4 & CR3_ADDR_MASK,
                  (uint64_t)__builtin_return_address(0));
 }
 

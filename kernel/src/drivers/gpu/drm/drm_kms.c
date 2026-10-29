@@ -6,6 +6,8 @@
 
 extern struct drm_gem_object *ascentdrm_gem_find_by_handle(struct drm_device *dev, uint32_t handle);
 extern void ascentdrm_obj_add_prop(struct drm_mode_object *obj, uint32_t prop_id, uint64_t default_val);
+extern void ascentdrm_framebuffer_free_full(struct drm_device *dev,
+                                             struct drm_framebuffer *fb);
 
 void ascentdrm_mode_object_init(struct drm_device *dev, struct drm_mode_object *obj, uint32_t type) {
     spinlock_acquire(&dev->lock);
@@ -131,7 +133,9 @@ void ascentdrm_kms_init(struct drm_device *dev) {
     klog_puts(")\n");
 }
 
-struct drm_framebuffer *ascentdrm_framebuffer_create(struct drm_device *dev, struct drm_mode_fb_cmd *cmd) {
+struct drm_framebuffer *ascentdrm_framebuffer_create_for_file(
+    struct drm_file *file, struct drm_device *dev,
+    struct drm_mode_fb_cmd *cmd) {
     struct drm_gem_object *gem_obj = ascentdrm_gem_find_by_handle_get(dev, cmd->handle);
     if (!gem_obj) return NULL;
 
@@ -163,6 +167,7 @@ struct drm_framebuffer *ascentdrm_framebuffer_create(struct drm_device *dev, str
     }
     memset(fb, 0, sizeof(struct drm_framebuffer));
 
+    fb->owner_file = file;
     fb->width = cmd->width;
     fb->height = cmd->height;
     fb->pitch = cmd->pitch;
@@ -183,7 +188,13 @@ struct drm_framebuffer *ascentdrm_framebuffer_create(struct drm_device *dev, str
     return fb;
 }
 
-void ascentdrm_framebuffer_free(struct drm_device *dev, struct drm_framebuffer *fb) {
+struct drm_framebuffer *ascentdrm_framebuffer_create(
+    struct drm_device *dev, struct drm_mode_fb_cmd *cmd) {
+    return ascentdrm_framebuffer_create_for_file(NULL, dev, cmd);
+}
+
+void ascentdrm_framebuffer_unlink(struct drm_device *dev,
+                                  struct drm_framebuffer *fb) {
     spinlock_acquire(&dev->lock);
     list_del(&fb->base.list);
     /* KMS objects must never retain a framebuffer that is being deleted. */
@@ -200,6 +211,16 @@ void ascentdrm_framebuffer_free(struct drm_device *dev, struct drm_framebuffer *
         }
     }
     spinlock_release(&dev->lock);
+}
+
+void ascentdrm_framebuffer_free(struct drm_device *dev,
+                                struct drm_framebuffer *fb) {
+    if (fb->is_full) {
+        ascentdrm_framebuffer_free_full(dev, fb);
+        return;
+    }
+
+    ascentdrm_framebuffer_unlink(dev, fb);
 
     if (fb->gem_obj) {
         struct drm_gem_object *gem = fb->gem_obj;
@@ -208,4 +229,88 @@ void ascentdrm_framebuffer_free(struct drm_device *dev, struct drm_framebuffer *
             ascentdrm_gem_object_free(dev, gem);
     }
     kfree(fb);
+}
+
+static bool ascentdrm_framebuffer_in_use_locked(struct drm_device *dev,
+                                                 struct drm_framebuffer *fb) {
+    struct drm_mode_object *obj;
+    list_for_each_entry(obj, &dev->kms_objects, list) {
+        if (obj->type == DRM_MODE_OBJECT_CRTC &&
+            ((struct drm_crtc *)obj)->fb == fb)
+            return true;
+        if (obj->type == DRM_MODE_OBJECT_PLANE &&
+            ((struct drm_plane *)obj)->fb == fb)
+            return true;
+    }
+    return false;
+}
+
+void ascentdrm_framebuffer_reap_closed(struct drm_device *dev) {
+    if (!dev)
+        return;
+
+    for (;;) {
+        struct drm_framebuffer *dead = NULL;
+        spinlock_acquire(&dev->lock);
+        struct drm_mode_object *obj;
+        list_for_each_entry(obj, &dev->kms_objects, list) {
+            if (obj->type != DRM_MODE_OBJECT_FB)
+                continue;
+            struct drm_framebuffer *fb = (struct drm_framebuffer *)obj;
+            if (fb->closed && !fb->destroying &&
+                !ascentdrm_framebuffer_in_use_locked(dev, fb)) {
+                fb->destroying = 1;
+                dead = fb;
+                break;
+            }
+        }
+        spinlock_release(&dev->lock);
+
+        if (!dead)
+            return;
+        ascentdrm_framebuffer_free(dev, dead);
+    }
+}
+
+void ascentdrm_framebuffer_close_file(struct drm_device *dev,
+                                      struct drm_file *file) {
+    if (!dev || !file)
+        return;
+
+    spinlock_acquire(&dev->lock);
+    struct drm_mode_object *obj;
+    list_for_each_entry(obj, &dev->kms_objects, list) {
+        if (obj->type != DRM_MODE_OBJECT_FB)
+            continue;
+        struct drm_framebuffer *fb = (struct drm_framebuffer *)obj;
+        if (fb->owner_file == file) {
+            fb->owner_file = NULL;
+            fb->closed = 1;
+        }
+    }
+    spinlock_release(&dev->lock);
+
+    ascentdrm_framebuffer_reap_closed(dev);
+}
+
+void ascentdrm_framebuffer_drop_closed_scanout(struct drm_device *dev) {
+    if (!dev)
+        return;
+
+    spinlock_acquire(&dev->lock);
+    struct drm_mode_object *obj;
+    list_for_each_entry(obj, &dev->kms_objects, list) {
+        if (obj->type == DRM_MODE_OBJECT_CRTC) {
+            struct drm_crtc *crtc = (struct drm_crtc *)obj;
+            if (crtc->fb && crtc->fb->closed)
+                crtc->fb = NULL;
+        } else if (obj->type == DRM_MODE_OBJECT_PLANE) {
+            struct drm_plane *plane = (struct drm_plane *)obj;
+            if (plane->fb && plane->fb->closed)
+                plane->fb = NULL;
+        }
+    }
+    spinlock_release(&dev->lock);
+
+    ascentdrm_framebuffer_reap_closed(dev);
 }

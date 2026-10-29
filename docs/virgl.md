@@ -37,8 +37,8 @@ and reused, avoiding contiguous DMA allocations after desktop memory becomes
 fragmented. The pool reserves at most 32 MiB with the current buddy allocator;
 limited boot memory selects fewer slots, or the synchronous path if none fit.
 Queue pressure waits for space; CPU WAIT calls
-wait for the requested buffer's submitted fence prefix, so unrelated work and later frames from another client cannot
-extend that wait indefinitely. Malformed fence replies quarantine their buffers.
+wait for the requested buffer's snapshotted producer fences, so older unrelated
+batches and later frames from another client cannot extend that wait. Malformed fence replies quarantine their buffers.
 Sharing a texture with another GL context, transferring its pixels, or exposing
 it to the display frontend waits for its queued producer before accessing it.
 Sync-file export requests use the queued path and return live Linux DMA fences
@@ -77,7 +77,7 @@ snapshots retain up to 32 BOs per file-lock acquisition; attachments and host
 waits run after releasing that lock. WAIT retains its BO after serializing with
 earlier metadata/transfer operations, then releases the global virgl ioctl gate
 before waiting for the fence. Other clients can submit while it sleeps. Buffer
-references, fence-prefix waits and producer synchronization remain in force.
+references, snapshotted producer waits and producer synchronization remain in force.
 
 Completed flips release their submission slot before notifying the compositor,
 so submitting the next frame from the completion event cannot spuriously fail
@@ -287,3 +287,41 @@ The fixed kernel passed 6000 simultaneous resources and a Minecraft stress
 scene with over 5900 live handles. Normal host vertex binding is enabled by
 default; the earlier legacy NVIDIA path is opt-in. Details and evidence are in
 [minecraft-rendering-2026-10-26.md](minecraft-rendering-2026-10-26.md).
+
+
+## Buffer dependency waits (2026-10-29)
+
+Buffer WAIT, cross-context sharing, transfers and scanout now wait for the exact
+render jobs using their BOs. The previous lookup found the right producers but
+then waited for every device fence up to the newest producer, including older
+unrelated render jobs and control commands. Device-idle/context-close waits
+still cover the submitted device prefix.
+
+Each buffer wait snapshots the fence identity for each dependent slot. A
+completed producer's slot can be reclaimed and reused without extending the
+wait to its replacement. After registering a sleeping waiter, the driver also
+checks whether the completion count changed since the dependency check. This
+prevents sleeping until an unrelated completion or timeout when another CPU
+has already reaped the producer. Nonblocking and dependency-free queries retain
+a single queue-lock acquisition and no heap allocations.
+
+The render-queue regression covers an older unrelated batch still pending when
+the newer buffer producer completes, for both WAIT and cross-context sharing,
+and immediate reuse of the producer slot. The command-ownership regression
+covers producer completion during waiter registration with unrelated work still
+pending and an already-consumed used-ring notification. These checks establish
+that unrelated work no longer extends these waits; they do not measure desktop
+or game FPS.
+
+Validation: kernel build, render queue, command ownership, batched reclaim,
+resource lookup, concurrent WAIT, exec/sync-file fences and Virgl scanout checks
+passed. Private ABI boot (including 6000 live resources) and Mesa EGL boot
+(including 512 textures) passed with TCG and host llvmpipe. KVM and a host GPU
+were unavailable, so no hardware FPS comparison was made. Two broader tests
+remain incompatible with existing workspace changes: `test_virgl_gate_sleep.py`
+expects a timed gate sleep while the gate clears `wakeup_ticks`, and
+`test_virtio_scanout_engine.py` lacks the gate/thread fixtures required by the
+existing scanout gate implementation.
+
+The subsequent user-captured terrain profile and host draw-state changes are
+documented in [virgl-terrain-profile-2026-10-29.md](virgl-terrain-profile-2026-10-29.md).

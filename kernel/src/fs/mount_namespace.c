@@ -99,7 +99,7 @@ static void view_close(vfs_node_t *n) {
   if (n->view_parent)
     vfs_close(n->view_parent);
 }
-static struct dirent *view_readdir(vfs_node_t *n, uint32_t i) {
+static struct dirent *view_readdir(vfs_node_t *n, uint64_t i) {
   return vfs_readdir(n->view_backing, i);
 }
 #define VIEW_MUTATE(name, decl, args, call)                                    \

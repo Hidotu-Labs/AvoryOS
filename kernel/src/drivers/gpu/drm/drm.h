@@ -53,6 +53,7 @@
 #define DRM_IOCTL_MODE_CURSOR2 0xC02464BB
 #define DRM_IOCTL_MODE_ADDFB 0xC01C64AE
 #define DRM_IOCTL_MODE_RMFB 0xC00464AF
+#define DRM_IOCTL_MODE_CLOSEFB 0xC00864D0
 #define DRM_IOCTL_MODE_PAGE_FLIP 0xC01864B0
 #define DRM_IOCTL_MODE_CREATE_DUMB 0xC02064B2
 #define DRM_IOCTL_MODE_MAP_DUMB 0xC01064B3
@@ -162,6 +163,13 @@ struct drm_mode_fb_cmd {
   uint32_t depth;
   uint32_t handle;
 };
+
+struct drm_mode_closefb {
+  uint32_t fb_id;
+  uint32_t pad;
+};
+_Static_assert(sizeof(struct drm_mode_closefb) == 8,
+               "drm_mode_closefb ABI size");
 
 struct drm_mode_crtc_page_flip {
   uint32_t crtc_id;
@@ -468,8 +476,14 @@ void ascentdrm_crtc_set_mode(struct drm_crtc *crtc,
  * region degrades gradually rather than into one huge box. */
 #define DRM_MAX_DAMAGE_CLIPS 64
 
+struct drm_file;
+
 struct drm_framebuffer {
   struct drm_mode_object base;
+  struct drm_file *owner_file;
+  uint8_t closed;
+  uint8_t destroying;
+  uint8_t is_full;
   uint32_t width, height;
   uint32_t pitch, bpp;
   uint32_t pixel_format; /* DRM_FORMAT_* fourcc; important for cursor alpha */
@@ -774,6 +788,19 @@ int ascentdrm_prime_import(struct drm_file *file, int fd, uint32_t *handle);
 int ascentdrm_gem_begin_cpu(struct drm_gem_object *obj);
 void ascentdrm_gem_end_cpu(struct drm_gem_object *obj);
 struct drm_gem_object *ascentdrm_gem_find_by_handle_get(struct drm_device *dev, uint32_t handle);
+/* Keep the two-argument constructor for in-kernel callers and selftests.
+ * The ioctl path uses the file-aware variant to track framebuffer ownership. */
+struct drm_framebuffer *ascentdrm_framebuffer_create(
+    struct drm_device *dev, struct drm_mode_fb_cmd *cmd);
+struct drm_framebuffer *ascentdrm_framebuffer_create_for_file(
+    struct drm_file *file, struct drm_device *dev,
+    struct drm_mode_fb_cmd *cmd);
+void ascentdrm_framebuffer_unlink(struct drm_device *dev,
+                                  struct drm_framebuffer *fb);
+void ascentdrm_framebuffer_reap_closed(struct drm_device *dev);
+void ascentdrm_framebuffer_close_file(struct drm_device *dev,
+                                      struct drm_file *file);
+void ascentdrm_framebuffer_drop_closed_scanout(struct drm_device *dev);
 /* Atomic lifetime helpers (implemented in drm_gem.c). get() adds one
  * reference; put() drops one and returns true exactly once, when the last
  * reference went away and the caller must free the object. */

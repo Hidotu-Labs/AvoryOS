@@ -44,14 +44,17 @@ static uint64_t *clone_table(uint64_t *src_table_phys, int level, size_t start,
           memcpy(PHYS_TO_VIRT((uint64_t)new_huge),
                  PHYS_TO_VIRT(src_huge_phys),
                  2ULL * 1024 * 1024);
-          new_virt[i] = ((uint64_t)new_huge & PAGE_MASK) | (src_virt[i] & ~PAGE_MASK);
+          new_virt[i] = ((uint64_t)new_huge & PAGE_MASK) |
+                        (src_virt[i] & ~PAGE_MASK & ~PAGE_FLAG_MLOCKED);
         } else {
           void *pt_phys = pmm_alloc();
           if (!pt_phys)
             return NULL;
           uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)pt_phys);
           uint64_t src_huge_phys = src_virt[i] & PAGE_MASK;
-          uint64_t pte_flags = (src_virt[i] & ~PAGE_MASK & ~PAGE_FLAG_PS) | PAGE_FLAG_PRESENT;
+          uint64_t pte_flags = (src_virt[i] & ~PAGE_MASK &
+                                ~(PAGE_FLAG_PS | PAGE_FLAG_MLOCKED)) |
+                               PAGE_FLAG_PRESENT;
           for (size_t p = 0; p < 512; p++) {
             void *new_p = pmm_alloc();
             if (!new_p)
@@ -84,7 +87,8 @@ static uint64_t *clone_table(uint64_t *src_table_phys, int level, size_t start,
         dst64[w] = src64[w];
 
       new_virt[i] =
-          ((uint64_t)new_page_phys & PAGE_MASK) | (src_virt[i] & ~PAGE_MASK);
+          ((uint64_t)new_page_phys & PAGE_MASK) |
+          (src_virt[i] & ~PAGE_MASK & ~PAGE_FLAG_MLOCKED);
     } else {
       uint64_t *child_src_phys = (uint64_t *)(src_virt[i] & PAGE_MASK);
       uint64_t *child_new_phys = clone_table(child_src_phys, level - 1, 0, 512);
@@ -170,7 +174,7 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
         uint64_t child_base = base_addr | ((uint64_t)i << 21);
         struct vma *hv = find_vma_cached(vmas, child_base, vma_cache);
         if (hv && (hv->flags & MAP_SHARED)) {
-          new_virt[i] = src_virt[i];
+          new_virt[i] = src_virt[i] & ~PAGE_FLAG_MLOCKED;
         } else {
           void *new_huge = pmm_alloc_huge_page();
           if (new_huge) {
@@ -178,7 +182,8 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
             memcpy(PHYS_TO_VIRT((uint64_t)new_huge),
                    PHYS_TO_VIRT(src_huge_phys),
                    2ULL * 1024 * 1024);
-            new_virt[i] = ((uint64_t)new_huge & PAGE_MASK) | (src_virt[i] & ~PAGE_MASK);
+            new_virt[i] = ((uint64_t)new_huge & PAGE_MASK) |
+                          (src_virt[i] & ~PAGE_MASK & ~PAGE_FLAG_MLOCKED);
           } else {
             void *pt_phys = pmm_alloc();
             if (!pt_phys)
@@ -187,7 +192,9 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
             new_virt[i] = ((uint64_t)pt_phys & PAGE_MASK) |
                           PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_USER;
             uint64_t src_huge_phys = src_virt[i] & PAGE_MASK;
-            uint64_t pte_flags = (src_virt[i] & ~PAGE_MASK & ~PAGE_FLAG_PS) | PAGE_FLAG_PRESENT;
+            uint64_t pte_flags = (src_virt[i] & ~PAGE_MASK &
+                                  ~(PAGE_FLAG_PS | PAGE_FLAG_MLOCKED)) |
+                                 PAGE_FLAG_PRESENT;
             for (size_t p = 0; p < 512; p++) {
               void *new_p = pmm_alloc();
               if (!new_p)
@@ -229,7 +236,7 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
         }
         if (shared_refs && pmm_is_managed(phys))
           pmm_incref((void *)phys);
-        new_virt[i] = src_virt[i];
+        new_virt[i] = src_virt[i] & ~PAGE_FLAG_MLOCKED;
       } else {
         // Private: CoW — mark both sides read-only and bump the refcount.
         if (pmm_is_managed(phys)) {
@@ -241,7 +248,7 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
           }
           pmm_incref((void *)phys);
         }
-        new_virt[i] = src_virt[i];
+        new_virt[i] = src_virt[i] & ~PAGE_FLAG_MLOCKED;
       }
     } else {
       int shift = 12 + 9 * (level - 1);

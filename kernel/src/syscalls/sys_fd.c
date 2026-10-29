@@ -524,22 +524,10 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     }
   }
 
-  char parent_walk[512];
   const char *lookup_path = path;
   vfs_node_t *lookup_base = base_dir;
 
   if (!node) {
-    /* The VFS component stack starts at base_dir. To walk above an open
-     * directory, seed it with that descriptor's saved absolute path. */
-    if (!vfs_namespace_active() && path[0] != '/' && (!strcmp(path, "..") || !strncmp(path, "../", 3))) {
-      spinlock_acquire(&t->files->lock);
-      const char *start = dirfd == AT_FDCWD ? t->cwd_path : fd_path_value(t, dirfd);
-      bool ok = fd_make_path(parent_walk, sizeof(parent_walk), start, path);
-      spinlock_release(&t->files->lock);
-      if (!ok) return (uint64_t)-36;
-      lookup_path = parent_walk;
-      lookup_base = fs_root;
-    }
     node = (flags & O_NOFOLLOW)
                ? vfs_resolve_symlink_node(lookup_base, lookup_path)
                : vfs_resolve_path_at(lookup_base, lookup_path);

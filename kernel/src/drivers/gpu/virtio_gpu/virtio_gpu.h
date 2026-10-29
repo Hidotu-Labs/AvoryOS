@@ -7,7 +7,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 struct drm_file;
-void virtio_gpu_request_perf_dump(void);
 struct drm_gem_object;
 struct vfs_node;
 #define VIRTIO_GPU_MAX_MODES 32

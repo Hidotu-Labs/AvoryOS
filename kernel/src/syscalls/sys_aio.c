@@ -1439,7 +1439,13 @@ static uint64_t memfd_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
         file->data_is_pmm = 1;
     }
 
-    if ((uint32_t)needed > node->length) node->length = (uint32_t)needed;
+    if (needed > node->length) {
+        /* Extending an existing memfd mapping grows the logical file without
+         * necessarily reallocating its backing. Clear bytes left by an older
+         * truncation before the mapping makes them visible again. */
+        memset(file->data + node->length, 0, (size_t)needed - node->length);
+        node->length = (uint32_t)needed;
+    }
 
     struct thread *t = sched_get_current();
     if (!t) return (uint64_t)-1;

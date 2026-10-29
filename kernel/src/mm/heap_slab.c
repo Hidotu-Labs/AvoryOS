@@ -1,5 +1,4 @@
 #include "mm/heap_internal.h"
-#include "console/console.h"
 #include "console/klog.h"
 #include "lib/string.h"
 #include "mm/pmm.h"
@@ -266,17 +265,20 @@ static void slab_free_to_cache_locked(struct slab_cache *c, struct slab *s, void
   uint64_t page_base = (uint64_t)s;
   uint64_t object_base = page_base + sizeof(struct slab);
   if ((uint64_t)ptr < object_base) {
-    console_puts("[WARN] kfree: pointer inside slab metadata (wild free)!\n");
+    klogf("[WARN] kfree: pointer inside slab metadata ptr=0x%016llX\n",
+          (unsigned long long)(uintptr_t)ptr);
     return;
   }
   uint64_t offset = (uint64_t)ptr - object_base;
   if (offset % c->obj_size != 0) {
-    console_puts("[WARN] kfree: pointer is not object-aligned (wild free)!\n");
+    klogf("[WARN] kfree: pointer is not slab-object aligned ptr=0x%016llX\n",
+          (unsigned long long)(uintptr_t)ptr);
     return;
   }
   uint32_t idx = offset / c->obj_size;
   if (idx >= s->total_count) {
-    console_puts("[WARN] kfree: object index out of range (wild free)!\n");
+    klogf("[WARN] kfree: slab object index out of range ptr=0x%016llX\n",
+          (unsigned long long)(uintptr_t)ptr);
     return;
   }
 
@@ -424,28 +426,36 @@ void *heap_slab_alloc(size_t size) {
 bool heap_slab_free(void *ptr, uint64_t page_base) {
   struct slab *s = (struct slab *)page_base;
   struct slab_cache *c = s->cache;
-  int cache_idx = (int)(c - heap_caches);
+  uintptr_t cache_addr = (uintptr_t)c;
+  uintptr_t cache_start = (uintptr_t)&heap_caches[0];
+  uintptr_t cache_end = (uintptr_t)&heap_caches[CACHE_COUNT];
 
-  if (cache_idx < 0 || cache_idx >= (int)CACHE_COUNT) {
-    console_puts("[WARN] kfree: slab points outside the generic caches!\n");
+  if (cache_addr < cache_start || cache_addr >= cache_end ||
+      (cache_addr - cache_start) % sizeof(heap_caches[0]) != 0) {
+    klogf("[WARN] kfree: slab points outside the generic caches ptr=0x%016llX\n",
+          (unsigned long long)(uintptr_t)ptr);
     return false;
   }
+  int cache_idx = (int)((cache_addr - cache_start) / sizeof(heap_caches[0]));
 
   /* Fast path: Per-CPU local magazine for small objects (<= 256 bytes) */
   if (cache_idx < HEAP_PCPU_CLASSES && heap_initialized) {
     uint64_t object_base = page_base + sizeof(struct slab);
     if (__builtin_expect((uint64_t)ptr < object_base, 0)) {
-      console_puts("[WARN] kfree: pointer inside slab metadata (wild free)!\n");
+      klogf("[WARN] kfree: pointer inside slab metadata ptr=0x%016llX\n",
+            (unsigned long long)(uintptr_t)ptr);
       return false;
     }
     uint64_t offset = (uint64_t)ptr - object_base;
     if (__builtin_expect(offset % c->obj_size != 0, 0)) {
-      console_puts("[WARN] kfree: pointer is not object-aligned (wild free)!\n");
+      klogf("[WARN] kfree: pointer is not slab-object aligned ptr=0x%016llX\n",
+            (unsigned long long)(uintptr_t)ptr);
       return false;
     }
     uint32_t idx = offset / c->obj_size;
     if (__builtin_expect(idx >= s->total_count, 0)) {
-      console_puts("[WARN] kfree: object index out of range (wild free)!\n");
+      klogf("[WARN] kfree: slab object index out of range ptr=0x%016llX\n",
+            (unsigned long long)(uintptr_t)ptr);
       return false;
     }
 

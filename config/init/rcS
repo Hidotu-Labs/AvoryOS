@@ -1,7 +1,7 @@
 #!/bin/sh
 # AvoryOS boot (busybox init rcS; OpenRC is unavailable on Arch official
-# repos, so this script is the service manager: fsck -> dbus -> udev ->
-# NetworkManager -> pipewire,
+# repos, so this script is the service manager: fsck -> dbus -> resolved ->
+# udev -> NetworkManager -> pipewire,
 # each guarded so a missing binary or empty config never fails the boot.
 # Status lines mimic OpenRC's ` * Starting foo ... [ ok ]` format (plain
 # text, no ANSI colors, so the serial log stays clean).
@@ -48,6 +48,44 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.5
 done
 if [ -S /run/dbus/system_bus_socket ]; then eend 0; else eend 1; fi
+# NSS is configured to query systemd-resolved before the DNS-file fallback.
+# The package is installed in the desktop image, but BusyBox init does not
+# activate systemd units or their RuntimeDirectory, so start the daemon and
+# create its runtime directory here. Keep /etc/resolv.conf under the existing
+# NetworkManager/static configuration; resolved can read it as its upstream.
+ebegin "Starting systemd-resolved"
+RESOLVED_OK=1
+if [ -x /usr/lib/systemd/systemd-resolved ]; then
+    mkdir -p /run/systemd/resolve
+    if [ ! -S /run/systemd/resolve/io.systemd.Resolve ]; then
+        nohup /usr/lib/systemd/systemd-resolved >>/var/log/systemd-resolved.log 2>&1 &
+    fi
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        if [ -S /run/systemd/resolve/io.systemd.Resolve ]; then
+            RESOLVED_OK=0
+            break
+        fi
+        sleep 0.1
+    done
+fi
+eend "$RESOLVED_OK"
+unset RESOLVED_OK
+# PolicyKit is not socket-activated on this image. KDE's authentication agent
+# can be present in the session, but privileged settings still fail until the
+# system polkit authority is running on the system bus.
+ebegin "Starting PolicyKit authority"
+POLKIT_OK=1
+if [ -x /usr/lib/polkit-1/polkitd ] && [ -S /run/dbus/system_bus_socket ]; then
+    if ! pidof polkitd >/dev/null 2>&1; then
+        /usr/lib/polkit-1/polkitd --no-debug >>/var/log/polkit.log 2>&1 &
+    fi
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if pidof polkitd >/dev/null 2>&1; then POLKIT_OK=0; break; fi
+        sleep 0.1
+    done
+fi
+eend "$POLKIT_OK"
+unset POLKIT_OK
 # udev processes coldplug events before audio discovers hardware. It runs
 # independently of systemd PID 1; BusyBox init remains the service manager.
 ebegin "Starting device manager"

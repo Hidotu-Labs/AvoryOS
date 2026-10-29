@@ -46,6 +46,11 @@ struct net_packet {
 };
 typedef void (*net_rx_handler_t)(struct net_packet *);
 
+struct net_rx_frame {
+  const void *data;
+  size_t length;
+};
+
 void net_core_init(void);
 void net_core_start_worker(void);
 void net_core_start_timer(void);
@@ -60,6 +65,9 @@ struct net_device *net_device_find(const char *name);
 void net_set_rx_handler(net_rx_handler_t);
 net_rx_handler_t net_get_rx_handler(void);
 bool net_rx_submit_irq(struct net_device *, const void *, size_t);
+/* Submit a burst with one queue-lock acquisition and one worker wake. */
+size_t net_rx_submit_batch_irq(struct net_device *,
+                               const struct net_rx_frame *, size_t);
 void net_queue_snapshot(uint32_t *queued, uint32_t *in_use);
 void net_print_stats(const struct net_device *);
 #endif

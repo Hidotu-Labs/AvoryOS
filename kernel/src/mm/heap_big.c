@@ -1,4 +1,5 @@
 #include "mm/heap_internal.h"
+#include "console/klog.h"
 #include "lib/string.h"
 #include "mm/pmm.h"
 
@@ -39,8 +40,19 @@ void *heap_big_alloc(size_t size) {
 }
 
 bool heap_big_free(void *ptr, uint64_t page_base) {
-  (void)ptr;
   struct big_alloc *b = (struct big_alloc *)page_base;
+
+  if ((uint64_t)ptr != page_base + sizeof(struct big_alloc)) {
+    klogf("[WARN] kfree: pointer is not the start of a big allocation ptr=0x%016llX base=0x%016llX\n",
+          (unsigned long long)(uintptr_t)ptr,
+          (unsigned long long)page_base);
+    return false;
+  }
+  if (b->pages == 0) {
+    klogf("[WARN] kfree: big allocation has an invalid page count ptr=0x%016llX\n",
+          (unsigned long long)(uintptr_t)ptr);
+    return false;
+  }
 
   spinlock_acquire(&heap_vmem_lock);
   if (b->prev)

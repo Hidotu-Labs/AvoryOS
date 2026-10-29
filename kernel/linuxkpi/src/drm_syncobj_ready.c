@@ -4,7 +4,6 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
 #include <drm/drm_syncobj.h>
-#include <linuxkpi/gpu_perf.h>
 
 int linuxkpi_original_drm_syncobj_timeline_wait_ioctl(struct drm_device *dev,
     void *data, struct drm_file *file_private);
@@ -40,12 +39,7 @@ int drm_syncobj_timeline_wait_ioctl(struct drm_device *dev, void *data,
     if (!ready)
         goto fallback;
     args->first_signaled = 0;
-    gpu_perf_syncobj_ready();
     return 0;
-fallback: {
-    __UINT64_TYPE__ start = gpu_perf_syncobj_wait_start();
-    int ret = linuxkpi_original_drm_syncobj_timeline_wait_ioctl(dev, data, file_private);
-    gpu_perf_syncobj_wait_finish(start, args->timeout_nsec == 0, ret);
-    return ret;
-}
+fallback:
+    return linuxkpi_original_drm_syncobj_timeline_wait_ioctl(dev, data, file_private);
 }

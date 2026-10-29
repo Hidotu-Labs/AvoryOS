@@ -134,11 +134,11 @@ static inline void futex_bucket_note(uint32_t bucket, bool woke_anyone) {
  * sched_wakeup() only after dropping the bucket lock is therefore safe only
  * if the waiting thread cannot be freed in between, so the waker claims the
  * thread while it still holds the lock of the bucket the waiter was found in.
- * The reaper waits for futex_wake_claims to reach zero before releasing the
- * stack: a claim is always made under a bucket lock the waiter currently
- * resides in, so a claim made after the reaper's scan of that bucket is
- * impossible (the waiter would already be unlinked), and waiting for zero
- * after the full scan is enough.
+ * The reaper defers releasing the stack while any claim remains: a futex claim
+ * is always made under a bucket lock the waiter currently resides in, so a
+ * claim made after the reaper's scan of that bucket is impossible (the waiter
+ * would already be unlinked), and checking for zero after the full scan is
+ * enough.
  *
  * Wakes are batched through a small on-stack array because the waiter itself
  * must not be touched once the bucket lock is gone.
@@ -268,11 +268,12 @@ static uint32_t futex_lock_waiter(struct futex_waiter *waiter) {
 // waiters live in futex_wait() stack frames; forced exit_group teardown does
 // not return through that function, so entries must be detached before the
 // kernel stack is released.
-void futex_remove_thread_waiters(struct thread *thread) {
-  if (!thread || !futex_initialized)
-    return;
+bool futex_remove_thread_waiters(struct thread *thread) {
+  if (!thread)
+    return true;
 
-  for (uint32_t bucket = 0; bucket < FUTEX_HASH_SIZE; bucket++) {
+  for (uint32_t bucket = 0; futex_initialized && bucket < FUTEX_HASH_SIZE;
+       bucket++) {
     // Fast path: skip empty buckets locklessly without touching spinlock
     if (__atomic_load_n(&futex_hash[bucket].waiters, __ATOMIC_RELAXED) == 0)
       continue;
@@ -291,15 +292,12 @@ void futex_remove_thread_waiters(struct thread *thread) {
 
   /* A waker that unlinked one of the waiters above claimed the thread before
    * dropping the bucket lock and still has to deliver its sched_wakeup().
-   * The count cannot grow again after the scan: every claim is made under a
-   * bucket lock while the waiter is linked, so it is visible to (and ordered
-   * before) the scan, or the scan unlinked the waiter first.  Wait with
-   * interrupts already masked by the caller; the claim window itself is not
-   * preemptible, so this drains in one sched_wakeup() worth of work. */
-  while (__atomic_load_n(&thread->futex_wake_claims, __ATOMIC_ACQUIRE) != 0) {
-    tlb_shootdown_poll();
-    __asm__ volatile("pause" ::: "memory");
-  }
+   * Futex claims cannot grow again after the scan: they are made under a
+   * bucket lock while the waiter is linked, so the claim is either observed
+   * here or the scan unlinked the waiter first. Signal pins are rechecked
+   * under tid_lock by the reaper. Never spin here: sched_reap_thread() defers
+   * cleanup while any wake pin is live, allowing its owner to run. */
+  return __atomic_load_n(&thread->futex_wake_claims, __ATOMIC_ACQUIRE) == 0;
 }
 
 /* The operation's PRIVATE flag is a fast-path promise, not a requirement for
@@ -532,6 +530,9 @@ static inline uint64_t futex_wake_key(struct futex_key key, uint32_t val, uint32
   if (val == 1) {
     struct thread *to_wake = NULL;
     uint64_t lock_flags[2];
+    /* Keep the claim-to-delivery interval non-preemptible, like the batched
+     * path below. This avoids a same-CPU reaper retry between unlink and wake. */
+    hal_irq_state_t irq_flags = hal_irq_save();
     futex_bucket_acquire(bucket, bucket, lock_flags);
 
     struct futex_waiter *w = futex_hash[bucket].head;
@@ -552,9 +553,11 @@ static inline uint64_t futex_wake_key(struct futex_key key, uint32_t val, uint32
     if (to_wake) {
       sched_wakeup(to_wake);
       __atomic_sub_fetch(&to_wake->futex_wake_claims, 1, __ATOMIC_RELEASE);
+      hal_irq_restore(irq_flags);
       futex_bucket_note(bucket, true);
       return 1;
     }
+    hal_irq_restore(irq_flags);
     futex_bucket_note(bucket, false);
     LOCKDIAG_STAT(futex_wake_nomatch, 1);
     return 0;

@@ -29,9 +29,9 @@
 #define KSM_EAGER_INTERVAL 1500u
 #define KSM_MAX_EAGER_INTERVAL (KSM_EAGER_INTERVAL * 40u) /* ~60 s */
 
-/* Background mode: slow enough that an application launch very rarely
- * overlaps a pass, frequent enough that dedup still accrues. */
-#define KSM_IDLE_INTERVAL 15000u /* ~15 s */
+/* Background mode is deliberately sparse: avoid competing with interactive
+ * launches when memory is plentiful, while still finding long-lived dupes. */
+#define KSM_IDLE_INTERVAL 60000u /* ~60 s */
 #define KSM_MAX_IDLE_INTERVAL 120000u /* ~2 min */
 
 struct ksm_node {
@@ -155,6 +155,7 @@ uint64_t ksm_scan_pass(void) {
     uint64_t cr3 = targets[target_idx].cr3;
     uint32_t first = ksm_node_count;
     unsigned work = 0;
+    bool needs_initial_flush = false;
     spinlock_acquire(&mm->lock);
     struct vma *stack[64];
     int sp = 0;
@@ -189,12 +190,21 @@ uint64_t ksm_scan_pass(void) {
         uint64_t *pte = vmm_get_pte_ptr((uint64_t *)cr3, va);
         if (!pte || !(*pte & PAGE_FLAG_PRESENT) || !(*pte & PAGE_FLAG_USER))
           continue;
-        uint64_t phys = *pte & PAGE_MASK;
+        uint64_t entry = *pte;
+        uint64_t phys = entry & PAGE_MASK;
         if (phys == zero_page_phys || phys == vdso_phys ||
             !pmm_is_managed(phys) || pmm_get_ref((void *)phys) != 1)
           continue;
+        /* Already-COW pages have no writable translation to revoke: they
+         * were published read-only by fork or an earlier KSM pass. Reusing
+         * them as candidates avoids flushing the whole mm on every scan. */
+        if (!(entry & PAGE_FLAG_RW) && !(entry & PAGE_FLAG_COW))
+          continue;
         pmm_incref((void *)phys);
-        *pte = (*pte & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
+        if (entry & PAGE_FLAG_RW) {
+          *pte = (entry & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
+          needs_initial_flush = true;
+        }
         ksm_node_pool[ksm_node_count++] = (struct ksm_node){
             .phys_page = phys, .va = va};
       }
@@ -210,7 +220,8 @@ uint64_t ksm_scan_pass(void) {
     }
     /* Spinlocks mask IRQs, so the synchronous flush MUST be outside them.
      * No page contents may be read until stale writable mappings are gone. */
-    tlb_shootdown_context_for(cr3);
+    if (needs_initial_flush)
+      tlb_shootdown_context_for(cr3);
 
     /* Hash and compare WITHOUT mm->lock.  Contents are stable here: the
      * frames are frozen (no writable mapping survives the flush above) and
@@ -262,6 +273,7 @@ uint64_t ksm_scan_pass(void) {
      * lock was dropped; replace and insert decisions for it are discarded
      * (its frozen frame still served as a correct content candidate). */
     spinlock_acquire(&mm->lock);
+    uint32_t replaced_pages = 0;
     for (uint32_t idx = first; idx < ksm_node_count; idx++) {
       struct ksm_node *snapshot = &ksm_node_pool[idx];
       uint64_t phys = snapshot->phys_page;
@@ -275,6 +287,7 @@ uint64_t ksm_scan_pass(void) {
          * shootdown and release below. */
         pmm_free_page((void *)phys);
         freed_pages++;
+        replaced_pages++;
       } else if (snapshot->replacement && snapshot->replacement != zero_page_phys) {
         /* The comparison reserved a reference for a new mapping. A CoW or
          * unmap during hashing cancels that mapping, so return its reference.
@@ -284,7 +297,8 @@ uint64_t ksm_scan_pass(void) {
       }
     }
     spinlock_release(&mm->lock);
-    tlb_shootdown_context_for(cr3);
+    if (replaced_pages)
+      tlb_shootdown_context_for(cr3);
     sched_yield();
   }
 
@@ -327,7 +341,7 @@ static void ksm_worker(void) {
       idle_mode = low_memory;
       klog_puts(low_memory
           ? "[KSM] memory pressure: eager scan mode (1.5 s base, max 60 s)\n"
-          : "[KSM] plenty of RAM: background dedup (15 s base, max 2 min)\n");
+          : "[KSM] plenty of RAM: background dedup (60 s base, max 2 min)\n");
       interval = low_memory ? KSM_EAGER_INTERVAL : KSM_IDLE_INTERVAL;
     }
 

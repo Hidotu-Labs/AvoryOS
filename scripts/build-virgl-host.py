@@ -13,7 +13,11 @@ PATCH = ROOT/'scripts/virgl/missing-vertex-buffer.patch'
 LEGACY_PATCH = ROOT/'scripts/virgl/missing-vertex-buffer-v1.patch'
 LEGACY_BINDING_PATCH = ROOT/'scripts/virgl/nvidia-vertex-binding-v1.patch'
 PATCHES = (PATCH, ROOT/'scripts/virgl/fog-semantic.patch',
-           ROOT/'scripts/virgl/nvidia-vertex-binding.patch')
+           ROOT/'scripts/virgl/nvidia-vertex-binding.patch',
+           ROOT/'scripts/virgl/vertex-shader-selection.patch',
+           ROOT/'scripts/virgl/host-dispatch-profile.patch',
+           ROOT/'scripts/virgl/draw-state-overhead.patch',
+           ROOT/'scripts/virgl/compat-context.patch')
 COMMIT = 'ca50e008863837e094747a69974dde3ae148aeaa'  # upstream 1.3.0
 
 def run(args, **kwargs):

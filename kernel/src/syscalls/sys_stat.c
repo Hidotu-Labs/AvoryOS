@@ -399,10 +399,10 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
     if (!buf || !is_user_ptr((uint64_t)buf)) return (uint64_t)-14;
 
     size_t   written = 0;
-    uint32_t index   = t->fd_offsets[fd];
+    uint64_t cookie  = t->fd_offsets[fd];
 
     while (1) {
-        struct dirent *de = vfs_readdir(node, index);
+        struct dirent *de = vfs_readdir(node, cookie);
         if (!de) break;
 
         size_t name_len   = strlen(de->name);
@@ -413,7 +413,7 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
         struct linux_dirent64 *entry = (struct linux_dirent64 *)(buf + written);
         memset(buf + written, 0, entry_size);
         entry->d_ino    = de->ino;
-        entry->d_off    = (uint64_t)(index + 1);
+        entry->d_off    = de->d_off;
         entry->d_reclen = (uint16_t)entry_size;
         /* The backend already classified the entry; asking the VFS to resolve
          * every name again was the quadratic part of a directory listing. */
@@ -421,10 +421,10 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
 
         strcpy(entry->d_name, de->name);
         written += entry_size;
-        index++;
+        cookie = de->d_off;
     }
 
-    t->fd_offsets[fd] = index;
+    t->fd_offsets[fd] = cookie;
     return written;
 }
 
@@ -442,10 +442,10 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
     if (!buf || !vmm_is_user_addr_range_valid(dirp, count)) return (uint64_t)-14;
 
     size_t   written = 0;
-    uint32_t index   = t->fd_offsets[fd];
+    uint64_t cookie  = t->fd_offsets[fd];
 
     while (1) {
-        struct dirent *de = vfs_readdir(node, index);
+        struct dirent *de = vfs_readdir(node, cookie);
         if (!de) break;
         size_t name_len   = strlen(de->name);
         size_t entry_size = 8 + 8 + 2 + name_len + 2;
@@ -455,14 +455,14 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
         struct linux_dirent *entry = (struct linux_dirent *)(buf + written);
         memset(buf + written, 0, entry_size);
         entry->d_ino    = de->ino;
-        entry->d_off    = (uint64_t)(index + 1);
+        entry->d_off    = de->d_off;
         entry->d_reclen = (uint16_t)entry_size;
         strcpy(entry->d_name, de->name);
         written += entry_size;
-        index++;
+        cookie = de->d_off;
     }
 
-    t->fd_offsets[fd] = index;
+    t->fd_offsets[fd] = cookie;
     return written;
 }
 
@@ -503,11 +503,8 @@ static int64_t statfs_handle_missing(vfs_node_t *node, struct statfs_buf *buf) {
     if (type == FS_SOCKET) { statfs_pseudo(buf, SOCKFS_MAGIC); return 0; }
     if (type == FS_EPOLL)  { statfs_pseudo(buf, ANON_INODE_FS_MAGIC); return 0; }
     if (__atomic_add_fetch(&statfs_nohandler_count, 1, __ATOMIC_RELAXED) <= 8) {
-        klog_puts("[STATFS] no handler: type=");
-        klog_uint64(type);
-        klog_puts(" inode=");
-        klog_uint64(node ? (uint64_t)node->inode : 0);
-        klog_puts("\n");
+        klogf("[STATFS] no handler: type=%u inode=%u\n", type,
+              node ? node->inode : 0);
     }
     return -38; /* ENOSYS */
 }

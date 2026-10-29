@@ -31,7 +31,6 @@
 #include "syscalls/syscall.h"
 #include <stdint.h>
 #include <linuxkpi/gpu_diag.h>
-#include <linuxkpi/gpu_perf.h>
 
 #define PROC_SUPER_MAGIC 0x9fa0
 
@@ -2111,7 +2110,7 @@ static vfs_node_t *procfs_pid_fd_finddir(vfs_node_t *node, char *name) {
   return link;
 }
 
-static struct dirent *procfs_pid_fd_readdir(vfs_node_t *node, uint32_t index) {
+static struct dirent *procfs_pid_fd_readdir(vfs_node_t *node, uint64_t index) {
   if (!procfs_pid_ptrace_access(node->impl)) return NULL;
   uint32_t pid = node->impl;
 
@@ -2210,7 +2209,7 @@ static vfs_node_t *procfs_pid_fdinfo_finddir(vfs_node_t *node, char *name) {
   return finfo;
 }
 
-static struct dirent *procfs_pid_fdinfo_readdir(vfs_node_t *node, uint32_t index) {
+static struct dirent *procfs_pid_fdinfo_readdir(vfs_node_t *node, uint64_t index) {
   if (!procfs_pid_ptrace_access(node->impl)) return NULL;
   uint32_t pid = node->impl;
 
@@ -2319,7 +2318,7 @@ static vfs_node_t *procfs_pid_ns_finddir(vfs_node_t *node, char *name) {
   return NULL;
 }
 
-static struct dirent *procfs_pid_ns_readdir(vfs_node_t *node, uint32_t index) {
+static struct dirent *procfs_pid_ns_readdir(vfs_node_t *node, uint64_t index) {
   if (!procfs_pid_visible(node->impl)) return NULL;
   struct dirent *d = vfs_readdir_buffer();
   memset(d, 0, sizeof(*d));
@@ -2609,7 +2608,7 @@ static uint32_t procfs_task_nlink(vfs_node_t *node) {
   return 2 + sched_get_group_threads(node->impl, 0, NULL);
 }
 
-static struct dirent *procfs_task_readdir(vfs_node_t *node, uint32_t index) {
+static struct dirent *procfs_task_readdir(vfs_node_t *node, uint64_t index) {
   struct dirent *dent = vfs_readdir_buffer();
   memset(dent, 0, sizeof(*dent));
   dent->d_type = DT_DIR;
@@ -3132,7 +3131,7 @@ static int procfs_self_readlink(vfs_node_t *node, char *buf, uint32_t size) {
 //   N+2 ..   → live PID entries (one per thread in global_thread_list)
 
 
-static struct dirent *procfs_root_readdir(vfs_node_t *node, uint32_t index) {
+static struct dirent *procfs_root_readdir(vfs_node_t *node, uint64_t index) {
   struct dirent *procfs_dent = vfs_readdir_buffer();
   memset(procfs_dent, 0, sizeof(*procfs_dent));
 
@@ -3275,7 +3274,16 @@ void procfs_init(void) {
     procfs_root->statfs = procfs_statfs;
 
     extern const char *kernel_boot_cmdline;
-    gpu_perf_init(kernel_boot_cmdline);
+    const char *diag_option = kernel_boot_cmdline;
+    while (diag_option && *diag_option) {
+      if ((diag_option == kernel_boot_cmdline || diag_option[-1] == ' ') &&
+          !strncmp(diag_option, "gpu_diag=0", 10) &&
+          (!diag_option[10] || diag_option[10] == ' ')) {
+        gpu_diag_control(1, (const unsigned char *)"0");
+        break;
+      }
+      diag_option++;
+    }
     vfs_open(procfs_root); // Permanent reference for the mount entry
 
     // Apply the mount: anyone looking up 'proc' will now get our virtual root

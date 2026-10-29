@@ -5,4 +5,6 @@
 
 void af_inet_init(void);
 
+void inet_diag_describe(socket_t *sock, char *out, size_t outsz);
+
 #endif

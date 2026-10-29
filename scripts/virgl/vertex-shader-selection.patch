@@ -1,0 +1,33 @@
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -3439,6 +3439,8 @@
+    struct vrend_vertex_element_array *v;
+ 
+    if (!handle) {
++      if (ctx->sub->ve)
++         ctx->sub->shader_dirty = true;
+       ctx->sub->ve = NULL;
+       return;
+    }
+@@ -3448,8 +3450,11 @@
+       return;
+    }
+ 
+-   if (ctx->sub->ve != v)
++   if (ctx->sub->ve != v) {
+       ctx->sub->vbo_dirty = true;
++      /* Shader keys depend on vertex formats, not buffer identities. */
++      ctx->sub->shader_dirty = true;
++   }
+    ctx->sub->ve = v;
+ 
+    if (v->count > vrend_state.max_vertex_attributes) {
+@@ -5959,7 +5964,7 @@
+    }
+ 
+    if (sub_ctx->shader_dirty || sub_ctx->swizzle_output_rgb_to_bgr ||
+-       sub_ctx->needs_manual_srgb_encode_bitmask || sub_ctx->vbo_dirty)
++       sub_ctx->needs_manual_srgb_encode_bitmask)
+       program_select_result = vrend_select_program(sub_ctx, info->vertices_per_patch);
+ 
+    if (!sub_ctx->prog || program_select_result == PROGRAMM_ERROR) {

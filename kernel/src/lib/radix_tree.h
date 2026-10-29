@@ -18,14 +18,14 @@ struct asc_radix_tree_allocator {
   void *context;
 };
 
-/* First two words of every radix node, reserved for tree users that defer
- * node reclamation.  Layout matches fs/vfs_rcu.h's struct vfs_rcu_head (queue
- * link + reclaim callback), so a deferred-free hook may enqueue a departing
- * node through this slot without allocating.  The tree itself never reads or
- * writes it; the slot only matters while a tree has a deferred-free hook. */
+/* First words of every radix node, reserved for tree users that defer node
+ * reclamation. Layout matches fs/vfs_rcu.h's struct vfs_rcu_head, including
+ * the duplicate-enqueue guard. The tree itself never reads or writes it. */
 struct radix_tree_defer_slot {
   void *next;
   void *reclaim;
+  uint32_t queued;
+  uint32_t reserved;
 };
 
 typedef bool (*asc_radix_tree_iter_fn)(uint64_t index, void *value, void *context);
@@ -79,8 +79,8 @@ void *asc_radix_tree_lookup_lockless_cached(const struct radix_tree *tree,
                                              uint32_t *cached_seq);
 
 /* Route every node freed by mutations through `free_fn(node, context)`.
- * Set once after init, before the tree is shared.  The node's first two words
- * are the radix_tree_defer_slot the hook may queue through. */
+ * Set once after init, before the tree is shared. The node starts with the
+ * radix_tree_defer_slot the hook may queue through. */
 void asc_radix_tree_set_deferred_free(struct radix_tree *tree,
                                       void (*free_fn)(void *node,
                                                       void *context),

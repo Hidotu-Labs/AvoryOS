@@ -78,6 +78,10 @@ static void gpu_wait_for_control(uint64_t start){
   assert(virtio_gpu_render_submit(&req,sizeof(req),NULL,0));
  }
 }
+static void gpu_wait_for_control_progress(uint64_t start,const uint64_t *completed){
+ if(gpu.stats.commands_completed!=*completed)return;
+ gpu_wait_for_control(start);
+}
 '''
 helpers = r'''
 static void gpu_drain_completions(void){LOCKDIAG_SPOT_LOCK(0,&gpu_poll_lock);gpu_reap_control_locked();LOCKDIAG_SPOT_UNLOCK(0,&gpu_poll_lock);}
@@ -167,6 +171,23 @@ int main(void){
  assert(!virtio_gpu_render_wait(&shared_ref,1,8));
  assert(nr==1&&gpu_render_pending==1);
  ready=nr;gpu_drain_completions();gpu_render_reclaim();complete_one=false;
+ /* An older unrelated batch must not hold a completed newer producer.
+  * Test WAIT and cross-context sharing, including immediate slot reuse. */
+ for(unsigned mode=0;mode<3;mode++){
+  assert(virtio_gpu_render_submit(&req,sizeof(req),NULL,0));
+  shared_refs=malloc(sizeof(*shared_refs));shared_refs[0]=&shared;shared.refs++;
+  assert(virtio_gpu_render_submit(&req,sizeof(req),shared_refs,1));
+  complete_on_wait=true;complete_one=true;reverse=true;
+  queue_later=mode==2;
+  unsigned before=waits;
+  if(mode==0)assert(!virtio_gpu_render_wait_bo(&shared,false));
+  else assert(!virtio_gpu_render_wait(&shared_ref,1,8));
+  assert(waits==before+1&&nr==(mode==2?2U:1U));
+  assert(virtio_gpu_wait_idle(true)==-16);
+  ready=nr;gpu_drain_completions();gpu_render_reclaim();
+ }
+ complete_one=false;reverse=false;
+ puts("PASS: BO and cross-context waits ignore older unrelated work and reused producer slots");
  /* One BO can occur repeatedly in several batches and contexts. A newer
   * completion must clear only its own slot, including with duplicate handles.
   * Reusing that slot for another BO must not create a stale dependency. */
@@ -233,3 +254,10 @@ with tempfile.TemporaryDirectory(prefix='virgl-render-queue-') as tmp:
     subprocess.run(['cc','-O2',str(path/'mask-mutant.c'),'-o',str(path/'mask-mutant')],check=True)
     assert subprocess.run([str(path/'mask-mutant')],capture_output=True).returncode != 0
     print('PASS: clearing another pending batch\'s dependency fails the reordered shared-BO regression')
+
+    mutant = code.replace('gpu_render_jobs[i].fence == fences[i]', 'true')
+    assert mutant != code
+    (path/'reuse-mutant.c').write_text(mutant)
+    subprocess.run(['cc','-O2',str(path/'reuse-mutant.c'),'-o',str(path/'reuse-mutant')],check=True)
+    assert subprocess.run([str(path/'reuse-mutant')],capture_output=True).returncode != 0
+    print('PASS: tracking slots without fence identities fails the immediate-reuse regression')

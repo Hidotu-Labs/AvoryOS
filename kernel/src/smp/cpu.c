@@ -27,11 +27,15 @@ extern uint8_t trampoline_start[];
 extern uint8_t trampoline_end[];
 extern uint8_t trampoline_data_cr3[];
 extern uint8_t trampoline_data_rip[];
-extern uint8_t trampoline_data_stack[];
+extern uint8_t trampoline_data_ap_count[];
+extern uint8_t trampoline_ap_records[];
+extern uint8_t trampoline_ap_records_end[];
 
 // Storage
 static struct cpu_info cpus[MAX_CPUS];
 static uint32_t cpu_count = 0;
+/* These early routines also publish shared feature caches and ISR state. */
+static volatile uint32_t ap_shared_init_lock;
 
 // Helpers
 
@@ -146,9 +150,7 @@ static inline uint32_t get_initial_apic_id(void) {
 
 // AP Entry Point
 
-static volatile struct cpu_info *starting_cpu = NULL;
-
-void ap_main(void) {
+void ap_main(struct cpu_info *bootstrap) {
   klog_puts("AP IN MAIN!\n");
   DBG("[AP] entered long mode\n");
 
@@ -158,13 +160,17 @@ void ap_main(void) {
   // This must be done FIRST because gdt_flush zeroes data segments like GS,
   // and we depend on the 64-bit code segment for subsequent interrupt handling.
   // Each AP also loads its own TSS so TSS.RSP0 is private to this core.
-  struct cpu_info *bootstrap = (struct cpu_info *)starting_cpu;
   gdt_load_ap(bootstrap ? bootstrap->cpu_id : 0);
+
+  /* APs now enter concurrently. Serialize the routines that publish shared
+   * feature caches and LAPIC handler state; CPU-local setup can still overlap. */
+  while (__atomic_exchange_n(&ap_shared_init_lock, 1, __ATOMIC_ACQUIRE))
+    hal_cpu_relax();
   cpu_features_init();
   DBG("[AP] gdt + cpu features ok\n");
 
   // 1. Setup GS base using the pointer passed by the BSP
-  cpu_set_gs_base((struct cpu_info *)starting_cpu);
+  cpu_set_gs_base(bootstrap);
   struct cpu_info *current = cpu_get_current();
 
   // 1.5 Switch to the dedicated kernel stack and page tables.
@@ -177,6 +183,7 @@ void ap_main(void) {
 
   // 2. Initialize the LAPIC for this core (needs the HHDM base mapping)
   lapic_init((uint64_t)acpi_get_lapic_base());
+  __atomic_store_n(&ap_shared_init_lock, 0, __ATOMIC_RELEASE);
   DBG("[AP] cpu %u: lapic ok\n", current->cpu_id);
 
   // 3. Load the IDT for this core (reuse the BSP's already-built table)
@@ -402,30 +409,35 @@ static bool ap_wait_icr_idle(uint32_t timeout_us) {
   return lapic_icr_idle();
 }
 
-static bool ap_wait_online(struct cpu_info *ap, uint32_t timeout_ms) {
-  uint64_t khz = tsc_get_freq_khz();
-  if (khz != 0) {
-    uint64_t cycles = khz * (uint64_t)timeout_ms;
-    uint64_t start = rdtsc();
-    while (__atomic_load_n(&ap->status, __ATOMIC_ACQUIRE) !=
-           CPU_STATUS_ONLINE) {
-      if (rdtsc() - start >= cycles)
-        break;
-      hal_cpu_relax();
-    }
-  } else {
-    for (uint64_t i = 0; i < (uint64_t)timeout_ms * 200000; i++) {
-      if (__atomic_load_n(&ap->status, __ATOMIC_ACQUIRE) == CPU_STATUS_ONLINE)
-        break;
-      hal_cpu_relax();
-    }
-  }
+static bool ap_is_online(const struct cpu_info *ap) {
   return __atomic_load_n(&ap->status, __ATOMIC_ACQUIRE) == CPU_STATUS_ONLINE;
 }
 
-// Put a CPU back into wait-for-SIPI state.  Called when an AP did not come
-// online so it cannot wake up later and consume the shared trampoline baton
-// that the next AP is about to reuse.
+static bool ap_wait_all_online(uint32_t timeout_ms) {
+  uint64_t khz = tsc_get_freq_khz();
+  uint64_t start = rdtsc();
+  uint64_t cycles = khz ? khz * (uint64_t)timeout_ms : 0;
+  uint64_t fallback_iterations = (uint64_t)timeout_ms * 200000;
+
+  for (uint64_t iteration = 0;; iteration++) {
+    bool all_online = true;
+    for (uint32_t i = 1; i < cpu_count; i++) {
+      if (cpus[i].status != CPU_STATUS_BSP && cpus[i].stack_top &&
+          !ap_is_online(&cpus[i])) {
+        all_online = false;
+        break;
+      }
+    }
+    if (all_online)
+      return true;
+    if ((khz && rdtsc() - start >= cycles) ||
+        (!khz && iteration >= fallback_iterations))
+      return false;
+    hal_cpu_relax();
+  }
+}
+
+// Put an AP back into wait-for-SIPI state after a timed-out batch startup.
 static void ap_park(uint32_t apic_id) {
   lapic_write_icr(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_ASSERT);
   (void)ap_wait_icr_idle(1000);
@@ -434,66 +446,10 @@ static void ap_park(uint32_t apic_id) {
   (void)ap_wait_icr_idle(1000);
 }
 
-// Returns true when the AP reached CPU_STATUS_ONLINE.
-static bool ap_start(struct cpu_info *ap, volatile uint64_t *ptr_stack,
-                     uint8_t sipi_vector) {
-  *ptr_stack = ap->stack_top;
-  starting_cpu = ap;
-
-  DBG("[SMP] AP %u (APIC 0x%x): INIT assert\n", ap->cpu_id, ap->apic_id);
-
-  // Intel SDM 8.4.4: INIT is a level-triggered assertion followed by a
-  // deassert.  The old sequence sent an edge-encoded INIT and a single
-  // STARTUP; some real chipsets ignore that INIT and then drop the SIPI,
-  // leaving the BSP spinning in the old unbounded ONLINE loop forever.
-  lapic_write_icr(ap->apic_id,
-                  LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_ASSERT);
-  if (!ap_wait_icr_idle(1000))
-    DBG("[SMP] AP %u: INIT delivery status stuck busy\n", ap->cpu_id);
-  ap_delay_us(10000);
-
-  lapic_write_icr(ap->apic_id,
-                  LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_DEASSERT);
-  (void)ap_wait_icr_idle(1000);
-  ap_delay_us(200);
-
-  // Send STARTUP twice: the first SIPI can be lost while the AP is still
-  // finishing its reset microcode.
-  for (int attempt = 0; attempt < 2; attempt++) {
-    DBG("[SMP] AP %u: SIPI #%d -> vector 0x%x\n", ap->cpu_id, attempt + 1,
-        sipi_vector);
-    lapic_write_icr(ap->apic_id,
-                    LAPIC_ICR_STARTUP | LAPIC_ICR_EDGE | sipi_vector);
-    if (!ap_wait_icr_idle(1000))
-      DBG("[SMP] AP %u: SIPI #%d delivery status stuck busy\n", ap->cpu_id,
-          attempt + 1);
-    ap_delay_us(200);
-    if (__atomic_load_n(&ap->status, __ATOMIC_ACQUIRE) == CPU_STATUS_ONLINE) {
-      DBG("[SMP] AP %u: online\n", ap->cpu_id);
-      return true;
-    }
-  }
-
-  if (ap_wait_online(ap, 1000)) {
-    DBG("[SMP] AP %u: online (late)\n", ap->cpu_id);
-    return true;
-  }
-
-  // Park the AP before the caller reuses the trampoline for the next CPU.
-  DBG("[SMP] AP %u: no response after 2 SIPIs; parking and continuing\n",
-      ap->cpu_id);
-  ap_park(ap->apic_id);
-
-  console_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET " CPU ");
-  print_uint32(ap->cpu_id);
-  console_puts(" (APIC ID 0x");
-  print_hex32(ap->apic_id);
-  console_puts(") did not come online.\n");
-  return false;
-}
-
 void cpu_init_aps(void) {
-  // Step 7: Wake up the Application Processors
+  // Start all APs from immutable per-CPU records. The SIPI trampoline can
+  // therefore resolve each AP independently, while the BSP batches the
+  // protocol's fixed waits instead of paying 10 ms per core.
   if (cpu_count > 1) {
     DBG("[SMP] cpu_init_aps: entering bring-up\n");
     console_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
@@ -504,38 +460,130 @@ void cpu_init_aps(void) {
 
     uint64_t tramp_phys = 0x8000;
     uint64_t tramp_virt = tramp_phys + pmm_get_hhdm_offset();
+    size_t trampoline_size = (size_t)(trampoline_end - trampoline_start);
+
+    if (trampoline_size > PAGE_SIZE) {
+      klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
+                " AP trampoline exceeds its SIPI page; APs remain offline.\n");
+      goto publish_gs_fastpath;
+    }
 
     // Copy trampoline code to 0x8000
-    memcpy((void *)tramp_virt, trampoline_start,
-           trampoline_end - trampoline_start);
+    memcpy((void *)tramp_virt, trampoline_start, trampoline_size);
 
     // Identity-map the 0x8000 page in the active PML4 so the AP safely
     // transitions PAGING -> 64-bit Long Mode
     if (!vmm_map_page(vmm_get_active_pml4(), tramp_phys, tramp_phys,
                       PAGE_FLAG_RW | PAGE_FLAG_PRESENT)) {
       klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
-                             " Warning: Failed to map trampoline page\n");
+                " AP trampoline mapping failed; APs remain offline.\n");
+      goto publish_gs_fastpath;
     }
 
-    // Find offsets to modify the trampoline variables natively
+    // Find offsets into the relocated low-memory copy.
     uint64_t cr3_offset = trampoline_data_cr3 - trampoline_start;
     uint64_t rip_offset = trampoline_data_rip - trampoline_start;
-    uint64_t stack_offset = trampoline_data_stack - trampoline_start;
+    uint64_t count_offset = trampoline_data_ap_count - trampoline_start;
+    uint64_t records_offset = trampoline_ap_records - trampoline_start;
 
     volatile uint64_t *ptr_cr3 = (volatile uint64_t *)(tramp_virt + cr3_offset);
     volatile uint64_t *ptr_rip = (volatile uint64_t *)(tramp_virt + rip_offset);
-    volatile uint64_t *ptr_stack =
-        (volatile uint64_t *)(tramp_virt + stack_offset);
+    volatile uint32_t *ptr_ap_count =
+        (volatile uint32_t *)(tramp_virt + count_offset);
 
-    // We only write these once since they are globally identical for all APs
+    struct trampoline_ap_record {
+      uint32_t apic_id;
+      uint32_t reserved;
+      uint64_t stack_top;
+      uint64_t cpu_info;
+    };
+    _Static_assert(sizeof(struct trampoline_ap_record) == 24,
+                   "trampoline AP record layout changed");
+    struct trampoline_ap_record *records =
+        (struct trampoline_ap_record *)(tramp_virt + records_offset);
+    size_t record_capacity =
+        (size_t)(trampoline_ap_records_end - trampoline_ap_records) /
+        sizeof(*records);
+    if (cpu_count - 1 > record_capacity) {
+      klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
+                " AP count exceeds trampoline handoff capacity.\n");
+      goto publish_gs_fastpath;
+    }
+
+    // These two values are identical for every AP in this startup batch.
     *ptr_cr3 = cr3;
     *ptr_rip = (uint64_t)ap_main;
 
     uint8_t vector = tramp_phys >> 12; // 0x08
 
+    uint32_t record_count = 0;
+    for (uint32_t i = 1; i < cpu_count; i++) {
+      if (cpus[i].status == CPU_STATUS_BSP || cpus[i].stack_top == 0)
+        continue;
+      records[record_count++] = (struct trampoline_ap_record){
+          .apic_id = cpus[i].apic_id,
+          .reserved = 0,
+          .stack_top = cpus[i].stack_top,
+          .cpu_info = (uint64_t)&cpus[i],
+      };
+    }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    *ptr_ap_count = record_count;
+
     DBG("[SMP] %u AP(s) to start; LAPIC mode: %s; trampoline at 0x%x\n",
-        cpu_count - 1, lapic_is_x2apic() ? "x2APIC (MSR)" : "xAPIC (MMIO)",
+        record_count, lapic_is_x2apic() ? "x2APIC (MSR)" : "xAPIC (MMIO)",
         (unsigned)tramp_phys);
+
+    // INIT is asserted for every AP first. The one mandatory 10 ms wait then
+    // covers the whole machine, rather than being repeated for each AP.
+    for (uint32_t i = 1; i < cpu_count; i++) {
+      if (cpus[i].status == CPU_STATUS_BSP || cpus[i].stack_top == 0)
+        continue;
+      DBG("[SMP] AP %u (APIC 0x%x): batched INIT assert\n", cpus[i].cpu_id,
+          cpus[i].apic_id);
+      lapic_write_icr(cpus[i].apic_id,
+                      LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_ASSERT);
+      if (!ap_wait_icr_idle(1000))
+        DBG("[SMP] AP %u: INIT delivery status stuck busy\n", cpus[i].cpu_id);
+    }
+    ap_delay_us(10000);
+
+    for (uint32_t i = 1; i < cpu_count; i++) {
+      if (cpus[i].status == CPU_STATUS_BSP || cpus[i].stack_top == 0)
+        continue;
+      lapic_write_icr(cpus[i].apic_id,
+                      LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_DEASSERT);
+      if (!ap_wait_icr_idle(1000))
+        DBG("[SMP] AP %u: INIT deassert delivery status stuck busy\n",
+            cpus[i].cpu_id);
+    }
+    ap_delay_us(200);
+
+    for (uint32_t i = 1; i < cpu_count; i++) {
+      if (cpus[i].status == CPU_STATUS_BSP || cpus[i].stack_top == 0)
+        continue;
+      lapic_write_icr(cpus[i].apic_id,
+                      LAPIC_ICR_STARTUP | LAPIC_ICR_EDGE | vector);
+      if (!ap_wait_icr_idle(1000))
+        DBG("[SMP] AP %u: first SIPI delivery status stuck busy\n",
+            cpus[i].cpu_id);
+    }
+    ap_delay_us(200);
+
+    for (uint32_t i = 1; i < cpu_count; i++) {
+      if (cpus[i].status == CPU_STATUS_BSP || cpus[i].stack_top == 0)
+        continue;
+      lapic_write_icr(cpus[i].apic_id,
+                      LAPIC_ICR_STARTUP | LAPIC_ICR_EDGE | vector);
+      if (!ap_wait_icr_idle(1000))
+        DBG("[SMP] AP %u: second SIPI delivery status stuck busy\n",
+            cpus[i].cpu_id);
+    }
+    ap_delay_us(200);
+
+    // All APs now have private stacks and records, so they can enter together.
+    // Use one timeout for the batch, then park only APs that missed it.
+    (void)ap_wait_all_online(1000);
 
     uint32_t online = 1; // the BSP
     uint32_t failed = 0;
@@ -543,14 +591,25 @@ void cpu_init_aps(void) {
     for (uint32_t i = 1; i < cpu_count; i++) {
       if (cpus[i].status == CPU_STATUS_BSP)
         continue;
-
-      if (ap_start(&cpus[i], ptr_stack, vector))
+      if (ap_is_online(&cpus[i])) {
         online++;
-      else
+      } else {
         failed++;
+        if (cpus[i].stack_top)
+          ap_park(cpus[i].apic_id);
+        console_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET " CPU ");
+        print_uint32(cpus[i].cpu_id);
+        console_puts(" (APIC ID 0x");
+        print_hex32(cpus[i].apic_id);
+        console_puts(") did not come online.\n");
+      }
     }
 
     if (failed > 0) {
+      /* A timed-out AP may have been reset while holding the early shared
+       * init lock. Every AP still below ONLINE has now been parked, so clear
+       * that abandoned lock before the BSP publishes the fast GS path. */
+      __atomic_store_n(&ap_shared_init_lock, 0, __ATOMIC_RELEASE);
       console_puts(KLOG_CLR_YELLOW "[ WARN ]" KLOG_CLR_RESET " ");
       print_uint32(failed);
       console_puts(" Application Processor(s) failed to start; continuing with ");
@@ -559,6 +618,7 @@ void cpu_init_aps(void) {
     }
   }
 
+publish_gs_fastpath:
   /* The BSP and every AP that successfully started have their own GS base.
    * Keep using RDMSR during bootstrap, then publish the safe GS:0 fast path
    * once no additional AP can still be running with the trampoline GS state. */

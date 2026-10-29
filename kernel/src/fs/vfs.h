@@ -139,6 +139,7 @@ struct dirent {
   char name[128];
   uint32_t ino;
   uint8_t d_type; // DT_* value; readdir backends fill this in
+  uint64_t d_off; // Opaque cookie to resume after this entry.
 };
 
 /* Directory entry types (Linux DT_* values). */
@@ -173,7 +174,7 @@ typedef void (*open_type_t)(struct vfs_node *);
 typedef void (*close_type_t)(struct vfs_node *);
 typedef struct vfs_node *(*open_instance_type_t)(struct vfs_node *);
 typedef int (*ioctl_type_t)(struct vfs_node *, uint32_t request, uint64_t arg);
-typedef struct dirent *(*readdir_type_t)(struct vfs_node *, uint32_t);
+typedef struct dirent *(*readdir_type_t)(struct vfs_node *, uint64_t);
 typedef struct vfs_node *(*finddir_type_t)(struct vfs_node *, char *name);
 typedef int (*create_type_t)(struct vfs_node *, char *name,
                              uint16_t permission);
@@ -217,6 +218,10 @@ typedef int (*statfs_type_t)(struct vfs_node *, struct statfs_buf *buf);
 typedef struct vfs_node {
   struct vfs_node *view_backing; /* Namespace path view; callbacks use the backing inode. */
   struct vfs_node *view_parent; /* Owned path ancestry, not the backing inode parent. */
+  /* Owned parent for ordinary VFS nodes. This keeps openat(dirfd, "..")
+   * anchored to the opened directory even after its pathname is removed. */
+  struct vfs_node *parent_node;
+  spinlock_t parent_lock;
   uint64_t mount_id; // Stable VFS mount identity, inherited during lookup
   uint64_t filesystem_mount_flags; // Immutable backing RO/NOSUID/NODEV/NOEXEC policy
   char name[128];
@@ -294,6 +299,9 @@ typedef struct vfs_node {
    * somebody was about to read through.  Use the helpers below. */
   uint32_t refcount;
   uint32_t magic; // VFS_NODE_MAGIC while the node is live
+  /* Serializes final-close and explicit retirement so only one path releases
+   * payload state and queues the node for RCU reclamation. */
+  uint32_t reclaim_state;
 
   struct radix_tree pages; // Cached pages keyed by file page index
   spinlock_t pages_lock;   // Serializes compound cache/value-lifetime changes
@@ -309,8 +317,10 @@ typedef struct vfs_node {
   uint32_t ra_seq_hits;
 
   /* Optional sequential readdir cursor used by filesystems with indexed API. */
-  uint32_t readdir_cursor_index;
+  uint64_t readdir_cursor_cookie;
   uint32_t readdir_cursor_offset;
+  uint32_t readdir_cursor_generation;
+  uint32_t readdir_generation;
   spinlock_t readdir_cursor_lock;
 
   /* Deferred-reclamation link (fs/vfs_rcu.c).  Valid only while the node sits
@@ -372,7 +382,7 @@ static inline bool vfs_node_tryref(vfs_node_t *node) {
 static inline bool vfs_node_unref(vfs_node_t *node) {
   return __atomic_sub_fetch(&node->refcount, 1, __ATOMIC_ACQ_REL) == 0;
 }
-struct dirent *vfs_readdir(vfs_node_t *node, uint32_t index);
+struct dirent *vfs_readdir(vfs_node_t *node, uint64_t cookie);
 struct dirent *vfs_readdir_buffer(void);
 vfs_node_t *vfs_finddir(vfs_node_t *node, char *name);
 void vfs_dentry_invalidate(vfs_node_t *parent, const char *name);

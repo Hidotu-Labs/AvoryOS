@@ -1215,6 +1215,62 @@ void vfs_open(vfs_node_t *node) {
   }
 }
 
+/* A final close and explicit retire can both observe refcount zero.  Claiming
+ * the node first prevents duplicate teardown and duplicate RCU queue entries. */
+static bool vfs_node_claim_reclaim(vfs_node_t *node) {
+  uint32_t expected = 0;
+  return __atomic_compare_exchange_n(&node->reclaim_state, &expected, 1, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+static void vfs_node_reclaim_done(vfs_node_t *node, bool released) {
+  __atomic_store_n(&node->reclaim_state, released ? 2u : 0u,
+                   __ATOMIC_RELEASE);
+}
+
+/* Ordinary VFS nodes keep their actual parent vnode instead of reconstructing
+ * ancestry from a pathname that can disappear while an open directory is
+ * still in use. The lock lets rename, lookup, and final reclamation transfer
+ * the owned reference without racing a concurrent openat(".."). */
+static void vfs_node_set_parent(vfs_node_t *node, vfs_node_t *parent) {
+  if (!node || !parent || node == parent ||
+      (node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
+    return;
+
+  vfs_node_ref(parent);
+  spinlock_acquire(&node->parent_lock);
+  vfs_node_t *old_parent = node->parent_node;
+  if (old_parent == parent) {
+    spinlock_release(&node->parent_lock);
+    vfs_close(parent);
+    return;
+  }
+  node->parent_node = parent;
+  spinlock_release(&node->parent_lock);
+  if (old_parent)
+    vfs_close(old_parent);
+}
+
+static vfs_node_t *vfs_node_parent_ref(vfs_node_t *node) {
+  if (!node)
+    return NULL;
+  spinlock_acquire(&node->parent_lock);
+  vfs_node_t *parent = node->parent_node;
+  if (parent)
+    vfs_node_ref(parent);
+  spinlock_release(&node->parent_lock);
+  return parent;
+}
+
+static void vfs_node_release_parent(vfs_node_t *node) {
+  spinlock_acquire(&node->parent_lock);
+  vfs_node_t *parent = node->parent_node;
+  node->parent_node = NULL;
+  spinlock_release(&node->parent_lock);
+  if (parent)
+    vfs_close(parent);
+}
+
 void vfs_close(vfs_node_t *node) {
   if (!node || node == (vfs_node_t *)-1)
     return;
@@ -1223,6 +1279,9 @@ void vfs_close(vfs_node_t *node) {
   void *wq = node->wait_queue;
 
   if (vfs_node_unref(node)) {
+    if (!vfs_node_claim_reclaim(node))
+      return;
+
     /* A namespace view's close drops its backing inode and parent path. The
      * last parent can destroy an ephemeral filesystem, so flush the view's
      * mapping cache while those references still keep the backing alive. */
@@ -1244,12 +1303,18 @@ void vfs_close(vfs_node_t *node) {
       node->destroy(node);
       node->destroy = NULL;
     }
-    if (!(node->flags & FS_PERSISTENT) || (node->flags & FS_DELETED)) {
+    vfs_node_release_parent(node);
+    bool release_node = !(node->flags & FS_PERSISTENT) ||
+                        (node->flags & FS_DELETED);
+    if (release_node) {
       node->magic = 0;
       vfs_xattr_clear(node);
+      vfs_node_reclaim_done(node, true);
       /* The last kfree is deferred: lockless cache readers may still hold this
        * pointer between an entry scan and their tryref (fs/vfs_rcu.h). */
       vfs_rcu_defer_free(node);
+    } else {
+      vfs_node_reclaim_done(node, false);
     }
     return;
   }
@@ -1267,18 +1332,23 @@ void vfs_node_retire(vfs_node_t *node) {
   if (!node)
     return;
 
-  node->flags |= FS_DELETED;
+  __atomic_or_fetch(&node->flags, FS_DELETED, __ATOMIC_RELEASE);
   if (__atomic_load_n(&node->refcount, __ATOMIC_ACQUIRE) != 0)
     return; /* the last vfs_close() finishes the teardown */
+
+  if (!vfs_node_claim_reclaim(node))
+    return; /* a concurrent final close/retire owns the teardown */
 
   vfs_cache_clear(node);
   if (node->destroy) {
     node->destroy(node);
     node->destroy = NULL;
   }
+  vfs_node_release_parent(node);
   node->magic = 0;
   vfs_xattr_clear(node);
   /* See vfs_close(): the final free waits for a grace period. */
+  vfs_node_reclaim_done(node, true);
   vfs_rcu_defer_free(node);
 }
 
@@ -1289,9 +1359,15 @@ struct dirent *vfs_readdir_buffer(void) {
   return t ? &t->readdir_result : &boot_result;
 }
 
-struct dirent *vfs_readdir(vfs_node_t *node, uint32_t index) {
+struct dirent *vfs_readdir(vfs_node_t *node, uint64_t cookie) {
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->readdir) {
-    return node->readdir(node, index);
+    struct dirent *entry = node->readdir(node, cookie);
+    /* Legacy backends use ordinal positions. Cookie-aware filesystems fill
+     * this field themselves; keep the old enumeration ABI working for the
+     * remaining synthetic/read-only directories. */
+    if (entry && !entry->d_off)
+      entry->d_off = cookie + 1;
+    return entry;
   }
   return 0;
 }
@@ -1300,6 +1376,11 @@ vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
   if (node && (node->view_backing || vfs_namespace_active())) {
     if (node == fs_root) node = vfs_task_root();
     return vfs_namespace_finddir(node, name);
+  }
+  if (node && name && !strcmp(name, "..")) {
+    vfs_node_t *parent = vfs_node_parent_ref(node);
+    if (parent)
+      return parent;
   }
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->finddir && name) {
     uint16_t len = 0;
@@ -1311,6 +1392,8 @@ vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
     if (__builtin_expect(cached != NULL, 1)) {
       if (!cached->mount_id)
         cached->mount_id = node->mount_id ? node->mount_id : 1;
+      if (strcmp(name, ".") && strcmp(name, ".."))
+        vfs_node_set_parent(cached, node);
       return cached;
     }
     if (negative)
@@ -1343,18 +1426,29 @@ vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
       vfs_close(res);
       res = next;
     }
+    if (strcmp(name, ".") && strcmp(name, ".."))
+      vfs_node_set_parent(res, node);
     vfs_dentry_insert_fast(node, name, len, hash, comp_hash, name_prefix, res);
     return res;
   }
   return 0;
 }
 
+static void vfs_readdir_generation_advance(vfs_node_t *node) {
+  /* Namespace views delegate enumeration to their backing nodes. Advance both
+   * generations so a cached ext4 cursor notices mutations through either view. */
+  for (unsigned depth = 0; node && depth < 16; depth++, node = node->view_backing)
+    __atomic_add_fetch(&node->readdir_generation, 1, __ATOMIC_RELEASE);
+}
+
 int vfs_create(vfs_node_t *node, char *name, uint16_t permission) {
   if (vfs_mount_readonly(node))
     return -30;
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->create) {
+    vfs_readdir_generation_advance(node);
     int result = node->create(node, name, permission);
     if (result == 0) {
+      vfs_readdir_generation_advance(node);
       vfs_dentry_invalidate_created(node, name);
       inotify_notify(node, IN_CREATE, name, 0);
     }
@@ -1367,10 +1461,23 @@ int vfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
   if (vfs_mount_readonly(node))
     return -30;
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->mkdir) {
+    vfs_readdir_generation_advance(node);
     int result = node->mkdir(node, name, permission);
     if (result == 0) {
+      vfs_readdir_generation_advance(node);
       vfs_dentry_invalidate_created(node, name);
       inotify_notify(node, IN_CREATE | IN_ISDIR, name, 0);
+    } else {
+      /* A concurrent mkdir can win after the caller's existence check but
+       * before this filesystem's serialized insert. Refresh a negative
+       * dentry and report the POSIX result for that race instead of leaking
+       * a backend's generic -1 as EPERM to userspace. */
+      vfs_dentry_invalidate_created(node, name);
+      vfs_node_t *existing = vfs_finddir(node, name);
+      if (existing) {
+        vfs_close(existing);
+        return -17; // EEXIST
+      }
     }
     return result;
   }
@@ -1386,8 +1493,10 @@ int vfs_unlink(vfs_node_t *node, char *name) {
      * removing its name, while open descriptors and mappings drain normally. */
     vfs_node_t *target = vfs_finddir(node, name);
     vfs_dentry_invalidate(node, name);
+    vfs_readdir_generation_advance(node);
     int result = node->unlink(node, name);
     if (result == 0) {
+      vfs_readdir_generation_advance(node);
       inotify_notify(node, IN_DELETE, name, 0);
       if (target) {
         inotify_notify(target, IN_DELETE_SELF, NULL, 0);
@@ -1407,8 +1516,10 @@ int vfs_rmdir(vfs_node_t *node, char *name) {
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->rmdir) {
     vfs_node_t *target = vfs_finddir(node, name);
     vfs_dentry_invalidate(node, name);
+    vfs_readdir_generation_advance(node);
     int rc = node->rmdir(node, name);
     if (!rc) {
+      vfs_readdir_generation_advance(node);
       inotify_notify(node, IN_DELETE | IN_ISDIR, name, 0);
       if (target) inotify_notify(target, IN_DELETE_SELF | IN_ISDIR, NULL, 0);
     }
@@ -1429,8 +1540,10 @@ int vfs_symlink(vfs_node_t *node, char *name, char *target) {
   if (vfs_mount_readonly(node))
     return -30;
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->symlink) {
+    vfs_readdir_generation_advance(node);
     int result = node->symlink(node, name, target);
     if (result == 0) {
+      vfs_readdir_generation_advance(node);
       vfs_dentry_invalidate_created(node, name);
       inotify_notify(node, IN_CREATE, name, 0);
     }
@@ -1460,8 +1573,10 @@ int vfs_rename(vfs_node_t *node, char *old_name, char *new_name) {
     vfs_node_t *replaced = vfs_finddir(node, new_name);
     vfs_dentry_invalidate(node, old_name);
     vfs_dentry_invalidate(node, new_name);
+    vfs_readdir_generation_advance(node);
     int result = node->rename(node, old_name, new_name);
     if (result == 0) {
+      vfs_readdir_generation_advance(node);
       /* Readers can refill either entry while the backend rename waits or
        * performs I/O. Drop pre-mutation positive/negative entries again once
        * the new namespace state is installed. */
@@ -1496,8 +1611,11 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
       new_parent->rename == ext2_rename_impl && old_parent->device &&
       old_parent->device == new_parent->device &&
       old_parent->inode == new_parent->inode) {
+    vfs_readdir_generation_advance(new_parent);
     vfs_dentry_invalidate(new_parent, new_name);
     int rc = vfs_rename(old_parent, old_name, new_name);
+    if (!rc)
+      vfs_readdir_generation_advance(new_parent);
     vfs_dentry_invalidate(new_parent, new_name);
     return rc;
   }
@@ -1512,7 +1630,15 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
     vfs_node_t *replaced = vfs_finddir(new_parent, new_name);
     vfs_dentry_invalidate(old_parent, old_name);
     vfs_dentry_invalidate(new_parent, new_name);
+    vfs_readdir_generation_advance(old_parent);
+    vfs_readdir_generation_advance(new_parent);
     int rc = ext2_rename_cross(old_parent, old_name, new_parent, new_name);
+    if (!rc) {
+      vfs_readdir_generation_advance(old_parent);
+      vfs_readdir_generation_advance(new_parent);
+      if (source && (source->flags & FS_TYPE_MASK) == FS_DIRECTORY)
+        vfs_node_set_parent(source, new_parent);
+    }
     vfs_dentry_invalidate(old_parent, old_name);
     vfs_dentry_invalidate(new_parent, new_name);
     if (!rc) vfs_notify_move(old_parent, old_name, new_parent, new_name, source, replaced);
@@ -1534,7 +1660,15 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
      * successful move (Qt renames its login socket into place this way). */
     vfs_dentry_invalidate(old_parent, old_name);
     vfs_dentry_invalidate(new_parent, new_name);
+    vfs_readdir_generation_advance(old_parent);
+    vfs_readdir_generation_advance(new_parent);
     int rc = tmpfs_rename_cross(old_parent, old_name, new_parent, new_name);
+    if (!rc) {
+      vfs_readdir_generation_advance(old_parent);
+      vfs_readdir_generation_advance(new_parent);
+      if (source && (source->flags & FS_TYPE_MASK) == FS_DIRECTORY)
+        vfs_node_set_parent(source, new_parent);
+    }
     vfs_dentry_invalidate(old_parent, old_name);
     vfs_dentry_invalidate(new_parent, new_name);
     if (!rc) vfs_notify_move(old_parent, old_name, new_parent, new_name, source, replaced);
@@ -1569,8 +1703,10 @@ int vfs_mknod(vfs_node_t *node, char *name, uint16_t permission, uint32_t flags,
   if (vfs_mount_readonly(node))
     return -30;
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->mknod) {
+    vfs_readdir_generation_advance(node);
     int result = node->mknod(node, name, permission, flags, device);
     if (result == 0) {
+      vfs_readdir_generation_advance(node);
       vfs_dentry_invalidate_created(node, name);
       inotify_notify(node, IN_CREATE, name, 0);
     }
@@ -1900,6 +2036,11 @@ reset_walk:
         resumed = false;
         goto reset_walk;
       }
+      vfs_node_t *parent = vfs_finddir(current, "..");
+      if (parent) {
+        vfs_close(current);
+        current = parent;
+      }
       continue;
     }
 
@@ -2043,12 +2184,14 @@ void vfs_node_init(vfs_node_t *node) {
   memset(node, 0, sizeof(vfs_node_t));
   INIT_LIST_HEAD(&node->ep_watchers);
   spinlock_init(&node->ep_lock);
+  spinlock_init(&node->parent_lock);
   asc_radix_tree_init(&node->pages);
   vfs_page_cache_tree_init(&node->pages);
   spinlock_init(&node->pages_lock);
   spinlock_init(&node->readdir_cursor_lock);
   node->refcount = 1;
   node->magic = VFS_NODE_MAGIC;
+  node->reclaim_state = 0;
 }
 
 bool vfs_node_is_alive(const vfs_node_t *node) {

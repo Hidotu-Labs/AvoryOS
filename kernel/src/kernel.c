@@ -81,7 +81,6 @@
 #include "net/udp.h"
 #include "net/tcp.h"
 #include "sched/sched.h"
-#include "shell/shell.h"
 #include "smp/cpu.h"
 #include "socket/epoll.h"
 #include "socket/socket.h"
@@ -327,14 +326,12 @@ static void init_thread_entry(void) {
       continue;
     }
 
-    // Fallback: try bash directly if sh failed
+    // Last userland fallback: try Bash directly.
     const char *bash_argv[] = {"/bin/bash", NULL};
     if (!process_exec_argv(bash_argv)) {
       klog_puts("\n" KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
-                " Failed to start Bash. Falling back to shell.\n");
-      shell_init();
-      shell_run();
-      break;
+                " No userspace init could be started; halting.\n");
+      halt();
     }
   }
 }

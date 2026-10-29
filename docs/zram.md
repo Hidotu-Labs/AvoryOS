@@ -56,10 +56,14 @@ native automatic swap implementation, not the complete Linux zram control ABI.
 The [Linux zram documentation](https://docs.kernel.org/admin-guide/blockdev/zram.html)
 describes that broader ABI.
 
-Memory pinning was previously a successful no-op. With compressed swap enabled,
-`mlock`, `mlockall` and `mlock2` now return `EOPNOTSUPP`, rather than promise
-that pages cannot be swapped without implementing pinning. Anonymous mappings
-created with MAP_LOCKED are conservatively excluded from compressed reclaim.
+`mlock` faults in the requested pages and marks them so compressed reclaim
+skips them; `munlock` clears those marks. `mlockall(MCL_CURRENT)` applies the
+same behavior to current mappings. `MCL_FUTURE` currently keeps the whole
+address space out of compressed reclaim until `munlockall`, including mappings
+that existed before the call. Lock state is not inherited across fork.
+`mlock2(MLOCK_ONFAULT)` is still unsupported. Anonymous mappings created with
+MAP_LOCKED are also excluded from compressed reclaim. Per-process
+`RLIMIT_MEMLOCK` accounting is not implemented yet.
 `MADV_COLD` is now a content-preserving hint, and `MADV_PAGEOUT` compresses
 eligible pages instead of discarding them. Both had previously followed the
 anonymous discard path.
@@ -67,13 +71,15 @@ anonymous discard path.
 ## Ownership and races
 
 A candidate frame is pinned and write-protected under the address-space and
-page-table locks. A synchronous TLB shootdown removes stale writable aliases
-before compression reads its data. Compression and allocation happen off those
-locks. Installation revalidates the VMA, PTE, frame and exclusive mapping count;
-a concurrent write, fork or replacement cancels installation safely. A second
-shootdown finishes before the former physical mapping and scan pin are freed.
-Read-only PTEs never acquire a new CoW permission during freezing, including
-when compression fails.
+page-table locks. Synchronous page-scoped TLB shootdowns remove stale writable
+aliases before compression reads its data, then remove the old mapping before
+its frame is freed. They avoid evicting translations from unrelated active
+address spaces; cached PCID entries on inactive CPUs are invalidated before
+that address space runs again. Compression and allocation happen off those
+locks. Installation
+revalidates the VMA, PTE, frame and exclusive mapping count; a concurrent write,
+fork or replacement cancels installation safely. Read-only PTEs never acquire
+a new CoW permission during freezing, including when compression fails.
 
 A compressed slot is immutable. Each PTE and in-flight reader owns a reference.
 Fork retains slot references; each fault restores a private physical copy.

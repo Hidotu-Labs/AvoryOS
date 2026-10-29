@@ -24,15 +24,16 @@
 #define VFS_RCU_ACCUMULATE_MS 2
 #define VFS_RCU_ACCUMULATE_LIMIT 256
 
-/* The page cache queues a departing radix node by its address, so the node's
- * first two words (struct radix_tree_defer_slot) must be layout-identical to
- * the queue head the drainer will read back. */
+/* The page cache queues a departing radix node by its address, so the
+ * radix_tree_defer_slot must match the queue head layout exactly. */
 _Static_assert(sizeof(struct vfs_rcu_head) == sizeof(struct radix_tree_defer_slot),
                "vfs_rcu_head must match the radix deferred-free slot");
 _Static_assert(__builtin_offsetof(struct vfs_rcu_head, next) == 0 &&
                    __builtin_offsetof(struct radix_tree_defer_slot, next) == 0 &&
                    __builtin_offsetof(struct vfs_rcu_head, reclaim) ==
-                       __builtin_offsetof(struct radix_tree_defer_slot, reclaim),
+                       __builtin_offsetof(struct radix_tree_defer_slot, reclaim) &&
+                   __builtin_offsetof(struct vfs_rcu_head, queued) ==
+                       __builtin_offsetof(struct radix_tree_defer_slot, queued),
                "vfs_rcu_head field offsets must match the radix slot");
 
 /* Objects released by the last reference, oldest first.  The queue links
@@ -216,6 +217,7 @@ static void vfs_rcu_reclaim(struct vfs_rcu_head *batch) {
     /* `next` is read before the reclaim: it may kfree the object that holds
      * this very link word. */
     struct vfs_rcu_head *next = batch->next;
+    __atomic_store_n(&batch->queued, 2, __ATOMIC_RELEASE);
     batch->reclaim(batch);
     batch = next;
     freed++;
@@ -232,11 +234,17 @@ void vfs_rcu_defer(struct vfs_rcu_head *head,
   if (!head || !reclaim)
     return;
 
+  uint32_t expected = 0;
+  if (!__atomic_compare_exchange_n(&head->queued, &expected, 1, false,
+                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    return;
+
   if (!vfs_rcu_ready()) {
     /* No engine: the lockless lookups are gated on vfs_rcu_ready() too, so
      * every reader holds a real reference and this object is already
      * unreachable.  Immediate reclaim is then the pre-RCU behavior, and boot
      * does not pile up objects for a drainer that may never come. */
+    __atomic_store_n(&head->queued, 2, __ATOMIC_RELEASE);
     reclaim(head);
     return;
   }
@@ -284,19 +292,24 @@ static void vfs_rcu_worker(void) {
       if (!self)
         return;
       wait_queue_entry_t entry = { .thread = self, .next = NULL };
+      hal_irq_state_t flags = hal_irq_save();
+      self->wakeup_ticks = 0;
       self->state = THREAD_BLOCKED;
       wait_queue_add(&vfs_rcu_wait, &entry);
       if (!vfs_rcu_queue_empty()) {
         self->state = THREAD_RUNNING;
         wait_queue_remove(&vfs_rcu_wait, &entry);
+        hal_irq_restore(flags);
         continue;
       }
-      /* Timed fallback: keeps the queue moving even if a wake was lost. */
-      self->wakeup_ticks = lapic_timer_get_ticks() + 100;
+      hal_irq_restore(flags);
       sched_yield();
+      flags = hal_irq_save();
       self->wakeup_ticks = 0;
-      self->state = THREAD_RUNNING;
+      if (self->state == THREAD_BLOCKED)
+        self->state = THREAD_RUNNING;
       wait_queue_remove(&vfs_rcu_wait, &entry);
+      hal_irq_restore(flags);
       continue;
     }
 

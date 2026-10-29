@@ -232,11 +232,11 @@ static int inet6_connect(socket_t *sock, struct sockaddr *addr, int len) {
     wait_queue_entry_t wqe = { .thread = self, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL };
     while (s->tcp->state == TCP_SYN_SENT && !s->tcp->error &&
            lapic_timer_get_ticks() < deadline) {
-      if (self) {
-        self->state = THREAD_BLOCKED;
-        self->wakeup_ticks = lapic_timer_get_ticks() + 50;
-      }
       wait_queue_add(sock->wait_queue, &wqe);
+      if (self) {
+        self->wakeup_ticks = deadline;
+        self->state = THREAD_BLOCKED;
+      }
       if (s->tcp->state != TCP_SYN_SENT || s->tcp->error) {
         if (self) {
           self->state = THREAD_RUNNING;
@@ -408,8 +408,21 @@ static int inet6_poll(socket_t *sock, int events) {
     if (s->tcp->state == TCP_ESTABLISHED || s->tcp->state == TCP_CLOSE_WAIT) {
       if ((events & POLLIN) && tcp_readable(s->tcp)) r |= POLLIN;
       if ((events & POLLOUT) && tcp_writable(s->tcp)) r |= POLLOUT;
-    } else if (s->tcp->state == TCP_RESET) r |= POLLERR | POLLHUP;
-    else if (s->tcp->state != TCP_SYN_SENT) r |= POLLHUP;
+    } else if (s->tcp->state == TCP_FIN_WAIT_1 ||
+               s->tcp->state == TCP_FIN_WAIT_2) {
+      /* Local half-close: no hangup/readability until the peer sends data
+       * or its FIN; a nonblocking read is still EAGAIN here. */
+      if ((events & POLLIN) && tcp_readable(s->tcp)) r |= POLLIN;
+    } else if (s->tcp->state == TCP_LAST_ACK ||
+               s->tcp->state == TCP_TIME_WAIT ||
+               s->tcp->state == TCP_CLOSED) {
+      if ((events & POLLIN) && tcp_readable(s->tcp)) r |= POLLIN;
+      r |= POLLHUP;
+    } else if (s->tcp->state == TCP_RESET) {
+      r |= POLLERR | POLLHUP;
+    } else if (s->tcp->state != TCP_SYN_SENT) {
+      r |= POLLHUP;
+    }
     if (s->tcp->error) r |= POLLERR;
     return r;
   }
@@ -793,6 +806,32 @@ static void udp6_input(const uint8_t src[16], const uint8_t dst[16],
 }
 
 static net_family_t family = {.family=AF_INET6, .create=inet6_create};
+void inet6_diag_describe(struct socket *sock, char *out, size_t outsz) {
+  if (!sock || !sock->sk || !out || outsz < 2)
+    return;
+  struct inet6_sock *s = (struct inet6_sock *)sock->sk;
+
+  if (s->tcp) {
+    struct tcp_tcb *t = s->tcp;
+    snprintf(out, outsz,
+             " inet6:tcp st=%d pc=%d err=%d rx=%lu tx=%lu list=%d",
+             t->state, t->peer_closed ? 1 : 0, t->error,
+             (unsigned long)(t->rx_head - t->rx_tail),
+             (unsigned long)(t->tx_head - t->snd_una),
+             t->state == TCP_LISTEN ? 1 : 0);
+  } else if (s->udp4) {
+    struct udp_socket *u = s->udp4;
+    snprintf(out, outsz, " inet6:udp4 used=%d q=%lu depth=%lu conn=%d",
+             u->used ? 1 : 0,
+             (unsigned long)(u->q_head - u->q_tail),
+             (unsigned long)u->rx_depth, u->connected ? 1 : 0);
+  } else {
+    snprintf(out, outsz, " inet6:udp6 q=%lu used=%d conn=%d",
+             (unsigned long)(s->head - s->tail), s->used ? 1 : 0,
+             s->connected ? 1 : 0);
+  }
+}
+
 void af_inet6_init(void) {
   spinlock_init(&udp6_lock); memset(udp6, 0, sizeof(udp6));
   sock_register_family(&family); ipv6_set_udp_handler(udp6_input);

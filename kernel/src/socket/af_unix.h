@@ -15,4 +15,6 @@ sock_ops_t *unix_get_ops(void);
 
 net_family_t *unix_get_family(void);
 
+void unix_diag_describe(socket_t *sock, char *out, size_t outsz);
+
 #endif // AF_UNIX_H

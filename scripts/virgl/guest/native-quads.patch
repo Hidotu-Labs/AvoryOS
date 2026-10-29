@@ -1,0 +1,13 @@
+--- a/src/gallium/drivers/virgl/virgl_screen.c
++++ b/src/gallium/drivers/virgl/virgl_screen.c
+@@ -317,6 +317,10 @@
+       BITFIELD_MASK(MESA_PRIM_COUNT) &
+       ~BITFIELD_BIT(MESA_PRIM_QUADS) &
+       ~BITFIELD_BIT(MESA_PRIM_QUAD_STRIP);
++   /* Compatibility hosts can consume quads directly. Core/GLES hosts keep
++    * the existing index-conversion path through their advertised mask. */
++   caps->supported_prim_modes |= vscreen->caps.caps.v1.prim_mask &
++      (BITFIELD_BIT(MESA_PRIM_QUADS) | BITFIELD_BIT(MESA_PRIM_QUAD_STRIP));
+    caps->primitive_restart =
+    caps->primitive_restart_fixed_index = vscreen->caps.caps.v1.bset.primitive_restart;
+    caps->shader_stencil_export = vscreen->caps.caps.v1.bset.shader_stencil_export;

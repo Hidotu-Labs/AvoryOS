@@ -1,6 +1,7 @@
 #include "net/core.h"
 #include "apic/lapic_timer.h"
 #include "console/klog.h"
+#include "hal/hal.h"
 #include "lib/string.h"
 #include "lock/spinlock.h"
 #include "mm/heap.h"
@@ -11,6 +12,7 @@
 #include "smp/cpu.h"
 
 #define NET_PACKET_HOT_CAPACITY 64
+#define NET_RX_BATCH_MAX 64
 /* RX buffers come directly from PMM: unlike kmalloc's OOM fallback, this
  * never invokes filesystem/cache reclaim from a NIC interrupt. One page owns
  * both the packet and its intrusive queue link. */
@@ -37,8 +39,8 @@ static struct net_device *devices[NET_DEVICE_MAX];
 static net_rx_handler_t rx_handler;
 static bool ready;
 
-/* PMM statistics walk free lists, so sample only in thread context and
- * outside the RX lock. IRQ admission reads the resulting cached budget. */
+/* Refresh the pressure budget in thread context and outside the RX lock.
+ * IRQ admission only reads the resulting cached limit. */
 static void refresh_rx_budget(void) {
   uint64_t available = pmm_get_free_pages();
   spinlock_acquire(&lock);
@@ -140,25 +142,28 @@ static void net_worker(void) {
       }
     }
 
+    /* Publish the blocked state and queue entry with local ticks masked. The
+     * queue recheck closes the enqueue-before-park race, so idle workers do
+     * not need periodic timeout wakeups. */
+    hal_irq_state_t flags = hal_irq_save();
+    self->wakeup_ticks = 0;
     self->state = THREAD_BLOCKED;
     wait_queue_add(&worker_wait, entry);
     spinlock_acquire(&lock);
     bool empty = (queue_head == NULL);
     if (!empty) {
       self->state = THREAD_RUNNING;
-    } else {
-      self->wakeup_ticks = lapic_timer_get_ticks() + 50;
     }
     spinlock_release(&lock);
-    if (empty) {
+    hal_irq_restore(flags);
+    if (empty)
       sched_yield();
-      self->wakeup_ticks = 0;
-    } else {
-      self->wakeup_ticks = 0;
-      wait_queue_remove(&worker_wait, entry);
-      continue;
-    }
+
+    flags = hal_irq_save();
+    self->state = THREAD_RUNNING;
+    self->wakeup_ticks = 0;
     wait_queue_remove(&worker_wait, entry);
+    hal_irq_restore(flags);
   }
 }
 
@@ -174,53 +179,95 @@ static void net_timer_worker(void) {
       last_budget = now;
     }
     tcp_timer_tick(now);
-    self->state = THREAD_SLEEPING;
+    /* Publish the timer deadline before a tick can observe SLEEPING. */
+    hal_irq_state_t flags = hal_irq_save();
     self->wakeup_ticks = lapic_timer_get_ticks() + 10;
+    self->state = THREAD_SLEEPING;
+    hal_irq_restore(flags);
     sched_yield();
     self->wakeup_ticks = 0;
   }
 }
 
-bool net_rx_submit_irq(struct net_device *dev, const void *frame, size_t len) {
-  if (!ready || !frame || !len || len > NET_FRAME_MAX) {
+size_t net_rx_submit_batch_irq(struct net_device *dev,
+                               const struct net_rx_frame *frames,
+                               size_t count) {
+  if (!ready || !frames || !count || count > NET_RX_BATCH_MAX) {
     if (dev && (uintptr_t)dev >= 0xFFFF800000000000ULL)
-      dev->stats.rx_errors++;
-    return false;
+      __atomic_add_fetch(&dev->stats.rx_errors, count, __ATOMIC_RELAXED);
+    return 0;
   }
   if (!dev || (uintptr_t)dev < 0xFFFF800000000000ULL)
     dev = default_device;
   if (!dev)
-    return false;
+    return 0;
+
+  struct rx_buffer *accepted[NET_RX_BATCH_MAX];
+  size_t accepted_indices[NET_RX_BATCH_MAX];
+  size_t accepted_count = 0;
+  uint64_t generation = __atomic_load_n(&dev->generation, __ATOMIC_ACQUIRE);
+  uint64_t dropped = 0;
+  bool report_pressure = false;
   spinlock_acquire(&lock);
-  struct rx_buffer *p = alloc_locked();
-  if (!p) {
-    dev->stats.rx_dropped++;
-    dev->stats.queue_full++;
+  for (size_t i = 0; i < count; i++) {
+    if (!frames[i].data || !frames[i].length ||
+        frames[i].length > NET_FRAME_MAX) {
+      dev->stats.rx_errors++;
+      continue;
+    }
+    struct rx_buffer *p = alloc_locked();
+    if (!p) {
+      dev->stats.rx_dropped++;
+      dev->stats.queue_full++;
+      dropped++;
+      continue;
+    }
+    accepted[accepted_count] = p;
+    accepted_indices[accepted_count++] = i;
+  }
+  if (dropped) {
     /* Serialize rate limiting with queue state; IRQ producers run on SMP. */
     static uint64_t last_pressure_log;
     uint64_t now = lapic_timer_get_ticks();
-    bool report = now - last_pressure_log >= 1000;
-    if (report)
+    report_pressure = now - last_pressure_log >= 1000;
+    if (report_pressure)
       last_pressure_log = now;
-    spinlock_release(&lock);
-    if (report)
-      klog_puts("[NET] rx dropped: memory pressure\n");
-    return false;
   }
-  p->packet.device = dev;
-  p->packet.generation = __atomic_load_n(&dev->generation, __ATOMIC_ACQUIRE);
-  p->packet.length = (uint16_t)len;
-  memcpy(p->packet.data, frame, len);
-  bool was_empty = (queue_head == NULL);
-  push_locked(p);
-  dev->stats.rx_packets++;
-  dev->stats.rx_bytes += len;
   spinlock_release(&lock);
-  if (was_empty)
+
+  /* Buffers are reserved but not linked yet, so frame copies do not hold the
+   * shared queue lock. NIC callers keep their ring lock until this returns. */
+  uint64_t accepted_bytes = 0;
+  for (size_t i = 0; i < accepted_count; i++) {
+    const struct net_rx_frame *frame = &frames[accepted_indices[i]];
+    struct rx_buffer *p = accepted[i];
+    p->packet.device = dev;
+    p->packet.generation = generation;
+    p->packet.length = (uint16_t)frame->length;
+    memcpy(p->packet.data, frame->data, frame->length);
+    accepted_bytes += frame->length;
+  }
+
+  spinlock_acquire(&lock);
+  bool was_empty = (queue_head == NULL);
+  for (size_t i = 0; i < accepted_count; i++)
+    push_locked(accepted[i]);
+  dev->stats.rx_packets += accepted_count;
+  dev->stats.rx_bytes += accepted_bytes;
+  spinlock_release(&lock);
+
+  if (dropped && report_pressure)
+    klog_puts("[NET] rx dropped: memory pressure\n");
+  if (accepted_count && was_empty)
     wait_queue_wake_all(&worker_wait);
-  else
+  else if (accepted_count)
     wait_queue_wake_one(&worker_wait);
-  return true;
+  return accepted_count;
+}
+
+bool net_rx_submit_irq(struct net_device *dev, const void *frame, size_t len) {
+  const struct net_rx_frame packet = {.data = frame, .length = len};
+  return net_rx_submit_batch_irq(dev, &packet, 1) == 1;
 }
 
 int net_device_register(struct net_device *dev) {

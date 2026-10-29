@@ -33,7 +33,8 @@ void vfs_dirindex_set_force_scan(bool force) {
 void vfs_dirindex_init(vfs_dirindex_t *di) {
   di->children = NULL;
   di->cursor = NULL;
-  di->cursor_index = 0;
+  di->cursor_cookie = 0;
+  di->next_cookie = 3; /* 0, 1 and 2 are reserved for . and .. */
   di->buckets = NULL;
   di->nbuckets = 0;
   di->count = 0;
@@ -126,6 +127,7 @@ bool vfs_dirindex_insert(vfs_dirindex_t *di, vfs_child_t *child) {
 
   /* Order list: prepend, keeping readdir order identical to the old
    * backends (newest first). */
+  child->cookie = di->next_cookie++;
   child->prev = NULL;
   child->next = di->children;
   if (di->children)
@@ -171,11 +173,11 @@ void vfs_dirindex_detach_locked(vfs_dirindex_t *di, vfs_child_t *child) {
   if (di->count)
     di->count--;
 
-  /* Any removal shifts the index of everything behind it, so a cursor
-   * trained before it can no longer resume correctly; drop it and let the
-   * next sequential getdents rescan from the head. */
+  /* Cookies remain stable across removals. Drop the pointer cursor because
+   * the removed wrapper may be the cursor itself; the next read resumes by
+   * searching for the next older cookie. */
   di->cursor = NULL;
-  di->cursor_index = 0;
+  di->cursor_cookie = 0;
 }
 
 void vfs_dirindex_rename_locked(vfs_dirindex_t *di, vfs_child_t *child,

@@ -24,6 +24,12 @@ struct buddy_trace_event {
 struct buddy_zone {
   struct list_head free_list[MAX_ORDER];
   spinlock_t lock;
+  /* List writers hold lock; pressure/statistics readers only load free_pages.
+   * Per-order counts let corruption recovery account for a discarded tail. */
+  size_t free_blocks[MAX_ORDER];
+  size_t free_pages_in_lists;
+  /* Published only at complete allocation/free boundaries. */
+  size_t free_pages;
   /* Per-boot tag stamped into every linked block header.  RAM survives a
    * guest reboot, and a stale header from the previous boot can satisfy
    * the free-list validity heuristic (order + reciprocal links); the
@@ -101,6 +107,7 @@ static inline size_t pmm_get_order(size_t count) {
 
 /* Buddy Allocator API */
 void buddy_zone_init(struct buddy_zone *zone);
+void buddy_zone_seed_block(struct buddy_zone *zone, uint64_t phys, size_t order);
 void buddy_free_internal(struct buddy_zone *zone, uint64_t phys, size_t order);
 void *buddy_alloc_internal(struct buddy_zone *zone, size_t order);
 void *buddy_alloc_page_locked(struct buddy_zone *zone);

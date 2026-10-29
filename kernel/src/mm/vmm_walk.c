@@ -284,3 +284,29 @@ uint64_t *vmm_get_pte_ptr(uint64_t *pml4_phys, uint64_t virtual_addr) {
   uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT(entry & PAGE_MASK);
   return &pt_virt[pt_index];
 }
+
+uint64_t *vmm_get_leaf_entry_ptr(uint64_t *pml4_phys, uint64_t virtual_addr) {
+  if (!pml4_phys)
+    return NULL;
+  size_t pml4_index = (virtual_addr >> 39) & 0x1FF;
+  size_t pdpt_index = (virtual_addr >> 30) & 0x1FF;
+  size_t pd_index = (virtual_addr >> 21) & 0x1FF;
+  size_t pt_index = (virtual_addr >> 12) & 0x1FF;
+
+  uint64_t *pml4 = PHYS_TO_VIRT((uint64_t)pml4_phys & PAGE_MASK);
+  uint64_t entry = pml4[pml4_index];
+  if (!(entry & PAGE_FLAG_PRESENT))
+    return NULL;
+  uint64_t *pdpt = PHYS_TO_VIRT(entry & PAGE_MASK);
+  if (!(pdpt[pdpt_index] & PAGE_FLAG_PRESENT))
+    return NULL;
+  if (pdpt[pdpt_index] & PAGE_FLAG_PS)
+    return &pdpt[pdpt_index];
+  uint64_t *pd = PHYS_TO_VIRT(pdpt[pdpt_index] & PAGE_MASK);
+  if (!(pd[pd_index] & PAGE_FLAG_PRESENT))
+    return NULL;
+  if (pd[pd_index] & PAGE_FLAG_PS)
+    return &pd[pd_index];
+  uint64_t *pt = PHYS_TO_VIRT(pd[pd_index] & PAGE_MASK);
+  return &pt[pt_index];
+}

@@ -7,6 +7,7 @@
 #include "mm/vmm.h"
 #include "lib/string.h"
 #include "sched/sched.h"
+#include "sched/wait.h"
 #include "console/klog.h"
 #include <linuxkpi/native_vfs.h>
 
@@ -409,6 +410,52 @@ static int ioctl_locked(struct drm_file *file, uint32_t request, uint64_t arg) {
     if (!ret) memcpy((void *)arg, &p, size);
     return ret;
 }
+/* Context/resource operations may sleep for host fences. Contenders must
+ * park too: repeatedly yielding keeps every blocked graphics client runnable
+ * while video uploads and compositor submissions share this gate. */
+static wait_queue_t ioctl_wait = {.lock = SPINLOCK_INIT};
+
+static int ioctl_gate_acquire(void) {
+    if (!__atomic_exchange_n(&ioctl_owner, 1, __ATOMIC_ACQUIRE))
+        return 0;
+    struct thread *self = sched_get_current();
+    for (;;) {
+        wait_queue_entry_t entry = {.thread = self};
+        hal_irq_state_t flags = hal_irq_save();
+        if (thread_has_pending_signal(self)) {
+            hal_irq_restore(flags);
+            return -4;
+        }
+        self->wakeup_ticks = 0;
+        self->state = THREAD_BLOCKED;
+        wait_queue_add_tail(&ioctl_wait, &entry);
+        /* An unlock before registration has no waiter to wake. Claim again
+         * after publication so that race cannot strand this client. */
+        bool acquired = !__atomic_exchange_n(&ioctl_owner, 1, __ATOMIC_ACQUIRE);
+        bool interrupted = !acquired && thread_has_pending_signal(self);
+        if (!acquired && !interrupted) {
+            hal_irq_restore(flags);
+            sched_yield();
+            flags = hal_irq_save();
+        }
+        wait_queue_remove(&ioctl_wait, &entry);
+        self->wakeup_ticks = 0;
+        self->state = THREAD_RUNNING;
+        hal_irq_restore(flags);
+        if (acquired)
+            return 0;
+        if (interrupted)
+            return -4;
+        if (!__atomic_exchange_n(&ioctl_owner, 1, __ATOMIC_ACQUIRE))
+            return 0;
+    }
+}
+
+static void ioctl_gate_release(void) {
+    __atomic_store_n(&ioctl_owner, 0, __ATOMIC_RELEASE);
+    wait_queue_wake_one(&ioctl_wait);
+}
+
 static int wait_ioctl(struct drm_file *file, uint32_t request, uint64_t arg) {
     uint32_t size = (request >> 16) & 0x3fff;
     if (size != sizeof(struct vg_wait) ||
@@ -419,11 +466,12 @@ static int wait_ioctl(struct drm_file *file, uint32_t request, uint64_t arg) {
     if (p.flags & ~1U) return -22;
     /* Snapshot after earlier metadata/transfer operations have completed,
      * then release the gate before the potentially blocking fence wait. */
-    while (__atomic_exchange_n(&ioctl_owner, 1, __ATOMIC_ACQUIRE)) sched_yield();
+    int ret = ioctl_gate_acquire();
+    if (ret) return ret;
     struct drm_gem_object *obj = lookup(file, p.handle);
-    __atomic_store_n(&ioctl_owner, 0, __ATOMIC_RELEASE);
+    ioctl_gate_release();
     if (!obj) return -2;
-    int ret = virtio_gpu_render_wait_bo(obj, p.flags & 1U);
+    ret = virtio_gpu_render_wait_bo(obj, p.flags & 1U);
     put(obj);
     if (!ret) memcpy((void *)arg, &p, sizeof(p));
     return ret;
@@ -434,8 +482,9 @@ int virtio_gpu_virgl_ioctl(struct drm_file *file, uint32_t request, uint64_t arg
      * the global context/resource gate stalls submissions from every client,
      * including Xorg and the compositor. It needs no metadata mutation gate. */
     if ((request & 0xff) == 0x48) return wait_ioctl(file, request, arg);
-    while (__atomic_exchange_n(&ioctl_owner, 1, __ATOMIC_ACQUIRE)) sched_yield();
-    int ret = ioctl_locked(file, request, arg);
-    __atomic_store_n(&ioctl_owner, 0, __ATOMIC_RELEASE);
+    int ret = ioctl_gate_acquire();
+    if (ret) return ret;
+    ret = ioctl_locked(file, request, arg);
+    ioctl_gate_release();
     return ret;
 }

@@ -874,8 +874,11 @@ static void vfs_prefetch_worker(void) {
         return;
       wait_queue_entry_t entry = { .thread = self, .next = NULL };
 
-      /* Block first, then link: a wake that lands between the two must not be
-       * overwritten by a later THREAD_BLOCKED store (lost-wakeup race). */
+      /* Mask local ticks while publishing the wait entry, then recheck the
+       * queue. That closes both the timer-before-registration and
+       * enqueue-before-park races without periodic idle wakeups. */
+      hal_irq_state_t flags = hal_irq_save();
+      self->wakeup_ticks = 0;
       self->state = THREAD_BLOCKED;
       wait_queue_add(&vfs_prefetch_wait, &entry);
 
@@ -885,14 +888,18 @@ static void vfs_prefetch_worker(void) {
       if (have_work) {
         self->state = THREAD_RUNNING;
         wait_queue_remove(&vfs_prefetch_wait, &entry);
+        hal_irq_restore(flags);
         continue;
       }
 
-      self->wakeup_ticks = lapic_timer_get_ticks() + 100;
+      hal_irq_restore(flags);
       sched_yield();
+      flags = hal_irq_save();
       self->wakeup_ticks = 0;
-      self->state = THREAD_RUNNING;
+      if (self->state == THREAD_BLOCKED)
+        self->state = THREAD_RUNNING;
       wait_queue_remove(&vfs_prefetch_wait, &entry);
+      hal_irq_restore(flags);
       continue;
     }
 

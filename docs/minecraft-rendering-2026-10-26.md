@@ -80,3 +80,46 @@ python3 scripts/tests/test_virgl_host_binding_state.py
 ```
 
 Start a fresh VM using `make run` to load the rebuilt kernel and local renderer.
+
+## Visible-terrain submission overhead (2026-10-29)
+
+The supplied 854x480 Minecraft screenshots show 549 FPS looking at the ground
+and 64 FPS looking across terrain, with F3's rendered chunk-section count
+increasing from 2 to 686. That corresponds to roughly 1.8 ms versus 15.6 ms per
+frame. This establishes strong scene dependence, but does not isolate guest
+CPU work, host draw submission, vertex processing or fragment processing.
+
+The pinned host renderer reran `vrend_select_program` whenever `vbo_dirty` was
+set. Switching chunk vertex buffers therefore rebuilt and compared shader keys
+and selected the linked program even when vertex formats and shaders were
+unchanged. Inspection of `vrend_fill_shader_key` shows that its vertex inputs
+come from the vertex element array, not buffer identities, offsets or strides.
+
+`scripts/virgl/vertex-shader-selection.patch` removes buffer dirtiness from the
+shader-selection condition and explicitly invalidates shaders when the vertex
+element array changes or is unbound. Vertex buffer uploads retain their dirty
+flag; shader, framebuffer swizzle and manual sRGB invalidation retain their
+existing selection paths. The missing-buffer host crash guard is unchanged.
+The local host build applies the patch and the normal launcher tracks it as a
+library prerequisite. Restart QEMU through `make run` to load the new library;
+an already-running VM retains its previous mapped library.
+
+Validation:
+
+- Host renderer builds and repeated builds are idempotent.
+- The actual format-binding function and draw-selection condition pass 6,860
+  simulated buffer switches without redundant selection, plus format switches,
+  unbind/restore, invalid handles and shader/framebuffer invalidation. Restoring
+  selection on buffer changes or removing format invalidation fails the test.
+- Existing retired-binding and missing-buffer validation regressions pass.
+- The live host invalid-indexed-draw guard test passes, including later valid
+  geometry and pixel readback.
+- A private VM with the rebuilt local library passes 32 frames of 64 rebuilt
+  chunks, indexed quads, packed colors, two textures, mipmaps, depth/alpha and
+  fog pixel checks (`test_virgl_mesa_boot.py --compat`). This run used TCG and
+  host llvmpipe because KVM and host GPU access are unavailable here.
+
+These checks demonstrate removed host CPU work and rendering correctness, not
+a measured Minecraft FPS improvement. Compare a restarted VM at the same saved
+position, view direction, resolution and game settings after chunk loading and
+shader compilation settle. No world data or game settings were changed.

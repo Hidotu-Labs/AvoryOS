@@ -16,6 +16,8 @@
 #define PAGE_FLAG_PAT ((uint64_t)1 << 7)
 #define PAGE_FLAG_PS ((uint64_t)1 << 7)
 #define PAGE_FLAG_COW ((uint64_t)1 << 9)
+/* Software PTE state: page is resident and must not be reclaimed to zram. */
+#define PAGE_FLAG_MLOCKED ((uint64_t)1 << 52)
 /* Native fault-path provenance: an unmodified, full file-cache page that a
  * fork child may reconstruct from its VMA. Clear on any private write/copy.
  * This is not the hardware dirty bit (private copies can be clean again). */
@@ -90,6 +92,8 @@ void vmm_unmap_huge_locked(uint64_t *pml4, uint64_t virtual_addr,
 /* Caller holds vmm_lock. True when any present leaf (4 KB or huge) covers
  * the address; allocates no page-table levels. */
 bool vmm_page_present_nolock(uint64_t *pml4, uint64_t virtual_addr);
+/* Caller holds vmm_lock. Returns the present 4 KB or huge-page leaf entry. */
+uint64_t *vmm_get_leaf_entry_ptr(uint64_t *pml4, uint64_t virtual_addr);
 /* Release a frame only after this CPU's queued TLB shootdowns are acknowledged. */
 void vmm_defer_frame_free(void *phys, uint16_t pages);
 /* Drain this CPU's queued TLB work and release frames parked behind it. */

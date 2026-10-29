@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 root=Path(__file__).resolve().parents[2]
 s=(root/'kernel/src/drivers/gpu/virtio_gpu/virtio_gpu.c').read_text()
+gates=s[s.index('static bool gpu_gate_try_acquire('):s.index('static void gpu_scanout_acquire(')]
 sync=s[s.index('static uint64_t gpu_sync_command_pending;'):s.index('static struct pci_device *find_gpu(')]
 batch=s[s.index('static int scanout_present_batch('):s.index('static const struct vgpu_scanout_ops scanout_ops =')]
 pre=r'''
@@ -39,7 +40,7 @@ struct virtio_gpu_transfer_to_host_2d {struct virtio_gpu_ctrl_hdr hdr;struct vir
 struct virtio_gpu_set_scanout {struct virtio_gpu_ctrl_hdr hdr;struct virtio_gpu_rect r;uint32_t scanout_id,resource_id;};
 struct virtio_gpu_resource_flush {struct virtio_gpu_ctrl_hdr hdr;struct virtio_gpu_rect r;uint32_t resource_id,pad;};
 struct drm_device;struct drm_gem_object;
-struct thread {unsigned state;uint64_t wakeup_ticks;};
+struct thread {bool is_idle;unsigned state;uint64_t wakeup_ticks;};
 #define THREAD_RUNNING 1
 #define THREAD_BLOCKED 2
 static struct thread current;
@@ -51,8 +52,11 @@ static void hal_irq_restore(hal_irq_state_t state){assert(state==1);}
 typedef struct {bool queued;} wait_queue_t;
 typedef struct {struct thread *thread;} wait_queue_entry_t;
 static unsigned yields,complete_on_yield,complete_on_add,worker_reap;
+static bool progress_on_add;
 static void sched_yield(void);
 static void wait_queue_add(wait_queue_t *,wait_queue_entry_t *);
+static void wait_queue_add_tail(wait_queue_t *q,wait_queue_entry_t *e){wait_queue_add(q,e);}
+static void wait_queue_wake_one(wait_queue_t *q){(void)q;}
 static void wait_queue_remove(wait_queue_t *q,wait_queue_entry_t *e){(void)e;assert(q->queued);q->queued=false;}
 struct used_ring {unsigned idx;};
 static struct used_ring used;
@@ -114,6 +118,7 @@ static void complete_wait(void){
 }
 static void wait_queue_add(wait_queue_t *q,wait_queue_entry_t *e){
  assert(!gpu_poll_lock && !q->queued && e->thread->state==THREAD_BLOCKED);q->queued=true;
+ if(progress_on_add)gpu.stats.commands_completed++;
  if(complete_on_add){complete_wait();used.idx++;}
 }
 static void sched_yield(void){
@@ -137,6 +142,17 @@ static int present(bool transfer,bool select){
  return scanout_present_batch(0,42,64,48,&damage,transfer,select);
 }
 int main(void){
+ /* Producer completion reaped before registration leaves no used-ring edge.
+  * Unrelated pending work must not force the waiter to sleep. */
+ reset();gpu_worker_started=gpu_irq_installed=true;gpu_render_pending=1;
+ uint64_t completed=gpu.stats.commands_completed;progress_on_add=true;
+ gpu_wait_for_control_progress(lapic_timer_get_ms(),&completed);
+ assert(!yields&&!gpu_command_wait.queued&&!current.wakeup_ticks);
+ progress_on_add=false;completed=gpu.stats.commands_completed;
+ gpu_wait_for_control_progress(lapic_timer_get_ms(),&completed);
+ assert(yields==1&&!gpu_command_wait.queued&&!current.wakeup_ticks);
+ gpu_render_pending=0;
+ puts("PASS: reaped producer completion during waiter registration avoids sleep with unrelated work pending");
  for(unsigned cycle=0;cycle<100;cycle++){
   reset();assert(!command() && nr==1 && gpu.command_busy && gpu_sync_command_pending);
   unsigned before=submit_attempt;unsigned char page[4096];memcpy(page,command_page,sizeof page);
@@ -201,7 +217,7 @@ int main(void){
 }
 '''
 with tempfile.TemporaryDirectory(prefix='avory-virtio-ownership-') as tmp:
- p=Path(tmp);code=pre+sync+batch+post;(p/'test.c').write_text(code)
+ p=Path(tmp);code=pre+gates+sync+batch+post;(p/'test.c').write_text(code)
  subprocess.run(['cc','-O2','-Wall','-Wextra','-Werror','-Wno-unused-function',str(p/'test.c'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)
  for variant in [code.replace('gpu.stats.commands_timed_out++;', 'gpu.stats.commands_timed_out++;\n            gpu.command_busy=false;')]:
@@ -211,3 +227,10 @@ with tempfile.TemporaryDirectory(prefix='avory-virtio-ownership-') as tmp:
   result=subprocess.run([str(p/'old')],capture_output=True)
   assert result.returncode!=0,'premature DMA return after timeout passed'
  print('PASS: the old command timeout path fails the retained-DMA ownership checks')
+
+ variant=code.replace('(completed && gpu.stats.commands_completed != *completed)', 'false')
+ assert variant!=code
+ (p/'progress-mutant.c').write_text(variant)
+ subprocess.run(['cc','-O2','-Wno-unused-function',str(p/'progress-mutant.c'),'-o',str(p/'progress-mutant')],check=True)
+ assert subprocess.run([str(p/'progress-mutant')],capture_output=True).returncode!=0
+ print('PASS: removing the completion-progress check fails the waiter-registration regression')

@@ -1,5 +1,12 @@
 #include "vma.h"
+/* VMA mutations are on mmap/munmap and fault-adjacent hot paths.  Keep the
+ * timing probes opt-in: tsc_probe_record() serializes samples through a global
+ * spinlock, which creates cross-CPU contention precisely while profiling a
+ * mapping-heavy workload.  Define ASCENT_PROFILE_VMA to collect these probes
+ * in a diagnostic build. */
+#if defined(ASCENT_PROFILE_VMA)
 #define TSC_PROBES_ENABLE
+#endif
 #include "../lib/tsc.h"
 #include "../console/klog.h"
 #include "../fs/vfs.h"
@@ -699,7 +706,8 @@ int vma_snapshot_stacks(struct vma_list *list, struct vma_snapshot *out,
 static bool clone_recursive(struct vma_list *dst, struct vma *node) {
   if (!node)
     return true;
-  if (vma_add(dst, node->start, node->end, node->prot, node->flags, node->fd,
+  if (vma_add(dst, node->start, node->end, node->prot,
+              node->flags & ~MAP_LOCKED, node->fd,
               node->offset, node->file_node, node->file_size) != 0)
     return false;
   vma_attach_linux(dst, node->start, node->linux_vma);
@@ -799,154 +807,64 @@ uint64_t vma_find_gap(struct vma_list *list, uint64_t length,
   return 0;
 }
 
+/* Reuse surviving nodes: rebuilding through vma_add() allocates every VMA
+ * again under mm->lock on each merge, including unrelated file/device views.
+ * A sorted array can restore AVL height/max_end in linear time, without
+ * dropping those views' references or risking a partial rebuild on OOM. */
+static struct vma *vma_build_balanced(struct vma **nodes, int first, int end) {
+  if (first == end)
+    return NULL;
+  int middle = first + (end - first) / 2;
+  struct vma *v = nodes[middle];
+  v->left = vma_build_balanced(nodes, first, middle);
+  v->right = vma_build_balanced(nodes, middle + 1, end);
+  update_node(v);
+  return v;
+}
+
 void vma_merge_adjacent(struct vma_list *list) {
   if (list->count < 2)
     return;
 
-  // Single-pass O(n) merge replacing the old O(n²) while(merged) loop.
-  //
-  // Old approach: re-allocated the array and re-scanned the whole tree
-  // after every single merge, giving O(n²) tree operations plus O(n)
-  // heap allocations per call.
-  //
-  // New approach:
-  //   1. Gather all nodes into a sorted array once — O(n).
-  //   2. Walk the array linearly, accumulating merge runs in-place.
-  //      When a pair is mergeable, extend the current run's end; when not,
-  //      emit the accumulated region and start a new run.
-  //   3. Destroy the tree and rebuild it from the merged array — O(n log n)
-  //      total, same as before but with a constant factor of 1 instead of n.
-
   struct vma *stack_arr[VMA_STACK_CAP];
-  struct vma **arr;
-  bool heap_used = false;
-
-  if (list->count <= VMA_STACK_CAP) {
-    arr = stack_arr;
-  } else {
-    arr = kmalloc(sizeof(struct vma *) * list->count);
+  struct vma **arr = stack_arr;
+  if (list->count > VMA_STACK_CAP) {
+    arr = kmalloc(sizeof(*arr) * list->count);
     if (!arr)
-      return;
-    heap_used = true;
+      return; /* No mutation has happened. */
   }
+  int count = 0;
+  inorder_gather(list->root, arr, &count);
 
-  int idx = 0;
-  inorder_gather(list->root, arr, &idx);
-
-  // Collect merged intervals into a flat temporary list.
-  // Stores all fields needed to reconstruct each VMA after the merge.
-  struct vma_merged_entry {
-    uint64_t start, end, prot, flags, offset, file_size;
-    int      fd;
-    void    *file_node;
-    void    *linux_vma;
-    int      numa_policy;
-    uint64_t numa_nodemask;
-    int      numa_preferred_node;
-  };
-
-  struct vma_merged_entry merged_stack[VMA_STACK_CAP];
-  struct vma_merged_entry *merged;
-  bool merged_heap = false;
-
-  if (idx <= VMA_STACK_CAP) {
-    merged = merged_stack;
-  } else {
-    merged = kmalloc(sizeof(*merged) * idx);
-    if (!merged) {
-      if (heap_used) kfree(arr);
-      return;
-    }
-    merged_heap = true;
-  }
-
-  int m = 0; // number of output regions
-
-  // Seed with the first entry — copy all fields.
-  merged[0].start               = arr[0]->start;
-  merged[0].end                 = arr[0]->end;
-  merged[0].prot                = arr[0]->prot;
-  merged[0].flags               = arr[0]->flags;
-  merged[0].offset              = arr[0]->offset;
-  merged[0].file_size           = arr[0]->file_size;
-  merged[0].fd                  = arr[0]->fd;
-  merged[0].file_node           = arr[0]->file_node;
-  merged[0].linux_vma           = arr[0]->linux_vma;
-  merged[0].numa_policy         = arr[0]->numa_policy;
-  merged[0].numa_nodemask       = arr[0]->numa_nodemask;
-  merged[0].numa_preferred_node = arr[0]->numa_preferred_node;
-  m = 1;
-
-  for (int i = 1; i < idx; i++) {
-    struct vma *cur              = arr[i];
-    struct vma_merged_entry *prev = &merged[m - 1];
-
-    // Only merge truly anonymous adjacent regions with identical prot, flags,
-    // and NUMA policy.
-    bool can_merge = (prev->end   == cur->start) &&
-                     (prev->prot  == cur->prot)   &&
-                     (prev->flags == cur->flags)   &&
-                     (prev->numa_policy == cur->numa_policy) &&
-                     (prev->numa_nodemask == cur->numa_nodemask) &&
-                     (prev->numa_preferred_node == cur->numa_preferred_node) &&
-                     (prev->file_node == NULL)      &&
-                     (cur->file_node  == NULL)      &&
-                     (prev->linux_vma == cur->linux_vma) &&
+  /* Clear cached node pointers before any redundant nodes are released. */
+  vma_cache_flush(list);
+  int kept = 1;
+  for (int i = 1; i < count; i++) {
+    struct vma *prev = arr[kept - 1];
+    struct vma *cur = arr[i];
+    bool can_merge = prev->end == cur->start &&
+                     prev->prot == cur->prot && prev->flags == cur->flags &&
+                     prev->numa_policy == cur->numa_policy &&
+                     prev->numa_nodemask == cur->numa_nodemask &&
+                     prev->numa_preferred_node == cur->numa_preferred_node &&
+                     !prev->file_node && !cur->file_node &&
+                     prev->linux_vma == cur->linux_vma &&
                      !((prev->flags | cur->flags) &
                        (MAP_GROWSDOWN | MAP_SYSV_SHM));
-
     if (can_merge) {
-      prev->end = cur->end; // extend the current run
+      prev->end = cur->end;
+      vma_drop_linux_ref(cur);
+      vma_node_free(cur);
     } else {
-      // Carry the VMA through unchanged — preserve every field.
-      merged[m].start               = cur->start;
-      merged[m].end                 = cur->end;
-      merged[m].prot                = cur->prot;
-      merged[m].flags               = cur->flags;
-      merged[m].offset              = cur->offset;
-      merged[m].file_size           = cur->file_size;
-      merged[m].fd                  = cur->fd;
-      merged[m].file_node           = cur->file_node;
-      merged[m].linux_vma           = cur->linux_vma;
-      merged[m].numa_policy         = cur->numa_policy;
-      merged[m].numa_nodemask       = cur->numa_nodemask;
-      merged[m].numa_preferred_node = cur->numa_preferred_node;
-      m++;
+      arr[kept++] = cur;
     }
   }
-
-  // Only rebuild the tree if at least one merge actually happened.
-  if (m < idx) {
-    /* The rebuild destroys every node, so hold a reference to each file node
-     * and Linux wrapper across it: an unrelated merge of two anonymous VMAs
-     * must not close the bridge of a GEM/dma-buf mapping that is simply being
-     * carried through.  Without this, every bridged VMA in the process lost
-     * its vm_ops wrapper (and ->close ran) the first time any merge happened. */
-    for (int i = 0; i < m; i++) {
-      vma_file_ref(merged[i].file_node);
-      vma_linux_get(merged[i].linux_vma);
-    }
-    vma_list_destroy(list); // frees all nodes, resets root + count
-    for (int i = 0; i < m; i++) {
-      vma_add(list,
-              merged[i].start, merged[i].end,
-              merged[i].prot,  merged[i].flags,
-              merged[i].fd,    merged[i].offset,
-              merged[i].file_node, merged[i].file_size);
-      vma_attach_linux(list, merged[i].start, merged[i].linux_vma);
-      struct vma *restored = vma_find(list, merged[i].start);
-      if (restored) {
-        restored->numa_policy = merged[i].numa_policy;
-        restored->numa_nodemask = merged[i].numa_nodemask;
-        restored->numa_preferred_node = merged[i].numa_preferred_node;
-      }
-      vma_file_unref(merged[i].file_node);
-      vma_linux_put(merged[i].linux_vma);
-    }
+  if (kept != count) {
+    list->root = vma_build_balanced(arr, 0, kept);
+    list->count = kept;
   }
-
-  if (merged_heap) kfree(merged);
-  if (heap_used)   kfree(arr);
+  if (arr != stack_arr)
+    kfree(arr);
 }
 
 static void vma_dump_recursive(struct vma *node) {

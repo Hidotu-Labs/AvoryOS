@@ -174,12 +174,12 @@ static bool range_page_is_pagecache(struct thread *t, uint64_t va,
 //   Does NOT touch the VMA list — callers manage that themselves.
 //
 //   @mm_locked: true when the caller holds t->mm->lock. The locked path is
-//   batched (one vmm_lock hold, one deferred drain and one empty-table sweep
-//   per 64-page chunk, VMA ownership hoisted per interval); the unlocked path
+//   batched (VMA ownership hoisted per interval; the locked path drains after
+//   each caller chunk or 128 collected frames); the unlocked path
 //   keeps the old per-page behavior for callers that cannot hold mm->lock.
 
 // Frames collected under vmm_lock; released after the deferred drain.
-#define TEARDOWN_COLLECT 64
+#define TEARDOWN_COLLECT 128
 
 static void teardown_release_collected(uint64_t *phys, uint16_t *npages,
                                        int n) {
@@ -198,7 +198,8 @@ static void teardown_release_collected(uint64_t *phys, uint16_t *npages,
 
 // Locked, batched teardown. Caller holds t->mm->lock (VMA tree stable).
 static void teardown_range_locked(uint64_t *pml4, struct thread *t,
-                                  uint64_t base, uint64_t len) {
+                                  uint64_t base, uint64_t len,
+                                  bool preserve_locked) {
   uint64_t end = base + len;
   uint64_t va = base;
 
@@ -234,6 +235,19 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
         ours = false;
         pagecache = false;
       }
+    }
+
+    /* MADV_DONTNEED cannot discard pages protected by mlock or MAP_LOCKED.
+     * Keep their PTEs and backing references intact. munmap still tears them
+     * down normally because it passes preserve_locked=false. */
+    uint64_t *leaf_entry = preserve_locked
+                               ? vmm_get_leaf_entry_ptr(pml4, va)
+                               : NULL;
+    if (preserve_locked &&
+        ((cv && (cv->flags & MAP_LOCKED)) ||
+         (leaf_entry && (*leaf_entry & PAGE_FLAG_MLOCKED)))) {
+      va += PAGE_SIZE;
+      continue;
     }
 
     uint64_t frame = 0;
@@ -303,7 +317,7 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
       }
     }
 
-    if (nf >= TEARDOWN_COLLECT - 1) {
+    if (nf >= TEARDOWN_COLLECT) {
       if (pt_dirty) {
         vmm_free_empty_tables(pml4, sweep_rep);
         pt_dirty = false;
@@ -333,7 +347,8 @@ static void teardown_range(uint64_t *pml4, struct thread *t, uint64_t base,
   if (len == 0)
     return;
   if (mm_locked) {
-    teardown_range_locked(pml4, t, base, len);
+    teardown_range_locked(pml4, t, base, len,
+                          ctx && strcmp(ctx, "madvise DONTNEED") == 0);
     return;
   }
   uint64_t end = base + len;
@@ -945,7 +960,8 @@ static uint64_t sys_brk(uint64_t addr, uint64_t a1, uint64_t a2, uint64_t a3,
 
 // sys_mprotect
 // Linux ABI: mprotect(addr, len, prot)
-#define MPROTECT_BATCH_PAGES 64
+/* Bound lock hold time while halving context shootdowns for large ranges. */
+#define MPROTECT_BATCH_PAGES 128
 static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
                              uint64_t a3, uint64_t a4, uint64_t a5) {
   (void)a3;
@@ -1004,27 +1020,51 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
     }
     vmm_lock_acquire_for(pml4, batch_start);
     bool ok = true;
-    bool touched = false;
+    uint32_t touched_pages = 0;
+    uint64_t touched_va = 0;
+    struct vma *page_vma = NULL;
+    uint64_t page_vma_end = batch_start;
 
     for (uint64_t va = batch_start; va < batch_end; va += PAGE_SIZE) {
-      uint64_t phys = vmm_virt_to_phys(pml4, va);
+      /* A normal 4 KB mapping needs only one page-table walk here. The old
+       * path walked once for vmm_virt_to_phys(), again for the software bits,
+       * and a third time in vmm_map_page_locked(). */
+      uint64_t *old_leaf = vmm_get_leaf_entry_ptr(pml4, va);
+      if (!old_leaf)
+        continue;
+      uint64_t old_entry = *old_leaf;
+      if (!(old_entry & PAGE_FLAG_PRESENT))
+        continue;
+
+      /* Bit 7 is PAT in a 4 KB PTE and PS in a huge leaf, so use the old
+       * translation helper on that uncommon path rather than guessing. */
+      bool special_leaf = (old_entry & PAGE_FLAG_PS) != 0;
+      uint64_t phys = special_leaf ? vmm_virt_to_phys(pml4, va)
+                                   : (old_entry & PAGE_MASK);
       if (phys == 0)
         continue;
 
       uint64_t new_flags = build_page_flags(prot);
+      /* The lock bit is software PTE state, independent of access rights.
+       * Preserve it when mprotect rebuilds the hardware permission bits. */
+      bool was_mlocked = (old_entry & PAGE_FLAG_MLOCKED) != 0;
+      bool was_refault = (old_entry & PAGE_FLAG_REFAULT) != 0;
       if (prot == PROT_NONE) {
         // Keep the PTE present so teardown_range / vmm_virt_to_phys can still
         // find this physical frame at munmap time. Omitting PAGE_FLAG_USER
         // gives ring 3 the expected protection fault.
         new_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_NX;
       } else if (prot & PROT_WRITE) {
-        struct vma *v = vma_find(&current->mm->vmas, va);
+        if (va >= page_vma_end) {
+          page_vma = vma_find(&current->mm->vmas, va);
+          page_vma_end = page_vma ? page_vma->end : va + PAGE_SIZE;
+        }
         uint64_t frame = PAGE_ALIGN_DOWN(phys);
-        bool private_view = v && (v->flags & MAP_PRIVATE);
+        bool private_view = page_vma && (page_vma->flags & MAP_PRIVATE);
         bool shared_private_frame = private_view && pmm_is_managed(frame) &&
                                     pmm_get_ref((void *)frame) > 1;
         if (frame == pmm_get_zero_page_phys() || shared_private_frame ||
-            (private_view && v->file_node != NULL)) {
+            (private_view && page_vma->file_node != NULL)) {
           /* Anonymous pages shared with a fork child need CoW too. Merely
            * making them writable here lets either process overwrite the
            * other's allocator state without taking a copy-on-write fault.
@@ -1033,13 +1073,36 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
           new_flags = (new_flags & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
         }
       }
+      if (was_mlocked)
+        new_flags |= PAGE_FLAG_MLOCKED;
+      if (was_refault)
+        new_flags |= PAGE_FLAG_REFAULT;
+
+      if (!special_leaf) {
+        /* Existing 4 KB leaves already have permissive parent entries from
+         * their original map, so update in place. Keep cache attributes and
+         * hardware A/D state while changing only the requested protections. */
+        uint64_t new_entry = (old_entry & PAGE_MASK) | new_flags |
+                             PAGE_FLAG_PRESENT |
+                             (old_entry & (PAGE_FLAG_A | PAGE_FLAG_D |
+                                           PAGE_FLAG_PWT | PAGE_FLAG_PCD |
+                                           PAGE_FLAG_PAT));
+        if (((old_entry ^ new_entry) & ~(PAGE_FLAG_A | PAGE_FLAG_D)) != 0) {
+          *old_leaf = new_entry;
+          if (touched_pages++ == 0)
+            touched_va = va;
+        }
+        continue;
+      }
+
       bool changed = false;
       if (!vmm_map_page_locked(pml4, va, PAGE_ALIGN_DOWN(phys), new_flags,
                                &changed)) {
         ok = false;
         break;
       }
-      touched |= changed;
+      if (changed && touched_pages++ == 0)
+        touched_va = va;
     }
 
     if (ok) {
@@ -1053,7 +1116,9 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
     // unlock-to-drain window so a timer tick cannot migrate it and strand the
     // queue on the CPU that performed the page-table writes.
     __kpi_preempt_disable();
-    if (touched)
+    if (touched_pages == 1)
+      tlb_flush_deferred(touched_va, (uint64_t)pml4);
+    else if (touched_pages > 1)
       tlb_flush_deferred_context((uint64_t)pml4);
     vmm_lock_release();
     spinlock_release(&current->mm->lock);
@@ -1061,7 +1126,7 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
     // The VMM lock's automatic drain sees IF=0 while mm->lock is held and
     // deliberately defers remote waits. Drain now that peers can take IPIs;
     // one address-space flush covers the whole batch's changed PTEs.
-    if (touched)
+    if (touched_pages != 0)
       (void)tlb_flush_deferred_drain();
     __kpi_preempt_enable();
     if (!ok)
@@ -1341,6 +1406,24 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
     }
   }
 
+  /* mremap(MAYMOVE) allocates new PTEs and copies contents. Carry page lock
+   * state to the destination before the old mappings are torn down. */
+  for (uint64_t off = 0; off < aligned_old; off += PAGE_SIZE) {
+    uint64_t old_va = old_addr + off;
+    uint64_t new_va = new_addr + off;
+    vmm_lock_acquire_for(pml4, old_va);
+    uint64_t *old_leaf = vmm_get_leaf_entry_ptr(pml4, old_va);
+    bool was_mlocked = old_leaf && (*old_leaf & PAGE_FLAG_MLOCKED);
+    vmm_lock_release();
+    if (!was_mlocked)
+      continue;
+    vmm_lock_acquire_for(pml4, new_va);
+    uint64_t *new_leaf = vmm_get_leaf_entry_ptr(pml4, new_va);
+    if (new_leaf && (*new_leaf & PAGE_FLAG_PRESENT))
+      *new_leaf |= PAGE_FLAG_MLOCKED;
+    vmm_lock_release();
+  }
+
   // Tear down old mapping, keeping any bridge wrapper for the new node.
   void *keep_lvma = orig_vma->linux_vma;
   vma_linux_get(keep_lvma);
@@ -1403,27 +1486,29 @@ static uint64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice,
 
   if (end < addr || aligned_len < len || end - 1 > USER_SPACE_LIMIT) return (uint64_t)-22;
   if (advice == MADV_COLD) return 0; /* Hint only; never discard contents. */
+  /* MADV_FREE is lazy: retain the current contents until memory pressure
+   * actually reclaims the page. The zram pager can reclaim it later without
+   * turning this advisory hint into an eager DONTNEED/refault cycle. */
+  if (advice == MADV_FREE) return 0;
   if (advice == MADV_PAGEOUT) {
     zram_pageout(current->mm, current->cr3, addr, end);
     return 0;
   }
   spinlock_acquire(&current->mm->lock);
 
-  // MADV_DONTNEED / MADV_REMOVE / MADV_FREE:
+  // MADV_DONTNEED / MADV_REMOVE:
   // Discard physical pages in the address range so that subsequent accesses
   // yield fresh zero-filled pages for anonymous mappings, as required by POSIX/Linux.
-  // Reclaiming pages immediately on MADV_FREE releases heap chunks back to PMM.
-  if (advice == MADV_DONTNEED || advice == MADV_REMOVE || advice == MADV_FREE) {
+  if (advice == MADV_DONTNEED || advice == MADV_REMOVE) {
     uint64_t *pml4 = (uint64_t *)current->cr3;
     if (!pml4)
       pml4 = vmm_get_active_pml4();
     spinlock_release(&current->mm->lock);
-    /* Batched exactly like sys_munmap: each 32-page chunk runs under mm->lock
-     * so the VMA classification is stable, and the deferred shootdown queue
-     * fills enough to coalesce into one context flush per batch. Holding
-     * mm->lock across the whole range would stall faulting peers for the
-     * full span; 32 pages keeps every critical section bounded. */
-#define MADVISE_BATCH_PAGES 32
+    /* Keep each chunk bounded so a large reclaim does not hold mm->lock for
+     * the full range. The 128-page chunk amortizes the synchronous context
+     * shootdown across more reclaimed pages while keeping VMA classification
+     * stable during each teardown. */
+#define MADVISE_BATCH_PAGES 128
     for (uint64_t b = addr; b < end;) {
       uint64_t be = b + (uint64_t)MADVISE_BATCH_PAGES * PAGE_SIZE;
       if (be < b || be > end)
@@ -1438,7 +1523,6 @@ static uint64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice,
       vmm_drain_deferred_work();
       b = be;
     }
-    tlb_shootdown_context_for((uint64_t)pml4);
     tlb_shootdown_poll();
     vmm_drain_deferred_work();
 #undef MADVISE_BATCH_PAGES

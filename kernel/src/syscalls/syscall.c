@@ -1,6 +1,7 @@
 #include "syscall.h"
 #include "../apic/lapic_timer.h"
 #include "sysdiag.h"
+#include "sys_ptrace.h"
 #include "../console/klog.h"
 #include "../cpu/ktrack.h"
 #include "../cpu/msr.h"
@@ -510,9 +511,9 @@ void syscall_dispatcher(struct syscall_regs *regs) {
 
 #if !SYSCALL_LOG
   /* Ultra-Fast Path: Trivial read-only process and thread identity queries */
-  if (__builtin_expect(t && !t->syscall_dispatch_enabled &&
+  if (__builtin_expect(t && !t->tracer_tid && !t->syscall_dispatch_enabled &&
                        !seccomp_mode(t) && !t->rseq_addr &&
-                       !(t->pending_signals & ~t->signal_mask) &&
+                       !thread_has_pending_signal(t) &&
                        !__atomic_load_n(&t->need_resched, __ATOMIC_RELAXED), 1)) {
     switch (syscall_num) {
       case SYS_GETPID: {
@@ -576,6 +577,19 @@ void syscall_dispatcher(struct syscall_regs *regs) {
       t->last_io_started_ms = lapic_timer_get_ticks();
   }
 
+  if (t) {
+    ptrace_syscall_enter(t, regs);
+    syscall_num = regs->rax;
+    syscall_return_ip = regs->rip;
+    t->last_syscall_num = syscall_num;
+    t->last_syscall_args[0] = regs->rdi;
+    t->last_syscall_args[1] = regs->rsi;
+    t->last_syscall_args[2] = regs->rdx;
+    t->last_syscall_args[3] = regs->r10;
+    t->last_syscall_args[4] = regs->r8;
+    t->last_syscall_args[5] = regs->r9;
+  }
+
   if (t && __builtin_expect(!t->seccomp_compat_dispatch && seccomp_mode(t), 0)) {
     uint64_t args[6] = {regs->rdi, regs->rsi, regs->rdx,
                          regs->r10, regs->r8, regs->r9};
@@ -593,6 +607,9 @@ void syscall_dispatcher(struct syscall_regs *regs) {
         rseq_update_cpu_id(t);
         rseq_maybe_abort(t, &regs->rip);
       }
+      ptrace_syscall_exit(t, regs);
+      if (thread_has_pending_signal(t) || t->ptrace_stop_pending)
+        signal_finish_syscall(regs, syscall_num, syscall_return_ip);
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
     return;
@@ -619,8 +636,10 @@ void syscall_dispatcher(struct syscall_regs *regs) {
         rseq_maybe_abort(t, &regs->rip);
       }
     }
+    ptrace_syscall_exit(t, regs);
     if (__builtin_expect(syscall_restart_error(regs->rax) ||
-                         (t && (t->pending_signals & ~t->signal_mask)), 0))
+                         (t && (thread_has_pending_signal(t) ||
+                                t->ptrace_stop_pending)), 0))
       signal_finish_syscall(regs, syscall_num, syscall_return_ip);
     if (t)
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
@@ -646,6 +665,9 @@ void syscall_dispatcher(struct syscall_regs *regs) {
         rseq_update_cpu_id(t);
         rseq_maybe_abort(t, &regs->rip);
       }
+      ptrace_syscall_exit(t, regs);
+      if (thread_has_pending_signal(t) || t->ptrace_stop_pending)
+        signal_finish_syscall(regs, syscall_num, syscall_return_ip);
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
     return;
@@ -685,10 +707,14 @@ finish_filtered:
     rseq_maybe_abort(t, &regs->rip);
   }
 
+  if (t)
+    ptrace_syscall_exit(t, regs);
+
   /* Signal frame conversion copies the complete register set. Keep it off the
    * syscall hot path unless this thread can actually deliver a signal. */
   if (__builtin_expect(syscall_restart_error(regs->rax) ||
-                       (t && (t->pending_signals & ~t->signal_mask)), 0))
+                       (t && (thread_has_pending_signal(t) ||
+                              t->ptrace_stop_pending)), 0))
     signal_finish_syscall(regs, syscall_num == SYS_RT_SIGRETURN ? UINT64_MAX : syscall_num,
                            syscall_return_ip);
   if (t)

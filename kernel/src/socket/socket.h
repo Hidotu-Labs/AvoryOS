@@ -294,9 +294,12 @@ ssize_t socket_recvfrom(socket_t *sock, void *buf, size_t len, int flags,
 // Socketpair Creation
 int socket_create_pair(int domain, int type, int protocol, socket_t *sv[2]);
 
+/* Diagnostic-only description of a socket's family-specific state for
+ * sysdiag EAGAIN/poll-mismatch reports.  Never used on a data path. */
+void socket_diag_describe(struct socket *sock, char *out, size_t outsz);
+
 // Socket FD Management
-int socket_alloc_fd(socket_t *sock);
-/* Caller owns a descriptor reference and must socket_fd_put() it. */
+int socket_alloc_fd(socket_t *sock);/* Caller owns a descriptor reference and must socket_fd_put() it. */
 socket_t *socket_from_fd(int fd);
 void socket_fd_put(socket_t *sock);
 int socket_close_fd(int fd);

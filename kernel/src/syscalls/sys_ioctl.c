@@ -80,6 +80,7 @@ static const char *ioctl_request_name(uint32_t request) {
   case 0xC0186449: return "DRM_IOCTL_VIRTGPU_GET_CAPS";
   case 0xC0106443: return "DRM_IOCTL_VIRTGPU_GETPARAM";
   case 0xC01064C7: return "DRM_IOCTL_MODE_LIST_LESSEES";
+  case 0xC00864D0: return "DRM_IOCTL_MODE_CLOSEFB";
   case 0xC018643B: return "DRM_IOCTL_CRTC_GET_SEQUENCE";
   case 0xC018643C: return "DRM_IOCTL_CRTC_QUEUE_SEQUENCE";
   case 0x40049409: return "FICLONE/BTRFS_IOC_CLONE";
@@ -161,47 +162,21 @@ static void ioctl_log_unhandled(struct thread *thread, uint64_t fd,
   if (!ioctl_miss_should_log(node ? node->name : NULL, request, &calls))
     return;
 
-  klog_puts("[IOCTL-MISS] ");
-  if (thread) {
-    klog_puts("comm=");
-    klog_puts(thread->comm);
-    klog_puts(" tid=");
-    klog_uint64(thread->tid);
-    klog_puts(" tgid=");
-    klog_uint64(thread->tgid);
-    klog_puts(" ");
-  }
-  klog_puts("fd=");
-  klog_uint64(fd);
-  klog_puts(" node=");
-  klog_puts(node && node->name[0] ? node->name : "<anonymous>");
-  if (node) {
-    klog_puts(" node_type=");
-    klog_uint64(node->flags & FS_TYPE_MASK);
-  }
-  if (FD_IN_RANGE(thread, fd) && thread->fd_paths && thread->fd_paths[fd]) {
-    klog_puts(" path=");
-    klog_puts(thread->fd_paths[fd]->value);
-  }
-  klog_puts(" request=");
-  klog_hex32(request);
-  klog_puts(" name=");
-  klog_puts(ioctl_request_name(request));
-  klog_puts(" type=");
-  klog_hex32((request >> 8) & 0xff);
-  klog_puts(" nr=");
-  klog_hex32(request & 0xff);
-  klog_puts(" dir=");
-  klog_uint64((request >> 30) & 3);
-  klog_puts(" size=");
-  klog_uint64((request >> 16) & 0x3fff);
-  klog_puts(" arg=");
-  klog_hex64(arg);
-  klog_puts(" result=-ENOTTY handler=");
-  klog_puts(handler_called ? "present-returned-ENOTTY" : "absent");
-  klog_puts(" occurrences=");
-  klog_uint64(calls);
-  klog_puts("\n");
+  const char *comm = thread ? thread->comm : "?";
+  const char *node_name = node && node->name[0] ? node->name : "<anonymous>";
+  const char *path = FD_IN_RANGE(thread, fd) && thread->fd_paths &&
+                             thread->fd_paths[fd]
+                         ? thread->fd_paths[fd]->value
+                         : NULL;
+  klogf("[IOCTL-MISS] comm=%s tid=%u tgid=%u fd=%llu node=%s node_type=%u path=%s request=0x%08X name=%s type=0x%02X nr=0x%02X dir=%u size=%u arg=0x%016llX result=-ENOTTY handler=%s occurrences=%llu\n",
+        comm, thread ? thread->tid : 0, thread ? thread->tgid : 0,
+        (unsigned long long)fd, node_name,
+        node ? node->flags & FS_TYPE_MASK : 0, path ? path : "-", request,
+        ioctl_request_name(request), (request >> 8) & 0xff, request & 0xff,
+        (request >> 30) & 3, (request >> 16) & 0x3fff,
+        (unsigned long long)arg,
+        handler_called ? "present-returned-ENOTTY" : "absent",
+        (unsigned long long)calls);
 }
 
 static int ioctl_arg_is_scalar(uint32_t request) {

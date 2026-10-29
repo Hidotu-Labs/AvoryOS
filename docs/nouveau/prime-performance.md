@@ -187,33 +187,14 @@ option because the launch gate verifies the complete baked command line.
 
 ## Low-logging timing profile
 
-The next C4 preparation keeps batching enabled, but defaults to
-`nouveau.debug=info drm.debug=0 gpu_diag=0 gpu_perf=1`. This removes verbose
-GSP/DRM logging and the globally locked per-event flight recorder from the
-performance comparison. Normal warnings/errors and the hang detector remain.
-The opt-in profiler records cumulative DRM ioctl wall time using atomic
-counters, without recording ioctl arguments or printing on the render path.
-It is not a GPU execution timer. Its ioctl-number buckets combine DRM devices,
-and live snapshots can include operations finishing concurrently.
+The default preparation keeps batching enabled and uses
+`nouveau.debug=info drm.debug=0 gpu_diag=0`. This disables verbose GSP/DRM
+logging and the per-event flight recorder for performance comparisons.
+Normal warnings/errors and the hang detector remain.
 
-Native presentation separately accumulates time in producer CPU-access/fence
-synchronization, pixel comparison/copy, and VirtIO publication. These are
-serialized presentation costs, not an explanation for all application-frame
-time. In the 6.18 UAPI, Nouveau VM_BIND and EXEC are DRM ioctl numbers 0x51
-and 0x52 respectively, after adding DRM_COMMAND_BASE. A slow EXEC ioctl can
-include kernel validation, locking and scheduling, not just GPU execution.
-
-After booting this build, the host can request a compact report using
-`python3 scripts/prime-dump.py --nouveau --perf`. The serial command only queues
-work; formatting and counter snapshots run in the VirtIO worker, not the timer
-interrupt. `[GPUPERF]` records appear in `build/logs/nouveau-c4.log`. Compare
-two reports around the same steady workload; reporting itself can perturb
-the measurement briefly. No guest terminal commands are required.
+The temporary GPU performance counters and serial timing snapshot command
+were removed on 2026-10-29.
 
 For a diagnostic comparison, pass `NOUVEAU_DEBUG=info,gsp=debug`,
-`NOUVEAU_DRM_DEBUG=0x4`, `NOUVEAU_GPU_DIAG=1` and `NOUVEAU_PERF=0` consistently
-to both prepare and run. `NOUVEAU_PERF=0` alone also permits measuring the
-profiler's own overhead. No clocks, power limits, fence semantics, NVK/Zink
-driver binaries or persistent host settings are changed. GSP-managed clock
-behavior and userspace overhead still require measurements; neither is
-declared fixed by this profile.
+`NOUVEAU_DRM_DEBUG=0x4` and `NOUVEAU_GPU_DIAG=1` consistently to both prepare
+and run.

@@ -119,7 +119,7 @@ fail:
   kfree(r);
   return NULL;
 }
-static struct dirent *pts_readdir(vfs_node_t *n, uint32_t index) {
+static struct dirent *pts_readdir(vfs_node_t *n, uint64_t index) {
   struct dirent *d = vfs_readdir_buffer();
   memset(d, 0, sizeof(*d));
   d->d_type = DT_DIR;

@@ -27,6 +27,7 @@
 #include "../sched/wait.h"
 #include "../smp/cpu.h"
 #include "sys_io_shared.h"
+#include "sys_ptrace.h"
 #include "syscall.h"
 #include "sysdiag.h"
 #define TSC_PROBES_ENABLE
@@ -405,6 +406,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
     new_mm->brk_base = 0;
     new_mm->brk_current = 0;
     new_mm->mmap_next_addr = MMAP_REGION_BASE;
+    new_mm->mlockall_future = false;
     spinlock_init(&new_mm->lock);
     current->mm = new_mm;
 
@@ -418,6 +420,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
     // identify MAP_SHARED pages when freeing the old address space.
     old_vmas = current->mm->vmas;
     vma_list_init(&current->mm->vmas); // Reset to empty for the new program
+    current->mm->mlockall_future = false;
   }
 
   current->cr3 = (uint64_t)new_pml4;
@@ -647,6 +650,8 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   regs->user_cs = elf_info.compat32 ? 0x1b : 0x2b;
   regs->user_rcx = regs->user_rsi = regs->user_rdi = 0;
   regs->rflags = 0x202; // IF | reserved bit 1
+
+  ptrace_exec_event(regs);
 
   return 0;
 }

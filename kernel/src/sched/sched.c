@@ -333,7 +333,7 @@ void sched_init(void) {
     global_thread_list = idle_thread;
     __atomic_add_fetch(&global_thread_count, 1, __ATOMIC_RELAXED);
     cpu->idle_thread = idle_thread;
-    cpu->current_thread = idle_thread;
+    __atomic_store_n(&cpu->current_thread, idle_thread, __ATOMIC_RELEASE);
     __atomic_store_n(&idle_thread->on_cpu, true, __ATOMIC_RELEASE);
     idle_thread->cpu_affinity = (1ULL << count) - 1;
     if (count == 64)
@@ -711,7 +711,7 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
     __atomic_store_n(&next_t->on_cpu, true, __ATOMIC_RELEASE);
     __atomic_store_n(&cpu->switching_from, prev, __ATOMIC_RELEASE);
     fpu_on_context_switch();
-    cpu->current_thread = next_t;
+    __atomic_store_n(&cpu->current_thread, next_t, __ATOMIC_RELEASE);
 
     cpu->stack_top = (next_t->stack_base + next_t->stack_size) & ~0xFULL;
     tss_set_rsp0(cpu->stack_top);
@@ -1358,15 +1358,23 @@ __attribute__((optimize("O3"))) void sched_wakeup(struct thread *t) {
 
         notify = should_kick;
       }
+    } else {
+      /* A timeout, signal, or earlier wake may have made the thread runnable
+       * while it was still linked on an external wait queue. Wakeups are
+       * idempotent: do not turn a live RUNNING thread into READY and enqueue
+       * its active stack a second time. */
     }
     sched_unlock_two_rq(prev_cpu, target);
 
     if (notify)
       sched_notify_runnable(dest);
   } else {
-    t->state = THREAD_READY;
-    t->wakeup_ticks = 0;
-    sched_enqueue_thread(t, cpu_get_current());
+    uint8_t cur_state = __atomic_load_n(&t->state, __ATOMIC_ACQUIRE);
+    if (cur_state == THREAD_BLOCKED || cur_state == THREAD_SLEEPING) {
+      t->state = THREAD_READY;
+      t->wakeup_ticks = 0;
+      sched_enqueue_thread(t, cpu_get_current());
+    }
   }
 
   hal_irq_restore(rflags);

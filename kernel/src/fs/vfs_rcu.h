@@ -9,14 +9,14 @@ struct vfs_node;
 /* IPI vector for the deferred-free barrier (49 = reschedule, 50 = TLB). */
 #define IPI_VECTOR_VFS_RCU 51
 
-/* One queued deferred-free record.  Embed it in any object whose final
- * release must wait for a grace period; the queue links through `next` and
- * `reclaim` is called with the memory still intact once the grace period has
- * passed.  Only the queue may touch these two words while the object sits on
- * it. */
+/* One queued deferred-free record. Embed it in any object whose final release
+ * must wait for a grace period. `queued` is claimed atomically at enqueue and
+ * stays set through the callback, rejecting duplicate retirement attempts. */
 struct vfs_rcu_head {
   struct vfs_rcu_head *next;
   void (*reclaim)(struct vfs_rcu_head *head);
+  uint32_t queued;
+  uint32_t reserved;
 };
 
 /*

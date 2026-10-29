@@ -97,7 +97,7 @@ int              ext2_replace_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_nu
                                         uint8_t file_type);
 bool             ext2_dir_is_empty(ext2_mount_t *mnt, uint32_t inode_num);
 
-struct dirent   *ext2_readdir_impl(vfs_node_t *node, uint32_t index);
+struct dirent   *ext2_readdir_impl(vfs_node_t *node, uint64_t cookie);
 vfs_node_t      *ext2_finddir_impl(vfs_node_t *node, char *name);
 int              ext2_create_impl(vfs_node_t *node, char *name, uint16_t permission);
 int              ext2_mkdir_impl(vfs_node_t *node, char *name, uint16_t permission);

@@ -76,6 +76,11 @@ typedef struct epitem {
    * delivery: a notification can outlive the data that caused it. */
   uint32_t ready_events;
   bool on_ready_list;          // Currently on ready list
+  /* epoll_wait removes a bounded batch from rdllist before polling outside
+   * ep->lock.  Keep that in-flight state distinct so a producer cannot take
+   * the queued-item fast path and lose a notification during the poll. */
+  bool in_scan;
+  uint64_t notify_seq;         // Notifications racing an unlocked readiness poll
   bool oneshot;                // One-shot mode active
   bool oneshot_disabled;        // One-shot has fired, needs re-arm
   bool exclusive;              // Exclusive wake-up mode

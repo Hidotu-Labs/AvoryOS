@@ -27,6 +27,7 @@
 #include "../sched/wait.h"
 #include "../smp/cpu.h"
 #include "sys_io_shared.h"
+#include "sys_ptrace.h"
 #include "syscall.h"
 #include "sysdiag.h"
 #define TSC_PROBES_ENABLE
@@ -104,6 +105,7 @@ void vfork_release_parent(struct thread *child) {
     __atomic_store_n(&parent->vfork_done, true, __ATOMIC_RELEASE);
     bool wake = parent->state == THREAD_BLOCKED;
     spinlock_release(&cpu->queue_lock);
+    ptrace_vfork_done(parent, child->tid);
     /* sched_wakeup takes queue_lock itself; never call it while holding it. */
     if (wake) {
       sched_wakeup(parent);
@@ -180,6 +182,11 @@ static void fork_child_entry(void) {
     copy_to_user((void *)self->child_set_tid, &visible_tid, sizeof(visible_tid));
     self->child_set_tid = 0;
   }
+
+  /* Traced children must hit their initial SIGSTOP before the first
+   * userspace instruction. This also drains any synchronous signal state
+   * prepared while the child was unpublished. */
+  signal_deliver_syscall(child_regs);
 
   // Jump to userspace — this never returns
   fork_return_to_userspace(child_regs);
@@ -358,11 +365,16 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   // Keep the return value independent of the child allocation in case it exits
   // quickly after being scheduled.
   int ns_error = process_namespace_inherit(child, parent, NULL, NULL, 0);
-  if (ns_error) { sched_reap_thread(child); return (uint64_t)ns_error; }
+  if (ns_error) {
+    while (!sched_reap_thread(child))
+      sched_yield();
+    return (uint64_t)ns_error;
+  }
   uint32_t child_tid = pid_namespace_tid(parent, child);
   capability_inherit(child, parent);
   seccomp_inherit(child, parent);
   fpu_copy_thread(child, parent);
+  ptrace_fork_event(regs, child, child_tid, SIGCHLD);
   sched_enqueue_thread(child, NULL);
 
   // 9. Return child PID to parent
@@ -625,7 +637,12 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
 #endif
 
   int ns_error = process_namespace_inherit(child, parent, new_mount, new_pid, flags);
-  if (ns_error) { PIDFD_UNRESERVE(); sched_reap_thread(child); return (uint64_t)ns_error; }
+  if (ns_error) {
+    PIDFD_UNRESERVE();
+    while (!sched_reap_thread(child))
+      sched_yield();
+    return (uint64_t)ns_error;
+  }
   new_mount = NULL;
   if (new_net) { net_namespace_install(child, new_net); new_net = NULL; }
   uint32_t visible_child_tid = pid_namespace_tid(parent, child);
@@ -656,6 +673,7 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   capability_inherit(child, parent);
   seccomp_inherit(child, parent);
   fpu_copy_thread(child, parent);
+  ptrace_fork_event(regs, child, visible_child_tid, flags);
   sched_enqueue_thread(child, target_cpu);
 
   if (vfork) {
@@ -769,7 +787,11 @@ uint64_t sys_vfork(struct syscall_regs *regs) {
 #endif
 
   int ns_error = process_namespace_inherit(child, parent, NULL, NULL, 0);
-  if (ns_error) { sched_reap_thread(child); return (uint64_t)ns_error; }
+  if (ns_error) {
+    while (!sched_reap_thread(child))
+      sched_yield();
+    return (uint64_t)ns_error;
+  }
   uint32_t visible_child_tid = pid_namespace_tid(parent, child);
   uint32_t child_tid = child->tid;
   // Publish the rendezvous before the child is runnable: it may exec/exit
@@ -780,6 +802,7 @@ uint64_t sys_vfork(struct syscall_regs *regs) {
   capability_inherit(child, parent);
   seccomp_inherit(child, parent);
   fpu_copy_thread(child, parent);
+  ptrace_fork_event(regs, child, visible_child_tid, child->clone_flags);
   sched_enqueue_thread(child, NULL);
 
   vfork_wait_for_child(parent);

@@ -8,7 +8,7 @@
 
 // Forward Declarations
 
-static struct dirent *fat32_readdir_impl(vfs_node_t *node, uint32_t index);
+static struct dirent *fat32_readdir_impl(vfs_node_t *node, uint64_t index);
 static vfs_node_t *fat32_finddir_impl(vfs_node_t *node, char *name);
 static uint32_t fat32_read_impl(vfs_node_t *node, uint32_t offset,
                                 uint32_t size, uint8_t *buffer);
@@ -844,7 +844,7 @@ static uint32_t fat32_read_impl(vfs_node_t *node, uint32_t offset,
 }
 
 // Forward declarations
-static struct dirent *fat32_readdir_impl(vfs_node_t *node, uint32_t index);
+static struct dirent *fat32_readdir_impl(vfs_node_t *node, uint64_t index);
 static vfs_node_t *fat32_finddir_impl(vfs_node_t *node, char *name);
 
 // Create a VFS node from a directory entry
@@ -1047,7 +1047,7 @@ static fat32_dir_entry_t *dir_iter_next(dir_iter_t *iter) {
 }
 
 // Read a directory entry
-static struct dirent *fat32_readdir_impl(vfs_node_t *node, uint32_t index) {
+static struct dirent *fat32_readdir_impl(vfs_node_t *node, uint64_t index) {
   fat32_mount_t *mnt = (fat32_mount_t *)node->device;
   if (!mnt)
     return NULL;

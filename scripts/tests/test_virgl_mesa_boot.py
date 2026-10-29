@@ -9,6 +9,7 @@ from pathlib import Path
 from boot_probe import run_probe, ROOT
 from test_virgl_boot import INIT
 parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--virgl-library', type=Path, help='test this guest libgallium DSO in the private VM')
 parser.add_argument('--desktop', action='store_true', help='also test Xorg glamor and Weston EGL clients')
 parser.add_argument('--compat', action='store_true', help='check legacy GL chunk-buffer replacement, textures and fog pixels')
 parser.add_argument('--mouse', action='store_true', help='test Xorg USB movement/clicks through QMP')
@@ -46,6 +47,8 @@ if args.scene_benchmark:
                     str(ROOT/'scripts/tests/virgl_scene_bench.c'), '-o', str(output/'virgl-scene'),
                     '-lGL', '-lX11'], check=True)
 def guest_file(path):
+    if args.virgl_library and str(path).startswith("usr/lib/libgallium-"):
+        return args.virgl_library.resolve()
     candidate = source/path
     for _ in range(64):
         if not candidate.is_symlink():

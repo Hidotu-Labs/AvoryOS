@@ -357,7 +357,159 @@ static void klog_dump_ptr(struct thread *current, const char *reg_name,
     } else {
         klog_puts("  *"); klog_puts(reg_name); klog_puts(" ("); klog_hex64(val);
         klog_puts("): <user address not backed by a readable frame>\n");
+  }
+}
+
+/* GLib fatal errors often reach #BP only after their original arguments have
+ * been copied into a GError on the user stack. Recover the formatted UUID
+ * diagnostic from a bounded set of stack locals/registers so the fault log
+ * can show the offending value without a broad process-memory scan. */
+static bool klog_user_read_u64(uint64_t *pml4, uint64_t addr, uint64_t *out) {
+  if ((addr & 0xFFF) <= 0xFF8) {
+    uint64_t kaddr;
+    if (!klog_user_kaddr(pml4, addr, &kaddr))
+      return false;
+    *out = *(uint64_t *)kaddr;
+    return true;
+  }
+  uint64_t value = 0;
+  for (uint32_t i = 0; i < sizeof(value); i++) {
+    uint64_t kaddr;
+    if (addr > UINT64_MAX - i ||
+        !klog_user_kaddr(pml4, addr + i, &kaddr))
+      return false;
+    value |= (uint64_t)*(uint8_t *)kaddr << (i * 8);
+  }
+  *out = value;
+  return true;
+}
+
+static bool klog_is_uuid_error_message(uint64_t *pml4, uint64_t addr) {
+  static const char prefix[] = "Invalid UUID string '";
+  if (addr < 0x10000 || addr >= 0x0000800000000000ULL)
+    return false;
+  for (uint32_t i = 0; i < sizeof(prefix) - 1; i++) {
+    uint64_t kaddr;
+    if (addr > UINT64_MAX - i ||
+        !klog_user_kaddr(pml4, addr + i, &kaddr) ||
+        *(uint8_t *)kaddr != (uint8_t)prefix[i])
+      return false;
+  }
+  return true;
+}
+
+static bool klog_is_uuid_error_format(uint64_t *pml4, uint64_t addr) {
+  static const char format[] = "Invalid UUID string '%s'";
+  for (uint32_t i = 0; i < sizeof(format) - 1; i++) {
+    uint64_t kaddr;
+    if (addr > UINT64_MAX - i ||
+        !klog_user_kaddr(pml4, addr + i, &kaddr) ||
+        *(uint8_t *)kaddr != (uint8_t)format[i])
+      return false;
+  }
+  return true;
+}
+
+static void klog_uuid_fault_value(struct registers *regs) {
+  uint64_t *pml4 = vmm_get_active_pml4();
+  uint64_t candidates[16] = {
+      regs->rax, regs->rbx, regs->rcx, regs->rdx,
+      regs->rsi, regs->rdi, regs->rbp, regs->r8,
+      regs->r9, regs->r10, regs->r11, regs->r12,
+      regs->r13, regs->r14, regs->r15, 0};
+  uint64_t message = 0;
+  bool uuid_fatal = false;
+
+  /* In the observed GLib path, UDisks passes this literal as the format
+   * string, preceded by its log-domain string in the same read-only segment. */
+  for (uint32_t i = 0; i < 15 && !uuid_fatal; i++) {
+    if (candidates[i] < 0x10000 ||
+        candidates[i] >= 0x0000800000000000ULL)
+      continue;
+    for (uint32_t off = 0; off < 16; off++) {
+      uint64_t addr = candidates[i] + off, kaddr;
+      if (addr < candidates[i] || !klog_user_kaddr(pml4, addr, &kaddr))
+        break;
+      if (*(uint8_t *)kaddr == 'I' &&
+          klog_is_uuid_error_format(pml4, addr)) {
+        uuid_fatal = true;
+        break;
+      }
     }
+  }
+  if (!uuid_fatal)
+    return;
+
+  for (uint32_t i = 0; i < 16 && !message; i++) {
+    uint64_t candidate = candidates[i];
+    if (klog_is_uuid_error_message(pml4, candidate)) {
+      message = candidate;
+      break;
+    }
+    uint64_t message_ptr = 0;
+    /* GError layout: domain (4), code (4), message pointer (8). */
+    if (candidate >= 0x10000 && candidate < 0x0000800000000000ULL &&
+        candidate <= UINT64_MAX - 8 &&
+        klog_user_read_u64(pml4, candidate + 8, &message_ptr) &&
+        klog_is_uuid_error_message(pml4, message_ptr))
+      message = message_ptr;
+  }
+
+  /* The UDisks logger keeps its GError local in the caller frame. Scan only
+   * the first 1 KiB of the interrupted stack for that local pointer. */
+  for (uint32_t i = 0; i < 128 && !message; i++) {
+    uint64_t slot = regs->rsp + (uint64_t)i * sizeof(uint64_t);
+    uint64_t candidate = 0, message_ptr = 0;
+    if (slot < regs->rsp ||
+        !klog_user_read_u64(pml4, slot, &candidate))
+      break;
+    if (klog_is_uuid_error_message(pml4, candidate)) {
+      message = candidate;
+      break;
+    }
+    if (candidate >= 0x10000 && candidate < 0x0000800000000000ULL &&
+        candidate <= UINT64_MAX - 8 &&
+        klog_user_read_u64(pml4, candidate + 8, &message_ptr) &&
+        klog_is_uuid_error_message(pml4, message_ptr))
+      message = message_ptr;
+  }
+
+  klog_puts("  UUID value: ");
+  if (!message) {
+    klog_puts("<not recoverable from saved registers/stack>\n");
+    return;
+  }
+
+  static const char prefix[] = "Invalid UUID string '";
+  for (uint32_t i = 0; i < sizeof(prefix) - 1; i++) {
+    uint64_t kaddr;
+    if (!klog_user_kaddr(pml4, message + i, &kaddr)) {
+      klog_puts("<unreadable>\n");
+      return;
+    }
+  }
+  bool closed = false;
+  for (uint32_t i = sizeof(prefix) - 1; i < 128; i++) {
+    uint64_t kaddr;
+    if (message > UINT64_MAX - i ||
+        !klog_user_kaddr(pml4, message + i, &kaddr))
+      break;
+    uint8_t ch = *(uint8_t *)kaddr;
+    if (ch == '\'') {
+      closed = true;
+      break;
+    }
+    if (ch == 0)
+      break;
+    if (ch < 0x20 || ch > 0x7e) {
+      klog_putchar('?');
+      continue;
+    }
+    klog_putchar((char)ch);
+  }
+  if (!closed)
+    klog_puts("<truncated>");
+  klog_puts("\n");
 }
 
 static const char *get_signal_name(int sig) {
@@ -831,7 +983,13 @@ void isr_report_user_fault(struct registers *regs, int sig,
       current->last_report_addr = addr;
       uint32_t seen = __atomic_add_fetch(&user_fault_detail_count, 1,
                                          __ATOMIC_RELAXED);
-      if (seen <= 4 && have_fault_log) {
+      /* Fatal runtime traps (SIGABRT/SIGTRAP) often deliberately stop in
+       * g_error()/assertion code. A full stack/register/fd dump is especially
+       * harmful here: exception gates run with IF=0, so serial output delays
+       * pending TLB IPIs and can stall unrelated address-space teardown.
+       * Keep the compact summary below for these deliberate process exits;
+       * retain deep reports for the first memory/instruction faults. */
+      if (sig != SIGABRT && sig != SIGTRAP && seen <= 4 && have_fault_log) {
       // 1. Log detailed report to kernel console
       klog_puts("\n" KLOG_CLR_RED "################################################################################" KLOG_CLR_RESET "\n");
       klog_puts(KLOG_CLR_RED "[ USER FAULT ]" KLOG_CLR_RESET " process '");
@@ -1278,6 +1436,8 @@ void isr_report_user_fault(struct registers *regs, int sig,
         klog_puts("[USERFAULT] repeated detailed reports suppressed; "
                   "sampling every 256th (counter is global)\n");
       }
+      if (have_fault_log && sig == SIGTRAP && regs->int_no == 3)
+        klog_uuid_fault_value(regs);
     }
 
     // 2. Add to /dev/faults for userland monitors
@@ -1376,6 +1536,18 @@ static void breakpoint_handler(struct registers *regs) {
   }
 }
 
+/* Hardware single-step and watchpoint traps are #DB. PTRACE_SINGLESTEP sets
+ * TF in the tracee's saved RFLAGS; clear it here so PTRACE_CONT executes
+ * normally, while the tracer can request the next step explicitly. */
+static void debug_exception_handler(struct registers *regs) {
+  if ((regs->cs & 0x3) == 0x3) {
+    regs->rflags &= ~(1ULL << 8);
+    isr_report_user_fault(regs, SIGTRAP, regs->rip);
+  } else {
+    isr_panic(regs, "Unhandled Debug Exception");
+  }
+}
+
 /* into (overflow) from user mode; Linux reports it as SIGSEGV. */
 static void overflow_handler(struct registers *regs) {
   if ((regs->cs & 0x3) == 0x3) {
@@ -1387,6 +1559,7 @@ static void overflow_handler(struct registers *regs) {
 
 void isr_init_exceptions(void) {
   register_interrupt_handler(2, panic_stop_nmi_handler);
+  register_interrupt_handler(1, debug_exception_handler);
   register_interrupt_handler(3, breakpoint_handler);
   register_interrupt_handler(4, overflow_handler);
   register_interrupt_handler(6, invalid_opcode_handler);
@@ -1402,27 +1575,12 @@ static void isr_dispatch(struct registers *regs) {
   if (interrupt_handlers[regs->int_no] != 0) {
     isr_t handler = interrupt_handlers[regs->int_no];
     handler(regs);
-
-    if ((regs->cs & 0x3) == 0x3) {
-      /* Signal frame construction writes the user stack directly.  The CPU
-       * clears RFLAGS.AC on exception entry, so open a window here (no-op
-       * without SMAP). */
-      user_access_begin();
-      signal_deliver(regs);
-      user_access_end();
-    }
-
     send_eoi(regs);
 
     return;
   }
 
   if (regs->int_no >= 32) {
-    if ((regs->cs & 0x3) == 0x3) {
-      user_access_begin();
-      signal_deliver(regs);
-      user_access_end();
-    }
     send_eoi(regs);
     return;
   }
@@ -1461,6 +1619,17 @@ void isr_handler(struct registers *regs) {
 
   if (is_hw_irq && linuxkpi_irq_exit)
     linuxkpi_irq_exit();
+
+  /* Signal delivery can stop or terminate this thread and never return to
+   * its interrupt frame. Finish EOI and hardirq accounting first: abandoning
+   * an in-service device vector blocks lower-priority timer/IPI delivery on
+   * this CPU even after the scheduler switches it to idle. */
+  if ((regs->cs & 0x3) == 0x3) {
+    /* Frame construction writes the user stack; exception entry clears AC. */
+    user_access_begin();
+    signal_deliver(regs);
+    user_access_end();
+  }
 
   /* Complete both the controller EOI and LinuxKPI hardirq accounting before
    * a reschedule request can switch away from this interrupt frame. Do not

@@ -1,0 +1,76 @@
+--- a/src/gallium/winsys/virgl/drm/virgl_drm_winsys.c
++++ b/src/gallium/winsys/virgl/drm/virgl_drm_winsys.c
+@@ -33,6 +33,7 @@
+ #include "util/os_time.h"
+ #include "util/simple_mtx.h"
+ #include "util/u_memory.h"
++#include "util/set.h"
+ #include "util/format/u_format.h"
+ #include "util/u_hash_table.h"
+ #include "util/u_inlines.h"
+@@ -745,6 +746,7 @@
+ {
+    cbuf->nres = initial_size;
+    cbuf->cres = 0;
++   cbuf->res_set = NULL;
+ 
+    cbuf->res_bo = CALLOC(cbuf->nres, sizeof(struct virgl_hw_buf*));
+    if (!cbuf->res_bo)
+@@ -756,6 +758,9 @@
+       return false;
+    }
+ 
++   /* Keep resource ownership in the existing arrays. The pointer set is
++    * only an acceleration index; allocation failure retains the linear path. */
++   cbuf->res_set = _mesa_pointer_set_create(NULL);
+    return true;
+ }
+ 
+@@ -767,6 +772,7 @@
+       p_atomic_dec(&cbuf->res_bo[i]->num_cs_references);
+       virgl_drm_resource_reference(cbuf->ws, &cbuf->res_bo[i], NULL);
+    }
++   _mesa_set_destroy(cbuf->res_set, NULL);
+    FREE(cbuf->res_hlist);
+    FREE(cbuf->res_bo);
+ }
+@@ -774,6 +780,9 @@
+ static bool virgl_drm_res_is_added(struct virgl_drm_cmd_buf *cbuf,
+                                    struct virgl_hw_res *res)
+ {
++   if (cbuf->res_set)
++      return _mesa_set_search(cbuf->res_set, res) != NULL;
++
+    for (int i = 0; i < cbuf->cres; i++) {
+       if (cbuf->res_bo[i] == res)
+          return true;
+@@ -817,12 +826,19 @@
+    cbuf->res_hlist[cbuf->cres] = res->bo_handle;
+    p_atomic_inc(&res->num_cs_references);
+    cbuf->cres++;
++   if (cbuf->res_set && !_mesa_set_add(cbuf->res_set, res)) {
++      /* A failed growth must never make an existing BO invisible. */
++      _mesa_set_destroy(cbuf->res_set, NULL);
++      cbuf->res_set = NULL;
++   }
+ }
+ 
+ /* This is called after the cbuf is submitted. */
+ static void virgl_drm_clear_res_list(struct virgl_drm_cmd_buf *cbuf)
+ {
+    int i;
++   if (cbuf->res_set)
++      _mesa_set_clear(cbuf->res_set, NULL);
+ 
+    for (i = 0; i < cbuf->cres; i++) {
+       /* mark all BOs busy after submission */
+--- a/src/gallium/winsys/virgl/drm/virgl_drm_winsys.h
++++ b/src/gallium/winsys/virgl/drm/virgl_drm_winsys.h
+@@ -127,6 +127,7 @@
+    struct virgl_hw_res **res_bo;
+    struct virgl_winsys *ws;
+    uint32_t *res_hlist;
++   struct set *res_set;
+ };
+ 
+ static inline struct virgl_drm_winsys *

@@ -32,8 +32,6 @@ void gpu_diag_prime_error(unsigned int stage,const void *o,uint64_t d,uint64_t n
  error_stage=stage;error_count++;
 }
 static unsigned int gpu_diag_level(void){return level;}
-static uint64_t gpu_perf_ioctl_start(unsigned int request){(void)request;return 0;}
-static void gpu_perf_ioctl_finish(unsigned int request,uint64_t start,long result){(void)request;(void)start;(void)result;}
 void gpu_diag_record(unsigned int k,const void *o,uint64_t a,uint64_t b,uint64_t c,uint64_t d,long r){
  (void)o;(void)c;(void)d;(void)r;assert(count<4);events[count++]=k;
  if(k==GPU_DIAG_CS_OUT){last_ctx=a;last_seq=b;}

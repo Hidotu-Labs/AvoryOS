@@ -39,7 +39,6 @@
 #include <linuxkpi/native_sched.h>
 #include <linuxkpi/log.h>
 #include <linuxkpi/gpu_diag.h>
-#include <linuxkpi/gpu_perf.h>
 #include <linux/uaccess.h>
 #include <drm/drm_file.h>
 #include <drm/drm_drv.h>
@@ -527,9 +526,7 @@ int linuxkpi_file_ioctl(void *node, unsigned int request, unsigned long arg) {
     if (cs) gpu_diag_record(GPU_DIAG_CS_IN,file,input.in.ctx_id,input.in.bo_list_handle,
                             input.in.num_chunks,input.in.flags,0);
   }
-  __UINT64_TYPE__ perf_start = gpu_perf_ioctl_start(request);
   int ret=(int)file->f_op->unlocked_ioctl(file,request,arg);
-  gpu_perf_ioctl_finish(request, perf_start, ret);
   if (trace) gpu_diag_record(GPU_DIAG_IOCTL,file,request,arg,
                              linuxkpi_monotonic_ms()-start,0,ret);
   if (trace && ret < 0) {

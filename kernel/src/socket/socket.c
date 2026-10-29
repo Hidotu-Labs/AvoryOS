@@ -900,6 +900,45 @@ void socket_vfs_close(struct vfs_node *node) {
   socket_put(sock);
 }
 
+/* Diagnostic-only snapshot used by sysdiag when a nonblocking receive keeps
+ * returning EAGAIN.  The generic socket fields answer "which family/state",
+ * and each family appends its queue/peer state.  Never called on a data
+ * path; readers only need this while investigating a poll/read mismatch. */
+void socket_diag_describe(socket_t *sock, char *out, size_t outsz) {
+  if (!out || outsz < 2)
+    return;
+  out[0] = '\0';
+  if (!sock)
+    return;
+
+  int n = snprintf(out, outsz, "dom=%d typ=%d st=%d err=%d fl=0x%x",
+                   sock->domain, sock->type, sock->state, sock->error,
+                   (unsigned)sock->flags);
+  if (n < 0) {
+    out[0] = '\0';
+    return;
+  }
+  size_t used = (size_t)n < outsz ? (size_t)n : outsz - 1;
+  char *tail = out + used;
+  size_t tail_size = outsz - used;
+  if (tail_size < 2)
+    return;
+
+  switch (sock->domain) {
+  case AF_UNIX:
+    unix_diag_describe(sock, tail, tail_size);
+    break;
+  case AF_INET:
+    inet_diag_describe(sock, tail, tail_size);
+    break;
+  case AF_INET6:
+    inet6_diag_describe(sock, tail, tail_size);
+    break;
+  default:
+    break;
+  }
+}
+
 int socket_vfs_poll(struct vfs_node *node, int events) {
   if (!node)
     return POLLNVAL;

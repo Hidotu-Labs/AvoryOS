@@ -14,6 +14,7 @@
 #include "net/core.h"
 #include "apic/lapic_timer.h"
 #include "sched/sched.h"
+#include "sched/wait.h"
 #include "smp/cpu.h"
 #include "socket/af_netlink.h"
 
@@ -26,8 +27,48 @@
 #define BUFFER_SIZE 2048u
 #define TX_TIMEOUT_MS 2000u
 #define SERVICE_INTERVAL_MS 100u
+#define RX_POLL_BUDGET 64u
+#define RX_INT_MASK (E1000_INT_RXDMT0 | E1000_INT_RXO | E1000_INT_RXT0)
 
 extern const char *kernel_boot_cmdline;
+
+struct e1000_profile {
+  const char *driver_name;
+  const char *log_tag;
+  uint16_t vendor_id;
+  uint16_t device_id;
+  uint32_t mmio_size;
+  uint32_t eerd_start;
+  uint32_t eerd_done;
+  uint8_t eerd_address_shift;
+  uint8_t eerd_data_shift;
+};
+
+static const struct e1000_profile profile_82540em = {
+    .driver_name = "e1000",
+    .log_tag = "E1000",
+    .vendor_id = E1000_VENDOR,
+    .device_id = E1000_82540EM,
+    .mmio_size = E1000_MMIO_SIZE,
+    .eerd_start = E1000_EERD_START,
+    .eerd_done = E1000_EERD_DONE,
+    .eerd_address_shift = E1000_EERD_ADDR_SHIFT,
+    .eerd_data_shift = E1000_EERD_DATA_SHIFT,
+};
+
+/* QEMU e1000e models the Intel 82574L. Its EERD address and DONE fields use
+ * the newer layout; keep it separate from the 82540EM profile above. */
+static const struct e1000_profile profile_82574l = {
+    .driver_name = "e1000e",
+    .log_tag = "E1000E",
+    .vendor_id = E1000_VENDOR,
+    .device_id = E1000E_82574L,
+    .mmio_size = E1000_MMIO_SIZE,
+    .eerd_start = E1000E_EERD_START,
+    .eerd_done = E1000E_EERD_DONE,
+    .eerd_address_shift = E1000E_EERD_ADDR_SHIFT,
+    .eerd_data_shift = E1000E_EERD_DATA_SHIFT,
+};
 
 struct e1000_rx_desc {
   uint64_t address;
@@ -47,6 +88,7 @@ _Static_assert(sizeof(struct e1000_rx_desc) == 16, "RX descriptor layout");
 _Static_assert(sizeof(struct e1000_tx_desc) == 16, "TX descriptor layout");
 
 struct e1000 {
+  const struct e1000_profile *profile;
   struct pci_device *pci;
   volatile uint8_t *regs;
   uint16_t saved_command;
@@ -57,7 +99,7 @@ struct e1000 {
   struct pci_irq irq;
   dma_buffer_t *rx_ring, *tx_ring, *rx_data, *tx_data;
   uint16_t rx_next, tx_next, tx_clean, tx_pending;
-  bool bound, active, rx_discard, quarantined;
+  bool bound, active, rx_discard, rx_poll_pending, quarantined;
   /* Only task context takes changing; IRQ/data paths take lock and check active. */
   bool changing, carrier, notify_link, test_configured, test_stall, restore_default;
   uint64_t tx_progress_ms;
@@ -70,11 +112,48 @@ struct e1000 {
  * DMA allocations are still released after a successful stop/reset. */
 static struct e1000 controllers[NET_DEVICE_MAX];
 static bool shutting_down, monitor_started, monitor_changing;
+static wait_queue_t monitor_wait;
+static wait_queue_entry_t monitor_entry;
 static void service_worker(void);
 static bool start(struct net_device *netdev);
 static void stop(struct net_device *netdev);
 static bool link_up(struct net_device *netdev);
 static int transmit(struct net_device *netdev, const void *frame, size_t length);
+static bool reset_device(struct e1000 *dev);
+
+enum e1000e_irq_policy {
+  E1000E_IRQ_AUTO,
+  E1000E_IRQ_INTX,
+  E1000E_IRQ_MSI,
+};
+
+static bool is_e1000e(const struct e1000 *dev) {
+  return dev->profile && dev->profile->device_id == E1000E_82574L;
+}
+
+static enum e1000e_irq_policy e1000e_irq_policy(void) {
+  const char *cmdline = kernel_boot_cmdline ? kernel_boot_cmdline : "";
+  static const char option[] = "e1000e_irq=";
+  for (const char *p = cmdline; *p;) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    const char *end = p;
+    while (*end && *end != ' ') end++;
+    if ((size_t)(end - p) >= sizeof(option) - 1 &&
+        !memcmp(p, option, sizeof(option) - 1)) {
+      const char *value = p + sizeof(option) - 1;
+      size_t length = (size_t)(end - value);
+      if (length == 3 && !memcmp(value, "msi", 3)) return E1000E_IRQ_MSI;
+      if (length == 4 && !memcmp(value, "intx", 4)) return E1000E_IRQ_INTX;
+      if (length == 4 && !memcmp(value, "auto", 4)) return E1000E_IRQ_AUTO;
+      klogf("[E1000E] invalid e1000e_irq value; using auto\n");
+      return E1000E_IRQ_AUTO;
+    }
+    p = end;
+  }
+  return E1000E_IRQ_AUTO;
+}
+
 static const struct net_device_ops ops = {
     .start = start, .stop = stop, .link_up = link_up, .transmit = transmit,
 };
@@ -92,6 +171,7 @@ static bool ensure_worker(void) {
   while (__atomic_test_and_set(&monitor_changing, __ATOMIC_ACQUIRE))
     sched_yield();
   if (!monitor_started) {
+    wait_queue_init(&monitor_wait);
     struct thread *worker = sched_create_kernel_thread(service_worker, cpu_get_current(), false);
     if (worker) {
       strcpy(worker->comm, "e1000-service");
@@ -143,8 +223,9 @@ static void set_command(struct e1000 *dev, uint16_t command) {
   pci_config_write16(pci->bus, pci->slot, pci->func, 0x04, command);
 }
 
-/* Leave failed probes and stopped devices unable to initiate DMA or assert
- * INTx. Keep register decoding enabled while the persistent slot owns MMIO. */
+/* Leave failed probes and stopped devices unable to initiate DMA or deliver
+ * controller interrupts. Keep register decoding enabled while the persistent
+ * slot owns MMIO. */
 static void quiesce(struct e1000 *dev) {
   if (dev->regs) {
     write32(dev, E1000_IMC, UINT32_MAX);
@@ -156,6 +237,15 @@ static void quiesce(struct e1000 *dev) {
   set_command(dev, ((dev->saved_command | (dev->regs ? PCI_COMMAND_MEMORY : 0)) &
                    ~PCI_COMMAND_MASTER) |
                        PCI_COMMAND_INTX_DISABLE);
+}
+
+/* The PCI MSI Enable bit gates all messages from this single-vector source.
+ * Keep its callback/vector installed for the slot's lifetime, and only toggle
+ * delivery after active has changed under dev->lock. */
+static bool mask_msi(struct e1000 *dev, bool masked) {
+  if (dev->irq.mode != PCI_IRQ_MSI)
+    return true;
+  return pci_irq_mask(&dev->irq, 0, masked);
 }
 
 static bool valid_mac(const uint8_t mac[6]) {
@@ -176,14 +266,15 @@ static bool read_mac(struct e1000 *dev) {
   if ((high & E1000_RAH_AV) && valid_mac(dev->mac))
     return true;
 
-  /* 82540EM EERD layout; do not apply this to other controller families. */
+  /* EEPROM command layouts are selected by controller profile. */
   for (unsigned i = 0; i < 3; i++) {
     write32(dev, E1000_EERD,
-            (i << E1000_EERD_ADDR_SHIFT) | E1000_EERD_START);
-    if (!wait32(dev, E1000_EERD, E1000_EERD_DONE, E1000_EERD_DONE,
+            (i << dev->profile->eerd_address_shift) | dev->profile->eerd_start);
+    if (!wait32(dev, E1000_EERD, dev->profile->eerd_done,
+                dev->profile->eerd_done,
                 EEPROM_TIMEOUT_MS))
       return false;
-    uint32_t word = read32(dev, E1000_EERD) >> E1000_EERD_DATA_SHIFT;
+    uint32_t word = read32(dev, E1000_EERD) >> dev->profile->eerd_data_shift;
     dev->mac[i * 2] = word;
     dev->mac[i * 2 + 1] = word >> 8;
   }
@@ -282,14 +373,19 @@ static int transmit(struct net_device *netdev, const void *frame, size_t length)
   return 0;
 }
 
-static void drain_rx(struct e1000 *dev) {
+/* Run from the service thread with dev->lock held. RX interrupts are masked
+ * while polling; return true when another bounded pass is needed. */
+static bool drain_rx(struct e1000 *dev) {
   struct e1000_rx_desc *ring = dev->rx_ring->virt;
-  for (unsigned budget = 0; budget < RING_COUNT; budget++) {
+  struct net_rx_frame frames[RX_POLL_BUDGET];
+  size_t frame_count = 0;
+  unsigned consumed = 0;
+  for (; consumed < RX_POLL_BUDGET; consumed++) {
     unsigned slot = dev->rx_next;
     struct e1000_rx_desc *desc = &ring[slot];
     uint8_t status = __atomic_load_n(&desc->status, __ATOMIC_ACQUIRE);
     if (!(status & E1000_RX_DD))
-      return;
+      break;
     bool end = (status & E1000_RX_EOP) != 0;
     /* 2 KiB buffers cover every supported frame. Drop the entire unexpected
      * multi-descriptor packet, including its final fragment. SECRC removes FCS. */
@@ -301,27 +397,31 @@ static void drain_rx(struct e1000 *dev) {
       dev->netdev.stats.rx_dropped++;
       dev->rx_discard = !end;
     } else {
-      net_rx_submit_irq(&dev->netdev,
-                        (uint8_t *)dev->rx_data->virt + slot * BUFFER_SIZE,
-                        desc->length);
+      frames[frame_count++] = (struct net_rx_frame){
+          .data = (uint8_t *)dev->rx_data->virt + slot * BUFFER_SIZE,
+          .length = desc->length,
+      };
     }
     desc->length = desc->checksum = desc->special = 0;
     desc->errors = 0;
     __atomic_store_n(&desc->status, 0, __ATOMIC_RELEASE);
     dev->rx_next = (slot + 1) % RING_COUNT;
+  }
+  if (frame_count)
+    (void)net_rx_submit_batch_irq(&dev->netdev, frames, frame_count);
+  if (consumed) {
+    /* Return a contiguous descriptor run with one tail write per batch. */
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    write32(dev, E1000_RDT, slot);
+    write32(dev, E1000_RDT,
+            (dev->rx_next + RING_COUNT - 1) % RING_COUNT);
   }
-  /* ICR is cleared only once at IRQ entry. If traffic refilled the ring during
-   * this bounded drain, explicitly leave a cause pending for another INTx. */
-  if (__atomic_load_n(&ring[dev->rx_next].status, __ATOMIC_ACQUIRE) & E1000_RX_DD) {
-    write32(dev, E1000_ICS, E1000_INT_RXT0);
-    flush(dev);
-  }
+  return (__atomic_load_n(&ring[dev->rx_next].status, __ATOMIC_ACQUIRE) &
+          E1000_RX_DD) != 0;
 }
 
 static void interrupt_slot(unsigned index) {
   struct e1000 *dev = &controllers[index];
+  bool wake_poller = false;
   spinlock_acquire(&dev->lock);
   if (dev->active) {
     uint32_t cause = read32(dev, E1000_ICR); /* read-to-clear, including shared IRQs */
@@ -332,12 +432,18 @@ static void interrupt_slot(unsigned index) {
         dev->netdev.stats.rx_overflows++;
       if (cause & E1000_INT_LSC)
         update_link(dev);
-      if (cause & (E1000_INT_RXT0 | E1000_INT_RXDMT0 | E1000_INT_RXO))
-        drain_rx(dev);
+      if (cause & RX_INT_MASK) {
+        /* Defer descriptor processing and frame copies out of hard IRQ. */
+        write32(dev, E1000_IMC, RX_INT_MASK);
+        __atomic_store_n(&dev->rx_poll_pending, true, __ATOMIC_RELEASE);
+        wake_poller = true;
+      }
       reclaim_tx(dev);
     }
   }
   spinlock_release(&dev->lock);
+  if (wake_poller)
+    wait_queue_wake_one(&monitor_wait);
 }
 
 #define SLOT_IRQ(n) static void irq##n(struct registers *regs) { \
@@ -360,6 +466,7 @@ static void program_rings(struct e1000 *dev) {
   }
   spinlock_acquire(&dev->lock);
   dev->rx_next = dev->tx_next = dev->tx_clean = dev->tx_pending = 0;
+  dev->rx_poll_pending = false;
   dev->rx_discard = false;
   write32(dev, E1000_CTRL, read32(dev, E1000_CTRL) | E1000_CTRL_SLU);
   write32(dev, E1000_RAL0, (uint32_t)dev->mac[0] | (uint32_t)dev->mac[1] << 8 |
@@ -378,11 +485,31 @@ static void program_rings(struct e1000 *dev) {
   write32(dev, E1000_TDH, 0);
   write32(dev, E1000_TDT, 0);
   write32(dev, E1000_RXCSUM, 0);
+  if (dev->profile->device_id == E1000E_82574L) {
+    /* QEMU's 82574 reset defaults enable IP/TCP/UDP checksum processing.
+     * Select the 16-byte legacy RX descriptor layout, disable RSS, checksum
+     * and VLAN transforms plus TX queue 1, and apply the TARC0 erratum bit. */
+    write32(dev, E1000_CTRL_EXT,
+            read32(dev, E1000_CTRL_EXT) & ~E1000E_CTRL_EXT_VME);
+    write32(dev, E1000_RFCTL,
+            read32(dev, E1000_RFCTL) & ~E1000E_RFCTL_EXTEN);
+    write32(dev, E1000_MRQC, 0);
+    write32(dev, E1000_TARC0,
+            read32(dev, E1000_TARC0) | E1000E_TARC_ENABLE |
+                E1000E_TARC_82574_ERRATA);
+    write32(dev, E1000_TARC1,
+            read32(dev, E1000_TARC1) & ~E1000E_TARC_ENABLE);
+  }
   write32(dev, E1000_RDTR, 0);
   write32(dev, E1000_RADV, 0);
   write32(dev, E1000_TIDV, 0);
   write32(dev, E1000_TADV, 0);
   write32(dev, E1000_ITR, 0);
+  if (is_e1000e(dev)) {
+    /* Use the legacy ICR read-to-clear path for both MSI and INTx. IAM is
+     * reserved for explicit auto-mask/rearm policies; keep it disabled. */
+    write32(dev, E1000_IAM, 0);
+  }
   write32(dev, E1000_TIPG, 10u | (8u << 10) | (6u << 20));
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
   dev->active = true;
@@ -392,11 +519,18 @@ static void program_rings(struct e1000 *dev) {
   set_command(dev, command | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER | PCI_COMMAND_INTX_DISABLE);
   write32(dev, E1000_TCTL, E1000_TCTL_EN | E1000_TCTL_PSP | (0x10u << 4) | (0x40u << 12));
   /* All-multicast supports IPv6 NDP without a multicast-filter API yet. */
-  write32(dev, E1000_RCTL, E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_MPE | E1000_RCTL_SECRC);
+  write32(dev, E1000_RCTL,
+          E1000_RCTL_EN | E1000_RCTL_BAM | E1000_RCTL_MPE |
+              E1000_RCTL_SECRC);
   (void)read32(dev, E1000_ICR);
   write32(dev, E1000_IMS, E1000_INT_MASK);
   flush(dev);
-  set_command(dev, (command | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER) & ~PCI_COMMAND_INTX_DISABLE);
+  uint16_t active_command = command | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
+  if (dev->irq.mode == PCI_IRQ_INTX)
+    active_command &= ~PCI_COMMAND_INTX_DISABLE;
+  else
+    active_command |= PCI_COMMAND_INTX_DISABLE;
+  set_command(dev, active_command);
   update_link(dev);
   dev->notify_link = true;
   spinlock_release(&dev->lock);
@@ -409,7 +543,7 @@ static bool start_device(struct e1000 *dev) {
   if (dev->active)
     return true;
   if (!ensure_worker()) {
-    klogf("[E1000] service worker creation failed\n");
+    klogf("[%s] service worker creation failed\n", dev->profile->log_tag);
     return false;
   }
   dev->rx_ring = dma_alloc(RING_COUNT * sizeof(struct e1000_rx_desc), DMA_FLAG_32BIT);
@@ -422,21 +556,55 @@ static bool start_device(struct e1000 *dev) {
                    (dev->tx_data ? dev->tx_data->size : 0);
   __atomic_store_n(&dev->netdev.stats.dma_bytes, bytes, __ATOMIC_RELEASE);
   if (!dev->rx_ring || !dev->tx_ring || !dev->rx_data || !dev->tx_data) {
-    klogf("[E1000] %s DMA allocation failed\n", netdev->name);
+    klogf("[%s] %s DMA allocation failed\n", dev->profile->log_tag,
+          netdev->name);
     free_dma(dev);
     return false;
   }
   unsigned index = dev - controllers;
-  if (dev->irq.mode == PCI_IRQ_NONE &&
-      !pci_irq_request_modes(dev->pci, &dev->irq, &handlers[index], 1, 0,
-                             PCI_IRQ_MODE_INTX)) {
-    klogf("[E1000] %s INTx registration failed\n", netdev->name);
+  if (dev->irq.mode == PCI_IRQ_NONE) {
+    uint32_t modes = PCI_IRQ_MODE_INTX;
+    enum e1000e_irq_policy policy = E1000E_IRQ_INTX;
+    if (is_e1000e(dev)) {
+      policy = e1000e_irq_policy();
+      modes = policy == E1000E_IRQ_INTX ? PCI_IRQ_MODE_INTX :
+              policy == E1000E_IRQ_MSI ? PCI_IRQ_MODE_MSI :
+                  PCI_IRQ_MODE_MSI | PCI_IRQ_MODE_INTX;
+    }
+    if (!pci_irq_request_modes(dev->pci, &dev->irq, &handlers[index], 1, 0,
+                               modes)) {
+      klogf("[%s] %s %s interrupt registration failed\n",
+            dev->profile->log_tag, netdev->name,
+            policy == E1000E_IRQ_MSI ? "forced MSI" :
+            policy == E1000E_IRQ_INTX ? "INTx" : "MSI/INTx");
+      free_dma(dev);
+      return false;
+    }
+  }
+  if (dev->irq.mode == PCI_IRQ_MSI && !mask_msi(dev, true)) {
+    klogf("[%s] %s failed to mask MSI before activation\n",
+          dev->profile->log_tag, netdev->name);
     free_dma(dev);
     return false;
   }
   program_rings(dev);
-  klogf("[E1000] %s RX/TX enabled; INTx IRQ %u, %u descriptors per ring, link=%s\n",
-        netdev->name, dev->pci->irq_line, RING_COUNT, link_up(netdev) ? "up" : "down");
+  if (dev->irq.mode == PCI_IRQ_MSI && !mask_msi(dev, false)) {
+    klogf("[%s] %s failed to enable MSI after activation\n",
+          dev->profile->log_tag, netdev->name);
+    (void)reset_device(dev);
+    free_dma(dev);
+    return false;
+  }
+  if (dev->irq.mode == PCI_IRQ_MSI)
+    klogf("[%s] %s RX/TX enabled; MSI vector %u, legacy INTx disabled, "
+          "%u descriptors per ring, link=%s\n",
+          dev->profile->log_tag, netdev->name,
+          pci_irq_vector(&dev->irq, 0), RING_COUNT,
+          link_up(netdev) ? "up" : "down");
+  else
+    klogf("[%s] %s RX/TX enabled; INTx IRQ %u, %u descriptors per ring, link=%s\n",
+        dev->profile->log_tag, netdev->name, dev->irq.irq_line, RING_COUNT,
+        link_up(netdev) ? "up" : "down");
   return true;
 }
 
@@ -458,7 +626,7 @@ static bool link_up(struct net_device *netdev) {
 
 /* Caller owns changing. Taking lock waits for any executing IRQ/transmit path
  * to leave the rings. active=false then prevents all new access, including
- * callbacks retained by the legacy IRQ registry. Reset waits keep IRQs enabled. */
+ * callbacks retained by the IRQ registry. MSI delivery is masked before reset. */
 static bool reset_device(struct e1000 *dev) {
   spinlock_acquire(&dev->lock);
   if (dev->tx_ring)
@@ -467,6 +635,7 @@ static bool reset_device(struct e1000 *dev) {
   dev->tx_pending = 0;
   dev->active = false;
   dev->netdev.started = false;
+  __atomic_store_n(&dev->rx_poll_pending, false, __ATOMIC_RELEASE);
   __atomic_add_fetch(&dev->netdev.generation, 1, __ATOMIC_RELEASE);
   if (dev->carrier) {
     dev->carrier = false;
@@ -474,21 +643,24 @@ static bool reset_device(struct e1000 *dev) {
   }
   dev->notify_link = true;
   quiesce(dev);
+  bool dma = dev->rx_ring || dev->tx_ring || dev->rx_data || dev->tx_data;
+  spinlock_release(&dev->lock);
+  if (!mask_msi(dev, true))
+    klogf("[%s] %s MSI mask failed after quiesce\n", dev->profile->log_tag,
+          dev->netdev.name);
   if (dev->quarantined) {
-    spinlock_release(&dev->lock);
     return false;
   }
-  bool dma = dev->rx_ring || dev->tx_ring || dev->rx_data || dev->tx_data;
   if (dma) {
     write32(dev, E1000_CTRL, read32(dev, E1000_CTRL) | E1000_CTRL_RST);
     flush(dev);
   }
-  spinlock_release(&dev->lock);
   if (dma) {
     if (!wait32(dev, E1000_CTRL, E1000_CTRL_RST, 0, RESET_TIMEOUT_MS)) {
       dev->quarantined = true;
       dev->netdev.stats.recovery_failures++;
-      klogf("[E1000] %s reset timeout; DMA buffers quarantined\n", dev->netdev.name);
+      klogf("[%s] %s reset timeout; DMA buffers quarantined\n",
+            dev->profile->log_tag, dev->netdev.name);
       return false;
     }
     delay_ms(dev, 10);
@@ -530,16 +702,25 @@ static void service_device(struct e1000 *dev) {
   }
   spinlock_release(&dev->lock);
   if (stalled)
-    klogf("[E1000] %s TX stalled: pending=%u TDH=%u TDT=%u ICR=%x; resetting\n",
-          dev->netdev.name, pending, head, tail, cause);
+    klogf("[%s] %s TX stalled: pending=%u TDH=%u TDT=%u ICR=%x; resetting\n",
+          dev->profile->log_tag, dev->netdev.name, pending, head, tail, cause);
   if (stalled && reset_device(dev)) {
     dev->test_stall = false;
     if (__atomic_load_n(&shutting_down, __ATOMIC_ACQUIRE)) {
       free_dma(dev);
     } else {
       program_rings(dev); /* reuse allocations only after reset acknowledged */
-      dev->netdev.stats.recoveries++;
-      klogf("[E1000] %s TX recovery complete\n", dev->netdev.name);
+      if (!mask_msi(dev, false)) {
+        klogf("[%s] %s failed to restore MSI after recovery\n",
+              dev->profile->log_tag, dev->netdev.name);
+        dev->netdev.stats.recovery_failures++;
+        if (reset_device(dev))
+          free_dma(dev);
+      } else {
+        dev->netdev.stats.recoveries++;
+        klogf("[%s] %s TX recovery complete\n", dev->profile->log_tag,
+              dev->netdev.name);
+      }
     }
   }
   spinlock_acquire(&dev->lock);
@@ -548,7 +729,8 @@ static void service_device(struct e1000 *dev) {
   dev->notify_link = false;
   spinlock_release(&dev->lock);
   if (notify) {
-    klogf("[E1000] %s link %s\n", dev->netdev.name, carrier ? "up" : "down");
+    klogf("[%s] %s link %s\n", dev->profile->log_tag, dev->netdev.name,
+          carrier ? "up" : "down");
     if (net_device_default() == &dev->netdev)
       netlink_notify_link(&dev->netdev);
   }
@@ -557,14 +739,54 @@ static void service_device(struct e1000 *dev) {
 
 static void service_worker(void) {
   struct thread *self = sched_get_current();
+  memset(&monitor_entry, 0, sizeof(monitor_entry));
+  monitor_entry.thread = self;
   for (;;) {
+    bool more_rx = false;
+    for (unsigned i = 0; i < NET_DEVICE_MAX; i++) {
+      struct e1000 *dev = &controllers[i];
+      spinlock_acquire(&dev->lock);
+      if (dev->active &&
+          __atomic_load_n(&dev->rx_poll_pending, __ATOMIC_ACQUIRE)) {
+        bool pending = drain_rx(dev);
+        more_rx |= pending;
+        if (!pending) {
+          __atomic_store_n(&dev->rx_poll_pending, false, __ATOMIC_RELEASE);
+          write32(dev, E1000_IMS, RX_INT_MASK);
+          flush(dev);
+        }
+      }
+      spinlock_release(&dev->lock);
+    }
     if (!__atomic_load_n(&shutting_down, __ATOMIC_ACQUIRE))
       for (unsigned i = 0; i < NET_DEVICE_MAX; i++)
         service_device(&controllers[i]);
+
+    if (more_rx) {
+      sched_yield(); /* Keep each poll bounded and let other runnable work run. */
+      continue;
+    }
+
+    /* Pair waiter publication with an RX-pending recheck, so an interrupt
+     * arriving during the park handoff cannot leave the poller asleep. */
+    hal_irq_state_t flags = hal_irq_save();
     self->wakeup_ticks = lapic_timer_get_ticks() + SERVICE_INTERVAL_MS;
     self->state = THREAD_SLEEPING;
-    sched_yield();
+    wait_queue_add(&monitor_wait, &monitor_entry);
+    bool pending = false;
+    for (unsigned i = 0; i < NET_DEVICE_MAX; i++)
+      pending |= __atomic_load_n(&controllers[i].rx_poll_pending,
+                                 __ATOMIC_ACQUIRE);
+    if (pending)
+      self->state = THREAD_RUNNING;
+    hal_irq_restore(flags);
+    if (!pending)
+      sched_yield();
+    flags = hal_irq_save();
+    self->state = THREAD_RUNNING;
     self->wakeup_ticks = 0;
+    wait_queue_remove(&monitor_wait, &monitor_entry);
+    hal_irq_restore(flags);
   }
 }
 
@@ -575,12 +797,19 @@ void e1000_shutdown(void) {
     if (!dev->pci)
       continue;
     stop(&dev->netdev);
-    klogf("[E1000] %s shutdown: DMA/INTx disabled, buffers=%s\n",
-          dev->netdev.name, dev->quarantined ? "quarantined" : "released");
+    klogf("[%s] %s shutdown: DMA/interrupts disabled, buffers=%s\n",
+          dev->profile->log_tag, dev->netdev.name,
+          dev->quarantined ? "quarantined" : "released");
   }
 }
 
 static int probe(struct device *device) {
+  const struct e1000_profile *profile =
+      device && device->driver ? device->driver->private_data : NULL;
+  if (!profile || !device->driver->name ||
+      strcmp(device->driver->name, profile->driver_name))
+    return -1;
+
   struct pci_device *pci = NULL;
   for (uint32_t i = 0; i < pci_get_device_count(); i++) {
     struct pci_device *candidate = asc_pci_get_device(i);
@@ -589,19 +818,19 @@ static int probe(struct device *device) {
       break;
     }
   }
-  if (!pci || pci->linux_driver_name || pci->vendor_id != E1000_VENDOR ||
-      pci->device_id != E1000_82540EM || pci->class_code != 2 ||
+  if (!pci || pci->linux_driver_name || pci->vendor_id != profile->vendor_id ||
+      pci->device_id != profile->device_id || pci->class_code != 2 ||
       pci->subclass != 0)
     return -1;
 
-  /* 82540EM BAR0 is a non-prefetchable 32-bit memory BAR. Fail closed for
-   * unsupported layouts rather than truncating a 64-bit BAR or mapping I/O. */
+  /* Supported profiles use a non-prefetchable 32-bit memory BAR0. Fail
+   * closed rather than truncating a 64-bit BAR or mapping I/O. */
   uint32_t bar = pci->bar[0];
   uint64_t phys = bar & ~0xfu;
   if ((bar & 0xfu) || !phys || (phys & (PAGE_SIZE - 1)) ||
-      pci->bar_size[0] < E1000_MMIO_SIZE ||
+      pci->bar_size[0] < profile->mmio_size ||
       pci->bar_size[0] > (1ull << 32) - phys) {
-    klogf("[E1000] %s invalid BAR0\n", device->name);
+    klogf("[%s] %s invalid BAR0\n", profile->log_tag, device->name);
     return -1;
   }
   uint64_t khz = tsc_get_freq_khz();
@@ -624,6 +853,7 @@ static int probe(struct device *device) {
     return -1;
   }
   /* Slot addresses, locks and installed handlers survive unbind/reprobe. */
+  dev->profile = profile;
   dev->pci = pci;
   dev->netdev.driver_private = dev;
   dev->cycles_per_ms = khz;
@@ -631,9 +861,9 @@ static int probe(struct device *device) {
   set_command(dev, (dev->saved_command | PCI_COMMAND_MEMORY |
                     PCI_COMMAND_INTX_DISABLE) & ~PCI_COMMAND_MASTER);
 
-  void *mapped = pci_map_mmio(phys, E1000_MMIO_SIZE);
+  void *mapped = pci_map_mmio(phys, profile->mmio_size);
   if (!mapped) {
-    klogf("[E1000] %s BAR0 mapping failed\n", device->name);
+    klogf("[%s] %s BAR0 mapping failed\n", profile->log_tag, device->name);
     goto fail;
   }
   dev->regs = (volatile uint8_t *)mapped;
@@ -648,7 +878,7 @@ static int probe(struct device *device) {
   write32(dev, E1000_CTRL, ctrl | E1000_CTRL_RST);
   flush(dev);
   if (!wait32(dev, E1000_CTRL, E1000_CTRL_RST, 0, RESET_TIMEOUT_MS)) {
-    klogf("[E1000] %s reset timeout\n", device->name);
+    klogf("[%s] %s reset timeout\n", profile->log_tag, device->name);
     goto fail;
   }
   /* Allow EEPROM auto-read to settle before consuming RAR0 or using EERD. */
@@ -658,7 +888,8 @@ static int probe(struct device *device) {
   write32(dev, E1000_TCTL, 0);
   (void)read32(dev, E1000_ICR);
   if (!read_mac(dev)) {
-    klogf("[E1000] %s MAC/EEPROM read failed\n", device->name);
+    klogf("[%s] %s MAC/EEPROM read failed\n", profile->log_tag,
+          device->name);
     goto fail;
   }
   write32(dev, E1000_CTRL, read32(dev, E1000_CTRL) | E1000_CTRL_SLU);
@@ -672,7 +903,8 @@ static int probe(struct device *device) {
   if (net_device_find(dev->netdev.name))
     dev->netdev.name[0] = 0;
   if (net_device_register(&dev->netdev)) {
-    klogf("[E1000] %s network registration failed\n", device->name);
+    klogf("[%s] %s network registration failed\n", profile->log_tag,
+          device->name);
     goto fail;
   }
   dev->bound = true;
@@ -684,11 +916,13 @@ static int probe(struct device *device) {
                        (!option[21] || option[21] == ' ');
     dev->test_configured = true;
     if (dev->test_stall)
-      klogf("[E1000] %s diagnostic TX stall armed\n", dev->netdev.name);
+      klogf("[%s] %s diagnostic TX stall armed\n", profile->log_tag,
+            dev->netdev.name);
   }
-  klogf("[E1000] %s 8086:100e MAC %02x:%02x:%02x:%02x:%02x:%02x link=%s; "
+  klogf("[%s] %s %04x:%04x MAC %02x:%02x:%02x:%02x:%02x:%02x link=%s; "
         "probe ready, RX/TX/DMA/interrupts disabled\n",
-        device->name, dev->mac[0], dev->mac[1], dev->mac[2], dev->mac[3],
+        profile->log_tag, device->name, profile->vendor_id, profile->device_id,
+        dev->mac[0], dev->mac[1], dev->mac[2], dev->mac[3],
         dev->mac[4], dev->mac[5],
         (read32(dev, E1000_STATUS) & E1000_STATUS_LU) ? "up" : "down");
   /* A sysfs rebind after protocol startup must reactivate this NIC without
@@ -726,21 +960,36 @@ static void remove_device(struct device *device) {
   device->driver_data = NULL;
 }
 
-static struct device_id ids[] = {
+static struct device_id e1000_ids[] = {
     {.type = ID_PCI, .pci = {.vendor = E1000_VENDOR, .device = E1000_82540EM}},
 };
-static struct driver driver = {
-    .name = "e1000", .ids = ids, .id_count = 1,
+static struct device_id e1000e_ids[] = {
+    {.type = ID_PCI, .pci = {.vendor = E1000_VENDOR, .device = E1000E_82574L}},
+};
+static struct driver e1000_driver = {
+    .name = "e1000", .ids = e1000_ids, .id_count = 1,
     .probe = probe, .remove = remove_device, .kind = DRIVER_KERNEL,
+    .private_data = (void *)&profile_82540em,
+};
+static struct driver e1000e_driver = {
+    .name = "e1000e", .ids = e1000e_ids, .id_count = 1,
+    .probe = probe, .remove = remove_device, .kind = DRIVER_KERNEL,
+    .private_data = (void *)&profile_82574l,
 };
 
 void e1000_init(void) {
-  driver.bus = asc_pci_bus_type();
-  dm_register_driver(&driver);
-  sysfs_pci_driver_registered(&driver);
+  struct driver *drivers[] = {&e1000_driver, &e1000e_driver};
+  struct bus_type *bus = asc_pci_bus_type();
+  for (unsigned i = 0; i < sizeof(drivers) / sizeof(drivers[0]); i++) {
+    drivers[i]->bus = bus;
+    dm_register_driver(drivers[i]);
+    sysfs_pci_driver_registered(drivers[i]);
+  }
   for (uint32_t i = 0; i < pci_get_device_count(); i++) {
     struct pci_device *pci = asc_pci_get_device(i);
-    if (pci && pci->kernel_device && pci->kernel_device->driver == &driver)
+    if (pci && pci->kernel_device &&
+        (pci->kernel_device->driver == &e1000_driver ||
+         pci->kernel_device->driver == &e1000e_driver))
       sysfs_pci_device_bound(pci->kernel_device);
   }
 }

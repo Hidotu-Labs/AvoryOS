@@ -25,7 +25,7 @@
 
 // Futex waiter records are stack-resident and must be detached before a
 // forced-exit thread stack is released.
-void futex_remove_thread_waiters(struct thread *thread);
+bool futex_remove_thread_waiters(struct thread *thread);
 
 // Wakes poll()/waitid(P_PIDFD) waiters; see sys_process.c.
 void pidfd_wake_waiters(void);
@@ -100,7 +100,16 @@ void sched_process_reap_queue(struct thread *prev) {
 
       if (!victim)
         break;
-      sched_reap_thread(victim);
+      if (!sched_reap_thread(victim)) {
+        /* Keep the in-flight queue flag set, but put this victim back for a
+         * later scheduler pass. The wake-claim owner must get CPU time before
+         * its target can be released. */
+        spinlock_acquire(&reap_queue_lock);
+        victim->reap_next = reap_queue;
+        reap_queue = victim;
+        spinlock_release(&reap_queue_lock);
+        break;
+      }
     }
     spinlock_release(&reap_worker_lock);
   }
@@ -115,37 +124,29 @@ void sched_process_reap_queue(struct thread *prev) {
   if (vmm_defer_pending() > VMM_DEFER_INLINE_BACKLOG)
     vmm_defer_drain(VMM_DEFER_INLINE_NODES);
 }
-void sched_reap_thread(struct thread *t) {
+bool sched_reap_thread(struct thread *t) {
   if (!t || t->is_idle)
-    return;
+    return true;
 
   klog_debug_puts("[REAP] Reaping thread ");
   klog_debug_uint64(t->tid);
   klog_debug_puts("\n");
 
-  futex_remove_thread_waiters(t);
-  wait_queue_cleanup_thread(t);
-  epoll_release_thread(t);
-  /* A thread killed mid-write may own a journal transaction (kill -9 of a
-   * game group while a worker holds it). The wait-queue cleanup above cannot
-   * release the transaction lock, so without this the mount wedges forever
-   * and every later writer spins on 5 s warnings. */
-  {
-    extern void ext3_journal_release_owner(uint32_t tid);
-    ext3_journal_release_owner(t->tid);
-  }
-
-  /* The reap-queue claimant checked terminal state and detached the thread
-   * from its runqueue while holding the owning CPU's queue_lock. */
-
-  /* Ensure reaped thread is removed from its CPU's runqueue before freeing */
-  remove_from_runqueue(t);
-
+  if (!futex_remove_thread_waiters(t))
+    return false;
   klog_debug_puts("[REAP] Step 1: remove from lists\n");
   TSC_BEGIN(reap_lists);
-  sched_itimer_disarm(t);
   uint32_t reap_tgid = t->tgid ? t->tgid : t->tid;
   spinlock_acquire(&tid_lock);
+
+  /* Signal delivery pins use the same lifetime count and are acquired while
+   * holding tid_lock. Recheck under that lock to close the race with a signal
+   * sender that started after futex waiters were detached. */
+  if (__atomic_load_n(&t->futex_wake_claims, __ATOMIC_ACQUIRE) != 0) {
+    spinlock_release(&tid_lock);
+    TSC_END(reap_lists);
+    return false;
+  }
 
   // 1.5 Remove from global thread list in O(1)
   if (t->global_prev) {
@@ -196,6 +197,26 @@ void sched_reap_thread(struct thread *t) {
   t->sibling_next = NULL;
   spinlock_release(&tid_lock);
   TSC_END(reap_lists);
+
+  /* The successful tid_lock removal above closes both signal-pin producers:
+   * new senders can no longer find this thread, and existing senders drained
+   * before it was unlinked. Futex waiters were detached above. It is now safe
+   * to dismantle queues and resources without a concurrent wake using them. */
+  wait_queue_cleanup_thread(t);
+  epoll_release_thread(t);
+  /* A thread killed mid-write may own a journal transaction (kill -9 of a
+   * game group while a worker holds it). The wait-queue cleanup above cannot
+   * release the transaction lock, so without this the mount wedges forever
+   * and every later writer spins on 5 s warnings. */
+  {
+    extern void ext3_journal_release_owner(uint32_t tid);
+    ext3_journal_release_owner(t->tid);
+  }
+
+  /* The reap-queue claimant checked terminal state and detached the thread
+   * from its runqueue while holding the owning CPU's queue_lock. */
+  remove_from_runqueue(t);
+  sched_itimer_disarm(t);
 
   {
     extern void posix_timer_delete_process(uint32_t tgid);
@@ -266,6 +287,7 @@ void sched_reap_thread(struct thread *t) {
   kfree(t);
 
   klog_debug_puts("[REAP] Done\n");
+  return true;
 }
 
 bool sched_terminate_thread(uint32_t tid) {

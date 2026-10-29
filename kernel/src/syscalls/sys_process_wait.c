@@ -60,6 +60,11 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
     bool has_matching_children = false;
     struct thread *zombie = NULL;
     struct thread *zombie_owner = NULL;
+    struct thread *tracee_parent_wake = NULL;
+    uint32_t stopped_tid = 0;
+    int stopped_status = 0;
+    uint32_t exited_tid = 0;
+    int exited_status = 0;
     bool should_block = false;
 
     spinlock_acquire(&tid_lock);
@@ -92,7 +97,8 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
 
         if (matches) {
           has_matching_children = true;
-          if (t->state == THREAD_ZOMBIE) {
+          if (t->state == THREAD_ZOMBIE &&
+              (!t->tracer_tid || t->tracer_tid == current->tid)) {
             zombie = t;
             zombie_owner = owner;
 
@@ -116,11 +122,50 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
         break;
       owner = owner->global_next;
     }
+    /* A ptrace tracer may wait for a tracee that is not its child. These
+     * reports are stop events: they never unlink or reap the target. */
+    if (!zombie) {
+      for (struct thread *t = global_thread_list; t; t = t->global_next) {
+        if (t->tracer_tid != current->tid)
+          continue;
+        uint32_t visible = pid_namespace_tid(current, t);
+        bool matches = target_pid == -1 ||
+                       (target_pid > 0 && visible == (uint32_t)target_pid) ||
+                       (target_pid == 0 && t->pgid == current->pgid) ||
+                       (target_pid < -1 &&
+                        pid_namespace_visible_locked(current, t->pgid) ==
+                            (uint32_t)(-target_pid));
+        if (!matches)
+          continue;
+        has_matching_children = true;
+        if ((t->state == THREAD_ZOMBIE || t->state == THREAD_DEAD) &&
+            !t->ptrace_exit_waited) {
+          exited_tid = visible;
+          exited_status = t->termination_signal ? t->termination_signal :
+                          (t->exit_status & 0xFF) << 8;
+          t->ptrace_exit_waited = true;
+          t->tracer_tid = 0;
+          tracee_parent_wake = t->parent;
+          break;
+        }
+        if (t->ptrace_stopped && !t->ptrace_stop_waited) {
+          int sig = t->ptrace_stop_signal;
+          if (t->ptrace_stop_event == 0 && t->ptrace_syscall_trace &&
+              (t->ptrace_options & 1ULL))
+            sig |= 0x80;
+          stopped_status = ((t->ptrace_stop_event & 0xffff) << 16) |
+                           ((sig & 0xff) << 8) | 0x7f;
+          stopped_tid = visible;
+          t->ptrace_stop_waited = true;
+          break;
+        }
+      }
+    }
     /* Publish BLOCKED while child exit is excluded from publishing ZOMBIE.
      * Keep waiting_for_child set until we re-check under the lock so we
      * cannot miss a wakeup that fires between sched_yield() returning and
      * the next spinlock_acquire at the top of the loop. */
-    if (!zombie && has_matching_children && !(options & WNOHANG)) {
+    if (!zombie && !stopped_tid && has_matching_children && !(options & WNOHANG)) {
       current->waiting_for_child = true;
       current->state = THREAD_BLOCKED;
       should_block = true;
@@ -144,6 +189,27 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
 
       current->waiting_for_child = false;
       return (uint64_t)reaped_pid;
+    }
+
+    if (stopped_tid) {
+      if (wstatus_ptr != 0)
+        *(int *)wstatus_ptr = stopped_status;
+      current->waiting_for_child = false;
+      return (uint64_t)stopped_tid;
+    }
+
+    if (exited_tid) {
+      if (tracee_parent_wake && tracee_parent_wake->waiting_for_child)
+        sched_wakeup(tracee_parent_wake);
+      if (wstatus_ptr != 0)
+        *(int *)wstatus_ptr = exited_status;
+      current->waiting_for_child = false;
+      return (uint64_t)exited_tid;
+    }
+
+    if (current->ptrace_stop_pending) {
+      current->waiting_for_child = false;
+      return (uint64_t)-4; // EINTR: let syscall exit publish the ptrace stop
     }
 
     if (!has_matching_children) {
@@ -202,6 +268,7 @@ struct k_siginfo_child {
 };
 #define CLD_EXITED 1
 #define CLD_KILLED 2
+#define CLD_TRAPPED 4
 
 static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
                            uint64_t infop_ptr, uint64_t options,
@@ -229,6 +296,13 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
     bool has_matching_children = false;
     struct thread *zombie = NULL;
     struct thread *zombie_owner = NULL;
+    struct thread *ptrace_stopped = NULL;
+    struct thread *tracee_parent_wake = NULL;
+    uint32_t ptrace_pid = 0, ptrace_uid = 0;
+    int ptrace_signal = 0;
+    bool ptrace_exited = false;
+    uint32_t ptrace_exit_pid = 0, ptrace_exit_uid = 0;
+    int ptrace_exit_status = 0, ptrace_exit_code = 0;
     bool should_block = false;
 
     spinlock_acquire(&tid_lock);
@@ -259,7 +333,8 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
 
         has_matching_children = true;
 
-        if (t->state == THREAD_ZOMBIE) {
+        if (t->state == THREAD_ZOMBIE &&
+            (!t->tracer_tid || t->tracer_tid == current->tid)) {
           zombie = t;
           zombie_owner = owner;
 
@@ -282,6 +357,72 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
         break;
     }
 
+    if (options & WSTOPPED) {
+      for (struct thread *t = global_thread_list; t; t = t->global_next) {
+        if (t->tracer_tid != current->tid)
+          continue;
+        uint32_t visible = pid_namespace_tid(current, t);
+        bool matches = false;
+        switch (idtype) {
+        case P_ALL: matches = true; break;
+        case P_PID: matches = visible == id; break;
+        case P_PGID:
+          matches = id ? pid_namespace_visible_locked(current, t->pgid) == id
+                       : t->pgid == current->pgid;
+          break;
+        case P_PIDFD: matches = t->tid == target_pid || t->tgid == target_pid; break;
+        default: break;
+        }
+        if (!matches)
+          continue;
+        has_matching_children = true;
+        if (t->ptrace_stopped && !t->ptrace_stop_waited) {
+          ptrace_stopped = t;
+          ptrace_pid = visible;
+          ptrace_uid = t->uid;
+          ptrace_signal = t->ptrace_stop_signal;
+          if (!(options & WNOWAIT))
+            t->ptrace_stop_waited = true;
+          break;
+        }
+      }
+    }
+
+    if ((options & WEXITED) && !ptrace_stopped) {
+      for (struct thread *t = global_thread_list; t; t = t->global_next) {
+        if (t->tracer_tid != current->tid || t->ptrace_exit_waited ||
+            (t->state != THREAD_ZOMBIE && t->state != THREAD_DEAD))
+          continue;
+        uint32_t visible = pid_namespace_tid(current, t);
+        bool matches = false;
+        switch (idtype) {
+        case P_ALL: matches = true; break;
+        case P_PID: matches = visible == id; break;
+        case P_PGID:
+          matches = id ? pid_namespace_visible_locked(current, t->pgid) == id
+                       : t->pgid == current->pgid;
+          break;
+        case P_PIDFD: matches = t->tid == target_pid || t->tgid == target_pid; break;
+        default: break;
+        }
+        if (!matches)
+          continue;
+        has_matching_children = true;
+        ptrace_exited = true;
+        ptrace_exit_pid = visible;
+        ptrace_exit_uid = t->uid;
+        ptrace_exit_status = t->termination_signal ? t->termination_signal :
+                             (t->exit_status & 0xff);
+        ptrace_exit_code = t->termination_signal ? CLD_KILLED : CLD_EXITED;
+        if (!(options & WNOWAIT)) {
+          t->ptrace_exit_waited = true;
+          t->tracer_tid = 0;
+          tracee_parent_wake = t->parent;
+        }
+        break;
+      }
+    }
+
     if (idtype == P_PIDFD && !has_matching_children) {
       /* P_PIDFD can wait on non-child processes */
       for (struct thread *t = global_thread_list; t; t = t->global_next) {
@@ -296,7 +437,8 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
       }
     }
 
-    if (!zombie && has_matching_children && !(options & WNOHANG)) {
+    if (!zombie && !ptrace_stopped && !ptrace_exited &&
+        has_matching_children && !(options & WNOHANG)) {
       current->waiting_for_child = true;
       current->state = THREAD_BLOCKED;
       should_block = true;
@@ -326,6 +468,41 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
 
       current->waiting_for_child = false;
       return 0; /* waitid returns 0 on success, not the pid */
+    }
+
+    if (ptrace_stopped) {
+      if (infop_ptr) {
+        struct k_siginfo_child *si = (struct k_siginfo_child *)infop_ptr;
+        memset(si, 0, sizeof(*si));
+        si->si_signo = 17;
+        si->si_code = CLD_TRAPPED;
+        si->si_pid = ptrace_pid;
+        si->si_uid = ptrace_uid;
+        si->si_status = ptrace_signal;
+      }
+      current->waiting_for_child = false;
+      return 0;
+    }
+
+    if (ptrace_exited) {
+      if (infop_ptr) {
+        struct k_siginfo_child *si = (struct k_siginfo_child *)infop_ptr;
+        memset(si, 0, sizeof(*si));
+        si->si_signo = 17;
+        si->si_code = ptrace_exit_code;
+        si->si_pid = ptrace_exit_pid;
+        si->si_uid = ptrace_exit_uid;
+        si->si_status = ptrace_exit_status;
+      }
+      if (tracee_parent_wake && tracee_parent_wake->waiting_for_child)
+        sched_wakeup(tracee_parent_wake);
+      current->waiting_for_child = false;
+      return 0;
+    }
+
+    if (current->ptrace_stop_pending) {
+      current->waiting_for_child = false;
+      return (uint64_t)-4; // EINTR: syscall return enters PTRACE_EVENT_STOP
     }
 
     if (!has_matching_children) {

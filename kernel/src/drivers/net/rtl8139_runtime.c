@@ -1,4 +1,5 @@
 #include "drivers/net/rtl8139.h"
+#include "apic/lapic_timer.h"
 #include "console/klog.h"
 #include "cpu/irq.h"
 #include "drivers/pci/pci.h"
@@ -8,6 +9,7 @@
 #include "mm/pmm.h"
 #include "net/core.h"
 #include "sched/sched.h"
+#include "smp/cpu.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -35,6 +37,7 @@
 #define INT_TIMEOUT 0x4000
 #define INT_KNOWN (INT_RX_OK | INT_RX_ERROR | INT_TX_OK | INT_TX_ERROR | \
                    INT_RX_OVERFLOW | INT_LINK_CHANGE | INT_TIMEOUT)
+#define INT_RX_MASK (INT_RX_OK | INT_RX_ERROR | INT_RX_OVERFLOW)
 
 #define TSD_OWN (1u << 13)
 #define TSD_UNDERRUN (1u << 14)
@@ -59,11 +62,46 @@
 
 static spinlock_t tx_lock = SPINLOCK_INIT;
 static spinlock_t rx_lock = SPINLOCK_INIT;
+static spinlock_t service_lock = SPINLOCK_INIT;
 static bool tx_busy[TX_COUNT];
 static uint8_t tx_next;
 static uint32_t rx_offset;
 static bool phase2_ready;
 static bool phase3_ready;
+static bool service_started;
+#define SERVICE_INTERVAL_MS 100u
+#define RX_POLL_BUDGET 16u
+
+static bool rtl8139_service(bool poll_rx);
+
+static void rtl8139_service_worker(void) {
+  struct thread *self = sched_get_current();
+  for (;;) {
+    bool more_rx = rtl8139_service(true);
+    if (more_rx) {
+      sched_yield();
+      continue;
+    }
+    self->wakeup_ticks = lapic_timer_get_ticks() + SERVICE_INTERVAL_MS;
+    self->state = THREAD_SLEEPING;
+    sched_yield();
+    self->wakeup_ticks = 0;
+  }
+}
+
+static bool ensure_service_worker(void) {
+  if (service_started)
+    return true;
+  struct thread *worker =
+      sched_create_kernel_thread(rtl8139_service_worker, cpu_get_current(), false);
+  if (!worker)
+    return false;
+  strcpy(worker->comm, "rtl8139-service");
+  sched_set_priority(worker, 0, -10);
+  service_started = true;
+  sched_enqueue_thread(worker, cpu_get_current());
+  return true;
+}
 
 static uint8_t *tx_virt(void) {
   return (uint8_t *)((uint64_t)rtl8139_tx_phys() + pmm_get_hhdm_offset());
@@ -148,6 +186,7 @@ bool rtl8139_phase2_init(void) {
     return false;
   spinlock_init(&tx_lock);
   spinlock_init(&rx_lock);
+  spinlock_init(&service_lock);
   memset(tx_busy, 0, sizeof(tx_busy));
   tx_next = 0;
   uint16_t io = rtl8139_io_base();
@@ -170,60 +209,78 @@ static inline uint16_t rtl8139_capr(uint32_t offset) {
   return (uint16_t)(offset - 16u);
 }
 
+static inline bool rx_ring_nonempty(uint16_t io) {
+  return (rx_offset % RX_RING_SIZE) !=
+         (inw(io + RTL_CBR) % RX_RING_SIZE);
+}
+
 static void recover_rx_overflow(void) {
   uint16_t io = rtl8139_io_base();
   rx_offset = inw(io + RTL_CBR) % RX_RING_SIZE;
   outw(io + RTL_CAPR, rtl8139_capr(rx_offset));
 }
 
-static void drain_rx(void) {
+/* Process a bounded number of records. CAPR advances once per batch, after
+ * the ring bytes have been copied into owned RX buffers. */
+static bool drain_rx(void) {
   struct net_device *dev = rtl8139_netdev();
   if (!dev)
-    return;
+    return false;
   spinlock_acquire(&rx_lock);
   uint16_t io = rtl8139_io_base();
   uint8_t *ring = rx_virt();
-  /* Bound IRQ work independently of the dynamically allocated RX backlog. */
-  uint32_t budget = 4096;
-
-  while (!(inb(io + RTL_CR) & CR_BUFFER_EMPTY) && budget--) {
+  struct net_rx_frame frames[RX_POLL_BUDGET];
+  size_t frame_count = 0;
+  uint32_t consumed = 0;
+  while (consumed < RX_POLL_BUDGET && rx_ring_nonempty(io)) {
     uint32_t offset = rx_offset % RX_RING_SIZE;
     uint16_t status = *(volatile uint16_t *)(ring + offset);
     uint16_t dma_length = *(volatile uint16_t *)(ring + offset + 2);
     uint16_t frame_length = 0;
     if (!rx_record_valid(status, dma_length, &frame_length)) {
+      if (frame_count)
+        (void)net_rx_submit_batch_irq(dev, frames, frame_count);
       dev->stats.rx_errors++;
       recover_rx_overflow();
       spinlock_release(&rx_lock);
-      return;
+      return false;
     }
-    net_rx_submit_irq(dev, ring + offset + 4, frame_length);
+    frames[frame_count++] = (struct net_rx_frame){
+        .data = ring + offset + 4,
+        .length = frame_length,
+    };
     rx_offset = (offset + 4u + dma_length + 3u) & ~3u;
     rx_offset %= RX_RING_SIZE;
-    outw(io + RTL_CAPR, rtl8139_capr(rx_offset));
+    consumed++;
   }
+  if (frame_count)
+    (void)net_rx_submit_batch_irq(dev, frames, frame_count);
+  if (consumed)
+    outw(io + RTL_CAPR, rtl8139_capr(rx_offset));
+  bool more = rx_ring_nonempty(io);
   spinlock_release(&rx_lock);
+  return more;
 }
 
-static void rtl8139_irq(struct registers *regs) {
-  (void)regs;
+/* IRQ service handles RX in bounded batches; periodic service catches a lost
+ * completion and drains remaining records without monopolizing the CPU. */
+static bool rtl8139_service(bool poll_rx) {
   struct net_device *dev = rtl8139_netdev();
   if (!phase3_ready || !dev)
-    return;
+    return false;
+  spinlock_acquire(&service_lock);
   uint16_t io = rtl8139_io_base();
   int loop_limit = 32;
+  bool more_rx = false;
+  bool rx_seen = false;
   while (loop_limit-- > 0) {
     uint16_t status = inw(io + RTL_ISR);
     if (!status || status == 0xffff || !(status & INT_KNOWN))
       break;
     dev->stats.interrupts++;
     outw(io + RTL_ISR, status & INT_KNOWN);
-    if (status & (INT_RX_OK | INT_RX_OVERFLOW))
-      drain_rx();
-    if (status & INT_TX_OK) {
-      spinlock_acquire(&tx_lock);
-      reclaim_tx_locked();
-      spinlock_release(&tx_lock);
+    if (status & INT_RX_MASK) {
+      rx_seen = true;
     }
     if (status & INT_RX_OVERFLOW)
       dev->stats.rx_overflows++;
@@ -233,16 +290,30 @@ static void rtl8139_irq(struct registers *regs) {
       recover_rx_overflow();
       spinlock_release(&rx_lock);
     }
-    if (status & INT_TX_ERROR) {
-      spinlock_acquire(&tx_lock);
-      reclaim_tx_locked();
-      spinlock_release(&tx_lock);
-    }
     if (status & INT_LINK_CHANGE)
       dev->stats.link_changes++;
     if (status & INT_TIMEOUT)
       dev->stats.rx_errors++;
   }
+
+  /* Ring state is authoritative even if the RX cause was lost. */
+  bool ring_nonempty = rx_ring_nonempty(io);
+  if (rx_seen || ring_nonempty) {
+    unsigned rounds = poll_rx ? 1 : (4096u / RX_POLL_BUDGET);
+    do {
+      more_rx = drain_rx();
+    } while (more_rx && --rounds);
+  }
+  spinlock_acquire(&tx_lock);
+  reclaim_tx_locked();
+  spinlock_release(&tx_lock);
+  spinlock_release(&service_lock);
+  return more_rx;
+}
+
+static void rtl8139_irq(struct registers *regs) {
+  (void)regs;
+  (void)rtl8139_service(false);
 }
 
 bool rtl8139_phase3_init(void) {
@@ -254,6 +325,10 @@ bool rtl8139_phase3_init(void) {
     klog_puts("[RTL8139] IRQ registration failed\n");
     return false;
   }
+  if (!ensure_service_worker()) {
+    klog_puts("[RTL8139] service worker creation failed\n");
+    return false;
+  }
   rx_offset = 0;
   outl(io + RTL_RCR, RCR_ACCEPT_PHYSICAL | RCR_ACCEPT_MULTICAST |
                          RCR_ACCEPT_BROADCAST | RCR_WRAP |
@@ -261,6 +336,8 @@ bool rtl8139_phase3_init(void) {
                          RCR_MAX_DMA | RCR_NO_THRESHOLD);
   outw(io + RTL_CAPR, rtl8139_capr(rx_offset));
   outw(io + RTL_ISR, 0xffff);
+  /* The IRQ handler may run as soon as RX/TX and their causes are enabled. */
+  phase3_ready = true;
   outb(io + RTL_CR, CR_RX_ENABLE | CR_TX_ENABLE);
   uint16_t mask = INT_RX_OK | INT_RX_ERROR | INT_TX_OK | INT_TX_ERROR |
                   INT_RX_OVERFLOW | INT_LINK_CHANGE;
@@ -270,7 +347,6 @@ bool rtl8139_phase3_init(void) {
       pci_config_read16(pci->bus, pci->slot, pci->func, 0x04);
   pci_config_write16(pci->bus, pci->slot, pci->func, 0x04,
                      command & ~(1u << 10));
-  phase3_ready = true;
   klog_puts("[RTL8139] receive and interrupt paths enabled\n");
   return true;
 }

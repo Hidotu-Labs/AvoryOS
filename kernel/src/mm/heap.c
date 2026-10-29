@@ -1,8 +1,8 @@
 #include "mm/heap.h"
 #include "mm/heap_internal.h"
-#include "console/console.h"
 #include "console/klog.h"
 #include "lib/string.h"
+#include "mm/pmm.h"
 
 bool heap_initialized = false;
 
@@ -29,7 +29,17 @@ void kfree(void *ptr) {
   if (!ptr)
     return;
 
-  heap_trace_record(ptr, __builtin_return_address(0));
+  void *caller = __builtin_return_address(0);
+  heap_trace_record(ptr, caller);
+
+  /* Heap allocations live in managed HHDM RAM. Reject wild pointers before
+   * probing their page header, which must never be an arbitrary ring-0 read. */
+  if (!pmm_kernel_ptr_is_managed(ptr)) {
+    klogf("[ERROR] kfree: rejected pointer outside managed heap space ptr=0x%016llX caller=0x%016llX\n",
+          (unsigned long long)(uintptr_t)ptr,
+          (unsigned long long)(uintptr_t)caller);
+    return;
+  }
 
   uint64_t page_base = (uint64_t)ptr & ~0xFFFULL;
   uint64_t magic_check = *(uint64_t *)page_base;
@@ -44,16 +54,11 @@ void kfree(void *ptr) {
     return;
   }
 
-  console_puts("[WARN] kfree: Fatal validation failure. Invalid pointer space.\n");
-  klog_puts("  ptr=");
-  klog_uint64((uint64_t)ptr);
-  klog_puts(" page_base=");
-  klog_uint64(page_base);
-  klog_puts(" magic=");
-  klog_uint64(magic_check);
-  klog_puts(" caller=");
-  klog_hex64((uint64_t)__builtin_return_address(0));
-  klog_puts("\n");
+  klogf("[ERROR] kfree: invalid allocation ptr=0x%016llX page=0x%016llX magic=0x%016llX caller=0x%016llX\n",
+        (unsigned long long)(uintptr_t)ptr,
+        (unsigned long long)page_base,
+        (unsigned long long)magic_check,
+        (unsigned long long)(uintptr_t)caller);
 }
 
 void *kcalloc(size_t num, size_t size) {
@@ -91,6 +96,9 @@ void *krealloc(void *ptr, size_t new_size) {
 
 size_t heap_ksize(const void *ptr) {
   if (!ptr)
+    return 0;
+
+  if (!pmm_kernel_ptr_is_managed(ptr))
     return 0;
 
   uint64_t page_base = (uint64_t)ptr & ~0xFFFULL;

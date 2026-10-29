@@ -39,7 +39,8 @@ static void setup(void) {
     memset(connections, 0, sizeof(connections));
     memset(emissions, 0, sizeof(emissions));
     memset(&stats, 0, sizeof(stats));
-    active_list = connections; active_count = 72; timer_cursor = NULL;
+    active_list = connections; active_count = 72;
+    timer_tree = (struct rb_root){0}; clock_ms = 0;
     for (unsigned i = 0; i < 72; i++) {
         struct tcp_tcb *t = &connections[i];
         t->used = t->socket_ref = true; t->state = TCP_ESTABLISHED;
@@ -51,10 +52,13 @@ static void setup(void) {
 }
 int main(void) {
     setup();
-    /* Keep every connection eligible for delayed ACK work on every tick.
-     * No retransmission deadline: the early-continue path must still rotate. */
+    /* More expired ACK deadlines than one timer pass can process. */
+    for (unsigned i = 0; i < 72; i++) {
+        connections[i].unacked_packets = 1;
+        connections[i].ack_deadline = 1;
+        tcp_timer_refresh_locked(&connections[i]);
+    }
     for (unsigned tick = 0; tick < 3; tick++) {
-        for (unsigned i = 0; i < 72; i++) connections[i].unacked_packets = 1;
         clock_ms += 100; tcp_timer_tick(clock_ms);
     }
     for (unsigned i = 0; i < 72; i++) assert(emissions[i] == 1);
@@ -62,9 +66,14 @@ int main(void) {
     setup();
     for (unsigned i = 24; i < 72; i++) {
         connections[i].state = TCP_SYN_SENT; connections[i].deadline = 1;
+        tcp_timer_refresh_locked(&connections[i]);
     }
     for (unsigned tick = 0; tick < 3; tick++) {
-        for (unsigned i = 0; i < 24; i++) connections[i].unacked_packets = 1;
+        for (unsigned i = 0; i < 24; i++) {
+            connections[i].unacked_packets = 1;
+            connections[i].ack_deadline = clock_ms + 1;
+            tcp_timer_refresh_locked(&connections[i]);
+        }
         clock_ms += 100; tcp_timer_tick(clock_ms);
     }
     for (unsigned i = 24; i < 72; i++) assert(emissions[i] == 1);

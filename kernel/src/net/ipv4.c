@@ -1,12 +1,14 @@
 #include "net/ipv4.h"
 #include "apic/lapic_timer.h"
 #include "console/klog.h"
+#include "hal/hal.h"
 #include "lib/string.h"
 #include "lock/spinlock.h"
 #include "mm/heap.h"
 #include "net/core.h"
 #include "net/ipv6.h"
 #include "sched/sched.h"
+#include "sched/wait.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -25,6 +27,7 @@
 #define ICMP_PORT_UNREACHABLE_TYPE 3
 #define ICMP_PORT_UNREACHABLE_CODE 3
 #define ARP_CACHE_SIZE 64
+#define ARP_WAIT_BUCKETS 16
 #define ARP_REACHABLE_MS 60000
 #define ARP_RESOLVE_WAIT_MS 50
 
@@ -85,6 +88,7 @@ struct arp_entry {
 static struct ipv4_config config;
 static struct arp_entry arp_cache[ARP_CACHE_SIZE];
 static spinlock_t arp_lock = SPINLOCK_INIT;
+static wait_queue_t arp_wait[ARP_WAIT_BUCKETS];
 static volatile bool address_conflict;
 static uint16_t next_ip_id = 1;
 
@@ -162,6 +166,10 @@ static struct arp_entry *arp_get_slot_locked(uint32_t ip) {
   return &arp_cache[slot];
 }
 
+static wait_queue_t *arp_wait_queue(uint32_t ip) {
+  return &arp_wait[ip & (ARP_WAIT_BUCKETS - 1)];
+}
+
 static void arp_learn(uint32_t ip, const uint8_t mac[6]) {
   spinlock_acquire(&arp_lock);
   struct arp_entry *entry = arp_get_slot_locked(ip);
@@ -171,6 +179,7 @@ static void arp_learn(uint32_t ip, const uint8_t mac[6]) {
   entry->retries = 0;
   entry->updated = lapic_timer_get_ticks();
   spinlock_release(&arp_lock);
+  wait_queue_wake_all(arp_wait_queue(ip));
 }
 
 static bool arp_lookup(uint32_t ip, uint8_t mac[6]) {
@@ -211,6 +220,47 @@ static bool in_net_worker_thread(void) {
   return cur && strcmp(cur->comm, "net-worker") == 0;
 }
 
+static bool arp_wait_for_reply(uint32_t ip, uint8_t mac[6],
+                               uint64_t deadline) {
+  struct thread *self = sched_get_current();
+  if (!self)
+    return arp_lookup(ip, mac);
+
+  wait_queue_t *wq = arp_wait_queue(ip);
+  wait_queue_entry_t entry = {.thread = self};
+  for (;;) {
+    if (arp_lookup(ip, mac))
+      return true;
+    if (lapic_timer_get_ticks() >= deadline)
+      return arp_lookup(ip, mac);
+
+    /* Link before rechecking the cache so an ARP reply can't fall between
+     * the lookup and the sleep. The deadline is the retry boundary, not a
+     * polling interval. */
+    hal_irq_state_t flags = hal_irq_save();
+    self->wakeup_ticks = deadline;
+    self->state = THREAD_BLOCKED;
+    wait_queue_add(wq, &entry);
+    bool found = arp_lookup(ip, mac);
+    if (found) {
+      self->state = THREAD_RUNNING;
+      self->wakeup_ticks = 0;
+    }
+    hal_irq_restore(flags);
+
+    if (!found)
+      sched_yield();
+
+    flags = hal_irq_save();
+    self->state = THREAD_RUNNING;
+    self->wakeup_ticks = 0;
+    wait_queue_remove(wq, &entry);
+    hal_irq_restore(flags);
+    if (found)
+      return true;
+  }
+}
+
 static bool arp_resolve(uint32_t ip, uint8_t mac[6]) {
   static const uint8_t broadcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
   static const uint8_t zero[6] = {0};
@@ -220,7 +270,8 @@ static bool arp_resolve(uint32_t ip, uint8_t mac[6]) {
   /* A worker thread cannot wait for an ARP reply because it is also the
    * thread that would process it.  From other contexts a short wait keeps
    * the first packet of a connection from being dropped. */
-  bool can_wait = !in_net_worker_thread();
+  struct thread *current = sched_get_current();
+  bool can_wait = current && !in_net_worker_thread();
   uint8_t attempts = can_wait ? 2 : 1;
 
   for (uint8_t attempt = 0; attempt < attempts; attempt++) {
@@ -234,13 +285,10 @@ static bool arp_resolve(uint32_t ip, uint8_t mac[6]) {
     if (arp_send(ARP_OP_REQUEST, broadcast, ip, zero) != 0)
       return false;
 
-    uint64_t deadline = lapic_timer_get_ticks() +
-                        (can_wait ? ARP_RESOLVE_WAIT_MS : 0);
-    while (lapic_timer_get_ticks() < deadline) {
-      if (arp_lookup(ip, mac))
-        return true;
-      sched_yield();
-    }
+    if (can_wait && arp_wait_for_reply(
+                        ip, mac,
+                        lapic_timer_get_ticks() + ARP_RESOLVE_WAIT_MS))
+      return true;
   }
   return false;
 }
@@ -559,6 +607,8 @@ bool net_phase4_init(void) {
     return false;
   spinlock_init(&arp_lock);
   memset(arp_cache, 0, sizeof(arp_cache));
+  for (uint32_t i = 0; i < ARP_WAIT_BUCKETS; i++)
+    wait_queue_init(&arp_wait[i]);
   spinlock_init(&reasm_lock);
   memset(reasm, 0, sizeof(reasm));
   config.address = IPV4_ADDR(10, 0, 2, 15);

@@ -154,8 +154,8 @@ static inline void *vmm_alloc_huge_page_numa(int vma_numa_policy, uint64_t vma_n
  * the allocator keeps a small reclaimable headroom while a Firefox/KDE
  * burst runs instead of first hitting zero.
  *
- * Rate-limited: pmm_get_free_pages() walks the free lists, and one reclaim
- * pass every 250 ms is plenty to track a demand-fault burst.  Parked PCP
+ * Rate-limited: one reclaim pass every 250 ms is plenty to track a
+ * demand-fault burst. Parked PCP
  * and zero-pool frames are returned unconditionally - cache reclaim cannot
  * see them, and merging them restores the high-order blocks that a TTM or
  * huge-page allocation needs. */

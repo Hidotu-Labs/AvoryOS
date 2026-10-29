@@ -79,6 +79,11 @@ typedef struct {
   char name[48];
   char comm[32];
   char path[96]; // first-seen pathname for path-taking syscalls ("" if none)
+  /* Latest descriptor state for a failing read/write-family call.  For an
+   * EAGAIN this records the poll() view of the same fd, so a poller that
+   * keeps reporting readiness while the read never makes progress is
+   * distinguishable from ordinary nonblocking traffic. */
+  char detail[160];
   uint32_t last_tgid;
   uint32_t last_tid;
   uint64_t last_rip;
@@ -86,6 +91,7 @@ typedef struct {
   uint64_t total_calls;
   uint64_t first_seen_ms;
   uint64_t last_seen_ms;
+  uint64_t last_detail_ms;
   bool is_severe;
   bool used;
   /* At least one recorded call on this key was answered by a seccomp

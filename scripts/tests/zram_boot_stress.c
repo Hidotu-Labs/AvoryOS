@@ -230,11 +230,14 @@ static void lifecycle(void) {
     rng ^= rng << 17;
     CHECK(p[i] == rng);
   }
-  errno = 0;
-  CHECK(mlock(p, PAGE) == -1 && errno == EOPNOTSUPP);
+  before = metric("swapouts");
+  CHECK(!mlock(p, PAGE));
+  CHECK(!madvise(p, PAGE, MADV_PAGEOUT));
+  CHECK(metric("swapouts") == before);
+  CHECK(!munlock(p, PAGE));
   CHECK(!munmap(p, pages * PAGE));
   puts("ZRAM_BOOT: PASS shared pages excluded, incompressible bytes retained, "
-       "unsupported pinning reported honestly");
+       "mlocked pages excluded from reclaim");
 }
 static void *concurrent(void *arg) {
   uintptr_t id = (uintptr_t)arg;

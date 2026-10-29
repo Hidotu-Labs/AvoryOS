@@ -15,6 +15,8 @@
 #define MAP_PRIVATE 0x02
 #define MAP_FIXED 0x10
 #define MAP_ANONYMOUS 0x20
+/* Linux mmap hint; its lock is not inherited by a fork child. */
+#define MAP_LOCKED 0x2000
 #define MAP_GROWSDOWN 0x0100
 /* Linux user-space flag: pthread stacks are created with this.  The kernel
  * stores it verbatim in vma.flags (it is not stripped on mmap) so the fault

@@ -108,15 +108,17 @@ all: $(IMAGE_NAME).iso disk.img edk2-ovmf
 RUN_SMP ?= 8
 # NIC selection for launchers that explicitly attach networking:
 #   make run RUN_NIC=e1000    # 82540EM networking
+#   make run RUN_NIC=e1000e   # 82574L networking (MSI preferred)
 #   make run RUN_NIC=both     # both drivers; RTL8139 is default
-#   make run RUN_NIC=both KERNEL_CMDLINE='net_default=eth1' # use e1000
+#   make run RUN_NIC=both KERNEL_CMDLINE='net_default=eth1' # select an Intel NIC
+#   make run RUN_NIC=e1000e KERNEL_CMDLINE='e1000e_irq=intx' # force legacy IRQ
 #   make run RUN_NIC=none     # no emulated NIC
 RUN_NIC ?= rtl8139
 ifneq ($(words $(RUN_NIC)),1)
-$(error RUN_NIC must be rtl8139, e1000, both, or none)
+$(error RUN_NIC must be rtl8139, e1000, e1000e, both, or none)
 endif
-ifeq ($(filter $(RUN_NIC),rtl8139 e1000 both none),)
-$(error RUN_NIC must be rtl8139, e1000, both, or none)
+ifeq ($(filter $(RUN_NIC),rtl8139 e1000 e1000e both none),)
+$(error RUN_NIC must be rtl8139, e1000, e1000e, both, or none)
 endif
 RUN_NIC_ADDR ?=
 NET_COMMA := ,
@@ -140,7 +142,7 @@ RUN_VIRGL_HOST_FIX ?= 1
 VIRGL_HOST_LIB := build/virgl-host/lib/libvirglrenderer.so.1
 RUN_VIRGL_FIXED = $(if $(filter 1,$(RUN_VIRGL)),$(filter 1,$(RUN_VIRGL_HOST_FIX)))
 RUN_VIRGL_ENV = $(if $(RUN_VIRGL_FIXED),env LD_LIBRARY_PATH="$(abspath build/virgl-host/lib):$${LD_LIBRARY_PATH:-}")
-$(VIRGL_HOST_LIB): scripts/build-virgl-host.py scripts/virgl/missing-vertex-buffer.patch scripts/virgl/missing-vertex-buffer-v1.patch scripts/virgl/fog-semantic.patch scripts/virgl/nvidia-vertex-binding.patch scripts/virgl/nvidia-vertex-binding-v1.patch
+$(VIRGL_HOST_LIB): scripts/virgl/compat-context.patch scripts/virgl/draw-state-overhead.patch scripts/virgl/host-dispatch-profile.patch scripts/virgl/vertex-shader-selection.patch scripts/build-virgl-host.py scripts/virgl/missing-vertex-buffer.patch scripts/virgl/missing-vertex-buffer-v1.patch scripts/virgl/fog-semantic.patch scripts/virgl/nvidia-vertex-binding.patch scripts/virgl/nvidia-vertex-binding-v1.patch
 	python3 scripts/build-virgl-host.py
 .PHONY: virgl-host
 virgl-host: $(VIRGL_HOST_LIB)
@@ -150,7 +152,7 @@ RUN_GL = $(if $(filter 1,$(RUN_VIRGL)),on,off)
 # SDL preserves host relative reports with the same virgl device and USB mouse.
 RUN_DISPLAY ?= $(if $(filter 1,$(RUN_VIRGL)),sdl,gtk)
 # Preserve complete kernel hang reports independently of terminal scrollback.
-# The stdio backend keeps the interactive serial commands (dump/diag/gpup).
+# The stdio backend keeps the interactive serial commands (dump/diag).
 RUN_SERIAL_LOG ?= build/logs/desktop-serial.log
 .PHONY: run run-tcg
 run: DISPLAY_OPT = -display $(RUN_DISPLAY),gl=$(RUN_GL),show-cursor=$(GTK_SHOW_CURSOR)$(if $(filter gtk,$(RUN_DISPLAY)),$(NET_COMMA)zoom-to-fit=off$(NET_COMMA)grab-on-hover=on)
@@ -514,21 +516,32 @@ disk.img: scripts/configure-accounts.sh userland/avory-account userland/test_acc
 DISK_SIZE_MIB ?= 12288
 DISK_PARTITION_CACHE := build/arch/disk-partition.img
 DISK_APP_MANIFEST := build/arch/disk-apps.json
+# Keep an immutable build output separate from guest/incremental writes.
+# DISK_CACHE=0 forces population from scratch; cache checks run after prerequisites.
+DISK_CACHE ?= 1
+DISK_CACHE_RESTORE ?= $(DISK_CACHE)
+DISK_PRISTINE_CACHE := build/arch/disk-pristine.img
+DISK_PRISTINE_METADATA := build/arch/disk-pristine.json
+DISK_CACHE_ARGS = --cache $(DISK_PRISTINE_CACHE) --metadata $(DISK_PRISTINE_METADATA) \
+	--disk disk.img --partition-cache $(DISK_PARTITION_CACHE) --manifest $(DISK_APP_MANIFEST) \
+	--makefile GNUmakefile --settings size=$(DISK_SIZE_MIB) xorg=$(XORG_PROFILE) \
+	--trees build/arch/rootfs build/firmware/lib/firmware userland/quake2 config \
+	--inputs $(DISK_NON_APP_DEPS) $(USERLAND_DISK_APPS) --apps $(USERLAND_DISK_APPS)
 DISK_NON_APP_DEPS := GNUmakefile \
 	userland/winoptions userland/icewm-menu $(ARCH_STAMP) \
 	scripts/setup-rootfs.sh scripts/axon-common.sh scripts/configure-axon-mirrors.py \
 	scripts/rootfs-packages.txt $(AXON_PROFILE_FILES) userland/avory-login.c \
 	scripts/glibc-toolchain.sh $(GLIBC_TOOLCHAIN_STAMP) \
 	scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh \
-	scripts/populate-ext2-dir.sh scripts/configure-image-root.sh config/init/rcS \
-	config/plasma/avory-plasma-wayland.sh \
+	scripts/populate-ext2-dir.sh scripts/populate-ext2-dir.py scripts/configure-image-root.sh config/init/rcS \
+	config/plasma/avory-plasma-wayland.sh config/kwinoutputconfig.json \
 	config/weston/avory-weston-session.sh config/weston/weston.desktop \
 	config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/10-virgl.conf config/xorg/20-output.conf \
 	scripts/image-runtime.py config/xorg/avory-prime-display.sh \
 	config/xorg/45-prime-output.sh config/xorg/avory-xorg-profile.sh \
 	config/xorg/10-nouveau.conf config/xorg/avory-nouveau-xorg.sh \
 	config/xorg/44-nouveau-env.sh scripts/image-firmware-install.sh \
-	scripts/image-add-firmware.py scripts/incremental-disk-apps.py \
+	scripts/image-add-firmware.py scripts/incremental-disk-apps.py scripts/image_copy.py scripts/disk-build-cache.py \
 	scripts/linux-firmware-install.sh scripts/linux/firmware-manifest.txt \
 	scripts/linux/firmware-sha256-20260916.txt build/test_fw.bin build/firmware/.stamp \
 	$(QUAKE2_STAMP) scripts/build-quake2.sh scripts/quake2-sdl2-config.in \
@@ -548,7 +561,7 @@ DISK_REBUILD ?= $(shell \
 		if [ ! -e "$$path" ] || [ "$$path" -nt disk.img ]; then echo 1; exit; fi; \
 	done; echo 0)
 
-disk.img: scripts/populate-ext2-dir.sh scripts/configure-image-root.sh
+disk.img: scripts/populate-ext2-dir.sh scripts/populate-ext2-dir.py scripts/configure-image-root.sh
 # All Xorg profiles ship in every image; /sbin/avory-early-init selects the
 # one matching the boot's PCI topology (amdgpu passthrough vs native card0),
 # so bare `sddm` works with or without VFIO. XORG_PROFILE only sets the
@@ -567,7 +580,7 @@ disk.img: build/test_fw.bin build/firmware/.stamp
 disk.img: $(ARCH_STAMP) $(QUAKE2_BUNDLE_FILES)
 disk.img: assets/boot.wav assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/terrain.png userland/texpacks/classicube.zip initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh
 
-disk.img: GNUmakefile scripts/incremental-disk-apps.py
+disk.img: GNUmakefile scripts/incremental-disk-apps.py scripts/image_copy.py scripts/disk-build-cache.py
 
 .PHONY: disk-rebuild disk-full-force
 disk-full-force:
@@ -576,6 +589,14 @@ disk-rebuild:
 	$(MAKE) --no-print-directory DISK_REBUILD=1 disk.img
 
 ifeq ($(DISK_REBUILD),1)
+ifeq ($(DISK_CACHE_RESTORE),1)
+disk.img: disk-full-force
+	@case "$${MAKEFLAGS%% *}" in *[ntq]*) exit 0;; esac; \
+	python3 scripts/disk-build-cache.py restore $(DISK_CACHE_ARGS); result=$$?; \
+	if [ "$$result" -eq 3 ]; then \
+		$(MAKE) --no-print-directory DISK_REBUILD=1 DISK_CACHE_RESTORE=0 disk.img; \
+	else exit "$$result"; fi
+else
 disk.img: disk-full-force
 
 	@echo "Creating partitioned disk image (GPT)..."
@@ -937,11 +958,12 @@ disk.img: disk-full-force
 	@bash scripts/configure-image-root.sh ./part.img build/arch/rootfs
 	@if [ -f userland/winoptions ] && [ -f userland/icewm-menu ]; then \
 		echo "Installing IceWM configuration into disk image..."; \
-		debugfs -w -R "mkdir etc/icewm" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm etc/icewm/winoptions" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write userland/winoptions etc/icewm/winoptions" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "rm etc/icewm/menu" ./part.img >/dev/null 2>&1 || true; \
-		debugfs -w -R "write userland/icewm-menu etc/icewm/menu" ./part.img >/dev/null 2>&1 || true; \
+		{ echo "mkdir etc/icewm"; \
+		  echo "rm etc/icewm/winoptions"; \
+		  echo "write userland/winoptions etc/icewm/winoptions"; \
+		  echo "rm etc/icewm/menu"; \
+		  echo "write userland/icewm-menu etc/icewm/menu"; \
+		} | debugfs -w ./part.img >/dev/null 2>&1 || true; \
 	fi
 	@echo "Fixing executable modes for directly injected launchers..."
 	@{ \
@@ -984,6 +1006,7 @@ disk.img: disk-full-force
 		echo "set_inode_field .cache mode 040777"; \
 	} | debugfs -w ./part.img >/dev/null 2>&1 || true
 
+	@echo "Finalizing partition image and incremental cache..."
 	@mkdir -p $(dir $(DISK_PARTITION_CACHE))
 	@rm -f $(DISK_PARTITION_CACHE)
 	@if [ -L ./part.img ]; then \
@@ -993,14 +1016,20 @@ disk.img: disk-full-force
 		python3 scripts/incremental-disk-apps.py --cache-from-disk \
 			--disk disk.img --partition-cache $(DISK_PARTITION_CACHE); \
 	else \
-		dd if=./part.img of=disk.img bs=1M seek=1 conv=notrunc,sparse; \
+		python3 scripts/incremental-disk-apps.py --install-partition ./part.img --disk disk.img && \
 		mv ./part.img $(DISK_PARTITION_CACHE); \
 	fi
 	@touch disk.img
+	@echo "Saving incremental app manifest..."
 	@python3 scripts/incremental-disk-apps.py --snapshot \
 		--disk disk.img --partition-cache $(DISK_PARTITION_CACHE) \
 		--manifest $(DISK_APP_MANIFEST) --makefile GNUmakefile \
 		--apps $(USERLAND_DISK_APPS)
+	@if [ "$(DISK_CACHE)" = 1 ]; then \
+		python3 scripts/disk-build-cache.py save $(DISK_CACHE_ARGS); \
+	fi
+	@echo "Disk image ready."
+endif
 else
 disk.img:
 	@python3 scripts/incremental-disk-apps.py --update \
@@ -1100,7 +1129,7 @@ clean-all: clean-minimal
 
 .PHONY: clean-disk
 clean-disk:
-	rm -f disk.img $(DISK_PARTITION_CACHE) $(DISK_APP_MANIFEST)
+	rm -f disk.img $(DISK_PARTITION_CACHE) $(DISK_APP_MANIFEST) $(DISK_PRISTINE_CACHE) $(DISK_PRISTINE_METADATA)
 
 .PHONY: distclean
 distclean:
@@ -1121,6 +1150,16 @@ gpu-diagnostics:
 
 test-phase6-login:
 	./scripts/test-phase6-login.sh
+
+.PHONY: test-e1000
+test-e1000:
+	$(MAKE) -C kernel -j4
+	python3 scripts/tests/test_net_device_start.py
+	python3 scripts/tests/test_pci_irq_fallback.py
+	python3 scripts/tests/test_e1000_probe.py
+	python3 scripts/tests/test_e1000_probe_boot.py --seconds 0 --smp 4
+	AVORY_NETWORK_TEST_NIC=e1000 python3 scripts/tests/test_network_statistics_boot.py
+	AVORY_NETWORK_TEST_NIC=e1000e python3 scripts/tests/test_network_statistics_boot.py
 
 # Root image recipes depend on these paths; delegate each app build to its local
 # userland makefile so callers can keep using `make userland/foo.elf`.
@@ -1144,11 +1183,10 @@ NOUVEAU_PRESENT_BATCH ?= 1
 NOUVEAU_DEBUG ?= info
 NOUVEAU_DRM_DEBUG ?= 0
 NOUVEAU_GPU_DIAG ?= 0
-NOUVEAU_PERF ?= 1
 # Prefer the 60 Hz display-info mode for the CPU-copy virtual scanout.
 # High-refresh EDID modes add compositor work and reduce uncapped client FPS.
 NOUVEAU_VIRTIO_EDID ?= off
-NOUVEAU_618_CMDLINE := init=/sbin/init splash quiet kpi_amdgpu=1 kpi_nouveau=1 kpi_nouveau_remove_on_shutdown=1 kpi_nouveau_bdf=0000:01:00.0 nouveau.modeset=1 nouveau.runpm=0 nouveau.config=NvGspRm=1 nouveau.debug=$(NOUVEAU_DEBUG) drm.debug=$(NOUVEAU_DRM_DEBUG) virtio_gpu.present_batch=$(NOUVEAU_PRESENT_BATCH) gpu_diag=$(NOUVEAU_GPU_DIAG) gpu_perf=$(NOUVEAU_PERF)
+NOUVEAU_618_CMDLINE := init=/sbin/init splash quiet kpi_amdgpu=1 kpi_nouveau=1 kpi_nouveau_remove_on_shutdown=1 kpi_nouveau_bdf=0000:01:00.0 nouveau.modeset=1 nouveau.runpm=0 nouveau.config=NvGspRm=1 nouveau.debug=$(NOUVEAU_DEBUG) drm.debug=$(NOUVEAU_DRM_DEBUG) virtio_gpu.present_batch=$(NOUVEAU_PRESENT_BATCH) gpu_diag=$(NOUVEAU_GPU_DIAG)
 
 .PHONY: nouveau-618-desktop-firmware nouveau-firmware run-nouveau
 nouveau-618-desktop-firmware: kernel disk.img

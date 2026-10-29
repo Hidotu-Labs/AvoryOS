@@ -168,13 +168,21 @@ static uint8_t *ramfs_alloc_buffer(ramfs_file_t *file, uint32_t req_cap, uint32_
       uint64_t hhdm = pmm_get_hhdm_offset();
       *out_cap = aligned_cap;
       *out_is_pmm = 1;
-      return (uint8_t *)((uint64_t)phys + hhdm);
+      uint8_t *data = (uint8_t *)((uint64_t)phys + hhdm);
+      /* RAM may return recycled frames. Files expose every byte below their
+       * length, including sparse gaps created by writes at a nonzero offset,
+       * and memfd mappings can expose the unused tail of this allocation. */
+      memset(data, 0, aligned_cap);
+      return data;
     }
   }
 
   *out_cap = req_cap;
   *out_is_pmm = 0;
-  return (uint8_t *)kmalloc(req_cap);
+  uint8_t *data = (uint8_t *)kmalloc(req_cap);
+  if (data)
+    memset(data, 0, req_cap);
+  return data;
 }
 
 uint32_t ramfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
@@ -213,6 +221,12 @@ uint32_t ramfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
     file->capacity = new_cap;
     file->data_is_pmm = new_is_pmm;
   }
+
+  /* POSIX file writes leave a zero-filled hole when they start past EOF.
+   * This also matters after a truncate shrinks a file without releasing its
+   * capacity: bytes left behind by the old contents must not reappear. */
+  if (offset > node->length)
+    memset(file->data + node->length, 0, offset - node->length);
 
   if (is_user_ptr((uint64_t)buffer)) {
     unsigned long uncopied = copy_from_user(file->data + offset, buffer, size);
@@ -315,7 +329,7 @@ int ramfs_fallocate(vfs_node_t *node, int mode, uint32_t offset, uint32_t len) {
   return 0;
 }
 
-static struct dirent *ramfs_readdir(vfs_node_t *node, uint32_t index) {
+static struct dirent *ramfs_readdir(vfs_node_t *node, uint64_t index) {
   if (!node || !node->device)
     return 0;
   ramfs_dir_t *dir = (ramfs_dir_t *)node->device;
@@ -327,38 +341,40 @@ static struct dirent *ramfs_readdir(vfs_node_t *node, uint32_t index) {
     strcpy(d->name, ".");
     d->ino = node->inode;
     d->d_type = DT_DIR;
+    d->d_off = 1;
     return d;
   }
   if (index == 1) {
     strcpy(d->name, "..");
     d->ino = node->inode;
     d->d_type = DT_DIR;
+    d->d_off = 2;
     return d;
   }
 
-  index -= 2;
-  /* Resume from the cursor for sequential getdents; otherwise rescan.  The
-   * walk runs under the index lock - entries behind the cursor can be
-   * unlinked (and their wrappers freed) at any time - and the dirent is
-   * filled while still locked-> */
+  /* Cookies descend in the newest-first order list. Deleting an entry does
+   * not change the cookies of later entries, so an open stream can resume
+   * safely during recursive unlink/rmdir. */
   vfs_dirindex_lock(dir);
   child_node_t *cursor = dir->cursor;
-  uint32_t cursor_index = dir->cursor_index;
   child_node_t *curr;
-  if (cursor && index == cursor_index + 1) {
+  if (index == 2) {
+    curr = dir->children;
+  } else if (cursor && index == dir->cursor_cookie) {
     curr = cursor->next;
   } else {
     curr = dir->children;
-    for (uint32_t i = 0; i < index && curr; i++)
+    while (curr && curr->cookie >= index)
       curr = curr->next;
   }
   dir->cursor = curr;
-  dir->cursor_index = index;
+  dir->cursor_cookie = curr ? curr->cookie : 0;
 
   if (curr) {
     strcpy(d->name, curr->node->name);
     d->ino = curr->node->inode;
     d->d_type = vfs_dtype(curr->node->flags);
+    d->d_off = curr->cookie;
   }
   vfs_dirindex_unlock(dir);
 

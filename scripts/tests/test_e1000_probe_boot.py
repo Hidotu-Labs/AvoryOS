@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 import json
+import re
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / 'build/e1000-probe-boot'
@@ -134,24 +135,36 @@ static int command(const char *slot) {
  int n=read(fd,bytes,sizeof(bytes));close(fd);
  return n==6 ? bytes[4] | bytes[5]<<8 : -1;
 }
-static int binding(const char *slot) {
+static int binding(const char *slot,const char *driver) {
  char path[160], target[160]={0};
  snprintf(path,sizeof(path),"/sys/bus/pci/devices/%s/driver",slot);
  int n=readlink(path,target,sizeof(target)-1);
- return n>0 && strstr(target,"/e1000")!=NULL;
+ char *name=strstr(target,"/drivers/");
+ return n>0 && name && !strcmp(name+9,driver);
 }
-static void rebind(const char *slot) {
- const char *paths[]={"/sys/bus/pci/drivers/e1000/unbind",
-                      "/sys/bus/pci/drivers/e1000/bind"};
+static void other_controller_active(const char *slot,const char *driver,int msi) {
+ int cmd=command(slot);
+ check(cmd>=0 && (cmd&6)==6 && !!(cmd&0x400)==msi,
+       "other Intel controller remains active during rebind");
+ check(binding(slot,driver),"other Intel controller keeps its driver binding");
+}
+static void rebind(const char *slot,const char *driver,
+                   int msi,const char *other_slot,const char *other_driver,
+                   int other_msi) {
+ char paths[2][160];
+ snprintf(paths[0],sizeof(paths[0]),"/sys/bus/pci/drivers/%s/unbind",driver);
+ snprintf(paths[1],sizeof(paths[1]),"/sys/bus/pci/drivers/%s/bind",driver);
  for(int i=0;i<2;i++) {
   int fd=open(paths[i],O_WRONLY);
   int n=fd<0 ? -1 : write(fd,slot,strlen(slot));
   if(fd>=0)close(fd);
-  check(n==(int)strlen(slot),i ? "e1000 rebind" : "e1000 unbind");
+  check(n==(int)strlen(slot),i ? "Intel NIC rebind" : "Intel NIC unbind");
   int cmd=command(slot);
-  check(cmd>=0 && (i ? (cmd&6)==6 && !(cmd&0x400) : !(cmd&4) && (cmd&0x400)),
-        i ? "e1000 rebind traffic enabled" : "e1000 DMA and INTx disabled");
-  check(binding(slot)==i,"e1000 binding lifecycle");
+  check(cmd>=0 && (i ? (cmd&6)==6 && !!(cmd&0x400)==msi :
+                         !(cmd&4) && (cmd&0x400)),
+        i ? "Intel NIC rebind traffic enabled" : "Intel NIC DMA and INTx disabled");
+  check(binding(slot,driver)==i,"Intel NIC binding lifecycle");
+  if(other_slot)other_controller_active(other_slot,other_driver,other_msi);
  }
 }
 static void child_exited(int signal) {(void)signal;}
@@ -164,16 +177,26 @@ int main(void) {
  setvbuf(stdout,NULL,_IOLBF,0);
  puts("NIC_PROBE: START");
  mount("sysfs","/sys","sysfs",0,NULL);
- FILE *f=fopen("/expect","r");int intel=0,rtl=0;
- if(!f || fscanf(f,"%d %d",&intel,&rtl)!=2)errors++;
+ FILE *f=fopen("/expect","r");int intel=0,rtl=0,e1000e_mask=0,msi_mask=0;
+ if(!f || fscanf(f,"%d %d %d %d",&intel,&rtl,&e1000e_mask,&msi_mask)!=4)errors++;
+ char expected_mac[32]={0};
+ if(!f || fscanf(f,"%31s",expected_mac)!=1)errors++;
  if(f)fclose(f);
  const char *slots[]={"0000:00:08.0","0000:00:0a.0"};
  for(int i=0;i<intel;i++) {
-  check(binding(slots[i]),"e1000 bound at boot");
+  const char *driver=(e1000e_mask&(1<<i))?"e1000e":"e1000";
+  check(binding(slots[i],driver),"Intel NIC bound to expected driver at boot");
   int cmd=command(slots[i]);
-  check(cmd>=0 && (cmd&6)==6 && !(cmd&0x400),"e1000 active PCI command");
+  check(cmd>=0 && (cmd&6)==6 && !!(cmd&0x400)==!!(msi_mask&(1<<i)),
+        "Intel NIC active PCI command matches selected IRQ mode");
  }
  check((access("/sys/class/net/@IFACE@",F_OK)==0)==(rtl||intel),"default NIC visible in sysfs");
+ if(strcmp(expected_mac,"none")) {
+  char path[160],address[32]={0};
+  snprintf(path,sizeof(path),"/sys/class/net/@IFACE@/address");
+  f=fopen(path,"r");if(f){fscanf(f,"%31s",address);fclose(f);}
+  check(!strcmp(address,expected_mac),"selected interface resolves to expected NIC MAC");
+ }
  if(rtl||intel) {
   unsigned char sent[4096],got[4096];
   for(unsigned i=0;i<sizeof(sent);i++)sent[i]=(i*37u)^0xa5u;
@@ -263,7 +286,12 @@ int main(void) {
  }
  unsigned long long memory_before=free_memory_kb();
  for(int cycle=0;cycle<3;cycle++) {
-  for(int i=0;i<intel;i++)rebind(slots[i]);
+  for(int i=0;i<intel;i++)
+   rebind(slots[i],(e1000e_mask&(1<<i))?"e1000e":"e1000",
+          !!(msi_mask&(1<<i)),
+          intel>1?slots[1-i]:NULL,
+          intel>1 && (e1000e_mask&(1<<(1-i)))?"e1000e":"e1000",
+          intel>1 && !!(msi_mask&(1<<(1-i))));
   if(intel) {
    check(stream(0,cycle+42)>0,"traffic after rebind");
    if(@LINKTEST@)check(counter("dma_bytes")==1056768,"DMA footprint stable after rebind");
@@ -279,7 +307,6 @@ int main(void) {
  fflush(NULL);reboot(RB_POWER_OFF);for(;;)sleep(1);
 }
 '''
-
 
 class Echo(socketserver.BaseRequestHandler):
     def handle(self):
@@ -303,7 +330,7 @@ def main():
     parser.add_argument('--seconds', type=int, default=10, help='seconds of four-stream load per networked boot')
     parser.add_argument('--accel', choices=('kvm', 'tcg'), default='kvm')
     parser.add_argument('--smp', type=int, choices=(1, 4, 8), default=4)
-    parser.add_argument('--case', action='append', choices=('none', 'e1000', 'rtl8139', 'mixed', 'mixed-e1000', 'recovery'))
+    parser.add_argument('--case', action='append', choices=('none', 'e1000', 'e1000e', 'e1000e-intx', 'e1000e-msi', 'e1000e-pair', 'rtl8139', 'mixed', 'mixed-e1000', 'mixed-intel', 'all-three', 'recovery', 'recovery-e1000e'))
     args = parser.parse_args()
     if not 0 <= args.seconds <= 300:
         parser.error('--seconds must be between 0 and 300')
@@ -355,20 +382,35 @@ def run_cases(port, udp_port, udp6_port, args):
         original_run(args)
 
     boot.run = run_with_kernel
-    # Two e1000s also exercise per-device state and independent rebinds.
-    for name, intel, rtl, iface in [('none', 0, 0, 'eth0'), ('e1000', 1, 0, 'eth0'),
-                                   ('rtl8139', 0, 1, 'eth0'), ('mixed', 2, 1, 'eth0'),
-                                   ('mixed-e1000', 2, 1, 'eth1'), ('recovery', 1, 0, 'eth0')]:
+    # Reuse the same traffic and lifecycle checks for either Intel profile.
+    cases = [
+        ('none', [], 0, 'eth0', False, 'auto', 'none'),
+        ('e1000', ['e1000'], 0, 'eth0', False, 'auto', '52:54:00:12:34:00'),
+        ('e1000e', ['e1000e'], 0, 'eth0', True, 'auto', '52:54:00:12:34:00'),
+        ('e1000e-intx', ['e1000e'], 0, 'eth0', True, 'intx', '52:54:00:12:34:00'),
+        ('e1000e-msi', ['e1000e'], 0, 'eth0', True, 'msi', '52:54:00:12:34:00'),
+        ('e1000e-pair', ['e1000e', 'e1000e'], 0, 'eth1', True, 'auto', '52:54:00:12:34:00'),
+        ('rtl8139', [], 1, 'eth0', False, 'auto', 'none'),
+        ('mixed', ['e1000', 'e1000'], 1, 'eth0', False, 'auto', 'none'),
+        ('mixed-e1000', ['e1000', 'e1000'], 1, 'eth1', True, 'auto', 'none'),
+        ('mixed-intel', ['e1000', 'e1000e'], 0, 'eth1', True, 'auto', '52:54:00:12:34:01'),
+        ('all-three', ['e1000', 'e1000e'], 1, 'eth2', True, 'auto', '52:54:00:12:34:01'),
+        ('recovery', ['e1000'], 0, 'eth0', False, 'auto', '52:54:00:12:34:00'),
+        ('recovery-e1000e', ['e1000e'], 0, 'eth0', True, 'auto', '52:54:00:12:34:00'),
+    ]
+    for name, models, rtl, iface, link_test, irq_policy, default_mac in cases:
         if args.case and name not in args.case:
             continue
-        link_test = bool(intel and (not rtl or iface != 'eth0'))
+        intel = len(models)
+        e1000e_mask = sum(1 << i for i, model in enumerate(models) if model == 'e1000e')
+        msi_mask = e1000e_mask if irq_policy in ('auto', 'msi') else 0
         boot.INIT = INIT.replace('@PORT@', str(port)).replace('@UDP_PORT@', str(udp_port)).replace('@UDP6_PORT@', str(udp6_port)).replace('@IFACE@', iface).replace('@SECONDS@', str(args.seconds)).replace('@LINKTEST@', str(int(link_test)))
         boot.OUT = OUT / name
         boot.OUT.mkdir(exist_ok=True)
         def setup(root):
-            (root / 'expect').write_text(f'{intel} {rtl}\n')
-        fault = ' e1000_test_tx_stall=1' if name == 'recovery' else ''
-        disk, iso = boot.prepare(setup, kernel_cmdline=f'kpi_amdgpu=0 init=/bin/probe-init net_default={iface}{fault}')
+            (root / 'expect').write_text(f'{intel} {rtl} {e1000e_mask} {msi_mask} {default_mac}\n')
+        fault = ' e1000_test_tx_stall=1' if name in ('recovery', 'recovery-e1000e') else ''
+        disk, iso = boot.prepare(setup, kernel_cmdline=f'kpi_amdgpu=0 init=/bin/probe-init net_default={iface} e1000e_irq={irq_policy}{fault}')
         serial = boot.OUT / 'serial.log'
         qmp_path = boot.OUT / 'qmp.sock'
         qmp_path.unlink(missing_ok=True)
@@ -381,9 +423,9 @@ def run_cases(port, udp_port, udp6_port, args):
                '-vga', 'none', '-device', 'virtio-vga,addr=06.0',
                '-display', 'none', '-serial', f'file:{serial}',
                '-monitor', 'none', '-qmp', f'unix:{qmp_path},server=on,wait=off', '-no-reboot']
-        for i in range(intel):
+        for i, model in enumerate(models):
             slot = (8, 10)[i]
-            cmd += ['-device', f'e1000,id=e{i},netdev=i{i},addr={slot:02x}.0,mac=52:54:00:12:34:{i:02x}',
+            cmd += ['-device', f'{model},id=e{i},netdev=i{i},addr={slot:02x}.0,mac=52:54:00:12:34:{i:02x}',
                     '-netdev', f'user,id=i{i},ipv6-net=2001:db8:1::/64']
         if rtl:
             cmd += ['-device', 'rtl8139,netdev=r0,addr=09.0', '-netdev', 'user,id=r0,ipv6-net=2001:db8:1::/64']
@@ -406,7 +448,8 @@ def run_cases(port, udp_port, udp6_port, args):
                             if time.monotonic() >= deadline:
                                 raise TimeoutError(str(serial))
                             log = serial.read_text(errors='replace') if serial.exists() else ''
-                            device = 'e1' if intel == 2 else 'e0'
+                            device = ('e0' if name == 'e1000e-pair'
+                                      else f'e{1 if iface in ("eth1", "eth2") else 0}')
                             if link_test and not down and 'NIC_LINK: DOWN_READY' in log:
                                 qmp_command(stream, 'set_link', {'name': device, 'up': False})
                                 down = True
@@ -426,12 +469,15 @@ def run_cases(port, udp_port, udp6_port, args):
         assert process.returncode == 0 and 'NIC_PROBE: END errors=0' in log, str(serial)
         for i in range(intel):
             assert f'MAC 52:54:00:12:34:{i:02x}' in log, str(serial)
+            if e1000e_mask & (1 << i):
+                mode = 'MSI vector' if msi_mask & (1 << i) else 'INTx IRQ'
+                assert re.search(rf'E1000E] eth\d+ RX/TX enabled; {re.escape(mode)}', log), str(serial)
         if rtl or intel:
             assert log.count('[NET] Ethernet, ARP and IPv4 initialized') == 1
             assert '[DHCP] lease acquisition failed' not in log
             assert '[DHCP] Lease obtained' in log
             assert f'[NET] default interface: {iface}' in log
-            if name == 'recovery':
+            if name in ('recovery', 'recovery-e1000e'):
                 assert log.count('TX recovery complete') == 1, str(serial)
             else:
                 assert 'TX stalled:' not in log, str(serial)
@@ -439,7 +485,7 @@ def run_cases(port, udp_port, udp6_port, args):
             assert '[NET] no usable network device; protocol startup skipped' in log
             assert '[NET] starting DHCP client' not in log
         if intel:
-            assert log.count('shutdown: DMA/INTx disabled, buffers=released') == intel, str(serial)
+            assert log.count('shutdown: DMA/interrupts disabled, buffers=released') == intel, str(serial)
         assert 'DMA buffers quarantined' not in log, str(serial)
         print(f'PASS: {name}, SMP={args.smp}: functional traffic, {args.seconds}s load, carrier/events, watchdog, rebind and shutdown', flush=True)
 
