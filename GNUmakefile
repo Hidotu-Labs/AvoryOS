@@ -71,14 +71,14 @@ GLIBC_USER_CXXFLAGS := -O2 -Wall -Wextra -fno-stack-protector \
 	--sysroot=$(GLIBC_SYSROOT) -Wl,-T,$(CURDIR)/config/userland-link.ld
 
 AXON_PROFILE_FILES := $(wildcard config/xorg/*) config/vlc/vlc.sh \
-	config/wireplumber/20-avoryos-hda.conf userland/avory-account \
+	config/axon/mirrorlist config/wireplumber/20-avoryos-hda.conf userland/avory-account \
 	userland/test_accounts.sh
 
 userland/avory-login.elf: userland/avory-login.c userland/GNUmakefile config/userland-link.ld $(GLIBC_STAMP) $(GLIBC_TOOLCHAIN_STAMP)
 	$(MAKE) -C userland -f GNUmakefile avory-login.elf
 
 
-$(ARCH_STAMP): scripts/setup-rootfs.sh scripts/axon-common.sh scripts/configure-axon-mirrors.py \
+$(ARCH_STAMP): scripts/setup-rootfs.sh scripts/axon-common.sh \
 		scripts/rootfs-packages.txt $(AXON_PROFILE_FILES) \
 		userland/avory-login.c $(GLIBC_TOOLCHAIN_STAMP)
 	@mkdir -p $(dir $(ARCH_STAMP))
@@ -315,7 +315,8 @@ MINIMAL_ISO := avoryos-minimal.iso
 MINIMAL_DISK := build/minimal/disk.img
 MINIMAL_STAMP := build/minimal/rootfs/.avoryos-minimal
 
-$(MINIMAL_STAMP): scripts/build-minimal.sh scripts/axon-common.sh scripts/minimal-rootfs-packages.txt
+$(MINIMAL_STAMP): scripts/build-minimal.sh scripts/axon-common.sh \
+		scripts/minimal-rootfs-packages.txt config/axon/mirrorlist
 	chmod +x scripts/build-minimal.sh
 	./scripts/build-minimal.sh rootfs
 
@@ -529,7 +530,7 @@ DISK_CACHE_ARGS = --cache $(DISK_PRISTINE_CACHE) --metadata $(DISK_PRISTINE_META
 	--inputs $(DISK_NON_APP_DEPS) $(USERLAND_DISK_APPS) --apps $(USERLAND_DISK_APPS)
 DISK_NON_APP_DEPS := GNUmakefile \
 	userland/winoptions userland/icewm-menu $(ARCH_STAMP) \
-	scripts/setup-rootfs.sh scripts/axon-common.sh scripts/configure-axon-mirrors.py \
+	scripts/setup-rootfs.sh scripts/axon-common.sh \
 	scripts/rootfs-packages.txt $(AXON_PROFILE_FILES) userland/avory-login.c \
 	scripts/glibc-toolchain.sh $(GLIBC_TOOLCHAIN_STAMP) \
 	scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh \
@@ -863,7 +864,7 @@ disk.img: disk-full-force
 		if [ -f build/arch/rootfs/etc/sddm.conf ]; then \
 			sed -i 's|^DisplayCommand=.*$$|DisplayCommand=/usr/bin/avory-prime-display|' build/arch/rootfs/etc/sddm.conf; \
 		fi; \
-		install -m 0755 config/init/rcS build/arch/rootfs/etc/init.d/rcS; \
+		install -D -m 0755 config/init/rcS build/arch/rootfs/etc/init.d/rcS; \
 		install -m 0755 config/weston/avory-weston-session.sh build/arch/rootfs/usr/bin/avory-weston-session; \
 		install -m 0644 config/weston/weston.desktop build/arch/rootfs/usr/share/wayland-sessions/weston.desktop; \
 		./scripts/configure-accounts.sh build/arch/rootfs; \

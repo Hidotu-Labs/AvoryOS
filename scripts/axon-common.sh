@@ -2,12 +2,13 @@
 # Shared Axon bootstrap for AvoryOS rootfs provisioning scripts.
 
 AXON_REPO_URL="${AXON_REPO_URL:-https://github.com/Hidotu-Labs/Axon.git}"
-AXON_REF="${AXON_REF:-codex/axon-rootfs-fixes}"
+AXON_REF="main"
 AXON_SOURCE_DIR="${AXON_SOURCE_DIR:-${ROOT_DIR}/build/axon-src}"
 case "${AXON_SOURCE_DIR}" in
     /*) ;;
     *) AXON_SOURCE_DIR="${ROOT_DIR}/${AXON_SOURCE_DIR}" ;;
 esac
+AXON_MIRRORLIST_FILE="${ROOT_DIR}/config/axon/mirrorlist"
 
 ensure_axon() {
     if [ -n "${AXON_BIN:-}" ]; then
@@ -47,12 +48,23 @@ ensure_axon() {
         git clone --depth 1 --branch "${AXON_REF}" \
             "${AXON_REPO_URL}" "${AXON_SOURCE_DIR}"
     else
-        local current_ref
+        local current_ref current_head fetched_head stash_created=0
         current_ref="$(git -C "${AXON_SOURCE_DIR}" branch --show-current 2>/dev/null || true)"
-        if [ "${current_ref}" != "${AXON_REF}" ]; then
+        echo "[*] Checking for the latest Axon on ${AXON_REF}..."
+        git -C "${AXON_SOURCE_DIR}" fetch --depth 1 origin "${AXON_REF}"
+        current_head="$(git -C "${AXON_SOURCE_DIR}" rev-parse HEAD)"
+        fetched_head="$(git -C "${AXON_SOURCE_DIR}" rev-parse FETCH_HEAD)"
+        if [ "${current_ref}" != "${AXON_REF}" ] || [ "${current_head}" != "${fetched_head}" ]; then
             echo "[*] Updating managed Axon checkout to ${AXON_REF}..."
-            git -C "${AXON_SOURCE_DIR}" fetch --depth 1 origin "${AXON_REF}"
+            if [ -n "$(git -C "${AXON_SOURCE_DIR}" status --porcelain)" ]; then
+                git -C "${AXON_SOURCE_DIR}" stash push --include-untracked \
+                    -m "AvoryOS Axon bootstrap update" >/dev/null
+                stash_created=1
+            fi
             git -C "${AXON_SOURCE_DIR}" switch -C "${AXON_REF}" FETCH_HEAD
+            if [ "${stash_created}" -eq 1 ]; then
+                git -C "${AXON_SOURCE_DIR}" stash pop
+            fi
         fi
     fi
 
@@ -77,4 +89,72 @@ ensure_axon() {
     fi
     AXON_BIN="${source_binary}"
     export PATH="$(dirname "${AXON_BIN}"):${PATH}"
+}
+
+axon_rootfs_command() {
+    local rootfs_dir="$1"
+    shift
+    AXON_MIRRORLIST="${AXON_MIRRORLIST_FILE}" \
+        "${AXON_BIN}" --root "${rootfs_dir}" \
+        --mirrorlist "${AXON_MIRRORLIST_FILE}" "$@"
+}
+
+axon_rootfs_sync() {
+    axon_rootfs_command "$1" upd
+}
+
+axon_rootfs_list_installed() {
+    local db_dir="$1" entry name
+    [ -d "${db_dir}" ] || return 0
+    while IFS= read -r -d '' entry; do
+        name="$(awk '$0 == "%NAME%" { getline; print; exit }' "${entry}")"
+        [ -z "${name}" ] || printf '%s\n' "${name}"
+    done < <(find "${db_dir}" -mindepth 2 -maxdepth 2 -type f -name desc -print0)
+}
+
+axon_rootfs_bootstrap() {
+    local rootfs_dir="$1"
+    local package_db="${rootfs_dir}/var/lib/pacman/local"
+    local package_name
+    local -a before_packages=() after_packages=() new_packages=()
+
+    mapfile -t before_packages < <(axon_rootfs_list_installed "${package_db}" | sort -u)
+
+    # The current Axon CLI bootstraps an empty target with a small transaction,
+    # then replays its deferred install scripts once bash is available.
+    axon_rootfs_command "${rootfs_dir}" get --needed --noconfirm --keep-cache \
+        --no-scriptlets filesystem glibc bash readline ncurses
+
+    install -D -m 0644 "${AXON_MIRRORLIST_FILE}" \
+        "${rootfs_dir}/etc/axon/mirrorlist"
+
+    mapfile -t after_packages < <(axon_rootfs_list_installed "${package_db}" | sort -u)
+    for package_name in "${after_packages[@]}"; do
+        if [[ ! " ${before_packages[*]} " == *" ${package_name} "* ]]; then
+            new_packages+=("${package_name}")
+        fi
+    done
+    [ "${#new_packages[@]}" -eq 0 ] && return 0
+    if [ ! -x "${rootfs_dir}/bin/bash" ] && [ ! -x "${rootfs_dir}/usr/bin/bash" ]; then
+        echo "[!] Axon bootstrap installed no usable target bash in ${rootfs_dir}." >&2
+        return 1
+    fi
+    axon_rootfs_command "${rootfs_dir}" replay-post-install \
+        "${new_packages[@]}"
+}
+
+axon_rootfs_install_list() {
+    local rootfs_dir="$1" package_file="$2"
+    shift 2
+    local -a packages=()
+    mapfile -t packages < <(awk 'NF && $1 !~ /^#/ { print $1 }' "${package_file}")
+    if [ "${#packages[@]}" -eq 0 ]; then
+        echo "[!] No package names found in ${package_file}." >&2
+        return 1
+    fi
+    # Bash and Coreutils both ship the shared GNU info index. Axon's conflict
+    # check treats that intentional overlap as a hard file conflict unless
+    # overwrite mode is enabled for the rootfs package transaction.
+    axon_rootfs_command "${rootfs_dir}" get --needed --noconfirm --keep-cache \
+        --overwrite "$@" "${packages[@]}"
 }

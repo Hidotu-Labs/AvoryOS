@@ -1,7 +1,6 @@
 # Axon package names for the AvoryOS desktop rootfs.
-# Includes the packages formerly installed by setup-arch.sh, translated
-# to their canonical package names, plus the Axon-native TCC package.
-# The desktop profile may add profile-specific packages as well.
+# Package names for direct installation into the target root with Axon's
+# current --root/get interface; keep AvoryOS-specific packages in this list.
 filesystem
 glibc
 bash

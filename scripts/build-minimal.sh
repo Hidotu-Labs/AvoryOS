@@ -31,8 +31,11 @@ mkdir -p "$BUILD_DIR" "$ROOTFS_DIR"
 install_packages() {
     ensure_axon
     log "Provisioning minimal rootfs with Axon..."
-    "${AXON_BIN}" rootfs --root "${ROOTFS_DIR}" --sync --profile minimal \
-        --packages-from "${ROOT_DIR}/scripts/minimal-rootfs-packages.txt"
+    make -C "${AXON_SOURCE_DIR}" axon
+    axon_rootfs_sync "${ROOTFS_DIR}"
+    axon_rootfs_bootstrap "${ROOTFS_DIR}"
+    axon_rootfs_install_list "${ROOTFS_DIR}" \
+        "${ROOT_DIR}/scripts/minimal-rootfs-packages.txt"
 }
 
 target_run() {

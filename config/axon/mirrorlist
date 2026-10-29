@@ -1,0 +1,5 @@
+# Arch stores architecture-independent packages in the x86_64 repository path.
+Server = https://fastly.mirror.pkgbuild.com/$repo/os/x86_64
+Server = https://geo.mirror.pkgbuild.com/$repo/os/x86_64
+Server = https://mirror.rackspace.com/archlinux/$repo/os/x86_64
+Server = https://mirrors.kernel.org/archlinux/$repo/os/x86_64
