@@ -15,6 +15,7 @@ gzip
 xz
 util-linux
 shadow
+sudo
 feh
 wine
 wine-mono
@@ -99,6 +100,13 @@ libfontenc
 xorg-fonts-misc
 xorg-xkbcomp
 mesa
+# GoldSrc and other i686 ELF binaries need /lib/ld-linux.so.2.
+lib32-glibc
+lib32-mesa
+lib32-libdrm
+lib32-libglvnd
+lib32-llvm-libs
+lib32-gcc-libs
 libdrm
 nettle
 file
@@ -234,6 +242,7 @@ make
 gcc
 libisl
 binutils
+pkgconf
 xfce4-session
 labwc
 xfwm4

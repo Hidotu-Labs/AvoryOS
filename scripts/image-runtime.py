@@ -103,6 +103,18 @@ class RuntimeImage:
                 self.command(f'write "{staged}" "{target}"', write=True)
                 self.command(f'set_inode_field "{target}" mode 0100755', write=True)
                 self.verify(target, '/usr/lib/' + name)
+        # AvoryOS keeps /lib as a real directory for the native runtime
+        # loader, so the usrmerge symlink /usr/lib/ld-linux.so.2 cannot
+        # satisfy an ELF32 PT_INTERP of /lib/ld-linux.so.2. Stage the
+        # multilib loader at its exact interpreter path as well.
+        compat_loader = self.tree_file('/usr/lib/ld-linux.so.2')
+        staged = self.tmp / 'ld-linux.so.2'
+        shutil.copyfile(compat_loader, staged)
+        target = '/lib/ld-linux.so.2'
+        self.command(f'rm "{target}"', write=True)
+        self.command(f'write "{staged}" "{target}"', write=True)
+        self.command(f'set_inode_field "{target}" mode 0100755', write=True)
+        self.verify(target, '/usr/lib/ld-linux.so.2')
         musl = self.root / 'usr/lib/musl/lib/libc.so'
         if musl.is_file():
             staged = self.tmp / 'musl'

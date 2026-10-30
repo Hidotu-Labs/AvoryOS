@@ -1,0 +1,9 @@
+# AvoryOS full desktop image: run services once, then keep the login prompt on
+# the kernel's sole interactive virtual terminal.
+::sysinit:/etc/init.d/rcS
+tty1::respawn:/bin/avory-login
+
+# BusyBox init handles Ctrl-Alt-Del and shutdown without a separate service
+# manager. BusyBox applet links, including /sbin/init, are staged in rootfs.
+::ctrlaltdel:/usr/bin/busybox reboot
+::shutdown:/usr/bin/busybox umount -a -r

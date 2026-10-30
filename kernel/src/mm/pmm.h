@@ -86,6 +86,8 @@ void pmm_mark_used(void *ptr, size_t count);
 // are no longer needed
 void pmm_reclaim_bootloader(uint64_t kernel_phys_base);
 bool pmm_is_reclaimable(uint64_t phys);
+/* Protect only reclaimable pages within a page-aligned mapped range. */
+void pmm_protect_reclaimable_range(uint64_t phys, size_t page_count);
 
 // Return usable memory in bytes
 uint64_t pmm_get_usable_memory(void);

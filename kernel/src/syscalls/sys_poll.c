@@ -1,5 +1,6 @@
 // Poll/Select Syscalls: poll, ppoll, select, pselect6
 #include "../apic/lapic_timer.h"
+#include "../include/arch/uaccess.h"
 #include "../console/klog.h"
 #include "../fs/vfs.h"
 #include "../lib/string.h"
@@ -197,17 +198,35 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms,
   (void)a4;
   (void)a5;
 
-  struct thread *t = sched_get_current();
-  /* A zero-fd poll is a signal-interruptible sleep, including an infinite
-   * timeout. Use the same deadline and wake handling as other polls. */
+  /* Snapshot userspace once. VMA bookkeeping is not a substitute for a
+   * fault-safe access check, and user fds may change while poll sleeps. */
+  if (nfds > MAX_FDS)
+    return (uint64_t)-22;
   if (nfds == 0)
     return do_poll(NULL, 0, timeout_ms);
-  if (!is_user_ptr(fds_ptr) ||
-      !vmm_is_user_addr_range_valid(fds_ptr, nfds * sizeof(struct pollfd)))
+  size_t bytes = (size_t)nfds * sizeof(struct pollfd);
+  if (!is_user_range((void *)fds_ptr, bytes))
     return (uint64_t)-14;
-
-  struct pollfd *p = (struct pollfd *)fds_ptr;
-  return do_poll(p, nfds, timeout_ms);
+  struct pollfd *fds = kmalloc(bytes);
+  if (!fds)
+    return (uint64_t)-12;
+  if (copy_from_user(fds, (void *)fds_ptr, bytes)) {
+    kfree(fds);
+    return (uint64_t)-14;
+  }
+  uint64_t result = do_poll(fds, nfds, timeout_ms);
+  if ((int64_t)result >= 0) {
+    for (size_t i = 0; i < nfds; i++) {
+      void *out = (void *)(fds_ptr + i * sizeof(struct pollfd) +
+                          __builtin_offsetof(struct pollfd, revents));
+      if (copy_to_user(out, &fds[i].revents, sizeof(fds[i].revents))) {
+        result = (uint64_t)-14;
+        break;
+      }
+    }
+  }
+  kfree(fds);
+  return result;
 }
 
 static uint64_t sys_ppoll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ptr,
@@ -215,40 +234,54 @@ static uint64_t sys_ppoll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ptr,
   (void)a5;
 
   uint64_t timeout_ms = (uint64_t)-1;
-  if (timeout_ptr && is_user_ptr(timeout_ptr)) {
-    struct {
-      int64_t tv_sec;
-      int64_t tv_nsec;
-    } *ts = (void *)timeout_ptr;
-    if (!vmm_is_user_addr_range_valid(timeout_ptr, 16))
+  int64_t seconds = -1, nanoseconds = 0;
+  if (timeout_ptr) {
+    struct { int64_t tv_sec, tv_nsec; } ts;
+    struct { int32_t tv_sec, tv_nsec; } ts32;
+    struct thread *caller = sched_get_current();
+    bool compat32 = caller && caller->seccomp_compat_dispatch &&
+                    caller->mm && caller->mm->compat32;
+    if (compat32) {
+      if (!is_user_range((void *)timeout_ptr, sizeof(ts32)) ||
+          copy_from_user(&ts32, (void *)timeout_ptr, sizeof(ts32)))
+        return (uint64_t)-14;
+      ts.tv_sec = ts32.tv_sec;
+      ts.tv_nsec = ts32.tv_nsec;
+    } else if (!is_user_range((void *)timeout_ptr, sizeof(ts)) ||
+               copy_from_user(&ts, (void *)timeout_ptr, sizeof(ts))) {
       return (uint64_t)-14;
-    /* Remember the raw request for /proc/PID/syscall spin diagnosis. */
-    struct thread *cur = sched_get_current();
-    if (cur) {
-      cur->last_poll_sec = ts->tv_sec;
-      cur->last_poll_nsec = ts->tv_nsec;
-      cur->last_poll_nfds = nfds;
     }
-    timeout_ms = (uint64_t)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
-  } else {
-    struct thread *cur = sched_get_current();
-    if (cur) {
-      cur->last_poll_sec = -1;
-      cur->last_poll_nsec = 0;
-      cur->last_poll_nfds = nfds;
-    }
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000)
+      return (uint64_t)-22;
+    seconds = ts.tv_sec;
+    nanoseconds = ts.tv_nsec;
+    /* Round up sub-millisecond waits and saturate long valid timeouts. */
+    uint64_t fraction = ((uint64_t)nanoseconds + 999999) / 1000000;
+    const uint64_t max_ms = (uint64_t)INT64_MAX;
+    timeout_ms = (uint64_t)seconds > (max_ms - fraction) / 1000
+                   ? max_ms : (uint64_t)seconds * 1000 + fraction;
   }
 
   struct thread *t = sched_get_current();
+  if (t) {
+    t->last_poll_sec = seconds;
+    t->last_poll_nsec = nanoseconds;
+    t->last_poll_nfds = nfds;
+  }
   uint64_t old_mask = t ? t->signal_mask : 0;
   bool swapped = false;
-  if (sigmask && is_user_ptr(sigmask) && sigsetsize == 8 && t) {
-    if (!vmm_is_user_addr_range_valid(sigmask, 8))
+  if (sigmask) {
+    if (sigsetsize != 8)
+      return (uint64_t)-22;
+    uint64_t new_mask;
+    if (!is_user_range((void *)sigmask, sizeof(new_mask)) ||
+        copy_from_user(&new_mask, (void *)sigmask, sizeof(new_mask)))
       return (uint64_t)-14;
-    uint64_t new_mask = *(uint64_t *)sigmask;
-    new_mask &= ~((1ULL << (9 - 1)) | (1ULL << (19 - 1))); // SIGKILL/SIGSTOP
-    t->signal_mask = new_mask;
-    swapped = true;
+    new_mask &= ~((1ULL << (9 - 1)) | (1ULL << (19 - 1)));
+    if (t) {
+      t->signal_mask = new_mask;
+      swapped = true;
+    }
   }
   uint64_t ret = sys_poll(fds_ptr, nfds, timeout_ms, 0, 0, 0);
   if (swapped)
@@ -337,57 +370,56 @@ static uint64_t do_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
 static uint64_t sys_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
                              uint64_t exceptfds, uint64_t timeout,
                              uint64_t sigmask) {
-  if (nfds > 1024)
-    return (uint64_t)-22;
-  size_t set_size = (nfds + 7) / 8;
-  if (readfds && (!is_user_ptr(readfds) ||
-                  !vmm_is_user_addr_range_valid(readfds, set_size)))
-    return (uint64_t)-14;
-  if (writefds && (!is_user_ptr(writefds) ||
-                   !vmm_is_user_addr_range_valid(writefds, set_size)))
-    return (uint64_t)-14;
-  if (exceptfds && (!is_user_ptr(exceptfds) ||
-                    !vmm_is_user_addr_range_valid(exceptfds, set_size)))
-    return (uint64_t)-14;
-
-  uint64_t timeout_ms = (uint64_t)-1;
-  if (timeout && is_user_ptr(timeout)) {
-    if (!vmm_is_user_addr_range_valid(timeout, 16))
-      return (uint64_t)-14;
-    struct {
-      int64_t tv_sec;
-      int64_t tv_nsec;
-    } *ts = (void *)timeout;
-    timeout_ms = (uint64_t)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
-  }
-
+  if (nfds > 1024) return (uint64_t)-22;
   struct thread *t = sched_get_current();
-  uint64_t old_mask = t ? t->signal_mask : 0;
-  bool swapped = false;
-  if (sigmask && is_user_ptr(sigmask) && t) {
-    // pselect6 passes struct { const sigset_t *ss; size_t ss_len; }
-    if (vmm_is_user_addr_range_valid(sigmask, 16)) {
-      uint64_t ss_ptr = *(uint64_t *)sigmask;
-      uint64_t ss_len = *((uint64_t *)sigmask + 1);
-      if (ss_ptr && ss_len == 8 && vmm_is_user_addr_range_valid(ss_ptr, 8)) {
-        uint64_t new_mask = *(uint64_t *)ss_ptr;
-        new_mask &= ~((1ULL << (9 - 1)) | (1ULL << (19 - 1)));
-        t->signal_mask = new_mask;
-        swapped = true;
-      } else if (ss_ptr == 0) {
-        // NULL ss with pselect6 means no mask change; fall through.
-      } else if (ss_ptr && vmm_is_user_addr_range_valid(ss_ptr, 8)) {
-        uint64_t new_mask = *(uint64_t *)ss_ptr;
-        new_mask &= ~((1ULL << (9 - 1)) | (1ULL << (19 - 1)));
-        t->signal_mask = new_mask;
-        swapped = true;
-      }
+  bool compat = t && t->seccomp_compat_dispatch;
+  size_t word = compat ? 4 : 8;
+  size_t bytes = ((nfds + word * 8 - 1) / (word * 8)) * word;
+  uint64_t sets[3][16] = {{0}};
+  uint64_t ptrs[3] = {readfds, writefds, exceptfds};
+  for (int i=0; i<3; i++)
+    if (ptrs[i] && copy_from_user(sets[i], (void *)ptrs[i], bytes)) return (uint64_t)-14;
+  uint64_t timeout_ms = (uint64_t)-1;
+  if (timeout) {
+    int64_t sec, ns;
+    if (compat) {
+      int32_t ts[2];
+      if (copy_from_user(ts, (void *)timeout, sizeof(ts))) return (uint64_t)-14;
+      sec=ts[0]; ns=ts[1];
+    } else {
+      int64_t ts[2];
+      if (copy_from_user(ts, (void *)timeout, sizeof(ts))) return (uint64_t)-14;
+      sec=ts[0]; ns=ts[1];
+    }
+    if (sec<0 || ns<0 || ns>=1000000000) return (uint64_t)-22;
+    timeout_ms = sec > INT64_MAX/1000 ? INT64_MAX : (uint64_t)sec*1000+(ns+999999)/1000000;
+  }
+  uint64_t old_mask=t ? t->signal_mask : 0;
+  bool swapped=false;
+  if (sigmask) {
+    uint64_t maskptr, len;
+    if (compat) {
+      uint32_t pair[2];
+      if (copy_from_user(pair, (void *)sigmask, sizeof(pair))) return (uint64_t)-14;
+      maskptr=pair[0]; len=pair[1];
+    } else {
+      uint64_t pair[2];
+      if (copy_from_user(pair, (void *)sigmask, sizeof(pair))) return (uint64_t)-14;
+      maskptr=pair[0]; len=pair[1];
+    }
+    if (maskptr) {
+      uint64_t mask;
+      if (len!=8) return (uint64_t)-22;
+      if (copy_from_user(&mask, (void *)maskptr, 8)) return (uint64_t)-14;
+      if (t) { t->signal_mask=mask & ~((1ULL<<8)|(1ULL<<18)); swapped=true; }
     }
   }
-
-  uint64_t ret = do_pselect6(nfds, readfds, writefds, exceptfds, timeout_ms);
-  if (swapped)
-    t->signal_mask = old_mask;
+  uint64_t ret=do_pselect6(nfds, readfds ? (uint64_t)sets[0] : 0,
+      writefds ? (uint64_t)sets[1] : 0, exceptfds ? (uint64_t)sets[2] : 0, timeout_ms);
+  if (swapped) t->signal_mask=old_mask;
+  if ((int64_t)ret>=0)
+    for (int i=0; i<3; i++)
+      if (ptrs[i] && copy_to_user((void *)ptrs[i], sets[i], bytes)) return (uint64_t)-14;
   return ret;
 }
 

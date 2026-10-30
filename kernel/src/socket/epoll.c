@@ -278,6 +278,27 @@ static uint32_t ep_check_events(epitem_t *epi) {
   return ep_check_events_mask(epi, watch_mask);
 }
 
+/* Waiters on ep->wq are interchangeable consumers of ep->rdllist, so one
+ * wake per queued event is enough.  Waking every parked thread made N-thread
+ * workers on a shared epfd all run (and re-park) for each event.  Whoever
+ * leaves ready items behind, or leaves without consuming its wake (signal,
+ * timeout), passes the baton on with this helper.  Caller holds ep->lock. */
+static inline void ep_wake_one_locked(eventpoll_t *ep) {
+  if (__atomic_load_n(&ep->wq.head, __ATOMIC_RELAXED) != NULL)
+    wait_queue_wake_one(&ep->wq);
+}
+
+/* Forward a wake to the next waiter when ready items remain. */
+static void ep_chain_wake(eventpoll_t *ep) {
+  if (__atomic_load_n(&ep->rdllist_count, __ATOMIC_ACQUIRE) == 0 ||
+      __atomic_load_n(&ep->wq.head, __ATOMIC_RELAXED) == NULL)
+    return;
+  spinlock_acquire(&ep->lock);
+  if (ep->rdllist_count > 0)
+    ep_wake_one_locked(ep);
+  spinlock_release(&ep->lock);
+}
+
 // Helper: Add item to ready list
 static void ep_add_to_ready_list(eventpoll_t *ep, epitem_t *epi) {
   /* Advance before the fast path so a concurrent unlocked readiness poll can
@@ -311,13 +332,7 @@ static void ep_add_to_ready_list(eventpoll_t *ep, epitem_t *epi) {
   // This closes the race: epoll_wait_impl sets THREAD_BLOCKED while holding
   // ep->lock, so if we wake here (also under ep->lock) we are guaranteed to
   // see the correct blocked state and the thread won't miss the wakeup.
-  if (__atomic_load_n(&ep->wq.head, __ATOMIC_RELAXED) != NULL) {
-    if (__atomic_load_n(&epi->exclusive, __ATOMIC_ACQUIRE)) {
-      wait_queue_wake_one(&ep->wq);
-    } else {
-      wait_queue_wake_all(&ep->wq);
-    }
-  }
+  ep_wake_one_locked(ep);
 
   spinlock_release(&ep->lock);
 
@@ -585,12 +600,8 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
         INIT_LIST_HEAD(&epi->rdllink);
       }
 
-      if (keep_ready && ep->wq.head) {
-        if (__atomic_load_n(&epi->exclusive, __ATOMIC_ACQUIRE))
-          wait_queue_wake_one(&ep->wq);
-        else
-          wait_queue_wake_all(&ep->wq);
-      }
+      if (keep_ready)
+        ep_wake_one_locked(ep);
       if (keep_ready)
         __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
       spinlock_release(&ep->lock);
@@ -697,6 +708,10 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
 
   current->state = THREAD_RUNNING;
   current->wakeup_ticks = 0;
+
+  /* Items still queued (maxevents cap, level-triggered requeue) or a wake we
+   * did not consume (EINTR/timeout) must reach another waiter. */
+  ep_chain_wake(ep);
 
   return returned;
 }

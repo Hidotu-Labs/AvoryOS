@@ -367,22 +367,14 @@ static int tmpfs_fallocate(vfs_node_t *node, int mode, uint32_t offset, uint32_t
 
     tmpfs_file_t *file = (tmpfs_file_t *)node->device;
 
-    if (mode & 0x01) { // FALLOC_FL_KEEP_SIZE
-        if (needed <= node->length)
-            return 0;
-        uint32_t first_page = offset / PAGE_SIZE;
-        uint32_t last_page  = (needed - 1) / PAGE_SIZE;
-        for (uint32_t i = first_page; i <= last_page; i++) {
-            if (!tmpfs_get_or_alloc_page(file, i))
-                return -12; // ENOMEM: -1 would surface as EPERM in userspace
-        }
-        return 0;
-    }
-
-    if (needed <= node->length)
-        return 0;
-
-    return tmpfs_truncate(node, needed);
+    /* fallocate reserves storage, unlike sparse ftruncate growth. */
+    uint32_t first_page = offset / PAGE_SIZE;
+    uint32_t last_page = (needed - 1) / PAGE_SIZE;
+    for (uint32_t i = first_page; i <= last_page; i++)
+        if (!tmpfs_get_or_alloc_page(file, i)) return -12;
+    if (!(mode & 0x01) && needed > node->length)
+        return tmpfs_truncate(node, needed);
+    return 0;
 }
 
 /*
@@ -397,8 +389,12 @@ static uint64_t tmpfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
                            uint64_t prot, uint64_t flags, uint64_t offset) {
     if (!node || (node->flags & FS_TYPE_MASK) != FS_FILE || !node->device)
         return (uint64_t)-1;
-    if (!(flags & MAP_SHARED) || length == 0 || (offset & (PAGE_SIZE - 1)))
+    if (((flags & 3) != MAP_SHARED &&
+         !((flags & 3) == MAP_PRIVATE && !node->mmap_shared_only)) ||
+        length == 0 || (offset & (PAGE_SIZE - 1)))
         return (uint64_t)-1;
+    if (offset > UINT32_MAX || length > (UINT32_MAX & ~(uint64_t)(PAGE_SIZE-1)) - offset)
+        return (uint64_t)-22;
     if (addr == 0 || !(flags & MAP_FIXED))
         return (uint64_t)-1;
 
@@ -411,9 +407,8 @@ static uint64_t tmpfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
     uint64_t aligned_len = (length + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
 
     /* Like Linux's shmem mmap, a shared mapping past EOF extends the file so
-     * the tail is real storage rather than a later fault.  tmpfs_truncate()
-     * both allocates the pages (subject to the mount's byte budget) and keeps
-     * node->length consistent for readers. */
+     * the tail is real storage rather than a later fault. The truncate
+     * updates the logical size; the loop below allocates mapped frames. */
     uint64_t map_end = offset + aligned_len;
     if (map_end > node->length) {
         if (map_end > UINT32_MAX)
@@ -422,39 +417,27 @@ static uint64_t tmpfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
             return (uint64_t)-1;
     }
 
-    uint64_t page_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_USER;
-    if (prot & 0x2) // PROT_WRITE
-        page_flags |= PAGE_FLAG_RW;
-    if (!(prot & 0x4)) // PROT_EXEC absent
-        page_flags |= PAGE_FLAG_NX;
-
-    uint32_t first_page = (uint32_t)(offset / PAGE_SIZE);
-    uint64_t page_count = aligned_len / PAGE_SIZE;
-
-    for (uint64_t i = 0; i < page_count; i++) {
-        tmpfs_page_t *pg = tmpfs_get_or_alloc_page(file, first_page + (uint32_t)i);
-        if (!pg)
-            return (uint64_t)-1;
-
-        uint64_t va = addr + i * PAGE_SIZE;
-        if (vmm_map_page_if_unmapped(pml4, va, pg->phys, page_flags)) {
-            /* This PTE owns its own reference until teardown.  The file's
-             * reference only covers the storage slot, which truncate or node
-             * retirement may release while the mapping is still live. */
-            if (pmm_is_managed(pg->phys))
-                pmm_incref((void *)pg->phys);
-            continue;
-        }
-
-        /* Already mapped: acceptable only if it is the very same tmpfs frame
-         * (a repeated or overlapping remap), never someone else's page. */
-        if (vmm_virt_to_phys(pml4, va) == pg->phys)
-            continue;
-
-        return (uint64_t)-1;
-    }
-
+    /* Reserve only the VMA. The fault path acquires individual storage pages,
+     * so mmap itself does not require RAM for the entire requested interval. */
     return addr;
+}
+
+bool tmpfs_is_shmem(vfs_node_t *node) {
+    return node && node->read == tmpfs_read && node->device;
+}
+uint64_t tmpfs_fault_page(vfs_node_t *node, uint64_t offset) {
+    if (!tmpfs_is_shmem(node) || offset >= node->length || offset > UINT32_MAX)
+        return 0;
+    tmpfs_file_t *file = node->device;
+    uint32_t index = offset / PAGE_SIZE;
+    if (!tmpfs_get_or_alloc_page(file, index)) return 0;
+    /* Truncate may have removed the new page before we reacquire the lock. */
+    spinlock_acquire(&file->lock);
+    tmpfs_page_t *page = tmpfs_get_page(file, index);
+    uint64_t phys = page && offset < node->length ? page->phys : 0;
+    if (phys) pmm_incref((void *)phys);
+    spinlock_release(&file->lock);
+    return phys;
 }
 
 static int tmpfs_truncate(vfs_node_t *node, uint32_t new_len) {
@@ -471,12 +454,9 @@ static int tmpfs_truncate(vfs_node_t *node, uint32_t new_len) {
     }
 
     if (new_len > old_len) {
+        /* Growing the logical file creates holes. Allocate individual frames
+         * on writes/mapping, rather than exhausting RAM during ftruncate. */
         uint32_t first_new_page = old_len / PAGE_SIZE;
-        uint32_t last_new_page  = (new_len - 1) / PAGE_SIZE;
-        for (uint32_t i = first_new_page; i <= last_new_page; i++) {
-            if (!tmpfs_get_or_alloc_page(file, i))
-                return -12; // ENOMEM: -1 would surface as EPERM in userspace
-        }
         uint32_t zero_start = old_len % PAGE_SIZE;
         if (zero_start != 0) {
             spinlock_acquire(&file->lock);
@@ -662,6 +642,28 @@ static int tmpfs_chown(vfs_node_t *node, uint32_t uid, uint32_t gid) {
     node->uid = uid;
     node->gid = gid;
     return 0;
+}
+
+static vfs_node_t *tmpfs_make_node(tmpfs_sb_t *, const char *, uint16_t, uint32_t);
+
+/* Anonymous shmem shares the page-backed storage implementation, without
+ * a directory entry or mount lifetime. Its mappings pin the vnode normally. */
+static tmpfs_sb_t memfd_sb = {
+    .max_bytes = UINT64_MAX, .max_inodes = UINT32_MAX,
+    .lock = SPINLOCK_INIT
+};
+static void tmpfs_destroy_memfd(vfs_node_t *node) {
+    tmpfs_destroy_node(node);
+    tmpfs_free_inode(&memfd_sb);
+}
+vfs_node_t *tmpfs_create_memfd(const char *name) {
+    vfs_node_t *node = tmpfs_make_node(&memfd_sb, name, 0600, FS_FILE);
+    if (!node) return NULL;
+    node->flags = FS_FILE | FS_AUTODESTROY;
+    node->destroy = tmpfs_destroy_memfd;
+    node->mmap_shared_only = false;
+    node->mmap_private_pmm_refs = true;
+    return node;
 }
 
 static int tmpfs_create(vfs_node_t *node, char *name, uint16_t permission);

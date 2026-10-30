@@ -15,6 +15,11 @@
 
 #define DRM_MAJOR 226
 
+/* i386 mmap2 has a 32-bit page offset, hence a 44-bit byte offset. */
+#define DRM_GEM_MMAP_TAG (1ULL << 60)
+#define DRM_GEM_MMAP_COMPAT_TAG (1ULL << 43)
+uint64_t ascentdrm_gem_mmap_offset(uint64_t phys);
+
 // KMS Object types
 #define DRM_MODE_OBJECT_CRTC 0xcccccccc
 #define DRM_MODE_OBJECT_PLANE 0xeeeeeeee

@@ -429,10 +429,6 @@ static uint64_t sys_recvfrom(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
     return (uint64_t)-14; // EFAULT
   }
 
-  if (len == 0) {
-    return 0;
-  }
-
   // Get socket from FD
   socket_t *sock __attribute__((cleanup(socket_release_fd))) =
       socket_from_fd(fd);
@@ -474,12 +470,63 @@ static uint64_t sys_recvfrom(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
 
 // Structures for recvmsg/sendmsg
 
+struct compat_msghdr {
+  uint32_t name, namelen, iov, iovlen, control, controllen, flags;
+};
+_Static_assert(sizeof(struct compat_msghdr) == 28, "i386 msghdr ABI");
+
+static uint64_t compat_socket_msg(int fd, uint64_t pointer, int flags, bool receive) {
+  struct compat_msghdr narrow;
+  if (copy_from_user(&narrow, (void *)pointer, sizeof(narrow))) return (uint64_t)-14;
+  if (narrow.iovlen > 1024) return (uint64_t)-90;
+  socket_t *sock __attribute__((cleanup(socket_release_fd))) = socket_from_fd(fd);
+  if (!sock) return socket_eno_notsock(fd);
+  if (sock->closing) return (uint64_t)-9;
+  if ((receive && (!sock->ops || !sock->ops->recvmsg)) ||
+      (!receive && (!sock->ops || !sock->ops->sendmsg))) return (uint64_t)-95;
+  struct iovec *iov = narrow.iovlen ? kmalloc(narrow.iovlen * sizeof(*iov)) : NULL;
+  if (narrow.iovlen && !iov) return (uint64_t)-12;
+  int error = 0;
+  for (size_t i = 0; i < narrow.iovlen; i++) {
+    struct { uint32_t base, size; } v;
+    uint64_t address = (uint64_t)narrow.iov + i * sizeof(v);
+    if (address + sizeof(v) > 0x100000000ULL ||
+        copy_from_user(&v, (void *)address, sizeof(v))) { error = -14; break; }
+    if (v.size && !vmm_is_user_addr_range_valid(v.base, v.size)) { error = -14; break; }
+    iov[i] = (struct iovec){ .iov_base=(void *)(uintptr_t)v.base, .iov_len=v.size };
+  }
+  if (!error && ((narrow.name && narrow.namelen &&
+      !vmm_is_user_addr_range_valid(narrow.name, narrow.namelen)) ||
+      (narrow.controllen && (!narrow.control ||
+      !vmm_is_user_addr_range_valid(narrow.control, narrow.controllen))))) error = -14;
+  if (error) { if (iov) kfree(iov); return (uint64_t)(int64_t)error; }
+  struct msghdr msg = {
+    .msg_name=(void *)(uintptr_t)narrow.name, .msg_namelen=narrow.namelen,
+    .msg_iov=iov, .msg_iovlen=narrow.iovlen,
+    .msg_control=(void *)(uintptr_t)narrow.control, .msg_controllen=narrow.controllen
+  };
+  ssize_t result = receive ? sock->ops->recvmsg(sock, &msg, flags)
+                           : sock->ops->sendmsg(sock, &msg, flags);
+  if (iov) kfree(iov);
+  if (receive && result >= 0) {
+    uint32_t length = msg.msg_namelen, control = msg.msg_controllen, output_flags = msg.msg_flags;
+    if (copy_to_user((void *)(pointer + 4), &length, 4) ||
+        copy_to_user((void *)(pointer + 20), &control, 4) ||
+        copy_to_user((void *)(pointer + 24), &output_flags, 4)) return (uint64_t)-14;
+  }
+  return (uint64_t)result;
+}
+
 // Syscall: sendmsg(int sockfd, struct msghdr *msg, int flags)
 static uint64_t sys_sendmsg(uint64_t sockfd, uint64_t msg_ptr, uint64_t flags,
                             uint64_t _arg3, uint64_t _arg4, uint64_t _arg5) {
   (void)_arg3;
   (void)_arg4;
   (void)_arg5;
+
+  struct thread *caller = sched_get_current();
+  if (caller && caller->seccomp_compat_dispatch)
+    return compat_socket_msg((int)sockfd, msg_ptr, (int)flags, false);
 
   int fd = (int)sockfd;
 
@@ -564,6 +611,10 @@ static uint64_t sys_recvmsg(uint64_t sockfd, uint64_t msg_ptr, uint64_t flags,
   (void)_arg3;
   (void)_arg4;
   (void)_arg5;
+
+  struct thread *caller = sched_get_current();
+  if (caller && caller->seccomp_compat_dispatch)
+    return compat_socket_msg((int)sockfd, msg_ptr, (int)flags, true);
 
   int fd = (int)sockfd;
 
@@ -787,10 +838,19 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
   if (!sock)
   return socket_eno_notsock(fd);
 
-  if (!is_user_ptr(optval_ptr) || !is_user_ptr(optlen_ptr))
+  if (!is_user_ptr(optlen_ptr))
   return (uint64_t)-14;
 
   int *optlen = (int *)optlen_ptr;
+  if (!is_user_ptr(optval_ptr) && !(optval_ptr == 0 && *optlen == 0))
+    return (uint64_t)-14;
+
+  /* Netlink membership enumeration first queries the required buffer size
+   * with a NULL value and zero length. Let the family implement that ABI. */
+  if (sock->domain == AF_NETLINK && (int)level == SOL_NETLINK &&
+      (int)optname == NETLINK_LIST_MEMBERSHIPS && sock->ops && sock->ops->getsockopt)
+    return (uint64_t)sock->ops->getsockopt(sock, (int)level, (int)optname,
+                                         (void *)optval_ptr, optlen);
 
   // Validate optlen
   if (*optlen < (int)sizeof(int)) {

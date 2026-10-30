@@ -25,6 +25,8 @@ prefix = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#define kmalloc malloc
+#define kfree free
 #include "kernel/src/lib/tsc.h"
 int avory_snprintf(char *, size_t, const char *, ...);
 #define snprintf avory_snprintf

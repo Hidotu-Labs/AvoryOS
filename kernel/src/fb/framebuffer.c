@@ -5,6 +5,7 @@
 #include "../console/klog.h"
 #include "../drivers/input/keyboard.h"
 #include "../fs/devfs.h"
+#include "../fs/mount_namespace.h"
 #include "../fs/ramfs.h"
 #include "../fs/vfs.h"
 #include "../lib/string.h"
@@ -41,6 +42,12 @@ static uint32_t console_dev_read(struct vfs_node *node, uint32_t offset, uint32_
     (void)offset;
     if (!buffer || !size)
         return 0;
+
+    /* Prompts and the last newline may still be in the deferred backbuffer.
+     * Present them before waiting for input, without depending on a later
+     * key/mouse event to trigger another console write. */
+    if (fb_get_kd_mode() == KD_TEXT)
+        console_flush_pending_swap();
 
     bool canonical = (console_termios.c_lflag & 0x00000002) != 0; // ICANON
     bool echo = (console_termios.c_lflag & 0x00000008) != 0;      // ECHO
@@ -309,6 +316,11 @@ void fb_register_device_node(const char *name, vfs_node_t *node) {
     spinlock_release(&fb_registry_lock);
 
     devfs_register_node(name, node);
+}
+
+bool fb_is_console_node(struct vfs_node *node) {
+    node = vfs_backing_node(node);
+    return node && node->ioctl == console_dev_ioctl;
 }
 
 vfs_node_t *fb_lookup_device(const char *name) {

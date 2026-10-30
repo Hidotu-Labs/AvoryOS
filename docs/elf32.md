@@ -27,9 +27,22 @@ converted from pages to bytes, signed PIDs/offsets/timeouts are sign-extended,
 and pread/pwrite offsets are assembled from their two 32-bit words. The number
 mapping follows Linux's `arch/x86/entry/syscalls/syscall_32.tbl`.
 
-This is initial compatibility support, not a complete Linux i386 ABI. TLS
-user_desc/set_thread_area, custom i386 signal frames, stat/stat64 conversion,
-socketcall, iovec conversion, time32 structures and SYSENTER are not implemented.
+The mmap2 page offset retains all 32 bits, allowing 44-bit byte offsets.
+Native GEM and virgl buffer-map ioctls return i386-compatible opaque tokens
+with their marker at bit 43. The native 64-bit token format remains unchanged.
+This lets 32-bit Mesa map vertex buffers; a bit-60 token is rejected by
+i386 glibc's mmap64 before a syscall is issued.
+
+Custom i386 handlers use Linux's legacy or SA_SIGINFO frame layout, including
+the 32-bit ucontext, signal mask, TLS selectors and x87/SSE state. Both
+sigreturn (119) and rt_sigreturn (173) restore the interrupted i386 context.
+Fallback restorers execute from a read-only shared page above the user stack;
+the stack does not need execute permission. sigaltstack translates the 12-byte
+i386 stack structure. Interrupted compat syscalls currently return EINTR
+rather than replaying int 0x80 for SA_RESTART.
+
+This remains partial Linux i386 compatibility. Several time32 structures and
+SYSENTER are not implemented.
 Unsupported calls return ENOSYS with a limited `[COMPAT32]` diagnostic. In
 particular, enabling ELF32 parsing does not install an i386 Unix Wine runtime,
 and running an older 32-bit glibc/Wine build still needs the remaining ABI work.
@@ -38,6 +51,8 @@ and running an older 32-bit glibc/Wine build still needs the remaining ABI work.
 
 ```
 python3 scripts/tests/test_elf_loader_placement.py
+python3 scripts/tests/test_compat_signal_boot.py
+python3 scripts/tests/test_compat_drm_mmap_boot.py
 python3 scripts/tests/test_elf32_abi.py
 python3 scripts/tests/test_mmap_fixed_reservations.py
 make userland/test_elf32.elf

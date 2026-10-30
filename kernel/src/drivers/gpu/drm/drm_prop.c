@@ -361,6 +361,33 @@ static void drm_fill_atomic_vblank_event(struct drm_event_vblank *ev,
  * Apply a single (object, property, value) triple.
  * Returns 0 on success, -1 on unknown object/property.
  */
+/* A compositor may hand its cursor buffer (<= 64x64) to the primary plane
+ * while it probes for or falls back from a hardware cursor, together with
+ * the matching SRC_*, CRTC_* rectangle.  Presented as scanout, that tiny
+ * buffer shrinks the display to cursor size, and an idle compositor never
+ * repaints to undo it.  No real mode is that small, so such an update is
+ * dropped whole: the primary plane keeps its current state. */
+static bool drm_atomic_cursor_on_primary(struct drm_device *dev,
+                                         struct drm_mode_object *mobj,
+                                         const uint32_t *prop_ids,
+                                         const uint64_t *prop_vals,
+                                         uint32_t count) {
+  if (mobj->type != DRM_MODE_OBJECT_PLANE ||
+      drm_plane_type((struct drm_plane *)mobj) != DRM_PLANE_TYPE_PRIMARY)
+    return false;
+  for (uint32_t j = 0; j < count; j++) {
+    if (prop_ids[j] != DRM_PROP_ID_FB_ID || !prop_vals[j])
+      continue;
+    struct drm_mode_object *fbobj;
+    list_for_each_entry(fbobj, &dev->kms_objects, list) {
+      if (fbobj->type == DRM_MODE_OBJECT_FB && fbobj->id == (uint32_t)prop_vals[j])
+        return ((struct drm_framebuffer *)fbobj)->width <= 64 &&
+               ((struct drm_framebuffer *)fbobj)->height <= 64;
+    }
+  }
+  return false;
+}
+
 int ascentdrm_atomic_apply_prop(struct drm_device *dev,
                              struct drm_mode_object *obj, uint32_t prop_id,
                              uint64_t value) {
@@ -394,6 +421,16 @@ int ascentdrm_atomic_apply_prop(struct drm_device *dev,
         klog_debug_puts("[DRM] atomic cursor: rejected invalid cursor FB\n");
         return -22;
       }
+
+      /* A compositor may hand its cursor buffer (<= 64x64) to the primary
+       * plane while it probes for or falls back from a hardware cursor.
+       * Presented as scanout, that tiny buffer shrinks the display to
+       * cursor size and the desktop never comes back until the next full
+       * repaint, which an idle compositor does not issue. No real mode is
+       * that small, so keep the existing primary buffer. */
+      if (plane_type == DRM_PLANE_TYPE_PRIMARY && new_fb &&
+          new_fb->width <= 64 && new_fb->height <= 64)
+        break;
 
       plane->fb = new_fb;
 
@@ -654,6 +691,13 @@ int ascentdrm_ioctl_atomic(struct vfs_node *node, struct drm_file *file,
       klog_debug_uint64(obj_id);
       klog_debug_puts("\n");
       return -1;
+    }
+
+    if (!test_only &&
+        drm_atomic_cursor_on_primary(dev, mobj, prop_ids + prop_offset,
+                                     prop_vals + prop_offset, num_props)) {
+      prop_offset += num_props;
+      continue;
     }
 
     for (uint32_t j = 0; j < num_props; j++) {

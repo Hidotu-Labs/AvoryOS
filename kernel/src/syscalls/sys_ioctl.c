@@ -272,21 +272,39 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
         return res;
     }
 
+  /* Only console devices may use the global termios fallback. PTYs handled
+   * these requests above. Reporting success for pipes or ordinary files
+   * makes isatty() lie; PAM's unix_chkpwd then rejects its password pipe and
+   * sleeps ten seconds as protection against interactive misuse. */
+  switch ((uint32_t)request) {
+  case TCGETS:
+  case TCGETS2:
+  case TCSETS:
+  case TCSETSW:
+  case TCSETSF:
+  case TCSETS2:
+  case TCSETSW2:
+  case TCSETSF2:
+    if (!fb_is_console_node(node))
+      return (uint64_t)-25; // ENOTTY
+    break;
+  }
+
   uint64_t ret = 0;
   switch ((uint32_t)request) {
   case 0x82307201: // VFAT_IOCTL_READDIR_BOTH
   case 0x82307202: { // VFAT_IOCTL_READDIR_SHORT
     struct fat32_ioctl_dirent entries[2];
-    if (t->fd_offsets[fd] > UINT32_MAX)
+    if (fd_offset_get(t, fd) > UINT32_MAX)
       return (uint64_t)-22;
-    int result = fat32_read_aliases(node, (uint32_t)t->fd_offsets[fd],
+    int result = fat32_read_aliases(node, (uint32_t)fd_offset_get(t, fd),
                                     (uint32_t)request == 0x82307202, entries);
     if (result < 0)
       return (uint64_t)result;
     if (!arg || copy_to_user((void *)arg, entries, sizeof(entries)))
       return (uint64_t)-14;
     if (result > 0)
-      t->fd_offsets[fd]++;
+      fd_offset_set(t, fd, fd_offset_get(t, fd) + 1);
     return (uint64_t)result;
   }
   case TIOCGWINSZ: {
@@ -526,7 +544,7 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     }
     int unread = 0;
     if (ioctl_node && (ioctl_node->flags & FS_TYPE_MASK) == FS_FILE) {
-      uint64_t off = FD_IN_RANGE(t, fd) ? t->fd_offsets[fd] : 0;
+      uint64_t off = FD_IN_RANGE(t, fd) ? fd_offset_get(t, fd) : 0;
       uint64_t len = ioctl_node->length;
       if (len > off) {
         unread = (int)(len - off);

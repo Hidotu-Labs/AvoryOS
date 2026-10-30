@@ -18,11 +18,13 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.tree = self.base / 'root'
-        for directory in ('usr/lib', 'opt/avory-glibc/lib', 'lib', 'lib64'):
+        for directory in ('usr/lib', 'usr/lib32', 'opt/avory-glibc/lib', 'lib', 'lib64'):
             (self.tree / directory).mkdir(parents=True, exist_ok=True)
         for name in ('libc.so.6', 'libm.so.6', 'ld-linux-x86-64.so.2'):
             (self.tree / 'opt/avory-glibc/lib' / name).write_bytes(b'guest runtime\0' + name.encode())
             (self.tree / 'usr/lib' / name).symlink_to('/opt/avory-glibc/lib/' + name)
+        (self.tree / 'usr/lib32/ld-linux.so.2').write_bytes(b'i686 runtime loader')
+        (self.tree / 'usr/lib/ld-linux.so.2').symlink_to('../lib32/ld-linux.so.2')
         # Exercise a block-backed (not fast) absolute symlink as well.
         long_dir = 'opt/' + 'private-' * 12
         (self.tree / long_dir).mkdir()
@@ -42,6 +44,7 @@ class RuntimeTests(unittest.TestCase):
     def test_copy_and_verify_compat(self):
         self.reader.copy_compat()
         self.reader.verify('/lib64/libc.so.6', '/usr/lib/libc.so.6')
+        self.reader.verify('/lib/ld-linux.so.2', '/usr/lib/ld-linux.so.2')
 
     def test_mismatch_rejected(self):
         (self.tree / 'opt/avory-glibc/lib/libc.so.6').write_bytes(b'different runtime')

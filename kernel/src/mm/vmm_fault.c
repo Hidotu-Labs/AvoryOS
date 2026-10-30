@@ -1,9 +1,11 @@
+#include "../fs/tmpfs.h"
 #include "mm/zram.h"
 
 #include "../apic/lapic_timer.h"
 #include "../arch/x86_64/extable.h"
 #include "../console/klog.h"
 #include "../cpu/kpf_dump.h"
+#include "../cpu/msr.h"
 #include "../fs/vfs.h"
 #include "../hal/hal.h"
 #include "../lib/string.h"
@@ -20,6 +22,8 @@
 #include "shm.h"
 #include <stddef.h>
 #include <stdint.h>
+
+static void pf_shmem_put(vfs_node_t **node) { if (*node) vfs_close(*node); }
 
 #ifndef PROT_NONE
 #define PROT_NONE 0x0
@@ -261,7 +265,7 @@ static void vmm_map_cow_cluster(uint64_t *pml4, uint64_t cr2,
   for (uint32_t i = 0; i < batch_count; i++) {
     struct vma *nv = vma_find(&mm->vmas, batch[i].vpage);
     uint64_t nv_file_size =
-        nv ? ((nv->file_size > 0) ? nv->file_size : (nv->end - nv->start)) : 0;
+        nv ? ((nv->file_size > 0 || (nv->flags & MAP_ELF_LOAD)) ? nv->file_size : (nv->end - nv->start)) : 0;
     bool ok = nv && (nv->flags & MAP_PRIVATE) && (nv->prot & PROT_READ) &&
               batch[i].vpage >= nv->start &&
               batch[i].vpage + PAGE_SIZE <= nv->end &&
@@ -294,6 +298,31 @@ static void vmm_map_cow_cluster(uint64_t *pml4, uint64_t cr2,
  *
  * Implemented in vmm_fault_check.c.
  */
+
+/* Transparent huge pages. "madvise" (default) only backs VMAs that asked for
+ * them (MAP_HUGETLB / MADV_HUGEPAGE). "always" also backs large anonymous
+ * private VMAs on a write fault; read faults keep using the shared zero page
+ * so an untouched mapping never costs 2 MB. Stacks and MADV_NOHUGEPAGE VMAs
+ * are excluded. fork still deep-copies huge pages, so "always" trades fork
+ * latency of big processes for fewer TLB misses and page faults. */
+static int thp_mode = THP_MODE_MADVISE;
+
+int vmm_thp_mode(void) { return __atomic_load_n(&thp_mode, __ATOMIC_RELAXED); }
+
+void vmm_set_thp_mode(int mode) {
+  if (mode == THP_MODE_MADVISE || mode == THP_MODE_ALWAYS)
+    __atomic_store_n(&thp_mode, mode, __ATOMIC_RELAXED);
+}
+
+static inline bool vma_wants_huge(uint64_t flags, bool write_fault) {
+  if (!(flags & MAP_ANONYMOUS))
+    return false;
+  if (flags & MAP_HUGEPAGE)
+    return true;
+  return vmm_thp_mode() == THP_MODE_ALWAYS && write_fault &&
+         (flags & MAP_PRIVATE) &&
+         !(flags & (MAP_NOHUGEPAGE | MAP_STACK | MAP_GROWSDOWN | MAP_SYSV_SHM));
+}
 
 int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
                           struct registers *regs) {
@@ -639,6 +668,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
   uint64_t vma_file_size = 0;
   uint64_t vma_start = 0;
   uint64_t vma_end = 0;
+  vfs_node_t *shmem_pin __attribute__((cleanup(pf_shmem_put))) = NULL;
   void *vma_file_node = NULL;
   void *vma_linux = NULL;
   int vma_numa_policy = 0;
@@ -654,6 +684,10 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     vma_start = vma->start;
     vma_end = vma->end;
     vma_file_node = vma->file_node;
+    if (tmpfs_is_shmem((vfs_node_t *)vma_file_node)) {
+      shmem_pin = vma_file_node;
+      vfs_node_ref(shmem_pin);
+    }
     vma_numa_policy = vma->numa_policy;
     vma_numa_nodemask = vma->numa_nodemask;
     vma_numa_preferred_node = vma->numa_preferred_node;
@@ -735,6 +769,33 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
           klog_puts(current->comm);
           klog_puts("' count=");
           klog_uint64(seen);
+          klog_puts("\n");
+          /* Preserve the user register state at the fault. In particular,
+           * null reads inside user code need the base/index registers to
+           * distinguish a bad pointer from a bad syscall or VMM mapping. */
+          klog_puts("[VMM] user fault regs rax="); klog_hex64(regs->rax);
+          klog_puts(" rbx="); klog_hex64(regs->rbx);
+          klog_puts(" rcx="); klog_hex64(regs->rcx);
+          klog_puts(" rdx="); klog_hex64(regs->rdx);
+          klog_puts(" rsi="); klog_hex64(regs->rsi);
+          klog_puts(" rdi="); klog_hex64(regs->rdi);
+          klog_puts(" rbp="); klog_hex64(regs->rbp);
+          klog_puts(" rsp="); klog_hex64(regs->rsp);
+          klog_puts("\n[VMM] user fault regs r8="); klog_hex64(regs->r8);
+          klog_puts(" r9="); klog_hex64(regs->r9);
+          klog_puts(" r10="); klog_hex64(regs->r10);
+          klog_puts(" r11="); klog_hex64(regs->r11);
+          klog_puts(" r12="); klog_hex64(regs->r12);
+          klog_puts(" r13="); klog_hex64(regs->r13);
+          klog_puts(" r14="); klog_hex64(regs->r14);
+          klog_puts(" r15="); klog_hex64(regs->r15);
+          klog_puts("\n[VMM] user TLS fs=");
+          klog_hex64(rdmsr(0xC0000100));
+          klog_puts(" gs=");
+          /* isr_common_stub already executed SWAPGS for this user fault. */
+          klog_hex64(rdmsr(0xC0000102));
+          klog_puts(" tracked_fs="); klog_hex64(current->fs_base);
+          klog_puts(" tracked_gs="); klog_hex64(current->gs_base);
           klog_puts("\n");
         } else if (seen == 9) {
           klog_puts("[VMM] repeated user no-VMA faults suppressed; sampling "
@@ -837,9 +898,45 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
   bool cow_mapping = false;
   bool refault_mapping = false;
   vfs_node_t *node = (vfs_node_t *)vma_file_node;
-  if (node && (node->flags & FS_TYPE_MASK) == FS_FILE) {
+  if (shmem_pin) {
     uint64_t page_offset = (cr2 & ~0xFFFULL) - vma_start;
-    uint64_t eff_file_size = (vma_file_size > 0) ? vma_file_size : (vma_end - vma_start);
+    uint64_t file_offset = vma_offset + page_offset;
+    uint64_t file_bytes = vma_file_size;
+    bool private_tail = (vma_flags & MAP_ELF_LOAD) &&
+                        (vma_flags & 3) == MAP_PRIVATE &&
+                        (page_offset >= file_bytes ||
+                         file_bytes - page_offset < PAGE_SIZE);
+    if (private_tail) {
+      /* ELF p_filesz can end inside a tmpfs storage page, before section
+       * headers or other file contents. The remainder belongs to BSS, not
+       * to the file: copying the whole storage page poisons global pointers.
+       * Pure BSS pages must also work beyond the file's EOF. Never zero the
+       * storage page itself, since other mappings still expose those bytes. */
+      frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask,
+                                 vma_numa_preferred_node, cr2);
+      if (!frame)
+        return PF_REJECT("PMM out of memory for private shmem tail", page_offset, file_bytes);
+      page_zero(PHYS_TO_VIRT((uint64_t)frame));
+      if (page_offset < file_bytes) {
+        void *storage = (void *)tmpfs_fault_page(node, file_offset);
+        if (!storage) {
+          pmm_decref(frame);
+          return PF_REJECT("shmem tail unavailable or past EOF", file_offset, node->length);
+        }
+        memcpy(PHYS_TO_VIRT((uint64_t)frame),
+               PHYS_TO_VIRT((uint64_t)storage), file_bytes - page_offset);
+        pmm_decref(storage);
+      }
+    } else {
+      frame = (void *)tmpfs_fault_page(node, file_offset);
+      if (!frame)
+        return PF_REJECT("shmem page unavailable or past EOF", file_offset, node->length);
+      cow_mapping = (vma_flags & 3) == MAP_PRIVATE;
+    }
+  } else if (node && (node->flags & FS_TYPE_MASK) == FS_FILE) {
+    uint64_t page_offset = (cr2 & ~0xFFFULL) - vma_start;
+    uint64_t eff_file_size = (vma_file_size > 0 || (vma_flags & MAP_ELF_LOAD))
+                                 ? vma_file_size : (vma_end - vma_start);
 
     if (page_offset >= eff_file_size) {
       // 1. Pure BSS page (past eff_file_size) — share the global zero page on
@@ -1060,7 +1157,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
         for (uint32_t bi = 0; bi < batch_count; bi++) {
           struct vma *nv = vma_find(&current->mm->vmas, batch[bi].vpage);
           uint64_t nv_file_size =
-              nv ? ((nv->file_size > 0) ? nv->file_size : (nv->end - nv->start)) : 0;
+              nv ? ((nv->file_size > 0 || (nv->flags & MAP_ELF_LOAD)) ? nv->file_size : (nv->end - nv->start)) : 0;
           uint64_t nv_page_off = (nv && batch[bi].vpage >= nv->start)
                                      ? (batch[bi].vpage - nv->start)
                                      : UINT64_MAX;
@@ -1107,10 +1204,14 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     //   4. PMM can hand us a 2 MB-aligned physical block (order-9 buddy)
     //
     // If any condition fails we fall through to the ordinary 4 KB path.
-    if ((vma_flags & MAP_HUGEPAGE) && (vma_flags & MAP_ANONYMOUS)) {
+    if (vma_wants_huge(vma_flags, write_fault)) {
 #define HUGE_PAGE_SIZE (2ULL * 1024 * 1024)
       uint64_t hp_base = cr2 & ~(HUGE_PAGE_SIZE - 1ULL); // 2 MB-align down
-      if (hp_base >= vma_start && hp_base + HUGE_PAGE_SIZE <= vma_end) {
+      /* Skip the 2 MB allocate+zero when a page table already covers the
+       * range (earlier 4 KB faults, a split): vmm_map_huge_page() would
+       * refuse it and every later fault here would repeat the waste. */
+      if (hp_base >= vma_start && hp_base + HUGE_PAGE_SIZE <= vma_end &&
+          vmm_huge_slot_free((uint64_t *)target_cr3, hp_base)) {
         void *huge_phys = vmm_alloc_huge_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
         if (huge_phys) {
           // Zero the entire 2 MB frame.
@@ -1121,8 +1222,8 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
            * have replaced this range with a file or driver mapping. */
           spinlock_acquire(&current->mm->lock);
           struct vma *w = vma_find(&current->mm->vmas, cr2);
-          bool valid = w && (w->flags & MAP_ANONYMOUS) &&
-                       (w->flags & MAP_HUGEPAGE) && !w->file_node &&
+          bool valid = w && vma_wants_huge(w->flags, write_fault) &&
+                       !w->file_node &&
                        !w->linux_vma && w->prot == vma_prot &&
                        w->flags == vma_flags && hp_base >= w->start &&
                        hp_base + HUGE_PAGE_SIZE <= w->end;
@@ -1443,6 +1544,14 @@ void vmm_init_vsyscall_page(void) {
   if (blob_len > 0xE00)
     blob_len = 0xE00;
   memcpy(v, vdso_blob_start, blob_len);
+
+  /* i386 fallback restorers live on this read-only executable shared page,
+   * never on an executable user stack. Legacy sigreturn pops the signal
+   * argument before entering the kernel; rt_sigreturn does not. */
+  static const uint8_t compat_return[] = {0x58, 0xb8, 119, 0, 0, 0, 0xcd, 0x80};
+  static const uint8_t compat_rt_return[] = {0xb8, 173, 0, 0, 0, 0xcd, 0x80};
+  memcpy(v + 0xF00, compat_return, sizeof(compat_return));
+  memcpy(v + 0xF10, compat_rt_return, sizeof(compat_rt_return));
 
   vmm_update_vdso_data();
 }

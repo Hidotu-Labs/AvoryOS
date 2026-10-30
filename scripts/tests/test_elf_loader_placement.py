@@ -18,6 +18,7 @@ prefix = r'''
 #include <unistd.h>
 #include "kernel/src/sched/elf.h"
 #define MAP_PRIVATE 2
+#define MAP_ELF_LOAD 0x2000000000ULL
 #define TSC_BEGIN(x) ((void)0)
 #define TSC_END(x) ((void)0)
 typedef struct { FILE *stream; uint64_t length; } vfs_node_t;

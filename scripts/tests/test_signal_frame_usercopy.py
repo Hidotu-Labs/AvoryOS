@@ -108,6 +108,13 @@ static void fault(int sig,siginfo_t *info,void *ctx){
   if(e->insn==(uintptr_t)u->uc_mcontext.gregs[REG_RIP]){u->uc_mcontext.gregs[REG_RIP]=e->fixup;recovered++;return;}
  fputs("FAIL: unguarded signal-frame user access\n",stderr);_Exit(90);
 }
+static void signal_compat_deliver(struct registers *r,int sig,struct thread *t,
+ struct k_sigaction *sa,const struct kernel_siginfo *info){
+ (void)r;(void)sig;(void)t;(void)sa;(void)info;assert(0);
+}
+static void ptrace_user_return_stop(struct registers *r){(void)r;}
+static int ptrace_signal_delivery_stop(struct registers *r,int sig,
+ const struct kernel_siginfo *info){(void)r;(void)sig;(void)info;return -1;}
 '''+function('static void fill_signal_context(')+function('static void signal_frame_terminate(')+function('static void signal_deliver_frame(')+r'''
 static struct registers regs;
 static void reset(uint8_t *frame){

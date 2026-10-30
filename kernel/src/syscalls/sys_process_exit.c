@@ -345,18 +345,14 @@ static void robust_handle_death(struct thread *t) {
   // _m_next=__p[4] off 32; pthread_create.c sets off=-28 and processes
   // private/detached lists in userspace, leaving pshared for the kernel).
   // Sanity range below still guards corrupted heads.
-  if (!vmm_is_user_addr_range_valid(head_addr, ROBUST_LIST_HEAD_LEN))
+  size_t width = t->mm && t->mm->compat32 ? 4 : 8;
+  if (!vmm_is_user_addr_range_valid(head_addr, width * 3))
     return;
-  uint64_t head_next = 0;
-  uint64_t futex_offset_u = 0;
-  uint64_t pending = 0;
-  if (copy_from_user(&head_next, (const void *)head_addr, 8) != 0)
-    return;
-  if (copy_from_user(&futex_offset_u, (const void *)(head_addr + 8), 8) != 0)
-    return;
-  if (copy_from_user(&pending, (const void *)(head_addr + 16), 8) != 0)
-    return;
-  int64_t futex_offset = (int64_t)futex_offset_u;
+  uint64_t head_next = 0, futex_offset_u = 0, pending = 0;
+  if (copy_from_user(&head_next, (void *)head_addr, width) ||
+      copy_from_user(&futex_offset_u, (void *)(head_addr + width), width) ||
+      copy_from_user(&pending, (void *)(head_addr + 2 * width), width)) return;
+  int64_t futex_offset = width == 4 ? (int32_t)futex_offset_u : (int64_t)futex_offset_u;
   // Corrupted heads (e.g. UAF) yield wild offsets; Linux offsets are tiny
   // (futex word inside the mutex). Refuse to walk instead of CASing heap.
   if (futex_offset < -32768 || futex_offset > 32768)
@@ -364,16 +360,16 @@ static void robust_handle_death(struct thread *t) {
   uint32_t dying_tid = t->tid;
   // Lock operation in progress at death: handle it first, like Linux.
   if (pending && pending != head_addr &&
-      vmm_is_user_addr_range_valid(pending, 8)) {
+      vmm_is_user_addr_range_valid(pending, width)) {
     uint64_t futex_uaddr = pending + (uint64_t)futex_offset;
     robust_handle_futex_death(futex_uaddr, dying_tid);
   }
   uint64_t entry = head_next;
   for (int i = 0; i < ROBUST_MAX_WALK && entry && entry != head_addr; i++) {
-    if (!vmm_is_user_addr_range_valid(entry, 8))
+    if (!vmm_is_user_addr_range_valid(entry, width))
       break;
     uint64_t next = 0;
-    if (copy_from_user(&next, (const void *)entry, 8) != 0)
+    if (copy_from_user(&next, (const void *)entry, width) != 0)
       break;
     uint64_t futex_uaddr = entry + (uint64_t)futex_offset;
     robust_handle_futex_death(futex_uaddr, dying_tid);
@@ -392,7 +388,7 @@ static uint64_t sys_set_robust_list(uint64_t head, uint64_t len, uint64_t a2,
   if (!current)
     return (uint64_t)-22; // EINVAL
 
-  if (len != ROBUST_LIST_HEAD_LEN)
+  if (len != (current->seccomp_compat_dispatch ? 12 : ROBUST_LIST_HEAD_LEN))
     return (uint64_t)-22; // EINVAL
   if (head && !vmm_is_user_addr_range_valid(head, len))
     return (uint64_t)-14; // EFAULT

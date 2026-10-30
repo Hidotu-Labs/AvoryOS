@@ -892,8 +892,7 @@ static bool futex_pi_owner_gone(uint32_t owner) {
  * (ms).  Returns 0 and stores the remaining time, or a negative -errno. */
 static int futex_pi_timeout_to_ms(const uint64_t *ts, bool realtime,
                                   uint64_t *remaining_ms) {
-  if (!vmm_is_user_addr_range_valid((uint64_t)ts, sizeof(uint64_t) * 2))
-    return -EFAULT;
+  /* ts is the syscall's fault-safe kernel snapshot. */
 
   uint64_t sec = ts[0];
   uint64_t nsec = ts[1];
@@ -1136,6 +1135,28 @@ static uint64_t sys_futex(uint64_t uaddr_val, uint64_t op_val, uint64_t val_arg,
   bool private = (op_val & FUTEX_PRIVATE_FLAG) != 0;
   int op = (int)(op_val & FUTEX_CMD_MASK);
   uint32_t val = (uint32_t)val_arg;
+  /* Only wait/PI-lock operations interpret argument four as a timespec.
+   * Requeue and wake-op use it as a scalar count. Snapshot before locking. */
+  uint64_t timeout[2];
+  bool timed_op = op == FUTEX_WAIT || op == FUTEX_WAIT_BITSET ||
+                  op == FUTEX_WAIT_REQUEUE_PI || op == FUTEX_LOCK_PI ||
+                  op == FUTEX_LOCK_PI2;
+  if (timeout_ptr && timed_op) {
+    struct thread *t = sched_get_current();
+    if (t && t->seccomp_compat_dispatch) {
+      int32_t narrow[2];
+      if (copy_from_user(narrow, (void *)timeout_ptr, sizeof(narrow)))
+        return (uint64_t)-EFAULT;
+      timeout[0] = (uint64_t)(int64_t)narrow[0];
+      timeout[1] = (uint64_t)(int64_t)narrow[1];
+    } else if (copy_from_user(timeout, (void *)timeout_ptr, sizeof(timeout))) {
+      return (uint64_t)-EFAULT;
+    }
+    if ((int64_t)timeout[0] < 0 || timeout[1] >= 1000000000ULL)
+      return (uint64_t)-EINVAL;
+    timeout_ptr = (uint64_t)timeout;
+  }
+
 
   switch (op) {
   case FUTEX_WAIT: {

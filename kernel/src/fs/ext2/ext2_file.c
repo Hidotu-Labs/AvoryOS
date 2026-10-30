@@ -504,6 +504,8 @@ static int ext2_rename_in_transaction(vfs_node_t *node, char *old_name,
     file_type = EXT2_FT_DIR;
   else if (ftype == FS_SYMLINK)
     file_type = EXT2_FT_SYMLINK;
+  else if (ftype == FS_SOCKET)
+    file_type = EXT2_FT_SOCK;
 
   kfree(src_node);
 
@@ -558,7 +560,7 @@ int ext2_rename_cross(vfs_node_t *old_parent, char *old_name,
   if (!source)
     goto out;
   uint32_t type = source->flags & FS_TYPE_MASK;
-  if (type != FS_FILE && type != FS_SYMLINK) {
+  if (type != FS_FILE && type != FS_SYMLINK && type != FS_SOCKET) {
     result = -95;
     goto out;
   }
@@ -568,7 +570,8 @@ int ext2_rename_cross(vfs_node_t *old_parent, char *old_name,
     goto out;
   }
   if (dest && (dest->flags & FS_TYPE_MASK) != FS_FILE &&
-      (dest->flags & FS_TYPE_MASK) != FS_SYMLINK) {
+      (dest->flags & FS_TYPE_MASK) != FS_SYMLINK &&
+      (dest->flags & FS_TYPE_MASK) != FS_SOCKET) {
     result = -95;
     goto out;
   }
@@ -581,7 +584,8 @@ int ext2_rename_cross(vfs_node_t *old_parent, char *old_name,
     result = -5;
     goto out;
   }
-  uint8_t dtype = type == FS_SYMLINK ? EXT2_FT_SYMLINK : EXT2_FT_REG_FILE;
+  uint8_t dtype = type == FS_SYMLINK ? EXT2_FT_SYMLINK :
+                  type == FS_SOCKET ? EXT2_FT_SOCK : EXT2_FT_REG_FILE;
   result = dest ? ext2_replace_dir_entry(mnt, new_parent->inode, new_name,
                                          source->inode, dtype)
                 : ext2_add_dir_entry(mnt, new_parent->inode, source->inode,
@@ -594,8 +598,9 @@ int ext2_rename_cross(vfs_node_t *old_parent, char *old_name,
     /* Preserve the original destination if source removal fails. Rollback
      * can itself fail on device I/O; never report success in either case. */
     if (dest) {
-      uint8_t old_dtype = (dest->flags & FS_TYPE_MASK) == FS_SYMLINK
-                             ? EXT2_FT_SYMLINK : EXT2_FT_REG_FILE;
+      uint32_t dest_type = dest->flags & FS_TYPE_MASK;
+      uint8_t old_dtype = dest_type == FS_SYMLINK ? EXT2_FT_SYMLINK :
+                          dest_type == FS_SOCKET ? EXT2_FT_SOCK : EXT2_FT_REG_FILE;
       ext2_replace_dir_entry(mnt, new_parent->inode, new_name,
                              dest->inode, old_dtype);
     } else {

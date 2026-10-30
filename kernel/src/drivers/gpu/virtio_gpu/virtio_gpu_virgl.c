@@ -397,7 +397,10 @@ static int ioctl_locked(struct drm_file *file, uint32_t request, uint64_t arg) {
         struct drm_gem_object *obj = lookup(file, handle);
         if (!obj) return -2;
         struct virgl_resource *res = resource(obj);
-        if (nr == 0x41 && !p.map.pad) { p.map.offset = obj->phys_addr | 0x1000000000000000ULL; ret = 0; }
+        if (nr == 0x41 && !p.map.pad) {
+            p.map.offset = ascentdrm_gem_mmap_offset(obj->phys_addr);
+            ret = p.map.offset ? 0 : -75;
+        }
         if (nr == 0x45 && res) {
             p.info.res_handle = res->id; p.info.size = obj->size; p.info.blob_mem = 0; ret = 0;
         }

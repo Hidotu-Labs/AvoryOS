@@ -51,6 +51,7 @@ struct vfs_node;
 typedef struct pty_pair {
   void *devpts_instance; /* NULL for the initial /dev/pts instance. */
   uint32_t devpts_uid, devpts_gid;
+  uint16_t devpts_mode;
   int index;            // PTY index
   bool allocated;       // Is this pair in use?
   bool locked;          // Is slave locked (cannot be opened)?

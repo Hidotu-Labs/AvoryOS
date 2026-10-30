@@ -10,6 +10,7 @@
 #include "console/klog.h"
 #include "lib/string.h"
 #include "lock/spinlock.h"
+#include "mm/heap.h"
 
 /* ── Calibration ─────────────────────────────────────────────────────────── */
 
@@ -169,7 +170,15 @@ void tsc_probe_dump(void) {
     /* Snapshot while records are serialized, then drop the lock before any
      * formatting or console I/O. Each caller owns its buffers, so simultaneous
      * dumps cannot overwrite one another or mix counters from different times. */
-    tsc_probe_t probes[TSC_PROBE_MAX];
+    struct dump_buffers {
+        tsc_probe_t probes[TSC_PROBE_MAX];
+        int order[TSC_PROBE_MAX];
+        char report[640 + TSC_PROBE_MAX * 144];
+    } *buffers = kmalloc(sizeof(*buffers));
+    if (!buffers) return;
+    tsc_probe_t *probes = buffers->probes;
+    int *order = buffers->order;
+    char *report = buffers->report;
     spinlock_acquire(&g_probe_lock);
     int count = g_probe_count;
     memcpy(probes, g_probes, (size_t)count * sizeof(*probes));
@@ -177,10 +186,10 @@ void tsc_probe_dump(void) {
     spinlock_release(&g_probe_lock);
     if (count == 0) {
         klog_puts("[TSC] No probes recorded.\n");
+        kfree(buffers);
         return;
     }
 
-    int order[TSC_PROBE_MAX];
     for (int i = 0; i < count; i++)
         order[i] = i;
     sort_by_total(probes, order, count);
@@ -188,8 +197,7 @@ void tsc_probe_dump(void) {
     /* Bounded names plus five 20-digit numbers fit in 144 bytes per row.
      * Keep the whole report in one klog write; never hold a logging lock
      * across formatting, and never emit individual fields or padding bytes. */
-    char report[640 + TSC_PROBE_MAX * 144];
-    size_t used = (size_t)snprintf(report, sizeof(report),
+    size_t used = (size_t)snprintf(report, sizeof(buffers->report),
         "\n[TSC] ===== Execution Time Summary =====\n"
         "[TSC]  MHz: %llu (calibrated)\n"
         "[TSC] -------------------------------------------------------\n"
@@ -203,7 +211,7 @@ void tsc_probe_dump(void) {
         uint64_t total_ns = mhz ? p->total_cycles * 1000ULL / mhz : 0;
         uint64_t min_ns = mhz ? p->min_cycles * 1000ULL / mhz : 0;
         uint64_t max_ns = mhz ? p->max_cycles * 1000ULL / mhz : 0;
-        used += (size_t)snprintf(report + used, sizeof(report) - used,
+        used += (size_t)snprintf(report + used, sizeof(buffers->report) - used,
             "[TSC]  %-24.24s %llu  %llu  %llu  %llu  %llu\n", p->name,
             (unsigned long long)p->count,
             (unsigned long long)total_ns,
@@ -211,7 +219,8 @@ void tsc_probe_dump(void) {
             (unsigned long long)min_ns,
             (unsigned long long)max_ns);
     }
-    snprintf(report + used, sizeof(report) - used,
+    snprintf(report + used, sizeof(buffers->report) - used,
              "[TSC] ========================================\n\n");
     klog_puts(report);
+    kfree(buffers);
 }

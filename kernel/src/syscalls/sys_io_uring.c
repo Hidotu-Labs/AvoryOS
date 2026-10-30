@@ -17,6 +17,7 @@
 // and the complete phase writes CQEs in claim order via a ticket so
 // concurrent enters cannot reorder completions.
 #include "sys_io_shared.h"
+#include "../apic/lapic_timer.h"
 #include "../console/klog.h"
 #include "../fs/ramfs.h"
 #include "../lib/string.h"
@@ -163,12 +164,26 @@ enum {
 
 #define IORING_MAX_ENTRIES 4096
 #define IORING_MAX_IOV 1024
+#define IORING_STACK_BATCH 8
 
 // ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
 
 #define IORING_MAGIC 0x7572696fU // "urio"
+
+// A POLL_ADD that was not ready at submit time. It owns a node reference.
+struct ioring_poll_req {
+  struct ioring_poll_req *next;
+  uint64_t user_data;
+  vfs_node_t *node;
+  int events;
+  int revents;
+};
+
+// CQE result meaning "completes later": no CQE is posted for this SQE yet.
+#define IORING_RES_DEFER INT32_MIN
+#define IORING_POLL_REAP_MS 1
 
 typedef struct {
   uint32_t magic;
@@ -193,6 +208,9 @@ typedef struct {
   uint32_t reg_file_count;
   vfs_node_t *eventfd_node;
   bool rings_disabled;
+  // POLL_ADD requests waiting for readiness (protected by lock).
+  struct ioring_poll_req *polls;
+  uint32_t poll_pending; // queued + currently being re-polled
 } ioring_ctx_t;
 
 static uint32_t ioring_pow2(uint32_t v) {
@@ -251,10 +269,13 @@ static volatile uint32_t *ioring_at(uint64_t base, uint32_t off) {
 // Node ops: poll / mmap / close
 // ---------------------------------------------------------------------------
 
+static void ioring_reap_polls(ioring_ctx_t *ctx);
+
 static int ioring_poll(vfs_node_t *node, int events) {
   ioring_ctx_t *ctx = node ? (ioring_ctx_t *)node->device : NULL;
   if (!ctx || ctx->magic != IORING_MAGIC)
     return 0;
+  ioring_reap_polls(ctx);
   spinlock_acquire(&ctx->lock);
   uint32_t head = __atomic_load_n((uint32_t *)ctx->cq_head, __ATOMIC_ACQUIRE);
   uint32_t tail = __atomic_load_n((uint32_t *)ctx->cq_tail, __ATOMIC_ACQUIRE);
@@ -316,6 +337,12 @@ static void ioring_close(vfs_node_t *node) {
   if (ctx->magic != IORING_MAGIC)
     return;
   wait_queue_wake_all(&ctx->wq);
+  for (struct ioring_poll_req *r = ctx->polls, *next; r; r = next) {
+    next = r->next;
+    vfs_close(r->node);
+    kfree(r);
+  }
+  ctx->polls = NULL;
   for (uint32_t i = 0; i < ctx->reg_file_count; i++)
     if (ctx->reg_files[i])
       vfs_close(ctx->reg_files[i]);
@@ -529,18 +556,176 @@ static int32_t ioring_do_read_write(struct thread *t, ioring_ctx_t *ctx,
                            (uint8_t *)sqe->addr);
 }
 
+// Post one CQE. Caller holds ctx->lock. A full CQ drops the new entry and
+// bumps the overflow counter (Linux behaviour without IORING_FEAT_NODROP).
+static bool ioring_cq_post_locked(ioring_ctx_t *ctx, uint64_t user_data,
+                                  int32_t res) {
+  uint32_t head = __atomic_load_n((uint32_t *)ctx->cq_head, __ATOMIC_ACQUIRE);
+  uint32_t ctail = __atomic_load_n((uint32_t *)ctx->cq_tail, __ATOMIC_RELAXED);
+  if (ctail - head >= ctx->cq_entries) {
+    __atomic_fetch_add((uint32_t *)ctx->cq_overflow, 1, __ATOMIC_RELAXED);
+    return false;
+  }
+  uint32_t slot = ctail & ctx->cq_mask;
+  ctx->cqes[slot].user_data = user_data;
+  ctx->cqes[slot].res = res;
+  ctx->cqes[slot].flags = 0;
+  __atomic_store_n((uint32_t *)ctx->cq_tail, ctail + 1, __ATOMIC_RELEASE);
+  return true;
+}
+
+// Tell waiters, epoll watchers and the registered eventfd that CQEs landed.
+static void ioring_notify(ioring_ctx_t *ctx) {
+  if (__atomic_load_n(&ctx->wq.head, __ATOMIC_RELAXED))
+    wait_queue_wake_all(&ctx->wq);
+  if (ctx->node)
+    epoll_notify_event(ctx->node, POLLIN | POLLRDNORM);
+  if (ctx->eventfd_node) {
+    uint64_t one = 1;
+    vfs_write(ctx->eventfd_node, 0, 8, (uint8_t *)&one);
+  }
+}
+
+// Re-poll every pending POLL_ADD and post a CQE for those now ready. The
+// list is detached while polling because node->poll() may take other locks.
+static void ioring_reap_polls(ioring_ctx_t *ctx) {
+  if (!__atomic_load_n(&ctx->poll_pending, __ATOMIC_RELAXED))
+    return;
+  spinlock_acquire(&ctx->lock);
+  struct ioring_poll_req *list = ctx->polls;
+  ctx->polls = NULL;
+  spinlock_release(&ctx->lock);
+  if (!list)
+    return;
+
+  struct ioring_poll_req *keep = NULL, *done = NULL, *next;
+  for (struct ioring_poll_req *r = list; r; r = next) {
+    next = r->next;
+    int want = r->events | POLLERR | POLLHUP;
+    int rev = r->node->poll ? r->node->poll(r->node, want) : want;
+    r->revents = rev & want;
+    if (r->revents) {
+      r->next = done;
+      done = r;
+    } else {
+      r->next = keep;
+      keep = r;
+    }
+  }
+
+  uint32_t finished = 0;
+  bool posted = false;
+  spinlock_acquire(&ctx->lock);
+  for (struct ioring_poll_req *r = keep; r; r = next) {
+    next = r->next;
+    r->next = ctx->polls;
+    ctx->polls = r;
+  }
+  for (struct ioring_poll_req *r = done; r; r = r->next) {
+    posted |= ioring_cq_post_locked(ctx, r->user_data, r->revents);
+    finished++;
+  }
+  spinlock_release(&ctx->lock);
+
+  for (struct ioring_poll_req *r = done; r; r = next) {
+    next = r->next;
+    vfs_close(r->node);
+    kfree(r);
+  }
+  if (finished)
+    __atomic_fetch_sub(&ctx->poll_pending, finished, __ATOMIC_RELAXED);
+  if (posted)
+    ioring_notify(ctx);
+}
+
+// POLL_ADD: complete now when ready, otherwise park until an enter or ring
+// poll finds the fd ready (IORING_RES_DEFER posts no CQE yet).
 static int32_t ioring_do_poll(struct thread *t, ioring_ctx_t *ctx,
                               const struct io_uring_sqe *sqe) {
-  vfs_node_t *node __attribute__((cleanup(fd_node_put))) =
-      ioring_pin_op_fd(t, ctx, sqe);
+  vfs_node_t *node = ioring_pin_op_fd(t, ctx, sqe);
   if (!node)
     return -9;
-  if (!node->poll)
-    return 0;
   int events = sqe->op_flags & 0xffff;
   if (!events)
     events = POLLIN | POLLERR;
-  return (int32_t)node->poll(node, events);
+  int want = events | POLLERR | POLLHUP;
+  // Nodes without a poll handler (regular files) are always ready.
+  int rev = node->poll ? node->poll(node, want) : events;
+  if (rev & want) {
+    vfs_close(node);
+    return rev & want;
+  }
+  struct ioring_poll_req *req = kmalloc(sizeof(*req));
+  if (!req) {
+    vfs_close(node);
+    return -12;
+  }
+  req->user_data = sqe->user_data;
+  req->node = node;
+  req->events = events;
+  req->revents = 0;
+  spinlock_acquire(&ctx->lock);
+  if (ctx->poll_pending >= IORING_MAX_ENTRIES) {
+    spinlock_release(&ctx->lock);
+    kfree(req);
+    vfs_close(node);
+    return -11; // EAGAIN
+  }
+  req->next = ctx->polls;
+  ctx->polls = req;
+  __atomic_fetch_add(&ctx->poll_pending, 1, __ATOMIC_RELAXED);
+  spinlock_release(&ctx->lock);
+  return IORING_RES_DEFER;
+}
+
+// POLL_REMOVE: addr names the target POLL_ADD by its user_data. The target
+// completes with -ECANCELED; a poll already being reaped yields -ENOENT.
+static int32_t ioring_do_poll_remove(ioring_ctx_t *ctx,
+                                     const struct io_uring_sqe *sqe) {
+  struct ioring_poll_req **pp, *req = NULL;
+  bool posted = false;
+  spinlock_acquire(&ctx->lock);
+  for (pp = &ctx->polls; *pp; pp = &(*pp)->next) {
+    if ((*pp)->user_data == sqe->addr) {
+      req = *pp;
+      *pp = req->next;
+      break;
+    }
+  }
+  if (req)
+    posted = ioring_cq_post_locked(ctx, req->user_data, -125); // ECANCELED
+  spinlock_release(&ctx->lock);
+  if (!req)
+    return -2; // ENOENT
+  vfs_close(req->node);
+  kfree(req);
+  __atomic_fetch_sub(&ctx->poll_pending, 1, __ATOMIC_RELAXED);
+  if (posted)
+    ioring_notify(ctx);
+  return 0;
+}
+
+// min_complete: sleep until the CQ holds min_events entries. With no poll
+// left pending only another submitter could add CQEs, so return rather than
+// hang the caller forever.
+static int ioring_wait_events(struct thread *t, ioring_ctx_t *ctx,
+                              uint32_t min_events) {
+  for (;;) {
+    ioring_reap_polls(ctx);
+    uint32_t ready =
+        __atomic_load_n((uint32_t *)ctx->cq_tail, __ATOMIC_ACQUIRE) -
+        __atomic_load_n((uint32_t *)ctx->cq_head, __ATOMIC_ACQUIRE);
+    if (ready >= min_events ||
+        !__atomic_load_n(&ctx->poll_pending, __ATOMIC_RELAXED))
+      return 0;
+    if (thread_has_pending_signal(t))
+      return -4; // EINTR
+    t->wakeup_ticks = lapic_timer_get_ticks() + IORING_POLL_REAP_MS;
+    t->state = THREAD_BLOCKED;
+    sched_yield();
+    t->state = THREAD_RUNNING;
+    t->wakeup_ticks = 0;
+  }
 }
 
 static int32_t ioring_do_openat(struct thread *t,
@@ -621,7 +806,7 @@ static int32_t ioring_execute(struct thread *t, ioring_ctx_t *ctx,
   case IORING_OP_POLL_ADD:
     return ioring_do_poll(t, ctx, sqe);
   case IORING_OP_POLL_REMOVE:
-    return -2; // ENOENT: nothing stays pending in sync execution
+    return ioring_do_poll_remove(ctx, sqe);
   case IORING_OP_OPENAT:
     return ioring_do_openat(t, sqe);
   case IORING_OP_CLOSE:
@@ -714,6 +899,8 @@ static uint64_t sys_io_uring_setup(uint64_t entries, uint64_t params_ptr,
   }
 
   ctx->magic = IORING_MAGIC;
+  ctx->polls = NULL;
+  ctx->poll_pending = 0;
   spinlock_init(&ctx->lock);
   wait_queue_init(&ctx->wq);
   ctx->sq_entries = sq_entries;
@@ -830,21 +1017,30 @@ static uint64_t sys_io_uring_enter(uint64_t fd, uint64_t to_submit,
     return (uint64_t)-22;
 
   // Claim phase: copy newly submitted SQEs under the lock.
+  // Small batches (the common case) stay on the stack: no kmalloc/kfree pair
+  // per io_uring_enter.
+  struct io_uring_sqe stack_sqes[IORING_STACK_BATCH];
+  int32_t stack_results[IORING_STACK_BATCH];
   struct ioring_batch batch = {0};
   spinlock_acquire(&ctx->lock);
   uint32_t tail = __atomic_load_n((uint32_t *)ctx->sq_tail, __ATOMIC_ACQUIRE);
   uint32_t avail = tail - ctx->khead;
   uint32_t n = avail < to_submit ? avail : (uint32_t)to_submit;
   if (n > 0) {
-    batch.sqes = kmalloc(n * sizeof(struct io_uring_sqe));
-    batch.results = kmalloc(n * sizeof(int32_t));
-    if (!batch.sqes || !batch.results) {
-      if (batch.sqes)
-        kfree(batch.sqes);
-      if (batch.results)
-        kfree(batch.results);
-      spinlock_release(&ctx->lock);
-      return (uint64_t)-12;
+    if (n <= IORING_STACK_BATCH) {
+      batch.sqes = stack_sqes;
+      batch.results = stack_results;
+    } else {
+      batch.sqes = kmalloc(n * sizeof(struct io_uring_sqe));
+      batch.results = kmalloc(n * sizeof(int32_t));
+      if (!batch.sqes || !batch.results) {
+        if (batch.sqes)
+          kfree(batch.sqes);
+        if (batch.results)
+          kfree(batch.results);
+        spinlock_release(&ctx->lock);
+        return (uint64_t)-12;
+      }
     }
     for (uint32_t i = 0; i < n; i++) {
       uint32_t idx = (ctx->khead + i) & ctx->sq_mask;
@@ -884,42 +1080,33 @@ static uint64_t sys_io_uring_enter(uint64_t fd, uint64_t to_submit,
   while (__atomic_load_n(&ctx->seq_complete, __ATOMIC_ACQUIRE) != batch.ticket)
     sched_yield();
   if (n > 0) {
+    bool posted = false;
     spinlock_acquire(&ctx->lock);
     for (uint32_t i = 0; i < n; i++) {
-      uint32_t head =
-          __atomic_load_n((uint32_t *)ctx->cq_head, __ATOMIC_ACQUIRE);
-      uint32_t ctail =
-          __atomic_load_n((uint32_t *)ctx->cq_tail, __ATOMIC_RELAXED);
-      if (ctail - head >= ctx->cq_entries) {
-        // Userspace is not draining: count overflow like Linux
-        // (IORING_FEAT_NODROP is not advertised) and overwrite the
-        // oldest slot.
-        __atomic_fetch_add((uint32_t *)ctx->cq_overflow, 1, __ATOMIC_RELAXED);
-      }
-      uint32_t slot = ctail & ctx->cq_mask;
-      ctx->cqes[slot].user_data = batch.sqes[i].user_data;
-      ctx->cqes[slot].res = batch.results[i];
-      ctx->cqes[slot].flags = 0;
-      __atomic_store_n((uint32_t *)ctx->cq_tail, ctail + 1, __ATOMIC_RELEASE);
+      if (batch.results[i] == IORING_RES_DEFER)
+        continue; // parked POLL_ADD: completes from ioring_reap_polls()
+      posted |= ioring_cq_post_locked(ctx, batch.sqes[i].user_data,
+                                      batch.results[i]);
     }
     spinlock_release(&ctx->lock);
     __atomic_store_n(&ctx->seq_complete, batch.ticket + 1, __ATOMIC_RELEASE);
-    wait_queue_wake_all(&ctx->wq);
-    if (ctx->node)
-      epoll_notify_event(ctx->node, POLLIN | POLLRDNORM);
-    // Signal the registered eventfd, if any.
-    if (ctx->eventfd_node) {
-      uint64_t one = 1;
-      vfs_write(ctx->eventfd_node, 0, 8, (uint8_t *)&one);
+    if (posted)
+      ioring_notify(ctx);
+    if (batch.sqes != stack_sqes) {
+      kfree(batch.sqes);
+      kfree(batch.results);
     }
-    kfree(batch.sqes);
-    kfree(batch.results);
   }
   __atomic_store_n(&ctx->seq_complete, batch.ticket + 1, __ATOMIC_RELEASE);
 
-  // min_complete: everything submitted above already completed
-  // synchronously, so any requested wait is trivially satisfied.
-  (void)min_complete;
+  // Parked POLL_ADDs may have become ready; surface them, then honour
+  // min_complete (IORING_ENTER_GETEVENTS) by sleeping until enough CQEs exist.
+  ioring_reap_polls(ctx);
+  if (flags & IORING_ENTER_GETEVENTS) {
+    int wrc = ioring_wait_events(t, ctx, (uint32_t)min_complete);
+    if (wrc < 0 && n == 0)
+      return (uint64_t)(int64_t)wrc;
+  }
   return n;
 }
 

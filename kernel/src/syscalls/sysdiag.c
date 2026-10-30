@@ -665,6 +665,14 @@ static void sysdiag_capture_error_path(uint64_t num,
   case 198: // lremovexattr
     path_ptr = regs->rdi;
     break;
+  case 82: { // rename: include both names so filesystem limitations are actionable
+    char old_path[96], new_path[96];
+    sysdiag_copy_user_path(regs->rdi, old_path, sizeof(old_path));
+    sysdiag_copy_user_path(regs->rsi, new_path, sizeof(new_path));
+    if (outsz > 1)
+      snprintf(out, outsz, "%s -> %s", old_path, new_path);
+    return;
+  }
   case 257: // openat
   case 262: // newfstatat
   case 269: // faccessat

@@ -45,12 +45,33 @@ struct avory_ifreq64 {
 _Static_assert(sizeof(struct avory_ifconf64) == 16, "Linux x86_64 ifconf ABI");
 _Static_assert(sizeof(struct avory_ifreq64) == 40, "Linux x86_64 ifreq ABI");
 
+static size_t socket_ifreq_size(void) {
+  struct thread *t = sched_get_current();
+  return t && t->seccomp_compat_dispatch ? 32 : 40;
+}
+static int socket_ifconf_read(struct avory_ifconf64 *out, uint64_t arg) {
+  memset(out, 0, sizeof(*out));
+  if (socket_ifreq_size() == 32) {
+    uint32_t narrow[2];
+    if (copy_from_user(narrow, (void *)arg, sizeof(narrow))) return -14;
+    out->length = (int32_t)narrow[0]; out->buffer = narrow[1]; return 0;
+  }
+  return copy_from_user(out, (void *)arg, sizeof(*out)) ? -14 : 0;
+}
+static int socket_ifconf_write(uint64_t arg, const struct avory_ifconf64 *in) {
+  if (socket_ifreq_size() == 32) {
+    uint32_t narrow[2] = {(uint32_t)in->length, (uint32_t)in->buffer};
+    return copy_to_user((void *)arg, narrow, sizeof(narrow)) ? -14 : 0;
+  }
+  return copy_to_user((void *)arg, in, sizeof(*in)) ? -14 : 0;
+}
+
 static int socket_ioctl_ifconf(uint64_t arg) {
-  if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(struct avory_ifconf64)))
+  if (!arg || !vmm_is_user_addr_range_valid(arg, (socket_ifreq_size() == 32 ? 8 : 16)))
     return -14;
 
   struct avory_ifconf64 ifc;
-  if (copy_from_user(&ifc, (const void *)arg, sizeof(ifc)))
+  if (socket_ifconf_read(&ifc, arg))
     return -14;
   if (ifc.length < 0)
     return -22;
@@ -63,15 +84,15 @@ static int socket_ioctl_ifconf(uint64_t arg) {
   /* Linux accepts a NULL buffer as a size query, regardless of ifc_len.
    * getifaddrs/JVM callers may pass a nonzero capacity for this first call. */
   if (!ifc.buffer) {
-    ifc.length = have_ipv4 ? sizeof(struct avory_ifreq64) : 0;
-    return copy_to_user((void *)arg, &ifc, sizeof(ifc)) ? -14 : 0;
+    ifc.length = have_ipv4 ? socket_ifreq_size() : 0;
+    return socket_ifconf_write(arg, &ifc) ? -14 : 0;
   }
-  if (have_ipv4 && ifc.length >= (int32_t)sizeof(struct avory_ifreq64)) {
+  if (have_ipv4 && ifc.length >= (int32_t)socket_ifreq_size()) {
     if (!vmm_is_user_addr_range_valid(
-                           ifc.buffer, sizeof(struct avory_ifreq64)))
+                           ifc.buffer, socket_ifreq_size()))
       return -14;
 
-    struct avory_ifreq64 ifr;
+    struct avory_ifreq64 ifr = {0};
     memset(&ifr, 0, sizeof(ifr));
     size_t name_len = strlen(dev->name);
     if (name_len >= sizeof(ifr.name))
@@ -83,13 +104,13 @@ static int socket_ioctl_ifconf(uint64_t arg) {
     ifr.address_data[3] = (uint8_t)(cfg->address >> 16);
     ifr.address_data[4] = (uint8_t)(cfg->address >> 8);
     ifr.address_data[5] = (uint8_t)cfg->address;
-    if (copy_to_user((void *)ifc.buffer, &ifr, sizeof(ifr)))
+    if (copy_to_user((void *)ifc.buffer, &ifr, socket_ifreq_size()))
       return -14;
-    written = sizeof(ifr);
+    written = socket_ifreq_size();
   }
 
   ifc.length = written;
-  return copy_to_user((void *)arg, &ifc, sizeof(ifc)) ? -14 : 0;
+  return socket_ifconf_write(arg, &ifc) ? -14 : 0;
 }
 
 static bool socket_ifreq_name_is(const char requested[16], const char *actual) {
@@ -105,11 +126,11 @@ static bool socket_ifreq_name_is(const char requested[16], const char *actual) {
 }
 
 static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
-  if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(struct avory_ifreq64)))
+  if (!arg || !vmm_is_user_addr_range_valid(arg, socket_ifreq_size()))
     return -14;
 
-  struct avory_ifreq64 ifr;
-  if (copy_from_user(&ifr, (const void *)arg, sizeof(ifr)) != 0)
+  struct avory_ifreq64 ifr = {0};
+  if (copy_from_user(&ifr, (const void *)arg, socket_ifreq_size()) != 0)
     return -14;
   struct net_device *dev = net_device_default();
   bool loopback = socket_ifreq_name_is(ifr.name, "lo");
@@ -126,7 +147,7 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
       return -19; /* ENODEV */
     memset(ifr.name, 0, sizeof(ifr.name));
     strncpy(ifr.name, name, sizeof(ifr.name) - 1);
-    return copy_to_user((void *)arg, &ifr, sizeof(ifr)) ? -14 : 0;
+    return copy_to_user((void *)arg, &ifr, socket_ifreq_size()) ? -14 : 0;
   }
 
   if (!loopback && (!dev || !dev->registered ||
@@ -175,7 +196,7 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
     return -25;
   }
 
-  return copy_to_user((void *)arg, &ifr, sizeof(ifr)) ? -14 : 0;
+  return copy_to_user((void *)arg, &ifr, socket_ifreq_size()) ? -14 : 0;
 }
 
 // Socket Family Registry
@@ -571,10 +592,12 @@ ssize_t socket_send(socket_t *sock, const void *buf, size_t len, int flags) {
 }
 
 ssize_t socket_recv(socket_t *sock, void *buf, size_t len, int flags) {
-  if (len == 0)
+  /* Netlink MSG_PEEK|MSG_TRUNC uses a zero-byte buffer to query packet
+   * size. Let the family report the queued length without consuming it. */
+  if (len == 0 && (!sock || sock->domain != AF_NETLINK))
     return 0;
 
-  if (!sock || !buf)
+  if (!sock || (!buf && len))
     return -22; // EINVAL
 
   if (sock->net_ns && (sock->domain == AF_INET || sock->domain == AF_INET6)) return -101;
@@ -603,10 +626,12 @@ ssize_t socket_sendto(socket_t *sock, const void *buf, size_t len, int flags,
 
 ssize_t socket_recvfrom(socket_t *sock, void *buf, size_t len, int flags,
                         struct sockaddr *src_addr, int *addrlen) {
-  if (len == 0)
+  /* Netlink MSG_PEEK|MSG_TRUNC uses a zero-byte buffer to query packet
+   * size. Let the family report the queued length without consuming it. */
+  if (len == 0 && (!sock || sock->domain != AF_NETLINK))
     return 0;
 
-  if (!sock || !buf)
+  if (!sock || (!buf && len))
     return -22;
 
   if (sock->net_ns && (sock->domain == AF_INET || sock->domain == AF_INET6)) return -101;
@@ -989,24 +1014,24 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     int ret = -19;
     if (request == 0x8912) {
       struct avory_ifconf64 conf;
-      if (copy_from_user(&conf, (void *)arg, sizeof(conf))) ret = -14;
+      if (socket_ifconf_read(&conf, arg)) ret = -14;
       else {
         if (conf.length < 0) ret = -22;
         else {
           bool configured = sock->net_ns->loopback_address != 0;
           struct avory_ifreq64 loop = {0}; memcpy(loop.name, "lo", 3);
           loop.family = 2; loop.address_data[2] = 127; loop.address_data[5] = 1;
-          if (!conf.buffer) conf.length = configured ? sizeof(loop) : 0;
-          else if (configured && conf.length >= (int)sizeof(loop)) {
-            ret = copy_to_user((void *)conf.buffer, &loop, sizeof(loop)) ? -14 : 0;
-            conf.length = ret ? 0 : sizeof(loop);
+          if (!conf.buffer) conf.length = configured ? socket_ifreq_size() : 0;
+          else if (configured && conf.length >= (int)socket_ifreq_size()) {
+            ret = copy_to_user((void *)conf.buffer, &loop, socket_ifreq_size()) ? -14 : 0;
+            conf.length = ret ? 0 : socket_ifreq_size();
           } else conf.length = 0;
-          if (ret != -14) ret = copy_to_user((void *)arg, &conf, sizeof(conf)) ? -14 : 0;
+          if (ret != -14) ret = socket_ifconf_write(arg, &conf) ? -14 : 0;
         }
       }
     } else {
-      struct avory_ifreq64 req;
-      if (copy_from_user(&req, (void *)arg, sizeof(req))) ret = -14;
+      struct avory_ifreq64 req = {0};
+      if (copy_from_user(&req, (void *)arg, socket_ifreq_size())) ret = -14;
       else if ((request == 0x8910 && req.family == 1 && req.address_data[0] == 0 && req.address_data[1] == 0) ||
                socket_ifreq_name_is(req.name, "lo")) {
         ret = 0;
@@ -1020,7 +1045,7 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
           memset(&req.family, 0, sizeof(req) - 16); req.family = 2;
           req.address_data[2] = 127; req.address_data[5] = 1;
         } else ret = request == 0x8915 ? -99 : -25;
-        if (!ret && copy_to_user((void *)arg, &req, sizeof(req))) ret = -14;
+        if (!ret && copy_to_user((void *)arg, &req, socket_ifreq_size())) ret = -14;
       }
     }
     socket_put(sock); return ret;

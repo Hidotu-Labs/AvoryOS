@@ -32,6 +32,21 @@ static void slave_close(vfs_node_t *n) {
   pty_slave_close(n);
   instance_put(i);
 }
+static int slave_chown(vfs_node_t *n, uint32_t uid, uint32_t gid) {
+  pty_pair_t *p = n->device;
+  spinlock_acquire(&p->lock);
+  p->devpts_uid = n->uid = uid;
+  p->devpts_gid = n->gid = gid;
+  spinlock_release(&p->lock);
+  return 0;
+}
+static int slave_chmod(vfs_node_t *n, uint16_t mode) {
+  pty_pair_t *p = n->device;
+  spinlock_acquire(&p->lock);
+  p->devpts_mode = n->mask = mode & 07777;
+  spinlock_release(&p->lock);
+  return 0;
+}
 static vfs_node_t *master_instance(vfs_node_t *n) {
   struct devpts_instance *i = n->device;
   int index = pty_alloc_pair();
@@ -47,6 +62,7 @@ static vfs_node_t *master_instance(vfs_node_t *n) {
   struct thread *t = sched_get_current();
   p->devpts_uid = t ? t->fsuid : 0;
   p->devpts_gid = t ? t->fsgid : 0;
+  p->devpts_mode = 0620;
   p->devpts_instance = i;
   instance_get(i);
   strcpy(m->name, "ptmx");
@@ -103,7 +119,7 @@ static vfs_node_t *pts_lookup(vfs_node_t *n, char *name) {
   instance_get(i);
   r->device = p;
   r->inode = (136u << 8) | idx;
-  r->mask = 0620;
+  r->mask = p->devpts_mode;
   r->uid = p->devpts_uid;
   r->gid = p->devpts_gid;
   r->read = pty_slave_read;
@@ -111,6 +127,8 @@ static vfs_node_t *pts_lookup(vfs_node_t *n, char *name) {
   r->ioctl = pty_slave_ioctl;
   r->poll = pty_slave_poll;
   r->open = pty_slave_open;
+  r->chown = slave_chown;
+  r->chmod = slave_chmod;
   r->close = slave_close;
   r->mmap = pty_slave_mmap;
   r->wait_queue = p->slave_waitq;

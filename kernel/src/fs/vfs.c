@@ -1232,7 +1232,7 @@ static void vfs_node_reclaim_done(vfs_node_t *node, bool released) {
  * ancestry from a pathname that can disappear while an open directory is
  * still in use. The lock lets rename, lookup, and final reclamation transfer
  * the owned reference without racing a concurrent openat(".."). */
-static void vfs_node_set_parent(vfs_node_t *node, vfs_node_t *parent) {
+void vfs_node_set_parent(vfs_node_t *node, vfs_node_t *parent) {
   if (!node || !parent || node == parent ||
       (node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
     return;
@@ -2069,6 +2069,14 @@ reset_walk:
         vfs_close(next);
         if (!target)
           goto fail;
+        /* A magic link names the target vnode itself, so subsequent `..`
+         * components must follow that vnode's ancestry, not the ancestry of
+         * the directory that contained the magic link. */
+        if ((target->flags & FS_TYPE_MASK) == FS_DIRECTORY) {
+          for (int j = 0; j <= stack_top; j++)
+            vfs_close(parent_stack[j]);
+          stack_top = -1;
+        }
         while (*p == '/')
           p++;
         if (!*p) {

@@ -43,8 +43,9 @@ typedef struct node {
  void *device;struct node *view_backing;uint32_t flags,length;
  uint32_t (*append)(struct node *,uint32_t,uint8_t *,uint32_t *);
 } vfs_node_t;
-struct files {pthread_mutex_t lock;unsigned capacity;vfs_node_t *fds[MAX_FDS];uint64_t fd_offsets[MAX_FDS],fd_flags[MAX_FDS];};
-struct thread {struct files *files;};
+struct fd_path {uint64_t offset;};
+struct files {struct fd_path *fd_paths[MAX_FDS];pthread_mutex_t lock;unsigned capacity;vfs_node_t *fds[MAX_FDS];uint64_t fd_offsets[MAX_FDS],fd_flags[MAX_FDS];};
+struct thread {struct files *files;bool seccomp_compat_dispatch;};
 static _Thread_local struct files table={.lock=PTHREAD_MUTEX_INITIALIZER,.capacity=MAX_FDS};
 static _Thread_local struct thread task;
 static _Thread_local bool user;
@@ -80,6 +81,8 @@ static int ext3_journal_start(ext2_mount_t *m){(void)m;if(fail_start)return -1;a
 static int ext3_journal_stop(ext2_mount_t *m){(void)m;assert(depth==1);depth=0;pthread_mutex_unlock(&transaction);return fail_commit?-1:0;}
 static void vfs_cache_clear(vfs_node_t *n){(void)n;clears++;}
 '''.replace('uint32_t flags,length;', 'uint32_t flags,length,inode;')
+for sig in ['static inline uint64_t fd_offset_get_locked(', 'static inline void fd_offset_set_locked(', 'static inline void fd_offset_add_locked(']:
+    code += extract(ROOT/'kernel/src/sched/sched.h', sig)
 fd = os.environ.get('FD_SOURCE', ROOT/'kernel/src/syscalls/sys_fd.c')
 for sig in ['static vfs_node_t *fd_pin_node(', 'static void fd_advance_offset(', 'static void fd_set_offset(']:
     code += extract(ROOT/'kernel/src/syscalls/sys_fd.c', sig)

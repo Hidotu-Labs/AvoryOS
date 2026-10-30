@@ -141,6 +141,44 @@ static bool clone_alloc_table(uint64_t **table_phys) {
   return true;
 }
 
+/* fork of a private 2 MB mapping: instead of copying 2 MB, split the huge PDE
+ * into a page table of 512 write-protected 4 KB entries in BOTH address spaces
+ * and take one PMM reference per frame. The ordinary 4 KB copy-on-write fault
+ * path then copies a single page on the first write from either side. Both
+ * tables are allocated before anything is modified, so failure leaves the
+ * parent untouched. The caller flushes the parent's TLB context. */
+static bool clone_split_share_huge(uint64_t *src_pde, uint64_t *dst_pde) {
+  uint64_t *parent_pt = pmm_alloc();
+  uint64_t *child_pt = pmm_alloc();
+  if (!parent_pt || !child_pt) {
+    if (parent_pt)
+      pmm_free_page(parent_pt);
+    if (child_pt)
+      pmm_free_page(child_pt);
+    return false;
+  }
+  uint64_t *ppt = (uint64_t *)PHYS_TO_VIRT((uint64_t)parent_pt);
+  uint64_t *cpt = (uint64_t *)PHYS_TO_VIRT((uint64_t)child_pt);
+
+  uint64_t huge = *src_pde & PAGE_MASK;
+  uint64_t attrs = (*src_pde & ~PAGE_MASK & ~PAGE_FLAG_PS) | PAGE_FLAG_PRESENT;
+  if (attrs & PAGE_FLAG_RW)
+    attrs = (attrs & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
+  uint64_t child_attrs = attrs & ~PAGE_FLAG_MLOCKED;
+
+  for (size_t p = 0; p < 512; p++) {
+    uint64_t phys = huge + p * PAGE_SIZE;
+    pmm_incref((void *)phys);
+    ppt[p] = phys | attrs;
+    cpt[p] = phys | child_attrs;
+  }
+
+  uint64_t table_attrs = PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_USER;
+  *src_pde = ((uint64_t)parent_pt & PAGE_MASK) | table_attrs;
+  *dst_pde = ((uint64_t)child_pt & PAGE_MASK) | table_attrs;
+  return true;
+}
+
 static bool clone_table_vma(uint64_t *src_table_phys, int level,
                             size_t start, size_t end,
                             struct vma_list *vmas, uint64_t base_addr,
@@ -175,6 +213,13 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
         struct vma *hv = find_vma_cached(vmas, child_base, vma_cache);
         if (hv && (hv->flags & MAP_SHARED)) {
           new_virt[i] = src_virt[i] & ~PAGE_FLAG_MLOCKED;
+        } else if (pmm_is_managed(src_virt[i] & PAGE_MASK)) {
+          if (!clone_split_share_huge(&src_virt[i], &new_virt[i]))
+            return false;
+          /* The parent's PDE changed from a 2 MB leaf to a table of
+           * read-only entries: count it so the context flush is issued. */
+          if (cow_count)
+            (*cow_count)++;
         } else {
           void *new_huge = pmm_alloc_huge_page();
           if (new_huge) {

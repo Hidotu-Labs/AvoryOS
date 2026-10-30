@@ -128,6 +128,8 @@ void process_jump_usermode(uint64_t rip, uint64_t user_rsp, uint64_t pml4) {
   if (cur) {
     cur->fs_base = 0;
     cur->gs_base = 0;
+    memset(cur->compat_tls, 0, sizeof(cur->compat_tls));
+    cur->compat_fs = cur->compat_gs = 0;
   }
 
   if (cur && cur->mm && cur->mm->compat32) {
@@ -386,7 +388,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
           prot |= 0x4;
 
         if (vma_add(&current_thread->mm->vmas, start_page, end_page, prot,
-                    MAP_PRIVATE, -1, filesz ? vma_offset : 0,
+                    MAP_PRIVATE | MAP_ELF_LOAD, -1, filesz ? vma_offset : 0,
                     filesz ? file : NULL, vma_file_size) < 0) {
           if (phdr_tab) kfree(phdr_tab);
           vfs_close(file);
@@ -468,7 +470,14 @@ bool elf_load(const char *path, uint64_t *pml4, elf_info_t *out_info) {
   if (current_thread && current_thread->mm) {
     vma_add(&current_thread->mm->vmas, stack_bottom, stack_top, 0x3,
             0x22 | MAP_GROWSDOWN, -1, 0, NULL, 0);
-    if (!main_info.compat32)
+    if (main_info.compat32) {
+      uint64_t phys = vmm_get_vsyscall_page_phys();
+      if (!phys || vma_add(&current_thread->mm->vmas, ELF32_SIGRETURN_PAGE,
+              ELF32_SIGRETURN_PAGE + PAGE_SIZE, 0x5,
+              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, NULL, 0) < 0 ||
+          !vmm_map_page(pml4, ELF32_SIGRETURN_PAGE, phys, PAGE_FLAG_USER))
+        return false;
+    } else
       vma_add(&current_thread->mm->vmas, VDSO_USER_BASE,
             VDSO_USER_BASE + PAGE_SIZE, 0x5, MAP_PRIVATE | MAP_ANONYMOUS, -1,
             0, NULL, 0);

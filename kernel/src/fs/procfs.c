@@ -477,6 +477,7 @@ uint32_t procfs_cpuinfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
 
   uint32_t cpu_count = cpu_get_count();
   int pos = 0;
+  uint64_t frequency_khz = tsc_get_freq_khz();
 
   for (uint32_t i = 0; i < cpu_count; i++) {
     uint32_t eax, ebx, ecx, edx;
@@ -531,6 +532,13 @@ uint32_t procfs_cpuinfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
         trimmed++;
       pos += snprintf(buf + pos, 16384 - pos, "model name      : %s\n", trimmed);
     }
+
+    /* Linux applications such as GoldSrc use this field as a fallback
+     * when their userspace TSC timing sample cannot determine a rate. */
+    if (frequency_khz)
+      pos += snprintf(buf + pos, 16384 - pos, "cpu MHz         : %llu.%03llu\n",
+                      (unsigned long long)(frequency_khz / 1000),
+                      (unsigned long long)(frequency_khz % 1000));
 
     uint32_t max_leaf;
     __asm__ volatile("cpuid" : "=a"(max_leaf) : "a"(0));
@@ -3122,6 +3130,23 @@ static int procfs_self_readlink(vfs_node_t *node, char *buf, uint32_t size) {
   return (int)len;
 }
 
+/* Keep /proc/self's normal readlink text for readlink(2), while path lookup
+ * follows directly to the caller's live PID directory. This avoids making
+ * /proc/self/... depend on round-tripping a namespace-visible PID. */
+static vfs_node_t *procfs_self_get_link(vfs_node_t *node) {
+  struct thread *t = sched_get_current();
+  if (!t)
+    return NULL;
+  uint32_t pid = t->tgid ? t->tgid : t->tid;
+  vfs_node_t *target = procfs_get_pid_dir(pid);
+  if (target) {
+    if (node->mount_id)
+      target->mount_id = node->mount_id;
+    vfs_node_set_parent(target, (vfs_node_t *)node->ptr);
+  }
+  return target;
+}
+
 // Custom readdir for /proc
 //
 // Index layout:
@@ -3197,7 +3222,9 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, char *name) {
     strcpy(self_link->name, "self");
     self_link->flags = FS_SYMLINK;
     self_link->mask = 0777;
+    self_link->ptr = node;
     self_link->readlink = procfs_self_readlink;
+    self_link->get_link = procfs_self_get_link;
     return self_link;
   }
   if (strcmp(name, "thread-self") == 0) {
@@ -4241,6 +4268,28 @@ static uint32_t procfs_sys_drop_caches_write(vfs_node_t *node, uint32_t offset,
     return size;
 }
 
+static uint32_t procfs_sys_thp_enabled_read(vfs_node_t *node, uint32_t offset,
+                                            uint32_t size, uint8_t *buffer) {
+    (void)node;
+    const char *val = vmm_thp_mode() == THP_MODE_ALWAYS ? "[always] madvise\n"
+                                                        : "always [madvise]\n";
+    uint32_t len = (uint32_t)strlen(val);
+    if (offset >= len) return 0;
+    if (size > len - offset) size = len - offset;
+    memcpy(buffer, val + offset, size);
+    return size;
+}
+
+static uint32_t procfs_sys_thp_enabled_write(vfs_node_t *node, uint32_t offset,
+                                             uint32_t size, uint8_t *buffer) {
+    (void)node;
+    (void)offset;
+    if (!buffer || size == 0) return 0;
+    if (buffer[0] == 'a') vmm_set_thp_mode(THP_MODE_ALWAYS);
+    else if (buffer[0] == 'm') vmm_set_thp_mode(THP_MODE_MADVISE);
+    return size;
+}
+
 static uint32_t procfs_sys_ksm_run_read(vfs_node_t *node, uint32_t offset,
                                         uint32_t size, uint8_t *buffer) {
     (void)node;
@@ -4419,6 +4468,18 @@ void procfs_sys_init(vfs_node_t *procfs_root) {
             dc_node->read = procfs_sys_drop_caches_read;
             dc_node->write = procfs_sys_drop_caches_write;
             ramfs_mount_node(vm_dir, dc_node);
+        }
+
+        vfs_node_t *thp_node = kmalloc(sizeof(*thp_node));
+        if (thp_node) {
+            procfs_node_init(thp_node);
+            strcpy(thp_node->name, "thp_enabled");
+            thp_node->flags = FS_FILE | FS_PERSISTENT;
+            thp_node->mask = 0644;
+            thp_node->length = 32;
+            thp_node->read = procfs_sys_thp_enabled_read;
+            thp_node->write = procfs_sys_thp_enabled_write;
+            ramfs_mount_node(vm_dir, thp_node);
         }
 
         vfs_node_t *ksm_run_node = kmalloc(sizeof(*ksm_run_node));

@@ -8,11 +8,20 @@
 ebegin() { printf ' * %s ...' "$*"; }
 eend() { if [ "${1:-0}" -eq 0 ] 2>/dev/null; then printf ' [ ok ]\n'; else printf ' [ !! ]\n'; fi; return 0; }
 eskip() { printf ' [ skipped ]\n'; return 0; }
+bus_has_owner() {
+    dbus-send --system --print-reply --reply-timeout=1000 \
+        --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus.NameHasOwner "string:$1" 2>/dev/null |
+        grep -q 'boolean true'
+}
 
 ebegin "Mounting pseudo-filesystems"
 mount -t proc proc /proc 2>/dev/null; rc1=$?
 mount -t sysfs sysfs /sys 2>/dev/null; rc2=$?
+ln -sfn /proc/mounts /etc/mtab
 mount -t devtmpfs dev /dev 2>/dev/null || true
+mkdir -p /dev/pts 2>/dev/null
+mount -t devpts devpts /dev/pts 2>/dev/null || true
 mkdir -p /run /run/lock /run/mount /var/log /tmp /dev/shm 2>/dev/null
 chmod 1777 /tmp /dev/shm 2>/dev/null || true
 mount -t tmpfs -o rw,nosuid,nodev,mode=1777 tmpfs /dev/shm 2>/dev/null || true
@@ -35,19 +44,21 @@ else
     eskip
 fi
 mkdir -p /var/lib/dbus /run/dbus
+chown dbus:dbus /run/dbus 2>/dev/null || true
+chmod 0755 /run/dbus
 [ -e /run/mount/utab ] || : > /run/mount/utab 2>/dev/null || true
 [ -e /var/lib/dbus/machine-id ] || cp -f /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null || true
 command -v dbus-uuidgen >/dev/null 2>&1 && dbus-uuidgen --ensure 2>/dev/null || true
 ebegin "Starting system message bus"
 if command -v dbus-daemon >/dev/null 2>&1 && [ ! -S /run/dbus/system_bus_socket ]; then
-    dbus-daemon --system --fork 2>/dev/null || true
+    dbus-daemon --system --fork >>/var/log/dbus.log 2>&1 || true
 fi
 # Wait for the system bus so dependents (pipewire, logins) do not race it.
 for i in 1 2 3 4 5 6 7 8 9 10; do
-    [ -S /run/dbus/system_bus_socket ] && break
+    bus_has_owner org.freedesktop.DBus && break
     sleep 0.5
 done
-if [ -S /run/dbus/system_bus_socket ]; then eend 0; else eend 1; fi
+if bus_has_owner org.freedesktop.DBus; then eend 0; else eend 1; fi
 # NSS is configured to query systemd-resolved before the DNS-file fallback.
 # The package is installed in the desktop image, but BusyBox init does not
 # activate systemd units or their RuntimeDirectory, so start the daemon and
@@ -57,11 +68,13 @@ ebegin "Starting systemd-resolved"
 RESOLVED_OK=1
 if [ -x /usr/lib/systemd/systemd-resolved ]; then
     mkdir -p /run/systemd/resolve
+    chown systemd-resolve:systemd-resolve /run/systemd/resolve 2>/dev/null || true
+    chmod 0755 /run/systemd/resolve
     if [ ! -S /run/systemd/resolve/io.systemd.Resolve ]; then
         nohup /usr/lib/systemd/systemd-resolved >>/var/log/systemd-resolved.log 2>&1 &
     fi
     for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-        if [ -S /run/systemd/resolve/io.systemd.Resolve ]; then
+        if [ -S /run/systemd/resolve/io.systemd.Resolve ] && bus_has_owner org.freedesktop.resolve1; then
             RESOLVED_OK=0
             break
         fi
@@ -80,7 +93,7 @@ if [ -x /usr/lib/polkit-1/polkitd ] && [ -S /run/dbus/system_bus_socket ]; then
         /usr/lib/polkit-1/polkitd --no-debug >>/var/log/polkit.log 2>&1 &
     fi
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        if pidof polkitd >/dev/null 2>&1; then POLKIT_OK=0; break; fi
+        if bus_has_owner org.freedesktop.PolicyKit1; then POLKIT_OK=0; break; fi
         sleep 0.1
     done
 fi
@@ -199,3 +212,5 @@ else
     eskip
 fi
 echo " * Entering runlevel: default"
+# BusyBox init starts /bin/avory-login on tty1 after this sysinit script exits;
+# /etc/inittab owns respawning the interactive login process.

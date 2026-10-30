@@ -6,6 +6,9 @@
 #include "../cpu/features.h"
 #include "../cpu/fpu.h"
 #include "../cpu/isr.h"
+#include "../cpu/msr.h"
+#include "../hal/hal.h"
+#include "../sched/elf.h"
 #include "../fs/vfs.h"
 #include "../include/arch/uaccess.h"
 #include "../lib/string.h"
@@ -258,6 +261,16 @@ static void fill_signal_context(struct sigframe *frame, int sig,
 }
 
 
+static void
+signal_frame_terminate(struct thread *current);
+#include "sys_signal_compat.h"
+
+struct compat_sigaction {
+  uint32_t handler, flags, restorer;
+  uint64_t mask;
+} __attribute__((packed, aligned(4)));
+_Static_assert(sizeof(struct compat_sigaction) == 20, "i386 sigaction size");
+
 // rt_sigaction: Set or get signal action
 static uint64_t sys_rt_sigaction(uint64_t signum, uint64_t act_ptr,
                                  uint64_t oldact_ptr, uint64_t sigsetsize,
@@ -277,15 +290,28 @@ static uint64_t sys_rt_sigaction(uint64_t signum, uint64_t act_ptr,
    * The uaccess helpers have exception-table fixups for that race and apply
    * the required SMAP access window. */
   struct k_sigaction new_action;
-  if (act_ptr && copy_from_user(&new_action, (const void *)act_ptr,
-                                sizeof(new_action)) != 0)
-    return (uint64_t)-14; // EFAULT
-
+  bool compat = current->seccomp_compat_dispatch;
+  if (act_ptr) {
+    if (compat) {
+      struct compat_sigaction narrow;
+      if (copy_from_user(&narrow, (void *)act_ptr, sizeof(narrow))) return (uint64_t)-14;
+      new_action = (struct k_sigaction){
+        .sa_handler=(void *)(uintptr_t)narrow.handler, .sa_flags=narrow.flags,
+        .sa_restorer=(void *)(uintptr_t)narrow.restorer, .sa_mask=narrow.mask
+      };
+    } else if (copy_from_user(&new_action, (void *)act_ptr, sizeof(new_action)))
+      return (uint64_t)-14;
+  }
   if (oldact_ptr) {
-    struct k_sigaction old_action = current->signal_handlers[idx];
-    if (copy_to_user((void *)oldact_ptr, &old_action,
-                     sizeof(old_action)) != 0)
-      return (uint64_t)-14; // EFAULT
+    struct k_sigaction old = current->signal_handlers[idx];
+    if (compat) {
+      struct compat_sigaction narrow = {
+        .handler=(uintptr_t)old.sa_handler, .flags=old.sa_flags,
+        .restorer=(uintptr_t)old.sa_restorer, .mask=old.sa_mask
+      };
+      if (copy_to_user((void *)oldact_ptr, &narrow, sizeof(narrow))) return (uint64_t)-14;
+    } else if (copy_to_user((void *)oldact_ptr, &old, sizeof(old)))
+      return (uint64_t)-14;
   }
 
   if (act_ptr) {
@@ -850,6 +876,12 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
     return;
   }
 
+  if (regs->cs == 0x1b) {
+    signal_compat_deliver(regs, sig, current, sa,
+                          has_queued_info ? &queued_info : NULL);
+    return;
+  }
+
   // Determine which stack to deliver the signal on
   bool using_altstack = on_sig_stack(current, regs->rsp);
   uint64_t rsp = regs->rsp;
@@ -1245,23 +1277,29 @@ static uint64_t sys_sigaltstack(uint64_t ss_ptr, uint64_t old_ss_ptr,
   if (!current)
     return (uint64_t)-1;
 
+  bool compat = current->seccomp_compat_dispatch;
   // Return the current alternate signal stack to userspace
   if (old_ss_ptr) {
-    if (!vmm_is_user_addr_range_valid(old_ss_ptr, sizeof(stack_t)))
-      return (uint64_t)-14; // EFAULT
-    stack_t *old = (stack_t *)old_ss_ptr;
-    old->ss_sp = current->ss_sp;
-    old->ss_size = current->ss_size;
-    old->ss_flags = current->ss_flags;
+    stack_t old = {.ss_sp=current->ss_sp, .ss_size=current->ss_size,
+                   .ss_flags=current->ss_flags};
+    if (compat) {
+      struct compat_signal_stack narrow = {old.ss_sp, old.ss_flags, old.ss_size};
+      if (copy_to_user((void *)old_ss_ptr, &narrow, sizeof(narrow))) return (uint64_t)-14;
+    } else if (copy_to_user((void *)old_ss_ptr, &old, sizeof(old))) return (uint64_t)-14;
     // If we're currently executing on the alt stack, report SS_ONSTACK
     // We can't easily know for sure here, so check the saved RSP if available
   }
 
   // Set a new alternate signal stack
   if (ss_ptr) {
-    if (!vmm_is_user_addr_range_valid(ss_ptr, sizeof(stack_t)))
-      return (uint64_t)-14; // EFAULT
-    stack_t *ss = (stack_t *)ss_ptr;
+    stack_t staged = {0};
+    if (compat) {
+      struct compat_signal_stack narrow;
+      if (copy_from_user(&narrow, (void *)ss_ptr, sizeof(narrow))) return (uint64_t)-14;
+      staged = (stack_t){.ss_sp=narrow.sp, .ss_flags=narrow.flags, .ss_size=narrow.size};
+      if (staged.ss_sp + staged.ss_size > ELF32_USER_LIMIT) return (uint64_t)-22;
+    } else if (copy_from_user(&staged, (void *)ss_ptr, sizeof(staged))) return (uint64_t)-14;
+    stack_t *ss = &staged;
 
     // Can't change the alt stack while executing on it
     // (We approximate this — a real kernel would check current RSP)

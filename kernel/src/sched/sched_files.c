@@ -143,6 +143,7 @@ bool fd_path_set(struct thread *t, int fd, const char *value) {
     path = kmalloc(sizeof(*path));
     if (!path)
       return false;
+    path->offset = t->files->fd_offsets[fd];
     path->ref_count = 1;
     strncpy(path->value, value, sizeof(path->value) - 1);
     path->value[sizeof(path->value) - 1] = '\0';
@@ -319,7 +320,7 @@ void sched_copy_files(struct thread *child, struct thread *parent) {
 
     vfs_node_ref(node);
     child->files->fds[fd] = node;
-    child->files->fd_offsets[fd] = parent->fd_offsets[fd];
+    child->files->fd_offsets[fd] = fd_offset_get_locked(parent, fd);
     child->files->fd_flags[fd] = parent->fd_flags[fd];
     fd_description_set_locked(child, (int)fd, fd_description_id_locked(parent, (int)fd));
     struct fd_path *path = parent->fd_paths[fd];
@@ -457,7 +458,7 @@ bool sched_get_fd_info_snapshot(uint32_t tid, uint32_t fd, uint64_t *out_pos,
   bool found = node && node != (vfs_node_t *)-1;
   if (found) {
     if (out_pos)
-      *out_pos = t->fd_offsets[fd];
+      *out_pos = fd_offset_get_locked(t, fd);
     if (out_flags)
       *out_flags = t->fd_flags[fd];
     if (out_ino)

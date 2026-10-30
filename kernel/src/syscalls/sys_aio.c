@@ -6,6 +6,7 @@
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
 #include "../fs/ramfs.h"
+#include "../fs/tmpfs.h"
 #include "../fs/vfs.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
@@ -1399,94 +1400,6 @@ static uint64_t sys_inotify_rm_watch(uint64_t fd, uint64_t wd,
 #define MFD_CLOEXEC      0x0001U
 #define MFD_ALLOW_SEALING 0x0002U
 
-static void memfd_close(vfs_node_t *node) {
-    if (!node || !node->device) return;
-
-    ramfs_file_t *file = (ramfs_file_t *)node->device;
-    ramfs_free_file_data(file);
-    kfree(file);
-    node->device = NULL;
-}
-
-static uint64_t memfd_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
-                            uint64_t prot, uint64_t flags, uint64_t offset) {
-    if (!node || !node->device) return (uint64_t)-1;
-    if (!length || (offset & (PAGE_SIZE - 1)) || offset > UINT32_MAX ||
-        length > (UINT32_MAX & ~(uint64_t)(PAGE_SIZE - 1)) - offset)
-        return (uint64_t)-22;
-    bool private_mapping = (flags & 3) == MAP_PRIVATE;
-
-    ramfs_file_t *file = (ramfs_file_t *)node->device;
-    uint64_t hhdm      = pmm_get_hhdm_offset();
-    uint64_t needed    = offset + length;
-
-    if (needed > file->capacity || !file->data || !file->data_is_pmm || ((uint64_t)file->data & 0xFFF)) {
-        uint32_t new_cap = (uint32_t)needed;
-        if (new_cap < 4096) new_cap = 4096;
-        new_cap = (new_cap + 0xFFF) & ~0xFFFU;
-
-        void *phys = pmm_alloc_pages(new_cap / PAGE_SIZE);
-        if (!phys) return (uint64_t)-12;
-        uint8_t *new_data = (uint8_t *)((uint64_t)phys + hhdm);
-        memset(new_data, 0, new_cap);
-        if (file->data && node->length > 0) {
-            uint32_t copy_len = node->length < file->capacity ? node->length : file->capacity;
-            memcpy(new_data, file->data, copy_len);
-            ramfs_free_file_data(file);
-        }
-        file->data     = new_data;
-        file->capacity = new_cap;
-        file->data_is_pmm = 1;
-    }
-
-    if (needed > node->length) {
-        /* Extending an existing memfd mapping grows the logical file without
-         * necessarily reallocating its backing. Clear bytes left by an older
-         * truncation before the mapping makes them visible again. */
-        memset(file->data + node->length, 0, (size_t)needed - node->length);
-        node->length = (uint32_t)needed;
-    }
-
-    struct thread *t = sched_get_current();
-    if (!t) return (uint64_t)-1;
-
-    uint64_t *pml4  = vmm_get_active_pml4();
-    uint64_t vaddr  = addr ? addr : mm_alloc_mmap_region(length);
-    if (vaddr == 0) return (uint64_t)-12;
-
-    uint64_t page_flags = PAGE_FLAG_PRESENT;
-    if (prot) page_flags |= PAGE_FLAG_USER;
-    if (prot & 0x2) page_flags |= PAGE_FLAG_RW;
-    if (!(prot & 0x4)) page_flags |= PAGE_FLAG_NX;
-    /* Private views share the live backing frame until the first write.
-     * Reading through the generic VFS cache creates a detached snapshot:
-     * Wine's session view then misses objects published by wineserver. */
-    if (private_mapping)
-        page_flags = (page_flags & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
-
-    for (uint64_t off = 0; off < length; off += 0x1000) {
-        uint64_t data_off = offset + off;
-        if (data_off >= file->capacity) break;
-        uint64_t kva  = (uint64_t)(file->data + data_off);
-        uint64_t phys = kva - hhdm;
-        /* Every installed PTE owns a reference.  Private PTEs need it because
-         * teardown/CoW releases it; shared PTEs need it because the file's
-         * storage reference only covers the block itself, and memfd growth
-         * reallocates and releases that block while mappings may still be
-         * live.  Re-mapping the same frame at the same address (mremap grow)
-         * already owns a reference and must not take a second one. */
-        if (private_mapping) {
-            pmm_incref((void *)phys);
-        } else if (pmm_is_managed(phys) &&
-                   vmm_virt_to_phys(pml4, vaddr + off) != phys) {
-            pmm_incref((void *)phys);
-        }
-        vmm_map_page(pml4, vaddr + off, phys, page_flags);
-    }
-
-    return vaddr;
-}
-
 static uint64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags_arg,
                                   uint64_t a2, uint64_t a3, uint64_t a4,
                                   uint64_t a5) {
@@ -1506,35 +1419,10 @@ static uint64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags_arg,
         strcpy(node_name, "memfd:(anonymous)");
     }
 
-    vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
+    vfs_node_t *node = tmpfs_create_memfd(node_name);
     if (!node) return (uint64_t)-12;
-    vfs_node_init(node);
-    strncpy(node->name, node_name, 127);
-    node->name[127] = '\0';
-    node->flags  = FS_FILE;
-    node->mask   = 0600;
-    node->length = 0;
-    node->uid    = t->fsuid;
-    node->gid    = t->fsgid;
-
-    ramfs_file_t *rfile = kmalloc(sizeof(ramfs_file_t));
-    if (!rfile) { kfree(node); return (uint64_t)-12; }
-    rfile->data     = NULL;
-    rfile->capacity = 0;
-    rfile->data_is_pmm = 1;
-
-    node->device    = rfile;
-    node->read      = ramfs_read;
-    node->write     = ramfs_write;
-    node->truncate  = ramfs_truncate;
-    node->fallocate = ramfs_fallocate;
-    node->chmod     = ramfs_chmod;
-    node->chown     = ramfs_chown;
-    node->mmap      = memfd_mmap;
-    node->mmap_shared_only = false;
-    node->mmap_private_pmm_refs = true;
-    node->mmap_shared_pmm_refs = true;
-    node->close     = memfd_close;
+    node->uid = t->fsuid;
+    node->gid = t->fsgid;
 
     t->fds[fd]        = node;
     t->fd_offsets[fd] = 0;

@@ -69,7 +69,10 @@ void mm_put(struct mm_struct *mm, uint64_t cr3);
 #define FD_INITIAL_CAPACITY 32
 #define MAX_FDS 1024
 
+/* Per-open metadata, shared by dup and fork. The name and file position
+ * have the same lifetime; independent opens allocate independent objects. */
 struct fd_path {
+  uint64_t offset;
   uint32_t ref_count;
   char value[256];
 };
@@ -143,6 +146,7 @@ struct fd_table {
 #define SA_RESTART 0x10000000
 #define SA_RESTORER 0x04000000
 #define SA_NODEFER 0x40000000
+#define SA_RESETHAND 0x80000000U
 
 struct k_sigaction {
   void (*sa_handler)(int);
@@ -283,6 +287,8 @@ struct thread {
   struct mm_struct *mm;        // Shared memory management state
   uint64_t fs_base;            // User FS_BASE (TLS) — inherited across fork
   uint64_t gs_base;            // User GS_BASE (TLS) — inherited across fork
+  uint64_t compat_tls[3];
+  uint16_t compat_fs, compat_gs;
   uint32_t uid;                // User ID
   uint32_t gid;                // Group ID
   uint32_t euid;               // Effective User ID
@@ -541,6 +547,40 @@ struct sched_thread_snapshot {
   char exe_path[256];
   char cwd_path[256];
 };
+
+/* Caller holds files->lock. Anonymous descriptors without path metadata keep
+ * their existing table-local position (pipes and sockets have no position). */
+static inline uint64_t fd_offset_get_locked(struct thread *t, uint64_t fd) {
+  struct fd_path *description = t->files->fd_paths[fd];
+  return description ? __atomic_load_n(&description->offset, __ATOMIC_RELAXED)
+                     : t->files->fd_offsets[fd];
+}
+static inline void fd_offset_set_locked(struct thread *t, uint64_t fd, uint64_t value) {
+  struct fd_path *description = t->files->fd_paths[fd];
+  if (description)
+    __atomic_store_n(&description->offset, value, __ATOMIC_RELAXED);
+  t->files->fd_offsets[fd] = value;
+}
+static inline void fd_offset_add_locked(struct thread *t, uint64_t fd, uint64_t value) {
+  struct fd_path *description = t->files->fd_paths[fd];
+  if (description)
+    t->files->fd_offsets[fd] = __atomic_add_fetch(&description->offset, value, __ATOMIC_RELAXED);
+  else
+    t->files->fd_offsets[fd] += value;
+}
+
+static inline uint64_t fd_offset_get(struct thread *t, uint64_t fd) {
+  spinlock_acquire(&t->files->lock);
+  uint64_t value = fd < t->files->capacity ? fd_offset_get_locked(t, fd) : 0;
+  spinlock_release(&t->files->lock);
+  return value;
+}
+static inline void fd_offset_set(struct thread *t, uint64_t fd, uint64_t value) {
+  spinlock_acquire(&t->files->lock);
+  if (fd < t->files->capacity)
+    fd_offset_set_locked(t, fd, value);
+  spinlock_release(&t->files->lock);
+}
 
 /* File-table lock held (or private unpublished table); identity is per open. */
 uint64_t fd_description_id_locked(struct thread *t, int fd);

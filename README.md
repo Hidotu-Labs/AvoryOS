@@ -16,6 +16,31 @@ AvoryOS is an open-source hobby operating system for x86_64 PCs. It includes a m
 
 AMDGPU and NVIDIA support is under active development. For stable graphics in QEMU, use the default make run target.
 
+## Boot speed and diagnostics
+
+The default and minimal images boot their first Limine entry immediately
+(`timeout: 0`). Hold a key during boot to access the menu, or set `timeout: 3`
+in `limine.conf` / `limine-minimal.conf` before rebuilding for a visible countdown.
+
+Kernel boot stress tests and benchmarks are opt-in. Add `boot_selftest=1` to
+the kernel command line to run the early memory/CPU tests and LinuxKPI suites
+at their usual initialization stages. For example:
+
+```sh
+make KERNEL_CMDLINE='init=/sbin/init boot_selftest=1 screenlog'
+```
+
+Boot-memory reclamation checks large mappings against reclaimable memory ranges,
+rather than scanning the memory map again for every 4 KiB page. Active mappings
+keep the same page protections.
+
+SATA/AHCI uses direct DMA for word-aligned kernel heap buffers. Startup logs
+report total AHCI and per-disk setup times; engine and IDENTIFY waits are
+bounded, and absent legacy ATA devices exit probing immediately.
+
+Normal boots still initialize all devices and drivers. Individual diagnostic
+options such as `vfs_selftest=1`, `fb_bench=1`, and `rcu_bench=1` remain available.
+
 ## Build
 
 On a Linux host, install the usual build tools and utilities, including Make, a C compiler, NASM, Git, Python 3, `xorriso`, QEMU, and the ext4 and partitioning utilities (`e2fsprogs`, `parted` or `util-linux`).

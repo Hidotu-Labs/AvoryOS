@@ -33,6 +33,7 @@ extern void __kpi_preempt_enable(void);
 #define MAP_PRIVATE 0x02
 #define MAP_FIXED 0x10
 #define MAP_ANONYMOUS 0x20
+#define MAP_32BIT 0x40 /* x86-64: place non-fixed mappings below 2 GiB */
 #define MAP_FIXED_NOREPLACE 0x100000 /* Linux: fail with EEXIST if range busy */
 #define MAP_HUGETLB 0x40000         /* Linux user-space: request huge pages */
 /* Linux user-space pthread stack hint, stored verbatim in vma.flags. */
@@ -480,6 +481,10 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
   if (fixed && fixed_noreplace)
     return E_INVAL;
 
+  bool low_mapping = !mm_compat32() && (flags & MAP_32BIT) &&
+                     !fixed && !fixed_noreplace;
+  uint64_t allocation_limit = low_mapping ? 0x80000000ULL : MMAP_REGION_LIMIT;
+
   if (fixed || fixed_noreplace) {
     if (addr == 0 || (addr & (PAGE_SIZE - 1))) {
       return E_INVAL;
@@ -546,8 +551,8 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
        * holding mm->lock.  File-backed mmap handlers run after that lock is
        * dropped, before their VMA is installed; searching below the high-water
        * mark could hand the same gap to another thread during that window. */
-      uint64_t search_base = MAX(MMAP_REGION_BASE,
-                                 current_thread->mm->mmap_next_addr);
+      uint64_t search_base = low_mapping ? 0x40000000ULL :
+          MAX(MMAP_REGION_BASE, current_thread->mm->mmap_next_addr);
 
       /* Anonymous hints can name any free user range. V8's aligned cages
        * deliberately use addresses below the usual high mmap arena; rejecting
@@ -555,8 +560,8 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
        * file-backed path needs the high-water constraint while its handler
        * runs outside mm->lock. */
       bool anonymous = (flags & MAP_ANONYMOUS) != 0;
-      uint64_t hint_floor = anonymous ? 0x10000ULL : search_base;
-      uint64_t hint_limit = anonymous && !mm_compat32()
+      uint64_t hint_floor = (anonymous || low_mapping) ? 0x10000ULL : search_base;
+      uint64_t hint_limit = low_mapping ? allocation_limit : anonymous && !mm_compat32()
                                 ? USER_ADDR_MAX + 1ULL : MMAP_REGION_LIMIT;
       if (addr != 0 && (addr & (PAGE_SIZE - 1)) == 0 &&
           addr >= hint_floor && addr < hint_limit &&
@@ -568,14 +573,14 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
 
       if (vaddr == 0) {
         vaddr = vma_find_gap(&current_thread->mm->vmas, aligned_len,
-                             search_base, MMAP_REGION_LIMIT);
+                             search_base, allocation_limit);
       }
 
       /* The usual high arena is less than 1 TiB wide. V8 reserves a sandbox
        * plus guard regions larger than that with PROT_NONE; reserve a free
        * lower canonical gap instead. Anonymous VMAs are installed under this
        * lock, so another mapper cannot take the fallback range in between. */
-      if (!vaddr && !mm_compat32() && (flags & MAP_ANONYMOUS)) {
+      if (!vaddr && !low_mapping && !mm_compat32() && (flags & MAP_ANONYMOUS)) {
         uint64_t low_base = MAX(0x100000000ULL,
                                 PAGE_ALIGN_UP(current_thread->mm->brk_current));
         vaddr = vma_find_gap(&current_thread->mm->vmas, aligned_len,
@@ -592,7 +597,7 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
        * placeholder VMA so the range stays reserved while the file-backed
        * handler runs outside mm->lock.  The real VMA replaces the
        * placeholder below; failure paths call mmap_gap_release(). */
-      if (!vaddr && !anonymous) {
+      if (!vaddr && !anonymous && !low_mapping) {
         vaddr = vma_find_gap(&current_thread->mm->vmas, aligned_len,
                              MMAP_REGION_BASE, MMAP_REGION_LIMIT);
         if (vaddr &&
@@ -624,7 +629,17 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
         return vaddr;
       }
 
-      if (vaddr && vaddr + aligned_len <= MMAP_REGION_LIMIT) {
+      /* Low file mappings cannot use the high arena's bump cursor. Hold
+       * their gap while the filesystem handler runs without mm->lock. */
+      if (low_mapping && vaddr && !anonymous) {
+        if (vma_add(&current_thread->mm->vmas, vaddr, vaddr + aligned_len,
+                    PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, NULL, 0) == 0)
+          gap_reserved = true;
+        else
+          vaddr = 0;
+      }
+
+      if (vaddr && vaddr + aligned_len <= allocation_limit) {
         /* A reserved interior gap already fits and must not move the cursor
          * past itself, or the fallback's whole point is lost. */
         if (!gap_reserved)
@@ -644,12 +659,12 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
       spinlock_release(&current_thread->mm->lock);
     }
 
-    if (vaddr == 0) {
+    if (vaddr == 0 && !low_mapping) {
       // Fallback to legacy allocator if AVL gap finding fails or thread context missing
       vaddr = mm_alloc_mmap_region(aligned_len);
     }
 
-    if (vaddr == 0 || vaddr + aligned_len > MMAP_REGION_LIMIT) {
+    if (vaddr == 0 || vaddr + aligned_len > allocation_limit) {
       return E_NOMEM;
     }
   }
@@ -1547,10 +1562,13 @@ static uint64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice,
 
     // Only apply to anonymous private mappings.
     if ((v->flags & MAP_ANONYMOUS) && (v->flags & MAP_PRIVATE)) {
-      if (advice == MADV_HUGEPAGE)
+      if (advice == MADV_HUGEPAGE) {
         v->flags |= MAP_HUGEPAGE;
-      else
+        v->flags &= ~MAP_NOHUGEPAGE;
+      } else {
         v->flags &= ~MAP_HUGEPAGE;
+        v->flags |= MAP_NOHUGEPAGE;
+      }
     }
 
     // Jump to the end of this VMA, clamped to the requested range.

@@ -951,7 +951,6 @@ void sched_reparent_children(struct thread *parent) {
       adopter = adopter->global_next;
   }
 
-  struct thread *to_reap = NULL;
   /* pdeath_signal targets queued under tid_lock, woken after releasing it:
    * waking takes runqueue/wait-queue locks and must never run with tid_lock
    * held (sys_kill hung this way). Stack cap is ample: one entry per child. */
@@ -965,10 +964,12 @@ void sched_reparent_children(struct thread *parent) {
      * its exit status. When reparenting to init (or if adopter is not waiting),
      * reap the dead zombie immediately so orphans do not leak. */
     if (child->state == THREAD_ZOMBIE || child->state == THREAD_DEAD) {
-      child->sibling_next = to_reap;
-      to_reap = child;
+      child->sibling_next = NULL;
       child->parent = NULL;
       child->state = THREAD_DEAD;
+      /* Queue under tid_lock so orphan scans cannot reclaim a child while
+       * it is waiting on an unprotected temporary sibling chain. */
+      sched_queue_reap(child);
       child = next_sibling;
       continue;
     }
@@ -997,12 +998,6 @@ void sched_reparent_children(struct thread *parent) {
   for (uint32_t i = 0; i < pdeath_count; i++)
     signal_notify_thread(pdeath_notify[i], pdeath_sig[i]);
 
-  while (to_reap) {
-    struct thread *victim = to_reap;
-    to_reap = to_reap->sibling_next;
-    victim->sibling_next = NULL;
-    sched_queue_reap(victim);
-  }
 }
 
 int sched_get_mount_snapshot(uint32_t tid, vfs_mount_info_t *mounts, int count) {

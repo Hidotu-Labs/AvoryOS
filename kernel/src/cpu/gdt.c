@@ -12,11 +12,12 @@
 // the two cores then interleave frames on the same stack.  The visible
 // symptom is a wild return (e.g. RIP=0x23, the user SS selector) long after
 // the corrupting interrupt.
-#define GDT_TSS_BASE 6
+#define GDT_TSS_BASE 9
 #define GDT_ENTRIES (GDT_TSS_BASE + 2 * MAX_CPUS)
 
 static struct gdt_entry gdt[GDT_ENTRIES];
-static struct gdt_ptr gp;
+static struct gdt_ptr gp[MAX_CPUS];
+static struct gdt_entry cpu_gdt[MAX_CPUS][GDT_ENTRIES];
 static struct tss_entry tss_table[MAX_CPUS];
 
 /* #DF must run on a stack that is still valid even when the faulting kernel
@@ -75,8 +76,7 @@ void tss_set_rsp0(uint64_t rsp0) {
 }
 
 void gdt_init(void) {
-  gp.limit = sizeof(gdt) - 1;
-  gp.base = (uint64_t)&gdt;
+
 
   // 0: Null descriptor
   gdt_set_gate(0, 0, 0, 0, 0);
@@ -106,12 +106,28 @@ void gdt_init(void) {
                 sizeof(struct tss_entry) - 1);
   }
 
-  gdt_flush((uint64_t)&gp);
+  for (uint32_t i = 0; i < MAX_CPUS; i++) {
+    memcpy(cpu_gdt[i], gdt, sizeof(gdt));
+    gp[i].limit = sizeof(gdt) - 1;
+    gp[i].base = (uint64_t)cpu_gdt[i];
+  }
+  gdt_flush((uint64_t)&gp[0]);
   ltr(tss_selector(0));
 }
 
 void gdt_load_ap(uint32_t cpu_id) {
-  gdt_flush((uint64_t)&gp);
+  if (cpu_id >= MAX_CPUS) return;
+  gdt_flush((uint64_t)&gp[cpu_id]);
   if (cpu_id < MAX_CPUS)
     ltr(tss_selector(cpu_id));
+}
+
+/* Called with interrupts masked: TLS descriptors belong to this CPU's
+ * incoming thread, never to a GDT shared with another CPU. */
+void gdt_set_compat_tls(const uint64_t entries[3]) {
+  uint16_t tr;
+  __asm__ volatile("str %0" : "=r"(tr));
+  unsigned cpu = ((tr >> 3) - GDT_TSS_BASE) / 2;
+  if (cpu >= MAX_CPUS) return;
+  memcpy(&cpu_gdt[cpu][6], entries, 3 * sizeof(uint64_t));
 }

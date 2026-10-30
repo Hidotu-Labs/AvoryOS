@@ -52,6 +52,7 @@ void fb_set_kd_mode(int mode);
 
 /* ── Device Registry & VFS Integration ───────────────────────────────────── */
 struct vfs_node *fb_lookup_device(const char *name);
+bool fb_is_console_node(struct vfs_node *node);
 void fb_register_device_node(const char *name, struct vfs_node *node);
 
 #endif /* FB_FRAMEBUFFER_H */

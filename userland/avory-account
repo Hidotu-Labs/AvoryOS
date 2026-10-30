@@ -30,7 +30,7 @@ useradd)
     [ "$create_home" -eq 1 ] || set -- "$@" -H
     /usr/sbin/adduser "$@" "$name"
     sed -i -E "s/^($name):[^:]*:/\1:!:/" /etc/passwd
-    rm -f /etc/shadow /etc/shadow- /etc/gshadow /etc/gshadow-
+    # Keep existing account credentials when adding a new user.
     if [ "$create_home" -eq 1 ]; then
         mkdir -p "$home"; cp -a /etc/skel/. "$home"/ 2>/dev/null || true
         chown -R "$name" "$home"; chmod 0700 "$home"

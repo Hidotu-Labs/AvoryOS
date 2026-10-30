@@ -61,6 +61,7 @@ prefix = r'''
 #define FS_TYPE_MASK 0x0F
 #define FS_PAGE_CACHE 0x80
 #define MAX_FDS 1024
+#define FD_IN_RANGE(t,fd) ((t) && (uint64_t)(fd) < MAX_FDS)
 #define TMPFS_PAGE_BATCH 64
 #define PAGE_SIZE 4096U
 #define PHYS_TO_VIRT(p) ((void *)((uint64_t)(p) + pmm_get_hhdm_offset()))
@@ -170,6 +171,7 @@ static void klogf(const char *fmt, ...) { (void)fmt; }
 #define klog_debugf(...) ((void)0)
 
 static unsigned close_calls;
+static bool vfs_mount_readonly(vfs_node_t *node) { (void)node; return false; }
 static void vfs_close(vfs_node_t *node) { (void)node; close_calls++; }
 static void vfs_cache_clear(vfs_node_t *node) { (void)node; }
 
@@ -329,8 +331,8 @@ int main(void) {
     node.fallocate = tmpfs_fallocate;
     tmpfs_alloc_ok = false;
     int rc = tmpfs_truncate(&node, 12288);
-    assert(rc == -12 && node.length == 0);
-    assert(tmpfs_alloc_calls == 1);   /* first failed page aborts the resize */
+    assert(rc == 0 && node.length == 12288);
+    assert(tmpfs_alloc_calls == 0);   /* sparse growth never allocates */
     rc = tmpfs_fallocate(&node, 0x01, 0, 12288);
     assert(rc == -12);
   }

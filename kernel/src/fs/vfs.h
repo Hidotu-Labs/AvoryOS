@@ -412,6 +412,8 @@ int vfs_mknod(vfs_node_t *node, char *name, uint16_t permission, uint32_t flags,
               void *device);
 int vfs_poll(vfs_node_t *node, int events);
 void vfs_node_init(vfs_node_t *node);
+/* Set the owned parent used by openat(dirfd, "..") and magic-link walks. */
+void vfs_node_set_parent(vfs_node_t *node, vfs_node_t *parent);
 int vfs_mount(vfs_node_t *mountpoint, vfs_node_t *target);
 /* `path` is the mountpoint as userspace sees it ("/run", "/tmp", ...).  It is
  * what /proc/mounts reports and what mountinfo(1)-style consumers match on;

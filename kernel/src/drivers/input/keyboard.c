@@ -113,9 +113,30 @@ void keyboard_push_bytes(const char *bytes, uint32_t len) {
 bool keyboard_has_char(void) { return kbd_head != kbd_tail; }
 
 char keyboard_get_char(void) {
-
   while (kbd_head == kbd_tail) {
+    struct thread *thread = sched_get_current();
+    if (!thread) {
+      sched_yield();
+      continue;
+    }
+    /* A runnable polling reader can keep the BSP's idle context from
+     * presenting deferred console output. Sleep on the same queue that input
+     * producers already wake. Register before rechecking the ring so a key
+     * arriving at the sleep boundary cannot leave us waiting for another. */
+    wait_queue_entry_t entry = {.thread = thread};
+    hal_irq_state_t flags = hal_irq_save();
+    thread->state = THREAD_BLOCKED;
+    wait_queue_add(&keyboard_wait_queue, &entry);
+    if (kbd_head != kbd_tail) {
+      thread->state = THREAD_RUNNING;
+      wait_queue_remove(&keyboard_wait_queue, &entry);
+      hal_irq_restore(flags);
+      continue;
+    }
     sched_yield();
+    thread->state = THREAD_RUNNING;
+    wait_queue_remove(&keyboard_wait_queue, &entry);
+    hal_irq_restore(flags);
   }
   char c = kbd_buffer[kbd_tail];
   kbd_tail = (kbd_tail + 1) % KBD_BUFFER_SIZE;

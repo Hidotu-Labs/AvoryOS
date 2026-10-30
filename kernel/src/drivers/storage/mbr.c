@@ -6,7 +6,13 @@ int mbr_scan_partitions(struct block_device *dev) {
   if (!dev || !dev->read_sectors)
     return -1;
 
-  struct mbr *mbr = kmalloc(sizeof(struct mbr));
+  /* read_sectors transfers one whole device sector. The MBR layout uses
+   * only its first 512 bytes, but 4 KiB-sector devices (including zram)
+   * still write 4096 bytes into the supplied buffer. */
+  uint32_t sector_size = dev->sector_size ? dev->sector_size : 512;
+  if (sector_size < sizeof(struct mbr))
+    return -1;
+  struct mbr *mbr = kmalloc(sector_size);
   if (!mbr)
     return -1;
 

@@ -34,9 +34,12 @@ SOCKETS_EOF
 chmod 0755 "${ROOTFS_DIR}/sbin/avory-early-init"
 
 mkdir -p "${ROOTFS_DIR}/etc" "${ROOTFS_DIR}/home" "${ROOTFS_DIR}/etc/skel"
-sed -E "s/^([^:]+):x:/\1:!:/" "${ROOTFS_DIR}/etc/passwd" | \
-    sed -E "s#^root:[^:]*:0:0:([^:]*):[^:]*:.*#root::0:0:\1:/:${DEFAULT_SHELL}#" > \
-    "${ROOTFS_DIR}/etc/passwd.avory-new"
+awk -F: -v shell="${DEFAULT_SHELL}" 'BEGIN { OFS = ":" }
+    $2 == "x" { $2 = "!" }
+    $1 == "root" { $2 = "x"; $3 = 0; $4 = 0; $6 = "/"; $7 = shell; root = 1 }
+    { print }
+    END { if (!root) print "root", "x", 0, 0, "root", "/", shell }
+' "${ROOTFS_DIR}/etc/passwd" > "${ROOTFS_DIR}/etc/passwd.avory-new"
 mv "${ROOTFS_DIR}/etc/passwd.avory-new" "${ROOTFS_DIR}/etc/passwd"
 rm -f "${ROOTFS_DIR}/etc/shadow" "${ROOTFS_DIR}/etc/shadow-" \
       "${ROOTFS_DIR}/etc/gshadow" "${ROOTFS_DIR}/etc/gshadow-"
@@ -145,7 +148,11 @@ done
 
 # Enable KWin compositing by default. KWIN_COMPOSE can still be overridden for
 # systems whose graphics stack needs a different OpenGL presentation mode.
-mkdir -p "${ROOTFS_DIR}/etc/xdg" "${ROOTFS_DIR}/home/avory/.config"
+mkdir -p "${ROOTFS_DIR}/etc/xdg" \
+    "${ROOTFS_DIR}/home/avory/.config" \
+    "${ROOTFS_DIR}/home/avory/.cache" \
+    "${ROOTFS_DIR}/home/avory/.local/share" \
+    "${ROOTFS_DIR}/home/avory/.local/state"
 cat > "${ROOTFS_DIR}/etc/xdg/kwinrc" << 'KWINRC_EOF'
 [Compositing]
 Backend=OpenGL
@@ -234,6 +241,19 @@ fi
 
 # 2. Setup XDG_RUNTIME_DIR
 USER_ID="$(id -u 2>/dev/null || echo 0)"
+if [ "$USER_ID" != 0 ]; then
+    ACCOUNT_HOME="$(awk -F: -v uid="$USER_ID" '$3 == uid { print $6; exit }' /etc/passwd 2>/dev/null)"
+    if [ -z "${HOME:-}" ] || [ "$HOME" = / ] || [ "$HOME" = /root ]; then
+        if [ -n "$ACCOUNT_HOME" ] && [ "$ACCOUNT_HOME" != / ]; then
+            HOME="$ACCOUNT_HOME"
+            export HOME
+        fi
+    fi
+    [ "${XDG_CONFIG_HOME:-}" = /.config ] && unset XDG_CONFIG_HOME
+    [ "${XDG_CACHE_HOME:-}" = /.cache ] && unset XDG_CACHE_HOME
+    [ "${XDG_DATA_HOME:-}" = /.local/share ] && unset XDG_DATA_HOME
+    [ "${XDG_STATE_HOME:-}" = /.local/state ] && unset XDG_STATE_HOME
+fi
 if [ -z "$XDG_RUNTIME_DIR" ] || [ ! -d "$XDG_RUNTIME_DIR" ]; then
     if [ -d "/run/user/$USER_ID" ]; then
         export XDG_RUNTIME_DIR="/run/user/$USER_ID"
@@ -421,6 +441,97 @@ fi
 if ! grep -q "^avory:" "${ROOTFS_DIR}/etc/passwd"; then
     echo "avory::1000:1000:AvoryOS User:/home/avory:${DEFAULT_SHELL}" >> "${ROOTFS_DIR}/etc/passwd"
 fi
+
+# avory-login authenticates against /etc/shadow while running as root. Keep
+# the root hash out of the world-readable passwd database, and regenerate its
+# salt on each image build. Avory intentionally has an empty password.
+if ! command -v openssl >/dev/null 2>&1 || ! command -v od >/dev/null 2>&1; then
+    echo "openssl and od are required to create account password hashes." >&2
+    exit 1
+fi
+make_password_hash() {
+    password=$1
+    salt=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+    case "$salt" in
+        *[!0-9a-f]*|'')
+            echo "Could not generate a password salt." >&2
+            exit 1
+            ;;
+    esac
+    printf '%s\n' "$password" | openssl passwd -6 -salt "$salt" -stdin
+}
+ROOT_PASSWORD_HASH=$(make_password_hash root)
+case "$ROOT_PASSWORD_HASH" in '$6$'*) ;; *) echo "Could not create the root password hash." >&2; exit 1 ;; esac
+# SDDM's unprivileged user model reads passwd, not shadow. An empty field
+# advertises Avory's passwordless account to Breeze's Log In button.
+awk -F: 'BEGIN { OFS = ":" } $1 == "root" { $2 = "x" } $1 == "avory" { $2 = "" } { print }' \
+    "${ROOTFS_DIR}/etc/passwd" > "${ROOTFS_DIR}/etc/passwd.avory-new"
+mv "${ROOTFS_DIR}/etc/passwd.avory-new" "${ROOTFS_DIR}/etc/passwd"
+PASSWORD_SET_DAY=$(($(date +%s) / 86400))
+(umask 077
+ printf 'root:%s:%s::::::\navory::%s::::::\n' \
+     "$ROOT_PASSWORD_HASH" "$PASSWORD_SET_DAY" \
+     "$PASSWORD_SET_DAY" > "${ROOTFS_DIR}/etc/shadow")
+chmod 0600 "${ROOTFS_DIR}/etc/shadow"
+awk -F: 'NF != 9 { exit 1 }' "${ROOTFS_DIR}/etc/shadow" || {
+    echo "Invalid /etc/shadow record: expected nine fields." >&2
+    exit 1
+}
+
+# Let the default desktop account use the sudo package installed from Axon.
+if [ -f "${ROOTFS_DIR}/etc/sudoers" ]; then
+    if ! awk -F: '$1 == "wheel" { found = 1 } END { exit !found }' "${ROOTFS_DIR}/etc/group"; then
+        echo "sudo is installed but its wheel group is missing from /etc/group." >&2
+        exit 1
+    fi
+    awk -F: 'BEGIN { OFS = ":" } $1 == "wheel" {
+        n = split($4, members, ",")
+        present = 0
+        for (i = 1; i <= n; i++) if (members[i] == "avory") present = 1
+        if (!present) $4 = ($4 == "" ? "avory" : $4 ",avory")
+    } { print }' "${ROOTFS_DIR}/etc/group" > "${ROOTFS_DIR}/etc/group.avory-new"
+    mv "${ROOTFS_DIR}/etc/group.avory-new" "${ROOTFS_DIR}/etc/group"
+    # The package ships sudoers read-only (0440). This is a build-time edit
+    # inside the staged rootfs, so make it writable briefly and restore the
+    # secure mode before the image is populated.
+    chmod 0640 "${ROOTFS_DIR}/etc/sudoers"
+    if ! sed -i 's/^# %wheel ALL=(ALL:ALL) ALL$/%wheel ALL=(ALL:ALL) ALL/' \
+        "${ROOTFS_DIR}/etc/sudoers" ||
+       ! grep -q '^%wheel ALL=(ALL:ALL) ALL$' "${ROOTFS_DIR}/etc/sudoers"; then
+        echo "Could not enable the wheel rule in /etc/sudoers." >&2
+        exit 1
+    fi
+    if ! grep -q '^Defaults:%wheel rootpw$' "${ROOTFS_DIR}/etc/sudoers"; then
+        printf '\nDefaults:%%wheel rootpw\n' >> "${ROOTFS_DIR}/etc/sudoers"
+    fi
+    chmod 0440 "${ROOTFS_DIR}/etc/sudoers"
+fi
+chmod 0644 "${ROOTFS_DIR}/etc/passwd" "${ROOTFS_DIR}/etc/group"
+
+# BusyBox init does not run the packages' systemd-sysusers units. Arch's
+# system bus uses "dbus" (not the legacy messagebus account), and resolved
+# drops privileges to systemd-resolve before creating its runtime sockets.
+for service_user in dbus systemd-resolve; do
+    service_gid=$(awk -F: -v name="$service_user" '$1 == name { print $3; exit }' "${ROOTFS_DIR}/etc/group")
+    if [ -z "$service_gid" ]; then
+        service_gid=$(awk -F: '{ used[$3] = 1 } END {
+            for (id = 999; id >= 101; id--) if (!used[id]) { print id; exit }
+            exit 1
+        }' "${ROOTFS_DIR}/etc/group")
+        printf '%s:x:%s:\n' "$service_user" "$service_gid" >> "${ROOTFS_DIR}/etc/group"
+    fi
+    if ! grep -q "^${service_user}:" "${ROOTFS_DIR}/etc/passwd"; then
+        service_uid=$(awk -F: -v preferred="$service_gid" '{ used[$3] = 1 } END {
+            if (!used[preferred]) { print preferred; exit }
+            for (id = 999; id >= 101; id--) if (!used[id]) { print id; exit }
+            exit 1
+        }' "${ROOTFS_DIR}/etc/passwd")
+        printf '%s:!:%s:%s:%s:/:/usr/bin/nologin\n' \
+            "$service_user" "$service_uid" "$service_gid" "$service_user" >> "${ROOTFS_DIR}/etc/passwd"
+    fi
+done
+unset service_user service_uid service_gid
+
 if ! grep -q "^messagebus:" "${ROOTFS_DIR}/etc/group"; then
     echo "messagebus:x:86:" >> "${ROOTFS_DIR}/etc/group"
 fi

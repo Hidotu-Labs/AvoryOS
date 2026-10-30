@@ -72,13 +72,13 @@ GLIBC_USER_CXXFLAGS := -O2 -Wall -Wextra -fno-stack-protector \
 
 AXON_PROFILE_FILES := $(wildcard config/xorg/*) config/vlc/vlc.sh \
 	config/axon/mirrorlist config/wireplumber/20-avoryos-hda.conf userland/avory-account \
-	userland/test_accounts.sh
+	userland/test_accounts.sh config/sddm/10-theme.conf
 
 userland/avory-login.elf: userland/avory-login.c userland/GNUmakefile config/userland-link.ld $(GLIBC_STAMP) $(GLIBC_TOOLCHAIN_STAMP)
 	$(MAKE) -C userland -f GNUmakefile avory-login.elf
 
 
-$(ARCH_STAMP): scripts/setup-rootfs.sh scripts/axon-common.sh \
+$(ARCH_STAMP): scripts/setup-rootfs.sh scripts/axon-common.sh scripts/configure-pacman.sh \
 		scripts/rootfs-packages.txt $(AXON_PROFILE_FILES) \
 		userland/avory-login.c $(GLIBC_TOOLCHAIN_STAMP)
 	@mkdir -p $(dir $(ARCH_STAMP))
@@ -100,12 +100,16 @@ $(GLIBC_TOOLCHAIN_STAMP): scripts/glibc-toolchain.sh
 glibc-toolchain: $(GLIBC_TOOLCHAIN_STAMP) $(GLIBC_STAMP)
 
 .PHONY: all
-all: $(IMAGE_NAME).iso disk.img edk2-ovmf
+all: $(IMAGE_NAME).iso disk.img edk2-ovmf nouveau-618-desktop-firmware
 
 # `make run` boots the NVMe desktop with KVM; `make run-tcg` is the same
 # configuration without KVM.  The arch-specific run-x86_64 target remains the
 # TCG implementation behind run-tcg.
 RUN_SMP ?= 8
+# Keep the desktop launch's virtual storage serialized. With eight NVMe
+# queues the same intact GPT image can mount but lose all userspace path
+# lookups during startup. Storage diagnostics can opt into more queues.
+RUN_NVME_QUEUES ?= 1
 # NIC selection for launchers that explicitly attach networking:
 #   make run RUN_NIC=e1000    # 82540EM networking
 #   make run RUN_NIC=e1000e   # 82574L networking (MSI preferred)
@@ -164,7 +168,7 @@ run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
 		-drive file=disk.img,format=raw,if=none,id=nvme0 \
-		-device nvme,serial=avoryos0,drive=nvme0 \
+		-device nvme,serial=avoryos0,drive=nvme0,max_ioqpairs=$(RUN_NVME_QUEUES) \
 		-cpu host -enable-kvm \
 		-smp $(RUN_SMP) \
 		-chardev stdio,id=desktop-serial,logfile=$(RUN_SERIAL_LOG),logappend=on \
@@ -510,11 +514,12 @@ build/firmware/.stamp: scripts/linux-firmware-install.sh scripts/linux/firmware-
 	@touch $@
 
 disk.img: userland/winoptions userland/icewm-menu $(ARCH_STAMP)
-disk.img: scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh
-# Fixed 12 GiB image by default (override during a forced rebuild with
+disk.img: scripts/configure-accounts.sh scripts/configure-pacman.sh userland/avory-account userland/test_accounts.sh
+disk.img: config/init/rcS config/init/inittab config/sddm/10-theme.conf
+# Fixed 14 GiB image by default (override during a forced rebuild with
 # `make disk-rebuild DISK_SIZE_MIB=<MiB>`). Leave room for filesystem metadata
 # and tools added after the rootfs overlay.
-DISK_SIZE_MIB ?= 12288
+DISK_SIZE_MIB ?= 14336
 DISK_PARTITION_CACHE := build/arch/disk-partition.img
 DISK_APP_MANIFEST := build/arch/disk-apps.json
 # Keep an immutable build output separate from guest/incremental writes.
@@ -530,11 +535,11 @@ DISK_CACHE_ARGS = --cache $(DISK_PRISTINE_CACHE) --metadata $(DISK_PRISTINE_META
 	--inputs $(DISK_NON_APP_DEPS) $(USERLAND_DISK_APPS) --apps $(USERLAND_DISK_APPS)
 DISK_NON_APP_DEPS := GNUmakefile \
 	userland/winoptions userland/icewm-menu $(ARCH_STAMP) \
-	scripts/setup-rootfs.sh scripts/axon-common.sh \
+	scripts/setup-rootfs.sh scripts/axon-common.sh config/sddm/10-theme.conf \
 	scripts/rootfs-packages.txt $(AXON_PROFILE_FILES) userland/avory-login.c \
 	scripts/glibc-toolchain.sh $(GLIBC_TOOLCHAIN_STAMP) \
-	scripts/configure-accounts.sh userland/avory-account userland/test_accounts.sh \
-	scripts/populate-ext2-dir.sh scripts/populate-ext2-dir.py scripts/configure-image-root.sh config/init/rcS \
+	scripts/configure-accounts.sh scripts/configure-pacman.sh userland/avory-account userland/test_accounts.sh \
+	scripts/populate-ext2-dir.sh scripts/populate-ext2-dir.py scripts/configure-image-root.sh config/init/rcS config/init/inittab \
 	config/plasma/avory-plasma-wayland.sh config/kwinoutputconfig.json \
 	config/weston/avory-weston-session.sh config/weston/weston.desktop \
 	config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/10-virgl.conf config/xorg/20-output.conf \
@@ -556,10 +561,12 @@ DISK_NON_APP_DEPS := GNUmakefile \
 # Userland app edits update only their installed files in the cached ext4
 # partition. Changes to rootfs/config/assets still take the safe full-build
 # path. A clean checkout also takes the full path to create the cache.
+# Guest writes and firmware copies can advance disk.img's timestamp without
+# installing changed startup files. Compare with the last build snapshot.
 DISK_REBUILD ?= $(shell \
 	if [ ! -f disk.img ] || [ ! -f $(DISK_PARTITION_CACHE) ] || [ ! -f $(DISK_APP_MANIFEST) ]; then echo 1; exit; fi; \
 	for path in $(DISK_NON_APP_DEPS); do \
-		if [ ! -e "$$path" ] || [ "$$path" -nt disk.img ]; then echo 1; exit; fi; \
+		if [ ! -e "$$path" ] || [ "$$path" -nt $(DISK_APP_MANIFEST) ]; then echo 1; exit; fi; \
 	done; echo 0)
 
 disk.img: scripts/populate-ext2-dir.sh scripts/populate-ext2-dir.py scripts/configure-image-root.sh
@@ -862,13 +869,16 @@ disk.img: disk-full-force
 		install -m 0755 config/xorg/45-prime-output.sh build/arch/rootfs/etc/X11/xinit/xinitrc.d/45-prime-output.sh; \
 		mkdir -p build/arch/rootfs/etc/sddm.conf.d; \
 		install -m 0644 config/xorg/20-output.conf build/arch/rootfs/etc/sddm.conf.d/20-output.conf; \
+		install -m 0644 config/sddm/10-theme.conf build/arch/rootfs/etc/sddm.conf.d/10-theme.conf; \
 		if [ -f build/arch/rootfs/etc/sddm.conf ]; then \
 			sed -i 's|^DisplayCommand=.*$$|DisplayCommand=/usr/bin/avory-prime-display|' build/arch/rootfs/etc/sddm.conf; \
 		fi; \
 		install -D -m 0755 config/init/rcS build/arch/rootfs/etc/init.d/rcS; \
+		install -D -m 0644 config/init/inittab build/arch/rootfs/etc/inittab; \
 		install -m 0755 config/weston/avory-weston-session.sh build/arch/rootfs/usr/bin/avory-weston-session; \
 		install -m 0644 config/weston/weston.desktop build/arch/rootfs/usr/share/wayland-sessions/weston.desktop; \
 		./scripts/configure-accounts.sh build/arch/rootfs; \
+		bash scripts/configure-pacman.sh build/arch/rootfs; \
 		./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs /; \
 		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs/usr/include usr/include; \
 		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs/usr/lib/gcc/x86_64-pc-linux-gnu usr/lib/gcc/x86_64-pc-linux-gnu; \
@@ -1083,7 +1093,10 @@ build/kernel_cmdline.stamp: FORCE
 	@printf '%s' '$(KERNEL_CMDLINE)' > $@.tmp
 	@if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv $@.tmp $@; fi
 
-$(IMAGE_NAME).iso: limine/limine kernel nouveau-618-desktop-firmware limine.conf build/kernel_cmdline.stamp
+# Building the boot medium must not modify the installed desktop disk.
+# Firmware provisioning belongs to `all` or its explicit target; `run` also
+# builds this ISO and must leave an existing disk untouched.
+$(IMAGE_NAME).iso: limine/limine kernel limine.conf build/kernel_cmdline.stamp
 	rm -rf iso_root
 	mkdir -p iso_root/boot
 	cp -v kernel/bin-x86_64/kernel iso_root/boot/kernel

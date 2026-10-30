@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
+#include <shadow.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,13 +32,16 @@ static void force_console_present(void) {
 }
 
 static int authenticate(const struct passwd *pw) {
-    if (!pw->pw_passwd || strcmp(pw->pw_passwd, "!") == 0 ||
-        strcmp(pw->pw_passwd, "*") == 0) return 0;
-    if (pw->pw_passwd[0] == 0) return 1;
+    const char *stored = pw->pw_passwd;
+    struct spwd *shadow = getspnam(pw->pw_name);
+    if (shadow && shadow->sp_pwdp) stored = shadow->sp_pwdp;
+    if (!stored) return 0;
+    if (!stored[0]) return strcmp(pw->pw_name, "avory") == 0;
+    if (stored[0] == '!' || stored[0] == '*') return 0;
     char *password = getpass("Password: ");
     if (!password) return 0;
-    char *hash = crypt(password, pw->pw_passwd);
-    int ok = hash && strcmp(hash, pw->pw_passwd) == 0;
+    char *hash = crypt(password, stored);
+    int ok = hash && strcmp(hash, stored) == 0;
     memset(password, 0, strlen(password));
     return ok;
 }

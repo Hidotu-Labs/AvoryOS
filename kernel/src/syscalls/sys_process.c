@@ -226,6 +226,18 @@ _Static_assert(offsetof(struct sysinfo, totalram) == 32 &&
                offsetof(struct sysinfo, mem_unit) == 104,
                "x86-64 sysinfo ABI offsets");
 
+struct compat_sysinfo {
+  int32_t uptime;
+  uint32_t loads[3];
+  uint32_t totalram, freeram, sharedram, bufferram, totalswap, freeswap;
+  uint16_t procs, pad;
+  uint32_t totalhigh, freehigh, mem_unit;
+  uint8_t padding[8];
+};
+_Static_assert(sizeof(struct compat_sysinfo) == 64, "i386 sysinfo ABI size");
+_Static_assert(offsetof(struct compat_sysinfo, mem_unit) == 52,
+               "i386 sysinfo memory unit offset");
+
 static uint64_t sys_sysinfo(uint64_t info_ptr, uint64_t a1, uint64_t a2,
                             uint64_t a3, uint64_t a4, uint64_t a5) {
   (void)a1;
@@ -256,6 +268,27 @@ static uint64_t sys_sysinfo(uint64_t info_ptr, uint64_t a1, uint64_t a2,
   info.totalswap = z.enabled ? z.capacity_pages * PAGE_SIZE : 0;
   info.freeswap = z.enabled ? (z.capacity_pages - z.stored_pages) * PAGE_SIZE : 0;
   info.mem_unit = 1;
+  struct thread *current = sched_get_current();
+  if (current && current->seccomp_compat_dispatch) {
+    /* Keep all memory counters in one common unit instead of truncating
+     * byte counts when the machine has more than 4 GiB of RAM. */
+    uint64_t values[8] = {info.totalram, info.freeram, info.sharedram,
+        info.bufferram, info.totalswap, info.freeswap, info.totalhigh, info.freehigh};
+    uint64_t largest = 0;
+    for (unsigned i=0; i<8; i++) if (values[i]>largest) largest=values[i];
+    unsigned shift=0;
+    while ((largest >> shift)>UINT32_MAX && shift<31) shift++;
+    struct compat_sysinfo out = {
+        .uptime=(int32_t)info.uptime,
+        .loads={(uint32_t)info.loads[0],(uint32_t)info.loads[1],(uint32_t)info.loads[2]},
+        .totalram=values[0]>>shift, .freeram=values[1]>>shift,
+        .sharedram=values[2]>>shift, .bufferram=values[3]>>shift,
+        .totalswap=values[4]>>shift, .freeswap=values[5]>>shift,
+        .procs=info.procs, .totalhigh=values[6]>>shift,
+        .freehigh=values[7]>>shift, .mem_unit=1U<<shift
+    };
+    return copy_to_user((void *)info_ptr, &out, sizeof(out)) ? (uint64_t)-14 : 0;
+  }
   if (copy_to_user((void *)info_ptr, &info, sizeof(info)) != 0)
     return (uint64_t)-14; // EFAULT
   return 0;
@@ -481,12 +514,14 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     return 0;
   case 47:
     return capability_prctl(current, option, arg2, arg3, arg4, arg5);
-  case 40: // PR_GET_TID_ADDRESS
-    if (arg2 && vmm_is_user_addr_range_writable(arg2, sizeof(uint64_t))) {
-      *(uint64_t *)arg2 = (uint64_t)current->tid_address;
-      return 0;
+  case 40: { // PR_GET_TID_ADDRESS: pointer width follows the caller ABI.
+    uint64_t value = (uint64_t)current->tid_address;
+    if (current->seccomp_compat_dispatch) {
+      uint32_t narrow = (uint32_t)value;
+      return copy_to_user((void *)arg2, &narrow, sizeof(narrow)) ? (uint64_t)-14 : 0;
     }
-    return (uint64_t)-14;
+    return copy_to_user((void *)arg2, &value, sizeof(value)) ? (uint64_t)-14 : 0;
+  }
   case 52: // PR_GET_SPECULATION_CTRL
     return 0; // PR_SPEC_NOT_AFFECTED
   case 53: // PR_SET_SPECULATION_CTRL
@@ -1297,6 +1332,14 @@ static uint64_t sys_getrlimit(uint64_t resource_arg, uint64_t rlim_ptr,
   uint32_t resource = (uint32_t)resource_arg;
   if (resource >= 16) return (uint64_t)-22;
   struct rlimit limit = resource_limit_value(resource);
+  struct thread *t = sched_get_current();
+  if (t && t->seccomp_compat_dispatch) {
+    uint32_t narrow[2] = {
+      limit.rlim_cur > UINT32_MAX ? UINT32_MAX : (uint32_t)limit.rlim_cur,
+      limit.rlim_max > UINT32_MAX ? UINT32_MAX : (uint32_t)limit.rlim_max
+    };
+    return copy_to_user((void *)rlim_ptr, narrow, sizeof(narrow)) ? (uint64_t)-14 : 0;
+  }
   return copy_to_user((void *)rlim_ptr, &limit, sizeof(limit)) != 0
              ? (uint64_t)-14 : 0;
 }

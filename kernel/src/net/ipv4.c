@@ -318,20 +318,32 @@ static void handle_arp(const uint8_t *payload, size_t length) {
 
 static int ipv4_send_tos(uint32_t destination, uint8_t protocol, uint8_t tos,
                          const void *payload, size_t payload_length) {
-  if (payload_length + sizeof(struct ipv4_header) > NET_MTU_ETHERNET)
-    return -1;
+  if (payload_length > NET_MTU_ETHERNET - sizeof(struct ipv4_header))
+    return -90; /* EMSGSIZE */
 
   struct net_device *dev = net_device_default();
   if (!dev)
-    return -1;
+    return -100; /* ENETDOWN */
 
-  uint32_t next_hop =
-      ((destination & config.netmask) == (config.address & config.netmask))
-          ? destination
-          : config.gateway;
   uint8_t destination_mac[6];
-  if (!arp_resolve(next_hop, destination_mac))
-    return -1;
+  bool broadcast = destination == 0xffffffffU ||
+      (config.netmask && config.netmask != 0xffffffffU &&
+       destination == (config.address | ~config.netmask));
+  if (broadcast) {
+    memset(destination_mac, 0xff, sizeof(destination_mac));
+  } else if ((destination & 0xf0000000U) == 0xe0000000U) {
+    destination_mac[0]=0x01; destination_mac[1]=0x00; destination_mac[2]=0x5e;
+    destination_mac[3]=(destination >> 16) & 0x7f;
+    destination_mac[4]=(destination >> 8) & 0xff;
+    destination_mac[5]=destination & 0xff;
+  } else {
+    uint32_t next_hop =
+        ((destination & config.netmask) == (config.address & config.netmask))
+            ? destination : config.gateway;
+    if (!next_hop) return -101; /* ENETUNREACH */
+    if (!arp_resolve(next_hop, destination_mac))
+      return -113; /* EHOSTUNREACH, not a permission failure */
+  }
 
   /* Build the whole Ethernet frame in one buffer: no intermediate packet
    * copy beyond the payload itself. */

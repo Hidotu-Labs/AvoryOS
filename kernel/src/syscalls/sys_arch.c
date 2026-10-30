@@ -11,6 +11,7 @@
 #include "../mm/vmm_internal.h"
 #include "../sched/sched.h"
 #include "syscall.h"
+#include "../include/arch/uaccess.h"
 #include <stdint.h>
 
 // arch_prctl sub-commands (Linux x86_64)
@@ -199,6 +200,18 @@ static uint64_t clock_now_ns(uint64_t clk_id) {
   }
 }
 
+static int sleep_copy_timespec(uint64_t ptr, int64_t out[2]) {
+  struct thread *t = sched_get_current();
+  if (t && t->seccomp_compat_dispatch) {
+    int32_t narrow[2];
+    if (copy_from_user(narrow, (void *)ptr, sizeof(narrow))) return -14;
+    out[0]=narrow[0]; out[1]=narrow[1];
+  } else if (copy_from_user(out, (void *)ptr, 16)) return -14;
+  if (out[0]<0 || out[1]<0 || out[1]>=1000000000) return -22;
+  if ((uint64_t)out[0] > (UINT64_MAX-999999999ULL)/1000000000ULL) return -22;
+  return 0;
+}
+
 static uint64_t sleep_for_timespec(uint64_t req_ptr) {
   uint64_t *req = (uint64_t *)req_ptr;
   uint64_t sec = req[0];
@@ -233,10 +246,10 @@ static uint64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr, uint64_t a2,
   (void)a5;
   (void)rem_ptr;
 
-  if (!req_ptr || !vmm_is_user_addr_range_valid(req_ptr, 16))
-    return (uint64_t)-14; // EFAULT
-
-  return sleep_for_timespec(req_ptr);
+  int64_t req[2];
+  int error=sleep_copy_timespec(req_ptr, req);
+  if (error) return (uint64_t)error;
+  return sleep_for_timespec((uint64_t)req);
 }
 
 // clock_nanosleep(clockid, flags, req, rem) - syscall 230
@@ -247,24 +260,14 @@ static uint64_t sys_clock_nanosleep(uint64_t clk_id, uint64_t flags,
   (void)a4;
   (void)a5;
 
-  if (!req_ptr || !vmm_is_user_addr_range_valid(req_ptr, 16))
-    return (uint64_t)-14; // EFAULT
-
-  if (flags & ~1ULL)
-    return (uint64_t)-22; // EINVAL
-
-  if (!(flags & 1ULL))
-    return sleep_for_timespec(req_ptr);
-
+  int64_t req[2];
+  int error=sleep_copy_timespec(req_ptr, req);
+  if (error) return (uint64_t)error;
+  if (flags & ~1ULL) return (uint64_t)-22;
   uint64_t now_ns = clock_now_ns(clk_id);
-  if (now_ns == UINT64_MAX)
-    return (uint64_t)-22; // EINVAL
-
-  uint64_t *req = (uint64_t *)req_ptr;
-  uint64_t sec = req[0];
-  uint64_t nsec = req[1];
-  if (nsec >= 1000000000ULL)
-    return (uint64_t)-22; // EINVAL
+  if (now_ns == UINT64_MAX || clk_id == 3) return (uint64_t)-22;
+  if (!(flags & 1ULL)) return sleep_for_timespec((uint64_t)req);
+  uint64_t sec = req[0], nsec = req[1];
 
   uint64_t target_ns = sec * 1000000000ULL + nsec;
   if (target_ns <= now_ns)

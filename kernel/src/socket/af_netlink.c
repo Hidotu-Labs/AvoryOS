@@ -50,6 +50,7 @@ struct nlmsghdr_min {
 #define IFA_LOCAL 2
 #define IFA_LABEL 3
 #define IFA_BROADCAST 4
+#define IFA_FLAGS 8
 #define RTA_DST 1
 #define RTA_SRC 2
 #define RTA_OIF 4
@@ -184,6 +185,8 @@ static int route_address(netlink_sock_t *nsk, uint32_t seq, uint32_t pid, const 
   pos = route_attr(msg, pos, sizeof(msg), IFA_LOCAL, ip, 4);
   pos = route_attr(msg, pos, sizeof(msg), IFA_LABEL, name, strlen(name) + 1);
   pos = route_attr(msg, pos, sizeof(msg), IFA_BROADCAST, broadcast, 4);
+  uint32_t address_flags = i->flags;
+  pos = route_attr(msg, pos, sizeof(msg), IFA_FLAGS, &address_flags, sizeof(address_flags));
   h->nlmsg_len = pos; return route_queue(nsk, msg, pos);
 }
 
@@ -212,6 +215,8 @@ static int route_loopback_addr(netlink_sock_t *nsk, uint32_t seq, uint32_t pid) 
   pos = route_attr(msg, pos, sizeof(msg), IFA_ADDRESS, ip, 4);
   pos = route_attr(msg, pos, sizeof(msg), IFA_LOCAL, ip, 4);
   pos = route_attr(msg, pos, sizeof(msg), IFA_LABEL, "lo", 3);
+  uint32_t address_flags = i->flags;
+  pos = route_attr(msg, pos, sizeof(msg), IFA_FLAGS, &address_flags, sizeof(address_flags));
   h->nlmsg_len = pos; return route_queue(nsk, msg, pos);
 }
 
@@ -225,6 +230,8 @@ static int route_address6(netlink_sock_t *nsk, uint32_t seq, uint32_t pid, const
   size_t pos = sizeof(*h) + sizeof(*i);
   pos = route_attr(msg, pos, sizeof(msg), IFA_ADDRESS, ip, 16);
   pos = route_attr(msg, pos, sizeof(msg), IFA_LOCAL, ip, 16);
+  uint32_t address_flags = i->flags;
+  pos = route_attr(msg, pos, sizeof(msg), IFA_FLAGS, &address_flags, sizeof(address_flags));
   h->nlmsg_len = pos; return route_queue(nsk, msg, pos);
 }
 
@@ -363,11 +370,25 @@ static int netlink_setsockopt(socket_t *sock, int level, int optname,
 
   if (level == SOL_NETLINK) {
     switch (optname) {
+    case NETLINK_PKTINFO: {
+      int enabled;
+      if (optlen < (int)sizeof(enabled)) return -22;
+      if (copy_from_user(&enabled, optval, sizeof(enabled))) return -14;
+      nsk->pktinfo = enabled != 0;
+      return 0;
+    }
     case NETLINK_EXT_ACK: {
       int enabled;
       if (optlen < (int)sizeof(enabled)) return -22;
       if (copy_from_user(&enabled, optval, sizeof(enabled))) return -14;
       nsk->ext_ack = enabled != 0;
+      return 0;
+    }
+    case NETLINK_NO_ENOBUFS: {
+      int enabled;
+      if (optlen < (int)sizeof(enabled)) return -22;
+      if (copy_from_user(&enabled, optval, sizeof(enabled))) return -14;
+      nsk->no_enobufs = enabled != 0;
       return 0;
     }
     case NETLINK_ADD_MEMBERSHIP: {
@@ -428,8 +449,21 @@ static int netlink_getsockopt(socket_t *sock, int level, int optname,
   if (!sock || !sock->sk) return -22;
   netlink_sock_t *nsk = (netlink_sock_t *)sock->sk;
   int value;
+  if (level == SOL_NETLINK && optname == NETLINK_LIST_MEMBERSHIPS) {
+    int length;
+    if (copy_from_user(&length, optlen, sizeof(length))) return -14;
+    if (length < 0) return -22;
+    if (length >= (int)sizeof(nsk->groups) &&
+        copy_to_user(optval, &nsk->groups, sizeof(nsk->groups))) return -14;
+    length = sizeof(nsk->groups);
+    return copy_to_user(optlen, &length, sizeof(length)) ? -14 : 0;
+  }
   if (level == SOL_NETLINK && optname == NETLINK_EXT_ACK) {
     value = nsk->ext_ack;
+  } else if (level == SOL_NETLINK && optname == NETLINK_PKTINFO) {
+    value = nsk->pktinfo;
+  } else if (level == SOL_NETLINK && optname == NETLINK_NO_ENOBUFS) {
+    value = nsk->no_enobufs;
   } else if (level == SOL_SOCKET) {
     switch (optname) {
     case SO_KEEPALIVE: value = nsk->keepalive; break;
@@ -448,7 +482,7 @@ static int netlink_getsockopt(socket_t *sock, int level, int optname,
   return 0;
 }
 
-struct netlink_sender { uint32_t pid, uid, gid; };
+struct netlink_sender { uint32_t pid, uid, gid, groups; };
 static ssize_t netlink_recvfrom_full(socket_t *sock, void *buf, size_t len,
                                 int flags, struct sockaddr *src_addr,
                                 int *addrlen, struct netlink_sender *sender) {
@@ -506,7 +540,8 @@ static ssize_t netlink_recvfrom_full(socket_t *sock, void *buf, size_t len,
     return -11; // EAGAIN
 
   size_t to_copy = (len < skb->len) ? len : skb->len;
-  memcpy(buf, skb->data, to_copy);
+  if (to_copy)
+    memcpy(buf, skb->data, to_copy);
 
   if (src_addr && addrlen) {
     struct sockaddr_nl nl;
@@ -522,6 +557,7 @@ static ssize_t netlink_recvfrom_full(socket_t *sock, void *buf, size_t len,
 
   if (sender) {
     sender->pid = skb->nl_pid; sender->uid = skb->nl_uid; sender->gid = skb->nl_gid;
+    sender->groups = skb->nl_groups;
   }
   ssize_t ret = (flags & MSG_TRUNC) ? (ssize_t)skb->len : (ssize_t)to_copy;
   if (!(flags & MSG_PEEK)) {
@@ -718,6 +754,8 @@ static ssize_t netlink_recvmsg(socket_t *sock, struct msghdr *msg, int flags) {
   ssize_t ret = netlink_recvfrom_full(sock, iov->iov_base, iov->iov_len, flags,
                                  (struct sockaddr *)msg->msg_name,
                                  (int *)&msg->msg_namelen, &sender);
+  size_t capacity = msg->msg_controllen, used = 0;
+  msg->msg_flags = 0;
 
   // Populate SCM_CREDENTIALS ancillary data when SO_PASSCRED is set.
   // Kernel events have pid 0. Processed udev events carry the sending
@@ -734,12 +772,22 @@ static ssize_t netlink_recvmsg(socket_t *sock, struct msghdr *msg, int flags) {
     cred->uid = sender.uid;
     cred->gid = sender.gid;
 
-    msg->msg_controllen = CMSG_SPACE(sizeof(struct ucred_nl));
-  } else {
-    msg->msg_controllen = 0;
+    used = CMSG_SPACE(sizeof(struct ucred_nl));
   }
-
-  msg->msg_flags = 0;
+  if (ret > 0 && nsk && nsk->pktinfo) {
+    if (msg->msg_control && capacity - used >= CMSG_SPACE(sizeof(uint32_t))) {
+      struct cmsghdr *cmsg = (void *)((uint8_t *)msg->msg_control + used);
+      cmsg->cmsg_len = CMSG_LEN(sizeof(uint32_t));
+      cmsg->cmsg_level = SOL_NETLINK;
+      cmsg->cmsg_type = NETLINK_PKTINFO;
+      uint32_t group = sender.groups ? (uint32_t)__builtin_ctz(sender.groups) + 1 : 0;
+      memcpy(CMSG_DATA(cmsg), &group, sizeof(group));
+      used += CMSG_SPACE(sizeof(uint32_t));
+    } else {
+      msg->msg_flags |= MSG_CTRUNC;
+    }
+  }
+  msg->msg_controllen = used;
   return ret;
 }
 

@@ -20,6 +20,27 @@ bool pmm_is_reclaimable(uint64_t phys) {
   return false;
 }
 
+void pmm_protect_reclaimable_range(uint64_t phys, size_t page_count) {
+  if (!pmm_internal_memmap || !page_count)
+    return;
+
+  uint64_t end = phys + (uint64_t)page_count * PAGE_SIZE;
+  for (uint64_t i = 0; i < pmm_internal_memmap->entry_count; i++) {
+    const struct limine_memmap_entry *entry = pmm_internal_memmap->entries[i];
+    if (entry->type != LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE)
+      continue;
+    uint64_t start = entry->base > phys ? entry->base : phys;
+    uint64_t limit = entry->base + entry->length;
+    if (limit > end)
+      limit = end;
+    /* Match pmm_is_reclaimable()'s page-start membership test, including
+     * partially aligned memory-map entries. Ordinary RAM is never marked. */
+    start = (start + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    for (uint64_t page = start; page < limit; page += PAGE_SIZE)
+      pmm_mark_used((void *)page, 1);
+  }
+}
+
 void pmm_reclaim_bootloader(uint64_t kernel_phys_base) {
   if (!pmm_internal_memmap)
     return;

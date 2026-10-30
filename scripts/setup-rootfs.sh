@@ -60,6 +60,8 @@ if [ "${1:-}" = "--nouveau-userspace" ]; then
     install -d "${ROOTFS_DIR}/etc/sddm.conf.d"
     install -m 0644 "${ROOT_DIR}/config/xorg/20-output.conf" \
         "${ROOTFS_DIR}/etc/sddm.conf.d/20-output.conf"
+    install -m 0644 "${ROOT_DIR}/config/sddm/10-theme.conf" \
+        "${ROOTFS_DIR}/etc/sddm.conf.d/10-theme.conf"
     exit 0
 elif [ "$#" -ne 0 ]; then
     echo "Usage: $0 [--nouveau-userspace]" >&2
@@ -109,6 +111,15 @@ axon_rootfs_install_list "${ROOTFS_DIR}" \
     "${ROOT_DIR}/scripts/rootfs-packages.txt" \
     --assume-installed ntsync-autoload
 check_glibc_244
+
+# The kernel starts the system through /sbin/init. Arch uses usrmerge, so
+# /sbin points into /usr/bin; install BusyBox's init applet link in the rootfs
+# before image population instead of patching the ext4 image afterward.
+if [ ! -x "${ROOTFS_DIR}/usr/bin/busybox" ]; then
+    echo "[!] BusyBox is missing from the target root; cannot install /sbin/init." >&2
+    exit 1
+fi
+ln -sfn /usr/bin/busybox "${ROOTFS_DIR}/sbin/init"
 
 # WirePlumber comes from Arch and can need a newer Lua ABI than Axon's native
 # interpreter. Supply its versioned runtime alongside the native one, using
@@ -188,7 +199,11 @@ install -m 0644 "${ROOT_DIR}/config/wireplumber/20-avoryos-hda.conf" \
 
 # Keep boot service startup in the versioned init script.
 install -D -m 0755 "${ROOT_DIR}/config/init/rcS" "${ROOTFS_DIR}/etc/init.d/rcS"
+install -D -m 0644 "${ROOT_DIR}/config/init/inittab" "${ROOTFS_DIR}/etc/inittab"
+install -D -m 0644 "${ROOT_DIR}/config/sddm/10-theme.conf" \
+    "${ROOTFS_DIR}/etc/sddm.conf.d/10-theme.conf"
 
 # Weston needs an explicit production display rather than VKMS heuristics.
 install -m 0755 "${ROOT_DIR}/config/weston/avory-weston-session.sh" "${ROOTFS_DIR}/usr/bin/avory-weston-session"
 install -m 0644 "${ROOT_DIR}/config/weston/weston.desktop" "${ROOTFS_DIR}/usr/share/wayland-sessions/weston.desktop"
+bash "${ROOT_DIR}/scripts/configure-pacman.sh" "${ROOTFS_DIR}"

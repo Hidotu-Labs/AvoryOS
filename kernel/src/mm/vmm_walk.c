@@ -216,6 +216,26 @@ bool vmm_is_huge_page(uint64_t *pml4_phys, uint64_t virtual_addr) {
   return (entry & PAGE_FLAG_PS) != 0;
 }
 
+bool vmm_huge_slot_free(uint64_t *pml4_phys, uint64_t virtual_addr) {
+  if (!pml4_phys)
+    return false;
+
+  uint64_t *pml4_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)pml4_phys & PAGE_MASK);
+  uint64_t entry = pml4_virt[(virtual_addr >> 39) & 0x1FF];
+  if (!(entry & PAGE_FLAG_PRESENT))
+    return true;
+
+  uint64_t *pdpt_virt = (uint64_t *)PHYS_TO_VIRT(entry & PAGE_MASK);
+  entry = pdpt_virt[(virtual_addr >> 30) & 0x1FF];
+  if (!(entry & PAGE_FLAG_PRESENT))
+    return true;
+  if (entry & PAGE_FLAG_PS)
+    return false;
+
+  uint64_t *pd_virt = (uint64_t *)PHYS_TO_VIRT(entry & PAGE_MASK);
+  return !(pd_virt[(virtual_addr >> 21) & 0x1FF] & PAGE_FLAG_PRESENT);
+}
+
 uint64_t vmm_user_resident_bytes(uint64_t cr3) {
   if (!cr3)
     return 0;

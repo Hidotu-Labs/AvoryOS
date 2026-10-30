@@ -379,6 +379,46 @@ static struct tcp_tcb *find_listener_locked(uint16_t port, uint8_t family)
     return NULL;
 }
 
+/* Check address overlap as well as port when binding per-interface sockets. */
+static bool bind_overlaps(const struct tcp_tcb *a, uint8_t family,
+                          const void *address, bool dualstack)
+{
+    static const uint8_t any6[16];
+    if (a->address_family == 4 && family == 4) {
+        uint32_t ip; memcpy(&ip, address, sizeof(ip));
+        return !a->local_ip || !ip || a->local_ip == ip;
+    }
+    if (a->address_family == 6 && family == 6)
+        return !memcmp(a->local_ip6, any6, 16) ||
+               !memcmp(address, any6, 16) || !memcmp(a->local_ip6, address, 16);
+    if (a->address_family == 6)
+        return a->ipv6_dualstack && !memcmp(a->local_ip6, any6, 16);
+    return dualstack && !memcmp(address, any6, 16);
+}
+
+static bool bind_conflict_locked(struct tcp_tcb *t, uint16_t port,
+                                 uint8_t family, const void *address)
+{
+    for (struct tcp_tcb *o = active_list; o; o = o->list_next)
+        if (o != t && o->used && o->local_port == port &&
+            bind_overlaps(o, family, address, t->ipv6_dualstack))
+            return true;
+    return false;
+}
+
+static struct tcp_tcb *find_listener_address_locked(uint16_t port,
+                                                    uint8_t family,
+                                                    const void *address)
+{
+    if (!find_listener_locked(port, family))
+        return NULL;
+    for (struct tcp_tcb *t = hash[port % TCP_HASH_SIZE]; t; t = t->hash_next)
+        if (t->used && t->state == TCP_LISTEN && t->local_port == port &&
+            bind_overlaps(t, family, address, false))
+            return t;
+    return NULL;
+}
+
 /* True when every TCB holding this port is a dying one (TIME_WAIT etc). */
 static bool port_reusable_locked(uint16_t port)
 {
@@ -931,7 +971,7 @@ int tcp_bind(struct tcp_tcb *t, uint32_t ip, uint16_t port)
             return -98;
         }
         t->port_owned = true;
-    } else if (port_bit_test(port)) {
+    } else if (bind_conflict_locked(t, port, 4, &ip)) {
         if (!t->reuseaddr || !port_reusable_locked(port)) {
             spinlock_release(&lock);
             return -98;
@@ -971,7 +1011,7 @@ int tcp_bind6(struct tcp_tcb *t, const uint8_t ip[16], uint16_t port)
             return -98;
         }
         t->port_owned = true;
-    } else if (port_bit_test(port)) {
+    } else if (bind_conflict_locked(t, port, 6, ip)) {
         if (!t->reuseaddr || !port_reusable_locked(port)) {
             spinlock_release(&lock);
             return -98;
@@ -2092,7 +2132,7 @@ void tcp_input_ipv4(uint32_t s, uint32_t d, const uint8_t *p, size_t len)
     }
 
     if (flags & SYN) {
-        struct tcp_tcb *lis = find_listener_locked(dp, 4);
+        struct tcp_tcb *lis = find_listener_address_locked(dp, 4, &d);
         if (lis) {
             if (!lis->accept_queue ||
                 lis->syn_backlog >= lis->backlog ||
@@ -2204,7 +2244,7 @@ void tcp_input_ipv6(const uint8_t s[16], const uint8_t d[16],
     }
 
     if (flags & SYN) {
-        struct tcp_tcb *lis = find_listener_locked(dp, 6);
+        struct tcp_tcb *lis = find_listener_address_locked(dp, 6, d);
         if (lis) {
             if (!lis->accept_queue ||
                 lis->syn_backlog >= lis->backlog ||

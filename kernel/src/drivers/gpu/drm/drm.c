@@ -10,9 +10,20 @@
 #include "../../../lib/string.h"
 #include "../../../mm/heap.h"
 #include "../../../mm/vmm.h"
+#include "arch/uaccess.h"
 
 #include <linuxkpi/native_vfs.h>
 #include <linuxkpi/native_sysfs.h>
+
+uint64_t ascentdrm_gem_mmap_offset(uint64_t phys) {
+  struct thread *t = sched_get_current();
+  if (t && t->mm && t->mm->compat32) {
+    if (phys >= DRM_GEM_MMAP_COMPAT_TAG)
+      return 0;
+    return phys | DRM_GEM_MMAP_COMPAT_TAG;
+  }
+  return phys | DRM_GEM_MMAP_TAG;
+}
 
 /* vrefresh is a userspace convenience field, often zero or stale. KMS
  * timing comes from the pixel clock (kHz), totals, and scan flags. */
@@ -1360,6 +1371,10 @@ static void drm_commit_atomic(struct drm_device *dev) {
 /* ── Per-client open / close ─────────────────────────────────────────────── */
 
 static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
+  bool compat_version = request == 0xc0246400U;
+  bool compat_unique = request == 0xc0086401U;
+  if (compat_version) request = DRM_IOCTL_VERSION;
+  if (compat_unique) request = DRM_IOCTL_GET_UNIQUE;
   struct drm_file *file = node_to_file(node);
   struct drm_device *dev = file ? file->dev : NULL;
   if (!dev)
@@ -1400,7 +1415,16 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   /* ── Version / caps ──────────────────────────────────────────────── */
   case DRM_IOCTL_VERSION: {
     klog_debug_puts("[DRM] VERSION ioctl\n");
+    struct { int32_t major, minor, patch; uint32_t name_len, name, date_len, date, desc_len, desc; } narrow;
+    struct drm_version staged;
     struct drm_version *v = (struct drm_version *)arg;
+    if (compat_version) {
+      if (copy_from_user(&narrow, (void *)arg, sizeof(narrow))) return -14;
+      staged = (struct drm_version){ .name_len=narrow.name_len, .name=(void *)(uintptr_t)narrow.name,
+        .date_len=narrow.date_len, .date=(void *)(uintptr_t)narrow.date,
+        .desc_len=narrow.desc_len, .desc=(void *)(uintptr_t)narrow.desc };
+      v = &staged;
+    }
     static const char ascent_name[] = "ascentdrm";
     const char *name = virtio_gpu_virgl_enabled() ? "virtio_gpu" : ascent_name;
     static const char date[] = "20260706";
@@ -1435,11 +1459,23 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     v->name_len = strlen(name);
     v->date_len = sizeof(date) - 1;
     v->desc_len = sizeof(desc) - 1;
+    if (compat_version) {
+      narrow.major=v->version_major; narrow.minor=v->version_minor; narrow.patch=v->version_patchlevel;
+      narrow.name_len=v->name_len; narrow.date_len=v->date_len; narrow.desc_len=v->desc_len;
+      if (copy_to_user((void *)arg, &narrow, sizeof(narrow))) return -14;
+    }
     return 0;
   }
   case DRM_IOCTL_GET_UNIQUE: {
     klog_debug_puts("[DRM] GET_UNIQUE ioctl\n");
+    struct { uint32_t length, pointer; } narrow;
+    struct drm_unique staged;
     struct drm_unique *u = (struct drm_unique *)arg;
+    if (compat_unique) {
+      if (copy_from_user(&narrow, (void *)arg, sizeof(narrow))) return -14;
+      staged = (struct drm_unique){ .unique_len=narrow.length, .unique=(void *)(uintptr_t)narrow.pointer };
+      u = &staged;
+    }
     char busid[32];
     const struct pci_device *pci = virtio_gpu_pci_device();
     if (pci)
@@ -1459,6 +1495,10 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     }
 
     u->unique_len = busid_len;
+    if (compat_unique) {
+      narrow.length=busid_len;
+      if (copy_to_user((void *)arg, &narrow, sizeof(narrow))) return -14;
+    }
     return 0;
   }
   case DRM_IOCTL_SET_VERSION: {
@@ -1692,7 +1732,9 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       return -2; /* ENOENT */
     m->offset = obj->prime_buffer
         ? 0x2000000000000000ULL | ((uint64_t)obj->handle << 32)
-        : obj->phys_addr | 0x1000000000000000ULL;
+        : ascentdrm_gem_mmap_offset(obj->phys_addr);
+    if (!m->offset)
+      return -75; /* EOVERFLOW: cannot encode this physical address. */
     return 0;
   }
   case DRM_IOCTL_MODE_DESTROY_DUMB: {
@@ -2500,9 +2542,11 @@ static uint64_t drm_vfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
     return (uint64_t)-1;
 #endif
   }
-  if ((offset & 0x1000000000000000ULL) == 0)
+  uint64_t tag = offset & DRM_GEM_MMAP_TAG ? DRM_GEM_MMAP_TAG :
+                 offset & DRM_GEM_MMAP_COMPAT_TAG ? DRM_GEM_MMAP_COMPAT_TAG : 0;
+  if (!tag)
     return (uint64_t)-1;
-  uint64_t phys = offset & ~0x1000000000000000ULL;
+  uint64_t phys = offset & ~tag;
 
   /* Resolve the opaque MAP_DUMB token to an object owned by this DRM file. */
   enum drm_gem_cache_mode cache_mode = DRM_GEM_CACHE_WB;

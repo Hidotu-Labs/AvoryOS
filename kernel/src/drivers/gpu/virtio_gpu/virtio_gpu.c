@@ -1723,7 +1723,6 @@ void virtio_gpu_restore_console_scanout(void) {
  * dirty rect front->scanout_dma and present it, so typing/scrolling shows.
  * Skipped when a DRM master (Plymouth splash, SDDM, Weston) owns the head —
  * those present themselves. */
-static uint64_t last_console_commit_ms = 0;
 static uint32_t pending_cx = 0, pending_cy = 0, pending_cw = 0, pending_ch = 0;
 static bool console_commit_pending = false;
 
@@ -1764,13 +1763,10 @@ void virtio_gpu_console_commit(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
         pending_ch = y2 - y1;
     }
 
-    uint64_t now = lapic_timer_get_ms();
-    /* Rate limit synchronous VirtIO GPU commits to ~60 FPS (16ms)
-     * to eliminate busy-spinning and VM exit overhead during rapid console writes. */
-    if (now - last_console_commit_ms < 16)
-        return;
-
-    last_console_commit_ms = now;
+    /* The console already coalesces writes before copying to the frontbuffer.
+     * A second time gate here stranded the final rect: no timer serviced it,
+     * so a newline/password prompt appeared only after another input event
+     * caused a later commit. Every submitted console rect must be presented. */
     uint32_t cx = pending_cx, cy = pending_cy, cw = pending_cw, ch = pending_ch;
     console_commit_pending = false;
 

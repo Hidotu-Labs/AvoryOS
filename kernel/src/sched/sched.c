@@ -6,6 +6,7 @@
 #include "../console/console.h"
 #include "../console/klog.h"
 #include "../cpu/features.h"
+#include "../cpu/gdt.h"
 #include "../cpu/fpu.h"
 #include "../cpu/idt.h"
 #include "../cpu/msr.h"
@@ -770,6 +771,27 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
         __asm__ volatile("mov %0, %%cr3" ::"r"(cpu->kernel_cr3) : "memory");
       }
     }
+    if (prev && prev->mm) {
+      /* FSGSBASE is enabled for user mode, so a native process can update
+       * its TLS bases with WRFSBASE/WRGSBASE without entering the kernel.
+       * Save the live values on every switch, not only for compat tasks, or
+       * a preempted thread can resume with stale TLS and corrupt its runtime
+       * state.  While in the kernel, SWAPGS has put the user GS base in
+       * IA32_KERNEL_GS_BASE (0xC0000102). */
+      if (prev->mm->compat32) {
+        __asm__ volatile("mov %%fs, %0" : "=rm"(prev->compat_fs));
+        __asm__ volatile("mov %%gs, %0" : "=rm"(prev->compat_gs));
+      }
+      prev->fs_base = rdmsr(0xC0000100);
+      prev->gs_base = rdmsr(0xC0000102);
+    }
+    gdt_set_compat_tls(next_t->compat_tls);
+    /* Loading GS changes its base. Preserve the kernel per-CPU base until
+     * the interrupt/syscall return swaps in the incoming user base. */
+    uint64_t kernel_gs = rdmsr(0xC0000101);
+    uint16_t fs = next_t->compat_fs, gs = next_t->compat_gs;
+    __asm__ volatile("mov %0, %%fs; mov %1, %%gs" :: "rm"(fs), "rm"(gs) : "memory");
+    wrmsr(0xC0000101, kernel_gs);
     /* Set TLS base for the incoming thread with hardware FSGSBASE fast-path.
      * Always write on switch because a migrated thread's fs_base/gs_base may
      * differ from what this CPU last loaded even if prev had the same value

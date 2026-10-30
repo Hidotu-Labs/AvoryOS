@@ -3,6 +3,39 @@
 # the same PipeWire routing before starting D-Bus-activated Plasma services.
 
 USER_ID="$(id -u 2>/dev/null || echo 0)"
+
+# SDDM/session startup can inherit HOME=/ from AvoryOS's root login defaults.
+# Plasma and its D-Bus services then try to write into /.cache and /.local,
+# which are root-owned. Resolve the account home for non-root sessions before
+# starting any desktop process.
+if [ "$USER_ID" != 0 ]; then
+    ACCOUNT_HOME="$(awk -F: -v uid="$USER_ID" '$3 == uid { print $6; exit }' /etc/passwd 2>/dev/null)"
+    if [ -z "${HOME:-}" ] || [ "$HOME" = / ] || [ "$HOME" = /root ]; then
+        if [ -n "$ACCOUNT_HOME" ] && [ "$ACCOUNT_HOME" != / ]; then
+            HOME="$ACCOUNT_HOME"
+            export HOME
+        fi
+    fi
+
+    # Drop stale XDG paths that point at root's home. Keep intentional custom
+    # paths, and derive the usual locations from this account's HOME below.
+    [ "${XDG_CONFIG_HOME:-}" = /.config ] && unset XDG_CONFIG_HOME
+    [ "${XDG_CACHE_HOME:-}" = /.cache ] && unset XDG_CACHE_HOME
+    [ "${XDG_DATA_HOME:-}" = /.local/share ] && unset XDG_DATA_HOME
+    [ "${XDG_STATE_HOME:-}" = /.local/state ] && unset XDG_STATE_HOME
+fi
+
+HOME="${HOME:-/}"
+home_base="${HOME%/}"
+export HOME
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${home_base}/.config}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${home_base}/.cache}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${home_base}/.local/share}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-${home_base}/.local/state}"
+unset home_base
+
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" 2>/dev/null || true
+
 if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ]; then
     if [ -d "/run/user/$USER_ID" ]; then
         XDG_RUNTIME_DIR="/run/user/$USER_ID"

@@ -45,7 +45,20 @@ int main(void){
  for(unsigned b=1;b<next_block;b++)for(unsigned j=0;j<BS;j++)assert(!disk[b][j]);
  for(unsigned b=1;b<next_block;b++)if(staged[b]){memcpy(disk[b],staged[b],BS);free(staged[b]);staged[b]=NULL;}
  for(unsigned i=0;i<1600;i++)assert(ext4_get_block_num(&m,&inode,i*3)==100000+i*7);
+ /* Torrent pieces arrive out of order. Verify mappings across random leaf
+    and index splits, including insertions before existing index minima. */
+ ext2_inode_t random_inode={0};ext4_extent_init_inode(&random_inode);
+ for(unsigned i=0;i<6000;i++){
+   unsigned key=(i*997+4500)%6000;
+   assert(!ext4_extent_insert(&m,&random_inode,2,key*3,200000+key*7,1));
+   for(unsigned j=0;j<=i;j++){
+     unsigned previous=(j*997+4500)%6000;
+     assert(ext4_get_block_num(&m,&random_inode,previous*3)==200000+previous*7);
+   }
+ }
+ for(unsigned b=1;b<next_block;b++)if(staged[b]){memcpy(disk[b],staged[b],BS);free(staged[b]);staged[b]=NULL;}
+ for(unsigned key=0;key<6000;key++)assert(ext4_get_block_num(&m,&random_inode,key*3)==200000+key*7);
  fail_stage=true;unsigned char node[BS]={0};assert(ext4_extent_write_node(&m,1,node)==-5);assert(!home_writes&&!flushes);
  fail_stage=false;m.journal.active=false;assert(!ext4_extent_write_node(&m,2,node));assert(home_writes==1&&flushes==1);
- printf("PASS: actual extent tree depth 2, 1600 fragmented mappings, staged re-reads, %u updates/%u unique nodes, commit readback, error propagation and unjournaled fallback\n",stage_calls,unique);
+ printf("PASS: actual extent tree depth 2, 1600 sequential and 6000 out-of-order fragmented mappings, staged re-reads, %u updates/%u unique nodes, commit readback, error propagation and unjournaled fallback\n",stage_calls,unique);
 }

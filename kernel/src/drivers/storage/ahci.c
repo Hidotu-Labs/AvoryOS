@@ -114,33 +114,6 @@ static int find_cmdslot(ahci_port_t *port) {
   return -1;
 }
 
-static void stop_cmd(ahci_port_t *port) {
-  // Clear ST (Start)
-  port->cmd &= ~AHCI_CMD_ST;
-  // Clear FRE (FIS Receive Enable)
-  port->cmd &= ~AHCI_CMD_FRE;
-
-  // Wait until FR (FIS Receive Running) and CR (Command List Running) are
-  // cleared
-  while (1) {
-    if (port->cmd & AHCI_CMD_FR)
-      continue;
-    if (port->cmd & AHCI_CMD_CR)
-      continue;
-    break;
-  }
-}
-
-static void start_cmd(ahci_port_t *port) {
-  // Wait until CR (Command List Running) is cleared
-  while (port->cmd & AHCI_CMD_CR)
-    ;
-
-  // Set FRE (FIS Receive Enable) and ST (Start)
-  port->cmd |= AHCI_CMD_FRE;
-  port->cmd |= AHCI_CMD_ST;
-}
-
 /* Stop DMA before releasing memory named by a failed command table. */
 static bool quiesce_port(ahci_port_t *port) {
   port->cmd &= ~AHCI_CMD_ST;
@@ -160,11 +133,15 @@ static bool quiesce_port(ahci_port_t *port) {
   return true;
 }
 
-static void port_rebase(ahci_port_t *port) {
-  stop_cmd(port);
+static bool port_rebase(ahci_port_t *port) {
+  port->ie = 0;
+  if (!quiesce_port(port))
+    return false;
 
   // Command list offset: 1K per port
   void *phys_clb = pmm_alloc(); // alloc 1 page (4K) for simplicity
+  if (!phys_clb)
+    return false;
   memset((void *)((uint64_t)phys_clb + pmm_get_hhdm_offset()), 0, 1024);
   port->clb = (uint32_t)(uint64_t)phys_clb;
   port->clbu = (uint32_t)((uint64_t)phys_clb >> 32);
@@ -178,6 +155,10 @@ static void port_rebase(ahci_port_t *port) {
   // Command table offset: 256 bytes per command table, 32 commands
   // We need 256 * 32 = 8K per port. Alloc 2 pages.
   void *phys_ctba_base = pmm_alloc_blocks(2);
+  if (!phys_ctba_base) {
+    pmm_free(phys_clb);
+    return false;
+  }
   memset((void *)((uint64_t)phys_ctba_base + pmm_get_hhdm_offset()), 0, 8192);
 
   ahci_command_header_t *cmdheader =
@@ -190,7 +171,12 @@ static void port_rebase(ahci_port_t *port) {
     cmdheader[i].ctbau = (uint32_t)(phys_ctba >> 32);
   }
 
-  start_cmd(port);
+  /* quiesce_port proved CR/FR clear before changing DMA addresses. */
+  port->serr = port->serr;
+  port->is = port->is;
+  port->cmd |= AHCI_CMD_FRE;
+  port->cmd |= AHCI_CMD_ST;
+  return true;
 }
 
 // AHCI Command IO
@@ -215,8 +201,8 @@ static ahci_command_table_t *ahci_command_table(ahci_command_header_t *header) {
  * caller may need several commands for a large buffer.
  *
  * Returns the number of bytes covered, or 0 when a page is not mapped.  The
- * caller guarantees a sector-aligned buffer, so the covered byte count is
- * always a multiple of 512.
+ * buffer needs only word alignment. If the descriptor budget runs out, trim
+ * the tail to whole sectors so the next command can continue at that offset.
  */
 static uint32_t ahci_build_prdt(ahci_command_table_t *table, uint64_t cr3,
                                 uint64_t va, uint32_t max_bytes,
@@ -238,7 +224,7 @@ static uint32_t ahci_build_prdt(ahci_command_table_t *table, uint64_t cr3,
     /* Extend the descriptor across physically contiguous pages. */
     while (run < remaining && run < AHCI_PRDT_MAX_BYTES) {
       uint64_t end_phys = phys + run;
-      if (((end_phys - 1) >> 32) != (phys >> 32))
+      if ((end_phys >> 32) != (phys >> 32))
         break; /* would cross a 4 GiB boundary */
       if (vmm_virt_to_phys((uint64_t *)cr3, cur_va + run) != end_phys)
         break; /* physically discontiguous */
@@ -259,6 +245,20 @@ static uint32_t ahci_build_prdt(ahci_command_table_t *table, uint64_t cr3,
     covered += run;
   }
 
+  /* A heap buffer can start partway through a sector. At the PRDT limit,
+   * keep only complete sectors and leave the tail for the next command. */
+  uint32_t trim = covered & 511u;
+  covered -= trim;
+  while (trim && entries) {
+    uint32_t bytes = table->prdt_entry[entries - 1].dbc + 1;
+    if (bytes <= trim) {
+      trim -= bytes;
+      entries--;
+    } else {
+      table->prdt_entry[entries - 1].dbc -= trim;
+      trim = 0;
+    }
+  }
   if (entries)
     table->prdt_entry[entries - 1].i = 1; /* interrupt on completion */
   *out_entries = entries;
@@ -500,7 +500,7 @@ static int ahci_wait_slot(struct ahci_drive *drive, int slot,
 }
 
 /* DMA straight into a kernel buffer using scatter-gather PRDT entries.
- * `buf` must be at least sector aligned. */
+ * `buf` must be word aligned. */
 static int ahci_io_direct(struct ahci_drive *drive, uint64_t lba,
                           uint32_t count, void *buf, int is_write) {
   ahci_port_t *port = drive->port;
@@ -561,9 +561,8 @@ static int ahci_io_direct(struct ahci_drive *drive, uint64_t lba,
   return 0;
 }
 
-/* Fallback for user or unaligned buffers: bounce through a physically
- * contiguous scratch buffer.  Kernel I/O normally goes through the page cache,
- * which passes sector-aligned kernel pointers, so this path is rare. */
+/* User and odd-address buffers need a physically contiguous scratch buffer.
+ * Word-aligned kernel heap buffers use the scatter-gather path directly. */
 static int ahci_io_bounce(struct ahci_drive *drive, uint64_t lba,
                           uint32_t count, void *buf, int is_write) {
   ahci_port_t *port = drive->port;
@@ -650,7 +649,7 @@ static int ahci_io(ahci_port_t *port, uint64_t lba, uint32_t count, void *buf,
     return -1;
   }
 
-  if (is_user_ptr((uint64_t)buf) || ((uint64_t)buf & 0x1FFu)) {
+  if (is_user_ptr((uint64_t)buf) || ((uint64_t)buf & 1u)) {
     return ahci_io_bounce(drive, lba, count, buf, is_write);
   }
   return ahci_io_direct(drive, lba, count, buf, is_write);
@@ -720,6 +719,8 @@ static bool ahci_identify(ahci_port_t *port, struct ahci_drive *drive) {
 
   // Use page allocator for temp buffer (must be physical!)
   void *phys_buf = pmm_alloc();
+  if (!phys_buf)
+    return false;
   void *virt_buf = (void *)((uint64_t)phys_buf + pmm_get_hhdm_offset());
   memset(virt_buf, 0, 4096);
 
@@ -747,16 +748,36 @@ static bool ahci_identify(ahci_port_t *port, struct ahci_drive *drive) {
   cmdfis->c = 1;
   cmdfis->command = ATA_CMD_IDENTIFY;
 
-  while (port->tfd & (0x80 | 0x08))
-    ;
+  uint64_t deadline = lapic_timer_get_ms() + 5000;
+  while (port->tfd & (AHCI_TFD_BSY | AHCI_TFD_DRQ)) {
+    if (lapic_timer_get_ms() >= deadline) {
+      pmm_free(phys_buf);
+      klogf("[AHCI] port %d not ready for IDENTIFY\n", drive->port_index);
+      return false;
+    }
+    hal_cpu_relax();
+  }
 
-  port->ci = 1 << slot;
+  port->is = port->is;
+  port->ci = 1u << slot;
+  deadline = lapic_timer_get_ms() + 5000;
 
   while (1) {
     if ((port->ci & (1 << slot)) == 0)
       break;
-    if (port->is & (1 << 30))
+    if ((port->is & AHCI_PXIS_TFES) || lapic_timer_get_ms() >= deadline) {
+      /* The DMA target cannot be freed until the controller releases it. */
+      if (quiesce_port(port))
+        pmm_free(phys_buf);
+      klogf("[AHCI] port %d IDENTIFY failed/timed out\n", drive->port_index);
       return false;
+    }
+    hal_cpu_relax();
+  }
+
+  if ((port->is & AHCI_PXIS_TFES) || (port->tfd & 1u)) {
+    pmm_free(phys_buf);
+    return false;
   }
 
   uint16_t *identify_data = (uint16_t *)virt_buf;
@@ -789,6 +810,7 @@ static bool ahci_identify(ahci_port_t *port, struct ahci_drive *drive) {
 }
 
 static void probe_port(ahci_port_t *port, int portno) {
+  uint64_t started_ms = lapic_timer_get_ms();
   uint32_t ssts = port->ssts;
 
   uint8_t ipm = (ssts >> 8) & 0x0F;
@@ -810,7 +832,10 @@ static void probe_port(ahci_port_t *port, int portno) {
     console_puts("     Port ");
     console_putchar('0' + portno);
     console_puts(": SATA drive found.\n");
-    port_rebase(port);
+    if (!port_rebase(port)) {
+      klogf("[AHCI] port %d could not stop/setup DMA engines; skipped\n", portno);
+      return;
+    }
 
     struct ahci_drive *drive = &ahci_drives[ahci_drive_count];
     drive->port = port;
@@ -824,6 +849,8 @@ static void probe_port(ahci_port_t *port, int portno) {
     }
 
     if (ahci_identify(port, drive)) {
+      klogf("[AHCI] port %d ready in %llu ms\n", portno,
+            (unsigned long long)(lapic_timer_get_ms() - started_ms));
       drive->present = true;
       uint64_t size_mb = (drive->total_sectors * 512) / (1024 * 1024);
 
@@ -880,6 +907,11 @@ static int ahci_probe(struct device *dev) {
   // reinstall it here: remapping during SMP early boot requires a global TLB
   // shootdown and can deadlock idle APs.
 
+  /* IDENTIFY already uses DMA: enable PCI decoding/mastering before it,
+   * rather than relying on firmware to have left bus mastering enabled. */
+  uint16_t pci_cmd = pci_config_read16(pci_dev->bus, pci_dev->slot, pci_dev->func, 0x04);
+  pci_config_write16(pci_dev->bus, pci_dev->slot, pci_dev->func, 0x04,
+                    pci_cmd | (1u << 1) | (1u << 2));
   hba = (ahci_hba_mem_t *)virt_abar;
   hba->ghc |= (1 << 31); // AHCI Enable
 
@@ -923,6 +955,7 @@ static struct driver ahci_driver = {
 };
 
 int ahci_init(void) {
+  uint64_t started_ms = lapic_timer_get_ms();
   ahci_drive_count = 0;
   dm_register_driver(&ahci_driver);
 
@@ -933,5 +966,7 @@ int ahci_init(void) {
     print_uint64(ahci_drive_count);
     console_puts(" drive(s) registered.\n");
   }
+  klogf("[AHCI] initialization completed in %llu ms\n",
+        (unsigned long long)(lapic_timer_get_ms() - started_ms));
   return ahci_drive_count;
 }

@@ -34,6 +34,12 @@
 #define MAP_PAGECACHE 0x400000000ULL
 #define MAP_DENY_SHARED_WRITE 0x800000000ULL
 #define MAP_DENY_EXEC 0x1000000000ULL
+/* file_size is an ELF segment's initialized byte count, including zero.
+ * Bytes beyond that count are BSS even if the underlying file has more data. */
+#define MAP_ELF_LOAD 0x2000000000ULL
+/* Kernel-internal: madvise(MADV_NOHUGEPAGE) - never use automatic 2 MB pages
+ * (thp_mode "always") for this anonymous VMA. */
+#define MAP_NOHUGEPAGE 0x4000000000ULL
 
 // VMA structure - internally represents an AVL Interval Tree Node
 struct vma {

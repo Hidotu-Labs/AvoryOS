@@ -109,11 +109,7 @@ static void vmm_protect_table_recursive(uint64_t phys, int level) {
          * reclaimable. */
         uint64_t leaf_phys = entry & PAGE_MASK;
         size_t page_count = (level == 3) ? 0x40000 : 0x200;
-        for (size_t p = 0; p < page_count; p++) {
-          uint64_t page = leaf_phys + p * PAGE_SIZE;
-          if (pmm_is_reclaimable(page))
-            pmm_mark_used((void *)page, 1);
-        }
+        pmm_protect_reclaimable_range(leaf_phys, page_count);
       } else {
         vmm_protect_table_recursive(entry & PAGE_MASK, level - 1);
       }

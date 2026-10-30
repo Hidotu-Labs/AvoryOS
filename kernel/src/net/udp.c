@@ -179,9 +179,15 @@ int udp_bind(struct udp_socket *s, uint32_t ip, uint16_t port) {
         return -22;
     }
     if (port) {
-        if (port_in_use_locked(port)) {
-            spinlock_release(&table_lock);
-            return -98;
+        /* Distinct concrete local addresses may use the same port. A
+         * wildcard binding still overlaps every address on that port. */
+        for (struct udp_socket *other = udp_hash[port % UDP_HASH_SIZE];
+             other; other = other->hash_next) {
+            if (other->used && other->bound && other->local_port == port &&
+                (!ip || !other->local_ip || other->local_ip == ip)) {
+                spinlock_release(&table_lock);
+                return -98;
+            }
         }
     } else {
         port = alloc_ephemeral_locked();

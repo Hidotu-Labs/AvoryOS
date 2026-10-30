@@ -770,6 +770,10 @@ void sysfs_init(void) {
   }
   vfs_node_init(sysfs_root);
   strcpy(sysfs_root->name, "sys");
+  /* Every sysfs lookup traverses this root. Without search permission,
+   * non-root libdrm/Mesa clients cannot discover even world-readable GPU
+   * attributes, and KWin exits with "Found no render device". */
+  sysfs_root->mask = 0555;
   ramfs_mount_on(sysfs_root);
   sysfs_root->statfs = sysfs_statfs;
   uevent_root = sysfs_root;

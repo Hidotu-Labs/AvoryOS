@@ -3,6 +3,61 @@
 #include "../syscalls/sys_io_shared.h"
 #include "arch/uaccess.h"
 
+/* Ancillary data is a userspace ABI, independent of the socket's peer ABI. */
+struct unix_cmsg32 { uint32_t length; int32_t level, type; };
+static bool unix_cmsg_compat(void) {
+  struct thread *t = sched_get_current();
+  return t && t->seccomp_compat_dispatch;
+}
+static size_t unix_cmsg_size(void) { return unix_cmsg_compat() ? 12 : 16; }
+static size_t unix_cmsg_align(size_t n) {
+  size_t a = unix_cmsg_compat() ? 4 : 8;
+  return (n + a - 1) & ~(a - 1);
+}
+static size_t unix_cmsg_len(const struct cmsghdr *c) {
+  return unix_cmsg_compat() ? ((const struct unix_cmsg32 *)c)->length : c->cmsg_len;
+}
+static int unix_cmsg_level(const struct cmsghdr *c) {
+  return unix_cmsg_compat() ? ((const struct unix_cmsg32 *)c)->level : c->cmsg_level;
+}
+static int unix_cmsg_type(const struct cmsghdr *c) {
+  return unix_cmsg_compat() ? ((const struct unix_cmsg32 *)c)->type : c->cmsg_type;
+}
+static void unix_cmsg_set(struct cmsghdr *c, int field, size_t value) {
+  if (unix_cmsg_compat()) {
+    struct unix_cmsg32 *n = (void *)c;
+    if (!field) n->length = value;
+    else if (field == 1) n->level = value;
+    else n->type = value;
+  } else {
+    if (!field) c->cmsg_len = value;
+    else if (field == 1) c->cmsg_level = value;
+    else c->cmsg_type = value;
+  }
+}
+static struct cmsghdr *unix_cmsg_next(struct msghdr *m, struct cmsghdr *c) {
+  size_t offset = (uint8_t *)c - (uint8_t *)m->msg_control;
+  size_t length = unix_cmsg_len(c), header = unix_cmsg_size();
+  if (length < header || offset > m->msg_controllen ||
+      length > m->msg_controllen - offset) return NULL;
+  size_t step = unix_cmsg_align(length);
+  if (step > m->msg_controllen - offset ||
+      m->msg_controllen - offset - step < header) return NULL;
+  return (void *)((uint8_t *)c + step);
+}
+#undef CMSG_ALIGN
+#undef CMSG_DATA
+#undef CMSG_SPACE
+#undef CMSG_LEN
+#undef CMSG_FIRSTHDR
+#undef CMSG_NXTHDR
+#define CMSG_ALIGN(n) unix_cmsg_align(n)
+#define CMSG_DATA(c) ((uint8_t *)(c) + unix_cmsg_size())
+#define CMSG_SPACE(n) (unix_cmsg_size() + unix_cmsg_align(n))
+#define CMSG_LEN(n) (unix_cmsg_size() + (n))
+#define CMSG_FIRSTHDR(m) ((m)->msg_controllen >= unix_cmsg_size() ? (struct cmsghdr *)(m)->msg_control : NULL)
+#define CMSG_NXTHDR(m,c) unix_cmsg_next(m,c)
+
 /* Pin and snapshot under the sender's file-table lock. A CLONE_FILES
  * sibling can close/reuse the descriptor while sendmsg is in progress. */
 static bool unix_scm_capture_fd(struct thread *sender, int fd,
@@ -901,11 +956,11 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     int total_fds = 0;
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg);
     while (cmsg) {
-      if (cmsg->cmsg_len < sizeof(struct cmsghdr))
+      if (unix_cmsg_len(cmsg) < unix_cmsg_size())
         break;
-      if (cmsg->cmsg_len >= sizeof(struct cmsghdr) &&
-          cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-        int count = (int)((cmsg->cmsg_len - CMSG_ALIGN(sizeof(struct cmsghdr))) / sizeof(int));
+      if (unix_cmsg_len(cmsg) >= unix_cmsg_size() &&
+          unix_cmsg_level(cmsg) == SOL_SOCKET && unix_cmsg_type(cmsg) == SCM_RIGHTS) {
+        int count = (int)((unix_cmsg_len(cmsg) - CMSG_ALIGN(unix_cmsg_size())) / sizeof(int));
         if (count > 0) total_fds += count;
       }
       cmsg = CMSG_NXTHDR(msg, cmsg);
@@ -925,12 +980,12 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
 
         cmsg = CMSG_FIRSTHDR(msg);
         while (cmsg) {
-          if (cmsg->cmsg_len < sizeof(struct cmsghdr))
+          if (unix_cmsg_len(cmsg) < unix_cmsg_size())
             break;
-          if (cmsg->cmsg_len >= sizeof(struct cmsghdr) &&
-              cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+          if (unix_cmsg_len(cmsg) >= unix_cmsg_size() &&
+              unix_cmsg_level(cmsg) == SOL_SOCKET && unix_cmsg_type(cmsg) == SCM_RIGHTS) {
             int *fds = (int *)CMSG_DATA(cmsg);
-            int count = (int)((cmsg->cmsg_len - CMSG_ALIGN(sizeof(struct cmsghdr))) / sizeof(int));
+            int count = (int)((unix_cmsg_len(cmsg) - CMSG_ALIGN(unix_cmsg_size())) / sizeof(int));
             for (int i = 0; i < count; i++) {
               if (scm_item->count >= total_fds)
                 break;
@@ -1081,11 +1136,11 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   int total_fds = 0;
   struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg);
   while (cmsg) {
-    if (cmsg->cmsg_len < sizeof(struct cmsghdr))
+    if (unix_cmsg_len(cmsg) < unix_cmsg_size())
       break;
-    if (cmsg->cmsg_len >= sizeof(struct cmsghdr) &&
-        cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-      int count = (int)((cmsg->cmsg_len - CMSG_ALIGN(sizeof(struct cmsghdr))) /
+    if (unix_cmsg_len(cmsg) >= unix_cmsg_size() &&
+        unix_cmsg_level(cmsg) == SOL_SOCKET && unix_cmsg_type(cmsg) == SCM_RIGHTS) {
+      int count = (int)((unix_cmsg_len(cmsg) - CMSG_ALIGN(unix_cmsg_size())) /
                         sizeof(int));
       if (count > 0)
         total_fds += count;
@@ -1108,12 +1163,12 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
 
       cmsg = CMSG_FIRSTHDR(msg);
       while (cmsg) {
-        if (cmsg->cmsg_len < sizeof(struct cmsghdr))
+        if (unix_cmsg_len(cmsg) < unix_cmsg_size())
           break;
-        if (cmsg->cmsg_len >= sizeof(struct cmsghdr) &&
-            cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+        if (unix_cmsg_len(cmsg) >= unix_cmsg_size() &&
+            unix_cmsg_level(cmsg) == SOL_SOCKET && unix_cmsg_type(cmsg) == SCM_RIGHTS) {
           int *fds = (int *)CMSG_DATA(cmsg);
-          int count = (int)((cmsg->cmsg_len - CMSG_ALIGN(sizeof(struct cmsghdr))) /
+          int count = (int)((unix_cmsg_len(cmsg) - CMSG_ALIGN(unix_cmsg_size())) /
                             sizeof(int));
           for (int i = 0; i < count; i++) {
             if (scm_item->count >= total_fds)
@@ -1370,9 +1425,9 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       if (control_capacity - control_used >= needed) {
         struct cmsghdr *cmsg = (struct cmsghdr *)
             ((uint8_t *)msg->msg_control + control_used);
-        cmsg->cmsg_len = CMSG_LEN(sizeof(struct unix_ucred));
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type = SCM_CREDENTIALS;
+        unix_cmsg_set(cmsg, 0, CMSG_LEN(sizeof(struct unix_ucred)));
+        unix_cmsg_set(cmsg, 1, SOL_SOCKET);
+        unix_cmsg_set(cmsg, 2, SCM_CREDENTIALS);
 
         struct unix_ucred *cred = (struct unix_ucred *)CMSG_DATA(cmsg);
         cred->pid = pkt->cred_pid;
@@ -1386,16 +1441,16 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
 
     if (pkt->scm != NULL && !is_peek) {
       unix_scm_msg_t *head = pkt->scm;
-      if (have_control && control_capacity - control_used >= sizeof(struct cmsghdr)) {
+      if (have_control && control_capacity - control_used >= unix_cmsg_size()) {
         struct cmsghdr *cmsg = (struct cmsghdr *)
             ((uint8_t *)msg->msg_control + control_used);
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type  = SCM_RIGHTS;
+        unix_cmsg_set(cmsg, 1, SOL_SOCKET);
+        unix_cmsg_set(cmsg, 2, SCM_RIGHTS);
 
         int *fds = (int *)CMSG_DATA(cmsg);
         size_t max_bytes_for_fds = 0;
-        if (control_capacity - control_used > CMSG_ALIGN(sizeof(struct cmsghdr)))
-          max_bytes_for_fds = control_capacity - control_used - CMSG_ALIGN(sizeof(struct cmsghdr));
+        if (control_capacity - control_used > CMSG_ALIGN(unix_cmsg_size()))
+          max_bytes_for_fds = control_capacity - control_used - CMSG_ALIGN(unix_cmsg_size());
         int max_fds = (int)(max_bytes_for_fds / sizeof(int));
         if (max_fds > head->count)
           max_fds = head->count;
@@ -1414,7 +1469,7 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
           head->fds[i].node = NULL;
         }
 
-        cmsg->cmsg_len = CMSG_LEN(actual_count * sizeof(int));
+        unix_cmsg_set(cmsg, 0, CMSG_LEN(actual_count * sizeof(int)));
         control_used += CMSG_SPACE(actual_count * sizeof(int));
 
         if (actual_count < head->count) {
@@ -1598,9 +1653,9 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       if (control_capacity - control_used >= needed) {
         struct cmsghdr *cmsg = (struct cmsghdr *)
             ((uint8_t *)msg->msg_control + control_used);
-        cmsg->cmsg_len = CMSG_LEN(sizeof(struct unix_ucred));
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type = SCM_CREDENTIALS;
+        unix_cmsg_set(cmsg, 0, CMSG_LEN(sizeof(struct unix_ucred)));
+        unix_cmsg_set(cmsg, 1, SOL_SOCKET);
+        unix_cmsg_set(cmsg, 2, SCM_CREDENTIALS);
 
         struct unix_ucred *cred = (struct unix_ucred *)CMSG_DATA(cmsg);
         cred->pid = usk->scm_cred_pid;
@@ -1637,16 +1692,16 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         if (!usk->scm_queue_head)
           usk->scm_queue_tail = NULL;
         kfree(head);
-      } else if (control_capacity - control_used >= sizeof(struct cmsghdr)) {
+      } else if (control_capacity - control_used >= unix_cmsg_size()) {
         struct cmsghdr *cmsg = (struct cmsghdr *)
             ((uint8_t *)msg->msg_control + control_used);
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type  = SCM_RIGHTS;
+        unix_cmsg_set(cmsg, 1, SOL_SOCKET);
+        unix_cmsg_set(cmsg, 2, SCM_RIGHTS);
 
         int *fds = (int *)CMSG_DATA(cmsg);
         size_t max_bytes_for_fds = 0;
-        if (control_capacity - control_used > CMSG_ALIGN(sizeof(struct cmsghdr)))
-          max_bytes_for_fds = control_capacity - control_used - CMSG_ALIGN(sizeof(struct cmsghdr));
+        if (control_capacity - control_used > CMSG_ALIGN(unix_cmsg_size()))
+          max_bytes_for_fds = control_capacity - control_used - CMSG_ALIGN(unix_cmsg_size());
         int max_fds = (int)(max_bytes_for_fds / sizeof(int));
         if (max_fds > head->count)
           max_fds = head->count;
@@ -1665,7 +1720,7 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
           head->fds[i].node = NULL;
         }
 
-        cmsg->cmsg_len = CMSG_LEN(actual_count * sizeof(int));
+        unix_cmsg_set(cmsg, 0, CMSG_LEN(actual_count * sizeof(int)));
         control_used += CMSG_SPACE(actual_count * sizeof(int));
 
         if (actual_count < head->count) {

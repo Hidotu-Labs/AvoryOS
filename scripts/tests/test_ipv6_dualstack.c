@@ -29,6 +29,7 @@ static void spinlock_release(spinlock_t *s) { assert(s->locked); s->locked = 0; 
 #undef hash_insert_locked
 #undef hash_remove_locked
 #include "../../kernel/src/net/tcp.c"
+#include "../../kernel/src/lib/rbtree.c"
 
 static struct ipv4_config cfg4 = {.address = 0x0a000002};
 static struct ipv6_config cfg6;
@@ -64,6 +65,13 @@ socket_t *socket_create(int domain, int type, int protocol) {
   assert(inet6_create(s, protocol) == 0);
   return s;
 }
+unsigned long copy_to_user(void *to, const void *from, unsigned long n) {
+  memcpy(to, from, n); return 0;
+}
+socket_t *socket_create_in_namespace(int domain, int type, int protocol,
+                                     struct net_namespace *net_ns) {
+  assert(!net_ns); return socket_create(domain, type, protocol);
+}
 static void drop(socket_t *s) { inet6_destroy(s); free(s); }
 static void option(socket_t *s, int value) {
   assert(inet6_setsockopt(s, SOL_IPV6, IPV6_V6ONLY, &value, sizeof(value)) == 0);
@@ -80,6 +88,48 @@ static void bind6(socket_t *s, uint16_t port) {
 }
 int main(void) {
   udp_init();
+  /* qBittorrent opens one UDP socket per local interface on the same port. */
+  struct udp_socket *loop = udp_socket_alloc();
+  struct udp_socket *ether = udp_socket_alloc();
+  struct udp_socket *conflict = udp_socket_alloc();
+  assert(udp_bind(loop, 0x7f000001, 46026) == 0);
+  assert(udp_bind(ether, cfg4.address, 46026) == 0);
+  assert(udp_bind(conflict, cfg4.address, 46026) == -98);
+  assert(udp_bind(conflict, 0, 46026) == -98);
+  udp_deliver(0x0a000003, 6881, 46026, (const uint8_t *)"peer", 4);
+  char peer[8];
+  assert(udp_recvfrom(ether, peer, sizeof(peer), NULL, NULL, true, 0) == 4);
+  assert(!memcmp(peer, "peer", 4));
+  assert(udp_recvfrom(loop, peer, sizeof(peer), NULL, NULL, true, 0) == -11);
+  udp_socket_free(loop);
+  assert(udp_bind(conflict, cfg4.address, 46026) == -98);
+  udp_socket_free(ether);
+  assert(udp_bind(conflict, 0, 46026) == 0);
+  loop = udp_socket_alloc();
+  assert(udp_bind(loop, cfg4.address, 46026) == -98);
+  udp_socket_free(loop); udp_socket_free(conflict);
+  struct tcp_tcb *lo_tcp = tcp_alloc(), *eth_tcp = tcp_alloc();
+  struct tcp_tcb *conflict_tcp = tcp_alloc(), *v6_tcp = tcp_alloc();
+  assert(tcp_bind(lo_tcp, 0x7f000001, 46026) == 0);
+  assert(tcp_listen(lo_tcp, 4) == 0);
+  assert(tcp_bind(eth_tcp, cfg4.address, 46026) == 0);
+  assert(tcp_listen(eth_tcp, 4) == 0);
+  assert(tcp_bind(conflict_tcp, cfg4.address, 46026) == -98);
+  assert(tcp_bind(conflict_tcp, 0, 46026) == -98);
+  uint32_t loop_ip = 0x7f000001;
+  assert(find_listener_address_locked(46026, 4, &loop_ip) == lo_tcp);
+  assert(find_listener_address_locked(46026, 4, &cfg4.address) == eth_tcp);
+  uint8_t link_ip[16] = {0xfe, 0x80}; link_ip[15] = 1;
+  assert(tcp_bind6(v6_tcp, link_ip, 46026) == 0);
+  assert(tcp_listen(v6_tcp, 4) == 0);
+  assert(find_listener_address_locked(46026, 6, link_ip) == v6_tcp);
+  tcp_free(lo_tcp);
+  assert(tcp_bind(conflict_tcp, cfg4.address, 46026) == -98);
+  tcp_free(eth_tcp); tcp_free(v6_tcp);
+  assert(tcp_bind(conflict_tcp, 0, 46026) == 0);
+  lo_tcp = tcp_alloc();
+  assert(tcp_bind(lo_tcp, cfg4.address, 46026) == -98);
+  tcp_free(lo_tcp); tcp_free(conflict_tcp);
   socket_t *s = socket_create(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
   option(s, 2); option(s, 0);
   int off = 0;

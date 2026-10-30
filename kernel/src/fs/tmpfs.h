@@ -53,6 +53,10 @@ typedef struct tmpfs_sb {
     spinlock_t lock;
 } tmpfs_sb_t;
 
+bool tmpfs_is_shmem(vfs_node_t *node);
+uint64_t tmpfs_fault_page(vfs_node_t *node, uint64_t offset);
+vfs_node_t *tmpfs_create_memfd(const char *name);
+
 void        tmpfs_mount_at(const char *path);
 void        tmpfs_mount_at_sized(const char *path, uint64_t max_bytes, uint64_t max_inodes);
 vfs_node_t *tmpfs_create_root(tmpfs_sb_t *sb);

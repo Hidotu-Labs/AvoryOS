@@ -520,6 +520,14 @@ retry:
         }
         if (!best_mid)
             best_mid = &mid_idxs[0];
+        /* Out-of-order writes can extend the first child to the left.
+         * Keep every ancestor's lower bound consistent with that child,
+         * including when the insertion below splits a leaf or index. */
+        bool lowered_mid = logical_block < best_mid->ei_block;
+        if (lowered_mid)
+            best_mid->ei_block = logical_block;
+        if (logical_block < best_root->ei_block)
+            best_root->ei_block = logical_block;
         uint64_t leaf_phys = ext4_idx_get_pblock(best_mid);
         if (!leaf_phys || leaf_phys > EXT4_MAX_PHYS_BLOCK) {
             kfree(idx_buf);
@@ -548,6 +556,8 @@ retry:
             leaf, (ext4_extent_t *)(leaf + 1), logical_block, phys_block, len);
         if (result == 0) {
             result = ext4_extent_write_node(mnt, leaf_phys, leaf_buf);
+            if (result == 0 && lowered_mid)
+                result = ext4_extent_write_node(mnt, idx_phys, idx_buf);
         } else if (result == 1) {
             /* Leaf is full. Split leaf into leaf and new_leaf */
             uint16_t total = leaf->eh_entries + 1;
@@ -632,6 +642,8 @@ retry:
     }
     if (!best)
         best = &idxs[0];
+    if (logical_block < best->ei_block)
+        best->ei_block = logical_block;
     uint64_t leaf_phys = ext4_idx_get_pblock(best);
     if (!leaf_phys || leaf_phys > EXT4_MAX_PHYS_BLOCK) {
         return -1;

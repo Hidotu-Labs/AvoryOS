@@ -89,6 +89,8 @@ void fill_kstat(struct kstat *ks, vfs_node_t *node) {
 // stat / lstat / fstat
 // ---------------------------------------------------------------------------
 
+static uint64_t copy_statat_result(void *, const struct kstat *, bool);
+
 static uint64_t sys_stat(uint64_t path_ptr, uint64_t statbuf_ptr, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
@@ -149,8 +151,9 @@ static uint64_t sys_fstat(uint64_t fd, uint64_t statbuf_ptr, uint64_t a2,
     struct thread *t = sched_get_current();
     if (!FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->fds[fd])) return (uint64_t)-9;
 
-    fill_kstat(ks, t->fds[fd]);
-    return 0;
+    struct kstat result = {0};
+    fill_kstat(&result, t->fds[fd]);
+    return copy_statat_result(ks, &result, t->seccomp_compat_dispatch);
 }
 
 // ---------------------------------------------------------------------------
@@ -201,11 +204,11 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
                 if ((int)dirfd == AT_FDCWD) {
                     base_dir = (t && t->cwd_node) ? t->cwd_node : fs_root;
                 } else {
-                    if (!FD_IN_RANGE(t, dirfd) || !t->fds[dirfd]) {
+                    if (!FD_IN_RANGE(t, (int)dirfd) || !t->fds[(int)dirfd]) {
                         if (base_owned) vfs_close(base_owned);
                         return (uint64_t)-9;
                     }
-                    base_dir = t->fds[dirfd];
+                    base_dir = t->fds[(int)dirfd];
                 }
             }
             if ((flags & AT_SYMLINK_NOFOLLOW) && kpathp[0] != '/') {
@@ -226,9 +229,9 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
                     node_owned = true;
                 }
             } else {
-                if (!FD_IN_RANGE(t, dirfd) || !t->fds[dirfd])
+                if (!FD_IN_RANGE(t, (int)dirfd) || !t->fds[(int)dirfd])
                     return (uint64_t)-9;
-                node = t->fds[dirfd];
+                node = t->fds[(int)dirfd];
             }
         } else {
             /* Empty string without AT_EMPTY_PATH: ENOENT like Linux, not
@@ -311,7 +314,7 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
 // newfstatat
 // ---------------------------------------------------------------------------
 
-static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
+static uint64_t fill_statat(uint64_t dirfd, uint64_t pathname_ptr,
                                 uint64_t statbuf_ptr, uint64_t flags,
                                 uint64_t a4, uint64_t a5) {
     (void)a4; (void)a5;
@@ -323,9 +326,14 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
     if (!t) return (uint64_t)-1;
 
     if ((flags & AT_EMPTY_PATH) && path && path[0] == '\0') {
-        if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
+        if ((int)dirfd == AT_FDCWD) {
+            vfs_node_t *cwd = (t && t->cwd_node) ? t->cwd_node : fs_root;
+            fill_kstat(ks, cwd);
+            return 0;
+        }
+        if (!FD_IN_RANGE(t, (int)dirfd) || !fd_is_valid_node(t->fds[(int)dirfd]))
             return (uint64_t)-9;
-        fill_kstat(ks, t->fds[dirfd]);
+        fill_kstat(ks, t->fds[(int)dirfd]);
         return 0;
     }
     if (!path) return (uint64_t)-14;
@@ -336,9 +344,9 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
         if ((int)dirfd == AT_FDCWD) {
             base_dir = (t && t->cwd_node) ? t->cwd_node : fs_root;
         } else {
-            if (!FD_IN_RANGE(t, dirfd) || !fd_is_valid_node(t->fds[dirfd]))
+            if (!FD_IN_RANGE(t, (int)dirfd) || !fd_is_valid_node(t->fds[(int)dirfd]))
                 return (uint64_t)-9;
-            base_dir = t->fds[dirfd];
+            base_dir = t->fds[(int)dirfd];
             if ((base_dir->flags & FS_TYPE_MASK) != FS_DIRECTORY)
                 return (uint64_t)-20;
         }
@@ -364,6 +372,65 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
     if (node_owned) vfs_close(node);
     if (base_owned) vfs_close(base_owned);
     return 0;
+}
+
+/* i386 stat64 has 4-byte alignment and a different field order from kstat.
+ * Never forward the native 144-byte output into its 96-byte userspace buffer. */
+struct compat_stat64 {
+    uint64_t dev;
+    uint8_t pad0[4];
+    uint32_t ino_low, mode, nlink, uid, gid;
+    uint64_t rdev;
+    uint8_t pad1[4];
+    int64_t size;
+    uint32_t blksize;
+    uint64_t blocks;
+    uint32_t atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec;
+    uint64_t ino;
+} __attribute__((packed, aligned(4)));
+_Static_assert(sizeof(struct compat_stat64) == 96, "i386 stat64 size");
+_Static_assert(__builtin_offsetof(struct compat_stat64, size) == 44,
+               "i386 stat64 size offset");
+_Static_assert(__builtin_offsetof(struct compat_stat64, ino) == 88,
+               "i386 stat64 inode offset");
+
+static uint64_t copy_statat_result(void *out, const struct kstat *ks, bool compat) {
+    if (!compat)
+        return copy_to_user(out, ks, sizeof(*ks)) ? (uint64_t)-14 : 0;
+    if (ks->st_nlink > UINT32_MAX || (uint64_t)ks->st_blksize > UINT32_MAX)
+        return (uint64_t)-75;
+    struct compat_stat64 result = {
+        .dev=ks->st_dev, .ino_low=(uint32_t)ks->st_ino,
+        .mode=ks->st_mode, .nlink=ks->st_nlink, .uid=ks->st_uid, .gid=ks->st_gid,
+        .rdev=ks->st_rdev, .size=ks->st_size, .blksize=ks->st_blksize,
+        .blocks=ks->st_blocks, .atime_sec=ks->st_atim_sec,
+        .atime_nsec=ks->st_atim_nsec, .mtime_sec=ks->st_mtim_sec,
+        .mtime_nsec=ks->st_mtim_nsec, .ctime_sec=ks->st_ctim_sec,
+        .ctime_nsec=ks->st_ctim_nsec, .ino=ks->st_ino
+    };
+    return copy_to_user(out, &result, sizeof(result)) ? (uint64_t)-14 : 0;
+}
+
+static void stat_path_release(char **path) { if (*path) kfree(*path); }
+
+static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
+                                uint64_t statbuf_ptr, uint64_t flags,
+                                uint64_t a4, uint64_t a5) {
+    if (flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | 0x800 /* AT_NO_AUTOMOUNT */))
+        return (uint64_t)-22;
+    char *path __attribute__((cleanup(stat_path_release))) = kmalloc(4096);
+    if (!path) return (uint64_t)-12;
+    long length = strncpy_from_user(path, (void *)pathname_ptr, 4096);
+    if (length < 0) return (uint64_t)-14;
+    if (length >= 4096) return (uint64_t)-36;
+    if (!path[0] && !(flags & AT_EMPTY_PATH)) return (uint64_t)-2;
+    struct kstat ks = {0};
+    uint64_t ret = fill_statat(dirfd, (uint64_t)path, (uint64_t)&ks,
+                              flags, a4, a5);
+    if (ret) return ret;
+    struct thread *t = sched_get_current();
+    return copy_statat_result((void *)statbuf_ptr, &ks,
+                              t && t->seccomp_compat_dispatch);
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +466,7 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
     if (!buf || !is_user_ptr((uint64_t)buf)) return (uint64_t)-14;
 
     size_t   written = 0;
-    uint64_t cookie  = t->fd_offsets[fd];
+    uint64_t cookie  = fd_offset_get(t, fd);
 
     while (1) {
         struct dirent *de = vfs_readdir(node, cookie);
@@ -424,7 +491,7 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
         cookie = de->d_off;
     }
 
-    t->fd_offsets[fd] = cookie;
+    fd_offset_set(t, fd, cookie);
     return written;
 }
 
@@ -442,7 +509,7 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
     if (!buf || !vmm_is_user_addr_range_valid(dirp, count)) return (uint64_t)-14;
 
     size_t   written = 0;
-    uint64_t cookie  = t->fd_offsets[fd];
+    uint64_t cookie  = fd_offset_get(t, fd);
 
     while (1) {
         struct dirent *de = vfs_readdir(node, cookie);
@@ -462,7 +529,7 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
         cookie = de->d_off;
     }
 
-    t->fd_offsets[fd] = cookie;
+    fd_offset_set(t, fd, cookie);
     return written;
 }
 
@@ -509,12 +576,36 @@ static int64_t statfs_handle_missing(vfs_node_t *node, struct statfs_buf *buf) {
     return -38; /* ENOSYS */
 }
 
+struct compat_statfs64 {
+    uint32_t type, bsize;
+    uint64_t blocks, bfree, bavail, files, ffree;
+    int32_t fsid[2];
+    uint32_t namelen, frsize, flags, spare[4];
+} __attribute__((packed, aligned(4)));
+_Static_assert(sizeof(struct compat_statfs64) == 84, "i386 statfs64 ABI");
+static size_t statfs_user_size(void) {
+    struct thread *t = sched_get_current();
+    return t && t->seccomp_compat_dispatch ? 84 : sizeof(struct statfs_buf);
+}
+static int statfs_copy_result(uint64_t ptr, const struct statfs_buf *b) {
+    if (statfs_user_size() == 84) {
+        struct compat_statfs64 out = {
+            .type=b->f_type, .bsize=b->f_bsize, .blocks=b->f_blocks,
+            .bfree=b->f_bfree, .bavail=b->f_bavail, .files=b->f_files,
+            .ffree=b->f_ffree, .fsid={b->f_fsid[0],b->f_fsid[1]},
+            .namelen=b->f_namelen, .frsize=b->f_frsize, .flags=b->f_flags
+        };
+        return copy_to_user((void *)ptr, &out, sizeof(out));
+    }
+    return copy_to_user((void *)ptr, b, sizeof(*b));
+}
+
 static uint64_t sys_statfs(uint64_t path_ptr, uint64_t buf_ptr, uint64_t a3,
                             uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
     if (!path_ptr || !buf_ptr || !is_user_ptr(path_ptr))
         return (uint64_t)-14;
-    if (!vmm_is_user_addr_range_valid(buf_ptr, sizeof(struct statfs_buf)))
+    if (!vmm_is_user_addr_range_valid(buf_ptr, statfs_user_size()))
         return (uint64_t)-14;
 
     /* Copy the pathname into kernel memory first: the VFS walk below
@@ -532,7 +623,11 @@ static uint64_t sys_statfs(uint64_t path_ptr, uint64_t buf_ptr, uint64_t a3,
         return (uint64_t)-36; /* ENAMETOOLONG */
     kpath[sizeof(kpath) - 1] = '\0';
 
-    vfs_node_t *node = vfs_resolve_path(kpath);
+    struct thread *t = sched_get_current();
+    vfs_node_t *cwd = (kpath[0] == '/')
+                          ? fs_root
+                          : (t && t->cwd_node ? t->cwd_node : fs_root);
+    vfs_node_t *node = vfs_resolve_path_at(cwd, kpath);
     if (!node) return (uint64_t)-2;
 
     struct statfs_buf kbuf;
@@ -543,7 +638,7 @@ static uint64_t sys_statfs(uint64_t path_ptr, uint64_t buf_ptr, uint64_t a3,
     vfs_close(node);
     if (ret != 0)
         return (uint64_t)ret;
-    if (copy_to_user((void *)buf_ptr, &kbuf, sizeof(kbuf)) != 0)
+    if (statfs_copy_result(buf_ptr, &kbuf) != 0)
         return (uint64_t)-14;
     return 0;
 }
@@ -554,7 +649,7 @@ static uint64_t sys_fstatfs(uint64_t fd, uint64_t buf_ptr, uint64_t a3,
     struct thread *t = sched_get_current();
     if (!FD_IN_RANGE(t, fd) || !t->fds[fd]) return (uint64_t)-9;
     if (!buf_ptr ||
-        !vmm_is_user_addr_range_valid(buf_ptr, sizeof(struct statfs_buf)))
+        !vmm_is_user_addr_range_valid(buf_ptr, statfs_user_size()))
         return (uint64_t)-14;
 
     vfs_node_t        *node = t->fds[fd];
@@ -565,7 +660,7 @@ static uint64_t sys_fstatfs(uint64_t fd, uint64_t buf_ptr, uint64_t a3,
         ret = (int)statfs_handle_missing(node, &kbuf);
     if (ret != 0)
         return (uint64_t)ret;
-    if (copy_to_user((void *)buf_ptr, &kbuf, sizeof(kbuf)) != 0)
+    if (statfs_copy_result(buf_ptr, &kbuf) != 0)
         return (uint64_t)-14;
     return 0;
 }

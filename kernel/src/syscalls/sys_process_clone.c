@@ -332,6 +332,9 @@ uint64_t sys_fork(struct syscall_regs *regs) {
            sizeof(child->signal_handlers));
     child->fs_base = parent->fs_base;
     child->gs_base = parent->gs_base;
+  memcpy(child->compat_tls, parent->compat_tls, sizeof(child->compat_tls));
+  child->compat_fs = parent->compat_fs;
+  child->compat_gs = parent->compat_gs;
     child->umask = parent->umask;
     child->uid = parent->uid;
     child->gid = parent->gid;
@@ -388,6 +391,15 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   struct thread *parent = sched_get_current();
   if (!parent || !parent->mm)
     return (uint64_t)-22;
+
+  uint32_t compat_entry = 0, compat_base = 0;
+  uint64_t compat_descriptor = 0;
+  bool compat_tls = parent->seccomp_compat_dispatch && (flags & CLONE_SETTLS);
+  if (compat_tls) {
+    extern int compat_clone_tls(uint64_t, uint32_t *, uint32_t *, uint64_t *);
+    int error = compat_clone_tls(newtls, &compat_entry, &compat_base, &compat_descriptor);
+    if (error) return (uint64_t)(int64_t)error;
+  }
 
   /* Linux clone flag dependencies. */
   if ((flags & CLONE_SIGHAND) && !(flags & CLONE_VM))
@@ -582,6 +594,15 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   child->tgid = (flags & CLONE_THREAD) ? parent->tgid : child->tid;
   child->fs_base = (flags & CLONE_SETTLS) ? newtls : parent->fs_base;
   child->gs_base = parent->gs_base;
+  memcpy(child->compat_tls, parent->compat_tls, sizeof(child->compat_tls));
+  child->compat_fs = parent->compat_fs;
+  child->compat_gs = parent->compat_gs;
+  if (compat_tls) {
+    child->compat_tls[compat_entry - 6] = compat_descriptor;
+    child->compat_gs = (compat_entry << 3) | 3;
+    child->gs_base = compat_base;
+    child->fs_base = parent->fs_base;
+  }
   child->tid_address =
       (flags & CLONE_CHILD_CLEARTID) ? (uint64_t *)ctid : NULL;
   child->child_set_tid = (flags & CLONE_CHILD_SETTID) ? ctid : 0;
@@ -764,6 +785,9 @@ uint64_t sys_vfork(struct syscall_regs *regs) {
          sizeof(child->signal_handlers));
   child->fs_base = parent->fs_base;
   child->gs_base = parent->gs_base;
+  memcpy(child->compat_tls, parent->compat_tls, sizeof(child->compat_tls));
+  child->compat_fs = parent->compat_fs;
+  child->compat_gs = parent->compat_gs;
   child->umask = parent->umask;
   child->uid = parent->uid;
   child->gid = parent->gid;

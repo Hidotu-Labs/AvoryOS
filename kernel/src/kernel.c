@@ -164,6 +164,25 @@ static bool cmdline_has(const char *name) {
   return kernel_boot_cmdline && strstr(kernel_boot_cmdline, name) != NULL;
 }
 
+/* Match a complete option so unrelated parameter values cannot enable tests. */
+static bool boot_selftests_enabled(void) {
+  const char *p = kernel_boot_cmdline;
+  const char option[] = "boot_selftest=1";
+  if (!p)
+    return false;
+  while (*p) {
+    while (*p && strchr(" \t\r\n", *p))
+      p++;
+    size_t len = 0;
+    while (p[len] && !strchr(" \t\r\n", p[len]))
+      len++;
+    if (len == sizeof(option) - 1 && !memcmp(p, option, len))
+      return true;
+    p += len;
+  }
+  return false;
+}
+
 static uint32_t cmdline_uint(const char *name, uint32_t fallback) {
   if (!kernel_boot_cmdline)
     return fallback;
@@ -245,7 +264,8 @@ static void init_thread_entry(void) {
 
   /* ── NUMA Subsystem self test ── */
   extern void test_numa(void);
-  test_numa();
+  if (boot_selftests_enabled())
+    test_numa();
 
   // Clear console only once when userland starts
   if (!cmdline_has("screenlog")) {
@@ -447,35 +467,38 @@ void kmain(void) {
 
   heap_init();
 
-  /* ── LinuxKPI Phase 1a stress test ── */
-  extern void linuxkpi_test_1a(void);
-  linuxkpi_test_1a();
+  /* Explicit diagnostics only: benchmarks must not delay normal boots. */
+  if (boot_selftests_enabled()) {
+    /* ── LinuxKPI Phase 1a stress test ── */
+    extern void linuxkpi_test_1a(void);
+    linuxkpi_test_1a();
 
-  /* ── LinuxKPI Phase 1b stress test ── */
-  extern void linuxkpi_test_1b(void);
-  linuxkpi_test_1b();
+    /* ── LinuxKPI Phase 1b stress test ── */
+    extern void linuxkpi_test_1b(void);
+    linuxkpi_test_1b();
 
-  /* ── PCID Hardware Tagging & Benchmark test ── */
-  extern void test_pcid(void);
-  test_pcid();
+    /* ── PCID Hardware Tagging & Benchmark test ── */
+    extern void test_pcid(void);
+    test_pcid();
 
-  /* ── Batched TLB Shootdown Clone test ── */
-  extern void test_vmm_clone(void);
-  test_vmm_clone();
+    /* ── Batched TLB Shootdown Clone test ── */
+    extern void test_vmm_clone(void);
+    test_vmm_clone();
 
-  /* ── Zero-Fill Neighbor Alias test (gdb us SIGSEGV regression: a present
-   * anonymous data page must never read back zero after zero-page installs
-   * in neighboring holes) ── */
-  extern void test_zero_alias(void);
-  test_zero_alias();
+    /* ── Zero-Fill Neighbor Alias test (gdb us SIGSEGV regression: a present
+     * anonymous data page must never read back zero after zero-page installs
+     * in neighboring holes) ── */
+    extern void test_zero_alias(void);
+    test_zero_alias();
 
-  /* ── Fast Word-at-a-time uaccess test ── */
-  extern void test_uaccess(void);
-  test_uaccess();
+    /* ── Fast Word-at-a-time uaccess test ── */
+    extern void test_uaccess(void);
+    test_uaccess();
 
-  /* ── Hardware-Accelerated Page Operations test ── */
-  extern void test_page_ops(void);
-  test_page_ops();
+    /* ── Hardware-Accelerated Page Operations test ── */
+    extern void test_page_ops(void);
+    test_page_ops();
+  }
 
   slab_cache_init();
 
@@ -486,7 +509,8 @@ void kmain(void) {
   vma_cache = kmem_cache_create("vma", sizeof(struct vma), 8, NULL, NULL);
 
   extern void tmpfs_test(void);
-  tmpfs_test();
+  if (boot_selftests_enabled())
+    tmpfs_test();
 
   dma_alloc_init();
   sb16_reserve_dma();
@@ -546,7 +570,8 @@ void kmain_high_half(void) {
    * Runs after sched_init(): the test deliberately takes page faults, and the
    * #PF path needs a valid current thread (cpu_init() has already set GS). */
   extern void test_smep_smap(void);
-  test_smep_smap();
+  if (boot_selftests_enabled())
+    test_smep_smap();
 
   if (lapic_base && ioapic_base) {
     klog_puts("\n" KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
@@ -617,9 +642,11 @@ void kmain_high_half(void) {
 
   /* ── Per-CPU Page Allocator (PCP) self-test ── */
   extern void test_pmm_pcp(void);
-  test_pmm_pcp();
+  if (boot_selftests_enabled())
+    test_pmm_pcp();
   extern void test_dma_cache(void);
-  test_dma_cache();
+  if (boot_selftests_enabled())
+    test_dma_cache();
 
   /* `tlb_bench=1` measures the single-page shootdown path once the APs are
    * online and can answer IPIs.  Run after the APs' own boot prints so the
@@ -868,7 +895,8 @@ mount_success:
    * initcall (module_init-style drivers bind here once they are imported). */
   extern void linuxkpi_test_phase0(void);
   extern void linuxkpi_run_initcalls(void);
-  linuxkpi_test_phase0();
+  if (boot_selftests_enabled())
+    linuxkpi_test_phase0();
 #ifdef LINUXKPI_LINUX_IMPORTED
   extern void linuxkpi_radix_init(void);
   extern void linuxkpi_time_init(void);
@@ -900,7 +928,8 @@ mount_success:
   ascentdrm_register_render_vfs();
   /* The Phase 1 suites sleep too; they get their own kthread instead of the
    * idle context kmain_high_half runs in. */
-  linuxkpi_run_boot_tests();
+  if (boot_selftests_enabled())
+    linuxkpi_run_boot_tests();
   /* `rcu_bench=1` measures the KPI RCU read side and grace-period latency
    * (spawns its own kthread). */
   extern void rcu_bench_maybe_run(void);

@@ -438,7 +438,6 @@ void sched_terminate_thread_group(struct thread *current) {
 }
 
 void sched_reap_orphaned_zombies(void) {
-  struct thread *to_reap = NULL;
   extern struct thread *global_thread_list;
   extern spinlock_t tid_lock;
 
@@ -486,16 +485,14 @@ void sched_reap_orphaned_zombies(void) {
         t->parent = NULL;
       }
       t->state = THREAD_DEAD;
-      t->sibling_next = to_reap;
-      to_reap = t;
+      t->sibling_next = NULL;
+      /* Claim the victim before dropping tid_lock. A temporary sibling
+       * chain outside this lock can be overwritten by another idle CPU's
+       * orphan scan, or freed by a reaper before we consume its next link.
+       * The reaper takes tid_lock before unlinking/freeing a queued task. */
+      sched_queue_reap(t);
     }
   }
   spinlock_release(&tid_lock);
 
-  while (to_reap) {
-    struct thread *victim = to_reap;
-    to_reap = to_reap->sibling_next;
-    victim->sibling_next = NULL;
-    sched_queue_reap(victim);
-  }
 }

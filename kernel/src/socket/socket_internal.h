@@ -178,6 +178,8 @@ typedef struct netlink_sock {
   bool keepalive;           // SOL_SOCKET state; no TCP timers on Netlink
   bool ext_ack;             // Optional extended ACK metadata requested
   bool passcred;            // SO_PASSCRED — attach SCM_CREDENTIALS in recvmsg
+  bool pktinfo;             // NETLINK_PKTINFO — multicast group in recvmsg
+  bool no_enobufs;          // NETLINK_NO_ENOBUFS — suppress ENOBUFS notifications
   sk_buff_head_t recv_queue;
   struct list_head list;
 } netlink_sock_t;

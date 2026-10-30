@@ -42,6 +42,9 @@ struct sockaddr_nl {
 #define NETLINK_EXT_ACK 11
 #define NETLINK_ADD_MEMBERSHIP 1
 #define NETLINK_DROP_MEMBERSHIP 2
+#define NETLINK_PKTINFO 3
+#define NETLINK_NO_ENOBUFS 5
+#define NETLINK_LIST_MEMBERSHIPS 9
 
 // Socket Types
 #define SOCK_STREAM 1    // Stream (connection-oriented)

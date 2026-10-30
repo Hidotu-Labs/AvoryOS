@@ -579,6 +579,17 @@ vfs_node_t *vfs_namespace_resolve(vfs_node_t *dir, const char *path) {
       }
       if (n->get_link) {
         vfs_node_t *target = n->get_link(n);
+        bool proc_self_dir = target &&
+            (target->flags & FS_TYPE_MASK) == FS_DIRECTORY &&
+            !strcmp(n->name, "self");
+        if (proc_self_dir) {
+          /* /proc/self is a direct alias for a PID directory. Preserve its
+           * proc-root ancestry in this mount namespace when following it. */
+          vfs_node_t *view = make_view(target, cur,
+                                       n->mount_id ? n->mount_id : cur->mount_id);
+          vfs_close(target);
+          target = view;
+        }
         vfs_close(n);
         if (!target)
           goto fail;

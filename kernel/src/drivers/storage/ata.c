@@ -55,6 +55,8 @@ static int ata_wait_bsy(uint16_t io_base) {
   // Wait for BSY to clear, with a timeout
   for (int i = 0; i < 100000; i++) {
     uint8_t status = inb(io_base + ATA_REG_STATUS);
+    if (status == 0xFF || status == 0)
+      return -1; // Floating bus or absent device: no reason to keep polling
     if (!(status & ATA_SR_BSY))
       return 0;
   }
@@ -64,6 +66,8 @@ static int ata_wait_bsy(uint16_t io_base) {
 static int ata_wait_drq(uint16_t io_base) {
   for (int i = 0; i < 100000; i++) {
     uint8_t status = inb(io_base + ATA_REG_STATUS);
+    if (status == 0xFF || status == 0)
+      return -1;
     if (status & ATA_SR_BSY)
       continue;
     if (status & ATA_SR_ERR)
@@ -98,7 +102,7 @@ static bool ata_identify_unlocked(struct ata_drive *drive) {
 
   // Check if drive exists
   uint8_t status = inb(io + ATA_REG_STATUS);
-  if (status == 0)
+  if (status == 0 || status == 0xFF)
     return false; // No drive
 
   // Wait for BSY to clear

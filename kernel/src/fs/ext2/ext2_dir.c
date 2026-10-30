@@ -1,6 +1,7 @@
 #include "ext2_internal.h"
 #include "fs/ext4/ext4_dir_index.h"
 #include "fs/ext4/ext4_extent.h"
+#include "sched/sched.h"
 
 static uint8_t ext2_dirent_dtype(uint8_t file_type) {
   switch (file_type) {
@@ -198,10 +199,12 @@ int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
   if (ext2_read_inode(mnt, dir_inode_num, &dir_inode))
     return -1;
   if (dir_inode.i_flags & EXT2_INDEX_FL) {
-    int dx_ret = ext4_dx_add_entry(mnt, dir_inode_num, &dir_inode,
-                                   child_inode_num, name, file_type);
-    if (dx_ret == 0)
-      return 0;
+    /* The apparent slack in the root's '..' record contains the HTree
+     * index. A failed indexed insertion must not fall through and overwrite
+     * it with a dirent. This also applies to unsupported tree depths and
+     * failed splits, which may already have staged journal updates. */
+    return ext4_dx_add_entry(mnt, dir_inode_num, &dir_inode,
+                             child_inode_num, name, file_type);
   }
 
   uint32_t name_len = strlen(name);
@@ -479,6 +482,13 @@ int ext2_create_impl(vfs_node_t *node, char *name, uint16_t permission) {
   ext2_inode_t new_inode;
   memset(&new_inode, 0, sizeof(ext2_inode_t));
   new_inode.i_mode        = EXT2_S_IFREG | (permission & 0x0FFF);
+  /* Publish the creator's ownership with the inode. IN_CREATE listeners and
+   * other path walkers can run before the syscall's follow-up chown; exposing
+   * uid 0 here lets them cache a root-owned copy of a user's new directory. */
+  struct thread *creator = sched_get_current();
+  new_inode.i_uid = creator ? creator->fsuid : 0;
+  new_inode.i_gid = (node->mask & 02000) ? node->gid
+                                      : (creator ? creator->fsgid : 0);
   new_inode.i_size        = 0;
   new_inode.i_links_count = 1;
   new_inode.i_blocks      = 0;
@@ -538,6 +548,13 @@ int ext2_mkdir_impl(vfs_node_t *node, char *name, uint16_t permission) {
   ext2_inode_t new_inode;
   memset(&new_inode, 0, sizeof(ext2_inode_t));
   new_inode.i_mode        = EXT2_S_IFDIR | (permission & 0x0FFF);
+  /* Publish the creator's ownership with the inode. IN_CREATE listeners and
+   * other path walkers can run before the syscall's follow-up chown; exposing
+   * uid 0 here lets them cache a root-owned copy of a user's new directory. */
+  struct thread *creator = sched_get_current();
+  new_inode.i_uid = creator ? creator->fsuid : 0;
+  new_inode.i_gid = (node->mask & 02000) ? node->gid
+                                      : (creator ? creator->fsgid : 0);
   new_inode.i_size        = mnt->block_size;
   new_inode.i_links_count = 2;
   new_inode.i_blocks      = mnt->block_size / 512;

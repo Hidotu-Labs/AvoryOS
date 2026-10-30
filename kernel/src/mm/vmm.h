@@ -102,6 +102,16 @@ void vmm_drain_deferred_work(void);
 // Returns true if the address is mapped with a huge page (PS bit set on PD/PDPT)
 bool vmm_is_huge_page(uint64_t *pml4, uint64_t virtual_addr);
 
+/* Lockless hint: true when the 2 MB range holding virtual_addr has no page
+ * table or huge leaf yet, so a huge page could be installed there. The install
+ * (vmm_map_huge_page) still rechecks under the lock. */
+bool vmm_huge_slot_free(uint64_t *pml4, uint64_t virtual_addr);
+
+/* Transparent huge page policy for anonymous VMAs. */
+enum { THP_MODE_MADVISE = 0, THP_MODE_ALWAYS = 1 };
+int vmm_thp_mode(void);
+void vmm_set_thp_mode(int mode);
+
 // Replaces a 2 MB leaf mapping with 512 4 KB entries so that only part of it
 // can be torn down.  Returns false only if the page table for the split could
 // not be allocated; true also when the address was already 4 KB mapped.

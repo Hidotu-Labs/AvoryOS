@@ -280,8 +280,9 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
   } else {
     // Auto-select address from SHM mmap region
     if (t->mm) {
-      vaddr = vma_find_gap(&t->mm->vmas, aligned_size, SHM_MMAP_REGION_BASE,
-                           SHM_MMAP_REGION_LIMIT);
+      vaddr = vma_find_gap(&t->mm->vmas, aligned_size,
+                           t->mm->compat32 ? 0x50000000ULL : SHM_MMAP_REGION_BASE,
+                           t->mm->compat32 ? 0xb0000000ULL : SHM_MMAP_REGION_LIMIT);
     } else {
       vaddr = 0;
     }
