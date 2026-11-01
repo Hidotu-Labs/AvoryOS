@@ -231,10 +231,16 @@ static void fd_release_kvec(struct iovec *vec, struct iovec *stack) {
  * Firefox uses this to create a read-only descriptor for a memfd. */
 static bool parse_proc_self_fd_path(const char *path, uint64_t *fd_out) {
   static const char prefix[] = "/proc/self/fd/";
-  if (!path || !fd_out || strncmp(path, prefix, sizeof(prefix) - 1) != 0)
+  static const char dev_prefix[] = "/dev/fd/";
+  if (!path || !fd_out)
     return false;
-
-  const char *p = path + sizeof(prefix) - 1;
+  const char *p;
+  if (strncmp(path, prefix, sizeof(prefix) - 1) == 0)
+    p = path + sizeof(prefix) - 1;
+  else if (strncmp(path, dev_prefix, sizeof(dev_prefix) - 1) == 0)
+    p = path + sizeof(dev_prefix) - 1;
+  else
+    return false;
   if (*p < '0' || *p > '9')
     return false;
   uint64_t fd = 0;
@@ -539,12 +545,37 @@ device_vfs_lookup:
   if (!node) {
     uint64_t proc_fd;
     if (!t->namei_resolve_flags && !(flags & O_NOFOLLOW) && parse_proc_self_fd_path(path, &proc_fd)) {
-      node = fd_pin_node(t, proc_fd, NULL, NULL);
+      uint64_t source_flags;
+      node = fd_pin_node(t, proc_fd, NULL, &source_flags);
       if (!node)
         return (uint64_t)-2; // ENOENT: no such open descriptor
       /* Treat the pin as the resolver's owned reference. open_done() takes
        * the descriptor reference and drops this temporary reference. */
       node_owned = true;
+      if ((node->flags & FS_TYPE_MASK) == FS_PIPE && !(flags & O_PATH)) {
+        /* A pipe descriptor already refers to an open endpoint, not a FIFO
+         * inode: fifo_open() cannot reopen its private pipe state. Retain the
+         * endpoint for same-direction opens such as bash process substitution. */
+        if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
+          vfs_close(node);
+          return (uint64_t)-17;
+        }
+        if (flags & O_DIRECTORY) {
+          vfs_close(node);
+          return (uint64_t)-20;
+        }
+        if ((flags & O_ACCMODE) != (source_flags & O_ACCMODE)) {
+          vfs_close(node);
+          return (uint64_t)-95; // Cross-direction pipe reopening unsupported.
+        }
+        uint32_t access = (flags & O_ACCMODE) == O_RDONLY ? 4 :
+                          (flags & O_ACCMODE) == O_WRONLY ? 2 : 6;
+        if (!vfs_access(node, access)) {
+          vfs_close(node);
+          return (uint64_t)-13;
+        }
+        goto open_done;
+      }
     }
   }
 
@@ -1482,6 +1513,19 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       return (uint64_t)-14;
     }
     payload_offset += len;
+  }
+
+  /* Remember the last thing written to stderr, as sys_write() does: GLib and
+   * most C++ runtimes report a fatal error with writev() just before abort(),
+   * and that text is the only explanation a crash report can show. */
+  if (fd == 2 && payload && payload_size) {
+    struct thread *st = sched_get_current();
+    if (st) {
+      size_t keep = payload_size < sizeof(st->last_stderr) - 1
+                        ? payload_size : sizeof(st->last_stderr) - 1;
+      memcpy(st->last_stderr, payload, keep);
+      st->last_stderr[keep] = '\0';
+    }
   }
 
   /* A socket writev is one send operation.  Splitting it into write calls can

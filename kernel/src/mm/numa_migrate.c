@@ -34,6 +34,13 @@ int numa_migrate_page(struct thread *t, uint64_t vaddr, int target_node) {
 
   uint64_t old_phys = *pte_ptr & PAGE_MASK;
 
+  // A locked page keeps its frame: KVM maps it into a guest NPT, and moving
+  // it would leave the guest reading the old frame.
+  if (*pte_ptr & PAGE_FLAG_MLOCKED) {
+    spinlock_release(&t->mm->lock);
+    return -16; // EBUSY
+  }
+
   // If already on the target node, nothing to do
   if (numa_phys_to_node(old_phys) == target_node) {
     spinlock_release(&t->mm->lock);

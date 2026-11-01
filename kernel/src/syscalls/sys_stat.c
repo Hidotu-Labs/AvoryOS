@@ -540,6 +540,7 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
 #define PIPEFS_MAGIC 0x50495045
 #define SOCKFS_MAGIC 0x534F434B
 #define ANON_INODE_FS_MAGIC 0x09041934
+#define DEVTMPFS_MAGIC 0x01021994 /* devtmpfs reports the tmpfs magic */
 
 /* Non-storage nodes (pipes, sockets, epoll) carry no filesystem handler.
  * Linux reports them as 0-block pseudo filesystems instead of failing, so
@@ -569,6 +570,13 @@ static int64_t statfs_handle_missing(vfs_node_t *node, struct statfs_buf *buf) {
     if (type == FS_PIPE)   { statfs_pseudo(buf, PIPEFS_MAGIC); return 0; }
     if (type == FS_SOCKET) { statfs_pseudo(buf, SOCKFS_MAGIC); return 0; }
     if (type == FS_EPOLL)  { statfs_pseudo(buf, ANON_INODE_FS_MAGIC); return 0; }
+    /* Device nodes live in /dev, which Linux reports as devtmpfs. udev and
+     * libudev fstatfs() the node they just opened and treated ENOSYS as a
+     * failure; a zero-block memory filesystem is the truthful answer. */
+    if (type == FS_CHARDEV || type == FS_BLOCKDEV) {
+        statfs_pseudo(buf, DEVTMPFS_MAGIC);
+        return 0;
+    }
     if (__atomic_add_fetch(&statfs_nohandler_count, 1, __ATOMIC_RELAXED) <= 8) {
         klogf("[STATFS] no handler: type=%u inode=%u\n", type,
               node ? node->inode : 0);

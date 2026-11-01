@@ -504,6 +504,9 @@ int fifo_open(vfs_node_t *node, uint64_t flags, vfs_node_t **out_node) {
     strncpy(inst->name, node->name, sizeof(inst->name) - 1);
     inst->name[sizeof(inst->name) - 1] = '\0';
     inst->flags = FS_PIPE;
+    inst->mask = node->mask;
+    inst->uid = node->uid;
+    inst->gid = node->gid;
     inst->device = end;
     inst->read = is_reader ? fifo_read : NULL;
     inst->write = is_writer ? fifo_write : NULL;

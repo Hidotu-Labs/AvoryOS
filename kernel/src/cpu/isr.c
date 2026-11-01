@@ -172,6 +172,10 @@ static void isr_panic(struct registers *regs, const char *msg);
  * serial or display state. Normal NMIs retain the existing fatal-exception
  * behavior. */
 static void panic_stop_nmi_handler(struct registers *regs) {
+  /* An NMI that kicks a running guest (AVM) is not an error. */
+  extern bool avm_nmi_kick_consume(void) __attribute__((weak));
+  if (avm_nmi_kick_consume && avm_nmi_kick_consume())
+    return;
   if (panic_screen_is_active()) {
     panic_screen_ack_stopped_cpu();
     panic_screen_stop_this_cpu();
@@ -837,6 +841,8 @@ void isr_report_user_fault(struct registers *regs, int sig,
             klog_puts(" first_rip=");
             klog_hex64(current->fault_regs.rip);
             klog_resolve_fault_address(current, current->fault_regs.rip);
+            klog_puts(" first_addr=");
+            klog_hex64(current->fault_addr);
           }
           klog_puts("; terminating (handler would loop)\n");
         }

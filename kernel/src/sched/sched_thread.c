@@ -849,6 +849,37 @@ uint32_t sched_get_group_threads(uint32_t tgid, uint32_t index, uint32_t *tid) {
   return count;
 }
 
+/* CPU time consumed by one thread (group=false, id is a tid) or by every
+ * thread of a process including exited ones still on the list (group=true, id
+ * is a tgid). Returns false when no such thread exists. */
+bool sched_get_cpu_time_ms(uint32_t id, bool group, bool user_only,
+                           uint64_t *ms) {
+  bool found = false;
+  uint64_t total = 0;
+  spinlock_acquire(&tid_lock);
+  if (!group) {
+    /* Per-thread clocks are read in loops (G1 polls its own CPU clock); a
+     * table lookup keeps that O(1) instead of a walk of every thread. */
+    struct thread *t = find_thread_by_tid_locked(id);
+    if (t && t->state != THREAD_DEAD && t->state != THREAD_ZOMBIE) {
+      found = true;
+      total = user_only ? t->runtime_user_ms : t->runtime_total;
+    }
+  } else {
+    /* Process clocks sum the group; only the rare process-wide clock walks. */
+    for (struct thread *t = global_thread_list; t; t = t->global_next) {
+      if ((t->tgid ? t->tgid : t->tid) != id)
+        continue;
+      found = true;
+      total += user_only ? t->runtime_user_ms : t->runtime_total;
+    }
+  }
+  spinlock_release(&tid_lock);
+  if (found && ms)
+    *ms = total;
+  return found;
+}
+
 uint16_t sched_get_thread_count(void) {
   /* Count is maintained at insert/unlink time - no list walk, no tid_lock
    * (the walk was half of sys_sysinfo's 1.5us). */

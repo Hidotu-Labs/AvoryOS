@@ -828,6 +828,20 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
                                   const struct syscall_regs *regs) {
   if (error_code >= 0) return;
 
+  /* futex() answers EAGAIN (value changed), ETIMEDOUT and EINTR on every
+   * contended lock handoff: a Java process does hundreds of thousands per
+   * minute. They are protocol results, never failures, and recording each one
+   * serialized every CPU on g_sysdiag_lock (a 536 ms wait was caught in a hang
+   * report) with interrupts masked, delaying TLB shootdown acks. */
+  if (syscall_num == 202 /* futex */ &&
+      (error_code == -11 || error_code == -110 || error_code == -4)) {
+    if (t) {
+      t->last_access_nonexec_probe = false;
+      __atomic_store_n(&t->seccomp_deny_pending, false, __ATOMIC_RELAXED);
+    }
+    return;
+  }
+
   uint64_t now_ms = lapic_timer_get_ms();
   bool first_time = false;
   bool severe = sysdiag_is_severe_syscall_error(syscall_num, error_code, regs);
@@ -976,7 +990,12 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
   // Phase 1: is this (num,err,comm) key already tracked? Path capture uses
   // copy_from_user, which must not run under the sysdiag spinlock.
   bool key_known = false;
-  spinlock_acquire(&g_sysdiag_lock);
+  /* Routine errors must never queue behind the global table: if another CPU
+   * holds it, drop this sample (the counters are statistical anyway). */
+  if (severe)
+    spinlock_acquire(&g_sysdiag_lock);
+  else if (!spinlock_try_acquire(&g_sysdiag_lock))
+    return;
   for (size_t i = 0; i < g_syscall_error_count; i++) {
     if (g_syscall_errors[i].used &&
         g_syscall_errors[i].syscall_num == syscall_num &&
@@ -1001,7 +1020,8 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
   if (error_code == -11 && t &&
       sysdiag_eagain_fd_event(syscall_num, regs, &detail_fd, &detail_events)) {
     bool due = true;
-    spinlock_acquire(&g_sysdiag_lock);
+    if (!spinlock_try_acquire(&g_sysdiag_lock))
+      return;
     for (size_t i = 0; i < g_syscall_error_count; i++) {
       if (g_syscall_errors[i].used &&
           g_syscall_errors[i].syscall_num == syscall_num &&
@@ -1042,7 +1062,10 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
   if (!key_known && regs)
     sysdiag_capture_error_path(syscall_num, regs, cap_path, sizeof(cap_path));
 
-  spinlock_acquire(&g_sysdiag_lock);
+  if (severe || first_time)
+    spinlock_acquire(&g_sysdiag_lock);
+  else if (!spinlock_try_acquire(&g_sysdiag_lock))
+    return;
   g_syscall_error_total_calls++;
 
   sysdiag_syscall_error_t *entry = NULL;

@@ -142,24 +142,48 @@ static uint64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr, uint64_t a2,
 
   switch (clk_id) {
   case 0: // CLOCK_REALTIME
-  case 4: // CLOCK_REALTIME_COARSE (map to REALTIME)
+  case 5: // CLOCK_REALTIME_COARSE (map to REALTIME)
     ((uint64_t *)tp_ptr)[0] = rtc_get_boot_timestamp() + sec;
     ((uint64_t *)tp_ptr)[1] = nsec;
     return 0;
   case 1: // CLOCK_MONOTONIC
+  case 4: // CLOCK_MONOTONIC_RAW
   case 6: // CLOCK_MONOTONIC_COARSE (map to monotonic)
   case 7: // CLOCK_BOOTTIME (map to monotonic for simplicity)
   case 11: // CLOCK_TAI (map to monotonic)
     ((uint64_t *)tp_ptr)[0] = sec;
     ((uint64_t *)tp_ptr)[1] = nsec;
     return 0;
-  case 2: // CLOCK_PROCESS_CPUTIME_ID - use monotonic time
-  case 3: // CLOCK_THREAD_CPUTIME_ID - use monotonic time
-    ((uint64_t *)tp_ptr)[0] = sec;
-    ((uint64_t *)tp_ptr)[1] = nsec;
+  default: {
+    /* CPU-time clocks: fixed ids 2/3 name the caller's process/thread, and
+     * negative ids are Linux's dynamic clock ids from pthread_getcpuclockid()
+     * / clock_getcpuclockid(): ~id << 3 | per-thread bit (4) | type (0 PROF,
+     * 1 VIRT, 2 SCHED). HotSpot reads these for GC and compiler threads; a
+     * wall-clock answer (or EINVAL) misreports every thread as fully busy. */
+    struct thread *cur = sched_get_current();
+    uint32_t id;
+    bool group, user_only;
+    if (clk_id == 2 || clk_id == 3) {
+      if (!cur)
+        return (uint64_t)-22;
+      group = clk_id == 2;
+      id = group ? (cur->tgid ? cur->tgid : cur->tid) : cur->tid;
+      user_only = false;
+    } else if ((int64_t)clk_id < 0 && (clk_id & 3) != 3) {
+      id = (uint32_t)~((int64_t)clk_id >> 3);
+      group = !(clk_id & 4);
+      user_only = (clk_id & 3) == 1;
+    } else {
+      return (uint64_t)-22; // EINVAL
+    }
+    uint64_t ms;
+    if (!sched_get_cpu_time_ms(id, group, user_only, &ms))
+      return (uint64_t)-22; // EINVAL (ESRCH on Linux for dead threads)
+    uint64_t cpu_ns = ms * 1000000ULL;
+    ((uint64_t *)tp_ptr)[0] = cpu_ns / 1000000000ULL;
+    ((uint64_t *)tp_ptr)[1] = cpu_ns % 1000000000ULL;
     return 0;
-  default:
-    return (uint64_t)-22; // EINVAL
+  }
   }
 }
 

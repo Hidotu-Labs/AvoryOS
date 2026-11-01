@@ -747,11 +747,18 @@ static uint64_t sys_mknod(uint64_t pathname_ptr, uint64_t mode, uint64_t dev,
         return (uint64_t)-17; // EEXIST
     }
 
-    int rc = vfs_mknod(parent, name, (uint16_t)(mode & 07777), type, NULL);
-    if (rc == 0 && (type == FS_CHARDEV || type == FS_BLOCKDEV)) {
+    struct thread *t = sched_get_current();
+    uint16_t permissions = (uint16_t)(mode & 07777);
+    if (t) permissions &= ~t->umask;
+    int rc = vfs_mknod(parent, name, permissions, type, NULL);
+    if (rc == 0) {
         vfs_node_t *created = vfs_finddir(parent, name);
         if (created) {
-            created->inode = (uint32_t)dev; // st_rdev for stat()
+            if (t)
+                vfs_chown(created, t->fsuid,
+                          (parent->mask & 02000) ? parent->gid : t->fsgid);
+            if (type == FS_CHARDEV || type == FS_BLOCKDEV)
+                created->inode = (uint32_t)dev; // st_rdev for stat()
             vfs_close(created);
         }
     }

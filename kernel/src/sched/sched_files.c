@@ -274,8 +274,15 @@ void sched_share_files(struct thread *child, struct thread *parent) {
   sched_release_files(child);
   spinlock_acquire(&parent->files->lock);
   parent->files->ref_count++;
-
+  /* Every thread caches this table's array pointers (t->fds, t->fd_offsets,
+   * ...), but fd_table_expand_locked() can only refresh the caller's copy
+   * before freeing the old buffer. Siblings then read and write freed memory
+   * (stale descriptors, scribbles into recycled heap). Size a shared table to
+   * its maximum once, here, so it never has to be reallocated while shared. */
+  if (parent->files->capacity < MAX_FDS)
+    fd_table_expand_locked(parent->files, MAX_FDS - 1);
   spinlock_release(&parent->files->lock);
+  thread_set_files(parent, parent->files);
   thread_set_files(child, parent->files);
 }
 

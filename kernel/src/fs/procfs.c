@@ -54,12 +54,22 @@ static int procfs_statfs(vfs_node_t *node, struct statfs_buf *buf) {
   return 0;
 }
 
+/* proc files have no backing store. Linux accepts O_TRUNC on them (sysctl
+ * tunables such as /proc/sys/vm/ksm_run are written with `echo x > file`, which
+ * opens with O_TRUNC), so truncating to zero is a successful no-op. Other sizes
+ * are refused as before. */
+static int procfs_truncate(vfs_node_t *node, uint32_t size) {
+  (void)node;
+  return size == 0 ? 0 : -1;
+}
+
 /* Process trees are created on demand without being grafted under the proc
  * root. Set the filesystem handler before ramfs directory construction so
  * every dynamic directory, file and symlink retains procfs identity. */
 static void procfs_node_init(vfs_node_t *node) {
   vfs_node_init(node);
   node->statfs = procfs_statfs;
+  node->truncate = procfs_truncate;
 }
 
 uint32_t procfs_meminfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
@@ -1793,6 +1803,43 @@ static void procfs_vma_collect(struct vma *node, struct vma **arr, int *count, i
   procfs_vma_collect(node->right, arr, count, max_count);
 }
 
+/* A VMA remembers the descriptor number it was mapped through, but ld.so closes
+ * that descriptor right after mmap() and the number is soon reused by an
+ * unrelated file. Naming the mapping from the current fd table then reports the
+ * wrong file: libffi parses /proc/self/maps to find the file backing its
+ * trampoline code and was handed the Minecraft jar, then mapped jar bytes as
+ * executable code. Only trust the fd while it still refers to the mapped node;
+ * otherwise rebuild the path from the node's own parent chain. */
+static bool maps_fd_still_maps(struct thread *t, int fd, void *file_node) {
+  bool same = false;
+  if (!t->files || !file_node || fd < 0)
+    return false;
+  spinlock_acquire(&t->files->lock);
+  if ((uint32_t)fd < t->files->capacity)
+    same = (void *)t->files->fds[fd] == file_node;
+  spinlock_release(&t->files->lock);
+  return same;
+}
+
+static bool maps_node_path(vfs_node_t *node, char *out, size_t cap) {
+  const char *names[32];
+  int depth = 0;
+  for (vfs_node_t *n = node; n && depth < 32; n = n->parent_node) {
+    if (n->name[0] && strcmp(n->name, "/") != 0)
+      names[depth++] = n->name;
+  }
+  if (!depth)
+    return false;
+  size_t pos = 0;
+  for (int i = depth - 1; i >= 0; i--) {
+    int w = snprintf(out + pos, cap - pos, "/%s", names[i]);
+    if (w < 0 || (size_t)w >= cap - pos)
+      return false;
+    pos += (size_t)w;
+  }
+  return true;
+}
+
 // /proc/<pid>/maps
 static uint32_t procfs_pid_maps_read(vfs_node_t *node, uint32_t offset,
                                      uint32_t size, uint8_t *buffer) {
@@ -1894,8 +1941,11 @@ static uint32_t procfs_pid_maps_read(vfs_node_t *node, uint32_t offset,
     } else if (s->flags & MAP_SYSV_SHM) {
       snprintf(path_buf, sizeof(path_buf), "/SYSV%08x (deleted)", (unsigned)s->offset);
     } else if (s->fd >= 0) {
-      if (!sched_get_fd_path_snapshot(pid, (uint32_t)s->fd, path_buf, sizeof(path_buf))) {
+      if (!maps_fd_still_maps(t, s->fd, s->file_node) ||
+          !sched_get_fd_path_snapshot(pid, (uint32_t)s->fd, path_buf, sizeof(path_buf))) {
         path_buf[0] = '\0';
+        if (s->file_node && vfs_node_is_alive((vfs_node_t *)s->file_node))
+          maps_node_path((vfs_node_t *)s->file_node, path_buf, sizeof(path_buf));
       }
     } else if (s->file_node && vfs_node_is_alive((vfs_node_t *)s->file_node)) {
       vfs_node_t *vn = (vfs_node_t *)s->file_node;
@@ -2371,6 +2421,19 @@ typedef struct procfs_pid_cache_entry {
 static procfs_pid_cache_entry_t *procfs_pid_cache;
 static spinlock_t procfs_pid_cache_lock = SPINLOCK_INIT;
 
+/* Linux owns /proc/<pid>/comm by the task's effective ids, so a non-root
+ * process can rename itself by writing /proc/self/comm (Chromium/Electron do
+ * this). The pid dir is cached across exec and setuid transitions, so refresh
+ * the owner on each lookup. Other writable pid entries stay root-owned: their
+ * write handlers are accept-and-discard stubs, and owner write access would
+ * make unsupported writes look like they succeeded. */
+static void procfs_pid_comm_refresh_owner(vfs_node_t *comm, uint32_t pid) {
+  struct sched_thread_snapshot snap;
+  if (!sched_get_thread_snapshot(pid, &snap)) return;
+  comm->uid = snap.euid;
+  comm->gid = snap.egid;
+}
+
 /* Dynamic PID trees own one reference to every contained node. Unlike the
  * normal persistent ramfs nodes, lookups need a separate caller reference. */
 static vfs_node_t *procfs_pid_ramfs_finddir(vfs_node_t *node, char *name) {
@@ -2385,6 +2448,8 @@ static vfs_node_t *procfs_pid_ramfs_finddir(vfs_node_t *node, char *name) {
   ramfs_dir_t *dir = (ramfs_dir_t *)node->device;
   for (child_node_t *child = dir->children; child; child = child->next) {
     if (strcmp(child->node->name, name) == 0) {
+      if (strcmp(name, "comm") == 0)
+        procfs_pid_comm_refresh_owner(child->node, node->impl);
       vfs_open(child->node);
       return child->node;
     }

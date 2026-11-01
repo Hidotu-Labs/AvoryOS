@@ -183,11 +183,16 @@ static int get_caps(struct vg_caps *p) {
 static int create(struct drm_file *file, struct vg_create *p) {
     if (p->bo_handle || !p->size || p->size > MAX_RESOURCE || !p->width ||
         !p->height || !p->depth || !p->array_size || p->last_level > 15 ||
-        p->flags & ~1U) return -22;
+        p->flags & ~1U) {
+        klogf("[VIRGL] create rejected: size=%u %ux%ux%u layers=%u last_level=%u flags=%#x bo=%u\n",
+              p->size, p->width, p->height, p->depth, p->array_size,
+              p->last_level, p->flags, p->bo_handle);
+        return -22;
+    }
     int ret = context(file);
-    if (ret) return ret;
+    if (ret) { klogf("[VIRGL] ctx create failed: %d\n", ret); return ret; }
     struct drm_gem_object *obj = ascentdrm_gem_object_create(file->dev, p->size);
-    if (!obj) return -12;
+    if (!obj) { klogf("[VIRGL] create: no memory for size=%u\n", p->size); return -12; }
     struct virgl_resource *res = kmalloc(sizeof(*res));
     if (!res) { put(obj); return -12; }
     *res = (struct virgl_resource){.id = virtio_gpu_resource_id(), .width = p->width,
@@ -201,7 +206,12 @@ static int create(struct drm_file *file, struct vg_create *p) {
     obj->virgl_resource = res;
     obj->free = free_resource;
     ret = command(&req, sizeof(req));
-    if (ret) { put(obj); return ret; }
+    if (ret) {
+        klogf("[VIRGL] RESOURCE_CREATE_3D rejected by host: id=%u target=%u fmt=%u bind=%#x %ux%ux%u\n",
+              res->id, p->target, p->format, p->bind, p->width, p->height, p->depth);
+        put(obj);
+        return ret;
+    }
     struct virtio_gpu_resource_attach_backing backing = {0};
     backing.hdr = header(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING, 0);
     backing.resource_id = res->id; backing.nr_entries = 1;

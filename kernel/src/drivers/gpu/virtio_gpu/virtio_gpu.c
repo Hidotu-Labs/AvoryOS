@@ -2413,7 +2413,21 @@ static int gpu_render_wait_objects(struct drm_gem_object **objects, uint32_t cou
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     if (failed) return -5;
     if (!(pending & candidates)) return 0;
-    if (nowait) return -16;
+    if (nowait) {
+        /* Mesa retries a nowait wait straight away while it returns EBUSY.
+         * Returning at once made that retry a spin: thousands of EBUSY per
+         * dump window on the Render thread, one full core while the game sat
+         * idle. Park for a millisecond so each retry costs a sleep. */
+        struct thread *self = sched_get_current();
+        if (self && !self->is_idle && hal_irq_enabled()) {
+            self->state = THREAD_SLEEPING;
+            self->wakeup_ticks = lapic_timer_get_ticks() + 1;
+            sched_yield();
+            self->state = THREAD_RUNNING;
+            self->wakeup_ticks = 0;
+        }
+        return -16;
+    }
     uint64_t start = lapic_timer_get_ms();
     /* A BO wait covers its producers, not an entire device fence prefix.
      * Snapshot fence identities as well as slots: completion/cleanup can

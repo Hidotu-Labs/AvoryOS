@@ -411,8 +411,15 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 
     uint64_t *pt = (uint64_t *)PHYS_TO_VIRT(pde & PAGE_MASK);
     uint64_t *pte = &pt[(virt >> 12) & 511];
-    if (!(*pte & PAGE_FLAG_PRESENT))
-      WALK_REJECT("error code says P=1 but the PTE is not present", *pte, virt);
+    if (!(*pte & PAGE_FLAG_PRESENT)) {
+      /* Reclaim or munmap can remove the mapping after the CPU raised the
+       * protection fault, including while zram_balance() runs above. Retry
+       * with a fresh translation so the non-present fault path can swap the
+       * page back in (or reject a genuinely invalid access). */
+      WALK_UNLOCK();
+      __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
+      return 0;
+    }
 
     /* The frame the PTE stopped pointing at, and whether a flush is owed.
      * Both are acted on only after the locks are dropped - see below. */

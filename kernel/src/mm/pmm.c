@@ -439,6 +439,17 @@ __attribute__((optimize("O3"))) void pmm_free_pages(void *ptr, size_t count) {
   spinlock_acquire(&n->zone.lock);
 
   for (size_t i = 0; i < num_pages; i++) {
+    /* A big block is released page by page, each with its own coalescing
+     * pass. Holding the zone lock (interrupts masked) across all of it keeps
+     * this CPU from answering TLB shootdown IPIs for tens of milliseconds and
+     * stalls every other CPU queued on the lock. Pages already freed stay
+     * freed and the rest are still ours, so letting go between batches is
+     * safe. */
+    if (i && (i & 63) == 0) {
+      spinlock_release(&n->zone.lock);
+      tlb_shootdown_poll();
+      spinlock_acquire(&n->zone.lock);
+    }
     uint64_t phys = addr + i * PAGE_SIZE;
     /* Mixed/shared blocks must release every last-reference page, even if
      * another page remains shared or was already released. Buddy coalescing

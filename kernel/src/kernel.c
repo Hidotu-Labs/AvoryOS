@@ -883,6 +883,8 @@ mount_success:
   watchdog_init();
   extern void rfkill_init(void);
   rfkill_init();
+  extern void avm_init(void);
+  avm_init();
   procfs_init();
 
   /* `vfs_selftest=1` additionally proves that no /proc resolution is entered

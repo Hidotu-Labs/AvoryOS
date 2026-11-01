@@ -229,7 +229,13 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
     // at the top of the next iteration once we hold tid_lock again and can
     // safely inspect the child list.
     if (should_block) {
+      /* Bounded fallback: a child exit that publishes its zombie but whose
+       * wake never reaches this thread (seen with Xwayland parked in wait4
+       * on an exited xkbcomp, which then never served its socket) must not
+       * park the caller forever.  The loop rescans after every round. */
+      current->wakeup_ticks = lapic_timer_get_ticks() + 20;
       sched_yield();
+      current->wakeup_ticks = 0;
       /* waiting_for_child is cleared at the top of the next loop iteration
        * after we reacquire tid_lock and rescan — do NOT clear it here. */
     }
@@ -540,8 +546,12 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
         current->wakeup_ticks = lapic_timer_get_ticks() + 10;
       }
 
+      if (!on_pidfd_wq)
+        current->wakeup_ticks = lapic_timer_get_ticks() + 20;
       sched_yield();
 
+      if (!on_pidfd_wq)
+        current->wakeup_ticks = 0;
       if (on_pidfd_wq) {
         wait_queue_remove(process_pidfd_wait_queue(), &pidfd_entry);
         current->wakeup_ticks = 0;

@@ -620,3 +620,5 @@ tevent
 smbclient
 plymouth
 tcc
+# Provides xorriso, needed to build Limine ISO images (e.g. limine-c-template).
+libisoburn

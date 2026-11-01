@@ -2734,12 +2734,20 @@ static struct dirent *drm_dri_readdir(vfs_node_t *dir, uint64_t index) {
   return entry;
 }
 
+/* /dev/dri is a ramfs directory whose lookups this file overrides. Keep the
+ * original so ordinary children (udev's /dev/dri/by-path and the symlinks in
+ * it) stay reachable: without the fallback they are created in the index but
+ * invisible to lookup, and mkdir cannot tell that the name already exists. */
+static vfs_node_t *(*drm_dri_base_finddir)(vfs_node_t *, char *);
+
 static vfs_node_t *drm_dri_finddir(vfs_node_t *dir, char *name) {
-  (void)dir;
   if (strcmp(name, "card0") == 0)
     return &drm_card_metadata_node;
 
-  return (vfs_node_t *)asc_vfs_devnode_lookup("dri", name);
+  vfs_node_t *dev = (vfs_node_t *)asc_vfs_devnode_lookup("dri", name);
+  if (dev)
+    return dev;
+  return drm_dri_base_finddir ? drm_dri_base_finddir(dir, name) : NULL;
 }
 
 static vfs_node_t *drm_alloc_client_node(void) {
@@ -2843,6 +2851,8 @@ void ascentdrm_register_vfs(void) {
   /* Keep enumeration consistent with the dynamic per-open node factory.
    * Mesa scans /dev/dri before opening a preferred KMS/render device. */
   dri_dir->flags |= FS_DENTRY_NOCACHE;
+  if (dri_dir->finddir != drm_dri_finddir)
+    drm_dri_base_finddir = dri_dir->finddir;
   dri_dir->readdir = drm_dri_readdir;
   dri_dir->finddir = drm_dri_finddir;
 

@@ -334,6 +334,74 @@ static uint64_t sys_setdomainname(uint64_t name_ptr, uint64_t len, uint64_t a2,
   return process_set_utsname(name_ptr, len, 1);
 }
 
+
+/* Adaptive sysname: programs see "Ascension" by default. If one that saw it
+ * exits with a plain error shortly afterwards (e.g. the JVM/LWJGL rejecting an
+ * unknown os.name), its executable is remembered and later launches see
+ * "Linux". State lives in memory only. */
+#define UNAME_POLICY_MAX 64
+#define UNAME_POLICY_WINDOW_MS 15000
+static struct {
+  char path[256];
+  bool force_linux;
+  uint64_t seen_ms;
+} uname_policy[UNAME_POLICY_MAX];
+static spinlock_t uname_policy_lock = SPINLOCK_INIT;
+
+const char *uname_policy_sysname(struct thread *t) {
+  if (!t || !t->exe_path[0])
+    return "Ascension";
+  const char *res = "Ascension";
+  uint64_t now = lapic_timer_get_ms();
+  int free_slot = -1;
+  spinlock_acquire(&uname_policy_lock);
+  for (int i = 0; i < UNAME_POLICY_MAX; i++) {
+    if (!uname_policy[i].path[0]) {
+      if (free_slot < 0)
+        free_slot = i;
+      continue;
+    }
+    if (strcmp(uname_policy[i].path, t->exe_path) == 0) {
+      if (uname_policy[i].force_linux)
+        res = "Linux";
+      else
+        uname_policy[i].seen_ms = now;
+      spinlock_release(&uname_policy_lock);
+      return res;
+    }
+  }
+  if (free_slot >= 0) {
+    strncpy(uname_policy[free_slot].path, t->exe_path,
+            sizeof(uname_policy[free_slot].path) - 1);
+    uname_policy[free_slot].force_linux = false;
+    uname_policy[free_slot].seen_ms = now;
+  }
+  spinlock_release(&uname_policy_lock);
+  return res;
+}
+
+/* Called from process_do_exit(). Plain error exits (not 0, not 128+signal) soon after
+ * uname() flip the executable to "Linux"; signal deaths do not. */
+void uname_policy_on_exit(struct thread *t, uint64_t status) {
+  if (!t || !t->exe_path[0] || status == 0 || (status > 128 && status <= 128 + 64))
+    return;
+  uint64_t now = lapic_timer_get_ms();
+  spinlock_acquire(&uname_policy_lock);
+  for (int i = 0; i < UNAME_POLICY_MAX; i++) {
+    if (uname_policy[i].path[0] && !uname_policy[i].force_linux &&
+        strcmp(uname_policy[i].path, t->exe_path) == 0) {
+      if (now - uname_policy[i].seen_ms <= UNAME_POLICY_WINDOW_MS) {
+        uname_policy[i].force_linux = true;
+        klog_puts("[UNAME] ");
+        klog_puts(t->exe_path);
+        klog_puts(" failed after seeing Ascension; will report Linux\n");
+      }
+      break;
+    }
+  }
+  spinlock_release(&uname_policy_lock);
+}
+
 static uint64_t sys_uname(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5) {
   (void)a1;
@@ -346,7 +414,7 @@ static uint64_t sys_uname(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
   if (!buf_ptr)
     return (uint64_t)-14; // EFAULT
 
-  strcpy(buf->sysname, "Ascension");
+  strcpy(buf->sysname, uname_policy_sysname(sched_get_current()));
   uts_namespace_read(sched_get_current(), buf->nodename, buf->domainname);
   strcpy(buf->release, AVORY_BUILD_VERSION);
 
@@ -431,8 +499,10 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     }
     return (uint64_t)-14;
   case 3: // PR_GET_DUMPABLE
-    return 1;
-  case 4: // PR_SET_DUMPABLE
+    return current->nondumpable ? 0 : 1;
+  case 4: // PR_SET_DUMPABLE: only 0 and 1 are valid, and reads must see the value
+    if (arg2 > 1) return (uint64_t)-22; // EINVAL
+    current->nondumpable = arg2 == 0;
     return 0;
   case PR_SET_NAME: {
     if (!arg2 || !vmm_is_user_addr_range_valid(arg2, 1))

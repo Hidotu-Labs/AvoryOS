@@ -3,6 +3,7 @@
 #include "mm/page_ops.h"
 #include "hal/hal.h"
 #include "console/klog.h"
+#include "lib/string.h"
 #include "smp/cpu.h"
 #include "cpu/features.h"
 #include "linuxkpi/fpu.h"
@@ -290,6 +291,36 @@ void pmm_zero_pool_stats(uint64_t *hits, uint64_t *misses,
     *cached = pmm_zero_pool_total_cached();
 }
 
+/* Pooled frames are trusted to stay zero for as long as they sit here, so a
+ * stray kernel write into a freed frame (a use-after-free) is handed straight
+ * to userspace as "zeroed" memory. Check a sample of pops, report what the
+ * corruption looks like, and zero the frame so the consumer still gets what it
+ * asked for. Reading a frame that was filled with non-temporal stores costs a
+ * DRAM round trip, which is why this samples instead of checking every pop. */
+static void zero_pool_verify(void *page) {
+  static uint32_t tick;
+  static uint32_t reports;
+  if (__atomic_fetch_add(&tick, 1, __ATOMIC_RELAXED) & 7)
+    return;
+
+  const uint64_t *w = (const uint64_t *)PHYS_TO_VIRT((uint64_t)page);
+  for (uint32_t i = 0; i < PAGE_SIZE / sizeof(uint64_t); i++) {
+    if (!w[i])
+      continue;
+    if (__atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) < 8) {
+      klogf("[PMM] zero-pool frame %#llx was dirty at +%#x: %#llx %#llx "
+            "%#llx %#llx - zeroing it (a kernel write hit a freed frame)\n",
+            (unsigned long long)(uintptr_t)page,
+            (unsigned)(i * sizeof(uint64_t)), (unsigned long long)w[i],
+            (unsigned long long)(i + 1 < 512 ? w[i + 1] : 0),
+            (unsigned long long)(i + 2 < 512 ? w[i + 2] : 0),
+            (unsigned long long)(i + 3 < 512 ? w[i + 3] : 0));
+    }
+    memset((void *)w, 0, PAGE_SIZE);
+    return;
+  }
+}
+
 void *pmm_alloc_zeroed_page(void) {
   hal_irq_state_t flags = hal_irq_save();
   struct cpu_info *cpu = cpu_get_current();
@@ -314,6 +345,7 @@ void *pmm_alloc_zeroed_page(void) {
         pcp->active = 0;
         hal_irq_restore(flags);
         __atomic_add_fetch(&zero_hits, 1, __ATOMIC_RELAXED);
+        zero_pool_verify(page);
         return page;
       }
     }
@@ -329,10 +361,12 @@ void *pmm_alloc_zeroed_page(void) {
   }
   spinlock_release(&pcp->lock);
   hal_irq_restore(flags);
-  if (page)
+  if (page) {
     __atomic_add_fetch(&zero_hits, 1, __ATOMIC_RELAXED);
-  else
+    zero_pool_verify(page);
+  } else {
     __atomic_add_fetch(&zero_misses, 1, __ATOMIC_RELAXED);
+  }
   return page;
 }
 

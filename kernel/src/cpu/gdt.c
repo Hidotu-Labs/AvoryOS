@@ -27,6 +27,11 @@ static struct tss_entry tss_table[MAX_CPUS];
  * with nothing on the serial line. */
 static uint8_t df_stack[MAX_CPUS][8192] __attribute__((aligned(16)));
 
+/* NMI runs on TSS IST2 for the same reason: an NMI can arrive while the CPU is
+ * on a user stack (the syscall entry and exit windows), and the NMI handler
+ * must not push onto that stack.  idt.c sets IST2 for vector 2. */
+static uint8_t nmi_stack[MAX_CPUS][8192] __attribute__((aligned(16)));
+
 extern void gdt_flush(uint64_t);
 
 static inline uint16_t tss_selector(uint32_t cpu_id) {
@@ -102,6 +107,8 @@ void gdt_init(void) {
     tss_table[i].iopb_offset = sizeof(struct tss_entry);
     tss_table[i].ist1 =
         (uint64_t)(df_stack[i] + sizeof(df_stack[i])) & ~0xFULL;
+    tss_table[i].ist2 =
+        (uint64_t)(nmi_stack[i] + sizeof(nmi_stack[i])) & ~0xFULL;
     gdt_set_tss(GDT_TSS_BASE + 2 * (int)i, (uint64_t)&tss_table[i],
                 sizeof(struct tss_entry) - 1);
   }

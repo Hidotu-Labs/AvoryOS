@@ -713,6 +713,17 @@ static void dump_user_wait(const struct thread *t) {
       if (i) ld_str(",");
       ld_hex(sample.words[i]);
     }
+    /* FUTEX_WAIT / WAIT_BITSET sleep only while the word still equals the
+     * expected value. If it no longer does, whoever changed it should have
+     * woken us, so a changed word on a parked waiter is a lost wake-up (or a
+     * waker that never ran), not an ordinary wait. */
+    unsigned fop = (unsigned)(t->last_syscall_args[1] & 0x7f);
+    if ((fop == 0 || fop == 9) &&
+        sample.words[0] != (uint32_t)t->last_syscall_args[2]) {
+      ld_str(" >>> WORD CHANGED since wait (expected ");
+      ld_hex((uint32_t)t->last_syscall_args[2]);
+      ld_str("): waiter was not woken <<<");
+    }
   }
   ld_str("\n[LOCKDIAG]   user-code candidates (stack scan, not an unwind):");
   for (unsigned i = 0; i < sample.count; i++) {
@@ -969,9 +980,14 @@ static void dump_spots(uint64_t now_tsc, uint64_t mhz) {
  * prolongs IRQ-masked stalls. Reports are best-effort; never wait for one. */
 static uint32_t report_active;
 
+/* Serial output makes a full report take seconds; ages computed against the
+ * live clock would grow down the page and look like missed wake-ups. */
+static uint64_t report_start_ms;
+
 void lockdiag_dump_all(const char *reason) {
   if (__atomic_exchange_n(&report_active, 1, __ATOMIC_ACQUIRE))
     return;
+  report_start_ms = lapic_timer_get_ms();
   uint64_t mhz = tsc_get_mhz();
   uint64_t now = rdtsc();
   uint32_t count = cpu_get_count();
@@ -1221,6 +1237,21 @@ void lockdiag_dump_all(const char *reason) {
       ld_dec(busy_count);
       ld_str(" (game-join focus: Main + workers print first)");
     }
+    /* The desktop compositor and its X server are what every GUI client
+     * ultimately waits on, and a stall there looks like an unrelated hang in
+     * dozens of processes (clients stuck in connect(), D-Bus callers, ...).
+     * Always report them in full, including their render/worker threads. */
+    uint32_t compositor_tgids[6];
+    unsigned compositor_count = 0;
+    for (const struct thread *t = global_thread_list; t; t = t->global_next) {
+      if (t->tid != t->tgid || compositor_count >= 6)
+        continue;
+      if ((strncmp(t->comm, "kwin_wayland", 12) == 0 &&
+           strncmp(t->comm, "kwin_wayland_wr", 15) != 0) ||
+          strncmp(t->comm, "Xwayland", 8) == 0 ||
+          strncmp(t->comm, "plasmashell", 11) == 0)
+        compositor_tgids[compositor_count++] = t->tgid;
+    }
     for (int pass = 0; pass < 4; pass++) {
     for (const struct thread *t = global_thread_list; t; t = t->global_next) {
       /* A thread that died while holding a lock leaves it held forever, and it
@@ -1272,8 +1303,11 @@ void lockdiag_dump_all(const char *reason) {
       if (t->state != THREAD_BLOCKED && t->state != THREAD_SLEEPING &&
           !(display && t->state == THREAD_READY))
         continue;
+      bool compositor = false;
+      for (unsigned ci = 0; ci < compositor_count; ci++)
+        compositor |= t->tgid == compositor_tgids[ci];
       bool focused = t->kpi_data || (focus_tgid && t->tgid == focus_tgid) ||
-                     (busy_tgid && t->tgid == busy_tgid) ||
+                     (busy_tgid && t->tgid == busy_tgid) || compositor ||
                      strncmp(t->comm, "Xorg", 4) == 0 ||
                      strncmp(t->comm, "glxgears", 8) == 0 ||
                      strncmp(t->comm, "xfce4-ab", 8) == 0 ||
@@ -1341,7 +1375,7 @@ void lockdiag_dump_all(const char *reason) {
       }
       uint64_t parked_ms = 0;
       if (t->blocked_since_ms) {
-        uint64_t now_ms = lapic_timer_get_ms();
+        uint64_t now_ms = report_start_ms;
         parked_ms = now_ms > t->blocked_since_ms ? now_ms - t->blocked_since_ms : 0;
       }
       if (t->in_futex_wait) {
@@ -1372,7 +1406,7 @@ void lockdiag_dump_all(const char *reason) {
       ld_str(" cpu="); ld_dec(t->cpu_index);
       ld_str(" wake_at_ms="); ld_dec(t->wakeup_ticks);
       if (t->wakeup_ticks && t->wakeup_ticks != (uint64_t)-1) {
-        uint64_t now_ms = lapic_timer_get_ms();
+        uint64_t now_ms = report_start_ms;
         if (now_ms > t->wakeup_ticks) {
           ld_str(" OVERDUE+");
           ld_dec(now_ms - t->wakeup_ticks);
@@ -1385,9 +1419,44 @@ void lockdiag_dump_all(const char *reason) {
       if (!t->in_futex_wait || focused || parked_ms > 10000)
         dump_parked_stack(t);
       if (focused && t->mm &&
-          (!t->in_futex_wait || parked_ms > 10000))
+          (!t->in_futex_wait || parked_ms > 10000 || compositor))
         dump_user_wait(t);
     }
+    }
+    /* The listing above covers BLOCKED/SLEEPING threads only. A thread that is
+     * RUNNING or READY but not executing is invisible there, and it is exactly
+     * what a lost wake-up or a thread dropped from its run queue looks like:
+     * with every CPU idle, a READY or RUNNING non-idle thread should not
+     * exist. Report them all, with the scheduler's own bookkeeping. */
+    {
+      unsigned active = 0;
+      ld_str("\n[LOCKDIAG] runnable/running non-idle threads:");
+      for (const struct thread *t = global_thread_list; t; t = t->global_next) {
+        if (t->state != THREAD_RUNNING && t->state != THREAD_READY)
+          continue;
+        if (strncmp(t->comm, "idle", 4) == 0)
+          continue;
+        if (active++ >= 48)
+          continue;
+        ld_str("\n[LOCKDIAG]   tid="); ld_dec(t->tid);
+        ld_str(" tgid="); ld_dec(t->tgid);
+        ld_str(" comm="); ld_comm(t->comm);
+        ld_str(" "); ld_str(state_name(t->state));
+        ld_str(" on_cpu="); ld_dec(t->on_cpu);
+        ld_str(" on_rq="); ld_dec(t->se.on_rq);
+        ld_str(" cpu="); ld_dec(t->cpu_index);
+        ld_str(" ready_since_ms="); ld_dec(t->ready_since_ms);
+        ld_str(" need_resched="); ld_dec(t->need_resched);
+        ld_str(" in_syscall="); ld_dec(t->in_syscall);
+        ld_str(" syscall="); ld_dec(t->last_syscall_num);
+      }
+      if (!active)
+        ld_str(" none");
+      else if (active > 48) {
+        ld_str("\n[LOCKDIAG]   ... ");
+        ld_dec(active - 48);
+        ld_str(" more");
+      }
     }
     spinlock_release(&tid_lock);
     ld_str("\n[LOCKDIAG]   ");

@@ -657,6 +657,10 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
     socket_t *notify_peer_sock = unix_get_live_peer(sock, &notify_peer);
     if (notify_peer_sock) {
       unix_notify_epoll(notify_peer_sock, EPOLLOUT | EPOLLWRNORM);
+      /* poll()/ppoll() writers sleep on the sender socket's own wait queue,
+       * which epoll notification does not touch; without this they only
+       * notice freed space at the 1 s poll safety-net wake-up. */
+      unix_wake_recv_waiters(notify_peer);
       socket_put(notify_peer_sock);
     }
 
@@ -796,6 +800,10 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
   socket_t *notify_peer_sock = unix_get_live_peer(sock, &notify_peer);
   if (notify_peer_sock) {
     unix_notify_epoll(notify_peer_sock, EPOLLOUT | EPOLLWRNORM);
+    /* poll()/ppoll() writers sleep on the sender socket's own wait queue,
+     * which epoll notification does not touch; without this they only
+     * notice freed space at the 1 s poll safety-net wake-up. */
+    unix_wake_recv_waiters(notify_peer);
     socket_put(notify_peer_sock);
   }
 
@@ -1535,6 +1543,10 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
     socket_t *notify_peer_sock = unix_get_live_peer(sock, &notify_peer);
     if (notify_peer_sock) {
       unix_notify_epoll(notify_peer_sock, EPOLLOUT | EPOLLWRNORM);
+      /* poll()/ppoll() writers sleep on the sender socket's own wait queue,
+       * which epoll notification does not touch; without this they only
+       * notice freed space at the 1 s poll safety-net wake-up. */
+      unix_wake_recv_waiters(notify_peer);
       socket_put(notify_peer_sock);
     }
 
@@ -1825,6 +1837,10 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   socket_t *notify_peer_sock = unix_get_live_peer(sock, &notify_peer);
   if (notify_peer_sock) {
     unix_notify_epoll(notify_peer_sock, EPOLLOUT | EPOLLWRNORM);
+    /* poll()/ppoll() writers sleep on the sender socket's own wait queue,
+     * which epoll notification does not touch; without this they only
+     * notice freed space at the 1 s poll safety-net wake-up. */
+    unix_wake_recv_waiters(notify_peer);
     socket_put(notify_peer_sock);
   }
 

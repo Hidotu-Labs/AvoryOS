@@ -65,6 +65,9 @@ bool ext3_perf_snapshot(unsigned index, struct block_device **dev,
 }
 
 static void ext3_grant_next(ext3_journal_state_t *trans);
+static void ext3_forward_grant(ext2_mount_t *mnt, ext3_journal_state_t *trans);
+static ext3_txn_entry_t *ext3_find_closed(ext3_journal_state_t *trans,
+                                          uint64_t block);
 static void ext3_discard_write_set(ext2_mount_t *mnt,
                                    ext3_journal_state_t *trans);
 
@@ -273,13 +276,13 @@ static bool ext3_take_grant(ext3_journal_state_t *trans, uint32_t tid) {
   return mine;
 }
 
-static void ext3_discard_write_set(ext2_mount_t *mnt,
-                                   ext3_journal_state_t *trans) {
+static void ext3_discard_list(ext2_mount_t *mnt, ext3_txn_chunk_t **head,
+                              ext3_txn_chunk_t **tail, uint32_t *count) {
   spinlock_acquire(&mnt->cache_lock);
-  ext3_txn_chunk_t *chunk = trans->txn_head;
-  trans->txn_head = NULL;
-  trans->txn_tail = NULL;
-  trans->txn_count = 0;
+  ext3_txn_chunk_t *chunk = *head;
+  *head = NULL;
+  *tail = NULL;
+  *count = 0;
   spinlock_release(&mnt->cache_lock);
 
   while (chunk) {
@@ -289,6 +292,13 @@ static void ext3_discard_write_set(ext2_mount_t *mnt,
     kfree(chunk);
     chunk = next;
   }
+}
+
+/* Drops only the running handle's images; closed (already stopped) handles
+ * keep theirs, so aborting one writer never loses another's committed work. */
+static void ext3_discard_write_set(ext2_mount_t *mnt,
+                                   ext3_journal_state_t *trans) {
+  ext3_discard_list(mnt, &trans->txn_head, &trans->txn_tail, &trans->txn_count);
 }
 
 static void ext3_publish_grant(struct thread *next, void *arg) {
@@ -359,6 +369,10 @@ int ext3_init_journal(ext2_mount_t *mnt) {
   trans->journal_features_incompat = 0;
   trans->txn_head = trans->txn_tail = NULL;
   trans->txn_count = 0;
+  trans->closed_head = trans->closed_tail = NULL;
+  trans->closed_count = trans->closed_handles = 0;
+  trans->closed_since_ms = 0;
+  trans->group_commits = trans->group_handles_batched = 0;
   rawspinlock_init(&trans->sched_lock);
   trans->granted_tid = 0;
   memset(trans->map_keys, 0, sizeof(trans->map_keys));
@@ -565,9 +579,12 @@ int ext3_journal_start(ext2_mount_t *mnt) {
       if (granted)
         trans->granted_tid = 0;
       rawspinlock_release(&trans->sched_lock);
-      if (granted)
-        ext3_grant_next(trans);
       hal_irq_restore(handoff_flags);
+      /* Forwarding may have to commit a deferred chain first, which sleeps on
+       * I/O, so it cannot stay inside the IRQ-masked window. We still own the
+       * lock (active stays true), so nobody can slip in meanwhile. */
+      if (granted)
+        ext3_forward_grant(mnt, trans);
       storage_latency_record(&trans->perf_wait,
           lapic_timer_get_ms() - wait_start, true);
       sched_critical_exit();
@@ -643,8 +660,11 @@ int ext3_journal_block(ext2_mount_t *mnt, uint64_t block_nr, const void *data) {
    * journal or home write. In-flight writes and cache collisions are never
    * evidence of an unchanged disk block. */
   uint32_t idx = (uint32_t)(block_nr % EXT2_CACHE_SIZE);
+  /* A closed handle may hold a newer image than home: restoring the old home
+   * content is then a real change and must be staged, not dropped. */
+  bool in_closed = ext3_find_closed(trans, block_nr) != NULL;
   spinlock_acquire(&mnt->cache_lock);
-  bool unchanged = mnt->cache[idx].num == block_nr &&
+  bool unchanged = !in_closed && mnt->cache[idx].num == block_nr &&
                    mnt->cache[idx].data && !mnt->cache[idx].writes_inflight &&
                    memcmp(mnt->cache[idx].data, data, mnt->block_size) == 0;
   spinlock_release(&mnt->cache_lock);
@@ -727,8 +747,205 @@ bool ext3_journal_read_staged(ext2_mount_t *mnt, uint64_t block_nr,
       break;
     }
   }
+  for (ext3_txn_chunk_t *chunk = trans->closed_head; chunk && !found;
+       chunk = chunk->next) {
+    for (uint32_t i = 0; i < chunk->count; i++) {
+      if (chunk->entries[i].block != block_nr || !chunk->entries[i].image)
+        continue;
+      memcpy(buffer, chunk->entries[i].image, mnt->block_size);
+      found = true;
+      break;
+    }
+  }
   spinlock_release(&mnt->cache_lock);
   return found;
+}
+
+/*
+ * Group commit.
+ *
+ * Handles stay exclusive, so allocator and directory code keeps its single-
+ * writer assumptions.  What changes is when the log is written: a stopping
+ * handle moves its images into the closed set and commits it only if nobody
+ * else is queued (or a limit is hit).  A burst of N contended handles then
+ * shares one payload/descriptor/commit/checkpoint round instead of paying N.
+ * The uncontended path never defers, so a lone writer commits exactly as
+ * before.  Whoever releases the lock with no successor commits what is left.
+ */
+#define EXT3_GROUP_MAX_HANDLES 16u
+#define EXT3_GROUP_MAX_AGE_MS 50u
+
+/* Owner-only lookup: only the lock holder mutates the lists, readers just copy
+ * under cache_lock, so the owner can scan without taking it. */
+static ext3_txn_entry_t *ext3_find_in(ext3_txn_chunk_t *head, uint64_t block) {
+  for (ext3_txn_chunk_t *chunk = head; chunk; chunk = chunk->next)
+    for (uint32_t i = 0; i < chunk->count; i++)
+      if (chunk->entries[i].block == block)
+        return &chunk->entries[i];
+  return NULL;
+}
+
+static ext3_txn_entry_t *ext3_find_closed(ext3_journal_state_t *trans,
+                                          uint64_t block) {
+  return ext3_find_in(trans->closed_head, block);
+}
+
+static bool ext3_has_waiters(ext3_journal_state_t *trans) {
+  /* A hint: a stale or dying entry only costs one extra drain, see stop(). */
+  return __atomic_load_n(&trans->waiters.head, __ATOMIC_RELAXED) != NULL;
+}
+
+static bool ext3_should_defer(ext2_mount_t *mnt, ext3_journal_state_t *trans) {
+  if (!trans->closed_count || !ext3_has_waiters(trans))
+    return false;
+  uint32_t tagcap = ext3_tag_capacity(mnt);
+  if (!tagcap || trans->closed_count > EXT3_JOURNAL_SEG_MAX * tagcap / 4)
+    return false; /* leave room: the next handle must still fit */
+  if (trans->closed_handles >= EXT3_GROUP_MAX_HANDLES)
+    return false;
+  if (trans->closed_handles &&
+      lapic_timer_get_ms() - trans->closed_since_ms >= EXT3_GROUP_MAX_AGE_MS)
+    return false;
+  return true;
+}
+
+/* Moves the running handle's images into the closed set, keeping only the
+ * newest image per block and assigning journal positions in closed order.
+ * Returns -1 on failure; the running set is left for the caller to discard. */
+static int ext3_commit_closed(ext2_mount_t *mnt, ext3_journal_state_t *trans);
+
+static int ext3_merge_running(ext2_mount_t *mnt, ext3_journal_state_t *trans) {
+  uint32_t tagcap = ext3_tag_capacity(mnt);
+  if (!tagcap)
+    return -1;
+  if (!trans->txn_count)
+    return 0;
+  /* Worst case every running block is new; flush the chain first if the log
+   * could not hold both. */
+  if (trans->closed_count + trans->txn_count >
+      (uint32_t)EXT3_JOURNAL_SEG_MAX * tagcap) {
+    if (ext3_commit_closed(mnt, trans) != 0)
+      return -1;
+  }
+
+  /* Chunks are allocated up front: kmalloc must not run under cache_lock. */
+  uint32_t need = (trans->closed_count % EXT3_TXN_CHUNK_ENTRIES +
+                   trans->txn_count + EXT3_TXN_CHUNK_ENTRIES - 1) /
+                  EXT3_TXN_CHUNK_ENTRIES;
+  ext3_txn_chunk_t *spare = NULL;
+  for (uint32_t i = 0; i < need; i++) {
+    ext3_txn_chunk_t *c = kmalloc(sizeof(*c));
+    if (!c) {
+      while (spare) {
+        ext3_txn_chunk_t *next = spare->next;
+        kfree(spare);
+        spare = next;
+      }
+      return -1;
+    }
+    c->next = spare;
+    c->count = 0;
+    spare = c;
+  }
+
+  int rc = 0;
+  for (ext3_txn_chunk_t *chunk = trans->txn_head; chunk && rc == 0;
+       chunk = chunk->next) {
+    for (uint32_t i = 0; i < chunk->count; i++) {
+      ext3_txn_entry_t *e = &chunk->entries[i];
+      ext3_txn_entry_t *hit = ext3_find_in(trans->closed_head, e->block);
+      if (hit) {
+        spinlock_acquire(&mnt->cache_lock);
+        uint8_t *old = hit->image;
+        hit->image = e->image;
+        spinlock_release(&mnt->cache_lock);
+        kfree(old);
+        continue;
+      }
+      uint32_t index = trans->closed_count;
+      if (!trans->closed_tail ||
+          trans->closed_tail->count == EXT3_TXN_CHUNK_ENTRIES) {
+        ext3_txn_chunk_t *c = spare;
+        if (!c) { /* sized above; defensive */
+          rc = -1;
+          break;
+        }
+        spare = c->next;
+        c->next = NULL;
+        spinlock_acquire(&mnt->cache_lock);
+        if (trans->closed_tail)
+          trans->closed_tail->next = c;
+        else
+          trans->closed_head = c;
+        trans->closed_tail = c;
+        spinlock_release(&mnt->cache_lock);
+      }
+      spinlock_acquire(&mnt->cache_lock);
+      ext3_txn_entry_t *slot =
+          &trans->closed_tail->entries[trans->closed_tail->count++];
+      slot->block = e->block;
+      slot->payload_pos = ext3_payload_pos(index, tagcap);
+      slot->desc_pos = ext3_desc_pos(index, tagcap);
+      slot->image = e->image;
+      trans->closed_count = index + 1;
+      spinlock_release(&mnt->cache_lock);
+    }
+  }
+  while (spare) {
+    ext3_txn_chunk_t *next = spare->next;
+    kfree(spare);
+    spare = next;
+  }
+
+  /* Images now belong to the closed set (or replaced a closed image); drop
+   * the running chunks without freeing them. On failure the caller discards
+   * the running set, which would double free the ones already moved, so null
+   * those pointers out instead. */
+  spinlock_acquire(&mnt->cache_lock);
+  ext3_txn_chunk_t *chunk = trans->txn_head;
+  trans->txn_head = NULL;
+  trans->txn_tail = NULL;
+  trans->txn_count = 0;
+  spinlock_release(&mnt->cache_lock);
+  while (chunk) {
+    ext3_txn_chunk_t *next = chunk->next;
+    if (rc != 0) {
+      /* Entries not yet moved still own their image; free those only. */
+      for (uint32_t i = 0; i < chunk->count; i++) {
+        uint64_t b = chunk->entries[i].block;
+        ext3_txn_entry_t *m = ext3_find_in(trans->closed_head, b);
+        if (!m || m->image != chunk->entries[i].image)
+          kfree(chunk->entries[i].image);
+      }
+    }
+    kfree(chunk);
+    chunk = next;
+  }
+  return rc;
+}
+
+/* End of a commit attempt, successful or not: the closed images are retired
+ * (home writes either happened or the failure was already reported). */
+static int ext3_commit_done(ext2_mount_t *mnt, ext3_journal_state_t *trans,
+                            int result) {
+  ext3_discard_list(mnt, &trans->closed_head, &trans->closed_tail,
+                    &trans->closed_count);
+  if (trans->closed_handles) { /* deferred handles plus the committing one */
+    trans->group_commits++;
+    trans->group_handles_batched += trans->closed_handles + 1;
+  }
+  trans->closed_handles = 0;
+  trans->closed_since_ms = 0;
+  return result;
+}
+
+/* Called with the lock held, instead of ext3_grant_next(), when the holder
+ * leaves without an operation of its own (cancelled waiter, forwarded grant):
+ * nobody is left to commit a deferred chain once the lock goes idle. */
+static void ext3_forward_grant(ext2_mount_t *mnt, ext3_journal_state_t *trans) {
+  if (trans->closed_count && !ext3_has_waiters(trans))
+    (void)ext3_commit_closed(mnt, trans);
+  ext3_grant_next(trans);
 }
 
 /*
@@ -771,51 +988,25 @@ static int ext3_commit_home_batch(ext2_mount_t *mnt, ext2_block_write_t *batch,
   return -1;
 }
 
-int ext3_journal_stop(ext2_mount_t *mnt) {
-  if (!mnt)
-    return -1;
-  if (mnt->read_only)
-    return -30;
-  ext3_journal_state_t *trans = ext3_journal_state(mnt);
-  if (!trans->active) {
-    /* A mount without a journal has no commit point, so write back the lazy
-     * allocator counters here.  On journaled mounts stop() is only reached by
-     * the transaction owner, which takes the commit path below. */
-    if (!(mnt->sb.s_feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL))
-      return ext2_flush_metadata(mnt);
-    return 0;
-  }
-  struct thread *current = sched_get_current();
-  uint32_t tid = current ? current->tid : 0;
-  if (__atomic_load_n(&trans->owner_tid, __ATOMIC_RELAXED) != tid)
-    return -1;
-  if (trans->depth > 1) {
-    trans->depth--;
-    return 0;
-  }
-
-  trans->phase = "commit-metadata";
-  /* All group-descriptor and superblock changes made by this transaction are
-   * staged into the write-set first, so recovery replays them together with
-   * the bitmap blocks in one descriptor set. */
-  if (trans->io_failed || ext2_flush_metadata(mnt) != 0 || trans->io_failed)
-    return ext3_finish_transaction(mnt, trans, -1);
-
-  /* Read-only nested helpers and unchanged chown calls need no log records. */
-  uint32_t n = trans->txn_count;
+/* Writes every closed image as one journal transaction: payloads, descriptors,
+ * commit record, log-head publish, checkpoint, log retire. Always retires the
+ * closed set. Lock held. */
+static int ext3_commit_closed(ext2_mount_t *mnt, ext3_journal_state_t *trans) {
+  /* Nothing closed (read-only handles, unchanged chown): no log records. */
+  uint32_t n = trans->closed_count;
   if (n == 0)
-    return ext3_finish_transaction(mnt, trans, 0);
+    return ext3_commit_done(mnt, trans, 0);
 
   uint32_t tagcap = ext3_tag_capacity(mnt);
   if (!tagcap)
-    return ext3_finish_transaction(mnt, trans, -1);
+    return ext3_commit_done(mnt, trans, -1);
   uint32_t segments = (n + tagcap - 1) / tagcap;
   uint32_t commit_pos = ext3_payload_pos(n - 1, tagcap) + 1;
   uint64_t commit_phys = ext3_journal_phys(mnt, commit_pos);
   uint64_t sb_phys = ext3_journal_phys(mnt, 0);
   if (segments > EXT3_JOURNAL_SEG_MAX || !commit_phys || !sb_phys) {
     trans->io_failed = true;
-    return ext3_finish_transaction(mnt, trans, -1);
+    return ext3_commit_done(mnt, trans, -1);
   }
 
   /* Reuse scratch storage under the mount's transaction lock. The journal
@@ -831,7 +1022,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
   if (!trans->desc_block_buf || !trans->commit_block_buf ||
       !trans->super_block_buf) {
     trans->io_failed = true;
-    return ext3_finish_transaction(mnt, trans, -1);
+    return ext3_commit_done(mnt, trans, -1);
   }
 
   /* Journal payloads first: each unique write-set block is copied once, no
@@ -844,7 +1035,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
   ext2_block_write_t payload_batch[EXT3_COMMIT_WRITE_BATCH];
   uint32_t payload_batch_count = 0;
   bool payload_failed = false;
-  for (ext3_txn_chunk_t *chunk = trans->txn_head; chunk && !payload_failed;
+  for (ext3_txn_chunk_t *chunk = trans->closed_head; chunk && !payload_failed;
        chunk = chunk->next) {
     for (uint32_t i = 0; i < chunk->count; i++) {
       ext3_txn_entry_t *entry = &chunk->entries[i];
@@ -885,7 +1076,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
     payload_failed = true;
   if (payload_failed) {
     trans->io_failed = true;
-    return ext3_finish_transaction(mnt, trans, -1);
+    return ext3_commit_done(mnt, trans, -1);
   }
 
   /* One descriptor per tag-capacity group, each terminated by LAST_TAG. */
@@ -894,7 +1085,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
       "commit-descriptor-cache-alloc", "commit-descriptor-cache-publish",
       "commit-descriptor-io", "commit-descriptor-cache-finish"};
   uint32_t index = 0;
-  ext3_txn_chunk_t *chunk = trans->txn_head;
+  ext3_txn_chunk_t *chunk = trans->closed_head;
   uint32_t chunk_index = 0;
   while (index < n) {
     trans->phase = "commit-descriptor-build";
@@ -915,7 +1106,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
       }
       if (!chunk) {
         trans->io_failed = true;
-        return ext3_finish_transaction(mnt, trans, -1);
+        return ext3_commit_done(mnt, trans, -1);
       }
       ext3_txn_entry_t *entry = &chunk->entries[chunk_index++];
       uint8_t *tag_bytes = desc + sizeof(jbd_header_t) +
@@ -956,7 +1147,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
     if (!desc_phys || ext2_write_block_traced(mnt, desc_phys, desc,
                             &trans->phase, descriptor_stages) != 0) {
       trans->io_failed = true;
-      return ext3_finish_transaction(mnt, trans, -1);
+      return ext3_commit_done(mnt, trans, -1);
     }
   }
 
@@ -969,7 +1160,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
   trans->phase = "commit-record";
   if (ext2_write_block(mnt, commit_phys, commit_buf) != 0) {
     trans->io_failed = true;
-    return ext3_finish_transaction(mnt, trans, -1);
+    return ext3_commit_done(mnt, trans, -1);
   }
 
   /* Publish the log head before any home block is written: a crash from here
@@ -978,14 +1169,14 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
   trans->phase = "commit-super-read";
   if (ext2_read_block(mnt, sb_phys, sb_buf) != 0) {
     trans->io_failed = true;
-    return ext3_finish_transaction(mnt, trans, -1);
+    return ext3_commit_done(mnt, trans, -1);
   }
   jbd_superblock_t *jsb = (jbd_superblock_t *)sb_buf;
   jsb->s_start = __builtin_bswap32(trans->start_block);
   trans->phase = "commit-super-publish";
   if (ext2_write_block(mnt, sb_phys, sb_buf) != 0) {
     trans->io_failed = true;
-    return ext3_finish_transaction(mnt, trans, -1);
+    return ext3_commit_done(mnt, trans, -1);
   }
 
   /* Checkpoint: one home write for each unique block.  These blocks are
@@ -995,7 +1186,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
   uint64_t failed_block = 0;
   ext2_block_write_t home_batch[EXT3_COMMIT_WRITE_BATCH];
   uint32_t home_batch_count = 0;
-  for (chunk = trans->txn_head; chunk && !home_failed; chunk = chunk->next) {
+  for (chunk = trans->closed_head; chunk && !home_failed; chunk = chunk->next) {
     for (uint32_t i = 0; i < chunk->count; i++) {
       ext3_txn_entry_t *entry = &chunk->entries[i];
       trans->phase = "metadata-home";
@@ -1024,7 +1215,7 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
   trans->phase = "commit-super-clear";
   if (ext2_write_block(mnt, sb_phys, sb_buf) != 0) {
     trans->io_failed = true;
-    return ext3_finish_transaction(mnt, trans, -1);
+    return ext3_commit_done(mnt, trans, -1);
   }
   trans->sequence++;
   if (home_failed) {
@@ -1032,9 +1223,75 @@ int ext3_journal_stop(ext2_mount_t *mnt) {
           "block=%llu sequence=%u\n",
           (unsigned long long)failed_block, trans->sequence - 1);
     trans->io_failed = true;
-    return ext3_finish_transaction(mnt, trans, -1);
+    return ext3_commit_done(mnt, trans, -1);
   }
-  return ext3_finish_transaction(mnt, trans, 0);
+  return ext3_commit_done(mnt, trans, 0);
+}
+
+
+static int ext3_journal_stop_impl(ext2_mount_t *mnt, bool allow_defer) {
+  if (!mnt)
+    return -1;
+  if (mnt->read_only)
+    return -30;
+  ext3_journal_state_t *trans = ext3_journal_state(mnt);
+  if (!trans->active) {
+    /* A mount without a journal has no commit point, so write back the lazy
+     * allocator counters here.  On journaled mounts stop() is only reached by
+     * the transaction owner, which takes the commit path below. */
+    if (!(mnt->sb.s_feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL))
+      return ext2_flush_metadata(mnt);
+    return 0;
+  }
+  struct thread *current = sched_get_current();
+  uint32_t tid = current ? current->tid : 0;
+  if (__atomic_load_n(&trans->owner_tid, __ATOMIC_RELAXED) != tid)
+    return -1;
+  if (trans->depth > 1) {
+    trans->depth--;
+    return 0;
+  }
+
+  trans->phase = "commit-metadata";
+  /* All group-descriptor and superblock changes made by this handle are staged
+   * into the write-set first, so recovery replays them together with the
+   * bitmap blocks in one descriptor set. */
+  int rc = 0;
+  if (trans->io_failed || ext2_flush_metadata(mnt) != 0 || trans->io_failed)
+    rc = -1;
+  else
+    rc = ext3_merge_running(mnt, trans);
+  if (rc != 0)
+    ext3_discard_write_set(mnt, trans); /* this handle only */
+
+  bool deferred = false;
+  if (trans->closed_count) {
+    if (allow_defer && ext3_should_defer(mnt, trans)) {
+      if (!trans->closed_handles)
+        trans->closed_since_ms = lapic_timer_get_ms();
+      trans->closed_handles++;
+      deferred = true;
+    } else {
+      int crc = ext3_commit_closed(mnt, trans);
+      if (rc == 0)
+        rc = crc;
+    }
+  }
+  int ret = ext3_finish_transaction(mnt, trans, rc);
+
+  /* The queue head we saw may have been a dead or cancelled waiter, in which
+   * case the lock just went idle with a chain still uncommitted. Close it
+   * with an empty handle that must not defer again. */
+  if (deferred && __atomic_load_n(&trans->closed_count, __ATOMIC_RELAXED) &&
+      !__atomic_load_n(&trans->active, __ATOMIC_ACQUIRE)) {
+    if (ext3_journal_start(mnt) == 0)
+      (void)ext3_journal_stop_impl(mnt, false);
+  }
+  return ret;
+}
+
+int ext3_journal_stop(ext2_mount_t *mnt) {
+  return ext3_journal_stop_impl(mnt, true);
 }
 
 static int ext3_recover_journal(ext2_mount_t *mnt, jbd_superblock_t *jsb,

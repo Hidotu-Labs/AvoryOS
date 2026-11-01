@@ -853,6 +853,14 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
           (unsigned long long)regs->rip, (unsigned long long)regs->rsp,
           (unsigned long long)regs->rax);
 
+    /* abort() and friends leave no other trace of why: show what the thread
+     * last wrote to stderr (e.g. a GLib "CRITICAL"/"ERROR" line). */
+    if ((sig == SIGABRT || sig == SIGSEGV || sig == SIGILL || sig == SIGFPE ||
+         sig == SIGBUS || sig == SIGSYS) && current->last_stderr[0]) {
+      klogf("[SIGNAL]   last stderr of tid=%u (%s): %s\n", current->tid,
+            current->comm, current->last_stderr);
+    }
+
     // Print full registers, backtrace, and memory inspection only for fatal crash signals
     if (sig == SIGQUIT || sig == SIGILL || sig == SIGTRAP || sig == SIGABRT ||
         sig == SIGFPE || sig == SIGSEGV || sig == SIGBUS || sig == SIGSYS) {

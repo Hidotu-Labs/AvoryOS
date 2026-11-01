@@ -465,18 +465,27 @@ int ext2_create_impl(vfs_node_t *node, char *name, uint16_t permission) {
   if (mnt->read_only)
     return -30;
 
-  /* Keep allocation, inode initialization, and directory insertion atomic. */
-  ext3_journal_start(mnt);
+  /* Keep allocation, inode initialization, and directory insertion atomic.
+   * Without the transaction (cancelled wait, read-only) nothing below is
+   * serialized, so give up instead of mutating metadata unprotected. */
+  int jret = ext3_journal_start(mnt);
+  if (jret)
+    return jret;
 
+  /* Specific errnos: the syscall layer passes negatives through, and a bare -1
+   * reaches userspace as EPERM, which sent callers (Mesa's shader cache)
+   * chasing a permission problem that was really exhaustion or I/O. */
   if (ext2_finddir_impl(node, name) != NULL) {
     ext3_journal_stop(mnt);
-    return -1;
+    return -17; /* EEXIST */
   }
 
   uint32_t new_ino = ext2_alloc_inode(mnt);
   if (!new_ino) {
+    klogf("[EXT2] create '%s': no free inode (parent ino=%u)\n", name,
+          node->inode);
     ext3_journal_stop(mnt);
-    return -1;
+    return -28; /* ENOSPC */
   }
 
   ext2_inode_t new_inode;
@@ -502,13 +511,16 @@ int ext2_create_impl(vfs_node_t *node, char *name, uint16_t permission) {
     ext4_extent_init_inode(&new_inode);
 
   if (ext2_write_inode(mnt, new_ino, &new_inode)) {
+    klogf("[EXT2] create '%s': inode %u write failed\n", name, new_ino);
     ext3_journal_stop(mnt);
-    return -1;
+    return -5; /* EIO */
   }
 
   if (ext2_add_dir_entry(mnt, node->inode, new_ino, name, EXT2_FT_REG_FILE)) {
+    klogf("[EXT2] create '%s': directory entry insert failed (parent ino=%u)\n",
+          name, node->inode);
     ext3_journal_stop(mnt);
-    return -1;
+    return -28; /* ENOSPC: directory could not grow, or the write failed */
   }
 
   ext3_journal_stop(mnt);

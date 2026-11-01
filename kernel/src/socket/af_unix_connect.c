@@ -2,8 +2,10 @@
 
 #include "af_unix_internal.h"
 #include "../apic/lapic_timer.h"
+#include "../lock/lockdiag.h"
 
 static volatile uint32_t unix_missing_destination_logs;
+static uint32_t unix_stall_dumped;
 
 int unix_listen_impl(socket_t *sock, int backlog) {
   if (!sock)
@@ -141,14 +143,100 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
   int connect_error = 0;
   uint64_t deadline = usk->sndtimeo_ms > 0
       ? lapic_timer_get_ticks() + (uint64_t)usk->sndtimeo_ms : 0;
+  uint64_t wait_start = lapic_timer_get_ticks();
+  bool logged_stall = false;
   spinlock_acquire(&listener_sock->lock);
   for (;;) {
     if (listener_sock->closing || listener_sock->state != SS_LISTENING) {
       connect_error = -111; // ECONNREFUSED
       goto connect_failed;
     }
-    if (dusk->accept_queue_len < dusk->backlog)
+    /* Linux treats a unix listener as full only when more than `backlog`
+     * connections are pending, so listen(fd, 1) queues two. kwin's on-demand
+     * Xwayland socket listens with a backlog of 1 and several X clients
+     * connect before the server exists, so being stricter by one blocks a
+     * client that Linux lets through. */
+    if (dusk->accept_queue_len <= dusk->backlog)
       break;
+
+    /* Backlog full. A listener that never accepts leaves every later
+     * connector asleep here forever (kded6, kaccess and plasmashell hung on
+     * the session bus this way). If the daemon is alive but idle in
+     * epoll_wait, the "readable" notification for its queued connections was
+     * lost, so poke it again once a second while we wait; name the listener
+     * once so a genuinely wedged one can be identified. */
+    uint64_t now = lapic_timer_get_ticks();
+    if (now - wait_start >= 1000) {
+      if (listener_sock->node)
+        epoll_notify_event(listener_sock->node, POLLIN);
+      else if (listener_sock->fd >= 0)
+        epoll_notify_socket(listener_sock->fd, POLLIN);
+      if (listener_sock->wait_queue)
+        wait_queue_wake_all((wait_queue_t *)listener_sock->wait_queue);
+    }
+    if (!logged_stall && now - wait_start >= 3000) {
+      char name[48];
+      const char *src = dusk->addr.sun_path[0] ? dusk->addr.sun_path
+                                               : dusk->addr.sun_path + 1;
+      strncpy(name, src, sizeof(name) - 1);
+      name[sizeof(name) - 1] = '\0';
+      klogf("[UNIX] connect blocked >3s: listener %s'%s' owner_pid=%u "
+            "queue=%d/%d connector tgid=%u\n",
+            dusk->addr.sun_path[0] ? "" : "@", name, dusk->owner_pid,
+            dusk->accept_queue_len, dusk->backlog,
+            sched_get_current() ? sched_get_current()->tgid : 0);
+      logged_stall = true;
+
+      /* Who is asleep on this socket? Xwayland/kwin sleeping here means a
+       * lost wake-up; nobody here means nothing is serving it. Also say
+       * whether the connection at the head of the queue is already dead. */
+      wait_queue_t *wq = dusk->wait;
+      unsigned seen_waiters = 0;
+      if (wq) {
+        spinlock_acquire(&wq->lock);
+        for (wait_queue_entry_t *w = wq->head; w && seen_waiters < 8;
+             w = w->next) {
+          struct thread *wt = w->thread;
+          if (!wt)
+            continue;
+          klogf("[UNIX]   waiter tid=%u tgid=%u comm=%s\n", wt->tid, wt->tgid,
+                wt->comm);
+          seen_waiters++;
+        }
+        spinlock_release(&wq->lock);
+      }
+      klogf("[UNIX]   waiters listed=%u head-of-queue orphaned=%d\n",
+            seen_waiters, dusk->accept_next ? (int)dusk->accept_next->orphaned : -1);
+
+      /* epoll watchers on the listener's node are what a server like Xwayland
+       * is woken through. None means nothing is epoll-watching this socket
+       * (server not running, or registered on a different node object). */
+      unsigned ep_watchers = 0;
+      struct vfs_node *lnode = listener_sock->node;
+      if (lnode) {
+        spinlock_acquire(&lnode->ep_lock);
+        struct list_head *head = &lnode->ep_watchers;
+        if (head->next && (uint64_t)head->next >= 0xFFFF800000000000ULL) {
+          for (struct list_head *pos = head->next; pos && pos != head &&
+               (uint64_t)pos >= 0xFFFF800000000000ULL && ep_watchers < 16;
+               pos = pos->next)
+            ep_watchers++;
+        }
+        spinlock_release(&lnode->ep_lock);
+      }
+      klogf("[UNIX]   listener node=%s epoll watchers=%u\n",
+            lnode ? "yes" : "NONE", ep_watchers);
+
+      /* Once per boot: the full thread/lock report, which shows what
+       * kwin_wayland and Xwayland are actually doing. It takes socket locks,
+       * so drop ours first and re-check the queue afterwards. */
+      if (__atomic_exchange_n(&unix_stall_dumped, 1, __ATOMIC_RELAXED) == 0) {
+        spinlock_release(&listener_sock->lock);
+        lockdiag_dump_all("AF_UNIX connect blocked >3s on a full accept queue");
+        spinlock_acquire(&listener_sock->lock);
+        continue;
+      }
+    }
     if ((sock->flags & SOCK_NONBLOCK) ||
         (deadline && lapic_timer_get_ticks() >= deadline)) {
       connect_error = -11; // EAGAIN, not a refusal by a live listener
@@ -166,7 +254,10 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
     wait_queue_entry_t entry = {.thread = current};
     current->state = THREAD_BLOCKED;
     wait_queue_add(dusk->wait, &entry);
-    if (deadline) current->wakeup_ticks = deadline;
+    /* Wake at least once a second to re-check and re-notify (see above). */
+    uint64_t next_wake = now + 1000;
+    current->wakeup_ticks = (deadline && deadline < next_wake) ? deadline
+                                                               : next_wake;
     bool interrupted = thread_has_pending_signal(current);
     if (interrupted) current->state = THREAD_RUNNING;
     spinlock_release(&listener_sock->lock);

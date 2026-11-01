@@ -56,6 +56,9 @@ typedef struct {
     uint32_t    flags;
     wait_queue_t wq;
     spinlock_t  lock;
+    /* Kernel hook, called after each signal or write (see asc_eventfd_set_notify). */
+    void        (*notify)(void *arg);
+    void       *notify_arg;
 } eventfd_ctx_t;
 
 static uint32_t eventfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
@@ -129,11 +132,15 @@ static uint32_t eventfd_write(vfs_node_t *node, uint32_t offset, uint32_t size,
         return (uint32_t)-22; // overflow
     }
     ctx->counter += val;
+    void (*notify)(void *) = ctx->notify;
+    void *notify_arg = ctx->notify_arg;
     spinlock_release(&ctx->lock);
 
     wait_queue_wake_all(&ctx->wq);
     extern void epoll_notify_event(struct vfs_node *node, uint32_t events);
     epoll_notify_event(node, 0x0001);
+    if (notify)
+        notify(notify_arg);
     return 8;
 }
 
@@ -174,9 +181,42 @@ void asc_eventfd_signal(void *opaque, unsigned int mask) {
     if (ctx->counter != UINT64_MAX)
         ctx->counter++;
     bool overflow = ctx->counter == UINT64_MAX;
+    void (*notify)(void *) = ctx->notify;
+    void *notify_arg = ctx->notify_arg;
     spinlock_release(&ctx->lock);
     wait_queue_wake_all(&ctx->wq);
     epoll_notify_event(node, POLLIN | mask | (overflow ? POLLERR : 0));
+    if (notify)
+        notify(notify_arg);
+}
+
+/* Registers fn(arg) to run after every signal and write on this eventfd, for
+ * the kernel's own users (irqfd).  fn runs without the eventfd lock held.  One
+ * hook per eventfd: a second one fails with -EBUSY (-16). */
+int asc_eventfd_set_notify(void *opaque, void (*fn)(void *arg), void *arg) {
+    vfs_node_t *node = opaque;
+    eventfd_ctx_t *ctx = node->device;
+    if (!ctx)
+        return -9; /* EBADF */
+    spinlock_acquire(&ctx->lock);
+    int err = ctx->notify ? -16 : 0;
+    if (!err) {
+        ctx->notify = fn;
+        ctx->notify_arg = arg;
+    }
+    spinlock_release(&ctx->lock);
+    return err;
+}
+
+void asc_eventfd_clear_notify(void *opaque) {
+    vfs_node_t *node = opaque;
+    eventfd_ctx_t *ctx = node->device;
+    if (!ctx)
+        return;
+    spinlock_acquire(&ctx->lock);
+    ctx->notify = NULL;
+    ctx->notify_arg = NULL;
+    spinlock_release(&ctx->lock);
 }
 
 static void eventfd_close(vfs_node_t *node) {
@@ -1010,6 +1050,9 @@ static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,
     vfs_node_init(read_node);
     vfs_node_init(write_node);
     read_node->flags = write_node->flags = FS_PIPE;
+    read_node->mask = write_node->mask = 0600;
+    read_node->uid = write_node->uid = t->fsuid;
+    read_node->gid = write_node->gid = t->fsgid;
     read_node->device = read_end;
     write_node->device = write_end;
     read_node->read = pipe_read;

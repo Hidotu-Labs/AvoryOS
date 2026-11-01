@@ -197,6 +197,18 @@ typedef struct {
   ext3_txn_chunk_t *txn_head;
   ext3_txn_chunk_t *txn_tail;
   uint32_t txn_count;
+  /* Group commit: images of handles that already stopped but whose commit was
+   * deferred because another writer was queued. Same locking as the running
+   * write-set (cache_lock for list changes; only the lock holder mutates), and
+   * newer than home but older than txn_*. Committed as one transaction by the
+   * last handle of a chain, so N contended handles cost one commit, not N. */
+  ext3_txn_chunk_t *closed_head;
+  ext3_txn_chunk_t *closed_tail;
+  uint32_t closed_count;
+  uint32_t closed_handles;
+  uint64_t closed_since_ms;
+  uint64_t group_commits;
+  uint64_t group_handles_batched;
   /* The journal inode's allocation is fixed for the lifetime of this mount.
    * Cache only mappings, never mutable journal contents. Keys are logical+1
    * so a zero-initialized slot is empty. Collisions just remap on demand. */

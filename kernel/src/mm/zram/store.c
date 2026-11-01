@@ -8,10 +8,13 @@
 struct packed_page {
   void *phys;
   struct packed_page *prev, *next;
-  uint32_t free_mask;
+  uint64_t free_mask;
   uint16_t size, bin;
 };
-static struct packed_page *partial[5]; /* 128..2048-byte objects */
+/* 64-byte size classes, 64..2048 bytes: a compressed page is rounded up by
+ * at most 63 bytes instead of up to 2x. */
+#define PACKED_CLASSES 32
+static struct packed_page *partial[PACKED_CLASSES];
 #define PACKED_CHARGE (4096 + 64)      /* frame plus descriptor slab object */
 struct slot {
   void *data;
@@ -67,16 +70,13 @@ static void unlink_partial(struct packed_page *p) {
   p->prev = p->next = NULL;
 }
 static void *packed_alloc(size_t n, struct packed_page **pool) {
-  unsigned bin = 0, size = 128;
-  while (size < n) {
-    size *= 2;
-    bin++;
-  }
+  unsigned bin = n ? (unsigned)((n + 63) / 64) - 1 : 0;
+  unsigned size = (bin + 1) * 64;
   spinlock_acquire(&lock);
   struct packed_page *p = partial[bin];
   if (p) {
-    unsigned i = (unsigned)__builtin_ctz(p->free_mask);
-    p->free_mask &= ~(1u << i);
+    unsigned i = (unsigned)__builtin_ctzll(p->free_mask);
+    p->free_mask &= ~(1ull << i);
     if (!p->free_mask)
       unlink_partial(p);
     *pool = p;
@@ -106,8 +106,8 @@ static void *packed_alloc(size_t n, struct packed_page **pool) {
   p->size = size;
   p->bin = bin;
   unsigned objects = 4096 / size;
-  p->free_mask = objects == 32 ? UINT32_MAX : (1u << objects) - 1;
-  p->free_mask &= ~1u;
+  p->free_mask = objects == 64 ? ~0ull : (1ull << objects) - 1;
+  p->free_mask &= ~1ull;
   spinlock_acquire(&lock);
   link_partial(p);
   spinlock_release(&lock);
@@ -127,6 +127,15 @@ uint32_t zram_store_page(const void *page) {
     if (value != pattern) {
       same = false;
       break;
+    }
+  }
+  /* Early exit for incompressible data: a 1 KiB probe that cannot reach 60%
+   * rejects the page without compressing all 4 KiB. */
+  if (!same) {
+    uint8_t probe[640];
+    if (!zram_lz4_compress(page, 1024, probe, sizeof(probe))) {
+      __atomic_add_fetch(&rejected, 1, __ATOMIC_RELAXED);
+      return 0;
     }
   }
   uint8_t compressed[2048];
@@ -162,7 +171,9 @@ uint32_t zram_store_page(const void *page) {
   slots[id].pool = pool;
   slots[id].same = pattern;
   slots[id].length = n;
-  slots[id].refs = 1; /* publish only initialized data */
+  /* Publish only initialized data: the release pairs with the acquire in
+   * zram_slot_get() and zram_slot_read(). */
+  __atomic_store_n(&slots[id].refs, 1, __ATOMIC_RELEASE);
   stats.stored_pages++;
   stats.compressed_bytes += n;
   if (same)
@@ -172,48 +183,60 @@ uint32_t zram_store_page(const void *page) {
   spinlock_release(&lock);
   return id;
 }
+/* Per-slot refcounts. A slot's data and metadata are written before its refs
+ * are published, and never change while refs > 0, so readers holding a pin
+ * need no lock. The global lock now guards only the free list, the packed
+ * pools and statistics. A count can reach zero only in zram_slot_put(), and
+ * after that no get can succeed, so the final put frees the slot exclusively. */
 bool zram_slot_get(uint32_t id) {
   if (!slots || !id || id > count)
     return false;
-  spinlock_acquire(&lock);
-  bool ok = slots[id].refs && slots[id].refs != UINT32_MAX;
-  if (ok)
-    slots[id].refs++;
-  spinlock_release(&lock);
-  return ok;
+  uint32_t r = __atomic_load_n(&slots[id].refs, __ATOMIC_ACQUIRE);
+  do {
+    if (!r || r == UINT32_MAX)
+      return false;
+  } while (!__atomic_compare_exchange_n(&slots[id].refs, &r, r + 1, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+  return true;
 }
 void zram_slot_put(uint32_t id) {
   if (!slots || !id || id > count)
     return;
+  uint32_t r = __atomic_load_n(&slots[id].refs, __ATOMIC_ACQUIRE);
+  do {
+    if (!r || r == UINT32_MAX)
+      return;
+  } while (!__atomic_compare_exchange_n(&slots[id].refs, &r, r - 1, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+  if (r - 1)
+    return;
   struct packed_page *release = NULL;
   spinlock_acquire(&lock);
   struct slot *s = &slots[id];
-  if (s->refs && !--s->refs) {
-    struct packed_page *p = s->pool;
-    if (p) {
-      unsigned i =
-          ((uint64_t)s->data - (uint64_t)p->phys - pmm_get_hhdm_offset()) /
-          p->size;
-      bool full = !p->free_mask;
-      p->free_mask |= 1u << i;
-      if (full)
-        link_partial(p);
-      unsigned objects = 4096 / p->size;
-      uint32_t all = objects == 32 ? UINT32_MAX : (1u << objects) - 1;
-      if (p->free_mask == all) {
-        unlink_partial(p);
-        stats.memory_bytes -= PACKED_CHARGE;
-        release = p;
-      }
+  struct packed_page *p = s->pool;
+  if (p) {
+    unsigned i =
+        ((uint64_t)s->data - (uint64_t)p->phys - pmm_get_hhdm_offset()) /
+        p->size;
+    bool full = !p->free_mask;
+    p->free_mask |= 1ull << i;
+    if (full)
+      link_partial(p);
+    unsigned objects = 4096 / p->size;
+    uint64_t all = objects == 64 ? ~0ull : (1ull << objects) - 1;
+    if (p->free_mask == all) {
+      unlink_partial(p);
+      stats.memory_bytes -= PACKED_CHARGE;
+      release = p;
     }
-    stats.compressed_bytes -= s->length;
-    stats.stored_pages--;
-    if (!s->length)
-      stats.same_pages--;
-    memset(s, 0, sizeof(*s));
-    s->next = free_head;
-    free_head = id;
   }
+  stats.compressed_bytes -= s->length;
+  stats.stored_pages--;
+  if (!s->length)
+    stats.same_pages--;
+  memset(s, 0, sizeof(*s));
+  s->next = free_head;
+  free_head = id;
   spinlock_release(&lock);
   if (release) {
     pmm_free_page(release->phys);
@@ -223,18 +246,19 @@ void zram_slot_put(uint32_t id) {
 int zram_slot_read(uint32_t id, void *page) {
   if (!slots || !id || id > count || !page)
     return -1;
-  /* The caller pins the object through this whole copy/decompression. */
-  spinlock_acquire(&lock);
-  struct slot s = slots[id];
-  spinlock_release(&lock);
-  if (!s.refs)
+  /* The caller holds a pin, so these fields are stable for the copy. */
+  struct slot *s = &slots[id];
+  if (!__atomic_load_n(&s->refs, __ATOMIC_ACQUIRE))
     return -1;
-  if (!s.length) {
+  uint64_t same = s->same;
+  uint16_t length = s->length;
+  void *data = s->data;
+  if (!length) {
     for (unsigned i = 0; i < 4096; i += 8)
-      memcpy((uint8_t *)page + i, &s.same, 8);
+      memcpy((uint8_t *)page + i, &same, 8);
     return 0;
   }
-  return zram_lz4_decompress(s.data, s.length, page, 4096);
+  return zram_lz4_decompress(data, length, page, 4096);
 }
 void zram_store_stats(struct zram_stats *out) {
   spinlock_acquire(&lock);

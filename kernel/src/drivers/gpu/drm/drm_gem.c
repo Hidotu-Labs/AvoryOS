@@ -2,6 +2,12 @@
 #include "../../../mm/pmm.h"
 #include "../../../mm/heap.h"
 #include "../../../lib/string.h"
+#include "../../../console/klog.h"
+#include "../../../fs/vfs.h"
+
+/* Same recovery heap_big_alloc() uses: shrink slab, buffer and file caches so
+ * a large contiguous request has a chance after fragmentation. */
+extern void heap_oom_reclaim(void);
 
 struct drm_gem_object *ascentdrm_gem_object_create(struct drm_device *dev, size_t size) {
     struct drm_gem_object *obj = kmalloc(sizeof(struct drm_gem_object));
@@ -16,6 +22,24 @@ struct drm_gem_object *ascentdrm_gem_object_create(struct drm_device *dev, size_
 
     void *phys = pmm_alloc_blocks(pages);
     if (!phys) {
+        heap_oom_reclaim();
+        phys = pmm_alloc_blocks(pages);
+    }
+    /* Large buffers (Minecraft's terrain heap asks for 128 MiB) need one
+     * physically contiguous run, which the bounded reclaim above rarely frees:
+     * it drops only a few dozen cache pages. Give the page and dentry caches
+     * up in proportion to the request, then retry, before failing the GL call
+     * with GL_OUT_OF_MEMORY. */
+    for (uint32_t attempt = 1; !phys && attempt <= 3; attempt++) {
+        size_t target = (size_t)pages * attempt;
+        mm_file_cache_reclaim(target);
+        vfs_dentry_reclaim_pages(target);
+        heap_oom_reclaim();
+        phys = pmm_alloc_blocks(pages);
+    }
+    if (!phys) {
+        klogf("[DRM] GEM alloc failed: %llu KiB contiguous\n",
+              (unsigned long long)(size >> 10));
         kfree(obj);
         return NULL;
     }

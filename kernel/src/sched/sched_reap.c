@@ -11,6 +11,7 @@
 #include "wait.h"
 #include "hal/hal.h"
 #include "../apic/lapic.h"
+#include "../apic/lapic_timer.h"
 #include "../console/klog.h"
 #include "../cpu/fpu.h"
 #include "../fs/procfs.h"
@@ -437,9 +438,25 @@ void sched_terminate_thread_group(struct thread *current) {
   }
 }
 
+/* Every idle CPU calls this on each wake-up, and each call walks the whole
+ * thread list under tid_lock. With thousands of threads on the list that scan
+ * ran on all cores several times a second, even with the game idle. Only one
+ * CPU scans per interval; orphans are still reaped within 100 ms. */
+#define ORPHAN_SCAN_INTERVAL_MS 100
+static uint64_t orphan_scan_next_ms;
+
 void sched_reap_orphaned_zombies(void) {
   extern struct thread *global_thread_list;
   extern spinlock_t tid_lock;
+
+  uint64_t now = lapic_timer_get_ms();
+  uint64_t next = __atomic_load_n(&orphan_scan_next_ms, __ATOMIC_RELAXED);
+  if (now < next)
+    return;
+  if (!__atomic_compare_exchange_n(&orphan_scan_next_ms, &next,
+                                   now + ORPHAN_SCAN_INTERVAL_MS, false,
+                                   __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+    return;
 
   spinlock_acquire(&tid_lock);
   for (struct thread *t = global_thread_list; t; t = t->global_next) {
@@ -452,7 +469,11 @@ void sched_reap_orphaned_zombies(void) {
 
     struct thread *parent = t->parent;
     bool can_reap = false;
-    if (!parent) {
+    if (!parent || t->state == THREAD_DEAD) {
+      /* DEAD is auto-reap: exit marked it as not waitable. A live,
+       * non-waiting parent used to keep it on the list forever, so exited
+       * JVM threads piled up (5000+ entries) and every walk of the list
+       * under tid_lock slowed the whole machine. */
       can_reap = true;
     } else {
       if (parent->state == THREAD_DEAD || parent->state == THREAD_ZOMBIE) {

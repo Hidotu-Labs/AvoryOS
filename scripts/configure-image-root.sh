@@ -102,6 +102,28 @@ fi
 # so seed the existing accounts and /etc/skel with the same GLX renderer view.
 # The image builder reserves /bin as a real directory for AvoryOS launchers,
 # so restore the essential usrmerge links needed by scripts and login shells.
+
+# Package post-install hooks do not run during rootless extraction, so the
+# GSettings schema cache is never built. Without gschemas.compiled GLib sees no
+# schemas at all and any program that needs one dies with a fatal g_error()
+# (at-spi-bus-launcher: "Cannot get the default GSettingsSchemaSource",
+# xdg-desktop-portal-gtk: "No GSettings schemas are installed"); both then abort
+# and respawn forever, and Qt's synchronous accessibility D-Bus call at startup
+# waits on them. Compile the cache from the rootfs and write it into the image.
+GSCHEMAS_COMPILED=""
+if [ -d "${ROOTFS_DIR}/usr/share/glib-2.0/schemas" ]; then
+    if command -v glib-compile-schemas >/dev/null 2>&1; then
+        mkdir -p "${CONFIG_DIR}/schemas"
+        if glib-compile-schemas --targetdir="${CONFIG_DIR}/schemas" \
+               "${ROOTFS_DIR}/usr/share/glib-2.0/schemas"; then
+            GSCHEMAS_COMPILED="${CONFIG_DIR}/schemas/gschemas.compiled"
+        else
+            echo "Warning: glib-compile-schemas failed; GSettings will be unavailable" >&2
+        fi
+    else
+        echo "Warning: glib-compile-schemas not found on the host; GSettings will be unavailable" >&2
+    fi
+fi
 {
     cat <<EOF
 rm bin/sh
@@ -187,6 +209,22 @@ EOF
             'set_inode_field etc/sudoers gid 0' \
             'set_inode_field etc/sudoers mode 0100440'
     fi
+    if [ -n "${GSCHEMAS_COMPILED}" ] && [ -f "${GSCHEMAS_COMPILED}" ]; then
+        printf '%s\n' \
+            'rm usr/share/glib-2.0/schemas/gschemas.compiled' \
+            "write ${GSCHEMAS_COMPILED} usr/share/glib-2.0/schemas/gschemas.compiled"
+    fi
+    # fusermount3 mounts FUSE filesystems for ordinary users (xdg-document-
+    # portal, gvfsd-fuse, AppImages) and relies on being setuid root: without
+    # it mount(2) fails the CAP_SYS_ADMIN check and the caller sees EPERM.
+    for helper in usr/bin/fusermount3 usr/bin/fusermount; do
+        if [ -f "${ROOTFS_DIR}/${helper}" ] && [ ! -L "${ROOTFS_DIR}/${helper}" ]; then
+            printf '%s\n' \
+                "set_inode_field ${helper} uid 0" \
+                "set_inode_field ${helper} gid 0" \
+                "set_inode_field ${helper} mode 0104755"
+        fi
+    done
     while IFS= read -r -d '' entry; do
         image_path="${entry#"${ROOTFS_DIR}/"}"
         printf 'set_inode_field "%s" uid %s\n' "${image_path}" "${AVORY_UID}"
@@ -200,6 +238,25 @@ for home_path in home/avory home/avory/.config home/avory/.config/kwinrc; do
         echo "Could not assign /${home_path} to Avory (${AVORY_UID}:${AVORY_GID}):" >&2
         printf '%s\n' "${details}" >&2
         exit 1
+    fi
+done
+
+if [ -n "${GSCHEMAS_COMPILED}" ]; then
+    if ! debugfs -R "stat /usr/share/glib-2.0/schemas/gschemas.compiled" "${IMAGE}" >/dev/null 2>&1; then
+        echo "Could not install /usr/share/glib-2.0/schemas/gschemas.compiled into the image" >&2
+        exit 1
+    fi
+fi
+
+for helper in usr/bin/fusermount3 usr/bin/fusermount; do
+    if [ -f "${ROOTFS_DIR}/${helper}" ] && [ ! -L "${ROOTFS_DIR}/${helper}" ]; then
+        details="$(debugfs -R "stat /${helper}" "${IMAGE}" 2>&1 || true)"
+        if ! grep -Eq "User:[[:space:]]+0[[:space:]]+Group:[[:space:]]+0([[:space:]]|$)" <<<"${details}" ||
+           ! grep -Eq "Mode:[[:space:]]+04755([[:space:]]|$)" <<<"${details}"; then
+            echo "Could not restore /${helper} root ownership and mode 04755:" >&2
+            printf '%s\n' "${details}" >&2
+            exit 1
+        fi
     fi
 done
 

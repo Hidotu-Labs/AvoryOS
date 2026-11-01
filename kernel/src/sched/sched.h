@@ -269,6 +269,9 @@ struct thread {
   vfs_node_t *fs_root_node;
   struct seccomp_filter *seccomp_filter;
   bool no_new_privs;
+  /* prctl(PR_SET_DUMPABLE, 0). Stored inverted so zeroed thread state stays
+   * dumpable; sandbox helpers set it and read it back to verify. */
+  bool nondumpable;
   bool caps_initialized;
   uint64_t cap_effective, cap_permitted, cap_inheritable;
   uint64_t cap_bounding, cap_ambient;
@@ -698,6 +701,8 @@ int sched_get_mount_snapshot(uint32_t tid, vfs_mount_info_t *mounts, int count);
 bool sched_get_nth_thread_tid(uint32_t index, uint32_t *tid);
 /* Live members only; copy IDs/count under tid_lock without exposing pointers. */
 uint32_t sched_get_group_threads(uint32_t tgid, uint32_t index, uint32_t *tid);
+bool sched_get_cpu_time_ms(uint32_t id, bool group, bool user_only,
+                           uint64_t *ms);
 bool sched_get_nth_open_fd(uint32_t tid, uint32_t index, uint32_t *fd);
 vfs_node_t *sched_get_fd_node_snapshot(uint32_t tid, uint32_t fd);
 bool sched_get_fd_path_snapshot(uint32_t tid, uint32_t fd, char *path,

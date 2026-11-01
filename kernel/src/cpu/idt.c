@@ -100,6 +100,8 @@ void idt_init(void) {
   idt_set_gate(8, (uint64_t)isr8, sel, flags);
   /* #DF runs on TSS IST1 so a nested fault can still be reported. */
   idt[8].ist = 1;
+  /* NMI runs on TSS IST2: see the NMI entry in interrupts.asm. */
+  idt[2].ist = 2;
   idt_set_gate(9, (uint64_t)isr9, sel, flags);
   idt_set_gate(10, (uint64_t)isr10, sel, flags);
   idt_set_gate(11, (uint64_t)isr11, sel, flags);

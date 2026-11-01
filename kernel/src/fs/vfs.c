@@ -1478,9 +1478,15 @@ int vfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
         vfs_close(existing);
         return -17; // EEXIST
       }
+      klogf("[VFS] mkdir '%s' in '%s' failed in the backend: %d\n", name,
+            node->name, result);
     }
     return result;
   }
+  /* No mkdir operation on this directory: Linux reports EPERM, but a bare -1
+   * left callers (udev creating /dev/dri/by-path) guessing why. */
+  klogf("[VFS] mkdir '%s' refused: directory '%s' has no mkdir op (type=%u)\n",
+        name, node->name, (unsigned)(node->flags & FS_TYPE_MASK));
   return -1;
 }
 

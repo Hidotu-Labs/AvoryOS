@@ -17,7 +17,33 @@ isr%1:
 
 ISR_NOERRCODE 0
 ISR_NOERRCODE 1
-ISR_NOERRCODE 2
+; NMI.  An NMI can arrive in the syscall exit window, after the swapgs that
+; precedes sysret and before the sysret itself.  There CS is still the kernel's,
+; so the common stub would not swap, and the handler would read per-CPU data
+; through the user's GS base.  This entry checks the GS base in that case, swaps,
+; and sets NMI_GS_MARK in the error-code slot.  The common exit swaps back when it
+; sees the mark.  An NMI from user mode is left to the common stub.
+NMI_GS_MARK equ 0x4E4D4953
+global isr2
+isr2:
+    push 0                  ; error-code slot, set to the mark below if needed
+    push 2                  ; interrupt number
+    push rax
+    push rcx
+    push rdx
+    test qword [rsp + 48], 3    ; CS of the NMI frame
+    jnz .nmi_done
+    mov ecx, 0xC0000101         ; IA32_GS_BASE
+    rdmsr
+    test edx, edx
+    js .nmi_done                ; GS base is already the kernel's
+    swapgs
+    mov qword [rsp + 32], NMI_GS_MARK
+.nmi_done:
+    pop rdx
+    pop rcx
+    pop rax
+    jmp isr_common_stub
 ISR_NOERRCODE 3
 ISR_NOERRCODE 4
 ISR_NOERRCODE 5
@@ -166,6 +192,12 @@ isr_common_stub:
     jz .skip_swapgs_exit
     swapgs
 .skip_swapgs_exit:
+
+    ; An NMI that swapped GS on entry swaps back here.
+    cmp qword [rsp + 8], NMI_GS_MARK
+    jne .skip_nmi_gs_exit
+    swapgs
+.skip_nmi_gs_exit:
 
     add rsp, 16             ; remove int_no + err_code
     iretq

@@ -46,6 +46,7 @@ extern void signal_notify_parent_exit(struct thread *child);
 uint64_t futex_wake_user(uint32_t *uaddr, uint32_t count);
 static void robust_handle_death(struct thread *t);
 void process_do_exit(uint64_t status) __attribute__((noreturn));
+void uname_policy_on_exit(struct thread *t, uint64_t status);
 
 static void process_clear_child_tid(struct thread *current) {
   uint32_t *tidptr = (uint32_t *)current->tid_address;
@@ -75,6 +76,7 @@ void process_do_exit(uint64_t status) {
       sched_yield();
     }
   }
+  uname_policy_on_exit(current, status);
   ptrace_tracer_exit(current);
   current->exit_status = (int)status;
   ptrace_exit_event(current, (int)status);
