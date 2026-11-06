@@ -2,6 +2,7 @@
 #include "../sched/capability.h"
 #include "../sched/net_namespace.h"
 #include "../sched/pid_namespace.h"
+#include "../sched/user_namespace.h"
 #include "inotify_limits.h"
 #include "fs/procfs.h"
 #include "console/klog.h"
@@ -569,6 +570,14 @@ uint32_t procfs_cpuinfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                        : "a"(0x80000001));
     }
 
+    uint32_t leafd_1_eax = 0;
+    if (max_leaf >= 0xD) {
+      uint32_t unused_b, unused_c, unused_d;
+      __asm__ volatile("cpuid"
+                       : "=a"(leafd_1_eax), "=b"(unused_b), "=c"(unused_c), "=d"(unused_d)
+                       : "a"(0xD), "c"(1));
+    }
+
     pos += snprintf(buf + pos, 16384 - pos, "flags           :");
 #define CPUINFO_FLAG(bits, bit, name)                                          \
     do {                                                                        \
@@ -601,6 +610,7 @@ uint32_t procfs_cpuinfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     CPUINFO_FLAG(features_ecx, 25, "aes");
     CPUINFO_FLAG(features_ecx, 26, "xsave");
     CPUINFO_FLAG(features_ecx, 27, "osxsave");
+    CPUINFO_FLAG(leafd_1_eax, 0, "xsaveopt");
     CPUINFO_FLAG(features_ecx, 28, "avx");
     CPUINFO_FLAG(features_ecx, 29, "f16c");
     CPUINFO_FLAG(features_ecx, 30, "rdrand");
@@ -1734,13 +1744,21 @@ static uint32_t procfs_pid_auxv_read(vfs_node_t *node, uint32_t offset,
   return (uint32_t)sched_read_thread_auxv(pid, offset, size, buffer);
 }
 
+/* Only a process's own user-namespace mappings can be written, so these files
+ * act on the calling thread. Other pids read as the initial namespace. */
+static bool procfs_pid_is_self(uint32_t pid) {
+  struct thread *current = sched_get_current();
+  return current && pid_namespace_tid(current, current) == pid;
+}
+
 // /proc/<pid>/setgroups (used by bwrap, podman, flatpak, unshare)
 static uint32_t procfs_pid_setgroups_read(vfs_node_t *node, uint32_t offset,
                                           uint32_t size, uint8_t *buffer) {
   if (!procfs_pid_visible(node->impl)) return 0;
-  (void)node;
-  const char *val = "allow\n";
-  uint32_t len = 6;
+  bool denied = procfs_pid_is_self(node->impl) &&
+                user_namespace_setgroups_denied(sched_get_current());
+  const char *val = denied ? "deny\n" : "allow\n";
+  uint32_t len = denied ? 5 : 6;
   if (offset >= len || !buffer) return 0;
   if (offset + size > len) size = len - offset;
   memcpy(buffer, val + offset, size);
@@ -1749,17 +1767,25 @@ static uint32_t procfs_pid_setgroups_read(vfs_node_t *node, uint32_t offset,
 
 static uint32_t procfs_pid_setgroups_write(vfs_node_t *node, uint32_t offset,
                                            uint32_t size, uint8_t *buffer) {
-  (void)node; (void)offset; (void)buffer;
-  return size; // Accept "deny" or "allow" successfully
+  (void)offset;
+  if (!procfs_pid_is_self(node->impl)) return 0;
+  int64_t rc = user_namespace_write_setgroups(sched_get_current(), (const char *)buffer, size);
+  return rc < 0 ? 0 : size;
 }
 
 // /proc/<pid>/uid_map and gid_map (used by bwrap, podman, flatpak)
 static uint32_t procfs_pid_id_map_read(vfs_node_t *node, uint32_t offset,
                                        uint32_t size, uint8_t *buffer) {
   if (!procfs_pid_visible(node->impl)) return 0;
-  (void)node;
+  bool gid = node->name[0] == 'g';
   const char *val = "         0          0 4294967295\n";
   uint32_t len = 34;
+  char text[USER_NS_MAP_TEXT];
+  struct thread *current = sched_get_current();
+  if (procfs_pid_is_self(node->impl) && current && current->user_ns) {
+    len = user_namespace_map_text(current, gid, text, sizeof(text));
+    val = text;
+  }
   if (offset >= len || !buffer) return 0;
   if (offset + size > len) size = len - offset;
   memcpy(buffer, val + offset, size);
@@ -1768,8 +1794,11 @@ static uint32_t procfs_pid_id_map_read(vfs_node_t *node, uint32_t offset,
 
 static uint32_t procfs_pid_id_map_write(vfs_node_t *node, uint32_t offset,
                                         uint32_t size, uint8_t *buffer) {
-  (void)node; (void)offset; (void)buffer;
-  return size; // Accept mapping successfully
+  (void)offset;
+  if (!procfs_pid_is_self(node->impl)) return 0;
+  bool gid = node->name[0] == 'g';
+  int64_t rc = user_namespace_write_map(sched_get_current(), gid, (const char *)buffer, size);
+  return rc < 0 ? 0 : size;
 }
 
 // /proc/<pid>/oom_score_adj
@@ -2421,17 +2450,16 @@ typedef struct procfs_pid_cache_entry {
 static procfs_pid_cache_entry_t *procfs_pid_cache;
 static spinlock_t procfs_pid_cache_lock = SPINLOCK_INIT;
 
-/* Linux owns /proc/<pid>/comm by the task's effective ids, so a non-root
- * process can rename itself by writing /proc/self/comm (Chromium/Electron do
- * this). The pid dir is cached across exec and setuid transitions, so refresh
- * the owner on each lookup. Other writable pid entries stay root-owned: their
- * write handlers are accept-and-discard stubs, and owner write access would
- * make unsupported writes look like they succeeded. */
-static void procfs_pid_comm_refresh_owner(vfs_node_t *comm, uint32_t pid) {
+/* Linux owns the writable /proc/<pid> files (comm, setgroups, uid_map,
+ * gid_map) by the task's effective ids, so a non-root process can write its
+ * own. The pid dir is cached across exec and setuid transitions, so refresh
+ * the owner on each lookup. Each write handler accepts only the calling
+ * thread's own pid, so the owner does not widen access. */
+static void procfs_pid_owner_refresh(vfs_node_t *node, uint32_t pid) {
   struct sched_thread_snapshot snap;
   if (!sched_get_thread_snapshot(pid, &snap)) return;
-  comm->uid = snap.euid;
-  comm->gid = snap.egid;
+  node->uid = snap.euid;
+  node->gid = snap.egid;
 }
 
 /* Dynamic PID trees own one reference to every contained node. Unlike the
@@ -2448,8 +2476,9 @@ static vfs_node_t *procfs_pid_ramfs_finddir(vfs_node_t *node, char *name) {
   ramfs_dir_t *dir = (ramfs_dir_t *)node->device;
   for (child_node_t *child = dir->children; child; child = child->next) {
     if (strcmp(child->node->name, name) == 0) {
-      if (strcmp(name, "comm") == 0)
-        procfs_pid_comm_refresh_owner(child->node, node->impl);
+      if (strcmp(name, "comm") == 0 || strcmp(name, "setgroups") == 0 ||
+          strcmp(name, "uid_map") == 0 || strcmp(name, "gid_map") == 0)
+        procfs_pid_owner_refresh(child->node, node->impl);
       vfs_open(child->node);
       return child->node;
     }
@@ -4211,8 +4240,10 @@ static uint32_t procfs_sys_max_user_ns_read(vfs_node_t *node, uint32_t offset,
                                             uint32_t size, uint8_t *buffer) {
     (void)node;
     klog_puts("[PROCFS] read /proc/sys/user/max_user_namespaces\n");
-    const char *val = "0\n";
-    uint32_t len = 2;
+    /* Advertised value. The kernel does not count namespaces; nesting is
+     * bounded by USER_NS_MAX_LEVEL. */
+    const char *val = "1024\n";
+    uint32_t len = 5;
     if (offset >= len) return 0;
     if (offset + size > len) size = len - offset;
     memcpy(buffer, val + offset, size);
@@ -4223,7 +4254,7 @@ static uint32_t procfs_sys_unprivileged_userns_clone_read(vfs_node_t *node, uint
                                                           uint32_t size, uint8_t *buffer) {
     (void)node;
     klog_puts("[PROCFS] read /proc/sys/kernel/unprivileged_userns_clone\n");
-    const char *val = "0\n";
+    const char *val = "1\n";
     uint32_t len = 2;
     if (offset >= len) return 0;
     if (offset + size > len) size = len - offset;

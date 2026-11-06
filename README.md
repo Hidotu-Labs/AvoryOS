@@ -57,6 +57,10 @@ Build the kernel and the default bootable images:
 make
 ```
 
+The userland benchmarks build as individual `.elf` targets like the other
+tests. They cover VFS, CPU usage, process startup, RAM and heavy iterations;
+see [benchmark instructions](docs/userland-benchmarks.md).
+
 The default target builds the kernel, ISO, GPT disk image, and OVMF firmware. To run the system in QEMU:
 
 Each kernel source state gets a generated build tag, shown in the boot message and `uname -v`. Rebuilding without kernel or LinuxKPI source changes keeps the same tag; changing those sources generates a new one.

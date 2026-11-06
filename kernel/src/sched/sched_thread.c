@@ -20,6 +20,7 @@
 #include "../mm/vmm.h"
 #include "../cpu/fpu.h"
 #include "../smp/cpu.h"
+#include "../syscalls/syscall.h"
 
 uint32_t next_tid = 1;
 spinlock_t tid_lock = SPINLOCK_INIT;
@@ -590,6 +591,8 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
   __atomic_add_fetch(&global_thread_count, 1, __ATOMIC_RELAXED);
   spinlock_release(&tid_lock);
 
+  thread_update_fastpath_state(t);
+
   // Balance and add to a CPU's runqueue conditionally
   if (enqueue) {
     sched_enqueue_thread(t, explicit_cpu);
@@ -849,13 +852,13 @@ uint32_t sched_get_group_threads(uint32_t tgid, uint32_t index, uint32_t *tid) {
   return count;
 }
 
-/* CPU time consumed by one thread (group=false, id is a tid) or by every
- * thread of a process including exited ones still on the list (group=true, id
- * is a tgid). Returns false when no such thread exists. */
-bool sched_get_cpu_time_ms(uint32_t id, bool group, bool user_only,
-                           uint64_t *ms) {
+/* Read both counters in one lookup. Exited members' counters survive reaping
+ * through the transfer in sched_reap_thread(), while thread clocks exclude
+ * those transferred counters. Values have scheduler tick (1 ms) precision. */
+bool sched_get_cpu_usage_ms(uint32_t id, bool group, uint64_t *user_ms,
+                            uint64_t *system_ms) {
   bool found = false;
-  uint64_t total = 0;
+  uint64_t user = 0, system = 0;
   spinlock_acquire(&tid_lock);
   if (!group) {
     /* Per-thread clocks are read in loops (G1 polls its own CPU clock); a
@@ -863,7 +866,8 @@ bool sched_get_cpu_time_ms(uint32_t id, bool group, bool user_only,
     struct thread *t = find_thread_by_tid_locked(id);
     if (t && t->state != THREAD_DEAD && t->state != THREAD_ZOMBIE) {
       found = true;
-      total = user_only ? t->runtime_user_ms : t->runtime_total;
+      user = __atomic_load_n(&t->runtime_user_ms, __ATOMIC_RELAXED);
+      system = __atomic_load_n(&t->runtime_system_ms, __ATOMIC_RELAXED);
     }
   } else {
     /* Process clocks sum the group; only the rare process-wide clock walks. */
@@ -871,12 +875,23 @@ bool sched_get_cpu_time_ms(uint32_t id, bool group, bool user_only,
       if ((t->tgid ? t->tgid : t->tid) != id)
         continue;
       found = true;
-      total += user_only ? t->runtime_user_ms : t->runtime_total;
+      user += __atomic_load_n(&t->runtime_user_ms, __ATOMIC_RELAXED) +
+              t->reaped_user_ms;
+      system += __atomic_load_n(&t->runtime_system_ms, __ATOMIC_RELAXED) +
+                t->reaped_system_ms;
     }
   }
   spinlock_release(&tid_lock);
-  if (found && ms)
-    *ms = total;
+  if (user_ms) *user_ms = user;
+  if (system_ms) *system_ms = system;
+  return found;
+}
+
+bool sched_get_cpu_time_ms(uint32_t id, bool group, bool user_only,
+                           uint64_t *ms) {
+  uint64_t user, system;
+  bool found = sched_get_cpu_usage_ms(id, group, &user, &system);
+  if (ms) *ms = user + (user_only ? 0 : system);
   return found;
 }
 

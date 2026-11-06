@@ -84,7 +84,7 @@ static const char *sysdiag_lookup_ioctl_name(uint32_t req) {
   case 0x80045432: return "TIOCGPTLCK";
   case 0x80045439: return "TIOCGPTLCK";
   case 0x5440: return "TIOCGSID";
-  case 0x5441: return "TCGETS2";
+  case 0x802C542A: return "TCGETS2";
   case 0x5442: return "TCSETS2";
   case 0x5450: return "FIONCLEX";
   case 0x5451: return "FIOCLEX";
@@ -971,6 +971,13 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
       /* PTY-number probe on a non-PTY descriptor (Electron stdio/log
        * isatty check). Linux also answers ENOTTY here; only a PTY
        * master implements TIOCGPTN. */
+      severe = false;
+    } else if (syscall_num == 16 /* ioctl */ && error_code == -25 &&
+               ((uint32_t)regs->rsi == 0x5401 /* TCGETS */ ||
+                (uint32_t)regs->rsi == 0x802C542A /* TCGETS2 */)) {
+      /* isatty() probe: glibc issues TCGETS/TCGETS2 on stdio streams and
+       * reads ENOTTY as "not a terminal". Linux answers exactly this for
+       * pipes, sockets, regular files and /dev/null, so it is not an error. */
       severe = false;
     } else if (syscall_num == 16 /* ioctl */ && error_code == -25 &&
                (((uint32_t)regs->rsi & 0xFF00) == 0x8B00)) {

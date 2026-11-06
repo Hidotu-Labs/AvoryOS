@@ -19,6 +19,22 @@ volatile int heap_slab_dbg_on;
 
 void heap_pcpu_flush_all(void);
 
+/* O(1) size class lookup: caches are 32, 64, 128, 256, 512, 1024 bytes (powers of 2).
+ * 31 - clz(size - 1) gives the highest bit index.
+ * For size <= 32: index 0.
+ * For size 33..64: highest bit is 5 -> 5 - 4 = 1.
+ * For size 65..128: highest bit is 6 -> 6 - 4 = 2.
+ * For size 129..256: highest bit is 7 -> 7 - 4 = 3.
+ * For size 257..512: highest bit is 8 -> 8 - 4 = 4.
+ * For size 513..1024: highest bit is 9 -> 9 - 4 = 5. */
+static inline int heap_cache_index(size_t size) {
+  if (__builtin_expect(size <= 32, 0))
+    return 0;
+  if (__builtin_expect(size > 1024, 0))
+    return -1;
+  return (31 - __builtin_clz((uint32_t)(size - 1))) - 4;
+}
+
 void heap_slab_init(void) {
   for (size_t cpu = 0; cpu < MAX_CPUS; cpu++) {
     for (size_t ci = 0; ci < HEAP_PCPU_CLASSES; ci++) {
@@ -30,6 +46,13 @@ void heap_slab_init(void) {
   }
   for (size_t i = 0; i < CACHE_COUNT; i++) {
     spinlock_init(&heap_caches[i].lock);
+  }
+  for (size_t s = 1; s <= 1024; s++) {
+    int idx = heap_cache_index(s);
+    if (idx < 0 || (size_t)idx >= CACHE_COUNT || s > heap_caches[idx].obj_size ||
+        (idx > 0 && s <= heap_caches[idx - 1].obj_size)) {
+      klogf("[FATAL] heap_cache_index error for size %zu: got %d\n", s, idx);
+    }
   }
 }
 
@@ -270,7 +293,7 @@ static void slab_free_to_cache_locked(struct slab_cache *c, struct slab *s, void
     return;
   }
   uint64_t offset = (uint64_t)ptr - object_base;
-  if (offset % c->obj_size != 0) {
+  if ((offset & (c->obj_size - 1)) != 0) {
     klogf("[WARN] kfree: pointer is not slab-object aligned ptr=0x%016llX\n",
           (unsigned long long)(uintptr_t)ptr);
     return;
@@ -369,15 +392,8 @@ void heap_pcpu_flush_all(void) {
 }
 
 void *heap_slab_alloc(size_t size) {
-  int cache_idx = -1;
-  for (size_t i = 0; i < CACHE_COUNT; i++) {
-    if (size <= heap_caches[i].obj_size) {
-      cache_idx = (int)i;
-      break;
-    }
-  }
-
-  if (cache_idx < 0)
+  int cache_idx = heap_cache_index(size);
+  if (__builtin_expect(cache_idx < 0, 0))
     return NULL;
 
   /* Fast path: Per-CPU local magazine for small objects (<= 256 bytes) */
@@ -447,7 +463,7 @@ bool heap_slab_free(void *ptr, uint64_t page_base) {
       return false;
     }
     uint64_t offset = (uint64_t)ptr - object_base;
-    if (__builtin_expect(offset % c->obj_size != 0, 0)) {
+    if (__builtin_expect((offset & (c->obj_size - 1)) != 0, 0)) {
       klogf("[WARN] kfree: pointer is not slab-object aligned ptr=0x%016llX\n",
             (unsigned long long)(uintptr_t)ptr);
       return false;
@@ -467,13 +483,15 @@ bool heap_slab_free(void *ptr, uint64_t page_base) {
         pcpu->active = 1;
         __asm__ volatile("" ::: "memory");
         if (__builtin_expect(!spinlock_is_locked(&pcpu->lock), 1)) {
-          /* Intercept immediate double-frees in local magazine */
-          for (uint32_t i = 0; i < pcpu->count; i++) {
-            if (__builtin_expect(pcpu->entries[i] == ptr, 0)) {
-              pcpu->active = 0;
-              heap_trace_warn_double("in per-CPU freelist!", ptr);
-              hal_irq_restore(flags);
-              return true;
+          /* Intercept immediate double-frees in local magazine if debug is enabled */
+          if (__builtin_expect(heap_slab_dbg_on, 0)) {
+            for (uint32_t i = 0; i < pcpu->count; i++) {
+              if (pcpu->entries[i] == ptr) {
+                pcpu->active = 0;
+                heap_trace_warn_double("in per-CPU freelist!", ptr);
+                hal_irq_restore(flags);
+                return true;
+              }
             }
           }
 
@@ -531,7 +549,7 @@ size_t heap_slab_ksize(const void *ptr, uint64_t page_base) {
   if ((uint64_t)ptr < object_base)
     return 0;
   uint64_t offset = (uint64_t)ptr - object_base;
-  if (offset % s->cache->obj_size != 0)
+  if ((offset & (s->cache->obj_size - 1)) != 0)
     return 0;
   uint32_t idx = offset / s->cache->obj_size;
   if (idx >= s->total_count)

@@ -133,6 +133,71 @@ void fd_release_reserved(struct thread *t, int fd) {
     vfs_close(reserved);
 }
 
+/*
+ * Borrowed vs referenced descriptor token.
+ * In single-threaded execution (t->files->ref_count == 1, no CLONE_FILES),
+ * no peer thread can close or reassign the descriptor during a synchronous
+ * syscall. We borrow the pointer directly with ZERO locks and ZERO atomic
+ * refcount churn (modeled on Linux's fdget/fdput optimization).
+ */
+struct fd_ref {
+  vfs_node_t *node;
+  bool borrowed;
+};
+
+static inline struct fd_ref fd_get_node(struct thread *t, uint64_t fd,
+                                        uint64_t *offset_out,
+                                        uint64_t *fd_flags_out) {
+  struct fd_ref ref = { .node = NULL, .borrowed = false };
+  if (!t || !t->files || fd >= MAX_FDS)
+    return ref;
+
+  /* Fast-path: single-threaded file table (ref_count == 1).
+   * No concurrent thread shares this table, so no thread can close or replace
+   * this descriptor under our feet during synchronous syscall handling.
+   * Skip files->lock and skip vfs_node_ref() atomic operations entirely. */
+  if (t->files->ref_count == 1) {
+    if (fd < t->files->capacity) {
+      vfs_node_t *node = t->files->fds[fd];
+      if (node && node != FD_RESERVED) {
+        ref.node = node;
+        ref.borrowed = true;
+        if (offset_out)
+          *offset_out = fd_offset_get_locked(t, fd);
+        if (fd_flags_out)
+          *fd_flags_out = t->files->fd_flags[fd];
+        return ref;
+      }
+    }
+    return ref;
+  }
+
+  /* Slow-path: multi-threaded shared file table (CLONE_FILES).
+   * A sibling thread could concurrently close/reuse this slot while I/O is in flight.
+   * Acquire files->lock and bump node->refcount. */
+  spinlock_acquire(&t->files->lock);
+  if (fd < t->files->capacity) {
+    vfs_node_t *node = t->files->fds[fd];
+    if (node && node != FD_RESERVED) {
+      vfs_node_ref(node);
+      ref.node = node;
+      ref.borrowed = false;
+      if (offset_out)
+        *offset_out = fd_offset_get_locked(t, fd);
+      if (fd_flags_out)
+        *fd_flags_out = t->files->fd_flags[fd];
+    }
+  }
+  spinlock_release(&t->files->lock);
+  return ref;
+}
+
+static inline void fd_put_node(struct fd_ref ref) {
+  if (ref.node && !ref.borrowed) {
+    vfs_close(ref.node);
+  }
+}
+
 /* Pin the node while an fd operation runs. CLONE_FILES threads can close and
  * reuse an fd concurrently; holding only the pointer lets the last close tear
  * down a tmpfs node while its read callback or page-cache fill is in flight. */
@@ -165,6 +230,12 @@ static void fd_advance_offset(struct thread *t, uint64_t fd,
                               vfs_node_t *node, uint64_t amount) {
   if (!t || !t->files || !node || fd >= MAX_FDS || !amount)
     return;
+  /* Fast-path for single-threaded tables: skip files->lock */
+  if (t->files->ref_count == 1) {
+    if (fd < t->files->capacity && t->files->fds[fd] == node)
+      fd_offset_add_locked(t, fd, amount);
+    return;
+  }
   spinlock_acquire(&t->files->lock);
   /* A concurrent close may have reused this slot for a different file. */
   if (fd < t->files->capacity && t->files->fds[fd] == node)
@@ -174,6 +245,14 @@ static void fd_advance_offset(struct thread *t, uint64_t fd,
 
 static void fd_set_offset(struct thread *t, uint64_t fd,
                            vfs_node_t *node, uint64_t offset) {
+  if (!t || !t->files || !node || fd >= MAX_FDS)
+    return;
+  /* Fast-path for single-threaded tables: skip files->lock */
+  if (t->files->ref_count == 1) {
+    if (fd < t->files->capacity && t->files->fds[fd] == node)
+      fd_offset_set_locked(t, fd, offset);
+    return;
+  }
   spinlock_acquire(&t->files->lock);
   if (fd < t->files->capacity && t->files->fds[fd] == node)
     fd_offset_set_locked(t, fd, offset);
@@ -589,6 +668,14 @@ device_vfs_lookup:
                : vfs_resolve_path_at(lookup_base, lookup_path);
     node_owned = node != NULL;
   }
+
+  /* The device-name branch above is skipped inside a mount namespace, where
+   * /dev/ttyN resolves to the ramfs entry registered under the console node's
+   * name ("console"), so the lookup misses. Fall back to the registry only
+   * when the namespace view has no entry, so a sandbox's own /dev still wins. */
+  if (!node && dev_path && !(flags & O_CREAT) &&
+      fs_root == vfs_backing_node(fs_root))
+    node = fb_lookup_device((char *)dev_path);
 
   if (node && (node->flags & FS_TYPE_MASK) == FS_SYMLINK &&
       (flags & O_NOFOLLOW) && !(flags & O_PATH) &&
@@ -1212,7 +1299,8 @@ static int64_t fd_write(int fd, const void *buf, size_t count) {
 
   uint64_t offset = 0;
   uint64_t flags = 0;
-  vfs_node_t *node = fd_pin_node(t, (uint64_t)fd, &offset, &flags);
+  struct fd_ref ref = fd_get_node(t, (uint64_t)fd, &offset, &flags);
+  vfs_node_t *node = ref.node;
   if (!node) {
     static uint32_t missing_write_fd_logs;
     if (__atomic_add_fetch(&missing_write_fd_logs, 1, __ATOMIC_RELAXED) <= 8)
@@ -1224,9 +1312,11 @@ static int64_t fd_write(int fd, const void *buf, size_t count) {
   bool append = (flags & O_APPEND) &&
                 (node->flags & FS_TYPE_MASK) == FS_FILE;
   uint32_t end_offset = 0;
+  t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
   int32_t bytes_written = append
       ? (int32_t)vfs_append(node, count, (uint8_t *)buf, &end_offset)
       : (int32_t)vfs_write(node, (uint32_t)offset, count, (uint8_t *)buf);
+  t->current_io_flags = 0;
   if (bytes_written == -9) {
     static uint32_t bad_write_node_logs;
     if (__atomic_add_fetch(&bad_write_node_logs, 1, __ATOMIC_RELAXED) <= 8)
@@ -1243,7 +1333,7 @@ static int64_t fd_write(int fd, const void *buf, size_t count) {
     else
       fd_advance_offset(t, (uint64_t)fd, node, (uint32_t)bytes_written);
   }
-  vfs_close(node);
+  fd_put_node(ref);
 
   /* A non-empty write MUST NEVER return 0.
    * Standard C runtimes (glibc, musl, Qt, etc.) treat a 0-byte return as a
@@ -1271,14 +1361,18 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count, uint64_t a3,
     return (uint64_t)-9;
 
   uint64_t offset = 0;
-  vfs_node_t *node = fd_pin_node(t, fd, &offset, NULL);
+  uint64_t flags = 0;
+  struct fd_ref ref = fd_get_node(t, fd, &offset, &flags);
+  vfs_node_t *node = ref.node;
   if (!node)
     return (uint64_t)-9;
+  t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
   int32_t bytes_read =
       (int32_t)vfs_read(node, (uint32_t)offset, count, (uint8_t *)buf);
+  t->current_io_flags = 0;
   if (bytes_read > 0)
     fd_advance_offset(t, fd, node, (uint32_t)bytes_read);
-  vfs_close(node);
+  fd_put_node(ref);
 
   return (uint64_t)(int64_t)bytes_read;
 }
@@ -1319,12 +1413,16 @@ static uint64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count,
   if (!t || fd >= MAX_FDS)
     return (uint64_t)-9;
 
-  vfs_node_t *node = fd_pin_node(t, fd, NULL, NULL);
+  uint64_t flags = 0;
+  struct fd_ref ref = fd_get_node(t, fd, NULL, &flags);
+  vfs_node_t *node = ref.node;
   if (!node)
     return (uint64_t)-9;
+  t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
   int32_t bytes_read =
       (int32_t)vfs_read(node, (uint32_t)offset, count, (uint8_t *)buf);
-  vfs_close(node);
+  t->current_io_flags = 0;
+  fd_put_node(ref);
   return (uint64_t)(int64_t)bytes_read;
 }
 
@@ -1339,16 +1437,19 @@ static uint64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
     return (uint64_t)-9;
 
   uint64_t flags = 0;
-  vfs_node_t *node = fd_pin_node(t, fd, NULL, &flags);
+  struct fd_ref ref = fd_get_node(t, fd, NULL, &flags);
+  vfs_node_t *node = ref.node;
   if (!node)
     return (uint64_t)-9;
   /* Linux also honors O_APPEND for pwrite, without changing f_pos. */
   uint32_t end_offset;
+  t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
   int32_t bytes_written = (flags & O_APPEND) &&
                           (node->flags & FS_TYPE_MASK) == FS_FILE
       ? (int32_t)vfs_append(node, count, (uint8_t *)buf, &end_offset)
       : (int32_t)vfs_write(node, (uint32_t)offset, count, (uint8_t *)buf);
-  vfs_close(node);
+  t->current_io_flags = 0;
+  fd_put_node(ref);
   return (uint64_t)(int64_t)bytes_written;
 }
 
@@ -1378,11 +1479,14 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     return (uint64_t)-9;
   }
   uint64_t offset = 0;
-  vfs_node_t *node = fd_pin_node(ct, fd, &offset, NULL);
+  uint64_t flags = 0;
+  struct fd_ref ref = fd_get_node(ct, fd, &offset, &flags);
+  vfs_node_t *node = ref.node;
   if (!node) {
     fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
   }
+  ct->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
 
   if (fuse_is_device(node)) {
     uint64_t capacity = 0;
@@ -1414,7 +1518,8 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
         }
       }
     }
-    kfree(packet); vfs_close(node); fd_release_iov(iov, stack_iov);
+    ct->current_io_flags = 0;
+    kfree(packet); fd_put_node(ref); fd_release_iov(iov, stack_iov);
     return (uint64_t)result;
   }
 
@@ -1426,7 +1531,8 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     if (len == 0)
       continue;
     if (!is_user_range((const void *)base, len)) {
-      vfs_close(node);
+      ct->current_io_flags = 0;
+      fd_put_node(ref);
       fd_release_iov(iov, stack_iov);
       return (uint64_t)-14;
     }
@@ -1436,7 +1542,8 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     if (bytes_read < 0) {
       if (total > 0)
         break;
-      vfs_close(node);
+      ct->current_io_flags = 0;
+      fd_put_node(ref);
       fd_release_iov(iov, stack_iov);
       return (uint64_t)(int64_t)bytes_read;
     }
@@ -1446,7 +1553,8 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
   }
   if (total > 0)
     fd_advance_offset(ct, fd, node, total);
-  vfs_close(node);
+  ct->current_io_flags = 0;
+  fd_put_node(ref);
   fd_release_iov(iov, stack_iov);
   return total;
 }
@@ -1659,11 +1767,13 @@ static uint64_t sys_preadv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
   }
-  vfs_node_t *node = fd_pin_node(ct, fd, NULL, NULL);
+  uint64_t flags = 0;
+  vfs_node_t *node = fd_pin_node(ct, fd, NULL, &flags);
   if (!node) {
     fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
   }
+  ct->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
 
   size_t total = 0;
 
@@ -1673,6 +1783,7 @@ static uint64_t sys_preadv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     if (len == 0)
       continue;
     if (!is_user_range((const void *)base, len)) {
+      ct->current_io_flags = 0;
       vfs_close(node);
       fd_release_iov(iov, stack_iov);
       return (uint64_t)-14;
@@ -1683,6 +1794,7 @@ static uint64_t sys_preadv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     if (bytes_read < 0) {
       if (total > 0)
         break;
+      ct->current_io_flags = 0;
       vfs_close(node);
       fd_release_iov(iov, stack_iov);
       return (uint64_t)(int64_t)bytes_read;
@@ -1691,6 +1803,7 @@ static uint64_t sys_preadv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     if ((uint32_t)bytes_read < len)
       break;
   }
+  ct->current_io_flags = 0;
   vfs_close(node);
   fd_release_iov(iov, stack_iov);
   return total;
@@ -1726,6 +1839,7 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     fd_release_iov(iov, stack_iov);
     return (uint64_t)-9;
   }
+  ct->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
 
   size_t total = 0;
 
@@ -1735,6 +1849,7 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     if (len == 0)
       continue;
     if (!is_user_range((const void *)base, len)) {
+      ct->current_io_flags = 0;
       vfs_close(node);
       fd_release_iov(iov, stack_iov);
       return (uint64_t)-14;
@@ -1748,6 +1863,7 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     if (bytes_written < 0) {
       if (total > 0)
         break;
+      ct->current_io_flags = 0;
       vfs_close(node);
       fd_release_iov(iov, stack_iov);
       return (uint64_t)(int64_t)bytes_written;
@@ -1756,6 +1872,7 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     if ((uint32_t)bytes_written < len)
       break;
   }
+  ct->current_io_flags = 0;
   vfs_close(node);
   fd_release_iov(iov, stack_iov);
   return total;
@@ -2003,6 +2120,32 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
   struct thread *t = sched_get_current();
   if (!t || !t->files)
     return (uint64_t)-9;
+
+  /* Fast-path: single-threaded file table (ref_count == 1). */
+  if (t->files->ref_count == 1) {
+    if (!FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->files->fds[fd]))
+      return (uint64_t)-9;
+    vfs_node_t *node = t->files->fds[fd];
+    /* dd must read/discard skip bytes when its input is a pipe. */
+    uint32_t type = node->flags & FS_TYPE_MASK;
+    if (type == FS_PIPE || type == FS_SOCKET)
+      return (uint64_t)-29; /* ESPIPE */
+    uint64_t base = 0;
+    if (whence == 1)
+      base = fd_offset_get_locked(t, fd);
+    else if (whence == 2)
+      base = node->length;
+    else if (whence != 0)
+      return (uint64_t)-22;
+    /* Unsigned addition avoids signed overflow for hostile offsets. */
+    uint64_t position = base + offset;
+    if ((int64_t)position < 0 ||
+        ((int64_t)offset >= 0 && position < base))
+      return (uint64_t)-22;
+    fd_offset_set_locked(t, fd, position);
+    return (uint64_t)(int64_t)position;
+  }
+
   spinlock_acquire(&t->files->lock);
   int64_t result = -9;
   if (!FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->files->fds[fd]))
@@ -2341,24 +2484,25 @@ static uint64_t sys_readahead(uint64_t fd, uint64_t offset, uint64_t count,
 
   struct thread *t = sched_get_current();
   uint64_t fd_flags = 0;
-  vfs_node_t *node = fd_pin_node(t, fd, NULL, &fd_flags);
+  struct fd_ref ref = fd_get_node(t, fd, NULL, &fd_flags);
+  vfs_node_t *node = ref.node;
   if (!node)
     return (uint64_t)-9; // EBADF
 
   if ((fd_flags & O_PATH) || (fd_flags & O_ACCMODE) == O_WRONLY) {
-    vfs_close(node);
+    fd_put_node(ref);
     return (uint64_t)-9; // EBADF: descriptor is not open for reading
   }
   if ((int64_t)offset < 0) {
-    vfs_close(node);
+    fd_put_node(ref);
     return (uint64_t)-22; // EINVAL
   }
   if ((node->flags & FS_TYPE_MASK) != FS_FILE) {
-    vfs_close(node);
+    fd_put_node(ref);
     return (uint64_t)-29; // ESPIPE: no seekable file to prefetch
   }
   if (!node->read) {
-    vfs_close(node);
+    fd_put_node(ref);
     return (uint64_t)-22; // EINVAL: file does not support reads
   }
 
@@ -2371,7 +2515,7 @@ static uint64_t sys_readahead(uint64_t fd, uint64_t offset, uint64_t count,
     (void)vfs_cache_readahead(node, byte_offset, bytes);
   }
 
-  vfs_close(node);
+  fd_put_node(ref);
   return 0;
 }
 

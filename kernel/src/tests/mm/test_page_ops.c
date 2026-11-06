@@ -10,6 +10,16 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+static void print_speedup(uint64_t base, uint64_t opt) {
+  if (!opt) return;
+  uint64_t scaled = (base * 10 + opt / 2) / opt;
+  klog_puts(" (");
+  klog_uint64(scaled / 10);
+  klog_puts(".");
+  klog_uint64(scaled % 10);
+  klog_puts("X)");
+}
+
 void test_page_ops(void) {
   klog_puts("[TEST] Running Hardware-Accelerated Page Operations Test Suite...\n");
 
@@ -217,23 +227,34 @@ void test_page_ops(void) {
 
   klog_puts("  [BENCH] page_zero_nt: ");
   klog_uint64(zero_nt_cycles);
-  klog_puts(" cycles | erms: ");
+  klog_puts(" cycles");
+  print_speedup(memset_cycles, zero_nt_cycles);
+  klog_puts(" | erms: ");
   klog_uint64(zero_erms_cycles);
-  klog_puts(" cycles | memset: ");
+  klog_puts(" cycles");
+  print_speedup(memset_cycles, zero_erms_cycles);
+  klog_puts(" | memset: ");
   klog_uint64(memset_cycles);
+  klog_puts(" cycles (baseline)");
   if (cpu_has_avx2()) {
-    klog_puts(" cycles | avx2: ");
+    klog_puts(" | avx2: ");
     klog_uint64(zero_avx2_cycles);
+    klog_puts(" cycles");
+    print_speedup(memset_cycles, zero_avx2_cycles);
   }
-  klog_puts(" cycles\n");
+  klog_puts("\n");
 
   klog_puts("  [BENCH] page_copy_nt: ");
   klog_uint64(copy_nt_cycles);
-  klog_puts(" cycles | erms: ");
+  klog_puts(" cycles");
+  print_speedup(memcpy_cycles, copy_nt_cycles);
+  klog_puts(" | erms: ");
   klog_uint64(copy_erms_cycles);
-  klog_puts(" cycles | memcpy: ");
+  klog_puts(" cycles");
+  print_speedup(memcpy_cycles, copy_erms_cycles);
+  klog_puts(" | memcpy: ");
   klog_uint64(memcpy_cycles);
-  klog_puts(" cycles\n");
+  klog_puts(" cycles (baseline)\n");
 
   pmm_free_page(p1_phys);
   pmm_free_page(p2_phys);

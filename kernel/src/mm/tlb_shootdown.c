@@ -1340,8 +1340,18 @@ void tlb_shootdown_all(void) {
 #define TLB_BENCH_ITERS 4000
 #define TLB_BENCH_PASSES 3
 
-static void tlb_bench_case(const char *name, uint64_t addr, uint64_t pml4,
-                           uint32_t iters) {
+static void print_speedup(uint64_t base, uint64_t opt) {
+    if (!opt) return;
+    uint64_t scaled = (base * 10 + opt / 2) / opt;
+    klog_puts(" (");
+    klog_uint64(scaled / 10);
+    klog_puts(".");
+    klog_uint64(scaled % 10);
+    klog_puts("X)");
+}
+
+static uint64_t tlb_bench_case(const char *name, uint64_t addr, uint64_t pml4,
+                               uint32_t iters) {
     uint64_t best = 0;
     tlb_shootdown_reset_stats();
 
@@ -1359,10 +1369,11 @@ static void tlb_bench_case(const char *name, uint64_t addr, uint64_t pml4,
 
     uint64_t total = (uint64_t)iters * TLB_BENCH_PASSES;
     uint64_t ns = tsc_cycles_to_ns(best);
+    uint64_t cycles_per_op = best / iters;
     klog_puts("[TLB-BENCH] ");
     klog_puts(name);
     klog_puts(": ");
-    klog_uint64(best / iters);
+    klog_uint64(cycles_per_op);
     klog_puts(" cycles/op");
     if (ns) {
         klog_puts(", ");
@@ -1374,6 +1385,7 @@ static void tlb_bench_case(const char *name, uint64_t addr, uint64_t pml4,
     klog_puts(", remote-acks/op x100=");
     klog_uint64(st.shootdowns * 100 / total);
     klog_puts("\n");
+    return cycles_per_op;
 }
 
 void tlb_bench_maybe_run(void) {
@@ -1400,7 +1412,7 @@ void tlb_bench_maybe_run(void) {
         return;
     }
 
-    klog_puts("\n[TLB-BENCH] single-page shootdown, ");
+    klog_puts("\n[TLB-BENCH] shootdown benchmark, ");
     klog_uint64(cpu_get_count());
     klog_puts(" CPUs, best of ");
     klog_uint64(TLB_BENCH_PASSES);
@@ -1408,12 +1420,16 @@ void tlb_bench_maybe_run(void) {
     klog_uint64(TLB_BENCH_ITERS);
     klog_puts(" iterations\n");
 
-    tlb_bench_case("foreign-mm", user_va, (uint64_t)scratch, TLB_BENCH_ITERS);
-
     uint64_t active;
     __asm__ volatile("mov %%cr3, %0" : "=r"(active));
-    tlb_bench_case("active-mm ", user_va, active & CR3_ADDR_MASK,
-                   TLB_BENCH_ITERS);
+    uint64_t baseline_cycles = tlb_bench_case("active-mm (baseline) ", user_va, active & CR3_ADDR_MASK,
+                                               TLB_BENCH_ITERS);
+
+    uint64_t foreign_cycles = tlb_bench_case("foreign-mm (filtered)", user_va, (uint64_t)scratch, TLB_BENCH_ITERS);
+
+    klog_puts("[TLB-BENCH] Speedup vs broadcast: ");
+    print_speedup(baseline_cycles, foreign_cycles);
+    klog_puts(" FASTER\n");
 
     vmm_free_user_pages((uint64_t)scratch);
     klog_puts("[TLB-BENCH] done\n");

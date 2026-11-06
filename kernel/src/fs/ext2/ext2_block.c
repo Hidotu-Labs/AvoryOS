@@ -244,12 +244,61 @@ int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
       entries[i].block_num >
           (UINT64_MAX - (sectors_per_block - 1)) / sectors_per_block)
       return -1;
-    ext2_cache_prepare(mnt, (uint32_t)(entries[i].block_num % EXT2_CACHE_SIZE));
     reqs[i].lba = entries[i].block_num * sectors_per_block;
     reqs[i].count = sectors_per_block;
     reqs[i].buf = (void *)entries[i].buffer;
     reqs[i].result = -1;
   }
+
+  /* Batch members are independent full-block writes. Sort an index, not
+   * the caller's entries, and merge adjacent disk blocks even in a mixed
+   * batch (including the superblock at block zero). No journal phase is
+   * reordered: this only groups writes already submitted as one batch. */
+  uint8_t order[EXT2_BLOCK_BATCH_MAX];
+  for (uint32_t i = 0; i < count; i++) {
+    order[i] = (uint8_t)i;
+    uint32_t j = i;
+    while (j && entries[order[j - 1]].block_num >
+                    entries[order[j]].block_num) {
+      uint8_t temp = order[j];
+      order[j] = order[j - 1];
+      order[j - 1] = temp;
+      j--;
+    }
+  }
+  bool mergeable = false;
+  for (uint32_t i = 1; i < count; i++)
+    if (entries[order[i]].block_num == entries[order[i - 1]].block_num + 1)
+      mergeable = true;
+  uint8_t *gathered = mergeable && mnt->block_size <= (128u * 1024u) / count
+                          ? kmalloc((size_t)count * mnt->block_size) : NULL;
+  uint8_t first_member[EXT2_BLOCK_BATCH_MAX], members[EXT2_BLOCK_BATCH_MAX];
+  uint32_t request_count = count;
+  if (gathered) {
+    request_count = 0;
+    for (uint32_t i = 0; i < count;) {
+      uint32_t end = i + 1;
+      while (end < count && entries[order[end]].block_num ==
+                               entries[order[end - 1]].block_num + 1)
+        end++;
+      first_member[request_count] = (uint8_t)i;
+      members[request_count] = (uint8_t)(end - i);
+      struct block_io_req *req = &reqs[request_count++];
+      req->lba = entries[order[i]].block_num * sectors_per_block;
+      req->count = (end - i) * sectors_per_block;
+      req->buf = (void *)entries[order[i]].buffer;
+      req->result = -1;
+      if (end - i > 1) {
+        for (uint32_t j = i; j < end; j++)
+          memcpy(gathered + (size_t)j * mnt->block_size,
+                 entries[order[j]].buffer, mnt->block_size);
+        req->buf = gathered + (size_t)i * mnt->block_size;
+      }
+      i = end;
+    }
+  }
+  for (uint32_t i = 0; i < count; i++)
+    ext2_cache_prepare(mnt, (uint32_t)(entries[i].block_num % EXT2_CACHE_SIZE));
 
   spinlock_acquire(&mnt->cache_lock);
   for (uint32_t i = 0; i < count; i++) {
@@ -263,13 +312,21 @@ int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
   }
   spinlock_release(&mnt->cache_lock);
 
-  block_write_batch(mnt->dev, reqs, count);
+  block_write_batch(mnt->dev, reqs, request_count);
+  if (gathered) {
+    for (uint32_t i = 0; i < request_count; i++)
+      for (uint32_t j = first_member[i]; j < first_member[i] + members[i]; j++)
+        entries[order[j]].result = reqs[i].result ? -1 : 0;
+  } else {
+    for (uint32_t i = 0; i < count; i++)
+      entries[i].result = reqs[i].result ? -1 : 0;
+  }
+  kfree(gathered);
 
   spinlock_acquire(&mnt->cache_lock);
   for (uint32_t i = 0; i < count; i++) {
     uint32_t idx = (uint32_t)(entries[i].block_num % EXT2_CACHE_SIZE);
-    bool failed = reqs[i].result != 0;
-    entries[i].result = failed ? -1 : 0;
+    bool failed = entries[i].result != 0;
     mnt->cache[idx].write_seq++;
     mnt->cache[idx].writes_inflight--;
     if (failed && mnt->cache[idx].num == entries[i].block_num)

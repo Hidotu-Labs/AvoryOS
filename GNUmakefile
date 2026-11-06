@@ -150,6 +150,16 @@ $(VIRGL_HOST_LIB): scripts/virgl/compat-context.patch scripts/virgl/draw-state-o
 	python3 scripts/build-virgl-host.py
 .PHONY: virgl-host
 virgl-host: $(VIRGL_HOST_LIB)
+# Query result polling needs main-thread event notification even with async
+# fences. Keep an explicit opt-out for the installed host QEMU.
+RUN_VIRGL_EVENT_POLL ?= 1
+QEMU_HOST_BIN := build/qemu-host/bin/qemu-system-x86_64
+RUN_QEMU_LOCAL = $(if $(filter x86_64,$(ARCH)),$(if $(RUN_VIRGL_FIXED),$(filter 1,$(RUN_VIRGL_EVENT_POLL))))
+RUN_QEMU = $(if $(RUN_QEMU_LOCAL),$(abspath $(QEMU_HOST_BIN)),qemu-system-$(ARCH))
+$(QEMU_HOST_BIN): scripts/build-qemu-host.py scripts/qemu/virgl-query-event-poll.patch
+	python3 scripts/build-qemu-host.py
+.PHONY: qemu-host
+qemu-host: $(QEMU_HOST_BIN)
 RUN_GPU = $(if $(filter 1,$(RUN_VIRGL)),virtio-vga-gl,virtio-vga)
 RUN_GL = $(if $(filter 1,$(RUN_VIRGL)),on,off)
 # GTK's Wayland GL widget can lose relative input after its pointer grab.
@@ -161,9 +171,9 @@ RUN_SERIAL_LOG ?= build/logs/desktop-serial.log
 .PHONY: run run-tcg
 run: DISPLAY_OPT = -display $(RUN_DISPLAY),gl=$(RUN_GL),show-cursor=$(GTK_SHOW_CURSOR)$(if $(filter gtk,$(RUN_DISPLAY)),$(NET_COMMA)zoom-to-fit=off$(NET_COMMA)grab-on-hover=on)
 run: QEMUFLAGS = $(QEMU_MEM) -vga none -device $(RUN_GPU),xres=1280,yres=800
-run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL_HOST_LIB))
+run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL_HOST_LIB)) $(if $(RUN_QEMU_LOCAL),$(QEMU_HOST_BIN))
 	@mkdir -p "$(dir $(RUN_SERIAL_LOG))"
-	$(RUN_VIRGL_ENV) qemu-system-$(ARCH) \
+	$(RUN_VIRGL_ENV) $(RUN_QEMU) \
 		-M q35,pcspk-audiodev=snd0 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
@@ -290,7 +300,7 @@ run-amd-gpu: GTK_SHOW_CURSOR = off
 # guest shutdown before closing passthrough PRIME sessions.
 GTK_WINDOW_CLOSE ?= on
 run-amd-gpu: DISPLAY_OPT = -display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=$(GTK_SHOW_CURSOR),window-close=$(GTK_WINDOW_CLOSE)
-run-amd-gpu: VFIO_LAUNCHER = python3 scripts/qemu-prime-log.py --
+run-amd-gpu: VFIO_LAUNCHER =
 run-amd-gpu: RUN_NIC_ADDR = 08.0
 run-amd-gpu: VFIO_EXTRA = -device edu -chardev socket,id=prime-diag,path=build/logs/p6-amd-gpu-serial.sock,server=on,wait=off,logfile=build/logs/p6-amd-gpu.log,logappend=on $(RUN_NET_FLAGS)
 run-amd-gpu: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
@@ -412,10 +422,6 @@ run-ata: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 		$(QEMUFLAGS)
 
 # FAT32 test image for testing the FAT32 driver
-nvme_test.img: scripts/nvme/create-nvme-test.sh userland/nvme_init.elf \
-		userland/shutdown.elf userland/nvme_test.elf userland/nvme_bench.elf
-	./scripts/nvme/create-nvme-test.sh
-
 fat32_test.img:
 	./scripts/create-fat32-test.sh
 
@@ -437,7 +443,15 @@ run-fat32: edk2-ovmf $(IMAGE_NAME).iso fat32_test.img
 		-device usb-tablet,bus=xhci.0 \
 		$(QEMUFLAGS)
 
+BENCH_COMPAT_APP := $(if $(or $(wildcard userland/bench_compat.exe),$(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)),userland/bench_compat.exe)
 USERLAND_DISK_APPS := \
+	userland/avory_bench.elf \
+	userland/bench_desktop.elf \
+	$(BENCH_COMPAT_APP) \
+	userland/bench_cpu.elf \
+	userland/bench_iterations.elf \
+	userland/bench_fork.elf \
+	userland/bench_vfs.elf \
 	userland/asplay.elf \
 	userland/avory-installer.elf \
 	userland/avory-login.elf \
@@ -805,6 +819,22 @@ disk.img: disk-full-force
 		echo "rm bin/test_readahead"; \
 		echo "write userland/test_readahead.elf bin/test_readahead"; \
 		echo "rm bin/proc_bench"; \
+		echo "rm bin/avory_bench"; \
+		echo "write userland/avory_bench.elf bin/avory_bench"; \
+		echo "rm bin/bench_desktop"; \
+		echo "write userland/bench_desktop.elf bin/bench_desktop"; \
+		if [ -f userland/bench_compat.exe ]; then \
+			echo "rm bin/bench_compat.exe"; \
+			echo "write userland/bench_compat.exe bin/bench_compat.exe"; \
+		fi; \
+		echo "rm bin/bench_cpu"; \
+		echo "write userland/bench_cpu.elf bin/bench_cpu"; \
+		echo "rm bin/bench_iterations"; \
+		echo "write userland/bench_iterations.elf bin/bench_iterations"; \
+		echo "rm bin/bench_fork"; \
+		echo "write userland/bench_fork.elf bin/bench_fork"; \
+		echo "rm bin/bench_vfs"; \
+		echo "write userland/bench_vfs.elf bin/bench_vfs"; \
 		echo "rm bin/radeonsi_vram_leak.elf"; \
 		echo "write userland/radeonsi_vram_leak.elf bin/radeonsi_vram_leak.elf"; \
 		echo "write userland/proc_bench.elf bin/proc_bench"; \
@@ -979,6 +1009,13 @@ disk.img: disk-full-force
 	fi
 	@echo "Fixing executable modes for directly injected launchers..."
 	@{ \
+		echo "set_inode_field bin/avory_bench mode 0100755"; \
+		echo "set_inode_field bin/bench_desktop mode 0100755"; \
+		if [ -f userland/bench_compat.exe ]; then echo "set_inode_field bin/bench_compat.exe mode 0100755"; fi; \
+		echo "set_inode_field bin/bench_cpu mode 0100755"; \
+		echo "set_inode_field bin/bench_iterations mode 0100755"; \
+		echo "set_inode_field bin/bench_fork mode 0100755"; \
+		echo "set_inode_field bin/bench_vfs mode 0100755"; \
 		echo "set_inode_field bin/avory-login mode 0100755"; \
 		echo "set_inode_field bin/avory-installer mode 0100755"; \
 		echo "set_inode_field usr/sbin/avory-installer mode 0100755"; \
@@ -1166,20 +1203,24 @@ gpu-diagnostics:
 test-phase6-login:
 	./scripts/test-phase6-login.sh
 
-.PHONY: test-e1000
-test-e1000:
-	$(MAKE) -C kernel -j4
-	python3 scripts/tests/test_net_device_start.py
-	python3 scripts/tests/test_pci_irq_fallback.py
-	python3 scripts/tests/test_e1000_probe.py
-	python3 scripts/tests/test_e1000_probe_boot.py --seconds 0 --smp 4
-	AVORY_NETWORK_TEST_NIC=e1000 python3 scripts/tests/test_network_statistics_boot.py
-	AVORY_NETWORK_TEST_NIC=e1000e python3 scripts/tests/test_network_statistics_boot.py
+.PHONY: test-benchmarks
+test-benchmarks:
+	python3 scripts/tests/test_benchmarks_boot.py
 
 # Root image recipes depend on these paths; delegate each app build to its local
 # userland makefile so callers can keep using `make userland/foo.elf`.
 userland/%.elf: userland/GNUmakefile config/userland-link.ld $(GLIBC_STAMP) $(GLIBC_TOOLCHAIN_STAMP)
 	$(MAKE) -C userland -f GNUmakefile $*.elf
+
+# Keep image builds sensitive to benchmark source edits as well as makefiles.
+userland/avory_bench.elf: userland/avory_bench.c
+userland/bench_desktop.elf: userland/benchmarks/desktop.c userland/benchmarks/desktop_storage.c userland/benchmarks/desktop_apps.c userland/benchmarks/desktop_graphics.c userland/benchmarks/desktop.h
+userland/bench_compat.exe: userland/benchmarks/compat_workload.c
+	$(MAKE) -C userland bench_compat.exe
+userland/bench_cpu.elf: userland/benchmarks/unixbench/dhry_1.c userland/benchmarks/unixbench/dhry_2.c userland/benchmarks/unixbench/dhry.h userland/benchmarks/unixbench/timeit.c userland/benchmarks/metrics.c
+userland/bench_iterations.elf: userland/benchmarks/unixbench/hanoi.c userland/benchmarks/unixbench/timeit.c userland/benchmarks/metrics.c
+userland/bench_fork.elf: userland/benchmarks/unixbench/spawn.c userland/benchmarks/unixbench/timeit.c userland/benchmarks/metrics.c
+userland/bench_vfs.elf: userland/benchmarks/unixbench/fstime.c userland/benchmarks/metrics.c
 
 userland/test_kpi_radeonsi.elf userland/radeonsi_vram_leak.elf \
 userland/test_gpu_constants.elf userland/test_gpu_pipeline.elf \

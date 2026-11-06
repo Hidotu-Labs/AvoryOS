@@ -653,6 +653,11 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
   ptrace_exec_event(regs);
 
+  if (ct) {
+    ct->restore_callee_regs = 1;
+    thread_update_fastpath_state(ct);
+  }
+
   return 0;
 }
 

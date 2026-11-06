@@ -28,6 +28,7 @@ static uint32_t feat_max_leaf;
 static uint32_t feat_1_ecx;
 static uint32_t feat_7_0_ebx;
 static uint32_t feat_7_0_ecx;
+static uint32_t feat_d_1_eax;
 static uint32_t feat_ext_max_leaf;
 static uint32_t feat_80000001_edx;
 static uint64_t feat_xstate_mask;
@@ -42,6 +43,7 @@ static void features_probe(void) {
     uint32_t xstate_lo = 0, xstate_hi = 0;
     cpuid(0xD, 0, &xstate_lo, NULL, NULL, &xstate_hi);
     feat_xstate_mask = ((uint64_t)xstate_hi << 32) | xstate_lo;
+    cpuid(0xD, 1, &feat_d_1_eax, NULL, NULL, NULL);
   }
   cpuid(0x80000000U, 0, &feat_ext_max_leaf, NULL, NULL, NULL);
   if (feat_ext_max_leaf >= 0x80000001U)
@@ -105,6 +107,13 @@ bool cpu_has_xsave(void) {
   return (feat_1_ecx & (1U << 26)) != 0; // CPUID.01H:ECX.XSAVE[bit 26]
 }
 
+bool cpu_has_xsaveopt(void) {
+  features_ensure_probed();
+  if (feat_max_leaf < 0xD)
+    return false;
+  return (feat_d_1_eax & (1U << 0)) != 0; // CPUID.0DH:EAX.XSAVEOPT[bit 0]
+}
+
 bool cpu_has_avx(void);
 bool cpu_has_avx(void) {
   features_ensure_probed();
@@ -155,9 +164,11 @@ static void cpu_pat_init(void) {
 }
 
 bool cpu_has_xsave_flag = false;
+bool cpu_has_xsaveopt_flag = false;
 /* x87 + SSE are the architectural baseline once OSXSAVE is enabled. */
 uint64_t cpu_xsave_mask = 3ULL;
 bool cpu_has_smap_flag = false;
+bool cpu_has_fsgsbase_flag = false;
 
 // Enable SSE/SSE2, PCID, FSGSBASE, AVX/XSAVE, SMEP and SMAP for long mode.
 void cpu_features_init(void) {
@@ -179,6 +190,7 @@ void cpu_features_init(void) {
 
   // Enable FSGSBASE (wrfsbase / rdfsbase) if supported by the CPU
   if (cpu_has_fsgsbase()) {
+    cpu_has_fsgsbase_flag = true;
     cr4 |= (1ULL << 16); // CR4.FSGSBASE (bit 16)
   }
 
@@ -191,6 +203,9 @@ void cpu_features_init(void) {
   if (cpu_has_xsave()) {
     cr4 |= (1ULL << 18); // CR4.OSXSAVE (bit 18)
     cpu_has_xsave_flag = true;
+    if (cpu_has_xsaveopt()) {
+      cpu_has_xsaveopt_flag = true;
+    }
   }
 
   // Enable SMEP: supervisor mode may not execute user-mapped pages.

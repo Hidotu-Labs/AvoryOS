@@ -2,6 +2,7 @@
 #include "sched.h"
 #include "sched_internal.h"
 #include "pid_namespace.h"
+#include "user_namespace.h"
 #include "../include/arch/uaccess.h"
 /* A new boot task starts privileged. Children always receive an explicit
  * credential snapshot, so dropping all capabilities never falls back to UID. */
@@ -15,10 +16,50 @@ static void ensure(struct thread *t) {
   __atomic_store_n(&t->caps_initialized, true, __ATOMIC_RELEASE);
   spinlock_release(&t->namespace_lock);
 }
+static bool ns_private(const struct thread *t, unsigned kind) {
+  return t->user_ns && t->ns_owner[kind] == t->user_ns;
+}
+
+/* Capabilities a thread inside a non-initial user namespace may use through
+ * capability_has(). Credentials are not mapped to outside ids, so DAC,
+ * setuid/setgid and host-wide admin capabilities are withheld: they would
+ * apply to host files and processes. CAP_SYS_ADMIN covers mounts, pivot_root
+ * and hostname changes, so it is granted only once the thread owns its mount,
+ * UTS, IPC and net namespaces. */
+static uint64_t ns_allowed_caps(const struct thread *t) {
+  uint64_t allowed = (1ULL << CAP_SYS_CHROOT) | (1ULL << CAP_SETPCAP);
+  if (ns_private(t, NS_OWN_MNT) && ns_private(t, NS_OWN_UTS) &&
+      ns_private(t, NS_OWN_IPC) && ns_private(t, NS_OWN_NET))
+    allowed |= 1ULL << CAP_SYS_ADMIN;
+  if (ns_private(t, NS_OWN_NET)) allowed |= 1ULL << CAP_NET_ADMIN;
+  return allowed;
+}
+
 bool capability_has(struct thread *t, unsigned cap) {
   if (!t) return true; /* Kernel callers. */
   ensure(t);
+  if (cap > CAP_LAST_CAP || !(t->cap_effective & (1ULL << cap))) return false;
+  return !t->user_ns || (ns_allowed_caps(t) & (1ULL << cap));
+}
+
+/* Effective check for creating namespaces owned by the caller's own user
+ * namespace: the restrictions above do not apply, because the new objects are
+ * private to that namespace. */
+bool capability_ns_has(struct thread *t, unsigned cap) {
+  if (!t) return true;
+  ensure(t);
   return cap <= CAP_LAST_CAP && (t->cap_effective & (1ULL << cap));
+}
+
+/* After unshare(CLONE_NEWUSER) or clone(CLONE_NEWUSER), the thread holds the
+ * full set in its new namespace, as Linux grants. capability_has() still
+ * limits what those capabilities can reach. */
+void capability_enter_user_ns(struct thread *t) {
+  ensure(t);
+  t->cap_effective = t->cap_permitted = CAP_VALID_MASK;
+  t->cap_bounding = CAP_VALID_MASK;
+  t->cap_inheritable = t->cap_ambient = 0;
+  t->securebits = 0;
 }
 void capability_inherit(struct thread *child, struct thread *parent) {
   ensure(parent);
@@ -29,7 +70,7 @@ void capability_inherit(struct thread *child, struct thread *parent) {
   child->cap_ambient = parent->cap_ambient;
   child->securebits = parent->securebits;
   child->caps_initialized = true;
-
+  user_namespace_inherit(child, parent);
 }
 void capability_uid_changed(struct thread *t, uint32_t uid, uint32_t euid, uint32_t suid) {
   ensure(t);

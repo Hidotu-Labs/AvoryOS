@@ -6,6 +6,7 @@
 #include "../lib/rbtree.h"
 #include "../mm/vma.h"
 #include "../mm/mempolicy.h"
+#include "../smp/cpu.h"
 #include "eevfd.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -194,6 +195,25 @@ struct thread {
    * the incoming stack. Placed at offset 16 so switch.asm can clear it
    * atomically after switching off the outgoing stack. */
   volatile bool on_cpu;
+  /* Fastpath identity cache and flags placed in the 47-byte padding before fpu_state.
+   * Offset 20: fastpath_disabled (1 if ptrace, seccomp, rseq, signals, or namespaces)
+   * Offset 24: cached pid
+   * Offset 28: cached tid
+   * Offset 32: cached uid
+   * Offset 36: cached gid
+   * Offset 40: cached euid
+   * Offset 44: cached egid
+   * Offset 48: restore_callee_regs (1 if execve, ptrace or signal handler modified rbx..r15)
+   */
+  uint8_t _pad_align[3];
+  uint32_t fastpath_disabled;
+  uint32_t identity_cached_pid;
+  uint32_t identity_cached_tid;
+  uint32_t identity_cached_uid;
+  uint32_t identity_cached_gid;
+  uint32_t identity_cached_euid;
+  uint32_t identity_cached_egid;
+  uint32_t restore_callee_regs;
   uint8_t fpu_state[4096] __attribute__((aligned(64))); // Saved XSAVE/FPU state (at offset 64)
   uint64_t stack_base;
   uint64_t stack_size;
@@ -276,6 +296,11 @@ struct thread {
   uint64_t cap_effective, cap_permitted, cap_inheritable;
   uint64_t cap_bounding, cap_ambient;
   uint32_t securebits;
+  struct user_namespace *user_ns; /* NULL: the initial user namespace. */
+  /* User namespace that created this thread's mount, UTS, IPC and net
+   * namespaces (indexed by enum user_ns_owned_kind). Compared, never
+   * dereferenced. */
+  struct user_namespace *ns_owner[4];
   struct net_namespace *net_ns;
   bool seccomp_compat_dispatch;
   bool seccomp_sigsys;
@@ -377,6 +402,10 @@ struct thread {
       runtime_total; // Total CPU time consumed (in LAPIC ticks, 1 tick = 1ms)
   uint64_t runtime_user_ms;
   uint64_t runtime_system_ms;
+  /* CPU time of reaped members, transferred to a remaining group member
+   * under tid_lock. Process CPU clocks must not go backwards after join. */
+  uint64_t reaped_user_ms;
+  uint64_t reaped_system_ms;
   uint64_t start_time_ms;
   bool in_syscall;
   uint64_t runtime_burst; // CPU time used in current quantum (for MLFQ)
@@ -508,10 +537,34 @@ struct thread {
   int32_t ptrace_resume_signal;
   struct registers *ptrace_live_regs;
   struct syscall_regs *ptrace_live_syscall_regs;
+  uint32_t current_io_flags;
+  /* Per-thread hint only: the next page of a sequential anonymous write
+   * stream. Mapping/protection checks always use the live VMA under lock. */
+  uint64_t anon_write_next;
+  uint64_t anon_write_start;
+  uint8_t anon_write_cluster_pages;
 };
 
 _Static_assert(offsetof(struct thread, on_cpu) == 16,
                "update switch.asm on_cpu offset");
+_Static_assert(offsetof(struct thread, fastpath_disabled) == 20,
+               "update syscall_entry.asm fastpath_disabled offset");
+_Static_assert(offsetof(struct thread, identity_cached_pid) == 24,
+               "update syscall_entry.asm identity_cached_pid offset");
+_Static_assert(offsetof(struct thread, identity_cached_tid) == 28,
+               "update syscall_entry.asm identity_cached_tid offset");
+_Static_assert(offsetof(struct thread, identity_cached_uid) == 32,
+               "update syscall_entry.asm identity_cached_uid offset");
+_Static_assert(offsetof(struct thread, identity_cached_gid) == 36,
+               "update syscall_entry.asm identity_cached_gid offset");
+_Static_assert(offsetof(struct thread, identity_cached_euid) == 40,
+               "update syscall_entry.asm identity_cached_euid offset");
+_Static_assert(offsetof(struct thread, identity_cached_egid) == 44,
+               "update syscall_entry.asm identity_cached_egid offset");
+_Static_assert(offsetof(struct thread, restore_callee_regs) == 48,
+               "update syscall_entry.asm restore_callee_regs offset");
+_Static_assert(offsetof(struct thread, fpu_state) == 64,
+               "update fpu_state 64-byte alignment offset");
 
 /*
  * Stable copy used by procfs. Returning a raw thread pointer after dropping
@@ -662,7 +715,9 @@ bool rseq_update_cpu_id(struct thread *t);
 bool rseq_maybe_abort(struct thread *t, uint64_t *rip_inout);
 
 // Returns the current thread *for the CPU currently executing this code*
-struct thread *sched_get_current(void);
+static inline struct thread *sched_get_current(void) {
+  return cpu_get_current_thread();
+}
 
 // Load balancing / dispatching
 void sched_enqueue_thread(struct thread *t, struct cpu_info *explicit_cpu);
@@ -703,6 +758,8 @@ bool sched_get_nth_thread_tid(uint32_t index, uint32_t *tid);
 uint32_t sched_get_group_threads(uint32_t tgid, uint32_t index, uint32_t *tid);
 bool sched_get_cpu_time_ms(uint32_t id, bool group, bool user_only,
                            uint64_t *ms);
+bool sched_get_cpu_usage_ms(uint32_t id, bool group, uint64_t *user_ms,
+                            uint64_t *system_ms);
 bool sched_get_nth_open_fd(uint32_t tid, uint32_t index, uint32_t *fd);
 vfs_node_t *sched_get_fd_node_snapshot(uint32_t tid, uint32_t fd);
 bool sched_get_fd_path_snapshot(uint32_t tid, uint32_t fd, char *path,
@@ -755,7 +812,11 @@ void fd_release_reserved(struct thread *t, int fd);
  * -EINTR, allowing signal delivery before re-entering the syscall.
  */
 static inline bool thread_has_pending_signal(struct thread *t) {
-  if (!t) return false;
+  if (__builtin_expect(!t, 0)) return false;
+  /* Fast path: 99.999% of cycles have neither pending signals nor ptrace stops.
+   * Return immediately without loading signal_mask or computing unmaskable sets. */
+  if (__builtin_expect(t->pending_signals == 0, 1))
+    return __builtin_expect(t->ptrace_stop_pending, 0);
   if (t->ptrace_stop_pending) return true;
   uint64_t unmaskable = (1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1));
   uint64_t pending = t->pending_signals & (~t->signal_mask | unmaskable);

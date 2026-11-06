@@ -11,6 +11,25 @@
 
 #define PHYS_TO_VIRT(p) ((void *)((uint64_t)(p) + pmm_get_hhdm_offset()))
 
+/* Share a private 2 MB huge page via Copy-On-Write without splitting it into
+ * 512 4 KB page tables. Marks the huge PDE read-only + COW and increments the
+ * PMM refcount on all 512 constituent 4 KB frames. Preserves 2 MB TLB reach
+ * and avoids page-table allocations. */
+static void clone_share_huge_cow(uint64_t *src_pde, uint64_t *dst_pde,
+                                 size_t *cow_count) {
+  uint64_t huge_phys = *src_pde & PAGE_MASK;
+  uint64_t attrs = *src_pde & ~PAGE_MASK;
+  if (attrs & PAGE_FLAG_RW) {
+    attrs = (attrs & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
+    *src_pde = huge_phys | attrs;
+    if (cow_count)
+      (*cow_count)++;
+  }
+  *dst_pde = huge_phys | (attrs & ~PAGE_FLAG_MLOCKED);
+  for (size_t p = 0; p < 512; p++)
+    pmm_incref((void *)(huge_phys + p * PAGE_SIZE));
+}
+
 static uint64_t *clone_table(uint64_t *src_table_phys, int level, size_t start,
                              size_t end) {
   void *new_table_phys = pmm_alloc();
@@ -35,36 +54,39 @@ static uint64_t *clone_table(uint64_t *src_table_phys, int level, size_t start,
       continue; // skip kernel / Limine mappings
 
     if (src_virt[i] & PAGE_FLAG_PS) {
-      // 2MB huge page at level 2: deep-copy the 2MB data instead of treating
-      // user heap memory as a page table.
+      // 2MB huge page at level 2: CoW for managed memory, or copy for unmanaged.
       if (level == 2) {
-        void *new_huge = pmm_alloc_huge_page();
-        if (new_huge) {
-          uint64_t src_huge_phys = src_virt[i] & PAGE_MASK;
-          memcpy(PHYS_TO_VIRT((uint64_t)new_huge),
-                 PHYS_TO_VIRT(src_huge_phys),
-                 2ULL * 1024 * 1024);
-          new_virt[i] = ((uint64_t)new_huge & PAGE_MASK) |
-                        (src_virt[i] & ~PAGE_MASK & ~PAGE_FLAG_MLOCKED);
+        if (pmm_is_managed(src_virt[i] & PAGE_MASK)) {
+          clone_share_huge_cow(&src_virt[i], &new_virt[i], NULL);
         } else {
-          void *pt_phys = pmm_alloc();
-          if (!pt_phys)
-            return NULL;
-          uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)pt_phys);
-          uint64_t src_huge_phys = src_virt[i] & PAGE_MASK;
-          uint64_t pte_flags = (src_virt[i] & ~PAGE_MASK &
-                                ~(PAGE_FLAG_PS | PAGE_FLAG_MLOCKED)) |
-                               PAGE_FLAG_PRESENT;
-          for (size_t p = 0; p < 512; p++) {
-            void *new_p = pmm_alloc();
-            if (!new_p)
+          void *new_huge = pmm_alloc_huge_page();
+          if (new_huge) {
+            uint64_t src_huge_phys = src_virt[i] & PAGE_MASK;
+            memcpy(PHYS_TO_VIRT((uint64_t)new_huge),
+                   PHYS_TO_VIRT(src_huge_phys),
+                   2ULL * 1024 * 1024);
+            new_virt[i] = ((uint64_t)new_huge & PAGE_MASK) |
+                          (src_virt[i] & ~PAGE_MASK & ~PAGE_FLAG_MLOCKED);
+          } else {
+            void *pt_phys = pmm_alloc();
+            if (!pt_phys)
               return NULL;
-            memcpy(PHYS_TO_VIRT((uint64_t)new_p),
-                   PHYS_TO_VIRT(src_huge_phys + p * PAGE_SIZE),
-                   PAGE_SIZE);
-            pt_virt[p] = ((uint64_t)new_p & PAGE_MASK) | pte_flags;
+            uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)pt_phys);
+            uint64_t src_huge_phys = src_virt[i] & PAGE_MASK;
+            uint64_t pte_flags = (src_virt[i] & ~PAGE_MASK &
+                                  ~(PAGE_FLAG_PS | PAGE_FLAG_MLOCKED)) |
+                                 PAGE_FLAG_PRESENT;
+            for (size_t p = 0; p < 512; p++) {
+              void *new_p = pmm_alloc();
+              if (!new_p)
+                return NULL;
+              memcpy(PHYS_TO_VIRT((uint64_t)new_p),
+                     PHYS_TO_VIRT(src_huge_phys + p * PAGE_SIZE),
+                     PAGE_SIZE);
+              pt_virt[p] = ((uint64_t)new_p & PAGE_MASK) | pte_flags;
+            }
+            new_virt[i] = ((uint64_t)pt_phys & PAGE_MASK) | PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_USER;
           }
-          new_virt[i] = ((uint64_t)pt_phys & PAGE_MASK) | PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_USER;
         }
       }
       continue;
@@ -141,44 +163,6 @@ static bool clone_alloc_table(uint64_t **table_phys) {
   return true;
 }
 
-/* fork of a private 2 MB mapping: instead of copying 2 MB, split the huge PDE
- * into a page table of 512 write-protected 4 KB entries in BOTH address spaces
- * and take one PMM reference per frame. The ordinary 4 KB copy-on-write fault
- * path then copies a single page on the first write from either side. Both
- * tables are allocated before anything is modified, so failure leaves the
- * parent untouched. The caller flushes the parent's TLB context. */
-static bool clone_split_share_huge(uint64_t *src_pde, uint64_t *dst_pde) {
-  uint64_t *parent_pt = pmm_alloc();
-  uint64_t *child_pt = pmm_alloc();
-  if (!parent_pt || !child_pt) {
-    if (parent_pt)
-      pmm_free_page(parent_pt);
-    if (child_pt)
-      pmm_free_page(child_pt);
-    return false;
-  }
-  uint64_t *ppt = (uint64_t *)PHYS_TO_VIRT((uint64_t)parent_pt);
-  uint64_t *cpt = (uint64_t *)PHYS_TO_VIRT((uint64_t)child_pt);
-
-  uint64_t huge = *src_pde & PAGE_MASK;
-  uint64_t attrs = (*src_pde & ~PAGE_MASK & ~PAGE_FLAG_PS) | PAGE_FLAG_PRESENT;
-  if (attrs & PAGE_FLAG_RW)
-    attrs = (attrs & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
-  uint64_t child_attrs = attrs & ~PAGE_FLAG_MLOCKED;
-
-  for (size_t p = 0; p < 512; p++) {
-    uint64_t phys = huge + p * PAGE_SIZE;
-    pmm_incref((void *)phys);
-    ppt[p] = phys | attrs;
-    cpt[p] = phys | child_attrs;
-  }
-
-  uint64_t table_attrs = PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_USER;
-  *src_pde = ((uint64_t)parent_pt & PAGE_MASK) | table_attrs;
-  *dst_pde = ((uint64_t)child_pt & PAGE_MASK) | table_attrs;
-  return true;
-}
-
 static bool clone_table_vma(uint64_t *src_table_phys, int level,
                             size_t start, size_t end,
                             struct vma_list *vmas, uint64_t base_addr,
@@ -214,12 +198,7 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
         if (hv && (hv->flags & MAP_SHARED)) {
           new_virt[i] = src_virt[i] & ~PAGE_FLAG_MLOCKED;
         } else if (pmm_is_managed(src_virt[i] & PAGE_MASK)) {
-          if (!clone_split_share_huge(&src_virt[i], &new_virt[i]))
-            return false;
-          /* The parent's PDE changed from a 2 MB leaf to a table of
-           * read-only entries: count it so the context flush is issued. */
-          if (cow_count)
-            (*cow_count)++;
+          clone_share_huge_cow(&src_virt[i], &new_virt[i], cow_count);
         } else {
           void *new_huge = pmm_alloc_huge_page();
           if (new_huge) {
@@ -358,6 +337,7 @@ uint64_t vmm_clone_user_mappings(uint64_t *src_pml4_phys) {
   for (size_t i = 256; i < 512; i++)
     new_pml4_virt[i] = __atomic_load_n(&kernel_pml4_virt[i], __ATOMIC_ACQUIRE);
 
+  tlb_flush_deferred_context((uint64_t)src_pml4_phys);
   vmm_lock_release();
   return (uint64_t)new_pml4_phys;
 }

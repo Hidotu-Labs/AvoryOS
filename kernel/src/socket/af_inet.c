@@ -150,7 +150,18 @@ static int inet_connect(socket_t *sock, struct sockaddr *addr, int addrlen) {
         if (isk->linger_seconds >= 0)
             tcp_set_linger(isk->tcp, isk->linger_seconds);
         int r = tcp_active_open(isk->tcp, sa_addr(sin), sa_port(sin));
-        if (r < 0) return r;
+        if (r < 0) {
+            /* Clients such as Qt retry connect() on the same socket, so a
+             * persistent failure looks like a hang. Record what was asked
+             * for, bounded so a retry loop cannot flood the log. */
+            static volatile uint32_t connect_fail_logs;
+            if (__atomic_fetch_add(&connect_fail_logs, 1, __ATOMIC_RELAXED) < 64)
+                klogf("[INET] connect failed r=%d dst=%u.%u.%u.%u:%u\n", r,
+                      (sa_addr(sin) >> 24) & 0xff, (sa_addr(sin) >> 16) & 0xff,
+                      (sa_addr(sin) >> 8) & 0xff, sa_addr(sin) & 0xff,
+                      (unsigned)sa_port(sin));
+            return r;
+        }
         if (socket_is_nonblocking(sock)) {
             sock->state = SS_CONNECTING;
             return -115; /* EINPROGRESS */

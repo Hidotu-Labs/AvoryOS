@@ -50,7 +50,6 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a2,
     }
     wrmsr(IA32_FS_BASE, addr);
     {
-      extern struct thread *sched_get_current(void);
       struct thread *cur = sched_get_current();
       if (cur)
         cur->fs_base = addr;
@@ -92,7 +91,6 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a2,
     // After sysret + swapgs, this becomes the active GS for userspace.
     wrmsr(IA32_KERNEL_GS_BASE, addr);
     {
-      extern struct thread *sched_get_current(void);
       struct thread *cur = sched_get_current();
       if (cur)
         cur->gs_base = addr;

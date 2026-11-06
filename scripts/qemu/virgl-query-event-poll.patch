@@ -1,0 +1,56 @@
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -13,6 +13,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/error-report.h"
++#include "qemu/main-loop.h"
+ #include "qemu/iov.h"
+ #include "trace.h"
+ #include "hw/virtio/virtio.h"
+@@ -1491,6 +1492,14 @@
+ 
+     gl->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                   virtio_gpu_fence_poll, g);
++    /* Async fence callbacks do not retire through this fd, but vrend's
++     * query handshake still signals it to request polling on the GL thread.
++     * Keep the timer fallback for renderers without an event fd. */
++    gl->renderer_poll_fd = virgl_renderer_get_poll_fd();
++    if (gl->renderer_poll_fd >= 0) {
++        qemu_set_fd_handler(gl->renderer_poll_fd, virtio_gpu_fence_poll,
++                            NULL, g);
++    }
+ 
+     if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
+         gl->print_stats = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -16,6 +16,7 @@
+ #include "qemu/mmap-alloc.h"
+ #include "qemu/module.h"
+ #include "qemu/error-report.h"
++#include "qemu/main-loop.h"
+ #include "qapi/error.h"
+ #include "system/system.h"
+ #include "hw/virtio/virtio.h"
+@@ -188,6 +189,10 @@
+ #endif
+         if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
+             timer_free(gl->print_stats);
++        }
++        if (gl->renderer_poll_fd >= 0) {
++            qemu_set_fd_handler(gl->renderer_poll_fd, NULL, NULL, NULL);
++            gl->renderer_poll_fd = -1;
+         }
+         timer_free(gl->fence_poll);
+         virgl_renderer_cleanup(NULL);
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -257,6 +257,7 @@
+     RenderState renderer_state;
+ 
+     QEMUTimer *fence_poll;
++    int renderer_poll_fd;
+     QEMUTimer *print_stats;
+ 
+     QEMUBH *cmdq_resume_bh;

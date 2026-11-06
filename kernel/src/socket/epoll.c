@@ -19,6 +19,7 @@ static eventpoll_t *epoll_table[EPOLL_MAX_INSTANCES];
 #define EPOLL_BITMAP_WORDS ((EPOLL_MAX_INSTANCES + 63) / 64)
 static uint64_t epoll_free_bitmap[EPOLL_BITMAP_WORDS]; // 1 = free
 static spinlock_t epoll_table_lock = SPINLOCK_INIT;
+static volatile uint16_t epoll_fd_watchers[EPOLL_MAX_WATCHED];
 
 /* Fallback full rescan of the watched set.  Event discovery is driven by
  * epoll_notify_event(); the rescan is only a safety net for producers that
@@ -214,6 +215,8 @@ void epoll_destroy(eventpoll_t *ep) {
         }
         list_del(&epi->ep_node_link);
         ep->items[i] = NULL;
+        if (i < EPOLL_MAX_WATCHED && epoll_fd_watchers[i] > 0)
+          __atomic_sub_fetch(&epoll_fd_watchers[i], 1, __ATOMIC_RELEASE);
         spinlock_release(&ep->lock);
         spinlock_release(&epi->node->ep_lock);
         epitem_free(epi);
@@ -362,6 +365,8 @@ int epoll_ctl_del(eventpoll_t *ep, int fd) {
     __atomic_store_n(&epi->removed, true, __ATOMIC_RELEASE);
     ep->items[fd] = NULL;
     ep->item_count--;
+    if (fd < EPOLL_MAX_WATCHED && epoll_fd_watchers[fd] > 0)
+      __atomic_sub_fetch(&epoll_fd_watchers[fd], 1, __ATOMIC_RELEASE);
     __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
     if (__atomic_load_n(&epi->on_ready_list, __ATOMIC_ACQUIRE)) {
       list_del(&epi->rdllink);
@@ -430,6 +435,8 @@ int epoll_ctl_add(eventpoll_t *ep, int fd, struct epoll_event *event) {
   ep->items[fd] = epi;
   ep->item_count++;
   if (fd >= ep->items_high) ep->items_high = fd + 1;
+  if (fd < EPOLL_MAX_WATCHED)
+    __atomic_add_fetch(&epoll_fd_watchers[fd], 1, __ATOMIC_RELEASE);
   __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
   if (node->ep_watchers.next == NULL || node->ep_watchers.prev == NULL) {
     INIT_LIST_HEAD(&node->ep_watchers);
@@ -538,76 +545,87 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
     }
 
     // Reconcile each poll with notifications that arrived while it was unlocked.
+    // Amortize ep->lock across the entire batch to eliminate repeated lock roundtrips.
     struct epoll_event event_batch[64];
     int batch_count = 0;
 
-    for (int i = 0; i < cand_count; i++) {
-      epitem_t *epi = candidates[i];
+    if (cand_count > 0) {
+      bool was_empty = false;
+      bool notify_vfs = false;
+      bool any_keep_ready = false;
+      vfs_node_t *ep_vnode = NULL;
+
       spinlock_acquire(&ep->lock);
-      if (!__atomic_load_n(&epi->in_scan, __ATOMIC_ACQUIRE) ||
-          !__atomic_load_n(&epi->on_ready_list, __ATOMIC_ACQUIRE) ||
-          __atomic_load_n(&epi->removed, __ATOMIC_ACQUIRE)) {
-        // EPOLL_CTL_DEL may have detached and retired this pinned item.
-        spinlock_release(&ep->lock);
-        continue;
-      }
+      was_empty = (ep->rdllist_count == 0);
+      ep_vnode = ep->vfs_node;
 
-      bool was_empty = ep->rdllist_count == 0;
-      bool requeue =
-          scan_sequences[i] != __atomic_load_n(&epi->notify_seq, __ATOMIC_ACQUIRE);
-      uint32_t current_events = polled_events[i] &
-          (watch_masks[i] | EPOLLERR | EPOLLHUP);
-      bool deliver = !requeue &&
-          !__atomic_load_n(&epi->oneshot_disabled, __ATOMIC_ACQUIRE) &&
-          current_events != 0;
-      bool level_requeue = deliver &&
-          !(epi->event.events & (EPOLLET | EPOLLONESHOT));
-      bool keep_ready = requeue || level_requeue;
+      for (int i = 0; i < cand_count; i++) {
+        epitem_t *epi = candidates[i];
+        if (!__atomic_load_n(&epi->in_scan, __ATOMIC_ACQUIRE) ||
+            !__atomic_load_n(&epi->on_ready_list, __ATOMIC_ACQUIRE) ||
+            __atomic_load_n(&epi->removed, __ATOMIC_ACQUIRE)) {
+          // EPOLL_CTL_DEL may have detached and retired this pinned item.
+          continue;
+        }
 
-      if (requeue) {
-        // A producer raced with the poll. Keep the candidate queued for a
-        // fresh poll instead of delivering a stale/partial readiness result.
-        __atomic_store_n(&epi->in_scan, false, __ATOMIC_RELEASE);
-        list_add_tail(&epi->rdllink, &ep->rdllist);
-        ep->rdllist_count++;
-        __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
-      } else if (deliver && batch_count < maxevents) {
-        event_batch[batch_count] = epi->event;
-        event_batch[batch_count].events = current_events;
-        batch_count++;
+        bool requeue =
+            scan_sequences[i] != epi->notify_seq;
+        uint32_t current_events = polled_events[i] &
+            (watch_masks[i] | EPOLLERR | EPOLLHUP);
+        bool deliver = !requeue &&
+            !epi->oneshot_disabled &&
+            current_events != 0;
+        bool level_requeue = deliver &&
+            !(epi->event.events & (EPOLLET | EPOLLONESHOT));
+        bool keep_ready = requeue || level_requeue;
 
-        if (epi->event.events & EPOLLET) {
-          epi->last_events = current_events &
-                             (EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM);
-          __atomic_store_n(&epi->in_scan, false, __ATOMIC_RELEASE);
-          __atomic_store_n(&epi->on_ready_list, false, __ATOMIC_RELEASE);
-          INIT_LIST_HEAD(&epi->rdllink);
-        } else if (__atomic_load_n(&epi->oneshot, __ATOMIC_ACQUIRE)) {
-          __atomic_store_n(&epi->oneshot_disabled, true, __ATOMIC_RELEASE);
-          __atomic_store_n(&epi->registered_events, 0, __ATOMIC_RELEASE);
-          __atomic_store_n(&epi->in_scan, false, __ATOMIC_RELEASE);
-          __atomic_store_n(&epi->on_ready_list, false, __ATOMIC_RELEASE);
-          INIT_LIST_HEAD(&epi->rdllink);
-        } else {
-          // Level-triggered readiness stays queued for the next wait.
-          __atomic_store_n(&epi->in_scan, false, __ATOMIC_RELEASE);
+        epi->in_scan = false;
+
+        if (requeue) {
+          // A producer raced with the poll. Keep the candidate queued for a
+          // fresh poll instead of delivering a stale/partial readiness result.
           list_add_tail(&epi->rdllink, &ep->rdllist);
           ep->rdllist_count++;
+        } else if (deliver && batch_count < maxevents) {
+          event_batch[batch_count] = epi->event;
+          event_batch[batch_count].events = current_events;
+          batch_count++;
+
+          if (epi->event.events & EPOLLET) {
+            epi->last_events = current_events &
+                               (EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM);
+            epi->on_ready_list = false;
+            INIT_LIST_HEAD(&epi->rdllink);
+          } else if (epi->oneshot) {
+            epi->oneshot_disabled = true;
+            epi->registered_events = 0;
+            epi->on_ready_list = false;
+            INIT_LIST_HEAD(&epi->rdllink);
+          } else {
+            // Level-triggered readiness stays queued for the next wait.
+            list_add_tail(&epi->rdllink, &ep->rdllist);
+            ep->rdllist_count++;
+          }
+        } else {
+          epi->on_ready_list = false;
+          INIT_LIST_HEAD(&epi->rdllink);
         }
-      } else {
-        __atomic_store_n(&epi->in_scan, false, __ATOMIC_RELEASE);
-        __atomic_store_n(&epi->on_ready_list, false, __ATOMIC_RELEASE);
-        INIT_LIST_HEAD(&epi->rdllink);
+
+        if (keep_ready) {
+          any_keep_ready = true;
+          if (was_empty && ep_vnode)
+            notify_vfs = true;
+        }
       }
 
-      if (keep_ready)
+      if (any_keep_ready) {
         ep_wake_one_locked(ep);
-      if (keep_ready)
-        __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
+        ep->generation++;
+      }
       spinlock_release(&ep->lock);
 
-      if (keep_ready && was_empty && ep->vfs_node) {
-        epoll_notify_event(ep->vfs_node, EPOLLIN);
+      if (notify_vfs && ep_vnode) {
+        epoll_notify_event(ep_vnode, EPOLLIN);
       }
     }
 
@@ -638,18 +656,29 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
     uint64_t scan_now = lapic_timer_get_ticks();
     if (scan_now >= __atomic_load_n(&ep->next_scan_ticks, __ATOMIC_RELAXED)) {
       int items_high = __atomic_load_n(&ep->items_high, __ATOMIC_RELAXED);
-      for (int _i = 0; _i < items_high; _i++) {
+      int _idx = 0;
+      while (_idx < items_high) {
+        epitem_t *rescan_batch[32];
+        int batch_len = 0;
+
         spinlock_acquire(&ep->lock);
-        epitem_t *_epi = (_i < (int)ep->items_capacity) ? ep->items[_i] : NULL;
-        if (!_epi || __atomic_load_n(&_epi->on_ready_list, __ATOMIC_ACQUIRE) ||
-            __atomic_load_n(&_epi->oneshot_disabled, __ATOMIC_ACQUIRE)) {
-          spinlock_release(&ep->lock);
-          continue;
+        while (_idx < items_high && batch_len < 32) {
+          epitem_t *_epi = (_idx < (int)ep->items_capacity) ? ep->items[_idx] : NULL;
+          _idx++;
+          if (!_epi || __atomic_load_n(&_epi->on_ready_list, __ATOMIC_ACQUIRE) ||
+              __atomic_load_n(&_epi->oneshot_disabled, __ATOMIC_ACQUIRE)) {
+            continue;
+          }
+          epitem_pin(_epi, (unsigned)batch_len);
+          rescan_batch[batch_len++] = _epi;
         }
-        epitem_pin(_epi, 0);
         spinlock_release(&ep->lock);
-        if (ep_check_events(_epi)) ep_add_to_ready_list(ep, _epi);
-        epitem_unpin(0);
+
+        for (int b = 0; b < batch_len; b++) {
+          if (ep_check_events(rescan_batch[b]))
+            ep_add_to_ready_list(ep, rescan_batch[b]);
+          epitem_unpin((unsigned)b);
+        }
       }
       __atomic_store_n(&ep->next_scan_ticks, scan_now + EPOLL_RESCAN_INTERVAL_MS,
                        __ATOMIC_RELAXED);
@@ -943,6 +972,11 @@ void epoll_notify_socket(int fd, uint32_t events) {
   if (fd < 0 || fd >= EPOLL_MAX_WATCHED)
     return;
 
+  /* Fast path: if no epoll instance is watching this socket descriptor, return
+   * immediately in 1 cycle without scanning epoll_table or acquiring locks. */
+  if (__atomic_load_n(&epoll_fd_watchers[fd], __ATOMIC_ACQUIRE) == 0)
+    return;
+
   /* Walk only live instances: the free-bitmap marks in-use slots (1 = free),
    * so a system with a handful of epoll instances open does a handful of
    * iterations instead of probing every slot.  The bitmap and
@@ -981,6 +1015,7 @@ void epoll_notify_socket(int fd, uint32_t events) {
 void epoll_init(void) {
   memset(epoll_table, 0, sizeof(epoll_table));
   memset(epoll_free_bitmap, 0xff, sizeof(epoll_free_bitmap));
+  memset((void *)epoll_fd_watchers, 0, sizeof(epoll_fd_watchers));
   spinlock_init(&epoll_table_lock);
 
   klog_puts("[OK] Epoll subsystem initialized (max instances: ");

@@ -15,6 +15,8 @@
 #include "numa.h"
 #include "mempolicy.h"
 #include "page_ops.h"
+#include "../cpu/features.h"
+#include "../linuxkpi/fpu.h"
 #include "tlb_shootdown.h"
 #include "vma.h"
 #include "vmm.h"
@@ -183,6 +185,97 @@ extern size_t pty_shrink_unused_buffers(void)
 
 static volatile uint64_t vmm_fault_reclaim_next_ms;
 
+/* A sequential writer otherwise enters the fault gate for every 4 KiB.
+ * After consecutive write faults, grow from 64 KiB to at most 256 KiB of
+ * ordinary pages. Small/sparse regions and stacks keep demand allocation; reads
+ * still use the shared zero page. This is not a huge-page policy change. */
+static bool vmm_anon_write_cluster(struct thread *current, uint64_t cr3,
+                                    uint64_t page, uint64_t start,
+                                    uint64_t end, uint64_t prot,
+                                    uint64_t mapping_flags) {
+  bool sequential = current->anon_write_next == page &&
+                    current->anon_write_start == start;
+  unsigned previous = current->anon_write_cluster_pages;
+  current->anon_write_cluster_pages = 0;
+  current->anon_write_next = page + PAGE_SIZE;
+  current->anon_write_start = start;
+  if (!sequential || end <= start || end - start < 1024 * 1024 ||
+      page < start || page >= end || !(prot & PROT_WRITE) ||
+      (mapping_flags & (MAP_PRIVATE | MAP_ANONYMOUS)) !=
+          (MAP_PRIVATE | MAP_ANONYMOUS) ||
+      (mapping_flags & (MAP_SHARED | MAP_STACK | MAP_GROWSDOWN | MAP_SYSV_SHM |
+                        MAP_LOCKED)) ||
+      current->mm->mlockall_future ||
+      !vmm_zero_pool_usable(MPOL_DEFAULT))
+    return false;
+
+  unsigned limit = previous >= 32 ? 64 : previous >= 16 ? 32 : 16;
+  uint64_t remaining = (end - page) / PAGE_SIZE;
+  unsigned count = remaining > limit ? limit : (unsigned)remaining;
+  if (count < 2) return false;
+  if (pmm_get_free_pages() < VMM_FAULT_WATERMARK_PAGES + count)
+    return false;
+  void *frames[64] = {0};
+  unsigned allocated = 0;
+  unsigned unzeroed = count;
+  bool try_zero_pool = true;
+  for (; allocated < count; allocated++) {
+    if (try_zero_pool) frames[allocated] = pmm_alloc_zeroed_page();
+    if (!frames[allocated]) {
+      // Once empty, leave the idle refill to replenish the pool. Repeated
+      // misses in the same batch only repeat locking and counter updates.
+      if (try_zero_pool) unzeroed = allocated;
+      try_zero_pool = false;
+      frames[allocated] = pmm_alloc_page();
+      if (!frames[allocated]) break;
+    }
+  }
+  if (!allocated) return false;
+  if (unzeroed < allocated) {
+    void *pages[64];
+    for (unsigned i = unzeroed; i < allocated; i++)
+      pages[i - unzeroed] = PHYS_TO_VIRT((uint64_t)frames[i]);
+    /* One guarded vector batch instead of a separate zero operation for
+     * every frame. Publish only after the batch's store fence completes. */
+    if (cpu_has_avx2() || cpu_has_avx512()) {
+      kernel_fpu_begin();
+      page_zero_batch(pages, allocated - unzeroed);
+      kernel_fpu_end();
+    } else {
+      page_zero_nt_batch(pages, allocated - unzeroed);
+    }
+  }
+
+  bool handled = false;
+  spinlock_acquire(&current->mm->lock);
+  struct vma *v = vma_find(&current->mm->vmas, page);
+  bool valid = v && v->start == start && v->end == end &&
+               v->prot == prot && v->flags == mapping_flags &&
+               !v->file_node && !v->linux_vma &&
+               v->numa_policy == MPOL_DEFAULT &&
+               !current->mm->mlockall_future &&
+               vmm_zero_pool_usable(v->numa_policy);
+  if (valid) {
+    uint64_t flags = dp_build_flags(v->prot);
+    vmm_lock_acquire_for((uint64_t *)cr3, page);
+    handled = vmm_map_fresh_pages_locked((uint64_t *)cr3, page, frames,
+                                         allocated, flags);
+    vmm_lock_release();
+  }
+  spinlock_release(&current->mm->lock);
+  for (unsigned i = 0; i < allocated; i++)
+    if (frames[i]) pmm_free_page(frames[i]);
+  if (!valid) {
+    current->anon_write_next = 0;
+    return true; // retry the fault against the replacement VMA
+  }
+  if (handled) {
+    current->anon_write_next = page + (uint64_t)allocated * PAGE_SIZE;
+    current->anon_write_cluster_pages = allocated;
+  }
+  return handled;
+}
+
 static void vmm_fault_watermark_reclaim(void) {
   uint64_t now = lapic_timer_get_ms();
   uint64_t next = __atomic_load_n(&vmm_fault_reclaim_next_ms, __ATOMIC_RELAXED);
@@ -280,6 +373,101 @@ static void vmm_map_cow_cluster(uint64_t *pml4, uint64_t cr2,
 
     uint64_t flags = (dp_build_flags(nv->prot) & ~PAGE_FLAG_RW) |
                      PAGE_FLAG_COW | PAGE_FLAG_REFAULT;
+    bool changed = false;
+    if (vmm_page_present_nolock(pml4, batch[i].vpage) ||
+        !vmm_map_page_locked(pml4, batch[i].vpage, batch[i].phys, flags,
+                             &changed))
+      pmm_decref((void *)batch[i].phys);
+  }
+  vmm_lock_release();
+  spinlock_release(&mm->lock);
+}
+
+/* Map already-cached neighbours of a freshly faulted tmpfs/shmem page in one
+ * pass, mirroring the proactive clustering of regular file mappings.
+ * Each frame gets its own reference; pages whose VMA changed or are unmapped
+ * are dropped safely. */
+static void vmm_map_tmpfs_cluster(uint64_t *pml4, uint64_t cr2,
+                                  vfs_node_t *node, struct mm_struct *mm,
+                                  uint64_t vma_start, uint64_t vma_end,
+                                  uint64_t vma_offset, uint64_t vma_file_size,
+                                  uint64_t vma_flags, uint64_t vma_prot,
+                                  void *vma_linux) {
+  if (!pml4 || !node || !mm || !node->device)
+    return;
+
+  tmpfs_file_t *file = (tmpfs_file_t *)node->device;
+  uint64_t fault_vpage = cr2 & ~0xFFFULL;
+  uint64_t cluster_vstart = cr2 & ~0x1FFFFULL; // 128 KB (32 pages) window
+
+  uint64_t eff_file_size =
+      (vma_file_size > 0 || (vma_flags & MAP_ELF_LOAD))
+          ? vma_file_size
+          : (node->length < (vma_end - vma_start) ? node->length : (vma_end - vma_start));
+
+  struct {
+    uint64_t vpage;
+    uint64_t phys;
+  } batch[32];
+  uint32_t batch_count = 0;
+
+  spinlock_acquire(&file->lock);
+  for (int ci = 0; ci < 32; ci++) {
+    uint64_t vpage = cluster_vstart + (uint64_t)ci * PAGE_SIZE;
+    if (vpage == fault_vpage || vpage < vma_start || vpage >= vma_end)
+      continue;
+    uint64_t page_off = vpage - vma_start;
+    // BSS / partial tail check: never map file storage into BSS or partial tail
+    if (((vma_flags & MAP_ELF_LOAD) || ((vma_flags & 3) == MAP_PRIVATE)) &&
+        page_off + PAGE_SIZE > eff_file_size)
+      continue;
+
+    uint64_t file_off = vma_offset + page_off;
+    if (file_off >= node->length)
+      continue;
+
+    uint32_t index = (uint32_t)(file_off >> 12);
+    tmpfs_page_t *p = (tmpfs_page_t *)asc_radix_tree_lookup(&file->pages, index);
+    if (p && p->phys && pmm_is_managed(p->phys)) {
+      batch[batch_count].vpage = vpage;
+      batch[batch_count].phys = p->phys;
+      pmm_incref((void *)p->phys);
+      batch_count++;
+    }
+  }
+  spinlock_release(&file->lock);
+
+  if (batch_count == 0)
+    return;
+
+  spinlock_acquire(&mm->lock);
+  vmm_lock_acquire_for(pml4, cluster_vstart);
+  for (uint32_t i = 0; i < batch_count; i++) {
+    struct vma *nv = vma_find(&mm->vmas, batch[i].vpage);
+    uint64_t orig_off = vma_offset + (batch[i].vpage - vma_start);
+    uint64_t cur_off =
+        nv && batch[i].vpage >= nv->start
+            ? nv->offset + (batch[i].vpage - nv->start)
+            : UINT64_MAX;
+    uint64_t nv_eff_file_size =
+        nv ? ((nv->file_size > 0 || (nv->flags & MAP_ELF_LOAD))
+                  ? nv->file_size
+                  : (node->length < (nv->end - nv->start) ? node->length : (nv->end - nv->start)))
+           : 0;
+    bool ok = nv && nv->prot == vma_prot && nv->flags == vma_flags &&
+              nv->file_node == node && cur_off == orig_off &&
+              nv->linux_vma == vma_linux &&
+              (!(((nv->flags & MAP_ELF_LOAD) || ((nv->flags & 3) == MAP_PRIVATE)) &&
+                 (batch[i].vpage - nv->start) + PAGE_SIZE > nv_eff_file_size));
+    if (!ok) {
+      pmm_decref((void *)batch[i].phys);
+      continue;
+    }
+
+    uint64_t flags = dp_build_flags(nv->prot);
+    if ((nv->flags & 3) == MAP_PRIVATE)
+      flags = (flags & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
+
     bool changed = false;
     if (vmm_page_present_nolock(pml4, batch[i].vpage) ||
         !vmm_map_page_locked(pml4, batch[i].vpage, batch[i].phys, flags,
@@ -406,8 +594,101 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 
     uint64_t *pd = (uint64_t *)PHYS_TO_VIRT(pdpte & PAGE_MASK);
     uint64_t pde = pd[(virt >> 21) & 511];
-    if (!(pde & PAGE_FLAG_PRESENT) || (pde & PAGE_FLAG_PS))
-      WALK_REJECT("write walk: PD entry missing or a 2MB huge page", pde, virt);
+    if (!(pde & PAGE_FLAG_PRESENT))
+      WALK_REJECT("write walk: PD entry missing", pde, virt);
+
+    if (pde & PAGE_FLAG_PS) {
+      if (pde & PAGE_FLAG_RW) {
+        // Stale TLB: Another thread in this process already broke CoW on this
+        // huge page.
+        WALK_UNLOCK();
+        tlb_shootdown_page(virt);
+        return 0;
+      }
+
+      int v_numa_policy = 0;
+      uint64_t v_numa_nodemask = 0;
+      int v_numa_preferred_node = 0;
+      struct vma *v = vma_find(&current->mm->vmas, cr2);
+      if (v) {
+        v_numa_policy = v->numa_policy;
+        v_numa_nodemask = v->numa_nodemask;
+        v_numa_preferred_node = v->numa_preferred_node;
+        if ((v->flags & MAP_PRIVATE) && (v->prot & PROT_WRITE)) {
+          pde |= PAGE_FLAG_COW;
+          pd[(virt >> 21) & 511] = pde;
+        }
+      }
+
+      if (!(pde & PAGE_FLAG_COW)) {
+        WALK_UNLOCK();
+        if (user_mode) {
+          klog_puts("[VMM] Write-protect fault on huge page at CR2=");
+          klog_hex64(cr2);
+          klog_puts(" RIP=");
+          klog_hex64(regs->rip);
+          klog_puts(" tid=");
+          klog_uint64(current->tid);
+          klog_puts(" RSP=");
+          klog_hex64(regs->rsp);
+          klog_puts("\n");
+          return PF_REJECT("write-protect violation: present huge page is read-only and not CoW",
+                           pde, 0);
+        }
+        return PF_REJECT("write-protect violation: ring-0 write to read-only huge page",
+                         pde, 0);
+      }
+
+      uint64_t old_huge = pde & PAGE_MASK;
+      uint16_t refs = pmm_get_ref((void *)old_huge);
+
+      if (refs == 1) {
+        // Sole owner: unprotect in place.
+        pd[(virt >> 21) & 511] = (pde & ~(PAGE_FLAG_COW | PAGE_FLAG_REFAULT)) | PAGE_FLAG_RW;
+        pml4[(virt >> 39) & 511] |= (PAGE_FLAG_RW | PAGE_FLAG_USER);
+        pdpt[(virt >> 30) & 511] |= (PAGE_FLAG_RW | PAGE_FLAG_USER);
+        WALK_UNLOCK();
+        tlb_shootdown_page(virt);
+        return 0;
+      }
+
+      // Multiple owners: allocate a fresh 2MB huge page.
+      void *new_huge = vmm_alloc_huge_page_numa(v_numa_policy, v_numa_nodemask,
+                                                v_numa_preferred_node, virt);
+      if (new_huge) {
+        memcpy(PHYS_TO_VIRT((uint64_t)new_huge), PHYS_TO_VIRT(old_huge), 2ULL * 1024 * 1024);
+        pd[(virt >> 21) & 511] = ((uint64_t)new_huge & PAGE_MASK) |
+                                 (pde & ~PAGE_MASK & ~(PAGE_FLAG_COW | PAGE_FLAG_REFAULT)) |
+                                 PAGE_FLAG_RW;
+        pml4[(virt >> 39) & 511] |= (PAGE_FLAG_RW | PAGE_FLAG_USER);
+        pdpt[(virt >> 30) & 511] |= (PAGE_FLAG_RW | PAGE_FLAG_USER);
+        WALK_UNLOCK();
+        tlb_shootdown_page(virt);
+        for (size_t p = 0; p < 512; p++)
+          pmm_decref((void *)(old_huge + p * PAGE_SIZE));
+        return 0;
+      }
+
+      // Fragmentation fallback: allocate a 4KB page table and split the 2MB huge page.
+      void *pt_phys = pmm_alloc();
+      if (!pt_phys)
+        WALK_REJECT("CoW copy: PMM out of memory for huge page split PT", old_huge, refs);
+
+      uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)pt_phys);
+      bool pat = (pde & (1ULL << 12)) != 0;
+      uint64_t pte_flags = (pde & ~PAGE_MASK & ~((1ULL << 12) | PAGE_FLAG_PS)) |
+                           PAGE_FLAG_PRESENT;
+      if (pat)
+        pte_flags |= PAGE_FLAG_PAT;
+
+      for (size_t p = 0; p < 512; p++)
+        pt_virt[p] = (old_huge + p * PAGE_SIZE) | pte_flags;
+
+      uint64_t table_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_USER;
+      pd[(virt >> 21) & 511] = ((uint64_t)pt_phys & PAGE_MASK) | table_flags;
+      pde = pd[(virt >> 21) & 511];
+      // Fall through to 4KB CoW handler using this new page table.
+    }
 
     uint64_t *pt = (uint64_t *)PHYS_TO_VIRT(pde & PAGE_MASK);
     uint64_t *pte = &pt[(virt >> 12) & 511];
@@ -939,6 +1220,11 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
       if (!frame)
         return PF_REJECT("shmem page unavailable or past EOF", file_offset, node->length);
       cow_mapping = (vma_flags & 3) == MAP_PRIVATE;
+
+      // Proactively cluster adjacent already-cached tmpfs pages
+      vmm_map_tmpfs_cluster((uint64_t *)target_cr3, cr2, node, current->mm,
+                            vma_start, vma_end, vma_offset, vma_file_size,
+                            vma_flags, vma_prot, vma_linux);
     }
   } else if (node && (node->flags & FS_TYPE_MASK) == FS_FILE) {
     uint64_t page_offset = (cr2 & ~0xFFFULL) - vma_start;
@@ -1311,6 +1597,11 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 #undef FAULT_AROUND_PAGES
 
     // 4 KB fallback (always correct, also handles non-huge VMAs).
+    if (write_fault && !vma_file_node && !vma_linux && vma_numa_policy == MPOL_DEFAULT &&
+        vmm_anon_write_cluster(current, target_cr3, cr2 & PAGE_MASK,
+                               vma_start, vma_end, vma_prot, vma_flags))
+      return 0;
+
     // Prefer an idle-zeroed frame; fall back to alloc+zero inline.
     bool pre_zeroed = false;
     frame = vmm_zero_pool_usable(vma_numa_policy) ? pmm_alloc_zeroed_page()

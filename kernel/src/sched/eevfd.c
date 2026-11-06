@@ -37,6 +37,7 @@ void eevfd_rq_init(struct eevfd_rq *rq) {
     rq->nr_running = 0;
     rq->min_vruntime = 0;
     rq->curr = NULL;
+    rq->curr_start_exec_ns = 0;
 }
 
 void eevfd_entity_init(struct sched_entity *se, int nice, uint64_t slice_ns) {
@@ -58,6 +59,7 @@ void eevfd_entity_init(struct sched_entity *se, int nice, uint64_t slice_ns) {
     se->on_rq = false;
     se->custom_slice = (slice_ns != 0);
     se->critical_depth = 0;
+    se->burst_exec_us = 0;
 }
 
 void eevfd_set_nice(struct sched_entity *se, int nice) {
@@ -86,6 +88,22 @@ void eevfd_set_slice(struct sched_entity *se, uint64_t slice_ns) {
     se->custom_slice = true;
     se->deadline = calc_deadline(se->vruntime, se->slice_ns, se->weight, se->wmult);
     se->min_deadline = se->deadline;
+}
+
+/* A short CPU burst followed by blocking is an interactive request, even
+ * at nice 0. Shorten only the next default request; keep the weight (fair
+ * share), explicit slices, batch/idle/RT policy and priority ceilings intact. */
+void eevfd_note_sleep(struct sched_entity *se) {
+    if (!se)
+        return;
+    if (!se->custom_slice && !se->critical_depth) {
+        uint64_t base = eevfd_calc_slice_for_nice(se->nice_value);
+        uint64_t predicted = (uint64_t)se->burst_exec_us * 4000ULL;
+        if (predicted < EEVFD_MIN_SLICE_NS)
+            predicted = EEVFD_MIN_SLICE_NS;
+        se->slice_ns = predicted < base ? predicted : base;
+    }
+    se->burst_exec_us = 0;
 }
 
 void eevfd_place_entity(struct eevfd_rq *rq, struct sched_entity *se, bool initial_spawn) {
@@ -124,6 +142,23 @@ void eevfd_place_entity(struct eevfd_rq *rq, struct sched_entity *se, bool initi
         se->min_deadline = se->deadline;
         se->lag = lag;
     }
+}
+
+/* The running entity is absent from the tree, but still participates in
+ * the runqueue floor. Advancing to a queued neighbour can put virtual time
+ * ahead of the task being dispatched and delay newly awakened requests. */
+static void eevfd_update_min_vruntime(struct eevfd_rq *rq) {
+    struct sched_entity *left = rq->rb_leftmost
+        ? rb_entry(rq->rb_leftmost, struct sched_entity, rb_node) : NULL;
+    if (!rq->curr && !left)
+        return;
+    uint64_t minimum = rq->curr ? rq->curr->vruntime : left->vruntime;
+    if (left && left->vruntime < minimum)
+        minimum = left->vruntime;
+    if (minimum > rq->min_vruntime)
+        rq->min_vruntime = minimum;
+    if (rq->vtime < rq->min_vruntime)
+        rq->vtime = rq->min_vruntime;
 }
 
 __attribute__((optimize("O3"))) void eevfd_enqueue_entity(struct eevfd_rq *rq, struct sched_entity *se) {
@@ -166,10 +201,8 @@ __attribute__((optimize("O3"))) void eevfd_enqueue_entity(struct eevfd_rq *rq, s
 
     if (leftmost) {
         rq->rb_leftmost = &se->rb_node;
-        rq->min_vruntime = se->vruntime;
-        if (rq->vtime < rq->min_vruntime)
-            rq->vtime = rq->min_vruntime;
     }
+    eevfd_update_min_vruntime(rq);
 
     rq->total_weight += se->weight;
     rq->nr_running++;
@@ -197,12 +230,7 @@ __attribute__((optimize("O3"))) void eevfd_dequeue_entity(struct eevfd_rq *rq, s
     se->rb_node.rb_left = NULL;
     se->rb_node.rb_right = NULL;
 
-    if (rq->rb_leftmost) {
-        struct sched_entity *left = rb_entry(rq->rb_leftmost, struct sched_entity, rb_node);
-        rq->min_vruntime = left->vruntime;
-        if (rq->vtime < rq->min_vruntime)
-            rq->vtime = rq->min_vruntime;
-    }
+    eevfd_update_min_vruntime(rq);
 }
 
 __attribute__((optimize("O3"))) void eevfd_update_curr(struct eevfd_rq *rq, uint64_t now_ns) {
@@ -221,6 +249,14 @@ __attribute__((optimize("O3"))) void eevfd_update_curr(struct eevfd_rq *rq, uint
     uint64_t delta_exec_ns = now_ns - curr->exec_start_ns;
     curr->exec_start_ns = now_ns;
     curr->prev_sum_exec_ns += delta_exec_ns;
+    uint64_t burst = curr->burst_exec_us + (delta_exec_ns + 999ULL) / 1000ULL;
+    curr->burst_exec_us = burst > UINT16_MAX ? UINT16_MAX : (uint16_t)burst;
+    /* Stop treating a task as a short-burst sleeper once it becomes CPU
+     * bound. Its next virtual request returns to the normal nice-based size. */
+    if (!curr->custom_slice && !curr->critical_depth &&
+        (uint64_t)curr->burst_exec_us * 4000ULL >=
+            eevfd_calc_slice_for_nice(curr->nice_value))
+        curr->slice_ns = eevfd_calc_slice_for_nice(curr->nice_value);
 
     /* Advance entity virtual runtime */
     uint64_t delta_vr = calc_delta_vruntime(delta_exec_ns, curr->weight, curr->wmult);
@@ -274,6 +310,22 @@ __attribute__((optimize("O3"))) static void __pick_eevfd_candidate(struct rb_nod
     /* If se->vruntime > vtime, right subtree has vruntime > vtime (not eligible), pruned */
 }
 
+/* Inspect the same eligible earliest-deadline candidate as dispatch, without
+ * advancing virtual time when all queued entities are ineligible. */
+struct sched_entity *eevfd_peek_eligible_entity(struct eevfd_rq *rq) {
+    if (!rq || !rq->tasks_tree.rb_node || !rq->rb_leftmost)
+        return NULL;
+    struct sched_entity *left = rb_entry(rq->rb_leftmost, struct sched_entity, rb_node);
+    if (left->vruntime > rq->vtime)
+        return NULL;
+    struct sched_entity *root = rb_entry(rq->tasks_tree.rb_node, struct sched_entity, rb_node);
+    if (left->deadline <= root->min_deadline)
+        return left;
+    struct sched_entity *best = left;
+    __pick_eevfd_candidate(rq->tasks_tree.rb_node, rq->vtime, &best);
+    return best;
+}
+
 __attribute__((optimize("O3"))) struct sched_entity *eevfd_pick_next_entity(struct eevfd_rq *rq) {
     if (!rq || !rq->tasks_tree.rb_node)
         return NULL;
@@ -309,8 +361,9 @@ __attribute__((optimize("O3"))) struct sched_entity *eevfd_pick_next_entity(stru
 void eevfd_set_next_entity(struct eevfd_rq *rq, struct sched_entity *se) {
     if (!rq || !se)
         return;
-    eevfd_dequeue_entity(rq, se);
     rq->curr = se;
+    eevfd_dequeue_entity(rq, se);
+    rq->curr_start_exec_ns = se->prev_sum_exec_ns;
     se->exec_start_ns = 0;
 }
 
@@ -383,11 +436,8 @@ bool eevfd_check_preempt(struct eevfd_rq *rq, struct sched_entity *curr,
 
     /* Enforce minimum execution granularity floor before allowing preemption */
     uint64_t now_ns = lapic_timer_get_ns();
-    if (curr->exec_start_ns && now_ns > curr->exec_start_ns) {
-        uint64_t exec_delta = now_ns - curr->exec_start_ns;
-        if (exec_delta < min_gran)
-            return false;
-    }
+    if (eevfd_curr_runtime(rq, curr, now_ns) < min_gran)
+        return false;
 
     /* For interactive/higher-priority tasks, drop the wakeup granularity barrier */
     uint64_t gran_v = (interactive && woken->deadline <= curr->deadline)

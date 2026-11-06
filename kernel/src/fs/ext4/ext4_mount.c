@@ -50,6 +50,7 @@ int ext4_check_feature_flags(const ext2_superblock_t *sb,
      * the HTree directory format handled by ext4_htree_*. */
     const uint32_t supported_ro_compat =
         EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER |
+        EXT4_FEATURE_RO_COMPAT_LARGE_FILE |
         EXT4_FEATURE_RO_COMPAT_BTREE_DIR;
     uint32_t unknown_ro_compat =
         sb->s_feature_ro_compat & ~supported_ro_compat;

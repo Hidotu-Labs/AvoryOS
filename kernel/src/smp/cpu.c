@@ -86,7 +86,7 @@ static inline uint64_t rdmsr(uint32_t msr) {
  * RDMSR. This is one global fast-path gate, so it is enabled only after AP
  * startup finishes; setting it in cpu_set_gs_base() would let the BSP's flag
  * make a later-starting AP dereference its still-uninitialized GS base. */
-static volatile bool cpu_gs_installed;
+volatile bool cpu_gs_installed = false;
 
 // Set GS base and IA32_TSC_AUX (Linux x86-64 ABI: (node_id << 12) | cpu_id)
 // for the current CPU so user-mode RDTSCP/RDPID and __vdso_getcpu work
@@ -116,15 +116,9 @@ static uint64_t alloc_cpu_stack(void) {
 
 // Public API
 
-/* GS base points at this CPU's cpu_info and cpu_info.self (offset 0) points
- * back at itself, so the current CPU struct is one segment-relative load
- * away.  The old rdmsr(MSR_GS_BASE) is a VM exit under KVM (see the matching
- * note in fs/page_cache.c) and this runs on every syscall via
- * sched_get_current() plus every kmalloc/kfree.  Until cpu_set_gs_base() has
- * installed a self-pointing base we must return the raw MSR value exactly as
- * before - see cpu_gs_installed above. */
-struct cpu_info *cpu_get_current(void) {
-  if (__atomic_load_n(&cpu_gs_installed, __ATOMIC_ACQUIRE)) {
+/* Slow fallback for early boot before cpu_gs_installed is published. */
+struct cpu_info *cpu_get_current_slow(void) {
+  if (cpu_gs_installed) {
     struct cpu_info *info;
     __asm__ volatile("movq %%gs:0, %0" : "=r"(info));
     return info;

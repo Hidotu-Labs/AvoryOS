@@ -29,9 +29,7 @@
 #define KSUBSYS_AUDIO      "DRIVERS/AUDIO"
 #define KSUBSYS_SYSCALL    "SYSCALL"
 
-// Forward declaration
-struct thread;
-struct thread *sched_get_current(void);
+#include "../sched/sched.h"
 
 void ktrack_record(const char *subsys, const char *file, uint32_t line, const char *func, int64_t err);
 

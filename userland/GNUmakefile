@@ -21,6 +21,32 @@ $(GLIBC_STAMP): $(GLIBC_TOOLCHAIN_STAMP)
 .PHONY: all gpu-diagnostics
 all: avory-login.elf avory-installer.elf hello_glibc.elf booter.elf reboot.elf shutdown.elf kilo.elf ls.elf lspci.elf lsblk.elf readelf.elf pong.elf raycast.elf asplay.elf dns_lookup.elf kria.elf drm_identify.elf
 
+# Pinned UnixBench components plus native RAM/startup/metadata workloads.
+BENCH_SRC := benchmarks/unixbench
+
+avory_bench.elf: avory_bench.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) $< -o $@
+
+DESKTOP_BENCH_SRC := benchmarks/desktop.c benchmarks/desktop_storage.c benchmarks/desktop_apps.c benchmarks/desktop_graphics.c
+bench_desktop.elf: $(DESKTOP_BENCH_SRC) benchmarks/desktop.h $(GLIBC_STAMP) GNUmakefile
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -I$(GLIBC_SYSROOT)/usr/include/freetype2 $(DESKTOP_BENCH_SRC) -ldl -o $@
+
+# Optional real Win32 workload for Wine/other compatibility runners.
+bench_compat.exe: benchmarks/compat_workload.c
+	x86_64-w64-mingw32-gcc -O2 -Wall -Wextra $< -o $@
+
+bench_cpu.elf: $(BENCH_SRC)/dhry_1.c $(BENCH_SRC)/dhry_2.c $(BENCH_SRC)/dhry.h $(BENCH_SRC)/timeit.c benchmarks/metrics.c $(GLIBC_STAMP) GNUmakefile
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -std=gnu89 -DTIME -DHZ=100 -fno-lto $(BENCH_SRC)/dhry_1.c $(BENCH_SRC)/dhry_2.c benchmarks/metrics.c -o $@
+
+bench_iterations.elf: $(BENCH_SRC)/hanoi.c $(BENCH_SRC)/timeit.c benchmarks/metrics.c $(GLIBC_STAMP) GNUmakefile
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -std=gnu89 -fno-lto $< benchmarks/metrics.c -o $@
+
+bench_fork.elf: $(BENCH_SRC)/spawn.c $(BENCH_SRC)/timeit.c benchmarks/metrics.c $(GLIBC_STAMP) GNUmakefile
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -std=gnu89 $< benchmarks/metrics.c -o $@
+
+bench_vfs.elf: $(BENCH_SRC)/fstime.c benchmarks/metrics.c $(GLIBC_STAMP) GNUmakefile
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -std=gnu89 $< benchmarks/metrics.c -o $@
+
 avory-login.elf: avory-login.c $(GLIBC_STAMP)
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		avory-login.c -lcrypt -o avory-login.elf
@@ -285,8 +311,6 @@ gpu-diagnostics: test_gpu_corruption.elf test_gpu_depth.elf test_gpu_constants.e
 	install -m 0755 test_gpu_pipeline.elf $(ROOT_DIR)/build/gpu-diagnostics/test_gpu_pipeline
 	install -m 0755 test_gpu_pipeline_gl.elf $(ROOT_DIR)/build/gpu-diagnostics/test_gpu_pipeline_gl
 	install -m 0755 radeonsi_vram_leak.elf $(ROOT_DIR)/build/gpu-diagnostics/radeonsi_vram_leak.elf
-	install -m 0755 $(ROOT_DIR)/scripts/gpu-debug-capture.sh $(ROOT_DIR)/build/gpu-diagnostics/gpu-debug-capture
-	install -m 0755 $(ROOT_DIR)/scripts/gpu-first-boot-capture.sh $(ROOT_DIR)/build/gpu-diagnostics/gpu-first-boot-capture.sh
 	@echo 'Diagnostics ready. Serve to the QEMU guest with:'
 	@echo 'python3 -m http.server 9007 --bind 127.0.0.1 --directory $(ROOT_DIR)/build/gpu-diagnostics'
 

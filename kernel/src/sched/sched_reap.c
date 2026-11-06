@@ -6,6 +6,7 @@
 #include "seccomp.h"
 #include "pid_namespace.h"
 #include "net_namespace.h"
+#include "user_namespace.h"
 #include "../fs/mount_namespace.h"
 #include "../lib/string.h"
 #include "wait.h"
@@ -149,6 +150,19 @@ bool sched_reap_thread(struct thread *t) {
     return false;
   }
 
+  /* Keep process clocks monotonic when a joined thread leaves the list.
+   * Transfer to any remaining member, since the leader can exit first. */
+  for (struct thread *member = global_thread_list; member;
+       member = member->global_next) {
+    if (member != t && (member->tgid ? member->tgid : member->tid) == reap_tgid) {
+      member->reaped_user_ms += t->reaped_user_ms +
+          __atomic_load_n(&t->runtime_user_ms, __ATOMIC_RELAXED);
+      member->reaped_system_ms += t->reaped_system_ms +
+          __atomic_load_n(&t->runtime_system_ms, __ATOMIC_RELAXED);
+      break;
+    }
+  }
+
   // 1.5 Remove from global thread list in O(1)
   if (t->global_prev) {
     t->global_prev->global_next = t->global_next;
@@ -242,6 +256,7 @@ bool sched_reap_thread(struct thread *t) {
   ipc_namespace_release(t);
   pid_namespace_release(t);
   net_namespace_release(t);
+  user_namespace_release(t);
   vfs_namespace_release(t);
   seccomp_release_task(t);
   if (t->cwd_node) {

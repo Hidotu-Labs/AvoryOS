@@ -159,8 +159,23 @@ void sched_arm_next_deadline(struct cpu_info *cpu,
   uint64_t now = lapic_timer_get_ms();
   uint64_t deadline = 0;
   if (next_t && !next_t->is_idle) {
-    /* Ceiling division: round up to avoid firing late */
-    uint64_t slice_ms = (next_t->se.slice_ns + 999999ULL) / 1000000ULL;
+    uint64_t remaining_ns = next_t->se.slice_ns;
+    if (cpu->eevfd.nr_running) {
+      uint64_t used = eevfd_curr_runtime(&cpu->eevfd, &next_t->se,
+                                         lapic_timer_get_ns());
+      remaining_ns = used < remaining_ns ? remaining_ns - used : 1;
+      /* A preempted task can resume a partly consumed virtual request. Do
+       * not grant a fresh request just because it was dispatched again. */
+      uint64_t virtual_left = next_t->se.deadline > next_t->se.vruntime
+                                  ? next_t->se.deadline - next_t->se.vruntime : 0;
+      uint64_t request_left = (uint64_t)(((__uint128_t)virtual_left *
+                                         next_t->se.weight) / EEVFD_NICE_0_WEIGHT);
+      if (request_left < remaining_ns)
+        remaining_ns = request_left ? request_left : 1;
+    }
+    /* Re-arm the remaining budget, not another full slice on every timer
+     * interrupt. Keep the existing millisecond timer resolution. */
+    uint64_t slice_ms = (remaining_ns + 999999ULL) / 1000000ULL;
     if (slice_ms < 1) slice_ms = 1;
     cpu->quantum_deadline_ms = now + slice_ms;
     deadline = cpu->quantum_deadline_ms;
@@ -588,17 +603,31 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
   /* Fast-path: single runnable task on this core. Zero tree overhead.
    * Only applicable on non-voluntary preemption/ticks. */
   if (!voluntary_yield && prev->state == THREAD_RUNNING && !prev->is_idle && cpu->eevfd.nr_running == 0) {
-    eevfd_update_curr(&cpu->eevfd, now_ns);
-    prev->runtime_total = prev->se.prev_sum_exec_ns / 1000000ULL;
-    sched_arm_next_deadline(cpu, prev);
+    /* This core runs one CPU-bound thread and has nothing queued, so the
+     * idle steal further down is never reached. Tasks queued behind a busy
+     * neighbour then wait for that neighbour's slice on every tick. Pull one
+     * from the busiest core here; if something arrived, fall through and
+     * dispatch it instead of keeping prev. */
     spinlock_release(&cpu->queue_lock);
-    hal_irq_restore(irq_flags);
-    return;
+    sched_steal_one_task(cpu);
+    spinlock_acquire(&cpu->queue_lock);
+    if (cpu->eevfd.nr_running == 0) {
+      eevfd_update_curr(&cpu->eevfd, now_ns);
+      prev->runtime_total = prev->se.prev_sum_exec_ns / 1000000ULL;
+      sched_arm_next_deadline(cpu, prev);
+      spinlock_release(&cpu->queue_lock);
+      hal_irq_restore(irq_flags);
+      return;
+    }
+    now = lapic_timer_get_ms();
+    now_ns = lapic_timer_get_ns();
   }
 
   if (!prev->is_idle) {
     eevfd_update_curr(&cpu->eevfd, now_ns);
     prev->runtime_total = prev->se.prev_sum_exec_ns / 1000000ULL;
+    if (prev->state == THREAD_BLOCKED || prev->state == THREAD_SLEEPING)
+      eevfd_note_sleep(&prev->se);
     eevfd_put_prev_entity(&cpu->eevfd, &prev->se);
   }
 
@@ -782,26 +811,48 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
         __asm__ volatile("mov %%fs, %0" : "=rm"(prev->compat_fs));
         __asm__ volatile("mov %%gs, %0" : "=rm"(prev->compat_gs));
       }
-      prev->fs_base = rdmsr(0xC0000100);
+      if (cpu_has_fsgsbase_fast()) {
+        prev->fs_base = rdfsbase();
+      } else {
+        prev->fs_base = rdmsr(0xC0000100);
+      }
       prev->gs_base = rdmsr(0xC0000102);
     }
-    gdt_set_compat_tls(next_t->compat_tls);
-    /* Loading GS changes its base. Preserve the kernel per-CPU base until
-     * the interrupt/syscall return swaps in the incoming user base. */
-    uint64_t kernel_gs = rdmsr(0xC0000101);
-    uint16_t fs = next_t->compat_fs, gs = next_t->compat_gs;
-    __asm__ volatile("mov %0, %%fs; mov %1, %%gs" :: "rm"(fs), "rm"(gs) : "memory");
-    wrmsr(0xC0000101, kernel_gs);
+
+    /* Only update GDT TLS descriptors if either outgoing or incoming thread
+     * has active compat descriptors. Normal 64-bit processes have all zeroes. */
+    if ((prev && (prev->compat_tls[0] || prev->compat_tls[1] || prev->compat_tls[2])) ||
+        next_t->compat_tls[0] || next_t->compat_tls[1] || next_t->compat_tls[2]) {
+      gdt_set_compat_tls(next_t->compat_tls);
+    }
+
+    /* Reloading %fs/%gs selectors resets active GS base to 0, requiring slow
+     * rdmsr/wrmsr of IA32_GS_BASE (0xC0000101). Pure 64-bit threads keep both
+     * selectors at 0, so only reload when switching to/from 32-bit compat selectors. */
+    if ((prev && (prev->compat_fs != 0 || prev->compat_gs != 0)) ||
+        next_t->compat_fs != 0 || next_t->compat_gs != 0) {
+      uint64_t kernel_gs = rdmsr(0xC0000101);
+      uint16_t fs = next_t->compat_fs, gs = next_t->compat_gs;
+      __asm__ volatile("mov %0, %%fs; mov %1, %%gs" :: "rm"(fs), "rm"(gs) : "memory");
+      wrmsr(0xC0000101, kernel_gs);
+    }
+
     /* Set TLS base for the incoming thread with hardware FSGSBASE fast-path.
-     * Always write on switch because a migrated thread's fs_base/gs_base may
-     * differ from what this CPU last loaded even if prev had the same value
-     * on another core. */
-    if (cpu_has_fsgsbase()) {
+     * Always write on switch because a migrated thread's fs_base may differ
+     * from what this CPU last loaded. */
+    if (cpu_has_fsgsbase_fast()) {
       wrfsbase(next_t->fs_base);
     } else {
       wrmsr(0xC0000100, next_t->fs_base);
     }
-    wrmsr(0xC0000102, next_t->gs_base);
+
+    /* IA32_KERNEL_GS_BASE (0xC0000102) holds user GS base while in ring 0.
+     * Since prev->gs_base was just read from this CPU's MSR above, if next_t
+     * has the exact same gs_base (0 for 99.9% of processes), writing it again
+     * is redundant and costs ~150-250 cycles. Only write when it changes. */
+    if (!prev || !prev->mm || next_t->gs_base != prev->gs_base) {
+      wrmsr(0xC0000102, next_t->gs_base);
+    }
 
     spinlock_release(&cpu->queue_lock);
     switch_context(prev, next_t);
@@ -1018,14 +1069,14 @@ __attribute__((optimize("O3"))) void sched_tick(struct registers *regs) {
     if (curr->is_idle && cpu->eevfd.nr_running > 0) {
       preempt = true;
     } else if (!curr->is_idle && cpu->eevfd.nr_running > 0) {
-      uint64_t exec_delta = (curr->se.exec_start_ns && now_ns > curr->se.exec_start_ns)
-                                ? (now_ns - curr->se.exec_start_ns)
-                                : 0;
+      uint64_t exec_delta = eevfd_curr_runtime(&cpu->eevfd, &curr->se, now_ns);
       if (curr->se.vruntime >= curr->se.deadline || exec_delta >= curr->se.slice_ns) {
         preempt = true;
-      } else if (exec_delta >= EEVFD_MIN_GRANULARITY_NS && cpu->eevfd.rb_leftmost) {
-        struct sched_entity *left = rb_entry(cpu->eevfd.rb_leftmost, struct sched_entity, rb_node);
-        if (left && eevfd_check_preempt(&cpu->eevfd, &curr->se, left)) {
+      } else if (exec_delta >= EEVFD_INTERACTIVE_MIN_GRANULARITY_NS) {
+        /* Tree order is virtual runtime, not deadline order. A short request
+         * may sit behind a CPU-bound entity and still deserve preemption. */
+        struct sched_entity *candidate = eevfd_peek_eligible_entity(&cpu->eevfd);
+        if (candidate && eevfd_check_preempt(&cpu->eevfd, &curr->se, candidate)) {
           preempt = true;
         }
       }
@@ -1051,12 +1102,6 @@ __attribute__((optimize("O3"))) void sched_tick(struct registers *regs) {
   }
 }
 
-struct thread *sched_get_current(void) {
-  struct cpu_info *cpu = cpu_get_current();
-  if (!cpu)
-    return NULL;
-  return cpu->current_thread;
-}
 
 bool sched_validate_runqueues(struct cpu_info *cpu) {
   if (!cpu) return false;

@@ -20,12 +20,13 @@ struct sched_entity {
     uint32_t weight;              /* Nice weight from prio_to_weight */
     uint32_t wmult;               /* Inverse multiplier from prio_to_wmult */
     int64_t  lag;                 /* Virtual lag: V_rq - vruntime */
-    uint64_t exec_start_ns;       /* Start timestamp of current CPU run */
+    uint64_t exec_start_ns;       /* Timestamp of last runtime-accounting update */
     uint64_t prev_sum_exec_ns;    /* Total execution time in nanoseconds */
     int8_t   nice_value;          /* Nice value [-20, 19] */
     bool     on_rq;               /* True if entity is currently in runqueue tree */
     bool     custom_slice;        /* True if userland/thread requested custom slice */
     uint16_t critical_depth;     /* Nested kernel priority-ceiling scopes. */
+    uint16_t burst_exec_us;      /* Saturating CPU time since the last blocking sleep; uses existing padding */
 };
 
 typedef struct sched_entity sched_entity_t;
@@ -41,15 +42,33 @@ struct eevfd_rq {
     uint32_t nr_running;          /* Number of runnable entities */
     uint64_t min_vruntime;        /* Minimum vruntime across all runnable entities */
     struct sched_entity *curr;    /* Currently running entity on this CPU */
+    uint64_t curr_start_exec_ns;  /* Cumulative runtime at dispatch; accounting must not reset it */
 };
 
 typedef struct eevfd_rq eevfd_rq_t;
+
+/* Runtime in this uninterrupted dispatch, including the not-yet-accounted
+ * tail. exec_start_ns alone measures time since the last accounting update,
+ * so using it for a preemption floor makes every timer tick look like a new
+ * dispatch. Keep this separate from virtual deadline/request accounting. */
+static inline uint64_t eevfd_curr_runtime(const struct eevfd_rq *rq,
+                                         const struct sched_entity *se,
+                                         uint64_t now_ns) {
+    if (!rq || rq->curr != se)
+        return 0;
+    uint64_t used = se->prev_sum_exec_ns >= rq->curr_start_exec_ns
+                        ? se->prev_sum_exec_ns - rq->curr_start_exec_ns : 0;
+    if (se->exec_start_ns && now_ns > se->exec_start_ns)
+        used += now_ns - se->exec_start_ns;
+    return used;
+}
 
 /* Runqueue and Entity Management API */
 void eevfd_rq_init(struct eevfd_rq *rq);
 void eevfd_entity_init(struct sched_entity *se, int nice, uint64_t slice_ns);
 void eevfd_set_nice(struct sched_entity *se, int nice);
 void eevfd_set_slice(struct sched_entity *se, uint64_t slice_ns);
+void eevfd_note_sleep(struct sched_entity *se);
 
 /* Enqueue / Dequeue */
 void eevfd_place_entity(struct eevfd_rq *rq, struct sched_entity *se, bool initial_spawn);
@@ -58,6 +77,7 @@ void eevfd_dequeue_entity(struct eevfd_rq *rq, struct sched_entity *se);
 
 /* Execution accounting & context switching */
 void eevfd_update_curr(struct eevfd_rq *rq, uint64_t now_ns);
+struct sched_entity *eevfd_peek_eligible_entity(struct eevfd_rq *rq);
 struct sched_entity *eevfd_pick_next_entity(struct eevfd_rq *rq);
 void eevfd_set_next_entity(struct eevfd_rq *rq, struct sched_entity *se);
 void eevfd_put_prev_entity(struct eevfd_rq *rq, struct sched_entity *se);

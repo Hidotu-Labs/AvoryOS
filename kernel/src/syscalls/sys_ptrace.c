@@ -280,6 +280,7 @@ static int ptrace_stop_frame(struct registers *regs,
 void ptrace_syscall_enter(struct thread *task, struct syscall_regs *regs) {
   if (!task || !regs || !task->tracer_tid || !task->ptrace_syscall_trace)
     return;
+  task->restore_callee_regs = 1;
   syscall_info_entry(task, regs);
   task->ptrace_syscall_entry_stop = true;
   (void)ptrace_stop_frame(NULL, regs, SIGTRAP_NUM, 0, false, NULL);
@@ -289,6 +290,7 @@ void ptrace_syscall_enter(struct thread *task, struct syscall_regs *regs) {
 void ptrace_syscall_exit(struct thread *task, struct syscall_regs *regs) {
   if (!task || !regs || !task->tracer_tid || !task->ptrace_syscall_trace)
     return;
+  task->restore_callee_regs = 1;
   syscall_info_exit(task, regs);
   task->ptrace_syscall_exit_stop = true;
   (void)ptrace_stop_frame(NULL, regs, SIGTRAP_NUM, 0, false, NULL);

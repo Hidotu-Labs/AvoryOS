@@ -43,8 +43,9 @@ syscall_entry:
     push rsi
     push rdi
 
-    mov rbp, rsp
-    and rsp, -16
+    ; Stack is already 16-byte aligned: 20 quadwords (160 bytes) pushed from 16-byte aligned stack_top.
+    ; Pass struct syscall_regs * in rdi.
+    mov rdi, rsp
 
     ; IA32_FMASK masked IF on SYSCALL entry, so the swapgs + stack-switch
     ; window above cannot be interrupted.  The kernel GS and stack are in
@@ -63,7 +64,6 @@ syscall_entry:
     stac
 .stac_done:
 
-    mov rdi, rbp
     call syscall_dispatcher
 
     ; Close the window before returning to user mode.  The user's own AC
@@ -87,11 +87,10 @@ syscall_entry:
     test rax, rax
     jnz .sigreturn_iret
 
-    cmp qword [rbp + 128], 0x1b
+    cmp qword [rsp + 128], 0x1b
     je .compat_iret
 
-    mov rsp, rbp
-
+    ; Pop scratch registers (and return value in rax)
     pop rdi
     pop rsi
     pop rdx
@@ -99,6 +98,26 @@ syscall_entry:
     pop r8
     pop r9
     pop rax
+
+    ; Callee-Saved Register Pruning:
+    ; By System V AMD64 ABI, rbx, rbp, r12-r15 are callee-saved across C functions.
+    ; Unless explicitly modified (restore_callee_regs set by execve, ptrace or signal),
+    ; hardware registers already hold their exact userspace values.
+    ; Skipping these 6 pops avoids 48 bytes of memory reads on every normal syscall return.
+    ; R10 holds the user's arg4 here and must not be used as scratch; R11 is
+    ; reloaded from the frame at .sysret_exit, so it is free to clobber.
+    mov r11, gs:[48]           ; current_thread
+    test r11, r11
+    jz .pop_callee_saved
+    cmp dword [r11 + 48], 0    ; restore_callee_regs
+    jne .pop_callee_saved_clear
+
+    add rsp, 48                ; Skip popping rbx..r15!
+    jmp .sysret_exit
+
+.pop_callee_saved_clear:
+    mov dword [r11 + 48], 0    ; One-shot clear
+.pop_callee_saved:
     pop rbx
     pop rbp
     pop r12
@@ -106,6 +125,7 @@ syscall_entry:
     pop r14
     pop r15
 
+.sysret_exit:
     pop rcx ; User RIP
     pop r11 ; User RFLAGS
     pop rsp ; User RSP
@@ -118,7 +138,7 @@ syscall_entry:
     o64 sysret
 
 .compat_iret:
-    mov rdi, rbp
+    mov rdi, rsp
     jmp fork_return_to_userspace
 
 .sigreturn_iret:

@@ -12,7 +12,12 @@
 #include <stdint.h>
 
 static void reclaim_unmapped_file_cache(struct vma *v) {
-  if (!v)
+  /* Keep clean, reclaimable executable/library pages warm across exit and
+   * exec. Unconditionally dropping them here makes every new process read
+   * the same private-data source pages from storage again. Under the same
+   * 8 MiB headroom used by the demand-fault pressure hook, retain the old
+   * eager cleanup; global cache reclaim can also evict these pages at need. */
+  if (!v || pmm_get_free_pages() >= 2048u)
     return;
   reclaim_unmapped_file_cache(v->left);
   reclaim_unmapped_file_cache(v->right);
@@ -214,9 +219,9 @@ void vmm_free_user_pages_vma(uint64_t cr3, struct vma_list *vmas) {
     pmm_free_page((void *)pdpt_phys);
   }
 
-  /* PTE teardown above dropped this process's references to file-backed
-   * pages. Return cache pages that now have no mappings to the PMM; cache
-   * pages still mapped by another process retain their extra references. */
+  /* Drop unused file-cache pages eagerly only under memory pressure. The
+   * process's PTE references were already released above; the surviving
+   * cache references remain reachable and reclaimable through the VFS. */
   reclaim_unmapped_file_cache(vmas->root);
   pmm_free_page((void *)cr3);
 }

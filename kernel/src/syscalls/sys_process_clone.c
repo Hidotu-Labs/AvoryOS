@@ -23,6 +23,7 @@
 #include "../sched/pid_namespace.h"
 #include "../sched/seccomp.h"
 #include "../sched/net_namespace.h"
+#include "../sched/user_namespace.h"
 #include "../fs/mount_namespace.h"
 #include "../sched/wait.h"
 #include "../smp/cpu.h"
@@ -378,6 +379,7 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   seccomp_inherit(child, parent);
   fpu_copy_thread(child, parent);
   ptrace_fork_event(regs, child, child_tid, SIGCHLD);
+  thread_update_fastpath_state(child);
   sched_enqueue_thread(child, NULL);
 
   // 9. Return child PID to parent
@@ -408,13 +410,22 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     return (uint64_t)-22;
   /* Reject combined sandbox requests until every requested namespace exists.
    * In particular, accepting NEWNS with a global mount table is not safe. */
-  if (flags & (CLONE_NEWCGROUP | CLONE_NEWUSER | CLONE_NEWTIME))
+  /* CLONE_NEWCGROUP is a no-op here; see sys_unshare. */
+  if (flags & CLONE_NEWTIME)
     return (uint64_t)-1; // EPERM
   if ((flags & CLONE_NEWIPC) && (flags & CLONE_SYSVSEM)) return (uint64_t)-22;
   if ((flags & CLONE_NEWPID) && (flags & (CLONE_THREAD | CLONE_PARENT))) return (uint64_t)-22;
   if ((flags & CLONE_NEWNS) && (flags & CLONE_FS)) return (uint64_t)-22;
+  /* The child's new user namespace grants it the capabilities for namespaces
+   * it creates, so the check only applies without CLONE_NEWUSER. */
+  struct user_namespace *new_user __attribute__((cleanup(user_namespace_cleanup))) = NULL;
+  if (flags & CLONE_NEWUSER) {
+    if (flags & (CLONE_THREAD | CLONE_FS)) return (uint64_t)-22;
+    new_user = user_namespace_create(parent->user_ns);
+    if (!new_user) return (uint64_t)-28; /* ENOSPC: nesting limit */
+  }
   if ((flags & (CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET)) &&
-      !capability_has(parent, CAP_SYS_ADMIN))
+      !new_user && !capability_ns_has(parent, CAP_SYS_ADMIN))
     return (uint64_t)-1;
   struct uts_namespace *new_uts
       __attribute__((cleanup(uts_namespace_cleanup))) = NULL;
@@ -692,9 +703,19 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     __atomic_store_n(&parent->vfork_done, false, __ATOMIC_RELEASE);
   }
   capability_inherit(child, parent);
+  if (new_user) {
+    user_namespace_install(child, new_user);
+    new_user = NULL;
+    capability_enter_user_ns(child);
+  }
+  if (flags & CLONE_NEWNS) user_namespace_mark_owned(child, NS_OWN_MNT);
+  if (flags & CLONE_NEWUTS) user_namespace_mark_owned(child, NS_OWN_UTS);
+  if (flags & CLONE_NEWIPC) user_namespace_mark_owned(child, NS_OWN_IPC);
+  if (flags & CLONE_NEWNET) user_namespace_mark_owned(child, NS_OWN_NET);
   seccomp_inherit(child, parent);
   fpu_copy_thread(child, parent);
   ptrace_fork_event(regs, child, visible_child_tid, flags);
+  thread_update_fastpath_state(child);
   sched_enqueue_thread(child, target_cpu);
 
   if (vfork) {
@@ -827,6 +848,7 @@ uint64_t sys_vfork(struct syscall_regs *regs) {
   seccomp_inherit(child, parent);
   fpu_copy_thread(child, parent);
   ptrace_fork_event(regs, child, visible_child_tid, child->clone_flags);
+  thread_update_fastpath_state(child);
   sched_enqueue_thread(child, NULL);
 
   vfork_wait_for_child(parent);

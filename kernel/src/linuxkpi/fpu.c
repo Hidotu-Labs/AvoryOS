@@ -23,7 +23,14 @@ static hal_irq_state_t fpu_irq_flags[MAX_CPUS];
 static bool fpu_section_active[MAX_CPUS];
 
 static inline void fpu_save_state(void *area) {
-  if (cpu_has_xsave_flag) {
+  if (cpu_has_xsaveopt_fast()) {
+    uint64_t mask = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE);
+    __asm__ volatile("xsaveopt64 (%0)"
+                     :
+                     : "r"(area), "a"((uint32_t)mask),
+                       "d"((uint32_t)(mask >> 32))
+                     : "memory");
+  } else if (cpu_has_xsave_flag) {
     uint64_t mask = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE);
     __asm__ volatile("xsave64 (%0)"
                      :

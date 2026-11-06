@@ -493,6 +493,57 @@ bool vmm_map_page_locked(uint64_t *pml4, uint64_t virtual_addr,
   return ok;
 }
 
+bool vmm_map_fresh_pages_locked(uint64_t *pml4, uint64_t virtual_addr,
+                                void **frames, size_t count, uint64_t flags) {
+  if (!count || count > 64 || (virtual_addr & (PAGE_SIZE - 1)) ||
+      virtual_addr > USER_SPACE_LIMIT ||
+      count - 1 > (USER_SPACE_LIMIT - virtual_addr) / PAGE_SIZE)
+    return false;
+
+  uint64_t *root = (uint64_t *)PHYS_TO_VIRT((uint64_t)pml4 & PAGE_MASK);
+  uint64_t propagate = flags & (PAGE_FLAG_USER | PAGE_FLAG_RW);
+  bool handled = false;
+  size_t i = 0;
+  while (i < count) {
+    uint64_t va = virtual_addr + i * PAGE_SIZE;
+    size_t l4 = (va >> 39) & 511, l3 = (va >> 30) & 511;
+    size_t l2 = (va >> 21) & 511, l1 = (va >> 12) & 511;
+    uint64_t *pdpt = get_next_level(root, l4, true, 4);
+    if (!pdpt) break;
+    root[l4] |= propagate;
+    /* An existing huge mapping belongs to its current owner. In particular,
+     * do not split it merely to install speculative neighbours. */
+    if ((pdpt[l3] & (PAGE_FLAG_PRESENT | PAGE_FLAG_PS)) ==
+        (PAGE_FLAG_PRESENT | PAGE_FLAG_PS))
+      return handled || i == 0;
+    uint64_t *pd = get_next_level(pdpt, l3, true, 3);
+    if (!pd) break;
+    pdpt[l3] |= propagate;
+    if ((pd[l2] & (PAGE_FLAG_PRESENT | PAGE_FLAG_PS)) ==
+        (PAGE_FLAG_PRESENT | PAGE_FLAG_PS))
+      return handled || i == 0;
+    uint64_t *pt = get_next_level(pd, l2, true, 2);
+    if (!pt) break;
+    pd[l2] |= propagate;
+
+    size_t span = 512 - l1;
+    if (span > count - i) span = count - i;
+    for (size_t j = 0; j < span; j++, i++) {
+      /* Only an all-zero slot is fresh: non-present swap entries, shared
+       * zero pages and resident CoW pages must all survive this operation. */
+      if (!pt[l1 + j]) {
+        pt[l1 + j] = ((uint64_t)frames[i] & PAGE_MASK) |
+                       flags | PAGE_FLAG_PRESENT;
+        frames[i] = NULL;
+      }
+      if (!i) handled = true;
+    }
+  }
+  /* Only previously empty PTEs changed. No old translation was replaced,
+   * so no local invalidation or remote shootdown is needed. */
+  return handled;
+}
+
 bool vmm_map_page_if_unmapped(uint64_t *pml4, uint64_t virtual_addr,
                              uint64_t physical_addr, uint64_t flags) {
   vmm_lock_acquire_for(pml4, virtual_addr);

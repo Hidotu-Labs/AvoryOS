@@ -8,7 +8,6 @@ struct thread;
 #define CAP_DAC_READ_SEARCH 2
 #define CAP_FOWNER 3
 #define CAP_KILL 5
-#define CAP_KILL 5
 #define CAP_SETGID 6
 #define CAP_SETUID 7
 #define CAP_SETPCAP 8
@@ -22,6 +21,8 @@ struct thread;
 #define CAP_LAST_CAP 40
 #define CAP_VALID_MASK ((1ULL << 41) - 1)
 bool capability_has(struct thread *, unsigned);
+bool capability_ns_has(struct thread *, unsigned);
+void capability_enter_user_ns(struct thread *);
 void capability_inherit(struct thread *, struct thread *);
 void capability_uid_changed(struct thread *, uint32_t, uint32_t, uint32_t);
 void capability_exec(struct thread *, uint32_t);

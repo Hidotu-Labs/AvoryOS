@@ -1179,8 +1179,8 @@ static uint64_t sys_futex(uint64_t uaddr_val, uint64_t op_val, uint64_t val_arg,
 
   case FUTEX_WAKE: {
     uint64_t woken = futex_wake(uaddr, val, private);
-    if (woken == 0) {
-      woken = futex_wake(uaddr, val, !private);
+    if (woken == 0 && !private) {
+      woken = futex_wake(uaddr, val, true);
     }
     return woken;
   }
@@ -1189,8 +1189,8 @@ static uint64_t sys_futex(uint64_t uaddr_val, uint64_t op_val, uint64_t val_arg,
     if (val3 == 0)
       return (uint64_t)(-(int64_t)EINVAL);
     uint64_t woken = futex_wake_bitset(uaddr, val, (uint32_t)val3, private);
-    if (woken == 0) {
-      woken = futex_wake_bitset(uaddr, val, (uint32_t)val3, !private);
+    if (woken == 0 && !private) {
+      woken = futex_wake_bitset(uaddr, val, (uint32_t)val3, true);
     }
     return woken;
   }

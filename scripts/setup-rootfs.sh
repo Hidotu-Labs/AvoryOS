@@ -206,4 +206,20 @@ install -D -m 0644 "${ROOT_DIR}/config/sddm/10-theme.conf" \
 # Weston needs an explicit production display rather than VKMS heuristics.
 install -m 0755 "${ROOT_DIR}/config/weston/avory-weston-session.sh" "${ROOTFS_DIR}/usr/bin/avory-weston-session"
 install -m 0644 "${ROOT_DIR}/config/weston/weston.desktop" "${ROOTFS_DIR}/usr/share/wayland-sessions/weston.desktop"
+
+# Restore bubblewrap if an older incremental rootfs has the Glycin shim.
+if [ -f "${ROOTFS_DIR}/usr/lib/avory-bwrap/bwrap" ]; then
+    mv -f "${ROOTFS_DIR}/usr/lib/avory-bwrap/bwrap" "${ROOTFS_DIR}/usr/bin/bwrap"
+    rmdir "${ROOTFS_DIR}/usr/lib/avory-bwrap" 2>/dev/null || true
+fi
+
+# Non-root bubblewrap cannot yet write a child's user namespace UID map on
+# AvoryOS. Glycin needs its explicit fallback until those mappings work.
+# This disables isolation for Glycin image loaders in login sessions.
+ENVIRONMENT_FILE="${ROOTFS_DIR}/etc/environment"
+mkdir -p "$(dirname "${ENVIRONMENT_FILE}")"
+touch "${ENVIRONMENT_FILE}"
+if ! grep -q '^GLYCIN_DISABLE_SANDBOX=' "${ENVIRONMENT_FILE}"; then
+    printf '\nGLYCIN_DISABLE_SANDBOX=i-know-the-risks\n' >> "${ENVIRONMENT_FILE}"
+fi
 bash "${ROOT_DIR}/scripts/configure-pacman.sh" "${ROOTFS_DIR}"

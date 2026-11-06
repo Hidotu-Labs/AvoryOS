@@ -24,6 +24,7 @@
 #include "../sched/pid_namespace.h"
 #include "../sched/seccomp.h"
 #include "../sched/net_namespace.h"
+#include "../sched/user_namespace.h"
 #include "../fs/mount_namespace.h"
 #include "../sched/wait.h"
 #include "../smp/cpu.h"
@@ -801,6 +802,7 @@ static uint64_t sys_setuid(struct syscall_regs *regs) {
     return (uint64_t)-1;
   }
   capability_uid_changed(t, old_uid, old_euid, old_suid);
+  thread_update_fastpath_state(t);
   return 0;
 }
 
@@ -817,6 +819,7 @@ static uint64_t sys_setgid(struct syscall_regs *regs) {
   } else {
     return (uint64_t)-1;
   }
+  thread_update_fastpath_state(t);
   return 0;
 }
 
@@ -847,6 +850,7 @@ static uint64_t sys_setreuid(struct syscall_regs *regs) {
   }
   t->fsuid = t->euid;
   capability_uid_changed(t, old_uid, old_euid, old_suid);
+  thread_update_fastpath_state(t);
   return 0;
 }
 
@@ -875,6 +879,7 @@ static uint64_t sys_setregid(struct syscall_regs *regs) {
     t->sgid = t->egid;
   }
   t->fsgid = t->egid;
+  thread_update_fastpath_state(t);
   return 0;
 }
 
@@ -1342,11 +1347,15 @@ static uint64_t sys_getrusage(uint64_t who, uint64_t usage_ptr, uint64_t a2,
     return (uint64_t)-22;
 
   if (who_int == RUSAGE_SELF || who_int == RUSAGE_THREAD) {
-    // runtime_total is in LAPIC ticks (1 tick ≈ 1ms)
-    // Report as user time (we don't separately track user vs kernel time)
-    uint64_t total_ms = t->runtime_total;
-    ru->ru_utime.tv_sec = (int64_t)(total_ms / 1000);
-    ru->ru_utime.tv_usec = (int64_t)((total_ms % 1000) * 1000);
+    uint64_t user_ms, system_ms;
+    bool group = who_int == RUSAGE_SELF;
+    uint32_t id = group ? (t->tgid ? t->tgid : t->tid) : t->tid;
+    if (!sched_get_cpu_usage_ms(id, group, &user_ms, &system_ms))
+      return (uint64_t)-22;
+    ru->ru_utime.tv_sec = (int64_t)(user_ms / 1000);
+    ru->ru_utime.tv_usec = (int64_t)((user_ms % 1000) * 1000);
+    ru->ru_stime.tv_sec = (int64_t)(system_ms / 1000);
+    ru->ru_stime.tv_usec = (int64_t)((system_ms % 1000) * 1000);
 
     // Report resident memory if mm is available
     if (t->mm) {
@@ -1764,9 +1773,8 @@ static uint64_t sys_sched_rr_get_interval(uint64_t pid, uint64_t tp_ptr,
 
 // sys_times (syscall 100)
 // Fills struct tms { utime, stime, cutime, cstime } in clock ticks
-// (USER_HZ = 100) and returns elapsed ticks since boot.  User vs system time
-// is not tracked separately (getrusage reports the same total as utime) and
-// child times are not accumulated (RUSAGE_CHILDREN is zeroed there too).
+// (USER_HZ = 100) and returns elapsed ticks since boot. Child times are not
+// accumulated yet (RUSAGE_CHILDREN is zeroed in getrusage too).
 static uint64_t sys_times(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5) {
   (void)a1;
@@ -1783,8 +1791,12 @@ static uint64_t sys_times(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
     if (!vmm_is_user_addr_range_writable(buf_ptr, 4 * sizeof(long)))
       return (uint64_t)-14; // EFAULT
     long *tms = (long *)buf_ptr;
-    tms[0] = (long)(t->runtime_total / 10); // utime: ms -> 100 Hz ticks
-    tms[1] = 0;                             // stime: not tracked separately
+    uint64_t user_ms, system_ms;
+    if (!sched_get_cpu_usage_ms(t->tgid ? t->tgid : t->tid, true,
+                                &user_ms, &system_ms))
+      return (uint64_t)-22;
+    tms[0] = (long)(user_ms / 10);
+    tms[1] = (long)(system_ms / 10);
     tms[2] = 0;                             // cutime: children not accumulated
     tms[3] = 0;                             // cstime: children not accumulated
   }
@@ -2101,26 +2113,49 @@ static uint64_t sys_unshare(uint64_t flags, uint64_t a2, uint64_t a3,
                    CLONE_FILES | CLONE_FS;
   if (flags & ~known) return (uint64_t)-22;
   if (flags & (CLONE_FILES | CLONE_FS | CLONE_SYSVSEM)) return (uint64_t)-95;
-  if (flags & (CLONE_NEWCGROUP | CLONE_NEWUSER | CLONE_NEWTIME))
+  /* CLONE_NEWCGROUP is accepted without creating an object: cgroupfs is not
+   * virtualised here, so the view is the same as the host's. bwrap requests it
+   * with its pid-namespace clone and cannot continue if it is refused. */
+  if (flags & CLONE_NEWTIME)
     return (uint64_t)-1;
   if (!flags) return 0;
   struct thread *current = sched_get_current();
-  if (!capability_has(current, CAP_SYS_ADMIN)) return (uint64_t)-1;
+  /* A new user namespace grants its creator the capabilities needed for the
+   * other namespaces, so the check applies only without CLONE_NEWUSER. */
+  bool new_user = (flags & CLONE_NEWUSER) != 0;
+  uint64_t owned = flags & (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC |
+                            CLONE_NEWNET | CLONE_NEWPID);
+  if (owned && !new_user && !capability_ns_has(current, CAP_SYS_ADMIN))
+    return (uint64_t)-1;
+  struct user_namespace *user __attribute__((cleanup(user_namespace_cleanup))) = NULL;
   struct uts_namespace *uts __attribute__((cleanup(uts_namespace_cleanup))) = NULL;
   struct ipc_namespace *ipc __attribute__((cleanup(ipc_namespace_cleanup))) = NULL;
   struct mount_namespace *mount __attribute__((cleanup(process_mount_cleanup))) = NULL;
   struct pid_namespace *pid __attribute__((cleanup(pid_namespace_cleanup))) = NULL;
   struct net_namespace *net __attribute__((cleanup(net_namespace_cleanup))) = NULL;
+  if (new_user) {
+    user = user_namespace_create(current->user_ns);
+    if (!user) return (uint64_t)-28; /* ENOSPC: nesting limit */
+  }
   if (flags & CLONE_NEWNET) { net = net_namespace_create(); if (!net) return (uint64_t)-12; }
   if (flags & CLONE_NEWUTS) { uts = uts_namespace_copy(current); if (!uts) return (uint64_t)-12; }
   if (flags & CLONE_NEWIPC) { ipc = ipc_namespace_create(); if (!ipc) return (uint64_t)-12; }
   if (flags & CLONE_NEWNS) { mount = vfs_namespace_prepare(current); if (!mount) return (uint64_t)-12; }
   if (flags & CLONE_NEWPID) { pid = pid_namespace_create(current); if (!pid) return (uint64_t)-12; }
+  if (user) {
+    user_namespace_install(current, user);
+    user = NULL;
+    capability_enter_user_ns(current);
+  }
   if (net) { net_namespace_install(current, net); net = NULL; }
   if (uts) { uts_namespace_install(current, uts); uts = NULL; }
   if (ipc) { ipc_namespace_install(current, ipc); ipc = NULL; }
   if (mount) { vfs_namespace_install(current, mount); mount = NULL; }
   if (pid) { pid_namespace_unshare(current, pid); pid = NULL; }
+  if (flags & CLONE_NEWNET) user_namespace_mark_owned(current, NS_OWN_NET);
+  if (flags & CLONE_NEWUTS) user_namespace_mark_owned(current, NS_OWN_UTS);
+  if (flags & CLONE_NEWIPC) user_namespace_mark_owned(current, NS_OWN_IPC);
+  if (flags & CLONE_NEWNS) user_namespace_mark_owned(current, NS_OWN_MNT);
   return 0;
 }
 

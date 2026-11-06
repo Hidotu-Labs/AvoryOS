@@ -59,6 +59,12 @@ bool vmm_map_page_locked(uint64_t *pml4, uint64_t virtual_addr,
                          uint64_t physical_addr, uint64_t flags,
                          bool *changed);
 
+// Install up to 64 fresh user pages with one walk per page-table window.
+// Caller holds the owning mm and VMM locks. Occupied entries are preserved;
+// consumed frames are set to NULL. True means the first slot is handled.
+bool vmm_map_fresh_pages_locked(uint64_t *pml4, uint64_t virtual_addr,
+                                void **frames, size_t count, uint64_t flags);
+
 // Maps a virtual page only if no present mapping already exists.
 // Returns true on successful mapping, false if already mapped or on OOM.
 bool vmm_map_page_if_unmapped(uint64_t *pml4, uint64_t virtual_addr,

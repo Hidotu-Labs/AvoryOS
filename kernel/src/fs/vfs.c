@@ -1372,34 +1372,34 @@ struct dirent *vfs_readdir(vfs_node_t *node, uint64_t cookie) {
   return 0;
 }
 
-vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
-  if (node && (node->view_backing || vfs_namespace_active())) {
+vfs_node_t *vfs_finddir_fast(vfs_node_t *node, const char *name, uint16_t len,
+                             uint32_t comp_hash, uint64_t name_prefix) {
+  if (__builtin_expect(!node || !name, 0))
+    return NULL;
+  if (__builtin_expect(node->view_backing != NULL || vfs_namespace_active(), 0)) {
     if (node == fs_root) node = vfs_task_root();
-    return vfs_namespace_finddir(node, name);
+    return vfs_namespace_finddir(node, (char *)name);
   }
-  if (node && name && !strcmp(name, "..")) {
+  if (__builtin_expect(len == 2 && name[0] == '.' && name[1] == '.', 0)) {
     vfs_node_t *parent = vfs_node_parent_ref(node);
     if (parent)
       return parent;
   }
-  if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->finddir && name) {
-    uint16_t len = 0;
-    uint64_t name_prefix = 0;
-    uint32_t comp_hash = vfs_component_hash(name, &len, &name_prefix);
+  if (__builtin_expect((node->flags & FS_TYPE_MASK) == FS_DIRECTORY && node->finddir, 1)) {
     uint32_t hash = vfs_dentry_hash_combine(node, comp_hash);
-    bool negative;
+    bool negative = false;
     vfs_node_t *cached = vfs_dentry_lookup_fast(node, name, len, hash, comp_hash, name_prefix, &negative);
     if (__builtin_expect(cached != NULL, 1)) {
       if (!cached->mount_id)
         cached->mount_id = node->mount_id ? node->mount_id : 1;
-      if (strcmp(name, ".") && strcmp(name, ".."))
+      if (__builtin_expect(!(len <= 2 && name[0] == '.'), 1))
         vfs_node_set_parent(cached, node);
       return cached;
     }
     if (negative)
       return NULL;
 
-    vfs_node_t *res = node->finddir(node, name);
+    vfs_node_t *res = node->finddir(node, (char *)name);
     if (!res) {
       vfs_dentry_insert_fast(node, name, len, hash, comp_hash, name_prefix, NULL);
       return 0;
@@ -1426,12 +1426,21 @@ vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
       vfs_close(res);
       res = next;
     }
-    if (strcmp(name, ".") && strcmp(name, ".."))
+    if (__builtin_expect(!(len <= 2 && name[0] == '.'), 1))
       vfs_node_set_parent(res, node);
     vfs_dentry_insert_fast(node, name, len, hash, comp_hash, name_prefix, res);
     return res;
   }
   return 0;
+}
+
+vfs_node_t *vfs_finddir(vfs_node_t *node, char *name) {
+  if (__builtin_expect(!node || !name, 0))
+    return NULL;
+  uint16_t len = 0;
+  uint64_t name_prefix = 0;
+  uint32_t comp_hash = vfs_component_hash(name, &len, &name_prefix);
+  return vfs_finddir_fast(node, name, len, comp_hash, name_prefix);
 }
 
 static void vfs_readdir_generation_advance(vfs_node_t *node) {
@@ -2008,6 +2017,8 @@ reset_walk:
 
   while (*p) {
     char comp[128];
+    uint32_t comp_hash = 2166136261u;
+    uint64_t name_prefix = 0;
     int i = 0;
 
     while (*p == '/')
@@ -2016,14 +2027,21 @@ reset_walk:
       break;
 
     while (*p && *p != '/' && i < 127) {
-      comp[i++] = *p++;
+      uint8_t c = (uint8_t)*p++;
+      comp[i] = c;
+      if (i < 8) {
+        name_prefix |= ((uint64_t)c) << (i * 8);
+      }
+      comp_hash = (comp_hash ^ c) * 16777619u;
+      i++;
     }
     comp[i] = '\0';
+    uint16_t comp_len = (uint16_t)i;
 
     if ((current->flags & FS_TYPE_MASK) != FS_DIRECTORY)
       goto fail;
 
-    if (strcmp(comp, "..") == 0) {
+    if (__builtin_expect(comp_len == 2 && comp[0] == '.' && comp[1] == '.', 0)) {
       if (stack_top >= 0) {
         vfs_close(current);
         current = parent_stack[stack_top];
@@ -2050,12 +2068,12 @@ reset_walk:
       continue;
     }
 
-    if (strcmp(comp, ".") == 0)
+    if (__builtin_expect(comp_len == 1 && comp[0] == '.', 0))
       continue;
 
     if (!vfs_access(current, 1)) goto fail;
 
-    vfs_node_t *next = vfs_finddir(current, comp);
+    vfs_node_t *next = vfs_finddir_fast(current, comp, comp_len, comp_hash, name_prefix);
     if (!next) {
       for (int j = 0; j <= stack_top; j++) {
         vfs_close(parent_stack[j]);

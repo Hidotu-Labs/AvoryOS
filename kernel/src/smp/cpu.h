@@ -79,6 +79,10 @@ struct cpu_info {
 
 
 
+_Static_assert(offsetof(struct cpu_info, self) == 0,
+               "cpu_info self offset");
+_Static_assert(offsetof(struct cpu_info, current_thread) == 48,
+               "cpu_info current_thread offset");
 _Static_assert(offsetof(struct cpu_info, scratch_rsp) == 368,
                "update syscall_entry.asm scratch_rsp offset");
 _Static_assert(offsetof(struct cpu_info, switching_from) == 376,
@@ -97,8 +101,31 @@ void cpu_init(void);
 // timers.
 void cpu_init_aps(void);
 
+extern volatile bool cpu_gs_installed;
+struct cpu_info *cpu_get_current_slow(void);
+
 // Returns a pointer to the calling CPU's cpu_info (read from GS base).
-struct cpu_info *cpu_get_current(void);
+static inline struct cpu_info *cpu_get_current(void) {
+  if (__builtin_expect(cpu_gs_installed, 1)) {
+    struct cpu_info *info;
+    __asm__ volatile("movq %%gs:%c1, %0" : "=r"(info)
+                     : "i"(offsetof(struct cpu_info, self)));
+    return info;
+  }
+  return cpu_get_current_slow();
+}
+
+// Returns the current thread running on this CPU directly from GS base.
+static inline struct thread *cpu_get_current_thread(void) {
+  if (__builtin_expect(cpu_gs_installed, 1)) {
+    struct thread *t;
+    __asm__ volatile("movq %%gs:%c1, %0" : "=r"(t)
+                     : "i"(offsetof(struct cpu_info, current_thread)));
+    return t;
+  }
+  struct cpu_info *c = cpu_get_current_slow();
+  return c ? c->current_thread : NULL;
+}
 
 // Returns the total number of CPUs discovered in the MADT.
 uint32_t cpu_get_count(void);

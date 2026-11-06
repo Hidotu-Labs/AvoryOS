@@ -47,11 +47,16 @@ static uint64_t monotonic_ns(void) {
 }
 
 static uint32_t deadline_to_initial_count(uint64_t deadline_ms) {
-    uint64_t now = monotonic_ms();
-    uint64_t delay_ms = deadline_ms > now ? deadline_ms - now : 1;
-    uint64_t max_ms = 0xffffffffULL / ticks_per_ms;
-    if (delay_ms > max_ms) delay_ms = max_ms;
-    uint64_t count = delay_ms * ticks_per_ms;
+    /* The deadline is absolute. Subtract the precise current time before
+     * converting to LAPIC ticks; subtracting floor(now_ms) adds up to a
+     * millisecond to every arm and can repeatedly postpone short requests. */
+    uint64_t now_ns = monotonic_ns();
+    __uint128_t target_ns = (__uint128_t)deadline_ms * 1000000ULL;
+    if (target_ns <= now_ns || !ticks_per_ms)
+        return 1;
+    __uint128_t count = ((target_ns - now_ns) * ticks_per_ms + 999999ULL) / 1000000ULL;
+    if (count > 0xffffffffULL)
+        return 0xffffffffU;
     return (uint32_t)(count ? count : 1);
 }
 

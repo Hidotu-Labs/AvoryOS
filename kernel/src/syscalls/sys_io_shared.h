@@ -40,6 +40,7 @@
 
 /* FD_CLOEXEC packed into fd_flags[] above the status-flag range */
 #define FD_FLAGS_CLOEXEC_BIT (1u << 24)
+#define IO_FLAGS_VALID (1u << 31)
 
 /* Placeholder a descriptor slot carries between reserving the number and
  * installing the node, so a concurrent fork or lookup never sees a half-built

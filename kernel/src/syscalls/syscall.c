@@ -498,6 +498,21 @@ static inline void record_syscall_error(struct thread *t, uint64_t syscall_num, 
   }
 }
 
+void thread_update_fastpath_state(struct thread *t) {
+  if (!t) return;
+  bool disabled = t->tracer_tid || t->syscall_dispatch_enabled ||
+                  seccomp_mode(t) || t->rseq_addr ||
+                  thread_has_pending_signal(t) ||
+                  t->pid_ns != NULL || t->is_main_session;
+  t->fastpath_disabled = disabled ? 1 : 0;
+  t->identity_cached_pid = t->tgid ? t->tgid : t->tid;
+  t->identity_cached_tid = t->tid;
+  t->identity_cached_uid = t->uid;
+  t->identity_cached_gid = t->gid;
+  t->identity_cached_euid = t->euid;
+  t->identity_cached_egid = t->egid;
+}
+
 void syscall_dispatcher(struct syscall_regs *regs) {
   struct thread *t = sched_get_current();
   /* Foreign syscall numbers and argument ABIs must be intercepted before
@@ -608,8 +623,10 @@ void syscall_dispatcher(struct syscall_regs *regs) {
         rseq_maybe_abort(t, &regs->rip);
       }
       ptrace_syscall_exit(t, regs);
-      if (thread_has_pending_signal(t) || t->ptrace_stop_pending)
+      if (thread_has_pending_signal(t) || t->ptrace_stop_pending) {
         signal_finish_syscall(regs, syscall_num, syscall_return_ip);
+        t->restore_callee_regs = 1;
+      }
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     }
     return;
@@ -638,9 +655,10 @@ void syscall_dispatcher(struct syscall_regs *regs) {
     }
     ptrace_syscall_exit(t, regs);
     if (__builtin_expect(syscall_restart_error(regs->rax) ||
-                         (t && (thread_has_pending_signal(t) ||
-                                t->ptrace_stop_pending)), 0))
+                         (t && thread_has_pending_signal(t)), 0)) {
       signal_finish_syscall(regs, syscall_num, syscall_return_ip);
+      if (t) t->restore_callee_regs = 1;
+    }
     if (t)
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
     if (t && __builtin_expect(syscall_num == SYS_RT_SIGRETURN, 0)) {
@@ -713,10 +731,11 @@ finish_filtered:
   /* Signal frame conversion copies the complete register set. Keep it off the
    * syscall hot path unless this thread can actually deliver a signal. */
   if (__builtin_expect(syscall_restart_error(regs->rax) ||
-                       (t && (thread_has_pending_signal(t) ||
-                              t->ptrace_stop_pending)), 0))
+                       (t && thread_has_pending_signal(t)), 0)) {
     signal_finish_syscall(regs, syscall_num == SYS_RT_SIGRETURN ? UINT64_MAX : syscall_num,
                            syscall_return_ip);
+    if (t) t->restore_callee_regs = 1;
+  }
   if (t)
     __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
 }

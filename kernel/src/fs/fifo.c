@@ -41,6 +41,21 @@ typedef struct {
 
 static spinlock_t fifo_init_lock = SPINLOCK_INIT;
 
+static inline bool fifo_is_nonblock(struct thread *t, vfs_node_t *node) {
+    if (!t) return false;
+    /* O(1) Fast path: flags passed from syscall entry */
+    if (__builtin_expect((t->current_io_flags & IO_FLAGS_VALID) != 0, 1)) {
+        return (t->current_io_flags & O_NONBLOCK) != 0;
+    }
+    /* Fallback for internal kernel callers */
+    for (uint32_t i = 0; i < t->fd_capacity; i++) {
+        if (t->fds[i] == node) {
+            return (t->fd_flags[i] & O_NONBLOCK) != 0;
+        }
+    }
+    return false;
+}
+
 static uint32_t fifo_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {
     (void)offset;
     if (size == 0) return 0;
@@ -50,19 +65,13 @@ static uint32_t fifo_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint
 
     spinlock_acquire(&fifo->lock);
     while (fifo->count == 0) {
-        struct thread *t = sched_get_current();
-        int fd = -1;
-        if (t) {
-            for (uint32_t i = 0; i < t->fd_capacity; i++) {
-                if (t->fds[i] == node) { fd = (int)i; break; }
-            }
-        }
         // If no writers remain, an empty FIFO yields EOF (0)
         if (fifo->writers == 0) {
             spinlock_release(&fifo->lock);
             return 0;
         }
-        if (t && fd != -1 && (t->fd_flags[fd] & O_NONBLOCK)) {
+        struct thread *t = sched_get_current();
+        if (fifo_is_nonblock(t, node)) {
             spinlock_release(&fifo->lock);
             return (uint32_t)-11; // -EAGAIN
         }
@@ -143,13 +152,7 @@ static uint32_t fifo_write(vfs_node_t *node, uint32_t offset, uint32_t size, uin
     // Handle buffer capacity limits
     while (fifo->count >= FIFO_MAX_BUFFER) {
         struct thread *t = sched_get_current();
-        int fd = -1;
-        if (t) {
-            for (uint32_t i = 0; i < t->fd_capacity; i++) {
-                if (t->fds[i] == node) { fd = (int)i; break; }
-            }
-        }
-        if (t && fd != -1 && (t->fd_flags[fd] & O_NONBLOCK)) {
+        if (fifo_is_nonblock(t, node)) {
             spinlock_release(&fifo->lock);
             return (uint32_t)-11; // -EAGAIN
         }

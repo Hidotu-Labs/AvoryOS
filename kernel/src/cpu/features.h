@@ -17,7 +17,12 @@ bool cpu_has_smep(void);
 bool cpu_has_smap(void);
 bool cpu_has_rdtscp(void);
 bool cpu_has_rdpid(void);
+bool cpu_has_xsaveopt(void);
 extern bool cpu_has_xsave_flag;
+extern bool cpu_has_xsaveopt_flag;
+static inline bool cpu_has_xsaveopt_fast(void) {
+  return cpu_has_xsaveopt_flag;
+}
 /* XCR0 components enabled by cpu_features_init(); XSAVE/XRSTOR masks must
  * never request bits outside this mask. */
 extern uint64_t cpu_xsave_mask;
@@ -25,6 +30,12 @@ extern uint64_t cpu_xsave_mask;
 /* True once CR4.SMAP has been enabled on the BSP.  stac/clac are #UD on CPUs
  * that do not enumerate SMAP, so every stac/clac site gates on this flag. */
 extern bool cpu_has_smap_flag;
+
+/* Cached FSGSBASE flag: true once CR4.FSGSBASE has been probed and enabled. */
+extern bool cpu_has_fsgsbase_flag;
+static inline bool cpu_has_fsgsbase_fast(void) {
+  return cpu_has_fsgsbase_flag;
+}
 
 /* Coarse-grained user access window.  The syscall entry path sets AC for the
  * whole dispatch (see syscall_entry.asm) because most legacy syscalls here

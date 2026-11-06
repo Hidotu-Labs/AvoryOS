@@ -401,6 +401,7 @@ void syscall_restart_return(struct registers *regs, uint64_t number,
                              uint64_t return_ip, bool handler,
                              uint64_t action_flags);
 struct thread;
+void thread_update_fastpath_state(struct thread *t);
 int syscall_user_dispatch_configure(struct thread *t, uint64_t mode,
                                     uint64_t offset, uint64_t length,
                                     uint64_t selector);

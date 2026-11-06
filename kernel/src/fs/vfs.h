@@ -385,6 +385,8 @@ static inline bool vfs_node_unref(vfs_node_t *node) {
 struct dirent *vfs_readdir(vfs_node_t *node, uint64_t cookie);
 struct dirent *vfs_readdir_buffer(void);
 vfs_node_t *vfs_finddir(vfs_node_t *node, char *name);
+vfs_node_t *vfs_finddir_fast(vfs_node_t *node, const char *name, uint16_t len,
+                             uint32_t comp_hash, uint64_t name_prefix);
 void vfs_dentry_invalidate(vfs_node_t *parent, const char *name);
 // For successful create/mkdir/mknod/symlink of a previously free name: cheap
 // and provably sufficient, see vfs.c.
