@@ -373,7 +373,8 @@ void sched_terminate_thread_group(struct thread *current) {
       if (!auto_reap &&
           (chld_action->sa_handler == (void *)SIG_DFL || chld_action->sa_handler == NULL) &&
           !parent->waiting_for_child) {
-        if (parent->tgid == 1 || parent->tid == 1) {
+        if ((parent->tgid == 1 || parent->tid == 1) &&
+            !sched_init_collects_children(parent)) {
           auto_reap = true;
         }
       }
@@ -494,7 +495,8 @@ void sched_reap_orphaned_zombies(void) {
       if (parent->state == THREAD_DEAD || parent->state == THREAD_ZOMBIE) {
         can_reap = true;
       } else if (!parent->waiting_for_child) {
-        if (parent->tgid == 1 || parent->tid == 1) {
+        if ((parent->tgid == 1 || parent->tid == 1) &&
+            !sched_init_collects_children(parent)) {
           struct k_sigaction *chld_action = &parent->signal_handlers[SIGCHLD - 1];
           if (chld_action->sa_handler == (void *)SIG_DFL ||
               chld_action->sa_handler == NULL ||

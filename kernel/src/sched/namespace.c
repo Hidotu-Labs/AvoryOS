@@ -14,7 +14,7 @@ struct uts_namespace {
 };
 
 static struct uts_namespace initial_uts = {
-    .refs = 1, .id = 0x4E530008, .hostname = "AvoryOS", .domain = "localhost"};
+    .refs = 1, .id = NS_INIT_INO_UTS, .hostname = "AvoryOS", .domain = "localhost"};
 static uint64_t next_namespace_id = 0x4E540000;
 
 uint32_t namespace_allocate_id(void) {

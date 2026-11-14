@@ -90,13 +90,19 @@ vfs_node_t *vfs_resolve_symlink_node(vfs_node_t *base, const char *path) {
 
 vfs_node_t *resolve_parent_and_name(const char *path, char *name_out,
                                      size_t name_size) {
+    return resolve_parent_and_name_at(NULL, path, name_out, name_size);
+}
+
+/* As above, with relative paths resolved against `dir` (NULL: the cwd). */
+vfs_node_t *resolve_parent_and_name_at(vfs_node_t *dir, const char *path,
+                                        char *name_out, size_t name_size) {
     if (!path) return NULL;
     size_t len = strlen(path);
     if (len == 0 || len >= 256) return NULL;
 
     struct thread *t = sched_get_current();
-    vfs_node_t *base  = (path[0] == '/') ? fs_root
-                       : (t->cwd_node ? t->cwd_node : fs_root);
+    vfs_node_t *cwd   = dir ? dir : (t->cwd_node ? t->cwd_node : fs_root);
+    vfs_node_t *base  = (path[0] == '/') ? fs_root : cwd;
 
     const char *last_slash = NULL;
     for (const char *p = path; *p; p++)
@@ -717,9 +723,8 @@ static uint64_t sys_symlinkat(uint64_t target_ptr, uint64_t newdirfd,
  * node carries the type so stat() reports it and the rdev is kept in inode
  * for userland that inspects it.  Services such as dmesg create /dev/kmsg
  * this way; without the syscall they fail with ENOSYS. */
-static uint64_t sys_mknod(uint64_t pathname_ptr, uint64_t mode, uint64_t dev,
-                          uint64_t a3, uint64_t a4, uint64_t a5) {
-    (void)a3; (void)a4; (void)a5;
+static uint64_t do_mknodat(vfs_node_t *dir, uint64_t pathname_ptr,
+                           uint64_t mode, uint64_t dev) {
     const char *path = (const char *)pathname_ptr;
     if (!path) return (uint64_t)-14;
 
@@ -734,7 +739,7 @@ static uint64_t sys_mknod(uint64_t pathname_ptr, uint64_t mode, uint64_t dev,
 
     char name[128];
     vfs_node_t *parent =
-        resolve_parent_and_name(path, name, sizeof(name));
+        resolve_parent_and_name_at(dir, path, name, sizeof(name));
     if (!parent) return (uint64_t)-2;
     if (!vfs_access(parent, 3)) {
         vfs_close(parent);
@@ -766,10 +771,27 @@ static uint64_t sys_mknod(uint64_t pathname_ptr, uint64_t mode, uint64_t dev,
     return rc == 0 ? 0 : (uint64_t)-1;
 }
 
+static uint64_t sys_mknod(uint64_t pathname_ptr, uint64_t mode, uint64_t dev,
+                          uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)a3; (void)a4; (void)a5;
+    return do_mknodat(NULL, pathname_ptr, mode, dev);
+}
+
 static uint64_t sys_mknodat(uint64_t dirfd, uint64_t pathname_ptr, uint64_t mode,
                             uint64_t dev, uint64_t a4, uint64_t a5) {
-    (void)dirfd; (void)a4; (void)a5;
-    return sys_mknod(pathname_ptr, mode, dev, 0, 0, 0);
+    (void)a4; (void)a5;
+    if ((int)dirfd == AT_FDCWD)
+        return do_mknodat(NULL, pathname_ptr, mode, dev);
+    /* systemd creates its notify FIFOs relative to an open /run directory. */
+    struct thread *t = sched_get_current();
+    vfs_node_t *dir = fd_node_get(t, dirfd);
+    if (!dir)
+        return (uint64_t)-9; // EBADF
+    uint64_t ret = (dir->flags & FS_TYPE_MASK) == FS_DIRECTORY
+                       ? do_mknodat(dir, pathname_ptr, mode, dev)
+                       : (uint64_t)-20; // ENOTDIR
+    fd_node_put(&dir);
+    return ret;
 }
 
 static uint64_t do_sys_readlink_at(vfs_node_t *base, const char *path,
@@ -1332,8 +1354,12 @@ static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
                ? vfs_resolve_symlink_node(fs_root, path)
                : vfs_resolve_path_at(fs_root, path);
         node_owned = node != NULL;
-    } else if (strncmp(path, "/dev/", 5) == 0) {
-        node = fb_lookup_device((char *)path + 5);
+        /* Dynamic /dev nodes (ttyN, ptmx, pts/N, dri/cardN) are not in the
+         * VFS tree; open() and stat() find them through fb_lookup_device, so
+         * access() must too. systemd's ConditionPathExists=/dev/tty1 (the
+         * login unit) is an faccessat() probe. Borrowed node: no ref. */
+        if (!node && strncmp(path, "/dev/", 5) == 0)
+            node = fb_lookup_device((char *)path + 5);
     }
 
     if (!node) {
@@ -1662,9 +1688,10 @@ static uint64_t sys_open_by_handle_at(uint64_t mountdirfd, uint64_t handle, uint
     return (uint64_t)(-(int64_t)95);
 }
 
-// New mount API (fsopen/fsmount/fsconfig/move_mount/open_tree/fspick/
-// mount_setattr): no filesystem-context infrastructure yet. Explicit
-// -ENOSYS so libmount falls back to legacy mount(2); see syscall.h.
+// open_tree/fspick: explicit -ENOSYS so libmount falls back to legacy
+// mount(2). fsopen/fsconfig/fsmount/move_mount live in sys_mount_api.c.
+void syscall_register_mount_api(void);
+
 static uint64_t sys_nosys_mount_api(uint64_t a0, uint64_t a1, uint64_t a2,
                                     uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
@@ -1803,11 +1830,8 @@ void syscall_register_fs(void) {
     syscall_register(SYS_NAME_TO_HANDLE_AT, sys_name_to_handle_at);
     syscall_register(SYS_OPEN_BY_HANDLE_AT, sys_open_by_handle_at);
     syscall_register(SYS_OPEN_TREE,   sys_nosys_mount_api);
-    syscall_register(SYS_MOVE_MOUNT,  sys_nosys_mount_api);
-    syscall_register(SYS_FSOPEN,      sys_nosys_mount_api);
-    syscall_register(SYS_FSCONFIG,    sys_nosys_mount_api);
-    syscall_register(SYS_FSMOUNT,     sys_nosys_mount_api);
     syscall_register(SYS_FSPICK,      sys_nosys_mount_api);
+    syscall_register_mount_api(); /* fsopen/fsconfig/fsmount/move_mount */
     syscall_register(SYS_QUOTACTL,    sys_quotactl);
     syscall_register(SYS_QUOTACTL_FD, sys_quotactl_fd);
 }

@@ -5,6 +5,15 @@
 struct thread;
 struct uts_namespace;
 struct ipc_namespace;
+/* Linux's fixed inode numbers for the initial namespaces (proc_ns.h).
+ * systemd compares /proc/self/ns/<type> against these and reports
+ * "container-other" when the initial PID namespace does not match. */
+#define NS_INIT_INO_IPC    0xEFFFFFFFU
+#define NS_INIT_INO_UTS    0xEFFFFFFEU
+#define NS_INIT_INO_USER   0xEFFFFFFDU
+#define NS_INIT_INO_PID    0xEFFFFFFCU
+#define NS_INIT_INO_CGROUP 0xEFFFFFFBU
+#define NS_INIT_INO_TIME   0xEFFFFFFAU
 uint32_t namespace_allocate_id(void);
 struct ipc_namespace *ipc_namespace_create(void);
 void ipc_namespace_put(struct ipc_namespace *ns);

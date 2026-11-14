@@ -936,6 +936,17 @@ static uint64_t sys_mount_setattr(uint64_t dirfd, uint64_t path_ptr, uint64_t fl
   else point=(flags&0x100)?vfs_resolve_symlink_node(base,path):vfs_resolve_path_at(base,path);
   if((int)dirfd!=AT_FDCWD)vfs_close(base);
   if(!point)return (uint64_t)-2;
+  /* Initial namespace: mount attributes live on the mount root's backing
+   * node (systemd marks its credential tmpfs read-only this way). */
+  if(!vfs_namespace_active()){
+    int r=-22;
+    vfs_node_t *backing=vfs_backing_node(point);
+    if(backing&&backing!=vfs_backing_node(fs_root)&&vfs_is_mount_root(point)){
+      backing->filesystem_mount_flags=(backing->filesystem_mount_flags&~attr.clear)|attr.set;
+      r=0;
+    }
+    vfs_close(point);return (uint64_t)r;
+  }
   int result=vfs_namespace_setattr(point,attr.set,attr.clear,(flags&0x8000)!=0);
   vfs_close(point);return (uint64_t)result;
 }
@@ -2442,6 +2453,31 @@ static uint64_t sys_fdatasync(uint64_t fd, uint64_t a1, uint64_t a2,
   return sys_fsync(fd, a1, a2, a3, a4, a5);
 }
 
+/* sync(2) never fails. There is no global dirty-inode list: pages of closed
+ * files are written back on last close, so flushing the caller's open
+ * descriptors covers everything still cached for it. */
+static uint64_t sys_sync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                         uint64_t a4, uint64_t a5) {
+  (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+  struct thread *t = sched_get_current();
+  for (uint64_t fd = 0; t && t->files && fd < t->files->capacity; fd++) {
+    vfs_node_t *node = fd_node_get(t, fd);
+    if (!node)
+      continue;
+    vfs_cache_sync(node);
+    fd_node_put(&node);
+  }
+  return 0;
+}
+
+static uint64_t sys_syncfs(uint64_t fd, uint64_t a1, uint64_t a2, uint64_t a3,
+                           uint64_t a4, uint64_t a5) {
+  struct thread *t = sched_get_current();
+  if (!t || !FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->fds[fd]))
+    return (uint64_t)-9;
+  return sys_sync(0, a1, a2, a3, a4, a5);
+}
+
 /* Linux sync_file_range(2).  WAIT_BEFORE/WRITE/WAIT_AFTER stage writeback of
  * a byte range; this kernel has no dirty-page tracking to flush selectively,
  * so any valid request degrades to the same cache sync fsync performs. */
@@ -2523,7 +2559,7 @@ static uint64_t sys_readahead(uint64_t fd, uint64_t offset, uint64_t count,
 // so elogind can determine root cgroup ("0::/\n" + mountinfo entry) and
 // allocate its manager. Without this, mount is a no-op stub and elogind
 // fails with "Cannot determine cgroup ...: No data available".
-#define CGROUP2_SUPER_MAGIC 0x63677262
+#define CGROUP2_SUPER_MAGIC 0x63677270
 #define CGROUP_SUPER_MAGIC 0x27e0eb
 
 static int cgroup2_statfs(struct vfs_node *node, struct statfs_buf *buf) {
@@ -2567,15 +2603,56 @@ static const char *mount_canonicalize(const char *target, char *buf,
     fd = fd * 10 + (uint32_t)(*p - '0');
   uint32_t pid = 0;
   struct thread *cur = sched_get_current();
+  uint32_t self = cur ? (cur->tgid ? cur->tgid : cur->tid) : 0;
   if (strncmp(target, "/proc/self/fd/", 14) == 0) {
-    pid = cur ? (cur->tgid ? cur->tgid : cur->tid) : 0;
+    pid = self;
   } else {
     for (const char *p = target + 6; *p >= '0' && *p <= '9'; p++)
       pid = pid * 10 + (uint32_t)(*p - '0');
   }
+  /* The caller's own descriptors come straight from its file table: PID 1's
+   * tid is rewritten after creation, so a tid lookup can miss it (systemd
+   * mounts everything through /proc/self/fd/N). */
+  if (cur && cur->files && pid == self) {
+    bool ok = false;
+    spinlock_acquire(&cur->files->lock);
+    if (FD_IN_RANGE(cur, fd) && fd_is_valid_node(cur->fds[fd])) {
+      const char *value = fd_path_value(cur, (int)fd);
+      if (value && value[0] == '/') {
+        strncpy(buf, value, bufsz - 1);
+        buf[bufsz - 1] = '\0';
+        ok = true;
+      }
+    }
+    spinlock_release(&cur->files->lock);
+    return ok ? buf : target;
+  }
   if (pid && sched_get_fd_path_snapshot(pid, fd, buf, bufsz) && buf[0] == '/')
     return buf;
   return target;
+}
+
+static const char *const cgroup2_control_files[] = {
+    "cgroup.controllers", "cgroup.procs",  "cgroup.threads",
+    "cgroup.subtree_control", "cgroup.events", "cgroup.kill",
+    "cgroup.type", "cgroup.freeze", "tasks", "notify_on_release", NULL};
+
+static void cgroup2_write_file(vfs_node_t *dir, const char *name,
+                               const char *text) {
+  vfs_node_t *f = vfs_finddir(dir, (char *)name);
+  if (f) {
+    vfs_write(f, 0, (uint32_t)strlen(text), (uint8_t *)text);
+    vfs_close(f);
+  }
+}
+
+/* Seed the hierarchy root's control files. Child cgroups get theirs from
+ * tmpfs_mkdir (tmpfs_sb_t.cgroupfs). */
+static void cgroup2_populate(vfs_node_t *dir, const char *controllers) {
+  for (int i = 0; cgroup2_control_files[i]; i++)
+    vfs_create(dir, (char *)cgroup2_control_files[i], 0644);
+  cgroup2_write_file(dir, "cgroup.controllers", controllers);
+  cgroup2_write_file(dir, "cgroup.events", "populated 0\nfrozen 0\n");
 }
 
 uint64_t cgroup2_mount_at(const char *target, const char *fstype) {
@@ -2644,6 +2721,7 @@ uint64_t cgroup2_mount_at(const char *target, const char *fstype) {
   sb->max_inodes = 65536;
   sb->used_bytes = 0;
   sb->used_inodes = 0;
+  sb->cgroupfs = true;
   spinlock_init(&sb->lock);
 
   vfs_node_t *root = tmpfs_create_root(sb);
@@ -2679,26 +2757,7 @@ uint64_t cgroup2_mount_at(const char *target, const char *fstype) {
   // Include v1 names (tasks) so hybrid submounts don't fail on missing files.
   vfs_node_t *cgroup_root = vfs_resolve_path(ctarget);
   if (cgroup_root) {
-    const char *files[] = {"cgroup.controllers", "cgroup.procs",
-                           "cgroup.threads", "cgroup.subtree_control",
-                           "cgroup.events", "cgroup.kill", "tasks",
-                           "notify_on_release", NULL};
-    for (int i = 0; files[i]; i++)
-      vfs_create(cgroup_root, (char *)files[i], 0644);
-    // cgroup.controllers: advertise controllers (no real control).
-    vfs_node_t *ctrl = vfs_finddir(cgroup_root, "cgroup.controllers");
-    if (ctrl) {
-      const char *list = "cpu memory pids\n";
-      vfs_write(ctrl, 0, (uint32_t)strlen(list), (uint8_t *)list);
-      vfs_close(ctrl);
-    }
-    // cgroup.events: valid populated count.
-    vfs_node_t *ev = vfs_finddir(cgroup_root, "cgroup.events");
-    if (ev) {
-      const char *e = "populated 0\n";
-      vfs_write(ev, 0, (uint32_t)strlen(e), (uint8_t *)e);
-      vfs_close(ev);
-    }
+    cgroup2_populate(cgroup_root, "cpu memory pids\n");
     vfs_close(cgroup_root);
   }
   klog_puts("[  OK  ] cgroup2 mounted at ");
@@ -2763,8 +2822,11 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
         int result = -95;
         if (flags & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20))) {
             /* Tables are private by construction. Shared propagation needs
-             * peer groups; reject that request rather than pretend to share. */
-            result = (flags & ((1 << 17) | (1 << 20))) ? -95 : 0;
+             * peer groups, which do not exist: MS_SHARED is accepted as a
+             * no-op because systemd-executor re-shares "/" after building
+             * every sandbox and fails the unit otherwise. Mounts made later
+             * elsewhere will not propagate in. MS_UNBINDABLE stays refused. */
+            result = (flags & (1 << 17)) ? -95 : 0;
         } else if (flags & 0x20) {
             result = vfs_namespace_remount(point, flags);
         } else if (flags & 0x2000) {
@@ -2796,14 +2858,26 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
             vfs_node_t *root = vfs_initial_filesystem("proc");
             result = root ? vfs_namespace_mount(point, root, source, "proc", target, flags) : -19;
             if (root) vfs_close(root);
+        } else if (fstype && !strcmp(fstype, "sysfs")) {
+            /* sysfs has a single instance, like proc here; systemd sandboxes
+             * (ProtectKernelTunables=, PrivateNetwork=) mount a fresh one. */
+            vfs_node_t *root = vfs_initial_filesystem("sysfs");
+            result = root ? vfs_namespace_mount(point, root, source, "sysfs", target, flags) : -19;
+            if (root) vfs_close(root);
         }
         vfs_close(point);
         return (uint64_t)result;
     }
+    /* systemd mounts on /proc/self/fd/N (an O_PATH handle on the target).
+     * The legacy paths below resolve and record targets by name. */
+    char target_canon[256];
+    target = mount_canonicalize(target, target_canon, sizeof(target_canon));
+
     /* Initial-namespace propagation remains private; unsupported mutations
      * are rejected rather than silently claiming isolation or read-only. */
-    if (flags & ((1 << 18) | (1 << 19))) return 0;
-    if (flags & (0x20 | (1 << 17) | (1 << 20))) return (uint64_t)-95;
+    /* MS_SHARED: same no-op as in a private namespace (see above). */
+    if (flags & ((1 << 18) | (1 << 19) | (1 << 20))) return 0;
+    if (flags & (0x20 | (1 << 17))) return (uint64_t)-95;
     if (flags & 0x1000) {
         vfs_node_t *src = source ? vfs_resolve_path_at(base, source) : NULL;
         vfs_node_t *point = vfs_resolve_path_at(base, target);
@@ -3009,6 +3083,8 @@ void syscall_register_fd(void) {
   syscall_register(SYS_FLOCK, sys_flock);
   syscall_register(SYS_FSYNC, sys_fsync);
   syscall_register(SYS_FDATASYNC, sys_fdatasync);
+  syscall_register(SYS_SYNC, sys_sync);
+  syscall_register(SYS_SYNCFS, sys_syncfs);
   syscall_register(SYS_SYNC_FILE_RANGE, sys_sync_file_range);
   syscall_register(SYS_MOUNT, sys_mount);
   syscall_register(SYS_UMOUNT2, sys_umount2);

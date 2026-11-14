@@ -1,0 +1,17 @@
+# Experimental systemd entry: AvoryOS early setup that BusyBox rcS runs as
+# "Running early init" (Xorg profile selection, X11/ICE socket directories).
+[Unit]
+Description=AvoryOS early desktop setup
+DefaultDependencies=no
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=avory-login.service display-manager.service shutdown.target
+Conflicts=shutdown.target
+ConditionFileIsExecutable=/sbin/avory-early-init
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/avory-early-init
+
+[Install]
+WantedBy=multi-user.target

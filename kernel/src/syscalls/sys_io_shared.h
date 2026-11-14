@@ -164,6 +164,7 @@ struct statx {
 #define STATX_BLOCKS 0x0400U
 #define STATX_BASIC_STATS 0x07ffU
 #define STATX_BTIME 0x0800U
+#define STATX_ATTR_MOUNT_ROOT 0x2000U
 
 #define AT_STATX_SYNC_AS_STAT 0x0000
 #define AT_STATX_FORCE_SYNC 0x2000
@@ -322,6 +323,8 @@ vfs_node_t *vfs_resolve_symlink_node(vfs_node_t *base, const char *path);
 // or NULL.
 vfs_node_t *resolve_parent_and_name(const char *path, char *name_out,
                                     size_t name_size);
+vfs_node_t *resolve_parent_and_name_at(vfs_node_t *dir, const char *path,
+                                        char *name_out, size_t name_size);
 
 // timerfd tick (called from lapic_timer) — defined in sys_aio.c
 void timerfd_tick(void);

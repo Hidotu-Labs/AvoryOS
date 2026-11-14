@@ -137,6 +137,9 @@ static int console_dev_poll(struct vfs_node *node, int events) {
 
 static int console_dev_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) {
     switch (cmd) {
+    case 0x540C: // TIOCEXCL
+    case 0x540D: // TIOCNXCL — exclusive mode is advisory; systemd clears it
+        return 0;
     case 0x540E: { // TIOCSCTTY — attach the session's virtual console
         struct thread *t = sched_get_current();
         if (!t)

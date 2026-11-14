@@ -28,6 +28,7 @@
 #include "mm/ksm.h"
 #include "sched/sched.h"
 #include "sched/namespace.h"
+#include "hal/hal.h"
 #include "smp/cpu.h"
 #include "syscalls/syscall.h"
 #include <stdint.h>
@@ -1308,36 +1309,6 @@ uint32_t procfs_usb_xhci_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   return usb_xhci_diag_read(offset, size, buffer);
 }
 
-/* /proc/usb_debug — runtime switch for the verbose USB transfer trace.
- * `echo 1 > /proc/usb_debug` enables it, `echo 0` disables it. */
-uint32_t procfs_usb_debug_read(vfs_node_t *node, uint32_t offset, uint32_t size,
-                               uint8_t *buffer) {
-  (void)node;
-  static const char on[] = "1\n";
-  static const char off[] = "0\n";
-  const char *s = usb_get_verbose() ? on : off;
-  uint32_t len = 2;
-  if (offset >= len || !buffer)
-    return 0;
-  uint32_t n = len - offset;
-  if (n > size)
-    n = size;
-  for (uint32_t i = 0; i < n; i++)
-    buffer[i] = (uint8_t)s[offset + i];
-  return n;
-}
-
-uint32_t procfs_usb_debug_write(vfs_node_t *node, uint32_t offset,
-                                uint32_t size, uint8_t *buffer) {
-  (void)node;
-  (void)offset;
-  if (!buffer || !size)
-    return 0;
-  char c = (char)buffer[0];
-  usb_set_verbose(c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T');
-  return size;
-}
-
 /* The real Limine command line (kernel/src/kernel.c), matching upstream
  * /proc/cmdline.  Session helpers parse it (drm-pick.sh looks for the
  * kpi_emu_sink boot parameter); it used to be a hard-coded "Xfbdev" string. */
@@ -2339,9 +2310,10 @@ static const struct {
   const char *name;
   uint32_t inode;
 } procfs_ns_entries[] = {
-    {"cgroup", 0x4E530001}, {"ipc", 0x4E530002}, {"mnt", 0x4E530003},
-    {"net", 0x4E530004},    {"pid", 0x4E530005}, {"time", 0x4E530006},
-    {"user", 0x4E530007},   {"uts", 0x4E530008},
+    {"cgroup", NS_INIT_INO_CGROUP}, {"ipc", NS_INIT_INO_IPC},
+    {"mnt", 0x4E530003},            {"net", 0x4E530004},
+    {"pid", NS_INIT_INO_PID},       {"time", NS_INIT_INO_TIME},
+    {"user", NS_INIT_INO_USER},     {"uts", NS_INIT_INO_UTS},
 };
 
 #define PROCFS_NS_ENTRY_COUNT \
@@ -3530,19 +3502,6 @@ void procfs_init(void) {
       ramfs_mount_node(procfs_root, usb_xhci_node);
     }
 
-    // Add /proc/usb_debug: runtime switch for the verbose USB transfer trace.
-    vfs_node_t *usb_debug_node = kmalloc(sizeof(vfs_node_t));
-    if (usb_debug_node) {
-      procfs_node_init(usb_debug_node);
-      strncpy(usb_debug_node->name, "usb_debug", 127);
-      usb_debug_node->flags = FS_FILE | FS_PERSISTENT;
-      usb_debug_node->mask = 0644;
-      usb_debug_node->read = procfs_usb_debug_read;
-      usb_debug_node->write = procfs_usb_debug_write;
-      usb_debug_node->length = 2;
-      ramfs_mount_node(procfs_root, usb_debug_node);
-    }
-
     // Add /proc/drmstats
     vfs_node_t *drmstats_node = kmalloc(sizeof(vfs_node_t));
     if (drmstats_node) {
@@ -4178,6 +4137,36 @@ static uint32_t procfs_sys_hostname_read(vfs_node_t *node, uint32_t offset,
     return size;
 }
 
+/* kernel.domainname (NIS domain of the caller's UTS namespace). systemd's
+ * ProtectHostname= bind-mounts over it in every sandboxed service, so the
+ * file has to exist. */
+static uint32_t procfs_sys_domainname_read(vfs_node_t *node, uint32_t offset,
+                                           uint32_t size, uint8_t *buffer) {
+    (void)node;
+    char host[65], val[67];
+    uts_namespace_read(sched_get_current(), host, val);
+    uint32_t len = (uint32_t)strlen(val);
+    val[len++] = '\n';
+    if (offset >= len) return 0;
+    if (size > len - offset) size = len - offset;
+    memcpy(buffer, val + offset, size);
+    return size;
+}
+
+static uint32_t procfs_sys_domainname_write(vfs_node_t *node, uint32_t offset,
+                                            uint32_t size, uint8_t *buffer) {
+    (void)node;
+    if (offset != 0 || !buffer) return (uint32_t)-22;
+    uint32_t len = size;
+    while (len && (buffer[len - 1] == '\n' || buffer[len - 1] == '\0')) len--;
+    if (len > 64) return (uint32_t)-22;
+    char name[65];
+    memcpy(name, buffer, len);
+    name[len] = '\0';
+    int r = uts_namespace_set(sched_get_current(), name, len, 1);
+    return r < 0 ? (uint32_t)r : size;
+}
+
 static uint32_t procfs_sys_osrelease_read(vfs_node_t *node, uint32_t offset,
                                           uint32_t size, uint8_t *buffer) {
     (void)node;
@@ -4270,6 +4259,94 @@ static uint32_t procfs_sys_file_max_read(vfs_node_t *node, uint32_t offset,
     uint32_t len = 8;
     if (offset >= len) return 0;
     if (offset + size > len) size = len - offset;
+    memcpy(buffer, val + offset, size);
+    return size;
+}
+
+/* /proc/sys/kernel/random/{boot_id,uuid}: random v4 UUIDs. boot_id is fixed
+ * for the boot (systemd and journald key their state on it), uuid is fresh on
+ * every open. */
+static uint64_t procfs_uuid_mix(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+static void procfs_uuid_format(char out[38], uint64_t seed) {
+    uint64_t hi = procfs_uuid_mix(seed), lo = procfs_uuid_mix(seed ^ hi);
+    uint8_t b[16];
+    for (int i = 0; i < 8; i++) {
+        b[i] = (uint8_t)(hi >> (i * 8));
+        b[8 + i] = (uint8_t)(lo >> (i * 8));
+    }
+    b[6] = (uint8_t)((b[6] & 0x0f) | 0x40); /* version 4 */
+    b[8] = (uint8_t)((b[8] & 0x3f) | 0x80); /* RFC 4122 variant */
+    static const char hex[] = "0123456789abcdef";
+    int o = 0;
+    for (int i = 0; i < 16; i++) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out[o++] = '-';
+        out[o++] = hex[b[i] >> 4];
+        out[o++] = hex[b[i] & 15];
+    }
+    out[o++] = '\n';
+    out[o] = '\0';
+}
+
+static uint32_t procfs_uuid_copy(const char *val, uint32_t offset,
+                                 uint32_t size, uint8_t *buffer) {
+    if (offset >= 37) return 0;
+    if (offset + size > 37) size = 37 - offset;
+    memcpy(buffer, val + offset, size);
+    return size;
+}
+
+static uint32_t procfs_sys_boot_id_read(vfs_node_t *node, uint32_t offset,
+                                        uint32_t size, uint8_t *buffer) {
+    (void)node;
+    static char boot_id[38];
+    static spinlock_t boot_id_lock = SPINLOCK_INIT;
+    spinlock_acquire(&boot_id_lock);
+    if (!boot_id[0])
+        procfs_uuid_format(boot_id, hal_cpu_cycle_count());
+    spinlock_release(&boot_id_lock);
+    return procfs_uuid_copy(boot_id, offset, size, buffer);
+}
+
+static uint32_t procfs_sys_uuid_read(vfs_node_t *node, uint32_t offset,
+                                     uint32_t size, uint8_t *buffer) {
+    (void)node;
+    /* A read from offset 0 starts a new value; a continuation of a short
+     * read sees the same one. */
+    static char uuid[38];
+    static uint64_t counter;
+    static spinlock_t uuid_lock = SPINLOCK_INIT;
+    spinlock_acquire(&uuid_lock);
+    if (offset == 0 || !uuid[0])
+        procfs_uuid_format(uuid, hal_cpu_cycle_count() ^ (++counter << 48));
+    uint32_t n = procfs_uuid_copy(uuid, offset, size, buffer);
+    spinlock_release(&uuid_lock);
+    return n;
+}
+
+/* systemd raises fs.file-max at boot. There is no global file table limit to
+ * change, so the write is accepted and the reported value stays. */
+static uint32_t procfs_sys_accept_write(vfs_node_t *node, uint32_t offset,
+                                        uint32_t size, uint8_t *buffer) {
+    (void)node;
+    (void)offset;
+    (void)buffer;
+    return size;
+}
+
+/* Per-process descriptor ceiling (MAX_FDS); systemd caps RLIMIT_NOFILE here. */
+static uint32_t procfs_sys_nr_open_read(vfs_node_t *node, uint32_t offset,
+                                        uint32_t size, uint8_t *buffer) {
+    (void)node;
+    char val[16];
+    int len = snprintf(val, sizeof(val), "%u\n", (unsigned)MAX_FDS);
+    if (len <= 0 || offset >= (uint32_t)len) return 0;
+    if (offset + size > (uint32_t)len) size = (uint32_t)len - offset;
     memcpy(buffer, val + offset, size);
     return size;
 }
@@ -4508,11 +4585,26 @@ void procfs_sys_init(vfs_node_t *procfs_root) {
         procfs_add_file_node(kernel_dir, "overflowgid", procfs_sys_overflowgid_read, 16);
         procfs_add_file_node(kernel_dir, "pid_max",     procfs_sys_pid_max_read, 16);
         procfs_add_file_node(kernel_dir, "hostname",    procfs_sys_hostname_read, 32);
+        procfs_add_file_node(kernel_dir, "domainname",  procfs_sys_domainname_read, 32);
+        {
+            vfs_node_t *dn = vfs_finddir(kernel_dir, "domainname");
+            if (dn) {
+                dn->write = procfs_sys_domainname_write;
+                dn->mask = 0644;
+                vfs_close(dn);
+            }
+        }
         procfs_add_file_node(kernel_dir, "osrelease",   procfs_sys_osrelease_read, 32);
         procfs_add_file_node(kernel_dir, "ostype",      procfs_sys_ostype_read, 16);
         procfs_add_file_node(kernel_dir, "version",     procfs_sys_version_read, 32);
         procfs_add_file_node(kernel_dir, "cap_last_cap", procfs_sys_cap_last_cap_read, 16);
         procfs_add_file_node(kernel_dir, "ngroups_max",  procfs_sys_ngroups_max_read, 16);
+        vfs_node_t *random_dir = procfs_create_dir_node("random");
+        if (random_dir) {
+            procfs_add_file_node(random_dir, "boot_id", procfs_sys_boot_id_read, 37);
+            procfs_add_file_node(random_dir, "uuid",    procfs_sys_uuid_read, 37);
+            ramfs_mount_node(kernel_dir, random_dir);
+        }
         ramfs_mount_node(sys_dir, kernel_dir);
     }
 
@@ -4527,6 +4619,15 @@ void procfs_sys_init(vfs_node_t *procfs_root) {
     vfs_node_t *fs_dir = procfs_create_dir_node("fs");
     if (fs_dir) {
         procfs_add_file_node(fs_dir, "file-max",  procfs_sys_file_max_read, 16);
+        procfs_add_file_node(fs_dir, "nr_open",   procfs_sys_nr_open_read, 16);
+        {
+            vfs_node_t *fm = vfs_finddir(fs_dir, "file-max");
+            if (fm) {
+                fm->write = procfs_sys_accept_write;
+                fm->mask = 0644;
+                vfs_close(fm);
+            }
+        }
         procfs_add_file_node(fs_dir, "mount-max", procfs_sys_mount_max_read, 16);
         vfs_node_t *inotify_dir = procfs_create_dir_node("inotify");
         if (inotify_dir) {

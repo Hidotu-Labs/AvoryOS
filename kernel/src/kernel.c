@@ -315,7 +315,7 @@ static void init_thread_entry(void) {
       current->is_main_session = true;
       extern spinlock_t tid_lock;
       spinlock_acquire(&tid_lock);
-      current->tid = 1;
+      sched_assume_init_tid_locked(current);
       current->tgid = 1;
       current->pgid = 1;
       current->sid = 1;

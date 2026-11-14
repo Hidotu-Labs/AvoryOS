@@ -30,6 +30,7 @@ int vfs_namespace_umount(vfs_node_t *point, unsigned flags);
 int vfs_namespace_pivot(vfs_node_t *newroot, vfs_node_t *oldpoint);
 int vfs_namespace_chroot(vfs_node_t *root);
 int vfs_namespace_mounts(vfs_mount_info_t *buffer, int count);
+bool vfs_namespace_is_mount_root(vfs_node_t *node);
 int vfs_get_mounts_task(struct thread *task, vfs_mount_info_t *buffer,
                         int count);
 int vfs_initial_mounts_get(vfs_mount_info_t *buffer, int count);

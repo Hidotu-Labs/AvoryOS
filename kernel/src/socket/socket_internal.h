@@ -62,6 +62,10 @@ typedef struct unix_sock {
 
   // Connection state
   struct unix_sock *peer;     // Connected peer
+  /* connect() on SOCK_DGRAM only names a default destination: `peer` is
+   * the bound socket, pinned by a reference on peer->parent, and the link
+   * is one-way (the destination does not point back). */
+  bool dgram_peer;
   struct unix_sock *listener; // Listening socket we're connecting to
   uint32_t owner_pid;
   uint32_t owner_group_count;

@@ -1,5 +1,6 @@
 #include "vfs.h"
 #include "mount_namespace.h"
+#include "devfs.h"
 #include "../sched/capability.h"
 #include "vfs_rcu.h"
 #include "dirindex.h"
@@ -1372,6 +1373,27 @@ struct dirent *vfs_readdir(vfs_node_t *node, uint64_t cookie) {
   return 0;
 }
 
+/* Character devices registered by drivers (tty1, kmsg, dri/...) are attached
+ * as children of the root filesystem's /dev directory node, but ext4 hands
+ * out directory nodes per lookup, so a later /dev node does not carry them.
+ * Fall back to the device registry for names in /dev, as open() and stat()
+ * already do for absolute "/dev/..." strings; this also covers component-wise
+ * walks such as openat(open("/dev"), "tty1") (systemd's TTYPath=). */
+static vfs_node_t *vfs_dev_dir_fallback(vfs_node_t *dir, const char *name) {
+  if (strcmp(dir->name, "dev") != 0)
+    return NULL;
+  vfs_node_t *parent = vfs_node_parent_ref(dir);
+  bool in_root = parent && vfs_backing_node(parent) == vfs_backing_node(fs_root);
+  if (parent)
+    vfs_close(parent);
+  if (!in_root)
+    return NULL;
+  vfs_node_t *dev = devfs_lookup(name);
+  if (dev)
+    vfs_node_ref(dev);
+  return dev;
+}
+
 vfs_node_t *vfs_finddir_fast(vfs_node_t *node, const char *name, uint16_t len,
                              uint32_t comp_hash, uint64_t name_prefix) {
   if (__builtin_expect(!node || !name, 0))
@@ -1397,10 +1419,13 @@ vfs_node_t *vfs_finddir_fast(vfs_node_t *node, const char *name, uint16_t len,
       return cached;
     }
     if (negative)
-      return NULL;
+      return vfs_dev_dir_fallback(node, name);
 
     vfs_node_t *res = node->finddir(node, (char *)name);
     if (!res) {
+      vfs_node_t *dev = vfs_dev_dir_fallback(node, name);
+      if (dev)
+        return dev;
       vfs_dentry_insert_fast(node, name, len, hash, comp_hash, name_prefix, NULL);
       return 0;
     }
@@ -2333,6 +2358,31 @@ int vfs_statfs(vfs_node_t *node, void *buf) {
     return node->statfs(node, buf);
   }
   return -1;
+}
+
+/* Match on mount id as well as inode: ext2/ext4 hand out ephemeral nodes, so
+ * a bind-mounted directory reached through its original path has the same
+ * inode but inherits the parent's mount id and is not a mount root there. */
+bool vfs_is_mount_root(vfs_node_t *node) {
+  vfs_node_t *b = vfs_backing_node(node);
+  if (!b)
+    return false;
+  if (b == vfs_backing_node(fs_root))
+    return true;
+  if (vfs_namespace_active())
+    return vfs_namespace_is_mount_root(node);
+  bool root = false;
+  spinlock_acquire(&vfs_mount_lock);
+  for (vfs_mount_entry_t *m = vfs_mount_list; m; m = m->next) {
+    vfs_node_t *t = vfs_backing_node(m->target);
+    if (t && m->mount_id == node->mount_id &&
+        (t == b || (t->inode == b->inode && t->device == b->device))) {
+      root = true;
+      break;
+    }
+  }
+  spinlock_release(&vfs_mount_lock);
+  return root;
 }
 
 int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count) {

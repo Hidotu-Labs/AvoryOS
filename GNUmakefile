@@ -530,6 +530,11 @@ build/firmware/.stamp: scripts/linux-firmware-install.sh scripts/linux/firmware-
 disk.img: userland/winoptions userland/icewm-menu $(ARCH_STAMP)
 disk.img: scripts/configure-accounts.sh scripts/configure-pacman.sh userland/avory-account userland/test_accounts.sh
 disk.img: config/init/rcS config/init/inittab config/sddm/10-theme.conf
+SYSTEMD_UNIT_FILES := config/systemd/avory-login.service \
+	config/systemd/avory-early-init.service \
+	config/systemd/seatd.service.d/avoryos.conf \
+	config/systemd/logind.conf.d/avoryos.conf
+disk.img: $(SYSTEMD_UNIT_FILES)
 # Fixed 14 GiB image by default (override during a forced rebuild with
 # `make disk-rebuild DISK_SIZE_MIB=<MiB>`). Leave room for filesystem metadata
 # and tools added after the rootfs overlay.
@@ -554,6 +559,7 @@ DISK_NON_APP_DEPS := GNUmakefile \
 	scripts/glibc-toolchain.sh $(GLIBC_TOOLCHAIN_STAMP) \
 	scripts/configure-accounts.sh scripts/configure-pacman.sh userland/avory-account userland/test_accounts.sh \
 	scripts/populate-ext2-dir.sh scripts/populate-ext2-dir.py scripts/configure-image-root.sh config/init/rcS config/init/inittab \
+	$(SYSTEMD_UNIT_FILES) \
 	config/plasma/avory-plasma-wayland.sh config/kwinoutputconfig.json \
 	config/weston/avory-weston-session.sh config/weston/weston.desktop \
 	config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/10-virgl.conf config/xorg/20-output.conf \

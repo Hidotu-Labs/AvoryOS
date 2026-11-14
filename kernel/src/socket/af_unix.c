@@ -319,6 +319,7 @@ int unix_create(socket_t *sock, int protocol) {
 
   usk->parent           = sock;
   usk->peer             = NULL;
+  usk->dgram_peer       = false;
   usk->listener         = NULL;
   usk->backlog          = 0;
   usk->accept_queue_len = 0;
@@ -389,7 +390,14 @@ void unix_destroy(socket_t *sock) {
   }
 
   // Detach the peer before freeing buffers so concurrent I/O stops seeing us.
-  if (usk->peer) {
+  if (usk->peer && usk->dgram_peer) {
+    /* One-way datagram destination: only drop the pinning reference. */
+    socket_t *peer_parent = usk->peer->parent;
+    usk->peer = NULL;
+    usk->dgram_peer = false;
+    if (peer_parent)
+      socket_put(peer_parent);
+  } else if (usk->peer) {
     unix_sock_t *peer = usk->peer;
     socket_t *peer_parent = peer->parent;
 

@@ -24,7 +24,9 @@
 #include "../sched/seccomp.h"
 #include "../sched/net_namespace.h"
 #include "../sched/user_namespace.h"
+#include "../fs/cgroupfs.h"
 #include "../fs/mount_namespace.h"
+#include "../fs/tmpfs.h"
 #include "../sched/wait.h"
 #include "../smp/cpu.h"
 #include "sys_io_shared.h"
@@ -380,16 +382,19 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   fpu_copy_thread(child, parent);
   ptrace_fork_event(regs, child, child_tid, SIGCHLD);
   thread_update_fastpath_state(child);
+  cgroupfs_fork(parent, child);
   sched_enqueue_thread(child, NULL);
 
   // 9. Return child PID to parent
   return child_tid;
 }
 
+/* cgroup_dir: clone3(CLONE_INTO_CGROUP) target, already validated; NULL
+ * makes a new process inherit its parent's cgroup. */
 static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
                                    uint64_t child_stack, uint64_t ptid,
                                    uint64_t ctid, uint64_t newtls,
-                                   uint64_t pidfd_slot) {
+                                   uint64_t pidfd_slot, vfs_node_t *cgroup_dir) {
   struct thread *parent = sched_get_current();
   if (!parent || !parent->mm)
     return (uint64_t)-22;
@@ -716,6 +721,10 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   fpu_copy_thread(child, parent);
   ptrace_fork_event(regs, child, visible_child_tid, flags);
   thread_update_fastpath_state(child);
+  if (cgroup_dir)
+    cgroupfs_clone_into(child, cgroup_dir);
+  else if (!(flags & CLONE_THREAD))
+    cgroupfs_fork(parent, child);
   sched_enqueue_thread(child, target_cpu);
 
   if (vfork) {
@@ -741,7 +750,7 @@ uint64_t sys_clone(struct syscall_regs *regs) {
   uint64_t pidfd_slot = (flags & CLONE_PIDFD) ? ptid : 0;
 
   return sys_clone_internal(regs, flags, child_stack, ptid, ctid, newtls,
-                            pidfd_slot);
+                            pidfd_slot, NULL);
 }
 
 // sys_vfork (syscall 58) — real vfork semantics, shared with
@@ -849,11 +858,16 @@ uint64_t sys_vfork(struct syscall_regs *regs) {
   fpu_copy_thread(child, parent);
   ptrace_fork_event(regs, child, visible_child_tid, child->clone_flags);
   thread_update_fastpath_state(child);
+  cgroupfs_fork(parent, child);
   sched_enqueue_thread(child, NULL);
 
   vfork_wait_for_child(parent);
   return visible_child_tid;
 }
+
+#ifndef CLONE_INTO_CGROUP
+#define CLONE_INTO_CGROUP 0x200000000ULL /* clone3 only */
+#endif
 
 struct clone_args {
   uint64_t flags;
@@ -901,8 +915,25 @@ uint64_t sys_clone3(struct syscall_regs *regs) {
               (unsigned long long)kargs.stack_size, (unsigned long long)ptid,
               (unsigned long long)ctid, (unsigned long long)newtls);
 
+  /* CLONE_INTO_CGROUP needs the v2 struct (with .cgroup) and a cgroup2
+   * directory fd; check it before any child exists. */
+  vfs_node_t *cgroup_dir = NULL;
+  if (kargs.flags & CLONE_INTO_CGROUP) {
+    if (size < 88 || (kargs.flags & CLONE_THREAD))
+      return (uint64_t)-22; // EINVAL
+    cgroup_dir = fd_node_get(sched_get_current(), kargs.cgroup);
+    if (!cgroup_dir || !tmpfs_cgroup_of(cgroup_dir)) {
+      if (cgroup_dir)
+        vfs_close(cgroup_dir);
+      return (uint64_t)-9; // EBADF
+    }
+  }
+
   uint64_t ret = sys_clone_internal(regs, flags, child_stack, ptid, ctid, newtls,
-                                    (kargs.flags & CLONE_PIDFD) ? kargs.pidfd : 0);
+                                    (kargs.flags & CLONE_PIDFD) ? kargs.pidfd : 0,
+                                    cgroup_dir);
+  if (cgroup_dir)
+    vfs_close(cgroup_dir);
   return ret;
 }
 

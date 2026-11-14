@@ -1,4 +1,5 @@
 #include "tmpfs.h"
+#include "cgroupfs.h"
 #include "vfs.h"
 #include "../console/klog.h"
 #include "../lib/string.h"
@@ -741,6 +742,7 @@ static vfs_node_t *tmpfs_make_node(tmpfs_sb_t *sb, const char *name,
         }
         vfs_dirindex_init(&d->di);
         d->sb       = sb;
+        d->cgroup   = NULL;
         n->device   = d;
         n->readdir  = tmpfs_readdir;
         n->finddir  = vfs_dirindex_finddir_ref;
@@ -767,6 +769,115 @@ static int tmpfs_create(vfs_node_t *node, char *name, uint16_t permission) {
     return 0;
 }
 
+/* cgroup2 mounts are tmpfs with stub control files (cgroup2_mount_at seeds
+ * the root). A cgroup directory needs its own set: systemd creates init.scope
+ * and writes its PID to init.scope/cgroup.procs before allocating the manager.
+ * cgroup.procs, cgroup.threads and cgroup.events are bound to cgroupfs.c and
+ * read back live membership; writes to the others land in the stub files and
+ * have no effect. Child cgroups also get the cpu/memory/pids interface files
+ * the root advertises, holding Linux's defaults: systemd reads them back and
+ * an empty file is ENODATA. There is no cgroup.kill: a no-op one would make
+ * systemd skip killing processes itself, so it uses cgroup.procs + kill(). */
+static const struct {
+    const char *name;
+    const char *init;
+} tmpfs_cgroup_files[] = {
+    {"cgroup.controllers", NULL},
+    {"cgroup.procs", NULL},
+    {"cgroup.threads", NULL},
+    {"cgroup.subtree_control", NULL},
+    {"cgroup.events", NULL},
+    {"cgroup.type", "domain\n"},
+    {"cgroup.freeze", "0\n"},
+    {"cpu.weight", "100\n"},
+    {"memory.min", "0\n"},
+    {"memory.low", "0\n"},
+    {"memory.high", "max\n"},
+    {"memory.max", "max\n"},
+    {"memory.swap.max", "max\n"},
+    {"memory.zswap.max", "max\n"},
+    {"memory.zswap.writeback", "1\n"},
+    {"memory.oom.group", "0\n"},
+    {"pids.max", "max\n"},
+    {NULL, NULL}};
+
+static void tmpfs_cgroup_bind(vfs_node_t *dir, char *name,
+                              struct cgroupfs_group *group,
+                              enum cgroupfs_file kind) {
+    vfs_node_t *f = vfs_finddir(dir, name);
+    if (f) {
+        cgroupfs_bind_file(f, group, kind);
+        vfs_close(f);
+    }
+}
+
+static void tmpfs_cgroup_populate(vfs_node_t *parent, vfs_node_t *dir) {
+    /* The mount root gets its group on first use; its own control files
+     * stay plain stubs (cgroup2_mount_at). */
+    tmpfs_dir_t *pdir = (tmpfs_dir_t *)parent->device;
+    if (!pdir->cgroup)
+        pdir->cgroup = cgroupfs_group_create(NULL);
+    struct cgroupfs_group *group = cgroupfs_group_create(pdir->cgroup);
+    if (!group)
+        return;
+    ((tmpfs_dir_t *)dir->device)->cgroup = group;
+
+    for (int i = 0; tmpfs_cgroup_files[i].name; i++) {
+        char *name = (char *)tmpfs_cgroup_files[i].name;
+        const char *init = tmpfs_cgroup_files[i].init;
+        if (tmpfs_create(dir, name, 0644) != 0 || !init)
+            continue;
+        vfs_node_t *f = vfs_finddir(dir, name);
+        if (f) {
+            vfs_write(f, 0, (uint32_t)strlen(init), (uint8_t *)init);
+            vfs_close(f);
+        }
+    }
+    tmpfs_cgroup_bind(dir, "cgroup.procs", group, CGROUPFS_PROCS);
+    tmpfs_cgroup_bind(dir, "cgroup.threads", group, CGROUPFS_THREADS);
+    tmpfs_cgroup_bind(dir, "cgroup.events", group, CGROUPFS_EVENTS);
+}
+
+struct cgroupfs_group *tmpfs_cgroup_of(vfs_node_t *dir) {
+    if (dir && dir->view_backing)
+        dir = dir->view_backing;
+    if (!dir || (dir->flags & FS_TYPE_MASK) != FS_DIRECTORY ||
+        dir->mkdir != tmpfs_mkdir || !dir->device)
+        return NULL;
+    tmpfs_dir_t *d = (tmpfs_dir_t *)dir->device;
+    return d->sb && d->sb->cgroupfs ? d->cgroup : NULL;
+}
+
+/* rmdir on a real cgroup ignores its control files. Drop the stubs when they
+ * are all that is left and no live process is still in the cgroup, so the
+ * emptiness check in tmpfs_rmdir passes; a cgroup that still has child
+ * cgroups or member processes keeps its files and fails rmdir. */
+static void tmpfs_cgroup_clear(vfs_node_t *parent, char *name) {
+    vfs_node_t *dir = vfs_finddir(parent, name);
+    if (!dir)
+        return;
+    if ((dir->flags & FS_TYPE_MASK) == FS_DIRECTORY && dir->device) {
+        uint32_t stubs = 0;
+        for (int i = 0; tmpfs_cgroup_files[i].name; i++) {
+            vfs_node_t *f = vfs_finddir(dir, (char *)tmpfs_cgroup_files[i].name);
+            if (f) {
+                if ((f->flags & FS_TYPE_MASK) == FS_FILE)
+                    stubs++;
+                vfs_close(f);
+            }
+        }
+        vfs_dirindex_t *di = vfs_dirindex_of(dir);
+        vfs_dirindex_lock(di);
+        bool only_stubs = di->count == stubs;
+        vfs_dirindex_unlock(di);
+        if (only_stubs &&
+            cgroupfs_group_remove(((tmpfs_dir_t *)dir->device)->cgroup))
+            for (int i = 0; tmpfs_cgroup_files[i].name; i++)
+                tmpfs_unlink(dir, (char *)tmpfs_cgroup_files[i].name);
+    }
+    vfs_close(dir);
+}
+
 static int tmpfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
     if (!node || (node->flags & FS_TYPE_MASK) != FS_DIRECTORY)
         return -1;
@@ -783,6 +894,8 @@ static int tmpfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
         tmpfs_discard_node(child, sb);
         return -1;
     }
+    if (sb->cgroupfs)
+        tmpfs_cgroup_populate(node, child);
     return 0;
 }
 
@@ -926,6 +1039,8 @@ static int tmpfs_rmdir(vfs_node_t *node, char *name) {
         return -1;
 
     tmpfs_dir_t *dir = (tmpfs_dir_t *)node->device;
+    if (dir->sb && dir->sb->cgroupfs)
+        tmpfs_cgroup_clear(node, name);
 
     vfs_dirindex_lock(&dir->di);
     tmpfs_child_t *curr = vfs_dirindex_find_locked(&dir->di, name);
@@ -1127,6 +1242,7 @@ void tmpfs_mount_at_sized(const char *path, uint64_t max_bytes,
     sb->max_inodes  = max_inodes ? max_inodes : TMPFS_DEFAULT_MAX_INODES;
     sb->used_bytes  = 0;
     sb->used_inodes = 0;
+    sb->cgroupfs    = false;
     spinlock_init(&sb->lock);
 
     vfs_node_t *mountpoint = vfs_resolve_path(path);

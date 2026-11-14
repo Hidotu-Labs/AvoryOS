@@ -54,7 +54,7 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
     return -22;
   }
 
-  if (sock->state == SS_CONNECTED) {
+  if (sock->state == SS_CONNECTED && sock->type != SOCK_DGRAM) {
     KTRACK_ERR(KSUBSYS_AF_UNIX, -106);
     return -106; // EISCONN
   }
@@ -117,6 +117,26 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
     sock->state = SS_CONNECTED;
     usk->was_connected = true;
     socket_put(listener_sock);
+    return 0;
+  }
+
+  /* Datagram sockets never listen: connect() just sets the default
+   * destination (sd_notify connects to /run/systemd/notify this way). */
+  if (sock->type == SOCK_DGRAM) {
+    if (listener_sock->type != SOCK_DGRAM) {
+      socket_put(listener_sock);
+      KTRACK_ERR(KSUBSYS_AF_UNIX, -91);
+      return -91; // EPROTOTYPE
+    }
+    spinlock_acquire(&sock->lock);
+    socket_t *old_peer = usk->dgram_peer && usk->peer ? usk->peer->parent : NULL;
+    usk->peer = dusk;
+    usk->dgram_peer = true; /* keeps the reference taken by the lookup */
+    sock->state = SS_CONNECTED;
+    usk->was_connected = true;
+    spinlock_release(&sock->lock);
+    if (old_peer)
+      socket_put(old_peer);
     return 0;
   }
 

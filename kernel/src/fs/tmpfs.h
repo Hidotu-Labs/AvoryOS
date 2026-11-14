@@ -35,9 +35,12 @@ typedef struct {
  * callback, with the superblock pointer after it. */
 typedef vfs_child_t tmpfs_child_t;
 
+struct cgroupfs_group;
+
 typedef struct {
     vfs_dirindex_t di;
     tmpfs_sb_t    *sb;
+    struct cgroupfs_group *cgroup; /* cgroup2 mounts only, else NULL */
 } tmpfs_dir_t;
 
 typedef struct {
@@ -51,6 +54,8 @@ typedef struct tmpfs_sb {
     uint64_t   used_bytes;
     uint64_t   used_inodes;
     spinlock_t lock;
+    /* cgroup2 hierarchy: every directory carries stub control files. */
+    bool       cgroupfs;
 } tmpfs_sb_t;
 
 bool tmpfs_is_shmem(vfs_node_t *node);
@@ -60,6 +65,8 @@ vfs_node_t *tmpfs_create_memfd(const char *name);
 void        tmpfs_mount_at(const char *path);
 void        tmpfs_mount_at_sized(const char *path, uint64_t max_bytes, uint64_t max_inodes);
 vfs_node_t *tmpfs_create_root(tmpfs_sb_t *sb);
+/* The cgroup a cgroup2 directory represents, or NULL for any other node. */
+struct cgroupfs_group *tmpfs_cgroup_of(vfs_node_t *dir);
 vfs_node_t *tmpfs_create_private_root(void);
 
 /* Cross-directory rename within a single tmpfs instance (both parents must

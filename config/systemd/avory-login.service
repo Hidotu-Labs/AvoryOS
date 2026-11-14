@@ -1,0 +1,22 @@
+# Experimental systemd entry: the AvoryOS login prompt on the kernel's sole
+# interactive virtual terminal. Replaces getty@tty1, which is masked in
+# setup-rootfs.sh, and respawns like the inittab entry does under BusyBox.
+[Unit]
+Description=AvoryOS login on tty1
+After=avory-early-init.service systemd-user-sessions.service dbus.socket
+Conflicts=getty@tty1.service
+ConditionPathExists=/dev/tty1
+
+[Service]
+Type=idle
+ExecStart=/bin/avory-login
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

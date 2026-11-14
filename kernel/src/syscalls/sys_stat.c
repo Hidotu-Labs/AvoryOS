@@ -257,6 +257,11 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
         kstx.stx_mask |= STATX_MNT_ID_UNIQUE;
     else
         kstx.stx_mask |= STATX_MNT_ID;
+    /* systemd >= 258 decides "is this a mount point" from this attribute
+     * alone and fails with EUNATCH when the kernel does not report it. */
+    kstx.stx_attributes_mask = STATX_ATTR_MOUNT_ROOT;
+    if (vfs_is_mount_root(node))
+        kstx.stx_attributes |= STATX_ATTR_MOUNT_ROOT;
     kstx.stx_blksize = 4096;
     kstx.stx_nlink   = node->get_nlink ? node->get_nlink(node) : 1;
     kstx.stx_uid     = node->uid;

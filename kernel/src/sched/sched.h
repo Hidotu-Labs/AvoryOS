@@ -731,6 +731,14 @@ bool sched_validate_runqueues(struct cpu_info *cpu);
 void sched_print_tasks(void);
 bool sched_terminate_thread(uint32_t tid);
 struct thread *sched_get_thread_by_tid(uint32_t tid);
+void sched_assume_init_tid_locked(struct thread *t);
+
+/* PID 1's orphan fallback auto-reaps children it is not waiting for at exit.
+ * An init that blocks SIGCHLD (systemd reads it from a signalfd and reaps
+ * through pidfds) collects every child itself, so they must stay waitable. */
+static inline bool sched_init_collects_children(const struct thread *init) {
+  return (init->signal_mask & (1ULL << (SIGCHLD - 1))) != 0;
+}
 bool sched_get_thread_snapshot(uint32_t tid,
                                struct sched_thread_snapshot *snapshot);
 

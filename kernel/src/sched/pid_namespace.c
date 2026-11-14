@@ -69,7 +69,7 @@ void pid_namespace_release(struct thread *task) {
   pid_namespace_put(ns); pid_namespace_put(children);
 }
 uint32_t pid_namespace_id(struct thread *task) {
-  return task && task->pid_ns ? task->pid_ns->id : 0x4e530005;
+  return task && task->pid_ns ? task->pid_ns->id : NS_INIT_INO_PID;
 }
 uint32_t pid_namespace_tid(struct thread *viewer, struct thread *target) {
   if (!target) return 0;

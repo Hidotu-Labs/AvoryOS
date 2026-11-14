@@ -27,6 +27,7 @@ static tmpfs_sb_t *make_sb(uint64_t max_bytes, uint64_t max_inodes) {
     sb->max_inodes  = max_inodes;
     sb->used_bytes  = 0;
     sb->used_inodes = 0;
+    sb->cgroupfs    = false;
     spinlock_init(&sb->lock);
     return sb;
 }

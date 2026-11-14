@@ -457,6 +457,8 @@ typedef struct vfs_mount_info {
 } vfs_mount_info_t;
 
 int vfs_get_mounts(vfs_mount_info_t *buffer, int max_count);
+/* True when `node` is the root of a mount (statx STATX_ATTR_MOUNT_ROOT). */
+bool vfs_is_mount_root(vfs_node_t *node);
 
 // Page Cache API
 bool vfs_cache_page_valid(const vfs_page_t *page);

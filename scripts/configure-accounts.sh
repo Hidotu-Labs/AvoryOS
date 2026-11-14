@@ -336,10 +336,17 @@ if [ -d /usr/lib/xorg/modules/dri ]; then
 fi
 export KWIN_COMPOSE="${KWIN_COMPOSE:-O2}"
 
-# rcS starts root's audio graph in /run/pipewire. Keep the desktop runtime
-# separate, but point native and PulseAudio clients at those existing sockets.
-# Export before D-Bus activation so activated services inherit the same paths.
-if [ "$USER_ID" = 0 ]; then
+# A pam_systemd login's user manager runs the stock per-user PipeWire units.
+# Otherwise BusyBox rcS starts root's graph in /run/pipewire; point root's
+# native and PulseAudio clients at it, and start a session graph for anyone
+# else. Export before D-Bus activation so activated services inherit paths.
+AUDIO_GRAPH=session
+if [ -d "$XDG_RUNTIME_DIR/systemd" ]; then
+    AUDIO_GRAPH=systemd
+elif [ "$USER_ID" = 0 ] && [ -S /run/pipewire/pipewire-0 ]; then
+    AUDIO_GRAPH=system
+fi
+if [ "$AUDIO_GRAPH" = system ]; then
     export PIPEWIRE_RUNTIME_DIR=/run/pipewire
     # WebKitGTK 2.54's bindPulse() asserts on a nonempty unix: PULSE_SERVER
     # (CStringView::fromUTF8 is passed a span without its NUL terminator).
@@ -375,8 +382,8 @@ if command -v kbuildsycoca6 >/dev/null 2>&1; then
     kbuildsycoca6 --noincremental || true
 fi
 
-# 5b. Non-root sessions need their own audio graph; root uses rcS above.
-if [ "$USER_ID" != 0 ]; then
+# 5b. Start a session audio graph when neither rcS nor systemd provides one.
+if [ "$AUDIO_GRAPH" = session ]; then
     session_pipewire_started=0
     if command -v pipewire >/dev/null 2>&1 && [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
         XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup pipewire >>"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &

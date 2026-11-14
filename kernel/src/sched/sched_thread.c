@@ -615,6 +615,30 @@ struct thread *find_thread_by_tid_locked(uint32_t tid) {
   return NULL;
 }
 
+/* tid 1 belongs to userspace init, but boot-time kernel threads are allocated
+ * before the init thread execs, so one of them may already hold it. Swap tids
+ * with that holder so tid_map[1] - and with it /proc/1, /proc/self/fdinfo for
+ * PID 1 (systemd resolves its pidfds there) and kill(1, ...) - reaches init.
+ * Caller holds tid_lock. */
+void sched_assume_init_tid_locked(struct thread *t) {
+  uint32_t old = t->tid;
+  if (old == 1 || old >= PID_MAX_LIMIT)
+    return;
+  struct thread *holder = tid_map[1];
+  if (holder && holder != t) {
+    holder->tid = old;
+    if (holder->tgid == 1)
+      holder->tgid = old;
+    tid_map[old] = holder;
+  } else {
+    pid_clear_bit(old);
+    tid_map[old] = NULL;
+    pid_set_bit(1);
+  }
+  tid_map[1] = t;
+  t->tid = 1;
+}
+
 struct thread *sched_get_thread_by_tid(uint32_t tid) {
   spinlock_acquire(&tid_lock);
   struct thread *curr = find_thread_by_tid_locked(tid);

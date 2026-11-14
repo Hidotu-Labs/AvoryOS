@@ -783,8 +783,6 @@ static bool usb_mouse_parse_report(struct usb_mouse_state *ms,
   const struct hid_mouse_layout *layout = &ms->layout;
   if (!layout->valid) {
     ms->parse_failures++;
-    if (ms->parse_failures <= 4)
-      usb_dbgf("[USB-MOUSE] report dropped: no valid layout (len=%u)\n", len);
     return false;
   }
 
@@ -817,7 +815,6 @@ static bool usb_mouse_parse_report(struct usb_mouse_state *ms,
             len, report_id,
             rep ? rep->id : usb_mouse_layout_report_id(layout),
             rep ? rep->total_bits : 0, layout->has_report_id ? 1 : 0);
-      usb_debug_hexdump("[USB-MOUSE]   raw", buf, len, 16);
     }
     return false; // Not the mouse report, or a truncated transfer
   }
@@ -883,11 +880,6 @@ static void usb_mouse_decode(struct usb_mouse_state *ms, const uint8_t *buf,
   ms->last_report_ms = lapic_timer_get_ms();
   ms->reports_logged++;
   if (ms->reports_logged <= 16 || (ms->reports_logged & 0xFFU) == 0) {
-    usb_dbgf("[USB-MOUSE] report #%u len=%u dx=%d dy=%d wheel=%d pan=%d "
-          "buttons=0x%X layout=%s\n",
-          ms->reports_logged, len, delta.dx, delta.dy, delta.wheel, delta.pan,
-          delta.buttons, ms->using_boot ? "boot" : "report");
-    usb_debug_hexdump("[USB-MOUSE]   raw", buf, len, 16);
   }
 
   if (delta.absolute_x && delta.absolute_y)
@@ -1107,7 +1099,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
     klog_puts("[USB-MOUSE] Failed to get config descriptor header\n");
     return false;
   }
-  usb_debug_hexdump("[USB-MOUSE] config header", config_buf, 9, 9);
 
   struct usb_config_descriptor_m *cfg =
       (struct usb_config_descriptor_m *)config_buf;
@@ -1124,7 +1115,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
     klog_puts("[USB-MOUSE] Failed to get full config descriptor\n");
     return false;
   }
-  usb_debug_hexdump("[USB-MOUSE] config bundle", config_buf, total_len, 96);
 
   // 2. Walk interfaces and collect HID mouse candidates with their interrupt
   //    IN endpoints.  The report descriptor is deliberately NOT fetched here:
@@ -1142,8 +1132,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
     if (desc_len == 0)
       break;
 
-    usb_dbgf("[USB-MOUSE-DBG] desc off=%u len=%u type=0x%02X\n", offset, desc_len,
-          desc_type);
 
     if (desc_type == USB_DESC_INTERFACE && desc_len >= 9) {
       struct usb_interface_descriptor_m *iface =
@@ -1157,9 +1145,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
       klog_puts(" protocol=0x");
       klog_hex32(iface->interface_protocol);
       klog_puts("\n");
-      usb_dbgf("[USB-MOUSE-DBG]   iface num=%u alt=%u endpoints=%u\n",
-            iface->interface_number, iface->alternate_setting,
-            iface->num_endpoints);
 
       if (iface->interface_class == USB_CLASS_HID &&
           iface->interface_protocol != USB_PROTOCOL_KEYBOARD &&
@@ -1174,15 +1159,7 @@ bool usb_mouse_probe(struct usb_device *dev) {
                              iface->interface_subclass == USB_SUBCLASS_BOOT;
         current = cand;
         candidate_count++;
-        usb_dbgf("[USB-MOUSE-DBG]   candidate#%d iface=%u protocol=%u "
-              "subclass=%u alt=%u boot_capable=%u\n",
-              candidate_count - 1, cand->iface_num, cand->protocol,
-              cand->subclass, cand->alt_setting, cand->boot_capable ? 1 : 0);
       } else {
-        usb_dbgf("[USB-MOUSE-DBG]   iface not a mouse candidate (class=%u "
-              "protocol=%u candidates=%d)\n",
-              iface->interface_class, iface->interface_protocol,
-              candidate_count);
       }
     } else if (desc_type == USB_DESC_ENDPOINT && desc_len >= 7 && current &&
                current->ep_addr == 0) {
@@ -1204,10 +1181,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
         klog_uint64(current->interval);
         klog_puts("\n");
       } else {
-        usb_dbgf("[USB-MOUSE-DBG]   ignored endpoint addr=0x%02X attr=0x%02X "
-              "maxpkt=%u interval=%u\n",
-              ep->endpoint_address, ep->attributes, ep->max_packet_size,
-              ep->interval);
       }
     }
 
@@ -1218,10 +1191,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
   int usable = 0;
   for (int i = 0; i < candidate_count; i++) {
     if (!candidates[i].ep_addr || !candidates[i].max_packet) {
-      usb_dbgf("[USB-MOUSE-DBG] drop candidate iface=%u ep=0x%02X maxpkt=%u "
-            "(no usable interrupt IN)\n",
-            candidates[i].iface_num, candidates[i].ep_addr,
-            candidates[i].max_packet);
       continue;
     }
     if (candidates[i].max_packet > 1024)
@@ -1236,7 +1205,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
     klog_puts("[USB-MOUSE] No HID mouse interface found\n");
     return false;
   }
-  usb_dbgf("[USB-MOUSE-DBG] %d usable candidate(s)\n", candidate_count);
 
   // 3. SET_CONFIGURATION before touching interface class requests.
   if (!dev->configured || dev->configuration_value != cfg->config_value) {
@@ -1253,11 +1221,7 @@ bool usb_mouse_probe(struct usb_device *dev) {
     }
     dev->configuration_value = cfg->config_value;
     dev->configured = true;
-    usb_dbgf("[USB-MOUSE-DBG] SET_CONFIGURATION value=%u done\n",
-          cfg->config_value);
   } else {
-    usb_dbgf("[USB-MOUSE-DBG] already configured value=%u\n",
-          dev->configuration_value);
   }
 
   // Small settle delay
@@ -1275,8 +1239,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
     uint8_t desc[1024];
     int res = -1;
     for (int attempt = 0; attempt < 2 && res < 0; attempt++) {
-      usb_dbgf("[USB-MOUSE-DBG] report descriptor fetch iface=%u attempt=%d\n",
-            cand->iface_num, attempt + 1);
       res = usb_hid_get_report_descriptor(dev, cand->iface_num, desc,
                                           sizeof(desc));
       if (res < 0)
@@ -1289,13 +1251,7 @@ bool usb_mouse_probe(struct usb_device *dev) {
       klog_puts("\n");
       continue;
     }
-    usb_debug_hexdump("[USB-MOUSE-DBG] report descriptor", desc, 96, 96);
     cand->layout_ok = hid_parse_mouse_layout(desc, sizeof(desc), &cand->layout);
-    usb_dbgf("[USB-MOUSE-DBG] parse iface=%u -> %s (reports=%u buttons=%u "
-          "report_id=%u dropped=%u)\n",
-          cand->iface_num, cand->layout_ok ? "ok" : "no mouse collection",
-          cand->layout.report_count, cand->layout.button_count,
-          cand->layout.has_report_id ? 1 : 0, cand->layout.dropped_fields);
     if (!cand->layout_ok)
       klog_puts("[USB-MOUSE] No mouse collection in report descriptor\n");
   }
@@ -1324,11 +1280,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
     return false;
   }
   struct mouse_candidate *chosen = &candidates[best];
-  usb_dbgf("[USB-MOUSE-DBG] chosen candidate#%d iface=%u ep=0x%02X maxpkt=%u "
-        "interval=%u protocol=%u subclass=%u boot_capable=%u layout_ok=%u\n",
-        best, chosen->iface_num, chosen->ep_addr, chosen->max_packet,
-        chosen->interval, chosen->protocol, chosen->subclass,
-        chosen->boot_capable ? 1 : 0, chosen->layout_ok ? 1 : 0);
 
   klog_puts("[USB-MOUSE] HID mouse detected (iface=");
   klog_uint64(chosen->iface_num);
@@ -1366,8 +1317,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
   //     control endpoint for the descriptor fetch.  Its failure is harmless:
   //     idle only controls repeat reports, not movement.
   int set_idle_result = usb_mouse_set_idle(dev, chosen->iface_num);
-  usb_dbgf("[USB-MOUSE-DBG] SET_IDLE iface=%u -> res=%d\n", chosen->iface_num,
-        set_idle_result);
 
   // 6b2. GET_PROTOCOL: 0 = boot, 1 = report.  Purely diagnostic, but it is
   //      the first thing to check when reports do not match the layout.
@@ -1397,8 +1346,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
   greq.value = 0x0100 | get_report_id; // Input report, parsed report ID
   greq.index = chosen->iface_num;
   greq.length = sizeof(get_report);
-  usb_dbgf("[USB-MOUSE-DBG] GET_REPORT(input) iface=%u report_id=%u\n",
-        chosen->iface_num, get_report_id);
   int8_t get_report_result =
       (int8_t)usb_control_transfer(dev, &greq, get_report, sizeof(get_report));
 
@@ -1415,7 +1362,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
     if (usb_control_transfer(dev, &alt_req, NULL, 0) < 0)
       klog_puts("[USB-MOUSE] SET_INTERFACE failed (non-fatal)\n");
   } else {
-    usb_dbg_puts("[USB-MOUSE-DBG] SET_INTERFACE skipped (alt=0)\n");
   }
 
   hid_log_layout(&layout);
@@ -1431,8 +1377,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
     return false;
   }
   memset(buf, 0, 4096);
-  usb_dbgf("[USB-MOUSE-DBG] DMA report buffer virt=%p phys=0x%llX\n", buf,
-        (unsigned long long)phys);
 
   // 10. Fill in the mouse state.
   struct usb_mouse_state *ms = &mice[state_index];
@@ -1488,32 +1432,22 @@ bool usb_mouse_probe(struct usb_device *dev) {
   } else {
     klog_puts("ok\n");
   }
-  usb_debug_hexdump("[USB-MOUSE-DBG] get_report bytes", ms->get_report,
-                    sizeof(ms->get_report), sizeof(ms->get_report));
 
   // 11. Start the interrupt transfer.  If opening the pipe fails, try one
   //     recovery pass that clears a stale endpoint halt (firmware or a
   //     previous driver can leave one behind) and open again.  Configure
   //     Endpoint normally resets the endpoint, so this is only a fallback.
   int8_t halt_result = 0;
-  usb_dbgf("[USB-MOUSE-DBG] opening interrupt pipe ep=0x%02X maxpkt=%u "
-        "interval=%u\n",
-        ms->ep_addr, ms->max_packet, ms->interval);
   ms->generic_pipe = usb_interrupt_open(
       dev, ms->ep_addr, ms->max_packet, ms->interval, ms->report_buf,
       ms->report_buf_phys);
   if (!ms->generic_pipe) {
-    usb_dbg_puts("[USB-MOUSE-DBG] pipe open failed, clearing endpoint halt\n");
     halt_result = (int8_t)usb_mouse_clear_halt(dev, chosen->ep_addr);
     ms->halt_result = halt_result;
-    usb_dbgf("[USB-MOUSE-DBG] CLEAR_FEATURE(HALT) ep=0x%02X -> %d\n",
-          chosen->ep_addr, halt_result);
     if (halt_result >= 0) {
       ms->generic_pipe = usb_interrupt_open(
           dev, ms->ep_addr, ms->max_packet, ms->interval, ms->report_buf,
           ms->report_buf_phys);
-      usb_dbgf("[USB-MOUSE-DBG] reopen after halt clear -> %s\n",
-            ms->generic_pipe ? "ok" : "FAIL");
     }
   }
   if (ms->generic_pipe) {
@@ -1569,16 +1503,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
   klog_puts(", transport=");
   klog_puts(ms->transport);
   klog_puts(")\n");
-  usb_dbgf("[USB-MOUSE-DBG] attached addr=%u ep=0x%02X dci=%u iface=%u "
-        "maxpkt=%u interval=%u layout=%s reports=%u buttons=%u "
-        "report_id=%u boot_capable=%u using_boot=%u protocol=%u "
-        "get_report=%d set_idle=%d\n",
-        dev->address, ms->ep_addr, ms->ep_number * 2 + 1, ms->interface_number,
-        ms->max_packet, ms->interval, ms->using_boot ? "boot" : "report",
-        ms->layout.report_count, ms->layout.button_count,
-        ms->layout.has_report_id ? 1 : 0, ms->boot_capable ? 1 : 0,
-        ms->using_boot ? 1 : 0, protocol_value, get_report_result,
-        set_idle_result);
 
   mouse_last_probe_failure = "none";
   return true;
@@ -1589,10 +1513,6 @@ void usb_mouse_disconnect(struct usb_device *dev) {
     struct usb_mouse_state *ms = &mice[i];
     if (!ms->active || ms->dev != dev)
       continue;
-    usb_dbgf("[USB-MOUSE-DBG] disconnect state=%d addr=%u ep=0x%02X "
-          "completions=%u reports=%u unknown=%u\n",
-          i, dev->address, ms->ep_addr, ms->pipe_completions,
-          ms->reports_decoded, ms->unknown_reports);
     if (ms->generic_pipe)
       usb_interrupt_cancel(ms->generic_pipe);
     ms->generic_pipe = NULL;
@@ -1786,8 +1706,6 @@ static void usb_mouse_recover_silent(struct usb_mouse_state *ms) {
       klogf("[USB-MOUSE] recovery 4/4: still silent after %llu ms; "
             "GET_PROTOCOL=%u GET_REPORT(id=%u)=%d\n",
             (unsigned long long)(now - ms->attach_ms), protocol, id, res);
-      usb_debug_hexdump("[USB-MOUSE] recovery GET_REPORT", report,
-                        sizeof(report), sizeof(report));
       klog_puts("[USB-MOUSE] endpoint is NAKing: mouse asleep, off, "
                 "unpaired, or the receiver is not forwarding its reports\n");
     }
@@ -1851,12 +1769,6 @@ void usb_mouse_poll(void) {
       if (raw_len == 0)
         ms->zero_len_completions++;
       if (ms->pipe_completions <= 16) {
-        usb_dbgf("[USB-MOUSE-DBG] completion ep=0x%02X code=%u actual=%u "
-              "buflen=%u using=%u\n",
-              ms->ep_addr, ms->generic_pipe->last_completion, raw_len,
-              ms->generic_pipe->buffer_len, len);
-        usb_debug_hexdump("[USB-MOUSE-DBG]   buffer",
-                          ms->generic_pipe->buffer, len, 16);
       }
       usb_mouse_poll_pipe(ms, ms->generic_pipe->buffer, len);
       if (usb_interrupt_resubmit(ms->generic_pipe) < 0)

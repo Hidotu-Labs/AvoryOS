@@ -229,6 +229,43 @@ int unix_getsockopt_impl(socket_t *sock, int level, int optname,
   }
 }
 
+/* Resize the receive ring to `sz` bytes (a power of two), keeping every byte
+ * already queued: Linux never drops data on SO_RCVBUF(FORCE). sd-bus raises
+ * the buffer of each accepted connection, and a client's AUTH line that
+ * arrived first used to be discarded, deadlocking both sides (random systemd
+ * start jobs hung on PID 1's private bus). */
+static int unix_resize_recv_buf(socket_t *sock, unix_sock_t *usk, size_t sz) {
+  for (;;) {
+    uint8_t *new_buf = kmalloc(sz);
+    if (!new_buf) {
+      klog_puts("[WARN] unix_setsockopt: failed to allocate new recv buffer\n");
+      return -12; // ENOMEM
+    }
+    spinlock_acquire(&usk->recv_lock);
+    size_t count = usk->recv_buf_count;
+    if (count > sz) {
+      /* More is queued than the requested size: grow to fit and retry. */
+      spinlock_release(&usk->recv_lock);
+      kfree(new_buf);
+      sz = unix_round_pow2(count);
+      continue;
+    }
+    if (usk->recv_buf && count > 0)
+      unix_ring_consume(usk->recv_buf, usk->recv_buf_size, usk->recv_buf_head,
+                        new_buf, count);
+    kfree(usk->recv_buf);
+    usk->recv_buf      = new_buf;
+    usk->recv_buf_size = sz;
+    usk->recv_buf_mask = sz - 1;
+    usk->recv_buf_head = 0;
+    usk->recv_buf_tail = count;
+    usk->recv_buf_count = count;
+    sock->rcvbuf       = (int)sz;
+    spinlock_release(&usk->recv_lock);
+    return 0;
+  }
+}
+
 int unix_setsockopt_impl(socket_t *sock, int level, int optname,
                          const void *optval, int optlen) {
   if (!sock || !sock->sk || !optval)
@@ -251,34 +288,9 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
     int val = *(const int *)optval;
     if (val < 256)       val = 256;
     if (val > 4*1024*1024) val = 4*1024*1024;
-    size_t sz = unix_round_pow2((size_t)val);
-
-    uint8_t *new_buf = kmalloc(sz);
-    if (!new_buf) {
-      klog_puts("[WARN] unix_setsockopt: failed to allocate new recv buffer\n");
-      return -12; // ENOMEM
-    }
-
-    spinlock_acquire(&usk->recv_lock);
-    size_t head      = usk->recv_buf_head;
-    size_t old_size  = usk->recv_buf_size;
-    size_t count     = usk->recv_buf_count;
-
-    size_t keep = count < sz ? count : sz;
-    if (usk->recv_buf && keep > 0) {
-      unix_ring_consume(usk->recv_buf, old_size, head, new_buf, keep);
-    }
-
-    usk->recv_buf_head = 0;
-    usk->recv_buf_tail = keep;
-    usk->recv_buf_count = keep;
-    kfree(usk->recv_buf);
-    usk->recv_buf      = new_buf;
-    usk->recv_buf_size = sz;
-    usk->recv_buf_mask = sz - 1;
-    sock->rcvbuf       = (int)sz;
-    spinlock_release(&usk->recv_lock);
-
+    int r = unix_resize_recv_buf(sock, usk, unix_round_pow2((size_t)val));
+    if (r)
+      return r;
     klog_debug_puts("[OK] unix_setsockopt: SO_RCVBUF set to ");
     klog_debug_uint64(val);
     klog_debug_puts("\n");
@@ -318,23 +330,7 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
       return -22;
     int val = *(const int *)optval;
     if (val < 64) val = 64;
-    size_t sz = unix_round_pow2((size_t)val);
-
-    uint8_t *new_buf = kmalloc(sz);
-    if (!new_buf)
-      return -12;
-
-    spinlock_acquire(&usk->recv_lock);
-    kfree(usk->recv_buf);
-    usk->recv_buf      = new_buf;
-    usk->recv_buf_size = sz;
-    usk->recv_buf_mask = sz - 1;
-    usk->recv_buf_head = 0;
-    usk->recv_buf_tail = 0;
-    usk->recv_buf_count = 0;
-    sock->rcvbuf       = (int)sz;
-    spinlock_release(&usk->recv_lock);
-    return 0;
+    return unix_resize_recv_buf(sock, usk, unix_round_pow2((size_t)val));
   }
 
   case SO_SNDBUFFORCE: {
@@ -410,6 +406,21 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
 
   case 31: // SO_PEERSEC
   case 59: // SO_PEERGROUPS
+    return -92; // ENOPROTOOPT
+
+  case 29: // SO_TIMESTAMP
+  case 35: // SO_TIMESTAMPNS
+  case 37: // SO_TIMESTAMPING
+    /* Accepted, but no SCM_TIMESTAMP* control message is delivered;
+     * receivers then stamp messages themselves. systemd-journald treats a
+     * failing SO_TIMESTAMP on its syslog socket as fatal and exits. */
+    return 0;
+
+  case 34: // SO_PASSSEC
+  case 76: // SO_PASSPIDFD
+  case 83: // SO_PASSRIGHTS
+    /* Not implemented; callers (systemd) treat ENOPROTOOPT as optional.
+     * Skip the WARN so boot logs stay readable. */
     return -92; // ENOPROTOOPT
 
   case 2:  // SO_REUSEADDR

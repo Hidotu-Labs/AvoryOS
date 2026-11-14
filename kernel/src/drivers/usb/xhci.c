@@ -350,11 +350,6 @@ static uint32_t xhci_drain_events(struct xhci_controller *hc,
       hc->last_transfer_code = ev_cc;
       if (hc->transfer_events_logged < 4) {
         hc->transfer_events_logged++;
-        usb_dbgf("[XHCI-DBG] xfer evt #%llu slot=%u dci=%u cc=%u residual=%u "
-              "trb=0x%llX control=0x%08X\n",
-              (unsigned long long)hc->transfer_events, ev_slot, ev_dci, ev_cc,
-              ev_residual, (unsigned long long)(event.parameter & ~0xFULL),
-              ev_control);
       }
       /* EP0 (DCI 1) completions belong to the control-transfer waiter.  Keep
        * them separate: interrupt completions on other endpoints otherwise
@@ -364,10 +359,6 @@ static uint32_t xhci_drain_events(struct xhci_controller *hc,
         hc->last_ep0_event_code = ev_cc;
         if (hc->ep0_events_logged < 24) {
           hc->ep0_events_logged++;
-          usb_dbgf("[XHCI-DBG] EP0 event trb=0x%llX cc=%u residual=%u "
-                "control=0x%08X slot=%u\n",
-                (unsigned long long)(event.parameter & ~0xFULL), ev_cc,
-                ev_residual, ev_control, (ev_control >> 24) & 0xFFU);
         }
       }
       bool matched = false;
@@ -401,23 +392,12 @@ static uint32_t xhci_drain_events(struct xhci_controller *hc,
          * serial console must stay usable. */
         if (state->logged_events < 4 ||
             (state->logged_events & 0xFFFU) == 0) {
-          usb_dbgf("[XHCI-DBG] xfer evt dci=%u slot=%u ep=0x%02X cc=%u "
-                "residual=%u len=%u buflen=%u trb=0x%llX\n",
-                state->endpoint_id, (ev_control >> 24) & 0xFFU,
-                state->pipe.endpoint, ev_cc, ev_residual, actual_len,
-                state->pipe.buffer_len,
-                (unsigned long long)event.parameter);
         }
         state->logged_events++;
         break;
       }
       if (!matched) {
         hc->orphan_transfer_events++;
-        if (hc->orphan_transfer_events <= 8)
-          usb_dbgf("[XHCI-DBG] ORPHAN xfer evt dci=%u cc=%u residual=%u "
-                "trb=0x%llX (no active pipe for this TRB)\n",
-                ev_dci, ev_cc, ev_residual,
-                (unsigned long long)event.parameter);
       }
     } else if (XHCI_TRB_TYPE_GET(event.control) == XHCI_TRB_PORT_STATUS) {
       uint8_t port = (event.parameter >> 24) & 0xFFU;
@@ -733,12 +713,6 @@ retry:
   hc->last_ep0_event_code = 0;
   if (hc->debug_ep0_logs < 24) {
     hc->debug_ep0_logs++;
-    usb_dbgf("[XHCI-DBG] EP0 wait slot=%u setup=0x%llX status=0x%llX idx=%u "
-          "cycle=%u in=%u len=%u req=0x%02X attempt=%u\n",
-          slot->id, (unsigned long long)(slot->ep0_ring_phys +
-                                          setup_index * sizeof(struct xhci_trb)),
-          (unsigned long long)status_trb, setup_index, setup_cycle, in ? 1 : 0,
-          len, req->request, attempt);
   }
   /* Publish the complete control TD atomically. The Setup TRB was written
      with the inverse cycle bit so a fast physical xHC could not consume it
@@ -828,17 +802,6 @@ retry:
   hc->debug_usbcmd = mmio_read32(hc->op, XHCI_USBCMD);
   hc->debug_usbsts = mmio_read32(hc->op, XHCI_USBSTS);
   klog_puts("[XHCI] EP0 transfer timed out\n");
-  usb_dbgf("[XHCI-DBG] EP0 timeout detail: slot=%u awaited=0x%llX last_ep0=0x%llX "
-        "ep0_cc=%u global_trb=0x%llX global_cc=%u xfer_events=%llu "
-        "idx=%u cycle=%u last_evt_control=0x%08X last_evt_status=0x%08X "
-        "last_evt_trb=0x%llX\n",
-        slot->id, (unsigned long long)status_trb,
-        (unsigned long long)hc->last_ep0_event_trb, hc->last_ep0_event_code,
-        (unsigned long long)hc->last_transfer_trb, hc->last_transfer_code,
-        (unsigned long long)hc->transfer_events, slot->ep0_enqueue,
-        slot->ep0_cycle, hc->last_transfer_event_control,
-        hc->last_transfer_event_status,
-        (unsigned long long)hc->last_transfer_event_parameter);
   /* The TD may still be owned by the xHC; Reset Endpoint stops it and Set TR
    * Dequeue makes EP0 usable for the next request instead of leaving it
    * wedged forever. */
@@ -1111,19 +1074,10 @@ static int xhci_interrupt_submit(struct xhci_controller *hc,
   __atomic_thread_fence(__ATOMIC_RELEASE);
   struct xhci_slot *slot = state->pipe.dev->hcd_data;
   if (!slot || !slot->enabled) {
-    usb_dbgf("[XHCI-DBG] submit dci=%u ABORT: slot=%p enabled=%u\n",
-          state->endpoint_id, (void *)slot, slot ? slot->enabled : 0);
     return -1;
   }
   hc->doorbells[slot->id] = state->endpoint_id;
   state->doorbell_rings++;
-  if (state->submitted <= 4 || (state->submitted & 0xFFFU) == 0)
-    usb_dbgf("[XHCI-DBG] submit dci=%u slot=%u idx=%u trb=0x%llX buf=0x%llX "
-          "len=%u cycle=%u doorbell[%u]=%u n=%u\n",
-          state->endpoint_id, slot->id, index,
-          (unsigned long long)state->expected_trb,
-          (unsigned long long)state->pipe.buffer_phys, state->pipe.buffer_len,
-          state->cycle, slot->id, state->endpoint_id, state->submitted);
   return 0;
 }
 
@@ -1133,18 +1087,8 @@ static struct usb_interrupt_pipe *xhci_interrupt_open(
     uint64_t buffer_phys) {
   struct xhci_controller *hc = hcd->priv;
   struct xhci_slot *slot = dev ? dev->hcd_data : NULL;
-  usb_dbgf("[XHCI-DBG] interrupt_open dev=%u port=%u speed=%s ep=0x%02X "
-        "maxpkt=%u interval=%u buf=0x%llX\n",
-        dev ? dev->address : 0, dev ? dev->port + 1 : 0,
-        dev ? usb_speed_name(dev->speed) : "?", endpoint, max_packet, interval,
-        (unsigned long long)buffer_phys);
   if (!slot || !slot->enabled || !(endpoint & 0x80U) || !max_packet ||
       !buffer || !buffer_phys) {
-    usb_dbgf("[XHCI-DBG] interrupt_open REJECTED slot=%p enabled=%u dir=%u "
-          "maxpkt=%u buffer=%p phys=0x%llX\n",
-          (void *)slot, slot ? slot->enabled : 0,
-          (endpoint & 0x80U) ? 1 : 0, max_packet, buffer,
-          (unsigned long long)buffer_phys);
     return NULL;
   }
   struct xhci_interrupt_state *state = NULL;
@@ -1154,25 +1098,18 @@ static struct usb_interrupt_pipe *xhci_interrupt_open(
       break;
     }
   if (!state) {
-    usb_dbg_puts("[XHCI-DBG] interrupt_open REJECTED no free pipe slot\n");
     return NULL;
   }
   memset(state, 0, sizeof(*state));
   state->endpoint_id = (endpoint & 0x0FU) * 2U + 1U;
   if (state->endpoint_id < 2 || state->endpoint_id > 31 ||
       !xhci_alloc_page(hc, (void **)&state->ring, &state->ring_phys)) {
-    usb_dbgf("[XHCI-DBG] interrupt_open REJECTED dci=%u ring alloc failed\n",
-          state->endpoint_id);
     return NULL;
   }
   state->cycle = 1;
   state->ring[XHCI_RING_TRBS - 1].parameter = state->ring_phys;
   state->ring[XHCI_RING_TRBS - 1].control =
       XHCI_TRB_TYPE(XHCI_TRB_LINK) | XHCI_TRB_CYCLE | (1U << 1);
-  usb_dbgf("[XHCI-DBG] interrupt_open slot=%u dci=%u ring=0x%llX enqueue=%u "
-        "cycle=%u\n",
-        slot->id, state->endpoint_id, (unsigned long long)state->ring_phys,
-        state->enqueue, state->cycle);
 
   memset(slot->input_context, 0, 4096);
   uint32_t *icc = xhci_context(slot->input_context, 0, hc->context_64);
@@ -1180,10 +1117,6 @@ static struct usb_interrupt_pipe *xhci_interrupt_open(
   uint32_t *out_sc = xhci_context(slot->output_context, 0, hc->context_64);
   uint32_t context_bytes = hc->context_64 ? 64U : 32U;
   memcpy(sc, out_sc, context_bytes);
-  usb_dbgf("[XHCI-DBG] slot ctx out: d0=0x%08X d1=0x%08X (context_entries=%u "
-        "speed=%u root_port=%u)\n",
-        out_sc[0], out_sc[1], (out_sc[0] >> 27) & 0x1FU,
-        (out_sc[0] >> 20) & 0x0FU, (out_sc[1] >> 16) & 0xFFU);
 
   /* Configure Endpoint only touches the endpoints referenced by the Add
    * Context Flags; endpoints that are already running are left alone.  Linux
@@ -1202,9 +1135,6 @@ static struct usb_interrupt_pipe *xhci_interrupt_open(
   }
   sc[0] = (sc[0] & ~(0x1FU << 27)) | ((uint32_t)max_dci << 27);
   icc[1] = add_flags;
-  usb_dbgf("[XHCI-DBG] configure add_flags=0x%08X max_dci=%u slot ctx in: "
-        "d0=0x%08X d1=0x%08X\n",
-        add_flags, max_dci, sc[0], sc[1]);
 
   uint32_t *ep = xhci_context(slot->input_context,
                               state->endpoint_id + 1U, hc->context_64);
@@ -1223,10 +1153,6 @@ static struct usb_interrupt_pipe *xhci_interrupt_open(
   ep[2] = (uint32_t)dequeue;
   ep[3] = (uint32_t)(dequeue >> 32);
   ep[4] = avg_trb | (esit << 16);
-  usb_dbgf("[XHCI-DBG] ep ctx dci=%u: d0=0x%08X d1=0x%08X d2=0x%08X d3=0x%08X "
-        "d4=0x%08X (interval=%u esit=%u avg=%u)\n",
-        state->endpoint_id, ep[0], ep[1], ep[2], ep[3], ep[4], interval_field,
-        esit, avg_trb);
 
   bool configured = xhci_submit_command(
       hc, slot->input_context_phys, 0,
@@ -1234,8 +1160,6 @@ static struct usb_interrupt_pipe *xhci_interrupt_open(
           ((uint32_t)slot->id << 24),
       NULL);
   if (!configured) {
-    usb_dbgf("[XHCI-DBG] Configure Endpoint FAILED slot=%u dci=%u\n", slot->id,
-          state->endpoint_id);
     klog_puts("[XHCI] Configure Endpoint failed\n");
     return NULL;
   }
@@ -1248,23 +1172,15 @@ static struct usb_interrupt_pipe *xhci_interrupt_open(
   klogf("[XHCI] Interrupt endpoint state=");
   klog_uint64(ep_state);
   klog_puts("\n");
-  usb_dbgf("[XHCI-DBG] configure done slot=%u dci=%u ep_state=%u "
-        "out_ep_d0=0x%08X out_slot_d0=0x%08X\n",
-        slot->id, state->endpoint_id, ep_state, out_ep[0], out_sc_after[0]);
   if (ep_state != 1U) {
     /* Retry once: a context that lost a race with an earlier command can come
      * back Running on the second try, and the retry costs one command. */
-    usb_dbgf("[XHCI-DBG] endpoint not running (state=%u), retrying Configure "
-          "Endpoint once\n", ep_state);
     configured = xhci_submit_command(
         hc, slot->input_context_phys, 0,
         XHCI_TRB_TYPE(XHCI_TRB_CONFIGURE_ENDPOINT) |
             ((uint32_t)slot->id << 24),
         NULL);
     ep_state = out_ep[0] & 7U;
-    usb_dbgf("[XHCI-DBG] configure retry slot=%u dci=%u ok=%u ep_state=%u "
-          "out_ep_d0=0x%08X\n",
-          slot->id, state->endpoint_id, configured ? 1 : 0, ep_state, out_ep[0]);
     if (!configured || ep_state != 1U) {
       klog_puts("[XHCI] Configured interrupt endpoint is not running\n");
       return NULL;
@@ -1303,11 +1219,6 @@ static bool xhci_interrupt_completed(struct usb_hcd *hcd,
       state->completions_ok++;
     else
       state->completions_short++;
-    if (state->completions_ok + state->completions_short <= 4)
-      usb_dbgf("[XHCI-DBG] interrupt done dci=%u ep=0x%02X cc=%u len=%u "
-            "(ok=%u short=%u)\n",
-            state->endpoint_id, pipe->endpoint, code, actual_len,
-            state->completions_ok, state->completions_short);
     return true;
   }
 
@@ -1322,10 +1233,6 @@ static bool xhci_interrupt_completed(struct usb_hcd *hcd,
     klog_puts(" endpoint=0x");
     klog_hex32(pipe->endpoint);
     klog_puts(" - resubmitting\n");
-    usb_dbgf("[XHCI-DBG] error detail dci=%u residual=%u last_len=%u "
-          "evt_status=0x%08X evt_control=0x%08X\n",
-          state->endpoint_id, state->last_residual, state->last_length,
-          state->last_event_status, state->last_event_control);
   }
   xhci_interrupt_resubmit(hcd, pipe);
   return false;
@@ -1337,10 +1244,6 @@ static int xhci_interrupt_resubmit(struct usb_hcd *hcd,
   if (!state || !pipe->active)
     return -1;
   state->resubmits++;
-  if (state->resubmits <= 4 || (state->resubmits & 0xFFFU) == 0)
-    usb_dbgf("[XHCI-DBG] resubmit dci=%u ep=0x%02X n=%u enqueue=%u cycle=%u\n",
-          state->endpoint_id, pipe->endpoint, state->resubmits,
-          state->enqueue, state->cycle);
   return xhci_interrupt_submit(hcd->priv, state);
 }
 
@@ -1373,10 +1276,6 @@ static void xhci_irq(struct registers *regs) {
       klog_puts(hc->msix_enabled ? "[XHCI] MSI-X interrupt received\n"
                                  : "[XHCI] MSI interrupt received\n");
     }
-    if (hc->irq_count <= 4)
-      usb_dbgf("[XHCI-DBG] irq #%llu vector=%u iman=0x%08X events=%llu\n",
-            (unsigned long long)hc->irq_count, (unsigned)regs->int_no, iman,
-            (unsigned long long)hc->events_seen);
     /* IMAN.IP is RW1C. Acknowledge this interrupter before consuming its
        event ring; ERDP.EHB is cleared as the dequeue pointer advances. */
     mmio_write32(hc->runtime + 0x20, 0,

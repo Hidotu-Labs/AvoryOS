@@ -44,9 +44,9 @@ void ipc_namespace_inherit(struct thread *child, struct thread *parent) {
 void ipc_namespace_release(struct thread *task) { ipc_namespace_install(task, NULL); }
 
 uint32_t ipc_namespace_id(struct thread *task) {
-  if (!task) return 0x4E530002;
+  if (!task) return NS_INIT_INO_IPC;
   spinlock_acquire(&task->namespace_lock);
-  uint32_t id = task->ipc_ns ? task->ipc_ns->id : 0x4E530002;
+  uint32_t id = task->ipc_ns ? task->ipc_ns->id : NS_INIT_INO_IPC;
   spinlock_release(&task->namespace_lock);
   return id;
 }

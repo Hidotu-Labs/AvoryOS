@@ -742,6 +742,26 @@ static void sysfs_populate_nodes(vfs_node_t *node_dir) {
   }
 }
 
+// True when the kernel command line asks for systemd as init (init=...systemd).
+static bool sysfs_init_is_systemd(void) {
+  extern const char *kernel_boot_cmdline;
+  const char *p = kernel_boot_cmdline;
+  while (p && (p = strstr(p, "init=")) != NULL) {
+    bool key_start = p == kernel_boot_cmdline || p[-1] == ' ' || p[-1] == '\t';
+    p += 5;
+    if (!key_start)
+      continue;
+    const char *end = p;
+    while (*end && *end != ' ' && *end != '\t' && *end != '\n')
+      end++;
+    for (const char *q = p; q + 7 <= end; q++)
+      if (strncmp(q, "systemd", 7) == 0)
+        return true;
+    return false;
+  }
+  return false;
+}
+
 // Main init
 
 void sysfs_init(void) {
@@ -1192,7 +1212,10 @@ void sysfs_init(void) {
   // /sys/fs/cgroup expecting tmpfs (hybrid) or cgroup2 (unified); sysfs magic
   // yields ENOMEDIUM without further reads. Pre-mount tmpfs here so the first
   // statfs already sees tmpfs; submounts (unified/elogind) stack on top.
-  tmpfs_mount_at("/sys/fs/cgroup");
+  // systemd >= 256 refuses the hybrid layout ("legacy cgroup hierarchy") and
+  // mounts cgroup2 on the bare directory itself, so leave it empty there.
+  if (!sysfs_init_is_systemd())
+    tmpfs_mount_at("/sys/fs/cgroup");
 
   klog_puts("[OK] SysFS initialized at /sys\n");
 }

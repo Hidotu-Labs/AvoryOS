@@ -200,6 +200,41 @@ install -m 0644 "${ROOT_DIR}/config/wireplumber/20-avoryos-hda.conf" \
 # Keep boot service startup in the versioned init script.
 install -D -m 0755 "${ROOT_DIR}/config/init/rcS" "${ROOTFS_DIR}/etc/init.d/rcS"
 install -D -m 0644 "${ROOT_DIR}/config/init/inittab" "${ROOTFS_DIR}/etc/inittab"
+
+# Experimental systemd entry (init=/usr/lib/systemd/systemd). BusyBox init
+# stays the default /sbin/init; these units only load under that entry.
+# rcS is not used there: each daemon it starts is a native unit (udevd, dbus,
+# polkit by socket/bus activation; resolved, seatd and NetworkManager enabled
+# below), plus AvoryOS units for early init. Audio uses the stock per-user
+# PipeWire units that pam_systemd starts with each login.
+SYSTEMD_ETC="${ROOTFS_DIR}/etc/systemd/system"
+rm -f "${SYSTEMD_ETC}/avoryos-rcs.service" \
+    "${SYSTEMD_ETC}/multi-user.target.wants/avoryos-rcs.service" \
+    "${SYSTEMD_ETC}/avory-pipewire.service" \
+    "${SYSTEMD_ETC}/avory-wireplumber.service" \
+    "${SYSTEMD_ETC}/avory-pipewire-pulse.service" \
+    "${SYSTEMD_ETC}/multi-user.target.wants/avory-pipewire.service"
+for unit in avory-login.service avory-early-init.service; do
+    install -D -m 0644 "${ROOT_DIR}/config/systemd/${unit}" \
+        "${SYSTEMD_ETC}/${unit}"
+done
+install -D -m 0644 "${ROOT_DIR}/config/systemd/seatd.service.d/avoryos.conf" \
+    "${SYSTEMD_ETC}/seatd.service.d/avoryos.conf"
+mkdir -p "${SYSTEMD_ETC}/multi-user.target.wants" \
+    "${SYSTEMD_ETC}/sysinit.target.wants"
+for unit in avory-login.service avory-early-init.service; do
+    ln -sfn "../${unit}" "${SYSTEMD_ETC}/multi-user.target.wants/${unit}"
+done
+ln -sfn /usr/lib/systemd/system/seatd.service \
+    "${SYSTEMD_ETC}/multi-user.target.wants/seatd.service"
+ln -sfn /usr/lib/systemd/system/systemd-resolved.service \
+    "${SYSTEMD_ETC}/sysinit.target.wants/systemd-resolved.service"
+# avory-login owns tty1; mask the stock getty so the two never race for it.
+ln -sfn /dev/null "${ROOTFS_DIR}/etc/systemd/system/getty@tty1.service"
+rm -f "${ROOTFS_DIR}/etc/systemd/system/getty.target.wants/getty@tty1.service"
+rm -rf "${ROOTFS_DIR}/etc/systemd/system/getty@tty1.service.d"
+install -D -m 0644 "${ROOT_DIR}/config/systemd/logind.conf.d/avoryos.conf" \
+    "${ROOTFS_DIR}/etc/systemd/logind.conf.d/avoryos.conf"
 install -D -m 0644 "${ROOT_DIR}/config/sddm/10-theme.conf" \
     "${ROOTFS_DIR}/etc/sddm.conf.d/10-theme.conf"
 

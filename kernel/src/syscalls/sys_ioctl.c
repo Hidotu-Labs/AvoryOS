@@ -721,7 +721,10 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
   case 0x80086601: { // FS_IOC_GETFLAGS: _IOR('f', 1, long)
     // Baloo's database layer asks for extent flags on its index file/dir.
     // This VFS tracks no per-file flags, so report none.
-    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(long))) {
+    // Despite the `long` in the ioctl number, Linux reads and writes an int
+    // here and userspace (systemd chattr_fd, e2fsprogs) passes an int: an
+    // 8-byte store smashes the caller's stack (systemd PID 1 aborted).
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int))) {
       ret = (uint64_t)-14; // EFAULT
       break;
     }
@@ -732,13 +735,13 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
         break;
       }
     }
-    *(long *)arg = 0;
-    ret = 0;
+    int no_flags = 0;
+    ret = copy_to_user((void *)arg, &no_flags, sizeof(no_flags)) ? (uint64_t)-14 : 0;
     break;
   }
   case 0x40086602: { // FS_IOC_SETFLAGS: _IOW('f', 2, long)
     // Paired with GETFLAGS above: validated and accepted, nothing to store.
-    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(long))) {
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int))) {
       ret = (uint64_t)-14; // EFAULT
       break;
     }

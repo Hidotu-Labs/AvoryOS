@@ -335,7 +335,9 @@ static uint64_t sys_gettimeofday(uint64_t tv_ptr, uint64_t tz_ptr, uint64_t a2,
 // settimeofday(tv, tz) - syscall 164
 // NULL/NULL is a harmless no-op probe (returns 0, like Linux).  Actually
 // setting the clock is not supported - there is no RTC-write path - so any
-// real request fails EPERM after pointer validation.
+// real request fails EPERM after pointer validation.  A timezone-only call
+// (systemd PID 1 does this at boot) succeeds: the kernel keeps time in UTC
+// and nothing reads sys_tz.
 static uint64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz_ptr, uint64_t a2,
                                  uint64_t a3, uint64_t a4, uint64_t a5) {
   (void)a2;
@@ -350,7 +352,28 @@ static uint64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz_ptr, uint64_t a2,
     return (uint64_t)-14; // EFAULT
   if (tz_ptr && !vmm_is_user_addr_range_valid(tz_ptr, 8))
     return (uint64_t)-14; // EFAULT
+  if (!tv_ptr)
+    return 0;
   return (uint64_t)-1; // EPERM: setting the clock is not supported
+}
+
+// personality(persona) - syscall 135
+// Only the PER_LINUX execution domain exists, with no personality flags.
+// 0xffffffff queries it (systemd's LockPersonality= does this in every
+// sandboxed service before installing its seccomp filter); setting PER_LINUX
+// is a no-op that returns the previous value, anything else is EINVAL rather
+// than silently ignored (e.g. ADDR_NO_RANDOMIZE would not take effect).
+static uint64_t sys_personality(uint64_t persona, uint64_t a1, uint64_t a2,
+                                uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a1;
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  uint32_t p = (uint32_t)persona;
+  if (p == 0xffffffffU || p == 0 /* PER_LINUX */)
+    return 0;
+  return (uint64_t)-22; // EINVAL
 }
 
 // time(tloc) - syscall 201
@@ -757,6 +780,7 @@ void syscall_register_arch(void) {
   syscall_register(SYS_NANOSLEEP, sys_nanosleep);
   syscall_register(SYS_GETTIMEOFDAY, sys_gettimeofday);
   syscall_register(SYS_SETTIMEOFDAY, sys_settimeofday);
+  syscall_register(SYS_PERSONALITY, sys_personality);
   syscall_register(SYS_TIME, sys_time);
   syscall_register(SYS_MLOCK, sys_mlock);
   syscall_register(SYS_MUNLOCK, sys_munlock);

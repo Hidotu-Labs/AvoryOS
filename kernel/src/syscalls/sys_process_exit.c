@@ -169,7 +169,8 @@ void process_do_exit(uint64_t status) {
         if (!auto_reap &&
             (chld_action->sa_handler == (void *)SIG_DFL || chld_action->sa_handler == NULL) &&
             !parent_group_waiting) {
-          if (parent->tgid == 1 || parent->tid == 1) {
+          if ((parent->tgid == 1 || parent->tid == 1) &&
+              !sched_init_collects_children(parent)) {
             auto_reap = true;
           }
         }

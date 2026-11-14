@@ -47,7 +47,10 @@ fi
 mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
 chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
-if [ "$USER_ID" = 0 ]; then
+if [ -d "$XDG_RUNTIME_DIR/systemd" ]; then
+    # A pam_systemd login's user manager runs the stock PipeWire units.
+    :
+elif [ "$USER_ID" = 0 ] && [ -S /run/pipewire/pipewire-0 ]; then
     # rcS owns the root graph in /run/pipewire. Route both native and Pulse
     # clients there before the Plasma D-Bus session is created.
     export PIPEWIRE_RUNTIME_DIR=/run/pipewire

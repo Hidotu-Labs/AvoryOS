@@ -93,6 +93,8 @@
 #define SYS_FLOCK 73
 #define SYS_FSYNC 74
 #define SYS_FDATASYNC 75
+#define SYS_SYNC 162
+#define SYS_SYNCFS 306
 #define SYS_FTRUNCATE 77
 #define SYS_GETCWD 79
 #define SYS_CHDIR 80
@@ -254,6 +256,7 @@
 #define SYS_PIVOT_ROOT 155
 #define SYS_CHROOT 161
 #define SYS_SETTIMEOFDAY 164
+#define SYS_PERSONALITY 135
 #define SYS_MOUNT 165
 #define SYS_SWAPON 167
 #define SYS_INIT_MODULE 175

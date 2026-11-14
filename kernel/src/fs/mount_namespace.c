@@ -1017,3 +1017,18 @@ int vfs_get_mounts_task(struct thread *task, vfs_mount_info_t *b, int max) {
 int vfs_namespace_mounts(vfs_mount_info_t *b, int max) {
   return vfs_get_mounts_task(sched_get_current(), b, max);
 }
+/* A view is a mount root when it carries a live mount's id and inode. */
+bool vfs_namespace_is_mount_root(vfs_node_t *n) {
+  struct mount_namespace *ns = current_ns();
+  bool root = false;
+  if (!ns || !n)
+    return false;
+  spinlock_acquire(&ns->lock);
+  for (struct mount_link *m = ns->mounts; m; m = m->next)
+    if (!m->detached && m->id == n->mount_id && same_inode(m->target, n)) {
+      root = true;
+      break;
+    }
+  spinlock_release(&ns->lock);
+  return root;
+}
