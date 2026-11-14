@@ -15,6 +15,9 @@
 #include <linuxkpi/service.h>
 
 #define KPI_WQ_MAX_WORKERS 4
+/* Serializes the work->wq publication with disable/cancel callers. Lock order
+ * is submission lock then queue lock; workers take only the queue lock. */
+static DEFINE_SPINLOCK(work_submit_lock);
 static unsigned long workqueue_live_count;
 unsigned long linuxkpi_workqueue_live_count(void) {
   return __atomic_load_n(&workqueue_live_count, __ATOMIC_ACQUIRE);
@@ -199,11 +202,13 @@ static void wq_ensure_worker(struct workqueue_struct *wq) {
 }
 
 static bool __queue_work(struct workqueue_struct *wq, struct work_struct *work) {
-  unsigned long flags;
-  spin_lock_irqsave(&wq->lock, flags);
+  unsigned long submit_flags, queue_flags;
+  spin_lock_irqsave(&work_submit_lock, submit_flags);
+  spin_lock_irqsave(&wq->lock, queue_flags);
 
-  if (work->pending) {
-    spin_unlock_irqrestore(&wq->lock, flags);
+  if (work->pending || __atomic_load_n(&work->disabled, __ATOMIC_ACQUIRE)) {
+    spin_unlock_irqrestore(&wq->lock, queue_flags);
+    spin_unlock_irqrestore(&work_submit_lock, submit_flags);
     return false;
   }
 
@@ -213,7 +218,8 @@ static bool __queue_work(struct workqueue_struct *wq, struct work_struct *work) 
   wq->gen++;
   list_add_tail(&work->entry, &wq->pending);
 
-  spin_unlock_irqrestore(&wq->lock, flags);
+  spin_unlock_irqrestore(&wq->lock, queue_flags);
+  spin_unlock_irqrestore(&work_submit_lock, submit_flags);
 
   __kpi_wake_up(&wq->more_work, 1, 0);
   wq_ensure_worker(wq);
@@ -299,6 +305,50 @@ bool cancel_work_sync(struct work_struct *work) {
       msleep(1);
   } while (running);
   return cancelled;
+}
+
+bool disable_work(struct work_struct *work) {
+  if (!work)
+    return false;
+  unsigned long flags;
+  bool cancelled = false;
+  spin_lock_irqsave(&work_submit_lock, flags);
+  __atomic_fetch_add(&work->disabled, 1, __ATOMIC_ACQ_REL);
+  struct workqueue_struct *wq = work->wq;
+  if (wq) {
+    spin_lock(&wq->lock);
+    if (work->pending) {
+      list_del_init(&work->entry);
+      work->pending = 0;
+      wq->active--;
+      cancelled = true;
+    }
+    spin_unlock(&wq->lock);
+  }
+  spin_unlock_irqrestore(&work_submit_lock, flags);
+  if (cancelled && wq)
+    __kpi_wake_up(&wq->flush_wait, 0, 0);
+  return cancelled;
+}
+
+bool disable_work_sync(struct work_struct *work) {
+  if (!work)
+    return false;
+  bool cancelled = disable_work(work);
+  (void)cancel_work_sync(work);
+  return cancelled;
+}
+
+bool enable_work(struct work_struct *work) {
+  if (!work)
+    return false;
+  int depth = __atomic_load_n(&work->disabled, __ATOMIC_ACQUIRE);
+  while (depth > 0) {
+    if (__atomic_compare_exchange_n(&work->disabled, &depth, depth - 1, false,
+                                    __ATOMIC_RELEASE, __ATOMIC_ACQUIRE))
+      return depth == 1;
+  }
+  return false;
 }
 
 /* ── delayed work ───────────────────────────────────────────────────────── */

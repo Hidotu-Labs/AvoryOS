@@ -113,6 +113,71 @@ static bool kpi_nouveau_probe_allowed(const struct pci_dev *pdev) {
   return !strcmp(kpi_nouveau_bdf, bdf);
 }
 
+/* r8169 passed its R3 hardware gate and binds Realtek-vendor NICs in its ID
+ * table by default; kpi_r8169=0 opts out and kpi_r8169_bdf narrows binding to
+ * one canonical BDF. The Wi-Fi drivers remain unbound unless both an explicit
+ * boolean and a BDF are supplied. Malformed selectors cannot match a device.
+ * These selectors are independent of build-time object gates. */
+static bool kpi_r8169 = true;
+static bool kpi_rtw89_8852be;
+static bool kpi_rtw88_8822ce;
+static char kpi_r8169_bdf[16];
+static char kpi_rtw89_8852be_bdf[16];
+static char kpi_rtw88_8822ce_bdf[16];
+module_param(kpi_r8169, bool, 0);
+module_param(kpi_rtw89_8852be, bool, 0);
+module_param(kpi_rtw88_8822ce, bool, 0);
+module_param_string(kpi_r8169_bdf, kpi_r8169_bdf,
+                    sizeof(kpi_r8169_bdf), 0);
+/* R3 hardware test: fail the selected r8169's first probe at register_netdev,
+ * after BARs, IRQ vectors and the MDIO bus exist, verify the unwind, then
+ * probe the same device again. */
+static bool kpi_r8169_probe_fail_test;
+module_param(kpi_r8169_probe_fail_test, bool, 0);
+module_param_string(kpi_rtw89_8852be_bdf, kpi_rtw89_8852be_bdf,
+                    sizeof(kpi_rtw89_8852be_bdf), 0);
+module_param_string(kpi_rtw88_8822ce_bdf, kpi_rtw88_8822ce_bdf,
+                    sizeof(kpi_rtw88_8822ce_bdf), 0);
+
+static bool kpi_realtek_driver(const struct pci_driver *drv) {
+  return drv && drv->name &&
+      (!strcmp(drv->name, "r8169") ||
+       !strcmp(drv->name, "rtw89_8852be") ||
+       !strcmp(drv->name, "rtw88_8822ce"));
+}
+
+static bool kpi_realtek_probe_allowed(const struct pci_driver *drv,
+                                     const struct pci_dev *pdev) {
+  const bool *enabled = NULL;
+  const char *selected_bdf = NULL;
+  struct linuxkpi_pci_info info;
+  char bdf[16];
+
+  if (!drv || !drv->name || !pdev || !pdev->sysdata)
+    return false;
+  if (!strcmp(drv->name, "r8169")) {
+    enabled = &kpi_r8169;
+    selected_bdf = kpi_r8169_bdf;
+  } else if (!strcmp(drv->name, "rtw89_8852be")) {
+    enabled = &kpi_rtw89_8852be;
+    selected_bdf = kpi_rtw89_8852be_bdf;
+  } else if (!strcmp(drv->name, "rtw88_8822ce")) {
+    enabled = &kpi_rtw88_8822ce;
+    selected_bdf = kpi_rtw88_8822ce_bdf;
+  } else {
+    return true;
+  }
+  if (!*enabled || pdev->vendor != 0x10ec || (pdev->class >> 16) != 0x02)
+    return false;
+  if (!selected_bdf[0])
+    return enabled == &kpi_r8169;
+
+  linuxkpi_pci_native_snapshot(pdev->sysdata, &info);
+  snprintf(bdf, sizeof(bdf), "0000:%02x:%02x.%u", info.bus, info.slot,
+           info.func);
+  return !strcmp(selected_bdf, bdf);
+}
+
 /* Test support for test_phase6_link: amdgpu's probe fails while firmware and
  * rings are still missing (C4), and the driver core unbinds the device on
  * probe failure, so remember that the probe ran and what it returned. */
@@ -494,10 +559,14 @@ const struct pci_device_id *pci_match_id(const struct pci_device_id *ids,
 }
 
 extern bool linuxkpi_nouveau_device_registered(struct pci_dev *) __attribute__((weak));
+extern void linuxkpi_netdev_fail_next_register(int) __attribute__((weak));
+extern unsigned linuxkpi_netdev_registered_count(void) __attribute__((weak));
+
+static bool kpi_pci_irq_vectors_allocated(struct pci_dev *dev);
 
 struct kpi_probe_usage {
   struct linuxkpi_firmware_usage firmware;
-  unsigned long maps, irqs, queues;
+  unsigned long maps, irqs, queues, netdevs;
   int enables;
 };
 
@@ -507,9 +576,12 @@ static void kpi_probe_usage(struct pci_dev *pdev, struct kpi_probe_usage *usage)
   usage->irqs = linuxkpi_irq_live_actions();
   usage->queues = linuxkpi_workqueue_live_count();
   usage->enables = atomic_read(&pdev->enable_cnt);
+  usage->netdevs = linuxkpi_netdev_registered_count
+      ? linuxkpi_netdev_registered_count() : 0;
 }
 
 static void kpi_probe_cleanup_check(struct pci_dev *pdev,
+                                    const char *name,
                                     const struct kpi_probe_usage *before) {
   struct kpi_probe_usage after;
   bool clean;
@@ -519,18 +591,25 @@ static void kpi_probe_cleanup_check(struct pci_dev *pdev,
           before->firmware.bytes == after.firmware.bytes &&
           before->maps == after.maps && before->irqs == after.irqs &&
           before->queues == after.queues && before->enables == after.enables &&
+          before->netdevs == after.netdevs &&
           !pdev->driver && !pdev->dev.driver && !pci_get_drvdata(pdev) &&
           list_empty(&pdev->dev.devres_head) && !pdev->msi_enabled &&
-          !pdev->msix_enabled && linuxkpi_nouveau_device_registered &&
-          !linuxkpi_nouveau_device_registered(pdev);
-  klogf("[%s] LinuxKPI: nouveau failed-probe cleanup headers=%lu/%lu "
+          !pdev->msix_enabled && !kpi_pci_irq_vectors_allocated(pdev) &&
+          !pdev->is_msi_managed;
+  if (!strcmp(name, "nouveau"))
+    clean = clean && linuxkpi_nouveau_device_registered &&
+            !linuxkpi_nouveau_device_registered(pdev);
+  klogf("[%s] LinuxKPI: %s failed-probe cleanup headers=%lu/%lu "
         "buffers=%lu/%lu bytes=%lu/%lu maps=%lu/%lu IRQ=%lu/%lu "
-        "queues=%lu/%lu enables=%d/%d unbound=%d\n", clean ? "  OK  " : "FAIL",
+        "queues=%lu/%lu netdevs=%lu/%lu enables=%d/%d vectors=%d "
+        "unbound=%d\n",
+        clean ? "  OK  " : "FAIL", name,
         before->firmware.headers, after.firmware.headers,
         before->firmware.buffers, after.firmware.buffers,
         before->firmware.bytes, after.firmware.bytes, before->maps, after.maps,
         before->irqs, after.irqs, before->queues, after.queues,
-        before->enables, after.enables, !pdev->driver);
+        before->netdevs, after.netdevs, before->enables, after.enables,
+        kpi_pci_irq_vectors_allocated(pdev), !pdev->driver);
 }
 
 static void kpi_pci_probe_device(struct pci_driver *drv,
@@ -538,15 +617,29 @@ static void kpi_pci_probe_device(struct pci_driver *drv,
   const struct pci_device_id *id;
   struct kpi_probe_usage before;
   bool check_cleanup = kpi_nouveau_probe_cleanup_test && !strcmp(drv->name, "nouveau");
+  bool r8169_fail_test = false;
   int ret;
 
   if (!pdev || pdev->driver)
     return;
   if (!strcmp(drv->name, "nouveau") && !kpi_nouveau_probe_allowed(pdev))
     return;
+  if (!kpi_realtek_probe_allowed(drv, pdev))
+    return;
   id = pci_match_id(drv->id_table, pdev);
   if (!id)
     return;
+
+  /* Device-manager ownership is claimed under the same native device lock
+   * used by dm_bind_device(). This closes the race with native and user
+   * driver binds; the sysfs Linux driver symlink is publication only. */
+  bool claim_native = kpi_realtek_driver(drv);
+  if (claim_native &&
+      !linuxkpi_pci_native_claim(pdev->sysdata, drv->name)) {
+    klogf("[KERNEL] LinuxKPI: pci %s skipped %s; native device already owned\n",
+          drv->name, pci_name(pdev));
+    return;
+  }
 
   pdev->driver = drv;
   pdev->dev.driver = &drv->driver;
@@ -564,6 +657,13 @@ static void kpi_pci_probe_device(struct pci_driver *drv,
             (unsigned long long)pci_resource_start(pdev, bar),
             (unsigned long long)pci_resource_len(pdev, bar),
             (unsigned long)pci_resource_flags(pdev, bar));
+  }
+  if (kpi_r8169_probe_fail_test && !strcmp(drv->name, "r8169") &&
+      linuxkpi_netdev_fail_next_register) {
+    /* One shot: the retry below must take the normal path. */
+    kpi_r8169_probe_fail_test = false;
+    r8169_fail_test = check_cleanup = true;
+    linuxkpi_netdev_fail_next_register(-EIO);
   }
   if (check_cleanup)
     kpi_probe_usage(pdev, &before);
@@ -583,8 +683,15 @@ static void kpi_pci_probe_device(struct pci_driver *drv,
     pci_set_drvdata(pdev, NULL);
     pdev->driver = NULL;
     pdev->dev.driver = NULL;
+    if (claim_native)
+      linuxkpi_pci_native_release(pdev->sysdata, drv->name);
     if (check_cleanup)
-      kpi_probe_cleanup_check(pdev, &before);
+      kpi_probe_cleanup_check(pdev, drv->name, &before);
+    if (r8169_fail_test) {
+      klogf("[KERNEL] LinuxKPI: pci r8169 retrying %s after failed probe\n",
+            pci_name(pdev));
+      kpi_pci_probe_device(drv, pdev);
+    }
     return;
   }
 
@@ -699,6 +806,10 @@ void pci_unregister_driver(struct pci_driver *drv) {
       linuxkpi_pci_native_driver(pdev->sysdata, NULL);
       pdev->driver = NULL;
       pdev->dev.driver = NULL;
+      /* Keep native ownership reserved through remove, resource release and
+       * sysfs unpublication. Only then may a native driver bind. */
+      if (kpi_realtek_driver(drv))
+        linuxkpi_pci_native_release(pdev->sysdata, drv->name);
     }
 
     list_del(&node->node);
@@ -1026,6 +1137,31 @@ int pcim_enable_device(struct pci_dev *pdev) {
 
 void pcim_pin_device(struct pci_dev *pdev) { (void)pdev; }
 
+int pcim_set_mwi(struct pci_dev *pdev) {
+  /* The native PCI core does not configure the cache line size for MWI.
+   * Drivers can keep using ordinary memory writes. */
+  return pdev ? -EOPNOTSUPP : -EINVAL;
+}
+
+bool pci_dev_run_wake(struct pci_dev *pdev) {
+  (void)pdev;
+  return false; /* Runtime PCI wake is unavailable in this profile. */
+}
+
+int pci_prepare_to_sleep(struct pci_dev *pdev) {
+  return pdev ? -EOPNOTSUPP : -EINVAL;
+}
+
+int pci_status_get_and_clear_errors(struct pci_dev *pdev) {
+  u16 status;
+  if (pci_read_config_word(pdev, PCI_STATUS, &status))
+    return -EIO;
+  status &= PCI_STATUS_ERROR_BITS;
+  if (status && pci_write_config_word(pdev, PCI_STATUS, status))
+    return -EIO;
+  return status;
+}
+
 void pci_set_master(struct pci_dev *dev) {
   if (!dev)
     return;
@@ -1220,6 +1356,53 @@ void pci_iounmap(struct pci_dev *dev, void __iomem *addr) {
     iounmap(addr);
 }
 
+struct kpi_pcim_mapping {
+  struct pci_dev *dev;
+  void __iomem *addr;
+  int bar;
+};
+
+static void kpi_pcim_release_mapping(void *data) {
+  struct kpi_pcim_mapping *mapping = data;
+  pci_iounmap(mapping->dev, mapping->addr);
+  pci_release_region(mapping->dev, mapping->bar);
+  kfree(mapping);
+}
+
+void __iomem *pcim_iomap_region(struct pci_dev *pdev, int bar,
+                                 const char *name) {
+  if (!pdev || bar < 0 || bar >= PCI_STD_NUM_BARS)
+    return IOMEM_ERR_PTR(-EINVAL);
+  struct resource *res = &pdev->resource[bar];
+  if (!(res->flags & (IORESOURCE_MEM | IORESOURCE_IO)) ||
+      !pci_resource_len(pdev, bar))
+    return IOMEM_ERR_PTR(-EINVAL);
+  if (res->flags & IORESOURCE_BUSY)
+    return IOMEM_ERR_PTR(-EBUSY);
+  struct kpi_pcim_mapping *mapping = kzalloc(sizeof(*mapping), GFP_KERNEL);
+  if (!mapping)
+    return IOMEM_ERR_PTR(-ENOMEM);
+  /* Own the region and mapping in one devres action so the BAR busy flag
+   * is cleared on both probe failure and driver removal. */
+  if (!__request_region(kpi_pci_region_parent(res->flags), res->start,
+                        resource_size(res), name, 0)) {
+    kfree(mapping);
+    return IOMEM_ERR_PTR(-EBUSY);
+  }
+  res->flags |= IORESOURCE_BUSY;
+  mapping->dev = pdev;
+  mapping->bar = bar;
+  mapping->addr = pci_iomap(pdev, bar, 0);
+  if (!mapping->addr) {
+    kpi_pcim_release_mapping(mapping);
+    return IOMEM_ERR_PTR(-ENOMEM);
+  }
+  void __iomem *addr = mapping->addr;
+  int ret = devm_add_action_or_reset(&pdev->dev, kpi_pcim_release_mapping,
+                                     mapping);
+  return ret ? IOMEM_ERR_PTR(ret) : addr;
+}
+
 /* ── device lookup ──────────────────────────────────────────────────────── */
 
 static int kpi_pci_index_of(const struct pci_dev *dev) {
@@ -1386,6 +1569,21 @@ static unsigned int kpi_pci_flags_to_modes(unsigned int flags) {
   return modes;
 }
 
+static void kpi_pcim_msi_release(void *data) {
+  struct pci_dev *dev = data;
+
+  dev->is_msi_managed = false;
+  pci_free_irq_vectors(dev);
+}
+
+static bool kpi_pci_irq_vectors_allocated(struct pci_dev *dev) {
+  int idx = kpi_pci_index_of(dev);
+
+  return idx >= 0 &&
+         idx < (int)(sizeof(kpi_pci_irqs) / sizeof(kpi_pci_irqs[0])) &&
+         kpi_pci_irqs[idx].used;
+}
+
 int pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
                                    unsigned int max_vecs, unsigned int flags,
                                    struct irq_affinity *affd) {
@@ -1433,6 +1631,15 @@ int pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
     st->vecs[i].index = i;
     if (linuxkpi_native_pci_irq_can_mask(st->native))
       linuxkpi_irq_register_mask(st->irq[i], kpi_pci_irq_mask_cb, &st->vecs[i]);
+  }
+  /* Upstream pcim_setup_msi_release(): vectors of a pcim-enabled device are
+   * freed by devres, including the failed-probe unwind. */
+  if (pci_is_managed(dev) && !dev->is_msi_managed) {
+    if (devm_add_action(&dev->dev, kpi_pcim_msi_release, dev)) {
+      pci_free_irq_vectors(dev);
+      return -ENOMEM;
+    }
+    dev->is_msi_managed = true;
   }
   return count;
 }
@@ -2005,6 +2212,21 @@ u32 pcie_bandwidth_available(struct pci_dev *dev, struct pci_dev **limiting_dev,
 int pci_reset_function(struct pci_dev *dev) {
   (void)dev;
   return -ENOTSUPP;
+}
+
+int pci_reset_bus(struct pci_dev *dev) {
+  /* Reset affects other functions behind the bridge. LinuxKPI has no
+   * coordinated bus reset/restore operation yet. */
+  return dev ? -EOPNOTSUPP : -EINVAL;
+}
+
+int pcie_set_readrq(struct pci_dev *dev, int rq) {
+  if (!dev || rq < 128 || rq > 4096 || (rq & (rq - 1)))
+    return -EINVAL;
+  u16 encoding = (u16)(__builtin_ctz((unsigned int)rq) - 7) << 12;
+  int ret = pcie_capability_clear_and_set_word_locked(
+      dev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_READRQ, encoding);
+  return ret ? -EIO : 0;
 }
 
 u32 pci_rebar_get_possible_sizes(struct pci_dev *pdev, int bar) {

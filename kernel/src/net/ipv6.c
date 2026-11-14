@@ -79,18 +79,28 @@ static uint16_t icmp6_checksum(const uint8_t source[16],
   return (uint16_t)~sum;
 }
 
-static int ethernet_send(const uint8_t mac[6], const void *payload,
+static int ethernet_send(const uint8_t expected_mac[6],
+                         const uint8_t mac[6], const void *payload,
                          size_t length) {
-  struct net_device *dev = net_device_default();
+  struct net_device *dev = net_device_default_acquire();
   if (!dev || length + 14 > NET_FRAME_MAX - 4)
-    return -1;
+    goto send_fail;
+  if (expected_mac && memcmp(expected_mac, dev->mac, 6) != 0)
+    goto send_fail;
   uint8_t frame[NET_FRAME_MAX - 4];
   memcpy(frame, mac, 6);
   memcpy(frame + 6, dev->mac, 6);
   frame[12] = (uint8_t)(ETH_TYPE_IPV6 >> 8);
   frame[13] = (uint8_t)ETH_TYPE_IPV6;
   memcpy(frame + 14, payload, length);
-  return dev->ops->transmit(dev, frame, length + 14);
+  int ret = dev->ops && dev->ops->transmit
+                ? dev->ops->transmit(dev, frame, length + 14)
+                : -1;
+  net_device_put(dev);
+  return ret;
+send_fail:
+  net_device_put(dev);
+  return -1;
 }
 
 static void multicast_mac(const uint8_t address[16], uint8_t mac[6]) {
@@ -139,7 +149,8 @@ static bool neighbor_lookup(const uint8_t address[16], uint8_t mac[6]) {
   return found;
 }
 
-static int ipv6_send_to(const uint8_t source[16], const uint8_t destination[16],
+static int ipv6_send_to(const uint8_t expected_mac[6],
+                        const uint8_t source[16], const uint8_t destination[16],
                         const uint8_t mac[6], uint8_t next_header,
                         uint8_t *payload, size_t length) {
   if (length + sizeof(struct ipv6_header) > NET_MTU_ETHERNET)
@@ -160,7 +171,7 @@ static int ipv6_send_to(const uint8_t source[16], const uint8_t destination[16],
     payload[3] = (uint8_t)csum;
   }
   memcpy(packet + sizeof(*h), payload, length);
-  return ethernet_send(mac, packet, sizeof(*h) + length);
+  return ethernet_send(expected_mac, mac, packet, sizeof(*h) + length);
 }
 
 static bool local_address(const uint8_t address[16]) {
@@ -170,17 +181,21 @@ static bool local_address(const uint8_t address[16]) {
 
 static void send_na(const uint8_t destination[16], const uint8_t mac[6],
                     const uint8_t target[16]) {
-  struct net_device *dev = net_device_default();
+  struct net_device *dev = net_device_default_acquire();
   if (!dev)
     return;
+  uint8_t device_mac[6];
+  memcpy(device_mac, dev->mac, sizeof(device_mac));
+  net_device_put(dev);
   uint8_t na[32];
   memset(na, 0, sizeof(na));
   na[0] = ICMP6_NA;
   na[4] = 0x60; /* solicited + override */
   memcpy(na + 8, target, 16);
   na[24] = 2; na[25] = 1;
-  memcpy(na + 26, dev->mac, 6);
-  ipv6_send_to(target, destination, mac, IPV6_NEXT_ICMP, na, sizeof(na));
+  memcpy(na + 26, device_mac, 6);
+  ipv6_send_to(device_mac, target, destination, mac, IPV6_NEXT_ICMP, na,
+               sizeof(na));
 }
 
 static bool in_net_worker_thread(void) {
@@ -228,10 +243,8 @@ static bool neighbor_wait_for_reply(const uint8_t target[16], uint8_t mac[6],
   }
 }
 
-static bool resolve_neighbor(const uint8_t target[16], uint8_t mac[6]) {
-  struct net_device *dev = net_device_default();
-  if (!dev)
-    return false;
+static bool resolve_neighbor(const uint8_t target[16], uint8_t mac[6],
+                             const uint8_t device_mac[6]) {
   if (addr_multicast(target)) {
     multicast_mac(target, mac);
     return true;
@@ -249,13 +262,14 @@ static bool resolve_neighbor(const uint8_t target[16], uint8_t mac[6]) {
   ns[0] = ICMP6_NS;
   memcpy(ns + 8, target, 16);
   ns[24] = 1; ns[25] = 1;
-  memcpy(ns + 26, dev->mac, 6);
+  memcpy(ns + 26, device_mac, 6);
   struct thread *current = sched_get_current();
   bool can_wait = current && !in_net_worker_thread();
   int attempts = can_wait ? 3 : 1;
   for (int attempt = 0; attempt < attempts; attempt++) {
-    ipv6_send_to(config.link_local, solicited, multicast, IPV6_NEXT_ICMP,
-                 ns, sizeof(ns));
+    if (ipv6_send_to(device_mac, config.link_local, solicited, multicast,
+                     IPV6_NEXT_ICMP, ns, sizeof(ns)) != 0)
+      return false;
     if (!can_wait)
       return neighbor_lookup(target, mac);
     if (neighbor_wait_for_reply(target, mac,
@@ -269,6 +283,12 @@ int ipv6_send_raw(const uint8_t destination[16], uint8_t next_header,
                   const void *payload, size_t length) {
   if (!destination || !payload)
     return -22;
+  struct net_device *dev = net_device_default_acquire();
+  if (!dev)
+    return -100;
+  uint8_t device_mac[6];
+  memcpy(device_mac, dev->mac, sizeof(device_mac));
+  net_device_put(dev);
   const uint8_t *source = config.link_local;
   const uint8_t *next_hop = destination;
   bool link_local = destination[0] == 0xfe &&
@@ -285,13 +305,14 @@ int ipv6_send_raw(const uint8_t destination[16], uint8_t next_header,
       next_hop = config.router;
   }
   uint8_t mac[6];
-  if (!resolve_neighbor(next_hop, mac))
+  if (!resolve_neighbor(next_hop, mac, device_mac))
     return -113;
   uint8_t copy[NET_MTU_ETHERNET - sizeof(struct ipv6_header)];
   if (length > sizeof(copy))
     return -90;
   memcpy(copy, payload, length);
-  return ipv6_send_to(source, destination, mac, next_header, copy, length);
+  return ipv6_send_to(device_mac, source, destination, mac, next_header,
+                      copy, length);
 }
 
 static void handle_ra(const uint8_t source[16], const uint8_t source_mac[6],
@@ -352,7 +373,7 @@ void ipv6_receive(const uint8_t source_mac[6], const uint8_t *packet,
     uint8_t reply[NET_MTU_ETHERNET - sizeof(*h)];
     memcpy(reply, icmp, payload_length);
     reply[0] = ICMP6_ECHO_REPLY;
-    ipv6_send_to(h->destination, h->source, source_mac, IPV6_NEXT_ICMP,
+    ipv6_send_to(NULL, h->destination, h->source, source_mac, IPV6_NEXT_ICMP,
                  reply, payload_length);
   } else if (icmp[0] == ICMP6_NS && payload_length >= 24 &&
              local_address(icmp + 8)) {
@@ -365,9 +386,12 @@ void ipv6_receive(const uint8_t source_mac[6], const uint8_t *packet,
 }
 
 static void send_router_solicitation(void) {
-  struct net_device *dev = net_device_default();
+  struct net_device *dev = net_device_default_acquire();
   if (!dev)
     return;
+  uint8_t device_mac[6];
+  memcpy(device_mac, dev->mac, sizeof(device_mac));
+  net_device_put(dev);
   static const uint8_t all_routers[16] =
       {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2};
   uint8_t mac[6], rs[16];
@@ -375,15 +399,18 @@ static void send_router_solicitation(void) {
   memset(rs, 0, sizeof(rs));
   rs[0] = ICMP6_RS;
   rs[8] = 1; rs[9] = 1;
-  memcpy(rs + 10, dev->mac, 6);
-  ipv6_send_to(config.link_local, all_routers, mac, IPV6_NEXT_ICMP,
-               rs, sizeof(rs));
+  memcpy(rs + 10, device_mac, 6);
+  ipv6_send_to(device_mac, config.link_local, all_routers, mac,
+               IPV6_NEXT_ICMP, rs, sizeof(rs));
 }
 
 bool net_phase11_init(void) {
-  struct net_device *dev = net_device_default();
+  struct net_device *dev = net_device_default_acquire();
   if (!dev)
     return false;
+  uint8_t device_mac[6];
+  memcpy(device_mac, dev->mac, sizeof(device_mac));
+  net_device_put(dev);
   memset(&config, 0, sizeof(config));
   spinlock_init(&neighbor_lock);
   memset(neighbors, 0, sizeof(neighbors));
@@ -392,14 +419,14 @@ bool net_phase11_init(void) {
     wait_queue_init(&neighbor_wait[i]);
   config.link_local[0] = 0xfe;
   config.link_local[1] = 0x80;
-  config.link_local[8] = dev->mac[0] ^ 0x02;
-  config.link_local[9] = dev->mac[1];
-  config.link_local[10] = dev->mac[2];
+  config.link_local[8] = device_mac[0] ^ 0x02;
+  config.link_local[9] = device_mac[1];
+  config.link_local[10] = device_mac[2];
   config.link_local[11] = 0xff;
   config.link_local[12] = 0xfe;
-  config.link_local[13] = dev->mac[3];
-  config.link_local[14] = dev->mac[4];
-  config.link_local[15] = dev->mac[5];
+  config.link_local[13] = device_mac[3];
+  config.link_local[14] = device_mac[4];
+  config.link_local[15] = device_mac[5];
 
   send_router_solicitation();
   klog_puts("[NET] IPv6 link-local, NDP and SLAAC initialized\n");

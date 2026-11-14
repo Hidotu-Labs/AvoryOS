@@ -67,6 +67,7 @@ void disable_irq(unsigned int irq);
 void disable_irq_nosync(unsigned int irq);
 bool disable_hardirq(unsigned int irq);
 void synchronize_irq(unsigned int irq);
+void irq_wake_thread(unsigned int irq, void *dev_id);
 bool synchronize_hardirq(unsigned int irq);
 
 int irq_set_affinity_hint(unsigned int irq, const struct cpumask *m);

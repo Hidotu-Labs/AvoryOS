@@ -9,6 +9,7 @@
 
 #include "drivers/pci/pci.h"
 #include "drivers/pci/pcie.h"
+#include "drivers/manager/device.h"
 #include "fs/sysfs_pci.h"
 #include "lib/string.h"
 
@@ -23,6 +24,19 @@ int linuxkpi_pci_config_size(void *handle) {
 
 void linuxkpi_pci_native_driver(void *handle, const char *name) {
   sysfs_pci_linux_driver(handle, name);
+}
+
+int linuxkpi_pci_native_claim(void *handle, const char *name) {
+  struct pci_device *dev = handle;
+  if (!dev || !dev->kernel_device)
+    return 0;
+  return dm_claim_external_device(dev->kernel_device, name) ? 1 : 0;
+}
+
+void linuxkpi_pci_native_release(void *handle, const char *name) {
+  struct pci_device *dev = handle;
+  if (dev && dev->kernel_device)
+    dm_release_external_device(dev->kernel_device, name);
 }
 
 void *linuxkpi_pci_native_get(int index) {

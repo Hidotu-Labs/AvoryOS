@@ -731,7 +731,7 @@ static void service_device(struct e1000 *dev) {
   if (notify) {
     klogf("[%s] %s link %s\n", dev->profile->log_tag, dev->netdev.name,
           carrier ? "up" : "down");
-    if (net_device_default() == &dev->netdev)
+    if (net_device_is_default(&dev->netdev))
       netlink_notify_link(&dev->netdev);
   }
   lifecycle_unlock(dev);
@@ -953,7 +953,7 @@ static void remove_device(struct device *device) {
   struct e1000 *dev = device->driver_data;
   if (!dev)
     return;
-  dev->restore_default = net_device_default() == &dev->netdev;
+  dev->restore_default = net_device_is_default(&dev->netdev);
   stop(&dev->netdev);
   net_device_unregister(&dev->netdev);
   dev->bound = false;

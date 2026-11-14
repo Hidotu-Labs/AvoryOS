@@ -19,6 +19,7 @@ struct class {
   const char *name;
   const struct attribute_group **dev_groups;
   char *(*devnode)(const struct device *dev, umode_t *mode);
+  void (*dev_release)(struct device *dev);
   struct kobject *dev_kobj;
   struct device *(*get_device)(struct device *dev);
   void *kpi_dir; /* native /sys/class/<name> vfs_node_t (Avory) */
@@ -75,5 +76,7 @@ void class_destroy(const struct class *cls);
 
 int class_register(const struct class *cls);
 void class_unregister(const struct class *cls);
+struct device *class_find_device_by_name(const struct class *cls,
+                                          const char *name);
 
 #endif /* __AVORY_LINUXKPI_DEVICE_CLASS_H */

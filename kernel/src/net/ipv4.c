@@ -128,20 +128,6 @@ static uint16_t checksum(const void *data, size_t length) {
   return (uint16_t)~sum;
 }
 
-static int ethernet_send(const uint8_t destination[6], uint16_t type,
-                         const void *payload, size_t length) {
-  struct net_device *dev = net_device_default();
-  if (!dev || length + sizeof(struct eth_header) > NET_FRAME_MAX - 4)
-    return -1;
-  uint8_t frame[NET_FRAME_MAX - 4];
-  struct eth_header *header = (struct eth_header *)frame;
-  memcpy(header->destination, destination, 6);
-  memcpy(header->source, dev->mac, 6);
-  header->type = be16(type);
-  memcpy(frame + sizeof(*header), payload, length);
-  return dev->ops->transmit(dev, frame, sizeof(*header) + length);
-}
-
 static struct arp_entry *arp_find_locked(uint32_t ip) {
   for (uint32_t i = 0; i < ARP_CACHE_SIZE; i++)
     if (arp_cache[i].state != ARP_FREE && arp_cache[i].ip == ip)
@@ -199,7 +185,9 @@ static bool arp_lookup(uint32_t ip, uint8_t mac[6]) {
 
 static int arp_send(uint16_t operation, const uint8_t destination_mac[6],
                     uint32_t target_ip, const uint8_t target_mac[6]) {
-  struct net_device *dev = net_device_default();
+  struct net_device *dev = net_device_default_acquire();
+  if (!dev)
+    return -1;
   struct arp_packet packet;
   memset(&packet, 0, sizeof(packet));
   packet.hardware_type = be16(ARP_HTYPE_ETHERNET);
@@ -212,7 +200,17 @@ static int arp_send(uint16_t operation, const uint8_t destination_mac[6],
   if (target_mac)
     memcpy(packet.target_mac, target_mac, 6);
   put_ip(packet.target_ip, target_ip);
-  return ethernet_send(destination_mac, ETH_TYPE_ARP, &packet, sizeof(packet));
+  uint8_t frame[NET_FRAME_MAX - 4];
+  struct eth_header *header = (struct eth_header *)frame;
+  memcpy(header->destination, destination_mac, 6);
+  memcpy(header->source, dev->mac, 6);
+  header->type = be16(ETH_TYPE_ARP);
+  memcpy(frame + sizeof(*header), &packet, sizeof(packet));
+  int ret = dev->ops && dev->ops->transmit
+                ? dev->ops->transmit(dev, frame, sizeof(*header) + sizeof(packet))
+                : -1;
+  net_device_put(dev);
+  return ret;
 }
 
 static bool in_net_worker_thread(void) {
@@ -294,9 +292,14 @@ static bool arp_resolve(uint32_t ip, uint8_t mac[6]) {
 }
 
 static void handle_arp(const uint8_t *payload, size_t length) {
-  struct net_device *dev = net_device_default();
-  if (!dev || length < sizeof(struct arp_packet))
+  if (length < sizeof(struct arp_packet))
     return;
+  uint8_t device_mac[6];
+  struct net_device *dev = net_device_default_acquire();
+  if (!dev)
+    return;
+  memcpy(device_mac, dev->mac, sizeof(device_mac));
+  net_device_put(dev);
   const struct arp_packet *packet = (const struct arp_packet *)payload;
   if (be16(packet->hardware_type) != ARP_HTYPE_ETHERNET ||
       be16(packet->protocol_type) != ETH_TYPE_IPV4 ||
@@ -305,7 +308,7 @@ static void handle_arp(const uint8_t *payload, size_t length) {
   uint32_t sender_ip = get_ip(packet->sender_ip);
   uint32_t target_ip = get_ip(packet->target_ip);
   if (sender_ip == config.address &&
-      !mac_equal(packet->sender_mac, dev->mac)) {
+      !mac_equal(packet->sender_mac, device_mac)) {
     address_conflict = true;
     return;
   }
@@ -321,9 +324,12 @@ static int ipv4_send_tos(uint32_t destination, uint8_t protocol, uint8_t tos,
   if (payload_length > NET_MTU_ETHERNET - sizeof(struct ipv4_header))
     return -90; /* EMSGSIZE */
 
-  struct net_device *dev = net_device_default();
-  if (!dev)
+  uint8_t source_mac[6];
+  struct net_device *initial_dev = net_device_default_acquire();
+  if (!initial_dev)
     return -100; /* ENETDOWN */
+  memcpy(source_mac, initial_dev->mac, sizeof(source_mac));
+  net_device_put(initial_dev);
 
   uint8_t destination_mac[6];
   bool broadcast = destination == 0xffffffffU ||
@@ -350,7 +356,6 @@ static int ipv4_send_tos(uint32_t destination, uint8_t protocol, uint8_t tos,
   uint8_t frame[NET_FRAME_MAX - 4];
   struct eth_header *eth = (struct eth_header *)frame;
   memcpy(eth->destination, destination_mac, 6);
-  memcpy(eth->source, dev->mac, 6);
   eth->type = be16(ETH_TYPE_IPV4);
 
   struct ipv4_header *header = (struct ipv4_header *)(frame + sizeof(*eth));
@@ -368,8 +373,21 @@ static int ipv4_send_tos(uint32_t destination, uint8_t protocol, uint8_t tos,
   header->checksum = be16(checksum(header, sizeof(*header)));
 
   memcpy(frame + sizeof(*eth) + sizeof(*header), payload, payload_length);
-  return dev->ops->transmit(dev, frame,
-                            sizeof(*eth) + sizeof(*header) + payload_length);
+  struct net_device *dev = net_device_default_acquire();
+  if (!dev)
+    return -100; /* ENETDOWN */
+  if (memcmp(source_mac, dev->mac, sizeof(source_mac)) != 0) {
+    net_device_put(dev);
+    return -100; /* default interface changed during neighbor resolution */
+  }
+  memcpy(eth->source, dev->mac, 6);
+  int ret = dev->ops && dev->ops->transmit
+                ? dev->ops->transmit(dev, frame,
+                                     sizeof(*eth) + sizeof(*header) +
+                                         payload_length)
+                : -1;
+  net_device_put(dev);
+  return ret;
 }
 
 static int ipv4_send(uint32_t destination, uint8_t protocol,
@@ -591,16 +609,18 @@ static void ethernet_receive(struct net_packet *packet) {
   const struct eth_header *header = (const struct eth_header *)packet->data;
   bool ipv6_multicast = header->destination[0] == 0x33 &&
                         header->destination[1] == 0x33;
-  struct net_device *dev = packet->device;
-  if (!dev || (uintptr_t)dev < 0xFFFF800000000000ULL)
-    dev = net_device_default();
-  /* Protocol configuration and routes are currently global. Traffic from a
-   * secondary NIC must not update the default interface's ARP/DHCP/NDP state. */
-  if (dev != net_device_default())
-    return;
+  struct net_device *dev = net_device_default_acquire();
   if (!dev)
     return;
-  if (!mac_equal(header->destination, dev->mac) &&
+  uint8_t device_mac[6];
+  memcpy(device_mac, dev->mac, sizeof(device_mac));
+  bool default_packet = packet->device == dev;
+  net_device_put(dev);
+  /* Protocol configuration and routes are currently global. Traffic from a
+   * secondary NIC must not update the default interface's ARP/DHCP/NDP state. */
+  if (!default_packet)
+    return;
+  if (!mac_equal(header->destination, device_mac) &&
       !mac_broadcast(header->destination) && !ipv6_multicast)
     return;
   const uint8_t *payload = packet->data + sizeof(*header);
@@ -615,8 +635,10 @@ static void ethernet_receive(struct net_packet *packet) {
 }
 
 bool net_phase4_init(void) {
-  if (!net_device_default())
+  struct net_device *dev = net_device_default_acquire();
+  if (!dev)
     return false;
+  net_device_put(dev);
   spinlock_init(&arp_lock);
   memset(arp_cache, 0, sizeof(arp_cache));
   for (uint32_t i = 0; i < ARP_WAIT_BUCKETS; i++)

@@ -494,7 +494,7 @@ static int net_operstate_show(void *ctx, char *buf, unsigned int size) {
 }
 
 static void sysfs_populate_net(vfs_node_t *net_class_dir) {
-  struct net_device *dev = net_device_default();
+  struct net_device *dev = net_device_default_acquire();
   if (!dev)
     return;
   vfs_node_t *pci_parent = sysfs_pci_device_node(dev->pci);
@@ -516,8 +516,10 @@ static void sysfs_populate_net(vfs_node_t *net_class_dir) {
     if (ndir)
       sysfs_symlink(ndir, "subsystem", "../../net");
   }
-  if (!ndir)
+  if (!ndir) {
+    net_device_put(dev);
     return;
+  }
 
   char uevent[96];
   snprintf(uevent, sizeof(uevent), "INTERFACE=%s\nIFINDEX=2\nSUBSYSTEM=net\n", dev->name);
@@ -525,8 +527,10 @@ static void sysfs_populate_net(vfs_node_t *net_class_dir) {
   append_dec_line(ndir, "ifindex", 2);
   append_dec_line(ndir, "iflink", 2);
   sysfs_mkfile(ndir, "addr_assign_type", "0\n");
-  /* Only opt-in persistent netdevs can be retained by permanent sysfs files.
-   * User-driver endpoints can disappear with their session; keep snapshots. */
+  /* Persistent netdevs are embedded in static native driver storage (RTL8139
+   * and E1000E), so the installed callbacks retain a stable device address.
+   * Dynamic endpoints keep snapshots instead. The temporary pin below covers
+   * construction and callback installation only. */
   if (dev->persistent)
     asc_sysfs_attr_file(ndir, "carrier", 0444, dev, net_carrier_show, NULL, NULL);
   else
@@ -589,8 +593,10 @@ static void sysfs_populate_net(vfs_node_t *net_class_dir) {
   append_dec_line(ndir, "rx_queue_depth", queued);
   append_dec_line(ndir, "packet_buffers_in_use", in_use);
   vfs_node_t *stats = sysfs_mkdir(ndir, "statistics");
-  if (!stats)
+  if (!stats) {
+    net_device_put(dev);
     return;
+  }
 #define NET_STAT(field) do { \
   if (dev->persistent) \
     asc_sysfs_attr_file(stats, #field, 0444, &dev->stats.field, net_counter_show, NULL, NULL); \
@@ -606,6 +612,7 @@ static void sysfs_populate_net(vfs_node_t *net_class_dir) {
   NET_STAT(tx_timeouts); NET_STAT(recoveries); NET_STAT(recovery_failures);
   NET_STAT(dma_bytes);
 #undef NET_STAT
+  net_device_put(dev);
 }
 
 void sysfs_populate_network(void) {

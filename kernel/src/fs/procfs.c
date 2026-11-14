@@ -3747,6 +3747,7 @@ void procfs_init(void) {
 // =============================================================================
 
 #include "net/core.h"
+#include "net/dhcp.h"
 #include "net/ipv4.h"
 #include "net/tcp.h"
 #include "net/udp.h"
@@ -3829,20 +3830,41 @@ static uint32_t procfs_net_dev_read(vfs_node_t *node, uint32_t offset,
         "    lo:       0       0    0    0    0     0          0         0"
         "        0       0    0    0    0     0       0          0\n");
 
-    struct net_device *dev = net_device_default();
+    struct net_device *dev = net_device_default_acquire();
+    bool have_dev = dev != NULL;
+    char dev_name[16] = {0};
+    uint64_t rx_bytes = 0, rx_packets = 0, rx_errors = 0, rx_dropped = 0;
+    uint64_t tx_bytes = 0, tx_packets = 0, tx_errors = 0, tx_dropped = 0;
     if (dev) {
+        memcpy(dev_name, dev->name, sizeof(dev_name));
+#define SNAP_STAT(dst, field) dst = __atomic_load_n(&dev->stats.field, __ATOMIC_RELAXED)
+        SNAP_STAT(rx_bytes, rx_bytes);
+        SNAP_STAT(rx_packets, rx_packets);
+        SNAP_STAT(rx_errors, rx_errors);
+        SNAP_STAT(rx_dropped, rx_dropped);
+        SNAP_STAT(tx_bytes, tx_bytes);
+        SNAP_STAT(tx_packets, tx_packets);
+        SNAP_STAT(tx_errors, tx_errors);
+        SNAP_STAT(tx_dropped, tx_dropped);
+        uint64_t rx_overflows =
+            __atomic_load_n(&dev->stats.rx_overflows, __ATOMIC_RELAXED);
+#undef SNAP_STAT
+        rx_errors += rx_overflows;
+        net_device_put(dev);
+    }
+    if (have_dev) {
         pos += snprintf(buf + pos, 2048 - pos,
             "%6s: %llu %llu %llu %llu    0     0          0         0"
             " %llu %llu %llu %llu    0     0       0          0\n",
-            dev->name,
-            (unsigned long long)dev->stats.rx_bytes,
-            (unsigned long long)dev->stats.rx_packets,
-            (unsigned long long)(dev->stats.rx_errors + dev->stats.rx_overflows),
-            (unsigned long long)dev->stats.rx_dropped,
-            (unsigned long long)dev->stats.tx_bytes,
-            (unsigned long long)dev->stats.tx_packets,
-            (unsigned long long)dev->stats.tx_errors,
-            (unsigned long long)dev->stats.tx_dropped);
+            dev_name,
+            (unsigned long long)rx_bytes,
+            (unsigned long long)rx_packets,
+            (unsigned long long)rx_errors,
+            (unsigned long long)rx_dropped,
+            (unsigned long long)tx_bytes,
+            (unsigned long long)tx_packets,
+            (unsigned long long)tx_errors,
+            (unsigned long long)tx_dropped);
     }
 
     node->length = (uint32_t)pos;
@@ -3955,8 +3977,12 @@ static uint32_t procfs_net_route_read(vfs_node_t *node, uint32_t offset,
         "MTU\tWindow\tIRTT\n");
 
     const struct ipv4_config *cfg = ipv4_get_config();
-    struct net_device *dev = net_device_default();
-    const char *ifname = dev ? dev->name : "eth0";
+    struct net_device *dev = net_device_default_acquire();
+    char ifname[16] = "eth0";
+    if (dev) {
+        memcpy(ifname, dev->name, sizeof(ifname));
+        net_device_put(dev);
+    }
 
     if (cfg && cfg->address) {
         // Network route: destination = address & mask, gateway = 0.0.0.0
@@ -3971,6 +3997,42 @@ static uint32_t procfs_net_route_read(vfs_node_t *node, uint32_t offset,
                 "%s\t%08X\t%08X\t0003\t0\t0\t100\t%08X\t0\t0\t0\n",
                 ifname, 0U, cfg->gateway, 0U);
         }
+    }
+
+    node->length = (uint32_t)pos;
+    if (offset >= (uint32_t)pos) return 0;
+    if (offset + size > (uint32_t)pos) size = (uint32_t)pos - offset;
+    memcpy(buffer, buf + offset, size);
+    return size;
+}
+
+// ---- /proc/net/pnp ----------------------------------------------------------
+// Linux's in-kernel DHCP publishes its nameservers here in resolv.conf syntax;
+// rcS copies them to /etc/resolv.conf at boot.
+
+static uint32_t procfs_net_pnp_read(vfs_node_t *node, uint32_t offset,
+                                    uint32_t size, uint8_t *buffer) {
+    if (sched_get_current() && sched_get_current()->net_ns)
+      return procfs_private_net_read(node, offset, size, buffer, "");
+    char buf[256];
+    int pos = 0;
+
+    const struct dhcp_lease *current = dhcp_current_lease();
+    if (current) {
+        struct dhcp_lease lease = *current;
+        pos += snprintf(buf + pos, (int)sizeof(buf) - pos, "#PROTO: DHCP\n");
+        for (int i = 0; i < 2; i++) {
+            uint32_t ns = lease.dns[i];
+            if (ns)
+                pos += snprintf(buf + pos, (int)sizeof(buf) - pos,
+                    "nameserver %u.%u.%u.%u\n", ns >> 24, (ns >> 16) & 0xFF,
+                    (ns >> 8) & 0xFF, ns & 0xFF);
+        }
+        if (lease.server_id)
+            pos += snprintf(buf + pos, (int)sizeof(buf) - pos,
+                "bootserver %u.%u.%u.%u\n", lease.server_id >> 24,
+                (lease.server_id >> 16) & 0xFF, (lease.server_id >> 8) & 0xFF,
+                lease.server_id & 0xFF);
     }
 
     node->length = (uint32_t)pos;
@@ -4075,6 +4137,7 @@ void procfs_net_init(vfs_node_t *procfs_root) {
     ADD_NET_FILE("tcp",      procfs_net_tcp_read,      4096);
     ADD_NET_FILE("udp",      procfs_net_udp_read,      4096);
     ADD_NET_FILE("route",    procfs_net_route_read,     512);
+    ADD_NET_FILE("pnp",      procfs_net_pnp_read,       256);
     ADD_NET_FILE("if_inet6", procfs_net_if_inet6_read,  128);
     ADD_NET_FILE("sockstat", procfs_net_sockstat_read,  256);
 

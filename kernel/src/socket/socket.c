@@ -49,6 +49,21 @@ static size_t socket_ifreq_size(void) {
   struct thread *t = sched_get_current();
   return t && t->seccomp_compat_dispatch ? 32 : 40;
 }
+
+static bool socket_default_netdev_snapshot(char name[16], uint8_t mac[6],
+                                           bool *registered, bool *carrier) {
+  struct net_device *dev = net_device_default_acquire();
+  if (!dev)
+    return false;
+  memcpy(name, dev->name, 16);
+  memcpy(mac, dev->mac, 6);
+  *registered = __atomic_load_n(&dev->registered, __ATOMIC_RELAXED);
+  *carrier = *registered && dev->ops && dev->ops->link_up &&
+             dev->ops->link_up(dev);
+  net_device_put(dev);
+  return true;
+}
+
 static int socket_ifconf_read(struct avory_ifconf64 *out, uint64_t arg) {
   memset(out, 0, sizeof(*out));
   if (socket_ifreq_size() == 32) {
@@ -76,9 +91,13 @@ static int socket_ioctl_ifconf(uint64_t arg) {
   if (ifc.length < 0)
     return -22;
 
-  struct net_device *dev = net_device_default();
+  char dev_name[16] = {0};
+  uint8_t dev_mac[6];
+  bool dev_registered = false, carrier = false;
+  bool have_dev = socket_default_netdev_snapshot(dev_name, dev_mac,
+                                                  &dev_registered, &carrier);
   const struct ipv4_config *cfg = ipv4_get_config();
-  bool have_ipv4 = dev && dev->registered && cfg && cfg->address != 0;
+  bool have_ipv4 = have_dev && dev_registered && cfg && cfg->address != 0;
   int written = 0;
 
   /* Linux accepts a NULL buffer as a size query, regardless of ifc_len.
@@ -94,10 +113,10 @@ static int socket_ioctl_ifconf(uint64_t arg) {
 
     struct avory_ifreq64 ifr = {0};
     memset(&ifr, 0, sizeof(ifr));
-    size_t name_len = strlen(dev->name);
+    size_t name_len = strlen(dev_name);
     if (name_len >= sizeof(ifr.name))
       name_len = sizeof(ifr.name) - 1;
-    memcpy(ifr.name, dev->name, name_len);
+    memcpy(ifr.name, dev_name, name_len);
     ifr.family = 2; /* AF_INET */
     /* sockaddr_in address begins after family and the two-byte port. */
     ifr.address_data[2] = (uint8_t)(cfg->address >> 24);
@@ -132,7 +151,11 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
   struct avory_ifreq64 ifr = {0};
   if (copy_from_user(&ifr, (const void *)arg, socket_ifreq_size()) != 0)
     return -14;
-  struct net_device *dev = net_device_default();
+  char dev_name[16] = {0};
+  uint8_t dev_mac[6];
+  bool dev_registered = false, carrier = false;
+  bool have_dev = socket_default_netdev_snapshot(dev_name, dev_mac,
+                                                  &dev_registered, &carrier);
   bool loopback = socket_ifreq_name_is(ifr.name, "lo");
 
   if (request == 0x8910) { /* SIOCGIFNAME: input is an index, not a name. */
@@ -141,8 +164,8 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
     const char *name;
     if (ifindex == 1)
       name = "lo";
-    else if (ifindex == 2 && dev && dev->registered)
-      name = dev->name;
+    else if (ifindex == 2 && have_dev && dev_registered)
+      name = dev_name;
     else
       return -19; /* ENODEV */
     memset(ifr.name, 0, sizeof(ifr.name));
@@ -150,8 +173,8 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
     return copy_to_user((void *)arg, &ifr, socket_ifreq_size()) ? -14 : 0;
   }
 
-  if (!loopback && (!dev || !dev->registered ||
-                    !socket_ifreq_name_is(ifr.name, dev->name)))
+  if (!loopback && (!have_dev || !dev_registered ||
+                    !socket_ifreq_name_is(ifr.name, dev_name)))
     return -19; /* ENODEV */
 
   if (request == 0x8915) { /* SIOCGIFADDR */
@@ -167,7 +190,7 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
     ifr.address_data[5] = (uint8_t)address;
   } else if (request == 0x8913) { /* SIOCGIFFLAGS: short ifr_flags */
     uint16_t flags = loopback ? (0x1 | 0x8 | 0x40) : (0x1 | 0x2 | 0x1000);
-    if (!loopback && dev->ops && dev->ops->link_up && dev->ops->link_up(dev))
+    if (!loopback && carrier)
       flags |= 0x40; /* IFF_RUNNING */
     memset(&ifr.family, 0, sizeof(ifr) - 16);
     memcpy(&ifr.family, &flags, sizeof(flags));
@@ -175,7 +198,7 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
     memset(&ifr.family, 0, sizeof(ifr) - 16);
     ifr.family = loopback ? 772 : 1; /* ARPHRD_LOOPBACK / ARPHRD_ETHER */
     if (!loopback)
-      memcpy(ifr.address_data, dev->mac, sizeof(dev->mac));
+      memcpy(ifr.address_data, dev_mac, sizeof(dev_mac));
   } else if (request == 0x891b || request == 0x8919) {
     /* SIOCGIFNETMASK / SIOCGIFBRDADDR: IPv4 in network byte order. */
     const struct ipv4_config *cfg = ipv4_get_config();

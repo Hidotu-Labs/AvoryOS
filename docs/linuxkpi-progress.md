@@ -1,3 +1,91 @@
+## Realtek LinuxKPI R3 complete on physical RTL8168 (2026-11-14)
+
+Upstream `r8169` now drives the onboard RTL8168h/8111h (`10ec:8168` rev
+`0x15`, XID 541), assigned through VFIO to a KVM guest running the gated
+`KPI_R8169=1` kernel with `kpi_r8169=1 kpi_r8169_bdf=0000:00:05.0`. It probed,
+loaded `rtl_nic/rtl8168h-2.fw`, attached the Realtek PHY, reached link-up
+(100 Mbps/Full) and registered native `eth0`, which obtained a DHCP lease from
+the LAN router. A boot without the blob shows the non-fatal missing-firmware
+path. With `kpi_r8169_probe_fail_test=1`, an injected `register_netdev`
+failure after resource allocation unwound to zero maps, IRQs, netdevs and
+MSI vectors with an empty devres list, and the same-boot re-probe succeeded.
+
+The failed-probe case exposed a LinuxKPI leak: `pci_alloc_irq_vectors()`
+lacked upstream's `pcim_msi_release` devres action, so a managed device's
+vectors survived probe failure and the retry hit `-EBUSY`. `pci.c` now
+registers that action, and the shared cleanup check counts vectors. Evidence:
+`/tmp/avory-r3-hw/hw1.log`, `hw2.log` (the leak), `hw3.log` (pass).
+
+Default-profile regressions after the fix: native RTL8139 and E1000E QEMU boots
+got DHCP and registered `/dev/dri/card0`. The R2 bridge fixture failed its
+timed "second RX batch accepted before teardown" wait in the first RTL8139
+and E1000E boots and passed on two RTL8139 reruns. That timing check is
+intermittent under TCG. R4 is next. Report:
+[`docs/realtek/r3-compile-closure.md`](realtek/r3-compile-closure.md).
+
+## Realtek LinuxKPI R3 software closure (2026-11-14)
+
+The `KPI_R8169=1` kernel now links. All 16 gated R8169, PHYLIB, MDIO-bus and
+Realtek PHY objects compile; the last five undefined symbols were closed by a
+LinuxKPI `property.c` (upstream fwnode/device property dispatch through
+`fwnode_operations`) and a klog-backed `vprintk()`. The first gated QEMU boot
+showed `phy_init` failing with `-ENODEV` because the generated link order put
+libphy before mdio-bus and r8169 before the Realtek PHY. `kbuild-subset.py`
+now mirrors upstream link order, so `mdio_bus_init` precedes `phy_init` and
+`phy_module_init` precedes `rtl8169_pci_driver_init`.
+
+Gated QEMU TCG boots passed with every LinuxKPI initcall succeeding, native
+RTL8139 DHCP, `[R2 NET] PASS` and `/dev/dri/card0`
+(`/tmp/avory-r2-runtime/r3-gated-order.log`). With the r8169 selector pointed
+at the RTL8139's BDF, native ownership and DHCP were unaffected
+(`r3-gated-sel.log`). The default-profile kernel rebuilt cleanly afterwards
+(`/tmp/r3-default-after-link.log`). QEMU cannot emulate RTL8168, so probe,
+firmware, PHY, link-up and failed-probe cleanup remain open. They need a
+bare-metal boot with `kpi_r8169=1 kpi_r8169_bdf=0000:07:00.0`; passthrough
+from this host requires root and would remove its only network link. Runbook:
+[`docs/realtek/r3-compile-closure.md`](realtek/r3-compile-closure.md).
+
+## Realtek LinuxKPI R3 compile closure started (2026-11-14)
+
+R8169's selected Kbuild closure now includes Linux PHYLIB, MDIO bus and the
+Realtek PHY driver under the same default-off `KPI_R8169` gate. The generator
+uses scoped Kconfig defines and requires every selected source; dry runs
+confirmed no PHY/R8169 recipes in the default profile and the shared narrow
+network ABI on enabled objects. The enabled objects still fail to compile due
+unimplemented Linux task/compat/security, PHY/PM and full networking APIs.
+
+The enabled R8169 recipe had an early parse conflict because the narrow
+`netdevice.h` overlay redeclared Linux UAPI interface flags as macros. It now
+uses pinned Linux UAPI definitions for interface, ARP and Ethernet constants;
+the default frontend and fixture objects compile with that shared header.
+Actual `KPI_R8169=1` main and PHY-config recipes remain blocked by upstream
+transitive task/compat/credential, page/netmem and networking headers. The
+latest R8169 main recipe has no direct driver-source errors, but the object
+does not compile because the LinuxKPI include graph still lacks these shared
+contracts. The default kernel rebuild passes at
+`/tmp/r3-lkpi-default-poststats.log`; this does not validate the enabled driver.
+R3 remains open; report:
+[`docs/realtek/r3-compile-closure.md`](realtek/r3-compile-closure.md).
+
+## Realtek LinuxKPI R2 Ethernet bridge (2026-11-14)
+
+The shared LinuxKPI Ethernet frontend and native bridge now cover linear skb
+RX/TX, NAPI budget and disable, carrier and queue state, bounded TX backpressure,
+and unregister lifetime. The opt-in `kpi_r2_bridge=1` QEMU fixture passed
+registration/open, exact 64-byte frame comparisons in both directions, missed
+NAPI scheduling, BUSY retry, 128-frame capacity, and repeated registration.
+For teardown, it held a worker RX packet, verified unregister remained blocked
+while the device reference was live, released the callback and observed
+unregister complete. Evidence: `/tmp/avory-r2-runtime/fixture-pass.log`, lines
+306–332.
+
+Native RTL8139 and E1000E regression boots also passed DHCP and registered
+`/dev/dri/card0` in `/tmp/avory-r2-runtime/native-final-rtl8139.log` and
+`native-final-e1000e.log`. This is native-driver evidence only. The imported
+`r8169` enabled build remains blocked at Linux netmem/page-pool and other
+networking compatibility interfaces; no Realtek hardware was bound. See
+[`docs/realtek/r2-net-core.md`](realtek/r2-net-core.md).
+
 ## Nouveau C7 userspace installation (2026-10-21)
 
 NVK/Zink now passes exact shader pixels and context recreation on AD106.

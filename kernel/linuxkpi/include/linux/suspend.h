@@ -18,6 +18,11 @@ struct notifier_block;
 static inline bool pm_resume_via_firmware(void) { return false; }
 static inline bool pm_hibernate_is_recovering(void) { return false; }
 static inline bool pm_hibernation_mode_is_suspend(void) { return false; }
+#ifdef CONFIG_PM_SLEEP
+void pm_system_wakeup(void);
+#else
+static inline void pm_system_wakeup(void) { }
+#endif
 static inline int register_pm_notifier(struct notifier_block *nb) {
   (void)nb; return 0;
 }

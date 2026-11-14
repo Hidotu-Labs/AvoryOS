@@ -7,15 +7,7 @@
 
 #include <linux/kernel.h>
 #include <linux/string.h>
-#include <linux/types.h>
-
-struct timer_list {
-  struct list_head entry;
-  unsigned long expires;
-  void (*function)(struct timer_list *);
-  u32 flags;
-  volatile int running;
-};
+#include <linux/timer_types.h>
 
 #define TIMER_CPUMASK 0
 #define TIMER_MIGRATING 0x10000000

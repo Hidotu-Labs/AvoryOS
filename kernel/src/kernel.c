@@ -245,7 +245,11 @@ static void network_start(void) {
       if (!net_device_set_default(name))
         klogf("[NET] requested default %s unavailable; keeping working NIC\n", name);
     }
-    klogf("[NET] default interface: %s\n", net_device_default()->name);
+    struct net_device *default_netdev = net_device_default_acquire();
+    if (default_netdev) {
+      klogf("[NET] default interface: %s\n", default_netdev->name);
+      net_device_put(default_netdev);
+    }
     net_phase4_init();
     net_phase5_init();
     net_phase6_init();
@@ -260,6 +264,12 @@ static void network_start(void) {
 
 static void init_thread_entry(void) {
   network_start();
+#ifdef LINUXKPI_LINUX_IMPORTED
+  if (cmdline_has("kpi_r2_bridge=1")) {
+    extern void linuxkpi_test_r2_net_bridge(void);
+    linuxkpi_test_r2_net_bridge();
+  }
+#endif
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " Init thread started\n");
 
   /* ── NUMA Subsystem self test ── */
@@ -556,6 +566,7 @@ void kmain(void) {
 }
 
 void kmain_high_half(void) {
+  bool net_core_initialized = false;
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
                            " Switched to kernel-allocated stack.\n");
 
@@ -893,6 +904,11 @@ mount_success:
    * mounted /proc, so it runs here rather than with the VFS checks above. */
   vfs_procfs_selftest();
 
+  /* LinuxKPI network drivers register from initcalls. Prepare the native
+   * network queues before those callbacks can register/probe an interface. */
+  net_core_init();
+  net_core_initialized = true;
+
   /* LinuxKPI bring-up: run the Phase 0 self-test, then every registered
    * initcall (module_init-style drivers bind here once they are imported). */
   extern void linuxkpi_test_phase0(void);
@@ -950,7 +966,10 @@ mount_fail:
   audio_dsp_register_vfs();
   alsa_emu_register_vfs();
 
-  net_core_init();
+  /* The no-root-filesystem path jumps directly here and skips initcalls.
+   * Keep the native core initialized exactly once on both boot paths. */
+  if (!net_core_initialized)
+    net_core_init();
   rtl8139_phase1_init();
   e1000_init();
 

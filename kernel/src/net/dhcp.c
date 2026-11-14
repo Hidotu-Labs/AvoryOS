@@ -37,8 +37,11 @@
 #define OPT_REBIND_TIME      59
 #define OPT_END              255
 
-#define DHCP_INITIAL_TIMEOUT_MS   4000u
+/* Wired LAN servers answer in milliseconds; start short and back off. */
+#define DHCP_INITIAL_TIMEOUT_MS   2000u
 #define DHCP_MAX_TIMEOUT_MS      64000u
+/* Frames sent before autonegotiation finishes are dropped by the PHY. */
+#define DHCP_LINK_WAIT_MS        10000u
 #define DHCP_TOTAL_TIMEOUT_MS   120000u
 #define DHCP_RENEW_RETRY_MS       5000u
 
@@ -216,7 +219,7 @@ static bool opt_next(opt_reader_t *r, uint8_t *tag,
 }
 
 static size_t build_dhcp_frame(uint8_t *out, size_t out_cap,
-                               const struct net_device *dev,
+                               const uint8_t mac[6],
                                uint32_t xid, uint8_t msg_type,
                                uint32_t requested_ip, uint32_t server_id,
                                uint16_t secs) {
@@ -233,7 +236,7 @@ static size_t build_dhcp_frame(uint8_t *out, size_t out_cap,
     msg->xid   = be32(xid);
     msg->secs  = be16(secs);
     msg->flags = be16(0x8000); 
-    memcpy(msg->chaddr, dev->mac, 6);
+    memcpy(msg->chaddr, mac, 6);
     msg->magic = be32(DHCP_MAGIC_COOKIE);
 
     uint8_t opts[DHCP_OPTIONS_MAX];
@@ -264,7 +267,7 @@ static size_t build_dhcp_frame(uint8_t *out, size_t out_cap,
 
     struct eth_hdr *eth = (struct eth_hdr *)p;
     memcpy(eth->dst, broadcast_mac, 6);
-    memcpy(eth->src, dev->mac, 6);
+    memcpy(eth->src, mac, 6);
     eth->type = be16(0x0800);
     p += sizeof(struct eth_hdr);
 
@@ -449,21 +452,35 @@ static void apply_lease(const struct dhcp_lease *l) {
     klog_puts("s\n");
 }
 
-static uint32_t next_xid(const struct net_device *dev) {
+static uint32_t next_xid(const uint8_t mac[6]) {
     static uint32_t counter = 0;
-    uint32_t seed = ((uint32_t)dev->mac[2] << 24) |
-                    ((uint32_t)dev->mac[3] << 16) |
-                    ((uint32_t)dev->mac[4] <<  8) |
-                     (uint32_t)dev->mac[5];
+    uint32_t seed = ((uint32_t)mac[2] << 24) |
+                    ((uint32_t)mac[3] << 16) |
+                    ((uint32_t)mac[4] <<  8) |
+                     (uint32_t)mac[5];
     return seed ^ ((uint32_t)lapic_timer_get_ticks() & 0xffffffffu)
                 ^ (++counter * 0x9e3779b9u);
 }
 
-static bool dhcp_exchange(struct net_device *dev, uint32_t timeout_ms,
+static int dhcp_transmit_on_mac(const uint8_t mac[6], const uint8_t *frame,
+                                size_t length) {
+    struct net_device *dev = net_device_default_acquire();
+    if (!dev)
+        return -1;
+    int ret = memcmp(dev->mac, mac, 6) == 0 && dev->ops && dev->ops->transmit
+                  ? dev->ops->transmit(dev, frame, length)
+                  : -1;
+    if (ret == 0)
+        dev->stats.tx_packets++;
+    net_device_put(dev);
+    return ret;
+}
+
+static bool dhcp_exchange(const uint8_t mac[6], uint32_t timeout_ms,
                            struct dhcp_lease *lease_out) {
     uint8_t frame[NET_FRAME_MAX];
 
-    uint32_t xid  = next_xid(dev);
+    uint32_t xid  = next_xid(mac);
     active_xid    = xid;
     rx_got_offer  = false;
     rx_got_ack    = false;
@@ -471,11 +488,10 @@ static bool dhcp_exchange(struct net_device *dev, uint32_t timeout_ms,
 
     uint64_t deadline = lapic_timer_get_ticks() + timeout_ms;
 
-    size_t flen = build_dhcp_frame(frame, sizeof(frame), dev, xid,
+    size_t flen = build_dhcp_frame(frame, sizeof(frame), mac, xid,
                                    DHCP_DISCOVER, 0, 0, 0);
     if (!flen) return false;
-    if (dev->ops->transmit(dev, frame, flen) != 0) return false;
-    dev->stats.tx_packets++;
+    if (dhcp_transmit_on_mac(mac, frame, flen) != 0) return false;
 
     while (!rx_got_offer && !rx_got_nak &&
            lapic_timer_get_ticks() < deadline)
@@ -488,11 +504,10 @@ static bool dhcp_exchange(struct net_device *dev, uint32_t timeout_ms,
     rx_got_offer = false;
     spinlock_release(&dhcp_lock);
 
-    flen = build_dhcp_frame(frame, sizeof(frame), dev, xid,
+    flen = build_dhcp_frame(frame, sizeof(frame), mac, xid,
                              DHCP_REQUEST, offer.address, offer.server_id, 0);
     if (!flen) return false;
-    if (dev->ops->transmit(dev, frame, flen) != 0) return false;
-    dev->stats.tx_packets++;
+    if (dhcp_transmit_on_mac(mac, frame, flen) != 0) return false;
 
     while (!rx_got_ack && !rx_got_nak &&
            lapic_timer_get_ticks() < deadline)
@@ -517,12 +532,42 @@ void dhcp_set_static_fallback(uint32_t address, uint32_t netmask,
     spinlock_release(&dhcp_lock);
 }
 
+/* Devices without link reporting are treated as up. */
+static bool dhcp_link_up(void) {
+    struct net_device *dev = net_device_default_acquire();
+    if (!dev) return false;
+    bool up = !dev->ops || !dev->ops->link_up || dev->ops->link_up(dev);
+    net_device_put(dev);
+    return up;
+}
+
+static void dhcp_wait_for_link(void) {
+    if (dhcp_link_up()) return;
+    klog_puts("[DHCP] waiting for link\n");
+    uint64_t start    = lapic_timer_get_ticks();
+    uint64_t deadline = start + DHCP_LINK_WAIT_MS;
+    while (!dhcp_link_up() && lapic_timer_get_ticks() < deadline)
+        sched_yield();
+    if (!dhcp_link_up()) {
+        klog_puts("[DHCP] no link after ");
+        klog_uint64(DHCP_LINK_WAIT_MS);
+        klog_puts("ms; sending anyway\n");
+        return;
+    }
+    klog_puts("[DHCP] link up after ");
+    klog_uint64(lapic_timer_get_ticks() - start);
+    klog_puts("ms\n");
+}
+
 bool dhcp_start(void) {
-    struct net_device *dev = net_device_default();
+    struct net_device *dev = net_device_default_acquire();
     if (!dev) {
         klog_puts("[DHCP] No network device — skipping\n");
         goto use_fallback;
     }
+    uint8_t device_mac[6];
+    memcpy(device_mac, dev->mac, sizeof(device_mac));
+    net_device_put(dev);
 
     prev_rx_handler = net_get_rx_handler(); /* save existing (ipv4) handler */
 
@@ -534,8 +579,11 @@ bool dhcp_start(void) {
     rx_got_ack    = false;
     rx_got_nak    = false;
 
+    dhcp_wait_for_link();
+
     uint32_t wait_ms  = DHCP_INITIAL_TIMEOUT_MS;
-    uint64_t absolute = lapic_timer_get_ticks() + DHCP_TOTAL_TIMEOUT_MS;
+    uint64_t started  = lapic_timer_get_ticks();
+    uint64_t absolute = started + DHCP_TOTAL_TIMEOUT_MS;
     uint32_t attempt  = 0;
     struct dhcp_lease lease;
 
@@ -547,8 +595,11 @@ bool dhcp_start(void) {
         klog_uint64(wait_ms);
         klog_puts("ms)\n");
 
-        if (dhcp_exchange(dev, wait_ms, &lease)) {
+        if (dhcp_exchange(device_mac, wait_ms, &lease)) {
             apply_lease(&lease);
+            klog_puts("[DHCP] exchange took ");
+            klog_uint64(lapic_timer_get_ticks() - started);
+            klog_puts("ms\n");
             klog_puts("[DHCP] Lease obtained\n");
             return true;
         }
@@ -590,7 +641,7 @@ bool dhcp_renew(void) {
 
     if (!valid) return false;
 
-    struct net_device *dev = net_device_default();
+    struct net_device *dev = net_device_default_acquire();
     if (!dev) return false;
 
     klog_puts("[DHCP] Renewing lease\n");
@@ -600,15 +651,26 @@ bool dhcp_renew(void) {
     rx_got_nak   = false;
 
     struct dhcp_lease new_lease;
-    uint32_t xid = next_xid(dev);
+    uint8_t device_mac[6];
+    memcpy(device_mac, dev->mac, sizeof(device_mac));
+    uint32_t xid = next_xid(device_mac);
     active_xid   = xid;
     uint8_t frame[NET_FRAME_MAX];
-    size_t flen = build_dhcp_frame(frame, sizeof(frame), dev, xid,
+    size_t flen = build_dhcp_frame(frame, sizeof(frame), device_mac, xid,
                                     DHCP_REQUEST, saved.address,
                                     saved.server_id, 0);
-    if (!flen) return false;
-    if (dev->ops->transmit(dev, frame, flen) != 0) return false;
-    dev->stats.tx_packets++;
+    if (!flen) {
+        net_device_put(dev);
+        return false;
+    }
+    int tx_ret = dev->ops && dev->ops->transmit
+                     ? dev->ops->transmit(dev, frame, flen)
+                     : -1;
+    if (tx_ret == 0)
+        dev->stats.tx_packets++;
+    net_device_put(dev);
+    if (tx_ret != 0)
+        return false;
 
     uint64_t deadline = lapic_timer_get_ticks() + DHCP_RENEW_RETRY_MS;
     while (!rx_got_ack && !rx_got_nak &&

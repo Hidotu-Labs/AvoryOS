@@ -38,3 +38,17 @@ nvidia/ad106/gsp/bootloader-570.144.bin=nvidia/ad102/gsp/bootloader-570.144.bin
 nvidia/ad106/gsp/booter_load-570.144.bin=nvidia/ad102/gsp/booter_load-570.144.bin
 nvidia/ad106/gsp/booter_unload-570.144.bin=nvidia/ad102/gsp/booter_unload-570.144.bin
 LICENSES/LICENCE.nvidia
+
+# Realtek R1 firmware from linux-firmware 20260916. Host ethtool reports
+# rtl8168h-2_0.0.2 02/26/15 for r8169 at the onboard RTL8168H, confirming the
+# selected Ethernet blob. AvoryOS loading is still untested. RTL8852B's pinned
+# driver advertises format max 1 and probes
+# rtw8852b_fw-1.bin then the unsuffixed rtw8852b_fw.bin fallback; -2 is not
+# requested by this code. RTL8822C can request the WoW image under PM paths.
+rtl_nic/rtl8168h-2.fw
+LICENSES/LICENSE.r8169
+rtw88/rtw8822c_fw.bin
+rtw88/rtw8822c_wow_fw.bin
+rtw89/rtw8852b_fw-1.bin
+rtw89/rtw8852b_fw.bin
+LICENSES/LICENCE.rtlwifi_firmware.txt

@@ -274,11 +274,45 @@ ifneq ($(linux-obj-y),)
     # generated per-target rules append to them at parse time).
     KPI_AMDGPU ?= 1
     KPI_NOUVEAU ?= 1
+    # Realtek import/build gates are independent and disabled until their
+    # compatibility and probe gates have passed. Setting a gate only adds its
+    # selected upstream objects; runtime selectors in linuxkpi/src/pci.c decide
+    # binding. r8169 passed R3 on RTL8168h and is built by default
+    # (`make KPI_R8169=0` drops it); the Wi-Fi gates remain off.
+    KPI_R8169 ?= 1
+    KPI_RTW89 ?= 0
+    KPI_RTW88 ?= 0
+    ifneq ($(KPI_R8169),0)
+    ifneq ($(KPI_R8169),1)
+    $(error KPI_R8169 must be exactly 0 or 1)
+    endif
+    endif
+    ifneq ($(KPI_RTW89),0)
+    ifneq ($(KPI_RTW89),1)
+    $(error KPI_RTW89 must be exactly 0 or 1)
+    endif
+    endif
+    ifneq ($(KPI_RTW88),0)
+    ifneq ($(KPI_RTW88),1)
+    $(error KPI_RTW88 must be exactly 0 or 1)
+    endif
+    endif
     # Keep parameter namespaces distinct even in a single static kernel.
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/%.c.o: override LINUX_CPPFLAGS += -UKBUILD_MODNAME -DKBUILD_MODNAME='"amdgpu"'
     obj-$(ARCH)/linux/drivers/gpu/drm/nouveau/%.c.o: override LINUX_CPPFLAGS += -UKBUILD_MODNAME -DKBUILD_MODNAME='"nouveau"'
     obj-$(ARCH)/linux/drivers/gpu/drm/drm_print.c.o: override LINUX_CPPFLAGS += -UKBUILD_MODNAME -DKBUILD_MODNAME='"drm"'
     -include linux/Makefile.kbuild
+    # Fail closed if an opt-in build gate is requested but the generated
+    # Kbuild fragment is stale or lacks this target's source/object closure.
+    ifeq ($(KPI_R8169),1)
+    $(foreach source,drivers/net/ethernet/realtek/r8169_main.c drivers/net/ethernet/realtek/r8169_firmware.c drivers/net/ethernet/realtek/r8169_phy_config.c drivers/net/phy/phy.c drivers/net/phy/phy-c45.c drivers/net/phy/phy-core.c drivers/net/phy/phy_device.c drivers/net/phy/linkmode.c drivers/net/phy/phy_link_topology.c drivers/net/phy/phy_caps.c drivers/net/phy/mdio_bus_provider.c drivers/net/phy/stubs.c drivers/net/phy/mdio_devres.c drivers/net/phy/mdio_bus.c drivers/net/phy/mdio_device.c drivers/net/phy/realtek/realtek_main.c,$(if $(filter $(source),$(linux-obj-y)),,$(error KPI_R8169=1 but $(source) is absent from linux/Makefile.kbuild; rerun scripts/linux-import.sh)))
+    endif
+    ifeq ($(KPI_RTW89),1)
+    $(foreach source,drivers/net/wireless/realtek/rtw89/core.c drivers/net/wireless/realtek/rtw89/pci.c drivers/net/wireless/realtek/rtw89/rtw8852be.c net/wireless/core.c net/mac80211/main.c,$(if $(filter $(source),$(linux-obj-y)),,$(error KPI_RTW89=1 but $(source) is absent from linux/Makefile.kbuild; rerun scripts/linux-import.sh)))
+    endif
+    ifeq ($(KPI_RTW88),1)
+    $(foreach source,drivers/net/wireless/realtek/rtw88/main.c drivers/net/wireless/realtek/rtw88/pci.c drivers/net/wireless/realtek/rtw88/rtw8822c.c drivers/net/wireless/realtek/rtw88/rtw8822ce.c net/wireless/core.c net/mac80211/main.c,$(if $(filter $(source),$(linux-obj-y)),,$(error KPI_RTW88=1 but $(source) is absent from linux/Makefile.kbuild; rerun scripts/linux-import.sh)))
+    endif
     ifeq ($(KPI_NOUVEAU),1)
     obj-$(ARCH)/linux/drivers/gpu/drm/nouveau/nouveau_sched.c.o: override LINUX_CPPFLAGS += -Ddma_fence_wait_timeout=linuxkpi_nouveau_bind_wait_timeout
     obj-$(ARCH)/linux/drivers/gpu/drm/nouveau/nvkm/engine/device/pci.c.o: override LINUX_CPPFLAGS += -Dnvkm_device_pci_new=linuxkpi_original_nvkm_device_pci_new
@@ -330,6 +364,9 @@ ifneq ($(linux-obj-y),)
         -Ilinux/drivers/gpu/drm/amd/display/dc \
         -Ilinux/drivers/gpu/drm/amd/display/amdgpu_dm
     endif
+    obj-$(ARCH)/linuxkpi/src/net_frontend.c.o: override LINUX_CPPFLAGS += -DLINUXKPI_NET_FRONTEND
+    obj-$(ARCH)/linuxkpi/src/phy_link_modes.c.o: override LINUX_CPPFLAGS += -DLINUXKPI_NET_FRONTEND
+    obj-$(ARCH)/src/tests/linuxkpi/linux/test_r2_net_bridge.c.o: override LINUX_CPPFLAGS += -DLINUXKPI_NET_FRONTEND
     LINUX_TEST_SRCFILES := $(shell find -L src/tests/linuxkpi/linux -type f -name '*.c' 2>/dev/null | LC_ALL=C sort)
     LINUX_TEST_OBJ := $(addprefix obj-$(ARCH)/,$(LINUX_TEST_SRCFILES:.c=.c.o))
 endif
@@ -408,7 +445,7 @@ LINUX_IMPORT_ID := $(shell sed -n '/^tag=/p;/^commit=/p' linux/.pin 2>/dev/null)
 .PHONY: linux-profile-force
 $(LINUX_PROFILE_STAMP): linux-profile-force
 	@mkdir -p "$(dir $@)"
-	@printf '%s\n' '$(LINUX_IMPORT_ID) KPI_AMDGPU=$(KPI_AMDGPU) KPI_NOUVEAU=$(KPI_NOUVEAU) LINUX_IMPORTED=$(if $(linux-obj-y),1,0)' > $@.tmp
+	@printf '%s\n' '$(LINUX_IMPORT_ID) KPI_AMDGPU=$(KPI_AMDGPU) KPI_NOUVEAU=$(KPI_NOUVEAU) KPI_R8169=$(KPI_R8169) KPI_RTW89=$(KPI_RTW89) KPI_RTW88=$(KPI_RTW88) LINUX_IMPORTED=$(if $(linux-obj-y),1,0)' > $@.tmp
 	@if ! cmp -s $@.tmp $@; then mv $@.tmp $@; else rm $@.tmp; fi
 $(OBJ) $(LINUX_OBJ): $(LINUX_PROFILE_STAMP)
 

@@ -332,6 +332,11 @@ int __printk_ratelimit(const char *func) {
   return ___ratelimit(&printk_ratelimit_state, func);
 }
 
+int net_ratelimit(void) {
+  static struct ratelimit_state state = {.interval = 5 * HZ, .burst = 10};
+  return ___ratelimit(&state, __func__);
+}
+
 enum system_states system_state = SYSTEM_RUNNING;
 
 void add_taint(unsigned flag, enum lockdep_ok lockdep_ok) {

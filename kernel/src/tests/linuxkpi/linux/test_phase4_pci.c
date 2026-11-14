@@ -21,6 +21,7 @@
 #include <linux/string.h>
 
 #include <linuxkpi/log.h>
+#include <linuxkpi/native_pci.h>
 
 #define P4P_EDU_VENDOR 0x1234
 #define P4P_EDU_DEVICE 0x11e8
@@ -43,17 +44,24 @@ static void p4p_fail(const char *what, long v) {
 static int p4p_probe_calls;
 static int p4p_remove_calls;
 static int p4p_marker;
+static bool p4p_fail_probe;
 
 static int p4p_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
   (void)id;
   p4p_probe_calls++;
+  if (!linuxkpi_pci_native_claim(pdev->sysdata, "kpi-pci-test"))
+    return -EBUSY;
+  if (p4p_fail_probe) {
+    linuxkpi_pci_native_release(pdev->sysdata, "kpi-pci-test");
+    return -EIO;
+  }
   pci_set_drvdata(pdev, &p4p_marker);
   return 0;
 }
 
 static void p4p_remove(struct pci_dev *pdev) {
-  (void)pdev;
   p4p_remove_calls++;
+  linuxkpi_pci_native_release(pdev->sysdata, "kpi-pci-test");
 }
 
 static const struct pci_device_id p4p_ids[] = {
@@ -85,11 +93,41 @@ static void p4p_test_driver_lifecycle(struct pci_dev *edu) {
   else
     p4p_fail("driver data roundtrip", pci_get_drvdata(edu) ? 1 : 0);
 
+  if (!linuxkpi_pci_native_claim(edu->sysdata, "competing-native-owner"))
+    p4p_ok("native PCI manager rejects concurrent claim");
+  else {
+    p4p_fail("native PCI manager accepted concurrent claim", 0);
+    linuxkpi_pci_native_release(edu->sysdata, "competing-native-owner");
+  }
+
   pci_unregister_driver(&p4p_driver);
   if (p4p_remove_calls == 1 && pci_dev_driver(edu) == NULL)
     p4p_ok("test driver remove called on unregister");
   else
     p4p_fail("remove call count", p4p_remove_calls);
+
+  if (linuxkpi_pci_native_claim(edu->sysdata, "post-unregister-owner")) {
+    p4p_ok("native PCI claim released on unregister");
+    linuxkpi_pci_native_release(edu->sysdata, "post-unregister-owner");
+  } else {
+    p4p_fail("native PCI claim remains after unregister", 0);
+  }
+
+  p4p_fail_probe = true;
+  p4p_probe_calls = 0;
+  p4p_remove_calls = 0;
+  if (pci_register_driver(&p4p_driver) != 0 || p4p_probe_calls != 1 ||
+      pci_dev_driver(edu) != NULL) {
+    p4p_fail("failed probe lifecycle", p4p_probe_calls);
+  } else if (linuxkpi_pci_native_claim(edu->sysdata,
+                                      "post-failed-probe-owner")) {
+    p4p_ok("native PCI claim released on probe failure");
+    linuxkpi_pci_native_release(edu->sysdata, "post-failed-probe-owner");
+  } else {
+    p4p_fail("native PCI claim remains after failed probe", 0);
+  }
+  pci_unregister_driver(&p4p_driver);
+  p4p_fail_probe = false;
 }
 
 /* ── main suite ─────────────────────────────────────────────────────────── */

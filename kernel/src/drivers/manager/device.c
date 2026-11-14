@@ -165,7 +165,8 @@ int device_destroy(struct device *dev) {
   if (!dev || dev == root_node || dev->first_child)
     return -1;
   spinlock_acquire(&dev->lock);
-  if (dev->state == DEVICE_REMOVING || dev->state == DEVICE_DEAD) {
+  if (dev->state == DEVICE_REMOVING || dev->state == DEVICE_DEAD ||
+      dev->external_driver) {
     spinlock_release(&dev->lock);
     return -1;
   }
@@ -277,7 +278,7 @@ int dm_bind_device(struct device *dev, struct driver *drv) {
   if (!dev || !drv || !drv->probe || !dm_driver_matches(dev, drv))
     return -1;
   spinlock_acquire(&dev->lock);
-  if (dev->state != DEVICE_UNBOUND || dev->driver) {
+  if (dev->state != DEVICE_UNBOUND || dev->driver || dev->external_driver) {
     spinlock_release(&dev->lock);
     return -1;
   }
@@ -367,6 +368,32 @@ int dm_unregister_driver(struct driver *drv) {
   return 0;
 }
 
+bool dm_claim_external_device(struct device *dev, const char *driver_name) {
+  bool claimed = false;
+  if (!dev || !driver_name || !driver_name[0])
+    return false;
+  spinlock_acquire(&dev->lock);
+  if (dev->state == DEVICE_UNBOUND && !dev->driver && !dev->external_driver) {
+    dev->external_driver = driver_name;
+    dev->state = DEVICE_BOUND_EXTERNAL;
+    claimed = true;
+  }
+  spinlock_release(&dev->lock);
+  return claimed;
+}
+
+void dm_release_external_device(struct device *dev, const char *driver_name) {
+  if (!dev || !driver_name)
+    return;
+  spinlock_acquire(&dev->lock);
+  if (dev->external_driver && strcmp(dev->external_driver, driver_name) == 0) {
+    dev->external_driver = NULL;
+    if (dev->state == DEVICE_BOUND_EXTERNAL)
+      dev->state = DEVICE_UNBOUND;
+  }
+  spinlock_release(&dev->lock);
+}
+
 void dm_for_each_device(struct bus_type *bus, dm_device_iter_t fn, void *ctx) {
   if (!bus || !fn)
     return;
@@ -393,6 +420,10 @@ static void dump_device(struct device *dev, int depth) {
   if (dev->driver) {
     console_puts(" [");
     console_puts(dev->driver->name);
+    console_puts("]");
+  } else if (dev->external_driver) {
+    console_puts(" [external: ");
+    console_puts(dev->external_driver);
     console_puts("]");
   }
   console_puts("\n");

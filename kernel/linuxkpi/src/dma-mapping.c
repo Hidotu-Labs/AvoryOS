@@ -84,6 +84,50 @@ void *dma_alloc_coherent(struct device *dev, size_t size,
   return dma_alloc_attrs(dev, size, dma_handle, flag, 0);
 }
 
+struct kpi_dmam_resource {
+  struct device *dev;
+  size_t size;
+  void *cpu_addr;
+  dma_addr_t dma_addr;
+  unsigned long attrs;
+};
+
+static void kpi_dmam_release(void *data) {
+  struct kpi_dmam_resource *resource = data;
+  dma_free_attrs(resource->dev, resource->size, resource->cpu_addr,
+                 resource->dma_addr, resource->attrs);
+  kfree(resource);
+}
+
+void *dmam_alloc_attrs(struct device *dev, size_t size, dma_addr_t *dma_handle,
+                       gfp_t flags, unsigned long attrs) {
+  if (!dev || !dma_handle || !size)
+    return NULL;
+
+  dma_addr_t address = DMA_MAPPING_ERROR;
+  void *cpu_addr = dma_alloc_attrs(dev, size, &address, flags, attrs);
+  if (!cpu_addr)
+    return NULL;
+
+  struct kpi_dmam_resource *resource = kmalloc(sizeof(*resource), flags);
+  if (!resource) {
+    dma_free_attrs(dev, size, cpu_addr, address, attrs);
+    return NULL;
+  }
+  resource->dev = dev;
+  resource->size = size;
+  resource->cpu_addr = cpu_addr;
+  resource->dma_addr = address;
+  resource->attrs = attrs;
+
+  /* devres owns the coherent block and releases it after driver remove.
+   * add_action_or_reset unwinds the allocation if bookkeeping fails. */
+  if (devm_add_action_or_reset(dev, kpi_dmam_release, resource))
+    return NULL;
+  *dma_handle = address;
+  return cpu_addr;
+}
+
 void dma_free_attrs(struct device *dev, size_t size, void *cpu_addr,
                     dma_addr_t dma_handle, unsigned long attrs) {
   unsigned int order;

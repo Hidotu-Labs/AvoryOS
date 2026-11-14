@@ -77,6 +77,11 @@ struct device_attribute {
                    const char *buf, size_t count);
 };
 
+struct dev_ext_attribute {
+  struct device_attribute attr;
+  void *var;
+};
+
 #define __ATTR(_name, _mode, _show, _store)                                   \
   {                                                                           \
     .attr = {.name = __stringify(_name), .mode = (_mode)},                    \

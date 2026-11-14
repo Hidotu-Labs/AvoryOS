@@ -37,6 +37,7 @@ struct attribute_group;
 struct fwnode_handle;
 struct kobj_uevent_env;
 struct dev_pm_ops;
+struct device_driver;
 
 /* Minimal bus_type: the bus shims (platform.c, pci.c) match synchronously and
  * only need the name.  Upstream's <linux/device/bus.h> is deliberately not
@@ -44,6 +45,9 @@ struct dev_pm_ops;
  * (see below).  Recorded in docs/linuxkpi-gaps.md. */
 struct bus_type {
   const char *name;
+  const struct attribute_group **dev_groups;
+  int (*match)(struct device *, const struct device_driver *);
+  int (*uevent)(const struct device *, struct kobj_uevent_env *);
 };
 
 #ifndef NUMA_NO_NODE
@@ -53,6 +57,15 @@ struct bus_type {
 struct device_dma_parameters {
   unsigned int max_segment_size;
   unsigned long segment_boundary_mask;
+};
+
+/* The system has no suspend/wakeup core (CONFIG_PM_SLEEP is off), but the
+ * upstream PM-wakeup inline contract still records capability and enablement
+ * bits on each device. Keep exactly the state read by pm_wakeup.h's disabled
+ * branch; event delivery remains the upstream no-PM no-op. */
+struct dev_pm_info {
+  bool can_wakeup : 1;
+  bool should_wakeup : 1;
 };
 
 /* pm_message_t and struct dev_pm_ops come from the <linux/pm.h> overlay;
@@ -92,15 +105,25 @@ struct device {
   u64 dma_mask;          /* DMA addressing limit (linuxkpi/dma-mapping.c) */
   u64 coherent_dma_mask; /* coherent allocation addressing limit           */
   struct device_dma_parameters dma_parms;
+  struct dev_pm_info power;
   bool removable; /* dev_is_removable() consumers (stock device.h) */
   struct list_head devres_head;
   spinlock_t devres_lock;
   struct list_head kpi_list; /* global created-device list (device_destroy) */
+  struct list_head kpi_bus_node;
+  struct list_head kpi_class_node;
+  unsigned int kpi_refs;
   char kpi_name[48];
 };
 
 /* Defined here (not in driver.h) because upstream <linux/device.h> provides
  * it through device/driver.h, and both pci.h and driver.h rely on that. */
+enum probe_type {
+  PROBE_DEFAULT_STRATEGY,
+  PROBE_PREFER_ASYNCHRONOUS,
+  PROBE_FORCE_SYNCHRONOUS,
+};
+
 struct device_driver {
   struct module *owner;
   const char *name;
@@ -110,7 +133,8 @@ struct device_driver {
   const struct attribute_group **dev_groups;
   const struct dev_pm_ops *pm;
   int (*probe)(struct device *dev);
-  void (*remove)(struct device *dev);
+  int (*remove)(struct device *dev);
+  enum probe_type probe_type;
   void (*shutdown)(struct device *dev);
 };
 
@@ -185,6 +209,14 @@ static inline int dev_to_node(struct device *dev) {
       dev_info(dev, fmt, ##__VA_ARGS__);                                       \
     }                                                                          \
   } while (0)
+#define dev_notice_once(dev, fmt, ...)                                        \
+  do {                                                                        \
+    static bool __noted;                                                       \
+    if (!__noted) {                                                            \
+      __noted = true;                                                          \
+      dev_notice(dev, fmt, ##__VA_ARGS__);                                     \
+    }                                                                          \
+  } while (0)
 #define dev_dbg_once(dev, fmt, ...)                                           \
   do {                                                                        \
     static bool __warned;                                                      \
@@ -197,6 +229,17 @@ static inline int dev_to_node(struct device *dev) {
 static inline bool device_is_registered(struct device *dev) {
   return dev && dev->kobj.name != NULL;
 }
+
+int bus_register(const struct bus_type *bus);
+void bus_unregister(const struct bus_type *bus);
+struct device *bus_find_device_by_name(const struct bus_type *bus,
+                                        struct device *start, const char *name);
+struct device *bus_find_device_by_fwnode(const struct bus_type *bus,
+                                          const struct fwnode_handle *fwnode);
+int device_bind_driver(struct device *dev);
+void device_release_driver(struct device *dev);
+int driver_register(struct device_driver *drv);
+void driver_unregister(struct device_driver *drv);
 
 /* Groups are accepted but not materialized yet (sysfs dynamic nodes are a
  * native-sysfs follow-up; see docs/linuxkpi-gaps.md). */
@@ -260,6 +303,10 @@ struct device *device_create_with_groups(const struct class *cls,
 /* ── devres ─────────────────────────────────────────────────────────────── */
 
 typedef void (*dr_release_t)(struct device *dev, void *res);
+typedef int (*dr_match_t)(struct device *dev, void *res, void *match_data);
+void device_set_node(struct device *dev, struct fwnode_handle *fwnode);
+void *devres_find(struct device *dev, dr_release_t release, dr_match_t match,
+                  void *match_data);
 
 void *devres_alloc(dr_release_t release, size_t size, gfp_t gfp);
 void devres_free(void *res);
@@ -354,12 +401,23 @@ void device_remove_file(struct device *dev,
 /* Optional audio-component ordering links have no native provider. */
 struct device_link;
 #define DL_FLAG_STATELESS (1U << 0)
+#define DL_FLAG_PM_RUNTIME (1U << 2)
 static inline struct device_link *device_link_add(struct device *consumer,
     struct device *supplier, u32 flags) {
   (void)consumer; (void)supplier; (void)flags;
   return NULL;
 }
+static inline void device_link_del(struct device_link *link) {
+  /* No link is allocated while the native runtime PM core is disabled. */
+  (void)link;
+}
 
 int dev_err_probe(const struct device *dev, int err, const char *fmt, ...);
+
+/* Match upstream device.h's inclusion order: PM wakeup helpers rely on the
+ * device and power-state definitions above. */
+#define _DEVICE_H_
+#include <linux/pm_wakeup.h>
+#undef _DEVICE_H_
 
 #endif /* __AVORY_LINUXKPI_DEVICE_H */

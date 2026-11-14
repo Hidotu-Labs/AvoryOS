@@ -101,3 +101,14 @@ drivers/gpu/drm/nouveau
 lib/maple_tree.c
 ?drivers/gpu/drm/drm_gpuvm.c
 ?drivers/gpu/drm/drm_encoder_slave.c
+
+# Phase 7 (Realtek): source and private-header closure for R8169 and the
+# selected PCIe Wi-Fi families. Object selection comes from Kbuild in
+# scripts/linux/kbuild-subset.py and stays behind independent default-off
+# KPI_R8169 / KPI_RTW89 / KPI_RTW88 gates. Importing the source does not enable
+# PCI registration or probe.
+drivers/net/ethernet/realtek
+drivers/net/phy
+drivers/net/wireless/realtek
+net/wireless
+net/mac80211

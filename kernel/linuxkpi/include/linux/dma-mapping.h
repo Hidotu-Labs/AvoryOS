@@ -12,6 +12,7 @@
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <linux/device.h>
+#include <linux/gfp.h>
 #include <linux/scatterlist.h>
 #include <linux/dma-direction.h>
 #include <asm/barrier.h>
@@ -43,8 +44,16 @@ void dma_free_noncoherent(struct device *dev, size_t size, void *addr,
 
 void *dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *dma_handle,
                       gfp_t flag, unsigned long attrs);
+void *dmam_alloc_attrs(struct device *dev, size_t size, dma_addr_t *dma_handle,
+                       gfp_t flag, unsigned long attrs);
 void dma_free_attrs(struct device *dev, size_t size, void *cpu_addr,
                     dma_addr_t dma_handle, unsigned long attrs);
+
+static inline void *dmam_alloc_coherent(struct device *dev, size_t size,
+                                        dma_addr_t *dma_handle, gfp_t flags) {
+  return dmam_alloc_attrs(dev, size, dma_handle, flags,
+                          (flags & __GFP_NOWARN) ? DMA_ATTR_NO_WARN : 0);
+}
 
 dma_addr_t dma_map_page_attrs(struct device *dev, struct page *page,
                               size_t offset, size_t size,

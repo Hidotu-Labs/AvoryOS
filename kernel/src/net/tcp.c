@@ -1832,22 +1832,22 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
     t->keepalive_probing = false;
     t->keepalive_probes = 0;
 
-    /* Update the peer window (unscaled during the SYN exchange). */
-    uint32_t new_wnd;
-    if ((flags & SYN) && t->state == TCP_SYN_SENT)
-        new_wnd = raw_wnd;
-    else
-        new_wnd = raw_wnd << t->snd_wscale;
-
+    /* Update the peer window once synchronized. In SYN-SENT, snd_wl1/snd_wl2
+     * are not yet initialized, so RFC 793 initializes them unconditionally
+     * from the valid SYN+ACK below (otherwise seq >= 0x80000000 fails
+     * seq_gt(seq, 0) and leaves snd_wnd stuck at 0). */
     bool wnd_grew = false;
-    if (seq_gt(seq, t->snd_wl1) ||
-        (seq == t->snd_wl1 && seq_ge(ack, t->snd_wl2))) {
-        wnd_grew = new_wnd > t->snd_wnd;
-        t->snd_wnd = new_wnd;
-        t->snd_wl1 = seq;
-        t->snd_wl2 = ack;
-        if (wnd_grew)
-            act->output = true;
+    if (t->state != TCP_SYN_SENT) {
+        uint32_t new_wnd = raw_wnd << t->snd_wscale;
+        if (seq_gt(seq, t->snd_wl1) ||
+            (seq == t->snd_wl1 && seq_ge(ack, t->snd_wl2))) {
+            wnd_grew = new_wnd > t->snd_wnd;
+            t->snd_wnd = new_wnd;
+            t->snd_wl1 = seq;
+            t->snd_wl2 = ack;
+            if (wnd_grew)
+                act->output = true;
+        }
     }
 
     if (flags & RST) {
@@ -1876,6 +1876,9 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
         if ((flags & (SYN | ACK)) == (SYN | ACK) && ack == t->snd_nxt) {
             t->snd_una = ack;
             t->rcv_nxt = seq + 1;
+            t->snd_wnd = raw_wnd;
+            t->snd_wl1 = seq;
+            t->snd_wl2 = ack;
             t->state = TCP_ESTABLISHED;
             t->retries = 0;
             t->deadline = 0;
@@ -2080,7 +2083,6 @@ void tcp_input_ipv4(uint32_t s, uint32_t d, const uint8_t *p, size_t len)
     }
 
     size_t header_len = (size_t)(p[12] >> 4) * 4;
-
     if (header_len < 20 || header_len > len) {
         stats.malformed++;
         return;
@@ -2154,6 +2156,9 @@ void tcp_input_ipv4(uint32_t s, uint32_t d, const uint8_t *p, size_t len)
                 child->snd_una = new_iss();
                 child->snd_nxt = child->snd_una + 1;
                 child->tx_head = child->snd_nxt;
+                child->snd_wnd = raw_wnd;
+                child->snd_wl1 = seq;
+                child->snd_wl2 = child->snd_una;
                 child->state = TCP_SYN_RECEIVED;
                 child->deadline =
                     lapic_timer_get_ticks() + child->rto_ms;
@@ -2266,6 +2271,9 @@ void tcp_input_ipv6(const uint8_t s[16], const uint8_t d[16],
                 child->snd_una = new_iss();
                 child->snd_nxt = child->snd_una + 1;
                 child->tx_head = child->snd_nxt;
+                child->snd_wnd = raw_wnd;
+                child->snd_wl1 = seq;
+                child->snd_wl2 = child->snd_una;
                 child->state = TCP_SYN_RECEIVED;
                 child->deadline =
                     lapic_timer_get_ticks() + child->rto_ms;

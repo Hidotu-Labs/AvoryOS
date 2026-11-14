@@ -1,0 +1,895 @@
+/* Linux-shaped frontend for the native Ethernet bridge. This file deliberately
+ * sees only upstream Linux headers and opaque native handles. */
+#include <linux/bitops.h>
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/etherdevice.h>
+#include <linux/errno.h>
+#include <linux/gfp.h>
+#include <linux/netdevice.h>
+#include <linux/ethtool.h>
+#include <linux/rtnetlink.h>
+#include <linux/refcount.h>
+#include <linux/skbuff.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+
+#include <linuxkpi/native_net.h>
+#include <linuxkpi/frontend_net.h>
+
+extern void linuxkpi_guid_bytes(void *buffer, size_t len);
+
+#define FRONTEND_NETDEVS 8
+#define FRONTEND_NAPI_SLOTS 64
+
+struct frontend_netdev {
+  struct net_device *dev;
+  struct linuxkpi_native_net *native;
+  bool used;
+  bool active;
+};
+struct frontend_napi {
+  struct napi_struct *napi;
+  struct net_device *dev;
+  struct linuxkpi_native_napi *native;
+  bool used;
+  bool removing;
+  unsigned references;
+};
+
+static struct frontend_netdev netdevs[FRONTEND_NETDEVS];
+static struct frontend_napi napis[FRONTEND_NAPI_SLOTS];
+static DEFINE_SPINLOCK(frontend_lock);
+static DEFINE_MUTEX(frontend_rtnl_lock);
+static unsigned int frontend_tx_active;
+static const struct ethtool_phy_ops *frontend_phy_ethtool_ops;
+
+void rtnl_lock(void) { mutex_lock(&frontend_rtnl_lock); }
+void rtnl_unlock(void) { mutex_unlock(&frontend_rtnl_lock); }
+int rtnl_trylock(void) { return mutex_trylock(&frontend_rtnl_lock); }
+int rtnl_is_locked(void) { return mutex_is_locked(&frontend_rtnl_lock); }
+void ethtool_set_ethtool_phy_ops(const struct ethtool_phy_ops *ops) {
+  __atomic_store_n(&frontend_phy_ethtool_ops, ops, __ATOMIC_RELEASE);
+}
+const struct ethtool_phy_ops *linuxkpi_ethtool_phy_ops_get(void) {
+  return __atomic_load_n(&frontend_phy_ethtool_ops, __ATOMIC_ACQUIRE);
+}
+int ethtool_op_get_ts_info(struct net_device *dev,
+                           struct kernel_ethtool_ts_info *info) {
+  (void)dev;
+  memset(info, 0, sizeof(*info));
+  info->cmd = ETHTOOL_GET_TS_INFO;
+  info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
+                          SOF_TIMESTAMPING_RX_SOFTWARE |
+                          SOF_TIMESTAMPING_SOFTWARE;
+  info->phc_index = -1;
+  return 0;
+}
+
+static struct frontend_netdev *find_netdev_locked(struct net_device *dev) {
+  for (unsigned i = 0; i < FRONTEND_NETDEVS; i++)
+    if (netdevs[i].used && netdevs[i].active && netdevs[i].dev == dev)
+      return &netdevs[i];
+  return NULL;
+}
+
+static struct frontend_napi *find_napi_locked(struct napi_struct *napi) {
+  for (unsigned i = 0; i < FRONTEND_NAPI_SLOTS; i++)
+    if (napis[i].used && !napis[i].removing && napis[i].napi == napi)
+      return &napis[i];
+  return NULL;
+}
+
+static struct frontend_napi *frontend_napi_get(struct napi_struct *napi) {
+  spin_lock(&frontend_lock);
+  struct frontend_napi *entry = find_napi_locked(napi);
+  if (entry)
+    __atomic_add_fetch(&entry->references, 1, __ATOMIC_RELAXED);
+  spin_unlock(&frontend_lock);
+  return entry;
+}
+
+static void frontend_napi_put(struct frontend_napi *entry) {
+  if (!entry)
+    return;
+  spin_lock(&frontend_lock);
+  __atomic_sub_fetch(&entry->references, 1, __ATOMIC_RELEASE);
+  spin_unlock(&frontend_lock);
+}
+
+/* Imported drivers can enable features during PCI probe. Reconcile their
+ * hardware state before opening the native linear-frame endpoint. */
+static int frontend_limit_features(struct net_device *dev) {
+  netdev_features_t features = dev->features & NETIF_F_HIGHDMA;
+  if (features != dev->features && dev->netdev_ops &&
+      dev->netdev_ops->ndo_set_features) {
+    int ret = dev->netdev_ops->ndo_set_features(dev, features);
+    if (ret < 0)
+      return ret;
+  }
+  dev->features = features;
+  dev->hw_features = 0;
+  dev->wanted_features = 0;
+  dev->vlan_features = 0;
+  return 0;
+}
+
+static int frontend_open(void *context) {
+  struct frontend_netdev *entry = context;
+  int ret = entry->dev->netdev_ops && entry->dev->netdev_ops->ndo_open
+                ? entry->dev->netdev_ops->ndo_open(entry->dev) : 0;
+  if (!ret)
+    set_bit(__LINK_STATE_START, &entry->dev->state);
+  return ret;
+}
+
+static void frontend_stop(void *context) {
+  struct frontend_netdev *entry = context;
+  struct net_device *dev = entry->dev;
+  clear_bit(__LINK_STATE_START, &dev->state);
+  if (dev->netdev_ops && dev->netdev_ops->ndo_stop)
+    dev->netdev_ops->ndo_stop(dev);
+  /* A driver may omit napi_disable in ndo_stop. Synchronize every registered
+   * poll context before native unregister drains RX references. */
+  for (unsigned i = 0; i < FRONTEND_NAPI_SLOTS; i++) {
+    spin_lock(&frontend_lock);
+    struct frontend_napi *n = napis[i].used && !napis[i].removing &&
+                              napis[i].dev == dev ? &napis[i] : NULL;
+    if (n)
+      __atomic_add_fetch(&n->references, 1, __ATOMIC_RELAXED);
+    spin_unlock(&frontend_lock);
+    if (n)
+      linuxkpi_native_napi_disable(n->native);
+    frontend_napi_put(n);
+  }
+}
+
+static int frontend_carrier(void *context) {
+  struct frontend_netdev *entry = context;
+  return netif_carrier_ok(entry->dev);
+}
+
+static enum linuxkpi_native_tx_result frontend_transmit(
+    void *context, const unsigned char *data, unsigned long length) {
+  struct frontend_netdev *entry = context;
+  struct net_device *dev = entry->dev;
+  __atomic_add_fetch(&frontend_tx_active, 1, __ATOMIC_ACQUIRE);
+  if (!test_bit(__LINK_STATE_PRESENT, &dev->state) ||
+      !dev->netdev_ops || !dev->netdev_ops->ndo_start_xmit) {
+    __atomic_sub_fetch(&frontend_tx_active, 1, __ATOMIC_RELEASE);
+    return LINUXKPI_NATIVE_TX_FAILED;
+  }
+  if (netif_queue_stopped(dev)) {
+    __atomic_sub_fetch(&frontend_tx_active, 1, __ATOMIC_RELEASE);
+    return LINUXKPI_NATIVE_TX_BUSY;
+  }
+  if (length > (unsigned long)~0U - (ETH_ZLEN - ETH_HLEN)) {
+    __atomic_sub_fetch(&frontend_tx_active, 1, __ATOMIC_RELEASE);
+    return LINUXKPI_NATIVE_TX_FAILED;
+  }
+  struct sk_buff *skb = alloc_skb((unsigned int)length + ETH_ZLEN - ETH_HLEN,
+                                  GFP_ATOMIC);
+  if (!skb) {
+    __atomic_sub_fetch(&frontend_tx_active, 1, __ATOMIC_RELEASE);
+    return LINUXKPI_NATIVE_TX_FAILED;
+  }
+  void *dst = skb_put(skb, (unsigned int)length);
+  if (!dst) {
+    kfree_skb(skb);
+    __atomic_sub_fetch(&frontend_tx_active, 1, __ATOMIC_RELEASE);
+    return LINUXKPI_NATIVE_TX_FAILED;
+  }
+  memcpy(dst, data, length);
+  skb->dev = dev;
+  skb->queue_mapping = 0;
+  unsigned int network_offset = ETH_HLEN;
+  unsigned short protocol = length >= ETH_HLEN
+      ? (unsigned short)(((unsigned short)data[12] << 8) | data[13])
+      : ETH_P_802_3;
+  if (length >= ETH_HLEN + 4 &&
+      (protocol == ETH_P_8021Q || protocol == ETH_P_8021AD)) {
+    protocol = (unsigned short)(((unsigned short)data[16] << 8) | data[17]);
+    network_offset += 4;
+  }
+  skb->protocol = htons(protocol);
+  if (length >= ETH_HLEN)
+    skb->network_header = (u16)network_offset;
+  netdev_tx_t result = dev->netdev_ops->ndo_start_xmit(skb, dev);
+  __atomic_sub_fetch(&frontend_tx_active, 1, __ATOMIC_RELEASE);
+  if (result == NETDEV_TX_OK)
+    return LINUXKPI_NATIVE_TX_ACCEPTED;
+  kfree_skb(skb);
+  return result == NETDEV_TX_BUSY ? LINUXKPI_NATIVE_TX_BUSY
+                                  : LINUXKPI_NATIVE_TX_FAILED;
+}
+
+static const struct linuxkpi_native_net_ops frontend_net_ops = {
+  .open = frontend_open,
+  .stop = frontend_stop,
+  .carrier = frontend_carrier,
+  .transmit = frontend_transmit,
+};
+
+bool linuxkpi_netdev_is_bound(struct net_device *dev) {
+  spin_lock(&frontend_lock);
+  struct frontend_netdev *entry = find_netdev_locked(dev);
+  bool bound = entry != NULL;
+  spin_unlock(&frontend_lock);
+  return bound;
+}
+
+/* Test hook for the R3 failed-probe case: fail the next registration once,
+ * after the driver has already acquired its probe-time resources. */
+static int register_fault;
+
+void linuxkpi_netdev_fail_next_register(int err) {
+  spin_lock(&frontend_lock);
+  register_fault = err;
+  spin_unlock(&frontend_lock);
+}
+
+unsigned linuxkpi_netdev_registered_count(void) {
+  unsigned count = 0;
+  spin_lock(&frontend_lock);
+  for (unsigned i = 0; i < FRONTEND_NETDEVS; i++)
+    count += netdevs[i].used;
+  spin_unlock(&frontend_lock);
+  return count;
+}
+
+int register_netdev(struct net_device *dev) {
+  if (!dev || !dev->dev_addr || dev->addr_len != ETH_ALEN)
+    return -EINVAL;
+  spin_lock(&frontend_lock);
+  int fault = register_fault;
+  register_fault = 0;
+  spin_unlock(&frontend_lock);
+  if (fault) {
+    pr_info("[KERNEL] LinuxKPI: injected register_netdev failure %d\n", fault);
+    return fault;
+  }
+  spin_lock(&frontend_lock);
+  struct frontend_netdev *entry = find_netdev_locked(dev);
+  if (entry) {
+    spin_unlock(&frontend_lock);
+    return -EEXIST;
+  }
+  for (unsigned i = 0; i < FRONTEND_NETDEVS; i++) {
+    if (!netdevs[i].used) {
+      entry = &netdevs[i];
+      memset(entry, 0, sizeof(*entry));
+      entry->used = true;
+      entry->dev = dev;
+      break;
+    }
+  }
+  spin_unlock(&frontend_lock);
+  if (!entry)
+    return -ENOSPC;
+
+  char requested_name[IFNAMSIZ];
+  strscpy(requested_name, dev->name, sizeof(requested_name));
+  if (strchr(requested_name, '%'))
+    requested_name[0] = '\0';
+  if (dev->netdev_ops && dev->netdev_ops->ndo_init) {
+    int ret = dev->netdev_ops->ndo_init(dev);
+    if (ret) {
+      spin_lock(&frontend_lock);
+      memset(entry, 0, sizeof(*entry));
+      spin_unlock(&frontend_lock);
+      return ret;
+    }
+  }
+  int ret = frontend_limit_features(dev);
+  if (ret) {
+    if (dev->netdev_ops && dev->netdev_ops->ndo_uninit)
+      dev->netdev_ops->ndo_uninit(dev);
+    spin_lock(&frontend_lock);
+    memset(entry, 0, sizeof(*entry));
+    spin_unlock(&frontend_lock);
+    return ret;
+  }
+  spin_lock(&frontend_lock);
+  entry->active = true;
+  spin_unlock(&frontend_lock);
+  struct linuxkpi_native_net *native = linuxkpi_native_net_register(
+      requested_name, dev->dev_addr, (unsigned short)dev->mtu,
+      &frontend_net_ops, entry);
+  if (!native) {
+    if (dev->netdev_ops && dev->netdev_ops->ndo_uninit)
+      dev->netdev_ops->ndo_uninit(dev);
+    spin_lock(&frontend_lock);
+    memset(entry, 0, sizeof(*entry));
+    spin_unlock(&frontend_lock);
+    return -ENODEV;
+  }
+  spin_lock(&frontend_lock);
+  entry->native = native;
+  spin_unlock(&frontend_lock);
+  linuxkpi_native_net_get_name(native, dev->name);
+  dev->dev.init_name = dev->name;
+  return 0;
+}
+
+void unregister_netdev(struct net_device *dev) {
+  spin_lock(&frontend_lock);
+  struct frontend_netdev *entry = find_netdev_locked(dev);
+  struct linuxkpi_native_net *native = entry ? entry->native : NULL;
+  if (entry)
+    entry->active = false;
+  spin_unlock(&frontend_lock);
+  if (!entry)
+    return;
+  if (linuxkpi_native_net_unregister(native) != 0) {
+    spin_lock(&frontend_lock);
+    entry->active = true;
+    spin_unlock(&frontend_lock);
+    return;
+  }
+  if (dev->netdev_ops && dev->netdev_ops->ndo_uninit)
+    dev->netdev_ops->ndo_uninit(dev);
+  spin_lock(&frontend_lock);
+  memset(entry, 0, sizeof(*entry));
+  spin_unlock(&frontend_lock);
+}
+
+void netif_carrier_on(struct net_device *dev) {
+  if (dev)
+    clear_bit(__LINK_STATE_NOCARRIER, &dev->state);
+}
+
+void netif_carrier_off(struct net_device *dev) {
+  if (dev)
+    set_bit(__LINK_STATE_NOCARRIER, &dev->state);
+}
+
+void netif_tx_wake_queue(struct netdev_queue *queue) {
+  if (!queue)
+    return;
+  clear_bit(__QUEUE_STATE_DRV_XOFF, &queue->state);
+  spin_lock(&frontend_lock);
+  struct frontend_netdev *entry = find_netdev_locked(queue->dev);
+  struct linuxkpi_native_net *native = entry ? entry->native : NULL;
+  if (native)
+    linuxkpi_native_net_tx_wake(native);
+  spin_unlock(&frontend_lock);
+}
+
+void linuxkpi_netdev_test_stats(struct net_device *dev,
+                                unsigned long long *rx_packets,
+                                unsigned long long *tx_packets,
+                                unsigned long long *rx_dropped,
+                                unsigned long long *tx_dropped) {
+  spin_lock(&frontend_lock);
+  struct frontend_netdev *entry = find_netdev_locked(dev);
+  if (entry)
+    linuxkpi_native_net_stats(entry->native, rx_packets, tx_packets,
+                              rx_dropped, tx_dropped);
+  spin_unlock(&frontend_lock);
+}
+
+void linuxkpi_netdev_test_set_rx_tap(struct net_device *dev,
+                                     linuxkpi_test_rx_tap_fn tap,
+                                     void *context) {
+  spin_lock(&frontend_lock);
+  struct frontend_netdev *entry = find_netdev_locked(dev);
+  if (entry)
+    linuxkpi_native_net_set_rx_tap(entry->native, tap, context);
+  spin_unlock(&frontend_lock);
+}
+
+unsigned linuxkpi_netdev_test_references(struct net_device *dev) {
+  spin_lock(&frontend_lock);
+  struct frontend_netdev *entry = find_netdev_locked(dev);
+  unsigned references = entry ? linuxkpi_native_net_references(entry->native) : 0;
+  spin_unlock(&frontend_lock);
+  return references;
+}
+
+int dev_queue_xmit(struct sk_buff *skb) {
+  if (!skb || !skb->dev) {
+    kfree_skb(skb);
+    return -EINVAL;
+  }
+  spin_lock(&frontend_lock);
+  struct frontend_netdev *entry = find_netdev_locked(skb->dev);
+  int ret = entry ? linuxkpi_native_net_transmit(
+                        entry->native, skb->data, skb->len) : -ENODEV;
+  spin_unlock(&frontend_lock);
+  kfree_skb(skb);
+  return ret;
+}
+
+void netif_tx_stop_all_queues(struct net_device *dev) {
+  if (!dev || !dev->_tx)
+    return;
+  for (unsigned int i = 0; i < dev->num_tx_queues; i++)
+    set_bit(__QUEUE_STATE_DRV_XOFF, &dev->_tx[i].state);
+}
+
+static int frontend_poll(void *context, int budget) {
+  struct frontend_napi *entry = context;
+  clear_bit(NAPI_STATE_MISSED, &entry->napi->state);
+  return entry->napi->poll(entry->napi, budget);
+}
+
+void netif_napi_add_weight_locked(struct net_device *dev,
+                                  struct napi_struct *napi,
+                                  int (*poll)(struct napi_struct *, int),
+                                  int weight) {
+  if (!dev || !napi || !poll || weight <= 0)
+    return;
+  spin_lock(&frontend_lock);
+  struct frontend_napi *entry = find_napi_locked(napi);
+  if (!entry) {
+    for (unsigned i = 0; i < FRONTEND_NAPI_SLOTS; i++)
+      if (!napis[i].used) {
+        entry = &napis[i];
+        memset(entry, 0, sizeof(*entry));
+        entry->used = true;
+        break;
+      }
+  }
+  if (!entry) {
+    spin_unlock(&frontend_lock);
+    return;
+  }
+  entry->napi = napi;
+  entry->dev = dev;
+  napi->dev = dev;
+  napi->poll = poll;
+  napi->weight = weight;
+  napi->state = 0;
+  INIT_LIST_HEAD(&napi->poll_list);
+  INIT_LIST_HEAD(&napi->dev_list);
+  spin_unlock(&frontend_lock);
+  struct linuxkpi_native_napi *native = linuxkpi_native_napi_create(
+      frontend_poll, entry, (unsigned)weight);
+  spin_lock(&frontend_lock);
+  bool attached = entry->used && entry->napi == napi && !entry->removing;
+  if (attached)
+    entry->native = native;
+  if (!native)
+    memset(entry, 0, sizeof(*entry));
+  spin_unlock(&frontend_lock);
+  if (native && !attached)
+    linuxkpi_native_napi_destroy(native);
+}
+
+void __netif_napi_del_locked(struct napi_struct *napi) {
+  spin_lock(&frontend_lock);
+  struct frontend_napi *entry = find_napi_locked(napi);
+  if (entry)
+    entry->removing = true;
+  spin_unlock(&frontend_lock);
+  while (entry && __atomic_load_n(&entry->references, __ATOMIC_ACQUIRE) != 0)
+    __asm__ volatile("pause" ::: "memory");
+  struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
+  if (native)
+    linuxkpi_native_napi_destroy(native);
+  if (entry) {
+    spin_lock(&frontend_lock);
+    memset(entry, 0, sizeof(*entry));
+    spin_unlock(&frontend_lock);
+  }
+  if (napi) {
+    clear_bit(NAPI_STATE_SCHED, &napi->state);
+    clear_bit(NAPI_STATE_MISSED, &napi->state);
+    napi->dev = NULL;
+  }
+}
+
+bool napi_schedule_prep(struct napi_struct *napi) {
+  if (!napi || test_bit(NAPI_STATE_DISABLE, &napi->state))
+    return false;
+  if (test_and_set_bit(NAPI_STATE_SCHED, &napi->state)) {
+    struct frontend_napi *entry = frontend_napi_get(napi);
+    struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
+    if (native) {
+      set_bit(NAPI_STATE_MISSED, &napi->state);
+      linuxkpi_native_napi_schedule(native);
+    }
+    frontend_napi_put(entry);
+    return false;
+  }
+  return true;
+}
+
+static void frontend_napi_schedule(struct napi_struct *napi) {
+  struct frontend_napi *entry = frontend_napi_get(napi);
+  struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
+  if (!native || linuxkpi_native_napi_schedule(native) != 0)
+    clear_bit(NAPI_STATE_SCHED, &napi->state);
+  frontend_napi_put(entry);
+}
+
+void __napi_schedule(struct napi_struct *napi) { frontend_napi_schedule(napi); }
+void __napi_schedule_irqoff(struct napi_struct *napi) { frontend_napi_schedule(napi); }
+
+bool napi_complete_done(struct napi_struct *napi, int work_done) {
+  struct frontend_napi *entry = frontend_napi_get(napi);
+  struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
+  bool complete = native &&
+      linuxkpi_native_napi_complete(native, work_done) != 0;
+  bool missed = test_and_clear_bit(NAPI_STATE_MISSED, &napi->state);
+  if (complete && !missed)
+    clear_bit(NAPI_STATE_SCHED, &napi->state);
+  frontend_napi_put(entry);
+  return complete && !missed;
+}
+
+void napi_enable(struct napi_struct *napi) {
+  if (!napi)
+    return;
+  struct frontend_napi *entry = frontend_napi_get(napi);
+  struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
+  if (native) {
+    clear_bit(NAPI_STATE_DISABLE, &napi->state);
+    linuxkpi_native_napi_enable(native);
+  }
+  frontend_napi_put(entry);
+}
+
+void napi_disable(struct napi_struct *napi) {
+  if (!napi)
+    return;
+  set_bit(NAPI_STATE_DISABLE, &napi->state);
+  struct frontend_napi *entry = frontend_napi_get(napi);
+  struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
+  if (native)
+    linuxkpi_native_napi_disable(native);
+  clear_bit(NAPI_STATE_SCHED, &napi->state);
+  clear_bit(NAPI_STATE_MISSED, &napi->state);
+  frontend_napi_put(entry);
+}
+
+gro_result_t gro_receive_skb(struct gro_node *gro, struct sk_buff *skb) {
+  (void)gro;
+  if (!skb)
+    return GRO_NORMAL;
+  netif_receive_skb(skb);
+  return GRO_NORMAL;
+}
+
+int netif_receive_skb(struct sk_buff *skb) {
+  if (!skb)
+    return -EINVAL;
+  struct net_device *dev = skb->dev;
+  spin_lock(&frontend_lock);
+  struct frontend_netdev *entry = find_netdev_locked(dev);
+  if (!entry) {
+    spin_unlock(&frontend_lock);
+    kfree_skb(skb);
+    return -ENODEV;
+  }
+  unsigned char *mac = skb_mac_header_was_set(skb) ? skb_mac_header(skb)
+                                                   : skb->data;
+  unsigned char *tail = skb_tail_pointer(skb);
+  if (tail < mac) {
+    spin_unlock(&frontend_lock);
+    kfree_skb(skb);
+    return -EINVAL;
+  }
+  unsigned long frame_len = (unsigned long)(tail - mac);
+  int ret = linuxkpi_native_net_rx(entry->native, mac, frame_len);
+  spin_unlock(&frontend_lock);
+  kfree_skb(skb);
+  return ret;
+}
+
+int __netif_rx(struct sk_buff *skb) { return netif_receive_skb(skb); }
+int netif_rx(struct sk_buff *skb) { return netif_receive_skb(skb); }
+
+__be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev) {
+  if (!skb || skb->len < ETH_HLEN)
+    return 0;
+  skb->dev = dev;
+  skb_reset_mac_header(skb);
+  __be16 protocol = *(__be16 *)(skb->data + 12);
+  skb_pull(skb, ETH_HLEN);
+  skb->network_header = (u16)(skb->data - skb->head);
+  return protocol;
+}
+
+void netdev_stats_to_stats64(void *out,
+                             const struct net_device_stats *in) {
+  u64 *stats = out;
+#define COPY_NET_STAT(index, name) stats[index] = in->name
+  COPY_NET_STAT(0, rx_packets); COPY_NET_STAT(1, tx_packets);
+  COPY_NET_STAT(2, rx_bytes); COPY_NET_STAT(3, tx_bytes);
+  COPY_NET_STAT(4, rx_errors); COPY_NET_STAT(5, tx_errors);
+  COPY_NET_STAT(6, rx_dropped); COPY_NET_STAT(7, tx_dropped);
+  COPY_NET_STAT(8, multicast); COPY_NET_STAT(9, collisions);
+  COPY_NET_STAT(10, rx_length_errors); COPY_NET_STAT(11, rx_over_errors);
+  COPY_NET_STAT(12, rx_crc_errors); COPY_NET_STAT(13, rx_frame_errors);
+  COPY_NET_STAT(14, rx_fifo_errors); COPY_NET_STAT(15, rx_missed_errors);
+  COPY_NET_STAT(16, tx_aborted_errors); COPY_NET_STAT(17, tx_carrier_errors);
+  COPY_NET_STAT(18, tx_fifo_errors); COPY_NET_STAT(19, tx_heartbeat_errors);
+  COPY_NET_STAT(20, tx_window_errors); COPY_NET_STAT(21, rx_compressed);
+  COPY_NET_STAT(22, tx_compressed);
+#undef COPY_NET_STAT
+  /* These two fields follow the legacy `net_device_stats` members in the
+   * pinned v6.18 `rtnl_link_stats64` UAPI layout and have no legacy source. */
+  stats[23] = 0;
+  stats[24] = 0;
+}
+
+void dev_fetch_sw_netstats(void *out,
+                           const struct pcpu_sw_netstats *software) {
+  u64 *stats = out;
+  stats[0] = __atomic_load_n(&software->rx_packets, __ATOMIC_RELAXED);
+  stats[2] = __atomic_load_n(&software->rx_bytes, __ATOMIC_RELAXED);
+  stats[1] = __atomic_load_n(&software->tx_packets, __ATOMIC_RELAXED);
+  stats[3] = __atomic_load_n(&software->tx_bytes, __ATOMIC_RELAXED);
+}
+
+bool is_valid_ether_addr(const u8 *addr) {
+  if (!addr || (addr[0] & 1U))
+    return false;
+  u8 nonzero = 0;
+  for (unsigned int i = 0; i < ETH_ALEN; i++)
+    nonzero |= addr[i];
+  return nonzero != 0;
+}
+
+void eth_hw_addr_set(struct net_device *dev, const u8 *addr) {
+  if (dev && dev->dev_addr && addr)
+    memcpy(dev->dev_addr, addr, ETH_ALEN);
+}
+
+int eth_mac_addr(struct net_device *dev, void *p) {
+  struct frontend_sockaddr { unsigned short family; unsigned char data[14]; };
+  if (!dev || !p)
+    return -EINVAL;
+  const struct frontend_sockaddr *sa = p;
+  if (!is_valid_ether_addr(sa->data))
+    return -EADDRNOTAVAIL;
+  eth_hw_addr_set(dev, sa->data);
+  return 0;
+}
+
+int eth_validate_addr(struct net_device *dev) {
+  return dev && is_valid_ether_addr(dev->dev_addr) ? 0 : -EADDRNOTAVAIL;
+}
+
+int eth_platform_get_mac_address(struct device *dev, u8 *addr) {
+  (void)dev;
+  (void)addr;
+  /* This platform has no firmware-node MAC property service. */
+  return -ENOENT;
+}
+
+void eth_random_addr(u8 *addr) {
+  if (!addr)
+    return;
+  /* MAC address randomization is not secret material. Use the existing
+   * hardware-RNG-first identifier byte source, then enforce local-unicast. */
+  linuxkpi_guid_bytes(addr, ETH_ALEN);
+  addr[0] = (addr[0] & 0xfeU) | 0x02U;
+}
+
+struct sk_buff *__alloc_skb(unsigned int size, gfp_t priority, int flags,
+                            int node) {
+  (void)priority;
+  (void)flags;
+  (void)node;
+  size_t requested = size ? (size_t)size : 1;
+  if (requested > (size_t)~0U - SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) - 15U)
+    return NULL;
+  size_t aligned = SKB_DATA_ALIGN(requested);
+  if (aligned > (size_t)~0U)
+    return NULL;
+  size_t total = aligned + SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+  struct sk_buff *skb = kzalloc(sizeof(*skb), GFP_ATOMIC);
+  if (!skb)
+    return NULL;
+  skb->head = kmalloc(total, GFP_ATOMIC);
+  if (!skb->head) {
+    kfree(skb);
+    return NULL;
+  }
+  memset(skb->head, 0, total);
+  skb->data = skb->head;
+  skb->tail = 0;
+  skb->end = (sk_buff_data_t)aligned;
+  skb->truesize = (unsigned int)(sizeof(*skb) + total);
+  refcount_set(&skb->users, 1);
+  skb_shinfo(skb)->nr_frags = 0;
+  atomic_set(&skb_shinfo(skb)->dataref, 1);
+  skb->mac_header = (u16)~0U;
+  skb->network_header = (u16)~0U;
+  skb->transport_header = (u16)~0U;
+  return skb;
+}
+
+void __kfree_skb(struct sk_buff *skb) {
+  if (!skb)
+    return;
+  kfree(skb->head);
+  kfree(skb);
+}
+
+void sk_skb_reason_drop(struct sock *sk, struct sk_buff *skb,
+                        enum skb_drop_reason reason) {
+  (void)sk;
+  (void)reason;
+  __kfree_skb(skb);
+}
+
+void dev_kfree_skb_any_reason(struct sk_buff *skb,
+                              enum skb_drop_reason reason) {
+  sk_skb_reason_drop(NULL, skb, reason);
+}
+
+void ether_setup(struct net_device *dev) {
+  if (!dev)
+    return;
+  dev->type = ARPHRD_ETHER;
+  dev->addr_len = ETH_ALEN;
+  dev->mtu = ETH_DATA_LEN;
+  dev->dev_addr = dev->perm_addr;
+  dev->flags = IFF_BROADCAST | IFF_MULTICAST;
+  INIT_LIST_HEAD(&dev->mc_list);
+  set_bit(__LINK_STATE_PRESENT, &dev->state);
+  memset(dev->broadcast, 0xff, ETH_ALEN);
+  set_bit(__LINK_STATE_NOCARRIER, &dev->state);
+}
+
+struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
+                                    unsigned char name_assign_type,
+                                    void (*setup)(struct net_device *),
+                                    unsigned int txqs, unsigned int rxqs) {
+  (void)name_assign_type;
+  if (sizeof_priv < 0 || txqs == 0 || rxqs == 0 || txqs > 16 || rxqs > 16)
+    return NULL;
+  size_t size = sizeof(struct net_device) + (size_t)sizeof_priv;
+  struct net_device *dev = kzalloc(size, GFP_KERNEL);
+  if (!dev)
+    return NULL;
+  device_initialize(&dev->dev);
+  dev->tstats = &dev->tstats_storage;
+  dev->ethtool = kzalloc(sizeof(*dev->ethtool), GFP_KERNEL);
+  if (!dev->ethtool) {
+    devres_release_all(&dev->dev);
+    kfree(dev);
+    return NULL;
+  }
+  xa_init(&dev->ethtool->rss_ctx);
+  mutex_init(&dev->ethtool->rss_lock);
+  dev->priv = (char *)dev + sizeof(*dev);
+  dev->dev_addr = dev->perm_addr;
+  set_bit(__LINK_STATE_PRESENT, &dev->state);
+  dev->num_tx_queues = txqs;
+  dev->real_num_tx_queues = txqs;
+  dev->num_rx_queues = rxqs;
+  dev->real_num_rx_queues = rxqs;
+  dev->tx_queue_len = 1000;
+  dev->_tx = kcalloc(txqs, sizeof(*dev->_tx), GFP_KERNEL);
+  if (!dev->_tx) {
+    xa_destroy(&dev->ethtool->rss_ctx);
+    kfree(dev->ethtool);
+    devres_release_all(&dev->dev);
+    kfree(dev);
+    return NULL;
+  }
+  mutex_init(&dev->lock);
+  for (unsigned int i = 0; i < txqs; i++) {
+    dev->_tx[i].dev = dev;
+    dev->_tx[i].xmit_lock_owner = -1;
+    spin_lock_init(&dev->_tx[i]._xmit_lock);
+  }
+  if (name)
+    strscpy(dev->name, name, sizeof(dev->name));
+  if (setup)
+    setup(dev);
+  return dev;
+}
+
+struct net_device *alloc_etherdev_mqs(int sizeof_priv, unsigned int txqs,
+                                      unsigned int rxqs) {
+  return alloc_netdev_mqs(sizeof_priv, "eth%d", NET_NAME_ENUM, ether_setup,
+                          txqs, rxqs);
+}
+
+static void frontend_devm_free_netdev(void *data) { free_netdev(data); }
+
+struct net_device *devm_alloc_etherdev_mqs(struct device *parent,
+                                           int sizeof_priv,
+                                           unsigned int txqs,
+                                           unsigned int rxqs) {
+  if (!parent)
+    return NULL;
+  struct net_device *dev = alloc_etherdev_mqs(sizeof_priv, txqs, rxqs);
+  if (!dev)
+    return NULL;
+  dev->dev.parent = parent;
+  if (devm_add_action_or_reset(parent, frontend_devm_free_netdev, dev))
+    return NULL;
+  return dev;
+}
+
+void free_netdev(struct net_device *dev) {
+  if (!dev)
+    return;
+  if (linuxkpi_netdev_is_bound(dev))
+    unregister_netdev(dev);
+  devres_release_all(&dev->dev);
+  if (dev->ethtool) {
+    xa_destroy(&dev->ethtool->rss_ctx);
+    kfree(dev->ethtool);
+  }
+  kfree(dev->_tx);
+  kfree(dev);
+}
+
+void netif_device_detach(struct net_device *dev) {
+  if (dev)
+    clear_bit(__LINK_STATE_PRESENT, &dev->state);
+}
+
+void netif_device_attach(struct net_device *dev) {
+  if (dev)
+    set_bit(__LINK_STATE_PRESENT, &dev->state);
+}
+
+void synchronize_net(void) {
+  while (__atomic_load_n(&frontend_tx_active, __ATOMIC_ACQUIRE) != 0)
+    msleep(1);
+}
+
+int netdev_update_features(struct net_device *dev) {
+  if (!dev)
+    return -EINVAL;
+  netdev_features_t features = dev->features;
+  if (dev->netdev_ops && dev->netdev_ops->ndo_fix_features)
+    features = dev->netdev_ops->ndo_fix_features(dev, features);
+  features &= NETIF_F_HIGHDMA;
+  if (features == dev->features)
+    return 0;
+  if (dev->netdev_ops && dev->netdev_ops->ndo_set_features) {
+    int ret = dev->netdev_ops->ndo_set_features(dev, features);
+    if (ret)
+      return ret;
+  }
+  dev->features = features;
+  return 1;
+}
+
+void netdev_reset_queue(struct net_device *dev) {
+  if (dev && dev->_tx)
+    clear_bit(__QUEUE_STATE_DRV_XOFF, &dev->_tx[0].state);
+}
+
+void dev_consume_skb_any(struct sk_buff *skb) { kfree_skb(skb); }
+
+bool __netdev_sent_queue(struct net_device *dev, unsigned int bytes, bool more) {
+  (void)dev;
+  (void)bytes;
+  (void)more;
+  /* BQL accounting is not enabled; always ring the device doorbell. */
+  return true;
+}
+
+void netdev_sw_irq_coalesce_default_on(struct net_device *dev) {
+  if (!dev)
+    return;
+#ifndef CONFIG_PREEMPT_RT
+  dev->gro_flush_timeout = 20000;
+  dev->napi_defer_hard_irqs = 1;
+#endif
+}
+
+int netif_set_real_num_tx_queues(struct net_device *dev, unsigned int count) {
+  if (!dev || count == 0 || count > dev->num_tx_queues)
+    return -EINVAL;
+  dev->real_num_tx_queues = count;
+  return 0;
+}
+
+int netif_set_real_num_rx_queues(struct net_device *dev, unsigned int count) {
+  if (!dev || count == 0 || count > dev->num_rx_queues)
+    return -EINVAL;
+  dev->real_num_rx_queues = count;
+  return 0;
+}

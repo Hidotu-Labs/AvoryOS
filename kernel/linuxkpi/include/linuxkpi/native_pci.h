@@ -50,6 +50,10 @@ void linuxkpi_pci_native_snapshot(void *handle, struct linuxkpi_pci_info *out);
 
 /* Publish a successful imported driver bind, or clear it on unbind. */
 void linuxkpi_pci_native_driver(void *handle, const char *name);
+/* Reserve/release native device-manager ownership for an imported PCI driver.
+ * The native and LinuxKPI bind paths serialize on the same device lock. */
+int linuxkpi_pci_native_claim(void *handle, const char *name);
+void linuxkpi_pci_native_release(void *handle, const char *name);
 
 /* Configuration space access (ECAM offsets above 0xFF are supported on
  * PCIe-capable buses by the native layer). */

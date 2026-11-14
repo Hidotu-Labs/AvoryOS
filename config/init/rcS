@@ -64,6 +64,12 @@ if bus_has_owner org.freedesktop.DBus; then eend 0; else eend 1; fi
 # activate systemd units or their RuntimeDirectory, so start the daemon and
 # create its runtime directory here. Keep /etc/resolv.conf under the existing
 # NetworkManager/static configuration; resolved can read it as its upstream.
+# The kernel's DHCP lease carries the network's nameservers; the image's static
+# resolv.conf only names QEMU user networking's 10.0.2.3. Linux's in-kernel
+# DHCP publishes them the same way, in resolv.conf syntax.
+if grep -q '^nameserver ' /proc/net/pnp 2>/dev/null; then
+    grep '^nameserver ' /proc/net/pnp > /etc/resolv.conf
+fi
 ebegin "Starting systemd-resolved"
 RESOLVED_OK=1
 if [ -x /usr/lib/systemd/systemd-resolved ]; then

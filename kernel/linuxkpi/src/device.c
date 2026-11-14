@@ -3,11 +3,13 @@
 
 #include <linux/container_of.h>
 #include <linux/device.h>
+#include <linux/driver.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/interrupt.h>
 #include <linux/ioport.h>
 #include <linux/kdev_t.h>
+#include <linux/of.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 
@@ -20,6 +22,9 @@ int linuxkpi_drm_devnode_register(struct device *dev, const char *path);
 void linuxkpi_drm_devnode_unregister(const char *path);
 
 static LIST_HEAD(created_devices);
+static LIST_HEAD(class_devices);
+static DEFINE_SPINLOCK(class_devices_lock);
+static bool device_refcounted(const struct device *dev);
 
 /* ── identity / driver data ─────────────────────────────────────────────── */
 
@@ -41,10 +46,20 @@ void dev_set_drvdata(struct device *dev, void *data) {
     dev->driver_data = data;
 }
 
+void device_set_node(struct device *dev, struct fwnode_handle *fwnode) {
+  dev->fwnode = fwnode;
+  dev->of_node = to_of_node(fwnode);
+}
+
 void device_initialize(struct device *dev) {
+  dev->power.can_wakeup = false;
+  dev->power.should_wakeup = false;
   INIT_LIST_HEAD(&dev->devres_head);
   spin_lock_init(&dev->devres_lock);
   INIT_LIST_HEAD(&dev->kpi_list);
+  INIT_LIST_HEAD(&dev->kpi_bus_node);
+  INIT_LIST_HEAD(&dev->kpi_class_node);
+  dev->kpi_refs = 1;
 }
 
 static const char *device_pci_ancestor_name(struct device *dev) {
@@ -105,7 +120,18 @@ int device_add(struct device *dev) {
       kfree(node_name);
     }
   }
-  return 0;
+  if (dev->class) {
+    spin_lock(&class_devices_lock);
+    list_add_tail(&dev->kpi_class_node, &class_devices);
+    spin_unlock(&class_devices_lock);
+    device_add_groups(dev, dev->class->dev_groups);
+  }
+  if (dev->type)
+    device_add_groups(dev, dev->type->groups);
+  int ret = linuxkpi_bus_add_device(dev);
+  if (ret)
+    device_del(dev);
+  return ret;
 }
 
 int device_register(struct device *dev) {
@@ -119,6 +145,11 @@ int device_register(struct device *dev) {
 void device_del(struct device *dev) {
   if (!dev)
     return;
+  linuxkpi_bus_remove_device(dev);
+  spin_lock(&class_devices_lock);
+  if (dev->kpi_class_node.next)
+    list_del_init(&dev->kpi_class_node);
+  spin_unlock(&class_devices_lock);
 
   /* Remove the dynamic sysfs directory (and its attributes), then the
    * devtmpfs node, then let device_is_registered() turn false. */
@@ -158,13 +189,34 @@ void device_unregister(struct device *dev) {
    * unregister+kfree (tests) must unlink them so the list never dangles. */
   if (dev->kpi_list.next && dev->kpi_list.next != &dev->kpi_list)
     list_del(&dev->kpi_list);
-  if (dev->release)
+  if (device_refcounted(dev))
+    put_device(dev);
+  else if (dev->release)
     dev->release(dev);
 }
 
-struct device *get_device(struct device *dev) { return dev; }
+static bool device_refcounted(const struct device *dev) {
+  return (dev->bus && dev->bus->match) ||
+         (dev->class && dev->class->dev_release);
+}
 
-void put_device(struct device *dev) { (void)dev; }
+struct device *get_device(struct device *dev) {
+  if (dev && device_refcounted(dev))
+    __atomic_add_fetch(&dev->kpi_refs, 1, __ATOMIC_RELAXED);
+  return dev;
+}
+
+void put_device(struct device *dev) {
+  if (!dev || !device_refcounted(dev) ||
+      __atomic_sub_fetch(&dev->kpi_refs, 1, __ATOMIC_ACQ_REL))
+    return;
+  if (dev->release)
+    dev->release(dev);
+  else if (dev->type && dev->type->release)
+    dev->type->release(dev);
+  else if (dev->class && dev->class->dev_release)
+    dev->class->dev_release(dev);
+}
 
 int dev_set_name(struct device *dev, const char *fmt, ...) {
   va_list ap;
@@ -198,13 +250,42 @@ int __kpi_dev_printk(const char *level, const struct device *dev,
 /* ── classes / device creation ──────────────────────────────────────────── */
 
 struct class *class_create(const char *name) {
-  struct class *cls = kmalloc(sizeof(*cls), GFP_KERNEL);
+  struct class *cls = kzalloc(sizeof(*cls), GFP_KERNEL);
 
   if (cls) {
     cls->name = name;
     cls->kpi_dir = name ? asc_sysfs_class_dir(name) : NULL;
   }
   return cls;
+}
+
+int class_register(const struct class *cls) {
+  if (!cls || !cls->name)
+    return -EINVAL;
+  return asc_sysfs_class_dir(cls->name) ? 0 : -ENOMEM;
+}
+
+void class_unregister(const struct class *cls) {
+  /* Native sysfs owns the class directory. Each device removes its node
+   * at device_del(), and the name can be reused by the next registration. */
+  (void)cls;
+}
+
+struct device *class_find_device_by_name(const struct class *cls,
+                                          const char *name) {
+  struct device *dev;
+  if (!cls || !name)
+    return NULL;
+  spin_lock(&class_devices_lock);
+  list_for_each_entry(dev, &class_devices, kpi_class_node) {
+    if (dev->class == cls && !strcmp(dev_name(dev), name)) {
+      get_device(dev);
+      spin_unlock(&class_devices_lock);
+      return dev;
+    }
+  }
+  spin_unlock(&class_devices_lock);
+  return NULL;
 }
 
 void class_destroy(const struct class *cls) {
@@ -338,6 +419,26 @@ void devres_add(struct device *dev, void *res) {
   rec->node.owner = dev;
   list_add_tail(&rec->node.entry, &dev->devres_head);
   spin_unlock_irqrestore(&dev->devres_lock, flags);
+}
+
+void *devres_find(struct device *dev, dr_release_t release, dr_match_t match,
+                  void *match_data) {
+  if (!dev)
+    return NULL;
+  struct devres_node *node;
+  unsigned long flags;
+  void *result = NULL;
+  devres_ensure(dev);
+  spin_lock_irqsave(&dev->devres_lock, flags);
+  list_for_each_entry_reverse(node, &dev->devres_head, entry) {
+    if (node->kind == DEVRES_RESOURCE && node->resource_release == release &&
+        (!match || match(dev, node->data, match_data))) {
+      result = node->data;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&dev->devres_lock, flags);
+  return result;
 }
 
 void devres_free(void *res) {

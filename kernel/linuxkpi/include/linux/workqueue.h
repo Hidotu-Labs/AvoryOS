@@ -15,18 +15,7 @@
 #include <linux/completion.h>
 #include <linux/list.h>
 #include <linux/timer.h>
-#include <linux/types.h>
-
-struct work_struct;
-typedef void (*work_func_t)(struct work_struct *work);
-
-struct work_struct {
-  struct list_head entry;
-  work_func_t func;
-  volatile int pending;
-  volatile int running; /* Reserved; execution is tracked by the worker pool. */
-  struct workqueue_struct *wq;
-};
+#include <linux/workqueue_types.h>
 
 #define work_pending(work) ((work)->pending)
 #define delayed_work_pending(dwork) work_pending(&(dwork)->work)
@@ -38,11 +27,12 @@ struct work_struct {
     (_work)->func = (_func);                                                  \
     (_work)->pending = 0;                                                     \
     (_work)->running = 0;                                                     \
+    (_work)->disabled = 0;                                                    \
     (_work)->wq = NULL;                                                       \
   } while (0)
 
 #define DECLARE_WORK(n, f)                                                    \
-  struct work_struct n = {{NULL, NULL}, (f), 0, 0, NULL}
+  struct work_struct n = {{NULL, NULL}, (f), 0, 0, 0, NULL}
 
 /* On-stack work: the native first-party implementation has no stack-tracking
  * machinery, so these are the plain macros plus no-op destroy hooks. */
@@ -78,6 +68,9 @@ void flush_workqueue(struct workqueue_struct *wq);
  * workqueue "draining" state, so it is equivalent to flush_workqueue(). */
 void drain_workqueue(struct workqueue_struct *wq);
 bool cancel_work_sync(struct work_struct *work);
+bool disable_work(struct work_struct *work);
+bool disable_work_sync(struct work_struct *work);
+bool enable_work(struct work_struct *work);
 
 /* Upstream returns the work item the current task is running (for
  * concurrency-managed pools).  AvoryOS workers are plain kthreads, so this is
@@ -89,8 +82,6 @@ struct delayed_work {
   struct timer_list timer;
   int canceling; /* Blocks callback rearm while sync cancellation drains work. */
 };
-
-void delayed_work_timer_fn(struct timer_list *t);
 
 static inline struct delayed_work *to_delayed_work(struct work_struct *work) {
   return container_of(work, struct delayed_work, work);

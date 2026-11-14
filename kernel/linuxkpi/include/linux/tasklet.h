@@ -28,13 +28,13 @@ static inline void __kpi_tasklet_entry(struct work_struct *work) {
 
 #define DECLARE_TASKLET(_name, _func, _data)                                  \
   struct tasklet_struct _name = {                                             \
-    .work = {{NULL, NULL}, __kpi_tasklet_entry, 0, 0, NULL},                  \
+    .work = {{NULL, NULL}, __kpi_tasklet_entry, 0, 0, 0, NULL},               \
     .func = (_func), .data = (_data), .count = 0,                             \
   }
 
 #define DECLARE_TASKLET_DISABLED(_name, _func, _data)                         \
   struct tasklet_struct _name = {                                             \
-    .work = {{NULL, NULL}, __kpi_tasklet_entry, 0, 0, NULL},                  \
+    .work = {{NULL, NULL}, __kpi_tasklet_entry, 0, 0, 0, NULL},               \
     .func = (_func), .data = (_data), .count = 1,                             \
   }
 

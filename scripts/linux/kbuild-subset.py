@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""kbuild-subset.py -- evaluate the selected graphics drivers’ Kbuild files.
+"""kbuild-subset.py -- evaluate selected graphics/network Kbuild files.
 
 The selected baseline Makefiles are the source of truth for which .c files compile,
 which include paths apply and which per-file flags exist.  This script
@@ -44,6 +44,36 @@ ROOTS = [
      "drivers/gpu/drm/nouveau", "nouveau-y", "nouveau"),
     ("drivers/gpu/drm/display/Makefile",
      "drivers/gpu/drm/display", "drm_display_helper-y", "display"),
+    # Network drivers and the wireless core are evaluated from the pinned
+    # Kbuild files just like the graphics imports. Profiles below set only the
+    # narrowly selected CONFIG symbols needed to obtain each object closure.
+    # Emission order is link order, and therefore initcall order within a
+    # level. Mirror upstream: mdio-bus.o before libphy.o (mdio_bus_init must
+    # register the bus before phy_init registers the generic PHY drivers),
+    # and drivers/net/phy/ before drivers/net/ethernet/ so the Realtek PHY
+    # driver is registered before r8169 probes and attaches it.
+    ("drivers/net/phy/Makefile", "drivers/net/phy", "mdio-bus-y", "mdio_bus"),
+    ("drivers/net/phy/Makefile", "drivers/net/phy", "libphy-y", "phylib"),
+    ("drivers/net/phy/realtek/Makefile",
+     "drivers/net/phy/realtek", "realtek-y", "realtek_phy"),
+    ("drivers/net/ethernet/realtek/Makefile",
+     "drivers/net/ethernet/realtek", "r8169-y", "r8169"),
+    ("drivers/net/wireless/realtek/rtw89/Makefile",
+     "drivers/net/wireless/realtek/rtw89", "rtw89_core-y", "rtw89_core"),
+    ("drivers/net/wireless/realtek/rtw89/Makefile",
+     "drivers/net/wireless/realtek/rtw89", "rtw89_pci-y", "rtw89_pci"),
+    ("drivers/net/wireless/realtek/rtw89/Makefile",
+     "drivers/net/wireless/realtek/rtw89", "rtw89_8852be-objs", "rtw89_8852be"),
+    ("drivers/net/wireless/realtek/rtw88/Makefile",
+     "drivers/net/wireless/realtek/rtw88", "rtw88_core-y", "rtw88_core"),
+    ("drivers/net/wireless/realtek/rtw88/Makefile",
+     "drivers/net/wireless/realtek/rtw88", "rtw88_pci-objs", "rtw88_pci"),
+    ("drivers/net/wireless/realtek/rtw88/Makefile",
+     "drivers/net/wireless/realtek/rtw88", "rtw88_8822c-objs", "rtw88_8822c"),
+    ("drivers/net/wireless/realtek/rtw88/Makefile",
+     "drivers/net/wireless/realtek/rtw88", "rtw88_8822ce-objs", "rtw88_8822ce"),
+    ("net/wireless/Makefile", "net/wireless", "cfg80211-y", "cfg80211"),
+    ("net/mac80211/Makefile", "net/mac80211", "mac80211-y", "mac80211"),
 ]
 
 # Objects that must be in the generated list.  If one disappears, the
@@ -66,6 +96,13 @@ KNOWN_OBJECTS = [
     "drivers/gpu/drm/nouveau/dispnv50/disp.c",
     "drivers/gpu/drm/display/drm_dp_helper.c",
     "drivers/gpu/drm/display/drm_dsc_helper.c",
+    "drivers/net/phy/phy.c",
+    "drivers/net/phy/phy_device.c",
+    "drivers/net/phy/mdio_bus.c",
+    "drivers/net/phy/mdio_device.c",
+    "drivers/net/phy/mdio_devres.c",
+    "drivers/net/phy/stubs.c",
+    "drivers/net/phy/realtek/realtek_main.c",
 ]
 KNOWN_OBJECT_ALTERNATIVES = [
     ("drivers/gpu/drm/amd/display/dc/dcn31/dcn31_hwseq.c",
@@ -408,6 +445,12 @@ class Evaluator:
         i = 0
         while i < len(raw_lines):
             line = raw_lines[i]
+            # Recipes have no bearing on the object/include closure collected
+            # here. Kbuild-generated sources (cfg80211's certificate objects,
+            # for example) may include ordinary recipes in the same file.
+            if line.startswith("\t"):
+                i += 1
+                continue
             while line.endswith("\\") and i + 1 < len(raw_lines):
                 i += 1
                 line = line[:-1] + " " + raw_lines[i]
@@ -449,6 +492,12 @@ class Evaluator:
             if m:
                 name = self.expand(m.group(1)).strip()
                 self.set_var(name, m.group(2), m.group(3))
+                continue
+
+            # Ignore ordinary prerequisite rules that begin with a computed
+            # target. They do not contribute objects, include flags or
+            # generated data to this source subset.
+            if stripped.startswith("$(") and re.match(r"^\$\([^)]*\).*:", stripped):
                 continue
 
             if stripped.startswith("$("):
@@ -622,6 +671,21 @@ def main():
         # GCC, which dml/Makefile probes for via CONFIG_CC_IS_GCC.
         for name, value in config.items():
             ev.vars[name] = [value, True]
+        profile_config = {
+            "phylib": {"CONFIG_PHYLIB": "y", "CONFIG_MDIO_BUS": "y"},
+            "mdio_bus": {"CONFIG_PHYLIB": "y", "CONFIG_MDIO_BUS": "y"},
+            "realtek_phy": {"CONFIG_REALTEK_PHY": "y"},
+            "display": {"CONFIG_DRM_DISPLAY_DSC_HELPER": "y"},
+            "rtw89_core": {"CONFIG_RTW89_CORE": "y"},
+            "rtw89_pci": {"CONFIG_RTW89_PCI": "y"},
+            "rtw89_8852be": {"CONFIG_RTW89_8852BE": "y"},
+            "rtw88_core": {"CONFIG_RTW88_CORE": "y"},
+            "rtw88_pci": {"CONFIG_RTW88_PCI": "y"},
+            "rtw88_8822c": {"CONFIG_RTW88_8822C": "y"},
+            "rtw88_8822ce": {"CONFIG_RTW88_8822CE": "y"},
+        }.get(label, {})
+        for name, value in profile_config.items():
+            ev.vars[name] = [value, True]
         ev.vars["CONFIG_CC_IS_GCC"] = ["y", True]
         # Linux 6.12 DML uses architecture-supplied FPU flag variables.
         # Match our x86 GCC build; remove the corresponding base flags in
@@ -635,6 +699,16 @@ def main():
         if ev.cond_stack:
             raise SystemExit("kbuild-subset: unclosed conditional in %s" % makefile)
         objects, duplicates = ev.collect_objects(var, base)
+        if label == "phylib":
+            # Kbuild's built-in PHYLIB closure includes these direct objects
+            # beside the flattened libphy-y composite above.
+            builtins = split_words(ev.expand("$(obj-y)"))
+            for required in ("stubs.o", "mdio_devres.o"):
+                if required not in builtins:
+                    raise MakeError("PHYLIB Kbuild no longer selects %s" % required)
+                source = ev.normalize_obj(required, base)
+                if source not in objects:
+                    objects.append(source)
         includes = ev.collect_include_flags()
         flags = ev.collect_per_file_flags(base, objects)
         removals = ev.per_file_removals
@@ -701,8 +775,20 @@ def main():
         for label, (objects, includes, flags, removals) in groups.items():
             if label == "display":
                 condition = "ifneq ($(filter 1,$(KPI_AMDGPU) $(KPI_NOUVEAU)),)"
+            elif label in ("cfg80211", "mac80211"):
+                condition = "ifneq ($(filter 1,$(KPI_RTW89) $(KPI_RTW88)),)"
+            elif label in ("phylib", "mdio_bus", "realtek_phy"):
+                condition = "ifeq ($(KPI_R8169),1)"
+            elif label.startswith("rtw89_"):
+                condition = "ifeq ($(KPI_RTW89),1)"
+            elif label.startswith("rtw88_"):
+                condition = "ifeq ($(KPI_RTW88),1)"
             else:
-                condition = "ifeq ($(KPI_%s),1)" % ("AMDGPU" if label == "amd" else "NOUVEAU")
+                gate = {"amd": "AMDGPU", "nouveau": "NOUVEAU",
+                        "r8169": "R8169"}.get(label)
+                if not gate:
+                    raise SystemExit("kbuild-subset: no gate mapping for group %s" % label)
+                condition = "ifeq ($(KPI_%s),1)" % gate
             f.write("# %s objects and flags from the selected Kbuild.\n" % label)
             f.write(condition + "\n")
             f.write("linux-obj-y += " + " ".join(objects) + "\n")
@@ -712,6 +798,24 @@ def main():
             targets = " ".join("obj-$(ARCH)/linux/%s.o" % obj for obj in objects)
             if includes:
                 f.write("%s: LINUX_CPPFLAGS += %s\n" % (targets, " ".join(includes)))
+            selected_symbols = {
+                "r8169": ("CONFIG_R8169", "CONFIG_PHYLIB", "CONFIG_MDIO_BUS",
+                          "CONFIG_REALTEK_PHY"),
+                "phylib": ("CONFIG_PHYLIB", "CONFIG_MDIO_BUS"),
+                "mdio_bus": ("CONFIG_PHYLIB", "CONFIG_MDIO_BUS"),
+                "realtek_phy": ("CONFIG_PHYLIB", "CONFIG_MDIO_BUS",
+                                "CONFIG_REALTEK_PHY"),
+            }.get(label, ())
+            if selected_symbols:
+                f.write("%s: LINUX_CPPFLAGS += %s\n" %
+                        (targets, " ".join("-D%s=1" % symbol
+                                           for symbol in selected_symbols)))
+            if label in ("r8169", "phylib", "mdio_bus", "realtek_phy"):
+                f.write("%s: LINUX_CPPFLAGS += -DLINUXKPI_NET_FRONTEND\n" % targets)
+            if label == "r8169":
+                f.write("%s: LINUX_CPPFLAGS += -UKBUILD_MODNAME -DKBUILD_MODNAME='\"r8169\"'\n" % targets)
+            elif label == "rtw88_8822ce":
+                f.write("%s: LINUX_CPPFLAGS += -UKBUILD_MODNAME -DKBUILD_MODNAME='\"rtw88_8822ce\"'\n" % targets)
             for path, value in flags:
                 f.write("obj-$(ARCH)/linux/%s.o: LINUX_CFLAGS += %s\n" % (path, value))
             for path, value in removals:

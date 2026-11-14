@@ -109,6 +109,15 @@ __attribute__((weak)) int _printk(const char *fmt, ...) {
   return 0;
 }
 
+/* va_list form used by dev_err_probe() and PHYLIB's phy_attached_print(). */
+__attribute__((weak)) int vprintk(const char *fmt, va_list args) {
+  if (fmt && fmt[0] == '\001' && fmt[1] != '\0')
+    fmt += 2;
+
+  vklogf(fmt, args);
+  return 0;
+}
+
 /* ── string / allocation helpers (upstream lib/string.c, mm/util.c) ─────── */
 
 __attribute__((weak)) void *memchr_inv(const void *start, int c,

@@ -6,17 +6,9 @@
  * CONFIG_LOCKDEP they are all no-ops, which is what this overlay provides
  * without dragging in sched.h/thread_info.h. */
 
-#include <linux/types.h>
+#include <linux/lockdep_types.h>
 
 #define SINGLE_DEPTH_NESTING 1
-
-struct lockdep_map {
-  const char *name;
-};
-
-struct lock_class_key {
-  int dummy;
-};
 
 static inline void lockdep_init(void) {}
 static inline void lockdep_off(void) {}

@@ -25,6 +25,8 @@ typedef enum {
     DEVICE_PROBING,
     DEVICE_BOUND_KERNEL,
     DEVICE_BOUND_USER,
+    /* Owned by an external framework such as LinuxKPI, outside native DM. */
+    DEVICE_BOUND_EXTERNAL,
     DEVICE_REMOVING,
     DEVICE_DEAD
 } device_state_t;
@@ -85,6 +87,7 @@ struct device {
     uint8_t pci_prog_if;
 
     struct driver *driver;
+    const char *external_driver;
     void *driver_data; // Pointer to driver-specific state
     device_state_t state;
     uint32_t refcount;
@@ -147,6 +150,10 @@ void dm_register_driver(struct driver *drv);
 int dm_unregister_driver(struct driver *drv);
 int dm_probe_device(struct device *dev);
 int dm_bind_device(struct device *dev, struct driver *drv);
+/* Reserve a device for a non-native driver framework. Reservation and native
+ * binding use the same device lock, so exactly one framework can own it. */
+bool dm_claim_external_device(struct device *dev, const char *driver_name);
+void dm_release_external_device(struct device *dev, const char *driver_name);
 int dm_bind_device_named(struct device *dev, const char *driver_name);
 int dm_unbind_device(struct device *dev);
 struct driver *dm_find_driver(struct bus_type *bus, const char *name);

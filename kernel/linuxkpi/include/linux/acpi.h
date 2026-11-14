@@ -20,6 +20,14 @@ struct acpi_buffer;
 struct device;
 struct fwnode_handle;
 
+#ifndef CONFIG_ACPI
+static inline bool is_acpi_node(const struct fwnode_handle *fwnode) {
+  (void)fwnode;
+  return false;
+}
+#endif
+
+
 /* Included unconditionally by some upstream headers even with ACPI off. */
 struct acpi_driver;
 

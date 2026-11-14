@@ -258,6 +258,27 @@ void disable_irq_nosync(unsigned int irq) {
   spin_unlock_irqrestore(&d->lock, fl);
 }
 
+void irq_wake_thread(unsigned int irq, void *dev_id) {
+  if (irq >= KPI_IRQ_MAX)
+    return;
+  struct kpi_irq_desc *d = &kpi_irq_descs[irq];
+  unsigned long flags;
+  spin_lock_irqsave(&d->lock, flags);
+  for (struct kpi_irq_action *action = d->actions; action;
+       action = action->next) {
+    if (action->dev_id != dev_id)
+      continue;
+    if (action->thread_fn && schedule_work(&action->work)) {
+      d->threads_active++;
+      if (action->flags & IRQF_ONESHOT)
+        d->oneshot_active++;
+      kpi_irq_update_mask(d);
+    }
+    break;
+  }
+  spin_unlock_irqrestore(&d->lock, flags);
+}
+
 void synchronize_irq(unsigned int irq) {
   struct kpi_irq_desc *d;
   struct kpi_irq_action *a;

@@ -156,19 +156,16 @@ static size_t route_build_link(uint8_t msg[512], uint32_t seq, uint32_t pid,
   h->nlmsg_len = pos; return pos;
 }
 
-static int route_link(netlink_sock_t *nsk, uint32_t seq, uint32_t pid,
-                      const struct net_device *dev) {
-  uint8_t msg[512];
-  size_t len = route_build_link(msg, seq, pid, NLM_F_MULTI, dev);
-  return route_queue(nsk, msg, len);
-}
-
 void netlink_notify_link(struct net_device *dev) {
   /* Routing/netlink currently exports only the one configured default NIC. */
-  if (!dev || dev != net_device_default() || !dev->registered)
+  struct net_device *current = net_device_default_acquire();
+  if (!dev || dev != current || !dev->registered) {
+    net_device_put(current);
     return;
+  }
   uint8_t msg[512];
   size_t len = route_build_link(msg, 0, 0, 0, dev);
+  net_device_put(current);
   netlink_broadcast(NETLINK_ROUTE, 1 /* RTMGRP_LINK */, msg, len);
 }
 
@@ -642,7 +639,21 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
     }
 
     uint32_t reply_pid = nsk->portid ? (uint32_t)nsk->portid : request.nlmsg_pid;
-    struct net_device *dev = sock->net_ns ? NULL : net_device_default();
+    struct net_device *dev = sock->net_ns ? NULL : net_device_default_acquire();
+    char dev_name[16] = {0};
+    uint8_t link_msg[512];
+    size_t link_msg_len = 0;
+    bool have_dev = dev != NULL;
+    if (dev) {
+      memcpy(dev_name, dev->name, sizeof(dev_name));
+      if (request.nlmsg_type == RTM_GETLINK)
+        link_msg_len = route_build_link(link_msg, request.nlmsg_seq, reply_pid,
+                                        NLM_F_MULTI, dev);
+      /* The link record owns a snapshot; drop the device pin before queueing
+       * replies, waking sockets, or copying any data to userspace. */
+      net_device_put(dev);
+      dev = NULL;
+    }
     const struct ipv4_config *cfg = sock->net_ns ? NULL : ipv4_get_config();
     const struct ipv6_config *cfg6 = sock->net_ns ? NULL : ipv6_get_config();
     if (sock->net_ns && (request.nlmsg_type == RTM_NEWLINK || request.nlmsg_type == RTM_NEWADDR)) {
@@ -689,20 +700,22 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
           }
         }
       }
-      if (route_queue(nsk, &ack, sizeof(ack))) return -12;
+      if (route_queue(nsk, &ack, sizeof(ack))) {
+        return -12;
+      }
       socket_wake(sock); if (sock->node) epoll_notify_event(sock->node, EPOLLIN);
       return len;
     }
     int route_ret = 0;
     if (request.nlmsg_type == RTM_GETLINK) {
       route_ret = route_loopback_link(nsk, request.nlmsg_seq, reply_pid);
-      if (route_ret == 0 && dev)
-        route_ret = route_link(nsk, request.nlmsg_seq, reply_pid, dev);
+      if (route_ret == 0 && link_msg_len)
+        route_ret = route_queue(nsk, link_msg, link_msg_len);
     } else if (request.nlmsg_type == RTM_GETADDR) {
       if (!sock->net_ns || sock->net_ns->loopback_address)
         route_ret = route_loopback_addr(nsk, request.nlmsg_seq, reply_pid);
-      if (route_ret == 0 && dev && cfg && cfg->address)
-        route_ret = route_address(nsk, request.nlmsg_seq, reply_pid, dev->name,
+      if (route_ret == 0 && have_dev && cfg && cfg->address)
+        route_ret = route_address(nsk, request.nlmsg_seq, reply_pid, dev_name,
                                   cfg->address, cfg->netmask);
       if (route_ret == 0 && cfg6 && cfg6->link_local[0] != 0)
         route_ret = route_address6(nsk, request.nlmsg_seq, reply_pid, cfg6->link_local);
@@ -710,8 +723,9 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
       if (cfg && cfg->gateway)
         route_ret = route_default(nsk, request.nlmsg_seq, reply_pid, cfg->gateway, cfg->address);
     }
-    if (route_ret != 0)
+    if (route_ret != 0) {
       return route_ret;
+    }
 
     struct nlmsghdr_min done;
     memset(&done, 0, sizeof(done));
@@ -721,8 +735,9 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
     done.nlmsg_seq = request.nlmsg_seq;
     done.nlmsg_pid = reply_pid;
 
-    if (route_queue(nsk, &done, sizeof(done)) != 0)
+    if (route_queue(nsk, &done, sizeof(done)) != 0) {
       return -12; // ENOMEM
+    }
     socket_wake(sock);
     if (sock->node)
       epoll_notify_event(sock->node, EPOLLIN);

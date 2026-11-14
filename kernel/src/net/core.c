@@ -32,12 +32,18 @@ static uint32_t active_packets = 0;
 static uint64_t rx_page_limit;
 static struct rx_buffer *queue_head, *queue_tail;
 static uint32_t queue_depth;
+static struct net_deferred_work *work_head, *work_tail;
+static uint32_t work_depth, work_running;
 static spinlock_t lock = SPINLOCK_INIT;
 static wait_queue_t worker_wait;
 static struct net_device *default_device;
 static struct net_device *devices[NET_DEVICE_MAX];
 static net_rx_handler_t rx_handler;
+static net_rx_tap_t rx_tap;
+static void *rx_tap_context;
+static uint32_t rx_tap_active;
 static bool ready;
+static bool devices_started;
 
 /* Refresh the pressure budget in thread context and outside the RX lock.
  * IRQ admission only reads the resulting cached limit. */
@@ -78,6 +84,36 @@ static void free_locked(struct rx_buffer *p) {
   }
 }
 
+/* Drop the RX-held lifetime reference after the handler can no longer see the
+ * packet. Caller holds the queue lock so unregister's admission barrier and
+ * queue state remain serialized. */
+static void release_rx_packet_locked(struct rx_buffer *p) {
+  struct net_device *dev = p ? p->packet.device : NULL;
+  free_locked(p);
+  if (!dev)
+    return;
+  __atomic_sub_fetch(&dev->references, 1, __ATOMIC_RELEASE);
+}
+
+static void wait_for_device_references(struct net_device *dev) {
+  struct thread *self = sched_get_current();
+  while (__atomic_load_n(&dev->references, __ATOMIC_ACQUIRE) != 0) {
+    if (self)
+      sched_yield();
+    else
+      __asm__ volatile("pause" ::: "memory");
+  }
+}
+
+static struct net_device *net_device_find_locked(const char *name) {
+  if (!name)
+    return NULL;
+  for (int i = 0; i < NET_DEVICE_MAX; i++)
+    if (devices[i] && strcmp(devices[i]->name, name) == 0)
+      return devices[i];
+  return NULL;
+}
+
 static void push_locked(struct rx_buffer *p) {
   p->next = NULL;
   if (queue_tail)
@@ -98,6 +134,21 @@ static struct rx_buffer *pop_locked(void) {
   p->next = NULL;
   queue_depth--;
   return p;
+}
+
+static struct net_deferred_work *pop_work_locked(void) {
+  struct net_deferred_work *work = work_head;
+  if (!work)
+    return NULL;
+  work_head = work->next;
+  if (!work_head)
+    work_tail = NULL;
+  work->next = NULL;
+  __atomic_store_n(&work->running, true, __ATOMIC_RELEASE);
+  work->queued = false;
+  work_depth--;
+  work_running++;
+  return work;
 }
 
 static bool packet_current(const struct net_packet *packet) {
@@ -122,23 +173,58 @@ static void net_worker(void) {
   struct rx_buffer *batch[128];
   for (;;) {
     size_t count = 0;
+    struct net_deferred_work *work = NULL;
     for (;;) {
       spinlock_acquire(&lock);
       if (count > 0) {
         for (size_t i = 0; i < count; i++)
-          free_locked(batch[i]);
+          release_rx_packet_locked(batch[i]);
       }
       count = 0;
       while (count < 128 && queue_head)
         batch[count++] = pop_locked();
+      work = pop_work_locked();
       spinlock_release(&lock);
 
-      if (count == 0)
+      if (count == 0 && !work)
         break;
 
       for (size_t i = 0; i < count; i++) {
-        if (rx_handler && packet_current(&batch[i]->packet))
+        if (!packet_current(&batch[i]->packet))
+          continue;
+        spinlock_acquire(&lock);
+        net_rx_tap_t tap = rx_tap;
+        void *tap_context = rx_tap_context;
+        if (tap)
+          __atomic_add_fetch(&rx_tap_active, 1, __ATOMIC_RELAXED);
+        spinlock_release(&lock);
+        if (tap) {
+          tap(&batch[i]->packet, tap_context);
+          __atomic_sub_fetch(&rx_tap_active, 1, __ATOMIC_RELEASE);
+        }
+        if (rx_handler)
           rx_handler(&batch[i]->packet);
+      }
+      if (work) {
+        bool again = work->run(work);
+        spinlock_acquire(&lock);
+        work_running--;
+        if (!work->cancelled && (again || work->reschedule) && !work->queued) {
+          work->reschedule = false;
+          work->queued = true;
+          work->next = NULL;
+          /* Reuse the just-completed slot for this repoll, so the global
+           * outstanding-work bound cannot discard a budget continuation. */
+          work_depth++;
+          if (work_tail) work_tail->next = work;
+          else work_head = work;
+          work_tail = work;
+        }
+        work->reschedule = false;
+        /* Last access to @work before releasing the queue lock. Cancel waits
+         * on this flag and takes the same lock before permitting reclamation. */
+        __atomic_store_n(&work->running, false, __ATOMIC_RELEASE);
+        spinlock_release(&lock);
       }
     }
 
@@ -150,7 +236,7 @@ static void net_worker(void) {
     self->state = THREAD_BLOCKED;
     wait_queue_add(&worker_wait, entry);
     spinlock_acquire(&lock);
-    bool empty = (queue_head == NULL);
+    bool empty = (queue_head == NULL && work_head == NULL);
     if (!empty) {
       self->state = THREAD_RUNNING;
     }
@@ -197,18 +283,25 @@ size_t net_rx_submit_batch_irq(struct net_device *dev,
       __atomic_add_fetch(&dev->stats.rx_errors, count, __ATOMIC_RELAXED);
     return 0;
   }
-  if (!dev || (uintptr_t)dev < 0xFFFF800000000000ULL)
-    dev = default_device;
-  if (!dev)
-    return 0;
-
   struct rx_buffer *accepted[NET_RX_BATCH_MAX];
   size_t accepted_indices[NET_RX_BATCH_MAX];
   size_t accepted_count = 0;
-  uint64_t generation = __atomic_load_n(&dev->generation, __ATOMIC_ACQUIRE);
+  uint64_t generation;
   uint64_t dropped = 0;
   bool report_pressure = false;
+
+  /* Device removal closes RX admission while holding this same lock. Take
+   * one reference per accepted packet before dropping it, so unregister can
+   * safely wait through both queued and worker-local batches. */
   spinlock_acquire(&lock);
+  if (!dev || (uintptr_t)dev < 0xFFFF800000000000ULL)
+    dev = default_device;
+  if (!dev || !__atomic_load_n(&dev->registered, __ATOMIC_RELAXED) ||
+      dev->unregistering) {
+    spinlock_release(&lock);
+    return 0;
+  }
+  generation = __atomic_load_n(&dev->generation, __ATOMIC_ACQUIRE);
   for (size_t i = 0; i < count; i++) {
     if (!frames[i].data || !frames[i].length ||
         frames[i].length > NET_FRAME_MAX) {
@@ -224,6 +317,7 @@ size_t net_rx_submit_batch_irq(struct net_device *dev,
     }
     accepted[accepted_count] = p;
     accepted_indices[accepted_count++] = i;
+    __atomic_add_fetch(&dev->references, 1, __ATOMIC_RELAXED);
   }
   if (dropped) {
     /* Serialize rate limiting with queue state; IRQ producers run on SMP. */
@@ -234,6 +328,12 @@ size_t net_rx_submit_batch_irq(struct net_device *dev,
       last_pressure_log = now;
   }
   spinlock_release(&lock);
+
+  if (!accepted_count) {
+    if (dropped && report_pressure)
+      klog_puts("[NET] rx dropped: memory pressure\n");
+    return 0;
+  }
 
   /* Buffers are reserved but not linked yet, so frame copies do not hold the
    * shared queue lock. NIC callers keep their ring lock until this returns. */
@@ -249,6 +349,16 @@ size_t net_rx_submit_batch_irq(struct net_device *dev,
   }
 
   spinlock_acquire(&lock);
+  if (!__atomic_load_n(&dev->registered, __ATOMIC_RELAXED) ||
+      dev->unregistering ||
+      generation != __atomic_load_n(&dev->generation, __ATOMIC_ACQUIRE)) {
+    for (size_t i = 0; i < accepted_count; i++) {
+      free_locked(accepted[i]);
+      __atomic_sub_fetch(&dev->references, 1, __ATOMIC_RELEASE);
+    }
+    spinlock_release(&lock);
+    return 0;
+  }
   bool was_empty = (queue_head == NULL);
   for (size_t i = 0; i < accepted_count; i++)
     push_locked(accepted[i]);
@@ -271,45 +381,82 @@ bool net_rx_submit_irq(struct net_device *dev, const void *frame, size_t len) {
 }
 
 int net_device_register(struct net_device *dev) {
-  if (!ready || !dev || !dev->ops || !dev->ops->link_up || !dev->ops->stop ||
-      dev->registered)
+  if (!dev)
     return -1;
+  spinlock_acquire(&lock);
+  if (!ready || !dev->ops || !dev->ops->link_up || !dev->ops->stop ||
+      __atomic_load_n(&dev->registered, __ATOMIC_RELAXED) ||
+      dev->unregistering || dev->references != 0) {
+    spinlock_release(&lock);
+    return -1;
+  }
   /* Empty names request the first free ethN. Explicit user-driver names keep
    * their existing duplicate-name checks. */
   if (!dev->name[0]) {
     for (unsigned i = 0; i < NET_DEVICE_MAX; i++) {
       char name[sizeof(dev->name)];
       snprintf(name, sizeof(name), "eth%u", i);
-      if (!net_device_find(name)) {
+      if (!net_device_find_locked(name)) {
         strcpy(dev->name, name);
         break;
       }
     }
-    if (!dev->name[0])
+    if (!dev->name[0]) {
+      spinlock_release(&lock);
       return -1;
+    }
   }
   int free_slot = -1;
   for (int i = 0; i < NET_DEVICE_MAX; i++) {
     if (devices[i] && strcmp(devices[i]->name, dev->name) == 0)
-      return -1;
+      goto register_fail;
     if (!devices[i] && free_slot < 0)
       free_slot = i;
   }
   if (free_slot < 0)
-    return -1;
+    goto register_fail;
+  dev->references = 0;
+  dev->unregistering = false;
   if (!dev->mtu)
     dev->mtu = NET_MTU_ETHERNET;
-  dev->registered = true;
+  __atomic_store_n(&dev->registered, true, __ATOMIC_RELEASE);
   devices[free_slot] = dev;
-  if (!default_device)
+  bool start_now = devices_started;
+  if (!default_device && !start_now)
     default_device = dev;
+  spinlock_release(&lock);
+  if (start_now) {
+    if (dev->ops->start && !dev->ops->start(dev)) {
+      klogf("[NET] %s hotplug activation failed\n", dev->name);
+      dev->ops->stop(dev);
+      net_device_unregister(dev);
+      return -1;
+    }
+    spinlock_acquire(&lock);
+    if (__atomic_load_n(&dev->registered, __ATOMIC_RELAXED) &&
+        !dev->unregistering) {
+      dev->started = true;
+      if (!default_device)
+        default_device = dev;
+    }
+    spinlock_release(&lock);
+  }
   return 0;
+
+register_fail:
+  spinlock_release(&lock);
+  return -1;
 }
 
 bool net_devices_start(void) {
+  struct net_device *snapshot[NET_DEVICE_MAX];
+  spinlock_acquire(&lock);
   default_device = NULL;
+  devices_started = true;
+  memcpy(snapshot, devices, sizeof(snapshot));
+  spinlock_release(&lock);
   for (unsigned i = 0; i < NET_DEVICE_MAX; i++) {
-    struct net_device *dev = devices[i];
+    struct net_device *dev = snapshot[i];
     if (!dev)
       continue;
     if (!dev->started && dev->ops->start && !dev->ops->start(dev)) {
@@ -318,16 +465,28 @@ bool net_devices_start(void) {
       net_device_unregister(dev);
       continue;
     }
+    spinlock_acquire(&lock);
     dev->started = true;
     if (!default_device)
       default_device = dev;
+    spinlock_release(&lock);
   }
-  return default_device != NULL;
+  struct net_device *dev = net_device_default_acquire();
+  if (!dev)
+    return false;
+  net_device_put(dev);
+  return true;
 }
 
 int net_device_unregister(struct net_device *dev) {
-  if (!dev || !dev->registered)
+  if (!dev)
     return -1;
+  spinlock_acquire(&lock);
+  if (!__atomic_load_n(&dev->registered, __ATOMIC_RELAXED) ||
+      dev->unregistering) {
+    spinlock_release(&lock);
+    return -1;
+  }
   for (int i = 0; i < NET_DEVICE_MAX; i++)
     if (devices[i] == dev)
       devices[i] = NULL;
@@ -339,32 +498,89 @@ int net_device_unregister(struct net_device *dev) {
         break;
       }
   }
-  dev->registered = false;
+  dev->unregistering = true;
+  __atomic_store_n(&dev->registered, false, __ATOMIC_RELEASE);
   __atomic_add_fetch(&dev->generation, 1, __ATOMIC_RELEASE);
   dev->started = false;
+  spinlock_release(&lock);
+
+  /* The producer must be stopped/synchronized before unregister. This grace
+   * period covers packets already admitted to the shared queue or worker's
+   * private batch; each packet holds the device alive through its handler. */
+  wait_for_device_references(dev);
+
+  spinlock_acquire(&lock);
+  dev->unregistering = false;
+  spinlock_release(&lock);
   return 0;
 }
 
-struct net_device *net_device_default(void) { return default_device; }
+struct net_device *net_device_default(void) {
+  spinlock_acquire(&lock);
+  struct net_device *dev = default_device;
+  spinlock_release(&lock);
+  return dev;
+}
+
+struct net_device *net_device_default_acquire(void) {
+  spinlock_acquire(&lock);
+  struct net_device *dev = default_device;
+  if (dev && !dev->unregistering &&
+      __atomic_load_n(&dev->registered, __ATOMIC_RELAXED))
+    __atomic_add_fetch(&dev->references, 1, __ATOMIC_RELAXED);
+  else
+    dev = NULL;
+  spinlock_release(&lock);
+  return dev;
+}
+
+void net_device_put(struct net_device *dev) {
+  if (dev)
+    __atomic_sub_fetch(&dev->references, 1, __ATOMIC_RELEASE);
+}
+
+bool net_device_is_default(const struct net_device *dev) {
+  spinlock_acquire(&lock);
+  bool is_default = dev && default_device == dev;
+  spinlock_release(&lock);
+  return is_default;
+}
 
 bool net_device_set_default(const char *name) {
-  struct net_device *dev = net_device_find(name);
-  if (!dev || !dev->started)
+  spinlock_acquire(&lock);
+  struct net_device *dev = net_device_find_locked(name);
+  if (!dev || !dev->started) {
+    spinlock_release(&lock);
     return false;
+  }
   default_device = dev;
+  spinlock_release(&lock);
   return true;
 }
 
 struct net_device *net_device_find(const char *name) {
-  if (!name)
-    return NULL;
-  for (int i = 0; i < NET_DEVICE_MAX; i++)
-    if (devices[i] && strcmp(devices[i]->name, name) == 0)
-      return devices[i];
-  return NULL;
+  spinlock_acquire(&lock);
+  struct net_device *dev = net_device_find_locked(name);
+  spinlock_release(&lock);
+  return dev;
 }
 void net_set_rx_handler(net_rx_handler_t handler) { rx_handler = handler; }
 net_rx_handler_t net_get_rx_handler(void) { return rx_handler; }
+
+void net_set_rx_tap(net_rx_tap_t tap, void *context) {
+  spinlock_acquire(&lock);
+  rx_tap = NULL;
+  rx_tap_context = NULL;
+  spinlock_release(&lock);
+  while (__atomic_load_n(&rx_tap_active, __ATOMIC_ACQUIRE) != 0)
+    sched_yield();
+  if (tap) {
+    spinlock_acquire(&lock);
+    rx_tap_context = context;
+    rx_tap = tap;
+    spinlock_release(&lock);
+  }
+}
 
 void net_core_init(void) {
   spinlock_init(&lock);
@@ -372,11 +588,17 @@ void net_core_init(void) {
   hot_count = 0;
   active_packets = 0;
   memset(devices, 0, sizeof(devices));
+  devices_started = false;
   default_device = NULL;
   queue_head = queue_tail = NULL;
   queue_depth = 0;
+  work_head = work_tail = NULL;
+  work_depth = work_running = 0;
   refresh_rx_budget();
   ready = true;
+  rx_tap = NULL;
+  rx_tap_context = NULL;
+  rx_tap_active = 0;
   klog_puts("[NET] core prepared\n");
 }
 
@@ -467,5 +689,101 @@ void net_queue_snapshot(uint32_t *queued, uint32_t *in_use) {
     *queued = queue_depth;
   if (in_use)
     *in_use = active_packets;
+  spinlock_release(&lock);
+}
+
+void net_deferred_work_init(struct net_deferred_work *work,
+                            bool (*run)(struct net_deferred_work *)) {
+  if (!work)
+    return;
+  work->next = NULL;
+  work->run = run;
+  work->queued = false;
+  __atomic_store_n(&work->running, false, __ATOMIC_RELAXED);
+  work->reschedule = false;
+  work->cancelled = false;
+}
+
+bool net_deferred_work_schedule(struct net_deferred_work *work) {
+  if (!work || !work->run || !ready)
+    return false;
+  spinlock_acquire(&lock);
+  if (work->queued) {
+    spinlock_release(&lock);
+    return true;
+  }
+  if (__atomic_load_n(&work->running, __ATOMIC_ACQUIRE)) {
+    work->cancelled = false;
+    work->reschedule = true;
+    spinlock_release(&lock);
+    return true;
+  }
+  if (work_depth + work_running >= 128) {
+    spinlock_release(&lock);
+    return false;
+  }
+  work->queued = true;
+  work->cancelled = false;
+  work->next = NULL;
+  bool was_empty = work_head == NULL && queue_head == NULL;
+  if (work_tail)
+    work_tail->next = work;
+  else
+    work_head = work;
+  work_tail = work;
+  work_depth++;
+  spinlock_release(&lock);
+  if (was_empty)
+    wait_queue_wake_all(&worker_wait);
+  else
+    wait_queue_wake_one(&worker_wait);
+  return true;
+}
+
+void net_deferred_work_cancel(struct net_deferred_work *work) {
+  if (!work)
+    return;
+  spinlock_acquire(&lock);
+  if (work->queued) {
+    struct net_deferred_work **link = &work_head;
+    while (*link && *link != work)
+      link = &(*link)->next;
+    if (*link == work) {
+      *link = work->next;
+      if (work_tail == work) {
+        work_tail = NULL;
+        for (struct net_deferred_work *it = work_head; it; it = it->next)
+          work_tail = it;
+      }
+      work->next = NULL;
+      work->queued = false;
+      work->reschedule = false;
+      work_depth--;
+    }
+  }
+  work->cancelled = true;
+  spinlock_release(&lock);
+  while (__atomic_load_n(&work->running, __ATOMIC_ACQUIRE))
+    sched_yield();
+  spinlock_acquire(&lock);
+  /* A callback cannot republish after cancellation; remove any item that was
+   * queued just before the suppress flag became visible. */
+  if (work->queued) {
+    struct net_deferred_work **link = &work_head;
+    while (*link && *link != work)
+      link = &(*link)->next;
+    if (*link == work) {
+      *link = work->next;
+      if (work_tail == work) {
+        work_tail = NULL;
+        for (struct net_deferred_work *it = work_head; it; it = it->next)
+          work_tail = it;
+      }
+      work->next = NULL;
+      work->queued = false;
+      work_depth--;
+    }
+  }
+  work->reschedule = false;
   spinlock_release(&lock);
 }

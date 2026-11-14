@@ -105,14 +105,45 @@ enum rpm_request {
   .runtime_suspend = suspend_fn, .runtime_resume = resume_fn,                  \
   .runtime_idle = idle_fn,
 
+#ifdef CONFIG_PM_SLEEP
+#define SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
+  SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
+#define SET_LATE_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
+  LATE_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
+#define SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
+  NOIRQ_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
+#else
 #define SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
 #define SET_LATE_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
 #define SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)
-#define SET_RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn)
+#endif
 
+#ifdef CONFIG_PM
+#define SET_RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn) \
+  RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn)
+#else
+#define SET_RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn)
+#endif
+
+/* Linux 6.18 compatibility form; with CONFIG_PM_SLEEP unset the upstream
+ * SET_SYSTEM_SLEEP_PM_OPS expansion deliberately leaves the table empty. */
+#define SIMPLE_DEV_PM_OPS(name, suspend_fn, resume_fn)                        \
+  const struct dev_pm_ops __maybe_unused name = {                             \
+      SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn)                          \
+  }
+
+#ifdef CONFIG_PM
+#define pm_ptr(_ptr) (_ptr)
+#define pm_runtime_ptr(_ptr) (_ptr)
+#else
 #define pm_ptr(_ptr) NULL
-#define pm_sleep_ptr(_ptr) NULL
 #define pm_runtime_ptr(_ptr) NULL
+#endif
+#ifdef CONFIG_PM_SLEEP
+#define pm_sleep_ptr(_ptr) (_ptr)
+#else
+#define pm_sleep_ptr(_ptr) NULL
+#endif
 
 /* PM driver flags (stock pm.h values) and the TRUE/FALSE constants upstream
  * picks up from <acpi/actypes.h> when CONFIG_ACPI is on.  amdgpu_drv.c's

@@ -17,6 +17,8 @@
 int driver_register(struct device_driver *drv);
 void driver_unregister(struct device_driver *drv);
 int driver_attach(struct device_driver *drv);
+int linuxkpi_bus_add_device(struct device *dev);
+void linuxkpi_bus_remove_device(struct device *dev);
 
 /* module_driver() is defined in the device.h overlay (as upstream's
  * device/driver.h). */

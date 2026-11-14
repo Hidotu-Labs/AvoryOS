@@ -9,6 +9,18 @@
  * "no supply"; linuxkpi/src/drm_compat.c implements them. */
 
 #include <linux/types.h>
+#include <linux/bits.h>
+#include <uapi/regulator/regulator.h>
+
+#define REGULATOR_ERROR_UNDER_VOLTAGE BIT(1)
+#define REGULATOR_ERROR_OVER_CURRENT BIT(2)
+#define REGULATOR_ERROR_REGULATION_OUT BIT(3)
+#define REGULATOR_ERROR_FAIL BIT(4)
+#define REGULATOR_ERROR_OVER_TEMP BIT(5)
+#define REGULATOR_ERROR_UNDER_VOLTAGE_WARN BIT(6)
+#define REGULATOR_ERROR_OVER_CURRENT_WARN BIT(7)
+#define REGULATOR_ERROR_OVER_VOLTAGE_WARN BIT(8)
+#define REGULATOR_ERROR_OVER_TEMP_WARN BIT(9)
 
 struct device;
 struct regulator;

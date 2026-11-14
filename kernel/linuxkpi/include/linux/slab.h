@@ -74,6 +74,12 @@ static inline void *kmalloc(size_t size, gfp_t flags) {
   return __kpi_kmalloc(size, flags);
 }
 
+/* LinuxKPI has no allocation-site profiling. Preserve the allocation flags
+ * and use the same allocator and ownership as kmalloc(). */
+static inline void *kmalloc_track_caller_noprof(size_t size, gfp_t flags) {
+  return __kpi_kmalloc(size, flags);
+}
+
 static inline void *kmalloc_node(size_t size, gfp_t flags, int node) {
   (void)node;
   return __kpi_kmalloc(size, flags);
