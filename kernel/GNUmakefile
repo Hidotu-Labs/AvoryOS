@@ -139,6 +139,12 @@ ifeq ($(USB_MOUSE_SELFTEST),1)
 override CPPFLAGS += -DUSB_MOUSE_SELFTEST=1
 endif
 
+# USB Audio UAC1 configuration parser regression (captured QEMU usb-audio
+# descriptor plus malformed and unsupported endpoint cases).
+ifeq ($(USB_AUDIO_SELFTEST),1)
+override CPPFLAGS += -DUSB_AUDIO_SELFTEST=1
+endif
+
 # NVMe completion interrupt knobs (Phase 4).  The driver falls back through
 # MSI-X -> MSI -> INTx -> polled; these force a lower mode for the stress
 # matrix.  NVME_FAULT_DROP_IRQ consumes completions in the handler but delays

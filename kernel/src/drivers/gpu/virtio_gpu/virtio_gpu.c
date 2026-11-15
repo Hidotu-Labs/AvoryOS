@@ -2341,6 +2341,8 @@ void virtio_gpu_get_stats(struct virtio_gpu_stats *out) {
         out->frames_in_flight = gpu_render_pending + (gpu.command_busy ? 1U : 0U);
         out->cursor_runtime_ms =
             cursor_phase7_started_ms ? lapic_timer_get_ms() - cursor_phase7_started_ms : 0;
+        out->pending_flip = __atomic_load_n(&gpu.pending_flip, __ATOMIC_RELAXED) ? 1U : 0U;
+        out->async_flip_state = __atomic_load_n(&gpu_async_flip_state, __ATOMIC_RELAXED);
     }
 }
 

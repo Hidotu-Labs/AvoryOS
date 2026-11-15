@@ -47,6 +47,25 @@ struct usb_interrupt_pipe {
   uint16_t last_length;      // Actual length of the most recent transfer
 };
 
+/* A caller-owned isochronous OUT packet.  The buffer must remain DMA-valid
+ * until completed is true or usb_isoch_cancel() returns. */
+struct usb_isoch_packet {
+  void *buffer;
+  uint64_t buffer_phys;
+  uint16_t length;
+  uint16_t actual_length;
+  uint8_t completion_code;
+  volatile bool completed;
+};
+
+/* HCD-owned stream handle.  Fields after hcd_data are private to the HCD. */
+struct usb_isoch_stream {
+  struct usb_device *dev;
+  void *hcd_data;
+  uint8_t endpoint;
+  bool active;
+};
+
 // USB Request Types
 #define USB_REQ_GET_STATUS 0x00
 #define USB_REQ_CLEAR_FEATURE 0x01
@@ -115,6 +134,13 @@ struct usb_hcd {
                             struct usb_interrupt_pipe *pipe);
   void (*interrupt_cancel)(struct usb_hcd *hcd,
                            struct usb_interrupt_pipe *pipe);
+  struct usb_isoch_stream *(*isoch_open)(
+      struct usb_hcd *hcd, struct usb_device *dev, uint8_t endpoint,
+      uint16_t max_packet, uint8_t interval);
+  int (*isoch_submit)(struct usb_hcd *hcd, struct usb_isoch_stream *stream,
+                      struct usb_isoch_packet *packet);
+  bool (*isoch_cancel)(struct usb_hcd *hcd,
+                       struct usb_isoch_stream *stream);
   struct usb_hcd_stats stats;
 };
 
@@ -194,6 +220,17 @@ struct usb_interrupt_pipe *usb_interrupt_open(
 bool usb_interrupt_completed(struct usb_interrupt_pipe *pipe);
 int usb_interrupt_resubmit(struct usb_interrupt_pipe *pipe);
 void usb_interrupt_cancel(struct usb_interrupt_pipe *pipe);
+
+/* Periodic isochronous OUT transport.  The first implementation is limited
+ * to directly attached full-speed endpoints. */
+struct usb_isoch_stream *usb_isoch_open(struct usb_device *dev,
+                                        uint8_t endpoint,
+                                        uint16_t max_packet,
+                                        uint8_t interval);
+int usb_isoch_submit(struct usb_isoch_stream *stream,
+                     struct usb_isoch_packet *packet);
+bool usb_isoch_completed(struct usb_isoch_packet *packet);
+bool usb_isoch_cancel(struct usb_isoch_stream *stream);
 
 // Called by HC driver when a new device is detected on a root hub port
 void usb_device_discovered(struct usb_hcd *hcd, uint8_t port,

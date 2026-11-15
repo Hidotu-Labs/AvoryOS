@@ -698,6 +698,10 @@ void sched_tick(struct registers *regs);
 void sched_yield_user(void);
 void sched_itimer_arm(struct thread *t, uint64_t next_ms, uint64_t interval_ms, uint64_t value_ms);
 void sched_itimer_disarm(struct thread *t);
+void sched_itimer_set_group(struct thread *caller, uint64_t now_ms,
+                            uint64_t value_ms, uint64_t interval_ms,
+                            uint64_t *old_remaining_ms,
+                            uint64_t *old_interval_ms);
 
 /* Deferred preemption point for the interrupt and syscall return paths.
  * to_user is true when the caller is about to return to ring 3. Kernel IRQ

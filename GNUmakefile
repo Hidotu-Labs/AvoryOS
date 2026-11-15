@@ -168,7 +168,16 @@ RUN_DISPLAY ?= $(if $(filter 1,$(RUN_VIRGL)),sdl,gtk)
 # Preserve complete kernel hang reports independently of terminal scrollback.
 # The stdio backend keeps the interactive serial commands (dump/diag).
 RUN_SERIAL_LOG ?= build/logs/desktop-serial.log
-.PHONY: run run-tcg
+# Select guest audio device for `make run`: hda (Intel HDA) or usb (UAC1 USB audio).
+RUN_AUDIO ?= hda
+ifeq ($(filter $(RUN_AUDIO),hda usb),)
+$(error RUN_AUDIO must be hda or usb)
+endif
+RUN_AUDIO_DEV_FLAGS = $(if $(filter usb,$(RUN_AUDIO)),,-device intel-hda -device hda-duplex,audiodev=snd0)
+RUN_USB_AUDIO_DEV_FLAGS = $(if $(filter usb,$(RUN_AUDIO)),-device usb-audio$(NET_COMMA)bus=xhci.0$(NET_COMMA)port=1$(NET_COMMA)multi=off$(NET_COMMA)msos-desc=off$(NET_COMMA)audiodev=snd0,)
+.PHONY: run run-tcg run-usb
+run-usb: RUN_AUDIO := usb
+run-usb: run
 run: DISPLAY_OPT = -display $(RUN_DISPLAY),gl=$(RUN_GL),show-cursor=$(GTK_SHOW_CURSOR)$(if $(filter gtk,$(RUN_DISPLAY)),$(NET_COMMA)zoom-to-fit=off$(NET_COMMA)grab-on-hover=on)
 run: QEMUFLAGS = $(QEMU_MEM) -vga none -device $(RUN_GPU),xres=1280,yres=800
 run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL_HOST_LIB)) $(if $(RUN_QEMU_LOCAL),$(QEMU_HOST_BIN))
@@ -185,13 +194,44 @@ run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL
 		-serial chardev:desktop-serial \
 		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
 		$(RUN_NET_FLAGS) \
-		-device intel-hda -device hda-duplex,audiodev=snd0 \
+		$(RUN_AUDIO_DEV_FLAGS) \
 		-device qemu-xhci,id=xhci \
+		$(RUN_USB_AUDIO_DEV_FLAGS) \
 		-device usb-kbd,bus=xhci.0 \
 		-device $(RUN_POINTER),bus=xhci.0 \
 		$(DISPLAY_OPT) \
 		$(QEMUFLAGS)
 run-tcg: run-x86_64
+
+# Headless, TCG-only USB audio fixture. Use the null backend by default so it
+# also boots on build hosts without a desktop audio server; choose pa, pipewire,
+# or another QEMU backend with USB_AUDIO_BACKEND to hear playback. The disk is
+# an ephemeral overlay so this hardware exercise cannot alter the user's image.
+USB_AUDIO_BACKEND ?= none
+USB_AUDIO_SMP ?= 2
+USB_AUDIO_DISK ?= disk.img
+USB_AUDIO_DISK_DEP := $(if $(wildcard $(USB_AUDIO_DISK)),,$(USB_AUDIO_DISK))
+.PHONY: run-usb-audio
+run-usb-audio: edk2-ovmf $(IMAGE_NAME).iso $(USB_AUDIO_DISK_DEP)
+	@set -e; \
+	mkdir -p build; \
+	overlay=$$(mktemp build/usb-audio-disk.XXXXXX); \
+	trap 'rm -f "$$overlay"' EXIT HUP INT TERM; \
+	qemu-img create -q -f qcow2 -F raw -b "$(abspath $(USB_AUDIO_DISK))" "$$overlay"; \
+	qemu-system-$(ARCH) \
+		-M q35 -cpu max -accel tcg \
+		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
+		-cdrom $(IMAGE_NAME).iso \
+		-drive file="$$overlay",format=qcow2,if=none,id=nvme0 \
+		-device nvme,serial=avoryos0,drive=nvme0 \
+		-smp $(USB_AUDIO_SMP) $(QEMU_MEM) -vga none -device virtio-vga,addr=06.0 \
+		-display none -serial stdio -monitor none -no-reboot \
+		-audiodev $(USB_AUDIO_BACKEND),id=usbaudio \
+		$(RUN_NET_FLAGS) \
+		-device qemu-xhci,id=xhci \
+		-device usb-audio,bus=xhci.0,port=1,multi=off,msos-desc=off,audiodev=usbaudio \
+		-device usb-kbd,bus=xhci.0 \
+		-device usb-tablet,bus=xhci.0
 
 # ── NUMA multi-node test target ──────────────────────────────────────────────
 #

@@ -14,6 +14,10 @@
 // Register a device node in the registry and mount it under /dev.
 void devfs_register_node(const char *name, vfs_node_t *node);
 
+// Remove a dynamic device-name mapping and its /dev path. If the vnode is
+// still open, VFS retirement keeps it alive until the last descriptor closes.
+void devfs_unregister_node(const char *name, vfs_node_t *node);
+
 // Look up a device node by name (without the /dev/ prefix).
 vfs_node_t *devfs_lookup(const char *name);
 

@@ -2,8 +2,10 @@
 #include "fuse.h"
 #include "../console/klog.h"
 #include "../fs/ramfs.h"
+#include "../fs/mount_namespace.h"
 #include "../fs/vfs.h"
 #include "../lib/string.h"
+#include "../lock/spinlock.h"
 #include "../mm/heap.h"
 
 // Device Node Registry
@@ -18,6 +20,32 @@ typedef struct {
 
 static device_entry_t device_registry[MAX_DEVICES];
 static int device_count = 0;
+static spinlock_t device_registry_lock = SPINLOCK_INIT;
+
+static vfs_node_t *devfs_parent_for_name(const char *name, char *leaf,
+                                         size_t leaf_size) {
+  if (!name || !*name || !leaf || !leaf_size || name[0] == '/')
+    return NULL;
+  size_t len = strlen(name);
+  if (len >= 64)
+    return NULL;
+  const char *slash = strrchr(name, '/');
+  const char *base = slash ? slash + 1 : name;
+  size_t base_len = strlen(base);
+  if (!base_len || base_len >= leaf_size)
+    return NULL;
+  strcpy(leaf, base);
+
+  char path[96] = "/dev";
+  if (slash) {
+    size_t parent_len = (size_t)(slash - name);
+    if (!parent_len || parent_len + 6 >= sizeof(path))
+      return NULL;
+    strcat(path, "/");
+    strncat(path, name, parent_len);
+  }
+  return vfs_resolve_path(path);
+}
 
 void devfs_register_node(const char *name, vfs_node_t *node) {
   if (!node)
@@ -26,26 +54,34 @@ void devfs_register_node(const char *name, vfs_node_t *node) {
   // Mark node as persistent so it doesn't get kfree'd during path resolution.
   node->flags |= FS_PERSISTENT;
 
+  spinlock_acquire(&device_registry_lock);
+
   // Update existing entry if the name is already registered.
   for (int i = 0; i < device_count; i++) {
     if (strcmp(device_registry[i].name, name) == 0) {
       device_registry[i].node = node;
+      spinlock_release(&device_registry_lock);
       goto mount_vfs;
     }
   }
 
   // Add new entry.
-  if (device_count >= MAX_DEVICES)
+  if (device_count >= MAX_DEVICES) {
+    spinlock_release(&device_registry_lock);
     return;
+  }
   strncpy(device_registry[device_count].name, name, 63);
   device_registry[device_count].name[63] = '\0';
   device_registry[device_count].node = node;
   device_count++;
+  spinlock_release(&device_registry_lock);
 
 mount_vfs:
-  // Also mount it in /dev so it appears in directory listings.
+  // Mount slash-qualified names at their matching /dev subtree; ordinary
+  // names stay directly under /dev.
   if (fs_root) {
-    vfs_node_t *dev_dir = vfs_resolve_path("/dev");
+    char leaf[64];
+    vfs_node_t *dev_dir = devfs_parent_for_name(name, leaf, sizeof(leaf));
     if (dev_dir) {
       klog_puts("[VFS] Registering '");
       klog_puts((char *)name);
@@ -61,12 +97,58 @@ mount_vfs:
 }
 
 vfs_node_t *devfs_lookup(const char *name) {
+  if (!name)
+    return NULL;
+  vfs_node_t *result = NULL;
+  spinlock_acquire(&device_registry_lock);
   for (int i = 0; i < device_count; i++) {
     if (strcmp(device_registry[i].name, name) == 0) {
-      return device_registry[i].node;
+      result = device_registry[i].node;
+      break;
     }
   }
-  return NULL;
+  spinlock_release(&device_registry_lock);
+  return result;
+}
+
+void devfs_unregister_node(const char *name, vfs_node_t *node) {
+  if (!name || !*name)
+    return;
+
+  bool removed = false;
+  spinlock_acquire(&device_registry_lock);
+  for (int i = 0; i < device_count; i++) {
+    if (strcmp(device_registry[i].name, name) == 0 &&
+        (!node || device_registry[i].node == node)) {
+      for (int j = i + 1; j < device_count; j++)
+        device_registry[j - 1] = device_registry[j];
+      device_count--;
+      memset(&device_registry[device_count], 0,
+             sizeof(device_registry[device_count]));
+      removed = true;
+      break;
+    }
+  }
+  spinlock_release(&device_registry_lock);
+
+  if (!removed)
+    return;
+
+  /* Names may be simple (/dev/foo) or class-relative aliases such as
+   * snd/controlC1. Removing the matching tree entry invalidates cached path
+   * lookups; any already-open vnode survives until its final close. */
+  char basename[64];
+  vfs_node_t *dir = devfs_parent_for_name(name, basename, sizeof(basename));
+  if (!dir)
+    return;
+  vfs_node_t *current = vfs_finddir(dir, basename);
+  if (current) {
+    bool same = !node || vfs_backing_node(current) == vfs_backing_node(node);
+    vfs_close(current);
+    if (same)
+      vfs_unlink(dir, basename);
+  }
+  vfs_close(dir);
 }
 
 // Character device helper

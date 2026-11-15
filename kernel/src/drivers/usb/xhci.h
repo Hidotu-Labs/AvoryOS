@@ -24,6 +24,8 @@ struct xhci_erst_entry {
 
 struct xhci_slot {
   bool enabled;
+  bool removal_pending;
+  struct usb_device *device;
   uint8_t id;
   uint8_t port;
   enum usb_speed speed;
@@ -38,9 +40,13 @@ struct xhci_slot {
   uint8_t ep0_cycle;
   void *control_buffer;
   uint64_t control_buffer_phys;
+  uint32_t isoch_quarantined_mask;
+  volatile uint32_t isoch_transition;
 };
 
 #define XHCI_MAX_INTERRUPT_PIPES 16
+#define XHCI_MAX_ISOCH_STREAMS 8
+#define XHCI_ISOCH_RING_TRBS (XHCI_RING_TRBS - 1)
 struct xhci_interrupt_state {
   struct usb_interrupt_pipe pipe;
   struct xhci_trb *ring;
@@ -68,6 +74,28 @@ struct xhci_interrupt_state {
   uint32_t last_event_control;// Raw control dword of the last event
 };
 
+struct xhci_isoch_state {
+  struct usb_isoch_stream stream;
+  struct xhci_trb *ring;
+  uint64_t ring_phys;
+  uint16_t enqueue;
+  uint8_t cycle;
+  uint8_t endpoint_id;
+  uint16_t max_packet;
+  uint8_t interval;
+  struct usb_isoch_packet * volatile packets[XHCI_ISOCH_RING_TRBS];
+  uint32_t submitted;
+  uint32_t completed;
+  uint32_t errors;
+  uint32_t cancellations;
+  uint32_t doorbells;
+  volatile uint32_t submitting;
+  volatile uint32_t reserved;
+  bool quarantined;
+  volatile bool stopping;
+  volatile bool disconnected;
+};
+
 struct xhci_controller {
   struct pci_device *pci;
   volatile uint8_t *cap;
@@ -91,6 +119,7 @@ struct xhci_controller {
   struct usb_hcd hcd;
   struct xhci_slot slots[256];
   struct xhci_interrupt_state interrupt_pipes[XHCI_MAX_INTERRUPT_PIPES];
+  struct xhci_isoch_state isoch_streams[XHCI_MAX_ISOCH_STREAMS];
   uint32_t pending_ports;
   uint32_t connected_ports;
   /* Bounded late-enumeration attempts for ports that only report their
@@ -116,6 +145,9 @@ struct xhci_controller {
    * event and skip the next one, which loses control-transfer completions
    * (random enumeration failures) and interrupt reports. */
   spinlock_t event_lock;
+  /* Counts events copied from the ring but not fully dispatched. A stop path
+   * waits for this to reach zero before returning packet ownership. */
+  volatile uint32_t event_dispatching;
   /* Command-ring submission is shared by thread context (probes, HID LED
    * reports) and IRQ context (silent-endpoint recovery and the GET_REPORT
    * fallback).  The ring cursor and the completion wait are not reentrant. */

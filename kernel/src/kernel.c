@@ -44,6 +44,7 @@
 #include "drivers/usb/ohci.h"
 #include "drivers/usb/uhci.h"
 #include "drivers/usb/usb.h"
+#include "drivers/usb/usb_audio.h"
 #include "drivers/usb/xhci.h"
 #include "drivers/virtio/virtio.h"
 #include "drivers/gpu/virtio_gpu/virtio_gpu.h"
@@ -694,6 +695,7 @@ void kmain_high_half(void) {
   xhci_init();
   uhci_init();
   ohci_init();
+  usb_audio_boot_smoke();
 
   /* `usbdump` in the kernel cmdline prints the USB diagnostics at boot.
    * /proc/usb has the same content after boot; this variant exists for
@@ -965,6 +967,7 @@ mount_fail:
   hda_register_vfs();
   audio_dsp_register_vfs();
   alsa_emu_register_vfs();
+  usb_audio_start_worker();
 
   /* The no-root-filesystem path jumps directly here and skips initcalls.
    * Keep the native core initialized exactly once on both boot paths. */

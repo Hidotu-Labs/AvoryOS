@@ -986,6 +986,53 @@ void sched_itimer_disarm(struct thread *t) {
   }
 }
 
+/* ITIMER_REAL / alarm() is per-process (TGID) in POSIX/Linux, not per-thread.
+ * Disarm any sibling thread's timer before arming the new deadline so an
+ * alarm(0) or reset from another thread cancels the whole group's timer. */
+void sched_itimer_set_group(struct thread *caller, uint64_t now_ms,
+                            uint64_t value_ms, uint64_t interval_ms,
+                            uint64_t *old_remaining_ms,
+                            uint64_t *old_interval_ms) {
+  uint64_t prev_rem = 0;
+  uint64_t prev_int = 0;
+  if (!caller) {
+    if (old_remaining_ms) *old_remaining_ms = 0;
+    if (old_interval_ms) *old_interval_ms = 0;
+    return;
+  }
+
+  extern spinlock_t tid_lock;
+  spinlock_acquire(&tid_lock);
+
+  uint32_t tgid = caller->tgid ? caller->tgid : caller->tid;
+  struct thread *target = caller;
+  bool found_old = false;
+
+  for (struct thread *p = global_thread_list; p; p = p->global_next) {
+    uint32_t p_tgid = p->tgid ? p->tgid : p->tid;
+    if (p_tgid != tgid)
+      continue;
+    if (p->tid == tgid && p->state != THREAD_ZOMBIE && p->state != THREAD_DEAD)
+      target = p;
+    if (p->it_real_next != 0) {
+      if (!found_old) {
+        prev_rem = p->it_real_next > now_ms ? p->it_real_next - now_ms : 0;
+        prev_int = p->it_real_interval;
+        found_old = true;
+      }
+      sched_itimer_disarm(p);
+    }
+  }
+
+  if (value_ms)
+    sched_itimer_arm(target, now_ms + value_ms, interval_ms, value_ms);
+
+  spinlock_release(&tid_lock);
+
+  if (old_remaining_ms) *old_remaining_ms = prev_rem;
+  if (old_interval_ms) *old_interval_ms = prev_int;
+}
+
 __attribute__((optimize("O3"))) void sched_tick(struct registers *regs) {
   (void)regs;
   struct cpu_info *cpu = cpu_get_current();

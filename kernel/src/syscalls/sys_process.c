@@ -1261,23 +1261,14 @@ static uint64_t sys_setitimer(uint64_t which, uint64_t new_value_ptr,
     return (uint64_t)-22;
 
   uint64_t now = lapic_timer_get_ms();
-  struct kernel_itimerval old_value = {0};
-  uint64_t remaining_ms =
-      t->it_real_next > now ? t->it_real_next - now : 0;
-  ms_to_timeval(remaining_ms, &old_value.it_value);
-  ms_to_timeval(t->it_real_interval, &old_value.it_interval);
+  uint64_t remaining_ms = 0;
+  uint64_t old_interval_ms = 0;
+  sched_itimer_set_group(t, now, value_ms, interval_ms, &remaining_ms,
+                         &old_interval_ms);
 
-  t->it_real_value = value_ms;
-  t->it_real_interval = interval_ms;
-  /* Route through the arm/disarm helpers: the tick fast-path skips the
-   * whole itimer scan while active_itimer_count==0, so writing it_real_next
-   * directly (as here before) leaves the timer armed but never delivered -
-   * alarm(2) would never fire. The helpers also maintain
-   * earliest_itimer_deadline and handle re-arm accounting. */
-  if (value_ms)
-    sched_itimer_arm(t, now + value_ms, interval_ms, value_ms);
-  else
-    sched_itimer_disarm(t);
+  struct kernel_itimerval old_value = {0};
+  ms_to_timeval(remaining_ms, &old_value.it_value);
+  ms_to_timeval(old_interval_ms, &old_value.it_interval);
 
   if (old_value_ptr)
     memcpy((void *)old_value_ptr, &old_value, sizeof(old_value));
@@ -1289,15 +1280,10 @@ static uint64_t sys_alarm(uint64_t seconds, uint64_t a1, uint64_t a2,
   (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
   struct thread *t = sched_get_current();
   if (!t) return 0;
-  uint64_t now = lapic_timer_get_ticks();
-  uint64_t remaining = t->it_real_next > now ? (t->it_real_next - now + 999) / 1000 : 0;
-  /* Same accounting as setitimer: bypassing sched_itimer_arm leaves
-   * active_itimer_count at zero and the tick scan never delivers SIGALRM. */
-  if (seconds)
-    sched_itimer_arm(t, now + seconds * 1000, 0, seconds * 1000);
-  else
-    sched_itimer_disarm(t);
-  return remaining;
+  uint64_t now = lapic_timer_get_ms();
+  uint64_t remaining_ms = 0;
+  sched_itimer_set_group(t, now, seconds * 1000, 0, &remaining_ms, NULL);
+  return (remaining_ms + 999) / 1000;
 }
 
 // getrusage (syscall 98)

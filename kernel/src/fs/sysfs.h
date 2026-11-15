@@ -9,6 +9,12 @@ void sysfs_enable_uevent(struct vfs_node *node, struct vfs_node *parent);
 void sysfs_populate_network(void);
 void sysfs_gpu_update_connector(uint32_t scanout, bool connected, const char *modes);
 
+// Publish/remove an ALSA sound card and its control/playback sysfs devices.
+// ALSA owns the corresponding /dev character nodes.
+bool sysfs_sound_card_register(uint32_t card, const char *id,
+                               bool playback_pcm);
+void sysfs_sound_card_unregister(uint32_t card);
+
 // GPU device path for netlink uevents (e.g. "/devices/pci0000:00/0000:00:02.0/drm/card0")
 extern char sysfs_gpu_devpath[128];
 extern char sysfs_gpu_connector_devpath[128];

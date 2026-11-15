@@ -40,6 +40,7 @@
 #define XHCI_TRB_SET_TR_DEQUEUE 16U
 #define XHCI_TRB_NOOP_CMD 23U
 #define XHCI_TRB_NORMAL 1U
+#define XHCI_TRB_ISOCH 5U
 #define XHCI_TRB_TRANSFER_EVENT 32U
 #define XHCI_TRB_COMMAND_COMPLETION 33U
 #define XHCI_TRB_PORT_STATUS 34U
@@ -47,6 +48,7 @@
 #define XHCI_TRB_DATA_STAGE 3U
 #define XHCI_TRB_STATUS_STAGE 4U
 #define XHCI_TRB_IOC (1U << 5)
+#define XHCI_TRB_SIA (1U << 31)
 #define XHCI_TRB_IDT (1U << 6)
 #define XHCI_TRB_CHAIN (1U << 4)
 #define XHCI_TRB_ISP (1U << 2)
@@ -78,6 +80,9 @@ static bool last_ac64;
 static const char *last_dma_layer = "none";
 static uint32_t last_dma_flags;
 static uint64_t last_dma_phys;
+
+static void xhci_wait_event_dispatch(struct xhci_controller *hc);
+static void xhci_isoch_finish_pending(struct xhci_isoch_state *state);
 
 static inline uint32_t mmio_read32(volatile void *base, uint32_t offset) {
   return *(volatile uint32_t *)((volatile uint8_t *)base + offset);
@@ -322,6 +327,7 @@ static uint32_t xhci_drain_events(struct xhci_controller *hc,
     }
     event = *pending;
     xhci_event_advance(hc);
+    __atomic_add_fetch(&hc->event_dispatching, 1, __ATOMIC_ACQ_REL);
     spinlock_release(&hc->event_lock);
 
     hc->events_seen++;
@@ -397,6 +403,43 @@ static uint32_t xhci_drain_events(struct xhci_controller *hc,
         break;
       }
       if (!matched) {
+        uint64_t trb_phys = event.parameter & ~0xFULL;
+        bool event_data = (ev_control & (1U << 2)) != 0;
+        for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+          struct xhci_isoch_state *state = &hc->isoch_streams[i];
+          struct xhci_slot *slot = state->stream.dev
+                                       ? state->stream.dev->hcd_data
+                                       : NULL;
+          if (event_data || !state->stream.active || !slot ||
+              slot->id != ev_slot || state->endpoint_id != ev_dci ||
+              !state->ring ||
+              trb_phys < state->ring_phys ||
+              trb_phys >= state->ring_phys +
+                              XHCI_ISOCH_RING_TRBS * sizeof(*state->ring) ||
+              ((trb_phys - state->ring_phys) % sizeof(*state->ring)) != 0)
+            continue;
+          uint16_t index =
+              (uint16_t)((trb_phys - state->ring_phys) / sizeof(*state->ring));
+          struct usb_isoch_packet *packet =
+              __atomic_exchange_n(&state->packets[index], NULL,
+                                  __ATOMIC_ACQ_REL);
+          if (!packet)
+            break;
+          packet->completion_code = ev_cc;
+          packet->actual_length =
+              ev_residual < packet->length
+                  ? (uint16_t)(packet->length - ev_residual)
+                  : 0;
+          if (ev_cc == XHCI_COMPLETION_SUCCESS)
+            state->completed++;
+          else
+            state->errors++;
+          __atomic_store_n(&packet->completed, true, __ATOMIC_RELEASE);
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
         hc->orphan_transfer_events++;
       }
     } else if (XHCI_TRB_TYPE_GET(event.control) == XHCI_TRB_PORT_STATUS) {
@@ -404,6 +447,7 @@ static uint32_t xhci_drain_events(struct xhci_controller *hc,
       if (port && port <= 32)
         hc->pending_ports |= 1U << (port - 1);
     }
+    __atomic_sub_fetch(&hc->event_dispatching, 1, __ATOMIC_ACQ_REL);
   }
   return completion;
 }
@@ -550,6 +594,7 @@ static int xhci_prepare_device(struct usb_hcd *hcd, struct usb_device *dev) {
   }
   struct xhci_slot *slot = &hc->slots[slot_id];
   memset(slot, 0, sizeof(*slot));
+  slot->device = dev;
   slot->id = slot_id;
   slot->port = dev->port;
   slot->speed = dev->speed;
@@ -974,6 +1019,38 @@ static void xhci_remove_device(struct usb_hcd *hcd, struct usb_device *dev) {
   struct xhci_slot *slot = dev ? dev->hcd_data : NULL;
   if (!slot || !slot->enabled)
     return;
+  for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+    struct xhci_isoch_state *state = &hc->isoch_streams[i];
+    if (state->stream.dev == dev &&
+        __atomic_load_n(&state->stream.active, __ATOMIC_ACQUIRE))
+      __atomic_store_n(&state->stopping, true, __ATOMIC_RELEASE);
+  }
+  uint32_t expected_transition = 0;
+  if (!__atomic_compare_exchange_n(&slot->isoch_transition,
+                                   &expected_transition, 1, false,
+                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    /* Port-change handling runs in interrupt context. Defer if a stream
+     * transition owns the slot; spinning here could deadlock its owner. */
+    __atomic_store_n(&slot->removal_pending, true, __ATOMIC_RELEASE);
+    return;
+  }
+  for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+    struct xhci_isoch_state *state = &hc->isoch_streams[i];
+    if (state->stream.dev == dev &&
+        __atomic_load_n(&state->stream.active, __ATOMIC_ACQUIRE))
+      __atomic_store_n(&state->stopping, true, __ATOMIC_RELEASE);
+  }
+  for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+    struct xhci_isoch_state *state = &hc->isoch_streams[i];
+    if (state->stream.dev == dev &&
+        __atomic_load_n(&state->submitting, __ATOMIC_ACQUIRE)) {
+      /* Never wait for a submitter in the port IRQ: the interrupted CPU may
+       * own the in-progress post. The stopping flag prevents another one. */
+      __atomic_store_n(&slot->removal_pending, true, __ATOMIC_RELEASE);
+      __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
+      return;
+    }
+  }
   for (uint32_t i = 0; i < XHCI_MAX_INTERRUPT_PIPES; i++) {
     struct xhci_interrupt_state *state = &hc->interrupt_pipes[i];
     if (state->pipe.dev != dev)
@@ -982,12 +1059,37 @@ static void xhci_remove_device(struct usb_hcd *hcd, struct usb_device *dev) {
     __atomic_store_n(&state->completed, false, __ATOMIC_RELEASE);
     state->pipe.dev = NULL;
   }
-  xhci_submit_command(hc, 0, 0,
-                      XHCI_TRB_TYPE(XHCI_TRB_DISABLE_SLOT) |
-                          ((uint32_t)slot->id << 24),
-                      NULL);
-  ((uint64_t *)hc->dcbaa)[slot->id] = 0;
-  slot->enabled = false;
+  bool disabled = xhci_submit_command(
+      hc, 0, 0,
+      XHCI_TRB_TYPE(XHCI_TRB_DISABLE_SLOT) | ((uint32_t)slot->id << 24),
+      NULL);
+  if (disabled) {
+    /* A completed Disable Slot revokes DMA for every endpoint. Process all
+     * earlier Transfer Events before allowing packet owners to release RAM. */
+    xhci_drain_events(hc, 0);
+    xhci_wait_event_dispatch(hc);
+    for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+      struct xhci_isoch_state *state = &hc->isoch_streams[i];
+      if (state->stream.dev != dev)
+        continue;
+      xhci_isoch_finish_pending(state);
+      __atomic_store_n(&state->stream.active, false, __ATOMIC_RELEASE);
+      __atomic_store_n(&state->disconnected, true, __ATOMIC_RELEASE);
+      __atomic_store_n(&state->stopping, false, __ATOMIC_RELEASE);
+    }
+    ((uint64_t *)hc->dcbaa)[slot->id] = 0;
+    slot->enabled = false;
+    slot->device = NULL;
+    __atomic_store_n(&slot->removal_pending, false, __ATOMIC_RELEASE);
+  } else {
+    /* Keep the slot and isoch packet owners quarantined if DMA revocation
+     * failed; /proc/usb will show the unplugged device rather than reusing it. */
+    klog_puts("[XHCI] Disable Slot failed during removal; retaining DMA owners\n");
+    /* Keep every matching stream stopped from accepting new packets while
+     * the watchdog retries slot teardown. */
+    __atomic_store_n(&slot->removal_pending, true, __ATOMIC_RELEASE);
+  }
+  __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
 }
 
 static void xhci_service_ports(struct xhci_controller *hc) {
@@ -1263,6 +1365,308 @@ static void xhci_interrupt_cancel(struct usb_hcd *hcd,
   pipe->active = false;
 }
 
+static struct usb_isoch_stream *xhci_isoch_open(
+    struct usb_hcd *hcd, struct usb_device *dev, uint8_t endpoint,
+    uint16_t max_packet, uint8_t interval) {
+  struct xhci_controller *hc = hcd ? hcd->priv : NULL;
+  struct xhci_slot *slot = dev ? dev->hcd_data : NULL;
+  /* The first milestone deliberately supports only directly attached,
+   * full-speed, isochronous OUT endpoints. */
+  if (!hc || !dev || !dev->connected || dev->speed != USB_SPEED_FULL ||
+      !slot || !slot->enabled ||
+      (endpoint & 0x80U) || !(endpoint & 0x0FU) || !max_packet ||
+      max_packet > 1023 || interval != 1)
+    return NULL;
+  uint32_t expected_transition = 0;
+  if (!__atomic_compare_exchange_n(&slot->isoch_transition,
+                                   &expected_transition, 1, false,
+                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+    return NULL;
+  uint8_t requested_dci = (endpoint & 0x0FU) * 2U;
+  if (slot->isoch_quarantined_mask & (1U << requested_dci)) {
+    __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
+    return NULL;
+  }
+  for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+    struct xhci_isoch_state *existing = &hc->isoch_streams[i];
+    if (existing->stream.dev == dev &&
+        (__atomic_load_n(&existing->stream.active, __ATOMIC_ACQUIRE) ||
+         __atomic_load_n(&existing->reserved, __ATOMIC_ACQUIRE))) {
+      __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
+      return NULL;
+    }
+  }
+  struct xhci_isoch_state *state = NULL;
+  for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+    uint32_t expected_reserved = 0;
+    if (!hc->isoch_streams[i].stream.active &&
+        !__atomic_load_n(&hc->isoch_streams[i].stopping, __ATOMIC_ACQUIRE) &&
+        !hc->isoch_streams[i].quarantined &&
+        __atomic_compare_exchange_n(&hc->isoch_streams[i].reserved,
+                                   &expected_reserved, 1, false,
+                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      state = &hc->isoch_streams[i];
+      break;
+    }
+  }
+  if (!state) {
+    __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
+    return NULL;
+  }
+  if (!state->ring &&
+      !xhci_alloc_page(hc, (void **)&state->ring, &state->ring_phys)) {
+    __atomic_store_n(&state->reserved, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
+    return NULL;
+  }
+  memset(state->ring, 0, 4096);
+  memset((void *)state->packets, 0, sizeof(state->packets));
+  state->enqueue = 0;
+  state->cycle = 1;
+  state->endpoint_id = requested_dci;
+  state->max_packet = max_packet;
+  state->interval = interval;
+  state->ring[XHCI_ISOCH_RING_TRBS].parameter = state->ring_phys;
+  state->ring[XHCI_ISOCH_RING_TRBS].control =
+      XHCI_TRB_TYPE(XHCI_TRB_LINK) | XHCI_TRB_CYCLE | (1U << 1);
+
+  memset(slot->input_context, 0, 4096);
+  uint32_t *icc = xhci_context(slot->input_context, 0, hc->context_64);
+  uint32_t *sc = xhci_context(slot->input_context, 1, hc->context_64);
+  uint32_t *out_sc = xhci_context(slot->output_context, 0, hc->context_64);
+  uint32_t context_bytes = hc->context_64 ? 64U : 32U;
+  memcpy(sc, out_sc, context_bytes);
+  uint32_t existing_dci = (out_sc[0] >> 27) & 0x1FU;
+  uint8_t max_dci = existing_dci > state->endpoint_id
+                        ? (uint8_t)existing_dci
+                        : state->endpoint_id;
+  for (uint32_t i = 0; i < XHCI_MAX_INTERRUPT_PIPES; i++) {
+    struct xhci_interrupt_state *other = &hc->interrupt_pipes[i];
+    if (other->pipe.active && other->pipe.dev == dev &&
+        other->endpoint_id > max_dci)
+      max_dci = other->endpoint_id;
+  }
+  for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+    struct xhci_isoch_state *other = &hc->isoch_streams[i];
+    if (other != state && other->stream.active && other->stream.dev == dev &&
+        other->endpoint_id > max_dci)
+      max_dci = other->endpoint_id;
+  }
+  sc[0] = (sc[0] & ~(0x1FU << 27)) | ((uint32_t)max_dci << 27);
+  icc[1] = 1U | (1U << state->endpoint_id);
+  uint32_t *ep = xhci_context(slot->input_context,
+                              state->endpoint_id + 1U, hc->context_64);
+  ep[0] = xhci_interval_value(USB_SPEED_FULL, interval) << 16;
+  ep[1] = (1U << 3) | ((uint32_t)max_packet << 16); /* CErr=0 for isoch */
+  uint64_t dequeue = state->ring_phys | state->cycle;
+  ep[2] = (uint32_t)dequeue;
+  ep[3] = (uint32_t)(dequeue >> 32);
+  ep[4] = max_packet | ((uint32_t)max_packet << 16);
+  if (!xhci_submit_command(
+          hc, slot->input_context_phys, 0,
+          XHCI_TRB_TYPE(XHCI_TRB_CONFIGURE_ENDPOINT) |
+              ((uint32_t)slot->id << 24),
+          NULL)) {
+    __atomic_store_n(&state->reserved, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
+    return NULL;
+  }
+  uint32_t *out_ep = xhci_context(slot->output_context, state->endpoint_id,
+                                  hc->context_64);
+  if ((out_ep[0] & 7U) != 1U) {
+    slot->isoch_quarantined_mask |= 1U << requested_dci;
+    state->quarantined = true;
+    __atomic_store_n(&state->reserved, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
+    return NULL;
+  }
+
+  state->stream.dev = dev;
+  state->stream.hcd_data = state;
+  state->stream.endpoint = endpoint;
+  __atomic_store_n(&state->stopping, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&state->disconnected, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&state->stream.active, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
+  return &state->stream;
+}
+
+static int xhci_isoch_submit(struct usb_hcd *hcd,
+                             struct usb_isoch_stream *stream,
+                             struct usb_isoch_packet *packet) {
+  struct xhci_controller *hc = hcd ? hcd->priv : NULL;
+  struct xhci_isoch_state *state = stream ? stream->hcd_data : NULL;
+  struct xhci_slot *slot = stream && stream->dev ? stream->dev->hcd_data : NULL;
+  uint32_t expected = 0;
+  hal_irq_state_t irq_flags = hal_irq_save();
+  if (!hc || !state || !packet ||
+      !__atomic_compare_exchange_n(&state->submitting, &expected, 1, false,
+                                  __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    hal_irq_restore(irq_flags);
+    return -1;
+  }
+  if (!__atomic_load_n(&stream->active, __ATOMIC_ACQUIRE) ||
+      __atomic_load_n(&state->stopping, __ATOMIC_ACQUIRE) || !slot ||
+      !slot->enabled || !stream->dev->connected ||
+      !packet->buffer || !packet->buffer_phys || !packet->length ||
+      packet->length > state->max_packet) {
+    __atomic_store_n(&state->submitting, 0, __ATOMIC_RELEASE);
+    hal_irq_restore(irq_flags);
+    return -1;
+  }
+  uint16_t index = state->enqueue;
+  if (__atomic_load_n(&state->packets[index], __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&state->submitting, 0, __ATOMIC_RELEASE);
+    hal_irq_restore(irq_flags);
+    return -1;
+  }
+  struct xhci_trb *trb = &state->ring[index];
+  trb->parameter = packet->buffer_phys;
+  trb->status = packet->length;
+  __atomic_store_n(&state->packets[index], packet, __ATOMIC_RELEASE);
+  /* Cycle is published last so the controller cannot observe an incomplete
+   * TRB while a prior doorbell is still advancing the ring. */
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  trb->control = XHCI_TRB_TYPE(XHCI_TRB_ISOCH) | XHCI_TRB_IOC |
+                 XHCI_TRB_SIA | state->cycle;
+  state->submitted++;
+  state->enqueue++;
+  if (state->enqueue == XHCI_ISOCH_RING_TRBS) {
+    state->ring[XHCI_ISOCH_RING_TRBS].control =
+        XHCI_TRB_TYPE(XHCI_TRB_LINK) | state->cycle | (1U << 1);
+    state->enqueue = 0;
+    state->cycle ^= 1U;
+  }
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  hc->doorbells[slot->id] = state->endpoint_id;
+  state->doorbells++;
+  __atomic_store_n(&state->submitting, 0, __ATOMIC_RELEASE);
+  hal_irq_restore(irq_flags);
+  return 0;
+}
+
+static void xhci_wait_event_dispatch(struct xhci_controller *hc) {
+  while (__atomic_load_n(&hc->event_dispatching, __ATOMIC_ACQUIRE))
+    io_wait();
+}
+
+static void xhci_isoch_finish_pending(struct xhci_isoch_state *state) {
+  for (uint32_t i = 0; i < XHCI_ISOCH_RING_TRBS; i++) {
+    struct usb_isoch_packet *packet =
+        __atomic_exchange_n(&state->packets[i], NULL, __ATOMIC_ACQ_REL);
+    if (!packet)
+      continue;
+    packet->actual_length = 0;
+    packet->completion_code = 0xFFU; /* cancelled by host */
+    __atomic_store_n(&packet->completed, true, __ATOMIC_RELEASE);
+    state->cancellations++;
+  }
+}
+
+static bool xhci_isoch_cancel(struct usb_hcd *hcd,
+                              struct usb_isoch_stream *stream) {
+  struct xhci_controller *hc = hcd ? hcd->priv : NULL;
+  struct xhci_isoch_state *state = stream ? stream->hcd_data : NULL;
+  struct xhci_slot *slot = stream && stream->dev ? stream->dev->hcd_data : NULL;
+  if (!stream)
+    return false;
+  if (!hc || !state)
+    return false;
+  if (!__atomic_load_n(&stream->active, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&state->disconnected, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&state->reserved, __ATOMIC_ACQUIRE)) {
+      stream->dev = NULL;
+      __atomic_store_n(&state->disconnected, false, __ATOMIC_RELEASE);
+      state->quarantined = false;
+      __atomic_store_n(&state->reserved, 0, __ATOMIC_RELEASE);
+    }
+    return true;
+  }
+  if (!slot)
+    return false;
+  uint32_t expected_transition = 0;
+  if (!__atomic_compare_exchange_n(&slot->isoch_transition,
+                                   &expected_transition, 1, false,
+                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+    return false;
+  __atomic_store_n(&state->stopping, true, __ATOMIC_RELEASE);
+  while (__atomic_load_n(&state->submitting, __ATOMIC_ACQUIRE))
+    io_wait();
+  bool endpoint_stopped = xhci_submit_command(
+      hc, 0, 0,
+      XHCI_TRB_TYPE(XHCI_TRB_STOP_ENDPOINT) |
+          ((uint32_t)state->endpoint_id << 16) |
+          ((uint32_t)slot->id << 24),
+      NULL);
+  bool teardown_safe = false;
+  if (endpoint_stopped) {
+    /* Disable the endpoint context so a later open can safely add it again. */
+    memset(slot->input_context, 0, 4096);
+    uint32_t *icc = xhci_context(slot->input_context, 0, hc->context_64);
+    uint32_t *sc = xhci_context(slot->input_context, 1, hc->context_64);
+    uint32_t *out_sc = xhci_context(slot->output_context, 0, hc->context_64);
+    memcpy(sc, out_sc, hc->context_64 ? 64U : 32U);
+    icc[0] = 1U << state->endpoint_id;
+    /* Preserve the slot context and recompute Context Entries after the drop. */
+    uint8_t remaining_dci = 1;
+    for (uint8_t dci = 2; dci <= 31; dci++) {
+      if (dci == state->endpoint_id)
+        continue;
+      uint32_t *other_ep = xhci_context(slot->output_context, dci,
+                                        hc->context_64);
+      if ((other_ep[0] & 7U) != 0U)
+        remaining_dci = dci;
+    }
+    sc[0] = (sc[0] & ~(0x1FU << 27)) | ((uint32_t)remaining_dci << 27);
+    icc[1] = 1U; /* Add Slot Context while dropping this endpoint context. */
+    if (xhci_submit_command(
+            hc, slot->input_context_phys, 0,
+            XHCI_TRB_TYPE(XHCI_TRB_CONFIGURE_ENDPOINT) |
+                ((uint32_t)slot->id << 24),
+            NULL)) {
+      teardown_safe = true;
+    } else {
+      /* Endpoint DMA is stopped, so buffers are safe, but this DCI cannot be
+       * re-added reliably until the slot is removed. Quarantine it. */
+      slot->isoch_quarantined_mask |= 1U << state->endpoint_id;
+      state->quarantined = true;
+      teardown_safe = true;
+    }
+  }
+  if (!endpoint_stopped) {
+    /* If STOP Endpoint failed, disabling the slot is the only safe way to
+     * revoke DMA ownership. This sacrifices the whole USB device. */
+    if (xhci_submit_command(
+            hc, 0, 0,
+            XHCI_TRB_TYPE(XHCI_TRB_DISABLE_SLOT) |
+                ((uint32_t)slot->id << 24),
+            NULL)) {
+      ((uint64_t *)hc->dcbaa)[slot->id] = 0;
+      slot->enabled = false;
+      teardown_safe = true;
+    }
+  }
+  /* STOP Endpoint completion ends DMA. Drain transfer events and wait for
+   * any event already copied by another drainer before returning buffers. */
+  xhci_drain_events(hc, 0);
+  xhci_wait_event_dispatch(hc);
+  if (teardown_safe) {
+    xhci_isoch_finish_pending(state);
+    __atomic_store_n(&state->stopping, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&stream->active, false, __ATOMIC_RELEASE);
+    stream->dev = NULL;
+    __atomic_store_n(&state->reserved, 0, __ATOMIC_RELEASE);
+    hcd->stats.cancellations++;
+    __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
+    return true;
+  } else {
+    __atomic_store_n(&state->stopping, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
+    klog_puts("[XHCI] Isochronous cancel failed; packet buffers remain owned\n");
+    return false;
+  }
+}
+
 static void xhci_irq(struct registers *regs) {
   for (int i = 0; i < controller_count; i++) {
     struct xhci_controller *hc = &controllers[i];
@@ -1359,6 +1763,15 @@ void xhci_msix_watchdog(void) {
     xhci_drain_events(hc, 0);
     if (hc->events_seen != before)
       xhci_service_ports(hc);
+    /* Port removal is initiated in IRQ context. If a stream transition was
+     * already in flight, the IRQ only marked it pending; retry here once the
+     * short state transition has released the per-slot gate. */
+    for (uint8_t slot_id = 1; slot_id <= hc->max_slots; slot_id++) {
+      struct xhci_slot *slot = &hc->slots[slot_id];
+      if (__atomic_load_n(&slot->removal_pending, __ATOMIC_ACQUIRE) &&
+          slot->device)
+        xhci_remove_device(&hc->hcd, slot->device);
+    }
     /* Poll unconditionally: a mouse whose endpoint is NAKing produces no
      * events at all, and the driver's silent-endpoint recovery needs a tick
      * even when nothing happened.  The poll only inspects cached flags. */
@@ -1534,6 +1947,9 @@ static bool xhci_probe(struct pci_device *pci) {
   hc->hcd.interrupt_completed = xhci_interrupt_completed;
   hc->hcd.interrupt_resubmit = xhci_interrupt_resubmit;
   hc->hcd.interrupt_cancel = xhci_interrupt_cancel;
+  hc->hcd.isoch_open = xhci_isoch_open;
+  hc->hcd.isoch_submit = xhci_isoch_submit;
+  hc->hcd.isoch_cancel = xhci_isoch_cancel;
   klog_puts("[XHCI] Command/event rings operational (v");
   klog_hex32(hc->version);
   if (hc->msix_enabled)

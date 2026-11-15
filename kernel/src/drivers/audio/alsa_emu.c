@@ -1,10 +1,12 @@
 #include "alsa_emu.h"
 #include "audio_dsp.h"
 #include "hda.h"
+#include "../../fs/sysfs.h"
 #include "../../console/klog.h"
 #include "../../fb/framebuffer.h"
 #include "../../fs/ramfs.h"
 #include "../../fs/vfs.h"
+#include "../../io/io.h"
 #include "../../include/arch/uaccess.h"
 #include "../../lib/string.h"
 #include "../../mm/heap.h"
@@ -109,6 +111,7 @@ struct snd_ctl_card_info {
     uint8_t driver[16];
     uint8_t name[32];
     uint8_t longname[80];
+    uint8_t reserved[16];
     uint8_t mixername[80];
     uint8_t components[128];
 };
@@ -337,35 +340,72 @@ struct snd_pcm_mmap_begin_area {
 // PCM DMA ring buffer - 512 KiB, allocated once at init
 #define ALSA_DMA_BUF_SIZE  (512 * 1024)
 #define ALSA_DMA_BUF_PAGES (ALSA_DMA_BUF_SIZE / 4096)
-static uint8_t  *alsa_dma_buf_virt = NULL;  // kernel-space virtual address
-static uint64_t  alsa_dma_buf_phys = 0;     // physical base
-static uint64_t  alsa_mmap_appl_offset = 0; // current write head in frames
+#define ALSA_MAX_CARDS 8
 
-// One-page buffers for the ALSA hw plugin's STATUS and CONTROL mmap areas
-static uint8_t  *alsa_status_page_virt = NULL;
-static uint64_t  alsa_status_page_phys = 0;
-static uint8_t  *alsa_control_page_virt = NULL;
-static uint64_t  alsa_control_page_phys = 0;
+struct alsa_card_state {
+    bool allocated;
+    bool online;
+    bool dynamic;
+    bool nodes_registered;
+    bool sysfs_registered;
+    bool backend_open;
+    bool retired;
+    bool detaching;
+    uint32_t node_refs;
+    volatile uint32_t active_users;
+    int index;
+    char id[16];
+    char name[32];
+    void *backend_ctx;
+    struct alsa_pcm_backend_ops backend_ops;
+    uint8_t *dma_buf_virt;
+    uint64_t dma_buf_phys;
+    uint64_t mmap_appl_offset;
+    uint8_t *status_page_virt;
+    uint64_t status_page_phys;
+    uint8_t *control_page_virt;
+    uint64_t control_page_phys;
+    uint32_t sample_rate;
+    uint8_t channels;
+    uint8_t bits;
+    int pcm_state;
+    uint64_t appl_ptr;
+    uint64_t hw_ptr;
+    uint64_t avail_min;
+    uint64_t start_threshold;
+    uint64_t buffer_frames;
+    bool access_mmap;
+    uint64_t mmap_consumed;
+    spinlock_t pump_lock;
+    vfs_node_t *control_node;
+    vfs_node_t *pcm_node;
+};
 
-// Internal ALSA state
-static uint32_t alsa_sample_rate = 48000;
-static uint8_t alsa_channels = 2;
-static uint8_t alsa_bits = 16;
-static int alsa_pcm_state = 0; // 0 = OPEN, 1 = SETUP, 2 = PREPARED, 3 = RUNNING, 6 = PAUSED
-static uint64_t alsa_appl_ptr = 0;
-static uint64_t alsa_hw_ptr = 0;
-static uint64_t alsa_avail_min = 1;
-static uint64_t alsa_start_threshold = 1;
-// Playback buffer the client negotiated in HW_PARAMS, in frames.  It bounds
-// both the driver queue and the avail figures reported back to alsa-lib.
-static uint64_t alsa_buffer_frames = 0;
-// mmap-transfer tracking.  In MMAP access mode the application (or one of
-// alsa-lib's converter chains) writes straight into alsa_dma_buf and publishes
-// the new write position in the shared control page; alsa_mmap_pump() copies
-// that data into the HDA ring.
-static bool alsa_access_mmap = false;
-static uint64_t alsa_mmap_consumed = 0;
-static spinlock_t alsa_pump_lock = SPINLOCK_INIT;
+static struct alsa_card_state alsa_hda_card;
+static struct alsa_card_state *alsa_cards[ALSA_MAX_CARDS];
+static spinlock_t alsa_cards_lock = SPINLOCK_INIT;
+static bool alsa_vfs_ready;
+
+/* Internal callback helpers use a local `card` selected from node->device. */
+#define alsa_dma_buf_virt       (card->dma_buf_virt)
+#define alsa_dma_buf_phys       (card->dma_buf_phys)
+#define alsa_mmap_appl_offset   (card->mmap_appl_offset)
+#define alsa_status_page_virt   (card->status_page_virt)
+#define alsa_status_page_phys   (card->status_page_phys)
+#define alsa_control_page_virt  (card->control_page_virt)
+#define alsa_control_page_phys  (card->control_page_phys)
+#define alsa_sample_rate        (card->sample_rate)
+#define alsa_channels           (card->channels)
+#define alsa_bits               (card->bits)
+#define alsa_pcm_state          (card->pcm_state)
+#define alsa_appl_ptr           (card->appl_ptr)
+#define alsa_hw_ptr             (card->hw_ptr)
+#define alsa_avail_min          (card->avail_min)
+#define alsa_start_threshold    (card->start_threshold)
+#define alsa_buffer_frames      (card->buffer_frames)
+#define alsa_access_mmap        (card->access_mmap)
+#define alsa_mmap_consumed      (card->mmap_consumed)
+#define alsa_pump_lock          (card->pump_lock)
 
 // alsa-lib passes 0/1 by value for some _IOW('A', …, int) PCM ioctls (e.g. PAUSE).
 static int alsa_ioctl_get_int(uint64_t arg, int *out) {
@@ -454,7 +494,10 @@ static void alsa_seed_default_mixer(void) {
     }
 }
 static int alsa_ctl_ioctl_internal(struct vfs_node *node, uint32_t request, uint64_t arg) {
-    (void)node;
+    struct alsa_card_state *card = node && node->device
+                                      ? node->device : &alsa_hda_card;
+    if (!card->online)
+        return -19;
     if (request == SNDRV_CTL_IOCTL_PVERSION) {
         int *ver = (int *)arg;
         if (!ver) return -14;
@@ -466,13 +509,24 @@ static int alsa_ctl_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         struct snd_ctl_card_info *info = (struct snd_ctl_card_info *)arg;
         if (!info) return -14;
         memset(info, 0, sizeof(*info));
-        info->card = 0;
-        strcpy((char *)info->id, "AvoryOS");
-        strcpy((char *)info->driver, "AvoryOS-Audio");
-        strcpy((char *)info->name, "AvoryOS Audio");
-        strcpy((char *)info->longname, "AvoryOS HD Audio Controller");
-        strcpy((char *)info->mixername, "AvoryOS Audio Mixer");
-        strcpy((char *)info->components, "HDA:00000000");
+        info->card = card->index;
+        strncpy((char *)info->id, card->dynamic ? card->id : "AvoryOS",
+                sizeof(info->id) - 1);
+        strncpy((char *)info->driver,
+                card->dynamic ? "AvoryOS-USB" : "AvoryOS-Audio",
+                sizeof(info->driver) - 1);
+        strncpy((char *)info->name,
+                card->dynamic ? card->name : "AvoryOS Audio",
+                sizeof(info->name) - 1);
+        strncpy((char *)info->longname,
+                card->dynamic ? "AvoryOS USB Audio Playback" : "AvoryOS HD Audio Controller",
+                sizeof(info->longname) - 1);
+        strncpy((char *)info->mixername,
+                card->dynamic ? card->name : "AvoryOS Audio Mixer",
+                sizeof(info->mixername) - 1);
+        strncpy((char *)info->components,
+                card->dynamic ? "USB-Audio:UAC1" : "HDA:00000000",
+                sizeof(info->components) - 1);
         return 0;
     }
 
@@ -663,9 +717,11 @@ static int alsa_ctl_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         info->device = 0;
         info->subdevice = 0;
         info->stream = 0;
-        info->card = 0;
-        strcpy((char *)info->id, "HDA PCM");
-        strcpy((char *)info->name, "HDA Intel PCM");
+        info->card = card->index;
+        strncpy((char *)info->id, card->dynamic ? "USB PCM" : "HDA PCM",
+                sizeof(info->id) - 1);
+        strncpy((char *)info->name, card->dynamic ? "USB Audio PCM" : "HDA Intel PCM",
+                sizeof(info->name) - 1);
         strcpy((char *)info->subname, "subdevice #0");
         info->subdevices_count = 1;
         info->subdevices_avail = 1;
@@ -729,7 +785,7 @@ static bool alsa_interval_exact(const struct snd_interval *it) {
     return it && !it->empty && it->min == it->max;
 }
 
-static uint32_t alsa_frame_bytes(void) {
+static uint32_t alsa_frame_bytes(struct alsa_card_state *card) {
     uint32_t frame_size = (alsa_bits / 8) * alsa_channels;
     return frame_size ? frame_size : 4;
 }
@@ -739,12 +795,40 @@ static uint32_t alsa_frame_bytes(void) {
 static uint32_t alsa_proc_cards_read(vfs_node_t *node, uint32_t offset,
                                     uint32_t size, uint8_t *buffer) {
     (void)node;
-    static const char no_cards[] = "--- no soundcards ---\n";
-    static const char hda_card[] =
-        " 0 [HDA            ]: HDA - AvoryOS HDA Audio\n"
-        "                      AvoryOS QEMU High Definition Audio\n";
-    const char *text = hda_is_present() ? hda_card : no_cards;
-    uint32_t length = (uint32_t)strlen(text);
+    static char text[512];
+    uint32_t length = 0;
+    spinlock_acquire(&alsa_cards_lock);
+    struct alsa_card_state *hda = alsa_cards[0];
+    if (hda && hda->online) {
+        static const char legacy_hda[] =
+            " 0 [HDA            ]: HDA - AvoryOS HDA Audio\n"
+            "                      AvoryOS QEMU High Definition Audio\n";
+        memcpy(text, legacy_hda, sizeof(legacy_hda) - 1);
+        length = sizeof(legacy_hda) - 1;
+    }
+    for (uint32_t i = 1; i < ALSA_MAX_CARDS; i++) {
+        struct alsa_card_state *card = alsa_cards[i];
+        if (!card || !card->online)
+            continue;
+        int n = snprintf(text + length, sizeof(text) - length,
+                         "%2u [%-16.16s]: %s - %s\n"
+                         "                      AvoryOS %s playback\n",
+                         i, card->name,
+                         card->dynamic ? "USB" : "HDA",
+                         card->name,
+                         card->dynamic ? "USB audio" : "HDA");
+        if (n < 0 || (uint32_t)n >= sizeof(text) - length) {
+            length = sizeof(text) - 1;
+            break;
+        }
+        length += (uint32_t)n;
+    }
+    if (!length) {
+        static const char no_cards[] = "--- no soundcards ---\n";
+        memcpy(text, no_cards, sizeof(no_cards));
+        length = sizeof(no_cards) - 1;
+    }
+    spinlock_release(&alsa_cards_lock);
     if (offset >= length)
         return 0;
     if (size > length - offset)
@@ -782,8 +866,10 @@ static void alsa_register_proc_cards(void) {
 // play it.  This matters: ALSA clients such as VLC keep the decoder's native
 // format whenever the mask claims support, so advertising FLOAT made AAC
 // streams (float) reach the DAC as garbage while S16 MP3 stayed fine.
-static uint32_t alsa_supported_formats(void) {
+static uint32_t alsa_supported_formats(struct alsa_card_state *card) {
     uint32_t formats = (1U << 2); // S16_LE is always renderable
+    if (card && card->dynamic)
+        return formats;
     uint32_t caps = 0;
     if (hda_get_pcm_caps(&caps) && (((caps >> 16) & 0x1F) & (1U << 4))) {
         formats |= (1U << 10); // S32_LE (codec advertises 32-bit)
@@ -794,19 +880,21 @@ static uint32_t alsa_supported_formats(void) {
 // Publish the hardware pointer into the mmap status page.  alsa-lib reads
 // hw_ptr straight from that page to pace writes, so it must advance while the
 // stream plays, not only when an ioctl happens to be issued.
-static void alsa_publish_hw_ptr(void) {
-    uint32_t frame_size = alsa_frame_bytes();
+static void alsa_publish_hw_ptr(struct alsa_card_state *card) {
+    uint32_t frame_size = alsa_frame_bytes(card);
     uint64_t delay_frames = 0;
-    if (hda_is_present()) {
+    if (card->dynamic && card->backend_ops.pointer) {
+        alsa_hw_ptr = card->backend_ops.pointer(card->backend_ctx);
+    } else if (hda_is_present()) {
         delay_frames = hda_get_delay_bytes() / frame_size;
     }
-    if (alsa_access_mmap) {
+    if (!card->dynamic && alsa_access_mmap) {
         // MMAP mode: frames written by the client may still sit in alsa_dma_buf
         // waiting for the pump, so hw_ptr is derived from what has actually
         // been handed to (and played by) the DMA, not from appl_ptr.
         alsa_hw_ptr = (alsa_mmap_consumed > delay_frames)
                           ? (alsa_mmap_consumed - delay_frames) : 0;
-    } else {
+    } else if (!card->dynamic) {
         if (delay_frames > alsa_appl_ptr) {
             delay_frames = alsa_appl_ptr;
         }
@@ -825,8 +913,8 @@ static void alsa_publish_hw_ptr(void) {
 }
 
 // Frames that may still be queued without exceeding the negotiated buffer.
-static uint64_t alsa_avail_frames(void) {
-    uint32_t frame_size = alsa_frame_bytes();
+static uint64_t alsa_avail_frames(struct alsa_card_state *card) {
+    uint32_t frame_size = alsa_frame_bytes(card);
     uint64_t buffer_frames = alsa_buffer_frames;
     if (buffer_frames == 0) {
         buffer_frames = ALSA_DMA_BUF_SIZE / frame_size;
@@ -842,11 +930,37 @@ static uint64_t alsa_avail_frames(void) {
 
 /* PipeWire deliberately sets LONG_MAX and explicitly starts after priming.
  * A write into PREPARED must not start the hardware behind its back. */
-static void alsa_start_if_ready(void) {
+static void alsa_start_if_ready(struct alsa_card_state *card) {
     if (alsa_pcm_state == 2 && alsa_appl_ptr >= alsa_start_threshold) {
-        if (hda_is_present()) hda_start_playback();
+        if (card->dynamic) {
+            if (card->backend_ops.start)
+                card->backend_ops.start(card->backend_ctx);
+        } else if (hda_is_present()) {
+            hda_start_playback();
+        }
         alsa_pcm_state = 3;
     }
+}
+
+static uint32_t alsa_queue_pcm(struct alsa_card_state *card,
+                               const uint8_t *samples, uint32_t bytes) {
+    uint32_t frame_bytes = alsa_frame_bytes(card);
+    if (card->dynamic) {
+        if (!card->backend_ops.write || !card->backend_open || !frame_bytes)
+            return 0;
+        uint32_t frames = bytes / frame_bytes;
+        uint32_t accepted = card->backend_ops.write(card->backend_ctx,
+                                                     samples, frames);
+        if (accepted > frames)
+            accepted = frames;
+        return accepted * frame_bytes;
+    }
+    if (hda_is_present())
+        return hda_write_pcm((uint8_t *)samples, bytes, alsa_sample_rate,
+                             alsa_channels, alsa_bits);
+    vfs_node_t *dsp = fb_lookup_device("dsp");
+    return dsp && dsp->write ? dsp->write(dsp, 0, bytes, (uint8_t *)samples)
+                             : 0;
 }
 
 // Move newly written mmap frames from alsa_dma_buf into the HDA ring.  In
@@ -854,8 +968,9 @@ static void alsa_start_if_ready(void) {
 // the shared write pointer itself; this runs from the HDA interrupt (tick
 // callback) and from the query ioctls.  hda_queue_pcm() handles its own IRQ
 // masking and never blocks.
-static void alsa_mmap_pump_locked(void) {
-    if (!alsa_access_mmap || !hda_is_present() || !alsa_dma_buf_virt ||
+static void alsa_mmap_pump_locked(struct alsa_card_state *card) {
+    if (!alsa_access_mmap || (!card->dynamic && !hda_is_present()) ||
+        (card->dynamic && !card->online) || !alsa_dma_buf_virt ||
         !alsa_buffer_frames) {
         return;
     }
@@ -870,11 +985,11 @@ static void alsa_mmap_pump_locked(void) {
     }
 
     if (appl <= alsa_mmap_consumed) {
-        alsa_publish_hw_ptr();
+        alsa_publish_hw_ptr(card);
         return;
     }
 
-    uint32_t frame_size = alsa_frame_bytes();
+    uint32_t frame_size = alsa_frame_bytes(card);
     uint64_t pending = appl - alsa_mmap_consumed;
     if (pending > alsa_buffer_frames) {
         pending = alsa_buffer_frames;
@@ -886,9 +1001,9 @@ static void alsa_mmap_pump_locked(void) {
         if (pending < cont) {
             cont = pending;
         }
-        uint32_t accepted = hda_queue_pcm(alsa_dma_buf_virt + off * frame_size,
-                                          (uint32_t)(cont * frame_size),
-                                          alsa_sample_rate, alsa_channels, alsa_bits);
+        uint32_t accepted = alsa_queue_pcm(card,
+                                           alsa_dma_buf_virt + off * frame_size,
+                                           (uint32_t)(cont * frame_size));
         if (accepted < frame_size) {
             break;
         }
@@ -897,21 +1012,54 @@ static void alsa_mmap_pump_locked(void) {
         pending -= done;
     }
 
-    alsa_start_if_ready();
-    alsa_publish_hw_ptr();
+    alsa_start_if_ready(card);
+    alsa_publish_hw_ptr(card);
 }
 
-static void alsa_mmap_pump(void) {
+static void alsa_mmap_pump(struct alsa_card_state *card) {
     /* A query on another CPU must not submit the same mmap frames as the
      * completion callback. IRQs stay masked until consumed is published. */
     spinlock_acquire(&alsa_pump_lock);
-    alsa_mmap_pump_locked();
+    alsa_mmap_pump_locked(card);
     spinlock_release(&alsa_pump_lock);
 }
 
-static void alsa_tick(void) {
-    alsa_mmap_pump();
-    alsa_publish_hw_ptr();
+static void alsa_wake_waiters(struct alsa_card_state *card) {
+    extern void wait_queue_wake_all(void *wq);
+    if (card && card->dynamic) {
+        if (card->pcm_node && card->pcm_node->wait_queue)
+            wait_queue_wake_all(card->pcm_node->wait_queue);
+    } else if (hda_is_present()) {
+        wait_queue_wake_all(hda_get_wait_queue());
+    }
+}
+
+void alsa_emu_pcm_tick(void) {
+    struct alsa_card_state *card = &alsa_hda_card;
+    if (!card->online)
+        return;
+    alsa_mmap_pump(card);
+    alsa_publish_hw_ptr(card);
+}
+
+void alsa_emu_pcm_notify(int card_index) {
+    if (card_index < 0 || card_index >= ALSA_MAX_CARDS)
+        return;
+    spinlock_acquire(&alsa_cards_lock);
+    struct alsa_card_state *card = alsa_cards[card_index];
+    if (!card || !card->online) {
+        spinlock_release(&alsa_cards_lock);
+        return;
+    }
+    __atomic_add_fetch(&card->active_users, 1, __ATOMIC_ACQ_REL);
+    spinlock_release(&alsa_cards_lock);
+    alsa_mmap_pump(card);
+    alsa_publish_hw_ptr(card);
+    if (card->pcm_node && card->pcm_node->wait_queue) {
+        extern void wait_queue_wake_all(void *wq);
+        wait_queue_wake_all(card->pcm_node->wait_queue);
+    }
+    __atomic_sub_fetch(&card->active_users, 1, __ATOMIC_ACQ_REL);
 }
 
 /* HW_REFINE intersects constraints; it must never pick a default period or
@@ -922,7 +1070,8 @@ static uint32_t alsa_div_ceil(uint64_t n, uint32_t d) {
     return (uint32_t)((n + d - 1) / d);
 }
 
-static int alsa_reconcile_hw_params(struct snd_pcm_hw_params *p, bool commit) {
+static int alsa_reconcile_hw_params(struct alsa_card_state *card,
+                                    struct snd_pcm_hw_params *p, bool commit) {
     struct snd_interval *it = p->intervals;
     uint32_t formats = p->masks[1].bits[0];
     uint32_t min_bits = (formats & (1U << 2)) ? 16 : 32;
@@ -964,7 +1113,7 @@ static int alsa_reconcile_hw_params(struct snd_pcm_hw_params *p, bool commit) {
     NARROW(1, frame_bytes * 8, frame_bytes * 8);
     uint32_t period = it[5].min + !!it[5].openmin;
     NARROW(5, period, period);
-    if (alsa_reconcile_hw_params(p, false)) return -22;
+    if (alsa_reconcile_hw_params(card, p, false)) return -22;
     uint32_t periods;
     if (alsa_interval_exact(&it[9])) {
         if (it[9].min % period) return -22;
@@ -980,7 +1129,7 @@ static int alsa_reconcile_hw_params(struct snd_pcm_hw_params *p, bool commit) {
     NARROW(10, buffer * frame_bytes, buffer * frame_bytes);
     /* Time fields may round up or down by a microsecond; retain the exact
      * endpoint selected by alsa-lib instead of replacing its geometry. */
-    if (alsa_reconcile_hw_params(p, false)) return -22;
+    if (alsa_reconcile_hw_params(card, p, false)) return -22;
     if (!alsa_interval_exact(&it[4])) alsa_set_interval(&it[4], it[4].min);
     if (!alsa_interval_exact(&it[8])) alsa_set_interval(&it[8], it[8].min);
 #undef NARROW
@@ -989,7 +1138,10 @@ static int alsa_reconcile_hw_params(struct snd_pcm_hw_params *p, bool commit) {
 
 // ALSA PCM Node Callbacks
 static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint64_t arg) {
-    (void)node;
+    struct alsa_card_state *card = node && node->device
+                                      ? node->device : &alsa_hda_card;
+    if (!card->online)
+        return -19;
 
     if (request == SNDRV_PCM_IOCTL_PVERSION) {
         int *ver = (int *)arg;
@@ -1005,9 +1157,11 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         info->device = 0;
         info->subdevice = 0;
         info->stream = 0; // Playback
-        info->card = 0;
-        strcpy((char *)info->id, "HDA PCM");
-        strcpy((char *)info->name, "HDA Intel PCM");
+        info->card = card->index;
+        strncpy((char *)info->id, card->dynamic ? "USB PCM" : "HDA PCM",
+                sizeof(info->id) - 1);
+        strncpy((char *)info->name, card->dynamic ? "USB Audio PCM" : "HDA Intel PCM",
+                sizeof(info->name) - 1);
         strcpy((char *)info->subname, "subdevice #0");
         info->subdevices_count = 1;
         info->subdevices_avail = 1;
@@ -1027,7 +1181,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         // ALSA access enum: MMAP_INTERLEAVED=0, MMAP_NONINTERLEAVED=1, MMAP_COMPLEX=2,
         //                   RW_INTERLEAVED=3, RW_NONINTERLEAVED=4
         uint32_t supported_access = (1U << 0) | (1U << 3);
-        uint32_t supported_format = alsa_supported_formats();
+        uint32_t supported_format = alsa_supported_formats(card);
         uint32_t supported_subformat = (1U << 0);
 
         uint32_t supported[3] = {supported_access, supported_format, supported_subformat};
@@ -1051,19 +1205,21 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         REFINE_INTERVAL(6, 64, 262144);     // PERIOD_BYTES
         REFINE_INTERVAL(7, 2, 1024);        // PERIODS
         REFINE_INTERVAL(8, 1000, 10000000); // BUFFER_TIME
-        REFINE_INTERVAL(9, 32, 131072);     // BUFFER_SIZE
-        REFINE_INTERVAL(10, 128, 524288);   // BUFFER_BYTES
+        REFINE_INTERVAL(9, 32, card->dynamic ? 32768 : 131072); // BUFFER_SIZE
+        REFINE_INTERVAL(10, 128, card->dynamic ? 131072 : 524288); // BUFFER_BYTES
         REFINE_INTERVAL(11, 0, 0);          // TICK_TIME
         #undef REFINE_INTERVAL
 
         params->info = 0x00000001 | 0x00000002 | 0x00000100 |
-                       0x00010000 | 0x00040000 | 0x00080000;
+                       0x00010000;
+        if (!card->dynamic)
+            params->info |= 0x00040000 | 0x00080000;
         params->msbits = 16;
         params->fifo_size = 0;
         params->cmask = params->rmask ? params->rmask : 0xFFFFFFFF;
         params->rmask = 0;
 
-        if (alsa_reconcile_hw_params(params, false)) return -22;
+        if (alsa_reconcile_hw_params(card, params, false)) return -22;
 
         if (alsa_interval_exact(&params->intervals[3])) {
             params->rate_num = params->intervals[3].min;
@@ -1100,7 +1256,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         if (params->masks[1].bits[0]) {
             chosen_format = 1U << (__builtin_ctz(params->masks[1].bits[0]));
         }
-        if (!(chosen_format & alsa_supported_formats())) {
+        if (!(chosen_format & alsa_supported_formats(card))) {
             return -22; // -EINVAL: format would not render correctly
         }
         params->masks[1].bits[0] = chosen_format;
@@ -1110,7 +1266,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         params->masks[2].bits[0] = (1U << 0);
         for (int b = 1; b < 8; b++) params->masks[2].bits[b] = 0;
 
-        if (alsa_reconcile_hw_params(params, true)) return -22;
+        if (alsa_reconcile_hw_params(card, params, true)) return -22;
 
         alsa_bits = alsa_format_to_bits(params->masks[1].bits[0]);
         alsa_channels = (uint8_t)params->intervals[2].min;
@@ -1126,22 +1282,37 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         params->rmask = 0;
         params->cmask = 0;
         params->info = 0x00000001 | 0x00000002 | 0x00000100 |
-                       0x00010000 | 0x00040000 | 0x00080000;
+                       0x00010000;
+        if (!card->dynamic)
+            params->info |= 0x00040000 | 0x00080000;
         params->flags &= ~0x4U;
         params->msbits = alsa_bits;
         params->rate_num = alsa_sample_rate;
         params->rate_den = 1;
         params->fifo_size = 0;
 
-        if (hda_is_present()) {
+        if (!card->dynamic && hda_is_present()) {
             hda_set_format(alsa_sample_rate, alsa_channels, alsa_bits);
             // Ensure ample queue headroom so video decode jitter doesn't starve the audio engine
-            uint32_t qlimit = (uint32_t)(alsa_buffer_frames * alsa_frame_bytes());
+            uint32_t qlimit = (uint32_t)(alsa_buffer_frames * alsa_frame_bytes(card));
             if (qlimit < 65536) {
                 qlimit = 65536;
             }
             hda_set_queue_limit(qlimit);
             hda_reset_stream();
+        }
+        if (card->dynamic) {
+            if (card->backend_open && card->backend_ops.stop &&
+                !card->backend_ops.stop(card->backend_ctx))
+                return -16;
+            if (card->backend_open && card->backend_ops.close)
+                card->backend_ops.close(card->backend_ctx);
+            card->backend_open = false;
+            if (!card->backend_ops.open ||
+                card->backend_ops.open(card->backend_ctx, alsa_sample_rate,
+                                       alsa_channels, alsa_bits) != 0)
+                return -22;
+            card->backend_open = true;
         }
         alsa_pcm_state = 1; // SNDRV_PCM_STATE_SETUP
         alsa_appl_ptr = 0;
@@ -1159,8 +1330,16 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
     }
 
     if (request == SNDRV_PCM_IOCTL_HW_FREE) {
+        if (card->dynamic && card->backend_open) {
+            if (card->backend_ops.stop &&
+                !card->backend_ops.stop(card->backend_ctx))
+                return -16;
+            if (card->backend_ops.close)
+                card->backend_ops.close(card->backend_ctx);
+            card->backend_open = false;
+        }
         alsa_buffer_frames = 0;
-        if (hda_is_present()) {
+        if (!card->dynamic && hda_is_present()) {
             hda_set_queue_limit(0); // back to the default cap
         }
         return 0;
@@ -1170,7 +1349,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         (request & 0xFFFF) == 0x4113) {
         struct snd_pcm_sw_params *sw = (struct snd_pcm_sw_params *)arg;
         if (!sw) return -14;
-        uint64_t buf_frames = alsa_buffer_frames ? alsa_buffer_frames : (ALSA_DMA_BUF_SIZE / alsa_frame_bytes());
+        uint64_t buf_frames = alsa_buffer_frames ? alsa_buffer_frames : (ALSA_DMA_BUF_SIZE / alsa_frame_bytes(card));
         uint64_t boundary = buf_frames;
         while (boundary * 2 <= 0x7FFFFFFFFFFFFFFFULL - buf_frames) {
             boundary *= 2;
@@ -1202,8 +1381,8 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
     if (request == SNDRV_PCM_IOCTL_DELAY) {
         int64_t *delay = (int64_t *)arg;
         if (!delay) return -14;
-        alsa_mmap_pump();
-        alsa_publish_hw_ptr();
+        alsa_mmap_pump(card);
+        alsa_publish_hw_ptr(card);
         *delay = (int64_t)(alsa_appl_ptr - alsa_hw_ptr);
         return 0;
     }
@@ -1232,8 +1411,8 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
             }
         }
 
-        alsa_mmap_pump();
-        alsa_publish_hw_ptr();
+        alsa_mmap_pump(card);
+        alsa_publish_hw_ptr(card);
         sync->s.status.state = alsa_pcm_state;
         sync->s.status.hw_ptr = alsa_hw_ptr;
         extern uint64_t lapic_timer_get_ms(void);
@@ -1244,7 +1423,18 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
     }
 
     if (request == SNDRV_PCM_IOCTL_PREPARE) {
-        if (hda_is_present()) {
+        if (card->dynamic) {
+            if (card->backend_open && card->backend_ops.stop &&
+                !card->backend_ops.stop(card->backend_ctx))
+                return -16;
+            if (card->backend_open && card->backend_ops.close)
+                card->backend_ops.close(card->backend_ctx);
+            card->backend_open = false;
+            if (card->backend_ops.open &&
+                card->backend_ops.open(card->backend_ctx, alsa_sample_rate,
+                                       alsa_channels, alsa_bits) == 0)
+                card->backend_open = true;
+        } else if (hda_is_present()) {
             hda_reset_stream();
             hda_set_autostart(false);
         }
@@ -1253,33 +1443,34 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         alsa_hw_ptr = 0;
         alsa_mmap_consumed = 0;
         alsa_mmap_appl_offset = 0;
-        alsa_publish_hw_ptr();
+        alsa_publish_hw_ptr(card);
         if (alsa_control_page_virt) {
             ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = 0;
         }
-        if (hda_is_present()) {
-            extern void wait_queue_wake_all(void *wq);
-            wait_queue_wake_all(hda_get_wait_queue());
-        }
+        alsa_wake_waiters(card);
         return 0;
     }
 
     if (request == SNDRV_PCM_IOCTL_START) {
         alsa_pcm_state = 3; // SNDRV_PCM_STATE_RUNNING
-        alsa_mmap_pump();
-        if (hda_is_present()) {
+        alsa_mmap_pump(card);
+        if (card->dynamic) {
+            if (card->backend_ops.start &&
+                !card->backend_ops.start(card->backend_ctx))
+                return -5;
+        } else if (hda_is_present()) {
             hda_start_playback();
         }
-        alsa_publish_hw_ptr();
-        if (hda_is_present()) {
-            extern void wait_queue_wake_all(void *wq);
-            wait_queue_wake_all(hda_get_wait_queue());
-        }
+        alsa_publish_hw_ptr(card);
+        alsa_wake_waiters(card);
         return 0;
     }
 
     if (request == SNDRV_PCM_IOCTL_DROP) {
-        if (hda_is_present()) {
+        if (card->dynamic && card->backend_open && card->backend_ops.stop &&
+            !card->backend_ops.stop(card->backend_ctx))
+            return -16;
+        if (!card->dynamic && hda_is_present()) {
             hda_reset_stream();
         }
         alsa_pcm_state = 1; // SNDRV_PCM_STATE_SETUP
@@ -1287,19 +1478,19 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         alsa_hw_ptr = 0;
         alsa_mmap_consumed = 0;
         alsa_mmap_appl_offset = 0;
-        alsa_publish_hw_ptr();
+        alsa_publish_hw_ptr(card);
         if (alsa_control_page_virt) {
             ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = 0;
         }
-        if (hda_is_present()) {
-            extern void wait_queue_wake_all(void *wq);
-            wait_queue_wake_all(hda_get_wait_queue());
-        }
+        alsa_wake_waiters(card);
         return 0;
     }
 
     if (request == SNDRV_PCM_IOCTL_RESET) {
-        if (hda_is_present()) {
+        if (card->dynamic && card->backend_open && card->backend_ops.stop &&
+            !card->backend_ops.stop(card->backend_ctx))
+            return -16;
+        if (!card->dynamic && hda_is_present()) {
             hda_reset_stream();
         }
         alsa_appl_ptr = 0;
@@ -1309,20 +1500,24 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         if (alsa_pcm_state != 2 /* PREPARED */ && alsa_pcm_state != 3 /* RUNNING */) {
             alsa_pcm_state = 1; // SNDRV_PCM_STATE_SETUP
         }
-        alsa_publish_hw_ptr();
+        alsa_publish_hw_ptr(card);
         if (alsa_control_page_virt) {
             ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = 0;
         }
-        if (hda_is_present()) {
-            extern void wait_queue_wake_all(void *wq);
-            wait_queue_wake_all(hda_get_wait_queue());
-        }
+        alsa_wake_waiters(card);
         return 0;
     }
 
     if (request == SNDRV_PCM_IOCTL_DRAIN) {
+        if (card->dynamic)
+            alsa_mmap_pump(card);
         if (alsa_pcm_state == 2 && alsa_appl_ptr) {
-            if (hda_is_present()) hda_start_playback();
+            if (card->dynamic) {
+                if (card->backend_ops.start)
+                    card->backend_ops.start(card->backend_ctx);
+            } else if (hda_is_present()) {
+                hda_start_playback();
+            }
             alsa_pcm_state = 3;
         }
         if (alsa_pcm_state == 3 /* RUNNING */) {
@@ -1330,13 +1525,34 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
             if (alsa_status_page_virt) {
                 ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
             }
+            if (card->dynamic && card->backend_ops.pointer) {
+                extern uint64_t lapic_timer_get_ms(void);
+                if (card->backend_ops.drain &&
+                    !card->backend_ops.drain(card->backend_ctx))
+                    return -5;
+                uint64_t deadline = lapic_timer_get_ms() + 10000;
+                while (card->backend_ops.pointer(card->backend_ctx) < alsa_appl_ptr &&
+                       lapic_timer_get_ms() < deadline) {
+                    alsa_mmap_pump(card);
+                    io_wait();
+                }
+                alsa_publish_hw_ptr(card);
+                if (alsa_hw_ptr < alsa_appl_ptr)
+                    return -5;
+                if (card->backend_ops.stop &&
+                    !card->backend_ops.stop(card->backend_ctx))
+                    return -16;
+                alsa_pcm_state = 1; // drained; backend remains configured
+                if (alsa_status_page_virt)
+                    ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
+            }
         }
         return 0;
     }
 
     if (request == SNDRV_PCM_IOCTL_HWSYNC) {
-        alsa_mmap_pump();
-        alsa_publish_hw_ptr();
+        alsa_mmap_pump(card);
+        alsa_publish_hw_ptr(card);
         return 0;
     }
 
@@ -1368,28 +1584,18 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         uint32_t total_bytes = (uint32_t)(xferi->frames * frame_size);
 
         uint32_t written = 0;
-        if (hda_is_present()) {
-            written = hda_write_pcm(xferi->buf, total_bytes, alsa_sample_rate, alsa_channels, alsa_bits);
-        } else {
-            vfs_node_t *dsp = fb_lookup_device("dsp");
-            if (dsp && dsp->write) {
-                written = dsp->write(dsp, 0, total_bytes, (uint8_t *)xferi->buf);
-            }
-        }
+        written = alsa_queue_pcm(card, xferi->buf, total_bytes);
 
         uint64_t frames_written = (written / frame_size);
         xferi->result = frames_written;
         alsa_appl_ptr += frames_written;
-        alsa_start_if_ready();
+        alsa_start_if_ready(card);
         if (alsa_control_page_virt) {
             ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = alsa_appl_ptr;
         }
         // Let alsa-lib see how much of what it just wrote is still queued.
-        alsa_publish_hw_ptr();
-        if (hda_is_present()) {
-            extern void wait_queue_wake_all(void *wq);
-            wait_queue_wake_all(hda_get_wait_queue());
-        }
+        alsa_publish_hw_ptr(card);
+        alsa_wake_waiters(card);
         return 0;
     }
 
@@ -1432,14 +1638,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         // Flush mmap buffer to hardware
         if (alsa_dma_buf_virt) {
             uint8_t *src = alsa_dma_buf_virt + byte_off;
-            if (hda_is_present()) {
-                hda_write_pcm(src, byte_len, alsa_sample_rate, alsa_channels, alsa_bits);
-            } else {
-                vfs_node_t *dsp = fb_lookup_device("dsp");
-                if (dsp && dsp->write) {
-                    dsp->write(dsp, 0, byte_len, src);
-                }
-            }
+            alsa_queue_pcm(card, src, byte_len);
         }
         alsa_mmap_appl_offset += frames;
         alsa_appl_ptr += frames;
@@ -1448,7 +1647,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         if (alsa_control_page_virt) {
             ((struct snd_pcm_mmap_control *)alsa_control_page_virt)->appl_ptr = alsa_appl_ptr;
         }
-        alsa_publish_hw_ptr();
+        alsa_publish_hw_ptr(card);
         return 0;
     }
 
@@ -1461,8 +1660,8 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         struct snd_pcm_status *st = (struct snd_pcm_status *)arg;
         if (!st) return -14;
         memset(st, 0, sizeof(*st));
-        alsa_mmap_pump();
-        alsa_publish_hw_ptr();
+        alsa_mmap_pump(card);
+        alsa_publish_hw_ptr(card);
         st->state = alsa_pcm_state;
         extern uint64_t lapic_timer_get_ms(void);
         uint64_t ms = lapic_timer_get_ms();
@@ -1471,9 +1670,9 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         st->appl_ptr  = alsa_appl_ptr;
         st->hw_ptr    = alsa_hw_ptr;
         st->delay     = (int64_t)(alsa_appl_ptr - alsa_hw_ptr);
-        st->avail     = alsa_avail_frames();
+        st->avail     = alsa_avail_frames(card);
         st->avail_max = alsa_buffer_frames ? alsa_buffer_frames
-                                           : ALSA_DMA_BUF_SIZE / alsa_frame_bytes();
+                                           : ALSA_DMA_BUF_SIZE / alsa_frame_bytes(card);
         return 0;
     }
 
@@ -1486,10 +1685,7 @@ static int alsa_pcm_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         if (alsa_status_page_virt) {
             ((struct snd_pcm_mmap_status *)alsa_status_page_virt)->state = alsa_pcm_state;
         }
-        if (hda_is_present()) {
-            extern void wait_queue_wake_all(void *wq);
-            wait_queue_wake_all(hda_get_wait_queue());
-        }
+        alsa_wake_waiters(card);
         return 0;
     }
 
@@ -1513,28 +1709,24 @@ static int alsa_pcm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg)
 
 static uint32_t alsa_pcm_write(struct vfs_node *node, uint32_t offset,
                               uint32_t size, uint8_t *buffer) {
-    (void)node;
+    struct alsa_card_state *card = node && node->device
+                                      ? node->device : &alsa_hda_card;
     (void)offset;
-    uint32_t written;
-    if (hda_is_present()) {
-        written = hda_write_pcm(buffer, size, alsa_sample_rate, alsa_channels, alsa_bits);
-    } else {
-        vfs_node_t *dsp = fb_lookup_device("dsp");
-        if (dsp && dsp->write) {
-            written = dsp->write(dsp, offset, size, buffer);
-        } else {
-            written = size;
-        }
-    }
-    alsa_appl_ptr += written / alsa_frame_bytes();
-    alsa_start_if_ready();
-    alsa_publish_hw_ptr();
+    if (!card->online)
+        return 0;
+    uint32_t written = alsa_queue_pcm(card, buffer, size);
+    alsa_appl_ptr += written / alsa_frame_bytes(card);
+    alsa_start_if_ready(card);
+    alsa_publish_hw_ptr(card);
     return written;
 }
 
 static int alsa_pcm_poll(struct vfs_node *node, int events) {
-    (void)node;
-    if (!hda_is_present()) {
+    struct alsa_card_state *card = node && node->device
+                                      ? node->device : &alsa_hda_card;
+    if (!card->online)
+        return POLLHUP | POLLERR;
+    if (!card->dynamic && !hda_is_present()) {
         return (events & (POLLOUT | POLLWRNORM));
     }
 
@@ -1546,8 +1738,8 @@ static int alsa_pcm_poll(struct vfs_node *node, int events) {
         return (events & (POLLOUT | POLLWRNORM));
     }
 
-    alsa_mmap_pump();
-    alsa_publish_hw_ptr();
+    alsa_mmap_pump(card);
+    alsa_publish_hw_ptr(card);
 
     if (alsa_pcm_state == 4 /* SNDRV_PCM_STATE_XRUN */) {
         return (events & (POLLOUT | POLLWRNORM));
@@ -1561,7 +1753,7 @@ static int alsa_pcm_poll(struct vfs_node *node, int events) {
         }
     }
     int revents = 0;
-    if ((events & (POLLOUT | POLLWRNORM)) && alsa_avail_frames() >= avail_min) {
+    if ((events & (POLLOUT | POLLWRNORM)) && alsa_avail_frames(card) >= avail_min) {
         revents |= (events & (POLLOUT | POLLWRNORM));
     }
     return revents;
@@ -1673,8 +1865,11 @@ static int alsa_timer_poll(struct vfs_node *node, int events) {
 static uint64_t alsa_pcm_mmap(struct vfs_node *node, uint64_t addr,
                                uint64_t length, uint64_t prot,
                                uint64_t flags, uint64_t offset) {
-    (void)node;
+    struct alsa_card_state *card = node && node->device
+                                      ? node->device : &alsa_hda_card;
     (void)flags;
+    if (!card->online)
+        return (uint64_t)-1;
 
     uint64_t *pml4 = vmm_get_active_pml4();
     if (!pml4) {
@@ -1702,7 +1897,7 @@ static uint64_t alsa_pcm_mmap(struct vfs_node *node, uint64_t addr,
         phys_base = alsa_status_page_phys;
         map_size  = 4096;
         // Reflect current state into the status page
-        alsa_publish_hw_ptr();
+        alsa_publish_hw_ptr(card);
     } else {
         // DATA area: the audio ring buffer
         if (!alsa_dma_buf_virt || !alsa_dma_buf_phys) { return (uint64_t)-1; }
@@ -1713,9 +1908,264 @@ static uint64_t alsa_pcm_mmap(struct vfs_node *node, uint64_t addr,
 
     uint64_t pages = (map_size + 4095) / 4096;
     for (uint64_t i = 0; i < pages; i++) {
+        /* Shared ALSA mappings can outlive the file descriptor and are
+         * released one PTE at a time by VMA teardown when this flag is set.
+         * Give each installed PTE its own PMM reference. HDA retains its
+         * historical device-owned mapping convention (flag clear). */
+        if (node && node->mmap_shared_pmm_refs)
+            pmm_incref((void *)(phys_base + i * 4096));
         vmm_map_page(pml4, addr + i * 4096, phys_base + i * 4096, page_flags);
     }
     return addr;
+}
+
+static bool alsa_card_alloc_buffers(struct alsa_card_state *card) {
+    if (!card->dma_buf_virt) {
+        void *phys = pmm_alloc_pages(ALSA_DMA_BUF_PAGES);
+        if (!phys)
+            return false;
+        card->dma_buf_phys = (uint64_t)phys;
+        card->dma_buf_virt = (uint8_t *)(card->dma_buf_phys +
+                                         pmm_get_hhdm_offset());
+        memset(card->dma_buf_virt, 0, ALSA_DMA_BUF_SIZE);
+    }
+    if (!card->status_page_virt) {
+        void *phys = pmm_alloc_page();
+        if (!phys)
+            return false;
+        card->status_page_phys = (uint64_t)phys;
+        card->status_page_virt = (uint8_t *)(card->status_page_phys +
+                                             pmm_get_hhdm_offset());
+        memset(card->status_page_virt, 0, 4096);
+        ((struct snd_pcm_mmap_status *)card->status_page_virt)->state = 0;
+    }
+    if (!card->control_page_virt) {
+        void *phys = pmm_alloc_page();
+        if (!phys)
+            return false;
+        card->control_page_phys = (uint64_t)phys;
+        card->control_page_virt = (uint8_t *)(card->control_page_phys +
+                                              pmm_get_hhdm_offset());
+        memset(card->control_page_virt, 0, 4096);
+        ((struct snd_pcm_mmap_control *)card->control_page_virt)->avail_min = 1;
+    }
+    return true;
+}
+
+static void alsa_card_node_destroy(struct vfs_node *node) {
+    struct alsa_card_state *card = node ? node->device : NULL;
+    if (!card || !card->dynamic)
+        return;
+    bool release = false;
+    spinlock_acquire(&alsa_cards_lock);
+    if (card->node_refs)
+        card->node_refs--;
+    if (card->retired && card->node_refs == 0) {
+        if (card->index >= 0 && card->index < ALSA_MAX_CARDS &&
+            alsa_cards[card->index] == card)
+            alsa_cards[card->index] = NULL;
+        release = true;
+    }
+    spinlock_release(&alsa_cards_lock);
+    if (!release)
+        return;
+    if (card->dma_buf_phys)
+        pmm_free_pages((void *)card->dma_buf_phys, ALSA_DMA_BUF_PAGES);
+    if (card->status_page_phys)
+        pmm_free_page((void *)card->status_page_phys);
+    if (card->control_page_phys)
+        pmm_free_page((void *)card->control_page_phys);
+    kfree(card);
+}
+
+static bool alsa_card_register_nodes(struct alsa_card_state *card) {
+    if (!card || !card->dynamic || card->nodes_registered || !alsa_vfs_ready)
+        return card && (!card->dynamic || card->nodes_registered);
+    if (!alsa_card_alloc_buffers(card))
+        return false;
+    char ctl_name[32], pcm_name[32], ctl_path[48], pcm_path[48];
+    snprintf(ctl_name, sizeof(ctl_name), "controlC%u", (unsigned)card->index);
+    snprintf(pcm_name, sizeof(pcm_name), "pcmC%uD0p", (unsigned)card->index);
+    snprintf(ctl_path, sizeof(ctl_path), "snd/%s", ctl_name);
+    snprintf(pcm_path, sizeof(pcm_path), "snd/%s", pcm_name);
+    vfs_node_t *snd_dir = vfs_resolve_path("/dev/snd");
+    if (!snd_dir)
+        return false;
+    vfs_node_t *ctl_node = kmalloc(sizeof(*ctl_node));
+    vfs_node_t *pcm_node = kmalloc(sizeof(*pcm_node));
+    if (!ctl_node || !pcm_node) {
+        if (ctl_node) kfree(ctl_node);
+        if (pcm_node) kfree(pcm_node);
+        vfs_close(snd_dir);
+        return false;
+    }
+    vfs_node_init(ctl_node);
+    strncpy(ctl_node->name, ctl_name, sizeof(ctl_node->name) - 1);
+    ctl_node->flags = FS_CHARDEV;
+    ctl_node->mask = 0666;
+    ctl_node->ioctl = alsa_ctl_ioctl;
+    ctl_node->inode = (116U << 8) | (uint32_t)(card->index * 32);
+    ctl_node->device = card;
+    ctl_node->destroy = alsa_card_node_destroy;
+
+    vfs_node_init(pcm_node);
+    strncpy(pcm_node->name, pcm_name, sizeof(pcm_node->name) - 1);
+    pcm_node->flags = FS_CHARDEV;
+    pcm_node->mask = 0666;
+    pcm_node->length = ALSA_DMA_BUF_SIZE;
+    pcm_node->write = alsa_pcm_write;
+    pcm_node->ioctl = alsa_pcm_ioctl;
+    pcm_node->poll = alsa_pcm_poll;
+    pcm_node->mmap = alsa_pcm_mmap;
+    pcm_node->mmap_shared_only = true;
+    pcm_node->mmap_shared_pmm_refs = true;
+    pcm_node->inode = (116U << 8) | (uint32_t)(card->index * 32 + 24);
+    pcm_node->device = card;
+    pcm_node->destroy = alsa_card_node_destroy;
+    if (card->backend_ops.wait_queue)
+        pcm_node->wait_queue = card->backend_ops.wait_queue(card->backend_ctx);
+
+    card->control_node = ctl_node;
+    card->pcm_node = pcm_node;
+    card->node_refs = 2;
+    fb_register_device_node(ctl_path, ctl_node);
+    fb_register_device_node(pcm_path, pcm_node);
+    ramfs_mount_node(snd_dir, ctl_node);
+    ramfs_mount_node(snd_dir, pcm_node);
+    vfs_close(snd_dir);
+    card->nodes_registered = true;
+    if (!sysfs_sound_card_register((uint32_t)card->index, card->id, true)) {
+        vfs_node_t *old_ctl = card->control_node;
+        vfs_node_t *old_pcm = card->pcm_node;
+        card->control_node = NULL;
+        card->pcm_node = NULL;
+        card->nodes_registered = false;
+        fb_unregister_device_node(ctl_path, old_ctl);
+        fb_unregister_device_node(pcm_path, old_pcm);
+        return false;
+    }
+    card->sysfs_registered = true;
+    return true;
+}
+
+int alsa_emu_register_pcm_card(const char *name, void *ctx,
+                               const struct alsa_pcm_backend_ops *ops) {
+    if (!name || !ops || !ops->open || !ops->write || !ops->stop)
+        return -1;
+    struct alsa_card_state *card = kmalloc(sizeof(*card));
+    if (!card)
+        return -1;
+    memset(card, 0, sizeof(*card));
+    card->dynamic = true;
+    card->online = true;
+    card->allocated = true;
+    card->sample_rate = 48000;
+    card->channels = 2;
+    card->bits = 16;
+    card->pcm_state = 0;
+    card->avail_min = 1;
+    card->start_threshold = 1;
+    card->pump_lock = (spinlock_t)SPINLOCK_INIT;
+    card->backend_ctx = ctx;
+    card->backend_ops = *ops;
+    strncpy(card->name, name, sizeof(card->name) - 1);
+    spinlock_acquire(&alsa_cards_lock);
+    int index = -1;
+    for (int i = 1; i < ALSA_MAX_CARDS; i++) {
+        if (!alsa_cards[i]) {
+            index = i;
+            card->index = i;
+            alsa_cards[i] = card;
+            break;
+        }
+    }
+    spinlock_release(&alsa_cards_lock);
+    if (index >= 0)
+        snprintf(card->id, sizeof(card->id), "USB%d", index);
+    if (index < 0 || !alsa_card_alloc_buffers(card)) {
+        if (index >= 0) {
+            spinlock_acquire(&alsa_cards_lock);
+            if (alsa_cards[index] == card)
+                alsa_cards[index] = NULL;
+            spinlock_release(&alsa_cards_lock);
+        }
+        if (card->dma_buf_phys)
+            pmm_free_pages((void *)card->dma_buf_phys, ALSA_DMA_BUF_PAGES);
+        if (card->status_page_phys)
+            pmm_free_page((void *)card->status_page_phys);
+        if (card->control_page_phys)
+            pmm_free_page((void *)card->control_page_phys);
+        kfree(card);
+        return -1;
+    }
+    if (alsa_vfs_ready && !alsa_card_register_nodes(card)) {
+        (void)alsa_emu_unregister_pcm_card(index);
+        return -1;
+    }
+    return index;
+}
+
+bool alsa_emu_unregister_pcm_card(int card_index) {
+    if (card_index <= 0 || card_index >= ALSA_MAX_CARDS)
+        return false;
+    spinlock_acquire(&alsa_cards_lock);
+    struct alsa_card_state *card = alsa_cards[card_index];
+    if (!card || !card->dynamic || !card->online) {
+        spinlock_release(&alsa_cards_lock);
+        return false;
+    }
+    card->online = false; /* Blocks new asynchronous PCM notifications. */
+    spinlock_release(&alsa_cards_lock);
+    if (card->backend_open && card->backend_ops.stop &&
+        !card->backend_ops.stop(card->backend_ctx)) {
+        spinlock_acquire(&alsa_cards_lock);
+        card->online = true;
+        spinlock_release(&alsa_cards_lock);
+        return false;
+    }
+    while (__atomic_load_n(&card->active_users, __ATOMIC_ACQUIRE))
+        io_wait();
+    if (card->backend_open && card->backend_ops.close)
+        card->backend_ops.close(card->backend_ctx);
+    card->backend_open = false;
+    card->retired = true;
+    card->backend_ctx = NULL;
+    if (card->pcm_node && card->pcm_node->wait_queue) {
+        extern void wait_queue_wake_all(void *wq);
+        wait_queue_wake_all(card->pcm_node->wait_queue);
+    }
+    if (card->nodes_registered) {
+        char ctl_name[32], pcm_name[32], ctl_path[48], pcm_path[48];
+        snprintf(ctl_name, sizeof(ctl_name), "controlC%u", (unsigned)card_index);
+        snprintf(pcm_name, sizeof(pcm_name), "pcmC%uD0p", (unsigned)card_index);
+        snprintf(ctl_path, sizeof(ctl_path), "snd/%s", ctl_name);
+        snprintf(pcm_path, sizeof(pcm_path), "snd/%s", pcm_name);
+        vfs_node_t *ctl_node = card->control_node;
+        vfs_node_t *pcm_node = card->pcm_node;
+        card->control_node = NULL;
+        card->pcm_node = NULL;
+        card->nodes_registered = false;
+        if (card->sysfs_registered)
+            sysfs_sound_card_unregister((uint32_t)card_index);
+        card->sysfs_registered = false;
+        fb_unregister_device_node(ctl_path, ctl_node);
+        fb_unregister_device_node(pcm_path, pcm_node);
+    } else {
+        if (card->node_refs == 0) {
+            spinlock_acquire(&alsa_cards_lock);
+            if (alsa_cards[card_index] == card)
+                alsa_cards[card_index] = NULL;
+            spinlock_release(&alsa_cards_lock);
+            if (card->dma_buf_phys)
+                pmm_free_pages((void *)card->dma_buf_phys, ALSA_DMA_BUF_PAGES);
+            if (card->status_page_phys)
+                pmm_free_page((void *)card->status_page_phys);
+            if (card->control_page_phys)
+                pmm_free_page((void *)card->control_page_phys);
+            kfree(card);
+        }
+    }
+    return true;
 }
 
 void alsa_emu_init(void) {
@@ -1723,9 +2173,25 @@ void alsa_emu_init(void) {
 }
 
 void alsa_emu_register_vfs(void) {
+    struct alsa_card_state *card = &alsa_hda_card;
+    if (!card->allocated) {
+        memset(card, 0, sizeof(*card));
+        card->allocated = true;
+        card->online = true;
+        card->index = 0;
+        strncpy(card->id, "HDA", sizeof(card->id) - 1);
+        strncpy(card->name, "AvoryOS HDA Audio", sizeof(card->name) - 1);
+        card->sample_rate = 48000;
+        card->channels = 2;
+        card->bits = 16;
+        card->avail_min = 1;
+        card->start_threshold = 1;
+        spinlock_init(&card->pump_lock);
+        alsa_cards[0] = card;
+    }
     // Let the HDA interrupt drive the mmap pump and status updates so both
     // MMAP-mode and standard RW-mode clients keep pace with the DMA ring.
-    hda_set_tick_callback(alsa_tick);
+    hda_set_tick_callback(alsa_emu_pcm_tick);
 
     // Standard mixer controls (Master/PCM/Capture): PipeWire and alsamixer
     // probe these by name at startup; without them every ELEM_INFO/READ
@@ -1743,43 +2209,10 @@ void alsa_emu_register_vfs(void) {
         snd_dir = vfs_resolve_path("/dev/snd");
     }
 
-    // Allocate the PCM DMA ring buffer (contiguous physical pages)
-    if (!alsa_dma_buf_virt) {
-        void *phys = pmm_alloc_pages(ALSA_DMA_BUF_PAGES);
-        if (phys) {
-            alsa_dma_buf_phys = (uint64_t)phys;
-            // Map into kernel space via HHDM
-            alsa_dma_buf_virt = (uint8_t *)(alsa_dma_buf_phys + pmm_get_hhdm_offset());
-            // Zero it out
-            memset(alsa_dma_buf_virt, 0, ALSA_DMA_BUF_SIZE);
-        }
-    }
-
-    // Allocate the STATUS page (read-only mmap at offset 0x80000000)
-    if (!alsa_status_page_virt) {
-        void *phys = pmm_alloc_page();
-        if (phys) {
-            alsa_status_page_phys = (uint64_t)phys;
-            alsa_status_page_virt = (uint8_t *)(alsa_status_page_phys + pmm_get_hhdm_offset());
-            memset(alsa_status_page_virt, 0, 4096);
-            // Pre-fill state = PREPARED (2)
-            struct snd_pcm_mmap_status *st = (struct snd_pcm_mmap_status *)alsa_status_page_virt;
-            st->state = 2;
-        }
-    }
-
-    // Allocate the CONTROL page (rw mmap at offset 0x81000000)
-    if (!alsa_control_page_virt) {
-        void *phys = pmm_alloc_page();
-        if (phys) {
-            alsa_control_page_phys = (uint64_t)phys;
-            alsa_control_page_virt = (uint8_t *)(alsa_control_page_phys + pmm_get_hhdm_offset());
-            memset(alsa_control_page_virt, 0, 4096);
-            // avail_min = 1 frame by default
-            struct snd_pcm_mmap_control *ctrl = (struct snd_pcm_mmap_control *)alsa_control_page_virt;
-            ctrl->avail_min = 1;
-        }
-    }
+    (void)alsa_card_alloc_buffers(card);
+    if (card->status_page_virt)
+        ((struct snd_pcm_mmap_status *)card->status_page_virt)->state = 2;
+    alsa_vfs_ready = snd_dir != NULL;
 
     // 1. Register /dev/snd/controlC0
     vfs_node_t *ctl_node = kmalloc(sizeof(vfs_node_t));
@@ -1791,6 +2224,7 @@ void alsa_emu_register_vfs(void) {
         ctl_node->length = 0;
         ctl_node->ioctl = alsa_ctl_ioctl;
         ctl_node->inode = (116 << 8) | 0; // major 116, minor 0
+        ctl_node->device = card;
         fb_register_device_node("snd/controlC0", ctl_node);
         fb_register_device_node("controlC0", ctl_node);
         if (snd_dir) {
@@ -1810,7 +2244,10 @@ void alsa_emu_register_vfs(void) {
         pcm_node->ioctl = alsa_pcm_ioctl;
         pcm_node->poll  = alsa_pcm_poll;
         pcm_node->mmap  = alsa_pcm_mmap;
+        pcm_node->mmap_shared_only = true;
+        pcm_node->mmap_shared_pmm_refs = false;
         pcm_node->inode = (116 << 8) | 24; // major 116, minor 24
+        pcm_node->device = card;
         if (hda_is_present()) {
             pcm_node->wait_queue = hda_get_wait_queue();
         }
@@ -1855,4 +2292,17 @@ void alsa_emu_register_vfs(void) {
             ramfs_mount_node(snd_dir, seq_node);
         }
     }
+
+    if (alsa_vfs_ready) {
+        for (uint32_t i = 1; i < ALSA_MAX_CARDS; i++) {
+            struct alsa_card_state *dynamic = alsa_cards[i];
+            if (dynamic && dynamic->online &&
+                !alsa_card_register_nodes(dynamic))
+                (void)alsa_emu_unregister_pcm_card((int)i);
+        }
+    }
+    if (snd_dir)
+        vfs_close(snd_dir);
+    if (dev_dir)
+        vfs_close(dev_dir);
 }

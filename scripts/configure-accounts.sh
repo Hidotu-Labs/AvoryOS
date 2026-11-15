@@ -384,30 +384,61 @@ fi
 
 # 5b. Start a session audio graph when neither rcS nor systemd provides one.
 if [ "$AUDIO_GRAPH" = session ]; then
+    PIPEWIRE_LOG="$XDG_RUNTIME_DIR/pipewire.log"
+    if ! (: >>"$PIPEWIRE_LOG") 2>/dev/null; then
+        rm -f "$PIPEWIRE_LOG" 2>/dev/null || true
+        if ! (: >>"$PIPEWIRE_LOG") 2>/dev/null; then
+            PIPEWIRE_LOG=/dev/null
+        fi
+    fi
     session_pipewire_started=0
-    if command -v pipewire >/dev/null 2>&1 && [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
-        XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup pipewire >>"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
-        session_pipewire_started=1
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
-            sleep 0.5
-        done
+    if command -v pipewire >/dev/null 2>&1; then
+        pw_running=0
+        if command -v pgrep >/dev/null 2>&1; then
+            pgrep -u "$USER_ID" -x pipewire >/dev/null 2>&1 && pw_running=1
+        elif [ -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
+            pw_running=1
+        fi
+        if [ "$pw_running" = 0 ]; then
+            rm -f "$XDG_RUNTIME_DIR/pipewire-0" "$XDG_RUNTIME_DIR/pipewire-0.lock" 2>/dev/null || true
+            XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup pipewire >>"$PIPEWIRE_LOG" 2>&1 &
+            session_pipewire_started=1
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+                [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
+                sleep 0.1
+            done
+        fi
     fi
     if [ -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
         if command -v wireplumber >/dev/null 2>&1; then
-            if command -v pidof >/dev/null 2>&1; then
+            if command -v pgrep >/dev/null 2>&1; then
+                if [ "$session_pipewire_started" = 1 ] || ! pgrep -u "$USER_ID" -x wireplumber >/dev/null 2>&1; then
+                    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup wireplumber >>"$PIPEWIRE_LOG" 2>&1 &
+                fi
+            elif command -v pidof >/dev/null 2>&1; then
                 # Background only the daemon. `pidof ... || command &` would
                 # background the entire list in a temporary shell; that shell
                 # can exit after this wrapper execs Plasma and remain unreaped.
                 if [ "$session_pipewire_started" = 1 ] || ! pidof wireplumber >/dev/null 2>&1; then
-                    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup wireplumber >>"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
+                    XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup wireplumber >>"$PIPEWIRE_LOG" 2>&1 &
                 fi
             else
-                XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup wireplumber >>"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
+                XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup wireplumber >>"$PIPEWIRE_LOG" 2>&1 &
             fi
         fi
-        if command -v pipewire-pulse >/dev/null 2>&1 && [ ! -S "$XDG_RUNTIME_DIR/pulse/native" ]; then
-            nohup pipewire-pulse >>"$XDG_RUNTIME_DIR/pipewire.log" 2>&1 &
+        if command -v pipewire-pulse >/dev/null 2>&1; then
+            mkdir -p "$XDG_RUNTIME_DIR/pulse" 2>/dev/null || true
+            chmod 0700 "$XDG_RUNTIME_DIR/pulse" 2>/dev/null || true
+            pwp_running=0
+            if command -v pgrep >/dev/null 2>&1; then
+                pgrep -u "$USER_ID" -x pipewire-pulse >/dev/null 2>&1 && pwp_running=1
+            elif [ -S "$XDG_RUNTIME_DIR/pulse/native" ]; then
+                pwp_running=1
+            fi
+            if [ "$pwp_running" = 0 ]; then
+                rm -f "$XDG_RUNTIME_DIR/pulse/native" "$XDG_RUNTIME_DIR/pulse/pid" 2>/dev/null || true
+                nohup pipewire-pulse >>"$PIPEWIRE_LOG" 2>&1 &
+            fi
         fi
     fi
 fi

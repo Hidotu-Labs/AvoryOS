@@ -51,6 +51,13 @@ static vfs_node_t *gpu_status_nodes[VIRTIO_GPU_MAX_SCANOUTS];
 static vfs_node_t *gpu_enabled_nodes[VIRTIO_GPU_MAX_SCANOUTS];
 static vfs_node_t *gpu_modes_nodes[VIRTIO_GPU_MAX_SCANOUTS];
 static vfs_node_t *gpu_dpms_nodes[VIRTIO_GPU_MAX_SCANOUTS];
+static vfs_node_t *sound_class_root;
+static vfs_node_t *sound_virtual_root;
+static vfs_node_t *sound_class_devices_root;
+static vfs_node_t *sysfs_dev_char_root;
+
+static vfs_node_t *sysfs_mkfile(vfs_node_t *parent, const char *name,
+                                const char *content);
 
 // Helpers
 
@@ -304,6 +311,174 @@ void sysfs_enable_uevent(vfs_node_t *node, vfs_node_t *parent) {
   node->ptr = parent;
   node->mask = 0644;
   node->write = sysfs_uevent_write;
+}
+
+static void sysfs_sound_emit(vfs_node_t *device_dir, const char *action) {
+  if (!device_dir || !action)
+    return;
+  vfs_node_t *uevent = vfs_finddir(device_dir, "uevent");
+  if (uevent) {
+    sysfs_uevent_write(uevent, 0, (uint32_t)strlen(action),
+                       (uint8_t *)action);
+    vfs_close(uevent);
+  }
+}
+
+static bool sysfs_sound_publish_minor(vfs_node_t *card_dir, uint32_t card,
+                                      const char *node_name,
+                                      uint32_t minor, const char *devname,
+                                      bool pcm) {
+  if (!card_dir || !node_name || !devname || !sound_class_root ||
+      !sound_class_devices_root || !sysfs_dev_char_root)
+    return false;
+
+  char value[192];
+  char target[192];
+  vfs_node_t *device = sysfs_mkdir(card_dir, node_name);
+  if (!device)
+    return false;
+
+  snprintf(value, sizeof(value), "116:%u\n", minor);
+  if (!sysfs_mkfile(device, "dev", value))
+    goto fail;
+  snprintf(value, sizeof(value),
+           "MAJOR=116\nMINOR=%u\nDEVNAME=%s\nSUBSYSTEM=sound\n", minor,
+           devname);
+  if (!sysfs_mkfile(device, "uevent", value))
+    goto fail;
+  if (pcm && !sysfs_mkfile(device, "pcm_class", "generic\n"))
+    goto fail;
+  sysfs_symlink(device, "subsystem", "../../../../../class/sound");
+
+  snprintf(target, sizeof(target),
+           "../../devices/virtual/sound/card%u/%s", card, node_name);
+  sysfs_symlink(sound_class_root, node_name, target);
+  snprintf(target, sizeof(target),
+           "../../../devices/virtual/sound/card%u/%s", card, node_name);
+  sysfs_symlink(sound_class_devices_root, node_name, target);
+  snprintf(target, sizeof(target),
+           "../../devices/virtual/sound/card%u/%s", card, node_name);
+  snprintf(value, sizeof(value), "116:%u", minor);
+  sysfs_symlink(sysfs_dev_char_root, value, target);
+  return true;
+
+fail:
+  asc_sysfs_remove(card_dir, node_name);
+  return false;
+}
+
+bool sysfs_sound_card_register(uint32_t card, const char *id,
+                               bool playback_pcm) {
+  if (!sound_class_root || !sound_virtual_root || !id || !*id)
+    return false;
+
+  char card_name[32];
+  char control_name[32];
+  char pcm_name[32];
+  char devname[48];
+  char value[128];
+  snprintf(card_name, sizeof(card_name), "card%u", card);
+  snprintf(control_name, sizeof(control_name), "controlC%u", card);
+  snprintf(pcm_name, sizeof(pcm_name), "pcmC%uD0p", card);
+
+  vfs_node_t *existing = vfs_finddir(sound_virtual_root, card_name);
+  if (existing) {
+    vfs_close(existing);
+    return false;
+  }
+
+  vfs_node_t *card_dir = sysfs_mkdir(sound_virtual_root, card_name);
+  if (!card_dir)
+    return false;
+  snprintf(value, sizeof(value), "%u\n", card);
+  if (!sysfs_mkfile(card_dir, "number", value))
+    goto fail;
+  snprintf(value, sizeof(value), "%.120s\n", id);
+  if (!sysfs_mkfile(card_dir, "id", value) ||
+      !sysfs_mkfile(card_dir, "uevent",
+                    "SUBSYSTEM=sound\nSOUND_INITIALIZED=1\n"))
+    goto fail;
+  sysfs_symlink(card_dir, "subsystem", "../../../../class/sound");
+
+  snprintf(devname, sizeof(devname), "snd/controlC%u", card);
+  if (!sysfs_sound_publish_minor(card_dir, card, control_name, card * 32,
+                                 devname, false))
+    goto fail;
+  if (playback_pcm) {
+    snprintf(devname, sizeof(devname), "snd/pcmC%uD0p", card);
+    if (!sysfs_sound_publish_minor(card_dir, card, pcm_name, card * 32 + 24,
+                                   devname, true))
+      goto fail;
+  }
+
+  snprintf(value, sizeof(value), "../../devices/virtual/sound/%s", card_name);
+  sysfs_symlink(sound_class_root, card_name, value);
+  snprintf(value, sizeof(value), "../../../devices/virtual/sound/%s", card_name);
+  if (sound_class_devices_root)
+    sysfs_symlink(sound_class_devices_root, card_name, value);
+
+  sysfs_sound_emit(card_dir, "add");
+  if (playback_pcm) {
+    vfs_node_t *pcm = vfs_finddir(card_dir, pcm_name);
+    sysfs_sound_emit(pcm, "add");
+    if (pcm)
+      vfs_close(pcm);
+  }
+  vfs_node_t *control = vfs_finddir(card_dir, control_name);
+  sysfs_sound_emit(control, "add");
+  if (control)
+    vfs_close(control);
+  return true;
+
+fail:
+  asc_sysfs_remove(sound_virtual_root, card_name);
+  return false;
+}
+
+void sysfs_sound_card_unregister(uint32_t card) {
+  if (!sound_class_root || !sound_virtual_root)
+    return;
+
+  char card_name[32];
+  char control_name[32];
+  char pcm_name[32];
+  char minor_name[32];
+  snprintf(card_name, sizeof(card_name), "card%u", card);
+  snprintf(control_name, sizeof(control_name), "controlC%u", card);
+  snprintf(pcm_name, sizeof(pcm_name), "pcmC%uD0p", card);
+  vfs_node_t *card_dir = vfs_finddir(sound_virtual_root, card_name);
+  if (!card_dir)
+    return;
+
+  vfs_node_t *pcm = vfs_finddir(card_dir, pcm_name);
+  if (pcm) {
+    sysfs_sound_emit(pcm, "remove");
+    vfs_close(pcm);
+  }
+  vfs_node_t *control = vfs_finddir(card_dir, control_name);
+  if (control) {
+    sysfs_sound_emit(control, "remove");
+    vfs_close(control);
+  }
+  sysfs_sound_emit(card_dir, "remove");
+  vfs_close(card_dir);
+
+  snprintf(minor_name, sizeof(minor_name), "116:%u", card * 32);
+  if (sysfs_dev_char_root)
+    asc_sysfs_remove(sysfs_dev_char_root, minor_name);
+  if (sound_class_devices_root) {
+    asc_sysfs_remove(sound_class_devices_root, control_name);
+    asc_sysfs_remove(sound_class_devices_root, pcm_name);
+    asc_sysfs_remove(sound_class_devices_root, card_name);
+  }
+  asc_sysfs_remove(sound_class_root, control_name);
+  asc_sysfs_remove(sound_class_root, pcm_name);
+  asc_sysfs_remove(sound_class_root, card_name);
+  asc_sysfs_remove(sound_virtual_root, card_name);
+
+  snprintf(minor_name, sizeof(minor_name), "116:%u", card * 32 + 24);
+  if (sysfs_dev_char_root)
+    asc_sysfs_remove(sysfs_dev_char_root, minor_name);
 }
 
 // Create a read-only file under parent with the given content.
@@ -1093,10 +1268,10 @@ void sysfs_init(void) {
 
   // ALSA cards are parent devices; only control/PCM children have devnums.
   // udev's sound rules write ../uevent on controlC0 to initialize its card.
-  vfs_node_t *sound_class = sysfs_mkdir(class_dir, "sound");
-  vfs_node_t *sound_virtual = sysfs_mkdir(virtual_dir, "sound");
-  vfs_node_t *sound_card = sysfs_mkdir(sound_virtual, "card0");
-  if (sound_class && sound_card) {
+  sound_class_root = sysfs_mkdir(class_dir, "sound");
+  sound_virtual_root = sysfs_mkdir(virtual_dir, "sound");
+  vfs_node_t *sound_card = sysfs_mkdir(sound_virtual_root, "card0");
+  if (sound_class_root && sound_card) {
     sysfs_mkfile(sound_card, "number", "0\n");
     sysfs_mkfile(sound_card, "id", "HDA\n");
     /* PipeWire's ALSA monitor ignores cards until SOUND_INITIALIZED is
@@ -1115,13 +1290,13 @@ void sysfs_init(void) {
     sysfs_mkfile(pcm, "uevent", "MAJOR=116\nMINOR=24\nDEVNAME=snd/pcmC0D0p\nSUBSYSTEM=sound\n");
     sysfs_mkfile(pcm, "pcm_class", "generic\n");
     sysfs_symlink(pcm, "subsystem", "../../../../../class/sound");
-    sysfs_symlink(sound_class, "card0", "../../devices/virtual/sound/card0");
-    sysfs_symlink(sound_class, "controlC0", "../../devices/virtual/sound/card0/controlC0");
-    sysfs_symlink(sound_class, "pcmC0D0p", "../../devices/virtual/sound/card0/pcmC0D0p");
-    vfs_node_t *devices = sysfs_mkdir(sound_class, "devices");
-    sysfs_symlink(devices, "card0", "../../../devices/virtual/sound/card0");
-    sysfs_symlink(devices, "controlC0", "../../../devices/virtual/sound/card0/controlC0");
-    sysfs_symlink(devices, "pcmC0D0p", "../../../devices/virtual/sound/card0/pcmC0D0p");
+    sysfs_symlink(sound_class_root, "card0", "../../devices/virtual/sound/card0");
+    sysfs_symlink(sound_class_root, "controlC0", "../../devices/virtual/sound/card0/controlC0");
+    sysfs_symlink(sound_class_root, "pcmC0D0p", "../../devices/virtual/sound/card0/pcmC0D0p");
+    sound_class_devices_root = sysfs_mkdir(sound_class_root, "devices");
+    sysfs_symlink(sound_class_devices_root, "card0", "../../../devices/virtual/sound/card0");
+    sysfs_symlink(sound_class_devices_root, "controlC0", "../../../devices/virtual/sound/card0/controlC0");
+    sysfs_symlink(sound_class_devices_root, "pcmC0D0p", "../../../devices/virtual/sound/card0/pcmC0D0p");
   }
 
   // /sys/class/tty/tty0/active — elogind manager_connect_console() opens it
@@ -1164,6 +1339,7 @@ void sysfs_init(void) {
     }
   }
   vfs_node_t *char_dir = sysfs_mkdir(dev_dir, "char");
+  sysfs_dev_char_root = char_dir;
   {
     char dev_target[160];
     snprintf(dev_target, sizeof(dev_target), "../..%s", sysfs_gpu_devpath);

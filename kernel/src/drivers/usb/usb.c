@@ -7,6 +7,7 @@
 #include "uhci.h"
 #include "usb_kbd.h"
 #include "usb_mouse.h"
+#include "usb_audio.h"
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -25,6 +26,9 @@ void usb_init(void) {
   if (usb_initialized)
     return;
   usb_initialized = true;
+#ifdef USB_AUDIO_SELFTEST
+  usb_audio_selftest();
+#endif
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " USB: Subsystem initialized.\n");
   klogf("[USB] core build %s %s\n", __DATE__, __TIME__);
   for (int i = 0; i < MAX_USB_DEVICES; i++)
@@ -192,6 +196,45 @@ void usb_interrupt_cancel(struct usb_interrupt_pipe *pipe) {
   pipe->dev->hcd->stats.cancellations++;
 }
 
+struct usb_isoch_stream *usb_isoch_open(struct usb_device *dev,
+                                        uint8_t endpoint,
+                                        uint16_t max_packet,
+                                        uint8_t interval) {
+  if (!dev || !dev->connected || !dev->hcd || !dev->hcd->isoch_open)
+    return NULL;
+  return dev->hcd->isoch_open(dev->hcd, dev, endpoint, max_packet, interval);
+}
+
+int usb_isoch_submit(struct usb_isoch_stream *stream,
+                     struct usb_isoch_packet *packet) {
+  if (!stream ||
+      !__atomic_load_n(&stream->active, __ATOMIC_ACQUIRE) || !stream->dev ||
+      !packet ||
+      !stream->dev->hcd || !stream->dev->hcd->isoch_submit ||
+      !packet->buffer || !packet->buffer_phys || !packet->length)
+    return -1;
+  packet->actual_length = 0;
+  packet->completion_code = 0;
+  __atomic_store_n(&packet->completed, false, __ATOMIC_RELEASE);
+  return stream->dev->hcd->isoch_submit(stream->dev->hcd, stream, packet);
+}
+
+bool usb_isoch_completed(struct usb_isoch_packet *packet) {
+  return packet && __atomic_load_n(&packet->completed, __ATOMIC_ACQUIRE);
+}
+
+bool usb_isoch_cancel(struct usb_isoch_stream *stream) {
+  if (!stream)
+    return false;
+  if (!stream->dev)
+    return true;
+  if (!stream->dev->hcd)
+    return false;
+  if (stream->dev->hcd->isoch_cancel)
+    return stream->dev->hcd->isoch_cancel(stream->dev->hcd, stream);
+  return false;
+}
+
 void usb_device_discovered(struct usb_hcd *hcd, uint8_t port,
                            enum usb_speed speed) {  klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " USB: New device detected on port ");
   klog_uint64(port + 1);
@@ -326,6 +369,10 @@ void usb_enumerate_device(struct usb_device *dev) {
 
   bool keyboard = usb_kbd_probe(dev);
   bool mouse = usb_mouse_probe(dev);
+  struct usb_audio_playback_desc audio_playback;
+  bool audio_supported = usb_audio_discover(dev, &audio_playback);
+  if (audio_supported)
+    usb_audio_device_discovered(dev, &audio_playback);
   if (keyboard) {
     dev->claimed_by |= 0x01;
     klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " USB: Keyboard driver attached\n");
@@ -334,11 +381,27 @@ void usb_enumerate_device(struct usb_device *dev) {
     dev->claimed_by |= 0x02;
     klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " USB: Mouse driver attached\n");
   }
-  if (!keyboard && !mouse)
+  if (audio_supported)
+    klogf("[USB-AUDIO] UAC1 playback descriptor matched: iface=%u alt=%u "
+          "ep=0x%02X maxpkt=%u interval=%u sync=%s; configuration unchanged\n",
+          audio_playback.interface_number, audio_playback.alternate_setting,
+          audio_playback.endpoint_address, audio_playback.max_packet_size,
+          audio_playback.interval,
+          ((audio_playback.endpoint_attributes >> 2) & 3) == 3
+              ? "synchronous" : "adaptive");
+  if (!keyboard && !mouse && !audio_supported)
     klogf("[USB] no driver claimed vid=0x%04X pid=0x%04X class=0x%02X "
           "(kbd=%u mouse=%u)\n",
           dev->desc.vendor_id, dev->desc.product_id, dev->desc.device_class,
           keyboard ? 1 : 0, mouse ? 1 : 0);
+}
+
+/* Run only after every host controller's initial root-port scan has finished.
+ * Keeping this out of device-discovery callbacks makes the opt-in transport
+ * exercise safe from IRQ and hotplug contexts. */
+void usb_audio_boot_smoke(void) {
+  for (int i = 0; i < device_count; i++)
+    usb_audio_probe_smoke(devices[i]);
 }
 
 void usb_device_removed(struct usb_hcd *hcd, uint8_t port) {
@@ -352,6 +415,9 @@ void usb_device_removed(struct usb_hcd *hcd, uint8_t port) {
     usb_mouse_disconnect(dev);
     if (hcd->device_removed)
       hcd->device_removed(hcd, dev);
+    /* The HCD has revoked endpoint DMA by this point. ALSA node removal runs
+     * later in the audio worker, outside this IRQ/watchdog context. */
+    usb_audio_device_removed(dev);
     klog_puts("[USB] Device removed from port ");
     klog_uint64(port + 1);
     klog_puts("\n");
@@ -523,6 +589,7 @@ uint32_t usb_diag_read(uint32_t offset, uint32_t size, uint8_t *buffer) {
     ehci_diag(&d);
     usb_kbd_diag(&d);
     usb_mouse_diag(&d);
+    usb_audio_diag(&d);
     usb_diag_boot_lines(&d);
     cache_len = d.len;
     spinlock_release(&cache_lock);

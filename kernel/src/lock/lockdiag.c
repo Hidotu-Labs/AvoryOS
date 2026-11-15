@@ -1037,6 +1037,8 @@ void lockdiag_dump_all(const char *reason) {
   ld_str(" invalid_responses="); ld_dec(gpu_stats.invalid_responses);
   ld_str(" frames="); ld_dec(gpu_stats.frames_presented);
   ld_str(" present_failures="); ld_dec(gpu_stats.present_failures);
+  ld_str(" pending_flip="); ld_dec(gpu_stats.pending_flip);
+  ld_str(" async_flip="); ld_dec(gpu_stats.async_flip_state);
 
   const lockdiag_stats_t *s = &g_stats;
   ld_str("\n[LOCKDIAG] counters: futex waits=");

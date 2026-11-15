@@ -39,6 +39,7 @@ struct virtio_gpu_stats {
     uint64_t frames_in_flight, max_frames_in_flight;
     uint64_t config_events, display_refreshes, hotplug_events;
     uint64_t edid_reads, edid_failures, edid_modes;
+    uint64_t pending_flip, async_flip_state;
 };
 
 struct virtio_gpu_device {

@@ -321,6 +321,27 @@ void fb_register_device_node(const char *name, vfs_node_t *node) {
     devfs_register_node(name, node);
 }
 
+void fb_unregister_device_node(const char *name, vfs_node_t *node) {
+    if (!name)
+        return;
+
+    spinlock_acquire(&fb_registry_lock);
+    for (size_t i = 0; i < fb_device_count; i++) {
+        if (strcmp(fb_device_registry[i].name, name) != 0 ||
+            (node && fb_device_registry[i].node != node))
+            continue;
+        for (size_t j = i + 1; j < fb_device_count; j++)
+            fb_device_registry[j - 1] = fb_device_registry[j];
+        fb_device_count--;
+        memset(&fb_device_registry[fb_device_count], 0,
+               sizeof(fb_device_registry[fb_device_count]));
+        break;
+    }
+    spinlock_release(&fb_registry_lock);
+
+    devfs_unregister_node(name, node);
+}
+
 bool fb_is_console_node(struct vfs_node *node) {
     node = vfs_backing_node(node);
     return node && node->ioctl == console_dev_ioctl;
