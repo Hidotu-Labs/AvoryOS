@@ -54,11 +54,32 @@ static bool start(struct net_device *netdev) {
 }
 
 static int rtl8139_dm_probe(struct device *dev) {
-  return rtl.initialized && rtl.pci && rtl.pci->kernel_device == dev ? 0 : -1;
+  if (!rtl.initialized || !rtl.pci || rtl.pci->kernel_device != dev)
+    return -1;
+  dev->driver_data = &rtl;
+  return 0;
 }
 
 static void rtl8139_dm_remove(struct device *dev) {
   (void)dev;
+}
+
+static int rtl8139_dm_suspend(struct device *dev) {
+  if (!dev || dev->driver_data != &rtl)
+    return -1;
+  int result = rtl8139_pm_suspend();
+  if (!result)
+    klog_puts("[RTL8139] Suspended for S3\n");
+  return result;
+}
+
+static int rtl8139_dm_resume(struct device *dev) {
+  if (!dev || dev->driver_data != &rtl)
+    return -1;
+  int result = rtl8139_pm_resume();
+  if (!result)
+    klog_puts("[RTL8139] Resumed after S3\n");
+  return result;
 }
 
 static struct device_id rtl8139_dm_ids[] = {
@@ -74,6 +95,8 @@ static struct driver rtl8139_dm_driver = {
     .id_count = 1,
     .probe = rtl8139_dm_probe,
     .remove = rtl8139_dm_remove,
+    .suspend = rtl8139_dm_suspend,
+    .resume = rtl8139_dm_resume,
     .kind = DRIVER_KERNEL,
 };
 

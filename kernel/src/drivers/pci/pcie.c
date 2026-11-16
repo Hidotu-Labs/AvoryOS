@@ -56,6 +56,8 @@ void pcie_init(void) {
             struct device *seg_dev = device_find_by_path("/sys/pci/seg0");
             if (!seg_dev)
                 seg_dev = device_create(pci_root, seg_name);
+            if (seg_dev)
+                seg_dev->pm_managed_by_core = true;
             device_add_resource(seg_dev, RES_MEM, "ecam",
                                 entry->base_address + ((uint64_t)entry->start_bus_number << 20),
                                 entry->base_address + (((uint64_t)entry->end_bus_number + 1) << 20));

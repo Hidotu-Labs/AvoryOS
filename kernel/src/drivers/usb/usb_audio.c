@@ -764,6 +764,23 @@ void usb_audio_device_removed(struct usb_device *dev) {
   usb_audio_wake_worker();
 }
 
+/* Device objects are recycled after a controller reset. Audio card removal is
+ * asynchronous, so keep the old object alive until its worker drops the last
+ * state reference. */
+bool usb_audio_device_reusable(struct usb_device *dev) {
+  if (!dev || !usb_audio_states_initialized)
+    return dev != NULL;
+  for (uint32_t i = 0; i < USB_AUDIO_MAX_DEVICES; i++) {
+    struct usb_audio_state *state = &usb_audio_states[i];
+    spinlock_acquire(&state->lock);
+    bool referenced = state->dev == dev;
+    spinlock_release(&state->lock);
+    if (referenced)
+      return false;
+  }
+  return true;
+}
+
 static bool usb_audio_transition_begin(struct usb_audio_state *state) {
   spinlock_acquire(&state->lock);
   bool available = !state->transitioning;

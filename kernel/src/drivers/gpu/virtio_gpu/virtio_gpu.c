@@ -9,6 +9,7 @@
 #include "sched/wait.h"
 #include "console/klog.h"
 #include "drivers/pci/pci.h"
+#include "drivers/manager/device.h"
 #include "drivers/gpu/drm/drm.h"
 #include "drivers/input/mouse.h"
 #include "mm/heap.h"
@@ -21,11 +22,43 @@
 #define GPU_CONTROLQ   0
 #define GPU_CURSORQ    1
 #define GPU_TIMEOUT_MS 1000
+#define GPU_CURSOR_IMAGE_BYTES (64U * 64U * 4U)
 #define REQ_OFF        0
 #define REQ_CAP        (1024U * 1024U + 32U)
 #define RESP_OFF       ((REQ_CAP + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
 #define RESP_CAP       (64U * 1024U)
 static struct virtio_gpu_device gpu;
+static spinlock_t gpu_cursor_lock, gpu_cursor_shape_lock;
+static volatile bool gpu_pm_quiescing;
+static bool gpu_pm_suspended;
+static bool gpu_pm_command_gate_held;
+static uint16_t gpu_pm_saved_pci_command;
+static uint32_t cursor_resource_id;
+static dma_buffer_t *cursor_shape_dma;
+static void gpu_drain_completions(void);
+static void gpu_drain_cursor_completions(void);
+static bool create_2d_format(uint32_t id, uint32_t w, uint32_t h,
+                             uint32_t format);
+static bool create_2d(uint32_t id, uint32_t w, uint32_t h);
+static bool attach_backing(uint32_t id, uint64_t phys, uint32_t len);
+static bool transfer_2d(uint32_t id, uint32_t w, uint32_t h);
+static int virtio_gpu_pm_probe(struct device *dev);
+static int virtio_gpu_pm_suspend(struct device *dev);
+static int virtio_gpu_pm_resume(struct device *dev);
+static bool virtio_gpu_restore_console_scanout_locked(void);
+static struct device_id virtio_gpu_pm_ids[] = {
+    {.type = ID_PCI,
+     .pci = {.vendor = VIRTIO_GPU_PCI_VENDOR_ID,
+             .device = VIRTIO_GPU_PCI_DEVICE_ID_MODERN}}};
+static struct driver virtio_gpu_pm_driver = {
+    .name = "virtio-gpu-pm",
+    .kind = DRIVER_KERNEL,
+    .ids = virtio_gpu_pm_ids,
+    .id_count = sizeof(virtio_gpu_pm_ids) / sizeof(virtio_gpu_pm_ids[0]),
+    .probe = virtio_gpu_pm_probe,
+    .suspend = virtio_gpu_pm_suspend,
+    .resume = virtio_gpu_pm_resume,
+    .resume_early = true};
 static uint32_t fbcon_scanout_id = 0;
 static spinlock_t gpu_poll_lock;
 static spinlock_t gpu_present_lock;
@@ -154,6 +187,8 @@ static volatile uint32_t gpu_pending_work;
 #define GPU_WORK_CONTROL (1U << 0)
 #define GPU_WORK_CURSOR  (1U << 1)
 #define GPU_WORK_CONFIG  (1U << 2)
+#define GPU_WORK_RESUME_REFRESH (1U << 3)
+#define GPU_WORK_RESUME_CURSOR  (1U << 4)
 static bool gpu_phase8_started, gpu_phase8_reported;
 static uint64_t gpu_phase8_started_ms;
 /* Protected by gpu_poll_lock. A timeout does not return DMA ownership: the
@@ -251,6 +286,15 @@ static bool gpu_sync_command_waiter;
 static uint32_t gpu_command_owner;
 static wait_queue_t gpu_command_owner_wait;
 static wait_queue_t gpu_command_wait;
+
+static void gpu_pm_release_command_gate(void) {
+    if (!gpu_pm_command_gate_held)
+        return;
+    gpu_pm_command_gate_held = false;
+    __atomic_store_n(&gpu_command_owner, 0, __ATOMIC_RELEASE);
+    wait_queue_wake_one(&gpu_command_owner_wait);
+}
+
 static bool handle_sync_completion(void *cookie, uint32_t used) {
     uintptr_t tag = (uintptr_t)cookie;
     if (gpu_sync_command_pending && tag == gpu_sync_command_pending)
@@ -327,7 +371,8 @@ static bool gpu_command_locked(
     const void *req, uint32_t req_len, void *resp, uint32_t resp_len, uint32_t *resp_type) {
     if (gpu.command_busy)
         gpu_reap_control_locked();
-    if (!gpu.initialized || !gpu.command_dma || !req || !resp || gpu.command_busy ||
+    if (__atomic_load_n(&gpu_pm_quiescing, __ATOMIC_ACQUIRE) ||
+        !gpu.initialized || !gpu.command_dma || !req || !resp || gpu.command_busy ||
         req_len < sizeof(struct virtio_gpu_ctrl_hdr) || req_len > REQ_CAP ||
         resp_len < sizeof(struct virtio_gpu_ctrl_hdr) || resp_len > RESP_CAP)
         return false;
@@ -429,7 +474,8 @@ static bool gpu_command_batch(const void *const *requests, const uint32_t *lengt
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     gpu_reap_control_locked();
     bool ok = false;
-    if (!gpu.initialized || !gpu.present_dma || gpu.command_busy ||
+    if (__atomic_load_n(&gpu_pm_quiescing, __ATOMIC_ACQUIRE) ||
+        !gpu.initialized || !gpu.present_dma || gpu.command_busy ||
         !count || count > GPU_BATCH_COMMANDS)
         goto release;
     for (uint32_t index = 0; index < count; index++)
@@ -492,6 +538,13 @@ static struct pci_device *find_gpu(void) {
             return p;
     }
     return NULL;
+}
+static int virtio_gpu_pm_probe(struct device *dev) {
+    if (!gpu.initialized || !gpu.transport.pci ||
+        gpu.transport.pci->kernel_device != dev)
+        return -1;
+    dev->driver_data = gpu.transport.pci;
+    return 0;
 }
 static void read_config(void) {
     uint8_t a, b;
@@ -735,10 +788,179 @@ static bool virtio_gpu_setup_irq(void) {
     return false;
 }
 
+static bool virtio_gpu_restore_msix_routes(void) {
+    if (gpu_irq_mode != GPU_IRQ_MSIX)
+        return true;
+    if (gpu_msix_vectors[0] == 0xFF || gpu_msix_vectors[1] == 0xFF ||
+        gpu_msix_vectors[2] == 0xFF ||
+        !virtio_pci_msix_init(&gpu.transport) ||
+        gpu.transport.msix.table_size < 3)
+        return false;
+    for (uint16_t i = 0; i < 3; i++) {
+        if (!virtio_pci_msix_route(&gpu.transport, i, gpu_msix_vectors[i],
+                                   (uint8_t)lapic_get_id()))
+            return false;
+    }
+    if (!virtio_pci_msix_enable(&gpu.transport) ||
+        !virtio_pci_msix_assign_queue(&gpu.transport, GPU_CONTROLQ, 0) ||
+        !virtio_pci_msix_assign_queue(&gpu.transport, GPU_CURSORQ, 1) ||
+        !virtio_pci_msix_assign_config(&gpu.transport, 2)) {
+        virtio_pci_msix_disable(&gpu.transport);
+        return false;
+    }
+    for (uint16_t i = 0; i < 3; i++)
+        pci_msix_mask(&gpu.transport.msix, i, false);
+    return true;
+}
+
+static bool virtio_gpu_restore_host_resources(void) {
+    gpu.resources_live = 0;
+    gpu.owns_scanout = false;
+    memset(gpu.head_resource, 0, sizeof(gpu.head_resource));
+    memset(gpu.queued_head_resource, 0, sizeof(gpu.queued_head_resource));
+    gpu.scanout_resource_id = 0;
+    gpu.queued_scanout_resource_id = 0;
+
+    for (uint32_t i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
+        if (i == 0 || scanout_heads[i].current || scanout_heads[i].pending ||
+            scanout_heads[i].selected_id) {
+            klogf("[VIRTIO-GPU] S3 recovery: restoring head %u selected=%u\n",
+                  i, scanout_heads[i].selected_id);
+        }
+        if (!vgpu_scanout_restore(&scanout_heads[i], &scanout_ops, i)) {
+            klogf("[VIRTIO-GPU] S3 recovery: failed to restore retained scanout %u\n",
+                  i);
+            return false;
+        }
+        if (i == 0)
+            klog_puts("[VIRTIO-GPU] S3 recovery: head 0 resources restored\n");
+    }
+
+    /* The device reset clears every host resource, including Virgl textures.
+     * A Virgl head has no retained 2D staging surface, so use the rebuilt host
+     * selection as the authority before deciding whether console fallback is
+     * needed. */
+    if (!gpu.head_resource[0]) {
+        klog_puts("[VIRTIO-GPU] S3 recovery: head 0 resource was not retained; restoring console fallback\n");
+        if (fbcon_scanout_id && gpu.scanout_dma &&
+            (!create_2d(fbcon_scanout_id, gpu.scanout_width, gpu.scanout_height) ||
+             !attach_backing(fbcon_scanout_id, gpu.scanout_dma->phys,
+                             gpu.scanout_width * gpu.scanout_height * 4U))) {
+            klog_puts("[VIRTIO-GPU] S3 recovery: failed to recreate console resource\n");
+            return false;
+        }
+        if (!virtio_gpu_restore_console_scanout_locked()) {
+            klog_puts("[VIRTIO-GPU] S3 recovery: console upload or scanout command failed\n");
+            return false;
+        }
+        if (!fbcon_scanout_id || gpu.head_resource[0] != fbcon_scanout_id) {
+            klog_puts("[VIRTIO-GPU] S3 recovery: console scanout could not be selected\n");
+            return false;
+        }
+        scanout_heads[0].selected_id = fbcon_scanout_id;
+        scanout_heads[0].selection_unknown = false;
+        vgpu_scanout_invalidate(&scanout_heads[0]);
+    }
+    return true;
+}
+
+/* GET_DISPLAY_INFO reports whether a monitor is connected, not whether a
+ * resource is currently selected on it. After a device reset, use our restored
+ * SET_SCANOUT bookkeeping to detect a missing output and fall back to fbcon. */
+static bool virtio_gpu_ensure_visible_scanout(void) {
+    if (!gpu.head_resource[0]) {
+        klog_puts("[VIRTIO-GPU] S3 recovery: no selected resource on head 0; restoring console\n");
+        if (!virtio_gpu_restore_console_scanout_locked()) {
+            klog_puts("[VIRTIO-GPU] S3 recovery: console scanout fallback failed\n");
+            return false;
+        }
+        scanout_heads[0].selected_id = fbcon_scanout_id;
+        scanout_heads[0].selection_unknown = false;
+        vgpu_scanout_invalidate(&scanout_heads[0]);
+    }
+
+    if (!gpu.head_resource[0]) {
+        klog_puts("[VIRTIO-GPU] S3 recovery: head 0 has no selected resource\n");
+        return false;
+    }
+
+    klogf("[VIRTIO-GPU] S3 recovery: head 0 resource %u selected\n",
+          gpu.head_resource[0]);
+    return true;
+}
+
+static bool virtio_gpu_restart_after_reset(void) {
+    const uint64_t wanted = VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID |
+                            VIRTIO_GPU_F_VIRGL;
+    if (!virtio_pci_negotiate(&gpu.transport, wanted, VIRTIO_F_VERSION_1,
+                              &gpu.negotiated_features)) {
+        klog_puts("[VIRTIO-GPU] S3 recovery: feature negotiation failed\n");
+        return false;
+    }
+
+    virtq_destroy(&gpu.controlq);
+    virtq_destroy(&gpu.cursorq);
+    if (!virtio_pci_setup_queue(&gpu.transport, GPU_CONTROLQ, &gpu.controlq) ||
+        !virtio_pci_setup_queue(&gpu.transport, GPU_CURSORQ, &gpu.cursorq)) {
+        klog_puts("[VIRTIO-GPU] S3 recovery: queue setup failed\n");
+        return false;
+    }
+    klog_puts("[VIRTIO-GPU] S3 recovery: queues rebuilt\n");
+    if (!virtio_gpu_restore_msix_routes()) {
+        klog_puts("[VIRTIO-GPU] S3 recovery: MSI-X route restore failed\n");
+        return false;
+    }
+    klog_puts("[VIRTIO-GPU] S3 recovery: MSI-X routes restored\n");
+    if (!virtio_pci_set_driver_ok(&gpu.transport)) {
+        klog_puts("[VIRTIO-GPU] S3 recovery: DRIVER_OK was rejected\n");
+        return false;
+    }
+    klog_puts("[VIRTIO-GPU] S3 recovery: DRIVER_OK restored\n");
+
+    /* All queues and status bits are live now. Clear pre-S3 failure/inflight
+     * state and resume the command path before querying display configuration
+     * or recreating host resources. The BSP is still scheduler-frozen, so no
+     * other task can race this restore. */
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    gpu_render_failed = false;
+    gpu_batch_failed = false;
+    gpu_batch_pending = 0;
+    gpu_sync_command_pending = 0;
+    gpu_batch_waiter = false;
+    gpu_sync_command_waiter = false;
+    gpu.command_busy = false;
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    gpu_pm_release_command_gate();
+    __atomic_store_n(&gpu_pm_quiescing, false, __ATOMIC_RELEASE);
+    gpu.config = (volatile struct virtio_gpu_config *)gpu.transport.device_cfg;
+    read_config();
+    klog_puts("[VIRTIO-GPU] S3 recovery: device config read\n");
+    if ((gpu.negotiated_features & VIRTIO_GPU_F_VIRGL) &&
+        virtio_gpu_virgl_restore_after_reset(gpu.negotiated_features,
+                                             gpu.num_capsets) != 0) {
+        klog_puts("[VIRTIO-GPU] S3 recovery: Virgl context/resource restore failed\n");
+    }
+    if (!virtio_gpu_restore_host_resources())
+        return false;
+    klog_puts("[VIRTIO-GPU] S3 recovery: host scanouts restored\n");
+    if (!virtio_gpu_ensure_visible_scanout())
+        return false;
+
+    /* Re-querying display/EDID state and capsets is not needed to restore the
+     * saved scanout, and must not hold the S3 initiator in a synchronous GPU
+     * command wait. Refresh it from the normal worker after scheduling thaws. */
+    __atomic_fetch_or(&gpu_pending_work, GPU_WORK_RESUME_REFRESH, __ATOMIC_RELEASE);
+    __atomic_fetch_or(&gpu_pending_work, GPU_WORK_RESUME_CURSOR, __ATOMIC_RELEASE);
+    wait_queue_wake_one(&gpu_worker_wait);
+    return true;
+}
+
 bool virtio_gpu_init(void) {
     memset(&gpu, 0, sizeof(gpu));
     spinlock_init(&gpu_poll_lock);
     spinlock_init(&gpu_present_lock);
+    spinlock_init(&gpu_cursor_lock);
+    spinlock_init(&gpu_cursor_shape_lock);
     wait_queue_init(&gpu_scanout_wait);
     wait_queue_init(&gpu_worker_wait);
     wait_queue_init(&gpu_command_owner_wait);
@@ -783,6 +1005,8 @@ bool virtio_gpu_init(void) {
         return false;
     }
     gpu.initialized = true;
+    __atomic_store_n(&gpu_pm_quiescing, false, __ATOMIC_RELEASE);
+    gpu_pm_suspended = false;
     virtio_gpu_virgl_init(gpu.negotiated_features, gpu.num_capsets);
     extern const char *kernel_boot_cmdline;
     const char *batch_option = kernel_boot_cmdline ?
@@ -817,6 +1041,17 @@ bool virtio_gpu_init(void) {
         klog_putchar(120);
         klog_uint64(m->r.height);
         klog_puts("\n");
+    }
+    dm_register_driver(&virtio_gpu_pm_driver);
+    if (pci->kernel_device && pci->kernel_device->driver != &virtio_gpu_pm_driver &&
+        pci->kernel_device->state == DEVICE_UNBOUND)
+        (void)dm_bind_device(pci->kernel_device, &virtio_gpu_pm_driver);
+    if (pci->kernel_device && pci->kernel_device->driver == &virtio_gpu_pm_driver)
+        klog_puts("[VIRTIO-GPU] S3 suspend owner registered\n");
+    else {
+        if (pci->kernel_device)
+            (void)dm_claim_external_device(pci->kernel_device, "virtio-gpu");
+        klog_puts("[VIRTIO-GPU] S3 suspend owner registration failed\n");
     }
     return true;
 }
@@ -1166,14 +1401,12 @@ bool virtio_gpu_phase3_stress_test(uint32_t cycles, uint32_t frames) {
     return true;
 }
 #define GPU_CURSOR_SLOTS       16U
-#define GPU_CURSOR_IMAGE_BYTES (64U * 64U * 4U)
 struct gpu_cursor_slot {
     bool in_use;
 };
 static struct gpu_cursor_slot cursor_slots[GPU_CURSOR_SLOTS];
-static dma_buffer_t *cursor_command_dma, *cursor_shape_dma;
-static spinlock_t gpu_cursor_lock, gpu_cursor_shape_lock;
-static uint32_t cursor_resource_id, cursor_in_flight, cursor_active_head;
+static dma_buffer_t *cursor_command_dma;
+static uint32_t cursor_in_flight, cursor_active_head;
 static uint64_t cursor_phase7_started_ms;
 static bool cursor_pending_move, cursor_visible, cursor_phase7_reported;
 static int32_t cursor_pending_x, cursor_pending_y;
@@ -1194,6 +1427,8 @@ static uint32_t cursor_coord(int32_t value, uint32_t limit) {
 static bool cursor_submit_locked(
     uint32_t head, uint32_t type, uint32_t resource_id,
     int32_t x, int32_t y, int32_t hot_x, int32_t hot_y) {
+    if (__atomic_load_n(&gpu_pm_quiescing, __ATOMIC_ACQUIRE))
+        return false;
     uint32_t slot = GPU_CURSOR_SLOTS;
     for (uint32_t i = 0; i < GPU_CURSOR_SLOTS; i++)
         if (!cursor_slots[i].in_use) {
@@ -1324,6 +1559,106 @@ static void gpu_drain_completions(void) {
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
 }
 
+static int virtio_gpu_pm_suspend(struct device *dev) {
+    if (!gpu.initialized || !gpu.transport.pci ||
+        gpu.transport.pci->kernel_device != dev)
+        return -1;
+    if (gpu_pm_suspended)
+        return 0;
+
+    __atomic_store_n(&gpu_pm_quiescing, true, __ATOMIC_RELEASE);
+    if (!gpu_gate_try_acquire(&gpu_command_owner)) {
+        __atomic_store_n(&gpu_pm_quiescing, false, __ATOMIC_RELEASE);
+        klog_puts("[VIRTIO-GPU] S3 refused: a control command is still owned\n");
+        return -16;
+    }
+    gpu_pm_command_gate_held = true;
+    uint64_t deadline = lapic_timer_get_ms() + GPU_TIMEOUT_MS;
+    for (;;) {
+        gpu_drain_completions();
+        gpu_drain_cursor_completions();
+        LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+        bool control_idle = !gpu.command_busy && !gpu_sync_command_pending &&
+                            !gpu_batch_pending && !gpu_render_pending;
+        LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+        if (control_idle && virtq_is_idle(&gpu.controlq) &&
+            virtq_is_idle(&gpu.cursorq)) {
+            gpu_pm_saved_pci_command = pci_config_read16(
+                gpu.transport.pci->bus, gpu.transport.pci->slot,
+                gpu.transport.pci->func, 0x04);
+            gpu_pm_suspended = true;
+            klog_puts("[VIRTIO-GPU] queues drained for S3\n");
+            return 0;
+        }
+        if (lapic_timer_get_ms() >= deadline) {
+            gpu_pm_release_command_gate();
+            __atomic_store_n(&gpu_pm_quiescing, false, __ATOMIC_RELEASE);
+            klog_puts("[VIRTIO-GPU] S3 refused: command queues did not drain\n");
+            return -16;
+        }
+        hal_cpu_relax();
+    }
+}
+
+static int virtio_gpu_pm_resume(struct device *dev) {
+    if (!gpu.initialized || !gpu.transport.pci ||
+        gpu.transport.pci->kernel_device != dev)
+        return -1;
+    if (!gpu_pm_suspended)
+        return 0;
+    if (!pci_restore_bars(gpu.transport.pci)) {
+        gpu_pm_release_command_gate();
+        gpu_pm_suspended = false;
+        __atomic_store_n(&gpu_pm_quiescing, false, __ATOMIC_RELEASE);
+        return -5;
+    }
+    pci_config_write16(gpu.transport.pci->bus, gpu.transport.pci->slot,
+                       gpu.transport.pci->func, 0x04,
+                       gpu_pm_saved_pci_command | 0x0006U);
+    if (!virtio_pci_init(&gpu.transport, gpu.transport.pci)) {
+        gpu_pm_release_command_gate();
+        gpu_pm_suspended = false;
+        __atomic_store_n(&gpu_pm_quiescing, false, __ATOMIC_RELEASE);
+        return -5;
+    }
+    gpu.config = (volatile struct virtio_gpu_config *)gpu.transport.device_cfg;
+    if (!(virtio_pci_get_status(&gpu.transport) & VIRTIO_STATUS_DRIVER_OK)) {
+        klog_puts("[VIRTIO-GPU] device lost DRIVER_OK across S3; rebuilding transport\n");
+        __atomic_store_n(&gpu_pm_quiescing, true, __ATOMIC_RELEASE);
+        if (!virtio_gpu_restart_after_reset()) {
+            gpu_pm_release_command_gate();
+            gpu.initialized = false;
+            gpu_pm_suspended = false;
+            __atomic_store_n(&gpu_pm_quiescing, false, __ATOMIC_RELEASE);
+            klog_puts("[VIRTIO-GPU] failed to restore device after S3\n");
+            return -5;
+        }
+        gpu_pm_suspended = false;
+        __atomic_store_n(&gpu_pm_quiescing, false, __ATOMIC_RELEASE);
+        klog_puts("[VIRTIO-GPU] transport and scanout restored after S3\n");
+    } else {
+        if (!virtio_gpu_restore_msix_routes()) {
+            klog_puts("[VIRTIO-GPU] S3 recovery: MSI-X route restore failed\n");
+        }
+        gpu_pm_release_command_gate();
+        __atomic_store_n(&gpu_pm_quiescing, false, __ATOMIC_RELEASE);
+        gpu_pm_suspended = false;
+    }
+
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_CURSOR, &gpu_cursor_lock);
+    if (cursor_pending_move) {
+        cursor_pending_move = false;
+        if (!cursor_submit_locked(cursor_pending_head, VIRTIO_GPU_CMD_MOVE_CURSOR,
+                                  cursor_pending_resource, cursor_pending_x,
+                                  cursor_pending_y, cursor_pending_hot_x,
+                                  cursor_pending_hot_y))
+            cursor_pending_move = true;
+    }
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_CURSOR, &gpu_cursor_lock);
+    klog_puts("[VIRTIO-GPU] resumed after S3\n");
+    return 0;
+}
+
 /* Reclaim retired generations after late acknowledgements even if the
  * producer stopped issuing commits. Never wait behind a fence-owning task
  * in the completion worker; control/cursor draining must keep progressing. */
@@ -1337,13 +1672,14 @@ static void gpu_collect_scanouts(void) {
     gpu_scanout_release();
 }
 
-static void gpu_handle_config_event(void) {
+static void gpu_handle_config_event(bool force_refresh) {
     uint32_t events = __atomic_load_n(&gpu.config->events_read, __ATOMIC_ACQUIRE);
-    if (!(events & VIRTIO_GPU_EVENT_DISPLAY)) {
+    if (!force_refresh && !(events & VIRTIO_GPU_EVENT_DISPLAY)) {
         read_config();
         return;
     }
-    __atomic_store_n(&gpu.config->events_clear, events, __ATOMIC_RELEASE);
+    if (events & VIRTIO_GPU_EVENT_DISPLAY)
+        __atomic_store_n(&gpu.config->events_clear, events, __ATOMIC_RELEASE);
     gpu.stats.config_events++;
     bool old_enabled[VIRTIO_GPU_MAX_SCANOUTS];
     uint32_t old_w[VIRTIO_GPU_MAX_SCANOUTS], old_h[VIRTIO_GPU_MAX_SCANOUTS];
@@ -1408,6 +1744,20 @@ static void gpu_handle_config_event(void) {
     }
 }
 
+static void gpu_restore_cursor_after_resume(void) {
+    if (!cursor_resource_id || !cursor_shape_dma)
+        return;
+    if (!create_2d_format(cursor_resource_id, 64, 64,
+                          VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM) ||
+        !attach_backing(cursor_resource_id, cursor_shape_dma->phys,
+                        GPU_CURSOR_IMAGE_BYTES) ||
+        !transfer_2d(cursor_resource_id, 64, 64)) {
+        klog_puts("[VIRTIO-GPU] deferred cursor restore failed after S3\n");
+        return;
+    }
+    klog_puts("[VIRTIO-GPU] cursor resource restored after S3\n");
+}
+
 static void virtio_gpu_worker(void) {
     struct thread *self = sched_get_current();
     wait_queue_entry_t entry = {.thread = self, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
@@ -1419,7 +1769,11 @@ static void virtio_gpu_worker(void) {
         if (!pending && !gpu_irq_installed)
             gpu.stats.watchdog_polls++;
         if (pending & GPU_WORK_CONFIG)
-            gpu_handle_config_event();
+            gpu_handle_config_event(false);
+        if (pending & GPU_WORK_RESUME_REFRESH)
+            gpu_handle_config_event(true);
+        if (pending & GPU_WORK_RESUME_CURSOR)
+            gpu_restore_cursor_after_resume();
         gpu_drain_completions();
         gpu_render_reclaim();
         gpu_collect_scanouts();
@@ -1574,8 +1928,6 @@ bool virtio_gpu_phase7_start(void) {
         klog_puts("[VIRTIO-GPU] Relative pointer: framebuffer cursor required\n");
         return true;
     }
-    spinlock_init(&gpu_cursor_lock);
-    spinlock_init(&gpu_cursor_shape_lock);
     cursor_shape_dma = dma_alloc(GPU_CURSOR_IMAGE_BYTES, DMA_FLAG_32BIT);
     cursor_command_dma = dma_alloc(PAGE_SIZE, DMA_FLAG_32BIT);
     if (!cursor_shape_dma || !cursor_command_dma) {
@@ -1627,7 +1979,7 @@ bool virtio_gpu_phase8_start(void) {
     }
     uint32_t pending = __atomic_load_n(&gpu.config->events_read, __ATOMIC_ACQUIRE);
     if (pending & VIRTIO_GPU_EVENT_DISPLAY)
-        gpu_handle_config_event();
+        gpu_handle_config_event(false);
     klog_puts("[VIRTIO-GPU] Phase 8 display management active: EDID modes, config hotplug, "
               "multihead connectors\n");
     for (uint32_t i = 0; i < gpu.num_scanouts && i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
@@ -1650,14 +2002,14 @@ static bool disable_scanout(uint32_t head) {
     if (ok) virgl_scanout_replaced(head, 0);
     return ok;
 }
-static void virtio_gpu_restore_console_scanout_locked(void) {
+static bool virtio_gpu_restore_console_scanout_locked(void) {
     /* -vga none: no VGA fallback, so disabling leaves "Display output is
      * not active". Re-present a native fbcon resource instead, seeded
      * from the GOP fb (already redrawn with the login prompt). Phase3
      * init never runs on this config, so allocate the native resource
      * on demand the first time Plymouth quits. */
     if (!gpu.initialized)
-        return;
+        return false;
     if (!fbcon_scanout_id) {
         uint32_t dw = fb_get_width(), dh = fb_get_height();
         if (!dw || !dh || dw > 8192 || dh > 8192) {
@@ -1665,19 +2017,19 @@ static void virtio_gpu_restore_console_scanout_locked(void) {
             dh = gpu.scanout_height;
         }
         if (!dw || !dh || dw > 8192 || dh > 8192)
-            return;
+            return false;
         uint64_t bytes = (uint64_t)dw * dh * 4ULL;
         if (!bytes || bytes > 0xFFFFFFFFULL)
-            return;
+            return false;
         dma_buffer_t *dma = dma_alloc((size_t)bytes, DMA_FLAG_32BIT);
         if (!dma)
-            return;
+            return false;
         uint32_t id = __atomic_add_fetch(&gpu.next_resource_id, 1, __ATOMIC_RELAXED);
         if (!create_2d(id, dw, dh) ||
             !attach_backing(id, dma->phys, (uint32_t)bytes)) {
             if (gpu.resources_live)
                 unref_resource(id);
-            return;
+            return false;
         }
         gpu.scanout_dma = dma;
         gpu.scanout_width = dw;
@@ -1685,12 +2037,12 @@ static void virtio_gpu_restore_console_scanout_locked(void) {
         fbcon_scanout_id = id;
     }
     if (!gpu.scanout_dma || !gpu.scanout_dma->virt)
-        return;
+        return false;
     void *base = fb_get_base();
     uint32_t fw = fb_get_width(), fh = fb_get_height(), pitch = fb_get_pitch();
     uint32_t sw = gpu.scanout_width, sh = gpu.scanout_height;
     if (!base || !fw || !fh || !pitch || !sw || !sh)
-        return;
+        return false;
     uint32_t w = fw < sw ? fw : sw;
     uint32_t h = fh < sh ? fh : sh;
     uint8_t *dst = (uint8_t *)gpu.scanout_dma->virt;
@@ -1700,14 +2052,24 @@ static void virtio_gpu_restore_console_scanout_locked(void) {
         memcpy(dst + (uint64_t)y * dst_pitch, src + (uint64_t)y * pitch,
                (size_t)w * 4);
     __asm__ volatile("" ::: "memory");
-    transfer_2d(fbcon_scanout_id, sw, sh);
-    set_scanout(0, fbcon_scanout_id, sw, sh);
-    flush_resource(fbcon_scanout_id, sw, sh);
+    if (!transfer_2d(fbcon_scanout_id, sw, sh)) {
+        klog_puts("[VIRTIO-GPU] console restore: transfer-to-host failed\n");
+        return false;
+    }
+    if (!set_scanout(0, fbcon_scanout_id, sw, sh)) {
+        klog_puts("[VIRTIO-GPU] console restore: SET_SCANOUT failed\n");
+        return false;
+    }
+    if (!flush_resource(fbcon_scanout_id, sw, sh)) {
+        klog_puts("[VIRTIO-GPU] console restore: resource flush failed\n");
+        return false;
+    }
     gpu.head_resource[0] = fbcon_scanout_id;
     gpu.queued_head_resource[0] = fbcon_scanout_id;
     gpu.scanout_resource_id = fbcon_scanout_id;
     gpu.queued_scanout_resource_id = fbcon_scanout_id;
     gpu.owns_scanout = true;
+    return true;
 }
 void virtio_gpu_restore_console_scanout(void) {
     gpu_scanout_acquire();
@@ -1715,7 +2077,7 @@ void virtio_gpu_restore_console_scanout(void) {
         gpu_scanout_release();
         return;
     }
-    virtio_gpu_restore_console_scanout_locked();
+    (void)virtio_gpu_restore_console_scanout_locked();
     gpu_scanout_release();
 }
 /* Live console mirror: fb_swap just copied back->front (GOP). While the
@@ -1921,7 +2283,8 @@ static void virtio_gpu_complete_flip(uint32_t head) {
  * that texture straight to QEMU preserves format/origin metadata and avoids
  * downloading and re-uploading every desktop frame. */
 static bool virtio_gpu_present_virgl(uint32_t head, struct drm_framebuffer *fb,
-                                     const struct virtio_gpu_rect *view) {
+                                     const struct virtio_gpu_rect *view,
+                                     const struct virtio_gpu_rect *damage) {
     static bool announced;
     static struct virtio_gpu_rect selected_view[VIRTIO_GPU_MAX_SCANOUTS];
     uint32_t id = virtio_gpu_virgl_resource_id(fb->gem_obj);
@@ -1933,6 +2296,7 @@ static bool virtio_gpu_present_virgl(uint32_t head, struct drm_framebuffer *fb,
         return false;
     struct vgpu_scanout_head *state = &scanout_heads[head];
     bool ok;
+    uint64_t flushed_pixels;
     if (state->selection_unknown || state->selected_id != id ||
         memcmp(&selected_view[head], view, sizeof(*view))) {
         struct virtio_gpu_set_scanout req = {0};
@@ -1958,16 +2322,24 @@ static bool virtio_gpu_present_virgl(uint32_t head, struct drm_framebuffer *fb,
         selected_view[head] = *view;
         scanout_record_selection(head, id);
         ok = true;
+        flushed_pixels = (uint64_t)view->width * view->height;
         gpu.stats.present_batches++;
     } else {
-        ok = flush_rect(id, view->x, view->y, view->width, view->height);
+        const struct virtio_gpu_rect *flush = damage;
+        if (!flush || !flush->width || !flush->height)
+            flush = view;
+        ok = flush_rect(id, flush->x, flush->y, flush->width, flush->height);
+        flushed_pixels = (uint64_t)flush->width * flush->height;
     }
     if (ok && !announced) {
         announced = true;
         klog_puts("[VIRTIO-GPU] Direct virgl host-texture scanout active\n");
     }
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
-    if (ok) gpu.stats.frames_presented++;
+    if (ok) {
+        gpu.stats.frames_presented++;
+        gpu.stats.damage_pixels += flushed_pixels;
+    }
     else gpu.stats.present_failures++;
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
     return ok;
@@ -1993,16 +2365,7 @@ static void virtio_gpu_commit_damage(struct drm_device *dev,
     if (coalesce && (__atomic_load_n(&gpu_prime_waiters, __ATOMIC_ACQUIRE) ||
         __atomic_load_n(&gpu_prime_enter_seq, __ATOMIC_ACQUIRE) != entered))
         goto release_gem;
-    if (virtio_gpu_virgl_resource_id(fb->gem_obj)) {
-        snapshot_committed = virtio_gpu_present_virgl(head, fb, &view);
-        goto release_gem;
-    }
-    struct vgpu_scanout_source source = {
-        .pixels = fb->gem_obj->virt_addr, .size = fb->gem_obj->size,
-        .offset = fb->backing_offset, .width = fb->width, .height = fb->height,
-        .pitch = fb->pitch, .x = view.x, .y = view.y,
-        .view_width = view.width, .view_height = view.height,
-    };
+
     struct vgpu_scanout_damage damage = {0};
     bool have_damage = false;
     if (clips && n && n <= 4096) {
@@ -2027,6 +2390,23 @@ static void virtio_gpu_commit_damage(struct drm_device *dev,
         if (have_damage)
             damage = (struct vgpu_scanout_damage){left, top, right - left, bottom - top};
     }
+    if (virtio_gpu_virgl_resource_id(fb->gem_obj)) {
+        struct virtio_gpu_rect flush = view;
+        if (have_damage) {
+            flush.x += damage.x;
+            flush.y += damage.y;
+            flush.width = damage.width;
+            flush.height = damage.height;
+        }
+        snapshot_committed = virtio_gpu_present_virgl(head, fb, &view, &flush);
+        goto release_gem;
+    }
+    struct vgpu_scanout_source source = {
+        .pixels = fb->gem_obj->virt_addr, .size = fb->gem_obj->size,
+        .offset = fb->backing_offset, .width = fb->width, .height = fb->height,
+        .pitch = fb->pitch, .x = view.x, .y = view.y,
+        .view_width = view.width, .view_height = view.height,
+    };
     if (!vgpu_scanout_source_valid(&source))
         goto release_gem;
     struct vgpu_scanout_image *image = vgpu_scanout_prepare(&scanout_heads[head],
@@ -2161,7 +2541,7 @@ static void virtio_gpu_flip_worker(void) {
         bool published = false;
         if (virtio_gpu_virgl_resource_id(object)) {
             struct virtio_gpu_rect view = {0, 0, framebuffer->width, framebuffer->height};
-            published = virtio_gpu_present_virgl(flip.head, framebuffer, &view);
+            published = virtio_gpu_present_virgl(flip.head, framebuffer, &view, &view);
         } else {
             struct vgpu_scanout_image *image = vgpu_scanout_prepare(
                 &scanout_heads[flip.head], &scanout_ops, flip.head,
@@ -2518,7 +2898,8 @@ bool virtio_gpu_render_submit_parts(const void *request, uint32_t request_size,
                                    const void *payload, uint32_t payload_size,
                                    struct drm_gem_object **objects, uint32_t count,
                                    void (*notify)(void *, int), void *notify_data) {
-    if (!gpu_render_capacity || !request ||
+    if (__atomic_load_n(&gpu_pm_quiescing, __ATOMIC_ACQUIRE) ||
+        !gpu_render_capacity || !request ||
         request_size < sizeof(struct virtio_gpu_ctrl_hdr) || request_size > REQ_CAP ||
         payload_size > REQ_CAP - request_size || (payload_size && !payload))
         return false;
@@ -2556,7 +2937,8 @@ bool virtio_gpu_render_submit_parts(const void *request, uint32_t request_size,
     /* Fence numbering must follow descriptor submission order, including
      * synchronous KMS commands sharing this queue. */
     wire->fence_id = __atomic_add_fetch(&gpu.next_fence_id, 1, __ATOMIC_RELAXED);
-    if (gpu_render_failed || virtq_submit(&gpu.controlq, &out, 1, &in, 1, job) < 0) {
+    if (__atomic_load_n(&gpu_pm_quiescing, __ATOMIC_ACQUIRE) ||
+        gpu_render_failed || virtq_submit(&gpu.controlq, &out, 1, &in, 1, job) < 0) {
         LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
         goto fail;
     }

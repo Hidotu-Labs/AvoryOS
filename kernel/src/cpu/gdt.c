@@ -124,9 +124,23 @@ void gdt_init(void) {
 
 void gdt_load_ap(uint32_t cpu_id) {
   if (cpu_id >= MAX_CPUS) return;
+  /* INIT/SIPI after S3 clears TR, but the per-CPU GDT survives in RAM with
+   * the TSS descriptor's busy bit set by the previous LTR.  Loading that
+   * busy descriptor again raises #GP before the AP has installed its IDT.
+   * Make it available before reloading the GDT and task register. */
+  cpu_gdt[cpu_id][GDT_TSS_BASE + 2 * cpu_id].access = 0x89;
   gdt_flush((uint64_t)&gp[cpu_id]);
   if (cpu_id < MAX_CPUS)
     ltr(tss_selector(cpu_id));
+}
+
+/* ACPI S3 does not preserve the processor's GDTR/TR state. Reuse the BSP's
+ * existing GDT and TSS without clearing its live RSP0/IST stacks. LTR marks
+ * the TSS descriptor busy, so make it available again before reloading TR. */
+void gdt_reload_bsp(void) {
+  cpu_gdt[0][GDT_TSS_BASE].access = 0x89;
+  gdt_flush((uint64_t)&gp[0]);
+  ltr(tss_selector(0));
 }
 
 /* Called with interrupts masked: TLS descriptors belong to this CPU's

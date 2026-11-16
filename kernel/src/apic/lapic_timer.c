@@ -7,6 +7,7 @@
 #include "../console/klog.h"
 #include "../cpu/tsc.h"
 #include "../drivers/timer/hpet.h"
+#include "../drivers/timer/rtc.h"
 #include "../lib/string.h"
 #include "../lib/tsc.h"
 #include "../drivers/usb/xhci.h"
@@ -27,23 +28,32 @@
 // State
 static uint32_t          ticks_per_ms      = 0;   // LAPIC decrements per ms
 static uint64_t          boot_tsc          = 0;
+static uint64_t          boot_mono_ms      = 0;
+static uint64_t          boot_mono_ns      = 0;
+static bool              s3_timer_suspended = false;
+static uint64_t          s3_saved_mono_ms  = 0;
+static uint64_t          s3_saved_mono_ns  = 0;
+static uint64_t          s3_saved_rtc       = 0;
 
 static uint64_t monotonic_ms(void) {
     uint64_t khz = tsc_get_freq_khz();
     if (khz == 0) return 0;
-    return (rdtsc() - boot_tsc) / khz;
+    uint64_t tsc = rdtsc();
+    uint64_t elapsed = tsc >= boot_tsc ? tsc - boot_tsc : 0;
+    return boot_mono_ms + elapsed / khz;
 }
 
 static uint64_t monotonic_ns(void) {
     uint64_t khz = tsc_get_freq_khz();
     if (khz == 0) return 0;
-    uint64_t elapsed = rdtsc() - boot_tsc;
+    uint64_t tsc = rdtsc();
+    uint64_t elapsed = tsc >= boot_tsc ? tsc - boot_tsc : 0;
     /* Split into whole milliseconds + remainder to avoid overflow.
      * khz = cycles/ms, so elapsed/khz = ms, remainder < khz.
      * rem * 1,000,000 fits in uint64 since rem < ~4M (typ. CPU freq). */
     uint64_t ms  = elapsed / khz;
     uint64_t rem = elapsed % khz;
-    return ms * 1000000ULL + rem * 1000000ULL / khz;
+    return boot_mono_ns + ms * 1000000ULL + rem * 1000000ULL / khz;
 }
 
 static uint32_t deadline_to_initial_count(uint64_t deadline_ms) {
@@ -242,6 +252,8 @@ void lapic_timer_init(void) {
     }
 
     boot_tsc = rdtsc();
+    boot_mono_ms = 0;
+    boot_mono_ns = 0;
 
     /* One complete line, so the value can never be split across two frames
      * on screen (the "LAPIC ticks/ms: 0x" with no digits symptom). */
@@ -286,6 +298,62 @@ void lapic_timer_init_ap(void) {
     lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
     lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_ONESHOT | LAPIC_TIMER_VECTOR);
     lapic_timer_arm_at(monotonic_ms() + LAPIC_SCHED_QUANTUM_MS);
+}
+
+void lapic_timer_save_s4_state(void) {
+    if (s3_timer_suspended)
+        return;
+    s3_saved_mono_ms = monotonic_ms();
+    s3_saved_mono_ns = monotonic_ns();
+    s3_saved_rtc = rtc_get_timestamp();
+    s3_timer_suspended = true;
+}
+
+void lapic_timer_suspend_for_s3(void) {
+    lapic_timer_save_s4_state();
+    struct cpu_info *cpu = cpu_get_current();
+    if (cpu)
+        lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
+}
+
+void lapic_timer_resume_from_s3(bool slept) {
+    if (!s3_timer_suspended)
+        return;
+
+    if (slept) {
+        uint64_t rtc_now = rtc_get_timestamp();
+        uint64_t elapsed_ms = rtc_now >= s3_saved_rtc
+                                  ? (rtc_now - s3_saved_rtc) * 1000ULL
+                                  : 0;
+        boot_mono_ms = s3_saved_mono_ms + elapsed_ms;
+        boot_mono_ns = s3_saved_mono_ns + elapsed_ms * 1000000ULL;
+        boot_tsc = rdtsc();
+
+        if (hpet_is_available()) {
+            hpet_enable(true);
+            tsc_recalibrate_hpet();
+            uint32_t hpet_ticks = calibrate_lapic_timer_hpet();
+            if (lapic_rate_plausible(hpet_ticks))
+                ticks_per_ms = hpet_ticks;
+        }
+        if (!lapic_rate_plausible(ticks_per_ms)) {
+            uint32_t pit_ticks = calibrate_lapic_timer();
+            if (lapic_rate_plausible(pit_ticks))
+                ticks_per_ms = pit_ticks;
+        }
+        vmm_update_vdso_data();
+    }
+
+    s3_timer_suspended = false;
+    if (!ticks_per_ms || !lapic_is_ready())
+        return;
+    lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
+    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_ONESHOT | LAPIC_TIMER_VECTOR);
+    struct cpu_info *cpu = cpu_get_current();
+    uint64_t deadline = cpu ? cpu->timer_deadline_ms : 0;
+    if (!deadline)
+        deadline = monotonic_ms() + LAPIC_SCHED_QUANTUM_MS;
+    lapic_timer_arm_at(deadline);
 }
 
 uint64_t lapic_timer_get_ticks(void) {

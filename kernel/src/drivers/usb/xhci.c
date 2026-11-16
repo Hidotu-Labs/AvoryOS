@@ -3,6 +3,7 @@
 #include "../../apic/lapic_timer.h"
 #include "../../console/klog.h"
 #include "../../cpu/isr.h"
+#include "../../drivers/manager/device.h"
 #include "../../io/io.h"
 #include "../../lib/string.h"
 #include "../../mm/dma_alloc.h"
@@ -83,6 +84,44 @@ static uint64_t last_dma_phys;
 
 static void xhci_wait_event_dispatch(struct xhci_controller *hc);
 static void xhci_isoch_finish_pending(struct xhci_isoch_state *state);
+static int xhci_pm_probe(struct device *dev);
+static int xhci_pm_suspend(struct device *dev);
+static int xhci_pm_resume(struct device *dev);
+static bool xhci_setup_msi(struct xhci_controller *hc);
+static void xhci_enumerate_ports(struct xhci_controller *hc);
+static void xhci_power_ports(struct xhci_controller *hc);
+static void xhci_reset_runtime_state(struct xhci_controller *hc);
+
+static struct device_id xhci_device_ids[] = {{
+    .type = ID_PCI,
+    .pci = {.class = 0x0C,
+            .subclass = 0x03,
+            .prog_if = 0x30,
+            .match_class = true},
+}};
+
+static struct driver xhci_device_driver = {
+    .name = "xhci",
+    .ids = xhci_device_ids,
+    .id_count = sizeof(xhci_device_ids) / sizeof(xhci_device_ids[0]),
+    .probe = xhci_pm_probe,
+    .suspend = xhci_pm_suspend,
+    .resume = xhci_pm_resume,
+    .kind = DRIVER_KERNEL,
+};
+
+static int xhci_pm_probe(struct device *dev) {
+  if (!dev)
+    return -1;
+  for (int i = 0; i < controller_count; i++) {
+    struct xhci_controller *hc = &controllers[i];
+    if (hc->pci && hc->pci->kernel_device == dev) {
+      dev->driver_data = hc;
+      return 0;
+    }
+  }
+  return -1;
+}
 
 static inline uint32_t mmio_read32(volatile void *base, uint32_t offset) {
   return *(volatile uint32_t *)((volatile uint8_t *)base + offset);
@@ -111,7 +150,7 @@ static uint64_t xhci_bar0(struct pci_device *pci) {
  * Firmware commonly leaves a secondary xHCI controller in D3hot with memory
  * space disabled; the capability reads then return 0xFFFFFFFF and the whole
  * controller (and every port behind it, e.g. a mouse) is silently skipped. */
-static void xhci_pci_prepare(struct pci_device *pci) {
+static bool xhci_pci_prepare(struct pci_device *pci) {
   uint16_t status = pci_config_read16(pci->bus, pci->slot, pci->func, 0x06);
   if (status & (1U << 4)) { /* capability list present */
     uint8_t cap = pci_config_read8(pci->bus, pci->slot, pci->func, 0x34) & 0xFC;
@@ -135,9 +174,12 @@ static void xhci_pci_prepare(struct pci_device *pci) {
       cap = next;
     }
   }
+  if (!pci_restore_bars(pci))
+    return false;
   uint16_t command = pci_config_read16(pci->bus, pci->slot, pci->func, 0x04);
   pci_config_write16(pci->bus, pci->slot, pci->func, 0x04,
                      command | 0x0006U | (1U << 10));
+  return true;
 }
 
 static bool xhci_map_mmio(uint64_t phys, uint64_t length) {
@@ -269,12 +311,16 @@ static bool xhci_alloc_runtime(struct xhci_controller *hc) {
 
 static void xhci_program_runtime(struct xhci_controller *hc) {
   mmio_write64(hc->op, XHCI_DCBAAP, hc->dcbaa_phys);
-  mmio_write64(hc->op, XHCI_CRCR, hc->command_ring_phys | hc->command_cycle);
+  uint64_t command_dequeue = hc->command_ring_phys +
+                             hc->command_enqueue * sizeof(struct xhci_trb);
+  mmio_write64(hc->op, XHCI_CRCR, command_dequeue | hc->command_cycle);
   mmio_write32(hc->op, XHCI_CONFIG, hc->max_slots);
   volatile uint8_t *ir = hc->runtime + 0x20;
   mmio_write32(ir, 0x08, 1);
   mmio_write64(ir, 0x10, hc->erst_phys);
-  mmio_write64(ir, 0x18, hc->event_ring_phys);
+  uint64_t event_dequeue = hc->event_ring_phys +
+                           hc->event_dequeue * sizeof(struct xhci_trb);
+  mmio_write64(ir, 0x18, event_dequeue | (1U << 3));
   mmio_write32(ir, 0x04, 0);
   mmio_write32(ir, 0x00, XHCI_IMAN_IP | XHCI_IMAN_IE);
 }
@@ -288,6 +334,168 @@ static bool xhci_start(struct xhci_controller *hc) {
   }
   hc->running = true;
   return true;
+}
+
+static bool xhci_pm_has_active_isoch(struct xhci_controller *hc) {
+  for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+    struct xhci_isoch_state *state = &hc->isoch_streams[i];
+    if (__atomic_load_n(&state->stream.active, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&state->submitting, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&state->reserved, __ATOMIC_ACQUIRE))
+      return true;
+  }
+  for (uint16_t i = 1; i <= hc->max_slots; i++) {
+    struct xhci_slot *slot = &hc->slots[i];
+    if (__atomic_load_n(&slot->isoch_transition, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&slot->removal_pending, __ATOMIC_ACQUIRE))
+      return true;
+  }
+  return false;
+}
+
+static void xhci_pm_unquiesce(struct xhci_controller *hc) {
+  volatile uint8_t *ir = hc->runtime + 0x20;
+  mmio_write32(ir, 0x00, XHCI_IMAN_IE | XHCI_IMAN_IP);
+  __atomic_store_n(&hc->suspending, false, __ATOMIC_RELEASE);
+}
+
+static int xhci_pm_suspend(struct device *dev) {
+  struct xhci_controller *hc = dev ? dev->driver_data : NULL;
+  if (!hc || !hc->running || hc->suspended)
+    return -16;
+
+  __atomic_store_n(&hc->suspending, true, __ATOMIC_RELEASE);
+  volatile uint8_t *ir = hc->runtime + 0x20;
+  uint32_t iman = mmio_read32(ir, 0x00);
+  mmio_write32(ir, 0x00, iman & ~XHCI_IMAN_IE);
+
+  uint64_t activity_deadline = lapic_timer_get_ms() + XHCI_WAIT_MS;
+  while (__atomic_load_n(&hc->pm_activity, __ATOMIC_ACQUIRE) &&
+         lapic_timer_get_ms() < activity_deadline)
+    io_wait();
+  if (__atomic_load_n(&hc->pm_activity, __ATOMIC_ACQUIRE)) {
+    xhci_pm_unquiesce(hc);
+    return -16;
+  }
+
+  /* Do not strand a synchronous command/control waiter or an event-ring
+   * drainer when the controller stops producing interrupts. */
+  if (!spinlock_try_acquire(&hc->command_lock)) {
+    xhci_pm_unquiesce(hc);
+    return -16;
+  }
+  spinlock_release(&hc->command_lock);
+  if (!spinlock_try_acquire(&hc->control_lock)) {
+    xhci_pm_unquiesce(hc);
+    return -16;
+  }
+  spinlock_release(&hc->control_lock);
+  if (!spinlock_try_acquire(&hc->event_lock)) {
+    xhci_pm_unquiesce(hc);
+    return -16;
+  }
+  spinlock_release(&hc->event_lock);
+  uint64_t dispatch_deadline = lapic_timer_get_ms() + XHCI_WAIT_MS;
+  while (__atomic_load_n(&hc->event_dispatching, __ATOMIC_ACQUIRE) &&
+         lapic_timer_get_ms() < dispatch_deadline)
+    io_wait();
+  if (__atomic_load_n(&hc->event_dispatching, __ATOMIC_ACQUIRE) ||
+      xhci_pm_has_active_isoch(hc)) {
+    xhci_pm_unquiesce(hc);
+    return -16;
+  }
+
+  uint32_t command = mmio_read32(hc->op, XHCI_USBCMD);
+  mmio_write32(hc->op, XHCI_USBCMD,
+               command & ~(XHCI_CMD_RUN | XHCI_CMD_INTE));
+  if (!xhci_wait32(hc->op, XHCI_USBSTS, XHCI_STS_HALTED,
+                   XHCI_STS_HALTED)) {
+    /* A failed halt must not leave the USB stack believing the controller
+     * was suspended. Restore its previous running configuration. */
+    mmio_write32(hc->op, XHCI_USBCMD,
+                 command | XHCI_CMD_RUN | XHCI_CMD_INTE);
+    xhci_pm_unquiesce(hc);
+    return -16;
+  }
+  hc->running = false;
+  hc->suspended = true;
+  klog_puts("[XHCI] Controller halted for S3\n");
+  return 0;
+}
+
+static int xhci_pm_resume(struct device *dev) {
+  struct xhci_controller *hc = dev ? dev->driver_data : NULL;
+  if (!hc || !hc->suspended)
+    return -1;
+  __atomic_store_n(&hc->suspending, true, __ATOMIC_RELEASE);
+  if (hc->msix_enabled)
+    pci_msix_mask(&hc->msix, 0, true);
+  if (!xhci_pci_prepare(hc->pci)) {
+    hc->running = false;
+    klog_puts("[XHCI] S3 recovery: PCI/MMIO restore failed\n");
+    return -5;
+  }
+
+  /* Firmware/QEMU may return from S3 with the xHC reset. Old USB slot IDs and
+   * endpoint contexts then exist only in guest memory. Drop those logical
+   * devices without issuing commands to the controller, reset the HC, and
+   * enumerate its still-connected root ports again. */
+  __atomic_store_n(&hc->recovering, true, __ATOMIC_RELEASE);
+  klog_puts("[XHCI] S3 recovery: resetting controller and rebuilding USB state\n");
+  for (uint8_t port = 0; port < hc->max_ports && port < 32; port++)
+    if (hc->connected_ports & (1U << port))
+      usb_device_removed(&hc->hcd, port);
+  if (!xhci_halt_reset(hc)) {
+    hc->running = false;
+    __atomic_store_n(&hc->recovering, false, __ATOMIC_RELEASE);
+    klog_puts("[XHCI] S3 recovery: controller reset timed out\n");
+    return -5;
+  }
+  xhci_reset_runtime_state(hc);
+  if (!xhci_start(hc)) {
+    hc->running = false;
+    __atomic_store_n(&hc->recovering, false, __ATOMIC_RELEASE);
+    klog_puts("[XHCI] S3 recovery: controller restart timed out\n");
+    return -5;
+  }
+
+  /* Restore the PCI MSI route using the vector already installed at probe.
+   * The timer watchdog remains a working fallback if firmware lost MSI-X. */
+  bool unmask_msix = false;
+  if (hc->msix_enabled) {
+    if (pci_msix_init(hc->pci, &hc->msix) &&
+        pci_msix_program(&hc->msix, 0, hc->irq_vector,
+                         (uint8_t)lapic_get_id())) {
+      pci_msix_mask(&hc->msix, 0, true);
+      if (pci_msix_enable(&hc->msix))
+        unmask_msix = true;
+    }
+    if (!unmask_msix) {
+      hc->msix_enabled = false;
+      klog_puts("[XHCI] MSI-X route restore failed; using timer polling\n");
+    }
+  } else if (hc->msi_enabled &&
+             !pci_msi_enable(hc->pci, &hc->msi, hc->irq_vector,
+                             (uint8_t)lapic_get_id())) {
+    hc->msi_enabled = false;
+    klog_puts("[XHCI] MSI route restore failed; using timer polling\n");
+  }
+
+  hc->connected_ports = 0;
+  hc->pending_ports = 0;
+  hc->suspended = false;
+  __atomic_store_n(&hc->enumerating, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&hc->recovering, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&hc->suspending, false, __ATOMIC_RELEASE);
+  xhci_power_ports(hc);
+  xhci_enumerate_ports(hc);
+  hc->pending_ports = 0;
+  __atomic_store_n(&hc->enumerating, false, __ATOMIC_RELEASE);
+  if (unmask_msix)
+    pci_msix_mask(&hc->msix, 0, false);
+  mmio_write32(hc->runtime + 0x20, 0x00, XHCI_IMAN_IE | XHCI_IMAN_IP);
+  klog_puts("[XHCI] Controller resumed after S3\n");
+  return 0;
 }
 
 static struct xhci_trb *xhci_event_peek(struct xhci_controller *hc) {
@@ -455,7 +663,13 @@ static uint32_t xhci_drain_events(struct xhci_controller *hc,
 static bool xhci_submit_command(struct xhci_controller *hc, uint64_t parameter,
                                 uint32_t status, uint32_t control,
                                 uint8_t *slot_id) {
+  if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE))
+    return false;
   spinlock_acquire(&hc->command_lock);
+  if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE)) {
+    spinlock_release(&hc->command_lock);
+    return false;
+  }
   uint16_t index = hc->command_enqueue;
   struct xhci_trb *trb = &hc->command_ring[index];
   uint64_t phys = hc->command_ring_phys + index * sizeof(*trb);
@@ -500,7 +714,7 @@ static bool xhci_submit_command(struct xhci_controller *hc, uint64_t parameter,
       spinlock_release(&hc->command_lock);
       return ok;
     }
-    io_wait();
+    hal_cpu_relax();
   }
   hc->timeouts++;
   hc->debug_stage = "command timeout";
@@ -547,17 +761,99 @@ static uint16_t xhci_initial_mps(enum usb_speed speed) {
 
 static bool xhci_slot_alloc(struct xhci_controller *hc,
                             struct xhci_slot *slot) {
-  if (!xhci_alloc_page(hc, &slot->output_context,
-                       &slot->output_context_phys) ||
-      !xhci_alloc_page(hc, &slot->input_context, &slot->input_context_phys) ||
-      !xhci_alloc_page(hc, (void **)&slot->ep0_ring, &slot->ep0_ring_phys) ||
-      !xhci_alloc_page(hc, &slot->control_buffer, &slot->control_buffer_phys))
+  if ((!slot->output_context &&
+       !xhci_alloc_page(hc, &slot->output_context,
+                        &slot->output_context_phys)) ||
+      (!slot->input_context &&
+       !xhci_alloc_page(hc, &slot->input_context, &slot->input_context_phys)) ||
+      (!slot->ep0_ring &&
+       !xhci_alloc_page(hc, (void **)&slot->ep0_ring, &slot->ep0_ring_phys)) ||
+      (!slot->control_buffer &&
+       !xhci_alloc_page(hc, &slot->control_buffer,
+                        &slot->control_buffer_phys)))
     return false;
+  memset(slot->output_context, 0, 4096);
+  memset(slot->input_context, 0, 4096);
+  memset(slot->ep0_ring, 0, 4096);
+  memset(slot->control_buffer, 0, 4096);
+  slot->ep0_enqueue = 0;
   slot->ep0_cycle = 1;
   slot->ep0_ring[XHCI_RING_TRBS - 1].parameter = slot->ep0_ring_phys;
   slot->ep0_ring[XHCI_RING_TRBS - 1].control =
       XHCI_TRB_TYPE(XHCI_TRB_LINK) | XHCI_TRB_CYCLE | (1U << 1);
   return true;
+}
+
+/* Slot IDs are reused by the controller. Keep their DMA allocations when the
+ * software ownership record is cleared so re-enumeration does not leak pages. */
+static void xhci_slot_reset(struct xhci_slot *slot) {
+  void *output_context = slot->output_context;
+  uint64_t output_context_phys = slot->output_context_phys;
+  void *input_context = slot->input_context;
+  uint64_t input_context_phys = slot->input_context_phys;
+  struct xhci_trb *ep0_ring = slot->ep0_ring;
+  uint64_t ep0_ring_phys = slot->ep0_ring_phys;
+  void *control_buffer = slot->control_buffer;
+  uint64_t control_buffer_phys = slot->control_buffer_phys;
+  memset(slot, 0, sizeof(*slot));
+  slot->output_context = output_context;
+  slot->output_context_phys = output_context_phys;
+  slot->input_context = input_context;
+  slot->input_context_phys = input_context_phys;
+  slot->ep0_ring = ep0_ring;
+  slot->ep0_ring_phys = ep0_ring_phys;
+  slot->control_buffer = control_buffer;
+  slot->control_buffer_phys = control_buffer_phys;
+}
+
+/* S3 can reset the xHC while guest RAM remains intact. Point its rings and
+ * device-context table at a fresh software state before starting the HC. */
+static void xhci_reset_runtime_state(struct xhci_controller *hc) {
+  memset(hc->dcbaa, 0, 4096);
+  if (hc->scratchpad_count)
+    ((uint64_t *)hc->dcbaa)[0] = hc->scratchpad_array_phys;
+  memset(hc->command_ring, 0, 4096);
+  memset(hc->event_ring, 0, 4096);
+  memset(hc->erst, 0, 4096);
+  hc->command_enqueue = 0;
+  hc->command_cycle = 1;
+  hc->event_dequeue = 0;
+  hc->event_cycle = 1;
+  hc->last_command_trb = 0;
+  hc->last_command_slot = 0;
+  hc->last_completion_code = 0;
+  hc->last_transfer_trb = 0;
+  hc->last_transfer_code = 0;
+  hc->last_ep0_event_trb = 0;
+  hc->last_ep0_event_code = 0;
+  hc->event_dispatching = 0;
+  hc->pending_ports = 0;
+  hc->connected_ports = 0;
+  hc->late_rescan_attempts = 0;
+  hc->command_ring[XHCI_RING_TRBS - 1].parameter = hc->command_ring_phys;
+  hc->command_ring[XHCI_RING_TRBS - 1].control =
+      XHCI_TRB_TYPE(XHCI_TRB_LINK) | XHCI_TRB_CYCLE | (1U << 1);
+  hc->erst[0].base = hc->event_ring_phys;
+  hc->erst[0].size = XHCI_RING_TRBS;
+
+  for (uint16_t id = 1; id <= hc->max_slots; id++)
+    xhci_slot_reset(&hc->slots[id]);
+  for (uint32_t i = 0; i < XHCI_MAX_INTERRUPT_PIPES; i++) {
+    struct xhci_interrupt_state *state = &hc->interrupt_pipes[i];
+    struct xhci_trb *ring = state->ring;
+    uint64_t ring_phys = state->ring_phys;
+    memset(state, 0, sizeof(*state));
+    state->ring = ring;
+    state->ring_phys = ring_phys;
+  }
+  for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+    struct xhci_isoch_state *state = &hc->isoch_streams[i];
+    struct xhci_trb *ring = state->ring;
+    uint64_t ring_phys = state->ring_phys;
+    memset(state, 0, sizeof(*state));
+    state->ring = ring;
+    state->ring_phys = ring_phys;
+  }
 }
 
 static void xhci_build_address_context(struct xhci_controller *hc,
@@ -593,7 +889,7 @@ static int xhci_prepare_device(struct usb_hcd *hcd, struct usb_device *dev) {
     return -1;
   }
   struct xhci_slot *slot = &hc->slots[slot_id];
-  memset(slot, 0, sizeof(*slot));
+  xhci_slot_reset(slot);
   slot->device = dev;
   slot->id = slot_id;
   slot->port = dev->port;
@@ -840,7 +1136,7 @@ retry:
       hc->debug_stage = "EP0 completed";
       return 0;
     }
-    io_wait();
+    hal_cpu_relax();
   }
   hc->timeouts++;
   hc->debug_stage = "EP0 timeout";
@@ -858,9 +1154,13 @@ static int xhci_control_device(struct usb_hcd *hcd, struct usb_device *dev,
                                struct usb_control_request *req, void *data,
                                uint16_t len) {
   struct xhci_controller *hc = hcd ? hcd->priv : NULL;
-  if (!hc)
+  if (!hc || __atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE))
     return -1;
   spinlock_acquire(&hc->control_lock);
+  if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE)) {
+    spinlock_release(&hc->control_lock);
+    return -1;
+  }
   int result = xhci_control_device_locked(hcd, dev, req, data, len);
   spinlock_release(&hc->control_lock);
   return result;
@@ -961,6 +1261,8 @@ static bool xhci_reset_port(struct xhci_controller *hc, uint8_t port) {
 
 static void xhci_enumerate_ports(struct xhci_controller *hc) {
   for (uint8_t port = 0; port < hc->max_ports; port++) {
+    if (port < 32 && (hc->connected_ports & (1U << port)))
+      continue;
     uint32_t ps = mmio_read32(hc->op, XHCI_PORTSC + port * 0x10U);
     hc->debug_portsc[port] = ps;
     hc->debug_port_result[port] = (ps & XHCI_PORT_CCS) ? 1 : 0;
@@ -969,8 +1271,10 @@ static void xhci_enumerate_ports(struct xhci_controller *hc) {
     /* Claim before the reset: xhci_reset_port() takes up to 500 ms, and the
      * timer watchdog would otherwise service a port-status event for this same
      * port, reset it again and start a second enumeration mid-probe. */
-    if (port < 32)
+    if (port < 32) {
       hc->connected_ports |= 1U << port;
+      hc->pending_ports &= ~(1U << port);
+    }
     if (!xhci_reset_port(hc, port)) {
       klog_puts("[XHCI] Port reset failed\n");
       if (port < 32)
@@ -1019,6 +1323,33 @@ static void xhci_remove_device(struct usb_hcd *hcd, struct usb_device *dev) {
   struct xhci_slot *slot = dev ? dev->hcd_data : NULL;
   if (!slot || !slot->enabled)
     return;
+  if (__atomic_load_n(&hc->recovering, __ATOMIC_ACQUIRE)) {
+    for (uint32_t i = 0; i < XHCI_MAX_INTERRUPT_PIPES; i++) {
+      struct xhci_interrupt_state *state = &hc->interrupt_pipes[i];
+      if (state->pipe.dev != dev)
+        continue;
+      state->pipe.active = false;
+      state->pipe.dev = NULL;
+      __atomic_store_n(&state->completed, false, __ATOMIC_RELEASE);
+    }
+    for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+      struct xhci_isoch_state *state = &hc->isoch_streams[i];
+      if (state->stream.dev != dev)
+        continue;
+      __atomic_store_n(&state->stream.active, false, __ATOMIC_RELEASE);
+      __atomic_store_n(&state->disconnected, true, __ATOMIC_RELEASE);
+      __atomic_store_n(&state->stopping, false, __ATOMIC_RELEASE);
+      __atomic_store_n(&state->reserved, 0, __ATOMIC_RELEASE);
+      state->stream.dev = NULL;
+    }
+    ((uint64_t *)hc->dcbaa)[slot->id] = 0;
+    slot->enabled = false;
+    slot->device = NULL;
+    dev->hcd_data = NULL;
+    __atomic_store_n(&slot->removal_pending, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&slot->isoch_transition, 0, __ATOMIC_RELEASE);
+    return;
+  }
   for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
     struct xhci_isoch_state *state = &hc->isoch_streams[i];
     if (state->stream.dev == dev &&
@@ -1153,6 +1484,12 @@ static uint8_t xhci_interval_value(enum usb_speed speed, uint8_t interval) {
 
 static int xhci_interrupt_submit(struct xhci_controller *hc,
                                  struct xhci_interrupt_state *state) {
+  __atomic_add_fetch(&hc->pm_activity, 1, __ATOMIC_ACQ_REL);
+  if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&state->needs_resubmit, true, __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&hc->pm_activity, 1, __ATOMIC_ACQ_REL);
+    return -1;
+  }
   uint16_t index = state->enqueue;
   struct xhci_trb *trb = &state->ring[index];
   trb->parameter = state->pipe.buffer_phys;
@@ -1176,10 +1513,13 @@ static int xhci_interrupt_submit(struct xhci_controller *hc,
   __atomic_thread_fence(__ATOMIC_RELEASE);
   struct xhci_slot *slot = state->pipe.dev->hcd_data;
   if (!slot || !slot->enabled) {
+    __atomic_sub_fetch(&hc->pm_activity, 1, __ATOMIC_ACQ_REL);
     return -1;
   }
   hc->doorbells[slot->id] = state->endpoint_id;
   state->doorbell_rings++;
+  __atomic_store_n(&state->needs_resubmit, false, __ATOMIC_RELEASE);
+  __atomic_sub_fetch(&hc->pm_activity, 1, __ATOMIC_ACQ_REL);
   return 0;
 }
 
@@ -1202,12 +1542,18 @@ static struct usb_interrupt_pipe *xhci_interrupt_open(
   if (!state) {
     return NULL;
   }
+  struct xhci_trb *saved_ring = state->ring;
+  uint64_t saved_ring_phys = state->ring_phys;
   memset(state, 0, sizeof(*state));
+  state->ring = saved_ring;
+  state->ring_phys = saved_ring_phys;
   state->endpoint_id = (endpoint & 0x0FU) * 2U + 1U;
   if (state->endpoint_id < 2 || state->endpoint_id > 31 ||
-      !xhci_alloc_page(hc, (void **)&state->ring, &state->ring_phys)) {
+      (!state->ring &&
+       !xhci_alloc_page(hc, (void **)&state->ring, &state->ring_phys))) {
     return NULL;
   }
+  memset(state->ring, 0, 4096);
   state->cycle = 1;
   state->ring[XHCI_RING_TRBS - 1].parameter = state->ring_phys;
   state->ring[XHCI_RING_TRBS - 1].control =
@@ -1356,6 +1702,11 @@ static void xhci_interrupt_cancel(struct usb_hcd *hcd,
   struct xhci_slot *slot = pipe && pipe->dev ? pipe->dev->hcd_data : NULL;
   if (!state || !slot)
     return;
+  if (__atomic_load_n(&hc->recovering, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&state->completed, false, __ATOMIC_RELEASE);
+    pipe->active = false;
+    return;
+  }
   xhci_submit_command(hc, 0, 0,
                       XHCI_TRB_TYPE(XHCI_TRB_STOP_ENDPOINT) |
                           ((uint32_t)state->endpoint_id << 16) |
@@ -1500,12 +1851,14 @@ static int xhci_isoch_submit(struct usb_hcd *hcd,
   uint32_t expected = 0;
   hal_irq_state_t irq_flags = hal_irq_save();
   if (!hc || !state || !packet ||
+      __atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE) ||
       !__atomic_compare_exchange_n(&state->submitting, &expected, 1, false,
                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
     hal_irq_restore(irq_flags);
     return -1;
   }
   if (!__atomic_load_n(&stream->active, __ATOMIC_ACQUIRE) ||
+      __atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE) ||
       __atomic_load_n(&state->stopping, __ATOMIC_ACQUIRE) || !slot ||
       !slot->enabled || !stream->dev->connected ||
       !packet->buffer || !packet->buffer_phys || !packet->length ||
@@ -1672,7 +2025,13 @@ static void xhci_irq(struct registers *regs) {
     struct xhci_controller *hc = &controllers[i];
     if (hc->irq_vector == 0xFF || regs->int_no != hc->irq_vector)
       continue;
+    __atomic_add_fetch(&hc->pm_activity, 1, __ATOMIC_ACQ_REL);
     uint32_t iman = mmio_read32(hc->runtime + 0x20, 0);
+    if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE)) {
+      mmio_write32(hc->runtime + 0x20, 0, iman | XHCI_IMAN_IP);
+      __atomic_sub_fetch(&hc->pm_activity, 1, __ATOMIC_ACQ_REL);
+      return;
+    }
     hc->interrupts++;
     hc->irq_count++;
     if (!hc->irq_reported) {
@@ -1685,9 +2044,11 @@ static void xhci_irq(struct registers *regs) {
     mmio_write32(hc->runtime + 0x20, 0,
                  (iman & XHCI_IMAN_IE) | XHCI_IMAN_IP);
     xhci_drain_events(hc, 0);
-    xhci_service_ports(hc);
+    if (!__atomic_load_n(&hc->enumerating, __ATOMIC_ACQUIRE))
+      xhci_service_ports(hc);
     usb_kbd_poll();
     usb_mouse_poll();
+    __atomic_sub_fetch(&hc->pm_activity, 1, __ATOMIC_ACQ_REL);
     return;
   }
 }
@@ -1732,17 +2093,35 @@ static void xhci_rescan_idle_ports(struct xhci_controller *hc) {
 
 void xhci_msix_watchdog(void) {
   static bool checking;
+  static uint64_t next_watchdog_ms;
   static uint64_t next_rescan_ms;
   static uint64_t next_enum_retry_ms;
   if (__atomic_test_and_set(&checking, __ATOMIC_ACQUIRE))
     return;
+
+  /* This fallback inspects the event ring, endpoint recovery state, and slot
+   * table. Running it at every LAPIC tick needlessly steals BSP time from the
+   * desktop on interrupt-capable controllers. IRQs still service events
+   * immediately; a 10 ms watchdog interval is only the lost-IRQ fallback. */
+  uint64_t now = lapic_timer_get_ms();
+  if (now < next_watchdog_ms) {
+    __atomic_clear(&checking, __ATOMIC_RELEASE);
+    return;
+  }
+  next_watchdog_ms = now + 10;
+
+  for (int i = 0; i < controller_count; i++) {
+    if (__atomic_load_n(&controllers[i].suspending, __ATOMIC_ACQUIRE)) {
+      __atomic_clear(&checking, __ATOMIC_RELEASE);
+      return;
+    }
+  }
 
   /* Late-enumeration sweep every ~500 ms: real controllers can report a
    * port's connect status long after the host reset, and a second device
    * (e.g. a mouse plugged in next to the keyboard's receiver) must still be
    * picked up while another port is already claimed.  Port status events
    * drive hotplug after this window. */
-  uint64_t now = lapic_timer_get_ms();
   bool do_rescan = now >= next_rescan_ms;
   if (do_rescan)
     next_rescan_ms = now + 500;
@@ -1755,13 +2134,28 @@ void xhci_msix_watchdog(void) {
 
   for (int i = 0; i < controller_count; i++) {
     struct xhci_controller *hc = &controllers[i];
-    if (!hc->running)
+    __atomic_add_fetch(&hc->pm_activity, 1, __ATOMIC_ACQ_REL);
+    if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE)) {
+      __atomic_sub_fetch(&hc->pm_activity, 1, __ATOMIC_ACQ_REL);
       continue;
+    }
+    if (!hc->running) {
+      __atomic_sub_fetch(&hc->pm_activity, 1, __ATOMIC_ACQ_REL);
+      continue;
+    }
     /* This reads only cached DMA memory. It recovers lost interrupt edges and
        supports controllers which expose neither MSI-X nor MSI. */
     uint64_t before = hc->events_seen;
     xhci_drain_events(hc, 0);
-    if (hc->events_seen != before)
+    for (uint32_t pipe_index = 0; pipe_index < XHCI_MAX_INTERRUPT_PIPES;
+         pipe_index++) {
+      struct xhci_interrupt_state *state = &hc->interrupt_pipes[pipe_index];
+      if (state->pipe.active &&
+          __atomic_load_n(&state->needs_resubmit, __ATOMIC_ACQUIRE))
+        xhci_interrupt_submit(hc, state);
+    }
+    bool enumerating = __atomic_load_n(&hc->enumerating, __ATOMIC_ACQUIRE);
+    if (!enumerating && hc->events_seen != before)
       xhci_service_ports(hc);
     /* Port removal is initiated in IRQ context. If a stream transition was
      * already in flight, the IRQ only marked it pending; retry here once the
@@ -1777,10 +2171,11 @@ void xhci_msix_watchdog(void) {
      * even when nothing happened.  The poll only inspects cached flags. */
     usb_kbd_poll();
     usb_mouse_poll();
-    if (do_rescan && hc->late_rescan_attempts < 40) {
+    if (!enumerating && do_rescan && hc->late_rescan_attempts < 40) {
       hc->late_rescan_attempts++;
       xhci_rescan_idle_ports(hc);
     }
+    __atomic_sub_fetch(&hc->pm_activity, 1, __ATOMIC_ACQ_REL);
   }
   __atomic_clear(&checking, __ATOMIC_RELEASE);
 }
@@ -1832,7 +2227,10 @@ static bool xhci_probe(struct pci_device *pci) {
   hc->pci = pci;
   klogf("[XHCI] probing %02x:%02x.%u vendor=0x%04X device=0x%04X\n",
         pci->bus, pci->slot, pci->func, pci->vendor_id, pci->device_id);
-  xhci_pci_prepare(pci);
+  if (!xhci_pci_prepare(pci)) {
+    last_probe_failure = "PCI BAR restore";
+    return false;
+  }
   hc->mmio_phys = xhci_bar0(pci);
   if (!hc->mmio_phys) {
     last_probe_failure = "invalid BAR0";
@@ -1958,8 +2356,11 @@ static bool xhci_probe(struct pci_device *pci) {
     klog_puts(", MSI)\n");
   else
     klog_puts(", timer fallback)\n");
+  __atomic_store_n(&hc->enumerating, true, __ATOMIC_RELEASE);
   xhci_power_ports(hc);
   xhci_enumerate_ports(hc);
+  hc->pending_ports = 0;
+  __atomic_store_n(&hc->enumerating, false, __ATOMIC_RELEASE);
   hc->debug_usbcmd = mmio_read32(hc->op, XHCI_USBCMD);
   hc->debug_usbsts = mmio_read32(hc->op, XHCI_USBSTS);  last_probe_failure = "none";
   return true;
@@ -1983,6 +2384,7 @@ void xhci_init(void) {
       xhci_probe(pci);
     }
   }
+  dm_register_driver(&xhci_device_driver);
   if (!controller_count)
     klog_puts("[XHCI] No operational xHCI controller found\n");
 }
@@ -2159,4 +2561,26 @@ void xhci_interrupt_pipe_diag(struct usb_diag *d,
                   s->completion_code, s->last_length, s->last_residual,
                   s->last_event_status, s->last_event_control,
                   (unsigned long long)s->expected_trb, s->enqueue, s->cycle);
+}
+
+bool xhci_interrupt_pipe_healthy(const struct usb_interrupt_pipe *pipe) {
+  if (!pipe || !pipe->active || !pipe->dev || !pipe->dev->hcd ||
+      !pipe->dev->hcd->name || strcmp(pipe->dev->hcd->name, "xhci") != 0 ||
+      !pipe->hcd_data)
+    return false;
+  const struct xhci_interrupt_state *s = pipe->hcd_data;
+  const struct xhci_controller *hc = pipe->dev->hcd->priv;
+  const struct xhci_slot *slot = pipe->dev->hcd_data;
+  if (!hc)
+    return false;
+  if (hc->suspending || hc->suspended || hc->recovering)
+    return true;
+  if (!hc->running || !slot || !slot->enabled || !slot->output_context ||
+      s->endpoint_id < 2 || s->endpoint_id >= 32)
+    return false;
+  if (s->submitted == 0 || s->errors != 0)
+    return false;
+  const uint32_t *out_ep =
+      xhci_context(slot->output_context, s->endpoint_id, hc->context_64);
+  return (out_ep[0] & 0x7U) == 1U;
 }

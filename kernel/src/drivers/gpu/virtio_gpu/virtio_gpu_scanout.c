@@ -265,8 +265,17 @@ bool vgpu_scanout_copy_damage(struct vgpu_scanout_head *head,
     }
     struct vgpu_scanout_damage upload = image->pixels_valid ? image->pending :
         (struct vgpu_scanout_damage){0, 0, source->view_width, source->view_height};
-    image->compared_pixels = image->host_pixels_valid ? (uint64_t)upload.width * upload.height : 0;
-    if (image->host_pixels_valid)
+    uint64_t upload_pixels = (uint64_t)upload.width * upload.height;
+    uint64_t frame_pixels = (uint64_t)source->view_width * source->view_height;
+    /* Pixel comparison helps when a compositor submits a small or padded
+     * dirty rectangle. For a large redraw, comparing every pixel and then
+     * copying the same region just adds a full extra memory read before the
+     * transfer we already need. Keep exact no-change detection for smaller
+     * updates and send large dirty regions directly. */
+    bool compare_pixels = image->host_pixels_valid && frame_pixels &&
+                          upload_pixels <= frame_pixels / 4U;
+    image->compared_pixels = compare_pixels ? upload_pixels : 0;
+    if (compare_pixels)
         upload = scanout_changed_rect(image, source, upload);
     if (upload.width && upload.height)
         image->host_pixels_valid = false;
@@ -405,4 +414,81 @@ bool vgpu_scanout_detach(struct vgpu_scanout_head *head,
     head->current = head->pending = NULL;
     vgpu_scanout_collect(head, ops);
     return !head->retired;
+}
+
+static void discard_retired_after_reset(struct vgpu_scanout_head *head) {
+    while (head->retired) {
+        struct vgpu_scanout_surface *surface = head->retired;
+        head->retired = surface->next;
+        for (unsigned i = 0; i < 2; i++) {
+            if (surface->images[i].storage)
+                dma_free(surface->images[i].storage);
+        }
+        kfree(surface);
+    }
+}
+
+static bool restore_surface(struct vgpu_scanout_surface *surface,
+                            const struct vgpu_scanout_ops *ops,
+                            uint32_t selected_resource) {
+    if (!surface)
+        return true;
+    uint32_t bytes = surface->width * surface->height * 4U;
+    for (unsigned i = 0; i < 2; i++) {
+        struct vgpu_scanout_image *image = &surface->images[i];
+        if (!image->storage || !image->resource_id)
+            return false;
+        if (!ops->create(image->resource_id, surface->width, surface->height))
+            return false;
+        image->counted = true;
+        if (!ops->attach(image->resource_id, image->storage->phys, bytes))
+            return false;
+        /* Only the selected image is visible immediately after resume. Its
+         * backing bytes survived in guest DMA memory, so restore those pixels
+         * before selecting it. The other swapchain image is repainted by the
+         * next present; uploading it here doubles wake latency for no benefit. */
+        image->host_pixels_valid = image->resource_id == selected_resource;
+        if (image->host_pixels_valid &&
+            !ops->transfer(image->resource_id, surface->width, surface->height))
+            return false;
+    }
+    surface->source_valid = false;
+    return true;
+}
+
+bool vgpu_scanout_restore(struct vgpu_scanout_head *head,
+                          const struct vgpu_scanout_ops *ops,
+                          uint32_t scanout) {
+    if (!head || !ops || !ops->create || !ops->attach || !ops->transfer ||
+        !ops->select || !ops->flush)
+        return false;
+
+    uint32_t selected = head->selected_id;
+    discard_retired_after_reset(head);
+    head->selected_id = 0;
+    head->selection_unknown = false;
+    if (!restore_surface(head->current, ops, selected) ||
+        !restore_surface(head->pending, ops, selected))
+        return false;
+
+    struct vgpu_scanout_surface *surfaces[2] = {head->current, head->pending};
+    for (unsigned s = 0; s < 2; s++) {
+        struct vgpu_scanout_surface *surface = surfaces[s];
+        if (!surface)
+            continue;
+        for (unsigned i = 0; i < 2; i++) {
+            struct vgpu_scanout_image *image = &surface->images[i];
+            if (image->resource_id != selected)
+                continue;
+            if (!ops->select(scanout, selected, surface->width, surface->height) ||
+                !ops->flush(selected, surface->width, surface->height))
+                return false;
+            head->selected_id = selected;
+            image->host_pixels_valid = true;
+            vgpu_scanout_invalidate(head);
+            return true;
+        }
+    }
+    vgpu_scanout_invalidate(head);
+    return true;
 }

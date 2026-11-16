@@ -15,6 +15,9 @@ void pmm_init_early(uint64_t hhdm_offset);
 // offset.
 void pmm_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset);
 
+// Rebuild buddy free lists from pmm_bitmap/pmm_managed_bitmap (used on S4 resume).
+void pmm_rebuild_free_lists_from_bitmap(void);
+
 // Initialize Per-CPU Page Frame Allocator (PCP) caches after SMP/CPU is initialized
 void pmm_pcp_init(void);
 void pmm_pcp_drain_local(void);

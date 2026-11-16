@@ -16,4 +16,6 @@ uint8_t rtl8139_irq_line(void);
 void *rtl8139_rx_phys(void);
 void *rtl8139_tx_phys(void);
 bool rtl8139_present(void);
+int rtl8139_pm_suspend(void);
+int rtl8139_pm_resume(void);
 #endif

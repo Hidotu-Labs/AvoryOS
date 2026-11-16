@@ -74,15 +74,19 @@ static inline bool serial_lock_bounded(void) {
   return false;
 }
 
-void serial_init(void) {
-  spinlock_acquire(&serial_lock);
-
+static void serial_program_registers(void) {
   outb(COM1 + 1, 0x00); // Disable all interrupts
   outb(COM1 + 3, 0x80); // Enable DLAB (set baud rate divisor)
   outb(COM1 + 0, 0x01); // Set divisor to 1 (lo byte) 115200 baud
   outb(COM1 + 1, 0x00); //                  (hi byte)
   outb(COM1 + 3, 0x03); // 8 bits, no parity, one stop bit
   outb(COM1 + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
+}
+
+void serial_init(void) {
+  spinlock_acquire(&serial_lock);
+
+  serial_program_registers();
 
   /* Hardware presence detection: 16550 loopback test */
   outb(COM1 + 4, 0x1E); // Set loopback mode
@@ -97,6 +101,15 @@ void serial_init(void) {
 
   serial_initialized = true;
 
+  spinlock_release(&serial_lock);
+}
+
+void serial_resume(void) {
+  spinlock_acquire(&serial_lock);
+  if (serial_initialized && serial_hardware_present) {
+    serial_program_registers();
+    outb(COM1 + 4, 0x0B);
+  }
   spinlock_release(&serial_lock);
 }
 

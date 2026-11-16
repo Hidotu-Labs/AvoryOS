@@ -57,6 +57,7 @@ struct xhci_interrupt_state {
   uint64_t expected_trb;
   uint8_t completion_code;
   bool completed;
+  volatile bool needs_resubmit;
   uint64_t completions;
   uint32_t pipe_errors;
   /* Verbose per-pipe tracing counters, reported at /proc/usb. */
@@ -112,6 +113,12 @@ struct xhci_controller {
   bool context_64;
   bool ac64;
   bool running;
+  volatile bool suspending;
+  bool suspended;
+  /* Suppress commands while S3 recovery invalidates controller-owned slots. */
+  volatile bool recovering;
+  volatile bool enumerating;
+  volatile uint32_t pm_activity;
   /* Bitmap of ports whose Supported Protocol capability says USB3.  A port's
    * speed field reads 0 until a SuperSpeed link trains, so the reset type
    * (warm reset vs bus reset) must come from the protocol, not the speed. */
@@ -215,6 +222,7 @@ void xhci_diag(struct usb_diag *d);
  * transfer event.  Used by /proc/usb_mouse so one short read is decisive. */
 void xhci_interrupt_pipe_diag(struct usb_diag *d,
                               struct usb_interrupt_pipe *pipe);
+bool xhci_interrupt_pipe_healthy(const struct usb_interrupt_pipe *pipe);
 int xhci_get_controller_count(void);
 int xhci_get_matched_count(void);
 const char *xhci_get_last_probe_failure(void);

@@ -1,0 +1,578 @@
+[SLAB] Named object slab cache subsystem initialized.
+[SLAB] Created cache 'vma': obj_size=120 aligned=120 per_slab=33
+[DMA] Allocator initialized
+[CONSOLE] build Nov 16 2026 23:06:01 (scrollback: Shift+PgUp/PgDn, Shift+Up/Down, Shift+Home/End)
+[  OK  ] Device core initialized.
+[  OK  ] Checking for platform DTB...
+      No platform DTB provided (standard for x86/ACPI).
+[INFO] Initializing ACPI...
+[OK] ACPI 2.0+ (XSDT) detected.
+[OK] MADT table found.
+     Local APIC Base: 0xFEE00000
+
+     ISO: IRQ0 -> GSI 2 (flags=0x00000000)
+     ISO: IRQ5 -> GSI 5 (flags=0x0000000D)
+     ISO: IRQ9 -> GSI 9 (flags=0x0000000D)
+     ISO: IRQ10 -> GSI 10 (flags=0x0000000D)
+     ISO: IRQ11 -> GSI 11 (flags=0x0000000D)
+     CPU Cores active: 8
+[INFO] Initializing HPET...
+[OK] HPET ACPI table found.
+     HPET Base Address: 0x00000000FED00000
+     Timer Count: 3
+     Counter Size: 64-bit
+     Legacy Route: Capable
+     Frequency: 100 MHz (100000000 Hz)
+[OK] HPET initialized successfully.
+[OK] FADT table found.
+     Sleep states in DSDT: S3 S4 S5
+     Revision: 3.0
+     PM Profile: Unspecified
+     SCI Interrupt: 0x00000009
+     SMI Command Port: 0x000000B2
+     ACPI Enable Value: 0x02
+     ACPI Disable Value: 0x03
+     PM1a Event Block: 0x00000600
+     PM1a Control Block: 0x00000604
+     PM Timer Block: 0x00000608 (length: 4)
+     GPE0 Block: 0x00000620 (length: 16)
+     C2 Latency: 4095 us
+     C3 Latency: 4095 us
+     Feature Flags: 0x000084A5
+       - C1 power state supported
+       - Reset register supported
+     Reset Register: 0x00000CF9 (value: 0x0F)
+     Boot Arch Flags: 0x00000002
+       - MSI devices supported
+[  OK  ] Initializing per-CPU data structures...
+[  OK  ] Per-CPU structures initialized.
+     Total CPUs: 8
+     CPU 0: APIC ID=0x00000000, Stack=0xFFFF8000, Node 0 [BSP]
+     CPU 1: APIC ID=0x00000001, Stack=0xFFFF8000, Node 0 [OFFLINE]
+     CPU 2: APIC ID=0x00000002, Stack=0xFFFF8000, Node 0 [OFFLINE]
+     CPU 3: APIC ID=0x00000003, Stack=0xFFFF8000, Node 0 [OFFLINE]
+     CPU 4: APIC ID=0x00000004, Stack=0xFFFF8000, Node 0 [OFFLINE]
+     CPU 5: APIC ID=0x00000005, Stack=0xFFFF8000, Node 0 [OFFLINE]
+     CPU 6: APIC ID=0x00000006, Stack=0xFFFF8000, Node 0 [OFFLINE]
+     CPU 7: APIC ID=0x00000007, Stack=0xFFFF8000, Node 0 [OFFLINE]
+[  OK  ] GS base self-pointer verified for BSP.
+[32m[  OK  ][0m Transitioning to kernel-allocated stack...
+[32m[  OK  ][0m Switched to kernel-allocated stack.
+[32m[  OK  ][0m Initializing Scheduler...
+
+[32m[  OK  ][0m Switching to APIC interrupt mode...
+[32m[  OK  ][0m Legacy 8259 PIC disabled.
+[OK] Local APIC Base: 0xFEE00000
+     APIC ID: 0x00000000, Version: 0x00000014
+[OK] I/O APIC ID: 0x00000000, Max Redirections: 24, GSI Base: 0
+[32m[  OK  ][0m APIC interrupt mode ACTIVE.
+
+[CPU] TSC re-calibrated against HPET: 3790.692 MHz
+[INFO] Calibrating LAPIC timer...
+     LAPIC ticks/ms: 0x0000F470 (62576), reference HPET
+[OK] LAPIC Timer started: one-shot (vector 48)
+[34m[ INFO ][0m HPET available as backup timer.
+[TLB] Shootdown IPI handler registered on vector 0x0x000000F0
+[LOCKDIAG] Hang detector armed: probe vector 0x0x00000060, hung-CPU threshold 3000 ms, stuck-waiter threshold off (make LOCKDIAG_STUCK_MS=30000 to enumerate futex waiters; long parks are listed in a hang report either way), lock owner tracking OFF (rebuild with make LOCKDIAG_OWNER=1)
+[  OK  ] Waking up Application Processors...
+AP IN MAIN!
+AP IN MAIN!
+AP IN MAIN!
+AP IN MAIN!
+AP IN MAIN!
+     AP Woke up! CPU      AP Woke up! CPU      AP Woke up! CPU 53     AP Woke up! CPU  (APIC ID      AP Woke up! CPU  (APIC ID 721AP IN MAIN!
+AP IN MAIN!
+     AP Woke up! CPU      AP Woke up! CPU 640x000000030x00000005) ONLINE.
+) ONLINE.
+ (APIC ID  (APIC ID [RAMDISK] No Limine modules provided.
+ (APIC ID  (APIC ID 0x00000006 (APIC ID 0x00000002) ONLINE.
+[PMM] Analyzing buffered memory map for reclamation...
+0x000000070x00000001[PMM] Reclaiming unprotected bootloader pages...
+0x00000004[PMM] Bootloader memory reclaimed. Usable RAM now: ) ONLINE.
+) ONLINE.
+) ONLINE.
+4008) ONLINE.
+ MB
+[PMM] Per-CPU Page Frame Allocator (PCP) initialized.
+[32m[  OK  ][0m Initializing RamFS & Virtual Filesystem (VFS)...
+[SLAB] Created cache 'vfs_node': obj_size=736 aligned=736 per_slab=5
+[VFS] deferred node reclamation active, IPI 0x00000062
+[SHM] Shared memory subsystem initialized.
+     Segment 0: Bus 0-255 at 0x00000000E0000000
+[  OK  ] Scanning PCI bus...
+[  OK  ] PCI: Found 10 device(s). Dumping Device Tree...
+Device Tree Hierarchy:
+- 
+  - sys
+    - lapic
+    - ioapic0
+    - pci
+      - seg0
+        - 0000:00:00.0
+        - 0000:00:01.0
+        - 0000:00:02.0
+        - 0000:00:03.0
+        - 0000:00:04.0
+        - 0000:00:05.0
+        - 0000:00:06.0
+        - 0000:00:1f.0
+        - 0000:00:1f.2
+        - 0000:00:1f.3
+[VIRTIO-GPU] Found PCI device
+[VIRTIO-PCI] BAR0 mapped at virt=0xFFFF800080000000
+[VIRTIO-PCI] BAR2 mapped at virt=0xFFFFB0000000C000
+[VIRTIO-PCI] Found NOTIFY_CFG at BAR2+0x00003000 mult=0x00000004
+[VIRTIO-PCI] Found DEVICE_CFG at BAR2+0x00002000
+[VIRTIO-PCI] Found ISR_CFG
+[VIRTIO-PCI] Found COMMON_CFG at BAR2+0x00001000
+[VIRTIO-PCI] Queue 0 initialized: size=256 desc=0x000000007A5D6000
+[VIRTIO-PCI] Queue 1 initialized: size=16 desc=0x000000007A5D5000
+[VIRTIO-GPU] Virgl rendering enabled (preallocated queued host fences)
+[VIRTIO-GPU] Ready: scanouts=1 capsets=2 EDID=1
+[VIRTIO-GPU] scanout 0: 1280x800
+[VIRTIO-GPU] S3 suspend owner registered
+[32m[  OK  ][0m USB: Subsystem initialized.
+[USB] core build Nov 16 2026 20:54:23
+[32m[  OK  ][0m Searching for EHCI controllers...
+[XHCI] probing 00:04.0 vendor=0x1B36 device=0x000D
+[XHCI] Found controller: version=0x0x00000000 slots=64 ports=8 scratchpads=0
+[XHCI] protocol caps: rev=2 ports 5..8 (USB2)
+[XHCI] Command/event rings operational (v0x00000000, MSI-X)
+[32m[  OK  ][0m USB: New device detected on port 5 (High-Speed)
+[32m[  OK  ][0m USB: Enumerating device...
+[32m[  OK  ][0m USB: Max Packet Size: 64
+[32m[  OK  ][0m USB: Device Vendor: 0x00000627 Product: 0x00000001
+[USB-KBD] Interface: class=0x0x00000003 subclass=0x0x00000001 protocol=0x0x00000001
+[USB-KBD] HID keyboard interface selected
+[USB-KBD] Found Interrupt IN endpoint: addr=0x0x00000081 maxpkt=8 interval=7ms
+[USB-KBD] USB Boot Keyboard detected!
+[XHCI] Interrupt endpoint state=1
+[XHCI] Interrupt endpoint configured
+[USB-KBD] Generic HCD interrupt pipe active
+[USB-KBD] Keyboard driver attached (addr=1, ep=1)
+[USB-MOUSE] driver build Nov 16 2026 23:06:02
+[USB-MOUSE] probe begin addr=1 port=5 speed=High-Speed hcd=xhci vid=0x0627 pid=0x0001 class=0x00
+[USB-MOUSE] using state slot 0 (mouse_count=1)
+[USB-MOUSE] config total_len=34 num_interfaces=1 config_value=1 attributes=0xA0 max_power=50
+[USB-MOUSE] Interface: class=0x0x00000003 subclass=0x0x00000001 protocol=0x0x00000001
+[USB-MOUSE] No HID mouse interface found
+[32m[  OK  ][0m USB: Keyboard driver attached
+[32m[  OK  ][0m USB: New device detected on port 6 (High-Speed)
+[32m[  OK  ][0m USB: Enumerating device...
+[32m[  OK  ][0m USB: Max Packet Size: 64
+[32m[  OK  ][0m USB: Device Vendor: 0x00000627 Product: 0x00000001
+[USB-KBD] Interface: class=0x0x00000003 subclass=0x0x00000001 protocol=0x0x00000002
+[USB-MOUSE] driver build Nov 16 2026 23:06:02
+[USB-MOUSE] probe begin addr=2 port=6 speed=High-Speed hcd=xhci vid=0x0627 pid=0x0001 class=0x00
+[USB-MOUSE] using state slot 0 (mouse_count=1)
+[USB-MOUSE] config total_len=34 num_interfaces=1 config_value=1 attributes=0xA0 max_power=50
+[USB-MOUSE] Interface: class=0x0x00000003 subclass=0x0x00000001 protocol=0x0x00000002
+[USB-MOUSE] Interrupt IN endpoint: addr=0x0x00000081 maxpkt=4 interval=7
+[USB-HID] report descriptor iface=0 req_len=1024 -> ok
+[USB-MOUSE] HID mouse detected (iface=0, protocol=2, layout=report)
+[USB-MOUSE] GET_PROTOCOL iface=0 -> res=0 value=1
+[USB-MOUSE] Layout: no report-id, 1 report(s), 5 button(s)
+[USB-MOUSE]   report id=0 size=4 bytes, fields: button#1@0+1 button#2@1+1 button#3@2+1 button#4@3+1 button#5@4+1 X@8+8s Y@16+8s wheel@24+8s
+[USB-MOUSE] GET_REPORT(input) ok
+[XHCI] Interrupt endpoint state=1
+[XHCI] Interrupt endpoint configured
+[USB-MOUSE] Generic HCD interrupt pipe active
+[USB-MOUSE] Mouse driver attached (addr=2, ep=1, iface=0, transport=generic)
+[32m[  OK  ][0m USB: Mouse driver attached
+[INFO] Searching for UHCI (USB 1.x) controllers...
+[WARN] No UHCI controllers found.
+[OHCI] Initializing controllers...
+[  OK  ] NVMe: nvme0 completions: MSI-X 8 vectors (one per queue)
+NVME-IRQ: nvme0 mode=msix vectors=8 queues=8
+NVME-IRQ-DEST: nvme0 vec=103 apic=0
+NVME-IRQ-DEST: nvme0 vec=104 apic=1
+NVME-IRQ-DEST: nvme0 vec=105 apic=2
+NVME-IRQ-DEST: nvme0 vec=106 apic=3
+NVME-IRQ-DEST: nvme0 vec=107 apic=4
+NVME-IRQ-DEST: nvme0 vec=108 apic=5
+NVME-IRQ-DEST: nvme0 vec=109 apic=6
+NVME-IRQ-DEST: nvme0 vec=110 apic=7
+[  OK  ] NVMe: nvme0 SN="avoryos-s4" MN="QEMU NVMe Ctrl" FR="11.1.2" NN=256 MDTS=7 max_xfer=524288
+[  OK  ] NVMe: nvme0 nsid=1 NSZE=12582912 LBADS=9 (512-byte LBAs, 12582912 sectors)
+[NVMe] nvme0 allocated 1/8 requested I/O queue pairs
+[  OK  ] NVMe: 00:06.0 nvme0 VS=1.4 CAP{mqes=2047 cqr=1 to=15 dstrd=0 css=41 mpsmin=0 mpsmax=4}
+[  OK  ] NVMe: nvme0 1 I/O queue(s), 8 completion vector(s)
+NVME-QUEUES: nvme0 io=1 vectors=8 wanted=8
+[VFS] Registering 'nvme0n1' in /dev
+[VFS] Registering 'nvme0n1p1' in /dev
+[  OK  ] nvme0n1: GPT part 1: "s4swap" [PARTUUID=55686925-fb41-4f90-b1d4-810f8450d005] (Linux swap)
+[  OK  ] NVMe: nvme1 completions: MSI-X 8 vectors (one per queue)
+NVME-IRQ: nvme1 mode=msix vectors=8 queues=8
+NVME-IRQ-DEST: nvme1 vec=111 apic=0
+NVME-IRQ-DEST: nvme1 vec=112 apic=1
+NVME-IRQ-DEST: nvme1 vec=113 apic=2
+NVME-IRQ-DEST: nvme1 vec=114 apic=3
+NVME-IRQ-DEST: nvme1 vec=115 apic=4
+NVME-IRQ-DEST: nvme1 vec=116 apic=5
+NVME-IRQ-DEST: nvme1 vec=117 apic=6
+NVME-IRQ-DEST: nvme1 vec=118 apic=7
+[  OK  ] NVMe: nvme1 SN="avoryos0" MN="QEMU NVMe Ctrl" FR="11.1.2" NN=256 MDTS=7 max_xfer=524288
+[  OK  ] NVMe: nvme1 nsid=1 NSZE=29360128 LBADS=9 (512-byte LBAs, 29360128 sectors)
+[NVMe] nvme1 allocated 1/8 requested I/O queue pairs
+[  OK  ] NVMe: 00:01.0 nvme1 VS=1.4 CAP{mqes=2047 cqr=1 to=15 dstrd=0 css=41 mpsmin=0 mpsmax=4}
+[  OK  ] NVMe: nvme1 1 I/O queue(s), 8 completion vector(s)
+NVME-QUEUES: nvme1 io=1 vectors=8 wanted=8
+[VFS] Registering 'nvme1n1' in /dev
+[VFS] Registering 'nvme1n1p1' in /dev
+[  OK  ] nvme1n1: GPT part 1: "rootfs" [PARTUUID=40ae25c1-8b8f-4947-8587-5dde196ed67e] (Linux root (x86-64))
+[  OK  ] NVMe: 2 controller(s), 2 namespace(s) initialized.
+     Port 2: ATAPI drive found. Skipping.
+[ FAIL ] No SATA drives successfully initialized.
+[AHCI] initialization completed in 4 ms
+[  OK  ] Probing ATA drives...
+[ FAIL ] No ATA drives detected.
+[S4] Valid hibernation image detected; loading...
+[S4] Quiescing APs, relocating memory, and jumping to saved context...
+[OK] I/O APIC ID: 0x00000000, Max Redirections: 24, GSI Base: 0
+[CPU] TSC re-calibrated against HPET: 3790.720 MHz
+[  OK  ] Waking up Application Processors...
+AP IN MAIN!
+AP IN MAIN!
+AP IN MAIN!
+AP IN MAIN!
+AP IN MAIN!
+     AP Woke up! CPU      AP Woke up! CPU 4AP IN MAIN!
+AP IN MAIN!
+     AP Woke up! CPU      AP Woke up! CPU      AP Woke up! CPU      AP Woke up! CPU 2 (APIC ID  (APIC ID 0x000000040x0000000217) ONLINE.
+3) ONLINE.
+ (APIC ID 5 (APIC ID 0x00000003 (APIC ID  (APIC ID 0x000000050x00000001) ONLINE.
+) ONLINE.
+) ONLINE.
+0x00000007) ONLINE.
+
+
+[LOCKDIAG] ================= HANG REPORT =================
+[LOCKDIAG] reason: cpu 0 stopped taking timer ticks
+[LOCKDIAG] reporter cpu=2 cpus=8 tsc_mhz=3790 since-lockdiag-init=11086ms
+[LOCKDIAG] probe acks: cpu7..cpu0 = YNYYYYYN
+[CPU  0] status=1 ticks=2196 last-tick=3250ms-ago
+[LOCKDIAG]   PROBE-UNANSWERED: not executing kernel code with interrupts enabled (spinning in a critical section, or dead)
+[LOCKDIAG]   WAITING-ON lock=0xFFFFFFFF81693088 at=0xFFFFFFFF80127D4A for=3250ms
+[LOCKDIAG]   cur tid=203 tgid=203 comm='s3-power' state=RUNNING
+[LOCKDIAG]   stack: 0xFFFFFFFF80138B40 0xFFFFFFFF801C3D09 0xFFFFFFFF800C8A64 0xFFFFFFFF800C8A50 0xFFFFFFFF801C3BE6 0xFFFFFFFF80127D4A 0xFFFFFFFF801C3C57 0xFFFFFFFF801C3BE1 0xFFFFFFFF801332BA 0xFFFFFFFF800DEAD9 0xFFFFFFFF8013174F 0xFFFFFFFF8012A8BF 0xFFFFFFFF800E36E8 0xFFFFFFFF80017225
+[CPU  1] status=2 ticks=5215
+[LOCKDIAG]   PROBE-ACK rip=0xFFFFFFFF801C2EE2 rsp=0xFFFF80007BE6FFF8 IF=1
+[LOCKDIAG]   cur tid=2147483633 tgid=2147483633 comm='idle' state=RUNNING
+[LOCKDIAG]   stack: 0xFFFFFFFF8013F66E 0xFFFFFFFF801C2EE2 0xFFFFFFFF801C3B60 0xFFFFFFFF800171D9 0xFFFFFFFF800175DC 0xFFFFFFFF80003BD1 0xFFFFFFFF8010F908 0xFFFFFFFF80164EC1 0xFFFFFFFF800042E9 0xFFFFFFFF800F286C 0xFFFFFFFF800EEE15 0xFFFFFFFF800035EC 0xFFFFFFFF800FE3F3 0xFFFFFFFF800E75C8
+[CPU  2] status=2 ticks=4793 last-tick=250ms-ago
+[LOCKDIAG]   reporting core (alive by construction; its own RIP is not sampled)
+[LOCKDIAG]   cur tid=2147483634 tgid=2147483634 comm='idle' state=RUNNING
+[LOCKDIAG]   stack: 0xFFFFFFFF8013F66E 0xFFFFFFFF801C2EE2 0xFFFFFFFF801C3B60 0xFFFFFFFF800171D9 0xFFFFFFFF800175DC 0xFFFFFFFF80003BD1 0xFFFFFFFF80164EC1 0xFFFFFFFF800F2A1A 0xFFFFFFFF800EEDB0 0xFFFFFFFF800035EC 0xFFFFFFFF800FE3F3 0xFFFFFFFF800E75C8 0xFFFFFFFF800157DD 0xFFFFFFFF800FD7A2
+[CPU  3] status=2 ticks=6296
+[LOCKDIAG]   PROBE-ACK rip=0xFFFFFFFF801C2EE2 rsp=0xFFFF8000772CFFF8 IF=1
+[LOCKDIAG]   cur tid=2147483635 tgid=2147483635 comm='idle' state=RUNNING
+[LOCKDIAG]   stack: 0xFFFFFFFF8013F66E 0xFFFFFFFF801C2EE2 0xFFFFFFFF801C3B60 0xFFFFFFFF800171D9 0xFFFFFFFF800175DC 0xFFFFFFFF80003BD1 0xFFFFFFFF8010F908 0xFFFFFFFF80164EC1 0xFFFFFFFF800042E9 0xFFFFFFFF800F286C 0xFFFFFFFF800EEE15 0xFFFFFFFF800035EC 0xFFFFFFFF800FE3F3 0xFFFFFFFF800E75C8
+[CPU  4] status=2 ticks=4455
+[LOCKDIAG]   PROBE-ACK rip=0xFFFFFFFF801C2EE2 rsp=0xFFFF8000772DFFF8 IF=1
+[LOCKDIAG]   cur tid=2147483636 tgid=2147483636 comm='idle' state=RUNNING
+[LOCKDIAG]   stack: 0xFFFFFFFF8013F66E 0xFFFFFFFF801C2EE2 0xFFFFFFFF801C3B60 0xFFFFFFFF800171D9 0xFFFFFFFF800175DC 0xFFFFFFFF80003BD1 0xFFFFFFFF8010F908 0xFFFFFFFF80164EC1 0xFFFFFFFF800042E9 0xFFFFFFFF800F286C 0xFFFFFFFF800EEE15 0xFFFFFFFF800035EC 0xFFFFFFFF800FE3F3 0xFFFFFFFF800E75C8
+[CPU  5] status=2 ticks=4151
+[LOCKDIAG]   PROBE-ACK rip=0xFFFFFFFF801C2EE2 rsp=0xFFFF800079B6FFF8 IF=1
+[LOCKDIAG]   cur tid=2147483637 tgid=2147483637 comm='idle' state=RUNNING
+[LOCKDIAG]   stack: 0xFFFFFFFF8013F66E 0xFFFFFFFF801C2EE2 0xFFFFFFFF801C3B60 0xFFFFFFFF800171D9 0xFFFFFFFF800175DC 0xFFFFFFFF80003BD1 0xFFFFFFFF8010F908 0xFFFFFFFF80164EC1 0xFFFFFFFF800042E9 0xFFFFFFFF800F286C 0xFFFFFFFF800EEE15 0xFFFFFFFF800035EC 0xFFFFFFFF800FE3F3 0xFFFFFFFF800E75C8
+[CPU  6] status=2 ticks=1030 last-tick=3250ms-ago
+[LOCKDIAG]   PROBE-UNANSWERED: not executing kernel code with interrupts enabled (spinning in a critical section, or dead)
+[LOCKDIAG]   cur tid=2147483638 tgid=2147483638 comm='idle' state=RUNNING
+[LOCKDIAG]   stack: 0xFFFFFFFF8013F607 0xFFFFFFFF80013D23 0xFFFFFFFF80062175 0xFFFFFFFF801C3B60 0xFFFFFFFF800171D9 0xFFFFFFFF800175DC 0xFFFFFFFF800042E9 0xFFFFFFFF80164EC1 0xFFFFFFFF800042E9 0xFFFFFFFF800F279A 0xFFFFFFFF80062227 0xFFFFFFFF80003839 0xFFFFFFFF800042E9 0xFFFFFFFF800157DD
+[CPU  7] status=2 ticks=4060
+[LOCKDIAG]   PROBE-ACK rip=0xFFFFFFFF801C2EE2 rsp=0xFFFF80007BE4FFF8 IF=1
+[LOCKDIAG]   cur tid=2147483639 tgid=2147483639 comm='idle' state=RUNNING
+[LOCKDIAG]   stack: 0xFFFFFFFF8013F66E 0xFFFFFFFF801C2EE2 0xFFFFFFFF801C3B60 0xFFFFFFFF800171D9 0xFFFFFFFF800175DC 0xFFFFFFFF80003BD1 0xFFFFFFFF8010F908 0xFFFFFFFF80164EC1 0xFFFFFFFF800042E9 0xFFFFFFFF800F286C 0xFFFFFFFF800EEE15 0xFFFFFFFF800035EC 0xFFFFFFFF800FE3F3 0xFFFFFFFF800E75C8
+[LOCKDIAG] lock spotlight:
+[LOCKDIAG]   vmm_lock free | acquires=1269 max-wait=0ms max-hold=0ms slow-waits=0
+[LOCKDIAG]   gpu_poll_lock free | acquires=3508881 max-wait=0ms max-hold=44ms slow-waits=0
+[LOCKDIAG]   gpu_present_lock free | acquires=0 max-wait=0ms max-hold=0ms slow-waits=0
+[LOCKDIAG]   gpu_cursor_lock free | acquires=0 max-wait=0ms max-hold=0ms slow-waits=0
+[LOCKDIAG]   gpu_cursor_shape_lock free | acquires=0 max-wait=0ms max-hold=0ms slow-waits=0
+[LOCKDIAG]   shootdown_lock free | acquires=2759 max-wait=0ms max-hold=2ms slow-waits=0
+[LOCKDIAG] wait-queue holders: none
+[LOCKDIAG] GPU progress: submitted=183 completed=183 in_flight=0 interrupts=163 timeouts=0 host_errors=0 invalid_responses=0 frames=0 present_failures=0 pending_flip=0 async_flip=0
+[LOCKDIAG] counters: futex waits=166 wakes=141 wake-no-match=20 timeouts=8 zero-timeout=0
+[LOCKDIAG]            wait_queue adds=10101 wakes=2601 | shootdowns=251 slow-acks=0 max-ack-wait=2594898ns shot-down-under-vmm_lock=0
+[LOCKDIAG]            hung-cpu-reports=1 stuck-waiter-warns=0
+[LOCKDIAG] shootdown callers:
+[LOCKDIAG]   0xFFFFFFFF8010E4D7 flushes=230 under-vmm_lock=0
+[LOCKDIAG]   0xFFFFFFFF8010E449 flushes=10 under-vmm_lock=0
+[LOCKDIAG]   0xFFFFFFFF80186749 flushes=11 under-vmm_lock=0
+[LOCKDIAG] owner tracking: OFF (rebuild with make LOCKDIAG_OWNER=1 to name every lock each CPU holds and where it took it from)
+[LOCKDIAG] display tasks and blocked / waiting threads:
+[LOCKDIAG] root journal: active=0 owner=0 comm='wireplumber' depth=0 blocks=0 phase=idle owner_ip=0xFFFFFFFF80097AE5 hold_ms=0 granted=0
+[LOCKDIAG] busiest blocked group: tgid=161 threads=2 (game-join focus: Main + workers print first)
+[LOCKDIAG]   tid=4 tgid=4 comm='virtio-present' BLOCKED [display on_cpu=0 on_rq=0 ready_since_ms=0 need_resched=0 irq_depth=0] [fd=0 count=0] cpu=3 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF8003FB20 0xFFFFFFFF8003FBB6 0xFFFFFFFF8003FB20 0xFFFFFFFF801C3D09 0xFFFFFFFF80138B40
+[LOCKDIAG]   tid=3 tgid=3 comm='virtio-gpu' BLOCKED [display on_cpu=0 on_rq=0 ready_since_ms=0 need_resched=0 irq_depth=0] [fd=0 count=0] cpu=0 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF801C3B60 0xFFFFFFFF80082CDD 0xFFFFFFFF80082CDD 0xFFFFFFFF800425AB 0xFFFFFFFF80042290 0xFFFFFFFF801C3D09 0xFFFFFFFF80138B40
+[LOCKDIAG]   tid=199 tgid=199 comm='bash' BLOCKED in write#1 [fd=1 count=5 syscall_ms=21704 inode=531 path='/sys/power/state' fd_flags=0x0000000000000241 node_flags=0x0000000000000011 (sampled)] cpu=2 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF800E3606 0xFFFFFFFF800035EC 0xFFFFFFFF80132D46 0xFFFFFFFF800C8F33 0xFFFFFFFF801AA802 0xFFFFFFFF800D5335 0xFFFFFFFF8016A58B 0xFFFFFFFF801AF8AB 0xFFFFFFFF80017262 0xFFFFFFFF801C3E1F
+[LOCKDIAG]   user-wait rsp=0x00007FFFEFFFF650
+[LOCKDIAG]   user-code candidates (stack scan, not an unwind):
+[LOCKDIAG]     0x00007F00001716E8 libc.so.6 file+0x00000000001126E8 stack-slot=0x0000000000000000
+[LOCKDIAG]     0x00007F00000EF12D libc.so.6 file+0x000000000009012D stack-slot=0x00007FFFEFFFF668
+[LOCKDIAG]     0x00007F00000ECEB6 libc.so.6 file+0x000000000008DEB6 stack-slot=0x00007FFFEFFFF698
+[LOCKDIAG]     0x00007F00000EDFE1 libc.so.6 file+0x000000000008EFE1 stack-slot=0x00007FFFEFFFF6C8
+[LOCKDIAG]     0x00007F00000EE500 libc.so.6 file+0x000000000008F500 stack-slot=0x00007FFFEFFFF6E8
+[LOCKDIAG]     0x00007F00000ECA11 libc.so.6 file+0x000000000008DA11 stack-slot=0x00007FFFEFFFF6F8
+[LOCKDIAG]     0x00000000004B6EA4 bash file+0x00000000000B6EA4 stack-slot=0x00007FFFEFFFF728
+[LOCKDIAG]     0x00000000004BC1E0 bash file+0x00000000000BC1E0 stack-slot=0x00007FFFEFFFF770
+[LOCKDIAG]     0x00000000004B6A30 bash file+0x00000000000B6A30 stack-slot=0x00007FFFEFFFF780
+[LOCKDIAG]     0x000000000043DDC2 bash file+0x000000000003DDC2 stack-slot=0x00007FFFEFFFF798
+[LOCKDIAG]     0x000000000043FAAD bash file+0x000000000003FAAD stack-slot=0x00007FFFEFFFF808
+[LOCKDIAG]     0x00000000004854C3 bash file+0x00000000000854C3 stack-slot=0x00007FFFEFFFF898
+[LOCKDIAG]     0x00007F000018D481 libc.so.6 file+0x000000000012E481 stack-slot=0x00007FFFEFFFF8C8
+[LOCKDIAG]     0x0000000000488158 bash file+0x0000000000088158 stack-slot=0x00007FFFEFFFF8F8
+[LOCKDIAG]     0x000000000048DD30 bash file+0x000000000008DD30 stack-slot=0x00007FFFEFFFF900
+[LOCKDIAG]     0x000000000044101C bash file+0x000000000004101C stack-slot=0x00007FFFEFFFF958
+[LOCKDIAG]   tid=163 tgid=161 comm='pool-spawner' BLOCKED in futex#202 [uaddr=0x00000000004210E0 op=0x0000000000000080 expected=0x0000000000000001] [futex bucket=497 wakes=1 no-match=0 parked=29823ms] cpu=3 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF800FC195 0xFFFFFFFF8017B969 0xFFFFFFFF8017AC6A 0xFFFFFFFF8017C219 0xFFFFFFFF8017CBD5 0xFFFFFFFF80195494 0xFFFFFFFF8018954C 0xFFFFFFFF80192E7A 0xFFFFFFFF801AF8AB 0xFFFFFFFF80017262 0xFFFFFFFF801C3E1F
+[LOCKDIAG]   user-wait rsp=0x00007F0009C98B78 futex-words (sampled, starting at uaddr)=0x0000000000000001,0x0000000000000000,0x0000000000000000,0x0000000000000000
+[LOCKDIAG]   user-code candidates (stack scan, not an unwind):
+[LOCKDIAG]     0x00007F000067446D libc.so.6 file+0x000000000011E46D stack-slot=0x0000000000000000
+[LOCKDIAG]     0x00007F000045ABDE libglib-2.0.so.0.9000.1 file+0x0000000000098BDE stack-slot=0x00007F0009C98B78
+[LOCKDIAG]     0x00007F00003E84AD libglib-2.0.so.0.9000.1 file+0x00000000000264AD stack-slot=0x00007F0009C98BB8
+[LOCKDIAG]     0x00007F000045AB43 libglib-2.0.so.0.9000.1 file+0x0000000000098B43 stack-slot=0x00007F0009C98BC8
+[LOCKDIAG]     0x00007F0000461027 libglib-2.0.so.0.9000.1 file+0x000000000009F027 stack-slot=0x00007F0009C98BF8
+[LOCKDIAG]     0x00007F000045EB54 libglib-2.0.so.0.9000.1 file+0x000000000009CB54 stack-slot=0x00007F0009C98C48
+[LOCKDIAG]     0x00007F00005EE042 libc.so.6 file+0x0000000000098042 stack-slot=0x00007F0009C98C98
+[LOCKDIAG]     0x00007F00005EDCA0 libc.so.6 file+0x0000000000097CA0 stack-slot=0x00007F0009C98D98
+[LOCKDIAG]     0x00007F000067672C libc.so.6 file+0x000000000012072C stack-slot=0x00007F0009C98DB8
+[LOCKDIAG]   tid=161 tgid=161 comm='nm-dispatcher' BLOCKED in ppoll#271 [poll nfds=1 fd0=4 ev=0x0000000000000001 path='anon_inode:[eventfd]'] cpu=1 wake_at_ms=12045 OVERDUE+20643ms
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF8016040B 0xFFFFFFFF8018C39F 0xFFFFFFFF801A4040 0xFFFFFFFF800D75E8 0xFFFFFFFF800DA5DA 0xFFFFFFFF801102D5 0xFFFFFFFF8006819B 0xFFFFFFFF800D3CE2 0xFFFFFFFF800D76B1 0xFFFFFFFF800DA5DA 0xFFFFFFFF801034F0 0xFFFFFFFF801004FA 0xFFFFFFFF801034F0 0xFFFFFFFF8006CF34 0xFFFFFFFF800FA5E9
+[LOCKDIAG]   user-wait rsp=0x00007FFFEFFFFA78
+[LOCKDIAG]   user-code candidates (stack scan, not an unwind):
+[LOCKDIAG]     0x00007F00005F68F2 libc.so.6 file+0x00000000000A08F2 stack-slot=0x0000000000000000
+[LOCKDIAG]     0x00007F00006679D7 libc.so.6 file+0x00000000001119D7 stack-slot=0x00007FFFEFFFFA78
+[LOCKDIAG]     0x00007F000042CC9E libglib-2.0.so.0.9000.1 file+0x000000000006AC9E stack-slot=0x00007FFFEFFFFAD8
+[LOCKDIAG]     0x00007F000042CDB5 libglib-2.0.so.0.9000.1 file+0x000000000006ADB5 stack-slot=0x00007FFFEFFFFB68
+[LOCKDIAG]     0x0000000000404DE9 nm-dispatcher file+0x0000000000004DE9 stack-slot=0x00007FFFEFFFFB88
+[LOCKDIAG]     0x00007F000057D781 libc.so.6 file+0x0000000000027781 stack-slot=0x00007FFFEFFFFCA8
+[LOCKDIAG]     0x00000000004046F0 nm-dispatcher file+0x00000000000046F0 stack-slot=0x00007FFFEFFFFCC8
+[LOCKDIAG]     0x00007F000057D8B9 libc.so.6 file+0x00000000000278B9 stack-slot=0x00007FFFEFFFFD58
+[LOCKDIAG]     0x0000000000405110 nm-dispatcher file+0x0000000000005110 stack-slot=0x00007FFFEFFFFD90
+[LOCKDIAG]     0x0000000000405135 nm-dispatcher file+0x0000000000005135 stack-slot=0x00007FFFEFFFFDB8
+[LOCKDIAG]     0x0000700000000000 <anonymous> file+0x0000000000000000 stack-slot=0x00007FFFEFFFFF08
+[LOCKDIAG]   tid=156 tgid=146 comm='gdbus' BLOCKED in ppoll#271 [poll nfds=2 fd0=6 ev=0x0000000000000001 path='' fd1=7 ev=0x0000000000000001 path='anon_inode:[eventfd]'] cpu=0 wake_at_ms=12116 OVERDUE+20572ms
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF801C3B60 0xFFFFFFFF8014C6A2 0xFFFFFFFF8016040B 0xFFFFFFFF8018C39F 0xFFFFFFFF801A4040 0xFFFFFFFF801A4040 0xFFFFFFFF801034F0 0xFFFFFFFF801034F0 0xFFFFFFFF801004FA 0xFFFFFFFF801004FA 0xFFFFFFFF8010341E 0xFFFFFFFF800FD7A2 0xFFFFFFFF801844D0 0xFFFFFFFF800FA5E9 0xFFFFFFFF8010DAA3
+[LOCKDIAG]   tid=136 tgid=136 comm='seatd' BLOCKED in poll#7 at src/syscalls/sys_socket.c:82 sys_socket cpu=6 wake_at_ms=12400 OVERDUE+20288ms
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF8014C444 0xFFFFFFFF8015CD84 0xFFFFFFFF8018C39F 0xFFFFFFFF801102D5 0xFFFFFFFF8006819B 0xFFFFFFFF800D4E02 0xFFFFFFFF801A4040 0xFFFFFFFF800D7A7B 0xFFFFFFFF800D4E02 0xFFFFFFFF801102D5 0xFFFFFFFF8006819B 0xFFFFFFFF8006C4C7 0xFFFFFFFF8006D4B7 0xFFFFFFFF800D7A7B 0xFFFFFFFF800D7AC8
+[LOCKDIAG]   tid=12 tgid=12 comm='net-worker' BLOCKED [fd=0 count=0] cpu=1 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF801C3B60 0xFFFFFFFF80114A4C 0xFFFFFFFF80114300 0xFFFFFFFF801C3D09 0xFFFFFFFF80138B40
+[LOCKDIAG]   tid=11 tgid=11 comm='net-worker' BLOCKED [fd=0 count=0] cpu=6 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF801C3B60 0xFFFFFFFF80114A4C 0xFFFFFFFF80114300 0xFFFFFFFF801C3D09 0xFFFFFFFF80138B40
+[LOCKDIAG]   tid=1 tgid=1 comm='init' BLOCKED in rt_sigtimedwait#128 cpu=3 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF80133399 0xFFFFFFFF800175EA 0xFFFFFFFF80017225 0xFFFFFFFF801C3B60 0xFFFFFFFF800FB533 0xFFFFFFFF801A315C 0xFFFFFFFF800FAA90 0xFFFFFFFF800F3C4D 0xFFFFFFFF801959FE 0xFFFFFFFF801AF8AB 0xFFFFFFFF800172C4 0xFFFFFFFF801C3E1F
+[LOCKDIAG]   tid=9 tgid=9 comm='ksmd' SLEEPING [fd=0 count=0] cpu=7 wake_at_ms=120788
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF80062175 0xFFFFFFFF800F6C69 0xFFFFFFFF800F6BD0 0xFFFFFFFF801C3D09 0xFFFFFFFF80138B40
+[LOCKDIAG]   tid=10 tgid=10 comm='kthread' BLOCKED [fd=0 count=0] cpu=7 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF800F51DD 0xFFFFFFFF800035EC 0xFFFFFFFF800DEB87 0xFFFFFFFF800DF1B5 0xFFFFFFFF800DEF60 0xFFFFFFFF801C3D09 0xFFFFFFFF80138B40
+[LOCKDIAG]   tid=192 tgid=187 comm='pool-spawner' BLOCKED in futex#202 [uaddr=0x0000000000448230 op=0x0000000000000080 expected=0x0000000000000001] [futex bucket=575 wakes=1 no-match=0 parked=29026ms] cpu=0 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF8017B969 0xFFFFFFFF8017AC6A 0xFFFFFFFF8017C219 0xFFFFFFFF8017CBD5 0xFFFFFFFF80195494 0xFFFFFFFF8018954C 0xFFFFFFFF80192E7A 0xFFFFFFFF801AF8AB 0xFFFFFFFF80017262 0xFFFFFFFF801C3E1F
+[LOCKDIAG]   tid=171 tgid=169 comm='pool-spawner' BLOCKED in futex#202 [uaddr=0x0000000000662A50 op=0x0000000000000080 expected=0x0000000000000002] [futex bucket=2 wakes=2 no-match=0 parked=29783ms] cpu=6 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF8017B969 0xFFFFFFFF8017AC6A 0xFFFFFFFF8017C219 0xFFFFFFFF8017CBD5 0xFFFFFFFF80195494 0xFFFFFFFF8018954C 0xFFFFFFFF80192E7A 0xFFFFFFFF801AF8AB 0xFFFFFFFF80017262 0xFFFFFFFF801C3E1F
+[LOCKDIAG]   tid=155 tgid=146 comm='pool-spawner' BLOCKED in futex#202 [uaddr=0x00000000007D2A90 op=0x0000000000000080 expected=0x0000000000000003] [futex bucket=700 wakes=3 no-match=0 parked=29818ms] cpu=1 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF8017B969 0xFFFFFFFF8017AC6A 0xFFFFFFFF8017C219 0xFFFFFFFF8017CBD5 0xFFFFFFFF80195494 0xFFFFFFFF8018954C 0xFFFFFFFF80192E7A 0xFFFFFFFF801AF8AB 0xFFFFFFFF80017262 0xFFFFFFFF801C3E1F
+[LOCKDIAG]   tid=106 tgid=101 comm='pool-spawner' BLOCKED in futex#202 [uaddr=0x0000000000450270 op=0x0000000000000080 expected=0x0000000000000001] [futex bucket=265 wakes=3 no-match=2 parked=31428ms] cpu=7 wake_at_ms=0
+[LOCKDIAG]   parked-stack (newest first): 0xFFFFFFFF80131FC9 0xFFFFFFFF800FC195 0xFFFFFFFF8017B969 0xFFFFFFFF8017AC6A 0xFFFFFFFF8017C219 0xFFFFFFFF8017CBD5 0xFFFFFFFF80195494 0xFFFFFFFF80192E7A 0xFFFFFFFF801AF8AB 0xFFFFFFFF80017262 0xFFFFFFFF801C3E1F
+[LOCKDIAG] runnable/running non-idle threads:
+[LOCKDIAG]   tid=203 tgid=203 comm='s3-power' RUNNING on_cpu=1 on_rq=0 cpu=0 ready_since_ms=0 need_resched=0 in_syscall=0 syscall=0
+[LOCKDIAG]   tid=198 tgid=198 comm='avory-login' READY on_cpu=0 on_rq=1 cpu=1 ready_since_ms=11415 need_resched=0 in_syscall=1 syscall=61
+[LOCKDIAG]   tid=197 tgid=187 comm='wireplumber' READY on_cpu=0 on_rq=1 cpu=0 ready_since_ms=11692 need_resched=0 in_syscall=1 syscall=232
+[LOCKDIAG]   tid=196 tgid=187 comm='wireplumber' READY on_cpu=0 on_rq=1 cpu=0 ready_since_ms=11688 need_resched=0 in_syscall=1 syscall=232
+[LOCKDIAG]   tid=195 tgid=187 comm='gdbus' READY on_cpu=0 on_rq=1 cpu=5 ready_since_ms=11669 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=194 tgid=187 comm='pool-0' READY on_cpu=0 on_rq=1 cpu=3 ready_since_ms=29438 need_resched=0 in_syscall=1 syscall=202
+[LOCKDIAG]   tid=193 tgid=187 comm='wireplumber' READY on_cpu=0 on_rq=1 cpu=2 ready_since_ms=11655 need_resched=0 in_syscall=1 syscall=232
+[LOCKDIAG]   tid=191 tgid=187 comm='gmain' READY on_cpu=0 on_rq=1 cpu=1 ready_since_ms=11639 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=190 tgid=188 comm='pipewire-pulse' READY on_cpu=0 on_rq=1 cpu=6 ready_since_ms=11633 need_resched=0 in_syscall=1 syscall=232
+[LOCKDIAG]   tid=188 tgid=188 comm='pipewire-pulse' READY on_cpu=0 on_rq=1 cpu=6 ready_since_ms=11635 need_resched=0 in_syscall=1 syscall=232
+[LOCKDIAG]   tid=187 tgid=187 comm='wireplumber' READY on_cpu=0 on_rq=1 cpu=4 ready_since_ms=11817 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=185 tgid=183 comm='pipewire' READY on_cpu=0 on_rq=1 cpu=1 ready_since_ms=12130 need_resched=0 in_syscall=1 syscall=232
+[LOCKDIAG]   tid=183 tgid=183 comm='pipewire' READY on_cpu=0 on_rq=1 cpu=7 ready_since_ms=12132 need_resched=0 in_syscall=1 syscall=232
+[LOCKDIAG]   tid=174 tgid=169 comm='gdbus' READY on_cpu=0 on_rq=1 cpu=6 ready_since_ms=11665 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=173 tgid=169 comm='pool-1' READY on_cpu=0 on_rq=1 cpu=2 ready_since_ms=29436 need_resched=0 in_syscall=1 syscall=202
+[LOCKDIAG]   tid=172 tgid=169 comm='pool-0' READY on_cpu=0 on_rq=1 cpu=7 ready_since_ms=29439 need_resched=0 in_syscall=1 syscall=202
+[LOCKDIAG]   tid=170 tgid=169 comm='gmain' READY on_cpu=0 on_rq=1 cpu=5 ready_since_ms=11905 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=169 tgid=169 comm='ModemManager' READY on_cpu=0 on_rq=1 cpu=1 ready_since_ms=11935 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=167 tgid=146 comm='pool-2' READY on_cpu=0 on_rq=1 cpu=6 ready_since_ms=29438 need_resched=0 in_syscall=1 syscall=202
+[LOCKDIAG]   tid=166 tgid=146 comm='pool-1' READY on_cpu=0 on_rq=1 cpu=5 ready_since_ms=29437 need_resched=0 in_syscall=1 syscall=202
+[LOCKDIAG]   tid=165 tgid=161 comm='gdbus' READY on_cpu=0 on_rq=1 cpu=6 ready_since_ms=12046 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=164 tgid=161 comm='pool-0' READY on_cpu=0 on_rq=1 cpu=4 ready_since_ms=29437 need_resched=0 in_syscall=1 syscall=202
+[LOCKDIAG]   tid=162 tgid=161 comm='gmain' READY on_cpu=0 on_rq=1 cpu=1 ready_since_ms=11865 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=157 tgid=146 comm='pool-0' READY on_cpu=0 on_rq=1 cpu=4 ready_since_ms=29437 need_resched=0 in_syscall=1 syscall=202
+[LOCKDIAG]   tid=154 tgid=146 comm='gmain' READY on_cpu=0 on_rq=1 cpu=7 ready_since_ms=12000 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=146 tgid=146 comm='NetworkManager' READY on_cpu=0 on_rq=1 cpu=3 ready_since_ms=11879 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=142 tgid=142 comm='systemd-network' READY on_cpu=0 on_rq=1 cpu=4 ready_since_ms=11602 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=121 tgid=121 comm='systemd-udevd' READY on_cpu=0 on_rq=1 cpu=4 ready_since_ms=12363 need_resched=0 in_syscall=1 syscall=232
+[LOCKDIAG]   tid=116 tgid=101 comm='pool-0' READY on_cpu=0 on_rq=1 cpu=1 ready_since_ms=29437 need_resched=0 in_syscall=1 syscall=202
+[LOCKDIAG]   tid=107 tgid=101 comm='gdbus' READY on_cpu=0 on_rq=1 cpu=1 ready_since_ms=11663 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=105 tgid=101 comm='gmain' READY on_cpu=0 on_rq=1 cpu=6 ready_since_ms=11999 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=101 tgid=101 comm='polkitd' READY on_cpu=0 on_rq=1 cpu=4 ready_since_ms=11664 need_resched=0 in_syscall=1 syscall=271
+[LOCKDIAG]   tid=96 tgid=96 comm='systemd-resolve' READY on_cpu=0 on_rq=1 cpu=6 ready_since_ms=12144 need_resched=0 in_syscall=1 syscall=232
+[LOCKDIAG]   tid=87 tgid=87 comm='dbus-daemon' READY on_cpu=0 on_rq=1 cpu=0 ready_since_ms=12107 need_resched=0 in_syscall=1 syscall=232
+[LOCKDIAG]   tid=14 tgid=14 comm='tcp-timer' READY on_cpu=0 on_rq=1 cpu=3 ready_since_ms=11406 need_resched=0 in_syscall=0 syscall=0
+[LOCKDIAG]   tid=13 tgid=13 comm='rtl8139-service' READY on_cpu=0 on_rq=1 cpu=0 ready_since_ms=11497 need_resched=0 in_syscall=0 syscall=0
+[LOCKDIAG]   tid=8 tgid=8 comm='usb-mouse' READY on_cpu=0 on_rq=1 cpu=0 ready_since_ms=11786 need_resched=0 in_syscall=0 syscall=0
+[LOCKDIAG]   tid=7 tgid=7 comm='usb-audio' READY on_cpu=0 on_rq=1 cpu=0 ready_since_ms=11784 need_resched=0 in_syscall=0 syscall=0
+[LOCKDIAG]   tid=2 tgid=2 comm='zramd' READY on_cpu=0 on_rq=1 cpu=1 ready_since_ms=11515 need_resched=0 in_syscall=0 syscall=0
+[LOCKDIAG]   16 blocked
+[LOCKDIAG] serial ring: 0 bytes queued but not yet on the wire
+
+[SYSDIAG] ================= UNHANDLED / MISSING COMPAT =================
+[SYSDIAG] missing syscalls (unique: 1, total invocations: 2):
+[SYSDIAG]   #1: syscall 463 (unknown) called 2x by comm='systemd-udevd' pid=121 rip=0x00007F000075246D args=(0x00000000FFFFFF9C, 0x0000000000478E8A, 0x0000000000001100)
+[SYSDIAG] unhandled ioctls (unique: 17, total invocations: 27):
+[SYSDIAG]   #1: ioctl 0x80280215 (_IOR('?',0x15,sz=40)) on node='nvme0n1' called 1x by comm='(udev-worker)' pid=125 fd=19 last_arg=0x00007FFFEFFF5070 [-ENOTTY]
+[SYSDIAG]   #2: ioctl 0x80280215 (_IOR('?',0x15,sz=40)) on node='nvme0n1p1' called 1x by comm='(udev-worker)' pid=127 fd=20 last_arg=0x00007FFFEFFF5070 [-ENOTTY]
+[SYSDIAG]   #3: ioctl 0x80280215 (_IOR('?',0x15,sz=40)) on node='nvme1n1' called 1x by comm='(udev-worker)' pid=128 fd=23 last_arg=0x00007FFFEFFF5070 [-ENOTTY]
+[SYSDIAG]   #4: ioctl 0x00005331 (_IO('S',0x31)) on node='nvme0n1' called 1x by comm='(udev-worker)' pid=125 fd=19 last_arg=0x0000000000000000 [-ENOTTY]
+[SYSDIAG]   #5: ioctl 0x00005331 (_IO('S',0x31)) on node='nvme0n1p1' called 1x by comm='(udev-worker)' pid=127 fd=20 last_arg=0x0000000000000000 [-ENOTTY]
+[SYSDIAG]   #6: ioctl 0x00005331 (_IO('S',0x31)) on node='nvme1n1' called 1x by comm='(udev-worker)' pid=128 fd=23 last_arg=0x0000000000000000 [-ENOTTY]
+[SYSDIAG]   #7: ioctl 0x80280215 (_IOR('?',0x15,sz=40)) on node='nvme1n1p1' called 1x by comm='(udev-worker)' pid=129 fd=24 last_arg=0x00007FFFEFFF5070 [-ENOTTY]
+[SYSDIAG]   #8: ioctl 0x00005395 (_IO('S',0x95)) on node='nvme0n1p1' called 1x by comm='(udev-worker)' pid=127 fd=20 last_arg=0x00007FFFEFFF4FB0 [-ENOTTY]
+[SYSDIAG]   #9: ioctl 0x00005395 (_IO('S',0x95)) on node='nvme0n1' called 1x by comm='(udev-worker)' pid=125 fd=19 last_arg=0x00007FFFEFFF4FB0 [-ENOTTY]
+[SYSDIAG]   #10: ioctl 0x80280215 (_IOR('?',0x15,sz=40)) on node='zram0' called 1x by comm='(udev-worker)' pid=130 fd=27 last_arg=0x00007FFFEFFF5070 [-ENOTTY]
+[SYSDIAG]   #11: ioctl 0x00005395 (_IO('S',0x95)) on node='nvme1n1' called 1x by comm='(udev-worker)' pid=128 fd=23 last_arg=0x00007FFFEFFF4FB0 [-ENOTTY]
+[SYSDIAG]   #12: ioctl 0x00005331 (_IO('S',0x31)) on node='nvme1n1p1' called 1x by comm='(udev-worker)' pid=129 fd=24 last_arg=0x0000000000000000 [-ENOTTY]
+[SYSDIAG]   #13: ioctl 0x00005331 (_IO('S',0x31)) on node='zram0' called 1x by comm='(udev-worker)' pid=130 fd=27 last_arg=0x0000000000000000 [-ENOTTY]
+[SYSDIAG]   #14: ioctl 0x00005395 (_IO('S',0x95)) on node='nvme1n1p1' called 1x by comm='(udev-worker)' pid=129 fd=24 last_arg=0x00007FFFEFFF4FB0 [-ENOTTY]
+[SYSDIAG]   #15: ioctl 0x00005395 (_IO('S',0x95)) on node='zram0' called 1x by comm='(udev-worker)' pid=130 fd=27 last_arg=0x00007FFFEFFF4FB0 [-ENOTTY]
+[SYSDIAG]   #16: ioctl 0x00008946 (_IO('?',0x46)) on node='anon' called 10x by comm='NetworkManager' pid=146 fd=18 last_arg=0x00007FFFEFFFE210 [-ENOTTY]
+[SYSDIAG]   #17: ioctl 0x00008947 (_IO('?',0x47)) on node='anon' called 2x by comm='NetworkManager' pid=146 fd=17 last_arg=0x00007FFFEFFFF080 [-ENOTTY]
+[SYSDIAG] recent / frequent syscall errors (tracked keys: 128, total errors: 508956, evicted keys: 106):
+[SYSDIAG]   #1: wait4(#61) -> -10 (ECHILD) count=3 comm='bash' pid=199 rip=0x00007F00001644FD args=(0xFFFFFFFFFFFFFFFF, 0x00007FFFEFFFF054, 0x000000000000000B)
+[SYSDIAG]   #2: openat(#257) -> -2 (ENOENT) count=5 comm='bash' pid=199 rip=0x00007F000016FFC7 args=(0xFFFFFFFFFFFFFF9C, 0x00000000005600A0, 0x0000000000000000) path='//.bash_profile'
+[SYSDIAG]   #3: inotify_add_watch(#254) -> -2 (ENOENT) count=12 comm='gmain' pid=146 rip=0x00007F0000A24AEB args=(0x000000000000000E, 0x00000000008AEB90, 0x0000000001002FCE)
+[SYSDIAG]   #4: openat(#257) -> -2 (ENOENT) count=32 comm='NetworkManager' pid=146 rip=0x00007F0000A15A46 args=(0x00000000FFFFFF9C, 0x00000000006EA7D2, 0x0000000000090800) path='/usr/lib/glibc-hwcaps/x86-64-v4/libgio-2.0.so.0'
+[SYSDIAG]   #5: newfstatat(#262) -> -2 (ENOENT) count=24 comm='NetworkManager' pid=146 rip=0x00007F0000A0EA6E args=(0x00000000FFFFFF9C, 0x00000000006E6F82, 0x00007FFFEFFFF820) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #6: setsockopt(#54) -> -92 (ENOPROTOOPT) count=2 comm='systemd-network' pid=142 rip=0x00007F000075706E args=(0x0000000000000007, 0x000000000000010E, 0x000000000000000C)
+[SYSDIAG]   #7: newfstatat(#262) -> -2 (ENOENT) count=3 comm='systemd-network' pid=142 rip=0x000040000002756E args=(0x00000000FFFFFF9C, 0x00007FFFEFFFEB00, 0x00007FFFEFFFEA50) path='/usr/lib/systemd/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #8: mkdirat(#258) -> -17 (EEXIST) count=1 comm='systemd-network' pid=142 rip=0x00007F0000744DFB args=(0x00000000FFFFFF9C, 0x000000000054B498, 0x00000000000001ED) path='/run/systemd/netif'
+[SYSDIAG]   #9: ioctl(#16) -> -25 (ENOTTY) count=4 comm='systemd-network' pid=142 rip=0x00007F0000746EA9 args=(0x0000000000000005, 0x00000000802C542A, 0x00007FFFEFFFF4B0)
+[SYSDIAG]   #10: inotify_rm_watch(#255) -> -22 (EINVAL) count=1 comm='systemd-resolve' pid=96 rip=0x00007F0000755B4B args=(0x0000000000000006, 0x000000000000000F, 0x00007FFFEFFFF800)
+[SYSDIAG]   #11: openat(#257) -> -13 (EACCES) count=1 comm='systemd-network' pid=142 rip=0x00007F0000744FC7 args=(0xFFFFFFFFFFFFFF9C, 0x00007FFFEFFFF5F0, 0x0000000000080902) path='/proc/self/fd/5'
+[SYSDIAG]   #12: openat(#257) -> -2 (ENOENT) count=6 comm='systemd-network' pid=142 rip=0x00007F0000744FC7 args=(0xFFFFFFFFFFFFFF9C, 0x00000000006015C0, 0x0000000000280000) path='/usr/lib/systemd/glibc-hwcaps/x86-64-v4/libsystemd-shared-262.1-1.so'
+[SYSDIAG]   #13: newfstatat(#262) -> -2 (ENOENT) count=4 comm='nmcli' pid=175 rip=0x000040000002756E args=(0x00000000FFFFFF9C, 0x00007FFFEFFFEAB0, 0x00007FFFEFFFEA00) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #14: openat(#257) -> -2 (ENOENT) count=6 comm='ModemManager' pid=169 rip=0x00007F0000C8E8F2 args=(0x000000000000000A, 0x0000000000676CC0, 0x00000000002A0000) path='/usr/lib/glibc-hwcaps/x86-64-v4/libmm-glib.so.0'
+[SYSDIAG]   #15: access(#21) -> -2 (ENOENT) count=2 comm='nmcli' pid=175 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000001) path='/etc/ld.so.preload'
+[SYSDIAG]   #16: access(#21) -> -2 (ENOENT) count=1 comm='clear' pid=202 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #17: ioctl(#16) -> -25 (ENOTTY) count=1 comm='pidof' pid=143 rip=0x00007F0000141F19 args=(0x0000000000000001, 0x00000000802C542A, 0x00007FFFEFFFF790)
+[SYSDIAG]   #18: access(#21) -> -2 (ENOENT) count=2 comm='systemd-network' pid=142 rip=0x00007F000073EA9B args=(0x00007F000049175D, 0x0000000000000000, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #19: access(#21) -> -2 (ENOENT) count=11 comm='mkdir' pid=200 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #20: mkdir(#83) -> -17 (EEXIST) count=30 comm='mkdir' pid=200 rip=0x00007F0000113DCB args=(0x00007FFFEFFFFD9E, 0x00000000000001FF, 0x0000000000000000) path='/dev'
+[SYSDIAG]   #21: access(#21) -> -2 (ENOENT) count=7 comm='chmod' pid=201 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #22: openat(#257) -> -2 (ENOENT) count=6 comm='nmcli' pid=175 rip=0x00004000000277F5 args=(0x00000000FFFFFF9C, 0x00007FFFEFFFEAB0, 0x0000000000080000) path='/usr/lib/glibc-hwcaps/x86-64-v4/libnm.so.0'
+[SYSDIAG]   #23: access(#21) -> -2 (ENOENT) count=7 comm='NetworkManager' pid=146 rip=0x00007F0000A0DA9B args=(0x00000000008CDFD0, 0x0000000000000000, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #24: recvmsg(#47) -> -11 (EAGAIN) count=500572 comm='NetworkManager' pid=146 rip=0x00007F00009A38F2 args=(0x000000000000000D, 0x00007FFFEFFFE3C0, 0x0000000000000000) detail='fd=12 ev=0x1 r=0x0 dom=16 typ=3 st=0 err=0 fl=0x80800'
+[SYSDIAG]   #25: recvmsg(#47) -> -11 (EAGAIN) count=1 comm='systemd-network' pid=142 rip=0x00007F0000756CD8 args=(0x0000000000000007, 0x00007FFFEFFFF440, 0x0000000000000022) detail='fd=7 ev=0x1 r=0x0 dom=16 typ=3 st=0 err=0 fl=0x80800'
+[SYSDIAG]   #26: ioctl(#16) -> -25 (ENOTTY) count=4 comm='nmcli' pid=175 rip=0x00007F00006CBEA9 args=(0x0000000000000001, 0x00000000802C542A, 0x00007FFFEFFFF2D0)
+[SYSDIAG]   #27: recvfrom(#45) -> -11 (EAGAIN) count=18 comm='pool-0' pid=187 rip=0x00007F000040A8F2 args=(0x000000000000000D, 0x00007F0018005B70, 0x0000000000001000) recv-flags=0x0000000000000000 detail='fd=13 ev=0x1 r=0x0 dom=1 typ=1 st=2 err=0 fl=0x80800 u:rb=0 br=0 scm=0 off=0 dgram=0 peer=1 pw=0 pst=2 rd=0 wr=0 wc=1 lst=0 orph=0 aorph=0'
+[SYSDIAG]   #28: close(#3) -> -9 (EBADF) count=26 comm='sh' pid=15 rip=0x00007F0000169BE4 args=(0x0000000000000003, 0x0000000000000000, 0x0000000000000000)
+[SYSDIAG]   #29: mkdir(#83) -> -17 (EEXIST) count=4 comm='NetworkManager' pid=146 rip=0x00007F0000A13DCB args=(0x00000000007F8770, 0x00000000000001C0, 0x000000000000000A) path='/var/lib'
+[SYSDIAG]   #30: sendmsg(#46) -> -107 (ENOTCONN) count=39 comm='NetworkManager' pid=146 rip=0x00007F00009A38F2 args=(0x0000000000000005, 0x00007FFFEFFFE8D0, 0x0000000000004000)
+[SYSDIAG]   #31: recvfrom(#45) -> -11 (EAGAIN) count=7 comm='NetworkManager' pid=146 rip=0x00007F00009A38F2 args=(0x000000000000001B, 0x0000000000917398, 0x0000000000004000) recv-flags=0x0000000000000000 detail='fd=6 ev=0x1 r=0x0 dom=1 typ=1 st=2 err=0 fl=0x80800 u:rb=0 br=0 scm=0 off=0 dgram=0 peer=1 pw=0 pst=2 rd=0 wr=0 wc=1 lst=0 orph=0 aorph=0'
+[SYSDIAG]   #32: setsockopt(#54) -> -92 (ENOPROTOOPT) count=3 comm='NetworkManager' pid=146 rip=0x00007F0000A2606E args=(0x000000000000000D, 0x000000000000010E, 0x000000000000000C)
+[SYSDIAG]   #33: access(#21) -> -2 (ENOENT) count=1 comm='false' pid=159 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #34: access(#21) -> -2 (ENOENT) count=10 comm='grep' pid=176 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #35: openat(#257) -> -2 (ENOENT) count=28 comm='grep' pid=176 rip=0x00004000000277F5 args=(0x00000000FFFFFF9C, 0x00007FFFEFFFEB00, 0x0000000000080000) path='/usr/lib/glibc-hwcaps/x86-64-v4/libpcre2-8.so.0'
+[SYSDIAG]   #36: newfstatat(#262) -> -2 (ENOENT) count=28 comm='grep' pid=176 rip=0x000040000002756E args=(0x00000000FFFFFF9C, 0x00007FFFEFFFEB00, 0x00007FFFEFFFEA50) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #37: ioctl(#16) -> -25 (ENOTTY) count=11 comm='NetworkManager' pid=146 rip=0x00007F0000A1ED9D args=(0x0000000000000012, 0x0000000000008946, 0x00007FFFEFFFE210)
+[SYSDIAG]   #38: faccessat2(#439) -> -2 (ENOENT) count=11 comm='NetworkManager' pid=146 rip=0x00007F0000A0E0A9 args=(0x00000000FFFFFF9C, 0x00007F0000502CEF, 0x0000000000000000) path='anycast_mask'
+[SYSDIAG]   #39: readlinkat(#267) -> -2 (ENOENT) count=1 comm='NetworkManager' pid=146 rip=0x00007F0000A14B6E args=(0x00000000FFFFFF9C, 0x00000000007DF280, 0x00000000007EBFA0) path='/sys/devices/pci0000:00/0000:00:02.0/net/eth0/driver'
+[SYSDIAG]   #40: newfstatat(#262) -> -2 (ENOENT) count=15 comm='sh' pid=15 rip=0x00007F000016AA6E args=(0x00000000FFFFFF9C, 0x00000000005501D0, 0x00007FFFEFFFED20) path='/sbin/cmp'
+[SYSDIAG]   #41: connect(#42) -> -2 (ENOENT) count=12 comm='dbus-daemon' pid=87 rip=0x00007F0000332790 args=(0x000000000000000D, 0x00007F00003C7160, 0x000000000000006E) path='/dev/log'
+[SYSDIAG]   #42: access(#21) -> -2 (ENOENT) count=3 comm='dbus-daemon-lau' pid=169 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #43: openat(#257) -> -2 (ENOENT) count=9 comm='dbus-daemon-lau' pid=169 rip=0x00004000000277F5 args=(0x00000000FFFFFF9C, 0x00007FFFEFFFE9D0, 0x0000000000080000) path='/usr/lib/glibc-hwcaps/x86-64-v4/libdbus-1.so.3'
+[SYSDIAG]   #44: newfstatat(#262) -> -2 (ENOENT) count=12 comm='dbus-daemon-lau' pid=169 rip=0x00007F0000193A6E args=(0x00000000FFFFFF9C, 0x000000000040D270, 0x00007FFFEFFFFA50) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #45: unlink(#87) -> -2 (ENOENT) count=2 comm='systemd-udevd' pid=121 rip=0x00007F00007464FB args=(0x000000000047C9C9, 0x00007F0000357540, 0x00000000FFFFFFFF) path='/run/udev/queue'
+[SYSDIAG]   #46: openat(#257) -> -2 (ENOENT) count=60 comm='chown' pid=139 rip=0x00007F000011416D args=(0x0000000000000003, 0x0000000000418380, 0x00000000002A0000) path='/usr/lib/glibc-hwcaps/x86-64-v4/libnss_systemd.so.2'
+[SYSDIAG]   #47: newfstatat(#262) -> -2 (ENOENT) count=9 comm='chown' pid=139 rip=0x000040000002756E args=(0x00000000FFFFFF9C, 0x00007FFFEFFFE840, 0x00007FFFEFFFE790) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #48: poll(#7) -> -4 (EINTR) count=2 comm='dbus-daemon' pid=168 rip=0x00007F0000321320 args=(0x00007FFFEFFFF600, 0x0000000000000002, 0xFFFFFFFFFFFFFFFF)
+[SYSDIAG]   #49: access(#21) -> -2 (ENOENT) count=1 comm='nm-dispatcher' pid=161 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000001) path='/etc/ld.so.preload'
+[SYSDIAG]   #50: openat(#257) -> -2 (ENOENT) count=5 comm='nm-dispatcher' pid=161 rip=0x00007F00005F68F2 args=(0xFFFFFFFFFFFFFF9C, 0x00007F001C002D90, 0x0000000000000000) path='/usr/lib/glibc-hwcaps/x86-64-v4/libnm.so.0'
+[SYSDIAG]   #51: access(#21) -> -2 (ENOENT) count=14 comm='dbus-daemon' pid=87 rip=0x00007F000031AA9B args=(0x000000000042BF9D, 0x0000000000000000, 0x0000000000000001) path='/etc/ld.so.preload'
+[SYSDIAG]   #52: openat(#257) -> -2 (ENOENT) count=84 comm='dbus-daemon' pid=87 rip=0x00007F0000322A46 args=(0x00000000FFFFFF9C, 0x0000000000478D10, 0x0000000000090800) path='/usr/lib/glibc-hwcaps/x86-64-v4/libdbus-1.so.3'
+[SYSDIAG]   #53: newfstatat(#262) -> -2 (ENOENT) count=3 comm='nm-dispatcher' pid=161 rip=0x000040000002756E args=(0x00000000FFFFFF9C, 0x00007FFFEFFFEB50, 0x00007FFFEFFFEAA0) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #54: readlink(#89) -> -22 (EINVAL) count=12 comm='nm-dispatcher' pid=161 rip=0x00007F0000667B3B args=(0x0000000000431390, 0x0000000000429290, 0x0000000000000100) path='/etc/NetworkManager/dispatcher.d/pre-down.d'
+[SYSDIAG]   #55: inotify_add_watch(#254) -> -2 (ENOENT) count=1 comm='NetworkManager' pid=146 rip=0x00007F0000A24AEB args=(0x000000000000000E, 0x00000000008AEB90, 0x0000000001002FCE)
+[SYSDIAG]   #56: connect(#42) -> -2 (ENOENT) count=1 comm='NetworkManager' pid=146 rip=0x00007F00009A38F2 args=(0x0000000000000014, 0x00007FFFEFFFF8A0, 0x000000000000001B) path='/run/openvswitch/db.sock'
+[SYSDIAG]   #57: lseek(#8) -> -29 (ESPIPE) count=7 comm='grep' pid=176 rip=0x00007F00001C6D7B args=(0x0000000000000000, 0x0000000000000000, 0x0000000000000001)
+[SYSDIAG]   #58: getsockname(#51) -> -14 (EFAULT) count=1 comm='ModemManager' pid=169 rip=0x00007F0000D1082B args=(0x0000000000000008, 0x00007FFFEFFFEFC0, 0x00007FFFEFFFEFB4)
+[SYSDIAG]   #59: close(#3) -> -9 (EBADF) count=1 comm='ModemManager' pid=169 rip=0x00007F0000C8E8F2 args=(0x0000000000000008, 0x0000000000000000, 0x0000000000000000)
+[SYSDIAG]   #60: readlinkat(#267) -> -2 (ENOENT) count=2 comm='ModemManager' pid=169 rip=0x00007F0000CFFB6E args=(0x00000000FFFFFF9C, 0x0000000000680300, 0x00000000006B6700) path='/sys/class/tty/tty0/subsystem'
+[SYSDIAG]   #61: getsockopt(#55) -> -92 (ENOPROTOOPT) count=23 comm='dbus-daemon' pid=87 rip=0x00007F000033285E args=(0x000000000000000D, 0x0000000000000001, 0x000000000000004D)
+[SYSDIAG]   #62: faccessat2(#439) -> -2 (ENOENT) count=4 comm='ModemManager' pid=169 rip=0x00007F0000CF90A9 args=(0x0000000000000009, 0x00007F0000F8321C, 0x0000000000000000) path='uevent'
+[SYSDIAG]   #63: recvmsg(#47) -> -11 (EAGAIN) count=93 comm='dbus-daemon' pid=87 rip=0x00007F0000332CD8 args=(0x000000000000000C, 0x00007FFFEFFFF720, 0x0000000040000000) detail='fd=13 ev=0x1 r=0x0 dom=1 typ=1 st=2 err=0 fl=0x800 u:rb=0 br=179 scm=0 off=0 dgram=0 peer=1 pw=0 pst=2 rd=0 wr=0 wc=1 lst=0 orph=0 aorph=0'
+[SYSDIAG]   #64: access(#21) -> -2 (ENOENT) count=1 comm='ModemManager' pid=169 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #65: access(#21) -> -2 (ENOENT) count=6 comm='sleep' pid=189 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #66: access(#21) -> -2 (ENOENT) count=7 comm='nohup' pid=188 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #67: ioctl(#16) -> -25 (ENOTTY) count=21 comm='nohup' pid=188 rip=0x00007F0000115EA9 args=(0x0000000000000002, 0x00000000802C542A, 0x00007FFFEFFFFB90)
+[SYSDIAG]   #68: recvmsg(#47) -> -11 (EAGAIN) count=2 comm='systemd-resolve' pid=96 rip=0x00007F0000756CD8 args=(0x0000000000000011, 0x00007FFFEFFFE050, 0x0000000040000040) detail='fd=17 ev=0x1 r=0x0 dom=1 typ=1 st=2 err=0 fl=0x80800 u:rb=0 br=1324 scm=0 off=0 dgram=0 peer=1 pw=0 pst=2 rd=0 wr=0 wc=1 lst=0 orph=0 aorp'
+[SYSDIAG]   #69: openat(#257) -> -2 (ENOENT) count=68 comm='systemd-resolve' pid=96 rip=0x00007F0000746A46 args=(0x00000000FFFFFF9C, 0x000000000047CF20, 0x0000000000090800) path='/usr/lib/systemd/glibc-hwcaps/x86-64-v4/libsystemd-shared-262.1-1.so'
+[SYSDIAG]   #70: newfstatat(#262) -> -2 (ENOENT) count=20 comm='systemd-resolve' pid=96 rip=0x00007F000073FA6E args=(0x00000000FFFFFF9C, 0x00007FFFEFFFF6C0, 0x00007FFFEFFFF6F0) path='/usr/lib/systemd/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #71: newfstatat(#262) -> -2 (ENOENT) count=3 comm='ModemManager' pid=169 rip=0x000040000002756E args=(0x00000000FFFFFF9C, 0x00007FFFEFFFEB50, 0x00007FFFEFFFEAA0) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #72: ioctl(#16) -> -25 (ENOTTY) count=74 comm='systemd-resolve' pid=96 rip=0x00007F0000746EA9 args=(0x0000000000000018, 0x00000000802C542A, 0x00007FFFEFFFF2C0)
+[SYSDIAG]   #73: inotify_add_watch(#254) -> -2 (ENOENT) count=3 comm='systemd-resolve' pid=96 rip=0x00007F0000755AEB args=(0x0000000000000006, 0x00007F00004A06E1, 0x0000000000000280)
+[SYSDIAG]   #74: fgetxattr(#193) -> -61 count=2 comm='pool-1' pid=146 rip=0x00007F0000A17E4E args=(0x0000000000000013, 0x00007F00362A4AEF, 0x00007F001C002AB0)
+[SYSDIAG]   #75: openat(#257) -> -2 (ENOENT) count=1 comm='pool-2' pid=146 rip=0x00007F00009A38F2 args=(0xFFFFFFFFFFFFFF9C, 0x00007F0030001E30, 0x0000000000080000) path='/run/systemd/machines/ping.archlinux.org'
+[SYSDIAG]   #76: getsockopt(#55) -> -92 (ENOPROTOOPT) count=4 comm='systemd-resolve' pid=96 rip=0x00007F000075685E args=(0x000000000000001B, 0x0000000000000000, 0x000000000000000E)
+[SYSDIAG]   #77: recvfrom(#45) -> -11 (EAGAIN) count=1 comm='pool-1' pid=146 rip=0x00007F00009A38F2 args=(0x0000000000000013, 0x00007F00362C1010, 0x0000000000020FE8) recv-flags=0x0000000000000040 detail='fd=19 ev=0x1 r=0x0 dom=1 typ=1 st=2 err=0 fl=0x80800 u:rb=0 br=0 scm=0 off=0 dgram=0 peer=1 pw=0 pst=2 rd=0 wr=0 wc=1 lst=0 orph=0 aorph=0'
+[SYSDIAG]   #78: fgetxattr(#193) -> -61 count=1 comm='pool-2' pid=146 rip=0x00007F0000A17E4E args=(0x0000000000000014, 0x00007F00362A4AEF, 0x00007F0030002120)
+[SYSDIAG]   #79: recvfrom(#45) -> -11 (EAGAIN) count=1 comm='pool-2' pid=146 rip=0x00007F00009A38F2 args=(0x0000000000000014, 0x00007F00362E2010, 0x0000000000020FE8) recv-flags=0x0000000000000040 detail='fd=20 ev=0x1 r=0x0 dom=1 typ=1 st=2 err=0 fl=0x80800 u:rb=0 br=0 scm=0 off=0 dgram=0 peer=1 pw=0 pst=2 rd=0 wr=0 wc=1 lst=0 orph=0 aorph=0'
+[SYSDIAG]   #80: access(#21) -> -2 (ENOENT) count=5 comm='pidof' pid=186 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #81: openat(#257) -> -2 (ENOENT) count=15 comm='pidof' pid=186 rip=0x00004000000277F5 args=(0x00000000FFFFFF9C, 0x00007FFFEFFFEB00, 0x0000000000080000) path='/usr/lib/glibc-hwcaps/x86-64-v4/libproc2.so.1'
+[SYSDIAG]   #82: newfstatat(#262) -> -2 (ENOENT) count=15 comm='pidof' pid=186 rip=0x000040000002756E args=(0x00000000FFFFFF9C, 0x00007FFFEFFFEB00, 0x00007FFFEFFFEA50) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #83: recvfrom(#45) -> -11 (EAGAIN) count=2 comm='systemd-resolve' pid=96 rip=0x00007F0000756A45 args=(0x0000000000000019, 0x00007F0000AA3010, 0x0000000000020FE8) recv-flags=0x0000000000000040 detail='fd=26 ev=0x1 r=0x0 dom=1 typ=1 st=2 err=0 fl=0x800 u:rb=0 br=113 scm=0 off=0 dgram=0 peer=1 pw=0 pst=2 rd=0 wr=0 wc=1 lst=0 orph=0 aorph=0'
+[SYSDIAG]   #84: connect(#42) -> -115 (EINPROGRESS) count=3 comm='NetworkManager' pid=146 rip=0x00007F00009A38F2 args=(0x000000000000001B, 0x0000000000900408, 0x0000000000000010)
+[SYSDIAG]   #85: connect(#42) -> -101 (ENETUNREACH) count=1 comm='pool-2' pid=146 rip=0x00007F00009A38F2 args=(0x0000000000000013, 0x00007F0030001F20, 0x000000000000001C)
+[SYSDIAG]   #86: connect(#42) -> -2 (ENOENT) count=2 comm='ModemManager' pid=169 rip=0x00007F0000C8E8F2 args=(0x0000000000000008, 0x00007F0000DA5160, 0x000000000000006E) path='/dev/log'
+[SYSDIAG]   #87: fgetxattr(#193) -> -61 count=2 comm='systemd-resolve' pid=96 rip=0x00007F0000748E4E args=(0x000000000000001A, 0x00007F000049F57A, 0x00000000004A8860)
+[SYSDIAG]   #88: connect(#42) -> -22 (EINVAL) count=1 comm='pool-2' pid=146 rip=0x00007F00009A38F2 args=(0x0000000000000013, 0x00007F0030002340, 0x0000000000000010)
+[SYSDIAG]   #89: connect(#42) -> -22 (EINVAL) count=1 comm='pool-1' pid=146 rip=0x00007F00009A38F2 args=(0x0000000000000013, 0x0000000000901F70, 0x0000000000000010)
+[SYSDIAG]   #90: connect(#42) -> -101 (ENETUNREACH) count=1 comm='pool-1' pid=146 rip=0x00007F00009A38F2 args=(0x0000000000000013, 0x00000000007C98B0, 0x000000000000001C)
+[SYSDIAG]   #91: sendmsg(#46) -> -32 (EPIPE) count=5 comm='dbus-daemon' pid=87 rip=0x00007F0000332F68 args=(0x000000000000000D, 0x00007FFFEFFFF380, 0x0000000000004000)
+[SYSDIAG]   #92: recvmsg(#47) -> -11 (EAGAIN) count=80 comm='pipewire' pid=183 rip=0x00007F00001738F2 args=(0x000000000000001D, 0x00007FFFEFFFE720, 0x0000000040000040) detail='fd=25 ev=0x1 r=0x0 dom=1 typ=1 st=2 err=0 fl=0x0 u:rb=0 br=1512 scm=0 off=0 dgram=0 peer=1 pw=0 pst=2 rd=0 wr=0 wc=1 lst=0 orph=0 aorph=0'
+[SYSDIAG]   #93: access(#21) -> -2 (ENOENT) count=38 comm='wireplumber' pid=187 rip=0x00007F0000474A9B args=(0x0000000000689650, 0x0000000000000004, 0x00007FFFEFFFBFD0) path='/etc/ld.so.preload'
+[SYSDIAG]   #94: openat(#257) -> -2 (ENOENT) count=112 comm='wireplumber' pid=187 rip=0x00007F000040A8F2 args=(0xFFFFFFFFFFFFFF9C, 0x00007F0000A5E47A, 0x0000000000080000) path='/usr/lib/glibc-hwcaps/x86-64-v4/libwireplumber-0.5.so.0'
+[SYSDIAG]   #95: access(#21) -> -2 (ENOENT) count=12 comm='pipewire' pid=183 rip=0x00007F00001DDA9B args=(0x00000000004FE420, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #96: ioctl(#16) -> -2 (ENOENT) count=3 comm='pipewire' pid=183 rip=0x00007F00001EED9D args=(0x000000000000001C, 0x00000000C4C85512, 0x00000000004DA3A0)
+[SYSDIAG]   #97: newfstatat(#262) -> -2 (ENOENT) count=11 comm='pipewire' pid=183 rip=0x00007F00001DEA6E args=(0x00000000FFFFFF9C, 0x0000000000448810, 0x00007FFFEFFFD500) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #98: newfstatat(#262) -> -2 (ENOENT) count=14 comm='bash' pid=199 rip=0x00007F000016AA6E args=(0x00000000FFFFFF9C, 0x0000000000582390, 0x00007FFFEFFFF4A0) path='/usr/local/sbin/-bash'
+[SYSDIAG]   #99: futex(#202) -> -1 (EPERM) count=1 comm='pipewire-pulse' pid=188 rip=0x00007F000016E019 args=(0x00007FFFEFFFE344, 0x0000000000000087, 0x0000000000000000)
+[SYSDIAG]   #100: ioctl(#16) -> -25 (ENOTTY) count=1 comm='pipewire-pulse' pid=188 rip=0x00007F00001E5EA9 args=(0x0000000000000002, 0x00000000802C542A, 0x00007FFFEFFFE860)
+[SYSDIAG]   #101: newfstatat(#262) -> -2 (ENOENT) count=125 comm='wireplumber' pid=187 rip=0x00007F0000475A6E args=(0x00000000FFFFFF9C, 0x00000000006D58C0, 0x00007FFFEFFFF5C0) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #102: openat(#257) -> -2 (ENOENT) count=16 comm='pipewire' pid=183 rip=0x00007F00001738F2 args=(0x000000000000001F, 0x00007F0000EE3192, 0x0000000000080100) path='/usr/lib/glibc-hwcaps/x86-64-v4/libpipewire-0.3.so.0'
+[SYSDIAG]   #103: ioctl(#16) -> -25 (ENOTTY) count=1 comm='wireplumber' pid=187 rip=0x00007F000047CEA9 args=(0x0000000000000002, 0x00000000802C542A, 0x00007FFFEFFFFB20)
+[SYSDIAG]   #104: getpeername(#52) -> -88 (ENOTSOCK) count=1 comm='wireplumber' pid=187 rip=0x00007F000048C7FB args=(0x0000000000000002, 0x00007FFFEFFFFAD0, 0x00007FFFEFFFFACC)
+[SYSDIAG]   #105: futex(#202) -> -1 (EPERM) count=1 comm='wireplumber' pid=187 rip=0x00007F0000405019 args=(0x00007FFFEFFFEDC4, 0x0000000000000087, 0x0000000000000000)
+[SYSDIAG]   #106: getsockopt(#55) -> -92 (ENOPROTOOPT) count=3 comm='pipewire' pid=183 rip=0x00007F00001F585E args=(0x000000000000001E, 0x0000000000000001, 0x000000000000001F)
+[SYSDIAG]   #107: ioctl(#16) -> -25 (ENOTTY) count=1 comm='pipewire' pid=183 rip=0x00007F00001E5EA9 args=(0x0000000000000002, 0x00000000802C542A, 0x00007FFFEFFFE860)
+[SYSDIAG]   #108: futex(#202) -> -1 (EPERM) count=1 comm='pipewire' pid=183 rip=0x00007F000016E019 args=(0x00007FFFEFFFE344, 0x0000000000000087, 0x0000000000000000)
+[SYSDIAG]   #109: recvmsg(#47) -> -11 (EAGAIN) count=23 comm='pipewire-pulse' pid=188 rip=0x00007F00001738F2 args=(0x000000000000000D, 0x00007FFFEFFFE6B0, 0x0000000040000040) detail='fd=13 ev=0x1 r=0x0 dom=1 typ=1 st=2 err=0 fl=0x80800 u:rb=0 br=16136 scm=0 off=0 dgram=0 peer=1 pw=0 pst=2 rd=0 wr=0 wc=1 lst=0 orph=0 aor'
+[SYSDIAG]   #110: access(#21) -> -2 (ENOENT) count=6 comm='pipewire-pulse' pid=188 rip=0x00007F00001DDA9B args=(0x00007FFFEFFFC8A0, 0x0000000000000004, 0x000000000040E950) path='/etc/ld.so.preload'
+[SYSDIAG]   #111: rt_sigtimedwait(#128) -> -11 (EAGAIN) count=1 comm='init' pid=1 rip=0x00000000004E2715 args=(0x000000000053E580, 0x0000000000000000, 0x000000000053E600)
+[SYSDIAG]   #112: openat(#257) -> -2 (ENOENT) count=17 comm='pipewire-pulse' pid=188 rip=0x00007F00001E5A46 args=(0x00000000FFFFFF9C, 0x00007F000028E07C, 0x0000000000080000) path='/usr/lib/glibc-hwcaps/x86-64-v4/libpipewire-0.3.so.0'
+[SYSDIAG]   #113: newfstatat(#262) -> -2 (ENOENT) count=9 comm='pipewire-pulse' pid=188 rip=0x00007F00001DEA6E args=(0x00000000FFFFFF9C, 0x0000000000436210, 0x00007FFFEFFFD360) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #114: openat(#257) -> -2 (ENOENT) count=3 comm='avory-login' pid=198 rip=0x00004000000277F5 args=(0x00000000FFFFFF9C, 0x00007FFFEFFFEB10, 0x0000000000080000) path='/usr/lib/glibc-hwcaps/x86-64-v4/libcrypt.so.2'
+[SYSDIAG]   #115: newfstatat(#262) -> -2 (ENOENT) count=3 comm='avory-login' pid=198 rip=0x000040000002756E args=(0x00000000FFFFFF9C, 0x00007FFFEFFFEB10, 0x00007FFFEFFFEA60) path='/usr/lib/glibc-hwcaps/x86-64-v4/'
+[SYSDIAG]   #116: access(#21) -> -2 (ENOENT) count=1 comm='init' pid=198 rip=0x00000000004E3A87 args=(0x000000000051B3DF, 0x0000000000000000, 0x0000000000000000) path='/.init_enable_core'
+[SYSDIAG]   #117: mkdir(#83) -> -17 (EEXIST) count=5 comm='avory-login' pid=199 rip=0x00007F0000146DCB args=(0x000000000040216C, 0x00000000000001ED, 0xFFFFFFFFFFFFFFB0) path='/.config'
+[SYSDIAG]   #118: mkdir(#83) -> -17 (EEXIST) count=6 comm='wireplumber' pid=187 rip=0x00007F000047ADCB args=(0x00007F00000A13A0, 0x00000000000001C0, 0x0000000000451190) path='/.local/state/wireplumber'
+[SYSDIAG]   #119: write(#1) -> -9 (EBADF) count=1 comm='init' pid=198 rip=0x00000000004E2715 args=(0x0000000000000003, 0x00007FFFEFFFFA18, 0x0000000000000037)
+[SYSDIAG]   #120: access(#21) -> -2 (ENOENT) count=1 comm='avory-login' pid=198 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #121: rt_sigaction(#13) -> -22 (EINVAL) count=1 comm='init' pid=198 rip=0x00000000004DECBF args=(0x0000000000000013, 0x00007FFFEFFFF8E0, 0x00007FFFEFFFF900)
+[SYSDIAG]   #122: access(#21) -> -2 (ENOENT) count=1 comm='bash' pid=199 rip=0x000040000002750B args=(0x0000400000031760, 0x0000000000000004, 0x0000000000000000) path='/etc/ld.so.preload'
+[SYSDIAG]   #123: fcntl(#72) -> -9 (EBADF) count=18 comm='bash' pid=199 rip=0x00007F0000171917 args=(0x00000000000000FF, 0x0000000000000001, 0x00007FFFEFFFF914)
+[SYSDIAG]   #124: recvmsg(#47) -> -11 (EAGAIN) count=65 comm='wireplumber' pid=187 rip=0x00007F000040A8F2 args=(0x000000000000000A, 0x00007FFFEFFFF590, 0x0000000040000040) detail='fd=10 ev=0x1 r=0x0 dom=1 typ=1 st=2 err=0 fl=0x80800 u:rb=0 br=17592 scm=0 off=0 dgram=0 peer=1 pw=0 pst=2 rd=0 wr=0 wc=1 lst=0 orph=0 aor'
+[SYSDIAG]   #125: readlinkat(#267) -> -2 (ENOENT) count=1 comm='wireplumber' pid=187 rip=0x00007F000047BB6E args=(0x00000000FFFFFF9C, 0x00000000005718E0, 0x00000000005BE4B0) path='/sys/class/sound/devices/subsystem'
+[SYSDIAG]   #126: readlink(#89) -> -2 (ENOENT) count=2 comm='wireplumber' pid=187 rip=0x00007F000047BB3B args=(0x00000000005B1E10, 0x0000000000528240, 0x0000000000000063) path='/sys/class/sound/card0/device/driver/module'
+[SYSDIAG]   #127: faccessat2(#439) -> -2 (ENOENT) count=6 comm='wireplumber' pid=187 rip=0x00007F00004750A9 args=(0x000000000000001A, 0x00007F002E0FF21C, 0x0000000000000000) path='uevent'
+[SYSDIAG]   #128: epoll_ctl(#233) -> -17 (EEXIST) count=1 comm='wireplumber' pid=187 rip=0x00007F000048B99E args=(0x000000000000000F, 0x0000000000000001, 0x0000000000000018)
+[SYSDIAG] join investigation candidates (game comms + I/O errors; excludes EAGAIN/EINTR/futex timeouts, 1 matching):
+[SYSDIAG]   sig: sendmsg(#46) -> -32 count=5 comm='dbus-daemon' pid=87 rip=0x00007F0000332F68
+[SYSDIAG] =============================================================
+
+[LOCKDIAG] ===================================================
+[LOCKDIAG] addresses are raw: resolve with addr2line -f -e kernel/bin-x86_64/kernel <addr>  (or nm -n that file and search); the same ELF the ISO was built from

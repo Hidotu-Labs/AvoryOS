@@ -78,6 +78,11 @@ struct pci_device *asc_pci_get_device(uint32_t index);
 
 // Get the 64-bit physical base address of a PCI BAR
 uint64_t pci_bar_phys(struct pci_device *dev, uint8_t bir);
+/* Restore the BAR values cached at enumeration after firmware or a device
+ * power transition cleared PCI configuration space. Leaves decode disabled. */
+bool pci_restore_bars(struct pci_device *dev);
+void pci_save_platform_s3_state(void);
+void pci_restore_platform_s3_state(void);
 
 // Map an MMIO physical address range into kernel virtual address space (at phys + hhdm).
 // Automatically uses 2 MB huge pages for 2 MB-aligned ranges to optimize page table
@@ -92,6 +97,7 @@ void *pci_map_bar(struct pci_device *dev, int bar_idx, uint64_t *out_size);
 
 #define PCI_CAP_ID_MSI  0x05
 #define PCI_CAP_ID_MSIX 0x11
+#define PCI_CAP_ID_PM   0x01
 #define PCI_MSIX_VECTOR_MASK 1U
 
 struct pci_msix {

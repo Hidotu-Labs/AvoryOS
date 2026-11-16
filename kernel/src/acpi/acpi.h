@@ -289,6 +289,23 @@ struct acpi_fadt {
   uint64_t hypervisor_vendor_identity;
 } __attribute__((packed));
 
+/* Firmware ACPI Control Structure. Unlike SDTs, FACS has no checksum. */
+struct acpi_facs {
+  char signature[4];
+  uint32_t length;
+  uint32_t hardware_signature;
+  uint32_t firmware_waking_vector;
+  uint32_t global_lock;
+  uint32_t flags;
+  uint64_t x_firmware_waking_vector;
+  uint8_t version;
+  uint8_t reserved[3];
+  uint32_t ospm_flags;
+} __attribute__((packed));
+
+#define ACPI_FACS_FLAG_64BIT_WAKE (1u << 1)
+#define ACPI_FACS_OSPM_FLAG_64BIT_WAKE (1u << 0)
+
 // FADT Preferred PM Profile strings
 static inline const char *fadt_pm_profile_name(uint8_t profile) {
   switch (profile) {
@@ -367,6 +384,18 @@ struct acpi_mcfg *acpi_get_mcfg(void);
 
 // Returns the FADT table if present, otherwise NULL.
 struct acpi_fadt *acpi_get_fadt(void);
+// Returns the validated FACS table if the FADT supplies one.
+struct acpi_facs *acpi_get_facs(void);
+// Set/clear the low-memory S3 wake vector in the firmware-owned FACS.
+bool acpi_set_waking_vector(uint32_t physical_address);
+void acpi_clear_waking_vector(void);
+// Reads SLP_TYPa and SLP_TYPb from the DSDT's _S1_ through _S5_ package.
+bool acpi_get_sleep_types(uint8_t state, uint8_t *type_a, uint8_t *type_b);
+// Enter ACPI S3/S4 using the DSDT sleep types and FADT PM1 controls.
+bool acpi_s3_supported(void);
+bool acpi_enter_s3(void);
+bool acpi_s4_supported(void);
+bool acpi_enter_s4(void);
 
 // Returns the SRAT table if present, otherwise NULL.
 struct acpi_srat *acpi_get_srat(void);
@@ -382,7 +411,7 @@ void *acpi_early_find_table(struct limine_rsdp_response *response,
 bool acpi_parse_fadt(void);
 
 // Power control (backed by ACPI FADT)
-// acpi_poweroff: enter the S5 (soft-off) sleep state; never returns on success.
+// acpi_poweroff: enter the firmware-described S5 (soft-off) state; never returns.
 void acpi_poweroff(void);
 // acpi_reboot: trigger a hardware reset via the FADT reset register, falling
 // back to the PS/2 keyboard controller reset pulse (port 0x64 / 0xFE).

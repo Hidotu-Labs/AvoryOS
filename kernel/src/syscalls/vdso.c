@@ -35,6 +35,7 @@ struct vdso_data {
     uint64_t mult_rem_ns;
     uint64_t mult_rem_us;
     uint64_t getcpu_mode; /* 0 = syscall fallback, 1 = rdtscp, 2 = rdpid */
+    uint64_t boot_mono_ns;
 };
 
 static inline const struct vdso_data *get_vdso_data(void) {
@@ -48,6 +49,25 @@ static inline uint64_t rdtsc(void) {
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
+}
+
+/* Return elapsed time from the current TSC base, including the monotonic
+ * offset carried across ACPI S3. The same elapsed value feeds monotonic and
+ * realtime clocks, keeping both continuous after the kernel rebases TSC. */
+static inline void vdso_elapsed_time(const struct vdso_data *data,
+                                     uint64_t *sec_out, uint64_t *nsec_out) {
+    uint64_t tsc = rdtsc();
+    uint64_t delta = tsc > data->boot_tsc ? tsc - data->boot_tsc : 0;
+    uint64_t sec = (uint64_t)(((__uint128_t)delta * data->sec_mult) >>
+                              (64 + data->sec_shift));
+    uint64_t sec_tsc = sec * data->tsc_hz;
+    uint64_t rem_tsc = delta > sec_tsc ? delta - sec_tsc : 0;
+    uint64_t nsec = (uint64_t)(((__uint128_t)rem_tsc * data->mult_rem_ns) >> 32);
+    uint64_t base_sec = data->boot_mono_ns / 1000000000ULL;
+    uint64_t base_nsec = data->boot_mono_ns % 1000000000ULL;
+    uint64_t total_nsec = base_nsec + nsec;
+    *sec_out = base_sec + sec + total_nsec / 1000000000ULL;
+    *nsec_out = total_nsec % 1000000000ULL;
 }
 
 static inline uint32_t read_tsc_aux_rdtscp(void) {
@@ -86,28 +106,14 @@ int __vdso_clock_gettime(int clock_id, struct timespec *ts) {
 
     if (clock_id == CLOCK_MONOTONIC || clock_id == CLOCK_MONOTONIC_RAW ||
         clock_id == CLOCK_BOOTTIME || clock_id == CLOCK_MONOTONIC_COARSE) {
-        uint64_t tsc = rdtsc();
-        uint64_t delta = (tsc > data->boot_tsc) ? (tsc - data->boot_tsc) : 0;
-        
-        uint64_t sec = (uint64_t)(((__uint128_t)delta * data->sec_mult) >> (64 + data->sec_shift));
-        uint64_t sec_tsc = (sec * data->tsc_hz);
-        uint64_t rem_tsc = (delta > sec_tsc) ? (delta - sec_tsc) : 0;
-        uint64_t nsec = ((uint64_t)(((__uint128_t)rem_tsc * data->mult_rem_ns) >> 32));
-        if (nsec >= 1000000000ULL) nsec = 999999999ULL;
-
+        uint64_t sec, nsec;
+        vdso_elapsed_time(data, &sec, &nsec);
         ts->tv_sec = (int64_t)sec;
         ts->tv_nsec = (int64_t)nsec;
         return 0;
     } else if (clock_id == CLOCK_REALTIME || clock_id == CLOCK_REALTIME_COARSE) {
-        uint64_t tsc = rdtsc();
-        uint64_t delta = (tsc > data->boot_tsc) ? (tsc - data->boot_tsc) : 0;
-        
-        uint64_t sec = (uint64_t)(((__uint128_t)delta * data->sec_mult) >> (64 + data->sec_shift));
-        uint64_t sec_tsc = (sec * data->tsc_hz);
-        uint64_t rem_tsc = (delta > sec_tsc) ? (delta - sec_tsc) : 0;
-        uint64_t nsec = ((uint64_t)(((__uint128_t)rem_tsc * data->mult_rem_ns) >> 32));
-        if (nsec >= 1000000000ULL) nsec = 999999999ULL;
-
+        uint64_t sec, nsec;
+        vdso_elapsed_time(data, &sec, &nsec);
         ts->tv_sec = (int64_t)(data->boot_sec + sec);
         ts->tv_nsec = (int64_t)nsec;
         return 0;
@@ -127,17 +133,10 @@ int __vdso_gettimeofday(struct timeval *tv, struct timezone *tz) {
         return (int)vdso_syscall2(96, (long)tv, (long)tz);
     }
 
-    uint64_t tsc = rdtsc();
-    uint64_t delta = (tsc > data->boot_tsc) ? (tsc - data->boot_tsc) : 0;
-    
-    uint64_t sec = (uint64_t)(((__uint128_t)delta * data->sec_mult) >> (64 + data->sec_shift));
-    uint64_t sec_tsc = (sec * data->tsc_hz);
-    uint64_t rem_tsc = (delta > sec_tsc) ? (delta - sec_tsc) : 0;
-    uint64_t usec = ((uint64_t)(((__uint128_t)rem_tsc * data->mult_rem_us) >> 32));
-    if (usec >= 1000000ULL) usec = 999999ULL;
-
+    uint64_t sec, nsec;
+    vdso_elapsed_time(data, &sec, &nsec);
     tv->tv_sec = (int64_t)(data->boot_sec + sec);
-    tv->tv_usec = (int64_t)usec;
+    tv->tv_usec = (int64_t)(nsec / 1000ULL);
     return 0;
 }
 
@@ -149,9 +148,9 @@ int64_t __vdso_time(int64_t *tloc) {
         return vdso_syscall2(201, (long)tloc, 0);
     }
 
-    uint64_t tsc = rdtsc();
-    uint64_t delta = (tsc > data->boot_tsc) ? (tsc - data->boot_tsc) : 0;
-    uint64_t sec = (uint64_t)(((__uint128_t)delta * data->sec_mult) >> (64 + data->sec_shift));
+    uint64_t sec, nsec;
+    vdso_elapsed_time(data, &sec, &nsec);
+    (void)nsec;
     int64_t now = (int64_t)(data->boot_sec + sec);
     if (tloc)
         *tloc = now;

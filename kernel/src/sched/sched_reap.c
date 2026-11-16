@@ -35,8 +35,22 @@ void pidfd_wake_waiters(void);
 // Threads in a CLONE_THREAD group are not wait4() children. Queue them for
 // destruction after they have switched off their kernel stacks.
 static struct thread *reap_queue = NULL;
+static struct thread *reap_queue_tail = NULL;
 static spinlock_t reap_queue_lock = SPINLOCK_INIT;
 static spinlock_t reap_worker_lock = SPINLOCK_INIT;
+
+/* Caller holds reap_queue_lock. Keep an in-flight victim visible for a later
+ * pass without taking a runqueue lock inside the global reap-queue critical
+ * section. */
+static void sched_reap_append_locked(struct thread *t) {
+  t->reap_next = NULL;
+  if (!reap_queue) {
+    reap_queue = reap_queue_tail = t;
+    return;
+  }
+  reap_queue_tail->reap_next = t;
+  reap_queue_tail = t;
+}
 
 void sched_queue_reap(struct thread *t) {
   if (!t || t->is_idle)
@@ -53,6 +67,8 @@ void sched_queue_reap(struct thread *t) {
   __atomic_store_n(&t->reap_queued, true, __ATOMIC_RELAXED);
   t->reap_next = reap_queue;
   reap_queue = t;
+  if (!reap_queue_tail)
+    reap_queue_tail = t;
   spinlock_release(&reap_queue_lock);
 }
 
@@ -85,30 +101,53 @@ void sched_queue_reap_and_wait(struct thread *t) {
 void sched_process_reap_queue(struct thread *prev) {
   if (__atomic_load_n(&reap_queue, __ATOMIC_RELAXED) != NULL &&
       spinlock_try_acquire(&reap_worker_lock)) {
-    while (1) {
+    /* Bound this pass to the queue snapshot. Producers may enqueue more work
+     * concurrently, but that work can be handled by the next scheduler pass. */
+    size_t budget = 0;
+    spinlock_acquire(&reap_queue_lock);
+    for (struct thread *it = reap_queue; it; it = it->reap_next)
+      budget++;
+    spinlock_release(&reap_queue_lock);
+
+    while (budget--) {
       struct thread *victim = NULL;
       spinlock_acquire(&reap_queue_lock);
       struct thread **link = &reap_queue;
+      struct thread *previous = NULL;
       while (*link) {
-        if (*link != prev && sched_prepare_thread_reap(*link)) {
+        if (*link != prev) {
           victim = *link;
           *link = victim->reap_next;
+          if (reap_queue_tail == victim)
+            reap_queue_tail = previous;
           victim->reap_next = NULL;
           break;
         }
+        previous = *link;
         link = &(*link)->reap_next;
       }
       spinlock_release(&reap_queue_lock);
 
       if (!victim)
         break;
+
+      /* sched_prepare_thread_reap() takes the owning CPU's runqueue lock.
+       * Never wait for it while holding reap_queue_lock: idle orphan scans
+       * enqueue while holding tid_lock, and this nesting can pin every CPU in
+       * a tid_lock -> reap_queue_lock -> runqueue_lock chain. */
+      if (!sched_prepare_thread_reap(victim)) {
+        spinlock_acquire(&reap_queue_lock);
+        sched_reap_append_locked(victim);
+        spinlock_release(&reap_queue_lock);
+        continue;
+      }
+
       if (!sched_reap_thread(victim)) {
         /* Keep the in-flight queue flag set, but put this victim back for a
          * later scheduler pass. The wake-claim owner must get CPU time before
          * its target can be released. */
         spinlock_acquire(&reap_queue_lock);
-        victim->reap_next = reap_queue;
-        reap_queue = victim;
+        sched_reap_append_locked(victim);
         spinlock_release(&reap_queue_lock);
         break;
       }
@@ -290,7 +329,7 @@ bool sched_reap_thread(struct thread *t) {
    * paths already called this; repeats are harmless no-ops. */
   vfork_release_parent(t);
   /* HHDM-backed stack pages need no page-table unmap during release. */
-  thread_stack_release(t->stack_base);
+  thread_stack_release(t->stack_base, t->stack_size, t);
   /* Clear any per-CPU fpu_owner references pointing at this thread
      before the struct is freed, to avoid stale pointer dereferences. */
   fpu_forget_thread(t);

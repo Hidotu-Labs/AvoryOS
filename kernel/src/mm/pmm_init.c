@@ -15,6 +15,8 @@ uint64_t pmm_usable_memory = 0;
 uint64_t pmm_total_memory = 0;
 uint64_t pmm_physical_memory_offset = 0;
 struct limine_memmap_response *pmm_internal_memmap = NULL;
+struct pmm_phys_range pmm_kernel_ranges[PMM_MAX_KERNEL_RANGES];
+size_t pmm_kernel_range_count = 0;
 uint64_t pmm_zero_page_phys = 0;
 
 void pmm_init_early(uint64_t hhdm_offset) {
@@ -36,6 +38,13 @@ void pmm_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
         entry->type == LIMINE_MEMMAP_ACPI_NVS ||
         entry->type == LIMINE_MEMMAP_FRAMEBUFFER) {
       pmm_total_memory += entry->length;
+    }
+
+    if (entry->type == LIMINE_MEMMAP_EXECUTABLE_AND_MODULES &&
+        entry->length > 0 && pmm_kernel_range_count < PMM_MAX_KERNEL_RANGES) {
+      pmm_kernel_ranges[pmm_kernel_range_count].base = entry->base;
+      pmm_kernel_ranges[pmm_kernel_range_count].length = entry->length;
+      pmm_kernel_range_count++;
     }
 
     uint64_t top = entry->base + entry->length;
@@ -94,6 +103,11 @@ void pmm_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
   buddy_zone_init(&b_zone);
 
   uint64_t bitmap_phys_base = (uint64_t)pmm_bitmap - hhdm_offset;
+  if (pmm_kernel_range_count < PMM_MAX_KERNEL_RANGES) {
+    pmm_kernel_ranges[pmm_kernel_range_count].base = bitmap_phys_base;
+    pmm_kernel_ranges[pmm_kernel_range_count].length = total_metadata_size;
+    pmm_kernel_range_count++;
+  }
 
   klog_puts("[PMM] Identified Physical Memory: ");
   klog_uint64(pmm_total_memory / 1024 / 1024);
@@ -174,5 +188,56 @@ void pmm_init(struct limine_memmap_response *memmap, uint64_t hhdm_offset) {
     memset((void *)(pmm_zero_page_phys + hhdm_offset), 0, PAGE_SIZE);
     uint64_t pfn = pmm_zero_page_phys / PAGE_SIZE;
     pmm_refcounts[pfn - pmm_lowest_page] = 0xFFFF; // Permanently pinned
+  }
+}
+
+void pmm_rebuild_free_lists_from_bitmap(void) {
+  int nodes = numa_node_count();
+  if (nodes <= 0)
+    nodes = 1;
+  for (int nid = 0; nid < nodes; nid++) {
+    struct numa_node *n = numa_get_node(nid);
+    if (n)
+      buddy_zone_init(&n->zone);
+  }
+
+  uint64_t pfn = pmm_lowest_page;
+  while (pfn < pmm_highest_page) {
+    size_t bit = (size_t)(pfn - pmm_lowest_page);
+    if (!pmm_bitmap_test(pmm_managed_bitmap, bit) ||
+        pmm_bitmap_test(pmm_bitmap, bit)) {
+      pfn++;
+      continue;
+    }
+
+    uint64_t phys = pfn * PAGE_SIZE;
+    int node = numa_phys_to_node(phys);
+    struct numa_node *n = numa_get_node(node);
+    struct buddy_zone *zone = n ? &n->zone : &b_zone;
+
+    size_t order = MAX_ORDER - 1;
+    while (order > 0) {
+      uint64_t blk_pages = 1ULL << order;
+      if ((pfn & (blk_pages - 1)) != 0 || pfn + blk_pages > pmm_highest_page) {
+        order--;
+        continue;
+      }
+      bool all_free = true;
+      for (uint64_t k = 0; k < blk_pages; k++) {
+        size_t b = (size_t)(pfn + k - pmm_lowest_page);
+        if (!pmm_bitmap_test(pmm_managed_bitmap, b) ||
+            pmm_bitmap_test(pmm_bitmap, b) ||
+            numa_phys_to_node((pfn + k) * PAGE_SIZE) != node) {
+          all_free = false;
+          break;
+        }
+      }
+      if (all_free)
+        break;
+      order--;
+    }
+
+    buddy_zone_seed_block(zone, phys, order);
+    pfn += (1ULL << order);
   }
 }

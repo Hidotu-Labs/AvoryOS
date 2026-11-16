@@ -137,6 +137,9 @@ static inline uint32_t nvme_cq_doorbell_offset(uint16_t qid, uint8_t dstrd) {
 #define NVME_ADMIN_GET_FEATURES 0x0A
 #define NVME_ADMIN_ASYNC_EVENT 0x0C
 
+/* Set Features identifiers (NVMe 1.4 §5.21). */
+#define NVME_FEAT_NUMBER_OF_QUEUES 0x07
+
 /* NVM command opcodes (NVMe 1.4 §6). */
 #define NVME_CMD_FLUSH 0x00
 #define NVME_CMD_WRITE 0x01
@@ -263,6 +266,8 @@ unsigned nvme_namespace_count(void);
  * reboot/power-off syscall path; a no-op when no controller is started.
  */
 void nvme_shutdown(void);
+void nvme_s4_pre_snapshot(void);
+void nvme_s4_post_snapshot_quiesce(void);
 
 #ifdef NVME_SELFTEST
 /*

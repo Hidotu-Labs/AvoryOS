@@ -685,6 +685,10 @@ void sched_wakeup(struct thread *t);
 void sched_critical_enter(void);
 void sched_critical_exit(void);
 void sched_yield(void);
+/* Keep the caller running while devices are being quiesced for system sleep. */
+bool sched_power_freeze_current(void);
+void sched_power_thaw_current(void);
+void sched_resume_from_s3(void);
 
 /* Releases a thread blocked in sys_vfork once its borrowing child is gone
  * (exec success, _exit, or kill/reap backstop). Sets the parent's completion
@@ -696,6 +700,9 @@ struct cpu_info;
 struct thread *sched_create_kernel_thread(void (*entry_point)(void),
                                           struct cpu_info *explicit_cpu,
                                           bool enqueue);
+struct thread *sched_create_kernel_thread_sized(
+    void (*entry_point)(void), struct cpu_info *explicit_cpu, bool enqueue,
+    size_t stack_size);
 
 void sched_tick(struct registers *regs);
 void sched_yield_user(void);

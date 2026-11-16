@@ -117,6 +117,8 @@ struct hda_bdl_entry {
 
 // Public Driver API
 void hda_init(void);
+int hda_suspend_for_s3(void);
+int hda_resume_from_s3(void);
 void hda_register_vfs(void);
 bool hda_is_present(void);
 // HDA_PARAM_PCM_SIZE_RATE of the active DAC: bits 0-10 = supported rates,

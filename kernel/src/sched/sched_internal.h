@@ -16,7 +16,9 @@ extern uint32_t next_tid;
 
 /* Stack allocation & lookaside caching */
 void *thread_stack_alloc(void);
-void thread_stack_release(uint64_t stack_base);
+void *thread_stack_alloc_sized(size_t stack_size);
+void thread_stack_release(uint64_t stack_base, size_t stack_size,
+                          const struct thread *owner);
 size_t thread_stack_cache_reclaim(size_t max_reclaim);
 size_t kstack_cache_total_cached(void);
 void kstack_cache_init(void);

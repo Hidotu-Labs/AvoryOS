@@ -98,6 +98,7 @@ static void spurious_handler(struct registers *regs) {
 // Initialization
 
 void lapic_init(uint64_t base_phys) {
+  bool first_init = (lapic_base == NULL);
   /* ACPI reports 0 in the MADT Local APIC Address field on some x2APIC-only
    * firmware; the architectural default is still 0xFEE00000.  Without this,
    * the boot log prints "Local APIC Base: 0x00000000" and xAPIC MMIO (if the
@@ -119,12 +120,16 @@ void lapic_init(uint64_t base_phys) {
   uint64_t apic_base = lapic_rdmsr(MSR_IA32_APIC_BASE);
   if (apic_base & APIC_BASE_X2APIC_ENABLE) {
     lapic_x2apic = true;
-    console_puts("[INFO] LAPIC is in x2APIC mode; using MSR access.\n");
-  }
+    if (first_init)
+      console_puts("[INFO] LAPIC is in x2APIC mode; using MSR access.\n");
+  } else
+    lapic_x2apic = false;
 
-  console_puts("[OK] Local APIC Base: 0x");
-  print_hex32((uint32_t)base_phys);
-  console_puts("\n");
+  if (first_init) {
+    console_puts("[OK] Local APIC Base: 0x");
+    print_hex32((uint32_t)base_phys);
+    console_puts("\n");
+  }
 
   // Register the spurious interrupt handler (vector 0xFF)
   register_interrupt_handler(LAPIC_SPURIOUS_VECTOR, spurious_handler);
@@ -164,11 +169,13 @@ void lapic_init(uint64_t base_phys) {
   lapic_write(LAPIC_EOI, 0);
 
   // Report
-  console_puts("     APIC ID: 0x");
-  print_hex32(lapic_get_id());
-  console_puts(", Version: 0x");
-  print_hex32(lapic_read(LAPIC_VERSION) & 0xFF);
-  console_puts("\n");
+  if (first_init) {
+    console_puts("     APIC ID: 0x");
+    print_hex32(lapic_get_id());
+    console_puts(", Version: 0x");
+    print_hex32(lapic_read(LAPIC_VERSION) & 0xFF);
+    console_puts("\n");
+  }
 }
 
 void lapic_write_icr(uint32_t apic_id, uint32_t icr_low) {

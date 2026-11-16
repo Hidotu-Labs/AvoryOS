@@ -70,5 +70,10 @@ bool vgpu_scanout_publish(struct vgpu_scanout_head *head,
     const struct vgpu_scanout_ops *ops, uint32_t scanout, struct vgpu_scanout_image *image);
 bool vgpu_scanout_detach(struct vgpu_scanout_head *head,
                          const struct vgpu_scanout_ops *ops, uint32_t scanout);
+/* Recreate retained staging images after a transport reset discarded all
+ * device-side resources. Returns true when every retained image is restored. */
+bool vgpu_scanout_restore(struct vgpu_scanout_head *head,
+                          const struct vgpu_scanout_ops *ops,
+                          uint32_t scanout);
 void vgpu_scanout_collect(struct vgpu_scanout_head *head, const struct vgpu_scanout_ops *ops);
 #endif

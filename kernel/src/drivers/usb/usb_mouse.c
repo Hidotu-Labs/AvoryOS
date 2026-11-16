@@ -33,6 +33,7 @@
 #include "../input/mouse.h"
 #include "ehci.h"
 #include "ohci.h"
+#include "sched/sched.h"
 #include "uhci.h"
 #include "usb.h"
 #include "xhci.h"
@@ -80,9 +81,6 @@ struct usb_endpoint_descriptor_m {
 #define USB_PROTOCOL_MOUSE 0x02
 
 #define USB_REQ_SET_IDLE_M 0x0A
-#define USB_REQ_SET_PROTOCOL_M 0x0B
-#define HID_PROTOCOL_BOOT_M 0x00
-#define HID_PROTOCOL_REPORT_M 0x01
 
 // HID report descriptor item constants
 
@@ -599,7 +597,6 @@ struct usb_mouse_state {
   int8_t halt_result;    // CLEAR_FEATURE(ENDPOINT_HALT) result
   const char *transport; // "generic", "uhci", "ehci", "ohci" or "none"
   uint64_t attach_ms;
-  bool silent_warned;
   int8_t get_report_result; // GET_REPORT(input) at probe time
   uint8_t get_report[8];
 
@@ -619,9 +616,16 @@ struct usb_mouse_state {
   uint32_t resubmit_failures;
   uint32_t reports_logged;
   uint32_t parse_failures;
-  uint32_t recovery_stage;     // Silent-endpoint recovery state machine
-  uint64_t next_recovery_ms;
   uint64_t last_report_ms;
+  bool control_poll_active;
+  bool interrupt_proven;
+  uint32_t control_polls;
+  uint32_t control_poll_failures;
+  int8_t last_control_result;
+  uint64_t next_control_poll_ms;
+  uint8_t last_control_report[16];
+  uint8_t last_control_len;
+  bool have_last_control_report;
   uint32_t get_protocol_result;
   uint8_t get_protocol_value;
   uint32_t set_idle_result;
@@ -630,19 +634,6 @@ struct usb_mouse_state {
   struct usb_mouse_event event_log[USB_MOUSE_EVENT_LOG];
   uint8_t event_head;
   uint8_t event_count;
-
-  // Control-endpoint fallback.  Some receivers answer GET_REPORT while never
-  // completing the interrupt transfer; after the silent-endpoint recovery
-  // gives up, poll GET_REPORT and decode whatever comes back.
-  bool control_poll_active;
-  bool interrupt_proven; // Endpoint delivered at least one report ever
-  uint32_t control_polls;
-  uint32_t control_poll_failures;
-  int8_t last_control_result;
-  uint64_t next_control_poll_ms;
-  uint8_t last_control_report[16];
-  uint8_t last_control_len;
-  bool have_last_control_report;
 
   // Absolute axis carry for touchpad-style devices
   int32_t abs_x;
@@ -666,12 +657,18 @@ struct usb_mouse_state {
 
 static struct usb_mouse_state mice[MAX_USB_MICE];
 static int mouse_count = 0;
-/* xHCI calls usb_mouse_poll() from both its IRQ and timer paths. With SMP the
- * timer watchdog may run on a different CPU while an IRQ is consuming the
- * same completion, so only one caller may inspect/resubmit each pipe at once.
- * This is a try-gate: a concurrent poll can be skipped and the next tick will
- * observe any completion that remains pending. */
+static bool usb_mouse_worker_started;
+static struct thread *usb_mouse_worker_thread;
+/* HCD IRQ/watchdog polling and the process-context fallback worker share this
+ * try-gate so they cannot consume the same completion or race the same pipe. */
 static volatile uint8_t usb_mouse_polling;
+
+static void usb_mouse_wake_worker(void) {
+  struct thread *worker =
+      __atomic_load_n(&usb_mouse_worker_thread, __ATOMIC_ACQUIRE);
+  if (worker && sched_get_current() != worker)
+    sched_wakeup(worker);
+}
 
 // Report decoding
 
@@ -1002,10 +999,8 @@ static int usb_mouse_set_idle(struct usb_device *dev, uint8_t iface) {
   return usb_control_transfer(dev, &req, NULL, 0);
 }
 
-// GET_PROTOCOL (HID 7.2.4).  A boot-capable interface answers 0 (boot) or 1
-// (report).  The driver adapts either way, but the value is the single most
-// useful fact when a mouse is silent: a device left in boot protocol and a
-// device in report protocol need different report layouts.
+// GET_PROTOCOL (HID 7.2.4) is optional; the parsed report descriptor remains
+// available when a device stalls this request.
 static int usb_mouse_get_protocol(struct usb_device *dev, uint8_t iface,
                                   uint8_t *value) {
   uint8_t buf[2];
@@ -1021,22 +1016,6 @@ static int usb_mouse_get_protocol(struct usb_device *dev, uint8_t iface,
     *value = buf[0];
   klogf("[USB-MOUSE] GET_PROTOCOL iface=%u -> res=%d value=%u\n", iface,
         result, buf[0]);
-  return result;
-}
-
-// SET_PROTOCOL (HID 7.2.5): 0 = boot, 1 = report.  Used only by the silent
-// endpoint recovery path, never during a normal probe.
-static int usb_mouse_set_protocol(struct usb_device *dev, uint8_t iface,
-                                  uint8_t protocol) {
-  struct usb_control_request req;
-  req.request_type = 0x21; // Host-to-device, class, interface
-  req.request = USB_REQ_SET_PROTOCOL_M;
-  req.value = protocol;
-  req.index = iface;
-  req.length = 0;
-  int result = usb_control_transfer(dev, &req, NULL, 0);
-  klogf("[USB-MOUSE] SET_PROTOCOL iface=%u protocol=%u -> res=%d\n", iface,
-        protocol, result);
   return result;
 }
 
@@ -1400,7 +1379,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
   ms->halt_result = 0; // updated below if a recovery attempt is made
   ms->transport = "none";
   ms->attach_ms = lapic_timer_get_ms();
-  ms->next_recovery_ms = ms->attach_ms + 3000;
   ms->get_report_result = get_report_result;
   memcpy(ms->get_report, get_report, sizeof(ms->get_report));
   ms->get_protocol_result = (uint32_t)get_protocol_result;
@@ -1505,6 +1483,7 @@ bool usb_mouse_probe(struct usb_device *dev) {
   klog_puts(")\n");
 
   mouse_last_probe_failure = "none";
+  usb_mouse_wake_worker();
   return true;
 }
 
@@ -1518,6 +1497,7 @@ void usb_mouse_disconnect(struct usb_device *dev) {
     ms->generic_pipe = NULL;
     ms->active = false;
     ms->dev = NULL;
+    ms->control_poll_active = false;
     klog_puts("[USB-MOUSE] Mouse detached\n");
   }
   bool absolute = false;
@@ -1538,14 +1518,6 @@ static void usb_mouse_poll_pipe(struct usb_mouse_state *ms, const void *buf,
   usb_mouse_decode(ms, (const uint8_t *)buf, len);
 }
 
-// Silent-endpoint recovery
-//
-// A configured interrupt endpoint that never completes a transfer is NAKing:
-// the device has nothing to send (mouse asleep, off, unpaired, wrong protocol)
-// or the endpoint is stuck.  Escalate through the cheap recovery steps once
-// every few seconds, logging each one, so a single boot on real hardware shows
-// exactly which step (if any) brings the mouse to life.
-
 static void usb_mouse_log_event(struct usb_mouse_state *ms, uint8_t code,
                                 uint16_t len, const uint8_t *data) {
   struct usb_mouse_event *ev = &ms->event_log[ms->event_head];
@@ -1561,51 +1533,48 @@ static void usb_mouse_log_event(struct usb_mouse_state *ms, uint8_t code,
     ms->event_count++;
 }
 
-static uint16_t usb_mouse_report_bytes(const struct hid_mouse_layout *l) {
-  if (!l->valid)
+static uint16_t usb_mouse_report_bytes(const struct hid_mouse_layout *layout) {
+  if (!layout->valid)
     return 0;
-  uint16_t id = usb_mouse_layout_report_id(l);
-  for (uint8_t r = 0; r < HID_MAX_REPORTS; r++) {
-    if (l->reports[r].used && l->reports[r].id == id) {
-      uint16_t bytes = (uint16_t)((l->reports[r].total_bits + 7) / 8);
-      if (l->has_report_id)
-        bytes++;
-      return bytes;
-    }
+  uint16_t id = usb_mouse_layout_report_id(layout);
+  for (uint8_t i = 0; i < HID_MAX_REPORTS; i++) {
+    const struct hid_mouse_report *report = &layout->reports[i];
+    if (!report->used || report->id != id)
+      continue;
+    uint16_t bytes = (uint16_t)((report->total_bits + 7) / 8);
+    return bytes + (layout->has_report_id ? 1 : 0);
   }
   return 0;
 }
 
-// Ask the device for its current input report over the control endpoint.
-// This is the fallback for a receiver whose interrupt endpoint stays silent
-// even though GET_REPORT works (see /proc/usb_mouse's get_report bytes).
+/* Some receiver firmware returns useful mouse reports on GET_REPORT while its
+ * interrupt endpoint stays pending. This runs only in the worker thread. */
 static void usb_mouse_control_poll(struct usb_mouse_state *ms) {
-  if (!ms->active || !ms->dev)
+  if (!ms->active || !ms->dev || !ms->dev->connected)
     return;
+
   uint8_t report[16];
   memset(report, 0, sizeof(report));
   uint16_t id = usb_mouse_layout_report_id(&ms->layout);
-  struct usb_control_request req;
-  req.request_type = 0xA1; // IN | class | interface
-  req.request = 0x01;      // GET_REPORT
-  req.value = 0x0100 | id; // Input report, current layout's report ID
-  req.index = ms->interface_number;
-  req.length = sizeof(report);
-  int res = usb_control_transfer(ms->dev, &req, report, sizeof(report));
+  struct usb_control_request req = {
+      .request_type = 0xA1,
+      .request = 0x01,
+      .value = (uint16_t)(0x0100 | id),
+      .index = ms->interface_number,
+      .length = sizeof(report),
+  };
+  int result = usb_control_transfer(ms->dev, &req, report, sizeof(report));
   ms->control_polls++;
-  ms->last_control_result = (int8_t)res;
-  if (res < 0) {
+  ms->last_control_result = (int8_t)result;
+  if (result < 0) {
     ms->control_poll_failures++;
     if (ms->control_poll_failures <= 3)
-      klogf("[USB-MOUSE] control poll failed (%d), failure %u\n", res,
-            ms->control_poll_failures);
+      klogf("[USB-MOUSE] GET_REPORT fallback failed (%d), failure %u\n",
+            result, ms->control_poll_failures);
     return;
   }
   ms->control_poll_failures = 0;
 
-  /* Use the longer of the boot and report layouts so the decoder's
-   * report-format auto-detect sees the real report even if the active layout
-   * was switched to boot by the recovery. */
   uint16_t len = usb_mouse_report_bytes(&ms->layout);
   if (ms->have_report_layout) {
     uint16_t report_len = usb_mouse_report_bytes(&ms->report_layout);
@@ -1614,105 +1583,14 @@ static void usb_mouse_control_poll(struct usb_mouse_state *ms) {
   }
   if (len == 0 || len > sizeof(report))
     return;
-  /* A device that keeps returning the same relative-delta report would make
-   * the cursor drift if replayed on every poll; skip exact repeats. */
   if (ms->have_last_control_report && len == ms->last_control_len &&
       memcmp(report, ms->last_control_report, len) == 0)
     return;
+
   memcpy(ms->last_control_report, report, len);
   ms->last_control_len = (uint8_t)len;
   ms->have_last_control_report = true;
   usb_mouse_decode(ms, report, len);
-}
-
-static void usb_mouse_recover_silent(struct usb_mouse_state *ms) {
-  if (!ms->active || !ms->dev)
-    return;
-  uint64_t now = lapic_timer_get_ms();
-  if (!ms->next_recovery_ms)
-    ms->next_recovery_ms = ms->attach_ms + 3000;
-  if (now < ms->next_recovery_ms)
-    return;
-  struct usb_device *dev = ms->dev;
-  usb_mouse_log_event(
-      ms, (uint8_t)(0xF0 + (ms->recovery_stage > 3 ? 3 : ms->recovery_stage)),
-      0, NULL);
-
-  switch (ms->recovery_stage) {
-  case 0: {
-    klogf("[USB-MOUSE] recovery 1/4: no reports after %llu ms, clearing "
-          "endpoint halt ep=0x%02X\n",
-          (unsigned long long)(now - ms->attach_ms), ms->ep_addr);
-    int res = usb_mouse_clear_halt(dev, ms->ep_addr);
-    klogf("[USB-MOUSE] recovery 1/4: CLEAR_FEATURE(HALT) -> %d\n", res);
-    ms->recovery_stage = 1;
-    ms->next_recovery_ms = now + 3000;
-    break;
-  }
-  case 1: {
-    klogf("[USB-MOUSE] recovery 2/4: reopening interrupt pipe ep=0x%02X\n",
-          ms->ep_addr);
-    if (ms->generic_pipe) {
-      usb_interrupt_cancel(ms->generic_pipe);
-      ms->generic_pipe = NULL;
-    }
-    ms->generic_pipe = usb_interrupt_open(
-        dev, ms->ep_addr, ms->max_packet, ms->interval, ms->report_buf,
-        ms->report_buf_phys);
-    klogf("[USB-MOUSE] recovery 2/4: reopen -> %s\n",
-          ms->generic_pipe ? "ok" : "FAIL");
-    ms->recovery_stage = 2;
-    ms->next_recovery_ms = now + 3000;
-    break;
-  }
-  case 2: {
-    if (ms->boot_capable) {
-      klogf("[USB-MOUSE] recovery 3/4: switching iface=%u to boot protocol\n",
-            ms->interface_number);
-      int res = usb_mouse_set_protocol(dev, ms->interface_number,
-                                       HID_PROTOCOL_BOOT_M);
-      if (res >= 0) {
-        struct hid_mouse_layout boot;
-        hid_build_boot_layout(&boot, ms->max_packet);
-        ms->layout = boot;
-        ms->using_boot = true;
-        ms->boot_layout = true;
-      }
-      klogf("[USB-MOUSE] recovery 3/4: SET_PROTOCOL(boot) -> %d layout=%s\n",
-            res, ms->using_boot ? "boot" : "report");
-    } else {
-      klog_puts("[USB-MOUSE] recovery 3/4: not boot-capable, skipping "
-                "SET_PROTOCOL\n");
-    }
-    ms->recovery_stage = 3;
-    ms->next_recovery_ms = now + 3000;
-    break;
-  }
-  default: {
-    if (!ms->silent_warned) {
-      ms->silent_warned = true;
-      uint8_t protocol = 0xFF;
-      usb_mouse_get_protocol(dev, ms->interface_number, &protocol);
-      uint8_t report[16];
-      memset(report, 0, sizeof(report));
-      uint16_t id = usb_mouse_layout_report_id(&ms->layout);
-      struct usb_control_request req;
-      req.request_type = 0xA1;
-      req.request = 0x01;
-      req.value = 0x0100 | id;
-      req.index = ms->interface_number;
-      req.length = sizeof(report);
-      int res = usb_control_transfer(dev, &req, report, sizeof(report));
-      klogf("[USB-MOUSE] recovery 4/4: still silent after %llu ms; "
-            "GET_PROTOCOL=%u GET_REPORT(id=%u)=%d\n",
-            (unsigned long long)(now - ms->attach_ms), protocol, id, res);
-      klog_puts("[USB-MOUSE] endpoint is NAKing: mouse asleep, off, "
-                "unpaired, or the receiver is not forwarding its reports\n");
-    }
-    ms->next_recovery_ms = now + 30000;
-    break;
-  }
-  }
 }
 
 void usb_mouse_poll(void) {
@@ -1726,41 +1604,22 @@ void usb_mouse_poll(void) {
     if (ms->generic_pipe) {
       ms->poll_calls++;
       if (!usb_interrupt_completed(ms->generic_pipe)) {
-        /* No completion: the endpoint is NAKing or stuck.  Drive the silent
-         * endpoint recovery state machine and keep polling. */
-        usb_mouse_recover_silent(ms);
-        uint64_t now = lapic_timer_get_ms();
-        /* The recovery steps have all run and the interrupt endpoint has
-         * never delivered a single report: fall back to control-endpoint
-         * polling.  Once the endpoint proves it works (one report), silence
-         * just means the device is idle and the fallback stays off. */
-        if (!ms->control_poll_active && !ms->interrupt_proven &&
-            ms->recovery_stage >= 3 && ms->attach_ms &&
-            now - ms->attach_ms > 10000) {
-          ms->control_poll_active = true;
-          ms->next_control_poll_ms = now;
-          klog_puts("[USB-MOUSE] interrupt endpoint still silent; polling "
-                    "GET_REPORT as a fallback\n");
-        }
-        if (ms->control_poll_active && now >= ms->next_control_poll_ms) {
-          usb_mouse_control_poll(ms);
-          /* 50 Hz while the device answers, 1 Hz after a failure so a
-           * misbehaving device cannot stall the timer for long. */
-          ms->next_control_poll_ms =
-              now + (ms->control_poll_failures ? 1000 : 20);
-        }
+        /* Interrupt-IN transfers remain pending while an HID device has no
+         * input to report. Silence is normal. This function also runs from
+         * the xHCI timer/IRQ path, so it must not issue synchronous control
+         * transfers or rebuild the pipe here. */
         continue;
       }
       ms->pipe_completions++;
       if (!ms->interrupt_proven) {
         ms->interrupt_proven = true;
-        klog_puts("[USB-MOUSE] interrupt endpoint delivering reports\n");
-      }
-      if (ms->control_poll_active) {
-        ms->control_poll_active = false;
-        ms->have_last_control_report = false;
-        klog_puts("[USB-MOUSE] interrupt endpoint recovered; stopping "
-                  "GET_REPORT polling\n");
+        if (ms->control_poll_active) {
+          ms->control_poll_active = false;
+          ms->have_last_control_report = false;
+          klog_puts("[USB-MOUSE] interrupt endpoint recovered; stopping "
+                    "GET_REPORT fallback\n");
+          usb_mouse_wake_worker();
+        }
       }
       uint16_t raw_len = ms->generic_pipe->actual_length;
       uint16_t len = raw_len ? raw_len : ms->generic_pipe->buffer_len;
@@ -1814,6 +1673,76 @@ void usb_mouse_poll(void) {
   }
 
   __atomic_clear(&usb_mouse_polling, __ATOMIC_RELEASE);
+}
+
+static uint64_t usb_mouse_poll_fallbacks(void) {
+  uint64_t now = lapic_timer_get_ms();
+  uint64_t next_wake_ms = now + 1000;
+  if (__atomic_test_and_set(&usb_mouse_polling, __ATOMIC_ACQUIRE))
+    return 1;
+
+  for (int i = 0; i < mouse_count; i++) {
+    struct usb_mouse_state *ms = &mice[i];
+    if (!ms->active || !ms->generic_pipe || ms->interrupt_proven ||
+        ms->get_report_result < 0 || !ms->dev || !ms->dev->connected)
+      continue;
+    if (!ms->control_poll_active && xhci_interrupt_pipe_healthy(ms->generic_pipe))
+      continue;
+    if (!ms->control_poll_active && now < ms->attach_ms + 3000) {
+      uint64_t start_ms = ms->attach_ms + 3000;
+      if (start_ms < next_wake_ms)
+        next_wake_ms = start_ms;
+      continue;
+    }
+    if (!ms->control_poll_active) {
+      ms->control_poll_active = true;
+      ms->next_control_poll_ms = now;
+      klog_puts("[USB-MOUSE] interrupt endpoint silent; starting "
+                "process-context GET_REPORT fallback\n");
+    }
+    if (now >= ms->next_control_poll_ms) {
+      usb_mouse_control_poll(ms);
+      /* Keep mouse response near 50 Hz when the request works; back off to
+       * one per second if the control endpoint fails. This is process context,
+       * so a slow EP0 transaction cannot stall timers or input IRQs. */
+      ms->next_control_poll_ms = lapic_timer_get_ms() +
+                                 (ms->control_poll_failures ? 1000 : 20);
+    }
+    if (ms->next_control_poll_ms < next_wake_ms)
+      next_wake_ms = ms->next_control_poll_ms;
+  }
+
+  __atomic_clear(&usb_mouse_polling, __ATOMIC_RELEASE);
+  now = lapic_timer_get_ms();
+  return next_wake_ms > now ? next_wake_ms - now : 1;
+}
+
+static void usb_mouse_worker(void) {
+  struct thread *self = sched_get_current();
+  for (;;) {
+    uint64_t wait_ms = usb_mouse_poll_fallbacks();
+    self->wakeup_ticks = lapic_timer_get_ms() + wait_ms;
+    self->state = THREAD_SLEEPING;
+    sched_yield();
+    self->wakeup_ticks = 0;
+  }
+}
+
+void usb_mouse_start_worker(void) {
+  if (usb_mouse_worker_started)
+    return;
+  struct thread *worker =
+      sched_create_kernel_thread(usb_mouse_worker, cpu_get_current(), false);
+  if (!worker) {
+    klog_puts("[USB-MOUSE] failed to start process-context fallback worker\n");
+    return;
+  }
+  strcpy(worker->comm, "usb-mouse");
+  sched_set_priority(worker, 0, -5);
+  __atomic_store_n(&usb_mouse_worker_thread, worker, __ATOMIC_RELEASE);
+  usb_mouse_worker_started = true;
+  sched_enqueue_thread(worker, cpu_get_current());
+  klog_puts("[USB-MOUSE] process-context fallback worker started\n");
 }
 
 // Layout self-test
@@ -2028,19 +1957,17 @@ void usb_mouse_diag(struct usb_diag *d) {
                     ms->layout.button_count, ms->boot_capable ? 1 : 0);
     usb_diag_printf(d,
                     "    counters: polls=%u completions=%u zero_len=%u "
-                    "resubmit_fail=%u parse_fail=%u recovery_stage=%u "
-                    "silent_warned=%u\n",
+                    "resubmit_fail=%u parse_fail=%u\n",
                     ms->poll_calls, ms->pipe_completions,
                     ms->zero_len_completions, ms->resubmit_failures,
-                    ms->parse_failures, ms->recovery_stage,
-                    ms->silent_warned ? 1 : 0);
+                    ms->parse_failures);
     usb_diag_printf(d,
                     "    protocol: get_protocol_res=%d value=%u set_idle=%d "
                     "get_report=%d\n",
                     (int)ms->get_protocol_result, ms->get_protocol_value,
                     (int)ms->set_idle_result, ms->get_report_result);
     usb_diag_printf(d,
-                    "    control_poll: active=%u polls=%u failures=%u "
+                    "    get_report_fallback: active=%u polls=%u failures=%u "
                     "last_res=%d\n",
                     ms->control_poll_active ? 1 : 0, ms->control_polls,
                     ms->control_poll_failures, (int)ms->last_control_result);

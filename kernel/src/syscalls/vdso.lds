@@ -22,7 +22,8 @@ SECTIONS
   .text           : { *(.text) *(.text.__vdso_clock_gettime*) *(.text.__vdso_gettimeofday*) *(.text.__vdso_time*) } :text
   .got            : { *(.got*) } :text
   .got.plt        : { *(.got.plt*) } :text
-  . = 0x800;
+  /* Keep the fixed data page at 0xE00 while leaving room for clock helpers. */
+  . = 0xA00;
   .text.getcpu    : { *(.text.getcpu) } :text
   /DISCARD/       : { *(.note*) *(.comment*) }
 }

@@ -16,6 +16,7 @@
 #include "../mm/heap.h"
 #include "../mm/vmm.h"
 #include "../sched/sched.h"
+#include "../sched/sched_internal.h"
 #include "../socket/socket.h"
 #include "sys_io_shared.h"
 #include "syscall.h"
@@ -815,7 +816,6 @@ device_vfs_lookup:
       if (node_owned) vfs_close(node);
       return (uint64_t)truncate_result;
     }
-    node->length = 0;
   }
 
   /* Persistent metadata may provide a fresh per-open object.  DRM was the
@@ -2454,20 +2454,62 @@ static uint64_t sys_fdatasync(uint64_t fd, uint64_t a1, uint64_t a2,
   return sys_fsync(fd, a1, a2, a3, a4, a5);
 }
 
-/* sync(2) never fails. There is no global dirty-inode list: pages of closed
- * files are written back on last close, so flushing the caller's open
- * descriptors covers everything still cached for it. */
+/* There is no global dirty-inode list. Snapshot references from every live
+ * task's shared fd table under the scheduler locks, then do writeback unlocked. */
+void sys_sync_all_open_files(void) {
+  uint32_t max_tid = 0;
+  spinlock_acquire(&tid_lock);
+  for (struct thread *t = global_thread_list; t; t = t->global_next)
+    if (t->tid > max_tid)
+      max_tid = t->tid;
+  spinlock_release(&tid_lock);
+
+  uint32_t cursor = 0;
+  vfs_node_t *nodes[MAX_FDS];
+  for (;;) {
+    struct thread *next = NULL;
+    bool found = false;
+    uint32_t next_tid = 0;
+    size_t node_count = 0;
+
+    spinlock_acquire(&tid_lock);
+    for (struct thread *t = global_thread_list; t; t = t->global_next) {
+      if (!t->files || t->tid <= cursor || t->tid > max_tid ||
+          (found && t->tid >= next_tid))
+        continue;
+      next = t;
+      next_tid = t->tid;
+      found = true;
+    }
+    if (!found) {
+      spinlock_release(&tid_lock);
+      break;
+    }
+
+    struct fd_table *files = next->files;
+    spinlock_acquire(&files->lock);
+    for (uint32_t fd = 0; fd < files->capacity && fd < MAX_FDS; fd++) {
+      vfs_node_t *node = files->fds[fd];
+      if (!fd_is_valid_node(node))
+        continue;
+      vfs_node_ref(node);
+      nodes[node_count++] = node;
+    }
+    spinlock_release(&files->lock);
+    spinlock_release(&tid_lock);
+
+    cursor = next_tid;
+    for (size_t i = 0; i < node_count; i++) {
+      vfs_cache_sync(nodes[i]);
+      vfs_close(nodes[i]);
+    }
+  }
+}
+
 static uint64_t sys_sync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                          uint64_t a4, uint64_t a5) {
   (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
-  struct thread *t = sched_get_current();
-  for (uint64_t fd = 0; t && t->files && fd < t->files->capacity; fd++) {
-    vfs_node_t *node = fd_node_get(t, fd);
-    if (!node)
-      continue;
-    vfs_cache_sync(node);
-    fd_node_put(&node);
-  }
+  sys_sync_all_open_files();
   return 0;
 }
 

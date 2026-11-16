@@ -39,6 +39,7 @@ void tss_set_rsp0(uint64_t rsp0);
 
 void gdt_set_compat_tls(const uint64_t entries[3]);
 void gdt_init(void);
+void gdt_reload_bsp(void);
 void gdt_load_ap(uint32_t cpu_id);
 void cpu_switch_stack(uint64_t new_rsp);
 void cpu_jump_to_stack(uint64_t new_rsp, void (*target)(void));

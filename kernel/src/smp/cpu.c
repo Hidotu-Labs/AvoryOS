@@ -10,6 +10,7 @@
 #include "cpu/fpu.h"
 #include "cpu/gdt.h"
 #include "cpu/idt.h"
+#include "cpu/isr.h"
 #include "cpu/tsc.h"
 #include "drivers/timer/pit.h"
 #include "io/io.h"
@@ -17,23 +18,60 @@
 #include "lib/tsc.h"
 #include "mm/pmm.h"
 #include "mm/numa.h"
+#include "mm/pcid.h"
 #include "mm/vmm.h"
 #include "syscalls/syscall.h"
+#include "sched/sched.h"
 #include <stdbool.h>
 #include <stddef.h>
 
 // External Trampoline Symbols
 extern uint8_t trampoline_start[];
 extern uint8_t trampoline_end[];
+extern uint8_t trampoline_wake_entry[];
 extern uint8_t trampoline_data_cr3[];
 extern uint8_t trampoline_data_rip[];
 extern uint8_t trampoline_data_ap_count[];
+extern uint8_t trampoline_data_mode[];
+extern uint8_t trampoline_data_resume_rsp[];
+extern uint8_t trampoline_data_resume_rip[];
+extern uint8_t trampoline_data_resume_cr4[];
+extern uint8_t trampoline_data_resume_cr0[];
+extern uint8_t trampoline_data_resume_efer[];
 extern uint8_t trampoline_ap_records[];
 extern uint8_t trampoline_ap_records_end[];
 
 // Storage
 static struct cpu_info cpus[MAX_CPUS];
 static uint32_t cpu_count = 0;
+static bool trampoline_ready;
+static int s3_park_vector = -1;
+static volatile bool s3_park_requested;
+static volatile uint64_t s3_park_ack_mask;
+static bool s3_aps_quiesced;
+static uint64_t s3_saved_bsp_cr3;
+static uint64_t s3_saved_fs_base;
+static uint64_t s3_saved_kernel_gs_base;
+static uint64_t s3_saved_apic_base;
+
+#define MSR_MTRRCAP 0xFEU
+#define MSR_MTRR_DEF_TYPE 0x2FFU
+#define MSR_MTRR_PHYSBASE(i) (0x200U + 2U * (uint32_t)(i))
+#define MSR_MTRR_PHYSMASK(i) (0x201U + 2U * (uint32_t)(i))
+#define CPU_MAX_VAR_MTRRS 16U
+
+static const uint32_t s3_fixed_mtrr_msrs[11] = {
+    0x250U, 0x258U, 0x259U,
+    0x268U, 0x269U, 0x26AU, 0x26BU,
+    0x26CU, 0x26DU, 0x26EU, 0x26FU,
+};
+static bool s3_mtrr_saved;
+static bool s3_mtrr_fixed_valid;
+static uint32_t s3_mtrr_vcnt;
+static uint64_t s3_mtrr_def_type;
+static uint64_t s3_mtrr_fixed[11];
+static uint64_t s3_mtrr_var_base[CPU_MAX_VAR_MTRRS];
+static uint64_t s3_mtrr_var_mask[CPU_MAX_VAR_MTRRS];
 /* These early routines also publish shared feature caches and ISR state. */
 static volatile uint32_t ap_shared_init_lock;
 
@@ -80,6 +118,90 @@ static inline uint64_t rdmsr(uint32_t msr) {
   uint32_t lo, hi;
   __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
   return ((uint64_t)hi << 32) | lo;
+}
+
+static bool cpu_supports_mtrr(void) {
+  uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+  __asm__ volatile("cpuid"
+                   : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                   : "a"(1), "c"(0)
+                   : "memory");
+  return (edx & (1U << 12)) != 0;
+}
+
+static void cpu_save_s3_mtrrs(void) {
+  s3_mtrr_saved = false;
+  s3_mtrr_fixed_valid = false;
+  s3_mtrr_vcnt = 0;
+  if (!cpu_supports_mtrr())
+    return;
+  uint64_t cap = rdmsr(MSR_MTRRCAP);
+  s3_mtrr_def_type = rdmsr(MSR_MTRR_DEF_TYPE);
+  if (cap & (1ULL << 8)) {
+    s3_mtrr_fixed_valid = true;
+    for (size_t i = 0; i < 11; i++)
+      s3_mtrr_fixed[i] = rdmsr(s3_fixed_mtrr_msrs[i]);
+  }
+  uint32_t vcnt = (uint32_t)(cap & 0xFFU);
+  if (vcnt > CPU_MAX_VAR_MTRRS)
+    vcnt = CPU_MAX_VAR_MTRRS;
+  s3_mtrr_vcnt = vcnt;
+  for (uint32_t i = 0; i < vcnt; i++) {
+    s3_mtrr_var_base[i] = rdmsr(MSR_MTRR_PHYSBASE(i));
+    s3_mtrr_var_mask[i] = rdmsr(MSR_MTRR_PHYSMASK(i));
+  }
+  s3_mtrr_saved = true;
+}
+
+static void cpu_restore_s3_mtrrs(void) {
+  if (!s3_mtrr_saved || !(s3_mtrr_def_type & (1ULL << 11)) ||
+      !cpu_supports_mtrr())
+    return;
+  uint64_t cap = rdmsr(MSR_MTRRCAP);
+  uint32_t vcnt = (uint32_t)(cap & 0xFFU);
+  if (vcnt > s3_mtrr_vcnt)
+    vcnt = s3_mtrr_vcnt;
+  wrmsr(MSR_MTRR_DEF_TYPE, s3_mtrr_def_type & ~(1ULL << 11));
+  if (s3_mtrr_fixed_valid && (cap & (1ULL << 8))) {
+    for (size_t i = 0; i < 11; i++)
+      wrmsr(s3_fixed_mtrr_msrs[i], s3_mtrr_fixed[i]);
+  }
+  for (uint32_t i = 0; i < vcnt; i++) {
+    wrmsr(MSR_MTRR_PHYSBASE(i), s3_mtrr_var_base[i]);
+    wrmsr(MSR_MTRR_PHYSMASK(i), s3_mtrr_var_mask[i]);
+  }
+  wrmsr(MSR_MTRR_DEF_TYPE, s3_mtrr_def_type);
+}
+
+static void cpu_s3_park_ipi(struct registers *regs) { (void)regs; }
+
+static bool cpu_ap_park_if_idle(struct cpu_info *cpu) {
+  if (!cpu || cpu->cpu_id == 0 ||
+      !__atomic_load_n(&s3_park_requested, __ATOMIC_ACQUIRE))
+    return false;
+
+  hal_irq_state_t irq = hal_irq_save();
+  spinlock_acquire(&cpu->queue_lock);
+  bool may_park = cpu->current_thread == cpu->idle_thread &&
+                  cpu->runnable_count == 0 && cpu->status == CPU_STATUS_ONLINE;
+  if (may_park)
+    __atomic_store_n(&cpu->status, CPU_STATUS_OFFLINE, __ATOMIC_RELEASE);
+  spinlock_release(&cpu->queue_lock);
+  if (!may_park) {
+    hal_irq_restore(irq);
+    return false;
+  }
+
+  /* Each processor must push its dirty cache lines before the BSP asks the
+   * platform to enter S3/S4. Keep local interrupts masked while parked so
+   * timer ticks (sched_tick / eevfd) cannot run during snapshot or sleep. */
+  __asm__ volatile("wbinvd" ::: "memory");
+  __atomic_fetch_or(&s3_park_ack_mask, 1ULL << cpu->cpu_id, __ATOMIC_RELEASE);
+  while (__atomic_load_n(&s3_park_requested, __ATOMIC_ACQUIRE))
+    hal_cpu_relax();
+  __atomic_store_n(&cpu->status, CPU_STATUS_ONLINE, __ATOMIC_RELEASE);
+  hal_irq_restore(irq);
+  return true;
 }
 
 /* Before every CPU has installed its own GS base, cpu_get_current() must use
@@ -145,9 +267,6 @@ static inline uint32_t get_initial_apic_id(void) {
 // AP Entry Point
 
 void ap_main(struct cpu_info *bootstrap) {
-  klog_puts("AP IN MAIN!\n");
-  DBG("[AP] entered long mode\n");
-
   // We are now in 64-bit Long Mode!
 
   // 0. Load the proper full kernel GDT (replaces the temporary trampoline GDT)
@@ -156,6 +275,14 @@ void ap_main(struct cpu_info *bootstrap) {
   // Each AP also loads its own TSS so TSS.RSP0 is private to this core.
   gdt_load_ap(bootstrap ? bootstrap->cpu_id : 0);
 
+  /* S3 INIT/SIPI resets AP MSRs while the BSP's GS fast path remains
+   * published. Install this AP's base and restore MTRRs before logging or any
+   * GS-based lookup. */
+  cpu_set_gs_base(bootstrap);
+  cpu_restore_s3_mtrrs();
+  klog_puts("AP IN MAIN!\n");
+  DBG("[AP] entered long mode\n");
+
   /* APs now enter concurrently. Serialize the routines that publish shared
    * feature caches and LAPIC handler state; CPU-local setup can still overlap. */
   while (__atomic_exchange_n(&ap_shared_init_lock, 1, __ATOMIC_ACQUIRE))
@@ -163,8 +290,6 @@ void ap_main(struct cpu_info *bootstrap) {
   cpu_features_init();
   DBG("[AP] gdt + cpu features ok\n");
 
-  // 1. Setup GS base using the pointer passed by the BSP
-  cpu_set_gs_base(bootstrap);
   struct cpu_info *current = cpu_get_current();
 
   // 1.5 Switch to the dedicated kernel stack and page tables.
@@ -173,6 +298,7 @@ void ap_main(struct cpu_info *bootstrap) {
   cpu_set_active_cr3(current->kernel_cr3);
   __asm__ volatile("mov %0, %%cr3" ::"r"(current->kernel_cr3) : "memory");
   cpu_switch_stack(current->stack_top);
+  cpu_pcid_invalidate_all(current);
   DBG("[AP] cpu %u: cr3 + kernel stack ok\n", current->cpu_id);
 
   // 2. Initialize the LAPIC for this core (needs the HHDM base mapping)
@@ -189,11 +315,7 @@ void ap_main(struct cpu_info *bootstrap) {
   // and takes a #UD (observed as a SIGILL in radeonsi's compiler threads).
   syscall_init_cpu();
 
-  // 4. initialize the LAPIC timer for this core so it can independently preempt
-  lapic_timer_init_ap();
-  DBG("[AP] cpu %u: idt + syscall + timer ok\n", current->cpu_id);
-
-  // 5. Enable interrupts locally on this core
+  // 4. Enable interrupts locally on this core
   hal_irq_enable();
 
   // Mark as online to unblock the BSP's boot loop
@@ -206,6 +328,11 @@ void ap_main(struct cpu_info *bootstrap) {
   klog_puts(") ONLINE.\n");
   DBG("[AP] cpu %u: ONLINE, entering idle\n", current->cpu_id);
 
+  // 5. Initialize the LAPIC timer for this core after boot/resume logging so
+  // scheduler ticks do not preempt ap_main() mid-klog.
+  lapic_timer_init_ap();
+  DBG("[AP] cpu %u: timer ok\n", current->cpu_id);
+
   // Endless loop, waiting for IPIs or scheduler interrupts.
   //
   // The LAPIC is one-shot and only armed when this CPU has a deadline, so an
@@ -216,6 +343,8 @@ void ap_main(struct cpu_info *bootstrap) {
   // one tick a second, which is enough for all of them to notice a hang and
   // enough for any of them to read the serial console.
   while (1) {
+    if (cpu_ap_park_if_idle(current))
+      continue;
     extern void sched_reap_orphaned_zombies(void);
     sched_reap_orphaned_zombies();
     /* rearm_if_earlier(), not arm_at(): a sleeping thread's deadline may have
@@ -441,6 +570,19 @@ static void ap_park(uint32_t apic_id) {
 }
 
 void cpu_init_aps(void) {
+  uint64_t tramp_phys = 0x8000;
+  uint64_t tramp_virt = tramp_phys + pmm_get_hhdm_offset();
+  size_t trampoline_size = (size_t)(trampoline_end - trampoline_start);
+  if (trampoline_size > PAGE_SIZE ||
+      !vmm_map_page(vmm_get_active_pml4(), tramp_phys, tramp_phys,
+                    PAGE_FLAG_RW | PAGE_FLAG_PRESENT)) {
+    klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
+              " S3/AP low-memory trampoline setup failed.\n");
+    goto publish_gs_fastpath;
+  }
+  memcpy((void *)tramp_virt, trampoline_start, trampoline_size);
+  trampoline_ready = true;
+
   // Start all APs from immutable per-CPU records. The SIPI trampoline can
   // therefore resolve each AP independently, while the BSP batches the
   // protocol's fixed waits instead of paying 10 ms per core.
@@ -451,28 +593,6 @@ void cpu_init_aps(void) {
 
     uint64_t cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-
-    uint64_t tramp_phys = 0x8000;
-    uint64_t tramp_virt = tramp_phys + pmm_get_hhdm_offset();
-    size_t trampoline_size = (size_t)(trampoline_end - trampoline_start);
-
-    if (trampoline_size > PAGE_SIZE) {
-      klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
-                " AP trampoline exceeds its SIPI page; APs remain offline.\n");
-      goto publish_gs_fastpath;
-    }
-
-    // Copy trampoline code to 0x8000
-    memcpy((void *)tramp_virt, trampoline_start, trampoline_size);
-
-    // Identity-map the 0x8000 page in the active PML4 so the AP safely
-    // transitions PAGING -> 64-bit Long Mode
-    if (!vmm_map_page(vmm_get_active_pml4(), tramp_phys, tramp_phys,
-                      PAGE_FLAG_RW | PAGE_FLAG_PRESENT)) {
-      klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
-                " AP trampoline mapping failed; APs remain offline.\n");
-      goto publish_gs_fastpath;
-    }
 
     // Find offsets into the relocated low-memory copy.
     uint64_t cr3_offset = trampoline_data_cr3 - trampoline_start;
@@ -617,4 +737,190 @@ publish_gs_fastpath:
    * Keep using RDMSR during bootstrap, then publish the safe GS:0 fast path
    * once no additional AP can still be running with the trampoline GS state. */
   __atomic_store_n(&cpu_gs_installed, true, __ATOMIC_RELEASE);
+  if (cpu_count > 1 && s3_park_vector < 0)
+    s3_park_vector = interrupt_vector_alloc(cpu_s3_park_ipi);
+}
+
+uint32_t cpu_s3_wake_vector(void) {
+  if (!trampoline_ready)
+    return 0;
+  return 0x8000u + (uint32_t)(trampoline_wake_entry - trampoline_start);
+}
+
+void cpu_save_s3_context(void) {
+  uint64_t cr3;
+  __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+  s3_saved_bsp_cr3 = cr3;
+  s3_saved_fs_base = rdmsr(0xC0000100);
+  s3_saved_kernel_gs_base = rdmsr(MSR_KERNEL_GS_BASE);
+  s3_saved_apic_base = rdmsr(0x1B);
+  cpu_save_s3_mtrrs();
+}
+
+bool cpu_prepare_s3_wake(uint64_t resume_rsp, uint64_t resume_rip) {
+  uint8_t s3_type_a, s3_type_b;
+  uint32_t wake_vector = cpu_s3_wake_vector();
+  if (!wake_vector || !resume_rsp || !resume_rip || !s3_aps_quiesced ||
+      !acpi_get_sleep_types(3, &s3_type_a, &s3_type_b))
+    return false;
+
+  uint64_t tramp_virt = 0x8000u + pmm_get_hhdm_offset();
+  volatile uint32_t *mode = (volatile uint32_t *)(tramp_virt +
+      (uint64_t)(trampoline_data_mode - trampoline_start));
+  volatile uint64_t *cr3_slot = (volatile uint64_t *)(tramp_virt +
+      (uint64_t)(trampoline_data_cr3 - trampoline_start));
+  volatile uint64_t *rsp_slot = (volatile uint64_t *)(tramp_virt +
+      (uint64_t)(trampoline_data_resume_rsp - trampoline_start));
+  volatile uint64_t *rip_slot = (volatile uint64_t *)(tramp_virt +
+      (uint64_t)(trampoline_data_resume_rip - trampoline_start));
+  volatile uint64_t *cr4_slot = (volatile uint64_t *)(tramp_virt +
+      (uint64_t)(trampoline_data_resume_cr4 - trampoline_start));
+  volatile uint64_t *cr0_slot = (volatile uint64_t *)(tramp_virt +
+      (uint64_t)(trampoline_data_resume_cr0 - trampoline_start));
+  volatile uint64_t *efer_slot = (volatile uint64_t *)(tramp_virt +
+      (uint64_t)(trampoline_data_resume_efer - trampoline_start));
+  uint64_t cr0, cr4;
+  __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+  __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+  cpu_save_s3_context();
+  *mode = 0;
+  *cr3_slot = cpus[0].kernel_cr3 & PAGE_MASK;
+  *rsp_slot = resume_rsp;
+  *rip_slot = resume_rip;
+  *cr4_slot = cr4;
+  *cr0_slot = cr0;
+  *efer_slot = rdmsr(0xC0000080);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  if (!acpi_set_waking_vector(wake_vector)) {
+    *rsp_slot = 0;
+    *rip_slot = 0;
+    return false;
+  }
+  return true;
+}
+
+void cpu_restore_s3_context(void) {
+  cpu_set_gs_base(&cpus[0]);
+  cpu_restore_s3_mtrrs();
+  cpu_set_active_cr3(s3_saved_bsp_cr3);
+  __asm__ volatile("mov %0, %%cr3" : : "r"(s3_saved_bsp_cr3) : "memory");
+  cpu_pcid_invalidate_all(&cpus[0]);
+  wrmsr(0xC0000100, s3_saved_fs_base);
+  wrmsr(MSR_KERNEL_GS_BASE, s3_saved_kernel_gs_base);
+  wrmsr(0x1B, s3_saved_apic_base);
+}
+
+void cpu_cancel_s3_wake(void) {
+  uint64_t tramp_virt = 0x8000u + pmm_get_hhdm_offset();
+  if (trampoline_ready) {
+    volatile uint32_t *mode = (volatile uint32_t *)(tramp_virt +
+        (uint64_t)(trampoline_data_mode - trampoline_start));
+    volatile uint64_t *rsp_slot = (volatile uint64_t *)(tramp_virt +
+        (uint64_t)(trampoline_data_resume_rsp - trampoline_start));
+    volatile uint64_t *rip_slot = (volatile uint64_t *)(tramp_virt +
+        (uint64_t)(trampoline_data_resume_rip - trampoline_start));
+    *mode = 0;
+    *rsp_slot = 0;
+    *rip_slot = 0;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  }
+  acpi_clear_waking_vector();
+}
+
+bool cpu_quiesce_aps(uint32_t timeout_ms) {
+  if (cpu_count <= 1) {
+    s3_aps_quiesced = true;
+    return true;
+  }
+  if (!timeout_ms)
+    return false;
+  if (s3_park_vector < 0 || !lapic_is_ready())
+    return false;
+
+  uint64_t expected = 0;
+  for (uint32_t i = 1; i < cpu_count; i++) {
+    if (__atomic_load_n(&cpus[i].status, __ATOMIC_ACQUIRE) == CPU_STATUS_ONLINE)
+      expected |= 1ULL << i;
+  }
+  if (!expected) {
+    s3_aps_quiesced = true;
+    return true;
+  }
+
+  __atomic_store_n(&s3_park_ack_mask, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&s3_park_requested, true, __ATOMIC_RELEASE);
+  for (uint32_t i = 1; i < cpu_count; i++)
+    if (expected & (1ULL << i))
+      lapic_send_ipi(cpus[i].apic_id, (uint8_t)s3_park_vector);
+
+  uint64_t khz = tsc_get_freq_khz();
+  uint64_t start = rdtsc();
+  uint64_t cycles = khz ? khz * (uint64_t)timeout_ms : 0;
+  uint64_t max_iters = (uint64_t)timeout_ms * 200000;
+  for (uint64_t it = 0;; it++) {
+    uint64_t acked = __atomic_load_n(&s3_park_ack_mask, __ATOMIC_ACQUIRE);
+    if ((acked & expected) == expected) {
+      s3_aps_quiesced = true;
+      return true;
+    }
+    if ((khz && rdtsc() - start >= cycles) ||
+        (!khz && it >= max_iters))
+      break;
+    hal_cpu_relax();
+  }
+
+  cpu_release_aps();
+  return false;
+}
+
+void cpu_release_aps(void) {
+  uint64_t acked = __atomic_load_n(&s3_park_ack_mask, __ATOMIC_ACQUIRE);
+  __atomic_store_n(&s3_park_requested, false, __ATOMIC_RELEASE);
+  for (uint32_t i = 1; i < cpu_count; i++)
+    if ((acked & (1ULL << i)) && s3_park_vector >= 0)
+      lapic_send_ipi(cpus[i].apic_id, (uint8_t)s3_park_vector);
+
+  uint64_t khz = tsc_get_freq_khz();
+  uint64_t start = rdtsc();
+  uint64_t cycles = khz ? khz * 1000ULL : 0;
+  for (uint64_t it = 0; it < 200000000ULL; it++) {
+    bool online = true;
+    for (uint32_t i = 1; i < cpu_count; i++) {
+      if ((acked & (1ULL << i)) &&
+          __atomic_load_n(&cpus[i].status, __ATOMIC_ACQUIRE) != CPU_STATUS_ONLINE) {
+        online = false;
+        break;
+      }
+    }
+    if (online || (khz && rdtsc() - start >= cycles))
+      break;
+    hal_cpu_relax();
+  }
+  __atomic_store_n(&s3_park_ack_mask, 0, __ATOMIC_RELEASE);
+  s3_aps_quiesced = false;
+}
+
+void cpu_resume_aps(void) {
+  // S3 firmware leaves application processors in their boot wait state. Reuse
+  // the normal INIT/SIPI bring-up and per-CPU initialization path. The BSP is
+  // still executing the suspend syscall under a process CR3, so run AP startup
+  // with the permanent kernel page tables and restore the caller's CR3 after.
+  __atomic_store_n(&s3_park_requested, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&s3_park_ack_mask, 0, __ATOMIC_RELEASE);
+  s3_aps_quiesced = false;
+  if (cpu_count > 1) {
+    uint64_t saved_cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint64_t kernel_cr3 = cpus[0].kernel_cr3 & PAGE_MASK;
+    bool switched = (saved_cr3 & PAGE_MASK) != kernel_cr3;
+    if (switched) {
+      cpu_set_active_cr3(kernel_cr3);
+      __asm__ volatile("mov %0, %%cr3" : : "r"(kernel_cr3) : "memory");
+    }
+    cpu_init_aps();
+    if (switched) {
+      cpu_set_active_cr3(saved_cr3);
+      __asm__ volatile("mov %0, %%cr3" : : "r"(saved_cr3) : "memory");
+    }
+  }
 }

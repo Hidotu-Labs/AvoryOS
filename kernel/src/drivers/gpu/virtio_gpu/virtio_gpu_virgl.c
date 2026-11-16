@@ -42,11 +42,22 @@ _Static_assert(sizeof(struct vg_exec) == 64, "virtgpu exec UAPI");
 struct virgl_attachment { uint32_t context; struct virgl_attachment *next; };
 struct virgl_resource {
     uint32_t id, width, height, depth, stride, target;
+    uint32_t format, bind, array_size, last_level, nr_samples, flags;
+    struct drm_gem_object *obj;
     struct virgl_attachment *attachments;
+    struct virgl_resource *prev, *next;
+    bool tracked;
+};
+struct virgl_ctx_entry {
+    uint32_t id;
+    struct virgl_ctx_entry *next;
 };
 static struct { uint32_t version, size; } caps[3];
 static bool enabled;
 static uint32_t next_context, ioctl_owner;
+static spinlock_t virgl_track_lock = SPINLOCK_INIT;
+static struct virgl_ctx_entry *virgl_contexts_head;
+static struct virgl_resource *virgl_resources_head;
 extern int linuxkpi_virgl_fence_wait(int fd);
 extern int linuxkpi_virgl_fence_export(void);
 extern void *linuxkpi_virgl_fence_create(void);
@@ -90,19 +101,35 @@ uint32_t virtio_gpu_virgl_resource_id(struct drm_gem_object *obj) {
 }
 static int context(struct drm_file *file) {
     if (file->virgl_context) return 0;
+    struct virgl_ctx_entry *ctx_entry = kmalloc(sizeof(*ctx_entry));
+    if (!ctx_entry) return -12;
     struct virtio_gpu_ctx_create req = {0};
     uint32_t id = __atomic_add_fetch(&next_context, 1, __ATOMIC_RELAXED);
-    if (!id) return -12;
+    if (!id) { kfree(ctx_entry); return -12; }
     req.hdr = header(VIRTIO_GPU_CMD_CTX_CREATE, id);
     memcpy(req.name, "Ascension", 9);
     req.nlen = 9;
     int ret = command(&req, sizeof(req));
-    if (!ret) file->virgl_context = id;
+    if (!ret) {
+        file->virgl_context = id;
+        ctx_entry->id = id;
+        spinlock_acquire(&virgl_track_lock);
+        ctx_entry->next = virgl_contexts_head;
+        virgl_contexts_head = ctx_entry;
+        spinlock_release(&virgl_track_lock);
+    } else {
+        kfree(ctx_entry);
+    }
     return ret;
 }
 static int attach(struct drm_file *file, struct virgl_resource *res) {
+    spinlock_acquire(&virgl_track_lock);
     for (struct virgl_attachment *p = res->attachments; p; p = p->next)
-        if (p->context == file->virgl_context) return 0;
+        if (p->context == file->virgl_context) {
+            spinlock_release(&virgl_track_lock);
+            return 0;
+        }
+    spinlock_release(&virgl_track_lock);
     struct virgl_attachment *entry = kmalloc(sizeof(*entry));
     if (!entry) return -12;
     struct virtio_gpu_ctx_resource req = {0};
@@ -110,8 +137,17 @@ static int attach(struct drm_file *file, struct virgl_resource *res) {
     req.resource_id = res->id;
     int ret = command(&req, sizeof(req));
     if (ret) { kfree(entry); return ret; }
+    spinlock_acquire(&virgl_track_lock);
+    for (struct virgl_attachment *p = res->attachments; p; p = p->next) {
+        if (p->context == file->virgl_context) {
+            spinlock_release(&virgl_track_lock);
+            kfree(entry);
+            return 0;
+        }
+    }
     *entry = (struct virgl_attachment){file->virgl_context, res->attachments};
     res->attachments = entry;
+    spinlock_release(&virgl_track_lock);
     return 0;
 }
 static void free_resource(struct drm_device *dev, struct drm_gem_object *obj) {
@@ -123,9 +159,24 @@ static void free_resource(struct drm_device *dev, struct drm_gem_object *obj) {
     /* A timeout is not DMA completion. Keep backing pinned on error, since
      * the host may still access it. This deliberately leaks on device failure. */
     if (command(&req, sizeof(req))) return;
-    while (res->attachments) {
-        struct virgl_attachment *entry = res->attachments;
-        res->attachments = entry->next;
+    spinlock_acquire(&virgl_track_lock);
+    if (res->tracked) {
+        if (res->prev)
+            res->prev->next = res->next;
+        else if (virgl_resources_head == res)
+            virgl_resources_head = res->next;
+        if (res->next)
+            res->next->prev = res->prev;
+        res->prev = NULL;
+        res->next = NULL;
+        res->tracked = false;
+    }
+    struct virgl_attachment *attachments = res->attachments;
+    res->attachments = NULL;
+    spinlock_release(&virgl_track_lock);
+    while (attachments) {
+        struct virgl_attachment *entry = attachments;
+        attachments = entry->next;
         kfree(entry);
     }
     kfree(res);
@@ -155,9 +206,171 @@ bool virtio_gpu_virgl_enabled(void) { return enabled; }
 void virtio_gpu_virgl_close(struct drm_file *file) {
     if (!file->virgl_context) return;
     if (virtio_gpu_wait_idle(false)) return; /* Retain a timed-out host context. */
-    struct virtio_gpu_ctrl_hdr req = header(VIRTIO_GPU_CMD_CTX_DESTROY, file->virgl_context);
+    uint32_t id = file->virgl_context;
+    struct virtio_gpu_ctrl_hdr req = header(VIRTIO_GPU_CMD_CTX_DESTROY, id);
     command(&req, sizeof(req));
+    spinlock_acquire(&virgl_track_lock);
+    struct virgl_ctx_entry **link = &virgl_contexts_head;
+    struct virgl_ctx_entry *victim = NULL;
+    while (*link) {
+        if ((*link)->id == id) {
+            victim = *link;
+            *link = victim->next;
+            break;
+        }
+        link = &(*link)->next;
+    }
+    spinlock_release(&virgl_track_lock);
+    kfree(victim);
     file->virgl_context = 0;
+}
+
+static bool virgl_ctx_in_list(const uint32_t *ctx_ids, uint32_t count,
+                              uint32_t id) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (ctx_ids[i] == id)
+            return true;
+    }
+    return false;
+}
+
+int virtio_gpu_virgl_restore_after_reset(uint64_t features, uint32_t count) {
+    virtio_gpu_virgl_init(features, count);
+    if (!enabled)
+        return 0;
+
+    spinlock_acquire(&virgl_track_lock);
+    uint32_t ctx_cap = 0, res_cap = 0, att_cap = 0;
+    for (struct virgl_ctx_entry *c = virgl_contexts_head; c; c = c->next)
+        ctx_cap++;
+    for (struct virgl_resource *r = virgl_resources_head; r; r = r->next) {
+        res_cap++;
+        for (struct virgl_attachment *a = r->attachments; a; a = a->next)
+            att_cap++;
+    }
+    spinlock_release(&virgl_track_lock);
+
+    if (!ctx_cap && !res_cap)
+        return 0;
+
+    struct virgl_res_snap {
+        uint32_t id, width, height, depth, target;
+        uint32_t format, bind, array_size, last_level, nr_samples, flags;
+        struct drm_gem_object *obj;
+        uint32_t att_offset, att_count;
+    };
+
+    uint32_t *ctx_ids = ctx_cap ? kmalloc(ctx_cap * sizeof(uint32_t)) : NULL;
+    struct virgl_res_snap *snaps =
+        res_cap ? kmalloc(res_cap * sizeof(*snaps)) : NULL;
+    uint32_t *all_atts = att_cap ? kmalloc(att_cap * sizeof(uint32_t)) : NULL;
+    if ((ctx_cap && !ctx_ids) || (res_cap && !snaps) || (att_cap && !all_atts)) {
+        kfree(ctx_ids);
+        kfree(snaps);
+        kfree(all_atts);
+        return -12;
+    }
+
+    uint32_t n_ctx = 0, n_res = 0, n_att = 0;
+    spinlock_acquire(&virgl_track_lock);
+    for (struct virgl_ctx_entry *c = virgl_contexts_head;
+         c && n_ctx < ctx_cap; c = c->next) {
+        ctx_ids[n_ctx++] = c->id;
+    }
+    for (struct virgl_resource *r = virgl_resources_head;
+         r && n_res < res_cap; r = r->next) {
+        if (!r->obj)
+            continue;
+        int old_ref = __atomic_load_n(&r->obj->refcount, __ATOMIC_ACQUIRE);
+        while (old_ref > 0 &&
+               !__atomic_compare_exchange_n(&r->obj->refcount, &old_ref,
+                                            old_ref + 1, true,
+                                            __ATOMIC_ACQ_REL,
+                                            __ATOMIC_RELAXED)) {
+        }
+        if (old_ref <= 0)
+            continue;
+        struct virgl_res_snap *s = &snaps[n_res++];
+        s->id = r->id;
+        s->width = r->width;
+        s->height = r->height;
+        s->depth = r->depth;
+        s->target = r->target;
+        s->format = r->format;
+        s->bind = r->bind;
+        s->array_size = r->array_size;
+        s->last_level = r->last_level;
+        s->nr_samples = r->nr_samples;
+        s->flags = r->flags;
+        s->obj = r->obj;
+        s->att_offset = n_att;
+        s->att_count = 0;
+        for (struct virgl_attachment *a = r->attachments;
+             a && n_att < att_cap; a = a->next) {
+            all_atts[n_att++] = a->context;
+            s->att_count++;
+        }
+    }
+    spinlock_release(&virgl_track_lock);
+
+    int ret = 0;
+    for (uint32_t i = 0; i < n_ctx; i++) {
+        struct virtio_gpu_ctx_create req = {0};
+        req.hdr = header(VIRTIO_GPU_CMD_CTX_CREATE, ctx_ids[i]);
+        memcpy(req.name, "Ascension", 9);
+        req.nlen = 9;
+        if (command(&req, sizeof(req)))
+            ret = -5;
+    }
+
+    for (uint32_t i = 0; i < n_res; i++) {
+        struct virgl_res_snap *s = &snaps[i];
+        struct virtio_gpu_resource_create_3d req = {0};
+        req.hdr = header(VIRTIO_GPU_CMD_RESOURCE_CREATE_3D, 0);
+        req.resource_id = s->id;
+        req.target = s->target;
+        req.format = s->format;
+        req.bind = s->bind;
+        req.width = s->width;
+        req.height = s->height;
+        req.depth = s->depth;
+        req.array_size = s->array_size;
+        req.last_level = s->last_level;
+        req.nr_samples = s->nr_samples;
+        req.flags = s->flags;
+        if (command(&req, sizeof(req))) {
+            ret = -5;
+        } else {
+            struct virtio_gpu_resource_attach_backing backing = {0};
+            backing.hdr = header(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING, 0);
+            backing.resource_id = s->id;
+            backing.nr_entries = 1;
+            backing.entry.addr = s->obj->phys_addr;
+            backing.entry.length = s->obj->size;
+            if (command(&backing, sizeof(backing))) {
+                ret = -5;
+            } else {
+                for (uint32_t a = 0; a < s->att_count; a++) {
+                    uint32_t cid = all_atts[s->att_offset + a];
+                    if (!virgl_ctx_in_list(ctx_ids, n_ctx, cid))
+                        continue;
+                    struct virtio_gpu_ctx_resource areq = {0};
+                    areq.hdr = header(VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, cid);
+                    areq.resource_id = s->id;
+                    if (command(&areq, sizeof(areq)))
+                        ret = -5;
+                }
+            }
+        }
+        put(s->obj);
+    }
+
+    kfree(all_atts);
+    kfree(snaps);
+    kfree(ctx_ids);
+    klogf("[VIRGL] S3 recovery: restored %u context(s) and %u 3D resource(s) (ret=%d)\n",
+          n_ctx, n_res, ret);
+    return ret;
 }
 static int get_caps(struct vg_caps *p) {
     if (p->pad || p->id < 1 || p->id > 2 || !caps[p->id].size ||
@@ -195,8 +408,21 @@ static int create(struct drm_file *file, struct vg_create *p) {
     if (!obj) { klogf("[VIRGL] create: no memory for size=%u\n", p->size); return -12; }
     struct virgl_resource *res = kmalloc(sizeof(*res));
     if (!res) { put(obj); return -12; }
-    *res = (struct virgl_resource){.id = virtio_gpu_resource_id(), .width = p->width,
-        .height = p->height, .depth = p->depth, .stride = p->stride, .target = p->target};
+    *res = (struct virgl_resource){
+        .id = virtio_gpu_resource_id(),
+        .width = p->width,
+        .height = p->height,
+        .depth = p->depth,
+        .stride = p->stride,
+        .target = p->target,
+        .format = p->format,
+        .bind = p->bind,
+        .array_size = p->array_size,
+        .last_level = p->last_level,
+        .nr_samples = p->nr_samples,
+        .flags = p->flags,
+        .obj = obj,
+    };
     struct virtio_gpu_resource_create_3d req = {0};
     req.hdr = header(VIRTIO_GPU_CMD_RESOURCE_CREATE_3D, 0);
     req.resource_id = res->id; req.target = p->target; req.format = p->format;
@@ -212,6 +438,14 @@ static int create(struct drm_file *file, struct vg_create *p) {
         put(obj);
         return ret;
     }
+    spinlock_acquire(&virgl_track_lock);
+    res->prev = NULL;
+    res->next = virgl_resources_head;
+    if (virgl_resources_head)
+        virgl_resources_head->prev = res;
+    virgl_resources_head = res;
+    res->tracked = true;
+    spinlock_release(&virgl_track_lock);
     struct virtio_gpu_resource_attach_backing backing = {0};
     backing.hdr = header(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING, 0);
     backing.resource_id = res->id; backing.nr_entries = 1;

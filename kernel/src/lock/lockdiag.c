@@ -340,11 +340,11 @@ static uint64_t g_init_tsc;
 
 /* Per-CPU and cache-line isolated, so the reporting core never shares a line
  * with the cores it is describing. */
-typedef struct {
+typedef struct __attribute__((aligned(64))) {
   const void *locks[6];
   uint64_t ips[6];
   volatile int depth;
-} holds_t __attribute__((aligned(64)));
+} holds_t;
 
 #if LOCKDIAG_OWNER
 static holds_t g_holds[MAX_CPUS];
@@ -944,7 +944,7 @@ static void dump_cpu(uint32_t id, uint64_t ack_mask, uint64_t now_tsc,
   }
 
   if (c->stack_top)
-    dump_stack(c->stack_top - CPU_STACK_SIZE, c->stack_top, 14);
+    dump_stack(c->stack_top - CPU_STACK_SIZE, c->stack_top, 32);
 }
 
 static void dump_spots(uint64_t now_tsc, uint64_t mhz) {

@@ -2,6 +2,7 @@
 #define APIC_LAPIC_TIMER_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 // LAPIC Timer Configuration
 // The timer fires at this vector.  Must not collide with existing IRQ vectors
@@ -19,6 +20,12 @@ void lapic_timer_init(void);
 
 // Initialize the LAPIC timer on an AP.
 void lapic_timer_init_ap(void);
+
+// Save/mask the BSP one-shot timer immediately before ACPI S3 entry. Resume
+// rebases monotonic time using the RTC and restores the saved absolute timer.
+void lapic_timer_save_s4_state(void);
+void lapic_timer_suspend_for_s3(void);
+void lapic_timer_resume_from_s3(bool slept);
 
 // Returns total ticks since the LAPIC timer was started.
 uint64_t lapic_timer_get_ticks(void);

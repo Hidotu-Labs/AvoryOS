@@ -1,5 +1,6 @@
 
 #include "usb_kbd.h"
+#include "../../apic/lapic_timer.h"
 #include "../../lock/lockdiag.h"
 #include "../../console/console.h"
 #include "../../console/klog.h"
@@ -56,6 +57,8 @@ struct usb_endpoint_descriptor {
 #define USB_REQ_SET_IDLE 0x0A
 #define USB_REQ_SET_PROTOCOL 0x0B
 #define HID_PROTOCOL_BOOT 0x00
+#define USB_KBD_REPEAT_DELAY_MS 500
+#define USB_KBD_REPEAT_PERIOD_MS 33
 
 // HID Usage ID to PS/2 Scancode mapping
 // USB HID uses "Usage IDs" (from the HID Usage Tables spec) for key codes.
@@ -253,7 +256,7 @@ struct usb_kbd_state {
   bool report_format_known;
   bool report_has_id;
   uint8_t last_pressed_usage;
-  int repeat_delay_counter;
+  uint64_t repeat_deadline_ms;
 };
 
 static struct usb_kbd_state keyboards[MAX_USB_KEYBOARDS];
@@ -501,13 +504,12 @@ static void usb_kbd_inject_key(struct usb_kbd_state *kbd, uint8_t usage,
 static void usb_kbd_handle_repeat(struct usb_kbd_state *kbd) {
   if (kbd->last_pressed_usage == 0)
     return;
+  uint64_t now = lapic_timer_get_ms();
+  if (now < kbd->repeat_deadline_ms)
+    return;
 
-  if (kbd->repeat_delay_counter > 0) {
-    kbd->repeat_delay_counter--;
-  } else {
-    // Repeat the key
-    usb_kbd_inject_key(kbd, kbd->last_pressed_usage, &kbd->prev_report);
-  }
+  usb_kbd_inject_key(kbd, kbd->last_pressed_usage, &kbd->prev_report);
+  kbd->repeat_deadline_ms = now + USB_KBD_REPEAT_PERIOD_MS;
 }
 
 static void usb_kbd_process_report(struct usb_kbd_state *kbd,
@@ -528,6 +530,7 @@ static void usb_kbd_process_report(struct usb_kbd_state *kbd,
     // Key was released
     if (usage == kbd->last_pressed_usage) {
       kbd->last_pressed_usage = 0;
+      kbd->repeat_deadline_ms = 0;
     }
 
     uint8_t sc = hid_to_scancode[usage];
@@ -560,7 +563,8 @@ static void usb_kbd_process_report(struct usb_kbd_state *kbd,
     // Key was just pressed
     if (usage >= 0x04 && usage < 0xE0 && usage != 0x39) {
       kbd->last_pressed_usage = usage;
-      kbd->repeat_delay_counter = 12; // ~500ms delay at 40ms heartbeat
+      kbd->repeat_deadline_ms =
+          lapic_timer_get_ms() + USB_KBD_REPEAT_DELAY_MS;
     }
 
     uint8_t sc_press = hid_to_scancode[usage];
@@ -909,6 +913,8 @@ bool usb_kbd_probe(struct usb_device *dev) {
   kbd->caps_lock = false;
   kbd->report_format_known = false;
   kbd->report_has_id = false;
+  kbd->last_pressed_usage = 0;
+  kbd->repeat_deadline_ms = 0;
   kbd->active = true;
 
   // Zero out previous report
@@ -977,6 +983,13 @@ void usb_kbd_disconnect(struct usb_device *dev) {
     if (kbd->generic_pipe)
       usb_interrupt_cancel(kbd->generic_pipe);
     kbd->generic_pipe = NULL;
+    /* A controller reset can detach the keyboard while a key is held. Emit
+     * releases before the state slot is reused, so a remembered key cannot
+     * start repeating against the new device's empty reports. */
+    struct usb_kbd_report released = {0};
+    usb_kbd_process_report(kbd, &released);
+    kbd->last_pressed_usage = 0;
+    kbd->repeat_deadline_ms = 0;
     kbd->active = false;
     kbd->dev = NULL;
     klog_puts("[USB-KBD] Keyboard detached\n");

@@ -201,6 +201,10 @@ static void pci_check_function(uint8_t bus, uint8_t slot, uint8_t func) {
     pci_node->pci_class = dev->class_code;
     pci_node->pci_subclass = dev->subclass;
     pci_node->pci_prog_if = dev->prog_if;
+    /* PCI bridges are platform topology. ACPI/QEMU keeps their S3 transition
+     * with the chipset instead of treating them as ordinary endpoint devices. */
+    if (dev->class_code == 0x06)
+      pci_node->pm_managed_by_core = true;
     dev->kernel_device = pci_node;
   }
 
@@ -350,6 +354,164 @@ uint64_t pci_bar_phys(struct pci_device *dev, uint8_t bir) {
   if (((dev->bar[bir] >> 1) & 3U) == 2U && bir < 5)
     phys |= (uint64_t)dev->bar[bir + 1] << 32;
   return phys;
+}
+
+bool pci_restore_bars(struct pci_device *dev) {
+  if (!dev || (dev->header_type & 0x7FU) != 0)
+    return false;
+
+  uint8_t pm_cap = asc_pci_find_capability(dev, PCI_CAP_ID_PM);
+  if (pm_cap) {
+    uint16_t pmcsr = pci_config_read16(dev->bus, dev->slot, dev->func,
+                                       (uint16_t)pm_cap + 4);
+    if (pmcsr == 0xFFFF)
+      return false;
+    if (pmcsr & 0x0003U) {
+      /* PME_STATUS is write-one-to-clear; do not replay it while returning
+       * the endpoint to D0. */
+      pci_config_write16(dev->bus, dev->slot, dev->func,
+                         (uint16_t)pm_cap + 4,
+                         pmcsr & ~(0x8003U));
+      for (int i = 0; i < 10000; i++)
+        io_wait();
+    }
+    if (pci_config_read16(dev->bus, dev->slot, dev->func,
+                          (uint16_t)pm_cap + 4) & 0x0003U) {
+      klogf("[PCI] could not return %04x:%02x:%02x.%x to D0\n",
+            dev->vendor_id, dev->bus, dev->slot, dev->func);
+      return false;
+    }
+  }
+
+  uint16_t command =
+      pci_config_read16(dev->bus, dev->slot, dev->func, 0x04);
+  pci_config_write16(dev->bus, dev->slot, dev->func, 0x04,
+                     command & ~0x0007U);
+
+  bool ok = true;
+  for (uint8_t i = 0; i < 6; i++) {
+    uint16_t offset = (uint16_t)(0x10 + i * 4);
+    uint32_t saved = dev->bar[i];
+    uint32_t current =
+        pci_config_read32(dev->bus, dev->slot, dev->func, offset);
+    bool is_io = (saved & 1U) != 0;
+    bool is_64 = !is_io && (((saved >> 1) & 3U) == 2U) && i < 5;
+
+    if (current != saved) {
+      klogf("[PCI] restoring %04x:%02x:%02x.%x BAR%u %08x -> %08x\n",
+            dev->vendor_id, dev->bus, dev->slot, dev->func, i, current, saved);
+      pci_config_write32(dev->bus, dev->slot, dev->func, offset, saved);
+    }
+    if (is_64) {
+      uint32_t saved_hi = dev->bar[i + 1];
+      uint32_t current_hi = pci_config_read32(
+          dev->bus, dev->slot, dev->func, (uint16_t)(offset + 4));
+      if (current_hi != saved_hi)
+        pci_config_write32(dev->bus, dev->slot, dev->func,
+                           (uint16_t)(offset + 4), saved_hi);
+      if (pci_config_read32(dev->bus, dev->slot, dev->func,
+                            (uint16_t)(offset + 4)) != saved_hi)
+        ok = false;
+      i++;
+    }
+    if (pci_config_read32(dev->bus, dev->slot, dev->func, offset) != saved)
+      ok = false;
+  }
+
+  if (ok && dev->irq_line != 0 && dev->irq_line != 0xFF) {
+    uint32_t intr =
+        pci_config_read32(dev->bus, dev->slot, dev->func, 0x3C);
+    if ((uint8_t)(intr & 0xFFU) != dev->irq_line) {
+      intr = (intr & ~0xFFU) | (uint32_t)dev->irq_line;
+      pci_config_write32(dev->bus, dev->slot, dev->func, 0x3C, intr);
+    }
+  }
+
+  if (!ok)
+    klogf("[PCI] BAR restore failed for %04x:%02x:%02x.%x\n",
+          dev->vendor_id, dev->bus, dev->slot, dev->func);
+  return ok;
+}
+
+static struct {
+  bool valid_mch;
+  uint16_t mch_cmd;
+  uint32_t mch_pciexbar_lo;
+  uint32_t mch_pciexbar_hi;
+
+  bool valid_lpc;
+  uint16_t lpc_cmd;
+  uint32_t lpc_pmbase;
+  uint32_t lpc_acpi_ctrl;
+  uint32_t lpc_pirq_ad;
+  uint32_t lpc_pirq_eh;
+  uint32_t lpc_rcba;
+} pci_platform_s3_state;
+
+static uint32_t pci_legacy_read32(uint8_t bus, uint8_t slot, uint8_t func,
+                                  uint16_t offset) {
+  spinlock_acquire(&pci_config_lock);
+  outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, slot, func, offset));
+  uint32_t val = inl(PCI_CONFIG_DATA);
+  spinlock_release(&pci_config_lock);
+  return val;
+}
+
+static void pci_legacy_write32(uint8_t bus, uint8_t slot, uint8_t func,
+                               uint16_t offset, uint32_t value) {
+  spinlock_acquire(&pci_config_lock);
+  outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, slot, func, offset));
+  outl(PCI_CONFIG_DATA, value);
+  spinlock_release(&pci_config_lock);
+}
+
+static void pci_legacy_write16(uint8_t bus, uint8_t slot, uint8_t func,
+                               uint16_t offset, uint16_t value) {
+  spinlock_acquire(&pci_config_lock);
+  outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, slot, func, offset));
+  outw(PCI_CONFIG_DATA + (offset & 2), value);
+  spinlock_release(&pci_config_lock);
+}
+
+void pci_save_platform_s3_state(void) {
+  memset(&pci_platform_s3_state, 0, sizeof(pci_platform_s3_state));
+
+  if ((pci_legacy_read32(0, 0, 0, 0x00) & 0xFFFFU) == 0x8086U) {
+    pci_platform_s3_state.valid_mch = true;
+    pci_platform_s3_state.mch_cmd =
+        (uint16_t)(pci_legacy_read32(0, 0, 0, 0x04) & 0xFFFFU);
+    pci_platform_s3_state.mch_pciexbar_lo = pci_legacy_read32(0, 0, 0, 0x60);
+    pci_platform_s3_state.mch_pciexbar_hi = pci_legacy_read32(0, 0, 0, 0x64);
+  }
+
+  if ((pci_legacy_read32(0, 0x1F, 0, 0x00) & 0xFFFFU) == 0x8086U) {
+    pci_platform_s3_state.valid_lpc = true;
+    pci_platform_s3_state.lpc_cmd =
+        (uint16_t)(pci_legacy_read32(0, 0x1F, 0, 0x04) & 0xFFFFU);
+    pci_platform_s3_state.lpc_pmbase = pci_legacy_read32(0, 0x1F, 0, 0x40);
+    pci_platform_s3_state.lpc_acpi_ctrl = pci_legacy_read32(0, 0x1F, 0, 0x44);
+    pci_platform_s3_state.lpc_pirq_ad = pci_legacy_read32(0, 0x1F, 0, 0x60);
+    pci_platform_s3_state.lpc_pirq_eh = pci_legacy_read32(0, 0x1F, 0, 0x68);
+    pci_platform_s3_state.lpc_rcba = pci_legacy_read32(0, 0x1F, 0, 0xF0);
+  }
+}
+
+void pci_restore_platform_s3_state(void) {
+  if (pci_platform_s3_state.valid_mch) {
+    /* Restore PCIEXBAR via legacy CF8/CFC before any ECAM MMIO accesses run. */
+    pci_legacy_write32(0, 0, 0, 0x64, pci_platform_s3_state.mch_pciexbar_hi);
+    pci_legacy_write32(0, 0, 0, 0x60, pci_platform_s3_state.mch_pciexbar_lo);
+    pci_legacy_write16(0, 0, 0, 0x04, pci_platform_s3_state.mch_cmd);
+  }
+
+  if (pci_platform_s3_state.valid_lpc) {
+    pci_config_write32(0, 0x1F, 0, 0x40, pci_platform_s3_state.lpc_pmbase);
+    pci_config_write32(0, 0x1F, 0, 0x44, pci_platform_s3_state.lpc_acpi_ctrl);
+    pci_config_write32(0, 0x1F, 0, 0x60, pci_platform_s3_state.lpc_pirq_ad);
+    pci_config_write32(0, 0x1F, 0, 0x68, pci_platform_s3_state.lpc_pirq_eh);
+    pci_config_write32(0, 0x1F, 0, 0xF0, pci_platform_s3_state.lpc_rcba);
+    pci_config_write16(0, 0x1F, 0, 0x04, pci_platform_s3_state.lpc_cmd);
+  }
 }
 
 void *pci_map_mmio(uint64_t phys, uint64_t length) {

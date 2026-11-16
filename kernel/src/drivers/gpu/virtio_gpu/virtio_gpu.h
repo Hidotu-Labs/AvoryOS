@@ -102,6 +102,7 @@ int virtio_gpu_render_wait_bo(struct drm_gem_object *, bool);
 uint32_t virtio_gpu_resource_id(void);
 int virtio_gpu_wait_idle(bool nowait);
 void virtio_gpu_virgl_init(uint64_t features, uint32_t capsets);
+int virtio_gpu_virgl_restore_after_reset(uint64_t features, uint32_t capsets);
 bool virtio_gpu_virgl_enabled(void);
 int virtio_gpu_virgl_ioctl(struct drm_file *, uint32_t request, uint64_t arg);
 void virtio_gpu_virgl_close(struct drm_file *);

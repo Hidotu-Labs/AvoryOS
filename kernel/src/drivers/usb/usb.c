@@ -242,23 +242,30 @@ void usb_device_discovered(struct usb_hcd *hcd, uint8_t port,
   klog_puts(usb_speed_name(speed));
   klog_puts(")\n");
 
-  if (device_count >= MAX_USB_DEVICES)
-    return;
-
   /* One device per port: a duplicate discovery (port-status event racing the
    * boot scan) used to create a second entry whose enumeration reset the port
    * out from under the first one. */
+  struct usb_device *dev = NULL;
   for (int i = 0; i < device_count; i++) {
     struct usb_device *existing = devices[i];
-    if (existing && existing->hcd == hcd && existing->port == port &&
-        existing->connected && !existing->enumerate_failed)
+    if (!existing || existing->hcd != hcd || existing->port != port)
+      continue;
+    if (existing->connected && !existing->enumerate_failed)
       return;
+    if (!existing->connected && !dev && usb_audio_device_reusable(existing))
+      dev = existing;
   }
 
-  struct usb_device *dev = kmalloc(sizeof(struct usb_device));
-  if (!dev)
-    return;
+  if (!dev) {
+    if (device_count >= MAX_USB_DEVICES)
+      return;
+    dev = kmalloc(sizeof(struct usb_device));
+    if (!dev)
+      return;
+    devices[device_count++] = dev;
+  }
 
+  memset(dev, 0, sizeof(*dev));
   dev->address = 0; // Not yet assigned
   dev->port = port;
   dev->connected = true;
@@ -272,8 +279,6 @@ void usb_device_discovered(struct usb_hcd *hcd, uint8_t port,
   dev->enumerate_attempts = 0;
   dev->enumerate_failed = false;
   hcd->stats.devices_connected++;
-
-  devices[device_count++] = dev;
 
   if (hcd->device_prepare && hcd->device_prepare(hcd, dev) < 0) {
     dev->connected = false;

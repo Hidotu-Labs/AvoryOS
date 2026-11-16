@@ -71,6 +71,14 @@ extern uint64_t pmm_physical_memory_offset;
 extern struct limine_memmap_response *pmm_internal_memmap;
 extern uint64_t pmm_zero_page_phys;
 
+#define PMM_MAX_KERNEL_RANGES 16
+struct pmm_phys_range {
+  uint64_t base;
+  uint64_t length;
+};
+extern struct pmm_phys_range pmm_kernel_ranges[PMM_MAX_KERNEL_RANGES];
+extern size_t pmm_kernel_range_count;
+
 /* Bitmap and conversion inline helpers */
 static inline void pmm_bitmap_set(uint8_t *bm, size_t bit) {
   bm[bit / 8] |= (1 << (bit % 8));

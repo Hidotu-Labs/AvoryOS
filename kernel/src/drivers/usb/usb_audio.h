@@ -47,6 +47,7 @@ void usb_audio_device_discovered(
     struct usb_device *dev,
     const struct usb_audio_playback_desc *selected);
 void usb_audio_device_removed(struct usb_device *dev);
+bool usb_audio_device_reusable(struct usb_device *dev);
 void usb_audio_start_worker(void);
 void usb_audio_poll(void);
 void usb_audio_diag(struct usb_diag *d);

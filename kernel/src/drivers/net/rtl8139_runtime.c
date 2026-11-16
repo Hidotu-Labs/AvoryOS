@@ -16,6 +16,7 @@
 
 #define RTL_TSD0 0x10
 #define RTL_TSAD0 0x20
+#define RTL_RBSTART 0x30
 #define RTL_CR 0x37
 #define RTL_CAPR 0x38
 #define RTL_CBR 0x3A
@@ -23,10 +24,12 @@
 #define RTL_ISR 0x3E
 #define RTL_TCR 0x40
 #define RTL_RCR 0x44
+#define RTL_CONFIG1 0x52
 
 #define CR_BUFFER_EMPTY 0x01
 #define CR_TX_ENABLE 0x04
 #define CR_RX_ENABLE 0x08
+#define CR_RESET 0x10
 
 #define INT_RX_OK 0x0001
 #define INT_RX_ERROR 0x0002
@@ -38,6 +41,8 @@
 #define INT_KNOWN (INT_RX_OK | INT_RX_ERROR | INT_TX_OK | INT_TX_ERROR | \
                    INT_RX_OVERFLOW | INT_LINK_CHANGE | INT_TIMEOUT)
 #define INT_RX_MASK (INT_RX_OK | INT_RX_ERROR | INT_RX_OVERFLOW)
+#define RTL_INT_MASK (INT_RX_OK | INT_RX_ERROR | INT_TX_OK | INT_TX_ERROR | \
+                      INT_RX_OVERFLOW | INT_LINK_CHANGE)
 
 #define TSD_OWN (1u << 13)
 #define TSD_UNDERRUN (1u << 14)
@@ -55,6 +60,8 @@
 #define TCR_IFG96 (3u << 24)
 
 #define RX_RING_SIZE 32768u
+#define RX_PAGES 10u
+#define TX_PAGES 2u
 #define TX_COUNT 4u
 #define TX_BUFFER_SIZE 2048u
 #define ETH_HEADER_SIZE 14u
@@ -69,10 +76,18 @@ static uint32_t rx_offset;
 static bool phase2_ready;
 static bool phase3_ready;
 static bool service_started;
+static volatile bool pm_quiescing;
+static bool pm_suspended;
+static bool pm_was_running;
+static bool pm_saved_bus_master;
+static volatile uint32_t pm_activity;
 #define SERVICE_INTERVAL_MS 100u
 #define RX_POLL_BUDGET 16u
 
 static bool rtl8139_service(bool poll_rx);
+static bool rtl8139_service_inner(bool poll_rx);
+static int rtl8139_transmit_inner(struct net_device *dev, const void *frame,
+                                  size_t length);
 
 static void rtl8139_service_worker(void) {
   struct thread *self = sched_get_current();
@@ -130,7 +145,8 @@ static void reclaim_tx_locked(void) {
   }
 }
 
-int rtl8139_transmit(struct net_device *dev, const void *frame, size_t length) {
+static int rtl8139_transmit_inner(struct net_device *dev, const void *frame,
+                                  size_t length) {
   if (!phase2_ready || dev != rtl8139_netdev() || !frame ||
       length < ETH_HEADER_SIZE || length > NET_FRAME_MAX - 4) {
     if (dev)
@@ -179,6 +195,19 @@ int rtl8139_transmit(struct net_device *dev, const void *frame, size_t length) {
   reclaim_tx_locked();
   spinlock_release(&tx_lock);
   return 0;
+}
+
+int rtl8139_transmit(struct net_device *dev, const void *frame, size_t length) {
+  if (__atomic_load_n(&pm_quiescing, __ATOMIC_ACQUIRE))
+    return -1;
+  __atomic_add_fetch(&pm_activity, 1, __ATOMIC_ACQ_REL);
+  if (__atomic_load_n(&pm_quiescing, __ATOMIC_ACQUIRE)) {
+    __atomic_sub_fetch(&pm_activity, 1, __ATOMIC_ACQ_REL);
+    return -1;
+  }
+  int result = rtl8139_transmit_inner(dev, frame, length);
+  __atomic_sub_fetch(&pm_activity, 1, __ATOMIC_ACQ_REL);
+  return result;
 }
 
 bool rtl8139_phase2_init(void) {
@@ -264,7 +293,7 @@ static bool drain_rx(void) {
 
 /* IRQ service handles RX in bounded batches; periodic service catches a lost
  * completion and drains remaining records without monopolizing the CPU. */
-static bool rtl8139_service(bool poll_rx) {
+static bool rtl8139_service_inner(bool poll_rx) {
   struct net_device *dev = rtl8139_netdev();
   if (!phase3_ready || !dev)
     return false;
@@ -311,6 +340,19 @@ static bool rtl8139_service(bool poll_rx) {
   return more_rx;
 }
 
+static bool rtl8139_service(bool poll_rx) {
+  if (__atomic_load_n(&pm_quiescing, __ATOMIC_ACQUIRE))
+    return false;
+  __atomic_add_fetch(&pm_activity, 1, __ATOMIC_ACQ_REL);
+  if (__atomic_load_n(&pm_quiescing, __ATOMIC_ACQUIRE)) {
+    __atomic_sub_fetch(&pm_activity, 1, __ATOMIC_ACQ_REL);
+    return false;
+  }
+  bool more_rx = rtl8139_service_inner(poll_rx);
+  __atomic_sub_fetch(&pm_activity, 1, __ATOMIC_ACQ_REL);
+  return more_rx;
+}
+
 static void rtl8139_irq(struct registers *regs) {
   (void)regs;
   (void)rtl8139_service(false);
@@ -339,9 +381,7 @@ bool rtl8139_phase3_init(void) {
   /* The IRQ handler may run as soon as RX/TX and their causes are enabled. */
   phase3_ready = true;
   outb(io + RTL_CR, CR_RX_ENABLE | CR_TX_ENABLE);
-  uint16_t mask = INT_RX_OK | INT_RX_ERROR | INT_TX_OK | INT_TX_ERROR |
-                  INT_RX_OVERFLOW | INT_LINK_CHANGE;
-  outw(io + RTL_IMR, mask);
+  outw(io + RTL_IMR, RTL_INT_MASK);
   struct pci_device *pci = rtl8139_pci();
   uint16_t command =
       pci_config_read16(pci->bus, pci->slot, pci->func, 0x04);
@@ -349,4 +389,98 @@ bool rtl8139_phase3_init(void) {
                      command & ~(1u << 10));
   klog_puts("[RTL8139] receive and interrupt paths enabled\n");
   return true;
+}
+
+int rtl8139_pm_suspend(void) {
+  struct pci_device *pci = rtl8139_pci();
+  if (!pci || pm_suspended)
+    return pci ? 0 : -95;
+
+  uint16_t command =
+      pci_config_read16(pci->bus, pci->slot, pci->func, 0x04);
+  pm_saved_bus_master = (command & (1u << 2)) != 0;
+  pm_was_running = phase2_ready && phase3_ready;
+  __atomic_store_n(&pm_quiescing, true, __ATOMIC_RELEASE);
+  outw(rtl8139_io_base() + RTL_IMR, 0);
+
+  uint64_t deadline = lapic_timer_get_ms() + 500;
+  while (__atomic_load_n(&pm_activity, __ATOMIC_ACQUIRE) &&
+         lapic_timer_get_ms() < deadline)
+    hal_cpu_relax();
+  if (__atomic_load_n(&pm_activity, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&pm_quiescing, false, __ATOMIC_RELEASE);
+    if (phase3_ready)
+      outw(rtl8139_io_base() + RTL_IMR, RTL_INT_MASK);
+    return -16;
+  }
+
+  outb(rtl8139_io_base() + RTL_CR, 0);
+  pci_set_bus_mastering(pci, false);
+  phase2_ready = false;
+  phase3_ready = false;
+  pm_suspended = true;
+  return 0;
+}
+
+int rtl8139_pm_resume(void) {
+  struct pci_device *pci = rtl8139_pci();
+  if (!pci || !pm_suspended)
+    return pci ? 0 : -95;
+  if (!pci_restore_bars(pci))
+    return -5;
+
+  uint16_t command =
+      pci_config_read16(pci->bus, pci->slot, pci->func, 0x04);
+  command |= 1u; /* I/O space */
+  if (pm_was_running)
+    command |= 1u << 2;
+  else if (pm_saved_bus_master)
+    command |= 1u << 2;
+  else
+    command &= ~(1u << 2);
+  pci_config_write16(pci->bus, pci->slot, pci->func, 0x04, command);
+
+  if (pm_was_running) {
+    uint16_t io = rtl8139_io_base();
+    outw(io + RTL_IMR, 0);
+    outw(io + RTL_ISR, 0xffff);
+    outb(io + RTL_CONFIG1, 0);
+    outb(io + RTL_CR, CR_RESET);
+    uint32_t timeout = 1000000;
+    while ((inb(io + RTL_CR) & CR_RESET) && --timeout)
+      hal_cpu_relax();
+    if (!timeout) {
+      pci_set_bus_mastering(pci, false);
+      return -5;
+    }
+
+    memset((void *)((uint64_t)rtl8139_rx_phys() + pmm_get_hhdm_offset()), 0,
+           RX_PAGES * PAGE_SIZE);
+    memset((void *)((uint64_t)rtl8139_tx_phys() + pmm_get_hhdm_offset()), 0,
+           TX_PAGES * PAGE_SIZE);
+    outl(io + RTL_RBSTART, (uint32_t)(uint64_t)rtl8139_rx_phys());
+    for (uint32_t i = 0; i < TX_COUNT; i++)
+      outl(io + RTL_TSAD0 + i * 4,
+           (uint32_t)(uint64_t)rtl8139_tx_phys() + i * TX_BUFFER_SIZE);
+    outl(io + RTL_TCR, TCR_IFG96 | TCR_MAX_DMA);
+    outl(io + RTL_RCR, RCR_ACCEPT_PHYSICAL | RCR_ACCEPT_MULTICAST |
+                           RCR_ACCEPT_BROADCAST | RCR_WRAP | RCR_RBLEN_32K |
+                           RCR_MAX_DMA | RCR_NO_THRESHOLD);
+    memset(tx_busy, 0, sizeof(tx_busy));
+    tx_next = 0;
+    rx_offset = 0;
+    outw(io + RTL_CAPR, rtl8139_capr(rx_offset));
+    outw(io + RTL_ISR, 0xffff);
+    phase2_ready = true;
+    phase3_ready = true;
+    outb(io + RTL_CR, CR_RX_ENABLE | CR_TX_ENABLE);
+    outw(io + RTL_IMR, RTL_INT_MASK);
+    command = pci_config_read16(pci->bus, pci->slot, pci->func, 0x04);
+    pci_config_write16(pci->bus, pci->slot, pci->func, 0x04,
+                       command & ~(1u << 10));
+  }
+
+  pm_suspended = false;
+  __atomic_store_n(&pm_quiescing, false, __ATOMIC_RELEASE);
+  return 0;
 }

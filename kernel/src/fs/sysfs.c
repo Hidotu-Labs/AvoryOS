@@ -17,6 +17,10 @@
 #include "net/ipv6.h"
 #include "smp/cpu.h"
 #include "socket/af_netlink.h"
+#include "power/hibernate.h"
+#include "power/suspend.h"
+#include "sched/sched.h"
+#include "sched/wait.h"
 
 #include <linuxkpi/native_sysfs.h>
 
@@ -56,6 +60,85 @@ static vfs_node_t *sound_virtual_root;
 static vfs_node_t *sound_class_devices_root;
 static vfs_node_t *sysfs_dev_char_root;
 
+/* ACPI S3 must be initiated by the BSP. The sysfs writer may be running on
+ * an AP, so hand the operation to a BSP-pinned kernel thread and block the
+ * writer until the resume path completes. */
+static struct {
+  spinlock_t lock;
+  wait_queue_t waiters;
+  bool busy;
+  bool done;
+  bool is_s4;
+  int result;
+} sysfs_s3_request = {
+    .lock = SPINLOCK_INIT,
+    .waiters = {.lock = SPINLOCK_INIT, .head = NULL},
+};
+
+#define SYSFS_S3_WORKER_STACK_SIZE (64u * 1024u)
+
+static void sysfs_s3_request_worker(void) {
+  int result = sysfs_s3_request.is_s4 ? power_s4_enter() : power_s3_enter();
+
+  spinlock_acquire(&sysfs_s3_request.lock);
+  sysfs_s3_request.result = result;
+  sysfs_s3_request.done = true;
+  spinlock_release(&sysfs_s3_request.lock);
+
+  wait_queue_wake_all(&sysfs_s3_request.waiters);
+}
+
+static int sysfs_power_request_on_bsp(bool is_s4) {
+  struct thread *waiter = sched_get_current();
+  struct cpu_info *bsp = cpu_get_bsp();
+  if (!waiter || !bsp)
+    return -5;
+
+  spinlock_acquire(&sysfs_s3_request.lock);
+  if (sysfs_s3_request.busy) {
+    spinlock_release(&sysfs_s3_request.lock);
+    return -16;
+  }
+  sysfs_s3_request.busy = true;
+  sysfs_s3_request.done = false;
+  sysfs_s3_request.is_s4 = is_s4;
+  sysfs_s3_request.result = 0;
+  spinlock_release(&sysfs_s3_request.lock);
+
+  struct thread *worker = sched_create_kernel_thread_sized(
+      sysfs_s3_request_worker, bsp, false, SYSFS_S3_WORKER_STACK_SIZE);
+  if (!worker) {
+    spinlock_acquire(&sysfs_s3_request.lock);
+    sysfs_s3_request.busy = false;
+    spinlock_release(&sysfs_s3_request.lock);
+    return -12;
+  }
+  strcpy(worker->comm, "s3-power");
+  worker->cpu_affinity = 1ULL << bsp->cpu_id;
+  sched_enqueue_thread(worker, bsp);
+
+  wait_queue_entry_t entry = {.thread = waiter};
+  for (;;) {
+    spinlock_acquire(&sysfs_s3_request.lock);
+    if (sysfs_s3_request.done) {
+      int result = sysfs_s3_request.result;
+      sysfs_s3_request.busy = false;
+      spinlock_release(&sysfs_s3_request.lock);
+      return result;
+    }
+
+    /* Register under the same lock the worker uses to publish completion, so
+     * a fast resume cannot finish between the check and waiter registration. */
+    waiter->state = THREAD_BLOCKED;
+    wait_queue_add(&sysfs_s3_request.waiters, &entry);
+    spinlock_release(&sysfs_s3_request.lock);
+
+    sched_yield();
+    waiter->state = THREAD_RUNNING;
+    wait_queue_remove(&sysfs_s3_request.waiters, &entry);
+  }
+}
+
 static vfs_node_t *sysfs_mkfile(vfs_node_t *parent, const char *name,
                                 const char *content);
 
@@ -74,6 +157,43 @@ static const struct pci_device *sysfs_display_pci(bool amd) {
       return pd;
   }
   return native ? native : first;
+}
+
+static uint32_t sysfs_power_state_write(vfs_node_t *node, uint32_t offset,
+                                        uint32_t size, uint8_t *buffer) {
+  (void)node;
+  if (offset != 0 || !buffer || size < 3 || size > 8)
+    return (uint32_t)-22;
+
+  bool is_mem = (size >= 3 && buffer[0] == 'm' && buffer[1] == 'e' &&
+                 buffer[2] == 'm');
+  bool is_disk = (size >= 4 && buffer[0] == 'd' && buffer[1] == 'i' &&
+                  buffer[2] == 's' && buffer[3] == 'k');
+  if (!is_mem && !is_disk)
+    return (uint32_t)-22;
+
+  uint32_t prefix = is_disk ? 4u : 3u;
+  for (uint32_t i = prefix; i < size; i++)
+    if (buffer[i] != '\n' && buffer[i] != '\r')
+      return (uint32_t)-22;
+
+  int result = sysfs_power_request_on_bsp(is_disk);
+  if (result) {
+    klog_puts(is_disk ? "[S4] Hibernate request failed: "
+                      : "[S3] Suspend request failed: ");
+    klog_uint64((uint64_t)(-(int64_t)result));
+    klog_puts("\n");
+    return (uint32_t)result;
+  }
+  return size;
+}
+
+/* Shell redirection opens sysfs attributes with O_TRUNC. The value advertised
+ * by this control file is static, so truncation must not erase "mem" before
+ * the subsequent write reaches sysfs_power_state_write(). */
+static int sysfs_power_state_truncate(vfs_node_t *node, uint32_t size) {
+  (void)node;
+  return size == 0 ? 0 : -22;
 }
 
 static void sysfs_display_address(char *buf, size_t size,
@@ -1379,7 +1499,12 @@ void sysfs_init(void) {
 
   // /sys/power
   vfs_node_t *power_dir = sysfs_mkdir(sysfs_root, "power");
-  sysfs_mkfile(power_dir, "state", "mem\n");
+  vfs_node_t *power_state = sysfs_mkfile(power_dir, "state", "mem\n");
+  if (power_state) {
+    power_state->mask = 0200;
+    power_state->truncate = sysfs_power_state_truncate;
+    power_state->write = sysfs_power_state_write;
+  }
 
   // /sys/fs/cgroup mountpoint for cgroup2. OpenRC/elogind mount cgroup2
   // here; without the dirs mount(2) fails with ENOENT and elogind fails

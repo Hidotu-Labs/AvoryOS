@@ -16,8 +16,12 @@
 bool usb_mouse_probe(struct usb_device *dev);
 void usb_mouse_disconnect(struct usb_device *dev);
 
-// Called periodically to poll the mouse for new data.
-// Invoked from the HCD IRQ handlers and the xHCI watchdog.
+/* Start the process-context worker used for devices whose interrupt pipe is
+ * silent but whose HID GET_REPORT endpoint still returns input. */
+void usb_mouse_start_worker(void);
+
+// Called from HCD IRQ/watchdog paths to consume completed interrupt reports.
+// It does not issue synchronous control transfers.
 void usb_mouse_poll(void);
 
 #endif

@@ -101,6 +101,18 @@ void cpu_init(void);
 // timers.
 void cpu_init_aps(void);
 
+/* Prepare the relocated low-memory trampoline and FACS S3 wake vector. The
+ * caller supplies a kernel stack and resume landing pad; S3 entry stays gated
+ * until the power coordinator and restore path are complete. */
+bool cpu_prepare_s3_wake(uint64_t resume_rsp, uint64_t resume_rip);
+void cpu_save_s3_context(void);
+void cpu_restore_s3_context(void);
+void cpu_cancel_s3_wake(void);
+uint32_t cpu_s3_wake_vector(void);
+bool cpu_quiesce_aps(uint32_t timeout_ms);
+void cpu_release_aps(void);
+void cpu_resume_aps(void);
+
 extern volatile bool cpu_gs_installed;
 struct cpu_info *cpu_get_current_slow(void);
 

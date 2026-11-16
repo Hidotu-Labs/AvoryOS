@@ -175,11 +175,20 @@ $(error RUN_AUDIO must be hda or usb)
 endif
 RUN_AUDIO_DEV_FLAGS = $(if $(filter usb,$(RUN_AUDIO)),,-device intel-hda -device hda-duplex,audiodev=snd0)
 RUN_USB_AUDIO_DEV_FLAGS = $(if $(filter usb,$(RUN_AUDIO)),-device usb-audio$(NET_COMMA)bus=xhci.0$(NET_COMMA)port=1$(NET_COMMA)multi=off$(NET_COMMA)msos-desc=off$(NET_COMMA)audiodev=snd0,)
-.PHONY: run run-tcg run-usb
+.PHONY: run run-tcg run-usb run-s4
+S4_SWAP_IMG ?= build/s4-swap.img
+S4_SWAP_SIZE ?= 6G
+$(S4_SWAP_IMG):
+	@mkdir -p "$(dir $@)"
+	truncate -s $(S4_SWAP_SIZE) "$@"
+	printf 'label: gpt\ntype=0657FD6D-A4AB-43C4-84E5-0933C84B4F4F, name="s4swap"\n' | sfdisk "$@" >/dev/null
 run-usb: RUN_AUDIO := usb
 run-usb: run
+run-s4: KERNEL_CMDLINE = resume=PARTLABEL=s4swap
+run-s4: RUN_EXTRA_QEMU_FLAGS = -drive file=$(S4_SWAP_IMG),format=raw,if=none,id=s4swap -device nvme,serial=avoryos-s4,drive=s4swap,max_ioqpairs=$(RUN_NVME_QUEUES)
+run-s4: $(S4_SWAP_IMG) run
 run: DISPLAY_OPT = -display $(RUN_DISPLAY),gl=$(RUN_GL),show-cursor=$(GTK_SHOW_CURSOR)$(if $(filter gtk,$(RUN_DISPLAY)),$(NET_COMMA)zoom-to-fit=off$(NET_COMMA)grab-on-hover=on)
-run: QEMUFLAGS = $(QEMU_MEM) -vga none -device $(RUN_GPU),xres=1280,yres=800
+run: QEMUFLAGS = $(QEMU_MEM) -vga none -device $(RUN_GPU),xres=1280,yres=800 $(RUN_EXTRA_QEMU_FLAGS)
 run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL_HOST_LIB)) $(if $(RUN_QEMU_LOCAL),$(QEMU_HOST_BIN))
 	@mkdir -p "$(dir $(RUN_SERIAL_LOG))"
 	$(RUN_VIRGL_ENV) $(RUN_QEMU) \

@@ -40,6 +40,7 @@ extern void switch_context(struct thread *old_t, struct thread *new_t);
 extern void tss_set_rsp0(uint64_t rsp0);
 extern void signal_send(struct thread *, int);
 extern void signal_notify_thread(struct thread *t, int sig);
+static struct thread *sched_power_freeze_owner;
 
 static void ipi_reschedule_handler(struct registers *regs) {
   (void)regs;
@@ -554,6 +555,19 @@ __attribute__((optimize("O3"))) void sched_enqueue_thread(struct thread *t, stru
   hal_irq_state_t irq_flags = hal_irq_save();
   spinlock_acquire(&target_cpu->queue_lock);
 
+  // A CPU can be taken offline for a system sleep transition after placement
+  // selected it but before this queue lock was acquired. Recheck under the
+  // lock and redirect the task instead of leaving work on a parked runqueue.
+  if (!sched_cpu_accepting_work(target_cpu)) {
+    spinlock_release(&target_cpu->queue_lock);
+    target_cpu = cpu_get_bsp();
+    if (!sched_cpu_accepting_work(target_cpu)) {
+      hal_irq_restore(irq_flags);
+      return;
+    }
+    spinlock_acquire(&target_cpu->queue_lock);
+  }
+
   if (t->on_runqueue || t->se.on_rq) {
     spinlock_release(&target_cpu->queue_lock);
     hal_irq_restore(irq_flags);
@@ -597,6 +611,29 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
   }
 
   struct thread *prev = cpu->current_thread;
+
+  /* The S3 initiator stays on the BSP while devices are quiesced. Do not
+   * switch it out on a timer/yield; callbacks must use interruptible polling
+   * rather than blocking on another schedulable thread during this phase. */
+  struct thread *freeze_owner =
+      __atomic_load_n(&sched_power_freeze_owner, __ATOMIC_ACQUIRE);
+  if (freeze_owner) {
+    if (prev == freeze_owner) {
+      if (prev->state == THREAD_BLOCKED || prev->state == THREAD_SLEEPING) {
+        prev->state = THREAD_RUNNING;
+        prev->wakeup_ticks = 0;
+      }
+      if (prev->state == THREAD_RUNNING || prev->state == THREAD_READY) {
+        lapic_timer_arm_at(lapic_timer_get_ms() + LAPIC_SCHED_QUANTUM_MS);
+        hal_irq_restore(irq_flags);
+        return;
+      }
+    } else if (prev->is_idle) {
+      lapic_timer_arm_at(lapic_timer_get_ms() + LAPIC_SCHED_QUANTUM_MS);
+      hal_irq_restore(irq_flags);
+      return;
+    }
+  }
 
   // Reap detached threads from a different scheduler context.
   sched_process_reap_queue(prev);
@@ -899,6 +936,55 @@ __attribute__((optimize("O3"))) void sched_yield(void) {
 
 __attribute__((optimize("O3"))) void sched_yield_user(void) {
   sched_schedule(true);
+}
+
+bool sched_power_freeze_current(void) {
+  hal_irq_state_t irq_flags = hal_irq_save();
+  struct cpu_info *cpu = cpu_get_current();
+  struct thread *current = cpu ? cpu->current_thread : NULL;
+  if (!current || current->is_idle || current->state != THREAD_RUNNING ||
+      __atomic_load_n(&sched_power_freeze_owner, __ATOMIC_ACQUIRE)) {
+    hal_irq_restore(irq_flags);
+    return false;
+  }
+  __atomic_store_n(&sched_power_freeze_owner, current, __ATOMIC_RELEASE);
+  hal_irq_restore(irq_flags);
+  return true;
+}
+
+void sched_power_thaw_current(void) {
+  __atomic_store_n(&sched_power_freeze_owner, NULL, __ATOMIC_RELEASE);
+}
+
+void sched_resume_from_s3(void) {
+  uint64_t now_ms = lapic_timer_get_ms();
+  uint64_t now_ns = lapic_timer_get_ns();
+  uint32_t count = cpu_get_count();
+
+  for (uint32_t i = 0; i < count; i++) {
+    struct cpu_info *cpu = cpu_get_info(i);
+    if (!cpu || __atomic_load_n(&cpu->status, __ATOMIC_ACQUIRE) == CPU_STATUS_OFFLINE)
+      continue;
+    hal_irq_state_t flags = hal_irq_save();
+    spinlock_acquire(&cpu->queue_lock);
+    cpu->stats_last_ms = now_ms ? now_ms : 1;
+    if (cpu->current_thread)
+      cpu->current_thread->se.exec_start_ns = now_ns;
+    if (cpu->eevfd.curr)
+      cpu->eevfd.curr->exec_start_ns = now_ns;
+    sched_deadline_expire_locked(cpu, now_ms);
+    spinlock_release(&cpu->queue_lock);
+    hal_irq_restore(flags);
+  }
+
+  struct cpu_info *self = cpu_get_current();
+  if (self) {
+    hal_irq_state_t flags = hal_irq_save();
+    spinlock_acquire(&self->queue_lock);
+    sched_arm_next_deadline(self, self->current_thread);
+    spinlock_release(&self->queue_lock);
+    hal_irq_restore(flags);
+  }
 }
 
 /* Priority-ceiling protocol for kernel locks that may sleep with ownership.

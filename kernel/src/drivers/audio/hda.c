@@ -12,6 +12,7 @@
 #include "../../cpu/isr.h"
 #include "../../fb/framebuffer.h"
 #include "../../fs/vfs.h"
+#include "../../fs/sysfs_pci.h"
 #include "../../io/io.h"
 #include "../../lib/string.h"
 #include "../../mm/heap.h"
@@ -19,6 +20,7 @@
 #include "../../mm/vmm.h"
 #include "../../sched/sched.h"
 #include "../../sched/wait.h"
+#include "../manager/device.h"
 #include "../pci/pci.h"
 
 // Cyclic DMA ring.  The whole ring is hardware look-ahead: every byte written
@@ -41,6 +43,9 @@
 static struct pci_device *hda_pci = NULL;
 static volatile uint8_t *hda_base = NULL;
 static bool hda_present = false;
+static bool hda_s3_suspended = false;
+static bool hda_s3_was_playing = false;
+static bool hda_s3_failed = false;
 static uint8_t hda_iss = 0;  // Input Streams count
 static uint8_t hda_oss = 0;  // Output Streams count
 static uint32_t hda_stream_offset = 0; // Stream 0 MMIO offset
@@ -49,6 +54,8 @@ static uint32_t hda_stream_offset = 0; // Stream 0 MMIO offset
 static uint8_t active_codec = 0;
 static uint8_t active_dac_nid = 0;
 static uint8_t active_pin_nid = 0;
+static uint8_t active_afg_nid = 0;
+static bool hda_route_valid = false;
 static uint32_t active_dac_pcm_caps = 0; // HDA_PARAM_PCM_SIZE_RATE of the DAC
 
 // Active Stream Format
@@ -103,6 +110,25 @@ static spinlock_t hda_stream_lock = SPINLOCK_INIT;
 // Invoked from the ISR so upper layers can refill the queue (ALSA mmap path).
 static void (*hda_tick_callback)(void) = NULL;
 static void hda_start_stream(void);
+
+static int hda_dm_probe(struct device *dev);
+static int hda_dm_suspend(struct device *dev);
+static int hda_dm_resume(struct device *dev);
+
+static struct device_id hda_device_ids[] = {
+    {.type = ID_PCI,
+     .pci = {.match_class = true, .class = 0x04, .subclass = 0x03}},
+};
+
+static struct driver hda_device_driver = {
+    .name = "hda",
+    .kind = DRIVER_KERNEL,
+    .ids = hda_device_ids,
+    .id_count = sizeof(hda_device_ids) / sizeof(hda_device_ids[0]),
+    .probe = hda_dm_probe,
+    .suspend = hda_dm_suspend,
+    .resume = hda_dm_resume,
+};
 
 // MMIO Access Helpers
 static inline uint8_t hda_read8(uint32_t reg) {
@@ -526,6 +552,7 @@ static bool hda_setup_codec(void) {
         }
     }
     if (!afg_nid) afg_nid = 1;
+    active_afg_nid = afg_nid;
 
     // Power up Audio Function Group (D0)
     hda_exec_verb(active_codec, afg_nid, HDA_VERB_SET_POWER_STATE, 0x00);
@@ -591,7 +618,170 @@ static bool hda_setup_codec(void) {
     hda_exec_verb(active_codec, active_dac_nid, HDA_VERB_SET_CONV_STREAM_CHAN, (1 << 4) | 0); // Stream 1, Channel 0
     hda_exec_verb_16(active_codec, active_dac_nid, 0x2, HDA_FMT_48KHZ_16BIT_STEREO);
 
+    hda_route_valid = true;
+
     return true;
+}
+
+/* The controller reset during S3 clears codec widget power and routing, but
+ * the codec topology is stable. Reapply the cached route instead of probing
+ * every function group and widget again on the resume critical path. */
+static bool hda_restore_cached_codec_route(void) {
+    if (!hda_route_valid || active_codec >= 15 || !active_afg_nid ||
+        !active_dac_nid || !active_pin_nid)
+        return false;
+
+    hda_exec_verb(active_codec, active_afg_nid,
+                  HDA_VERB_SET_POWER_STATE, 0x00);
+    hda_exec_verb(active_codec, active_pin_nid,
+                  HDA_VERB_SET_POWER_STATE, 0x00);
+    hda_exec_verb(active_codec, active_dac_nid,
+                  HDA_VERB_SET_POWER_STATE, 0x00);
+    hda_exec_verb(active_codec, active_pin_nid,
+                  HDA_VERB_SET_PIN_WIDGET_CTRL, 0x40);
+    hda_exec_verb(active_codec, active_pin_nid,
+                  HDA_VERB_SET_EAPD_BTLENABLE, 0x02);
+    hda_exec_verb_16(active_codec, active_pin_nid, 0x3, 0xB07F);
+    hda_exec_verb_16(active_codec, active_dac_nid, 0x3, 0xB07F);
+    hda_exec_verb(active_codec, active_dac_nid,
+                  HDA_VERB_SET_CONV_STREAM_CHAN, (1U << 4));
+    return true;
+}
+
+int hda_suspend_for_s3(void) {
+    if (!hda_present)
+        return 0;
+    if (hda_s3_failed)
+        return -5;
+    if (hda_s3_suspended)
+        return -16;
+
+    hal_irq_state_t irq_flags = hal_irq_save();
+    spinlock_acquire(&hda_stream_lock);
+    uint32_t saved_intctl = hda_read32(HDA_REG_INTCTL);
+    uint32_t saved_stream_ctl = hda_sd_read32(HDA_SD_CTL);
+    hda_write32(HDA_REG_INTCTL, 0);
+    hda_sd_write32(HDA_SD_CTL, saved_stream_ctl & ~HDA_SD_CTL_RUN);
+
+    uint32_t timeout = 100000;
+    while ((hda_sd_read32(HDA_SD_CTL) & HDA_SD_CTL_RUN) && --timeout)
+        io_wait();
+    if (!timeout) {
+        hda_sd_write32(HDA_SD_CTL, saved_stream_ctl);
+        hda_write32(HDA_REG_INTCTL, saved_intctl);
+        spinlock_release(&hda_stream_lock);
+        hal_irq_restore(irq_flags);
+        return -16;
+    }
+
+    hda_s3_was_playing = hda_is_playing;
+    hda_is_playing = false;
+    hda_s3_suspended = true;
+    spinlock_release(&hda_stream_lock);
+    hal_irq_restore(irq_flags);
+    return 0;
+}
+
+int hda_resume_from_s3(void) {
+    if (!hda_present || !hda_s3_suspended)
+        return hda_present ? -22 : 0;
+
+    /* Firmware may have reset the controller and PCI command register while
+     * asleep. Re-enable MMIO/DMA access, reset the link, then rebuild the
+     * codec route and stream descriptor before unmasking its interrupt. */
+    if (!pci_restore_bars(hda_pci))
+        goto failed;
+    uint16_t command = pci_config_read16(hda_pci->bus, hda_pci->slot,
+                                         hda_pci->func, 0x04);
+    pci_config_write16(hda_pci->bus, hda_pci->slot, hda_pci->func, 0x04,
+                       command | 0x0006);
+    hda_write32(HDA_REG_INTCTL, 0);
+
+    uint32_t gctl = hda_read32(HDA_REG_GCTL);
+    hda_write32(HDA_REG_GCTL, gctl & ~HDA_GCTL_CRST);
+    uint32_t timeout = 100000;
+    while ((hda_read32(HDA_REG_GCTL) & HDA_GCTL_CRST) && --timeout)
+        io_wait();
+    if (!timeout)
+        goto failed;
+
+    hda_write32(HDA_REG_GCTL, HDA_GCTL_CRST);
+    timeout = 100000;
+    while (!(hda_read32(HDA_REG_GCTL) & HDA_GCTL_CRST) && --timeout)
+        io_wait();
+    if (!timeout)
+        goto failed;
+    for (uint32_t i = 0; i < 2000; i++)
+        io_wait();
+
+    if (!hda_restore_cached_codec_route() && !hda_setup_codec())
+        goto failed;
+
+    hda_sd_write8(HDA_SD_CTL, HDA_SD_CTL_SRST);
+    timeout = 100000;
+    while (!(hda_sd_read8(HDA_SD_CTL) & HDA_SD_CTL_SRST) && --timeout)
+        io_wait();
+    if (!timeout)
+        goto failed;
+    hda_sd_write8(HDA_SD_CTL, 0);
+    timeout = 100000;
+    while ((hda_sd_read8(HDA_SD_CTL) & HDA_SD_CTL_SRST) && --timeout)
+        io_wait();
+    if (!timeout)
+        goto failed;
+
+    hda_sd_write8(HDA_SD_STS, 0x1C);
+    hda_sd_write32(HDA_SD_BDLPL, (uint32_t)hda_bdl_phys);
+    hda_sd_write32(HDA_SD_BDLPU, (uint32_t)(hda_bdl_phys >> 32));
+    hda_sd_write32(HDA_SD_CBL, HDA_BDL_ENTRIES * HDA_BUFFER_SIZE);
+    hda_sd_write16(HDA_SD_LVI, HDA_BDL_ENTRIES - 1);
+    uint16_t format = hda_compute_format(current_sample_rate,
+                                         current_channels, current_bits);
+    hda_sd_write16(HDA_SD_FMT, format);
+    hda_exec_verb_16(active_codec, active_dac_nid, 0x2, format);
+    hda_sd_write8(HDA_SD_CTL + 2, (1U << 4));
+    hda_write32(HDA_REG_INTSTS, 0xFFFFFFFFU);
+
+    hal_irq_state_t irq_flags = hal_irq_save();
+    spinlock_acquire(&hda_stream_lock);
+    hda_last_lpib = 0;
+    hda_lpib_pos = 0;
+    hda_refill_pos = 0;
+    hda_playing_desc = 0;
+    if (hda_s3_was_playing)
+        hda_start_stream();
+    else
+        hda_sd_write8(HDA_SD_CTL, HDA_SD_CTL_IOCE | HDA_SD_CTL_FEIE |
+                                      HDA_SD_CTL_DEIE);
+    hda_write32(HDA_REG_INTCTL,
+                HDA_INTCTL_GIE | HDA_INTCTL_CIE | (1U << hda_iss));
+    hda_s3_was_playing = false;
+    hda_s3_suspended = false;
+    spinlock_release(&hda_stream_lock);
+    hal_irq_restore(irq_flags);
+    wait_queue_wake_all(&hda_wait_queue);
+    return 0;
+
+failed:
+    hda_s3_failed = true;
+    klog_puts("[HDA] S3 resume failed; audio controller left quiesced.\n");
+    return -5;
+}
+
+static int hda_dm_probe(struct device *dev) {
+    return hda_present && hda_pci && hda_pci->kernel_device == dev ? 0 : -19;
+}
+
+static int hda_dm_suspend(struct device *dev) {
+    return hda_pci && hda_pci->kernel_device == dev
+               ? hda_suspend_for_s3()
+               : -19;
+}
+
+static int hda_dm_resume(struct device *dev) {
+    return hda_pci && hda_pci->kernel_device == dev
+               ? hda_resume_from_s3()
+               : -19;
 }
 
 // Initialize Intel HDA Hardware
@@ -609,6 +799,8 @@ void hda_init(void) {
         klog_puts("[HDA] No Intel HDA device found.\n");
         return;
     }
+
+    hda_device_driver.bus = asc_pci_bus_type();
 
     klog_puts("[HDA] Controller found at PCI ");
     klog_uint64(hda_pci->bus);
@@ -711,6 +903,15 @@ void hda_init(void) {
 
     hda_present = true;
     klog_puts("[OK] Intel High Definition Audio (HDA) Initialized.\n");
+
+    dm_register_driver(&hda_device_driver);
+    sysfs_pci_driver_registered(&hda_device_driver);
+    if (hda_pci->kernel_device &&
+        hda_pci->kernel_device->driver == &hda_device_driver) {
+        sysfs_pci_device_bound(hda_pci->kernel_device);
+    } else {
+        klog_puts("[HDA] Device-manager binding failed; S3 will remain disabled.\n");
+    }
 }
 
 bool hda_is_present(void) {

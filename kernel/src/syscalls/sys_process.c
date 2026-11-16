@@ -36,6 +36,7 @@
 #include "../lib/tsc.h"
 #include <stdint.h>
 #include <stddef.h>
+extern void sys_sync_all_open_files(void);
 #ifdef LINUXKPI_LINUX_IMPORTED
 #include <linuxkpi/native_pci.h>
 #endif
@@ -1954,6 +1955,7 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
   case LINUX_REBOOT_CMD_RESTART:
   case LINUX_REBOOT_CMD_RESTART2:
     klog_puts("[REBOOT] System reboot requested via syscall.\n");
+    sys_sync_all_open_files();
     vmm_defer_sync();
 #ifdef LINUXKPI_LINUX_IMPORTED
     linuxkpi_pci_shutdown();
@@ -1966,6 +1968,7 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 
   case LINUX_REBOOT_CMD_POWER_OFF:
     klog_puts("[REBOOT] System power-off requested via syscall.\n");
+    sys_sync_all_open_files();
     vmm_defer_sync();
 #ifdef LINUXKPI_LINUX_IMPORTED
     linuxkpi_pci_shutdown();
@@ -1978,6 +1981,7 @@ static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 
   case LINUX_REBOOT_CMD_HALT:
     klog_puts("[REBOOT] System halt requested via syscall.\n");
+    sys_sync_all_open_files();
     vmm_defer_sync();
 #ifdef LINUXKPI_LINUX_IMPORTED
     linuxkpi_pci_shutdown();

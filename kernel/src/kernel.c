@@ -45,6 +45,7 @@
 #include "drivers/usb/uhci.h"
 #include "drivers/usb/usb.h"
 #include "drivers/usb/usb_audio.h"
+#include "drivers/usb/usb_mouse.h"
 #include "drivers/usb/xhci.h"
 #include "drivers/virtio/virtio.h"
 #include "drivers/gpu/virtio_gpu/virtio_gpu.h"
@@ -62,6 +63,7 @@
 #include "fs/vfs_rcu.h"
 #include "hal/hal.h"
 #include "io/io.h"
+#include "power/hibernate.h"
 #include "lib/radix_tree.h"
 #include "lib/string.h"
 #include "mm/dma_alloc.h"
@@ -735,6 +737,9 @@ void kmain_high_half(void) {
     ata_init();
   }
 
+  // Probe for a valid S4 hibernation image before mounting filesystems R/W.
+  power_s4_try_resume();
+
   // Mount root filesystem
   struct block_device *boot_dev = NULL;
 
@@ -969,6 +974,7 @@ mount_fail:
   audio_dsp_register_vfs();
   alsa_emu_register_vfs();
   usb_audio_start_worker();
+  usb_mouse_start_worker();
 
   /* The no-root-filesystem path jumps directly here and skips initcalls.
    * Keep the native core initialized exactly once on both boot paths. */

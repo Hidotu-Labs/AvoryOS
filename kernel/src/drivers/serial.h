@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 void serial_init(void);
+void serial_resume(void);
 void serial_putchar(char c);
 void serial_write(const char *data, size_t length);
 void serial_write_async(const char *data, size_t length);

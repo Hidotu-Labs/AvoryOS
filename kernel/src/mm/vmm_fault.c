@@ -1800,10 +1800,12 @@ void vmm_update_vdso_data(void) {
 
   extern uint64_t tsc_get_freq_khz(void);
   extern uint64_t lapic_timer_get_boot_tsc(void);
+  extern uint64_t lapic_timer_get_ns(void);
   extern uint64_t rtc_get_boot_timestamp(void);
 
   uint64_t khz = tsc_get_freq_khz();
   uint64_t boot_tsc = lapic_timer_get_boot_tsc();
+  uint64_t boot_mono_ns = lapic_timer_get_ns();
   uint64_t boot_sec = rtc_get_boot_timestamp();
   uint64_t tsc_hz = khz * 1000ULL;
 
@@ -1833,6 +1835,7 @@ void vmm_update_vdso_data(void) {
   data[6] = mult_rem_ns;
   data[7] = mult_rem_us;
   data[8] = getcpu_mode;
+  data[9] = boot_mono_ns;
 }
 
 

@@ -122,6 +122,11 @@ struct nvme_controller {
   volatile bool failed;
   bool io_ready;
   bool logged; /* Identify details already printed once */
+  volatile bool pm_quiescing;
+  volatile uint32_t pm_activity;
+  bool pm_suspended;
+  bool pm_was_started;
+  uint16_t pm_saved_pci_command;
 
   /*
    * True only while CC.EN=0 and CSTS.RDY=0 have been observed (or the
@@ -179,6 +184,24 @@ static unsigned nvme_count;
  * boot thread while storage is still being brought up, where blocking on a
  * wait queue (and a scheduler tick) is unnecessary; poll instead. */
 static bool nvme_runtime;
+static int nvme_pm_suspend(struct device *dev);
+static int nvme_pm_resume(struct device *dev);
+static bool nvme_irq_restore_after_s3(struct nvme_controller *ctrl);
+
+static bool nvme_pm_io_enter(struct nvme_controller *ctrl) {
+  if (!ctrl || __atomic_load_n(&ctrl->pm_quiescing, __ATOMIC_ACQUIRE))
+    return false;
+  __atomic_add_fetch(&ctrl->pm_activity, 1, __ATOMIC_ACQ_REL);
+  if (__atomic_load_n(&ctrl->pm_quiescing, __ATOMIC_ACQUIRE)) {
+    __atomic_sub_fetch(&ctrl->pm_activity, 1, __ATOMIC_ACQ_REL);
+    return false;
+  }
+  return true;
+}
+
+static void nvme_pm_io_exit(struct nvme_controller *ctrl) {
+  __atomic_sub_fetch(&ctrl->pm_activity, 1, __ATOMIC_ACQ_REL);
+}
 /* Test hook: while positive, submission doorbell writes are suppressed and
  * the count is decremented, so a command never reaches the controller and the
  * timeout/fail-stop (and, with recovery enabled, reset) path is exercised.
@@ -641,18 +664,58 @@ static int nvme_create_io_queue(struct nvme_controller *ctrl, unsigned index) {
   return 0;
 }
 
+/* Ask the controller to allocate the queue pairs before creating them.
+ * Create I/O CQ/SQ commands for unallocated qids are rejected even when the
+ * controller has enough MSI-X vectors.  The returned counts are zero-based
+ * per the Number of Queues feature, so add one and use the smaller direction. */
+static unsigned nvme_negotiate_io_queues(struct nvme_controller *ctrl) {
+  unsigned wanted = ctrl->wanted_queues;
+  if (wanted <= 1)
+    return 1;
+
+  uint32_t requested = wanted - 1;
+  nvme_command_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.opcode = NVME_ADMIN_SET_FEATURES;
+  cmd.cdw10 = NVME_FEAT_NUMBER_OF_QUEUES;
+  cmd.cdw11 = requested | (requested << 16);
+
+  uint32_t result = 0;
+  uint16_t sc = 0;
+  if (nvme_admin_cmd(ctrl, &cmd, &result, &sc) != 0 ||
+      sc != NVME_SC_SUCCESS) {
+    klogf("[NVMe] %s Number of Queues negotiation failed (sc=%02x); "
+          "using one I/O queue\n",
+          ctrl->name, sc);
+    return 1;
+  }
+
+  unsigned sq_count = (result & 0xFFFFu) + 1u;
+  unsigned cq_count = ((result >> 16) & 0xFFFFu) + 1u;
+  unsigned granted = sq_count < cq_count ? sq_count : cq_count;
+  if (granted > wanted)
+    granted = wanted;
+  if (granted == 0)
+    granted = 1;
+
+  klogf("[NVMe] %s allocated %u/%u requested I/O queue pairs\n", ctrl->name,
+        granted, wanted);
+  return granted;
+}
+
 /*
- * Bring up as many queue pairs as the controller lets us.  wanted_queues is
- * min(ncpus, NVME_MAX_QUEUES); a device with a smaller max_ioqpairs (QEMU's
- * max_ioqpairs= knob) rejects the extra qids and we keep the ones that
- * worked, with CPUs sharing them modulo the count.
+ * Create the queue pairs granted by the controller.  CPUs beyond the actual
+ * count share queues modulo that count.
  */
-static int nvme_create_io_queues(struct nvme_controller *ctrl) {
+static int nvme_create_io_queues(struct nvme_controller *ctrl,
+                                 unsigned queue_limit) {
   unsigned created = 0;
   uint16_t depth = 0;
   nvme_queue_depth_for(ctrl->cap, &depth);
 
-  for (unsigned i = 0; i < ctrl->wanted_queues; i++) {
+  if (queue_limit > ctrl->wanted_queues)
+    queue_limit = ctrl->wanted_queues;
+  for (unsigned i = 0; i < queue_limit; i++) {
     if (!ctrl->io[i].q.valid &&
         !nvme_queue_alloc(&ctrl->io[i].q, (uint16_t)(i + 1), depth,
                           ctrl->dstrd)) {
@@ -1098,7 +1161,8 @@ static int nvme_controller_start(struct nvme_controller *ctrl) {
   nvme_parse_controller(ctrl);
   nvme_scan_namespaces(ctrl);
 
-  if (nvme_create_io_queues(ctrl) != 0) {
+  unsigned queue_limit = nvme_negotiate_io_queues(ctrl);
+  if (nvme_create_io_queues(ctrl, queue_limit) != 0) {
     nvme_controller_disable(ctrl);
     return -1;
   }
@@ -1157,6 +1221,115 @@ static bool nvme_controller_shutdown(struct nvme_controller *ctrl) {
   }
   nvme_controller_disable(ctrl);
   return acknowledged;
+}
+
+static int nvme_pm_suspend(struct device *dev) {
+  struct nvme_controller *ctrl = dev ? dev->driver_data : NULL;
+  if (!ctrl)
+    return -1;
+  if (ctrl->pm_suspended)
+    return 0;
+
+  __atomic_store_n(&ctrl->pm_quiescing, true, __ATOMIC_RELEASE);
+  uint64_t deadline = lapic_timer_get_ms() + NVME_TIMEOUT_MS;
+  while (__atomic_load_n(&ctrl->pm_activity, __ATOMIC_ACQUIRE) &&
+         lapic_timer_get_ms() < deadline)
+    hal_cpu_relax();
+  if (__atomic_load_n(&ctrl->pm_activity, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&ctrl->pm_quiescing, false, __ATOMIC_RELEASE);
+    return -16;
+  }
+
+  ctrl->pm_was_started = ctrl->started && ctrl->io_ready;
+  ctrl->pm_saved_pci_command = pci_config_read16(
+      ctrl->pdev->bus, ctrl->pdev->slot, ctrl->pdev->func, 0x04);
+  bool shutdown_ok = true;
+  if (ctrl->pm_was_started)
+    shutdown_ok = nvme_controller_shutdown(ctrl);
+  else
+    shutdown_ok = nvme_controller_disable(ctrl);
+
+  if (!ctrl->dma_quiesced) {
+    /* Do not enter S3 while the controller may still own queue or data DMA. */
+    __atomic_store_n(&ctrl->pm_quiescing, false, __ATOMIC_RELEASE);
+    return -16;
+  }
+  nvme_controller_stop(ctrl);
+  pci_set_bus_mastering(ctrl->pdev, false);
+  if (!shutdown_ok) {
+    /* A timed-out SHN may still be made safe by CC.EN clearing, but report the
+     * failed orderly shutdown and restore service instead of entering S3. */
+    pci_config_write16(ctrl->pdev->bus, ctrl->pdev->slot, ctrl->pdev->func,
+                       0x04, ctrl->pm_saved_pci_command);
+    int restarted = nvme_controller_start(ctrl);
+    if (restarted != 0)
+      klogf("[NVMe] %s could not restart after S3 preparation failed\n",
+            ctrl->name);
+    /* If restart failed, started/io_ready remain false and new requests fail
+     * before submitting DMA. Do not leave the namespace permanently PM-gated. */
+    __atomic_store_n(&ctrl->pm_quiescing, false, __ATOMIC_RELEASE);
+    return -16;
+  }
+
+  ctrl->pm_suspended = true;
+  klogf("[NVMe] %s quiesced for S3\n", ctrl->name);
+  return 0;
+}
+
+static int nvme_pm_resume(struct device *dev) {
+  struct nvme_controller *ctrl = dev ? dev->driver_data : NULL;
+  if (!ctrl)
+    return -1;
+  if (!ctrl->pm_suspended)
+    return 0;
+
+  if (!pci_restore_bars(ctrl->pdev)) {
+    ctrl->pm_suspended = false;
+    __atomic_store_n(&ctrl->pm_quiescing, false, __ATOMIC_RELEASE);
+    return -5;
+  }
+  uint16_t command = ctrl->pm_saved_pci_command;
+  if (ctrl->pm_was_started)
+    command |= 1u << 2;
+  pci_config_write16(ctrl->pdev->bus, ctrl->pdev->slot, ctrl->pdev->func, 0x04,
+                     command);
+  (void)nvme_irq_restore_after_s3(ctrl);
+  if (ctrl->pm_was_started) {
+    nvme_controller_stop(ctrl);
+    if (nvme_controller_start(ctrl) != 0) {
+      ctrl->pm_suspended = false;
+      __atomic_store_n(&ctrl->pm_quiescing, false, __ATOMIC_RELEASE);
+      klogf("[NVMe] %s failed to restart after S3\n", ctrl->name);
+      return -5;
+    }
+  }
+
+  ctrl->pm_suspended = false;
+  __atomic_store_n(&ctrl->pm_quiescing, false, __ATOMIC_RELEASE);
+  klogf("[NVMe] %s resumed after S3\n", ctrl->name);
+  return 0;
+}
+
+void nvme_s4_pre_snapshot(void) {
+  for (unsigned c = 0; c < nvme_count; c++) {
+    struct nvme_controller *ctrl = &controllers[c];
+    ctrl->pm_was_started = ctrl->started && ctrl->io_ready;
+    ctrl->pm_saved_pci_command = pci_config_read16(
+        ctrl->pdev->bus, ctrl->pdev->slot, ctrl->pdev->func, 0x04);
+    ctrl->pm_suspended = true;
+  }
+}
+
+void nvme_s4_post_snapshot_quiesce(void) {
+  for (unsigned c = 0; c < nvme_count; c++) {
+    struct nvme_controller *ctrl = &controllers[c];
+    if (ctrl->pm_was_started)
+      (void)nvme_controller_shutdown(ctrl);
+    else
+      (void)nvme_controller_disable(ctrl);
+    nvme_controller_stop(ctrl);
+    pci_set_bus_mastering(ctrl->pdev, false);
+  }
 }
 
 void nvme_shutdown(void) {
@@ -1407,6 +1580,61 @@ static bool nvme_irq_setup(struct nvme_controller *ctrl) {
   }
   return true;
 #endif
+}
+
+/* S3 firmware or the PCI function may lose message routes even though the
+ * driver's vector allocations and handlers remain live. Rebuild the MSI-X
+ * table after BAR restoration and before recreating I/O CQs, otherwise disk
+ * callers can end up waiting for completion polling instead of interrupts. */
+static bool nvme_irq_restore_after_s3(struct nvme_controller *ctrl) {
+  if (!ctrl->irq_active)
+    return true;
+
+  if (ctrl->irq.mode == PCI_IRQ_MSIX) {
+    if (!pci_msix_init(ctrl->pdev, &ctrl->irq.msix) ||
+        ctrl->irq.msix.table_size < ctrl->irq.vector_count) {
+      klogf("[NVMe] %s could not restore MSI-X table; using polled I/O\n",
+            ctrl->name);
+      ctrl->irq_active = false;
+      return false;
+    }
+
+    uint8_t bsp = (uint8_t)lapic_get_id();
+    for (uint16_t i = 0; i < ctrl->irq.vector_count; i++) {
+      uint8_t destination = bsp;
+      struct cpu_info *ci = cpu_get_info(i);
+      if (ci && ci->status != CPU_STATUS_OFFLINE)
+        destination = (uint8_t)ci->apic_id;
+      if (!pci_msix_program(&ctrl->irq.msix, i, ctrl->irq.vectors[i],
+                            destination)) {
+        klogf("[NVMe] %s could not restore MSI-X vector %u; using polled I/O\n",
+              ctrl->name, i);
+        ctrl->irq_active = false;
+        return false;
+      }
+      pci_msix_mask(&ctrl->irq.msix, i, false);
+    }
+    if (!pci_msix_enable(&ctrl->irq.msix)) {
+      klogf("[NVMe] %s could not enable restored MSI-X; using polled I/O\n",
+            ctrl->name);
+      ctrl->irq_active = false;
+      return false;
+    }
+    klogf("[NVMe] %s restored MSI-X routes (%u vectors)\n", ctrl->name,
+          ctrl->irq.vector_count);
+    return true;
+  }
+
+  if (ctrl->irq.mode == PCI_IRQ_MSI && ctrl->irq.vector_count) {
+    if (!pci_msi_enable(ctrl->pdev, &ctrl->irq.msi, ctrl->irq.vectors[0],
+                        (uint8_t)lapic_get_id())) {
+      klogf("[NVMe] %s could not restore MSI; using polled I/O\n", ctrl->name);
+      ctrl->irq_active = false;
+      return false;
+    }
+    klogf("[NVMe] %s restored MSI route\n", ctrl->name);
+  }
+  return true;
 }
 
 /* Take a completed verdict for `cid`; 0 means it is still outstanding. */
@@ -2417,27 +2645,45 @@ static int nvme_io_batch(struct nvme_controller *ctrl, struct nvme_namespace *ns
 static int nvme_ns_read(struct block_device *dev, uint64_t lba, uint32_t count,
                         void *buf) {
   struct nvme_namespace *ns = nvme_ns_from_block(dev);
+  if (!ns)
+    return -1;
+  struct nvme_controller *ctrl = ns->ctrl;
+  if (!nvme_pm_io_enter(ctrl))
+    return -16;
   int ret = nvme_io(ns, lba, count, (uint8_t *)buf, false, false);
   if (ret == 0)
     block_stat_read(dev, count);
+  nvme_pm_io_exit(ctrl);
   return ret;
 }
 
 static int nvme_ns_write(struct block_device *dev, uint64_t lba,
                          uint32_t count, const void *buf) {
   struct nvme_namespace *ns = nvme_ns_from_block(dev);
+  if (!ns)
+    return -1;
+  struct nvme_controller *ctrl = ns->ctrl;
+  if (!nvme_pm_io_enter(ctrl))
+    return -16;
   int ret = nvme_io(ns, lba, count, (uint8_t *)buf, true, NVME_FUA_DEFAULT);
   if (ret == 0)
     block_stat_write(dev, count);
+  nvme_pm_io_exit(ctrl);
   return ret;
 }
 
 static int nvme_ns_write_fua(struct block_device *dev, uint64_t lba,
                              uint32_t count, const void *buf) {
   struct nvme_namespace *ns = nvme_ns_from_block(dev);
+  if (!ns)
+    return -1;
+  struct nvme_controller *ctrl = ns->ctrl;
+  if (!nvme_pm_io_enter(ctrl))
+    return -16;
   int ret = nvme_io(ns, lba, count, (uint8_t *)buf, true, true);
   if (ret == 0)
     block_stat_write(dev, count);
+  nvme_pm_io_exit(ctrl);
   return ret;
 }
 
@@ -2447,10 +2693,14 @@ static int nvme_ns_read_batch(struct block_device *dev,
   struct nvme_namespace *ns = nvme_ns_from_block(dev);
   if (!ns || !reqs || n == 0)
     return -1;
+  struct nvme_controller *ctrl = ns->ctrl;
+  if (!nvme_pm_io_enter(ctrl))
+    return -16;
   int rc = nvme_io_batch(ns->ctrl, ns, reqs, n, false, false);
   for (unsigned i = 0; i < n; i++)
     if (reqs[i].result == 0)
       block_stat_read(dev, reqs[i].count);
+  nvme_pm_io_exit(ctrl);
   return rc;
 }
 
@@ -2459,10 +2709,14 @@ static int nvme_ns_write_batch(struct block_device *dev,
   struct nvme_namespace *ns = nvme_ns_from_block(dev);
   if (!ns || !reqs || n == 0)
     return -1;
+  struct nvme_controller *ctrl = ns->ctrl;
+  if (!nvme_pm_io_enter(ctrl))
+    return -16;
   int rc = nvme_io_batch(ns->ctrl, ns, reqs, n, true, NVME_FUA_DEFAULT);
   for (unsigned i = 0; i < n; i++)
     if (reqs[i].result == 0)
       block_stat_write(dev, reqs[i].count);
+  nvme_pm_io_exit(ctrl);
   return rc;
 }
 #endif /* NVME_BATCH_IO */
@@ -2497,14 +2751,21 @@ static int nvme_flush_once(struct nvme_controller *ctrl,
 static int nvme_ns_flush(struct block_device *dev) {
   struct nvme_namespace *ns = nvme_ns_from_block(dev);
   struct nvme_controller *ctrl = ns ? ns->ctrl : NULL;
-  if (!ctrl || !ctrl->started || !ctrl->io_ready || ctrl->failed)
+  if (!ctrl)
     return -1;
+  if (!nvme_pm_io_enter(ctrl))
+    return -16;
+  if (!ctrl->started || !ctrl->io_ready || ctrl->failed) {
+    nvme_pm_io_exit(ctrl);
+    return -1;
+  }
 
   int rc = nvme_flush_once(ctrl, ns);
 #ifdef NVME_RESET_RECOVERY
   if (rc == -2 && nvme_recover(ctrl))
     rc = nvme_flush_once(ctrl, ns);
 #endif
+  nvme_pm_io_exit(ctrl);
   return rc;
 }
 
@@ -2621,6 +2882,7 @@ static int nvme_probe(struct device *dev) {
         ctrl->io_queue_count, ctrl->irq_active ? ctrl->irq.vector_count : 0,
         ctrl->wanted_queues);
   nvme_register_namespaces(ctrl);
+  dev->driver_data = ctrl;
   nvme_count++;
   return 0;
 }
@@ -2633,7 +2895,9 @@ static struct driver nvme_driver = {.name = "nvme",
                                     .kind = DRIVER_KERNEL,
                                     .ids = nvme_ids,
                                     .id_count = 1,
-                                    .probe = nvme_probe};
+                                    .probe = nvme_probe,
+                                    .suspend = nvme_pm_suspend,
+                                    .resume = nvme_pm_resume};
 
 int nvme_init(void) {
   nvme_count = 0;

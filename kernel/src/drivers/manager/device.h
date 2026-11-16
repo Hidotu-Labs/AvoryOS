@@ -92,6 +92,16 @@ struct device {
     device_state_t state;
     uint32_t refcount;
     spinlock_t lock;
+    bool pm_suspended;
+    /* Core/platform-owned hardware is transitioned outside bound-driver
+     * suspend/resume callbacks. */
+    bool pm_managed_by_core;
+    /* PCI-core fallback state for an unbound endpoint whose bus mastering and
+     * decoding were disabled directly by the power manager. */
+    bool pm_pci_suspended;
+    uint16_t pm_pci_command;
+    uint16_t pm_pci_pmcsr;
+    uint8_t pm_pci_pm_cap;
     char driver_override[DRIVER_OVERRIDE_LEN];
 };
 
@@ -102,11 +112,20 @@ struct driver {
 
     int (*probe)(struct device *dev);
     void (*remove)(struct device *dev);
+    /* S3 callbacks run while scheduling is frozen on the BSP and interrupts
+     * are enabled. They may poll or wait for IRQs, but must not block on
+     * another schedulable thread. */
+    int (*suspend)(struct device *dev);
+    int (*resume)(struct device *dev);
 
     struct bus_type *bus;
     driver_kind_t kind;
     void *private_data;
     struct driver *next;
+    /* Resume this device before ordinary devices once its parents are live.
+     * Intended for output devices needed while later resume callbacks do slow
+     * hardware re-enumeration. */
+    bool resume_early;
 };
 
 struct bus_type {
@@ -144,6 +163,11 @@ struct device *device_find_by_path(const char *path);
 
 // Log the device tree to the console (for debugging)
 void dm_dump_tree(void);
+
+/* Transactional system sleep callbacks. Devices suspend child-first and
+ * resume parent-first. A bound device without both callbacks blocks suspend. */
+int dm_suspend_devices(void);
+int dm_resume_devices(void);
 
 
 void dm_register_driver(struct driver *drv);

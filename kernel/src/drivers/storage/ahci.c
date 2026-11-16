@@ -82,6 +82,8 @@ static ahci_hba_mem_t *hba;
 static struct ahci_drive ahci_drives[32];
 static int ahci_drive_count = 0;
 static bool ahci_irq_active = false;
+static uint16_t ahci_pm_saved_command;
+static bool ahci_pm_suspended;
 
 // Helpers
 
@@ -896,6 +898,7 @@ static int ahci_probe(struct device *dev) {
   // We should ideally have BARs in dev->resources, but for now we'll do legacy PCI read
   struct pci_device *pci_dev = pci_find_device_by_id(dev->vendor_id, dev->device_id);
   if (!pci_dev) return -1;
+  dev->driver_data = pci_dev;
   
   abar = pci_dev->bar[5];
   if (abar == 0) return -1;
@@ -942,6 +945,37 @@ static int ahci_probe(struct device *dev) {
   return 0;
 }
 
+static int ahci_pm_suspend(struct device *dev) {
+  struct pci_device *pci = dev ? dev->driver_data : NULL;
+  if (!pci || !hba)
+    return -1;
+  /* The current AHCI stack cannot quiesce live command engines yet. Refuse
+   * S3 if any SATA disk is attached; the QEMU CD-ROM-only controller is idle. */
+  if (ahci_drive_count)
+    return -16;
+  ahci_pm_saved_command =
+      pci_config_read16(pci->bus, pci->slot, pci->func, 0x04);
+  hba->ghc &= ~(1u << 1); /* Disable HBA interrupts. */
+  pci_set_bus_mastering(pci, false);
+  ahci_pm_suspended = true;
+  return 0;
+}
+
+static int ahci_pm_resume(struct device *dev) {
+  struct pci_device *pci = dev ? dev->driver_data : NULL;
+  if (!pci || !hba)
+    return -1;
+  if (!ahci_pm_suspended)
+    return 0;
+  if (!pci_restore_bars(pci))
+    return -5;
+  pci_config_write16(pci->bus, pci->slot, pci->func, 0x04,
+                     ahci_pm_saved_command);
+  hba->ghc |= 1u << 31; /* Keep AHCI mode enabled. */
+  ahci_pm_suspended = false;
+  return 0;
+}
+
 static struct device_id ahci_ids[] = {
     { .type = ID_PCI, .pci = { .match_class = true, .class = 0x01, .subclass = 0x06 } }
 };
@@ -951,7 +985,9 @@ static struct driver ahci_driver = {
     .kind = DRIVER_KERNEL,
     .ids = ahci_ids,
     .id_count = 1,
-    .probe = ahci_probe
+    .probe = ahci_probe,
+    .suspend = ahci_pm_suspend,
+    .resume = ahci_pm_resume
 };
 
 int ahci_init(void) {

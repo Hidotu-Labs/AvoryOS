@@ -233,7 +233,7 @@ extern void signal_notify_thread(struct thread *t, int sig);
 
 #define KSTACK_CACHE_PER_CPU 2
 #define KSTACK_GLOBAL_POOL_MAX 16
-#define KSTACK_CANARY 0x5AFE57AC05AFE57ACULL
+#define KSTACK_CANARY 0xAFE57AC05AFE57ACULL
 #define KSTACK_CANARY_WORDS 8
 
 struct kstack_cpu_cache {
@@ -331,19 +331,50 @@ void *thread_stack_alloc(void) {
   return stack;
 }
 
-void thread_stack_release(uint64_t stack_base) {
+void *thread_stack_alloc_sized(size_t stack_size) {
+  if (stack_size == THREAD_STACK_SIZE)
+    return thread_stack_alloc();
+  if (stack_size < THREAD_STACK_SIZE || (stack_size % PAGE_SIZE) != 0)
+    return NULL;
+
+  void *phys = pmm_alloc_pages(stack_size / PAGE_SIZE);
+  if (!phys)
+    return NULL;
+  void *stack = (void *)((uint64_t)phys + pmm_get_hhdm_offset());
+  __atomic_add_fetch(&kstack_stat_alloc_pmm, 1, __ATOMIC_RELAXED);
+  memset(stack, 0, stack_size);
+  kstack_arm_canary(stack);
+  return stack;
+}
+
+void thread_stack_release(uint64_t stack_base, size_t stack_size,
+                          const struct thread *owner) {
   if (!stack_base)
+    return;
+  if (stack_size < THREAD_STACK_SIZE || (stack_size % PAGE_SIZE) != 0)
     return;
 
   void *stack = (void *)stack_base;
 
   /* Check stack overflow canary zone at the bottom of the stack */
   if (!kstack_verify_canary(stack)) {
-    klogf("[KSTACK] WARNING: Kernel stack overflow detected on stack %p (canary corrupted)!\n",
-          stack);
+    struct cpu_info *cpu = cpu_get_current();
+    klogf("[KSTACK] WARNING: Kernel stack canary corrupted: stack=%p tid=%u "
+          "tgid=%u comm='%s' reaped_on_cpu=%u\n",
+          stack, owner ? owner->tid : 0, owner ? owner->tgid : 0,
+          owner ? owner->comm : "?", cpu ? cpu->cpu_id : UINT32_MAX);
     /* Corrupted stack: do not recycle into cache, free directly to PMM */
     void *phys = (void *)(stack_base - pmm_get_hhdm_offset());
-    pmm_free_pages(phys, THREAD_STACK_SIZE / PAGE_SIZE);
+    pmm_free_pages(phys, stack_size / PAGE_SIZE);
+    __atomic_add_fetch(&kstack_stat_free_pmm, 1, __ATOMIC_RELAXED);
+    return;
+  }
+
+  /* Oversized stacks are private to deep kernel paths and bypass the
+   * fixed-size stack caches. */
+  if (stack_size != THREAD_STACK_SIZE) {
+    void *phys = (void *)(stack_base - pmm_get_hhdm_offset());
+    pmm_free_pages(phys, stack_size / PAGE_SIZE);
     __atomic_add_fetch(&kstack_stat_free_pmm, 1, __ATOMIC_RELAXED);
     return;
   }
@@ -454,9 +485,12 @@ static void thread_exit(void) {
   }
 }
 
-struct thread *sched_create_kernel_thread(void (*entry)(void),
-                                          struct cpu_info *explicit_cpu,
-                                          bool enqueue) {
+struct thread *sched_create_kernel_thread_sized(void (*entry)(void),
+                                                struct cpu_info *explicit_cpu,
+                                                bool enqueue,
+                                                size_t stack_size) {
+  if (stack_size < THREAD_STACK_SIZE || (stack_size % PAGE_SIZE) != 0)
+    return NULL;
   // Allocate thread struct
   struct thread *t = kmalloc(sizeof(struct thread));
   if (!t)
@@ -520,9 +554,9 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
   t->priority = SCHED_PRIORITY_DEFAULT;
   t->static_priority = SCHED_PRIORITY_DEFAULT;
   t->nice_value = 0;
-  t->stack_size = THREAD_STACK_SIZE;
+  t->stack_size = stack_size;
 
-  t->stack_base = (uint64_t)thread_stack_alloc();
+  t->stack_base = (uint64_t)thread_stack_alloc_sized(stack_size);
 
   if (!t->stack_base) {
     sched_release_files(t);
@@ -536,7 +570,7 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
     return NULL;
   }
 
-  uint64_t stack_top = t->stack_base + THREAD_STACK_SIZE;
+  uint64_t stack_top = t->stack_base + stack_size;
   stack_top &= ~0xFULL; // Align stack
 
   // 1. Build thread_stub's synthetic frame.  The stub is entered by
@@ -599,6 +633,13 @@ struct thread *sched_create_kernel_thread(void (*entry)(void),
   }
 
   return t;
+}
+
+struct thread *sched_create_kernel_thread(void (*entry)(void),
+                                          struct cpu_info *explicit_cpu,
+                                          bool enqueue) {
+  return sched_create_kernel_thread_sized(entry, explicit_cpu, enqueue,
+                                          THREAD_STACK_SIZE);
 }
 
 struct thread *find_thread_by_tid_locked(uint32_t tid) {
