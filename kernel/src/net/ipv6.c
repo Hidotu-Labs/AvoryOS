@@ -341,8 +341,69 @@ static void handle_ra(const uint8_t source[16], const uint8_t source_mac[6],
   }
 }
 
+#ifdef USE_RUST_NET
+struct rust_ipv6_ingress {
+  int kind;
+  uint8_t src_ip[16];
+  uint8_t dst_ip[16];
+  uint8_t nd_target[16];
+  uint8_t ra_prefix[8];
+  bool has_ra_prefix;
+  uint8_t hop_limit;
+  size_t payload_offset;
+  size_t payload_len;
+};
+
+#define RUST_IPV6_INGRESS_IGNORE       0
+#define RUST_IPV6_INGRESS_UDP          1
+#define RUST_IPV6_INGRESS_TCP          2
+#define RUST_IPV6_INGRESS_ICMP_ECHO    3
+#define RUST_IPV6_INGRESS_ICMP_NS      4
+#define RUST_IPV6_INGRESS_ICMP_NA      5
+#define RUST_IPV6_INGRESS_ICMP_RA      6
+
+extern int rust_ipv6_parse_packet(const uint8_t *packet, size_t len,
+                                  struct rust_ipv6_ingress *out);
+#endif
+
 void ipv6_receive(const uint8_t source_mac[6], const uint8_t *packet,
                   size_t length) {
+#ifdef USE_RUST_NET
+  struct rust_ipv6_ingress ing;
+  int kind = rust_ipv6_parse_packet(packet, length, &ing);
+  if (kind == RUST_IPV6_INGRESS_IGNORE)
+    return;
+  if (!local_address(ing.dst_ip) && !addr_multicast(ing.dst_ip))
+    return;
+  const uint8_t *payload = packet + ing.payload_offset;
+  neighbor_learn(ing.src_ip, source_mac);
+
+  if (kind == RUST_IPV6_INGRESS_UDP) {
+    if (udp_handler)
+      udp_handler(ing.src_ip, ing.dst_ip, payload, ing.payload_len);
+  } else if (kind == RUST_IPV6_INGRESS_TCP) {
+    if (tcp_handler)
+      tcp_handler(ing.src_ip, ing.dst_ip, payload, ing.payload_len);
+  } else if (kind == RUST_IPV6_INGRESS_ICMP_ECHO && local_address(ing.dst_ip)) {
+    uint8_t reply[NET_MTU_ETHERNET - sizeof(struct ipv6_header)];
+    memcpy(reply, payload, ing.payload_len);
+    reply[0] = ICMP6_ECHO_REPLY;
+    ipv6_send_to(NULL, ing.dst_ip, ing.src_ip, source_mac, IPV6_NEXT_ICMP,
+                 reply, ing.payload_len);
+  } else if (kind == RUST_IPV6_INGRESS_ICMP_NS && local_address(ing.nd_target)) {
+    send_na(ing.src_ip, source_mac, ing.nd_target);
+  } else if (kind == RUST_IPV6_INGRESS_ICMP_NA) {
+    neighbor_learn(ing.nd_target, source_mac);
+  } else if (kind == RUST_IPV6_INGRESS_ICMP_RA) {
+    memcpy(config.router, ing.src_ip, 16);
+    if (ing.has_ra_prefix) {
+      memcpy(config.global, ing.ra_prefix, 8);
+      memcpy(config.global + 8, config.link_local + 8, 8);
+      config.prefix_length = 64;
+      config.global_valid = true;
+    }
+  }
+#else
   if (!packet || length < sizeof(struct ipv6_header) || packet[0] >> 4 != 6)
     return;
   const struct ipv6_header *h = (const struct ipv6_header *)packet;
@@ -383,6 +444,7 @@ void ipv6_receive(const uint8_t source_mac[6], const uint8_t *packet,
   } else if (icmp[0] == ICMP6_RA && h->hop_limit == 255) {
     handle_ra(h->source, source_mac, icmp, payload_length);
   }
+#endif
 }
 
 static void send_router_solicitation(void) {

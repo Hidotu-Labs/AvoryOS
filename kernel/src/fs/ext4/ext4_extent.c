@@ -15,6 +15,26 @@ bool ext4_inode_has_extents(ext2_inode_t *inode) {
     return (inode->i_flags & EXT4_EXTENTS_FL) != 0;
 }
 
+#ifdef USE_RUST_EXT4
+struct rust_ext4_extent_lookup {
+    uint64_t pblock;
+    uint64_t child_phys;
+    uint32_t run_len;
+    uint32_t hole_limit;
+};
+
+#define RUST_EXT4_LOOKUP_ERR     0
+#define RUST_EXT4_LOOKUP_HIT     1
+#define RUST_EXT4_LOOKUP_HOLE    2
+#define RUST_EXT4_LOOKUP_DESCEND 3
+
+extern int rust_ext4_lookup_extent_node(const uint8_t *node, size_t node_bytes,
+                                        uint32_t logical_block,
+                                        uint64_t blocks_count,
+                                        uint16_t max_depth, uint32_t hole_limit,
+                                        struct rust_ext4_extent_lookup *out);
+#endif
+
 uint64_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
                              uint32_t logical_block, uint32_t *out_run_len) {
     if (out_run_len)
@@ -27,6 +47,47 @@ uint64_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
     uint32_t hole_limit = UINT32_MAX - logical_block;
     if (!hole_limit) hole_limit = 1;
 
+#ifdef USE_RUST_EXT4
+    const uint8_t *node = (const uint8_t *)inode->i_block;
+    size_t node_bytes = sizeof(inode->i_block);
+    while (1) {
+        struct rust_ext4_extent_lookup lk;
+        int status = rust_ext4_lookup_extent_node(
+            node, node_bytes, logical_block, mnt->blocks_count, 5, hole_limit,
+            &lk);
+        if (status == RUST_EXT4_LOOKUP_HIT) {
+            if (out_run_len)
+                *out_run_len = lk.run_len;
+            result = lk.pblock;
+            goto done;
+        }
+        if (status == RUST_EXT4_LOOKUP_HOLE) {
+            if (out_run_len)
+                *out_run_len = lk.run_len;
+            result = 0;
+            goto done;
+        }
+        if (status != RUST_EXT4_LOOKUP_DESCEND || depth_idx >= 4)
+            goto done;
+
+        hole_limit = lk.hole_limit;
+        if (!buf) {
+            if (mnt->block_size <= sizeof(stack_buf)) {
+                buf = stack_buf;
+            } else {
+                dyn_buf = kmalloc(mnt->block_size);
+                if (!dyn_buf)
+                    goto done;
+                buf = dyn_buf;
+            }
+        }
+        depth_idx++;
+        if (ext2_read_block(mnt, lk.child_phys, buf) != 0)
+            goto done;
+        node = buf;
+        node_bytes = mnt->block_size;
+    }
+#else
     ext4_extent_header_t *hdr = (ext4_extent_header_t *)inode->i_block;
     void *entries = (uint8_t *)inode->i_block + sizeof(ext4_extent_header_t);
 
@@ -104,6 +165,7 @@ uint64_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
                 goto done;
         }
     }
+#endif
 
 done:
     if (dyn_buf)

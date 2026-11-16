@@ -252,7 +252,8 @@ static void network_start(void) {
       net_device_put(default_netdev);
     }
     net_phase4_init();
-    net_phase5_init();
+    if (cmdline_has("kernel_dhcp=1"))
+      net_phase5_init();
     net_phase6_init();
     ipv4_set_tcp_handler(tcp_input_ipv4);
     net_phase8_init();

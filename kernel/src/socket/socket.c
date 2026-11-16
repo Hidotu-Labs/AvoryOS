@@ -16,6 +16,7 @@
 #include "af_netlink.h"
 #include "af_inet.h"
 #include "af_inet6.h"
+#include "af_packet.h"
 #include "af_qrtr.h"
 #include "socket_internal.h"
 #include "../syscalls/sys_io_shared.h"
@@ -215,6 +216,31 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
     uint32_t ifindex = loopback ? 1 : 2; /* Match route netlink. */
     memset(&ifr.family, 0, sizeof(ifr) - 16);
     memcpy(&ifr.family, &ifindex, sizeof(ifindex));
+  } else if (request == 0x8914 || request == 0x8916 ||
+             request == 0x891a || request == 0x891c) {
+    if (!capability_has(sched_get_current(), CAP_NET_ADMIN))
+      return -1; /* EPERM */
+    if (loopback)
+      return 0;
+    if (request == 0x8914) /* SIOCSIFFLAGS */
+      return 0;
+    if (request == 0x891a) /* SIOCSIFBRDADDR */
+      return 0;
+    if (ifr.family != 2 && ifr.family != 0)
+      return -97; /* EAFNOSUPPORT */
+    uint32_t ip_val = ((uint32_t)ifr.address_data[2] << 24) |
+                      ((uint32_t)ifr.address_data[3] << 16) |
+                      ((uint32_t)ifr.address_data[4] << 8) |
+                      (uint32_t)ifr.address_data[5];
+    const struct ipv4_config *cur = ipv4_get_config();
+    struct ipv4_config next = cur ? *cur : (struct ipv4_config){0};
+    if (request == 0x8916) { /* SIOCSIFADDR */
+      next.address = ip_val;
+    } else if (request == 0x891c) { /* SIOCSIFNETMASK */
+      next.netmask = ip_val;
+    }
+    ipv4_apply_config(&next);
+    return 0;
   } else {
     return -25;
   }
@@ -384,7 +410,7 @@ socket_t *socket_create_in_namespace(int domain, int type, int protocol, struct 
   if (net_ns && domain == AF_QIPCRTR) return NULL;
   // Validate domain
   if (domain != AF_UNIX && domain != AF_INET && domain != AF_INET6 &&
-      domain != AF_NETLINK && domain != AF_QIPCRTR) {
+      domain != AF_NETLINK && domain != AF_PACKET && domain != AF_QIPCRTR) {
     return NULL; // EAFNOSUPPORT
   }
 
@@ -1082,9 +1108,38 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     socket_put(sock);
     return ret;
   }
-  if (request == 0x8910 || request == 0x8913 || request == 0x8915 ||
-      request == 0x8919 || request == 0x891b || request == 0x8927 ||
-      request == 0x8933) {
+  if (request == 0x890b || request == 0x890c) { /* SIOCADDRT / SIOCDELRT */
+    if (!capability_has(sched_get_current(), CAP_NET_ADMIN)) {
+      socket_put(sock);
+      return -1; /* EPERM */
+    }
+    /* Linux x86_64 struct rtentry: rt_pad1(8), rt_dst(16), rt_gateway(16), rt_genmask(16) */
+    uint8_t rtbuf[56];
+    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(rtbuf)) ||
+        copy_from_user(rtbuf, (const void *)arg, sizeof(rtbuf)) != 0) {
+      socket_put(sock);
+      return -14;
+    }
+    uint16_t dst_fam = 0, gw_fam = 0;
+    memcpy(&dst_fam, rtbuf + 8, sizeof(dst_fam));
+    memcpy(&gw_fam, rtbuf + 24, sizeof(gw_fam));
+    uint32_t dst_ip = ((uint32_t)rtbuf[12] << 24) | ((uint32_t)rtbuf[13] << 16) |
+                      ((uint32_t)rtbuf[14] << 8) | (uint32_t)rtbuf[15];
+    uint32_t gw_ip = ((uint32_t)rtbuf[28] << 24) | ((uint32_t)rtbuf[29] << 16) |
+                     ((uint32_t)rtbuf[30] << 8) | (uint32_t)rtbuf[31];
+    if (dst_fam == 2 && dst_ip == 0) {
+      const struct ipv4_config *cur = ipv4_get_config();
+      struct ipv4_config next = cur ? *cur : (struct ipv4_config){0};
+      next.gateway = (request == 0x890b && gw_fam == 2) ? gw_ip : 0;
+      ipv4_apply_config(&next);
+    }
+    socket_put(sock);
+    return 0;
+  }
+  if (request == 0x8910 || request == 0x8913 || request == 0x8914 ||
+      request == 0x8915 || request == 0x8916 || request == 0x8919 ||
+      request == 0x891a || request == 0x891b || request == 0x891c ||
+      request == 0x8927 || request == 0x8933) {
     int ret = socket_ioctl_ifreq(request, arg);
     socket_put(sock);
     return ret;
@@ -1170,6 +1225,7 @@ void socket_init(void) {
   af_unix_init();
   af_netlink_init();
   af_inet_init();
+  af_packet_init();
   af_inet6_init();
   af_qrtr_init();
 

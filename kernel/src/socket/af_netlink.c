@@ -37,8 +37,10 @@ struct nlmsghdr_min {
 #define RTM_NEWLINK 16
 #define RTM_GETLINK 18
 #define RTM_NEWADDR 20
+#define RTM_DELADDR 21
 #define RTM_GETADDR 22
 #define RTM_NEWROUTE 24
+#define RTM_DELROUTE 25
 #define RTM_GETROUTE 26
 #define IFLA_ADDRESS 1
 #define IFLA_IFNAME 3
@@ -696,6 +698,103 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
             if (!invalid && address) {
               if ((request.nlmsg_flags & 0x200) && sock->net_ns->loopback_address) ack.error = -17;
               else { __atomic_store_n(&sock->net_ns->loopback_address, address, __ATOMIC_RELEASE); ack.error = 0; }
+            }
+          }
+        }
+      }
+      if (route_queue(nsk, &ack, sizeof(ack))) {
+        return -12;
+      }
+      socket_wake(sock); if (sock->node) epoll_notify_event(sock->node, EPOLLIN);
+      return len;
+    }
+    if (!sock->net_ns &&
+        (request.nlmsg_type == RTM_NEWLINK || request.nlmsg_type == RTM_NEWADDR ||
+         request.nlmsg_type == RTM_DELADDR || request.nlmsg_type == RTM_NEWROUTE ||
+         request.nlmsg_type == RTM_DELROUTE)) {
+      struct { struct nlmsghdr_min hdr; int32_t error; struct nlmsghdr_min request; } ack = {0};
+      ack.hdr.nlmsg_len = sizeof(ack); ack.hdr.nlmsg_type = 2;
+      ack.hdr.nlmsg_seq = request.nlmsg_seq; ack.hdr.nlmsg_pid = reply_pid; ack.request = request;
+      ack.error = -22;
+      uint8_t payload[512];
+      if (!capability_has(sched_get_current(), CAP_NET_ADMIN)) {
+        ack.error = -1;
+      } else if (request.nlmsg_len <= len && request.nlmsg_len <= sizeof(payload) &&
+                 request.nlmsg_len >= sizeof(request)) {
+        int fault = 0;
+        if (is_user_ptr((uint64_t)buf)) fault = copy_from_user(payload, buf, request.nlmsg_len);
+        else memcpy(payload, buf, request.nlmsg_len);
+        if (fault) {
+          ack.error = -14;
+        } else if (request.nlmsg_type == RTM_NEWLINK &&
+                   request.nlmsg_len >= sizeof(request) + sizeof(struct ifinfomsg_min)) {
+          struct ifinfomsg_min info;
+          memcpy(&info, payload + sizeof(request), sizeof(info));
+          ack.error = (info.index == 1 || info.index == 2) ? 0 : -19;
+        } else if ((request.nlmsg_type == RTM_NEWADDR || request.nlmsg_type == RTM_DELADDR) &&
+                   request.nlmsg_len >= sizeof(request) + sizeof(struct ifaddrmsg_min)) {
+          struct ifaddrmsg_min info;
+          memcpy(&info, payload + sizeof(request), sizeof(info));
+          if (info.index != 1 && info.index != 2) {
+            ack.error = -19;
+          } else if (info.index == 1) {
+            ack.error = 0;
+          } else if (info.family == 2) {
+            uint32_t address = 0;
+            bool invalid = false;
+            for (size_t off = sizeof(request) + sizeof(info); off + 4 <= request.nlmsg_len;) {
+              struct rtattr_min attr;
+              memcpy(&attr, payload + off, sizeof(attr));
+              if (attr.len < 4 || off + attr.len > request.nlmsg_len) { invalid = true; break; }
+              if ((attr.type == IFA_LOCAL || attr.type == IFA_ADDRESS) && attr.len >= 8) {
+                const uint8_t *p = payload + off + 4;
+                address = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                          ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+              }
+              off += NL_ALIGN(attr.len);
+            }
+            if (!invalid) {
+              struct ipv4_config next = cfg ? *cfg : (struct ipv4_config){0};
+              if (request.nlmsg_type == RTM_NEWADDR && address) {
+                next.address = address;
+                next.netmask = (info.prefixlen == 0) ? 0 :
+                               (info.prefixlen >= 32) ? 0xffffffffU :
+                               (~0U << (32 - info.prefixlen));
+                ipv4_apply_config(&next);
+                ack.error = 0;
+              } else if (request.nlmsg_type == RTM_DELADDR) {
+                next.address = 0;
+                next.netmask = 0;
+                ipv4_apply_config(&next);
+                ack.error = 0;
+              }
+            }
+          }
+        } else if ((request.nlmsg_type == RTM_NEWROUTE || request.nlmsg_type == RTM_DELROUTE) &&
+                   request.nlmsg_len >= sizeof(request) + sizeof(struct rtmsg_min)) {
+          struct rtmsg_min rtm;
+          memcpy(&rtm, payload + sizeof(request), sizeof(rtm));
+          if (rtm.rtm_family == 2) {
+            uint32_t gw = 0;
+            bool invalid = false;
+            for (size_t off = sizeof(request) + sizeof(rtm); off + 4 <= request.nlmsg_len;) {
+              struct rtattr_min attr;
+              memcpy(&attr, payload + off, sizeof(attr));
+              if (attr.len < 4 || off + attr.len > request.nlmsg_len) { invalid = true; break; }
+              if (attr.type == RTA_GATEWAY && attr.len >= 8) {
+                const uint8_t *p = payload + off + 4;
+                gw = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+              }
+              off += NL_ALIGN(attr.len);
+            }
+            if (!invalid) {
+              if (rtm.rtm_dst_len == 0) {
+                struct ipv4_config next = cfg ? *cfg : (struct ipv4_config){0};
+                next.gateway = (request.nlmsg_type == RTM_NEWROUTE) ? gw : 0;
+                ipv4_apply_config(&next);
+              }
+              ack.error = 0;
             }
           }
         }

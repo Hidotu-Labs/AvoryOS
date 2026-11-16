@@ -178,13 +178,11 @@ cp -f "${ROOT_DIR}/initrd/avory-drm.sh" \
     "${ROOTFS_DIR}/etc/xdg/plasma-workspace/env/avory-drm.sh"
 chmod 0644 "${ROOTFS_DIR}/etc/xdg/plasma-workspace/env/avory-drm.sh"
 
-# Plasma's Wayland desktop entry bypasses startplasma-x11, so route it through
-# the matching audio setup before Plasma starts D-Bus-activated services.
-install -m 0755 "${ROOT_DIR}/config/plasma/avory-plasma-wayland.sh" \
-    "${ROOTFS_DIR}/usr/bin/avory-plasma-wayland"
+# Ensure Plasma Wayland uses its upstream launcher instead of a custom wrapper.
+rm -f "${ROOTFS_DIR}/usr/bin/avory-plasma-wayland"
 PLASMA_WAYLAND_SESSION="${ROOTFS_DIR}/usr/share/wayland-sessions/plasma.desktop"
 if [ -f "$PLASMA_WAYLAND_SESSION" ]; then
-    sed -i 's|^Exec=.*|Exec=/usr/bin/avory-plasma-wayland|' "$PLASMA_WAYLAND_SESSION"
+    sed -i 's|^Exec=.*|Exec=/usr/lib/plasma-dbus-run-session-if-needed /usr/bin/startplasma-wayland|' "$PLASMA_WAYLAND_SESSION"
 fi
 
 # Xfwm4 ships with compositing enabled upstream, but write the channel default
@@ -383,6 +381,14 @@ if command -v kbuildsycoca6 >/dev/null 2>&1; then
 fi
 
 # 5b. Start a session audio graph when neither rcS nor systemd provides one.
+if [ "$AUDIO_GRAPH" = systemd ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user start pipewire.service wireplumber.service pipewire-pulse.service >/dev/null 2>&1 || true
+    fi
+    if [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
+        AUDIO_GRAPH=session
+    fi
+fi
 if [ "$AUDIO_GRAPH" = session ]; then
     PIPEWIRE_LOG="$XDG_RUNTIME_DIR/pipewire.log"
     if ! (: >>"$PIPEWIRE_LOG") 2>/dev/null; then
@@ -403,9 +409,11 @@ if [ "$AUDIO_GRAPH" = session ]; then
             rm -f "$XDG_RUNTIME_DIR/pipewire-0" "$XDG_RUNTIME_DIR/pipewire-0.lock" 2>/dev/null || true
             XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup pipewire >>"$PIPEWIRE_LOG" 2>&1 &
             session_pipewire_started=1
-            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            i=0
+            while [ "$i" -lt 50 ]; do
                 [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
                 sleep 0.1
+                i=$((i + 1))
             done
         fi
     fi
@@ -438,6 +446,12 @@ if [ "$AUDIO_GRAPH" = session ]; then
             if [ "$pwp_running" = 0 ]; then
                 rm -f "$XDG_RUNTIME_DIR/pulse/native" "$XDG_RUNTIME_DIR/pulse/pid" 2>/dev/null || true
                 nohup pipewire-pulse >>"$PIPEWIRE_LOG" 2>&1 &
+                i=0
+                while [ "$i" -lt 30 ]; do
+                    [ -S "$XDG_RUNTIME_DIR/pulse/native" ] && break
+                    sleep 0.1
+                    i=$((i + 1))
+                done
             fi
         fi
     fi

@@ -7,6 +7,7 @@
 /kernel/freestnd-c-hdrs/
 /kernel/bin-*/
 /kernel/obj-*/
+/kernel/rust/target/
 /doomgeneric/
 /limine/
 /toolchain/

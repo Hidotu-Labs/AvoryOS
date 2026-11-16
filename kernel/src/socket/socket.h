@@ -18,6 +18,7 @@ typedef uint16_t sa_family_t;
 #define AF_INET 2
 #define AF_INET6 10
 #define AF_NETLINK 16
+#define AF_PACKET 17
 #define AF_QIPCRTR 42
 #define NETLINK_ROUTE 0
 #define NETLINK_AUDIT 9
@@ -183,6 +184,16 @@ struct sockaddr_in6 {
   uint32_t sin6_flowinfo;
   struct in6_addr sin6_addr;
   uint32_t sin6_scope_id;
+};
+
+struct sockaddr_ll {
+  sa_family_t sll_family;
+  uint16_t sll_protocol;
+  int32_t sll_ifindex;
+  uint16_t sll_hatype;
+  uint8_t sll_pkttype;
+  uint8_t sll_halen;
+  uint8_t sll_addr[8];
 };
 
 #define INADDR_ANY       0x00000000u

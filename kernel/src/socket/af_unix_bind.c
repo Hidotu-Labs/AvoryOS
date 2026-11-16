@@ -1,6 +1,7 @@
 // AF_UNIX – Bind logic (abstract and filesystem namespaces)
 
 #include "af_unix_internal.h"
+#include "../fs/mount_namespace.h"
 
 static int unix_bind_abstract(unix_sock_t *usk, struct sockaddr_un *sun,
                               int addrlen) {
@@ -114,6 +115,10 @@ static int unix_bind_fs(unix_sock_t *usk, struct sockaddr_un *sun, int addrlen) 
             current_thread->fsgid);
 
   usk->bound_vnode = fs_node; // reference transferred to the socket
+  vfs_node_t *backing = vfs_backing_node(fs_node);
+  usk->bound_backing = backing;
+  usk->bound_inode = backing ? backing->inode : 0;
+  usk->bound_device = backing ? backing->device : NULL;
 
   {
     size_t copy = (size_t)addrlen < sizeof(usk->addr) ? (size_t)addrlen : sizeof(usk->addr);

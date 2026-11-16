@@ -7,6 +7,7 @@
 #include "../mm/heap.h"
 #include "../sched/namespace.h"
 #include "../sched/sched.h"
+#include "../sched/sched_internal.h"
 
 struct mount_link {
   uint64_t id, parent_id, flags;
@@ -902,12 +903,46 @@ int vfs_namespace_chroot(vfs_node_t *root) {
   vfs_node_t *n = make_view(root, NULL, root->mount_id);
   if (!n)
     return -12;
-  spinlock_acquire(&t->namespace_lock);
-  vfs_node_t *old = t->fs_root_node;
-  t->fs_root_node = n;
-  spinlock_release(&t->namespace_lock);
-  if (old)
-    vfs_close(old);
+  uint64_t share_id = __atomic_load_n(&t->fs_share_id, __ATOMIC_ACQUIRE);
+  if (!share_id) {
+    spinlock_acquire(&t->namespace_lock);
+    vfs_node_t *old = t->fs_root_node;
+    t->fs_root_node = n;
+    spinlock_release(&t->namespace_lock);
+    if (old)
+      vfs_close(old);
+    return 0;
+  }
+
+  vfs_node_t *olds[64];
+  int old_count = 0;
+  bool updated_self = false;
+  spinlock_acquire(&tid_lock);
+  for (struct thread *it = global_thread_list; it; it = it->global_next) {
+    if (it->fs_share_id == share_id) {
+      spinlock_acquire(&it->namespace_lock);
+      vfs_node_t *old = it->fs_root_node;
+      if (it != t)
+        vfs_open(n);
+      else
+        updated_self = true;
+      it->fs_root_node = n;
+      spinlock_release(&it->namespace_lock);
+      if (old && old_count < 64)
+        olds[old_count++] = old;
+    }
+  }
+  if (!updated_self) {
+    spinlock_acquire(&t->namespace_lock);
+    vfs_node_t *old = t->fs_root_node;
+    t->fs_root_node = n;
+    spinlock_release(&t->namespace_lock);
+    if (old && old_count < 64)
+      olds[old_count++] = old;
+  }
+  spinlock_release(&tid_lock);
+  for (int i = 0; i < old_count; i++)
+    vfs_close(olds[i]);
   return 0;
 }
 int vfs_namespace_pivot(vfs_node_t *newroot, vfs_node_t *oldpoint) {

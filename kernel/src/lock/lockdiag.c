@@ -355,6 +355,8 @@ static holds_t g_holds[MAX_CPUS];
  * writer that still works when a CPU is parked holding the serial lock. */
 
 static void ld_str(const char *s) {
+  extern void vfs_rcu_poll(void);
+  vfs_rcu_poll();
   size_t n = 0;
   while (s[n])
     n++;
@@ -1310,6 +1312,8 @@ void lockdiag_dump_all(const char *reason) {
         compositor |= t->tgid == compositor_tgids[ci];
       bool focused = t->kpi_data || (focus_tgid && t->tgid == focus_tgid) ||
                      (busy_tgid && t->tgid == busy_tgid) || compositor ||
+                     strncmp(t->comm, "kded6", 5) == 0 ||
+                     strncmp(t->comm, "dbus-daemon", 11) == 0 ||
                      strncmp(t->comm, "Xorg", 4) == 0 ||
                      strncmp(t->comm, "glxgears", 8) == 0 ||
                      strncmp(t->comm, "xfce4-ab", 8) == 0 ||
@@ -1407,6 +1411,12 @@ void lockdiag_dump_all(const char *reason) {
       }
       ld_str(" cpu="); ld_dec(t->cpu_index);
       ld_str(" wake_at_ms="); ld_dec(t->wakeup_ticks);
+      if (t->vfork_child) {
+        ld_str(" vfork_child=");
+        ld_dec(t->vfork_child);
+        ld_str(" vfork_done=");
+        ld_dec(__atomic_load_n(&t->vfork_done, __ATOMIC_ACQUIRE) ? 1 : 0);
+      }
       if (t->wakeup_ticks && t->wakeup_ticks != (uint64_t)-1) {
         uint64_t now_ms = report_start_ms;
         if (now_ms > t->wakeup_ticks) {

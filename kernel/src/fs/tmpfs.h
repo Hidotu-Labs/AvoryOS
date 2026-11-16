@@ -67,6 +67,7 @@ void        tmpfs_mount_at_sized(const char *path, uint64_t max_bytes, uint64_t 
 vfs_node_t *tmpfs_create_root(tmpfs_sb_t *sb);
 /* The cgroup a cgroup2 directory represents, or NULL for any other node. */
 struct cgroupfs_group *tmpfs_cgroup_of(vfs_node_t *dir);
+void tmpfs_cgroup_populate_group(vfs_node_t *dir, struct cgroupfs_group *group);
 vfs_node_t *tmpfs_create_private_root(void);
 
 /* Cross-directory rename within a single tmpfs instance (both parents must

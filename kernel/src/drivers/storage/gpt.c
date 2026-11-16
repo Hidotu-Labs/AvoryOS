@@ -150,6 +150,57 @@ enum pmbr_type {
   PMBR_HYBRID,
 };
 
+#ifdef USE_RUST_STORAGE
+struct rust_mbr_partition_pmbr {
+  uint32_t start_lba;
+  uint32_t total_sectors;
+  uint8_t part_type;
+  bool active;
+};
+
+struct rust_mbr_result_pmbr {
+  bool valid;
+  bool is_pmbr;
+  bool is_hybrid_mbr;
+  size_t count;
+  struct rust_mbr_partition_pmbr partitions[4];
+};
+
+struct rust_gpt_header {
+  uint32_t revision;
+  uint32_t header_size;
+  uint64_t current_lba;
+  uint64_t first_usable_lba;
+  uint64_t last_usable_lba;
+  uint64_t partition_entry_lba;
+  uint32_t num_partition_entries;
+  uint32_t partition_entry_size;
+  uint32_t partition_array_crc32;
+};
+
+struct rust_gpt_entry_parsed {
+  uint64_t starting_lba;
+  uint64_t ending_lba;
+  uint64_t total_sectors;
+  uint8_t type_guid[16];
+  uint8_t partition_type;
+  char partuuid[37];
+  char partlabel[64];
+};
+
+extern bool rust_mbr_parse_sector(const uint8_t *sector, size_t len,
+                                  struct rust_mbr_result_pmbr *out);
+extern bool rust_gpt_validate_header(const uint8_t *sector, size_t sector_len,
+                                     uint64_t expected_lba,
+                                     uint64_t total_sectors,
+                                     struct rust_gpt_header *out_hdr);
+extern bool rust_gpt_crc32_matches(const uint8_t *buf, size_t len,
+                                   uint32_t expected_crc);
+extern bool rust_gpt_parse_entry(const uint8_t *entry, size_t entry_len,
+                                 uint64_t first_usable, uint64_t last_usable,
+                                 struct rust_gpt_entry_parsed *out);
+#endif
+
 static enum pmbr_type gpt_check_pmbr(struct block_device *dev, uint32_t sector_size) {
   uint8_t *mbr_buf = kmalloc(sector_size);
   if (!mbr_buf)
@@ -160,6 +211,18 @@ static enum pmbr_type gpt_check_pmbr(struct block_device *dev, uint32_t sector_s
     return PMBR_ABSENT;
   }
 
+#ifdef USE_RUST_STORAGE
+  struct rust_mbr_result_pmbr parsed;
+  bool ok = rust_mbr_parse_sector(mbr_buf, sector_size, &parsed);
+  kfree(mbr_buf);
+  if (!ok)
+    return PMBR_ABSENT;
+  if (parsed.is_hybrid_mbr)
+    return PMBR_HYBRID;
+  if (parsed.is_pmbr)
+    return PMBR_VALID;
+  return PMBR_ABSENT;
+#else
   uint16_t sig = (uint16_t)mbr_buf[510] | ((uint16_t)mbr_buf[511] << 8);
   if (sig != 0xAA55) {
     kfree(mbr_buf);
@@ -186,7 +249,36 @@ static enum pmbr_type gpt_check_pmbr(struct block_device *dev, uint32_t sector_s
   if (has_ee)
     return PMBR_VALID;
   return PMBR_ABSENT;
+#endif
 }
+
+#ifdef USE_RUST_STORAGE
+static uint8_t *gpt_read_entries_rust(struct block_device *dev,
+                                      const struct rust_gpt_header *hdr,
+                                      uint32_t sector_size) {
+  uint64_t total_bytes =
+      (uint64_t)hdr->num_partition_entries * hdr->partition_entry_size;
+  uint32_t num_sectors =
+      (uint32_t)((total_bytes + sector_size - 1) / sector_size);
+
+  uint8_t *buf = kmalloc(num_sectors * sector_size);
+  if (!buf)
+    return NULL;
+
+  if (dev->read_sectors(dev, hdr->partition_entry_lba, num_sectors, buf) != 0) {
+    kfree(buf);
+    return NULL;
+  }
+
+  if (!rust_gpt_crc32_matches(buf, (size_t)total_bytes,
+                              hdr->partition_array_crc32)) {
+    kfree(buf);
+    return NULL;
+  }
+
+  return buf;
+}
+#endif
 
 static bool gpt_validate_header(const struct gpt_header *hdr,
                                 uint64_t expected_lba, uint64_t total_sectors,
@@ -279,6 +371,104 @@ int gpt_scan_partitions(struct block_device *dev) {
   if (!hdr_buf)
     return -1;
 
+#ifdef USE_RUST_STORAGE
+  struct rust_gpt_header active_hdr;
+  uint8_t *entries = NULL;
+  bool is_gpt = false;
+  bool primary_corrupt = false;
+
+  if (dev->read_sectors(dev, 1, 1, hdr_buf) == 0) {
+    if (memcmp(hdr_buf, GPT_SIGNATURE, 8) == 0) {
+      is_gpt = true;
+      if (rust_gpt_validate_header(hdr_buf, sector_size, 1,
+                                   dev->total_sectors, &active_hdr)) {
+        entries = gpt_read_entries_rust(dev, &active_hdr, sector_size);
+        if (!entries)
+          primary_corrupt = true;
+      } else {
+        primary_corrupt = true;
+      }
+    }
+  }
+
+  if (!entries) {
+    uint64_t backup_lba = dev->total_sectors - 1;
+    if (dev->read_sectors(dev, backup_lba, 1, hdr_buf) == 0) {
+      if (memcmp(hdr_buf, GPT_SIGNATURE, 8) == 0) {
+        is_gpt = true;
+        if (rust_gpt_validate_header(hdr_buf, sector_size, backup_lba,
+                                     dev->total_sectors, &active_hdr)) {
+          entries = gpt_read_entries_rust(dev, &active_hdr, sector_size);
+          if (entries && primary_corrupt) {
+            klog_puts("[WARN] Primary GPT corrupted. Recovered partition table "
+                      "from Backup GPT!\n");
+          }
+        }
+      }
+    }
+  }
+
+  kfree(hdr_buf);
+
+  if (!entries) {
+    if (is_gpt) {
+      klog_puts("[FAIL] Both primary and backup GPT tables are corrupted!\n");
+    }
+    return 0;
+  }
+
+  struct partition_range ranges[GPT_MAX_PARTITIONS];
+  int range_count = 0;
+  int count = 0;
+
+  for (uint32_t i = 0; i < active_hdr.num_partition_entries; i++) {
+    const uint8_t *raw_entry =
+        entries + ((size_t)i * active_hdr.partition_entry_size);
+    struct rust_gpt_entry_parsed pe;
+    if (!rust_gpt_parse_entry(raw_entry, active_hdr.partition_entry_size,
+                              active_hdr.first_usable_lba,
+                              active_hdr.last_usable_lba, &pe)) {
+      continue;
+    }
+
+    bool overlap = false;
+    for (int r = 0; r < range_count; r++) {
+      if (!(pe.ending_lba < ranges[r].start ||
+            pe.starting_lba > ranges[r].end)) {
+        overlap = true;
+        break;
+      }
+    }
+    if (overlap) {
+      klog_puts("[WARN] GPT partition overlap detected, skipping entry\n");
+      continue;
+    }
+
+    struct partition_meta meta = {
+        .partuuid = pe.partuuid,
+        .partlabel = pe.partlabel,
+        .type_guid = pe.type_guid,
+        .partition_type = pe.partition_type,
+    };
+
+    if (block_add_partition_ex(dev, i + 1, pe.starting_lba, pe.total_sectors,
+                               &meta) == 0) {
+      if (range_count < GPT_MAX_PARTITIONS) {
+        ranges[range_count].start = pe.starting_lba;
+        ranges[range_count].end = pe.ending_lba;
+        range_count++;
+      }
+      klogf("[  OK  ] %s: GPT part %u: \"%s\" [PARTUUID=%s] (%s)\n",
+            dev->name, i + 1,
+            pe.partlabel[0] ? pe.partlabel : "(unlabeled)",
+            pe.partuuid, gpt_partition_type_str(pe.partition_type));
+      count++;
+    }
+  }
+
+  kfree(entries);
+  return count;
+#else
   struct gpt_header active_hdr;
   uint8_t *entries = NULL;
   bool is_gpt = false;
@@ -398,4 +588,5 @@ int gpt_scan_partitions(struct block_device *dev) {
 
   kfree(entries);
   return count;
+#endif
 }

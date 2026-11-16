@@ -1207,6 +1207,22 @@ void isr_report_user_fault(struct registers *regs, int sig,
         klog_hex64(addr);
         klog_puts(" err=");
         klog_hex64(regs->err_code);
+        klog_puts(" sc=");
+        klog_puts(syscall_get_name(current->last_syscall_num));
+        klog_puts("(");
+        klog_uint64(current->last_syscall_num);
+        klog_puts(") ret=");
+        klog_int64(current->last_syscall_ret);
+        if (current->last_syscall_num == 262 && current->last_syscall_args[1]) {
+          char pbuf[96];
+          extern long strncpy_from_user(char *dst, const char *src, size_t count);
+          if (strncpy_from_user(pbuf, (const char *)current->last_syscall_args[1], sizeof(pbuf)) >= 0) {
+            pbuf[sizeof(pbuf) - 1] = '\0';
+            klog_puts(" path='");
+            klog_puts(pbuf);
+            klog_puts("'");
+          }
+        }
         klog_puts(" count=");
         klog_uint64(seen);
         klog_puts("\n");

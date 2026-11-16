@@ -47,9 +47,33 @@ fi
 mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
 chmod 0700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
 
+# Ensure D-Bus session bus is active BEFORE starting PipeWire / WirePlumber
+# so the audio daemons and Plasma share the same session bus and environment.
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    mkdir -p /run/dbus /var/run/dbus 2>/dev/null || true
+    [ -e /var/run/dbus ] || ln -sf /run/dbus /var/run/dbus 2>/dev/null || true
+    if [ -S /run/dbus/system_bus_socket ]; then
+        export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
+    fi
+    if command -v dbus-run-session >/dev/null 2>&1; then
+        exec dbus-run-session -- "$0" "$@"
+    fi
+fi
+
+if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    dbus-update-activation-environment --all 2>/dev/null || true
+fi
+
+USE_SESSION_AUDIO=0
 if [ -d "$XDG_RUNTIME_DIR/systemd" ]; then
     # A pam_systemd login's user manager runs the stock PipeWire units.
-    :
+    # Ensure they are active before Plasma starts instead of racing socket activation.
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user start pipewire.service wireplumber.service pipewire-pulse.service >/dev/null 2>&1 || true
+    fi
+    if [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ]; then
+        USE_SESSION_AUDIO=1
+    fi
 elif [ "$USER_ID" = 0 ] && [ -S /run/pipewire/pipewire-0 ]; then
     # rcS owns the root graph in /run/pipewire. Route both native and Pulse
     # clients there before the Plasma D-Bus session is created.
@@ -60,6 +84,9 @@ elif [ "$USER_ID" = 0 ] && [ -S /run/pipewire/pipewire-0 ]; then
         unset PULSE_SERVER
     fi
 else
+    USE_SESSION_AUDIO=1
+fi
+if [ "$USE_SESSION_AUDIO" = 1 ]; then
     PIPEWIRE_LOG="$XDG_RUNTIME_DIR/pipewire.log"
     if ! (: >>"$PIPEWIRE_LOG") 2>/dev/null; then
         rm -f "$PIPEWIRE_LOG" 2>/dev/null || true
@@ -78,9 +105,11 @@ else
         if [ "$pw_running" = 0 ]; then
             rm -f "$XDG_RUNTIME_DIR/pipewire-0" "$XDG_RUNTIME_DIR/pipewire-0.lock" 2>/dev/null || true
             XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" nohup pipewire >>"$PIPEWIRE_LOG" 2>&1 &
-            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            i=0
+            while [ "$i" -lt 50 ]; do
                 [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
                 sleep 0.1
+                i=$((i + 1))
             done
         fi
     fi

@@ -431,6 +431,25 @@ override OBJ += $(KPI_OBJ) $(LINUX_TEST_OBJ)
 override HEADER_DEPS := $(addprefix obj-$(ARCH)/,$(CFILES:.c=.c.d) $(ASFILES:.S=.S.d))
 override HEADER_DEPS += $(LINUX_OBJ:.o=.d) $(KPI_OBJ:.o=.d) $(LINUX_TEST_OBJ:.o=.d)
 
+USE_RUST ?= 1
+RUST_LIB :=
+ifeq ($(ARCH),x86_64)
+ifeq ($(USE_RUST),1)
+    RUST_TARGET := x86_64-unknown-none
+    RUST_LIB := rust/target/$(RUST_TARGET)/release/libavory_rust.a
+    RUST_SRCS := $(shell find -L rust/src -type f -name '*.rs' 2>/dev/null | LC_ALL=C sort)
+    obj-$(ARCH)/src/net/tcp.c.o: override CPPFLAGS += -DUSE_RUST_NET=1
+    obj-$(ARCH)/src/net/ipv4.c.o: override CPPFLAGS += -DUSE_RUST_NET=1
+    obj-$(ARCH)/src/net/ipv6.c.o: override CPPFLAGS += -DUSE_RUST_NET=1
+    obj-$(ARCH)/src/drivers/storage/mbr.c.o: override CPPFLAGS += -DUSE_RUST_STORAGE=1
+    obj-$(ARCH)/src/drivers/storage/gpt.c.o: override CPPFLAGS += -DUSE_RUST_STORAGE=1
+    obj-$(ARCH)/src/sched/process.c.o: override CPPFLAGS += -DUSE_RUST_ELF=1
+    obj-$(ARCH)/src/acpi/acpi.c.o: override CPPFLAGS += -DUSE_RUST_ACPI=1
+    obj-$(ARCH)/src/fs/ext4/ext4_mount.c.o: override CPPFLAGS += -DUSE_RUST_EXT4=1
+    obj-$(ARCH)/src/fs/ext4/ext4_extent.c.o: override CPPFLAGS += -DUSE_RUST_EXT4=1
+endif
+endif
+
 .PHONY: all
 all: bin-$(ARCH)/$(OUTPUT)
 
@@ -486,9 +505,14 @@ obj-$(ARCH)/src/syscalls/vdso_blob.asm.o: src/syscalls/vdso_blob.asm src/syscall
 	mkdir -p "$(dir $@)"
 	nasm -I src/syscalls/ $(NASMFLAGS) $< -o $@
 
-bin-$(ARCH)/$(OUTPUT): GNUmakefile linker-scripts/$(ARCH).lds $(OBJ) $(LINUX_OBJ)
+ifneq ($(RUST_LIB),)
+$(RUST_LIB): rust/Cargo.toml rust/.cargo/config.toml $(RUST_SRCS)
+	cargo build --manifest-path rust/Cargo.toml --release --target $(RUST_TARGET)
+endif
+
+bin-$(ARCH)/$(OUTPUT): GNUmakefile linker-scripts/$(ARCH).lds $(OBJ) $(LINUX_OBJ) $(RUST_LIB)
 	mkdir -p "$(dir $@)"
-	$(LD) $(LDFLAGS) $(OBJ) $(LINUX_OBJ) -o $@
+	$(LD) $(LDFLAGS) $(OBJ) $(LINUX_OBJ) $(RUST_LIB) -o $@
 
 obj-$(ARCH)/%.c.o: %.c GNUmakefile
 	mkdir -p "$(dir $@)"

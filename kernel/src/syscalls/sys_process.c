@@ -192,12 +192,7 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t a1, uint64_t a2,
   }
 
   // If validation passes, update thread
-  if (current->cwd_node)
-    vfs_close(current->cwd_node);
-  current->cwd_node = node; // vfs_resolve_path_at already opened it
-
-  strncpy(current->cwd_path, new_path, 255);
-  current->cwd_path[255] = '\0';
+  sched_set_cwd(current, node, new_path);
 
   return 0; // Success
 }

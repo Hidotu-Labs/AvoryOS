@@ -1439,11 +1439,9 @@ static uint64_t sys_fchdir(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4,
 
     const char *fd_path = fd_path_value(t, (int)fd);
     if (fd_path && fd_path[0]) {
-        strncpy(t->cwd_path, fd_path, sizeof(t->cwd_path) - 1);
-        t->cwd_path[sizeof(t->cwd_path) - 1] = '\0';
-        if (t->cwd_node) vfs_close(t->cwd_node);
-        t->cwd_node = t->fds[fd];
-        vfs_open(t->cwd_node);
+        vfs_node_t *node = t->fds[fd];
+        vfs_open(node);
+        sched_set_cwd(t, node, fd_path);
         return 0;
     }
     return (uint64_t)-9;

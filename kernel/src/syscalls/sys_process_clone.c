@@ -98,26 +98,21 @@ void vfork_release_parent(struct thread *child) {
     return;
   struct thread *parent = child->parent;
   if (parent) {
-    /* Pair completion with the waiter's check-and-block under its runqueue
-     * lock. Publishing the flag and inspecting state without that handshake
-     * can miss a parent that is just about to sleep. Started threads remain
-     * on their owning CPU (sched_wakeup uses the same queue_lock). */
-    struct cpu_info *cpu = cpu_get_info(parent->cpu_index);
-    spinlock_acquire(&cpu->queue_lock);
-    parent->vfork_release_tsc = rdtsc_fence();
+    /* Publish completion before waking parent. sched_wakeup() takes the
+     * parent's actual current runqueue lock (handling any concurrent CPU
+     * migration), so calling it unconditionally pairs with vfork_wait_for_child()
+     * checking vfork_done under cpu->queue_lock without ever locking a stale
+     * cpu_index. */
+    __atomic_store_n(&parent->vfork_release_tsc, rdtsc_fence(),
+                     __ATOMIC_RELAXED);
     __atomic_store_n(&parent->vfork_done, true, __ATOMIC_RELEASE);
-    bool wake = parent->state == THREAD_BLOCKED;
-    spinlock_release(&cpu->queue_lock);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     ptrace_vfork_done(parent, child->tid);
-    /* sched_wakeup takes queue_lock itself; never call it while holding it. */
-    if (wake) {
-      sched_wakeup(parent);
-      /* The same-CPU child should give the waiting launcher a scheduling
-       * opportunity at syscall exit, even when normal wakeup fairness would
-       * let the child keep its slice. No context switch while holding locks. */
-      if (cpu == cpu_get_current() && cpu->current_thread == child)
-        __atomic_store_n(&child->need_resched, true, __ATOMIC_RELEASE);
-    }
+    sched_wakeup(parent);
+    struct cpu_info *cpu = cpu_get_current();
+    if (cpu && cpu->current_thread == child &&
+        __atomic_load_n(&parent->cpu_index, __ATOMIC_RELAXED) == cpu->cpu_id)
+      __atomic_store_n(&child->need_resched, true, __ATOMIC_RELEASE);
   }
   child->clone_flags &= ~CLONE_VFORK;
 }
@@ -127,14 +122,20 @@ static void vfork_wait_for_child(struct thread *parent) {
   uint64_t released_at = 0;
   for (;;) {
     struct cpu_info *cpu = cpu_get_current();
+    hal_irq_state_t irq = hal_irq_save();
     spinlock_acquire(&cpu->queue_lock);
+    __atomic_store_n(&parent->state, THREAD_BLOCKED, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (__atomic_load_n(&parent->vfork_done, __ATOMIC_ACQUIRE)) {
-      released_at = parent->vfork_release_tsc;
+      __atomic_store_n(&parent->state, THREAD_RUNNING, __ATOMIC_RELEASE);
+      released_at = __atomic_load_n(&parent->vfork_release_tsc,
+                                     __ATOMIC_RELAXED);
       spinlock_release(&cpu->queue_lock);
+      hal_irq_restore(irq);
       break;
     }
-    parent->state = THREAD_BLOCKED;
     spinlock_release(&cpu->queue_lock);
+    hal_irq_restore(irq);
     /* A completion after unlock makes us runnable before yield, or wakes us
      * after the switch. Spurious signal wakeups simply repeat the handshake. */
     sched_yield();
@@ -229,6 +230,9 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   struct thread *parent = sched_get_current();
   if (!regs || !parent || !parent->mm)
     return (uint64_t)-22;
+
+  if (!cgroupfs_can_fork(parent, NULL))
+    return (uint64_t)-11; /* -EAGAIN */
 
   // 2. Clone the user address space with VMA awareness
   //    Shared mappings share physical pages, private mappings get copied
@@ -411,6 +415,8 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   /* Linux clone flag dependencies. */
   if ((flags & CLONE_SIGHAND) && !(flags & CLONE_VM))
     return (uint64_t)-22;
+  if (!(flags & CLONE_THREAD) && !cgroupfs_can_fork(parent, cgroup_dir))
+    return (uint64_t)-11; /* -EAGAIN */
   if ((flags & CLONE_THREAD) && !(flags & CLONE_SIGHAND))
     return (uint64_t)-22;
   /* Reject combined sandbox requests until every requested namespace exists.
@@ -681,6 +687,8 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     return (uint64_t)ns_error;
   }
   new_mount = NULL;
+  if (flags & CLONE_FS)
+    sched_share_fs(child, parent);
   if (new_net) { net_namespace_install(child, new_net); new_net = NULL; }
   uint32_t visible_child_tid = pid_namespace_tid(parent, child);
   if (flags & CLONE_PARENT_SETTID)
@@ -766,6 +774,9 @@ uint64_t sys_vfork(struct syscall_regs *regs) {
   struct thread *parent = sched_get_current();
   if (!regs || !parent || !parent->mm)
     return (uint64_t)-22;
+
+  if (!cgroupfs_can_fork(parent, NULL))
+    return (uint64_t)-11; /* -EAGAIN */
 
   // Child register state: returns 0 in the child, same user stack as parent.
   struct syscall_regs *child_regs = kmalloc(sizeof(*child_regs));

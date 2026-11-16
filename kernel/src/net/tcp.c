@@ -2037,6 +2037,52 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
 /* Option parsing                                                      */
 /* ------------------------------------------------------------------ */
 
+#ifdef USE_RUST_NET
+struct rust_tcp_options {
+    uint16_t mss;
+    uint8_t wscale;
+    bool has_mss;
+    bool has_wscale;
+};
+
+struct rust_tcp_segment {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq;
+    uint32_t ack;
+    uint16_t raw_wnd;
+    uint8_t flags;
+    uint8_t _pad;
+    size_t header_len;
+    size_t payload_len;
+    struct rust_tcp_options options;
+};
+
+#define RUST_TCP_PARSE_OK       0
+#define RUST_TCP_PARSE_MALFORMED 1
+#define RUST_TCP_PARSE_BAD_CSUM 2
+
+extern int rust_tcp_parse_segment_v4(uint32_t src_ip, uint32_t dst_ip,
+                                     const uint8_t *seg, size_t len,
+                                     struct rust_tcp_segment *out);
+extern int rust_tcp_parse_segment_v6(const uint8_t src_ip[16],
+                                     const uint8_t dst_ip[16],
+                                     const uint8_t *seg, size_t len,
+                                     struct rust_tcp_segment *out);
+extern bool rust_tcp_parse_options(const uint8_t *header, size_t header_len,
+                                   struct rust_tcp_options *out);
+
+static void apply_rust_options_locked(struct tcp_tcb *t,
+                                      const struct rust_tcp_options *opts)
+{
+    if (opts->has_mss)
+        t->mss = opts->mss;
+    if (opts->has_wscale)
+        t->snd_wscale = opts->wscale;
+    else
+        t->rcv_wscale = 0; /* peer cannot scale our window */
+}
+#else
 static bool parse_options_locked(struct tcp_tcb *t, const uint8_t *p,
                                  size_t header_len)
 {
@@ -2070,6 +2116,7 @@ static bool parse_options_locked(struct tcp_tcb *t, const uint8_t *p,
     }
     return ws_seen;
 }
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Packet input                                                        */
@@ -2077,6 +2124,25 @@ static bool parse_options_locked(struct tcp_tcb *t, const uint8_t *p,
 
 void tcp_input_ipv4(uint32_t s, uint32_t d, const uint8_t *p, size_t len)
 {
+#ifdef USE_RUST_NET
+    struct rust_tcp_segment seg;
+    int parse_rc = rust_tcp_parse_segment_v4(s, d, p, len, &seg);
+    if (parse_rc == RUST_TCP_PARSE_MALFORMED) {
+        stats.malformed++;
+        return;
+    }
+    if (parse_rc != RUST_TCP_PARSE_OK) {
+        stats.bad_checksum++;
+        return;
+    }
+    size_t header_len = seg.header_len;
+    uint16_t sp = seg.src_port;
+    uint16_t dp = seg.dst_port;
+    uint8_t flags = seg.flags;
+    uint32_t seq = seg.seq;
+    uint32_t ack = seg.ack;
+    uint32_t raw_wnd = seg.raw_wnd;
+#else
     if (!p || len < 20) {
         stats.malformed++;
         return;
@@ -2099,6 +2165,7 @@ void tcp_input_ipv4(uint32_t s, uint32_t d, const uint8_t *p, size_t len)
     uint32_t seq = g32(p + 4);
     uint32_t ack = g32(p + 8);
     uint32_t raw_wnd = g16(p + 14);
+#endif
 
     spinlock_acquire(&lock);
 
@@ -2107,11 +2174,15 @@ void tcp_input_ipv4(uint32_t s, uint32_t d, const uint8_t *p, size_t len)
         t->refs++;
         stats.rx_segments++;
         if (flags & SYN) {
+#ifdef USE_RUST_NET
+            apply_rust_options_locked(t, &seg.options);
+#else
             bool ws = false;
             if (header_len > 20)
                 ws = parse_options_locked(t, p, header_len);
             if (!ws)
                 t->rcv_wscale = 0; /* peer cannot scale our window */
+#endif
         }
 
         struct tcp_rx_actions act = {0};
@@ -2163,11 +2234,15 @@ void tcp_input_ipv4(uint32_t s, uint32_t d, const uint8_t *p, size_t len)
                 child->deadline =
                     lapic_timer_get_ticks() + child->rto_ms;
                 child->last_activity = lapic_timer_get_ticks();
+#ifdef USE_RUST_NET
+                apply_rust_options_locked(child, &seg.options);
+#else
                 bool ws = false;
                 if (header_len > 20)
                     ws = parse_options_locked(child, p, header_len);
                 if (!ws)
                     child->rcv_wscale = 0;
+#endif
                 hash_insert_locked(child);
                 lis->syn_backlog++;
                 child->syn_accounted = true;
@@ -2193,6 +2268,25 @@ void tcp_input_ipv4(uint32_t s, uint32_t d, const uint8_t *p, size_t len)
 void tcp_input_ipv6(const uint8_t s[16], const uint8_t d[16],
                     const uint8_t *p, size_t len)
 {
+#ifdef USE_RUST_NET
+    struct rust_tcp_segment seg;
+    int parse_rc = rust_tcp_parse_segment_v6(s, d, p, len, &seg);
+    if (parse_rc == RUST_TCP_PARSE_MALFORMED) {
+        stats.malformed++;
+        return;
+    }
+    if (parse_rc != RUST_TCP_PARSE_OK) {
+        stats.bad_checksum++;
+        return;
+    }
+    size_t header_len = seg.header_len;
+    uint16_t sp = seg.src_port;
+    uint16_t dp = seg.dst_port;
+    uint8_t flags = seg.flags;
+    uint32_t seq = seg.seq;
+    uint32_t ack = seg.ack;
+    uint32_t raw_wnd = seg.raw_wnd;
+#else
     if (!p || len < 20) {
         stats.malformed++;
         return;
@@ -2214,6 +2308,7 @@ void tcp_input_ipv6(const uint8_t s[16], const uint8_t d[16],
     uint32_t seq = g32(p + 4);
     uint32_t ack = g32(p + 8);
     uint32_t raw_wnd = g16(p + 14);
+#endif
 
     spinlock_acquire(&lock);
 
@@ -2222,11 +2317,15 @@ void tcp_input_ipv6(const uint8_t s[16], const uint8_t d[16],
         t->refs++;
         stats.rx_segments++;
         if (flags & SYN) {
+#ifdef USE_RUST_NET
+            apply_rust_options_locked(t, &seg.options);
+#else
             bool ws = false;
             if (header_len > 20)
                 ws = parse_options_locked(t, p, header_len);
             if (!ws)
                 t->rcv_wscale = 0; /* peer cannot scale our window */
+#endif
         }
 
         struct tcp_rx_actions act = {0};
@@ -2278,11 +2377,15 @@ void tcp_input_ipv6(const uint8_t s[16], const uint8_t d[16],
                 child->deadline =
                     lapic_timer_get_ticks() + child->rto_ms;
                 child->last_activity = lapic_timer_get_ticks();
+#ifdef USE_RUST_NET
+                apply_rust_options_locked(child, &seg.options);
+#else
                 bool ws = false;
                 if (header_len > 20)
                     ws = parse_options_locked(child, p, header_len);
                 if (!ws)
                     child->rcv_wscale = 0;
+#endif
                 hash_insert_locked(child);
                 lis->syn_backlog++;
                 child->syn_accounted = true;

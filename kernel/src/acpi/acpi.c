@@ -56,13 +56,43 @@ static void print_hex32(uint32_t num) {
   }
 }
 
+#ifdef USE_RUST_ACPI
+struct rust_acpi_iso_entry {
+  uint8_t irq_source;
+  uint8_t _pad;
+  uint16_t flags;
+  uint32_t gsi;
+};
+
+struct rust_acpi_madt_parsed {
+  uint32_t lapic_base_address;
+  uint32_t ioapic_address;
+  uint32_t ioapic_gsi;
+  bool has_ioapic;
+  uint32_t cpu_count;
+  uint8_t cpu_apic_ids[MAX_CPUS_ACPI];
+  uint32_t iso_count;
+  struct rust_acpi_iso_entry iso_entries[MAX_ISOS];
+};
+
+extern bool rust_acpi_validate_checksum(const void *table, size_t length);
+extern bool rust_acpi_parse_rsdp(const void *rsdp, bool *out_use_xsdt,
+                                 uint64_t *out_sdt_phys);
+extern bool rust_acpi_parse_madt(const void *madt, size_t madt_len,
+                                 struct rust_acpi_madt_parsed *out);
+#endif
+
 static bool acpi_validate_checksum(void *table, size_t length) {
+#ifdef USE_RUST_ACPI
+  return rust_acpi_validate_checksum(table, length);
+#else
   uint8_t *bytes = (uint8_t *)table;
   uint8_t sum = 0;
   for (size_t i = 0; i < length; i++) {
     sum += bytes[i];
   }
   return sum == 0;
+#endif
 }
 
 // Table lookup
@@ -446,6 +476,18 @@ void acpi_init(struct limine_rsdp_response *response) {
 
   rsdp = (struct acpi_rsdp *)rsdp_response->address;
 
+#ifdef USE_RUST_ACPI
+  uint64_t sdt_phys = 0;
+  if (!rust_acpi_parse_rsdp(rsdp, &use_xsdt, &sdt_phys)) {
+    console_puts("[ERR] RSDP Checksum invalid!\n");
+    return;
+  }
+  root_sdt = (struct acpi_sdt_header *)(sdt_phys + pmm_get_hhdm_offset());
+  if (use_xsdt)
+    console_puts("[OK] ACPI 2.0+ (XSDT) detected.\n");
+  else
+    console_puts("[OK] ACPI 1.0 (RSDT) detected.\n");
+#else
   if (rsdp->revision >= 2) {
     struct acpi_rsdp_ext *rsdp_ext = (struct acpi_rsdp_ext *)rsdp;
     if (acpi_validate_checksum(rsdp_ext, rsdp_ext->length)) {
@@ -468,6 +510,7 @@ void acpi_init(struct limine_rsdp_response *response) {
       return;
     }
   }
+#endif
 
   if (!acpi_validate_checksum(root_sdt, root_sdt->length)) {
     console_puts("[ERR] Root SDT Checksum invalid!\n");
@@ -483,6 +526,57 @@ void acpi_init(struct limine_rsdp_response *response) {
 
   console_puts("[OK] MADT table found.\n");
 
+#ifdef USE_RUST_ACPI
+  struct rust_acpi_madt_parsed madt_parsed;
+  if (!rust_acpi_parse_madt(madt, madt->header.length, &madt_parsed)) {
+    console_puts("[ERR] MADT parse failed.\n");
+    return;
+  }
+
+  lapic_base_address = madt_parsed.lapic_base_address;
+  console_puts("     Local APIC Base: 0x");
+  print_hex32(lapic_base_address);
+  console_puts("\n");
+
+  struct device *sys_node = device_find_by_path("/sys");
+  struct device *lapic_dev = device_create(sys_node, "lapic");
+  device_add_resource(lapic_dev, RES_MEM, "regs", lapic_base_address,
+                      lapic_base_address + 0x400);
+
+  uint32_t core_count = madt_parsed.cpu_count;
+  uint32_t copy_cpus = core_count < MAX_CPUS_ACPI ? core_count : MAX_CPUS_ACPI;
+  for (uint32_t i = 0; i < copy_cpus; i++) {
+    cpu_apic_ids[i] = madt_parsed.cpu_apic_ids[i];
+  }
+
+  if (madt_parsed.has_ioapic) {
+    ioapic_address = madt_parsed.ioapic_address;
+    ioapic_gsi = madt_parsed.ioapic_gsi;
+    console_puts("\n");
+    char ioapic_name[16];
+    strcpy(ioapic_name, "ioapic0");
+    struct device *ioapic_dev =
+        device_create(device_find_by_path("/sys"), ioapic_name);
+    device_add_resource(ioapic_dev, RES_MEM, "regs", ioapic_address,
+                        ioapic_address + 0x20);
+    device_add_resource(ioapic_dev, RES_IRQ, "gsi_base", ioapic_gsi,
+                        ioapic_gsi);
+  }
+
+  for (uint32_t i = 0; i < madt_parsed.iso_count && iso_count < MAX_ISOS; i++) {
+    iso_entries[iso_count].irq_source = madt_parsed.iso_entries[i].irq_source;
+    iso_entries[iso_count].gsi = madt_parsed.iso_entries[i].gsi;
+    iso_entries[iso_count].flags = madt_parsed.iso_entries[i].flags;
+    iso_count++;
+    console_puts("     ISO: IRQ");
+    print_uint32(madt_parsed.iso_entries[i].irq_source);
+    console_puts(" -> GSI ");
+    print_uint32(madt_parsed.iso_entries[i].gsi);
+    console_puts(" (flags=0x");
+    print_hex32(madt_parsed.iso_entries[i].flags);
+    console_puts(")\n");
+  }
+#else
   // Save the Local APIC physical base from the MADT header
   lapic_base_address = madt->local_apic_address;
   console_puts("     Local APIC Base: 0x");
@@ -559,6 +653,7 @@ void acpi_init(struct limine_rsdp_response *response) {
       break; // prevent infinite loop on corrupt table
     entries += header->length;
   }
+#endif
 
   cpu_count = core_count;
 

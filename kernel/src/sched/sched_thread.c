@@ -1078,3 +1078,65 @@ int sched_get_mount_snapshot(uint32_t tid, vfs_mount_info_t *mounts, int count) 
   spinlock_release(&tid_lock);
   return result;
 }
+
+static uint64_t next_fs_share_id = 1;
+
+void sched_share_fs(struct thread *child, struct thread *parent) {
+  if (!child || !parent)
+    return;
+  spinlock_acquire(&tid_lock);
+  uint64_t id = parent->fs_share_id;
+  if (!id) {
+    id = next_fs_share_id++;
+    if (!id)
+      id = next_fs_share_id++;
+    parent->fs_share_id = id;
+  }
+  child->fs_share_id = id;
+  spinlock_release(&tid_lock);
+}
+
+void sched_set_cwd(struct thread *t, vfs_node_t *node, const char *path) {
+  if (!t || !node || !path)
+    return;
+  uint64_t share_id = __atomic_load_n(&t->fs_share_id, __ATOMIC_ACQUIRE);
+  if (!share_id) {
+    vfs_node_t *old = t->cwd_node;
+    t->cwd_node = node;
+    strncpy(t->cwd_path, path, sizeof(t->cwd_path) - 1);
+    t->cwd_path[sizeof(t->cwd_path) - 1] = '\0';
+    if (old)
+      vfs_close(old);
+    return;
+  }
+
+  vfs_node_t *olds[64];
+  int old_count = 0;
+  bool updated_self = false;
+  spinlock_acquire(&tid_lock);
+  for (struct thread *it = global_thread_list; it; it = it->global_next) {
+    if (it->fs_share_id == share_id) {
+      vfs_node_t *old = it->cwd_node;
+      if (it != t)
+        vfs_open(node);
+      else
+        updated_self = true;
+      it->cwd_node = node;
+      strncpy(it->cwd_path, path, sizeof(it->cwd_path) - 1);
+      it->cwd_path[sizeof(it->cwd_path) - 1] = '\0';
+      if (old && old_count < 64)
+        olds[old_count++] = old;
+    }
+  }
+  if (!updated_self) {
+    vfs_node_t *old = t->cwd_node;
+    t->cwd_node = node;
+    strncpy(t->cwd_path, path, sizeof(t->cwd_path) - 1);
+    t->cwd_path[sizeof(t->cwd_path) - 1] = '\0';
+    if (old && old_count < 64)
+      olds[old_count++] = old;
+  }
+  spinlock_release(&tid_lock);
+  for (int i = 0; i < old_count; i++)
+    vfs_close(olds[i]);
+}

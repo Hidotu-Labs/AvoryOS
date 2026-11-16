@@ -1,4 +1,19 @@
 #include "sched.h"
+#include "eevfd_math.h"
+#include "../fs/cgroupfs.h"
+
+static inline void sched_sync_cgroup_weight(struct thread *t) {
+  if (!t || t->is_idle)
+    return;
+  int effective = t->se.critical_depth ? -20 : t->se.nice_value;
+  uint32_t base_w = nice_to_weight(effective);
+  uint32_t eff_w = cgroupfs_effective_cpu_weight(t, base_w);
+  if (eff_w != t->se.weight) {
+    t->se.weight = eff_w;
+    t->se.wmult = (eff_w == base_w) ? nice_to_wmult(effective)
+                                    : (uint32_t)((1ULL << 32) / eff_w);
+  }
+}
 #include "sched_internal.h"
 #include "hal/hal.h"
 #include "../apic/lapic.h"
@@ -67,6 +82,8 @@ static void sched_account_cpu_time_locked(struct cpu_info *cpu, uint64_t now_ms)
       __atomic_fetch_add(&current->runtime_user_ms, elapsed,
                          __ATOMIC_RELAXED);
     }
+    cgroupfs_account_cpu_tick(current, elapsed * 1000000ULL,
+                              lapic_timer_get_ns(), !system);
   }
 }
 
@@ -544,6 +561,7 @@ __attribute__((optimize("O3"))) void sched_enqueue_thread(struct thread *t, stru
   }
 
   t->ready_since_ms = lapic_timer_get_ms();
+  sched_sync_cgroup_weight(t);
   eevfd_place_entity(&target_cpu->eevfd, &t->se, (t->se.vruntime == 0));
   eevfd_enqueue_entity(&target_cpu->eevfd, &t->se);
   t->on_runqueue = true;
@@ -666,6 +684,7 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
         }
       }
       __atomic_store_n(&prev->cpu_index, cpu->cpu_id, __ATOMIC_RELEASE);
+      sched_sync_cgroup_weight(prev);
       eevfd_enqueue_entity(&cpu->eevfd, &prev->se);
       prev->on_runqueue = true;
     }
@@ -697,10 +716,18 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
   // serializes dispatch with sched_prepare_thread_reap().
   struct sched_entity *next_se;
   struct thread *next_t = NULL;
+  struct thread *throttled[16];
+  int throttled_count = 0;
   while ((next_se = eevfd_pick_next_entity(&cpu->eevfd)) != NULL) {
     struct thread *candidate = rb_entry(next_se, struct thread, se);
     uint8_t state = __atomic_load_n(&candidate->state, __ATOMIC_ACQUIRE);
     if (state != THREAD_DEAD && state != THREAD_ZOMBIE) {
+      if (cgroupfs_is_throttled_or_frozen(candidate, now_ns) &&
+          throttled_count < 16) {
+        eevfd_dequeue_entity(&cpu->eevfd, &candidate->se);
+        throttled[throttled_count++] = candidate;
+        continue;
+      }
       next_t = candidate;
       break;
     }
@@ -710,6 +737,9 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
     candidate->on_runqueue = false;
     if (__atomic_load_n(&cpu->runnable_count, __ATOMIC_RELAXED))
       __atomic_sub_fetch(&cpu->runnable_count, 1, __ATOMIC_RELEASE);
+  }
+  for (int ti = 0; ti < throttled_count; ti++) {
+    eevfd_enqueue_entity(&cpu->eevfd, &throttled[ti]->se);
   }
 
   // 3. Perform the switch
@@ -1045,6 +1075,7 @@ __attribute__((optimize("O3"))) void sched_tick(struct registers *regs) {
     if (cpu == cpu_get_bsp()) {
       extern void posix_timer_tick(void);
       posix_timer_tick();
+      psi_tick(now_ns);
       /* Skip tid_lock and thread list traversal entirely when no itimers are
        * active or when the earliest deadline has not arrived yet. */
       if (__atomic_load_n(&active_itimer_count, __ATOMIC_RELAXED) > 0) {
@@ -1114,6 +1145,9 @@ __attribute__((optimize("O3"))) void sched_tick(struct registers *regs) {
     }
 
     if (curr->is_idle && cpu->eevfd.nr_running > 0) {
+      preempt = true;
+    } else if (!curr->is_idle &&
+               cgroupfs_is_throttled_or_frozen(curr, now_ns)) {
       preempt = true;
     } else if (!curr->is_idle && cpu->eevfd.nr_running > 0) {
       uint64_t exec_delta = eevfd_curr_runtime(&cpu->eevfd, &curr->se, now_ns);

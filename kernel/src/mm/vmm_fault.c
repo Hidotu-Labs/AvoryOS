@@ -1,3 +1,4 @@
+#include "../fs/cgroupfs.h"
 #include "../fs/tmpfs.h"
 #include "mm/zram.h"
 
@@ -542,6 +543,15 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
    * allocator reaches zero (see vmm_fault_watermark_reclaim()). */
   if (user_mode)
     vmm_fault_watermark_reclaim();
+
+  if (user_mode && !present_bit &&
+      __atomic_load_n(&current->cgroup, __ATOMIC_RELAXED)) {
+    bool irq_state = pf_enable_irqs_for_wait();
+    int cg_rc = cgroupfs_mem_try_charge(current, PAGE_SIZE);
+    pf_restore_irqs_after_wait(irq_state);
+    if (cg_rc < 0)
+      return 0; /* SIGKILL already queued by cgroup OOM killer */
+  }
 
   /* Swap faults must precede anonymous zero-fill/fault-around: a
    * compressed non-present PTE is data, never an empty mapping. */

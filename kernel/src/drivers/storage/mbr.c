@@ -2,6 +2,26 @@
 #include "drivers/storage/block.h"
 #include "mm/heap.h"
 
+#ifdef USE_RUST_STORAGE
+struct rust_mbr_partition {
+  uint32_t start_lba;
+  uint32_t total_sectors;
+  uint8_t part_type;
+  bool active;
+};
+
+struct rust_mbr_result {
+  bool valid;
+  bool is_pmbr;
+  bool is_hybrid_mbr;
+  size_t count;
+  struct rust_mbr_partition partitions[MBR_PARTITION_COUNT];
+};
+
+extern bool rust_mbr_parse_sector(const uint8_t *sector, size_t len,
+                                  struct rust_mbr_result *out);
+#endif
+
 int mbr_scan_partitions(struct block_device *dev) {
   if (!dev || !dev->read_sectors)
     return -1;
@@ -21,6 +41,24 @@ int mbr_scan_partitions(struct block_device *dev) {
     return -1;
   }
 
+#ifdef USE_RUST_STORAGE
+  struct rust_mbr_result parsed;
+  if (!rust_mbr_parse_sector((const uint8_t *)mbr, sector_size, &parsed)) {
+    kfree(mbr);
+    return -1;
+  }
+
+  int count = 0;
+  for (int i = 0; i < MBR_PARTITION_COUNT; i++) {
+    const struct rust_mbr_partition *p = &parsed.partitions[i];
+    if (p->part_type == 0 || p->total_sectors == 0)
+      continue;
+
+    if (block_add_partition(dev, i + 1, p->start_lba, p->total_sectors) == 0) {
+      count++;
+    }
+  }
+#else
   if (mbr->signature != MBR_SIGNATURE) {
     kfree(mbr);
     return -1;
@@ -36,6 +74,7 @@ int mbr_scan_partitions(struct block_device *dev) {
       count++;
     }
   }
+#endif
 
   kfree(mbr);
   return count;

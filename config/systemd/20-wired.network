@@ -1,0 +1,5 @@
+[Match]
+Name=eth* en*
+
+[Network]
+DHCP=ipv4

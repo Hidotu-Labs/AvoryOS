@@ -233,6 +233,53 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
   TSC_BEGIN(elf_phdr);
   // Normalize the ELF32 header; the segment mapper uses 64-bit arithmetic.
   Elf64_Ehdr ehdr = {0};
+#ifdef USE_RUST_ELF
+  struct rust_elf_header_norm {
+    bool compat32;
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+  };
+  struct rust_elf_load_layout {
+    uint64_t vaddr;
+    uint64_t seg_end;
+    uint64_t start_page;
+    uint64_t end_page;
+    uint64_t vma_offset;
+    uint64_t vma_file_size;
+  };
+  extern bool rust_elf_parse_header(const uint8_t *hdr, size_t hdr_len,
+                                    uint64_t file_length,
+                                    struct rust_elf_header_norm *out);
+  extern bool rust_elf_validate_pt_load(bool compat32, uint64_t load_base,
+                                        uint64_t file_length, uint64_t p_offset,
+                                        uint64_t p_vaddr, uint64_t p_filesz,
+                                        uint64_t p_memsz,
+                                        struct rust_elf_load_layout *out);
+
+  uint8_t raw_ehdr[sizeof(Elf64_Ehdr)];
+  int64_t ehdr_read = vfs_read(file, 0, sizeof(raw_ehdr), raw_ehdr);
+  if (ehdr_read < (int64_t)sizeof(Elf32_Ehdr))
+    goto bad_header;
+  struct rust_elf_header_norm norm;
+  if (!rust_elf_parse_header(raw_ehdr, (size_t)ehdr_read, file->length, &norm))
+    goto bad_header;
+  bool compat32 = norm.compat32;
+  ehdr.e_type = norm.e_type;
+  ehdr.e_machine = norm.e_machine;
+  ehdr.e_version = norm.e_version;
+  ehdr.e_entry = norm.e_entry;
+  ehdr.e_phoff = norm.e_phoff;
+  ehdr.e_ehsize = norm.e_ehsize;
+  ehdr.e_phentsize = norm.e_phentsize;
+  ehdr.e_phnum = norm.e_phnum;
+  size_t phdr_size = compat32 ? sizeof(Elf32_Phdr) : sizeof(Elf64_Phdr);
+#else
   uint8_t ident[16];
   if (vfs_read(file, 0, sizeof(ident), ident) != sizeof(ident) ||
       ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' ||
@@ -260,6 +307,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
       ehdr.e_phentsize < phdr_size || ehdr.e_phoff > UINT32_MAX ||
       ehdr.e_phoff + (uint64_t)ehdr.e_phnum * ehdr.e_phentsize > file->length)
     goto bad_header;
+#endif
   if (compat32 && is_interp)
     requested_base = ELF32_INTERP_BASE;
 
@@ -316,6 +364,18 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
       vfs_close(file);
       return false;
     }
+#ifdef USE_RUST_ELF
+    struct rust_elf_load_layout load_layout;
+    if (phdr.p_type == PT_LOAD &&
+        !rust_elf_validate_pt_load(compat32, load_base, file->length,
+                                   phdr.p_offset, phdr.p_vaddr,
+                                   phdr.p_filesz, phdr.p_memsz,
+                                   &load_layout)) {
+      if (phdr_tab) kfree(phdr_tab);
+      vfs_close(file);
+      return false;
+    }
+#else
     uint64_t user_limit = compat32 ? ELF32_USER_LIMIT : 0x800000000000ULL;
     if (phdr.p_type == PT_LOAD &&
         (phdr.p_filesz > phdr.p_memsz || phdr.p_offset > UINT32_MAX ||
@@ -330,6 +390,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
       vfs_close(file);
       return false;
     }
+#endif
 
     // Collect interpreter path from PT_INTERP.
     if (phdr.p_type == PT_INTERP && interp_path) {
@@ -357,6 +418,25 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
     if (phdr.p_type != PT_LOAD)
       continue;
 
+#ifdef USE_RUST_ELF
+    uint64_t memsz = phdr.p_memsz;
+    uint64_t filesz = phdr.p_filesz;
+
+    // Track uppermost loaded address for the main program brk base.
+    if (!is_interp && current_thread && current_thread->mm) {
+      uint64_t seg_end = load_layout.seg_end;
+      if (seg_end > current_thread->mm->brk_base) {
+        current_thread->mm->brk_base = seg_end;
+        current_thread->mm->brk_current = seg_end;
+      }
+    }
+
+    if (memsz > 0) {
+      uint64_t start_page = load_layout.start_page;
+      uint64_t end_page = load_layout.end_page;
+      uint64_t vma_offset = load_layout.vma_offset;
+      uint64_t vma_file_size = load_layout.vma_file_size;
+#else
     uint64_t vaddr = load_base + phdr.p_vaddr;
     uint64_t memsz = phdr.p_memsz;
     uint64_t filesz = phdr.p_filesz;
@@ -376,6 +456,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
       uint64_t end_page = (vaddr + memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
       uint64_t vma_offset = file_offset - (vaddr - start_page);
       uint64_t vma_file_size = (vaddr - start_page) + filesz;
+#endif
 
       // Register segment in VMA list for lazy demand paging via page fault.
       if (current_thread && current_thread->mm) {

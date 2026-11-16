@@ -143,6 +143,29 @@ if [ -x /usr/bin/seatd ]; then
 fi
 eend "$SEATD_OK"
 
+# systemd-networkd handles userland DHCP when in-kernel DHCP is disabled.
+ebegin "Starting systemd-networkd"
+NETWORKD_OK=1
+if [ -x /usr/lib/systemd/systemd-networkd ]; then
+    mkdir -p /run/systemd/netif
+    chown systemd-network:systemd-network /run/systemd/netif 2>/dev/null || true
+    chmod 0755 /run/systemd/netif
+    if ! pidof systemd-networkd >/dev/null 2>&1; then
+        nohup /usr/lib/systemd/systemd-networkd >>/var/log/systemd-networkd.log 2>&1 &
+    fi
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if [ -S /run/systemd/netif/io.systemd.Network ] || pidof systemd-networkd >/dev/null 2>&1; then
+            NETWORKD_OK=0
+            break
+        fi
+        sleep 0.1
+    done
+    eend "$NETWORKD_OK"
+else
+    eskip
+fi
+unset NETWORKD_OK
+
 # NetworkManager is a system service; start it once after D-Bus and coldplug.
 ebegin "Starting NetworkManager"
 NM_OK=1

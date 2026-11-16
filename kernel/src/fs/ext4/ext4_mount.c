@@ -6,10 +6,33 @@
 #include "lib/string.h"
 #include "arch/uaccess.h"
 
+#ifdef USE_RUST_EXT4
+extern int rust_ext4_check_feature_flags(uint32_t log_block_size,
+                                         uint16_t desc_size, uint32_t compat,
+                                         uint32_t incompat, uint32_t ro_compat,
+                                         bool require_extents,
+                                         bool *out_read_only);
+#endif
+
 int ext4_check_feature_flags(const ext2_superblock_t *sb,
                              bool require_extents, bool *read_only) {
     if (!sb || !read_only)
         return -1;
+#ifdef USE_RUST_EXT4
+    if (rust_ext4_check_feature_flags(sb->s_log_block_size, sb->s_desc_size,
+                                      sb->s_feature_compat,
+                                      sb->s_feature_incompat,
+                                      sb->s_feature_ro_compat,
+                                      require_extents, read_only) != 0) {
+        klog_puts("[EXT4] Superblock feature/geometry check failed.\n");
+        return -1;
+    }
+    if (*read_only) {
+        klogf("[EXT4] Mounting read-only for unsupported ro-compat features: "
+              "0x%x\n", sb->s_feature_ro_compat);
+    }
+    return 0;
+#else
     if (sb->s_log_block_size > 6) {
         klog_puts("[EXT4] Unsupported block size in superblock.\n");
         return -1;
@@ -60,6 +83,7 @@ int ext4_check_feature_flags(const ext2_superblock_t *sb,
               "0x%x\n", unknown_ro_compat);
     }
     return 0;
+#endif
 }
 
 uint32_t ext4_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_t *buffer) {

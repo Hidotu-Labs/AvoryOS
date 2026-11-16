@@ -429,8 +429,33 @@ static void send_icmp_port_unreachable(uint32_t src_ip,
   ipv4_send(src_ip, IP_PROTO_ICMP, icmp_buf, total);
 }
 
-static void handle_udp(uint32_t src_ip, const uint8_t *ip_hdr,
+#ifdef USE_RUST_NET
+struct rust_udp_header {
+  uint16_t src_port;
+  uint16_t dst_port;
+  uint16_t udp_len;
+  uint16_t payload_len;
+};
+
+extern bool rust_udp_parse_v4(uint32_t src_ip, uint32_t dst_ip,
+                              const uint8_t *seg, size_t len,
+                              struct rust_udp_header *out);
+#endif
+
+static void handle_udp(uint32_t src_ip, uint32_t dst_ip, const uint8_t *ip_hdr,
                         const uint8_t *seg, size_t seg_len) {
+#ifdef USE_RUST_NET
+  struct rust_udp_header uh;
+  if (!rust_udp_parse_v4(src_ip, dst_ip, seg, seg_len, &uh))
+    return;
+  if (udp_handler) {
+    udp_handler(src_ip, uh.src_port, uh.dst_port, seg + 8, uh.payload_len);
+  } else if (ip_hdr) {
+    send_icmp_port_unreachable(src_ip, ip_hdr,
+                               sizeof(struct ipv4_header) + uh.udp_len);
+  }
+#else
+  (void)dst_ip;
   if (seg_len < 8) return;
   uint16_t src_port = (uint16_t)(((uint16_t)seg[0] << 8) | seg[1]);
   uint16_t dst_port = (uint16_t)(((uint16_t)seg[2] << 8) | seg[3]);
@@ -443,6 +468,7 @@ static void handle_udp(uint32_t src_ip, const uint8_t *ip_hdr,
     send_icmp_port_unreachable(src_ip, ip_hdr,
                                sizeof(struct ipv4_header) + udp_len);
   }
+#endif
 }
 
 /* ---- IPv4 fragment reassembly ------------------------------------------- */
@@ -558,7 +584,7 @@ static void handle_ipv4_fragment(const uint8_t *packet,
     spinlock_release(&reasm_lock);
 
     if (proto == IP_PROTO_UDP)
-      handle_udp(src, NULL, data, len);
+      handle_udp(src, dst, NULL, data, len);
     else if (proto == IP_PROTO_TCP && tcp_handler)
       tcp_handler(src, dst, data, len);
     else if (proto == IP_PROTO_ICMP)
@@ -596,19 +622,55 @@ static void handle_ipv4(const uint8_t *packet, size_t length) {
                 total_length - header_length);
   }
   else if (header->protocol == IP_PROTO_UDP)
-    handle_udp(source, packet, packet + header_length,
+    handle_udp(source, destination, packet, packet + header_length,
                total_length - header_length);
   else if (header->protocol == IP_PROTO_TCP && tcp_handler)
     tcp_handler(source, destination, packet + header_length,
                 total_length - header_length);
 }
 
+#ifdef USE_RUST_NET
+struct rust_arp_parsed {
+  uint16_t operation;
+  uint8_t sender_mac[6];
+  uint32_t sender_ip;
+  uint32_t target_ip;
+  bool address_conflict;
+};
+
+struct rust_ipv4_parsed {
+  uint32_t src_ip;
+  uint32_t dst_ip;
+  size_t header_len;
+  size_t total_len;
+  uint16_t frag;
+  uint8_t protocol;
+  bool is_fragment;
+};
+
+struct rust_eth_ingress {
+  int kind;
+  uint8_t eth_src_mac[6];
+  size_t payload_offset;
+  size_t payload_len;
+  struct rust_arp_parsed arp;
+  struct rust_ipv4_parsed ipv4;
+};
+
+#define RUST_ETH_INGRESS_IGNORE 0
+#define RUST_ETH_INGRESS_ARP    1
+#define RUST_ETH_INGRESS_IPV4   2
+#define RUST_ETH_INGRESS_IPV6   3
+
+extern int rust_net_parse_ethernet_frame(const uint8_t *frame, size_t len,
+                                         const uint8_t device_mac[6],
+                                         uint32_t local_ip,
+                                         struct rust_eth_ingress *out);
+#endif
+
 static void ethernet_receive(struct net_packet *packet) {
   if (!packet || packet->length < sizeof(struct eth_header))
     return;
-  const struct eth_header *header = (const struct eth_header *)packet->data;
-  bool ipv6_multicast = header->destination[0] == 0x33 &&
-                        header->destination[1] == 0x33;
   struct net_device *dev = net_device_default_acquire();
   if (!dev)
     return;
@@ -620,6 +682,49 @@ static void ethernet_receive(struct net_packet *packet) {
    * secondary NIC must not update the default interface's ARP/DHCP/NDP state. */
   if (!default_packet)
     return;
+
+#ifdef USE_RUST_NET
+  struct rust_eth_ingress ing;
+  int kind = rust_net_parse_ethernet_frame(packet->data, packet->length,
+                                           device_mac, config.address, &ing);
+  if (kind == RUST_ETH_INGRESS_ARP) {
+    if (ing.arp.address_conflict) {
+      address_conflict = true;
+      return;
+    }
+    arp_learn(ing.arp.sender_ip, ing.arp.sender_mac);
+    if (ing.arp.operation == ARP_OP_REQUEST &&
+        ing.arp.target_ip == config.address) {
+      arp_send(ARP_OP_REPLY, ing.arp.sender_mac, ing.arp.sender_ip,
+               ing.arp.sender_mac);
+    }
+  } else if (kind == RUST_ETH_INGRESS_IPV4) {
+    const uint8_t *ip_pkt = packet->data + ing.payload_offset;
+    if (ing.ipv4.is_fragment) {
+      handle_ipv4_fragment(ip_pkt, (const struct ipv4_header *)ip_pkt,
+                           ing.ipv4.header_len, ing.ipv4.frag);
+      return;
+    }
+    const uint8_t *l4 = ip_pkt + ing.ipv4.header_len;
+    size_t l4_len = ing.ipv4.total_len - ing.ipv4.header_len;
+    if (ing.ipv4.protocol == IP_PROTO_ICMP) {
+      if (icmp_handler)
+        icmp_handler(ing.ipv4.src_ip, ing.ipv4.dst_ip, ip_pkt,
+                     ing.ipv4.total_len);
+      handle_icmp(ing.ipv4.src_ip, l4, l4_len);
+    } else if (ing.ipv4.protocol == IP_PROTO_UDP) {
+      handle_udp(ing.ipv4.src_ip, ing.ipv4.dst_ip, ip_pkt, l4, l4_len);
+    } else if (ing.ipv4.protocol == IP_PROTO_TCP && tcp_handler) {
+      tcp_handler(ing.ipv4.src_ip, ing.ipv4.dst_ip, l4, l4_len);
+    }
+  } else if (kind == RUST_ETH_INGRESS_IPV6) {
+    ipv6_receive(ing.eth_src_mac, packet->data + ing.payload_offset,
+                 ing.payload_len);
+  }
+#else
+  const struct eth_header *header = (const struct eth_header *)packet->data;
+  bool ipv6_multicast = header->destination[0] == 0x33 &&
+                        header->destination[1] == 0x33;
   if (!mac_equal(header->destination, device_mac) &&
       !mac_broadcast(header->destination) && !ipv6_multicast)
     return;
@@ -632,6 +737,7 @@ static void ethernet_receive(struct net_packet *packet) {
     handle_ipv4(payload, length);
   else if (type == ETH_TYPE_IPV6)
     ipv6_receive(header->source, payload, length);
+#endif
 }
 
 bool net_phase4_init(void) {

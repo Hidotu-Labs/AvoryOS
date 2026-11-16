@@ -229,6 +229,22 @@ ln -sfn /usr/lib/systemd/system/seatd.service \
     "${SYSTEMD_ETC}/multi-user.target.wants/seatd.service"
 ln -sfn /usr/lib/systemd/system/systemd-resolved.service \
     "${SYSTEMD_ETC}/sysinit.target.wants/systemd-resolved.service"
+install -D -m 0644 "${ROOT_DIR}/config/systemd/20-wired.network" \
+    "${ROOTFS_DIR}/etc/systemd/network/20-wired.network"
+if [ -f "${ROOTFS_DIR}/usr/lib/systemd/system/systemd-networkd.service" ]; then
+    ln -sfn /usr/lib/systemd/system/systemd-networkd.service \
+        "${SYSTEMD_ETC}/multi-user.target.wants/systemd-networkd.service"
+fi
+# Start user PipeWire services eagerly on login instead of relying solely on
+# socket activation during Plasma startup.
+SYSTEMD_USER_ETC="${ROOTFS_DIR}/etc/systemd/user"
+mkdir -p "${SYSTEMD_USER_ETC}/default.target.wants"
+for unit in pipewire.service pipewire-pulse.service; do
+    if [ -f "${ROOTFS_DIR}/usr/lib/systemd/user/${unit}" ]; then
+        ln -sfn "/usr/lib/systemd/user/${unit}" \
+            "${SYSTEMD_USER_ETC}/default.target.wants/${unit}"
+    fi
+done
 # avory-login owns tty1; mask the stock getty so the two never race for it.
 ln -sfn /dev/null "${ROOTFS_DIR}/etc/systemd/system/getty@tty1.service"
 rm -f "${ROOTFS_DIR}/etc/systemd/system/getty.target.wants/getty@tty1.service"

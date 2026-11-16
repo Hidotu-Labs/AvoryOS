@@ -23,6 +23,7 @@
 #include "../fs/ext2.h"
 #include "../fs/ext4.h"
 #include "../fs/fat32.h"
+#include "../fs/cgroupfs.h"
 #include "../fs/tmpfs.h"
 #include "../drivers/storage/block.h"
 #include "arch/uaccess.h"
@@ -2632,27 +2633,14 @@ static const char *mount_canonicalize(const char *target, char *buf,
   return target;
 }
 
-static const char *const cgroup2_control_files[] = {
-    "cgroup.controllers", "cgroup.procs",  "cgroup.threads",
-    "cgroup.subtree_control", "cgroup.events", "cgroup.kill",
-    "cgroup.type", "cgroup.freeze", "tasks", "notify_on_release", NULL};
-
-static void cgroup2_write_file(vfs_node_t *dir, const char *name,
-                               const char *text) {
-  vfs_node_t *f = vfs_finddir(dir, (char *)name);
-  if (f) {
-    vfs_write(f, 0, (uint32_t)strlen(text), (uint8_t *)text);
-    vfs_close(f);
-  }
-}
-
-/* Seed the hierarchy root's control files. Child cgroups get theirs from
- * tmpfs_mkdir (tmpfs_sb_t.cgroupfs). */
 static void cgroup2_populate(vfs_node_t *dir, const char *controllers) {
-  for (int i = 0; cgroup2_control_files[i]; i++)
-    vfs_create(dir, (char *)cgroup2_control_files[i], 0644);
-  cgroup2_write_file(dir, "cgroup.controllers", controllers);
-  cgroup2_write_file(dir, "cgroup.events", "populated 0\nfrozen 0\n");
+  (void)controllers;
+  struct cgroupfs_group *root_group = cgroupfs_group_create(NULL);
+  if (root_group)
+    tmpfs_cgroup_populate_group(dir, root_group);
+  /* Legacy v1 names for hybrid submounts (elogind/OpenRC). */
+  vfs_create(dir, "tasks", 0644);
+  vfs_create(dir, "notify_on_release", 0644);
 }
 
 uint64_t cgroup2_mount_at(const char *target, const char *fstype) {

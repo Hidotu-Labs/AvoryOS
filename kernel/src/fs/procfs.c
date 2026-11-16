@@ -4,6 +4,7 @@
 #include "../sched/pid_namespace.h"
 #include "../sched/user_namespace.h"
 #include "inotify_limits.h"
+#include "cgroupfs.h"
 #include "fs/procfs.h"
 #include "console/klog.h"
 #include "apic/lapic_timer.h"
@@ -1719,7 +1720,9 @@ static uint32_t procfs_pid_auxv_read(vfs_node_t *node, uint32_t offset,
  * act on the calling thread. Other pids read as the initial namespace. */
 static bool procfs_pid_is_self(uint32_t pid) {
   struct thread *current = sched_get_current();
-  return current && pid_namespace_tid(current, current) == pid;
+  if (!current) return false;
+  uint32_t self_tgid = current->tgid ? current->tgid : current->tid;
+  return pid == self_tgid || pid == current->tid;
 }
 
 // /proc/<pid>/setgroups (used by bwrap, podman, flatpak, unshare)
@@ -3344,6 +3347,36 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, char *name) {
   return procfs_get_pid_dir(pid);
 }
 
+static uint32_t procfs_psi_read(enum psi_resource res, uint32_t offset,
+                                uint32_t size, uint8_t *buffer) {
+  char text[256];
+  uint32_t len = psi_format(res, NULL, text, sizeof(text));
+  if (offset >= len)
+    return 0;
+  if (size > len - offset)
+    size = len - offset;
+  memcpy(buffer, text + offset, size);
+  return size;
+}
+
+static uint32_t procfs_pressure_cpu_read(vfs_node_t *node, uint32_t offset,
+                                         uint32_t size, uint8_t *buffer) {
+  (void)node;
+  return procfs_psi_read(PSI_CPU, offset, size, buffer);
+}
+
+static uint32_t procfs_pressure_mem_read(vfs_node_t *node, uint32_t offset,
+                                         uint32_t size, uint8_t *buffer) {
+  (void)node;
+  return procfs_psi_read(PSI_MEMORY, offset, size, buffer);
+}
+
+static uint32_t procfs_pressure_io_read(vfs_node_t *node, uint32_t offset,
+                                        uint32_t size, uint8_t *buffer) {
+  (void)node;
+  return procfs_psi_read(PSI_IO, offset, size, buffer);
+}
+
 void procfs_init(void) {
   if (!fs_root)
     return;
@@ -3435,6 +3468,38 @@ void procfs_init(void) {
       numainfo_node->length = 512;
 
       ramfs_mount_node(procfs_root, numainfo_node);
+    }
+
+    // Add /proc/pressure/{cpu,memory,io} (PSI)
+    vfs_node_t *pressure_dir = kmalloc(sizeof(vfs_node_t));
+    if (pressure_dir) {
+      procfs_node_init(pressure_dir);
+      strncpy(pressure_dir->name, "pressure", 127);
+      pressure_dir->flags = FS_DIRECTORY | FS_PERSISTENT;
+      pressure_dir->mask = 0555;
+      ramfs_mount_on(pressure_dir);
+      ramfs_mount_node(procfs_root, pressure_dir);
+
+      const struct {
+        const char *name;
+        uint32_t (*fn)(vfs_node_t *, uint32_t, uint32_t, uint8_t *);
+      } psi_entries[] = {
+          {"cpu", procfs_pressure_cpu_read},
+          {"memory", procfs_pressure_mem_read},
+          {"io", procfs_pressure_io_read},
+      };
+      for (int pi = 0; pi < 3; pi++) {
+        vfs_node_t *pn = kmalloc(sizeof(vfs_node_t));
+        if (!pn)
+          continue;
+        procfs_node_init(pn);
+        strncpy(pn->name, psi_entries[pi].name, 127);
+        pn->flags = FS_FILE | FS_PERSISTENT;
+        pn->mask = 0444;
+        pn->read = psi_entries[pi].fn;
+        pn->length = 256;
+        ramfs_mount_node(pressure_dir, pn);
+      }
     }
 
     // Add /proc/klog: the persistent boot-log ring (console/klog.c).  Serial

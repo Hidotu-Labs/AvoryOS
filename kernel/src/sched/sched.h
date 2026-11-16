@@ -56,6 +56,7 @@ struct mm_struct {
 };
 
 struct syscall_regs;
+struct cgroupfs_group;
 
 /*
  * Drop one lifetime reference on an mm (the reference is taken with an atomic
@@ -287,6 +288,7 @@ struct thread {
   vfs_node_t *namei_path_root; /* Borrowed original root for scoped openat2 d_path. */
   struct mount_namespace *mount_ns;
   vfs_node_t *fs_root_node;
+  uint64_t fs_share_id;
   struct seccomp_filter *seccomp_filter;
   bool no_new_privs;
   /* prctl(PR_SET_DUMPABLE, 0). Stored inverted so zeroed thread state stays
@@ -543,6 +545,7 @@ struct thread {
   uint64_t anon_write_next;
   uint64_t anon_write_start;
   uint8_t anon_write_cluster_pages;
+  struct cgroupfs_group *cgroup;
 };
 
 _Static_assert(offsetof(struct thread, on_cpu) == 16,
@@ -790,6 +793,8 @@ void sched_terminate_thread_group(struct thread *current);
 void sched_share_files(struct thread *child, struct thread *parent);
 void sched_release_files(struct thread *t);
 bool sched_ensure_files(struct thread *t);
+void sched_share_fs(struct thread *child, struct thread *parent);
+void sched_set_cwd(struct thread *t, vfs_node_t *node, const char *path);
 
 // Returns the total number of threads in the global thread list
 /* Exact length of global_thread_count's list, maintained atomically at the

@@ -780,25 +780,42 @@ static int tmpfs_create(vfs_node_t *node, char *name, uint16_t permission) {
  * systemd skip killing processes itself, so it uses cgroup.procs + kill(). */
 static const struct {
     const char *name;
+    enum cgroupfs_file kind;
+} tmpfs_cgroup_bound_files[] = {
+    {"cgroup.controllers", CGROUPFS_CONTROLLERS},
+    {"cgroup.procs", CGROUPFS_PROCS},
+    {"cgroup.threads", CGROUPFS_THREADS},
+    {"cgroup.subtree_control", CGROUPFS_SUBTREE_CONTROL},
+    {"cgroup.events", CGROUPFS_EVENTS},
+    {"cgroup.kill", CGROUPFS_KILL},
+    {"cgroup.freeze", CGROUPFS_FREEZE},
+    {"cpu.weight", CGROUPFS_CPU_WEIGHT},
+    {"cpu.max", CGROUPFS_CPU_MAX},
+    {"cpu.stat", CGROUPFS_CPU_STAT},
+    {"cpu.pressure", CGROUPFS_CPU_PRESSURE},
+    {"memory.current", CGROUPFS_MEM_CURRENT},
+    {"memory.min", CGROUPFS_MEM_MIN},
+    {"memory.low", CGROUPFS_MEM_LOW},
+    {"memory.high", CGROUPFS_MEM_HIGH},
+    {"memory.max", CGROUPFS_MEM_MAX},
+    {"memory.oom.group", CGROUPFS_MEM_OOM_GROUP},
+    {"memory.events", CGROUPFS_MEM_EVENTS},
+    {"memory.stat", CGROUPFS_MEM_STAT},
+    {"memory.pressure", CGROUPFS_MEM_PRESSURE},
+    {"pids.current", CGROUPFS_PIDS_CURRENT},
+    {"pids.max", CGROUPFS_PIDS_MAX},
+    {"pids.events", CGROUPFS_PIDS_EVENTS},
+    {"io.pressure", CGROUPFS_IO_PRESSURE},
+    {NULL, 0}};
+
+static const struct {
+    const char *name;
     const char *init;
-} tmpfs_cgroup_files[] = {
-    {"cgroup.controllers", NULL},
-    {"cgroup.procs", NULL},
-    {"cgroup.threads", NULL},
-    {"cgroup.subtree_control", NULL},
-    {"cgroup.events", NULL},
+} tmpfs_cgroup_static_files[] = {
     {"cgroup.type", "domain\n"},
-    {"cgroup.freeze", "0\n"},
-    {"cpu.weight", "100\n"},
-    {"memory.min", "0\n"},
-    {"memory.low", "0\n"},
-    {"memory.high", "max\n"},
-    {"memory.max", "max\n"},
     {"memory.swap.max", "max\n"},
     {"memory.zswap.max", "max\n"},
     {"memory.zswap.writeback", "1\n"},
-    {"memory.oom.group", "0\n"},
-    {"pids.max", "max\n"},
     {NULL, NULL}};
 
 static void tmpfs_cgroup_bind(vfs_node_t *dir, char *name,
@@ -811,20 +828,19 @@ static void tmpfs_cgroup_bind(vfs_node_t *dir, char *name,
     }
 }
 
-static void tmpfs_cgroup_populate(vfs_node_t *parent, vfs_node_t *dir) {
-    /* The mount root gets its group on first use; its own control files
-     * stay plain stubs (cgroup2_mount_at). */
-    tmpfs_dir_t *pdir = (tmpfs_dir_t *)parent->device;
-    if (!pdir->cgroup)
-        pdir->cgroup = cgroupfs_group_create(NULL);
-    struct cgroupfs_group *group = cgroupfs_group_create(pdir->cgroup);
-    if (!group)
+void tmpfs_cgroup_populate_group(vfs_node_t *dir, struct cgroupfs_group *group) {
+    if (!dir || !group)
         return;
     ((tmpfs_dir_t *)dir->device)->cgroup = group;
 
-    for (int i = 0; tmpfs_cgroup_files[i].name; i++) {
-        char *name = (char *)tmpfs_cgroup_files[i].name;
-        const char *init = tmpfs_cgroup_files[i].init;
+    for (int i = 0; tmpfs_cgroup_bound_files[i].name; i++) {
+        char *name = (char *)tmpfs_cgroup_bound_files[i].name;
+        if (tmpfs_create(dir, name, 0644) == 0)
+            tmpfs_cgroup_bind(dir, name, group, tmpfs_cgroup_bound_files[i].kind);
+    }
+    for (int i = 0; tmpfs_cgroup_static_files[i].name; i++) {
+        char *name = (char *)tmpfs_cgroup_static_files[i].name;
+        const char *init = tmpfs_cgroup_static_files[i].init;
         if (tmpfs_create(dir, name, 0644) != 0 || !init)
             continue;
         vfs_node_t *f = vfs_finddir(dir, name);
@@ -833,9 +849,16 @@ static void tmpfs_cgroup_populate(vfs_node_t *parent, vfs_node_t *dir) {
             vfs_close(f);
         }
     }
-    tmpfs_cgroup_bind(dir, "cgroup.procs", group, CGROUPFS_PROCS);
-    tmpfs_cgroup_bind(dir, "cgroup.threads", group, CGROUPFS_THREADS);
-    tmpfs_cgroup_bind(dir, "cgroup.events", group, CGROUPFS_EVENTS);
+}
+
+static void tmpfs_cgroup_populate(vfs_node_t *parent, vfs_node_t *dir) {
+    tmpfs_dir_t *pdir = (tmpfs_dir_t *)parent->device;
+    if (!pdir->cgroup)
+        pdir->cgroup = cgroupfs_group_create(NULL);
+    struct cgroupfs_group *group = cgroupfs_group_create(pdir->cgroup);
+    if (!group)
+        return;
+    tmpfs_cgroup_populate_group(dir, group);
 }
 
 struct cgroupfs_group *tmpfs_cgroup_of(vfs_node_t *dir) {
@@ -858,8 +881,16 @@ static void tmpfs_cgroup_clear(vfs_node_t *parent, char *name) {
         return;
     if ((dir->flags & FS_TYPE_MASK) == FS_DIRECTORY && dir->device) {
         uint32_t stubs = 0;
-        for (int i = 0; tmpfs_cgroup_files[i].name; i++) {
-            vfs_node_t *f = vfs_finddir(dir, (char *)tmpfs_cgroup_files[i].name);
+        for (int i = 0; tmpfs_cgroup_bound_files[i].name; i++) {
+            vfs_node_t *f = vfs_finddir(dir, (char *)tmpfs_cgroup_bound_files[i].name);
+            if (f) {
+                if ((f->flags & FS_TYPE_MASK) == FS_FILE)
+                    stubs++;
+                vfs_close(f);
+            }
+        }
+        for (int i = 0; tmpfs_cgroup_static_files[i].name; i++) {
+            vfs_node_t *f = vfs_finddir(dir, (char *)tmpfs_cgroup_static_files[i].name);
             if (f) {
                 if ((f->flags & FS_TYPE_MASK) == FS_FILE)
                     stubs++;
@@ -871,9 +902,12 @@ static void tmpfs_cgroup_clear(vfs_node_t *parent, char *name) {
         bool only_stubs = di->count == stubs;
         vfs_dirindex_unlock(di);
         if (only_stubs &&
-            cgroupfs_group_remove(((tmpfs_dir_t *)dir->device)->cgroup))
-            for (int i = 0; tmpfs_cgroup_files[i].name; i++)
-                tmpfs_unlink(dir, (char *)tmpfs_cgroup_files[i].name);
+            cgroupfs_group_remove(((tmpfs_dir_t *)dir->device)->cgroup)) {
+            for (int i = 0; tmpfs_cgroup_bound_files[i].name; i++)
+                tmpfs_unlink(dir, (char *)tmpfs_cgroup_bound_files[i].name);
+            for (int i = 0; tmpfs_cgroup_static_files[i].name; i++)
+                tmpfs_unlink(dir, (char *)tmpfs_cgroup_static_files[i].name);
+        }
     }
     vfs_close(dir);
 }

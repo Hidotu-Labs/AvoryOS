@@ -128,7 +128,10 @@ typedef struct unix_sock {
   int rcvtimeo_ms; // SO_RCVTIMEO - receive timeout in ms
   int sndtimeo_ms; // SO_SNDTIMEO - send timeout in ms
 
-  struct vfs_node *bound_vnode; // Filesystem socket inode, if bound to a path
+  struct vfs_node *bound_vnode;   // Filesystem socket inode, if bound to a path
+  struct vfs_node *bound_backing; // Cached vfs_backing_node(bound_vnode)
+  uint64_t bound_inode;           // Cached inode number at bind time
+  void *bound_device;             // Cached device pointer at bind time
 
   struct unix_scm_msg *scm_queue_head; // FIFO queue of pending SCM messages (for stream sockets)
   struct unix_scm_msg *scm_queue_tail;

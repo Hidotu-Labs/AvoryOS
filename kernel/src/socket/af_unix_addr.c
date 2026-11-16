@@ -55,10 +55,10 @@ static unix_sock_t *unix_find_filesystem_socket(struct sockaddr_un *addr, bool p
     struct list_head *entry;
     list_for_each(entry, &unix_bound_list) {
       unix_sock_t *candidate = list_entry(entry, unix_sock_t, bind_node);
-      vfs_node_t *bound = vfs_backing_node(candidate->bound_vnode);
-      if (!bound || candidate->is_abstract) continue;
-      if (bound == backing || (bound->inode && bound->inode == backing->inode &&
-                               bound->device == backing->device)) {
+      if (candidate->is_abstract || !candidate->bound_vnode) continue;
+      if (candidate->bound_backing == backing ||
+          (candidate->bound_inode && candidate->bound_inode == backing->inode &&
+           candidate->bound_device == backing->device)) {
         found = pin ? af_unix_sock_ref(candidate) : candidate;
         break;
       }
