@@ -19,6 +19,26 @@ static int fat32_rmdir_impl(vfs_node_t *parent, char *name);
 static int fat32_truncate_impl(vfs_node_t *node, uint32_t new_size);
 int fat32_statfs_impl(vfs_node_t *node, struct statfs_buf *buf);
 
+// Live-node accounting.  Every node from fat32_make_vfs_node() is counted
+// on its mount; the count drops when the node is released by the VFS
+// (->destroy, see fat32_node_destroy) or freed directly by fat32 code
+// (fat32_node_drop).
+static void fat32_node_drop(vfs_node_t *node) {
+  fat32_mount_t *mnt = (fat32_mount_t *)node->device;
+  if (mnt)
+    __atomic_sub_fetch(&mnt->live_nodes, 1, __ATOMIC_ACQ_REL);
+  kfree(node);
+}
+
+static void fat32_node_destroy(vfs_node_t *node) {
+  fat32_mount_t *mnt = (fat32_mount_t *)node->device;
+  /* vfs_close() keeps a persistent node alive (something is mounted on
+   * it), so that node still references the mount and keeps counting. */
+  if (!mnt || ((node->flags & FS_PERSISTENT) && !(node->flags & FS_DELETED)))
+    return;
+  __atomic_sub_fetch(&mnt->live_nodes, 1, __ATOMIC_ACQ_REL);
+}
+
 // Internal Helpers
 
 // Convert FAT date (16-bit) to Unix timestamp (approximate)
@@ -329,7 +349,7 @@ static int fat32_rmdir_impl(vfs_node_t *parent, char *name) {
     return -1;
 
   if (!(dir_node->flags & FS_DIRECTORY)) {
-    kfree(dir_node);
+    fat32_node_drop(dir_node);
     return -2; // Not a directory
   }
 
@@ -343,12 +363,12 @@ static int fat32_rmdir_impl(vfs_node_t *parent, char *name) {
 
   // Directory should have at least . and .., more means not empty
   if (count > 2) {
-    kfree(dir_node);
+    fat32_node_drop(dir_node);
     return -3; // Directory not empty
   }
 
   uint32_t dir_cluster = dir_node->impl;
-  kfree(dir_node);
+  fat32_node_drop(dir_node);
 
   // Now delete from parent directory
   uint32_t parent_cluster = parent->impl;
@@ -676,7 +696,7 @@ static int fat32_create_impl(vfs_node_t *parent, char *name,
   // Check if file already exists
   vfs_node_t *existing = fat32_finddir_impl(parent, name);
   if (existing) {
-    kfree(existing);
+    fat32_node_drop(existing);
     return -1; // File exists
   }
 
@@ -910,6 +930,12 @@ static vfs_node_t *fat32_make_vfs_node(fat32_mount_t *mnt,
     node->mask |= 0222; // Add write permission
   }
   node->statfs = fat32_statfs_impl;
+
+  /* FS_AUTODESTROY makes vfs_close() run ->destroy on the last close, so
+   * the count is returned even when the node is not retired. */
+  node->flags |= FS_AUTODESTROY;
+  node->destroy = fat32_node_destroy;
+  __atomic_add_fetch(&mnt->live_nodes, 1, __ATOMIC_ACQ_REL);
 
   return node;
 }
@@ -1435,6 +1461,22 @@ int fat32_mount(struct block_device *dev, vfs_node_t *mountpoint) {
 
   klog_puts("[OK] FAT32 filesystem mounted.\n");
   return 0;
+}
+
+int fat32_live_nodes(vfs_node_t *root) {
+  fat32_mount_t *mnt = root ? (fat32_mount_t *)root->device : NULL;
+  if (!mnt)
+    return 0;
+  return (int)__atomic_load_n(&mnt->live_nodes, __ATOMIC_ACQUIRE);
+}
+
+void fat32_unmount(vfs_node_t *root) {
+  fat32_mount_t *mnt = root ? (fat32_mount_t *)root->device : NULL;
+  if (!mnt)
+    return;
+  if (mnt->root_node)
+    kfree(mnt->root_node);
+  kfree(mnt);
 }
 
 int fat32_mount_root(struct block_device *dev) {

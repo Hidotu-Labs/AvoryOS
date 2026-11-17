@@ -447,6 +447,8 @@ ifeq ($(USE_RUST),1)
     obj-$(ARCH)/src/acpi/acpi.c.o: override CPPFLAGS += -DUSE_RUST_ACPI=1
     obj-$(ARCH)/src/fs/ext4/ext4_mount.c.o: override CPPFLAGS += -DUSE_RUST_EXT4=1
     obj-$(ARCH)/src/fs/ext4/ext4_extent.c.o: override CPPFLAGS += -DUSE_RUST_EXT4=1
+    obj-$(ARCH)/src/drivers/usb/usb.c.o: override CPPFLAGS += -DUSE_RUST_USB=1
+    obj-$(ARCH)/src/drivers/usb/usb_rust_glue.c.o: override CPPFLAGS += -DUSE_RUST_USB=1
 endif
 endif
 
@@ -509,6 +511,11 @@ ifneq ($(RUST_LIB),)
 $(RUST_LIB): rust/Cargo.toml rust/.cargo/config.toml $(RUST_SRCS)
 	cargo build --manifest-path rust/Cargo.toml --release --target $(RUST_TARGET)
 endif
+
+# Host unit tests for the Rust USB/driver logic (no kernel, no ffi).
+.PHONY: rust-test
+rust-test:
+	cargo test --manifest-path rust/Cargo.toml --target x86_64-unknown-linux-gnu
 
 bin-$(ARCH)/$(OUTPUT): GNUmakefile linker-scripts/$(ARCH).lds $(OBJ) $(LINUX_OBJ) $(RUST_LIB)
 	mkdir -p "$(dir $@)"

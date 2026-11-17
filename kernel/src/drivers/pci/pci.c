@@ -446,6 +446,14 @@ static struct {
   uint32_t lpc_pirq_ad;
   uint32_t lpc_pirq_eh;
   uint32_t lpc_rcba;
+
+  bool valid_amd_lpc;
+  uint16_t amd_lpc_cmd;
+  uint32_t amd_lpc_io_decode;
+  uint32_t amd_lpc_iomem_decode;
+  uint32_t amd_lpc_mem_range;
+  uint32_t amd_lpc_wide_io;
+  uint32_t amd_lpc_alt_wide_io_en;
 } pci_platform_s3_state;
 
 static uint32_t pci_legacy_read32(uint8_t bus, uint8_t slot, uint8_t func,
@@ -473,6 +481,16 @@ static void pci_legacy_write16(uint8_t bus, uint8_t slot, uint8_t func,
   spinlock_release(&pci_config_lock);
 }
 
+static void pci_restore_reg32_if_changed(uint8_t bus, uint8_t slot, uint8_t func,
+                                         uint16_t offset, uint32_t saved) {
+  uint32_t current = pci_config_read32(bus, slot, func, offset);
+  if (current != saved) {
+    klogf("[PCI] restoring %02x:%02x.%x reg 0x%02x %08x -> %08x\n",
+          bus, slot, func, offset, current, saved);
+    pci_config_write32(bus, slot, func, offset, saved);
+  }
+}
+
 void pci_save_platform_s3_state(void) {
   memset(&pci_platform_s3_state, 0, sizeof(pci_platform_s3_state));
 
@@ -494,6 +512,27 @@ void pci_save_platform_s3_state(void) {
     pci_platform_s3_state.lpc_pirq_eh = pci_legacy_read32(0, 0x1F, 0, 0x68);
     pci_platform_s3_state.lpc_rcba = pci_legacy_read32(0, 0x1F, 0, 0xF0);
   }
+
+  uint16_t amd_vendor =
+      (uint16_t)(pci_legacy_read32(0, 0x14, 3, 0x00) & 0xFFFFU);
+  if (amd_vendor == 0x1022U || amd_vendor == 0x1002U) {
+    uint32_t amd_class = pci_legacy_read32(0, 0x14, 3, 0x08);
+    if ((amd_class >> 16) == 0x0601U) {
+      pci_platform_s3_state.valid_amd_lpc = true;
+      pci_platform_s3_state.amd_lpc_cmd =
+          (uint16_t)(pci_legacy_read32(0, 0x14, 3, 0x04) & 0xFFFFU);
+      pci_platform_s3_state.amd_lpc_io_decode =
+          pci_legacy_read32(0, 0x14, 3, 0x44);
+      pci_platform_s3_state.amd_lpc_iomem_decode =
+          pci_legacy_read32(0, 0x14, 3, 0x48);
+      pci_platform_s3_state.amd_lpc_mem_range =
+          pci_legacy_read32(0, 0x14, 3, 0x4C);
+      pci_platform_s3_state.amd_lpc_wide_io =
+          pci_legacy_read32(0, 0x14, 3, 0x64);
+      pci_platform_s3_state.amd_lpc_alt_wide_io_en =
+          pci_legacy_read32(0, 0x14, 3, 0x74);
+    }
+  }
 }
 
 void pci_restore_platform_s3_state(void) {
@@ -511,6 +550,25 @@ void pci_restore_platform_s3_state(void) {
     pci_config_write32(0, 0x1F, 0, 0x68, pci_platform_s3_state.lpc_pirq_eh);
     pci_config_write32(0, 0x1F, 0, 0xF0, pci_platform_s3_state.lpc_rcba);
     pci_config_write16(0, 0x1F, 0, 0x04, pci_platform_s3_state.lpc_cmd);
+  }
+
+  if (pci_platform_s3_state.valid_amd_lpc) {
+    pci_restore_reg32_if_changed(0, 0x14, 3, 0x44,
+                                 pci_platform_s3_state.amd_lpc_io_decode);
+    pci_restore_reg32_if_changed(0, 0x14, 3, 0x48,
+                                 pci_platform_s3_state.amd_lpc_iomem_decode);
+    pci_restore_reg32_if_changed(0, 0x14, 3, 0x4C,
+                                 pci_platform_s3_state.amd_lpc_mem_range);
+    pci_restore_reg32_if_changed(0, 0x14, 3, 0x64,
+                                 pci_platform_s3_state.amd_lpc_wide_io);
+    pci_restore_reg32_if_changed(0, 0x14, 3, 0x74,
+                                 pci_platform_s3_state.amd_lpc_alt_wide_io_en);
+    uint16_t cmd = pci_config_read16(0, 0x14, 3, 0x04);
+    if (cmd != pci_platform_s3_state.amd_lpc_cmd) {
+      klogf("[PCI] restoring 00:14.3 reg 0x04 %04x -> %04x\n",
+            cmd, pci_platform_s3_state.amd_lpc_cmd);
+      pci_config_write16(0, 0x14, 3, 0x04, pci_platform_s3_state.amd_lpc_cmd);
+    }
   }
 }
 

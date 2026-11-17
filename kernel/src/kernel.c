@@ -21,6 +21,7 @@
 #include "drivers/audio/hda.h"
 #include "drivers/audio/sb16.h"
 #include "drivers/gpu/drm/drm.h"
+#include "drivers/i2c/smbus_piix4.h"
 #include "drivers/input/evdev.h"
 #include "drivers/input/keyboard.h"
 #include "drivers/input/mouse.h"
@@ -687,6 +688,7 @@ void kmain_high_half(void) {
   shm_init();
 
   pci_init();
+  smbus_piix4_init();
   if (!virtio_gpu_init()) {
     klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET
                            " VirtIO-GPU initialization failed; keeping GOP.\n");
@@ -699,6 +701,7 @@ void kmain_high_half(void) {
   uhci_init();
   ohci_init();
   usb_audio_boot_smoke();
+  usb_storage_boot_smoke();
 
   /* `usbdump` in the kernel cmdline prints the USB diagnostics at boot.
    * /proc/usb has the same content after boot; this variant exists for

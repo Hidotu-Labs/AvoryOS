@@ -315,3 +315,8 @@ int ext2_mount_root(struct block_device *dev) {
   klog_puts("[OK] Ext2/3 filesystem mounted as root (/)\n");
   return 0;
 }
+
+int ext2_unmount(vfs_node_t *root) {
+  ext2_mount_t *mnt = root ? (ext2_mount_t *)root->device : NULL;
+  return mnt ? ext2_flush_metadata(mnt) : 0;
+}

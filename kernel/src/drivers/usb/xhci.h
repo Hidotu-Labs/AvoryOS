@@ -97,6 +97,36 @@ struct xhci_isoch_state {
   volatile bool disconnected;
 };
 
+/* Bulk endpoint state.  A transfer is one TD of at most XHCI_BULK_MAX_TRBS
+ * Normal TRBs (each within one 64 KiB window).  The owning caller waits on
+ * `waiting`/`done`, which the event dispatcher sets when a TRB of the TD
+ * reports completion. */
+#define XHCI_MAX_BULK_PIPES 4
+#define XHCI_BULK_MAX_TRBS 32
+#define XHCI_BULK_CHUNK_BYTES 65536U
+#define XHCI_BULK_CC_CANCELLED 0xFFU
+struct xhci_bulk_state {
+  struct usb_bulk_pipe pipe;
+  struct xhci_trb *ring;
+  uint64_t ring_phys;
+  uint16_t enqueue;
+  uint8_t cycle;
+  uint8_t slot_id;
+  uint8_t dci;
+  uint8_t max_burst;
+  uint16_t td_count;
+  uint64_t td_phys[XHCI_BULK_MAX_TRBS];
+  uint32_t td_len[XHCI_BULK_MAX_TRBS];
+  volatile bool waiting;
+  volatile bool done;
+  volatile uint8_t cc;
+  volatile uint32_t residual;
+  volatile uint16_t event_index;
+  uint32_t stalls;
+  uint32_t timeouts;
+  uint32_t completions;
+};
+
 struct xhci_controller {
   struct pci_device *pci;
   volatile uint8_t *cap;
@@ -127,6 +157,7 @@ struct xhci_controller {
   struct xhci_slot slots[256];
   struct xhci_interrupt_state interrupt_pipes[XHCI_MAX_INTERRUPT_PIPES];
   struct xhci_isoch_state isoch_streams[XHCI_MAX_ISOCH_STREAMS];
+  struct xhci_bulk_state bulk_pipes[XHCI_MAX_BULK_PIPES];
   uint32_t pending_ports;
   uint32_t connected_ports;
   /* Bounded late-enumeration attempts for ports that only report their
@@ -158,11 +189,14 @@ struct xhci_controller {
   /* Command-ring submission is shared by thread context (probes, HID LED
    * reports) and IRQ context (silent-endpoint recovery and the GET_REPORT
    * fallback).  The ring cursor and the completion wait are not reentrant. */
-  spinlock_t command_lock;
+  uint8_t command_busy; /* xhci_wait_lock: never held with IRQs masked */
   /* EP0 transfers share one control buffer and one TRB ring per slot.  A
    * thread-context control transfer can overlap the IRQ-driven GET_REPORT
    * fallback, so the whole transfer is serialized per controller. */
-  spinlock_t control_lock;
+  uint8_t control_busy; /* xhci_wait_lock: never held with IRQs masked */
+  /* Serialises bulk TD construction, waiting and endpoint recovery across
+   * pipes.  Never taken from the interrupt path. */
+  spinlock_t bulk_lock;
   struct xhci_erst_entry *erst;
   uint64_t erst_phys;
 

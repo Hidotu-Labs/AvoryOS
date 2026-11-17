@@ -187,6 +187,7 @@ run-usb: run
 run-s4: KERNEL_CMDLINE = resume=PARTLABEL=s4swap
 run-s4: RUN_EXTRA_QEMU_FLAGS = -drive file=$(S4_SWAP_IMG),format=raw,if=none,id=s4swap -device nvme,serial=avoryos-s4,drive=s4swap,max_ioqpairs=$(RUN_NVME_QUEUES)
 run-s4: $(S4_SWAP_IMG) run
+RUN_ACCEL_FLAGS ?= -cpu host -enable-kvm
 run: DISPLAY_OPT = -display $(RUN_DISPLAY),gl=$(RUN_GL),show-cursor=$(GTK_SHOW_CURSOR)$(if $(filter gtk,$(RUN_DISPLAY)),$(NET_COMMA)zoom-to-fit=off$(NET_COMMA)grab-on-hover=on)
 run: QEMUFLAGS = $(QEMU_MEM) -vga none -device $(RUN_GPU),xres=1280,yres=800 $(RUN_EXTRA_QEMU_FLAGS)
 run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL_HOST_LIB)) $(if $(RUN_QEMU_LOCAL),$(QEMU_HOST_BIN))
@@ -197,7 +198,7 @@ run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL
 		-cdrom $(IMAGE_NAME).iso \
 		-drive file=disk.img,format=raw,if=none,id=nvme0 \
 		-device nvme,serial=avoryos0,drive=nvme0,max_ioqpairs=$(RUN_NVME_QUEUES) \
-		-cpu host -enable-kvm \
+		$(RUN_ACCEL_FLAGS) \
 		-smp $(RUN_SMP) \
 		-chardev stdio,id=desktop-serial,logfile=$(RUN_SERIAL_LOG),logappend=on \
 		-serial chardev:desktop-serial \
@@ -210,7 +211,8 @@ run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL
 		-device $(RUN_POINTER),bus=xhci.0 \
 		$(DISPLAY_OPT) \
 		$(QEMUFLAGS)
-run-tcg: run-x86_64
+run-tcg: RUN_ACCEL_FLAGS := -accel tcg,thread=multi -cpu max
+run-tcg: run
 
 # Headless, TCG-only USB audio fixture. Use the null backend by default so it
 # also boots on build hosts without a desktop audio server; choose pa, pipewire,
@@ -220,6 +222,7 @@ USB_AUDIO_BACKEND ?= none
 USB_AUDIO_SMP ?= 2
 USB_AUDIO_DISK ?= disk.img
 USB_AUDIO_DISK_DEP := $(if $(wildcard $(USB_AUDIO_DISK)),,$(USB_AUDIO_DISK))
+USB_TEST_DISPLAY ?= -display gtk,zoom-to-fit=off,grab-on-hover=on
 .PHONY: run-usb-audio
 run-usb-audio: edk2-ovmf $(IMAGE_NAME).iso $(USB_AUDIO_DISK_DEP)
 	@set -e; \
@@ -242,6 +245,68 @@ run-usb-audio: edk2-ovmf $(IMAGE_NAME).iso $(USB_AUDIO_DISK_DEP)
 		-device usb-kbd,bus=xhci.0 \
 		-device usb-tablet,bus=xhci.0
 
+# Headless USB mass-storage and hub fixtures (QEMU xHCI, TCG). Like run-usb-audio
+# they boot the existing ISO without rebuilding it. Every disk is attached with
+# snapshot=on,file.locking=off, so disk.img and a running `make run` VM are never
+# written. USB_STORAGE_PORT picks the xHCI root port for the stick: 1 is a
+# SuperSpeed (USB3) port; set it empty to auto-assign, which lands on a USB2 port.
+USB_STORAGE_DISK ?= disk.img
+USB_STORAGE_DISK_DEP := $(if $(wildcard $(USB_STORAGE_DISK)),,$(USB_STORAGE_DISK))
+USB_STORAGE_IMG ?= build/usb-stick.img
+USB_STORAGE_SIZE_MIB ?= 64
+USB_STORAGE_PORT ?= 1
+USB_STORAGE_SMP ?= 8
+
+$(USB_STORAGE_IMG):
+	@set -e; \
+	mkdir -p $(dir $@); \
+	command -v mkfs.fat >/dev/null || { echo "mkfs.fat (dosfstools) is required" >&2; exit 1; }; \
+	rm -f $@.tmp; \
+	truncate -s $(USB_STORAGE_SIZE_MIB)M $@.tmp; \
+	mkfs.fat -F 32 -n AVORYUSB $@.tmp >/dev/null; \
+	mv $@.tmp $@
+
+.PHONY: run-usb-storage
+run-usb-storage: edk2-ovmf $(IMAGE_NAME).iso $(USB_STORAGE_DISK_DEP) $(USB_STORAGE_IMG)
+	@set -e; \
+	qemu-system-$(ARCH) \
+		-M q35 $(RUN_ACCEL_FLAGS) \
+		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
+		-cdrom $(IMAGE_NAME).iso \
+		-drive file=$(USB_STORAGE_DISK),format=raw,if=none,id=nvme0,snapshot=on,file.locking=off \
+		-device nvme,serial=avoryos0,drive=nvme0 \
+		-smp $(USB_STORAGE_SMP) $(QEMU_MEM) -vga none -device virtio-vga,addr=06.0 \
+		$(USB_TEST_DISPLAY) -serial stdio -monitor none -no-reboot $(USB_TEST_EXTRA) \
+		$(RUN_NET_FLAGS) \
+		-device qemu-xhci,id=xhci \
+		-drive if=none,id=stick,file=$(USB_STORAGE_IMG),format=raw,snapshot=on,file.locking=off \
+		-device usb-storage,bus=xhci.0$(if $(USB_STORAGE_PORT),$(NET_COMMA)port=$(USB_STORAGE_PORT)),drive=stick \
+		-device usb-kbd,bus=xhci.0 \
+		-device usb-tablet,bus=xhci.0
+
+# Hub topology: kbd, mouse and stick on hub port 1 (1.1-1.3), and a second hub on
+# 1.4 with a keyboard on 1.4.1. QEMU's usb-hub is full-speed USB 1.1 only.
+.PHONY: run-usb-hub
+run-usb-hub: edk2-ovmf $(IMAGE_NAME).iso $(USB_STORAGE_DISK_DEP) $(USB_STORAGE_IMG)
+	@set -e; \
+	qemu-system-$(ARCH) \
+		-M q35 $(RUN_ACCEL_FLAGS) \
+		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
+		-cdrom $(IMAGE_NAME).iso \
+		-drive file=$(USB_STORAGE_DISK),format=raw,if=none,id=nvme0,snapshot=on,file.locking=off \
+		-device nvme,serial=avoryos0,drive=nvme0 \
+		-smp $(USB_STORAGE_SMP) $(QEMU_MEM) -vga none -device virtio-vga,addr=06.0 \
+		$(USB_TEST_DISPLAY) -serial stdio -monitor none -no-reboot $(USB_TEST_EXTRA) \
+		$(RUN_NET_FLAGS) \
+		-device qemu-xhci,id=xhci \
+		-drive if=none,id=stick,file=$(USB_STORAGE_IMG),format=raw,snapshot=on,file.locking=off \
+		-device usb-hub,bus=xhci.0,port=1 \
+		-device usb-kbd,bus=xhci.0,port=1.1 \
+		-device usb-mouse,bus=xhci.0,port=1.2 \
+		-device usb-storage,bus=xhci.0,port=1.3,drive=stick \
+		-device usb-hub,bus=xhci.0,port=1.4 \
+		-device usb-kbd,bus=xhci.0,port=1.4.1
+
 # ── NUMA multi-node test target ──────────────────────────────────────────────
 #
 # Boots AvoryOS with 2 NUMA nodes, 4 vCPUs (2 per node), 4GB RAM (2GB per node),
@@ -254,7 +319,7 @@ run-numa: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 		-cdrom $(IMAGE_NAME).iso \
 		-drive file=disk.img,format=raw,if=none,id=nvme0 \
 		-device nvme,serial=avoryos0,drive=nvme0 \
-		-cpu host -enable-kvm \
+		$(RUN_ACCEL_FLAGS) \
 		-smp $(RUN_SMP),sockets=2,cores=4,threads=1 \
 		-m 4G \
 		-object memory-backend-ram,id=mem0,size=2G \
@@ -311,7 +376,7 @@ run-vfio: edk2-ovmf $(RUN_ISO_DEP) $(RUN_DISK_DEP)
 	$(VFIO_LAUNCHER) qemu-system-$(ARCH) \
 		-M q35 \
 		-m $(VFIO_MEM) \
-		-cpu host -enable-kvm \
+		$(RUN_ACCEL_FLAGS) \
 		-smp $(VFIO_SMP) \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(RUN_ISO) \
@@ -425,7 +490,7 @@ run-sata: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
 		-drive file=disk.img,format=raw,if=none,id=disk0 -device ide-hd,drive=disk0,bus=ide.0 \
-		-cpu host -enable-kvm \
+		$(RUN_ACCEL_FLAGS) \
 		-smp 4 \
 		-serial stdio \
 		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \

@@ -697,3 +697,8 @@ int ext4_statfs_impl(vfs_node_t *node, struct statfs_buf *buf) {
     buf->f_flags = mnt->read_only ? 1 : 0; /* ST_RDONLY */
     return 0;
 }
+
+int ext4_unmount(vfs_node_t *root) {
+  ext2_mount_t *base = root ? (ext2_mount_t *)root->device : NULL;
+  return base ? ext2_flush_metadata(base) : 0;
+}

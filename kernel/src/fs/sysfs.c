@@ -59,6 +59,10 @@ static vfs_node_t *sound_class_root;
 static vfs_node_t *sound_virtual_root;
 static vfs_node_t *sound_class_devices_root;
 static vfs_node_t *sysfs_dev_char_root;
+/* Block roots, so block hot-plug can publish and remove entries after boot. */
+static vfs_node_t *block_class_root;
+static vfs_node_t *block_alias_root;
+static vfs_node_t *block_devnum_root;
 
 /* ACPI S3 must be initiated by the BSP. The sysfs writer may be running on
  * an AP, so hand the operation to a BSP-pinned kernel thread and block the
@@ -661,16 +665,11 @@ static uint32_t zram_attribute_read(vfs_node_t *node, uint32_t offset, uint32_t 
   memcpy(buffer, buf + offset, size); return size;
 }
 
-static void sysfs_populate_block(vfs_node_t *block_class_dir) {
-  int count = block_count();
-  for (int i = 0; i < count; i++) {
-    struct block_device *bd = block_get(i);
-    if (!bd)
-      continue;
-
+static void sysfs_block_class_entry(vfs_node_t *block_class_dir,
+                                    struct block_device *bd) {
     vfs_node_t *bdir = sysfs_mkdir(block_class_dir, bd->name);
     if (!bdir)
-      continue;
+      return;
 
     /* dev: major:minor — must match /proc/partitions, /proc/diskstats,
      * /proc/self/mountinfo and stat()->st_rdev or UDisks2/Solid cannot
@@ -696,8 +695,8 @@ static void sysfs_populate_block(vfs_node_t *block_class_dir) {
     strcat(sbuf, "\n");
     sysfs_mkfile(bdir, "size", sbuf);
 
-    sysfs_mkfile(bdir, "removable", "0\n");
-    sysfs_mkfile(bdir, "ro", bd->write_sectors ? "0\n" : "1\n");
+    sysfs_mkfile(bdir, "removable", bd->removable ? "1\n" : "0\n");
+    sysfs_mkfile(bdir, "ro", (bd->read_only || !bd->write_sectors) ? "1\n" : "0\n");
     if (!strcmp(bd->name, "zram0")) {
       sysfs_mkfile(bdir, "comp_algorithm", "[lz4]\n");
       const char *attrs[] = {"disksize", "mem_limit", "initstate", "mm_stat"};
@@ -743,6 +742,14 @@ static void sysfs_populate_block(vfs_node_t *block_class_dir) {
       sysfs_mkfile(queue, "max_sectors_kb", "1024\n");
       sysfs_mkfile(queue, "nr_requests", "128\n");
     }
+}
+
+static void sysfs_populate_block(vfs_node_t *block_class_dir) {
+  int count = block_count();
+  for (int i = 0; i < count; i++) {
+    struct block_device *bd = block_get(i);
+    if (bd)
+      sysfs_block_class_entry(block_class_dir, bd);
   }
 }
 
@@ -1133,11 +1140,13 @@ void sysfs_init(void) {
 
   // /sys/class/block
   vfs_node_t *block_class = sysfs_mkdir(class_dir, "block");
+  block_class_root = block_class;
   sysfs_populate_block(block_class);
 
   // /sys/block — top-level alias for the block class.  Created after the
   // class so the symlink targets exist.
   vfs_node_t *block_alias = sysfs_mkdir(sysfs_root, "block");
+  block_alias_root = block_alias;
   sysfs_populate_block_alias(block_alias);
 
   // /sys/class/net
@@ -1435,6 +1444,7 @@ void sysfs_init(void) {
   // /sys/dev/block  /sys/dev/char
   vfs_node_t *dev_dir = sysfs_mkdir(sysfs_root, "dev");
   vfs_node_t *dev_block_dir = sysfs_mkdir(dev_dir, "block");
+  block_devnum_root = dev_block_dir;
   /* UDisks2 resolves every block device through /sys/dev/block/<major>:<minor>
    * (libudev's sysname path). Without these symlinks it sees /sys/block but
    * cannot map a /dev node back to its sysfs entry, so no StorageVolume gets
@@ -1931,4 +1941,77 @@ void *asc_sysfs_dir_by_path(const char *path) {
    * lookup reference.  Sysfs directories live for the kernel's lifetime. */
   vfs_close(node);
   return node;
+}
+
+/* ── block hot-plug (drivers/storage/block.c) ───────────────────────────── */
+
+/* Write an action to the entry's uevent file, which broadcasts it over
+ * netlink exactly like a udevadm trigger would.  Same path as the sound
+ * cards.  Boot coldplug has no add event of its own: udev triggers one later. */
+static void sysfs_block_emit(vfs_node_t *bdir, const char *action) {
+  vfs_node_t *uevent = vfs_finddir(bdir, "uevent");
+  if (!uevent)
+    return;
+  sysfs_uevent_write(uevent, 0, (uint32_t)strlen(action), (uint8_t *)action);
+  vfs_close(uevent);
+}
+
+static void sysfs_block_devnum_name(const struct block_device *bd, char *out,
+                                    size_t cap) {
+  char majbuf[16], minbuf[16];
+  u64_to_dec(bd->linux_major, majbuf);
+  u64_to_dec(bd->linux_minor, minbuf);
+  snprintf(out, cap, "%s:%s", majbuf, minbuf);
+}
+
+/* Publish one disk or partition after boot, then announce it with "add".
+ * Before sysfs_init() has built the block roots this does nothing: the boot
+ * populate pass covers those devices and no add event is sent for them. */
+void sysfs_block_device_added(struct block_device *bd) {
+  if (!bd || !block_class_root)
+    return;
+  vfs_node_t *existing = vfs_finddir(block_class_root, bd->name);
+  if (existing) {
+    vfs_close(existing);
+    return;
+  }
+
+  sysfs_block_class_entry(block_class_root, bd);
+  vfs_node_t *bdir = vfs_finddir(block_class_root, bd->name);
+  if (!bdir)
+    return;
+
+  char target[96];
+  snprintf(target, sizeof(target), "../class/block/%s", bd->name);
+  if (block_alias_root)
+    sysfs_symlink(block_alias_root, bd->name, target);
+  if (block_devnum_root) {
+    char devnum[32];
+    sysfs_block_devnum_name(bd, devnum, sizeof(devnum));
+    snprintf(target, sizeof(target), "../../class/block/%s", bd->name);
+    sysfs_symlink(block_devnum_root, devnum, target);
+  }
+  sysfs_block_emit(bdir, "add");
+  vfs_close(bdir);
+}
+
+/* Announce "remove" while the entry still exists, then delete the class,
+ * /sys/block and /sys/dev/block entries.  The caller has already detached the
+ * device from the registry so no new lookup finds it. */
+void sysfs_block_device_removed(struct block_device *bd) {
+  if (!bd || !block_class_root)
+    return;
+  vfs_node_t *bdir = vfs_finddir(block_class_root, bd->name);
+  if (bdir) {
+    sysfs_block_emit(bdir, "remove");
+    vfs_close(bdir);
+  }
+  asc_sysfs_remove(block_class_root, bd->name);
+  if (block_alias_root)
+    asc_sysfs_remove(block_alias_root, bd->name);
+  if (block_devnum_root) {
+    char devnum[32];
+    sysfs_block_devnum_name(bd, devnum, sizeof(devnum));
+    asc_sysfs_remove(block_devnum_root, devnum);
+  }
 }

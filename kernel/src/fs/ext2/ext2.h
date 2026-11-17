@@ -279,6 +279,9 @@ typedef struct ext2_mount {
 } ext2_mount_t;
 
 int ext2_mount(struct block_device *dev, vfs_node_t *mountpoint);
+// Flush cached group-descriptor/superblock state for an in-place mount.  The
+// mount struct is not freed: open descriptors may still reference it.
+int ext2_unmount(vfs_node_t *root);
 int ext2_mount_root(struct block_device *dev);
 int ext2_statfs_impl(vfs_node_t *node, struct statfs_buf *buf);
 int ext2_read_block(ext2_mount_t *mnt, uint64_t block_num, void *buffer);

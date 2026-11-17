@@ -28,6 +28,8 @@ typedef struct {
 } ext4_mount_t;
 
 int ext4_mount(struct block_device *dev, vfs_node_t *mountpoint);
+// Flush-only detach for an in-place ext4 mount (see ext2_unmount).
+int ext4_unmount(vfs_node_t *root);
 int ext4_mount_root(struct block_device *dev);
 uint32_t ext4_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
                         uint8_t *buffer);

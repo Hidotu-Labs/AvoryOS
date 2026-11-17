@@ -83,6 +83,9 @@ static uint32_t last_dma_flags;
 static uint64_t last_dma_phys;
 
 static void xhci_wait_event_dispatch(struct xhci_controller *hc);
+static bool xhci_wait_lock(uint8_t *busy);
+static bool xhci_wait_trylock(uint8_t *busy);
+static void xhci_wait_unlock(uint8_t *busy);
 static void xhci_isoch_finish_pending(struct xhci_isoch_state *state);
 static int xhci_pm_probe(struct device *dev);
 static int xhci_pm_suspend(struct device *dev);
@@ -380,16 +383,16 @@ static int xhci_pm_suspend(struct device *dev) {
 
   /* Do not strand a synchronous command/control waiter or an event-ring
    * drainer when the controller stops producing interrupts. */
-  if (!spinlock_try_acquire(&hc->command_lock)) {
+  if (!xhci_wait_trylock(&hc->command_busy)) {
     xhci_pm_unquiesce(hc);
     return -16;
   }
-  spinlock_release(&hc->command_lock);
-  if (!spinlock_try_acquire(&hc->control_lock)) {
+  xhci_wait_unlock(&hc->command_busy);
+  if (!xhci_wait_trylock(&hc->control_busy)) {
     xhci_pm_unquiesce(hc);
     return -16;
   }
-  spinlock_release(&hc->control_lock);
+  xhci_wait_unlock(&hc->control_busy);
   if (!spinlock_try_acquire(&hc->event_lock)) {
     xhci_pm_unquiesce(hc);
     return -16;
@@ -610,6 +613,30 @@ static uint32_t xhci_drain_events(struct xhci_controller *hc,
         state->logged_events++;
         break;
       }
+      if (!matched && ev_dci > 1) {
+        /* Bulk TD completion.  Only a TRB inside the waiting TD counts; the
+         * first event for that TD wins, and a Stopped event after a timeout
+         * arrives when `waiting` is already clear and is dropped here. */
+        uint64_t trb_phys = event.parameter & ~0xFULL;
+        for (uint32_t i = 0; i < XHCI_MAX_BULK_PIPES && !matched; i++) {
+          struct xhci_bulk_state *bulk = &hc->bulk_pipes[i];
+          if (!__atomic_load_n(&bulk->waiting, __ATOMIC_ACQUIRE) ||
+              bulk->slot_id != ev_slot || bulk->dci != ev_dci)
+            continue;
+          for (uint16_t t = 0; t < bulk->td_count; t++) {
+            if (bulk->td_phys[t] != trb_phys)
+              continue;
+            if (!__atomic_load_n(&bulk->done, __ATOMIC_ACQUIRE)) {
+              bulk->cc = ev_cc;
+              bulk->residual = ev_residual;
+              bulk->event_index = t;
+              __atomic_store_n(&bulk->done, true, __ATOMIC_RELEASE);
+            }
+            matched = true;
+            break;
+          }
+        }
+      }
       if (!matched) {
         uint64_t trb_phys = event.parameter & ~0xFULL;
         bool event_data = (ev_control & (1U << 2)) != 0;
@@ -665,9 +692,10 @@ static bool xhci_submit_command(struct xhci_controller *hc, uint64_t parameter,
                                 uint8_t *slot_id) {
   if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE))
     return false;
-  spinlock_acquire(&hc->command_lock);
+  if (!xhci_wait_lock(&hc->command_busy))
+    return false;
   if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE)) {
-    spinlock_release(&hc->command_lock);
+    xhci_wait_unlock(&hc->command_busy);
     return false;
   }
   uint16_t index = hc->command_enqueue;
@@ -711,7 +739,7 @@ static bool xhci_submit_command(struct xhci_controller *hc, uint64_t parameter,
         klog_puts("\n");
       }
       bool ok = cc == XHCI_COMPLETION_SUCCESS;
-      spinlock_release(&hc->command_lock);
+      xhci_wait_unlock(&hc->command_busy);
       return ok;
     }
     hal_cpu_relax();
@@ -727,7 +755,7 @@ static bool xhci_submit_command(struct xhci_controller *hc, uint64_t parameter,
   klog_puts(" event_dequeue=");
   klog_uint64(hc->event_dequeue);
   klog_puts("\n");
-  spinlock_release(&hc->command_lock);
+  xhci_wait_unlock(&hc->command_busy);
   return false;
 }
 
@@ -854,19 +882,57 @@ static void xhci_reset_runtime_state(struct xhci_controller *hc) {
     state->ring = ring;
     state->ring_phys = ring_phys;
   }
+  for (uint32_t i = 0; i < XHCI_MAX_BULK_PIPES; i++) {
+    struct xhci_bulk_state *state = &hc->bulk_pipes[i];
+    struct xhci_trb *ring = state->ring;
+    uint64_t ring_phys = state->ring_phys;
+    memset(state, 0, sizeof(*state));
+    state->ring = ring;
+    state->ring_phys = ring_phys;
+  }
 }
 
+static uint8_t xhci_speed_id(enum usb_speed speed) {
+  switch (speed) {
+  case USB_SPEED_FULL: return 1;
+  case USB_SPEED_LOW: return 2;
+  case USB_SPEED_HIGH: return 3;
+  case USB_SPEED_SUPER: return 4;
+  case USB_SPEED_SUPER_PLUS: return 5;
+  default: return 0;
+  }
+}
+
+/* Slot Context for a device.  Root devices keep reading the speed from their
+ * port, as before.  A device behind a hub takes its route string, root port
+ * and speed from the topology, and an LS/FS device behind a high-speed hub
+ * names that hub's TT slot and port.  No root port is touched for children. */
 static void xhci_build_address_context(struct xhci_controller *hc,
                                        struct xhci_slot *slot) {
   memset(slot->input_context, 0, 4096);
   uint32_t *icc = xhci_context(slot->input_context, 0, hc->context_64);
   uint32_t *sc = xhci_context(slot->input_context, 1, hc->context_64);
   uint32_t *ep0 = xhci_context(slot->input_context, 2, hc->context_64);
+  struct usb_device *dev = slot->device;
   icc[1] = 3; // Add Slot Context and Endpoint Context 0.
-  uint32_t portsc = mmio_read32(hc->op, XHCI_PORTSC + slot->port * 0x10U);
-  uint8_t speed_id = XHCI_PORT_SPEED(portsc);
-  sc[0] = (1U << 27) | ((uint32_t)speed_id << 20);
-  sc[1] = ((uint32_t)slot->port + 1U) << 16;
+  uint8_t speed_id;
+  uint32_t route = 0;
+  uint8_t root_port = (uint8_t)(slot->port + 1U);
+  if (dev && dev->depth > 0) {
+    speed_id = xhci_speed_id(dev->speed);
+    route = dev->route & 0xFFFFFU;
+    root_port = dev->root_port;
+  } else {
+    uint32_t portsc = mmio_read32(hc->op, XHCI_PORTSC + slot->port * 0x10U);
+    speed_id = XHCI_PORT_SPEED(portsc);
+  }
+  sc[0] = (1U << 27) | ((uint32_t)speed_id << 20) | route;
+  sc[1] = (uint32_t)root_port << 16;
+  if (dev && dev->depth > 0 && dev->tt_hub && dev->tt_hub->hcd_data &&
+      (dev->speed == USB_SPEED_LOW || dev->speed == USB_SPEED_FULL)) {
+    struct xhci_slot *tt = dev->tt_hub->hcd_data;
+    sc[2] = (uint32_t)tt->id | ((uint32_t)dev->tt_port << 8);
+  }
   ep0[1] = (3U << 1) | (4U << 3) |
            ((uint32_t)slot->ep0_max_packet << 16);
   uint64_t dequeue = slot->ep0_ring_phys +
@@ -877,10 +943,20 @@ static void xhci_build_address_context(struct xhci_controller *hc,
   ep0[4] = 8;
 }
 
+/* Only the root-port entry points (usb_device_discovered and the port service
+ * paths) reset or read PORTSC for a device.  A device behind a hub is reset by
+ * its hub's class requests before usb_hub_child_discovered(), so this path
+ * just allocates a slot and addresses it. */
 static int xhci_prepare_device(struct usb_hcd *hcd, struct usb_device *dev) {
   struct xhci_controller *hc = hcd->priv;
   hc->debug_stage = "enable slot";
   hc->debug_last_port = dev->port;
+  if (dev->depth > 0 && dev->tt_hub &&
+      (dev->speed == USB_SPEED_LOW || dev->speed == USB_SPEED_FULL)) {
+    struct xhci_slot *tt = dev->tt_hub->hcd_data;
+    if (!tt || !tt->enabled)
+      return -1;
+  }
   uint8_t slot_id = 0;
   if (!xhci_submit_command(hc, 0, 0,
                            XHCI_TRB_TYPE(XHCI_TRB_ENABLE_SLOT), &slot_id) ||
@@ -985,28 +1061,41 @@ static uint64_t xhci_ep0_enqueue(struct xhci_slot *slot, uint64_t parameter,
   return phys;
 }
 
-static bool xhci_recover_ep0(struct xhci_controller *hc,
-                             struct xhci_slot *slot) {
-  hc->debug_stage = "reset halted EP0";
-  uint32_t endpoint = 1U << 16; /* DCI 1 is the default control endpoint. */
-  uint32_t slot_id = (uint32_t)slot->id << 24;
-  if (!xhci_submit_command(hc, 0, 0,
-                           XHCI_TRB_TYPE(XHCI_TRB_RESET_ENDPOINT) |
-                               endpoint | slot_id,
-                           NULL))
-    return false;
-
-  /* Skip every TRB left in the failed control TD. Reset Endpoint deliberately
-     preserves the old dequeue pointer, so Set TR Dequeue is required before a
-     retry can make progress. */
-  uint64_t dequeue = slot->ep0_ring_phys +
-                     slot->ep0_enqueue * sizeof(struct xhci_trb);
-  dequeue |= slot->ep0_cycle;
-  hc->debug_stage = "set EP0 dequeue";
+/* Reset a halted endpoint and move its dequeue pointer to `dequeue_phys` with
+ * cycle `cycle`.  Reset Endpoint deliberately preserves the old dequeue
+ * pointer, so Set TR Dequeue is required before the endpoint can make
+ * progress again.  Callers pass the position just past the failed TD. */
+static bool xhci_set_endpoint_dequeue(struct xhci_controller *hc,
+                                      uint8_t slot_id, uint8_t dci,
+                                      uint64_t dequeue_phys, uint8_t cycle) {
+  hc->debug_stage = "set endpoint dequeue";
+  uint64_t dequeue = dequeue_phys | cycle;
   return xhci_submit_command(hc, dequeue, 0,
                              XHCI_TRB_TYPE(XHCI_TRB_SET_TR_DEQUEUE) |
-                                 endpoint | slot_id,
+                                 ((uint32_t)dci << 16) |
+                                 ((uint32_t)slot_id << 24),
                              NULL);
+}
+
+static bool xhci_recover_endpoint(struct xhci_controller *hc, uint8_t slot_id,
+                                  uint8_t dci, uint64_t dequeue_phys,
+                                  uint8_t cycle) {
+  hc->debug_stage = "reset halted endpoint";
+  if (!xhci_submit_command(hc, 0, 0,
+                           XHCI_TRB_TYPE(XHCI_TRB_RESET_ENDPOINT) |
+                               ((uint32_t)dci << 16) |
+                               ((uint32_t)slot_id << 24),
+                           NULL))
+    return false;
+  return xhci_set_endpoint_dequeue(hc, slot_id, dci, dequeue_phys, cycle);
+}
+
+static bool xhci_recover_ep0(struct xhci_controller *hc,
+                             struct xhci_slot *slot) {
+  /* Skip every TRB left in the failed control TD. */
+  uint64_t dequeue = slot->ep0_ring_phys +
+                     slot->ep0_enqueue * sizeof(struct xhci_trb);
+  return xhci_recover_endpoint(hc, slot->id, 1, dequeue, slot->ep0_cycle);
 }
 
 static int xhci_control_device_locked(struct usb_hcd *hcd,
@@ -1156,13 +1245,14 @@ static int xhci_control_device(struct usb_hcd *hcd, struct usb_device *dev,
   struct xhci_controller *hc = hcd ? hcd->priv : NULL;
   if (!hc || __atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE))
     return -1;
-  spinlock_acquire(&hc->control_lock);
+  if (!xhci_wait_lock(&hc->control_busy))
+    return -1;
   if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE)) {
-    spinlock_release(&hc->control_lock);
+    xhci_wait_unlock(&hc->control_busy);
     return -1;
   }
   int result = xhci_control_device_locked(hcd, dev, req, data, len);
-  spinlock_release(&hc->control_lock);
+  xhci_wait_unlock(&hc->control_busy);
   return result;
 }
 
@@ -1318,6 +1408,397 @@ static void xhci_power_ports(struct xhci_controller *hc) {
   }
 }
 
+/* ---- Hub parameters and bulk transport ---- */
+
+/* Highest DCI in use on `dev` by any bulk pipe, starting from `current`. */
+static uint8_t xhci_bulk_max_dci(struct xhci_controller *hc,
+                                 struct usb_device *dev, uint8_t current) {
+  for (uint32_t i = 0; i < XHCI_MAX_BULK_PIPES; i++) {
+    struct xhci_bulk_state *b = &hc->bulk_pipes[i];
+    if (b->pipe.active && b->pipe.dev == dev && b->dci > current)
+      current = b->dci;
+  }
+  return current;
+}
+
+/* Highest DCI in use on `dev` across interrupt, isoch and bulk endpoints.
+ * Context Entries must cover every endpoint that stays configured. */
+static uint8_t xhci_endpoint_max_dci(struct xhci_controller *hc,
+                                     struct usb_device *dev) {
+  uint8_t max = 1;
+  for (uint32_t i = 0; i < XHCI_MAX_INTERRUPT_PIPES; i++) {
+    struct xhci_interrupt_state *s = &hc->interrupt_pipes[i];
+    if (s->pipe.active && s->pipe.dev == dev && s->endpoint_id > max)
+      max = s->endpoint_id;
+  }
+  for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+    struct xhci_isoch_state *s = &hc->isoch_streams[i];
+    if (s->stream.active && s->stream.dev == dev && s->endpoint_id > max)
+      max = s->endpoint_id;
+  }
+  return xhci_bulk_max_dci(hc, dev, max);
+}
+
+static int xhci_hub_configure(struct usb_hcd *hcd, struct usb_device *hub,
+                              uint8_t nports, bool multi_tt,
+                              uint8_t tt_think_time) {
+  struct xhci_controller *hc = hcd ? hcd->priv : NULL;
+  struct xhci_slot *slot = hub ? hub->hcd_data : NULL;
+  if (!hc || !slot || !slot->enabled || !hub->is_hub || !nports ||
+      tt_think_time > 3)
+    return -1;
+  memset(slot->input_context, 0, 4096);
+  uint32_t *icc = xhci_context(slot->input_context, 0, hc->context_64);
+  uint32_t *sc = xhci_context(slot->input_context, 1, hc->context_64);
+  uint32_t *out_sc = xhci_context(slot->output_context, 0, hc->context_64);
+  memcpy(sc, out_sc, hc->context_64 ? 64U : 32U);
+  /* Slot Context only.  Context Entries is copied from the output context, so
+   * the endpoints that are already configured stay as they are. */
+  icc[1] = 1U;
+  sc[0] = (sc[0] & ~((1U << 25) | (1U << 26))) | (1U << 26) |
+          (multi_tt ? (1U << 25) : 0);
+  sc[1] = (sc[1] & 0x00FFFFFFU) | ((uint32_t)nports << 24);
+  sc[2] = (sc[2] & ~(3U << 16)) | ((uint32_t)tt_think_time << 16);
+  hc->debug_stage = "hub slot configure";
+  if (!xhci_submit_command(hc, slot->input_context_phys, 0,
+                           XHCI_TRB_TYPE(XHCI_TRB_CONFIGURE_ENDPOINT) |
+                               ((uint32_t)slot->id << 24),
+                           NULL)) {
+    klog_puts("[XHCI] Hub slot configure failed\n");
+    return -1;
+  }
+  return 0;
+}
+
+static struct usb_bulk_pipe *xhci_bulk_open(struct usb_hcd *hcd,
+                                            struct usb_device *dev,
+                                            uint8_t endpoint,
+                                            uint16_t max_packet,
+                                            uint8_t max_burst) {
+  struct xhci_controller *hc = hcd ? hcd->priv : NULL;
+  struct xhci_slot *slot = dev ? dev->hcd_data : NULL;
+  uint8_t number = endpoint & 0x0FU;
+  if (!hc || !slot || !slot->enabled || !number || !max_packet ||
+      max_packet > 1024 || max_burst > 15)
+    return NULL;
+  bool in = (endpoint & 0x80U) != 0;
+  uint8_t dci = (uint8_t)(number * 2U + (in ? 1U : 0U));
+
+  /* One pipe per endpoint.  An interrupt or isoch endpoint with the same DCI
+   * on this device is a conflict, not a second user. */
+  struct xhci_bulk_state *state = NULL;
+  for (uint32_t i = 0; i < XHCI_MAX_BULK_PIPES; i++) {
+    struct xhci_bulk_state *b = &hc->bulk_pipes[i];
+    if (b->pipe.active && b->pipe.dev == dev && b->dci == dci)
+      return NULL;
+    if (!state && !b->pipe.active)
+      state = b;
+  }
+  for (uint32_t i = 0; i < XHCI_MAX_INTERRUPT_PIPES; i++) {
+    struct xhci_interrupt_state *s = &hc->interrupt_pipes[i];
+    if (s->pipe.active && s->pipe.dev == dev && s->endpoint_id == dci)
+      return NULL;
+  }
+  for (uint32_t i = 0; i < XHCI_MAX_ISOCH_STREAMS; i++) {
+    struct xhci_isoch_state *s = &hc->isoch_streams[i];
+    if (s->stream.active && s->stream.dev == dev && s->endpoint_id == dci)
+      return NULL;
+  }
+  if (!state)
+    return NULL;
+
+  /* Keep the ring page across reuse of the pool entry. */
+  struct xhci_trb *ring = state->ring;
+  uint64_t ring_phys = state->ring_phys;
+  memset(state, 0, sizeof(*state));
+  state->ring = ring;
+  state->ring_phys = ring_phys;
+  if (!state->ring &&
+      !xhci_alloc_page(hc, (void **)&state->ring, &state->ring_phys))
+    return NULL;
+  memset(state->ring, 0, 4096);
+  state->cycle = 1;
+  state->enqueue = 0;
+  state->ring[XHCI_RING_TRBS - 1].parameter = state->ring_phys;
+  state->ring[XHCI_RING_TRBS - 1].control =
+      XHCI_TRB_TYPE(XHCI_TRB_LINK) | XHCI_TRB_CYCLE | (1U << 1);
+  state->slot_id = slot->id;
+  state->dci = dci;
+  state->max_burst = max_burst;
+
+  /* Configure Endpoint adds only this DCI (and the slot, for Context Entries).
+   * Endpoints already running on the slot keep their data toggle and ring. */
+  memset(slot->input_context, 0, 4096);
+  uint32_t *icc = xhci_context(slot->input_context, 0, hc->context_64);
+  uint32_t *sc = xhci_context(slot->input_context, 1, hc->context_64);
+  uint32_t *out_sc = xhci_context(slot->output_context, 0, hc->context_64);
+  memcpy(sc, out_sc, hc->context_64 ? 64U : 32U);
+  uint8_t max_dci = xhci_endpoint_max_dci(hc, dev);
+  if (dci > max_dci)
+    max_dci = dci;
+  uint8_t existing = (uint8_t)((out_sc[0] >> 27) & 0x1FU);
+  if (existing > max_dci)
+    max_dci = existing;
+  sc[0] = (sc[0] & ~(0x1FU << 27)) | ((uint32_t)max_dci << 27);
+  icc[1] = 1U | (1U << dci);
+  uint32_t *ep = xhci_context(slot->input_context, dci + 1U, hc->context_64);
+  uint32_t ep_type = in ? 6U : 2U; /* 2 = Bulk OUT, 6 = Bulk IN */
+  ep[0] = 0;
+  ep[1] = (3U << 1) | (ep_type << 3) | ((uint32_t)max_burst << 8) |
+          ((uint32_t)max_packet << 16);
+  uint64_t dequeue = state->ring_phys | state->cycle;
+  ep[2] = (uint32_t)dequeue;
+  ep[3] = (uint32_t)(dequeue >> 32);
+  ep[4] = 3072U; /* Average TRB Length */
+
+  hc->debug_stage = "bulk endpoint configure";
+  if (!xhci_submit_command(hc, slot->input_context_phys, 0,
+                           XHCI_TRB_TYPE(XHCI_TRB_CONFIGURE_ENDPOINT) |
+                               ((uint32_t)slot->id << 24),
+                           NULL)) {
+    klog_puts("[XHCI] Bulk Configure Endpoint failed\n");
+    return NULL;
+  }
+  uint32_t *out_ep = xhci_context(slot->output_context, dci, hc->context_64);
+  if ((out_ep[0] & 7U) != 1U) {
+    klog_puts("[XHCI] Configured bulk endpoint is not running\n");
+    return NULL;
+  }
+  state->pipe.dev = dev;
+  state->pipe.hcd_data = state;
+  state->pipe.endpoint = endpoint;
+  state->pipe.max_packet = max_packet;
+  state->pipe.active = true;
+  return &state->pipe;
+}
+
+/* Publishes a TD of Normal TRBs (one per 64 KiB window, CH on all but the last,
+ * ISP on IN, IOC on the last) and rings the doorbell.  Returns the TRB count,
+ * or 0 when the transfer does not fit the TD limit. */
+static uint32_t xhci_bulk_build_td(struct xhci_bulk_state *st, uint64_t phys,
+                                   uint32_t len, bool in) {
+  uint32_t trbs = 0;
+  for (uint32_t off = 0; off < len;) {
+    uint32_t room = XHCI_BULK_CHUNK_BYTES - (uint32_t)((phys + off) & 0xFFFFU);
+    uint32_t chunk = len - off < room ? len - off : room;
+    off += chunk;
+    trbs++;
+  }
+  if (trbs == 0 || trbs > XHCI_BULK_MAX_TRBS)
+    return 0;
+
+  uint16_t first_index = st->enqueue;
+  uint8_t first_cycle = st->cycle;
+  uint32_t idx = 0;
+  for (uint32_t off = 0; off < len;) {
+    uint64_t p = phys + off;
+    uint32_t room = XHCI_BULK_CHUNK_BYTES - (uint32_t)(p & 0xFFFFU);
+    uint32_t chunk = len - off < room ? len - off : room;
+    uint32_t after = len - off - chunk;
+    uint32_t packets = (after + st->pipe.max_packet - 1U) / st->pipe.max_packet;
+    if (packets > 31U)
+      packets = 31U;
+    bool last = off + chunk == len;
+    uint32_t control = XHCI_TRB_TYPE(XHCI_TRB_NORMAL) |
+                       (last ? XHCI_TRB_IOC : XHCI_TRB_CHAIN) |
+                       (in ? XHCI_TRB_ISP : 0U);
+    struct xhci_trb *trb = &st->ring[st->enqueue];
+    trb->parameter = p;
+    trb->status = chunk | (packets << 17);
+    /* The first TRB is written with the inverse cycle bit and flipped last, so
+     * the controller cannot start on a TD that is still being built. */
+    trb->control = control | (idx == 0 ? (first_cycle ^ 1U) : first_cycle);
+    st->td_phys[idx] = st->ring_phys + st->enqueue * sizeof(struct xhci_trb);
+    st->td_len[idx] = chunk;
+    idx++;
+    st->enqueue++;
+    if (st->enqueue == XHCI_RING_TRBS - 1) {
+      st->ring[XHCI_RING_TRBS - 1].control =
+          XHCI_TRB_TYPE(XHCI_TRB_LINK) | st->cycle | (1U << 1);
+      st->enqueue = 0;
+      st->cycle ^= 1;
+    }
+    off += chunk;
+  }
+  st->td_count = (uint16_t)idx;
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  st->ring[first_index].control =
+      (st->ring[first_index].control & ~XHCI_TRB_CYCLE) | first_cycle;
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  return idx;
+}
+
+static int xhci_bulk_transfer(struct usb_hcd *hcd, struct usb_bulk_pipe *pipe,
+                              void *buf, uint64_t phys, uint32_t len,
+                              uint32_t *actual, uint32_t timeout_ms) {
+  (void)buf;
+  struct xhci_controller *hc = hcd ? hcd->priv : NULL;
+  struct xhci_bulk_state *st = pipe ? pipe->hcd_data : NULL;
+  struct xhci_slot *slot = pipe && pipe->dev ? pipe->dev->hcd_data : NULL;
+  if (actual)
+    *actual = 0;
+  if (!hc || !st || !slot || !slot->enabled || !pipe->active)
+    return USB_BULK_GONE;
+  if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE))
+    return USB_BULK_ERR;
+  if (!len)
+    return USB_BULK_OK;
+  if (!phys)
+    return USB_BULK_ERR;
+  bool in = (pipe->endpoint & 0x80U) != 0;
+
+  spinlock_acquire(&hc->bulk_lock);
+  st->done = false;
+  st->cc = 0;
+  st->residual = 0;
+  st->event_index = 0;
+  if (!xhci_bulk_build_td(st, phys, len, in)) {
+    spinlock_release(&hc->bulk_lock);
+    return USB_BULK_ERR;
+  }
+  hc->debug_stage = "bulk transfer";
+  __atomic_store_n(&st->waiting, true, __ATOMIC_RELEASE);
+  hc->doorbells[slot->id] = st->dci;
+
+  /* Polls the event ring like the control path does; xhci_drain_events()
+   * completes this TD via the DCI/TRB match above. */
+  uint64_t deadline = lapic_timer_get_ms() + timeout_ms;
+  bool gone = false;
+  for (;;) {
+    xhci_drain_events(hc, 0);
+    if (__atomic_load_n(&st->done, __ATOMIC_ACQUIRE))
+      break;
+    if (!__atomic_load_n(&pipe->active, __ATOMIC_ACQUIRE)) {
+      gone = true;
+      break;
+    }
+    if (lapic_timer_get_ms() >= deadline)
+      break;
+    hal_cpu_relax();
+  }
+  bool completed = __atomic_load_n(&st->done, __ATOMIC_ACQUIRE);
+  __atomic_store_n(&st->waiting, false, __ATOMIC_RELEASE);
+
+  if (completed) {
+    uint8_t cc = st->cc;
+    spinlock_release(&hc->bulk_lock);
+    if (cc == XHCI_BULK_CC_CANCELLED)
+      return USB_BULK_GONE;
+    if (cc == XHCI_COMPLETION_SUCCESS || cc == 13U) {
+      /* Bytes before the event TRB, plus what the event TRB moved. */
+      uint32_t moved = 0;
+      uint16_t ev = st->event_index;
+      for (uint16_t t = 0; t < ev; t++)
+        moved += st->td_len[t];
+      uint32_t residual = st->residual;
+      if (residual > st->td_len[ev])
+        residual = st->td_len[ev];
+      moved += st->td_len[ev] - residual;
+      if (actual)
+        *actual = moved;
+      st->completions++;
+      return USB_BULK_OK;
+    }
+    if (cc == 6U) {
+      st->stalls++;
+      return USB_BULK_STALL; /* Endpoint halted; usb_clear_halt() recovers. */
+    }
+    klog_puts("[XHCI] bulk transfer failed: completion=");
+    klog_uint64(cc);
+    klog_puts("\n");
+    return USB_BULK_ERR; /* Error completions also halt the endpoint. */
+  }
+
+  if (gone) {
+    spinlock_release(&hc->bulk_lock);
+    return USB_BULK_GONE;
+  }
+
+  /* Timeout: stop the endpoint, then move its dequeue past this TD so the next
+   * transfer does not replay it.  Stop leaves the endpoint Stopped, so Set TR
+   * Dequeue alone is valid; if Stop fails the endpoint is halted and a full
+   * reset is needed. */
+  st->timeouts++;
+  hc->debug_stage = "bulk timeout";
+  uint64_t past = st->ring_phys + st->enqueue * sizeof(struct xhci_trb);
+  bool stopped = xhci_submit_command(
+      hc, 0, 0,
+      XHCI_TRB_TYPE(XHCI_TRB_STOP_ENDPOINT) | ((uint32_t)st->dci << 16) |
+          ((uint32_t)slot->id << 24),
+      NULL);
+  if (stopped)
+    xhci_set_endpoint_dequeue(hc, slot->id, st->dci, past, st->cycle);
+  else
+    xhci_recover_endpoint(hc, slot->id, st->dci, past, st->cycle);
+  spinlock_release(&hc->bulk_lock);
+  return USB_BULK_TIMEOUT;
+}
+
+static int xhci_bulk_clear_halt(struct usb_hcd *hcd,
+                                struct usb_bulk_pipe *pipe) {
+  struct xhci_controller *hc = hcd ? hcd->priv : NULL;
+  struct xhci_bulk_state *st = pipe ? pipe->hcd_data : NULL;
+  struct xhci_slot *slot = pipe && pipe->dev ? pipe->dev->hcd_data : NULL;
+  if (!hc || !st || !slot || !slot->enabled || !pipe->active)
+    return USB_BULK_GONE;
+  /* Reset Endpoint is only valid for a Halted endpoint.  A running or
+   * stopped endpoint has no failed TD to skip, so there is nothing to do. */
+  uint32_t *out_ep = xhci_context(slot->output_context, st->dci, hc->context_64);
+  if ((out_ep[0] & 7U) != 2U)
+    return USB_BULK_OK;
+  uint64_t dequeue = st->ring_phys + st->enqueue * sizeof(struct xhci_trb);
+  spinlock_acquire(&hc->bulk_lock);
+  bool ok = xhci_recover_endpoint(hc, slot->id, st->dci, dequeue, st->cycle);
+  spinlock_release(&hc->bulk_lock);
+  return ok ? USB_BULK_OK : USB_BULK_ERR;
+}
+
+static void xhci_bulk_close(struct usb_hcd *hcd, struct usb_bulk_pipe *pipe) {
+  struct xhci_controller *hc = hcd ? hcd->priv : NULL;
+  struct xhci_bulk_state *st = pipe ? pipe->hcd_data : NULL;
+  if (!hc || !st || !pipe->active)
+    return;
+  struct usb_device *dev = pipe->dev;
+  struct xhci_slot *slot = dev ? dev->hcd_data : NULL;
+  /* Inactive first, so the Context Entries computed below leave it out. */
+  pipe->active = false;
+  pipe->dev = NULL;
+  if (!slot || !slot->enabled)
+    return;
+  spinlock_acquire(&hc->bulk_lock);
+  xhci_submit_command(hc, 0, 0,
+                      XHCI_TRB_TYPE(XHCI_TRB_STOP_ENDPOINT) |
+                          ((uint32_t)st->dci << 16) |
+                          ((uint32_t)slot->id << 24),
+                      NULL);
+  uint32_t *icc = xhci_context(slot->input_context, 0, hc->context_64);
+  uint32_t *sc = xhci_context(slot->input_context, 1, hc->context_64);
+  uint32_t *out_sc = xhci_context(slot->output_context, 0, hc->context_64);
+  memset(slot->input_context, 0, 4096);
+  memcpy(sc, out_sc, hc->context_64 ? 64U : 32U);
+  uint8_t max_dci = xhci_endpoint_max_dci(hc, dev);
+  sc[0] = (sc[0] & ~(0x1FU << 27)) | ((uint32_t)max_dci << 27);
+  icc[0] = 1U << st->dci; /* Drop this endpoint */
+  icc[1] = 1U;            /* Slot Context: Context Entries may shrink */
+  if (!xhci_submit_command(hc, slot->input_context_phys, 0,
+                           XHCI_TRB_TYPE(XHCI_TRB_CONFIGURE_ENDPOINT) |
+                               ((uint32_t)slot->id << 24),
+                           NULL))
+    klog_puts("[XHCI] Bulk endpoint drop failed\n");
+  spinlock_release(&hc->bulk_lock);
+}
+
+/* Removal with a transfer in flight: the waiter sees the cancelled completion
+ * and returns USB_BULK_GONE.  Caller holds the slot's removal path. */
+static void xhci_bulk_detach(struct xhci_bulk_state *st) {
+  if (__atomic_load_n(&st->waiting, __ATOMIC_ACQUIRE)) {
+    st->cc = XHCI_BULK_CC_CANCELLED;
+    __atomic_store_n(&st->done, true, __ATOMIC_RELEASE);
+  }
+  __atomic_store_n(&st->pipe.active, false, __ATOMIC_RELEASE);
+  st->pipe.dev = NULL;
+}
+
 static void xhci_remove_device(struct usb_hcd *hcd, struct usb_device *dev) {
   struct xhci_controller *hc = hcd->priv;
   struct xhci_slot *slot = dev ? dev->hcd_data : NULL;
@@ -1341,6 +1822,11 @@ static void xhci_remove_device(struct usb_hcd *hcd, struct usb_device *dev) {
       __atomic_store_n(&state->stopping, false, __ATOMIC_RELEASE);
       __atomic_store_n(&state->reserved, 0, __ATOMIC_RELEASE);
       state->stream.dev = NULL;
+    }
+    for (uint32_t i = 0; i < XHCI_MAX_BULK_PIPES; i++) {
+      struct xhci_bulk_state *state = &hc->bulk_pipes[i];
+      if (state->pipe.dev == dev)
+        xhci_bulk_detach(state);
     }
     ((uint64_t *)hc->dcbaa)[slot->id] = 0;
     slot->enabled = false;
@@ -1389,6 +1875,13 @@ static void xhci_remove_device(struct usb_hcd *hcd, struct usb_device *dev) {
     state->pipe.active = false;
     __atomic_store_n(&state->completed, false, __ATOMIC_RELEASE);
     state->pipe.dev = NULL;
+  }
+  /* Cancel bulk TDs in flight and free the pipes before the slot goes away.
+   * PORTSC is not touched: a child's removal never resets a root port. */
+  for (uint32_t i = 0; i < XHCI_MAX_BULK_PIPES; i++) {
+    struct xhci_bulk_state *state = &hc->bulk_pipes[i];
+    if (state->pipe.dev == dev)
+      xhci_bulk_detach(state);
   }
   bool disabled = xhci_submit_command(
       hc, 0, 0,
@@ -1581,6 +2074,7 @@ static struct usb_interrupt_pipe *xhci_interrupt_open(
     if (other->endpoint_id > max_dci)
       max_dci = other->endpoint_id;
   }
+  max_dci = xhci_bulk_max_dci(hc, dev, max_dci);
   sc[0] = (sc[0] & ~(0x1FU << 27)) | ((uint32_t)max_dci << 27);
   icc[1] = add_flags;
 
@@ -1803,6 +2297,7 @@ static struct usb_isoch_stream *xhci_isoch_open(
         other->endpoint_id > max_dci)
       max_dci = other->endpoint_id;
   }
+  max_dci = xhci_bulk_max_dci(hc, dev, max_dci);
   sc[0] = (sc[0] & ~(0x1FU << 27)) | ((uint32_t)max_dci << 27);
   icc[1] = 1U | (1U << state->endpoint_id);
   uint32_t *ep = xhci_context(slot->input_context,
@@ -1896,6 +2391,32 @@ static int xhci_isoch_submit(struct usb_hcd *hcd,
   __atomic_store_n(&state->submitting, 0, __ATOMIC_RELEASE);
   hal_irq_restore(irq_flags);
   return 0;
+}
+
+/* Command and control waits can last a whole timeout.  Holding a spinlock
+ * for that long kept interrupts masked on the CPU, starving TLB shootdowns
+ * and the timer.  These locks leave interrupts as the caller had them: a
+ * thread waits with interrupts on, and a caller in interrupt context
+ * (interrupts masked on entry) tries once, so it never spins against the
+ * thread it interrupted. */
+static bool xhci_wait_lock(uint8_t *busy) {
+  hal_irq_state_t flags = hal_irq_save();
+  hal_irq_restore(flags);
+  bool may_wait = (flags & SPINLOCK_RFLAGS_IF) != 0;
+  while (__atomic_test_and_set(busy, __ATOMIC_ACQUIRE)) {
+    if (!may_wait)
+      return false;
+    hal_cpu_relax();
+  }
+  return true;
+}
+
+static bool xhci_wait_trylock(uint8_t *busy) {
+  return !__atomic_test_and_set(busy, __ATOMIC_ACQUIRE);
+}
+
+static void xhci_wait_unlock(uint8_t *busy) {
+  __atomic_clear(busy, __ATOMIC_RELEASE);
 }
 
 static void xhci_wait_event_dispatch(struct xhci_controller *hc) {
@@ -2348,6 +2869,11 @@ static bool xhci_probe(struct pci_device *pci) {
   hc->hcd.isoch_open = xhci_isoch_open;
   hc->hcd.isoch_submit = xhci_isoch_submit;
   hc->hcd.isoch_cancel = xhci_isoch_cancel;
+  hc->hcd.hub_configure = xhci_hub_configure;
+  hc->hcd.bulk_open = xhci_bulk_open;
+  hc->hcd.bulk_transfer = xhci_bulk_transfer;
+  hc->hcd.bulk_clear_halt = xhci_bulk_clear_halt;
+  hc->hcd.bulk_close = xhci_bulk_close;
   klog_puts("[XHCI] Command/event rings operational (v");
   klog_hex32(hc->version);
   if (hc->msix_enabled)

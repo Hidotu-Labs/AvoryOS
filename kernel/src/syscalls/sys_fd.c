@@ -3009,51 +3009,63 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
         return (uint64_t)-6;
     }
 
+    /* The block filesystems adopt mountpoint in place.  Keep the pre-mount
+     * image so umount can put the directory back. */
+    vfs_node_t *saved = kmalloc(sizeof(vfs_node_t));
+    if (!saved) {
+        vfs_close(mountpoint);
+        return (uint64_t)-12;
+    }
+    memcpy(saved, mountpoint, sizeof(vfs_node_t));
+
     if (fstype) {
         if (strcmp(fstype, "vfat") == 0 || strcmp(fstype, "fat32") == 0 || strcmp(fstype, "msdos") == 0) {
             if (fat32_mount(dev, mountpoint) == 0) {
-                vfs_mount_ex(mountpoint, mountpoint, dev->name, "vfat", target);
+                vfs_mount_inplace(mountpoint, saved, dev, dev->name, "vfat", target, NULL, fat32_unmount, fat32_live_nodes);
                 return 0;
             }
+            kfree(saved);
             vfs_close(mountpoint);
             return (uint64_t)-22;
         }
         if (strcmp(fstype, "ext4") == 0) {
             if (ext4_mount(dev, mountpoint) == 0) {
-                vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext4", target);
+                vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext4", target, ext4_unmount, NULL, NULL);
                 return 0;
             }
             if (ext2_mount(dev, mountpoint) == 0) {
-                vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext2", target);
+                vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext2", target, ext2_unmount, NULL, NULL);
                 return 0;
             }
+            kfree(saved);
             vfs_close(mountpoint);
             return (uint64_t)-22;
         }
         if (strcmp(fstype, "ext2") == 0 || strcmp(fstype, "ext3") == 0) {
             if (ext2_mount(dev, mountpoint) == 0) {
-                vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext2", target);
+                vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext2", target, ext2_unmount, NULL, NULL);
                 return 0;
             }
             if (ext4_mount(dev, mountpoint) == 0) {
-                vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext4", target);
+                vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext4", target, ext4_unmount, NULL, NULL);
                 return 0;
             }
+            kfree(saved);
             vfs_close(mountpoint);
             return (uint64_t)-22;
         }
     }
 
     if (ext4_mount(dev, mountpoint) == 0) {
-        vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext4", target);
+        vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext4", target, ext4_unmount, NULL, NULL);
         return 0;
     }
     if (ext2_mount(dev, mountpoint) == 0) {
-        vfs_mount_ex(mountpoint, mountpoint, dev->name, "ext2", target);
+        vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext2", target, ext2_unmount, NULL, NULL);
         return 0;
     }
     if (fat32_mount(dev, mountpoint) == 0) {
-        vfs_mount_ex(mountpoint, mountpoint, dev->name, "vfat", target);
+        vfs_mount_inplace(mountpoint, saved, dev, dev->name, "vfat", target, NULL, fat32_unmount, fat32_live_nodes);
         return 0;
     }
 
@@ -3061,6 +3073,7 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
      * On success the filesystem adopts the node in place (clearing
      * FS_PERSISTENT), so that reference is what keeps the mounted root alive
      * and must not be dropped. */
+    kfree(saved);
     vfs_close(mountpoint);
     return (uint64_t)-22;
 }
@@ -3082,7 +3095,8 @@ static uint64_t sys_umount2(uint64_t target_ptr, uint64_t flags,
         result = !(flags & 2) && fuse_mount_busy(point) ? -16 :
             vfs_initial_unmount(point, (unsigned)flags);
         if (!result) fuse_detach_mount(point);
-    } else result = vfs_namespace_active() ? vfs_namespace_umount(point, (unsigned)flags) : -95;
+    } else if (vfs_namespace_active()) result = vfs_namespace_umount(point, (unsigned)flags);
+    else result = vfs_inplace_unmount(point, (unsigned)flags);
     vfs_close(point);
     return (uint64_t)result;
 }

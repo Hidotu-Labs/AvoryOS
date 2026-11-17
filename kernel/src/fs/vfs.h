@@ -424,6 +424,14 @@ int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
                  const char *dev_name, const char *fs_type,
                  const char *path);
 int vfs_initial_unmount(vfs_node_t *root, unsigned flags);
+struct block_device;
+int vfs_mount_inplace(vfs_node_t *node, vfs_node_t *saved,
+                      struct block_device *dev, const char *dev_name,
+                      const char *fs_type, const char *path,
+                      int (*fs_flush)(vfs_node_t *),
+                      void (*fs_free)(vfs_node_t *),
+                      int (*fs_busy)(vfs_node_t *));
+int vfs_inplace_unmount(vfs_node_t *point, unsigned flags);
 int vfs_statfs(vfs_node_t *node, void *buf);
 
 /* In-memory extended attributes (fs/xattr.c). Generic per-node store backing

@@ -135,6 +135,9 @@ typedef struct {
   uint32_t total_clusters;      // Total data clusters
   uint32_t cluster_count;       // Number of clusters
   vfs_node_t *root_node;        // VFS node for root directory
+  /* Nodes made by fat32_make_vfs_node() that are not yet released.  Read by
+   * the in-place umount busy check (fat32_live_nodes). */
+  uint32_t live_nodes;
 } fat32_mount_t;
 
 /* Native x86_64 VFAT directory ioctl ABI. Names are lengths, not record sizes. */
@@ -152,6 +155,15 @@ int fat32_read_aliases(vfs_node_t *node, uint32_t index, bool short_only,
 // Mount a FAT32 filesystem from the given block device onto the given VFS node.
 // Returns 0 on success, -1 on failure.
 int fat32_mount(struct block_device *dev, vfs_node_t *mountpoint);
+
+// Release the mount state of a FAT32 root mounted by fat32_mount().  Called by
+// the VFS detach path with the root still attached (root->device names the
+// mount).  FAT32 writes through, so there is no dirty state to flush first.
+void fat32_unmount(vfs_node_t *root);
+
+// Number of fat32 nodes of this mount still alive (excludes the root node).
+// Nonzero means the mount is busy and must not be detached.
+int fat32_live_nodes(vfs_node_t *root);
 
 // Mount FAT32 as the root filesystem, replacing the current fs_root.
 // Returns 0 on success, -1 on failure.

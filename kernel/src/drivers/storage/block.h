@@ -117,10 +117,27 @@ struct block_device {
     char partlabel[64];         // Null-terminated PARTLABEL string
     uint8_t type_guid[16];      // Raw 16-byte partition type GUID
     uint8_t partition_type;     // enum partition_type
+
+    /* Hot-plug state.  block_unregister() sets `gone` first; from then on
+     * every I/O entry point returns -1 without reaching the driver.  The
+     * struct is never freed, so /dev nodes, partitions and open descriptors
+     * may keep a pointer to it safely. */
+    bool gone;
+    bool removable;             // sysfs removable=1 (USB mass storage)
+    bool read_only;             // sysfs ro=1 and BLKROGET, whatever write_sectors says
 };
 
-// Register a block device. Returns 0 on success, -1 if full.
+static inline bool block_device_gone(const struct block_device *dev) {
+    return __atomic_load_n(&dev->gone, __ATOMIC_SEQ_CST);
+}
+
+// Register a block device. Returns 0 on success, -1 if full.  Emits a sysfs
+// "add" uevent when sysfs is already up (hot-plug), then scans partitions.
 int block_register(struct block_device *dev);
+
+// Remove a block device: partitions first, then /dev, sysfs (with a "remove"
+// uevent) and the registry slot.  The struct stays allocated.  Idempotent.
+void block_unregister(struct block_device *dev);
 
 // Get a registered block device by index. Returns NULL if invalid.
 struct block_device *block_get(int index);

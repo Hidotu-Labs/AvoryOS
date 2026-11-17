@@ -30,6 +30,7 @@
 #include "../../io/io.h"
 #include "../../lib/string.h"
 #include "../../mm/dma_alloc.h"
+#include "../../mm/heap.h"
 #include "../input/mouse.h"
 #include "ehci.h"
 #include "ohci.h"
@@ -1031,9 +1032,27 @@ static int usb_mouse_clear_halt(struct usb_device *dev, uint8_t ep_addr) {
   return usb_control_transfer(dev, &req, NULL, 0);
 }
 
+/* The candidate array holds one full HID layout per interface (several KB
+ * each).  Probing runs on 16 KB kernel stacks, including the hub worker's,
+ * where it used to overflow into neighbouring pages, so it lives on the
+ * heap. */
+static bool usb_mouse_probe_with(struct usb_device *dev,
+                                 struct mouse_candidate *candidates);
+
 bool usb_mouse_probe(struct usb_device *dev) {
   if (!dev || !dev->hcd)
     return false;
+  struct mouse_candidate *candidates =
+      kmalloc(sizeof(*candidates) * HID_MAX_CANDIDATES);
+  if (!candidates)
+    return false;
+  bool claimed = usb_mouse_probe_with(dev, candidates);
+  kfree(candidates);
+  return claimed;
+}
+
+static bool usb_mouse_probe_with(struct usb_device *dev,
+                                 struct mouse_candidate *candidates) {
 
   klogf("[USB-MOUSE] driver build %s %s\n", __DATE__, __TIME__);
   klogf("[USB-MOUSE] probe begin addr=%u port=%u speed=%s hcd=%s vid=0x%04X "
@@ -1099,7 +1118,6 @@ bool usb_mouse_probe(struct usb_device *dev) {
   //    IN endpoints.  The report descriptor is deliberately NOT fetched here:
   //    class requests to an unconfigured device STALL on some real hardware
   //    (Linux fetches report descriptors only after SET_CONFIGURATION).
-  struct mouse_candidate candidates[HID_MAX_CANDIDATES];
   int candidate_count = 0;
   struct mouse_candidate *current = NULL;
 

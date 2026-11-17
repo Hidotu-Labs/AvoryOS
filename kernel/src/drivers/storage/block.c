@@ -4,9 +4,15 @@
 #include <stddef.h>
 
 #include "fs/devfs.h"
+#include "fs/sysfs.h"
+#include "lock/spinlock.h"
 
+/* registered[] is compacted on removal.  next_minor only grows, so a
+ * replugged disk never reuses the minor of a live device. */
 static struct block_device *registered[BLOCK_MAX_DEVICES];
 static int num_devices = 0;
+static uint32_t next_minor = 0;
+static spinlock_t block_table_lock = SPINLOCK_INIT;
 
 #include "fs/ramfs.h"
 #include "fs/vfs.h"
@@ -61,10 +67,28 @@ struct partition_wrapper {
   uint64_t start_lba;
 };
 
+static struct block_device *partition_parent(const struct block_device *dev) {
+  const struct partition_wrapper *wrap =
+      (const struct partition_wrapper *)dev->driver_data;
+  return wrap ? wrap->parent : NULL;
+}
+
+/* A partition is unusable once it or its disk is being removed. */
+static bool partition_gone(const struct block_device *dev) {
+  struct block_device *parent = partition_parent(dev);
+  return block_device_gone(dev) || (parent && block_device_gone(parent));
+}
+
+/* Batch members must each get a verdict, even when the whole batch fails. */
+static void block_batch_fail(struct block_io_req *reqs, unsigned n) {
+  for (unsigned i = 0; i < n; i++)
+    reqs[i].result = -1;
+}
+
 static int partition_read(struct block_device *dev, uint64_t lba,
                           uint32_t count, void *buf) {
   struct partition_wrapper *wrap = (struct partition_wrapper *)dev->driver_data;
-  if (!wrap || !wrap->parent || !buf || count == 0 ||
+  if (partition_gone(dev) || !wrap || !wrap->parent || !buf || count == 0 ||
       lba >= dev->total_sectors ||
       (uint64_t)count > dev->total_sectors - lba)
     return -1;
@@ -78,7 +102,7 @@ static int partition_read(struct block_device *dev, uint64_t lba,
 static int partition_write(struct block_device *dev, uint64_t lba,
                            uint32_t count, const void *buf) {
   struct partition_wrapper *wrap = (struct partition_wrapper *)dev->driver_data;
-  if (!wrap || !wrap->parent || !wrap->parent->write_sectors || !buf ||
+  if (partition_gone(dev) || !wrap || !wrap->parent || !wrap->parent->write_sectors || !buf ||
       count == 0 || lba >= dev->total_sectors ||
       (uint64_t)count > dev->total_sectors - lba)
     return -1;
@@ -92,7 +116,7 @@ static int partition_write(struct block_device *dev, uint64_t lba,
 static int partition_write_fua(struct block_device *dev, uint64_t lba,
                                uint32_t count, const void *buf) {
   struct partition_wrapper *wrap = (struct partition_wrapper *)dev->driver_data;
-  if (!wrap || !wrap->parent || !wrap->parent->write_sectors || !buf ||
+  if (partition_gone(dev) || !wrap || !wrap->parent || !wrap->parent->write_sectors || !buf ||
       count == 0 || lba >= dev->total_sectors ||
       (uint64_t)count > dev->total_sectors - lba)
     return -1;
@@ -113,7 +137,7 @@ static int partition_write_fua(struct block_device *dev, uint64_t lba,
 
 static int partition_flush(struct block_device *dev) {
   struct partition_wrapper *wrap = (struct partition_wrapper *)dev->driver_data;
-  if (!wrap || !wrap->parent)
+  if (partition_gone(dev) || !wrap || !wrap->parent)
     return -1;
   return block_flush(wrap->parent);
 }
@@ -131,8 +155,13 @@ static bool partition_batch_member_valid(const struct block_device *dev,
 static int partition_read_batch(struct block_device *dev,
                                 struct block_io_req *reqs, unsigned n) {
   struct partition_wrapper *wrap = (struct partition_wrapper *)dev->driver_data;
-  if (!wrap || !wrap->parent || !wrap->parent->read_sectors || !reqs || n == 0)
+  if (!reqs || n == 0)
     return -1;
+  if (partition_gone(dev) || !wrap || !wrap->parent ||
+      !wrap->parent->read_sectors) {
+    block_batch_fail(reqs, n);
+    return -1;
+  }
   int worst = 0;
   unsigned i = 0;
   while (i < n) {
@@ -162,8 +191,13 @@ static int partition_read_batch(struct block_device *dev,
 static int partition_write_batch(struct block_device *dev,
                                  struct block_io_req *reqs, unsigned n) {
   struct partition_wrapper *wrap = (struct partition_wrapper *)dev->driver_data;
-  if (!wrap || !wrap->parent || !wrap->parent->write_sectors || !reqs || n == 0)
+  if (!reqs || n == 0)
     return -1;
+  if (partition_gone(dev) || !wrap || !wrap->parent ||
+      !wrap->parent->write_sectors) {
+    block_batch_fail(reqs, n);
+    return -1;
+  }
   int worst = 0;
   unsigned i = 0;
   while (i < n) {
@@ -410,7 +444,7 @@ static int block_vfs_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) {
     int *out = (int *)arg;
     if (!out || !vmm_is_user_addr_range_valid(arg, sizeof(int)))
       return -14;
-    *out = dev->write_sectors ? 0 : 1;
+    *out = (dev->read_only || !dev->write_sectors) ? 1 : 0;
     return 0;
   }
 
@@ -531,23 +565,34 @@ struct block_device *block_get_by_name(const char *name) {
 }
 
 int block_register(struct block_device *dev) {
-  if (num_devices >= BLOCK_MAX_DEVICES)
+  if (!dev)
     return -1;
+  spinlock_acquire(&block_table_lock);
+  if (num_devices >= BLOCK_MAX_DEVICES) {
+    spinlock_release(&block_table_lock);
+    return -1;
+  }
   /* Assign a stable Linux-compatible device number once. NVMe uses major
-   * 259 like Linux; everything else uses major 8. Minor is the registration
-   * index, unique across whole disks and partitions. */
+   * 259 like Linux; everything else uses major 8. Minor comes from a counter
+   * that is never reused, so removal cannot make two live devices collide. */
   if (dev->linux_major == 0 && dev->linux_minor == 0) {
     if (strncmp(dev->name, "nvme", 4) == 0)
       dev->linux_major = 259;
     else
       dev->linux_major = 8;
-    dev->linux_minor = (uint32_t)num_devices;
+    dev->linux_minor = next_minor++;
   }
   registered[num_devices++] = dev;
+  spinlock_release(&block_table_lock);
 
   // Register to VFS if root exists
   if (fs_root)
     block_publish_node(dev);
+
+  // Hot-plug: announce the node with an "add" uevent.  A no-op during early
+  // boot, where the sysfs populate pass publishes it instead.  Done before
+  // the partition scan so a disk's "add" always precedes its partitions'.
+  sysfs_block_device_added(dev);
 
   // Auto-scan for partitions if this isn't already a partition
   if (!block_is_partition(dev)) {
@@ -557,23 +602,83 @@ int block_register(struct block_device *dev) {
   return 0;
 }
 
-struct block_device *block_get(int index) {
-  if (index < 0 || index >= num_devices)
-    return NULL;
-  return registered[index];
+/* Remove a device and, first, every partition on it.  Order: stop I/O (gone),
+ * drop the /dev node, emit "remove" and drop the sysfs entries, then free the
+ * registry slot.  The struct itself is never freed: partitions, /dev vnodes
+ * and open descriptors may still point at it, and they all see gone. */
+void block_unregister(struct block_device *dev) {
+  if (!dev)
+    return;
+  __atomic_store_n(&dev->gone, true, __ATOMIC_SEQ_CST);
+
+  for (;;) {
+    struct block_device *child = NULL;
+    spinlock_acquire(&block_table_lock);
+    for (int i = 0; i < num_devices && !child; i++) {
+      struct block_device *d = registered[i];
+      if (d && d != dev && block_is_partition(d) && partition_parent(d) == dev)
+        child = d;
+    }
+    spinlock_release(&block_table_lock);
+    if (!child)
+      break;
+    block_unregister(child);
+  }
+
+  spinlock_acquire(&block_table_lock);
+  bool present = false;
+  for (int i = 0; i < num_devices; i++)
+    if (registered[i] == dev) {
+      present = true;
+      break;
+    }
+  spinlock_release(&block_table_lock);
+  if (!present)
+    return;
+
+  vfs_node_t *node = devfs_lookup(dev->name);
+  if (node && node->device == dev)
+    devfs_unregister_node(dev->name, node);
+
+  sysfs_block_device_removed(dev);
+
+  spinlock_acquire(&block_table_lock);
+  for (int i = 0; i < num_devices; i++) {
+    if (registered[i] == dev) {
+      for (int j = i + 1; j < num_devices; j++)
+        registered[j - 1] = registered[j];
+      num_devices--;
+      registered[num_devices] = NULL;
+      break;
+    }
+  }
+  spinlock_release(&block_table_lock);
 }
 
-int block_count(void) { return num_devices; }
+struct block_device *block_get(int index) {
+  spinlock_acquire(&block_table_lock);
+  struct block_device *dev =
+      (index < 0 || index >= num_devices) ? NULL : registered[index];
+  spinlock_release(&block_table_lock);
+  return dev;
+}
+
+int block_count(void) {
+  spinlock_acquire(&block_table_lock);
+  int n = num_devices;
+  spinlock_release(&block_table_lock);
+  return n;
+}
 
 int block_flush(struct block_device *dev) {
-  if (!dev)
+  if (!dev || block_device_gone(dev))
     return -1;
   return dev->flush ? dev->flush(dev) : 0;
 }
 
 int block_write_fua(struct block_device *dev, uint64_t lba, uint32_t count,
                     const void *buf) {
-  if (!dev || !buf)
+  if (!dev || !buf || block_device_gone(dev))
     return -1;
   if (dev->write_sectors_fua)
     return dev->write_sectors_fua(dev, lba, count, buf);
@@ -596,6 +701,10 @@ int block_read_batch(struct block_device *dev, struct block_io_req *reqs,
                      unsigned n) {
   if (!dev || !reqs || n == 0)
     return -1;
+  if (block_device_gone(dev)) {
+    block_batch_fail(reqs, n);
+    return -1;
+  }
   if (dev->read_batch)
     return dev->read_batch(dev, reqs, n);
   for (unsigned i = 0; i < n; i++)
@@ -610,6 +719,10 @@ int block_write_batch(struct block_device *dev, struct block_io_req *reqs,
                       unsigned n) {
   if (!dev || !reqs || n == 0)
     return -1;
+  if (block_device_gone(dev)) {
+    block_batch_fail(reqs, n);
+    return -1;
+  }
   if (dev->write_batch)
     return dev->write_batch(dev, reqs, n);
   for (unsigned i = 0; i < n; i++)

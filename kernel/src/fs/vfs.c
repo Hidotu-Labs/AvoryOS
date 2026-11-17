@@ -3,6 +3,7 @@
 #include "devfs.h"
 #include "../sched/capability.h"
 #include "vfs_rcu.h"
+#include "drivers/storage/block.h"
 #include "dirindex.h"
 #include "inotify.h"
 #include "../console/klog.h"
@@ -91,6 +92,17 @@ typedef struct vfs_mount_entry {
    * OpenRC's mountinfo compare the second field against a full path, and with
    * only "run" they would mount a fresh tmpfs over the kernel's /run. */
   char path[256];
+  /* In-place block mounts (vfat/ext) adopt the mountpoint node.  `saved` is
+   * the node image from before the mount and is copied back on umount; `dev`
+   * is flushed on detach.  fs_flush runs before the mount lock is taken (it
+   * may sleep); fs_free runs under the lock and releases the fs state. */
+  vfs_node_t *saved;
+  struct block_device *dev;
+  int (*fs_flush)(vfs_node_t *root);
+  void (*fs_free)(vfs_node_t *root);
+  /* Live-node count of the filesystem (0 = idle).  NULL when the fs has no
+   * count, in which case only the root refcount decides. */
+  int (*fs_busy)(vfs_node_t *root);
   struct vfs_mount_entry *next;
 } vfs_mount_entry_t;
 
@@ -101,8 +113,12 @@ static vfs_node_t *vfs_follow_mount(vfs_node_t *node) {
   vfs_node_t *result = NULL;
   spinlock_acquire(&vfs_mount_lock);
   for (vfs_mount_entry_t *m = vfs_mount_list; m; m = m->next) {
-    if (m->mountpoint && m->mountpoint->inode == node->inode &&
-        m->mountpoint->device == node->device && m->target != node) {
+    /* An in-place mount overwrites the mountpoint node's identity with the
+     * mounted root's, so match fresh lookups of the covered directory
+     * against the pre-mount snapshot. */
+    const vfs_node_t *id = m->saved ? m->saved : m->mountpoint;
+    if (m->mountpoint && id->inode == node->inode && id->device == node->device &&
+        m->target != node) {
       if (vfs_node_tryref(m->target)) result = m->target;
       break;
     }
@@ -2271,6 +2287,11 @@ int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
   entry->mountpoint = mountpoint;
   entry->target = target;
   entry->point_was_persistent = mountpoint && (mountpoint->flags & FS_PERSISTENT);
+  entry->saved = NULL;
+  entry->dev = NULL;
+  entry->fs_flush = NULL;
+  entry->fs_free = NULL;
+  entry->fs_busy = NULL;
   entry->mount_id = __atomic_fetch_add(&vfs_next_mount_id, 1, __ATOMIC_RELAXED);
   target->mount_id = entry->mount_id;
   strncpy(entry->dev_name, dev_name ? dev_name : "none", 63);
@@ -2347,6 +2368,188 @@ int vfs_initial_unmount(vfs_node_t *root, unsigned flags) {
   vfs_dentry_invalidate(NULL, NULL);
   vfs_close(m->mountpoint); vfs_close(root); kfree(m);
   return 0;
+}
+
+/* Pins that keep an in-place block mount busy:
+ *  - live filesystem nodes (fs_busy, fat32): every node the filesystem made
+ *    and has not released, including open files and directories;
+ *  - the adopted root's own references (open directory fd, dentry parent);
+ *  - a thread whose cwd or root node is the mount root or inside the mount.
+ * MNT_FORCE/MNT_DETACH skip these checks.  A filesystem with live nodes keeps
+ * its state allocated instead of freeing it, because stale descriptors still
+ * point into it. */
+#define VFS_INPLACE_BASE_REFS 2u
+
+/* A cwd/root pins the mount if it is the adopted root, a node of the mounted
+ * fs, or the covered directory itself: chdir stores the node path lookup
+ * returns, which for the mountpoint is a fresh node of the parent fs with the
+ * snapshot's inode. */
+static bool vfs_inplace_node_in_mount(const vfs_node_t *n, const vfs_node_t *root,
+                                      uint64_t mount_id, const vfs_node_t *saved) {
+  return n && (n == root || (mount_id && n->mount_id == mount_id) ||
+               (saved && n->inode == saved->inode && n->device == saved->device &&
+                n->mount_id == saved->mount_id));
+}
+
+/* Caller must hold no VFS lock; tid_lock is taken here. */
+static bool vfs_inplace_thread_pins(const vfs_node_t *root, uint64_t mount_id,
+                                    const vfs_node_t *saved) {
+  extern spinlock_t tid_lock;
+  bool pinned = false;
+  spinlock_acquire(&tid_lock);
+  for (struct thread *t = sched_get_thread_list_head(); t && !pinned;
+       t = t->global_next)
+    pinned = vfs_inplace_node_in_mount(t->cwd_node, root, mount_id, saved) ||
+             vfs_inplace_node_in_mount(t->fs_root_node, root, mount_id, saved);
+  spinlock_release(&tid_lock);
+  return pinned;
+}
+
+/* Detaches a block filesystem that was mounted in place (no mount namespace). */
+int vfs_inplace_unmount(vfs_node_t *point, unsigned flags) {
+  if (flags & ~(1u | 2u | 8u)) return -22;
+  if (vfs_namespace_active()) return -95;
+  if (!point || point == fs_root) return -22;
+  bool override = (flags & (1u | 2u)) != 0;
+  /* vfs_is_mount_root() takes vfs_mount_lock itself; ask before locking. */
+  bool point_is_root = point->mount_id && vfs_is_mount_root(point);
+
+  spinlock_acquire(&vfs_mount_lock);
+  vfs_mount_entry_t *m = NULL;
+  /* Path lookup may hand back a different node object for the same mount
+   * root (dentry cache, ephemeral ext nodes), so also match the mount id of
+   * a node that is that mount's root.  All work below uses the recorded
+   * target, the node the filesystem actually adopted. */
+  for (vfs_mount_entry_t *c = vfs_mount_list; c; c = c->next)
+    if (c->saved && (c->target == point ||
+                     (point_is_root && c->mount_id == point->mount_id) ||
+                     /* ext2/ext4 build a fresh node per lookup, so the
+                      * resolved path is the covered directory: match the
+                      * pre-mount snapshot by inode on the same fs. */
+                     (c->saved->inode == point->inode &&
+                      c->saved->device == point->device &&
+                      c->saved->mount_id == point->mount_id))) {
+      m = c;
+      break;
+    }
+  if (!m) { spinlock_release(&vfs_mount_lock); return -22; }
+  vfs_node_t *root = m->target;
+  uint64_t mount_id = m->mount_id;
+  const vfs_node_t *saved = m->saved;
+  int (*fs_busy)(vfs_node_t *) = m->fs_busy;
+  /* The mount entry holds one reference; the caller's lookup holds another
+   * only when it resolved to the adopted node itself. */
+  uint32_t base_refs = root == point ? VFS_INPLACE_BASE_REFS
+                                     : VFS_INPLACE_BASE_REFS - 1;
+  struct block_device *dev = m->dev;
+  int (*fs_flush)(vfs_node_t *) = m->fs_flush;
+  spinlock_release(&vfs_mount_lock);
+
+  if (!override) {
+    /* Cached dentries hold child and parent references that look like pins;
+     * drop them before judging the mount. */
+    vfs_dentry_invalidate(NULL, NULL);
+    if ((fs_busy && fs_busy(root) > 0) ||
+        vfs_inplace_thread_pins(root, mount_id, saved) ||
+        __atomic_load_n(&root->refcount, __ATOMIC_ACQUIRE) > base_refs)
+      return -16;
+  }
+
+  /* Flush outside the lock: fs and block flushes may sleep.  Errors are
+   * ignored once the device is gone so a yanked stick can still be detached. */
+  if (fs_flush && fs_flush(root) != 0 && !(dev && block_device_gone(dev)))
+    return -5;
+  if (dev && block_flush(dev) != 0 && !block_device_gone(dev))
+    return -5;
+
+  /* The mounted root's cached pages and readdir state describe the FAT
+   * directory; drop them so the restored node lists its own contents. */
+  vfs_cache_invalidate_range(root, 0, 0xFFFFFFFFu);
+  vfs_dentry_invalidate(NULL, NULL);
+  spinlock_acquire(&vfs_mount_lock);
+  vfs_mount_entry_t **p = &vfs_mount_list;
+  while (*p && *p != m) p = &(*p)->next;
+  if (!*p) { spinlock_release(&vfs_mount_lock); return -22; }
+  /* Re-check under the mount lock: a node created since the first check must
+   * still block the detach. */
+  bool fs_live = fs_busy && fs_busy(root) > 0;
+  if (!override &&
+      (fs_live || __atomic_load_n(&root->refcount, __ATOMIC_ACQUIRE) > base_refs)) {
+    spinlock_release(&vfs_mount_lock); return -16;
+  }
+  *p = m->next;
+
+  /* Free the fs state while root->device still names it, then copy back the
+   * pre-mount image.  Runtime state (refcount, locks, page cache, parent and
+   * view links, list heads, rcu link) is live, not part of the image, so it
+   * is carried over from the current node.  A filesystem with live nodes is
+   * never freed: those nodes still point at its state. */
+  bool free_fs = m->fs_free && (fs_busy ? !fs_live : !override);
+  if (free_fs) m->fs_free(root);
+  vfs_node_t live;
+  memcpy(&live, root, sizeof(live));
+  memcpy(root, m->saved, sizeof(*root));
+  root->refcount = live.refcount;
+  root->magic = live.magic;
+  root->reclaim_state = live.reclaim_state;
+  root->view_backing = live.view_backing;
+  root->view_parent = live.view_parent;
+  root->parent_node = live.parent_node;
+  root->parent_lock = live.parent_lock;
+  root->filesystem_mount_flags = live.filesystem_mount_flags;
+  root->pages = live.pages;
+  root->pages_lock = live.pages_lock;
+  root->pc_cache_chunk = live.pc_cache_chunk;
+  root->pc_cache_leaf = live.pc_cache_leaf;
+  root->pc_cache_seq = live.pc_cache_seq;
+  root->ra_prev_offset = live.ra_prev_offset;
+  root->ra_window = live.ra_window;
+  root->ra_seq_hits = live.ra_seq_hits;
+  root->readdir_generation = live.readdir_generation + 1;
+  root->readdir_cursor_lock = live.readdir_cursor_lock;
+  root->wait_queue = live.wait_queue;
+  root->xattrs = live.xattrs;
+  root->ep_watchers = live.ep_watchers;
+  root->ep_lock = live.ep_lock;
+  root->rcu = live.rcu;
+  spinlock_release(&vfs_mount_lock);
+
+  vfs_dentry_invalidate(NULL, NULL);
+  vfs_close(root);  /* the reference the mount entry held */
+  klogf("[VFS] unmounted %s (mount %llu)\n", m->path, (unsigned long long)m->mount_id);
+  kfree(m->saved);
+  kfree(m);
+  return 0;
+}
+
+/* Records an in-place block mount made by a filesystem's *_mount(), which has
+ * already adopted `node`.  Takes ownership of `saved` (the pre-mount image).
+ * fs_busy returns the filesystem's live-node count (0 when idle); NULL means
+ * the filesystem has no node count and the root refcount decides. */
+int vfs_mount_inplace(vfs_node_t *node, vfs_node_t *saved,
+                      struct block_device *dev, const char *dev_name,
+                      const char *fs_type, const char *path,
+                      int (*fs_flush)(vfs_node_t *),
+                      void (*fs_free)(vfs_node_t *),
+                      int (*fs_busy)(vfs_node_t *)) {
+  int result = vfs_mount_ex(node, node, dev_name, fs_type, path);
+  if (result == 0) {
+    spinlock_acquire(&vfs_mount_lock);
+    for (vfs_mount_entry_t *m = vfs_mount_list; m; m = m->next) {
+      if (m->target == node && !m->saved) {
+        m->saved = saved;
+        m->dev = dev;
+        m->fs_flush = fs_flush;
+        m->fs_free = fs_free;
+        m->fs_busy = fs_busy;
+        saved = NULL;
+        break;
+      }
+    }
+    spinlock_release(&vfs_mount_lock);
+  }
+  kfree(saved);
+  return result;
 }
 
 int vfs_mount(vfs_node_t *mountpoint, vfs_node_t *target) {

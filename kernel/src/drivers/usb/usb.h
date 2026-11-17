@@ -15,6 +15,7 @@ enum usb_speed {
 
 struct usb_device;
 struct usb_interrupt_pipe;
+struct usb_bulk_pipe;
 
 struct usb_hcd_stats {
   uint64_t control_submitted;
@@ -65,6 +66,28 @@ struct usb_isoch_stream {
   uint8_t endpoint;
   bool active;
 };
+
+/* Bulk endpoint handle, one per endpoint address.  Transfers on one pipe must
+ * be serialised by the caller; different pipes may be used concurrently.
+ * usb_bulk_transfer() blocks (polling the HCD event ring) until the transfer
+ * completes, stalls, times out or the device goes away. */
+struct usb_bulk_pipe {
+  struct usb_device *dev;
+  void *hcd_data;
+  uint8_t endpoint; // Endpoint address, direction bit included
+  uint16_t max_packet;
+  bool active;
+};
+
+/* usb_bulk_transfer() results.  Zero is success; a short IN packet is success
+ * with *actual < len.  After USB_BULK_STALL the endpoint is halted and the
+ * caller must call usb_clear_halt() before reusing it.  After
+ * USB_BULK_TIMEOUT the transfer has been cancelled and the pipe is usable. */
+#define USB_BULK_OK 0
+#define USB_BULK_ERR (-1)
+#define USB_BULK_STALL (-2)
+#define USB_BULK_TIMEOUT (-3)
+#define USB_BULK_GONE (-4)
 
 // USB Request Types
 #define USB_REQ_GET_STATUS 0x00
@@ -141,6 +164,19 @@ struct usb_hcd {
                       struct usb_isoch_packet *packet);
   bool (*isoch_cancel)(struct usb_hcd *hcd,
                        struct usb_isoch_stream *stream);
+  /* Hub parameters for a hub device (Slot Context Hub/MTT/ports/think time). */
+  int (*hub_configure)(struct usb_hcd *hcd, struct usb_device *hub,
+                       uint8_t nports, bool multi_tt, uint8_t tt_think_time);
+  struct usb_bulk_pipe *(*bulk_open)(struct usb_hcd *hcd,
+                                     struct usb_device *dev, uint8_t endpoint,
+                                     uint16_t max_packet, uint8_t max_burst);
+  int (*bulk_transfer)(struct usb_hcd *hcd, struct usb_bulk_pipe *pipe,
+                       void *buf, uint64_t phys, uint32_t len,
+                       uint32_t *actual, uint32_t timeout_ms);
+  /* Resets the halted endpoint and moves its dequeue past any failed TD.  The
+   * class-generic CLEAR_FEATURE(ENDPOINT_HALT) is sent by usb_clear_halt(). */
+  int (*bulk_clear_halt)(struct usb_hcd *hcd, struct usb_bulk_pipe *pipe);
+  void (*bulk_close)(struct usb_hcd *hcd, struct usb_bulk_pipe *pipe);
   struct usb_hcd_stats stats;
 };
 
@@ -156,13 +192,37 @@ struct usb_device {
   void *hcd_data;
   struct usb_device_descriptor desc;
   struct usb_hcd *hcd; // Reference to the host controller driver
-  uint8_t claimed_by;  // 0=none, bit0=keyboard, bit1=mouse, bit2=hub
+  uint8_t claimed_by;  // USB_CLAIM_* bits
   /* Enumeration retry.  A device that fails its first descriptor read used to
    * stay dead until it was unplugged; real controllers can NAK/timeout once
    * during link training.  The watchdog retries a bounded number of times. */
   uint8_t enumerate_attempts;
   bool enumerate_failed;
+
+  /* Topology.  A device is identified by (hcd, parent, parent_port); root-port
+   * devices have parent NULL and parent_port 0.  `port` is always the 0-based
+   * ROOT port, for children too, so root-port code (xHCI slot setup, the
+   * diagnostics) keeps its meaning. */
+  struct usb_device *parent;
+  uint8_t parent_port; // 1-based hub port on parent; 0 for root devices
+  uint8_t root_port;   // 1-based root port number (the "3" in "1-3.2.4")
+  uint8_t depth;       // 0 for root devices, at most USB_MAX_DEPTH
+  uint32_t route;      // USB route string: 4-bit hub port per tier, tier 1 in bits 3:0
+  struct usb_device *tt_hub; // Nearest HS hub above an LS/FS device, else NULL
+  uint8_t tt_port;           // 1-based port on tt_hub that leads to this device
+  bool is_hub;
+  uint8_t num_ports;         // Downstream ports (hubs only)
+  bool multi_tt;             // Hub has one TT per port (hubs only)
 };
+
+/* USB allows five hub tiers below the root; a device at depth 6 is rejected. */
+#define USB_MAX_DEPTH 5
+
+/* Bits in usb_device.claimed_by. */
+#define USB_CLAIM_KBD 0x01
+#define USB_CLAIM_MOUSE 0x02
+#define USB_CLAIM_HUB 0x04
+#define USB_CLAIM_STORAGE 0x08
 
 // Diagnostics
 //
@@ -232,10 +292,44 @@ int usb_isoch_submit(struct usb_isoch_stream *stream,
 bool usb_isoch_completed(struct usb_isoch_packet *packet);
 bool usb_isoch_cancel(struct usb_isoch_stream *stream);
 
+/* Bulk transport.  usb_bulk_open() configures one endpoint on a device whose
+ * configuration is already set (SET_CONFIGURATION); it does not disturb other
+ * endpoints on the slot.  `phys` must be the DMA address of `buf`. */
+struct usb_bulk_pipe *usb_bulk_open(struct usb_device *dev, uint8_t endpoint,
+                                    uint16_t max_packet, uint8_t max_burst);
+int usb_bulk_transfer(struct usb_bulk_pipe *pipe, void *buf, uint64_t phys,
+                      uint32_t len, uint32_t *actual, uint32_t timeout_ms);
+/* Recovers a halted endpoint: HCD reset plus CLEAR_FEATURE(ENDPOINT_HALT). */
+int usb_clear_halt(struct usb_bulk_pipe *pipe);
+void usb_bulk_close(struct usb_bulk_pipe *pipe);
+
+/* Hub-only: program Hub/MTT/Number of Ports/TT Think Time into the hub's Slot
+ * Context.  Call after the hub is configured and before its children run. */
+int usb_hub_configure(struct usb_device *hub, uint8_t nports, bool multi_tt,
+                      uint8_t tt_think_time);
+
+/* Boot-time mass-storage BOT self-test (usb_storage_probe.c).  Runs only with
+ * usb_storage_probe=1 on the kernel command line, after enumeration, and only
+ * on devices with a class 08/06/50 interface. */
+void usb_storage_probe_smoke(struct usb_device *dev);
+void usb_storage_boot_smoke(void);
+
 // Called by HC driver when a new device is detected on a root hub port
 void usb_device_discovered(struct usb_hcd *hcd, uint8_t port,
                            enum usb_speed speed);
 void usb_device_removed(struct usb_hcd *hcd, uint8_t port);
+
+/* Called by a hub driver for its downstream ports.  `port` is the 1-based hub
+ * port.  Returns 0 when the device is attached (or was already present), -1
+ * when the topology is invalid (not a hub, depth > USB_MAX_DEPTH, bad port) or
+ * no slot is free.  Removal recursively takes every device below the port. */
+int usb_hub_child_discovered(struct usb_device *hub, uint8_t port,
+                             enum usb_speed speed);
+void usb_hub_child_removed(struct usb_device *hub, uint8_t port);
+
+/* Boot-time self-test of route, TT and removal-order logic on a private mock
+ * tree.  Runs only with usb_topology_selftest=1 on the kernel command line. */
+void usb_topology_selftest(void);
 
 /* Retry devices whose enumeration failed (bounded per device).  Called from
  * the xHCI watchdog so a one-off descriptor timeout does not leave a device
