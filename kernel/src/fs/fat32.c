@@ -19,15 +19,28 @@ static int fat32_rmdir_impl(vfs_node_t *parent, char *name);
 static int fat32_truncate_impl(vfs_node_t *node, uint32_t new_size);
 int fat32_statfs_impl(vfs_node_t *node, struct statfs_buf *buf);
 
-// Live-node accounting.  Every node from fat32_make_vfs_node() is counted
-// on its mount; the count drops when the node is released by the VFS
-// (->destroy, see fat32_node_destroy) or freed directly by fat32 code
-// (fat32_node_drop).
+static void fat32_mount_free(fat32_mount_t *mnt) {
+  kfree(mnt->root_node);
+  block_put(mnt->dev);
+  kfree(mnt);
+}
+
+// Mount lifetime.  `refs` is one for the mount itself plus one per node from
+// fat32_make_vfs_node().  A node's reference drops when the VFS releases it
+// (->destroy, see fat32_node_destroy) or fat32 code frees it directly
+// (fat32_node_drop); the mount's drops in fat32_unmount().  Whichever is last
+// frees the state, so a forced unmount with open files frees it on the last
+// close instead of leaking it.
+static void fat32_mount_put(fat32_mount_t *mnt) {
+  if (__atomic_sub_fetch(&mnt->refs, 1, __ATOMIC_ACQ_REL) == 0)
+    fat32_mount_free(mnt);
+}
+
 static void fat32_node_drop(vfs_node_t *node) {
   fat32_mount_t *mnt = (fat32_mount_t *)node->device;
-  if (mnt)
-    __atomic_sub_fetch(&mnt->live_nodes, 1, __ATOMIC_ACQ_REL);
   kfree(node);
+  if (mnt)
+    fat32_mount_put(mnt);
 }
 
 static void fat32_node_destroy(vfs_node_t *node) {
@@ -36,7 +49,8 @@ static void fat32_node_destroy(vfs_node_t *node) {
    * it), so that node still references the mount and keeps counting. */
   if (!mnt || ((node->flags & FS_PERSISTENT) && !(node->flags & FS_DELETED)))
     return;
-  __atomic_sub_fetch(&mnt->live_nodes, 1, __ATOMIC_ACQ_REL);
+  node->device = NULL;
+  fat32_mount_put(mnt);
 }
 
 // Internal Helpers
@@ -687,8 +701,9 @@ static void get_fat_time(uint16_t *date, uint16_t *time) {
 }
 
 // Create a new file in a directory (VFS create callback)
-static int fat32_create_impl(vfs_node_t *parent, char *name,
-                             uint16_t permission) {
+/* Add a directory entry `name` to `parent`. A directory also gets a fresh
+ * zeroed cluster holding its "." and ".." entries. */
+static int fat32_create_entry(vfs_node_t *parent, char *name, uint8_t attr) {
   fat32_mount_t *mnt = (fat32_mount_t *)parent->device;
   if (!mnt)
     return -1;
@@ -787,8 +802,7 @@ static int fat32_create_impl(vfs_node_t *parent, char *name,
     }
   }
 
-  // Set attributes (create regular file, not directory - mkdir handles that)
-  new_entry->attr = 0; // Regular file
+  new_entry->attr = attr;
   new_entry->reserved = 0;
   get_fat_time(&new_entry->create_date, &new_entry->create_time);
   new_entry->last_access_date = new_entry->create_date;
@@ -796,6 +810,45 @@ static int fat32_create_impl(vfs_node_t *parent, char *name,
   get_fat_time(&new_entry->modify_date, &new_entry->modify_time);
   new_entry->cluster_low = 0;
   new_entry->file_size = 0;
+
+  if (attr & FAT32_ATTR_DIRECTORY) {
+    uint32_t sub = fat32_alloc_cluster(mnt, 0);
+    uint8_t *sub_buf = sub ? kmalloc(cluster_size) : NULL;
+    if (!sub_buf) {
+      if (sub)
+        fat32_free_cluster_chain(mnt, sub);
+      kfree(cluster_buf);
+      return -1;
+    }
+    memset(sub_buf, 0, cluster_size);
+    fat32_dir_entry_t *dot = (fat32_dir_entry_t *)sub_buf;
+    /* ".." of a root-level directory points at cluster 0 by the FAT spec. */
+    uint32_t up = dir_cluster == mnt->root_cluster ? 0 : dir_cluster;
+    for (int i = 0; i < 2; i++) {
+      memset(dot[i].name, ' ', 11);
+      dot[i].name[0] = '.';
+      if (i == 1)
+        dot[i].name[1] = '.';
+      uint32_t c = i == 0 ? sub : up;
+      dot[i].attr = FAT32_ATTR_DIRECTORY;
+      dot[i].create_date = new_entry->create_date;
+      dot[i].create_time = new_entry->create_time;
+      dot[i].modify_date = new_entry->modify_date;
+      dot[i].modify_time = new_entry->modify_time;
+      dot[i].last_access_date = new_entry->create_date;
+      dot[i].cluster_high = (uint16_t)(c >> 16);
+      dot[i].cluster_low = (uint16_t)(c & 0xFFFF);
+    }
+    int wr = fat32_write_cluster(mnt, sub, sub_buf);
+    kfree(sub_buf);
+    if (wr != 0) {
+      fat32_free_cluster_chain(mnt, sub);
+      kfree(cluster_buf);
+      return -1;
+    }
+    new_entry->cluster_high = (uint16_t)(sub >> 16);
+    new_entry->cluster_low = (uint16_t)(sub & 0xFFFF);
+  }
 
   // Write directory entry back
   if (fat32_write_cluster(mnt, entry_cluster, cluster_buf) != 0) {
@@ -805,6 +858,18 @@ static int fat32_create_impl(vfs_node_t *parent, char *name,
 
   kfree(cluster_buf);
   return 0; // Success
+}
+
+static int fat32_create_impl(vfs_node_t *parent, char *name,
+                             uint16_t permission) {
+  (void)permission;
+  return fat32_create_entry(parent, name, 0);
+}
+
+static int fat32_mkdir_impl(vfs_node_t *parent, char *name,
+                            uint16_t permission) {
+  (void)permission;
+  return fat32_create_entry(parent, name, FAT32_ATTR_DIRECTORY);
 }
 
 // VFS Operations
@@ -914,6 +979,7 @@ static vfs_node_t *fat32_make_vfs_node(fat32_mount_t *mnt,
     node->readdir = fat32_readdir_impl;
     node->finddir = fat32_finddir_impl;
     node->create = fat32_create_impl;
+    node->mkdir = fat32_mkdir_impl;
     node->unlink = fat32_unlink_impl;
     node->rmdir = fat32_rmdir_impl;
   } else {
@@ -935,7 +1001,7 @@ static vfs_node_t *fat32_make_vfs_node(fat32_mount_t *mnt,
    * the count is returned even when the node is not retired. */
   node->flags |= FS_AUTODESTROY;
   node->destroy = fat32_node_destroy;
-  __atomic_add_fetch(&mnt->live_nodes, 1, __ATOMIC_ACQ_REL);
+  __atomic_add_fetch(&mnt->refs, 1, __ATOMIC_ACQ_REL);
 
   return node;
 }
@@ -1378,7 +1444,6 @@ int fat32_mount(struct block_device *dev, vfs_node_t *mountpoint) {
     return -1;
   memset(mnt, 0, sizeof(fat32_mount_t));
 
-  mnt->dev = dev;
   memcpy(&mnt->boot, boot, sizeof(fat32_boot_sector_t));
   mnt->bytes_per_sector = boot->bpb.bytes_per_sector;
   mnt->sectors_per_cluster = boot->bpb.sectors_per_cluster;
@@ -1440,6 +1505,7 @@ int fat32_mount(struct block_device *dev, vfs_node_t *mountpoint) {
   root_vfs->readdir = fat32_readdir_impl;
   root_vfs->finddir = fat32_finddir_impl;
   root_vfs->create = fat32_create_impl;
+  root_vfs->mkdir = fat32_mkdir_impl;
   root_vfs->unlink = fat32_unlink_impl;
   root_vfs->rmdir = fat32_rmdir_impl;
   root_vfs->mask = 0755;
@@ -1448,13 +1514,33 @@ int fat32_mount(struct block_device *dev, vfs_node_t *mountpoint) {
 
   mnt->root_node = root_vfs;
 
-  // Wire up the mountpoint
+  mnt->dev = block_ref(dev);
+  mnt->refs = 1;
+
+  // Wire up the mountpoint. It is usually a directory of another filesystem
+  // (the ESP on an ext4 root), so every operation it inherited must go: an
+  // ext4 mkdir left in place would run against this FAT32 mount as if it were
+  // an ext2_mount_t and read garbage journal state.
   mountpoint->flags = FS_DIRECTORY;
   mountpoint->inode = mnt->root_cluster;
   mountpoint->device = mnt;
+  mountpoint->read = NULL;
+  mountpoint->write = NULL;
+  mountpoint->append = NULL;
+  mountpoint->mknod = NULL;
+  mountpoint->readlink = NULL;
+  mountpoint->symlink = NULL;
+  mountpoint->rename = NULL;
+  mountpoint->chmod = NULL;
+  mountpoint->chown = NULL;
+  mountpoint->truncate = NULL;
+  mountpoint->mmap = NULL;
+  mountpoint->fallocate = NULL;
+  mountpoint->get_nlink = NULL;
   mountpoint->readdir = fat32_readdir_impl;
   mountpoint->finddir = fat32_finddir_impl;
   mountpoint->create = fat32_create_impl;
+  mountpoint->mkdir = fat32_mkdir_impl;
   mountpoint->unlink = fat32_unlink_impl;
   mountpoint->rmdir = fat32_rmdir_impl;
   mountpoint->statfs = fat32_statfs_impl;
@@ -1467,16 +1553,13 @@ int fat32_live_nodes(vfs_node_t *root) {
   fat32_mount_t *mnt = root ? (fat32_mount_t *)root->device : NULL;
   if (!mnt)
     return 0;
-  return (int)__atomic_load_n(&mnt->live_nodes, __ATOMIC_ACQUIRE);
+  return (int)__atomic_load_n(&mnt->refs, __ATOMIC_ACQUIRE) - 1;
 }
 
 void fat32_unmount(vfs_node_t *root) {
   fat32_mount_t *mnt = root ? (fat32_mount_t *)root->device : NULL;
-  if (!mnt)
-    return;
-  if (mnt->root_node)
-    kfree(mnt->root_node);
-  kfree(mnt);
+  if (mnt)
+    fat32_mount_put(mnt);
 }
 
 int fat32_mount_root(struct block_device *dev) {
@@ -1528,6 +1611,7 @@ void fat32_self_test(void) {
   vfs_node_t *mountpoint = kmalloc(sizeof(vfs_node_t));
   if (!mountpoint) {
     klog_puts("[FAT32] TEST FAIL: Out of memory\n");
+    block_put(dev);
     return;
   }
   vfs_node_init(mountpoint);
@@ -1770,16 +1854,15 @@ void fat32_self_test(void) {
     failed++;
   }
 
-  // Cleanup
+  // Cleanup.  The test frees its nodes with kfree(), bypassing the mount's
+  // reference count, so free the mount state directly.
   fat32_mount_t *mnt = (fat32_mount_t *)mountpoint->device;
-  if (mnt) {
-    if (mnt->root_node)
-      kfree(mnt->root_node);
-    kfree(mnt);
-  }
+  if (mnt)
+    fat32_mount_free(mnt);
   kfree(mountpoint);
 
 summary:
+  block_put(dev);
   klog_puts("\n[FAT32] ═══ Test Summary ═══\n");
   klog_puts("Passed: ");
   klog_uint64(passed);

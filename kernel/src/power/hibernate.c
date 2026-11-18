@@ -77,6 +77,9 @@ static bool hibernate_extract_resume_arg(char *out, size_t out_cap) {
   return false;
 }
 
+/* Returns a block reference that the S4 paths never drop: the image target
+ * stays pinned, which matters only if it is a removable disk (its struct then
+ * outlives an unplug instead of being freed under a resume in progress). */
 struct block_device *hibernate_find_target(void) {
   char spec[128];
   if (hibernate_extract_resume_arg(spec, sizeof(spec))) {

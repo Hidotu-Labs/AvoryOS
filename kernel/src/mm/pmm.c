@@ -332,6 +332,17 @@ void pmm_mark_used(void *ptr, size_t count) {
   }
 }
 
+/* Low-watermark hook for kswapd. The reclaim thread installs it; the buddy
+ * slow path calls it once free memory falls under the watermark. The hook
+ * only wakes the thread, so the allocator never reclaims inline. */
+static size_t pmm_low_watermark_pages;
+static void (*pmm_low_watermark_hook)(void);
+
+void pmm_set_low_watermark(size_t pages, void (*hook)(void)) {
+  pmm_low_watermark_pages = pages;
+  __atomic_store_n(&pmm_low_watermark_hook, hook, __ATOMIC_RELEASE);
+}
+
 __attribute__((optimize("O3"))) void *pmm_alloc_pages(size_t count) {
   if (count == 0)
     return NULL;
@@ -344,6 +355,9 @@ __attribute__((optimize("O3"))) void *pmm_alloc_pages(size_t count) {
   void *res = pmm_alloc_pages_node(count, node);
   if (res && pmm_sites_enabled)
     pmm_site_record_alloc(count, __builtin_return_address(0));
+  void (*hook)(void) = __atomic_load_n(&pmm_low_watermark_hook, __ATOMIC_ACQUIRE);
+  if (res && hook && pmm_get_free_pages_including_pcp() < pmm_low_watermark_pages)
+    hook();
   return res;
 }
 

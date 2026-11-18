@@ -92,11 +92,13 @@ void ext3_journal_release_owner(uint32_t tid) {
     /* The previous owner finished and handed the still-held lock to this
      * thread, which died before its ext3_journal_start() consumed the grant.
      * Nothing was staged; pass ownership on. */
+    hal_irq_state_t irq_flags = hal_irq_save();
     rawspinlock_acquire(&trans->sched_lock);
     bool pending_grant = trans->granted_tid == tid;
     if (pending_grant)
       trans->granted_tid = 0;
     rawspinlock_release(&trans->sched_lock);
+    hal_irq_restore(irq_flags);
     if (pending_grant) {
       klogf("[JBD2] granted owner tid=%u died before starting, handing off\n",
             tid);
@@ -262,17 +264,25 @@ static uint32_t ext3_payload_pos(uint32_t index, uint32_t tagcap) {
 }
 
 /* Consume a pending ownership grant for this tid. The grant keeps the
- * transaction lock held and `active` true across the handoff. */
+ * transaction lock held and `active` true across the handoff.
+ *
+ * sched_lock is a raw spinlock that ext3_grant_next() and the waiter recheck
+ * take with IRQs masked, so every holder must mask them too: a holder
+ * preempted on this CPU could otherwise never run again while the next
+ * thread here spins on the lock with IRQs off (seen as a hung CPU in mkdir
+ * right after a writer process exited). */
 static bool ext3_take_grant(ext3_journal_state_t *trans, uint32_t tid) {
   if (!tid)
     return false;
   if (__atomic_load_n(&trans->granted_tid, __ATOMIC_ACQUIRE) != tid)
     return false;
+  hal_irq_state_t irq_flags = hal_irq_save();
   rawspinlock_acquire(&trans->sched_lock);
   bool mine = trans->granted_tid == tid;
   if (mine)
     trans->granted_tid = 0;
   rawspinlock_release(&trans->sched_lock);
+  hal_irq_restore(irq_flags);
   return mine;
 }
 

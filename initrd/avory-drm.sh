@@ -14,10 +14,23 @@ EOF
             export KWIN_RENDER_NODES="$_avory_render"
         fi
         if [ "$_avory_driver" = nouveau ]; then
-            # Current NVIDIA hardware uses Mesa's NVK Vulkan driver through
-            # Zink for OpenGL, including KWin's EGL renderer and Qt clients.
-            export NOUVEAU_USE_ZINK="${NOUVEAU_USE_ZINK:-1}"
-            export MESA_VK_WSI_PRESENT_MODE="${MESA_VK_WSI_PRESENT_MODE:-immediate}"
+            # NVK (and Zink over NVK) only supports Turing (0x1e00+) and newer.
+            # Pre-Turing GPUs (Kepler/Maxwell/Pascal) fall back to Gallium nouveau.
+            _nouveau_supports_nvk=0
+            for _drm_dev in /sys/class/drm/card*/device; do
+                [ -r "$_drm_dev/vendor" ] && [ -r "$_drm_dev/device" ] || continue
+                read -r _vendor < "$_drm_dev/vendor" || continue
+                read -r _dev_id < "$_drm_dev/device" || continue
+                if [ "$_vendor" = 0x10de ] && [ "$((_dev_id))" -ge "$((0x1e00))" ]; then
+                    _nouveau_supports_nvk=1
+                    break
+                fi
+            done
+            if [ "$_nouveau_supports_nvk" -eq 1 ]; then
+                export NOUVEAU_USE_ZINK="${NOUVEAU_USE_ZINK:-1}"
+                export MESA_VK_WSI_PRESENT_MODE="${MESA_VK_WSI_PRESENT_MODE:-immediate}"
+            fi
+            unset _nouveau_supports_nvk _drm_dev _vendor _dev_id
         fi
     fi
     unset _avory_session _avory_display _avory_render _avory_driver _avory_cards

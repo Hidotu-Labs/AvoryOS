@@ -2761,14 +2761,14 @@ long ret = syscall(430, "ext4", 0);
 // Syscall #431: fsconfig
 static int test_sc_fsconfig_431(void) {
 long ret = syscall(431, -1, 0, NULL, NULL, 0);
-  SC_ASSERT(ret == -1 && errno == ENOSYS);
+  SC_ASSERT(ret == -1 && (errno == EBADF || errno == ENOSYS));
   return 1;
 }
 
 // Syscall #432: fsmount
 static int test_sc_fsmount_432(void) {
 long ret = syscall(432, -1, 0, 0);
-  SC_ASSERT(ret == -1 && errno == ENOSYS);
+  SC_ASSERT(ret == -1 && (errno == EBADF || errno == ENOSYS));
   return 1;
 }
 

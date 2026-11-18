@@ -62,8 +62,19 @@ def main():
         hashes = {name: digest for digest, name in
                   (line.split() for line in (ROOT/'scripts/linux/firmware-sha256-20260916.txt').read_text().splitlines()
                    if line.strip() and not line.startswith('#'))}
-        names = [f'nvidia/ad106/gsp/{name}-{args.interface}.bin' for name in
-                 ('gsp', 'bootloader', 'booter_load', 'booter_unload')]
+        booter_chips = (
+            'tu102', 'tu104', 'tu106',
+            'tu116', 'tu117',
+            'ga102', 'ga103', 'ga104', 'ga106', 'ga107',
+            'ad102', 'ad103', 'ad104', 'ad106', 'ad107',
+        )
+        fmc_chips = ('gb202', 'gb203', 'gb205', 'gb206', 'gb207')
+        names = [f'nvidia/{chip}/gsp/{name}-{args.interface}.bin'
+                 for chip in booter_chips
+                 for name in ('gsp', 'bootloader', 'booter_load', 'booter_unload')] + [
+                 f'nvidia/{chip}/gsp/{name}-{args.interface}.bin'
+                 for chip in fmc_chips
+                 for name in ('gsp', 'bootloader', 'fmc')]
         notice = 'LICENSES/LICENCE.nvidia'
         if any(not (source/name).is_file() for name in names+[notice]):
             import subprocess
@@ -79,7 +90,7 @@ def main():
         rows = stage(source, args.output, lock)
     else:
         rows = stage(args.source, args.output, ROOT/'docs/nouveau/c0-lock.json')
-    print(f'Staged {len(rows)} pinned AD106 files ({sum(r["size"] for r in rows):,} bytes) and NVIDIA notice in {args.output}')
+    print(f'Staged {len(rows)} pinned Nouveau files ({sum(r["size"] for r in rows):,} bytes) and NVIDIA notice in {args.output}')
 
 if __name__ == '__main__':
     try: main()

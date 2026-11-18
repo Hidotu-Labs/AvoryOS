@@ -1,5 +1,6 @@
 #include "lapic.h"
 #include "../console/console.h"
+#include "../cpu/features.h"
 #include "../cpu/isr.h"
 #include "../mm/vmm.h"
 #include "../mm/pmm.h"
@@ -19,6 +20,7 @@ static uint64_t lapic_phys_base = 0;
 static bool lapic_x2apic = false;
 
 #define MSR_IA32_APIC_BASE 0x1B
+#define APIC_BASE_ENABLE (1ULL << 11)
 #define APIC_BASE_X2APIC_ENABLE (1ULL << 10)
 #define X2APIC_MSR_BASE 0x800u
 
@@ -118,6 +120,11 @@ void lapic_init(uint64_t base_phys) {
    * the registers through their MSR interface instead; the accessors below
    * dispatch transparently. */
   uint64_t apic_base = lapic_rdmsr(MSR_IA32_APIC_BASE);
+  if (!(apic_base & APIC_BASE_X2APIC_ENABLE) &&
+      (apic_base & APIC_BASE_ENABLE) && cpu_has_x2apic()) {
+    lapic_wrmsr(MSR_IA32_APIC_BASE, apic_base | APIC_BASE_X2APIC_ENABLE);
+    apic_base = lapic_rdmsr(MSR_IA32_APIC_BASE);
+  }
   if (apic_base & APIC_BASE_X2APIC_ENABLE) {
     lapic_x2apic = true;
     if (first_init)

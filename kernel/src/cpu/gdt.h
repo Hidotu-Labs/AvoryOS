@@ -36,6 +36,7 @@ struct tss_entry {
 } __attribute__((packed));
 
 void tss_set_rsp0(uint64_t rsp0);
+uint64_t gdt_get_df_stack_top(uint32_t cpu_id);
 
 void gdt_set_compat_tls(const uint64_t entries[3]);
 void gdt_init(void);

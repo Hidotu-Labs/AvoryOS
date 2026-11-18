@@ -1,4 +1,5 @@
 global fork_return_to_userspace
+extern cpu_has_fred_flag
 
 section .text
 
@@ -24,6 +25,9 @@ fork_return_to_userspace:
     mov  ds, ax
     mov  es, ax
     pop  rax
+
+    cmp byte [rel cpu_has_fred_flag], 0
+    jne .fred_eretu
 
     cmp qword [rax + 128], 0x1b
     je .compat_iret
@@ -93,3 +97,44 @@ fork_return_to_userspace:
     mov rax, [rax + 48]
     swapgs
     iretq
+
+.fred_eretu:
+    cli
+    push qword 0                 ; reserved
+    push qword 0                 ; event_data
+    push qword 0x23              ; user SS
+    push qword [rax + 120]       ; user RSP
+    push qword [rax + 112]       ; user RFLAGS
+    push qword [rax + 128]       ; user CS (0x2b or 0x1b)
+    push qword [rax + 104]       ; user RIP
+    push qword 0                 ; error_code
+
+    mov r15, [rax + 96]
+    mov r14, [rax + 88]
+    mov r13, [rax + 80]
+    mov r12, [rax + 72]
+    mov rbp, [rax + 64]
+    mov rbx, [rax + 56]
+    mov r9,  [rax + 40]
+    mov r8,  [rax + 32]
+    mov r10, [rax + 24]
+    mov rdx, [rax + 16]
+    cmp qword [rax + 128], 0x1b
+    je .fred_compat_regs
+    mov rsi, [rax + 8]
+    mov rdi, [rax + 0]
+    mov rcx, [rax + 104]
+    mov r11, [rax + 112]
+    mov rax, [rax + 48]
+    eretu
+
+.fred_compat_regs:
+    xor r11d, r11d
+    xor r10d, r10d
+    xor r9d, r9d
+    xor r8d, r8d
+    mov rcx, [rax + 136]
+    mov rsi, [rax + 144]
+    mov rdi, [rax + 152]
+    mov rax, [rax + 48]
+    eretu

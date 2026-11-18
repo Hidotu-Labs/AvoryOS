@@ -51,9 +51,13 @@ fi
 
 if [ -d "$SRC/.git" ]; then
     if [ -n "$REF" ]; then
-        log "fetching $REF"
-        git -C "$SRC" fetch --depth 1 origin "$REF"
-        git -C "$SRC" checkout --detach FETCH_HEAD
+        head_sha="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || true)"
+        ref_sha="$(git -C "$SRC" rev-parse -q --verify "$REF^{commit}" 2>/dev/null || true)"
+        if [ -z "$ref_sha" ] || [ "$head_sha" != "$ref_sha" ]; then
+            log "fetching $REF"
+            git -C "$SRC" fetch --depth 1 origin "$REF"
+            git -C "$SRC" checkout --detach FETCH_HEAD
+        fi
     fi
     if [ "$(git -C "$SRC" config --get core.sparseCheckout || true)" = true ]; then
         printf '/%s\n' "${entries[@]#*=}" | git -C "$SRC" sparse-checkout add --stdin

@@ -30,6 +30,11 @@ if [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ]; then eend 0; else eend 1; fi
 ebegin "Setting hostname"
 /usr/bin/busybox hostname AvoryOS 2>/dev/null; eend $?
 
+# Without a /dev/log reader, glibc syslog() falls back to /dev/console and
+# daemons such as ModemManager scribble over tty1 (and the installer TUI).
+ebegin "Starting system logger"
+/usr/bin/busybox syslogd -O /var/log/messages -s 1024 -b 2 2>/dev/null; eend $?
+
 if [ -x /sbin/avory-early-init ]; then
     ebegin "Running early init"
     /sbin/avory-early-init 2>/dev/null; eend $?

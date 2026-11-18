@@ -140,6 +140,15 @@ void process_jump_usermode(uint64_t rip, uint64_t user_rsp, uint64_t pml4) {
     fork_return_to_userspace(&frame);
   }
 
+  extern bool cpu_has_fred_flag;
+  if (cpu_has_fred_flag) {
+    struct syscall_regs frame = { .rip=rip, .rsp=user_rsp, .rflags=0x202,
+                                  .user_cs=0x2b };
+    extern void fork_return_to_userspace(struct syscall_regs *)
+        __attribute__((noreturn));
+    fork_return_to_userspace(&frame);
+  }
+
   register uint64_t asm_rip asm("rcx") = rip;
   register uint64_t asm_rflags asm("r11") = 0x202;
   register uint64_t asm_rsp asm("rdi") =

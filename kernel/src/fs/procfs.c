@@ -75,6 +75,32 @@ static void procfs_node_init(vfs_node_t *node) {
   node->truncate = procfs_truncate;
 }
 
+static uint32_t procfs_vmstat_read(vfs_node_t *node, uint32_t offset,
+                                   uint32_t size, uint8_t *buffer) {
+  char buf[512];
+  struct vfs_pc_stats s;
+  vfs_pc_stats_read(&s);
+  int len = snprintf(buf, sizeof(buf),
+      "kswapd_passes %llu\n"
+      "kswapd_reclaimed_pages %llu\n"
+      "idle_trim_reclaimed_pages %llu\n"
+      "writeback_nodes %llu\n"
+      "writeback_pages %llu\n",
+      (unsigned long long)s.kswapd_passes,
+      (unsigned long long)s.kswapd_reclaimed,
+      (unsigned long long)s.idle_reclaimed,
+      (unsigned long long)s.writeback_nodes,
+      (unsigned long long)s.writeback_pages);
+
+  node->length = (uint32_t)len;
+  if (offset >= (uint32_t)len)
+    return 0;
+  if (offset + size > (uint32_t)len)
+    size = (uint32_t)len - offset;
+  memcpy(buffer, buf + offset, size);
+  return size;
+}
+
 uint32_t procfs_meminfo_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                              uint8_t *buffer) {
   char buf[1024];
@@ -755,6 +781,7 @@ uint32_t procfs_partitions_read(vfs_node_t *node, uint32_t offset,
         "   %u     %-8u%-10llu%s\n",
         dev->linux_major, dev->linux_minor,
         (unsigned long long)blocks, dev->name);
+    block_put(dev);
     if (written < 0 || written >= 4096 - pos)
       break;
     pos += written;
@@ -789,8 +816,12 @@ uint32_t procfs_diskstats_read(vfs_node_t *node, uint32_t offset,
 
   for (int i = 0; i < count && pos < 3800; i++) {
     struct block_device *dev = block_get(i);
-    if (!dev || !dev->name[0])
+    if (!dev)
       continue;
+    if (!dev->name[0]) {
+      block_put(dev);
+      continue;
+    }
     uint64_t reads =
         __atomic_load_n(&dev->stat_reads, __ATOMIC_RELAXED);
     uint64_t read_sectors =
@@ -804,6 +835,7 @@ uint32_t procfs_diskstats_read(vfs_node_t *node, uint32_t offset,
         dev->linux_major, dev->linux_minor, dev->name,
         (unsigned long long)reads, (unsigned long long)read_sectors,
         (unsigned long long)writes, (unsigned long long)write_sectors);
+    block_put(dev);
     if (written < 0 || written >= 4096 - pos)
       break;
     pos += written;
@@ -863,6 +895,7 @@ static uint32_t procfs_storage_perf_read(vfs_node_t *node, uint32_t offset,
     struct storage_latency flush;
     storage_latency_snapshot(&dev->hw_flush, &flush);
     pos += procfs_latency_line(buf + pos, cap - pos, "nvme_flush", dev->name, &flush);
+    block_put(dev);
   }
   for (unsigned i = 0; i < 8 && pos < cap - 1024; i++) {
     struct block_device *dev;
@@ -899,7 +932,7 @@ static const char *procfs_mount_src(const char *src, char *out,
       strcmp(src, "devpts") == 0 || strcmp(src, "cgroup") == 0 ||
       strcmp(src, "cgroup2") == 0)
     return src;
-  if (block_get_by_name(src) != NULL) {
+  if (block_name_in_use(src)) {
     snprintf(out, out_sz, "/dev/%s", src);
     return out;
   }
@@ -1278,6 +1311,20 @@ uint32_t procfs_bootlog_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   uint32_t total = klog_bootlog_length();
   node->length = total;
   return klog_bootlog_read(offset, size, buffer);
+}
+
+/* /proc/boot_kernel — the kernel file this boot was loaded from (kernel.c). */
+uint32_t procfs_boot_kernel_read(vfs_node_t *node, uint32_t offset,
+                                 uint32_t size, uint8_t *buffer) {
+  extern const uint8_t *kernel_boot_image;
+  extern uint64_t kernel_boot_image_size;
+  node->length = (uint32_t)kernel_boot_image_size;
+  if (!kernel_boot_image || offset >= kernel_boot_image_size)
+    return 0;
+  if (size > kernel_boot_image_size - offset)
+    size = (uint32_t)(kernel_boot_image_size - offset);
+  memcpy(buffer, kernel_boot_image + offset, size);
+  return size;
 }
 
 /* /proc/usb — USB controller/device/HID-driver diagnostics (drivers/usb). */
@@ -2474,6 +2521,7 @@ static void procfs_pid_dir_close(vfs_node_t *node) {
     kfree(child);
     child = next;
   }
+  vfs_dirindex_destroy(dir);
   kfree(dir);
 }
 
@@ -2564,6 +2612,7 @@ static uint32_t procfs_pid_mountinfo_read(vfs_node_t *node, uint32_t offset,
       /* procfs_mount_src already rewrote dev to /dev/<name> when bd exists. */
       major = bd->linux_major;
       minor = bd->linux_minor;
+      block_put(bd);
     }
     /* id parent major:minor root mountpoint opts optional - fstype src super */
     char options[80]; procfs_mount_options(mounts[i].flags, options);
@@ -3443,6 +3492,19 @@ void procfs_init(void) {
       ramfs_mount_node(procfs_root, meminfo_node);
     }
 
+    // Add /proc/vmstat — page-cache reclaim and writeback counters.
+    vfs_node_t *vmstat_node = kmalloc(sizeof(vfs_node_t));
+    if (vmstat_node) {
+      procfs_node_init(vmstat_node);
+      strncpy(vmstat_node->name, "vmstat", 127);
+      vmstat_node->flags = FS_FILE | FS_PERSISTENT;
+      vmstat_node->mask = 0444; // Read-only
+      vmstat_node->read = procfs_vmstat_read;
+      vmstat_node->length = 512; // Dummy size, redefined on read
+
+      ramfs_mount_node(procfs_root, vmstat_node);
+    }
+
     // Add /proc/zoneinfo — PMM zone watermarks/free pages.  WebKit's
     // memory-pressure monitor opens it unconditionally; htop/btop read it.
     vfs_node_t *zoneinfo_node = kmalloc(sizeof(vfs_node_t));
@@ -3514,6 +3576,19 @@ void procfs_init(void) {
       klog_node->read = procfs_klog_read;
       klog_node->length = 65536;
       ramfs_mount_node(procfs_root, klog_node);
+    }
+
+    // Add /proc/boot_kernel: the running kernel's file, for the installer.
+    extern uint64_t kernel_boot_image_size;
+    vfs_node_t *bk_node = kernel_boot_image_size ? kmalloc(sizeof(vfs_node_t)) : NULL;
+    if (bk_node) {
+      procfs_node_init(bk_node);
+      strncpy(bk_node->name, "boot_kernel", 127);
+      bk_node->flags = FS_FILE | FS_PERSISTENT;
+      bk_node->mask = 0400;
+      bk_node->read = procfs_boot_kernel_read;
+      bk_node->length = (uint32_t)kernel_boot_image_size;
+      ramfs_mount_node(procfs_root, bk_node);
     }
 
     // Add /proc/bootlog: frozen snapshot of the boot log up to the first
@@ -4540,16 +4615,15 @@ static uint32_t procfs_sys_drop_caches_write(vfs_node_t *node, uint32_t offset,
     char c = (char)buffer[0];
     if (c == '1' || c == '2' || c == '3') {
         if (c == '1' || c == '3') {
+            /* Dirty pages are never reclaimed, so write them back first. This
+             * matches the usual "sync; echo 3 > drop_caches" sequence. */
+            vfs_dentry_sync_all();
             if (mm_file_cache_reclaim)
                 mm_file_cache_reclaim((size_t)-1);
             if (vfs_dentry_reclaim_pages)
                 vfs_dentry_reclaim_pages((size_t)-1);
-            if (ext2_buffer_cache_shrink) {
-                for (int iter = 0; iter < 16; iter++) {
-                    if (ext2_buffer_cache_shrink(256) == 0)
-                        break;
-                }
-            }
+            if (ext2_buffer_cache_shrink)
+                ext2_buffer_cache_shrink((size_t)-1);
         }
         if (c == '2' || c == '3') {
             if (vfs_dentry_reclaim_pages)

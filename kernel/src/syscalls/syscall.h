@@ -23,6 +23,9 @@
 #define SYS_LSEEK 8
 #define SYS_MMAP 9
 #define SYS_MPROTECT 10
+#define SYS_PKEY_MPROTECT 329
+#define SYS_PKEY_ALLOC 330
+#define SYS_PKEY_FREE 331
 #define SYS_MUNMAP 11
 #define SYS_BRK 12
 #define SYS_RT_SIGACTION 13

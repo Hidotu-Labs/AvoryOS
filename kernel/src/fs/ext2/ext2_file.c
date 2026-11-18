@@ -1,4 +1,5 @@
 #include "ext2_internal.h"
+#include "fs/ext4/ext4.h"
 #include "fs/ext4/ext4_extent.h"
 #include "mm/vmm.h"
 #include "syscalls/syscall.h"
@@ -369,7 +370,11 @@ int ext2_readlink_impl(vfs_node_t *node, char *buf, uint32_t size) {
     return (int)copy_len;
   }
 
-  uint32_t bytes_read = ext2_read_impl(node, 0, copy_len, (uint8_t *)buf);
+  /* A target longer than 60 bytes lives in a data block, which ext4 maps
+   * with extents; the ext2 block-map reader refuses those with EIO. */
+  uint32_t bytes_read = (inode.i_flags & EXT4_EXTENTS_FL)
+                            ? ext4_read_impl(node, 0, copy_len, (uint8_t *)buf)
+                            : ext2_read_impl(node, 0, copy_len, (uint8_t *)buf);
   return (int)bytes_read;
 }
 

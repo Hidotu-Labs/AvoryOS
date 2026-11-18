@@ -27,6 +27,7 @@ struct mm_struct {
   uint64_t mmap_next_addr; // Bump-pointer for anonymous mmap
   bool compat32;          // Address space uses the Linux i386 ABI
   bool mlockall_future;   // Conservatively keep this address space out of zram reclaim
+  uint16_t pkey_alloc_mask; // Bitmask of allocated PKU keys (bit 0 reserved)
   int ref_count;           // Reference count for sharing across threads
   uint16_t pcid;           // Hardware PCID tag (0 = kernel/unassigned)
   spinlock_t lock;         // Lock for thread-safe MM state updates
@@ -317,6 +318,7 @@ struct thread {
   struct mm_struct *mm;        // Shared memory management state
   uint64_t fs_base;            // User FS_BASE (TLS) — inherited across fork
   uint64_t gs_base;            // User GS_BASE (TLS) — inherited across fork
+  uint32_t pkru;               // User PKRU (Protection Key Rights)
   uint64_t compat_tls[3];
   uint16_t compat_fs, compat_gs;
   uint32_t uid;                // User ID

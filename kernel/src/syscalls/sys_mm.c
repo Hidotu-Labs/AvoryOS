@@ -6,6 +6,7 @@
 #include "../mm/pmm.h"
 #include "../mm/numa.h"
 #include "../mm/mempolicy.h"
+#include "../cpu/features.h"
 #include "../mm/numa_migrate.h"
 #include "../mm/vma.h"
 #include "../mm/vmm.h"
@@ -977,11 +978,8 @@ static uint64_t sys_brk(uint64_t addr, uint64_t a1, uint64_t a2, uint64_t a3,
 // Linux ABI: mprotect(addr, len, prot)
 /* Bound lock hold time while halving context shootdowns for large ranges. */
 #define MPROTECT_BATCH_PAGES 128
-static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
-                             uint64_t a3, uint64_t a4, uint64_t a5) {
-  (void)a3;
-  (void)a4;
-  (void)a5;
+static uint64_t sys_mprotect_common(uint64_t addr, uint64_t len, uint64_t prot,
+                                    int pkey) {
 
   if (addr == 0 || (addr & (PAGE_SIZE - 1)))
     return (addr == 0) ? E_NOMEM : E_INVAL;
@@ -1092,6 +1090,10 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
         new_flags |= PAGE_FLAG_MLOCKED;
       if (was_refault)
         new_flags |= PAGE_FLAG_REFAULT;
+      if (pkey >= 0)
+        new_flags |= page_flag_pkey((uint8_t)pkey);
+      else
+        new_flags |= (old_entry & PAGE_FLAG_PKEY_MASK);
 
       if (!special_leaf) {
         /* Existing 4 KB leaves already have permissive parent entries from
@@ -1123,7 +1125,7 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
     if (ok) {
       // Publish each bounded range's VMA permissions while the same mm lock
       // still excludes concurrent faults and mapping changes.
-      vma_mprotect(&current->mm->vmas, batch_start, batch_end, prot);
+      vma_mprotect_pkey(&current->mm->vmas, batch_start, batch_end, prot, pkey);
       vma_merge_adjacent(&current->mm->vmas);
     }
 
@@ -1150,6 +1152,96 @@ static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
     batch_start = batch_end;
   }
 
+  return 0;
+}
+
+static uint64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
+                             uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  return sys_mprotect_common(addr, len, prot, -1);
+}
+
+static uint64_t sys_pkey_mprotect(uint64_t addr, uint64_t len, uint64_t prot,
+                                  uint64_t pkey, uint64_t a4, uint64_t a5) {
+  (void)a4;
+  (void)a5;
+  if (pkey == (uint64_t)-1)
+    return sys_mprotect_common(addr, len, prot, -1);
+  if (!cpu_has_pku_flag)
+    return (uint64_t)-38; // -ENOSYS
+  if (pkey > 15)
+    return E_INVAL;
+  struct thread *current = sched_get_current();
+  if (!current || !current->mm)
+    return E_INVAL;
+  spinlock_acquire(&current->mm->lock);
+  uint16_t mask = (uint16_t)(current->mm->pkey_alloc_mask | 1U);
+  spinlock_release(&current->mm->lock);
+  if (!(mask & (1U << pkey)))
+    return E_INVAL;
+  return sys_mprotect_common(addr, len, prot, (int)pkey);
+}
+
+static uint64_t sys_pkey_alloc(uint64_t flags, uint64_t init_val, uint64_t a2,
+                               uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  if (!cpu_has_pku_flag)
+    return (uint64_t)-38; // -ENOSYS
+  if (flags != 0 || (init_val & ~3ULL) != 0)
+    return E_INVAL;
+  struct thread *current = sched_get_current();
+  if (!current || !current->mm)
+    return E_INVAL;
+
+  spinlock_acquire(&current->mm->lock);
+  current->mm->pkey_alloc_mask |= 1U; // Key 0 is always reserved
+  int found = -1;
+  for (int k = 1; k < 16; k++) {
+    if (!(current->mm->pkey_alloc_mask & (1U << k))) {
+      current->mm->pkey_alloc_mask |= (uint16_t)(1U << k);
+      found = k;
+      break;
+    }
+  }
+  spinlock_release(&current->mm->lock);
+  if (found < 0)
+    return (uint64_t)-28; // -ENOSPC
+
+  uint32_t pkru = rdpkru();
+  pkru &= ~(3U << (found * 2));
+  pkru |= (uint32_t)(init_val & 3U) << (found * 2);
+  wrpkru(pkru);
+  current->pkru = pkru;
+  return (uint64_t)found;
+}
+
+static uint64_t sys_pkey_free(uint64_t pkey, uint64_t a1, uint64_t a2,
+                              uint64_t a3, uint64_t a4, uint64_t a5) {
+  (void)a1;
+  (void)a2;
+  (void)a3;
+  (void)a4;
+  (void)a5;
+  if (!cpu_has_pku_flag)
+    return (uint64_t)-38; // -ENOSYS
+  if (pkey < 1 || pkey > 15)
+    return E_INVAL;
+  struct thread *current = sched_get_current();
+  if (!current || !current->mm)
+    return E_INVAL;
+
+  spinlock_acquire(&current->mm->lock);
+  if (!(current->mm->pkey_alloc_mask & (1U << pkey))) {
+    spinlock_release(&current->mm->lock);
+    return E_INVAL;
+  }
+  current->mm->pkey_alloc_mask &= (uint16_t)~(1U << pkey);
+  spinlock_release(&current->mm->lock);
   return 0;
 }
 
@@ -1896,6 +1988,9 @@ void syscall_register_mm(void) {
   syscall_register(SYS_MADVISE, sys_madvise);
   syscall_register(SYS_BRK, sys_brk);
   syscall_register(SYS_MPROTECT, sys_mprotect);
+  syscall_register(SYS_PKEY_MPROTECT, sys_pkey_mprotect);
+  syscall_register(SYS_PKEY_ALLOC, sys_pkey_alloc);
+  syscall_register(SYS_PKEY_FREE, sys_pkey_free);
   syscall_register(SYS_MBIND, sys_mbind);
   syscall_register(SYS_SET_MEMPOLICY, sys_set_mempolicy);
   syscall_register(SYS_GET_MEMPOLICY, sys_get_mempolicy);

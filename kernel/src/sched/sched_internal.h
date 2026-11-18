@@ -21,6 +21,7 @@ void thread_stack_release(uint64_t stack_base, size_t stack_size,
                           const struct thread *owner);
 size_t thread_stack_cache_reclaim(size_t max_reclaim);
 size_t kstack_cache_total_cached(void);
+void kstack_check_live(const struct thread *t);
 void kstack_cache_init(void);
 
 /* Thread search under tid_lock */

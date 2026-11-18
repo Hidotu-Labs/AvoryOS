@@ -4,7 +4,9 @@
  * A disk is a struct block_device named sdX (major 8) whose read/write/flush
  * entry points forward to the Rust ops table.  Removal sets `gone` first, so
  * new I/O fails without touching the driver, then waits for calls already
- * inside the driver to leave.  Only after that does unregister return. */
+ * inside the driver to leave.  Only after that does unregister return.  The
+ * structs are freed by the block layer once the last reference (open /dev
+ * node, partition, mount) is dropped. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -89,18 +91,41 @@ static int usb_rust_block_flush(struct block_device *dev) {
   return ret;
 }
 
+/* Disk index to its Linux name: 0 -> sda, 25 -> sdz, 26 -> sdaa, 701 -> sdzz,
+ * 702 -> sdaaa.  The suffix is bijective base 26 (no zero digit). */
+static void usb_rust_disk_name(uint32_t index, char name[16]) {
+  char suffix[8];
+  int len = 0;
+  uint32_t n = index + 1;
+  while (n > 0 && len < (int)sizeof(suffix)) {
+    n--;
+    suffix[len++] = (char)('a' + n % 26);
+    n /= 26;
+  }
+  name[0] = 's';
+  name[1] = 'd';
+  for (int i = 0; i < len; i++)
+    name[2 + i] = suffix[len - 1 - i];
+  name[2 + len] = '\0';
+}
+
 /* First sdX name not in use.  Registration is single-threaded per driver, so
- * no reservation is needed between the check and block_register(). */
+ * no reservation is needed between the check and block_register().  At most
+ * BLOCK_MAX_DEVICES names can be taken, so one of the first
+ * BLOCK_MAX_DEVICES + 1 is free whenever the registry has room. */
 static bool usb_rust_pick_name(char name[16]) {
-  for (char c = 'a'; c <= 'z'; c++) {
-    name[0] = 's';
-    name[1] = 'd';
-    name[2] = c;
-    name[3] = '\0';
-    if (!block_get_by_name(name))
+  for (uint32_t i = 0; i <= BLOCK_MAX_DEVICES; i++) {
+    usb_rust_disk_name(i, name);
+    if (!block_name_in_use(name))
       return true;
   }
   return false;
+}
+
+/* Last reference gone: no I/O can reach the driver any more. */
+static void usb_rust_disk_release(struct block_device *dev) {
+  kfree(dev->driver_data);
+  kfree(dev);
 }
 
 void *usb_rust_block_register(void *usb_dev, uint32_t sector_size,
@@ -140,6 +165,7 @@ void *usb_rust_block_register(void *usb_dev, uint32_t sector_size,
   if (ops->flush)
     dev->flush = usb_rust_block_flush;
   dev->driver_data = d;
+  dev->release = usb_rust_disk_release;
 
   /* block_register() scans partitions itself once the disk is published, so
    * there is no separate block_scan_partitions() call here: a second scan
@@ -159,15 +185,18 @@ void usb_rust_block_unregister(void *block) {
   if (!dev || block_is_partition(dev))
     return;
 
+  /* Hold our own reference across the drain: block_unregister() drops the
+   * registry's, which may be the last one. */
+  block_ref(dev);
   __atomic_store_n(&dev->gone, true, __ATOMIC_SEQ_CST);
   block_unregister(dev);
 
   /* Partitions were removed with the disk, so this drains their calls too.
-   * The struct and its driver_data are never freed: a later dev->gone check
-   * from a stale partition or /dev vnode still reads valid memory. */
+   * Stale partitions, /dev vnodes and mounts keep the struct alive through
+   * their references and only ever see gone. */
   struct usb_rust_disk *d = disk_of(dev);
-  if (!d)
-    return;
-  while (__atomic_load_n(&d->inflight, __ATOMIC_SEQ_CST) != 0)
-    sched_yield();
+  if (d)
+    while (__atomic_load_n(&d->inflight, __ATOMIC_SEQ_CST) != 0)
+      sched_yield();
+  block_put(dev);
 }

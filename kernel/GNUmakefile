@@ -324,6 +324,7 @@ ifneq ($(linux-obj-y),)
     obj-$(ARCH)/linux/drivers/gpu/drm/nouveau/nvkm/engine/device/pci.c.o: override LINUX_CPPFLAGS += -Dnvkm_device_pci_new=linuxkpi_original_nvkm_device_pci_new
     obj-$(ARCH)/linuxkpi/src/nouveau_probe_unwind.c.o: override LINUX_CPPFLAGS += -DAVORYOS_NOUVEAU_COMPAT -Ilinux/drivers/gpu/drm/nouveau/include/nvkm -Ilinux/drivers/gpu/drm/nouveau/include
     obj-$(ARCH)/src/tests/linuxkpi/linux/test_nouveau_firmware_failures.c.o: override LINUX_CPPFLAGS += -DAVORYOS_NOUVEAU_COMPAT -Ilinux/drivers/gpu/drm/nouveau/include/nvkm -Ilinux/drivers/gpu/drm/nouveau/include -Ilinux/drivers/gpu/drm/nouveau/nvkm/subdev/gsp
+    obj-$(ARCH)/src/tests/linuxkpi/linux/test_nouveau_arch_firmware.c.o: override LINUX_CPPFLAGS += -DAVORYOS_NOUVEAU_COMPAT -Ilinux/drivers/gpu/drm/nouveau/include/nvkm -Ilinux/drivers/gpu/drm/nouveau/include -Ilinux/drivers/gpu/drm/nouveau/nvkm/subdev/gsp
     endif
 
     override LINUX_OBJ := \

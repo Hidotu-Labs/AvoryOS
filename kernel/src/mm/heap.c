@@ -17,7 +17,7 @@ void *kmalloc(size_t size) {
     return NULL;
 
   if (size <= 1024) {
-    void *ptr = heap_slab_alloc(size);
+    void *ptr = heap_slab_alloc_at(size, __builtin_return_address(0));
     if (ptr)
       return ptr;
   }

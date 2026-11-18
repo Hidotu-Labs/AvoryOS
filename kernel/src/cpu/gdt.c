@@ -1,4 +1,7 @@
 #include "gdt.h"
+#include "features.h"
+#include "fred.h"
+#include "msr.h"
 #include "../lib/string.h"
 #include "../smp/cpu.h"
 
@@ -78,6 +81,15 @@ void tss_set_rsp0(uint64_t rsp0) {
   if (cpu_id >= MAX_CPUS)
     return;
   tss_table[cpu_id].rsp0 = rsp0;
+  if (cpu_has_fred_flag) {
+    wrmsr(IA32_FRED_RSP0, rsp0 & ~0x3FULL);
+  }
+}
+
+uint64_t gdt_get_df_stack_top(uint32_t cpu_id) {
+  if (cpu_id >= MAX_CPUS)
+    return 0;
+  return (uint64_t)(df_stack[cpu_id] + sizeof(df_stack[cpu_id])) & ~0x3FULL;
 }
 
 void gdt_init(void) {

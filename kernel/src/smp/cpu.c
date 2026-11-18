@@ -314,6 +314,8 @@ void ap_main(struct cpu_info *bootstrap) {
   // this, a user thread scheduled here executes `syscall` with EFER.SCE clear
   // and takes a #UD (observed as a SIGILL in radeonsi's compiler threads).
   syscall_init_cpu();
+  extern void fred_init_cpu(void);
+  fred_init_cpu();
 
   // 4. Enable interrupts locally on this core
   hal_irq_enable();
@@ -808,6 +810,8 @@ void cpu_restore_s3_context(void) {
   wrmsr(0xC0000100, s3_saved_fs_base);
   wrmsr(MSR_KERNEL_GS_BASE, s3_saved_kernel_gs_base);
   wrmsr(0x1B, s3_saved_apic_base);
+  extern void fred_init_cpu(void);
+  fred_init_cpu();
 }
 
 void cpu_cancel_s3_wake(void) {

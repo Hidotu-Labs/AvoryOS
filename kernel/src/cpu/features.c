@@ -26,8 +26,10 @@ static inline void cpuid(uint32_t leaf, uint32_t subleaf, uint32_t *eax,
  * that arrives even earlier triggers the same one-shot probe. */
 static uint32_t feat_max_leaf;
 static uint32_t feat_1_ecx;
+static uint32_t feat_7_0_eax;
 static uint32_t feat_7_0_ebx;
 static uint32_t feat_7_0_ecx;
+static uint32_t feat_7_1_eax;
 static uint32_t feat_d_1_eax;
 static uint32_t feat_ext_max_leaf;
 static uint32_t feat_80000001_edx;
@@ -37,8 +39,11 @@ static bool feat_probed;
 static void features_probe(void) {
   cpuid(0, 0, &feat_max_leaf, NULL, NULL, NULL);
   cpuid(1, 0, NULL, NULL, &feat_1_ecx, NULL);
-  if (feat_max_leaf >= 7)
-    cpuid(7, 0, NULL, &feat_7_0_ebx, &feat_7_0_ecx, NULL);
+  if (feat_max_leaf >= 7) {
+    cpuid(7, 0, &feat_7_0_eax, &feat_7_0_ebx, &feat_7_0_ecx, NULL);
+    if (feat_7_0_eax >= 1)
+      cpuid(7, 1, &feat_7_1_eax, NULL, NULL, NULL);
+  }
   if (feat_max_leaf >= 0xD) {
     uint32_t xstate_lo = 0, xstate_hi = 0;
     cpuid(0xD, 0, &xstate_lo, NULL, NULL, &xstate_hi);
@@ -100,6 +105,44 @@ bool cpu_has_smap(void) {
   if (feat_max_leaf < 7)
     return false;
   return (feat_7_0_ebx & (1U << 20)) != 0; // CPUID.07H:EBX.SMAP[bit 20]
+}
+
+bool cpu_has_umip(void) {
+  features_ensure_probed();
+  if (feat_max_leaf < 7)
+    return false;
+  return (feat_7_0_ecx & (1U << 2)) != 0; // CPUID.07H:ECX.UMIP[bit 2]
+}
+
+bool cpu_has_pku(void) {
+  features_ensure_probed();
+  if (feat_max_leaf < 7)
+    return false;
+  return (feat_7_0_ecx & (1U << 3)) != 0; // CPUID.07H:ECX.PKU[bit 3]
+}
+
+bool cpu_has_fred(void) {
+  features_ensure_probed();
+  if (feat_max_leaf < 7 || feat_7_0_eax < 1)
+    return false;
+  return (feat_7_1_eax & (1U << 17)) != 0; // CPUID.(07H,01H):EAX.FRED[bit 17]
+}
+
+bool cpu_has_lkgs(void) {
+  features_ensure_probed();
+  if (feat_max_leaf < 7 || feat_7_0_eax < 1)
+    return false;
+  return (feat_7_1_eax & (1U << 18)) != 0; // CPUID.(07H,01H):EAX.LKGS[bit 18]
+}
+
+bool cpu_has_x2apic(void) {
+  features_ensure_probed();
+  return (feat_1_ecx & (1U << 21)) != 0; // CPUID.01H:ECX.x2APIC[bit 21]
+}
+
+bool cpu_has_tsc_deadline(void) {
+  features_ensure_probed();
+  return (feat_1_ecx & (1U << 24)) != 0; // CPUID.01H:ECX.TSC-Deadline[bit 24]
 }
 
 bool cpu_has_xsave(void) {
@@ -169,6 +212,8 @@ bool cpu_has_xsaveopt_flag = false;
 uint64_t cpu_xsave_mask = 3ULL;
 bool cpu_has_smap_flag = false;
 bool cpu_has_fsgsbase_flag = false;
+bool cpu_has_fred_flag = false;
+bool cpu_has_pku_flag = false;
 
 // Enable SSE/SSE2, PCID, FSGSBASE, AVX/XSAVE, SMEP and SMAP for long mode.
 void cpu_features_init(void) {
@@ -222,6 +267,17 @@ void cpu_features_init(void) {
     cr4 |= (1ULL << 21); // CR4.SMAP (bit 21)
   }
 
+  // Enable UMIP: block user-mode SGDT/SIDT/SLDT/SMSW/STR (#GP).
+  if (cpu_has_umip()) {
+    cr4 |= (1ULL << 11); // CR4.UMIP (bit 11)
+  }
+
+  // Enable PKU (Memory Protection Keys) if supported along with XSAVE.
+  if (cpu_has_pku() && cpu_has_xsave()) {
+    cpu_has_pku_flag = true;
+    cr4 |= (1ULL << 22); // CR4.PKE (bit 22)
+  }
+
   __asm__ volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
 
   // Initialize XCR0 with x87, SSE, and AVX state components. AVX-512
@@ -238,6 +294,9 @@ void cpu_features_init(void) {
     if (avx512f && cpu_has_avx() &&
         (feat_xstate_mask & avx512_state) == avx512_state) {
       xcr0 |= avx512_state;
+    }
+    if (cpu_has_pku_flag && (feat_xstate_mask & (1ULL << 9))) {
+      xcr0 |= (1ULL << 9); // PKRU state component
     }
     /* Publish the exact enabled state set before any thread context can use
      * XSAVE/XRSTOR.  Requesting all bits in those instructions is not valid:

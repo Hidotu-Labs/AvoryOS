@@ -112,6 +112,10 @@ size_t pmm_get_free_pages(void);
 // are still free; soak/leak checks want this total.
 size_t pmm_get_free_pages_including_pcp(void);
 
+// kswapd: when a buddy allocation leaves fewer than `pages` free, call `hook`.
+// Passing a NULL hook disables the check.
+void pmm_set_low_watermark(size_t pages, void (*hook)(void));
+
 // Bounded per-caller alloc/free attribution used by kernel-side leak tests
 // (two separate tables keyed by the exact return address).
 void pmm_site_record_alloc(size_t pages, void *caller);

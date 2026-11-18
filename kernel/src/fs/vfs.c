@@ -94,14 +94,17 @@ typedef struct vfs_mount_entry {
   char path[256];
   /* In-place block mounts (vfat/ext) adopt the mountpoint node.  `saved` is
    * the node image from before the mount and is copied back on umount; `dev`
-   * is flushed on detach.  fs_flush runs before the mount lock is taken (it
-   * may sleep); fs_free runs under the lock and releases the fs state. */
+   * is flushed on detach and the entry holds a reference on it.  fs_flush
+   * runs before the mount lock is taken (it may sleep); fs_free runs under
+   * the lock and releases the fs state. */
   vfs_node_t *saved;
   struct block_device *dev;
   int (*fs_flush)(vfs_node_t *root);
   void (*fs_free)(vfs_node_t *root);
   /* Live-node count of the filesystem (0 = idle).  NULL when the fs has no
-   * count, in which case only the root refcount decides. */
+   * count, in which case only the root refcount decides.  A filesystem with
+   * a count must keep its state until its last node goes, so its fs_free
+   * runs even on a forced detach of a busy mount. */
   int (*fs_busy)(vfs_node_t *root);
   struct vfs_mount_entry *next;
 } vfs_mount_entry_t;
@@ -164,6 +167,26 @@ typedef struct vfs_dentry_cache_bucket {
 
 static vfs_dentry_cache_bucket_t vfs_dentry_cache[VFS_DENTRY_BUCKETS];
 
+/* Pin each distinct file node a bucket's entries reference. The caller holds
+ * bucket->lock; every returned node carries a reference the caller must drop
+ * with vfs_close(). */
+static uint32_t vfs_dentry_pin_bucket_files(vfs_dentry_cache_bucket_t *bucket,
+                                            vfs_node_t *nodes[VFS_DENTRY_WAYS]) {
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < VFS_DENTRY_WAYS; i++) {
+    vfs_node_t *node = bucket->entries[i].child;
+    if (!bucket->entries[i].valid || !node ||
+        (node->flags & FS_TYPE_MASK) != FS_FILE)
+      continue;
+    bool duplicate = false;
+    for (uint32_t j = 0; j < count; j++)
+      if (nodes[j] == node) duplicate = true;
+    if (!duplicate && vfs_node_tryref(node))
+      nodes[count++] = node;
+  }
+  return count;
+}
+
 /* Find cold cache pages beyond the allocating process's mapped files. Cache
  * entries already own the child references; pin under their bucket lock and
  * reclaim outside it. Never wait for a bucket held by the OOM caller. */
@@ -180,18 +203,7 @@ size_t vfs_dentry_reclaim_pages(size_t target) {
     if (!spinlock_try_acquire(&bucket->lock))
       continue;
     vfs_node_t *nodes[VFS_DENTRY_WAYS];
-    uint32_t count = 0;
-    for (uint32_t i = 0; i < VFS_DENTRY_WAYS; i++) {
-      vfs_node_t *node = bucket->entries[i].child;
-      if (!bucket->entries[i].valid || !node ||
-          (node->flags & FS_TYPE_MASK) != FS_FILE)
-        continue;
-      bool duplicate = false;
-      for (uint32_t j = 0; j < count; j++)
-        if (nodes[j] == node) duplicate = true;
-      if (!duplicate && vfs_node_tryref(node))
-        nodes[count++] = node;
-    }
+    uint32_t count = vfs_dentry_pin_bucket_files(bucket, nodes);
     spinlock_release(&bucket->lock);
     for (uint32_t i = 0; i < count; i++) {
       if (reclaimed < target)
@@ -201,6 +213,26 @@ size_t vfs_dentry_reclaim_pages(size_t target) {
   }
   __atomic_store_n(&active, 0, __ATOMIC_RELEASE);
   return reclaimed;
+}
+
+/* Write back every file the dentry cache keeps alive. An entry holds a
+ * reference on its child, so a file that was closed, or dirtied through a
+ * shared mapping and then unmapped, never reaches the last-close sync while
+ * its entry is resident. Those dirty pages then stayed resident, and reclaim
+ * skips dirty pages, until the entry aged out. Runs in thread context only:
+ * it does file I/O. */
+void vfs_dentry_sync_all(void) {
+  for (uint32_t slot = 0; slot < VFS_DENTRY_BUCKETS; slot++) {
+    vfs_dentry_cache_bucket_t *bucket = &vfs_dentry_cache[slot];
+    vfs_node_t *nodes[VFS_DENTRY_WAYS];
+    spinlock_acquire(&bucket->lock);
+    uint32_t count = vfs_dentry_pin_bucket_files(bucket, nodes);
+    spinlock_release(&bucket->lock);
+    for (uint32_t i = 0; i < count; i++) {
+      vfs_cache_sync(nodes[i]);
+      vfs_close(nodes[i]);
+    }
+  }
 }
 
 /* Fast 32-bit FNV-1a hash and register prefix extraction for path components */
@@ -2134,6 +2166,8 @@ reset_walk:
         vfs_close(next);
         if (!target)
           goto fail;
+        if ((target->flags & FS_DENTRY_NOCACHE) != 0)
+          synthetic_descent = true;
         /* A magic link names the target vnode itself, so subsequent `..`
          * components must follow that vnode's ancestry, not the ancestry of
          * the directory that contained the magic link. */
@@ -2256,6 +2290,7 @@ void vfs_node_init(vfs_node_t *node) {
     return;
   memset(node, 0, sizeof(vfs_node_t));
   INIT_LIST_HEAD(&node->ep_watchers);
+  INIT_LIST_HEAD(&node->pc_link);
   spinlock_init(&node->ep_lock);
   spinlock_init(&node->parent_lock);
   asc_radix_tree_init(&node->pages);
@@ -2375,9 +2410,10 @@ int vfs_initial_unmount(vfs_node_t *root, unsigned flags) {
  *    and has not released, including open files and directories;
  *  - the adopted root's own references (open directory fd, dentry parent);
  *  - a thread whose cwd or root node is the mount root or inside the mount.
- * MNT_FORCE/MNT_DETACH skip these checks.  A filesystem with live nodes keeps
- * its state allocated instead of freeing it, because stale descriptors still
- * point into it. */
+ * MNT_FORCE/MNT_DETACH skip these checks.  A counted filesystem (fs_busy) gets
+ * fs_free either way and frees its state once its last live node is released;
+ * one without a count keeps its state on a forced detach, because stale
+ * descriptors may still point into it. */
 #define VFS_INPLACE_BASE_REFS 2u
 
 /* A cwd/root pins the mount if it is the adopted root, a node of the mounted
@@ -2479,13 +2515,17 @@ int vfs_inplace_unmount(vfs_node_t *point, unsigned flags) {
   }
   *p = m->next;
 
-  /* Free the fs state while root->device still names it, then copy back the
-   * pre-mount image.  Runtime state (refcount, locks, page cache, parent and
-   * view links, list heads, rcu link) is live, not part of the image, so it
-   * is carried over from the current node.  A filesystem with live nodes is
-   * never freed: those nodes still point at its state. */
-  bool free_fs = m->fs_free && (fs_busy ? !fs_live : !override);
+  /* Release the fs state while root->device still names it, then copy back
+   * the pre-mount image.  Runtime state (refcount, locks, page cache, parent
+   * and view links, list heads, rcu link) is live, not part of the image, so
+   * it is carried over from the current node.  A counted filesystem defers
+   * the free to its last live node; an uncounted one is only freed when the
+   * detach was not forced. */
+  bool free_fs = m->fs_free && (fs_busy || !override);
   if (free_fs) m->fs_free(root);
+  /* The image copy below overwrites the node's registry link, so unlink the
+   * node first: a reclaim walk must never see the link half-written. */
+  bool pc_linked = vfs_cache_registry_detach(root);
   vfs_node_t live;
   memcpy(&live, root, sizeof(live));
   memcpy(root, m->saved, sizeof(*root));
@@ -2499,6 +2539,11 @@ int vfs_inplace_unmount(vfs_node_t *point, unsigned flags) {
   root->filesystem_mount_flags = live.filesystem_mount_flags;
   root->pages = live.pages;
   root->pages_lock = live.pages_lock;
+  /* The saved image carries no registry link, so the one the node had is put
+   * back by hand. */
+  root->pc_registered = false;
+  INIT_LIST_HEAD(&root->pc_link);
+  vfs_cache_registry_attach(root, pc_linked);
   root->pc_cache_chunk = live.pc_cache_chunk;
   root->pc_cache_leaf = live.pc_cache_leaf;
   root->pc_cache_seq = live.pc_cache_seq;
@@ -2517,6 +2562,7 @@ int vfs_inplace_unmount(vfs_node_t *point, unsigned flags) {
   vfs_dentry_invalidate(NULL, NULL);
   vfs_close(root);  /* the reference the mount entry held */
   klogf("[VFS] unmounted %s (mount %llu)\n", m->path, (unsigned long long)m->mount_id);
+  block_put(m->dev);
   kfree(m->saved);
   kfree(m);
   return 0;
@@ -2538,7 +2584,7 @@ int vfs_mount_inplace(vfs_node_t *node, vfs_node_t *saved,
     for (vfs_mount_entry_t *m = vfs_mount_list; m; m = m->next) {
       if (m->target == node && !m->saved) {
         m->saved = saved;
-        m->dev = dev;
+        m->dev = block_ref(dev);
         m->fs_flush = fs_flush;
         m->fs_free = fs_free;
         m->fs_busy = fs_busy;

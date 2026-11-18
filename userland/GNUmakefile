@@ -51,9 +51,12 @@ avory-login.elf: avory-login.c $(GLIBC_STAMP)
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		avory-login.c -lcrypt -o avory-login.elf
 
-avory-installer.elf: avory-installer.c $(GLIBC_STAMP)
-	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
-		avory-installer.c -o avory-installer.elf
+INSTALLER_SRCS := installer/main.c installer/tui.c installer/disks.c installer/install.c installer/packages.c
+INSTALLER_HDRS := installer/installer.h installer/tui.h installer/disks.h installer/install.h installer/packages.h
+
+avory-installer.elf: $(INSTALLER_SRCS) $(INSTALLER_HDRS) $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -Iinstaller \
+		$(INSTALLER_SRCS) -o avory-installer.elf
 
 nvme_init.elf: nvme_init.c $(GLIBC_STAMP)
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -static nvme_init.c -o nvme_init.elf
@@ -365,6 +368,10 @@ test_hugepages.elf: test_hugepages.c $(GLIBC_STAMP)
 test_zero_page.elf: test_zero_page.c $(GLIBC_STAMP)
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		test_zero_page.c -o test_zero_page.elf
+
+test_heap_corrupt.elf: test_heap_corrupt.c $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
+		test_heap_corrupt.c -o test_heap_corrupt.elf
 
 test_watchdog.elf: test_watchdog.c $(GLIBC_STAMP)
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \

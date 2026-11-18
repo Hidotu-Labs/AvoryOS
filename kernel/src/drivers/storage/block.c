@@ -19,45 +19,98 @@ static spinlock_t block_table_lock = SPINLOCK_INIT;
 #include "lib/string.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
+#include "arch/uaccess.h"
+
+/* Copy between the caller's buffer, which may be user memory, and a kernel
+ * bounce sector. */
+static int block_copy_out(uint8_t *dst, const uint8_t *src, uint32_t n) {
+  if (is_user_ptr((uint64_t)dst))
+    return copy_to_user(dst, src, n) ? -1 : 0;
+  memcpy(dst, src, n);
+  return 0;
+}
+
+static int block_copy_in(uint8_t *dst, const uint8_t *src, uint32_t n) {
+  if (is_user_ptr((uint64_t)src))
+    return copy_from_user(dst, src, n) ? -1 : 0;
+  memcpy(dst, src, n);
+  return 0;
+}
+
+/* Raw block-device I/O at any byte offset and length, like Linux's buffered
+ * block devices (mtools, for one, reads its boot sector unaligned). Whole
+ * aligned sectors go straight to the driver, which bounces user buffers
+ * itself; partial sectors at either edge go through a kernel bounce sector,
+ * read-modify-write for writes. Transfers stop at the end of the device. */
+static uint32_t block_vfs_rw(struct vfs_node *node, uint64_t offset,
+                             uint32_t size, uint8_t *buffer, bool write) {
+  struct block_device *dev = (struct block_device *)node->device;
+  if (!dev || !dev->read_sectors || (write && !dev->write_sectors))
+    return 0;
+
+  uint32_t ss = dev->sector_size ? dev->sector_size : 512;
+  uint64_t total = dev->total_sectors * ss;
+  if (offset >= total || size == 0)
+    return 0;
+  if (size > total - offset)
+    size = (uint32_t)(total - offset);
+
+  uint8_t *bounce = NULL;
+  uint32_t done = 0;
+  while (done < size) {
+    uint64_t pos = offset + done;
+    uint64_t sector = pos / ss;
+    uint32_t in = (uint32_t)(pos % ss);
+    uint32_t left = size - done;
+
+    if (in == 0 && left >= ss) {
+      uint32_t count = left / ss;
+      int err = write ? dev->write_sectors(dev, sector, count, buffer + done)
+                      : dev->read_sectors(dev, sector, count, buffer + done);
+      if (err)
+        break;
+      done += count * ss;
+      continue;
+    }
+
+    if (!bounce && !(bounce = kmalloc(ss)))
+      break;
+    uint32_t chunk = ss - in < left ? ss - in : left;
+    if (dev->read_sectors(dev, sector, 1, bounce))
+      break;
+    if (write) {
+      if (block_copy_in(bounce + in, buffer + done, chunk) ||
+          dev->write_sectors(dev, sector, 1, bounce))
+        break;
+    } else if (block_copy_out(buffer + done, bounce + in, chunk)) {
+      break;
+    }
+    done += chunk;
+  }
+  kfree(bounce);
+  return done;
+}
 
 static uint32_t block_vfs_read(struct vfs_node *node, uint32_t offset,
                                uint32_t size, uint8_t *buffer) {
-  struct block_device *dev = (struct block_device *)node->device;
-  if (!dev || !dev->read_sectors)
-    return 0;
-
-  uint32_t sector_size = dev->sector_size ? dev->sector_size : 512;
-  uint32_t sector = offset / sector_size;
-  uint32_t count = size / sector_size;
-
-  if (size % sector_size != 0)
-    return 0; // Enforce sector aligned logical reads for now
-
-  int err = dev->read_sectors(dev, sector, count, buffer);
-  if (err)
-    return 0;
-  return size;
+  return block_vfs_rw(node, offset, size, buffer, false);
 }
 
-// Raw block-device writes.  Like reads, the request must be sector aligned;
-// the driver is responsible for bouncing user or otherwise unaligned buffers.
 static uint32_t block_vfs_write(struct vfs_node *node, uint32_t offset,
                                 uint32_t size, uint8_t *buffer) {
-  struct block_device *dev = (struct block_device *)node->device;
-  if (!dev || !dev->write_sectors)
-    return 0;
+  return block_vfs_rw(node, offset, size, buffer, true);
+}
 
-  uint32_t sector_size = dev->sector_size ? dev->sector_size : 512;
-  uint32_t sector = offset / sector_size;
-  uint32_t count = size / sector_size;
-
-  if (size % sector_size != 0)
-    return 0;
-
-  int err = dev->write_sectors(dev, sector, count, buffer);
-  if (err)
-    return 0;
-  return size;
+/* The vnode read/write hooks carry 32-bit offsets, which would wrap raw I/O
+ * past 4 GiB back onto the start of the device (mke2fs's backup superblocks
+ * on a 6 GiB partition, for one). Syscalls route raw block nodes here with
+ * the full file offset instead. */
+bool block_node_rw64(struct vfs_node *node, uint64_t offset, uint32_t size,
+                     uint8_t *buffer, bool write, uint32_t *out) {
+  if (!node || node->read != block_vfs_read)
+    return false;
+  *out = block_vfs_rw(node, offset, size, buffer, write);
+  return true;
 }
 
 // Partition Wrapper
@@ -65,6 +118,7 @@ static uint32_t block_vfs_write(struct vfs_node *node, uint32_t offset,
 struct partition_wrapper {
   struct block_device *parent;
   uint64_t start_lba;
+  int index; /* 1-based table slot, the BLKPG pno */
 };
 
 static struct block_device *partition_parent(const struct block_device *dev) {
@@ -77,6 +131,16 @@ static struct block_device *partition_parent(const struct block_device *dev) {
 static bool partition_gone(const struct block_device *dev) {
   struct block_device *parent = partition_parent(dev);
   return block_device_gone(dev) || (parent && block_device_gone(parent));
+}
+
+/* A partition holds a reference on its disk; both go when the partition's
+ * last holder lets go. */
+static void partition_release(struct block_device *dev) {
+  struct partition_wrapper *wrap = (struct partition_wrapper *)dev->driver_data;
+  if (wrap)
+    block_put(wrap->parent);
+  kfree(wrap);
+  kfree(dev);
 }
 
 /* Batch members must each get a verdict, even when the whole batch fails. */
@@ -259,11 +323,13 @@ int block_add_partition_ex(struct block_device *parent, int part_index,
   if (!wrap)
     return -1;
 
-  wrap->parent = parent;
+  wrap->parent = block_ref(parent);
   wrap->start_lba = start_lba;
+  wrap->index = part_index;
 
   struct block_device *pdev = kmalloc(sizeof(struct block_device));
   if (!pdev) {
+    block_put(parent);
     kfree(wrap);
     return -1;
   }
@@ -291,6 +357,7 @@ int block_add_partition_ex(struct block_device *parent, int part_index,
   if (parent->write_sectors)
     pdev->write_batch = partition_write_batch;
   pdev->driver_data = wrap;
+  pdev->release = partition_release;
 
   if (meta) {
     if (meta->partuuid)
@@ -302,7 +369,11 @@ int block_add_partition_ex(struct block_device *parent, int part_index,
     pdev->partition_type = meta->partition_type;
   }
 
-  return block_register(pdev);
+  if (block_register(pdev) != 0) {
+    partition_release(pdev);
+    return -1;
+  }
+  return 0;
 }
 
 int block_add_partition(struct block_device *parent, int part_index,
@@ -313,33 +384,48 @@ int block_add_partition(struct block_device *parent, int part_index,
 struct block_device *block_find_by_partuuid(const char *uuid) {
   if (!uuid || !*uuid)
     return NULL;
+  spinlock_acquire(&block_table_lock);
   for (int i = 0; i < num_devices; i++) {
     struct block_device *dev = registered[i];
-    if (dev && dev->partuuid[0] && strcasecmp(dev->partuuid, uuid) == 0)
+    if (dev && dev->partuuid[0] && strcasecmp(dev->partuuid, uuid) == 0) {
+      block_ref(dev);
+      spinlock_release(&block_table_lock);
       return dev;
+    }
   }
+  spinlock_release(&block_table_lock);
   return NULL;
 }
 
 struct block_device *block_find_by_partlabel(const char *label) {
   if (!label || !*label)
     return NULL;
+  spinlock_acquire(&block_table_lock);
   for (int i = 0; i < num_devices; i++) {
     struct block_device *dev = registered[i];
-    if (dev && dev->partlabel[0] && strcmp(dev->partlabel, label) == 0)
+    if (dev && dev->partlabel[0] && strcmp(dev->partlabel, label) == 0) {
+      block_ref(dev);
+      spinlock_release(&block_table_lock);
       return dev;
+    }
   }
+  spinlock_release(&block_table_lock);
   return NULL;
 }
 
 struct block_device *block_find_by_type(uint8_t partition_type) {
   if (partition_type == PART_TYPE_UNKNOWN)
     return NULL;
+  spinlock_acquire(&block_table_lock);
   for (int i = 0; i < num_devices; i++) {
     struct block_device *dev = registered[i];
-    if (dev && dev->partition_type == partition_type)
+    if (dev && dev->partition_type == partition_type) {
+      block_ref(dev);
+      spinlock_release(&block_table_lock);
       return dev;
+    }
   }
+  spinlock_release(&block_table_lock);
   return NULL;
 }
 
@@ -347,6 +433,153 @@ bool block_is_partition(const struct block_device *dev) {
   if (!dev)
     return false;
   return dev->read_sectors == partition_read;
+}
+
+/* Partition `pno` of `disk`, referenced, or NULL. */
+static struct block_device *block_find_partition(struct block_device *disk,
+                                                 int pno) {
+  struct block_device *found = NULL;
+  spinlock_acquire(&block_table_lock);
+  for (int i = 0; i < num_devices && !found; i++) {
+    struct block_device *d = registered[i];
+    if (d && block_is_partition(d) && partition_parent(d) == disk &&
+        ((struct partition_wrapper *)d->driver_data)->index == pno)
+      found = block_ref(d);
+  }
+  spinlock_release(&block_table_lock);
+  return found;
+}
+
+/* True when the global mount table uses `dev` as a mount source. */
+static bool block_is_mounted(const struct block_device *dev) {
+  vfs_mount_info_t *mounts = kmalloc(sizeof(vfs_mount_info_t) * 64);
+  if (!mounts)
+    return true; /* cannot tell: refuse rather than yank a live mount */
+  int n = vfs_get_mounts(mounts, 64);
+  bool used = false;
+  for (int i = 0; i < n && !used; i++) {
+    const char *src = mounts[i].dev_name;
+    if (strncmp(src, "/dev/", 5) == 0)
+      src += 5;
+    used = strcmp(src, dev->name) == 0;
+  }
+  kfree(mounts);
+  return used;
+}
+
+/* Drop every partition of `disk` so a rescan does not register duplicates.
+ * Fails with -EBUSY, removing nothing, while any of them is mounted. */
+static int block_drop_partitions(struct block_device *disk) {
+  struct block_device *parts[BLOCK_MAX_DEVICES];
+  int n = 0;
+  spinlock_acquire(&block_table_lock);
+  for (int i = 0; i < num_devices; i++) {
+    struct block_device *d = registered[i];
+    if (d && block_is_partition(d) && partition_parent(d) == disk)
+      parts[n++] = block_ref(d);
+  }
+  spinlock_release(&block_table_lock);
+
+  int rc = 0;
+  for (int i = 0; i < n && rc == 0; i++)
+    if (block_is_mounted(parts[i]))
+      rc = -16; // -EBUSY
+  for (int i = 0; i < n; i++) {
+    if (rc == 0)
+      block_unregister(parts[i]);
+    block_put(parts[i]);
+  }
+  return rc;
+}
+
+/* BLKPG (linux/blkpg.h): parted, sfdisk and partx add or drop single
+ * partitions after rewriting the table instead of rescanning the disk. */
+struct blkpg_ioctl_arg {
+  int op;
+  int flags;
+  int datalen;
+  void *data;
+};
+
+struct blkpg_partition {
+  long long start;  /* bytes */
+  long long length; /* bytes */
+  int pno;
+  char devname[64];
+  char volname[64];
+};
+
+#define BLKPG_ADD_PARTITION 1
+#define BLKPG_DEL_PARTITION 2
+#define BLKPG_RESIZE_PARTITION 3
+
+static int block_blkpg(struct block_device *disk, uint64_t arg) {
+  if (block_is_partition(disk))
+    return -22; // -EINVAL
+  if (!vmm_is_user_addr_range_valid(arg, sizeof(struct blkpg_ioctl_arg)))
+    return -14;
+  struct blkpg_ioctl_arg a = *(struct blkpg_ioctl_arg *)arg;
+  if (a.datalen < (int)sizeof(struct blkpg_partition) ||
+      !vmm_is_user_addr_range_valid((uint64_t)a.data,
+                                    sizeof(struct blkpg_partition)))
+    return -14;
+  struct blkpg_partition p = *(struct blkpg_partition *)a.data;
+  if (p.pno <= 0)
+    return -22;
+
+  uint32_t ss = disk->sector_size ? disk->sector_size : 512;
+  struct block_device *cur = block_find_partition(disk, p.pno);
+  int rc = 0;
+  switch (a.op) {
+  case BLKPG_ADD_PARTITION:
+    if (cur) {
+      rc = -16; // -EBUSY: slot taken
+      break;
+    }
+    if (p.start < 0 || p.length <= 0 || p.start % ss || p.length % ss) {
+      rc = -22;
+      break;
+    }
+    if (block_add_partition_ex(disk, p.pno, (uint64_t)p.start / ss,
+                               (uint64_t)p.length / ss, NULL) != 0)
+      rc = -22;
+    break;
+  case BLKPG_DEL_PARTITION:
+    if (!cur) {
+      rc = -6; // -ENXIO: parted treats this as "already gone"
+      break;
+    }
+    if (block_is_mounted(cur)) {
+      rc = -16;
+      break;
+    }
+    block_unregister(cur);
+    break;
+  case BLKPG_RESIZE_PARTITION: {
+    if (!cur) {
+      rc = -6;
+      break;
+    }
+    uint64_t start = ((struct partition_wrapper *)cur->driver_data)->start_lba;
+    if (p.length <= 0 || p.length % ss || (uint64_t)p.start != start * ss) {
+      rc = -22;
+      break;
+    }
+    if (block_is_mounted(cur)) {
+      rc = -16;
+      break;
+    }
+    block_unregister(cur);
+    if (block_add_partition_ex(disk, p.pno, start, (uint64_t)p.length / ss,
+                               NULL) != 0)
+      rc = -22;
+    break;
+  }
+  default:
+    rc = -22;
+  }
+  block_put(cur);
+  return rc;
 }
 
 void block_scan_partitions(struct block_device *dev) {
@@ -494,12 +727,16 @@ static int block_vfs_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) {
   }
 
   case 0x125F: { // BLKRRPART (re-read partition table)
-    if (!block_is_partition(dev)) {
+    if (block_is_partition(dev))
+      return -22; // -EINVAL on a partition
+    int rc = block_drop_partitions(dev);
+    if (rc == 0)
       block_scan_partitions(dev);
-      return 0;
-    }
-    return -22; // -EINVAL on a partition
+    return rc;
   }
+
+  case 0x1269: // BLKPG
+    return block_blkpg(dev, arg);
 
   case 0x1261: { // BLKFLSBUF (flush buffer cache)
     return block_flush(dev);
@@ -515,6 +752,13 @@ static int block_vfs_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg) {
  * so lookups stay valid and mounts it in the ramfs /dev directory.  Hand-rolling
  * ramfs_create()/vfs_finddir()/vfs_close() here used to free the node while it
  * was still linked in the directory. */
+/* The /dev vnode's reference on its device.  Runs on the vnode's final
+ * release, which after block_unregister() unlinks it is the last close. */
+static void block_node_destroy(vfs_node_t *node) {
+  block_put((struct block_device *)node->device);
+  node->device = NULL;
+}
+
 static void block_publish_node(struct block_device *dev) {
   if (!fs_root || !dev)
     return;
@@ -528,7 +772,8 @@ static void block_publish_node(struct block_device *dev) {
   node->mask = 0600;
   node->length =
       dev->total_sectors * (dev->sector_size ? dev->sector_size : 512);
-  node->device = dev;
+  node->device = block_ref(dev);
+  node->destroy = block_node_destroy;
   node->read = block_vfs_read;
   node->write = block_vfs_write;
   node->ioctl = block_vfs_ioctl;
@@ -556,12 +801,30 @@ struct block_device *block_get_by_name(const char *name) {
   /* Accept "/dev/nvme0n1p1" as well as bare "nvme0n1p1". */
   if (strncmp(name, "/dev/", 5) == 0)
     name += 5;
+  spinlock_acquire(&block_table_lock);
   for (int i = 0; i < num_devices; i++) {
     struct block_device *dev = registered[i];
-    if (dev && strcmp(dev->name, name) == 0)
+    if (dev && strcmp(dev->name, name) == 0) {
+      block_ref(dev);
+      spinlock_release(&block_table_lock);
       return dev;
+    }
   }
+  spinlock_release(&block_table_lock);
   return NULL;
+}
+
+bool block_name_in_use(const char *name) {
+  struct block_device *dev = block_get_by_name(name);
+  block_put(dev);
+  return dev != NULL;
+}
+
+void block_put(struct block_device *dev) {
+  if (!dev)
+    return;
+  if (__atomic_sub_fetch(&dev->refs, 1, __ATOMIC_ACQ_REL) == 0 && dev->release)
+    dev->release(dev);
 }
 
 int block_register(struct block_device *dev) {
@@ -582,6 +845,7 @@ int block_register(struct block_device *dev) {
       dev->linux_major = 8;
     dev->linux_minor = next_minor++;
   }
+  block_ref(dev); /* the registry's */
   registered[num_devices++] = dev;
   spinlock_release(&block_table_lock);
 
@@ -604,8 +868,9 @@ int block_register(struct block_device *dev) {
 
 /* Remove a device and, first, every partition on it.  Order: stop I/O (gone),
  * drop the /dev node, emit "remove" and drop the sysfs entries, then free the
- * registry slot.  The struct itself is never freed: partitions, /dev vnodes
- * and open descriptors may still point at it, and they all see gone. */
+ * registry slot and drop the registry's reference.  The struct is freed by the
+ * last block_put(): partitions, /dev vnodes and mounts that still point at it
+ * keep it alive, and they all see gone. */
 void block_unregister(struct block_device *dev) {
   if (!dev)
     return;
@@ -617,12 +882,13 @@ void block_unregister(struct block_device *dev) {
     for (int i = 0; i < num_devices && !child; i++) {
       struct block_device *d = registered[i];
       if (d && d != dev && block_is_partition(d) && partition_parent(d) == dev)
-        child = d;
+        child = block_ref(d);
     }
     spinlock_release(&block_table_lock);
     if (!child)
       break;
     block_unregister(child);
+    block_put(child);
   }
 
   spinlock_acquire(&block_table_lock);
@@ -642,6 +908,7 @@ void block_unregister(struct block_device *dev) {
 
   sysfs_block_device_removed(dev);
 
+  bool removed = false;
   spinlock_acquire(&block_table_lock);
   for (int i = 0; i < num_devices; i++) {
     if (registered[i] == dev) {
@@ -649,16 +916,21 @@ void block_unregister(struct block_device *dev) {
         registered[j - 1] = registered[j];
       num_devices--;
       registered[num_devices] = NULL;
+      removed = true;
       break;
     }
   }
   spinlock_release(&block_table_lock);
+  /* Only the caller that took the slot out drops the registry's reference,
+   * so racing unregisters cannot drop it twice. */
+  if (removed)
+    block_put(dev);
 }
 
 struct block_device *block_get(int index) {
   spinlock_acquire(&block_table_lock);
   struct block_device *dev =
-      (index < 0 || index >= num_devices) ? NULL : registered[index];
+      (index < 0 || index >= num_devices) ? NULL : block_ref(registered[index]);
   spinlock_release(&block_table_lock);
   return dev;
 }

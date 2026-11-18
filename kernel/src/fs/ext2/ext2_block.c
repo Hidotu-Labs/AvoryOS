@@ -1227,24 +1227,32 @@ size_t ext2_buffer_cache_shrink(size_t max_buffers) {
 
   spinlock_acquire(&ext2_mounts_lock);
   for (ext2_mount_t *m = ext2_active_mounts; m && total_freed < max_buffers; m = m->next) {
-    uint32_t batch_count = 0;
-    spinlock_acquire(&m->cache_lock);
-    uint32_t start = m->cache_shrink_cursor;
-    for (uint32_t step = 0; step < EXT2_CACHE_SIZE && (total_freed + batch_count) < max_buffers && batch_count < 32; step++) {
-      uint32_t idx = (start + step) % EXT2_CACHE_SIZE;
-      if (m->cache[idx].data != NULL && m->cache[idx].writes_inflight == 0) {
-        batch[batch_count++] = m->cache[idx].data;
-        m->cache[idx].data = NULL;
-        m->cache[idx].num = 0;
-        m->cache[idx].write_seq++;
+    /* Sweep the whole cache in lock-held batches of up to 32 buffers. A single
+     * batch per mount per call capped every caller at 32 buffers per mount, so
+     * drop_caches could release only a quarter of a 2048-slot cache. The
+     * cursor now only records where the next call starts. */
+    uint32_t scanned = 0;
+    while (scanned < EXT2_CACHE_SIZE && total_freed < max_buffers) {
+      uint32_t batch_count = 0;
+      spinlock_acquire(&m->cache_lock);
+      uint32_t start = m->cache_shrink_cursor;
+      while (scanned < EXT2_CACHE_SIZE && batch_count < 32 &&
+             total_freed + batch_count < max_buffers) {
+        uint32_t idx = (start + scanned) % EXT2_CACHE_SIZE;
+        scanned++;
+        if (m->cache[idx].data != NULL && m->cache[idx].writes_inflight == 0) {
+          batch[batch_count++] = m->cache[idx].data;
+          m->cache[idx].data = NULL;
+          m->cache[idx].num = 0;
+          m->cache[idx].write_seq++;
+        }
       }
-    }
-    m->cache_shrink_cursor = (start + max_buffers) % EXT2_CACHE_SIZE;
-    spinlock_release(&m->cache_lock);
+      m->cache_shrink_cursor = (start + scanned) % EXT2_CACHE_SIZE;
+      spinlock_release(&m->cache_lock);
 
-    for (uint32_t b = 0; b < batch_count; b++) {
-      kfree(batch[b]);
-      total_freed++;
+      for (uint32_t b = 0; b < batch_count; b++)
+        kfree(batch[b]);
+      total_freed += batch_count;
     }
   }
   spinlock_release(&ext2_mounts_lock);

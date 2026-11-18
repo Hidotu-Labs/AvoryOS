@@ -8,6 +8,7 @@
 void console_init(struct limine_framebuffer *framebuffer);
 void console_putchar(char c);
 void console_puts(const char *s);
+void console_set_kernel_quiet(bool quiet);
 
 // Batch write: renders all `len` bytes then does a single backbuffer swap.
 // Use this from sys_write / VFS write to eliminate per-character flicker.

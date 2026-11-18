@@ -160,6 +160,81 @@ size_t vfs_cache_page_count(void) {
   return (size_t)__atomic_load_n(&vfs_cached_pages, __ATOMIC_RELAXED);
 }
 
+/* ── Registry of nodes that hold cached pages ─────────────────────────────
+ *
+ * The reclaim walks above reach only files that the dentry cache or the
+ * caller's own mappings keep reachable. A file held just by another process's
+ * open descriptor, or evicted from the dentry cache while still open, kept its
+ * clean pages through drop_caches and OOM. A node is linked here when its
+ * first page is inserted and unlinked when its tree is cleared or found empty.
+ * The registry takes no reference. A linked node is only touched under
+ * vfs_pc_nodes_lock, and vfs_cache_clear() unlinks it before the final close
+ * frees it.
+ *
+ * Lock order: node->pages_lock, then vfs_pc_nodes_lock. */
+static struct list_head vfs_pc_nodes = {&vfs_pc_nodes, &vfs_pc_nodes};
+static uint32_t vfs_pc_node_count;
+static spinlock_t vfs_pc_nodes_lock = SPINLOCK_INIT;
+
+/* Reclaim and writeback counters, shown in /proc/vmstat. Diagnostics only, so
+ * they are updated without atomics: a lost increment costs nothing. */
+static uint64_t vfs_pc_stat_idle_reclaimed;
+static uint64_t vfs_pc_stat_writeback_nodes;
+static uint64_t vfs_pc_stat_writeback_pages;
+
+/* Idle trim: a node none of whose pages was touched for this long gives back
+ * its clean, unmapped pages. Dirty and mapped pages are never released. The
+ * worker runs every VFS_PC_TRIM_PERIOD_MS. */
+#define VFS_PC_IDLE_MS 30000u
+#define VFS_PC_TRIM_PERIOD_MS 5000u
+
+static inline void cache_touch(vfs_node_t *node) {
+  uint64_t now = lapic_timer_get_ms();
+  if (node->pc_last_ms != now)
+    node->pc_last_ms = now;
+}
+
+/* Caller holds node->pages_lock. */
+static void cache_register_locked(vfs_node_t *node) {
+  if (node->pc_registered)
+    return;
+  spinlock_acquire(&vfs_pc_nodes_lock);
+  list_add_tail(&node->pc_link, &vfs_pc_nodes);
+  vfs_pc_node_count++;
+  spinlock_release(&vfs_pc_nodes_lock);
+  node->pc_registered = true;
+  cache_touch(node);
+}
+
+/* Caller holds node->pages_lock. */
+static void cache_unregister_locked(vfs_node_t *node) {
+  if (!node->pc_registered)
+    return;
+  spinlock_acquire(&vfs_pc_nodes_lock);
+  list_del(&node->pc_link);
+  vfs_pc_node_count--;
+  spinlock_release(&vfs_pc_nodes_lock);
+  node->pc_registered = false;
+}
+
+/* In-place mount swap: unlink `node` so its image can be overwritten while a
+ * reclaim walk runs. Returns whether it was linked, for the attach call. */
+bool vfs_cache_registry_detach(vfs_node_t *node) {
+  spinlock_acquire(&node->pages_lock);
+  bool linked = node->pc_registered;
+  cache_unregister_locked(node);
+  spinlock_release(&node->pages_lock);
+  return linked;
+}
+
+void vfs_cache_registry_attach(vfs_node_t *node, bool linked) {
+  if (!linked)
+    return;
+  spinlock_acquire(&node->pages_lock);
+  cache_register_locked(node);
+  spinlock_release(&node->pages_lock);
+}
+
 static void cache_page_reclaim(struct vfs_rcu_head *head) {
   vfs_page_t *page =
       (vfs_page_t *)((uint8_t *)head - __builtin_offsetof(vfs_page_t, rcu));
@@ -248,6 +323,7 @@ static bool vfs_cache_lookup_force_locked;
 vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
   if (!node)
     return NULL;
+  cache_touch(node);
   if (vfs_cache_lookup_force_locked || !vfs_rcu_ready())
     return vfs_cache_lookup_locked(node, offset);
 
@@ -337,6 +413,7 @@ vfs_page_t *vfs_cache_insert(vfs_node_t *node, uint32_t offset,
     return NULL;
   }
   __atomic_add_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
+  cache_register_locked(node);
   spinlock_release(&node->pages_lock);
   return new_page;
 }
@@ -441,6 +518,7 @@ retry:
     page = candidate;
     creator = true;
     __atomic_add_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
+    cache_register_locked(node);
   }
   spinlock_release(&node->pages_lock);
 
@@ -672,6 +750,7 @@ static uint32_t vfs_cache_fill_pages(vfs_node_t *node, uint32_t offset,
 uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_bytes) {
   if (!node || !node->read || !max_bytes || offset >= node->length)
     return 0;
+  cache_touch(node);
 
   offset &= ~(PAGE_SIZE - 1);
   if (offset >= node->length)
@@ -795,6 +874,7 @@ uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_byt
       break;
     }
     __atomic_add_fetch(&vfs_cached_pages, 1, __ATOMIC_RELAXED);
+    cache_register_locked(node);
     inserted++;
   }
   spinlock_release(&node->pages_lock);
@@ -1264,6 +1344,9 @@ void vfs_cache_clear(vfs_node_t *node) {
   if (!vfs_node_is_alive(node))
     return;
   spinlock_acquire(&node->pages_lock);
+  /* Unlink before the tree goes: the final close frees the node right after
+   * this, and the registry must not reach it again. */
+  cache_unregister_locked(node);
   asc_radix_tree_destroy(&node->pages, cache_destroy_value);
   spinlock_release(&node->pages_lock);
 }
@@ -1352,13 +1435,76 @@ size_t vfs_cache_reclaim(vfs_node_t *node, size_t target) {
   return reclaimed;
 }
 
-// OOM hook for mm (heap.c / slab_cache.c call it via weak symbol).
+/* Unlink a node whose tree is empty, so later walks skip it. try-lock: the
+ * walk must not wait on a node whose pages_lock the caller may already hold
+ * (OOM can run inside an insert). A miss just leaves the node for next time. */
+static void vfs_pc_prune(vfs_node_t *node) {
+  if (!spinlock_try_acquire(&node->pages_lock))
+    return;
+  if (node->pages.entries == 0)
+    cache_unregister_locked(node);
+  spinlock_release(&node->pages_lock);
+}
+
+/* What a registry walk does to each node it visits. */
+enum vfs_pc_walk_mode {
+  VFS_PC_WALK_CLEAN,     /* release clean pages, any age (pressure, OOM) */
+  VFS_PC_WALK_IDLE,      /* release clean pages of nodes idle for VFS_PC_IDLE_MS */
+  VFS_PC_WALK_WRITEBACK, /* write back dirty pages; nothing is released */
+};
+
+/* Visit up to `target` pages' worth of registered files, each node once.
+ * Visited nodes rotate to the tail, so repeated calls spread the work.
+ * Bounded: the visit count is fixed on entry, and nothing allocates. */
+static size_t vfs_pc_walk(size_t target, enum vfs_pc_walk_mode mode) {
+  size_t reclaimed = 0;
+  spinlock_acquire(&vfs_pc_nodes_lock);
+  uint32_t budget = vfs_pc_node_count;
+  spinlock_release(&vfs_pc_nodes_lock);
+
+  while (reclaimed < target && budget--) {
+    vfs_node_t *node = NULL;
+    spinlock_acquire(&vfs_pc_nodes_lock);
+    if (!list_empty(&vfs_pc_nodes)) {
+      node = list_first_entry(&vfs_pc_nodes, vfs_node_t, pc_link);
+      list_del(&node->pc_link);
+      list_add_tail(&node->pc_link, &vfs_pc_nodes);
+      if (mode == VFS_PC_WALK_IDLE &&
+          lapic_timer_get_ms() - node->pc_last_ms < VFS_PC_IDLE_MS)
+        node = NULL;
+      /* A zero refcount means the node is on its way out; its last close
+       * unlinks it, so skip it rather than revive it. */
+      else if (!vfs_node_tryref(node))
+        node = NULL;
+    }
+    spinlock_release(&vfs_pc_nodes_lock);
+    if (!node)
+      continue;
+    /* Directories and other non-file nodes keep their pages, as the dentry
+     * path has always done. Only file pages are reclaimed or written here. */
+    if ((node->flags & FS_TYPE_MASK) == FS_FILE) {
+      if (mode == VFS_PC_WALK_WRITEBACK) {
+        vfs_pc_stat_writeback_nodes++;
+        vfs_cache_sync(node);
+      } else {
+        size_t got = vfs_cache_reclaim(node, target - reclaimed);
+        reclaimed += got;
+        if (mode == VFS_PC_WALK_IDLE)
+          vfs_pc_stat_idle_reclaimed += got;
+      }
+    }
+    vfs_pc_prune(node);
+    vfs_close(node);
+  }
+  return reclaimed;
+}
+
 // Frees up to `target` clean, unmapped page-cache pages owned by files
-// mapped into the CURRENT process. Bounded and allocation-free: node
-// pointers are collected on the stack under a try-locked mm->lock (skipped
-// when contended, e.g. OOM inside mmap while holding it), each pinned with
-// vfs_node_tryref and released with vfs_close after reclaim.
-size_t mm_file_cache_reclaim(size_t target) {
+// mapped into the CURRENT process, then by dentry-cached files. Bounded and
+// allocation-free: node pointers are collected on the stack under a try-locked
+// mm->lock (skipped when contended, e.g. OOM inside mmap while holding it),
+// each pinned with vfs_node_tryref and released with vfs_close after reclaim.
+static size_t mm_file_cache_reclaim_mapped(size_t target) {
   if (!target)
     return 0;
 
@@ -1423,6 +1569,155 @@ size_t mm_file_cache_reclaim(size_t target) {
     reclaimed += vfs_dentry_reclaim_pages(target - reclaimed);
   return reclaimed;
 #undef MM_RECLAIM_MAX_NODES
+}
+
+// OOM and drop_caches hook (heap_oom_reclaim, procfs drop_caches). Serves the
+// caller's own mappings and the dentry cache first, then every other file that
+// still holds cached pages.
+size_t mm_file_cache_reclaim(size_t target) {
+  if (!target)
+    return 0;
+  size_t reclaimed = mm_file_cache_reclaim_mapped(target);
+  if (reclaimed < target)
+    reclaimed += vfs_pc_walk(target - reclaimed, VFS_PC_WALK_CLEAN);
+  return reclaimed;
+}
+
+/* Background idle trim. Runs on its own kernel thread. Each pass releases the
+ * clean pages of files nothing has touched for VFS_PC_IDLE_MS, so a file read
+ * once does not stay resident until memory runs out. */
+static void vfs_pc_trim_worker(void) {
+  struct thread *self = sched_get_current();
+  for (;;) {
+    self->state = THREAD_SLEEPING;
+    self->wakeup_ticks = lapic_timer_get_ticks() + VFS_PC_TRIM_PERIOD_MS;
+    sched_yield();
+    self->wakeup_ticks = 0;
+    self->state = THREAD_RUNNING;
+    vfs_pc_walk((size_t)-1, VFS_PC_WALK_IDLE);
+  }
+}
+
+void vfs_pc_trim_init(void) {
+  if (!sched_create_kernel_thread(vfs_pc_trim_worker, NULL, true))
+    klog_puts("[VFS] idle page-cache trim off: no worker thread\n");
+}
+
+/* ── kswapd: pressure-driven background reclaim ──────────────────────────
+ *
+ * The buddy allocator wakes this thread when free memory drops under the low
+ * watermark. A pass releases clean cache from registered files until free
+ * memory reaches the high watermark. If the clean cache is exhausted and
+ * memory is still low, the pass writes dirty pages back, so the next pass can
+ * release them. Slab shrinking runs only under the low mark. A periodic
+ * writeback pass keeps dirty data from waiting on memory pressure. Nothing
+ * here runs in an allocation path. */
+#define KSWAPD_POLL_MS 250u
+#define KSWAPD_PRESSURE_MS 5u
+#define KSWAPD_LOG_INTERVAL_MS 1000u
+#define KSWAPD_WRITEBACK_PERIOD_MS 3600000u /* DIAGNOSTIC: pass disabled, revert */
+
+extern void kmem_cache_shrink_all(void) __attribute__((weak));
+
+static size_t kswapd_low_pages;
+static size_t kswapd_high_pages;
+static uint32_t kswapd_wanted;
+static uint64_t kswapd_passes;
+static uint64_t kswapd_pages_reclaimed;
+static uint64_t kswapd_last_log_ms;
+
+static void kswapd_wake(void) {
+  __atomic_store_n(&kswapd_wanted, 1, __ATOMIC_RELEASE);
+}
+
+static void kswapd_log(size_t free_pages, const char *what) {
+  uint64_t now = lapic_timer_get_ms();
+  if (now - kswapd_last_log_ms < KSWAPD_LOG_INTERVAL_MS)
+    return;
+  kswapd_last_log_ms = now;
+  klogf("[KSWAPD] %s: free=%llu low=%llu high=%llu passes=%llu reclaimed=%llu\n",
+        what, (unsigned long long)free_pages,
+        (unsigned long long)kswapd_low_pages,
+        (unsigned long long)kswapd_high_pages,
+        (unsigned long long)kswapd_passes,
+        (unsigned long long)kswapd_pages_reclaimed);
+}
+
+/* Set once free memory falls under the low mark; cleared when it reaches the
+ * high mark. In between, kswapd keeps reclaiming, so it doesn't stop just
+ * above the low mark. */
+static bool kswapd_active;
+
+static void kswapd_pass(void) {
+  size_t free_pages = pmm_get_free_pages_including_pcp();
+  if (free_pages >= kswapd_high_pages) {
+    kswapd_active = false;
+    return;
+  }
+  kswapd_passes++;
+
+  size_t reclaimed =
+      vfs_pc_walk(kswapd_high_pages - free_pages, VFS_PC_WALK_CLEAN);
+  kswapd_pages_reclaimed += reclaimed;
+
+  free_pages = pmm_get_free_pages_including_pcp();
+  if (free_pages < kswapd_low_pages) {
+    if (kmem_cache_shrink_all)
+      kmem_cache_shrink_all();
+    /* No clean cache left to release. Write dirty pages back so the next pass
+     * can release them. */
+    if (!reclaimed)
+      vfs_pc_walk((size_t)-1, VFS_PC_WALK_WRITEBACK);
+    kswapd_log(free_pages, "pressure");
+  }
+}
+
+static void kswapd_worker(void) {
+  struct thread *self = sched_get_current();
+  uint64_t last_writeback = lapic_timer_get_ms();
+  for (;;) {
+    bool wanted = __atomic_exchange_n(&kswapd_wanted, 0, __ATOMIC_ACQUIRE);
+    if (pmm_get_free_pages_including_pcp() < kswapd_low_pages)
+      kswapd_active = true;
+    bool pressure = kswapd_active;
+    if (wanted || pressure)
+      kswapd_pass();
+
+    uint64_t now = lapic_timer_get_ms();
+    if (now - last_writeback >= KSWAPD_WRITEBACK_PERIOD_MS) {
+      vfs_pc_walk((size_t)-1, VFS_PC_WALK_WRITEBACK);
+      last_writeback = now;
+    }
+
+    self->state = THREAD_SLEEPING;
+    self->wakeup_ticks = lapic_timer_get_ticks() +
+                         (pressure ? KSWAPD_PRESSURE_MS : KSWAPD_POLL_MS);
+    sched_yield();
+    self->wakeup_ticks = 0;
+    self->state = THREAD_RUNNING;
+  }
+}
+
+void vfs_pc_kswapd_init(void) {
+  size_t usable_pages = pmm_get_usable_memory() / PAGE_SIZE;
+  kswapd_low_pages = usable_pages / 10;
+  kswapd_high_pages = usable_pages * 15 / 100;
+  if (!sched_create_kernel_thread(kswapd_worker, NULL, true)) {
+    klog_puts("[KSWAPD] off: no worker thread\n");
+    return;
+  }
+  pmm_set_low_watermark(kswapd_low_pages, kswapd_wake);
+  klogf("[KSWAPD] watermarks low=%llu high=%llu pages\n",
+        (unsigned long long)kswapd_low_pages,
+        (unsigned long long)kswapd_high_pages);
+}
+
+void vfs_pc_stats_read(struct vfs_pc_stats *out) {
+  out->kswapd_passes = kswapd_passes;
+  out->kswapd_reclaimed = kswapd_pages_reclaimed;
+  out->idle_reclaimed = vfs_pc_stat_idle_reclaimed;
+  out->writeback_nodes = vfs_pc_stat_writeback_nodes;
+  out->writeback_pages = vfs_pc_stat_writeback_pages;
 }
 
 void vfs_cache_mark_dirty(vfs_node_t *node, uint32_t offset) {
@@ -1635,6 +1930,7 @@ void vfs_cache_sync(vfs_node_t *node) {
     if (batch.count) {
       if (!cache_sync_batch(node, &batch))
         break;
+      vfs_pc_stat_writeback_pages += batch.count;
       continue;
     }
     if (!invalid_deleted)

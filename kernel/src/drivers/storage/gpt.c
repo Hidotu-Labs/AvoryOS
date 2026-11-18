@@ -354,6 +354,18 @@ struct partition_range {
   uint64_t end;
 };
 
+/* Accepted ranges for the overlap check live on the heap. GPT_MAX_PARTITIONS
+ * of them are 16 KiB - an entire thread kernel stack, which has no guard
+ * page - and BLKRRPART runs this scan on the calling process's stack. The
+ * frame landed in the physically adjacent page (a user heap page), and so did
+ * every frame below it (block_add_partition_ex -> sysfs uevent), corrupting
+ * that process's memory. */
+static uint32_t gpt_range_cap(uint32_t num_entries) {
+  if (num_entries > GPT_MAX_PARTITIONS)
+    num_entries = GPT_MAX_PARTITIONS;
+  return num_entries ? num_entries : 1;
+}
+
 int gpt_scan_partitions(struct block_device *dev) {
   if (!dev || !dev->read_sectors || dev->total_sectors < 34)
     return 0;
@@ -417,7 +429,12 @@ int gpt_scan_partitions(struct block_device *dev) {
     return 0;
   }
 
-  struct partition_range ranges[GPT_MAX_PARTITIONS];
+  uint32_t range_cap = gpt_range_cap(active_hdr.num_partition_entries);
+  struct partition_range *ranges = kmalloc(range_cap * sizeof(*ranges));
+  if (!ranges) {
+    kfree(entries);
+    return -1;
+  }
   int range_count = 0;
   int count = 0;
 
@@ -453,7 +470,7 @@ int gpt_scan_partitions(struct block_device *dev) {
 
     if (block_add_partition_ex(dev, i + 1, pe.starting_lba, pe.total_sectors,
                                &meta) == 0) {
-      if (range_count < GPT_MAX_PARTITIONS) {
+      if ((uint32_t)range_count < range_cap) {
         ranges[range_count].start = pe.starting_lba;
         ranges[range_count].end = pe.ending_lba;
         range_count++;
@@ -466,6 +483,7 @@ int gpt_scan_partitions(struct block_device *dev) {
     }
   }
 
+  kfree(ranges);
   kfree(entries);
   return count;
 #else
@@ -525,7 +543,12 @@ int gpt_scan_partitions(struct block_device *dev) {
   }
 
   // 3. Process partition entries
-  struct partition_range ranges[GPT_MAX_PARTITIONS];
+  uint32_t range_cap = gpt_range_cap(active_hdr.num_partition_entries);
+  struct partition_range *ranges = kmalloc(range_cap * sizeof(*ranges));
+  if (!ranges) {
+    kfree(entries);
+    return -1;
+  }
   int range_count = 0;
   int count = 0;
 
@@ -574,7 +597,7 @@ int gpt_scan_partitions(struct block_device *dev) {
 
     if (block_add_partition_ex(dev, i + 1, entry->starting_lba, total_sectors,
                                &meta) == 0) {
-      if (range_count < GPT_MAX_PARTITIONS) {
+      if ((uint32_t)range_count < range_cap) {
         ranges[range_count].start = entry->starting_lba;
         ranges[range_count].end = entry->ending_lba;
         range_count++;
@@ -586,6 +609,7 @@ int gpt_scan_partitions(struct block_device *dev) {
     }
   }
 
+  kfree(ranges);
   kfree(entries);
   return count;
 #endif

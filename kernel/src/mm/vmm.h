@@ -22,6 +22,11 @@
  * fork child may reconstruct from its VMA. Clear on any private write/copy.
  * This is not the hardware dirty bit (private copies can be clean again). */
 #define PAGE_FLAG_REFAULT ((uint64_t)1 << 10)
+#define PAGE_FLAG_PKEY_SHIFT 59
+#define PAGE_FLAG_PKEY_MASK (0xFULL << PAGE_FLAG_PKEY_SHIFT)
+static inline uint64_t page_flag_pkey(uint8_t pkey) {
+  return ((uint64_t)(pkey & 0xFU)) << PAGE_FLAG_PKEY_SHIFT;
+}
 #define PAGE_FLAG_NX ((uint64_t)1 << 63)
 
 // Mask to extract the physical address from a page table entry.

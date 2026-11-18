@@ -290,6 +290,62 @@ static inline bool kstack_verify_canary(void *stack) {
   return true;
 }
 
+/* Thread stacks are HHDM frames with no guard page, so an overflow silently
+ * writes into whatever frame sits physically below - often a user page.
+ * Stacks are zeroed on allocation, so the lowest non-zero word above the
+ * canary zone is the deepest point the stack ever reached, including the
+ * IRQs and page faults that were taken on it. */
+static size_t kstack_bytes_used(const void *stack, size_t stack_size) {
+  const uint64_t *words = (const uint64_t *)stack;
+  size_t count = stack_size / sizeof(uint64_t);
+  size_t i = KSTACK_CANARY_WORDS;
+  while (i < count && words[i] == 0)
+    i++;
+  return (count - i) * sizeof(uint64_t);
+}
+
+static uint32_t kstack_deepest;
+static uint32_t kstack_live_reports;
+
+static void kstack_note_depth(const void *stack, size_t stack_size,
+                              const struct thread *owner) {
+  size_t used = kstack_bytes_used(stack, stack_size);
+  uint32_t deepest = __atomic_load_n(&kstack_deepest, __ATOMIC_RELAXED);
+  while (used > deepest &&
+         !__atomic_compare_exchange_n(&kstack_deepest, &deepest, (uint32_t)used,
+                                      false, __ATOMIC_RELAXED,
+                                      __ATOMIC_RELAXED))
+    ;
+  if (used <= deepest || used < stack_size / 2)
+    return;
+  klogf("[KSTACK] deepest kernel stack so far: %zu of %zu bytes tid=%u "
+        "comm='%s'\n",
+        used, stack_size, owner ? owner->tid : 0, owner ? owner->comm : "?");
+}
+
+/* Called on every reschedule while still on @t's stack. Cheap: the canary
+ * words plus the first word above them, which a frame reaching within a few
+ * bytes of the bottom must have written. */
+void kstack_check_live(const struct thread *t) {
+  if (!t || t->is_idle || !t->stack_base || t->stack_size < THREAD_STACK_SIZE)
+    return;
+  const uint64_t *words = (const uint64_t *)t->stack_base;
+  bool canary_ok = kstack_verify_canary((void *)t->stack_base);
+  if (canary_ok && words[KSTACK_CANARY_WORDS] == 0)
+    return;
+  if (__atomic_fetch_add(&kstack_live_reports, 1, __ATOMIC_RELAXED) >= 16)
+    return;
+  klogf("[KSTACK] %s: tid=%u comm='%s' stack=%#llx-%#llx phys=%#llx "
+        "word0=%#llx above-canary=%#llx\n",
+        canary_ok ? "kernel stack within 8 bytes of its bottom"
+                  : "KERNEL STACK OVERFLOW (canary smashed)",
+        t->tid, t->comm, (unsigned long long)t->stack_base,
+        (unsigned long long)(t->stack_base + t->stack_size),
+        (unsigned long long)(t->stack_base - pmm_get_hhdm_offset()),
+        (unsigned long long)words[0],
+        (unsigned long long)words[KSTACK_CANARY_WORDS]);
+}
+
 void *thread_stack_alloc(void) {
   void *stack = NULL;
   struct cpu_info *cpu = cpu_get_current();
@@ -355,6 +411,7 @@ void thread_stack_release(uint64_t stack_base, size_t stack_size,
     return;
 
   void *stack = (void *)stack_base;
+  kstack_note_depth(stack, stack_size, owner);
 
   /* Check stack overflow canary zone at the bottom of the stack */
   if (!kstack_verify_canary(stack)) {

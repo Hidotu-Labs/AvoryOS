@@ -568,6 +568,11 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     if (swapped < 0) return PF_REJECT("compressed swap fault failed", -swapped, cr2);
   }
 
+  // Protection Key (PKU) violation (error code bit 5 = PK). Must run before
+  // the CoW fast-path so a writable PTE with a disabled key isn't retried.
+  if (error_code & 0x20)
+    return PF_REJECT("protection key violation", cr2, error_code);
+
   if (present_bit && write_fault) {
     uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(target_cr3);
     uint64_t virt = cr2 & PAGE_MASK;
@@ -844,6 +849,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
                           : "present page: ring-0 fault outside any VMA "
                             "(protection violation)";
     uint64_t vma_prot = 0;
+  uint8_t vma_pkey = 0;
     uint64_t vma_start = 0;
     spinlock_acquire(&current->mm->lock);
     struct vma *v = vma_find(&current->mm->vmas, cr2);
@@ -960,6 +966,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
   }
 
   uint64_t vma_prot = 0;
+  uint8_t vma_pkey = 0;
   uint64_t vma_flags = 0;
   int vma_fd = -1;
   uint64_t vma_offset = 0;
@@ -989,6 +996,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     vma_numa_policy = vma->numa_policy;
     vma_numa_nodemask = vma->numa_nodemask;
     vma_numa_preferred_node = vma->numa_preferred_node;
+    vma_pkey = vma->pkey;
 
     /* The Linux-facing bridge wrapper can go away the moment a concurrent
      * munmap removes this native VMA, and the imported driver's ->close
@@ -1732,7 +1740,7 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     return 0;
   }
 
-  uint64_t flags = dp_build_flags(vma_prot);
+  uint64_t flags = dp_build_flags(vma_prot) | page_flag_pkey(vma_pkey);
   if (cow_mapping)
     flags = (flags & ~PAGE_FLAG_RW) | PAGE_FLAG_COW;
   if (refault_mapping)

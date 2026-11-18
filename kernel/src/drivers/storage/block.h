@@ -120,12 +120,29 @@ struct block_device {
 
     /* Hot-plug state.  block_unregister() sets `gone` first; from then on
      * every I/O entry point returns -1 without reaching the driver.  The
-     * struct is never freed, so /dev nodes, partitions and open descriptors
-     * may keep a pointer to it safely. */
+     * struct stays allocated while anything holds a reference (see `refs`),
+     * so /dev nodes, partitions and mounts may keep a pointer to it safely. */
     bool gone;
     bool removable;             // sysfs removable=1 (USB mass storage)
     bool read_only;             // sysfs ro=1 and BLKROGET, whatever write_sectors says
+
+    /* Lifetime.  The registry holds one reference from block_register() to
+     * block_unregister(); lookups, /dev vnodes, partitions (on their disk)
+     * and mounts each hold another.  The last block_put() calls `release`,
+     * which frees the driver state and the struct.  Devices without a
+     * `release` are never freed (boot disks, static structs). */
+    uint32_t refs;
+    void (*release)(struct block_device *dev);
 };
+
+static inline struct block_device *block_ref(struct block_device *dev) {
+    if (dev)
+        __atomic_add_fetch(&dev->refs, 1, __ATOMIC_RELAXED);
+    return dev;
+}
+
+// Drop a reference taken by block_ref() or a lookup.  NULL is ignored.
+void block_put(struct block_device *dev);
 
 static inline bool block_device_gone(const struct block_device *dev) {
     return __atomic_load_n(&dev->gone, __ATOMIC_SEQ_CST);
@@ -136,10 +153,12 @@ static inline bool block_device_gone(const struct block_device *dev) {
 int block_register(struct block_device *dev);
 
 // Remove a block device: partitions first, then /dev, sysfs (with a "remove"
-// uevent) and the registry slot.  The struct stays allocated.  Idempotent.
+// uevent) and the registry slot, then drop the registry's reference.  The
+// struct stays allocated until the last holder calls block_put().  Idempotent.
 void block_unregister(struct block_device *dev);
 
 // Get a registered block device by index. Returns NULL if invalid.
+// Every lookup below returns a reference: release it with block_put().
 struct block_device *block_get(int index);
 
 // Get the number of registered block devices.
@@ -195,6 +214,7 @@ int block_add_partition_ex(struct block_device *parent, int part_index,
                            uint64_t start_lba, uint64_t total_sectors,
                            const struct partition_meta *meta);
 
+// Lookups return a reference (block_put() it) or NULL.
 // Lookup a block device by PARTUUID (case-insensitive)
 struct block_device *block_find_by_partuuid(const char *uuid);
 
@@ -215,6 +235,15 @@ struct block_device *block_find_by_type(uint8_t partition_type);
 
 // Check if a block device is a partition device.
 bool block_is_partition(const struct block_device *dev);
+
+// True when a registered device has this name.  Takes no reference.
+bool block_name_in_use(const char *name);
+
+// Raw I/O on a /dev block node at a 64-bit offset. Returns false, touching
+// nothing, when `node` is not a raw block device node.
+struct vfs_node;
+bool block_node_rw64(struct vfs_node *node, uint64_t offset, uint32_t size,
+                     uint8_t *buffer, bool write, uint32_t *out);
 
 // Scan for partitions on a block device.
 void block_scan_partitions(struct block_device *dev);

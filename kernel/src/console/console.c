@@ -53,6 +53,12 @@ static char serial_mirror_buf[128];
 static size_t serial_mirror_len = 0;
 /* Protected by console_lock; klog already emitted its complete serial record. */
 static bool serial_mirror_enabled = true;
+/* Once userland owns the screen, kernel-originated console_puts/putchar
+ * output (driver status lines) goes to serial only, so it cannot scroll a
+ * full-screen program such as the installer. Userspace writes still render. */
+static bool kernel_output_serial_only = false;
+
+void console_set_kernel_quiet(bool quiet) { kernel_output_serial_only = quiet; }
 
 static void console_serial_flush(void) {
   if (!serial_mirror_len)
@@ -378,7 +384,8 @@ static void console_wipe_history_unlocked(void) {
   }
   for (uint32_t i = 0; i < HISTORY_MAX; i++) {
     if (history_rows[i]) {
-      memset(history_rows[i], 0, max_cols * sizeof(console_char_t));
+      kfree(history_rows[i]);
+      history_rows[i] = NULL;
     }
   }
   cursor_x = 0;
@@ -1497,6 +1504,10 @@ void console_flush_pending_swap(void) {
 void console_putchar(char c) {
   if (fb_get_kd_mode() == KD_GRAPHICS)
     return;
+  if (kernel_output_serial_only) {
+    serial_write(&c, 1);
+    return;
+  }
   spinlock_acquire(&console_lock);
 
   // Use backbuffer even for single putchar to keep it in sync with puts
@@ -1520,6 +1531,10 @@ void console_puts(const char *s) {
    * over it. */
   if (fb_get_kd_mode() == KD_GRAPHICS)
     return;
+  if (kernel_output_serial_only) {
+    serial_write(s, strlen(s));
+    return;
+  }
 
   spinlock_acquire(&console_lock);
   fb_set_backbuffer_mode(true);

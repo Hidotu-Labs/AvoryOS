@@ -150,6 +150,17 @@ __attribute__((used, section(".limine_requests"))) static volatile struct
     limine_executable_cmdline_request executable_cmdline_request = {
         .id = LIMINE_EXECUTABLE_CMDLINE_REQUEST_ID, .revision = 0};
 
+__attribute__((used, section(".limine_requests"))) static volatile struct
+    limine_executable_file_request executable_file_request = {
+        .id = LIMINE_EXECUTABLE_FILE_REQUEST_ID, .revision = 0};
+
+/* The kernel file as Limine loaded it from the boot medium.  It lives in
+ * EXECUTABLE_AND_MODULES memory, which is never reclaimed, so the pointer
+ * stays valid; the response struct around it does not.  /proc/boot_kernel
+ * serves it so the installer can copy the running kernel to the target. */
+const uint8_t *kernel_boot_image;
+uint64_t kernel_boot_image_size;
+
 /* Kernel command line, exposed to the LinuxKPI module-parameter parser via
  * linuxkpi_boot_cmdline() (kernel/src/linuxkpi/native.c). */
 const char *kernel_boot_cmdline = "";
@@ -285,6 +296,7 @@ static void init_thread_entry(void) {
   // Clear console only once when userland starts
   if (!cmdline_has("screenlog")) {
     console_clear();
+    console_set_kernel_quiet(true);
     klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
                              " Console cleared, starting session...\n");
   } else {
@@ -382,6 +394,12 @@ void kmain(void) {
   if (executable_cmdline_request.response &&
       executable_cmdline_request.response->cmdline) {
     kernel_boot_cmdline = executable_cmdline_request.response->cmdline;
+  }
+  if (executable_file_request.response &&
+      executable_file_request.response->executable_file) {
+    struct limine_file *f = executable_file_request.response->executable_file;
+    kernel_boot_image = (const uint8_t *)f->address;
+    kernel_boot_image_size = f->size;
   }
 
   if (framebuffer_request.response == NULL ||
@@ -565,6 +583,8 @@ void kmain(void) {
   acpi_parse_fadt();
 
   cpu_init();
+  extern void fred_init_cpu(void);
+  fred_init_cpu();
   klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
                            " Transitioning to kernel-allocated stack...\n");
   cpu_jump_to_stack(cpu_get_bsp()->stack_top, kmain_high_half);
@@ -608,6 +628,10 @@ void kmain_high_half(void) {
     isr_set_apic_mode(true);
 
     hal_irq_enable();
+
+    extern void test_fred(void);
+    if (boot_selftests_enabled() || cpu_has_fred_flag)
+      test_fred();
 
     klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET
                              " APIC interrupt mode ACTIVE.\n\n");
@@ -684,6 +708,8 @@ void kmain_high_half(void) {
    * Must be up before any node can be freed: the lookups gate their lockless
    * fast path on it, and every last-close routes its kfree through it. */
   vfs_rcu_init();
+  vfs_pc_trim_init();
+  vfs_pc_kswapd_init();
 
   shm_init();
 
@@ -743,7 +769,8 @@ void kmain_high_half(void) {
   // Probe for a valid S4 hibernation image before mounting filesystems R/W.
   power_s4_try_resume();
 
-  // Mount root filesystem
+  // Mount root filesystem.  Lookups return a reference; the device that ends
+  // up as root keeps it for good, every rejected candidate drops it.
   struct block_device *boot_dev = NULL;
 
   // 1. Smart discovery: partition typed as Linux root or labeled rootfs/AvoryOS-Root
@@ -769,6 +796,7 @@ void kmain_high_half(void) {
     if (ext2_mount_root(boot_dev) == 0) {
       goto mount_success;
     }
+    block_put(boot_dev);
   }
 
   // 2. Sequential fallback across all partitions
@@ -785,6 +813,7 @@ void kmain_high_half(void) {
       if (ext2_mount_root(boot_dev) == 0) {
         goto mount_success;
       }
+      block_put(boot_dev);
     }
   }
 
@@ -801,6 +830,7 @@ void kmain_high_half(void) {
     if (ext2_mount_root(boot_dev) == 0) {
       goto mount_success;
     }
+    block_put(boot_dev);
   }
 
   klog_puts(KLOG_CLR_RED "[ FAIL ]" KLOG_CLR_RESET

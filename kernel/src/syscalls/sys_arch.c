@@ -652,11 +652,13 @@ static uint64_t sys_munlockall(uint64_t a0, uint64_t a1, uint64_t a2,
   if (!thread || !thread->mm)
     return (uint64_t)-12;
   struct mm_struct *mm = thread->mm;
-  uint64_t *pml4 = thread->cr3 ? (uint64_t *)thread->cr3
-                               : vmm_get_active_pml4();
+  uint64_t *pml4_phys = thread->cr3 ? (uint64_t *)thread->cr3
+                                    : vmm_get_active_pml4();
+  uint64_t *pml4 = (uint64_t *)(pmm_get_hhdm_offset() +
+                                ((uint64_t)pml4_phys & PAGE_MASK));
   spinlock_acquire(&mm->lock);
   mm->mlockall_future = false;
-  vmm_lock_acquire_for(pml4, 0);
+  vmm_lock_acquire_for(pml4_phys, 0);
   for (size_t i = 0; i < 256; i++) {
     if (!(pml4[i] & PAGE_FLAG_PRESENT))
       continue;

@@ -312,27 +312,34 @@ static void sysfs_symlink(vfs_node_t *parent, const char *name,
  * udevadm's coldplug and the standard udev rules both rely on this ABI. */
 static vfs_node_t *uevent_root;
 
+/* Recursive, and run synchronously from deep callers (BLKRRPART re-adding
+ * partitions inside an ioctl), on a 16 KiB kernel stack with no guard page.
+ * Keep each level small: the candidate name is copied straight into its slot
+ * in @path (which vfs_readdir()'s per-thread buffer cannot outlive) instead
+ * of a per-level local copy. */
+#define SYSFS_DEVPATH_MAX 512
 static bool sysfs_find_devpath(vfs_node_t *dir, vfs_node_t *target,
                                char *path, size_t used, unsigned depth) {
   if (dir == target) return true;
   if (depth >= 32) return false;
   uint64_t cookie = 0;
+  char *name = path + used + 1;
   for (;;) {
     struct dirent *entry = vfs_readdir(dir, cookie);
     if (!entry) break;
     cookie = entry->d_off;
-    char name[128];
-    memcpy(name, entry->name, sizeof(name));
-    name[sizeof(name) - 1] = 0;
+    size_t len = 0;
+    while (len < sizeof(entry->name) - 1 && entry->name[len])
+      len++;
+    if (used + len + 2 > SYSFS_DEVPATH_MAX) continue;
+    memcpy(name, entry->name, len);
+    name[len] = 0;
     if (!strcmp(name, ".") || !strcmp(name, "..")) continue;
-    size_t len = strlen(name);
-    if (used + len + 2 > 512) continue;
     vfs_node_t *child = vfs_finddir(dir, name);
     if (!child) continue;
     bool found = false;
     if ((child->flags & FS_TYPE_MASK) == FS_DIRECTORY) {
       path[used] = '/';
-      memcpy(path + used + 1, name, len + 1);
       found = sysfs_find_devpath(child, target, path, used + len + 1, depth + 1);
     }
     vfs_close(child);
@@ -378,40 +385,61 @@ static uint32_t sysfs_uevent_write(vfs_node_t *node, uint32_t offset,
     if (!strcmp(command, actions[i])) valid = true;
   if (!valid) return (uint32_t)-22;
 
+  /* The ~1.3 KiB of path/subsystem/field scratch lives on the heap: this
+   * runs from deep kernel callers on a guard-less 16 KiB stack (see
+   * sysfs_find_devpath()). */
+  struct {
+    char path[SYSFS_DEVPATH_MAX];
+    char subsystem[128];
+    char field[640];
+  } *scratch = kmalloc(sizeof(*scratch));
+  if (!scratch) return (uint32_t)-12;
+  char *path = scratch->path, *subsystem = scratch->subsystem;
+  char *field = scratch->field;
+  const size_t field_size = sizeof(scratch->field);
+  path[0] = 0;
+  subsystem[0] = 0;
+
   vfs_node_t *parent = node->ptr;
-  char path[512] = "", subsystem[128] = "";
-  if (!uevent_root || !sysfs_find_devpath(uevent_root, parent, path, 0, 0))
+  if (!uevent_root || !sysfs_find_devpath(uevent_root, parent, path, 0, 0)) {
+    kfree(scratch);
     return (uint32_t)-2;
+  }
   vfs_node_t *link = vfs_finddir(parent, "subsystem");
   if (link) {
     if (link->readlink) {
-      int n = link->readlink(link, subsystem, sizeof(subsystem)-1);
+      int n = link->readlink(link, subsystem, sizeof(scratch->subsystem) - 1);
       if (n > 0) subsystem[n] = 0;
     }
     vfs_close(link);
   }
   char *sub = strrchr(subsystem, '/');
   sub = sub ? sub + 1 : subsystem;
-  if (!*sub) return (uint32_t)-22;
+  if (!*sub) { kfree(scratch); return (uint32_t)-22; }
   char *event = kmalloc(4096), *properties = kmalloc(4096);
-  if (!event || !properties) { kfree(event); kfree(properties); return (uint32_t)-12; }
+  if (!event || !properties) {
+    kfree(event); kfree(properties); kfree(scratch);
+    return (uint32_t)-12;
+  }
   uint32_t n = vfs_read(node, 0, 4095, (uint8_t *)properties);
-  if (n > 4095) { kfree(event); kfree(properties); return (uint32_t)-5; }
+  if (n > 4095) {
+    kfree(event); kfree(properties); kfree(scratch);
+    return (uint32_t)-5;
+  }
   properties[n] = 0;
-  char field[640];
   size_t used = 0;
-  snprintf(field, sizeof(field), "%s@%s", command, path);
+  snprintf(field, field_size, "%s@%s", command, path);
   bool ok = sysfs_event_field(event, &used, field);
-  snprintf(field, sizeof(field), "ACTION=%s", command);
+  snprintf(field, field_size, "ACTION=%s", command);
   ok = ok && sysfs_event_field(event, &used, field);
-  snprintf(field, sizeof(field), "DEVPATH=%s", path);
+  snprintf(field, field_size, "DEVPATH=%s", path);
   ok = ok && sysfs_event_field(event, &used, field);
-  snprintf(field, sizeof(field), "SUBSYSTEM=%s", sub);
+  snprintf(field, field_size, "SUBSYSTEM=%s", sub);
   ok = ok && sysfs_event_field(event, &used, field);
-  snprintf(field, sizeof(field), "SEQNUM=%llu", (unsigned long long)netlink_uevent_next_seqnum());
+  snprintf(field, field_size, "SEQNUM=%llu", (unsigned long long)netlink_uevent_next_seqnum());
   ok = ok && sysfs_event_field(event, &used, field);
   if (uuid) {
-    snprintf(field, sizeof(field), "SYNTH_UUID=%s", uuid);
+    snprintf(field, field_size, "SYNTH_UUID=%s", uuid);
     ok = ok && sysfs_event_field(event, &used, field);
   }
   char *line = properties;
@@ -426,7 +454,7 @@ static uint32_t sysfs_uevent_write(vfs_node_t *node, uint32_t offset,
     line = end + 1;
   }
   if (ok) netlink_broadcast(NETLINK_KOBJECT_UEVENT, 1, event, used);
-  kfree(event); kfree(properties);
+  kfree(event); kfree(properties); kfree(scratch);
   return ok ? written : (uint32_t)-7;
 }
 
@@ -750,6 +778,7 @@ static void sysfs_populate_block(vfs_node_t *block_class_dir) {
     struct block_device *bd = block_get(i);
     if (bd)
       sysfs_block_class_entry(block_class_dir, bd);
+    block_put(bd);
   }
 }
 
@@ -768,6 +797,7 @@ static void sysfs_populate_block_alias(vfs_node_t *block_root) {
     char target[96];
     snprintf(target, sizeof(target), "../class/block/%s", bd->name);
     sysfs_symlink(block_root, bd->name, target);
+    block_put(bd);
   }
 }
 
@@ -1453,8 +1483,12 @@ void sysfs_init(void) {
     int bcount = block_count();
     for (int bi = 0; bi < bcount; bi++) {
       struct block_device *bd = block_get(bi);
-      if (!bd || !bd->name[0])
+      if (!bd)
         continue;
+      if (!bd->name[0]) {
+        block_put(bd);
+        continue;
+      }
       char link_name[32];
       char majbuf[16], minbuf[16];
       u64_to_dec(bd->linux_major, majbuf);
@@ -1466,6 +1500,7 @@ void sysfs_init(void) {
       snprintf(link_target, sizeof(link_target), "../../class/block/%s",
                bd->name);
       sysfs_symlink(dev_block_dir, link_name, link_target);
+      block_put(bd);
     }
   }
   vfs_node_t *char_dir = sysfs_mkdir(dev_dir, "char");

@@ -622,3 +622,8 @@ plymouth
 tcc
 # Provides xorriso, needed to build Limine ISO images (e.g. limine-c-template).
 libisoburn
+# The TTY installer formats the ESP (mkfs.vfat), writes it with mtools and
+# installs Limine onto the target disk from /usr/share/limine.
+dosfstools
+mtools
+limine

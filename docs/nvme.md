@@ -7,10 +7,7 @@ block device (`nvme0n1`, `nvme0n11`, …), and can serve as the root disk.
 
 The interactive QEMU targets now serve the root filesystem from NVMe:
 `make run` (KVM) and `make run-tcg` (TCG; `make run-x86_64` is the
-arch-specific implementation behind it).  `make run-sata` and
-`make run-sata-tcg` keep the legacy IDE/AHCI root disk for regression and A/B
-comparison, while `make run-nvme` / `make run-nvme-tcg` are aliases of the
-primary targets.
+arch-specific implementation behind it).
 
 This document is the reference for the driver architecture, the build/runtime
 knobs, the test tooling, and the Phase 7 hardening audit.

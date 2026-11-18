@@ -15,6 +15,12 @@ bool cpu_has_erms(void);
 bool cpu_has_fsgsbase(void);
 bool cpu_has_smep(void);
 bool cpu_has_smap(void);
+bool cpu_has_umip(void);
+bool cpu_has_pku(void);
+bool cpu_has_fred(void);
+bool cpu_has_lkgs(void);
+bool cpu_has_x2apic(void);
+bool cpu_has_tsc_deadline(void);
 bool cpu_has_rdtscp(void);
 bool cpu_has_rdpid(void);
 bool cpu_has_xsaveopt(void);
@@ -33,6 +39,10 @@ extern bool cpu_has_smap_flag;
 
 /* Cached FSGSBASE flag: true once CR4.FSGSBASE has been probed and enabled. */
 extern bool cpu_has_fsgsbase_flag;
+/* True once FRED has been probed and enabled on the BSP. */
+extern bool cpu_has_fred_flag;
+/* True once CR4.PKE (PKU) has been probed and enabled. */
+extern bool cpu_has_pku_flag;
 static inline bool cpu_has_fsgsbase_fast(void) {
   return cpu_has_fsgsbase_flag;
 }
@@ -68,6 +78,16 @@ static inline uint64_t rdfsbase(void) {
   uint64_t val;
   __asm__ volatile("rdfsbase %0" : "=r"(val));
   return val;
+}
+
+static inline uint32_t rdpkru(void) {
+  uint32_t eax, edx;
+  __asm__ volatile(".byte 0x0f, 0x01, 0xee" : "=a"(eax), "=d"(edx) : "c"(0));
+  return eax;
+}
+
+static inline void wrpkru(uint32_t val) {
+  __asm__ volatile(".byte 0x0f, 0x01, 0xef" : : "a"(val), "c"(0), "d"(0) : "memory");
 }
 
 #endif

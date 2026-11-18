@@ -62,7 +62,8 @@ void fill_kstat(struct kstat *ks, vfs_node_t *node) {
      * mount a path belongs to; with st_dev 0 every file looks like it lives
      * on no device and the match falls back to pure path prefixing. */
     if (((node->flags & FS_TYPE_MASK) == FS_FILE ||
-         (node->flags & FS_TYPE_MASK) == FS_DIRECTORY) &&
+         (node->flags & FS_TYPE_MASK) == FS_DIRECTORY ||
+         (node->flags & FS_TYPE_MASK) == FS_SYMLINK) &&
         node->device && node->statfs &&
         (node->statfs == ext4_statfs_impl ||
          node->statfs == ext2_statfs_impl ||

@@ -2,6 +2,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/futex.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <dirent.h>
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
@@ -45,7 +48,8 @@
 #include <utime.h>
 #include <sys/ptrace.h>
 
-#define DEBUGLOG(...) printf(__VA_ARGS__)
+static int g_quiet_log = 0;
+#define DEBUGLOG(...) do { if (!g_quiet_log) printf(__VA_ARGS__); } while (0)
 
 #ifndef SYS_pidfd_send_signal
 #define SYS_pidfd_send_signal 424
@@ -1043,15 +1047,27 @@ void test_readv_stress() {
 
 void test_exec_stress() {
   DEBUGLOG("Starting EXECVE stress test...\n");
-  // Use hello.elf if it exists, otherwise skip
-  char *argv[] = {"/userland/hello.elf", NULL};
-  char *envp[] = {NULL};
-
-  if (access(argv[0], X_OK) != 0) {
-    DEBUGLOG("Skipping EXECVE stress test (hello.elf not found or not "
-             "executable)\n");
+  const char *candidates[] = {
+    "/userland/hello.elf",
+    "/bin/true",
+    "/usr/bin/true",
+    "/bin/echo",
+    "/usr/bin/echo",
+  };
+  const char *target = NULL;
+  for (size_t c = 0; c < sizeof(candidates) / sizeof(candidates[0]); c++) {
+    if (access(candidates[c], X_OK) == 0) {
+      target = candidates[c];
+      break;
+    }
+  }
+  if (!target) {
+    DEBUGLOG("Skipping EXECVE stress test (no executable candidate found)\n");
     return;
   }
+
+  char *argv[] = {(char *)target, NULL};
+  char *envp[] = {NULL};
 
   for (int i = 0; i < 20; i++) {
     pid_t pid = fork();
@@ -1886,6 +1902,10 @@ void test_vfork_stress() {
   DEBUGLOG("VFORK stress test PASSED\n");
 }
 
+static void kill_stress_noop_handler(int sig) {
+  (void)sig;
+}
+
 // ---- kill (self SIGCONT, ignored signals) stress ----
 void test_kill_stress() {
   DEBUGLOG("Starting KILL stress test...\n");
@@ -1909,6 +1929,15 @@ void test_kill_stress() {
     kill(self, 0);
     if (i % 250 == 0) DEBUGLOG("KILL iteration %d complete\n", i);
   }
+  // Drain any pending ignored signals before restoring the original handlers:
+  // sys_kill marks pending_signals even while SIG_IGN is set, and syscall
+  // return skips delivery for SIG_IGN, so restoring SIG_DFL directly would
+  // deliver the still-pending signal with its default (terminate) action.
+  sa.sa_handler = kill_stress_noop_handler;
+  sigaction(SIGUSR1, &sa, NULL);
+  sigaction(SIGUSR2, &sa, NULL);
+  sigaction(SIGCONT, &sa, NULL);
+
   // Restore original handlers
   sigaction(SIGUSR1, &old_usr1, NULL);
   sigaction(SIGUSR2, &old_usr2, NULL);
@@ -2659,22 +2688,25 @@ static void run_registered_syscall_coverage(int iterations) {
 #include "syscall_tests.h"
 
 void test_registered_syscall_coverage(void) {
+  int saved_stdout = -1;
+  if (g_quiet_log) {
+    fflush(stdout);
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      saved_stdout = dup(STDOUT_FILENO);
+      dup2(devnull, STDOUT_FILENO);
+      close(devnull);
+    }
+  }
   int rc = run_all_single_syscall_tests();
+  if (saved_stdout >= 0) {
+    fflush(stdout);
+    dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+  }
   if (rc != 0) {
     fprintf(stderr, "WARNING: Some individual syscall tests failed assertions!\n");
   }
-}
-
-void check_leak(const char *test_name, long *last_mem) {
-  long current_mem = get_free_mem_kb();
-  if (current_mem == -1)
-    return;
-
-  long diff = *last_mem - current_mem;
-  if (diff > 0) {
-    printf("  [!] %s: RETAINED %ld kB (single MemFree sample; use --focus to classify)\n", test_name, diff);
-  }
-  *last_mem = current_mem;
 }
 
 /* Preserve immediate and delayed samples, without a cache allowance that
@@ -2686,9 +2718,207 @@ static void leak_settle(void) {
   }
 }
 
+static void test_netlink_stress(void) {
+  for (int i = 0; i < NUM_ITERATIONS; i++) {
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (fd < 0)
+      continue;
+    struct sockaddr_nl sa = {0};
+    sa.nl_family = AF_NETLINK;
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+      struct {
+        struct nlmsghdr nlh;
+        struct rtgenmsg rtg;
+      } req = {0};
+      req.nlh.nlmsg_len = sizeof(req);
+      req.nlh.nlmsg_type = RTM_GETLINK;
+      req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+      req.rtg.rtgen_family = AF_UNSPEC;
+      sendto(fd, &req, sizeof(req), 0, NULL, 0);
+      char buf[2048];
+      recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+    }
+    close(fd);
+  }
+}
+
+static void test_procfs_stress(void) {
+  static const char *const paths[] = {
+    "/proc/cpuinfo",
+    "/proc/meminfo",
+    "/proc/uptime",
+    "/proc/mounts",
+    "/proc/self/stat",
+    "/proc/self/maps",
+  };
+  char buf[4096];
+  for (int i = 0; i < NUM_ITERATIONS; i++) {
+    for (size_t p = 0; p < sizeof(paths) / sizeof(paths[0]); p++) {
+      int fd = open(paths[p], O_RDONLY);
+      if (fd >= 0) {
+        (void)read(fd, buf, sizeof(buf));
+        close(fd);
+      }
+    }
+    (void)readlink("/proc/self/exe", buf, sizeof(buf));
+  }
+}
+
+static void test_ext4_readdir_stress(void) {
+  const char *dir_path = access("/var/lib/pacman/local", R_OK) == 0
+                             ? "/var/lib/pacman/local"
+                             : "/bin";
+  for (int i = 0; i < 30; i++) {
+    DIR *d = opendir(dir_path);
+    if (d) {
+      while (readdir(d) != NULL) {
+      }
+      closedir(d);
+    }
+  }
+}
+
+struct focus_test_entry {
+  const char *name;
+  void (*fn)(void);
+};
+
+static const struct focus_test_entry focus_tests[] = {
+  {"mmap", test_mmap_stress},
+  {"vfs", test_vfs_stress},
+  {"vfs-open-close", test_vfs_open_close_stress},
+  {"epoll", test_epoll_stress},
+  {"poll", test_poll_stress},
+  {"ppoll", test_ppoll_stress},
+  {"pipe", test_pipe_stress},
+  {"socket", test_socket_stress},
+  {"unix-stream", test_unix_stream_stress},
+  {"socketpair", test_socketpair_stress},
+  {"unix-dgram", test_unix_dgram_stress},
+  {"socket-opts", test_socket_opts_stress},
+  {"shutdown", test_shutdown_stress},
+  {"accept4", test_accept4_stress},
+  {"fork", test_fork_stress},
+  {"clone", test_clone_futex_stress},
+  {"vfs-error", test_vfs_error_stress},
+  {"mmap-fixed", test_mmap_fixed_stress},
+  {"readv", test_readv_stress},
+  {"execve", test_exec_stress},
+  {"dup-fcntl", test_dup_fcntl_stress},
+  {"pread-pwrite", test_pread_pwrite_stress},
+  {"writev", test_writev_stress},
+  {"sendfile", test_sendfile_stress},
+  {"ftruncate", test_ftruncate_fsync_stress},
+  {"lseek", test_lseek_stress},
+  {"stat", test_stat_variants_stress},
+  {"getdents64", test_getdents64_stress},
+  {"statfs", test_statfs_stress},
+  {"fs-ops", test_fs_ops_stress},
+  {"access", test_access_stress},
+  {"getcwd", test_getcwd_chdir_stress},
+  {"mprotect", test_mprotect_stress},
+  {"mremap", test_mremap_stress},
+  {"brk", test_brk_stress},
+  {"madvise", test_madvise_stress},
+  {"pipe2", test_pipe2_stress},
+  {"memfd", test_memfd_stress},
+  {"timerfd", test_timerfd_stress},
+  {"eventfd", test_eventfd_stress},
+  {"inotify", test_inotify_stress},
+  {"getrandom", test_getrandom_stress},
+  {"clock", test_clock_stress},
+  {"sysinfo", test_sysinfo_stress},
+  {"pid-query", test_pid_query_stress},
+  {"uid-gid", test_uid_gid_stress},
+  {"prctl", test_prctl_stress},
+  {"sched", test_sched_stress},
+  {"process-attrs", test_process_attrs_stress},
+  {"itimer", test_itimer_stress},
+  {"mlock", test_mlock_stress},
+  {"utimes", test_utimes_stress},
+  {"umask", test_umask_stress},
+  {"at-variants", test_at_variants_stress},
+  {"vfork", test_vfork_stress},
+  {"kill", test_kill_stress},
+  {"sigmask", test_signal_mask_stress},
+  {"wait4", test_wait4_stress},
+  {"xattr", test_xattr_stress},
+  {"sysv-sem", test_sysv_sem_stress},
+  {"splice", test_splice_copy_range_stress},
+  {"msg-vector", test_msg_vector_stress},
+  {"mem-policy", test_mem_policy_stress},
+  {"extended-signals", test_extended_signals_stress},
+  {"netlink-route", test_netlink_stress},
+  {"procfs-read", test_procfs_stress},
+  {"ext4-readdir", test_ext4_readdir_stress},
+  {"registered-syscalls", test_registered_syscall_coverage},
+};
+
+static int run_one_focus(const char *name, void (*workload)(void),
+                         unsigned rounds, long *final_retained_kb) {
+  printf("FOCUS %s: one warm-up, %u measured rounds, 200 ms cleanup wait\n",
+         name, rounds);
+  g_quiet_log = 1;
+  workload();
+  leak_settle();
+  long baseline = get_free_mem_kb(), previous = baseline;
+  if (baseline < 0) { g_quiet_log = 0; return 2; }
+  printf("BASELINE free_kb=%ld\n", baseline);
+  long total_retained = 0;
+  for (unsigned round = 1; round <= rounds; round++) {
+    workload();
+    long immediate = get_free_mem_kb();
+    leak_settle();
+    long settled = get_free_mem_kb();
+    if (immediate < 0 || settled < 0) { g_quiet_log = 0; return 2; }
+    total_retained = baseline - settled;
+    printf("ROUND %u free_immediate_kb=%ld free_settled_kb=%ld retained_since_previous_kb=%ld retained_since_baseline_kb=%ld\n",
+           round, immediate, settled, previous - settled, total_retained);
+    previous = settled;
+  }
+  g_quiet_log = 0;
+  if (final_retained_kb) *final_retained_kb = total_retained;
+  return 0;
+}
+
+/* Warm up caches, settle deferred teardown, then measure two consecutive
+ * rounds via /proc/meminfo. Only repeated positive retention in both rounds
+ * indicates a leak rather than one-time slab growth or background noise. */
+static int check_leak_settled(const char *name, void (*workload)(void)) {
+  g_quiet_log = 1;
+  workload();
+  leak_settle();
+  long b0 = get_free_mem_kb();
+  workload();
+  leak_settle();
+  long b1 = get_free_mem_kb();
+  workload();
+  leak_settle();
+  long b2 = get_free_mem_kb();
+  g_quiet_log = 0;
+
+  if (b0 < 0 || b1 < 0 || b2 < 0) {
+    printf("  [ERR]  %-20s failed to read /proc/meminfo\n", name);
+    return 0;
+  }
+
+  long r1 = b0 - b1;
+  long r2 = b1 - b2;
+  if (r1 > 0 && r2 > 0) {
+    printf("  [LEAK] %-20s r1=+%ld kB, r2=+%ld kB (total=%ld kB, MemFree=%ld kB)\n",
+           name, r1, r2, b0 - b2, b2);
+    return 1;
+  }
+
+  printf("  [PASS] %-20s deltas=(%ld, %ld) kB (MemFree=%ld kB)\n",
+         name, r1, r2, b2);
+  return 0;
+}
+
 static int run_leak_focus(int argc, char **argv) {
   const char *name = NULL;
   unsigned rounds = 6;
+  bool rounds_set = false;
   for (int a = 1; a < argc; a++) {
     if (a + 1 >= argc) return -1;
     if (!strcmp(argv[a], "--focus")) name = argv[++a];
@@ -2699,39 +2929,44 @@ static int run_leak_focus(int argc, char **argv) {
       unsigned long n = strtoul(value, &end, 10);
       if (errno || !*value || *end || n < 1 || n > 100) return -1;
       rounds = n;
+      rounds_set = true;
     } else return -1;
   }
-  void (*workload)(void) = NULL;
   if (!name) return -1;
-  if (!strcmp(name, "wait4")) workload = test_wait4_stress;
-  else if (!strcmp(name, "sched")) workload = test_sched_stress;
-  else if (!strcmp(name, "clone")) workload = test_clone_futex_stress;
-  else if (!strcmp(name, "accept4")) workload = test_accept4_stress;
-  else if (!strcmp(name, "unix-stream")) workload = test_unix_stream_stress;
-  else if (!strcmp(name, "process-attrs")) workload = test_process_attrs_stress;
-  else if (!strcmp(name, "mmap")) workload = test_mmap_stress;
-  else if (!strcmp(name, "epoll")) workload = test_epoll_stress;
-  else if (!strcmp(name, "brk")) workload = test_brk_stress;
-  else if (!strcmp(name, "pipe2")) workload = test_pipe2_stress;
-  else return -1;
 
   setvbuf(stdout, NULL, _IOLBF, 0);
-  printf("FOCUS %s: one warm-up, %u measured rounds, 200 ms cleanup wait\n", name, rounds);
-  workload();
-  leak_settle();
-  long baseline = get_free_mem_kb(), previous = baseline;
-  if (baseline < 0) return 2;
-  printf("BASELINE free_kb=%ld\n", baseline);
-  for (unsigned round = 1; round <= rounds; round++) {
-    workload();
-    long immediate = get_free_mem_kb();
-    leak_settle();
-    long settled = get_free_mem_kb();
-    if (immediate < 0 || settled < 0) return 2;
-    printf("ROUND %u free_immediate_kb=%ld free_settled_kb=%ld retained_since_previous_kb=%ld retained_since_baseline_kb=%ld\n",
-           round, immediate, settled, previous - settled, baseline - settled);
-    previous = settled;
+  if (!strcmp(name, "all")) {
+    if (!rounds_set) rounds = 3;
+    size_t count = sizeof(focus_tests) / sizeof(focus_tests[0]);
+    long retained[sizeof(focus_tests) / sizeof(focus_tests[0])];
+    for (size_t i = 0; i < count; i++) {
+      retained[i] = 0;
+      int rc = run_one_focus(focus_tests[i].name, focus_tests[i].fn, rounds,
+                             &retained[i]);
+      if (rc != 0) return rc;
+    }
+    printf("\n=== FOCUS ALL SUMMARY (%u rounds each) ===\n", rounds);
+    for (size_t i = 0; i < count; i++) {
+      if (retained[i] > 0)
+        printf("  [!] %-18s retained_since_baseline_kb=%ld\n",
+               focus_tests[i].name, retained[i]);
+    }
+    printf("FOCUS completed: inspect repeated retention with background workloads controlled.\n");
+    return 0;
   }
+
+  void (*workload)(void) = NULL;
+  size_t count = sizeof(focus_tests) / sizeof(focus_tests[0]);
+  for (size_t i = 0; i < count; i++) {
+    if (!strcmp(name, focus_tests[i].name)) {
+      workload = focus_tests[i].fn;
+      break;
+    }
+  }
+  if (!workload) return -1;
+
+  int rc = run_one_focus(name, workload, rounds, NULL);
+  if (rc != 0) return rc;
   printf("FOCUS completed: inspect repeated retention with background workloads controlled.\n");
   return 0;
 }
@@ -2740,7 +2975,7 @@ int main(int argc, char **argv) {
   if (argc > 1) {
     int result = run_leak_focus(argc, argv);
     if (result >= 0) return result;
-    fprintf(stderr, "Usage: %s [--focus wait4|sched|clone|accept4|unix-stream|process-attrs|mmap|epoll|brk|pipe2 --rounds 1..100]\n", argv[0]);
+    fprintf(stderr, "Usage: %s [--focus all|<test-name> --rounds 1..100]\n", argv[0]);
     return 2;
   }
 
@@ -2777,279 +3012,23 @@ int main(int argc, char **argv) {
     return 1;
   }
   printf("Initial Free Memory: %ld kB\n", initial_mem);
-  long current_mem = initial_mem;
-
-  printf("\n--- Running MMAP Stress ---\n");
-  test_mmap_stress();
-  check_leak("MMAP Stress", &current_mem);
-
-  printf("\n--- Running VFS Stress ---\n");
-  test_vfs_stress();
-  check_leak("VFS Stress", &current_mem);
-
-  printf("\n--- Running VFS Open/Close Stress ---\n");
-  test_vfs_open_close_stress();
-  check_leak("VFS Open/Close Stress", &current_mem);
-
-  printf("\n--- Running EPOLL Stress ---\n");
-  test_epoll_stress();
-  check_leak("EPOLL Stress", &current_mem);
-
-  printf("\n--- Running POLL Stress ---\n");
-  test_poll_stress();
-  check_leak("POLL Stress", &current_mem);
-
-  printf("\n--- Running PPOLL Stress ---\n");
-  test_ppoll_stress();
-  check_leak("PPOLL Stress", &current_mem);
-
-  printf("\n--- Running PIPE Stress ---\n");
-  test_pipe_stress();
-  check_leak("PIPE Stress", &current_mem);
-
-  printf("\n--- Running SOCKET Stress ---\n");
-  test_socket_stress();
-  check_leak("SOCKET Stress", &current_mem);
-
-  printf("\n--- Running UNIX STREAM Stress ---\n");
-  test_unix_stream_stress();
-  check_leak("UNIX STREAM Stress", &current_mem);
-
-  printf("\n--- Running SOCKETPAIR Stress ---\n");
-  test_socketpair_stress();
-  check_leak("SOCKETPAIR Stress", &current_mem);
-
-  printf("\n--- Running UNIX DGRAM Stress ---\n");
-  test_unix_dgram_stress();
-  check_leak("UNIX DGRAM Stress", &current_mem);
-
-  printf("\n--- Running SOCKET OPTS Stress ---\n");
-  test_socket_opts_stress();
-  check_leak("SOCKET OPTS Stress", &current_mem);
-
-  printf("\n--- Running SHUTDOWN Stress ---\n");
-  test_shutdown_stress();
-  check_leak("SHUTDOWN Stress", &current_mem);
-
-  printf("\n--- Running ACCEPT4 Stress ---\n");
-  test_accept4_stress();
-  check_leak("ACCEPT4 Stress", &current_mem);
-
-  printf("\n--- Running FORK Stress ---\n");
-  test_fork_stress();
-  check_leak("FORK Stress", &current_mem);
-
-  printf("\n--- Running CLONE/FUTEX Stress ---\n");
-  test_clone_futex_stress();
-  check_leak("CLONE/FUTEX Stress", &current_mem);
-
-  printf("\n--- Running VFS Error Stress ---\n");
-  test_vfs_error_stress();
-  check_leak("VFS Error Stress", &current_mem);
-
-  printf("\n--- Running MMAP FIXED Stress ---\n");
-  test_mmap_fixed_stress();
-  check_leak("MMAP FIXED Stress", &current_mem);
-
-  printf("\n--- Running READV Stress ---\n");
-  test_readv_stress();
-  check_leak("READV Stress", &current_mem);
-
-  printf("\n--- Running EXECVE Stress ---\n");
-  test_exec_stress();
-  check_leak("EXECVE Stress", &current_mem);
-
-  printf("\n--- Running DUP/DUP2/FCNTL Stress ---\n");
-  test_dup_fcntl_stress();
-  check_leak("DUP/DUP2/FCNTL Stress", &current_mem);
-
-  printf("\n--- Running PREAD64/PWRITE64 Stress ---\n");
-  test_pread_pwrite_stress();
-  check_leak("PREAD64/PWRITE64 Stress", &current_mem);
-
-  printf("\n--- Running WRITEV Stress ---\n");
-  test_writev_stress();
-  check_leak("WRITEV Stress", &current_mem);
-
-  printf("\n--- Running SENDFILE Stress ---\n");
-  test_sendfile_stress();
-  check_leak("SENDFILE Stress", &current_mem);
-
-  printf("\n--- Running FTRUNCATE/FALLOCATE/FSYNC/FSTAT Stress ---\n");
-  test_ftruncate_fsync_stress();
-  check_leak("FTRUNCATE/FALLOCATE/FSYNC Stress", &current_mem);
-
-  printf("\n--- Running LSEEK Stress ---\n");
-  test_lseek_stress();
-  check_leak("LSEEK Stress", &current_mem);
-
-  printf("\n--- Running STAT Variants Stress ---\n");
-  test_stat_variants_stress();
-  check_leak("STAT Variants Stress", &current_mem);
-
-  printf("\n--- Running GETDENTS64 Stress ---\n");
-  test_getdents64_stress();
-  check_leak("GETDENTS64 Stress", &current_mem);
-
-  printf("\n--- Running STATFS/FSTATFS Stress ---\n");
-  test_statfs_stress();
-  check_leak("STATFS/FSTATFS Stress", &current_mem);
-
-  printf("\n--- Running FS OPS Stress ---\n");
-  test_fs_ops_stress();
-  check_leak("FS OPS Stress", &current_mem);
-
-  printf("\n--- Running ACCESS/FACCESSAT Stress ---\n");
-  test_access_stress();
-  check_leak("ACCESS/FACCESSAT Stress", &current_mem);
-
-  printf("\n--- Running GETCWD/CHDIR/FCHDIR Stress ---\n");
-  test_getcwd_chdir_stress();
-  check_leak("GETCWD/CHDIR Stress", &current_mem);
-
-  printf("\n--- Running MPROTECT Stress ---\n");
-  test_mprotect_stress();
-  check_leak("MPROTECT Stress", &current_mem);
-
-  printf("\n--- Running MREMAP Stress ---\n");
-  test_mremap_stress();
-  check_leak("MREMAP Stress", &current_mem);
-
-  printf("\n--- Running BRK Stress ---\n");
-  test_brk_stress();
-  check_leak("BRK Stress", &current_mem);
-
-  printf("\n--- Running MADVISE Stress ---\n");
-  test_madvise_stress();
-  check_leak("MADVISE Stress", &current_mem);
-
-  printf("\n--- Running PIPE2 Stress ---\n");
-  test_pipe2_stress();
-  check_leak("PIPE2 Stress", &current_mem);
-
-  printf("\n--- Running MEMFD_CREATE Stress ---\n");
-  test_memfd_stress();
-  check_leak("MEMFD_CREATE Stress", &current_mem);
-
-  printf("\n--- Running TIMERFD Stress ---\n");
-  test_timerfd_stress();
-  check_leak("TIMERFD Stress", &current_mem);
-
-  printf("\n--- Running EVENTFD Stress ---\n");
-  test_eventfd_stress();
-  check_leak("EVENTFD Stress", &current_mem);
-
-  printf("\n--- Running INOTIFY Stress ---\n");
-  test_inotify_stress();
-  check_leak("INOTIFY Stress", &current_mem);
-
-  printf("\n--- Running GETRANDOM Stress ---\n");
-  test_getrandom_stress();
-  check_leak("GETRANDOM Stress", &current_mem);
-
-  printf("\n--- Running CLOCK/TIME Stress ---\n");
-  test_clock_stress();
-  check_leak("CLOCK/TIME Stress", &current_mem);
-
-  printf("\n--- Running UNAME/SYSINFO/GETRLIMIT Stress ---\n");
-  test_sysinfo_stress();
-  check_leak("SYSINFO/GETRLIMIT Stress", &current_mem);
-
-  printf("\n--- Running PID/TID/PGID Query Stress ---\n");
-  test_pid_query_stress();
-  check_leak("PID Query Stress", &current_mem);
-
-  printf("\n--- Running UID/GID Stress ---\n");
-  test_uid_gid_stress();
-  check_leak("UID/GID Stress", &current_mem);
-
-  printf("\n--- Running PRCTL Stress ---\n");
-  test_prctl_stress();
-  check_leak("PRCTL Stress", &current_mem);
-
-  printf("\n--- Running SCHED Stress ---\n");
-  test_sched_stress();
-  check_leak("SCHED Stress", &current_mem);
-
-  printf("\n--- Running PROCESS ATTRS Stress ---\n");
-  test_process_attrs_stress();
-  check_leak("PROCESS ATTRS Stress", &current_mem);
-
-  printf("\n--- Running SETITIMER/ALARM Stress ---\n");
-  test_itimer_stress();
-  check_leak("SETITIMER/ALARM Stress", &current_mem);
-
-  printf("\n--- Running MLOCK Stress ---\n");
-  test_mlock_stress();
-  check_leak("MLOCK Stress", &current_mem);
-
-  printf("\n--- Running UTIMES/UTIMENSAT Stress ---\n");
-  test_utimes_stress();
-  check_leak("UTIMES/UTIMENSAT Stress", &current_mem);
-
-  printf("\n--- Running UMASK Stress ---\n");
-  test_umask_stress();
-  check_leak("UMASK Stress", &current_mem);
-
-  printf("\n--- Running *AT Variants Stress ---\n");
-  test_at_variants_stress();
-  check_leak("AT Variants Stress", &current_mem);
-
-  printf("\n--- Running VFORK Stress ---\n");
-  test_vfork_stress();
-  check_leak("VFORK Stress", &current_mem);
-
-  printf("\n--- Running KILL Stress ---\n");
-  test_kill_stress();
-  check_leak("KILL Stress", &current_mem);
-
-  printf("\n--- Running SIGACTION/SIGPROCMASK Stress ---\n");
-  test_signal_mask_stress();
-  check_leak("SIGACTION/SIGPROCMASK Stress", &current_mem);
-
-  printf("\n--- Running WAIT4 Stress ---\n");
-  test_wait4_stress();
-  check_leak("WAIT4 Stress", &current_mem);
-
-  printf("\n--- Running XATTR Stress ---\n");
-  test_xattr_stress();
-  check_leak("XATTR Stress", &current_mem);
-
-  printf("\n--- Running SYSV SEMAPHORE Stress ---\n");
-  test_sysv_sem_stress();
-  check_leak("SYSV Semaphore Stress", &current_mem);
-
-  printf("\n--- Running SPLICE / COPY_FILE_RANGE Stress ---\n");
-  test_splice_copy_range_stress();
-  check_leak("SPLICE/CFR Stress", &current_mem);
-
-  printf("\n--- Running SENDMMSG / RECVMMSG Stress ---\n");
-  test_msg_vector_stress();
-  check_leak("SENDMMSG/RECVMMSG Stress", &current_mem);
-
-  printf("\n--- Running MEMORY POLICY & EXTENDED MM Stress ---\n");
-  test_mem_policy_stress();
-  check_leak("Memory Policy Stress", &current_mem);
-
-  printf("\n--- Running EXTENDED SIGNALS Stress ---\n");
-  test_extended_signals_stress();
-  check_leak("Extended Signals Stress", &current_mem);
-
-  printf("\n--- Running REGISTERED SYSCALL COVERAGE Stress ---\n");
-  test_registered_syscall_coverage();
-  check_leak("Registered Syscall Coverage Stress", &current_mem);
-
-  printf("Verifying memory levels...\n");
-  long final_mem = get_free_mem_kb();
-  printf("Final Free Memory:   %ld kB\n", final_mem);
-
-  long total_diff = initial_mem - final_mem;
-  if (total_diff > 0) {
-    printf("FAIL: Total Memory leak: %ld kB\n", total_diff);
-    return 1;
-  } else {
-    printf("PASS: No memory leaks detected.\n");
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  int leaks_found = 0;
+  size_t test_count = sizeof(focus_tests) / sizeof(focus_tests[0]);
+  for (size_t idx = 0; idx < test_count; idx++) {
+    leaks_found += check_leak_settled(focus_tests[idx].name, focus_tests[idx].fn);
   }
+
+  printf("\nVerifying memory levels...\n");
+  long final_mem = get_free_mem_kb();
+  printf("Final Free Memory:   %ld kB (delta=%ld kB)\n",
+         final_mem, initial_mem - final_mem);
+
+  if (leaks_found > 0) {
+    printf("FAIL: %d test(s) showed repeated memory retention.\n", leaks_found);
+    return 1;
+  }
+  printf("PASS: No repeated memory leaks detected across %zu tests.\n", test_count);
 
   printf("ALL TESTS COMPLETED!\n");
   return 0;

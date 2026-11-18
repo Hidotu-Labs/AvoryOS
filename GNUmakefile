@@ -175,7 +175,7 @@ $(error RUN_AUDIO must be hda or usb)
 endif
 RUN_AUDIO_DEV_FLAGS = $(if $(filter usb,$(RUN_AUDIO)),,-device intel-hda -device hda-duplex,audiodev=snd0)
 RUN_USB_AUDIO_DEV_FLAGS = $(if $(filter usb,$(RUN_AUDIO)),-device usb-audio$(NET_COMMA)bus=xhci.0$(NET_COMMA)port=1$(NET_COMMA)multi=off$(NET_COMMA)msos-desc=off$(NET_COMMA)audiodev=snd0,)
-.PHONY: run run-tcg run-usb run-s4
+.PHONY: run run-tcg run-usb run-s4 run-installer run-installed
 S4_SWAP_IMG ?= build/s4-swap.img
 S4_SWAP_SIZE ?= 6G
 $(S4_SWAP_IMG):
@@ -187,6 +187,18 @@ run-usb: run
 run-s4: KERNEL_CMDLINE = resume=PARTLABEL=s4swap
 run-s4: RUN_EXTRA_QEMU_FLAGS = -drive file=$(S4_SWAP_IMG),format=raw,if=none,id=s4swap -device nvme,serial=avoryos-s4,drive=s4swap,max_ioqpairs=$(RUN_NVME_QUEUES)
 run-s4: $(S4_SWAP_IMG) run
+# Installer test: boots the ISO's TTY installer with disk.img as the live root
+# (snapshot=on, so installs never write it) and a blank sparse NVMe target.
+# Delete the target image to start over; boot the result with run-installed.
+INSTALL_TARGET_IMG ?= build/install-target.img
+INSTALL_TARGET_SIZE ?= 6G
+$(INSTALL_TARGET_IMG):
+	@mkdir -p "$(dir $@)"
+	truncate -s $(INSTALL_TARGET_SIZE) "$@"
+run-installer: KERNEL_CMDLINE = init=/sbin/init avory_installer quiet
+run-installer: RUN_ROOT_DRIVE_OPTS = ,snapshot=on,file.locking=off
+run-installer: RUN_EXTRA_QEMU_FLAGS = -drive file=$(INSTALL_TARGET_IMG),format=raw,if=none,id=target0 -device nvme,serial=avoryos-target,drive=target0,max_ioqpairs=$(RUN_NVME_QUEUES)
+run-installer: $(INSTALL_TARGET_IMG) run
 RUN_ACCEL_FLAGS ?= -cpu host -enable-kvm
 run: DISPLAY_OPT = -display $(RUN_DISPLAY),gl=$(RUN_GL),show-cursor=$(GTK_SHOW_CURSOR)$(if $(filter gtk,$(RUN_DISPLAY)),$(NET_COMMA)zoom-to-fit=off$(NET_COMMA)grab-on-hover=on)
 run: QEMUFLAGS = $(QEMU_MEM) -vga none -device $(RUN_GPU),xres=1280,yres=800 $(RUN_EXTRA_QEMU_FLAGS)
@@ -196,7 +208,7 @@ run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL
 		-M q35,pcspk-audiodev=snd0 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
-		-drive file=disk.img,format=raw,if=none,id=nvme0 \
+		-drive file=disk.img,format=raw,if=none,id=nvme0$(RUN_ROOT_DRIVE_OPTS) \
 		-device nvme,serial=avoryos0,drive=nvme0,max_ioqpairs=$(RUN_NVME_QUEUES) \
 		$(RUN_ACCEL_FLAGS) \
 		-smp $(RUN_SMP) \
@@ -211,42 +223,39 @@ run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL
 		-device $(RUN_POINTER),bus=xhci.0 \
 		$(DISPLAY_OPT) \
 		$(QEMUFLAGS)
-run-tcg: RUN_ACCEL_FLAGS := -accel tcg,thread=multi -cpu max
+run-tcg: RUN_ACCEL_FLAGS := -accel tcg,thread=multi -cpu max,+fred,+lkgs
 run-tcg: run
 
-# Headless, TCG-only USB audio fixture. Use the null backend by default so it
-# also boots on build hosts without a desktop audio server; choose pa, pipewire,
-# or another QEMU backend with USB_AUDIO_BACKEND to hear playback. The disk is
-# an ephemeral overlay so this hardware exercise cannot alter the user's image.
-USB_AUDIO_BACKEND ?= none
-USB_AUDIO_SMP ?= 2
-USB_AUDIO_DISK ?= disk.img
-USB_AUDIO_DISK_DEP := $(if $(wildcard $(USB_AUDIO_DISK)),,$(USB_AUDIO_DISK))
-USB_TEST_DISPLAY ?= -display gtk,zoom-to-fit=off,grab-on-hover=on
-.PHONY: run-usb-audio
-run-usb-audio: edk2-ovmf $(IMAGE_NAME).iso $(USB_AUDIO_DISK_DEP)
-	@set -e; \
-	mkdir -p build; \
-	overlay=$$(mktemp build/usb-audio-disk.XXXXXX); \
-	trap 'rm -f "$$overlay"' EXIT HUP INT TERM; \
-	qemu-img create -q -f qcow2 -F raw -b "$(abspath $(USB_AUDIO_DISK))" "$$overlay"; \
-	qemu-system-$(ARCH) \
-		-M q35 -cpu max -accel tcg \
+# Boot the disk run-installer produced on its own (no ISO, no disk.img), through
+# the Limine EFI loader the installer put on its ESP. Without saved firmware
+# variables OVMF would try the NIC's PXE ROM first, so the disk gets bootindex=0.
+# OVMF's NVMe driver needs two I/O queue pairs; with RUN_NVME_QUEUES=1 it
+# cannot bring the controller up and never sees the disk.
+INSTALLED_NVME_QUEUES ?= 2
+run-installed: DISPLAY_OPT = -display $(RUN_DISPLAY),gl=$(RUN_GL),show-cursor=$(GTK_SHOW_CURSOR)$(if $(filter gtk,$(RUN_DISPLAY)),$(NET_COMMA)zoom-to-fit=off$(NET_COMMA)grab-on-hover=on)
+run-installed: edk2-ovmf $(if $(RUN_VIRGL_FIXED),$(VIRGL_HOST_LIB)) $(if $(RUN_QEMU_LOCAL),$(QEMU_HOST_BIN))
+	@test -s "$(INSTALL_TARGET_IMG)" || { echo "$(INSTALL_TARGET_IMG) missing; run make run-installer first" >&2; exit 1; }
+	@mkdir -p "$(dir $(RUN_SERIAL_LOG))"
+	$(RUN_VIRGL_ENV) $(RUN_QEMU) \
+		-M q35,pcspk-audiodev=snd0 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso \
-		-drive file="$$overlay",format=qcow2,if=none,id=nvme0 \
-		-device nvme,serial=avoryos0,drive=nvme0 \
-		-smp $(USB_AUDIO_SMP) $(QEMU_MEM) -vga none -device virtio-vga,addr=06.0 \
-		-display none -serial stdio -monitor none -no-reboot \
-		-audiodev $(USB_AUDIO_BACKEND),id=usbaudio \
+		-drive file=$(INSTALL_TARGET_IMG),format=raw,if=none,id=target0 \
+		-device nvme,serial=avoryos-target,drive=target0,max_ioqpairs=$(INSTALLED_NVME_QUEUES),bootindex=0 \
+		$(RUN_ACCEL_FLAGS) \
+		-smp $(RUN_SMP) \
+		-chardev stdio,id=desktop-serial,logfile=$(RUN_SERIAL_LOG),logappend=on \
+		-serial chardev:desktop-serial \
+		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
 		$(RUN_NET_FLAGS) \
+		$(RUN_AUDIO_DEV_FLAGS) \
 		-device qemu-xhci,id=xhci \
-		-device usb-audio,bus=xhci.0,port=1,multi=off,msos-desc=off,audiodev=usbaudio \
+		$(RUN_USB_AUDIO_DEV_FLAGS) \
 		-device usb-kbd,bus=xhci.0 \
-		-device usb-tablet,bus=xhci.0
+		-device $(RUN_POINTER),bus=xhci.0 \
+		$(DISPLAY_OPT) \
+		$(QEMU_MEM) -vga none -device $(RUN_GPU),xres=1280,yres=800
 
-# Headless USB mass-storage and hub fixtures (QEMU xHCI, TCG). Like run-usb-audio
-# they boot the existing ISO without rebuilding it. Every disk is attached with
+# USB mass-storage and hub fixtures (QEMU xHCI). Every disk is attached with
 # snapshot=on,file.locking=off, so disk.img and a running `make run` VM are never
 # written. USB_STORAGE_PORT picks the xHCI root port for the stick: 1 is a
 # SuperSpeed (USB3) port; set it empty to auto-assign, which lands on a USB2 port.
@@ -256,6 +265,7 @@ USB_STORAGE_IMG ?= build/usb-stick.img
 USB_STORAGE_SIZE_MIB ?= 64
 USB_STORAGE_PORT ?= 1
 USB_STORAGE_SMP ?= 8
+USB_TEST_DISPLAY ?= -display gtk,zoom-to-fit=off,grab-on-hover=on
 
 $(USB_STORAGE_IMG):
 	@set -e; \
@@ -306,37 +316,6 @@ run-usb-hub: edk2-ovmf $(IMAGE_NAME).iso $(USB_STORAGE_DISK_DEP) $(USB_STORAGE_I
 		-device usb-storage,bus=xhci.0,port=1.3,drive=stick \
 		-device usb-hub,bus=xhci.0,port=1.4 \
 		-device usb-kbd,bus=xhci.0,port=1.4.1
-
-# ── NUMA multi-node test target ──────────────────────────────────────────────
-#
-# Boots AvoryOS with 2 NUMA nodes, 4 vCPUs (2 per node), 4GB RAM (2GB per node),
-# and explicit inter-node distance matrix.
-.PHONY: run-numa
-run-numa: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
-	qemu-system-$(ARCH) \
-		-M q35,pcspk-audiodev=snd0 \
-		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso \
-		-drive file=disk.img,format=raw,if=none,id=nvme0 \
-		-device nvme,serial=avoryos0,drive=nvme0 \
-		$(RUN_ACCEL_FLAGS) \
-		-smp $(RUN_SMP),sockets=2,cores=4,threads=1 \
-		-m 4G \
-		-object memory-backend-ram,id=mem0,size=2G \
-		-object memory-backend-ram,id=mem1,size=2G \
-		-numa node,nodeid=0,cpus=0-3,memdev=mem0 \
-		-numa node,nodeid=1,cpus=4-7,memdev=mem1 \
-		-numa dist,src=0,dst=1,val=21 \
-		-numa dist,src=1,dst=0,val=21 \
-		-serial stdio \
-		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
-		$(RUN_NET_FLAGS) \
-		-device intel-hda -device hda-duplex,audiodev=snd0 \
-		-device qemu-xhci,id=xhci \
-		-device usb-kbd,bus=xhci.0 \
-		-device usb-tablet,bus=xhci.0 \
-		$(QEMUFLAGS)
-
 
 # Shared QEMU settings for interactive and VFIO launchers.
 SERIAL ?= stdio
@@ -481,82 +460,6 @@ run-minimal: edk2-ovmf $(MINIMAL_ISO)
 clean-minimal:
 	rm -rf build/minimal $(MINIMAL_ISO)
 
-# Legacy SATA/IDE root disk (the pre-NVMe run layout), kept for AHCI/ATA
-# regression and A/B comparisons.  run-sata is KVM, run-sata-tcg is TCG.
-.PHONY: run-sata run-sata-tcg
-run-sata: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
-	qemu-system-$(ARCH) \
-		-M q35,pcspk-audiodev=snd0 \
-		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso \
-		-drive file=disk.img,format=raw,if=none,id=disk0 -device ide-hd,drive=disk0,bus=ide.0 \
-		$(RUN_ACCEL_FLAGS) \
-		-smp 4 \
-		-serial stdio \
-		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
-		$(RUN_NET_FLAGS) \
-		-device intel-hda -device hda-duplex,audiodev=snd0 \
-		-device qemu-xhci,id=xhci \
-		-device usb-kbd,bus=xhci.0 \
-		-device usb-tablet,bus=xhci.0 \
-		$(QEMUFLAGS)
-
-.PHONY: run-bios
-run-bios: $(IMAGE_NAME).iso $(RUN_DISK_DEP)
-	qemu-system-$(ARCH) \
-		-M q35,pcspk-audiodev=snd0 \
-		-cdrom $(IMAGE_NAME).iso \
-		-hda disk.img \
-		-boot d \
-		-audiodev pa,id=snd0 \
-		-serial stdio \
-		-device AC97,audiodev=snd0 \
-		-device intel-hda -device hda-duplex,audiodev=snd0 \
-		-device usb-ehci,id=ehci \
-		-device usb-tablet,bus=ehci.0 \
-		-device usb-kbd,bus=ehci.0 \
-		$(QEMUFLAGS)
-
-.PHONY: run-ata
-run-ata: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP)
-	qemu-system-$(ARCH) \
-		-M pc,pcspk-audiodev=snd0 \
-		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso \
-		-drive file=disk.img,format=raw,if=ide \
-		-smp 4 \
-		-serial stdio \
-		-audiodev pa,id=snd0 \
-		-device sb16,audiodev=snd0 \
-		-device AC97,audiodev=snd0 \
-		-device intel-hda -device hda-duplex,audiodev=snd0 \
-		-device usb-ehci,id=ehci \
-		-device usb-tablet,bus=ehci.0 \
-		-device usb-kbd,bus=ehci.0 \
-		$(QEMUFLAGS)
-
-# FAT32 test image for testing the FAT32 driver
-fat32_test.img:
-	./scripts/create-fat32-test.sh
-
-.PHONY: run-fat32
-run-fat32: edk2-ovmf $(IMAGE_NAME).iso fat32_test.img
-	qemu-system-$(ARCH) \
-		-M q35,pcspk-audiodev=snd0 \
-		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
-		-cdrom $(IMAGE_NAME).iso \
-		-hda fat32_test.img \
-		-smp 4 \
-		-serial stdio \
-		-audiodev pa,id=snd0 \
-		-device sb16,audiodev=snd0 \
-		-device AC97,audiodev=snd0 \
-		-device intel-hda -device hda-duplex,audiodev=snd0 \
-		-device qemu-xhci,id=xhci \
-		-device usb-kbd,bus=xhci.0 \
-		-device usb-tablet,bus=xhci.0 \
-		$(QEMUFLAGS)
-
 BENCH_COMPAT_APP := $(if $(or $(wildcard userland/bench_compat.exe),$(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)),userland/bench_compat.exe)
 USERLAND_DISK_APPS := \
 	userland/avory_bench.elf \
@@ -620,7 +523,8 @@ USERLAND_DISK_APPS := \
 	userland/test_user_dispatch.elf \
 	userland/test_vdso_bench.elf \
 	userland/test_watchdog.elf \
-	userland/test_zero_page.elf
+	userland/test_zero_page.elf \
+	userland/test_heap_corrupt.elf
 
 disk.img: $(USERLAND_DISK_APPS)
 
@@ -914,6 +818,8 @@ disk.img: disk-full-force
 		echo "write userland/test_hugepages.elf bin/test_hugepages"; \
 		echo "rm bin/test_zero_page"; \
 		echo "write userland/test_zero_page.elf bin/test_zero_page"; \
+		echo "rm bin/test_heap_corrupt"; \
+		echo "write userland/test_heap_corrupt.elf bin/test_heap_corrupt"; \
 		echo "rm bin/test_copy_user"; \
 		echo "write userland/test_copy_user.elf bin/test_copy_user"; \
 		echo "rm bin/test_pcp_pmm"; \
@@ -1143,6 +1049,7 @@ disk.img: disk-full-force
 		echo "set_inode_field bin/test_accounts mode 0100755"; \
 		echo "set_inode_field bin/test_hugepages mode 0100755"; \
 		echo "set_inode_field bin/test_zero_page mode 0100755"; \
+		echo "set_inode_field bin/test_heap_corrupt mode 0100755"; \
 		echo "set_inode_field bin/test_copy_user mode 0100755"; \
 		echo "set_inode_field bin/test_pcp_pmm mode 0100755"; \
 		echo "set_inode_field bin/test_ticket_lock mode 0100755"; \

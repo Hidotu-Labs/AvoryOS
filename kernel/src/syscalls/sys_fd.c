@@ -1301,6 +1301,24 @@ static void trace_userspace_debug_write(struct thread *t, int fd,
     klog_putchar('\n');
 }
 
+/* vfs_read/vfs_write take 32-bit offsets; raw block devices get the full
+ * 64-bit file offset so I/O past 4 GiB does not wrap. */
+static uint32_t fd_vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size,
+                            uint8_t *buf) {
+  uint32_t done;
+  if (block_node_rw64(node, offset, size, buf, false, &done))
+    return done;
+  return vfs_read(node, (uint32_t)offset, size, buf);
+}
+
+static uint32_t fd_vfs_write(vfs_node_t *node, uint64_t offset, uint32_t size,
+                             uint8_t *buf) {
+  uint32_t done;
+  if (block_node_rw64(node, offset, size, buf, true, &done))
+    return done;
+  return vfs_write(node, (uint32_t)offset, size, buf);
+}
+
 static int64_t fd_write(int fd, const void *buf, size_t count) {
   if (count == 0)
     return 0;
@@ -1327,7 +1345,7 @@ static int64_t fd_write(int fd, const void *buf, size_t count) {
   t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
   int32_t bytes_written = append
       ? (int32_t)vfs_append(node, count, (uint8_t *)buf, &end_offset)
-      : (int32_t)vfs_write(node, (uint32_t)offset, count, (uint8_t *)buf);
+      : (int32_t)fd_vfs_write(node, offset, count, (uint8_t *)buf);
   t->current_io_flags = 0;
   if (bytes_written == -9) {
     static uint32_t bad_write_node_logs;
@@ -1380,7 +1398,7 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count, uint64_t a3,
     return (uint64_t)-9;
   t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
   int32_t bytes_read =
-      (int32_t)vfs_read(node, (uint32_t)offset, count, (uint8_t *)buf);
+      (int32_t)fd_vfs_read(node, offset, count, (uint8_t *)buf);
   t->current_io_flags = 0;
   if (bytes_read > 0)
     fd_advance_offset(t, fd, node, (uint32_t)bytes_read);
@@ -1432,7 +1450,7 @@ static uint64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count,
     return (uint64_t)-9;
   t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
   int32_t bytes_read =
-      (int32_t)vfs_read(node, (uint32_t)offset, count, (uint8_t *)buf);
+      (int32_t)fd_vfs_read(node, offset, count, (uint8_t *)buf);
   t->current_io_flags = 0;
   fd_put_node(ref);
   return (uint64_t)(int64_t)bytes_read;
@@ -1459,7 +1477,7 @@ static uint64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
   int32_t bytes_written = (flags & O_APPEND) &&
                           (node->flags & FS_TYPE_MASK) == FS_FILE
       ? (int32_t)vfs_append(node, count, (uint8_t *)buf, &end_offset)
-      : (int32_t)vfs_write(node, (uint32_t)offset, count, (uint8_t *)buf);
+      : (int32_t)fd_vfs_write(node, offset, count, (uint8_t *)buf);
   t->current_io_flags = 0;
   fd_put_node(ref);
   return (uint64_t)(int64_t)bytes_written;
@@ -1549,7 +1567,7 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       return (uint64_t)-14;
     }
     int32_t bytes_read =
-        (int32_t)vfs_read(node, (uint32_t)(offset + total), len,
+        (int32_t)fd_vfs_read(node, offset + total, len,
                           (uint8_t *)base);
     if (bytes_read < 0) {
       if (total > 0)
@@ -1801,7 +1819,7 @@ static uint64_t sys_preadv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       return (uint64_t)-14;
     }
     int32_t bytes_read =
-        (int32_t)vfs_read(node, (uint32_t)(offset + total), len,
+        (int32_t)fd_vfs_read(node, offset + total, len,
                           (uint8_t *)base);
     if (bytes_read < 0) {
       if (total > 0)
@@ -1870,7 +1888,7 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     int32_t bytes_written = (flags & O_APPEND) &&
                             (node->flags & FS_TYPE_MASK) == FS_FILE
         ? (int32_t)vfs_append(node, len, (uint8_t *)base, &end_offset)
-        : (int32_t)vfs_write(node, (uint32_t)(offset + total), len,
+        : (int32_t)fd_vfs_write(node, offset + total, len,
                              (uint8_t *)base);
     if (bytes_written < 0) {
       if (total > 0)
@@ -2504,6 +2522,9 @@ void sys_sync_all_open_files(void) {
       vfs_close(nodes[i]);
     }
   }
+  /* Open descriptors are only part of the dirty set: files closed but still
+   * held by the dentry cache keep their dirty pages until they are synced. */
+  vfs_dentry_sync_all();
 }
 
 static uint64_t sys_sync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
@@ -2798,6 +2819,28 @@ uint64_t cgroup2_mount_at(const char *target, const char *fstype) {
   return 0;
 }
 
+
+/* Mount one block filesystem type on `dev` in place.  False leaves
+ * mountpoint untouched.  The mount entry and fat32 hold their own device
+ * references.  ext2/ext4 never free their mount state, which keeps a raw
+ * device pointer, so it pins the device for good. */
+static bool sys_mount_block_try(struct block_device *dev, vfs_node_t *mountpoint,
+                                vfs_node_t *saved, const char *target,
+                                const char *type) {
+    if (strcmp(type, "vfat") == 0) {
+        if (fat32_mount(dev, mountpoint) != 0)
+            return false;
+        vfs_mount_inplace(mountpoint, saved, dev, dev->name, "vfat", target, NULL, fat32_unmount, fat32_live_nodes);
+        return true;
+    }
+    bool ext4 = strcmp(type, "ext4") == 0;
+    if ((ext4 ? ext4_mount(dev, mountpoint) : ext2_mount(dev, mountpoint)) != 0)
+        return false;
+    block_ref(dev);
+    vfs_mount_inplace(mountpoint, saved, dev, dev->name, type, target, ext4 ? ext4_unmount : ext2_unmount, NULL, NULL);
+    return true;
+}
+
 static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
                           uint64_t fstype_ptr, uint64_t flags,
                           uint64_t data_ptr, uint64_t a5) {
@@ -2990,20 +3033,7 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
         return (uint64_t)-20;
     }
 
-    const char *dev_name = source;
-    if (strncmp(source, "/dev/", 5) == 0)
-        dev_name = source + 5;
-
-    struct block_device *dev = NULL;
-    int device_count = block_count();
-    for (int i = 0; i < device_count; i++) {
-        struct block_device *d = block_get(i);
-        if (d && strcmp(d->name, dev_name) == 0) {
-            dev = d;
-            break;
-        }
-    }
-
+    struct block_device *dev = block_get_by_name(source);
     if (!dev) {
         vfs_close(mountpoint);
         return (uint64_t)-6;
@@ -3013,66 +3043,39 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
      * image so umount can put the directory back. */
     vfs_node_t *saved = kmalloc(sizeof(vfs_node_t));
     if (!saved) {
+        block_put(dev);
         vfs_close(mountpoint);
         return (uint64_t)-12;
     }
     memcpy(saved, mountpoint, sizeof(vfs_node_t));
 
+    static const char *const fat_order[] = {"vfat", NULL};
+    static const char *const ext4_order[] = {"ext4", "ext2", NULL};
+    static const char *const ext2_order[] = {"ext2", "ext4", NULL};
+    static const char *const any_order[] = {"ext4", "ext2", "vfat", NULL};
+    const char *const *order = any_order;
     if (fstype) {
-        if (strcmp(fstype, "vfat") == 0 || strcmp(fstype, "fat32") == 0 || strcmp(fstype, "msdos") == 0) {
-            if (fat32_mount(dev, mountpoint) == 0) {
-                vfs_mount_inplace(mountpoint, saved, dev, dev->name, "vfat", target, NULL, fat32_unmount, fat32_live_nodes);
-                return 0;
-            }
-            kfree(saved);
-            vfs_close(mountpoint);
-            return (uint64_t)-22;
-        }
-        if (strcmp(fstype, "ext4") == 0) {
-            if (ext4_mount(dev, mountpoint) == 0) {
-                vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext4", target, ext4_unmount, NULL, NULL);
-                return 0;
-            }
-            if (ext2_mount(dev, mountpoint) == 0) {
-                vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext2", target, ext2_unmount, NULL, NULL);
-                return 0;
-            }
-            kfree(saved);
-            vfs_close(mountpoint);
-            return (uint64_t)-22;
-        }
-        if (strcmp(fstype, "ext2") == 0 || strcmp(fstype, "ext3") == 0) {
-            if (ext2_mount(dev, mountpoint) == 0) {
-                vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext2", target, ext2_unmount, NULL, NULL);
-                return 0;
-            }
-            if (ext4_mount(dev, mountpoint) == 0) {
-                vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext4", target, ext4_unmount, NULL, NULL);
-                return 0;
-            }
-            kfree(saved);
-            vfs_close(mountpoint);
-            return (uint64_t)-22;
-        }
+        if (strcmp(fstype, "vfat") == 0 || strcmp(fstype, "fat32") == 0 || strcmp(fstype, "msdos") == 0)
+            order = fat_order;
+        else if (strcmp(fstype, "ext4") == 0)
+            order = ext4_order;
+        else if (strcmp(fstype, "ext2") == 0 || strcmp(fstype, "ext3") == 0)
+            order = ext2_order;
     }
 
-    if (ext4_mount(dev, mountpoint) == 0) {
-        vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext4", target, ext4_unmount, NULL, NULL);
-        return 0;
-    }
-    if (ext2_mount(dev, mountpoint) == 0) {
-        vfs_mount_inplace(mountpoint, saved, dev, dev->name, "ext2", target, ext2_unmount, NULL, NULL);
-        return 0;
-    }
-    if (fat32_mount(dev, mountpoint) == 0) {
-        vfs_mount_inplace(mountpoint, saved, dev, dev->name, "vfat", target, NULL, fat32_unmount, fat32_live_nodes);
-        return 0;
+    /* The lookup reference is ours alone; mounts take their own. */
+    for (; *order; order++) {
+        if (sys_mount_block_try(dev, mountpoint, saved, target, *order)) {
+            block_put(dev);
+            return 0;
+        }
     }
 
     /* All probes failed before touching mountpoint: drop our resolver ref.
      * On success the filesystem adopts the node in place (clearing
      * FS_PERSISTENT), so that reference is what keeps the mounted root alive
      * and must not be dropped. */
+    block_put(dev);
     kfree(saved);
     vfs_close(mountpoint);
     return (uint64_t)-22;

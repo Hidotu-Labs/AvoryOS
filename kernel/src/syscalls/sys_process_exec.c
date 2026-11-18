@@ -4,6 +4,7 @@
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
 #include "../cpu/gdt.h"
+#include "../cpu/features.h"
 #include "../cpu/fpu.h"
 #include "../cpu/msr.h"
 #include "../drivers/storage/nvme.h"
@@ -625,6 +626,12 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   if (ct) {
     ct->fs_base = 0;
     ct->gs_base = 0;
+    if (cpu_has_pku_flag) {
+      wrpkru(0);
+      ct->pkru = 0;
+    }
+    if (ct->mm)
+      ct->mm->pkey_alloc_mask = 1;
   }
 
   // Set the return registers for the syscall exit handler to jump to.

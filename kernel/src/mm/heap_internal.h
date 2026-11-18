@@ -87,6 +87,7 @@ void heap_trace_warn_double(const char *where, void *ptr);
 /* Slab subsystem */
 void heap_slab_init(void);
 void *heap_slab_alloc(size_t size);
+void *heap_slab_alloc_at(size_t size, void *caller);
 bool heap_slab_free(void *ptr, uint64_t page_base);
 size_t heap_slab_ksize(const void *ptr, uint64_t page_base);
 void heap_slab_get_info(char *buf);

@@ -416,8 +416,8 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
   return overall_removed;
 }
 
-int vma_mprotect(struct vma_list *list, uint64_t start, uint64_t end,
-                 uint64_t new_prot) {
+int vma_mprotect_pkey(struct vma_list *list, uint64_t start, uint64_t end,
+                      uint64_t new_prot, int pkey) {
   uint64_t curr = start;
   while (curr < end) {
     struct vma *v = vma_find(list, curr);
@@ -441,6 +441,7 @@ int vma_mprotect(struct vma_list *list, uint64_t start, uint64_t end,
     uint64_t orig_file_size = v->file_size;
     void *vma_file_node = v->file_node;
     uint64_t original_start = v->start;
+    uint8_t target_pkey = (pkey >= 0) ? (uint8_t)(pkey & 0xF) : v->pkey;
     /* Keep the Linux wrapper alive across the remove/re-add: a full-range
      * mprotect drops the last node reference inside vma_remove(), and the
      * re-added node must inherit the wrapper (upstream neither closes the
@@ -461,6 +462,9 @@ int vma_mprotect(struct vma_list *list, uint64_t start, uint64_t end,
     // this segment started relative to the original VMA.
     vma_add(list, m_start, m_end, new_prot, flags, fd,
             offset + rel, vma_file_node, sub_file_size);
+    struct vma *updated = vma_find(list, m_start);
+    if (updated)
+      updated->pkey = target_pkey;
     vma_file_unref(vma_file_node);
     vma_attach_linux(list, m_start, vma_linux_vma);
     vma_linux_put(vma_linux_vma);
@@ -468,6 +472,11 @@ int vma_mprotect(struct vma_list *list, uint64_t start, uint64_t end,
     curr = m_end;
   }
   return 0;
+}
+
+int vma_mprotect(struct vma_list *list, uint64_t start, uint64_t end,
+                 uint64_t new_prot) {
+  return vma_mprotect_pkey(list, start, end, new_prot, -1);
 }
 
 /* ── unmap_mapping_range() support ─────────────────────────────────────── */
@@ -844,6 +853,7 @@ void vma_merge_adjacent(struct vma_list *list) {
     struct vma *cur = arr[i];
     bool can_merge = prev->end == cur->start &&
                      prev->prot == cur->prot && prev->flags == cur->flags &&
+                     prev->pkey == cur->pkey &&
                      prev->numa_policy == cur->numa_policy &&
                      prev->numa_nodemask == cur->numa_nodemask &&
                      prev->numa_preferred_node == cur->numa_preferred_node &&

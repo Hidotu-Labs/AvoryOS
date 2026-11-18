@@ -135,9 +135,10 @@ typedef struct {
   uint32_t total_clusters;      // Total data clusters
   uint32_t cluster_count;       // Number of clusters
   vfs_node_t *root_node;        // VFS node for root directory
-  /* Nodes made by fat32_make_vfs_node() that are not yet released.  Read by
-   * the in-place umount busy check (fat32_live_nodes). */
-  uint32_t live_nodes;
+  /* One for the mount plus one per node made by fat32_make_vfs_node() and
+   * not yet released.  The last fat32_mount_put() frees the state.  While
+   * mounted, refs - 1 is the in-place umount busy count (fat32_live_nodes). */
+  uint32_t refs;
 } fat32_mount_t;
 
 /* Native x86_64 VFAT directory ioctl ABI. Names are lengths, not record sizes. */
@@ -156,9 +157,11 @@ int fat32_read_aliases(vfs_node_t *node, uint32_t index, bool short_only,
 // Returns 0 on success, -1 on failure.
 int fat32_mount(struct block_device *dev, vfs_node_t *mountpoint);
 
-// Release the mount state of a FAT32 root mounted by fat32_mount().  Called by
-// the VFS detach path with the root still attached (root->device names the
-// mount).  FAT32 writes through, so there is no dirty state to flush first.
+// Drop the mount's reference on the state of a FAT32 root mounted by
+// fat32_mount().  Called by the VFS detach path with the root still attached
+// (root->device names the mount), busy or not: the state is freed now if no
+// node is alive, otherwise when the last one is released.  FAT32 writes
+// through, so there is no dirty state to flush first.
 void fat32_unmount(vfs_node_t *root);
 
 // Number of fat32 nodes of this mount still alive (excludes the root node).

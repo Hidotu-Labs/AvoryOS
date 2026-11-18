@@ -50,6 +50,7 @@ extern void linuxkpi_test_phase6_link(void);
 extern void linuxkpi_test_phase6_dcn(void);
 extern void linuxkpi_test_nouveau_compat(void);
 extern void linuxkpi_test_nouveau_firmware_failures(void);
+extern void linuxkpi_test_nouveau_arch_firmware(void);
 
 static struct completion boot_tests_done;
 
@@ -89,6 +90,7 @@ static int linuxkpi_boot_tests_thread(void *arg) {
   linuxkpi_test_phase6_dcn();
   linuxkpi_test_nouveau_compat();
   linuxkpi_test_nouveau_firmware_failures();
+  linuxkpi_test_nouveau_arch_firmware();
 
   complete(&boot_tests_done);
   return 0;

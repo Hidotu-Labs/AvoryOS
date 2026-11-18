@@ -611,6 +611,7 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
   }
 
   struct thread *prev = cpu->current_thread;
+  kstack_check_live(prev);
 
   /* The S3 initiator stays on the BSP while devices are quiesced. Do not
    * switch it out on a timer/yield; callbacks must use interruptible polling
@@ -919,6 +920,13 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
      * is redundant and costs ~150-250 cycles. Only write when it changes. */
     if (!prev || !prev->mm || next_t->gs_base != prev->gs_base) {
       wrmsr(0xC0000102, next_t->gs_base);
+    }
+
+    if (cpu_has_pku_flag) {
+      if (prev && prev->mm)
+        prev->pkru = rdpkru();
+      if (!prev || !prev->mm || next_t->pkru != prev->pkru)
+        wrpkru(next_t->pkru);
     }
 
     spinlock_release(&cpu->queue_lock);

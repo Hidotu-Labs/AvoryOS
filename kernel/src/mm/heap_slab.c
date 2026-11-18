@@ -17,6 +17,47 @@ struct heap_pcpu_cache heap_pcpu_caches[MAX_CPUS][HEAP_PCPU_CLASSES];
 static struct heap_slab_dbg heap_slab_dbg[CACHE_COUNT];
 volatile int heap_slab_dbg_on;
 
+#define HEAP_SITE_SLOTS 256
+struct heap_site_entry {
+  uint64_t caller;
+  uint64_t count64;
+  uint64_t count1024;
+};
+static struct heap_site_entry heap_sites[HEAP_SITE_SLOTS];
+static spinlock_t heap_site_lock = SPINLOCK_INIT;
+
+static void heap_site_record(int cache_idx, void *caller_ptr) {
+  if ((cache_idx != 1 && cache_idx != 5) || !caller_ptr)
+    return;
+  uint64_t caller = (uint64_t)(uintptr_t)caller_ptr;
+  size_t idx = (size_t)((caller >> 4) ^ (caller >> 16)) & (HEAP_SITE_SLOTS - 1);
+  hal_irq_state_t flags = hal_irq_save();
+  spinlock_acquire(&heap_site_lock);
+  for (size_t probe = 0; probe < HEAP_SITE_SLOTS; probe++) {
+    struct heap_site_entry *e = &heap_sites[(idx + probe) & (HEAP_SITE_SLOTS - 1)];
+    if (e->caller == caller || e->caller == 0) {
+      e->caller = caller;
+      if (cache_idx == 1)
+        e->count64++;
+      else
+        e->count1024++;
+      break;
+    }
+  }
+  spinlock_release(&heap_site_lock);
+  hal_irq_restore(flags);
+}
+
+static void heap_u64_to_hex(uint64_t val, char *buf) {
+  static const char hex[] = "0123456789ABCDEF";
+  buf[0] = '0';
+  buf[1] = 'x';
+  for (int i = 0; i < 16; i++) {
+    buf[2 + i] = hex[(val >> ((15 - i) * 4)) & 0xF];
+  }
+  buf[18] = '\0';
+}
+
 void heap_pcpu_flush_all(void);
 
 /* O(1) size class lookup: caches are 32, 64, 128, 256, 512, 1024 bytes (powers of 2).
@@ -392,9 +433,15 @@ void heap_pcpu_flush_all(void) {
 }
 
 void *heap_slab_alloc(size_t size) {
+  return heap_slab_alloc_at(size, __builtin_return_address(0));
+}
+
+void *heap_slab_alloc_at(size_t size, void *caller) {
   int cache_idx = heap_cache_index(size);
   if (__builtin_expect(cache_idx < 0, 0))
     return NULL;
+
+  heap_site_record(cache_idx, caller);
 
   /* Fast path: Per-CPU local magazine for small objects (<= 256 bytes) */
   if (cache_idx < HEAP_PCPU_CLASSES && heap_initialized) {
@@ -631,6 +678,42 @@ void heap_slab_get_info(char *buf) {
     strcat(buf, num_buf);
     strcat(buf, "\n");
     spinlock_release(&c->lock);
+  }
+
+  struct heap_site_entry snap[HEAP_SITE_SLOTS];
+  hal_irq_state_t flags = hal_irq_save();
+  spinlock_acquire(&heap_site_lock);
+  memcpy(snap, heap_sites, sizeof(snap));
+  spinlock_release(&heap_site_lock);
+  hal_irq_restore(flags);
+
+  for (int pass = 0; pass < 2; pass++) {
+    strcat(buf, pass == 0 ? "\nTop 64B Callers:\n" : "\nTop 1024B Callers:\n");
+    for (int top = 0; top < 8; top++) {
+      int best = -1;
+      uint64_t best_cnt = 0;
+      for (int i = 0; i < HEAP_SITE_SLOTS; i++) {
+        uint64_t cnt = pass == 0 ? snap[i].count64 : snap[i].count1024;
+        if (snap[i].caller && cnt > best_cnt) {
+          best = i;
+          best_cnt = cnt;
+        }
+      }
+      if (best < 0)
+        break;
+      char hex_buf[24];
+      heap_u64_to_hex(snap[best].caller, hex_buf);
+      strcat(buf, "  ");
+      strcat(buf, hex_buf);
+      strcat(buf, " count=");
+      heap_u64_to_str(best_cnt, num_buf);
+      strcat(buf, num_buf);
+      strcat(buf, "\n");
+      if (pass == 0)
+        snap[best].count64 = 0;
+      else
+        snap[best].count1024 = 0;
+    }
   }
 }
 

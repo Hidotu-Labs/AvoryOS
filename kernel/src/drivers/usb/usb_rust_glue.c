@@ -216,7 +216,21 @@ int usb_rust_thread_spawn(void (*entry)(void)) {
                                                                        : -1;
 }
 
-void usb_rust_msleep(uint32_t ms) { lapic_timer_sleep(ms); }
+void usb_rust_msleep(uint32_t ms) {
+  if (ms == 0)
+    return;
+  struct thread *self = sched_get_current();
+  if (self && !self->is_idle && lapic_timer_get_ticks() > 0) {
+    self->wakeup_ticks = lapic_timer_get_ms() + ms;
+    self->state = THREAD_SLEEPING;
+    sched_yield();
+    self->wakeup_ticks = 0;
+    if (self->state == THREAD_SLEEPING)
+      self->state = THREAD_RUNNING;
+    return;
+  }
+  lapic_timer_sleep(ms);
+}
 
 uint64_t usb_rust_now_ms(void) { return lapic_timer_get_ms(); }
 

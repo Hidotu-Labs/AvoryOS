@@ -62,6 +62,7 @@ struct vma {
   int numa_policy;
   uint64_t numa_nodemask;
   int numa_preferred_node;
+  uint8_t pkey;
 
   int height; // AVL Balance Height Tracker
   struct vma *left;
@@ -116,6 +117,8 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end);
 // Update protection bits for a range, splitting VMAs if necessary.
 int vma_mprotect(struct vma_list *list, uint64_t start, uint64_t end,
                  uint64_t new_prot);
+int vma_mprotect_pkey(struct vma_list *list, uint64_t start, uint64_t end,
+                      uint64_t new_prot, int pkey);
 
 // Find VMA containing a given address (O(log n))
 struct vma *vma_find(struct vma_list *list, uint64_t addr);

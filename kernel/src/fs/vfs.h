@@ -329,6 +329,16 @@ typedef struct vfs_node {
    * the node avoids an allocation on the last-close path, which must not fail.
    */
   struct vfs_rcu_head rcu;
+
+  /* Page-cache registry link (fs/page_cache.c). Set while the node holds
+   * cached pages, so drop_caches and OOM reclaim reach files that no dentry or
+   * mapping keeps reachable. pc_registered is guarded by pages_lock; pc_link
+   * by the registry lock. */
+  struct list_head pc_link;
+  bool pc_registered;
+  /* lapic ms of the last cache access. The idle trim releases a node's clean
+   * pages once this is old enough. */
+  uint64_t pc_last_ms;
 } vfs_node_t;
 
 extern vfs_node_t *fs_root;
@@ -476,6 +486,25 @@ void vfs_page_cache_tree_init(struct radix_tree *tree);
 vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset);
 vfs_page_t *vfs_cache_insert(vfs_node_t *node, uint32_t offset, uint64_t frame);
 size_t vfs_cache_page_count(void);
+// In-place mount swap: keep a node out of the page-cache registry while its
+// image is overwritten. detach returns whether the node was linked.
+bool vfs_cache_registry_detach(vfs_node_t *node);
+void vfs_cache_registry_attach(vfs_node_t *node, bool linked);
+// Start the idle page-cache trim worker. Call once, after the scheduler is up.
+void vfs_pc_trim_init(void);
+// Start kswapd: pressure-driven background reclaim and writeback. Call once,
+// after the scheduler is up and before memory pressure can build.
+void vfs_pc_kswapd_init(void);
+
+/* Page-cache reclaim and writeback counters, read by /proc/vmstat. */
+struct vfs_pc_stats {
+  uint64_t kswapd_passes;     /* kswapd passes that ran a reclaim walk */
+  uint64_t kswapd_reclaimed;  /* pages kswapd released from clean cache */
+  uint64_t idle_reclaimed;    /* pages the idle trim released */
+  uint64_t writeback_nodes;   /* files visited by a writeback pass */
+  uint64_t writeback_pages;   /* dirty pages written back */
+};
+void vfs_pc_stats_read(struct vfs_pc_stats *out);
 void vfs_cache_invalidate(vfs_node_t *node, uint32_t offset);
 void vfs_cache_invalidate_range(vfs_node_t *node, uint32_t offset,
                                 uint32_t length);
@@ -490,6 +519,8 @@ size_t vfs_cache_reclaim(vfs_node_t *node, size_t target);
 // clean unmapped pages from the current process's mapped files.
 size_t mm_file_cache_reclaim(size_t target);
 size_t vfs_dentry_reclaim_pages(size_t target);
+// Sync dirty pages of every file the dentry cache holds (sync(2), suspend).
+void vfs_dentry_sync_all(void);
 vfs_page_t *vfs_cache_get_or_create(vfs_node_t *node, uint32_t offset);
 void vfs_cache_put(vfs_node_t *node, vfs_page_t *page);
 bool vfs_cache_phase3_stress_test(void);

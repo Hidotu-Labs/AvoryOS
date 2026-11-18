@@ -5,6 +5,8 @@
 #include "../cpu/isr.h"
 #include "../console/console.h"
 #include "../console/klog.h"
+#include "../cpu/features.h"
+#include "../cpu/msr.h"
 #include "../cpu/tsc.h"
 #include "../drivers/timer/hpet.h"
 #include "../drivers/timer/rtc.h"
@@ -25,8 +27,11 @@
 #define PIT_BASE_FREQ  1193182  // PIT oscillator frequency in Hz
 #define CALIBRATION_MS 10       // How long to measure (10 ms)
 
+#define IA32_TSC_DEADLINE 0x6E0U
+
 // State
 static uint32_t          ticks_per_ms      = 0;   // LAPIC decrements per ms
+static bool              use_tsc_deadline  = false;
 static uint64_t          boot_tsc          = 0;
 static uint64_t          boot_mono_ms      = 0;
 static uint64_t          boot_mono_ns      = 0;
@@ -280,10 +285,17 @@ void lapic_timer_init(void) {
     // Register ISR for our timer vector
     register_interrupt_handler(LAPIC_TIMER_VECTOR, lapic_timer_handler);
 
-    // One-shot mode; scheduler and timer users arm the earliest deadline.
-    lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
-    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_ONESHOT | LAPIC_TIMER_VECTOR);
-    klog_puts("[OK] LAPIC Timer started: one-shot (vector ");
+    if (cpu_has_tsc_deadline() && tsc_get_freq_khz() > 0) {
+        use_tsc_deadline = true;
+        lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_TSC | LAPIC_TIMER_VECTOR);
+        __asm__ volatile("mfence" ::: "memory");
+        klog_puts("[OK] LAPIC Timer started: TSC-deadline (vector ");
+    } else {
+        // One-shot mode; scheduler and timer users arm the earliest deadline.
+        lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
+        lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_ONESHOT | LAPIC_TIMER_VECTOR);
+        klog_puts("[OK] LAPIC Timer started: one-shot (vector ");
+    }
     klog_uint64(LAPIC_TIMER_VECTOR);
     klog_puts(")\n");
     lapic_timer_arm_at(monotonic_ms() + LAPIC_SCHED_QUANTUM_MS);
@@ -294,9 +306,14 @@ void lapic_timer_init(void) {
 
 
 void lapic_timer_init_ap(void) {
-    if (ticks_per_ms == 0) return;
-    lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
-    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_ONESHOT | LAPIC_TIMER_VECTOR);
+    if (!use_tsc_deadline && ticks_per_ms == 0) return;
+    if (use_tsc_deadline) {
+        lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_TSC | LAPIC_TIMER_VECTOR);
+        __asm__ volatile("mfence" ::: "memory");
+    } else {
+        lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
+        lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_ONESHOT | LAPIC_TIMER_VECTOR);
+    }
     lapic_timer_arm_at(monotonic_ms() + LAPIC_SCHED_QUANTUM_MS);
 }
 
@@ -345,10 +362,15 @@ void lapic_timer_resume_from_s3(bool slept) {
     }
 
     s3_timer_suspended = false;
-    if (!ticks_per_ms || !lapic_is_ready())
+    if ((!use_tsc_deadline && !ticks_per_ms) || !lapic_is_ready())
         return;
-    lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
-    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_ONESHOT | LAPIC_TIMER_VECTOR);
+    if (use_tsc_deadline) {
+        lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_TSC | LAPIC_TIMER_VECTOR);
+        __asm__ volatile("mfence" ::: "memory");
+    } else {
+        lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
+        lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_ONESHOT | LAPIC_TIMER_VECTOR);
+    }
     struct cpu_info *cpu = cpu_get_current();
     uint64_t deadline = cpu ? cpu->timer_deadline_ms : 0;
     if (!deadline)
@@ -374,9 +396,19 @@ uint64_t lapic_timer_get_boot_tsc(void) {
 
 
 void lapic_timer_arm_at(uint64_t deadline_ms) {
-    if (!ticks_per_ms || !lapic_is_ready()) return;
+    if ((!use_tsc_deadline && !ticks_per_ms) || !lapic_is_ready()) return;
     struct cpu_info *cpu = cpu_get_current();
     if (cpu) cpu->timer_deadline_ms = deadline_ms;
+    if (use_tsc_deadline) {
+        uint64_t khz = tsc_get_freq_khz();
+        uint64_t target_tsc = (deadline_ms > boot_mono_ms)
+                                  ? (boot_tsc + (deadline_ms - boot_mono_ms) * khz)
+                                  : boot_tsc;
+        if (target_tsc == 0)
+            target_tsc = 1;
+        wrmsr(IA32_TSC_DEADLINE, target_tsc);
+        return;
+    }
     lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_ONESHOT | LAPIC_TIMER_VECTOR);
     lapic_write(LAPIC_TIMER_INIT, deadline_to_initial_count(deadline_ms));
 }
