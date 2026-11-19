@@ -345,7 +345,7 @@ static void usb_kbd_decode_report(struct usb_kbd_state *kbd,
     if (buf[0] != 0 && buf[1] == 0 && buf[2] == 0) {
       kbd->report_has_id = true;
       kbd->report_format_known = true;
-      klog_puts("[USB-KBD] HID report has leading Report ID=0x");
+      klog_puts("[USB-KBD] HID report has leading Report ID=");
       klog_hex32(buf[0]);
       klog_puts("\n");
     } else if (buf[1] == 0 && buf[2] >= 4) {
@@ -779,11 +779,11 @@ bool usb_kbd_probe(struct usb_device *dev) {
       struct usb_interface_descriptor *iface =
           (struct usb_interface_descriptor *)&config_buf[offset];
 
-      klog_puts("[USB-KBD] Interface: class=0x");
+      klog_puts("[USB-KBD] Interface: class=");
       klog_hex32(iface->interface_class);
-      klog_puts(" subclass=0x");
+      klog_puts(" subclass=");
       klog_hex32(iface->interface_subclass);
-      klog_puts(" protocol=0x");
+      klog_puts(" protocol=");
       klog_hex32(iface->interface_protocol);
       klog_puts("\n");
 
@@ -818,7 +818,7 @@ bool usb_kbd_probe(struct usb_device *dev) {
         ep_max_packet = ep->max_packet_size;
         ep_interval = ep->interval;
 
-        klog_puts("[USB-KBD] Found Interrupt IN endpoint: addr=0x");
+        klog_puts("[USB-KBD] Found Interrupt IN endpoint: addr=");
         klog_hex32(ep_addr);
         klog_puts(" maxpkt=");
         klog_uint64(ep_max_packet);

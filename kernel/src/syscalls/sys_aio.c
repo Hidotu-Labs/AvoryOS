@@ -490,31 +490,37 @@ static uint64_t sys_timerfd_settime(uint64_t fd, uint64_t flags_arg,
     timerfd_ctx_t *ctx  = (timerfd_ctx_t *)node->device;
     if (!ctx) return (uint64_t)-22;
 
-    if (old_value_ptr &&
-        vmm_is_user_addr_range_valid(old_value_ptr, sizeof(struct itimerspec))) {
-        struct itimerspec *old = (struct itimerspec *)old_value_ptr;
-        old->it_interval_sec  = ctx->interval_sec;
-        old->it_interval_nsec = ctx->interval_nsec;
-        old->it_value_sec     = 0;
-        old->it_value_nsec    = 0;
-    }
+    struct itimerspec nv;
     if (!new_value_ptr ||
-        !vmm_is_user_addr_range_valid(new_value_ptr, sizeof(struct itimerspec)))
+        !is_user_range((const void *)new_value_ptr, sizeof(nv)) ||
+        copy_from_user(&nv, (const void *)new_value_ptr, sizeof(nv)) != 0)
         return (uint64_t)-14;
 
-    struct itimerspec *nv = (struct itimerspec *)new_value_ptr;
+    if (old_value_ptr) {
+        if (!is_user_range((const void *)old_value_ptr, sizeof(struct itimerspec)))
+            return (uint64_t)-14;
+        struct itimerspec kold = {
+            .it_interval_sec  = ctx->interval_sec,
+            .it_interval_nsec = ctx->interval_nsec,
+            .it_value_sec     = 0,
+            .it_value_nsec    = 0,
+        };
+        if (copy_to_user((void *)old_value_ptr, &kold, sizeof(kold)) != 0)
+            return (uint64_t)-14;
+    }
+
     spinlock_acquire(&ctx->lock);
-    ctx->interval_sec  = nv->it_interval_sec;
-    ctx->interval_nsec = nv->it_interval_nsec;
+    ctx->interval_sec  = nv.it_interval_sec;
+    ctx->interval_nsec = nv.it_interval_nsec;
     ctx->expirations   = 0;
 
-    if (nv->it_value_sec == 0 && nv->it_value_nsec == 0) {
+    if (nv.it_value_sec == 0 && nv.it_value_nsec == 0) {
         ctx->expire_ms = 0;
     } else {
         extern uint64_t lapic_timer_get_ms(void);
         extern uint64_t rtc_get_boot_timestamp(void);
         uint64_t lapic_now = lapic_timer_get_ms();
-        uint64_t value_ms  = nv->it_value_sec * 1000 + nv->it_value_nsec / 1000000;
+        uint64_t value_ms  = nv.it_value_sec * 1000 + nv.it_value_nsec / 1000000;
         if (flags_arg & 1) { // TFD_TIMER_ABSTIME
             if (ctx->clockid == 0) {
                 uint64_t boot_unix_ms = rtc_get_boot_timestamp() * 1000;
@@ -546,27 +552,29 @@ static uint64_t sys_timerfd_gettime(uint64_t fd, uint64_t curr_value_ptr,
 
     timerfd_ctx_t *ctx = (timerfd_ctx_t *)t->fds[fd]->device;
     if (!ctx || !curr_value_ptr ||
-        !vmm_is_user_addr_range_valid(curr_value_ptr, sizeof(struct itimerspec)))
+        !is_user_range((const void *)curr_value_ptr, sizeof(struct itimerspec)))
         return (uint64_t)-14;
 
-    struct itimerspec *cv = (struct itimerspec *)curr_value_ptr;
+    struct itimerspec cv;
     spinlock_acquire(&ctx->lock);
-    cv->it_interval_sec  = ctx->interval_sec;
-    cv->it_interval_nsec = ctx->interval_nsec;
+    cv.it_interval_sec  = ctx->interval_sec;
+    cv.it_interval_nsec = ctx->interval_nsec;
     if (ctx->expire_ms == 0) {
-        cv->it_value_sec = 0; cv->it_value_nsec = 0;
+        cv.it_value_sec = 0; cv.it_value_nsec = 0;
     } else {
         extern uint64_t lapic_timer_get_ms(void);
         uint64_t now = lapic_timer_get_ms();
         if (now >= ctx->expire_ms) {
-            cv->it_value_sec = 0; cv->it_value_nsec = 1;
+            cv.it_value_sec = 0; cv.it_value_nsec = 1;
         } else {
             uint64_t remaining_ms  = ctx->expire_ms - now;
-            cv->it_value_sec  = remaining_ms / 1000;
-            cv->it_value_nsec = (remaining_ms % 1000) * 1000000;
+            cv.it_value_sec  = remaining_ms / 1000;
+            cv.it_value_nsec = (remaining_ms % 1000) * 1000000;
         }
     }
     spinlock_release(&ctx->lock);
+    if (copy_to_user((void *)curr_value_ptr, &cv, sizeof(cv)) != 0)
+        return (uint64_t)-14;
     return 0;
 }
 
@@ -1006,7 +1014,7 @@ static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,
 #endif
     const uint64_t PIPE_SUPPORTED_FLAGS = O_CLOEXEC | O_NONBLOCK | O_ASYNC;
     int *pipefd = (int *)pipefd_ptr;
-    if (!pipefd) return (uint64_t)-14;
+    if (!pipefd || !is_user_range(pipefd, sizeof(int) * 2)) return (uint64_t)-14;
     if (flags & ~PIPE_SUPPORTED_FLAGS) return (uint64_t)-22; // EINVAL
 
     struct thread *t = sched_get_current();
@@ -1076,8 +1084,16 @@ static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,
         t->fd_flags[fd_read]  |= FD_FLAGS_CLOEXEC_BIT;
         t->fd_flags[fd_write] |= FD_FLAGS_CLOEXEC_BIT;
     }
-    pipefd[0] = fd_read;
-    pipefd[1] = fd_write;
+    int fds[2] = {fd_read, fd_write};
+    if (copy_to_user(pipefd, fds, sizeof(fds)) != 0) {
+        t->fds[fd_read] = NULL;
+        t->fds[fd_write] = NULL;
+        t->fd_flags[fd_read] = 0;
+        t->fd_flags[fd_write] = 0;
+        vfs_close(read_node);
+        vfs_close(write_node);
+        return (uint64_t)-14;
+    }
     return 0;
 }
 
@@ -1455,8 +1471,13 @@ static uint64_t sys_memfd_create(uint64_t name_ptr, uint64_t flags_arg,
 
     char node_name[128];
     if (name_ptr && is_user_ptr(name_ptr)) {
+        char kname[120];
+        long n = strncpy_from_user(kname, (const char *)name_ptr, sizeof(kname));
+        if (n < 0)
+            return (uint64_t)-14;
+        kname[sizeof(kname) - 1] = '\0';
         strncpy(node_name, "memfd:", 7);
-        strncat(node_name, (const char *)name_ptr, sizeof(node_name) - 8);
+        strncat(node_name, kname, sizeof(node_name) - 8);
         node_name[sizeof(node_name) - 1] = '\0';
     } else {
         strcpy(node_name, "memfd:(anonymous)");

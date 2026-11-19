@@ -109,7 +109,7 @@ static void uhci_irq_handler(struct registers *regs) {
     handled = true;
 
     if (sts & (UHCI_STS_HSE | UHCI_STS_HCPE)) {
-      klog_puts("[UHCI] Fatal Status: 0x");
+      klog_puts("[UHCI] Fatal Status: ");
       klog_hex32(sts);
       klog_puts("\n");
     }
@@ -324,15 +324,15 @@ int uhci_control_transfer(struct uhci_controller *hc, uint8_t addr,
   // 9. Check result
   if (timed_out || (setup_td->status & TD_STATUS_HALTED) ||
       (data_td && (data_td->status & TD_STATUS_HALTED))) {
-    klog_puts("[UHCI] Xfer fail. SETUP=0x");
+    klog_puts("[UHCI] Xfer fail. SETUP=");
     klog_hex32(setup_td->status);
     if (data_td) {
-      klog_puts(" DATA=0x");
+      klog_puts(" DATA=");
       klog_hex32(data_td->status);
     }
-    klog_puts(" STS=0x");
+    klog_puts(" STS=");
     klog_hex32(status_td->status);
-    klog_puts(" USBSTS=0x");
+    klog_puts(" USBSTS=");
     klog_hex32(uhci_read16(hc, UHCI_REG_USBSTS));
     klog_puts("\n");
     // Return TDs to pool

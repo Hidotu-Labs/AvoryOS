@@ -79,6 +79,8 @@ bool ext3_perf_snapshot(unsigned index, struct block_device **dev,
 
 int ext3_journal_start(ext2_mount_t *mnt);
 int ext3_journal_stop(ext2_mount_t *mnt);
+/* Commit every deferred (idle group-commit) handle now: fsync/sync. */
+void ext3_journal_commit_all(void);
 int ext3_journal_block(ext2_mount_t *mnt, uint64_t block_nr, const void *data);
 
 /* True when the active journal transaction holds a newer full-block image of

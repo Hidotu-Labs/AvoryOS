@@ -27,6 +27,7 @@
 // and the signal-handler table instead of sharing a reference-counted object.
 
 #include "../fs/vfs.h"
+#include "../lib/csprng.h"
 #include "../sched/sched.h"
 #include "../socket/epoll.h"
 #include "sys_io_shared.h"
@@ -60,22 +61,40 @@ struct kcmp_epoll_slot {
 extern spinlock_t tid_lock;
 extern struct thread *find_thread_by_tid_locked(uint32_t tid);
 
+static uint64_t kcmp_obfuscate(const void *p) {
+  static uint64_t key = 0;
+  static int key_ready = 0;
+  if (!__atomic_load_n(&key_ready, __ATOMIC_ACQUIRE)) {
+    uint64_t k = 0;
+    csprng_get_bytes(&k, sizeof(k));
+    k |= 1ULL;
+    uint64_t expected = 0;
+    __atomic_compare_exchange_n(&key, &expected, k, false, __ATOMIC_RELEASE,
+                                __ATOMIC_RELAXED);
+    __atomic_store_n(&key_ready, 1, __ATOMIC_RELEASE);
+  }
+  uint64_t x = (uint64_t)(uintptr_t)p ^ __atomic_load_n(&key, __ATOMIC_RELAXED);
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 31;
+  return x;
+}
+
 // 0 when both tokens name the same object, otherwise 1 (a < b) or 2 (a > b).
 static uint64_t kcmp_ident(const void *a, const void *b) {
   if (a == b)
     return 0;
-  return (uintptr_t)a < (uintptr_t)b ? 1 : 2;
+  return kcmp_obfuscate(a) < kcmp_obfuscate(b) ? 1 : 2;
 }
 
-// No ptrace permission model yet; mirror sys_get_robust_list(): the caller may
-// inspect its own task, root may inspect anything, otherwise the owner must
-// match. Target IDs are resolved in the caller's PID namespace.
+// Mirror ptrace_access_allowed(): the caller may inspect its own task,
+// CAP_SYS_PTRACE may inspect any task, otherwise UID/EUID/SUID must match.
 static bool kcmp_may_access(struct thread *current, struct thread *target) {
   if (target == current)
     return true;
   if (capability_has(current, CAP_SYS_PTRACE))
     return true;
-  return target->uid == current->uid || target->euid == current->euid;
+  return target->uid == current->uid && target->uid == target->suid &&
+         target->euid == current->uid && target->euid == target->suid;
 }
 
 // Live node behind fd `idx` of task `t`.  The caller holds tid_lock, which

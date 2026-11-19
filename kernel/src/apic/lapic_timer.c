@@ -415,8 +415,15 @@ void lapic_timer_arm_at(uint64_t deadline_ms) {
 
 void lapic_timer_rearm_if_earlier(uint64_t deadline_ms) {
     struct cpu_info *cpu = cpu_get_current();
+    /* A recorded deadline already in the past means its interrupt was lost
+     * (or is about to land and clear it): treat the timer as unarmed.  Without
+     * this, one dropped tick left timer_deadline_ms stale forever, every later
+     * "earlier?" test failed, and the CPU halted for good with expired
+     * sleepers and READY threads queued on it - the rare Plasma black screen
+     * where plasma_session sat on a dead CPU 0 and never started plasmashell. */
     if (!cpu || cpu->timer_deadline_ms == 0 ||
-        deadline_ms < cpu->timer_deadline_ms)
+        deadline_ms < cpu->timer_deadline_ms ||
+        cpu->timer_deadline_ms <= monotonic_ms())
         lapic_timer_arm_at(deadline_ms);
 }
 

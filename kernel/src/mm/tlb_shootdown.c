@@ -202,6 +202,15 @@ static bool cpu_needs_shootdown(struct cpu_info *cpu, struct cpu_info *self,
 
 #define KERNEL_IMAGE_BASE 0xFFFFFFFF80000000ULL
 
+static uint64_t shootdown_stack_end(uint64_t rsp, const struct thread *thread) {
+    if (!thread || !thread->stack_base || !thread->stack_size ||
+        thread->stack_base > UINT64_MAX - thread->stack_size)
+        return 0;
+
+    uint64_t end = thread->stack_base + thread->stack_size;
+    return rsp >= thread->stack_base && rsp < end ? end : 0;
+}
+
 void tlb_shootdown_handle_ipi_regs(struct registers *regs) {
     struct cpu_info *self = cpu_get_current();
     if (!self)
@@ -249,13 +258,28 @@ void tlb_shootdown_handle_ipi_regs(struct registers *regs) {
         __atomic_store_n(&cpu_shootdown_interrupted_rsp[id], regs->rsp, __ATOMIC_RELAXED);
 
         /* Kernel stacks may live in the HHDM or VMAP, below the linked image
-         * base. Accept the whole kernel half so slow-ack reports can sample
-         * return addresses from those stacks too. */
+         * base. Limit sampling to the allocated stack: regs->rsp may be close
+         * to its top, and scanning a fixed 16 words can cross into unmapped
+         * memory. During a context switch, the old stack remains live until
+         * switch_context clears switching_from. */
+        uint64_t stack_end = 0;
         if ((regs->cs & 3) == 0 && regs->rsp >= KERNEL_SPACE_BASE &&
             regs->rsp < 0xFFFFFFFFFF000000ULL) {
+            stack_end = shootdown_stack_end(regs->rsp, current);
+            if (!stack_end) {
+                struct thread *switching_from =
+                    __atomic_load_n(&self->switching_from, __ATOMIC_ACQUIRE);
+                stack_end = shootdown_stack_end(regs->rsp, switching_from);
+            }
+        }
+
+        if (stack_end) {
             uint64_t *sp = (uint64_t *)regs->rsp;
             int found = 0;
-            for (int i = 0; i < 16 && found < 4; i++) {
+            uint64_t available = (stack_end - regs->rsp) / sizeof(*sp);
+            if (available > 16)
+                available = 16;
+            for (uint64_t i = 0; i < available && found < 4; i++) {
                 uint64_t val = sp[i];
                 if (val >= KERNEL_IMAGE_BASE && val < 0xFFFFFFFFFF000000ULL) {
                     cpu_shootdown_kernel_stack[id][found++] = val;
@@ -513,7 +537,7 @@ void tlb_shootdown_init(void) {
         cpu_shootdown_seen_tid[i] = 0;
     }
     register_interrupt_handler(IPI_VECTOR_TLB_SHOOTDOWN, tlb_shootdown_isr);
-    klog_puts("[TLB] Shootdown IPI handler registered on vector 0x");
+    klog_puts("[TLB] Shootdown IPI handler registered on vector ");
     klog_hex32(IPI_VECTOR_TLB_SHOOTDOWN);
     klog_puts("\n");
 }

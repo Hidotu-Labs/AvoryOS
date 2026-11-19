@@ -194,13 +194,13 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
       if (listener_sock->wait_queue)
         wait_queue_wake_all((wait_queue_t *)listener_sock->wait_queue);
     }
-    if (!logged_stall && now - wait_start >= 3000) {
+    if (!logged_stall && now - wait_start >= 15000) {
       char name[48];
       const char *src = dusk->addr.sun_path[0] ? dusk->addr.sun_path
                                                : dusk->addr.sun_path + 1;
       strncpy(name, src, sizeof(name) - 1);
       name[sizeof(name) - 1] = '\0';
-      klogf("[UNIX] connect blocked >3s: listener %s'%s' owner_pid=%u "
+      klogf("[UNIX] connect blocked >15s: listener %s'%s' owner_pid=%u "
             "queue=%d/%d connector tgid=%u\n",
             dusk->addr.sun_path[0] ? "" : "@", name, dusk->owner_pid,
             dusk->accept_queue_len, dusk->backlog,
@@ -252,7 +252,7 @@ int unix_connect_impl(socket_t *sock, struct sockaddr *addr, int addrlen) {
        * so drop ours first and re-check the queue afterwards. */
       if (__atomic_exchange_n(&unix_stall_dumped, 1, __ATOMIC_RELAXED) == 0) {
         spinlock_release(&listener_sock->lock);
-        lockdiag_dump_all("AF_UNIX connect blocked >3s on a full accept queue");
+        lockdiag_dump_all("AF_UNIX connect blocked >15s on a full accept queue");
         spinlock_acquire(&listener_sock->lock);
         continue;
       }

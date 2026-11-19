@@ -48,6 +48,9 @@ static inline uint64_t zram_pte(uint32_t slot) { return ((uint64_t)slot << 12) |
 #define HHDM_BASE 0xFFFF800000000000ULL
 #define VMAP_BASE 0xFFFFC00000000000ULL
 #define KERNEL_HEAP_BASE 0xFFFFE00000000000ULL
+#define KSTACK_VMAP_BASE 0xFFFFF00000000000ULL
+
+extern bool vmm_initialized;
 
 // To retrieve the active top-level page directory from CR3
 uint64_t *vmm_get_active_pml4(void);
@@ -260,6 +263,7 @@ bool vmm_is_user_addr_range_writable(uint64_t addr, size_t size);
 void vmm_map_signal_trampoline(uint64_t *pml4);
 void vmm_init_vsyscall_page(void);
 void vmm_map_vsyscall_page(uint64_t *pml4);
+bool vmm_emulate_vsyscall(uint64_t fault_addr, struct registers *regs);
 void vmm_update_vdso_data(void);
 uint64_t vmm_get_vsyscall_page_phys(void);
 

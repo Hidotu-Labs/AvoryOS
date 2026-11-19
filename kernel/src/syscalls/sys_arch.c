@@ -9,6 +9,7 @@
 #include "../mm/vma.h"
 #include "../mm/vmm.h"
 #include "../mm/vmm_internal.h"
+#include "../sched/capability.h"
 #include "../sched/sched.h"
 #include "syscall.h"
 #include "../include/arch/uaccess.h"
@@ -26,9 +27,7 @@
 #define IA32_KERNEL_GS_BASE 0xC0000102
 
 static int is_canonical_user_addr(uint64_t addr) {
-  uint64_t sign = (addr >> 47) & 1ULL;
-  uint64_t upper = addr >> 48;
-  return (sign == 0) ? (upper == 0) : (upper == 0xFFFF);
+  return addr < 0x0000800000000000ULL;
 }
 
 // sys_arch_prctl
@@ -74,9 +73,11 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a2,
   case ARCH_GET_FS:
     // addr is a pointer to a uint64_t in userspace where we store the value.
     if (addr) {
-      if (!vmm_is_user_addr_range_valid(addr, sizeof(uint64_t)))
+      if (!is_user_range((const void *)addr, sizeof(uint64_t)))
         return (uint64_t)-14;
-      *(uint64_t *)addr = rdmsr(IA32_FS_BASE);
+      uint64_t val = rdmsr(IA32_FS_BASE);
+      if (copy_to_user((void *)addr, &val, sizeof(val)) != 0)
+        return (uint64_t)-14;
     }
     return 0;
 
@@ -99,9 +100,11 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a2,
 
   case ARCH_GET_GS:
     if (addr) {
-      if (!vmm_is_user_addr_range_valid(addr, sizeof(uint64_t)))
+      if (!is_user_range((const void *)addr, sizeof(uint64_t)))
         return (uint64_t)-14;
-      *(uint64_t *)addr = rdmsr(IA32_KERNEL_GS_BASE);
+      uint64_t val = rdmsr(IA32_KERNEL_GS_BASE);
+      if (copy_to_user((void *)addr, &val, sizeof(val)) != 0)
+        return (uint64_t)-14;
     }
     return 0;
 
@@ -110,8 +113,10 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a2,
     return 0;
 
   case 0x5005: // ARCH_SHSTK_STATUS
-    if (addr && vmm_is_user_addr_range_valid(addr, sizeof(uint64_t))) {
-      *(uint64_t *)addr = 0;
+    if (addr && is_user_range((const void *)addr, sizeof(uint64_t))) {
+      uint64_t zero = 0;
+      if (copy_to_user((void *)addr, &zero, sizeof(zero)) != 0)
+        return (uint64_t)-14;
       return 0;
     }
     return (uint64_t)-14;
@@ -131,27 +136,28 @@ static uint64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr, uint64_t a2,
   (void)a4;
   (void)a5;
 
-  if (!tp_ptr)
+  if (!tp_ptr || !is_user_range((const void *)tp_ptr, 16))
     return (uint64_t)-14; // EFAULT
 
   uint64_t ns = lapic_timer_get_ns();
   uint64_t sec = ns / 1000000000ULL;
   uint64_t nsec = ns % 1000000000ULL;
+  uint64_t ts[2];
 
   switch (clk_id) {
   case 0: // CLOCK_REALTIME
   case 5: // CLOCK_REALTIME_COARSE (map to REALTIME)
-    ((uint64_t *)tp_ptr)[0] = rtc_get_boot_timestamp() + sec;
-    ((uint64_t *)tp_ptr)[1] = nsec;
-    return 0;
+    ts[0] = rtc_get_boot_timestamp() + sec;
+    ts[1] = nsec;
+    return copy_to_user((void *)tp_ptr, ts, sizeof(ts)) ? (uint64_t)-14 : 0;
   case 1: // CLOCK_MONOTONIC
   case 4: // CLOCK_MONOTONIC_RAW
   case 6: // CLOCK_MONOTONIC_COARSE (map to monotonic)
   case 7: // CLOCK_BOOTTIME (map to monotonic for simplicity)
   case 11: // CLOCK_TAI (map to monotonic)
-    ((uint64_t *)tp_ptr)[0] = sec;
-    ((uint64_t *)tp_ptr)[1] = nsec;
-    return 0;
+    ts[0] = sec;
+    ts[1] = nsec;
+    return copy_to_user((void *)tp_ptr, ts, sizeof(ts)) ? (uint64_t)-14 : 0;
   default: {
     /* CPU-time clocks: fixed ids 2/3 name the caller's process/thread, and
      * negative ids are Linux's dynamic clock ids from pthread_getcpuclockid()
@@ -178,9 +184,9 @@ static uint64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr, uint64_t a2,
     if (!sched_get_cpu_time_ms(id, group, user_only, &ms))
       return (uint64_t)-22; // EINVAL (ESRCH on Linux for dead threads)
     uint64_t cpu_ns = ms * 1000000ULL;
-    ((uint64_t *)tp_ptr)[0] = cpu_ns / 1000000000ULL;
-    ((uint64_t *)tp_ptr)[1] = cpu_ns % 1000000000ULL;
-    return 0;
+    ts[0] = cpu_ns / 1000000000ULL;
+    ts[1] = cpu_ns % 1000000000ULL;
+    return copy_to_user((void *)tp_ptr, ts, sizeof(ts)) ? (uint64_t)-14 : 0;
   }
   }
 }
@@ -194,13 +200,13 @@ static uint64_t sys_clock_getres(uint64_t clk_id, uint64_t tp_ptr, uint64_t a2,
   (void)a5;
 
   if (!tp_ptr)
+    return 0; // Linux allows NULL res
+  if (!is_user_range((const void *)tp_ptr, 16))
     return (uint64_t)-14; // EFAULT
 
   // TSC-based clock has ~1ns resolution
-  ((uint64_t *)tp_ptr)[0] = 0;
-  ((uint64_t *)tp_ptr)[1] = 1;
-
-  return 0;
+  uint64_t ts[2] = {0, 1};
+  return copy_to_user((void *)tp_ptr, ts, sizeof(ts)) ? (uint64_t)-14 : 0;
 }
 
 static uint64_t clock_now_ns(uint64_t clk_id) {
@@ -320,16 +326,18 @@ static uint64_t sys_gettimeofday(uint64_t tv_ptr, uint64_t tz_ptr, uint64_t a2,
 
   if (!tv_ptr)
     return 0; // Linux allows NULL tv
+  if (!is_user_range((const void *)tv_ptr, 16))
+    return (uint64_t)-14; // EFAULT
 
   uint64_t ns = lapic_timer_get_ns();
   uint64_t sec = ns / 1000000000ULL;
   uint64_t usec = (ns % 1000000000ULL) / 1000ULL;
 
-  uint64_t *tv = (uint64_t *)tv_ptr;
+  uint64_t tv[2];
   tv[0] = rtc_get_boot_timestamp() + sec; // tv_sec
   tv[1] = usec;                           // tv_usec
 
-  return 0;
+  return copy_to_user((void *)tv_ptr, tv, sizeof(tv)) ? (uint64_t)-14 : 0;
 }
 
 // settimeofday(tv, tz) - syscall 164
@@ -391,10 +399,10 @@ static uint64_t sys_time(uint64_t tloc_ptr, uint64_t a1, uint64_t a2,
   uint64_t sec = rtc_get_boot_timestamp() + (ns / 1000000000ULL);
 
   if (tloc_ptr) {
-    if (tloc_ptr >= 0x8000000000000000ULL) {
+    if (!is_user_range((const void *)tloc_ptr, sizeof(uint64_t)) ||
+        copy_to_user((void *)tloc_ptr, &sec, sizeof(sec)) != 0) {
       return (uint64_t)-14; // EFAULT
     }
-    *(uint64_t *)tloc_ptr = sec;
   }
 
   return sec;
@@ -403,6 +411,7 @@ static uint64_t sys_time(uint64_t tloc_ptr, uint64_t a1, uint64_t a2,
 #define MCL_CURRENT 1
 #define MCL_FUTURE 2
 #define MLOCK_ONFAULT 1
+#define MLOCK_UNPRIV_LIMIT (64ULL * 1024ULL)
 
 struct mlock_vma_range {
   uint64_t start;
@@ -456,6 +465,15 @@ static uint64_t mlock_apply_range(struct thread *thread, uint64_t start,
     return (uint64_t)-12; // ENOMEM
 
   if (lock_pages) {
+    uint64_t bytes = end - start;
+    if (!capability_has_init_ns(thread, CAP_IPC_LOCK)) {
+      spinlock_acquire(&mm->lock);
+      bool over = bytes > MLOCK_UNPRIV_LIMIT ||
+                  mm->mlocked_bytes > MLOCK_UNPRIV_LIMIT - bytes;
+      spinlock_release(&mm->lock);
+      if (over)
+        return (uint64_t)-12; // ENOMEM
+    }
     struct registers synthetic_regs = {0};
     /* mlock makes the covered pages resident. Use the ordinary fault path so
      * demand-zero, file-backed, and compressed pages follow their normal
@@ -504,6 +522,9 @@ static uint64_t mlock_apply_range(struct thread *thread, uint64_t start,
           return (uint64_t)-12;
       }
     }
+    spinlock_acquire(&mm->lock);
+    mm->mlocked_bytes += (end - start);
+    spinlock_release(&mm->lock);
   } else {
     /* Unlocking a range never faults pages in. Clear its markers under the
      * same lock order used by reclaim, so a racing compressor either sees the
@@ -520,6 +541,8 @@ static uint64_t mlock_apply_range(struct thread *thread, uint64_t start,
         *leaf &= ~PAGE_FLAG_MLOCKED;
       vmm_lock_release();
     }
+    uint64_t bytes = end - start;
+    mm->mlocked_bytes = mm->mlocked_bytes > bytes ? mm->mlocked_bytes - bytes : 0;
     spinlock_release(&mm->lock);
   }
   return 0;
@@ -578,6 +601,9 @@ static uint64_t sys_mlockall(uint64_t flags, uint64_t a1, uint64_t a2,
   if ((flags & ~(MCL_CURRENT | MCL_FUTURE)) != 0 ||
       !(flags & (MCL_CURRENT | MCL_FUTURE)))
     return (uint64_t)-22; // EINVAL
+  bool priv = capability_has_init_ns(thread, CAP_IPC_LOCK);
+  if (!priv && (flags & MCL_FUTURE))
+    return (uint64_t)-1; // EPERM
 
   struct mm_struct *mm = thread->mm;
   spinlock_acquire(&mm->lock);
@@ -617,6 +643,22 @@ static uint64_t sys_mlockall(uint64_t flags, uint64_t a1, uint64_t a2,
       mm->mlockall_future = prior_future;
       spinlock_release(&mm->lock);
       return (uint64_t)-12;
+    }
+    if (!priv) {
+      uint64_t total_req = 0;
+      for (size_t i = 0; i < count; i++) {
+        if (!ranges[i].prot)
+          continue;
+        uint64_t seg = ranges[i].end - ranges[i].start;
+        if (seg > MLOCK_UNPRIV_LIMIT - total_req) {
+          kfree(ranges);
+          spinlock_acquire(&mm->lock);
+          mm->mlockall_future = prior_future;
+          spinlock_release(&mm->lock);
+          return (uint64_t)-12;
+        }
+        total_req += seg;
+      }
     }
     for (size_t i = 0; i < count; i++) {
       if (!ranges[i].prot)
@@ -658,6 +700,7 @@ static uint64_t sys_munlockall(uint64_t a0, uint64_t a1, uint64_t a2,
                                 ((uint64_t)pml4_phys & PAGE_MASK));
   spinlock_acquire(&mm->lock);
   mm->mlockall_future = false;
+  mm->mlocked_bytes = 0;
   vmm_lock_acquire_for(pml4_phys, 0);
   for (size_t i = 0; i < 256; i++) {
     if (!(pml4[i] & PAGE_FLAG_PRESENT))
@@ -748,6 +791,8 @@ static uint64_t sys_syslog(uint64_t type, uint64_t bufp, uint64_t len,
   (void)a3;
   (void)a4;
   (void)a5;
+  if (!capability_has_init_ns(sched_get_current(), CAP_SYSLOG))
+    return (uint64_t)-1; // EPERM
   switch (type) {
   case 0: /* SYSLOG_ACTION_CLOSE */
   case 1: /* SYSLOG_ACTION_OPEN */
@@ -765,9 +810,20 @@ static uint64_t sys_syslog(uint64_t type, uint64_t bufp, uint64_t len,
   case 4: /* SYSLOG_ACTION_READ_CLEAR */
     if (len == 0)
       return 0;
-    if (!bufp || !vmm_is_user_addr_range_writable(bufp, (size_t)len))
+    if (!bufp || !is_user_range((const void *)bufp, (size_t)len))
       return (uint64_t)-14; // EFAULT
-    return (uint64_t)klog_ring_read(0, (uint32_t)len, (uint8_t *)bufp);
+    {
+      size_t want = (size_t)len;
+      if (want > 65536)
+        want = 65536;
+      uint8_t *kbuf = (uint8_t *)kmalloc(want);
+      if (!kbuf)
+        return (uint64_t)-12; // ENOMEM
+      uint32_t got = klog_ring_read(0, (uint32_t)want, kbuf);
+      int rc = got ? (copy_to_user((void *)bufp, kbuf, got) != 0 ? -14 : (int)got) : 0;
+      kfree(kbuf);
+      return (uint64_t)(int64_t)rc;
+    }
   default:
     return (uint64_t)-38; /* ENOSYS: unknown syslog action */
   }

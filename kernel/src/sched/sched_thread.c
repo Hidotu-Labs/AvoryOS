@@ -12,12 +12,14 @@
 #include "../fs/procfs.h"
 #include "../fs/vfs.h"
 #include "../fs/mount_namespace.h"
+#include "../lib/csprng.h"
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
 #include "../mm/heap.h"
 #include "../mm/pcid.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
+#include "../cpu/fault.h"
 #include "../cpu/fpu.h"
 #include "../smp/cpu.h"
 #include "../syscalls/syscall.h"
@@ -235,6 +237,9 @@ extern void signal_notify_thread(struct thread *t, int sig);
 #define KSTACK_GLOBAL_POOL_MAX 16
 #define KSTACK_CANARY 0xAFE57AC05AFE57ACULL
 #define KSTACK_CANARY_WORDS 8
+#define KSTACK_GUARD_SIZE PAGE_SIZE
+#define KSTACK_SLOT_STRIDE 0x10000ULL
+#define KSTACK_MAX_SLOTS 4096
 
 struct kstack_cpu_cache {
   void *stacks[KSTACK_CACHE_PER_CPU];
@@ -246,6 +251,103 @@ static struct kstack_cpu_cache kstack_cpu_caches[MAX_CPUS];
 static void *kstack_global_pool[KSTACK_GLOBAL_POOL_MAX];
 static uint32_t kstack_global_count = 0;
 static spinlock_t kstack_global_lock = SPINLOCK_INIT;
+static uint64_t kstack_slot_bitmap[KSTACK_MAX_SLOTS / 64];
+
+static inline bool kstack_is_vmap(uint64_t base, size_t stack_size) {
+  return base >= KSTACK_VMAP_BASE &&
+         base + stack_size <=
+             KSTACK_VMAP_BASE + (uint64_t)KSTACK_MAX_SLOTS * KSTACK_SLOT_STRIDE;
+}
+
+static void *kstack_alloc_backing(size_t stack_size) {
+  size_t pages = stack_size / PAGE_SIZE;
+  if (!vmm_initialized || !vmm_get_kernel_pml4() ||
+      stack_size > KSTACK_SLOT_STRIDE - KSTACK_GUARD_SIZE || pages > 16) {
+    void *phys = pmm_alloc_pages(pages);
+    return phys ? (void *)((uint64_t)phys + pmm_get_hhdm_offset()) : NULL;
+  }
+
+  uint32_t rand_slot = 0;
+  csprng_get_bytes(&rand_slot, sizeof(rand_slot));
+  uint32_t start_word = (rand_slot % KSTACK_MAX_SLOTS) / 64;
+  uint32_t start_bit = rand_slot % 64;
+
+  int slot = -1;
+  spinlock_acquire(&kstack_global_lock);
+  for (uint32_t step = 0; step <= KSTACK_MAX_SLOTS / 64; step++) {
+    uint32_t w = (start_word + step) % (KSTACK_MAX_SLOTS / 64);
+    uint64_t avail = ~kstack_slot_bitmap[w];
+    if (step == 0 && start_bit > 0)
+      avail &= (~0ULL << start_bit);
+    else if (step == KSTACK_MAX_SLOTS / 64) {
+      if (start_bit == 0)
+        break;
+      avail &= ((1ULL << start_bit) - 1ULL);
+    }
+    if (avail) {
+      int bit = __builtin_ctzll(avail);
+      kstack_slot_bitmap[w] |= (1ULL << bit);
+      slot = (int)(w * 64 + (uint32_t)bit);
+      break;
+    }
+  }
+  spinlock_release(&kstack_global_lock);
+  if (slot < 0)
+    return NULL;
+
+  uint64_t va =
+      KSTACK_VMAP_BASE + (uint64_t)slot * KSTACK_SLOT_STRIDE + KSTACK_GUARD_SIZE;
+  void *mapped_phys[16];
+  uint64_t *kpml4 = vmm_get_kernel_pml4();
+  size_t mapped = 0;
+  for (; mapped < pages; mapped++) {
+    void *phys = pmm_alloc_page();
+    if (!phys)
+      break;
+    if (!vmm_map_page(kpml4, va + mapped * PAGE_SIZE, (uint64_t)phys,
+                      PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_NX)) {
+      pmm_free_page(phys);
+      break;
+    }
+    mapped_phys[mapped] = phys;
+  }
+  if (mapped < pages) {
+    for (size_t i = 0; i < mapped; i++) {
+      vmm_unmap_page(kpml4, va + i * PAGE_SIZE);
+      pmm_free_page(mapped_phys[i]);
+    }
+    spinlock_acquire(&kstack_global_lock);
+    kstack_slot_bitmap[(uint32_t)slot / 64] &= ~(1ULL << ((uint32_t)slot % 64));
+    spinlock_release(&kstack_global_lock);
+    return NULL;
+  }
+  return (void *)va;
+}
+
+static void kstack_free_backing(uint64_t stack_base, size_t stack_size) {
+  size_t pages = stack_size / PAGE_SIZE;
+  if (!kstack_is_vmap(stack_base, stack_size)) {
+    void *phys = (void *)(stack_base - pmm_get_hhdm_offset());
+    pmm_free_pages(phys, pages);
+    return;
+  }
+
+  uint64_t *kpml4 = vmm_get_kernel_pml4();
+  for (size_t i = 0; i < pages; i++) {
+    uint64_t va = stack_base + i * PAGE_SIZE;
+    uint64_t phys = vmm_virt_to_phys(kpml4, va);
+    vmm_unmap_page(kpml4, va);
+    if (phys)
+      pmm_free_page((void *)phys);
+  }
+  uint64_t offset = stack_base - KSTACK_VMAP_BASE;
+  uint32_t slot = (uint32_t)(offset / KSTACK_SLOT_STRIDE);
+  if (slot < KSTACK_MAX_SLOTS) {
+    spinlock_acquire(&kstack_global_lock);
+    kstack_slot_bitmap[slot / 64] &= ~(1ULL << (slot % 64));
+    spinlock_release(&kstack_global_lock);
+  }
+}
 
 /* Diagnostic statistics */
 static uint64_t kstack_stat_alloc_cache = 0;
@@ -333,16 +435,27 @@ void kstack_check_live(const struct thread *t) {
   bool canary_ok = kstack_verify_canary((void *)t->stack_base);
   if (canary_ok && words[KSTACK_CANARY_WORDS] == 0)
     return;
+  if (!canary_ok) {
+    __asm__ volatile("cli");
+    klogf("[KSTACK] FATAL: KERNEL STACK OVERFLOW (canary smashed): "
+          "tid=%u comm='%s' stack=%#llx-%#llx word0=%#llx above-canary=%#llx\n",
+          t->tid, t->comm, (unsigned long long)t->stack_base,
+          (unsigned long long)(t->stack_base + t->stack_size),
+          (unsigned long long)words[0],
+          (unsigned long long)words[KSTACK_CANARY_WORDS]);
+    for (;;)
+      __asm__ volatile("hlt");
+  }
   if (__atomic_fetch_add(&kstack_live_reports, 1, __ATOMIC_RELAXED) >= 16)
     return;
-  klogf("[KSTACK] %s: tid=%u comm='%s' stack=%#llx-%#llx phys=%#llx "
-        "word0=%#llx above-canary=%#llx\n",
-        canary_ok ? "kernel stack within 8 bytes of its bottom"
-                  : "KERNEL STACK OVERFLOW (canary smashed)",
+  uint64_t phys = kstack_is_vmap(t->stack_base, t->stack_size)
+                      ? 0
+                      : (t->stack_base - pmm_get_hhdm_offset());
+  klogf("[KSTACK] kernel stack within 8 bytes of its bottom: tid=%u comm='%s' "
+        "stack=%#llx-%#llx phys=%#llx word0=%#llx above-canary=%#llx\n",
         t->tid, t->comm, (unsigned long long)t->stack_base,
         (unsigned long long)(t->stack_base + t->stack_size),
-        (unsigned long long)(t->stack_base - pmm_get_hhdm_offset()),
-        (unsigned long long)words[0],
+        (unsigned long long)phys, (unsigned long long)words[0],
         (unsigned long long)words[KSTACK_CANARY_WORDS]);
 }
 
@@ -371,12 +484,11 @@ void *thread_stack_alloc(void) {
     spinlock_release(&kstack_global_lock);
   }
 
-  /* 3. Slow path: on-demand allocate order-2 physical pages from PMM */
+  /* 3. Slow path: allocate guarded virtual stack backing */
   if (!stack) {
-    void *phys = pmm_alloc_pages(THREAD_STACK_SIZE / PAGE_SIZE);
-    if (!phys)
+    stack = kstack_alloc_backing(THREAD_STACK_SIZE);
+    if (!stack)
       return NULL;
-    stack = (void *)((uint64_t)phys + pmm_get_hhdm_offset());
     __atomic_add_fetch(&kstack_stat_alloc_pmm, 1, __ATOMIC_RELAXED);
   }
 
@@ -393,10 +505,9 @@ void *thread_stack_alloc_sized(size_t stack_size) {
   if (stack_size < THREAD_STACK_SIZE || (stack_size % PAGE_SIZE) != 0)
     return NULL;
 
-  void *phys = pmm_alloc_pages(stack_size / PAGE_SIZE);
-  if (!phys)
+  void *stack = kstack_alloc_backing(stack_size);
+  if (!stack)
     return NULL;
-  void *stack = (void *)((uint64_t)phys + pmm_get_hhdm_offset());
   __atomic_add_fetch(&kstack_stat_alloc_pmm, 1, __ATOMIC_RELAXED);
   memset(stack, 0, stack_size);
   kstack_arm_canary(stack);
@@ -420,9 +531,8 @@ void thread_stack_release(uint64_t stack_base, size_t stack_size,
           "tgid=%u comm='%s' reaped_on_cpu=%u\n",
           stack, owner ? owner->tid : 0, owner ? owner->tgid : 0,
           owner ? owner->comm : "?", cpu ? cpu->cpu_id : UINT32_MAX);
-    /* Corrupted stack: do not recycle into cache, free directly to PMM */
-    void *phys = (void *)(stack_base - pmm_get_hhdm_offset());
-    pmm_free_pages(phys, stack_size / PAGE_SIZE);
+    /* Corrupted stack: do not recycle into cache, unmap & free immediately */
+    kstack_free_backing(stack_base, stack_size);
     __atomic_add_fetch(&kstack_stat_free_pmm, 1, __ATOMIC_RELAXED);
     return;
   }
@@ -430,8 +540,7 @@ void thread_stack_release(uint64_t stack_base, size_t stack_size,
   /* Oversized stacks are private to deep kernel paths and bypass the
    * fixed-size stack caches. */
   if (stack_size != THREAD_STACK_SIZE) {
-    void *phys = (void *)(stack_base - pmm_get_hhdm_offset());
-    pmm_free_pages(phys, stack_size / PAGE_SIZE);
+    kstack_free_backing(stack_base, stack_size);
     __atomic_add_fetch(&kstack_stat_free_pmm, 1, __ATOMIC_RELAXED);
     return;
   }
@@ -461,9 +570,8 @@ void thread_stack_release(uint64_t stack_base, size_t stack_size,
   }
   spinlock_release(&kstack_global_lock);
 
-  /* 3. Cache full: free back to PMM buddy allocator */
-  void *phys = (void *)(stack_base - pmm_get_hhdm_offset());
-  pmm_free_pages(phys, THREAD_STACK_SIZE / PAGE_SIZE);
+  /* 3. Cache full: unmap & free backing pages */
+  kstack_free_backing(stack_base, THREAD_STACK_SIZE);
   __atomic_add_fetch(&kstack_stat_free_pmm, 1, __ATOMIC_RELAXED);
 }
 
@@ -484,8 +592,7 @@ size_t thread_stack_cache_reclaim(size_t max_reclaim) {
     if (!stack)
       break;
 
-    void *phys = (void *)((uint64_t)stack - pmm_get_hhdm_offset());
-    pmm_free_pages(phys, THREAD_STACK_SIZE / PAGE_SIZE);
+    kstack_free_backing((uint64_t)stack, THREAD_STACK_SIZE);
     reclaimed_stacks++;
   }
 
@@ -507,8 +614,7 @@ size_t thread_stack_cache_reclaim(size_t max_reclaim) {
         if (!stack)
           break;
 
-        void *phys = (void *)((uint64_t)stack - pmm_get_hhdm_offset());
-        pmm_free_pages(phys, THREAD_STACK_SIZE / PAGE_SIZE);
+        kstack_free_backing((uint64_t)stack, THREAD_STACK_SIZE);
         reclaimed_stacks++;
       }
     }
@@ -554,6 +660,7 @@ struct thread *sched_create_kernel_thread_sized(void (*entry)(void),
     return NULL;
 
   memset(t, 0, sizeof(struct thread));
+  t->stack_canary = stack_chk_gen_canary();
   spinlock_init(&t->namespace_lock);
   t->start_time_ms = lapic_timer_get_ms();
   if (t->start_time_ms == 0)
@@ -744,6 +851,19 @@ struct thread *sched_get_thread_by_tid(uint32_t tid) {
   return curr;
 }
 
+/* True once a vfork child no longer borrows its parent: it is gone, has
+ * exited, or has dropped CLONE_VFORK (exec/_exit release).  Read under
+ * tid_lock so the child cannot be freed while it is inspected. */
+bool sched_vfork_child_settled(uint32_t tid) {
+  spinlock_acquire(&tid_lock);
+  struct thread *child = find_thread_by_tid_locked(tid);
+  bool settled = !child || child->state == THREAD_ZOMBIE ||
+                 child->state == THREAD_DEAD ||
+                 !(child->clone_flags & 0x00004000 /* CLONE_VFORK */);
+  spinlock_release(&tid_lock);
+  return settled;
+}
+
 bool sched_get_thread_snapshot(uint32_t tid,
                                struct sched_thread_snapshot *snapshot) {
   if (!snapshot)
@@ -768,6 +888,22 @@ bool sched_get_thread_snapshot(uint32_t tid,
   snapshot->runtime_system_ms =
       __atomic_load_n(&t->runtime_system_ms, __ATOMIC_RELAXED);
   snapshot->start_time_ms = t->start_time_ms;
+  if (t->mm) {
+    snapshot->nr_faults = __atomic_load_n(&t->mm->nr_faults, __ATOMIC_RELAXED);
+    snapshot->maj_flt = __atomic_load_n(&t->mm->maj_flt, __ATOMIC_RELAXED);
+    snapshot->fault_cycles =
+        __atomic_load_n(&t->mm->fault_cycles, __ATOMIC_RELAXED);
+    for (int c = 0; c < 3; c++) {
+      snapshot->fault_class_count[c] =
+          __atomic_load_n(&t->mm->fault_class_count[c], __ATOMIC_RELAXED);
+      snapshot->fault_class_cycles[c] =
+          __atomic_load_n(&t->mm->fault_class_cycles[c], __ATOMIC_RELAXED);
+    }
+    snapshot->nr_syscalls =
+        __atomic_load_n(&t->mm->nr_syscalls, __ATOMIC_RELAXED);
+    snapshot->syscall_cycles =
+        __atomic_load_n(&t->mm->syscall_cycles, __ATOMIC_RELAXED);
+  }
   snapshot->uts_namespace_id = uts_namespace_id(t);
   snapshot->ipc_namespace_id = ipc_namespace_id(t);
   snapshot->pid_namespace_id = pid_namespace_id(t);

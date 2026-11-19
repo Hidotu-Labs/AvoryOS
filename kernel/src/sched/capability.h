@@ -13,15 +13,19 @@ struct thread;
 #define CAP_SETPCAP 8
 #define CAP_NET_ADMIN 12
 #define CAP_NET_RAW 13
+#define CAP_IPC_LOCK 14
 #define CAP_SYS_CHROOT 18
 #define CAP_SYS_PTRACE 19
 #define CAP_SYS_ADMIN 21
 #define CAP_SYS_BOOT 22
 #define CAP_SYS_NICE 23
+#define CAP_SYSLOG 34
 #define CAP_LAST_CAP 40
 #define CAP_VALID_MASK ((1ULL << 41) - 1)
 bool capability_has(struct thread *, unsigned);
+bool capability_has_init_ns(struct thread *, unsigned);
 bool capability_ns_has(struct thread *, unsigned);
+bool capability_mount_ns_admin(struct thread *);
 void capability_enter_user_ns(struct thread *);
 void capability_inherit(struct thread *, struct thread *);
 void capability_uid_changed(struct thread *, uint32_t, uint32_t, uint32_t);

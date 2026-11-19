@@ -762,6 +762,8 @@ static void block_node_destroy(vfs_node_t *node) {
 static void block_publish_node(struct block_device *dev) {
   if (!fs_root || !dev)
     return;
+  if (dev->published_root == (void *)fs_root)
+    return; /* already in this root's /dev */
 
   vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
   if (!node)
@@ -785,6 +787,7 @@ static void block_publish_node(struct block_device *dev) {
   node->inode = block_device_userspace_rdev(dev);
 
   devfs_register_node(dev->name, node);
+  dev->published_root = (void *)fs_root;
 }
 
 uint32_t block_device_userspace_rdev(const struct block_device *dev) {
@@ -830,6 +833,7 @@ void block_put(struct block_device *dev) {
 int block_register(struct block_device *dev) {
   if (!dev)
     return -1;
+  dev->published_root = NULL; /* not every driver zeroes its struct */
   spinlock_acquire(&block_table_lock);
   if (num_devices >= BLOCK_MAX_DEVICES) {
     spinlock_release(&block_table_lock);

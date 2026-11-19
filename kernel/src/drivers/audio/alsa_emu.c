@@ -639,7 +639,7 @@ static int alsa_ctl_ioctl_internal(struct vfs_node *node, uint32_t request, uint
         // SYSDIAG triage can extend the seeded mixer instead of guessing.
         {
             static uint32_t miss_logs;
-            if (miss_logs < 8) {
+            if (miss_logs < 8 && KLOG_RATELIMITED_EX("ALSA ELEM_READ miss", 1, 10000)) {
                 miss_logs++;
                 klog_puts("[ALSA] ELEM_INFO miss numid=");
                 klog_uint64(info->id.numid);

@@ -12,6 +12,7 @@
 #include "../lock/spinlock.h"
 #include "../mm/vma.h"
 #include "../sched/sched.h"
+#include "../smp/cpu.h"
 #include "../socket/socket.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -37,6 +38,42 @@ static uint64_t g_fs_miss_total_calls = 0;
 static sysdiag_syscall_error_t g_syscall_errors[SYSDIAG_MAX_SYSCALL_ERRORS];
 static size_t g_syscall_error_count = 0;
 static uint64_t g_syscall_error_total_calls = 0;
+
+/*
+ * Repeat filter for syscall errors.  Every key is reported (and its path
+ * captured) the first time it is seen; after that a repeat only needs its
+ * count.  Hot benign errors (ld.so search-path ENOENT, readlink EINVAL,
+ * non-blocking EAGAIN) reached 600k+ per desktop boot, each paying severity
+ * classification, two global-lock attempts and two strcmp scans of the key
+ * table.  A published key is answered here lock-free with one atomic add;
+ * the report folds those repeats back into the key's count.
+ */
+#define SYSDIAG_SEEN_SLOTS 1024
+static uint64_t g_seen_sig[SYSDIAG_SEEN_SLOTS];
+static uint64_t g_seen_repeats[SYSDIAG_SEEN_SLOTS];
+static uint64_t g_seen_total;
+
+static uint64_t sysdiag_err_sig(uint64_t num, int64_t err, const char *comm) {
+  uint64_t h = 1469598103934665603ULL;
+  for (const char *c = comm; *c; c++)
+    h = (h ^ (uint8_t)*c) * 1099511628211ULL;
+  h ^= num * 0x9E3779B97F4A7C15ULL;
+  h ^= (uint64_t)err * 0xC2B2AE3D27D4EB4FULL;
+  return h | 1; // 0 marks an empty slot
+}
+
+static inline uint32_t sysdiag_seen_slot(uint64_t sig) {
+  return (uint32_t)(sig >> 32) & (SYSDIAG_SEEN_SLOTS - 1);
+}
+
+/* Lock-free repeats of a published key, for report output. */
+static uint64_t sysdiag_seen_repeats(uint64_t num, int64_t err, const char *comm) {
+  uint64_t sig = sysdiag_err_sig(num, err, comm);
+  uint32_t slot = sysdiag_seen_slot(sig);
+  if (__atomic_load_n(&g_seen_sig[slot], __ATOMIC_ACQUIRE) != sig)
+    return 0;
+  return __atomic_load_n(&g_seen_repeats[slot], __ATOMIC_RELAXED);
+}
 static uint64_t g_syscall_error_evictions = 0;
 
 /* Build variable-length diagnostics first, then dispatch each record once so
@@ -291,6 +328,9 @@ void sysdiag_init(void) {
   g_syscall_error_count = 0;
   g_syscall_error_total_calls = 0;
   g_syscall_error_evictions = 0;
+  memset(g_seen_sig, 0, sizeof(g_seen_sig));
+  memset(g_seen_repeats, 0, sizeof(g_seen_repeats));
+  g_seen_total = 0;
   spinlock_release(&g_sysdiag_lock);
 }
 
@@ -842,6 +882,23 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
     return;
   }
 
+  /* Repeat of an already-reported key: count it and stop.  The per-thread
+   * probe markers are consumed exactly as the full path would. */
+  {
+    const char *rcomm = (t && t->comm[0]) ? t->comm : "?";
+    uint64_t sig = sysdiag_err_sig(syscall_num, error_code, rcomm);
+    uint32_t slot = sysdiag_seen_slot(sig);
+    if (__atomic_load_n(&g_seen_sig[slot], __ATOMIC_ACQUIRE) == sig) {
+      if (t) {
+        t->last_access_nonexec_probe = false;
+        __atomic_store_n(&t->seccomp_deny_pending, false, __ATOMIC_RELAXED);
+      }
+      __atomic_add_fetch(&g_seen_repeats[slot], 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&g_seen_total, 1, __ATOMIC_RELAXED);
+      return;
+    }
+  }
+
   uint64_t now_ms = lapic_timer_get_ms();
   bool first_time = false;
   bool severe = sysdiag_is_severe_syscall_error(syscall_num, error_code, regs);
@@ -1098,6 +1155,15 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
           entry = &g_syscall_errors[i];
       }
       g_syscall_error_evictions++;
+      /* The victim's repeats would otherwise keep landing on a key the
+       * report no longer lists. */
+      uint64_t vsig = sysdiag_err_sig(entry->syscall_num, entry->error_code,
+                                      entry->comm);
+      uint32_t vslot = sysdiag_seen_slot(vsig);
+      if (__atomic_load_n(&g_seen_sig[vslot], __ATOMIC_RELAXED) == vsig) {
+        __atomic_store_n(&g_seen_sig[vslot], 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_seen_repeats[vslot], 0, __ATOMIC_RELAXED);
+      }
     }
     memset(entry, 0, sizeof(*entry));
     entry->used = true;
@@ -1155,6 +1221,17 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
         entry->detail[sizeof(entry->detail) - 1] = '\0';
       }
     }
+    /* Publish the key for the lock-free repeat path.  EAGAIN keys keep
+     * the slow path: they sample poll() readiness once a second to catch
+     * stale-readiness spin loops.  A slot owned by another key stays put
+     * (that key just keeps the slow path). */
+    if (error_code != -11) {
+      uint64_t sig = sysdiag_err_sig(syscall_num, error_code, entry->comm);
+      uint32_t slot = sysdiag_seen_slot(sig);
+      uint64_t empty = 0;
+      __atomic_compare_exchange_n(&g_seen_sig[slot], &empty, sig, false,
+                                  __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    }
   }
   spinlock_release(&g_sysdiag_lock);
 
@@ -1165,45 +1242,59 @@ void sysdiag_record_syscall_error(uint64_t syscall_num, int64_t error_code,
         regs && (regs->rdi & (CLONE_NEWCGROUP | CLONE_NEWUSER | CLONE_NEWTIME));
     bool unsupported_strict_check = syscall_num == 54 && error_code == -92 &&
         regs && regs->rsi == 270 && regs->rdx == 12;
-    char line[1536];
+    /* Rate-limit before formatting: a suppressed line costs nothing. */
+    if (!KLOG_RATELIMITED("SYSDIAG syscall error"))
+      return;
+    /* Per-CPU line buffer, filled with IRQs off: this runs on every failed
+     * syscall, and 1.5 KiB on the 16 KiB guard-less kernel stack on top of a
+     * deep syscall frame is how kernel stacks overflow into user pages. */
+    static char sysdiag_lines[MAX_CPUS][1536];
+    hal_irq_state_t line_irq = hal_irq_save();
+    struct cpu_info *line_cpu = cpu_get_current();
+    uint32_t line_idx = line_cpu ? line_cpu->cpu_id : 0;
+    if (line_idx >= MAX_CPUS)
+      line_idx = 0;
+    char *line = sysdiag_lines[line_idx];
+    const size_t line_cap = sizeof(sysdiag_lines[0]);
     size_t line_len = 0;
-    sysdiag_appendf(line, sizeof(line), &line_len, "%s%s(#%llu) returned -%llu",
+    sysdiag_appendf(line, line_cap, &line_len, "%s%s(#%llu) returned -%llu",
         unsupported_namespace
             ? KLOG_CLR_YELLOW "[SYSDIAG] UNSUPPORTED NAMESPACES: " KLOG_CLR_RESET
             : KLOG_CLR_YELLOW "[SYSDIAG] SYSCALL ERROR: " KLOG_CLR_RESET,
         sname ? sname : "syscall", (unsigned long long)syscall_num,
         (unsigned long long)-error_code);
     if (ename)
-      sysdiag_appendf(line, sizeof(line), &line_len, " (%s)", ename);
+      sysdiag_appendf(line, line_cap, &line_len, " (%s)", ename);
     if (via_seccomp)
-      sysdiag_appendf(line, sizeof(line), &line_len,
+      sysdiag_appendf(line, line_cap, &line_len,
           " via seccomp deny (the handler never ran; errno came from the caller's own filter)");
-    sysdiag_appendf(line, sizeof(line), &line_len, " called by comm='%s' pid=%u",
+    sysdiag_appendf(line, line_cap, &line_len, " called by comm='%s' pid=%u",
                     comm, t ? t->tgid : 0);
     if (regs) {
-      sysdiag_appendf(line, sizeof(line), &line_len,
+      sysdiag_appendf(line, line_cap, &line_len,
           " args=(0x%016llX, 0x%016llX, 0x%016llX, 0x%016llX, 0x%016llX, 0x%016llX)",
           (unsigned long long)regs->rdi, (unsigned long long)regs->rsi,
           (unsigned long long)regs->rdx, (unsigned long long)regs->r10,
           (unsigned long long)regs->r8, (unsigned long long)regs->r9);
     }
-    sysdiag_appendf(line, sizeof(line), &line_len, " rip=0x%016llX",
+    sysdiag_appendf(line, line_cap, &line_len, " rip=0x%016llX",
                     (unsigned long long)(regs ? regs->rip : 0));
     if (cap_path[0])
-      sysdiag_appendf(line, sizeof(line), &line_len, " path='%s'", cap_path);
+      sysdiag_appendf(line, line_cap, &line_len, " path='%s'", cap_path);
     if (cap_attr[0])
-      sysdiag_appendf(line, sizeof(line), &line_len, " xattr='%s'", cap_attr);
+      sysdiag_appendf(line, line_cap, &line_len, " xattr='%s'", cap_attr);
     if (unsupported_namespace)
-      sysdiag_appendf(line, sizeof(line), &line_len,
+      sysdiag_appendf(line, line_cap, &line_len,
                       " reason='requested namespace isolation is not implemented'");
     if (unsupported_strict_check)
-      sysdiag_appendf(line, sizeof(line), &line_len,
+      sysdiag_appendf(line, line_cap, &line_len,
           " option='NETLINK_GET_STRICT_CHK' reason='strict Netlink request validation is not implemented'");
     if (syscall_num == 9 && error_code == -22 && regs && !regs->rsi)
-      sysdiag_appendf(line, sizeof(line), &line_len,
+      sysdiag_appendf(line, line_cap, &line_len,
                       " reason='zero-length mapping requested'");
-    sysdiag_appendf(line, sizeof(line), &line_len, "\n");
+    sysdiag_appendf(line, line_cap, &line_len, "\n");
     klogf("%s", line);
+    hal_irq_restore(line_irq);
   }
 }
 
@@ -1439,7 +1530,8 @@ void sysdiag_dump_report(void) {
     sd_put("[SYSDIAG] recent / frequent syscall errors (tracked keys: ");
     sd_dec(g_syscall_error_count);
     sd_put(", total errors: ");
-    sd_dec(g_syscall_error_total_calls);
+    sd_dec(g_syscall_error_total_calls +
+           __atomic_load_n(&g_seen_total, __ATOMIC_RELAXED));
     sd_put(", evicted keys: ");
     sd_dec(g_syscall_error_evictions);
     sd_put("):\n");
@@ -1462,7 +1554,8 @@ void sysdiag_dump_report(void) {
       if (e->via_seccomp)
         sd_put(" via-seccomp-deny");
       sd_put(" count=");
-      sd_dec(e->total_calls);
+      sd_dec(e->total_calls +
+             sysdiag_seen_repeats(e->syscall_num, e->error_code, e->comm));
       sd_put(" comm='");
       sd_put(e->comm[0] ? e->comm : "?");
       sd_put("' pid=");
@@ -1723,7 +1816,8 @@ size_t sysdiag_format_report(char *buf, size_t max_size) {
     p = b_write(buf, max_size, p, "\nRecent / Frequent Syscall Errors (unique: ");
     p = b_dec(buf, max_size, p, g_syscall_error_count);
     p = b_write(buf, max_size, p, ", total: ");
-    p = b_dec(buf, max_size, p, g_syscall_error_total_calls);
+    p = b_dec(buf, max_size, p, g_syscall_error_total_calls +
+              __atomic_load_n(&g_seen_total, __ATOMIC_RELAXED));
     p = b_write(buf, max_size, p, "):\n");
     for (size_t i = 0; i < g_syscall_error_count && p + 256 < max_size; i++) {
       sysdiag_syscall_error_t *e = &g_syscall_errors[i];
@@ -1744,7 +1838,8 @@ size_t sysdiag_format_report(char *buf, size_t max_size) {
       if (e->via_seccomp)
         p = b_write(buf, max_size, p, " via-seccomp-deny");
       p = b_write(buf, max_size, p, " count=");
-      p = b_dec(buf, max_size, p, e->total_calls);
+      p = b_dec(buf, max_size, p, e->total_calls +
+                sysdiag_seen_repeats(e->syscall_num, e->error_code, e->comm));
       p = b_write(buf, max_size, p, " comm='");
       p = b_write(buf, max_size, p, e->comm[0] ? e->comm : "?");
       p = b_write(buf, max_size, p, "' pid=");

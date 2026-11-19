@@ -630,12 +630,29 @@ int ext3_journal_block(ext2_mount_t *mnt, uint64_t block_nr, const void *data) {
   if (!mnt || mnt->read_only)
     return -30;
   ext3_journal_state_t *trans = ext3_journal_state(mnt);
-  if (!trans->active)
-    return ext2_write_block(mnt, block_nr, data);
   struct thread *current = sched_get_current();
   uint32_t tid = current ? current->tid : 0;
-  if (__atomic_load_n(&trans->owner_tid, __ATOMIC_RELAXED) != tid ||
-      trans->io_failed)
+  bool owned = __atomic_load_n(&trans->active, __ATOMIC_ACQUIRE) &&
+               __atomic_load_n(&trans->owner_tid, __ATOMIC_RELAXED) == tid;
+  if (!owned) {
+    /* No journal on this mount (or not loaded yet): plain home write. */
+    if (!(mnt->sb.s_feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL) ||
+        !trans->journal_blocks)
+      return ext2_write_block(mnt, block_nr, data);
+    /* A caller outside any handle.  A direct home write here used to race
+     * the deferred group commit: lookups prefer the closed image, and its
+     * later checkpoint overwrote this write (symlinks created by pacman
+     * vanished).  Journal it in an implicit one-block handle instead. */
+    if (ext3_journal_start(mnt) != 0)
+      return -1;
+    int rc = -1;
+    if (__atomic_load_n(&trans->active, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&trans->owner_tid, __ATOMIC_RELAXED) == tid)
+      rc = ext3_journal_block(mnt, block_nr, data);
+    int stop = ext3_journal_stop(mnt);
+    return rc ? rc : stop;
+  }
+  if (trans->io_failed)
     return -1;
 
   if (block_nr >= mnt->blocks_count ||
@@ -669,15 +686,11 @@ int ext3_journal_block(ext2_mount_t *mnt, uint64_t block_nr, const void *data) {
   /* A completed coherent cache image equal to this metadata needs no new
    * journal or home write. In-flight writes and cache collisions are never
    * evidence of an unchanged disk block. */
-  uint32_t idx = (uint32_t)(block_nr % EXT2_CACHE_SIZE);
   /* A closed handle may hold a newer image than home: restoring the old home
    * content is then a real change and must be staged, not dropped. */
   bool in_closed = ext3_find_closed(trans, block_nr) != NULL;
-  spinlock_acquire(&mnt->cache_lock);
-  bool unchanged = !in_closed && mnt->cache[idx].num == block_nr &&
-                   mnt->cache[idx].data && !mnt->cache[idx].writes_inflight &&
-                   memcmp(mnt->cache[idx].data, data, mnt->block_size) == 0;
-  spinlock_release(&mnt->cache_lock);
+  bool unchanged = !in_closed &&
+                   ext2_bc_matches(mnt, block_nr, data);
   if (unchanged) {
     trans->metadata_unchanged++;
     return 0;
@@ -805,18 +818,49 @@ static bool ext3_has_waiters(ext3_journal_state_t *trans) {
   return __atomic_load_n(&trans->waiters.head, __ATOMIC_RELAXED) != NULL;
 }
 
-static bool ext3_should_defer(ext2_mount_t *mnt, ext3_journal_state_t *trans) {
-  if (!trans->closed_count || !ext3_has_waiters(trans))
-    return false;
+/*
+ * Idle (timed) group commit.  A lone writer used to commit synchronously at
+ * every handle stop: each create/link/write paid descriptor + payload + commit
+ * + checkpoint + superblock writes, so unpacking thousands of files (git
+ * checkout, pacman) was bound by journal round trips.  When the flusher thread
+ * runs, an uncontended stop may leave its images in the closed set for up to
+ * EXT3_IDLE_MAX_AGE_MS / EXT3_IDLE_MAX_HANDLES; the flusher, the next
+ * non-deferring stop, or fsync/sync commits them.  Readers already see closed
+ * images through ext3_journal_read_staged(), so visibility is unchanged; only
+ * the durability point moves (bounded, like jbd2's commit interval).
+ */
+#define EXT3_IDLE_MAX_HANDLES 512u
+#define EXT3_IDLE_MAX_AGE_MS 1000u
+#define EXT3_FLUSH_PERIOD_MS 100u
+static volatile int ext3_flusher_up;
+static volatile int ext3_flusher_starting;
+static void ext3_flusher_ensure(void);
+
+enum ext3_defer_kind { EXT3_DEFER_NONE, EXT3_DEFER_WAITERS, EXT3_DEFER_IDLE };
+
+static enum ext3_defer_kind ext3_should_defer(ext2_mount_t *mnt,
+                                              ext3_journal_state_t *trans) {
+  if (!trans->closed_count)
+    return EXT3_DEFER_NONE;
   uint32_t tagcap = ext3_tag_capacity(mnt);
   if (!tagcap || trans->closed_count > EXT3_JOURNAL_SEG_MAX * tagcap / 4)
-    return false; /* leave room: the next handle must still fit */
-  if (trans->closed_handles >= EXT3_GROUP_MAX_HANDLES)
-    return false;
-  if (trans->closed_handles &&
-      lapic_timer_get_ms() - trans->closed_since_ms >= EXT3_GROUP_MAX_AGE_MS)
-    return false;
-  return true;
+    return EXT3_DEFER_NONE; /* leave room: the next handle must still fit */
+  uint64_t age = trans->closed_handles
+                     ? lapic_timer_get_ms() - trans->closed_since_ms
+                     : 0;
+  if (ext3_has_waiters(trans)) {
+    if (trans->closed_handles >= EXT3_GROUP_MAX_HANDLES ||
+        age >= EXT3_GROUP_MAX_AGE_MS)
+      return EXT3_DEFER_NONE;
+    return EXT3_DEFER_WAITERS;
+  }
+  ext3_flusher_ensure();
+  if (!__atomic_load_n(&ext3_flusher_up, __ATOMIC_ACQUIRE))
+    return EXT3_DEFER_NONE;
+  if (trans->closed_handles >= EXT3_IDLE_MAX_HANDLES ||
+      age >= EXT3_IDLE_MAX_AGE_MS)
+    return EXT3_DEFER_NONE;
+  return EXT3_DEFER_IDLE;
 }
 
 /* Moves the running handle's images into the closed set, keeping only the
@@ -976,7 +1020,7 @@ static int ext3_commit_io_batch(ext2_mount_t *mnt, ext2_block_write_t *batch,
     return 0;
   uint32_t n = *count;
   *count = 0;
-  return ext2_write_blocks_batch(mnt, batch, n);
+  return ext2_write_blocks_batch_nocache(mnt, batch, n);
 }
 
 /* Like ext3_commit_io_batch(), but reports the first failed block (in
@@ -1065,7 +1109,8 @@ static int ext3_commit_closed(ext2_mount_t *mnt, ext3_journal_state_t *trans) {
         }
         memcpy(trans->desc_block_buf, entry->image, mnt->block_size);
         memset(trans->desc_block_buf, 0, sizeof(uint32_t));
-        if (ext2_write_block(mnt, phys, trans->desc_block_buf) != 0) {
+        if (ext2_write_block_nocache(mnt, phys, trans->desc_block_buf, NULL,
+                                     NULL) != 0) {
           payload_failed = true;
           break;
         }
@@ -1154,7 +1199,7 @@ static int ext3_commit_closed(ext2_mount_t *mnt, ext3_journal_state_t *trans) {
     }
     trans->phase = "commit-descriptor-map";
     uint64_t desc_phys = ext3_journal_phys(mnt, ext3_desc_pos(index - 1, tagcap));
-    if (!desc_phys || ext2_write_block_traced(mnt, desc_phys, desc,
+    if (!desc_phys || ext2_write_block_nocache(mnt, desc_phys, desc,
                             &trans->phase, descriptor_stages) != 0) {
       trans->io_failed = true;
       return ext3_commit_done(mnt, trans, -1);
@@ -1168,7 +1213,7 @@ static int ext3_commit_closed(ext2_mount_t *mnt, ext3_journal_state_t *trans) {
   ch->h_blocktype = __builtin_bswap32(JBD_COMMIT_BLOCK);
   ch->h_sequence = __builtin_bswap32(trans->sequence);
   trans->phase = "commit-record";
-  if (ext2_write_block(mnt, commit_phys, commit_buf) != 0) {
+  if (ext2_write_block_nocache(mnt, commit_phys, commit_buf, NULL, NULL) != 0) {
     trans->io_failed = true;
     return ext3_commit_done(mnt, trans, -1);
   }
@@ -1275,8 +1320,10 @@ static int ext3_journal_stop_impl(ext2_mount_t *mnt, bool allow_defer) {
     ext3_discard_write_set(mnt, trans); /* this handle only */
 
   bool deferred = false;
+  enum ext3_defer_kind kind = EXT3_DEFER_NONE;
   if (trans->closed_count) {
-    if (allow_defer && ext3_should_defer(mnt, trans)) {
+    if (allow_defer && rc == 0 &&
+        (kind = ext3_should_defer(mnt, trans)) != EXT3_DEFER_NONE) {
       if (!trans->closed_handles)
         trans->closed_since_ms = lapic_timer_get_ms();
       trans->closed_handles++;
@@ -1292,7 +1339,8 @@ static int ext3_journal_stop_impl(ext2_mount_t *mnt, bool allow_defer) {
   /* The queue head we saw may have been a dead or cancelled waiter, in which
    * case the lock just went idle with a chain still uncommitted. Close it
    * with an empty handle that must not defer again. */
-  if (deferred && __atomic_load_n(&trans->closed_count, __ATOMIC_RELAXED) &&
+  if (deferred && kind == EXT3_DEFER_WAITERS &&
+      __atomic_load_n(&trans->closed_count, __ATOMIC_RELAXED) &&
       !__atomic_load_n(&trans->active, __ATOMIC_ACQUIRE)) {
     if (ext3_journal_start(mnt) == 0)
       (void)ext3_journal_stop_impl(mnt, false);
@@ -1302,6 +1350,61 @@ static int ext3_journal_stop_impl(ext2_mount_t *mnt, bool allow_defer) {
 
 int ext3_journal_stop(ext2_mount_t *mnt) {
   return ext3_journal_stop_impl(mnt, true);
+}
+
+extern ext2_mount_t *ext2_active_mounts;
+extern spinlock_t ext2_mounts_lock;
+
+#define EXT3_FLUSH_MAX_MOUNTS 16u
+
+/* Commit deferred handles: all of them (force) or those older than the idle
+ * age.  An empty handle that may not defer closes the chain. */
+static void ext3_commit_deferred(bool force) {
+  ext2_mount_t *mounts[EXT3_FLUSH_MAX_MOUNTS];
+  uint32_t n = 0;
+  spinlock_acquire(&ext2_mounts_lock);
+  for (ext2_mount_t *m = ext2_active_mounts; m && n < EXT3_FLUSH_MAX_MOUNTS;
+       m = m->next)
+    mounts[n++] = m;
+  spinlock_release(&ext2_mounts_lock);
+  for (uint32_t i = 0; i < n; i++) {
+    ext2_mount_t *m = mounts[i];
+    if (m->read_only)
+      continue;
+    ext3_journal_state_t *trans = ext3_journal_state(m);
+    if (!__atomic_load_n(&trans->closed_count, __ATOMIC_RELAXED))
+      continue;
+    if (!force &&
+        lapic_timer_get_ms() - trans->closed_since_ms < EXT3_IDLE_MAX_AGE_MS)
+      continue;
+    if (ext3_journal_start(m) == 0)
+      (void)ext3_journal_stop_impl(m, false);
+  }
+}
+
+void ext3_journal_commit_all(void) {
+  ext3_commit_deferred(true);
+}
+
+static void ext3_flusher_worker(void) {
+  struct thread *self = sched_get_current();
+  __atomic_store_n(&ext3_flusher_up, 1, __ATOMIC_RELEASE);
+  for (;;) {
+    self->state = THREAD_SLEEPING;
+    self->wakeup_ticks = lapic_timer_get_ticks() + EXT3_FLUSH_PERIOD_MS;
+    sched_yield();
+    self->wakeup_ticks = 0;
+    self->state = THREAD_RUNNING;
+    ext3_commit_deferred(false);
+  }
+}
+
+static void ext3_flusher_ensure(void) {
+  if (__atomic_load_n(&ext3_flusher_up, __ATOMIC_ACQUIRE) ||
+      __atomic_exchange_n(&ext3_flusher_starting, 1, __ATOMIC_ACQ_REL))
+    return;
+  if (!sched_create_kernel_thread(ext3_flusher_worker, NULL, true))
+    klog_puts("[JBD2] idle group commit off: no flusher thread\n");
 }
 
 static int ext3_recover_journal(ext2_mount_t *mnt, jbd_superblock_t *jsb,

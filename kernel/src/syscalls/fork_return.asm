@@ -1,5 +1,7 @@
 global fork_return_to_userspace
 extern cpu_has_fred_flag
+extern cpu_md_clear_active
+extern cpu_verw_ds
 
 section .text
 
@@ -47,6 +49,11 @@ fork_return_to_userspace:
 
     ; Set up sysret registers
     mov rcx, [rax + 104]    ; RCX = user RIP (sysret jumps here)
+    mov r11, 0x00007FFFFFFFFFFF
+    cmp rcx, r11
+    jbe .sysret_rip_ok
+    xor ecx, ecx
+.sysret_rip_ok:
     mov r11, [rax + 112]    ; R11 = user RFLAGS (sysret loads this)
 
     ; Mask interrupts BEFORE the user RSP is loaded.  Interrupts may be
@@ -67,6 +74,11 @@ fork_return_to_userspace:
 
     ; Swap GS: put user GS (0) into active, save kernel GS base
     swapgs
+
+    cmp byte [rel cpu_md_clear_active], 0
+    je .skip_verw_fork_sysret
+    verw word [rel cpu_verw_ds]
+.skip_verw_fork_sysret:
 
     ; Return to user mode
     o64 sysret
@@ -96,6 +108,10 @@ fork_return_to_userspace:
     mov rdi, [rax + 152]
     mov rax, [rax + 48]
     swapgs
+    cmp byte [rel cpu_md_clear_active], 0
+    je .skip_verw_fork_iret
+    verw word [rel cpu_verw_ds]
+.skip_verw_fork_iret:
     iretq
 
 .fred_eretu:
@@ -126,6 +142,10 @@ fork_return_to_userspace:
     mov rcx, [rax + 104]
     mov r11, [rax + 112]
     mov rax, [rax + 48]
+    cmp byte [rel cpu_md_clear_active], 0
+    je .skip_verw_fork_fred64
+    verw word [rel cpu_verw_ds]
+.skip_verw_fork_fred64:
     eretu
 
 .fred_compat_regs:
@@ -137,4 +157,8 @@ fork_return_to_userspace:
     mov rsi, [rax + 144]
     mov rdi, [rax + 152]
     mov rax, [rax + 48]
+    cmp byte [rel cpu_md_clear_active], 0
+    je .skip_verw_fork_fred32
+    verw word [rel cpu_verw_ds]
+.skip_verw_fork_fred32:
     eretu

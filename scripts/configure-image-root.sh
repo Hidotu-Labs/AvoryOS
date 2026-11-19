@@ -124,6 +124,20 @@ if [ -d "${ROOTFS_DIR}/usr/share/glib-2.0/schemas" ]; then
         echo "Warning: glib-compile-schemas not found on the host; GSettings will be unavailable" >&2
     fi
 fi
+# Rootless extraction also skips the glibc ldconfig hook, leaving a stale
+# /etc/ld.so.cache that names only a few dozen libraries. ld.so then walks the
+# whole search path for every other DT_NEEDED entry, costing thousands of
+# failed openat() calls per Xorg/SDDM/Plasma start. Rebuild it from the rootfs
+# (-X: cache only, never touch the package-owned soname links).
+LDSO_CACHE=""
+if [ -f "${ROOTFS_DIR}/etc/ld.so.conf" ]; then
+    if command -v ldconfig >/dev/null 2>&1 &&
+       ldconfig -X -r "${ROOTFS_DIR}" && [ -s "${ROOTFS_DIR}/etc/ld.so.cache" ]; then
+        LDSO_CACHE="${ROOTFS_DIR}/etc/ld.so.cache"
+    else
+        echo "Warning: could not rebuild /etc/ld.so.cache; library loading will be slow" >&2
+    fi
+fi
 {
     cat <<EOF
 rm bin/sh
@@ -214,6 +228,9 @@ EOF
             'rm usr/share/glib-2.0/schemas/gschemas.compiled' \
             "write ${GSCHEMAS_COMPILED} usr/share/glib-2.0/schemas/gschemas.compiled"
     fi
+    if [ -n "${LDSO_CACHE}" ]; then
+        printf '%s\n' 'rm etc/ld.so.cache' "write ${LDSO_CACHE} etc/ld.so.cache"
+    fi
     # fusermount3 mounts FUSE filesystems for ordinary users (xdg-document-
     # portal, gvfsd-fuse, AppImages) and relies on being setuid root: without
     # it mount(2) fails the CAP_SYS_ADMIN check and the caller sees EPERM.
@@ -244,6 +261,14 @@ done
 if [ -n "${GSCHEMAS_COMPILED}" ]; then
     if ! debugfs -R "stat /usr/share/glib-2.0/schemas/gschemas.compiled" "${IMAGE}" >/dev/null 2>&1; then
         echo "Could not install /usr/share/glib-2.0/schemas/gschemas.compiled into the image" >&2
+        exit 1
+    fi
+fi
+
+if [ -n "${LDSO_CACHE}" ]; then
+    want="$(stat -c %s "${LDSO_CACHE}")"
+    if ! debugfs -R "stat /etc/ld.so.cache" "${IMAGE}" 2>/dev/null | grep -Eq "Size:[[:space:]]+${want}([[:space:]]|$)"; then
+        echo "Could not install /etc/ld.so.cache (${want} bytes) into the image" >&2
         exit 1
     fi
 fi

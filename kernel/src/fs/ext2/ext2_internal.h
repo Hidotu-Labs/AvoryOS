@@ -37,6 +37,9 @@ typedef struct {
 
 int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
                             uint32_t count);
+int ext2_write_blocks_batch_nocache(ext2_mount_t *mnt,
+                                    ext2_block_write_t *entries,
+                                    uint32_t count);
 
 int  ext2_write_superblock(ext2_mount_t *mnt);
 int  ext2_write_bgdt(ext2_mount_t *mnt);
@@ -99,6 +102,7 @@ bool             ext2_dir_is_empty(ext2_mount_t *mnt, uint32_t inode_num);
 
 struct dirent   *ext2_readdir_impl(vfs_node_t *node, uint64_t cookie);
 vfs_node_t      *ext2_finddir_impl(vfs_node_t *node, char *name);
+vfs_node_t      *ext2_finddir_vfs(vfs_node_t *node, char *name);
 int              ext2_create_impl(vfs_node_t *node, char *name, uint16_t permission);
 int              ext2_mkdir_impl(vfs_node_t *node, char *name, uint16_t permission);
 
@@ -118,6 +122,7 @@ int ext2_unlink_impl(vfs_node_t *node, char *name);
 int ext2_rmdir_impl(vfs_node_t *node, char *name);
 int ext2_readlink_impl(vfs_node_t *node, char *buf, uint32_t size);
 int ext2_symlink_impl(vfs_node_t *node, char *name, char *target);
+int ext2_link_impl(vfs_node_t *dir, char *name, vfs_node_t *target);
 int ext2_rename_impl(vfs_node_t *node, char *old_name, char *new_name);
 int ext2_rename_cross(vfs_node_t *old_parent, char *old_name,
                       vfs_node_t *new_parent, char *new_name);

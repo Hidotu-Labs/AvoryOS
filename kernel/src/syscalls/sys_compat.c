@@ -369,7 +369,6 @@ static int compat_prepare(struct registers *r, struct syscall_regs *s) {
 }
 
 void syscall_compat_dispatch(struct registers *regs) {
-  user_access_begin();
   hal_irq_enable();
   struct syscall_regs native;
   uint32_t number = regs->rax;
@@ -461,5 +460,4 @@ compat_finished:;
   /* Deliver against the actual i386 interrupt frame, including sigreturn. */
   signal_deliver(regs);
   hal_irq_disable();
-  user_access_end();
 }

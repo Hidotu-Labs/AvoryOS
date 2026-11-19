@@ -29,6 +29,21 @@
  * which lives in the unlinkat namespace): use effective IDs for the check. */
 #define AT_EACCESS          0x200
 
+/* Copy a NUL-terminated path string from user space into dst.
+ * Returns 0 on success, or negative errno (-14 EFAULT, -36 ENAMETOOLONG). */
+static int fs_copy_user_path(const char *user_path, char *dst, size_t dst_size) {
+    if (!user_path || !dst || dst_size == 0)
+        return -14;
+    if (!is_user_range(user_path, 1))
+        return -14;
+    long copied = strncpy_from_user(dst, user_path, (long)dst_size);
+    if (copied < 0)
+        return -14;
+    if ((size_t)copied >= dst_size)
+        return -36;
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // vfs_resolve_symlink_node — resolve WITHOUT following the final symlink
 // ---------------------------------------------------------------------------
@@ -286,8 +301,9 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
 static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
                               uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a3; (void)a4; (void)a5;
-    const char *path = (const char *)pathname;
-    if (!path) return (uint64_t)-14;
+    char path[512];
+    int err = fs_copy_user_path((const char *)pathname, path, sizeof(path));
+    if (err < 0) return (uint64_t)err;
 
     struct thread *t = sched_get_current();
     if (!t) return (uint64_t)-1;
@@ -315,7 +331,15 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
     size_t len = strlen(path);
     if (len == 0) {
         if (base_owned) vfs_close(base_owned);
-        return (uint64_t)-14;
+        return (uint64_t)-2; // ENOENT
+    }
+    if (flags & AT_REMOVEDIR) {
+        while (len > 1 && path[len - 1] == '/')
+            path[--len] = '\0';
+        if (strcmp(path, "/") == 0) {
+            if (base_owned) vfs_close(base_owned);
+            return (uint64_t)-16; // EBUSY
+        }
     }
 
     const char *slash = 0;
@@ -461,9 +485,12 @@ static uint64_t sys_renameat(uint64_t olddfd, uint64_t oldname_ptr,
                              uint64_t newdfd, uint64_t newname_ptr,
                              uint64_t a4, uint64_t a5) {
     (void)a4; (void)a5;
-    const char *oldname = (const char *)oldname_ptr;
-    const char *newname = (const char *)newname_ptr;
-    if (!oldname || !newname) return (uint64_t)-14;
+    char oldname[512];
+    char newname[512];
+    int err = fs_copy_user_path((const char *)oldname_ptr, oldname, sizeof(oldname));
+    if (err < 0) return (uint64_t)err;
+    err = fs_copy_user_path((const char *)newname_ptr, newname, sizeof(newname));
+    if (err < 0) return (uint64_t)err;
 
     struct thread *t = sched_get_current();
     if (!t) return (uint64_t)-1;
@@ -608,8 +635,13 @@ static uint64_t sys_renameat2(uint64_t olddfd, uint64_t oldname_ptr,
 // symlink / readlink / readlinkat
 // ---------------------------------------------------------------------------
 
-static uint64_t do_sys_symlinkat(const char *target, int newdirfd, const char *linkpath) {
-    if (!target || !linkpath) return (uint64_t)-14;
+static uint64_t do_sys_symlinkat(const char *target_user, int newdirfd, const char *linkpath_user) {
+    char target[512];
+    char linkpath[512];
+    int err = fs_copy_user_path(target_user, target, sizeof(target));
+    if (err < 0) return (uint64_t)err;
+    err = fs_copy_user_path(linkpath_user, linkpath, sizeof(linkpath));
+    if (err < 0) return (uint64_t)err;
     if (!linkpath[0]) return (uint64_t)-2;
 
     struct thread *t = sched_get_current();
@@ -725,8 +757,9 @@ static uint64_t sys_symlinkat(uint64_t target_ptr, uint64_t newdirfd,
  * this way; without the syscall they fail with ENOSYS. */
 static uint64_t do_mknodat(vfs_node_t *dir, uint64_t pathname_ptr,
                            uint64_t mode, uint64_t dev) {
-    const char *path = (const char *)pathname_ptr;
-    if (!path) return (uint64_t)-14;
+    char path[512];
+    int err = fs_copy_user_path((const char *)pathname_ptr, path, sizeof(path));
+    if (err < 0) return (uint64_t)err;
 
     uint32_t type;
     switch ((uint32_t)mode & 0170000u) {
@@ -797,21 +830,28 @@ static uint64_t sys_mknodat(uint64_t dirfd, uint64_t pathname_ptr, uint64_t mode
 static uint64_t do_sys_readlink_at(vfs_node_t *base, const char *path,
                                     char *buf, uint64_t bufsiz);
 
+static uint64_t do_sys_readlink_at(vfs_node_t *base, const char *path,
+                                    char *user_buf, uint64_t bufsiz);
+
 static uint64_t sys_readlink(uint64_t pathname_ptr, uint64_t buf_ptr,
                               uint64_t bufsiz, uint64_t a3, uint64_t a4,
                               uint64_t a5) {
     (void)a3; (void)a4; (void)a5;
-    const char *path = (const char *)pathname_ptr;
-    char *buf        = (char *)buf_ptr;
-    if (!path || !buf) return (uint64_t)-14;
+    char path[512];
+    int err = fs_copy_user_path((const char *)pathname_ptr, path, sizeof(path));
+    if (err < 0) return (uint64_t)err;
+    char *buf = (char *)buf_ptr;
+    if (!buf) return (uint64_t)-14;
     if (bufsiz == 0)   return (uint64_t)-22;
+    if (!is_user_range(buf, bufsiz)) return (uint64_t)-14;
 
     if (strcmp(path, "/proc/self/exe") == 0) {
         struct thread *ct = sched_get_current();
         const char *exe_path = (ct && ct->exe_path[0]) ? ct->exe_path : "/init";
         size_t len = strlen(exe_path);
         if (len > bufsiz) len = bufsiz;
-        memcpy(buf, exe_path, len);
+        if (copy_to_user(buf, exe_path, len) != 0)
+            return (uint64_t)-14;
         return len;
     }
 
@@ -824,8 +864,25 @@ static uint64_t sys_readlink(uint64_t pathname_ptr, uint64_t buf_ptr,
 // Shared resolver for readlink/readlinkat: base is already selected
 // (fs_root, cwd, or an open dirfd). Returns byte count or a negative errno
 // (propagated verbatim: dead-pid/fd ENOENT must not become EINVAL).
+static uint64_t readlink_node_to_user(vfs_node_t *node, char *user_buf,
+                                      uint64_t bufsiz) {
+    char stack_buf[512];
+    uint32_t cap = bufsiz < 4096 ? (uint32_t)bufsiz : 4096U;
+    bool heap_used = (cap > sizeof(stack_buf));
+    char *kbuf = heap_used ? (char *)kmalloc(cap) : stack_buf;
+    if (!kbuf)
+        return (uint64_t)-12; // ENOMEM
+
+    int ret = vfs_readlink(node, kbuf, cap);
+    if (ret >= 0 && copy_to_user(user_buf, kbuf, (size_t)ret) != 0)
+        ret = -14;
+    if (heap_used)
+        kfree(kbuf);
+    return (uint64_t)ret;
+}
+
 static uint64_t do_sys_readlink_at(vfs_node_t *base, const char *path,
-                                    char *buf, uint64_t bufsiz) {
+                                    char *user_buf, uint64_t bufsiz) {
     vfs_node_t *node = vfs_resolve_symlink_node(base, path);
     if (!node) {
         return (uint64_t)-2;
@@ -835,21 +892,22 @@ static uint64_t do_sys_readlink_at(vfs_node_t *base, const char *path,
         return (uint64_t)-22;
     }
 
-    int ret = vfs_readlink(node, buf, (uint32_t)bufsiz);
+    uint64_t ret = readlink_node_to_user(node, user_buf, bufsiz);
     vfs_close(node);
-    if (ret < 0) return (uint64_t)ret;
-
-    return (uint64_t)ret;
+    return ret;
 }
 
 static uint64_t sys_readlinkat(uint64_t dirfd, uint64_t pathname_ptr,
                                 uint64_t buf_ptr, uint64_t bufsiz,
                                 uint64_t a4, uint64_t a5) {
     (void)a4; (void)a5;
-    const char *path = (const char *)pathname_ptr;
-    char *buf        = (char *)buf_ptr;
-    if (!path || !buf) return (uint64_t)-14;
+    char path[512];
+    int err = fs_copy_user_path((const char *)pathname_ptr, path, sizeof(path));
+    if (err < 0) return (uint64_t)err;
+    char *buf = (char *)buf_ptr;
+    if (!buf) return (uint64_t)-14;
     if (bufsiz == 0)   return (uint64_t)-22;
+    if (!is_user_range(buf, bufsiz)) return (uint64_t)-14;
 
     // Absolute paths ignore dirfd, exactly like Linux.
     if (path[0] == '/' || (int)dirfd == AT_FDCWD)
@@ -866,7 +924,7 @@ static uint64_t sys_readlinkat(uint64_t dirfd, uint64_t pathname_ptr,
     if (path[0] == '\0') {
         if ((base->flags & FS_TYPE_MASK) != FS_SYMLINK)
             return (uint64_t)-22;
-        return (uint64_t)vfs_readlink(base, buf, (uint32_t)bufsiz);
+        return readlink_node_to_user(base, buf, bufsiz);
     }
     if ((base->flags & FS_TYPE_MASK) != FS_DIRECTORY)
         return (uint64_t)-20; // ENOTDIR
@@ -877,12 +935,41 @@ static uint64_t sys_readlinkat(uint64_t dirfd, uint64_t pathname_ptr,
 // link
 // ---------------------------------------------------------------------------
 
+/* Native hard link when the filesystem has one.  Returns 1 when it does not
+ * (the caller falls back to the old create+copy emulation), else 0 or a
+ * negative errno.  Mount-namespace views are unwrapped to their backing
+ * nodes, which own the link operation and the device identity. */
+static int fs_try_native_link(vfs_node_t *parent, const char *name,
+                              vfs_node_t *src) {
+    vfs_node_t *bp = vfs_backing_node(parent);
+    vfs_node_t *bs = vfs_backing_node(src);
+    if (!bp || !bs || !bp->link)
+        return 1;
+    if (bp->device != bs->device)
+        return -18; /* EXDEV */
+    if (vfs_mount_readonly(parent))
+        return -30;
+    char nm[256];
+    strncpy(nm, name, sizeof(nm) - 1);
+    nm[sizeof(nm) - 1] = 0;
+    int rc = bp->link(bp, nm, bs);
+    if (rc == 0) {
+        vfs_dentry_invalidate_created(parent, nm);
+        if (bp != parent)
+            vfs_dentry_invalidate_created(bp, nm);
+    }
+    return rc;
+}
+
 static uint64_t sys_link(uint64_t oldpath_ptr, uint64_t newpath_ptr,
                           uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
-    const char *oldpath = (const char *)oldpath_ptr;
-    const char *newpath = (const char *)newpath_ptr;
-    if (!oldpath || !newpath) return (uint64_t)-14;
+    char oldpath[512];
+    char newpath[512];
+    int err = fs_copy_user_path((const char *)oldpath_ptr, oldpath, sizeof(oldpath));
+    if (err < 0) return (uint64_t)err;
+    err = fs_copy_user_path((const char *)newpath_ptr, newpath, sizeof(newpath));
+    if (err < 0) return (uint64_t)err;
 
     struct thread *t = sched_get_current();
     vfs_node_t *base = (oldpath[0] == '/') ? fs_root
@@ -934,6 +1021,14 @@ static uint64_t sys_link(uint64_t oldpath_ptr, uint64_t newpath_ptr,
         vfs_close(src);
         return (uint64_t)-17;
     }
+    {
+        int nrc = fs_try_native_link(parent, file_name, src);
+        if (nrc != 1) {
+            vfs_close(parent);
+            vfs_close(src);
+            return (uint64_t)(int64_t)nrc;
+        }
+    }
     if (vfs_create(parent, file_name, src->mask & 0777) != 0) {
         vfs_close(parent);
         vfs_close(src);
@@ -970,9 +1065,12 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
                             uint64_t newdirfd, uint64_t newpath_ptr,
                             uint64_t flags, uint64_t a5) {
     (void)a5;
-    const char *oldpath = (const char *)oldpath_ptr;
-    const char *newpath = (const char *)newpath_ptr;
-    if (!oldpath || !newpath) return (uint64_t)-14; // EFAULT
+    char oldpath[512];
+    char newpath[512];
+    int err = fs_copy_user_path((const char *)oldpath_ptr, oldpath, sizeof(oldpath));
+    if (err < 0) return (uint64_t)err;
+    err = fs_copy_user_path((const char *)newpath_ptr, newpath, sizeof(newpath));
+    if (err < 0) return (uint64_t)err;
 
     struct thread *t = sched_get_current();
 
@@ -1102,7 +1200,16 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
         return (uint64_t)-17; // EEXIST
     }
 
-    // ---- Create the destination entry and copy data ------------------------
+    {
+        int nrc = fs_try_native_link(new_parent, file_name, src);
+        if (nrc != 1) {
+            if (src_owned) vfs_close(src);
+            if (new_parent_owned) vfs_close(new_parent);
+            return (uint64_t)(int64_t)nrc;
+        }
+    }
+
+    // ---- Fallback: create the destination entry and copy data --------------
     if (vfs_create(new_parent, file_name, src->mask & 0777) != 0) {
         if (src_owned) vfs_close(src);
         if (new_parent_owned) vfs_close(new_parent);
@@ -1135,8 +1242,9 @@ static uint64_t sys_linkat(uint64_t olddirfd, uint64_t oldpath_ptr,
 static uint64_t sys_chmod(uint64_t pathname_ptr, uint64_t mode, uint64_t a2,
                            uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
-    const char *path = (const char *)pathname_ptr;
-    if (!path) return (uint64_t)-14;
+    char path[512];
+    int err = fs_copy_user_path((const char *)pathname_ptr, path, sizeof(path));
+    if (err < 0) return (uint64_t)err;
     struct thread *t = sched_get_current();
     vfs_node_t *base  = (t && t->cwd_node && path[0] != '/') ? t->cwd_node : fs_root;
     vfs_node_t *base_owned = NULL;
@@ -1158,10 +1266,12 @@ static uint64_t sys_chmod(uint64_t pathname_ptr, uint64_t mode, uint64_t a2,
 
 /* Return an owned node for metadata operations. Empty paths address the fd
  * itself (including O_PATH handles); nofollow applies only to the final link. */
-static vfs_node_t *metadata_node_at(int dirfd, const char *path, unsigned flags,
+static vfs_node_t *metadata_node_at(int dirfd, const char *user_path, unsigned flags,
                                     int *error) {
     struct thread *t = sched_get_current();
-    if (!path) { *error = -14; return NULL; }
+    char path[512];
+    int err = fs_copy_user_path(user_path, path, sizeof(path));
+    if (err < 0) { *error = err; return NULL; }
     if (!path[0] && !(flags & AT_EMPTY_PATH)) {
         *error = -2;
         return NULL;
@@ -1253,8 +1363,9 @@ static uint64_t sys_fchmodat(uint64_t dirfd, uint64_t pathname_ptr,
                               uint64_t mode, uint64_t flags, uint64_t a4,
                               uint64_t a5) {
     (void)flags; (void)a4; (void)a5;
-    const char *path = (const char *)pathname_ptr;
-    if (!path) return (uint64_t)-14;
+    char path[512];
+    int err = fs_copy_user_path((const char *)pathname_ptr, path, sizeof(path));
+    if (err < 0) return (uint64_t)err;
     struct thread *t = sched_get_current();
     vfs_node_t *base  = fs_root;
     vfs_node_t *base_owned = NULL;
@@ -1320,7 +1431,7 @@ static uint64_t sys_fchownat(uint64_t dirfd, uint64_t pathname_ptr,
 // access / faccessat2
 // ---------------------------------------------------------------------------
 
-static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
+static uint64_t do_sys_access(int dirfd, const char *user_path, uint64_t mode,
                                int flags) {
     struct thread *t = sched_get_current();
     if (t) t->last_access_nonexec_probe = false;
@@ -1328,7 +1439,9 @@ static uint64_t do_sys_access(int dirfd, const char *path, uint64_t mode,
     // anything else is EINVAL, matching Linux.
     if (flags & ~(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH))
         return (uint64_t)-22;
-    if (!path) return (uint64_t)-14;
+    char path[512];
+    int err = fs_copy_user_path(user_path, path, sizeof(path));
+    if (err < 0) return (uint64_t)err;
     // AT_EACCESS selects effective-ID semantics, which is what vfs_access()
     // already keys off (fsuid/fsgid). Plain access() per POSIX uses real
     // IDs; for setuid processes this is a known minor deviation (behavior
@@ -1546,14 +1659,18 @@ static int vfs_set_node_times(vfs_node_t *node, uint32_t atime, uint32_t mtime) 
 static uint64_t do_utimensat_impl(uint64_t dirfd, uint64_t pathname,
                                   const struct sys_timespec *ts_in,
                                   bool have_times, uint64_t flags) {
-    if (pathname && !is_user_ptr(pathname))
-        return (uint64_t)-14; // EFAULT
-    const char *path = (const char *)pathname;
+    char path[512];
+    path[0] = '\0';
+    if (pathname) {
+        int err = fs_copy_user_path((const char *)pathname, path, sizeof(path));
+        if (err < 0)
+            return (uint64_t)(int64_t)err;
+    }
     struct thread *t = sched_get_current();
     vfs_node_t *node = NULL;
     vfs_node_t *base_owned = NULL;
 
-    if (!path || path[0] == '\0') {
+    if (path[0] == '\0') {
         if ((int)dirfd == AT_FDCWD) {
             node = (t && t->cwd_node) ? t->cwd_node : fs_root;
             vfs_node_ref(node);
@@ -1664,9 +1781,9 @@ static uint64_t sys_utime(uint64_t pathname, uint64_t times, uint64_t a2,
         ts[0].tv_nsec = 0;
         ts[1].tv_sec = ub.modtime;
         ts[1].tv_nsec = 0;
-        return sys_utimensat((uint64_t)AT_FDCWD, pathname, (uint64_t)ts, 0, 0, 0);
+        return do_utimensat_impl((uint64_t)AT_FDCWD, pathname, ts, true, 0);
     }
-    return sys_utimensat((uint64_t)AT_FDCWD, pathname, 0, 0, 0, 0);
+    return do_utimensat_impl((uint64_t)AT_FDCWD, pathname, NULL, false, 0);
 }
 
 // ---------------------------------------------------------------------------

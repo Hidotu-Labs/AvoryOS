@@ -102,6 +102,8 @@ void idt_init(void) {
   idt[8].ist = 1;
   /* NMI runs on TSS IST2: see the NMI entry in interrupts.asm. */
   idt[2].ist = 2;
+  /* #DB runs on TSS IST3 so user debug traps never touch user stacks. */
+  idt[1].ist = 3;
   idt_set_gate(9, (uint64_t)isr9, sel, flags);
   idt_set_gate(10, (uint64_t)isr10, sel, flags);
   idt_set_gate(11, (uint64_t)isr11, sel, flags);

@@ -444,73 +444,79 @@ static int inet_getpeername(socket_t *sock, struct sockaddr *addr, int *addrlen)
     return 0;
 }
 
+static int inet_opt_put_int(void *optval, int *optlen, int klen, int val) {
+    if (klen < (int)sizeof(int))
+        return -22;
+    int out_len = (int)sizeof(int);
+    if (!is_user_range(optval, sizeof(int)) ||
+        copy_to_user(optval, &val, sizeof(int)) ||
+        copy_to_user(optlen, &out_len, sizeof(int)))
+        return -14;
+    return 0;
+}
+
 static int inet_getsockopt(socket_t *sock, int level, int optname,
                             void *optval, int *optlen) {
     inet_sock_t *isk = sock->sk;
-    if (!isk) return -22;
+    if (!isk || !optlen) return -22;
+    int klen = 0;
+    if (!is_user_range(optlen, sizeof(int)) ||
+        copy_from_user(&klen, optlen, sizeof(int)))
+        return -14;
     if (level == SOL_SOCKET) {
         if (optname == SO_LINGER) {
-            if (*optlen < 0) return -22;
+            if (klen < 0) return -22;
             int linger[2] = {isk->linger_seconds >= 0,
                             isk->linger_seconds >= 0 ? isk->linger_seconds : 0};
-            int length = *optlen < (int)sizeof(linger) ? *optlen : (int)sizeof(linger);
-            if (copy_to_user(optval, linger, length)) return -14;
-            *optlen = length;
+            int length = klen < (int)sizeof(linger) ? klen : (int)sizeof(linger);
+            if ((length > 0 && (!is_user_range(optval, (size_t)length) ||
+                                copy_to_user(optval, linger, (size_t)length))) ||
+                copy_to_user(optlen, &length, sizeof(int)))
+                return -14;
             return 0;
         }
-        if (optname == SO_ERROR && *optlen >= (int)sizeof(int)) {
+        if (optname == SO_ERROR && klen >= (int)sizeof(int)) {
             int err = 0;
             if (isk->tcp) { err = isk->tcp->error; isk->tcp->error = 0; }
-            *(int *)optval = err;
-            *optlen = sizeof(int);
-            return 0;
+            return inet_opt_put_int(optval, optlen, klen, err);
         }
-        if (optname == SO_RCVTIMEO && *optlen >= (int)sizeof(int)) {
-            *(int *)optval = isk->udp ? isk->udp->rcvtimeo_ms : isk->rcvtimeo_ms;
-            *optlen = sizeof(int);
-            return 0;
+        if (optname == SO_RCVTIMEO && klen >= (int)sizeof(int)) {
+            return inet_opt_put_int(optval, optlen, klen,
+                                    isk->udp ? isk->udp->rcvtimeo_ms : isk->rcvtimeo_ms);
         }
-        if (optname == SO_SNDTIMEO && *optlen >= (int)sizeof(int)) {
-            *(int *)optval = isk->udp ? isk->udp->sndtimeo_ms : isk->sndtimeo_ms;
-            *optlen = sizeof(int);
-            return 0;
+        if (optname == SO_SNDTIMEO && klen >= (int)sizeof(int)) {
+            return inet_opt_put_int(optval, optlen, klen,
+                                    isk->udp ? isk->udp->sndtimeo_ms : isk->sndtimeo_ms);
         }
-        if (optname == SO_KEEPALIVE && *optlen >= (int)sizeof(int)) {
-            *(int *)optval = isk->tcp_keepalive ? 1 : 0;
-            *optlen = sizeof(int);
-            return 0;
+        if (optname == SO_KEEPALIVE && klen >= (int)sizeof(int)) {
+            return inet_opt_put_int(optval, optlen, klen, isk->tcp_keepalive ? 1 : 0);
         }
-        if (optname == SO_ACCEPTCONN && *optlen >= (int)sizeof(int)) {
-            *(int *)optval = (isk->tcp && isk->tcp->state == TCP_LISTEN) ? 1 : 0;
-            *optlen = sizeof(int);
-            return 0;
+        if (optname == SO_ACCEPTCONN && klen >= (int)sizeof(int)) {
+            return inet_opt_put_int(optval, optlen, klen,
+                                    (isk->tcp && isk->tcp->state == TCP_LISTEN) ? 1 : 0);
+        }
+    }
+    if (level == SOL_IP || level == IPPROTO_IP) {
+        if (optname == 14 /* IP_MTU */ && klen >= (int)sizeof(int)) {
+            return inet_opt_put_int(optval, optlen, klen, 1500);
         }
     }
     if (level == SOL_TCP || level == IPPROTO_TCP) {
-        if (optname == TCP_NODELAY && *optlen >= (int)sizeof(int)) {
-            *(int *)optval = isk->tcp_nodelay ? 1 : 0;
-            *optlen = sizeof(int);
-            return 0;
+        if (optname == TCP_NODELAY && klen >= (int)sizeof(int)) {
+            return inet_opt_put_int(optval, optlen, klen, isk->tcp_nodelay ? 1 : 0);
         }
-        if (optname == TCP_MAXSEG && *optlen >= (int)sizeof(int)) {
-            *(int *)optval = isk->tcp && isk->tcp->mss ? isk->tcp->mss : TCP_MAX_MSS;
-            *optlen = sizeof(int);
-            return 0;
+        if (optname == TCP_MAXSEG && klen >= (int)sizeof(int)) {
+            return inet_opt_put_int(optval, optlen, klen,
+                                    isk->tcp && isk->tcp->mss ? isk->tcp->mss : TCP_MAX_MSS);
         }
-        if (optname == TCP_KEEPIDLE && *optlen >= (int)sizeof(int)) {
-            *(int *)optval = isk->tcp_keepidle_s;
-            *optlen = sizeof(int);
-            return 0;
+        if (optname == TCP_KEEPIDLE && klen >= (int)sizeof(int)) {
+            return inet_opt_put_int(optval, optlen, klen, isk->tcp_keepidle_s);
         }
-        if (optname == TCP_KEEPINTVL && *optlen >= (int)sizeof(int)) {
-            *(int *)optval = isk->tcp_keepintvl_s;
-            *optlen = sizeof(int);
-            return 0;
+        if (optname == TCP_KEEPINTVL && klen >= (int)sizeof(int)) {
+            return inet_opt_put_int(optval, optlen, klen, isk->tcp_keepintvl_s);
         }
-        if (optname == TCP_KEEPCNT && *optlen >= (int)sizeof(int)) {
-            *(int *)optval = isk->tcp_keepcnt;
-            *optlen = sizeof(int);
-            return 0;
+        if (optname == TCP_KEEPCNT && klen >= (int)sizeof(int)) {
+            return inet_opt_put_int(optval, optlen, klen, isk->tcp_keepcnt);
         }
     }
     /* Unknown option — return ENOPROTOOPT */
@@ -519,14 +525,20 @@ static int inet_getsockopt(socket_t *sock, int level, int optname,
 
 static int inet_timeval_ms(const void *optval, int optlen) {
     if (optlen >= (int)(2 * sizeof(int64_t))) {
-        const int64_t *tv = (const int64_t *)optval;
+        int64_t tv[2];
+        if (!is_user_range(optval, sizeof(tv)) ||
+            copy_from_user(tv, optval, sizeof(tv)))
+            return -14;
         int64_t ms = tv[0] * 1000 + tv[1] / 1000;
         if (ms < 0) ms = 0;
         if (ms > 3600000) ms = 3600000;
         return (int)ms;
     }
     if (optlen >= (int)sizeof(int)) {
-        int v = *(const int *)optval;
+        int v = 0;
+        if (!is_user_range(optval, sizeof(v)) ||
+            copy_from_user(&v, optval, sizeof(v)))
+            return -14;
         return v < 0 ? 0 : v;
     }
     return 0;
@@ -538,7 +550,10 @@ static int inet_setsockopt(socket_t *sock, int level, int optname,
     if (!isk || !optval) return -22;
 
     if (level == SOL_SOCKET && optlen >= (int)sizeof(int)) {
-        int v = *(const int *)optval;
+        int v = 0;
+        if (!is_user_range(optval, sizeof(v)) ||
+            copy_from_user(&v, optval, sizeof(v)))
+            return -14;
 
         if (optname == SO_RCVBUF || optname == SO_RCVBUFFORCE) {
             if (isk->tcp) tcp_set_rcvbuf(isk->tcp, v < 0 ? 0 : (size_t)v);
@@ -564,18 +579,23 @@ static int inet_setsockopt(socket_t *sock, int level, int optname,
         }
         if (optname == SO_RCVTIMEO) {
             int ms = inet_timeval_ms(optval, optlen);
+            if (ms < 0) return ms;
             isk->rcvtimeo_ms = ms;
             if (isk->udp) isk->udp->rcvtimeo_ms = ms;
             return 0;
         }
         if (optname == SO_SNDTIMEO) {
             int ms = inet_timeval_ms(optval, optlen);
+            if (ms < 0) return ms;
             isk->sndtimeo_ms = ms;
             if (isk->udp) isk->udp->sndtimeo_ms = ms;
             return 0;
         }
         if (optname == SO_LINGER && optlen >= (int)(2 * sizeof(int))) {
-            const int *lv = (const int *)optval;
+            int lv[2];
+            if (!is_user_range(optval, sizeof(lv)) ||
+                copy_from_user(lv, optval, sizeof(lv)))
+                return -14;
             if (!lv[0]) isk->linger_seconds = -1;
             else if (lv[1] <= 0) isk->linger_seconds = 0;
             else isk->linger_seconds = lv[1] > 3600 ? 3600 : lv[1];
@@ -587,14 +607,21 @@ static int inet_setsockopt(socket_t *sock, int level, int optname,
 
     if ((level == SOL_IP || level == IPPROTO_IP) && optname == 1 /* IP_TOS */
         && optlen >= (int)sizeof(int)) {
+        int tos = 0;
+        if (!is_user_range(optval, sizeof(tos)) ||
+            copy_from_user(&tos, optval, sizeof(tos)))
+            return -14;
         if (isk->udp)
-            udp_set_tos(isk->udp, *(const int *)optval);
+            udp_set_tos(isk->udp, tos);
         return 0;
     }
 
     if ((level == SOL_TCP || level == IPPROTO_TCP) && isk->tcp) {
         if (optlen < (int)sizeof(int)) return -22;
-        int v = *(const int *)optval;
+        int v = 0;
+        if (!is_user_range(optval, sizeof(v)) ||
+            copy_from_user(&v, optval, sizeof(v)))
+            return -14;
         switch (optname) {
         case TCP_NODELAY:
             isk->tcp_nodelay = v != 0;

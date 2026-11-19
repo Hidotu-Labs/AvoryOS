@@ -6,6 +6,7 @@
 #include "../mm/heap.h"
 #include "../sched/sched.h"
 #include "../sched/namespace.h"
+#include "../include/arch/uaccess.h"
 #include "syscall.h"
 #include <stdbool.h>
 #include <stdint.h>
@@ -177,7 +178,15 @@ int64_t sys_semtimedop(uint64_t semid, uint64_t sops_addr, uint64_t nsops, uint6
         return -22; // EINVAL
     }
 
-    struct sembuf *sops = (struct sembuf *)sops_addr;
+    size_t sops_bytes = (size_t)nsops * sizeof(struct sembuf);
+    if (!is_user_range((const void *)sops_addr, sops_bytes)) {
+        return -14; // EFAULT
+    }
+
+    struct sembuf sops[SEM_MAX_SEMS_PER_SET];
+    if (copy_from_user(sops, (const void *)sops_addr, sops_bytes) != 0) {
+        return -14; // EFAULT
+    }
 
     spinlock_acquire(&sem_lock);
 
@@ -306,16 +315,20 @@ int64_t sys_semctl(uint64_t semid, uint64_t semnum, uint64_t cmd, uint64_t arg, 
     case IPC_STAT:
     case SEM_STAT:
         if (arg != 0) {
-            struct semid_ds_raw *ds = (struct semid_ds_raw *)arg;
-            memset(ds, 0, sizeof(*ds));
-            ds->sem_perm.__key = set->key;
-            ds->sem_perm.uid = set->creator_uid;
-            ds->sem_perm.gid = set->creator_gid;
-            ds->sem_perm.mode = set->perm_mode;
-            ds->sem_nsems = set->nsems;
-            ds->sem_otime = set->otime;
-            ds->sem_ctime = set->ctime;
+            struct semid_ds_raw ds;
+            memset(&ds, 0, sizeof(ds));
+            ds.sem_perm.__key = set->key;
+            ds.sem_perm.uid = set->creator_uid;
+            ds.sem_perm.gid = set->creator_gid;
+            ds.sem_perm.mode = set->perm_mode;
+            ds.sem_nsems = set->nsems;
+            ds.sem_otime = set->otime;
+            ds.sem_ctime = set->ctime;
             spinlock_release(&sem_lock);
+            if (!is_user_range((const void *)arg, sizeof(ds)) ||
+                copy_to_user((void *)arg, &ds, sizeof(ds)) != 0) {
+                return -14; // EFAULT
+            }
             return 0;
         }
         spinlock_release(&sem_lock);
@@ -347,11 +360,17 @@ int64_t sys_semctl(uint64_t semid, uint64_t semnum, uint64_t cmd, uint64_t arg, 
             return -14;
         }
         {
-            uint16_t *array = (uint16_t *)arg;
-            for (uint16_t i = 0; i < set->nsems; i++) {
-                array[i] = set->sems[i].val;
+            uint16_t vals[SEM_MAX_SEMS_PER_SET];
+            uint16_t nsems = set->nsems;
+            for (uint16_t i = 0; i < nsems; i++) {
+                vals[i] = set->sems[i].val;
             }
             spinlock_release(&sem_lock);
+            size_t bytes = (size_t)nsems * sizeof(uint16_t);
+            if (!is_user_range((const void *)arg, bytes) ||
+                copy_to_user((void *)arg, vals, bytes) != 0) {
+                return -14;
+            }
             return 0;
         }
 
@@ -361,9 +380,21 @@ int64_t sys_semctl(uint64_t semid, uint64_t semnum, uint64_t cmd, uint64_t arg, 
             return -14;
         }
         {
-            uint16_t *array = (uint16_t *)arg;
-            for (uint16_t i = 0; i < set->nsems; i++) {
-                set->sems[i].val = array[i];
+            uint16_t vals[SEM_MAX_SEMS_PER_SET];
+            uint16_t nsems = set->nsems;
+            size_t bytes = (size_t)nsems * sizeof(uint16_t);
+            spinlock_release(&sem_lock);
+            if (!is_user_range((const void *)arg, bytes) ||
+                copy_from_user(vals, (const void *)arg, bytes) != 0) {
+                return -14;
+            }
+            spinlock_acquire(&sem_lock);
+            if (!set->active || set->nsems != nsems) {
+                spinlock_release(&sem_lock);
+                return -22;
+            }
+            for (uint16_t i = 0; i < nsems; i++) {
+                set->sems[i].val = vals[i];
             }
             spinlock_release(&sem_lock);
             return 0;

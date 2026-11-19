@@ -12,9 +12,11 @@
 #include "lib/string.h"
 #include "mm/heap.h"
 #include "mm/dma_alloc.h"
+#include "arch/uaccess.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "net/core.h"
+#include "sched/capability.h"
 #include "sched/sched.h"
 #include "sched/wait.h"
 #include "socket/epoll.h"
@@ -1394,7 +1396,8 @@ static bool session_is_owner(struct udriver_session *session) {
 
 static int driverctl_ioctl(vfs_node_t *node, uint32_t request, uint64_t arg) {
   struct udriver_session *session = node ? node->device : NULL;
-  if (!session_is_owner(session))
+  if (!session_is_owner(session) ||
+      !capability_has_init_ns(sched_get_current(), CAP_SYS_ADMIN))
     return -1;
   if (!arg)
     return -14;
@@ -1402,101 +1405,144 @@ static int driverctl_ioctl(vfs_node_t *node, uint32_t request, uint64_t arg) {
   switch (request) {
   case UDRV_IOCTL_REGISTER: {
     struct udrv_register copy;
-    memcpy(&copy, (const void *)(uintptr_t)arg, sizeof(copy));
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     return udriver_session_register(session, &copy);
   }
   case UDRV_IOCTL_CLAIM: {
     struct udrv_claim copy;
-    memcpy(&copy, (const void *)(uintptr_t)arg, sizeof(copy));
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     return udriver_session_claim(session, copy.device_name);
   }
   case UDRV_IOCTL_RELEASE: {
     struct udrv_claim copy;
-    memcpy(&copy, (const void *)(uintptr_t)arg, sizeof(copy));
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     return udriver_session_release(session, copy.device_name);
   }
-  case UDRV_IOCTL_GET_STATUS:
-    return udriver_session_status(session, (struct udrv_status *)(uintptr_t)arg);
+  case UDRV_IOCTL_GET_STATUS: {
+    struct udrv_status copy;
+    int result = udriver_session_status(session, &copy);
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
+    return result;
+  }
   case UDRV_IOCTL_GET_DEVICE: {
-    struct udrv_device_info copy; memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    struct udrv_device_info copy;
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     int result = get_device_info(session, &copy);
-    if (!result) memcpy((void *)(uintptr_t)arg, &copy, sizeof(copy));
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
     return result;
   }
   case UDRV_IOCTL_GET_RESOURCE: {
-    struct udrv_resource_info copy; memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    struct udrv_resource_info copy;
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     int result = get_resource_info(session, &copy);
-    if (!result) memcpy((void *)(uintptr_t)arg, &copy, sizeof(copy));
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
     return result;
   }
   case UDRV_IOCTL_PCI_CONFIG: {
-    struct udrv_pci_config copy; memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    struct udrv_pci_config copy;
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     int result = pci_config_access(session, &copy);
-    if (!result) memcpy((void *)(uintptr_t)arg, &copy, sizeof(copy));
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
     return result;
   }
   case UDRV_IOCTL_PORT_IO: {
-    struct udrv_port_io copy; memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    struct udrv_port_io copy;
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     int result = port_io_access(session, &copy, true);
-    if (!result) memcpy((void *)(uintptr_t)arg, &copy, sizeof(copy));
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
     return result;
   }
   case UDRV_IOCTL_IRQ_SETUP: {
-    struct udrv_irq_setup copy; memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    struct udrv_irq_setup copy;
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     int result = irq_setup(session, &copy);
-    if (!result) memcpy((void *)(uintptr_t)arg, &copy, sizeof(copy));
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
     return result;
   }
   case UDRV_IOCTL_IRQ_CONTROL: {
-    struct udrv_irq_control copy; memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    struct udrv_irq_control copy;
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     int result = irq_control(session, &copy);
-    if (!result) memcpy((void *)(uintptr_t)arg, &copy, sizeof(copy));
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
     return result;
   }
   case UDRV_IOCTL_DMA_INFO: {
-    struct udrv_dma_info copy; memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    struct udrv_dma_info copy;
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     int result = dma_info(session, &copy);
-    if (!result) memcpy((void *)(uintptr_t)arg, &copy, sizeof(copy));
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
     return result;
   }
   case UDRV_IOCTL_DMA_ALLOC: {
-    struct udrv_dma_alloc copy; memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    struct udrv_dma_alloc copy;
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     int result = dma_allocate(session, &copy);
-    if (!result) memcpy((void *)(uintptr_t)arg, &copy, sizeof(copy));
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
     return result;
   }
   case UDRV_IOCTL_DMA_FREE: {
-    struct udrv_dma_free copy; memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    struct udrv_dma_free copy;
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     return dma_free_buffer(session, &copy);
   }
   case UDRV_IOCTL_BUS_MASTER: {
-    struct udrv_bus_master copy; memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    struct udrv_bus_master copy;
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     int result = bus_master_control(session, &copy);
-    if (!result) memcpy((void *)(uintptr_t)arg, &copy, sizeof(copy));
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
     return result;
   }
   case UDRV_IOCTL_NET_REGISTER: {
     struct udrv_net_register copy;
-    memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     return net_register_endpoint(session, &copy);
   }
   case UDRV_IOCTL_NET_RX: {
     struct udrv_net_frame copy;
-    memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     return net_receive_frame(session, &copy);
   }
   case UDRV_IOCTL_NET_TX: {
     struct udrv_net_frame copy;
-    memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     int result = net_dequeue_frame(session, &copy);
-    if (!result) memcpy((void *)(uintptr_t)arg, &copy, sizeof(copy));
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
     return result;
   }
   case UDRV_IOCTL_NET_STATE: {
     struct udrv_net_state copy;
-    memcpy(&copy, (void *)(uintptr_t)arg, sizeof(copy));
+    if (copy_from_user(&copy, (const void *)(uintptr_t)arg, sizeof(copy)))
+      return -14;
     int result = net_get_state(session, &copy);
-    if (!result) memcpy((void *)(uintptr_t)arg, &copy, sizeof(copy));
+    if (!result && copy_to_user((void *)(uintptr_t)arg, &copy, sizeof(copy)))
+      return -14;
     return result;
   }
   default:
@@ -1514,7 +1560,7 @@ static void driverctl_close(vfs_node_t *node) {
 static vfs_node_t *driverctl_open_instance(vfs_node_t *metadata) {
   (void)metadata;
   struct thread *current = sched_get_current();
-  if (!current)
+  if (!current || !capability_has_init_ns(current, CAP_SYS_ADMIN))
     return NULL;
   struct udriver_session *session =
       udriver_session_create(current->tgid);

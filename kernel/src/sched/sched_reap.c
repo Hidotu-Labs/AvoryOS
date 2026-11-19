@@ -263,7 +263,9 @@ bool sched_reap_thread(struct thread *t) {
    * release the transaction lock, so without this the mount wedges forever
    * and every later writer spins on 5 s warnings. */
   {
+    extern void ext2_release_inflight_writes(uint32_t tid);
     extern void ext3_journal_release_owner(uint32_t tid);
+    ext2_release_inflight_writes(t->tid);
     ext3_journal_release_owner(t->tid);
   }
 

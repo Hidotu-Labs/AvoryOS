@@ -58,6 +58,36 @@ void klog_ramfs_free(void *ptr, uint64_t capacity, bool is_pmm, uint64_t pages);
 
 void klog_set_screen_logging(bool enabled);
 
+/* Per-call-site rate limiting.  At most `burst` messages per `interval_ms`
+ * window; the rest are counted and reported as one
+ * "[klog] <tag>: N messages suppressed" line when the next window opens.
+ *
+ *   if (KLOG_RATELIMITED("SIGNALFD"))
+ *     klogf("[SIGNALFD] ...\n", ...);
+ *
+ * Wrap the whole multi-call line (klog_puts + klog_uint64 + ...) in the same
+ * if, so a suppressed line is dropped as a unit. */
+struct klog_ratelimit {
+  uint64_t window_start_ms;
+  uint32_t printed;
+  uint32_t missed;
+};
+bool klog_ratelimit_check(struct klog_ratelimit *rl, const char *tag,
+                          uint32_t burst, uint32_t interval_ms);
+#define KLOG_RATELIMIT_BURST 5
+#define KLOG_RATELIMIT_INTERVAL_MS 5000
+#define KLOG_RATELIMITED_EX(tag, burst, interval_ms)                           \
+  ({                                                                           \
+    static struct klog_ratelimit __klog_rl;                                    \
+    klog_ratelimit_check(&__klog_rl, (tag), (burst), (interval_ms));           \
+  })
+#define KLOG_RATELIMITED(tag)                                                  \
+  KLOG_RATELIMITED_EX(tag, KLOG_RATELIMIT_BURST, KLOG_RATELIMIT_INTERVAL_MS)
+
+/* Dispatch any buffered partial line (lines are normally sent on '\n').
+ * all_cpus=true is for panic/halt paths only. */
+void klog_flush(bool all_cpus);
+
 /* Persistent boot-log ring: the last KLOG_RING_SIZE bytes of kernel output,
  * readable at /proc/klog.  klog_ring_read() serves [offset, offset+size) from
  * the oldest retained byte and returns the number of bytes copied. */

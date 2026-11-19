@@ -6,6 +6,7 @@
 #include "../cpu/ktrack.h"
 #include "../cpu/msr.h"
 #include "../lib/string.h"
+#include "../lib/tsc.h"
 #include "../sched/sched.h"
 #include "../sched/seccomp.h"
 #include "../sched/pid_namespace.h"
@@ -513,6 +514,73 @@ void thread_update_fastpath_state(struct thread *t) {
   t->identity_cached_egid = t->egid;
 }
 
+/* /proc/sysprof: per-syscall call counts and TSC cycles (wall time inside the
+ * handler) across all processes since boot or the last reset, plus the same
+ * totals per image in /proc/<pid>/status, to locate startup cost. */
+static uint64_t sysprof_count[MAX_SYSCALL];
+static uint64_t sysprof_cycles[MAX_SYSCALL];
+
+static inline void sysprof_account(struct thread *t, uint64_t num, uint64_t t0) {
+  uint64_t dt = rdtsc() - t0;
+  __atomic_add_fetch(&sysprof_count[num], 1, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&sysprof_cycles[num], dt, __ATOMIC_RELAXED);
+  if (t && t->mm) {
+    __atomic_add_fetch(&t->mm->nr_syscalls, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&t->mm->syscall_cycles, dt, __ATOMIC_RELAXED);
+  }
+}
+
+void syscall_prof_reset(void) {
+  for (uint32_t i = 0; i < MAX_SYSCALL; i++) {
+    __atomic_store_n(&sysprof_count[i], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&sysprof_cycles[i], 0, __ATOMIC_RELAXED);
+  }
+}
+
+/* Top syscalls by total time, most expensive first. */
+uint32_t syscall_prof_format(char *buf, uint32_t cap) {
+  enum { TOP = 40 };
+  uint16_t top[TOP];
+  uint64_t cyc[TOP];
+  uint32_t n = 0;
+  uint64_t all_count = 0, all_cycles = 0;
+  for (uint32_t i = 0; i < MAX_SYSCALL; i++) {
+    uint64_t c = __atomic_load_n(&sysprof_cycles[i], __ATOMIC_RELAXED);
+    all_count += __atomic_load_n(&sysprof_count[i], __ATOMIC_RELAXED);
+    all_cycles += c;
+    if (!c || (n == TOP && c <= cyc[TOP - 1]))
+      continue;
+    uint32_t j = n < TOP ? n++ : TOP - 1;
+    while (j > 0 && cyc[j - 1] < c) {
+      top[j] = top[j - 1];
+      cyc[j] = cyc[j - 1];
+      j--;
+    }
+    top[j] = (uint16_t)i;
+    cyc[j] = c;
+  }
+  int len = snprintf(buf, cap, "total %llu calls %llu us\n%-24s %10s %12s %8s\n",
+                     (unsigned long long)all_count,
+                     (unsigned long long)(tsc_cycles_to_ns(all_cycles) / 1000),
+                     "syscall", "calls", "total_us", "avg_us");
+  for (uint32_t k = 0; k < n && len > 0 && (uint32_t)len < cap; k++) {
+    uint64_t calls = __atomic_load_n(&sysprof_count[top[k]], __ATOMIC_RELAXED);
+    uint64_t us = tsc_cycles_to_ns(cyc[k]) / 1000;
+    const char *name = syscall_get_name(top[k]);
+    char num[16];
+    if (!name) {
+      snprintf(num, sizeof(num), "#%u", top[k]);
+      name = num;
+    }
+    len += snprintf(buf + len, cap - (uint32_t)len, "%-24s %10llu %12llu %8llu\n",
+                    name, (unsigned long long)calls, (unsigned long long)us,
+                    (unsigned long long)(calls ? us / calls : 0));
+  }
+  if (len < 0)
+    return 0;
+  return (uint32_t)len < cap ? (uint32_t)len : cap - 1;
+}
+
 void syscall_dispatcher(struct syscall_regs *regs) {
   struct thread *t = sched_get_current();
   /* Foreign syscall numbers and argument ABIs must be intercepted before
@@ -638,7 +706,9 @@ void syscall_dispatcher(struct syscall_regs *regs) {
 #if SYSCALL_LOG
     log_syscall_entry(regs, t);
 #endif
+    uint64_t sp_t0 = rdtsc();
     regs->rax = raw_handler(regs);
+    sysprof_account(t, syscall_num, sp_t0);
 #if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
     log_syscall_error(syscall_num, t, (int64_t)regs->rax);
 #endif
@@ -695,8 +765,10 @@ void syscall_dispatcher(struct syscall_regs *regs) {
   log_syscall_entry(regs, t);
 #endif
 
+  uint64_t sp_t0 = rdtsc();
   regs->rax =
       handler(regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8, regs->r9);
+  sysprof_account(t, syscall_num, sp_t0);
 #if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
   log_syscall_error(syscall_num, t, (int64_t)regs->rax);
 #endif
@@ -796,5 +868,8 @@ void syscall_init_cpu(void) {
    * with AC already set and bypass supervisor access prevention for the
    * whole syscall.  syscall_entry.asm re-opens AC deliberately, only for
    * the dispatch window. */
-  wrmsr(IA32_FMASK, 0x200 | (1ULL << 18));
+  /* Mask TF, IF, DF, IOPL, NT, and AC on SYSCALL entry so userspace cannot
+   * enter the pre-swapgs/stack-switch window with single-stepping (#DB),
+   * interrupts, direction flag, or SMAP AC bypass enabled. */
+  wrmsr(IA32_FMASK, 0x47700ULL);
 }

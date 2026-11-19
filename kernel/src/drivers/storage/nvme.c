@@ -725,10 +725,14 @@ static int nvme_create_io_queues(struct nvme_controller *ctrl,
     /* The CQ's interrupt vector must be known before the Create CQ command:
      * it goes into the IV field. */
     ctrl->io[i].queue_index = (uint16_t)i;
+    /* Must agree with nvme_irq_map_queues(): queues beyond the vector count
+     * share the LAST vector, which scans them all.  Pointing them at vector 0
+     * instead routed their completions to a vector that only drains queue 0,
+     * so their waiters slept until the 10-tick timeout. */
+    uint16_t vectors = ctrl->irq.vector_count;
     ctrl->io[i].vector = (uint16_t)((ctrl->irq_active &&
-                                     ctrl->irq.mode == PCI_IRQ_MSIX &&
-                                     i < ctrl->irq.vector_count)
-                                        ? i
+                                     ctrl->irq.mode == PCI_IRQ_MSIX && vectors)
+                                        ? (i < vectors ? i : vectors - 1u)
                                         : 0);
     if (nvme_create_io_queue(ctrl, i) != 0)
       break;
@@ -2074,6 +2078,18 @@ static int nvme_sq_submit(struct nvme_controller *ctrl, struct nvme_iovq *vq,
  * Returns 0 on success, -1 on a command status error and -2 on a transport
  * failure; only -2 is retried by the reset-recovery wrapper.
  */
+/* Each of `n` reads in flight together took `dt` cycles submit-to-complete. */
+static void nvme_account_read_latency(struct block_device *dev, uint64_t dt,
+                                      unsigned n) {
+  __atomic_add_fetch(&dev->hw_read_cycles, dt * n, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&dev->hw_read_timed, n, __ATOMIC_RELAXED);
+  uint64_t max = __atomic_load_n(&dev->hw_read_max_cycles, __ATOMIC_RELAXED);
+  while (dt > max &&
+         !__atomic_compare_exchange_n(&dev->hw_read_max_cycles, &max, dt, false,
+                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+    ;
+}
+
 static int nvme_io_direct_once(struct nvme_controller *ctrl,
                                struct nvme_namespace *ns, uint64_t slba,
                                uint32_t nlb, uint64_t va, bool write,
@@ -2127,8 +2143,11 @@ static int nvme_io_direct_once(struct nvme_controller *ctrl,
                      __ATOMIC_RELAXED);
   __atomic_add_fetch(write ? &dev->hw_write_bytes : &dev->hw_read_bytes,
                      bytes, __ATOMIC_RELAXED);
+  uint64_t t0 = write ? 0 : rdtsc();
   int rc = nvme_io_wait(ctrl, vq, (uint32_t)cid, generation);
   if (rc) __atomic_add_fetch(&dev->hw_errors, 1, __ATOMIC_RELAXED);
+  if (!write)
+    nvme_account_read_latency(dev, rdtsc() - t0, 1);
   return rc;
 }
 
@@ -2516,6 +2535,7 @@ static int nvme_batch_submit(struct nvme_controller *ctrl,
     unsigned slots[NVME_BATCH_WAVE_MAX];
     unsigned wave = 0;
     int wave_rc = 0;
+    uint64_t wave_t0 = rdtsc();
 
     while (i < n && wave < NVME_BATCH_WAVE_MAX &&
            nvme_batch_entry_fast(ctrl, ns, &reqs[i])) {
@@ -2585,6 +2605,8 @@ static int nvme_batch_submit(struct nvme_controller *ctrl,
     if (wave) {
       int verdicts[NVME_BATCH_WAVE_MAX];
       int rc = nvme_io_wait_many(ctrl, vq, cids, verdicts, wave, generation);
+      if (!write)
+        nvme_account_read_latency(&ns->blkdev, rdtsc() - wave_t0, wave);
       for (unsigned k = 0; k < wave; k++) {
         int verdict = verdicts[k];
         reqs[slots[k]].result = verdict > 0 ? 0 : (verdict < 0 ? -1 : -2);

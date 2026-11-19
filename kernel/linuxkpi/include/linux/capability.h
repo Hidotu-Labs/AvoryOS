@@ -58,28 +58,27 @@ struct file;
 
 #define CAP_LAST_CAP CAP_CHECKPOINT_RESTORE
 
+extern bool linuxkpi_capable(int cap);
+
 static inline bool capable(int cap) {
-  (void)cap;
-  return true;
+  return linuxkpi_capable(cap);
 }
 
 static inline bool ns_capable(void *ns, int cap) {
   (void)ns;
-  (void)cap;
-  return true;
+  return linuxkpi_capable(cap);
 }
 
 static inline bool file_ns_capable(const struct file *file, void *ns, int cap) {
   (void)file;
   (void)ns;
-  (void)cap;
-  return true;
+  return linuxkpi_capable(cap);
 }
 
 static inline bool ptracer_capable(void *tsk, void *ns) {
   (void)tsk;
   (void)ns;
-  return true;
+  return linuxkpi_capable(CAP_SYS_PTRACE);
 }
 
 #endif /* __AVORY_LINUXKPI_CAPABILITY_H */

@@ -92,15 +92,12 @@ static bool exec_wine_debug_env(const char *path, char ***envp, int *envc) {
     return true;
   for (int i = 0; i < *envc; i++)
     if (strncmp((*envp)[i], "WINEDEBUG=", 10) == 0) return true;
-  const char *setting = "WINEDEBUG=-all";
-  size_t setting_size = strlen(setting) + 1;
+  /* Static string: exec_args_free() only frees the array and arena. */
+  static char setting[] = "WINEDEBUG=-all";
   char **expanded = kmalloc(((size_t)*envc + 2) * sizeof(*expanded));
   if (!expanded) return false;
-  char *value = kmalloc(setting_size);
-  if (!value) { kfree(expanded); return false; }
-  memcpy(value, setting, setting_size);
   memcpy(expanded, *envp, (size_t)*envc * sizeof(*expanded));
-  expanded[*envc] = value;
+  expanded[*envc] = setting;
   expanded[*envc + 1] = NULL;
   kfree(*envp);
   *envp = expanded;
@@ -108,10 +105,115 @@ static bool exec_wine_debug_env(const char *path, char ***envp, int *envc) {
   return true;
 }
 
-static const char *exec_vector_entry(const char **vector, int index,
-                                      bool compat32) {
-  return compat32 ? (const char *)(uintptr_t)((const uint32_t *)vector)[index]
-                  : vector[index];
+static bool exec_vector_entry(const char **vector, int index,
+                              bool compat32, const char **out) {
+  if (compat32) {
+    uint32_t entry32 = 0;
+    const uint32_t *u32 = (const uint32_t *)vector + index;
+    if (!is_user_range(u32, sizeof(entry32)) ||
+        copy_from_user(&entry32, u32, sizeof(entry32)) != 0)
+      return false;
+    *out = (const char *)(uintptr_t)entry32;
+    return true;
+  }
+  const char *entry64 = NULL;
+  const char *const *u64 = (const char *const *)vector + index;
+  if (!is_user_range(u64, sizeof(entry64)) ||
+      copy_from_user(&entry64, u64, sizeof(entry64)) != 0)
+    return false;
+  *out = entry64;
+  return true;
+}
+
+/* Kernel copies of execve's argv/envp.  Every string copied from user space
+ * lives in one growable arena (offsets during the copy, pointers once done),
+ * so a whole exec needs a handful of allocations instead of one per string.
+ * Strings added later (shebang interpreter words, script paths) are tracked in
+ * `owned` and freed with the rest by exec_args_free(). */
+#define EXEC_STR_MAX 4096
+#define EXEC_OWNED_MAX 16
+
+struct exec_strings {
+  char *arena;
+  size_t used, cap;
+  void *owned[EXEC_OWNED_MAX];
+  int nowned;
+};
+
+static void exec_args_free(struct exec_strings *s, char **argv, char **envp) {
+  kfree(argv);
+  kfree(envp);
+  kfree(s->arena);
+  for (int i = 0; i < s->nowned; i++)
+    kfree(s->owned[i]);
+  s->arena = NULL;
+  s->used = s->cap = 0;
+  s->nowned = 0;
+}
+
+static bool exec_strings_own(struct exec_strings *s, void *ptr) {
+  if (!ptr || s->nowned >= EXEC_OWNED_MAX)
+    return false;
+  s->owned[s->nowned++] = ptr;
+  return true;
+}
+
+/* Copies a NULL-terminated user vector into s->arena.  On success *out_vec
+ * holds arena offsets (as pointers); exec_strings_finish() rebases them once
+ * the arena has stopped moving. */
+static int exec_copy_user_vector(struct exec_strings *s, const char **user_vec,
+                                 bool compat32, char ***out_vec,
+                                 int *out_count) {
+  int count = 0;
+  if (user_vec) {
+    while (count < 4096) {
+      const char *entry = NULL;
+      if (!exec_vector_entry(user_vec, count, compat32, &entry))
+        return -14;
+      if (!entry)
+        break;
+      count++;
+    }
+  }
+  char **k_vec = kmalloc(((size_t)count + 1) * sizeof(char *));
+  if (!k_vec)
+    return -12;
+  for (int i = 0; i < count; i++) {
+    const char *entry = NULL;
+    if (!exec_vector_entry(user_vec, i, compat32, &entry) || !entry ||
+        !is_user_range(entry, 1)) {
+      kfree(k_vec);
+      return -14;
+    }
+    if (s->cap - s->used < EXEC_STR_MAX) {
+      size_t ncap = s->cap ? s->cap * 2 : 2 * EXEC_STR_MAX;
+      while (ncap - s->used < EXEC_STR_MAX)
+        ncap *= 2;
+      char *na = krealloc(s->arena, ncap);
+      if (!na) {
+        kfree(k_vec);
+        return -12;
+      }
+      s->arena = na;
+      s->cap = ncap;
+    }
+    long len = strncpy_from_user(s->arena + s->used, entry, EXEC_STR_MAX);
+    if (len < 0 || len >= EXEC_STR_MAX) {
+      kfree(k_vec);
+      return len < 0 ? -14 : -7; /* E2BIG */
+    }
+    k_vec[i] = (char *)(uintptr_t)s->used;
+    s->used += (size_t)len + 1;
+  }
+  k_vec[count] = NULL;
+  *out_vec = k_vec;
+  *out_count = count;
+  return 0;
+}
+
+static void exec_strings_finish(struct exec_strings *s, char **vec, int count) {
+  for (int i = 0; i < count; i++)
+    vec[i] = s->arena + (uintptr_t)vec[i];
 }
 
 /* A procfs symlink is resolved relative to /proc/<pid>, not the exec cwd.
@@ -167,46 +269,29 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   }
 
   TSC_BEGIN(execve_arg_copy);
+  struct exec_strings strs = {0};
   int argc = 0;
-  if (user_argv)
-    while (exec_vector_entry(user_argv, argc, compat32))
-      argc++;
-  char **k_argv = kmalloc((argc + 1) * sizeof(char *));
-  if (!k_argv) {
+  char **k_argv = NULL;
+  int vec_rc = exec_copy_user_vector(&strs, user_argv, compat32, &k_argv, &argc);
+  if (vec_rc < 0) {
     kfree(path);
-    return (uint64_t)-12;
+    exec_args_free(&strs, NULL, NULL);
+    return (uint64_t)vec_rc;
   }
-  for (int i = 0; i < argc; i++) {
-    size_t len = strlen(exec_vector_entry(user_argv, i, compat32));
-    k_argv[i] = kmalloc(len + 1);
-    memcpy(k_argv[i], exec_vector_entry(user_argv, i, compat32), len + 1);
-  }
-  k_argv[argc] = NULL;
 
   int envc = 0;
-  if (user_envp)
-    while (exec_vector_entry(user_envp, envc, compat32))
-      envc++;
-  char **k_envp = kmalloc((envc + 1) * sizeof(char *));
-  if (!k_envp) {
+  char **k_envp = NULL;
+  vec_rc = exec_copy_user_vector(&strs, user_envp, compat32, &k_envp, &envc);
+  if (vec_rc < 0) {
     kfree(path);
-    for (int i = 0; i < argc; i++)
-      kfree(k_argv[i]);
-    kfree(k_argv);
-    return (uint64_t)-12;
+    exec_args_free(&strs, k_argv, NULL);
+    return (uint64_t)vec_rc;
   }
-  for (int i = 0; i < envc; i++) {
-    size_t len = strlen(exec_vector_entry(user_envp, i, compat32));
-    k_envp[i] = kmalloc(len + 1);
-    memcpy(k_envp[i], exec_vector_entry(user_envp, i, compat32), len + 1);
-  }
-  k_envp[envc] = NULL;
+  exec_strings_finish(&strs, k_argv, argc);
+  exec_strings_finish(&strs, k_envp, envc);
   if (!exec_wine_debug_env(path, &k_envp, &envc)) {
     kfree(path);
-    for (int i = 0; i < argc; i++) kfree(k_argv[i]);
-    kfree(k_argv);
-    for (int i = 0; i < envc; i++) kfree(k_envp[i]);
-    kfree(k_envp);
+    exec_args_free(&strs, k_argv, k_envp);
     return (uint64_t)-12;
   }
   TSC_END(execve_arg_copy);
@@ -216,6 +301,9 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   int shebang_depth = 0;
   uint32_t exec_mode = 0, exec_uid = 0, exec_gid = 0;
   uint64_t exec_mount_flags = 0;
+  /* Referenced node of the binary that elf_load() will map.  Holding it from
+   * here on means the final path is resolved once, not again in the loader. */
+  vfs_node_t *exec_file = NULL;
 
   while (shebang_depth < 4) {
     vfs_node_t *exec_base = (path[0] == '/') ? fs_root :
@@ -230,16 +318,15 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
     }
     if (exec_err) {
       if (exec_node) vfs_close(exec_node);
-      klog_puts("[PROC] execve failed path=\"");
-      klog_puts(path);
-      klog_puts("\" errno=");
-      klog_uint64((uint64_t)exec_err);
-      klog_puts("\n");
+      if (KLOG_RATELIMITED("PROC execve failed")) {
+        klog_puts("[PROC] execve failed path=\"");
+        klog_puts(path);
+        klog_puts("\" errno=");
+        klog_uint64((uint64_t)exec_err);
+        klog_puts("\n");
+      }
       kfree(path);
-      for (int i = 0; i < argc; i++) kfree(k_argv[i]);
-      kfree(k_argv);
-      for (int i = 0; i < envc; i++) kfree(k_envp[i]);
-      kfree(k_envp);
+      exec_args_free(&strs, k_argv, k_envp);
       return (uint64_t)(-exec_err);
     }
     exec_mode = exec_node->mask;
@@ -249,9 +336,9 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
     char header[256];
     uint32_t hlen = vfs_read(exec_node, 0, sizeof(header) - 1, (uint8_t *)header);
-    vfs_close(exec_node);
 
     if (hlen >= 2 && header[0] == '#' && header[1] == '!') {
+      vfs_close(exec_node);
       header[hlen] = '\0';
       for (char *c = header; *c; c++) {
         if (*c == '\n' || *c == '\r') {
@@ -265,10 +352,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       while (*p == ' ' || *p == '\t') p++;
       if (*p == '\0') {
         kfree(path);
-        for (int i = 0; i < argc; i++) kfree(k_argv[i]);
-        kfree(k_argv);
-        for (int i = 0; i < envc; i++) kfree(k_envp[i]);
-        kfree(k_envp);
+        exec_args_free(&strs, k_argv, k_envp);
         return (uint64_t)-8; // ENOEXEC
       }
 
@@ -293,54 +377,71 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       char **new_k_argv = kmalloc((new_argc + 1) * sizeof(char *));
       if (!new_k_argv) {
         kfree(path);
-        for (int i = 0; i < argc; i++) kfree(k_argv[i]);
-        kfree(k_argv);
-        for (int i = 0; i < envc; i++) kfree(k_envp[i]);
-        kfree(k_envp);
+        exec_args_free(&strs, k_argv, k_envp);
         return (uint64_t)-12;
       }
 
-      new_k_argv[0] = kmalloc(strlen(interp_bin) + 1);
-      strcpy(new_k_argv[0], interp_bin);
+      /* The script path moves into argv; interpreter words get their own
+       * buffers.  All are owned by strs and freed with the arena. */
+      char *bin_copy = kmalloc(strlen(interp_bin) + 1);
+      char *arg_copy = interp_arg ? kmalloc(strlen(interp_arg) + 1) : NULL;
+      char *next_path = kmalloc(strlen(interp_bin) + 1);
+      if (!bin_copy || (interp_arg && !arg_copy) || !next_path ||
+          strs.nowned + 3 > EXEC_OWNED_MAX) {
+        kfree(bin_copy);
+        kfree(arg_copy);
+        kfree(next_path);
+        kfree(new_k_argv);
+        kfree(path);
+        exec_args_free(&strs, k_argv, k_envp);
+        return (uint64_t)-12;
+      }
+      strcpy(bin_copy, interp_bin);
+      strcpy(next_path, interp_bin);
+      exec_strings_own(&strs, bin_copy);
+      exec_strings_own(&strs, path);
+      new_k_argv[0] = bin_copy;
 
       int dst_idx = 1;
       if (interp_arg) {
-        new_k_argv[dst_idx] = kmalloc(strlen(interp_arg) + 1);
-        strcpy(new_k_argv[dst_idx], interp_arg);
-        dst_idx++;
+        strcpy(arg_copy, interp_arg);
+        exec_strings_own(&strs, arg_copy);
+        new_k_argv[dst_idx++] = arg_copy;
       }
-      new_k_argv[dst_idx] = path; // Reuse script path buffer
-      dst_idx++;
+      new_k_argv[dst_idx++] = path; // Reuse script path buffer
 
       for (int i = 1; i < argc; i++) {
         new_k_argv[dst_idx++] = k_argv[i];
       }
       new_k_argv[new_argc] = NULL;
 
-      kfree(k_argv[0]);
       kfree(k_argv);
       k_argv = new_k_argv;
       argc = new_argc;
-
-      path = kmalloc(strlen(interp_bin) + 1);
-      strcpy(path, interp_bin);
+      path = next_path;
 
       shebang_depth++;
       continue;
     }
 
-    // Binary executable verified
+    // Binary executable verified; keep its reference for elf_load().
+    exec_file = exec_node;
     break;
+  }
+
+  if (!exec_file) {
+    // Shebang depth limit reached: the last interpreter was never verified.
+    kfree(path);
+    exec_args_free(&strs, k_argv, k_envp);
+    return (uint64_t)-8; // ENOEXEC
   }
 
   char saved_exe_path[sizeof(exec_caller->exe_path)];
   if (!exec_save_absolute_path(saved_exe_path, sizeof(saved_exe_path), path,
                                 exec_caller ? exec_caller->cwd_path : "/")) {
+    vfs_close(exec_file);
     kfree(path);
-    for (int i = 0; i < argc; i++) kfree(k_argv[i]);
-    kfree(k_argv);
-    for (int i = 0; i < envc; i++) kfree(k_envp[i]);
-    kfree(k_envp);
+    exec_args_free(&strs, k_argv, k_envp);
     return (uint64_t)-36; // ENAMETOOLONG: never publish a truncated exe link
   }
 
@@ -348,13 +449,9 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   uint64_t *new_pml4 = vmm_create_pml4();
   TSC_END(execve_pml4_create);
   if (!new_pml4) {
+    vfs_close(exec_file);
     kfree(path);
-    for (int i = 0; i < argc; i++)
-      kfree(k_argv[i]);
-    kfree(k_argv);
-    for (int i = 0; i < envc; i++)
-      kfree(k_envp[i]);
-    kfree(k_envp);
+    exec_args_free(&strs, k_argv, k_envp);
     return (uint64_t)-12;
   }
 
@@ -383,13 +480,9 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
     if (!new_mm) {
       /* Nothing has been modified yet: free the execve scratch buffers and
        * report the failure, staying on the current address space. */
+      vfs_close(exec_file);
       kfree(path);
-      for (int i = 0; i < argc; i++)
-        kfree(k_argv[i]);
-      kfree(k_argv);
-      for (int i = 0; i < envc; i++)
-        kfree(k_envp[i]);
-      kfree(k_envp);
+      exec_args_free(&strs, k_argv, k_envp);
       return (uint64_t)-12;
     }
   }
@@ -434,7 +527,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
   elf_info_t elf_info = {0};
   TSC_BEGIN(execve_elf_load);
-  if (!elf_load(path, new_pml4, &elf_info)) {
+  if (!elf_load(exec_file, new_pml4, &elf_info)) {
     TSC_END(execve_elf_load);
     klog_puts("[PROC] execve failed path=\"");
     klog_puts(path);
@@ -468,12 +561,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       current->mm->compat32 = old_compat32;
     }
     kfree(path);
-    for (int i = 0; i < argc; i++)
-      kfree(k_argv[i]);
-    kfree(k_argv);
-    for (int i = 0; i < envc; i++)
-      kfree(k_envp[i]);
-    kfree(k_envp);
+    exec_args_free(&strs, k_argv, k_envp);
     // Note: new_pml4 is leaked if elf_load fails. Fixing that would require
     // vmm_destroy_pml4 or similar, but for now we focus on the reported leak.
     return (uint64_t)-8; // ENOEXEC
@@ -527,9 +615,11 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       (const char **)k_envp, &elf_info);
   TSC_END(execve_stack);
 
+#ifdef TSC_AUTO_DUMP
   /* Parent-side vfork_wait already dumps completed samples. Avoid rendering
    * a duplicate exec table while the borrowing child still holds it asleep. */
   bool borrowed_vfork = (current->clone_flags & CLONE_VFORK) != 0;
+#endif
   /* Successful exec starts with architectural FPU defaults. */
   fpu_reset_current();
 
@@ -539,11 +629,13 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   /* Probes are cumulative (fork stats must survive to be averaged), so print
    * the first few launches; fork_probe_maybe_dump() covers later activity. */
   {
+#ifdef TSC_AUTO_DUMP /* prctl(0x50544344) still dumps on demand */
     static uint32_t exec_probe_dumps;
     if (!borrowed_vfork && exec_probe_dumps < 4) {
       exec_probe_dumps++;
       tsc_probe_dump();
     }
+#endif
   }
 
   uint64_t actual_entry =
@@ -588,6 +680,8 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
   // Publish only after successful exec; argv and AT_EXECFN retain the caller path.
   strcpy(current->exe_path, saved_exe_path);
+  /* Queue readahead for the windows this executable faulted in last time. */
+  vfs_exec_profile_prefetch(current->exe_path);
 
   // Map the vsyscall page into the new address space
   vmm_map_vsyscall_page((uint64_t *)current->cr3);
@@ -605,18 +699,25 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
     vmm_queue_free_user_pages_vma(old_cr3, &old_vmas);
     TSC_END(exec_free_old);
   }
+  /* Fault counters describe the new image only, so /proc/<pid>/status shows
+   * what this launch cost (Linux keeps them across exec; we want startup). */
+  __atomic_store_n(&current->mm->nr_faults, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&current->mm->maj_flt, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&current->mm->fault_cycles, 0, __ATOMIC_RELAXED);
+  for (int c = 0; c < 3; c++) {
+    __atomic_store_n(&current->mm->fault_class_count[c], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&current->mm->fault_class_cycles[c], 0, __ATOMIC_RELAXED);
+  }
+  __atomic_store_n(&current->mm->nr_syscalls, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&current->mm->syscall_cycles, 0, __ATOMIC_RELAXED);
+
   // Now destroy the old VMA tree nodes
   TSC_BEGIN(exec_vma_destroy);
   vma_list_destroy(&old_vmas);
   TSC_END(exec_vma_destroy);
 
   // Cleanup kernel-side copies
-  for (int i = 0; i < argc; i++)
-    kfree(k_argv[i]);
-  kfree(k_argv);
-  for (int i = 0; i < envc; i++)
-    kfree(k_envp[i]);
-  kfree(k_envp);
+  exec_args_free(&strs, k_argv, k_envp);
   kfree(path);
 
   // Reset TLS Bases for this process

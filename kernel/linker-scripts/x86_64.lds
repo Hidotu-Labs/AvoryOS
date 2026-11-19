@@ -25,6 +25,34 @@ SECTIONS {
         __kernel_text_end = .;
     } :text
 
+    . = ALIGN(0x1000);
+
+    .rodata : {
+        *(.rodata .rodata.*)
+        . = ALIGN(8);
+        __start___ex_table = .;
+        KEEP(*(__ex_table))
+        __stop___ex_table = .;
+    } :rodata
+
+    /* LinuxKPI module parameters and __setup/early_param handlers.  The
+     * parser in linuxkpi/src/params.c walks these when applying the boot
+     * command line.  KEEP is mandatory: --gc-sections would discard the
+     * entries (and their referenced variables/functions) otherwise. */
+    .kpi_params : ALIGN(8) {
+        __kpi_param_start = .;
+        KEEP(*(.kpi_params))
+        __kpi_param_end = .;
+    } :rodata
+
+    .kpi_setups : ALIGN(8) {
+        __kpi_setup_start = .;
+        KEEP(*(.kpi_setups))
+        __kpi_setup_end = .;
+    } :rodata
+
+    . = ALIGN(0x1000);
+
     /* LinuxKPI initcalls (module_init and friends).  Upstream Linux places
      * these function pointers in .initcall<level>.init sections.  The walker
      * in kernel/src/linuxkpi/init.c iterates __initcall_start..__initcall_end
@@ -58,39 +86,13 @@ SECTIONS {
         KEEP(*(.initcall7.init))
         KEEP(*(.initcall7s.init))
         __initcall_end = .;
-    } :text
+    } :data
 
-    /* LinuxKPI module parameters and __setup/early_param handlers.  The
-     * parser in linuxkpi/src/params.c walks these when applying the boot
-     * command line.  KEEP is mandatory: --gc-sections would discard the
-     * entries (and their referenced variables/functions) otherwise. */
-    .kpi_params : ALIGN(8) {
-        __kpi_param_start = .;
-        KEEP(*(.kpi_params))
-        __kpi_param_end = .;
-    } :text
-
-    .kpi_setups : ALIGN(8) {
-        __kpi_setup_start = .;
-        KEEP(*(.kpi_setups))
-        __kpi_setup_end = .;
-    } :text
-
-    . = ALIGN(0x1000);
-
-    .rodata : {
-        *(.rodata .rodata.*)
-        . = ALIGN(8);
-        __start___ex_table = .;
-        KEEP(*(__ex_table))
-        __stop___ex_table = .;
-        . = ALIGN(8);
+    .bug_table : ALIGN(8) {
         __start___bug_table = .;
         KEEP(*(__bug_table))
         __stop___bug_table = .;
-    } :rodata
-
-    . = ALIGN(0x1000);
+    } :data
 
     .data : {
         . = ALIGN(0x1000);

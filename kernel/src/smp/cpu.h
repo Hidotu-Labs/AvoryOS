@@ -48,6 +48,7 @@ struct cpu_info {
   // stack handoff so interrupts observe the arriving task.
   struct thread *switching_from;
   uint64_t sigreturn_frame;
+  uint64_t stack_canary;
 #define MAX_TIMER_HEAP_SIZE 1024
 
   // Timed sleepers ordered by wakeup_ticks; the cached leftmost node is the
@@ -89,8 +90,11 @@ _Static_assert(offsetof(struct cpu_info, switching_from) == 376,
                "update switch.asm switching_from offset");
 _Static_assert(offsetof(struct cpu_info, sigreturn_frame) == 384,
                "update syscall_entry.asm sigreturn offset");
+_Static_assert(offsetof(struct cpu_info, stack_canary) == 392,
+               "update GNUmakefile and switch.asm stack_canary offset");
 
 // Public API
+__attribute__((no_stack_protector)) void cpu_early_init_bsp_canary(uint64_t canary);
 
 // Initialize the per-CPU subsystem.  Must be called after pmm_init() and
 // acpi_init() so that physical memory can be allocated and APIC IDs are known.

@@ -120,7 +120,17 @@ void vfork_release_parent(struct thread *child) {
 static void vfork_wait_for_child(struct thread *parent) {
   TSC_BEGIN(vfork_wait);
   uint64_t released_at = 0;
+  uint32_t child_tid = parent->vfork_child;
   for (;;) {
+    /* The flag plus one wakeup is the fast path.  Also accept the child's
+     * real state: a child seen as a zombie with the parent still waiting
+     * (vfork_done=0) stalled kded6 - and every D-Bus caller behind it, such
+     * as plasmashell - after a posix_spawn whose execve failed. */
+    if (child_tid && sched_vfork_child_settled(child_tid)) {
+      released_at = __atomic_load_n(&parent->vfork_release_tsc,
+                                     __ATOMIC_RELAXED);
+      break;
+    }
     struct cpu_info *cpu = cpu_get_current();
     hal_irq_state_t irq = hal_irq_save();
     spinlock_acquire(&cpu->queue_lock);
@@ -134,11 +144,15 @@ static void vfork_wait_for_child(struct thread *parent) {
       hal_irq_restore(irq);
       break;
     }
+    /* Bounded block: a lost wakeup costs at most a few ticks, then the
+     * child-state check above settles the rendezvous. */
+    parent->wakeup_ticks = lapic_timer_get_ticks() + 5;
     spinlock_release(&cpu->queue_lock);
     hal_irq_restore(irq);
     /* A completion after unlock makes us runnable before yield, or wakes us
      * after the switch. Spurious signal wakeups simply repeat the handshake. */
     sched_yield();
+    parent->wakeup_ticks = 0;
   }
   parent->vfork_child = 0;
   uint64_t resumed_at = rdtsc_fence();
@@ -154,8 +168,12 @@ static void vfork_wait_for_child(struct thread *parent) {
    * samples from the parent. This is elapsed time, not CPU time. */
   static uint32_t waits;
   uint32_t n = __atomic_add_fetch(&waits, 1, __ATOMIC_RELAXED);
+#ifdef TSC_AUTO_DUMP /* off by default: ~10 KB of serial per boot */
   if (n <= 4 || n == 16 || n == 64)
     tsc_probe_dump();
+#else
+  (void)n;
+#endif
 }
 // Fork child kernel thread entry point
 // This function runs as a kernel thread.  When scheduled, it switches to the
@@ -202,8 +220,10 @@ static void fork_child_entry(void) {
 static void fork_probe_maybe_dump(void) {
   static uint32_t forks;
   uint32_t n = __atomic_add_fetch(&forks, 1, __ATOMIC_RELAXED);
+#ifdef TSC_AUTO_DUMP
   if (n == 16 || n == 64)
     tsc_probe_dump();
+#endif
   /* Zero-pool hit rate next to the TSC table: boot is pool-cold by
    * construction (no idle time during the exec storm), steady state should
    * show hits climbing once idle refills. Every 64th fork, additive. */
@@ -691,10 +711,13 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     sched_share_fs(child, parent);
   if (new_net) { net_namespace_install(child, new_net); new_net = NULL; }
   uint32_t visible_child_tid = pid_namespace_tid(parent, child);
-  if (flags & CLONE_PARENT_SETTID)
-    __atomic_store_n((uint32_t *)ptid, visible_child_tid, __ATOMIC_RELEASE);
-  if ((flags & CLONE_CHILD_SETTID) && (flags & CLONE_VM))
-    __atomic_store_n((uint32_t *)ctid, pid_namespace_tid(child, child), __ATOMIC_RELEASE);
+  if ((flags & CLONE_PARENT_SETTID) && is_user_range((const void *)ptid, sizeof(uint32_t)))
+    copy_to_user((void *)ptid, &visible_child_tid, sizeof(uint32_t));
+  if ((flags & CLONE_CHILD_SETTID) && (flags & CLONE_VM) &&
+      is_user_range((const void *)ctid, sizeof(uint32_t))) {
+    uint32_t child_ns_tid = pid_namespace_tid(child, child);
+    copy_to_user((void *)ctid, &child_ns_tid, sizeof(uint32_t));
+  }
   if (pidfd_fd >= 0) {
     /* The child has copied the descriptor table by now, so the pidfd is only
      * the parent's.  Publish it before the child runs: the whole point of a

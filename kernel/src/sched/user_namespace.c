@@ -26,8 +26,17 @@ struct user_namespace *user_namespace_create(struct user_namespace *parent) {
   if (!ns) return NULL;
   memset(ns, 0, sizeof(*ns));
   ns->refs = 1;
+  spinlock_init(&ns->lock);
   ns->level = level;
   ns->parent = user_namespace_get(parent);
+  return ns;
+}
+
+static struct user_namespace *user_namespace_from_thread(struct thread *t) {
+  if (!t) return NULL;
+  spinlock_acquire(&t->namespace_lock);
+  struct user_namespace *ns = user_namespace_get(t->user_ns);
+  spinlock_release(&t->namespace_lock);
   return ns;
 }
 
@@ -58,11 +67,23 @@ void user_namespace_mark_owned(struct thread *t, unsigned kind) {
 }
 
 bool user_namespace_setgroups_denied(struct thread *t) {
-  if (!t) return false;
-  spinlock_acquire(&t->namespace_lock);
-  bool denied = t->user_ns && t->user_ns->setgroups_denied;
-  spinlock_release(&t->namespace_lock);
+  struct user_namespace *ns = user_namespace_from_thread(t);
+  if (!ns) return false;
+  spinlock_acquire(&ns->lock);
+  bool denied = ns->setgroups_denied;
+  spinlock_release(&ns->lock);
+  user_namespace_put(ns);
   return denied;
+}
+
+bool user_namespace_uid_is_root(struct thread *t, uint32_t uid) {
+  struct user_namespace *ns = user_namespace_from_thread(t);
+  if (!ns) return false;
+  spinlock_acquire(&ns->lock);
+  bool root = ns->uid_map_set && ns->uid_inside == 0 && ns->uid_outside == uid;
+  spinlock_release(&ns->lock);
+  user_namespace_put(ns);
+  return root;
 }
 
 static bool parse_u32(const char **p, uint32_t *out) {
@@ -89,46 +110,50 @@ static bool skip_blank(const char **p) {
  * supported, and an unprivileged writer may map only its own id, as Linux
  * requires. */
 int64_t user_namespace_write_map(struct thread *t, bool gid, const char *buf, uint32_t len) {
-  if (!t) return -1;
-  spinlock_acquire(&t->namespace_lock);
-  struct user_namespace *ns = t->user_ns;
-  bool already_set = !ns || (gid ? ns->gid_map_set : ns->uid_map_set);
-  bool needs_setgroups_deny = gid && ns && !ns->setgroups_denied;
-  spinlock_release(&t->namespace_lock);
-  /* The initial namespace is not writable, and each map is written once. */
-  if (already_set || needs_setgroups_deny) return -1;
-  if (len == 0 || len >= USER_NS_MAP_TEXT) return -22;
+  struct user_namespace *ns = user_namespace_from_thread(t);
+  /* The initial namespace is not writable. */
+  if (!ns) return -1;
+  if (len == 0 || len >= USER_NS_MAP_TEXT) { user_namespace_put(ns); return -22; }
 
   char text[USER_NS_MAP_TEXT];
   memcpy(text, buf, len);
   text[len] = '\0';
   for (uint32_t i = 0; i + 1 < len; i++)
-    if (text[i] == '\n') return -22;
+    if (text[i] == '\n') { user_namespace_put(ns); return -22; }
 
   const char *p = text;
   uint32_t inside, outside, count;
   if (!parse_u32(&p, &inside) || !skip_blank(&p) || !parse_u32(&p, &outside) ||
-      !skip_blank(&p) || !parse_u32(&p, &count))
+      !skip_blank(&p) || !parse_u32(&p, &count)) {
+    user_namespace_put(ns);
     return -22;
+  }
   if (*p == '\n') p++;
-  if (*p) return -22;
-  if (count != 1) return -22;
+  if (*p || count != 1) { user_namespace_put(ns); return -22; }
 
-  spinlock_acquire(&t->namespace_lock);
   uint32_t own = gid ? t->egid : t->euid;
   if (outside != own) {
-    spinlock_release(&t->namespace_lock);
+    user_namespace_put(ns);
     return -1;
   }
-  if (gid ? ns->gid_map_set : ns->uid_map_set) {
-    spinlock_release(&t->namespace_lock);
+
+  spinlock_acquire(&ns->lock);
+  bool already_set = gid ? ns->gid_map_set : ns->uid_map_set;
+  bool needs_setgroups_deny = gid && !ns->setgroups_denied;
+  if (already_set || needs_setgroups_deny) {
+    spinlock_release(&ns->lock);
+    user_namespace_put(ns);
     return -1;
   }
   memcpy(gid ? ns->gid_map : ns->uid_map, text, len);
   if (gid) ns->gid_map_set = true;
-  else ns->uid_map_set = true;
-  spinlock_release(&t->namespace_lock);
-  (void)inside;
+  else {
+    ns->uid_inside = inside;
+    ns->uid_outside = outside;
+    ns->uid_map_set = true;
+  }
+  spinlock_release(&ns->lock);
+  user_namespace_put(ns);
   return (int64_t)len;
 }
 
@@ -142,30 +167,33 @@ int64_t user_namespace_write_setgroups(struct thread *t, const char *buf, uint32
   bool allow = n == 5 && memcmp(buf, "allow", 5) == 0;
   if (!deny && !allow) return -22;
 
-  spinlock_acquire(&t->namespace_lock);
-  struct user_namespace *ns = t->user_ns;
+  struct user_namespace *ns = user_namespace_from_thread(t);
+  if (!ns) return -1;
+  spinlock_acquire(&ns->lock);
   int64_t result = (int64_t)len;
-  if (!ns) {
-    result = -1;
-  } else if (deny) {
+  if (deny) {
     if (ns->gid_map_set && !ns->setgroups_denied) result = -1;
     else ns->setgroups_denied = true;
   } else if (ns->setgroups_denied) {
     result = -1;
   }
-  spinlock_release(&t->namespace_lock);
+  spinlock_release(&ns->lock);
+  user_namespace_put(ns);
   return result;
 }
 
 uint32_t user_namespace_map_text(struct thread *t, bool gid, char *out, uint32_t cap) {
   if (!t || !out || !cap) return 0;
-  spinlock_acquire(&t->namespace_lock);
-  const char *src = t->user_ns ? (gid ? t->user_ns->gid_map : t->user_ns->uid_map) : "";
+  struct user_namespace *ns = user_namespace_from_thread(t);
+  if (!ns) return 0;
+  spinlock_acquire(&ns->lock);
+  const char *src = gid ? ns->gid_map : ns->uid_map;
   uint32_t len = 0;
   while (len + 1 < cap && len < USER_NS_MAP_TEXT && src[len]) {
     out[len] = src[len];
     len++;
   }
-  spinlock_release(&t->namespace_lock);
+  spinlock_release(&ns->lock);
+  user_namespace_put(ns);
   return len;
 }

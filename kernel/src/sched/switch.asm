@@ -28,6 +28,14 @@ switch_context:
     ; Load new stack pointer from new_t->rsp (offset 0)
     mov rsp, [rsi]
 
+    ; Switch per-CPU stack canary to the incoming thread's canary
+    ; (new_t->stack_canary at offset 56 -> cpu_info.stack_canary at gs:392).
+    mov rax, [rsi + 56]
+    test rax, rax
+    jz .keep_canary
+    mov [gs:392], rax
+.keep_canary:
+
     ; The old kernel stack is no longer in use. Clear this actual CPU's
     ; stack hazard and release old_t->on_cpu (offset 16) here so no remote
     ; CPU can migrate or dispatch old_t before its rsp is saved.

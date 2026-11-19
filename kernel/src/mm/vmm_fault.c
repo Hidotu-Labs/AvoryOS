@@ -10,8 +10,13 @@
 #include "../fs/vfs.h"
 #include "../hal/hal.h"
 #include "../lib/string.h"
+#include "../lib/tsc.h"
 #include "../sched/sched.h"
+#include "../sched/seccomp.h"
 #include "../smp/cpu.h"
+#include "../syscalls/syscall.h"
+#include "../drivers/timer/rtc.h"
+#include "arch/uaccess.h"
 #include "pmm.h"
 #include "numa.h"
 #include "mempolicy.h"
@@ -513,8 +518,30 @@ static inline bool vma_wants_huge(uint64_t flags, bool write_fault) {
          !(flags & (MAP_NOHUGEPAGE | MAP_STACK | MAP_GROWSDOWN | MAP_SYSV_SHM));
 }
 
+static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
+                                       struct registers *regs);
+
+/* Accounting wrapper: per-mm fault count and time, no global lock, so it is
+ * cheap enough to stay on in every build. */
 int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
                           struct registers *regs) {
+  struct thread *current = sched_get_current();
+  struct mm_struct *mm = current ? current->mm : NULL;
+  uint64_t t0 = rdtsc();
+  int rc = vmm_handle_page_fault_inner(cr2, error_code, regs);
+  if (mm) {
+    uint64_t dt = rdtsc() - t0;
+    int cls = (error_code & 0x1) ? 2 : (error_code & 0x2) ? 1 : 0;
+    __atomic_add_fetch(&mm->nr_faults, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&mm->fault_cycles, dt, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&mm->fault_class_count[cls], 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&mm->fault_class_cycles[cls], dt, __ATOMIC_RELAXED);
+  }
+  return rc;
+}
+
+static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
+                                       struct registers *regs) {
   bool user_mode = (error_code & 0x4) != 0;
   bool write_fault = (error_code & 0x2) != 0;
   bool present_bit = (error_code & 0x1) != 0;
@@ -522,6 +549,11 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
 
 
   struct thread *current = sched_get_current();
+  if (!user_mode && present_bit && cpu_has_smap_flag &&
+      cr2 <= USER_SPACE_LIMIT && regs && !(regs->rflags & (1ULL << 18))) {
+    return PF_REJECT("SMAP violation: supervisor access to user memory with AC=0",
+                     0, 0);
+  }
   if (!current)
     return PF_REJECT("no current thread - fault outside any thread context", 0,
                      0);
@@ -1328,10 +1360,10 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
         }
       } else {
         /* On-demand readahead: prefetch 128 KB window ahead of cold write/read fault */
-        if (node && node->read && (node->flags & FS_TYPE_MASK) == FS_FILE) {
-          (void)vfs_cache_readahead(node, file_offset, 128 * 1024);
-        }
+        vfs_cache_fault_readahead(node, file_offset);
+        uint64_t cold_n = __atomic_add_fetch(&current->mm->maj_flt, 1, __ATOMIC_RELAXED);
         cached = vfs_cache_get_or_create(node, file_offset);
+        vfs_exec_profile_note_cold(node, file_offset, current->exe_path, cold_n);
       }
       pf_restore_irqs_after_wait(irq_state);
 
@@ -1401,10 +1433,10 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
         }
       } else {
         /* On-demand readahead: prefetch 128 KB window ahead of cold execution/read fault */
-        if (node && node->read && (node->flags & FS_TYPE_MASK) == FS_FILE) {
-          (void)vfs_cache_readahead(node, file_offset, 128 * 1024);
-        }
+        vfs_cache_fault_readahead(node, file_offset);
+        uint64_t cold_n = __atomic_add_fetch(&current->mm->maj_flt, 1, __ATOMIC_RELAXED);
         cached = vfs_cache_get_or_create(node, file_offset);
+        vfs_exec_profile_note_cold(node, file_offset, current->exe_path, cold_n);
       }
       pf_restore_irqs_after_wait(irq_state);
 
@@ -1797,7 +1829,47 @@ void vmm_map_signal_trampoline(uint64_t *pml4) {
 // ─────────────────────────────────────────────────────────────────────────────
 #define VSYSCALL_BASE 0xFFFFFFFFFF600000ULL
 
+enum vsyscall_mode_t {
+  VSYSCALL_EMULATE = 0,
+  VSYSCALL_NONE = 1,
+  VSYSCALL_NATIVE = 2,
+};
+
 static uint64_t vsyscall_page_phys = 0;
+static enum vsyscall_mode_t vsyscall_mode = VSYSCALL_EMULATE;
+
+extern const char *kernel_boot_cmdline;
+
+static bool cmdline_tok_eq(const char *tok, size_t tok_len, const char *lit) {
+  size_t i = 0;
+  while (i < tok_len && lit[i] != '\0' && tok[i] == lit[i])
+    i++;
+  return i == tok_len && lit[i] == '\0';
+}
+
+static enum vsyscall_mode_t vsyscall_parse_cmdline(const char *cmdline) {
+  enum vsyscall_mode_t mode = VSYSCALL_EMULATE;
+  if (!cmdline)
+    return mode;
+  const char *p = cmdline;
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n')
+      p++;
+    if (!*p)
+      break;
+    const char *start = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n')
+      p++;
+    size_t len = (size_t)(p - start);
+    if (cmdline_tok_eq(start, len, "vsyscall=none"))
+      mode = VSYSCALL_NONE;
+    else if (cmdline_tok_eq(start, len, "vsyscall=native"))
+      mode = VSYSCALL_NATIVE;
+    else if (cmdline_tok_eq(start, len, "vsyscall=emulate"))
+      mode = VSYSCALL_EMULATE;
+  }
+  return mode;
+}
 
 extern uint8_t vdso_blob_start[];
 extern uint8_t vdso_blob_end[];
@@ -1848,6 +1920,7 @@ void vmm_update_vdso_data(void) {
 
 
 void vmm_init_vsyscall_page(void) {
+  vsyscall_mode = vsyscall_parse_cmdline(kernel_boot_cmdline);
   if (vsyscall_page_phys != 0)
     return; // already done
 
@@ -1883,8 +1956,116 @@ uint64_t vmm_get_vsyscall_page_phys(void) {
 void vmm_map_vsyscall_page(uint64_t *pml4) {
   if (vsyscall_page_phys == 0)
     return;
-  // Map legacy vsyscall page (0xFFFFFFFFFF600000) for HotSpot getcpu stub
-  vmm_map_page(pml4, VSYSCALL_BASE, vsyscall_page_phys, PAGE_FLAG_USER);
-  // Map standard ELF vDSO page (0x700000000000) for musl/glibc dynamic linker
+  if (vsyscall_mode == VSYSCALL_NATIVE) {
+    // Only map the fixed legacy vsyscall page when explicitly opted in.
+    vmm_map_page(pml4, VSYSCALL_BASE, vsyscall_page_phys, PAGE_FLAG_USER);
+  }
+  // Always map the standard ELF vDSO page (0x700000000000) for musl/glibc.
   vmm_map_page(pml4, VDSO_USER_BASE, vsyscall_page_phys, PAGE_FLAG_USER);
+}
+
+static inline bool vsyscall_user_range_ok(uint64_t ptr, size_t len) {
+  return ptr != 0 && len <= 0x0000800000000000ULL &&
+         ptr <= 0x0000800000000000ULL - len;
+}
+
+bool vmm_emulate_vsyscall(uint64_t fault_addr, struct registers *regs) {
+  if (!regs || vsyscall_mode != VSYSCALL_EMULATE)
+    return false;
+  if ((regs->cs & 3) != 3 || regs->cs != 0x2B)
+    return false;
+  if ((regs->err_code & 0x10ULL) == 0 || regs->rip != fault_addr)
+    return false;
+
+  uint32_t nr = 0;
+  switch (fault_addr) {
+  case VSYSCALL_BASE + 0x000:
+    nr = SYS_GETTIMEOFDAY;
+    break;
+  case VSYSCALL_BASE + 0x400:
+    nr = SYS_TIME;
+    break;
+  case VSYSCALL_BASE + 0x800:
+    nr = SYS_GETCPU;
+    break;
+  default:
+    return false;
+  }
+
+  uint64_t ret_addr = 0;
+  if (!vsyscall_user_range_ok(regs->rsp, sizeof(ret_addr)) ||
+      copy_from_user(&ret_addr, (const void *)regs->rsp, sizeof(ret_addr)) != 0 ||
+      ret_addr >= 0x0000800000000000ULL) {
+    return false;
+  }
+
+  struct thread *cur = sched_get_current();
+  if (cur && seccomp_mode(cur) != 0) {
+    struct syscall_regs sc_regs;
+    memset(&sc_regs, 0, sizeof(sc_regs));
+    sc_regs.rdi = regs->rdi;
+    sc_regs.rsi = regs->rsi;
+    sc_regs.rdx = regs->rdx;
+    sc_regs.rax = nr;
+    sc_regs.rip = regs->rip;
+    sc_regs.rsp = regs->rsp;
+    sc_regs.rflags = regs->rflags;
+    sc_regs.user_cs = regs->cs;
+    uint64_t args[6] = {regs->rdi, regs->rsi, regs->rdx, 0, 0, 0};
+    if (!seccomp_syscall(cur, &sc_regs, nr, 0xC000003EU /* AUDIT_ARCH_X86_64 */,
+                         args)) {
+      regs->rax = sc_regs.rax;
+      regs->rip = ret_addr;
+      regs->rsp += 8;
+      return true;
+    }
+  }
+
+  uint64_t ret = 0;
+  if (nr == SYS_GETTIMEOFDAY) {
+    uint64_t tv_ptr = regs->rdi;
+    if (tv_ptr != 0) {
+      if (!vsyscall_user_range_ok(tv_ptr, 16)) {
+        ret = (uint64_t)-14;
+      } else {
+        uint64_t ns = lapic_timer_get_ns();
+        uint64_t tv[2];
+        tv[0] = rtc_get_boot_timestamp() + (ns / 1000000000ULL);
+        tv[1] = (ns % 1000000000ULL) / 1000ULL;
+        ret = copy_to_user((void *)tv_ptr, tv, sizeof(tv)) ? (uint64_t)-14 : 0;
+      }
+    }
+  } else if (nr == SYS_TIME) {
+    uint64_t tloc_ptr = regs->rdi;
+    uint64_t sec = rtc_get_boot_timestamp() + (lapic_timer_get_ns() / 1000000000ULL);
+    if (tloc_ptr != 0) {
+      if (!vsyscall_user_range_ok(tloc_ptr, sizeof(sec)) ||
+          copy_to_user((void *)tloc_ptr, &sec, sizeof(sec)) != 0) {
+        ret = (uint64_t)-14;
+      } else {
+        ret = sec;
+      }
+    } else {
+      ret = sec;
+    }
+  } else {
+    /* SYS_GETCPU */
+    struct cpu_info *ci = cpu_get_current();
+    uint32_t cpu_id = ci ? ci->cpu_id : 0;
+    uint32_t node = (uint32_t)numa_cpu_to_node(cpu_id);
+    if (regs->rdi != 0 && (!vsyscall_user_range_ok(regs->rdi, sizeof(cpu_id)) ||
+                           copy_to_user((void *)regs->rdi, &cpu_id, sizeof(cpu_id)) != 0)) {
+      ret = (uint64_t)-14;
+    } else if (regs->rsi != 0 && (!vsyscall_user_range_ok(regs->rsi, sizeof(node)) ||
+                                  copy_to_user((void *)regs->rsi, &node, sizeof(node)) != 0)) {
+      ret = (uint64_t)-14;
+    } else {
+      ret = 0;
+    }
+  }
+
+  regs->rax = ret;
+  regs->rip = ret_addr;
+  regs->rsp += 8;
+  return true;
 }

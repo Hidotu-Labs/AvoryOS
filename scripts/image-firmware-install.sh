@@ -15,6 +15,8 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/lib/firmware"
 cp -a "$SOURCE/." "$STAGE/lib/firmware/"
+bash "$ROOT/scripts/prune-nvidia-firmware.sh" "$STAGE/lib/firmware"
+python3 "$ROOT/scripts/dedup-firmware.py" "$STAGE/lib/firmware"
 cp "$TEST_BLOB" "$STAGE/lib/firmware/test_fw.bin"
 
 bash "$ROOT/scripts/populate-ext2-dir.sh" "$IMAGE" "$STAGE/lib/firmware" /lib/firmware

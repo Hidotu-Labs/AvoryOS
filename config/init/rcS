@@ -117,6 +117,12 @@ UDEV_OK=1
 if [ -x /usr/lib/systemd/systemd-udevd ] && command -v udevadm >/dev/null 2>&1; then
     mkdir -p /run/udev
     /usr/lib/systemd/systemd-udevd --daemon --resolve-names=never >>/var/log/udev.log 2>&1
+    # --daemon returns before the child binds its socket: wait up to 5 s.
+    i=0
+    while [ ! -S /run/udev/control ] && [ "$i" -lt 50 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
     if udevadm control --timeout=5 --ping >>/var/log/udev.log 2>&1; then
         UDEV_OK=0
     fi

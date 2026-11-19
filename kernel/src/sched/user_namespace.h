@@ -2,6 +2,7 @@
 #define AVORY_USER_NAMESPACE_H
 #include <stdbool.h>
 #include <stdint.h>
+#include "../lock/spinlock.h"
 
 struct thread;
 
@@ -29,11 +30,13 @@ enum user_ns_owned_kind {
 
 struct user_namespace {
   uint64_t refs;
+  spinlock_t lock;
   struct user_namespace *parent; /* NULL: the initial user namespace. */
   uint32_t level;
   bool setgroups_denied;
   bool uid_map_set;
   bool gid_map_set;
+  uint32_t uid_inside, uid_outside; /* Single extent, valid if uid_map_set. */
   char uid_map[USER_NS_MAP_TEXT];
   char gid_map[USER_NS_MAP_TEXT];
 };
@@ -54,6 +57,9 @@ int64_t user_namespace_write_setgroups(struct thread *t, const char *buf, uint32
  * length, or 0 when t is in the initial user namespace. */
 uint32_t user_namespace_map_text(struct thread *t, bool gid, char *out, uint32_t cap);
 bool user_namespace_setgroups_denied(struct thread *t);
+/* True when t's user namespace maps outside uid `uid` to inside uid 0, so
+ * exec should treat the thread as root there (credentials stay untranslated). */
+bool user_namespace_uid_is_root(struct thread *t, uint32_t uid);
 
 static inline void user_namespace_cleanup(struct user_namespace **ns) {
   user_namespace_put(*ns);

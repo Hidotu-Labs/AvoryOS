@@ -47,7 +47,12 @@ def populate(image, source, destination):
     if not os.access(debugfs, os.X_OK):
         debugfs = 'debugfs'
     debugfs_image = buffered_image(debugfs, image)
-    excludes = os.environ.get('EXCLUDE_IMAGE_PATHS') or 'usr/include usr/share/doc usr/share/man'
+    # Downloaded package archives (var/cache/{axon,pacman}/pkg) stay in the
+    # host rootfs, where bootstrap replay and rebuilds reuse them; the guest
+    # only gets the empty directories (~2 GiB saved).
+    excludes = os.environ.get('EXCLUDE_IMAGE_PATHS') or (
+        'usr/include usr/share/doc usr/share/man '
+        'var/cache/axon/pkg/* var/cache/pacman/pkg/*')
     excludes = excludes.split()
     archive_pattern = os.environ.get('EXCLUDE_IMAGE_STATIC', '*.a')
 

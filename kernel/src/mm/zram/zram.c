@@ -430,6 +430,14 @@ int zram_fault(struct mm_struct *mm, uint64_t cr3, uint64_t va, bool write,
   if (!enabled)
     return 0;
   va &= ~(PAGE_SIZE - 1ULL);
+  /* Lockless pre-check: nearly every not-present fault is a first touch with
+   * no swap slot, and taking mm->lock + vmm_lock just to learn that was a
+   * fixed cost on every demand fault.  Page tables are reached through the
+   * HHDM, so a stale walk reads harmless memory; a slot found here is
+   * re-validated under both locks below. */
+  uint64_t *pte_peek = vmm_get_pte_ptr((uint64_t *)cr3, va);
+  if (!pte_peek || !zram_pte_slot(__atomic_load_n(pte_peek, __ATOMIC_RELAXED)))
+    return 0;
   spinlock_acquire(&mm->lock);
   vmm_lock_acquire_for((uint64_t *)cr3, va);
   uint64_t *pte = vmm_get_pte_ptr((uint64_t *)cr3, va);

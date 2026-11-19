@@ -1135,11 +1135,11 @@ static bool usb_mouse_probe_with(struct usb_device *dev,
           (struct usb_interface_descriptor_m *)&config_buf[offset];
       current = NULL;
 
-      klog_puts("[USB-MOUSE] Interface: class=0x");
+      klog_puts("[USB-MOUSE] Interface: class=");
       klog_hex32(iface->interface_class);
-      klog_puts(" subclass=0x");
+      klog_puts(" subclass=");
       klog_hex32(iface->interface_subclass);
-      klog_puts(" protocol=0x");
+      klog_puts(" protocol=");
       klog_hex32(iface->interface_protocol);
       klog_puts("\n");
 
@@ -1170,7 +1170,7 @@ static bool usb_mouse_probe_with(struct usb_device *dev,
         current->max_packet = ep->max_packet_size;
         current->interval = ep->interval;
 
-        klog_puts("[USB-MOUSE] Interrupt IN endpoint: addr=0x");
+        klog_puts("[USB-MOUSE] Interrupt IN endpoint: addr=");
         klog_hex32(current->ep_addr);
         klog_puts(" maxpkt=");
         klog_uint64(current->max_packet);

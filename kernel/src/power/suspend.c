@@ -10,6 +10,7 @@
 #include "../cpu/idt.h"
 #include "../cpu/irq.h"
 #include "../cpu/isr.h"
+#include "../cpu/msr.h"
 #include "../cpu/pic.h"
 #include "../drivers/manager/device.h"
 #include "../drivers/pci/pci.h"
@@ -83,8 +84,9 @@ void power_s3_before_sleep(void) {
 /* The real-mode trampoline restores the BSP's kernel CR3 and jumps here with
  * interrupts disabled. Rebuild the architectural state that firmware may
  * have reset before any device callback or AP is allowed to run. */
-void power_s3_restore_bsp_early(void) {
+__attribute__((no_stack_protector)) void power_s3_restore_bsp_early(void) {
   __asm__ volatile("clts" ::: "memory");
+  wrmsr(0xC0000101U, (uint64_t)cpu_get_bsp());
   cpu_features_init();
   serial_resume();
   gdt_reload_bsp();

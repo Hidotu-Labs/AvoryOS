@@ -23,6 +23,7 @@
 #include "../sched/pid_namespace.h"
 #include "../sched/seccomp.h"
 #include "../sched/net_namespace.h"
+#include "../include/arch/uaccess.h"
 #include "../fs/mount_namespace.h"
 #include "../sched/wait.h"
 #include "../smp/cpu.h"
@@ -53,6 +54,9 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
   struct thread *current = sched_get_current();
   if (!current)
     return (uint64_t)-10; // ECHILD
+
+  if (wstatus_ptr != 0 && !is_user_range((const void *)wstatus_ptr, sizeof(int)))
+    return (uint64_t)-14;
 
   int target_pid = (int)pid;
 
@@ -174,9 +178,12 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
 
     if (zombie) {
       if (wstatus_ptr != 0) {
-        int *wstatus = (int *)wstatus_ptr;
-        *wstatus = zombie->termination_signal ? zombie->termination_signal :
-                   (zombie->exit_status & 0xFF) << 8;
+        int status = zombie->termination_signal ? zombie->termination_signal :
+                     (zombie->exit_status & 0xFF) << 8;
+        if (copy_to_user((void *)wstatus_ptr, &status, sizeof(status)) != 0) {
+          current->waiting_for_child = false;
+          return (uint64_t)-14;
+        }
       }
       uint32_t reaped_pid = pid_namespace_tid(current, zombie);
 
@@ -192,8 +199,11 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
     }
 
     if (stopped_tid) {
-      if (wstatus_ptr != 0)
-        *(int *)wstatus_ptr = stopped_status;
+      if (wstatus_ptr != 0 &&
+          copy_to_user((void *)wstatus_ptr, &stopped_status, sizeof(stopped_status)) != 0) {
+        current->waiting_for_child = false;
+        return (uint64_t)-14;
+      }
       current->waiting_for_child = false;
       return (uint64_t)stopped_tid;
     }
@@ -201,8 +211,11 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
     if (exited_tid) {
       if (tracee_parent_wake && tracee_parent_wake->waiting_for_child)
         sched_wakeup(tracee_parent_wake);
-      if (wstatus_ptr != 0)
-        *(int *)wstatus_ptr = exited_status;
+      if (wstatus_ptr != 0 &&
+          copy_to_user((void *)wstatus_ptr, &exited_status, sizeof(exited_status)) != 0) {
+        current->waiting_for_child = false;
+        return (uint64_t)-14;
+      }
       current->waiting_for_child = false;
       return (uint64_t)exited_tid;
     }
@@ -455,16 +468,19 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
     if (zombie) {
       /* Fill in the siginfo_t if the caller supplied a buffer */
       if (infop_ptr) {
-        struct k_siginfo_child *si = (struct k_siginfo_child *)infop_ptr;
-        si->si_signo  = 17; /* SIGCHLD */
-        si->si_errno  = 0;
-        si->si_code   = zombie->termination_signal ? 2 /* CLD_KILLED */ : CLD_EXITED;
-        si->si_pid    = pid_namespace_tid(current, zombie);
-        si->si_uid    = (uint32_t)zombie->uid;
-        si->si_status = zombie->termination_signal ? zombie->termination_signal :
+        struct k_siginfo_child si;
+        memset(&si, 0, sizeof(si));
+        si.si_signo  = 17; /* SIGCHLD */
+        si.si_errno  = 0;
+        si.si_code   = zombie->termination_signal ? 2 /* CLD_KILLED */ : CLD_EXITED;
+        si.si_pid    = pid_namespace_tid(current, zombie);
+        si.si_uid    = (uint32_t)zombie->uid;
+        si.si_status = zombie->termination_signal ? zombie->termination_signal :
                         zombie->exit_status & 0xFF;
-        si->_pad0     = 0;
-        si->_pad1     = 0;
+        if (copy_to_user((void *)infop_ptr, &si, sizeof(si)) != 0) {
+          current->waiting_for_child = false;
+          return (uint64_t)-14;
+        }
       }
 
       if (!(options & WNOWAIT) && zombie_owner && zombie_owner->tgid == current->tgid) {
@@ -478,13 +494,17 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
 
     if (ptrace_stopped) {
       if (infop_ptr) {
-        struct k_siginfo_child *si = (struct k_siginfo_child *)infop_ptr;
-        memset(si, 0, sizeof(*si));
-        si->si_signo = 17;
-        si->si_code = CLD_TRAPPED;
-        si->si_pid = ptrace_pid;
-        si->si_uid = ptrace_uid;
-        si->si_status = ptrace_signal;
+        struct k_siginfo_child si;
+        memset(&si, 0, sizeof(si));
+        si.si_signo = 17;
+        si.si_code = CLD_TRAPPED;
+        si.si_pid = ptrace_pid;
+        si.si_uid = ptrace_uid;
+        si.si_status = ptrace_signal;
+        if (copy_to_user((void *)infop_ptr, &si, sizeof(si)) != 0) {
+          current->waiting_for_child = false;
+          return (uint64_t)-14;
+        }
       }
       current->waiting_for_child = false;
       return 0;
@@ -492,13 +512,17 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
 
     if (ptrace_exited) {
       if (infop_ptr) {
-        struct k_siginfo_child *si = (struct k_siginfo_child *)infop_ptr;
-        memset(si, 0, sizeof(*si));
-        si->si_signo = 17;
-        si->si_code = ptrace_exit_code;
-        si->si_pid = ptrace_exit_pid;
-        si->si_uid = ptrace_exit_uid;
-        si->si_status = ptrace_exit_status;
+        struct k_siginfo_child si;
+        memset(&si, 0, sizeof(si));
+        si.si_signo = 17;
+        si.si_code = ptrace_exit_code;
+        si.si_pid = ptrace_exit_pid;
+        si.si_uid = ptrace_exit_uid;
+        si.si_status = ptrace_exit_status;
+        if (copy_to_user((void *)infop_ptr, &si, sizeof(si)) != 0) {
+          current->waiting_for_child = false;
+          return (uint64_t)-14;
+        }
       }
       if (tracee_parent_wake && tracee_parent_wake->waiting_for_child)
         sched_wakeup(tracee_parent_wake);
@@ -519,8 +543,12 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
     if (options & WNOHANG) {
       /* No zombie yet; zero out siginfo_t per POSIX/Linux specification */
       if (infop_ptr) {
-        struct k_siginfo_child *si = (struct k_siginfo_child *)infop_ptr;
-        memset(si, 0, sizeof(*si));
+        struct k_siginfo_child si;
+        memset(&si, 0, sizeof(si));
+        if (copy_to_user((void *)infop_ptr, &si, sizeof(si)) != 0) {
+          current->waiting_for_child = false;
+          return (uint64_t)-14;
+        }
       }
       current->waiting_for_child = false;
       return 0;

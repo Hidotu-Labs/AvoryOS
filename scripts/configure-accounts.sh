@@ -177,6 +177,8 @@ mkdir -p "${ROOTFS_DIR}/etc/xdg/plasma-workspace/env"
 cp -f "${ROOT_DIR}/initrd/avory-drm.sh" \
     "${ROOTFS_DIR}/etc/xdg/plasma-workspace/env/avory-drm.sh"
 chmod 0644 "${ROOTFS_DIR}/etc/xdg/plasma-workspace/env/avory-drm.sh"
+install -m 0644 "${ROOT_DIR}/config/plasma/avory-pipewire-systemd.sh" \
+    "${ROOTFS_DIR}/etc/xdg/plasma-workspace/env/avory-pipewire-systemd.sh"
 
 # Ensure Plasma Wayland uses its upstream launcher instead of a custom wrapper.
 rm -f "${ROOTFS_DIR}/usr/bin/avory-plasma-wayland"

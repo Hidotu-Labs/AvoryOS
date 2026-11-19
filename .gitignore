@@ -17,6 +17,10 @@
 /assets/game.unx
 /assets/assets
 *.d
+!/config/systemd/logind.conf.d/
+!/config/systemd/seatd.service.d/
+!/config/systemd/systemd-hostnamed.service.d/
+!/config/systemd/systemd-vconsole-setup.service.d/
 *.elf
 *.o
 *.a

@@ -77,6 +77,22 @@ void vmm_init(void) {
     }
   }
 
+  /* Pre-allocate a shared PDPT for KSTACK_VMAP_BASE (PML4[480]) so all cloned
+   * process address spaces share future guarded kernel stack mappings. */
+  size_t kstack_pml4_idx = (KSTACK_VMAP_BASE >> 39) & 0x1FF;
+  if (!(new_pml4_virt[kstack_pml4_idx] & PAGE_FLAG_PRESENT)) {
+    void *kstack_pdpt_phys = pmm_alloc();
+    if (kstack_pdpt_phys) {
+      uint64_t *kstack_pdpt_virt =
+          (uint64_t *)PHYS_TO_VIRT((uint64_t)kstack_pdpt_phys);
+      for (int i = 0; i < 512; i++)
+        kstack_pdpt_virt[i] = 0;
+      new_pml4_virt[kstack_pml4_idx] =
+          ((uint64_t)kstack_pdpt_phys & PAGE_MASK) | PAGE_FLAG_PRESENT |
+          PAGE_FLAG_RW;
+    }
+  }
+
   vmm_set_kernel_pml4((uint64_t *)new_pml4_phys);
 
   // Switch to the newly allocated kernel-owned PML4.

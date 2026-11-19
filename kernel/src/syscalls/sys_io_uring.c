@@ -25,6 +25,7 @@
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
 #include "../sched/sched.h"
+#include "../sched/seccomp.h"
 #include "../sched/wait.h"
 #include "syscall.h"
 #include <stdint.h>
@@ -205,6 +206,7 @@ typedef struct {
   struct user_iovec *reg_bufs;
   uint32_t reg_buf_count;
   vfs_node_t **reg_files;
+  uint32_t *reg_file_flags;
   uint32_t reg_file_count;
   vfs_node_t *eventfd_node;
   bool rings_disabled;
@@ -235,13 +237,17 @@ static uint64_t ioring_alloc_region(uint32_t pages, uint64_t *phys_out) {
   return (uint64_t)phys + hhdm;
 }
 
+static void ioring_put_region(uint64_t phys, uint32_t pages) {
+  if (!phys)
+    return;
+  for (uint32_t i = 0; i < pages; i++)
+    pmm_decref((void *)(phys + (uint64_t)i * PAGE_SIZE));
+}
+
 static void ioring_free_ctx_rings(ioring_ctx_t *ctx) {
-  if (ctx->sq_ring_phys)
-    pmm_free_pages((void *)ctx->sq_ring_phys, ctx->sq_ring_pages);
-  if (ctx->cq_ring_phys)
-    pmm_free_pages((void *)ctx->cq_ring_phys, ctx->cq_ring_pages);
-  if (ctx->sqe_phys)
-    pmm_free_pages((void *)ctx->sqe_phys, ctx->sqe_pages);
+  ioring_put_region(ctx->sq_ring_phys, ctx->sq_ring_pages);
+  ioring_put_region(ctx->cq_ring_phys, ctx->cq_ring_pages);
+  ioring_put_region(ctx->sqe_phys, ctx->sqe_pages);
   ctx->sq_ring_phys = ctx->cq_ring_phys = ctx->sqe_phys = 0;
 }
 
@@ -316,8 +322,12 @@ static uint64_t ioring_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
   }
   if (!phys || length > region_size)
     return (uint64_t)-22;
-  uint64_t vaddr = addr ? addr : mm_alloc_mmap_region(length);
-  if (!vaddr)
+  uint64_t map_len = (length + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
+  if (map_len < length || map_len > region_size)
+    return (uint64_t)-22;
+  uint64_t vaddr = addr ? addr : mm_alloc_mmap_region(map_len);
+  if (!vaddr || (vaddr & (PAGE_SIZE - 1ULL)) ||
+      !is_user_range((void *)vaddr, map_len))
     return (uint64_t)-12;
   uint64_t page_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_USER;
   if (prot & 0x2)
@@ -325,8 +335,17 @@ static uint64_t ioring_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
   if (!(prot & 0x4))
     page_flags |= PAGE_FLAG_NX;
   uint64_t *pml4 = vmm_get_active_pml4();
-  for (uint64_t off = 0; off < length; off += PAGE_SIZE)
-    vmm_map_page(pml4, vaddr + off, phys + off, page_flags);
+  for (uint64_t off = 0; off < map_len; off += PAGE_SIZE) {
+    pmm_incref((void *)(phys + off));
+    if (!vmm_map_page(pml4, vaddr + off, phys + off, page_flags)) {
+      pmm_decref((void *)(phys + off));
+      for (uint64_t u = 0; u < off; u += PAGE_SIZE) {
+        vmm_unmap_page(pml4, vaddr + u);
+        pmm_decref((void *)(phys + u));
+      }
+      return (uint64_t)-12;
+    }
+  }
   return vaddr;
 }
 
@@ -348,6 +367,8 @@ static void ioring_close(vfs_node_t *node) {
       vfs_close(ctx->reg_files[i]);
   if (ctx->reg_files)
     kfree(ctx->reg_files);
+  if (ctx->reg_file_flags)
+    kfree(ctx->reg_file_flags);
   if (ctx->reg_bufs)
     kfree(ctx->reg_bufs);
   if (ctx->eventfd_node)
@@ -361,21 +382,123 @@ static void ioring_close(vfs_node_t *node) {
 // Op execution (no context lock held; SQE already copied out)
 // ---------------------------------------------------------------------------
 
+static vfs_node_t *ioring_pin_fd_with_flags(struct thread *t, uint64_t fd,
+                                            uint32_t *flags_out) {
+  if (!t || !t->files || fd >= MAX_FDS)
+    return NULL;
+  spinlock_acquire(&t->files->lock);
+  if (fd >= t->files->capacity) {
+    spinlock_release(&t->files->lock);
+    return NULL;
+  }
+  vfs_node_t *node = t->fds[fd];
+  if (fd_is_valid_node(node)) {
+    vfs_node_ref(node);
+    if (flags_out)
+      *flags_out = t->fd_flags[fd];
+  } else {
+    node = NULL;
+  }
+  spinlock_release(&t->files->lock);
+  return node;
+}
+
+static bool ioring_mode_allows(uint32_t fd_flags, bool write) {
+  if (fd_flags & O_PATH)
+    return false;
+  uint32_t acc = fd_flags & O_ACCMODE;
+  return write ? (acc == O_WRONLY || acc == O_RDWR)
+               : (acc == O_RDONLY || acc == O_RDWR);
+}
+
 static vfs_node_t *ioring_pin_op_fd(struct thread *t, ioring_ctx_t *ctx,
-                                    const struct io_uring_sqe *sqe) {
+                                    const struct io_uring_sqe *sqe,
+                                    uint32_t *flags_out) {
   if (sqe->flags & IOSQE_FIXED_FILE) {
     uint32_t idx = (uint32_t)sqe->fd;
     spinlock_acquire(&ctx->lock);
     vfs_node_t *node =
         (idx < ctx->reg_file_count) ? ctx->reg_files[idx] : NULL;
-    if (node)
+    if (node) {
       vfs_node_ref(node);
+      if (flags_out)
+        *flags_out = ctx->reg_file_flags ? ctx->reg_file_flags[idx] : 0;
+    }
     spinlock_release(&ctx->lock);
     return node;
   }
   if (sqe->fd < 0)
     return NULL;
-  return fd_node_get(t, (uint64_t)(uint32_t)sqe->fd);
+  return ioring_pin_fd_with_flags(t, (uint64_t)(uint32_t)sqe->fd, flags_out);
+}
+
+static int32_t ioring_vfs_io_user(vfs_node_t *node, uint64_t off,
+                                  uint64_t user_addr, uint32_t len,
+                                  bool write) {
+  if (len == 0)
+    return 0;
+  if (off > UINT32_MAX)
+    return -22;
+  if (!is_user_range((const void *)user_addr, len))
+    return -14;
+
+  uint8_t stack_buf[256];
+  uint8_t *kbuf = stack_buf;
+  size_t buf_cap = sizeof(stack_buf);
+  if (len > sizeof(stack_buf)) {
+    size_t want = len < 16384U ? len : 16384U;
+    uint8_t *heap_buf = kmalloc(want);
+    if (heap_buf) {
+      kbuf = heap_buf;
+      buf_cap = want;
+    }
+  }
+
+  uint32_t done = 0;
+  int32_t err = 0;
+  while (done < len) {
+    if (off + done > UINT32_MAX) {
+      err = -22;
+      break;
+    }
+    uint32_t chunk = len - done;
+    if (chunk > (uint32_t)buf_cap)
+      chunk = (uint32_t)buf_cap;
+    if (write) {
+      if (copy_from_user(kbuf, (const void *)(user_addr + done), chunk) != 0) {
+        err = -14;
+        break;
+      }
+      int32_t r = (int32_t)vfs_write(node, (uint32_t)(off + done), chunk, kbuf);
+      if (r <= 0) {
+        err = r;
+        break;
+      }
+      done += (uint32_t)r;
+      if ((uint32_t)r < chunk)
+        break;
+    } else {
+      int32_t r = (int32_t)vfs_read(node, (uint32_t)(off + done), chunk, kbuf);
+      if (r <= 0) {
+        err = r;
+        break;
+      }
+      uint32_t got = (uint32_t)r;
+      if (got > chunk)
+        got = chunk;
+      if (copy_to_user((void *)(user_addr + done), kbuf, got) != 0) {
+        err = -14;
+        break;
+      }
+      done += got;
+      if (got < chunk)
+        break;
+    }
+  }
+
+  if (kbuf != stack_buf)
+    kfree(kbuf);
+  return done ? (int32_t)done : err;
 }
 
 static int32_t ioring_do_readv(struct thread *t, ioring_ctx_t *ctx,
@@ -383,9 +506,10 @@ static int32_t ioring_do_readv(struct thread *t, ioring_ctx_t *ctx,
   (void)ctx;
   if (sqe->len > IORING_MAX_IOV)
     return -22;
+  uint32_t fd_flags = 0;
   vfs_node_t *node __attribute__((cleanup(fd_node_put))) =
-      ioring_pin_op_fd(t, ctx, sqe);
-  if (!node)
+      ioring_pin_op_fd(t, ctx, sqe, &fd_flags);
+  if (!node || !ioring_mode_allows(fd_flags, false))
     return -9;
   uint64_t off = sqe->off;
   int64_t total = 0;
@@ -407,9 +531,7 @@ static int32_t ioring_do_readv(struct thread *t, ioring_ctx_t *ctx,
       return -14;
     if (off > UINT32_MAX || sqe->len > UINT32_MAX)
       return -22;
-    int32_t r = (int32_t)vfs_read(node, (uint32_t)off, sqe->len,
-                                  (uint8_t *)sqe->addr);
-    return r < 0 ? r : r;
+    return ioring_vfs_io_user(node, off, sqe->addr, sqe->len, false);
   }
   if (sqe->len == 0)
     return 0;
@@ -441,8 +563,8 @@ static int32_t ioring_do_readv(struct thread *t, ioring_ctx_t *ctx,
         total = -14;
       break;
     }
-    int32_t r = (int32_t)vfs_read(node, (uint32_t)off, (uint32_t)iov[i].iov_len,
-                                  (uint8_t *)iov[i].iov_base);
+    int32_t r = ioring_vfs_io_user(node, off, iov[i].iov_base,
+                                   (uint32_t)iov[i].iov_len, false);
     if (r < 0) {
       if (!total)
         total = r;
@@ -463,9 +585,10 @@ static int32_t ioring_do_writev(struct thread *t, ioring_ctx_t *ctx,
   (void)ctx;
   if (!fixed && sqe->len > IORING_MAX_IOV)
     return -22;
+  uint32_t fd_flags = 0;
   vfs_node_t *node __attribute__((cleanup(fd_node_put))) =
-      ioring_pin_op_fd(t, ctx, sqe);
-  if (!node)
+      ioring_pin_op_fd(t, ctx, sqe, &fd_flags);
+  if (!node || !ioring_mode_allows(fd_flags, true))
     return -9;
   uint64_t off = sqe->off;
   if (fixed) {
@@ -485,8 +608,7 @@ static int32_t ioring_do_writev(struct thread *t, ioring_ctx_t *ctx,
       return -14;
     if (off > UINT32_MAX || sqe->len > UINT32_MAX)
       return -22;
-    return (int32_t)vfs_write(node, (uint32_t)off, sqe->len,
-                              (uint8_t *)sqe->addr);
+    return ioring_vfs_io_user(node, off, sqe->addr, sqe->len, true);
   }
   if (sqe->len == 0)
     return 0;
@@ -519,9 +641,8 @@ static int32_t ioring_do_writev(struct thread *t, ioring_ctx_t *ctx,
         total = -14;
       break;
     }
-    int32_t r = (int32_t)vfs_write(node, (uint32_t)off,
-                                   (uint32_t)iov[i].iov_len,
-                                   (uint8_t *)iov[i].iov_base);
+    int32_t r = ioring_vfs_io_user(node, off, iov[i].iov_base,
+                                   (uint32_t)iov[i].iov_len, true);
     if (r < 0) {
       if (!total)
         total = r;
@@ -539,9 +660,10 @@ static int32_t ioring_do_writev(struct thread *t, ioring_ctx_t *ctx,
 
 static int32_t ioring_do_read_write(struct thread *t, ioring_ctx_t *ctx,
                                     const struct io_uring_sqe *sqe, bool write) {
+  uint32_t fd_flags = 0;
   vfs_node_t *node __attribute__((cleanup(fd_node_put))) =
-      ioring_pin_op_fd(t, ctx, sqe);
-  if (!node)
+      ioring_pin_op_fd(t, ctx, sqe, &fd_flags);
+  if (!node || !ioring_mode_allows(fd_flags, write))
     return -9;
   if (sqe->len == 0)
     return 0;
@@ -549,11 +671,7 @@ static int32_t ioring_do_read_write(struct thread *t, ioring_ctx_t *ctx,
     return -14;
   if (sqe->off > UINT32_MAX || sqe->len > UINT32_MAX)
     return -22;
-  if (write)
-    return (int32_t)vfs_write(node, (uint32_t)sqe->off, sqe->len,
-                              (uint8_t *)sqe->addr);
-  return (int32_t)vfs_read(node, (uint32_t)sqe->off, sqe->len,
-                           (uint8_t *)sqe->addr);
+  return ioring_vfs_io_user(node, sqe->off, sqe->addr, sqe->len, write);
 }
 
 // Post one CQE. Caller holds ctx->lock. A full CQ drops the new entry and
@@ -642,7 +760,7 @@ static void ioring_reap_polls(ioring_ctx_t *ctx) {
 // poll finds the fd ready (IORING_RES_DEFER posts no CQE yet).
 static int32_t ioring_do_poll(struct thread *t, ioring_ctx_t *ctx,
                               const struct io_uring_sqe *sqe) {
-  vfs_node_t *node = ioring_pin_op_fd(t, ctx, sqe);
+  vfs_node_t *node = ioring_pin_op_fd(t, ctx, sqe, NULL);
   if (!node)
     return -9;
   int events = sqe->op_flags & 0xffff;
@@ -730,9 +848,17 @@ static int ioring_wait_events(struct thread *t, ioring_ctx_t *ctx,
 
 static int32_t ioring_do_openat(struct thread *t,
                                 const struct io_uring_sqe *sqe) {
-  (void)t;
   if (!sqe->addr)
     return -14;
+  int dirfd = sqe->fd;
+  uint64_t flags = sqe->op_flags;
+  uint64_t mode = sqe->len;
+  if (seccomp_mode(t)) {
+    struct syscall_regs dummy = {0};
+    uint64_t args[6] = {(uint64_t)(int64_t)dirfd, sqe->addr, flags, mode, 0, 0};
+    if (!seccomp_syscall(t, &dummy, SYS_OPENAT, 0xC000003E, args))
+      return (int32_t)(int64_t)(dummy.rax ? dummy.rax : (uint64_t)-1);
+  }
   char *path = kmalloc(4096);
   if (!path)
     return -12;
@@ -745,9 +871,6 @@ static int32_t ioring_do_openat(struct thread *t,
     kfree(path);
     return -36;
   }
-  int dirfd = sqe->fd;
-  uint64_t flags = sqe->op_flags;
-  uint64_t mode = sqe->len;
   // sys_open_path resolves relative to dirfd (or CWD for AT_FDCWD).
   uint64_t r = sys_open_path(dirfd, path, flags, mode);
   kfree(path);
@@ -929,6 +1052,8 @@ static uint64_t sys_io_uring_setup(uint64_t entries, uint64_t params_ptr,
   vfs_node_init(node);
   strncpy(node->name, "io_uring", sizeof(node->name) - 1);
   node->flags = FS_FILE;
+  node->mmap_shared_only = true;
+  node->mmap_shared_pmm_refs = true;
   node->device = ctx;
   node->poll = ioring_poll;
   node->mmap = ioring_mmap;
@@ -1012,6 +1137,8 @@ static uint64_t sys_io_uring_enter(uint64_t fd, uint64_t to_submit,
   vfs_node_t *node __attribute__((cleanup(fd_node_put))) = fd_node_get(t, fd);
   if (!node)
     return (uint64_t)-9;
+  if (node->close != ioring_close)
+    return (uint64_t)-22;
   ioring_ctx_t *ctx = (ioring_ctx_t *)node->device;
   if (!ctx || ctx->magic != IORING_MAGIC)
     return (uint64_t)-22;
@@ -1121,6 +1248,8 @@ static uint64_t sys_io_uring_register(uint64_t fd, uint64_t opcode,
   vfs_node_t *node __attribute__((cleanup(fd_node_put))) = fd_node_get(t, fd);
   if (!node)
     return (uint64_t)-9;
+  if (node->close != ioring_close)
+    return (uint64_t)-22;
   ioring_ctx_t *ctx = (ioring_ctx_t *)node->device;
   if (!ctx || ctx->magic != IORING_MAGIC)
     return (uint64_t)-22;
@@ -1161,30 +1290,36 @@ static uint64_t sys_io_uring_register(uint64_t fd, uint64_t opcode,
       return (uint64_t)-22;
     int32_t *fds = kmalloc(nr_args * sizeof(int32_t));
     vfs_node_t **nodes = kmalloc(nr_args * sizeof(vfs_node_t *));
-    if (!fds || !nodes) {
+    uint32_t *fflags = kmalloc(nr_args * sizeof(uint32_t));
+    if (!fds || !nodes || !fflags) {
       if (fds)
         kfree(fds);
       if (nodes)
         kfree(nodes);
+      if (fflags)
+        kfree(fflags);
       return (uint64_t)-12;
     }
     if (copy_from_user(fds, (const void *)arg, nr_args * sizeof(int32_t)) != 0) {
       kfree(fds);
       kfree(nodes);
+      kfree(fflags);
       return (uint64_t)-14;
     }
     for (uint64_t i = 0; i < nr_args; i++) {
       if (fds[i] < 0) {
         nodes[i] = NULL; // sparse slot, like Linux
+        fflags[i] = 0;
         continue;
       }
-      nodes[i] = fd_node_get(t, (uint64_t)fds[i]);
+      nodes[i] = ioring_pin_fd_with_flags(t, (uint64_t)fds[i], &fflags[i]);
       if (!nodes[i]) {
         for (uint64_t j = 0; j < i; j++)
           if (nodes[j])
             vfs_close(nodes[j]);
         kfree(fds);
         kfree(nodes);
+        kfree(fflags);
         return (uint64_t)-9;
       }
     }
@@ -1195,7 +1330,10 @@ static uint64_t sys_io_uring_register(uint64_t fd, uint64_t opcode,
         vfs_close(ctx->reg_files[i]);
     if (ctx->reg_files)
       kfree(ctx->reg_files);
+    if (ctx->reg_file_flags)
+      kfree(ctx->reg_file_flags);
     ctx->reg_files = nodes;
+    ctx->reg_file_flags = fflags;
     ctx->reg_file_count = (uint32_t)nr_args;
     spinlock_release(&ctx->lock);
     return 0;
@@ -1207,7 +1345,10 @@ static uint64_t sys_io_uring_register(uint64_t fd, uint64_t opcode,
         vfs_close(ctx->reg_files[i]);
     if (ctx->reg_files)
       kfree(ctx->reg_files);
+    if (ctx->reg_file_flags)
+      kfree(ctx->reg_file_flags);
     ctx->reg_files = NULL;
+    ctx->reg_file_flags = NULL;
     ctx->reg_file_count = 0;
     spinlock_release(&ctx->lock);
     return 0;
@@ -1233,7 +1374,10 @@ static uint64_t sys_io_uring_register(uint64_t fd, uint64_t opcode,
       if (copy_from_user(&newfd, (const void *)(upd.fds + i * sizeof(newfd)),
                          sizeof(newfd)) != 0)
         return (uint64_t)-14;
-      vfs_node_t *nn = (newfd < 0) ? NULL : fd_node_get(t, (uint64_t)newfd);
+      uint32_t nflags = 0;
+      vfs_node_t *nn = (newfd < 0)
+          ? NULL
+          : ioring_pin_fd_with_flags(t, (uint64_t)newfd, &nflags);
       if (newfd >= 0 && !nn)
         return (uint64_t)-9;
       spinlock_acquire(&ctx->lock);
@@ -1241,6 +1385,8 @@ static uint64_t sys_io_uring_register(uint64_t fd, uint64_t opcode,
         if (ctx->reg_files[upd.offset + i])
           vfs_close(ctx->reg_files[upd.offset + i]);
         ctx->reg_files[upd.offset + i] = nn;
+        if (ctx->reg_file_flags)
+          ctx->reg_file_flags[upd.offset + i] = nflags;
       } else if (nn) {
         vfs_close(nn);
       }

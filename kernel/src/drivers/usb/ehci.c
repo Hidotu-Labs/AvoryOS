@@ -220,7 +220,7 @@ static void ehci_reset_port(struct ehci_controller *hc, uint8_t port) {
   } else {
     klog_puts(KLOG_CLR_GREEN "[  OK  ]" KLOG_CLR_RESET " EHCI: Port ");
     klog_uint64(port);
-    klog_puts(": Device enabled (portsc=0x");
+    klog_puts(": Device enabled (portsc=");
     klog_hex32(status);
     klog_puts(")\n");
   }
@@ -728,7 +728,7 @@ static void ehci_enumerate_ports(struct ehci_controller *hc) {
     } else {
       klog_puts("       Port ");
       klog_uint64(p);
-      klog_puts(": Not enabled after reset (PORTSC=0x");
+      klog_puts(": Not enabled after reset (PORTSC=");
       klog_hex32(portsc);
       klog_puts(")\n");
     }

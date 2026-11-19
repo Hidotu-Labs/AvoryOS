@@ -1,4 +1,8 @@
 extern isr_handler
+extern gdt_nmi_stack
+extern cpu_gs_table
+extern cpu_md_clear_active
+extern cpu_verw_ds
 
 %macro ISR_NOERRCODE 1
 global isr%1
@@ -31,15 +35,29 @@ isr2:
     push rax
     push rcx
     push rdx
-    test qword [rsp + 48], 3    ; CS of the NMI frame
+    push rbx
+    test qword [rsp + 56], 3    ; CS of the NMI frame
     jnz .nmi_done
+    lea rbx, [rel gdt_nmi_stack]
+    mov rcx, rsp
+    sub rcx, rbx
+    shr rcx, 13                 ; cpu_id = offset / 8192
+    cmp rcx, 64
+    jae .nmi_done
+    lea rax, [rel cpu_gs_table]
+    mov rbx, [rax + rcx * 8]
+    test rbx, rbx
+    jz .nmi_done
     mov ecx, 0xC0000101         ; IA32_GS_BASE
     rdmsr
-    test edx, edx
-    js .nmi_done                ; GS base is already the kernel's
+    shl rdx, 32
+    or rax, rdx
+    cmp rax, rbx
+    je .nmi_done                ; GS base already equals this CPU's kernel GS
     swapgs
-    mov qword [rsp + 32], NMI_GS_MARK
+    mov qword [rsp + 40], NMI_GS_MARK
 .nmi_done:
+    pop rbx
     pop rdx
     pop rcx
     pop rax
@@ -191,6 +209,10 @@ isr_common_stub:
     test qword [rsp + 24], 3
     jz .skip_swapgs_exit
     swapgs
+    cmp byte [rel cpu_md_clear_active], 0
+    je .skip_verw_irq
+    verw word [rel cpu_verw_ds]
+.skip_verw_irq:
 .skip_swapgs_exit:
 
     ; An NMI that swapped GS on entry swaps back here.

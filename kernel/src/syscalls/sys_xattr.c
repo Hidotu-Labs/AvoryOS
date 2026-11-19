@@ -35,7 +35,12 @@ static bool xattr_fd_ok(uint64_t fd) {
 /* Resolve `path` to an owned node, honouring the caller's cwd. Returns NULL
  * when the path does not resolve; `*cwd_out` (when non-NULL) receives an
  * owned cwd node the caller must close, or NULL. */
-static vfs_node_t *xattr_resolve_path(const char *path, vfs_node_t **cwd_out) {
+static vfs_node_t *xattr_resolve_path(const char *user_path, vfs_node_t **cwd_out) {
+  char path[XATTR_PATH_MAX];
+  long n = strncpy_from_user(path, user_path, sizeof(path));
+  if (n <= 0 || n >= (long)sizeof(path))
+    return NULL;
+
   struct thread *t = sched_get_current();
   vfs_node_t *base = fs_root;
   vfs_node_t *cwd = NULL;

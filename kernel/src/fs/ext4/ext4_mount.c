@@ -172,7 +172,7 @@ uint32_t ext4_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_
             uint32_t to_copy = mnt->block_size - off_in;
             if (to_copy > size - bytes_read) to_copy = size - bytes_read;
 
-            if (ext2_read_block(mnt, disk_block, block_buf)) {
+            if (ext2_read_block_data(mnt, disk_block, block_buf)) {
                 error = 5;
                 break;
             }
@@ -211,7 +211,7 @@ uint32_t ext4_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_
         } else {
             uint32_t done_in_run = 0;
             while (done_in_run < to_read_blocks) {
-                if (ext2_read_block(mnt, disk_block + done_in_run, block_buf)) {
+                if (ext2_read_block_data(mnt, disk_block + done_in_run, block_buf)) {
                     error = 5;
                     break;
                 }
@@ -258,6 +258,15 @@ static uint32_t ext4_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t si
         ext3_journal_stop(mnt);
         kfree(block_buf);
         return (uint32_t)-5;
+    }
+    if ((inode.i_mode & 0xF000) != EXT2_S_IFREG) {
+        /* File data only: never append data blocks to a symlink, directory
+         * or socket inode reached through a stale or mistyped node. */
+        klogf("[EXT4] refused data write to non-regular inode %u mode=%o\n",
+              node->inode, inode.i_mode);
+        ext3_journal_stop(mnt);
+        kfree(block_buf);
+        return (uint32_t)-22;
     }
     if (!ext4_inode_has_extents(&inode)) {
         ext3_journal_stop(mnt);
@@ -332,7 +341,7 @@ static uint32_t ext4_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t si
             memset(block_buf, 0, mnt->block_size);
         } else if (in_block || count < mnt->block_size) {
             mnt->journal.phase = "write-data-read";
-            if (ext2_read_block(mnt, disk_block, block_buf) != 0) {
+            if (ext2_read_block_data(mnt, disk_block, block_buf) != 0) {
                 error = 5;
                 break;
             }
@@ -364,7 +373,7 @@ static uint32_t ext4_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t si
 
         memcpy(block_buf + in_block, buffer + bytes_written, count);
         mnt->journal.phase = "write-data";
-        if (ext2_write_block(mnt, disk_block, block_buf) != 0) {
+        if (ext2_write_block_nocache(mnt, disk_block, block_buf, NULL, NULL) != 0) {
             error = 5;
             klog_puts("[EXT4] data write failed inode=");
             klog_uint64(node->inode);
@@ -566,12 +575,13 @@ int ext4_mount(struct block_device *dev, vfs_node_t *mountpoint) {
     mountpoint->read    = ext4_read_impl;
     mountpoint->write   = ext4_write_impl;
     mountpoint->readdir = ext2_readdir_impl;
-    mountpoint->finddir = ext2_finddir_impl;
+    mountpoint->finddir = ext2_finddir_vfs;
     mountpoint->create  = ext4_create_impl;
     mountpoint->mkdir   = ext4_mkdir_impl;
     mountpoint->unlink  = ext2_unlink_impl;
     mountpoint->rmdir   = ext2_rmdir_impl;
     mountpoint->symlink = ext2_symlink_impl;
+    mountpoint->link    = ext2_link_impl;
     mountpoint->rename  = ext2_rename_impl;
     mountpoint->chmod   = ext2_chmod_impl;
     mountpoint->chown   = ext2_chown_impl;

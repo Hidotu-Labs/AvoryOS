@@ -1313,6 +1313,12 @@ void lockdiag_dump_all(const char *reason) {
       bool focused = t->kpi_data || (focus_tgid && t->tgid == focus_tgid) ||
                      (busy_tgid && t->tgid == busy_tgid) || compositor ||
                      strncmp(t->comm, "kded6", 5) == 0 ||
+                     /* Plasma startup chain: a black screen means one of
+                      * these never launched or never mapped plasmashell. */
+                     strncmp(t->comm, "plasma", 6) == 0 ||
+                     strncmp(t->comm, "startplasma", 11) == 0 ||
+                     strncmp(t->comm, "ksmserver", 9) == 0 ||
+                     strncmp(t->comm, "ksplash", 7) == 0 ||
                      strncmp(t->comm, "dbus-daemon", 11) == 0 ||
                      strncmp(t->comm, "Xorg", 4) == 0 ||
                      strncmp(t->comm, "glxgears", 8) == 0 ||
@@ -1852,7 +1858,7 @@ void lockdiag_init(void) {
   if (vec >= 0)
     probe_vector_state = (uint8_t)vec;
 
-  klog_puts("[LOCKDIAG] Hang detector armed: probe vector 0x");
+  klog_puts("[LOCKDIAG] Hang detector armed: probe vector ");
   klog_hex32(vec >= 0 ? (uint32_t)vec : 0);
   klog_puts(", hung-CPU threshold ");
   klog_uint64(LOCKDIAG_HUNG_CPU_MS);

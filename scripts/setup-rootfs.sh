@@ -218,8 +218,17 @@ for unit in avory-login.service avory-early-init.service; do
     install -D -m 0644 "${ROOT_DIR}/config/systemd/${unit}" \
         "${SYSTEMD_ETC}/${unit}"
 done
-install -D -m 0644 "${ROOT_DIR}/config/systemd/seatd.service.d/avoryos.conf" \
-    "${SYSTEMD_ETC}/seatd.service.d/avoryos.conf"
+# Let a local login start while network services initialize. Remote home
+# mounts and NSS keep their upstream ordering.
+sessions_unit="${ROOTFS_DIR}/usr/lib/systemd/system/systemd-user-sessions.service"
+if [ -f "$sessions_unit" ]; then
+    sed '/^After=/s/ network\.target\([[:space:]]\|$\)/\1/' "$sessions_unit" \
+        > "${SYSTEMD_ETC}/systemd-user-sessions.service"
+fi
+for unit in seatd.service systemd-hostnamed.service systemd-vconsole-setup.service; do
+    install -D -m 0644 "${ROOT_DIR}/config/systemd/${unit}.d/avoryos.conf" \
+        "${SYSTEMD_ETC}/${unit}.d/avoryos.conf"
+done
 mkdir -p "${SYSTEMD_ETC}/multi-user.target.wants" \
     "${SYSTEMD_ETC}/sysinit.target.wants"
 for unit in avory-login.service avory-early-init.service; do

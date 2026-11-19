@@ -267,6 +267,7 @@ static void fd_set_offset(struct thread *t, uint64_t fd,
  * failure, -14 on a bad user pointer. */
 #include "../fs/mount_namespace.h"
 #include "../sched/capability.h"
+#include "../fs/ext3/ext3.h"
 #define fs_root vfs_task_root()
 
 #define FD_IOV_STACK_MAX 16u
@@ -918,7 +919,8 @@ static uint64_t sys_mount_setattr(uint64_t dirfd, uint64_t path_ptr, uint64_t fl
                                   uint64_t attr_ptr, uint64_t size, uint64_t a5) {
   (void)a5;
   struct thread *task=sched_get_current();
-  if(!capability_has(task,CAP_SYS_ADMIN))return (uint64_t)-1;
+  bool ns_ok = vfs_namespace_active() && capability_mount_ns_admin(task);
+  if(!ns_ok && !capability_has_init_ns(task,CAP_SYS_ADMIN))return (uint64_t)-1;
   if(flags&~(0x100ULL|0x1000ULL|0x8000ULL))return (uint64_t)-22;
   struct {uint64_t set,clear,propagation,userns_fd;} attr;
   if(size<sizeof(attr))return (uint64_t)-22;
@@ -940,6 +942,7 @@ static uint64_t sys_mount_setattr(uint64_t dirfd, uint64_t path_ptr, uint64_t fl
   /* Initial namespace: mount attributes live on the mount root's backing
    * node (systemd marks its credential tmpfs read-only this way). */
   if(!vfs_namespace_active()){
+    if(!capability_has_init_ns(task,CAP_SYS_ADMIN)){vfs_close(point);return (uint64_t)-1;}
     int r=-22;
     vfs_node_t *backing=vfs_backing_node(point);
     if(backing&&backing!=vfs_backing_node(fs_root)&&vfs_is_mount_root(point)){
@@ -1290,15 +1293,42 @@ static void trace_userspace_debug_write(struct thread *t, int fd,
     return;
 
   klog_puts(prefix);
-  const char *s = (const char *)buf;
-  for (size_t i = 0; i < count; i++) {
-    char c = s[i];
-    if (c == '\0')
-      break;
-    klog_putchar(c);
+  if (is_user_range(buf, count)) {
+    char kbuf[256];
+    size_t pos = 0;
+    char last = '\0';
+    while (pos < count) {
+      size_t chunk = count - pos;
+      if (chunk > sizeof(kbuf))
+        chunk = sizeof(kbuf);
+      if (copy_from_user(kbuf, (const uint8_t *)buf + pos, chunk) != 0)
+        break;
+      bool hit_nul = false;
+      for (size_t i = 0; i < chunk; i++) {
+        if (kbuf[i] == '\0') {
+          hit_nul = true;
+          break;
+        }
+        klog_putchar(kbuf[i]);
+        last = kbuf[i];
+      }
+      pos += chunk;
+      if (hit_nul)
+        break;
+    }
+    if (last != '\n')
+      klog_putchar('\n');
+  } else {
+    const char *s = (const char *)buf;
+    for (size_t i = 0; i < count; i++) {
+      char c = s[i];
+      if (c == '\0')
+        break;
+      klog_putchar(c);
+    }
+    if (((const char *)buf)[count - 1] != '\n')
+      klog_putchar('\n');
   }
-  if (((const char *)buf)[count - 1] != '\n')
-    klog_putchar('\n');
 }
 
 /* vfs_read/vfs_write take 32-bit offsets; raw block devices get the full
@@ -1317,6 +1347,95 @@ static uint32_t fd_vfs_write(vfs_node_t *node, uint64_t offset, uint32_t size,
   if (block_node_rw64(node, offset, size, buf, true, &done))
     return done;
   return vfs_write(node, (uint32_t)offset, size, buf);
+}
+
+#define FD_BOUNCE_STACK_MAX 512
+#define FD_BOUNCE_HEAP_MAX  (1024U * 1024U)
+
+static int64_t fd_read_to_user(vfs_node_t *node, uint64_t offset, size_t count,
+                               uint8_t *user_buf) {
+  if (count == 0)
+    return 0;
+  uint8_t stack_buf[FD_BOUNCE_STACK_MAX];
+  size_t cap = count <= FD_BOUNCE_STACK_MAX ? count
+             : (count <= FD_BOUNCE_HEAP_MAX ? count : FD_BOUNCE_HEAP_MAX);
+  uint8_t *kbuf = cap <= FD_BOUNCE_STACK_MAX ? stack_buf : (uint8_t *)kmalloc(cap);
+  if (!kbuf) {
+    kbuf = stack_buf;
+    cap = FD_BOUNCE_STACK_MAX;
+  }
+
+  size_t total = 0;
+  int64_t err = 0;
+  while (total < count) {
+    size_t chunk = count - total;
+    if (chunk > cap)
+      chunk = cap;
+    int32_t got = (int32_t)fd_vfs_read(node, offset + total, (uint32_t)chunk, kbuf);
+    if (got < 0) {
+      err = got;
+      break;
+    }
+    if (got == 0)
+      break;
+    if (copy_to_user(user_buf + total, kbuf, (size_t)got) != 0) {
+      err = -14;
+      break;
+    }
+    total += (size_t)got;
+    if ((size_t)got < chunk)
+      break;
+  }
+
+  if (kbuf != stack_buf)
+    kfree(kbuf);
+  return total > 0 ? (int64_t)total : err;
+}
+
+static int64_t fd_write_from_user_node(vfs_node_t *node, uint64_t offset,
+                                       size_t count, const uint8_t *user_buf,
+                                       bool append, uint32_t *end_offset_out) {
+  if (count == 0)
+    return 0;
+  uint8_t stack_buf[FD_BOUNCE_STACK_MAX];
+  size_t cap = count <= FD_BOUNCE_STACK_MAX ? count
+             : (count <= FD_BOUNCE_HEAP_MAX ? count : FD_BOUNCE_HEAP_MAX);
+  uint8_t *kbuf = cap <= FD_BOUNCE_STACK_MAX ? stack_buf : (uint8_t *)kmalloc(cap);
+  if (!kbuf) {
+    kbuf = stack_buf;
+    cap = FD_BOUNCE_STACK_MAX;
+  }
+
+  size_t total = 0;
+  int64_t err = 0;
+  uint32_t end_off = 0;
+  while (total < count) {
+    size_t chunk = count - total;
+    if (chunk > cap)
+      chunk = cap;
+    if (copy_from_user(kbuf, user_buf + total, chunk) != 0) {
+      err = -14;
+      break;
+    }
+    int32_t wrote = append
+        ? (int32_t)vfs_append(node, (uint32_t)chunk, kbuf, &end_off)
+        : (int32_t)fd_vfs_write(node, offset + total, (uint32_t)chunk, kbuf);
+    if (wrote < 0) {
+      err = wrote;
+      break;
+    }
+    if (wrote == 0)
+      break;
+    total += (size_t)wrote;
+    if ((size_t)wrote < chunk)
+      break;
+  }
+
+  if (end_offset_out)
+    *end_offset_out = end_off;
+  if (kbuf != stack_buf)
+    kfree(kbuf);
+  return total > 0 ? (int64_t)total : err;
 }
 
 static int64_t fd_write(int fd, const void *buf, size_t count) {
@@ -1341,11 +1460,22 @@ static int64_t fd_write(int fd, const void *buf, size_t count) {
   trace_userspace_debug_write(t, fd, buf, count);
   bool append = (flags & O_APPEND) &&
                 (node->flags & FS_TYPE_MASK) == FS_FILE;
+  bool positioned = (node->flags & FS_TYPE_MASK) == FS_FILE;
+  if (positioned) {
+    while (__atomic_exchange_n(&node->write_pos_lock, 1, __ATOMIC_ACQUIRE))
+      sched_yield();
+    if (!append)
+      offset = fd_offset_get(t, (uint64_t)fd);
+  }
   uint32_t end_offset = 0;
   t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
-  int32_t bytes_written = append
-      ? (int32_t)vfs_append(node, count, (uint8_t *)buf, &end_offset)
-      : (int32_t)fd_vfs_write(node, offset, count, (uint8_t *)buf);
+  bool from_user = is_user_range(buf, count);
+  int32_t bytes_written = from_user
+      ? (int32_t)fd_write_from_user_node(node, offset, count, (const uint8_t *)buf,
+                                         append, &end_offset)
+      : (append
+          ? (int32_t)vfs_append(node, count, (uint8_t *)buf, &end_offset)
+          : (int32_t)fd_vfs_write(node, offset, count, (uint8_t *)buf));
   t->current_io_flags = 0;
   if (bytes_written == -9) {
     static uint32_t bad_write_node_logs;
@@ -1363,6 +1493,8 @@ static int64_t fd_write(int fd, const void *buf, size_t count) {
     else
       fd_advance_offset(t, (uint64_t)fd, node, (uint32_t)bytes_written);
   }
+  if (positioned)
+    __atomic_store_n(&node->write_pos_lock, 0, __ATOMIC_RELEASE);
   fd_put_node(ref);
 
   /* A non-empty write MUST NEVER return 0.
@@ -1397,14 +1529,13 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count, uint64_t a3,
   if (!node)
     return (uint64_t)-9;
   t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
-  int32_t bytes_read =
-      (int32_t)fd_vfs_read(node, offset, count, (uint8_t *)buf);
+  int64_t bytes_read = fd_read_to_user(node, offset, count, (uint8_t *)buf);
   t->current_io_flags = 0;
   if (bytes_read > 0)
     fd_advance_offset(t, fd, node, (uint32_t)bytes_read);
   fd_put_node(ref);
 
-  return (uint64_t)(int64_t)bytes_read;
+  return (uint64_t)bytes_read;
 }
 
 static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count,
@@ -1449,11 +1580,10 @@ static uint64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count,
   if (!node)
     return (uint64_t)-9;
   t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
-  int32_t bytes_read =
-      (int32_t)fd_vfs_read(node, offset, count, (uint8_t *)buf);
+  int64_t bytes_read = fd_read_to_user(node, offset, count, (uint8_t *)buf);
   t->current_io_flags = 0;
   fd_put_node(ref);
-  return (uint64_t)(int64_t)bytes_read;
+  return (uint64_t)bytes_read;
 }
 
 static uint64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
@@ -1473,14 +1603,13 @@ static uint64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
     return (uint64_t)-9;
   /* Linux also honors O_APPEND for pwrite, without changing f_pos. */
   uint32_t end_offset;
+  bool append = (flags & O_APPEND) && (node->flags & FS_TYPE_MASK) == FS_FILE;
   t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
-  int32_t bytes_written = (flags & O_APPEND) &&
-                          (node->flags & FS_TYPE_MASK) == FS_FILE
-      ? (int32_t)vfs_append(node, count, (uint8_t *)buf, &end_offset)
-      : (int32_t)fd_vfs_write(node, offset, count, (uint8_t *)buf);
+  int64_t bytes_written = fd_write_from_user_node(
+      node, offset, count, (const uint8_t *)buf, append, &end_offset);
   t->current_io_flags = 0;
   fd_put_node(ref);
-  return (uint64_t)(int64_t)bytes_written;
+  return (uint64_t)bytes_written;
 }
 
 static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
@@ -1567,8 +1696,8 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       return (uint64_t)-14;
     }
     int32_t bytes_read =
-        (int32_t)fd_vfs_read(node, offset + total, len,
-                          (uint8_t *)base);
+        (int32_t)fd_read_to_user(node, offset + total, len,
+                                 (uint8_t *)base);
     if (bytes_read < 0) {
       if (total > 0)
         break;
@@ -1819,8 +1948,8 @@ static uint64_t sys_preadv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       return (uint64_t)-14;
     }
     int32_t bytes_read =
-        (int32_t)fd_vfs_read(node, offset + total, len,
-                          (uint8_t *)base);
+        (int32_t)fd_read_to_user(node, offset + total, len,
+                                 (uint8_t *)base);
     if (bytes_read < 0) {
       if (total > 0)
         break;
@@ -1885,11 +2014,9 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       return (uint64_t)-14;
     }
     uint32_t end_offset;
-    int32_t bytes_written = (flags & O_APPEND) &&
-                            (node->flags & FS_TYPE_MASK) == FS_FILE
-        ? (int32_t)vfs_append(node, len, (uint8_t *)base, &end_offset)
-        : (int32_t)fd_vfs_write(node, offset + total, len,
-                             (uint8_t *)base);
+    bool append = (flags & O_APPEND) && (node->flags & FS_TYPE_MASK) == FS_FILE;
+    int32_t bytes_written = (int32_t)fd_write_from_user_node(
+        node, offset + total, len, (const uint8_t *)base, append, &end_offset);
     if (bytes_written < 0) {
       if (total > 0)
         break;
@@ -2464,6 +2591,8 @@ static uint64_t sys_fsync(uint64_t fd, uint64_t a1, uint64_t a2, uint64_t a3,
   if (!t || !FD_IN_RANGE(t, fd) || !fd_is_valid_node(t->fds[fd]))
     return (uint64_t)-9;
   vfs_cache_sync(t->fds[fd]);
+  /* Metadata may sit in a deferred journal group commit. */
+  ext3_journal_commit_all();
   return 0;
 }
 
@@ -2483,7 +2612,11 @@ void sys_sync_all_open_files(void) {
   spinlock_release(&tid_lock);
 
   uint32_t cursor = 0;
-  vfs_node_t *nodes[MAX_FDS];
+  vfs_node_t *stack_nodes[64];
+  vfs_node_t **nodes = (vfs_node_t **)kmalloc(MAX_FDS * sizeof(vfs_node_t *));
+  size_t nodes_cap = nodes ? MAX_FDS : 64;
+  if (!nodes)
+    nodes = stack_nodes;
   for (;;) {
     struct thread *next = NULL;
     bool found = false;
@@ -2506,7 +2639,7 @@ void sys_sync_all_open_files(void) {
 
     struct fd_table *files = next->files;
     spinlock_acquire(&files->lock);
-    for (uint32_t fd = 0; fd < files->capacity && fd < MAX_FDS; fd++) {
+    for (uint32_t fd = 0; fd < files->capacity && fd < MAX_FDS && node_count < nodes_cap; fd++) {
       vfs_node_t *node = files->fds[fd];
       if (!fd_is_valid_node(node))
         continue;
@@ -2522,6 +2655,8 @@ void sys_sync_all_open_files(void) {
       vfs_close(nodes[i]);
     }
   }
+  if (nodes != stack_nodes)
+    kfree(nodes);
   /* Open descriptors are only part of the dirty set: files closed but still
    * held by the dentry cache keep their dirty pages until they are synced. */
   vfs_dentry_sync_all();
@@ -2531,6 +2666,7 @@ static uint64_t sys_sync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                          uint64_t a4, uint64_t a5) {
   (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
   sys_sync_all_open_files();
+  ext3_journal_commit_all();
   return 0;
 }
 
@@ -2841,10 +2977,69 @@ static bool sys_mount_block_try(struct block_device *dev, vfs_node_t *mountpoint
     return true;
 }
 
+/* The runtime-dir service supplies uid, gid and mode in the legacy mount
+ * data. Set them before publishing the filesystem so the user manager can
+ * open its bus socket as soon as the mount syscall succeeds. */
+static int mount_tmpfs_at(vfs_node_t *point, const char *target,
+                          uint64_t data_ptr) {
+    uint32_t mode = 0777, uid = 0, gid = 0;
+    if (data_ptr) {
+        char options[512];
+        long n = strncpy_from_user(options, (const void *)data_ptr, sizeof(options));
+        if (n < 0) return -14;
+        if ((size_t)n >= sizeof(options)) return -36;
+        const char *option = options;
+        while (*option) {
+            const char *end = option;
+            while (*end && *end != ',') end++;
+            size_t length = end - option;
+            uint32_t *out = NULL;
+            unsigned base = 10, prefix = 4;
+            uint32_t max = UINT32_MAX - 1;
+            if (length >= 5 && !strncmp(option, "mode=", 5)) {
+                out = &mode;
+                base = 8;
+                prefix = 5;
+                max = 07777;
+            } else if (length >= 4 && !strncmp(option, "uid=", 4)) {
+                out = &uid;
+            } else if (length >= 4 && !strncmp(option, "gid=", 4)) {
+                out = &gid;
+            }
+            if (out) {
+                const char *digit = option + prefix;
+                if (digit == end) return -22;
+                uint32_t value = 0;
+                while (digit < end) {
+                    unsigned d = (unsigned)(*digit++ - '0');
+                    if (d >= base || value > (max - d) / base) return -22;
+                    value = value * base + d;
+                }
+                *out = value;
+            }
+            option = *end ? end + 1 : end;
+        }
+    }
+    if ((point->flags & FS_TYPE_MASK) != FS_DIRECTORY) return -20;
+    vfs_node_t *root = tmpfs_create_private_root();
+    if (!root) return -12;
+    const char *name = strrchr(target, '/');
+    strncpy(root->name, name ? name + 1 : target, sizeof(root->name) - 1);
+    root->name[sizeof(root->name) - 1] = '\0';
+    root->mask = mode;
+    root->uid = uid;
+    root->gid = gid;
+    int result = vfs_mount_ex(point, root, "tmpfs", "tmpfs", target);
+    if (result) {
+        vfs_close(root);
+        return -12;
+    }
+    return 0;
+}
+
 static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
                           uint64_t fstype_ptr, uint64_t flags,
                           uint64_t data_ptr, uint64_t a5) {
-    (void)data_ptr;
     (void)a5;
 
     /* Legacy libc mount magic occupies the propagation-bit range. Linux
@@ -2873,9 +3068,13 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
     }
 
     struct thread *task = sched_get_current();
-    if (!capability_has(task, CAP_SYS_ADMIN)) return (uint64_t)-1;
+    /* Inside an owned mount namespace, changes stay in that namespace's
+     * table; everything else needs full CAP_SYS_ADMIN. */
+    bool ns_ok = vfs_namespace_active() && capability_mount_ns_admin(task);
+    if (!ns_ok && !capability_has_init_ns(task, CAP_SYS_ADMIN)) return (uint64_t)-1;
     vfs_node_t *base = task && task->cwd_node ? task->cwd_node : fs_root;
     if (fstype && (!strcmp(fstype, "fuse") || !strncmp(fstype, "fuse.", 5))) {
+        if (!capability_has_init_ns(task, CAP_SYS_ADMIN)) return (uint64_t)-1;
         char options[1024];
         if (!data_ptr) return (uint64_t)-22;
         long length = strncpy_from_user(options, (void *)data_ptr, sizeof(options));
@@ -2884,7 +3083,7 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
         vfs_node_t *point = vfs_resolve_path_at(base, target);
         if (!point) return (uint64_t)-2;
         int result = fuse_mount_at(point, source, fstype, target, flags, options);
-        if (result || vfs_namespace_active()) vfs_close(point);
+        vfs_close(point);
         return (uint64_t)result;
     }
     /* Namespace mount operations resolve relative to the actual directory
@@ -2955,7 +3154,11 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
         vfs_node_t *src = source ? vfs_resolve_path_at(base, source) : NULL;
         vfs_node_t *point = vfs_resolve_path_at(base, target);
         if (!src || !point) { if (src) vfs_close(src); if (point) vfs_close(point); return (uint64_t)-2; }
-        return vfs_mount_ex(point, src, source, "bind", target);
+        int result = vfs_mount_ex(point, src, source, "bind", target);
+        vfs_close(point);
+        if (result)
+            vfs_close(src);
+        return (uint64_t)result;
     }
 
     /* Pseudo-filesystems handling */
@@ -2994,6 +3197,11 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
             vfs_node_t *mountpoint = vfs_resolve_path(ct);
             if (!mountpoint)
                 return (uint64_t)-2;
+            if (!strcmp(fstype, "tmpfs")) {
+                int result = mount_tmpfs_at(mountpoint, ct, data_ptr);
+                vfs_close(mountpoint);
+                return (uint64_t)result;
+            }
             vfs_close(mountpoint);
             tmpfs_mount_at(ct);
             return 0;
@@ -3085,7 +3293,8 @@ static uint64_t sys_umount2(uint64_t target_ptr, uint64_t flags,
                             uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) {
     (void)a3; (void)a4; (void)a5; (void)a6;
     struct thread *task = sched_get_current();
-    if (!capability_has(task, CAP_SYS_ADMIN)) return (uint64_t)-1;
+    bool ns_ok = vfs_namespace_active() && capability_mount_ns_admin(task);
+    if (!ns_ok && !capability_has_init_ns(task, CAP_SYS_ADMIN)) return (uint64_t)-1;
     char path[512];
     if (!target_ptr || !is_user_range((void *)target_ptr, 1)) return (uint64_t)-14;
     long n = strncpy_from_user(path, (void *)target_ptr, sizeof(path));
@@ -3095,11 +3304,18 @@ static uint64_t sys_umount2(uint64_t target_ptr, uint64_t flags,
     if (!point) return (uint64_t)-2;
     int result;
     if (fuse_is_root(point)) {
+        if (!capability_has_init_ns(task, CAP_SYS_ADMIN)) {
+            vfs_close(point);
+            return (uint64_t)-1;
+        }
         result = !(flags & 2) && fuse_mount_busy(point) ? -16 :
             vfs_initial_unmount(point, (unsigned)flags);
         if (!result) fuse_detach_mount(point);
     } else if (vfs_namespace_active()) result = vfs_namespace_umount(point, (unsigned)flags);
-    else result = vfs_inplace_unmount(point, (unsigned)flags);
+    else {
+        if (!capability_has_init_ns(task, CAP_SYS_ADMIN)) result = -1;
+        else result = vfs_inplace_unmount(point, (unsigned)flags);
+    }
     vfs_close(point);
     return (uint64_t)result;
 }

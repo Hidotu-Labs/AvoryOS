@@ -78,7 +78,14 @@ userland/avory-login.elf: userland/avory-login.c userland/GNUmakefile config/use
 	$(MAKE) -C userland -f GNUmakefile avory-login.elf
 
 
-$(ARCH_STAMP): scripts/setup-rootfs.sh scripts/axon-common.sh scripts/configure-pacman.sh \
+SYSTEMD_UNIT_FILES := config/systemd/avory-login.service \
+	config/systemd/avory-early-init.service \
+	config/systemd/seatd.service.d/avoryos.conf \
+	config/systemd/systemd-hostnamed.service.d/avoryos.conf \
+	config/systemd/systemd-vconsole-setup.service.d/avoryos.conf \
+	config/systemd/logind.conf.d/avoryos.conf
+
+$(ARCH_STAMP): $(SYSTEMD_UNIT_FILES) scripts/setup-rootfs.sh scripts/axon-common.sh scripts/configure-pacman.sh \
 		scripts/rootfs-packages.txt $(AXON_PROFILE_FILES) \
 		userland/avory-login.c $(GLIBC_TOOLCHAIN_STAMP)
 	@mkdir -p $(dir $(ARCH_STAMP))
@@ -106,10 +113,11 @@ all: $(IMAGE_NAME).iso disk.img edk2-ovmf nouveau-618-desktop-firmware
 # configuration without KVM.  The arch-specific run-x86_64 target remains the
 # TCG implementation behind run-tcg.
 RUN_SMP ?= 8
-# Keep the desktop launch's virtual storage serialized. With eight NVMe
-# queues the same intact GPT image can mount but lose all userspace path
-# lookups during startup. Storage diagnostics can opt into more queues.
+# Keep the desktop root disk on one queue by default. Multi-queue and
+# io_uring remain available for storage testing via RUN_NVME_QUEUES and
+# RUN_DISK_IO, while the normal boot uses QEMU's thread backend.
 RUN_NVME_QUEUES ?= 1
+RUN_DISK_IO ?=
 # NIC selection for launchers that explicitly attach networking:
 #   make run RUN_NIC=e1000    # 82540EM networking
 #   make run RUN_NIC=e1000e   # 82574L networking (MSI preferred)
@@ -208,7 +216,7 @@ run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL
 		-M q35,pcspk-audiodev=snd0 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
-		-drive file=disk.img,format=raw,if=none,id=nvme0$(RUN_ROOT_DRIVE_OPTS) \
+		-drive file=disk.img,format=raw,if=none,id=nvme0$(RUN_DISK_IO)$(RUN_ROOT_DRIVE_OPTS) \
 		-device nvme,serial=avoryos0,drive=nvme0,max_ioqpairs=$(RUN_NVME_QUEUES) \
 		$(RUN_ACCEL_FLAGS) \
 		-smp $(RUN_SMP) \
@@ -548,15 +556,15 @@ build/firmware/.stamp: scripts/linux-firmware-install.sh scripts/linux/firmware-
 disk.img: userland/winoptions userland/icewm-menu $(ARCH_STAMP)
 disk.img: scripts/configure-accounts.sh scripts/configure-pacman.sh userland/avory-account userland/test_accounts.sh
 disk.img: config/init/rcS config/init/inittab config/sddm/10-theme.conf
-SYSTEMD_UNIT_FILES := config/systemd/avory-login.service \
-	config/systemd/avory-early-init.service \
-	config/systemd/seatd.service.d/avoryos.conf \
-	config/systemd/logind.conf.d/avoryos.conf
 disk.img: $(SYSTEMD_UNIT_FILES)
 # Fixed 14 GiB image by default (override during a forced rebuild with
 # `make disk-rebuild DISK_SIZE_MIB=<MiB>`). Leave room for filesystem metadata
 # and tools added after the rootfs overlay.
 DISK_SIZE_MIB ?= 14336
+# NVIDIA GSP firmware to put on disk.img, by chip (e.g. NOUVEAU_CHIPS=ad106).
+# Empty installs every chip (~1.1 GiB). QEMU's virtio-gpu needs none.
+NOUVEAU_CHIPS ?=
+export NOUVEAU_CHIPS
 DISK_PARTITION_CACHE := build/arch/disk-partition.img
 DISK_APP_MANIFEST := build/arch/disk-apps.json
 # Keep an immutable build output separate from guest/incremental writes.
@@ -578,21 +586,19 @@ DISK_NON_APP_DEPS := GNUmakefile \
 	scripts/configure-accounts.sh scripts/configure-pacman.sh userland/avory-account userland/test_accounts.sh \
 	scripts/populate-ext2-dir.sh scripts/populate-ext2-dir.py scripts/configure-image-root.sh config/init/rcS config/init/inittab \
 	$(SYSTEMD_UNIT_FILES) \
-	config/plasma/avory-plasma-wayland.sh config/kwinoutputconfig.json \
+	config/plasma/avory-plasma-wayland.sh config/plasma/avory-pipewire-systemd.sh config/kwinoutputconfig.json \
 	config/weston/avory-weston-session.sh config/weston/weston.desktop \
 	config/xorg/10-modesetting.conf config/xorg/10-native.conf config/xorg/10-virgl.conf config/xorg/20-output.conf \
 	scripts/image-runtime.py config/xorg/avory-prime-display.sh \
 	config/xorg/45-prime-output.sh config/xorg/avory-xorg-profile.sh \
 	config/xorg/10-nouveau.conf config/xorg/avory-nouveau-xorg.sh \
 	config/xorg/44-nouveau-env.sh scripts/image-firmware-install.sh \
-	scripts/image-add-firmware.py scripts/incremental-disk-apps.py scripts/image_copy.py scripts/disk-build-cache.py \
+	scripts/image-add-firmware.py scripts/incremental-disk-apps.py scripts/image_copy.py scripts/disk-build-cache.py scripts/verify-desktop-image.sh \
 	scripts/linux-firmware-install.sh scripts/linux/firmware-manifest.txt \
 	scripts/linux/firmware-sha256-20260916.txt build/test_fw.bin build/firmware/.stamp \
 	$(QUAKE2_STAMP) scripts/build-quake2.sh scripts/quake2-sdl2-config.in \
 	$(QUAKE2_BUNDLE_FILES) \
-	assets/boot.wav assets/test.wav assets/jane.mp3 assets/mc9.mp3 \
-	assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png \
-	assets/logo.png assets/linus.gif assets/video.mp4 userland/terrain.png \
+	assets/logo.png userland/terrain.png \
 	userland/texpacks/classicube.zip initrd/weston.ini initrd/drm-pick.sh \
 	initrd/avory-drm.sh
 
@@ -624,9 +630,9 @@ disk.img: config/xorg/44-nouveau-env.sh
 disk.img: scripts/image-firmware-install.sh
 disk.img: build/test_fw.bin build/firmware/.stamp
 disk.img: $(ARCH_STAMP) $(QUAKE2_BUNDLE_FILES)
-disk.img: assets/boot.wav assets/test.wav assets/jane.mp3 assets/mc9.mp3 assets/train.mp3 assets/test.bmp assets/test.tar assets/room.png assets/logo.png assets/linus.gif assets/video.mp4 userland/terrain.png userland/texpacks/classicube.zip initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh
+disk.img: assets/logo.png userland/terrain.png userland/texpacks/classicube.zip initrd/weston.ini initrd/drm-pick.sh initrd/avory-drm.sh
 
-disk.img: GNUmakefile scripts/incremental-disk-apps.py scripts/image_copy.py scripts/disk-build-cache.py
+disk.img: GNUmakefile scripts/incremental-disk-apps.py scripts/image_copy.py scripts/disk-build-cache.py scripts/verify-desktop-image.sh
 
 .PHONY: disk-rebuild disk-full-force
 disk-full-force:
@@ -743,33 +749,13 @@ disk.img: disk-full-force
 		echo "write userland/test_cred.elf bin/test_cred"; \
 		echo "rm standalone.s"; \
 		echo "write userland/standalone.s standalone.s"; \
-		echo "rm test.wav"; \
-		echo "write assets/test.wav test.wav"; \
-		echo "rm boot.wav"; \
-		echo "write assets/boot.wav boot.wav"; \
-		echo "rm jane.mp3"; \
-		echo "write assets/jane.mp3 jane.mp3"; \
-		echo "rm mc9.mp3"; \
-		echo "write assets/mc9.mp3 mc9.mp3"; \
-		echo "rm train.mp3"; \
-		echo "write assets/train.mp3 train.mp3"; \
-		echo "rm test.bmp"; \
-		echo "write assets/test.bmp test.bmp"; \
-		echo "mkdir assets"; \
-		echo "rm assets/room.png"; \
-		echo "write assets/room.png assets/room.png"; \
 		echo "rm assets/logo.png"; \
 		echo "write assets/logo.png assets/logo.png"; \
-		echo "rm assets/linus.gif"; \
-		echo "write assets/linus.gif assets/linus.gif"; \
-		echo "rm assets/video.mp4"; \
 		echo "write assets/video.mp4 assets/video.mp4"; \
 		echo "rm hello.krx"; \
 		echo "write userland/hello.krx hello.krx"; \
 		echo "rm bin/dns_lookup"; \
 		echo "write userland/dns_lookup.elf bin/dns_lookup"; \
-		echo "rm test.tar"; \
-		echo "write assets/test.tar test.tar"; \
 		echo "rm bin/test_mem_stress"; \
 		echo "write userland/test_mem_stress.elf bin/test_mem_stress"; \
 		echo "rm bin/test_clone_futex"; \
@@ -897,6 +883,8 @@ disk.img: disk-full-force
 		cp -f build/test_fw.bin build/arch/rootfs/lib/firmware/test_fw.bin; \
 		if [ -d build/firmware/lib/firmware ]; then \
 			cp -a build/firmware/lib/firmware/. build/arch/rootfs/lib/firmware/; \
+			NOUVEAU_CHIPS='$(NOUVEAU_CHIPS)' bash scripts/prune-nvidia-firmware.sh build/arch/rootfs/lib/firmware; \
+			python3 scripts/dedup-firmware.py build/arch/rootfs/lib/firmware; \
 		fi; \
 	fi
 	@if [ -d build/arch/rootfs ]; then \
@@ -1024,6 +1012,7 @@ disk.img: disk-full-force
 	@bash scripts/image-firmware-install.sh ./part.img
 	@echo "Applying AvoryOS image defaults..."
 	@bash scripts/configure-image-root.sh ./part.img build/arch/rootfs
+	@bash scripts/verify-desktop-image.sh ./part.img
 	@if [ -f userland/winoptions ] && [ -f userland/icewm-menu ]; then \
 		echo "Installing IceWM configuration into disk image..."; \
 		{ echo "mkdir etc/icewm"; \
@@ -1233,6 +1222,10 @@ test-phase6-login:
 .PHONY: test-benchmarks
 test-benchmarks:
 	python3 scripts/tests/test_benchmarks_boot.py
+
+.PHONY: test-systemd
+test-systemd:
+	python3 scripts/tests/test_systemd_boot.py --desktop --nvme-queues $(RUN_NVME_QUEUES) --kernel kernel/bin-$(ARCH)/kernel
 
 # Root image recipes depend on these paths; delegate each app build to its local
 # userland makefile so callers can keep using `make userland/foo.elf`.

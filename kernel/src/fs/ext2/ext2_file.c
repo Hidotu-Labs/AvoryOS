@@ -43,7 +43,7 @@ uint32_t ext2_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
       else
         memset(buffer + bytes_read, 0, count);
     } else if (!is_user && !off_in && count == mnt->block_size) {
-      if (ext2_read_block(mnt, disk_block, buffer + bytes_read)) {
+      if (ext2_read_block_data(mnt, disk_block, buffer + bytes_read)) {
         error = 5;
         break;
       }
@@ -54,7 +54,7 @@ uint32_t ext2_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size,
         error = 12;
         break;
       }
-      if (ext2_read_block(mnt, disk_block, block_buf)) {
+      if (ext2_read_block_data(mnt, disk_block, block_buf)) {
         error = 5;
         break;
       }
@@ -233,6 +233,12 @@ static uint32_t ext2_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t si
     mnt->journal.phase = "write-inode-read";
     if (ext2_read_inode(mnt, node->inode, &inode)) {
       error = 5;
+    } else if ((inode.i_mode & 0xF000) != EXT2_S_IFREG) {
+      /* File data only: a stale or mistyped node must never append data
+       * blocks to a symlink, directory or socket inode. */
+      klogf("[EXT2] refused data write to non-regular inode %u mode=%o\n",
+            node->inode, inode.i_mode);
+      error = 22;
     } else {
       for (unsigned touched = 0;
            touched < EXT2_WRITE_BATCH_BLOCKS && bytes_written < size;
@@ -267,7 +273,7 @@ static uint32_t ext2_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t si
           memset(block_buf, 0, mnt->block_size);
         } else if (offset_in_block || to_write < mnt->block_size) {
           mnt->journal.phase = "write-data-read";
-          if (ext2_read_block(mnt, disk_block, block_buf)) {
+          if (ext2_read_block_data(mnt, disk_block, block_buf)) {
             error = 5;
             break;
           }
@@ -275,7 +281,7 @@ static uint32_t ext2_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t si
 
         memcpy(block_buf + offset_in_block, buffer + bytes_written, to_write);
         mnt->journal.phase = "write-data";
-        if (ext2_write_block(mnt, disk_block, block_buf)) {
+        if (ext2_write_block_nocache(mnt, disk_block, block_buf, NULL, NULL)) {
           error = 5;
           break;
         }
@@ -378,15 +384,33 @@ int ext2_readlink_impl(vfs_node_t *node, char *buf, uint32_t size) {
   return (int)bytes_read;
 }
 
+static int ext2_symlink_locked(vfs_node_t *node, char *name, char *target);
+
+/* The whole symlink (inode allocation, inode, data blocks, directory entry)
+ * is one journal transaction, like create/mkdir.  It used to run outside any
+ * handle, so its metadata went straight home and was lost to a deferred group
+ * commit holding an older image of the same directory block. */
 int ext2_symlink_impl(vfs_node_t *node, char *name, char *target) {
   ext2_mount_t *mnt = (ext2_mount_t *)node->device;
   if (!mnt)
     return -1;
   if (mnt->read_only)
     return -30;
-
-  if (ext2_finddir_impl(node, name) != NULL)
+  if (ext3_journal_start(mnt) != 0)
     return -1;
+  int rc = ext2_symlink_locked(node, name, target);
+  int stop = ext3_journal_stop(mnt);
+  return rc ? rc : (stop ? -5 : 0);
+}
+
+static int ext2_symlink_locked(vfs_node_t *node, char *name, char *target) {
+  ext2_mount_t *mnt = (ext2_mount_t *)node->device;
+
+  vfs_node_t *existing = ext2_finddir_impl(node, name);
+  if (existing) {
+    kfree(existing);
+    return -17;
+  }
 
   uint32_t new_ino = ext2_alloc_inode(mnt);
   if (!new_ino)
@@ -540,10 +564,99 @@ int ext2_rename_impl(vfs_node_t *node, char *old_name, char *new_name) {
   return result != 0 ? result : stop_result;
 }
 
+/* Moves directory `source` (an entry of old_parent) into new_parent. Runs
+ * inside the caller's transaction. Besides the two entries this rewrites the
+ * moved directory's "..", shifts one link from old_parent to new_parent and,
+ * when replacing an empty directory, frees that directory as rmdir does. */
+static int ext2_rename_cross_dir(ext2_mount_t *mnt, vfs_node_t *old_parent,
+                                 char *old_name, vfs_node_t *new_parent,
+                                 char *new_name, vfs_node_t *source) {
+  if (!strcmp(old_name, ".") || !strcmp(old_name, "..") ||
+      !strcmp(new_name, ".") || !strcmp(new_name, ".."))
+    return -22;
+  /* Refuse moving a directory beneath itself: walk new_parent up to root. */
+  vfs_node_t *cur = new_parent;
+  for (int depth = 0; depth < 4096; depth++) {
+    if (cur->inode == source->inode) {
+      if (cur != new_parent) kfree(cur);
+      return -22;
+    }
+    if (cur->inode == 2) break;
+    vfs_node_t *up = ext2_finddir_impl(cur, "..");
+    bool stuck = up && up->inode == cur->inode;
+    if (cur != new_parent) kfree(cur);
+    if (!up) return -5;
+    if (stuck) { kfree(up); cur = new_parent; break; }
+    cur = up;
+  }
+  if (cur != new_parent) kfree(cur);
+
+  vfs_node_t *dest = ext2_finddir_impl(new_parent, new_name);
+  int result = 0;
+  ext2_inode_t dest_inode;
+  if (dest) {
+    if (dest->inode == source->inode) { kfree(dest); return 0; }
+    if ((dest->flags & FS_TYPE_MASK) != FS_DIRECTORY) { kfree(dest); return -20; }
+    if (!ext2_dir_is_empty(mnt, dest->inode)) { kfree(dest); return -39; }
+    if (ext2_read_inode(mnt, dest->inode, &dest_inode)) { kfree(dest); return -5; }
+  }
+
+  result = dest ? ext2_replace_dir_entry(mnt, new_parent->inode, new_name,
+                                         source->inode, EXT2_FT_DIR)
+                : ext2_add_dir_entry(mnt, new_parent->inode, source->inode,
+                                     new_name, EXT2_FT_DIR);
+  if (result) { result = -5; goto out; }
+  if (ext2_remove_dir_entry(mnt, old_parent->inode, old_name)) {
+    if (dest)
+      ext2_replace_dir_entry(mnt, new_parent->inode, new_name, dest->inode,
+                             EXT2_FT_DIR);
+    else
+      ext2_remove_dir_entry(mnt, new_parent->inode, new_name);
+    result = -5;
+    goto out;
+  }
+  if (ext2_replace_dir_entry(mnt, source->inode, "..", new_parent->inode,
+                             EXT2_FT_DIR))
+    result = -5;
+
+  uint32_t now = ext2_current_time();
+  ext2_inode_t pi;
+  if (ext2_read_inode(mnt, old_parent->inode, &pi) == 0) {
+    if (pi.i_links_count > 1) pi.i_links_count--;
+    pi.i_mtime = pi.i_ctime = now;
+    if (ext2_write_inode(mnt, old_parent->inode, &pi)) result = -5;
+  }
+  /* A replaced directory's ".." link to new_parent goes away as the moved
+   * one's arrives, so new_parent gains a link only for a fresh entry. */
+  if (ext2_read_inode(mnt, new_parent->inode, &pi) == 0) {
+    if (!dest) pi.i_links_count++;
+    pi.i_mtime = pi.i_ctime = now;
+    if (ext2_write_inode(mnt, new_parent->inode, &pi)) result = -5;
+  }
+  if (ext2_read_inode(mnt, source->inode, &pi) == 0) {
+    pi.i_ctime = now;
+    ext2_write_inode(mnt, source->inode, &pi);
+  }
+  if (dest) {
+    ext2_free_all_blocks(mnt, &dest_inode);
+    dest_inode.i_links_count = 0;
+    dest_inode.i_dtime = now;
+    ext2_write_inode(mnt, dest->inode, &dest_inode);
+    ext2_free_inode(mnt, dest->inode);
+    uint32_t group = (dest->inode - 1) / mnt->inodes_per_group;
+    uint32_t used_dirs = ext2_bgd_used_dirs(&mnt->bgdt[group]);
+    if (used_dirs > 0)
+      ext2_bgd_set_used_dirs(&mnt->bgdt[group], used_dirs - 1);
+    ext2_mark_group_dirty(mnt, group);
+  }
+out:
+  kfree(dest);
+  return result;
+}
+
 /* Cache downloads move regular files between staging and final directories.
  * Keep source inode/link count intact and serialize both directory mutations
- * in one transaction. Directory moves require '..' and parent-link updates
- * and are deliberately rejected until those semantics are implemented. */
+ * in one transaction. Directories go through ext2_rename_cross_dir(). */
 int ext2_rename_cross(vfs_node_t *old_parent, char *old_name,
                       vfs_node_t *new_parent, char *new_name) {
   if (!old_parent || !new_parent || !old_parent->device ||
@@ -565,6 +678,11 @@ int ext2_rename_cross(vfs_node_t *old_parent, char *old_name,
   if (!source)
     goto out;
   uint32_t type = source->flags & FS_TYPE_MASK;
+  if (type == FS_DIRECTORY) {
+    result = ext2_rename_cross_dir(mnt, old_parent, old_name, new_parent,
+                                   new_name, source);
+    goto out;
+  }
   if (type != FS_FILE && type != FS_SYMLINK && type != FS_SOCKET) {
     result = -95;
     goto out;
@@ -767,27 +885,49 @@ int ext2_unlink_impl(vfs_node_t *node, char *name) {
   return 0;
 }
 
-/* ext2 has no persistent open-file table, so defer reclaiming an unlinked
- * regular inode until the VFS has dropped its final descriptor/mapping/cache
- * reference.  Otherwise a concurrent create can reuse its inode while a
- * mapped VMA still faults pages from that file. */
-void ext2_destroy_unlinked_node(vfs_node_t *node) {
-  if (!node || !node->device || (node->flags & FS_TYPE_MASK) != FS_FILE)
-    return;
-  ext2_mount_t *mnt = (ext2_mount_t *)node->device;
+/* Real hard link: one more directory entry and i_links_count for an existing
+ * regular inode.  The VFS used to emulate link() by creating a new file and
+ * copying the data, so every hardlinked package file (git ships ~140 names
+ * for one binary) cost a full copy and a failed copy left the name missing. */
+int ext2_link_impl(vfs_node_t *dir, char *name, vfs_node_t *target) {
+  ext2_mount_t *mnt = (ext2_mount_t *)dir->device;
+  if (!mnt || !target || target->device != dir->device)
+    return -18; /* EXDEV */
   if (mnt->read_only)
-    return;
+    return -30;
+  if (!name || !name[0] || strlen(name) > 255)
+    return -36;
   if (ext3_journal_start(mnt) != 0)
-    return;
+    return -5;
 
+  int rc = 0;
   ext2_inode_t inode;
-  if (ext2_read_inode(mnt, node->inode, &inode) == 0 &&
-      inode.i_links_count == 0 && inode.i_dtime != 0) {
-    ext2_free_all_blocks(mnt, &inode);
-    ext2_write_inode(mnt, node->inode, &inode);
-    ext2_free_inode(mnt, node->inode);
+  if (ext2_read_inode(mnt, target->inode, &inode)) {
+    rc = -5;
+  } else if ((inode.i_mode & 0xF000) != EXT2_S_IFREG) {
+    rc = -1; /* EPERM: directories and special nodes are not linked here */
+  } else if (inode.i_links_count == 0) {
+    rc = -2; /* being deleted */
+  } else if (inode.i_links_count >= 65000) {
+    rc = -31; /* EMLINK */
+  } else {
+    vfs_node_t *existing = ext2_finddir_impl(dir, name);
+    if (existing) {
+      kfree(existing);
+      rc = -17;
+    } else if (ext2_add_dir_entry(mnt, dir->inode, target->inode, name,
+                                  EXT2_FT_REG_FILE)) {
+      rc = -28;
+    } else {
+      inode.i_links_count++;
+      inode.i_ctime = ext2_current_time();
+      if (ext2_write_inode(mnt, target->inode, &inode))
+        rc = -5;
+    }
   }
-  ext3_journal_stop(mnt);
+  if (ext3_journal_stop(mnt) != 0 && rc == 0)
+    rc = -5;
+  return rc;
 }
 
 int ext2_rmdir_impl(vfs_node_t *node, char *name) {
@@ -875,8 +1015,17 @@ int ext2_mknod_impl(vfs_node_t *node, char *name, uint16_t permission,
     return -1;
   }
 
+  /* A socket owns no data: e2fsck rejects one that still carries the empty
+   * extent root (EXTENTS_FL plus a header in i_block) that create gave it,
+   * and its directory entry must say SOCK, not REG_FILE. */
+  ext3_journal_start(mnt);
   inode.i_mode = (inode.i_mode & 0x0FFF) | EXT2_S_IFSOCK;
+  inode.i_flags &= ~EXT4_EXTENTS_FL;
+  memset(inode.i_block, 0, sizeof(inode.i_block));
   ext2_write_inode(mnt, new_node->inode, &inode);
+  ext2_replace_dir_entry(mnt, node->inode, name, new_node->inode,
+                         EXT2_FT_SOCK);
+  ext3_journal_stop(mnt);
 
   new_node->flags  = FS_SOCKET;
   new_node->device = device;

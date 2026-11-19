@@ -112,7 +112,7 @@ static int drm_fb_validate(struct drm_file *file,
     for (int p = 0; p < info->num_planes; p++) {
         uint64_t mod = cmd->modifier[p];
         if (mod != DRM_FORMAT_MOD_LINEAR && mod != DRM_FORMAT_MOD_INVALID) {
-            klog_puts("[DRM] ADDFB2: unsupported modifier 0x");
+            klog_puts("[DRM] ADDFB2: unsupported modifier ");
             klog_hex32((uint32_t)(mod >> 32));
             klog_hex32((uint32_t)mod);
             klog_puts(" (treating as LINEAR)\n");
@@ -137,7 +137,7 @@ struct drm_framebuffer *ascentdrm_framebuffer_create_full(struct drm_file *file,
                                                     struct drm_mode_fb_cmd2 *cmd) {
     const struct drm_format_info *info = drm_format_lookup(cmd->pixel_format);
     if (!info) {
-        klog_puts("[DRM] ADDFB2: unknown pixel format 0x");
+        klog_puts("[DRM] ADDFB2: unknown pixel format ");
         klog_hex32(cmd->pixel_format);
         klog_puts("\n");
         return NULL;
@@ -203,19 +203,21 @@ struct drm_framebuffer *ascentdrm_framebuffer_create_full(struct drm_file *file,
 
     ascentdrm_mode_object_init(dev, &fb->base_fb.base, DRM_MODE_OBJECT_FB);
 
-    klog_puts("[DRM] ADDFB2: created fb id=");
-    klog_uint64(fb->base_fb.base.id);
-    klog_puts(" fmt=");
-    klog_puts(info->name);
-    klog_puts(" ");
-    klog_uint64(cmd->width);
-    klog_puts("x");
-    klog_uint64(cmd->height);
-    klog_puts(" planes=");
-    klog_uint64(info->num_planes);
-    klog_puts(" mod=");
-    klog_hex32((uint32_t)cmd->modifier[0]);
-    klog_puts("\n");
+    if (KLOG_RATELIMITED("DRM ADDFB2")) {
+        klog_puts("[DRM] ADDFB2: created fb id=");
+        klog_uint64(fb->base_fb.base.id);
+        klog_puts(" fmt=");
+        klog_puts(info->name);
+        klog_puts(" ");
+        klog_uint64(cmd->width);
+        klog_puts("x");
+        klog_uint64(cmd->height);
+        klog_puts(" planes=");
+        klog_uint64(info->num_planes);
+        klog_puts(" mod=");
+        klog_hex32((uint32_t)cmd->modifier[0]);
+        klog_puts("\n");
+    }
 
     /* Return as drm_framebuffer* — the base is the first member */
     return &fb->base_fb;
@@ -252,13 +254,14 @@ void ascentdrm_framebuffer_free_full(struct drm_device *dev,
 int ascentdrm_ioctl_addfb2(struct drm_file *file, struct drm_device *dev, uint64_t arg) {
     struct drm_mode_fb_cmd2 *cmd = (struct drm_mode_fb_cmd2 *)arg;
 
+#if KLOG_VERBOSE
     klog_puts("[DRM] ADDFB2 in width=");
     klog_uint64(cmd->width);
     klog_puts(" height=");
     klog_uint64(cmd->height);
-    klog_puts(" fmt=0x");
+    klog_puts(" fmt=");
     klog_hex32(cmd->pixel_format);
-    klog_puts(" flags=0x");
+    klog_puts(" flags=");
     klog_hex32(cmd->flags);
     klog_puts(" h0=");
     klog_uint64(cmd->handles[0]);
@@ -266,9 +269,10 @@ int ascentdrm_ioctl_addfb2(struct drm_file *file, struct drm_device *dev, uint64
     klog_uint64(cmd->pitches[0]);
     klog_puts(" off0=");
     klog_uint64(cmd->offsets[0]);
-    klog_puts(" mod0=0x");
+    klog_puts(" mod0=");
     klog_hex64(cmd->modifier[0]);
     klog_puts("\n");
+#endif
 
     struct drm_framebuffer *fb = ascentdrm_framebuffer_create_full(file, dev, cmd);
     if (!fb) {
@@ -277,8 +281,10 @@ int ascentdrm_ioctl_addfb2(struct drm_file *file, struct drm_device *dev, uint64
     }
 
     cmd->fb_id = fb->base.id;
+#if KLOG_VERBOSE
     klog_puts("[DRM] ADDFB2 out fb_id=");
     klog_uint64(cmd->fb_id);
     klog_puts("\n");
+#endif
     return 0;
 }

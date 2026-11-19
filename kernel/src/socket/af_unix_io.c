@@ -140,6 +140,8 @@ static void unix_discard_consumed_scm(unix_sock_t *usk) {
 static bool unix_user_range_valid(uint64_t addr, size_t len) {
   if (!addr)
     return false;
+  if (addr >= 0xFFFF800000000000ULL)
+    return true;
   return is_user_range((const void *)addr, len);
 }
 

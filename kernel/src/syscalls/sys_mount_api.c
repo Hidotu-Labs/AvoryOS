@@ -131,7 +131,7 @@ static uint64_t sys_fsopen(uint64_t fstype_ptr, uint64_t flags, uint64_t a2,
     return (uint64_t)-1;
   if (flags & ~(uint64_t)FSOPEN_CLOEXEC)
     return (uint64_t)-22;
-  if (!capability_has(t, CAP_SYS_ADMIN))
+  if (!capability_mount_ns_admin(t) && !capability_has_init_ns(t, CAP_SYS_ADMIN))
     return (uint64_t)-1;
   char type[16];
   if (!fstype_ptr || !is_user_range((void *)fstype_ptr, 1))
@@ -420,7 +420,8 @@ static uint64_t sys_move_mount(uint64_t from_dfd, uint64_t from_path_ptr,
                                uint64_t flags, uint64_t a5) {
   (void)a5;
   struct thread *t = sched_get_current();
-  if (!t || !capability_has(t, CAP_SYS_ADMIN))
+  if (!t || (vfs_namespace_active() ? !capability_mount_ns_admin(t)
+                                    : !capability_has_init_ns(t, CAP_SYS_ADMIN)))
     return (uint64_t)-1;
   char from_path[256], to_path[256];
   if (!from_path_ptr || !to_path_ptr ||

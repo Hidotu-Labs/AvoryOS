@@ -14,6 +14,7 @@
 #include "drivers/timer/rtc.h"
 #include "drivers/usb/usb.h"
 #include "cpu/tsc.h"
+#include "lib/tsc.h"
 #include "cpu/isr.h"
 #include "fs/ramfs.h"
 #include "fs/vfs.h"
@@ -892,10 +893,38 @@ static uint32_t procfs_storage_perf_read(vfs_node_t *node, uint32_t offset,
         (unsigned long long)__atomic_load_n(&dev->hw_writes, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&dev->hw_write_bytes, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&dev->hw_errors, __ATOMIC_RELAXED));
+    uint64_t hw_reads = __atomic_load_n(&dev->hw_reads, __ATOMIC_RELAXED);
+    uint64_t timed = __atomic_load_n(&dev->hw_read_timed, __ATOMIC_RELAXED);
+    if (hw_reads && timed) {
+      uint64_t cyc = __atomic_load_n(&dev->hw_read_cycles, __ATOMIC_RELAXED);
+      uint64_t bytes = __atomic_load_n(&dev->hw_read_bytes, __ATOMIC_RELAXED);
+      pos += scnprintf(buf + pos, cap - pos,
+          "nvme_read %s count=%llu avg_us=%llu max_us=%llu avg_kb=%llu\n",
+          dev->name, (unsigned long long)hw_reads,
+          (unsigned long long)(tsc_cycles_to_ns(cyc / timed) / 1000),
+          (unsigned long long)(tsc_cycles_to_ns(__atomic_load_n(
+              &dev->hw_read_max_cycles, __ATOMIC_RELAXED)) / 1000),
+          (unsigned long long)(bytes / hw_reads / 1024));
+    }
     struct storage_latency flush;
     storage_latency_snapshot(&dev->hw_flush, &flush);
     pos += procfs_latency_line(buf + pos, cap - pos, "nvme_flush", dev->name, &flush);
     block_put(dev);
+  }
+  {
+    extern void ext2_buffer_cache_stats(uint64_t *, uint64_t *, uint64_t *,
+                                        uint64_t *) __attribute__((weak));
+    if (ext2_buffer_cache_stats) {
+      uint64_t hits, misses, evictions, entries;
+      ext2_buffer_cache_stats(&hits, &misses, &evictions, &entries);
+      uint64_t total = hits + misses;
+      pos += scnprintf(buf + pos, cap - pos,
+          "ext_metadata_cache hits=%llu misses=%llu hit_pct=%llu "
+          "evictions=%llu entries=%llu\n",
+          (unsigned long long)hits, (unsigned long long)misses,
+          (unsigned long long)(total ? hits * 100 / total : 0),
+          (unsigned long long)evictions, (unsigned long long)entries);
+    }
   }
   for (unsigned i = 0; i < 8 && pos < cap - 1024; i++) {
     struct block_device *dev;
@@ -1441,7 +1470,7 @@ static uint32_t procfs_pid_stat_read(vfs_node_t *node, uint32_t offset,
   // 23..38: 16 zeroes
   // 39:processor 40..52: 13 zeroes
   int len = snprintf(buf, sizeof(buf),
-      "%u (%s) %c %u %u %u 0 0 0 0 0 0 0 %llu %llu "
+      "%u (%s) %c %u %u %u 0 0 0 %llu 0 %llu 0 %llu %llu "
       "0 0 20 0 1 0 %llu "
       "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 %u "
       "0 0 0 0 0 0 0 0 0 0 0 0 0\n",
@@ -1451,6 +1480,8 @@ static uint32_t procfs_pid_stat_read(vfs_node_t *node, uint32_t offset,
       pid_namespace_visible(sched_get_current(), t.parent_tid),
       pid_namespace_visible(sched_get_current(), t.pgid),
       pid_namespace_visible(sched_get_current(), t.pgid),
+      (unsigned long long)(t.nr_faults - t.maj_flt),
+      (unsigned long long)t.maj_flt,
       (unsigned long long)user_jiffies,
       (unsigned long long)system_jiffies,
       (unsigned long long)start_ticks,
@@ -1532,6 +1563,35 @@ static uint32_t procfs_pid_syscall_read(vfs_node_t *node, uint32_t offset,
   return size;
 }
 
+// /proc/sysprof: read for the per-syscall time table, write anything to reset.
+static uint32_t procfs_sysprof_read(vfs_node_t *node, uint32_t offset,
+                                    uint32_t size, uint8_t *buffer) {
+  enum { CAP = 4096 };
+  char *buf = kmalloc(CAP);
+  if (!buf)
+    return 0;
+  uint32_t len = syscall_prof_format(buf, CAP);
+  node->length = len;
+  if (offset >= len) {
+    kfree(buf);
+    return 0;
+  }
+  if (offset + size > len)
+    size = len - offset;
+  memcpy(buffer, buf + offset, size);
+  kfree(buf);
+  return size;
+}
+
+static uint32_t procfs_sysprof_write(vfs_node_t *node, uint32_t offset,
+                                     uint32_t size, uint8_t *buffer) {
+  (void)node;
+  (void)offset;
+  (void)buffer;
+  syscall_prof_reset();
+  return size;
+}
+
 // /proc/<pid>/status
 static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
                                        uint32_t size, uint8_t *buffer) {
@@ -1565,7 +1625,10 @@ static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
       "VmRSS:\t%llu kB\n"
       "CapInh:\t%016llx\nCapPrm:\t%016llx\nCapEff:\t%016llx\n"
       "CapBnd:\t%016llx\nCapAmb:\t%016llx\n"
-      "NoNewPrivs:\t%u\nSeccomp:\t%u\n",
+      "NoNewPrivs:\t%u\nSeccomp:\t%u\n"
+      "Faults:\t%llu (major %llu) %llu us since exec\n"
+      "FaultTypes:\tread %llu/%lluus write %llu/%lluus cow %llu/%lluus\n"
+      "Syscalls:\t%llu %llu us since exec\n",
       t.comm[0] ? t.comm : "unknown",
       thread_state_char(t.state),
       pid_namespace_visible(sched_get_current(), t.tgid ? t.tgid : t.tid),
@@ -1578,7 +1641,17 @@ static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
       (unsigned long long)rss_kb,
       (unsigned long long)t.cap_inheritable, (unsigned long long)t.cap_permitted,
       (unsigned long long)t.cap_effective, (unsigned long long)t.cap_bounding,
-      (unsigned long long)t.cap_ambient, t.no_new_privs ? 1u : 0u, t.seccomp_mode);
+      (unsigned long long)t.cap_ambient, t.no_new_privs ? 1u : 0u, t.seccomp_mode,
+      (unsigned long long)t.nr_faults, (unsigned long long)t.maj_flt,
+      (unsigned long long)(tsc_cycles_to_ns(t.fault_cycles) / 1000),
+      (unsigned long long)t.fault_class_count[0],
+      (unsigned long long)(tsc_cycles_to_ns(t.fault_class_cycles[0]) / 1000),
+      (unsigned long long)t.fault_class_count[1],
+      (unsigned long long)(tsc_cycles_to_ns(t.fault_class_cycles[1]) / 1000),
+      (unsigned long long)t.fault_class_count[2],
+      (unsigned long long)(tsc_cycles_to_ns(t.fault_class_cycles[2]) / 1000),
+      (unsigned long long)t.nr_syscalls,
+      (unsigned long long)(tsc_cycles_to_ns(t.syscall_cycles) / 1000));
 
   node->length = (uint32_t)len;
   if (offset >= (uint32_t)len) {
@@ -3783,6 +3856,18 @@ void procfs_init(void) {
       sysdiag_node->mask = 0444;
       sysdiag_node->read = procfs_sysdiag_read;
       ramfs_mount_node(procfs_root, sysdiag_node);
+    }
+
+    // Add /proc/sysprof
+    vfs_node_t *sysprof_node = kmalloc(sizeof(vfs_node_t));
+    if (sysprof_node) {
+      procfs_node_init(sysprof_node);
+      strncpy(sysprof_node->name, "sysprof", 127);
+      sysprof_node->flags = FS_FILE | FS_PERSISTENT;
+      sysprof_node->mask = 0644;
+      sysprof_node->read = procfs_sysprof_read;
+      sysprof_node->write = procfs_sysprof_write;
+      ramfs_mount_node(procfs_root, sysprof_node);
     }
 
     // Add /proc/loadavg

@@ -16,7 +16,17 @@ static char *serial_buf = NULL;
 static volatile uint32_t serial_head = 0; // write position
 static volatile uint32_t serial_tail = 0; // read/send position
 
+/* Two locks so that logging never waits for port I/O:
+ *  - serial_lock (producers) owns serial_head and the bytes being written;
+ *  - serial_tx_lock (consumer) owns serial_tail and all UART transmit I/O.
+ * A producer reads serial_tail atomically to size its free space; the
+ * consumer reads serial_head (acquire) to see published bytes.  Drains under
+ * KVM take ~1 us per byte, so with a single lock every klog call that landed
+ * during a 128-byte tick or mirror drain timed out and dropped its line.
+ * Lock order when both are held: serial_lock, then serial_tx_lock (always via
+ * trylock from producers, so the order can never deadlock). */
 static spinlock_t serial_lock = SPINLOCK_INIT;
+static spinlock_t serial_tx_lock = SPINLOCK_INIT;
 static volatile bool serial_initialized = false;
 static volatile bool serial_hardware_present = true;
 
@@ -84,7 +94,7 @@ static void serial_program_registers(void) {
 }
 
 void serial_init(void) {
-  spinlock_acquire(&serial_lock);
+  spinlock_acquire(&serial_tx_lock);
 
   serial_program_registers();
 
@@ -101,16 +111,16 @@ void serial_init(void) {
 
   serial_initialized = true;
 
-  spinlock_release(&serial_lock);
+  spinlock_release(&serial_tx_lock);
 }
 
 void serial_resume(void) {
-  spinlock_acquire(&serial_lock);
+  spinlock_acquire(&serial_tx_lock);
   if (serial_initialized && serial_hardware_present) {
     serial_program_registers();
     outb(COM1 + 4, 0x0B);
   }
-  spinlock_release(&serial_lock);
+  spinlock_release(&serial_tx_lock);
 }
 
 /* A single THRE check covers at most one 16550 FIFO (16 bytes); a real UART
@@ -130,19 +140,19 @@ void serial_resume(void) {
  *  - idle loop: the BSP has nothing else to run, so a larger slice of the
  *    backlog can go out at the device's own pace (bounded so console_tick()
  *    and the hang detector still get a turn between slices). */
-#define SERIAL_TICK_DRAIN_BYTES 32u
+#define SERIAL_TICK_DRAIN_BYTES 128u
 #define SERIAL_ASYNC_DRAIN_BYTES 128u
 #define SERIAL_IDLE_DRAIN_BYTES 2048u
 
 /* Move up to `budget` bytes from the ring to the UART, one FIFO burst per
  * THRE check, stopping as soon as the UART stops accepting.  Caller holds
- * serial_lock.  Returns the number of bytes moved. */
+ * serial_tx_lock.  Returns the number of bytes moved. */
 static uint32_t serial_drain_locked(uint32_t budget) {
   if (!serial_buf || !serial_hardware_present)
     return 0;
 
   uint32_t tail = serial_tail;
-  uint32_t head = serial_head;
+  uint32_t head = __atomic_load_n(&serial_head, __ATOMIC_ACQUIRE);
   uint32_t moved = 0;
 
   while (moved < budget && tail != head) {
@@ -164,8 +174,17 @@ static uint32_t serial_drain_locked(uint32_t budget) {
     tail = (tail + chunk) & SERIAL_BUF_MASK;
     moved += chunk;
   }
-  serial_tail = tail;
+  __atomic_store_n(&serial_tail, tail, __ATOMIC_RELEASE);
   return moved;
+}
+
+/* Drain a bounded burst if no other CPU is already transmitting (that CPU
+ * will move these bytes too).  Never waits. */
+static inline void serial_drain_try(uint32_t budget) {
+  if (!spinlock_try_acquire(&serial_tx_lock))
+    return;
+  serial_drain_locked(budget);
+  spinlock_release(&serial_tx_lock);
 }
 
 // Enqueue a character into the ring buffer (pure memory operation, 0 port I/O).
@@ -174,10 +193,10 @@ static inline void serial_enqueue_locked(char c) {
   if (!serial_ensure_buf_locked())
     return;
   uint32_t next = (serial_head + 1) & SERIAL_BUF_MASK;
-  if (next == serial_tail)
+  if (next == __atomic_load_n(&serial_tail, __ATOMIC_ACQUIRE))
     return; // Buffer full: drop silently without blocking or port I/O
   serial_buf[serial_head] = c;
-  serial_head = next;
+  __atomic_store_n(&serial_head, next, __ATOMIC_RELEASE);
 }
 
 /* How much is queued but not yet on the wire.  A nonzero count that keeps
@@ -203,10 +222,7 @@ void serial_flush(void) {
     return;
   /* Called from the BSP timer tick: never block, or a contended log lock
    * stops this CPU from taking ticks and the hang detector fires. */
-  if (!spinlock_try_acquire(&serial_lock))
-    return;
-  serial_drain_locked(SERIAL_TICK_DRAIN_BYTES);
-  spinlock_release(&serial_lock);
+  serial_drain_try(SERIAL_TICK_DRAIN_BYTES);
 }
 
 /* Idle-loop pump: the BSP has nothing else to run, so a chunk of the backlog
@@ -216,19 +232,18 @@ void serial_flush(void) {
 void serial_flush_idle(void) {
   if (serial_pending_bytes() == 0)
     return;
-  if (!spinlock_try_acquire(&serial_lock))
-    return;
-  serial_drain_locked(SERIAL_IDLE_DRAIN_BYTES);
-  spinlock_release(&serial_lock);
+  serial_drain_try(SERIAL_IDLE_DRAIN_BYTES);
 }
 
 // Synchronously drain the entire ring buffer until empty.
 // Safe for panics and shutdown; includes timeout to prevent infinite hangs.
 void serial_flush_sync(void) {
+  /* Panic/halt/suspend paths: push klog's buffered partial lines first. */
+  klog_flush(true);
   if (!serial_buf || !serial_hardware_present)
     return;
-  if (!spinlock_try_acquire(&serial_lock)) {
-    /* Panic on the CPU that holds serial_lock: draining lock-free is the only
+  if (!spinlock_try_acquire(&serial_tx_lock)) {
+    /* Panic on the CPU that holds serial_tx_lock: draining lock-free is the only
      * way out.  Racing another drain can drop bytes; that is fine here. */
     uint32_t guard = 0;
     while (serial_tail != serial_head && guard++ < SERIAL_BUF_SIZE) {
@@ -251,7 +266,7 @@ void serial_flush_sync(void) {
     serial_drain_locked(SERIAL_FIFO_BYTES);
   }
 
-  spinlock_release(&serial_lock);
+  spinlock_release(&serial_tx_lock);
 }
 
 void serial_putchar(char c) {
@@ -273,8 +288,8 @@ void serial_putchar(char c) {
   if (c == '\n')
     serial_enqueue_locked('\r');
   serial_enqueue_locked(c);
-  serial_drain_locked(SERIAL_FIFO_BYTES);
   spinlock_release(&serial_lock);
+  serial_drain_try(SERIAL_FIFO_BYTES);
 }
 
 /* Enqueue a byte range with LF->CRLF translation, touching no port.  The
@@ -284,7 +299,9 @@ static uint32_t serial_enqueue_range_locked(const char *data, size_t length) {
   if (!serial_ensure_buf_locked())
     return 0;
   uint32_t head = serial_head;
-  uint32_t free_space = (serial_tail - head - 1) & SERIAL_BUF_MASK;
+  uint32_t free_space =
+      (__atomic_load_n(&serial_tail, __ATOMIC_ACQUIRE) - head - 1) &
+      SERIAL_BUF_MASK;
   uint32_t queued = 0;
 
   for (size_t i = 0; i < length; i++) {
@@ -307,7 +324,7 @@ static uint32_t serial_enqueue_range_locked(const char *data, size_t length) {
     queued++;
   }
 
-  serial_head = head;
+  __atomic_store_n(&serial_head, head, __ATOMIC_RELEASE);
   return queued;
 }
 
@@ -333,7 +350,81 @@ void serial_write_async(const char *data, size_t length) {
   }
 
   serial_enqueue_range_locked(data, length);
-  serial_drain_locked(SERIAL_ASYNC_DRAIN_BYTES);
+  spinlock_release(&serial_lock);
+  serial_drain_try(SERIAL_ASYNC_DRAIN_BYTES);
+}
+
+/* klog path: queue only, no port I/O.  The BSP timer tick (serial_flush) and
+ * the idle loop (serial_flush_idle) move the bytes, so a log call costs a
+ * memcpy instead of microseconds of UART exits.  Three exceptions:
+ *  - panic mode (serial_set_panic_mode): drain everything synchronously, the
+ *    tick may never run again;
+ *  - backpressure: once the ring is 3/4 full the caller drains a bounded
+ *    burst itself, so a long IRQs-off stretch (SMP bring-up, a busy BSP)
+ *    slows logging down instead of dropping it;
+ *  - overflow: bytes that still do not fit are counted and reported as
+ *    "[serial: N bytes dropped]" once room returns. */
+#define SERIAL_BACKPRESSURE_BYTES (SERIAL_BUF_SIZE / 4 * 3)
+#define SERIAL_BACKPRESSURE_DRAIN 512u
+static volatile bool serial_panic_mode = false;
+static uint64_t serial_dropped_bytes = 0;
+
+void serial_set_panic_mode(void) { serial_panic_mode = true; }
+
+uint64_t serial_dropped_total(void) {
+  return __atomic_load_n(&serial_dropped_bytes, __ATOMIC_RELAXED);
+}
+
+static uint64_t serial_dropped_reported = 0;
+
+static void serial_report_drops_locked(void) {
+  uint64_t total = __atomic_load_n(&serial_dropped_bytes, __ATOMIC_RELAXED);
+  uint64_t lost = total - serial_dropped_reported;
+  if (!lost)
+    return;
+  char msg[48];
+  int n = snprintf(msg, sizeof(msg), "\n[serial: %llu bytes dropped]\n",
+                   (unsigned long long)lost);
+  if (n <= 0)
+    return;
+  uint32_t free_space =
+      (__atomic_load_n(&serial_tail, __ATOMIC_ACQUIRE) - serial_head - 1) &
+      SERIAL_BUF_MASK;
+  if (free_space < (uint32_t)n + 8) /* +CRs */
+    return;
+  serial_enqueue_range_locked(msg, (size_t)n);
+  serial_dropped_reported = total;
+}
+
+void serial_enqueue(const char *data, size_t length) {
+  if (!data || length == 0 || !serial_hardware_present)
+    return;
+
+  if (!serial_lock_bounded()) {
+    __atomic_add_fetch(&serial_dropped_bytes, length, __ATOMIC_RELAXED);
+    return;
+  }
+
+  if (!serial_ensure_buf_locked()) {
+    spinlock_release(&serial_lock);
+    return;
+  }
+
+  if (__builtin_expect(serial_panic_mode, 0)) {
+    serial_enqueue_range_locked(data, length);
+    spinlock_release(&serial_lock);
+    serial_flush_sync();
+    return;
+  }
+
+  if (serial_pending_bytes() + length > SERIAL_BACKPRESSURE_BYTES)
+    serial_drain_try(SERIAL_BACKPRESSURE_DRAIN);
+
+  serial_report_drops_locked();
+  uint32_t queued = serial_enqueue_range_locked(data, length);
+  /* queued counts inserted CRs; only flag a shortfall of source bytes. */
+  if (queued < length)
+    __atomic_add_fetch(&serial_dropped_bytes, length - queued, __ATOMIC_RELAXED);
   spinlock_release(&serial_lock);
 }
 
@@ -364,9 +455,8 @@ void serial_write(const char *data, size_t length) {
 
   /* klog writes are synchronous by contract: push until the UART stops
    * accepting (a real 16550 fills its FIFO after 16 bytes). */
-  serial_drain_locked(UINT32_MAX);
-
   spinlock_release(&serial_lock);
+  serial_drain_try(UINT32_MAX);
 }
 
 // Direct synchronous write bypassing the ring buffer (ideal for early boot or panic)
@@ -493,11 +583,11 @@ static void bench_report(const char *name, uint32_t bytes, uint32_t calls,
 /* The old tick policy in one call: THRE check, then at most one FIFO burst -
  * exactly what serial_flush() did before the drain points were budgeted. */
 static void bench_old_flush(void) {
-  if (!spinlock_try_acquire(&serial_lock))
+  if (!spinlock_try_acquire(&serial_tx_lock))
     return;
   if (is_transmit_empty())
     serial_drain_locked(SERIAL_FIFO_BYTES);
-  spinlock_release(&serial_lock);
+  spinlock_release(&serial_tx_lock);
 }
 
 /* Old vs new tick drain on the same filled ring, back to back, the way

@@ -582,14 +582,21 @@ static ssize_t inet6_recvmsg(socket_t *sock, struct msghdr *msg, int flags) {
 
 static int inet6_getsockopt(socket_t *sock, int level, int option,
                             void *value, int *length) {
-  if (!value || !length || *length < (int)sizeof(int)) return -22;
+  if (!value || !length) return -22;
+  int klen = 0;
+  if (!is_user_range(length, sizeof(int)) ||
+      copy_from_user(&klen, length, sizeof(int)))
+    return -14;
+  if (klen < (int)sizeof(int)) return -22;
   struct inet6_sock *s = sock->sk;
   if (level == SOL_SOCKET && option == SO_LINGER) {
     int linger[2] = {s->linger_seconds >= 0,
                     s->linger_seconds >= 0 ? s->linger_seconds : 0};
-    int n = *length < (int)sizeof(linger) ? *length : (int)sizeof(linger);
-    if (copy_to_user(value, linger, n)) return -14;
-    *length = n;
+    int n = klen < (int)sizeof(linger) ? klen : (int)sizeof(linger);
+    if (!is_user_range(value, (size_t)n) ||
+        copy_to_user(value, linger, n) ||
+        copy_to_user(length, &n, sizeof(int)))
+      return -14;
     return 0;
   }
   int result;
@@ -607,15 +614,24 @@ static int inet6_getsockopt(socket_t *sock, int level, int option,
   else if (level == SOL_TCP && option == TCP_KEEPINTVL) result = s->keepintvl_s;
   else if (level == SOL_TCP && option == TCP_KEEPCNT) result = s->keepcnt;
   else if (level == SOL_IPV6 && option == IPV6_V6ONLY) result = s->v6only ? 1 : 0;
+  else if (level == SOL_IPV6 && option == 24 /* IPV6_MTU */) result = 1500;
   else return -92;
-  *(int *)value = result; *length = sizeof(int); return 0;
+  int out_len = (int)sizeof(int);
+  if (!is_user_range(value, sizeof(int)) ||
+      copy_to_user(value, &result, sizeof(int)) ||
+      copy_to_user(length, &out_len, sizeof(int)))
+    return -14;
+  return 0;
 }
 
 static int inet6_setsockopt(socket_t *sock, int level, int option,
                             const void *value, int length) {
   struct inet6_sock *s = sock->sk;
   if (!s || !value || length < (int)sizeof(int)) return -22;
-  int v = *(const int *)value;
+  int v = 0;
+  if (!is_user_range(value, sizeof(v)) ||
+      copy_from_user(&v, value, sizeof(v)))
+    return -14;
 
   if (level == SOL_IPV6 && option == IPV6_V6ONLY) {
     if (s->bound || (s->tcp && s->tcp->local_port)) return -22;
@@ -646,7 +662,10 @@ static int inet6_setsockopt(socket_t *sock, int level, int option,
       return 0;
     }
     if (option == SO_LINGER && length >= (int)(2 * sizeof(int))) {
-      const int *lv = (const int *)value;
+      int lv[2];
+      if (!is_user_range(value, sizeof(lv)) ||
+          copy_from_user(lv, value, sizeof(lv)))
+        return -14;
       if (!lv[0]) s->linger_seconds = -1;
       else if (lv[1] <= 0) s->linger_seconds = 0;
       else s->linger_seconds = lv[1] > 3600 ? 3600 : lv[1];

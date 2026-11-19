@@ -101,6 +101,10 @@ void isr_panic(struct registers *regs, const char *msg) {
     fatal_report_halt();
   }
 
+  /* The timer tick that normally drains klog's serial queue is gone from
+   * here on: make every klog write synchronous. */
+  serial_set_panic_mode();
+
   /* Serial diagnostics stay independent of all screen and scheduler locks. */
   kpf_dump_panic_entry(msg, regs);
 
@@ -127,6 +131,11 @@ void isr_panic(struct registers *regs, const char *msg) {
 static void page_fault_handler(struct registers *regs) {
   uint64_t cr2;
   __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+
+  if (cr2 >= 0xFFFFFFFFFF600000ULL && cr2 < 0xFFFFFFFFFF601000ULL &&
+      vmm_emulate_vsyscall(cr2, regs)) {
+    return;
+  }
 
   if (vmm_handle_page_fault(cr2, regs->err_code, regs) != 0) {
     if ((regs->cs & 0x3) == 0x3) {
@@ -273,10 +282,7 @@ void isr_handler(struct registers *regs) {
    * an in-service device vector blocks lower-priority timer/IPI delivery on
    * this CPU even after the scheduler switches it to idle. */
   if ((regs->cs & 0x3) == 0x3) {
-    /* Frame construction writes the user stack; exception entry clears AC. */
-    user_access_begin();
     signal_deliver(regs);
-    user_access_end();
   }
 
   /* Complete both the controller EOI and LinuxKPI hardirq accounting before

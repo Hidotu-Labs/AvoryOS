@@ -2319,6 +2319,12 @@ int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
   vfs_mount_entry_t *entry = kmalloc(sizeof(vfs_mount_entry_t));
   if (!entry)
     return -1;
+  /* The caller transfers one target reference on success. Pin the covered
+   * vnode independently: deleting its name can retire it even while
+   * FS_PERSISTENT is set, and namespace copies still walk this entry.
+   * In-place mounts use the same reference for both fields. */
+  if (mountpoint && mountpoint != target)
+    vfs_node_ref(mountpoint);
   entry->mountpoint = mountpoint;
   entry->target = target;
   entry->point_was_persistent = mountpoint && (mountpoint->flags & FS_PERSISTENT);
@@ -2401,7 +2407,10 @@ int vfs_initial_unmount(vfs_node_t *root, unsigned flags) {
   root->flags &= ~FS_PERSISTENT;
   spinlock_release(&vfs_mount_lock);
   vfs_dentry_invalidate(NULL, NULL);
-  vfs_close(m->mountpoint); vfs_close(root); kfree(m);
+  if (m->mountpoint != root)
+    vfs_close(m->mountpoint);
+  vfs_close(root);
+  kfree(m);
   return 0;
 }
 

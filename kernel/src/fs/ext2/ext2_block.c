@@ -14,29 +14,185 @@ uint32_t ext2_current_time(void) {
   return (uint32_t)(rtc_get_boot_timestamp() + lapic_timer_get_ms() / 1000);
 }
 
-/* Cache storage is optional, and remains installed for the mount's lifetime.
- * Allocate outside cache_lock: kmalloc may reclaim file pages and take other
- * filesystem locks. Holding an IRQ-masking spinlock across that can freeze
- * readers and the journal owner together. Recheck for a competing installer. */
-static void ext2_cache_prepare(ext2_mount_t *mnt, uint32_t idx) {
-  spinlock_acquire(&mnt->cache_lock);
-  bool ready = mnt->cache[idx].data != NULL;
-  spinlock_release(&mnt->cache_lock);
-  if (ready)
-    return;
-  uint8_t *data = kmalloc(mnt->block_size);
-  if (!data)
-    return;
-  spinlock_acquire(&mnt->cache_lock);
-  if (!mnt->cache[idx].data) {
-    mnt->cache[idx].data = data;
-    data = NULL;
-  }
-  spinlock_release(&mnt->cache_lock);
-  kfree(data);
+#include "mm/pmm.h"
+
+#define EXT2_SEQ(mnt, num) (&(mnt)->bc_seq[(num) % EXT2_SEQ_BUCKETS])
+
+static uint32_t ext2_current_tid(void) {
+  struct thread *cur = sched_get_current();
+  return cur ? cur->tid : 0;
 }
 
-int ext2_read_block(ext2_mount_t *mnt, uint64_t block_num, void *buffer) {
+static void ext2_inflight_link_locked(ext2_mount_t *mnt,
+                                      ext2_inflight_write_t *iw) {
+  if (!iw->owner_tid || !iw->count)
+    return;
+  iw->next = mnt->inflight_writes;
+  mnt->inflight_writes = iw;
+}
+
+static void ext2_inflight_unlink_locked(ext2_mount_t *mnt,
+                                        ext2_inflight_write_t *iw) {
+  if (!iw->owner_tid || !iw->count)
+    return;
+  ext2_inflight_write_t **pp = &mnt->inflight_writes;
+  while (*pp && *pp != iw)
+    pp = &(*pp)->next;
+  if (*pp)
+    *pp = iw->next;
+  iw->next = NULL;
+}
+
+static inline uint32_t ext2_bc_hash(uint64_t num) {
+  return (uint32_t)((num * 0x9E3779B97F4A7C15ULL) >> 51) & (EXT2_BC_BUCKETS - 1);
+}
+
+static uint32_t ext2_bc_cap(const ext2_mount_t *mnt) {
+  uint64_t cap = pmm_get_total_memory() / 100 * EXT2_BC_RAM_PERCENT /
+                 mnt->block_size;
+  if (cap < 2048)
+    cap = 2048; // never below the old fixed cache
+  return cap > UINT32_MAX ? UINT32_MAX : (uint32_t)cap;
+}
+
+static void ext2_bc_lru_unlink(ext2_mount_t *mnt, ext2_bc_entry_t *e) {
+  if (e->lru_prev) e->lru_prev->lru_next = e->lru_next;
+  else mnt->bc_lru_head = e->lru_next;
+  if (e->lru_next) e->lru_next->lru_prev = e->lru_prev;
+  else mnt->bc_lru_tail = e->lru_prev;
+  e->lru_prev = e->lru_next = NULL;
+}
+
+static void ext2_bc_lru_push(ext2_mount_t *mnt, ext2_bc_entry_t *e) {
+  e->lru_prev = NULL;
+  e->lru_next = mnt->bc_lru_head;
+  if (mnt->bc_lru_head) mnt->bc_lru_head->lru_prev = e;
+  else mnt->bc_lru_tail = e;
+  mnt->bc_lru_head = e;
+}
+
+/* Caller holds cache_lock.  A hit becomes the most recently used entry. */
+static ext2_bc_entry_t *ext2_bc_find_locked(ext2_mount_t *mnt, uint64_t num) {
+  for (ext2_bc_entry_t *e = mnt->bc_hash[ext2_bc_hash(num)]; e; e = e->hnext) {
+    if (e->num != num)
+      continue;
+    if (mnt->bc_lru_head != e) {
+      ext2_bc_lru_unlink(mnt, e);
+      ext2_bc_lru_push(mnt, e);
+    }
+    return e;
+  }
+  return NULL;
+}
+
+/* Caller holds cache_lock.  The entry joins *to_free (chained through hnext)
+ * so the caller can release its memory after dropping the lock. */
+static void ext2_bc_remove_locked(ext2_mount_t *mnt, ext2_bc_entry_t *e,
+                                  ext2_bc_entry_t **to_free) {
+  ext2_bc_entry_t **pp = &mnt->bc_hash[ext2_bc_hash(e->num)];
+  while (*pp && *pp != e)
+    pp = &(*pp)->hnext;
+  if (*pp)
+    *pp = e->hnext;
+  ext2_bc_lru_unlink(mnt, e);
+  mnt->bc_count--;
+  e->hnext = *to_free;
+  *to_free = e;
+}
+
+/* Drop any cached image of `num` (caller holds cache_lock). */
+static void ext2_bc_invalidate_locked(ext2_mount_t *mnt, uint64_t num,
+                                      ext2_bc_entry_t **to_free) {
+  for (ext2_bc_entry_t *e = mnt->bc_hash[ext2_bc_hash(num)]; e; e = e->hnext) {
+    if (e->num == num) {
+      ext2_bc_remove_locked(mnt, e, to_free);
+      return;
+    }
+  }
+}
+
+/*
+ * Publish `src` as the cached image of `num` (caller holds cache_lock).  An
+ * existing entry is overwritten in place; otherwise *spare (allocated by the
+ * caller outside the lock) is consumed.  Without a spare the block is simply
+ * left uncached, which is always safe.  Inserting past the soft cap evicts
+ * the least recently used entry into *to_free.
+ */
+static void ext2_bc_store_locked(ext2_mount_t *mnt, uint64_t num,
+                                 const void *src, ext2_bc_entry_t **spare,
+                                 ext2_bc_entry_t **to_free) {
+  ext2_bc_entry_t *e = ext2_bc_find_locked(mnt, num);
+  if (!e) {
+    if (!spare || !*spare)
+      return;
+    e = *spare;
+    *spare = NULL;
+    e->num = num;
+    uint32_t h = ext2_bc_hash(num);
+    e->hnext = mnt->bc_hash[h];
+    mnt->bc_hash[h] = e;
+    ext2_bc_lru_push(mnt, e);
+    mnt->bc_count++;
+    if (mnt->bc_count > ext2_bc_cap(mnt) && mnt->bc_lru_tail != e) {
+      ext2_bc_remove_locked(mnt, mnt->bc_lru_tail, to_free);
+      mnt->bc_evictions++;
+    }
+  }
+  memcpy(e->data, src, mnt->block_size);
+}
+
+/* Allocate outside cache_lock: kmalloc may reclaim file pages and take other
+ * filesystem locks (including this cache's shrinker).  Holding an IRQ-masking
+ * spinlock across that can freeze readers and the journal owner together. */
+static ext2_bc_entry_t *ext2_bc_alloc(ext2_mount_t *mnt) {
+  ext2_bc_entry_t *e = kmalloc(sizeof(*e));
+  if (!e)
+    return NULL;
+  e->data = kmalloc(mnt->block_size);
+  if (!e->data) {
+    kfree(e);
+    return NULL;
+  }
+  e->hnext = e->lru_prev = e->lru_next = NULL;
+  return e;
+}
+
+/* Spare entry for a block about to be published, or NULL if it is already
+ * cached (a racing insert just leaves the spare unused). */
+static ext2_bc_entry_t *ext2_bc_spare_for(ext2_mount_t *mnt, uint64_t num) {
+  spinlock_acquire(&mnt->cache_lock);
+  bool cached = false;
+  for (ext2_bc_entry_t *e = mnt->bc_hash[ext2_bc_hash(num)]; e; e = e->hnext)
+    if (e->num == num) { cached = true; break; }
+  spinlock_release(&mnt->cache_lock);
+  return cached ? NULL : ext2_bc_alloc(mnt);
+}
+
+/* True when `num` has a cached image equal to `data` and no write to it is in
+ * flight: evidence that the home block already holds `data`. */
+bool ext2_bc_matches(ext2_mount_t *mnt, uint64_t num, const void *data) {
+  spinlock_acquire(&mnt->cache_lock);
+  ext2_bc_entry_t *e = ext2_bc_find_locked(mnt, num);
+  bool same = e && !EXT2_SEQ(mnt, num)->writes_inflight &&
+              memcmp(e->data, data, mnt->block_size) == 0;
+  spinlock_release(&mnt->cache_lock);
+  return same;
+}
+
+/* Free entries chained through hnext; never call with cache_lock held. */
+static void ext2_bc_free_chain(ext2_bc_entry_t *e) {
+  while (e) {
+    ext2_bc_entry_t *next = e->hnext;
+    kfree(e->data);
+    kfree(e);
+    e = next;
+  }
+}
+
+/* `install` false is for file data: return a cached image if one exists but
+ * never add one, since the page cache already holds file contents. */
+static int ext2_read_block_impl(ext2_mount_t *mnt, uint64_t block_num,
+                                void *buffer, bool install) {
   if (!mnt || !buffer || !mnt->block_size)
     return -1;
   if (ext3_journal_read_staged(mnt, block_num, buffer))
@@ -58,20 +214,27 @@ int ext2_read_block(ext2_mount_t *mnt, uint64_t block_num, void *buffer) {
           (UINT64_MAX - (sectors_per_block - 1)) / sectors_per_block)
     return -1;
 
-  uint32_t idx = (uint32_t)(block_num % EXT2_CACHE_SIZE);
+  bool counted_miss = !install; // only metadata lookups feed the hit rate
 read_retry:
   spinlock_acquire(&mnt->cache_lock);
-  if (mnt->cache[idx].data && mnt->cache[idx].num == block_num) {
-    memcpy(buffer, mnt->cache[idx].data, mnt->block_size);
+  ext2_bc_entry_t *hit = ext2_bc_find_locked(mnt, block_num);
+  if (hit) {
+    memcpy(buffer, hit->data, mnt->block_size);
+    if (!counted_miss)
+      mnt->bc_hits++;
     spinlock_release(&mnt->cache_lock);
     return 0;
   }
-  if (mnt->cache[idx].writes_inflight) {
+  if (!counted_miss) {
+    mnt->bc_misses++;
+    counted_miss = true;
+  }
+  if (EXT2_SEQ(mnt, block_num)->writes_inflight) {
     spinlock_release(&mnt->cache_lock);
     sched_yield();
     goto read_retry;
   }
-  uint64_t write_seq = mnt->cache[idx].write_seq;
+  uint64_t write_seq = EXT2_SEQ(mnt, block_num)->write_seq;
   spinlock_release(&mnt->cache_lock);
 
   uint64_t lba     = block_num * sectors_per_block;
@@ -96,39 +259,49 @@ read_retry:
     return err;
   }
 
-  ext2_cache_prepare(mnt, idx);
+  ext2_bc_entry_t *spare = install ? ext2_bc_alloc(mnt) : NULL;
+  ext2_bc_entry_t *to_free = NULL;
   spinlock_acquire(&mnt->cache_lock);
-  if (mnt->cache[idx].data && mnt->cache[idx].num == block_num) {
+  ext2_bc_entry_t *raced = ext2_bc_find_locked(mnt, block_num);
+  if (raced) {
     /* A writer populated this block while the device read was in flight.
      * Keep and return the newer cached version instead of restoring stale data. */
-    memcpy(buffer, mnt->cache[idx].data, mnt->block_size);
+    memcpy(buffer, raced->data, mnt->block_size);
   } else {
-    if (mnt->cache[idx].write_seq != write_seq ||
-        mnt->cache[idx].writes_inflight) {
+    if (EXT2_SEQ(mnt, block_num)->write_seq != write_seq ||
+        EXT2_SEQ(mnt, block_num)->writes_inflight) {
       /* The disk image may predate a write whose cache entry was evicted.
        * Do not return it or use it as a later metadata RMW's starting image. */
       spinlock_release(&mnt->cache_lock);
+      if (spare)
+        spare->hnext = NULL;
+      ext2_bc_free_chain(spare);
       sched_yield();
       goto read_retry;
     }
-    /* This is a direct-mapped cache.  An occupied slot belonging to another
-     * block must be replaced; retaining it makes later writes to that block
-     * invisible to the cache and can return stale extent metadata. */
-    if (mnt->cache[idx].data) {
-      mnt->cache[idx].num = block_num;
-      memcpy(mnt->cache[idx].data, buffer, mnt->block_size);
-    }
+    ext2_bc_store_locked(mnt, block_num, buffer, &spare, &to_free);
   }
   spinlock_release(&mnt->cache_lock);
+  if (spare)
+    spare->hnext = to_free, to_free = spare;
+  ext2_bc_free_chain(to_free);
 
   return 0;
 }
 
+int ext2_read_block(ext2_mount_t *mnt, uint64_t block_num, void *buffer) {
+  return ext2_read_block_impl(mnt, block_num, buffer, true);
+}
+
+int ext2_read_block_data(ext2_mount_t *mnt, uint64_t block_num, void *buffer) {
+  return ext2_read_block_impl(mnt, block_num, buffer, false);
+}
+
 /* An optional phase pointer belongs to the owning journal transaction. It
  * exposes which part of the home write is stalled without a new mount layout. */
-int ext2_write_block_traced(ext2_mount_t *mnt, uint64_t block_num,
-                            const void *buffer, const char **phase,
-                            const char *const stages[4]) {
+static int ext2_write_block_impl(ext2_mount_t *mnt, uint64_t block_num,
+                                 const void *buffer, const char **phase,
+                                 const char *const stages[4], bool cache_new) {
   if (!mnt || mnt->read_only || !buffer ||
       !mnt->block_size || block_num >= mnt->blocks_count ||
       mnt->block_size % 512 || !mnt->dev ||
@@ -138,30 +311,55 @@ int ext2_write_block_traced(ext2_mount_t *mnt, uint64_t block_num,
   if (!sectors || block_num > (UINT64_MAX - (sectors - 1)) / sectors)
     return -1;
 
-  uint32_t idx = (uint32_t)(block_num % EXT2_CACHE_SIZE);
   if (phase) *phase = stages[0];
-  ext2_cache_prepare(mnt, idx);
+  ext2_bc_entry_t *spare = cache_new ? ext2_bc_spare_for(mnt, block_num) : NULL;
+  ext2_bc_entry_t *to_free = NULL;
+  ext2_inflight_write_t iw = {
+      .owner_tid = ext2_current_tid(),
+      .count = 1,
+      .blocks = { block_num },
+  };
   if (phase) *phase = stages[1];
   spinlock_acquire(&mnt->cache_lock);
-  mnt->cache[idx].write_seq++;
-  mnt->cache[idx].writes_inflight++;
-  if (mnt->cache[idx].data) {
-    mnt->cache[idx].num = block_num;
-    memcpy(mnt->cache[idx].data, buffer, mnt->block_size);
-  }
+  EXT2_SEQ(mnt, block_num)->write_seq++;
+  EXT2_SEQ(mnt, block_num)->writes_inflight++;
+  ext2_inflight_link_locked(mnt, &iw);
+  ext2_bc_store_locked(mnt, block_num, buffer, &spare, &to_free);
   spinlock_release(&mnt->cache_lock);
+  if (spare)
+    spare->hnext = to_free, to_free = spare;
+  ext2_bc_free_chain(to_free);
+  to_free = NULL;
 
   uint64_t lba = block_num * sectors;
   if (phase) *phase = stages[2];
   int err = mnt->dev->write_sectors(mnt->dev, lba, sectors, buffer);
   if (phase) *phase = stages[3];
   spinlock_acquire(&mnt->cache_lock);
-  mnt->cache[idx].write_seq++;
-  mnt->cache[idx].writes_inflight--;
-  if (err && mnt->cache[idx].num == block_num)
-    mnt->cache[idx].num = 0;
+  ext2_inflight_unlink_locked(mnt, &iw);
+  EXT2_SEQ(mnt, block_num)->write_seq++;
+  EXT2_SEQ(mnt, block_num)->writes_inflight--;
+  if (err)
+    ext2_bc_invalidate_locked(mnt, block_num, &to_free);
   spinlock_release(&mnt->cache_lock);
+  ext2_bc_free_chain(to_free);
   return err;
+}
+
+int ext2_write_block_traced(ext2_mount_t *mnt, uint64_t block_num,
+                            const void *buffer, const char **phase,
+                            const char *const stages[4]) {
+  return ext2_write_block_impl(mnt, block_num, buffer, phase, stages, true);
+}
+
+/* File data and journal-area blocks: refresh a cached image, never add one.
+ * `phase`/`stages` may be NULL. */
+int ext2_write_block_nocache(ext2_mount_t *mnt, uint64_t block_num,
+                             const void *buffer, const char **phase,
+                             const char *const stages[4]) {
+  static const char *const none[4] = {"", "", "", ""};
+  return ext2_write_block_impl(mnt, block_num, buffer, phase,
+                               stages ? stages : none, false);
 }
 
 int ext2_write_block_phase(ext2_mount_t *mnt, uint64_t block_num,
@@ -193,31 +391,37 @@ int ext2_write_blocks(ext2_mount_t *mnt, uint64_t first, uint32_t count,
   if (!sectors_per_block ||
       first > (UINT64_MAX - (request_sectors - 1)) / sectors_per_block)
     return -1;
+  /* File data runs (ext4 writes, fallocate zeroing) refresh blocks that are
+   * already cached but never add new ones: caching data here would fill the
+   * metadata cache with file contents the page cache already holds. */
+  ext2_bc_entry_t *to_free = NULL;
+  ext2_inflight_write_t iw = {
+      .owner_tid = ext2_current_tid(),
+      .count = count,
+  };
   for (uint32_t i = 0; i < count; i++)
-    ext2_cache_prepare(mnt, (uint32_t)((first + i) % EXT2_CACHE_SIZE));
+    iw.blocks[i] = first + i;
   spinlock_acquire(&mnt->cache_lock);
   for (uint32_t i = 0; i < count; i++) {
-    uint32_t idx = (uint32_t)((first + i) % EXT2_CACHE_SIZE);
-    mnt->cache[idx].write_seq++;
-    mnt->cache[idx].writes_inflight++;
-    if (mnt->cache[idx].data) {
-      mnt->cache[idx].num = first + i;
-      memcpy(mnt->cache[idx].data, (const uint8_t *)buffer +
-             (size_t)i * mnt->block_size, mnt->block_size);
-    }
+    EXT2_SEQ(mnt, first + i)->write_seq++;
+    EXT2_SEQ(mnt, first + i)->writes_inflight++;
+    ext2_bc_store_locked(mnt, first + i, (const uint8_t *)buffer +
+                         (size_t)i * mnt->block_size, NULL, &to_free);
   }
+  ext2_inflight_link_locked(mnt, &iw);
   spinlock_release(&mnt->cache_lock);
   int err = mnt->dev->write_sectors(mnt->dev,
       first * sectors_per_block, (uint32_t)request_sectors, buffer);
   spinlock_acquire(&mnt->cache_lock);
+  ext2_inflight_unlink_locked(mnt, &iw);
   for (uint32_t i = 0; i < count; i++) {
-    uint32_t idx = (uint32_t)((first + i) % EXT2_CACHE_SIZE);
-    mnt->cache[idx].write_seq++;
-    mnt->cache[idx].writes_inflight--;
-    if (err && mnt->cache[idx].num == first + i)
-      mnt->cache[idx].num = 0;
+    EXT2_SEQ(mnt, first + i)->write_seq++;
+    EXT2_SEQ(mnt, first + i)->writes_inflight--;
+    if (err)
+      ext2_bc_invalidate_locked(mnt, first + i, &to_free);
   }
   spinlock_release(&mnt->cache_lock);
+  ext2_bc_free_chain(to_free);
   return err;
 }
 
@@ -227,8 +431,9 @@ int ext2_write_blocks(ext2_mount_t *mnt, uint64_t first, uint32_t count,
  * must name distinct blocks: batching does not order completions. */
 #define EXT2_BLOCK_BATCH_MAX 32u
 
-int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
-                            uint32_t count) {
+static int ext2_write_blocks_batch_impl(ext2_mount_t *mnt,
+                                        ext2_block_write_t *entries,
+                                        uint32_t count, bool cache_new) {
   if (!mnt || mnt->read_only || !entries || !count ||
       count > EXT2_BLOCK_BATCH_MAX ||
       !mnt->dev || !mnt->dev->write_sectors || !mnt->block_size ||
@@ -297,20 +502,32 @@ int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
       i = end;
     }
   }
+  ext2_bc_entry_t *spares[EXT2_BLOCK_BATCH_MAX];
+  ext2_bc_entry_t *to_free = NULL;
   for (uint32_t i = 0; i < count; i++)
-    ext2_cache_prepare(mnt, (uint32_t)(entries[i].block_num % EXT2_CACHE_SIZE));
+    spares[i] = cache_new ? ext2_bc_spare_for(mnt, entries[i].block_num) : NULL;
+
+  ext2_inflight_write_t iw = {
+      .owner_tid = ext2_current_tid(),
+      .count = count,
+  };
+  for (uint32_t i = 0; i < count; i++)
+    iw.blocks[i] = entries[i].block_num;
 
   spinlock_acquire(&mnt->cache_lock);
   for (uint32_t i = 0; i < count; i++) {
-    uint32_t idx = (uint32_t)(entries[i].block_num % EXT2_CACHE_SIZE);
-    mnt->cache[idx].write_seq++;
-    mnt->cache[idx].writes_inflight++;
-    if (mnt->cache[idx].data) {
-      mnt->cache[idx].num = entries[i].block_num;
-      memcpy(mnt->cache[idx].data, entries[i].buffer, mnt->block_size);
-    }
+    EXT2_SEQ(mnt, entries[i].block_num)->write_seq++;
+    EXT2_SEQ(mnt, entries[i].block_num)->writes_inflight++;
+    ext2_bc_store_locked(mnt, entries[i].block_num, entries[i].buffer,
+                         &spares[i], &to_free);
   }
+  ext2_inflight_link_locked(mnt, &iw);
   spinlock_release(&mnt->cache_lock);
+  for (uint32_t i = 0; i < count; i++)
+    if (spares[i])
+      spares[i]->hnext = to_free, to_free = spares[i];
+  ext2_bc_free_chain(to_free);
+  to_free = NULL;
 
   block_write_batch(mnt->dev, reqs, request_count);
   if (gathered) {
@@ -324,20 +541,33 @@ int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
   kfree(gathered);
 
   spinlock_acquire(&mnt->cache_lock);
+  ext2_inflight_unlink_locked(mnt, &iw);
   for (uint32_t i = 0; i < count; i++) {
-    uint32_t idx = (uint32_t)(entries[i].block_num % EXT2_CACHE_SIZE);
-    bool failed = entries[i].result != 0;
-    mnt->cache[idx].write_seq++;
-    mnt->cache[idx].writes_inflight--;
-    if (failed && mnt->cache[idx].num == entries[i].block_num)
-      mnt->cache[idx].num = 0;
+    EXT2_SEQ(mnt, entries[i].block_num)->write_seq++;
+    EXT2_SEQ(mnt, entries[i].block_num)->writes_inflight--;
+    if (entries[i].result != 0)
+      ext2_bc_invalidate_locked(mnt, entries[i].block_num, &to_free);
   }
   spinlock_release(&mnt->cache_lock);
+  ext2_bc_free_chain(to_free);
 
   for (uint32_t i = 0; i < count; i++)
     if (entries[i].result != 0)
       return -1;
   return 0;
+}
+
+int ext2_write_blocks_batch(ext2_mount_t *mnt, ext2_block_write_t *entries,
+                            uint32_t count) {
+  return ext2_write_blocks_batch_impl(mnt, entries, count, true);
+}
+
+/* Journal payloads: written once per transaction slot and read back only by
+ * replay, so they must not displace metadata in the cache. */
+int ext2_write_blocks_batch_nocache(ext2_mount_t *mnt,
+                                    ext2_block_write_t *entries,
+                                    uint32_t count) {
+  return ext2_write_blocks_batch_impl(mnt, entries, count, false);
 }
 
 int ext2_write_superblock(ext2_mount_t *mnt) {
@@ -891,14 +1121,14 @@ static uint64_t ext2_alloc_in_group(ext2_mount_t *mnt, uint32_t g,
 
       uint64_t allocated_block = (uint64_t)mnt->sb.s_first_data_block +
                                  (uint64_t)g * mnt->sb.s_blocks_per_group + b;
+      ext2_bc_entry_t *stale = NULL;
       spinlock_acquire(&mnt->cache_lock);
       for (uint32_t n = 0; n < count; n++) {
-        uint32_t c_idx = (uint32_t)((allocated_block + n) % EXT2_CACHE_SIZE);
-        mnt->cache[c_idx].write_seq++;
-        if (mnt->cache[c_idx].num == allocated_block + n)
-          mnt->cache[c_idx].num = 0;
+        EXT2_SEQ(mnt, allocated_block + n)->write_seq++;
+        ext2_bc_invalidate_locked(mnt, allocated_block + n, &stale);
       }
       spinlock_release(&mnt->cache_lock);
+      ext2_bc_free_chain(stale);
       *run_count = count;
       return allocated_block;
     }
@@ -1060,28 +1290,52 @@ int ext2_free_block(ext2_mount_t *mnt, uint64_t block_num) {
   if (!bitmap)
     return -1;
 
+  /* The bitmap read-modify-write and counter update must be serialized with
+   * the allocator; journal ownership does that (it nests for callers that
+   * already hold it). */
+  if (ext3_journal_start(mnt) != 0) {
+    kfree(bitmap);
+    return -1;
+  }
   uint64_t bitmap_block = ext2_bgd_block_bitmap(&mnt->bgdt[group]);
-  ext2_read_block(mnt, bitmap_block, bitmap);
+  if (ext2_read_block(mnt, bitmap_block, bitmap) != 0) {
+    ext3_journal_stop(mnt);
+    kfree(bitmap);
+    return -5;
+  }
 
   uint32_t byte_idx = index / 8;
   uint8_t  bit_mask = 1 << (index % 8);
+  if (!(bitmap[byte_idx] & bit_mask)) {
+    /* Double free.  Counting it anyway inflated the group's free counter
+     * past the group size; 32-byte descriptors keep only its low 16 bits on
+     * disk, so e2fsck then saw groups "with 65473 free" and full bitmaps. */
+    static uint32_t double_frees;
+    if (__atomic_add_fetch(&double_frees, 1, __ATOMIC_RELAXED) <= 16)
+      klogf("[EXT2] double free of block %llu (group %u) caller=%p\n",
+            (unsigned long long)block_num, group,
+            __builtin_return_address(0));
+    ext3_journal_stop(mnt);
+    kfree(bitmap);
+    return -1;
+  }
   bitmap[byte_idx] &= ~bit_mask;
 
   ext3_journal_block(mnt, bitmap_block, bitmap);
   kfree(bitmap);
 
-  uint32_t c_idx = (uint32_t)(block_num % EXT2_CACHE_SIZE);
+  ext2_bc_entry_t *stale = NULL;
   spinlock_acquire(&mnt->cache_lock);
-  mnt->cache[c_idx].write_seq++;
-  if (mnt->cache[c_idx].num == block_num) {
-    mnt->cache[c_idx].num = 0;
-  }
+  EXT2_SEQ(mnt, block_num)->write_seq++;
+  ext2_bc_invalidate_locked(mnt, block_num, &stale);
   spinlock_release(&mnt->cache_lock);
+  ext2_bc_free_chain(stale);
 
   ext2_bgd_set_free_blocks(&mnt->bgdt[group],
       ext2_bgd_free_blocks(&mnt->bgdt[group]) + 1);
   mnt->free_blocks_count++;
   ext2_mark_group_dirty(mnt, group);
+  ext3_journal_stop(mnt);
   return 0;
 }
 
@@ -1101,11 +1355,29 @@ int ext2_free_inode(ext2_mount_t *mnt, uint32_t inode_num) {
   if (!bitmap)
     return -1;
 
+  if (ext3_journal_start(mnt) != 0) {
+    kfree(bitmap);
+    return -1;
+  }
   uint64_t inode_bitmap = ext2_bgd_inode_bitmap(&mnt->bgdt[group]);
-  ext2_read_block(mnt, inode_bitmap, bitmap);
+  if (ext2_read_block(mnt, inode_bitmap, bitmap) != 0) {
+    ext3_journal_stop(mnt);
+    kfree(bitmap);
+    return -5;
+  }
 
   uint32_t byte_idx = index / 8;
   uint8_t  bit_mask = 1 << (index % 8);
+  if (!(bitmap[byte_idx] & bit_mask)) {
+    /* Same counter-inflation hazard as a double block free. */
+    static uint32_t double_frees;
+    if (__atomic_add_fetch(&double_frees, 1, __ATOMIC_RELAXED) <= 16)
+      klogf("[EXT2] double free of inode %u caller=%p\n", inode_num,
+            __builtin_return_address(0));
+    ext3_journal_stop(mnt);
+    kfree(bitmap);
+    return -1;
+  }
   bitmap[byte_idx] &= ~bit_mask;
 
   ext3_journal_block(mnt, inode_bitmap, bitmap);
@@ -1115,6 +1387,7 @@ int ext2_free_inode(ext2_mount_t *mnt, uint32_t inode_num) {
       ext2_bgd_free_inodes(&mnt->bgdt[group]) + 1);
   mnt->sb.s_free_inodes_count++;
   ext2_mark_group_dirty(mnt, group);
+  ext3_journal_stop(mnt);
   return 0;
 }
 
@@ -1205,12 +1478,8 @@ size_t ext2_buffer_cache_total_kb(void) {
   size_t total_kb = 0;
   spinlock_acquire(&ext2_mounts_lock);
   for (ext2_mount_t *m = ext2_active_mounts; m; m = m->next) {
-    uint32_t count = 0;
     spinlock_acquire(&m->cache_lock);
-    for (uint32_t i = 0; i < EXT2_CACHE_SIZE; i++) {
-      if (m->cache[i].data != NULL)
-        count++;
-    }
+    uint32_t count = m->bc_count;
     spinlock_release(&m->cache_lock);
     total_kb += (size_t)count * (m->block_size / 1024);
   }
@@ -1218,44 +1487,81 @@ size_t ext2_buffer_cache_total_kb(void) {
   return total_kb;
 }
 
+/* Cumulative metadata-cache statistics over every mounted ext2/3/4. */
+void ext2_buffer_cache_stats(uint64_t *hits, uint64_t *misses,
+                             uint64_t *evictions, uint64_t *entries) {
+  *hits = *misses = *evictions = *entries = 0;
+  spinlock_acquire(&ext2_mounts_lock);
+  for (ext2_mount_t *m = ext2_active_mounts; m; m = m->next) {
+    spinlock_acquire(&m->cache_lock);
+    *hits += m->bc_hits;
+    *misses += m->bc_misses;
+    *evictions += m->bc_evictions;
+    *entries += m->bc_count;
+    spinlock_release(&m->cache_lock);
+  }
+  spinlock_release(&ext2_mounts_lock);
+}
+
+/* Release up to max_buffers least recently used images.  Write ordering is
+ * tracked in bc_seq, so any entry may go, including one with a write in
+ * flight: a later miss then simply waits for that write. */
 size_t ext2_buffer_cache_shrink(size_t max_buffers) {
   if (max_buffers == 0)
     max_buffers = 64;
 
   size_t total_freed = 0;
-  uint8_t *batch[32];
-
   spinlock_acquire(&ext2_mounts_lock);
   for (ext2_mount_t *m = ext2_active_mounts; m && total_freed < max_buffers; m = m->next) {
-    /* Sweep the whole cache in lock-held batches of up to 32 buffers. A single
-     * batch per mount per call capped every caller at 32 buffers per mount, so
-     * drop_caches could release only a quarter of a 2048-slot cache. The
-     * cursor now only records where the next call starts. */
-    uint32_t scanned = 0;
-    while (scanned < EXT2_CACHE_SIZE && total_freed < max_buffers) {
-      uint32_t batch_count = 0;
+    /* Lock-held batches of 32 keep IRQ-masked sections short. */
+    for (;;) {
+      ext2_bc_entry_t *to_free = NULL;
+      uint32_t batch = 0;
       spinlock_acquire(&m->cache_lock);
-      uint32_t start = m->cache_shrink_cursor;
-      while (scanned < EXT2_CACHE_SIZE && batch_count < 32 &&
-             total_freed + batch_count < max_buffers) {
-        uint32_t idx = (start + scanned) % EXT2_CACHE_SIZE;
-        scanned++;
-        if (m->cache[idx].data != NULL && m->cache[idx].writes_inflight == 0) {
-          batch[batch_count++] = m->cache[idx].data;
-          m->cache[idx].data = NULL;
-          m->cache[idx].num = 0;
-          m->cache[idx].write_seq++;
-        }
+      while (m->bc_lru_tail && batch < 32 && total_freed + batch < max_buffers) {
+        ext2_bc_remove_locked(m, m->bc_lru_tail, &to_free);
+        batch++;
       }
-      m->cache_shrink_cursor = (start + scanned) % EXT2_CACHE_SIZE;
       spinlock_release(&m->cache_lock);
-
-      for (uint32_t b = 0; b < batch_count; b++)
-        kfree(batch[b]);
-      total_freed += batch_count;
+      ext2_bc_free_chain(to_free);
+      total_freed += batch;
+      if (batch < 32 || total_freed >= max_buffers)
+        break;
     }
   }
   spinlock_release(&ext2_mounts_lock);
 
   return total_freed;
+}
+
+/* Release any in-flight write markers left behind by a thread killed mid-I/O
+ * so readers hashing to the same bc_seq bucket do not spin forever. */
+void ext2_release_inflight_writes(uint32_t tid) {
+  if (!tid)
+    return;
+  spinlock_acquire(&ext2_mounts_lock);
+  for (ext2_mount_t *m = ext2_active_mounts; m; m = m->next) {
+    ext2_bc_entry_t *to_free = NULL;
+    spinlock_acquire(&m->cache_lock);
+    ext2_inflight_write_t **pp = &m->inflight_writes;
+    while (*pp) {
+      ext2_inflight_write_t *iw = *pp;
+      if (iw->owner_tid != tid) {
+        pp = &iw->next;
+        continue;
+      }
+      *pp = iw->next;
+      iw->next = NULL;
+      for (uint32_t i = 0; i < iw->count; i++) {
+        uint64_t b = iw->blocks[i];
+        EXT2_SEQ(m, b)->write_seq++;
+        if (EXT2_SEQ(m, b)->writes_inflight > 0)
+          EXT2_SEQ(m, b)->writes_inflight--;
+        ext2_bc_invalidate_locked(m, b, &to_free);
+      }
+    }
+    spinlock_release(&m->cache_lock);
+    ext2_bc_free_chain(to_free);
+  }
+  spinlock_release(&ext2_mounts_lock);
 }

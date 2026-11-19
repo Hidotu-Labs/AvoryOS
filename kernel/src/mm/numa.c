@@ -264,9 +264,9 @@ void numa_dump(void) {
     klog_uint64(numa_nodes[i].total_memory / (1024 * 1024));
     klog_puts("MB Usable=");
     klog_uint64(numa_nodes[i].usable_memory / (1024 * 1024));
-    klog_puts("MB [0x");
+    klog_puts("MB [");
     klog_hex64(numa_nodes[i].phys_start);
-    klog_puts(" - 0x");
+    klog_puts(" - ");
     klog_hex64(numa_nodes[i].phys_end);
     klog_puts("]\n");
   }

@@ -421,6 +421,8 @@ void syscall_register_sem(void);
 void syscall_register_futex(void);
 
 const char *syscall_get_name(uint64_t num);
+uint32_t syscall_prof_format(char *buf, uint32_t cap);
+void syscall_prof_reset(void);
 
 void syscall_init(void);
 

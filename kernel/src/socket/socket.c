@@ -218,7 +218,7 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
     memcpy(&ifr.family, &ifindex, sizeof(ifindex));
   } else if (request == 0x8914 || request == 0x8916 ||
              request == 0x891a || request == 0x891c) {
-    if (!capability_has(sched_get_current(), CAP_NET_ADMIN))
+    if (!capability_has_init_ns(sched_get_current(), CAP_NET_ADMIN))
       return -1; /* EPERM */
     if (loopback)
       return 0;
@@ -1088,7 +1088,11 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
         else if (request == 0x8933) { uint32_t index = 1; memcpy(&req.family, &index, 4); }
         else if (request == 0x8913) req.family = sock->net_ns->loopback_flags;
         else if (request == 0x8914) {
-          if (!capability_has(sched_get_current(), CAP_NET_ADMIN)) ret = -1;
+          struct thread *cur = sched_get_current();
+          bool allowed = capability_has_init_ns(cur, CAP_NET_ADMIN) ||
+                         (cur && cur->net_ns == sock->net_ns &&
+                          capability_has(cur, CAP_NET_ADMIN));
+          if (!allowed) ret = -1;
           else __atomic_store_n(&sock->net_ns->loopback_flags, (uint32_t)(req.family & 1) | 8, __ATOMIC_RELEASE);
         } else if (request == 0x8915 && sock->net_ns->loopback_address) {
           memset(&req.family, 0, sizeof(req) - 16); req.family = 2;
@@ -1109,7 +1113,7 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     return ret;
   }
   if (request == 0x890b || request == 0x890c) { /* SIOCADDRT / SIOCDELRT */
-    if (!capability_has(sched_get_current(), CAP_NET_ADMIN)) {
+    if (sock->net_ns || !capability_has_init_ns(sched_get_current(), CAP_NET_ADMIN)) {
       socket_put(sock);
       return -1; /* EPERM */
     }

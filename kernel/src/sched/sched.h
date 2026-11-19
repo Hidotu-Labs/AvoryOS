@@ -27,6 +27,7 @@ struct mm_struct {
   uint64_t mmap_next_addr; // Bump-pointer for anonymous mmap
   bool compat32;          // Address space uses the Linux i386 ABI
   bool mlockall_future;   // Conservatively keep this address space out of zram reclaim
+  uint64_t mlocked_bytes; // Tracked locked memory bytes for unprivileged mlock limits
   uint16_t pkey_alloc_mask; // Bitmask of allocated PKU keys (bit 0 reserved)
   int ref_count;           // Reference count for sharing across threads
   uint16_t pcid;           // Hardware PCID tag (0 = kernel/unassigned)
@@ -54,6 +55,21 @@ struct mm_struct {
   uint64_t arg_end;     // User VA just past the last argv string
   uint64_t zram_scan_cursor;
   uint64_t ksm_scan_cursor; // Next VA for a bounded background scan; mm->lock
+  /* Page-fault accounting since this address space was created by fork or
+   * reset by execve (atomic, no lock).  Reported as minflt/majflt in
+   * /proc/<pid>/stat and getrusage(), and as "Faults:" in /proc/<pid>/status
+   * so process startup cost can be measured per launch. */
+  uint64_t nr_faults;    // every fault handled against this mm
+  uint64_t maj_flt;      // faults that had to read the file (cold page cache)
+  uint64_t fault_cycles; // TSC cycles spent inside vmm_handle_page_fault()
+  /* Split by error code: [0] not-present read/exec, [1] not-present write,
+   * [2] present write (copy-on-write). */
+  uint64_t fault_class_count[3];
+  uint64_t fault_class_cycles[3];
+  /* Syscalls entered by this image and TSC cycles spent inside them (wall
+   * time, so blocking calls such as poll and futex wait count in full). */
+  uint64_t nr_syscalls;
+  uint64_t syscall_cycles;
 };
 
 struct syscall_regs;
@@ -216,6 +232,8 @@ struct thread {
   uint32_t identity_cached_euid;
   uint32_t identity_cached_egid;
   uint32_t restore_callee_regs;
+  uint32_t _pad_canary;
+  uint64_t stack_canary;
   uint8_t fpu_state[4096] __attribute__((aligned(64))); // Saved XSAVE/FPU state (at offset 64)
   uint64_t stack_base;
   uint64_t stack_size;
@@ -568,6 +586,8 @@ _Static_assert(offsetof(struct thread, identity_cached_egid) == 44,
                "update syscall_entry.asm identity_cached_egid offset");
 _Static_assert(offsetof(struct thread, restore_callee_regs) == 48,
                "update syscall_entry.asm restore_callee_regs offset");
+_Static_assert(offsetof(struct thread, stack_canary) == 56,
+               "update switch.asm stack_canary offset");
 _Static_assert(offsetof(struct thread, fpu_state) == 64,
                "update fpu_state 64-byte alignment offset");
 
@@ -607,6 +627,13 @@ struct sched_thread_snapshot {
   char comm[16];
   char exe_path[256];
   char cwd_path[256];
+  uint64_t nr_faults;
+  uint64_t maj_flt;
+  uint64_t fault_cycles;
+  uint64_t fault_class_count[3];
+  uint64_t fault_class_cycles[3];
+  uint64_t nr_syscalls;
+  uint64_t syscall_cycles;
 };
 
 /* Caller holds files->lock. Anonymous descriptors without path metadata keep
@@ -747,6 +774,7 @@ bool sched_validate_runqueues(struct cpu_info *cpu);
 void sched_print_tasks(void);
 bool sched_terminate_thread(uint32_t tid);
 struct thread *sched_get_thread_by_tid(uint32_t tid);
+bool sched_vfork_child_settled(uint32_t tid);
 void sched_assume_init_tid_locked(struct thread *t);
 
 /* PID 1's orphan fallback auto-reaps children it is not waiting for at exit.
@@ -870,7 +898,8 @@ static inline bool thread_has_pending_signal(struct thread *t) {
 // Userspace Management
 #include "elf.h"
 #include <stdbool.h>
-bool elf_load(const char *path, uint64_t *pml4, elf_info_t *out_info);
+/* Consumes the caller's reference to `file` (closed on every path). */
+bool elf_load(vfs_node_t *file, uint64_t *pml4, elf_info_t *out_info);
 // Linux-style stack: path string near top, then auxv/envp/argv/argc; RSP points
 // at argc.
 uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,

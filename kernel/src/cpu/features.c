@@ -29,10 +29,12 @@ static uint32_t feat_1_ecx;
 static uint32_t feat_7_0_eax;
 static uint32_t feat_7_0_ebx;
 static uint32_t feat_7_0_ecx;
+static uint32_t feat_7_0_edx;
 static uint32_t feat_7_1_eax;
 static uint32_t feat_d_1_eax;
 static uint32_t feat_ext_max_leaf;
 static uint32_t feat_80000001_edx;
+static uint32_t feat_80000008_ebx;
 static uint64_t feat_xstate_mask;
 static bool feat_probed;
 
@@ -40,7 +42,7 @@ static void features_probe(void) {
   cpuid(0, 0, &feat_max_leaf, NULL, NULL, NULL);
   cpuid(1, 0, NULL, NULL, &feat_1_ecx, NULL);
   if (feat_max_leaf >= 7) {
-    cpuid(7, 0, &feat_7_0_eax, &feat_7_0_ebx, &feat_7_0_ecx, NULL);
+    cpuid(7, 0, &feat_7_0_eax, &feat_7_0_ebx, &feat_7_0_ecx, &feat_7_0_edx);
     if (feat_7_0_eax >= 1)
       cpuid(7, 1, &feat_7_1_eax, NULL, NULL, NULL);
   }
@@ -53,6 +55,8 @@ static void features_probe(void) {
   cpuid(0x80000000U, 0, &feat_ext_max_leaf, NULL, NULL, NULL);
   if (feat_ext_max_leaf >= 0x80000001U)
     cpuid(0x80000001U, 0, NULL, NULL, NULL, &feat_80000001_edx);
+  if (feat_ext_max_leaf >= 0x80000008U)
+    cpuid(0x80000008U, 0, NULL, &feat_80000008_ebx, NULL, NULL);
   __atomic_store_n(&feat_probed, true, __ATOMIC_RELEASE);
 }
 
@@ -189,6 +193,37 @@ bool cpu_has_erms(void) {
   return (feat_7_0_ebx & (1U << 9)) != 0; // CPUID.07H:EBX.ERMS[bit 9]
 }
 
+bool cpu_has_ibrs(void) {
+  features_ensure_probed();
+  if (feat_max_leaf >= 7 && (feat_7_0_edx & (1U << 26)))
+    return true;
+  return feat_ext_max_leaf >= 0x80000008U && (feat_80000008_ebx & (1U << 14)) != 0;
+}
+
+bool cpu_has_ibpb(void) {
+  features_ensure_probed();
+  if (feat_max_leaf >= 7 && (feat_7_0_edx & (1U << 26)))
+    return true;
+  return feat_ext_max_leaf >= 0x80000008U && (feat_80000008_ebx & (1U << 12)) != 0;
+}
+
+bool cpu_has_stibp(void) {
+  features_ensure_probed();
+  if (feat_max_leaf >= 7 && (feat_7_0_edx & (1U << 27)))
+    return true;
+  return feat_ext_max_leaf >= 0x80000008U && (feat_80000008_ebx & (1U << 15)) != 0;
+}
+
+bool cpu_has_md_clear(void) {
+  features_ensure_probed();
+  return feat_max_leaf >= 7 && (feat_7_0_edx & (1U << 10)) != 0;
+}
+
+bool cpu_has_arch_capabilities(void) {
+  features_ensure_probed();
+  return feat_max_leaf >= 7 && (feat_7_0_edx & (1U << 29)) != 0;
+}
+
 static inline void __attribute__((unused)) xsetbv(uint32_t index, uint64_t value) {
   uint32_t eax = (uint32_t)value;
   uint32_t edx = (uint32_t)(value >> 32);
@@ -214,6 +249,11 @@ bool cpu_has_smap_flag = false;
 bool cpu_has_fsgsbase_flag = false;
 bool cpu_has_fred_flag = false;
 bool cpu_has_pku_flag = false;
+bool cpu_has_ibrs_flag = false;
+bool cpu_has_ibpb_flag = false;
+bool cpu_has_stibp_flag = false;
+uint8_t cpu_md_clear_active = 0;
+uint16_t cpu_verw_ds = 0x10;
 
 // Enable SSE/SSE2, PCID, FSGSBASE, AVX/XSAVE, SMEP and SMAP for long mode.
 void cpu_features_init(void) {
@@ -307,4 +347,31 @@ void cpu_features_init(void) {
 
   __asm__ volatile("fninit");
   cpu_pat_init();
+
+  /* Hardware transient-execution mitigations (Spectre v2 / MDS / TAA). */
+  cpu_has_ibrs_flag = cpu_has_ibrs();
+  cpu_has_ibpb_flag = cpu_has_ibpb();
+  cpu_has_stibp_flag = cpu_has_stibp();
+
+  uint64_t spec_ctrl = 0;
+  if (cpu_has_ibrs_flag)
+    spec_ctrl |= SPEC_CTRL_IBRS;
+  if (cpu_has_stibp_flag)
+    spec_ctrl |= SPEC_CTRL_STIBP;
+  if (spec_ctrl != 0)
+    wrmsr(IA32_SPEC_CTRL, spec_ctrl);
+
+  if (cpu_has_md_clear()) {
+    bool immune = false;
+    if (cpu_has_arch_capabilities()) {
+      uint64_t arch_cap = rdmsr(IA32_ARCH_CAPABILITIES);
+      if ((arch_cap & (ARCH_CAP_MDS_NO | ARCH_CAP_TAA_NO)) ==
+          (ARCH_CAP_MDS_NO | ARCH_CAP_TAA_NO)) {
+        immune = true;
+      }
+    }
+    cpu_md_clear_active = immune ? 0 : 1;
+  } else {
+    cpu_md_clear_active = 0;
+  }
 }

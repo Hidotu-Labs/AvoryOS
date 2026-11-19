@@ -200,7 +200,7 @@ int64_t seccomp_control(uint32_t op, uint32_t flags, uint64_t args) {
     program = ptr;
   } else if (copy_from_user(&program, (void *)(args + 8), 8)) return -14;
   if (!count || count > SC_MAX_INSNS) return -22;
-  if (!current->no_new_privs && !capability_has(current, CAP_SYS_ADMIN)) return -13;
+  if (!current->no_new_privs && !capability_has_init_ns(current, CAP_SYS_ADMIN)) return -13;
   struct seccomp_filter *f = kmalloc(sizeof(*f) + count * sizeof(f->insn[0]));
   if (!f) return -12;
   memset(f, 0, sizeof(*f));

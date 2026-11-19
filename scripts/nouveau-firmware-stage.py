@@ -69,6 +69,10 @@ def main():
             'ad102', 'ad103', 'ad104', 'ad106', 'ad107',
         )
         fmc_chips = ('gb202', 'gb203', 'gb205', 'gb206', 'gb207')
+        wanted = os.environ.get('NOUVEAU_CHIPS', '').replace(',', ' ').split()
+        if wanted:
+            booter_chips = tuple(c for c in booter_chips if c in wanted)
+            fmc_chips = tuple(c for c in fmc_chips if c in wanted)
         names = [f'nvidia/{chip}/gsp/{name}-{args.interface}.bin'
                  for chip in booter_chips
                  for name in ('gsp', 'bootloader', 'booter_load', 'booter_unload')] + [

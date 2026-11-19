@@ -56,6 +56,39 @@ void fpu_init_thread(struct thread *t) {
     memcpy(t->fpu_state, initial_fpu_state, sizeof(t->fpu_state));
 }
 
+bool fpu_validate_legacy(const uint8_t fx[512], const uint8_t *cur_fpu_state) {
+    uint32_t mxcsr = 0, mxcsr_mask = 0;
+    memcpy(&mxcsr, fx + 24, sizeof(mxcsr));
+    if (cur_fpu_state)
+        memcpy(&mxcsr_mask, cur_fpu_state + 28, sizeof(mxcsr_mask));
+    if (!mxcsr_mask)
+        mxcsr_mask = 0x0000ffbfU;
+    return (mxcsr & ~mxcsr_mask) == 0;
+}
+
+void fpu_sanitize_xstate(uint8_t *state, size_t state_size,
+                         const uint8_t *cur_fpu_state) {
+    if (!state || state_size < 32)
+        return;
+    uint32_t mxcsr = 0, mxcsr_mask = 0;
+    memcpy(&mxcsr, state + 24, sizeof(mxcsr));
+    if (cur_fpu_state)
+        memcpy(&mxcsr_mask, cur_fpu_state + 28, sizeof(mxcsr_mask));
+    if (!mxcsr_mask)
+        mxcsr_mask = 0x0000ffbfU;
+    mxcsr &= mxcsr_mask;
+    memcpy(state + 24, &mxcsr, sizeof(mxcsr));
+
+    if (cpu_has_xsave_flag && state_size >= 576) {
+        uint64_t allowed = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE) & ~(1ULL << 9);
+        uint64_t xstate_bv = 0;
+        memcpy(&xstate_bv, state + 512, sizeof(xstate_bv));
+        xstate_bv &= allowed;
+        memcpy(state + 512, &xstate_bv, sizeof(xstate_bv));
+        memset(state + 520, 0, 56); /* Clear xcomp_bv and reserved XSAVE header bytes */
+    }
+}
+
 /* Called locally after GS and IDT exist, before this CPU dispatches tasks. */
 void fpu_init_cpu(void) {
     hal_irq_state_t flags = hal_irq_save();

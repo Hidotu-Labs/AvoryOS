@@ -1,25 +1,28 @@
 #include "random.h"
 #include "hal/hal.h"
 #include "../fb/framebuffer.h"
+#include "../lib/csprng.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
 #include "vfs.h"
 
-static inline uint64_t __random_rdtsc(void) {
-  return hal_cpu_cycle_count();
-}
-
 static uint32_t random_read(struct vfs_node *node, uint32_t offset,
                             uint32_t size, uint8_t *buffer) {
   (void)node;
   (void)offset;
-  for (uint32_t i = 0; i < size; i++) {
-    uint64_t ticks = __random_rdtsc();
-    // Minimal mixing to satisfy WolfSSL requirement
-    buffer[i] = (uint8_t)(ticks ^ (ticks >> 7) ^ (ticks >> 17) ^ (ticks >> 23));
-  }
+  if (buffer && size)
+    csprng_get_bytes(buffer, size);
+  return size;
+}
+
+static uint32_t random_write(struct vfs_node *node, uint32_t offset,
+                             uint32_t size, uint8_t *buffer) {
+  (void)node;
+  (void)offset;
+  if (buffer && size)
+    csprng_stir(buffer, size);
   return size;
 }
 
@@ -80,21 +83,42 @@ static uint64_t zero_mmap(struct vfs_node *node, uint64_t addr, uint64_t length,
   (void)flags;
   (void)offset;
   uint64_t *user_pml4 = vmm_get_active_pml4();
-  if (!user_pml4 || !addr)
+  if (!user_pml4 || !addr || !length)
+    return (uint64_t)-1;
+  if (length + 0xFFFULL < length)
     return (uint64_t)-1;
 
-  size_t pages = (length + 0xFFF) / 0x1000;
+  size_t pages = (length + 0xFFFULL) / 0x1000ULL;
+  uint64_t map_bytes = (uint64_t)pages * 0x1000ULL;
+  if (addr > USER_SPACE_LIMIT || map_bytes > USER_SPACE_LIMIT + 1ULL - addr)
+    return (uint64_t)-1;
+
   uint64_t page_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_USER;
   if (prot & 0x2)
     page_flags |= PAGE_FLAG_RW;
+  if (!(prot & 0x4))
+    page_flags |= PAGE_FLAG_NX;
 
   for (size_t i = 0; i < pages; i++) {
     void *phys = pmm_alloc();
-    if (!phys)
+    if (!phys) {
+      for (size_t j = 0; j < i; j++) {
+        uint64_t p = vmm_virt_to_phys(user_pml4, addr + j * 0x1000ULL);
+        vmm_unmap_page(user_pml4, addr + j * 0x1000ULL);
+        if (p)
+          pmm_free_page((void *)p);
+      }
       return (uint64_t)-1;
+    }
     memset((void *)((uint64_t)phys + pmm_get_hhdm_offset()), 0, 4096);
     if (!vmm_map_page(user_pml4, addr + (i * 0x1000), (uint64_t)phys, page_flags)) {
       pmm_free_page(phys);
+      for (size_t j = 0; j < i; j++) {
+        uint64_t p = vmm_virt_to_phys(user_pml4, addr + j * 0x1000ULL);
+        vmm_unmap_page(user_pml4, addr + j * 0x1000ULL);
+        if (p)
+          pmm_free_page((void *)p);
+      }
       return (uint64_t)-1;
     }
   }
@@ -154,7 +178,7 @@ void random_register_vfs(void) {
     unode->inode = (1U << 8) | 9U;
     unode->mask = 0666;
     unode->read = random_read;
-    unode->write = null_write;
+    unode->write = random_write;
     unode->poll = null_poll;
     fb_register_device_node("urandom", unode);
   }
@@ -168,7 +192,7 @@ void random_register_vfs(void) {
     rnode->inode = (1U << 8) | 8U;
     rnode->mask = 0666;
     rnode->read = random_read;
-    rnode->write = null_write;
+    rnode->write = random_write;
     rnode->poll = null_poll;
     fb_register_device_node("random", rnode);
   }

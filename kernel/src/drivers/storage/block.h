@@ -110,6 +110,8 @@ struct block_device {
     /* Actual submitted NVMe commands, including retries and failures.
      * Namespace-only: partition forwarding does not double-count these. */
     uint64_t hw_reads, hw_writes, hw_read_bytes, hw_write_bytes, hw_errors;
+    /* NVMe read submit-to-completion time in TSC cycles (sum and worst). */
+    uint64_t hw_read_cycles, hw_read_max_cycles, hw_read_timed;
     struct storage_latency hw_flush;
 
     // Partition metadata (if this device is a partition)
@@ -133,6 +135,10 @@ struct block_device {
      * `release` are never freed (boot disks, static structs). */
     uint32_t refs;
     void (*release)(struct block_device *dev);
+    /* Root filesystem the /dev node was last published under.  The node has
+     * to be re-published once the real root replaces the boot ramfs (its /dev
+     * is a different directory), but never twice under the same root. */
+    void *published_root;
 };
 
 static inline struct block_device *block_ref(struct block_device *dev) {

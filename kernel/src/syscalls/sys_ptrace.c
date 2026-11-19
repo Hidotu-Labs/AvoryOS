@@ -2,6 +2,7 @@
 
 #include "syscall.h"
 #include "../cpu/features.h"
+#include "../cpu/fpu.h"
 #include "../include/arch/uaccess.h"
 #include "../include/linux/errno.h"
 #include "../lib/string.h"
@@ -744,10 +745,14 @@ static int ptrace_regset_copy(struct thread *target, uint64_t note,
     return -EINVAL;
   }
   size_t amount = *length < available ? *length : available;
-  if (set)
+  if (set) {
     memcpy(destination, buffer, amount);
-  else
+    if (note == NT_FPREGSET || note == NT_X86_XSTATE)
+      fpu_sanitize_xstate(target->fpu_state, sizeof(target->fpu_state),
+                          target->fpu_state);
+  } else {
     memcpy(buffer, source, amount);
+  }
   *length = amount;
   return 0;
 }
@@ -758,12 +763,15 @@ static bool set_user_register(uint64_t regs[USER_REG_COUNT], unsigned index,
     return false;
   /* Linux protects the privilege and execution-mode bits in EFLAGS. */
   if (index == 18) {
-    uint64_t allowed = 0x0000000000254dd5ULL;
+    uint64_t allowed = 0x0000000000250dd5ULL;
     regs[index] = (regs[index] & ~allowed) | (value & allowed) | 0x202;
     return true;
   }
   if (index == 17 || index == 20 || (index >= 23 && index <= 26))
     return value == regs[index]; /* segment selectors are fixed by this ABI */
+  if ((index == 16 || index == 19 || index == 21 || index == 22) &&
+      value >= 0x0000800000000000ULL)
+    return false;
   regs[index] = value;
   return true;
 }
@@ -998,6 +1006,8 @@ static uint64_t ptrace_request(uint64_t request, uint64_t pid_val,
   case PTRACE_SETFPREGS:
   case PTRACE_SETFPXREGS:
     memcpy(target->fpu_state, input_fp, FPREG_BYTES);
+    fpu_sanitize_xstate(target->fpu_state, sizeof(target->fpu_state),
+                        target->fpu_state);
     break;
   case PTRACE_GETEVENTMSG:
     input_sigmask = target->ptrace_message;
@@ -1027,22 +1037,25 @@ static uint64_t ptrace_request(uint64_t request, uint64_t pid_val,
     bool set = request == PTRACE_SETREGSET;
     int rc = 0;
     if (set && addr == NT_PRSTATUS) {
+      size_t copy_len = len < USER_REG_BYTES ? len : USER_REG_BYTES;
+      uint64_t merged[USER_REG_COUNT];
       uint64_t sanitized[USER_REG_COUNT];
+      memcpy(merged, target->ptrace_regs, sizeof(merged));
+      memcpy(merged, input_regset, copy_len);
       memcpy(sanitized, target->ptrace_regs, sizeof(sanitized));
-      size_t count = len < USER_REG_BYTES ? len / sizeof(uint64_t)
-                                         : USER_REG_COUNT;
-      uint64_t *incoming = (uint64_t *)input_regset;
-      for (size_t i = 0; i < count; i++) {
-        if (!set_user_register(sanitized, (unsigned)i, incoming[i])) {
+      for (size_t i = 0; i < USER_REG_COUNT; i++) {
+        if (!set_user_register(sanitized, (unsigned)i, merged[i])) {
           rc = -EIO;
           break;
         }
       }
-      if (!rc)
-        memcpy(input_regset, sanitized, count * sizeof(uint64_t));
-    }
-    if (!rc)
+      if (!rc) {
+        memcpy(target->ptrace_regs, sanitized, sizeof(sanitized));
+        len = copy_len;
+      }
+    } else {
       rc = ptrace_regset_copy(target, addr, input_regset, &len, set);
+    }
     if (rc) { spinlock_release(&tid_lock); return neg_errno(-rc); }
     input_iov.len = len;
     spinlock_release(&tid_lock);

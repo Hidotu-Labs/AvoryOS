@@ -101,6 +101,8 @@ typedef struct {
   uint64_t interp_base;  // Base address of interpreter
   uint64_t interp_entry; // Entry point of interpreter
   bool compat32;        // i386 executable and initial stack ABI
+  uint64_t dyn_vaddr;    // main executable PT_DYNAMIC VA (biased), 0 if none
+  uint64_t dyn_memsz;    // PT_DYNAMIC p_memsz
 } elf_info_t;
 
 #endif

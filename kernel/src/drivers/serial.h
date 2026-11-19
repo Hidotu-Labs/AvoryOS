@@ -10,6 +10,11 @@ void serial_resume(void);
 void serial_putchar(char c);
 void serial_write(const char *data, size_t length);
 void serial_write_async(const char *data, size_t length);
+/* Queue only (no port I/O); drained by the BSP tick and idle loop. */
+void serial_enqueue(const char *data, size_t length);
+/* After this, serial_enqueue drains synchronously (panic/halt paths). */
+void serial_set_panic_mode(void);
+uint64_t serial_dropped_total(void);
 void serial_flush(void);
 void serial_flush_idle(void);
 uint32_t serial_pending_bytes(void);

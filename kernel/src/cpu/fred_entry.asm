@@ -4,6 +4,8 @@ global fred_entry_kernel
 extern isr_handler
 extern syscall_dispatcher
 extern cpu_has_smap_flag
+extern cpu_md_clear_active
+extern cpu_verw_ds
 
 section .text
 align 4096
@@ -161,6 +163,10 @@ fred_user_event:
     pop rbx
     pop rax
     add rsp, 56
+    cmp byte [rel cpu_md_clear_active], 0
+    je .skip_verw_fred_evt
+    verw word [rel cpu_verw_ds]
+.skip_verw_fred_evt:
     eretu
 
 ; Ring 3 -> Ring 0 SYSCALL under FRED.
@@ -191,17 +197,7 @@ fred_user_syscall:
     mov rdi, rsp
     sti
 
-    cmp byte [rel cpu_has_smap_flag], 0
-    je .stac_done
-    stac
-.stac_done:
-
     call syscall_dispatcher
-
-    cmp byte [rel cpu_has_smap_flag], 0
-    je .clac_done
-    clac
-.clac_done:
 
     cli
 
@@ -234,6 +230,10 @@ fred_user_syscall:
     pop r14
     pop r15
     add rsp, 56                  ; drop rip..user_rdi; rsp now at FRED frame
+    cmp byte [rel cpu_md_clear_active], 0
+    je .skip_verw_fred_sys
+    verw word [rel cpu_verw_ds]
+.skip_verw_fred_sys:
     eretu
 
 .sigreturn_eretu:
@@ -264,4 +264,8 @@ fred_user_syscall:
     mov rcx, [rax + 96]
     mov rbx, [rax + 104]
     mov rax, [rax + 112]
+    cmp byte [rel cpu_md_clear_active], 0
+    je .skip_verw_fred_sigret
+    verw word [rel cpu_verw_ds]
+.skip_verw_fred_sigret:
     eretu

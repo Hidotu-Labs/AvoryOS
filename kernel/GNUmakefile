@@ -149,6 +149,11 @@ endif
 # MSI-X -> MSI -> INTx -> polled; these force a lower mode for the stress
 # matrix.  NVME_FAULT_DROP_IRQ consumes completions in the handler but delays
 # the waiter wakeup, exercising the scheduler-tick fallback.
+# make TSC_AUTO_DUMP=1 prints the exec/fork/vfork TSC probe tables during boot
+# (prctl(0x50544344) dumps them on demand either way).
+ifeq ($(TSC_AUTO_DUMP),1)
+override CPPFLAGS += -DTSC_AUTO_DUMP=1
+endif
 ifeq ($(NVME_NOIRQ),1)
 override CPPFLAGS += -DNVME_NOIRQ=1
 endif
@@ -200,7 +205,10 @@ override CFLAGS += \
     -std=gnu11 \
     -nostdinc \
     -ffreestanding \
-    -fno-stack-protector \
+    -fstack-protector-strong \
+    -mstack-protector-guard=tls \
+    -mstack-protector-guard-reg=gs \
+    -mstack-protector-guard-offset=392 \
     -fno-stack-check \
     -fno-lto \
     -fno-PIC \
@@ -399,6 +407,11 @@ ifeq ($(ARCH),x86_64)
         -mno-sse2 \
         -mno-red-zone \
         -mcmodel=kernel
+    ifeq ($(CC_IS_CLANG),0)
+        override CFLAGS += \
+            -mindirect-branch=thunk-inline \
+            -mindirect-branch-register
+    endif
     override LDFLAGS += \
         -m elf_x86_64
     override NASMFLAGS := \

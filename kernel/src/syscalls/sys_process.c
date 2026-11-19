@@ -153,8 +153,11 @@ static uint64_t sys_getcwd(uint64_t buf_ptr, uint64_t size, uint64_t a2,
   size_t len = strlen(current->cwd_path) + 1;
   if (size < len)
     return (uint64_t)-34; // ERANGE
+  if (!is_user_range(buf, len))
+    return (uint64_t)-14; // EFAULT
 
-  memcpy(buf, current->cwd_path, len);
+  if (copy_to_user(buf, current->cwd_path, len) != 0)
+    return (uint64_t)-14; // EFAULT
   return len; // Linux getcwd syscall returns length of copied bytes
 }
 
@@ -166,9 +169,15 @@ static uint64_t sys_chdir(uint64_t path_ptr, uint64_t a1, uint64_t a2,
   (void)a3;
   (void)a4;
   (void)a5;
-  const char *path = (const char *)path_ptr;
-  if (!path)
+  if (!path_ptr || !is_user_range((const void *)path_ptr, 1))
     return (uint64_t)-14; // EFAULT
+
+  char path[512];
+  long copied = strncpy_from_user(path, (const char *)path_ptr, sizeof(path));
+  if (copied < 0)
+    return (uint64_t)-14; // EFAULT
+  if ((size_t)copied >= sizeof(path))
+    return (uint64_t)-36; // ENAMETOOLONG
 
   struct thread *current = sched_get_current();
   if (!current)
@@ -502,22 +511,25 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     current->nondumpable = arg2 == 0;
     return 0;
   case PR_SET_NAME: {
-    if (!arg2 || !vmm_is_user_addr_range_valid(arg2, 1))
+    if (!arg2 || !is_user_range((const void *)arg2, 1))
       return (uint64_t)-14; // EFAULT
 
-    const char *name = (const char *)arg2;
-    // Copy up to 15 chars + null terminator
-    strncpy(current->comm, name, 15);
-    current->comm[15] = '\0';
+    char name[16];
+    long copied = strncpy_from_user(name, (const char *)arg2, sizeof(name));
+    if (copied < 0)
+      return (uint64_t)-14; // EFAULT
+    name[15] = '\0';
+    memcpy(current->comm, name, 16);
     return 0;
   }
   case PR_GET_NAME: {
-    if (!arg2 || !vmm_is_user_addr_range_valid(arg2, 16))
+    if (!arg2 || !is_user_range((const void *)arg2, 16))
       return (uint64_t)-14; // EFAULT
 
-    char *out = (char *)arg2;
+    char out[16];
     strncpy(out, current->comm, 16);
-    return 0;
+    out[15] = '\0';
+    return copy_to_user((void *)arg2, out, 16) ? (uint64_t)-14 : 0;
   }
   case 7: case 8: case 23: case 24: case 27: case 28:
     return capability_prctl(current, option, arg2, arg3, arg4, arg5);
@@ -526,9 +538,9 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
   case 14: // PR_SET_TIMING
     return 0;
   case 19: // PR_GET_ENDIAN
-    if (arg2 && vmm_is_user_addr_range_writable(arg2, sizeof(int))) {
-      *(int *)arg2 = 1; // PR_ENDIAN_LITTLE
-      return 0;
+    if (arg2 && is_user_range((const void *)arg2, sizeof(int))) {
+      int endian = 1; // PR_ENDIAN_LITTLE
+      return copy_to_user((void *)arg2, &endian, sizeof(endian)) ? (uint64_t)-14 : 0;
     }
     return (uint64_t)-14;
   case 20: // PR_SET_ENDIAN
@@ -539,9 +551,9 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     if (arg2 != 2) return (uint64_t)-22;
     return (uint64_t)seccomp_control(1, 0, arg3);
   case 25: // PR_GET_TSC
-    if (arg2 && vmm_is_user_addr_range_writable(arg2, sizeof(int))) {
-      *(int *)arg2 = 1; // PR_TSC_ENABLE
-      return 0;
+    if (arg2 && is_user_range((const void *)arg2, sizeof(int))) {
+      int tsc = 1; // PR_TSC_ENABLE
+      return copy_to_user((void *)arg2, &tsc, sizeof(tsc)) ? (uint64_t)-14 : 0;
     }
     return (uint64_t)-14;
   case 26: // PR_SET_TSC
@@ -630,6 +642,10 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     tsc_probe_dump();
     return 0;
   }
+  case 0x50544352: { // TEMPORARY "PTCR": reset TSC probe stats before a launch
+    tsc_probe_reset();
+    return 0;
+  }
   default: {
     char opt_str[32];
     snprintf(opt_str, sizeof(opt_str), "option=0x%llx", (unsigned long long)option);
@@ -698,19 +714,19 @@ static uint64_t sys_getresuid(struct syscall_regs *regs) {
     return (uint64_t)-1;
 
   if (ruid_ptr) {
-    if (!vmm_is_user_addr_range_valid((uint64_t)ruid_ptr, sizeof(uint32_t)))
+    if (!is_user_range(ruid_ptr, sizeof(uint32_t)) ||
+        copy_to_user(ruid_ptr, &t->uid, sizeof(uint32_t)) != 0)
       return (uint64_t)-14;
-    *ruid_ptr = t->uid;
   }
   if (euid_ptr) {
-    if (!vmm_is_user_addr_range_valid((uint64_t)euid_ptr, sizeof(uint32_t)))
+    if (!is_user_range(euid_ptr, sizeof(uint32_t)) ||
+        copy_to_user(euid_ptr, &t->euid, sizeof(uint32_t)) != 0)
       return (uint64_t)-14;
-    *euid_ptr = t->euid;
   }
   if (suid_ptr) {
-    if (!vmm_is_user_addr_range_valid((uint64_t)suid_ptr, sizeof(uint32_t)))
+    if (!is_user_range(suid_ptr, sizeof(uint32_t)) ||
+        copy_to_user(suid_ptr, &t->suid, sizeof(uint32_t)) != 0)
       return (uint64_t)-14;
-    *suid_ptr = t->suid;
   }
 
   return 0;
@@ -727,19 +743,19 @@ static uint64_t sys_getresgid(struct syscall_regs *regs) {
     return (uint64_t)-1;
 
   if (rgid_ptr) {
-    if (!vmm_is_user_addr_range_valid((uint64_t)rgid_ptr, sizeof(uint32_t)))
+    if (!is_user_range(rgid_ptr, sizeof(uint32_t)) ||
+        copy_to_user(rgid_ptr, &t->gid, sizeof(uint32_t)) != 0)
       return (uint64_t)-14;
-    *rgid_ptr = t->gid;
   }
   if (egid_ptr) {
-    if (!vmm_is_user_addr_range_valid((uint64_t)egid_ptr, sizeof(uint32_t)))
+    if (!is_user_range(egid_ptr, sizeof(uint32_t)) ||
+        copy_to_user(egid_ptr, &t->egid, sizeof(uint32_t)) != 0)
       return (uint64_t)-14;
-    *egid_ptr = t->egid;
   }
   if (sgid_ptr) {
-    if (!vmm_is_user_addr_range_valid((uint64_t)sgid_ptr, sizeof(uint32_t)))
+    if (!is_user_range(sgid_ptr, sizeof(uint32_t)) ||
+        copy_to_user(sgid_ptr, &t->sgid, sizeof(uint32_t)) != 0)
       return (uint64_t)-14;
-    *sgid_ptr = t->sgid;
   }
 
   return 0;
@@ -914,10 +930,10 @@ static uint64_t sys_getgroups(struct syscall_regs *regs) {
   if (!t || size < 0) return (uint64_t)-22;
   if (size == 0) return t->supplementary_group_count;
   if ((uint32_t)size < t->supplementary_group_count) return (uint64_t)-22;
-  if (!list || !vmm_is_user_addr_range_writable((uint64_t)list,
-      t->supplementary_group_count * sizeof(uint32_t))) return (uint64_t)-14;
-  memcpy(list, t->supplementary_groups,
-         t->supplementary_group_count * sizeof(uint32_t));
+  size_t bytes = t->supplementary_group_count * sizeof(uint32_t);
+  if (bytes && (!list || !is_user_range(list, bytes) ||
+                copy_to_user(list, t->supplementary_groups, bytes) != 0))
+    return (uint64_t)-14;
   return t->supplementary_group_count;
 }
 
@@ -927,9 +943,10 @@ static uint64_t sys_setgroups(struct syscall_regs *regs) {
   struct thread *t = sched_get_current();
   if (!t || !capability_has(t, CAP_SETGID)) return (uint64_t)-1;
   if (size > MAX_SUPPLEMENTARY_GROUPS) return (uint64_t)-22;
-  if (size && (!list || !vmm_is_user_addr_range_valid((uint64_t)list,
-      size * sizeof(uint32_t)))) return (uint64_t)-14;
-  if (size) memcpy(t->supplementary_groups, list, size * sizeof(uint32_t));
+  size_t bytes = size * sizeof(uint32_t);
+  if (bytes && (!list || !is_user_range(list, bytes) ||
+                copy_from_user(t->supplementary_groups, list, bytes) != 0))
+    return (uint64_t)-14;
   t->supplementary_group_count = size;
   return 0;
 }
@@ -1244,7 +1261,8 @@ static uint64_t sys_setitimer(uint64_t which, uint64_t new_value_ptr,
 
   /* Copy input first because old_value is allowed to alias new_value. */
   struct kernel_itimerval new_value;
-  memcpy(&new_value, (const void *)new_value_ptr, sizeof(new_value));
+  if (copy_from_user(&new_value, (const void *)new_value_ptr, sizeof(new_value)) != 0)
+    return (uint64_t)-14;
 
   uint64_t value_ms;
   uint64_t interval_ms;
@@ -1266,8 +1284,9 @@ static uint64_t sys_setitimer(uint64_t which, uint64_t new_value_ptr,
   ms_to_timeval(remaining_ms, &old_value.it_value);
   ms_to_timeval(old_interval_ms, &old_value.it_interval);
 
-  if (old_value_ptr)
-    memcpy((void *)old_value_ptr, &old_value, sizeof(old_value));
+  if (old_value_ptr &&
+      copy_to_user((void *)old_value_ptr, &old_value, sizeof(old_value)) != 0)
+    return (uint64_t)-14;
   return 0;
 }
 
@@ -1313,8 +1332,7 @@ static uint64_t sys_getrusage(uint64_t who, uint64_t usage_ptr, uint64_t a2,
   (void)a4;
   (void)a5;
 
-  struct rusage *ru = (struct rusage *)usage_ptr;
-  if (!ru || !vmm_is_user_addr_range_writable((uint64_t)ru, sizeof(*ru)))
+  if (!usage_ptr || !is_user_range((const void *)usage_ptr, sizeof(struct rusage)))
     return (uint64_t)-14; // EFAULT
 
   int who_int = (int)(int64_t)who;
@@ -1322,6 +1340,8 @@ static uint64_t sys_getrusage(uint64_t who, uint64_t usage_ptr, uint64_t a2,
       who_int != RUSAGE_THREAD)
     return (uint64_t)-22; // EINVAL
 
+  struct rusage kru;
+  struct rusage *ru = &kru;
   memset(ru, 0, sizeof(*ru));
 
   struct thread *t = sched_get_current();
@@ -1341,6 +1361,10 @@ static uint64_t sys_getrusage(uint64_t who, uint64_t usage_ptr, uint64_t a2,
 
     // Report resident memory if mm is available
     if (t->mm) {
+      uint64_t faults = __atomic_load_n(&t->mm->nr_faults, __ATOMIC_RELAXED);
+      uint64_t major = __atomic_load_n(&t->mm->maj_flt, __ATOMIC_RELAXED);
+      ru->ru_minflt = (int64_t)(faults - major);
+      ru->ru_majflt = (int64_t)major;
       // Convert bytes to KB for ru_maxrss (Linux convention)
       uint64_t resident = 0;
       spinlock_acquire(&t->mm->lock);
@@ -1354,6 +1378,9 @@ static uint64_t sys_getrusage(uint64_t who, uint64_t usage_ptr, uint64_t a2,
     }
   }
   // RUSAGE_CHILDREN: leave zeroed (we don't accumulate child usage yet)
+
+  if (copy_to_user((void *)usage_ptr, &kru, sizeof(kru)) != 0)
+    return (uint64_t)-14;
 
   return 0;
 }

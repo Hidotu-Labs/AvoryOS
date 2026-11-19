@@ -748,7 +748,7 @@ static bool xhci_submit_command(struct xhci_controller *hc, uint64_t parameter,
   hc->debug_stage = "command timeout";
   hc->debug_usbcmd = mmio_read32(hc->op, XHCI_USBCMD);
   hc->debug_usbsts = mmio_read32(hc->op, XHCI_USBSTS);
-  klog_puts("[XHCI] Command timeout: USBSTS=0x");
+  klog_puts("[XHCI] Command timeout: USBSTS=");
   klog_hex32(mmio_read32(hc->op, XHCI_USBSTS));
   klog_puts(" enqueue=");
   klog_uint64(index);
@@ -2172,7 +2172,7 @@ static bool xhci_interrupt_completed(struct usb_hcd *hcd,
     state->pipe_errors++;
     klog_puts("[XHCI] Interrupt transfer error completion=");
     klog_uint64(code);
-    klog_puts(" endpoint=0x");
+    klog_puts(" endpoint=");
     klog_hex32(pipe->endpoint);
     klog_puts(" - resubmitting\n");
   }
@@ -2783,7 +2783,7 @@ static bool xhci_probe(struct pci_device *pci) {
   hc->ac64 = hcc1 & 1U;
   last_ac64 = hc->ac64;
   hc->context_64 = hcc1 & (1U << 2);
-  klog_puts("[XHCI] Found controller: version=0x");
+  klog_puts("[XHCI] Found controller: version=");
   klog_hex32(hc->version);
   klog_puts(" slots=");
   klog_uint64(hc->max_slots);

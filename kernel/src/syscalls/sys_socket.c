@@ -150,7 +150,7 @@ static uint64_t sys_socketpair(uint64_t domain, uint64_t type,
       !capability_has(sched_get_current(), CAP_NET_RAW)) return (uint64_t)-1;
 
   // Validate sv pointer
-  if (!is_user_ptr(sv_ptr) || (sv_ptr & 3)) {
+  if (!sv_ptr || !is_user_range((const void *)sv_ptr, sizeof(int) * 2) || (sv_ptr & 3)) {
     return (uint64_t)-14; // EFAULT
   }
 
@@ -177,9 +177,12 @@ static uint64_t sys_socketpair(uint64_t domain, uint64_t type,
   }
 
   // Write FDs to user space
-  int *sv = (int *)sv_ptr;
-  sv[0] = fd0;
-  sv[1] = fd1;
+  int sv[2] = {fd0, fd1};
+  if (copy_to_user((void *)sv_ptr, sv, sizeof(sv)) != 0) {
+    socket_close_fd(fd0);
+    socket_close_fd(fd1);
+    return (uint64_t)-14;
+  }
 
   return 0;
 }
@@ -209,11 +212,12 @@ static uint64_t sys_bind(uint64_t sockfd, uint64_t addr_ptr, uint64_t addrlen,
   if (addrlen > sizeof(kaddr_buf))
   return (uint64_t)-22; // EINVAL
 
-  if (!vmm_is_user_addr_range_valid(addr_ptr, addrlen))
+  if (!is_user_range((const void *)addr_ptr, addrlen))
   return (uint64_t)-14; // EFAULT
 
   memset(kaddr_buf, 0, sizeof(kaddr_buf));
-  memcpy(kaddr_buf, (void *)addr_ptr, addrlen);
+  if (copy_from_user(kaddr_buf, (const void *)addr_ptr, addrlen) != 0)
+  return (uint64_t)-14; // EFAULT
   struct sockaddr *kaddr = (struct sockaddr *)kaddr_buf;
   if (kaddr->sa_family == AF_UNIX && addrlen >= (int)offsetof(struct sockaddr_un, sun_path)) {
     struct sockaddr_un *sun = (struct sockaddr_un *)kaddr;
@@ -255,7 +259,9 @@ static uint64_t sys_connect(uint64_t sockfd, uint64_t addr_ptr,
   return (uint64_t)-22; // EINVAL
 
   memset(kaddr_buf, 0, sizeof(kaddr_buf));
-  memcpy(kaddr_buf, (void *)addr_ptr, addrlen);
+  if (!is_user_range((const void *)addr_ptr, addrlen) ||
+      copy_from_user(kaddr_buf, (const void *)addr_ptr, addrlen) != 0)
+  return (uint64_t)-14; // EFAULT
   struct sockaddr *kaddr = (struct sockaddr *)kaddr_buf;
   if (kaddr->sa_family == AF_UNIX && addrlen >= (int)offsetof(struct sockaddr_un, sun_path)) {
     struct sockaddr_un *sun = (struct sockaddr_un *)kaddr;
@@ -386,7 +392,7 @@ static uint64_t sys_sendto(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
   int fd = (int)sockfd;
 
   // Validate buffer pointer
-  if (len > 0 && (!is_user_ptr(buf_ptr) || !is_user_ptr(buf_ptr + len - 1))) {
+  if (len > 0 && !is_user_range((const void *)buf_ptr, len)) {
     return (uint64_t)-14; // EFAULT
   }
 
@@ -404,17 +410,34 @@ static uint64_t sys_sendto(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
     return (uint64_t)-9;
   }
 
-  const void *buf = (const void *)buf_ptr;
+  uint8_t kaddr_buf[128];
   struct sockaddr *dest_addr = NULL;
   if (dest_addr_ptr) {
-    if (!is_user_ptr(dest_addr_ptr)) {
+    if (addrlen > sizeof(kaddr_buf))
+      return (uint64_t)-22;
+    if (!is_user_range((const void *)dest_addr_ptr, addrlen) ||
+        copy_from_user(kaddr_buf, (const void *)dest_addr_ptr, addrlen) != 0) {
       return (uint64_t)-14;
     }
-    dest_addr = (struct sockaddr *)dest_addr_ptr;
+    dest_addr = (struct sockaddr *)kaddr_buf;
+  }
+
+  uint8_t stack_buf[4096];
+  size_t copy_len = len <= sizeof(stack_buf) ? (size_t)len : (size_t)len;
+  uint8_t *kbuf = copy_len <= sizeof(stack_buf) ? stack_buf : (uint8_t *)kmalloc(copy_len);
+  if (!kbuf) {
+    return (uint64_t)-12; // ENOMEM
+  }
+  if (copy_from_user(kbuf, (const void *)buf_ptr, copy_len) != 0) {
+    if (kbuf != stack_buf)
+      kfree(kbuf);
+    return (uint64_t)-14;
   }
 
   ssize_t ret =
-      socket_sendto(sock, buf, len, (int)flags, dest_addr, (int)addrlen);
+      socket_sendto(sock, kbuf, copy_len, (int)flags, dest_addr, (int)addrlen);
+  if (kbuf != stack_buf)
+    kfree(kbuf);
   return (uint64_t)ret;
 }
 
@@ -425,7 +448,7 @@ static uint64_t sys_recvfrom(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
   int fd = (int)sockfd;
 
   // Validate buffer pointer
-  if (len > 0 && (!is_user_ptr(buf_ptr) || !is_user_ptr(buf_ptr + len - 1))) {
+  if (len > 0 && !is_user_range((const void *)buf_ptr, len)) {
     return (uint64_t)-14; // EFAULT
   }
 
@@ -439,31 +462,57 @@ static uint64_t sys_recvfrom(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
     return (uint64_t)-9;
   }
 
-  void *buf = (void *)buf_ptr;
+  uint8_t kaddr_buf[128];
   struct sockaddr *src_addr = NULL;
   int *addrlen = NULL;
   int k_addrlen = 0;
 
-  if (src_addr_ptr) {
-    if (!is_user_ptr(src_addr_ptr)) {
-      return (uint64_t)-14;
-    }
-    src_addr = (struct sockaddr *)src_addr_ptr;
-  }
-
   if (addrlen_ptr) {
-    if (!is_user_ptr(addrlen_ptr)) {
+    if (!is_user_range((const void *)addrlen_ptr, sizeof(int)) ||
+        copy_from_user(&k_addrlen, (const void *)addrlen_ptr, sizeof(int)) != 0) {
       return (uint64_t)-14;
     }
-    if (copy_from_user(&k_addrlen, (const void *)addrlen_ptr, sizeof(int)) != 0) {
-      return (uint64_t)-14;
-    }
+    if (k_addrlen < 0)
+      return (uint64_t)-22;
+    if ((size_t)k_addrlen > sizeof(kaddr_buf))
+      k_addrlen = (int)sizeof(kaddr_buf);
     addrlen = &k_addrlen;
   }
 
-  ssize_t ret = socket_recvfrom(sock, buf, len, (int)flags, src_addr, addrlen);
+  if (src_addr_ptr) {
+    if (!addrlen_ptr || !is_user_range((const void *)src_addr_ptr, (size_t)k_addrlen)) {
+      return (uint64_t)-14;
+    }
+    memset(kaddr_buf, 0, sizeof(kaddr_buf));
+    src_addr = (struct sockaddr *)kaddr_buf;
+  }
+
+  uint8_t stack_buf[4096];
+  size_t cap = (size_t)len;
+  uint8_t *kbuf = cap <= sizeof(stack_buf) ? stack_buf : (uint8_t *)kmalloc(cap);
+  if (!kbuf) {
+    return (uint64_t)-12; // ENOMEM
+  }
+
+  ssize_t ret = socket_recvfrom(sock, kbuf, cap, (int)flags, src_addr, addrlen);
+  /* MSG_TRUNC can return the datagram length even for a zero-byte buffer. */
+  size_t copied = ret > 0 ? ((size_t)ret < cap ? (size_t)ret : cap) : 0;
+  if (copied && copy_to_user((void *)buf_ptr, kbuf, copied) != 0) {
+    if (kbuf != stack_buf)
+      kfree(kbuf);
+    return (uint64_t)-14;
+  }
+  if (kbuf != stack_buf)
+    kfree(kbuf);
+
+  if (ret >= 0 && src_addr_ptr && k_addrlen > 0) {
+    size_t copy_addr = (size_t)k_addrlen <= sizeof(kaddr_buf) ? (size_t)k_addrlen : sizeof(kaddr_buf);
+    if (copy_to_user((void *)src_addr_ptr, kaddr_buf, copy_addr) != 0)
+      return (uint64_t)-14;
+  }
   if (ret >= 0 && addrlen_ptr) {
-    copy_to_user((void *)addrlen_ptr, &k_addrlen, sizeof(int));
+    if (copy_to_user((void *)addrlen_ptr, &k_addrlen, sizeof(int)) != 0)
+      return (uint64_t)-14;
   }
   return (uint64_t)ret;
 }
@@ -517,6 +566,160 @@ static uint64_t compat_socket_msg(int fd, uint64_t pointer, int flags, bool rece
   return (uint64_t)result;
 }
 
+struct socket_msg_bounce {
+  struct msghdr kmsg;
+  struct iovec *kiov;
+  struct iovec *uiov;
+  size_t iovlen;
+  void *user_name;
+  uint32_t orig_namelen;
+  void *kname;
+  void *user_control;
+  size_t orig_controllen;
+  void *kcontrol;
+};
+
+static void socket_msg_bounce_free(struct socket_msg_bounce *b) {
+  if (b->kiov) {
+    for (size_t i = 0; i < b->iovlen; i++) {
+      if (b->kiov[i].iov_base)
+        kfree(b->kiov[i].iov_base);
+    }
+    kfree(b->kiov);
+  }
+  if (b->uiov)
+    kfree(b->uiov);
+  if (b->kname)
+    kfree(b->kname);
+  if (b->kcontrol)
+    kfree(b->kcontrol);
+}
+
+static int socket_msg_bounce_init(struct socket_msg_bounce *b, uint64_t msg_ptr,
+                                  bool is_send) {
+  memset(b, 0, sizeof(*b));
+  if (!is_user_range((const void *)msg_ptr, sizeof(struct msghdr)) ||
+      copy_from_user(&b->kmsg, (const void *)msg_ptr, sizeof(struct msghdr)) != 0)
+    return -14;
+
+  if (b->kmsg.msg_iovlen > 1024)
+    return -90; // EMSGSIZE
+
+  b->iovlen = b->kmsg.msg_iovlen;
+  b->user_name = b->kmsg.msg_name;
+  b->orig_namelen = b->kmsg.msg_namelen;
+  b->user_control = b->kmsg.msg_control;
+  b->orig_controllen = b->kmsg.msg_controllen;
+
+  if (b->user_name && b->orig_namelen > 0) {
+    if (b->orig_namelen > 4096)
+      return -22;
+    if (!is_user_range(b->user_name, b->orig_namelen))
+      return -14;
+    b->kname = kmalloc(b->orig_namelen);
+    if (!b->kname)
+      return -12;
+    if (is_send) {
+      if (copy_from_user(b->kname, b->user_name, b->orig_namelen) != 0) {
+        socket_msg_bounce_free(b);
+        return -14;
+      }
+    } else {
+      memset(b->kname, 0, b->orig_namelen);
+    }
+    b->kmsg.msg_name = b->kname;
+  } else {
+    b->kmsg.msg_name = NULL;
+  }
+
+  if (b->user_control && b->orig_controllen > 0) {
+    size_t control_capacity = b->orig_controllen;
+    if (control_capacity > 65536) {
+      if (is_send) {
+        socket_msg_bounce_free(b);
+        return -90; // EMSGSIZE
+      }
+      /* Receiving needs space only for the control messages we can emit.
+       * Varlink supplies 64 KiB for descriptors plus the cmsghdr. */
+      control_capacity = 65536;
+    }
+    if (!is_user_range(b->user_control, control_capacity)) {
+      socket_msg_bounce_free(b);
+      return -14;
+    }
+    b->kcontrol = kmalloc(control_capacity);
+    if (!b->kcontrol) {
+      socket_msg_bounce_free(b);
+      return -12;
+    }
+    if (is_send) {
+      if (copy_from_user(b->kcontrol, b->user_control, b->orig_controllen) != 0) {
+        socket_msg_bounce_free(b);
+        return -14;
+      }
+    } else {
+      memset(b->kcontrol, 0, control_capacity);
+    }
+    b->kmsg.msg_control = b->kcontrol;
+    b->kmsg.msg_controllen = control_capacity;
+  } else {
+    b->kmsg.msg_control = NULL;
+  }
+
+  if (b->iovlen > 0) {
+    size_t iov_bytes = b->iovlen * sizeof(struct iovec);
+    if (!is_user_range(b->kmsg.msg_iov, iov_bytes)) {
+      socket_msg_bounce_free(b);
+      return -14;
+    }
+    b->uiov = kmalloc(iov_bytes);
+    b->kiov = kmalloc(iov_bytes);
+    if (!b->uiov || !b->kiov) {
+      socket_msg_bounce_free(b);
+      return -12;
+    }
+    memset(b->kiov, 0, iov_bytes);
+    if (copy_from_user(b->uiov, b->kmsg.msg_iov, iov_bytes) != 0) {
+      socket_msg_bounce_free(b);
+      return -14;
+    }
+    for (size_t i = 0; i < b->iovlen; i++) {
+      size_t len = b->uiov[i].iov_len;
+      b->kiov[i].iov_len = len;
+      if (len > 0) {
+        if (len > (16ULL * 1024 * 1024)) {
+          socket_msg_bounce_free(b);
+          return -12;
+        }
+        if (!is_user_range(b->uiov[i].iov_base, len)) {
+          socket_msg_bounce_free(b);
+          return -14;
+        }
+        void *kbuf = kmalloc(len);
+        if (!kbuf) {
+          socket_msg_bounce_free(b);
+          return -12;
+        }
+        if (is_send) {
+          if (copy_from_user(kbuf, b->uiov[i].iov_base, len) != 0) {
+            kfree(kbuf);
+            socket_msg_bounce_free(b);
+            return -14;
+          }
+        } else {
+          memset(kbuf, 0, len);
+        }
+        b->kiov[i].iov_base = kbuf;
+      }
+    }
+    b->kmsg.msg_iov = b->kiov;
+  } else {
+    b->kmsg.msg_iov = NULL;
+  }
+
+  return 0;
+}
+
 // Syscall: sendmsg(int sockfd, struct msghdr *msg, int flags)
 static uint64_t sys_sendmsg(uint64_t sockfd, uint64_t msg_ptr, uint64_t flags,
                             uint64_t _arg3, uint64_t _arg4, uint64_t _arg5) {
@@ -530,12 +733,6 @@ static uint64_t sys_sendmsg(uint64_t sockfd, uint64_t msg_ptr, uint64_t flags,
 
   int fd = (int)sockfd;
 
-  // Validate msghdr pointer
-  if (!is_user_ptr(msg_ptr) ||
-      !vmm_is_user_addr_range_valid(msg_ptr, sizeof(struct msghdr))) {
-    return (uint64_t)-14; // EFAULT
-  }
-
   // Get socket from FD
   socket_t *sock __attribute__((cleanup(socket_release_fd))) =
       socket_from_fd(fd);
@@ -543,51 +740,32 @@ static uint64_t sys_sendmsg(uint64_t sockfd, uint64_t msg_ptr, uint64_t flags,
     return socket_eno_notsock(fd);
   }
 
-  struct msghdr *msg = (struct msghdr *)msg_ptr;
-
   if (sock->closing) {
     return (uint64_t)-9;
   }
 
-  // Validate iovec array
-  if (msg->msg_iovlen > 0 &&
-      (!is_user_ptr((uint64_t)msg->msg_iov) ||
-       !vmm_is_user_addr_range_valid((uint64_t)msg->msg_iov,
-                                     msg->msg_iovlen * sizeof(struct iovec)))) {
-    return (uint64_t)-14; // EFAULT
-  }
-
-  for (size_t i = 0; i < msg->msg_iovlen; i++) {
-    struct iovec *iov = &msg->msg_iov[i];
-    if (iov->iov_len > 0 &&
-        (!is_user_ptr((uint64_t)iov->iov_base) ||
-         !vmm_is_user_addr_range_valid((uint64_t)iov->iov_base, iov->iov_len))) {
-      return (uint64_t)-14; // EFAULT
-    }
-  }
+  struct socket_msg_bounce b;
+  int berr = socket_msg_bounce_init(&b, msg_ptr, true);
+  if (berr < 0)
+    return (uint64_t)(int64_t)berr;
 
   // Use family-specific sendmsg if available
   if (sock->ops && sock->ops->sendmsg) {
-    ssize_t r = sock->ops->sendmsg(sock, msg, (int)flags);
+    ssize_t r = sock->ops->sendmsg(sock, &b.kmsg, (int)flags);
+    socket_msg_bounce_free(&b);
     return (uint64_t)r;
   }
 
   // Fallback to simple send from iovec array
   ssize_t total_sent = 0;
-  for (size_t i = 0; i < msg->msg_iovlen; i++) {
-    struct iovec *iov = &msg->msg_iov[i];
-
-    if (!is_user_ptr((uint64_t)iov->iov_base) ||
-        !vmm_is_user_addr_range_valid((uint64_t)iov->iov_base, iov->iov_len)) {
-      return (uint64_t)-14; // EFAULT
-    }
-
-    if (iov->iov_len == 0) {
+  for (size_t i = 0; i < b.iovlen; i++) {
+    if (b.kiov[i].iov_len == 0) {
       continue;
     }
 
-    ssize_t ret = socket_send(sock, iov->iov_base, iov->iov_len, (int)flags);
+    ssize_t ret = socket_send(sock, b.kiov[i].iov_base, b.kiov[i].iov_len, (int)flags);
     if (ret < 0) {
+      socket_msg_bounce_free(&b);
       if (total_sent > 0) {
         return (uint64_t)total_sent;
       }
@@ -597,11 +775,12 @@ static uint64_t sys_sendmsg(uint64_t sockfd, uint64_t msg_ptr, uint64_t flags,
     total_sent += ret;
 
     // If we sent less than requested, we're done (buffer full)
-    if ((size_t)ret < iov->iov_len) {
+    if ((size_t)ret < b.kiov[i].iov_len) {
       break;
     }
   }
 
+  socket_msg_bounce_free(&b);
   return (uint64_t)total_sent;
 }
 
@@ -618,12 +797,6 @@ static uint64_t sys_recvmsg(uint64_t sockfd, uint64_t msg_ptr, uint64_t flags,
 
   int fd = (int)sockfd;
 
-  // Validate msghdr pointer
-  if (!is_user_ptr(msg_ptr) ||
-      !vmm_is_user_addr_range_valid(msg_ptr, sizeof(struct msghdr))) {
-    return (uint64_t)-14; // EFAULT
-  }
-
   // Get socket from FD
   socket_t *sock __attribute__((cleanup(socket_release_fd))) =
       socket_from_fd(fd);
@@ -631,93 +804,104 @@ static uint64_t sys_recvmsg(uint64_t sockfd, uint64_t msg_ptr, uint64_t flags,
     return socket_eno_notsock(fd);
   }
 
-  struct msghdr *msg = (struct msghdr *)msg_ptr;
-
   if (sock->closing) {
     return (uint64_t)-9;
   }
 
-  // Validate iovec array (only if iovlen > 0)
-  if (msg->msg_iovlen > 0 &&
-      (!is_user_ptr((uint64_t)msg->msg_iov) ||
-       !vmm_is_user_addr_range_valid((uint64_t)msg->msg_iov,
-                                     msg->msg_iovlen * sizeof(struct iovec)))) {
-    return (uint64_t)-14; // EFAULT
-  }
+  struct socket_msg_bounce b;
+  int berr = socket_msg_bounce_init(&b, msg_ptr, false);
+  if (berr < 0)
+    return (uint64_t)(int64_t)berr;
 
-  for (size_t i = 0; i < msg->msg_iovlen; i++) {
-    struct iovec *iov = &msg->msg_iov[i];
-    if (iov->iov_len > 0 &&
-        (!is_user_ptr((uint64_t)iov->iov_base) ||
-         !vmm_is_user_addr_range_valid((uint64_t)iov->iov_base, iov->iov_len))) {
-      return (uint64_t)-14; // EFAULT
-    }
-  }
+  ssize_t total_received = 0;
 
   // Use family-specific recvmsg if available
   if (sock->ops && sock->ops->recvmsg) {
-    ssize_t r = sock->ops->recvmsg(sock, msg, (int)flags);
-    return (uint64_t)r;
-  }
+    total_received = sock->ops->recvmsg(sock, &b.kmsg, (int)flags);
+  } else {
+    /* Fill msg_name with the source address when requested.
+     * Pull the first iovec as the data buffer and use recvfrom. */
+    struct sockaddr *src_addr = (struct sockaddr *)b.kname;
+    int src_addrlen = b.kname ? (int)b.orig_namelen : 0;
 
-  // Fallback to simple recv into iovec array
-  ssize_t total_received = 0;
-
-  /* Fill msg_name with the source address when requested.
-   * Pull the first iovec as the data buffer and use recvfrom. */
-  struct sockaddr *src_addr = NULL;
-  int src_addrlen = 0;
-  if (msg->msg_name && msg->msg_namelen > 0 &&
-      is_user_ptr((uint64_t)msg->msg_name)) {
-    src_addr = (struct sockaddr *)msg->msg_name;
-    src_addrlen = (int)msg->msg_namelen;
-  }
-
-  for (size_t i = 0; i < msg->msg_iovlen; i++) {
-    struct iovec *iov = &msg->msg_iov[i];
-
-    if (!is_user_ptr((uint64_t)iov->iov_base) ||
-        !vmm_is_user_addr_range_valid((uint64_t)iov->iov_base, iov->iov_len)) {
-      return (uint64_t)-14; // EFAULT
-    }
-
-    if (iov->iov_len == 0) {
-      continue;
-    }
-
-    ssize_t ret;
-    if (i == 0 && src_addr) {
-      /* First buffer: use recvfrom to capture source address */
-      ret = socket_recvfrom(
-          sock, iov->iov_base, iov->iov_len,
-          (int)flags | (sock->flags & SOCK_NONBLOCK ? MSG_DONTWAIT : 0),
-          src_addr, &src_addrlen);
-      if (ret >= 0)
-        msg->msg_namelen = (uint32_t)src_addrlen;
-    } else {
-      ret = socket_recv(sock, iov->iov_base, iov->iov_len, (int)flags);
-    }
-
-    if (ret < 0) {
-      if (total_received > 0) {
-        return (uint64_t)total_received;
+    for (size_t i = 0; i < b.iovlen; i++) {
+      if (b.kiov[i].iov_len == 0) {
+        continue;
       }
-      return (uint64_t)ret;
+
+      ssize_t ret;
+      if (i == 0 && src_addr) {
+        /* First buffer: use recvfrom to capture source address */
+        ret = socket_recvfrom(
+            sock, b.kiov[i].iov_base, b.kiov[i].iov_len,
+            (int)flags | (sock->flags & SOCK_NONBLOCK ? MSG_DONTWAIT : 0),
+            src_addr, &src_addrlen);
+        if (ret >= 0)
+          b.kmsg.msg_namelen = (uint32_t)src_addrlen;
+      } else {
+        ret = socket_recv(sock, b.kiov[i].iov_base, b.kiov[i].iov_len, (int)flags);
+      }
+
+      if (ret < 0) {
+        if (total_received == 0)
+          total_received = ret;
+        break;
+      }
+
+      total_received += ret;
+
+      // If we received less than requested, we're done
+      if ((size_t)ret < b.kiov[i].iov_len) {
+        break;
+      }
     }
-
-    total_received += ret;
-
-    // If we received less than requested, we're done
-    if ((size_t)ret < iov->iov_len) {
-      break;
+    if (total_received >= 0) {
+      b.kmsg.msg_controllen = 0;
+      b.kmsg.msg_flags = 0;
     }
   }
 
-  // Update msghdr fields for user space
-  // msg_namelen already updated above if src_addr was filled
-  msg->msg_controllen = 0;
-  msg->msg_flags = 0;
+  if (total_received >= 0) {
+    size_t remaining = (size_t)total_received;
+    for (size_t i = 0; i < b.iovlen && remaining > 0; i++) {
+      size_t chunk = b.kiov[i].iov_len;
+      if (chunk > remaining)
+        chunk = remaining;
+      if (chunk > 0 &&
+          copy_to_user(b.uiov[i].iov_base, b.kiov[i].iov_base, chunk) != 0) {
+        socket_msg_bounce_free(&b);
+        return (uint64_t)-14;
+      }
+      remaining -= chunk;
+    }
+    if (b.kname && b.user_name && b.kmsg.msg_namelen > 0) {
+      uint32_t copy_len = b.kmsg.msg_namelen;
+      if (copy_len > b.orig_namelen)
+        copy_len = b.orig_namelen;
+      if (copy_to_user(b.user_name, b.kname, copy_len) != 0) {
+        socket_msg_bounce_free(&b);
+        return (uint64_t)-14;
+      }
+    }
+    if (b.kcontrol && b.user_control && b.kmsg.msg_controllen > 0) {
+      size_t copy_len = b.kmsg.msg_controllen;
+      if (copy_len > b.orig_controllen)
+        copy_len = b.orig_controllen;
+      if (copy_to_user(b.user_control, b.kcontrol, copy_len) != 0) {
+        socket_msg_bounce_free(&b);
+        return (uint64_t)-14;
+      }
+    }
+    struct msghdr *umsg = (struct msghdr *)msg_ptr;
+    if (copy_to_user(&umsg->msg_namelen, &b.kmsg.msg_namelen, sizeof(umsg->msg_namelen)) != 0 ||
+        copy_to_user(&umsg->msg_controllen, &b.kmsg.msg_controllen, sizeof(umsg->msg_controllen)) != 0 ||
+        copy_to_user(&umsg->msg_flags, &b.kmsg.msg_flags, sizeof(umsg->msg_flags)) != 0) {
+      socket_msg_bounce_free(&b);
+      return (uint64_t)-14;
+    }
+  }
 
+  socket_msg_bounce_free(&b);
   return (uint64_t)total_received;
 }
 
@@ -754,7 +938,9 @@ static uint64_t sys_sendmmsg(uint64_t sockfd, uint64_t msgvec_ptr, uint64_t vlen
         return (uint64_t)sent_msgs;
       return ret;
     }
-    vec[i].msg_len = (unsigned int)ret;
+    unsigned int mlen = (unsigned int)ret;
+    if (copy_to_user(&vec[i].msg_len, &mlen, sizeof(mlen)) != 0)
+      return (uint64_t)-14;
     sent_msgs++;
   }
 
@@ -789,7 +975,9 @@ static uint64_t sys_recvmmsg(uint64_t sockfd, uint64_t msgvec_ptr, uint64_t vlen
         return (uint64_t)recvd_msgs;
       return ret;
     }
-    vec[i].msg_len = (unsigned int)ret;
+    unsigned int mlen = (unsigned int)ret;
+    if (copy_to_user(&vec[i].msg_len, &mlen, sizeof(mlen)) != 0)
+      return (uint64_t)-14;
     recvd_msgs++;
     if (flags & MSG_DONTWAIT)
       break;
@@ -836,78 +1024,116 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
   socket_t *sock __attribute__((cleanup(socket_release_fd))) =
       socket_from_fd(fd);
   if (!sock)
-  return socket_eno_notsock(fd);
+    return socket_eno_notsock(fd);
 
-  if (!is_user_ptr(optlen_ptr))
-  return (uint64_t)-14;
-
-  int *optlen = (int *)optlen_ptr;
-  if (!is_user_ptr(optval_ptr) && !(optval_ptr == 0 && *optlen == 0))
+  if (!is_user_range((const void *)optlen_ptr, sizeof(int)))
     return (uint64_t)-14;
+
+  int koptlen = 0;
+  if (copy_from_user(&koptlen, (const void *)optlen_ptr, sizeof(int)) != 0)
+    return (uint64_t)-14;
+
+  if (koptlen < 0 || koptlen > 65536)
+    return (uint64_t)-22;
+
+  if (!is_user_ptr(optval_ptr) && !(optval_ptr == 0 && koptlen == 0))
+    return (uint64_t)-14;
+
+  if (optval_ptr != 0 && koptlen > 0 &&
+      !is_user_range((const void *)optval_ptr, (size_t)koptlen))
+    return (uint64_t)-14;
+
+  int orig_optlen = koptlen;
+  void *koptval = NULL;
+  if (optval_ptr != 0 && koptlen > 0) {
+    koptval = kmalloc((size_t)koptlen);
+    if (!koptval)
+      return (uint64_t)-12;
+    if (copy_from_user(koptval, (const void *)optval_ptr, (size_t)koptlen) != 0) {
+      kfree(koptval);
+      return (uint64_t)-14;
+    }
+  }
 
   /* Netlink membership enumeration first queries the required buffer size
    * with a NULL value and zero length. Let the family implement that ABI. */
   if (sock->domain == AF_NETLINK && (int)level == SOL_NETLINK &&
-      (int)optname == NETLINK_LIST_MEMBERSHIPS && sock->ops && sock->ops->getsockopt)
+      (int)optname == NETLINK_LIST_MEMBERSHIPS && sock->ops && sock->ops->getsockopt) {
+    if (koptval) kfree(koptval);
     return (uint64_t)sock->ops->getsockopt(sock, (int)level, (int)optname,
-                                         (void *)optval_ptr, optlen);
+                                         (void *)optval_ptr, (int *)optlen_ptr);
+  }
 
   // Validate optlen
-  if (*optlen < (int)sizeof(int)) {
+  if (koptlen < (int)sizeof(int) || !koptval) {
+    if (koptval) kfree(koptval);
     return (uint64_t)-22; // EINVAL
   }
 
-  void *optval = (void *)optval_ptr;
+  int *val = (int *)koptval;
 
   // Handle socket-level options
   if ((int)level == SOL_SOCKET) {
-    int *val = (int *)optval;
+    int handled = 1;
     switch ((int)optname) {
     case SO_TYPE:
       *val = sock->type;
-      *optlen = sizeof(int);
-      return 0;
+      koptlen = sizeof(int);
+      break;
     case SO_DOMAIN:
       *val = sock->domain;
-      *optlen = sizeof(int);
-      return 0;
+      koptlen = sizeof(int);
+      break;
     case SO_PROTOCOL:
       *val = sock->protocol;
-      *optlen = sizeof(int);
-      return 0;
+      koptlen = sizeof(int);
+      break;
     case SO_ERROR:
       // Let the family report connection errors (e.g. failed non-blocking
       // connect); fall back to the generic socket error.
       if (sock->ops && sock->ops->getsockopt) {
         int ret = sock->ops->getsockopt(sock, (int)level, (int)optname,
-                                        optval, optlen);
-        if (ret == 0)
-        return 0;
+                                        (void *)optval_ptr, (int *)optlen_ptr);
+        if (ret == 0) {
+          kfree(koptval);
+          return 0;
+        }
       }
       *val = socket_get_error(sock);
-      *optlen = sizeof(int);
-      return 0;
+      koptlen = sizeof(int);
+      break;
     case SO_RCVBUF:
       *val = sock->rcvbuf;
-      *optlen = sizeof(int);
-      return 0;
+      koptlen = sizeof(int);
+      break;
     case SO_SNDBUF:
       *val = sock->sndbuf;
-      *optlen = sizeof(int);
-      return 0;
+      koptlen = sizeof(int);
+      break;
     case SO_REUSEADDR:
       *val = sock->reuseaddr;
-      *optlen = sizeof(int);
-      return 0;
-    default:
+      koptlen = sizeof(int);
       break;
+    default:
+      handled = 0;
+      break;
+    }
+    if (handled) {
+      int copy_len = koptlen < orig_optlen ? koptlen : orig_optlen;
+      int err = 0;
+      if ((copy_len > 0 && copy_to_user((void *)optval_ptr, koptval, (size_t)copy_len) != 0) ||
+          copy_to_user((void *)optlen_ptr, &koptlen, sizeof(int)) != 0)
+        err = -14;
+      kfree(koptval);
+      return (uint64_t)(int64_t)err;
     }
   }
 
   // Try family-specific handler
   if (sock->ops && sock->ops->getsockopt) {
-    int ret =
-        sock->ops->getsockopt(sock, (int)level, (int)optname, optval, optlen);
+    kfree(koptval);
+    int ret = sock->ops->getsockopt(sock, (int)level, (int)optname,
+                                    (void *)optval_ptr, (int *)optlen_ptr);
     /* The family owns this option's result. In particular ERANGE must keep
      * the required SO_PEERGROUPS length, and ENOTCONN/EINVAL must not be
      * converted to ENOPROTOOPT by the generic fallback below. */
@@ -919,7 +1145,8 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
   // pipewire/SPA, dbus and other runtimes that probe buffer sizes, timestamps
   // or credentials unconditionally. This mirrors what sys_setsockopt() already
   // does (stub success) so set-then-get stays coherent.
-  if ((int)level == SOL_SOCKET && *optlen >= (int)sizeof(int)) {
+  if ((int)level == SOL_SOCKET && koptlen >= (int)sizeof(int)) {
+    int handled = 1;
     switch ((int)optname) {
     case SO_DONTROUTE:
     case SO_BROADCAST:
@@ -935,16 +1162,17 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
     case 41: // SO_SELECT_ERR_QUEUE
     case 39: // SO_DOMAIN (non-generic sockets)
     case 38: // SO_PROTOCOL (non-generic sockets)
-      *(int *)optval = 0;
-      *optlen = sizeof(int);
-      return 0;
+      *(int *)koptval = 0;
+      koptlen = sizeof(int);
+      break;
     case SO_LINGER: {
       // struct linger { int l_onoff, l_linger; } — report disabled.
-      if (*optlen >= 8) {
-        ((int *)optval)[0] = 0;
-        ((int *)optval)[1] = 0;
-        *optlen = 8;
-        return 0;
+      if (koptlen >= 8) {
+        ((int *)koptval)[0] = 0;
+        ((int *)koptval)[1] = 0;
+        koptlen = 8;
+      } else {
+        handled = 0;
       }
       break;
     }
@@ -952,21 +1180,32 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
     case SO_SNDTIMEO: {
       // struct timeval { long tv_sec, tv_usec; } — report zero timeout.
       // Some callers pass an int-sized buffer; honor that too.
-      if (*optlen >= 16) {
-        ((long *)optval)[0] = 0;
-        ((long *)optval)[1] = 0;
-        *optlen = 16;
-        return 0;
+      if (koptlen >= 16) {
+        ((long *)koptval)[0] = 0;
+        ((long *)koptval)[1] = 0;
+        koptlen = 16;
+      } else {
+        *(int *)koptval = 0;
+        koptlen = sizeof(int);
       }
-      *(int *)optval = 0;
-      *optlen = sizeof(int);
-      return 0;
+      break;
     }
     default:
+      handled = 0;
       break;
+    }
+    if (handled) {
+      int copy_len = koptlen < orig_optlen ? koptlen : orig_optlen;
+      int err = 0;
+      if ((copy_len > 0 && copy_to_user((void *)optval_ptr, koptval, (size_t)copy_len) != 0) ||
+          copy_to_user((void *)optlen_ptr, &koptlen, sizeof(int)) != 0)
+        err = -14;
+      kfree(koptval);
+      return (uint64_t)(int64_t)err;
     }
   }
 
+  kfree(koptval);
   char opt_buf[48];
   snprintf(opt_buf, sizeof(opt_buf), "getsockopt lvl=%d opt=%d", (int)level, (int)optname);
   sysdiag_record_unimplemented_feature("socket", opt_buf, sched_get_current(), -92);
@@ -988,23 +1227,30 @@ static uint64_t sys_setsockopt(uint64_t sockfd, uint64_t level,
     return socket_eno_notsock(fd);
   }
 
+  // Validate optlen — must be at least 1 byte (timeval, int, etc.)
+  if (optlen < 1 || optlen > 65536) {
+    return (uint64_t)-22; // EINVAL
+  }
+
   // Validate pointer
-  if (!is_user_ptr(optval_ptr)) {
+  if (!is_user_range((const void *)optval_ptr, (size_t)optlen)) {
     return (uint64_t)-14; // EFAULT
   }
 
-  const void *optval = (const void *)optval_ptr;
-
-  // Validate optlen — must be at least 1 byte (timeval, int, etc.)
-  if (optlen < 1) {
-    return (uint64_t)-22; // EINVAL
+  void *koptval = kmalloc((size_t)optlen);
+  if (!koptval) {
+    return (uint64_t)-12;
+  }
+  if (copy_from_user(koptval, (const void *)optval_ptr, (size_t)optlen) != 0) {
+    kfree(koptval);
+    return (uint64_t)-14;
   }
 
   // Handle socket-level options. These are remembered on the generic socket
   // and then forwarded to the family handler so TCP/UDP can apply them.
   bool sol_handled = false;
-  if ((int)level == SOL_SOCKET) {
-    const int *val = (const int *)optval;
+  if ((int)level == SOL_SOCKET && optlen >= sizeof(int)) {
+    const int *val = (const int *)koptval;
     switch ((int)optname) {
     case SO_RCVBUF:
     case SO_RCVBUFFORCE: {
@@ -1045,18 +1291,19 @@ static uint64_t sys_setsockopt(uint64_t sockfd, uint64_t level,
   }
 
   // Try family-specific handler
+  kfree(koptval);
   if (sock->ops && sock->ops->setsockopt) {
-    int ret = sock->ops->setsockopt(sock, (int)level, (int)optname, optval,
-                                    (int)optlen);
+    int ret = sock->ops->setsockopt(sock, (int)level, (int)optname,
+                                    (const void *)optval_ptr, (int)optlen);
     /* A generic option can fall back when the family does not implement it,
      * but recognized invalid lengths or copy faults must reach the caller. */
     if (sol_handled && ret == -92)
-    return 0;
+      return 0;
     return (uint64_t)ret;
   }
 
   if (sol_handled)
-  return 0;
+    return 0;
 
   // Default stub for common SOL_SOCKET options if not handled by family
   if ((int)level == SOL_SOCKET) {

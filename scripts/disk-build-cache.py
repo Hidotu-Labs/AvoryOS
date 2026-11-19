@@ -131,6 +131,12 @@ def restore(args):
         # Refresh the incremental partition from the pristine image as well:
         # the old cache may include guest writes or earlier app patches.
         apps.cache_partition(temp, args.partition_cache)
+        checked = subprocess.run([
+            'bash', ROOT / 'scripts/verify-desktop-image.sh', args.partition_cache,
+        ])
+        if checked.returncode:
+            print('Pristine cache has stale desktop startup files; rebuilding disk.', flush=True)
+            return 3
         if metadata['fingerprint'] != build_key(args):
             print('Build inputs changed during restore; rebuilding from current inputs.', flush=True)
             return 3

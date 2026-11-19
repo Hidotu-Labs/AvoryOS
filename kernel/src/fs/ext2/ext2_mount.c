@@ -251,12 +251,13 @@ int ext2_mount(struct block_device *dev, vfs_node_t *mountpoint) {
   mountpoint->length  = root_inode.i_size;
   mountpoint->device  = mnt;
   mountpoint->readdir = ext2_readdir_impl;
-  mountpoint->finddir = ext2_finddir_impl;
+  mountpoint->finddir = ext2_finddir_vfs;
   mountpoint->create  = ext2_create_impl;
   mountpoint->mkdir   = ext2_mkdir_impl;
   mountpoint->unlink  = ext2_unlink_impl;
   mountpoint->rmdir   = ext2_rmdir_impl;
   mountpoint->symlink = ext2_symlink_impl;
+  mountpoint->link    = ext2_link_impl;
   mountpoint->rename  = ext2_rename_impl;
   mountpoint->chmod   = ext2_chmod_impl;
   mountpoint->chown   = ext2_chown_impl;

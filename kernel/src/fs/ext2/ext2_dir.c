@@ -267,7 +267,7 @@ int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
       kfree(block_buf);
       return -1;
     }
-    new_block = allocated;
+    new_block = allocated; // ext4_alloc_extent() already charged i_blocks
   } else {
     new_block = ext2_alloc_block(mnt);
     if (!new_block ||
@@ -277,9 +277,9 @@ int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
       kfree(block_buf);
       return -1;
     }
+    dir_inode.i_blocks += mnt->block_size / 512;
   }
   dir_inode.i_size   += mnt->block_size;
-  dir_inode.i_blocks += mnt->block_size / 512;
 
   memset(block_buf, 0, mnt->block_size);
   ext2_dirent_t *new_entry = (ext2_dirent_t *)block_buf;

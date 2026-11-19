@@ -185,6 +185,10 @@ typedef int (*unlink_type_t)(struct vfs_node *, char *name);
 typedef int (*rmdir_type_t)(struct vfs_node *, char *name);
 typedef int (*readlink_type_t)(struct vfs_node *, char *buf, uint32_t size);
 typedef int (*symlink_type_t)(struct vfs_node *, char *name, char *target);
+/* Hard link: add `name` in this directory for the existing inode `target`
+ * (same filesystem). Returns 0 or a negative errno. */
+typedef int (*link_type_t)(struct vfs_node *dir, char *name,
+                           struct vfs_node *target);
 typedef int (*rename_type_t)(struct vfs_node *, char *old_name, char *new_name);
 typedef int (*chmod_type_t)(struct vfs_node *, uint16_t permission);
 typedef int (*chown_type_t)(struct vfs_node *, uint32_t uid, uint32_t gid);
@@ -258,6 +262,7 @@ typedef struct vfs_node {
   readlink_type_t readlink;
   struct vfs_node *(*get_link)(struct vfs_node *); /* Owned proc magic-link target. */
   symlink_type_t symlink;
+  link_type_t link;
   rename_type_t rename;
   chmod_type_t chmod;
   chown_type_t chown;
@@ -315,6 +320,10 @@ typedef struct vfs_node {
   uint32_t ra_prev_offset;
   uint32_t ra_window;
   uint32_t ra_seq_hits;
+  /* Serializes position-based write()s to a regular file (Linux holds the
+   * inode lock for this): read f_pos, write, advance as one step. */
+  uint32_t write_pos_lock;
+  uint32_t fault_ra_window; // async window queued by cold mmap faults
 
   /* Optional sequential readdir cursor used by filesystems with indexed API. */
   uint64_t readdir_cursor_cookie;
@@ -429,7 +438,10 @@ void vfs_node_set_parent(vfs_node_t *node, vfs_node_t *parent);
 int vfs_mount(vfs_node_t *mountpoint, vfs_node_t *target);
 /* `path` is the mountpoint as userspace sees it ("/run", "/tmp", ...).  It is
  * what /proc/mounts reports and what mountinfo(1)-style consumers match on;
- * pass NULL to fall back to the mountpoint node's own name. */
+ * pass NULL to fall back to the mountpoint node's own name.
+ * Initial-namespace mounts consume one target reference on success and
+ * acquire their own reference to a distinct mountpoint. Namespace-local
+ * mounts acquire both references and leave the caller's references intact. */
 int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
                  const char *dev_name, const char *fs_type,
                  const char *path);
@@ -529,6 +541,12 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
 uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_bytes);
 void vfs_cache_prefetch_async(vfs_node_t *node, uint32_t offset,
                               uint32_t length);
+void vfs_cache_fault_readahead(vfs_node_t *node, uint32_t offset);
+/* Demand-based exec prefetch (page_cache.c): record a cold fault of the
+ * process running `exe`, and queue its recorded windows at the next exec. */
+void vfs_exec_profile_note_cold(vfs_node_t *node, uint32_t offset,
+                                const char *exe, uint64_t cold_index);
+void vfs_exec_profile_prefetch(const char *exe);
 bool vfs_cache_phase4_stress_test(void);
 bool vfs_cache_phase5_stress_test(void);
 

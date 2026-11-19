@@ -8,6 +8,7 @@
 
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
+#include "../cpu/features.h"
 #include "../lock/lockdiag.h"
 #include "../lock/spinlock.h"
 #include "../mm/vmm.h"
@@ -349,6 +350,28 @@ static inline int futex_get_key(uint32_t *uaddr, bool private,
 }
 
 // FUTEX_WAIT
+static inline uint32_t futex_uaccess_load32(const uint32_t *uaddr, int memorder) {
+  user_access_begin();
+  uint32_t v = __atomic_load_n(uaddr, memorder);
+  user_access_end();
+  return v;
+}
+
+static inline void futex_uaccess_store32(uint32_t *uaddr, uint32_t val, int memorder) {
+  user_access_begin();
+  __atomic_store_n(uaddr, val, memorder);
+  user_access_end();
+}
+
+static inline bool futex_uaccess_cas32(uint32_t *uaddr, uint32_t *expected,
+                                       uint32_t desired) {
+  user_access_begin();
+  bool ok = __atomic_compare_exchange_n(uaddr, expected, desired, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+  user_access_end();
+  return ok;
+}
+
 // Atomically check that *uaddr == val, then block the calling thread.
 // If a timeout is specified, the thread will be woken after the timeout.
 // Returns 0 on success (woken by FUTEX_WAKE).
@@ -412,7 +435,7 @@ static uint64_t futex_wait(uint32_t *uaddr, uint32_t val,
 
   // Re-read user value with SEQ_CST barrier to pair with lockless futex_wake_key check.
   // If *uaddr changed since caller read it, we must not block (Linux returns -EAGAIN).
-  uint32_t current_val = __atomic_load_n(uaddr, __ATOMIC_SEQ_CST);
+  uint32_t current_val = futex_uaccess_load32(uaddr, __ATOMIC_SEQ_CST);
   if (current_val != val) {
     futex_dequeue(bucket, &waiter);
     spinlock_release(&futex_hash[bucket].lock);
@@ -731,7 +754,7 @@ static uint64_t futex_cmp_requeue(uint32_t *uaddr1, uint32_t val, uint32_t val2,
 
     if (first_pass) {
       first_pass = false;
-      uint32_t cur = __atomic_load_n(uaddr1, __ATOMIC_RELAXED);
+      uint32_t cur = futex_uaccess_load32(uaddr1, __ATOMIC_RELAXED);
       if (cur != val3) {
         futex_bucket_release(bucket1, bucket2, lock_flags);
         hal_irq_restore(irq_flags);
@@ -811,25 +834,35 @@ static uint64_t futex_wake_op(uint32_t *uaddr, uint32_t val,
     return (uint64_t)(-(int64_t)EFAULT);
 
   // Atomically apply the operation to *uaddr2 and capture the old value
-  uint32_t old_val;
-  switch (op_code) {
-  case FUTEX_OP_SET:
-    old_val = __atomic_exchange_n(uaddr2, oparg, __ATOMIC_SEQ_CST);
-    break;
-  case FUTEX_OP_ADD:
-    old_val = __atomic_fetch_add(uaddr2, oparg, __ATOMIC_SEQ_CST);
-    break;
-  case FUTEX_OP_OR:
-    old_val = __atomic_fetch_or(uaddr2, oparg, __ATOMIC_SEQ_CST);
-    break;
-  case FUTEX_OP_ANDN:
-    old_val = __atomic_fetch_and(uaddr2, ~oparg, __ATOMIC_SEQ_CST);
-    break;
-  case FUTEX_OP_XOR:
-    old_val = __atomic_fetch_xor(uaddr2, oparg, __ATOMIC_SEQ_CST);
-    break;
-  default:
-    return (uint64_t)(-(int64_t)EINVAL);
+  uint32_t old_val = 0;
+  if (copy_from_user(&old_val, uaddr2, sizeof(old_val)) != 0)
+    return (uint64_t)(-(int64_t)EFAULT);
+  for (;;) {
+    uint32_t new_val;
+    switch (op_code) {
+    case FUTEX_OP_SET:
+      new_val = oparg;
+      break;
+    case FUTEX_OP_ADD:
+      new_val = old_val + oparg;
+      break;
+    case FUTEX_OP_OR:
+      new_val = old_val | oparg;
+      break;
+    case FUTEX_OP_ANDN:
+      new_val = old_val & ~oparg;
+      break;
+    case FUTEX_OP_XOR:
+      new_val = old_val ^ oparg;
+      break;
+    default:
+      return (uint64_t)(-(int64_t)EINVAL);
+    }
+    int rc = cmpxchg_user_u32(uaddr2, &old_val, new_val);
+    if (rc < 0)
+      return (uint64_t)(-(int64_t)EFAULT);
+    if (rc == 1)
+      break;
   }
 
   // Wake up to val threads waiting on uaddr (always)
@@ -934,7 +967,7 @@ static uint64_t futex_pi_lock(uint32_t *uaddr, bool private,
 retry:
   /* Uncontended / recover-from-dead-owner fast path. */
   for (;;) {
-    uint32_t cur = __atomic_load_n(uaddr, __ATOMIC_ACQUIRE);
+    uint32_t cur = futex_uaccess_load32(uaddr, __ATOMIC_ACQUIRE);
     uint32_t owner = cur & FUTEX_TID_MASK;
 
     if (owner == self_tid)
@@ -943,8 +976,7 @@ retry:
     if (owner == 0) {
       /* Keep FUTEX_WAITERS so a racing unlock still knows to look. */
       uint32_t newv = (cur & FUTEX_WAITERS) | self_tid;
-      if (__atomic_compare_exchange_n(uaddr, &cur, newv, false,
-                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      if (futex_uaccess_cas32(uaddr, &cur, newv))
         return 0;
       continue;
     }
@@ -953,8 +985,7 @@ retry:
       /* The owner died without unlocking.  Take the lock and leave
        * FUTEX_OWNER_DIED set so robust userspace can clean up. */
       uint32_t newv = (cur & FUTEX_WAITERS) | self_tid | FUTEX_OWNER_DIED;
-      if (__atomic_compare_exchange_n(uaddr, &cur, newv, false,
-                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+      if (futex_uaccess_cas32(uaddr, &cur, newv))
         return 0;
       continue;
     }
@@ -977,11 +1008,10 @@ retry:
 
   /* Mark that unlockers must go through the kernel for this word. */
   for (;;) {
-    uint32_t cur = __atomic_load_n(uaddr, __ATOMIC_ACQUIRE);
+    uint32_t cur = futex_uaccess_load32(uaddr, __ATOMIC_ACQUIRE);
     if (cur & FUTEX_WAITERS)
       break;
-    if (__atomic_compare_exchange_n(uaddr, &cur, cur | FUTEX_WAITERS, false,
-                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    if (futex_uaccess_cas32(uaddr, &cur, cur | FUTEX_WAITERS))
       break;
   }
 
@@ -1001,7 +1031,7 @@ retry:
 
   /* Re-check under the bucket lock: the owner may have released (or died)
    * while the waiters bit was being set. */
-  uint32_t cur = __atomic_load_n(uaddr, __ATOMIC_RELAXED);
+  uint32_t cur = futex_uaccess_load32(uaddr, __ATOMIC_RELAXED);
   uint32_t owner = cur & FUTEX_TID_MASK;
   if (owner == 0 || owner == self_tid || futex_pi_owner_gone(owner)) {
     spinlock_release(&futex_hash[bucket].lock);
@@ -1074,7 +1104,7 @@ static uint64_t futex_pi_unlock(uint32_t *uaddr, bool private) {
   if (!self)
     return (uint64_t)(-(int64_t)EFAULT);
 
-  uint32_t cur = __atomic_load_n(uaddr, __ATOMIC_ACQUIRE);
+  uint32_t cur = futex_uaccess_load32(uaddr, __ATOMIC_ACQUIRE);
   if ((cur & FUTEX_TID_MASK) != self->tid)
     return (uint64_t)(-(int64_t)EPERM);
 
@@ -1094,7 +1124,7 @@ static uint64_t futex_pi_unlock(uint32_t *uaddr, bool private) {
 
   if (!next) {
     /* No blocked waiter (or a stale FUTEX_WAITERS bit): release. */
-    __atomic_store_n(uaddr, 0, __ATOMIC_RELEASE);
+    futex_uaccess_store32(uaddr, 0, __ATOMIC_RELEASE);
     futex_bucket_release(bucket, bucket, lock_flags);
     hal_irq_restore(irq_flags);
     return 0;
@@ -1113,7 +1143,7 @@ static uint64_t futex_pi_unlock(uint32_t *uaddr, bool private) {
   }
 
   next->acquired = true;
-  __atomic_store_n(uaddr, newv, __ATOMIC_RELEASE);
+  futex_uaccess_store32(uaddr, newv, __ATOMIC_RELEASE);
   /* Hand the lock over outside the bucket lock; the claim keeps the waiter's
    * stack alive until the wake lands (see the deferred wake note above). */
   struct thread *woken = next->thread;

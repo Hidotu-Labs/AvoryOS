@@ -92,13 +92,19 @@ void fill_kstat(struct kstat *ks, vfs_node_t *node) {
 
 static uint64_t copy_statat_result(void *, const struct kstat *, bool);
 
+static void stat_path_release(char **path) { if (*path) kfree(*path); }
+
 static uint64_t sys_stat(uint64_t path_ptr, uint64_t statbuf_ptr, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
-    const char *path = (const char *)path_ptr;
     struct kstat *ks  = (struct kstat *)statbuf_ptr;
-    if (!path || !ks || !is_user_ptr((uint64_t)ks))
+    if (!path_ptr || !ks || !is_user_ptr((uint64_t)ks))
         return (uint64_t)-14;
+    char *path __attribute__((cleanup(stat_path_release))) = kmalloc(4096);
+    if (!path) return (uint64_t)-12;
+    long length = strncpy_from_user(path, (const void *)path_ptr, 4096);
+    if (length < 0) return (uint64_t)length;
+    if (length >= 4096) return (uint64_t)-36;
 
     struct thread *t = sched_get_current();
     vfs_node_t *node  = NULL;
@@ -116,19 +122,24 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t statbuf_ptr, uint64_t a2,
     if (!node) {
         return (uint64_t)-2;
     }
-    fill_kstat(ks, node);
+    struct kstat result = {0};
+    fill_kstat(&result, node);
     if (node_owned)
         vfs_close(node);
-    return 0;
+    return copy_statat_result(ks, &result, t && t->seccomp_compat_dispatch);
 }
 
 static uint64_t sys_lstat(uint64_t path_ptr, uint64_t statbuf_ptr, uint64_t a2,
                            uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
-    const char *path = (const char *)path_ptr;
     struct kstat *ks  = (struct kstat *)statbuf_ptr;
-    if (!path || !ks || !is_user_ptr((uint64_t)ks))
+    if (!path_ptr || !ks || !is_user_ptr((uint64_t)ks))
         return (uint64_t)-14;
+    char *path __attribute__((cleanup(stat_path_release))) = kmalloc(4096);
+    if (!path) return (uint64_t)-12;
+    long length = strncpy_from_user(path, (const void *)path_ptr, 4096);
+    if (length < 0) return (uint64_t)length;
+    if (length >= 4096) return (uint64_t)-36;
 
     struct thread *t = sched_get_current();
     vfs_node_t *base  = (t && t->cwd_node && path[0] != '/') ? t->cwd_node : fs_root;
@@ -138,9 +149,10 @@ static uint64_t sys_lstat(uint64_t path_ptr, uint64_t statbuf_ptr, uint64_t a2,
         return sys_stat(path_ptr, statbuf_ptr, a2, a3, a4, a5);
     }
 
-    fill_kstat(ks, node);
+    struct kstat result = {0};
+    fill_kstat(&result, node);
     vfs_close(node);
-    return 0;
+    return copy_statat_result(ks, &result, t && t->seccomp_compat_dispatch);
 }
 
 static uint64_t sys_fstat(uint64_t fd, uint64_t statbuf_ptr, uint64_t a2,
@@ -417,7 +429,6 @@ static uint64_t copy_statat_result(void *out, const struct kstat *ks, bool compa
     return copy_to_user(out, &result, sizeof(result)) ? (uint64_t)-14 : 0;
 }
 
-static void stat_path_release(char **path) { if (*path) kfree(*path); }
 
 static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
                                 uint64_t statbuf_ptr, uint64_t flags,
@@ -469,7 +480,7 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
     if ((node->flags & FS_TYPE_MASK) != FS_DIRECTORY) return (uint64_t)-20;
 
     uint8_t *buf = (uint8_t *)dirp;
-    if (!buf || !is_user_ptr((uint64_t)buf)) return (uint64_t)-14;
+    if (!buf || !is_user_range(buf, count)) return (uint64_t)-14;
 
     size_t   written = 0;
     uint64_t cookie  = fd_offset_get(t, fd);
@@ -483,8 +494,13 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
         entry_size = (entry_size + 7) & ~7;
         if (written + entry_size > count) break;
 
-        struct linux_dirent64 *entry = (struct linux_dirent64 *)(buf + written);
-        memset(buf + written, 0, entry_size);
+        uint8_t stack_entry[512];
+        uint8_t *kbuf = entry_size <= sizeof(stack_entry)
+                            ? stack_entry
+                            : (uint8_t *)kmalloc(entry_size);
+        if (!kbuf) return written ? written : (uint64_t)-12;
+        memset(kbuf, 0, entry_size);
+        struct linux_dirent64 *entry = (struct linux_dirent64 *)kbuf;
         entry->d_ino    = de->ino;
         entry->d_off    = de->d_off;
         entry->d_reclen = (uint16_t)entry_size;
@@ -493,6 +509,9 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count,
         entry->d_type   = de->d_type;
 
         strcpy(entry->d_name, de->name);
+        int copy_err = copy_to_user(buf + written, kbuf, entry_size) != 0;
+        if (kbuf != stack_entry) kfree(kbuf);
+        if (copy_err) return written ? written : (uint64_t)-14;
         written += entry_size;
         cookie = de->d_off;
     }
@@ -512,7 +531,7 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
     if ((node->flags & FS_TYPE_MASK) != FS_DIRECTORY) return (uint64_t)-20;
 
     uint8_t *buf = (uint8_t *)dirp;
-    if (!buf || !vmm_is_user_addr_range_valid(dirp, count)) return (uint64_t)-14;
+    if (!buf || !is_user_range(buf, count)) return (uint64_t)-14;
 
     size_t   written = 0;
     uint64_t cookie  = fd_offset_get(t, fd);
@@ -525,12 +544,20 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
         entry_size = (entry_size + 7) & ~7;
         if (written + entry_size > count) break;
 
-        struct linux_dirent *entry = (struct linux_dirent *)(buf + written);
-        memset(buf + written, 0, entry_size);
+        uint8_t stack_entry[512];
+        uint8_t *kbuf = entry_size <= sizeof(stack_entry)
+                            ? stack_entry
+                            : (uint8_t *)kmalloc(entry_size);
+        if (!kbuf) return written ? written : (uint64_t)-12;
+        memset(kbuf, 0, entry_size);
+        struct linux_dirent *entry = (struct linux_dirent *)kbuf;
         entry->d_ino    = de->ino;
         entry->d_off    = de->d_off;
         entry->d_reclen = (uint16_t)entry_size;
         strcpy(entry->d_name, de->name);
+        int copy_err = copy_to_user(buf + written, kbuf, entry_size) != 0;
+        if (kbuf != stack_entry) kfree(kbuf);
+        if (copy_err) return written ? written : (uint64_t)-14;
         written += entry_size;
         cookie = de->d_off;
     }

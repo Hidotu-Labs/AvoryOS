@@ -355,6 +355,7 @@ void sched_init(void) {
 
     idle_thread->stack_size = CPU_STACK_SIZE;
     idle_thread->stack_base = cpu->stack_top - CPU_STACK_SIZE;
+    idle_thread->stack_canary = cpu->stack_canary;
     idle_thread->parent = NULL;
     fpu_init_thread(idle_thread);
 
@@ -927,6 +928,11 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
         prev->pkru = rdpkru();
       if (!prev || !prev->mm || next_t->pkru != prev->pkru)
         wrpkru(next_t->pkru);
+    }
+
+    if (cpu_has_ibpb_flag && next_t->cr3 != 0 &&
+        (!prev || prev->cr3 != next_t->cr3)) {
+      wrmsr(IA32_PRED_CMD, PRED_CMD_IBPB);
     }
 
     spinlock_release(&cpu->queue_lock);

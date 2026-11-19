@@ -234,7 +234,28 @@ typedef struct {
   const char *phase;
 } ext3_journal_state_t;
 
-#define EXT2_CACHE_SIZE 2048
+/* Metadata block cache: a demand-grown hash table with LRU eviction.  Write
+ * ordering lives in a separate fixed table (bc_seq) so cached images can be
+ * evicted at any time without losing the in-flight-write protection. */
+#define EXT2_BC_BUCKETS 8192
+#define EXT2_SEQ_BUCKETS 2048
+#define EXT2_INFLIGHT_MAX_BLOCKS 32
+
+typedef struct ext2_inflight_write {
+  struct ext2_inflight_write *next;
+  uint32_t owner_tid;
+  uint32_t count;
+  uint64_t blocks[EXT2_INFLIGHT_MAX_BLOCKS];
+} ext2_inflight_write_t;
+/* Soft cap on cached blocks as a share of RAM; the shrinker trims below it. */
+#define EXT2_BC_RAM_PERCENT 5
+
+typedef struct ext2_bc_entry {
+  uint64_t num;
+  uint8_t *data;
+  struct ext2_bc_entry *hnext;
+  struct ext2_bc_entry *lru_prev, *lru_next;
+} ext2_bc_entry_t;
 #define EXT2_DIRTY_BGD_MAX 64
 
 typedef struct ext2_mount {
@@ -254,16 +275,21 @@ typedef struct ext2_mount {
    * driver does not implement. All VFS writes and block writes must reject. */
   bool read_only;
   vfs_node_t *root_node;
+  /* All bc_* fields are protected by cache_lock. */
+  ext2_bc_entry_t *bc_hash[EXT2_BC_BUCKETS];
+  ext2_bc_entry_t *bc_lru_head; // most recently used
+  ext2_bc_entry_t *bc_lru_tail; // eviction candidate
+  uint32_t bc_count;
+  uint64_t bc_hits, bc_misses, bc_evictions;
+  /* Misses must not install an image read across a write, even if the
+   * writer's cache entry has since been evicted.  Shared by every block that
+   * hashes to the bucket; a collision only causes a conservative retry. */
   struct {
-    uint64_t num;
-    uint8_t *data;
-    /* Protected by cache_lock. Misses must not install an image read across
-     * a write, even if another block has evicted the writer's cache entry. */
     uint64_t write_seq;
     uint32_t writes_inflight;
-  } cache[EXT2_CACHE_SIZE];
+  } bc_seq[EXT2_SEQ_BUCKETS];
   spinlock_t cache_lock;
-  uint32_t cache_shrink_cursor;
+  ext2_inflight_write_t *inflight_writes;
   struct ext2_mount *next;
   /* Group-descriptor table and superblock counters are mutated in memory by
    * the block/inode allocators.  The on-disk copies are only updated once per
@@ -285,6 +311,11 @@ int ext2_unmount(vfs_node_t *root);
 int ext2_mount_root(struct block_device *dev);
 int ext2_statfs_impl(vfs_node_t *node, struct statfs_buf *buf);
 int ext2_read_block(ext2_mount_t *mnt, uint64_t block_num, void *buffer);
+int ext2_read_block_data(ext2_mount_t *mnt, uint64_t block_num, void *buffer);
+int ext2_write_block_nocache(ext2_mount_t *mnt, uint64_t block_num,
+                             const void *buffer, const char **phase,
+                             const char *const stages[4]);
+bool ext2_bc_matches(ext2_mount_t *mnt, uint64_t num, const void *data);
 int ext2_write_block(ext2_mount_t *mnt, uint64_t block_num, const void *buffer);
 int ext2_read_inode(ext2_mount_t *mnt, uint32_t inode_num, ext2_inode_t *out);
 uint64_t ext2_get_block_num(ext2_mount_t *mnt, ext2_inode_t *inode, uint32_t logical_block);

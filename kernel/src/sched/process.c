@@ -220,14 +220,11 @@ static bool elf_read_phdr(vfs_node_t *file, const Elf64_Ehdr *ehdr,
   return true;
 }
 
-static bool do_elf_load(const char *path, uint64_t *pml4,
-                        uint64_t requested_base, bool is_interp,
-                        elf_info_t *out_info, char *interp_path,
-                        size_t interp_max_len) {
-  (void)pml4;
+/* Resolves a PT_INTERP name or a direct exec.  Relative names use the caller's
+ * cwd, just like the permission/shebang lookup in sys_execve.  The returned
+ * node carries a reference owned by the caller. */
+static vfs_node_t *elf_open_path(const char *path) {
   struct thread *current_thread = sched_get_current();
-  /* Relative exec and relative PT_INTERP names use the caller's cwd, just
-   * like the permission/shebang lookup in sys_execve. */
   vfs_node_t *base = path[0] == '/' ? fs_root :
       (current_thread && current_thread->cwd_node ? current_thread->cwd_node
                                                  : fs_root);
@@ -236,8 +233,127 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
     klog_puts("[PROC] ELF load failed: File not found: ");
     klog_puts(path);
     klog_puts("\n");
-    return false;
   }
+  return file;
+}
+
+/* ── Exec metadata cache ────────────────────────────────────────────────────
+ * Parsed headers, the program-header table and the PT_INTERP name of recently
+ * loaded images.  A repeat launch of the same file skips those reads.  An entry
+ * matches on node pointer, length and mtime.  While cached, an entry holds a
+ * reference to its node, so the pointer cannot be reused for another file.
+ * A slot is published (valid) only after its filler finishes, and a slot in use
+ * (users > 0) is never evicted. */
+#define ELF_META_SLOTS 32
+#define ELF_META_PHDR_BYTES (32 * sizeof(Elf64_Phdr))
+
+struct elf_meta_entry {
+  vfs_node_t *node;
+  uint32_t length;
+  uint32_t mtime;
+  uint32_t users;     /* loaders pinning the slot */
+  uint64_t stamp;     /* last-use counter for LRU eviction */
+  bool valid;         /* usable by a hit */
+  bool complete;      /* filler stored the header and the phdr table */
+  bool compat32;
+  bool interp_known;  /* interp[] holds the PT_INTERP name ("" if none) */
+  uint32_t phdr_bytes;
+  Elf64_Ehdr ehdr;
+  char interp[256];
+  uint8_t phdrs[ELF_META_PHDR_BYTES];
+};
+
+static struct elf_meta_entry elf_meta[ELF_META_SLOTS];
+static uint64_t elf_meta_clock;
+static spinlock_t elf_meta_lock = SPINLOCK_INIT;
+
+/* Returns a pinned slot.  On a hit *hit is true and the slot is valid.  On a
+ * miss the slot is claimed for filling and stays invalid until
+ * elf_meta_close().  Returns NULL when every slot is pinned; the load then runs
+ * uncached. */
+static struct elf_meta_entry *elf_meta_open(vfs_node_t *file, bool *hit) {
+  struct elf_meta_entry *pick = NULL;
+  vfs_node_t *evicted = NULL;
+  *hit = false;
+
+  spinlock_acquire(&elf_meta_lock);
+  for (int i = 0; i < ELF_META_SLOTS; i++) {
+    struct elf_meta_entry *e = &elf_meta[i];
+    if (e->valid && e->node == file && e->length == file->length &&
+        e->mtime == file->mtime) {
+      e->users++;
+      e->stamp = ++elf_meta_clock;
+      *hit = true;
+      spinlock_release(&elf_meta_lock);
+      return e;
+    }
+  }
+
+  /* Miss.  Prefer an unpinned slot that already holds this node (its reference
+   * is reused); otherwise evict the least recently used unpinned slot, empty
+   * slots first. */
+  for (int i = 0; i < ELF_META_SLOTS; i++) {
+    struct elf_meta_entry *e = &elf_meta[i];
+    if (!e->users && e->node == file) {
+      pick = e;
+      break;
+    }
+  }
+  if (!pick) {
+    for (int i = 0; i < ELF_META_SLOTS; i++) {
+      struct elf_meta_entry *e = &elf_meta[i];
+      if (e->users)
+        continue;
+      if (!pick || (!e->node && pick->node) ||
+          (!!e->node == !!pick->node && e->stamp < pick->stamp))
+        pick = e;
+    }
+    if (pick) {
+      evicted = pick->node;
+      vfs_node_ref(file);
+      pick->node = file;
+    }
+  }
+  if (!pick) {
+    spinlock_release(&elf_meta_lock);
+    return NULL;
+  }
+  pick->length = file->length;
+  pick->mtime = file->mtime;
+  pick->users = 1;
+  pick->stamp = ++elf_meta_clock;
+  pick->valid = false;
+  pick->complete = false;
+  pick->interp_known = false;
+  spinlock_release(&elf_meta_lock);
+
+  if (evicted)
+    vfs_close(evicted);
+  return pick;
+}
+
+static void elf_meta_close(struct elf_meta_entry *e) {
+  if (!e)
+    return;
+  spinlock_acquire(&elf_meta_lock);
+  e->valid = e->complete;
+  e->users--;
+  spinlock_release(&elf_meta_lock);
+}
+
+/* Consumes the caller's reference to `file`: it is closed on every return path
+ * (the VMAs for PT_LOAD segments hold their own references).  `meta` is the
+ * slot from elf_meta_open(); `meta_hit` says it is valid and its header, table
+ * and interpreter name may be used in place of file reads. */
+static bool do_elf_load_body(vfs_node_t *file, uint64_t *pml4,
+                             uint64_t requested_base, bool is_interp,
+                             elf_info_t *out_info, char *interp_path,
+                             size_t interp_max_len,
+                             struct elf_meta_entry *meta, bool meta_hit) {
+  (void)pml4;
+  struct thread *current_thread = sched_get_current();
+  bool compat32 = false;
+  size_t phdr_size = 0;
 
   TSC_BEGIN(elf_phdr);
   // Normalize the ELF32 header; the segment mapper uses 64-bit arithmetic.
@@ -270,7 +386,9 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
                                         uint64_t p_vaddr, uint64_t p_filesz,
                                         uint64_t p_memsz,
                                         struct rust_elf_load_layout *out);
-
+#endif
+  if (!meta_hit) {
+#ifdef USE_RUST_ELF
   uint8_t raw_ehdr[sizeof(Elf64_Ehdr)];
   int64_t ehdr_read = vfs_read(file, 0, sizeof(raw_ehdr), raw_ehdr);
   if (ehdr_read < (int64_t)sizeof(Elf32_Ehdr))
@@ -278,7 +396,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
   struct rust_elf_header_norm norm;
   if (!rust_elf_parse_header(raw_ehdr, (size_t)ehdr_read, file->length, &norm))
     goto bad_header;
-  bool compat32 = norm.compat32;
+  compat32 = norm.compat32;
   ehdr.e_type = norm.e_type;
   ehdr.e_machine = norm.e_machine;
   ehdr.e_version = norm.e_version;
@@ -287,7 +405,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
   ehdr.e_ehsize = norm.e_ehsize;
   ehdr.e_phentsize = norm.e_phentsize;
   ehdr.e_phnum = norm.e_phnum;
-  size_t phdr_size = compat32 ? sizeof(Elf32_Phdr) : sizeof(Elf64_Phdr);
+  phdr_size = compat32 ? sizeof(Elf32_Phdr) : sizeof(Elf64_Phdr);
 #else
   uint8_t ident[16];
   if (vfs_read(file, 0, sizeof(ident), ident) != sizeof(ident) ||
@@ -295,7 +413,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
       ident[3] != 'F' || (ident[4] != 1 && ident[4] != 2) ||
       ident[5] != 1 || ident[6] != 1)
     goto bad_header;
-  bool compat32 = ident[4] == 1;
+  compat32 = ident[4] == 1;
   if (compat32) {
     Elf32_Ehdr e;
     if (vfs_read(file, 0, sizeof(e), (uint8_t *)&e) != sizeof(e))
@@ -308,7 +426,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
   } else if (vfs_read(file, 0, sizeof(ehdr), (uint8_t *)&ehdr) != sizeof(ehdr)) {
     goto bad_header;
   }
-  size_t phdr_size = compat32 ? sizeof(Elf32_Phdr) : sizeof(Elf64_Phdr);
+  phdr_size = compat32 ? sizeof(Elf32_Phdr) : sizeof(Elf64_Phdr);
   if (ehdr.e_machine != (compat32 ? 3 : 62) || ehdr.e_version != 1 ||
       ehdr.e_ehsize != (compat32 ? sizeof(Elf32_Ehdr) : sizeof(Elf64_Ehdr)) ||
       (ehdr.e_type != ET_EXEC && ehdr.e_type != ET_DYN) ||
@@ -317,6 +435,11 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
       ehdr.e_phoff + (uint64_t)ehdr.e_phnum * ehdr.e_phentsize > file->length)
     goto bad_header;
 #endif
+  } else {
+    ehdr = meta->ehdr;
+    compat32 = meta->compat32;
+    phdr_size = compat32 ? sizeof(Elf32_Phdr) : sizeof(Elf64_Phdr);
+  }
   if (compat32 && is_interp)
     requested_base = ELF32_INTERP_BASE;
 
@@ -326,17 +449,45 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
   // e_phentsize values fall back to per-header reads in the loop below.
   uint32_t phdr_tab_bytes = (uint32_t)ehdr.e_phnum * ehdr.e_phentsize;
   uint8_t *phdr_tab = NULL;
-  if (phdr_tab_bytes > 0 && phdr_tab_bytes <= 64 * 1024 &&
-      ehdr.e_phentsize == phdr_size) {
-    phdr_tab = kmalloc(phdr_tab_bytes);
+  bool phdr_tab_owned = false;
+  if (meta_hit) {
+    phdr_tab = meta->phdrs;
+    phdr_tab_bytes = meta->phdr_bytes;
+  } else if (phdr_tab_bytes > 0 && phdr_tab_bytes <= 64 * 1024 &&
+             ehdr.e_phentsize == phdr_size) {
+    /* A claimed slot holds the table when it fits, so a miss needs no kmalloc. */
+    if (meta && phdr_tab_bytes <= sizeof(meta->phdrs)) {
+      phdr_tab = meta->phdrs;
+    } else {
+      phdr_tab = kmalloc(phdr_tab_bytes);
+      phdr_tab_owned = phdr_tab != NULL;
+    }
     if (phdr_tab &&
         vfs_read(file, ehdr.e_phoff, phdr_tab_bytes, phdr_tab) !=
             phdr_tab_bytes) {
-      kfree(phdr_tab);
+      if (phdr_tab_owned)
+        kfree(phdr_tab);
       phdr_tab = NULL;
+      phdr_tab_owned = false;
+    }
+    if (meta && phdr_tab == meta->phdrs) {
+      meta->ehdr = ehdr;
+      meta->compat32 = compat32;
+      meta->phdr_bytes = phdr_tab_bytes;
+      meta->complete = true;
     }
   }
   TSC_END(elf_phdr);
+
+  /* A cached PT_INTERP name replaces the read in the segment loop below. */
+  bool interp_from_cache = meta_hit && meta->interp_known && interp_path;
+  if (interp_from_cache) {
+    size_t n = strlen(meta->interp);
+    if (n >= interp_max_len)
+      n = interp_max_len - 1;
+    memcpy(interp_path, meta->interp, n);
+    interp_path[n] = '\0';
+  }
 
   uint64_t load_base = requested_base;
   if (!is_interp && ehdr.e_type == ET_DYN && load_base == 0) {
@@ -349,7 +500,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
       Elf64_Phdr phdr;
       if (!elf_read_phdr(file, &ehdr, compat32, phdr_tab, i, &phdr)) {
-        if (phdr_tab) kfree(phdr_tab);
+        if (phdr_tab_owned) kfree(phdr_tab);
         vfs_close(file);
         return false;
       }
@@ -366,10 +517,11 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
   // process PT_LOAD segments all at once.
   TSC_BEGIN(elf_segments);
   uint64_t phdr_vaddr = 0;
+  uint64_t dyn_vaddr = 0, dyn_memsz = 0;
   for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
     Elf64_Phdr phdr;
     if (!elf_read_phdr(file, &ehdr, compat32, phdr_tab, i, &phdr)) {
-      if (phdr_tab) kfree(phdr_tab);
+      if (phdr_tab_owned) kfree(phdr_tab);
       vfs_close(file);
       return false;
     }
@@ -380,7 +532,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
                                    phdr.p_offset, phdr.p_vaddr,
                                    phdr.p_filesz, phdr.p_memsz,
                                    &load_layout)) {
-      if (phdr_tab) kfree(phdr_tab);
+      if (phdr_tab_owned) kfree(phdr_tab);
       vfs_close(file);
       return false;
     }
@@ -395,14 +547,14 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
          phdr.p_memsz > user_limit - (load_base + phdr.p_vaddr) ||
          (phdr.p_vaddr & (PAGE_SIZE - 1)) !=
              (phdr.p_offset & (PAGE_SIZE - 1)))) {
-      if (phdr_tab) kfree(phdr_tab);
+      if (phdr_tab_owned) kfree(phdr_tab);
       vfs_close(file);
       return false;
     }
 #endif
 
     // Collect interpreter path from PT_INTERP.
-    if (phdr.p_type == PT_INTERP && interp_path) {
+    if (phdr.p_type == PT_INTERP && interp_path && !interp_from_cache) {
       uint32_t len = phdr.p_filesz;
       if (len >= interp_max_len)
         len = interp_max_len - 1;
@@ -412,6 +564,10 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
 
     // Track phdr table virtual address (PT_PHDR takes priority; fall back to
     // the PT_LOAD segment that contains the phdr table if PT_PHDR is absent).
+    if (phdr.p_type == PT_DYNAMIC && dyn_vaddr == 0) {
+      dyn_vaddr = load_base + phdr.p_vaddr;
+      dyn_memsz = phdr.p_memsz;
+    }
     if (phdr.p_type == PT_PHDR) {
       phdr_vaddr = load_base + phdr.p_vaddr;
     } else if (phdr.p_type == PT_LOAD && phdr_vaddr == 0 &&
@@ -480,7 +636,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
         if (vma_add(&current_thread->mm->vmas, start_page, end_page, prot,
                     MAP_PRIVATE | MAP_ELF_LOAD, -1, filesz ? vma_offset : 0,
                     filesz ? file : NULL, vma_file_size) < 0) {
-          if (phdr_tab) kfree(phdr_tab);
+          if (phdr_tab_owned) kfree(phdr_tab);
           vfs_close(file);
           return false;
         }
@@ -488,7 +644,7 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
       }
     }
   }
-  if (phdr_tab)
+  if (phdr_tab_owned)
     kfree(phdr_tab);
   TSC_END(elf_segments);
 
@@ -503,6 +659,18 @@ static bool do_elf_load(const char *path, uint64_t *pml4,
       out_info->phdr = phdr_vaddr;
       out_info->phentsize = ehdr.e_phentsize;
       out_info->phnum = ehdr.e_phnum;
+      out_info->dyn_vaddr = dyn_vaddr;
+      out_info->dyn_memsz = dyn_memsz;
+    }
+  }
+
+  /* Store the PT_INTERP name read above.  Only a filling load gets here with
+   * meta set; a hit reuses the stored name and never writes the slot. */
+  if (meta && !meta_hit && meta->complete && interp_path) {
+    size_t n = strlen(interp_path);
+    if (n < sizeof(meta->interp)) {
+      memcpy(meta->interp, interp_path, n + 1);
+      meta->interp_known = true;
     }
   }
 
@@ -515,7 +683,22 @@ bad_header:
   return false;
 }
 
-bool elf_load(const char *path, uint64_t *pml4, elf_info_t *out_info) {
+/* Consumes the caller's reference to `file`, as do_elf_load_body() does. */
+static bool do_elf_load(vfs_node_t *file, uint64_t *pml4,
+                        uint64_t requested_base, bool is_interp,
+                        elf_info_t *out_info, char *interp_path,
+                        size_t interp_max_len) {
+  bool hit = false;
+  struct elf_meta_entry *meta = elf_meta_open(file, &hit);
+  bool ok = do_elf_load_body(file, pml4, requested_base, is_interp, out_info,
+                             interp_path, interp_max_len, meta, hit);
+  elf_meta_close(meta);
+  return ok;
+}
+
+/* `file` is an already-resolved, referenced exec target; this function takes
+ * ownership of that reference and releases it before returning. */
+bool elf_load(vfs_node_t *file, uint64_t *pml4, elf_info_t *out_info) {
   struct thread *current_thread = sched_get_current();
   if (current_thread && current_thread->mm) {
     current_thread->mm->brk_base = 0;
@@ -525,14 +708,18 @@ bool elf_load(const char *path, uint64_t *pml4, elf_info_t *out_info) {
   char interp_path[256] = {0};
   elf_info_t main_info = {0};
 
-  if (!do_elf_load(path, pml4, 0, false, &main_info, interp_path,
+  if (!do_elf_load(file, pml4, 0, false, &main_info, interp_path,
                    sizeof(interp_path))) {
     return false;
   }
 
   if (interp_path[0] != '\0') {
     elf_info_t interp_info = {0};
-    if (!do_elf_load(interp_path, pml4, ELF_INTERP_BASE, true, &interp_info,
+    /* PT_INTERP names a different file, so it is resolved here once. */
+    vfs_node_t *interp = elf_open_path(interp_path);
+    if (!interp)
+      return false;
+    if (!do_elf_load(interp, pml4, ELF_INTERP_BASE, true, &interp_info,
                      NULL, 0)) {
       return false;
     }
@@ -838,33 +1025,14 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
 //   offset 0: char *can_do_threads (or similar)
 //   offset 8: size_t *auxv              ← we populate this
 //   ...
-static void process_fixup_libc_auxv(const char *path, uint64_t *pml4,
-                                    uint64_t user_sp,
+static void process_fixup_libc_auxv(uint64_t *pml4, uint64_t user_sp,
                                     const elf_info_t *elf_info) {
-  if (elf_info && elf_info->compat32) return;
+  if (!elf_info || elf_info->compat32) return;
   uint64_t hhdm = pmm_get_hhdm_offset();
-  uint64_t load_base = elf_info ? elf_info->load_base : 0;
-  vfs_node_t *file = vfs_resolve_path(path);
-  if (!file)
-    return;
-
-  Elf64_Ehdr ehdr;
-  if (vfs_read(file, 0, sizeof(ehdr), (uint8_t *)&ehdr) != sizeof(ehdr))
-    return;
-
-  // Find PT_DYNAMIC to locate the DYNAMIC section's VA
-  uint64_t dyn_vaddr = 0, dyn_memsz = 0;
-  for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
-    Elf64_Phdr phdr;
-    uint32_t off = ehdr.e_phoff + i * ehdr.e_phentsize;
-    if (vfs_read(file, off, sizeof(phdr), (uint8_t *)&phdr) != sizeof(phdr))
-      continue;
-    if (phdr.p_type == PT_DYNAMIC) {
-      dyn_vaddr = load_base + phdr.p_vaddr;
-      dyn_memsz = phdr.p_memsz;
-      break;
-    }
-  }
+  uint64_t load_base = elf_info->load_base;
+  /* PT_DYNAMIC was recorded by do_elf_load_body(); no re-resolve or re-read. */
+  uint64_t dyn_vaddr = elf_info->dyn_vaddr;
+  uint64_t dyn_memsz = elf_info->dyn_memsz;
   if (!dyn_vaddr)
     return;
 
@@ -992,7 +1160,8 @@ bool process_exec_argv(const char **argv) {
 
   elf_info_t elf_info = {0};
 
-  if (!elf_load(argv[0], pml4, &elf_info)) {
+  vfs_node_t *exec_file = elf_open_path(argv[0]);
+  if (!exec_file || !elf_load(exec_file, pml4, &elf_info)) {
     return false;
   }
 
@@ -1031,7 +1200,7 @@ bool process_exec_argv(const char **argv) {
   // Fix up __libc.auxv for binaries whose _start skips __libc_start_main
   // (e.g. TCC-compiled programs). Without this, musl's malloc crashes
   // trying to walk a NULL auxv to find AT_RANDOM.
-  process_fixup_libc_auxv(argv[0], pml4, user_rsp, &elf_info);
+  process_fixup_libc_auxv(pml4, user_rsp, &elf_info);
 
   // Initialize File Descriptors for the main thread
   struct thread *current_thread = sched_get_current();

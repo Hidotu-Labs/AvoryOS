@@ -1,11 +1,14 @@
 #include "fault.h"
 #include "../console/klog.h"
 #include "../fs/vfs.h"
+#include "../lib/csprng.h"
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
 #include "../mm/heap.h"
+#include "../sched/capability.h"
 #include "../sched/sched.h"
 #include "../sched/wait.h"
+#include "../smp/cpu.h"
 
 #define FAULT_BUFFER_SIZE 32
 
@@ -99,6 +102,8 @@ static uint32_t fault_dev_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                                uint8_t *buffer) {
   (void)node;
   (void)offset;
+  if (!capability_has_init_ns(sched_get_current(), CAP_SYSLOG))
+    return (uint32_t)-1;
 
   // Text interface: one line per fault so `cat /dev/faults` is readable.
   // Previously this copied raw `struct user_fault_record` bytes, which is why
@@ -164,7 +169,7 @@ void fault_init(void) {
 
   vfs_node_t *dev = vfs_resolve_path("/dev");
   if (dev) {
-    vfs_mknod(dev, "faults", 0666, FS_CHARDEV, NULL);
+    vfs_mknod(dev, "faults", 0600, FS_CHARDEV, NULL);
     vfs_node_t *node = vfs_resolve_path("/dev/faults");
     if (node) {
       node->read = fault_dev_read;
@@ -174,4 +179,81 @@ void fault_init(void) {
     }
     vfs_close(dev);
   }
+}
+
+/* Global stack canary for -fstack-protector-strong -mstack-protector-guard=global.
+ * Low byte is 0x00 to terminate unbounded C-string overflows. */
+uintptr_t __stack_chk_guard = 0x595e9fbd94fda700ULL;
+
+__attribute__((no_stack_protector)) void stack_chk_init(void) {
+  uint32_t lo, hi;
+  __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+  uint64_t seed = ((uint64_t)hi << 32) | lo;
+
+  /* Mix TSC with splitmix64 so even without RDRAND the canary is not fixed. */
+  seed += 0x9e3779b97f4a7c15ULL;
+  seed = (seed ^ (seed >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  seed = (seed ^ (seed >> 27)) * 0x94d049bb133111ebULL;
+  seed ^= seed >> 31;
+
+  /* Check CPUID.07H:EBX.RDSEED[bit 18] and CPUID.01H:ECX.RDRAND[bit 30]. */
+  uint32_t max_leaf = 0, ebx = 0, ecx = 0, edx = 0;
+  __asm__ volatile("cpuid"
+                   : "=a"(max_leaf), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                   : "a"(0), "c"(0));
+  if (max_leaf >= 7) {
+    uint32_t a7 = 7, b7 = 0, c7 = 0, d7 = 0;
+    __asm__ volatile("cpuid"
+                     : "+a"(a7), "=b"(b7), "+c"(c7), "=d"(d7));
+    if (b7 & (1U << 18)) {
+      for (int i = 0; i < 10; i++) {
+        uint64_t hw = 0;
+        uint8_t ok = 0;
+        __asm__ volatile("rdseed %0; setc %1" : "=r"(hw), "=qm"(ok));
+        if (ok) {
+          seed ^= hw;
+          break;
+        }
+      }
+    }
+  }
+  uint32_t eax = 1;
+  ecx = 0;
+  __asm__ volatile("cpuid"
+                   : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+  if (ecx & (1U << 30)) {
+    for (int i = 0; i < 10; i++) {
+      uint64_t hw = 0;
+      uint8_t ok = 0;
+      __asm__ volatile("rdrand %0; setc %1" : "=r"(hw), "=qm"(ok));
+      if (ok) {
+        seed ^= hw;
+        break;
+      }
+    }
+  }
+
+  /* Preserve a NUL low byte to stop unbounded C-string overflows. */
+  seed &= ~0xFFULL;
+  if ((seed >> 8) == 0)
+    seed |= 0x595e9fbd94fda700ULL;
+
+  __stack_chk_guard = (uintptr_t)seed;
+  cpu_early_init_bsp_canary(seed);
+}
+
+uint64_t stack_chk_gen_canary(void) {
+  uint64_t val = 0;
+  csprng_get_bytes(&val, sizeof(val));
+  val &= ~0xFFULL;
+  if ((val >> 8) == 0)
+    val |= ((uint64_t)__stack_chk_guard & ~0xFFULL) | 0xA500ULL;
+  return val;
+}
+
+__attribute__((no_stack_protector, noreturn)) void __stack_chk_fail(void) {
+  __asm__ volatile("cli");
+  klog_puts("KERNEL PANIC: stack smashing detected\n");
+  for (;;)
+    __asm__ volatile("hlt");
 }

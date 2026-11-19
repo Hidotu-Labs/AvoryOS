@@ -3,6 +3,8 @@ extern syscall_dispatcher
 extern console_puts
 extern cpu_has_smap_flag
 extern fork_return_to_userspace
+extern cpu_md_clear_active
+extern cpu_verw_ds
 
 section .text
 
@@ -54,24 +56,7 @@ syscall_entry:
     ; return paths mask again before swapgs/sysret.
     sti
 
-    ; Coarse SMAP user-access window: most syscalls in this kernel still read
-    ; and write user memory directly instead of going through copy_*_user, so
-    ; set RFLAGS.AC for the dispatch.  IA32_FMASK cleared AC on entry, and
-    ; switch_context saves/restores RFLAGS per thread so the window survives
-    ; blocking syscalls.  stac is #UD without SMAP, so gate it.
-    cmp byte [rel cpu_has_smap_flag], 0
-    je .stac_done
-    stac
-.stac_done:
-
     call syscall_dispatcher
-
-    ; Close the window before returning to user mode.  The user's own AC
-    ; (stored in R11) is theirs to keep; sysret restores it.
-    cmp byte [rel cpu_has_smap_flag], 0
-    je .clac_done
-    clac
-.clac_done:
 
     ; Interrupts must be masked before the user RSP is loaded.  After
     ; `pop rsp` the CPU is still ring 0 but RSP is the user stack, so a timer
@@ -127,12 +112,25 @@ syscall_entry:
 
 .sysret_exit:
     pop rcx ; User RIP
+    ; Ensure RCX is a canonical user-space address before switching to user
+    ; RSP/GS for sysret.  A non-canonical RIP makes sysret #GP in Ring 0
+    ; after swapgs and with RSP already pointing to user memory.
+    mov r11, 0x00007FFFFFFFFFFF
+    cmp rcx, r11
+    jbe .sysret_rip_ok
+    xor ecx, ecx
+.sysret_rip_ok:
     pop r11 ; User RFLAGS
     pop rsp ; User RSP
 
     ; Swap GS back to User TLS (if any).  Interrupts are already masked from
     ; above, so the ISR can never observe a kernel CS with user GS.
     swapgs
+
+    cmp byte [rel cpu_md_clear_active], 0
+    je .skip_verw_sysret
+    verw word [rel cpu_verw_ds]
+.skip_verw_sysret:
 
     ; Return to user mode safely
     o64 sysret
@@ -170,4 +168,8 @@ syscall_entry:
     mov rax, [rax + 112]
 
     swapgs
+    cmp byte [rel cpu_md_clear_active], 0
+    je .skip_verw_sigret
+    verw word [rel cpu_verw_ds]
+.skip_verw_sigret:
     iretq

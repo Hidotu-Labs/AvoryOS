@@ -3,12 +3,13 @@
 # setup-rootfs.sh, and respawns like the inittab entry does under BusyBox.
 [Unit]
 Description=AvoryOS login on tty1
-After=avory-early-init.service systemd-user-sessions.service dbus.socket
+After=avory-early-init.service systemd-user-sessions.service systemd-logind.service dbus.socket
+Wants=systemd-logind.service
 Conflicts=getty@tty1.service
 ConditionPathExists=/dev/tty1
 
 [Service]
-Type=idle
+Type=simple
 ExecStart=/bin/avory-login
 StandardInput=tty
 StandardOutput=tty

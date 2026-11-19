@@ -42,6 +42,25 @@ bool capability_has(struct thread *t, unsigned cap) {
   return !t->user_ns || (ns_allowed_caps(t) & (1ULL << cap));
 }
 
+bool capability_has_init_ns(struct thread *t, unsigned cap) {
+  if (!t) return true; /* Kernel callers. */
+  ensure(t);
+  return !t->user_ns && cap <= CAP_LAST_CAP && (t->cap_effective & (1ULL << cap)) != 0;
+}
+
+bool linuxkpi_capable(int cap) {
+  return cap >= 0 && capability_has_init_ns(sched_get_current(), (unsigned)cap);
+}
+
+/* Mount-table changes confined to a mount namespace owned by the caller's
+ * user namespace (unshare -rm, as pacman hooks and build scripts use). They
+ * cannot reach the host table, so the UTS/IPC/net ownership that full
+ * CAP_SYS_ADMIN needs is not required. */
+bool capability_mount_ns_admin(struct thread *t) {
+  if (capability_has(t, CAP_SYS_ADMIN)) return true;
+  return ns_private(t, NS_OWN_MNT) && (t->cap_effective & (1ULL << CAP_SYS_ADMIN));
+}
+
 /* Effective check for creating namespaces owned by the caller's own user
  * namespace: the restrictions above do not apply, because the new objects are
  * private to that namespace. */
@@ -85,12 +104,16 @@ void capability_uid_changed(struct thread *t, uint32_t uid, uint32_t euid, uint3
 void capability_exec(struct thread *t, uint32_t old_euid) {
   ensure(t);
   uint64_t p = t->cap_ambient;
-  if (!(t->securebits & 1) && (t->uid == 0 || t->euid == 0))
+  /* Ids are not translated inside user namespaces: an id mapped to inside
+   * root (unshare -r) execs as root there, as it does on Linux. */
+  bool euid_root = t->euid == 0 || user_namespace_uid_is_root(t, t->euid);
+  bool uid_root = t->uid == 0 || user_namespace_uid_is_root(t, t->uid);
+  if (!(t->securebits & 1) && (uid_root || euid_root))
     p |= t->cap_bounding | t->cap_inheritable;
   if (t->no_new_privs) p &= t->cap_permitted;
   if (old_euid != t->euid) t->cap_ambient = 0;
   t->cap_permitted = p;
-  t->cap_effective = t->euid == 0 ? p : t->cap_ambient;
+  t->cap_effective = euid_root ? p : t->cap_ambient;
   t->securebits &= ~16u;
 }
 int64_t capability_prctl(struct thread *t, uint64_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {

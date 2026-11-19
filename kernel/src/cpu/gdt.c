@@ -33,7 +33,11 @@ static uint8_t df_stack[MAX_CPUS][8192] __attribute__((aligned(16)));
 /* NMI runs on TSS IST2 for the same reason: an NMI can arrive while the CPU is
  * on a user stack (the syscall entry and exit windows), and the NMI handler
  * must not push onto that stack.  idt.c sets IST2 for vector 2. */
-static uint8_t nmi_stack[MAX_CPUS][8192] __attribute__((aligned(16)));
+uint8_t gdt_nmi_stack[MAX_CPUS][8192] __attribute__((aligned(16)));
+
+/* #DB runs on TSS IST3 so a user-triggered debug trap (e.g. TF into SYSCALL
+ * or SYSRET) cannot push onto a user or uninitialized stack. */
+static uint8_t db_stack[MAX_CPUS][8192] __attribute__((aligned(16)));
 
 extern void gdt_flush(uint64_t);
 
@@ -92,7 +96,7 @@ uint64_t gdt_get_df_stack_top(uint32_t cpu_id) {
   return (uint64_t)(df_stack[cpu_id] + sizeof(df_stack[cpu_id])) & ~0x3FULL;
 }
 
-void gdt_init(void) {
+__attribute__((no_stack_protector)) void gdt_init(void) {
 
 
   // 0: Null descriptor
@@ -120,7 +124,9 @@ void gdt_init(void) {
     tss_table[i].ist1 =
         (uint64_t)(df_stack[i] + sizeof(df_stack[i])) & ~0xFULL;
     tss_table[i].ist2 =
-        (uint64_t)(nmi_stack[i] + sizeof(nmi_stack[i])) & ~0xFULL;
+        (uint64_t)(gdt_nmi_stack[i] + sizeof(gdt_nmi_stack[i])) & ~0xFULL;
+    tss_table[i].ist3 =
+        (uint64_t)(db_stack[i] + sizeof(db_stack[i])) & ~0xFULL;
     gdt_set_tss(GDT_TSS_BASE + 2 * (int)i, (uint64_t)&tss_table[i],
                 sizeof(struct tss_entry) - 1);
   }
@@ -134,7 +140,7 @@ void gdt_init(void) {
   ltr(tss_selector(0));
 }
 
-void gdt_load_ap(uint32_t cpu_id) {
+__attribute__((no_stack_protector)) void gdt_load_ap(uint32_t cpu_id) {
   if (cpu_id >= MAX_CPUS) return;
   /* INIT/SIPI after S3 clears TR, but the per-CPU GDT survives in RAM with
    * the TSS descriptor's busy bit set by the previous LTR.  Loading that
@@ -149,7 +155,7 @@ void gdt_load_ap(uint32_t cpu_id) {
 /* ACPI S3 does not preserve the processor's GDTR/TR state. Reuse the BSP's
  * existing GDT and TSS without clearing its live RSP0/IST stacks. LTR marks
  * the TSS descriptor busy, so make it available again before reloading TR. */
-void gdt_reload_bsp(void) {
+__attribute__((no_stack_protector)) void gdt_reload_bsp(void) {
   cpu_gdt[0][GDT_TSS_BASE].access = 0x89;
   gdt_flush((uint64_t)&gp[0]);
   ltr(tss_selector(0));

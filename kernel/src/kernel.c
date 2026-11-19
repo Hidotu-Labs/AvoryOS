@@ -55,7 +55,6 @@
 #include "fs/ext2.h"
 #include "fs/ext4.h"
 #include "fs/fat32.h"
-#include "fs/precache.h"
 #include "fs/procfs.h"
 #include "fs/ramfs.h"
 #include "fs/random.h"
@@ -383,7 +382,9 @@ static void init_thread_entry(void) {
   }
 }
 
-void kmain(void) {
+__attribute__((no_stack_protector)) void kmain(void) {
+  stack_chk_init();
+
   if (!hal_init())
     halt();
 

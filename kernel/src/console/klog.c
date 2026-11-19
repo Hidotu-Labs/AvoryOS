@@ -5,6 +5,7 @@
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
 #include "console.h"
+#include "../smp/cpu.h"
 #include <stdarg.h>
 
 static spinlock_t klog_lock = SPINLOCK_INIT;
@@ -42,19 +43,54 @@ static char klog_boot[KLOG_BOOT_SIZE];
 static uint32_t klog_boot_len;
 static bool klog_boot_frozen;
 
-static void klog_ring_append(const char *s, size_t len) {
-  if (!spinlock_try_acquire(&klog_ring_lock))
-    return;
-  for (size_t i = 0; i < len; i++) {
-    klog_ring[klog_ring_head] = s[i];
-    klog_ring_head++;
-    if (klog_ring_head == KLOG_RING_SIZE)
-      klog_ring_head = 0;
-    if (klog_ring_count < KLOG_RING_SIZE)
-      klog_ring_count++;
-    if (!klog_boot_frozen && klog_boot_len < KLOG_BOOT_SIZE)
-      klog_boot[klog_boot_len++] = s[i];
+/* Owner of klog_ring_lock (CPU index), or -1.  Another CPU holding the lock
+ * is normal contention and we wait for it (the critical section is a memcpy);
+ * only re-entry on the *same* CPU (a fault/NMI inside the append) drops the
+ * record, since waiting there would deadlock. */
+static volatile int32_t klog_ring_owner = -1;
+
+static inline int32_t klog_this_cpu(void) {
+  struct cpu_info *ci = cpu_get_current();
+  return ci ? (int32_t)ci->cpu_id : 0;
+}
+
+static void klog_ring_copy_locked(const char *s, size_t len) {
+  if (!klog_boot_frozen && klog_boot_len < KLOG_BOOT_SIZE) {
+    size_t n = KLOG_BOOT_SIZE - klog_boot_len;
+    if (n > len)
+      n = len;
+    memcpy(&klog_boot[klog_boot_len], s, n);
+    klog_boot_len += (uint32_t)n;
   }
+  if (len > KLOG_RING_SIZE) {
+    s += len - KLOG_RING_SIZE;
+    len = KLOG_RING_SIZE;
+  }
+  size_t first = KLOG_RING_SIZE - klog_ring_head;
+  if (first > len)
+    first = len;
+  memcpy(&klog_ring[klog_ring_head], s, first);
+  if (len > first)
+    memcpy(&klog_ring[0], s + first, len - first);
+  klog_ring_head = (uint32_t)((klog_ring_head + len) % KLOG_RING_SIZE);
+  klog_ring_count += (uint32_t)len;
+  if (klog_ring_count > KLOG_RING_SIZE)
+    klog_ring_count = KLOG_RING_SIZE;
+}
+
+static void klog_ring_append(const char *s, size_t len) {
+  int32_t me = klog_this_cpu();
+  uint32_t spins = 0;
+  while (!spinlock_try_acquire(&klog_ring_lock)) {
+    if (__atomic_load_n(&klog_ring_owner, __ATOMIC_RELAXED) == me)
+      return; /* same-CPU re-entry: drop rather than deadlock */
+    if (++spins > 10000000u)
+      return; /* wedged holder: never hang the logger */
+    __asm__ volatile("pause" ::: "memory");
+  }
+  __atomic_store_n(&klog_ring_owner, me, __ATOMIC_RELAXED);
+  klog_ring_copy_locked(s, len);
+  __atomic_store_n(&klog_ring_owner, -1, __ATOMIC_RELAXED);
   spinlock_release(&klog_ring_lock);
 }
 
@@ -85,10 +121,14 @@ uint32_t klog_ring_read(uint32_t offset, uint32_t size, uint8_t *buffer) {
   uint32_t available = klog_ring_count - offset;
   if (size > available)
     size = available;
-  uint32_t start = (klog_ring_head + KLOG_RING_SIZE - klog_ring_count) %
-                   KLOG_RING_SIZE;
-  for (uint32_t i = 0; i < size; i++)
-    buffer[i] = (uint8_t)klog_ring[(start + offset + i) % KLOG_RING_SIZE];
+  uint32_t start = (klog_ring_head + KLOG_RING_SIZE - klog_ring_count +
+                    offset) % KLOG_RING_SIZE;
+  uint32_t first = KLOG_RING_SIZE - start;
+  if (first > size)
+    first = size;
+  memcpy(buffer, &klog_ring[start], first);
+  if (size > first)
+    memcpy(buffer + first, &klog_ring[0], size - first);
   spinlock_release_restore(&klog_ring_lock, flags);
   return size;
 }
@@ -203,7 +243,7 @@ static void klog_putchar_screen_unlocked(char c) {
   }
 }
 
-static inline void klog_write_dispatch(const char *s, size_t len) {
+static void klog_write_dispatch(const char *s, size_t len) {
   if (!s || len == 0)
     return;
 
@@ -215,8 +255,8 @@ static inline void klog_write_dispatch(const char *s, size_t len) {
    * and allow another CPU's output to interrupt them. */
   /* Never use serial_write's direct-UART contention fallback for ordinary
    * records: it bypasses the queue and splices bytes into another CPU's log.
-   * Queue the complete record and drain a bounded burst instead. */
-  serial_write_async(s, len);
+   * Queue the complete record; the BSP tick and idle loop drain it. */
+  serial_enqueue(s, len);
 
   /* After console_init() the console owns the screen and keeps its own
    * cursor.  Route the screen copy through it so the boot log stays visible
@@ -248,7 +288,123 @@ static inline void klog_write_dispatch(const char *s, size_t len) {
   }
 }
 
-void klog_putchar(char c) { klog_write_dispatch(&c, 1); }
+/* Per-CPU line buffers.  Most call sites build one line from several
+ * klog_puts/klog_uint64/klog_hex64 calls; sending each fragment straight to
+ * the ring + serial costs a lock round trip apiece and lets other CPUs' output
+ * splice into the middle of the line.  Fragments are collected here (IRQs off,
+ * so nothing on this CPU interleaves) and dispatched as one record on '\n'
+ * or when the buffer fills.  Re-entry on the same CPU (a fault or NMI while
+ * the buffer is busy) bypasses the buffer and writes directly.
+ *
+ * vklogf formats into the same per-CPU storage, which keeps its 1.5 KiB
+ * scratch buffer off the 16 KiB guard-less kernel stack. */
+#define KLOG_LINE_SIZE 512
+#define KLOG_FMT_SIZE 1536
+struct klog_cpu_buf {
+  char line[KLOG_LINE_SIZE];
+  char fmt[KLOG_FMT_SIZE];
+  uint32_t len;
+  volatile uint32_t busy;
+};
+static struct klog_cpu_buf klog_pcpu[MAX_CPUS];
+
+static inline struct klog_cpu_buf *klog_cpu_claim(hal_irq_state_t *flags) {
+  *flags = hal_irq_save();
+  int32_t cpu = klog_this_cpu();
+  if (cpu < 0 || cpu >= MAX_CPUS) {
+    hal_irq_restore(*flags);
+    return NULL;
+  }
+  struct klog_cpu_buf *b = &klog_pcpu[cpu];
+  if (b->busy) {
+    hal_irq_restore(*flags);
+    return NULL;
+  }
+  b->busy = 1;
+  return b;
+}
+
+static inline void klog_cpu_unclaim(struct klog_cpu_buf *b,
+                                    hal_irq_state_t flags) {
+  b->busy = 0;
+  hal_irq_restore(flags);
+}
+
+static void klog_line_flush_locked(struct klog_cpu_buf *b) {
+  uint32_t n = b->len;
+  if (n) {
+    b->len = 0; /* before dispatch: panic-mode dispatch re-enters klog_flush */
+    klog_write_dispatch(b->line, n);
+  }
+}
+
+static inline const char *klog_find_nl(const char *s, size_t len) {
+  for (size_t i = 0; i < len; i++)
+    if (s[i] == '\n')
+      return s + i;
+  return NULL;
+}
+
+static void klog_emit(const char *s, size_t len) {
+  if (!s || len == 0)
+    return;
+  hal_irq_state_t flags;
+  struct klog_cpu_buf *b = klog_cpu_claim(&flags);
+  if (!b) {
+    klog_write_dispatch(s, len);
+    return;
+  }
+  while (len) {
+    /* A complete line with nothing pending goes out without a copy. */
+    const char *nl = klog_find_nl(s, len);
+    size_t seg = nl ? (size_t)(nl - s) + 1 : len;
+    if (b->len == 0 && nl) {
+      klog_write_dispatch(s, seg);
+    } else {
+      size_t off = 0;
+      while (off < seg) {
+        size_t room = KLOG_LINE_SIZE - b->len;
+        size_t n = seg - off;
+        if (n > room)
+          n = room;
+        memcpy(&b->line[b->len], s + off, n);
+        b->len += (uint32_t)n;
+        off += n;
+        if (b->len == KLOG_LINE_SIZE)
+          klog_line_flush_locked(b);
+      }
+      if (nl)
+        klog_line_flush_locked(b);
+    }
+    s += seg;
+    len -= seg;
+  }
+  klog_cpu_unclaim(b, flags);
+}
+
+/* Push out any partial line still buffered.  This CPU's buffer is flushed
+ * safely; with `all_cpus` (panic/halt paths only) other CPUs' idle buffers are
+ * flushed too - racy by nature, but those CPUs are stopped or about to be. */
+void klog_flush(bool all_cpus) {
+  hal_irq_state_t flags;
+  struct klog_cpu_buf *b = klog_cpu_claim(&flags);
+  if (b) {
+    klog_line_flush_locked(b);
+    klog_cpu_unclaim(b, flags);
+  }
+  if (!all_cpus)
+    return;
+  for (int i = 0; i < MAX_CPUS; i++) {
+    struct klog_cpu_buf *o = &klog_pcpu[i];
+    if (o == b || o->busy || o->len == 0)
+      continue;
+    uint32_t n = o->len;
+    o->len = 0; /* before dispatch: see klog_line_flush_locked */
+    klog_write_dispatch(o->line, n);
+  }
+}
+
+void klog_putchar(char c) { klog_emit(&c, 1); }
 
 void klog_puts(const char *s) {
   if (!s)
@@ -258,7 +414,7 @@ void klog_puts(const char *s) {
   while (s[len])
     len++;
 
-  klog_write_dispatch(s, len);
+  klog_emit(s, len);
 }
 
 void klog_uint64(uint64_t num) {
@@ -266,7 +422,7 @@ void klog_uint64(uint64_t num) {
   if (num == 0) {
     buf[0] = '0';
     buf[1] = '\0';
-    klog_write_dispatch(buf, 1);
+    klog_emit(buf, 1);
     return;
   }
 
@@ -282,7 +438,7 @@ void klog_uint64(uint64_t num) {
   }
   buf[len] = '\0';
 
-  klog_write_dispatch(buf, (size_t)len);
+  klog_emit(buf, (size_t)len);
 }
 
 void klog_int64(int64_t num) {
@@ -304,7 +460,7 @@ void klog_hex64(uint64_t num) {
   }
   buf[18] = '\0';
 
-  klog_write_dispatch(buf, 18);
+  klog_emit(buf, 18);
 }
 
 void klog_hex32(uint32_t num) {
@@ -317,23 +473,40 @@ void klog_hex32(uint32_t num) {
   }
   buf[10] = '\0';
 
-  klog_write_dispatch(buf, 10);
+  klog_emit(buf, 10);
 }
 
 void vklogf(const char *fmt, va_list ap) {
   if (!fmt)
     return;
 
-  /* Keep one complete diagnostic together even when several CPUs log at once. */
-  char buf[1536];
-  int len = vsnprintf(buf, sizeof(buf), fmt, ap);
-  if (len <= 0)
+  hal_irq_state_t flags;
+  struct klog_cpu_buf *b = klog_cpu_claim(&flags);
+  if (!b) {
+    /* Re-entrant (fault inside klog) or pre-SMP oddity: small stack buffer. */
+    char small[192];
+    int len = vsnprintf(small, sizeof(small), fmt, ap);
+    if (len <= 0)
+      return;
+    if ((size_t)len >= sizeof(small))
+      len = (int)sizeof(small) - 1;
+    klog_write_dispatch(small, (size_t)len);
     return;
+  }
 
-  if ((size_t)len >= sizeof(buf))
-    len = (int)sizeof(buf) - 1;
-
-  klog_write_dispatch(buf, (size_t)len);
+  int len = vsnprintf(b->fmt, sizeof(b->fmt), fmt, ap);
+  if (len > 0) {
+    if ((size_t)len >= sizeof(b->fmt))
+      len = (int)sizeof(b->fmt) - 1;
+    /* Release the claim first so klog_emit can append to the line buffer
+     * (keeping any pending klog_puts prefix in front of this text).  IRQs stay
+     * off, so b->fmt cannot be reused by this CPU before it is consumed. */
+    b->busy = 0;
+    klog_emit(b->fmt, (size_t)len);
+    hal_irq_restore(flags);
+    return;
+  }
+  klog_cpu_unclaim(b, flags);
 }
 
 void klogf(const char *fmt, ...) {
@@ -341,6 +514,32 @@ void klogf(const char *fmt, ...) {
   va_start(ap, fmt);
   vklogf(fmt, ap);
   va_end(ap);
+}
+
+extern uint64_t lapic_timer_get_ms(void);
+
+bool klog_ratelimit_check(struct klog_ratelimit *rl, const char *tag,
+                          uint32_t burst, uint32_t interval_ms) {
+  uint64_t now = lapic_timer_get_ms();
+  uint64_t start = __atomic_load_n(&rl->window_start_ms, __ATOMIC_RELAXED);
+
+  /* First use, or the window expired: one CPU wins the reset and reports what
+   * the previous window suppressed. */
+  if (start == 0 || now - start >= interval_ms) {
+    if (__atomic_compare_exchange_n(&rl->window_start_ms, &start,
+                                    now ? now : 1, false, __ATOMIC_RELAXED,
+                                    __ATOMIC_RELAXED)) {
+      uint32_t missed = __atomic_exchange_n(&rl->missed, 0, __ATOMIC_RELAXED);
+      __atomic_store_n(&rl->printed, 0, __ATOMIC_RELAXED);
+      if (missed)
+        klogf("[klog] %s: %u messages suppressed\n", tag ? tag : "?", missed);
+    }
+  }
+
+  if (__atomic_add_fetch(&rl->printed, 1, __ATOMIC_RELAXED) <= burst)
+    return true;
+  __atomic_add_fetch(&rl->missed, 1, __ATOMIC_RELAXED);
+  return false;
 }
 
 bool klog_path_is_browser(const char *path) {
@@ -360,7 +559,7 @@ void klog_proc_exec(uint32_t tid, const char *path) {
     int nlen = snprintf(note, sizeof(note), "[PROC] [WEBKIT/BROWSER] Launching %s (tid=%u)\n",
                         path, tid);
     if (nlen > 0)
-      klog_write_dispatch(note, (size_t)nlen);
+      klog_emit(note, (size_t)nlen);
   }
 }
 
@@ -422,7 +621,7 @@ void klog_ramfs_free(void *ptr, uint64_t capacity, bool is_pmm, uint64_t pages) 
 
   *p++ = '\n';
 
-  klog_write_dispatch(buf, (size_t)(p - buf));
+  klog_emit(buf, (size_t)(p - buf));
 #else
   (void)ptr;
   (void)capacity;

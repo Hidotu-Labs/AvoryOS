@@ -56,7 +56,7 @@ def install(disk, bundle):
             with part.open('wb') as stream:stream.truncate(size)
             copy_image_range(copy,part,offset,0,size)
             image=runtime.RuntimeImage(part,bundle,temp)
-            commands=[];directories=set();pending=set()
+            commands=[];directories=set();pending=set();written={}
             for name in files:
                 parent=''
                 for component in name.parts[:-1]:
@@ -70,7 +70,14 @@ def install(disk, bundle):
                     if 'Type:' not in existing:
                         commands.append(f'mkdir "{parent}"');pending.add(parent)
                     directories.add(parent)
-                commands.extend([f'rm "/{name}"',f'write "{bundle/name}" "/{name}"'])
+                # Chips of one family share identical GSP blobs; store each
+                # once and link the rest, as linux-firmware does (~1 GiB saved).
+                first=written.setdefault(files[name],name)
+                if first!=name:
+                    target=os.path.relpath(first,name.parent)
+                    commands.extend([f'rm "/{name}"',f'symlink "/{name}" "{target}"'])
+                else:
+                    commands.extend([f'rm "/{name}"',f'write "{bundle/name}" "/{name}"'])
             batch=temp/'firmware.commands';batch.write_text('\n'.join(commands)+'\n')
             result=subprocess.run([image.debugfs,'-w','-f',str(batch),str(part)],
                                   capture_output=True,text=True)

@@ -29,5 +29,7 @@ struct user_fault_record {
 
 void fault_init(void);
 void fault_log_add(struct registers *regs, int sig, uint64_t cr2);
+void stack_chk_init(void);
+uint64_t stack_chk_gen_canary(void);
 
 #endif

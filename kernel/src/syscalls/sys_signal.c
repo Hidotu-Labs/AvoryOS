@@ -138,7 +138,7 @@ static void restore_signal_context(struct registers *regs,
   regs->rcx = g[14];
   regs->rsp = g[15];
   regs->rip = g[16];
-  regs->rflags = g[17] | 0x200;
+  regs->rflags = (g[17] & 0x0000000000250dd5ULL) | 0x202ULL;
 
   uint16_t cs = (uint16_t)g[18];
   regs->cs = ((cs & 3) == 3 && cs != 0) ? cs : 0x2B;
@@ -599,8 +599,15 @@ static uint64_t sys_rt_sigreturn(struct syscall_regs *sregs) {
   struct thread *current = sched_get_current();
   // Frame is on user stack.
   struct sigframe *frame = (struct sigframe *)sregs->rsp;
-  if (!vmm_is_user_addr_range_valid((uint64_t)frame, sizeof(struct sigframe))) {
+  if (!is_user_range(frame, sizeof(struct sigframe))) {
     klog_puts("[SIGNAL] sigreturn: invalid frame pointer\n");
+    process_do_exit(11); // SIGSEGV
+  }
+
+  struct kernel_ucontext *k_uc = kmalloc(sizeof(struct kernel_ucontext));
+  if (!k_uc || copy_from_user(k_uc, &frame->ucontext, sizeof(*k_uc)) != 0) {
+    if (k_uc) kfree(k_uc);
+    klog_puts("[SIGNAL] sigreturn: failed to copy ucontext\n");
     process_do_exit(11); // SIGSEGV
   }
 
@@ -608,13 +615,14 @@ static uint64_t sys_rt_sigreturn(struct syscall_regs *sregs) {
    * Linux defines the ucontext as the restorable signal state. Restore into
    * kernel-side current->sigreturn_regs so IRETQ restores from safe kernel memory.
    */
-  restore_signal_context(&current->sigreturn_regs, &frame->ucontext);
-  current->signal_mask = frame->ucontext.uc_sigmask[0];
+  restore_signal_context(&current->sigreturn_regs, k_uc);
+  current->signal_mask = k_uc->uc_sigmask[0];
   current->signal_mask &=
       ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
   current->fault_regs_valid = false;
   current->fault_addr = 0;
- if ((current->sigreturn_regs.cs & 3) != 3 || current->sigreturn_regs.ss != 0x23 ||
+ if ((current->sigreturn_regs.cs != 0x2B && current->sigreturn_regs.cs != 0x1B) ||
+      current->sigreturn_regs.ss != 0x23 ||
       current->sigreturn_regs.rip >= 0x0000800000000000ULL ||
       current->sigreturn_regs.rsp >= 0x0000800000000000ULL) {
     klog_puts("[SIGNAL] sigreturn: invalid user context rip=");
@@ -624,23 +632,30 @@ static uint64_t sys_rt_sigreturn(struct syscall_regs *sregs) {
     klog_puts(" cs=");
     klog_uint64(current->sigreturn_regs.cs);
     klog_puts("\n");
+    kfree(k_uc);
     process_do_exit(11);
   }
- __asm__ volatile("cli" ::: "memory");
+  if (!fpu_validate_legacy((const uint8_t *)k_uc->fpregs_mem, current->fpu_state)) {
+    kfree(k_uc);
+    process_do_exit(11);
+  }
+  __asm__ volatile("cli" ::: "memory");
   fpu_ensure_loaded(current);
   if (cpu_has_xsave_flag) {
     // Preserve extended AVX/YMM state: update only the legacy 512-byte region
     // at the beginning of current->fpu_state without clearing upper YMM registers
-    memcpy(&current->fpu_state, (const void *)frame->ucontext.fpregs_mem, 512);
+    memcpy(&current->fpu_state, (const void *)k_uc->fpregs_mem, 512);
+    fpu_sanitize_xstate(current->fpu_state, sizeof(current->fpu_state), current->fpu_state);
     uint64_t mask = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE);
     uint32_t eax = (uint32_t)mask, edx = (uint32_t)(mask >> 32);
     __asm__ volatile("xrstor64 %0" : : "m"(current->fpu_state), "a"(eax), "d"(edx) : "memory");
   } else {
     uint8_t aligned_fpregs[512] __attribute__((aligned(16)));
-    memcpy(aligned_fpregs, (const void *)frame->ucontext.fpregs_mem, sizeof(aligned_fpregs));
+    memcpy(aligned_fpregs, (const void *)k_uc->fpregs_mem, sizeof(aligned_fpregs));
     __asm__ volatile("fxrstor64 %0" : : "m"(aligned_fpregs) : "memory");
     memcpy(&current->fpu_state, aligned_fpregs, 512);
   }
+  kfree(k_uc);
 
   /* The dispatcher publishes this frame only after pending-signal delivery.
    * Delivery can exit/schedule, so a per-CPU pointer must not be set here. */
@@ -847,7 +862,8 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
       sender_code = queued_info.si_code;
     }
     sender_pid = pid_namespace_visible(current, sender_pid);
-    klogf("[SIGNAL] Default action (terminate) for sig %llu comm=%s tid=%u sender=%u si_code=%d rip=%llu rsp=%llu rax=%llu\n",
+    if (KLOG_RATELIMITED("SIGNAL terminate"))
+      klogf("[SIGNAL] Default action (terminate) for sig %llu comm=%s tid=%u sender=%u si_code=%d rip=%llu rsp=%llu rax=%llu\n",
           (unsigned long long)sig, current->comm, current->tid,
           sender_pid, sender_code,
           (unsigned long long)regs->rip, (unsigned long long)regs->rsp,
@@ -1659,7 +1675,8 @@ static uint32_t signalfd_read(vfs_node_t *node, uint32_t offset, uint32_t size,
       struct kernel_siginfo queued_info;
       bool has_info = false;
       if (sig && consume_signal_tgid(t, sig, &sender_pid, &queued_info, &has_info)) {
-        klogf("[SIGNALFD] read sig=%d from sender_pid=%u\n", sig,
+        if (KLOG_RATELIMITED("SIGNALFD read"))
+          klogf("[SIGNALFD] read sig=%d from sender_pid=%u\n", sig,
               sender_pid);
         struct signalfd_siginfo info;
         memset(&info, 0, sizeof(info));
@@ -1806,8 +1823,11 @@ static uint64_t sys_signalfd4(uint64_t fd, uint64_t mask_ptr, uint64_t sizemask,
     return (uint64_t)-1;
 
   uint64_t mask = 0;
-  if (mask_ptr && vmm_is_user_addr_range_valid(mask_ptr, 8))
-    mask = *(uint64_t *)mask_ptr;
+  if (mask_ptr) {
+    if (!is_user_range((const void *)mask_ptr, sizeof(mask)) ||
+        copy_from_user(&mask, (const void *)mask_ptr, sizeof(mask)) != 0)
+      return (uint64_t)-14;
+  }
 
   // If fd != -1, update existing signalfd
   if (FD_IN_RANGE(t, fd) && fd_is_valid_node(t->fds[fd])) {

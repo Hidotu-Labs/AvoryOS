@@ -1,5 +1,6 @@
 // sys_ioctl.c — ioctl syscall
 #include "../console/klog.h"
+#include "../cpu/features.h"
 #include "../fb/framebuffer.h"
 #include "../drivers/pty.h"
 #include "../font/font.h"
@@ -207,7 +208,7 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     klog_uint64(t->tid);
     klog_puts(" fd=");
     klog_uint64(fd);
-    klog_puts(" request=0x");
+    klog_puts(" request=");
     klog_hex32(request);
     klog_puts(" arg=0x");
     klog_uint64(arg);
@@ -216,9 +217,9 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
 
   klog_puts("[SYSCALL] sys_ioctl ENTER fd=");
   klog_uint64(fd);
-  klog_puts(" request=0x");
+  klog_puts(" request=");
   klog_hex32((uint32_t)request);
-  klog_puts(" arg=0x");
+  klog_puts(" arg=");
   klog_hex64(arg);
   klog_puts("\n");
 #endif
@@ -267,7 +268,9 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
 
     if (node->ioctl) {
       ioctl_handler_called = true;
+      user_access_begin();
       uint64_t res = (uint64_t)node->ioctl(node, (uint32_t)request, arg);
+      user_access_end();
       if (res != (uint64_t)-25)
         return res;
     }
@@ -308,30 +311,29 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     return (uint64_t)result;
   }
   case TIOCGWINSZ: {
-    struct winsize *ws = (struct winsize *)arg;
-    if (!ws || !vmm_is_user_addr_range_valid(arg, sizeof(struct winsize))) {
+    if (!arg || !is_user_range((const void *)arg, sizeof(struct winsize))) {
       ret = (uint64_t)-14;
       break;
     }
-    ws->ws_row = (unsigned short)(fb_get_height() / FONT_HEIGHT);
-    ws->ws_col = (unsigned short)(fb_get_width() / FONT_WIDTH);
-    ws->ws_xpixel = (unsigned short)fb_get_width();
-    ws->ws_ypixel = (unsigned short)fb_get_height();
-    ret = 0;
+    struct winsize ws;
+    ws.ws_row = (unsigned short)(fb_get_height() / FONT_HEIGHT);
+    ws.ws_col = (unsigned short)(fb_get_width() / FONT_WIDTH);
+    ws.ws_xpixel = (unsigned short)fb_get_width();
+    ws.ws_ypixel = (unsigned short)fb_get_height();
+    ret = copy_to_user((void *)arg, &ws, sizeof(ws)) ? (uint64_t)-14 : 0;
     break;
   }
   case TIOCSWINSZ: {
-    const struct winsize *ws = (const struct winsize *)arg;
-    if (!ws || !vmm_is_user_addr_range_valid(arg, sizeof(struct winsize))) {
+    if (!arg || !is_user_range((const void *)arg, sizeof(struct winsize))) {
       ret = (uint64_t)-14;
       break;
     }
-    ret = 0;
+    struct winsize ws;
+    ret = copy_from_user(&ws, (const void *)arg, sizeof(ws)) ? (uint64_t)-14 : 0;
     break;
   }
   case TCGETS: {
-    if (!arg ||
-        !vmm_is_user_addr_range_valid(arg, sizeof(struct kernel_termios))) {
+    if (!arg || !is_user_range((const void *)arg, sizeof(struct kernel_termios))) {
       ret = (uint64_t)-14;
       break;
     }
@@ -342,13 +344,11 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     kt.c_lflag = console_termios.c_lflag;
     kt.c_line = console_termios.c_line;
     memcpy(kt.c_cc, console_termios.c_cc, KERNEL_NCCS);
-    memcpy((void *)arg, &kt, sizeof(struct kernel_termios));
-    ret = 0;
+    ret = copy_to_user((void *)arg, &kt, sizeof(kt)) ? (uint64_t)-14 : 0;
     break;
   }
   case TCGETS2: {
-    if (!arg ||
-        !vmm_is_user_addr_range_valid(arg, sizeof(struct termios2))) {
+    if (!arg || !is_user_range((const void *)arg, sizeof(struct termios2))) {
       ret = (uint64_t)-14;
       break;
     }
@@ -361,20 +361,21 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     memcpy(t2.c_cc, console_termios.c_cc, KERNEL_NCCS);
     t2.c_ispeed = 38400;
     t2.c_ospeed = 38400;
-    memcpy((void *)arg, &t2, sizeof(struct termios2));
-    ret = 0;
+    ret = copy_to_user((void *)arg, &t2, sizeof(t2)) ? (uint64_t)-14 : 0;
     break;
   }
   case TCSETS:
   case TCSETSW:
   case TCSETSF: {
-    if (!arg ||
-        !vmm_is_user_addr_range_valid(arg, sizeof(struct kernel_termios))) {
+    if (!arg || !is_user_range((const void *)arg, sizeof(struct kernel_termios))) {
       ret = (uint64_t)-14;
       break;
     }
     struct kernel_termios kt;
-    memcpy(&kt, (const void *)arg, sizeof(struct kernel_termios));
+    if (copy_from_user(&kt, (const void *)arg, sizeof(kt)) != 0) {
+      ret = (uint64_t)-14;
+      break;
+    }
     console_termios.c_iflag = kt.c_iflag;
     console_termios.c_oflag = kt.c_oflag;
     console_termios.c_cflag = kt.c_cflag;
@@ -387,13 +388,15 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
   case TCSETS2:
   case TCSETSW2:
   case TCSETSF2: {
-    if (!arg ||
-        !vmm_is_user_addr_range_valid(arg, sizeof(struct termios2))) {
+    if (!arg || !is_user_range((const void *)arg, sizeof(struct termios2))) {
       ret = (uint64_t)-14;
       break;
     }
     struct termios2 t2;
-    memcpy(&t2, (const void *)arg, sizeof(struct termios2));
+    if (copy_from_user(&t2, (const void *)arg, sizeof(t2)) != 0) {
+      ret = (uint64_t)-14;
+      break;
+    }
     console_termios.c_iflag = t2.c_iflag;
     console_termios.c_oflag = t2.c_oflag;
     console_termios.c_cflag = t2.c_cflag;
@@ -404,18 +407,17 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     break;
   }
   case TIOCGPGRP: {
-    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int))) {
+    if (!arg || !is_user_range((const void *)arg, sizeof(int))) {
       ret = (uint64_t)-14;
       break;
     }
     struct thread *curr = sched_get_current();
     int pgrp = curr ? (int)curr->pgid : 1;
-    memcpy((void *)arg, &pgrp, sizeof(int));
-    ret = 0;
+    ret = copy_to_user((void *)arg, &pgrp, sizeof(pgrp)) ? (uint64_t)-14 : 0;
     break;
   }
   case TIOCSPGRP: {
-    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int))) {
+    if (!arg || !is_user_range((const void *)arg, sizeof(int))) {
       ret = (uint64_t)-14;
       break;
     }
@@ -423,14 +425,13 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     break;
   }
   case 0x5470: { // KBDSCANMODE_GET
-    int *mode = (int *)arg;
-    if (!mode) {
+    if (!arg || !is_user_range((const void *)arg, sizeof(int))) {
       ret = (uint64_t)-14;
       break;
     }
     extern bool keyboard_is_scancode_mode(void);
-    *mode = keyboard_is_scancode_mode() ? 1 : 0;
-    ret = 0;
+    int mode = keyboard_is_scancode_mode() ? 1 : 0;
+    ret = copy_to_user((void *)arg, &mode, sizeof(mode)) ? (uint64_t)-14 : 0;
     break;
   }
   case 0x5471: { // KBDSCANMODE_SET
@@ -489,22 +490,22 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     ret = 0;
     break;
   case KDGETMODE: {
-    int *mode = (int *)arg;
-    if (!mode) {
+    int mode = KD_TEXT;
+    if (!arg || !is_user_range((const void *)arg, sizeof(mode)) ||
+        copy_to_user((void *)arg, &mode, sizeof(mode)) != 0) {
       ret = (uint64_t)-14;
       break;
     }
-    *mode = KD_TEXT;
     ret = 0;
     break;
   }
   case KDGKBMODE: {
-    int *mode = (int *)arg;
-    if (!mode) {
+    int mode = 0;
+    if (!arg || !is_user_range((const void *)arg, sizeof(mode)) ||
+        copy_to_user((void *)arg, &mode, sizeof(mode)) != 0) {
       ret = (uint64_t)-14;
       break;
     }
-    *mode = 0;
     ret = 0;
     break;
   }
@@ -528,13 +529,12 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     ret = 0;
     break;
   case TIOCGETD: {
-    int *ldisc = (int *)arg;
-    if (!ldisc) {
+    if (!arg || !is_user_range((const void *)arg, sizeof(int))) {
       ret = (uint64_t)-14;
       break;
     }
-    *ldisc = 0;
-    ret = 0;
+    int ldisc = 0;
+    ret = copy_to_user((void *)arg, &ldisc, sizeof(ldisc)) ? (uint64_t)-14 : 0;
     break;
   }
   case 0x541B: { // FIONREAD / TIOCINQ
@@ -560,7 +560,9 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     } else if (ioctl_node && ((ioctl_node->flags & FS_TYPE_MASK) == FS_PIPE ||
                               (ioctl_node->flags & FS_TYPE_MASK) == FS_SOCKET)) {
       if (ioctl_node->ioctl) {
+        user_access_begin();
         ret = (uint64_t)ioctl_node->ioctl(ioctl_node, 0x541B, arg);
+        user_access_end();
         break;
       }
     }
@@ -568,11 +570,12 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     break;
   }
   case 0x5421: { // FIONBIO
-    if (!arg || !vmm_is_user_addr_range_valid(arg, sizeof(int))) {
+    int nonblocking = 0;
+    if (!arg || !is_user_range((const void *)arg, sizeof(int)) ||
+        copy_from_user(&nonblocking, (const void *)arg, sizeof(int)) != 0) {
       ret = (uint64_t)-14;
       break;
     }
-    int nonblocking = *(int *)arg;
     if (nonblocking)
       t->fd_flags[fd] |= O_NONBLOCK;
     else
@@ -643,17 +646,17 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
     break;
   }
   case 0x4020940D: { // FICLONERANGE
-    if (!arg || !vmm_is_user_addr_range_valid(arg, 32)) {
-      ret = (uint64_t)-14; // EFAULT
-      break;
-    }
     struct {
       int64_t src_fd;
       uint64_t src_offset;
       uint64_t src_length;
       uint64_t dest_offset;
     } cr;
-    memcpy(&cr, (const void *)arg, sizeof(cr));
+    if (!arg || !is_user_range((const void *)arg, sizeof(cr)) ||
+        copy_from_user(&cr, (const void *)arg, sizeof(cr)) != 0) {
+      ret = (uint64_t)-14; // EFAULT
+      break;
+    }
     if (!FD_IN_RANGE(t, cr.src_fd) || !t->fds[cr.src_fd]) {
       ret = (uint64_t)-9; // EBADF
       break;
@@ -758,11 +761,11 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
   case 0x81009431: { // BTRFS_IOC_GET_FSLABEL: _IOR(0x94, 49, char[256])
     // kded6 and other desktop tools probe the label of "/" on startup.
     // AvoryOS root is not btrfs, so report an empty (unlabeled) label.
-    if (!arg || !vmm_is_user_addr_range_valid(arg, 256)) {
+    if (!arg || !is_user_range((const void *)arg, 256) ||
+        clear_user((void *)arg, 256) != 0) {
       ret = (uint64_t)-14; // EFAULT
       break;
     }
-    memset((void *)arg, 0, 256);
     ret = 0;
     break;
   }
@@ -785,7 +788,7 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg,
                         ioctl_handler_called);
 
 #if IOCTL_DEBUG_LOGGING
-  klog_puts("[SYSCALL] sys_ioctl RETURN 0x");
+  klog_puts("[SYSCALL] sys_ioctl RETURN ");
   klog_hex64(ret);
   klog_puts("\n");
 #endif

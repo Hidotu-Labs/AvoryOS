@@ -595,7 +595,7 @@ static int evdev_vfs_ioctl(struct vfs_node *node, uint32_t request,
   // those represent missing evdev feature coverage worth knowing about.
   if (((request & 0xFF) >= 0x00 && (request & 0xFF00) == 0x4500) ||
       ((request >> 8 & 0xFF) == 0x45)) {
-    klog_puts("[EVDEV] unknown ioctl 0x");
+    klog_puts("[EVDEV] unknown ioctl ");
     klog_hex32(request);
     klog_puts("\n");
   }

@@ -24,6 +24,16 @@ bool cpu_has_tsc_deadline(void);
 bool cpu_has_rdtscp(void);
 bool cpu_has_rdpid(void);
 bool cpu_has_xsaveopt(void);
+bool cpu_has_ibrs(void);
+bool cpu_has_ibpb(void);
+bool cpu_has_stibp(void);
+bool cpu_has_md_clear(void);
+bool cpu_has_arch_capabilities(void);
+extern bool cpu_has_ibrs_flag;
+extern bool cpu_has_ibpb_flag;
+extern bool cpu_has_stibp_flag;
+extern uint8_t cpu_md_clear_active;
+extern uint16_t cpu_verw_ds;
 extern bool cpu_has_xsave_flag;
 extern bool cpu_has_xsaveopt_flag;
 static inline bool cpu_has_xsaveopt_fast(void) {

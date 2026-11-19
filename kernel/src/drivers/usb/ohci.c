@@ -300,7 +300,7 @@ static void ohci_probe_ports(struct ohci_controller *hc) {
       } else {
         klog_puts("[OHCI] Port ");
         klog_uint64(i + 1);
-        klog_puts(" reset failed (status=0x");
+        klog_puts(" reset failed (status=");
         klog_hex32(status);
         klog_puts(")\n");
       }
@@ -536,7 +536,7 @@ static bool ohci_probe_pci_device(struct pci_device *pci) {
   uint32_t descA = ohci_read32(hc, OHCI_REG_RH_DESCRIPTOR_A);
   hc->num_ports = descA & OHCI_RHA_NDP_MASK;
 
-  klog_puts("[OHCI] Initializing Controller: Rev=0x");
+  klog_puts("[OHCI] Initializing Controller: Rev=");
   klog_hex32(rev & 0xFF);
   klog_puts(", Ports=");
   klog_uint64(hc->num_ports);

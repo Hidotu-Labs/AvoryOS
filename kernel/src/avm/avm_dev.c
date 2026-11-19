@@ -26,6 +26,7 @@
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
+#include "../sched/capability.h"
 #include "../sched/sched.h"
 #include "../syscalls/sys_io_shared.h"
 
@@ -117,7 +118,8 @@ static uint64_t avm_vcpu_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
 
   pmm_incref((void *)vcpu->run_pa);
   if (!vmm_map_page(vmm_get_active_pml4(), addr, vcpu->run_pa,
-                    PAGE_FLAG_PRESENT | PAGE_FLAG_USER | PAGE_FLAG_RW)) {
+                    PAGE_FLAG_PRESENT | PAGE_FLAG_USER | PAGE_FLAG_RW |
+                        PAGE_FLAG_NX)) {
     pmm_decref((void *)vcpu->run_pa);
     return (uint64_t)-1;
   }
@@ -600,6 +602,8 @@ static int avm_dev_ioctl(vfs_node_t *node, uint32_t request, uint64_t arg) {
     /* One page holds the kvm_run header and the exit payload. */
     return (int)AVM_PAGE_SIZE;
   case KVM_CREATE_VM: {
+    if (!capability_has_init_ns(sched_get_current(), CAP_SYS_ADMIN))
+      return -EPERM;
     struct avm_vm *vm = kmalloc(sizeof(*vm));
     if (!vm)
       return -ENOMEM;
@@ -634,7 +638,7 @@ void avm_init(void) {
   vfs_node_init(&g_avm_node);
   strcpy(g_avm_node.name, "avm");
   g_avm_node.flags = FS_CHARDEV;
-  g_avm_node.mask = 0666;
+  g_avm_node.mask = 0600;
   /* Misc device: major 10, minor 232, as on Linux. */
   g_avm_node.inode = (10u << 8) | 232u;
   g_avm_node.ioctl = avm_dev_ioctl;

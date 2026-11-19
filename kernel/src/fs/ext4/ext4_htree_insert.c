@@ -219,6 +219,7 @@ int ext4_htree_add_entry(
     uint32_t item_capacity;
 
     uint8_t *root_buffer = NULL;
+    uint8_t *node_buffer = NULL;
     uint8_t *leaf_buffer = NULL;
     uint8_t *right_buffer = NULL;
 
@@ -235,6 +236,7 @@ int ext4_htree_add_entry(
     }
 
     root_buffer = kmalloc(mount->block_size);
+    node_buffer = kmalloc(mount->block_size);
     leaf_buffer = kmalloc(mount->block_size);
     right_buffer = kmalloc(mount->block_size);
 
@@ -242,6 +244,7 @@ int ext4_htree_add_entry(
     items = kmalloc(item_capacity * sizeof(*items));
 
     if (!root_buffer ||
+        !node_buffer ||
         !leaf_buffer ||
         !right_buffer ||
         !items) {
@@ -276,7 +279,7 @@ int ext4_htree_add_entry(
 
     if (root_info->zero != 0 ||
         root_info->info_length != 8 ||
-        root_info->indirect_levels != 0 ||
+        root_info->indirect_levels > 1 ||
         count_limit->count == 0 ||
         count_limit->count > count_limit->limit ||
         32u + (uint32_t)count_limit->limit * sizeof(ext4_dx_entry_t) >
@@ -298,17 +301,55 @@ int ext4_htree_add_entry(
         goto cleanup;
     }
 
-    uint16_t target_index = 0;
+    uint16_t root_index = 0;
 
     for (uint16_t i = 1; i < count_limit->count; i++) {
         if (name_hash < (entries[i].hash & ~1u))
             break;
 
-        target_index = i;
+        root_index = i;
+    }
+
+    /* Active index block where a split leaf boundary would be inserted. */
+    uint8_t *index_buffer = root_buffer;
+    uint64_t index_physical_block = root_physical_block;
+    ext4_dx_count_limit_t *index_cl = count_limit;
+    ext4_dx_entry_t *index_entries = entries;
+    uint16_t target_index = root_index;
+
+    if (root_info->indirect_levels == 1) {
+        uint32_t node_logical = entries[root_index].block & 0x0fffffffu;
+        uint64_t node_phys = ext2_get_block_num(mount, directory_inode, node_logical);
+        if (node_phys == 0 || ext2_read_block(mount, node_phys, node_buffer) != 0)
+            goto cleanup;
+
+        ext4_dx_count_limit_t *node_cl =
+            (ext4_dx_count_limit_t *)(node_buffer + 8);
+        ext4_dx_entry_t *node_entries =
+            (ext4_dx_entry_t *)(node_buffer + 8);
+
+        if (node_cl->count == 0 ||
+            node_cl->count > node_cl->limit ||
+            8u + (uint32_t)node_cl->limit * sizeof(ext4_dx_entry_t) > mount->block_size) {
+            goto cleanup;
+        }
+
+        uint16_t leaf_idx = 0;
+        for (uint16_t j = 1; j < node_cl->count; j++) {
+            if (name_hash < (node_entries[j].hash & ~1u))
+                break;
+            leaf_idx = j;
+        }
+
+        index_buffer = node_buffer;
+        index_physical_block = node_phys;
+        index_cl = node_cl;
+        index_entries = node_entries;
+        target_index = leaf_idx;
     }
 
     uint32_t leaf_logical_block =
-        entries[target_index].block & 0x0fffffffu;
+        index_entries[target_index].block & 0x0fffffffu;
 
     uint64_t leaf_physical_block = ext2_get_block_num(
         mount,
@@ -348,10 +389,10 @@ int ext4_htree_add_entry(
 
     /*
      * A negative result means that the leaf block was malformed.
-     * A full root index cannot accept another leaf pointer.
+     * A full index block cannot accept another leaf pointer.
      */
     if (insert_result < 0 ||
-        count_limit->count >= count_limit->limit) {
+        index_cl->count >= index_cl->limit) {
         goto cleanup;
     }
 
@@ -447,22 +488,22 @@ int ext4_htree_add_entry(
     if (items[split_index - 1].hash == boundary_hash)
         boundary_hash |= 1;
 
-    for (uint16_t i = count_limit->count;
+    for (uint16_t i = index_cl->count;
          i > target_index + 1;
          i--) {
-        entries[i] = entries[i - 1];
+        index_entries[i] = index_entries[i - 1];
     }
 
-    entries[target_index + 1].hash = boundary_hash;
-    entries[target_index + 1].block = new_logical_block;
+    index_entries[target_index + 1].hash = boundary_hash;
+    index_entries[target_index + 1].block = new_logical_block;
 
-    count_limit->count++;
+    index_cl->count++;
 
+    /* ext4_alloc_extent() already charged i_blocks for the new block. */
     directory_inode->i_size += mount->block_size;
-    directory_inode->i_blocks += mount->block_size / 512;
 
     /*
-     * Journal both leaves, the updated root, and finally the inode.
+     * Journal both leaves, the updated index block, and finally the inode.
      */
     result = ext3_journal_block(
         mount,
@@ -481,8 +522,8 @@ int ext4_htree_add_entry(
     if (result == 0) {
         result = ext3_journal_block(
             mount,
-            root_physical_block,
-            root_buffer
+            index_physical_block,
+            index_buffer
         );
     }
 
@@ -497,6 +538,9 @@ int ext4_htree_add_entry(
 cleanup:
     if (root_buffer)
         kfree(root_buffer);
+
+    if (node_buffer)
+        kfree(node_buffer);
 
     if (leaf_buffer)
         kfree(leaf_buffer);

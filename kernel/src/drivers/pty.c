@@ -524,7 +524,7 @@ uint32_t ptmx_write(struct vfs_node *node, uint32_t offset, uint32_t size,
 #if PTY_DEBUG_LOGGING
   klog_puts("[PTY] ptmx_write: size=");
   klog_uint64(size);
-  klog_puts(" first_byte=0x");
+  klog_puts(" first_byte=");
   klog_hex64(buffer[0]);
   klog_puts("\n");
 #endif
@@ -666,7 +666,7 @@ uint32_t ptmx_write(struct vfs_node *node, uint32_t offset, uint32_t size,
                          1);
             }
 #if PTY_DEBUG_LOGGING
-            klog_puts("[PTY] ptmx_write: echoing char 0x");
+            klog_puts("[PTY] ptmx_write: echoing char ");
             klog_hex64(c);
             klog_puts(" to s2m buffer\n");
 #endif
@@ -1632,7 +1632,7 @@ void pty_register_devices(void) {
 
   vfs_node_init(ptmx_node);
 #if PTY_DEBUG_LOGGING
-  klog_puts("[PTY] pty_slave_write addr=0x");
+  klog_puts("[PTY] pty_slave_write addr=");
   klog_hex64((uint64_t)pty_slave_write);
   klog_puts("\n");
 #endif

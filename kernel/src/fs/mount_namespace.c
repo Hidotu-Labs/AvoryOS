@@ -275,8 +275,8 @@ static struct mount_link *new_link(vfs_node_t *p, vfs_node_t *t, uint64_t id,
   m->point = p;
   m->target = t;
   if (p)
-    vfs_open(p);
-  vfs_open(t);
+    vfs_node_ref(p);
+  vfs_node_ref(t);
   strncpy(m->source, s ? s : "none", 63);
   strncpy(m->type, f ? f : "unknown", 31);
   strncpy(m->path, path ? path : "/", 255);

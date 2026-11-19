@@ -294,10 +294,10 @@ static void cache_drop_invalid_locked(vfs_node_t *node, uint32_t offset,
 
 static vfs_page_t *vfs_cache_lookup_locked(vfs_node_t *node, uint32_t offset) {
   spinlock_acquire(&node->pages_lock);
-  vfs_page_t *page = asc_radix_tree_lookup_cached(&node->pages, cache_key(offset),
-                                                  &node->pc_cache_chunk,
-                                                  &node->pc_cache_leaf,
-                                                  &node->pc_cache_seq);
+  /* No per-node leaf shortcut: its three fields are shared by every reader
+   * and cannot be updated atomically, so a torn chunk/leaf pair returned the
+   * page of a different 256 KiB chunk (wrong file data under concurrency). */
+  vfs_page_t *page = asc_radix_tree_lookup(&node->pages, cache_key(offset));
   if (page && !page_value_fast(page)) {
     cache_drop_invalid_locked(node, offset, page);
     page = NULL;
@@ -336,11 +336,12 @@ vfs_page_t *vfs_cache_lookup(vfs_node_t *node, uint32_t offset) {
     hal_irq_state_t flags = hal_irq_save();
 
     bool stable = false;
-    vfs_page_t *page =
-        asc_radix_tree_lookup_lockless_cached(&node->pages, key, &stable,
-                                              &node->pc_cache_chunk,
-                                              &node->pc_cache_leaf,
-                                              &node->pc_cache_seq);
+    /* Uncached walk: concurrent lockless readers used to rewrite the shared
+     * pc_cache_{chunk,leaf,seq} triple without synchronization; a torn
+     * triple (chunk A, leaf B, current seq) passed the fast-path check and
+     * returned the page at the same slot of another chunk.  Multithreaded
+     * pread of large files (git index-pack) read wrong data. */
+    vfs_page_t *page = asc_radix_tree_lookup_lockless(&node->pages, key, &stable);
     bool live = stable && page &&
                 page_value_fast(page) && vfs_page_tryref(page);
     hal_irq_restore(flags);
@@ -779,10 +780,7 @@ uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_byt
     uint32_t page_off = offset + i * PAGE_SIZE;
     if (page_off >= node->length)
       break;
-    vfs_page_t *existing = asc_radix_tree_lookup_cached(&node->pages, cache_key(page_off),
-                                                        &node->pc_cache_chunk,
-                                                        &node->pc_cache_leaf,
-                                                        &node->pc_cache_seq);
+    vfs_page_t *existing = asc_radix_tree_lookup(&node->pages, cache_key(page_off));
     if (existing && !page_value_valid(existing)) {
       cache_drop_invalid_locked(node, page_off, existing);
       existing = NULL;
@@ -983,7 +981,17 @@ static void vfs_prefetch_worker(void) {
       continue;
     }
 
-    vfs_cache_readahead(job->node, job->offset, job->length);
+    /* vfs_cache_readahead() stops after one MAX_READAHEAD_PAGES run, so walk
+     * a large job in chunks; each chunk skips pages that are already cached. */
+    for (uint32_t done = 0; done < job->length;) {
+      uint32_t chunk = job->length - done;
+      if (chunk > MAX_READAHEAD_PAGES * PAGE_SIZE)
+        chunk = MAX_READAHEAD_PAGES * PAGE_SIZE;
+      if (job->offset + done >= job->node->length)
+        break;
+      vfs_cache_readahead(job->node, job->offset + done, chunk);
+      done += chunk;
+    }
     vfs_close(job->node);
     kfree(job);
   }
@@ -1055,6 +1063,142 @@ void vfs_cache_prefetch_async(vfs_node_t *node, uint32_t offset,
   }
 
   wait_queue_wake_one(&vfs_prefetch_wait);
+}
+
+/*
+ * Readahead for a cold page fault on a file mapping (ELF text/data, mmap).
+ * The faulting process waits only for a 128 KB synchronous window; the next
+ * window goes to the vfs-prefetch worker so the disk stays busy while the
+ * process runs.  Each further cold fault on the same file doubles that async
+ * window (256 KB .. 2 MB, like Linux's ramp-up), so a large library is read
+ * in a handful of big requests instead of one blocking 128 KB read per fault.
+ */
+#define FAULT_RA_SYNC_BYTES (128u * 1024u)
+#define FAULT_RA_ASYNC_MIN (256u * 1024u)
+#define FAULT_RA_ASYNC_MAX (2u * 1024u * 1024u)
+#define FAULT_RA_ASYNC_FILE_MAX (256u * 1024u * 1024u)
+
+void vfs_cache_fault_readahead(vfs_node_t *node, uint32_t offset) {
+  if (!node || !node->read || (node->flags & FS_TYPE_MASK) != FS_FILE)
+    return;
+  offset &= ~(PAGE_SIZE - 1);
+  (void)vfs_cache_readahead(node, offset, FAULT_RA_SYNC_BYTES);
+
+  /* Huge mappings (databases, VM images) are usually accessed randomly; a
+   * 2 MB read per fault there would waste I/O and memory.  Binaries and
+   * shared libraries are well below this. */
+  if (node->length > FAULT_RA_ASYNC_FILE_MAX)
+    return;
+  uint32_t async_off = offset + FAULT_RA_SYNC_BYTES;
+  if (async_off <= offset || async_off >= node->length)
+    return;
+
+  spinlock_acquire(&node->pages_lock);
+  uint32_t win = node->fault_ra_window;
+  win = win ? win * 2 : FAULT_RA_ASYNC_MIN;
+  if (win > FAULT_RA_ASYNC_MAX)
+    win = FAULT_RA_ASYNC_MAX;
+  node->fault_ra_window = win;
+  spinlock_release(&node->pages_lock);
+
+  vfs_cache_prefetch_async(node, async_off, win);
+}
+
+/* ── Demand-based exec prefetch ──────────────────────────────────────────────
+ * The first EXEC_PROFILE_WINDOW cold file-backed faults of a process are
+ * recorded against its executable (current->exe_path), one 128 KB window per
+ * fault.  The next exec of that executable queues the same windows as
+ * background readahead, so a repeat launch finds its startup pages cached.
+ * Profiles last for the current boot.  Each recorded node holds a reference,
+ * so it stays valid while its profile exists.  Nothing is evicted: once the
+ * table is full, new executables are not recorded. */
+#define EXEC_PROFILE_SLOTS 64
+#define EXEC_PROFILE_ENTRIES 32
+#define EXEC_PROFILE_WINDOW 64
+#define EXEC_PROFILE_RA_BYTES FAULT_RA_SYNC_BYTES
+
+struct exec_profile_entry {
+  vfs_node_t *node;
+  uint32_t offset;
+};
+
+struct exec_profile {
+  bool used;
+  uint32_t count;
+  char exe[256];
+  struct exec_profile_entry ent[EXEC_PROFILE_ENTRIES];
+};
+
+static struct exec_profile exec_profiles[EXEC_PROFILE_SLOTS];
+static spinlock_t exec_profile_lock = SPINLOCK_INIT;
+
+void vfs_exec_profile_note_cold(vfs_node_t *node, uint32_t offset,
+                                const char *exe, uint64_t cold_index) {
+  if (!node || !exe || !exe[0] || cold_index > EXEC_PROFILE_WINDOW)
+    return;
+  offset &= ~(uint32_t)(EXEC_PROFILE_RA_BYTES - 1);
+
+  spinlock_acquire(&exec_profile_lock);
+  struct exec_profile *prof = NULL;
+  struct exec_profile *spare = NULL;
+  for (int i = 0; i < EXEC_PROFILE_SLOTS; i++) {
+    struct exec_profile *p = &exec_profiles[i];
+    if (!p->used) {
+      if (!spare)
+        spare = p;
+    } else if (strcmp(p->exe, exe) == 0) {
+      prof = p;
+      break;
+    }
+  }
+  if (!prof && spare) {
+    prof = spare;
+    prof->used = true;
+    prof->count = 0;
+    strncpy(prof->exe, exe, sizeof(prof->exe) - 1);
+    prof->exe[sizeof(prof->exe) - 1] = '\0';
+  }
+  if (prof && prof->count < EXEC_PROFILE_ENTRIES) {
+    bool seen = false;
+    for (uint32_t j = 0; j < prof->count && !seen; j++)
+      seen = prof->ent[j].node == node && prof->ent[j].offset == offset;
+    if (!seen) {
+      vfs_node_ref(node);
+      prof->ent[prof->count].node = node;
+      prof->ent[prof->count].offset = offset;
+      prof->count++;
+    }
+  }
+  spinlock_release(&exec_profile_lock);
+}
+
+void vfs_exec_profile_prefetch(const char *exe) {
+  struct exec_profile_entry todo[EXEC_PROFILE_ENTRIES];
+  uint32_t n = 0;
+  if (!exe || !exe[0])
+    return;
+
+  spinlock_acquire(&exec_profile_lock);
+  for (int i = 0; i < EXEC_PROFILE_SLOTS; i++) {
+    struct exec_profile *p = &exec_profiles[i];
+    if (p->used && strcmp(p->exe, exe) == 0) {
+      n = p->count;
+      for (uint32_t j = 0; j < n; j++) {
+        todo[j] = p->ent[j];
+        vfs_node_ref(todo[j].node); /* keeps the node alive after unlock */
+      }
+      break;
+    }
+  }
+  spinlock_release(&exec_profile_lock);
+
+  for (uint32_t j = 0; j < n; j++) {
+    /* The async queue takes its own reference.  If the queue is full the
+     * window is left to demand paging rather than blocking the exec. */
+    vfs_cache_prefetch_async(todo[j].node, todo[j].offset,
+                             EXEC_PROFILE_RA_BYTES);
+    vfs_close(todo[j].node);
+  }
 }
 
 uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
@@ -2853,9 +2997,9 @@ void vfs_cache_fill_selftest(void) {
         klog_uint64(off + i);
         klog_puts(" (page ");
         klog_uint64(off / PAGE_SIZE);
-        klog_puts("): direct=0x");
+        klog_puts("): direct=");
         klog_hex64(direct[i]);
-        klog_puts(" cached=0x");
+        klog_puts(" cached=");
         klog_hex64(cached[i]);
         klog_puts("\n");
         fail = true;

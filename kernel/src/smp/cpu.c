@@ -7,6 +7,7 @@
 #include "console/debug.h"
 #include "console/klog.h"
 #include "cpu/features.h"
+#include "cpu/fault.h"
 #include "cpu/fpu.h"
 #include "cpu/gdt.h"
 #include "cpu/idt.h"
@@ -209,11 +210,29 @@ static bool cpu_ap_park_if_idle(struct cpu_info *cpu) {
  * startup finishes; setting it in cpu_set_gs_base() would let the BSP's flag
  * make a later-starting AP dereference its still-uninitialized GS base. */
 volatile bool cpu_gs_installed = false;
+uint64_t cpu_gs_table[MAX_CPUS];
+
+extern uintptr_t __stack_chk_guard;
+
+__attribute__((no_stack_protector)) void
+cpu_early_init_bsp_canary(uint64_t canary) {
+  cpus[0].self = &cpus[0];
+  cpus[0].stack_canary = canary;
+  wrmsr(MSR_GS_BASE, (uint64_t)&cpus[0]);
+}
 
 // Set GS base and IA32_TSC_AUX (Linux x86-64 ABI: (node_id << 12) | cpu_id)
 // for the current CPU so user-mode RDTSCP/RDPID and __vdso_getcpu work
 // without entering ring 0.
-static void cpu_set_gs_base(struct cpu_info *info) {
+static __attribute__((no_stack_protector)) void
+cpu_set_gs_base(struct cpu_info *info) {
+  if (info) {
+    size_t idx = (size_t)(info - &cpus[0]);
+    if (idx < MAX_CPUS)
+      cpu_gs_table[idx] = (uint64_t)info;
+    if (info->stack_canary == 0)
+      info->stack_canary = (uint64_t)__stack_chk_guard;
+  }
   wrmsr(MSR_GS_BASE, (uint64_t)info);
   wrmsr(MSR_KERNEL_GS_BASE, (uint64_t)info);
   if (info && (cpu_has_rdtscp() || cpu_has_rdpid())) {
@@ -256,7 +275,9 @@ struct cpu_info *cpu_get_info(uint32_t cpu_id) {
   return &cpus[cpu_id];
 }
 
-struct cpu_info *cpu_get_bsp(void) { return &cpus[0]; }
+__attribute__((no_stack_protector)) struct cpu_info *cpu_get_bsp(void) {
+  return &cpus[0];
+}
 
 static inline uint32_t get_initial_apic_id(void) {
   uint32_t ebx;
@@ -266,7 +287,7 @@ static inline uint32_t get_initial_apic_id(void) {
 
 // AP Entry Point
 
-void ap_main(struct cpu_info *bootstrap) {
+__attribute__((no_stack_protector)) void ap_main(struct cpu_info *bootstrap) {
   // We are now in 64-bit Long Mode!
 
   // 0. Load the proper full kernel GDT (replaces the temporary trampoline GDT)
@@ -446,6 +467,8 @@ void cpu_init(void) {
   __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
   for (uint32_t i = 0; i < cpu_count; i++) {
     cpus[i].kernel_cr3 = cr3;
+    if (i > 0)
+      cpus[i].stack_canary = stack_chk_gen_canary();
   }
   // The BSP is running on the kernel CR3 right now; APs publish their own
   // when they load it in ap_main().
@@ -801,7 +824,7 @@ bool cpu_prepare_s3_wake(uint64_t resume_rsp, uint64_t resume_rip) {
   return true;
 }
 
-void cpu_restore_s3_context(void) {
+__attribute__((no_stack_protector)) void cpu_restore_s3_context(void) {
   cpu_set_gs_base(&cpus[0]);
   cpu_restore_s3_mtrrs();
   cpu_set_active_cr3(s3_saved_bsp_cr3);

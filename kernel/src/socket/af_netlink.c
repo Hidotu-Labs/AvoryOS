@@ -31,11 +31,17 @@ struct nlmsghdr_min {
   uint32_t nlmsg_pid;
 };
 
+#define NLMSG_ERROR 2
 #define NLMSG_DONE 3
+#define NLM_F_CAPPED 0x100
+
+#define GENL_ID_CTRL 16
+#define CTRL_CMD_GETFAMILY 3
 #define NLM_F_MULTI 2
 
 #define RTM_NEWLINK 16
 #define RTM_GETLINK 18
+#define RTM_SETLINK 19
 #define RTM_NEWADDR 20
 #define RTM_DELADDR 21
 #define RTM_GETADDR 22
@@ -112,6 +118,32 @@ static int route_queue(netlink_sock_t *nsk, const void *data, size_t len) {
   if (!skb) return -12;
   memcpy(skb->data, data, len); skb->len = len;
   skb_queue_tail(&nsk->recv_queue, skb);
+  return 0;
+}
+
+static int netlink_reply_error(netlink_sock_t *nsk,
+                               const struct nlmsghdr_min *request, int error) {
+  struct {
+    struct nlmsghdr_min header;
+    int32_t error;
+    struct nlmsghdr_min request;
+  } reply = {
+    .header = {
+      .nlmsg_len = sizeof(reply),
+      .nlmsg_type = NLMSG_ERROR,
+      .nlmsg_flags = NLM_F_CAPPED,
+      .nlmsg_seq = request->nlmsg_seq,
+      .nlmsg_pid = (uint32_t)nsk->portid,
+    },
+    .error = error,
+    .request = *request,
+  };
+  int result = route_queue(nsk, &reply, sizeof(reply));
+  if (result)
+    return result;
+  socket_wake(nsk->parent);
+  if (nsk->parent->node)
+    epoll_notify_event(nsk->parent->node, EPOLLIN);
   return 0;
 }
 
@@ -336,7 +368,7 @@ static int netlink_bind(socket_t *sock, struct sockaddr *addr, int addrlen) {
   nsk->groups = nl->nl_groups;
   spinlock_release(&netlink_lock);
 
-  klogf("[NETLINK] bind port=%llu groups=%u\n",
+  klog_debugf("[NETLINK] bind port=%llu groups=%u\n",
         (unsigned long long)nsk->portid, nsk->groups);
 
 
@@ -391,9 +423,11 @@ static int netlink_setsockopt(socket_t *sock, int level, int optname,
       return 0;
     }
     case NETLINK_ADD_MEMBERSHIP: {
-      if (optlen < (int)sizeof(int))
+      int group = 0;
+      if (optlen < (int)sizeof(group))
         return -22;
-      int group = *(const int *)optval;
+      if (copy_from_user(&group, optval, sizeof(group)))
+        return -14;
 
       if (group < 1 || group > 32) return -22;
       uint32_t group_mask = (1u << (group - 1));
@@ -402,9 +436,11 @@ static int netlink_setsockopt(socket_t *sock, int level, int optname,
       return 0;
     }
     case NETLINK_DROP_MEMBERSHIP: {
-      if (optlen < (int)sizeof(int))
+      int group = 0;
+      if (optlen < (int)sizeof(group))
         return -22;
-      int group = *(const int *)optval;
+      if (copy_from_user(&group, optval, sizeof(group)))
+        return -14;
       if (group < 1 || group > 32) return -22;
       uint32_t group_mask = (1u << (group - 1));
       nsk->groups &= ~group_mask;
@@ -421,11 +457,14 @@ static int netlink_setsockopt(socket_t *sock, int level, int optname,
       return 0;
     }
     case SO_PASSCRED:
-
-      if (optlen >= (int)sizeof(int))
-        nsk->passcred = (*(const int *)optval != 0);
-      else
+      if (optlen >= (int)sizeof(int)) {
+        int enabled = 0;
+        if (copy_from_user(&enabled, optval, sizeof(enabled)))
+          return -14;
+        nsk->passcred = (enabled != 0);
+      } else {
         nsk->passcred = true;
+      }
       return 0;
     case 26: // SO_ATTACH_FILTER
 
@@ -581,7 +620,7 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
   (void)flags;
   (void)dest_addr;
   (void)addrlen;
-  klogf("[NETLINK] sendto len=%llu\n", (unsigned long long)len);
+  klog_debugf("[NETLINK] sendto len=%llu\n", (unsigned long long)len);
 
   netlink_sock_t *nsk = sock ? (netlink_sock_t *)sock->sk : NULL;
   if (!nsk)
@@ -593,9 +632,14 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
     memcpy(&dest, dest_addr, sizeof(dest));
     if (dest.nl_family != AF_NETLINK) return -22;
     struct thread *current = sched_get_current();
+    bool uevent_admin = sock->net_ns
+        ? (capability_has_init_ns(current, CAP_NET_ADMIN) ||
+           (current && current->net_ns == sock->net_ns &&
+            capability_has(current, CAP_NET_ADMIN)))
+        : capability_has_init_ns(current, CAP_NET_ADMIN);
     // Group 1 is exclusively kernel events. Only root may publish processed
     // udev events to group 2; listeners receive the actual sender credentials.
-    if ((dest.nl_groups & 1) || (dest.nl_groups && (!current || !capability_has(current, CAP_NET_ADMIN))))
+    if ((dest.nl_groups & 1) || (dest.nl_groups && (!current || !uevent_admin)))
       return -1;
     if (!len || len > 1024 * 1024) return -90;
     void *payload = kmalloc(len);
@@ -625,6 +669,33 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
     return len;
   }
 
+  if (nsk->protocol == NETLINK_GENERIC) {
+    /* No Generic Netlink families are registered. Answer discovery requests
+     * promptly so clients can fall back when an optional family is missing. */
+    struct {
+      struct nlmsghdr_min header;
+      uint8_t command, version;
+      uint16_t reserved;
+    } request;
+    if (len < sizeof(request))
+      return -22;
+    if (is_user_ptr((uint64_t)buf)) {
+      if (copy_from_user(&request, buf, sizeof(request)) != 0)
+        return -14;
+    } else {
+      memcpy(&request, buf, sizeof(request));
+    }
+    if (request.header.nlmsg_len < sizeof(request) || request.header.nlmsg_len > len)
+      return -22;
+
+    int status = request.header.nlmsg_type == GENL_ID_CTRL &&
+                 request.command == CTRL_CMD_GETFAMILY ? -2 : -95;
+    int error = netlink_reply_error(nsk, &request.header, status);
+    if (error)
+      return error;
+    return (ssize_t)len;
+  }
+
   /* Complete route dump requests with an empty multipart result.  This is a
    * valid netlink transaction and lets getifaddrs(3) return an empty list
    * until RTM_NEWLINK/RTM_NEWADDR records are implemented. */
@@ -638,6 +709,14 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
         return -14; // EFAULT
     } else {
       memcpy(&request, buf, sizeof(request));
+    }
+
+    /* RTM_SETLINK expects an acknowledgement, not a dump terminator. */
+    if (request.nlmsg_type == RTM_SETLINK) {
+      int error = netlink_reply_error(nsk, &request, -95);
+      if (error)
+        return error;
+      return (ssize_t)len;
     }
 
     uint32_t reply_pid = nsk->portid ? (uint32_t)nsk->portid : request.nlmsg_pid;
@@ -664,7 +743,11 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
       ack.hdr.nlmsg_seq = request.nlmsg_seq; ack.hdr.nlmsg_pid = reply_pid; ack.request = request;
       ack.error = -22;
       uint8_t payload[256];
-      if (!capability_has(sched_get_current(), CAP_NET_ADMIN)) ack.error = -1;
+      struct thread *cur = sched_get_current();
+      bool net_admin = capability_has_init_ns(cur, CAP_NET_ADMIN) ||
+                       (cur && cur->net_ns == sock->net_ns &&
+                        capability_has(cur, CAP_NET_ADMIN));
+      if (!net_admin) ack.error = -1;
       else if (request.nlmsg_len <= len && request.nlmsg_len <= sizeof(payload) && request.nlmsg_len >= sizeof(request)) {
         int fault = 0;
         if (is_user_ptr((uint64_t)buf)) fault = copy_from_user(payload, buf, request.nlmsg_len);
@@ -717,7 +800,7 @@ static ssize_t netlink_sendto(socket_t *sock, const void *buf, size_t len,
       ack.hdr.nlmsg_seq = request.nlmsg_seq; ack.hdr.nlmsg_pid = reply_pid; ack.request = request;
       ack.error = -22;
       uint8_t payload[512];
-      if (!capability_has(sched_get_current(), CAP_NET_ADMIN)) {
+      if (!capability_has_init_ns(sched_get_current(), CAP_NET_ADMIN)) {
         ack.error = -1;
       } else if (request.nlmsg_len <= len && request.nlmsg_len <= sizeof(payload) &&
                  request.nlmsg_len >= sizeof(request)) {
@@ -1044,7 +1127,7 @@ int netlink_create(socket_t *sock, int protocol) {
   list_add_tail(&nsk->list, &netlink_sockets);
   spinlock_release(&netlink_lock);
 
-  klogf("[OK] AF_NETLINK socket created (protocol=%d)\n", protocol);
+  klog_debugf("[OK] AF_NETLINK socket created (protocol=%d)\n", protocol);
 
   return 0;
 }

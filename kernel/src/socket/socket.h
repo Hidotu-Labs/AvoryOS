@@ -23,6 +23,7 @@ typedef uint16_t sa_family_t;
 #define NETLINK_ROUTE 0
 #define NETLINK_AUDIT 9
 #define NETLINK_KOBJECT_UEVENT 15
+#define NETLINK_GENERIC 16
 
 // QRTR Address Structure
 struct sockaddr_qrtr {
