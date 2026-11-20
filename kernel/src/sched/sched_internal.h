@@ -34,6 +34,7 @@ void sched_free_tid_locked(uint32_t tid);
 /* Thread reaper operations */
 bool sched_thread_off_cpu(struct thread *t);
 void sched_process_reap_queue(struct thread *prev);
+void sched_drain_defer_backlog(void);
 
 /* Runqueue / Deadline helpers */
 void remove_from_runqueue(struct thread *t);

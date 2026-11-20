@@ -9,6 +9,7 @@
 #include "../../../fs/ramfs.h"
 #include "../../../lib/string.h"
 #include "../../../mm/heap.h"
+#include "../../../mm/pmm.h"
 #include "../../../mm/vmm.h"
 #include "arch/uaccess.h"
 
@@ -156,6 +157,8 @@ extern int ascentdrm_ioctl_addfb2(struct drm_file *file, struct drm_device *dev,
 drm_commit_damage_fn_t g_ascent_drm_commit_damage_fn = NULL;
 
 drm_pageflip_fn_t g_ascent_drm_pageflip_fn = NULL;
+/* virtio-gpu: deliver flip events no scanout commit completed. */
+extern void virtio_gpu_flush_flips(void) __attribute__((weak));
 static drm_async_flip_fn_t drm_async_flip;
 
 void ascentdrm_register_async_flip(drm_async_flip_fn_t submit) {
@@ -2276,6 +2279,8 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       drm_console_takeover();
       drm_commit_flipped_crtc(dev, flip->crtc_id);
       ascentdrm_framebuffer_reap_closed(dev);
+      if (g_ascent_drm_pageflip_fn && virtio_gpu_flush_flips)
+        virtio_gpu_flush_flips();
       /* If no virtio hook took ownership, deliver event via legacy path.
        * Pace the event to the next vblank boundary: without this the
        * completion fires the instant the blit finishes and compositors
@@ -2311,6 +2316,10 @@ static int drm_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
       drm_console_takeover();
       drm_commit_atomic(dev);
       ascentdrm_framebuffer_reap_closed(dev);
+      /* Every requested flip event must be delivered, even when the commit
+       * touched no scanout (see virtio_gpu_flush_flips). */
+      if (virtio_gpu_flush_flips)
+        virtio_gpu_flush_flips();
     }
     return ret;
   }
@@ -2523,9 +2532,9 @@ static uint64_t drm_vfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
     struct drm_gem_object *obj = NULL;
     spinlock_acquire(&file->lock);
     for (uint32_t i = 1; i < file->handle_high_water; i++) {
-      if (file->handles[i] && file->handles[i]->prime_buffer &&
-          file->handles[i]->handle == global_handle) {
-        obj = file->handles[i];
+      struct drm_gem_object *c = ascentdrm_file_handle_peek(file, i);
+      if (c && c->prime_buffer && c->handle == global_handle) {
+        obj = c;
         ascentdrm_gem_get(obj);
         break;
       }
@@ -2555,10 +2564,17 @@ static uint64_t drm_vfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
   bool found = false;
   spinlock_acquire(&file->lock);
   for (uint32_t i = 1; i < file->handle_high_water; i++) {
-    struct drm_gem_object *candidate = file->handles[i];
+    struct drm_gem_object *candidate = ascentdrm_file_handle_peek(file, i);
     if (!candidate || phys < candidate->phys_addr)
       continue;
     uint64_t object_offset = phys - candidate->phys_addr;
+    /* A scatter-gather object's token is its first page; the interval
+     * [phys_addr, phys_addr + size) is fictional and overlaps unrelated
+     * memory. Range-matching it resolved one virgl BO's mmap to another
+     * BO, so the client wrote into foreign (later freed) pages: corrupted
+     * renders and PMM free-list corruption. Only an exact token hits. */
+    if (candidate->sg_pages && object_offset != 0)
+      continue;
     if (object_offset <= candidate->size &&
         length <= candidate->size - object_offset) {
       cache_mode = candidate->cache_mode;
@@ -2602,8 +2618,25 @@ static uint64_t drm_vfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
         ? mapped_obj->get_page_phys(mapped_obj, (uint32_t)(page_offset / 4096))
         : mapped_obj->phys_addr + page_offset;
     if (!page_phys || !vmm_map_page(pml4, vaddr + (uint64_t)i * 4096,
-                                    page_phys, page_flags))
+                                    page_phys, page_flags)) {
+      /* Undo this call's PTEs and their references: no VMA will exist to
+       * tear them down. */
+      for (uint32_t j = 0; j < i; j++) {
+        uint64_t va = vaddr + (uint64_t)j * 4096;
+        uint64_t mapped = vmm_virt_to_phys(pml4, va) & PAGE_MASK;
+        vmm_unmap_page(pml4, va);
+        if (mapped && pmm_is_managed(mapped))
+          pmm_free_page((void *)mapped);
+      }
       return (uint64_t)-1;
+    }
+    /* Each PTE owns a PMM reference (mmap_shared/private_pmm_refs on the
+     * client node), as Linux pins a GEM object for the VMA's lifetime.
+     * Without it, GEM_CLOSE before munmap returned live-mapped frames to the
+     * PMM; the client kept writing through the stale PTEs into whatever
+     * reused them (free-list headers, other processes' heaps). */
+    if (pmm_is_managed(page_phys))
+      pmm_incref((void *)page_phys);
   }
   return vaddr;
 }
@@ -2675,8 +2708,10 @@ static uint32_t drm_read(struct vfs_node *node, uint32_t offset,
   }
   memcpy(buffer, &e->event, event_size);
   list_del(&e->list);
+  struct drm_pending_event *heap_event;
+  ascentdrm_event_release_locked(file, e, &heap_event);
   spinlock_release(&file->lock);
-  kfree(e);
+  kfree(heap_event);
   return event_size;
 }
 
@@ -2771,6 +2806,11 @@ static vfs_node_t *drm_alloc_client_node(void) {
   clone->device = file;            /* ← per-client state */
   clone->ioctl = drm_ioctl;
   clone->mmap = drm_vfs_mmap;
+  /* Native GEM mappings pin their frames per PTE (see drm_vfs_mmap). PRIME
+   * mappings go through Linux f_op->mmap and carry linux_vma, which the
+   * teardown paths treat as reference-free. */
+  clone->mmap_shared_pmm_refs = true;
+  clone->mmap_private_pmm_refs = true;
   clone->open = drm_open;
   clone->close = drm_close;
   clone->read = drm_read;

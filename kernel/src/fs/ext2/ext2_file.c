@@ -998,8 +998,9 @@ int ext2_mknod_impl(vfs_node_t *node, char *name, uint16_t permission,
     return -1;
   if (((ext2_mount_t *)node->device)->read_only)
     return -30;
-  if (flags != FS_SOCKET)
+  if (flags != FS_SOCKET && flags != FS_PIPE)
     return -1;
+  bool is_fifo = flags == FS_PIPE;
 
   if (ext2_create_impl(node, name, permission) < 0)
     return -1;
@@ -1019,13 +1020,17 @@ int ext2_mknod_impl(vfs_node_t *node, char *name, uint16_t permission,
    * extent root (EXTENTS_FL plus a header in i_block) that create gave it,
    * and its directory entry must say SOCK, not REG_FILE. */
   ext3_journal_start(mnt);
-  inode.i_mode = (inode.i_mode & 0x0FFF) | EXT2_S_IFSOCK;
+  inode.i_mode = (inode.i_mode & 0x0FFF) | (is_fifo ? EXT2_S_IFIFO : EXT2_S_IFSOCK);
   inode.i_flags &= ~EXT4_EXTENTS_FL;
   memset(inode.i_block, 0, sizeof(inode.i_block));
   ext2_write_inode(mnt, new_node->inode, &inode);
   ext2_replace_dir_entry(mnt, node->inode, name, new_node->inode,
-                         EXT2_FT_SOCK);
+                         is_fifo ? EXT2_FT_FIFO : EXT2_FT_SOCK);
   ext3_journal_stop(mnt);
+  if (is_fifo) {
+    kfree(new_node);
+    return 0;
+  }
 
   new_node->flags  = FS_SOCKET;
   new_node->device = device;

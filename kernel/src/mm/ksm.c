@@ -373,6 +373,21 @@ void ksm_init(void) {
    * timer ISR, which can run before scheduler/KSM initialization. */
   if (ksm_node_pool)
     return;
+  /* `ksm=0` on the kernel command line keeps the merger off, so anonymous-
+   * memory corruption can be bisected against zram (`zram=0`). */
+  {
+    extern const char *kernel_boot_cmdline;
+    const char *s = kernel_boot_cmdline;
+    while (s && (s = strstr(s, "ksm=0"))) {
+      bool start = s == kernel_boot_cmdline || s[-1] == ' ';
+      bool end = s[5] == '\0' || s[5] == ' ';
+      if (start && end) {
+        klog_puts("[KSM] disabled by ksm=0\n");
+        return;
+      }
+      s += 5;
+    }
+  }
   ksm_node_pool = kmalloc(KSM_MAX_NODES * sizeof(struct ksm_node));
   if (!ksm_node_pool) {
     klog_puts("[KSM] ERROR: failed to allocate node pool\n");

@@ -82,6 +82,8 @@ int ext3_journal_stop(ext2_mount_t *mnt);
 /* Commit every deferred (idle group-commit) handle now: fsync/sync. */
 void ext3_journal_commit_all(void);
 int ext3_journal_block(ext2_mount_t *mnt, uint64_t block_nr, const void *data);
+/* Freed block: drop its staged metadata images (caller owns the journal). */
+void ext3_journal_forget(ext2_mount_t *mnt, uint64_t block_nr);
 
 /* True when the active journal transaction holds a newer full-block image of
  * this filesystem block. Called by ext2_read_block before the home cache and

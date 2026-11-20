@@ -859,21 +859,29 @@ static int32_t ioring_do_openat(struct thread *t,
     if (!seccomp_syscall(t, &dummy, SYS_OPENAT, 0xC000003E, args))
       return (int32_t)(int64_t)(dummy.rax ? dummy.rax : (uint64_t)-1);
   }
-  char *path = kmalloc(4096);
-  if (!path)
-    return -12;
-  long n = strncpy_from_user(path, (const char *)sqe->addr, 4096);
-  if (n < 0) {
-    kfree(path);
+  char stack_path[256];
+  char *path = stack_path;
+  long n = strncpy_from_user(stack_path, (const char *)sqe->addr, sizeof(stack_path));
+  if (n < 0)
     return -14;
-  }
-  if ((size_t)n >= 4096) {
-    kfree(path);
-    return -36;
+  if ((size_t)n >= sizeof(stack_path)) {
+    path = kmalloc(4096);
+    if (!path)
+      return -12;
+    n = strncpy_from_user(path, (const char *)sqe->addr, 4096);
+    if (n < 0) {
+      kfree(path);
+      return -14;
+    }
+    if ((size_t)n >= 4096) {
+      kfree(path);
+      return -36;
+    }
   }
   // sys_open_path resolves relative to dirfd (or CWD for AT_FDCWD).
   uint64_t r = sys_open_path(dirfd, path, flags, mode);
-  kfree(path);
+  if (path != stack_path)
+    kfree(path);
   if (r >= (uint64_t)-4095)
     return (int32_t)(int64_t)r;
   return (int32_t)r;

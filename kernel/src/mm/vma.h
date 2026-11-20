@@ -114,6 +114,23 @@ int vma_collect_mapping(struct vma_list *list, void *mapping,
 // structures) Returns true if any region was removed/split
 bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end);
 
+#define VMA_DROP_BATCH 16
+struct vma_drop_entry {
+  void *file_node;
+  void *linux_vma;
+};
+struct vma_drop_list {
+  struct vma_drop_entry entries[VMA_DROP_BATCH];
+  uint32_t count;
+  bool more;
+};
+
+/* Remove VMAs under mm->lock while deferring final vfs_close() /
+ * vma_linux_put() calls until after mm->lock is released. */
+bool vma_remove_collect(struct vma_list *list, uint64_t start, uint64_t end,
+                        struct vma_drop_list *drops);
+void vma_drop_list_release(struct vma_drop_list *drops);
+
 // Update protection bits for a range, splitting VMAs if necessary.
 int vma_mprotect(struct vma_list *list, uint64_t start, uint64_t end,
                  uint64_t new_prot);

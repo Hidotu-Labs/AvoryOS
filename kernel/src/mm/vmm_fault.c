@@ -1,4 +1,5 @@
 #include "../fs/cgroupfs.h"
+#include "../fs/mount_namespace.h"
 #include "../fs/tmpfs.h"
 #include "mm/zram.h"
 
@@ -27,6 +28,11 @@
 #include "vma.h"
 #include "vmm.h"
 #include "vmm_internal.h"
+
+/* Device-physical VMAs (fb_dev_mmap) fault in windows of this size: one
+ * fault maps the aligned window around it, so a streaming writer takes one
+ * fault per window instead of one per 4 KiB page. */
+#define MMAP_PHYS_WINDOW_BYTES (64ULL * PAGE_SIZE)
 #include "shm.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -310,6 +316,27 @@ static void vmm_fault_watermark_reclaim(void) {
   mm_file_cache_reclaim(target);
 }
 
+static void vmm_fault_reclaim_on_failure(void) {
+  bool irq_state = pf_enable_irqs_for_wait();
+  if (hal_irq_enabled()) {
+    if (heap_oom_reclaim)
+      heap_oom_reclaim();
+    if (linuxkpi_shrink_reclaim)
+      linuxkpi_shrink_reclaim(0, 512);
+    mm_file_cache_reclaim(2048);
+    vmm_drain_deferred_work();
+    pmm_pcp_drain_all();
+  }
+  pf_restore_irqs_after_wait(irq_state);
+}
+
+static void vmm_fault_oom(struct thread *current) {
+  /* A surviving sibling could keep the exhausted mm and its locks alive. */
+  current->termination_signal = SIGKILL;
+  sched_terminate_thread_group(current);
+  sched_terminate_thread(current->tid);
+}
+
 /* Map already-cached neighbours of a freshly faulted private file page in one
  * pass, the way the shared/read-only path clusters its 128 KB window.  Every
  * page is installed read-only with the CoW bit, so the first write still
@@ -399,17 +426,13 @@ static void vmm_map_tmpfs_cluster(uint64_t *pml4, uint64_t cr2,
                                   uint64_t vma_offset, uint64_t vma_file_size,
                                   uint64_t vma_flags, uint64_t vma_prot,
                                   void *vma_linux) {
-  if (!pml4 || !node || !mm || !node->device)
+  vfs_node_t *backing = vfs_backing_node(node);
+  if (!pml4 || !mm || !backing || !backing->device)
     return;
 
-  tmpfs_file_t *file = (tmpfs_file_t *)node->device;
+  tmpfs_file_t *file = (tmpfs_file_t *)backing->device;
   uint64_t fault_vpage = cr2 & ~0xFFFULL;
   uint64_t cluster_vstart = cr2 & ~0x1FFFFULL; // 128 KB (32 pages) window
-
-  uint64_t eff_file_size =
-      (vma_file_size > 0 || (vma_flags & MAP_ELF_LOAD))
-          ? vma_file_size
-          : (node->length < (vma_end - vma_start) ? node->length : (vma_end - vma_start));
 
   struct {
     uint64_t vpage;
@@ -418,6 +441,11 @@ static void vmm_map_tmpfs_cluster(uint64_t *pml4, uint64_t cr2,
   uint32_t batch_count = 0;
 
   spinlock_acquire(&file->lock);
+  uint64_t backing_size = backing->length;
+  uint64_t span = vma_end - vma_start;
+  uint64_t eff_file_size =
+      (vma_file_size > 0 || (vma_flags & MAP_ELF_LOAD))
+          ? vma_file_size : (backing_size < span ? backing_size : span);
   for (int ci = 0; ci < 32; ci++) {
     uint64_t vpage = cluster_vstart + (uint64_t)ci * PAGE_SIZE;
     if (vpage == fault_vpage || vpage < vma_start || vpage >= vma_end)
@@ -429,7 +457,7 @@ static void vmm_map_tmpfs_cluster(uint64_t *pml4, uint64_t cr2,
       continue;
 
     uint64_t file_off = vma_offset + page_off;
-    if (file_off >= node->length)
+    if (file_off >= backing_size)
       continue;
 
     uint32_t index = (uint32_t)(file_off >> 12);
@@ -455,10 +483,12 @@ static void vmm_map_tmpfs_cluster(uint64_t *pml4, uint64_t cr2,
         nv && batch[i].vpage >= nv->start
             ? nv->offset + (batch[i].vpage - nv->start)
             : UINT64_MAX;
+    uint64_t nv_span = nv ? nv->end - nv->start : 0;
+    backing_size = backing->length;
     uint64_t nv_eff_file_size =
         nv ? ((nv->file_size > 0 || (nv->flags & MAP_ELF_LOAD))
                   ? nv->file_size
-                  : (node->length < (nv->end - nv->start) ? node->length : (nv->end - nv->start)))
+                  : (backing_size < nv_span ? backing_size : nv_span))
            : 0;
     bool ok = nv && nv->prot == vma_prot && nv->flags == vma_flags &&
               nv->file_node == node && cur_off == orig_off &&
@@ -595,8 +625,17 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
   if (!present_bit) {
     bool irq_state = pf_enable_irqs_for_wait();
     int swapped = zram_fault(current->mm, target_cr3, cr2, write_fault, exec_fault);
+    if (user_mode && swapped == -12) {
+      vmm_fault_reclaim_on_failure();
+      swapped = zram_fault(current->mm, target_cr3, cr2, write_fault, exec_fault);
+    }
     pf_restore_irqs_after_wait(irq_state);
     if (swapped > 0) return 0;
+    if (user_mode && swapped == -12) {
+      klogf("[VMM] OOM restoring a compressed page tid=%u\n", current->tid);
+      vmm_fault_oom(current);
+      return 0;
+    }
     if (swapped < 0) return PF_REJECT("compressed swap fault failed", -swapped, cr2);
   }
 
@@ -608,6 +647,7 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
   if (present_bit && write_fault) {
     uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(target_cr3);
     uint64_t virt = cr2 & PAGE_MASK;
+    bool reclaimed = false;
 
     /* Lock order in this kernel is mm->lock -> vmm_lock.  sys_mmap(),
      * sys_mprotect(), sys_madvise() and the teardown paths all hold mm->lock
@@ -615,6 +655,7 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
      * This path used to take them the other way round (mm->lock from inside
      * the vmm_lock section below), so a CoW fault on one CPU could deadlock
      * against an mprotect()/mmap() on another, with neither able to back off. */
+retry_cow:
     spinlock_acquire(&current->mm->lock);
     vmm_lock_acquire_for((uint64_t *)target_cr3, virt);
 
@@ -628,6 +669,20 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
   do {                                                                         \
     WALK_UNLOCK();                                                             \
     return PF_REJECT((reason), (d1), (d2));                                    \
+  } while (0)
+#define WALK_OOM(reason, d1, d2)                                                \
+  do {                                                                         \
+    WALK_UNLOCK();                                                             \
+    if (!user_mode)                                                            \
+      return PF_REJECT((reason), (d1), (d2));                                    \
+    if (!reclaimed) {                                                          \
+      reclaimed = true;                                                        \
+      vmm_fault_reclaim_on_failure();                                          \
+      goto retry_cow;                                                          \
+    }                                                                          \
+    klogf("[VMM] OOM during copy-on-write tid=%u: %s\n", current->tid, reason);  \
+    vmm_fault_oom(current);                                                     \
+    return 0;                                                                  \
   } while (0)
 
     uint64_t pml4e = pml4[(virt >> 39) & 511];
@@ -719,7 +774,7 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
       // Fragmentation fallback: allocate a 4KB page table and split the 2MB huge page.
       void *pt_phys = pmm_alloc();
       if (!pt_phys)
-        WALK_REJECT("CoW copy: PMM out of memory for huge page split PT", old_huge, refs);
+        WALK_OOM("CoW copy: PMM out of memory for huge page split PT", old_huge, refs);
 
       uint64_t *pt_virt = (uint64_t *)PHYS_TO_VIRT((uint64_t)pt_phys);
       bool pat = (pde & (1ULL << 12)) != 0;
@@ -793,8 +848,8 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
         if (!new_phys) {
           new_phys = vmm_alloc_page_numa(0, 0, 0, virt);
           if (!new_phys)
-            WALK_REJECT("CoW break of the shared zero page: PMM out of "
-                        "memory", old_phys, 0);
+            WALK_OOM("CoW break of the shared zero page: PMM out of memory",
+                     old_phys, 0);
 
           page_zero(PHYS_TO_VIRT((uint64_t)new_phys));
         }
@@ -816,7 +871,7 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
         // Multiple owners — make a private copy.
         void *new_phys = vmm_alloc_page_numa(0, 0, 0, virt);
         if (!new_phys)
-          WALK_REJECT("CoW copy: PMM out of memory", old_phys, refs);
+          WALK_OOM("CoW copy: PMM out of memory", old_phys, refs);
 
         page_copy(PHYS_TO_VIRT((uint64_t)new_phys), PHYS_TO_VIRT(old_phys));
 
@@ -840,6 +895,7 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
     WALK_UNLOCK();
 #undef WALK_UNLOCK
 #undef WALK_REJECT
+#undef WALK_OOM
 
     if (cow_broken) {
       /* Flushing and releasing the old frame happen outside both locks on
@@ -1232,6 +1288,45 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
     return 0;
   }
 
+  // Device-physical mapping (framebuffer): map a window of pages around the
+  // fault instead of the whole range at mmap() time.  Same lock order as the
+  // SHM branch: mm->lock, then the PTE lock inside vmm_map_page_if_unmapped().
+  vfs_node_t *dev_node = (vfs_node_t *)vma_file_node;
+  if (dev_node && dev_node->mmap_phys_pte_flags && dev_node->mmap_phys_fault) {
+    uint64_t fault_page = cr2 & ~0xFFFULL;
+    uint64_t win_start = fault_page & ~((uint64_t)MMAP_PHYS_WINDOW_BYTES - 1);
+    uint64_t win_end = win_start + MMAP_PHYS_WINDOW_BYTES;
+    bool faulted = false;
+
+    spinlock_acquire(&current->mm->lock);
+    struct vma *recheck = vma_find(&current->mm->vmas, fault_page);
+    if (!recheck || recheck->file_node != (void *)dev_node ||
+        fault_page < recheck->start || fault_page >= recheck->end) {
+      spinlock_release(&current->mm->lock);
+      vma_linux_put(vma_linux);
+      return 0; // raced with munmap, retry
+    }
+    uint64_t lo = win_start > recheck->start ? win_start : recheck->start;
+    uint64_t hi = win_end < recheck->end ? win_end : recheck->end;
+    for (uint64_t va = lo; va < hi; va += PAGE_SIZE) {
+      uint64_t phys = dev_node->mmap_phys_fault(
+          dev_node, recheck->offset + (va - recheck->start));
+      if (!phys) {
+        break;
+      }
+      vmm_map_page_if_unmapped((uint64_t *)target_cr3, va, phys,
+                               dev_node->mmap_phys_pte_flags);
+      if (va == fault_page)
+        faulted = true;
+    }
+    spinlock_release(&current->mm->lock);
+    vma_linux_put(vma_linux);
+    if (!faulted)
+      return PF_REJECT("device mapping has no physical page at the faulting "
+                       "address", cr2, 0);
+    return 0;
+  }
+
   void *frame = NULL;
   bool cow_mapping = false;
   bool refault_mapping = false;
@@ -1365,6 +1460,11 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
         cached = vfs_cache_get_or_create(node, file_offset);
         vfs_exec_profile_note_cold(node, file_offset, current->exe_path, cold_n);
       }
+      if (!cached && user_mode &&
+          pmm_get_free_pages_including_pcp() < VMM_FAULT_WATERMARK_PAGES) {
+        vmm_fault_reclaim_on_failure();
+        cached = vfs_cache_get_or_create(node, file_offset);
+      }
       pf_restore_irqs_after_wait(irq_state);
 
       if (!cached || !cached->frame_phys) {
@@ -1437,6 +1537,11 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
         uint64_t cold_n = __atomic_add_fetch(&current->mm->maj_flt, 1, __ATOMIC_RELAXED);
         cached = vfs_cache_get_or_create(node, file_offset);
         vfs_exec_profile_note_cold(node, file_offset, current->exe_path, cold_n);
+      }
+      if (!cached && user_mode &&
+          pmm_get_free_pages_including_pcp() < VMM_FAULT_WATERMARK_PAGES) {
+        vmm_fault_reclaim_on_failure();
+        cached = vfs_cache_get_or_create(node, file_offset);
       }
       pf_restore_irqs_after_wait(irq_state);
 
@@ -1683,14 +1788,7 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
        * that can hand pages back before declaring OOM. IRQs are opened
        * around the reclaim: none of it runs from a nested hard-IRQ fault,
        * and shrinkers may wait on locks held by interrupt handlers. */
-      bool irq_state = pf_enable_irqs_for_wait();
-      if (heap_oom_reclaim)
-        heap_oom_reclaim();
-      if (linuxkpi_shrink_reclaim)
-        linuxkpi_shrink_reclaim(0, 512);
-      mm_file_cache_reclaim(2048);
-      pmm_pcp_drain_all();
-      pf_restore_irqs_after_wait(irq_state);
+      vmm_fault_reclaim_on_failure();
       frame = vmm_alloc_page_numa(vma_numa_policy, vma_numa_nodemask, vma_numa_preferred_node, cr2);
     }
 
@@ -1724,8 +1822,7 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
          * the address space's memory is not released until a thread that
          * does not exist finishes exiting. This matches the fatal-signal
          * default action and Linux's fault-path OOM handling. */
-        sched_terminate_thread_group(current);
-        sched_terminate_thread(current->tid);
+        vmm_fault_oom(current);
         return 0;
       }
       return PF_REJECT("PMM out of memory while demand paging a 4KB page",
@@ -1743,6 +1840,8 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
   // that *some* VMA still covers the address is insufficient: it could now be
   // a different anonymous/file mapping, and installing this frame would
   // silently corrupt the new mapping (including allocator metadata).
+  bool reclaimed_pt = false;
+retry_demand_map:
   spinlock_acquire(&current->mm->lock);
   struct vma *recheck = vma_find(&current->mm->vmas, cr2);
   uint64_t page_vaddr = cr2 & PAGE_MASK;
@@ -1782,10 +1881,17 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
                                          (uint64_t)frame, flags);
   uint64_t existing_phys =
       mapped ? 0 : vmm_virt_to_phys((uint64_t *)target_cr3, vpage);
+  bool swapped_while_preparing = false;
+  if (!mapped && !existing_phys && vpage <= USER_SPACE_LIMIT) {
+    vmm_lock_acquire_for((uint64_t *)target_cr3, vpage);
+    uint64_t *pte = vmm_get_pte_ptr((uint64_t *)target_cr3, vpage);
+    swapped_while_preparing = pte && zram_pte_slot(*pte);
+    vmm_lock_release();
+  }
   spinlock_release(&current->mm->lock);
   if (!mapped) {
     // If another thread already mapped this page while we prepared the frame:
-    if (existing_phys != 0) {
+    if (existing_phys || swapped_while_preparing) {
       if (!node) {
         pmm_free_page(frame);
       } else {
@@ -1795,6 +1901,12 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
       return 0; // Handled concurrently by another thread!
     }
 
+    if (user_mode && !reclaimed_pt) {
+      reclaimed_pt = true;
+      vmm_fault_reclaim_on_failure();
+      goto retry_demand_map;
+    }
+
     if (!node) {
       pmm_free_page(frame);
     } else {
@@ -1802,7 +1914,7 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
     }
     klog_puts("[VMM] Fatal PT alloc failure in paging engine\n");
     if (user_mode) {
-      sched_terminate_thread(current->tid);
+      vmm_fault_oom(current);
       return 0;
     }
     return PF_REJECT("no memory left for an intermediate page table", vpage,
@@ -1936,6 +2048,22 @@ void vmm_init_vsyscall_page(void) {
   if (blob_len > 0xE00)
     blob_len = 0xE00;
   memcpy(v, vdso_blob_start, blob_len);
+
+  /* The vDSO lives on one page and 0xE00+ holds the data area, so a section
+   * header table past the copied blob would point at clobbered bytes or off
+   * the mapping. Userspace (NVIDIA libGL scanning for SHT_NOTE) walks it, so
+   * drop it unless it fits; PT_LOAD/PT_DYNAMIC are all loaders need. */
+  if (blob_len >= 64 && v[0] == 0x7F && v[1] == 'E' && v[2] == 'L' && v[3] == 'F') {
+    uint64_t shoff;
+    uint16_t shentsize, shnum;
+    memcpy(&shoff, v + 0x28, 8);
+    memcpy(&shentsize, v + 0x3A, 2);
+    memcpy(&shnum, v + 0x3C, 2);
+    if (shoff + (uint64_t)shentsize * shnum > blob_len) {
+      memset(v + 0x28, 0, 8);  /* e_shoff */
+      memset(v + 0x3A, 0, 6);  /* e_shentsize, e_shnum, e_shstrndx */
+    }
+  }
 
   /* i386 fallback restorers live on this read-only executable shared page,
    * never on an executable user stack. Legacy sigreturn pops the signal

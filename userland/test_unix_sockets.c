@@ -23,6 +23,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdint.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -98,6 +100,21 @@ static void test_socketpair_durability(unsigned iterations) {
             exit(1);
         }
         total_syscall_calls++;
+
+#if defined(__x86_64__) && !defined(__ILP32__)
+        if (i == 1) {
+            /* The syscall ABI uses only the low 32 bits of fd and cmd. */
+            const uint64_t upper_bits = UINT64_C(0xffffffff00000000);
+            long flags = syscall(SYS_fcntl, upper_bits | (uint32_t)sv[0],
+                                 upper_bits | F_GETFL, 0UL);
+            if (flags < 0 || (flags & (O_ACCMODE | O_NONBLOCK)) !=
+                             (O_RDWR | O_NONBLOCK)) {
+                fprintf(stderr, "fcntl(F_GETFL) with nonzero upper bits: %ld\n",
+                        flags);
+                exit(1);
+            }
+        }
+#endif
 
         // Send & recv probe byte
         char send_byte = (char)(i & 0xFF);
@@ -395,6 +412,10 @@ static void test_sendmsg_recvmsg_durability(unsigned iterations) {
         int fd_to_pass = -1;
         if (i % 10 == 0) {
             fd_to_pass = dup(sv[0]);
+            if (fd_to_pass < 0) {
+                perror("dup for SCM_RIGHTS");
+                exit(1);
+            }
             send_hdr.msg_control = cmsg_buf;
             send_hdr.msg_controllen = sizeof(cmsg_buf);
 
@@ -451,12 +472,18 @@ static void test_sendmsg_recvmsg_durability(unsigned iterations) {
 
         if (i % 10 == 0) {
             struct cmsghdr *cmsg = CMSG_FIRSTHDR(&recv_hdr);
-            if (cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
-                int received_fd = -1;
-                memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
-                if (received_fd >= 0) {
-                    close(received_fd);
-                }
+            if (!cmsg || cmsg->cmsg_level != SOL_SOCKET ||
+                cmsg->cmsg_type != SCM_RIGHTS ||
+                cmsg->cmsg_len != CMSG_LEN(sizeof(int)) ||
+                (recv_hdr.msg_flags & MSG_CTRUNC)) {
+                fprintf(stderr, "missing or truncated SCM_RIGHTS at iter %u\n", i);
+                exit(1);
+            }
+            int received_fd;
+            memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(received_fd));
+            if (close(received_fd) < 0) {
+                perror("close received SCM_RIGHTS fd");
+                exit(1);
             }
         }
 

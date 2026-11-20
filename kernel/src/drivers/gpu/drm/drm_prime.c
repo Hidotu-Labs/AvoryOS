@@ -55,7 +55,21 @@ void ascentdrm_gem_release_storage(struct drm_gem_object *obj) {
 #ifdef LINUXKPI_LINUX_IMPORTED
   linuxkpi_prime_reservation_free(obj->prime_reservation);
 #endif
-  pmm_free_blocks((void *)obj->phys_addr, obj->size / 4096);
+  /* Native objects only: PRIME imports returned above and were never
+   * counted by gem_object_create_impl(). */
+  __atomic_sub_fetch(&ascentdrm_live_gem_objects, 1, __ATOMIC_RELAXED);
+  __atomic_sub_fetch(&ascentdrm_live_gem_bytes, obj->size, __ATOMIC_RELAXED);
+  if (obj->sg_pages) {
+    uint32_t pages = obj->size / 4096;
+    for (uint32_t i = 0; i < pages; i++) {
+      if (obj->sg_pages[i])
+        pmm_free_page((void *)obj->sg_pages[i]);
+    }
+    kfree(obj->sg_pages);
+    obj->sg_pages = NULL;
+  } else {
+    pmm_free_blocks((void *)obj->phys_addr, obj->size / 4096);
+  }
   kfree(obj);
 }
 

@@ -413,7 +413,7 @@ static void parse_dhcp_reply(const uint8_t *frame, size_t len) {
 static void dhcp_rx_handler(struct net_packet *pkt) {
     if (prev_rx_handler)
         prev_rx_handler(pkt);
-    if (pkt && pkt->length >= 14)
+    if (pkt && pkt->device && pkt->length >= 14)
         parse_dhcp_reply(pkt->data, pkt->length);
 }
 

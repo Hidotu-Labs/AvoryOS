@@ -172,7 +172,7 @@ extern size_t pty_shrink_unused_buffers(void) __attribute__((weak));
 
 // Return every completely empty generic slab to PMM. Caller must NOT hold
 // any heap_caches[].lock (we take each one in turn). Returns pages freed.
-static size_t heap_shrink_empty(void) {
+size_t heap_shrink_empty(void) {
   heap_pcpu_flush_all();
   size_t freed = 0;
   uint64_t hhdm = pmm_get_hhdm_offset();
@@ -450,12 +450,11 @@ void *heap_slab_alloc_at(size_t size, void *caller) {
     if (cpu && cpu->cpu_id < MAX_CPUS) {
       struct heap_pcpu_cache *pcpu = &heap_pcpu_caches[cpu->cpu_id][cache_idx];
       if (__builtin_expect(!spinlock_is_locked(&pcpu->lock), 1)) {
-        pcpu->active = 1;
-        __asm__ volatile("" ::: "memory");
+        __atomic_store_n(&pcpu->active, 1, __ATOMIC_SEQ_CST);
         if (__builtin_expect(!spinlock_is_locked(&pcpu->lock), 1)) {
           if (pcpu->count > 0) {
             void *obj = pcpu->entries[--pcpu->count];
-            pcpu->active = 0;
+            __atomic_store_n(&pcpu->active, 0, __ATOMIC_RELEASE);
             if (heap_slab_dbg_on)
               __atomic_add_fetch(
                   &heap_slab_dbg[cache_idx].alloc_pcpu, 1, __ATOMIC_RELAXED);
@@ -463,7 +462,7 @@ void *heap_slab_alloc_at(size_t size, void *caller) {
             return obj;
           }
         }
-        pcpu->active = 0;
+        __atomic_store_n(&pcpu->active, 0, __ATOMIC_RELEASE);
       }
     }
     hal_irq_restore(flags);
@@ -527,14 +526,13 @@ bool heap_slab_free(void *ptr, uint64_t page_base) {
     if (cpu && cpu->cpu_id < MAX_CPUS) {
       struct heap_pcpu_cache *pcpu = &heap_pcpu_caches[cpu->cpu_id][cache_idx];
       if (__builtin_expect(!spinlock_is_locked(&pcpu->lock), 1)) {
-        pcpu->active = 1;
-        __asm__ volatile("" ::: "memory");
+        __atomic_store_n(&pcpu->active, 1, __ATOMIC_SEQ_CST);
         if (__builtin_expect(!spinlock_is_locked(&pcpu->lock), 1)) {
           /* Intercept immediate double-frees in local magazine if debug is enabled */
           if (__builtin_expect(heap_slab_dbg_on, 0)) {
             for (uint32_t i = 0; i < pcpu->count; i++) {
               if (pcpu->entries[i] == ptr) {
-                pcpu->active = 0;
+                __atomic_store_n(&pcpu->active, 0, __ATOMIC_RELEASE);
                 heap_trace_warn_double("in per-CPU freelist!", ptr);
                 hal_irq_restore(flags);
                 return true;
@@ -544,7 +542,7 @@ bool heap_slab_free(void *ptr, uint64_t page_base) {
 
           if (pcpu->count < HEAP_PCPU_CAPACITY) {
             pcpu->entries[pcpu->count++] = ptr;
-            pcpu->active = 0;
+            __atomic_store_n(&pcpu->active, 0, __ATOMIC_RELEASE);
             if (heap_slab_dbg_on)
               __atomic_add_fetch(
                   &heap_slab_dbg[cache_idx].free_park, 1, __ATOMIC_RELAXED);
@@ -558,7 +556,7 @@ bool heap_slab_free(void *ptr, uint64_t page_base) {
             drain_batch[i] = pcpu->entries[--pcpu->count];
           }
           pcpu->entries[pcpu->count++] = ptr;
-          pcpu->active = 0;
+          __atomic_store_n(&pcpu->active, 0, __ATOMIC_RELEASE);
           if (heap_slab_dbg_on)
             __atomic_add_fetch(
                 &heap_slab_dbg[cache_idx].free_park, 1, __ATOMIC_RELAXED);

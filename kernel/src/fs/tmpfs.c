@@ -1,4 +1,5 @@
 #include "tmpfs.h"
+#include "mount_namespace.h"
 #include "cgroupfs.h"
 #include "vfs.h"
 #include "../console/klog.h"
@@ -180,11 +181,16 @@ static tmpfs_page_t *tmpfs_get_or_alloc_page(tmpfs_file_t *file,
     if (p)
         return p;
 
-    if (!tmpfs_charge_bytes(sb, PAGE_SIZE))
+    if (!tmpfs_charge_bytes(sb, PAGE_SIZE)) {
+        klogf("[TMPFS] charge_bytes failed idx=%u used=%llu max=%llu\n",
+              page_index, (unsigned long long)(sb ? sb->used_bytes : 0),
+              (unsigned long long)(sb ? sb->max_bytes : 0));
         return NULL;
+    }
 
     void *frame = pmm_alloc_page();
     if (!frame) {
+        klogf("[TMPFS] pmm_alloc_page failed idx=%u\n", page_index);
         tmpfs_uncharge_bytes(sb, PAGE_SIZE);
         return NULL;
     }
@@ -192,6 +198,7 @@ static tmpfs_page_t *tmpfs_get_or_alloc_page(tmpfs_file_t *file,
 
     tmpfs_page_t *np = kmalloc(sizeof(tmpfs_page_t));
     if (!np) {
+        klogf("[TMPFS] kmalloc failed idx=%u\n", page_index);
         pmm_free_page(frame);
         tmpfs_uncharge_bytes(sb, PAGE_SIZE);
         return NULL;
@@ -200,11 +207,14 @@ static tmpfs_page_t *tmpfs_get_or_alloc_page(tmpfs_file_t *file,
     np->phys       = (uint64_t)frame;
 
     spinlock_acquire(&file->lock);
-    if (asc_radix_tree_insert(&file->pages, page_index, np) != 0) {
+    int ins_rc = asc_radix_tree_insert(&file->pages, page_index, np);
+    if (ins_rc != 0) {
         /* Lost a race (another thread inserted the page first) or the tree
          * could not allocate a node: keep whichever page is already there. */
         tmpfs_page_t *existing = tmpfs_get_page(file, page_index);
         spinlock_release(&file->lock);
+        if (!existing)
+            klogf("[TMPFS] radix_insert failed idx=%u rc=%d\n", page_index, ins_rc);
         pmm_free_page(frame);
         tmpfs_uncharge_bytes(sb, PAGE_SIZE);
         kfree(np);
@@ -423,11 +433,17 @@ static uint64_t tmpfs_mmap(vfs_node_t *node, uint64_t addr, uint64_t length,
     return addr;
 }
 
-bool tmpfs_is_shmem(vfs_node_t *node) {
+static bool tmpfs_is_storage_node(vfs_node_t *node) {
     return node && node->read == tmpfs_read && node->device;
 }
+
+bool tmpfs_is_shmem(vfs_node_t *node) {
+    return tmpfs_is_storage_node(vfs_backing_node(node));
+}
+
 uint64_t tmpfs_fault_page(vfs_node_t *node, uint64_t offset) {
-    if (!tmpfs_is_shmem(node) || offset >= node->length || offset > UINT32_MAX)
+    node = vfs_backing_node(node);
+    if (!tmpfs_is_storage_node(node) || offset >= node->length || offset > UINT32_MAX)
         return 0;
     tmpfs_file_t *file = node->device;
     uint32_t index = offset / PAGE_SIZE;
@@ -1251,11 +1267,16 @@ static void tmpfs_destroy_private_root(vfs_node_t *node) {
     tmpfs_destroy_node(node);
     kfree(sb);
 }
+uint64_t tmpfs_default_max_bytes(void) {
+    uint64_t half_ram = pmm_get_total_memory() / 2;
+    return half_ram > TMPFS_DEFAULT_MAX_BYTES ? half_ram : TMPFS_DEFAULT_MAX_BYTES;
+}
+
 vfs_node_t *tmpfs_create_private_root(void) {
     tmpfs_sb_t *sb = kmalloc(sizeof(*sb));
     if (!sb) return NULL;
     memset(sb, 0, sizeof(*sb));
-    sb->max_bytes = TMPFS_DEFAULT_MAX_BYTES;
+    sb->max_bytes = tmpfs_default_max_bytes();
     sb->max_inodes = TMPFS_DEFAULT_MAX_INODES;
     spinlock_init(&sb->lock);
     vfs_node_t *root = tmpfs_create_root(sb);
@@ -1272,7 +1293,7 @@ void tmpfs_mount_at_sized(const char *path, uint64_t max_bytes,
     if (!sb)
         return;
 
-    sb->max_bytes   = max_bytes  ? max_bytes  : TMPFS_DEFAULT_MAX_BYTES;
+    sb->max_bytes   = max_bytes  ? max_bytes  : tmpfs_default_max_bytes();
     sb->max_inodes  = max_inodes ? max_inodes : TMPFS_DEFAULT_MAX_INODES;
     sb->used_bytes  = 0;
     sb->used_inodes = 0;
@@ -1329,6 +1350,6 @@ void tmpfs_mount_at_sized(const char *path, uint64_t max_bytes,
 }
 
 void tmpfs_mount_at(const char *path) {
-    tmpfs_mount_at_sized(path, TMPFS_DEFAULT_MAX_BYTES,
+    tmpfs_mount_at_sized(path, tmpfs_default_max_bytes(),
                          TMPFS_DEFAULT_MAX_INODES);
 }

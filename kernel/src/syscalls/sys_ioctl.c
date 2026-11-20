@@ -74,6 +74,7 @@ static const char *ioctl_request_name(uint32_t request) {
   case 0x8912: return "SIOCGIFCONF";
   case 0x8915: return "SIOCGIFADDR";
   case 0x8933: return "SIOCGIFINDEX";
+  case 0x8946: return "SIOCETHTOOL";
   case 0x8B07: return "SIOCGIWMODE";
   case 0x80045430: return "TIOCGPTN";
   case 0x40045431: return "TIOCSPTLCK";

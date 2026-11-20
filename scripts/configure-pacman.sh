@@ -35,26 +35,84 @@ ln -sfn /proc/mounts "${ROOTFS_DIR}/etc/mtab"
 python3 - "${ROOTFS_DIR}" <<'PY'
 from collections import defaultdict
 from pathlib import Path
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 
 root = Path(sys.argv[1])
+local = root/'var/lib/pacman/local'
+backup = root/'var/lib/avoryos/pacman-local-backups'
+
+def field(desc, name):
+    fields = desc.read_text().splitlines()
+    marker = f'%{name}%'
+    return fields[fields.index(marker) + 1] if marker in fields else ''
+
+def files_section(record):
+    """Return (paths in %FILES%, lines of any later sections)."""
+    lines = (record/'files').read_text().splitlines()
+    paths, rest, section = [], [], None
+    for line in lines:
+        if line.startswith('%') and line.endswith('%'):
+            section = line
+        if section == '%FILES%':
+            if line and line != '%FILES%':
+                paths.append(line)
+        else:
+            rest.append(line)
+    return paths, rest
+
+def adopt_leftovers(keep, stale_records):
+    """A replaced record may have installed paths the kept one does not list
+    (Arch bash ships usr/bin/sh, usr/bin/rbash and bash.info.gz; Axon's bash
+    of the same version does not). Those files stay on disk, so dropping the
+    record orphans them and every later pacman upgrade of the package fails
+    with "exists in filesystem". Give still-present paths that no other
+    installed package owns to the kept record."""
+    owned = set()
+    for other in local.iterdir():
+        if other != keep and other.is_dir() and (other/'files').is_file():
+            owned.update(files_section(other)[0])
+    kept, rest = files_section(keep)
+    adopted = set()
+    for stale in stale_records:
+        if not (stale/'files').is_file():
+            continue
+        for path in files_section(stale)[0]:
+            if path not in kept and path not in owned and \
+               os.path.lexists(root/path.rstrip('/')):
+                adopted.add(path)
+    if adopted:
+        body = '\n'.join(['%FILES%', *sorted(set(kept) | adopted)]) + '\n\n'
+        # AvoryOS writes its own etc/ files (bash.bashrc, profile...). List
+        # adopted config files as modified backups (hash never matches) so a
+        # later pacman upgrade keeps them and installs a .pacnew instead.
+        configs = sorted(p for p in adopted if p.startswith('etc/')
+                         and not p.endswith('/') and (root/p).is_file())
+        if configs:
+            backed = {l.split('\t')[0] for l in rest if '\t' in l}
+            entries = [f'{p}\t{"0" * 32}' for p in configs if p not in backed]
+            if '%BACKUP%' not in rest:
+                rest = ['%BACKUP%'] + rest
+            i = rest.index('%BACKUP%') + 1
+            rest[i:i] = entries
+        tail = '\n'.join(rest).strip('\n')
+        (keep/'files').write_text(body + (tail + '\n\n' if tail else ''))
+        print(f'{keep.name}: adopted {len(adopted)} path(s) from the replaced record')
+
 packages = defaultdict(list)
-for entry in (root/'var/lib/pacman/local').iterdir():
+for entry in local.iterdir():
     if not entry.is_dir() or entry.is_symlink():
         continue
     desc = entry/'desc'
     if not desc.is_file():
         continue
-    fields = desc.read_text().splitlines()
-    def field(name):
-        marker = f'%{name}%'
-        return fields[fields.index(marker) + 1] if marker in fields else ''
-    name = field('NAME')
-    if not name or not field('INSTALLDATE').isdigit():
+    name = field(desc, 'NAME')
+    if not name or not field(desc, 'INSTALLDATE').isdigit():
         raise SystemExit(f'Invalid installed package metadata: {desc}')
-    packages[name].append((int(field('INSTALLDATE')), desc.stat().st_mtime_ns, entry))
+    packages[name].append((int(field(desc, 'INSTALLDATE')), desc.stat().st_mtime_ns, entry))
 
 for name, entries in packages.items():
     if len(entries) < 2:
@@ -65,12 +123,47 @@ for name, entries in packages.items():
     keep = entries[-1][2]
     if not (keep/'files').is_file():
         raise SystemExit(f'Incomplete installed package metadata: {keep}')
-    backup = root/'var/lib/avoryos/pacman-local-backups'
+    adopt_leftovers(keep, [e[2] for e in entries[:-1]])
     backup.mkdir(parents=True, exist_ok=True)
     for _, _, stale in entries[:-1]:
         destination = Path(tempfile.mkdtemp(prefix=stale.name+'-', dir=backup))
         shutil.move(str(stale), destination/stale.name)
         print(f'Archived stale pacman record {stale.name}; keeping {keep.name}')
+
+current = {name: entries[-1][2] for name, entries in packages.items()
+           if entries[-1][2].is_dir() and (entries[-1][2]/'files').is_file()}
+
+# Repair roots whose duplicates were archived before adoption existed.
+if backup.is_dir():
+    for archived in backup.glob('*/*'):
+        if archived.is_dir() and (archived/'desc').is_file():
+            keep = current.get(field(archived/'desc', 'NAME'))
+            if keep:
+                adopt_leftovers(keep, [archived])
+
+# A record can also be replaced in place (Arch bash 5.3.20 overwritten by
+# Axon's bash 5.3.15) with no copy of the old file list left. The old package
+# archive is still in the cache, so take that version's file list from it.
+with tempfile.TemporaryDirectory() as scratch:
+    for cache in ('var/cache/axon/pkg', 'var/cache/pacman/pkg'):
+        for archive in sorted((root/cache).glob('*.pkg.tar.*')):
+            if archive.name.endswith('.sig'):
+                continue
+            stem = archive.name.split('.pkg.tar.')[0]
+            name = stem.rsplit('-', 3)[0]
+            keep = current.get(name)
+            if not keep or stem.startswith(keep.name + '-'):
+                continue
+            listing = subprocess.run([shutil.which('bsdtar') or 'tar', '-tf', str(archive)],
+                                     capture_output=True, text=True)
+            if listing.returncode:
+                print(f'Warning: could not list {archive}', file=sys.stderr)
+                continue
+            record = Path(scratch)/stem
+            record.mkdir()
+            paths = [p for p in listing.stdout.splitlines() if p and not p.startswith('.')]
+            (record/'files').write_text('%FILES%\n' + '\n'.join(paths) + '\n')
+            adopt_leftovers(keep, [record])
 PY
 
 # Package sysusers hooks are not guaranteed to run during rootless bootstrap.

@@ -144,6 +144,10 @@ static bool vma_has_file_page_refs(struct vma *v) {
     return false;
   if (v->flags & (MAP_PAGECACHE | MAP_SYSV_SHM))
     return true;
+  /* Linux f_op->mmap() inserts frames without PMM references, even when the
+   * native node (e.g. a DRM client, for PRIME) pins its own mappings. */
+  if (v->linux_vma)
+    return false;
   vfs_node_t *node = (vfs_node_t *)v->file_node;
   if (!node)
     return false;
@@ -508,7 +512,18 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
        * masks interrupts, then drained below after faults can run again. */
       teardown_range(pml4, current_thread, vaddr, aligned_len, true,
                      "MAP_FIXED teardown");
-      vma_remove(&current_thread->mm->vmas, vaddr, vaddr + aligned_len);
+      struct vma_drop_list drops = {0};
+      bool more;
+      do {
+        vma_remove_collect(&current_thread->mm->vmas, vaddr,
+                           vaddr + aligned_len, &drops);
+        more = drops.more;
+        if (more) {
+          spinlock_release(&current_thread->mm->lock);
+          vma_drop_list_release(&drops);
+          spinlock_acquire(&current_thread->mm->lock);
+        }
+      } while (more);
       if (flags & MAP_ANONYMOUS) {
         /* Install fixed anonymous mappings atomically with the overlap check
          * and teardown.  The VMA itself reserves the range; moving the normal
@@ -521,11 +536,27 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
                              vaddr + aligned_len, prot, vma_flags,
                              -1, 0, NULL, 0);
         spinlock_release(&current_thread->mm->lock);
+        vma_drop_list_release(&drops);
         vmm_drain_deferred_work();
         if (result < 0)
           return E_NOMEM;
         return vaddr;
       }
+      /* Reserve the torn-down MAP_FIXED range with a PROT_NONE placeholder while
+       * mm->lock is dropped for the file-backed mmap handler, matching the
+       * non-fixed path so concurrent threads cannot claim the gap. */
+      if (vma_add(&current_thread->mm->vmas, vaddr, vaddr + aligned_len,
+                  PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0, NULL, 0) == 0)
+        gap_reserved = true;
+      else {
+        struct vma *pov = vma_find_overlap(&current_thread->mm->vmas, vaddr,
+                                           vaddr + aligned_len);
+        klogf("[MMAP-DIAG] MAP_FIXED placeholder vma_add failed addr=0x%llx len=0x%llx drops=%u pov=[0x%llx,0x%llx)\n",
+              (unsigned long long)vaddr, (unsigned long long)aligned_len,
+              drops.count, (unsigned long long)(pov ? pov->start : 0),
+              (unsigned long long)(pov ? pov->end : 0));
+      }
+
       /* Keep non-fixed mmap reservations above this range while a
        * file-backed MAP_FIXED operation finishes outside mm->lock. */
       if (vaddr < MMAP_REGION_LIMIT &&
@@ -538,6 +569,7 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
                 reservation_end);
       }
       spinlock_release(&current_thread->mm->lock);
+      vma_drop_list_release(&drops);
       vmm_drain_deferred_work();
     } else {
       teardown_range(pml4, current_thread, vaddr, aligned_len, false,
@@ -589,6 +621,30 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
         if (vaddr && (vaddr >= MMAP_REGION_BASE ||
                       aligned_len > MMAP_REGION_BASE - vaddr))
           vaddr = 0;
+      }
+
+      /* Anonymous VMAs are installed under mm->lock, so no file handler can
+       * be racing for interior gaps: reuse space munmap released below the
+       * bump cursor before declaring the arena full. */
+      if (!vaddr && anonymous && !low_mapping) {
+        vaddr = vma_find_gap(&current_thread->mm->vmas, aligned_len,
+                             MMAP_REGION_BASE, MMAP_REGION_LIMIT);
+      }
+
+      /* i386 tasks only own 3 GiB; the 1.75 GiB arena alone is too small for
+       * Steam/CEF. Fall back to the space between the arena and the stack
+       * (leaving 16 MiB for stack growth), then above the heap with 64 MiB of
+       * brk headroom. */
+      if (!vaddr && anonymous && mm_compat32()) {
+        vaddr = vma_find_gap(&current_thread->mm->vmas, aligned_len,
+                             0xB0000000ULL, 0xBFFFE000ULL /* ELF32_STACK_TOP */ - 0x1000000ULL);
+        if (!vaddr) {
+          uint64_t low_base = PAGE_ALIGN_UP(current_thread->mm->brk_current) +
+                              0x4000000ULL;
+          if (low_base < 0x40000000ULL)
+            vaddr = vma_find_gap(&current_thread->mm->vmas, aligned_len,
+                                 low_base, 0x40000000ULL);
+        }
       }
 
       /* The bump cursor only moves forward, so a region munmap released --
@@ -708,6 +764,11 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
         }
         if (gap_reserved)
           mmap_gap_release(current_thread->mm, vaddr, aligned_len);
+        if (fixed && (result == MAP_FAILED || result == E_NOMEM))
+          klogf("[MMAP-DIAG] node->mmap failed name='%s' ret=0x%llx addr=0x%llx len=0x%llx off=0x%llx\n",
+                node->name, (unsigned long long)result,
+                (unsigned long long)vaddr, (unsigned long long)aligned_len,
+                (unsigned long long)offset);
         return result == MAP_FAILED ? E_NOMEM : result;
       }
 
@@ -718,8 +779,19 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
         int vma_idx =
             vma_add(&current_thread->mm->vmas, result, result + aligned_len, prot,
                     flags | permissions, (int)fd, offset, node, 0);
+        struct vma *ov = vma_idx < 0 ? vma_find_overlap(&current_thread->mm->vmas,
+                                                        result, result + aligned_len) : NULL;
+        uint64_t ov_s = ov ? ov->start : 0, ov_e = ov ? ov->end : 0;
+        uint64_t ov_p = ov ? ov->prot : 0, ov_f = ov ? ov->flags : 0;
+        int ov_fd = ov ? ov->fd : -1;
         spinlock_release(&current_thread->mm->lock);
         if (vma_idx < 0) {
+          if (fixed)
+            klogf("[MMAP-DIAG] vma_add failed (node->mmap) name='%s' addr=0x%llx len=0x%llx gap=%d ov=[0x%llx,0x%llx) prot=0x%llx flags=0x%llx fd=%d\n",
+                  node->name, (unsigned long long)result,
+                  (unsigned long long)aligned_len, gap_reserved ? 1 : 0,
+                  (unsigned long long)ov_s, (unsigned long long)ov_e,
+                  (unsigned long long)ov_p, (unsigned long long)ov_f, ov_fd);
           extern void *linuxkpi_vma_take_pending(void) __attribute__((weak));
           extern void linuxkpi_vma_unref(void *) __attribute__((weak));
           if (linuxkpi_vma_take_pending && linuxkpi_vma_unref) {
@@ -776,9 +848,18 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
     int vma_idx = vma_add(&current_thread->mm->vmas, vaddr,
                           vaddr + aligned_len, prot,
                           flags | MAP_PAGECACHE | permissions, (int)fd, offset, node, 0);
+    struct vma *ov = vma_idx < 0 ? vma_find_overlap(&current_thread->mm->vmas,
+                                                    vaddr, vaddr + aligned_len) : NULL;
+    uint64_t ov_s = ov ? ov->start : 0, ov_e = ov ? ov->end : 0;
     spinlock_release(&current_thread->mm->lock);
-    if (vma_idx < 0)
+    if (vma_idx < 0) {
+      if (fixed)
+        klogf("[MMAP-DIAG] vma_add failed (pagecache) name='%s' addr=0x%llx len=0x%llx ov=[0x%llx,0x%llx)\n",
+              node->name, (unsigned long long)vaddr,
+              (unsigned long long)aligned_len,
+              (unsigned long long)ov_s, (unsigned long long)ov_e);
       return E_NOMEM;
+    }
     return vaddr;
   }
 
@@ -865,10 +946,17 @@ uint64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t a2, uint64_t a3,
     batch_start = batch_end;
   }
 
-  spinlock_acquire(&current->mm->lock);
-  vma_remove(&current->mm->vmas, addr, end);
-  vma_merge_adjacent(&current->mm->vmas);
-  spinlock_release(&current->mm->lock);
+  struct vma_drop_list drops = {0};
+  bool more;
+  do {
+    spinlock_acquire(&current->mm->lock);
+    vma_remove_collect(&current->mm->vmas, addr, end, &drops);
+    more = drops.more;
+    if (!more)
+      vma_merge_adjacent(&current->mm->vmas);
+    spinlock_release(&current->mm->lock);
+    vma_drop_list_release(&drops);
+  } while (more);
   vmm_drain_deferred_work();
 
   return 0;

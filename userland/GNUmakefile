@@ -357,6 +357,10 @@ test_syscall_cpu.elf: test_syscall_cpu.c $(GLIBC_STAMP)
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		test_syscall_cpu.c -o test_syscall_cpu.elf
 
+test_syscall_memory.elf: test_syscall_memory.c syscall_tests.h $(GLIBC_STAMP)
+	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
+		test_syscall_memory.c -o test_syscall_memory.elf
+
 test_blocking_liveness.elf: test_blocking_liveness.c $(GLIBC_STAMP)
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) \
 		test_blocking_liveness.c -o test_blocking_liveness.elf -lpthread

@@ -207,11 +207,12 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms,
   size_t bytes = (size_t)nfds * sizeof(struct pollfd);
   if (!is_user_range((void *)fds_ptr, bytes))
     return (uint64_t)-14;
-  struct pollfd *fds = kmalloc(bytes);
+  struct pollfd stack_fds[16];
+  struct pollfd *fds = nfds <= 16 ? stack_fds : kmalloc(bytes);
   if (!fds)
     return (uint64_t)-12;
   if (copy_from_user(fds, (void *)fds_ptr, bytes)) {
-    kfree(fds);
+    if (fds != stack_fds) kfree(fds);
     return (uint64_t)-14;
   }
   uint64_t result = do_poll(fds, nfds, timeout_ms);
@@ -225,7 +226,7 @@ static uint64_t sys_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ms,
       }
     }
   }
-  kfree(fds);
+  if (fds != stack_fds) kfree(fds);
   return result;
 }
 
@@ -296,7 +297,8 @@ static uint64_t do_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
     return 0;
   if (nfds > MAX_FDS)
     nfds = MAX_FDS;
-  struct pollfd *pfds = kmalloc(nfds * sizeof(*pfds));
+  struct pollfd stack_pfds[16];
+  struct pollfd *pfds = nfds <= 16 ? stack_pfds : kmalloc(nfds * sizeof(*pfds));
   if (!pfds)
     return (uint64_t)-12; // ENOMEM
   uint64_t p_count = 0;
@@ -330,13 +332,13 @@ static uint64_t do_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
       memset((void *)writefds, 0, set_size);
     if (exceptfds)
       memset((void *)exceptfds, 0, set_size);
-    kfree(pfds);
+    if (pfds != stack_pfds) kfree(pfds);
     return 0;
   }
 
   uint64_t ready = do_poll(pfds, p_count, timeout_ms);
   if ((int64_t)ready < 0) {
-    kfree(pfds);
+    if (pfds != stack_pfds) kfree(pfds);
     return ready;
   }
 
@@ -363,7 +365,7 @@ static uint64_t do_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
       res_count++;
     }
   }
-  kfree(pfds);
+  if (pfds != stack_pfds) kfree(pfds);
   return res_count;
 }
 
@@ -426,19 +428,52 @@ static uint64_t sys_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
 static uint64_t sys_select(uint64_t nfds, uint64_t readfds, uint64_t writefds,
                            uint64_t exceptfds, uint64_t timeout, uint64_t a5) {
   (void)a5;
-  uint64_t timeout_ms = (uint64_t)-1;
+  if (nfds > 1024)
+    return (uint64_t)-22;
 
-  if (timeout && is_user_ptr(timeout)) {
+  size_t bytes = ((nfds + 63) / 64) * sizeof(uint64_t);
+  uint64_t sets[3][16] = {{0}};
+  uint64_t ptrs[3] = {readfds, writefds, exceptfds};
+  if (bytes) {
+    for (int i = 0; i < 3; i++) {
+      if (ptrs[i] && copy_from_user(sets[i], (void *)ptrs[i], bytes))
+        return (uint64_t)-14;
+    }
+  }
+
+  uint64_t timeout_ms = (uint64_t)-1;
+  if (timeout) {
     struct {
       int64_t tv_sec;
       int64_t tv_usec;
-    } *tv = (void *)timeout;
-    if (!vmm_is_user_addr_range_valid(timeout, 16))
+    } tv;
+    if (!is_user_ptr(timeout) ||
+        !vmm_is_user_addr_range_valid(timeout, sizeof(tv)) ||
+        copy_from_user(&tv, (void *)timeout, sizeof(tv)))
       return (uint64_t)-14;
-    timeout_ms = (uint64_t)(tv->tv_sec * 1000 + tv->tv_usec / 1000);
+    if (tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1000000)
+      return (uint64_t)-22;
+
+    /* Convert to the millisecond resolution used by do_pselect6(), rounding
+     * up sub-millisecond waits and saturating large valid timeouts. */
+    uint64_t seconds = (uint64_t)tv.tv_sec;
+    uint64_t fraction_ms = ((uint64_t)tv.tv_usec + 999) / 1000;
+    const uint64_t max_ms = (uint64_t)INT64_MAX;
+    timeout_ms = seconds > (max_ms - fraction_ms) / 1000
+                     ? max_ms
+                     : seconds * 1000 + fraction_ms;
   }
 
-  return do_pselect6(nfds, readfds, writefds, exceptfds, timeout_ms);
+  uint64_t ret = do_pselect6(nfds, readfds ? (uint64_t)sets[0] : 0,
+                             writefds ? (uint64_t)sets[1] : 0,
+                             exceptfds ? (uint64_t)sets[2] : 0, timeout_ms);
+  if ((int64_t)ret >= 0 && bytes) {
+    for (int i = 0; i < 3; i++) {
+      if (ptrs[i] && copy_to_user((void *)ptrs[i], sets[i], bytes))
+        return (uint64_t)-14;
+    }
+  }
+  return ret;
 }
 
 // Register poll/select syscalls

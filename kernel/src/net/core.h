@@ -96,6 +96,8 @@ void net_set_rx_tap(net_rx_tap_t, void *context);
  * through return. Accepted frames hold an internal reference until the
  * handler finishes or the stale packet is discarded. */
 bool net_rx_submit_irq(struct net_device *, const void *, size_t);
+/* Queue a locally generated IPv4 datagram without a link-layer header. */
+bool net_rx_submit_loopback(const void *, size_t);
 /* Submit a burst with one queue-lock acquisition and one worker wake. */
 size_t net_rx_submit_batch_irq(struct net_device *,
                                const struct net_rx_frame *, size_t);

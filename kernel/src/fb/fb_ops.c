@@ -114,6 +114,41 @@ uint32_t fb_dev_write(struct vfs_node *node, uint32_t offset, uint32_t size, uin
     return size;
 }
 
+/* Physical base of the framebuffer aperture, or 0 when unknown. */
+static uint64_t fb_mmap_phys_base(uint64_t *pml4) {
+    uint64_t phys_base = fb_global.phys_base;
+    if (!phys_base && fb_global.screen_base) {
+        phys_base = vmm_virt_to_phys(pml4, (uint64_t)fb_global.screen_base);
+        if (!phys_base && (uint64_t)fb_global.screen_base >= 0xFFFF800000000000ULL) {
+            phys_base = (uint64_t)fb_global.screen_base - 0xFFFF800000000000ULL;
+        }
+    }
+    return phys_base;
+}
+
+/* Demand fault callback for framebuffer VMAs: the physical page behind one
+ * byte offset of the screen.  The fault path maps it with the WC flags below. */
+static uint64_t fb_mmap_phys_fault(struct vfs_node *node, uint64_t file_offset) {
+    (void)node;
+    if (file_offset >= fb_global.screen_size)
+        return 0;
+    uint64_t *pml4 = vmm_get_active_pml4();
+    if (!pml4)
+        return 0;
+    uint64_t phys_base = fb_mmap_phys_base(pml4);
+    return phys_base ? phys_base + file_offset : 0;
+}
+
+/* Write-Combining (WC) page attributes for user MMIO (PAT entry 7:
+ * PAT=1, PCD=1, PWT=1). */
+#define FB_MMAP_PTE_FLAGS (PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_USER | \
+                           PAGE_FLAG_PAT | PAGE_FLAG_PCD | PAGE_FLAG_PWT)
+
+void fb_mmap_demand_register(struct vfs_node *node) {
+    node->mmap_phys_pte_flags = FB_MMAP_PTE_FLAGS;
+    node->mmap_phys_fault = fb_mmap_phys_fault;
+}
+
 uint64_t fb_dev_mmap(struct vfs_node *node, uint64_t addr, uint64_t length,
                      uint64_t prot, uint64_t flags, uint64_t offset) {
     (void)node;
@@ -130,27 +165,11 @@ uint64_t fb_dev_mmap(struct vfs_node *node, uint64_t addr, uint64_t length,
     if (!user_pml4)
         return (uint64_t)-14; // -EFAULT
 
-    uint64_t phys_base = fb_global.phys_base;
-    if (!phys_base && fb_global.screen_base) {
-        phys_base = vmm_virt_to_phys(user_pml4, (uint64_t)fb_global.screen_base);
-        if (!phys_base && (uint64_t)fb_global.screen_base >= 0xFFFF800000000000ULL) {
-            phys_base = (uint64_t)fb_global.screen_base - 0xFFFF800000000000ULL;
-        }
-    }
-
-    if (!phys_base)
+    if (!fb_mmap_phys_base(user_pml4))
         return (uint64_t)-14;
 
-    /* Write-Combining (WC) page attributes for user MMIO (PAT entry 7:
-     * PAT=1, PCD=1, PWT=1). */
-    uint64_t page_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_RW | PAGE_FLAG_USER |
-                          PAGE_FLAG_PAT | PAGE_FLAG_PCD | PAGE_FLAG_PWT;
-
-    size_t pages = (length + 0xFFF) / 0x1000;
-    if (!vmm_map_range(user_pml4, addr, (phys_base + offset), pages, page_flags)) {
-        return (uint64_t)-12; // -ENOMEM
-    }
-
+    /* No PTEs here: sys_mmap() registers the VMA, and the fault path maps
+     * each window of the framebuffer on first touch via fb_mmap_phys_fault(). */
     return addr;
 }
 

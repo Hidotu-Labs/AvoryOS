@@ -437,6 +437,23 @@ static bool port_reusable_locked(uint16_t port)
 /* TCB lifecycle                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Socket buffers are physically contiguous kmalloc runs (the default receive
+ * buffer is 65 pages). Under fragmentation that failed socket() outright with
+ * ENOMEM for Steam, systemd-resolved and games. Every user of these rings is
+ * capacity-relative and SO_RCVBUF/SO_SNDBUF resize them later, so fall back
+ * to the largest power-of-two size that is available. */
+static void *tcp_buf_alloc(size_t want, size_t min, size_t *got)
+{
+    for (size_t sz = want; sz >= min; sz >>= 1) {
+        void *p = kmalloc(sz);
+        if (p) {
+            *got = sz;
+            return p;
+        }
+    }
+    return NULL;
+}
+
 static struct tcp_tcb *tcb_create(void)
 {
     struct tcp_tcb *t = kmalloc(sizeof(struct tcp_tcb));
@@ -444,20 +461,20 @@ static struct tcp_tcb *tcb_create(void)
         return NULL;
     memset(t, 0, sizeof(*t));
 
-    t->rx_buffer = kmalloc(TCP_DEFAULT_RCVBUF);
+    t->rx_buffer = tcp_buf_alloc(TCP_DEFAULT_RCVBUF, TCP_MIN_RCVBUF,
+                                 &t->rx_capacity);
     if (!t->rx_buffer) {
         kfree(t);
         return NULL;
     }
-    t->rx_capacity = TCP_DEFAULT_RCVBUF;
 
-    t->tx_buffer = kmalloc(TCP_DEFAULT_SNDBUF);
+    t->tx_buffer = tcp_buf_alloc(TCP_DEFAULT_SNDBUF, TCP_MIN_SNDBUF,
+                                 &t->tx_capacity);
     if (!t->tx_buffer) {
         kfree(t->rx_buffer);
         kfree(t);
         return NULL;
     }
-    t->tx_capacity = TCP_DEFAULT_SNDBUF;
     return t;
 }
 
@@ -467,7 +484,8 @@ static void tcb_init_locked(struct tcp_tcb *t)
     t->state = TCP_CLOSED;
     t->mss = TCP_MAX_MSS;
     t->rcv_wnd = TCP_DEFAULT_WINDOW;
-    t->sndbuf = TCP_DEFAULT_SNDBUF;
+    t->sndbuf = TCP_DEFAULT_SNDBUF < t->tx_capacity ? TCP_DEFAULT_SNDBUF
+                                                    : (uint32_t)t->tx_capacity;
     t->linger_seconds = -1;
     t->keepcnt = TCP_KEEPALIVE_CNT_DEFAULT;
     t->keepidle_ms = (uint32_t)TCP_KEEPALIVE_IDLE_DEFAULT * 1000u;
@@ -593,6 +611,7 @@ void tcp_put(struct tcp_tcb *t)
     if (had_ref) {
         t->wait_queue = NULL;
         t->vfs_node = NULL;
+        t->socket_inode = 0;
     }
     enum tcp_state st = t->state;
     spinlock_release(&lock);
@@ -641,6 +660,9 @@ void tcp_attach_socket(struct tcp_tcb *t, void *wait_queue, void *vfs_node)
         t->reap = false;
         t->wait_queue = wait_queue;
         t->vfs_node = vfs_node;
+        const vfs_node_t *node = vfs_node;
+        t->socket_inode = node ? node->inode : 0;
+        t->socket_uid = node ? node->uid : 0;
         tcp_timer_refresh_locked(t);
     }
     spinlock_release(&lock);
@@ -742,6 +764,9 @@ static int emit_at(struct tcp_tcb *t, uint32_t seq, uint8_t flags,
         return ipv6_send_raw(t->remote_ip6, 6, segment, hdr_len + len);
     }
     p16(segment + 16, csum(t->local_ip, t->remote_ip, segment, hdr_len + len));
+    if (ipv4_is_loopback(t->remote_ip))
+        return ipv4_send_loopback(t->local_ip, t->remote_ip, 6,
+                                  segment, hdr_len + len);
     return ipv4_send_raw(t->remote_ip, 6, segment, hdr_len + len);
 }
 
@@ -1039,7 +1064,8 @@ int tcp_active_open(struct tcp_tcb *t, uint32_t ip, uint16_t port)
         return -22;
 
     const struct ipv4_config *cfg = ipv4_get_config();
-    if (!cfg || !cfg->address)
+    bool loopback = ipv4_is_loopback(ip);
+    if (!loopback && (!cfg || !cfg->address))
         return -101;
 
     spinlock_acquire(&lock);
@@ -1049,7 +1075,20 @@ int tcp_active_open(struct tcp_tcb *t, uint32_t ip, uint16_t port)
     }
 
     t->address_family = 4;
-    t->local_ip = cfg->address;
+    if (loopback) {
+        if (t->local_ip && !ipv4_is_loopback(t->local_ip)) {
+            spinlock_release(&lock);
+            return -101;
+        }
+        if (!t->local_ip)
+            t->local_ip = IPV4_ADDR(127, 0, 0, 1);
+    } else {
+        if (ipv4_is_loopback(t->local_ip)) {
+            spinlock_release(&lock);
+            return -101;
+        }
+        t->local_ip = cfg->address;
+    }
     t->remote_ip = ip;
     t->remote_port = port;
 
@@ -2847,6 +2886,10 @@ int tcp_get_snapshot(struct tcp_entry_snapshot *out, int max)
         out[n].bytes_recv = t->bytes_recv;
         out[n].retransmits = t->retransmits;
         out[n].rx_queued = (uint32_t)(t->rx_head - t->rx_tail);
+        out[n].tx_queued = seq_gt(t->tx_head, t->snd_una)
+                              ? t->tx_head - t->snd_una : 0;
+        out[n].inode = t->socket_inode;
+        out[n].uid = t->socket_inode ? t->socket_uid : 0;
         out[n].cwnd = t->cwnd;
         out[n].srtt_ms = t->srtt_ms;
         n++;

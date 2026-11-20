@@ -342,8 +342,20 @@ static inline int futex_get_key(uint32_t *uaddr, bool private,
   }
   uint64_t phys = vmm_virt_to_phys((uint64_t *)t->cr3, vaddr);
   spinlock_release(&t->mm->lock);
-  if (!phys)
-    return -EFAULT;
+  if (!phys) {
+    /* Not mapped in this process yet (a fresh MAP_SHARED view of a memfd or
+     * shm file the caller has not touched). Linux faults it in here; failing
+     * with EFAULT instead broke cross-process xshmfence waits/wakes, so a
+     * 32-bit GLX client (Steam's update UI) never saw its Present complete. */
+    uint32_t probe;
+    if (copy_from_user(&probe, (const void *)vaddr, sizeof(probe)) != 0)
+      return -EFAULT;
+    spinlock_acquire(&t->mm->lock);
+    phys = vmm_virt_to_phys((uint64_t *)t->cr3, vaddr);
+    spinlock_release(&t->mm->lock);
+    if (!phys)
+      return -EFAULT;
+  }
   key->space = 0;
   key->address = phys;
   return 0;
@@ -506,7 +518,7 @@ park_again:
     /* An unrelated/spurious scheduler wake is not a timeout. Keep the
      * registered waiter and re-arm under its bucket lock until the actual
      * clock deadline, a matching futex wake, or a signal. */
-    if (timeout_ts && lapic_timer_get_ticks() < wait_deadline &&
+    if ((!timeout_ts || lapic_timer_get_ticks() < wait_deadline) &&
         !thread_has_pending_signal(waiter.thread)) {
       waiter.thread->wakeup_ticks = wait_deadline;
       waiter.thread->state = THREAD_BLOCKED;

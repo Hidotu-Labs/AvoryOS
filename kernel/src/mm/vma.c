@@ -342,14 +342,33 @@ void vma_attach_linux(struct vma_list *list, uint64_t start, void *linux_vma) {
   vma_linux_ref(linux_vma);
 }
 
-bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
+void vma_drop_list_release(struct vma_drop_list *drops) {
+  if (!drops)
+    return;
+  for (uint32_t i = 0; i < drops->count; i++) {
+    vma_file_unref(drops->entries[i].file_node);
+    vma_linux_put(drops->entries[i].linux_vma);
+  }
+  drops->count = 0;
+  drops->more = false;
+}
+
+bool vma_remove_collect(struct vma_list *list, uint64_t start, uint64_t end,
+                        struct vma_drop_list *drops) {
   TSC_BEGIN(vma_remove);
   vma_cache_flush(list);
+  if (drops)
+    drops->more = false;
   bool overall_removed = false;
   struct vma *v;
 
   // Continuously find and process overlapping regions recursively
   while ((v = vma_find_overlap(list, start, end)) != NULL) {
+    if (drops && (v->file_node || v->linux_vma) &&
+        drops->count >= VMA_DROP_BATCH) {
+      drops->more = true;
+      break;
+    }
     overall_removed = true;
 
     // Save current properties before deleting the structure
@@ -369,11 +388,13 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
     list->root = delete_node(list->root, v->start, &deleted);
     list->count--;
 
+    bool split = false;
     // Case 1: Complete overlap - node is entirely subsumed -> do not re-insert
     // anything
 
     // Case 2: Unmap from middle - split into two flanking regions
     if (start > v_start && end < v_end) {
+      split = true;
       uint64_t len1 = start - v_start;
       uint64_t sub1 = MIN(orig_file_size, len1);
 
@@ -388,6 +409,7 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
     }
     // Case 3: Unmap from start - shrinking start boundary forward
     else if (start <= v_start && end > v_start && end < v_end) {
+      split = true;
       uint64_t rel = end - v_start;
       uint64_t len = v_end - end;
       uint64_t sub = (orig_file_size > rel) ? MIN(orig_file_size - rel, len) : 0;
@@ -397,6 +419,7 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
     }
     // Case 4: Unmap from end - shrinking end boundary backward
     else if (end >= v_end && start > v_start && start < v_end) {
+      split = true;
       uint64_t len = start - v_start;
       uint64_t sub = MIN(orig_file_size, len);
 
@@ -404,16 +427,27 @@ bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
       vma_attach_linux(list, v_start, vma_linux_vma);
     }
 
-    vma_file_unref(vma_file_node);
-    /* delete_node() dropped the original node's reference; the re-added split
-     * pieces each took one above, so a wrapper shared by pieces stays alive
-     * until the last piece goes.  A fully-covered node's last reference was
-     * just dropped by delete_node(), closing the wrapper. */
-    vma_linux_put(vma_linux_vma);
+    if (!split && drops && (vma_file_node || vma_linux_vma)) {
+      drops->entries[drops->count++] = (struct vma_drop_entry){
+          .file_node = vma_file_node,
+          .linux_vma = vma_linux_vma,
+      };
+    } else {
+      vma_file_unref(vma_file_node);
+      /* delete_node() dropped the original node's reference; the re-added split
+       * pieces each took one above, so a wrapper shared by pieces stays alive
+       * until the last piece goes.  A fully-covered node's last reference was
+       * just dropped by delete_node(), closing the wrapper. */
+      vma_linux_put(vma_linux_vma);
+    }
   }
 
   TSC_END(vma_remove);
   return overall_removed;
+}
+
+bool vma_remove(struct vma_list *list, uint64_t start, uint64_t end) {
+  return vma_remove_collect(list, start, end, NULL);
 }
 
 int vma_mprotect_pkey(struct vma_list *list, uint64_t start, uint64_t end,

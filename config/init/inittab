@@ -6,4 +6,5 @@ tty1::respawn:/bin/avory-login
 # BusyBox init handles Ctrl-Alt-Del and shutdown without a separate service
 # manager. BusyBox applet links, including /sbin/init, are staged in rootfs.
 ::ctrlaltdel:/usr/bin/busybox reboot
+::shutdown:/bin/sh -c 'cat /proc/sys/kernel/uname_linux > /var/lib/avoryos/uname-linux.tmp && mv /var/lib/avoryos/uname-linux.tmp /var/lib/avoryos/uname-linux' 2>/dev/null
 ::shutdown:/usr/bin/busybox umount -a -r

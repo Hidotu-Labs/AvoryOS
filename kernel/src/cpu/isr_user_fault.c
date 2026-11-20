@@ -767,7 +767,7 @@ void isr_report_user_fault(struct registers *regs, int sig,
        * pending TLB IPIs and can stall unrelated address-space teardown.
        * Keep the compact summary below for these deliberate process exits;
        * retain deep reports for the first memory/instruction faults. */
-      if (sig != SIGABRT && sig != SIGTRAP && seen <= 4 && have_fault_log) {
+      if (sig != SIGTRAP && seen <= 4 && have_fault_log) {
       // 1. Log detailed report to kernel console
       klog_puts("\n" KLOG_CLR_RED "################################################################################" KLOG_CLR_RESET "\n");
       klog_puts(KLOG_CLR_RED "[ USER FAULT ]" KLOG_CLR_RESET " process '");
@@ -829,6 +829,16 @@ void isr_report_user_fault(struct registers *regs, int sig,
         klog_puts(KLOG_CLR_YELLOW "Signal delivered to thread" KLOG_CLR_RESET);
       }
       klog_puts("\n");
+      if (regs->int_no == 14) {
+        struct vmm_fault_reject rej;
+        if (vmm_get_last_fault_reject(&rej) && rej.cr2 == addr &&
+            rej.tid == current->tid && rej.reason) {
+          klogf("  PAGER VERDICT: %s (%s:%u, detail=0x%llx detail2=0x%llx)\n",
+                rej.reason, rej.file ? rej.file : "-", rej.line,
+                (unsigned long long)rej.detail,
+                (unsigned long long)rej.detail2);
+        }
+      }
 
       klog_puts("  RIP: "); klog_hex64(regs->rip);
       klog_resolve_fault_address(current, regs->rip);

@@ -4,6 +4,7 @@
 #include "console/klog.h"
 #include "hal/hal.h"
 #include "lib/string.h"
+#include "sched/sched.h"
 #include "smp/cpu.h"
 
 void pmm_bitmap_set_range(uint8_t *bm, size_t start_bit, size_t count) {
@@ -353,8 +354,13 @@ __attribute__((optimize("O3"))) void *pmm_alloc_pages(size_t count) {
   hal_irq_restore(flags);
 
   void *res = pmm_alloc_pages_node(count, node);
-  if (res && pmm_sites_enabled)
-    pmm_site_record_alloc(count, __builtin_return_address(0));
+  if (res) {
+    struct thread *cur = sched_get_current();
+    if (cur)
+      cur->pmm_alloc_bytes += (uint64_t)count * PAGE_SIZE;
+    if (pmm_sites_enabled)
+      pmm_site_record_alloc(count, __builtin_return_address(0));
+  }
   void (*hook)(void) = __atomic_load_n(&pmm_low_watermark_hook, __ATOMIC_ACQUIRE);
   if (res && hook && pmm_get_free_pages_including_pcp() < pmm_low_watermark_pages)
     hook();
@@ -399,6 +405,9 @@ void *pmm_alloc_pages_range(size_t count, uint64_t min_phys_addr,
 __attribute__((optimize("O3"))) void *pmm_alloc_page(void) {
   void *page = pmm_pcp_alloc_page();
   if (page) {
+    struct thread *cur = sched_get_current();
+    if (cur)
+      cur->pmm_alloc_bytes += PAGE_SIZE;
     if (pmm_sites_enabled)
       pmm_site_record_alloc(1, __builtin_return_address(0));
     return page;

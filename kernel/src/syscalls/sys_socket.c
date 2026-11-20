@@ -385,6 +385,40 @@ static uint64_t sys_accept4(uint64_t sockfd, uint64_t addr_ptr,
   return sys_accept_impl(sockfd, addr_ptr, addrlen_ptr, flags);
 }
 
+/* Allocate a socket bounce buffer, capping/stepping down on SOCK_STREAM
+ * to avoid large contiguous allocations and reclaim storms. */
+static uint8_t *socket_alloc_bounce_buf(socket_t *sock, size_t *cap,
+                                        uint8_t *stack_buf, size_t stack_cap,
+                                        bool allow_stepdown) {
+  bool stream_stepdown = allow_stepdown && sock && sock->type == SOCK_STREAM;
+  if (stream_stepdown && *cap > 16384)
+    *cap = 16384;
+  if (*cap <= stack_cap)
+    return stack_buf;
+
+  uint8_t *kbuf = (uint8_t *)kmalloc(*cap);
+  if (kbuf)
+    return kbuf;
+
+  if (stream_stepdown) {
+    for (size_t try_cap = *cap >> 1; try_cap > stack_cap; try_cap >>= 1) {
+      kbuf = (uint8_t *)kmalloc(try_cap);
+      if (kbuf) {
+        *cap = try_cap;
+        return kbuf;
+      }
+    }
+    *cap = stack_cap;
+    return stack_buf;
+  }
+
+  extern size_t mm_file_cache_reclaim(size_t target_pages);
+  extern size_t vfs_dentry_reclaim_pages(size_t target_pages);
+  mm_file_cache_reclaim(*cap / 4096 + 16);
+  vfs_dentry_reclaim_pages(64);
+  return (uint8_t *)kmalloc(*cap);
+}
+
 // Syscall: sendto(int sockfd, const void *buf, size_t len, int flags, ...)
 static uint64_t sys_sendto(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
                            uint64_t flags, uint64_t dest_addr_ptr,
@@ -423,8 +457,9 @@ static uint64_t sys_sendto(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
   }
 
   uint8_t stack_buf[4096];
-  size_t copy_len = len <= sizeof(stack_buf) ? (size_t)len : (size_t)len;
-  uint8_t *kbuf = copy_len <= sizeof(stack_buf) ? stack_buf : (uint8_t *)kmalloc(copy_len);
+  size_t copy_len = (size_t)len;
+  uint8_t *kbuf = socket_alloc_bounce_buf(sock, &copy_len, stack_buf,
+                                          sizeof(stack_buf), true);
   if (!kbuf) {
     return (uint64_t)-12; // ENOMEM
   }
@@ -489,7 +524,9 @@ static uint64_t sys_recvfrom(uint64_t sockfd, uint64_t buf_ptr, uint64_t len,
 
   uint8_t stack_buf[4096];
   size_t cap = (size_t)len;
-  uint8_t *kbuf = cap <= sizeof(stack_buf) ? stack_buf : (uint8_t *)kmalloc(cap);
+  uint8_t *kbuf = socket_alloc_bounce_buf(sock, &cap, stack_buf,
+                                          sizeof(stack_buf),
+                                          (flags & 0x100) == 0);
   if (!kbuf) {
     return (uint64_t)-12; // ENOMEM
   }
@@ -524,45 +561,193 @@ struct compat_msghdr {
 };
 _Static_assert(sizeof(struct compat_msghdr) == 28, "i386 msghdr ABI");
 
+/* i386 cmsghdr: {u32 len; i32 level; i32 type;} aligned to 4.
+ * x86-64 cmsghdr: {u64 len; i32 level; i32 type;} aligned to 8. */
+#define C32_ALIGN(x) (((x) + 3u) & ~(size_t)3u)
+#define C64_ALIGN(x) (((x) + 7u) & ~(size_t)7u)
+
+/* Convert a 32-bit control buffer (kernel copy) to native layout. */
+static int compat_cmsg_to_native(const uint8_t *in, size_t in_len, uint8_t *out,
+                                 size_t out_cap, size_t *out_len) {
+  size_t ip = 0, op = 0;
+  while (ip + 12 <= in_len) {
+    uint32_t len;
+    int32_t level, type;
+    memcpy(&len, in + ip, 4);
+    memcpy(&level, in + ip + 4, 4);
+    memcpy(&type, in + ip + 8, 4);
+    if (len < 12 || ip + len > in_len) return -22;
+    size_t payload = len - 12;
+    size_t need = C64_ALIGN(16 + payload);
+    if (op + need > out_cap) return -90;
+    uint64_t nlen = 16 + payload;
+    memset(out + op, 0, need);
+    memcpy(out + op, &nlen, 8);
+    memcpy(out + op + 8, &level, 4);
+    memcpy(out + op + 12, &type, 4);
+    memcpy(out + op + 16, in + ip + 12, payload);
+    op += need;
+    ip += C32_ALIGN(len);
+  }
+  *out_len = op;
+  return 0;
+}
+
+/* Convert native control output to 32-bit layout; sets *trunc on overflow. */
+static size_t compat_cmsg_from_native(const uint8_t *in, size_t in_len,
+                                      uint8_t *out, size_t out_cap, bool *trunc) {
+  size_t ip = 0, op = 0;
+  while (ip + 16 <= in_len) {
+    uint64_t len;
+    memcpy(&len, in + ip, 8);
+    if (len < 16 || ip + len > in_len) break;
+    size_t payload = (size_t)len - 16;
+    size_t need = C32_ALIGN(12 + payload);
+    if (op + 12 + payload > out_cap) { *trunc = true; break; }
+    uint32_t nlen = (uint32_t)(12 + payload);
+    memcpy(out + op, &nlen, 4);
+    memcpy(out + op + 4, in + ip + 8, 8);
+    memcpy(out + op + 12, in + ip + 16, payload);
+    op = (op + need > out_cap) ? out_cap : op + need;
+    ip += C64_ALIGN((size_t)len);
+  }
+  return op;
+}
+
 static uint64_t compat_socket_msg(int fd, uint64_t pointer, int flags, bool receive) {
   struct compat_msghdr narrow;
   if (copy_from_user(&narrow, (void *)pointer, sizeof(narrow))) return (uint64_t)-14;
   if (narrow.iovlen > 1024) return (uint64_t)-90;
+  if (narrow.namelen > 4096) return (uint64_t)-22;
+  if (narrow.controllen > 65536 && !receive) return (uint64_t)-90;
   socket_t *sock __attribute__((cleanup(socket_release_fd))) = socket_from_fd(fd);
   if (!sock) return socket_eno_notsock(fd);
   if (sock->closing) return (uint64_t)-9;
   if ((receive && (!sock->ops || !sock->ops->recvmsg)) ||
       (!receive && (!sock->ops || !sock->ops->sendmsg))) return (uint64_t)-95;
-  struct iovec *iov = narrow.iovlen ? kmalloc(narrow.iovlen * sizeof(*iov)) : NULL;
-  if (narrow.iovlen && !iov) return (uint64_t)-12;
+
+  /* Every buffer handed to sock->ops is a kernel bounce buffer: the family
+   * implementations memcpy into msg_name/msg_control/iov directly. */
+  struct iovec *uiov = NULL, *kiov = NULL;
+  void *kname = NULL, *kcontrol = NULL, *ucontrol32 = NULL;
+  /* AF_UNIX already reads and writes ancillary data in the caller's layout.
+   * Keep that layout in its bounce buffer so SCM_RIGHTS is translated once
+   * and the receiver's control capacity limits descriptor installation. */
+  bool native_control = sock->domain != AF_UNIX;
+  size_t control_len = narrow.controllen > 65536 ? 65536 : narrow.controllen;
+  size_t kcontrol_cap = 0;
   int error = 0;
+  ssize_t result = 0;
+
+  if (narrow.iovlen) {
+    uiov = kmalloc(narrow.iovlen * sizeof(*uiov));
+    if (!uiov) { error = -12; goto out; }
+    kiov = kmalloc(narrow.iovlen * sizeof(*kiov));
+    if (!kiov) { error = -12; goto out; }
+    memset(kiov, 0, narrow.iovlen * sizeof(*kiov));
+  }
   for (size_t i = 0; i < narrow.iovlen; i++) {
     struct { uint32_t base, size; } v;
     uint64_t address = (uint64_t)narrow.iov + i * sizeof(v);
     if (address + sizeof(v) > 0x100000000ULL ||
-        copy_from_user(&v, (void *)address, sizeof(v))) { error = -14; break; }
-    if (v.size && !vmm_is_user_addr_range_valid(v.base, v.size)) { error = -14; break; }
-    iov[i] = (struct iovec){ .iov_base=(void *)(uintptr_t)v.base, .iov_len=v.size };
+        copy_from_user(&v, (void *)address, sizeof(v))) { error = -14; goto out; }
+    uiov[i] = (struct iovec){ .iov_base=(void *)(uintptr_t)v.base, .iov_len=v.size };
+    kiov[i].iov_len = v.size;
+    if (!v.size) continue;
+    if (v.size > 16u * 1024 * 1024) { error = -12; goto out; }
+    if (!vmm_is_user_addr_range_valid(v.base, v.size)) { error = -14; goto out; }
+    kiov[i].iov_base = kmalloc(v.size);
+    if (!kiov[i].iov_base) { error = -12; goto out; }
+    if (receive) memset(kiov[i].iov_base, 0, v.size);
+    else if (copy_from_user(kiov[i].iov_base, uiov[i].iov_base, v.size)) { error = -14; goto out; }
   }
-  if (!error && ((narrow.name && narrow.namelen &&
-      !vmm_is_user_addr_range_valid(narrow.name, narrow.namelen)) ||
-      (narrow.controllen && (!narrow.control ||
-      !vmm_is_user_addr_range_valid(narrow.control, narrow.controllen))))) error = -14;
-  if (error) { if (iov) kfree(iov); return (uint64_t)(int64_t)error; }
+
+  if (narrow.name && narrow.namelen) {
+    if (!vmm_is_user_addr_range_valid(narrow.name, narrow.namelen)) { error = -14; goto out; }
+    kname = kmalloc(narrow.namelen);
+    if (!kname) { error = -12; goto out; }
+    if (receive) memset(kname, 0, narrow.namelen);
+    else if (copy_from_user(kname, (void *)(uintptr_t)narrow.name, narrow.namelen)) { error = -14; goto out; }
+  }
+
+  if (control_len) {
+    if (!narrow.control || !vmm_is_user_addr_range_valid(narrow.control, control_len)) { error = -14; goto out; }
+    /* Native headers are 4 bytes larger and 8-aligned: double plus slack. */
+    kcontrol_cap = native_control ? control_len * 2 + 64 : control_len;
+    kcontrol = kmalloc(kcontrol_cap);
+    if (!kcontrol) { error = -12; goto out; }
+    memset(kcontrol, 0, kcontrol_cap);
+    if (!receive && native_control) {
+      ucontrol32 = kmalloc(control_len);
+      if (!ucontrol32) { error = -12; goto out; }
+    }
+    if (!receive && copy_from_user(native_control ? ucontrol32 : kcontrol,
+                                   (void *)(uintptr_t)narrow.control, control_len)) {
+      error = -14;
+      goto out;
+    }
+    if (ucontrol32) {
+      error = compat_cmsg_to_native(ucontrol32, control_len, kcontrol,
+                                    kcontrol_cap, &kcontrol_cap);
+      if (error) goto out;
+    }
+  }
+
   struct msghdr msg = {
-    .msg_name=(void *)(uintptr_t)narrow.name, .msg_namelen=narrow.namelen,
-    .msg_iov=iov, .msg_iovlen=narrow.iovlen,
-    .msg_control=(void *)(uintptr_t)narrow.control, .msg_controllen=narrow.controllen
+    .msg_name=kname, .msg_namelen=kname ? narrow.namelen : 0,
+    .msg_iov=kiov, .msg_iovlen=narrow.iovlen,
+    .msg_control=kcontrol_cap ? kcontrol : NULL, .msg_controllen=kcontrol_cap
   };
-  ssize_t result = receive ? sock->ops->recvmsg(sock, &msg, flags)
-                           : sock->ops->sendmsg(sock, &msg, flags);
-  if (iov) kfree(iov);
+  result = receive ? sock->ops->recvmsg(sock, &msg, flags)
+                   : sock->ops->sendmsg(sock, &msg, flags);
+
   if (receive && result >= 0) {
-    uint32_t length = msg.msg_namelen, control = msg.msg_controllen, output_flags = msg.msg_flags;
+    size_t remaining = (size_t)result;
+    for (size_t i = 0; i < narrow.iovlen && remaining > 0; i++) {
+      size_t chunk = kiov[i].iov_len < remaining ? kiov[i].iov_len : remaining;
+      if (chunk && copy_to_user(uiov[i].iov_base, kiov[i].iov_base, chunk)) { error = -14; goto out; }
+      remaining -= chunk;
+    }
+    uint32_t length = msg.msg_namelen;
+    if (kname && length) {
+      uint32_t c = length < narrow.namelen ? length : narrow.namelen;
+      if (copy_to_user((void *)(uintptr_t)narrow.name, kname, c)) { error = -14; goto out; }
+    }
+    uint32_t control = 0, output_flags = (uint32_t)msg.msg_flags;
+    if (kcontrol && msg.msg_controllen > 0) {
+      const void *received_control = kcontrol;
+      control = (uint32_t)msg.msg_controllen;
+      if (native_control) {
+        ucontrol32 = kmalloc(control_len);
+        if (!ucontrol32) { error = -12; goto out; }
+        bool trunc = false;
+        control = (uint32_t)compat_cmsg_from_native(kcontrol, msg.msg_controllen,
+                                                   ucontrol32, control_len, &trunc);
+        if (trunc) output_flags |= 0x8; /* MSG_CTRUNC */
+        received_control = ucontrol32;
+      }
+      if (control && copy_to_user((void *)(uintptr_t)narrow.control,
+                                  received_control, control)) {
+        error = -14;
+        goto out;
+      }
+    }
     if (copy_to_user((void *)(pointer + 4), &length, 4) ||
         copy_to_user((void *)(pointer + 20), &control, 4) ||
-        copy_to_user((void *)(pointer + 24), &output_flags, 4)) return (uint64_t)-14;
+        copy_to_user((void *)(pointer + 24), &output_flags, 4)) { error = -14; goto out; }
   }
+
+out:
+  if (kiov) {
+    for (size_t i = 0; i < narrow.iovlen; i++)
+      if (kiov[i].iov_base) kfree(kiov[i].iov_base);
+    kfree(kiov);
+  }
+  if (uiov) kfree(uiov);
+  if (kname) kfree(kname);
+  if (kcontrol) kfree(kcontrol);
+  if (ucontrol32) kfree(ucontrol32);
+  if (error) return (uint64_t)(int64_t)error;
   return (uint64_t)result;
 }
 
@@ -577,27 +762,40 @@ struct socket_msg_bounce {
   void *user_control;
   size_t orig_controllen;
   void *kcontrol;
+  size_t inline_data_used;
+  struct iovec inline_kiov[4];
+  struct iovec inline_uiov[4];
+  uint8_t inline_name[128];
+  uint8_t inline_control[128];
+  uint8_t inline_data[256];
 };
+
+static inline bool socket_msg_is_inline_data(const struct socket_msg_bounce *b,
+                                             const void *ptr) {
+  const uint8_t *p = (const uint8_t *)ptr;
+  return p >= b->inline_data && p < b->inline_data + sizeof(b->inline_data);
+}
 
 static void socket_msg_bounce_free(struct socket_msg_bounce *b) {
   if (b->kiov) {
     for (size_t i = 0; i < b->iovlen; i++) {
-      if (b->kiov[i].iov_base)
+      if (b->kiov[i].iov_base && !socket_msg_is_inline_data(b, b->kiov[i].iov_base))
         kfree(b->kiov[i].iov_base);
     }
-    kfree(b->kiov);
+    if (b->kiov != b->inline_kiov)
+      kfree(b->kiov);
   }
-  if (b->uiov)
+  if (b->uiov && b->uiov != b->inline_uiov)
     kfree(b->uiov);
-  if (b->kname)
+  if (b->kname && b->kname != b->inline_name)
     kfree(b->kname);
-  if (b->kcontrol)
+  if (b->kcontrol && b->kcontrol != b->inline_control)
     kfree(b->kcontrol);
 }
 
-static int socket_msg_bounce_init(struct socket_msg_bounce *b, uint64_t msg_ptr,
-                                  bool is_send) {
-  memset(b, 0, sizeof(*b));
+static int socket_msg_bounce_init(socket_t *sock, struct socket_msg_bounce *b,
+                                  uint64_t msg_ptr, bool is_send) {
+  memset(b, 0, __builtin_offsetof(struct socket_msg_bounce, inline_kiov));
   if (!is_user_range((const void *)msg_ptr, sizeof(struct msghdr)) ||
       copy_from_user(&b->kmsg, (const void *)msg_ptr, sizeof(struct msghdr)) != 0)
     return -14;
@@ -616,7 +814,9 @@ static int socket_msg_bounce_init(struct socket_msg_bounce *b, uint64_t msg_ptr,
       return -22;
     if (!is_user_range(b->user_name, b->orig_namelen))
       return -14;
-    b->kname = kmalloc(b->orig_namelen);
+    b->kname = b->orig_namelen <= sizeof(b->inline_name)
+                   ? (void *)b->inline_name
+                   : kmalloc(b->orig_namelen);
     if (!b->kname)
       return -12;
     if (is_send) {
@@ -647,7 +847,17 @@ static int socket_msg_bounce_init(struct socket_msg_bounce *b, uint64_t msg_ptr,
       socket_msg_bounce_free(b);
       return -14;
     }
-    b->kcontrol = kmalloc(control_capacity);
+    b->kcontrol = control_capacity <= sizeof(b->inline_control)
+                      ? (void *)b->inline_control
+                      : kmalloc(control_capacity);
+    if (!b->kcontrol && !is_send) {
+      while (!b->kcontrol && control_capacity > 1024) {
+        control_capacity >>= 1;
+        b->kcontrol = control_capacity <= sizeof(b->inline_control)
+                      ? (void *)b->inline_control
+                      : kmalloc(control_capacity);
+      }
+    }
     if (!b->kcontrol) {
       socket_msg_bounce_free(b);
       return -12;
@@ -664,6 +874,7 @@ static int socket_msg_bounce_init(struct socket_msg_bounce *b, uint64_t msg_ptr,
     b->kmsg.msg_controllen = control_capacity;
   } else {
     b->kmsg.msg_control = NULL;
+    b->kmsg.msg_controllen = 0;
   }
 
   if (b->iovlen > 0) {
@@ -672,9 +883,13 @@ static int socket_msg_bounce_init(struct socket_msg_bounce *b, uint64_t msg_ptr,
       socket_msg_bounce_free(b);
       return -14;
     }
-    b->uiov = kmalloc(iov_bytes);
-    b->kiov = kmalloc(iov_bytes);
-    if (!b->uiov || !b->kiov) {
+    b->uiov = b->iovlen <= 4 ? b->inline_uiov : kmalloc(iov_bytes);
+    if (!b->uiov) {
+      socket_msg_bounce_free(b);
+      return -12;
+    }
+    b->kiov = b->iovlen <= 4 ? b->inline_kiov : kmalloc(iov_bytes);
+    if (!b->kiov) {
       socket_msg_bounce_free(b);
       return -12;
     }
@@ -683,9 +898,12 @@ static int socket_msg_bounce_init(struct socket_msg_bounce *b, uint64_t msg_ptr,
       socket_msg_bounce_free(b);
       return -14;
     }
+    bool stream_stepdown =
+        sock && sock->type == SOCK_STREAM &&
+        (!is_send || b->kmsg.msg_controllen == 0);
     for (size_t i = 0; i < b->iovlen; i++) {
-      size_t len = b->uiov[i].iov_len;
-      b->kiov[i].iov_len = len;
+      size_t orig_len = b->uiov[i].iov_len;
+      size_t len = orig_len;
       if (len > 0) {
         if (len > (16ULL * 1024 * 1024)) {
           socket_msg_bounce_free(b);
@@ -695,21 +913,48 @@ static int socket_msg_bounce_init(struct socket_msg_bounce *b, uint64_t msg_ptr,
           socket_msg_bounce_free(b);
           return -14;
         }
-        void *kbuf = kmalloc(len);
+        if (stream_stepdown && len > 16384)
+          len = 16384;
+        void *kbuf = NULL;
+        if (len <= sizeof(b->inline_data) - b->inline_data_used) {
+          kbuf = b->inline_data + b->inline_data_used;
+          b->inline_data_used += len;
+        } else {
+          kbuf = kmalloc(len);
+        }
+        if (!kbuf && stream_stepdown) {
+          for (size_t try_len = len >> 1; try_len >= 4096; try_len >>= 1) {
+            kbuf = kmalloc(try_len);
+            if (kbuf) {
+              len = try_len;
+              break;
+            }
+          }
+          if (!kbuf && i > 0) {
+            b->kmsg.msg_iovlen = i;
+            break;
+          }
+        }
         if (!kbuf) {
           socket_msg_bounce_free(b);
           return -12;
         }
         if (is_send) {
           if (copy_from_user(kbuf, b->uiov[i].iov_base, len) != 0) {
-            kfree(kbuf);
+            if (!socket_msg_is_inline_data(b, kbuf))
+              kfree(kbuf);
             socket_msg_bounce_free(b);
             return -14;
           }
         } else {
           memset(kbuf, 0, len);
         }
+        b->kiov[i].iov_len = len;
         b->kiov[i].iov_base = kbuf;
+        if (len < orig_len) {
+          b->kmsg.msg_iovlen = i + 1;
+          break;
+        }
       }
     }
     b->kmsg.msg_iov = b->kiov;
@@ -745,7 +990,7 @@ static uint64_t sys_sendmsg(uint64_t sockfd, uint64_t msg_ptr, uint64_t flags,
   }
 
   struct socket_msg_bounce b;
-  int berr = socket_msg_bounce_init(&b, msg_ptr, true);
+  int berr = socket_msg_bounce_init(sock, &b, msg_ptr, true);
   if (berr < 0)
     return (uint64_t)(int64_t)berr;
 
@@ -809,7 +1054,7 @@ static uint64_t sys_recvmsg(uint64_t sockfd, uint64_t msg_ptr, uint64_t flags,
   }
 
   struct socket_msg_bounce b;
-  int berr = socket_msg_bounce_init(&b, msg_ptr, false);
+  int berr = socket_msg_bounce_init(sock, &b, msg_ptr, false);
   if (berr < 0)
     return (uint64_t)(int64_t)berr;
 
@@ -910,6 +1155,26 @@ struct mmsghdr {
   unsigned int msg_len;
 };
 
+/* i386 mmsghdr: 28-byte compat_msghdr + u32 msg_len, no padding. The per-
+ * message sendmsg/recvmsg already translate the compat msghdr for 32-bit
+ * callers, so the vector walk only needs the narrower stride. */
+#define COMPAT_MMSGHDR_SIZE 32u
+#define COMPAT_MMSGHDR_LEN_OFF 28u
+#ifndef MSG_WAITFORONE
+#define MSG_WAITFORONE 0x10000
+#endif
+
+static void mmsg_layout(size_t *stride, size_t *len_off) {
+  struct thread *caller = sched_get_current();
+  if (caller && caller->seccomp_compat_dispatch) {
+    *stride = COMPAT_MMSGHDR_SIZE;
+    *len_off = COMPAT_MMSGHDR_LEN_OFF;
+  } else {
+    *stride = sizeof(struct mmsghdr);
+    *len_off = __builtin_offsetof(struct mmsghdr, msg_len);
+  }
+}
+
 // Syscall: sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)
 static uint64_t sys_sendmmsg(uint64_t sockfd, uint64_t msgvec_ptr, uint64_t vlen,
                              uint64_t flags, uint64_t _arg4, uint64_t _arg5) {
@@ -925,21 +1190,23 @@ static uint64_t sys_sendmmsg(uint64_t sockfd, uint64_t msgvec_ptr, uint64_t vlen
   if (count > 1024)
     count = 1024;
 
-  if (!vmm_is_user_addr_range_writable(msgvec_ptr, count * sizeof(struct mmsghdr)))
+  size_t stride, len_off;
+  mmsg_layout(&stride, &len_off);
+  if (!vmm_is_user_addr_range_writable(msgvec_ptr, count * stride))
     return (uint64_t)-14; // EFAULT
 
-  struct mmsghdr *vec = (struct mmsghdr *)msgvec_ptr;
   unsigned int sent_msgs = 0;
 
   for (unsigned int i = 0; i < count; i++) {
-    uint64_t ret = sys_sendmsg(sockfd, (uint64_t)&vec[i].msg_hdr, flags, 0, 0, 0);
+    uint64_t entry = msgvec_ptr + (uint64_t)i * stride;
+    uint64_t ret = sys_sendmsg(sockfd, entry, flags, 0, 0, 0);
     if ((int64_t)ret < 0) {
       if (sent_msgs > 0)
         return (uint64_t)sent_msgs;
       return ret;
     }
     unsigned int mlen = (unsigned int)ret;
-    if (copy_to_user(&vec[i].msg_len, &mlen, sizeof(mlen)) != 0)
+    if (copy_to_user((void *)(entry + len_off), &mlen, sizeof(mlen)) != 0)
       return (uint64_t)-14;
     sent_msgs++;
   }
@@ -962,25 +1229,31 @@ static uint64_t sys_recvmmsg(uint64_t sockfd, uint64_t msgvec_ptr, uint64_t vlen
   if (count > 1024)
     count = 1024;
 
-  if (!vmm_is_user_addr_range_writable(msgvec_ptr, count * sizeof(struct mmsghdr)))
+  size_t stride, len_off;
+  mmsg_layout(&stride, &len_off);
+  if (!vmm_is_user_addr_range_writable(msgvec_ptr, count * stride))
     return (uint64_t)-14; // EFAULT
 
-  struct mmsghdr *vec = (struct mmsghdr *)msgvec_ptr;
   unsigned int recvd_msgs = 0;
+  uint64_t msg_flags = flags & ~(uint64_t)MSG_WAITFORONE;
 
   for (unsigned int i = 0; i < count; i++) {
-    uint64_t ret = sys_recvmsg(sockfd, (uint64_t)&vec[i].msg_hdr, flags, 0, 0, 0);
+    uint64_t entry = msgvec_ptr + (uint64_t)i * stride;
+    uint64_t ret = sys_recvmsg(sockfd, entry, msg_flags, 0, 0, 0);
     if ((int64_t)ret < 0) {
       if (recvd_msgs > 0)
         return (uint64_t)recvd_msgs;
       return ret;
     }
     unsigned int mlen = (unsigned int)ret;
-    if (copy_to_user(&vec[i].msg_len, &mlen, sizeof(mlen)) != 0)
+    if (copy_to_user((void *)(entry + len_off), &mlen, sizeof(mlen)) != 0)
       return (uint64_t)-14;
     recvd_msgs++;
     if (flags & MSG_DONTWAIT)
       break;
+    /* Linux: after the first datagram, MSG_WAITFORONE stops blocking. */
+    if (flags & MSG_WAITFORONE)
+      msg_flags |= MSG_DONTWAIT;
   }
 
   return (uint64_t)recvd_msgs;
@@ -1044,13 +1317,15 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
     return (uint64_t)-14;
 
   int orig_optlen = koptlen;
+  uint8_t stack_opt[64];
   void *koptval = NULL;
   if (optval_ptr != 0 && koptlen > 0) {
-    koptval = kmalloc((size_t)koptlen);
+    koptval = (size_t)koptlen <= sizeof(stack_opt) ? (void *)stack_opt
+                                                   : kmalloc((size_t)koptlen);
     if (!koptval)
       return (uint64_t)-12;
     if (copy_from_user(koptval, (const void *)optval_ptr, (size_t)koptlen) != 0) {
-      kfree(koptval);
+      if (koptval != stack_opt) kfree(koptval);
       return (uint64_t)-14;
     }
   }
@@ -1059,14 +1334,14 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
    * with a NULL value and zero length. Let the family implement that ABI. */
   if (sock->domain == AF_NETLINK && (int)level == SOL_NETLINK &&
       (int)optname == NETLINK_LIST_MEMBERSHIPS && sock->ops && sock->ops->getsockopt) {
-    if (koptval) kfree(koptval);
+    if (koptval && koptval != stack_opt) kfree(koptval);
     return (uint64_t)sock->ops->getsockopt(sock, (int)level, (int)optname,
                                          (void *)optval_ptr, (int *)optlen_ptr);
   }
 
   // Validate optlen
   if (koptlen < (int)sizeof(int) || !koptval) {
-    if (koptval) kfree(koptval);
+    if (koptval && koptval != stack_opt) kfree(koptval);
     return (uint64_t)-22; // EINVAL
   }
 
@@ -1095,7 +1370,7 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
         int ret = sock->ops->getsockopt(sock, (int)level, (int)optname,
                                         (void *)optval_ptr, (int *)optlen_ptr);
         if (ret == 0) {
-          kfree(koptval);
+          if (koptval != stack_opt) kfree(koptval);
           return 0;
         }
       }
@@ -1124,14 +1399,14 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
       if ((copy_len > 0 && copy_to_user((void *)optval_ptr, koptval, (size_t)copy_len) != 0) ||
           copy_to_user((void *)optlen_ptr, &koptlen, sizeof(int)) != 0)
         err = -14;
-      kfree(koptval);
+      if (koptval != stack_opt) kfree(koptval);
       return (uint64_t)(int64_t)err;
     }
   }
 
   // Try family-specific handler
   if (sock->ops && sock->ops->getsockopt) {
-    kfree(koptval);
+    if (koptval != stack_opt) kfree(koptval);
     int ret = sock->ops->getsockopt(sock, (int)level, (int)optname,
                                     (void *)optval_ptr, (int *)optlen_ptr);
     /* The family owns this option's result. In particular ERANGE must keep
@@ -1200,12 +1475,12 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
       if ((copy_len > 0 && copy_to_user((void *)optval_ptr, koptval, (size_t)copy_len) != 0) ||
           copy_to_user((void *)optlen_ptr, &koptlen, sizeof(int)) != 0)
         err = -14;
-      kfree(koptval);
+      if (koptval != stack_opt) kfree(koptval);
       return (uint64_t)(int64_t)err;
     }
   }
 
-  kfree(koptval);
+  if (koptval != stack_opt) kfree(koptval);
   char opt_buf[48];
   snprintf(opt_buf, sizeof(opt_buf), "getsockopt lvl=%d opt=%d", (int)level, (int)optname);
   sysdiag_record_unimplemented_feature("socket", opt_buf, sched_get_current(), -92);
@@ -1237,12 +1512,14 @@ static uint64_t sys_setsockopt(uint64_t sockfd, uint64_t level,
     return (uint64_t)-14; // EFAULT
   }
 
-  void *koptval = kmalloc((size_t)optlen);
+  uint8_t stack_opt[64];
+  void *koptval = optlen <= sizeof(stack_opt) ? (void *)stack_opt
+                                              : kmalloc((size_t)optlen);
   if (!koptval) {
     return (uint64_t)-12;
   }
   if (copy_from_user(koptval, (const void *)optval_ptr, (size_t)optlen) != 0) {
-    kfree(koptval);
+    if (koptval != stack_opt) kfree(koptval);
     return (uint64_t)-14;
   }
 
@@ -1291,7 +1568,7 @@ static uint64_t sys_setsockopt(uint64_t sockfd, uint64_t level,
   }
 
   // Try family-specific handler
-  kfree(koptval);
+  if (koptval != stack_opt) kfree(koptval);
   if (sock->ops && sock->ops->setsockopt) {
     int ret = sock->ops->setsockopt(sock, (int)level, (int)optname,
                                     (const void *)optval_ptr, (int)optlen);

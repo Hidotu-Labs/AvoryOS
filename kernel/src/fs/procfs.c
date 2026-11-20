@@ -6,6 +6,7 @@
 #include "inotify_limits.h"
 #include "cgroupfs.h"
 #include "fs/procfs.h"
+#include "fs/mount_namespace.h"
 #include "console/klog.h"
 #include "apic/lapic_timer.h"
 #include "drivers/storage/block.h"
@@ -1446,7 +1447,17 @@ static bool procfs_pid_ptrace_access(uint32_t pid) {
   struct sched_thread_snapshot target;
   if (!current || !procfs_pid_visible(pid) ||
       !sched_get_thread_snapshot(pid, &target)) return false;
-  return target.tgid == current->tgid || capability_has(current, CAP_SYS_PTRACE);
+  if (target.tgid == current->tgid) return true;
+  /* Linux ptrace_may_access(PTRACE_MODE_READ_FSCREDS): the caller's fs ids
+   * must match all of the target's real, effective and saved ids, and the
+   * target must be dumpable. Without this a user cannot inspect their own
+   * processes' syscall/fd/maps (ps, lsof, gdb attach, hang triage). */
+  if (!target.nondumpable &&
+      current->fsuid == target.uid && current->fsuid == target.euid &&
+      current->fsuid == target.suid && current->fsgid == target.gid &&
+      current->fsgid == target.egid && current->fsgid == target.sgid)
+    return true;
+  return capability_has(current, CAP_SYS_PTRACE);
 }
 
 static uint32_t procfs_pid_stat_read(vfs_node_t *node, uint32_t offset,
@@ -1601,9 +1612,7 @@ static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
   if (!sched_get_thread_snapshot(pid, &t))
     return 0;
 
-  char *buf = kmalloc(1024);
-  if (!buf)
-    return 0;
+  char buf[1024];
 
   uint64_t virt_bytes = 0;
   uint64_t res_bytes = 0;
@@ -1612,7 +1621,7 @@ static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
   uint64_t virt_kb = virt_bytes / 1024;
   uint64_t rss_kb  = res_bytes / 1024;
 
-  int len = snprintf(buf, 1024,
+  int len = snprintf(buf, sizeof(buf),
       "Name:\t%s\n"
       "State:\t%c\n"
       "Tgid:\t%u\n"
@@ -1623,6 +1632,8 @@ static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
       "Threads:\t%u\n"
       "VmSize:\t%llu kB\n"
       "VmRSS:\t%llu kB\n"
+      "KHeapAlloc:\t%llu B\n"
+      "PmmAlloc:\t%llu B\n"
       "CapInh:\t%016llx\nCapPrm:\t%016llx\nCapEff:\t%016llx\n"
       "CapBnd:\t%016llx\nCapAmb:\t%016llx\n"
       "NoNewPrivs:\t%u\nSeccomp:\t%u\n"
@@ -1639,6 +1650,8 @@ static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
       sched_get_group_threads(t.tgid ? t.tgid : t.tid, 0, NULL),
       (unsigned long long)virt_kb,
       (unsigned long long)rss_kb,
+      (unsigned long long)t.kheap_alloc_bytes,
+      (unsigned long long)t.pmm_alloc_bytes,
       (unsigned long long)t.cap_inheritable, (unsigned long long)t.cap_permitted,
       (unsigned long long)t.cap_effective, (unsigned long long)t.cap_bounding,
       (unsigned long long)t.cap_ambient, t.no_new_privs ? 1u : 0u, t.seccomp_mode,
@@ -1653,15 +1666,17 @@ static uint32_t procfs_pid_status_read(vfs_node_t *node, uint32_t offset,
       (unsigned long long)t.nr_syscalls,
       (unsigned long long)(tsc_cycles_to_ns(t.syscall_cycles) / 1000));
 
-  node->length = (uint32_t)len;
-  if (offset >= (uint32_t)len) {
-    kfree(buf);
+  if (len < 0)
     return 0;
-  }
+  if (len >= (int)sizeof(buf))
+    len = (int)sizeof(buf) - 1;
+
+  node->length = (uint32_t)len;
+  if (offset >= (uint32_t)len)
+    return 0;
   if (offset + size > (uint32_t)len)
     size = (uint32_t)len - offset;
   memcpy(buffer, buf + offset, size);
-  kfree(buf);
   return size;
 }
 
@@ -2258,7 +2273,17 @@ static int procfs_pid_fd_link_readlink(vfs_node_t *node, char *buf,
 }
 
 static vfs_node_t *procfs_pid_fd_link_get_link(vfs_node_t *node) {
-  return sched_get_fd_node_snapshot((uint32_t)node->inode, node->impl);
+  return sched_get_fd_node_snapshot((uint32_t)node->inode, node->impl, false);
+}
+
+/* The same read permission as readlink suffices for socket inode metadata.
+ * Following a magic link for open keeps the stricter descriptor check. */
+vfs_node_t *procfs_socket_fd_stat_target(vfs_node_t *link) {
+  link = vfs_backing_node(link);
+  if (!link || link->readlink != procfs_pid_fd_link_readlink ||
+      !procfs_pid_ptrace_access((uint32_t)link->inode))
+    return NULL;
+  return sched_get_fd_node_snapshot((uint32_t)link->inode, link->impl, true);
 }
 
 static vfs_node_t *procfs_pid_fd_finddir(vfs_node_t *node, char *name) {
@@ -2864,6 +2889,32 @@ static vfs_node_t *procfs_task_finddir(vfs_node_t *node, char *name) {
     status->read = procfs_pid_status_read;
     ramfs_mount_node(dir, status);
   }
+  /* Per-thread comm and syscall: the readers already work on a TID, and
+   * tools inspecting multi-threaded programs (ps -L, gdb, hang triage via
+   * /proc/PID/task/TID/syscall) read these for every thread. */
+  vfs_node_t *comm = kmalloc(sizeof(*comm));
+  if (comm) {
+    procfs_node_init(comm);
+    strcpy(comm->name, "comm");
+    comm->flags = FS_FILE;
+    comm->mask = 0644;
+    comm->impl = tid;
+    comm->length = 16;
+    comm->read = procfs_pid_comm_read;
+    comm->write = procfs_pid_comm_write;
+    ramfs_mount_node(dir, comm);
+  }
+  vfs_node_t *syscall = kmalloc(sizeof(*syscall));
+  if (syscall) {
+    procfs_node_init(syscall);
+    strcpy(syscall->name, "syscall");
+    syscall->flags = FS_FILE;
+    syscall->mask = 0444;
+    syscall->impl = tid;
+    syscall->length = 256;
+    syscall->read = procfs_pid_syscall_read;
+    ramfs_mount_node(dir, syscall);
+  }
   return dir;
 }
 
@@ -3247,6 +3298,7 @@ static vfs_node_t *procfs_get_pid_dir(uint32_t pid) {
       vfs_node_t *dir = e->dir;
       vfs_open(dir);
       spinlock_release(&procfs_pid_cache_lock);
+      procfs_pid_owner_refresh(dir, pid);
       return dir;
     }
   }
@@ -3271,6 +3323,7 @@ static vfs_node_t *procfs_get_pid_dir(uint32_t pid) {
       spinlock_release(&procfs_pid_cache_lock);
       vfs_close(new_dir);
       kfree(new_entry);
+      procfs_pid_owner_refresh(dir, pid);
       return dir;
     }
   }
@@ -3280,6 +3333,7 @@ static vfs_node_t *procfs_get_pid_dir(uint32_t pid) {
   procfs_pid_cache = new_entry;
   vfs_open(new_dir); /* reference returned to the path walker */
   spinlock_release(&procfs_pid_cache_lock);
+  procfs_pid_owner_refresh(new_dir, pid);
   return new_dir;
 }
 
@@ -3404,8 +3458,15 @@ static struct dirent *procfs_root_readdir(vfs_node_t *node, uint64_t index) {
 
 // Custom finddir for /proc
 
+static vfs_node_t *procfs_self_node = NULL;
+static vfs_node_t *procfs_thread_self_node = NULL;
+
 static vfs_node_t *procfs_root_finddir(vfs_node_t *node, char *name) {
   if (strcmp(name, "self") == 0) {
+    if (procfs_self_node) {
+      vfs_open(procfs_self_node);
+      return procfs_self_node;
+    }
     vfs_node_t *self_link = kmalloc(sizeof(vfs_node_t));
     if (!self_link)
       return NULL;
@@ -3419,6 +3480,10 @@ static vfs_node_t *procfs_root_finddir(vfs_node_t *node, char *name) {
     return self_link;
   }
   if (strcmp(name, "thread-self") == 0) {
+    if (procfs_thread_self_node) {
+      vfs_open(procfs_thread_self_node);
+      return procfs_thread_self_node;
+    }
     vfs_node_t *tself_link = kmalloc(sizeof(vfs_node_t));
     if (!tself_link)
       return NULL;
@@ -3959,6 +4024,25 @@ void procfs_init(void) {
     // Add /proc/sys/ subdirectory
     procfs_sys_init(procfs_root);
 
+    procfs_self_node = kmalloc(sizeof(vfs_node_t));
+    if (procfs_self_node) {
+      procfs_node_init(procfs_self_node);
+      strcpy(procfs_self_node->name, "self");
+      procfs_self_node->flags = FS_SYMLINK | FS_PERSISTENT;
+      procfs_self_node->mask = 0777;
+      procfs_self_node->ptr = procfs_root;
+      procfs_self_node->readlink = procfs_self_readlink;
+      procfs_self_node->get_link = procfs_self_get_link;
+    }
+    procfs_thread_self_node = kmalloc(sizeof(vfs_node_t));
+    if (procfs_thread_self_node) {
+      procfs_node_init(procfs_thread_self_node);
+      strcpy(procfs_thread_self_node->name, "thread-self");
+      procfs_thread_self_node->flags = FS_SYMLINK | FS_PERSISTENT;
+      procfs_thread_self_node->mask = 0777;
+      procfs_thread_self_node->readlink = procfs_thread_self_readlink;
+    }
+
     // Install dynamic PID hooks on top of the ramfs root.
     // These wrap the ramfs readdir/finddir to also expose live per-PID dirs.
     procfs_root->flags |= FS_DENTRY_NOCACHE;
@@ -3977,11 +4061,9 @@ void procfs_init(void) {
 #include "net/tcp.h"
 #include "net/udp.h"
 
-// Helper: format a big-endian IPv4 address as the 8-char hex string Linux uses
-// in /proc/net/tcp and /proc/net/udp  (host byte-order, little-endian on x86).
+// Linux prints the stored IPv4 address as a native little-endian integer.
 static void fmt_ipv4_hex(char *out, uint32_t ip) {
-    // Linux stores the address in native 32-bit little-endian order.
-    // On x86 that means byte0=LSB, so we just print the uint32 as hex.
+    ip = __builtin_bswap32(ip);
     const char *hex = "0123456789ABCDEF";
     for (int i = 7; i >= 0; i--) {
         out[i] = hex[ip & 0xF];
@@ -4122,18 +4204,21 @@ static uint32_t procfs_net_tcp_read(vfs_node_t *node, uint32_t offset,
         "tr tm->when retrnsmt   uid  timeout inode\n");
 
     char lip[9], rip[9], lport[5], rport[5];
+    int slot = 0;
     for (int i = 0; i < n; i++) {
+        if (snaps[i].address_family != 4)
+            continue;
         fmt_ipv4_hex(lip,   snaps[i].local_ip);
         fmt_ipv4_hex(rip,   snaps[i].remote_ip);
         fmt_port_hex(lport, snaps[i].local_port);
         fmt_port_hex(rport, snaps[i].remote_port);
         uint8_t st = tcp_state_to_linux(snaps[i].state);
         pos += snprintf(buf + pos, 176,
-            "%4d: %s:%s %s:%s %02X %08X:%08X 00 00000000 %llu 0 0 0\n",
-            i, lip, lport, rip, rport, st,
-            (unsigned)(snaps[i].bytes_sent & 0xffffffffu),
-            (unsigned)snaps[i].rx_queued,
-            (unsigned long long)snaps[i].retransmits);
+            "%4d: %s:%s %s:%s %02X %08X:%08X 00:00000000 %08llX %u 0 %u\n",
+            slot++, lip, lport, rip, rport, st,
+            snaps[i].tx_queued, snaps[i].rx_queued,
+            (unsigned long long)snaps[i].retransmits,
+            snaps[i].uid, snaps[i].inode);
     }
     kfree(snaps);
 
@@ -4453,6 +4538,49 @@ static uint32_t procfs_sys_domainname_write(vfs_node_t *node, uint32_t offset,
     name[len] = '\0';
     int r = uts_namespace_set(sched_get_current(), name, len, 1);
     return r < 0 ? (uint32_t)r : size;
+}
+
+/* /proc/sys/kernel/uname_linux: programs the adaptive uname policy reports
+ * "Linux" to, one absolute path per line. Writing "path" adds an entry and
+ * "-path" removes one; the boot scripts save and restore this file. */
+extern uint32_t uname_policy_dump(char *buf, uint32_t cap);
+extern bool uname_policy_add(const char *path);
+extern void uname_policy_remove(const char *path);
+static uint32_t procfs_sys_uname_linux_read(vfs_node_t *node, uint32_t offset,
+                                            uint32_t size, uint8_t *buffer) {
+    const uint32_t cap = 128 * 257;
+    char *tmp = kmalloc(cap);
+    if (!tmp) return (uint32_t)-12;
+    uint32_t len = uname_policy_dump(tmp, cap);
+    if (node) node->length = len;
+    uint32_t n = 0;
+    if (offset < len) {
+        n = size < len - offset ? size : len - offset;
+        memcpy(buffer, tmp + offset, n);
+    }
+    kfree(tmp);
+    return n;
+}
+
+static uint32_t procfs_sys_uname_linux_write(vfs_node_t *node, uint32_t offset,
+                                             uint32_t size, uint8_t *buffer) {
+    (void)node; (void)offset;
+    if (!buffer) return (uint32_t)-22;
+    if (!capability_has(sched_get_current(), CAP_SYS_ADMIN)) return (uint32_t)-1;
+    char line[256];
+    uint32_t i = 0;
+    while (i < size) {
+        uint32_t len = 0;
+        while (i < size && buffer[i] != '\n' && buffer[i] != '\0') {
+            if (len < sizeof(line) - 1) line[len++] = (char)buffer[i];
+            i++;
+        }
+        i++;
+        line[len] = 0;
+        if (line[0] == '-') uname_policy_remove(line + 1);
+        else if (line[0] == '/') uname_policy_add(line);
+    }
+    return size;
 }
 
 static uint32_t procfs_sys_osrelease_read(vfs_node_t *node, uint32_t offset,
@@ -4879,6 +5007,15 @@ void procfs_sys_init(vfs_node_t *procfs_root) {
                 dn->write = procfs_sys_domainname_write;
                 dn->mask = 0644;
                 vfs_close(dn);
+            }
+        }
+        procfs_add_file_node(kernel_dir, "uname_linux", procfs_sys_uname_linux_read, 0);
+        {
+            vfs_node_t *ul = vfs_finddir(kernel_dir, "uname_linux");
+            if (ul) {
+                ul->write = procfs_sys_uname_linux_write;
+                ul->mask = 0644;
+                vfs_close(ul);
             }
         }
         procfs_add_file_node(kernel_dir, "osrelease",   procfs_sys_osrelease_read, 32);

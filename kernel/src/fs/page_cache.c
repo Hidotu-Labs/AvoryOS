@@ -751,6 +751,9 @@ static uint32_t vfs_cache_fill_pages(vfs_node_t *node, uint32_t offset,
 uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_bytes) {
   if (!node || !node->read || !max_bytes || offset >= node->length)
     return 0;
+  /* Leave the last 8 MiB for demand reads, page tables and writeback. */
+  if (pmm_get_free_pages_including_pcp() < 2048)
+    return 0;
   cache_touch(node);
 
   offset &= ~(PAGE_SIZE - 1);
@@ -1762,6 +1765,7 @@ void vfs_pc_trim_init(void) {
 #define KSWAPD_WRITEBACK_PERIOD_MS 3600000u /* DIAGNOSTIC: pass disabled, revert */
 
 extern void kmem_cache_shrink_all(void) __attribute__((weak));
+extern size_t heap_shrink_empty(void) __attribute__((weak));
 
 static size_t kswapd_low_pages;
 static size_t kswapd_high_pages;
@@ -1792,11 +1796,29 @@ static void kswapd_log(size_t free_pages, const char *what) {
  * above the low mark. */
 static bool kswapd_active;
 
-static void kswapd_pass(void) {
+/* Pressure work that is expensive and machine-wide is rate-limited. A pass
+ * runs every 5 ms under pressure; doing a full dirty-page writeback (every
+ * registered file synced to NVMe) and a shrink of every slab cache on each of
+ * those passes turned sustained pressure into back-to-back I/O storms: ~1 s
+ * desktop stalls, and vCPUs parked in NVMe doorbell exits long enough to hold
+ * TLB shootdowns for hundreds of ms. */
+#define KSWAPD_PRESSURE_WRITEBACK_MS 1000u
+#define KSWAPD_SHRINK_INTERVAL_MS 100u
+/* Unproductive passes back off exponentially up to the idle poll period:
+ * anonymous memory is zram's job, and rescanning every file each 5 ms while
+ * no clean cache exists only burns CPU and file-list locks. */
+#define KSWAPD_BACKOFF_MAX_MS KSWAPD_POLL_MS
+
+static uint64_t kswapd_last_pressure_writeback_ms;
+static uint64_t kswapd_last_shrink_ms;
+static uint32_t kswapd_backoff_ms = KSWAPD_PRESSURE_MS;
+
+/* Returns the pages this pass released. */
+static size_t kswapd_pass(void) {
   size_t free_pages = pmm_get_free_pages_including_pcp();
   if (free_pages >= kswapd_high_pages) {
     kswapd_active = false;
-    return;
+    return 0;
   }
   kswapd_passes++;
 
@@ -1806,14 +1828,26 @@ static void kswapd_pass(void) {
 
   free_pages = pmm_get_free_pages_including_pcp();
   if (free_pages < kswapd_low_pages) {
-    if (kmem_cache_shrink_all)
-      kmem_cache_shrink_all();
-    /* No clean cache left to release. Write dirty pages back so the next pass
-     * can release them. */
-    if (!reclaimed)
+    uint64_t now = lapic_timer_get_ms();
+    if (now - kswapd_last_shrink_ms >= KSWAPD_SHRINK_INTERVAL_MS) {
+      kswapd_last_shrink_ms = now;
+      if (kmem_cache_shrink_all)
+        kmem_cache_shrink_all();
+      if (heap_shrink_empty)
+        heap_shrink_empty();
+      vfs_dentry_reclaim_pages(64);
+    }
+    /* No clean cache left to release. Write dirty pages back so a later pass
+     * can release them - at most once per interval. */
+    if (!reclaimed &&
+        now - kswapd_last_pressure_writeback_ms >=
+            KSWAPD_PRESSURE_WRITEBACK_MS) {
+      kswapd_last_pressure_writeback_ms = now;
       vfs_pc_walk((size_t)-1, VFS_PC_WALK_WRITEBACK);
+    }
     kswapd_log(free_pages, "pressure");
   }
+  return reclaimed;
 }
 
 static void kswapd_worker(void) {
@@ -1824,8 +1858,9 @@ static void kswapd_worker(void) {
     if (pmm_get_free_pages_including_pcp() < kswapd_low_pages)
       kswapd_active = true;
     bool pressure = kswapd_active;
+    size_t got = 0;
     if (wanted || pressure)
-      kswapd_pass();
+      got = kswapd_pass();
 
     uint64_t now = lapic_timer_get_ms();
     if (now - last_writeback >= KSWAPD_WRITEBACK_PERIOD_MS) {
@@ -1833,9 +1868,21 @@ static void kswapd_worker(void) {
       last_writeback = now;
     }
 
+    uint32_t sleep_ms = KSWAPD_POLL_MS;
+    if (pressure && kswapd_active) {
+      if (got)
+        kswapd_backoff_ms = KSWAPD_PRESSURE_MS;
+      else if (kswapd_backoff_ms < KSWAPD_BACKOFF_MAX_MS)
+        kswapd_backoff_ms = kswapd_backoff_ms * 2 > KSWAPD_BACKOFF_MAX_MS
+                                ? KSWAPD_BACKOFF_MAX_MS
+                                : kswapd_backoff_ms * 2;
+      sleep_ms = kswapd_backoff_ms;
+    } else {
+      kswapd_backoff_ms = KSWAPD_PRESSURE_MS;
+    }
+
     self->state = THREAD_SLEEPING;
-    self->wakeup_ticks = lapic_timer_get_ticks() +
-                         (pressure ? KSWAPD_PRESSURE_MS : KSWAPD_POLL_MS);
+    self->wakeup_ticks = lapic_timer_get_ticks() + sleep_ms;
     sched_yield();
     self->wakeup_ticks = 0;
     self->state = THREAD_RUNNING;
@@ -1844,8 +1891,12 @@ static void kswapd_worker(void) {
 
 void vfs_pc_kswapd_init(void) {
   size_t usable_pages = pmm_get_usable_memory() / PAGE_SIZE;
-  kswapd_low_pages = usable_pages / 10;
-  kswapd_high_pages = usable_pages * 15 / 100;
+  kswapd_low_pages = usable_pages / 32;
+  if (kswapd_low_pages < 4096)
+    kswapd_low_pages = 4096;
+  kswapd_high_pages = usable_pages / 16;
+  if (kswapd_high_pages < 8192)
+    kswapd_high_pages = 8192;
   if (!sched_create_kernel_thread(kswapd_worker, NULL, true)) {
     klog_puts("[KSWAPD] off: no worker thread\n");
     return;

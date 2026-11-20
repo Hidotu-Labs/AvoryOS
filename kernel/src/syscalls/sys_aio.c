@@ -584,14 +584,19 @@ static uint64_t sys_timerfd_gettime(uint64_t fd, uint64_t curr_value_ptr,
 
 #define PIPE_BUF_SIZE 65536
 #define PIPE_BUF_MASK (PIPE_BUF_SIZE - 1)
+#define PIPE_PACKET_SLOTS (PIPE_BUF_SIZE / PIPE_PACKET_SIZE)
 
 typedef struct {
     uint8_t     *buffer;
+    uint32_t     buf_size;
     wait_queue_t wq;
     spinlock_t   lock;
     uint32_t     head;
     uint32_t     tail;
     uint32_t     count;
+    uint16_t     packet_sizes[PIPE_PACKET_SLOTS];
+    unsigned     packets;
+    bool         packet_mode;
     bool         reader_open;
     bool         writer_open;
     vfs_node_t  *read_node;
@@ -602,6 +607,76 @@ typedef struct {
     pipe_ctx_t *ctx;
     bool writer;
 } pipe_end_t;
+
+static uint32_t pipe_cap(const pipe_ctx_t *ctx) {
+    return ctx->buf_size ? ctx->buf_size : PIPE_BUF_SIZE;
+}
+
+#define PIPE_INIT_BUF_SIZE 4096
+
+static uint32_t pipe_target_size(uint32_t needed) {
+    uint32_t sz = PIPE_INIT_BUF_SIZE;
+    while (sz < needed && sz < PIPE_BUF_SIZE)
+        sz <<= 1;
+    return sz;
+}
+
+static bool pipe_ensure_buffer_for(pipe_ctx_t *ctx, uint32_t needed) {
+    if (ctx->buffer) {
+        if (ctx->packet_mode || ctx->buf_size >= PIPE_BUF_SIZE)
+            return true;
+        uint32_t room = ctx->buf_size - ctx->count;
+        if (needed <= room)
+            return true;
+        uint32_t max_add = PIPE_BUF_SIZE - ctx->count;
+        uint32_t target = ctx->count + (needed < max_add ? needed : max_add);
+        uint32_t new_size = ctx->buf_size;
+        while (new_size < target)
+            new_size <<= 1;
+        uint8_t *new_buf = kmalloc(new_size);
+        if (!new_buf)
+            return true; /* Keep existing buffer; caller will block/short-write. */
+        if (ctx->count > 0) {
+            uint32_t first = ctx->buf_size - ctx->tail;
+            if (first > ctx->count)
+                first = ctx->count;
+            memcpy(new_buf, ctx->buffer + ctx->tail, first);
+            if (ctx->count > first)
+                memcpy(new_buf + first, ctx->buffer, ctx->count - first);
+        }
+        kfree(ctx->buffer);
+        ctx->buffer = new_buf;
+        ctx->buf_size = new_size;
+        ctx->tail = 0;
+        ctx->head = ctx->count;
+        return true;
+    }
+
+    uint32_t size = ctx->packet_mode ? PIPE_BUF_SIZE : pipe_target_size(needed);
+    uint8_t *buf = kmalloc(size);
+    if (!buf && !ctx->packet_mode) {
+        for (uint32_t try_size = size >> 1; try_size >= PIPE_INIT_BUF_SIZE; try_size >>= 1) {
+            buf = kmalloc(try_size);
+            if (buf) {
+                size = try_size;
+                break;
+            }
+        }
+    }
+    if (!buf)
+        return false;
+    ctx->buffer = buf;
+    ctx->buf_size = size;
+    ctx->head = 0;
+    ctx->tail = 0;
+    ctx->count = 0;
+    return true;
+}
+
+static bool pipe_full(const pipe_ctx_t *ctx) {
+    return ctx->packet_mode ? ctx->packets == PIPE_PACKET_SLOTS
+                            : ctx->count == pipe_cap(ctx);
+}
 
 static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
                            uint8_t *buffer) {
@@ -651,8 +726,12 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     }
 
     /* O(1) contiguous block read from circular ring buffer */
-    uint32_t to_read = size < ctx->count ? size : ctx->count;
-    uint32_t first_chunk = PIPE_BUF_SIZE - ctx->tail;
+    uint32_t cap = pipe_cap(ctx);
+    uint32_t mask = cap - 1;
+    uint32_t available = ctx->packet_mode
+        ? ctx->packet_sizes[ctx->tail / PIPE_PACKET_SIZE] : ctx->count;
+    uint32_t to_read = size < available ? size : available;
+    uint32_t first_chunk = cap - ctx->tail;
     if (first_chunk > to_read)
         first_chunk = to_read;
 
@@ -662,8 +741,15 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
         memcpy(buffer + first_chunk, ctx->buffer, second_chunk);
     }
 
-    ctx->tail = (ctx->tail + to_read) & PIPE_BUF_MASK;
-    ctx->count -= to_read;
+    if (ctx->packet_mode) {
+        /* A short read consumes the packet and discards its unread tail. */
+        ctx->tail = (ctx->tail + PIPE_PACKET_SIZE) & mask;
+        ctx->count -= available;
+        ctx->packets--;
+    } else {
+        ctx->tail = (ctx->tail + to_read) & mask;
+        ctx->count -= to_read;
+    }
 
     if (ctx->count == 0) {
         ctx->head = 0;
@@ -671,6 +757,7 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
         if (!ctx->writer_open && ctx->buffer) {
             kfree(ctx->buffer);
             ctx->buffer = NULL;
+            ctx->buf_size = 0;
         }
     }
 
@@ -683,14 +770,8 @@ static uint32_t pipe_read(vfs_node_t *node, uint32_t offset, uint32_t size,
     return to_read;
 }
 
-static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
-                            uint8_t *buffer) {
-    (void)offset;
-    if (size == 0) return 0;
-    pipe_end_t *end = (pipe_end_t *)node->device;
-    pipe_ctx_t *ctx = end ? end->ctx : NULL;
-    if (!ctx) return (uint32_t)-9; // EBADF
-
+static int32_t pipe_write_chunk(pipe_ctx_t *ctx, uint32_t size,
+                                 const uint8_t *buffer) {
     spinlock_acquire(&ctx->lock);
     if (!ctx->reader_open) {
         spinlock_release(&ctx->lock);
@@ -699,13 +780,18 @@ static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
         return (uint32_t)-32;
     }
 
+    if (!pipe_ensure_buffer_for(ctx, size)) {
+        spinlock_release(&ctx->lock);
+        return (uint32_t)-12; // ENOMEM
+    }
+
     // Limit pipe buffer to 64KB
-    while (ctx->count >= PIPE_BUF_SIZE) {
+    while (pipe_full(ctx)) {
         struct thread *t = sched_get_current();
         int fd = -1;
         if (t) {
             for (uint32_t i = 0; i < t->fd_capacity; i++) {
-                if (t->fds[i] == node) { fd = (int)i; break; }
+                if (t->fds[i] == ctx->write_node) { fd = (int)i; break; }
             }
         }
         if (fd != -1 && (t->fd_flags[fd] & 0x800)) {
@@ -725,7 +811,7 @@ static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
         wait_queue_entry_t entry = {.thread = t, .next = NULL, .wq = NULL, .thread_next = NULL, .thread_prev = NULL};
         t->state = THREAD_BLOCKED;
         wait_queue_add(&ctx->wq, &entry);
-        if (ctx->count < PIPE_BUF_SIZE || !ctx->reader_open) {
+        if (!pipe_full(ctx) || !ctx->reader_open) {
             t->state = THREAD_RUNNING;
             spinlock_release(&ctx->lock);
             wait_queue_remove(&ctx->wq, &entry);
@@ -740,22 +826,18 @@ static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
         spinlock_acquire(&ctx->lock);
     }
 
-    if (!ctx->buffer) {
-        ctx->buffer = kmalloc(PIPE_BUF_SIZE);
-        if (!ctx->buffer) {
-            spinlock_release(&ctx->lock);
-            return (uint32_t)-12; // ENOMEM
-        }
-        ctx->head = 0;
-        ctx->tail = 0;
-        ctx->count = 0;
+    if (!pipe_ensure_buffer_for(ctx, size)) {
+        spinlock_release(&ctx->lock);
+        return (uint32_t)-12; // ENOMEM
     }
 
     /* O(1) contiguous block write into circular ring buffer */
-    uint32_t avail = PIPE_BUF_SIZE - ctx->count;
+    uint32_t cap = pipe_cap(ctx);
+    uint32_t mask = cap - 1;
+    uint32_t avail = cap - ctx->count;
     uint32_t to_write = size < avail ? size : avail;
 
-    uint32_t first_chunk = PIPE_BUF_SIZE - ctx->head;
+    uint32_t first_chunk = cap - ctx->head;
     if (first_chunk > to_write)
         first_chunk = to_write;
 
@@ -765,7 +847,13 @@ static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
         memcpy(ctx->buffer, buffer + first_chunk, second_chunk);
     }
 
-    ctx->head = (ctx->head + to_write) & PIPE_BUF_MASK;
+    if (ctx->packet_mode) {
+        ctx->packet_sizes[ctx->head / PIPE_PACKET_SIZE] = to_write;
+        ctx->head = (ctx->head + PIPE_PACKET_SIZE) & mask;
+        ctx->packets++;
+    } else {
+        ctx->head = (ctx->head + to_write) & mask;
+    }
     ctx->count += to_write;
 
     vfs_node_t *rnode = ctx->reader_open ? ctx->read_node : NULL;
@@ -775,6 +863,36 @@ static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
     if (rnode)
         epoll_notify_event(rnode, 0x0001);
     return to_write;
+}
+
+static uint32_t pipe_write(vfs_node_t *node, uint32_t offset, uint32_t size,
+                             uint8_t *buffer) {
+    (void)offset;
+    if (size == 0) return 0;
+    pipe_end_t *end = node->device;
+    pipe_ctx_t *ctx = end ? end->ctx : NULL;
+    if (!ctx) return (uint32_t)-9;
+    if (!ctx->packet_mode)
+        return pipe_write_chunk(ctx, size, buffer);
+
+    uint32_t done = 0;
+    while (done < size) {
+        uint32_t chunk = size - done;
+        if (chunk > PIPE_PACKET_SIZE)
+            chunk = PIPE_PACKET_SIZE;
+        int32_t written = pipe_write_chunk(ctx, chunk, buffer + done);
+        if (written < 0)
+            return done ? done : (uint32_t)written;
+        done += (uint32_t)written;
+    }
+    return done;
+}
+
+bool pipe_is_packet(const vfs_node_t *node) {
+    if (!node || (node->read != pipe_read && node->write != pipe_write))
+        return false;
+    const pipe_end_t *end = node->device;
+    return end && end->ctx->packet_mode;
 }
 
 static int pipe_poll(vfs_node_t *node, int events) {
@@ -788,7 +906,9 @@ static int pipe_poll(vfs_node_t *node, int events) {
         revents |= (POLLIN | POLLRDNORM | POLLHUP);
     }
     if (end->writer && !ctx->reader_open)               revents |= POLLERR;
-    if (end->writer && ctx->reader_open && ctx->count < PIPE_BUF_SIZE)
+    bool can_write = ctx->packet_mode ? (ctx->packets < PIPE_PACKET_SLOTS)
+                                      : (ctx->count < PIPE_BUF_SIZE);
+    if (end->writer && ctx->reader_open && can_write)
         revents |= (POLLOUT | POLLWRNORM);
     spinlock_release(&ctx->lock);
     return revents & (events | POLLERR | POLLHUP | POLLNVAL);
@@ -886,6 +1006,8 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
     pipe_ctx_t *out_ctx = out_end ? out_end->ctx : NULL;
     if (!in_ctx || !out_ctx)
         return (uint64_t)-9;
+    if (in_ctx->packet_mode || out_ctx->packet_mode)
+        return (uint64_t)-95; // This copy path cannot preserve packet boundaries.
     /* Linux rejects duplicating a pipe into itself. */
     if (in_ctx == out_ctx)
         return (uint64_t)-22;
@@ -936,21 +1058,20 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
         wait_queue_remove(&in_ctx->wq, &entry);
     }
 
-    if (!out_ctx->buffer) {
-        out_ctx->buffer = kmalloc(PIPE_BUF_SIZE);
-        if (!out_ctx->buffer) {
-            spinlock_release(&second->lock);
-            if (second != first)
-                spinlock_release(&first->lock);
-            return (uint64_t)-12; // ENOMEM
-        }
-        out_ctx->head = 0;
-        out_ctx->tail = 0;
-        out_ctx->count = 0;
+    uint32_t tee_need = in_ctx->count < (uint32_t)len ? in_ctx->count : (uint32_t)len;
+    if (!pipe_ensure_buffer_for(out_ctx, tee_need)) {
+        spinlock_release(&second->lock);
+        if (second != first)
+            spinlock_release(&first->lock);
+        return (uint64_t)-12; // ENOMEM
     }
 
+    uint32_t in_cap = pipe_cap(in_ctx);
+    uint32_t in_mask = in_cap - 1;
+    uint32_t out_cap = pipe_cap(out_ctx);
+    uint32_t out_mask = out_cap - 1;
     uint32_t avail_in = in_ctx->count;
-    uint32_t avail_out = PIPE_BUF_SIZE - out_ctx->count;
+    uint32_t avail_out = out_cap - out_ctx->count;
     if (avail_out == 0) {
         spinlock_release(&second->lock);
         if (second != first)
@@ -966,10 +1087,10 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
 
     uint32_t done = 0;
     while (done < to_tee) {
-        uint32_t in_pos = (in_ctx->tail + done) & PIPE_BUF_MASK;
-        uint32_t out_pos = (out_ctx->head + done) & PIPE_BUF_MASK;
-        uint32_t in_contig = PIPE_BUF_SIZE - in_pos;
-        uint32_t out_contig = PIPE_BUF_SIZE - out_pos;
+        uint32_t in_pos = (in_ctx->tail + done) & in_mask;
+        uint32_t out_pos = (out_ctx->head + done) & out_mask;
+        uint32_t in_contig = in_cap - in_pos;
+        uint32_t out_contig = out_cap - out_pos;
         uint32_t rem = to_tee - done;
         uint32_t step = rem < in_contig ? rem : in_contig;
         if (step > out_contig)
@@ -978,7 +1099,7 @@ static uint64_t sys_tee(uint64_t fd_in, uint64_t fd_out, uint64_t len,
         done += step;
     }
 
-    out_ctx->head = (out_ctx->head + done) & PIPE_BUF_MASK;
+    out_ctx->head = (out_ctx->head + done) & out_mask;
     out_ctx->count += done;
 
     vfs_node_t *notify_read =
@@ -1012,7 +1133,8 @@ static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,
 #ifndef O_ASYNC
 #define O_ASYNC 0x2000
 #endif
-    const uint64_t PIPE_SUPPORTED_FLAGS = O_CLOEXEC | O_NONBLOCK | O_ASYNC;
+    const uint64_t PIPE_SUPPORTED_FLAGS = O_CLOEXEC | O_NONBLOCK | O_ASYNC | O_DIRECT;
+    flags = (uint32_t)flags;
     int *pipefd = (int *)pipefd_ptr;
     if (!pipefd || !is_user_range(pipefd, sizeof(int) * 2)) return (uint64_t)-14;
     if (flags & ~PIPE_SUPPORTED_FLAGS) return (uint64_t)-22; // EINVAL
@@ -1037,6 +1159,7 @@ static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,
     wait_queue_init(&ctx->wq);
     ctx->reader_open = true;
     ctx->writer_open = true;
+    ctx->packet_mode = (flags & O_DIRECT) != 0;
 
     pipe_end_t *read_end = kmalloc(sizeof(pipe_end_t));
     pipe_end_t *write_end = kmalloc(sizeof(pipe_end_t));
@@ -1078,7 +1201,7 @@ static uint64_t sys_pipe2(uint64_t pipefd_ptr, uint64_t flags, uint64_t a2,
     /* Translate O_CLOEXEC into the descriptor flag exec_close_cloexec() looks
      * for instead of leaving it in the status flags, where it does nothing. */
     const uint64_t pipe_status = flags & ~(uint64_t)(O_ACCMODE | O_CLOEXEC);
-    t->fd_flags[fd_read]  = pipe_status | O_RDONLY;
+    t->fd_flags[fd_read]  = (pipe_status & ~O_DIRECT) | O_RDONLY;
     t->fd_flags[fd_write] = pipe_status | O_WRONLY;
     if (flags & O_CLOEXEC) {
         t->fd_flags[fd_read]  |= FD_FLAGS_CLOEXEC_BIT;

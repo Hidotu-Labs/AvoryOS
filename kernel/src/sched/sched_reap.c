@@ -155,15 +155,35 @@ void sched_process_reap_queue(struct thread *prev) {
     spinlock_release(&reap_worker_lock);
   }
 
-  /* Backlog safety net for the deferred mm teardown: normally the idle CPUs
-   * (ticking at 1 ms while vmm_defer_pending()) drain faster than producers
-   * queue.  If every core is busy - or this is a UP build - drain a few nodes
-   * here so dead address spaces cannot pile up unboundedly.  The >64
-   * threshold keeps the common case, including wait4's
-   * sched_queue_reap_and_wait() yield loop, from ever paying for a teardown
-   * it queued microseconds ago. */
-  if (vmm_defer_pending() > VMM_DEFER_INLINE_BACKLOG)
-    vmm_defer_drain(VMM_DEFER_INLINE_NODES);
+  /* The deferred-mm backlog safety net used to run here, but this runs inside
+   * sched_schedule() with interrupts masked: tearing down a multi-GiB address
+   * space took ~3 s with IF=0, so the CPU never acked TLB shootdown IPIs and
+   * the initiator spun with shootdown_lock held (desktop froze, "cpu 0 stopped
+   * taking timer ticks", TLB SLOW ack wait=3255ms).  It now lives in
+   * sched_drain_defer_backlog(), called from the yield path with IF=1. */
+  (void)0;
+}
+
+/* Backlog safety net for the deferred mm teardown: normally the idle CPUs
+ * drain faster than producers queue.  If every core is busy, drain a few nodes
+ * from a voluntary yield of a still-runnable thread, with interrupts enabled
+ * so this CPU keeps answering shootdown/probe IPIs and timer ticks.  One CPU
+ * at a time; the >64 threshold keeps wait4's reap loop from paying for a
+ * teardown it queued microseconds ago. */
+void sched_drain_defer_backlog(void) {
+  static uint32_t busy;
+  if (vmm_defer_pending() <= VMM_DEFER_INLINE_BACKLOG || !hal_irq_enabled())
+    return;
+  struct cpu_info *cpu = cpu_get_current();
+  struct thread *cur = cpu ? cpu->current_thread : NULL;
+  if (!cur || cur->is_idle || cur->state != THREAD_RUNNING)
+    return;
+  uint32_t expect = 0;
+  if (!__atomic_compare_exchange_n(&busy, &expect, 1, false, __ATOMIC_ACQUIRE,
+                                   __ATOMIC_RELAXED))
+    return;
+  vmm_defer_drain(VMM_DEFER_INLINE_NODES);
+  __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
 }
 bool sched_reap_thread(struct thread *t) {
   if (!t || t->is_idle)
@@ -359,6 +379,45 @@ bool sched_terminate_thread(uint32_t tid) {
     lapic_send_ipi(cpu->apic_id, IPI_VECTOR_RESCHEDULE);
   sched_queue_reap(t);
   return true;
+}
+
+/* execve() in a multi-threaded process: Linux de_thread() semantics. Every
+ * sibling in the thread group dies; the group itself (tgid, parent, children)
+ * carries on in the exec'ing thread. Without this the old image's threads kept
+ * running on the old mm while exec closed the shared table's O_CLOEXEC fds
+ * under them: GLib's gmain/gdbus then spun forever on poll()=POLLNVAL +
+ * read()=EBADF of their vanished wakeup pipes. Returns the number killed.
+ *
+ * A non-leader exec'ing thread does not take over the leader's tid here, so
+ * the leader is left alone in that case (its exit would end the process);
+ * see the caller. */
+uint32_t sched_exec_kill_siblings(struct thread *current) {
+  if (!current)
+    return 0;
+
+  uint32_t killed = 0;
+  spinlock_acquire(&tid_lock);
+  for (struct thread *t = global_thread_list; t; t = t->global_next) {
+    if (t == current || t->tgid != current->tgid || t->is_idle)
+      continue;
+    if (t->tid == current->tgid) /* leader, and not us */
+      continue;
+    if (t->state == THREAD_DEAD || t->state == THREAD_ZOMBIE)
+      continue;
+
+    t->reap_remove_runqueue = true;
+    __atomic_store_n(&t->state, THREAD_DEAD, __ATOMIC_RELEASE);
+
+    struct cpu_info *cpu = cpu_get_info(t->cpu_index);
+    if (cpu && cpu->status != CPU_STATUS_OFFLINE &&
+        __atomic_load_n(&cpu->current_thread, __ATOMIC_ACQUIRE) == t)
+      lapic_send_ipi(cpu->apic_id, IPI_VECTOR_RESCHEDULE);
+
+    sched_queue_reap(t);
+    killed++;
+  }
+  spinlock_release(&tid_lock);
+  return killed;
 }
 
 void sched_terminate_thread_group(struct thread *current) {

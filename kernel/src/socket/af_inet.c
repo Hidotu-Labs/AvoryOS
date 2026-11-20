@@ -103,7 +103,8 @@ static void inet_destroy(socket_t *sock) {
 static inline void inet_sync_node(socket_t *sock, inet_sock_t *isk) {
     if (sock && sock->node && isk) {
         if (isk->udp) isk->udp->vfs_node = sock->node;
-        if (isk->tcp) isk->tcp->vfs_node = sock->node;
+        if (isk->tcp && isk->tcp->vfs_node != sock->node)
+            tcp_attach_socket(isk->tcp, sock->wait_queue, sock->node);
     }
 }
 
@@ -140,8 +141,6 @@ static int inet_connect(socket_t *sock, struct sockaddr *addr, int addrlen) {
             return -106; /* EISCONN */
         if (sock->state == SS_CONNECTING || isk->tcp->state == TCP_SYN_SENT || isk->tcp->state == TCP_SYN_RECEIVED)
             return -114; /* EALREADY */
-        isk->tcp->vfs_node = sock->node;
-        isk->tcp->wait_queue = sock->wait_queue;
         tcp_set_nodelay(isk->tcp, isk->tcp_nodelay);
         tcp_set_reuseaddr(isk->tcp, sock->reuseaddr != 0);
         tcp_set_keepalive(isk->tcp, isk->tcp_keepalive,
@@ -204,8 +203,7 @@ static int inet_connect(socket_t *sock, struct sockaddr *addr, int addrlen) {
 static int inet_listen(socket_t *sock, int backlog) {
     inet_sock_t *isk = sock->sk;
     if (!isk || !isk->tcp) return -95;
-    isk->tcp->wait_queue = sock->wait_queue;
-    isk->tcp->vfs_node = sock->node;
+    inet_sync_node(sock, isk);
     int r = tcp_listen(isk->tcp, backlog);
     if (!r) sock->state = SS_LISTENING;
     return r;
@@ -678,7 +676,7 @@ static int inet_poll(socket_t *sock, int events) {
     if (!isk) return POLLNVAL;
     if (isk->tcp) {
         /* Keep vfs_node in sync so wake() can notify epoll */
-        isk->tcp->vfs_node = sock->node;
+        inet_sync_node(sock, isk);
         int r = 0;
         switch (isk->tcp->state) {
         case TCP_LISTEN:

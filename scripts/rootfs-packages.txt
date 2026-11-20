@@ -299,10 +299,8 @@ xorg-xrdb
 xorg-xhost
 librsvg
 gtksourceview3
-mousepad
 gspell
 menu-cache
-pcmanfm
 libfm
 libfm-extra
 libexif

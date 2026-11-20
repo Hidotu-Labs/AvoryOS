@@ -78,6 +78,59 @@ static int command(const void *req, uint32_t len) {
     return virtio_gpu_control(req, len, &reply, sizeof(reply), &type) &&
         type == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -5;
 }
+
+static int virgl_attach_backing(uint32_t resource_id, struct drm_gem_object *obj) {
+    if (!obj->sg_pages) {
+        struct virtio_gpu_resource_attach_backing backing = {0};
+        backing.hdr = header(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING, 0);
+        backing.resource_id = resource_id;
+        backing.nr_entries = 1;
+        backing.entry.addr = obj->phys_addr;
+        backing.entry.length = obj->size;
+        return command(&backing, sizeof(backing));
+    }
+
+    uint32_t pages = obj->size / 4096;
+    if (pages == 0)
+        return -22;
+
+    uint32_t runs = 1;
+    for (uint32_t i = 1; i < pages; i++) {
+        if (obj->sg_pages[i] != obj->sg_pages[i - 1] + 4096)
+            runs++;
+    }
+
+    size_t req_size = sizeof(struct virtio_gpu_resource_attach_backing) +
+                      (size_t)(runs - 1) * sizeof(struct virtio_gpu_mem_entry);
+    struct virtio_gpu_resource_attach_backing *backing = kmalloc(req_size);
+    if (!backing)
+        return -12;
+
+    memset(backing, 0, sizeof(*backing));
+    backing->hdr = header(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING, 0);
+    backing->resource_id = resource_id;
+    backing->nr_entries = runs;
+
+    struct virtio_gpu_mem_entry *entries = &backing->entry;
+    uint32_t run_idx = 0;
+    entries[0].addr = obj->sg_pages[0];
+    entries[0].length = 4096;
+    entries[0].padding = 0;
+    for (uint32_t i = 1; i < pages; i++) {
+        if (obj->sg_pages[i] == obj->sg_pages[i - 1] + 4096) {
+            entries[run_idx].length += 4096;
+        } else {
+            run_idx++;
+            entries[run_idx].addr = obj->sg_pages[i];
+            entries[run_idx].length = 4096;
+            entries[run_idx].padding = 0;
+        }
+    }
+
+    int ret = command(backing, (uint32_t)req_size);
+    kfree(backing);
+    return ret;
+}
 static void put(struct drm_gem_object *obj) {
     if (ascentdrm_gem_put_last(obj))
         ascentdrm_gem_object_free(obj->dev, obj);
@@ -87,7 +140,7 @@ static void put(struct drm_gem_object *obj) {
 static struct drm_gem_object *lookup(struct drm_file *file, uint32_t handle) {
     if (!handle || handle >= DRM_MAX_HANDLES_PER_FILE) return NULL;
     spinlock_acquire(&file->lock);
-    struct drm_gem_object *obj = file->handles[handle];
+    struct drm_gem_object *obj = ascentdrm_file_handle_peek(file, handle);
     if (obj) ascentdrm_gem_get(obj);
     spinlock_release(&file->lock);
     return obj;
@@ -161,6 +214,7 @@ static void free_resource(struct drm_device *dev, struct drm_gem_object *obj) {
     if (command(&req, sizeof(req))) return;
     spinlock_acquire(&virgl_track_lock);
     if (res->tracked) {
+        __atomic_sub_fetch(&ascentdrm_live_virgl_resources, 1, __ATOMIC_RELAXED);
         if (res->prev)
             res->prev->next = res->next;
         else if (virgl_resources_head == res)
@@ -341,13 +395,7 @@ int virtio_gpu_virgl_restore_after_reset(uint64_t features, uint32_t count) {
         if (command(&req, sizeof(req))) {
             ret = -5;
         } else {
-            struct virtio_gpu_resource_attach_backing backing = {0};
-            backing.hdr = header(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING, 0);
-            backing.resource_id = s->id;
-            backing.nr_entries = 1;
-            backing.entry.addr = s->obj->phys_addr;
-            backing.entry.length = s->obj->size;
-            if (command(&backing, sizeof(backing))) {
+            if (virgl_attach_backing(s->id, s->obj)) {
                 ret = -5;
             } else {
                 for (uint32_t a = 0; a < s->att_count; a++) {
@@ -404,7 +452,7 @@ static int create(struct drm_file *file, struct vg_create *p) {
     }
     int ret = context(file);
     if (ret) { klogf("[VIRGL] ctx create failed: %d\n", ret); return ret; }
-    struct drm_gem_object *obj = ascentdrm_gem_object_create(file->dev, p->size);
+    struct drm_gem_object *obj = ascentdrm_gem_object_create_sg(file->dev, p->size);
     if (!obj) { klogf("[VIRGL] create: no memory for size=%u\n", p->size); return -12; }
     struct virgl_resource *res = kmalloc(sizeof(*res));
     if (!res) { put(obj); return -12; }
@@ -445,12 +493,9 @@ static int create(struct drm_file *file, struct vg_create *p) {
         virgl_resources_head->prev = res;
     virgl_resources_head = res;
     res->tracked = true;
+    __atomic_add_fetch(&ascentdrm_live_virgl_resources, 1, __ATOMIC_RELAXED);
     spinlock_release(&virgl_track_lock);
-    struct virtio_gpu_resource_attach_backing backing = {0};
-    backing.hdr = header(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING, 0);
-    backing.resource_id = res->id; backing.nr_entries = 1;
-    backing.entry.addr = obj->phys_addr; backing.entry.length = obj->size;
-    ret = command(&backing, sizeof(backing));
+    ret = virgl_attach_backing(res->id, obj);
     if (!ret) ret = attach(file, res);
     if (!ret) {
         p->bo_handle = ascentdrm_file_gem_register(file, obj);
@@ -531,7 +576,7 @@ static int exec(struct drm_file *file, struct vg_exec *p, uint32_t abi_size) {
         for (uint32_t i = first; i < end; i++) {
             uint32_t handle = handles[i];
             if (handle && handle < DRM_MAX_HANDLES_PER_FILE) {
-                objects[i] = file->handles[handle];
+                objects[i] = ascentdrm_file_handle_peek(file, handle);
                 if (objects[i]) ascentdrm_gem_get(objects[i]);
             }
         }

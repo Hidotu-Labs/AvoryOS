@@ -37,6 +37,10 @@
  * exceeds this driver's writable support. Unlike per-mount MS_RDONLY, this
  * cannot be cleared by a remount. */
 #define FS_READONLY 0x800
+/* FIFO inode on a filesystem that may return several VFS nodes for the same
+ * inode (ext2/ext4). node->device belongs to the filesystem, so fifo_open()
+ * keys the shared pipe state by (device, inode) instead of storing it there. */
+#define FS_FIFO_SHARED 0x1000
 #define FS_TYPE_MASK 0x0F
 
 /* Live-object markers.  A node or cached page that has been freed has its
@@ -279,6 +283,13 @@ typedef struct vfs_node {
    * truncate, memfd growth realloc), so a mapping without its own reference
    * would keep writable PTEs to a frame the PMM has already re-issued. */
   bool mmap_shared_pmm_refs;
+  /* Device-physical mappings installed on demand by the VMA fault path.  When
+   * mmap_phys_pte_flags is nonzero, the fault path maps pages through
+   * mmap_phys_fault(node, file_offset) -> physical address (0 = no page).
+   * The mmap handler then only validates and registers the VMA; it writes no
+   * PTEs up front, so mapping a large framebuffer costs nothing until touched. */
+  uint64_t mmap_phys_pte_flags;
+  uint64_t (*mmap_phys_fault)(struct vfs_node *node, uint64_t file_offset);
   poll_type_t poll; // Device-specific poll handler
   statfs_type_t statfs;
   uint32_t (*get_nlink)(struct vfs_node *); // Optional dynamic link count

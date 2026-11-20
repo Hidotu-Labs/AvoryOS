@@ -256,7 +256,8 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
         bool shared_refs = shared && (pvma->flags & (MAP_PAGECACHE | MAP_SYSV_SHM));
         if (shared && !shared_refs) {
           vfs_node_t *fnode = (vfs_node_t *)pvma->file_node;
-          shared_refs = fnode && fnode->mmap_shared_pmm_refs;
+          shared_refs = fnode && fnode->mmap_shared_pmm_refs &&
+                        !pvma->linux_vma;
         }
         if (shared_refs && pmm_is_managed(phys))
           pmm_incref((void *)phys);

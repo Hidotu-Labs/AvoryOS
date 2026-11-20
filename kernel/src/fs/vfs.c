@@ -6,6 +6,8 @@
 #include "drivers/storage/block.h"
 #include "dirindex.h"
 #include "inotify.h"
+#include "../apic/lapic_timer.h"
+#include "../drivers/timer/rtc.h"
 #include "../console/klog.h"
 #include "../cpu/tsc.h"
 #include "../lib/string.h"
@@ -1523,6 +1525,19 @@ static void vfs_readdir_generation_advance(vfs_node_t *node) {
     __atomic_add_fetch(&node->readdir_generation, 1, __ATOMIC_RELEASE);
 }
 
+/* A successful entry change in a directory also changes its mtime/ctime.
+ * stat() answers from the cached node, so update it here as well as on disk
+ * (ext2 persists it in ext2_touch_dir); otherwise caches keyed on directory
+ * mtime, such as KDE's KSycoca menu database, miss newly installed files. */
+static void vfs_dir_changed(vfs_node_t *node) {
+  vfs_readdir_generation_advance(node);
+  uint32_t now = (uint32_t)(rtc_get_boot_timestamp() + lapic_timer_get_ms() / 1000);
+  for (unsigned depth = 0; node && depth < 16; depth++, node = node->view_backing) {
+    node->mtime = now;
+    node->ctime = now;
+  }
+}
+
 int vfs_create(vfs_node_t *node, char *name, uint16_t permission) {
   if (vfs_mount_readonly(node))
     return -30;
@@ -1530,7 +1545,7 @@ int vfs_create(vfs_node_t *node, char *name, uint16_t permission) {
     vfs_readdir_generation_advance(node);
     int result = node->create(node, name, permission);
     if (result == 0) {
-      vfs_readdir_generation_advance(node);
+      vfs_dir_changed(node);
       vfs_dentry_invalidate_created(node, name);
       inotify_notify(node, IN_CREATE, name, 0);
     }
@@ -1546,7 +1561,7 @@ int vfs_mkdir(vfs_node_t *node, char *name, uint16_t permission) {
     vfs_readdir_generation_advance(node);
     int result = node->mkdir(node, name, permission);
     if (result == 0) {
-      vfs_readdir_generation_advance(node);
+      vfs_dir_changed(node);
       vfs_dentry_invalidate_created(node, name);
       inotify_notify(node, IN_CREATE | IN_ISDIR, name, 0);
     } else {
@@ -1584,7 +1599,7 @@ int vfs_unlink(vfs_node_t *node, char *name) {
     vfs_readdir_generation_advance(node);
     int result = node->unlink(node, name);
     if (result == 0) {
-      vfs_readdir_generation_advance(node);
+      vfs_dir_changed(node);
       inotify_notify(node, IN_DELETE, name, 0);
       if (target) {
         inotify_notify(target, IN_DELETE_SELF, NULL, 0);
@@ -1607,7 +1622,7 @@ int vfs_rmdir(vfs_node_t *node, char *name) {
     vfs_readdir_generation_advance(node);
     int rc = node->rmdir(node, name);
     if (!rc) {
-      vfs_readdir_generation_advance(node);
+      vfs_dir_changed(node);
       inotify_notify(node, IN_DELETE | IN_ISDIR, name, 0);
       if (target) inotify_notify(target, IN_DELETE_SELF | IN_ISDIR, NULL, 0);
     }
@@ -1631,7 +1646,7 @@ int vfs_symlink(vfs_node_t *node, char *name, char *target) {
     vfs_readdir_generation_advance(node);
     int result = node->symlink(node, name, target);
     if (result == 0) {
-      vfs_readdir_generation_advance(node);
+      vfs_dir_changed(node);
       vfs_dentry_invalidate_created(node, name);
       inotify_notify(node, IN_CREATE, name, 0);
     }
@@ -1664,7 +1679,7 @@ int vfs_rename(vfs_node_t *node, char *old_name, char *new_name) {
     vfs_readdir_generation_advance(node);
     int result = node->rename(node, old_name, new_name);
     if (result == 0) {
-      vfs_readdir_generation_advance(node);
+      vfs_dir_changed(node);
       /* Readers can refill either entry while the backend rename waits or
        * performs I/O. Drop pre-mutation positive/negative entries again once
        * the new namespace state is installed. */
@@ -1703,7 +1718,7 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
     vfs_dentry_invalidate(new_parent, new_name);
     int rc = vfs_rename(old_parent, old_name, new_name);
     if (!rc)
-      vfs_readdir_generation_advance(new_parent);
+      vfs_dir_changed(new_parent);
     vfs_dentry_invalidate(new_parent, new_name);
     return rc;
   }
@@ -1722,8 +1737,8 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
     vfs_readdir_generation_advance(new_parent);
     int rc = ext2_rename_cross(old_parent, old_name, new_parent, new_name);
     if (!rc) {
-      vfs_readdir_generation_advance(old_parent);
-      vfs_readdir_generation_advance(new_parent);
+      vfs_dir_changed(old_parent);
+      vfs_dir_changed(new_parent);
       if (source && (source->flags & FS_TYPE_MASK) == FS_DIRECTORY)
         vfs_node_set_parent(source, new_parent);
     }
@@ -1752,8 +1767,8 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
     vfs_readdir_generation_advance(new_parent);
     int rc = tmpfs_rename_cross(old_parent, old_name, new_parent, new_name);
     if (!rc) {
-      vfs_readdir_generation_advance(old_parent);
-      vfs_readdir_generation_advance(new_parent);
+      vfs_dir_changed(old_parent);
+      vfs_dir_changed(new_parent);
       if (source && (source->flags & FS_TYPE_MASK) == FS_DIRECTORY)
         vfs_node_set_parent(source, new_parent);
     }
@@ -1794,7 +1809,7 @@ int vfs_mknod(vfs_node_t *node, char *name, uint16_t permission, uint32_t flags,
     vfs_readdir_generation_advance(node);
     int result = node->mknod(node, name, permission, flags, device);
     if (result == 0) {
-      vfs_readdir_generation_advance(node);
+      vfs_dir_changed(node);
       vfs_dentry_invalidate_created(node, name);
       inotify_notify(node, IN_CREATE, name, 0);
     }

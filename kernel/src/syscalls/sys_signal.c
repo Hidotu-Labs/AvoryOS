@@ -1349,13 +1349,33 @@ static uint64_t sys_sigaltstack(uint64_t ss_ptr, uint64_t old_ss_ptr,
   return 0;
 }
 
-static uint64_t __attribute__((unused)) sys_sigprocmask(uint64_t how, uint64_t set_ptr,
-                                uint64_t oldset_ptr, uint64_t a3, uint64_t a4,
-                                uint64_t a5) {
-  (void)a3;
-  (void)a4;
-  (void)a5;
-  return sys_rt_sigprocmask(how, set_ptr, oldset_ptr, 8, 0, 0);
+/* i386 sigprocmask (126): old_sigset_t covers signals 1-32 only; the upper
+ * half of the native mask is preserved, as on Linux. */
+uint64_t sys_compat_sigprocmask(uint64_t how, uint64_t set_ptr,
+                                uint64_t oldset_ptr) {
+  struct thread *current = sched_get_current();
+  if (!current)
+    return (uint64_t)-1;
+  if (oldset_ptr) {
+    uint32_t old = (uint32_t)current->signal_mask;
+    if (copy_to_user((void *)oldset_ptr, &old, sizeof(old)) != 0)
+      return (uint64_t)-14;
+  }
+  if (set_ptr) {
+    uint32_t set32;
+    if (copy_from_user(&set32, (const void *)set_ptr, sizeof(set32)) != 0)
+      return (uint64_t)-14;
+    uint64_t newset = set32 & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+    switch (how) {
+    case SIG_BLOCK: current->signal_mask |= newset; break;
+    case SIG_UNBLOCK: current->signal_mask &= ~newset; break;
+    case SIG_SETMASK:
+      current->signal_mask = (current->signal_mask & ~0xFFFFFFFFULL) | newset;
+      break;
+    default: return (uint64_t)-22;
+    }
+  }
+  return 0;
 }
 
 // Send a signal to a specific thread

@@ -138,6 +138,30 @@ if [ -f "${ROOTFS_DIR}/etc/ld.so.conf" ]; then
         echo "Warning: could not rebuild /etc/ld.so.cache; library loading will be slow" >&2
     fi
 fi
+
+# Enable en_US.UTF-8 in /etc/locale.gen and pre-build /usr/lib/locale/locale-archive
+# rootlessly so tools like Steam's pressure-vessel/pv-adverb don't fail locale-gen.
+LOCALE_GEN_FILE=""
+if [ -f "${ROOTFS_DIR}/etc/locale.gen" ]; then
+    sed 's/^#\s*en_US\.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' \
+        "${ROOTFS_DIR}/etc/locale.gen" > "${CONFIG_DIR}/locale.gen"
+    LOCALE_GEN_FILE="${CONFIG_DIR}/locale.gen"
+fi
+cat > "${CONFIG_DIR}/locale.conf" <<'EOF'
+LANG=en_US.UTF-8
+EOF
+LOCALE_ARCHIVE=""
+if [ -d "${ROOTFS_DIR}/usr/share/i18n" ] && command -v localedef >/dev/null 2>&1; then
+    mkdir -p "${CONFIG_DIR}/locale_root/usr/lib/locale"
+    if I18NPATH="${ROOTFS_DIR}/usr/share/i18n" \
+       localedef --prefix="${CONFIG_DIR}/locale_root" -c -i en_US -f UTF-8 en_US.UTF-8 \
+       >/dev/null 2>&1 &&
+       [ -s "${CONFIG_DIR}/locale_root/usr/lib/locale/locale-archive" ]; then
+        LOCALE_ARCHIVE="${CONFIG_DIR}/locale_root/usr/lib/locale/locale-archive"
+    else
+        echo "Warning: localedef failed; en_US.UTF-8 locale-archive not prebuilt" >&2
+    fi
+fi
 {
     cat <<EOF
 rm bin/sh
@@ -210,6 +234,16 @@ write ${ROOT_DIR}/assets/ascii-art.txt fastfetch/logo.txt
 EOF
     if [ -f "${CONFIG_DIR}/nsswitch.conf" ]; then
         printf 'rm etc/nsswitch.conf\nwrite %s etc/nsswitch.conf\n' "${CONFIG_DIR}/nsswitch.conf"
+    fi
+    if [ -n "${LOCALE_GEN_FILE}" ]; then
+        printf 'rm etc/locale.gen\nwrite %s etc/locale.gen\n' "${LOCALE_GEN_FILE}"
+        printf 'set_inode_field etc/locale.gen mode 0100644\n'
+    fi
+    printf 'rm etc/locale.conf\nwrite %s etc/locale.conf\n' "${CONFIG_DIR}/locale.conf"
+    printf 'set_inode_field etc/locale.conf mode 0100644\n'
+    if [ -n "${LOCALE_ARCHIVE}" ]; then
+        printf 'mkdir usr/lib/locale\nrm usr/lib/locale/locale-archive\nwrite %s usr/lib/locale/locale-archive\n' "${LOCALE_ARCHIVE}"
+        printf 'set_inode_field usr/lib/locale/locale-archive mode 0100644\n'
     fi
     # Rootless package extraction cannot retain root ownership and may drop
     # setuid. Restore sudo's installed metadata inside the image, where it

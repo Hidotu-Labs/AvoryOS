@@ -31,6 +31,7 @@ extern struct termios console_termios;
 extern uint32_t fb_dev_read(struct vfs_node *node, uint32_t offset, uint32_t size, uint8_t *buffer);
 extern uint32_t fb_dev_write(struct vfs_node *node, uint32_t offset, uint32_t size, uint8_t *buffer);
 extern uint64_t fb_dev_mmap(struct vfs_node *node, uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags, uint64_t offset);
+extern void fb_mmap_demand_register(struct vfs_node *node);
 extern int fb_dev_ioctl(struct vfs_node *node, uint32_t cmd, uint64_t arg);
 extern void fb_dev_open(struct vfs_node *node);
 extern void fb_dev_close(struct vfs_node *node);
@@ -614,6 +615,7 @@ void fb_register_vfs(void) {
     fb_vfs_node.read = fb_dev_read;
     fb_vfs_node.write = fb_dev_write;
     fb_vfs_node.mmap = fb_dev_mmap;
+    fb_mmap_demand_register(&fb_vfs_node);
     fb_vfs_node.ioctl = fb_dev_ioctl;
     fb_vfs_node.open = fb_dev_open;
     fb_vfs_node.close = fb_dev_close;
@@ -628,6 +630,7 @@ void fb_register_vfs(void) {
     fb_alias_node.read = fb_dev_read;
     fb_alias_node.write = fb_dev_write;
     fb_alias_node.mmap = fb_dev_mmap;
+    fb_mmap_demand_register(&fb_alias_node);
     fb_alias_node.ioctl = fb_dev_ioctl;
     fb_alias_node.open = fb_dev_open;
     fb_alias_node.close = fb_dev_close;

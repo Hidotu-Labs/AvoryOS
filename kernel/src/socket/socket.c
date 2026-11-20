@@ -783,7 +783,12 @@ int socket_alloc_fd(socket_t *sock) {
 
   vfs_node_init(node);
   node->flags = FS_SOCKET;
-  node->inode = (uint32_t)(uint64_t)sock; // Use socket pointer as inode
+  static uint32_t next_socket_inode = 0x40000000;
+  node->inode = __atomic_fetch_add(&next_socket_inode, 1, __ATOMIC_RELAXED);
+  node->uid = t->fsuid;
+  node->gid = t->fsgid;
+  node->mask = 0777;
+  snprintf(node->name, sizeof(node->name), "socket:[%u]", node->inode);
   node->device = sock;
   node->wait_queue = sock->wait_queue;
 
@@ -1139,6 +1144,10 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     }
     socket_put(sock);
     return 0;
+  }
+  if (request == 0x8946) { /* SIOCETHTOOL */
+    socket_put(sock);
+    return -95; /* EOPNOTSUPP */
   }
   if (request == 0x8910 || request == 0x8913 || request == 0x8914 ||
       request == 0x8915 || request == 0x8916 || request == 0x8919 ||

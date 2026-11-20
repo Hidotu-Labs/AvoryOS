@@ -1602,7 +1602,12 @@ static uint64_t sys_pivot_root(uint64_t new_root_ptr, uint64_t put_old_ptr,
     if ((uint64_t)n >= sizeof(put_old)) return (uint64_t)-36;
 
     struct thread *task = sched_get_current();
-    if (!capability_has(task, CAP_SYS_ADMIN)) return (uint64_t)-1;
+    /* pivot_root only rewrites the caller's own mount namespace, so the same
+     * rule as mount() applies: owning that namespace is enough. bwrap (Steam,
+     * Flatpak) keeps the host network, so it never owns a net namespace and
+     * cannot get the full CAP_SYS_ADMIN that capability_has() demands. */
+    bool ns_ok = vfs_namespace_active() && capability_mount_ns_admin(task);
+    if (!ns_ok && !capability_has_init_ns(task, CAP_SYS_ADMIN)) return (uint64_t)-1;
     vfs_node_t *base = task && task->cwd_node ? task->cwd_node : fs_root;
     vfs_node_t *n_node = vfs_resolve_path_at(base, new_root);
     if (!n_node) return (uint64_t)-2;
@@ -1735,8 +1740,19 @@ static uint64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
     if (times) {
         if (!is_user_ptr(times)) return (uint64_t)-14;
         struct sys_timespec ts[2];
-        if (copy_from_user(ts, (const void *)times, sizeof(ts)) != 0)
+        struct thread *caller = sched_get_current();
+        if (caller && caller->seccomp_compat_dispatch) {
+            /* i386 utimensat (320) takes two 32-bit {sec, nsec} pairs. */
+            int32_t t32[4];
+            if (copy_from_user(t32, (const void *)times, sizeof(t32)) != 0)
+                return (uint64_t)-14;
+            for (int i = 0; i < 2; i++) {
+                ts[i].tv_sec = t32[i * 2];
+                ts[i].tv_nsec = t32[i * 2 + 1];
+            }
+        } else if (copy_from_user(ts, (const void *)times, sizeof(ts)) != 0) {
             return (uint64_t)-14;
+        }
         return do_utimensat_impl(dirfd, pathname, ts, true, flags);
     }
     return do_utimensat_impl(dirfd, pathname, NULL, false, flags);

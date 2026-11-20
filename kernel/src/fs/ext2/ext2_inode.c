@@ -213,6 +213,11 @@ vfs_node_t *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
     node->flags = FS_SOCKET;
     node->chmod = ext2_chmod_impl;
     node->chown = ext2_chown_impl;
+  } else if (type == EXT2_S_IFIFO) {
+    /* node->device stays the mount; fifo_open() keys the pipe by inode. */
+    node->flags = FS_PIPE | FS_FIFO_SHARED;
+    node->chmod = ext2_chmod_impl;
+    node->chown = ext2_chown_impl;
   }
 
   if (mnt->sb.s_feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS)

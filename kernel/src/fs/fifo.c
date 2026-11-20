@@ -31,6 +31,11 @@ typedef struct fifo_ctx {
     uint32_t     refcount;
     vfs_node_t  *read_node; // For epoll notifications
     vfs_node_t  *write_node; // For epoll notifications
+    /* FS_FIFO_SHARED registry membership (fifo_init_lock). */
+    bool         shared;
+    void        *shared_dev;
+    uint32_t     shared_ino;
+    struct fifo_ctx *shared_next;
 } fifo_ctx_t;
 
 typedef struct {
@@ -40,6 +45,41 @@ typedef struct {
 } fifo_end_t;
 
 static spinlock_t fifo_init_lock = SPINLOCK_INIT;
+static fifo_ctx_t *fifo_shared_list; // FS_FIFO_SHARED contexts, fifo_init_lock
+
+static fifo_ctx_t *fifo_ctx_alloc(void) {
+    fifo_ctx_t *fifo = kmalloc(sizeof(fifo_ctx_t));
+    if (!fifo) return NULL;
+    memset(fifo, 0, sizeof(*fifo));
+    spinlock_init(&fifo->lock);
+    wait_queue_init(&fifo->data_wq);
+    wait_queue_init(&fifo->open_wq);
+    fifo->refcount = 1; // owner: node->device or the shared registry
+    return fifo;
+}
+
+/* fifo_init_lock held. */
+static fifo_ctx_t *fifo_shared_get(vfs_node_t *node) {
+    for (fifo_ctx_t *f = fifo_shared_list; f; f = f->shared_next)
+        if (f->shared_dev == node->device && f->shared_ino == node->inode)
+            return f;
+    fifo_ctx_t *f = fifo_ctx_alloc();
+    if (!f) return NULL;
+    f->shared = true;
+    f->shared_dev = node->device;
+    f->shared_ino = node->inode;
+    f->shared_next = fifo_shared_list;
+    fifo_shared_list = f;
+    return f;
+}
+
+/* fifo_init_lock held: drop an idle shared context (only the registry ref). */
+static bool fifo_shared_unlink_if_idle(fifo_ctx_t *fifo) {
+    if (!fifo->shared || fifo->refcount != 1) return false;
+    for (fifo_ctx_t **pp = &fifo_shared_list; *pp; pp = &(*pp)->shared_next)
+        if (*pp == fifo) { *pp = fifo->shared_next; return true; }
+    return false;
+}
 
 static inline bool fifo_is_nonblock(struct thread *t, vfs_node_t *node) {
     if (!t) return false;
@@ -329,7 +369,7 @@ static void fifo_close(vfs_node_t *node) {
             epoll_notify_event(notify_read, POLLHUP);
 
         spinlock_acquire(&fifo_init_lock);
-        if (--fifo->refcount == 0) {
+        if (--fifo->refcount == 0 || fifo_shared_unlink_if_idle(fifo)) {
             free_ctx = true;
         }
         spinlock_release(&fifo_init_lock);
@@ -370,20 +410,24 @@ int fifo_open(vfs_node_t *node, uint64_t flags, vfs_node_t **out_node) {
     *out_node = NULL;
 
     spinlock_acquire(&fifo_init_lock);
-    fifo_ctx_t *fifo = (fifo_ctx_t *)node->device;
-    if (!fifo) {
-        fifo = kmalloc(sizeof(fifo_ctx_t));
+    fifo_ctx_t *fifo;
+    if (node->flags & FS_FIFO_SHARED) {
+        fifo = fifo_shared_get(node);
         if (!fifo) {
             spinlock_release(&fifo_init_lock);
             return -12; // ENOMEM
         }
-        memset(fifo, 0, sizeof(*fifo));
-        spinlock_init(&fifo->lock);
-        wait_queue_init(&fifo->data_wq);
-        wait_queue_init(&fifo->open_wq);
-        fifo->refcount = 1; // 1 for node->device
-        node->device = fifo;
-        node->destroy = fifo_destroy;
+    } else {
+        fifo = (fifo_ctx_t *)node->device;
+        if (!fifo) {
+            fifo = fifo_ctx_alloc();
+            if (!fifo) {
+                spinlock_release(&fifo_init_lock);
+                return -12; // ENOMEM
+            }
+            node->device = fifo;
+            node->destroy = fifo_destroy;
+        }
     }
     fifo->refcount++; // 1 for this open instance
     spinlock_release(&fifo_init_lock);

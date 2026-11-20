@@ -673,7 +673,11 @@ int ext3_journal_block(ext2_mount_t *mnt, uint64_t block_nr, const void *data) {
     for (uint32_t i = 0; i < chunk->count; i++) {
       if (chunk->entries[i].block != block_nr)
         continue;
-      if (!memcmp(chunk->entries[i].image, data, mnt->block_size))
+      if (chunk->entries[i].forgotten) {
+        /* Freed and reused as metadata within this handle: live again. */
+        memcpy(chunk->entries[i].image, data, mnt->block_size);
+        chunk->entries[i].forgotten = false;
+      } else if (!memcmp(chunk->entries[i].image, data, mnt->block_size))
         trans->metadata_unchanged++;
       else
         memcpy(chunk->entries[i].image, data, mnt->block_size);
@@ -688,7 +692,8 @@ int ext3_journal_block(ext2_mount_t *mnt, uint64_t block_nr, const void *data) {
    * evidence of an unchanged disk block. */
   /* A closed handle may hold a newer image than home: restoring the old home
    * content is then a real change and must be staged, not dropped. */
-  bool in_closed = ext3_find_closed(trans, block_nr) != NULL;
+  ext3_txn_entry_t *closed_hit = ext3_find_closed(trans, block_nr);
+  bool in_closed = closed_hit && !closed_hit->forgotten;
   bool unchanged = !in_closed &&
                    ext2_bc_matches(mnt, block_nr, data);
   if (unchanged) {
@@ -745,12 +750,37 @@ int ext3_journal_block(ext2_mount_t *mnt, uint64_t block_nr, const void *data) {
   slot->payload_pos = payload_pos;
   slot->desc_pos = desc_pos;
   slot->image = image;
+  slot->forgotten = false;
   trans->txn_count = index + 1;
   spinlock_release(&mnt->cache_lock);
 
   trans->blocks_in_trans = index + 1;
   trans->phase = previous_phase;
   return 0;
+}
+
+/* jbd2 "forget": a freed block can be reallocated as file data at once, and
+ * data blocks bypass the journal. Without this, every read of the reused
+ * block (including a partial-block RMW) was answered from the stale staged
+ * metadata image, and the commit checkpoint later wrote that image over the
+ * new data - e.g. one silently corrupt 1 KiB block in a Steam download after
+ * preallocation reshaped the extent tree. The journal is retired after each
+ * commit, so no older logged copy can be replayed and no revoke record is
+ * needed; the forgotten image is only logged in its reserved slot. */
+void ext3_journal_forget(ext2_mount_t *mnt, uint64_t block_nr) {
+  if (!mnt)
+    return;
+  ext3_journal_state_t *trans = ext3_journal_state(mnt);
+  spinlock_acquire(&mnt->cache_lock);
+  for (ext3_txn_chunk_t *chunk = trans->txn_head; chunk; chunk = chunk->next)
+    for (uint32_t i = 0; i < chunk->count; i++)
+      if (chunk->entries[i].block == block_nr)
+        chunk->entries[i].forgotten = true;
+  for (ext3_txn_chunk_t *chunk = trans->closed_head; chunk; chunk = chunk->next)
+    for (uint32_t i = 0; i < chunk->count; i++)
+      if (chunk->entries[i].block == block_nr)
+        chunk->entries[i].forgotten = true;
+  spinlock_release(&mnt->cache_lock);
 }
 
 bool ext3_journal_read_staged(ext2_mount_t *mnt, uint64_t block_nr,
@@ -763,7 +793,8 @@ bool ext3_journal_read_staged(ext2_mount_t *mnt, uint64_t block_nr,
   for (ext3_txn_chunk_t *chunk = trans->txn_head; chunk && !found;
        chunk = chunk->next) {
     for (uint32_t i = 0; i < chunk->count; i++) {
-      if (chunk->entries[i].block != block_nr || !chunk->entries[i].image)
+      if (chunk->entries[i].block != block_nr || !chunk->entries[i].image ||
+          chunk->entries[i].forgotten)
         continue;
       memcpy(buffer, chunk->entries[i].image, mnt->block_size);
       found = true;
@@ -773,7 +804,8 @@ bool ext3_journal_read_staged(ext2_mount_t *mnt, uint64_t block_nr,
   for (ext3_txn_chunk_t *chunk = trans->closed_head; chunk && !found;
        chunk = chunk->next) {
     for (uint32_t i = 0; i < chunk->count; i++) {
-      if (chunk->entries[i].block != block_nr || !chunk->entries[i].image)
+      if (chunk->entries[i].block != block_nr || !chunk->entries[i].image ||
+          chunk->entries[i].forgotten)
         continue;
       memcpy(buffer, chunk->entries[i].image, mnt->block_size);
       found = true;
@@ -912,6 +944,7 @@ static int ext3_merge_running(ext2_mount_t *mnt, ext3_journal_state_t *trans) {
         spinlock_acquire(&mnt->cache_lock);
         uint8_t *old = hit->image;
         hit->image = e->image;
+        hit->forgotten = e->forgotten;
         spinlock_release(&mnt->cache_lock);
         kfree(old);
         continue;
@@ -941,6 +974,7 @@ static int ext3_merge_running(ext2_mount_t *mnt, ext3_journal_state_t *trans) {
       slot->payload_pos = ext3_payload_pos(index, tagcap);
       slot->desc_pos = ext3_desc_pos(index, tagcap);
       slot->image = e->image;
+      slot->forgotten = e->forgotten;
       trans->closed_count = index + 1;
       spinlock_release(&mnt->cache_lock);
     }
@@ -1244,6 +1278,8 @@ static int ext3_commit_closed(ext2_mount_t *mnt, ext3_journal_state_t *trans) {
   for (chunk = trans->closed_head; chunk && !home_failed; chunk = chunk->next) {
     for (uint32_t i = 0; i < chunk->count; i++) {
       ext3_txn_entry_t *entry = &chunk->entries[i];
+      if (entry->forgotten)
+        continue; /* freed: home may already hold the block's new data */
       trans->phase = "metadata-home";
       home_batch[home_batch_count].block_num = entry->block;
       home_batch[home_batch_count].buffer = entry->image;

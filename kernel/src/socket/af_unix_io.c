@@ -226,6 +226,10 @@ static bool unix_ensure_recv_buf(unix_sock_t *usk, size_t needed) {
       req = needed;
     size_t sz = unix_round_pow2(req);
     usk->recv_buf = kmalloc(sz);
+    while (!usk->recv_buf && sz > UNIX_RECV_BUF_MIN) {
+      sz >>= 1;
+      usk->recv_buf = kmalloc(sz);
+    }
     if (!usk->recv_buf) return false;
     usk->recv_buf_size = sz;
     usk->recv_buf_mask = sz - 1;
@@ -528,8 +532,13 @@ ssize_t unix_send_impl(socket_t *sock, const void *buf, size_t len, int flags) {
 
   bool closed = sock->closing || peer_sock->closing;
   socket_put(peer_sock);
-  if (sent == 0 && closed)
+  if (sent == 0 && closed) {
+    struct thread *cur = sched_get_current();
+    if (cur && strncmp(cur->comm, "Daedaluz", 8) == 0)
+      klogf("[AF_UNIX-DIAG] send EPIPE tid=%u sock_closing=%d peer_closing=%d\n",
+            cur->tid, sock->closing ? 1 : 0, peer_sock->closing ? 1 : 0);
     return -32; // EPIPE
+  }
   return (ssize_t)sent;
 }
 
@@ -709,6 +718,12 @@ ssize_t unix_recv_impl(socket_t *sock, void *buf, size_t len, int flags) {
 
       if (peer_shut) {
         spinlock_release(&usk->recv_lock);
+        if (received == 0) {
+          struct thread *cur = sched_get_current();
+          if (cur && strncmp(cur->comm, "Daedaluz", 8) == 0)
+            klogf("[AF_UNIX-DIAG] recv EOF peer_shut tid=%u state=%d\n",
+                  cur->tid, sock->state);
+        }
         return (ssize_t)received;
       }
 
@@ -877,6 +892,13 @@ ssize_t unix_recvfrom_impl(socket_t *sock, void *buf, size_t len, int flags,
 ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   if (!sock || !msg)
     return -22; // EINVAL
+  for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg); cmsg;
+       cmsg = CMSG_NXTHDR(msg, cmsg)) {
+    size_t offset = (uint8_t *)cmsg - (uint8_t *)msg->msg_control;
+    size_t length = unix_cmsg_len(cmsg);
+    if (length < unix_cmsg_size() || length > msg->msg_controllen - offset)
+      return -22; // EINVAL
+  }
   unix_sock_t *usk = (unix_sock_t *)sock->sk;
   if (!usk)
     return -22;
@@ -1462,6 +1484,11 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         if (control_capacity - control_used > CMSG_ALIGN(unix_cmsg_size()))
           max_bytes_for_fds = control_capacity - control_used - CMSG_ALIGN(unix_cmsg_size());
         int max_fds = (int)(max_bytes_for_fds / sizeof(int));
+        while (max_fds > 0 &&
+               CMSG_SPACE((size_t)max_fds * sizeof(int)) >
+                   control_capacity - control_used) {
+          max_fds--;
+        }
         if (max_fds > head->count)
           max_fds = head->count;
 
@@ -1717,6 +1744,11 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
         if (control_capacity - control_used > CMSG_ALIGN(unix_cmsg_size()))
           max_bytes_for_fds = control_capacity - control_used - CMSG_ALIGN(unix_cmsg_size());
         int max_fds = (int)(max_bytes_for_fds / sizeof(int));
+        while (max_fds > 0 &&
+               CMSG_SPACE((size_t)max_fds * sizeof(int)) >
+                   control_capacity - control_used) {
+          max_fds--;
+        }
         if (max_fds > head->count)
           max_fds = head->count;
 
@@ -1851,6 +1883,13 @@ ssize_t unix_recvmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
   return total_received;
 
 no_data:
+  {
+    struct thread *cur = sched_get_current();
+    if (cur && strncmp(cur->comm, "Daedaluz", 8) == 0)
+      klogf("[AF_UNIX-DIAG] recvmsg EOF tid=%u state=%d closing=%d read_shut=%d peer=%p\n",
+            cur->tid, sock->state, sock->closing ? 1 : 0,
+            usk->read_shutdown ? 1 : 0, (void *)usk->peer);
+  }
   msg->msg_controllen = 0;
   msg->msg_flags      = 0;
   unix_fill_msg_name(sock, msg);

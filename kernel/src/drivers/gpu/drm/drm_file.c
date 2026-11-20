@@ -98,10 +98,17 @@ void ascentdrm_file_free(struct drm_file *file) {
   for (uint32_t first = 0; first < DRM_MAX_HANDLES_PER_FILE; first += 32) {
     uint32_t n_free = 0;
     spinlock_acquire(&file->lock);
-    for (uint32_t i = first; i < first + 32 && i < DRM_MAX_HANDLES_PER_FILE; i++) {
-      struct drm_gem_object *obj = file->handles[i];
+    struct drm_gem_object **chunk =
+        file->handle_chunks[first >> DRM_HANDLE_CHUNK_SHIFT];
+    if (!chunk) {
+      spinlock_release(&file->lock);
+      continue;
+    }
+    for (uint32_t i = first; i < first + 32; i++) {
+      uint32_t slot = i & (DRM_HANDLE_CHUNK_SIZE - 1);
+      struct drm_gem_object *obj = chunk[slot];
       if (obj) {
-        file->handles[i] = NULL;
+        chunk[slot] = NULL;
         if (ascentdrm_gem_put_last(obj))
           to_free[n_free++] = obj;
       }
@@ -109,6 +116,10 @@ void ascentdrm_file_free(struct drm_file *file) {
     spinlock_release(&file->lock);
     for (uint32_t i = 0; i < n_free; i++)
       ascentdrm_gem_object_free(dev, to_free[i]);
+  }
+  for (uint32_t c = 0; c < DRM_HANDLE_CHUNKS; c++) {
+    kfree(file->handle_chunks[c]);
+    file->handle_chunks[c] = NULL;
   }
   spinlock_acquire(&file->lock);
   /* Release legacy hw FB reference */
@@ -122,7 +133,8 @@ void ascentdrm_file_free(struct drm_file *file) {
   struct drm_pending_event *e, *tmp;
   list_for_each_entry_safe(e, tmp, &file->event_queue, list) {
     list_del(&e->list);
-    kfree(e);
+    if (!e->reserved) /* reserve slots live inside *file */
+      kfree(e);
   }
   spinlock_release(&file->lock);
 
@@ -160,13 +172,25 @@ void ascentdrm_file_free(struct drm_file *file) {
  */
 uint32_t ascentdrm_file_gem_register(struct drm_file *file,
                                struct drm_gem_object *obj) {
+  /* Chunks are allocated outside the spinlock (the big-alloc path may run
+   * OOM reclaim); a spare is carried across the retry and freed if unused. */
+  struct drm_gem_object **spare = NULL;
+
+retry:
   spinlock_acquire(&file->lock);
 
   /* Linux GEM namespaces return the existing handle when the same dma-buf
    * is imported repeatedly into one DRM file. */
   for (uint32_t h = 1; h < file->handle_high_water; h++) {
-    if (file->handles[h] == obj) {
+    struct drm_gem_object **chunk =
+        file->handle_chunks[h >> DRM_HANDLE_CHUNK_SHIFT];
+    if (!chunk) {
+      h |= DRM_HANDLE_CHUNK_SIZE - 1; /* skip the empty chunk */
+      continue;
+    }
+    if (chunk[h & (DRM_HANDLE_CHUNK_SIZE - 1)] == obj) {
       spinlock_release(&file->lock);
+      kfree(spare);
       return h;
     }
   }
@@ -177,8 +201,23 @@ uint32_t ascentdrm_file_gem_register(struct drm_file *file,
     start = 1;
   uint32_t h = start;
   do {
-    if (h != 0xF0B0 && !file->handles[h]) {
-      file->handles[h] = obj;
+    struct drm_gem_object **chunk =
+        file->handle_chunks[h >> DRM_HANDLE_CHUNK_SHIFT];
+    if (!chunk) {
+      if (!spare) {
+        spinlock_release(&file->lock);
+        spare = kcalloc(DRM_HANDLE_CHUNK_SIZE, sizeof(*spare));
+        if (!spare)
+          return 0;
+        goto retry;
+      }
+      chunk = spare;
+      spare = NULL;
+      file->handle_chunks[h >> DRM_HANDLE_CHUNK_SHIFT] = chunk;
+    }
+    uint32_t slot = h & (DRM_HANDLE_CHUNK_SIZE - 1);
+    if (h != 0xF0B0 && !chunk[slot]) {
+      chunk[slot] = obj;
       if (h >= file->handle_high_water)
         file->handle_high_water = h + 1;
       ascentdrm_gem_get(obj);
@@ -186,6 +225,7 @@ uint32_t ascentdrm_file_gem_register(struct drm_file *file,
       if (file->next_handle >= DRM_MAX_HANDLES_PER_FILE)
         file->next_handle = 1;
       spinlock_release(&file->lock);
+      kfree(spare);
       return h;
     }
     h++;
@@ -194,6 +234,7 @@ uint32_t ascentdrm_file_gem_register(struct drm_file *file,
   } while (h != start);
 
   spinlock_release(&file->lock);
+  kfree(spare);
   return 0;
 }
 
@@ -211,7 +252,7 @@ struct drm_gem_object *ascentdrm_file_gem_lookup(struct drm_file *file,
   /* Fast path: per-client table */
   if (handle > 0 && handle < DRM_MAX_HANDLES_PER_FILE) {
     spinlock_acquire(&file->lock);
-    struct drm_gem_object *obj = file->handles[handle];
+    struct drm_gem_object *obj = ascentdrm_file_handle_peek(file, handle);
     spinlock_release(&file->lock);
     if (obj)
       return obj;
@@ -246,7 +287,7 @@ struct drm_gem_object *ascentdrm_file_gem_lookup_get(struct drm_file *file,
                                                uint32_t handle) {
   if (handle > 0 && handle < DRM_MAX_HANDLES_PER_FILE) {
     spinlock_acquire(&file->lock);
-    struct drm_gem_object *obj = file->handles[handle];
+    struct drm_gem_object *obj = ascentdrm_file_handle_peek(file, handle);
     if (obj)
       ascentdrm_gem_get(obj);
     spinlock_release(&file->lock);
@@ -272,9 +313,10 @@ void ascentdrm_file_gem_release(struct drm_file *file, uint32_t handle) {
   if (handle == 0 || handle >= DRM_MAX_HANDLES_PER_FILE)
     return;
   spinlock_acquire(&file->lock);
-  struct drm_gem_object *obj = file->handles[handle];
+  struct drm_gem_object *obj = ascentdrm_file_handle_peek(file, handle);
   if (obj) {
-    file->handles[handle] = NULL;
+    file->handle_chunks[handle >> DRM_HANDLE_CHUNK_SHIFT]
+                       [handle & (DRM_HANDLE_CHUNK_SIZE - 1)] = NULL;
     spinlock_release(&file->lock);
     if (ascentdrm_gem_put_last(obj))
       ascentdrm_gem_object_free(file->dev, obj);
@@ -288,13 +330,31 @@ void ascentdrm_file_gem_release(struct drm_file *file, uint32_t handle) {
 void ascentdrm_file_send_event(struct drm_file *file, struct drm_event_vblank *ev,
                          struct vfs_node *node) {
   struct drm_pending_event *e = kmalloc(sizeof(struct drm_pending_event));
-  if (!e)
-    return;
-
-  memset(e, 0, sizeof(struct drm_pending_event));
-  e->event = *ev;
+  if (e)
+    memset(e, 0, sizeof(struct drm_pending_event));
 
   spinlock_acquire(&file->lock);
+  if (!e) {
+    /* Never lose a completion event to a transient allocation failure. */
+    for (uint32_t i = 0; i < DRM_EVENT_RESERVE; i++) {
+      if (!(file->event_reserve_used & (1u << i))) {
+        file->event_reserve_used |= 1u << i;
+        e = &file->event_reserve[i];
+        memset(e, 0, sizeof(*e));
+        e->reserved = true;
+        break;
+      }
+    }
+  }
+  if (!e) {
+    spinlock_release(&file->lock);
+    static uint32_t dropped;
+    if (__atomic_add_fetch(&dropped, 1, __ATOMIC_RELAXED) <= 8)
+      klogf("[DRM] event dropped: no memory and %u reserve slots in use "
+            "(client not reading its DRM fd?)\n", DRM_EVENT_RESERVE);
+    return;
+  }
+  e->event = *ev;
   list_add_tail(&e->list, &file->event_queue);
   spinlock_release(&file->lock);
 

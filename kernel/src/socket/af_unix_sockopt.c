@@ -262,6 +262,20 @@ static int unix_resize_recv_buf(socket_t *sock, unix_sock_t *usk, size_t sz) {
   for (;;) {
     uint8_t *new_buf = kmalloc(sz);
     if (!new_buf) {
+      extern size_t mm_file_cache_reclaim(size_t target_pages);
+      extern size_t vfs_dentry_reclaim_pages(size_t target_pages);
+      mm_file_cache_reclaim(sz / 4096 + 16);
+      vfs_dentry_reclaim_pages(64);
+      new_buf = kmalloc(sz);
+    }
+    while (!new_buf && sz > UNIX_RECV_BUF_MIN && sz > usk->recv_buf_size) {
+      size_t smaller = sz >> 1;
+      if (smaller < UNIX_RECV_BUF_MIN || smaller <= usk->recv_buf_size)
+        break;
+      sz = smaller;
+      new_buf = kmalloc(sz);
+    }
+    if (!new_buf) {
       klog_puts("[WARN] unix_setsockopt: failed to allocate new recv buffer\n");
       return -12; // ENOMEM
     }
@@ -330,20 +344,18 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
     if (val < 256)       val = 256;
     if (val > 1024*1024) val = 1024*1024;
 
-    uint8_t *new_buf = kmalloc((size_t)val);
-    if (!new_buf) {
-      klog_puts("[WARN] unix_setsockopt: failed to allocate new send buffer\n");
-      return -12;
-    }
-
+    /* AF_UNIX sends land in the peer's receive ring; send_buf never holds
+     * data. Allocating up to 1 MiB contiguous here only made the call fail
+     * with ENOMEM under fragmentation (Linux never fails SO_SNDBUF so). */
     spinlock_acquire(&usk->send_lock);
-    kfree(usk->send_buf);
-    usk->send_buf      = new_buf;
+    uint8_t *old_buf = usk->send_buf;
+    usk->send_buf      = NULL;
     usk->send_buf_size = (size_t)val;
     usk->send_buf_head = 0;
     usk->send_buf_tail = 0;
     sock->sndbuf       = val;
     spinlock_release(&usk->send_lock);
+    kfree(old_buf);
 
     klog_debug_puts("[OK] unix_setsockopt: SO_SNDBUF set to ");
     klog_debug_uint64(val);
@@ -367,18 +379,15 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
       return err;
     if (val < 64) val = 64;
 
-    uint8_t *new_buf = kmalloc((size_t)val);
-    if (!new_buf)
-      return -12;
-
     spinlock_acquire(&usk->send_lock);
-    kfree(usk->send_buf);
-    usk->send_buf      = new_buf;
+    uint8_t *old_buf = usk->send_buf;
+    usk->send_buf      = NULL;
     usk->send_buf_size = (size_t)val;
     usk->send_buf_head = 0;
     usk->send_buf_tail = 0;
     sock->sndbuf       = val;
     spinlock_release(&usk->send_lock);
+    kfree(old_buf);
     return 0;
   }
 

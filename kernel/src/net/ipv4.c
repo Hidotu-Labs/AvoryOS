@@ -321,6 +321,8 @@ static void handle_arp(const uint8_t *payload, size_t length) {
 
 static int ipv4_send_tos(uint32_t destination, uint8_t protocol, uint8_t tos,
                          const void *payload, size_t payload_length) {
+  if (ipv4_is_loopback(destination))
+    return -101; /* A loopback datagram must never be sent over Ethernet. */
   if (payload_length > NET_MTU_ETHERNET - sizeof(struct ipv4_header))
     return -90; /* EMSGSIZE */
 
@@ -595,7 +597,7 @@ static void handle_ipv4_fragment(const uint8_t *packet,
   spinlock_release(&reasm_lock);
 }
 
-static void handle_ipv4(const uint8_t *packet, size_t length) {
+static void handle_ipv4(const uint8_t *packet, size_t length, bool loopback) {
   if (length < sizeof(struct ipv4_header))
     return;
   const struct ipv4_header *header = (const struct ipv4_header *)packet;
@@ -606,15 +608,18 @@ static void handle_ipv4(const uint8_t *packet, size_t length) {
       header_length > length || total_length < header_length ||
       total_length > length || checksum(packet, header_length) != 0)
     return;
+  uint32_t source = get_ip(header->source);
+  uint32_t destination = get_ip(header->destination);
+  if (ipv4_is_loopback(source) != loopback ||
+      ipv4_is_loopback(destination) != loopback)
+    return;
   uint16_t frag = be16(header->flags_fragment);
   if (frag & 0x3fff) { /* MF set or non-zero offset (DF is 0x4000) */
     handle_ipv4_fragment(packet, header, header_length, frag);
     return;
   }
-  uint32_t destination = get_ip(header->destination);
-  if (destination != config.address && destination != 0xffffffff)
+  if (!loopback && destination != config.address && destination != 0xffffffff)
     return;
-  uint32_t source = get_ip(header->source);
   if (header->protocol == IP_PROTO_ICMP) {
     if (icmp_handler)
       icmp_handler(source, destination, packet, total_length);
@@ -669,7 +674,13 @@ extern int rust_net_parse_ethernet_frame(const uint8_t *frame, size_t len,
 #endif
 
 static void ethernet_receive(struct net_packet *packet) {
-  if (!packet || packet->length < sizeof(struct eth_header))
+  if (!packet)
+    return;
+  if (!packet->device) {
+    handle_ipv4(packet->data, packet->length, true);
+    return;
+  }
+  if (packet->length < sizeof(struct eth_header))
     return;
   struct net_device *dev = net_device_default_acquire();
   if (!dev)
@@ -699,6 +710,8 @@ static void ethernet_receive(struct net_packet *packet) {
                ing.arp.sender_mac);
     }
   } else if (kind == RUST_ETH_INGRESS_IPV4) {
+    if (ipv4_is_loopback(ing.ipv4.src_ip) || ipv4_is_loopback(ing.ipv4.dst_ip))
+      return;
     const uint8_t *ip_pkt = packet->data + ing.payload_offset;
     if (ing.ipv4.is_fragment) {
       handle_ipv4_fragment(ip_pkt, (const struct ipv4_header *)ip_pkt,
@@ -734,7 +747,7 @@ static void ethernet_receive(struct net_packet *packet) {
   if (type == ETH_TYPE_ARP)
     handle_arp(payload, length);
   else if (type == ETH_TYPE_IPV4)
-    handle_ipv4(payload, length);
+    handle_ipv4(payload, length, false);
   else if (type == ETH_TYPE_IPV6)
     ipv6_receive(header->source, payload, length);
 #endif
@@ -782,6 +795,28 @@ void ipv4_apply_config(const struct ipv4_config *cfg) {
 int ipv4_send_raw(uint32_t dst_ip, uint8_t proto,
                   const void *payload, size_t payload_len) {
   return ipv4_send(dst_ip, proto, payload, payload_len);
+}
+
+int ipv4_send_loopback(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
+                       const void *payload, size_t payload_len) {
+  if (!ipv4_is_loopback(src_ip) || !ipv4_is_loopback(dst_ip))
+    return -101;
+  uint8_t packet[NET_MTU_ETHERNET];
+  struct ipv4_header *header = (struct ipv4_header *)packet;
+  if (payload_len > sizeof(packet) - sizeof(*header))
+    return -90;
+  size_t length = sizeof(*header) + payload_len;
+  memset(header, 0, sizeof(*header));
+  header->version_ihl = 0x45;
+  header->total_length = be16((uint16_t)length);
+  header->flags_fragment = be16(0x4000);
+  header->ttl = 64;
+  header->protocol = proto;
+  put_ip(header->source, src_ip);
+  put_ip(header->destination, dst_ip);
+  header->checksum = be16(checksum(header, sizeof(*header)));
+  memcpy(packet + sizeof(*header), payload, payload_len);
+  return net_rx_submit_loopback(packet, length) ? 0 : -105; /* ENOBUFS */
 }
 
 int ipv4_send_raw_tos(uint32_t dst_ip, uint8_t proto, uint8_t tos,

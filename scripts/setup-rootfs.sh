@@ -200,6 +200,9 @@ install -m 0644 "${ROOT_DIR}/config/wireplumber/20-avoryos-hda.conf" \
 # Keep boot service startup in the versioned init script.
 install -D -m 0755 "${ROOT_DIR}/config/init/rcS" "${ROOTFS_DIR}/etc/init.d/rcS"
 install -D -m 0644 "${ROOT_DIR}/config/init/inittab" "${ROOTFS_DIR}/etc/inittab"
+# Programs known to need uname "Linux"; rcS loads it, the kernel adds to it.
+[ -f "${ROOTFS_DIR}/var/lib/avoryos/uname-linux" ] ||
+    install -D -m 0644 "${ROOT_DIR}/config/init/uname-linux" "${ROOTFS_DIR}/var/lib/avoryos/uname-linux"
 
 # Experimental systemd entry (init=/usr/lib/systemd/systemd). BusyBox init
 # stays the default /sbin/init; these units only load under that entry.

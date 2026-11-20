@@ -447,6 +447,22 @@ struct shm_usage {
   uint64_t shm_tot, shm_rss, shm_swp, swap_attempts, swap_successes;
 };
 
+/* i386 ipc64_perm (36 bytes) + shmid64_ds (84 bytes). */
+struct compat_shmid64_ds {
+  int32_t key; uint32_t uid, gid, cuid, cgid;
+  uint16_t mode, pad1, seq, pad2;
+  uint32_t unused1, unused2;
+  uint32_t segsz, atime, atime_high, dtime, dtime_high, ctime, ctime_high;
+  int32_t cpid, lpid;
+  uint32_t nattch, unused4, unused5;
+};
+_Static_assert(sizeof(struct compat_shmid64_ds) == 84, "i386 shmid64_ds ABI");
+
+static bool shm_caller_compat(void) {
+  struct thread *t = sched_get_current();
+  return t && t->seccomp_compat_dispatch;
+}
+
 int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf, uint64_t a3,
                    uint64_t a4, uint64_t a5) {
   (void)a3;
@@ -455,9 +471,22 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf, uint64_t a3,
 
   cmd &= ~0x100ULL; // IPC_64: native x86_64 always uses the 64-bit layout
   struct shmid_ds input;
-  if (cmd == 1 /* IPC_SET */ &&
-      copy_from_user(&input, (const void *)buf, sizeof(input)) != 0)
-    return -14;
+  bool compat = shm_caller_compat();
+  if (cmd == 1 /* IPC_SET */) {
+    if (compat) {
+      struct compat_shmid64_ds c;
+      if (copy_from_user(&c, (const void *)buf, sizeof(c)) != 0)
+        return -14;
+      memset(&input, 0, sizeof(input));
+      input.shm_perm.uid = c.uid;
+      input.shm_perm.gid = c.gid;
+      input.shm_perm.mode = c.mode;
+    } else if (copy_from_user(&input, (const void *)buf, sizeof(input)) != 0) {
+      return -14;
+    }
+  }
+  if (compat && (cmd == 3 || cmd == 14))
+    return -22; /* i386 shminfo64/shm_info layouts not translated */
 
   spinlock_acquire(&shm_lock);
 
@@ -559,8 +588,22 @@ int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf, uint64_t a3,
     ds.shm_lpid = seg->last_pid;
     uint32_t id = seg->shmid;
     spinlock_release(&shm_lock);
-    return copy_to_user((void *)buf, &ds, sizeof(ds)) != 0 ? -14 :
-           (by_index ? (int64_t)id : 0);
+    int64_t ok = by_index ? (int64_t)id : 0;
+    if (compat) {
+      struct compat_shmid64_ds c = {
+        .key = (int32_t)ds.shm_perm.__key, .uid = ds.shm_perm.uid,
+        .gid = ds.shm_perm.gid, .cuid = ds.shm_perm.cuid,
+        .cgid = ds.shm_perm.cgid, .mode = (uint16_t)ds.shm_perm.mode,
+        .segsz = (uint32_t)ds.shm_segsz,
+        .atime = (uint32_t)ds.shm_atime, .atime_high = (uint32_t)(ds.shm_atime >> 32),
+        .dtime = (uint32_t)ds.shm_dtime, .dtime_high = (uint32_t)(ds.shm_dtime >> 32),
+        .ctime = (uint32_t)ds.shm_ctime, .ctime_high = (uint32_t)(ds.shm_ctime >> 32),
+        .cpid = (int32_t)ds.shm_cpid, .lpid = (int32_t)ds.shm_lpid,
+        .nattch = (uint32_t)ds.shm_nattch,
+      };
+      return copy_to_user((void *)buf, &c, sizeof(c)) != 0 ? -14 : ok;
+    }
+    return copy_to_user((void *)buf, &ds, sizeof(ds)) != 0 ? -14 : ok;
   }
 
   spinlock_release(&shm_lock);

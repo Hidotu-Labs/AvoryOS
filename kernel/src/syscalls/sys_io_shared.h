@@ -24,6 +24,7 @@
 #define O_ACCMODE 3
 #define O_APPEND 0x400
 #define O_NONBLOCK 0x800
+#define O_DIRECT 0x4000
 #define O_DIRECTORY 0x10000
 #define O_CLOEXEC 0x80000
 
@@ -41,6 +42,10 @@
 /* FD_CLOEXEC packed into fd_flags[] above the status-flag range */
 #define FD_FLAGS_CLOEXEC_BIT (1u << 24)
 #define IO_FLAGS_VALID (1u << 31)
+
+/* Linux PIPE_BUF is the maximum packet size for pipe2(O_DIRECT). */
+#define PIPE_PACKET_SIZE 4096U
+bool pipe_is_packet(const vfs_node_t *node);
 
 /* Placeholder a descriptor slot carries between reserving the number and
  * installing the node, so a concurrent fork or lookup never sees a half-built

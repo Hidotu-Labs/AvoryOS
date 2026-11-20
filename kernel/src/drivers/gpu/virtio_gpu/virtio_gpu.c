@@ -367,6 +367,19 @@ static void gpu_wait_for_control_progress(uint64_t start, const uint64_t *comple
 static void gpu_wait_for_control(uint64_t start) {
     gpu_wait_for_control_progress(start, NULL);
 }
+/* The controlq notify is a VM exit, and QEMU's virtio-gpu (virgl) processes
+ * the queue inside that exit, under its global lock. While the host GPU or
+ * QEMU's main loop is busy the write blocks for tens of ms. Doing it under
+ * gpu_poll_lock - an IRQ-masking spinlock every GPU path takes - stalled all
+ * submitters and IPIs behind one exit (max-hold 43 ms: dropped frames, slow
+ * TLB acks). Descriptors are published under the lock; the doorbell rings
+ * after it is dropped. Caller holds gpu_poll_lock; it is held again on return.
+ * Notifying late is safe: the device consumes everything published so far. */
+static void gpu_kick_unlocked(void) {
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    virtq_kick(&gpu.controlq);
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+}
 static bool gpu_command_locked(
     const void *req, uint32_t req_len, void *resp, uint32_t resp_len, uint32_t *resp_type) {
     if (gpu.command_busy)
@@ -387,7 +400,8 @@ static bool gpu_command_locked(
     wire->fence_id = seq;
     struct virtq_iov out = {gpu.command_dma->phys + REQ_OFF, req_len};
     struct virtq_iov in = {gpu.command_dma->phys + RESP_OFF, resp_len};
-    if (virtq_submit(&gpu.controlq, &out, 1, &in, 1, (void *)(uintptr_t)seq) < 0) {
+    if (virtq_submit_deferred(&gpu.controlq, &out, 1, &in, 1,
+                              (void *)(uintptr_t)seq) < 0) {
         gpu.command_busy = false;
         return false;
     }
@@ -395,6 +409,8 @@ static bool gpu_command_locked(
     gpu_sync_command_waiter = true;
     gpu_sync_command_used = 0;
     gpu.stats.commands_submitted++;
+    /* Never notify under gpu_poll_lock: see gpu_kick_unlocked(). */
+    gpu_kick_unlocked();
 
     uint64_t start = lapic_timer_get_ms();
     for (;;) {
@@ -505,7 +521,7 @@ static bool gpu_command_batch(const void *const *requests, const uint32_t *lengt
         gpu.stats.commands_submitted++;
     }
     if (submitted)
-        virtq_kick(&gpu.controlq);
+        gpu_kick_unlocked();
     uint64_t start = lapic_timer_get_ms();
     for (;;) {
         gpu_reap_control_locked();
@@ -2231,41 +2247,25 @@ static struct drm_framebuffer *virtio_gpu_active_fb(struct drm_device *dev,
     spinlock_release(&dev->lock);
     return fb;
 }
-static void virtio_gpu_queue_flip(
-    struct drm_file *file, struct vfs_node *node, uint32_t crtc, uint32_t fb, uint64_t user_data) {
-    (void)fb;
-    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
-    gpu.pending_flip_file = file;
-    gpu.pending_flip_node = node;
-    gpu.pending_flip_crtc_id = crtc;
-    gpu.pending_flip_user_data = user_data;
-    gpu.pending_flip = true;
-    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
-}
-static void virtio_gpu_complete_flip(uint32_t head) {
+/* Flips waiting for their scanout commit. KWin commits from a dedicated
+ * commit thread while its main thread also issues DRM work, so two commits
+ * that each request DRM_MODE_PAGE_FLIP_EVENT can overlap. A single pending
+ * slot let the second overwrite the first: that event was never delivered,
+ * KWin blocked forever reading card0, the desktop froze, and Xwayland clients
+ * (Steam's update window) hung waiting for frames. Keep a small queue and
+ * complete every flip queued for a head when that head commits. */
+#define VGPU_PENDING_FLIPS 8
+static struct {
     struct drm_file *file;
     struct vfs_node *node;
     uint64_t user_data;
-    uint32_t crtc_id, sequence;
-    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
-    if (!gpu.pending_flip || ascentdrm_crtc_scanout_id(gpu.pending_flip_crtc_id) != head) {
-        LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
-        return;
-    }
-    file = gpu.pending_flip_file;
-    node = gpu.pending_flip_node;
-    user_data = gpu.pending_flip_user_data;
-    crtc_id = gpu.pending_flip_crtc_id;
-    sequence = ++gpu.flip_sequence;
-    gpu.pending_flip = false;
-    gpu.pending_flip_file = NULL;
-    gpu.pending_flip_node = NULL;
-    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
-    /* Deliver on the next vblank boundary: deliver on the next boundary
-     * after the immutable upload finished.
-     * Runs in the commit (ioctl) context with no locks held. */
-    vblank_wait_next();
-    sequence = vblank_sequence();
+    uint32_t crtc_id;
+} pending_flips[VGPU_PENDING_FLIPS];
+static uint32_t pending_flip_count;
+
+static void virtio_gpu_send_flip_event(struct drm_file *file, struct vfs_node *node,
+                                       uint32_t crtc_id, uint64_t user_data,
+                                       uint32_t sequence) {
     struct drm_event_vblank ev;
     memset(&ev, 0, sizeof(ev));
     uint32_t sec, usec;
@@ -2278,6 +2278,90 @@ static void virtio_gpu_complete_flip(uint32_t head) {
     ev.sequence = sequence;
     ev.crtc_id = crtc_id;
     ascentdrm_file_send_event(file, &ev, node);
+}
+
+static void virtio_gpu_queue_flip(
+    struct drm_file *file, struct vfs_node *node, uint32_t crtc, uint32_t fb, uint64_t user_data) {
+    (void)fb;
+    bool overflow = false;
+    struct drm_file *old_file = NULL;
+    struct vfs_node *old_node = NULL;
+    uint64_t old_data = 0;
+    uint32_t old_crtc = 0;
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
+    if (pending_flip_count == VGPU_PENDING_FLIPS) {
+        /* Never drop an event: complete the oldest one now. */
+        overflow = true;
+        old_file = pending_flips[0].file;
+        old_node = pending_flips[0].node;
+        old_data = pending_flips[0].user_data;
+        old_crtc = pending_flips[0].crtc_id;
+        memmove(&pending_flips[0], &pending_flips[1],
+                sizeof(pending_flips[0]) * (VGPU_PENDING_FLIPS - 1));
+        pending_flip_count--;
+    }
+    pending_flips[pending_flip_count].file = file;
+    pending_flips[pending_flip_count].node = node;
+    pending_flips[pending_flip_count].user_data = user_data;
+    pending_flips[pending_flip_count].crtc_id = crtc;
+    pending_flip_count++;
+    gpu.pending_flip = true;
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
+    if (overflow)
+        virtio_gpu_send_flip_event(old_file, old_node, old_crtc, old_data,
+                                   vblank_sequence());
+}
+static void virtio_gpu_complete_flip(uint32_t head) {
+    typeof(pending_flips[0]) done[VGPU_PENDING_FLIPS];
+    uint32_t ndone = 0;
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
+    uint32_t keep = 0;
+    for (uint32_t i = 0; i < pending_flip_count; i++) {
+        /* An atomic commit that named no CRTC reports crtc_id 0: any head's
+         * commit completes it rather than leaving it pending forever. */
+        if (!pending_flips[i].crtc_id ||
+            ascentdrm_crtc_scanout_id(pending_flips[i].crtc_id) == head)
+            done[ndone++] = pending_flips[i];
+        else
+            pending_flips[keep++] = pending_flips[i];
+    }
+    pending_flip_count = keep;
+    gpu.pending_flip = keep != 0;
+    if (ndone)
+        gpu.flip_sequence++;
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
+    if (!ndone)
+        return;
+    /* Deliver on the next vblank boundary after the immutable upload
+     * finished. Runs in the commit (ioctl) context with no locks held. */
+    vblank_wait_next();
+    uint32_t sequence = vblank_sequence();
+    for (uint32_t i = 0; i < ndone; i++)
+        virtio_gpu_send_flip_event(done[i].file, done[i].node,
+                                   done[i].crtc_id, done[i].user_data, sequence);
+}
+/* Called by the DRM core once a commit has finished. Any flip still queued at
+ * that point had no scanout commit to complete it (a commit that changed no
+ * framebuffer, or named a CRTC without one); deliver it now instead of
+ * leaving the compositor blocked on card0 forever. */
+void virtio_gpu_flush_flips(void) {
+    for (uint32_t head = 0; head < VIRTIO_GPU_MAX_SCANOUTS; head++) {
+        if (!__atomic_load_n(&gpu.pending_flip, __ATOMIC_RELAXED))
+            return;
+        virtio_gpu_complete_flip(head);
+    }
+    /* Entries whose CRTC maps to no scanout at all. */
+    typeof(pending_flips[0]) done[VGPU_PENDING_FLIPS];
+    uint32_t ndone = 0;
+    LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
+    for (uint32_t i = 0; i < pending_flip_count; i++)
+        done[ndone++] = pending_flips[i];
+    pending_flip_count = 0;
+    gpu.pending_flip = false;
+    LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_PRESENT, &gpu_present_lock);
+    for (uint32_t i = 0; i < ndone; i++)
+        virtio_gpu_send_flip_event(done[i].file, done[i].node, done[i].crtc_id,
+                                   done[i].user_data, vblank_sequence());
 }
 /* Virgl scanout is a host GL texture, not its guest transfer backing. Passing
  * that texture straight to QEMU preserves format/origin metadata and avoids
@@ -2796,18 +2880,17 @@ static int gpu_render_wait_objects(struct drm_gem_object **objects, uint32_t cou
     if (failed) return -5;
     if (!(pending & candidates)) return 0;
     if (nowait) {
-        /* Mesa retries a nowait wait straight away while it returns EBUSY.
-         * Returning at once made that retry a spin: thousands of EBUSY per
-         * dump window on the Render thread, one full core while the game sat
-         * idle. Park for a millisecond so each retry costs a sleep. */
+        /* Linux answers a nowait wait with EBUSY at once. A 1-tick sleep here
+         * made every "busy?" query cost ~1 ms, and Mesa's virgl buffer cache
+         * asks it of each cached candidate when looking for a reusable BO:
+         * as the cache filled during play, every lookup cost one tick per
+         * busy entry and frame rate slid from 60 to single digits with all
+         * CPUs idle. Yield instead: a thread that re-polls in a loop still
+         * hands the CPU to runnable work, but an uncontended query returns
+         * immediately. */
         struct thread *self = sched_get_current();
-        if (self && !self->is_idle && hal_irq_enabled()) {
-            self->state = THREAD_SLEEPING;
-            self->wakeup_ticks = lapic_timer_get_ticks() + 1;
+        if (self && !self->is_idle && hal_irq_enabled())
             sched_yield();
-            self->state = THREAD_RUNNING;
-            self->wakeup_ticks = 0;
-        }
         return -16;
     }
     uint64_t start = lapic_timer_get_ms();
@@ -2938,7 +3021,8 @@ bool virtio_gpu_render_submit_parts(const void *request, uint32_t request_size,
      * synchronous KMS commands sharing this queue. */
     wire->fence_id = __atomic_add_fetch(&gpu.next_fence_id, 1, __ATOMIC_RELAXED);
     if (__atomic_load_n(&gpu_pm_quiescing, __ATOMIC_ACQUIRE) ||
-        gpu_render_failed || virtq_submit(&gpu.controlq, &out, 1, &in, 1, job) < 0) {
+        gpu_render_failed ||
+        virtq_submit_deferred(&gpu.controlq, &out, 1, &in, 1, job) < 0) {
         LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
         goto fail;
     }
@@ -2960,6 +3044,9 @@ bool virtio_gpu_render_submit_parts(const void *request, uint32_t request_size,
     if (in_flight > gpu.stats.max_frames_in_flight)
         gpu.stats.max_frames_in_flight = in_flight;
     LOCKDIAG_SPOT_UNLOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);
+    /* Doorbell outside gpu_poll_lock (gpu_kick_unlocked); the job is fully
+     * recorded before the device can complete it. */
+    virtq_kick(&gpu.controlq);
     return true;
 fail:
     LOCKDIAG_SPOT_LOCK(LOCKDIAG_SPOT_GPU_POLL, &gpu_poll_lock);

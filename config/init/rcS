@@ -251,6 +251,25 @@ if command -v pipewire >/dev/null 2>&1; then
 else
     eskip
 fi
+# Adaptive uname: the kernel reports "Ascension" but learns which programs
+# need "Linux" (Steam's launcher, for one). Restore what it learned on earlier
+# boots and keep the list saved as new programs are learned.
+UNAME_LINUX_DB=/var/lib/avoryos/uname-linux
+if [ -w /proc/sys/kernel/uname_linux ]; then
+    mkdir -p /var/lib/avoryos
+    [ -f "$UNAME_LINUX_DB" ] && cat "$UNAME_LINUX_DB" > /proc/sys/kernel/uname_linux
+    # Save within ~2 s of a new verdict and sync it, so a killed VM or a
+    # power cut (no shutdown hook runs) still keeps what was learned.
+    nohup sh -c 'db=$1
+        while sleep 2; do
+            cur=$(cat /proc/sys/kernel/uname_linux)
+            [ -n "$cur" ] && [ "$cur" != "$(cat "$db" 2>/dev/null)" ] || continue
+            printf "%s\n" "$cur" > "$db.tmp" || continue
+            sync "$db.tmp" 2>/dev/null || sync
+            mv "$db.tmp" "$db" && { sync "${db%/*}" 2>/dev/null || sync; }
+        done' uname-linux-saver "$UNAME_LINUX_DB" >/dev/null 2>&1 &
+fi
+unset UNAME_LINUX_DB
 echo " * Entering runlevel: default"
 # BusyBox init starts /bin/avory-login on tty1 after this sysinit script exits;
 # /etc/inittab owns respawning the interactive login process.

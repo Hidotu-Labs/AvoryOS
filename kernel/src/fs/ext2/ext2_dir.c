@@ -192,7 +192,7 @@ vfs_node_t *ext2_finddir_impl(vfs_node_t *node, char *name) {
   return NULL;
 }
 
-int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
+static int ext2_add_dir_entry_raw(ext2_mount_t *mnt, uint32_t dir_inode_num,
                        uint32_t child_inode_num, const char *name,
                        uint8_t file_type) {
   ext2_inode_t dir_inode;
@@ -297,7 +297,7 @@ int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
   return result;
 }
 
-int ext2_remove_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
+static int ext2_remove_dir_entry_raw(ext2_mount_t *mnt, uint32_t dir_inode_num,
                           const char *name) {
   ext2_inode_t dir_inode;
   if (ext2_read_inode(mnt, dir_inode_num, &dir_inode))
@@ -368,7 +368,7 @@ int ext2_remove_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
 /* Replace an existing name without allocating or temporarily unlinking its
  * inode. Linear scanning also works for indexed directories: HTree index
  * blocks contain fake empty dirents and the real names live in leaf blocks. */
-int ext2_replace_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
+static int ext2_replace_dir_entry_raw(ext2_mount_t *mnt, uint32_t dir_inode_num,
                            const char *name, uint32_t child_inode_num,
                            uint8_t file_type) {
   ext2_inode_t inode;
@@ -411,6 +411,49 @@ int ext2_replace_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
   }
 out:
   kfree(buf);
+  return result;
+}
+
+/* Every entry change is a directory content change: advance the directory's
+ * mtime/ctime like Linux does. Userspace caches keyed on directory mtime
+ * (KDE's KSycoca menu database, fontconfig, GTK icon caches) never notice
+ * new or removed files otherwise. */
+static void ext2_touch_dir(ext2_mount_t *mnt, uint32_t dir_inode_num) {
+  ext2_inode_t dir;
+  if (ext2_read_inode(mnt, dir_inode_num, &dir))
+    return;
+  uint32_t now = ext2_current_time();
+  if (dir.i_mtime == now && dir.i_ctime == now)
+    return;
+  dir.i_mtime = dir.i_ctime = now;
+  ext2_write_inode(mnt, dir_inode_num, &dir);
+}
+
+int ext2_add_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
+                       uint32_t child_inode_num, const char *name,
+                       uint8_t file_type) {
+  int result = ext2_add_dir_entry_raw(mnt, dir_inode_num, child_inode_num,
+                                      name, file_type);
+  if (result == 0)
+    ext2_touch_dir(mnt, dir_inode_num);
+  return result;
+}
+
+int ext2_remove_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
+                          const char *name) {
+  int result = ext2_remove_dir_entry_raw(mnt, dir_inode_num, name);
+  if (result == 0)
+    ext2_touch_dir(mnt, dir_inode_num);
+  return result;
+}
+
+int ext2_replace_dir_entry(ext2_mount_t *mnt, uint32_t dir_inode_num,
+                           const char *name, uint32_t child_inode_num,
+                           uint8_t file_type) {
+  int result = ext2_replace_dir_entry_raw(mnt, dir_inode_num, name,
+                                          child_inode_num, file_type);
+  if (result == 0)
+    ext2_touch_dir(mnt, dir_inode_num);
   return result;
 }
 

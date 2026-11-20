@@ -60,6 +60,12 @@ struct nvme_queue {
   uint64_t cq_phys;
   uint32_t sq_db_off;
   uint32_t cq_db_off;
+  /* Shadow doorbells (Doorbell Buffer Config), I/O queues only; NULL when the
+   * controller does not use them and the MMIO doorbell is written directly. */
+  volatile uint32_t *sq_shadow_db;
+  volatile uint32_t *sq_shadow_ei;
+  volatile uint32_t *cq_shadow_db;
+  volatile uint32_t *cq_shadow_ei;
 };
 
 /*
@@ -122,6 +128,7 @@ struct nvme_controller {
   volatile bool failed;
   bool io_ready;
   bool logged; /* Identify details already printed once */
+  bool logged_dbbuf;
   volatile bool pm_quiescing;
   volatile uint32_t pm_activity;
   bool pm_suspended;
@@ -173,6 +180,15 @@ struct nvme_controller {
 
   void *id_virt;
   uint64_t id_phys;
+
+  /* Shadow doorbell + EventIdx pages (OACS.DBBUF). Kept across resets; the
+   * command is re-issued on every enable because CC.EN=0 forgets it. */
+  uint16_t oacs;
+  bool dbbuf_enabled;
+  volatile uint32_t *dbbuf_dbs;
+  uint64_t dbbuf_dbs_phys;
+  volatile uint32_t *dbbuf_eis;
+  uint64_t dbbuf_eis_phys;
 
   struct nvme_namespace namespaces[NVME_MAX_NAMESPACES];
   unsigned ns_count;
@@ -664,6 +680,108 @@ static int nvme_create_io_queue(struct nvme_controller *ctrl, unsigned index) {
   return 0;
 }
 
+/* Shadow doorbells --------------------------------------------------------
+ *
+ * With Doorbell Buffer Config the host publishes each I/O SQ tail / CQ head
+ * in a shared page and rings the MMIO doorbell only when the controller's
+ * EventIdx says it is waiting for that update. On an emulated controller each
+ * MMIO doorbell is a VM exit serialized on the hypervisor's device lock; with
+ * shadow doorbells (and QEMU's nvme ioeventfd=on, which only arms once they
+ * are configured) a busy queue rarely traps, and a vCPU no longer sits in a
+ * doorbell exit with IRQs masked under vq->lock - which held TLB shootdown
+ * acknowledgements for hundreds of ms during swap-heavy I/O. */
+
+static void nvme_dbbuf_detach(struct nvme_queue *q) {
+  q->sq_shadow_db = q->sq_shadow_ei = NULL;
+  q->cq_shadow_db = q->cq_shadow_ei = NULL;
+}
+
+/* Entries are indexed like the MMIO doorbells: 2*qid (SQ) and 2*qid+1 (CQ),
+ * scaled by the doorbell stride, in 32-bit units. */
+static void nvme_dbbuf_attach(struct nvme_controller *ctrl,
+                              struct nvme_queue *q) {
+  nvme_dbbuf_detach(q);
+  if (!ctrl->dbbuf_enabled)
+    return;
+  uint32_t stride = 1u << ctrl->dstrd;
+  uint32_t sq = 2u * q->qid * stride, cq = (2u * q->qid + 1u) * stride;
+  q->sq_shadow_db = &ctrl->dbbuf_dbs[sq];
+  q->sq_shadow_ei = &ctrl->dbbuf_eis[sq];
+  q->cq_shadow_db = &ctrl->dbbuf_dbs[cq];
+  q->cq_shadow_ei = &ctrl->dbbuf_eis[cq];
+  /* A fresh queue starts at index 0 on both sides. */
+  *q->sq_shadow_db = 0;
+  *q->cq_shadow_db = 0;
+}
+
+/* Linux nvme_dbbuf_need_event(): has new_idx moved past event_idx since old? */
+static inline bool nvme_dbbuf_need_event(uint16_t event_idx, uint16_t new_idx,
+                                         uint16_t old) {
+  return (uint16_t)(new_idx - event_idx - 1) < (uint16_t)(new_idx - old);
+}
+
+/* Publish `value` to a doorbell; write the MMIO register only when there is
+ * no shadow or the controller asked to be notified. */
+static void nvme_ring_doorbell(struct nvme_controller *ctrl, uint32_t db_off,
+                               volatile uint32_t *shadow,
+                               volatile uint32_t *event_idx, uint16_t value) {
+  if (shadow) {
+    /* Queue entries / consumed CQEs before the shadow value. */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    uint16_t old = (uint16_t)*shadow;
+    *shadow = value;
+    /* Store->load: the controller may update EventIdx and then read the
+     * shadow; without a full fence we could miss each other's update. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!nvme_dbbuf_need_event((uint16_t)*event_idx, value, old))
+      return;
+  }
+  nvme_write32(ctrl, db_off, value);
+}
+
+/* Called once per enable, after Identify Controller and before any I/O queue
+ * exists (queues created later inherit the configuration). Failure is not
+ * fatal: the driver keeps ringing MMIO doorbells. */
+static void nvme_dbbuf_setup(struct nvme_controller *ctrl) {
+  ctrl->dbbuf_enabled = false;
+  for (unsigned v = 0; v < NVME_MAX_QUEUES; v++)
+    nvme_dbbuf_detach(&ctrl->io[v].q);
+
+  if (!(ctrl->oacs & NVME_OACS_DBBUF))
+    return;
+  /* One page per buffer must cover every queue's SQ+CQ entries. */
+  if ((uint64_t)(NVME_MAX_QUEUES + 1u) * 2u * NVME_DOORBELL_STRIDE(ctrl->dstrd) >
+      NVME_PAGE_SIZE)
+    return;
+  if (!ctrl->dbbuf_dbs)
+    ctrl->dbbuf_dbs = dma_alloc_page_flags(DMA_FLAG_ANYWHERE,
+                                           &ctrl->dbbuf_dbs_phys);
+  if (!ctrl->dbbuf_eis)
+    ctrl->dbbuf_eis = dma_alloc_page_flags(DMA_FLAG_ANYWHERE,
+                                           &ctrl->dbbuf_eis_phys);
+  if (!ctrl->dbbuf_dbs || !ctrl->dbbuf_eis)
+    return;
+  memset((void *)ctrl->dbbuf_dbs, 0, NVME_PAGE_SIZE);
+  memset((void *)ctrl->dbbuf_eis, 0, NVME_PAGE_SIZE);
+
+  nvme_command_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.opcode = NVME_ADMIN_DBBUF;
+  cmd.prp1 = ctrl->dbbuf_dbs_phys;
+  cmd.prp2 = ctrl->dbbuf_eis_phys;
+  uint16_t sc = 0;
+  if (nvme_admin_cmd(ctrl, &cmd, NULL, &sc) != 0 || sc != NVME_SC_SUCCESS) {
+    klogf("[NVMe] %s Doorbell Buffer Config failed (sc=%02x); using MMIO "
+          "doorbells\n", ctrl->name, sc);
+    return;
+  }
+  ctrl->dbbuf_enabled = true;
+  if (!ctrl->logged_dbbuf) {
+    klogf("[  OK  ] NVMe: %s shadow doorbells enabled\n", ctrl->name);
+    ctrl->logged_dbbuf = true;
+  }
+}
+
 /* Ask the controller to allocate the queue pairs before creating them.
  * Create I/O CQ/SQ commands for unallocated qids are rejected even when the
  * controller has enough MSI-X vectors.  The returned counts are zero-based
@@ -734,8 +852,10 @@ static int nvme_create_io_queues(struct nvme_controller *ctrl,
                                      ctrl->irq.mode == PCI_IRQ_MSIX && vectors)
                                         ? (i < vectors ? i : vectors - 1u)
                                         : 0);
+    nvme_dbbuf_detach(&ctrl->io[i].q);
     if (nvme_create_io_queue(ctrl, i) != 0)
       break;
+    nvme_dbbuf_attach(ctrl, &ctrl->io[i].q);
     created++;
   }
 
@@ -831,6 +951,7 @@ static void nvme_parse_controller(struct nvme_controller *ctrl) {
   nvme_copy_string(ctrl->fr, sizeof(ctrl->fr), id + NVME_ID_CTRL_FR, 8);
   ctrl->mdts = id[NVME_ID_CTRL_MDTS];
   ctrl->nn = nvme_ld16(id + NVME_ID_CTRL_NN);
+  ctrl->oacs = nvme_ld16(id + NVME_ID_CTRL_OACS);
 
   ctrl->max_transfer = nvme_max_transfer_for(ctrl->mdts);
 
@@ -1164,6 +1285,7 @@ static int nvme_controller_start(struct nvme_controller *ctrl) {
   }
   nvme_parse_controller(ctrl);
   nvme_scan_namespaces(ctrl);
+  nvme_dbbuf_setup(ctrl);
 
   unsigned queue_limit = nvme_negotiate_io_queues(ctrl);
   if (nvme_create_io_queues(ctrl, queue_limit) != 0) {
@@ -1408,6 +1530,15 @@ static void nvme_controller_release(struct nvme_controller *ctrl) {
     dma_free_page(ctrl->id_virt);
     ctrl->id_virt = NULL;
   }
+  ctrl->dbbuf_enabled = false;
+  if (ctrl->dbbuf_dbs) {
+    dma_free_page((void *)ctrl->dbbuf_dbs);
+    ctrl->dbbuf_dbs = NULL;
+  }
+  if (ctrl->dbbuf_eis) {
+    dma_free_page((void *)ctrl->dbbuf_eis);
+    ctrl->dbbuf_eis = NULL;
+  }
 }
 
 /* I/O completion plumbing -------------------------------------------------- */
@@ -1465,7 +1596,8 @@ static void nvme_drain_cq(struct nvme_controller *ctrl, struct nvme_iovq *vq,
    * for them to re-scan and sort out which members are still outstanding. */
   if (woke)
     wait_queue_wake_all(&vq->batch_wq);
-  nvme_write32(ctrl, q->cq_db_off, q->head);
+  nvme_ring_doorbell(ctrl, q->cq_db_off, q->cq_shadow_db, q->cq_shadow_ei,
+                     q->head);
   spinlock_release(&vq->cq_lock);
 }
 
@@ -2066,7 +2198,8 @@ static int nvme_sq_submit(struct nvme_controller *ctrl, struct nvme_iovq *vq,
   /* Same release ordering as the admin path: SQE + tail before doorbell. */
   __atomic_thread_fence(__ATOMIC_RELEASE);
   if (!wedge)
-    nvme_write32(ctrl, vq->q.sq_db_off, vq->q.tail);
+    nvme_ring_doorbell(ctrl, vq->q.sq_db_off, vq->q.sq_shadow_db,
+                       vq->q.sq_shadow_ei, vq->q.tail);
   spinlock_release(&vq->lock);
   return 0;
 }

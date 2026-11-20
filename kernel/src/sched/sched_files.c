@@ -18,16 +18,22 @@ static uint64_t next_description_id;
 
 /* Caller holds files->lock. Zero means a new, as-yet-unobserved description.
  * IDs survive dup/fork/SCM_RIGHTS without pointers or extra lifetime references. */
-uint64_t fd_description_id_locked(struct thread *t, int fd) {
-  if (!t || !t->files || fd < 0 || (uint32_t)fd >= t->files->capacity)
+static uint64_t fd_table_description_id_locked(struct fd_table *files, int fd) {
+  if (!files || fd < 0 || (uint32_t)fd >= files->capacity)
     return 0;
-  uint64_t *id = &t->files->description_ids[fd];
+  uint64_t *id = &files->description_ids[fd];
   if (!*id) {
     do {
       *id = __atomic_add_fetch(&next_description_id, 1, __ATOMIC_RELAXED);
     } while (!*id);
   }
   return *id;
+}
+
+uint64_t fd_description_id_locked(struct thread *t, int fd) {
+  if (!t)
+    return 0;
+  return fd_table_description_id_locked(t->files, fd);
 }
 
 void fd_description_set_locked(struct thread *t, int fd, uint64_t id) {
@@ -140,13 +146,16 @@ bool fd_path_set(struct thread *t, int fd, const char *value) {
   }
   struct fd_path *path = NULL;
   if (value && value[0]) {
-    path = kmalloc(sizeof(*path));
+    size_t len = 0;
+    while (len < 255 && value[len])
+      len++;
+    path = kmalloc(sizeof(*path) + len + 1);
     if (!path)
       return false;
     path->offset = t->files->fd_offsets[fd];
     path->ref_count = 1;
-    strncpy(path->value, value, sizeof(path->value) - 1);
-    path->value[sizeof(path->value) - 1] = '\0';
+    memcpy(path->value, value, len);
+    path->value[len] = '\0';
   }
   struct fd_path *old = t->files->fd_paths[fd];
   t->files->fd_paths[fd] = path;
@@ -204,6 +213,36 @@ bool sched_ensure_files(struct thread *t) {
   return true;
 }
 
+static void fd_table_destroy(struct fd_table *files, bool debug_forked) {
+  for (uint32_t i = 0; i < files->capacity; i++) {
+    if (files->reserved_nodes[i]) {
+      vfs_close(files->reserved_nodes[i]);
+      files->reserved_nodes[i] = NULL;
+    }
+    if (files->fds[i] && files->fds[i] != (vfs_node_t *)-1) {
+      vfs_node_t *node = files->fds[i];
+      if (debug_forked) {
+        klog_debug_puts("[FDDBG] closing fd ");
+        klog_debug_uint64(i);
+        klog_debug_puts(" node=");
+        klog_debug_hex64((uint64_t)node);
+        klog_debug_puts(" refs=");
+        klog_debug_uint64(node->refcount);
+        klog_debug_puts("\n");
+      }
+      files->fds[i] = NULL;
+      fd_path_put(files->fd_paths[i]);
+      files->fd_paths[i] = NULL;
+      vfs_close(node);
+      if (debug_forked)
+        klog_debug_puts("[FDDBG] close returned\n");
+    }
+  }
+  if (files->array_buf)
+    kfree(files->array_buf);
+  kfree(files);
+}
+
 void sched_release_files(struct thread *t) {
   if (!t)
     return;
@@ -232,39 +271,14 @@ void sched_release_files(struct thread *t) {
   if (--files->ref_count == 0)
     last = true;
   spinlock_release(&files->lock);
+  bool debug_forked = t->is_forked_child;
   thread_set_files(t, NULL);
   spinlock_release(&tid_lock);
 
   if (!last)
     return;
 
-  for (uint32_t i = 0; i < files->capacity; i++) {
-    if (files->reserved_nodes[i]) {
-      vfs_close(files->reserved_nodes[i]);
-      files->reserved_nodes[i] = NULL;
-    }
-    if (files->fds[i] && files->fds[i] != (vfs_node_t *)-1) {
-      vfs_node_t *node = files->fds[i];
-      if (t->is_forked_child) {
-        klog_debug_puts("[FDDBG] closing fd ");
-        klog_debug_uint64(i);
-        klog_debug_puts(" node=");
-        klog_debug_hex64((uint64_t)node);
-        klog_debug_puts(" refs=");
-        klog_debug_uint64(node->refcount);
-        klog_debug_puts("\n");
-      }
-      files->fds[i] = NULL;
-      fd_path_put(files->fd_paths[i]);
-      files->fd_paths[i] = NULL;
-      vfs_close(node);
-      if (t->is_forked_child)
-        klog_debug_puts("[FDDBG] close returned\n");
-    }
-  }
-  if (files->array_buf)
-    kfree(files->array_buf);
-  kfree(files);
+  fd_table_destroy(files, debug_forked);
 }
 
 void sched_share_files(struct thread *child, struct thread *parent) {
@@ -286,6 +300,67 @@ void sched_share_files(struct thread *child, struct thread *parent) {
   thread_set_files(child, parent->files);
 }
 
+static void fd_table_copy_locked(struct fd_table *dst, struct fd_table *src,
+                                 vfs_node_t **stack_nodes, int stack_cap,
+                                 vfs_node_t ***dyn_nodes_out,
+                                 int *pinned_count_out) {
+  dst->next_fd = src->next_fd;
+  uint32_t cap = src->capacity;
+
+  int total_open = 0;
+  for (uint32_t fd = 0; fd < cap; fd++) {
+    if (src->fds[fd] && src->fds[fd] != (vfs_node_t *)-1)
+      total_open++;
+  }
+
+  vfs_node_t **dyn_nodes = NULL;
+  vfs_node_t **nodes_to_open = stack_nodes;
+  if (total_open > stack_cap) {
+    dyn_nodes = kmalloc((size_t)total_open * sizeof(vfs_node_t *));
+    if (dyn_nodes)
+      nodes_to_open = dyn_nodes;
+  }
+
+  int pinned_count = 0;
+  int max_pins = dyn_nodes ? total_open : stack_cap;
+  for (uint32_t fd = 0; fd < cap; fd++) {
+    vfs_node_t *node = src->fds[fd];
+    if (!node || node == (vfs_node_t *)-1)
+      continue;
+
+    vfs_node_ref(node);
+    dst->fds[fd] = node;
+    struct fd_path *desc = src->fd_paths[fd];
+    dst->fd_offsets[fd] = desc
+        ? __atomic_load_n(&desc->offset, __ATOMIC_RELAXED)
+        : src->fd_offsets[fd];
+    dst->fd_flags[fd] = src->fd_flags[fd];
+    if (fd < dst->capacity)
+      dst->description_ids[fd] = fd_table_description_id_locked(src, (int)fd);
+    if (desc)
+      __atomic_add_fetch(&desc->ref_count, 1, __ATOMIC_RELAXED);
+    dst->fd_paths[fd] = desc;
+
+    if (pinned_count < max_pins)
+      nodes_to_open[pinned_count++] = node;
+  }
+
+  *dyn_nodes_out = dyn_nodes;
+  *pinned_count_out = pinned_count;
+}
+
+static void fd_table_finish_copy(vfs_node_t **stack_nodes,
+                                 vfs_node_t **dyn_nodes, int pinned_count) {
+  vfs_node_t **nodes_to_open = dyn_nodes ? dyn_nodes : stack_nodes;
+  for (int i = 0; i < pinned_count; i++) {
+    vfs_node_t *node = nodes_to_open[i];
+    vfs_open(node);
+    vfs_close(node); /* release snapshot pin after new table owns the open */
+  }
+  if (dyn_nodes)
+    kfree(dyn_nodes);
+}
+
 /* The child has a private, empty table and is not runnable yet. Snapshot each
  * descriptor, including its identity, while close/reuse is excluded. */
 void sched_copy_files(struct thread *child, struct thread *parent) {
@@ -300,55 +375,78 @@ void sched_copy_files(struct thread *child, struct thread *parent) {
   }
 
   vfs_node_t *pinned_nodes[64];
-  int pinned_count = 0;
   vfs_node_t **dyn_nodes = NULL;
+  int pinned_count = 0;
 
   spinlock_acquire(&parent->files->lock);
-  child->files->next_fd = parent->files->next_fd;
-  uint32_t cap = parent->files->capacity;
-
-  int total_open = 0;
-  for (uint32_t fd = 0; fd < cap; fd++) {
-    if (parent->fds[fd] && parent->fds[fd] != (vfs_node_t *)-1)
-      total_open++;
-  }
-
-  vfs_node_t **nodes_to_open = pinned_nodes;
-  if (total_open > 64) {
-    dyn_nodes = kmalloc((size_t)total_open * sizeof(vfs_node_t *));
-    if (dyn_nodes)
-      nodes_to_open = dyn_nodes;
-  }
-
-  for (uint32_t fd = 0; fd < cap; fd++) {
-    vfs_node_t *node = parent->fds[fd];
-    if (!node || node == (vfs_node_t *)-1)
-      continue;
-
-    vfs_node_ref(node);
-    child->files->fds[fd] = node;
-    child->files->fd_offsets[fd] = fd_offset_get_locked(parent, fd);
-    child->files->fd_flags[fd] = parent->fd_flags[fd];
-    fd_description_set_locked(child, (int)fd, fd_description_id_locked(parent, (int)fd));
-    struct fd_path *path = parent->fd_paths[fd];
-    if (path)
-      __atomic_add_fetch(&path->ref_count, 1, __ATOMIC_RELAXED);
-    child->files->fd_paths[fd] = path;
-
-    if (pinned_count < (dyn_nodes ? total_open : 64)) {
-      nodes_to_open[pinned_count++] = node;
-    }
-  }
+  fd_table_copy_locked(child->files, parent->files, pinned_nodes, 64,
+                       &dyn_nodes, &pinned_count);
   spinlock_release(&parent->files->lock);
 
-  for (int i = 0; i < pinned_count; i++) {
-    vfs_node_t *node = nodes_to_open[i];
-    vfs_open(node);
-    vfs_close(node); /* release snapshot pin after child owns the open */
+  fd_table_finish_copy(pinned_nodes, dyn_nodes, pinned_count);
+}
+
+bool sched_unshare_files(struct thread *t) {
+  if (!t || !t->files)
+    return false;
+
+  spinlock_acquire(&t->files->lock);
+  if (t->files->ref_count <= 1) {
+    spinlock_release(&t->files->lock);
+    return true;
+  }
+  uint32_t needed_cap = t->files->capacity;
+  spinlock_release(&t->files->lock);
+
+  struct fd_table *new_files = fd_table_create();
+  if (!new_files)
+    return false;
+
+  vfs_node_t *pinned_nodes[64];
+  vfs_node_t **dyn_nodes = NULL;
+  int pinned_count = 0;
+  struct fd_table *old_files = NULL;
+
+  for (;;) {
+    if (needed_cap > new_files->capacity &&
+        !fd_table_expand_locked(new_files, needed_cap - 1)) {
+      fd_table_destroy(new_files, false);
+      return false;
+    }
+
+    old_files = t->files;
+    spinlock_acquire(&old_files->lock);
+    if (old_files->ref_count <= 1) {
+      spinlock_release(&old_files->lock);
+      fd_table_destroy(new_files, false);
+      return true;
+    }
+    if (old_files->capacity > new_files->capacity) {
+      needed_cap = old_files->capacity;
+      spinlock_release(&old_files->lock);
+      continue;
+    }
+
+    fd_table_copy_locked(new_files, old_files, pinned_nodes, 64,
+                         &dyn_nodes, &pinned_count);
+    spinlock_release(&old_files->lock);
+    break;
   }
 
-  if (dyn_nodes)
-    kfree(dyn_nodes);
+  fd_table_finish_copy(pinned_nodes, dyn_nodes, pinned_count);
+
+  spinlock_acquire(&tid_lock);
+  thread_set_files(t, new_files);
+  spinlock_release(&tid_lock);
+
+  bool last = false;
+  spinlock_acquire(&old_files->lock);
+  if (--old_files->ref_count == 0)
+    last = true;
+  spinlock_release(&old_files->lock);
+  if (last)
+    fd_table_destroy(old_files, false);
+  return true;
 }
 
 bool sched_get_nth_open_fd(uint32_t tid, uint32_t index, uint32_t *fd) {
@@ -484,13 +582,15 @@ bool sched_get_fd_info_snapshot(uint32_t tid, uint32_t fd, uint64_t *out_pos,
 
 /* Proc magic links hold a vnode reference, independent of descriptor lifetime.
  * Resolve only visible tasks, and require ptrace authority for another process. */
-vfs_node_t *sched_get_fd_node_snapshot(uint32_t tid, uint32_t fd) {
+vfs_node_t *sched_get_fd_node_snapshot(uint32_t tid, uint32_t fd,
+                                      bool socket_metadata_only) {
   if (fd >= MAX_FDS) return NULL;
   struct thread *current = sched_get_current();
   spinlock_acquire(&tid_lock);
   struct thread *t = find_thread_by_tid_locked(tid);
   if (!t || !current || !pid_namespace_tid(current, t) || !t->files ||
-      (t->tgid != current->tgid && !capability_has(current, CAP_SYS_PTRACE))) {
+      (!socket_metadata_only && t->tgid != current->tgid &&
+       !capability_has(current, CAP_SYS_PTRACE))) {
     spinlock_release(&tid_lock); return NULL;
   }
   spinlock_acquire(&t->files->lock);
@@ -501,6 +601,8 @@ vfs_node_t *sched_get_fd_node_snapshot(uint32_t tid, uint32_t fd) {
   }
   vfs_node_t *node = t->fds[fd];
   if (node == (vfs_node_t *)-1) node = NULL;
+  if (socket_metadata_only && node && (node->flags & FS_TYPE_MASK) != FS_SOCKET)
+    node = NULL;
   if (node) vfs_node_ref(node);
   spinlock_release(&t->files->lock);
   spinlock_release(&tid_lock);

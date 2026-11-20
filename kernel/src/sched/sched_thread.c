@@ -904,6 +904,10 @@ bool sched_get_thread_snapshot(uint32_t tid,
     snapshot->syscall_cycles =
         __atomic_load_n(&t->mm->syscall_cycles, __ATOMIC_RELAXED);
   }
+  snapshot->kheap_alloc_bytes =
+      __atomic_load_n(&t->kheap_alloc_bytes, __ATOMIC_RELAXED);
+  snapshot->pmm_alloc_bytes =
+      __atomic_load_n(&t->pmm_alloc_bytes, __ATOMIC_RELAXED);
   snapshot->uts_namespace_id = uts_namespace_id(t);
   snapshot->ipc_namespace_id = ipc_namespace_id(t);
   snapshot->pid_namespace_id = pid_namespace_id(t);
@@ -918,6 +922,7 @@ bool sched_get_thread_snapshot(uint32_t tid,
   snapshot->no_new_privs = __atomic_load_n(&t->no_new_privs, __ATOMIC_ACQUIRE);
   snapshot->seccomp_mode = seccomp_mode(t);
   snapshot->uid = t->uid;
+  snapshot->nondumpable = t->nondumpable;
   snapshot->gid = t->gid;
   snapshot->euid = t->euid;
   snapshot->egid = t->egid;

@@ -193,7 +193,7 @@ $(S4_SWAP_IMG):
 run-usb: RUN_AUDIO := usb
 run-usb: run
 run-s4: KERNEL_CMDLINE = resume=PARTLABEL=s4swap
-run-s4: RUN_EXTRA_QEMU_FLAGS = -drive file=$(S4_SWAP_IMG),format=raw,if=none,id=s4swap -device nvme,serial=avoryos-s4,drive=s4swap,max_ioqpairs=$(RUN_NVME_QUEUES)
+run-s4: RUN_EXTRA_QEMU_FLAGS = -drive file=$(S4_SWAP_IMG),format=raw,if=none,id=s4swap -device nvme,serial=avoryos-s4,drive=s4swap,max_ioqpairs=$(RUN_NVME_QUEUES),ioeventfd=on
 run-s4: $(S4_SWAP_IMG) run
 # Installer test: boots the ISO's TTY installer with disk.img as the live root
 # (snapshot=on, so installs never write it) and a blank sparse NVMe target.
@@ -205,7 +205,7 @@ $(INSTALL_TARGET_IMG):
 	truncate -s $(INSTALL_TARGET_SIZE) "$@"
 run-installer: KERNEL_CMDLINE = init=/sbin/init avory_installer quiet
 run-installer: RUN_ROOT_DRIVE_OPTS = ,snapshot=on,file.locking=off
-run-installer: RUN_EXTRA_QEMU_FLAGS = -drive file=$(INSTALL_TARGET_IMG),format=raw,if=none,id=target0 -device nvme,serial=avoryos-target,drive=target0,max_ioqpairs=$(RUN_NVME_QUEUES)
+run-installer: RUN_EXTRA_QEMU_FLAGS = -drive file=$(INSTALL_TARGET_IMG),format=raw,if=none,id=target0 -device nvme,serial=avoryos-target,drive=target0,max_ioqpairs=$(RUN_NVME_QUEUES),ioeventfd=on
 run-installer: $(INSTALL_TARGET_IMG) run
 RUN_ACCEL_FLAGS ?= -cpu host -enable-kvm
 run: DISPLAY_OPT = -display $(RUN_DISPLAY),gl=$(RUN_GL),show-cursor=$(GTK_SHOW_CURSOR)$(if $(filter gtk,$(RUN_DISPLAY)),$(NET_COMMA)zoom-to-fit=off$(NET_COMMA)grab-on-hover=on)
@@ -217,7 +217,7 @@ run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
 		-drive file=disk.img,format=raw,if=none,id=nvme0$(RUN_DISK_IO)$(RUN_ROOT_DRIVE_OPTS) \
-		-device nvme,serial=avoryos0,drive=nvme0,max_ioqpairs=$(RUN_NVME_QUEUES) \
+		-device nvme,serial=avoryos0,drive=nvme0,max_ioqpairs=$(RUN_NVME_QUEUES),ioeventfd=on \
 		$(RUN_ACCEL_FLAGS) \
 		-smp $(RUN_SMP) \
 		-chardev stdio,id=desktop-serial,logfile=$(RUN_SERIAL_LOG),logappend=on \
@@ -248,7 +248,7 @@ run-installed: edk2-ovmf $(if $(RUN_VIRGL_FIXED),$(VIRGL_HOST_LIB)) $(if $(RUN_Q
 		-M q35,pcspk-audiodev=snd0 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-drive file=$(INSTALL_TARGET_IMG),format=raw,if=none,id=target0 \
-		-device nvme,serial=avoryos-target,drive=target0,max_ioqpairs=$(INSTALLED_NVME_QUEUES),bootindex=0 \
+		-device nvme,serial=avoryos-target,drive=target0,max_ioqpairs=$(INSTALLED_NVME_QUEUES),bootindex=0,ioeventfd=on \
 		$(RUN_ACCEL_FLAGS) \
 		-smp $(RUN_SMP) \
 		-chardev stdio,id=desktop-serial,logfile=$(RUN_SERIAL_LOG),logappend=on \
@@ -292,7 +292,7 @@ run-usb-storage: edk2-ovmf $(IMAGE_NAME).iso $(USB_STORAGE_DISK_DEP) $(USB_STORA
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
 		-drive file=$(USB_STORAGE_DISK),format=raw,if=none,id=nvme0,snapshot=on,file.locking=off \
-		-device nvme,serial=avoryos0,drive=nvme0 \
+		-device nvme,serial=avoryos0,drive=nvme0,ioeventfd=on \
 		-smp $(USB_STORAGE_SMP) $(QEMU_MEM) -vga none -device virtio-vga,addr=06.0 \
 		$(USB_TEST_DISPLAY) -serial stdio -monitor none -no-reboot $(USB_TEST_EXTRA) \
 		$(RUN_NET_FLAGS) \
@@ -312,7 +312,7 @@ run-usb-hub: edk2-ovmf $(IMAGE_NAME).iso $(USB_STORAGE_DISK_DEP) $(USB_STORAGE_I
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(IMAGE_NAME).iso \
 		-drive file=$(USB_STORAGE_DISK),format=raw,if=none,id=nvme0,snapshot=on,file.locking=off \
-		-device nvme,serial=avoryos0,drive=nvme0 \
+		-device nvme,serial=avoryos0,drive=nvme0,ioeventfd=on \
 		-smp $(USB_STORAGE_SMP) $(QEMU_MEM) -vga none -device virtio-vga,addr=06.0 \
 		$(USB_TEST_DISPLAY) -serial stdio -monitor none -no-reboot $(USB_TEST_EXTRA) \
 		$(RUN_NET_FLAGS) \
@@ -368,7 +368,7 @@ run-vfio: edk2-ovmf $(RUN_ISO_DEP) $(RUN_DISK_DEP)
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(RUN_ISO) \
 		-drive file=disk.img,format=raw,if=none,id=nvme0 \
-		-device nvme,serial=avoryos0,drive=nvme0 \
+		-device nvme,serial=avoryos0,drive=nvme0,ioeventfd=on \
 		$(VFIO_PREDEVICES) \
 		-device vfio-pci,host=$(VFIO_BDF),$(VFIO_GUEST_ADDRESS)$(VFIO_DEVICE_EXTRA),rombar=1$(VFIO_ROM_OPT) \
 		-audiodev pa,id=snd0,timer-period=2000,out.frequency=48000,out.channels=2,out.format=s16,out.buffer-length=$(AUDIO_BUFLEN),out.latency=$(AUDIO_LATENCY) \
@@ -521,6 +521,7 @@ USERLAND_DISK_APPS := \
 	userland/test_pty_master.elf \
 	userland/test_signal_stack.elf \
 	userland/test_syscall_cpu.elf \
+	userland/test_syscall_memory.elf \
 	userland/test_syscall_speed.elf \
 	userland/test_syscompat.elf \
 	userland/test_ticket_lock.elf \
@@ -555,12 +556,12 @@ build/firmware/.stamp: scripts/linux-firmware-install.sh scripts/linux/firmware-
 
 disk.img: userland/winoptions userland/icewm-menu $(ARCH_STAMP)
 disk.img: scripts/configure-accounts.sh scripts/configure-pacman.sh userland/avory-account userland/test_accounts.sh
-disk.img: config/init/rcS config/init/inittab config/sddm/10-theme.conf
+disk.img: config/init/rcS config/init/inittab config/init/uname-linux config/sddm/10-theme.conf
 disk.img: $(SYSTEMD_UNIT_FILES)
-# Fixed 14 GiB image by default (override during a forced rebuild with
+# Fixed 16 GiB image by default (override during a forced rebuild with
 # `make disk-rebuild DISK_SIZE_MIB=<MiB>`). Leave room for filesystem metadata
 # and tools added after the rootfs overlay.
-DISK_SIZE_MIB ?= 14336
+DISK_SIZE_MIB ?= 16384
 # NVIDIA GSP firmware to put on disk.img, by chip (e.g. NOUVEAU_CHIPS=ad106).
 # Empty installs every chip (~1.1 GiB). QEMU's virtio-gpu needs none.
 NOUVEAU_CHIPS ?=
@@ -584,7 +585,7 @@ DISK_NON_APP_DEPS := GNUmakefile \
 	scripts/rootfs-packages.txt $(AXON_PROFILE_FILES) userland/avory-login.c \
 	scripts/glibc-toolchain.sh $(GLIBC_TOOLCHAIN_STAMP) \
 	scripts/configure-accounts.sh scripts/configure-pacman.sh userland/avory-account userland/test_accounts.sh \
-	scripts/populate-ext2-dir.sh scripts/populate-ext2-dir.py scripts/configure-image-root.sh config/init/rcS config/init/inittab \
+	scripts/populate-ext2-dir.sh scripts/populate-ext2-dir.py scripts/configure-image-root.sh config/init/rcS config/init/inittab config/init/uname-linux \
 	$(SYSTEMD_UNIT_FILES) \
 	config/plasma/avory-plasma-wayland.sh config/plasma/avory-pipewire-systemd.sh config/kwinoutputconfig.json \
 	config/weston/avory-weston-session.sh config/weston/weston.desktop \
@@ -798,6 +799,8 @@ disk.img: disk-full-force
 		echo "write userland/test_journal_speed.elf bin/test_journal_speed"; \
 		echo "rm bin/test_syscall_cpu"; \
 		echo "write userland/test_syscall_cpu.elf bin/test_syscall_cpu"; \
+		echo "rm bin/test_syscall_memory"; \
+		echo "write userland/test_syscall_memory.elf bin/test_syscall_memory"; \
 		echo "rm bin/test_blocking_liveness"; \
 		echo "write userland/test_blocking_liveness.elf bin/test_blocking_liveness"; \
 		echo "rm bin/test_hugepages"; \
@@ -919,6 +922,7 @@ disk.img: disk-full-force
 		fi; \
 		install -D -m 0755 config/init/rcS build/arch/rootfs/etc/init.d/rcS; \
 		install -D -m 0644 config/init/inittab build/arch/rootfs/etc/inittab; \
+		[ -f build/arch/rootfs/var/lib/avoryos/uname-linux ] || install -D -m 0644 config/init/uname-linux build/arch/rootfs/var/lib/avoryos/uname-linux; \
 		install -m 0755 config/weston/avory-weston-session.sh build/arch/rootfs/usr/bin/avory-weston-session; \
 		install -m 0644 config/weston/weston.desktop build/arch/rootfs/usr/share/wayland-sessions/weston.desktop; \
 		./scripts/configure-accounts.sh build/arch/rootfs; \

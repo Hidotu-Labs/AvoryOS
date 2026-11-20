@@ -7,6 +7,7 @@ struct vfs_node;
 
 void procfs_init(void);
 void procfs_release_pid_dir(uint32_t pid);
+struct vfs_node *procfs_socket_fd_stat_target(struct vfs_node *link);
 uint32_t procfs_meminfo_read(struct vfs_node *node, uint32_t offset,
                              uint32_t size, uint8_t *buffer);
 uint32_t procfs_cpuinfo_read(struct vfs_node *node, uint32_t offset,

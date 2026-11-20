@@ -874,7 +874,10 @@ mount_success:
         dev_dir->mkdir(dev_dir, "shm", 01777);
       vfs_close(dev_dir);
     }
-    tmpfs_mount_at_sized("/dev/shm", TMPFS_SHM_MAX_BYTES, TMPFS_SHM_MAX_INODES);
+    uint64_t shm_bytes = pmm_get_total_memory() / 2;
+    if (shm_bytes < TMPFS_SHM_MAX_BYTES)
+      shm_bytes = TMPFS_SHM_MAX_BYTES;
+    tmpfs_mount_at_sized("/dev/shm", shm_bytes, TMPFS_SHM_MAX_INODES);
   }
   extern void devfs_init(void);
   devfs_init();

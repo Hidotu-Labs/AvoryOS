@@ -113,6 +113,7 @@ struct tcp_tcb {
 
   void *wait_queue;
   void *vfs_node;
+  uint32_t socket_inode, socket_uid;
 
   struct tcp_tcb *listener;
   struct tcp_tcb **accept_queue;
@@ -163,6 +164,8 @@ struct tcp_entry_snapshot {
   uint64_t bytes_sent, bytes_recv;
   uint64_t retransmits;
   uint32_t rx_queued;
+  uint32_t tx_queued;
+  uint32_t inode, uid;
   uint32_t cwnd;
   uint32_t srtt_ms;
 };

@@ -5,6 +5,7 @@
 #include "console/klog.h"
 #include "lib/string.h"
 #include "smp/cpu.h"
+#include "sched/sched.h"
 #include "cpu/features.h"
 #include "linuxkpi/fpu.h"
 
@@ -346,6 +347,9 @@ void *pmm_alloc_zeroed_page(void) {
         hal_irq_restore(flags);
         __atomic_add_fetch(&zero_hits, 1, __ATOMIC_RELAXED);
         zero_pool_verify(page);
+        struct thread *cur = sched_get_current();
+        if (cur)
+          cur->pmm_alloc_bytes += PAGE_SIZE;
         return page;
       }
     }
@@ -364,6 +368,9 @@ void *pmm_alloc_zeroed_page(void) {
   if (page) {
     __atomic_add_fetch(&zero_hits, 1, __ATOMIC_RELAXED);
     zero_pool_verify(page);
+    struct thread *cur = sched_get_current();
+    if (cur)
+      cur->pmm_alloc_bytes += PAGE_SIZE;
   } else {
     __atomic_add_fetch(&zero_misses, 1, __ATOMIC_RELAXED);
   }

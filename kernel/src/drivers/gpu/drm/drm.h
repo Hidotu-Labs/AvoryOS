@@ -526,7 +526,14 @@ struct drm_connector {
 struct drm_pending_event {
   struct drm_event_vblank event;
   struct list_head list;
+  bool reserved; /* one of drm_file.event_reserve[], never kfree()d */
 };
+
+/* Per-file event slots used when kmalloc() fails. A dropped flip-complete
+ * event leaves a compositor waiting for "frame done" forever: KWin stops
+ * presenting while the rest of the system runs (seen as a GPU hang under
+ * memory pressure). A client that stops reading may still exhaust these. */
+#define DRM_EVENT_RESERVE 16
 
 /* ── Property system ─────────────────────────────────────────────────────── */
 
@@ -645,6 +652,9 @@ _Static_assert(sizeof(struct drm_prime_handle) == 12, "drm_prime_handle ABI size
 /* ── Per-file (per-client) DRM state ─────────────────────────────────────── */
 /* Virgl desktops retain hundreds of textures and transient render buffers. */
 #define DRM_MAX_HANDLES_PER_FILE 65536
+#define DRM_HANDLE_CHUNK_SHIFT 8
+#define DRM_HANDLE_CHUNK_SIZE (1U << DRM_HANDLE_CHUNK_SHIFT)
+#define DRM_HANDLE_CHUNKS (DRM_MAX_HANDLES_PER_FILE / DRM_HANDLE_CHUNK_SIZE)
 
 /*
  * drm_file — allocated once per open() of /dev/dri/card0.
@@ -653,8 +663,12 @@ _Static_assert(sizeof(struct drm_prime_handle) == 12, "drm_prime_handle ABI size
 struct drm_file {
   struct drm_device *dev;
 
-  /* Per-client GEM handle table: maps local handle → global gem object */
-  struct drm_gem_object *handles[DRM_MAX_HANDLES_PER_FILE];
+  /* Per-client GEM handle table: maps local handle → global gem object.
+   * Two-level and populated on demand: a flat 64K-entry array made every
+   * open() of a DRM node a 129-page physically contiguous allocation, which
+   * fails under fragmentation (ENOMEM on renderD129 → Mesa llvmpipe). Read
+   * slots with ascentdrm_file_handle_peek() under file->lock. */
+  struct drm_gem_object **handle_chunks[DRM_HANDLE_CHUNKS];
   uint32_t next_handle; /* next local handle to assign (1-based) */
   uint32_t handle_high_water; /* one past the highest populated slot */
 
@@ -668,6 +682,8 @@ struct drm_file {
   /* Per-client event queue (so two clients don't steal each other's events) */
   struct list_head event_queue;
   wait_queue_t event_wq;
+  struct drm_pending_event event_reserve[DRM_EVENT_RESERVE];
+  uint32_t event_reserve_used; /* bitmask, under lock */
 
   /* Per-client capabilities */
   uint32_t client_caps; /* DRM_FILE_CAP_* */
@@ -681,6 +697,31 @@ struct drm_file {
   spinlock_t lock;
   struct list_head list; /* linked into drm_device.file_list */
 };
+
+/* Release a dequeued event: reserve slots go back to the file (caller holds
+ * file->lock), heap events are returned in *to_free for kfree() after it. */
+static inline void ascentdrm_event_release_locked(struct drm_file *file,
+                                                  struct drm_pending_event *e,
+                                                  struct drm_pending_event **to_free) {
+  *to_free = NULL;
+  if (e->reserved) {
+    uint32_t slot = (uint32_t)(e - file->event_reserve);
+    if (slot < DRM_EVENT_RESERVE)
+      file->event_reserve_used &= ~(1u << slot);
+  } else {
+    *to_free = e;
+  }
+}
+
+/* Caller holds file->lock. Returns NULL for out-of-range or unpopulated. */
+static inline struct drm_gem_object *
+ascentdrm_file_handle_peek(const struct drm_file *file, uint32_t handle) {
+  if (handle >= DRM_MAX_HANDLES_PER_FILE)
+    return NULL;
+  struct drm_gem_object **chunk =
+      file->handle_chunks[handle >> DRM_HANDLE_CHUNK_SHIFT];
+  return chunk ? chunk[handle & (DRM_HANDLE_CHUNK_SIZE - 1)] : NULL;
+}
 
 /* ── Full ADDFB2 framebuffer (multi-planar + modifiers) ──────────────────── */
 #define DRM_FORMAT_MOD_INVALID (~0ULL)
@@ -733,6 +774,7 @@ struct drm_gem_object {
   size_t size;
   uint64_t phys_addr;
   void *virt_addr;
+  uint64_t *sg_pages;
   enum drm_gem_cache_mode cache_mode;
   struct list_head list;
   struct list_head file_list;
@@ -786,6 +828,14 @@ void ascentdrm_register_scanout_backend(drm_create_dumb_fn_t create_dumb,
                                   drm_get_modes_fn_t get_modes,
                                   drm_pageflip_fn_t pageflip);
 struct drm_gem_object *ascentdrm_gem_object_create(struct drm_device *dev, size_t size);
+/* Lock-free leak gauges, readable from the hang report: native GEM objects
+ * (and their bytes) and virgl host resources currently alive. A count that
+ * only grows across reports means a reference is never dropped and the host
+ * keeps the texture, which slows virgl down the longer a game runs. */
+extern uint64_t ascentdrm_live_gem_objects;
+extern uint64_t ascentdrm_live_gem_bytes;
+extern uint64_t ascentdrm_live_virgl_resources;
+struct drm_gem_object *ascentdrm_gem_object_create_sg(struct drm_device *dev, size_t size);
 void ascentdrm_gem_object_free(struct drm_device *dev, struct drm_gem_object *obj);
 void ascentdrm_gem_release_storage(struct drm_gem_object *obj);
 int ascentdrm_prime_export(struct drm_gem_object *obj, unsigned int flags);

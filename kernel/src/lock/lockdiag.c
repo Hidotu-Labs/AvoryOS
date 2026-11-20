@@ -564,8 +564,10 @@ uint64_t lockdiag_probe_cpus(uint32_t timeout_ms) {
 static void dump_stack(uint64_t low, uint64_t high, int max_entries) {
   int shown = 0;
   ld_str("\n[LOCKDIAG]   stack:");
-  uint64_t top = high & ~7ULL;
-  for (uint64_t a = top; a >= low && shown < max_entries; a -= 8) {
+  /* stack_top is the exclusive end of the allocation. */
+  for (uint64_t a = high & ~7ULL; a > low && a - low >= 8 &&
+                                  shown < max_entries;) {
+    a -= 8;
     uint64_t v = *(const volatile uint64_t *)a;
     /* Below the image base is data or stale stack litter, never a frame. */
     if (v >= (uint64_t)__kernel_text_start &&
@@ -574,8 +576,6 @@ static void dump_stack(uint64_t low, uint64_t high, int max_entries) {
       ld_hex(v);
       shown++;
     }
-    if (a <= low + 8)
-      break;
   }
   if (!shown)
     ld_str(" (none)");
@@ -936,9 +936,12 @@ static void dump_cpu(uint32_t id, uint64_t ack_mask, uint64_t now_tsc,
     ld_str("\n[LOCKDIAG]   HOLDS ");
     ld_str(lockdiag_spot_name(s));
     ld_str(" held=");
-    ld_dec(cycles_to_ms(now_tsc -
-                        __atomic_load_n(&g_spots[s].taken_tsc, __ATOMIC_RELAXED),
-                        mhz));
+    {
+      /* The report snapshots now_tsc first; a lock retaken after that would
+       * wrap the subtraction into a ~2^64-cycle "held" time. */
+      uint64_t tk = __atomic_load_n(&g_spots[s].taken_tsc, __ATOMIC_RELAXED);
+      ld_dec(tk && tk < now_tsc ? cycles_to_ms(now_tsc - tk, mhz) : 0);
+    }
     ld_str("ms taken-from=");
     ld_hex(__atomic_load_n(&g_spots[s].taken_ip, __ATOMIC_RELAXED));
   }
@@ -961,7 +964,7 @@ static void dump_spots(uint64_t now_tsc, uint64_t mhz) {
       ld_str(" tid=");
       ld_dec(__atomic_load_n(&sp->owner_tid, __ATOMIC_RELAXED));
       ld_str(" for=");
-      ld_dec(taken ? cycles_to_ms(now_tsc - taken, mhz) : 0);
+      ld_dec(taken && taken < now_tsc ? cycles_to_ms(now_tsc - taken, mhz) : 0);
       ld_str("ms taken-from=");
       ld_hex(__atomic_load_n(&sp->taken_ip, __ATOMIC_RELAXED));
     }
@@ -1041,6 +1044,16 @@ void lockdiag_dump_all(const char *reason) {
   ld_str(" present_failures="); ld_dec(gpu_stats.present_failures);
   ld_str(" pending_flip="); ld_dec(gpu_stats.pending_flip);
   ld_str(" async_flip="); ld_dec(gpu_stats.async_flip_state);
+  {
+    extern uint64_t ascentdrm_live_gem_objects, ascentdrm_live_gem_bytes,
+        ascentdrm_live_virgl_resources;
+    ld_str("\n[LOCKDIAG] GPU objects: gem_live=");
+    ld_dec(__atomic_load_n(&ascentdrm_live_gem_objects, __ATOMIC_RELAXED));
+    ld_str(" gem_mib=");
+    ld_dec(__atomic_load_n(&ascentdrm_live_gem_bytes, __ATOMIC_RELAXED) >> 20);
+    ld_str(" virgl_resources_live=");
+    ld_dec(__atomic_load_n(&ascentdrm_live_virgl_resources, __ATOMIC_RELAXED));
+  }
 
   const lockdiag_stats_t *s = &g_stats;
   ld_str("\n[LOCKDIAG] counters: futex waits=");

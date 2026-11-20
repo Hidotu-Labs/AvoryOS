@@ -93,7 +93,7 @@ void mm_put(struct mm_struct *mm, uint64_t cr3);
 struct fd_path {
   uint64_t offset;
   uint32_t ref_count;
-  char value[256];
+  char value[];
 };
 
 /*
@@ -433,6 +433,18 @@ struct thread {
   uint64_t runtime_burst; // CPU time used in current quantum (for MLFQ)
   char comm[16];          // Executable name (basename, max 15 chars + NUL)
   char exe_path[256];     // Full path of the current executable (for /proc/self/exe)
+  /* Adaptive uname (syscalls/sys_process.c): the program identity the policy
+   * learns against - the script for an interpreted program (kept across an
+   * env -> interpreter re-exec), otherwise exe_path. */
+  char uname_key[256];
+  bool uname_key_script;
+  bool uname_force;          // this process sees "Linux"
+  bool uname_force_children; // descendants inherit uname_force (script verdicts)
+  bool uname_trial;          // running a provisional "Linux" verdict pending verification
+  bool uname_diag_match;     // wrote OS/uname/Ascension diagnostic after seeing "Ascension"
+  uint16_t uname_ascension_calls; // uname() calls returning "Ascension" in this tree
+  uint32_t uname_post_writes;     // non-matching stderr writes after seeing "Ascension"
+  uint64_t uname_seen_ms;    // last time it or a descendant saw "Ascension"
   uint64_t cpu_affinity;  // Bitmask of allowed CPUs
 
   // Subsystem & Site Diagnostics
@@ -566,6 +578,8 @@ struct thread {
   uint64_t anon_write_start;
   uint8_t anon_write_cluster_pages;
   struct cgroupfs_group *cgroup;
+  uint64_t kheap_alloc_bytes;
+  uint64_t pmm_alloc_bytes;
 };
 
 _Static_assert(offsetof(struct thread, on_cpu) == 16,
@@ -614,6 +628,7 @@ struct sched_thread_snapshot {
   uint64_t runtime_system_ms;
   uint64_t start_time_ms;
   uint32_t uid, gid, euid, egid, suid, sgid;
+  bool nondumpable;          // PR_SET_DUMPABLE 0: hide from same-uid ptrace/procfs
   uint32_t cpu_index;
   uint64_t last_syscall_num;
   int64_t last_syscall_ret;
@@ -634,6 +649,8 @@ struct sched_thread_snapshot {
   uint64_t fault_class_cycles[3];
   uint64_t nr_syscalls;
   uint64_t syscall_cycles;
+  uint64_t kheap_alloc_bytes;
+  uint64_t pmm_alloc_bytes;
 };
 
 /* Caller holds files->lock. Anonymous descriptors without path metadata keep
@@ -674,6 +691,7 @@ static inline void fd_offset_set(struct thread *t, uint64_t fd, uint64_t value) 
 uint64_t fd_description_id_locked(struct thread *t, int fd);
 void fd_description_set_locked(struct thread *t, int fd, uint64_t id);
 void sched_copy_files(struct thread *child, struct thread *parent);
+bool sched_unshare_files(struct thread *t);
 bool fd_table_expand_locked(struct fd_table *files, uint32_t needed_fd);
 
 static inline void sched_sync_files(struct thread *t) {
@@ -813,7 +831,8 @@ bool sched_get_cpu_time_ms(uint32_t id, bool group, bool user_only,
 bool sched_get_cpu_usage_ms(uint32_t id, bool group, uint64_t *user_ms,
                             uint64_t *system_ms);
 bool sched_get_nth_open_fd(uint32_t tid, uint32_t index, uint32_t *fd);
-vfs_node_t *sched_get_fd_node_snapshot(uint32_t tid, uint32_t fd);
+vfs_node_t *sched_get_fd_node_snapshot(uint32_t tid, uint32_t fd,
+                                      bool socket_metadata_only);
 bool sched_get_fd_path_snapshot(uint32_t tid, uint32_t fd, char *path,
                                 size_t path_size);
 bool sched_get_fd_info_snapshot(uint32_t tid, uint32_t fd, uint64_t *out_pos,
@@ -827,6 +846,7 @@ void sched_queue_reap(struct thread *t);
 void sched_queue_reap_and_wait(struct thread *t);
 bool sched_prepare_thread_reap(struct thread *t);
 void sched_terminate_thread_group(struct thread *current);
+uint32_t sched_exec_kill_siblings(struct thread *current);
 void sched_share_files(struct thread *child, struct thread *parent);
 void sched_release_files(struct thread *t);
 bool sched_ensure_files(struct thread *t);
@@ -907,6 +927,8 @@ uint64_t process_build_initial_stack(uint64_t stack_top, const char *path,
                                      const elf_info_t *elf_info);
 bool process_exec_argv(const char **argv);
 void process_do_exit(uint64_t status);
+void uname_policy_on_fork(struct thread *child, const struct thread *parent);
+void uname_policy_on_write(struct thread *t, int fd, const char *buf, size_t len);
 
 #define ASCENTOS_USER_STACK_TOP 0x00007FFFF0000000ULL
 

@@ -136,6 +136,9 @@ static inline uint32_t nvme_cq_doorbell_offset(uint16_t qid, uint8_t dstrd) {
 #define NVME_ADMIN_SET_FEATURES 0x09
 #define NVME_ADMIN_GET_FEATURES 0x0A
 #define NVME_ADMIN_ASYNC_EVENT 0x0C
+/* Doorbell Buffer Config (NVMe 1.3, shadow doorbells): PRP1 = shadow doorbell
+ * page, PRP2 = EventIdx page. Advertised by OACS bit 8. */
+#define NVME_ADMIN_DBBUF 0x7C
 
 /* Set Features identifiers (NVMe 1.4 §5.21). */
 #define NVME_FEAT_NUMBER_OF_QUEUES 0x07
@@ -190,6 +193,8 @@ static inline uint32_t nvme_cq_doorbell_offset(uint16_t qid, uint8_t dstrd) {
 #define NVME_ID_CTRL_MDTS 77
 #define NVME_ID_CTRL_CNTLID 78
 #define NVME_ID_CTRL_VER 80
+#define NVME_ID_CTRL_OACS 256
+#define NVME_OACS_DBBUF (1u << 8)
 #define NVME_ID_CTRL_SQES 512
 #define NVME_ID_CTRL_CQES 513
 #define NVME_ID_CTRL_MAXCMD 514

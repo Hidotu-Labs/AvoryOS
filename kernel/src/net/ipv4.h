@@ -9,6 +9,10 @@
   (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) |   \
    (uint32_t)(d))
 
+static inline bool ipv4_is_loopback(uint32_t addr) {
+  return (addr >> 24) == 127;
+}
+
 struct ipv4_config {
   uint32_t address;
   uint32_t netmask;
@@ -25,6 +29,8 @@ void ipv4_arp_flush(void);
 
 int ipv4_send_raw(uint32_t dst_ip, uint8_t proto,
                   const void *payload, size_t payload_len);
+int ipv4_send_loopback(uint32_t src_ip, uint32_t dst_ip, uint8_t proto,
+                       const void *payload, size_t payload_len);
 
 /* Same, with an explicit TOS/DSCP byte (UDP sockets may request one). */
 int ipv4_send_raw_tos(uint32_t dst_ip, uint8_t proto, uint8_t tos,

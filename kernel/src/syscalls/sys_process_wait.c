@@ -169,7 +169,9 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
      * Keep waiting_for_child set until we re-check under the lock so we
      * cannot miss a wakeup that fires between sched_yield() returning and
      * the next spinlock_acquire at the top of the loop. */
-    if (!zombie && !stopped_tid && has_matching_children && !(options & WNOHANG)) {
+    bool interrupted = thread_has_pending_signal(current);
+    if (!zombie && !stopped_tid && !exited_tid && has_matching_children &&
+        !(options & WNOHANG) && !interrupted) {
       current->waiting_for_child = true;
       current->state = THREAD_BLOCKED;
       should_block = true;
@@ -220,11 +222,6 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
       return (uint64_t)exited_tid;
     }
 
-    if (current->ptrace_stop_pending) {
-      current->waiting_for_child = false;
-      return (uint64_t)-4; // EINTR: let syscall exit publish the ptrace stop
-    }
-
     if (!has_matching_children) {
       current->waiting_for_child = false;
       return (uint64_t)-10; // ECHILD
@@ -235,6 +232,12 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t wstatus_ptr, uint64_t options,
       current->waiting_for_child = false;
       return 0;
     }
+
+    /* PTRACE_ATTACH queues SIGSTOP rather than ptrace_stop_pending. A tracer
+     * can itself be the child we're waiting for. Deliver the pending stop
+     * at syscall return before parking again. */
+    if (interrupted)
+      return (uint64_t)-512; // ERESTARTSYS
 
     // Block and wait for a child to exit.
     // Note: waiting_for_child stays true across sched_yield() so that a
@@ -285,6 +288,16 @@ struct k_siginfo_child {
   int      si_status;  /* exit code or signal */
   int      _pad1;
 };
+/* i386 siginfo has no padding before si_pid: pack the fields for compat. */
+static int waitid_copy_siginfo(uint64_t ptr, const struct k_siginfo_child *si) {
+  struct thread *t = sched_get_current();
+  if (t && t->seccomp_compat_dispatch) {
+    int32_t c[6] = {si->si_signo, si->si_errno, si->si_code,
+                    (int32_t)si->si_pid, (int32_t)si->si_uid, si->si_status};
+    return copy_to_user((void *)ptr, c, sizeof(c));
+  }
+  return copy_to_user((void *)ptr, si, sizeof(*si));
+}
 #define CLD_EXITED 1
 #define CLD_KILLED 2
 #define CLD_TRAPPED 4
@@ -456,8 +469,9 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
       }
     }
 
+    bool interrupted = thread_has_pending_signal(current);
     if (!zombie && !ptrace_stopped && !ptrace_exited &&
-        has_matching_children && !(options & WNOHANG)) {
+        has_matching_children && !(options & WNOHANG) && !interrupted) {
       current->waiting_for_child = true;
       current->state = THREAD_BLOCKED;
       should_block = true;
@@ -477,7 +491,7 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
         si.si_uid    = (uint32_t)zombie->uid;
         si.si_status = zombie->termination_signal ? zombie->termination_signal :
                         zombie->exit_status & 0xFF;
-        if (copy_to_user((void *)infop_ptr, &si, sizeof(si)) != 0) {
+        if (waitid_copy_siginfo(infop_ptr, &si) != 0) {
           current->waiting_for_child = false;
           return (uint64_t)-14;
         }
@@ -501,7 +515,7 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
         si.si_pid = ptrace_pid;
         si.si_uid = ptrace_uid;
         si.si_status = ptrace_signal;
-        if (copy_to_user((void *)infop_ptr, &si, sizeof(si)) != 0) {
+        if (waitid_copy_siginfo(infop_ptr, &si) != 0) {
           current->waiting_for_child = false;
           return (uint64_t)-14;
         }
@@ -519,7 +533,7 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
         si.si_pid = ptrace_exit_pid;
         si.si_uid = ptrace_exit_uid;
         si.si_status = ptrace_exit_status;
-        if (copy_to_user((void *)infop_ptr, &si, sizeof(si)) != 0) {
+        if (waitid_copy_siginfo(infop_ptr, &si) != 0) {
           current->waiting_for_child = false;
           return (uint64_t)-14;
         }
@@ -528,11 +542,6 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
         sched_wakeup(tracee_parent_wake);
       current->waiting_for_child = false;
       return 0;
-    }
-
-    if (current->ptrace_stop_pending) {
-      current->waiting_for_child = false;
-      return (uint64_t)-4; // EINTR: syscall return enters PTRACE_EVENT_STOP
     }
 
     if (!has_matching_children) {
@@ -545,7 +554,7 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
       if (infop_ptr) {
         struct k_siginfo_child si;
         memset(&si, 0, sizeof(si));
-        if (copy_to_user((void *)infop_ptr, &si, sizeof(si)) != 0) {
+        if (waitid_copy_siginfo(infop_ptr, &si) != 0) {
           current->waiting_for_child = false;
           return (uint64_t)-14;
         }
@@ -553,6 +562,9 @@ static uint64_t sys_waitid(uint64_t idtype_val, uint64_t id_val,
       current->waiting_for_child = false;
       return 0;
     }
+
+    if (interrupted)
+      return (uint64_t)-512; // ERESTARTSYS
 
     if (should_block) {
       /* A pidfd can name a process this one is not the parent of, so the

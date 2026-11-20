@@ -525,8 +525,13 @@ static inline void sysprof_account(struct thread *t, uint64_t num, uint64_t t0) 
   __atomic_add_fetch(&sysprof_count[num], 1, __ATOMIC_RELAXED);
   __atomic_add_fetch(&sysprof_cycles[num], dt, __ATOMIC_RELAXED);
   if (t && t->mm) {
-    __atomic_add_fetch(&t->mm->nr_syscalls, 1, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&t->mm->syscall_cycles, dt, __ATOMIC_RELAXED);
+    if (t->mm->ref_count == 1) {
+      t->mm->nr_syscalls++;
+      t->mm->syscall_cycles += dt;
+    } else {
+      __atomic_add_fetch(&t->mm->nr_syscalls, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&t->mm->syscall_cycles, dt, __ATOMIC_RELAXED);
+    }
   }
 }
 
@@ -660,7 +665,7 @@ void syscall_dispatcher(struct syscall_regs *regs) {
       t->last_io_started_ms = lapic_timer_get_ticks();
   }
 
-  if (t) {
+  if (t && __builtin_expect(t->tracer_tid && t->ptrace_syscall_trace, 0)) {
     ptrace_syscall_enter(t, regs);
     syscall_num = regs->rax;
     syscall_return_ip = regs->rip;
@@ -690,7 +695,8 @@ void syscall_dispatcher(struct syscall_regs *regs) {
         rseq_update_cpu_id(t);
         rseq_maybe_abort(t, &regs->rip);
       }
-      ptrace_syscall_exit(t, regs);
+      if (__builtin_expect(t->tracer_tid && t->ptrace_syscall_trace, 0))
+        ptrace_syscall_exit(t, regs);
       if (thread_has_pending_signal(t) || t->ptrace_stop_pending) {
         signal_finish_syscall(regs, syscall_num, syscall_return_ip);
         t->restore_callee_regs = 1;
@@ -723,7 +729,8 @@ void syscall_dispatcher(struct syscall_regs *regs) {
         rseq_maybe_abort(t, &regs->rip);
       }
     }
-    ptrace_syscall_exit(t, regs);
+    if (__builtin_expect(t && t->tracer_tid && t->ptrace_syscall_trace, 0))
+      ptrace_syscall_exit(t, regs);
     if (__builtin_expect(syscall_restart_error(regs->rax) ||
                          (t && thread_has_pending_signal(t)), 0)) {
       signal_finish_syscall(regs, syscall_num, syscall_return_ip);
@@ -753,7 +760,8 @@ void syscall_dispatcher(struct syscall_regs *regs) {
         rseq_update_cpu_id(t);
         rseq_maybe_abort(t, &regs->rip);
       }
-      ptrace_syscall_exit(t, regs);
+      if (__builtin_expect(t->tracer_tid && t->ptrace_syscall_trace, 0))
+        ptrace_syscall_exit(t, regs);
       if (thread_has_pending_signal(t) || t->ptrace_stop_pending)
         signal_finish_syscall(regs, syscall_num, syscall_return_ip);
       __atomic_store_n(&t->in_syscall, false, __ATOMIC_RELAXED);
@@ -797,7 +805,7 @@ finish_filtered:
     rseq_maybe_abort(t, &regs->rip);
   }
 
-  if (t)
+  if (t && __builtin_expect(t->tracer_tid && t->ptrace_syscall_trace, 0))
     ptrace_syscall_exit(t, regs);
 
   /* Signal frame conversion copies the complete register set. Keep it off the

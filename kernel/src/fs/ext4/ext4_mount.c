@@ -279,6 +279,10 @@ static uint32_t ext4_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t si
     int error = 0;
     bool transaction_active = true;
     bool inode_valid = true;
+    /* Logical blocks this call allocated. Their disk contents are whatever a
+     * previous owner left there, so a partial write into one starts from
+     * zeros instead of reading that stale block back. */
+    uint32_t fresh_first = 0, fresh_end = 0;
     while (bytes_written < size) {
         if (blocks_in_batch >= 32) {
             if (offset + bytes_written > inode.i_size)
@@ -338,6 +342,19 @@ static uint32_t ext4_write_kernel(vfs_node_t *node, uint32_t offset, uint32_t si
                 break;
             }
             disk_block = allocated;
+            /* The extent covers this block and possibly the following ones. */
+            uint32_t run = 0;
+            if (ext4_get_extent_run(mnt, &inode, logical, &run) == allocated &&
+                run) {
+                fresh_first = logical;
+                fresh_end = logical + (run < blocks_needed ? run : blocks_needed);
+            } else {
+                fresh_first = logical;
+                fresh_end = logical + 1;
+            }
+            memset(block_buf, 0, mnt->block_size);
+        } else if ((in_block || count < mnt->block_size) &&
+                   logical >= fresh_first && logical < fresh_end) {
             memset(block_buf, 0, mnt->block_size);
         } else if (in_block || count < mnt->block_size) {
             mnt->journal.phase = "write-data-read";

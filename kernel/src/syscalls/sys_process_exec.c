@@ -248,12 +248,19 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
     return (uint64_t)-14; // EFAULT
 
   // Snapshot the pathname before inspecting self-exec aliases or switching CR3.
-  char *path = kmalloc(4096);
-  if (!path) return (uint64_t)-12;
-  long path_len = strncpy_from_user(path, user_path, 4096);
-  if (path_len < 0 || path_len >= 4096) {
-    kfree(path);
-    return path_len < 0 ? (uint64_t)-14 : (uint64_t)-36;
+  char stack_path[256];
+  char *path = stack_path;
+  long path_len = strncpy_from_user(stack_path, user_path, sizeof(stack_path));
+  if (path_len < 0)
+    return (uint64_t)-14;
+  if ((size_t)path_len >= sizeof(stack_path)) {
+    path = kmalloc(4096);
+    if (!path) return (uint64_t)-12;
+    path_len = strncpy_from_user(path, user_path, 4096);
+    if (path_len < 0 || path_len >= 4096) {
+      if (path != stack_path) kfree(path);
+      return path_len < 0 ? (uint64_t)-14 : (uint64_t)-36;
+    }
   }
 
   /* Recording the alias itself as exe_path would make /proc/self/exe point
@@ -262,7 +269,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   if (!strcmp(path, "/proc/self/exe") ||
       !strcmp(path, "/proc/thread-self/exe")) {
     if (!exec_caller || !exec_caller->exe_path[0]) {
-      kfree(path);
+      if (path != stack_path) kfree(path);
       return (uint64_t)-2; // ENOENT
     }
     strcpy(path, exec_caller->exe_path);
@@ -274,7 +281,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   char **k_argv = NULL;
   int vec_rc = exec_copy_user_vector(&strs, user_argv, compat32, &k_argv, &argc);
   if (vec_rc < 0) {
-    kfree(path);
+    if (path != stack_path) kfree(path);
     exec_args_free(&strs, NULL, NULL);
     return (uint64_t)vec_rc;
   }
@@ -283,14 +290,14 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   char **k_envp = NULL;
   vec_rc = exec_copy_user_vector(&strs, user_envp, compat32, &k_envp, &envc);
   if (vec_rc < 0) {
-    kfree(path);
+    if (path != stack_path) kfree(path);
     exec_args_free(&strs, k_argv, NULL);
     return (uint64_t)vec_rc;
   }
   exec_strings_finish(&strs, k_argv, argc);
   exec_strings_finish(&strs, k_envp, envc);
   if (!exec_wine_debug_env(path, &k_envp, &envc)) {
-    kfree(path);
+    if (path != stack_path) kfree(path);
     exec_args_free(&strs, k_argv, k_envp);
     return (uint64_t)-12;
   }
@@ -304,6 +311,8 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   /* Referenced node of the binary that elf_load() will map.  Holding it from
    * here on means the final path is resolved once, not again in the loader. */
   vfs_node_t *exec_file = NULL;
+  /* Absolute path of the script the caller exec'd, for the uname policy. */
+  char *uname_script = NULL;
 
   while (shebang_depth < 4) {
     vfs_node_t *exec_base = (path[0] == '/') ? fs_root :
@@ -325,7 +334,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
         klog_uint64((uint64_t)exec_err);
         klog_puts("\n");
       }
-      kfree(path);
+      if (path != stack_path) kfree(path);
       exec_args_free(&strs, k_argv, k_envp);
       return (uint64_t)(-exec_err);
     }
@@ -339,6 +348,17 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
     if (hlen >= 2 && header[0] == '#' && header[1] == '!') {
       vfs_close(exec_node);
+      if (!uname_script && strs.nowned < EXEC_OWNED_MAX - 3) {
+        /* Owned by strs, so every exit path frees it with the arena. */
+        char *script = kmalloc(256);
+        if (script && exec_save_absolute_path(script, 256, path,
+                exec_thread ? exec_thread->cwd_path : "/")) {
+          exec_strings_own(&strs, script);
+          uname_script = script;
+        } else {
+          kfree(script);
+        }
+      }
       header[hlen] = '\0';
       for (char *c = header; *c; c++) {
         if (*c == '\n' || *c == '\r') {
@@ -351,7 +371,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       char *p = header + 2;
       while (*p == ' ' || *p == '\t') p++;
       if (*p == '\0') {
-        kfree(path);
+        if (path != stack_path) kfree(path);
         exec_args_free(&strs, k_argv, k_envp);
         return (uint64_t)-8; // ENOEXEC
       }
@@ -376,7 +396,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       int new_argc = argc + added;
       char **new_k_argv = kmalloc((new_argc + 1) * sizeof(char *));
       if (!new_k_argv) {
-        kfree(path);
+        if (path != stack_path) kfree(path);
         exec_args_free(&strs, k_argv, k_envp);
         return (uint64_t)-12;
       }
@@ -392,14 +412,18 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
         kfree(arg_copy);
         kfree(next_path);
         kfree(new_k_argv);
-        kfree(path);
+        if (path != stack_path) kfree(path);
         exec_args_free(&strs, k_argv, k_envp);
         return (uint64_t)-12;
       }
       strcpy(bin_copy, interp_bin);
       strcpy(next_path, interp_bin);
       exec_strings_own(&strs, bin_copy);
-      exec_strings_own(&strs, path);
+      /* Only a heap path is owned.  A short path is still the stack_path
+       * buffer, and exec_args_free() must never kfree() a kernel-stack
+       * address; argv only needs it until this exec returns. */
+      if (path != stack_path)
+        exec_strings_own(&strs, path);
       new_k_argv[0] = bin_copy;
 
       int dst_idx = 1;
@@ -431,7 +455,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
   if (!exec_file) {
     // Shebang depth limit reached: the last interpreter was never verified.
-    kfree(path);
+    if (path != stack_path) kfree(path);
     exec_args_free(&strs, k_argv, k_envp);
     return (uint64_t)-8; // ENOEXEC
   }
@@ -440,7 +464,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   if (!exec_save_absolute_path(saved_exe_path, sizeof(saved_exe_path), path,
                                 exec_caller ? exec_caller->cwd_path : "/")) {
     vfs_close(exec_file);
-    kfree(path);
+    if (path != stack_path) kfree(path);
     exec_args_free(&strs, k_argv, k_envp);
     return (uint64_t)-36; // ENAMETOOLONG: never publish a truncated exe link
   }
@@ -450,7 +474,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   TSC_END(execve_pml4_create);
   if (!new_pml4) {
     vfs_close(exec_file);
-    kfree(path);
+    if (path != stack_path) kfree(path);
     exec_args_free(&strs, k_argv, k_envp);
     return (uint64_t)-12;
   }
@@ -481,7 +505,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       /* Nothing has been modified yet: free the execve scratch buffers and
        * report the failure, staying on the current address space. */
       vfs_close(exec_file);
-      kfree(path);
+      if (path != stack_path) kfree(path);
       exec_args_free(&strs, k_argv, k_envp);
       return (uint64_t)-12;
     }
@@ -560,7 +584,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
       current->mm->mmap_next_addr = old_mmap_next_addr;
       current->mm->compat32 = old_compat32;
     }
-    kfree(path);
+    if (path != stack_path) kfree(path);
     exec_args_free(&strs, k_argv, k_envp);
     // Note: new_pml4 is leaked if elf_load fails. Fixing that would require
     // vmm_destroy_pml4 or similar, but for now we focus on the reported leak.
@@ -569,7 +593,18 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
   TSC_END(execve_elf_load);
 
-  exec_close_cloexec(current);
+  /* Point of no return: the new image is loaded. Like Linux de_thread(),
+   * the old image's other threads must not survive into it - in particular
+   * not while exec_close_cloexec() empties the fd table they share. */
+  sched_exec_kill_siblings(current);
+  if (current->tid != current->tgid)
+    klogf("[PROC] execve from non-leader tid=%u tgid=%u: leader kept\n",
+          current->tid, current->tgid);
+
+  /* Unshare the fd table if shared with a non-thread parent (CLONE_FILES)
+   * so closing FD_CLOEXEC descriptors never tears down the parent's fds. */
+  if (sched_unshare_files(current))
+    exec_close_cloexec(current);
 
   uint32_t old_exec_euid = current->euid;
   if ((exec_mode & 04000) && !current->no_new_privs && !(exec_mount_flags & 2))
@@ -680,6 +715,24 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
   // Publish only after successful exec; argv and AT_EXECFN retain the caller path.
   strcpy(current->exe_path, saved_exe_path);
+  {
+    /* Script identity survives `#!/usr/bin/env bash`: env re-execs the
+     * interpreter with the script path still in argv. */
+    bool keep = false;
+    if (!uname_script && current->uname_key_script && current->uname_key[0])
+      for (int i = 1; i < argc && k_argv[i]; i++)
+        if (strcmp(k_argv[i], current->uname_key) == 0) { keep = true; break; }
+    if (uname_script) {
+      strncpy(current->uname_key, uname_script, sizeof(current->uname_key) - 1);
+      current->uname_key[sizeof(current->uname_key) - 1] = 0;
+      current->uname_key_script = true;
+    } else if (!keep) {
+      strcpy(current->uname_key, current->exe_path);
+      current->uname_key_script = false;
+    }
+    extern void uname_policy_on_exec(struct thread *t);
+    uname_policy_on_exec(current);
+  }
   /* Queue readahead for the windows this executable faulted in last time. */
   vfs_exec_profile_prefetch(current->exe_path);
 
@@ -718,7 +771,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
 
   // Cleanup kernel-side copies
   exec_args_free(&strs, k_argv, k_envp);
-  kfree(path);
+  if (path != stack_path) kfree(path);
 
   // Reset TLS Bases for this process
   wrmsr(IA32_KERNEL_GS_BASE, 0);

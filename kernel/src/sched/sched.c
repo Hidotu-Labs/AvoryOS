@@ -945,10 +945,12 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
 }
 
 __attribute__((optimize("O3"))) void sched_yield(void) {
+  sched_drain_defer_backlog();
   sched_schedule(false);
 }
 
 __attribute__((optimize("O3"))) void sched_yield_user(void) {
+  sched_drain_defer_backlog();
   sched_schedule(true);
 }
 

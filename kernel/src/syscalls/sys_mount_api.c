@@ -238,7 +238,7 @@ static int fs_context_create(fs_context_t *ctx) {
   if (!sb)
     return -12;
   memset(sb, 0, sizeof(*sb));
-  sb->max_bytes = ctx->max_bytes ? ctx->max_bytes : TMPFS_DEFAULT_MAX_BYTES;
+  sb->max_bytes = ctx->max_bytes ? ctx->max_bytes : tmpfs_default_max_bytes();
   sb->max_inodes = ctx->max_inodes ? ctx->max_inodes : TMPFS_DEFAULT_MAX_INODES;
   spinlock_init(&sb->lock);
   vfs_node_t *root = tmpfs_create_root(sb);

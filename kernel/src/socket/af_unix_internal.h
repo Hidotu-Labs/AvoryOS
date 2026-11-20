@@ -33,12 +33,14 @@
 // consuming.  That bound is what makes one conditional subtract enough to
 // wrap, instead of a second divide.
 
+#define UNIX_RECV_BUF_MIN 16384
+
 static inline size_t unix_round_pow2(size_t n) {
-  if (n <= 65536)
-    return 65536;
+  if (n <= UNIX_RECV_BUF_MIN)
+    return UNIX_RECV_BUF_MIN;
   if (n >= 4 * 1024 * 1024)
     return 4 * 1024 * 1024;
-  size_t p = 65536;
+  size_t p = UNIX_RECV_BUF_MIN;
   while (p < n && p < 4 * 1024 * 1024)
     p <<= 1;
   return p;

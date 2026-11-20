@@ -5,6 +5,8 @@
 #include "../console/klog.h"
 #include "../drivers/storage/block.h"
 #include "../fb/framebuffer.h"
+#include "../fs/mount_namespace.h"
+#include "../fs/procfs.h"
 #include "../fs/vfs.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
@@ -25,6 +27,8 @@ extern int fat32_statfs_impl(vfs_node_t *, struct statfs_buf *);
 // ---------------------------------------------------------------------------
 
 void fill_kstat(struct kstat *ks, vfs_node_t *node) {
+    /* Mount views own path ancestry, while the inode owns its metadata. */
+    node = vfs_backing_node(node);
     ks->st_dev   = 0;
     ks->st_ino   = (uint64_t)node->inode;
     ks->st_nlink = node->get_nlink ? node->get_nlink(node) : 1;
@@ -75,7 +79,7 @@ void fill_kstat(struct kstat *ks, vfs_node_t *node) {
 
     ks->st_size    = (int64_t)node->length;
     ks->st_blksize = 4096;
-    ks->st_blocks  = ((int64_t)node->length + 511) / 512;
+    ks->st_blocks  = (ks->st_size + 511) / 512;
 
     ks->st_atim_sec  = (int64_t)node->atime;
     ks->st_atim_nsec = 0;
@@ -94,17 +98,58 @@ static uint64_t copy_statat_result(void *, const struct kstat *, bool);
 
 static void stat_path_release(char **path) { if (*path) kfree(*path); }
 
+static long stat_copy_user_path(const void *user_ptr, char *stack_buf,
+                                size_t stack_cap, char **heap_out,
+                                const char **path_out) {
+    long length = strncpy_from_user(stack_buf, user_ptr, stack_cap);
+    if (length < 0)
+        return length;
+    if ((size_t)length < stack_cap) {
+        *heap_out = NULL;
+        *path_out = stack_buf;
+        return length;
+    }
+    char *heap = kmalloc(4096);
+    if (!heap)
+        return -12;
+    length = strncpy_from_user(heap, user_ptr, 4096);
+    if (length < 0) {
+        kfree(heap);
+        return length;
+    }
+    if (length >= 4096) {
+        kfree(heap);
+        return -36;
+    }
+    *heap_out = heap;
+    *path_out = heap;
+    return length;
+}
+
+static vfs_node_t *stat_resolve_node(vfs_node_t *base, const char *path) {
+    vfs_node_t *node = vfs_resolve_path_at(base, path);
+    if (node)
+        return node;
+    vfs_node_t *link = vfs_resolve_symlink_node(base, path);
+    if (!link)
+        return NULL;
+    node = procfs_socket_fd_stat_target(link);
+    vfs_close(link);
+    return node;
+}
+
 static uint64_t sys_stat(uint64_t path_ptr, uint64_t statbuf_ptr, uint64_t a2,
                           uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
     struct kstat *ks  = (struct kstat *)statbuf_ptr;
     if (!path_ptr || !ks || !is_user_ptr((uint64_t)ks))
         return (uint64_t)-14;
-    char *path __attribute__((cleanup(stat_path_release))) = kmalloc(4096);
-    if (!path) return (uint64_t)-12;
-    long length = strncpy_from_user(path, (const void *)path_ptr, 4096);
+    char stack_path[256];
+    char *heap_path __attribute__((cleanup(stat_path_release))) = NULL;
+    const char *path = NULL;
+    long length = stat_copy_user_path((const void *)path_ptr, stack_path,
+                                      sizeof(stack_path), &heap_path, &path);
     if (length < 0) return (uint64_t)length;
-    if (length >= 4096) return (uint64_t)-36;
 
     struct thread *t = sched_get_current();
     vfs_node_t *node  = NULL;
@@ -116,7 +161,7 @@ static uint64_t sys_stat(uint64_t path_ptr, uint64_t statbuf_ptr, uint64_t a2,
     if (!node) {
         vfs_node_t *cwd = (path[0] == '/') ? fs_root
                           : (t->cwd_node ? t->cwd_node : fs_root);
-        node = vfs_resolve_path_at(cwd, path);
+        node = stat_resolve_node(cwd, path);
         node_owned = node != NULL;
     }
     if (!node) {
@@ -135,11 +180,12 @@ static uint64_t sys_lstat(uint64_t path_ptr, uint64_t statbuf_ptr, uint64_t a2,
     struct kstat *ks  = (struct kstat *)statbuf_ptr;
     if (!path_ptr || !ks || !is_user_ptr((uint64_t)ks))
         return (uint64_t)-14;
-    char *path __attribute__((cleanup(stat_path_release))) = kmalloc(4096);
-    if (!path) return (uint64_t)-12;
-    long length = strncpy_from_user(path, (const void *)path_ptr, 4096);
+    char stack_path[256];
+    char *heap_path __attribute__((cleanup(stat_path_release))) = NULL;
+    const char *path = NULL;
+    long length = stat_copy_user_path((const void *)path_ptr, stack_path,
+                                      sizeof(stack_path), &heap_path, &path);
     if (length < 0) return (uint64_t)length;
-    if (length >= 4096) return (uint64_t)-36;
 
     struct thread *t = sched_get_current();
     vfs_node_t *base  = (t && t->cwd_node && path[0] != '/') ? t->cwd_node : fs_root;
@@ -229,7 +275,7 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
             } else if ((flags & AT_SYMLINK_NOFOLLOW) && kpathp[0] == '/') {
                 node = vfs_resolve_symlink_node(fs_root, kpathp);
             } else {
-                node = vfs_resolve_path_at(base_dir, kpathp);
+                node = stat_resolve_node(base_dir, kpathp);
             }
             node_owned = node != NULL;
         }
@@ -275,6 +321,8 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
     kstx.stx_attributes_mask = STATX_ATTR_MOUNT_ROOT;
     if (vfs_is_mount_root(node))
         kstx.stx_attributes |= STATX_ATTR_MOUNT_ROOT;
+    vfs_node_t *view = node;
+    node = vfs_backing_node(view);
     kstx.stx_blksize = 4096;
     kstx.stx_nlink   = node->get_nlink ? node->get_nlink(node) : 1;
     kstx.stx_uid     = node->uid;
@@ -287,12 +335,16 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
     case FS_CHARDEV:   mode |= 0020000; break;
     case FS_BLOCKDEV:  mode |= 0060000; break;
     case FS_SYMLINK:   mode |= 0120000; break;
+    /* Same table as fill_kstat(): statx used to report FIFOs and sockets as
+     * regular files, so coreutils/glibc callers saw "regular empty file". */
+    case FS_SOCKET:    mode |= 0140000; break;
+    case FS_PIPE:      mode |= 0010000; break;
     default:           mode |= 0100000; break;
     }
     kstx.stx_mode   = (uint16_t)mode;
     kstx.stx_ino    = node->inode;
     kstx.stx_size   = node->length;
-    kstx.stx_blocks = (node->length + 511) / 512;
+    kstx.stx_blocks = (kstx.stx_size + 511) / 512;
     kstx.stx_atime.tv_sec = (int64_t)node->atime;
     kstx.stx_mtime.tv_sec = (int64_t)node->mtime;
     kstx.stx_ctime.tv_sec = (int64_t)node->ctime;
@@ -321,7 +373,7 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
             kstx.stx_dev_minor = bd->linux_minor;
         }
     }
-    if (node_owned) vfs_close(node);
+    if (node_owned) vfs_close(view);
     if (base_owned) vfs_close(base_owned);
     if (copy_to_user((void *)statxbuf_ptr, &kstx, sizeof(kstx)) != 0)
         return (uint64_t)-14;
@@ -378,7 +430,7 @@ static uint64_t fill_statat(uint64_t dirfd, uint64_t pathname_ptr,
     if (!node) {
         node = (flags & AT_SYMLINK_NOFOLLOW)
                ? vfs_resolve_symlink_node(base_dir, path)
-               : vfs_resolve_path_at(base_dir, path);
+               : stat_resolve_node(base_dir, path);
         node_owned = node != NULL;
         if (!node) {
             if (base_owned) vfs_close(base_owned);
@@ -435,11 +487,12 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t pathname_ptr,
                                 uint64_t a4, uint64_t a5) {
     if (flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | 0x800 /* AT_NO_AUTOMOUNT */))
         return (uint64_t)-22;
-    char *path __attribute__((cleanup(stat_path_release))) = kmalloc(4096);
-    if (!path) return (uint64_t)-12;
-    long length = strncpy_from_user(path, (void *)pathname_ptr, 4096);
-    if (length < 0) return (uint64_t)-14;
-    if (length >= 4096) return (uint64_t)-36;
+    char stack_path[256];
+    char *heap_path __attribute__((cleanup(stat_path_release))) = NULL;
+    const char *path = NULL;
+    long length = stat_copy_user_path((const void *)pathname_ptr, stack_path,
+                                      sizeof(stack_path), &heap_path, &path);
+    if (length < 0) return (uint64_t)(length == -36 ? -36 : -14);
     if (!path[0] && !(flags & AT_EMPTY_PATH)) return (uint64_t)-2;
     struct kstat ks = {0};
     uint64_t ret = fill_statat(dirfd, (uint64_t)path, (uint64_t)&ks,
@@ -539,9 +592,11 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
     while (1) {
         struct dirent *de = vfs_readdir(node, cookie);
         if (!de) break;
+        /* i386 getdents (141) uses 32-bit d_ino/d_off and 4-byte records. */
+        bool compat = t->seccomp_compat_dispatch;
         size_t name_len   = strlen(de->name);
-        size_t entry_size = 8 + 8 + 2 + name_len + 2;
-        entry_size = (entry_size + 7) & ~7;
+        size_t entry_size = (compat ? 4 + 4 : 8 + 8) + 2 + name_len + 2;
+        entry_size = compat ? (entry_size + 3) & ~3 : (entry_size + 7) & ~7;
         if (written + entry_size > count) break;
 
         uint8_t stack_entry[512];
@@ -550,11 +605,20 @@ static uint64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count,
                             : (uint8_t *)kmalloc(entry_size);
         if (!kbuf) return written ? written : (uint64_t)-12;
         memset(kbuf, 0, entry_size);
-        struct linux_dirent *entry = (struct linux_dirent *)kbuf;
-        entry->d_ino    = de->ino;
-        entry->d_off    = de->d_off;
-        entry->d_reclen = (uint16_t)entry_size;
-        strcpy(entry->d_name, de->name);
+        if (compat) {
+            uint32_t ino32 = (uint32_t)de->ino, off32 = (uint32_t)de->d_off;
+            uint16_t reclen = (uint16_t)entry_size;
+            memcpy(kbuf, &ino32, 4);
+            memcpy(kbuf + 4, &off32, 4);
+            memcpy(kbuf + 8, &reclen, 2);
+            memcpy(kbuf + 10, de->name, name_len + 1);
+        } else {
+            struct linux_dirent *entry = (struct linux_dirent *)kbuf;
+            entry->d_ino    = de->ino;
+            entry->d_off    = de->d_off;
+            entry->d_reclen = (uint16_t)entry_size;
+            strcpy(entry->d_name, de->name);
+        }
         int copy_err = copy_to_user(buf + written, kbuf, entry_size) != 0;
         if (kbuf != stack_entry) kfree(kbuf);
         if (copy_err) return written ? written : (uint64_t)-14;

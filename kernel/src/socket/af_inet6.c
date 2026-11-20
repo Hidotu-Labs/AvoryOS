@@ -209,8 +209,7 @@ static int inet6_connect(socket_t *sock, struct sockaddr *addr, int len) {
       return -106;
     if (sock->state == SS_CONNECTING || s->tcp->state == TCP_SYN_SENT || s->tcp->state == TCP_SYN_RECEIVED)
       return -114;
-    s->tcp->vfs_node = sock->node;
-    s->tcp->wait_queue = sock->wait_queue;
+    tcp_attach_socket(s->tcp, sock->wait_queue, sock->node);
     tcp_set_nodelay(s->tcp, s->tcp_nodelay);
     tcp_set_reuseaddr(s->tcp, sock->reuseaddr != 0);
     tcp_set_keepalive(s->tcp, s->tcp_keepalive, s->keepidle_s,
@@ -399,7 +398,8 @@ static int inet6_getpeername(socket_t *s, struct sockaddr *a, int *l) {
 static int inet6_poll(socket_t *sock, int events) {
   struct inet6_sock *s = sock->sk; int r = 0;
   if (s->tcp) {
-    s->tcp->vfs_node = sock->node;
+    if (s->tcp->vfs_node != sock->node)
+      tcp_attach_socket(s->tcp, sock->wait_queue, sock->node);
     if (s->tcp->state == TCP_LISTEN) {
       if ((events & POLLIN) && tcp_accept_pending(s->tcp))
         r |= POLLIN;

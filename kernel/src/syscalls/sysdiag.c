@@ -154,6 +154,7 @@ static const char *sysdiag_lookup_ioctl_name(uint32_t req) {
   case 0x891B: return "SIOCGIFNETMASK";
   case 0x8927: return "SIOCGIFHWADDR";
   case 0x8933: return "SIOCGIFINDEX";
+  case 0x8946: return "SIOCETHTOOL";
   case 0x8B07: return "SIOCGIWMODE";
 
   /* DRM */
@@ -606,6 +607,7 @@ static bool sysdiag_is_severe_syscall_error(uint64_t num, int64_t err,
 
   if (e == 38 /* ENOSYS */ ||
       e == 1  /* EPERM */  ||
+      e == 12 /* ENOMEM */ ||
       e == 13 /* EACCES */ ||
       e == 14 /* EFAULT */ ||
       e == 25 /* ENOTTY */ ||

@@ -1087,14 +1087,14 @@ static uint64_t sys_close(uint64_t fd, uint64_t a1, uint64_t a2, uint64_t a3,
     spinlock_release(&t->files->lock);
     return (uint64_t)-9;
   }
-  vfs_node_t *node = t->fds[fd];
+  vfs_node_t *node = t->files->fds[fd];
   if (!fd_is_valid_node(node)) {
     spinlock_release(&t->files->lock);
     return (uint64_t)-9;
   }
-  t->fds[fd] = NULL;
-  t->fd_offsets[fd] = 0;
-  t->fd_flags[fd] = 0;
+  t->files->fds[fd] = NULL;
+  t->files->fd_offsets[fd] = 0;
+  t->files->fd_flags[fd] = 0;
   fd_path_clear(t, (int)fd);
   if (fd < t->files->next_fd)
     t->files->next_fd = (uint32_t)fd;
@@ -1120,23 +1120,25 @@ static uint64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags,
   klog_debugf("[CLOSE_RANGE] tid=%llu first=%llu last=%llu flags=0x%llx\n",
               (unsigned long long)t->tid, (unsigned long long)first,
               (unsigned long long)last, (unsigned long long)flags);
+  if (flags & CLOSE_RANGE_UNSHARE) {
+    if (!sched_unshare_files(t))
+      return (uint64_t)-12;
+  }
+
   if (first >= MAX_FDS)
     return 0;
   if (last >= MAX_FDS)
     last = MAX_FDS - 1;
 
-  if (first >= t->files->capacity)
-    return 0;
-  if (last >= t->files->capacity)
-    last = t->files->capacity - 1;
-
-  /* File tables are already private for forked children.  CLONE_UNSHARE is
-   * accepted here; callers using it only need the range operation itself. */
   if (flags & CLOSE_RANGE_CLOEXEC) {
     spinlock_acquire(&t->files->lock);
-    for (uint64_t fd = first; fd <= last; fd++) {
-      if (t->fds[fd] && t->fds[fd] != FD_RESERVED)
-        t->fd_flags[fd] |= FD_FLAGS_CLOEXEC_BIT;
+    uint64_t cap = t->files->capacity;
+    uint64_t end = last < cap ? last : (cap ? cap - 1 : 0);
+    if (first < cap) {
+      for (uint64_t fd = first; fd <= end; fd++) {
+        if (t->files->fds[fd] && t->files->fds[fd] != FD_RESERVED)
+          t->files->fd_flags[fd] |= FD_FLAGS_CLOEXEC_BIT;
+      }
     }
     spinlock_release(&t->files->lock);
     return 0;
@@ -1144,14 +1146,18 @@ static uint64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags,
 
   for (uint64_t fd = first; fd <= last; fd++) {
     spinlock_acquire(&t->files->lock);
-    vfs_node_t *node = t->fds[fd];
+    if (fd >= t->files->capacity) {
+      spinlock_release(&t->files->lock);
+      break;
+    }
+    vfs_node_t *node = t->files->fds[fd];
     if (!node || node == FD_RESERVED) {
       spinlock_release(&t->files->lock);
       continue;
     }
-    t->fds[fd] = NULL;
-    t->fd_offsets[fd] = 0;
-    t->fd_flags[fd] = 0;
+    t->files->fds[fd] = NULL;
+    t->files->fd_offsets[fd] = 0;
+    t->files->fd_flags[fd] = 0;
     fd_path_clear(t, (int)fd);
     if (fd < t->files->next_fd)
       t->files->next_fd = (uint32_t)fd;
@@ -1349,18 +1355,26 @@ static uint32_t fd_vfs_write(vfs_node_t *node, uint64_t offset, uint32_t size,
   return vfs_write(node, (uint32_t)offset, size, buf);
 }
 
-#define FD_BOUNCE_STACK_MAX 512
-#define FD_BOUNCE_HEAP_MAX  (1024U * 1024U)
+#define FD_BOUNCE_STACK_MAX 4096
+/* Keep per-syscall scratch memory bounded. Larger read/write requests are
+ * already transferred in a loop, so 64 KiB limits peak kernel heap use without
+ * changing the userspace-visible request size. */
+#define FD_BOUNCE_HEAP_MAX  (64U * 1024U)
 
 static int64_t fd_read_to_user(vfs_node_t *node, uint64_t offset, size_t count,
                                uint8_t *user_buf) {
   if (count == 0)
     return 0;
+  bool packet_pipe = pipe_is_packet(node);
+  if (packet_pipe && count > PIPE_PACKET_SIZE)
+    count = PIPE_PACKET_SIZE;
   uint8_t stack_buf[FD_BOUNCE_STACK_MAX];
   size_t cap = count <= FD_BOUNCE_STACK_MAX ? count
              : (count <= FD_BOUNCE_HEAP_MAX ? count : FD_BOUNCE_HEAP_MAX);
   uint8_t *kbuf = cap <= FD_BOUNCE_STACK_MAX ? stack_buf : (uint8_t *)kmalloc(cap);
   if (!kbuf) {
+    if (packet_pipe)
+      return -12; // A smaller bounce buffer would discard part of the packet.
     kbuf = stack_buf;
     cap = FD_BOUNCE_STACK_MAX;
   }
@@ -1383,7 +1397,7 @@ static int64_t fd_read_to_user(vfs_node_t *node, uint64_t offset, size_t count,
       break;
     }
     total += (size_t)got;
-    if ((size_t)got < chunk)
+    if (packet_pipe || (size_t)got < chunk)
       break;
   }
 
@@ -1400,8 +1414,13 @@ static int64_t fd_write_from_user_node(vfs_node_t *node, uint64_t offset,
   uint8_t stack_buf[FD_BOUNCE_STACK_MAX];
   size_t cap = count <= FD_BOUNCE_STACK_MAX ? count
              : (count <= FD_BOUNCE_HEAP_MAX ? count : FD_BOUNCE_HEAP_MAX);
+  bool packet_pipe = pipe_is_packet(node);
+  if (packet_pipe && cap > PIPE_PACKET_SIZE)
+    cap = PIPE_PACKET_SIZE;
   uint8_t *kbuf = cap <= FD_BOUNCE_STACK_MAX ? stack_buf : (uint8_t *)kmalloc(cap);
   if (!kbuf) {
+    if (packet_pipe)
+      return -12; // Keep the original packet boundaries under memory pressure.
     kbuf = stack_buf;
     cap = FD_BOUNCE_STACK_MAX;
   }
@@ -1546,17 +1565,29 @@ static uint64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count,
   if (!is_user_range((const void *)buf, count))
     return (uint64_t)-14;
 
-  if (fd == 2) {
+  if (fd == 1 || fd == 2) {
     struct thread *t = sched_get_current();
     if (t) {
-      size_t copy_len = count < sizeof(t->last_stderr) - 1 ? count : sizeof(t->last_stderr) - 1;
-      if (copy_len > 0) {
-        if (copy_from_user(t->last_stderr, (const void *)buf, copy_len) != 0)
+      if (fd == 2) {
+        size_t copy_len = count < sizeof(t->last_stderr) - 1 ? count : sizeof(t->last_stderr) - 1;
+        if (copy_len > 0) {
+          if (copy_from_user(t->last_stderr, (const void *)buf, copy_len) != 0)
+            t->last_stderr[0] = '\0';
+          else
+            t->last_stderr[copy_len] = '\0';
+        } else {
           t->last_stderr[0] = '\0';
-        else
-          t->last_stderr[copy_len] = '\0';
-      } else {
-        t->last_stderr[0] = '\0';
+        }
+      }
+      if (count > 0 && t->uname_seen_ms && !t->uname_force && !t->uname_diag_match) {
+        if (fd == 2 && count < sizeof(t->last_stderr)) {
+          uname_policy_on_write(t, 2, t->last_stderr, (size_t)count);
+        } else {
+          char diag_buf[512];
+          size_t dlen = count < sizeof(diag_buf) ? (size_t)count : sizeof(diag_buf);
+          if (copy_from_user(diag_buf, (const void *)buf, dlen) == 0)
+            uname_policy_on_write(t, (int)fd, diag_buf, dlen);
+        }
       }
     }
   }
@@ -1647,7 +1678,8 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
   }
   ct->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
 
-  if (fuse_is_device(node)) {
+  bool fuse_device = fuse_is_device(node);
+  if (fuse_device || pipe_is_packet(node)) {
     uint64_t capacity = 0;
     int64_t result = 0;
     for (uint64_t i = 0; i < iovcnt; i++) {
@@ -1657,10 +1689,16 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       if (iov[i].iov_len > UINT64_MAX - capacity) { result = -22; break; }
       capacity += iov[i].iov_len;
     }
-    /* A FUSE request is at most the negotiated 64 KiB payload plus header. */
-    if (capacity > 65576) capacity = 65576;
-    uint8_t *packet = !result && capacity ? kmalloc(capacity) : NULL;
-    if (!result && capacity && !packet) result = -12;
+    /* Read exactly one FUSE request or pipe packet across all vectors. */
+    uint64_t limit = fuse_device ? 65576 : PIPE_PACKET_SIZE;
+    if (capacity > limit) capacity = limit;
+    uint8_t stack_packet[FD_BOUNCE_STACK_MAX];
+    uint8_t *packet = NULL;
+    if (!result && capacity) {
+      packet = capacity <= sizeof(stack_packet) ? stack_packet
+                                                : kmalloc(capacity);
+      if (!packet) result = -12;
+    }
     if (!result && capacity) {
       result = (int32_t)vfs_read(node, 0, capacity, packet);
       if (result > 0) {
@@ -1671,14 +1709,18 @@ static uint64_t sys_readv(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
           if (copy_to_user((void *)iov[i].iov_base, packet + copied, count)) {
             /* The message was consumed: abort rather than strand its caller
              * forever waiting for a daemon that received only a fragment. */
-            fuse_abort_device(node); result = -14; break;
+            if (fuse_device)
+              fuse_abort_device(node);
+            result = -14;
+            break;
           }
           copied += count;
         }
       }
     }
     ct->current_io_flags = 0;
-    kfree(packet); fd_put_node(ref); fd_release_iov(iov, stack_iov);
+    if (packet && packet != stack_packet) kfree(packet);
+    fd_put_node(ref); fd_release_iov(iov, stack_iov);
     return (uint64_t)result;
   }
 
@@ -1762,11 +1804,90 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     kernel_iov[i].iov_len = (size_t)len;
     payload_size += (size_t)len;
   }
-  uint8_t *payload = payload_size ? kmalloc(payload_size) : NULL;
+  uint8_t stack_payload[1024];
+  uint8_t *payload = payload_size == 0 ? NULL
+                   : (payload_size <= sizeof(stack_payload) ? stack_payload
+                                                            : kmalloc(payload_size));
   if (payload_size && !payload) {
+    extern size_t mm_file_cache_reclaim(size_t target_pages);
+    extern size_t vfs_dentry_reclaim_pages(size_t target_pages);
+    mm_file_cache_reclaim(payload_size / 4096 + 16);
+    vfs_dentry_reclaim_pages(64);
+    payload = kmalloc(payload_size);
+  }
+  if (payload_size && !payload) {
+    socket_t *chk_sock = socket_from_fd((int)fd);
+    bool is_stream_sock = chk_sock && chk_sock->type == 1 &&
+                          chk_sock->ops && chk_sock->ops->sendmsg;
+    if (chk_sock && !is_stream_sock) {
+      socket_fd_put(chk_sock);
+      fd_release_kvec(kernel_iov, stack_kvec);
+      fd_release_iov(iov, stack_iov);
+      return (uint64_t)-12;
+    }
+    if (chk_sock)
+      socket_fd_put(chk_sock);
+
+    struct thread *writer = sched_get_current();
+    vfs_node_t *chk_node = !is_stream_sock ? fd_pin_node(writer, fd, NULL, NULL) : NULL;
+    bool is_fuse = chk_node && fuse_is_device(chk_node);
+    if (chk_node) vfs_close(chk_node);
+    if (is_fuse) {
+      fd_release_kvec(kernel_iov, stack_kvec);
+      fd_release_iov(iov, stack_iov);
+      return (uint64_t)-12;
+    }
+
+    /* Fall back to 4 KiB stack-buffered writes when contiguous payload
+     * allocation fails under memory fragmentation. */
+    uint8_t chunk[4096];
+    size_t total = 0;
+    for (uint64_t i = 0; i < iovcnt; i++) {
+      uint64_t ubase = iov[i].iov_base;
+      size_t rem = (size_t)iov[i].iov_len;
+      while (rem > 0) {
+        size_t step = rem < sizeof(chunk) ? rem : sizeof(chunk);
+        if (copy_from_user(chunk, (const void *)ubase, step) != 0) {
+          fd_release_kvec(kernel_iov, stack_kvec);
+          fd_release_iov(iov, stack_iov);
+          return total > 0 ? total : (uint64_t)-14;
+        }
+        int64_t w;
+        if (is_stream_sock) {
+          socket_t *s = socket_from_fd((int)fd);
+          if (!s || s->closing || !s->ops || !s->ops->sendmsg) {
+            if (s) socket_fd_put(s);
+            fd_release_kvec(kernel_iov, stack_kvec);
+            fd_release_iov(iov, stack_iov);
+            return total > 0 ? total : (uint64_t)-32;
+          }
+          struct iovec ciov = {.iov_base = chunk, .iov_len = step};
+          struct msghdr cmsg = {0};
+          cmsg.msg_iov = &ciov;
+          cmsg.msg_iovlen = 1;
+          w = (int64_t)s->ops->sendmsg(s, &cmsg, 0);
+          socket_fd_put(s);
+        } else {
+          w = fd_write((int)fd, chunk, step);
+        }
+        if (w < 0) {
+          fd_release_kvec(kernel_iov, stack_kvec);
+          fd_release_iov(iov, stack_iov);
+          return total > 0 ? total : (uint64_t)w;
+        }
+        total += (size_t)w;
+        if ((size_t)w < step) {
+          fd_release_kvec(kernel_iov, stack_kvec);
+          fd_release_iov(iov, stack_iov);
+          return total;
+        }
+        ubase += step;
+        rem -= step;
+      }
+    }
     fd_release_kvec(kernel_iov, stack_kvec);
     fd_release_iov(iov, stack_iov);
-    return (uint64_t)-12;
+    return total;
   }
   size_t payload_offset = 0;
   for (uint64_t i = 0; i < iovcnt; i++) {
@@ -1774,7 +1895,7 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     kernel_iov[i].iov_base = payload ? payload + payload_offset : NULL;
     if (len && copy_from_user(kernel_iov[i].iov_base,
                               (const void *)iov[i].iov_base, len) != 0) {
-      if (payload) kfree(payload);
+      if (payload && payload != stack_payload) kfree(payload);
       fd_release_kvec(kernel_iov, stack_kvec);
       fd_release_iov(iov, stack_iov);
       return (uint64_t)-14;
@@ -1785,13 +1906,17 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
   /* Remember the last thing written to stderr, as sys_write() does: GLib and
    * most C++ runtimes report a fatal error with writev() just before abort(),
    * and that text is the only explanation a crash report can show. */
-  if (fd == 2 && payload && payload_size) {
+  if ((fd == 1 || fd == 2) && payload && payload_size) {
     struct thread *st = sched_get_current();
     if (st) {
-      size_t keep = payload_size < sizeof(st->last_stderr) - 1
-                        ? payload_size : sizeof(st->last_stderr) - 1;
-      memcpy(st->last_stderr, payload, keep);
-      st->last_stderr[keep] = '\0';
+      if (fd == 2) {
+        size_t keep = payload_size < sizeof(st->last_stderr) - 1
+                          ? payload_size : sizeof(st->last_stderr) - 1;
+        memcpy(st->last_stderr, payload, keep);
+        st->last_stderr[keep] = '\0';
+      }
+      if (st->uname_seen_ms && !st->uname_force && !st->uname_diag_match)
+        uname_policy_on_write(st, (int)fd, (const char *)payload, payload_size);
     }
   }
 
@@ -1801,7 +1926,7 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
   if (sock) {
     if (sock->closing) {
       socket_fd_put(sock);
-      if (payload) kfree(payload);
+      if (payload && payload != stack_payload) kfree(payload);
       fd_release_kvec(kernel_iov, stack_kvec);
       fd_release_iov(iov, stack_iov);
       return (uint64_t)-32;
@@ -1813,7 +1938,7 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
                       ? sock->ops->sendmsg(sock, &msg, 0)
                       : -95;
     socket_fd_put(sock);
-    if (payload) kfree(payload);
+    if (payload && payload != stack_payload) kfree(payload);
     fd_release_kvec(kernel_iov, stack_kvec);
     fd_release_iov(iov, stack_iov);
     return (uint64_t)ret;
@@ -1827,7 +1952,7 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     int32_t written = payload_size > UINT32_MAX ? -22 :
         (int32_t)vfs_write(packet_node, 0, (uint32_t)payload_size, payload);
     vfs_close(packet_node);
-    if (payload) kfree(payload);
+    if (payload && payload != stack_payload) kfree(payload);
     fd_release_kvec(kernel_iov, stack_kvec);
     fd_release_iov(iov, stack_iov);
     return (uint64_t)(int64_t)written;
@@ -1845,7 +1970,7 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
 
     int64_t w = fd_write((int)fd, (const void *)base, (size_t)len);
     if (w < 0) {
-      if (payload) kfree(payload);
+      if (payload && payload != stack_payload) kfree(payload);
       fd_release_kvec(kernel_iov, stack_kvec);
       fd_release_iov(iov, stack_iov);
       return total > 0 ? total : (uint64_t)w;
@@ -1881,7 +2006,7 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       else
         klog_puts("0");
       klog_puts("\n");
-      if (payload) kfree(payload);
+      if (payload && payload != stack_payload) kfree(payload);
       fd_release_kvec(kernel_iov, stack_kvec);
       fd_release_iov(iov, stack_iov);
       return total > 0 ? total : (uint64_t)-28; /* ENOSPC */
@@ -1890,7 +2015,7 @@ static uint64_t sys_writev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
     if ((size_t)w != len)
       break;
   }
-  if (payload) kfree(payload);
+  if (payload && payload != stack_payload) kfree(payload);
   fd_release_kvec(kernel_iov, stack_kvec);
   fd_release_iov(iov, stack_iov);
   return total;
@@ -2054,21 +2179,26 @@ static uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd,
 
   uint32_t offset;
   if (offset_ptr) {
-    if (!vmm_is_user_addr_range_valid(offset_ptr, sizeof(uint64_t)))
+    uint64_t user_offset;
+    if (!vmm_is_user_addr_range_valid(offset_ptr, sizeof(user_offset)) ||
+        copy_from_user(&user_offset, (const void *)offset_ptr,
+                       sizeof(user_offset)))
       return (uint64_t)-14;
-    offset = (uint32_t)(*(uint64_t *)offset_ptr);
+    offset = (uint32_t)user_offset;
   } else {
     offset = fd_offset_get(t, in_fd);
   }
 
-  uint8_t *buffer = kmalloc(4096);
+  uint8_t stack_buf[FD_BOUNCE_STACK_MAX];
+  size_t buf_cap = count > 4096 ? 4096 : (size_t)count;
+  uint8_t *buffer = buf_cap <= sizeof(stack_buf) ? stack_buf : kmalloc(buf_cap);
   if (!buffer)
     return (uint64_t)-12;
 
   uint32_t total_sent = 0;
   while (total_sent < count) {
     uint32_t to_read =
-        (count - total_sent > 4096) ? 4096 : (uint32_t)(count - total_sent);
+        (count - total_sent > buf_cap) ? (uint32_t)buf_cap : (uint32_t)(count - total_sent);
     int32_t bytes_read =
         (int32_t)vfs_read(in_node, offset + total_sent, to_read, buffer);
     if (bytes_read <= 0)
@@ -2083,11 +2213,15 @@ static uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd,
       break;
   }
 
-  kfree(buffer);
-  if (offset_ptr)
-    *(uint64_t *)offset_ptr = (uint64_t)(offset + total_sent);
-  else
+  if (buffer != stack_buf)
+    kfree(buffer);
+  if (offset_ptr) {
+    uint64_t user_offset = (uint64_t)(offset + total_sent);
+    if (copy_to_user((void *)offset_ptr, &user_offset, sizeof(user_offset)))
+      return (uint64_t)-14;
+  } else {
     fd_set_offset(t, in_fd, in_node, offset + total_sent);
+  }
 
   return (uint64_t)total_sent;
 }
@@ -2155,7 +2289,9 @@ static int64_t move_range(struct thread *t, uint64_t fd_in, uint64_t off_in_ptr,
   if (in_off > 0xFFFFFFFFULL || out_off > 0xFFFFFFFFULL)
     return -27; /* EFBIG: the VFS works in 32-bit offsets */
 
-  uint8_t *buf = kmalloc(RANGE_CHUNK);
+  uint8_t stack_buf[FD_BOUNCE_STACK_MAX];
+  size_t buf_cap = len > RANGE_CHUNK ? RANGE_CHUNK : (size_t)len;
+  uint8_t *buf = buf_cap <= sizeof(stack_buf) ? stack_buf : kmalloc(buf_cap);
   if (!buf)
     return -12;
 
@@ -2164,7 +2300,7 @@ static int64_t move_range(struct thread *t, uint64_t fd_in, uint64_t off_in_ptr,
   while ((uint64_t)moved < len) {
     uint64_t remaining = len - (uint64_t)moved;
     uint32_t want =
-        (uint32_t)(remaining > RANGE_CHUNK ? RANGE_CHUNK : remaining);
+        (uint32_t)(remaining > buf_cap ? buf_cap : remaining);
 
     int32_t got = (int32_t)vfs_read(in_node, (uint32_t)in_off, want, buf);
     if (got <= 0) {
@@ -2193,13 +2329,22 @@ static int64_t move_range(struct thread *t, uint64_t fd_in, uint64_t off_in_ptr,
     out_off += (uint64_t)put;
     moved += put;
 
+    /* Linux splice returns as soon as data moved through a pipe end rather
+     * than blocking to fill len. Looping here deadlocks coreutils cat, which
+     * splices FIFO -> its own pipe -> stdout with len = 512 KiB: the second
+     * read of its own pipe waits for a writer that is cat itself (Steam's
+     * srt-logger handshake hung forever on this). */
+    if (in_pipe || out_pipe)
+      break;
+
     if (put < got)
       break; /* short write: full pipe, non-blocking sink, or device limit */
     if (in_off > 0xFFFFFFFFULL || out_off > 0xFFFFFFFFULL)
       break;
   }
 
-  kfree(buf);
+  if (buf != stack_buf)
+    kfree(buf);
 
   if (moved < 0)
     return moved;
@@ -2254,6 +2399,8 @@ static uint64_t sys_splice(uint64_t fd_in, uint64_t off_in, uint64_t fd_out,
    * copy_file_range(2), and Linux rejects it here with EINVAL. */
   if (!fd_is_pipe(t->fds[fd_in]) && !fd_is_pipe(t->fds[fd_out]))
     return (uint64_t)-22;
+  if (pipe_is_packet(t->fds[fd_in]) || pipe_is_packet(t->fds[fd_out]))
+    return (uint64_t)-95; // The stream copy path would discard partial packets.
 
   if (flags & ~(uint64_t)(SPLICE_F_MOVE | SPLICE_F_NONBLOCK | SPLICE_F_MORE |
                           SPLICE_F_GIFT))
@@ -2291,7 +2438,7 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     if (whence == 1)
       base = fd_offset_get_locked(t, fd);
     else if (whence == 2)
-      base = node->length;
+      base = vfs_backing_node(node)->length;
     else if (whence != 0)
       return (uint64_t)-22;
     /* Unsigned addition avoids signed overflow for hostile offsets. */
@@ -2318,7 +2465,7 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
   if (whence == 1)
     base = fd_offset_get_locked(t, fd);
   else if (whence == 2)
-    base = node->length;
+    base = vfs_backing_node(node)->length;
   else if (whence != 0) {
     result = -22;
     goto out;
@@ -2370,9 +2517,13 @@ static uint64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a3,
   (void)a3;
   (void)a4;
   (void)a5;
+  /* The Linux ABI declares fd and cmd as unsigned int. Callers need only
+   * provide their low 32 bits. The third argument can hold a full pointer. */
+  fd = (uint32_t)fd;
+  cmd = (uint32_t)cmd;
   struct thread *t = sched_get_current();
-  if ((uint32_t)cmd == F_DUPFD_QUERY)
-    return (uint64_t)fd_query_description(t, (uint32_t)fd, (int)arg);
+  if (cmd == F_DUPFD_QUERY)
+    return (uint64_t)fd_query_description(t, fd, (int)arg);
   if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC)
     return (uint64_t)fd_duplicate(t, fd, (uint64_t)(int64_t)(int)arg,
                                    false, cmd == F_DUPFD_CLOEXEC);
@@ -2396,6 +2547,8 @@ static uint64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a3,
   case F_GETFL: {
     uint64_t fl = t->fd_flags[fd] & (O_ACCMODE | O_APPEND | O_NONBLOCK);
     vfs_node_t *node = t->fds[fd];
+    if (pipe_is_packet(node))
+      fl |= t->fd_flags[fd] & O_DIRECT;
     if (node && (node->flags & FS_TYPE_MASK) == FS_SOCKET) {
       fl = (fl & ~O_ACCMODE) | O_RDWR;
       socket_t *sock = (socket_t *)node->device;
@@ -2980,9 +3133,15 @@ static bool sys_mount_block_try(struct block_device *dev, vfs_node_t *mountpoint
 /* The runtime-dir service supplies uid, gid and mode in the legacy mount
  * data. Set them before publishing the filesystem so the user manager can
  * open its bus socket as soon as the mount syscall succeeds. */
-static int mount_tmpfs_at(vfs_node_t *point, const char *target,
-                          uint64_t data_ptr) {
-    uint32_t mode = 0777, uid = 0, gid = 0;
+/* Parse tmpfs mode=/uid=/gid= options. Defaults follow Linux: a sticky,
+ * world-writable root owned by the mounting task's fs credentials. bwrap
+ * (Steam, Flatpak) mounts an option-less tmpfs as an unprivileged user and
+ * then mkdir()s its new root inside it. */
+static int tmpfs_parse_root_options(uint64_t data_ptr, uint32_t *mode_out,
+                                    uint32_t *uid_out, uint32_t *gid_out) {
+    struct thread *cur = sched_get_current();
+    uint32_t mode = 01777;
+    uint32_t uid = cur ? cur->fsuid : 0, gid = cur ? cur->fsgid : 0;
     if (data_ptr) {
         char options[512];
         long n = strncpy_from_user(options, (const void *)data_ptr, sizeof(options));
@@ -3020,6 +3179,15 @@ static int mount_tmpfs_at(vfs_node_t *point, const char *target,
             option = *end ? end + 1 : end;
         }
     }
+    *mode_out = mode; *uid_out = uid; *gid_out = gid;
+    return 0;
+}
+
+static int mount_tmpfs_at(vfs_node_t *point, const char *target,
+                          uint64_t data_ptr) {
+    uint32_t mode, uid, gid;
+    int parsed = tmpfs_parse_root_options(data_ptr, &mode, &uid, &gid);
+    if (parsed) return parsed;
     if ((point->flags & FS_TYPE_MASK) != FS_DIRECTORY) return -20;
     vfs_node_t *root = tmpfs_create_private_root();
     if (!root) return -12;
@@ -3113,11 +3281,15 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
                 vfs_close(src);
             }
         } else if (fstype && (!strcmp(fstype, "tmpfs") || !strcmp(fstype, "ramfs"))) {
+            uint32_t mode, uid, gid;
             if ((point->flags & FS_TYPE_MASK) != FS_DIRECTORY) result = -20;
-            else {
+            else if ((result = tmpfs_parse_root_options(data_ptr, &mode, &uid, &gid)) == 0) {
                 vfs_node_t *root = tmpfs_create_private_root();
                 if (!root) result = -12;
                 else {
+                    root->mask = mode & 07777;
+                    root->uid = uid;
+                    root->gid = gid;
                     result = vfs_namespace_mount(point, root, source, fstype, target, flags);
                     vfs_close(root);
                 }

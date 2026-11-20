@@ -153,8 +153,8 @@ static struct net_deferred_work *pop_work_locked(void) {
 
 static bool packet_current(const struct net_packet *packet) {
   struct net_device *dev = packet->device;
-  return dev && __atomic_load_n(&dev->registered, __ATOMIC_ACQUIRE) &&
-         packet->generation == __atomic_load_n(&dev->generation, __ATOMIC_ACQUIRE);
+  return !dev || (__atomic_load_n(&dev->registered, __ATOMIC_ACQUIRE) &&
+         packet->generation == __atomic_load_n(&dev->generation, __ATOMIC_ACQUIRE));
 }
 
 static void net_worker(void) {
@@ -193,7 +193,7 @@ static void net_worker(void) {
         if (!packet_current(&batch[i]->packet))
           continue;
         spinlock_acquire(&lock);
-        net_rx_tap_t tap = rx_tap;
+        net_rx_tap_t tap = batch[i]->packet.device ? rx_tap : NULL;
         void *tap_context = rx_tap_context;
         if (tap)
           __atomic_add_fetch(&rx_tap_active, 1, __ATOMIC_RELAXED);
@@ -378,6 +378,24 @@ size_t net_rx_submit_batch_irq(struct net_device *dev,
 bool net_rx_submit_irq(struct net_device *dev, const void *frame, size_t len) {
   const struct net_rx_frame packet = {.data = frame, .length = len};
   return net_rx_submit_batch_irq(dev, &packet, 1) == 1;
+}
+
+bool net_rx_submit_loopback(const void *data, size_t len) {
+  if (!ready || !data || !len || len > NET_FRAME_MAX)
+    return false;
+  spinlock_acquire(&lock);
+  struct rx_buffer *p = alloc_locked();
+  spinlock_release(&lock);
+  if (!p)
+    return false;
+  p->packet.device = NULL;
+  p->packet.length = (uint16_t)len;
+  memcpy(p->packet.data, data, len);
+  spinlock_acquire(&lock);
+  push_locked(p);
+  spinlock_release(&lock);
+  wait_queue_wake_one(&worker_wait);
+  return true;
 }
 
 int net_device_register(struct net_device *dev) {

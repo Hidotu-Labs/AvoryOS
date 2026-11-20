@@ -1323,6 +1323,9 @@ int ext2_free_block(ext2_mount_t *mnt, uint64_t block_num) {
 
   ext3_journal_block(mnt, bitmap_block, bitmap);
   kfree(bitmap);
+  /* Its staged metadata image (extent/index/directory/indirect block) must
+   * not outlive the free: the block may be file data from the next alloc. */
+  ext3_journal_forget(mnt, block_num);
 
   ext2_bc_entry_t *stale = NULL;
   spinlock_acquire(&mnt->cache_lock);

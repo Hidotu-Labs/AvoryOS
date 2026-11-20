@@ -146,7 +146,7 @@ void vmm_free_user_pages_vma(uint64_t cr3, struct vma_list *vmas) {
           struct vma *v = vma_find(vmas, va);
           if (v && (v->flags & MAP_SHARED)) {
             vfs_node_t *file = (vfs_node_t *)v->file_node;
-            if (!(file && file->mmap_shared_pmm_refs)) {
+            if (v->linux_vma || !(file && file->mmap_shared_pmm_refs)) {
               pd_virt[k] = 0;
               continue; // shared device page — do NOT free
             }
@@ -199,7 +199,7 @@ void vmm_free_user_pages_vma(uint64_t cr3, struct vma_list *vmas) {
 
           if (v && (v->flags & MAP_SHARED)) {
             vfs_node_t *file = (vfs_node_t *)v->file_node;
-            if (!(file && file->mmap_shared_pmm_refs)) {
+            if (v->linux_vma || !(file && file->mmap_shared_pmm_refs)) {
               /* Device-backed shared mappings (GEM/framebuffer) do not take a
                * per-PTE PMM reference; their backing object owns the frame. */
               continue;

@@ -128,9 +128,16 @@ struct udp_socket *udp_socket_alloc(void) {
     memset(s, 0, sizeof(*s));
     spinlock_init(&s->lock);
 
-    s->rx_capacity = UDP_DEFAULT_RCVBUF;
     s->rx_depth = UDP_DEFAULT_RX_DEPTH;
-    s->rx_data = kmalloc(s->rx_capacity);
+    /* Contiguous 16-page run: degrade under fragmentation instead of failing
+     * socket() with ENOMEM (see tcp_buf_alloc). */
+    for (uint32_t sz = UDP_DEFAULT_RCVBUF; sz >= UDP_MIN_RCVBUF; sz >>= 1) {
+        s->rx_data = kmalloc(sz);
+        if (s->rx_data) {
+            s->rx_capacity = sz;
+            break;
+        }
+    }
     s->rx_desc = kmalloc(sizeof(struct udp_rxdesc) * s->rx_depth);
     if (!s->rx_data || !s->rx_desc) {
         kfree(s->rx_data);

@@ -341,71 +341,332 @@ static uint64_t sys_setdomainname(uint64_t name_ptr, uint64_t len, uint64_t a2,
 }
 
 
-/* Adaptive sysname: programs see "Ascension" by default. If one that saw it
- * exits with a plain error shortly afterwards (e.g. the JVM/LWJGL rejecting an
- * unknown os.name), its executable is remembered and later launches see
- * "Linux". State lives in memory only. */
-#define UNAME_POLICY_MAX 64
-#define UNAME_POLICY_WINDOW_MS 15000
+/* Adaptive sysname: programs see "Ascension" by default. When a program
+ * exits with a plain error soon after it - or a process it started - saw
+ * "Ascension" (Steam's steam.sh runs `uname` and refuses anything but
+ * "Linux"; the JVM/LWJGL rejects an unknown os.name), that program is
+ * remembered and later launches see "Linux".
+ *
+ * Programs are identified by uname_key: the script for interpreted programs
+ * (kept across `#!/usr/bin/env bash`), otherwise the executable. A verdict
+ * learned for a script also covers everything that script starts, so its
+ * `uname` child answers "Linux"; a verdict for a plain binary covers only that
+ * binary, so a flipped shell does not turn the whole desktop to "Linux".
+ *
+ * The confirmed list is exported at /proc/sys/kernel/uname_linux so userspace
+ * can save it across reboots and load it back at boot. */
+#define UNAME_POLICY_MAX 128
+#define UNAME_DIAG_WINDOW_MS 30000
+#define UNAME_SILENT_WINDOW_MS 500
+
+enum uname_policy_state {
+  UNAME_STATE_FREE = 0,
+  UNAME_STATE_TRIAL,     /* Provisional "Linux" on next launch to verify */
+  UNAME_STATE_CONFIRMED, /* Verified: failed on Ascension, succeeded on Linux */
+  UNAME_STATE_REJECTED,  /* Failed even on Linux; do not retry "Linux" */
+};
+
 static struct {
   char path[256];
-  bool force_linux;
-  uint64_t seen_ms;
+  enum uname_policy_state state;
 } uname_policy[UNAME_POLICY_MAX];
 static spinlock_t uname_policy_lock = SPINLOCK_INIT;
+static int uname_policy_reject_cursor = 0;
 
-const char *uname_policy_sysname(struct thread *t) {
-  if (!t || !t->exe_path[0])
-    return "Ascension";
-  const char *res = "Ascension";
-  uint64_t now = lapic_timer_get_ms();
-  int free_slot = -1;
-  spinlock_acquire(&uname_policy_lock);
-  for (int i = 0; i < UNAME_POLICY_MAX; i++) {
-    if (!uname_policy[i].path[0]) {
-      if (free_slot < 0)
-        free_slot = i;
-      continue;
-    }
-    if (strcmp(uname_policy[i].path, t->exe_path) == 0) {
-      if (uname_policy[i].force_linux)
-        res = "Linux";
-      else
-        uname_policy[i].seen_ms = now;
-      spinlock_release(&uname_policy_lock);
-      return res;
-    }
-  }
-  if (free_slot >= 0) {
-    strncpy(uname_policy[free_slot].path, t->exe_path,
-            sizeof(uname_policy[free_slot].path) - 1);
-    uname_policy[free_slot].force_linux = false;
-    uname_policy[free_slot].seen_ms = now;
-  }
-  spinlock_release(&uname_policy_lock);
-  return res;
+/* uname_policy_lock held. */
+static int uname_policy_find_locked(const char *path) {
+  for (int i = 0; i < UNAME_POLICY_MAX; i++)
+    if (uname_policy[i].state != UNAME_STATE_FREE &&
+        uname_policy[i].path[0] &&
+        strcmp(uname_policy[i].path, path) == 0)
+      return i;
+  return -1;
 }
 
-/* Called from process_do_exit(). Plain error exits (not 0, not 128+signal) soon after
- * uname() flip the executable to "Linux"; signal deaths do not. */
-void uname_policy_on_exit(struct thread *t, uint64_t status) {
-  if (!t || !t->exe_path[0] || status == 0 || (status > 128 && status <= 128 + 64))
-    return;
-  uint64_t now = lapic_timer_get_ms();
+static enum uname_policy_state uname_policy_get_state(const char *path) {
+  if (!path || !path[0]) return UNAME_STATE_FREE;
   spinlock_acquire(&uname_policy_lock);
-  for (int i = 0; i < UNAME_POLICY_MAX; i++) {
-    if (uname_policy[i].path[0] && !uname_policy[i].force_linux &&
-        strcmp(uname_policy[i].path, t->exe_path) == 0) {
-      if (now - uname_policy[i].seen_ms <= UNAME_POLICY_WINDOW_MS) {
-        uname_policy[i].force_linux = true;
-        klog_puts("[UNAME] ");
-        klog_puts(t->exe_path);
-        klog_puts(" failed after seeing Ascension; will report Linux\n");
-      }
-      break;
+  int i = uname_policy_find_locked(path);
+  enum uname_policy_state st = (i >= 0) ? uname_policy[i].state : UNAME_STATE_FREE;
+  spinlock_release(&uname_policy_lock);
+  return st;
+}
+
+/* uname_policy_lock held. Allocates a slot (evicting REJECTED if full). */
+static int uname_policy_alloc_locked(const char *path) {
+  int i = uname_policy_find_locked(path);
+  if (i >= 0) return i;
+  for (int j = 0; j < UNAME_POLICY_MAX; j++) {
+    if (uname_policy[j].state == UNAME_STATE_FREE)
+      return j;
+  }
+  for (int n = 0; n < UNAME_POLICY_MAX; n++) {
+    int idx = (uname_policy_reject_cursor + n) % UNAME_POLICY_MAX;
+    if (uname_policy[idx].state == UNAME_STATE_REJECTED) {
+      uname_policy_reject_cursor = (idx + 1) % UNAME_POLICY_MAX;
+      return idx;
+    }
+  }
+  return -1;
+}
+
+/* Returns true when newly added or promoted to CONFIRMED. */
+bool uname_policy_add(const char *path) {
+  if (!path || path[0] != '/') return false;
+  bool changed = false;
+  spinlock_acquire(&uname_policy_lock);
+  int i = uname_policy_alloc_locked(path);
+  if (i >= 0) {
+    if (uname_policy[i].state != UNAME_STATE_CONFIRMED ||
+        strcmp(uname_policy[i].path, path) != 0) {
+      strncpy(uname_policy[i].path, path, sizeof(uname_policy[i].path) - 1);
+      uname_policy[i].path[sizeof(uname_policy[i].path) - 1] = 0;
+      uname_policy[i].state = UNAME_STATE_CONFIRMED;
+      changed = true;
     }
   }
   spinlock_release(&uname_policy_lock);
+  return changed;
+}
+
+static bool uname_policy_set_state(const char *path,
+                                   enum uname_policy_state expected,
+                                   enum uname_policy_state next) {
+  if (!path || path[0] != '/') return false;
+  bool changed = false;
+  spinlock_acquire(&uname_policy_lock);
+  int i = uname_policy_find_locked(path);
+  if (expected == UNAME_STATE_FREE) {
+    if (i < 0) {
+      i = uname_policy_alloc_locked(path);
+      if (i >= 0) {
+        strncpy(uname_policy[i].path, path, sizeof(uname_policy[i].path) - 1);
+        uname_policy[i].path[sizeof(uname_policy[i].path) - 1] = 0;
+        uname_policy[i].state = next;
+        changed = true;
+      }
+    }
+  } else if (i >= 0 && uname_policy[i].state == expected) {
+    uname_policy[i].state = next;
+    changed = true;
+  }
+  spinlock_release(&uname_policy_lock);
+  return changed;
+}
+
+void uname_policy_remove(const char *path) {
+  spinlock_acquire(&uname_policy_lock);
+  int i = uname_policy_find_locked(path);
+  if (i >= 0) {
+    uname_policy[i].path[0] = 0;
+    uname_policy[i].state = UNAME_STATE_FREE;
+  }
+  spinlock_release(&uname_policy_lock);
+}
+
+/* Write confirmed paths, one per line, into buf; returns bytes used. */
+uint32_t uname_policy_dump(char *buf, uint32_t cap) {
+  uint32_t n = 0;
+  spinlock_acquire(&uname_policy_lock);
+  for (int i = 0; i < UNAME_POLICY_MAX; i++) {
+    if (uname_policy[i].state != UNAME_STATE_CONFIRMED) continue;
+    size_t len = strlen(uname_policy[i].path);
+    if (!len || n + len + 1 > cap) continue;
+    memcpy(buf + n, uname_policy[i].path, len);
+    n += (uint32_t)len;
+    buf[n++] = '\n';
+  }
+  spinlock_release(&uname_policy_lock);
+  return n;
+}
+
+void uname_policy_on_fork(struct thread *child, const struct thread *parent) {
+  if (!child || !parent) return;
+  memcpy(child->uname_key, parent->uname_key, sizeof(child->uname_key));
+  child->uname_key_script = parent->uname_key_script;
+  child->uname_force = parent->uname_force;
+  child->uname_force_children = parent->uname_force_children;
+  child->uname_trial = (child->tgid == parent->tgid) ? parent->uname_trial : false;
+  child->uname_seen_ms = 0;
+  child->uname_diag_match = false;
+  child->uname_ascension_calls = 0;
+  child->uname_post_writes = 0;
+}
+
+/* After a successful exec: decide what this image sees. */
+void uname_policy_on_exec(struct thread *t) {
+  if (!t) return;
+  bool inherited = t->uname_force_children; // from the parent or pre-exec image
+  enum uname_policy_state st = uname_policy_get_state(t->uname_key);
+  bool own = (st == UNAME_STATE_CONFIRMED || st == UNAME_STATE_TRIAL);
+  t->uname_force = inherited || own;
+  t->uname_force_children = inherited || (own && t->uname_key_script);
+  t->uname_trial = !inherited && (st == UNAME_STATE_TRIAL);
+  t->uname_seen_ms = 0;
+  t->uname_diag_match = false;
+  t->uname_ascension_calls = 0;
+  t->uname_post_writes = 0;
+}
+
+const char *uname_policy_sysname(struct thread *t) {
+  if (!t) return "Ascension";
+  if (t->uname_force) return "Linux";
+  /* Remember who saw "Ascension": this process and its ancestors (a script
+   * that runs `uname` sees the answer through its child). */
+  extern spinlock_t tid_lock;
+  uint64_t now = lapic_timer_get_ms();
+  spinlock_acquire(&tid_lock);
+  struct thread *p = t;
+  for (int depth = 0; p && depth < 8; depth++, p = p->parent) {
+    p->uname_seen_ms = now;
+    if (p->uname_ascension_calls < 0xFFFF)
+      p->uname_ascension_calls++;
+  }
+  spinlock_release(&tid_lock);
+  return "Ascension";
+}
+
+static char uname_ascii_lower(char c) {
+  return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+}
+
+static bool uname_contains_ci(const char *hay, size_t hay_len, const char *needle) {
+  size_t nlen = strlen(needle);
+  if (!nlen || hay_len < nlen) return false;
+  for (size_t i = 0; i <= hay_len - nlen; i++) {
+    size_t j = 0;
+    while (j < nlen && uname_ascii_lower(hay[i + j]) == needle[j])
+      j++;
+    if (j == nlen) return true;
+  }
+  return false;
+}
+
+static bool uname_diag_is_match(const char *buf, size_t len, int fd, const char *comm) {
+  if (!buf || !len) return false;
+  if (comm && strcmp(comm, "uname") == 0) return false;
+  size_t n = len < 512 ? len : 512;
+
+  static const char *const strong_phrases[] = {
+      "unsupported os",
+      "unsupported operating system",
+      "unsupported platform",
+      "unsupported system",
+      "unsupported kernel",
+      "unknown os",
+      "unknown operating system",
+      "unknown platform",
+      "unknown system",
+      "unrecognized os",
+      "unrecognized operating system",
+      "unrecognized system",
+      "requires linux",
+      "only supported on linux",
+      "linux only",
+      "expected linux",
+      "incompatible os",
+      "invalid os",
+      "not supported on",
+      "cannot run on",
+  };
+  for (size_t i = 0; i < sizeof(strong_phrases) / sizeof(strong_phrases[0]); i++) {
+    if (uname_contains_ci(buf, n, strong_phrases[i]))
+      return true;
+  }
+
+  /* "Ascension" in an error/OS context (skip bare "Ascension\n" on stdout). */
+  if ((fd == 2 || n > 12) && uname_contains_ci(buf, n, "ascension")) {
+    static const char *const ctx_words[] = {
+        "error", "unsupport", "unknown", "invalid", "fail",
+        "not ", "cannot", "can't", "only", "linux",
+        "os", "system", "platform", "kernel", "uname",
+    };
+    for (size_t i = 0; i < sizeof(ctx_words) / sizeof(ctx_words[0]); i++) {
+      if (uname_contains_ci(buf, n, ctx_words[i]))
+        return true;
+    }
+  }
+  return false;
+}
+
+void uname_policy_on_write(struct thread *t, int fd, const char *buf, size_t len) {
+  if (!t || !t->uname_seen_ms || t->uname_force || t->uname_diag_match)
+    return;
+  if (fd != 1 && fd != 2)
+    return;
+  if (uname_diag_is_match(buf, len, fd, t->comm)) {
+    extern spinlock_t tid_lock;
+    spinlock_acquire(&tid_lock);
+    struct thread *p = t;
+    for (int depth = 0; p && depth < 8; depth++, p = p->parent)
+      p->uname_diag_match = true;
+    spinlock_release(&tid_lock);
+  } else if (fd == 2 && len > 0) {
+    t->uname_post_writes++;
+  }
+}
+
+static bool uname_is_external_signal(uint8_t sig) {
+  return sig == SIGHUP || sig == SIGINT || sig == SIGQUIT ||
+         sig == SIGKILL || sig == SIGPIPE || sig == SIGTERM;
+}
+
+/* Called from process_do_exit() for both normal exits and signal deaths. */
+void uname_policy_on_exit(struct thread *t, uint64_t status) {
+  if (!t || !t->uname_key[0])
+    return;
+
+  uint8_t sig = t->termination_signal;
+  if (!sig && status > 128 && status <= 128 + 64)
+    sig = (uint8_t)(status - 128);
+
+  bool external_stop = (sig != 0) && uname_is_external_signal(sig);
+  bool failed = (status != 0 || sig != 0) && !external_stop;
+
+  /* Verify provisional "Linux" trial verdicts. */
+  if (t->uname_trial) {
+    /* A worker thread exiting cleanly should not confirm the whole process. */
+    if (!failed && t->tid != t->tgid)
+      return;
+    if (!failed) {
+      if (uname_policy_set_state(t->uname_key, UNAME_STATE_TRIAL,
+                                 UNAME_STATE_CONFIRMED)) {
+        klog_puts("[UNAME] ");
+        klog_puts(t->uname_key);
+        klog_puts(" succeeded with Linux; confirmed\n");
+      }
+    } else {
+      if (uname_policy_set_state(t->uname_key, UNAME_STATE_TRIAL,
+                                 UNAME_STATE_REJECTED)) {
+        klog_puts("[UNAME] ");
+        klog_puts(t->uname_key);
+        klog_puts(" still failed with Linux; reverting to Ascension\n");
+      }
+    }
+    return;
+  }
+
+  /* Detection on "Ascension" processes. */
+  if (t->uname_force || !t->uname_seen_ms || !failed)
+    return;
+
+  uint64_t elapsed = lapic_timer_get_ms() - t->uname_seen_ms;
+  bool causal_diag = t->uname_diag_match && (elapsed <= UNAME_DIAG_WINDOW_MS);
+  bool causal_silent = !t->uname_diag_match &&
+                       t->uname_post_writes == 0 &&
+                       (elapsed <= UNAME_SILENT_WINDOW_MS) &&
+                       (t->uname_ascension_calls >= 2 || sig == SIGABRT ||
+                        t->last_error_code == 0);
+  if (!causal_diag && !causal_silent)
+    return;
+
+  if (uname_policy_set_state(t->uname_key, UNAME_STATE_FREE, UNAME_STATE_TRIAL)) {
+    klog_puts("[UNAME] ");
+    klog_puts(t->uname_key);
+    klog_puts(causal_diag ? " failed with OS/uname diagnostic after Ascension; "
+                          : " aborted/exited immediately after Ascension; ");
+    klog_puts("will trial Linux on next launch\n");
+  }
 }
 
 static uint64_t sys_uname(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
@@ -500,8 +761,8 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     return (uint64_t)-22;
   case 2: // PR_GET_PDEATHSIG
     if (arg2 && vmm_is_user_addr_range_writable(arg2, sizeof(int))) {
-      *(int *)arg2 = current->pdeath_signal;
-      return 0;
+      int sig = current->pdeath_signal;
+      return copy_to_user((void *)arg2, &sig, sizeof(sig)) ? (uint64_t)-14 : 0;
     }
     return (uint64_t)-14;
   case 3: // PR_GET_DUMPABLE
@@ -576,8 +837,8 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     return 0;
   case 37: // PR_GET_CHILD_SUBREAPER
     if (arg2 && vmm_is_user_addr_range_writable(arg2, sizeof(int))) {
-      *(int *)arg2 = 0;
-      return 0;
+      int subreaper = 0;
+      return copy_to_user((void *)arg2, &subreaper, sizeof(subreaper)) ? (uint64_t)-14 : 0;
     }
     return (uint64_t)-14;
   case 38: // PR_SET_NO_NEW_PRIVS
@@ -613,7 +874,8 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     return 0;
   case 0x53564d41: // PR_SET_VMA
     return 0;
-  case 0x41555856: { // PR_GET_AUXV (Linux 6.4+)    if (!arg2 || !arg3)
+  case 0x41555856: { // PR_GET_AUXV (Linux 6.4+)
+    if (!arg2 || !arg3)
       return (uint64_t)-14; // EFAULT
     if (!current->mm)
       return 0;
@@ -635,7 +897,8 @@ static uint64_t sys_prctl(uint64_t option, uint64_t arg2, uint64_t arg3,
     size_t to_copy = (arg3 < aux_bytes) ? (size_t)arg3 : aux_bytes;
     if (!vmm_is_user_addr_range_writable(arg2, to_copy))
       return (uint64_t)-14; // EFAULT
-    memcpy((void *)arg2, src, to_copy);
+    if (copy_to_user((void *)arg2, src, to_copy))
+      return (uint64_t)-14; // EFAULT
     return (uint64_t)to_copy;
   }
   case 0x50544344: { // TEMPORARY "PTCD": dump TSC probe stats (syscall profiler)
@@ -1775,9 +2038,10 @@ static uint64_t sys_sched_rr_get_interval(uint64_t pid, uint64_t tp_ptr,
     return (uint64_t)-14; // EFAULT
 
   // struct timespec { tv_sec, tv_nsec }: 100 ms quantum.
-  ((uint64_t *)tp_ptr)[0] = 0;
-  ((uint64_t *)tp_ptr)[1] = 100000000ULL;
-  return 0;
+  const uint64_t interval[2] = {0, 100000000ULL};
+  return copy_to_user((void *)tp_ptr, interval, sizeof(interval))
+             ? (uint64_t)-14
+             : 0;
 }
 
 // sys_times (syscall 100)
@@ -1799,15 +2063,18 @@ static uint64_t sys_times(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
   if (buf_ptr) {
     if (!vmm_is_user_addr_range_writable(buf_ptr, 4 * sizeof(long)))
       return (uint64_t)-14; // EFAULT
-    long *tms = (long *)buf_ptr;
     uint64_t user_ms, system_ms;
     if (!sched_get_cpu_usage_ms(t->tgid ? t->tgid : t->tid, true,
                                 &user_ms, &system_ms))
       return (uint64_t)-22;
-    tms[0] = (long)(user_ms / 10);
-    tms[1] = (long)(system_ms / 10);
-    tms[2] = 0;                             // cutime: children not accumulated
-    tms[3] = 0;                             // cstime: children not accumulated
+    long tms[4] = {
+        (long)(user_ms / 10),
+        (long)(system_ms / 10),
+        0, // cutime: children not accumulated
+        0, // cstime: children not accumulated
+    };
+    if (copy_to_user((void *)buf_ptr, tms, sizeof(tms)))
+      return (uint64_t)-14;
   }
 
   return lapic_timer_get_ticks() / 10; // boot-relative ticks at 100 Hz
@@ -2124,7 +2391,7 @@ static uint64_t sys_unshare(uint64_t flags, uint64_t a2, uint64_t a3,
                    CLONE_NEWNET | CLONE_NEWTIME | CLONE_SYSVSEM |
                    CLONE_FILES | CLONE_FS;
   if (flags & ~known) return (uint64_t)-22;
-  if (flags & (CLONE_FILES | CLONE_FS | CLONE_SYSVSEM)) return (uint64_t)-95;
+  if (flags & (CLONE_FS | CLONE_SYSVSEM)) return (uint64_t)-95;
   /* CLONE_NEWCGROUP is accepted without creating an object: cgroupfs is not
    * virtualised here, so the view is the same as the host's. bwrap requests it
    * with its pid-namespace clone and cannot continue if it is refused. */
@@ -2154,6 +2421,7 @@ static uint64_t sys_unshare(uint64_t flags, uint64_t a2, uint64_t a3,
   if (flags & CLONE_NEWIPC) { ipc = ipc_namespace_create(); if (!ipc) return (uint64_t)-12; }
   if (flags & CLONE_NEWNS) { mount = vfs_namespace_prepare(current); if (!mount) return (uint64_t)-12; }
   if (flags & CLONE_NEWPID) { pid = pid_namespace_create(current); if (!pid) return (uint64_t)-12; }
+  if ((flags & CLONE_FILES) && !sched_unshare_files(current)) return (uint64_t)-12;
   if (user) {
     user_namespace_install(current, user);
     user = NULL;

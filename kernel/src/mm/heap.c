@@ -3,6 +3,7 @@
 #include "console/klog.h"
 #include "lib/string.h"
 #include "mm/pmm.h"
+#include "sched/sched.h"
 
 bool heap_initialized = false;
 
@@ -16,13 +17,19 @@ void *kmalloc(size_t size) {
   if (size == 0)
     return NULL;
 
+  void *ptr = NULL;
   if (size <= 1024) {
-    void *ptr = heap_slab_alloc_at(size, __builtin_return_address(0));
-    if (ptr)
-      return ptr;
+    ptr = heap_slab_alloc_at(size, __builtin_return_address(0));
   }
-
-  return heap_big_alloc(size);
+  if (!ptr) {
+    ptr = heap_big_alloc(size);
+  }
+  if (ptr) {
+    struct thread *cur = sched_get_current();
+    if (cur)
+      cur->kheap_alloc_bytes += size;
+  }
+  return ptr;
 }
 
 void kfree(void *ptr) {

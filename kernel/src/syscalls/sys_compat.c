@@ -87,7 +87,8 @@ static int compat_syscall_number(uint32_t number) {
   case 4: return SYS_WRITE;
   case 5: return SYS_OPEN;
   case 6: return SYS_CLOSE;
-  case 7: return SYS_WAIT4;
+  case 7:
+  case 114: return SYS_WAIT4;
   case 9: return SYS_LINK;
   case 10: return SYS_UNLINK;
   case 11: return SYS_EXECVE;
@@ -118,6 +119,7 @@ static int compat_syscall_number(uint32_t number) {
   case 91: return SYS_MUNMAP;
   case 93: return SYS_FTRUNCATE;
   case 94: return SYS_FCHMOD;
+  case 96: return SYS_GETPRIORITY; /* Unity/mono thread priority probes */
   case 97: return SYS_SETPRIORITY;
   case 172: return SYS_PRCTL;
   case 308: return SYS_PSELECT6;
@@ -164,8 +166,11 @@ static int compat_syscall_number(uint32_t number) {
   case 202: return SYS_GETEGID;
   case 213: return SYS_SETUID;
   case 214: return SYS_SETGID;
+  case 218: return SYS_MINCORE; /* addr, len, u8 vec: same layout on i386 */
   case 219: return SYS_MADVISE;
   case 220: return SYS_GETDENTS64;
+  case 141: return SYS_GETDENTS;  /* 32-bit records built natively */
+  case 284: return SYS_WAITID;    /* i386 siginfo packed natively */
   case 224: return SYS_GETTID;
   case 240: return SYS_FUTEX;
   case 252: return SYS_EXIT_GROUP;
@@ -181,6 +186,7 @@ static int compat_syscall_number(uint32_t number) {
   case 306: return SYS_FCHMODAT;
   case 307: return SYS_FACCESSAT;
   case 311: return SYS_SET_ROBUST_LIST;
+  case 312: return SYS_GET_ROBUST_LIST;
   case 330: return SYS_DUP3;
   case 331: return SYS_PIPE2;
   case 355: return SYS_GETRANDOM;
@@ -195,6 +201,8 @@ static int compat_syscall_number(uint32_t number) {
   case 367: return SYS_GETSOCKNAME;
   case 368: return SYS_GETPEERNAME;
   case 369: return SYS_SENDTO;
+  case 337: case 417: return SYS_RECVMMSG; /* timeout unused natively */
+  case 345: return SYS_SENDMMSG;
   case 370: return SYS_SENDMSG;
   case 372: return SYS_RECVMSG;
   case 371: return SYS_RECVFROM;
@@ -258,6 +266,7 @@ static int compat_syscall_number(uint32_t number) {
   case 310: return SYS_UNSHARE; /* unshare */
   case 315: return SYS_TEE; /* tee */
   case 318: return SYS_GETCPU; /* getcpu */
+  case 324: return SYS_FALLOCATE; /* fallocate */
   case 328: return SYS_EVENTFD2; /* eventfd2 */
   case 329: return SYS_EPOLL_CREATE1; /* epoll_create1 */
   case 332: return SYS_INOTIFY_INIT1; /* inotify_init1 */
@@ -272,6 +281,7 @@ static int compat_syscall_number(uint32_t number) {
   case 444: return SYS_LANDLOCK_CREATE_RULESET; /* landlock_create_ruleset */
   case 446: return SYS_LANDLOCK_RESTRICT_SELF; /* landlock_restrict_self */
   case 452: return SYS_FCHMODAT2; /* fchmodat2 */
+  case 320: return SYS_UTIMENSAT; /* timespec32 converted natively */
   default: return -1;
   }
 }
@@ -286,6 +296,7 @@ static int compat_prepare(struct registers *r, struct syscall_regs *s) {
     case 1: native=SYS_SEMOP; break;
     case 2: native=SYS_SEMGET; break;
     case 3: native=SYS_SEMCTL; break;
+    case 4: native=SYS_SEMTIMEDOP; break;
     case 21: native=SYS_SHMAT; break;
     case 22: native=SYS_SHMDT; break;
     case 23: native=SYS_SHMGET; break;
@@ -306,6 +317,11 @@ static int compat_prepare(struct registers *r, struct syscall_regs *s) {
     uint32_t command = (uint32_t)r->rbx & 0xffff;
     s->rdi=(uint32_t)r->rcx; s->rsi=(uint32_t)r->rdx; s->rdx=(uint32_t)r->rsi;
     if (command == 1) { s->rsi=(uint32_t)r->rdi; s->rdx=(uint32_t)r->rdx; }
+    /* ipc(SEMTIMEDOP, semid, nsops, 0, sops, timeout): the native op only
+     * tests timeout for NULL, so the timespec32 layout is never read. */
+    if (command == 4) {
+      s->rsi=(uint32_t)r->rdi; s->rdx=(uint32_t)r->rdx; s->r10=(uint32_t)r->rbp;
+    }
     if (command == 3) {
       if (((uint32_t)r->rsi & 0xff) < 11 && ((uint32_t)r->rsi & 0xff) != 0) return -38;
       uint32_t value;
@@ -314,14 +330,16 @@ static int compat_prepare(struct registers *r, struct syscall_regs *s) {
     }
     if (command == 21) { s->rsi=(uint32_t)r->rdi; s->rdx=(uint32_t)r->rdx; }
     if (command == 22) s->rdi=(uint32_t)r->rdi;
-    if (command == 24) {
-      if (((uint32_t)r->rdx & 0xff) != 0) return -38;
+    if (command == 24) /* sys_shmctl converts i386 shmid64_ds layouts */
       s->rdx=(uint32_t)r->rdi;
-    }
   }
   if (nr == 93) s->rsi=(uint64_t)(int64_t)(int32_t)r->rcx;
   if (nr == 194)
     s->rsi=(uint32_t)r->rcx | ((uint64_t)(uint32_t)r->rdx << 32);
+  if (nr == 324) {
+    s->rdx = (uint32_t)r->rdx | ((uint64_t)(uint32_t)r->rsi << 32);
+    s->r10 = (uint32_t)r->rdi | ((uint64_t)(uint32_t)r->rbp << 32);
+  }
   if (nr == 195 || nr == 196) {
     s->rdi = (uint64_t)(int64_t)-100;
     s->rsi = (uint32_t)r->rbx;
@@ -337,7 +355,7 @@ static int compat_prepare(struct registers *r, struct syscall_regs *s) {
   /* Native fcntl only accesses fixed-width l_type for lock queries;
    * other supported commands have scalar arguments. Unknown commands go
    * to the native EINVAL path rather than masquerading as absent syscalls. */
-  if (nr == 7) { s->rdi=(int32_t)r->rbx; s->r10=0; }
+  if (nr == 7 || nr == 114) { s->rdi=(int32_t)r->rbx; s->r10=0; }
   if (nr == 37) s->rdi=(int32_t)r->rbx;
   if (nr == 270) { s->rdi=(int32_t)r->rbx; s->rsi=(int32_t)r->rcx; }
   if (nr == 19) s->rsi=(int32_t)r->rcx;
@@ -402,6 +420,12 @@ void syscall_compat_dispatch(struct registers *regs) {
     signal_compat_sigreturn(regs, number == 173);
     goto compat_finished;
   }
+  if (number == 126) {
+    extern uint64_t sys_compat_sigprocmask(uint64_t, uint64_t, uint64_t);
+    regs->rax = (uint32_t)sys_compat_sigprocmask((uint32_t)regs->rbx,
+        (uint32_t)regs->rcx, (uint32_t)regs->rdx);
+    goto compat_finished;
+  }
   if (number == 265 || number == 266) {
     /* Legacy i386 clock_gettime/getres use two 32-bit longs. */
     uint32_t clock_id = (uint32_t)regs->rbx;
@@ -427,8 +451,8 @@ void syscall_compat_dispatch(struct registers *regs) {
     regs->rax=(uint32_t)err;
     static uint32_t missing_logs;
     if (err == -38 && __atomic_add_fetch(&missing_logs, 1, __ATOMIC_RELAXED) <= 16)
-      klogf("[COMPAT32] unsupported i386 syscall %u at %llx\n",
-            number, (unsigned long long)regs->rip);
+      klogf("[COMPAT32] unsupported i386 syscall %u (ebx=%u) at %llx\n",
+            number, (uint32_t)regs->rbx, (unsigned long long)regs->rip);
   } else {
     bool exec = native.rax == SYS_EXECVE;
     if (task) task->seccomp_compat_dispatch = true;

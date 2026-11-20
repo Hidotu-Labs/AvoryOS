@@ -235,7 +235,8 @@ static void out_entry_flags(uint64_t entry, bool leaf) {
 
 static void dump_pte_context(uint64_t err_code, uint64_t *table, uint64_t index) {
   out_lit("[KPF]   neighbours ");
-  for (uint64_t i = (index > 0 ? index - 1 : 0); i <= index + 1; i++) {
+  for (uint64_t i = (index > 0 ? index - 1 : 0);
+       i <= index + 1 && i < PAGE_SIZE / sizeof(*table); i++) {
     if (i == index)
       out_lit("<");
     out_hexn(table[i], 16);
@@ -246,6 +247,8 @@ static void dump_pte_context(uint64_t err_code, uint64_t *table, uint64_t index)
   out_lit("\n");
 
   uint64_t pte = table[index];
+  if (!(pte & PAGE_FLAG_PRESENT))
+    return; /* The walk already reported that the entry is absent. */
   bool said = false;
   if ((err_code & 0x2) && !(pte & PAGE_FLAG_RW)) {
     out_lit("[KPF]   verdict: write fault, but PTE.RW=0\n");

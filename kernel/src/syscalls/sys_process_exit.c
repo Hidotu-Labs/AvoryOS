@@ -86,6 +86,12 @@ void process_do_exit(uint64_t status) {
   if (current && current->robust_list)
     robust_handle_death(current);
   process_clear_child_tid(current);
+  /* SysV SEM_UNDO adjustments belong to the process, so apply them when its
+   * main thread exits (exit_group always ends with the leader here). */
+  if (current && current->tid == current->tgid) {
+    extern void sem_exit(uint32_t tgid);
+    sem_exit(current->tgid);
+  }
 
   if (current) {
     pid_namespace_exit(current);
@@ -96,6 +102,13 @@ void process_do_exit(uint64_t status) {
     klog_debug_puts("\n[SYSCALL] Process exited with status: ");
     klog_debug_uint64(status);
     klog_debug_puts("\n");
+    if (current->tid == current->tgid &&
+        (status != 0 || strncmp(current->comm, "Daedaluz", 8) == 0) &&
+        current->last_stderr[0]) {
+      klogf("[EXIT] comm=%s pid=%u status=%lld stderr=%s\n",
+            current->comm, current->tid, (long long)(int64_t)status,
+            current->last_stderr);
+    }
   }
 
   klog_debug_puts("[EXITDBG] begin cleanup\n");
@@ -414,9 +427,11 @@ static uint64_t sys_get_robust_list(uint64_t pid_val, uint64_t head_ptr,
   if (!current)
     return (uint64_t)-22; // EINVAL
 
+  bool compat = current->seccomp_compat_dispatch;
+  size_t ptr_size = compat ? sizeof(uint32_t) : sizeof(uint64_t);
   if (!head_ptr || !len_ptr ||
-      !vmm_is_user_addr_range_writable(head_ptr, sizeof(uint64_t)) ||
-      !vmm_is_user_addr_range_writable(len_ptr, sizeof(uint64_t)))
+      !vmm_is_user_addr_range_writable(head_ptr, ptr_size) ||
+      !vmm_is_user_addr_range_writable(len_ptr, ptr_size))
     return (uint64_t)-14; // EFAULT
 
   int32_t pid = (int32_t)pid_val;
@@ -451,9 +466,18 @@ static uint64_t sys_get_robust_list(uint64_t pid_val, uint64_t head_ptr,
   if (!found)
     return (uint64_t)-3; // ESRCH
 
+  if (compat) {
+    uint32_t head32 = (uint32_t)head;
+    uint32_t len32 = 12;
+    if (copy_to_user((void *)head_ptr, &head32, sizeof(head32)) != 0 ||
+        copy_to_user((void *)len_ptr, &len32, sizeof(len32)) != 0)
+      return (uint64_t)-14;
+    return 0;
+  }
   uint64_t len = ROBUST_LIST_HEAD_LEN;
-  copy_to_user((void *)head_ptr, &head, sizeof(head));
-  copy_to_user((void *)len_ptr, &len, sizeof(len));
+  if (copy_to_user((void *)head_ptr, &head, sizeof(head)) != 0 ||
+      copy_to_user((void *)len_ptr, &len, sizeof(len)) != 0)
+    return (uint64_t)-14;
   return 0;
 }
 

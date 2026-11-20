@@ -170,6 +170,10 @@ typedef struct {
   uint32_t payload_pos;
   uint32_t desc_pos;
   uint8_t *image;
+  /* The block was freed after this image was staged (jbd2 "forget"). It may
+   * already hold file data: never serve the image to readers and never
+   * checkpoint it home. The log slot keeps its reserved position. */
+  bool forgotten;
 } ext3_txn_entry_t;
 
 /* Appended-only chunks: readers (ext3_journal_read_staged) walk them under

@@ -254,49 +254,54 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   if (!cgroupfs_can_fork(parent, NULL))
     return (uint64_t)-11; /* -EAGAIN */
 
-  // 2. Clone the user address space with VMA awareness
-  //    Shared mappings share physical pages, private mappings get copied
-  TSC_BEGIN(fork_clone);
-  uint64_t child_cr3 = vmm_clone_user_mappings_vma(
-      parent_pml4_phys, &parent->mm->vmas);
-  TSC_END(fork_clone);
-  fork_probe_maybe_dump();
-  /* Never publish a child that would enter fork_child_entry with CR3 == 0.
-   * The VMM clone returns zero when it cannot allocate the child page tables. */
-  if (!child_cr3)
-    return (uint64_t)-12;
-
-  // 3. Allocate and populate the child's saved register state.
-  //    RAX = 0 so the child sees fork() returning 0.
+  // 2. Allocate child register/mm state before acquiring parent->mm->lock,
+  //    then clone the user address space and VMAs under parent->mm->lock so
+  //    concurrent mmap/munmap/brk calls cannot mutate parent->mm->vmas mid-fork.
   struct syscall_regs *child_regs = kmalloc(sizeof(struct syscall_regs));
-  if (!child_regs) {
-    vmm_free_user_pages_vma(child_cr3, &parent->mm->vmas);
+  if (!child_regs)
     return (uint64_t)(-12);
-  }
   memcpy(child_regs, regs, sizeof(struct syscall_regs));
   child_regs->rax = 0; // Child return value
 
-  /* Prepare every fallible process resource before publishing a thread. */
   struct mm_struct *child_mm = kmalloc(sizeof(*child_mm));
   if (!child_mm) {
     kfree(child_regs);
-    vmm_free_user_pages_vma(child_cr3, &parent->mm->vmas);
     return (uint64_t)-12;
   }
   memset(child_mm, 0, sizeof(*child_mm));
   vma_list_init(&child_mm->vmas);
-  TSC_BEGIN(fork_vma);
-  if (!vma_list_clone(&child_mm->vmas, &parent->mm->vmas)) {
+
+  spinlock_acquire(&parent->mm->lock);
+  TSC_BEGIN(fork_clone);
+  uint64_t child_cr3 = vmm_clone_user_mappings_vma(
+      parent_pml4_phys, &parent->mm->vmas);
+  TSC_END(fork_clone);
+  /* Never publish a child that would enter fork_child_entry with CR3 == 0.
+   * The VMM clone returns zero when it cannot allocate the child page tables. */
+  if (!child_cr3) {
+    spinlock_release(&parent->mm->lock);
+    vmm_drain_deferred_work();
+    fork_probe_maybe_dump();
     kfree(child_mm);
     kfree(child_regs);
+    return (uint64_t)-12;
+  }
+
+  TSC_BEGIN(fork_vma);
+  if (!vma_list_clone(&child_mm->vmas, &parent->mm->vmas)) {
     vmm_free_user_pages_vma(child_cr3, &parent->mm->vmas);
+    spinlock_release(&parent->mm->lock);
+    vmm_drain_deferred_work();
+    fork_probe_maybe_dump();
+    kfree(child_mm);
+    kfree(child_regs);
     return (uint64_t)-12;
   }
   TSC_END(fork_vma);
   child_mm->brk_base = parent->mm->brk_base;
   child_mm->brk_current = parent->mm->brk_current;
   child_mm->mmap_next_addr = parent->mm->mmap_next_addr;
-    child_mm->compat32 = parent->mm->compat32;
+  child_mm->compat32 = parent->mm->compat32;
   child_mm->ref_count = 1;
   child_mm->pcid = pcid_alloc();
   spinlock_init(&child_mm->lock);
@@ -308,6 +313,9 @@ uint64_t sys_fork(struct syscall_regs *regs) {
   child_mm->cmdline_len = parent->mm->cmdline_len;
   child_mm->arg_start = parent->mm->arg_start;
   child_mm->arg_end = parent->mm->arg_end;
+  spinlock_release(&parent->mm->lock);
+  vmm_drain_deferred_work();
+  fork_probe_maybe_dump();
 
   // 4. Create a kernel thread for the child process, not yet runnable.
   TSC_BEGIN(fork_thread);
@@ -378,7 +386,8 @@ uint64_t sys_fork(struct syscall_regs *regs) {
 
     // Inherit comm name — forked child keeps the parent's name until exec
     memcpy(child->comm, parent->comm, sizeof(child->comm));
-    memcpy(child->exe_path, parent->exe_path, sizeof(child->exe_path));
+      memcpy(child->exe_path, parent->exe_path, sizeof(child->exe_path));
+    uname_policy_on_fork(child, parent);
 
     // Inherit alternate signal stack
     child->ss_sp = parent->ss_sp;
@@ -548,28 +557,34 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   bool private_mm = !(flags & CLONE_VM);
 
   if (private_mm) {
-    TSC_BEGIN(fork_clone);
-    child_cr3 = vmm_clone_user_mappings_vma(
-        (uint64_t *)parent->cr3, &parent->mm->vmas);
-    TSC_END(fork_clone);
-    if (!child_cr3) {
-      PIDFD_UNRESERVE();
-      kfree(child_regs);
-      return (uint64_t)-12;
-    }
-
     child_mm = kmalloc(sizeof(*child_mm));
     if (!child_mm) {
-      vmm_free_user_pages_vma(child_cr3, &parent->mm->vmas);
       PIDFD_UNRESERVE();
       kfree(child_regs);
       return (uint64_t)-12;
     }
     memset(child_mm, 0, sizeof(*child_mm));
     vma_list_init(&child_mm->vmas);
-    if (!vma_list_clone(&child_mm->vmas, &parent->mm->vmas)) {
+
+    spinlock_acquire(&parent->mm->lock);
+    TSC_BEGIN(fork_clone);
+    child_cr3 = vmm_clone_user_mappings_vma(
+        (uint64_t *)parent->cr3, &parent->mm->vmas);
+    TSC_END(fork_clone);
+    if (!child_cr3) {
+      spinlock_release(&parent->mm->lock);
+      vmm_drain_deferred_work();
       kfree(child_mm);
+      PIDFD_UNRESERVE();
+      kfree(child_regs);
+      return (uint64_t)-12;
+    }
+
+    if (!vma_list_clone(&child_mm->vmas, &parent->mm->vmas)) {
       vmm_free_user_pages_vma(child_cr3, &parent->mm->vmas);
+      spinlock_release(&parent->mm->lock);
+      vmm_drain_deferred_work();
+      kfree(child_mm);
       PIDFD_UNRESERVE();
       kfree(child_regs);
       return (uint64_t)-12;
@@ -581,6 +596,8 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
     child_mm->ref_count = 1;
     child_mm->pcid = pcid_alloc();
     spinlock_init(&child_mm->lock);
+    spinlock_release(&parent->mm->lock);
+    vmm_drain_deferred_work();
   }
 
   struct cpu_info *target_cpu = vfork ? cpu_get_current() : NULL;
@@ -695,6 +712,7 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   }
   memcpy(child->comm, parent->comm, sizeof(child->comm));
   memcpy(child->exe_path, parent->exe_path, sizeof(child->exe_path));
+  uname_policy_on_fork(child, parent);
 #if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
   child->trace_syscalls = parent->trace_syscalls;
 #endif
@@ -867,6 +885,7 @@ uint64_t sys_vfork(struct syscall_regs *regs) {
   child->ctty = parent->ctty;
   memcpy(child->comm, parent->comm, sizeof(child->comm));
   memcpy(child->exe_path, parent->exe_path, sizeof(child->exe_path));
+  uname_policy_on_fork(child, parent);
   child->ss_sp = parent->ss_sp;
   child->ss_size = parent->ss_size;
   child->ss_flags = parent->ss_flags;

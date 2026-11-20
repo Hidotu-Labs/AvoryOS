@@ -99,6 +99,7 @@ static uint64_t sys_setxattr(uint64_t path, uint64_t name, uint64_t value,
   if (!node)
     return (uint64_t)-XATTR_ENOENT;
 
+  uint8_t stack_val[256];
   uint8_t *kvalue = NULL;
   if (size > 0) {
     if (value == 0) {
@@ -107,7 +108,7 @@ static uint64_t sys_setxattr(uint64_t path, uint64_t name, uint64_t value,
         vfs_close(cwd);
       return (uint64_t)-XATTR_EFAULT;
     }
-    kvalue = kmalloc((size_t)size);
+    kvalue = size <= sizeof(stack_val) ? stack_val : kmalloc((size_t)size);
     if (!kvalue) {
       vfs_close(node);
       if (cwd)
@@ -115,7 +116,8 @@ static uint64_t sys_setxattr(uint64_t path, uint64_t name, uint64_t value,
       return (uint64_t)-XATTR_ENOMEM;
     }
     if (copy_from_user(kvalue, (const void *)value, (unsigned long)size) != 0) {
-      kfree(kvalue);
+      if (kvalue != stack_val)
+        kfree(kvalue);
       vfs_close(node);
       if (cwd)
         vfs_close(cwd);
@@ -124,7 +126,7 @@ static uint64_t sys_setxattr(uint64_t path, uint64_t name, uint64_t value,
   }
 
   rc = vfs_setxattr(node, kname, kvalue, (uint32_t)size, (int)flags);
-  if (kvalue)
+  if (kvalue && kvalue != stack_val)
     kfree(kvalue);
   vfs_close(node);
   if (cwd)
@@ -155,22 +157,24 @@ static uint64_t sys_fsetxattr(uint64_t fd, uint64_t name, uint64_t value,
   if (rc != 0)
     return (uint64_t)rc;
 
+  uint8_t stack_val[256];
   uint8_t *kvalue = NULL;
   if (size > 0) {
     if (value == 0)
       return (uint64_t)-XATTR_EFAULT;
-    kvalue = kmalloc((size_t)size);
+    kvalue = size <= sizeof(stack_val) ? stack_val : kmalloc((size_t)size);
     if (!kvalue)
       return (uint64_t)-XATTR_ENOMEM;
     if (copy_from_user(kvalue, (const void *)value, (unsigned long)size) != 0) {
-      kfree(kvalue);
+      if (kvalue != stack_val)
+        kfree(kvalue);
       return (uint64_t)-XATTR_EFAULT;
     }
   }
 
   struct thread *t = sched_get_current();
   rc = vfs_setxattr(t->fds[fd], kname, kvalue, (uint32_t)size, (int)flags);
-  if (kvalue)
+  if (kvalue && kvalue != stack_val)
     kfree(kvalue);
   return (uint64_t)rc;
 }
@@ -184,7 +188,8 @@ static uint64_t xattr_do_get(vfs_node_t *node, const char *kname,
   }
   if (!is_user_range((const void *)value_ptr, (size_t)size))
     return (uint64_t)-XATTR_EFAULT;
-  uint8_t *tmp = kmalloc((size_t)size);
+  uint8_t stack_tmp[256];
+  uint8_t *tmp = size <= sizeof(stack_tmp) ? stack_tmp : kmalloc((size_t)size);
   if (!tmp)
     return (uint64_t)-XATTR_ENOMEM;
   int64_t rc = vfs_getxattr(node, kname, tmp, (uint32_t)size);
@@ -192,7 +197,8 @@ static uint64_t xattr_do_get(vfs_node_t *node, const char *kname,
     if (copy_to_user((void *)value_ptr, tmp, (unsigned long)rc) != 0)
       rc = -XATTR_EFAULT;
   }
-  kfree(tmp);
+  if (tmp != stack_tmp)
+    kfree(tmp);
   return (uint64_t)rc;
 }
 
@@ -252,7 +258,8 @@ static uint64_t xattr_do_list(vfs_node_t *node, uint64_t list_ptr,
     return (uint64_t)vfs_listxattr(node, NULL, 0);
   if (!is_user_range((const void *)list_ptr, (size_t)size))
     return (uint64_t)-XATTR_EFAULT;
-  char *tmp = kmalloc((size_t)size);
+  char stack_tmp[256];
+  char *tmp = size <= sizeof(stack_tmp) ? stack_tmp : kmalloc((size_t)size);
   if (!tmp)
     return (uint64_t)-XATTR_ENOMEM;
   int64_t rc = vfs_listxattr(node, tmp, (uint32_t)size);
@@ -260,7 +267,8 @@ static uint64_t xattr_do_list(vfs_node_t *node, uint64_t list_ptr,
     if (copy_to_user((void *)list_ptr, tmp, (unsigned long)rc) != 0)
       rc = -XATTR_EFAULT;
   }
-  kfree(tmp);
+  if (tmp != stack_tmp)
+    kfree(tmp);
   return (uint64_t)rc;
 }
 
