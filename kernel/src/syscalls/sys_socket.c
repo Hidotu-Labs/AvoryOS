@@ -416,7 +416,7 @@ static uint8_t *socket_alloc_bounce_buf(socket_t *sock, size_t *cap,
   extern size_t vfs_dentry_reclaim_pages(size_t target_pages);
   mm_file_cache_reclaim(*cap / 4096 + 16);
   vfs_dentry_reclaim_pages(64);
-  return (uint8_t *)kmalloc(*cap);
+  return (uint8_t *)kmalloc_fallback(*cap);
 }
 
 // Syscall: sendto(int sockfd, const void *buf, size_t len, int flags, ...)
@@ -849,13 +849,13 @@ static int socket_msg_bounce_init(socket_t *sock, struct socket_msg_bounce *b,
     }
     b->kcontrol = control_capacity <= sizeof(b->inline_control)
                       ? (void *)b->inline_control
-                      : kmalloc(control_capacity);
+                      : kmalloc_fallback(control_capacity);
     if (!b->kcontrol && !is_send) {
       while (!b->kcontrol && control_capacity > 1024) {
         control_capacity >>= 1;
         b->kcontrol = control_capacity <= sizeof(b->inline_control)
                       ? (void *)b->inline_control
-                      : kmalloc(control_capacity);
+                      : kmalloc_fallback(control_capacity);
       }
     }
     if (!b->kcontrol) {
@@ -883,12 +883,12 @@ static int socket_msg_bounce_init(socket_t *sock, struct socket_msg_bounce *b,
       socket_msg_bounce_free(b);
       return -14;
     }
-    b->uiov = b->iovlen <= 4 ? b->inline_uiov : kmalloc(iov_bytes);
+    b->uiov = b->iovlen <= 4 ? b->inline_uiov : kmalloc_fallback(iov_bytes);
     if (!b->uiov) {
       socket_msg_bounce_free(b);
       return -12;
     }
-    b->kiov = b->iovlen <= 4 ? b->inline_kiov : kmalloc(iov_bytes);
+    b->kiov = b->iovlen <= 4 ? b->inline_kiov : kmalloc_fallback(iov_bytes);
     if (!b->kiov) {
       socket_msg_bounce_free(b);
       return -12;
@@ -920,7 +920,7 @@ static int socket_msg_bounce_init(socket_t *sock, struct socket_msg_bounce *b,
           kbuf = b->inline_data + b->inline_data_used;
           b->inline_data_used += len;
         } else {
-          kbuf = kmalloc(len);
+          kbuf = stream_stepdown ? kmalloc(len) : kmalloc_fallback(len);
         }
         if (!kbuf && stream_stepdown) {
           for (size_t try_len = len >> 1; try_len >= 4096; try_len >>= 1) {
@@ -1351,6 +1351,10 @@ static uint64_t sys_getsockopt(uint64_t sockfd, uint64_t level,
   if ((int)level == SOL_SOCKET) {
     int handled = 1;
     switch ((int)optname) {
+    case 10: /* SO_OOBINLINE: no OOB data delivery; report off like a fresh Linux socket. */
+      *val = 0;
+      koptlen = sizeof(int);
+      break;
     case SO_TYPE:
       *val = sock->type;
       koptlen = sizeof(int);

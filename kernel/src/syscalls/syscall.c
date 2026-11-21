@@ -862,7 +862,7 @@ void syscall_init_cpu(void) {
   efer |= IA32_EFER_SCE | (1ULL << 11);
   wrmsr(IA32_EFER, efer);
 
-  uint64_t star = ((uint64_t)0x1B << 48) | ((uint64_t)0x08 << 32);
+  uint64_t star = ((uint64_t)0x23 << 48) | ((uint64_t)0x08 << 32);
   wrmsr(IA32_STAR, star);
 
   wrmsr(IA32_LSTAR, (uint64_t)syscall_entry);

@@ -1,3 +1,4 @@
+#include "mm/devframe.h"
 #include "mm/zram.h"
 #include "vmm.h"
 #include "../apic/lapic_timer.h"
@@ -173,6 +174,9 @@ void vmm_free_user_pages_vma(uint64_t cr3, struct vma_list *vmas) {
           uint64_t frame = pt_virt[l] & PAGE_MASK;
           if (frame == vdso_phys)
             continue;
+          /* Teardown of a device-range leaf drops its reference. */
+          devframe_pte_remove(((uint64_t)i << 39) | ((uint64_t)j << 30) |
+                              ((uint64_t)k << 21) | ((uint64_t)l << 12), frame);
 
           uint64_t va = ((uint64_t)i << 39) | ((uint64_t)j << 30) |
                         ((uint64_t)k << 21) | ((uint64_t)l << 12);

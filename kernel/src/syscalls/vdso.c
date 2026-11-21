@@ -1,6 +1,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* First per-CPU TSS descriptor index in the GDT (cpu/gdt.c GDT_TSS_BASE). */
+#define VDSO_GDT_TSS_BASE        10
+
 #define CLOCK_REALTIME           0
 #define CLOCK_MONOTONIC          1
 #define CLOCK_PROCESS_CPUTIME_ID 2
@@ -171,11 +174,12 @@ long __vdso_getcpu(unsigned *cpu, unsigned *node, void *unused) {
         aux = read_tsc_aux_rdtscp();
     } else {
         /* Fallback when neither RDPID nor RDTSCP is supported: extract the
-         * per-CPU TSS selector from TR (GDT_TSS_BASE=6, 2 slots per CPU). */
+         * per-CPU TSS selector from TR. Must match GDT_TSS_BASE in
+         * cpu/gdt.c (2 descriptor slots per CPU). */
         uint16_t sel;
         __asm__ volatile("str %0" : "=r"(sel));
         uint32_t idx = (uint32_t)(sel >> 3);
-        aux = (idx >= 6U) ? ((idx - 6U) >> 1) : 0U;
+        aux = (idx >= VDSO_GDT_TSS_BASE) ? ((idx - VDSO_GDT_TSS_BASE) >> 1) : 0U;
     }
     if (cpu)
         *cpu = aux & 0xFFFU;

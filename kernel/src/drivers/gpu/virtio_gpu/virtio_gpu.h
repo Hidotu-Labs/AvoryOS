@@ -108,4 +108,17 @@ int virtio_gpu_virgl_ioctl(struct drm_file *, uint32_t request, uint64_t arg);
 void virtio_gpu_virgl_close(struct drm_file *);
 int virtio_gpu_virgl_readback(struct drm_gem_object *);
 uint32_t virtio_gpu_virgl_resource_id(struct drm_gem_object *);
+/* Venus wire protocol (Phase 2). Not yet exported through DRM uapi. */
+bool virtio_gpu_blob_supported(void);
+uint64_t virtio_gpu_shm_size(void);
+uint64_t virtio_gpu_shm_phys(void);
+int virtio_gpu_venus_ctx_create(uint32_t ctx_id);
+int virtio_gpu_venus_ctx_destroy(uint32_t ctx_id);
+int virtio_gpu_blob_create(uint32_t ctx_id, uint32_t res_id, uint32_t blob_mem,
+                           uint32_t blob_flags, uint64_t blob_id, uint64_t size,
+                           const struct virtio_gpu_mem_entry *entries, uint32_t nr_entries);
+int virtio_gpu_blob_unref(uint32_t res_id);
+int virtio_gpu_blob_map(uint32_t res_id, uint64_t size, uint64_t *shm_offset, uint32_t *map_info);
+int virtio_gpu_blob_unmap(uint32_t res_id, uint64_t size, uint64_t shm_offset);
+bool virtio_gpu_venus_wire_selftest(void);
 #endif

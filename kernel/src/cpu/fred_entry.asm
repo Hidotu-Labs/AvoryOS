@@ -176,7 +176,7 @@ fred_user_syscall:
     push rsi                     ; offset 144: user_rsi
     push rcx                     ; offset 136: user_rcx
     movzx ecx, word [rsp + 24 + 16]
-    push rcx                     ; offset 128: user_cs (0x2b)
+    push rcx                     ; offset 128: user_cs (0x33)
     push qword [rsp + 32 + 32]   ; offset 120: rsp
     push qword [rsp + 40 + 24]   ; offset 112: rflags
     push qword [rsp + 48 + 8]    ; offset 104: rip

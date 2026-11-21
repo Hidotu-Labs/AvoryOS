@@ -17,7 +17,8 @@ static struct block_device device;
 static bool eligible(struct vma *v) {
   return v && (v->flags & MAP_PRIVATE) && (v->flags & MAP_ANONYMOUS) &&
          !(v->flags & (MAP_SHARED | MAP_SYSV_SHM | MAP_LOCKED)) &&
-         v->prot && !v->linux_vma && !v->file_node;
+         v->prot && !v->linux_vma && !v->file_node &&
+         v->start != VDSO_USER_BASE; /* shared kernel page, never swap */
 }
 /* First interval past cursor, including ineligible VMAs. The caller skips
  * those in O(log n), charging each against its bounded work budget. */
@@ -45,7 +46,11 @@ static uint64_t freeze(struct mm_struct *mm, uint64_t cr3, uint64_t va,
     if (!force && (*pte & PAGE_FLAG_A)) {
       *pte &= ~PAGE_FLAG_A;
     } else if (!(*pte & PAGE_FLAG_MLOCKED) &&
-               frame != pmm_get_zero_page_phys() && pmm_is_managed(frame) &&
+               frame != pmm_get_zero_page_phys() &&
+               /* The vDSO frame is mapped into every process with one
+                * reference; compressing it out of one mm freed a page the
+                * rest still execute, crashing the whole desktop at once. */
+               frame != vmm_get_vsyscall_page_phys() && pmm_is_managed(frame) &&
                pmm_get_ref((void *)frame) == 1) {
       pmm_incref((void *)frame);
       /* COW authorizes a later write fault. Never add it to an originally

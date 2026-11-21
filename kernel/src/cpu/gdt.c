@@ -15,7 +15,7 @@
 // the two cores then interleave frames on the same stack.  The visible
 // symptom is a wild return (e.g. RIP=0x23, the user SS selector) long after
 // the corrupting interrupt.
-#define GDT_TSS_BASE 9
+#define GDT_TSS_BASE 10
 #define GDT_ENTRIES (GDT_TSS_BASE + 2 * MAX_CPUS)
 
 static struct gdt_entry gdt[GDT_ENTRIES];
@@ -108,16 +108,20 @@ __attribute__((no_stack_protector)) void gdt_init(void) {
   // 2: Kernel Data descriptor (0x10)
   gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF);
 
-  // 3: User Code 32-bit (compatibility mode) (0x1B)
-  gdt_set_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF);
+  // 3: Unused / reserved (0x18)
+  gdt_set_gate(3, 0, 0, 0, 0);
 
-  // 4: User Data descriptor (0x23)   - DPL 3, Data R/W
-  gdt_set_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF);
+  // 4: User Code 32-bit (compatibility mode) (0x23)
+  gdt_set_gate(4, 0, 0xFFFFFFFF, 0xFA, 0xCF);
 
-  // 5: User Code descriptor (0x2B)   - DPL 3, Code Exec/Read, 64-bit
-  gdt_set_gate(5, 0, 0xFFFFFFFF, 0xFA, 0xAF);
+  // 5: User Data descriptor (0x2B)   - DPL 3, Data R/W
+  gdt_set_gate(5, 0, 0xFFFFFFFF, 0xF2, 0xCF);
 
-  // One TSS per CPU: CPU i uses descriptor (6 + 2*i), i.e. selector 0x30+16i.
+  // 6: User Code descriptor (0x33)   - DPL 3, Code Exec/Read, 64-bit
+  gdt_set_gate(6, 0, 0xFFFFFFFF, 0xFA, 0xAF);
+
+  // One TSS per CPU: CPU i uses descriptor (GDT_TSS_BASE + 2*i), i.e. selector
+  // (GDT_TSS_BASE*8) + 16*i (0x50 + 16*i with GDT_TSS_BASE == 10).
   for (uint32_t i = 0; i < MAX_CPUS; i++) {
     memset(&tss_table[i], 0, sizeof(struct tss_entry));
     tss_table[i].iopb_offset = sizeof(struct tss_entry);
@@ -168,5 +172,5 @@ void gdt_set_compat_tls(const uint64_t entries[3]) {
   __asm__ volatile("str %0" : "=r"(tr));
   unsigned cpu = ((tr >> 3) - GDT_TSS_BASE) / 2;
   if (cpu >= MAX_CPUS) return;
-  memcpy(&cpu_gdt[cpu][6], entries, 3 * sizeof(uint64_t));
+  memcpy(&cpu_gdt[cpu][7], entries, 3 * sizeof(uint64_t));
 }

@@ -153,8 +153,14 @@ RUN_VIRGL ?= 1
 RUN_VIRGL_HOST_FIX ?= 1
 VIRGL_HOST_LIB := build/virgl-host/lib/libvirglrenderer.so.1
 RUN_VIRGL_FIXED = $(if $(filter 1,$(RUN_VIRGL)),$(filter 1,$(RUN_VIRGL_HOST_FIX)))
-RUN_VIRGL_ENV = $(if $(RUN_VIRGL_FIXED),env LD_LIBRARY_PATH="$(abspath build/virgl-host/lib):$${LD_LIBRARY_PATH:-}")
-$(VIRGL_HOST_LIB): scripts/virgl/compat-context.patch scripts/virgl/draw-state-overhead.patch scripts/virgl/host-dispatch-profile.patch scripts/virgl/vertex-shader-selection.patch scripts/build-virgl-host.py scripts/virgl/missing-vertex-buffer.patch scripts/virgl/missing-vertex-buffer-v1.patch scripts/virgl/fog-semantic.patch scripts/virgl/nvidia-vertex-binding.patch scripts/virgl/nvidia-vertex-binding-v1.patch
+# Venus exposes every host Vulkan device to the guest, and apps that take the
+# first one can land on a second GPU (here the AMD iGPU, whose VRAM blobs the
+# host cannot map and whose frames cross GPUs to reach the NVIDIA host GL).
+# Limit the render server to one driver; RUN_VENUS_ICD= exposes all of them.
+RUN_VENUS_ICD ?= $(wildcard /usr/share/vulkan/icd.d/nvidia_icd.json)
+RUN_VENUS_ENV = $(if $(and $(RUN_VENUS_ENABLED),$(RUN_VENUS_ICD)),VK_DRIVER_FILES="$(RUN_VENUS_ICD)")
+RUN_VIRGL_ENV = $(if $(or $(RUN_VIRGL_FIXED),$(RUN_VENUS_ENV)),env $(if $(RUN_VIRGL_FIXED),LD_LIBRARY_PATH="$(abspath build/virgl-host/lib):$${LD_LIBRARY_PATH:-}") $(RUN_VENUS_ENV))
+$(VIRGL_HOST_LIB): scripts/virgl/nvidia-dmabuf-pitch.patch scripts/virgl/compat-context.patch scripts/virgl/draw-state-overhead.patch scripts/virgl/host-dispatch-profile.patch scripts/virgl/vertex-shader-selection.patch scripts/build-virgl-host.py scripts/virgl/missing-vertex-buffer.patch scripts/virgl/missing-vertex-buffer-v1.patch scripts/virgl/fog-semantic.patch scripts/virgl/nvidia-vertex-binding.patch scripts/virgl/nvidia-vertex-binding-v1.patch
 	python3 scripts/build-virgl-host.py
 .PHONY: virgl-host
 virgl-host: $(VIRGL_HOST_LIB)
@@ -170,6 +176,14 @@ $(QEMU_HOST_BIN): scripts/build-qemu-host.py scripts/qemu/virgl-query-event-poll
 qemu-host: $(QEMU_HOST_BIN)
 RUN_GPU = $(if $(filter 1,$(RUN_VIRGL)),virtio-vga-gl,virtio-vga)
 RUN_GL = $(if $(filter 1,$(RUN_VIRGL)),on,off)
+# Venus (Vulkan over virtio-gpu) requires virtio-vga-gl with blob/hostmem/venus
+# and a shared memfd memory backend for guest-backed blobs. On by default with
+# virgl; RUN_VENUS=0 gives the plain virgl device (no guest Vulkan).
+RUN_VENUS ?= 1
+RUN_VENUS_ENABLED = $(if $(filter 1,$(RUN_VIRGL)),$(filter 1,$(RUN_VENUS)))
+RUN_VENUS_MEM_SIZE = $(lastword $(QEMU_MEM))
+RUN_VENUS_MEM_FLAGS = $(if $(RUN_VENUS_ENABLED),-object memory-backend-memfd$(NET_COMMA)id=mem$(NET_COMMA)size=$(RUN_VENUS_MEM_SIZE)$(NET_COMMA)share=on -machine memory-backend=mem,)
+RUN_GPU_OPTS = xres=1280,yres=800$(if $(RUN_VENUS_ENABLED),$(NET_COMMA)blob=true$(NET_COMMA)hostmem=4G$(NET_COMMA)venus=true)
 # GTK's Wayland GL widget can lose relative input after its pointer grab.
 # SDL preserves host relative reports with the same virgl device and USB mouse.
 RUN_DISPLAY ?= $(if $(filter 1,$(RUN_VIRGL)),sdl,gtk)
@@ -209,7 +223,7 @@ run-installer: RUN_EXTRA_QEMU_FLAGS = -drive file=$(INSTALL_TARGET_IMG),format=r
 run-installer: $(INSTALL_TARGET_IMG) run
 RUN_ACCEL_FLAGS ?= -cpu host -enable-kvm
 run: DISPLAY_OPT = -display $(RUN_DISPLAY),gl=$(RUN_GL),show-cursor=$(GTK_SHOW_CURSOR)$(if $(filter gtk,$(RUN_DISPLAY)),$(NET_COMMA)zoom-to-fit=off$(NET_COMMA)grab-on-hover=on)
-run: QEMUFLAGS = $(QEMU_MEM) -vga none -device $(RUN_GPU),xres=1280,yres=800 $(RUN_EXTRA_QEMU_FLAGS)
+run: QEMUFLAGS = $(QEMU_MEM) $(RUN_VENUS_MEM_FLAGS) -vga none -device $(RUN_GPU),$(RUN_GPU_OPTS) $(RUN_EXTRA_QEMU_FLAGS)
 run: edk2-ovmf $(IMAGE_NAME).iso $(RUN_DISK_DEP) $(if $(RUN_VIRGL_FIXED),$(VIRGL_HOST_LIB)) $(if $(RUN_QEMU_LOCAL),$(QEMU_HOST_BIN))
 	@mkdir -p "$(dir $(RUN_SERIAL_LOG))"
 	$(RUN_VIRGL_ENV) $(RUN_QEMU) \
@@ -261,7 +275,7 @@ run-installed: edk2-ovmf $(if $(RUN_VIRGL_FIXED),$(VIRGL_HOST_LIB)) $(if $(RUN_Q
 		-device usb-kbd,bus=xhci.0 \
 		-device $(RUN_POINTER),bus=xhci.0 \
 		$(DISPLAY_OPT) \
-		$(QEMU_MEM) -vga none -device $(RUN_GPU),xres=1280,yres=800
+		$(QEMU_MEM) $(RUN_VENUS_MEM_FLAGS) -vga none -device $(RUN_GPU),$(RUN_GPU_OPTS)
 
 # USB mass-storage and hub fixtures (QEMU xHCI). Every disk is attached with
 # snapshot=on,file.locking=off, so disk.img and a running `make run` VM are never

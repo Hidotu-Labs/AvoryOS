@@ -17,7 +17,8 @@ PATCHES = (PATCH, ROOT/'scripts/virgl/fog-semantic.patch',
            ROOT/'scripts/virgl/vertex-shader-selection.patch',
            ROOT/'scripts/virgl/host-dispatch-profile.patch',
            ROOT/'scripts/virgl/draw-state-overhead.patch',
-           ROOT/'scripts/virgl/compat-context.patch')
+           ROOT/'scripts/virgl/compat-context.patch',
+           ROOT/'scripts/virgl/nvidia-dmabuf-pitch.patch')
 COMMIT = 'ca50e008863837e094747a69974dde3ae148aeaa'  # upstream 1.3.0
 
 def run(args, **kwargs):
@@ -55,7 +56,8 @@ def main():
         if (BUILD/'build.ninja').exists():
             setup += ['--reconfigure']
         run([*setup, BUILD, SOURCE, '--prefix='+str(PREFIX), '--libdir=lib',
-             '-Dtests=false', '-Dvideo=false', '-Dvenus=false', '-Dplatforms=egl,glx',
+             '--libexecdir=libexec',
+             '-Dtests=false', '-Dvideo=false', '-Dvenus=true', '-Dplatforms=egl,glx',
              '-Dbuildtype=debugoptimized'], env=env)
         run(['ninja', '-C', BUILD, '-j8'], env=env)
         # Replace the library atomically: another running VM may still map the
@@ -72,6 +74,14 @@ def main():
             temporary_link = libdir/(link+'.new-'+str(os.getpid()))
             temporary_link.symlink_to(target)
             os.replace(temporary_link, libdir/link)
+        libexecdir = PREFIX/'libexec'
+        libexecdir.mkdir(parents=True, exist_ok=True)
+        server_bin = BUILD/'server/virgl_render_server'
+        if server_bin.exists():
+            tmp_srv = libexecdir/('virgl_render_server.new-'+str(os.getpid()))
+            shutil.copy2(server_bin, tmp_srv)
+            os.utime(tmp_srv, None)
+            os.replace(tmp_srv, libexecdir/'virgl_render_server')
         print('Host virgl vertex-buffer guard ready: '+str(PREFIX/'lib/libvirglrenderer.so.1'))
 
 if __name__ == '__main__':

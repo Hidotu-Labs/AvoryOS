@@ -23,7 +23,7 @@ fork_return_to_userspace:
 
     ; Set user data segment selectors
     push rax
-    mov  ax, 0x23           ; User Data selector (0x20 | RPL=3)
+    mov  ax, 0x2b           ; User Data selector (0x28 | RPL=3)
     mov  ds, ax
     mov  es, ax
     pop  rax
@@ -31,7 +31,7 @@ fork_return_to_userspace:
     cmp byte [rel cpu_has_fred_flag], 0
     jne .fred_eretu
 
-    cmp qword [rax + 128], 0x1b
+    cmp qword [rax + 128], 0x23
     je .compat_iret
 
     ; Restore GPRs (except rdi and rax which we handle last)
@@ -87,10 +87,10 @@ fork_return_to_userspace:
     ; Compatibility mode cannot return through SYSRETQ. Keep the interrupt
     ; frame on the kernel stack until IRETQ switches both privilege and mode.
     cli
-    push qword 0x23
+    push qword 0x2b
     push qword [rax + 120]
     push qword [rax + 112]
-    push qword 0x1b
+    push qword 0x23
     push qword [rax + 104]
     mov r15, [rax + 96]
     mov r14, [rax + 88]
@@ -118,10 +118,10 @@ fork_return_to_userspace:
     cli
     push qword 0                 ; reserved
     push qword 0                 ; event_data
-    push qword 0x23              ; user SS
+    push qword 0x2b              ; user SS
     push qword [rax + 120]       ; user RSP
     push qword [rax + 112]       ; user RFLAGS
-    push qword [rax + 128]       ; user CS (0x2b or 0x1b)
+    push qword [rax + 128]       ; user CS (0x33 or 0x23)
     push qword [rax + 104]       ; user RIP
     push qword 0                 ; error_code
 
@@ -135,7 +135,7 @@ fork_return_to_userspace:
     mov r8,  [rax + 32]
     mov r10, [rax + 24]
     mov rdx, [rax + 16]
-    cmp qword [rax + 128], 0x1b
+    cmp qword [rax + 128], 0x23
     je .fred_compat_regs
     mov rsi, [rax + 8]
     mov rdi, [rax + 0]

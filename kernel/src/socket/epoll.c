@@ -10,6 +10,7 @@
 #include "../mm/heap.h"
 #include "../sched/sched.h"
 #include "../sched/wait.h"
+#include "../hal/hal.h"
 #include "socket.h"
 #include "arch/uaccess.h"
 #include <stdint.h>
@@ -28,7 +29,10 @@ static volatile uint16_t epoll_fd_watchers[EPOLL_MAX_WATCHED];
  * per epoll instance, instead of one pass every time epoll_wait() parks with
  * an empty ready list.  Raised from 100 ms, which cost a full wakeup + scan
  * ten times per second per idle epoll_wait. */
-#define EPOLL_RESCAN_INTERVAL_MS 1000
+/* Fallback rescan period for producers that miss epoll_notify_event(). At
+ * 1000 ms a single missed wake stalled wineserver long enough (330 ms seen)
+ * for a game's anti-debug timing check to trip and plant a crash. */
+#define EPOLL_RESCAN_INTERVAL_MS 10
 
 static int epoll_table_alloc(void) {
   spinlock_acquire(&epoll_table_lock);
@@ -348,6 +352,57 @@ static void ep_add_to_ready_list(eventpoll_t *ep, epitem_t *epi) {
   }
 }
 
+/* Rate-limited fallback rescan of every watched item, outside ep->lock: the
+ * safety net for producers that miss epoll_notify_event(). Uses pin slots
+ * 0..31, so the caller must hold no epoll pins of its own. */
+static void ep_rescan_items(eventpoll_t *ep) {
+  uint64_t scan_now = lapic_timer_get_ticks();
+  if (scan_now < __atomic_load_n(&ep->next_scan_ticks, __ATOMIC_RELAXED))
+    return;
+  int items_high = __atomic_load_n(&ep->items_high, __ATOMIC_RELAXED);
+  int _idx = 0;
+  while (_idx < items_high) {
+    epitem_t *rescan_batch[32];
+    int batch_len = 0;
+
+    spinlock_acquire(&ep->lock);
+    while (_idx < items_high && batch_len < 32) {
+      epitem_t *_epi = (_idx < (int)ep->items_capacity) ? ep->items[_idx] : NULL;
+      _idx++;
+      if (!_epi || __atomic_load_n(&_epi->on_ready_list, __ATOMIC_ACQUIRE) ||
+          __atomic_load_n(&_epi->oneshot_disabled, __ATOMIC_ACQUIRE)) {
+        continue;
+      }
+      epitem_pin(_epi, (unsigned)batch_len);
+      rescan_batch[batch_len++] = _epi;
+    }
+    spinlock_release(&ep->lock);
+
+    for (int b = 0; b < batch_len; b++) {
+      epitem_t *rb = rescan_batch[b];
+      if (ep_check_events(rb)) {
+        /* Ready, yet no notification queued it: a producer missed its wake.
+         * Name it so the dropping path can be found. */
+        static volatile uint32_t missed_logs;
+        if (!__atomic_load_n(&rb->on_ready_list, __ATOMIC_ACQUIRE) &&
+            __atomic_fetch_add(&missed_logs, 1, __ATOMIC_RELAXED) < 40) {
+          struct thread *ct = sched_get_current();
+          klogf("[EPOLL] rescan recovered a missed wake: comm='%s' tid=%u "
+                "node='%s' events=%#x\n",
+                ct ? ct->comm : "?", ct ? ct->tid : 0,
+                rb->node ? rb->node->name : "?",
+                (unsigned)__atomic_load_n(&rb->registered_events,
+                                          __ATOMIC_RELAXED));
+        }
+        ep_add_to_ready_list(ep, rb);
+      }
+      epitem_unpin((unsigned)b);
+    }
+  }
+  __atomic_store_n(&ep->next_scan_ticks, scan_now + EPOLL_RESCAN_INTERVAL_MS,
+                   __ATOMIC_RELAXED);
+}
+
 // Membership changes use node->ep_lock -> ep->lock, matching notifiers.
 int epoll_ctl_del(eventpoll_t *ep, int fd) {
   if (!ep) return -22;
@@ -653,36 +708,7 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
       break;
 
     // 7. Rate-limited fallback rescan of every watched item, outside ep->lock.
-    uint64_t scan_now = lapic_timer_get_ticks();
-    if (scan_now >= __atomic_load_n(&ep->next_scan_ticks, __ATOMIC_RELAXED)) {
-      int items_high = __atomic_load_n(&ep->items_high, __ATOMIC_RELAXED);
-      int _idx = 0;
-      while (_idx < items_high) {
-        epitem_t *rescan_batch[32];
-        int batch_len = 0;
-
-        spinlock_acquire(&ep->lock);
-        while (_idx < items_high && batch_len < 32) {
-          epitem_t *_epi = (_idx < (int)ep->items_capacity) ? ep->items[_idx] : NULL;
-          _idx++;
-          if (!_epi || __atomic_load_n(&_epi->on_ready_list, __ATOMIC_ACQUIRE) ||
-              __atomic_load_n(&_epi->oneshot_disabled, __ATOMIC_ACQUIRE)) {
-            continue;
-          }
-          epitem_pin(_epi, (unsigned)batch_len);
-          rescan_batch[batch_len++] = _epi;
-        }
-        spinlock_release(&ep->lock);
-
-        for (int b = 0; b < batch_len; b++) {
-          if (ep_check_events(rescan_batch[b]))
-            ep_add_to_ready_list(ep, rescan_batch[b]);
-          epitem_unpin((unsigned)b);
-        }
-      }
-      __atomic_store_n(&ep->next_scan_ticks, scan_now + EPOLL_RESCAN_INTERVAL_MS,
-                       __ATOMIC_RELAXED);
-    }
+    ep_rescan_items(ep);
 
     // 8. Prepare to block under ep->lock
     spinlock_acquire(&ep->lock);
@@ -898,6 +924,23 @@ int epoll_vfs_poll(struct vfs_node *node, int events) {
     return POLLNVAL;
 
   int revents = 0;
+
+  /* poll/ppoll/select on an epoll fd never reach epoll_wait's rescan, so a
+   * missed producer notification would leave the fd unreadable forever
+   * (KWin's libinput thread ppolls its epoll fd: a lost evdev notify froze
+   * all input). Run the same rate-limited rescan here, but only from a plain
+   * poll: inside epoll_wait (nested epoll) this thread's pin slots are busy
+   * and the outer epoll_wait rescans on its own. */
+  if ((events & POLLIN) &&
+      __atomic_load_n(&ep->rdllist_count, __ATOMIC_ACQUIRE) == 0 &&
+      hal_irq_enabled()) {
+    struct thread *t = sched_get_current();
+    bool pins_free = t != NULL;
+    for (unsigned i = 0; pins_free && i < 64; i++)
+      pins_free = t->active_epoll_items[i] == NULL;
+    if (pins_free)
+      ep_rescan_items(ep);
+  }
 
   // Lockless check: ready list count and head pointer
   if (__atomic_load_n(&ep->rdllist_count, __ATOMIC_ACQUIRE) > 0) {

@@ -77,8 +77,15 @@ int ascentdrm_prime_export(struct drm_gem_object *obj, unsigned int flags) {
 #ifdef LINUXKPI_LINUX_IMPORTED
   if (obj->prime_buffer)
     return linuxkpi_prime_fd(obj->prime_buffer, flags);
-  if (obj->cache_mode != DRM_GEM_CACHE_WB)
+  if (obj->prepare_export) {
+    int ret = obj->prepare_export(obj);
+    if (ret)
+      return ret;
+  }
+  if (obj->cache_mode != DRM_GEM_CACHE_WB && !obj->device_opaque)
     return -95; /* EOPNOTSUPP: don't export native MMIO scanout. */
+  if (obj->device_range && !obj->phys_addr && !obj->device_opaque)
+    return -22;
   if (!__atomic_load_n(&obj->prime_reservation, __ATOMIC_ACQUIRE)) {
     void *resv = linuxkpi_prime_reservation_new();
     void *expected = NULL;
@@ -89,6 +96,12 @@ int ascentdrm_prime_export(struct drm_gem_object *obj, unsigned int flags) {
       linuxkpi_prime_reservation_free(resv);
   }
   ascentdrm_gem_get(obj);
+  if (obj->device_opaque)
+    return linuxkpi_prime_export_range(obj, obj->size, obj->prime_reservation,
+                                      0, prime_native_release, flags);
+  if (obj->device_range)
+    return linuxkpi_prime_export_range(obj, obj->size, obj->prime_reservation,
+                                      obj->phys_addr, prime_native_release, flags);
   return linuxkpi_prime_export(obj, obj->size, obj->prime_reservation, prime_native_page,
                               prime_native_release, flags);
 #else

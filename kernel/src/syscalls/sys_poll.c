@@ -293,8 +293,12 @@ static uint64_t sys_ppoll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_ptr,
 static uint64_t do_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
                             uint64_t exceptfds, uint64_t timeout_ms) {
   size_t set_size = (nfds + 7) / 8;
+  /* select(0, NULL, NULL, NULL, &tv) is the classic precise sleep: Wine's
+   * non-alertable NtDelayExecution uses it for Sleep(). Returning at once made
+   * every Sleep() a no-op, so Dark Souls' speed-hack detector saw time run
+   * wrong and planted its tamper crash. Sleep like poll() with no fds. */
   if (nfds == 0)
-    return 0;
+    return do_poll(NULL, 0, timeout_ms);
   if (nfds > MAX_FDS)
     nfds = MAX_FDS;
   struct pollfd stack_pfds[16];
@@ -317,14 +321,13 @@ static uint64_t do_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds,
   }
 
   if (p_count == 0) {
-    if (timeout_ms != (uint64_t)-1 && timeout_ms > 0) {
-      struct thread *t = sched_get_current();
-      t->state = THREAD_SLEEPING;
-      uint64_t wait = (timeout_ms == (uint64_t)-1) ? 10 : timeout_ms;
-      if (wait == 0)
-        wait = 1;
-      t->wakeup_ticks = lapic_timer_get_ticks() + wait;
-      sched_yield();
+    /* No fds selected: a pure timed sleep. A single yield ended early on any
+     * unrelated wakeup and an infinite timeout never blocked; do_poll() loops
+     * to the real deadline and returns -EINTR on a signal, like Linux. */
+    uint64_t slept = do_poll(NULL, 0, timeout_ms);
+    if ((int64_t)slept < 0) {
+      if (pfds != stack_pfds) kfree(pfds);
+      return slept;
     }
     if (readfds)
       memset((void *)readfds, 0, set_size);

@@ -239,7 +239,7 @@ static bool exec_save_absolute_path(char *out, size_t capacity,
 }
 
 static uint64_t sys_execve(struct syscall_regs *regs) {
-  bool compat32 = regs->user_cs == 0x1b;
+  bool compat32 = regs->user_cs == 0x23;
   const char **user_argv = (const char **)regs->rsi;
   const char **user_envp = (const char **)regs->rdx;
   const char *user_path = (const char *)regs->rdi;
@@ -808,7 +808,7 @@ static uint64_t sys_execve(struct syscall_regs *regs) {
   regs->r13 = 0;
   regs->r14 = 0;
   regs->r15 = 0;
-  regs->user_cs = elf_info.compat32 ? 0x1b : 0x2b;
+  regs->user_cs = elf_info.compat32 ? 0x23 : 0x33;
   regs->user_rcx = regs->user_rsi = regs->user_rdi = 0;
   regs->rflags = 0x202; // IF | reserved bit 1
 

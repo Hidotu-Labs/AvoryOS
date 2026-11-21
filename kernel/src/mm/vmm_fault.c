@@ -2100,7 +2100,7 @@ static inline bool vsyscall_user_range_ok(uint64_t ptr, size_t len) {
 bool vmm_emulate_vsyscall(uint64_t fault_addr, struct registers *regs) {
   if (!regs || vsyscall_mode != VSYSCALL_EMULATE)
     return false;
-  if ((regs->cs & 3) != 3 || regs->cs != 0x2B)
+  if ((regs->cs & 3) != 3 || regs->cs != 0x33)
     return false;
   if ((regs->err_code & 0x10ULL) == 0 || regs->rip != fault_addr)
     return false;

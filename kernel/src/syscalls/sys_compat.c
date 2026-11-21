@@ -20,7 +20,7 @@ int compat_clone_tls(uint64_t pointer, uint32_t *entry, uint32_t *base, uint64_t
   struct { uint32_t entry, base, limit, flags; } d;
   if (pointer > UINT32_MAX || copy_from_user(&d, (void *)pointer, sizeof(d))) return -14;
   unsigned contents = (d.flags >> 1) & 3;
-  if (d.entry < 6 || d.entry > 8 || !(d.flags & 1) || contents > 1 ||
+  if (d.entry < 7 || d.entry > 9 || !(d.flags & 1) || contents > 1 ||
       (d.flags & 0x20) || (d.flags & ~0xffu)) return -22;
   uint64_t access = 0xf0 | (contents << 2) | ((d.flags & 8) ? 0 : 2);
   uint64_t gran = 4 | ((d.flags & 0x10) ? 8 : 0) | ((d.flags & 0x40) ? 1 : 0);
@@ -43,10 +43,10 @@ static int compat_set_thread_area(uint32_t pointer) {
   if (!t) return -1;
   uint32_t entry = desc.entry;
   if (entry == UINT32_MAX) {
-    for (entry = 6; entry < 9 && t->compat_tls[entry - 6]; entry++);
-    if (entry == 9) return -3;
+    for (entry = 7; entry < 10 && t->compat_tls[entry - 7]; entry++);
+    if (entry == 10) return -3;
   }
-  if (entry < 6 || entry > 8) return -22;
+  if (entry < 7 || entry > 9) return -22;
   uint64_t value = 0;
   if (!empty) {
     uint64_t access = 0xf0 | (contents << 2) | ((desc.flags & 8) ? 0 : 2);
@@ -58,7 +58,7 @@ static int compat_set_thread_area(uint32_t pointer) {
   }
   if (copy_to_user((void *)(uintptr_t)pointer, &entry, sizeof(entry))) return -14;
   hal_irq_state_t irq = hal_irq_save();
-  t->compat_tls[entry - 6] = value;
+  t->compat_tls[entry - 7] = value;
   gdt_set_compat_tls(t->compat_tls);
   if ((t->compat_fs >> 3) == entry) {
     uint16_t selector = empty ? 0 : t->compat_fs;
@@ -278,6 +278,7 @@ static int compat_syscall_number(uint32_t number) {
   case 436: return SYS_CLOSE_RANGE; /* close_range */
   case 438: return SYS_PIDFD_GETFD; /* pidfd_getfd */
   case 439: return SYS_FACCESSAT2; /* faccessat2 */
+  case 449: return 449; /* futex_waitv: same 24-byte waiter and 64-bit timespec on i386 */
   case 444: return SYS_LANDLOCK_CREATE_RULESET; /* landlock_create_ruleset */
   case 446: return SYS_LANDLOCK_RESTRICT_SELF; /* landlock_restrict_self */
   case 452: return SYS_FCHMODAT2; /* fchmodat2 */
@@ -407,7 +408,7 @@ void syscall_compat_dispatch(struct registers *regs) {
     regs->rax = (uint32_t)filtered.rax;
     goto compat_finished;
   }
-  if (regs->cs != 0x1b) {
+  if (regs->cs != 0x23 && !(regs->cs == 0x33 && number == 243)) {
     regs->rax = (uint32_t)-38;
     goto compat_finished;
   }
@@ -473,7 +474,7 @@ void syscall_compat_dispatch(struct registers *regs) {
       /* exec can change both ABI and address space. Return to the new image
        * through this interrupt's IRETQ, including a new CS and stack. */
       *regs=(struct registers){ .rip=native.rip, .rsp=native.rsp,
-          .rflags=native.rflags, .cs=native.user_cs, .ss=0x23, .int_no=0x80 };
+          .rflags=native.rflags, .cs=native.user_cs, .ss=0x2b, .int_no=0x80 };
     } else {
       regs->rax=(uint32_t)native.rax;
     }

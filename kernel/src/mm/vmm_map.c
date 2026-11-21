@@ -1,3 +1,4 @@
+#include "mm/devframe.h"
 #include "mm/zram.h"
 #include "vmm.h"
 #include "vmm_internal.h"
@@ -363,7 +364,13 @@ static bool vmm_map_page_nolock(uint64_t *pml4, uint64_t virtual_addr,
   pd_virt[pd_index] |= propagate_flags;
 
   if (zram_pte_slot(pt_virt[pt_index])) return false;
+  uint64_t old_pte = pt_virt[pt_index];
   pt_virt[pt_index] = (physical_addr & PAGE_MASK) | flags | PAGE_FLAG_PRESENT;
+  /* The new leaf takes its device-frame reference before the replaced one
+   * gives its back, so replacing a mapping with itself never reaches zero. */
+  devframe_pte_install(virtual_addr, physical_addr & PAGE_MASK);
+  if (old_pte & PAGE_FLAG_PRESENT)
+    devframe_pte_remove(virtual_addr, old_pte & PAGE_MASK);
 
   if (flush_tlb)
     tlb_flush_deferred(virtual_addr, (uint64_t)pml4);
@@ -834,8 +841,11 @@ void vmm_unmap_page(uint64_t *pml4, uint64_t virtual_addr) {
   uint32_t swap_slot = zram_pte_slot(pt_virt[pt_index]);
   if (!(pt_virt[pt_index] & PAGE_FLAG_PRESENT) && !swap_slot)
     goto unlock;
+  uint64_t cleared_pte = pt_virt[pt_index];
   pt_virt[pt_index] = 0;
   if (swap_slot) zram_slot_put(swap_slot);
+  else if (cleared_pte & PAGE_FLAG_PRESENT)
+    devframe_pte_remove(virtual_addr, cleared_pte & PAGE_MASK);
   tlb_flush_deferred(virtual_addr, (uint64_t)pml4);
 
   if (pml4_index < 256 ||
@@ -908,6 +918,7 @@ vmm_unmap_kind_t vmm_unmap_page_locked(uint64_t *pml4, uint64_t virtual_addr,
   if (!(pte & PAGE_FLAG_PRESENT))
     return VMM_UNMAP_HOLE;
   pt_virt[pt_index] = 0;
+  devframe_pte_remove(virtual_addr, pte & PAGE_MASK);
   tlb_flush_deferred(virtual_addr, (uint64_t)pml4);
   if (frame_out)
     *frame_out = pte & PAGE_MASK;

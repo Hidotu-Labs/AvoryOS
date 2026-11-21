@@ -22,6 +22,7 @@
 #define VIRTIO_PCI_CAP_ISR_CFG          3
 #define VIRTIO_PCI_CAP_DEVICE_CFG       4
 #define VIRTIO_PCI_CAP_PCI_CFG          5
+#define VIRTIO_PCI_CAP_SHARED_MEMORY_CFG 8
 
 // Common Configuration Structure (§4.1.4.3)
 // This is mapped via BAR + offset from the VIRTIO_PCI_CAP_COMMON_CFG cap.
@@ -81,6 +82,14 @@ struct virtio_pci_device {
   uint64_t bar_virt[6];
   uint64_t bar_size[6];
   struct pci_msix msix;
+
+  // Shared memory region (VIRTIO_PCI_CAP_SHARED_MEMORY_CFG, e.g. shmid 1)
+  uint64_t shm_phys;
+  uint64_t shm_size;
+  volatile void *shm_virt;
+  uint8_t shm_bar;
+  uint8_t shm_id;
+  bool shm_present;
 };
 
 // VirtIO PCI Transport API

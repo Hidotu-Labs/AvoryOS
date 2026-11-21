@@ -212,6 +212,10 @@ static int socket_ioctl_ifreq(uint32_t request, uint64_t arg) {
     ifr.address_data[3] = (uint8_t)(mask >> 16);
     ifr.address_data[4] = (uint8_t)(mask >> 8);
     ifr.address_data[5] = (uint8_t)mask;
+  } else if (request == 0x8921) { /* SIOCGIFMTU: int ifr_mtu */
+    int32_t mtu = loopback ? 65536 : 1500;
+    memset(&ifr.family, 0, sizeof(ifr) - 16);
+    memcpy(&ifr.family, &mtu, sizeof(mtu));
   } else if (request == 0x8933) { /* SIOCGIFINDEX */
     uint32_t ifindex = loopback ? 1 : 2; /* Match route netlink. */
     memset(&ifr.family, 0, sizeof(ifr) - 16);
@@ -1152,7 +1156,7 @@ int socket_vfs_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
   if (request == 0x8910 || request == 0x8913 || request == 0x8914 ||
       request == 0x8915 || request == 0x8916 || request == 0x8919 ||
       request == 0x891a || request == 0x891b || request == 0x891c ||
-      request == 0x8927 || request == 0x8933) {
+      request == 0x8921 || request == 0x8927 || request == 0x8933) {
     int ret = socket_ioctl_ifreq(request, arg);
     socket_put(sock);
     return ret;

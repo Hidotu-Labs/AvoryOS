@@ -907,7 +907,8 @@ static bool virtio_gpu_ensure_visible_scanout(void) {
 
 static bool virtio_gpu_restart_after_reset(void) {
     const uint64_t wanted = VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID |
-                            VIRTIO_GPU_F_VIRGL;
+                            VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_RESOURCE_BLOB |
+                            VIRTIO_GPU_F_CONTEXT_INIT;
     if (!virtio_pci_negotiate(&gpu.transport, wanted, VIRTIO_F_VERSION_1,
                               &gpu.negotiated_features)) {
         klog_puts("[VIRTIO-GPU] S3 recovery: feature negotiation failed\n");
@@ -992,7 +993,9 @@ bool virtio_gpu_init(void) {
         return false;
     }
     gpu.config = (volatile struct virtio_gpu_config *)gpu.transport.device_cfg;
-    uint64_t wanted = VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_VIRGL;
+    uint64_t wanted = VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID |
+                      VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_RESOURCE_BLOB |
+                      VIRTIO_GPU_F_CONTEXT_INIT;
     if (!virtio_pci_negotiate(
             &gpu.transport, wanted, VIRTIO_F_VERSION_1, &gpu.negotiated_features)) {
         klog_puts("[VIRTIO-GPU] Feature negotiation failed\n");
@@ -1045,6 +1048,14 @@ bool virtio_gpu_init(void) {
     klog_uint64(gpu.num_capsets);
     klog_puts(" EDID=");
     klog_putchar((gpu.negotiated_features & VIRTIO_GPU_F_EDID) ? 49 : 48);
+    klog_puts(" blob=");
+    klog_putchar((gpu.negotiated_features & VIRTIO_GPU_F_RESOURCE_BLOB) ? 49 : 48);
+    klog_puts(" ctx_init=");
+    klog_putchar((gpu.negotiated_features & VIRTIO_GPU_F_CONTEXT_INIT) ? 49 : 48);
+    if (gpu.transport.shm_present) {
+        klog_puts(" shm_size=");
+        klog_hex64(gpu.transport.shm_size);
+    }
     klog_puts("\n");
     for (uint32_t i = 0; i < VIRTIO_GPU_MAX_SCANOUTS; i++) {
         struct virtio_gpu_display_one *m = &gpu.display_info.pmodes[i];
@@ -2818,6 +2829,22 @@ bool virtio_gpu_control(const void *request, uint32_t request_size,
 }
 uint32_t virtio_gpu_resource_id(void) {
     return __atomic_add_fetch(&gpu.next_resource_id, 1, __ATOMIC_RELAXED);
+}
+
+/* Blob resources need both the negotiated feature and the host-visible shm
+ * window found by virtio_pci_init(). */
+bool virtio_gpu_blob_supported(void) {
+    return gpu.initialized &&
+           (gpu.negotiated_features & VIRTIO_GPU_F_RESOURCE_BLOB) &&
+           gpu.transport.shm_present;
+}
+
+uint64_t virtio_gpu_shm_size(void) {
+    return virtio_gpu_blob_supported() ? gpu.transport.shm_size : 0;
+}
+
+uint64_t virtio_gpu_shm_phys(void) {
+    return virtio_gpu_blob_supported() ? gpu.transport.shm_phys : 0;
 }
 
 static int gpu_render_wait_fence(uint64_t target, bool nowait) {

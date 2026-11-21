@@ -163,10 +163,23 @@ void pmm_sites_stop(void) {
 }
 
 void pmm_sites_dump(const char *tag) {
-  klogf("[INFO] PMM site dump (%s)\n", tag);
+  /* Snapshot under the lock and print after releasing it. Printing can block
+   * on the serial ring; while this lock was held, every CPU entering
+   * heap_big_alloc/free spun on it with interrupts masked and the machine
+   * stopped taking timer ticks. Boot diagnostics are single-caller, so the
+   * static snapshot needs no further protection. */
+  static struct pmm_site alloc_snap[PMM_SITE_SLOTS];
+  static struct pmm_site free_snap[PMM_SITE_SLOTS];
   spinlock_acquire(&pmm_sites_lock);
   for (size_t i = 0; i < PMM_SITE_SLOTS; i++) {
-    struct pmm_site *site = &pmm_alloc_sites[i];
+    alloc_snap[i] = pmm_alloc_sites[i];
+    free_snap[i] = pmm_free_sites[i];
+  }
+  spinlock_release(&pmm_sites_lock);
+
+  klogf("[INFO] PMM site dump (%s)\n", tag);
+  for (size_t i = 0; i < PMM_SITE_SLOTS; i++) {
+    struct pmm_site *site = &alloc_snap[i];
     if (!site->pages)
       continue;
     klog_puts("  alloc=");
@@ -176,7 +189,7 @@ void pmm_sites_dump(const char *tag) {
     klog_putchar('\n');
   }
   for (size_t i = 0; i < PMM_SITE_SLOTS; i++) {
-    struct pmm_site *site = &pmm_free_sites[i];
+    struct pmm_site *site = &free_snap[i];
     if (!site->pages)
       continue;
     klog_puts("  free =");
@@ -185,7 +198,6 @@ void pmm_sites_dump(const char *tag) {
     klog_uint64(site->pages);
     klog_putchar('\n');
   }
-  spinlock_release(&pmm_sites_lock);
 }
 
 bool pmm_is_managed(uint64_t phys) {

@@ -657,7 +657,7 @@ static uint64_t sys_clone_internal(struct syscall_regs *regs, uint64_t flags,
   child->compat_fs = parent->compat_fs;
   child->compat_gs = parent->compat_gs;
   if (compat_tls) {
-    child->compat_tls[compat_entry - 6] = compat_descriptor;
+    child->compat_tls[compat_entry - 7] = compat_descriptor;
     child->compat_gs = (compat_entry << 3) | 3;
     child->gs_base = compat_base;
     child->fs_base = parent->fs_base;

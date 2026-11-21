@@ -26,7 +26,7 @@ syscall_entry:
     push rdi           ; Original user RDI (compat return shadow)
     push rsi           ; Original user RSI
     push rcx           ; Original user RCX
-    push qword 0x2b    ; Return code segment, changed by execve for ELF32
+    push qword 0x33    ; Return code segment, changed by execve for ELF32
     push qword gs:[368] ; User RSP
     push r11           ; User RFLAGS
     push rcx           ; User RIP
@@ -72,7 +72,7 @@ syscall_entry:
     test rax, rax
     jnz .sigreturn_iret
 
-    cmp qword [rsp + 128], 0x1b
+    cmp qword [rsp + 128], 0x23
     je .compat_iret
 
     ; Pop scratch registers (and return value in rax)

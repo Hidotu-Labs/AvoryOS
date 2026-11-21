@@ -910,6 +910,11 @@ mount_success:
                   " VirtIO-GPU Phase 8 display management unavailable.\n");
     }
   }
+  /* `boot_selftest=1` checks the Venus wire protocol (context-init, host
+   * blobs, shm offsets) against the host when the device exposes capset 4.
+   * It is skipped, and logs why, on a plain virtio-gpu. */
+  if (boot_selftests_enabled() && virtio_gpu_is_initialized())
+    (void)virtio_gpu_venus_wire_selftest();
   ascentdrm_register_vfs();
   fb_detect_drm_backend();
 

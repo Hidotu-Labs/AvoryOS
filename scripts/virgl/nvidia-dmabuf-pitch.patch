@@ -1,0 +1,364 @@
+diff --git a/src/vrend/vrend_renderer.c b/src/vrend/vrend_renderer.c
+index 75c5c1d..801b9fa 100644
+--- a/src/vrend/vrend_renderer.c
++++ b/src/vrend/vrend_renderer.c
+@@ -1020,9 +1020,14 @@ static bool vrend_resource_supports_view(const struct vrend_resource *res,
+     *
+     * For views that don't require colorspace conversion, we can add swizzles
+     * instead. For views that do require colorspace conversion, manual srgb
+-    * decode/encode is required. */
++    * decode/encode is required.
++    *
++    * Pitch-copied dma-bufs (pitch_src_tex) replace an eglimage-backed
++    * texture, and the guest relies on its red/blue semantics, so they get the
++    * same treatment even though their own storage is GL_RGBA8. */
+    return !(vrend_format_is_bgra(res->base.format) &&
+-            has_bit(res->storage_bits, VREND_STORAGE_EGL_IMAGE)) &&
++            (has_bit(res->storage_bits, VREND_STORAGE_EGL_IMAGE) ||
++             res->pitch_src_tex)) &&
+          (vrend_resource_get_internal_format_override(res) == GL_NONE);
+ }
+ 
+@@ -2782,6 +2787,17 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
+       view->srgb_decode = GL_SKIP_DECODE_EXT;
+    }
+ 
++   /* The pitch copy stored red in the blue channel and vice versa; read each
++    * component from the other one. */
++   if (res->pitch_src_redblue) {
++      for (enum pipe_swizzle i = 0; i < 4; ++i) {
++         if (view->gl_swizzle[i] == GL_RED)
++            view->gl_swizzle[i] = GL_BLUE;
++         else if (view->gl_swizzle[i] == GL_BLUE)
++            view->gl_swizzle[i] = GL_RED;
++      }
++   }
++
+    if (!has_bit(view->texture->storage_bits, VREND_STORAGE_GL_BUFFER)) {
+       enum virgl_formats format;
+       bool needs_view = false;
+@@ -2838,8 +2854,16 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
+          * back, and still benefit from automatic srgb decoding.
+          * If the red/blue swap is intended, we just let it happen and don't
+          * need to explicit change to the sampler's swizzle parameters. */
+-        if (!vrend_resource_supports_view(view->texture, view->format) &&
+-            vrend_format_is_bgra(view->format)) {
++        bool redblue_swap = !vrend_resource_supports_view(view->texture, view->format) &&
++                            vrend_format_is_bgra(view->format);
++        /* A view of an eglimage reinterprets BGRA8 storage, which the swap
++         * above undoes for bgr* views. A pitch-copied resource's GL_RGBA8
++         * storage isn't reinterpreted, so it needs the swap for rgb* views. */
++        if (view->texture->pitch_src_tex &&
++            vrend_format_is_bgra(view->texture->base.format)) {
++           redblue_swap = !vrend_format_is_bgra(view->format);
++        }
++        if (redblue_swap) {
+               VREND_DEBUG(dbg_tex, ctx, "texture view with red/blue swizzle created for EGL-backed texture sampler"
+                           " (format: %s; view: %s)\n",
+                           util_format_name(view->texture->base.format),
+@@ -5257,6 +5281,18 @@ static void vrend_draw_bind_vertex_binding(struct vrend_context *ctx,
+    }
+ }
+ 
++/* Copy a pitch-imported dma-buf's visible region into the texture that host
++ * GL reads. The copy is queued in the reader's GL stream, so it sees what the
++ * dma-buf holds at the same point a direct sample would have. */
++static void vrend_resource_sync_pitch_src(struct vrend_resource *res)
++{
++   if (!res || !res->pitch_src_tex)
++      return;
++   glCopyImageSubData(res->pitch_src_tex, GL_TEXTURE_2D, 0, 0, 0, 0,
++                      res->gl_id, res->target, 0, 0, 0, 0,
++                      res->base.width0, res->base.height0, 1);
++}
++
+ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
+                                               int shader_type,
+                                               GLuint next_sampler_id)
+@@ -5272,6 +5308,10 @@ static GLuint vrend_draw_bind_samplers_shader(struct vrend_sub_context *sub_ctx,
+       int i = u_bit_scan(&mask);
+       struct vrend_sampler_view *tview = shader_view->views[i];
+ 
++      /* The dma-buf may have changed since the last draw, bound or not. */
++      if (tview)
++         vrend_resource_sync_pitch_src(tview->texture);
++
+       if ((dirty & (1 << i)) && tview) {
+          glActiveTexture(GL_TEXTURE0 + next_sampler_id);
+          glUniform1i(sprog->sampler_locs[shader_type][sampler_index], next_sampler_id);
+@@ -8709,9 +8749,10 @@ static void vrend_resource_gbm_init(struct vrend_resource *gr, uint32_t format)
+ #endif
+ }
+ 
+-static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+-                                        enum virgl_formats format,
+-                                        void *image_oes)
++static int vrend_resource_alloc_texture_ext(struct vrend_resource *gr,
++                                            enum virgl_formats format,
++                                            void *image_oes,
++                                            bool external_alloc)
+ {
+    unsigned level;
+    GLenum internalformat, glformat, gltype;
+@@ -8724,7 +8765,7 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+    if (format_can_texture_storage)
+       gr->storage_bits |= VREND_STORAGE_GL_IMMUTABLE;
+ 
+-   if (!image_oes) {
++   if (!image_oes && external_alloc) {
+       vrend_resource_d3d_init(gr, format);
+       vrend_resource_gbm_init(gr, format);
+       if (gr->gbm_bo && !has_bit(gr->storage_bits, VREND_STORAGE_EGL_IMAGE))
+@@ -8901,6 +8942,13 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
+    return 0;
+ }
+ 
++static int vrend_resource_alloc_texture(struct vrend_resource *gr,
++                                        enum virgl_formats format,
++                                        void *image_oes)
++{
++   return vrend_resource_alloc_texture_ext(gr, format, image_oes, true);
++}
++
+ static struct vrend_resource *
+ vrend_resource_create(const struct vrend_renderer_resource_create_args *args)
+ {
+@@ -8975,7 +9023,11 @@ void vrend_renderer_resource_destroy(struct vrend_resource *res)
+       glDeleteMemoryObjectsEXT(1, &res->memobj);
+    }
+ 
++   if (res->pitch_src_tex)
++      glDeleteTextures(1, &res->pitch_src_tex);
+ #ifdef ENABLE_GBM
++   if (res->pitch_src_image)
++      virgl_egl_image_destroy(egl, res->pitch_src_image);
+    if (res->egl_image) {
+       virgl_egl_image_destroy(egl, res->egl_image);
+       for (unsigned i = 0; i < ARRAY_SIZE(res->aux_plane_egl_image); i++) {
+@@ -9986,6 +10038,8 @@ static int vrend_renderer_transfer_send_iov(struct vrend_context *ctx,
+                                             const struct iovec *iov, int num_iovs,
+                                             const struct vrend_transfer_info *info)
+ {
++   vrend_resource_sync_pitch_src(res);
++
+    if ((is_only_bit(res->storage_bits, VREND_STORAGE_GUEST_MEMORY) ||
+        has_bit(res->storage_bits, VREND_STORAGE_HOST_SYSTEM_MEMORY)) && res->iov) {
+       return vrend_copy_iovec(res->iov, res->num_iovs, info->box->x,
+@@ -10740,6 +10794,8 @@ void vrend_renderer_resource_copy_region(struct vrend_context *ctx,
+       return;
+    }
+ 
++   vrend_resource_sync_pitch_src(src_res);
++
+    if (!resource_dest_contains_box(src_res, dst_res, dst_level,
+                                    dstx, dsty, dstz, src_box)) {
+       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_RESOURCE_OUT_OF_RANGE, dst_handle);
+@@ -10894,6 +10950,9 @@ static bool vrend_blit_needs_redblue_swizzle(struct vrend_resource *src_res,
+     * be taken when determining the swizzling. */
+    bool src_needs_swizzle = vrend_resource_needs_redblue_swizzle(src_res, info->src.format);
+    bool dst_needs_swizzle = vrend_resource_needs_redblue_swizzle(dst_res, info->dst.format);
++   /* Pitch copies with exchanged red/blue storage need the same correction. */
++   src_needs_swizzle ^= src_res->pitch_src_redblue;
++   dst_needs_swizzle ^= dst_res->pitch_src_redblue;
+    return src_needs_swizzle ^ dst_needs_swizzle;
+ }
+ 
+@@ -11269,6 +11328,8 @@ void vrend_renderer_blit(struct vrend_context *ctx,
+    if (ctx->in_error)
+       return;
+ 
++   vrend_resource_sync_pitch_src(src_res);
++
+    if (unlikely(info->src.format >= VIRGL_FORMAT_MAX ||
+                 tex_conv_table[info->src.format].format == VIRGL_FORMAT_NONE)) {
+       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_FORMAT, info->src.format);
+@@ -13397,6 +13458,101 @@ struct pipe_resource *vrend_get_blob_pipe(struct vrend_context *ctx, uint64_t bl
+    return NULL;
+ }
+ 
++#ifdef ENABLE_GBM
++/* NVIDIA's EGL (seen on 620.70) ignores EGL_DMA_BUF_PLANE0_PITCH_EXT for
++ * linear dma-bufs and uses align(width * cpp, 32) instead, which shears
++ * images whose rows are padded, such as Venus WSI buffers (256-byte rows).
++ * VIRGL_DMABUF_PITCH_COPY=0/1 overrides the vendor check. */
++static bool vrend_dmabuf_pitch_from_width(void)
++{
++   static int cached = -1;
++   if (cached < 0) {
++      const char *vendor = (const char *)glGetString(GL_VENDOR);
++      cached = debug_get_bool_option("VIRGL_DMABUF_PITCH_COPY",
++                                     vendor && strstr(vendor, "NVIDIA"));
++   }
++   return cached;
++}
++
++/* The wide import is copied into a texture with an alpha channel; keep the
++ * formats copy-compatible by importing X formats as their A variants. */
++static uint32_t vrend_dmabuf_alpha_format(uint32_t drm_format)
++{
++   switch (drm_format) {
++   case GBM_FORMAT_XRGB8888: return GBM_FORMAT_ARGB8888;
++   case GBM_FORMAT_XBGR8888: return GBM_FORMAT_ABGR8888;
++   case GBM_FORMAT_RGBX8888: return GBM_FORMAT_RGBA8888;
++   case GBM_FORMAT_BGRX8888: return GBM_FORMAT_BGRA8888;
++   case GBM_FORMAT_XRGB2101010: return GBM_FORMAT_ARGB2101010;
++   case GBM_FORMAT_XBGR2101010: return GBM_FORMAT_ABGR2101010;
++   default: return drm_format;
++   }
++}
++
++/* glCopyImageSubData moves raw texels. NVIDIA (620.70) keeps ARGB2101010
++ * EGL images in BGR order behind a GL_RGB10_A2 internal format, so the copy
++ * into a real GL_RGB10_A2 texture exchanges red and blue. Every other WSI
++ * format tested (8888 in both orders, ABGR2101010, ABGR16161616F) copies
++ * unchanged. drm_format is the format the wide image was imported with. */
++static bool vrend_dmabuf_copy_swaps_redblue(uint32_t drm_format)
++{
++   return drm_format == GBM_FORMAT_ARGB2101010;
++}
++
++/* Import a linear dma-buf whose rows are padded as a texture stride/cpp texels
++ * wide, so a driver that derives the pitch from the width still gets the real
++ * pitch, and give gr a plain texture of the guest's size to copy into.
++ * Host GL writes to gr stay in gl_id; this path is only taken for buffers the
++ * guest imports to read, such as Venus WSI images. */
++static int vrend_resource_alloc_pitch_src(struct vrend_resource *gr,
++                                          enum virgl_formats format,
++                                          uint32_t drm_format,
++                                          const struct vrend_renderer_resource_set_type_args *args,
++                                          const int *plane_fds)
++{
++   uint32_t cpp = util_format_get_blocksize(gr->base.format);
++   void *image;
++   GLuint tex;
++   int ret;
++
++   image = virgl_egl_image_from_dmabuf(egl, args->plane_strides[0] / cpp, args->height,
++                                       vrend_dmabuf_alpha_format(drm_format),
++                                       args->modifier, 1, plane_fds,
++                                       args->plane_strides, args->plane_offsets);
++   if (!image)
++      return EINVAL;
++
++   /* Errors of earlier commands were already reported; start clean. */
++   glGetError();
++   glGenTextures(1, &tex);
++   glBindTexture(GL_TEXTURE_2D, tex);
++   if (has_feature(feat_egl_image_storage))
++      glEGLImageTargetTexStorageEXT(GL_TEXTURE_2D, (GLeglImageOES)image, NULL);
++   else
++      glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
++   glBindTexture(GL_TEXTURE_2D, 0);
++   if (glGetError() != GL_NO_ERROR) {
++      glDeleteTextures(1, &tex);
++      virgl_egl_image_destroy(egl, image);
++      return EINVAL;
++   }
++
++   ret = vrend_resource_alloc_texture_ext(gr, format, NULL, false);
++   if (ret) {
++      glDeleteTextures(1, &tex);
++      virgl_egl_image_destroy(egl, image);
++      return ret;
++   }
++
++   gr->pitch_src_tex = tex;
++   gr->pitch_src_image = image;
++   gr->pitch_src_redblue =
++      vrend_dmabuf_copy_swaps_redblue(vrend_dmabuf_alpha_format(drm_format));
++   vrend_resource_sync_pitch_src(gr);
++   return 0;
++}
++#endif
++
+ int
+ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
+                                       uint32_t res_id,
+@@ -13471,28 +13627,49 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
+             return EINVAL;
+          }
+ 
+-         gr->egl_image = virgl_egl_image_from_dmabuf(egl,
+-                                                     args->width,
+-                                                     args->height,
+-                                                     drm_format,
+-                                                     args->modifier,
+-                                                     args->plane_count,
+-                                                     plane_fds,
+-                                                     args->plane_strides,
+-                                                     args->plane_offsets);
+-         if (!gr->egl_image) {
+-            virgl_error("%s: failed to create egl image\n", __func__);
+-            FREE(gr);
+-            return EINVAL;
++         uint32_t cpp = util_format_get_blocksize(gr->base.format);
++         bool pitch_src = vrend_dmabuf_pitch_from_width() &&
++                          has_feature(feat_copy_image) &&
++                          args->plane_count == 1 &&
++                          (args->modifier == 0 /* DRM_FORMAT_MOD_LINEAR */ ||
++                           args->modifier == DRM_FORMAT_MOD_INVALID) &&
++                          cpp && args->plane_strides[0] % cpp == 0 &&
++                          args->plane_strides[0] / cpp > args->width;
++
++         if (pitch_src) {
++            ret = vrend_resource_alloc_pitch_src(gr, virgl_format, drm_format,
++                                                 args, plane_fds);
++            if (ret) {
++               virgl_warn("%s: res %u: pitch %u import failed, sampling may shear\n",
++                          __func__, res_id, args->plane_strides[0]);
++               pitch_src = false;
++            }
+          }
+ 
+-         gr->storage_bits |= VREND_STORAGE_EGL_IMAGE;
++         if (!pitch_src) {
++            gr->egl_image = virgl_egl_image_from_dmabuf(egl,
++                                                        args->width,
++                                                        args->height,
++                                                        drm_format,
++                                                        args->modifier,
++                                                        args->plane_count,
++                                                        plane_fds,
++                                                        args->plane_strides,
++                                                        args->plane_offsets);
++            if (!gr->egl_image) {
++               virgl_error("%s: failed to create egl image\n", __func__);
++               FREE(gr);
++               return EINVAL;
++            }
+ 
+-         ret = vrend_resource_alloc_texture(gr, virgl_format, gr->egl_image);
+-         if (ret) {
+-            virgl_egl_image_destroy(egl, gr->egl_image);
+-            FREE(gr);
+-            return ret;
++            gr->storage_bits |= VREND_STORAGE_EGL_IMAGE;
++
++            ret = vrend_resource_alloc_texture(gr, virgl_format, gr->egl_image);
++            if (ret) {
++               virgl_egl_image_destroy(egl, gr->egl_image);
++               FREE(gr);
++               return ret;
++            }
+          }
+ 
+ #else /* ENABLE_GBM */
+diff --git a/src/vrend/vrend_renderer.h b/src/vrend/vrend_renderer.h
+index adb1213..df633e2 100644
+--- a/src/vrend/vrend_renderer.h
++++ b/src/vrend/vrend_renderer.h
+@@ -115,6 +115,14 @@ struct vrend_resource {
+    uint32_t blob_id;
+    struct list_head head;
+    bool is_imported;
++
++   /* Linear dma-buf imported stride/cpp texels wide; gl_id holds a copy of
++    * its visible region. See vrend_renderer_pipe_resource_set_type. */
++   GLuint pitch_src_tex;
++   void *pitch_src_image;
++   /* gl_id holds the copy with red and blue exchanged; see
++    * vrend_dmabuf_copy_swaps_redblue. */
++   bool pitch_src_redblue;
+ };
+ 
+ #define VIRGL_TEXTURE_NEED_SWIZZLE        (1 << 0)

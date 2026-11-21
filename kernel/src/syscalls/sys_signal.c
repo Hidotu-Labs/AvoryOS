@@ -1,6 +1,7 @@
 #include "../sched/pid_namespace.h"
 #include "../sched/capability.h"
 // Signal Syscalls: rt_sigaction, rt_sigprocmask
+#include "../apic/lapic.h"
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
 #include "../cpu/features.h"
@@ -101,12 +102,20 @@ struct kernel_ucontext {
   uint64_t fpregs_mem[64];
 };
 
+/* Staged signal frame. The first two members are the user-visible part and
+ * follow Linux's rt_sigframe layout (ucontext, then siginfo, with the restorer
+ * return address just below ucontext). libgcc's x86_64 signal-frame unwinder
+ * reads the interrupted context at cfa + 0x28 (gregs) and the RIP at
+ * cfa + 0xA8, where cfa is the ucontext address. Keep regs/mask after them and
+ * never copy them to user memory: that is kernel staging only. */
 struct sigframe {
+  struct kernel_ucontext ucontext;
+  struct kernel_siginfo info;
   struct registers regs;
   uint64_t mask;
-  struct kernel_siginfo info;
-  struct kernel_ucontext ucontext;
 } __attribute__((aligned(16)));
+
+#define SIGFRAME_USER_SIZE offsetof(struct sigframe, regs)
 
 _Static_assert(sizeof(struct kernel_siginfo) == 128,
                "x86_64 siginfo ABI size");
@@ -114,8 +123,42 @@ _Static_assert(offsetof(struct kernel_siginfo, _sigsys.si_call_addr) == 16 &&
                offsetof(struct kernel_siginfo, _sigsys.si_syscall) == 24 &&
                offsetof(struct kernel_siginfo, _sigsys.si_arch) == 28,
                "x86_64 SIGSYS siginfo ABI offsets");
-_Static_assert(offsetof(struct sigframe, ucontext) == 312,
-               "x86_64 signal frame ucontext offset");
+_Static_assert(offsetof(struct sigframe, ucontext) == 0,
+               "x86_64 signal frame ucontext must start the user frame");
+_Static_assert(offsetof(struct sigframe, info) == sizeof(struct kernel_ucontext),
+               "x86_64 signal frame siginfo follows ucontext");
+_Static_assert(offsetof(struct kernel_ucontext, uc_mcontext) == 40,
+               "x86_64 ucontext uc_mcontext offset");
+_Static_assert(offsetof(struct kernel_ucontext, uc_mcontext.gregs) +
+                   16 * sizeof(uint64_t) == 168,
+               "x86_64 gregs[REG_RIP] must be at ucontext+0xA8");
+
+/* Linux x86_64 extended FPU signal frame: uc_mcontext.fpregs points at a full
+ * XSAVE image on the user stack. Bytes 464..511 of its legacy area hold
+ * struct _fpx_sw_bytes and FP_XSTATE_MAGIC2 follows the image. Restoring the
+ * whole image on sigreturn keeps the interrupted code's YMM/ZMM state even if
+ * the handler was context-switched and the lazy FPU save reused fpu_state. */
+#define FP_XSTATE_MAGIC1 0x46505853U
+#define FP_XSTATE_MAGIC2 0x46505845U
+#define UC_FP_XSTATE 0x1
+struct fpx_sw_bytes {
+  uint32_t magic1;
+  uint32_t extended_size;
+  uint64_t xfeatures;
+  uint32_t xstate_size;
+  uint32_t padding[7];
+};
+_Static_assert(sizeof(struct fpx_sw_bytes) == 48, "fpx_sw_bytes ABI size");
+
+static uint32_t signal_xstate_size(void) {
+  if (!cpu_has_xsave_flag)
+    return 0;
+  uint32_t a, b, c, d;
+  __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0xD), "c"(0));
+  if (b < 576 || b > sizeof(((struct thread *)0)->fpu_state))
+    return 0;
+  return b;
+}
 
 static void restore_signal_context(struct registers *regs,
                                    const struct kernel_ucontext *uc) {
@@ -141,14 +184,14 @@ static void restore_signal_context(struct registers *regs,
   regs->rflags = (g[17] & 0x0000000000250dd5ULL) | 0x202ULL;
 
   uint16_t cs = (uint16_t)g[18];
-  regs->cs = ((cs & 3) == 3 && cs != 0) ? cs : 0x2B;
+  regs->cs = ((cs & 3) == 3 && cs != 0) ? cs : 0x33;
   regs->err_code = g[19];
   regs->int_no = g[20];
   uint16_t ss = (uint16_t)(g[18] >> 48);
   /* Legacy contexts can leave SS unset. Strict contexts must retain an
    * invalid selector so sigreturn rejects it before attempting IRETQ. */
-  regs->ss = (ss == 0x23 || (uc->uc_flags & UC_STRICT_RESTORE_SS) ||
-              regs->cs != 0x2B) ? ss : 0x23;
+  regs->ss = (ss == 0x2B || (uc->uc_flags & UC_STRICT_RESTORE_SS) ||
+              regs->cs != 0x33) ? ss : 0x2B;
 }
 
 static void fill_signal_context(struct sigframe *frame, int sig,
@@ -182,6 +225,12 @@ static void fill_signal_context(struct sigframe *frame, int sig,
       struct vma *v = vma_find(&current->mm->vmas, fault_address);
       code = v ? 2 : 1;
       spinlock_release(&current->mm->lock);
+    }
+    if (sig == SIGSEGV && frame->regs.int_no == 13) {
+      /* #GP carries no faulting address: Linux's do_general_protection()
+       * sends SIGSEGV with SI_KERNEL and si_addr 0. */
+      code = 128; /* SI_KERNEL */
+      fault_address = 0;
     }
     info->si_code = code;
     info->_sigfault.si_addr = fault_address;
@@ -229,12 +278,14 @@ static void fill_signal_context(struct sigframe *frame, int sig,
   g[17] = frame->regs.rflags;
   /* Linux REG_CSGSFS packs four 16-bit selectors: CS, GS, FS, SS.
    * Wine tests saved SS to distinguish native faults from 16-bit faults. */
-  uint16_t fs, gs;
-  __asm__ volatile("movw %%fs, %0; movw %%gs, %1" : "=r"(fs), "=r"(gs));
-  g[18] = (uint16_t)frame->regs.cs | ((uint64_t)gs << 16) |
-          ((uint64_t)fs << 32) | ((uint64_t)(uint16_t)frame->regs.ss << 48);
+  /* Linux's x86-64 setup_sigcontext() always stores 0 for fs and gs (64-bit
+   * code uses the FS/GS bases, not selectors). Reporting whatever selector
+   * the kernel happened to have loaded leaks into Wine's CONTEXT.SegFs/SegGs,
+   * which anti-debug code inspects. */
+  g[18] = (uint16_t)frame->regs.cs |
+          ((uint64_t)(uint16_t)frame->regs.ss << 48);
   uc->uc_flags = UC_SIGCONTEXT_SS;
-  if (frame->regs.cs == 0x2B)
+  if (frame->regs.cs == 0x33)
     uc->uc_flags |= UC_STRICT_RESTORE_SS;
   g[19] = frame->regs.err_code;
   g[20] = frame->regs.int_no;
@@ -599,7 +650,7 @@ static uint64_t sys_rt_sigreturn(struct syscall_regs *sregs) {
   struct thread *current = sched_get_current();
   // Frame is on user stack.
   struct sigframe *frame = (struct sigframe *)sregs->rsp;
-  if (!is_user_range(frame, sizeof(struct sigframe))) {
+  if (!is_user_range(frame, SIGFRAME_USER_SIZE)) {
     klog_puts("[SIGNAL] sigreturn: invalid frame pointer\n");
     process_do_exit(11); // SIGSEGV
   }
@@ -621,8 +672,8 @@ static uint64_t sys_rt_sigreturn(struct syscall_regs *sregs) {
       ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
   current->fault_regs_valid = false;
   current->fault_addr = 0;
- if ((current->sigreturn_regs.cs != 0x2B && current->sigreturn_regs.cs != 0x1B) ||
-      current->sigreturn_regs.ss != 0x23 ||
+ if ((current->sigreturn_regs.cs != 0x33 && current->sigreturn_regs.cs != 0x23) ||
+      current->sigreturn_regs.ss != 0x2B ||
       current->sigreturn_regs.rip >= 0x0000800000000000ULL ||
       current->sigreturn_regs.rsp >= 0x0000800000000000ULL) {
     klog_puts("[SIGNAL] sigreturn: invalid user context rip=");
@@ -639,9 +690,42 @@ static uint64_t sys_rt_sigreturn(struct syscall_regs *sregs) {
     kfree(k_uc);
     process_do_exit(11);
   }
+  /* Prefer the full XSAVE image the frame's fpregs points at (Linux ABI);
+   * handlers such as wine may also have edited it there. */
+  uint8_t *ximg = NULL;
+  uint32_t xsize = signal_xstate_size();
+  uint64_t fpregs_user = k_uc->uc_mcontext.fpregs;
+  if (xsize && fpregs_user && !(fpregs_user & 63) &&
+      is_user_range((const void *)fpregs_user, xsize + sizeof(uint32_t))) {
+    struct fpx_sw_bytes sw;
+    uint32_t magic2 = 0;
+    if (!copy_from_user(&sw, (const void *)(fpregs_user + 464), sizeof(sw)) &&
+        sw.magic1 == FP_XSTATE_MAGIC1 && sw.xstate_size == xsize &&
+        !copy_from_user(&magic2, (const void *)(fpregs_user + xsize), sizeof(magic2)) &&
+        magic2 == FP_XSTATE_MAGIC2) {
+      ximg = kmalloc(xsize);
+      if (ximg && copy_from_user(ximg, (const void *)fpregs_user, xsize)) {
+        kfree(ximg);
+        ximg = NULL;
+      }
+      if (ximg && !fpu_validate_legacy(ximg, current->fpu_state)) {
+        kfree(ximg);
+        kfree(k_uc);
+        process_do_exit(11);
+      }
+    }
+  }
   __asm__ volatile("cli" ::: "memory");
   fpu_ensure_loaded(current);
-  if (cpu_has_xsave_flag) {
+  if (cpu_has_xsave_flag && ximg) {
+    memcpy(current->fpu_state, ximg, xsize);
+    memset(current->fpu_state + 464, 0, sizeof(struct fpx_sw_bytes));
+    kfree(ximg);
+    fpu_sanitize_xstate(current->fpu_state, sizeof(current->fpu_state), current->fpu_state);
+    uint64_t mask = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE);
+    uint32_t eax = (uint32_t)mask, edx = (uint32_t)(mask >> 32);
+    __asm__ volatile("xrstor64 %0" : : "m"(current->fpu_state), "a"(eax), "d"(edx) : "memory");
+  } else if (cpu_has_xsave_flag) {
     // Preserve extended AVX/YMM state: update only the legacy 512-byte region
     // at the beginning of current->fpu_state without clearing upper YMM registers
     memcpy(&current->fpu_state, (const void *)k_uc->fpregs_mem, 512);
@@ -900,7 +984,7 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
     return;
   }
 
-  if (regs->cs == 0x1b) {
+  if (regs->cs == 0x23 && current->mm && current->mm->compat32) {
     signal_compat_deliver(regs, sig, current, sa,
                           has_queued_info ? &queued_info : NULL);
     return;
@@ -922,6 +1006,14 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
    * functions may keep live data in the 128 bytes immediately below RSP.
    */
   rsp -= X86_64_RED_ZONE_SIZE;
+
+  uint32_t xsize = signal_xstate_size();
+  uint64_t fpstate = 0;
+  if (xsize) {
+    rsp -= xsize + sizeof(uint32_t);
+    rsp &= ~63ULL; /* XRSTOR alignment */
+    fpstate = rsp;
+  }
 
   // Push frame to the chosen stack
   rsp -= sizeof(struct sigframe);
@@ -965,7 +1057,29 @@ static void signal_deliver_frame(struct registers *regs, uint64_t syscall_number
     frame->info = queued_info;
   frame->ucontext.uc_mcontext.fpregs =
       user_frame + offsetof(struct sigframe, ucontext.fpregs_mem);
-  if (copy_to_user((void *)user_frame, frame, sizeof(*frame))) {
+  if (fpstate) {
+    /* fill_signal_context just XSAVEd into current->fpu_state. */
+    uint8_t *img = current->fpu_state;
+    struct fpx_sw_bytes sw = {
+      .magic1 = FP_XSTATE_MAGIC1,
+      .extended_size = xsize + sizeof(uint32_t),
+      .xfeatures = __atomic_load_n(&cpu_xsave_mask, __ATOMIC_ACQUIRE),
+      .xstate_size = xsize,
+    };
+    memcpy(img + 464, &sw, sizeof(sw));
+    uint32_t magic2 = FP_XSTATE_MAGIC2;
+    if (!vmm_is_user_addr_range_writable(fpstate, xsize + sizeof(magic2)) ||
+        copy_to_user((void *)fpstate, img, xsize) ||
+        copy_to_user((void *)(fpstate + xsize), &magic2, sizeof(magic2))) {
+      klog_puts("[SIGNAL] Cannot write xstate frame\n");
+      signal_frame_terminate(current);
+      return;
+    }
+    memset(img + 464, 0, sizeof(sw));
+    frame->ucontext.uc_mcontext.fpregs = fpstate;
+    frame->ucontext.uc_flags |= UC_FP_XSTATE;
+  }
+  if (copy_to_user((void *)user_frame, frame, SIGFRAME_USER_SIZE)) {
     klog_puts("[SIGNAL] Cannot write signal frame\n");
     signal_frame_terminate(current);
     return;
@@ -1017,7 +1131,7 @@ static void signal_syscall_return(struct syscall_regs *sregs, uint64_t number,
                                    uint64_t return_ip) {
   /* int 0x80 delivers default actions using its original interrupt frame.
    * i386 custom signal frames are not implemented yet. */
-  if (sregs->user_cs == 0x1b) {
+  if (sregs->user_cs == 0x23) {
     /* Compat translation does not retain the original i386 syscall number.
      * It cannot replay an int 0x80 here; do not expose restart codes. */
     if (number != UINT64_MAX && syscall_restart_error(sregs->rax))
@@ -1052,8 +1166,8 @@ static void signal_syscall_return(struct syscall_regs *sregs, uint64_t number,
   regs.rcx = sregs->rip; /* Architectural SYSCALL clobbers */
   regs.r11 = sregs->rflags;
   regs.rsp = sregs->rsp;
-  regs.cs = 0x2B;
-  regs.ss = 0x23; // Standard user segments
+  regs.cs = 0x33;
+  regs.ss = 0x2B; // Standard user segments
 
   signal_deliver_frame(&regs, number, return_ip);
 
@@ -1815,6 +1929,17 @@ void signal_notify_thread(struct thread *t, int sig) {
   // Wake up thread if it's sleeping/blocked
   if (t->state == THREAD_SLEEPING || t->state == THREAD_BLOCKED) {
     sched_wakeup(t);
+  } else if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE) && lapic_is_ready()) {
+    /* Running on another CPU: like Linux's kick_process(), interrupt it so
+     * the signal is taken at its next return to user mode now, not whenever
+     * that CPU next happens to enter the kernel. Wine's SuspendThread is a
+     * SIGUSR1; without this a busy target stayed unsuspended for up to
+     * hundreds of ms, which a game's watchdog read as a debugger. */
+    struct cpu_info *self = cpu_get_current();
+    struct cpu_info *where =
+        cpu_get_info(__atomic_load_n(&t->cpu_index, __ATOMIC_ACQUIRE));
+    if (where && where != self && where->current_thread == t)
+      lapic_send_ipi(where->apic_id, IPI_VECTOR_RESCHEDULE);
   }
 
   signal_notify_signalfds(t, sig);

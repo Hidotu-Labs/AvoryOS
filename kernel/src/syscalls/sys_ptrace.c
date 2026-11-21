@@ -82,6 +82,9 @@
 #define SI_KERNEL_CODE 128
 #define USER_REG_COUNT 27
 #define USER_REG_BYTES (USER_REG_COUNT * sizeof(uint64_t))
+/* offsetof(struct user, u_debugreg) on x86-64 Linux. */
+#define USER_DEBUGREG_OFFSET 848
+#define USER_DEBUGREG_END (USER_DEBUGREG_OFFSET + 8 * sizeof(uint64_t))
 #define FPREG_BYTES 512
 #define MAX_PROCESS_VM_IOV 1024
 
@@ -154,7 +157,7 @@ static void user_regs_from_syscall(uint64_t out[USER_REG_COUNT],
   out[11] = r->rip; out[12] = r->rdx; out[13] = r->rsi; out[14] = r->rdi;
   out[15] = t->last_syscall_num; out[16] = r->rip;
   out[17] = r->user_cs; out[18] = r->rflags; out[19] = r->rsp;
-  out[20] = 0x23; out[21] = t->fs_base; out[22] = t->gs_base;
+  out[20] = 0x2b; out[21] = t->fs_base; out[22] = t->gs_base;
   out[23] = out[24] = out[25] = out[26] = 0;
 }
 
@@ -985,13 +988,31 @@ static uint64_t ptrace_request(uint64_t request, uint64_t pid_val,
     break;
   }
   case PTRACE_PEEKUSR: {
+    uint64_t value;
+    if (!(addr & 7) && addr >= USER_DEBUGREG_OFFSET && addr < USER_DEBUGREG_END) {
+      /* Debug registers: Linux reports DR4/DR5 as 0 and the rest as set. */
+      unsigned n = (unsigned)((addr - USER_DEBUGREG_OFFSET) / 8);
+      value = (n == 4 || n == 5) ? 0 : target->ptrace_debugreg[n];
+      spinlock_release(&tid_lock);
+      return copy_to_user((void *)data, &value, sizeof(value))
+                 ? neg_errno(EFAULT) : 0;
+    }
     if ((addr & 7) || addr >= USER_REG_BYTES) { result = neg_errno(EIO); break; }
-    uint64_t value = target->ptrace_regs[addr / 8];
+    value = target->ptrace_regs[addr / 8];
     spinlock_release(&tid_lock);
     return copy_to_user((void *)data, &value, sizeof(value))
                ? neg_errno(EFAULT) : 0;
   }
   case PTRACE_POKEUSR: {
+    if (!(addr & 7) && addr >= USER_DEBUGREG_OFFSET && addr < USER_DEBUGREG_END) {
+      unsigned n = (unsigned)((addr - USER_DEBUGREG_OFFSET) / 8);
+      /* DR0-DR3 hold user addresses; DR4/DR5 are aliases Linux rejects. */
+      if (n == 4 || n == 5 || (n < 4 && data >= 0x0000800000000000ULL))
+        result = neg_errno(EIO);
+      else
+        target->ptrace_debugreg[n] = data;
+      break;
+    }
     if ((addr & 7) || addr >= USER_REG_BYTES ||
         !set_user_register(target->ptrace_regs, (unsigned)(addr / 8), data))
       result = neg_errno(EIO);

@@ -206,6 +206,9 @@ int unix_getsockopt_impl(socket_t *sock, int level, int optname,
     }
     return unix_opt_put_int(optval, optlen, klen, usk->sndtimeo_ms);
 
+  case 10: // SO_OOBINLINE: AF_UNIX has no OOB data; report off like Linux.
+    return unix_opt_put_int(optval, optlen, klen, 0);
+
   case 9: { // SO_KEEPALIVE
     int r = unix_opt_put_int(optval, optlen, klen, 0);
     if (r == 0)
@@ -446,6 +449,9 @@ int unix_setsockopt_impl(socket_t *sock, int level, int optname,
     klog_debug_puts(" ms\n");
     return 0;
   }
+
+  case 10: // SO_OOBINLINE
+    return 0;
 
   case 9: // SO_KEEPALIVE
     klog_debug_puts("[OK] unix_setsockopt: SO_KEEPALIVE\n");

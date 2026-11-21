@@ -692,6 +692,9 @@ struct drm_file {
   /* Optional per-open state owned by the hardware driver. */
   void *driver_private;
   uint32_t virgl_context;
+  /* CONTEXT_INIT capset for this file; 0 until initialized. Only VENUS
+   * selects a non-legacy host context. */
+  uint32_t virgl_capset;
   bool is_render;
 
   spinlock_t lock;
@@ -789,6 +792,14 @@ struct drm_gem_object {
   void *prime_buffer; /* referenced Linux dma_buf for a foreign GEM import */
   void *prime_mapping; /* pinned attachment + CPU mapping */
   void *prime_reservation; /* shared implicit fences for native exports */
+  /* Device range with no struct pages (host shm window). phys_addr is the
+   * base; export uses the range instead of PMM pages. */
+  bool device_range;
+  /* Host-only device memory (a blob without USE_MAPPABLE): exported as an
+   * opaque dma-buf with no CPU or DMA access, importable only as this object. */
+  bool device_opaque;
+  /* Runs before a dma-buf export so lazily placed device memory exists. */
+  int (*prepare_export)(struct drm_gem_object *obj);
 };
 
 typedef void (*drm_commit_damage_fn_t)(struct drm_device *dev,

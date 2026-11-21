@@ -1,3 +1,4 @@
+#include "mm/devframe.h"
 #include "mm/zram.h"
 #include "../lib/string.h"
 #include "../lock/spinlock.h"
@@ -262,6 +263,7 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
         if (shared_refs && pmm_is_managed(phys))
           pmm_incref((void *)phys);
         new_virt[i] = src_virt[i] & ~PAGE_FLAG_MLOCKED;
+        devframe_pte_install(page_vaddr, phys);
       } else {
         // Private: CoW — mark both sides read-only and bump the refcount.
         if (pmm_is_managed(phys)) {
@@ -274,6 +276,7 @@ static bool clone_table_vma(uint64_t *src_table_phys, int level,
           pmm_incref((void *)phys);
         }
         new_virt[i] = src_virt[i] & ~PAGE_FLAG_MLOCKED;
+        devframe_pte_install(page_vaddr, phys);
       }
     } else {
       int shift = 12 + 9 * (level - 1);

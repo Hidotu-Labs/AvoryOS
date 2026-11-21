@@ -134,7 +134,7 @@ void process_jump_usermode(uint64_t rip, uint64_t user_rsp, uint64_t pml4) {
 
   if (cur && cur->mm && cur->mm->compat32) {
     struct syscall_regs frame = { .rip=rip, .rsp=user_rsp, .rflags=0x202,
-                                  .user_cs=0x1b };
+                                  .user_cs=0x23 };
     extern void fork_return_to_userspace(struct syscall_regs *)
         __attribute__((noreturn));
     fork_return_to_userspace(&frame);
@@ -143,7 +143,7 @@ void process_jump_usermode(uint64_t rip, uint64_t user_rsp, uint64_t pml4) {
   extern bool cpu_has_fred_flag;
   if (cpu_has_fred_flag) {
     struct syscall_regs frame = { .rip=rip, .rsp=user_rsp, .rflags=0x202,
-                                  .user_cs=0x2b };
+                                  .user_cs=0x33 };
     extern void fork_return_to_userspace(struct syscall_regs *)
         __attribute__((noreturn));
     fork_return_to_userspace(&frame);
@@ -155,7 +155,7 @@ void process_jump_usermode(uint64_t rip, uint64_t user_rsp, uint64_t pml4) {
       user_rsp; // Use rdi temporarily to hold stack
 
   __asm__ volatile(".intel_syntax noprefix\n"
-                   "mov ax, 0x23\n"
+                   "mov ax, 0x2b\n"
                    "mov ds, ax\n"
                    "mov es, ax\n"
                    "mov rsp, %[usr_stack]\n"

@@ -411,7 +411,7 @@ static uint64_t sys_time(uint64_t tloc_ptr, uint64_t a1, uint64_t a2,
 #define MCL_CURRENT 1
 #define MCL_FUTURE 2
 #define MLOCK_ONFAULT 1
-#define MLOCK_UNPRIV_LIMIT (64ULL * 1024ULL)
+#define MLOCK_UNPRIV_LIMIT (8ULL * 1024ULL * 1024ULL) /* Linux >= 5.16 default */
 
 struct mlock_vma_range {
   uint64_t start;

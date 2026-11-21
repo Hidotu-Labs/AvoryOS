@@ -5,6 +5,10 @@
 int linuxkpi_prime_export(void *object, __SIZE_TYPE__ size, void *reservation,
                          __UINT64_TYPE__ (*page_phys)(void *, unsigned int),
                          void (*release)(void *), unsigned int flags);
+/* Consumes the caller's native object reference, including on failure. */
+int linuxkpi_prime_export_range(void *object, __SIZE_TYPE__ size, void *reservation,
+                               __UINT64_TYPE__ phys, void (*release)(void *),
+                               unsigned int flags);
 int linuxkpi_prime_get(int fd, void **buffer, __SIZE_TYPE__ *size);
 void linuxkpi_prime_put(void *buffer);
 void *linuxkpi_prime_native_object(void *buffer);

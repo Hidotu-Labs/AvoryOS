@@ -12,8 +12,30 @@
 #define VIRTIO_GPU_EVENT_DISPLAY         (1U << 0)
 #define VIRTIO_GPU_MAX_SCANOUTS          16
 #define VIRTIO_GPU_FLAG_FENCE            (1U << 0)
+#define VIRTIO_GPU_FLAG_INFO_RING_IDX    (1U << 1)
+#define VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK 0x000000ffU
+/* blob_mem / blob_flags for RESOURCE_CREATE_BLOB */
+#define VIRTIO_GPU_BLOB_MEM_GUEST        0x0001U
+#define VIRTIO_GPU_BLOB_MEM_HOST3D       0x0002U
+#define VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST 0x0003U
+#define VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE    0x0001U
+#define VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE   0x0002U
+#define VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE 0x0004U
+/* map_info low bits from RESP_OK_MAP_INFO */
+#define VIRTIO_GPU_MAP_CACHE_MASK        0x0FU
+#define VIRTIO_GPU_MAP_CACHE_NONE        0x00U
+#define VIRTIO_GPU_MAP_CACHE_CACHED      0x01U
+#define VIRTIO_GPU_MAP_CACHE_UNCACHED    0x02U
+#define VIRTIO_GPU_MAP_CACHE_WC          0x03U
 #define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM 1U
 #define VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM 2U
+#define VIRTIO_GPU_SHM_ID_HOST_VISIBLE   1U
+#define VIRTIO_GPU_CAPSET_VIRGL          1U
+#define VIRTIO_GPU_CAPSET_VIRGL2         2U
+#define VIRTIO_GPU_CAPSET_GFXSTREAM      3U
+#define VIRTIO_GPU_CAPSET_VENUS          4U
+#define VIRTIO_GPU_CAPSET_CROSS_DOMAIN   5U
+#define VIRTIO_GPU_CAPSET_DRM            6U
 
 enum virtio_gpu_ctrl_type {
     VIRTIO_GPU_CMD_GET_DISPLAY_INFO = 0x0100,
@@ -38,6 +60,8 @@ enum virtio_gpu_ctrl_type {
     VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D,
     VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D,
     VIRTIO_GPU_CMD_SUBMIT_3D,
+    VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
+    VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
     VIRTIO_GPU_CMD_UPDATE_CURSOR = 0x0300,
     VIRTIO_GPU_CMD_MOVE_CURSOR,
     VIRTIO_GPU_RESP_OK_NODATA = 0x1100,
@@ -61,7 +85,8 @@ struct virtio_gpu_config {
 struct virtio_gpu_ctrl_hdr {
     uint32_t type, flags;
     uint64_t fence_id;
-    uint32_t ctx_id, padding;
+    uint32_t ctx_id;
+    uint8_t ring_idx, padding[3];
 } __attribute__((packed));
 struct virtio_gpu_rect {
     uint32_t x, y, width, height;
@@ -165,7 +190,30 @@ struct virtio_gpu_cmd_submit {
     struct virtio_gpu_ctrl_hdr hdr;
     uint32_t size, padding;
 };
+struct virtio_gpu_resource_create_blob {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id, blob_mem, blob_flags, nr_entries;
+    uint64_t blob_id, size;
+    /* followed by nr_entries struct virtio_gpu_mem_entry (GUEST blobs only) */
+} __attribute__((packed));
+struct virtio_gpu_resource_map_blob {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id, padding;
+    uint64_t offset; /* byte offset inside the host-visible shm window */
+} __attribute__((packed));
+struct virtio_gpu_resource_unmap_blob {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id, padding;
+} __attribute__((packed));
+struct virtio_gpu_resp_map_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t map_info, padding;
+} __attribute__((packed));
 _Static_assert(sizeof(struct virtio_gpu_ctx_create) == 96, "virgl context ABI");
+_Static_assert(sizeof(struct virtio_gpu_resource_create_blob) == 56, "virtio-gpu blob create ABI");
+_Static_assert(sizeof(struct virtio_gpu_resource_map_blob) == 40, "virtio-gpu blob map ABI");
+_Static_assert(sizeof(struct virtio_gpu_resource_unmap_blob) == 32, "virtio-gpu blob unmap ABI");
+_Static_assert(sizeof(struct virtio_gpu_resp_map_info) == 32, "virtio-gpu map info ABI");
 _Static_assert(sizeof(struct virtio_gpu_resource_create_3d) == 72, "virgl resource ABI");
 _Static_assert(sizeof(struct virtio_gpu_transfer_host_3d) == 72, "virgl transfer ABI");
 _Static_assert(sizeof(struct virtio_gpu_ctrl_hdr) == 24, "virtio-gpu control header ABI");

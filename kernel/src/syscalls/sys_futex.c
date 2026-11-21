@@ -12,6 +12,7 @@
 #include "../lock/lockdiag.h"
 #include "../lock/spinlock.h"
 #include "../mm/vmm.h"
+#include "../mm/heap.h"
 #include "../sched/sched.h"
 #include "syscall.h"
 #include "arch/uaccess.h"
@@ -1287,6 +1288,154 @@ static uint64_t sys_futex(uint64_t uaddr_val, uint64_t op_val, uint64_t val_arg,
   }
 }
 
+/* futex_waitv(2): wait on up to 128 32-bit futexes; returns the index of the
+ * woken entry. Waiters are heap-allocated (128 on the kernel stack would blow
+ * it) and each links into its own bucket, all pointing at this thread. */
+#define FUTEX_WAITV_MAX 128
+#define FUTEX2_SIZE_MASK 0x03
+#define FUTEX2_SIZE_U32 0x02
+#define FUTEX2_PRIVATE 128
+struct futex_waitv_user {
+  uint64_t val;
+  uint64_t uaddr;
+  uint32_t flags;
+  uint32_t reserved;
+};
+
+static int futex_waitv_unqueue_all(struct futex_waiter *w, uint32_t n) {
+  int woken = -1;
+  for (uint32_t i = 0; i < n; i++) {
+    uint32_t b = futex_lock_waiter(&w[i]);
+    if (w[i].queued)
+      futex_dequeue(b, &w[i]);
+    else if (woken < 0)
+      woken = (int)i;
+    spinlock_release(&futex_hash[b].lock);
+  }
+  return woken;
+}
+
+static uint64_t sys_futex_waitv(uint64_t waiters_ptr, uint64_t nr,
+                                uint64_t flags, uint64_t timeout_ptr,
+                                uint64_t clockid, uint64_t a6) {
+  (void)a6;
+  if (flags || nr == 0 || nr > FUTEX_WAITV_MAX)
+    return (uint64_t)-EINVAL;
+  if (!waiters_ptr)
+    return (uint64_t)-EINVAL;
+  uint64_t ts[2];
+  bool have_timeout = timeout_ptr != 0;
+  if (have_timeout) {
+    if (clockid != 0 && clockid != 1)
+      return (uint64_t)-EINVAL;
+    if (copy_from_user(ts, (void *)timeout_ptr, sizeof(ts)))
+      return (uint64_t)-EFAULT;
+    if ((int64_t)ts[0] < 0 || ts[1] >= 1000000000ULL)
+      return (uint64_t)-EINVAL;
+  }
+
+  struct thread *self = sched_get_current();
+  if (!self)
+    return (uint64_t)-EFAULT;
+
+  size_t ubytes = (size_t)nr * sizeof(struct futex_waitv_user);
+  struct futex_waitv_user *uv = kmalloc(ubytes);
+  struct futex_waiter *w = kmalloc((size_t)nr * sizeof(*w));
+  uint64_t ret = 0;
+  if (!uv || !w) {
+    ret = (uint64_t)-12; /* ENOMEM */
+    goto out;
+  }
+  if (copy_from_user(uv, (void *)waiters_ptr, ubytes)) {
+    ret = (uint64_t)-EFAULT;
+    goto out;
+  }
+  for (uint32_t i = 0; i < nr; i++) {
+    if (uv[i].reserved || (uv[i].flags & ~(FUTEX2_SIZE_MASK | FUTEX2_PRIVATE)) ||
+        (uv[i].flags & FUTEX2_SIZE_MASK) != FUTEX2_SIZE_U32 ||
+        (uv[i].val >> 32)) {
+      ret = (uint64_t)-EINVAL;
+      goto out;
+    }
+    int err = futex_get_key((uint32_t *)uv[i].uaddr,
+                            (uv[i].flags & FUTEX2_PRIVATE) != 0, &w[i].key);
+    if (err) {
+      ret = (uint64_t)(int64_t)err;
+      goto out;
+    }
+    w[i].bucket = futex_hash_key(w[i].key);
+    w[i].thread = self;
+    w[i].bitset = 0xffffffffU;
+    w[i].pi = false;
+    w[i].acquired = false;
+    w[i].queued = false;
+    w[i].next = w[i].prev = NULL;
+  }
+
+  uint64_t deadline = 0;
+  if (have_timeout) {
+    uint64_t now = lapic_timer_get_ticks();
+    int terr = futex_wait_deadline(ts, true, clockid == 0, now, &deadline);
+    if (terr) {
+      ret = (uint64_t)(int64_t)terr;
+      goto out;
+    }
+  }
+
+  /* Enqueue each waiter before checking its value so a concurrent wake can
+   * never be lost; abort with EAGAIN on the first mismatch. */
+  for (uint32_t i = 0; i < nr; i++) {
+    spinlock_acquire(&futex_hash[w[i].bucket].lock);
+    futex_enqueue(w[i].bucket, &w[i]);
+    uint32_t cur = futex_uaccess_load32((uint32_t *)uv[i].uaddr,
+                                        __ATOMIC_SEQ_CST);
+    spinlock_release(&futex_hash[w[i].bucket].lock);
+    if (cur != (uint32_t)uv[i].val) {
+      int woken = futex_waitv_unqueue_all(w, i + 1);
+      ret = woken >= 0 ? (uint64_t)woken : (uint64_t)-EAGAIN;
+      goto out;
+    }
+  }
+
+  for (;;) {
+    if (have_timeout && lapic_timer_get_ticks() >= deadline) {
+      int woken = futex_waitv_unqueue_all(w, (uint32_t)nr);
+      ret = woken >= 0 ? (uint64_t)woken : (uint64_t)-ETIMEDOUT;
+      break;
+    }
+    /* Publish BLOCKED, then look for a wake that already dequeued one of our
+     * waiters: either we see it here or the waker's sched_wakeup follows. */
+    hal_irq_state_t irq = hal_irq_save();
+    self->wakeup_ticks = have_timeout ? deadline : 0;
+    __atomic_store_n(&self->state, THREAD_BLOCKED, __ATOMIC_SEQ_CST);
+    bool any_woken = false;
+    for (uint32_t i = 0; i < nr && !any_woken; i++)
+      any_woken = !__atomic_load_n(&w[i].queued, __ATOMIC_SEQ_CST);
+    if (any_woken || thread_has_pending_signal(self))
+      self->state = THREAD_RUNNING;
+    hal_irq_restore(irq);
+    if (self->state == THREAD_BLOCKED)
+      sched_yield();
+    self->wakeup_ticks = 0;
+
+    bool any = false;
+    for (uint32_t i = 0; i < nr && !any; i++)
+      any = !__atomic_load_n(&w[i].queued, __ATOMIC_SEQ_CST);
+    if (any || thread_has_pending_signal(self)) {
+      int woken = futex_waitv_unqueue_all(w, (uint32_t)nr);
+      ret = woken >= 0 ? (uint64_t)woken : (uint64_t)-EINTR;
+      break;
+    }
+  }
+
+out:
+  if (uv)
+    kfree(uv);
+  if (w)
+    kfree(w);
+  return ret;
+}
+
 // Registration
 uint64_t futex_wake_user(uint32_t *uaddr, uint32_t count) {
   // CLONE_CHILD_CLEARTID is paired with pthread-private futex waits in musl,
@@ -1315,4 +1464,5 @@ void syscall_register_futex(void) {
   // race/branch unnecessary in every futex operation.
   futex_init_once();
   syscall_register(SYS_FUTEX, sys_futex);
+  syscall_register(449, sys_futex_waitv);
 }

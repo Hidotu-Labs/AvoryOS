@@ -11,6 +11,19 @@ void heap_big_init(void) {
   heap_big_alloc_head = NULL;
 }
 
+/* Big allocations need a physically contiguous run of pages. A failure with
+ * plenty of free pages means fragmentation, not exhaustion, and surfaces to
+ * userland as ENOMEM (e.g. socket bounce buffers). Log the first few so the
+ * two cases can be told apart from the console. */
+static void heap_big_report_failure(size_t size, size_t pages) {
+  static uint32_t reported;
+  if (__atomic_fetch_add(&reported, 1, __ATOMIC_RELAXED) >= 32)
+    return;
+  klogf("[HEAP] big alloc failed size=%llu pages=%llu free_pages=%llu\n",
+        (unsigned long long)size, (unsigned long long)pages,
+        (unsigned long long)pmm_get_free_pages_including_pcp());
+}
+
 void *heap_big_alloc(size_t size) {
   size_t total_size = size + sizeof(struct big_alloc);
   size_t pages = (total_size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -19,8 +32,10 @@ void *heap_big_alloc(size_t size) {
   if (!blocks) {
     heap_oom_reclaim();
     blocks = pmm_alloc_pages(pages);
-    if (!blocks)
+    if (!blocks) {
+      heap_big_report_failure(size, pages);
       return NULL;
+    }
   }
 
   uint64_t vaddr = (uint64_t)blocks + pmm_get_hhdm_offset();

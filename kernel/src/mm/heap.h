@@ -11,6 +11,11 @@ void heap_init(void);
 // Allocate 'size' bytes of memory
 void *kmalloc(size_t size);
 
+// Like kmalloc, but when no physically contiguous run is available it falls
+// back to vmalloc (order-0 pages mapped in the VMAP window). Use only for
+// CPU-only buffers that are never handed to a device. kfree() releases both.
+void *kmalloc_fallback(size_t size);
+
 // Free an allocated block of memory
 void kfree(void *ptr);
 

@@ -515,7 +515,7 @@ obj-$(ARCH)/src/drivers/storage/nvme.c.o: $(NVME_BATCH_STAMP)
 -include $(HEADER_DEPS)
 
 src/syscalls/vdso.so: src/syscalls/vdso.c src/syscalls/vdso.lds src/syscalls/vdso.version
-	gcc -shared -nostdlib -fPIC -fno-stack-protector -O2 -Wl,-T,src/syscalls/vdso.lds -Wl,-soname=linux-vdso.so.1 -Wl,--version-script=src/syscalls/vdso.version -Wl,--hash-style=both -Wl,-Bsymbolic -Wl,-z,max-page-size=4096 -o $@ $<
+	gcc -shared -nostdlib -fPIC -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -O2 -s -Wl,-T,src/syscalls/vdso.lds -Wl,-soname=linux-vdso.so.1 -Wl,--version-script=src/syscalls/vdso.version -Wl,--hash-style=both -Wl,-Bsymbolic -Wl,-z,max-page-size=4096 -o $@ $<
 
 obj-$(ARCH)/src/syscalls/vdso_blob.asm.o: src/syscalls/vdso_blob.asm src/syscalls/vdso.so GNUmakefile
 	mkdir -p "$(dir $@)"

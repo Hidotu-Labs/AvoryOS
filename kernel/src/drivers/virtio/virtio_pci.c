@@ -144,6 +144,49 @@ bool virtio_pci_init(struct virtio_pci_device *vdev, struct pci_device *pci) {
       struct virtio_pci_cap cap;
       read_pci_cap(pci, cap_off, &cap);
 
+      if (cap.cfg_type == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG) {
+        uint32_t offset_hi = 0, length_hi = 0;
+        if (cap.cap_len >= 24) {
+          offset_hi = pci_config_read32(pci->bus, pci->slot, pci->func,
+                                        cap_off + 16);
+          length_hi = pci_config_read32(pci->bus, pci->slot, pci->func,
+                                        cap_off + 20);
+        }
+        uint64_t shm_offset = ((uint64_t)offset_hi << 32) | cap.offset;
+        uint64_t shm_length = ((uint64_t)length_hi << 32) | cap.length;
+        uint64_t bar_phys = (cap.bar < 6) ? pci_bar_phys(pci, cap.bar) : 0;
+
+        klogf("[VIRTIO-PCI] Found SHARED_MEMORY_CFG id=%u BAR%u+0x%llx "
+              "size=0x%llx bar_phys=0x%llx\n",
+              cap.id, cap.bar, (unsigned long long)shm_offset,
+              (unsigned long long)shm_length, (unsigned long long)bar_phys);
+
+        if (cap.id == 1 && bar_phys != 0 && shm_length > 0 &&
+            !vdev->shm_present) {
+          uint64_t shm_phys = bar_phys + shm_offset;
+          void *mapped = pci_map_mmio(shm_phys, shm_length);
+          if (mapped) {
+            vdev->shm_phys = shm_phys;
+            vdev->shm_size = shm_length;
+            vdev->shm_virt = mapped;
+            vdev->shm_bar = cap.bar;
+            vdev->shm_id = cap.id;
+            vdev->shm_present = true;
+            klogf("[VIRTIO-PCI] Mapped shm window id=%u phys=0x%llx "
+                  "size=0x%llx virt=%p\n",
+                  cap.id, (unsigned long long)shm_phys,
+                  (unsigned long long)shm_length, mapped);
+          } else {
+            klogf("[VIRTIO-PCI] Failed to map shm window id=%u phys=0x%llx "
+                  "size=0x%llx\n",
+                  cap.id, (unsigned long long)shm_phys,
+                  (unsigned long long)shm_length);
+          }
+        }
+        cap_off = (cap_header >> 8) & 0xFF;
+        continue;
+      }
+
       // Map the BAR if not yet mapped
       if (cap.bar < 6 && vdev->bar_virt[cap.bar] == 0) {
         vdev->bar_virt[cap.bar] = map_bar(pci, cap.bar, &vdev->bar_size[cap.bar]);

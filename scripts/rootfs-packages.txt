@@ -145,6 +145,7 @@ wayland-protocols
 vulkan-icd-loader
 vulkan-tools
 vulkan-swrast
+vulkan-virtio
 vulkan-radeon
 vulkan-nouveau
 mesa-demos

@@ -65,11 +65,11 @@ static void signal_compat_deliver(struct registers *regs, int sig,
   uint16_t fs, gs;
   __asm__ volatile("mov %%fs, %0; mov %%gs, %1" : "=rm"(fs), "=rm"(gs));
   struct compat_sigcontext sc = {
-    .gs=gs, .fs=fs, .es=0x23, .ds=0x23,
+    .gs=gs, .fs=fs, .es=0x2b, .ds=0x2b,
     .di=regs->rdi, .si=regs->rsi, .bp=regs->rbp, .sp=regs->rsp,
     .bx=regs->rbx, .dx=regs->rdx, .cx=regs->rcx, .ax=regs->rax,
     .trapno=regs->int_no, .err=regs->err_code, .ip=regs->rip,
-    .cs=0x1b, .flags=regs->rflags, .sp_at_signal=regs->rsp, .ss=0x23,
+    .cs=0x23, .flags=regs->rflags, .sp_at_signal=regs->rsp, .ss=0x2b,
     .fpstate=fpaddr, .oldmask=mask, .cr2=t->fault_addr
   };
   /* _fpstate_32 has a 112-byte legacy x87 prefix followed by the 512-byte
@@ -142,16 +142,16 @@ static void signal_compat_deliver(struct registers *regs, int sig,
 }
 
 static bool compat_signal_selector(struct thread *t, uint32_t selector) {
-  if (!selector || selector == 0x23) return true;
-  return (selector & 7) == 3 && selector >> 3 >= 6 && selector >> 3 <= 8 &&
-         t->compat_tls[(selector >> 3) - 6] != 0;
+  if (!selector || selector == 0x2b) return true;
+  return (selector & 7) == 3 && selector >> 3 >= 7 && selector >> 3 <= 9 &&
+         t->compat_tls[(selector >> 3) - 7] != 0;
 }
 
 void signal_compat_sigreturn(struct registers *regs, bool rt) {
   struct thread *t = sched_get_current();
   struct compat_sigcontext sc;
   uint64_t mask;
-  if (!t || regs->cs != 0x1b || regs->rsp < (rt ? 4u : 8u))
+  if (!t || regs->cs != 0x23 || regs->rsp < (rt ? 4u : 8u))
     signal_frame_terminate(t);
   uint64_t address = (uint32_t)regs->rsp - (rt ? 4u : 8u);
   if (rt) {
@@ -172,10 +172,10 @@ void signal_compat_sigreturn(struct registers *regs, bool rt) {
     sc = frame.sc;
     mask = sc.oldmask | ((uint64_t)frame.extramask << 32);
   }
-  if (sc.cs != 0x1b || sc.ss != 0x23 || sc.ip >= ELF32_USER_LIMIT ||
+  if (sc.cs != 0x23 || sc.ss != 0x2b || sc.ip >= ELF32_USER_LIMIT ||
       sc.sp >= ELF32_USER_LIMIT || !compat_signal_selector(t, sc.fs) ||
-      !compat_signal_selector(t, sc.gs) || (sc.ds && sc.ds != 0x23) ||
-      (sc.es && sc.es != 0x23))
+      !compat_signal_selector(t, sc.gs) || (sc.ds && sc.ds != 0x2b) ||
+      (sc.es && sc.es != 0x2b))
     signal_frame_terminate(t);
   uint8_t fx[512] __attribute__((aligned(64)));
   if (sc.fpstate) {
@@ -218,15 +218,15 @@ void signal_compat_sigreturn(struct registers *regs, bool rt) {
   __asm__ volatile("mov %0, %%fs; mov %1, %%gs; mov %2, %%ds; mov %3, %%es"
                    :: "rm"(fs), "rm"(gs), "rm"(ds), "rm"(es) : "memory");
   wrmsr(0xC0000101, kernel_gs);
-  uint64_t fd = fs >> 3 >= 6 ? t->compat_tls[(fs >> 3) - 6] : 0;
-  uint64_t gd = gs >> 3 >= 6 ? t->compat_tls[(gs >> 3) - 6] : 0;
+  uint64_t fd = fs >> 3 >= 7 ? t->compat_tls[(fs >> 3) - 7] : 0;
+  uint64_t gd = gs >> 3 >= 7 ? t->compat_tls[(gs >> 3) - 7] : 0;
   t->compat_fs = fs; t->compat_gs = gs;
   t->fs_base = ((fd >> 16) & 0xffffff) | ((fd >> 32) & 0xff000000);
   t->gs_base = ((gd >> 16) & 0xffffff) | ((gd >> 32) & 0xff000000);
   wrmsr(0xC0000100, t->fs_base); wrmsr(0xC0000102, t->gs_base);
   *regs = (struct registers){.rdi=sc.di, .rsi=sc.si, .rbp=sc.bp,
     .rbx=sc.bx, .rdx=sc.dx, .rcx=sc.cx, .rax=sc.ax,
-    .rip=sc.ip, .rsp=sc.sp, .cs=0x1b, .ss=0x23,
+    .rip=sc.ip, .rsp=sc.sp, .cs=0x23, .ss=0x2b,
     .rflags=(sc.flags & 0x240dd5U) | 0x202, .int_no=0x80};
   t->signal_mask = mask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
   t->fault_regs_valid = false; t->fault_addr = 0;

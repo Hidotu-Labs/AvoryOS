@@ -580,10 +580,20 @@ retry:
            PAGE_SIZE - read);
 
   spinlock_acquire(&node->pages_lock);
-  page->uptodate = read == to_read && !vfs_page_is_evicted(page);
+  bool evicted = vfs_page_is_evicted(page);
+  page->uptodate = read == to_read && !evicted;
   page->loading = false;
   bool ok = page->uptodate;
   spinlock_release(&node->pages_lock);
+  if (!ok && read == to_read && evicted) {
+    /* The read succeeded but reclaim evicted the page while it loaded. That
+     * is a race, not an I/O error: drop it and look the offset up again.
+     * Failing here SIGBUSed whoever faulted (winedevice.exe on libgcc_s),
+     * killing Wine's mountmgr mid-registry-save. */
+    vfs_cache_invalidate(node, offset);
+    vfs_cache_put(node, page);
+    goto retry;
+  }
   if (!ok) {
     static uint32_t page_fill_failures;
     uint32_t failure_count =

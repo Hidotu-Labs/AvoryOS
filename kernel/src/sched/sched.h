@@ -564,6 +564,10 @@ struct thread {
   uint64_t ptrace_message;
   uint32_t ptrace_resume_pid;
   uint64_t ptrace_regs[27]; /* x86-64 struct user_regs_struct */
+  /* struct user u_debugreg[8] as seen through PTRACE_PEEKUSR/POKEUSR. Stored,
+   * not programmed into DR0-DR7: wineserver reads these for every
+   * CONTEXT_DEBUG_REGISTERS request and fails the call if the read errors. */
+  uint64_t ptrace_debugreg[8];
   uint8_t ptrace_siginfo[128];
   uint8_t ptrace_syscall_info[128];
   int32_t ptrace_stop_signal;

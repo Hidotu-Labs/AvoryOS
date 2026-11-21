@@ -225,10 +225,10 @@ static bool unix_ensure_recv_buf(unix_sock_t *usk, size_t needed) {
     if (needed > req)
       req = needed;
     size_t sz = unix_round_pow2(req);
-    usk->recv_buf = kmalloc(sz);
+    usk->recv_buf = kmalloc_fallback(sz);
     while (!usk->recv_buf && sz > UNIX_RECV_BUF_MIN) {
       sz >>= 1;
-      usk->recv_buf = kmalloc(sz);
+      usk->recv_buf = kmalloc_fallback(sz);
     }
     if (!usk->recv_buf) return false;
     usk->recv_buf_size = sz;
@@ -242,7 +242,7 @@ static bool unix_ensure_recv_buf(unix_sock_t *usk, size_t needed) {
       new_sz = usk->recv_buf_size * 2;
     if (new_sz > 4 * 1024 * 1024)
       new_sz = 4 * 1024 * 1024;
-    uint8_t *new_buf = kmalloc(new_sz);
+    uint8_t *new_buf = kmalloc_fallback(new_sz);
     if (new_buf) {
       size_t count = usk->recv_buf_count;
       size_t head = usk->recv_buf_head;
@@ -377,7 +377,7 @@ ssize_t unix_send_impl(socket_t *sock, const void *buf, size_t len, int flags) {
       break;
     }
 
-    unix_packet_t *pkt = kmalloc(sizeof(unix_packet_t) + len);
+    unix_packet_t *pkt = kmalloc_fallback(sizeof(unix_packet_t) + len);
     if (!pkt) {
       spinlock_release(&peer->recv_lock);
       socket_put(peer_sock);
@@ -1041,7 +1041,7 @@ ssize_t unix_sendmsg_impl(socket_t *sock, struct msghdr *msg, int flags) {
       }
     }
 
-    unix_packet_t *pkt = kmalloc(sizeof(unix_packet_t) + total_len);
+    unix_packet_t *pkt = kmalloc_fallback(sizeof(unix_packet_t) + total_len);
     if (!pkt) {
       if (scm_item) {
         for (int i = 0; i < scm_item->count; i++) {

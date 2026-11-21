@@ -32,12 +32,33 @@ void *kmalloc(size_t size) {
   return ptr;
 }
 
+/* VMAP window (linuxkpi/src/vmalloc.c). Pointers in it come from vmalloc and
+ * are never HHDM heap blocks, so they must be checked before the heap probe. */
+#define HEAP_VMAP_BASE 0xFFFFC00000000000ULL
+#define HEAP_VMAP_END 0xFFFFE00000000000ULL
+
+extern void *vmalloc(unsigned long size);
+extern void vfree(const void *addr);
+
+void *kmalloc_fallback(size_t size) {
+  void *ptr = kmalloc(size);
+  if (ptr || size == 0)
+    return ptr;
+  return vmalloc((unsigned long)size);
+}
+
 void kfree(void *ptr) {
   if (!ptr)
     return;
 
   void *caller = __builtin_return_address(0);
   heap_trace_record(ptr, caller);
+
+  if ((uint64_t)(uintptr_t)ptr >= HEAP_VMAP_BASE &&
+      (uint64_t)(uintptr_t)ptr < HEAP_VMAP_END) {
+    vfree(ptr);
+    return;
+  }
 
   /* Heap allocations live in managed HHDM RAM. Reject wild pointers before
    * probing their page header, which must never be an arbitrary ring-0 read. */

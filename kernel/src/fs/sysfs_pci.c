@@ -6,6 +6,8 @@
 #include "fs/ramfs.h"
 #include "lib/string.h"
 #include "mm/heap.h"
+#include "sched/capability.h"
+#include "sched/sched.h"
 #include <linuxkpi/native_sysfs.h>
 
 #define PCI_SYSFS_MAX_DEVICES PCI_MAX_DEVICES
@@ -135,8 +137,15 @@ static uint32_t config_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   struct pci_device *pci = node ? node->device : NULL;
   if (!pci || !buffer || offset >= node->length)
     return 0;
-  if (size > node->length - offset)
-    size = node->length - offset;
+  /* Like Linux, unprivileged readers see only the standard 64-byte header
+   * (lspci/steamsysinfo); the rest can have read side effects. */
+  uint32_t limit = node->length;
+  if (!capability_has_init_ns(sched_get_current(), CAP_SYS_ADMIN))
+    limit = 64;
+  if (offset >= limit)
+    return 0;
+  if (size > limit - offset)
+    size = limit - offset;
   for (uint32_t i = 0; i < size; i++) {
     uint32_t pos = offset + i;
     uint32_t value = pci_config_read32(pci->bus, pci->slot, pci->func,
@@ -479,7 +488,7 @@ static void add_config_file(vfs_node_t *dir, struct pci_device *pci) {
   vfs_node_init(node);
   strcpy(node->name, "config");
   node->flags = FS_FILE | FS_PERSISTENT;
-  node->mask = 0400;
+  node->mask = 0444; /* world-readable; reads gated in config_read */
   node->length = 256;
   node->device = pci;
   node->read = config_read;

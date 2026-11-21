@@ -21,6 +21,10 @@ struct native_prime_bo {
   struct page **pages;
   unsigned int count;
   void (*release)(void *);
+  /* Device range with no struct pages (host shm window): phys is the base.
+   * phys 0 is host-only memory with no CPU or DMA access at all. */
+  bool range;
+  unsigned long phys;
 };
 
 struct native_prime_mapping {
@@ -37,6 +41,22 @@ static struct sg_table *native_map(struct dma_buf_attachment *attach,
   int ret;
   if (!sgt)
     return ERR_PTR(-ENOMEM);
+  if (bo->range && !bo->phys) {
+    /* Host-only memory: only the exporting driver can use it. */
+    kfree(sgt);
+    return ERR_PTR(-EOPNOTSUPP);
+  }
+  if (bo->range) {
+    /* Device memory is host-coherent and never DMA-mapped here. */
+    ret = sg_alloc_table(sgt, 1, GFP_KERNEL);
+    if (ret) {
+      kfree(sgt);
+      return ERR_PTR(ret);
+    }
+    sg_dma_address(sgt->sgl) = bo->phys;
+    sg_dma_len(sgt->sgl) = attach->dmabuf->size;
+    return sgt;
+  }
   ret = sg_alloc_table_from_pages(sgt, bo->pages, bo->count, 0,
                                  attach->dmabuf->size, GFP_KERNEL);
   if (!ret)
@@ -51,7 +71,9 @@ static struct sg_table *native_map(struct dma_buf_attachment *attach,
 
 static void native_unmap(struct dma_buf_attachment *attach, struct sg_table *sgt,
                          enum dma_data_direction dir) {
-  dma_unmap_sgtable(attach->dev, sgt, dir, 0);
+  struct native_prime_bo *bo = attach->dmabuf->priv;
+  if (!bo->range)
+    dma_unmap_sgtable(attach->dev, sgt, dir, 0);
   sg_free_table(sgt);
   kfree(sgt);
 }
@@ -68,6 +90,17 @@ static int native_mmap(struct dma_buf *buf, struct vm_area_struct *vma) {
   unsigned long count = (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
   if (vma->vm_pgoff > bo->count || count > bo->count - vma->vm_pgoff)
     return -EINVAL;
+  /* Like Linux virtio-gpu, a blob without USE_MAPPABLE has no CPU mapping. */
+  if (bo->range && !bo->phys)
+    return -EINVAL;
+  if (bo->range) {
+    if (remap_pfn_range(vma, vma->vm_start,
+                        (bo->phys >> PAGE_SHIFT) + vma->vm_pgoff,
+                        count << PAGE_SHIFT, vma->vm_page_prot))
+      return -EAGAIN;
+    vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+    return 0;
+  }
   for (unsigned long i = 0; i < count; i++)
     if (remap_pfn_range(vma, vma->vm_start + i * PAGE_SIZE,
                         page_to_pfn(bo->pages[vma->vm_pgoff + i]), PAGE_SIZE,
@@ -79,7 +112,11 @@ static int native_mmap(struct dma_buf *buf, struct vm_area_struct *vma) {
 
 static int native_vmap(struct dma_buf *buf, struct iosys_map *map) {
   struct native_prime_bo *bo = buf->priv;
-  void *address = vmap(bo->pages, bo->count, VM_MAP, PAGE_KERNEL);
+  void *address;
+  /* Device ranges have no struct pages to vmap; CPU access uses mmap. */
+  if (bo->range)
+    return -EOPNOTSUPP;
+  address = vmap(bo->pages, bo->count, VM_MAP, PAGE_KERNEL);
   if (!address)
     return -ENOMEM;
   iosys_map_set_vaddr(map, address);
@@ -102,6 +139,48 @@ static const struct dma_buf_ops native_ops = {
   .vmap = native_vmap, .vunmap = native_vunmap,
   .begin_cpu_access = native_cpu_access, .end_cpu_access = native_cpu_access,
 };
+
+/* Consumes the caller's native object reference, including on failure.
+ * Exports a page-less device range [phys, phys + size) as a dma-buf, or with
+ * phys 0 an opaque buffer that only the exporting driver can import. */
+int linuxkpi_prime_export_range(void *object, size_t size, void *reservation,
+                               unsigned long phys,
+                               void (*release)(void *), unsigned int flags) {
+  DEFINE_DMA_BUF_EXPORT_INFO(info);
+  struct native_prime_bo *bo;
+  struct dma_buf *buf;
+  int ret;
+  if (!size || (size & ~PAGE_MASK) || size > UINT_MAX ||
+      (phys & ~PAGE_MASK) || (flags & ~(O_CLOEXEC | O_RDWR))) {
+    release(object);
+    return -EINVAL;
+  }
+  bo = kzalloc(sizeof(*bo), GFP_KERNEL);
+  if (!bo) {
+    release(object);
+    return -ENOMEM;
+  }
+  bo->count = size >> PAGE_SHIFT;
+  bo->object = object;
+  bo->release = release;
+  bo->range = true;
+  bo->phys = phys;
+  info.ops = &native_ops;
+  info.size = size;
+  info.flags = O_RDWR;
+  info.priv = bo;
+  info.resv = reservation;
+  buf = dma_buf_export(&info);
+  if (IS_ERR(buf)) {
+    ret = PTR_ERR(buf);
+    kfree(bo);
+    release(object);
+    return ret;
+  }
+  ret = linuxkpi_prime_fd(buf, flags);
+  dma_buf_put(buf);
+  return ret;
+}
 
 /* Each published fd owns one file reference and a distinct native node.
  * This also allows re-export after the original fd was closed: the held
