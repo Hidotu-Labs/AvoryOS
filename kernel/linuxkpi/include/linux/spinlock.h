@@ -15,6 +15,7 @@
  * code shared with hard IRQ context must use.
  */
 
+#include <linux/cleanup.h>
 #include <linux/spinlock_types.h>
 #include <linux/irqflags.h>
 #include <linux/preempt.h>
@@ -107,6 +108,11 @@ static __always_inline void spin_unlock_irq(spinlock_t *lock) {
     local_irq_restore(flags);                                                 \
     preempt_enable_resched();                                                 \
   } while (0)
+
+DEFINE_LOCK_GUARD_1(spinlock_irqsave, spinlock_t,
+                    spin_lock_irqsave(_T->lock, _T->flags),
+                    spin_unlock_irqrestore(_T->lock, _T->flags),
+                    unsigned long flags)
 
 /* ── bottom-half variants (no softirqs here; plain lock is already safe) ── */
 

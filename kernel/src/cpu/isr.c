@@ -154,6 +154,8 @@ static void page_fault_handler(struct registers *regs) {
 static void gpf_handler(struct registers *regs) {
   if ((regs->cs & 0x3) == 0x3) {
     isr_report_user_fault(regs, SIGSEGV, regs->rip);
+  } else if (extable_fixup(regs)) {
+    return;
   } else {
     isr_panic(regs, "Unhandled General Protection Fault");
   }

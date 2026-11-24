@@ -26,7 +26,7 @@ pub struct AcpiMadtParsedC {
     pub ioapic_gsi: u32,
     pub has_ioapic: bool,
     pub cpu_count: u32,
-    pub cpu_apic_ids: [u8; MAX_CPUS_ACPI],
+    pub cpu_apic_ids: [u32; MAX_CPUS_ACPI],
     pub iso_count: u32,
     pub iso_entries: [AcpiIsoEntryC; MAX_ISOS],
 }
@@ -39,7 +39,7 @@ impl Default for AcpiMadtParsedC {
             ioapic_gsi: 0,
             has_ioapic: false,
             cpu_count: 0,
-            cpu_apic_ids: [0u8; MAX_CPUS_ACPI],
+            cpu_apic_ids: [0u32; MAX_CPUS_ACPI],
             iso_count: 0,
             iso_entries: [AcpiIsoEntryC::default(); MAX_ISOS],
         }
@@ -91,6 +91,17 @@ pub fn parse_rsdp(rsdp: &[u8]) -> Option<(bool, u64)> {
     None
 }
 
+fn record_madt_cpu(out: &mut AcpiMadtParsedC, apic_id: u32) {
+    let limit = (out.cpu_count as usize).min(MAX_CPUS_ACPI);
+    if out.cpu_apic_ids[..limit].contains(&apic_id) {
+        return;
+    }
+    if limit < MAX_CPUS_ACPI {
+        out.cpu_apic_ids[limit] = apic_id;
+    }
+    out.cpu_count += 1;
+}
+
 pub fn parse_madt(madt: &[u8]) -> Option<AcpiMadtParsedC> {
     if madt.len() < MADT_HDR_LEN || &madt[0..4] != b"APIC" {
         return None;
@@ -126,11 +137,7 @@ pub fn parse_madt(madt: &[u8]) -> Option<AcpiMadtParsedC> {
             0 if entry_len >= 8 => {
                 // Local APIC: acpi_id(2), apic_id(3), flags(4..8)
                 if (le32(entry, 4) & 1) != 0 {
-                    let idx = out.cpu_count as usize;
-                    if idx < MAX_CPUS_ACPI {
-                        out.cpu_apic_ids[idx] = entry[3];
-                    }
-                    out.cpu_count += 1;
+                    record_madt_cpu(&mut out, entry[3] as u32);
                 }
             }
             1 if entry_len >= 12 => {
@@ -152,6 +159,13 @@ pub fn parse_madt(madt: &[u8]) -> Option<AcpiMadtParsedC> {
                         gsi: le32(entry, 4),
                     };
                     out.iso_count += 1;
+                }
+            }
+            9 if entry_len >= 16 => {
+                // Processor Local x2APIC: x2apic_id(4..8), flags(8..12)
+                let x2apic_id = le32(entry, 4);
+                if (le32(entry, 8) & 1) != 0 && x2apic_id != u32::MAX {
+                    record_madt_cpu(&mut out, x2apic_id);
                 }
             }
             _ => {}
@@ -289,5 +303,48 @@ mod tests {
         let partial = parse_madt(&madt).expect("still valid header");
         assert_eq!(partial.cpu_count, 1);
         assert!(!partial.has_ioapic);
+    }
+
+    #[test]
+    fn parses_madt_x2apic_and_deduplicates() {
+        let mut madt = vec![0u8; MADT_HDR_LEN + 8 + 16 + 16 + 16];
+        madt[0..4].copy_from_slice(b"APIC");
+        let total_len = madt.len() as u32;
+        madt[4..8].copy_from_slice(&total_len.to_le_bytes());
+
+        // Type 0: Local APIC (id=16, enabled)
+        let e0 = &mut madt[MADT_HDR_LEN..MADT_HDR_LEN + 8];
+        e0[0] = 0;
+        e0[1] = 8;
+        e0[3] = 16;
+        e0[4..8].copy_from_slice(&1u32.to_le_bytes());
+
+        // Type 9: Duplicate Local x2APIC (id=16, enabled) -> ignored
+        let e1 = &mut madt[MADT_HDR_LEN + 8..MADT_HDR_LEN + 24];
+        e1[0] = 9;
+        e1[1] = 16;
+        e1[4..8].copy_from_slice(&16u32.to_le_bytes());
+        e1[8..12].copy_from_slice(&1u32.to_le_bytes());
+
+        // Type 9: Local x2APIC (id=260, enabled) -> kept
+        let e2 = &mut madt[MADT_HDR_LEN + 24..MADT_HDR_LEN + 40];
+        e2[0] = 9;
+        e2[1] = 16;
+        e2[4..8].copy_from_slice(&260u32.to_le_bytes());
+        e2[8..12].copy_from_slice(&1u32.to_le_bytes());
+
+        // Type 9: Disabled Local x2APIC (id=261, flags=0) -> ignored
+        let e3 = &mut madt[MADT_HDR_LEN + 40..MADT_HDR_LEN + 56];
+        e3[0] = 9;
+        e3[1] = 16;
+        e3[4..8].copy_from_slice(&261u32.to_le_bytes());
+        e3[8..12].copy_from_slice(&0u32.to_le_bytes());
+
+        set_checksum(&mut madt, 9);
+
+        let parsed = parse_madt(&madt).expect("valid madt");
+        assert_eq!(parsed.cpu_count, 2);
+        assert_eq!(parsed.cpu_apic_ids[0], 16);
+        assert_eq!(parsed.cpu_apic_ids[1], 260);
     }
 }

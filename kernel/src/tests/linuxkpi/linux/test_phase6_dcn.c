@@ -164,7 +164,7 @@ static int p6d_ioctl(void *node, unsigned int request) {
 static void *p6d_find_card(struct p6d_scratch *s, int *card_out) {
   struct drm_version *ver = P6D_STRUCT(s);
 
-  for (int i = 2; i <= 5; i++) {
+  for (int i = 0; i <= 5; i++) {
     char path[32];
     char name[32];
     void *node;

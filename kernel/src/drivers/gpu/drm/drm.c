@@ -2723,6 +2723,8 @@ static uint32_t drm_read(struct vfs_node *node, uint32_t offset,
  * drm_file here leaked every scan because no fd existed to release it.
  */
 static vfs_node_t drm_card_metadata_node;
+static int ascentdrm_card_minor = 0;
+static char ascentdrm_card_name[16] = "card0";
 static int virgl_render_minor = -1;
 static void *drm_render_open(void *metadata) {
   (void)metadata;
@@ -2750,11 +2752,11 @@ static struct dirent *drm_dri_readdir(vfs_node_t *dir, uint64_t index) {
     entry->ino = dir->inode;
     entry->d_type = DT_DIR;
   } else if (index == 2) {
-    strcpy(entry->name, "card0");
-    entry->ino = (226U << 8) | 0U;
+    strcpy(entry->name, ascentdrm_card_name);
+    entry->ino = (226U << 8) | (uint32_t)ascentdrm_card_minor;
     entry->d_type = DT_CHR;
   } else {
-    /* Minors registered by the imported DRM core (dri/card1,
+    /* Minors registered by the imported DRM core (dri/card0,
      * dri/renderD128, ...) live in the LinuxKPI dynamic devnode registry. */
     uint32_t rdev = 0;
     const char *name = asc_vfs_devnode_name_at("dri", index - 3, &rdev);
@@ -2776,7 +2778,7 @@ static struct dirent *drm_dri_readdir(vfs_node_t *dir, uint64_t index) {
 static vfs_node_t *(*drm_dri_base_finddir)(vfs_node_t *, char *);
 
 static vfs_node_t *drm_dri_finddir(vfs_node_t *dir, char *name) {
-  if (strcmp(name, "card0") == 0)
+  if (strcmp(name, ascentdrm_card_name) == 0)
     return &drm_card_metadata_node;
 
   vfs_node_t *dev = (vfs_node_t *)asc_vfs_devnode_lookup("dri", name);
@@ -2799,10 +2801,10 @@ static vfs_node_t *drm_alloc_client_node(void) {
     return NULL;
   }
   vfs_node_init(clone);
-  strcpy(clone->name, "card0");
+  strcpy(clone->name, ascentdrm_card_name);
   clone->flags = FS_CHARDEV; /* non-persistent: freed when refcount→0 */
   clone->mask = 0666;
-  clone->inode = (226U << 8) | 0U; /* makedev(226,0) — DRM major:minor */
+  clone->inode = (226U << 8) | (uint32_t)ascentdrm_card_minor; /* makedev(226,N) — DRM major:minor */
   clone->device = file;            /* ← per-client state */
   clone->ioctl = drm_ioctl;
   clone->mmap = drm_vfs_mmap;
@@ -2870,7 +2872,19 @@ void ascentdrm_init(void) {
   }
 }
 
+int ascentdrm_get_card_minor(void) { return ascentdrm_card_minor; }
+
 void ascentdrm_register_vfs(void) {
+#ifdef LINUXKPI_LINUX_IMPORTED
+  extern int linuxkpi_ascentdrm_primary_reserve(void);
+  int reserved = linuxkpi_ascentdrm_primary_reserve();
+  if (reserved >= 0)
+    ascentdrm_card_minor = reserved;
+#endif
+  snprintf(ascentdrm_card_name, sizeof(ascentdrm_card_name), "card%d",
+           ascentdrm_card_minor);
+  global_ascentdrm_dev.name = ascentdrm_card_name;
+
   vfs_node_t *dev_dir = vfs_resolve_path("/dev");
   if (!dev_dir)
     return;
@@ -2880,10 +2894,10 @@ void ascentdrm_register_vfs(void) {
     return;
 
   vfs_node_init(&drm_card_metadata_node);
-  strcpy(drm_card_metadata_node.name, "card0");
+  strcpy(drm_card_metadata_node.name, ascentdrm_card_name);
   drm_card_metadata_node.flags = FS_CHARDEV | FS_PERSISTENT;
   drm_card_metadata_node.mask = 0666;
-  drm_card_metadata_node.inode = (226U << 8) | 0U;
+  drm_card_metadata_node.inode = (226U << 8) | (uint32_t)ascentdrm_card_minor;
   drm_card_metadata_node.device = &global_ascentdrm_dev;
   drm_card_metadata_node.open_instance = drm_open_instance;
   drm_card_metadata_node.refcount = 1;
@@ -2896,7 +2910,7 @@ void ascentdrm_register_vfs(void) {
   dri_dir->readdir = drm_dri_readdir;
   dri_dir->finddir = drm_dri_finddir;
 
-  klog_puts("[DRM] Registered /dev/dri/card0 (per-client mode)\n");
+  klogf("[DRM] Registered /dev/dri/%s (per-client mode)\n", ascentdrm_card_name);
 }
 static vfs_node_t *drm_open_instance(vfs_node_t *metadata) {
   (void)metadata;

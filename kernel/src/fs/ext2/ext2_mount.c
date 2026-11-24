@@ -92,6 +92,11 @@ void ext2_unregister_mount(ext2_mount_t *mnt) {
 }
 
 ext2_mount_t *ext2_init_mount(struct block_device *dev) {
+  uint32_t dev_ss = dev->sector_size ? dev->sector_size : 512;
+  if (dev_ss != 512) {
+    klog_puts("[EXT2] Unsupported device sector size.\n");
+    return NULL;
+  }
   uint8_t sb_buf[1024];
   if (dev->read_sectors(dev, 2, 2, sb_buf)) {
     klog_puts("[EXT2] Failed to read superblock sectors.\n");

@@ -88,6 +88,11 @@ void pmm_mark_used(void *ptr, size_t count);
 // Reclaims the memory occupied by the Limine bootloader after boot structures
 // are no longer needed
 void pmm_reclaim_bootloader(uint64_t kernel_phys_base);
+/* Reclaims page-aligned whole pages within [phys_start, phys_start + len)
+ * that sit in managed bounds and are not yet marked managed (e.g. a
+ * compressed boot module after its payload has been unpacked). Returns the
+ * number of bytes returned to the buddy allocator. */
+uint64_t pmm_reclaim_region(uint64_t phys_start, uint64_t len);
 bool pmm_is_reclaimable(uint64_t phys);
 /* Protect only reclaimable pages within a page-aligned mapped range. */
 void pmm_protect_reclaimable_range(uint64_t phys, size_t page_count);

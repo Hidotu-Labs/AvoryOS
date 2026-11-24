@@ -23,6 +23,7 @@
 #include "sysdiag.h"
 #include "../fs/ext2.h"
 #include "../fs/ext4.h"
+#include "../fs/exfat.h"
 #include "../fs/fat32.h"
 #include "../fs/cgroupfs.h"
 #include "../fs/tmpfs.h"
@@ -509,14 +510,6 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     dev_path = path + 4;
 
   if (dev_path && !vfs_namespace_active() && fs_root == vfs_backing_node(fs_root)) {
-    if (strcmp(dev_path, "dri/card0") == 0) {
-      node = ascentdrm_create_client_node();
-      if (!node)
-        return (uint64_t)-12;
-      if (flags & O_NONBLOCK)
-        node->flags |= FS_NONBLOCK;
-    }
-
     if (strcmp(dev_path, "ptmx") == 0) {
       /* A mounted devpts owns its PTYs. Bypassing it creates legacy slave
        * descriptors with no matching directory entry, so openpty callers
@@ -612,10 +605,17 @@ uint64_t sys_open_path(int dirfd, const char *path, uint64_t flags,
     if (strcmp(dev_path, "tty") == 0) {
       struct thread *ct = sched_get_current();
       if (ct && ct->ctty) {
-        if (flags & O_DIRECTORY)
-          return (uint64_t)-20; // ENOTDIR: controlling tty is not a directory
-        node = ct->ctty;
-        goto open_done;
+        if (!vfs_node_is_alive(ct->ctty) || !vfs_node_tryref(ct->ctty)) {
+          ct->ctty = NULL;
+        } else {
+          if (flags & O_DIRECTORY) {
+            vfs_close(ct->ctty);
+            return (uint64_t)-20; // ENOTDIR: controlling tty is not a directory
+          }
+          node = ct->ctty;
+          node_owned = true;
+          goto open_done;
+        }
       }
     }
 
@@ -1365,6 +1365,10 @@ static int64_t fd_read_to_user(vfs_node_t *node, uint64_t offset, size_t count,
                                uint8_t *user_buf) {
   if (count == 0)
     return 0;
+  if (asc_vfs_node_is_linux_file(node)) {
+    uint32_t chunk = count > 0x7ffff000U ? 0x7ffff000U : (uint32_t)count;
+    return (int32_t)fd_vfs_read(node, offset, chunk, user_buf);
+  }
   bool packet_pipe = pipe_is_packet(node);
   if (packet_pipe && count > PIPE_PACKET_SIZE)
     count = PIPE_PACKET_SIZE;
@@ -1411,6 +1415,13 @@ static int64_t fd_write_from_user_node(vfs_node_t *node, uint64_t offset,
                                        bool append, uint32_t *end_offset_out) {
   if (count == 0)
     return 0;
+  if (asc_vfs_node_is_linux_file(node)) {
+    uint32_t chunk = count > 0x7ffff000U ? 0x7ffff000U : (uint32_t)count;
+    int32_t wrote = (int32_t)fd_vfs_write(node, offset, chunk, (uint8_t *)user_buf);
+    if (end_offset_out)
+      *end_offset_out = 0;
+    return wrote;
+  }
   uint8_t stack_buf[FD_BOUNCE_STACK_MAX];
   size_t cap = count <= FD_BOUNCE_STACK_MAX ? count
              : (count <= FD_BOUNCE_HEAP_MAX ? count : FD_BOUNCE_HEAP_MAX);
@@ -3122,6 +3133,12 @@ static bool sys_mount_block_try(struct block_device *dev, vfs_node_t *mountpoint
         vfs_mount_inplace(mountpoint, saved, dev, dev->name, "vfat", target, NULL, fat32_unmount, fat32_live_nodes);
         return true;
     }
+    if (strcmp(type, "exfat") == 0) {
+        if (exfat_mount(dev, mountpoint) != 0)
+            return false;
+        vfs_mount_inplace(mountpoint, saved, dev, dev->name, "exfat", target, NULL, exfat_unmount, exfat_live_nodes);
+        return true;
+    }
     bool ext4 = strcmp(type, "ext4") == 0;
     if ((ext4 ? ext4_mount(dev, mountpoint) : ext2_mount(dev, mountpoint)) != 0)
         return false;
@@ -3430,13 +3447,18 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
     memcpy(saved, mountpoint, sizeof(vfs_node_t));
 
     static const char *const fat_order[] = {"vfat", NULL};
+    static const char *const exfat_order[] = {"exfat", NULL};
     static const char *const ext4_order[] = {"ext4", "ext2", NULL};
     static const char *const ext2_order[] = {"ext2", "ext4", NULL};
-    static const char *const any_order[] = {"ext4", "ext2", "vfat", NULL};
+    static const char *const any_order[] = {"ext4", "ext2", "vfat", "exfat", NULL};
     const char *const *order = any_order;
     if (fstype) {
-        if (strcmp(fstype, "vfat") == 0 || strcmp(fstype, "fat32") == 0 || strcmp(fstype, "msdos") == 0)
+        if (strcmp(fstype, "vfat") == 0 || strcmp(fstype, "fat32") == 0 ||
+            strcmp(fstype, "fat16") == 0 || strcmp(fstype, "fat12") == 0 ||
+            strcmp(fstype, "msdos") == 0)
             order = fat_order;
+        else if (strcmp(fstype, "exfat") == 0)
+            order = exfat_order;
         else if (strcmp(fstype, "ext4") == 0)
             order = ext4_order;
         else if (strcmp(fstype, "ext2") == 0 || strcmp(fstype, "ext3") == 0)

@@ -196,7 +196,7 @@ struct xhci_controller {
   uint8_t control_busy; /* xhci_wait_lock: never held with IRQs masked */
   /* Serialises bulk TD construction, waiting and endpoint recovery across
    * pipes.  Never taken from the interrupt path. */
-  spinlock_t bulk_lock;
+  uint8_t bulk_busy; /* xhci_wait_lock: never held with IRQs masked */
   struct xhci_erst_entry *erst;
   uint64_t erst_phys;
 

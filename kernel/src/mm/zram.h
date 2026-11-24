@@ -30,4 +30,8 @@ size_t zram_pageout(struct mm_struct *mm, uint64_t cr3, uint64_t start,
                     uint64_t end);
 /* Caller holds mm->lock; used by mremap's copy while old VMA is stable. */
 int zram_copy_swapped(uint64_t *pml4, uint64_t va, void *page);
+/* Disk-backed swap activation (Linux swap v1 / SWAPSPACE2). */
+int zram_swapon(const char *path, uint64_t flags);
+bool zram_get_disk_swap(char *name_out, size_t name_sz, uint64_t *total_kb,
+                        uint64_t *used_kb);
 #endif

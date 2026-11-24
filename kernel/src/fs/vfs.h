@@ -41,6 +41,8 @@
  * inode (ext2/ext4). node->device belongs to the filesystem, so fifo_open()
  * keys the shared pipe state by (device, inode) instead of storing it there. */
 #define FS_FIFO_SHARED 0x1000
+/* Private per-filesystem node flag (used by exFAT for NoFatChain streams). */
+#define FS_EXFAT_CONTIG 0x2000
 #define FS_TYPE_MASK 0x0F
 
 /* Live-object markers.  A node or cached page that has been freed has its

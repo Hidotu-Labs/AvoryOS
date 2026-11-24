@@ -1,3 +1,4 @@
+#include "drivers/storage/block.h"
 #include "lib/string.h"
 #include "lock/spinlock.h"
 #include "lz4.h"
@@ -28,6 +29,164 @@ static uint32_t count, free_head;
 static spinlock_t lock = SPINLOCK_INIT;
 static struct zram_stats stats;
 static uint64_t rejected;
+
+/* Disk-backed swap partition (slot IDs have DISK_SWAP_BIT set). */
+#define DISK_SWAP_BIT 0x80000000U
+#define DISK_SWAP_MAX_PAGES 1048576U /* up to 4 GiB per swap partition */
+static struct block_device *disk_dev;
+static uint32_t disk_pages;
+static uint32_t disk_used;
+static uint32_t disk_spp; /* sectors per 4 KiB page */
+static uint32_t disk_hint;
+static uint32_t *disk_refs;
+static uint64_t *disk_bitmap;
+static spinlock_t disk_lock = SPINLOCK_INIT;
+
+static uint32_t disk_store_page(const void *page) {
+  if (!disk_dev || !disk_refs || !disk_bitmap || !disk_pages)
+    return 0;
+  spinlock_acquire(&disk_lock);
+  uint32_t words = (disk_pages + 64) / 64;
+  uint32_t found = 0;
+  for (uint32_t pass = 0; pass < words && !found; pass++) {
+    uint32_t w = (disk_hint + pass) % words;
+    uint64_t free_bits = ~disk_bitmap[w];
+    if (!free_bits)
+      continue;
+    while (free_bits) {
+      unsigned bit = (unsigned)__builtin_ctzll(free_bits);
+      uint32_t idx = w * 64 + bit;
+      if (idx >= 1 && idx <= disk_pages) {
+        disk_bitmap[w] |= (1ull << bit);
+        disk_hint = w;
+        disk_used++;
+        __atomic_store_n(&disk_refs[idx], 1, __ATOMIC_RELEASE);
+        found = idx;
+        break;
+      }
+      free_bits &= ~(1ull << bit);
+    }
+  }
+  struct block_device *dev = disk_dev;
+  uint32_t spp = disk_spp;
+  spinlock_release(&disk_lock);
+
+  if (!found)
+    return 0;
+
+  if (dev->write_sectors(dev, (uint64_t)found * spp, spp, page) != 0) {
+    spinlock_acquire(&disk_lock);
+    __atomic_store_n(&disk_refs[found], 0, __ATOMIC_RELEASE);
+    disk_bitmap[found / 64] &= ~(1ull << (found % 64));
+    if (disk_used > 0)
+      disk_used--;
+    spinlock_release(&disk_lock);
+    return 0;
+  }
+  return DISK_SWAP_BIT | found;
+}
+
+int zram_swapon(const char *path, uint64_t flags) {
+  (void)flags;
+  if (!path || !path[0])
+    return -2; /* ENOENT */
+  if (strncmp(path, "/dev/", 5) != 0)
+    return -2; /* ENOENT */
+
+  struct block_device *dev = block_get_by_name(path + 5);
+  if (!dev)
+    return (strcmp(path, "/dev/null") == 0) ? -22 : -2; /* EINVAL or ENOENT */
+  if (!dev->read_sectors || !dev->write_sectors || dev->sector_size == 0)
+    return -22; /* EINVAL */
+  if (4096 % dev->sector_size != 0)
+    return -22; /* EINVAL */
+
+  spinlock_acquire(&disk_lock);
+  bool already = (disk_dev != NULL);
+  spinlock_release(&disk_lock);
+  if (already)
+    return -16; /* EBUSY */
+
+  uint32_t spp = 4096 / dev->sector_size;
+  if (dev->total_sectors < (uint64_t)spp * 2)
+    return -22; /* EINVAL */
+
+  uint8_t *hdr = kmalloc(4096);
+  if (!hdr)
+    return -12; /* ENOMEM */
+  if (dev->read_sectors(dev, 0, spp, hdr) != 0) {
+    kfree(hdr);
+    return -5; /* EIO */
+  }
+
+  /* Linux swap v1 header: "SWAPSPACE2" at 4086, version=1 at 1024, last_page at 1028 */
+  if (memcmp(hdr + 4086, "SWAPSPACE2", 10) != 0) {
+    kfree(hdr);
+    return -22; /* EINVAL */
+  }
+  uint32_t version = 0, last_page = 0;
+  memcpy(&version, hdr + 1024, 4);
+  memcpy(&last_page, hdr + 1028, 4);
+  kfree(hdr);
+
+  if (version != 1 || last_page < 1)
+    return -22; /* EINVAL */
+
+  uint64_t max_dev_pages = (dev->total_sectors / spp) - 1;
+  uint32_t pages = (last_page > max_dev_pages) ? (uint32_t)max_dev_pages : last_page;
+  if (pages > DISK_SWAP_MAX_PAGES)
+    pages = DISK_SWAP_MAX_PAGES;
+  if (pages < 1)
+    return -22;
+
+  uint32_t *refs = kmalloc(((size_t)pages + 1) * sizeof(uint32_t));
+  uint32_t words = (pages + 64) / 64;
+  uint64_t *bmap = kmalloc((size_t)words * sizeof(uint64_t));
+  if (!refs || !bmap) {
+    if (refs) kfree(refs);
+    if (bmap) kfree(bmap);
+    return -12; /* ENOMEM */
+  }
+  memset(refs, 0, ((size_t)pages + 1) * sizeof(uint32_t));
+  memset(bmap, 0, (size_t)words * sizeof(uint64_t));
+  bmap[0] |= 1ull; /* slot 0 is reserved */
+
+  spinlock_acquire(&disk_lock);
+  if (disk_dev) {
+    spinlock_release(&disk_lock);
+    kfree(refs);
+    kfree(bmap);
+    return -16; /* EBUSY */
+  }
+  disk_refs = refs;
+  disk_bitmap = bmap;
+  disk_pages = pages;
+  disk_used = 0;
+  disk_spp = spp;
+  disk_hint = 0;
+  disk_dev = dev;
+  spinlock_release(&disk_lock);
+  return 0;
+}
+
+bool zram_get_disk_swap(char *name_out, size_t name_sz, uint64_t *total_kb,
+                        uint64_t *used_kb) {
+  spinlock_acquire(&disk_lock);
+  if (!disk_dev) {
+    spinlock_release(&disk_lock);
+    return false;
+  }
+  if (name_out && name_sz > 0) {
+    strncpy(name_out, disk_dev->name, name_sz - 1);
+    name_out[name_sz - 1] = '\0';
+  }
+  if (total_kb)
+    *total_kb = (uint64_t)disk_pages * 4ULL;
+  if (used_kb)
+    *used_kb = (uint64_t)disk_used * 4ULL;
+  spinlock_release(&disk_lock);
+  return true;
+}
 
 bool zram_store_init(uint32_t capacity, uint64_t limit) {
   if (slots || !capacity || capacity > 524288 || limit < 4096)
@@ -115,8 +274,10 @@ static void *packed_alloc(size_t n, struct packed_page **pool) {
   return (void *)((uint64_t)phys + pmm_get_hhdm_offset());
 }
 uint32_t zram_store_page(const void *page) {
-  if (!slots || !page)
+  if (!page)
     return 0;
+  if (!slots)
+    return disk_store_page(page);
   const uint8_t *bytes = page;
   uint64_t pattern;
   memcpy(&pattern, page, 8);
@@ -134,6 +295,9 @@ uint32_t zram_store_page(const void *page) {
   if (!same) {
     uint8_t probe[640];
     if (!zram_lz4_compress(page, 1024, probe, sizeof(probe))) {
+      uint32_t dslot = disk_store_page(page);
+      if (dslot)
+        return dslot;
       __atomic_add_fetch(&rejected, 1, __ATOMIC_RELAXED);
       return 0;
     }
@@ -142,6 +306,9 @@ uint32_t zram_store_page(const void *page) {
   size_t n =
       same ? 0 : zram_lz4_compress(page, 4096, compressed, sizeof(compressed));
   if (!same && !n) {
+    uint32_t dslot = disk_store_page(page);
+    if (dslot)
+      return dslot;
     __atomic_add_fetch(&rejected, 1, __ATOMIC_RELAXED);
     return 0;
   }
@@ -150,7 +317,7 @@ uint32_t zram_store_page(const void *page) {
   if (!id) {
     stats.allocation_failures++;
     spinlock_release(&lock);
-    return 0;
+    return disk_store_page(page);
   }
   free_head = slots[id].next;
   spinlock_release(&lock);
@@ -162,7 +329,7 @@ uint32_t zram_store_page(const void *page) {
     slots[id].next = free_head;
     free_head = id;
     spinlock_release(&lock);
-    return 0;
+    return disk_store_page(page);
   }
   if (n)
     memcpy(data, compressed, n);
@@ -189,6 +356,18 @@ uint32_t zram_store_page(const void *page) {
  * pools and statistics. A count can reach zero only in zram_slot_put(), and
  * after that no get can succeed, so the final put frees the slot exclusively. */
 bool zram_slot_get(uint32_t id) {
+  if (id & DISK_SWAP_BIT) {
+    uint32_t idx = id & ~DISK_SWAP_BIT;
+    if (!disk_dev || !disk_refs || !idx || idx > disk_pages)
+      return false;
+    uint32_t r = __atomic_load_n(&disk_refs[idx], __ATOMIC_ACQUIRE);
+    do {
+      if (!r || r == UINT32_MAX)
+        return false;
+    } while (!__atomic_compare_exchange_n(&disk_refs[idx], &r, r + 1, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    return true;
+  }
   if (!slots || !id || id > count)
     return false;
   uint32_t r = __atomic_load_n(&slots[id].refs, __ATOMIC_ACQUIRE);
@@ -200,6 +379,25 @@ bool zram_slot_get(uint32_t id) {
   return true;
 }
 void zram_slot_put(uint32_t id) {
+  if (id & DISK_SWAP_BIT) {
+    uint32_t idx = id & ~DISK_SWAP_BIT;
+    if (!disk_dev || !disk_refs || !idx || idx > disk_pages)
+      return;
+    uint32_t r = __atomic_load_n(&disk_refs[idx], __ATOMIC_ACQUIRE);
+    do {
+      if (!r || r == UINT32_MAX)
+        return;
+    } while (!__atomic_compare_exchange_n(&disk_refs[idx], &r, r - 1, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    if (r - 1)
+      return;
+    spinlock_acquire(&disk_lock);
+    disk_bitmap[idx / 64] &= ~(1ull << (idx % 64));
+    if (disk_used > 0)
+      disk_used--;
+    spinlock_release(&disk_lock);
+    return;
+  }
   if (!slots || !id || id > count)
     return;
   uint32_t r = __atomic_load_n(&slots[id].refs, __ATOMIC_ACQUIRE);
@@ -244,7 +442,17 @@ void zram_slot_put(uint32_t id) {
   }
 }
 int zram_slot_read(uint32_t id, void *page) {
-  if (!slots || !id || id > count || !page)
+  if (!page)
+    return -1;
+  if (id & DISK_SWAP_BIT) {
+    uint32_t idx = id & ~DISK_SWAP_BIT;
+    if (!disk_dev || !disk_refs || !idx || idx > disk_pages)
+      return -1;
+    if (!__atomic_load_n(&disk_refs[idx], __ATOMIC_ACQUIRE))
+      return -1;
+    return disk_dev->read_sectors(disk_dev, (uint64_t)idx * disk_spp, disk_spp, page);
+  }
+  if (!slots || !id || id > count)
     return -1;
   /* The caller holds a pin, so these fields are stable for the copy. */
   struct slot *s = &slots[id];

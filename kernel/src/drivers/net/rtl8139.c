@@ -25,7 +25,7 @@
 #define CR_RX 0x08
 #define CR_TX 0x04
 #define MSR_LINK_DOWN 0x04
-#define RX_PAGES 10
+#define RX_PAGES 18
 #define TX_PAGES 2
 #define TX_COUNT 4
 #define TX_BUFFER_SIZE 2048

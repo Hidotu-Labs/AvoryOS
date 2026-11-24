@@ -40,7 +40,8 @@ int ext4_check_feature_flags(const ext2_superblock_t *sb,
 
     const uint32_t supported_incompat =
         EXT4_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_RECOVER |
-        EXT4_FEATURE_INCOMPAT_EXTENTS | EXT4_FEATURE_INCOMPAT_64BIT;
+        EXT4_FEATURE_INCOMPAT_EXTENTS | EXT4_FEATURE_INCOMPAT_64BIT |
+        EXT4_FEATURE_INCOMPAT_FLEX_BG | EXT4_FEATURE_INCOMPAT_CSUM_SEED;
     uint32_t unknown_incompat =
         sb->s_feature_incompat & ~supported_incompat;
     if (unknown_incompat) {
@@ -77,7 +78,10 @@ int ext4_check_feature_flags(const ext2_superblock_t *sb,
         EXT4_FEATURE_RO_COMPAT_BTREE_DIR;
     uint32_t unknown_ro_compat =
         sb->s_feature_ro_compat & ~supported_ro_compat;
-    *read_only = unknown_ro_compat != 0;
+    bool force_ro =
+        (sb->s_feature_incompat &
+         (EXT4_FEATURE_INCOMPAT_FLEX_BG | EXT4_FEATURE_INCOMPAT_CSUM_SEED)) != 0;
+    *read_only = force_ro || (unknown_ro_compat != 0);
     if (*read_only) {
         klogf("[EXT4] Mounting read-only for unsupported ro-compat features: "
               "0x%x\n", unknown_ro_compat);
@@ -451,6 +455,11 @@ void ext4_log_flags(ext4_mount_t *mnt) {
 }
 
 static ext4_mount_t *ext4_init_mount(struct block_device *dev) {
+    uint32_t dev_ss = dev->sector_size ? dev->sector_size : 512;
+    if (dev_ss != 512) {
+        klog_puts("[EXT4] Unsupported device sector size.\n");
+        return NULL;
+    }
     uint8_t sb_buf[1024];
     if (dev->read_sectors(dev, 2, 2, sb_buf)) {
         klog_puts("[EXT4] Failed to read superblock sectors.\n");

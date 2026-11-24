@@ -1,8 +1,12 @@
 #include "drivers/pci/pci_irq.h"
 #include "cpu/irq.h"
 #include "lib/string.h"
+#include "lock/spinlock.h"
 
 #define PCI_COMMAND_INTX_DISABLE (1U << 10)
+
+static spinlock_t pci_intx_lock = SPINLOCK_INIT;
+static struct pci_irq *pci_intx_users[16];
 
 static void disable_intx(struct pci_irq *irq) {
   struct pci_device *d = irq->dev;
@@ -76,15 +80,44 @@ static bool try_msi(struct pci_irq *irq, const isr_t *handlers,
  * single vector: the line is shared and all handlers on it fire together. */
 static bool try_intx(struct pci_irq *irq, isr_t handler) {
   struct pci_device *dev = irq->dev;
-  if (!dev || dev->irq_line >= 16)
+  if (!dev || dev->irq_line >= sizeof(pci_intx_users) / sizeof(pci_intx_users[0]))
     return false;
-  if (!irq_install_handler(dev->irq_line, handler, 0x000F))
+
+  /* LinuxKPI uses the same trampoline for every device. One native entry
+   * must dispatch the whole Linux action chain just once per interrupt. */
+  spinlock_acquire(&pci_intx_lock);
+  struct pci_irq *user = pci_intx_users[dev->irq_line];
+  while (user && user->handler != handler)
+    user = user->intx_next;
+  if (!user && !irq_install_handler(dev->irq_line, handler, 0x000F)) {
+    spinlock_release(&pci_intx_lock);
     return false;
+  }
   irq->handler = handler;
   irq->irq_line = dev->irq_line;
+  irq->intx_next = pci_intx_users[irq->irq_line];
+  pci_intx_users[irq->irq_line] = irq;
   irq->intx_installed = true;
   irq->mode = PCI_IRQ_INTX;
+  spinlock_release(&pci_intx_lock);
   return true;
+}
+
+static void release_intx(struct pci_irq *irq) {
+  spinlock_acquire(&pci_intx_lock);
+  struct pci_irq **link = &pci_intx_users[irq->irq_line];
+  while (*link != irq)
+    link = &(*link)->intx_next;
+  *link = irq->intx_next;
+  irq->intx_next = NULL;
+  irq->intx_installed = false;
+
+  struct pci_irq *user = pci_intx_users[irq->irq_line];
+  while (user && user->handler != irq->handler)
+    user = user->intx_next;
+  if (!user)
+    irq_uninstall_handler(irq->irq_line, irq->handler);
+  spinlock_release(&pci_intx_lock);
 }
 
 bool pci_irq_request_modes_routed(struct pci_device *dev, struct pci_irq *irq,
@@ -152,6 +185,15 @@ bool pci_irq_mask(struct pci_irq *irq, uint16_t index, bool masked) {
     struct pci_device *d = irq->dev;
     uint16_t control = pci_config_read16(d->bus, d->slot, d->func,
                                          irq->msi.capability + 2);
+    if (control & (1U << 8)) {
+      /* Keep MSI enabled so the device latches events in its pending bits
+       * while the vector is masked, and delivers them on unmask. */
+      uint16_t offset = irq->msi.capability + ((control & (1U << 7)) ? 16 : 12);
+      uint32_t mask = pci_config_read32(d->bus, d->slot, d->func, offset);
+      pci_config_write32(d->bus, d->slot, d->func, offset,
+                         masked ? mask | 1U : mask & ~1U);
+      return true;
+    }
     if (masked) control &= ~1U; else control |= 1U;
     pci_config_write16(d->bus, d->slot, d->func,
                        irq->msi.capability + 2, control);
@@ -170,10 +212,8 @@ void pci_irq_release(struct pci_irq *irq) {
   } else if (irq->mode == PCI_IRQ_MSI || irq->msi.dev) {
     pci_msi_disable(&irq->msi);
   }
-  if (irq->intx_installed) {
-    irq_uninstall_handler(irq->irq_line, irq->handler);
-    irq->intx_installed = false;
-  }
+  if (irq->intx_installed)
+    release_intx(irq);
   restore_intx(irq);
   free_vectors(irq);
   irq->mode = PCI_IRQ_NONE;

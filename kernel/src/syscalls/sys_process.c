@@ -2340,14 +2340,22 @@ static uint64_t sys_delete_module(uint64_t name_ptr, uint64_t flags,
 
 static uint64_t sys_swapon(uint64_t path_ptr, uint64_t flags, uint64_t a2,
                            uint64_t a3, uint64_t a4, uint64_t a5) {
-  (void)flags;
   (void)a2;
   (void)a3;
   (void)a4;
   (void)a5;
+  struct thread *cur = sched_get_current();
+  if (!cur || cur->euid != 0)
+    return (uint64_t)-1; /* EPERM */
   if (!path_ptr || !vmm_is_user_addr_range_valid(path_ptr, 1))
-    return (uint64_t)-14; // EFAULT
-  return (uint64_t)-1; // EPERM: swap activation is not supported
+    return (uint64_t)-14; /* EFAULT */
+  char kpath[256];
+  long n = strncpy_from_user(kpath, (const char *)path_ptr, sizeof(kpath));
+  if (n < 0)
+    return (uint64_t)-14; /* EFAULT */
+  if ((size_t)n >= sizeof(kpath))
+    return (uint64_t)-36; /* ENAMETOOLONG */
+  return (uint64_t)(int64_t)zram_swapon(kpath, flags);
 }
 
 // ---------------------------------------------------------------------------

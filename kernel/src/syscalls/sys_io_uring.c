@@ -28,6 +28,7 @@
 #include "../sched/seccomp.h"
 #include "../sched/wait.h"
 #include "syscall.h"
+#include <linuxkpi/native_vfs.h>
 #include <stdint.h>
 
 extern void epoll_notify_event(struct vfs_node *node, uint32_t events);
@@ -441,6 +442,11 @@ static int32_t ioring_vfs_io_user(vfs_node_t *node, uint64_t off,
     return -22;
   if (!is_user_range((const void *)user_addr, len))
     return -14;
+  if (asc_vfs_node_is_linux_file(node)) {
+    uint32_t chunk = len > 0x7ffff000U ? 0x7ffff000U : len;
+    return write ? (int32_t)vfs_write(node, (uint32_t)off, chunk, (uint8_t *)user_addr)
+                 : (int32_t)vfs_read(node, (uint32_t)off, chunk, (uint8_t *)user_addr);
+  }
 
   uint8_t stack_buf[256];
   uint8_t *kbuf = stack_buf;

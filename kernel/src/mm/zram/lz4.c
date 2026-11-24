@@ -81,7 +81,8 @@ static int length(const uint8_t *in, size_t n, size_t *at, size_t *value) {
   } while (b == 255);
   return 0;
 }
-int zram_lz4_decompress(const void *src, size_t n, void *dst, size_t expected) {
+int zram_lz4_decompress_partial(const void *src, size_t n, void *dst,
+                                size_t capacity, size_t *out_len) {
   if (!src || !dst || !n)
     return -1;
   const uint8_t *in = src;
@@ -92,13 +93,16 @@ int zram_lz4_decompress(const void *src, size_t n, void *dst, size_t expected) {
     size_t literal = token >> 4;
     if (literal == 15 && length(in, n, &at, &literal))
       return -1;
-    if (literal > n - at || literal > expected - done)
+    if (literal > n - at || literal > capacity - done)
       return -1;
     memcpy(out + done, in + at, literal);
     done += literal;
     at += literal;
-    if (at == n)
-      return done == expected ? 0 : -1;
+    if (at == n) {
+      if (out_len)
+        *out_len = done;
+      return 0;
+    }
     if (n - at < 2)
       return -1;
     size_t distance = in[at] | (size_t)in[at + 1] << 8;
@@ -108,11 +112,18 @@ int zram_lz4_decompress(const void *src, size_t n, void *dst, size_t expected) {
     size_t match = (token & 15) + 4;
     if ((token & 15) == 15 && length(in, n, &at, &match))
       return -1;
-    if (match > expected - done)
+    if (match > capacity - done)
       return -1;
     for (size_t i = 0; i < match; i++)
       out[done + i] = out[done + i - distance];
     done += match;
   }
   return -1;
+}
+
+int zram_lz4_decompress(const void *src, size_t n, void *dst, size_t expected) {
+  size_t done = 0;
+  if (zram_lz4_decompress_partial(src, n, dst, expected, &done) != 0)
+    return -1;
+  return done == expected ? 0 : -1;
 }

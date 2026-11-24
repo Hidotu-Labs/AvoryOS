@@ -231,7 +231,7 @@ pub mod hw {
 
     /// Bytes past the bounce buffer, for command and status blocks that live
     /// on the Rust stack (not DMA memory).
-    const STAGE_LEN: usize = 64;
+    const STAGE_LEN: usize = 512;
 
     /// One bulk endpoint as parsed from the configuration descriptor.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -200,6 +200,12 @@ install -m 0644 "${ROOT_DIR}/config/wireplumber/20-avoryos-hda.conf" \
 # Keep boot service startup in the versioned init script.
 install -D -m 0755 "${ROOT_DIR}/config/init/rcS" "${ROOTFS_DIR}/etc/init.d/rcS"
 install -D -m 0644 "${ROOT_DIR}/config/init/inittab" "${ROOTFS_DIR}/etc/inittab"
+install -D -m 0755 "${ROOT_DIR}/config/init/udhcpc.script" "${ROOTFS_DIR}/usr/share/udhcpc/default.script"
+for cmd in ping ping6 ifconfig route ip udhcpc nslookup traceroute; do
+    if [ ! -e "${ROOTFS_DIR}/usr/bin/${cmd}" ] && [ ! -e "${ROOTFS_DIR}/usr/sbin/${cmd}" ]; then
+        ln -sfn /usr/bin/busybox "${ROOTFS_DIR}/usr/bin/${cmd}"
+    fi
+done
 # Programs known to need uname "Linux"; rcS loads it, the kernel adds to it.
 [ -f "${ROOTFS_DIR}/var/lib/avoryos/uname-linux" ] ||
     install -D -m 0644 "${ROOT_DIR}/config/init/uname-linux" "${ROOTFS_DIR}/var/lib/avoryos/uname-linux"

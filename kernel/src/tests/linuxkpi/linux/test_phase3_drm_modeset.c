@@ -31,6 +31,7 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_mode.h>
 #include <linux/delay.h>
+#include <linux/sprintf.h>
 #include <linux/string.h>
 
 #include <linuxkpi/log.h>
@@ -555,17 +556,40 @@ static void phase3_drm_modeset(void) {
   uint32_t p_crtc_x, p_crtc_y, p_crtc_w, p_crtc_h;
   uint32_t dumb_handle, dumb_pitch, fb_id = 0, blob_id = 0;
   unsigned long gem_imm = 0, gem_delta = 0;
-  void *node;
+  void *node = NULL;
   int ret, gem_ret;
 
-  node = asc_vfs_kernel_open("/dev/dri/card1");
-  if (!node) {
-    klog_puts("[SKIP] LinuxKPI: card1 atomic modeset tests (node absent)\n");
-    return;
-  }
   if (p3m_scratch_alloc(&s)) {
     klog_puts("[ FAIL ] LinuxKPI: vkms atomic scratch allocation failed\n");
-    asc_vfs_kernel_close(node);
+    return;
+  }
+  for (int i = 0; i <= 5; i++) {
+    char path[32], name[32];
+    struct drm_version *ver;
+    void *cand;
+
+    snprintf(path, sizeof(path), "/dev/dri/card%d", i);
+    cand = asc_vfs_kernel_open(path);
+    if (!cand)
+      continue;
+    ver = (struct drm_version *)((char *)s.kva + P3M_OFF_STRUCT);
+    memset(ver, 0, sizeof(*ver));
+    ver->name = (char *)(uintptr_t)(P3M_VA + P3M_OFF_IDS);
+    ver->name_len = 31;
+    memset((char *)s.kva + P3M_OFF_IDS, 0, 32);
+    if (p3m_ioctl(cand, DRM_IOCTL_VERSION) == 0) {
+      memcpy(name, (char *)s.kva + P3M_OFF_IDS, sizeof(name));
+      name[31] = '\0';
+      if (strcmp(name, "vkms") == 0) {
+        node = cand;
+        break;
+      }
+    }
+    asc_vfs_kernel_close(cand);
+  }
+  if (!node) {
+    klog_puts("[SKIP] LinuxKPI: vkms atomic modeset tests (node absent)\n");
+    p3m_scratch_free(&s);
     return;
   }
 

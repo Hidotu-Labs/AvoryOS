@@ -59,15 +59,12 @@ static void ipi_reschedule_handler(struct registers *regs) {
  * ran the interval instead of repeating an evenly split system average. */
 static void sched_account_cpu_time_locked(struct cpu_info *cpu, uint64_t now_ms)
 {
-  if (!cpu || !cpu->stats_last_ms) {
-    if (cpu)
-      cpu->stats_last_ms = now_ms ? now_ms : 1;
+  /* Zero is a valid timestamp during boot. A repeated or older sample
+   * must not subtract from the per-CPU counters or move the baseline back. */
+  if (!cpu || now_ms <= cpu->stats_last_ms)
     return;
-  }
   uint64_t elapsed = now_ms - cpu->stats_last_ms;
   cpu->stats_last_ms = now_ms;
-  if (!elapsed)
-    return;
   struct thread *current = cpu->current_thread;
   if (current && current->is_idle) {
     __atomic_fetch_add(&cpu->stats_idle_ms, elapsed, __ATOMIC_RELAXED);
@@ -983,7 +980,7 @@ void sched_resume_from_s3(void) {
       continue;
     hal_irq_state_t flags = hal_irq_save();
     spinlock_acquire(&cpu->queue_lock);
-    cpu->stats_last_ms = now_ms ? now_ms : 1;
+    cpu->stats_last_ms = now_ms;
     if (cpu->current_thread)
       cpu->current_thread->se.exec_start_ns = now_ns;
     if (cpu->eevfd.curr)

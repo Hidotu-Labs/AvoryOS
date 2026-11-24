@@ -116,6 +116,15 @@ with open(path, "r+b") as f:
     f.write(entry)
 PY
 
+if [ "${AVORYOS_COMPRESS_DISK_IMG:-1}" = "1" ] && command -v lz4 >/dev/null 2>&1; then
+    echo "[INFO] Compressing disk.img with LZ4..."
+    UNCOMP_MiB=$(( $(wc -c < "$SHRUNK_DISK") / MiB ))
+    lz4 -9 -B4 --content-size --no-frame-crc -f "$SHRUNK_DISK" "${SHRUNK_DISK}.lz4" >/dev/null
+    mv -f "${SHRUNK_DISK}.lz4" "$SHRUNK_DISK"
+    COMP_MiB=$(( $(wc -c < "$SHRUNK_DISK") / MiB ))
+    echo "[INFO] LZ4-compressed disk.img: ${UNCOMP_MiB} MiB -> ${COMP_MiB} MiB"
+fi
+
 # Kernel (stripped; the unstripped build ELF stays in kernel/bin-${ARCH}/)
 cp -v "kernel/bin-${ARCH}/kernel"   "$ISO_ROOT/boot/"
 strip --strip-all "$ISO_ROOT/boot/kernel"

@@ -141,6 +141,16 @@ vfs_node_t *ext2_finddir_vfs(vfs_node_t *parent, char *name) {
   return node;
 }
 
+static uint32_t ext2_get_nlink_impl(vfs_node_t *node) {
+  if (!node || !node->device || node->inode == 0)
+    return 1;
+  ext2_mount_t *mnt = (ext2_mount_t *)node->device;
+  ext2_inode_t inode;
+  if (ext2_read_inode(mnt, node->inode, &inode) != 0)
+    return 1;
+  return inode.i_links_count;
+}
+
 vfs_node_t *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
                                 ext2_inode_t *inode) {
   vfs_node_t *node = kmalloc(sizeof(vfs_node_t));
@@ -232,6 +242,7 @@ vfs_node_t *ext2_make_vfs_node(ext2_mount_t *mnt, uint32_t inode_num,
     node->statfs = ext4_statfs_impl;
   }
 
+  node->get_nlink = ext2_get_nlink_impl;
   if (mnt->read_only)
     node->flags |= FS_READONLY;
 

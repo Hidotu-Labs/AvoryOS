@@ -134,7 +134,9 @@ static uint64_t sys_fsopen(uint64_t fstype_ptr, uint64_t flags, uint64_t a2,
   if (!capability_mount_ns_admin(t) && !capability_has_init_ns(t, CAP_SYS_ADMIN))
     return (uint64_t)-1;
   char type[16];
-  if (!fstype_ptr || !is_user_range((void *)fstype_ptr, 1))
+  if (!fstype_ptr)
+    return (uint64_t)-38; // libmount probes fsopen(NULL, FSOPEN_CLOEXEC) to decide mount(2) fallback
+  if (!is_user_range((void *)fstype_ptr, 1))
     return (uint64_t)-14;
   long n = strncpy_from_user(type, (void *)fstype_ptr, sizeof(type));
   if (n < 0)

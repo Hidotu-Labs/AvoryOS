@@ -568,6 +568,8 @@ void usb_enumerate_device(struct usb_device *dev) {
     res = dev->hcd->address_device(dev->hcd, dev, new_addr);
     if (res == 0 && dev->address == 0)
       res = -1;
+  } else if (dev->address != 0) {
+    res = 0;
   } else {
     res = usb_control_transfer(dev, &req, NULL, 0);
     if (res == 0)

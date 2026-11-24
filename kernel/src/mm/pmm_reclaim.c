@@ -179,3 +179,84 @@ void pmm_reclaim_bootloader(uint64_t kernel_phys_base) {
 
   pmm_free_pages(temp_bitmap_phys, temp_count);
 }
+
+uint64_t pmm_reclaim_region(uint64_t phys_start, uint64_t len) {
+  if (!len || !pmm_managed_bitmap || !pmm_bitmap)
+    return 0;
+
+  uint64_t end_raw = (len > UINT64_MAX - phys_start) ? UINT64_MAX : (phys_start + len);
+  uint64_t start = (phys_start > UINT64_MAX - (PAGE_SIZE - 1))
+                       ? (UINT64_MAX & ~(uint64_t)(PAGE_SIZE - 1))
+                       : ((phys_start + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1));
+  uint64_t end = end_raw & ~(uint64_t)(PAGE_SIZE - 1);
+  if (start < 0x100000ULL)
+    start = 0x100000ULL;
+  if (start >= end)
+    return 0;
+
+  uint64_t start_pfn = start / PAGE_SIZE;
+  uint64_t end_pfn = end / PAGE_SIZE;
+  if (start_pfn < pmm_lowest_page)
+    start_pfn = pmm_lowest_page;
+  if (end_pfn > pmm_highest_page)
+    end_pfn = pmm_highest_page;
+  if (start_pfn >= end_pfn)
+    return 0;
+
+  uint64_t reclaimed = 0;
+  hal_irq_state_t flags = hal_irq_save();
+
+  for (uint64_t pfn = start_pfn; pfn < end_pfn;) {
+    size_t idx = (size_t)(pfn - pmm_lowest_page);
+    if (pmm_bitmap_test(pmm_managed_bitmap, idx) ||
+        !pmm_bitmap_test(pmm_bitmap, idx)) {
+      pfn++;
+      continue;
+    }
+
+    uint64_t curr = pfn + 1;
+    while (curr < end_pfn) {
+      size_t cidx = (size_t)(curr - pmm_lowest_page);
+      if (pmm_bitmap_test(pmm_managed_bitmap, cidx) ||
+          !pmm_bitmap_test(pmm_bitmap, cidx))
+        break;
+      curr++;
+    }
+
+    uint64_t count = curr - pfn;
+    uint64_t p = 0;
+    while (p < count) {
+      uint64_t phys = (pfn + p) * PAGE_SIZE;
+      size_t remaining = (size_t)(count - p);
+      size_t order = 0;
+      while (order < MAX_ORDER - 1) {
+        uint64_t n_pages = 1ULL << (order + 1);
+        if (n_pages > remaining || (phys % (n_pages * PAGE_SIZE)) != 0)
+          break;
+        if (numa_phys_to_node(phys) !=
+            numa_phys_to_node(phys + n_pages * PAGE_SIZE - 1))
+          break;
+        order++;
+      }
+
+      uint64_t p_count = 1ULL << order;
+      uint64_t base_pfn = phys / PAGE_SIZE;
+      /* pmm_bitmap_set_range() subtracts pmm_lowest_page internally. */
+      pmm_bitmap_set_range(pmm_managed_bitmap, base_pfn, p_count);
+      memset(&pmm_refcounts[base_pfn - pmm_lowest_page], 0,
+             p_count * sizeof(uint16_t));
+      struct numa_node *node = numa_get_node(numa_phys_to_node(phys));
+      spinlock_acquire(&node->zone.lock);
+      buddy_free_internal(&node->zone, phys, order);
+      node->usable_memory += p_count * PAGE_SIZE;
+      spinlock_release(&node->zone.lock);
+      pmm_usable_memory += p_count * PAGE_SIZE;
+      reclaimed += p_count * PAGE_SIZE;
+      p += p_count;
+    }
+    pfn = curr;
+  }
+
+  hal_irq_restore(flags);
+  return reclaimed;
+}

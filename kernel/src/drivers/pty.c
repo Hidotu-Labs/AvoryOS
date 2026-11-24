@@ -1413,6 +1413,11 @@ int pty_slave_ioctl(struct vfs_node *node, uint32_t request, uint64_t arg) {
     break;
   }
 
+  case 0x540A: { // TCXONC — terminal start/stop flow control
+    ret = 0;
+    break;
+  }
+
   case 0x540E: { // TIOCSCTTY — make this PTY the controlling terminal
     struct thread *t = sched_get_current();
     if (t) {

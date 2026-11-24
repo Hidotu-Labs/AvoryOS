@@ -393,6 +393,11 @@ static int xhci_pm_suspend(struct device *dev) {
     return -16;
   }
   xhci_wait_unlock(&hc->control_busy);
+  if (!xhci_wait_trylock(&hc->bulk_busy)) {
+    xhci_pm_unquiesce(hc);
+    return -16;
+  }
+  xhci_wait_unlock(&hc->bulk_busy);
   if (!spinlock_try_acquire(&hc->event_lock)) {
     xhci_pm_unquiesce(hc);
     return -16;
@@ -1607,7 +1612,7 @@ static uint32_t xhci_bulk_build_td(struct xhci_bulk_state *st, uint64_t phys,
     trb->status = chunk | (packets << 17);
     /* The first TRB is written with the inverse cycle bit and flipped last, so
      * the controller cannot start on a TD that is still being built. */
-    trb->control = control | (idx == 0 ? (first_cycle ^ 1U) : first_cycle);
+    trb->control = control | (idx == 0 ? (st->cycle ^ 1U) : st->cycle);
     st->td_phys[idx] = st->ring_phys + st->enqueue * sizeof(struct xhci_trb);
     st->td_len[idx] = chunk;
     idx++;
@@ -1647,13 +1652,18 @@ static int xhci_bulk_transfer(struct usb_hcd *hcd, struct usb_bulk_pipe *pipe,
     return USB_BULK_ERR;
   bool in = (pipe->endpoint & 0x80U) != 0;
 
-  spinlock_acquire(&hc->bulk_lock);
+  if (!xhci_wait_lock(&hc->bulk_busy))
+    return USB_BULK_ERR;
+  if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE)) {
+    xhci_wait_unlock(&hc->bulk_busy);
+    return USB_BULK_ERR;
+  }
   st->done = false;
   st->cc = 0;
   st->residual = 0;
   st->event_index = 0;
   if (!xhci_bulk_build_td(st, phys, len, in)) {
-    spinlock_release(&hc->bulk_lock);
+    xhci_wait_unlock(&hc->bulk_busy);
     return USB_BULK_ERR;
   }
   hc->debug_stage = "bulk transfer";
@@ -1681,7 +1691,7 @@ static int xhci_bulk_transfer(struct usb_hcd *hcd, struct usb_bulk_pipe *pipe,
 
   if (completed) {
     uint8_t cc = st->cc;
-    spinlock_release(&hc->bulk_lock);
+    xhci_wait_unlock(&hc->bulk_busy);
     if (cc == XHCI_BULK_CC_CANCELLED)
       return USB_BULK_GONE;
     if (cc == XHCI_COMPLETION_SUCCESS || cc == 13U) {
@@ -1710,7 +1720,7 @@ static int xhci_bulk_transfer(struct usb_hcd *hcd, struct usb_bulk_pipe *pipe,
   }
 
   if (gone) {
-    spinlock_release(&hc->bulk_lock);
+    xhci_wait_unlock(&hc->bulk_busy);
     return USB_BULK_GONE;
   }
 
@@ -1730,7 +1740,7 @@ static int xhci_bulk_transfer(struct usb_hcd *hcd, struct usb_bulk_pipe *pipe,
     xhci_set_endpoint_dequeue(hc, slot->id, st->dci, past, st->cycle);
   else
     xhci_recover_endpoint(hc, slot->id, st->dci, past, st->cycle);
-  spinlock_release(&hc->bulk_lock);
+  xhci_wait_unlock(&hc->bulk_busy);
   return USB_BULK_TIMEOUT;
 }
 
@@ -1741,15 +1751,66 @@ static int xhci_bulk_clear_halt(struct usb_hcd *hcd,
   struct xhci_slot *slot = pipe && pipe->dev ? pipe->dev->hcd_data : NULL;
   if (!hc || !st || !slot || !slot->enabled || !pipe->active)
     return USB_BULK_GONE;
-  /* Reset Endpoint is only valid for a Halted endpoint.  A running or
-   * stopped endpoint has no failed TD to skip, so there is nothing to do. */
-  uint32_t *out_ep = xhci_context(slot->output_context, st->dci, hc->context_64);
-  if ((out_ep[0] & 7U) != 2U)
-    return USB_BULK_OK;
+  if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE))
+    return USB_BULK_ERR;
+  if (!xhci_wait_lock(&hc->bulk_busy))
+    return USB_BULK_ERR;
+  if (__atomic_load_n(&hc->suspending, __ATOMIC_ACQUIRE) || !pipe->active) {
+    bool active = pipe->active;
+    xhci_wait_unlock(&hc->bulk_busy);
+    return active ? USB_BULK_ERR : USB_BULK_GONE;
+  }
+
   uint64_t dequeue = st->ring_phys + st->enqueue * sizeof(struct xhci_trb);
-  spinlock_acquire(&hc->bulk_lock);
-  bool ok = xhci_recover_endpoint(hc, slot->id, st->dci, dequeue, st->cycle);
-  spinlock_release(&hc->bulk_lock);
+  uint32_t *out_ep = xhci_context(slot->output_context, st->dci, hc->context_64);
+  uint8_t ep_state = (uint8_t)(out_ep[0] & 7U);
+  bool ok = false;
+
+  if (ep_state == 2U) {
+    /* Halted: Reset Endpoint + Set TR Dequeue clears the halt and resets the
+     * xHC data toggle to DATA0 before usb_clear_halt() resets the device. */
+    ok = xhci_recover_endpoint(hc, slot->id, st->dci, dequeue, st->cycle);
+  } else {
+    /* Running or Stopped: usb_clear_halt() will still send CLEAR_FEATURE to
+     * reset the device's toggle to DATA0, so re-initialize the xHC endpoint
+     * context (Drop+Add via Configure Endpoint) to reset its toggle too. */
+    if (ep_state == 1U) {
+      xhci_submit_command(hc, 0, 0,
+                          XHCI_TRB_TYPE(XHCI_TRB_STOP_ENDPOINT) |
+                              ((uint32_t)st->dci << 16) |
+                              ((uint32_t)slot->id << 24),
+                          NULL);
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      ep_state = (uint8_t)(out_ep[0] & 7U);
+    }
+    if (ep_state == 2U) {
+      ok = xhci_recover_endpoint(hc, slot->id, st->dci, dequeue, st->cycle);
+    } else {
+      memset(slot->input_context, 0, 4096);
+      uint32_t *icc = xhci_context(slot->input_context, 0, hc->context_64);
+      uint32_t *sc = xhci_context(slot->input_context, 1, hc->context_64);
+      uint32_t *out_sc = xhci_context(slot->output_context, 0, hc->context_64);
+      memcpy(sc, out_sc, hc->context_64 ? 64U : 32U);
+      icc[0] = 1U << st->dci;
+      icc[1] = 1U | (1U << st->dci);
+      uint32_t *ep =
+          xhci_context(slot->input_context, st->dci + 1U, hc->context_64);
+      uint32_t ep_type = ((st->pipe.endpoint & 0x80U) != 0) ? 6U : 2U;
+      ep[0] = 0;
+      ep[1] = (3U << 1) | (ep_type << 3) | ((uint32_t)st->max_burst << 8) |
+              ((uint32_t)st->pipe.max_packet << 16);
+      uint64_t dequeue_pcs = dequeue | st->cycle;
+      ep[2] = (uint32_t)dequeue_pcs;
+      ep[3] = (uint32_t)(dequeue_pcs >> 32);
+      ep[4] = 3072U;
+      hc->debug_stage = "bulk clear halt configure";
+      ok = xhci_submit_command(hc, slot->input_context_phys, 0,
+                               XHCI_TRB_TYPE(XHCI_TRB_CONFIGURE_ENDPOINT) |
+                                   ((uint32_t)slot->id << 24),
+                               NULL);
+    }
+  }
+  xhci_wait_unlock(&hc->bulk_busy);
   return ok ? USB_BULK_OK : USB_BULK_ERR;
 }
 
@@ -1765,7 +1826,8 @@ static void xhci_bulk_close(struct usb_hcd *hcd, struct usb_bulk_pipe *pipe) {
   pipe->dev = NULL;
   if (!slot || !slot->enabled)
     return;
-  spinlock_acquire(&hc->bulk_lock);
+  if (!xhci_wait_lock(&hc->bulk_busy))
+    return;
   xhci_submit_command(hc, 0, 0,
                       XHCI_TRB_TYPE(XHCI_TRB_STOP_ENDPOINT) |
                           ((uint32_t)st->dci << 16) |
@@ -1785,7 +1847,7 @@ static void xhci_bulk_close(struct usb_hcd *hcd, struct usb_bulk_pipe *pipe) {
                                ((uint32_t)slot->id << 24),
                            NULL))
     klog_puts("[XHCI] Bulk endpoint drop failed\n");
-  spinlock_release(&hc->bulk_lock);
+  xhci_wait_unlock(&hc->bulk_busy);
 }
 
 /* Removal with a transfer in flight: the waiter sees the cancelled completion

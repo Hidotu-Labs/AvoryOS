@@ -359,8 +359,12 @@ vfs_node_t *fb_lookup_device(const char *name) {
         strcmp(name, "dev/tty0") == 0)
         return &tty0_vfs_node;
     if (strcmp(name, "tty") == 0 || strcmp(name, "/dev/tty") == 0 ||
-        strcmp(name, "dev/tty") == 0)
+        strcmp(name, "dev/tty") == 0) {
+        struct thread *t = sched_get_current();
+        if (t && t->ctty)
+            return t->ctty;
         return &tty_vfs_node;
+    }
 
     if (strcmp(name, "fb0") == 0 || strcmp(name, "fb") == 0 ||
         strcmp(name, "framebuffer") == 0 || strcmp(name, "/dev/fb0") == 0 ||

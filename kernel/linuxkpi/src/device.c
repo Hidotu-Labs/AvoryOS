@@ -72,7 +72,8 @@ static const char *device_pci_ancestor_name(struct device *dev) {
 
 static bool device_is_drm_minor(struct device *dev) {
   return dev->devt && dev->class && dev->class->name &&
-         !strcmp(dev->class->name, "drm");
+         !strcmp(dev->class->name, "drm") &&
+         !(strncmp(dev_name(dev), "card", 4) == 0 && MINOR(dev->devt) >= 192);
 }
 
 int device_add(struct device *dev) {

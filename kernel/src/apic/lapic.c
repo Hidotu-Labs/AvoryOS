@@ -18,6 +18,7 @@ static uint64_t lapic_phys_base = 0;
 // accessors below then serve IPIs, EOI and the timer in both xAPIC (MMIO)
 // and x2APIC (MSR) modes.
 static bool lapic_x2apic = false;
+static bool lapic_x2apic_rejected = false;
 
 #define MSR_IA32_APIC_BASE 0x1B
 #define APIC_BASE_ENABLE (1ULL << 11)
@@ -34,6 +35,27 @@ static inline void lapic_wrmsr(uint32_t msr, uint64_t value) {
   uint32_t lo = (uint32_t)(value & 0xFFFFFFFF);
   uint32_t hi = (uint32_t)(value >> 32);
   __asm__ volatile("wrmsr" : : "c"(msr), "a"(lo), "d"(hi));
+}
+
+static inline bool lapic_wrmsr_safe(uint32_t msr, uint64_t value) {
+  uint32_t lo = (uint32_t)(value & 0xFFFFFFFF);
+  uint32_t hi = (uint32_t)(value >> 32);
+  uint32_t ok = 1;
+  __asm__ volatile(
+      "1:\n\t"
+      "wrmsr\n\t"
+      "jmp 2f\n\t"
+      "3:\n\t"
+      "xor %k0, %k0\n\t"
+      "2:\n\t"
+      ".pushsection __ex_table,\"a\"\n\t"
+      ".align 8\n\t"
+      ".quad 1b, 3b\n\t"
+      ".popsection\n\t"
+      : "+r"(ok)
+      : "c"(msr), "a"(lo), "d"(hi)
+      : "memory");
+  return ok != 0;
 }
 
 // x2APIC exposes each LAPIC register as an MSR at 0x800 + (MMIO offset / 16).
@@ -121,16 +143,22 @@ void lapic_init(uint64_t base_phys) {
    * dispatch transparently. */
   uint64_t apic_base = lapic_rdmsr(MSR_IA32_APIC_BASE);
   if (!(apic_base & APIC_BASE_X2APIC_ENABLE) &&
-      (apic_base & APIC_BASE_ENABLE) && cpu_has_x2apic()) {
-    lapic_wrmsr(MSR_IA32_APIC_BASE, apic_base | APIC_BASE_X2APIC_ENABLE);
-    apic_base = lapic_rdmsr(MSR_IA32_APIC_BASE);
+      (apic_base & APIC_BASE_ENABLE) && cpu_has_x2apic() &&
+      !lapic_x2apic_rejected) {
+    if (lapic_wrmsr_safe(MSR_IA32_APIC_BASE,
+                         apic_base | APIC_BASE_X2APIC_ENABLE)) {
+      apic_base = lapic_rdmsr(MSR_IA32_APIC_BASE);
+    } else {
+      lapic_x2apic_rejected = true;
+    }
   }
   if (apic_base & APIC_BASE_X2APIC_ENABLE) {
     lapic_x2apic = true;
     if (first_init)
       console_puts("[INFO] LAPIC is in x2APIC mode; using MSR access.\n");
-  } else
+  } else {
     lapic_x2apic = false;
+  }
 
   if (first_init) {
     console_puts("[OK] Local APIC Base: 0x");

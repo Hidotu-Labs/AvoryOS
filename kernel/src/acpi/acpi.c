@@ -26,9 +26,9 @@ static struct {
 } iso_entries[MAX_ISOS];
 static uint32_t iso_count = 0;
 
-// CPU APIC IDs discovered from MADT Local APIC entries
+// CPU APIC IDs discovered from MADT Local APIC / x2APIC entries
 #define MAX_CPUS_ACPI 64
-static uint8_t cpu_apic_ids[MAX_CPUS_ACPI];
+static uint32_t cpu_apic_ids[MAX_CPUS_ACPI];
 static uint32_t cpu_count = 0;
 
 // Helpers
@@ -70,7 +70,7 @@ struct rust_acpi_madt_parsed {
   uint32_t ioapic_gsi;
   bool has_ioapic;
   uint32_t cpu_count;
-  uint8_t cpu_apic_ids[MAX_CPUS_ACPI];
+  uint32_t cpu_apic_ids[MAX_CPUS_ACPI];
   uint32_t iso_count;
   struct rust_acpi_iso_entry iso_entries[MAX_ISOS];
 };
@@ -97,40 +97,95 @@ static bool acpi_validate_checksum(void *table, size_t length) {
 
 // Table lookup
 
-void *acpi_find_table(const char *signature) {
-  if (!root_sdt)
+static void *acpi_find_table_in_sdt(struct acpi_sdt_header *sdt, bool is_xsdt,
+                                    const char *signature,
+                                    bool require_checksum,
+                                    bool *out_checksum_ok) {
+  if (!sdt || sdt->length < sizeof(struct acpi_sdt_header))
     return NULL;
 
-  size_t entries = (root_sdt->length - sizeof(struct acpi_sdt_header));
+  size_t raw_len = sdt->length - sizeof(struct acpi_sdt_header);
+  size_t entries = is_xsdt ? (raw_len / 8) : (raw_len / 4);
 
-  if (use_xsdt) {
-    entries /= 8;
-    struct acpi_xsdt *xsdt = (struct acpi_xsdt *)root_sdt;
-    for (size_t i = 0; i < entries; i++) {
-      struct acpi_sdt_header *header =
-          (struct acpi_sdt_header *)(xsdt->pointers[i] + pmm_get_hhdm_offset());
-      if (strncmp(header->signature, signature, 4) == 0) {
-        if (acpi_validate_checksum(header, header->length)) {
-          return header;
-        }
-      }
+  for (size_t i = 0; i < entries; i++) {
+    uint64_t phys = is_xsdt
+                        ? ((struct acpi_xsdt *)sdt)->pointers[i]
+                        : (uint64_t)((struct acpi_rsdt *)sdt)->pointers[i];
+    if (!phys)
+      continue;
+    struct acpi_sdt_header *header =
+        (struct acpi_sdt_header *)(phys + pmm_get_hhdm_offset());
+    if (strncmp(header->signature, signature, 4) == 0) {
+      bool csum_ok = acpi_validate_checksum(header, header->length);
+      if (out_checksum_ok)
+        *out_checksum_ok = csum_ok;
+      if (!require_checksum || csum_ok)
+        return header;
     }
-  } else {
-    entries /= 4;
-    struct acpi_rsdt *rsdt = (struct acpi_rsdt *)root_sdt;
-    for (size_t i = 0; i < entries; i++) {
-      struct acpi_sdt_header *header =
-          (struct acpi_sdt_header *)((uint64_t)rsdt->pointers[i] +
-                                     pmm_get_hhdm_offset());
-      if (strncmp(header->signature, signature, 4) == 0) {
-        if (acpi_validate_checksum(header, header->length)) {
-          return header;
-        }
-      }
-    }
+  }
+  return NULL;
+}
+
+void *acpi_find_table(const char *signature) {
+  return acpi_find_table_in_sdt(root_sdt, use_xsdt, signature, true, NULL);
+}
+
+void *acpi_find_table_unchecked(const char *signature, bool *out_checksum_ok) {
+  void *hdr = acpi_find_table_in_sdt(root_sdt, use_xsdt, signature, false,
+                                     out_checksum_ok);
+  if (hdr)
+    return hdr;
+
+  if (use_xsdt && rsdp && rsdp->rsdt_address) {
+    struct acpi_sdt_header *rsdt =
+        (struct acpi_sdt_header *)((uint64_t)rsdp->rsdt_address +
+                                   pmm_get_hhdm_offset());
+    hdr = acpi_find_table_in_sdt(rsdt, false, signature, false,
+                                 out_checksum_ok);
+    if (hdr)
+      return hdr;
   }
 
   return NULL;
+}
+
+void acpi_format_table_signatures(char *buf, size_t buf_size) {
+  if (!buf || buf_size == 0)
+    return;
+  buf[0] = '\0';
+  if (!root_sdt || root_sdt->length < sizeof(struct acpi_sdt_header)) {
+    const char *none = "(none)";
+    size_t i = 0;
+    while (none[i] && i + 1 < buf_size) {
+      buf[i] = none[i];
+      i++;
+    }
+    buf[i] = '\0';
+    return;
+  }
+
+  size_t raw_len = root_sdt->length - sizeof(struct acpi_sdt_header);
+  size_t entries = use_xsdt ? (raw_len / 8) : (raw_len / 4);
+  size_t pos = 0;
+
+  for (size_t i = 0; i < entries && pos + 8 < buf_size; i++) {
+    uint64_t phys = use_xsdt
+                        ? ((struct acpi_xsdt *)root_sdt)->pointers[i]
+                        : (uint64_t)((struct acpi_rsdt *)root_sdt)->pointers[i];
+    if (!phys)
+      continue;
+    struct acpi_sdt_header *header =
+        (struct acpi_sdt_header *)(phys + pmm_get_hhdm_offset());
+    if (pos > 0)
+      buf[pos++] = ' ';
+    for (int j = 0; j < 4 && pos + 1 < buf_size; j++) {
+      char c = header->signature[j];
+      buf[pos++] = (c >= 0x20 && c < 0x7f) ? c : '?';
+    }
+    if (!acpi_validate_checksum(header, header->length) && pos + 1 < buf_size)
+      buf[pos++] = '!';
+  }
+  buf[pos] = '\0';
 }
 
 // MADT Data Accessors
@@ -153,7 +208,7 @@ bool acpi_get_irq_override(uint8_t irq, uint32_t *gsi, uint16_t *flags) {
 }
 
 uint32_t acpi_get_cpu_count(void) { return cpu_count; }
-const uint8_t *acpi_get_cpu_apic_ids(void) { return cpu_apic_ids; }
+const uint32_t *acpi_get_cpu_apic_ids(void) { return cpu_apic_ids; }
 
 struct acpi_mcfg *acpi_get_mcfg(void) {
   return (struct acpi_mcfg *)acpi_find_table("MCFG");
@@ -931,13 +986,50 @@ void acpi_init(struct limine_rsdp_response *response) {
 
     switch (header->type) {
     case 0: { // Local APIC
-      struct acpi_madt_local_apic *lapic =
-          (struct acpi_madt_local_apic *)entries;
-      if (lapic->flags & 1) {
-        if (core_count < MAX_CPUS_ACPI) {
-          cpu_apic_ids[core_count] = lapic->apic_id;
+      if (header->length >= sizeof(struct acpi_madt_local_apic)) {
+        struct acpi_madt_local_apic *lapic =
+            (struct acpi_madt_local_apic *)entries;
+        if (lapic->flags & 1) {
+          uint32_t id = lapic->apic_id;
+          bool dup = false;
+          uint32_t limit = core_count < MAX_CPUS_ACPI ? core_count : MAX_CPUS_ACPI;
+          for (uint32_t j = 0; j < limit; j++) {
+            if (cpu_apic_ids[j] == id) {
+              dup = true;
+              break;
+            }
+          }
+          if (!dup) {
+            if (core_count < MAX_CPUS_ACPI) {
+              cpu_apic_ids[core_count] = id;
+            }
+            core_count++;
+          }
         }
-        core_count++;
+      }
+      break;
+    }
+    case 9: { // Processor Local x2APIC
+      if (header->length >= sizeof(struct acpi_madt_local_x2apic)) {
+        struct acpi_madt_local_x2apic *x2 =
+            (struct acpi_madt_local_x2apic *)entries;
+        if ((x2->flags & 1) && x2->x2apic_id != 0xFFFFFFFFU) {
+          uint32_t id = x2->x2apic_id;
+          bool dup = false;
+          uint32_t limit = core_count < MAX_CPUS_ACPI ? core_count : MAX_CPUS_ACPI;
+          for (uint32_t j = 0; j < limit; j++) {
+            if (cpu_apic_ids[j] == id) {
+              dup = true;
+              break;
+            }
+          }
+          if (!dup) {
+            if (core_count < MAX_CPUS_ACPI) {
+              cpu_apic_ids[core_count] = id;
+            }
+            core_count++;
+          }
+        }
       }
       break;
     }

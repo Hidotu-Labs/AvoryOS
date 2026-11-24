@@ -71,6 +71,15 @@ struct acpi_madt_local_apic {
   uint32_t flags;
 } __attribute__((packed));
 
+// MADT Entry Type 9: Processor Local x2APIC
+struct acpi_madt_local_x2apic {
+  struct acpi_madt_entry_header header;
+  uint16_t reserved;
+  uint32_t x2apic_id;
+  uint32_t flags;
+  uint32_t acpi_uid;
+} __attribute__((packed));
+
 // MADT Entry Type 1: I/O APIC
 struct acpi_madt_ioapic {
   struct acpi_madt_entry_header header;
@@ -357,6 +366,8 @@ static inline const char *fadt_pm_profile_name(uint8_t profile) {
 // ACPI Initialization & Table Lookup
 void acpi_init(struct limine_rsdp_response *response);
 void *acpi_find_table(const char *signature);
+void *acpi_find_table_unchecked(const char *signature, bool *out_checksum_ok);
+void acpi_format_table_signatures(char *buf, size_t buf_size);
 
 // MADT Data Accessors (valid after acpi_init)
 
@@ -377,7 +388,7 @@ bool acpi_get_irq_override(uint8_t irq, uint32_t *gsi, uint16_t *flags);
 uint32_t acpi_get_cpu_count(void);
 
 // Returns a pointer to the array of APIC IDs for all enabled CPUs.
-const uint8_t *acpi_get_cpu_apic_ids(void);
+const uint32_t *acpi_get_cpu_apic_ids(void);
 
 // Returns the MCFG table if present, otherwise NULL.
 struct acpi_mcfg *acpi_get_mcfg(void);

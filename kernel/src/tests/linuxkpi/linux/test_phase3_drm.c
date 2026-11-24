@@ -11,6 +11,7 @@
 
 #include <drm/drm.h>
 #include <drm/drm_mode.h>
+#include <linux/sprintf.h>
 #include <linux/string.h>
 
 #include <linuxkpi/log.h>
@@ -156,14 +157,56 @@ static void phase3_check_devnode_removal(void) {
 }
 
 /* Dynamic sysfs: class dirs/device dirs and real attribute show/store. */
-static void phase3_check_sysfs(void) {
-  static const char *paths[] = {
-      "/sys/class/drm/card1",
-      "/sys/class/drm/card1-Virtual-1",
-  };
+static int phase3_find_vkms_card(void) {
+  struct phase3_scratch scratch;
+
+  if (phase3_scratch_alloc(&scratch))
+    return -1;
+  for (int i = 0; i <= 5; i++) {
+    char path[32];
+    char name[32];
+    struct drm_version *ver;
+    void *node;
+
+    snprintf(path, sizeof(path), "/dev/dri/card%d", i);
+    node = asc_vfs_kernel_open(path);
+    if (!node)
+      continue;
+    ver = scratch.kva;
+    memset(ver, 0, sizeof(*ver));
+    ver->name = (char *)(uintptr_t)(PHASE3_SCRATCH_VA + 128);
+    ver->name_len = 31;
+    memset((char *)scratch.kva + 128, 0, 32);
+    if (asc_vfs_kernel_ioctl(node, DRM_IOCTL_VERSION, PHASE3_SCRATCH_VA) == 0) {
+      memcpy(name, (char *)scratch.kva + 128, sizeof(name));
+      name[31] = '\0';
+      if (strcmp(name, "vkms") == 0) {
+        asc_vfs_kernel_close(node);
+        phase3_scratch_free(&scratch);
+        return i;
+      }
+    }
+    asc_vfs_kernel_close(node);
+  }
+  phase3_scratch_free(&scratch);
+  return -1;
+}
+
+static void phase3_check_sysfs(int vkms_minor) {
+  char card_path[48];
+  char conn_path[64];
+  const char *paths[2];
   char buf[64];
   void *node;
   int len;
+
+  if (vkms_minor < 0)
+    vkms_minor = 1;
+  snprintf(card_path, sizeof(card_path), "/sys/class/drm/card%d", vkms_minor);
+  snprintf(conn_path, sizeof(conn_path), "/sys/class/drm/card%d-Virtual-1",
+           vkms_minor);
+  paths[0] = card_path;
+  paths[1] = conn_path;
 
   for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
     node = asc_vfs_kernel_open(paths[i]);
@@ -257,8 +300,8 @@ out:
 }
 
 /* vkms modeset resource discovery: GETRESOURCES + GETCONNECTOR must answer on
- * card1 (the atomic commit path itself is exercised from userland in C5). */
-static void phase3_check_vkms_resources(void) {
+ * the vkms card (the atomic commit path itself is exercised from userland in C5). */
+static void phase3_check_vkms_resources(const char *vkms_path) {
   struct phase3_scratch scratch;
   struct drm_mode_card_res *res;
   struct drm_mode_get_connector *con;
@@ -267,9 +310,9 @@ static void phase3_check_vkms_resources(void) {
   void *node;
   int ret;
 
-  node = asc_vfs_kernel_open("/dev/dri/card1");
+  node = asc_vfs_kernel_open(vkms_path);
   if (!node) {
-    klog_puts("[SKIP] LinuxKPI: card1 resource test (node absent)\n");
+    klogf("[SKIP] LinuxKPI: %s resource test (node absent)\n", vkms_path);
     return;
   }
   if (phase3_scratch_alloc(&scratch)) {
@@ -326,15 +369,20 @@ out:
 }
 
 void linuxkpi_test_phase3_drm(void) {
+  int vkms_minor = phase3_find_vkms_card();
+  char vkms_path[32];
+
+  snprintf(vkms_path, sizeof(vkms_path), "/dev/dri/card%d",
+           vkms_minor >= 0 ? vkms_minor : 1);
   klog_puts("[LINUXKPI] Phase 3 DRM devnode self-test\n");
 
   phase3_check_devnode_removal();
-  phase3_check_sysfs();
+  phase3_check_sysfs(vkms_minor);
   phase3_check_devnode("/dev/dri/renderD128");
   /* Present once the vkms canary finishes coming up (its initcall currently
    * returns -EINVAL after registering the minor), so the suite starts
    * covering it without further changes. */
-  phase3_check_devnode("/dev/dri/card1");
-  phase3_check_gem_dumb("/dev/dri/card1", "vkms");
-  phase3_check_vkms_resources();
+  phase3_check_devnode(vkms_path);
+  phase3_check_gem_dumb(vkms_path, "vkms");
+  phase3_check_vkms_resources(vkms_path);
 }

@@ -263,6 +263,7 @@ ifneq ($(linux-obj-y),)
         -include linux/include/linux/compiler_types.h \
         -include linux/include/generated/autoconf.h \
         -include linux/include/linux/kconfig.h \
+        -DCONFIG_DRM_CLIENT_SETUP=1 \
         $(filter -D%,$(CPPFLAGS)) \
         -MMD \
         -MP
@@ -347,6 +348,8 @@ ifneq ($(linux-obj-y),)
     # weak implementation of Linux cryptographic get_random_bytes().
     obj-$(ARCH)/linux/lib/uuid.c.o: override LINUX_CPPFLAGS += -Dget_random_bytes=linuxkpi_guid_bytes
     obj-$(ARCH)/linux/drivers/gpu/drm/drm_syncobj.c.o: override LINUX_CPPFLAGS += -Ddrm_syncobj_timeline_wait_ioctl=linuxkpi_original_drm_syncobj_timeline_wait_ioctl
+    obj-$(ARCH)/linux/drivers/gpu/drm/drm_drv.c.o: override LINUX_CPPFLAGS += -D__devm_drm_dev_alloc=linuxkpi_original___devm_drm_dev_alloc
+    obj-$(ARCH)/linux/drivers/gpu/drm/vkms/vkms_drv.c.o: override LINUX_CPPFLAGS += -include linuxkpi/include/linuxkpi/vkms_gate.h
     # Empty-manager eviction in the pinned import reads an undefined result.
     # LinuxKPI supplies the corrected entry point without editing the import.
     obj-$(ARCH)/linux/drivers/gpu/drm/ttm/ttm_resource.c.o: override LINUX_CPPFLAGS += -Dttm_resource_manager_evict_all=linuxkpi_original_ttm_resource_manager_evict_all
@@ -356,6 +359,7 @@ ifneq ($(linux-obj-y),)
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c.o: override LINUX_CPPFLAGS += -Damdgpu_gem_create_ioctl=linuxkpi_amdgpu_gem_create_ioctl
     # Release kernel doorbells while the TTM managers still own their BO.
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c.o: override LINUX_CPPFLAGS += -Damdgpu_ttm_fini=linuxkpi_original_amdgpu_ttm_fini
+    obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_bios.c.o: override LINUX_CPPFLAGS += -Damdgpu_get_bios=linuxkpi_original_amdgpu_get_bios
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_ib.c.o: override LINUX_CPPFLAGS += -Damdgpu_ib_schedule=linuxkpi_original_amdgpu_ib_schedule
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c.o: override LINUX_CPPFLAGS += -include linuxkpi/include/linuxkpi/amdgpu_init_reset.h
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c.o: override LINUX_CPPFLAGS += -Damdgpu_gem_va_ioctl=linuxkpi_original_amdgpu_gem_va_ioctl
@@ -368,7 +372,7 @@ ifneq ($(linux-obj-y),)
     obj-$(ARCH)/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_psp.c.o: override LINUX_CPPFLAGS += -include linuxkpi/include/linuxkpi/psp_ring_trace.h
     obj-$(ARCH)/linux/drivers/dma-buf/dma-fence.c.o: override LINUX_CPPFLAGS += -Ddma_fence_signal=linuxkpi_original_dma_fence_signal
     obj-$(ARCH)/linux/drivers/dma-buf/dma-resv.c.o: override LINUX_CPPFLAGS += -Ddma_resv_add_fence=linuxkpi_original_dma_resv_add_fence
-    obj-$(ARCH)/linuxkpi/src/amdgpu_memory.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_trace.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_teardown.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_init_reset.c.o obj-$(ARCH)/linuxkpi/src/psp_submit_trace.c.o obj-$(ARCH)/linuxkpi/src/psp_completion_trace.c.o obj-$(ARCH)/linuxkpi/src/psp_reinit.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_ib_visibility.c.o: override LINUX_CPPFLAGS += \
+    obj-$(ARCH)/linuxkpi/src/amdgpu_memory.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_trace.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_teardown.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_init_reset.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_vbios.c.o obj-$(ARCH)/linuxkpi/src/psp_submit_trace.c.o obj-$(ARCH)/linuxkpi/src/psp_completion_trace.c.o obj-$(ARCH)/linuxkpi/src/psp_reinit.c.o obj-$(ARCH)/linuxkpi/src/amdgpu_ib_visibility.c.o: override LINUX_CPPFLAGS += \
         -DAVORYOS_AMDGPU_MEMORY_POLICY \
         -Ilinux/drivers/gpu/drm/amd/amdgpu \
         -Ilinux/drivers/gpu/drm/amd/include \

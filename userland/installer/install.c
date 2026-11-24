@@ -203,6 +203,38 @@ void install_unmount_target(void) {
     umount2(TARGET_MOUNT "/dev", 2);
     umount2(TARGET_MOUNT "/proc", 2);
     umount2(TARGET_MOUNT "/sys", 2);
+
+    /* Unmount any nested mountpoints under TARGET_MOUNT deepest-first */
+    char submounts[16][128];
+    int n_sub = 0;
+    size_t base_len = strlen(TARGET_MOUNT);
+    FILE *m = fopen("/proc/mounts", "r");
+    if (m) {
+        char line[512];
+        while (fgets(line, sizeof(line), m) && n_sub < 16) {
+            char mdev[128] = {0}, mp[128] = {0};
+            if (sscanf(line, "%127s %127s", mdev, mp) == 2) {
+                if (strncmp(mp, TARGET_MOUNT "/", base_len + 1) == 0) {
+                    snprintf(submounts[n_sub++], sizeof(submounts[0]), "%s", mp);
+                }
+            }
+        }
+        fclose(m);
+    }
+    for (int i = 0; i < n_sub - 1; i++) {
+        for (int j = i + 1; j < n_sub; j++) {
+            if (strlen(submounts[j]) > strlen(submounts[i])) {
+                char tmp[128];
+                memcpy(tmp, submounts[i], sizeof(tmp));
+                memcpy(submounts[i], submounts[j], sizeof(submounts[i]));
+                memcpy(submounts[j], tmp, sizeof(submounts[j]));
+            }
+        }
+    }
+    for (int i = 0; i < n_sub; i++) {
+        umount2(submounts[i], 2);
+    }
+
     umount2(TARGET_MOUNT "/boot/efi", 2);
     umount2(TARGET_MOUNT, 2);
 }
@@ -233,7 +265,7 @@ void install_enter_chroot(void) {
     umount2(TARGET_MOUNT "/dev", 2);
 }
 
-static int write_xinitrc(const char *path, const char *xinit_cmd) {
+static int write_xinitrc(const char *path, const char *xinit_cmd, const char *xkb_layout) {
     const char *xdg_env =
         "_avory_home=\"${HOME:-/}\"\n"
         "_avory_home=\"${_avory_home%/}\"\n"
@@ -247,6 +279,9 @@ static int write_xinitrc(const char *path, const char *xinit_cmd) {
     if (!f) return -1;
     fputs("#!/bin/sh\n", f);
     fputs(xdg_env, f);
+    if (xkb_layout && xkb_layout[0]) {
+        fprintf(f, "command -v setxkbmap >/dev/null 2>&1 && setxkbmap %s 2>/dev/null || true\n", xkb_layout);
+    }
     fprintf(f, "%s\n", xinit_cmd);
     fclose(f);
     chmod(path, 0755);
@@ -285,23 +320,40 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
     /* ESP, filesystem metadata, firmware and unpackaged files need room on
      * top of the packages themselves. */
     uint64_t need = pkgsel_installed_bytes(sel) + pkgsel_installed_bytes(sel) / 4 + (1ULL << 30);
-    if (disk->size_bytes < need) {
-        char have_s[32], need_s[32];
-        disks_format_size(disk->size_bytes, have_s, sizeof(have_s));
-        disks_format_size(need, need_s, sizeof(need_s));
-        snprintf(err_buf, err_sz, "%s is too small (%s); this selection needs about %s",
-                 disk->dev_path, have_s, need_s);
+
+    part_entry_t parts[MAX_PARTITIONS];
+    int part_count = cfg->part_count;
+    bool wipe_disk = cfg->wipe_disk;
+    if (part_count > 0 && part_count <= MAX_PARTITIONS) {
+        memcpy(parts, cfg->parts, (size_t)part_count * sizeof(part_entry_t));
+    } else {
+        wipe_disk = true;
+        disks_init_preset(SCHEME_SINGLE_ROOT, disk->size_bytes, parts, &part_count);
+    }
+
+    if (!disks_validate_parts(parts, part_count, disk->size_bytes, need, wipe_disk, err_buf, err_sz)) {
         pkgsel_free(sel);
         return -1;
     }
 
-    char esp_dev[72] = {0};
-    char root_dev[72] = {0};
-
-    if (disks_partition_and_format(disk, esp_dev, sizeof(esp_dev), root_dev, sizeof(root_dev), cb, ctx) != 0) {
+    int part_rc = wipe_disk
+        ? disks_partition_and_format(disk, parts, part_count, cb, ctx)
+        : disks_apply_existing(disk, parts, part_count, cb, ctx);
+    if (part_rc != 0) {
         snprintf(err_buf, err_sz, "Partitioning or formatting %s failed. See %s", disk->dev_path, LOG_PATH);
         pkgsel_free(sel);
         return -1;
+    }
+
+    char esp_dev[80] = {0};
+    char root_dev[80] = {0};
+    for (int i = 0; i < part_count; i++) {
+        if (parts[i].is_free || parts[i].role == PART_NONE) continue;
+        if (parts[i].role == PART_ESP) {
+            snprintf(esp_dev, sizeof(esp_dev), "%s", parts[i].dev_path);
+        } else if (parts[i].role == PART_ROOT || strcmp(parts[i].mountpoint, "/") == 0) {
+            snprintf(root_dev, sizeof(root_dev), "%s", parts[i].dev_path);
+        }
     }
 
     /* Mount root */
@@ -311,6 +363,39 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
         const char *m_argv[] = {"mount", "-t", "ext4", root_dev, TARGET_MOUNT, NULL};
         if (run_cmd_logged(m_argv, NULL, cb, 42, "Mounting root...", ctx) != 0) {
             snprintf(err_buf, err_sz, "Failed to mount %s on %s", root_dev, TARGET_MOUNT);
+            pkgsel_free(sel);
+            return -1;
+        }
+    }
+
+    /* Mount additional ext4 partitions shallowest-first before copying files */
+    int extra_idx[MAX_PARTITIONS];
+    int n_extra = 0;
+    for (int i = 0; i < part_count; i++) {
+        if (parts[i].is_free || parts[i].role == PART_NONE) continue;
+        if (parts[i].fs == FS_EXT4 && parts[i].role != PART_ROOT && strcmp(parts[i].mountpoint, "/") != 0) {
+            extra_idx[n_extra++] = i;
+        }
+    }
+    for (int i = 0; i < n_extra - 1; i++) {
+        for (int j = i + 1; j < n_extra; j++) {
+            if (strlen(parts[extra_idx[j]].mountpoint) < strlen(parts[extra_idx[i]].mountpoint)) {
+                int tmp = extra_idx[i];
+                extra_idx[i] = extra_idx[j];
+                extra_idx[j] = tmp;
+            }
+        }
+    }
+    for (int k = 0; k < n_extra; k++) {
+        part_entry_t *p = &parts[extra_idx[k]];
+        char mpath[192];
+        snprintf(mpath, sizeof(mpath), TARGET_MOUNT "%s", p->mountpoint);
+        ensure_dir(mpath, 0755);
+        if (cb) cb(44, "Mounting additional partition...", p->mountpoint, ctx);
+        const char *m_argv[] = {"mount", "-t", "ext4", p->dev_path, mpath, NULL};
+        if (run_cmd_logged(m_argv, NULL, cb, 44, "Mounting partition...", ctx) != 0) {
+            snprintf(err_buf, err_sz, "Failed to mount %s on %s", p->dev_path, mpath);
+            install_unmount_target();
             pkgsel_free(sel);
             return -1;
         }
@@ -355,6 +440,12 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
     ensure_dir(TARGET_MOUNT "/mnt", 0755);
     chmod(TARGET_MOUNT "/tmp", 01777);
     chmod(TARGET_MOUNT "/run", 01777);
+    ensure_dir(TARGET_MOUNT "/var/cache/axon/pkg", 0755);
+    ensure_dir(TARGET_MOUNT "/var/cache/pacman/pkg", 0755);
+    ensure_dir(TARGET_MOUNT "/var/lib/axon/sync", 0755);
+    ensure_dir(TARGET_MOUNT "/var/log", 0755);
+    ensure_dir(TARGET_MOUNT "/var/tmp", 0755);
+    chmod(TARGET_MOUNT "/var/tmp", 01777);
 
     /* Bootloader & Kernel: everything is staged on the root's /boot first,
      * then the (unmounted) ESP is written from userspace with mtools. The
@@ -424,25 +515,51 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
             "    path: boot():/boot/kernel\n"
             "    cmdline: init=/bin/bash screenlog\n"
             "    resolution: 1280x800\n");
+
+    /* Detect other OS UEFI bootloaders on an existing ESP and add chainload entries */
+    if (!wipe_disk) {
+        static const struct { const char *label; const char *mpath; const char *lpath; } other_os[] = {
+            {"Windows Boot Manager", "::/EFI/Microsoft/Boot/bootmgfw.efi", "/EFI/Microsoft/Boot/bootmgfw.efi"},
+            {"Ubuntu",               "::/EFI/ubuntu/grubx64.efi",         "/EFI/ubuntu/grubx64.efi"},
+            {"Debian",               "::/EFI/debian/grubx64.efi",         "/EFI/debian/grubx64.efi"},
+            {"Fedora",               "::/EFI/fedora/grubx64.efi",         "/EFI/fedora/grubx64.efi"},
+            {"Arch Linux",           "::/EFI/arch/grubx64.efi",           "/EFI/arch/grubx64.efi"},
+            {"Linux (systemd-boot)", "::/EFI/systemd/systemd-bootx64.efi","/EFI/systemd/systemd-bootx64.efi"},
+        };
+        char mdir_out[512];
+        for (size_t i = 0; i < sizeof(other_os) / sizeof(other_os[0]); i++) {
+            const char *mdir_argv[] = {"env", "MTOOLS_SKIP_CHECK=1", "mdir", "-b", "-i", esp_dev,
+                                       other_os[i].mpath, NULL};
+            if (run_cmd_capture(mdir_argv, mdir_out, sizeof(mdir_out)) == 0 && mdir_out[0]) {
+                fprintf(lconf,
+                        "\n/%s\n"
+                        "    protocol: efi\n"
+                        "    path: boot():%s\n",
+                        other_os[i].label, other_os[i].lpath);
+            }
+        }
+    }
     fclose(lconf);
 
     /* Limine's UEFI loader reads limine.conf next to itself first; the BIOS
-     * stage searches /boot/limine and the volume root. */
+     * stage searches /boot/limine and the volume root. Install to both
+     * EFI/avoryos and EFI/BOOT so firmware with or without NVRAM entries boots. */
     struct { const char *src; const char *dst; bool want; } esp_files[] = {
         {"/usr/share/limine/BOOTX64.EFI", "::/EFI/BOOT/BOOTX64.EFI", true},
+        {"/usr/share/limine/BOOTX64.EFI", "::/EFI/avoryos/BOOTX64.EFI", true},
         {TARGET_MOUNT "/boot/kernel", "::/boot/kernel", true},
         {TARGET_MOUNT "/boot/limine/limine.conf", "::/EFI/BOOT/limine.conf", true},
+        {TARGET_MOUNT "/boot/limine/limine.conf", "::/EFI/avoryos/limine.conf", true},
         {TARGET_MOUNT "/boot/limine/limine.conf", "::/boot/limine/limine.conf", true},
         {TARGET_MOUNT "/boot/limine/limine.conf", "::/limine.conf", true},
         {TARGET_MOUNT "/boot/limine/limine-bios.sys", "::/boot/limine/limine-bios.sys", have_bios_stage},
         {TARGET_MOUNT "/boot/limine/boo.png", "::/boot/limine/boo.png", have_wallpaper},
     };
-    const char *mmd_argv[] = {"env", "MTOOLS_SKIP_CHECK=1", "mmd", "-i", esp_dev,
-                              "::/EFI", "::/EFI/BOOT", "::/boot", "::/boot/limine", NULL};
-    if (run_cmd_logged(mmd_argv, NULL, cb, 82, "Creating ESP directories...", ctx) != 0) {
-        snprintf(err_buf, err_sz, "Failed to create ESP directories on %s (is mtools installed?)", esp_dev);
-        install_unmount_target();
-        return -1;
+    const char *mmd_dirs[] = {"::/EFI", "::/EFI/BOOT", "::/EFI/avoryos", "::/boot", "::/boot/limine", NULL};
+    for (int d_i = 0; mmd_dirs[d_i]; d_i++) {
+        const char *mmd_argv[] = {"env", "MTOOLS_SKIP_CHECK=1", "mmd", "-D", "s", "-i", esp_dev,
+                                  mmd_dirs[d_i], NULL};
+        run_cmd_logged(mmd_argv, NULL, cb, 82, "Creating ESP directories...", ctx);
     }
     for (size_t i = 0; i < sizeof(esp_files) / sizeof(esp_files[0]); i++) {
         if (!esp_files[i].want) continue;
@@ -455,8 +572,24 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
         }
     }
 
-    const char *limine_argv[] = {"limine", "bios-install", disk->dev_path, NULL};
-    run_cmd_logged(limine_argv, NULL, cb, 84, "Installing Limine BIOS stage...", ctx);
+    if (access("/sys/firmware/efi", F_OK) == 0 &&
+        (access("/usr/bin/efibootmgr", X_OK) == 0 || access("/usr/sbin/efibootmgr", X_OK) == 0)) {
+        char pnum_s[16] = "1";
+        for (int i = 0; i < part_count; i++) {
+            if (!parts[i].is_free && parts[i].role == PART_ESP && parts[i].part_num > 0) {
+                snprintf(pnum_s, sizeof(pnum_s), "%d", parts[i].part_num);
+                break;
+            }
+        }
+        const char *efi_argv[] = {"efibootmgr", "-c", "-d", disk->dev_path, "-p", pnum_s,
+                                  "-L", "AvoryOS", "-l", "\\EFI\\avoryos\\BOOTX64.EFI", NULL};
+        run_cmd_logged(efi_argv, NULL, cb, 84, "Registering UEFI boot entry...", ctx);
+    }
+
+    if (wipe_disk || access("/sys/firmware/efi", F_OK) != 0) {
+        const char *limine_argv[] = {"limine", "bios-install", disk->dev_path, NULL};
+        run_cmd_logged(limine_argv, NULL, cb, 84, "Installing Limine BIOS stage...", ctx);
+    }
 
     /* fstab with UUIDs */
     if (cb) cb(88, "Generating /etc/fstab, hostname, and keymap...", NULL, ctx);
@@ -476,14 +609,42 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
     if (fstab) {
         fprintf(fstab,
                 "# /etc/fstab: static file system information\n"
-                "%-42s /          ext4   noatime,rw   0 1\n"
+                "%-42s %-10s ext4   noatime,rw   0 1\n",
+                root_spec, "/");
+
+        for (int k = 0; k < n_extra; k++) {
+            const part_entry_t *p = &parts[extra_idx[k]];
+            char spec[96];
+            if (disks_get_uuid(p->dev_path, uuid, sizeof(uuid))) {
+                snprintf(spec, sizeof(spec), "UUID=%s", uuid);
+            } else {
+                snprintf(spec, sizeof(spec), "%s", p->dev_path);
+            }
+            fprintf(fstab, "%-42s %-10s ext4   noatime,rw   0 2\n", spec, p->mountpoint);
+        }
+
+        for (int i = 0; i < part_count; i++) {
+            if (parts[i].is_free || parts[i].role == PART_NONE) continue;
+            if (parts[i].fs == FS_SWAP) {
+                char spec[96];
+                if (disks_get_uuid(parts[i].dev_path, uuid, sizeof(uuid))) {
+                    snprintf(spec, sizeof(spec), "UUID=%s", uuid);
+                } else {
+                    snprintf(spec, sizeof(spec), "%s", parts[i].dev_path);
+                }
+                fprintf(fstab, "%-42s %-10s swap   sw           0 0\n", spec, "none");
+            }
+        }
+
+        fprintf(fstab,
                 "# The ESP is maintained with mtools; the kernel's FAT32 writes are\n"
                 "# not yet safe for it, so it is not mounted at boot.\n"
-                "%-42s /boot/efi  vfat   noauto       0 0\n"
-                "tmpfs                                      /tmp       tmpfs  defaults     0 0\n"
-                "proc                                       /proc      proc   defaults     0 0\n"
-                "sysfs                                      /sys       sysfs  defaults     0 0\n",
-                root_spec, esp_spec);
+                "%-42s %-10s vfat   noauto       0 0\n"
+                "%-42s %-10s proc   defaults     0 0\n"
+                "%-42s %-10s sysfs  defaults     0 0\n",
+                esp_spec, "/boot/efi",
+                "proc", "/proc",
+                "sysfs", "/sys");
         fclose(fstab);
     }
 
@@ -502,21 +663,45 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
         fclose(hosts);
     }
 
-    /* Keymap */
+    /* Keymap (TTY vconsole + Xorg XKB) */
+    const char *xkb_layout = (strcmp(cfg->keymap, "uk") == 0) ? "gb" : cfg->keymap;
     FILE *vcon = fopen(TARGET_MOUNT "/etc/vconsole.conf", "w");
     if (vcon) {
         fprintf(vcon, "KEYMAP=%s\n", cfg->keymap);
         fclose(vcon);
     }
+    ensure_dir(TARGET_MOUNT "/etc/X11/xorg.conf.d", 0755);
+    FILE *xkb = fopen(TARGET_MOUNT "/etc/X11/xorg.conf.d/90-keyboard.conf", "w");
+    if (xkb) {
+        fprintf(xkb,
+                "Section \"InputClass\"\n"
+                "    Identifier \"system-keyboard\"\n"
+                "    MatchIsKeyboard \"on\"\n"
+                "    Option \"XkbLayout\" \"%s\"\n"
+                "EndSection\n",
+                xkb_layout);
+        fclose(xkb);
+    }
+    if (access(TARGET_MOUNT "/usr/share/sddm/scripts/Xsetup", F_OK) == 0) {
+        FILE *xs = fopen(TARGET_MOUNT "/usr/share/sddm/scripts/Xsetup", "a");
+        if (xs) {
+            fprintf(xs, "\ncommand -v setxkbmap >/dev/null 2>&1 && setxkbmap %s 2>/dev/null || true\n", xkb_layout);
+            fclose(xs);
+        }
+    }
 
     /* Network DHCP preference */
     if (cfg->enable_dhcp) {
+        unlink(TARGET_MOUNT "/etc/avory-no-dhcp");
         ensure_dir(TARGET_MOUNT "/etc/systemd/network", 0755);
         FILE *net = fopen(TARGET_MOUNT "/etc/systemd/network/20-wired.network", "w");
         if (net) {
             fputs("[Match]\nName=en* eth*\n\n[Network]\nDHCP=yes\n", net);
             fclose(net);
         }
+    } else {
+        FILE *nodhcp = fopen(TARGET_MOUNT "/etc/avory-no-dhcp", "w");
+        if (nodhcp) fclose(nodhcp);
     }
 
     /* Passwords & user account */
@@ -529,35 +714,92 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
     }
 
     if (cfg->username[0]) {
+        /* Remove the pre-seeded live user ("avory") when installing under a
+         * different username so the chosen user gets UID 1000 and is the
+         * primary account in SDDM. */
+        if (strcmp(cfg->username, "avory") != 0) {
+            const char *udel[] = {
+                "chroot", TARGET_MOUNT, "/bin/sh", "-c",
+                "userdel -r avory 2>/dev/null || true; rm -rf /home/avory",
+                NULL
+            };
+            run_cmd_logged(udel, NULL, cb, 94, "Removing live default user...", ctx);
+        }
+
         const char *comment = cfg->fullname[0] ? cfg->fullname : cfg->username;
         const char *uadd[] = {
-            "chroot", TARGET_MOUNT, "/usr/sbin/useradd",
-            "-m", "-s", "/bin/bash",
-            "-c", comment,
-            "-G", "wheel,audio,video,input",
-            cfg->username,
+            "chroot", TARGET_MOUNT, "/bin/sh", "-c",
+            "if id -u \"$2\" >/dev/null 2>&1; then exit 0; fi; "
+            "rm -f /etc/.pwd.lock /etc/passwd.lock /etc/shadow.lock "
+            "/etc/group.lock /etc/gshadow.lock /etc/subuid.lock /etc/subgid.lock; "
+            "grps=''; "
+            "for g in wheel audio video input; do "
+            "  grep -q \"^${g}:\" /etc/group 2>/dev/null && grps=\"${grps:+$grps,}$g\"; "
+            "done; "
+            "if [ -n \"$grps\" ]; then "
+            "  /usr/bin/useradd -m -s /bin/bash -c \"$1\" -G \"$grps\" \"$2\" || { "
+            "    rm -f /etc/.pwd.lock /etc/passwd.lock /etc/shadow.lock "
+            "    /etc/group.lock /etc/gshadow.lock /etc/subuid.lock /etc/subgid.lock; "
+            "    id -u \"$2\" >/dev/null 2>&1 || /usr/bin/useradd -M -s /bin/bash -c \"$1\" -G \"$grps\" \"$2\"; "
+            "  }; "
+            "else "
+            "  /usr/bin/useradd -m -s /bin/bash -c \"$1\" \"$2\" || { "
+            "    rm -f /etc/.pwd.lock /etc/passwd.lock /etc/shadow.lock "
+            "    /etc/group.lock /etc/gshadow.lock /etc/subuid.lock /etc/subgid.lock; "
+            "    id -u \"$2\" >/dev/null 2>&1 || /usr/bin/useradd -M -s /bin/bash -c \"$1\" \"$2\"; "
+            "  }; "
+            "fi; "
+            "id -u \"$2\" >/dev/null 2>&1",
+            "sh", comment, cfg->username,
             NULL
         };
-        run_cmd_logged(uadd, NULL, cb, 95, "Creating user account...", ctx);
+        if (run_cmd_logged(uadd, NULL, cb, 95, "Creating user account...", ctx) != 0) {
+            snprintf(err_buf, err_sz, "Failed to create user account '%s'. See %s", cfg->username, LOG_PATH);
+            install_unmount_target();
+            return -1;
+        }
 
-        /* The live rootfs may already define the default user (e.g. "avory")
-         * in /etc/passwd while /home is not copied, so useradd skips home
-         * creation. Ensure the home directory exists and is owned by the user. */
-        char home_cmd[512];
+        /* Create/populate the user's home directory from OUTSIDE chroot so
+         * submounts under TARGET_MOUNT (such as a separate /home partition)
+         * receive the files directly. */
+        char uid_s[32] = "1000", gid_s[32] = "1000";
+        const char *id_u[] = {"chroot", TARGET_MOUNT, "id", "-u", cfg->username, NULL};
+        const char *id_g[] = {"chroot", TARGET_MOUNT, "id", "-g", cfg->username, NULL};
+        if (run_cmd_capture(id_u, uid_s, sizeof(uid_s)) == 0) {
+            uid_s[strcspn(uid_s, "\r\n ")] = '\0';
+        }
+        if (run_cmd_capture(id_g, gid_s, sizeof(gid_s)) == 0) {
+            gid_s[strcspn(gid_s, "\r\n ")] = '\0';
+        }
+        char home_cmd[768];
         snprintf(home_cmd, sizeof(home_cmd),
-                 "h=$(getent passwd %s | cut -d: -f6); "
-                 "[ -n \"$h\" ] || h=/home/%s; "
-                 "if [ ! -d \"$h\" ]; then mkdir -p \"$h\" && cp -a /etc/skel/. \"$h\"/ 2>/dev/null || true; fi; "
-                 "chown -R %s:%s \"$h\" 2>/dev/null || true",
-                 cfg->username, cfg->username, cfg->username, cfg->username);
-        const char *home_argv[] = {"chroot", TARGET_MOUNT, "/bin/sh", "-c", home_cmd, NULL};
+                 "h='" TARGET_MOUNT "/home/%s'; "
+                 "mkdir -p \"$h\" && cp -a '" TARGET_MOUNT "/etc/skel/.' \"$h\"/ 2>/dev/null || true; "
+                 "chown -R %s:%s \"$h\" 2>/dev/null || true; "
+                 "chmod 0700 \"$h\" 2>/dev/null || true",
+                 cfg->username, uid_s, gid_s);
+        const char *home_argv[] = {"/bin/sh", "-c", home_cmd, NULL};
         run_cmd_logged(home_argv, NULL, cb, 95, "Preparing user home directory...", ctx);
 
         if (cfg->user_password[0]) {
+            char pw_prep[256];
+            snprintf(pw_prep, sizeof(pw_prep),
+                     "sed -i -E 's/^(%s):[^:]*:/\\1:x:/' /etc/passwd", cfg->username);
+            const char *prep_argv[] = {"chroot", TARGET_MOUNT, "/bin/sh", "-c", pw_prep, NULL};
+            run_cmd_logged(prep_argv, NULL, cb, 96, "Preparing user password...", ctx);
+
             char pw_in[128];
             snprintf(pw_in, sizeof(pw_in), "%s:%s\n", cfg->username, cfg->user_password);
             const char *chpw[] = {"chpasswd", "--root", TARGET_MOUNT, NULL};
             run_cmd_logged(chpw, pw_in, cb, 96, "Setting user password...", ctx);
+        } else {
+            char pw_cmd[256];
+            snprintf(pw_cmd, sizeof(pw_cmd),
+                     "sed -i -E 's/^(%s):[^:]*:/\\1::/' /etc/passwd; "
+                     "[ -f /etc/shadow ] && sed -i -E 's/^(%s):[^:]*:/\\1::/' /etc/shadow || true",
+                     cfg->username, cfg->username);
+            const char *pw_empty[] = {"chroot", TARGET_MOUNT, "/bin/sh", "-c", pw_cmd, NULL};
+            run_cmd_logged(pw_empty, NULL, cb, 96, "Configuring passwordless user...", ctx);
         }
     }
 
@@ -568,11 +810,17 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
     else if (cfg->desktop == DE_ICEWM) xinit_cmd = "exec icewm-session";
 
     if (xinit_cmd) {
-        write_xinitrc(TARGET_MOUNT "/root/.xinitrc", xinit_cmd);
+        write_xinitrc(TARGET_MOUNT "/root/.xinitrc", xinit_cmd, xkb_layout);
         if (cfg->username[0]) {
             char u_xinit[256];
             snprintf(u_xinit, sizeof(u_xinit), TARGET_MOUNT "/home/%s/.xinitrc", cfg->username);
-            write_xinitrc(u_xinit, xinit_cmd);
+            write_xinitrc(u_xinit, xinit_cmd, xkb_layout);
+            char uid_s[32] = "1000", gid_s[32] = "1000";
+            const char *id_u[] = {"chroot", TARGET_MOUNT, "id", "-u", cfg->username, NULL};
+            const char *id_g[] = {"chroot", TARGET_MOUNT, "id", "-g", cfg->username, NULL};
+            if (run_cmd_capture(id_u, uid_s, sizeof(uid_s)) == 0) uid_s[strcspn(uid_s, "\r\n ")] = '\0';
+            if (run_cmd_capture(id_g, gid_s, sizeof(gid_s)) == 0) gid_s[strcspn(gid_s, "\r\n ")] = '\0';
+            chown(u_xinit, (uid_t)strtoul(uid_s, NULL, 10), (gid_t)strtoul(gid_s, NULL, 10));
         }
     }
 
@@ -580,9 +828,9 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
         FILE *inittab = fopen(TARGET_MOUNT "/etc/inittab", "w");
         if (inittab) {
             fputs("# AvoryOS installed desktop: run services once, then launch SDDM on tty1.\n"
-                  "# Unset BusyBox init's HOME=/ so sddm-helper resolves each user's home.\n"
+                  "# Unset BusyBox init's HOME=/ and XDG_* so sddm-helper resolves each user's home.\n"
                   "::sysinit:/etc/init.d/rcS\n"
-                  "tty1::respawn:/usr/bin/env -u HOME /usr/bin/sddm\n"
+                  "tty1::respawn:/usr/bin/env -u HOME -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_STATE_HOME /usr/bin/sddm\n"
                   "\n"
                   "::ctrlaltdel:/usr/bin/busybox reboot\n"
                   "::shutdown:/usr/bin/busybox umount -a -r\n",
@@ -598,9 +846,21 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
         run_cmd_logged(sddm_chown, NULL, cb, 97, "Configuring display manager...", ctx);
 
         ensure_dir(TARGET_MOUNT "/etc/sddm.conf.d", 0755);
-        FILE *vtconf = fopen(TARGET_MOUNT "/etc/sddm.conf.d/00-vt.conf", "w");
+        ensure_dir(TARGET_MOUNT "/etc/sddm", 0755);
+        FILE *dsetup = fopen(TARGET_MOUNT "/etc/sddm/display-setup.sh", "w");
+        if (dsetup) {
+            fprintf(dsetup,
+                    "#!/bin/sh\n"
+                    "[ -x /usr/bin/avory-prime-display ] && /usr/bin/avory-prime-display || true\n"
+                    "command -v setxkbmap >/dev/null 2>&1 && setxkbmap %s 2>/dev/null || true\n",
+                    xkb_layout);
+            fclose(dsetup);
+            chmod(TARGET_MOUNT "/etc/sddm/display-setup.sh", 0755);
+        }
+        FILE *vtconf = fopen(TARGET_MOUNT "/etc/sddm.conf.d/99-avory.conf", "w");
         if (vtconf) {
-            fputs("[X11]\nMinimumVT=1\nSessionLogFile=/tmp/xorg-session.log\n", vtconf);
+            fputs("[X11]\nMinimumVT=1\nSessionLogFile=/tmp/xorg-session.log\n"
+                  "DisplayCommand=/etc/sddm/display-setup.sh\n", vtconf);
             fclose(vtconf);
         }
         if (access(TARGET_MOUNT "/usr/share/sddm/themes/breeze", F_OK) != 0) {
@@ -615,6 +875,31 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
                         TARGET_MOUNT "/etc/systemd/system/display-manager.service") != 0) {
                 install_log("Warning: failed to enable systemd display-manager.service");
             }
+        }
+    } else if (cfg->desktop == DE_CONSOLE &&
+               access(TARGET_MOUNT "/usr/local/bin/startx-icewm", F_OK) == 0) {
+        FILE *inittab = fopen(TARGET_MOUNT "/etc/inittab", "w");
+        if (inittab) {
+            const char *tty1_cmd = access(TARGET_MOUNT "/bin/avory-login", X_OK) == 0
+                ? "/bin/avory-login" : "/bin/bash -l";
+            fprintf(inittab,
+                    "::sysinit:/bin/mount -t proc proc /proc\n"
+                    "::sysinit:/bin/mount -t sysfs sysfs /sys\n"
+                    "::sysinit:/bin/mount -t tmpfs -o rw,nosuid,nodev,mode=1777 tmpfs /tmp\n"
+                    "::sysinit:/bin/mount -t tmpfs -o rw,nosuid,nodev,mode=0755 tmpfs /run\n"
+                    "::sysinit:/bin/mkdir -p /run/dbus /run/user/0 /tmp/.X11-unix\n");
+            if (access(TARGET_MOUNT "/usr/local/bin/avory-net-init", X_OK) == 0) {
+                fputs("::sysinit:/usr/local/bin/avory-net-init\n", inittab);
+            }
+            if (access(TARGET_MOUNT "/usr/local/bin/avory-xorg-init", X_OK) == 0) {
+                fputs("::sysinit:/usr/local/bin/avory-xorg-init\n", inittab);
+            }
+            fprintf(inittab,
+                    "tty1::respawn:%s\n"
+                    "::shutdown:/bin/umount -a -r\n"
+                    "::ctrlaltdel:/sbin/reboot\n",
+                    tty1_cmd);
+            fclose(inittab);
         }
     }
 

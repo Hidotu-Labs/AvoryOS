@@ -426,13 +426,18 @@ int ext3_init_journal(ext2_mount_t *mnt) {
   uint32_t type = __builtin_bswap32(jsb->s_header.h_blocktype);
   uint32_t block_size = __builtin_bswap32(jsb->s_blocksize);
   uint32_t incompat = __builtin_bswap32(jsb->s_feature_incompat);
-  const uint32_t supported_journal_incompat =
-      JBD_FEATURE_INCOMPAT_64BIT | JBD_FEATURE_INCOMPAT_REVOKE;
+  uint32_t start = __builtin_bswap32(jsb->s_start);
+  uint32_t supported_journal_incompat =
+      JBD_FEATURE_INCOMPAT_REVOKE | JBD_FEATURE_INCOMPAT_64BIT;
+  if (mnt->read_only && start == 0) {
+    supported_journal_incompat |=
+        JBD_FEATURE_INCOMPAT_CSUM_V2 | JBD_FEATURE_INCOMPAT_CSUM_V3;
+  }
   if (magic != EXT3_JOURNAL_MAGIC_NUMBER ||
       (type != JBD_SUPERBLOCK_V1 && type != JBD_SUPERBLOCK_V2) ||
       block_size != mnt->block_size ||
       (incompat & ~supported_journal_incompat) != 0 ||
-      ((mnt->sb.s_feature_incompat & EXT2_FEATURE_INCOMPAT_64BIT) &&
+      (mnt->blocks_count > UINT32_MAX &&
        !(incompat & JBD_FEATURE_INCOMPAT_64BIT))) {
     klog_puts("[JBD2] Unsupported journal format.\n");
     kfree(buf);
@@ -443,7 +448,6 @@ int ext3_init_journal(ext2_mount_t *mnt) {
   memcpy(trans->journal_uuid, jsb->s_uuid, sizeof(trans->journal_uuid));
   trans->sequence = __builtin_bswap32(jsb->s_sequence);
   trans->journal_blocks = __builtin_bswap32(jsb->s_maxlen);
-  uint32_t start = __builtin_bswap32(jsb->s_start);
 
   klog_puts("[JBD2] Found valid journal.\n");
   klog_puts("       Sequence:  ");

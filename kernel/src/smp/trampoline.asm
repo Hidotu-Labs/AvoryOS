@@ -65,12 +65,33 @@ pm32_entry:
     mov es, ax
     mov ss, ax
 
-    ; Preserve the APIC ID across the mode switch. This kernel currently
-    ; enumerates 8-bit ACPI APIC IDs, matching CPUID leaf 1's legacy APIC ID.
+    ; Preserve the APIC ID across the mode switch. Read the actual LAPIC
+    ; hardware ID (x2APIC MSR 0x802 or xAPIC MMIO 0x20) rather than relying
+    ; solely on CPUID leaf 1, which can differ from MADT/LAPIC IDs on real
+    ; hardware and is truncated to 8 bits on x2APIC systems.
+    mov ecx, 0x1B                  ; IA32_APIC_BASE
+    rdmsr
+    test eax, (1 << 10)            ; APIC_BASE_X2APIC_ENABLE
+    jnz .read_x2apic_id
+    test eax, (1 << 11)            ; APIC_BASE_ENABLE
+    jz .fallback_cpuid_id
+    test edx, edx                  ; unpaged 32-bit mode only reaches < 4 GiB
+    jnz .fallback_cpuid_id
+    and eax, 0xFFFFF000
+    mov edi, [eax + 0x20]
+    shr edi, 24
+    jmp .apic_id_done
+.read_x2apic_id:
+    mov ecx, 0x802                 ; IA32_X2APIC_APICID
+    rdmsr
+    mov edi, eax
+    jmp .apic_id_done
+.fallback_cpuid_id:
     mov eax, 1
     cpuid
     mov edi, ebx
     shr edi, 24
+.apic_id_done:
 
     cmp dword [abs TRAMPOLINE_PHYS + trampoline_data_mode - trampoline_start], 1
     jne .ap_cr4

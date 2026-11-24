@@ -28,9 +28,7 @@
 #define DEFINE_TIMER(_name, _function)                                        \
   struct timer_list _name = __TIMER_INITIALIZER(_function, 0)
 
-/* Stock __init_timer() memsets the timer before assigning the callback; do
- * the same so embedded/stack-allocated timers cannot inherit a stale
- * `running` value (del_timer_sync() waits on it). */
+/* Reset the timer before assigning its callback and initializing its list. */
 #define timer_setup(timer, callback, _flags)                                  \
   do {                                                                        \
     memset((timer), 0, sizeof(*(timer)));                                     \
@@ -60,6 +58,7 @@ static inline int timer_delete_sync(struct timer_list *timer) {
   return del_timer_sync(timer);
 }
 int timer_shutdown_sync(struct timer_list *timer);
+void linuxkpi_timer_wait_running(struct timer_list *timer);
 int timer_pending(const struct timer_list *timer);
 unsigned long round_jiffies(unsigned long j);
 unsigned long round_jiffies_relative(unsigned long j);

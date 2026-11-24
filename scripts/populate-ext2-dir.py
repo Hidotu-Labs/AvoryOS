@@ -50,11 +50,17 @@ def populate(image, source, destination):
     # Downloaded package archives (var/cache/{axon,pacman}/pkg) stay in the
     # host rootfs, where bootstrap replay and rebuilds reuse them; the guest
     # only gets the empty directories (~2 GiB saved).
-    excludes = os.environ.get('EXCLUDE_IMAGE_PATHS') or (
+    raw_excludes = (os.environ.get('EXCLUDE_IMAGE_PATHS') or (
         'usr/include usr/share/doc usr/share/man '
-        'var/cache/axon/pkg/* var/cache/pacman/pkg/*')
-    excludes = excludes.split()
+        'var/cache/axon/pkg/* var/cache/pacman/pkg/*')).split()
+    excludes = [p for p in raw_excludes if not p.startswith('!')]
+    includes = [p[1:] for p in raw_excludes if p.startswith('!') and len(p) > 1]
     archive_pattern = os.environ.get('EXCLUDE_IMAGE_STATIC', '*.a')
+
+    def is_excluded(relative):
+        if any(fnmatch.fnmatchcase(relative, pattern) for pattern in includes):
+            return False
+        return any(fnmatch.fnmatchcase(relative, pattern) for pattern in excludes)
 
     polkit_gid = None
     if not destination and (source / 'etc/polkit-1/rules.d').is_dir():
@@ -78,7 +84,7 @@ def populate(image, source, destination):
         with os.scandir(folder) as entries:
             for entry in entries:
                 relative = prefix + entry.name
-                if any(fnmatch.fnmatchcase(relative, pattern) for pattern in excludes):
+                if is_excluded(relative):
                     continue
                 info = entry.stat(follow_symlinks=False)
                 if stat.S_ISDIR(info.st_mode):

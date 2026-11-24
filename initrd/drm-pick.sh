@@ -29,7 +29,7 @@ fi
 if [ -z "$display" ]; then
     emulated=0
     if grep -qw 'kpi_emu_sink=1' /proc/cmdline 2>/dev/null; then emulated=1; fi
-    for driver in amdgpu nouveau virtio_gpu ascentdrm; do
+    for driver in amdgpu nouveau virtio_gpu bochs-drm ascentdrm; do
         display="$(printf '%s\n' "$inventory" | awk -v driver="$driver" -v emulated="$emulated" \
             '$2==driver&&($4==1||(driver=="amdgpu"&&emulated==1)) {print $1; exit}')"
         [ -z "$display" ] || break

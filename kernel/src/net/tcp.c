@@ -713,8 +713,8 @@ static void wake(struct tcp_tcb *t)
 /* Segment emission                                                    */
 /* ------------------------------------------------------------------ */
 
-static int emit_at(struct tcp_tcb *t, uint32_t seq, uint8_t flags,
-                   const void *data, size_t len)
+static int emit_at_mode(struct tcp_tcb *t, uint32_t seq, bool use_snd_nxt,
+                        uint8_t flags, const void *data, size_t len)
 {
     uint8_t segment[1514];
     size_t hdr_len = 20;
@@ -728,18 +728,41 @@ static int emit_at(struct tcp_tcb *t, uint32_t seq, uint8_t flags,
 
     memset(segment, 0, hdr_len + len);
 
-    p16(segment,      t->local_port);
-    p16(segment + 2,  t->remote_port);
-    p32(segment + 4,  seq);
-    p32(segment + 8,  t->rcv_nxt);
+    /* Snapshot header and receive-window fields under the TCP lock so
+     * concurrent rx_buffer resize or RX updates cannot tear the window. */
+    spinlock_acquire(&lock);
+    if (!t->used) {
+        spinlock_release(&lock);
+        return -107;
+    }
+    uint32_t tx_seq = use_snd_nxt ? t->snd_nxt : seq;
+    uint32_t ack_num = t->rcv_nxt;
+    uint16_t local_port = t->local_port;
+    uint16_t remote_port = t->remote_port;
+    uint16_t mss = t->mss;
+    uint8_t wscale = t->rcv_wscale;
+    uint8_t af = t->address_family;
+    uint32_t lip4 = t->local_ip;
+    uint32_t rip4 = t->remote_ip;
+    uint8_t lip6[16], rip6[16];
+    if (af == 6) {
+        memcpy(lip6, t->local_ip6, 16);
+        memcpy(rip6, t->remote_ip6, 16);
+    }
+    size_t used = t->rx_head - t->rx_tail;
+    size_t space = used < t->rx_capacity ? (t->rx_capacity - used) : 0;
+    spinlock_release(&lock);
+
+    p16(segment,      local_port);
+    p16(segment + 2,  remote_port);
+    p32(segment + 4,  tx_seq);
+    p32(segment + 8,  ack_num);
 
     segment[12] = (uint8_t)((hdr_len / 4) << 4);
     segment[13] = flags;
 
-    size_t used = t->rx_head - t->rx_tail;
-    size_t space = used < t->rx_capacity ? (t->rx_capacity - used) : 0;
     if (!is_syn)
-        space >>= t->rcv_wscale;
+        space >>= wscale;
     if (space > 65535)
         space = 65535;
     p16(segment + 14, (uint16_t)space);
@@ -747,27 +770,31 @@ static int emit_at(struct tcp_tcb *t, uint32_t seq, uint8_t flags,
     if (is_syn) {
         segment[20] = 0x02; /* MSS */
         segment[21] = 0x04;
-        segment[22] = (uint8_t)(t->mss >> 8);
-        segment[23] = (uint8_t)(t->mss & 0xff);
+        segment[22] = (uint8_t)(mss >> 8);
+        segment[23] = (uint8_t)(mss & 0xff);
         segment[24] = 0x01; /* NOP */
         segment[25] = 0x03; /* Window Scale */
         segment[26] = 0x03;
-        segment[27] = t->rcv_wscale;
+        segment[27] = wscale;
     }
 
     if (len && data)
         memcpy(segment + hdr_len, data, len);
 
-    if (t->address_family == 6) {
-        p16(segment + 16, csum6(t->local_ip6, t->remote_ip6,
-                                segment, hdr_len + len));
-        return ipv6_send_raw(t->remote_ip6, 6, segment, hdr_len + len);
+    if (af == 6) {
+        p16(segment + 16, csum6(lip6, rip6, segment, hdr_len + len));
+        return ipv6_send_raw(rip6, 6, segment, hdr_len + len);
     }
-    p16(segment + 16, csum(t->local_ip, t->remote_ip, segment, hdr_len + len));
-    if (ipv4_is_loopback(t->remote_ip))
-        return ipv4_send_loopback(t->local_ip, t->remote_ip, 6,
-                                  segment, hdr_len + len);
-    return ipv4_send_raw(t->remote_ip, 6, segment, hdr_len + len);
+    p16(segment + 16, csum(lip4, rip4, segment, hdr_len + len));
+    if (ipv4_is_loopback(rip4))
+        return ipv4_send_loopback(lip4, rip4, 6, segment, hdr_len + len);
+    return ipv4_send_raw(rip4, 6, segment, hdr_len + len);
+}
+
+static int emit_at(struct tcp_tcb *t, uint32_t seq, uint8_t flags,
+                   const void *data, size_t len)
+{
+    return emit_at_mode(t, seq, false, flags, data, len);
 }
 
 /* Keep retransmission diagnostics sparse: one early and one sustained retry
@@ -775,7 +802,7 @@ static int emit_at(struct tcp_tcb *t, uint32_t seq, uint8_t flags,
  * established stream without flooding the serial console during CDN fanout. */
 static int emit(struct tcp_tcb *t, uint8_t flags, const void *data, size_t len)
 {
-    return emit_at(t, t->snd_nxt, flags, data, len);
+    return emit_at_mode(t, 0, true, flags, data, len);
 }
 
 static uint32_t new_iss(void)
@@ -1523,9 +1550,13 @@ int tcp_recv(struct tcp_tcb *t, void *buf, size_t len, bool nonblock)
             size_t new_space = used_after < t->rx_capacity
                                    ? (t->rx_capacity - used_after)
                                    : 0;
+            size_t old_wnd = (old_space >> t->rcv_wscale) << t->rcv_wscale;
+            size_t new_wnd = (new_space >> t->rcv_wscale) << t->rcv_wscale;
             if ((t->state == TCP_ESTABLISHED || t->state == TCP_CLOSE_WAIT) &&
                 (t->unacked_packets > 0 ||
-                 (old_space < t->mss && new_space >= t->mss))) {
+                 (old_wnd < t->mss && new_wnd >= t->mss) ||
+                 (old_wnd < t->rx_capacity / 2 &&
+                  new_wnd >= t->rx_capacity / 2))) {
                 t->unacked_packets = 0;
                 t->ack_deadline = 0;
                 send_ack = true;
@@ -1701,21 +1732,21 @@ static void ooo_insert_locked(struct tcp_tcb *t, uint32_t seq,
 
     /* Trim any parts already covered by queued segments. */
     struct tcp_ooo_seg *s = t->ooo_head;
-    while (s && start < end) {
+    while (s && seq_lt(start, end)) {
         uint32_t s_start = s->seq;
         uint32_t s_end = s->seq + s->len;
-        if (end <= s_start || start >= s_end) {
+        if (seq_le(end, s_start) || seq_ge(start, s_end)) {
             s = s->next;
             continue;
         }
-        if (start < s_start) {
+        if (seq_lt(start, s_start)) {
             end = s_start;
             break;
         }
         start = s_end;
         s = s->next;
     }
-    if (start >= end)
+    if (seq_ge(start, end))
         return;
 
     size_t new_len = end - start;
@@ -1982,7 +2013,7 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
         if (trim >= len) {
             stats.duplicates++;
             t->dup_acks++;
-            if (t->ooo_ack_count < 8) {
+            if (t->ooo_ack_count < 64) {
                 act->send_ack = true;
                 t->ooo_ack_count++;
             }
@@ -1999,7 +2030,7 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
 
         if (len > space) {
             t->dropped_rx++;
-            if (t->ooo_ack_count < 8) {
+            if (t->ooo_ack_count < 64) {
                 act->send_ack = true;
                 t->ooo_ack_count++;
             }
@@ -2035,7 +2066,7 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
     } else if (len && seq_gt(seq, t->rcv_nxt)) {
         stats.out_of_order++;
         ooo_insert_locked(t, seq, payload, len);
-        if (t->ooo_ack_count < 8) {
+        if (t->ooo_ack_count < 64) {
             act->send_ack = true;
             t->ooo_ack_count++;
         }
@@ -2063,7 +2094,7 @@ static void input_locked(struct tcp_tcb *t, uint32_t seq, uint32_t ack,
 
             act->send_ack = true;
             wake(t);
-        } else if (!t->peer_closed && t->ooo_ack_count < 8) {
+        } else if (!t->peer_closed && t->ooo_ack_count < 64) {
             /* Gap before the FIN: ACK now so the peer retransmits the hole
              * instead of waiting for its retransmission timeout. */
             act->send_ack = true;
@@ -2212,7 +2243,8 @@ void tcp_input_ipv4(uint32_t s, uint32_t d, const uint8_t *p, size_t len)
     if (t) {
         t->refs++;
         stats.rx_segments++;
-        if (flags & SYN) {
+        if ((flags & SYN) &&
+            (t->state == TCP_SYN_SENT || t->state == TCP_SYN_RECEIVED)) {
 #ifdef USE_RUST_NET
             apply_rust_options_locked(t, &seg.options);
 #else
@@ -2355,7 +2387,8 @@ void tcp_input_ipv6(const uint8_t s[16], const uint8_t d[16],
     if (t) {
         t->refs++;
         stats.rx_segments++;
-        if (flags & SYN) {
+        if ((flags & SYN) &&
+            (t->state == TCP_SYN_SENT || t->state == TCP_SYN_RECEIVED)) {
 #ifdef USE_RUST_NET
             apply_rust_options_locked(t, &seg.options);
 #else

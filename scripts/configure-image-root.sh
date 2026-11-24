@@ -268,7 +268,14 @@ EOF
     # fusermount3 mounts FUSE filesystems for ordinary users (xdg-document-
     # portal, gvfsd-fuse, AppImages) and relies on being setuid root: without
     # it mount(2) fails the CAP_SYS_ADMIN check and the caller sees EPERM.
-    for helper in usr/bin/fusermount3 usr/bin/fusermount; do
+    # Similarly, su, unix_chkpwd, and other PAM/auth/mount helpers require
+    # setuid root to read /etc/shadow and call setuid(0).
+    for helper in \
+        usr/bin/fusermount3 usr/bin/fusermount \
+        usr/bin/su usr/bin/unix_chkpwd usr/bin/passwd \
+        usr/bin/chsh usr/bin/chfn usr/bin/newgrp usr/bin/gpasswd \
+        usr/bin/mount usr/bin/umount usr/bin/pkexec \
+        usr/lib/polkit-1/polkit-agent-helper-1; do
         if [ -f "${ROOTFS_DIR}/${helper}" ] && [ ! -L "${ROOTFS_DIR}/${helper}" ]; then
             printf '%s\n' \
                 "set_inode_field ${helper} uid 0" \
@@ -307,7 +314,12 @@ if [ -n "${LDSO_CACHE}" ]; then
     fi
 fi
 
-for helper in usr/bin/fusermount3 usr/bin/fusermount; do
+for helper in \
+    usr/bin/fusermount3 usr/bin/fusermount \
+    usr/bin/su usr/bin/unix_chkpwd usr/bin/passwd \
+    usr/bin/chsh usr/bin/chfn usr/bin/newgrp usr/bin/gpasswd \
+    usr/bin/mount usr/bin/umount usr/bin/pkexec \
+    usr/lib/polkit-1/polkit-agent-helper-1; do
     if [ -f "${ROOTFS_DIR}/${helper}" ] && [ ! -L "${ROOTFS_DIR}/${helper}" ]; then
         details="$(debugfs -R "stat /${helper}" "${IMAGE}" 2>&1 || true)"
         if ! grep -Eq "User:[[:space:]]+0[[:space:]]+Group:[[:space:]]+0([[:space:]]|$)" <<<"${details}" ||

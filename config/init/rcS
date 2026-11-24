@@ -29,6 +29,10 @@ if [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ]; then eend 0; else eend 1; fi
 
 ebegin "Setting hostname"
 /usr/bin/busybox hostname AvoryOS 2>/dev/null; eend $?
+if [ -r /etc/vconsole.conf ] && command -v loadkeys >/dev/null 2>&1; then
+    . /etc/vconsole.conf
+    [ -z "${KEYMAP:-}" ] || loadkeys "$KEYMAP" >/dev/null 2>&1 || true
+fi
 
 # Without a /dev/log reader, glibc syslog() falls back to /dev/console and
 # daemons such as ModemManager scribble over tty1 (and the installer TUI).
@@ -47,6 +51,17 @@ if [ -x /sbin/fsck ] && grep -q -v '^[[:space:]]*\(#\|$\)' /etc/fstab 2>/dev/nul
     fsck -A -T -a >>/var/log/boot.log 2>&1; eend $?
 else
     eskip
+fi
+ebegin "Mounting local filesystems"
+if grep -q -v '^[[:space:]]*\(#\|$\)' /etc/fstab 2>/dev/null; then
+    mount -a >>/var/log/boot.log 2>&1; eend $?
+    chmod 1777 /tmp /dev/shm 2>/dev/null || true
+else
+    eskip
+fi
+if grep -q '[[:space:]]swap[[:space:]]' /etc/fstab 2>/dev/null; then
+    ebegin "Activating swap"
+    swapon -a >>/var/log/boot.log 2>&1; eend $?
 fi
 mkdir -p /var/lib/dbus /run/dbus
 chown dbus:dbus /run/dbus 2>/dev/null || true

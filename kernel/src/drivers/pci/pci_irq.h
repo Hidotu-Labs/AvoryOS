@@ -31,6 +31,7 @@ struct pci_irq {
   bool command_saved;
   /* INTx fallback bookkeeping (only valid when mode == PCI_IRQ_INTX). */
   isr_t handler;
+  struct pci_irq *intx_next;
   uint8_t irq_line;
   bool intx_installed;
 };

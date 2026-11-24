@@ -21,6 +21,7 @@
 extern int ext4_statfs_impl(vfs_node_t *, struct statfs_buf *);
 extern int ext2_statfs_impl(vfs_node_t *, struct statfs_buf *);
 extern int fat32_statfs_impl(vfs_node_t *, struct statfs_buf *);
+extern int exfat_statfs_impl(vfs_node_t *, struct statfs_buf *);
 
 // ---------------------------------------------------------------------------
 // fill_kstat — convert a vfs_node into a kstat structure
@@ -71,7 +72,8 @@ void fill_kstat(struct kstat *ks, vfs_node_t *node) {
         node->device && node->statfs &&
         (node->statfs == ext4_statfs_impl ||
          node->statfs == ext2_statfs_impl ||
-         node->statfs == fat32_statfs_impl)) {
+         node->statfs == fat32_statfs_impl ||
+         node->statfs == exfat_statfs_impl)) {
         struct block_device *bd = *(struct block_device **)node->device;
         if (bd && (bd->linux_major || bd->linux_minor))
             ks->st_dev = (uint64_t)block_device_userspace_rdev(bd);
@@ -366,7 +368,8 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
                node->device && node->statfs &&
                (node->statfs == ext4_statfs_impl ||
                 node->statfs == ext2_statfs_impl ||
-                node->statfs == fat32_statfs_impl)) {
+                node->statfs == fat32_statfs_impl ||
+                node->statfs == exfat_statfs_impl)) {
         struct block_device *bd = *(struct block_device **)node->device;
         if (bd && (bd->linux_major || bd->linux_minor)) {
             kstx.stx_dev_major = bd->linux_major;

@@ -751,6 +751,7 @@ vfs_node_t *ascentdrm_create_client_node(void);
 bool ascentdrm_is_card_node(vfs_node_t *node);
 void ascentdrm_register_vfs(void);
 void ascentdrm_register_render_vfs(void);
+int ascentdrm_get_card_minor(void);
 void ascentdrm_stats_snapshot(struct drm_stats *out);
 
 void ascentdrm_obj_add_prop(struct drm_mode_object *obj, uint32_t prop_id,

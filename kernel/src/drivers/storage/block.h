@@ -228,6 +228,9 @@ struct block_device *block_find_by_partuuid(const char *uuid);
 // full dev paths ("/dev/nvme0n1p1"). Returns NULL when not found.
 struct block_device *block_get_by_name(const char *name);
 
+// Lookup a partition by its 1-based table slot on disk.
+struct block_device *block_find_partition(struct block_device *disk, int pno);
+
 // Userspace dev_t (glibc/musl sysmacros encoding) for stat()->st_rdev/st_dev:
 // (minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12). Matches the
 // kpi_userspace_devt() convention used by every native chardev.

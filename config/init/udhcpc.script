@@ -1,0 +1,41 @@
+#!/bin/sh
+# BusyBox udhcpc lease hook for AvoryOS.
+# Applies interface IP/netmask, default gateway, and /etc/resolv.conf.
+
+BB=/usr/bin/busybox
+[ -x "$BB" ] || BB=busybox
+
+case "${1:-}" in
+    deconfig)
+        "$BB" ifconfig "$interface" up 2>/dev/null || true
+        ;;
+    bound|renew)
+        "$BB" ifconfig "$interface" "$ip" ${subnet:+netmask "$subnet"} up
+
+        if [ -n "${router:-}" ]; then
+            # AvoryOS SIOCDELRT returns 0 unconditionally, so delete at most once.
+            "$BB" route del default 2>/dev/null || true
+            for gw in $router; do
+                if "$BB" route add default gw "$gw" dev "$interface" 2>/dev/null || \
+                   "$BB" route add default gw "$gw" 2>/dev/null; then
+                    break
+                fi
+            done
+        fi
+
+        if [ -n "${dns:-}" ]; then
+            tmp="/etc/resolv.conf.udhcpc.$$"
+            : > "$tmp"
+            if [ -n "${domain:-}" ]; then
+                printf 'search %s\n' "$domain" >> "$tmp"
+            fi
+            for ns in $dns; do
+                printf 'nameserver %s\n' "$ns" >> "$tmp"
+            done
+            chmod 0644 "$tmp" 2>/dev/null || true
+            mv -f "$tmp" /etc/resolv.conf
+        fi
+        ;;
+esac
+
+exit 0

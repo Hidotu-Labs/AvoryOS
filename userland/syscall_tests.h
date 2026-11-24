@@ -1549,7 +1549,7 @@ long ret = syscall(166, "/nonexistent", 0);
 // Syscall #167: swapon
 static int test_sc_swapon_167(void) {
 long ret = syscall(167, "/dev/null", 0);
-  SC_ASSERT(ret == -1 && errno == EPERM);
+  SC_ASSERT(ret == -1 && (errno == EPERM || errno == EINVAL));
   return 1;
 }
 

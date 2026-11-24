@@ -183,7 +183,9 @@ static void net_worker(void) {
       count = 0;
       while (count < 128 && queue_head)
         batch[count++] = pop_locked();
-      work = pop_work_locked();
+      /* Do not claim deferred work before invoking receive callbacks. A
+       * callback may block while another worker could run the queued poll. */
+      work = count ? NULL : pop_work_locked();
       spinlock_release(&lock);
 
       if (count == 0 && !work)
@@ -205,11 +207,18 @@ static void net_worker(void) {
         if (rx_handler)
           rx_handler(&batch[i]->packet);
       }
+      if (count) {
+        spinlock_acquire(&lock);
+        work = pop_work_locked();
+        spinlock_release(&lock);
+      }
       if (work) {
         bool again = work->run(work);
         spinlock_acquire(&lock);
         work_running--;
-        if (!work->cancelled && (again || work->reschedule) && !work->queued) {
+        bool requeued = !work->cancelled && (again || work->reschedule) &&
+                        !work->queued;
+        if (requeued) {
           work->reschedule = false;
           work->queued = true;
           work->next = NULL;
@@ -225,6 +234,8 @@ static void net_worker(void) {
          * on this flag and takes the same lock before permitting reclamation. */
         __atomic_store_n(&work->running, false, __ATOMIC_RELEASE);
         spinlock_release(&lock);
+        if (requeued)
+          wait_queue_wake_one(&worker_wait);
       }
     }
 

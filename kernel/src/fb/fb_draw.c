@@ -1,5 +1,6 @@
 #include "framebuffer.h"
 #include "../lib/string.h"
+#include "linuxkpi/drm_console.h"
 
 extern struct fb_info fb_global;
 extern void *fb_get_target_buffer(void);
@@ -424,6 +425,7 @@ void fb_swap_buffer_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     uint32_t pitch = fb_global.fix.line_length;
     uint8_t *front = (uint8_t *)fb_global.screen_base;
     uint8_t *back = (uint8_t *)fb_global.backbuffer;
+    bool drm_owns = linuxkpi_drm_console_owns_scanout();
 
     /* The frontbuffer is write-combining (fb_map_wc), so stream the copy with
      * non-temporal stores instead of one cached store per qword: a full-screen
@@ -441,20 +443,40 @@ void fb_swap_buffer_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
             uint32_t chunk = h - done;
             if (phys + chunk > max_h)
                 chunk = max_h - phys;
-            memcpy_to_wc(front + (uint64_t)(y + done) * pitch,
-                         back + (uint64_t)phys * pitch,
-                         (size_t)pitch * chunk);
+            if (drm_owns) {
+                linuxkpi_drm_console_blit_rect(back, max_w, max_h, pitch, phys,
+                                               0, y + done, max_w, chunk);
+            } else {
+                memcpy_to_wc(front + (uint64_t)(y + done) * pitch,
+                             back + (uint64_t)phys * pitch,
+                             (size_t)pitch * chunk);
+            }
             done += chunk;
         }
     } else {
         size_t row_bytes = (size_t)w * 4;
-        for (uint32_t r = 0; r < h; r++) {
-            uint32_t prow = fb_row_phys(back, y + r);
-            memcpy_to_wc(front + (uint64_t)(y + r) * pitch + (uint64_t)x * 4,
-                         back + (uint64_t)prow * pitch + (uint64_t)x * 4,
-                         row_bytes);
+        uint32_t done = 0;
+        while (done < h) {
+            uint32_t phys = fb_row_phys(back, y + done);
+            uint32_t chunk = h - done;
+            if (phys + chunk > max_h)
+                chunk = max_h - phys;
+            if (drm_owns) {
+                linuxkpi_drm_console_blit_rect(back, max_w, max_h, pitch, phys,
+                                               x, y + done, w, chunk);
+            } else {
+                for (uint32_t r = 0; r < chunk; r++) {
+                    memcpy_to_wc(front + (uint64_t)(y + done + r) * pitch + (uint64_t)x * 4,
+                                 back + (uint64_t)(phys + r) * pitch + (uint64_t)x * 4,
+                                 row_bytes);
+                }
+            }
+            done += chunk;
         }
     }
+
+    if (drm_owns)
+        return;
 
     /* Non-temporal stores retire out of order; fence them out before the
      * display engine (or another CPU) is allowed to look at the aperture. */
@@ -493,6 +515,7 @@ void fb_swap_buffer(void) {
     uint32_t pitch = fb_global.fix.line_length;
     uint8_t *front = (uint8_t *)fb_global.screen_base;
     uint8_t *back = (uint8_t *)fb_global.backbuffer;
+    bool drm_owns = linuxkpi_drm_console_owns_scanout();
 
     uint32_t r = min_row;
     while (r <= max_row) {
@@ -538,7 +561,10 @@ void fb_swap_buffer(void) {
             if (phys + chunk > max_h)
                 chunk = max_h - phys;
 
-            if (full_row) {
+            if (drm_owns) {
+                linuxkpi_drm_console_blit_rect(back, max_w, max_h, pitch, phys,
+                                               x, first, xmax - x, chunk);
+            } else if (full_row) {
                 memcpy_to_wc(front + (uint64_t)first * pitch,
                              back + (uint64_t)phys * pitch,
                              (size_t)pitch * chunk);
@@ -556,9 +582,13 @@ void fb_swap_buffer(void) {
     }
 
     fb_dirty_reset();
+    if (drm_owns)
+        return;
+
     __asm__ volatile("sfence" ::: "memory");
     /* Mirror the bounding box while fbcon owns the scanout. */
-    if (max_row >= min_row)
+    if (max_row >= min_row) {
         virtio_gpu_console_commit(0, min_row, max_w,
                                   max_row - min_row + 1);
+    }
 }

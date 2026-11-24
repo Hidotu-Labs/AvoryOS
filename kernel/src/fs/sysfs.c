@@ -59,6 +59,9 @@ static vfs_node_t *sound_class_root;
 static vfs_node_t *sound_virtual_root;
 static vfs_node_t *sound_class_devices_root;
 static vfs_node_t *sysfs_dev_char_root;
+static vfs_node_t *sysfs_devices_root;
+static vfs_node_t *drm_class_root;
+static vfs_node_t *drm_class_devices_root;
 /* Block roots, so block hot-plug can publish and remove entries after boot. */
 static vfs_node_t *block_class_root;
 static vfs_node_t *block_alias_root;
@@ -1192,163 +1195,11 @@ void sysfs_init(void) {
     }
   }
 
-  // /sys/class/drm/card0
-  // card0 is a symlink to the real device path (wlroots uses readlink on it)
-  // Target: ../../devices/pci0000:00/0000:BB:SS.F/drm/card0
-  // Find the display controller (PCI class 0x03)
-  vfs_node_t *drm_class = sysfs_mkdir(class_dir, "drm");
-  {
-    const struct pci_device *native_pci = sysfs_display_pci(false);
-    char pci_addr[20];
-    sysfs_display_address(pci_addr, sizeof(pci_addr), native_pci);
-    // Build symlink target as a relative path from /sys/class/drm/card0.
-    // wlroots calls readlink() and then resolves the result relative to the
-    // symlink's parent directory (/sys/class/drm/), so we must use a relative
-    // path — exactly what the real Linux kernel provides.
-    // From /sys/class/drm/ we need: ../../devices/pci0000:00/<addr>/drm/card0
-    char sl_target[128];
-    strcpy(sl_target, "../../devices/pci0000:00/");
-    strcat(sl_target, pci_addr);
-    strcat(sl_target, "/drm/card0");
-    sysfs_symlink(drm_class, "card0", sl_target);
-
-    char conn_sl_target[160];
-    strcpy(conn_sl_target, "../../devices/pci0000:00/");
-    strcat(conn_sl_target, pci_addr);
-    strcat(conn_sl_target, "/drm/card0/card0-HDMI-A-1");
-    sysfs_symlink(drm_class, "card0-HDMI-A-1", conn_sl_target);
-
-    // Also create the real device directory that the symlink points to
-    vfs_node_t *pci_seg = sysfs_mkdir(devices_dir, "pci0000:00");
-    vfs_node_t *gpu_dev = sysfs_mkdir(pci_seg, pci_addr);
-    vfs_node_t *drm_dev = sysfs_mkdir(gpu_dev, "drm");
-    vfs_node_t *card0_dir = sysfs_mkdir(drm_dev, "card0");
-    sysfs_mkfile(card0_dir, "dev", "226:0\n");
-    sysfs_mkfile(card0_dir, "uevent",
-                 "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\n"
-                 "DEVTYPE=drm_minor\nSUBSYSTEM=drm\n");
-
-    vfs_node_t *conn_dir = sysfs_mkdir(card0_dir, "card0-HDMI-A-1");
-    char live_modes[512];bool live_connected=false;strcpy(live_modes,"1280x800\n");virtio_gpu_scanout_summary(0,&live_connected,live_modes,sizeof(live_modes));
-    gpu_status_nodes[0]=sysfs_mkfile(conn_dir, "status", live_connected?"connected\n":"disconnected\n");
-    gpu_enabled_nodes[0]=sysfs_mkfile(conn_dir, "enabled", live_connected?"enabled\n":"disabled\n");
-    gpu_modes_nodes[0]=sysfs_mkfile(conn_dir, "modes", live_connected?live_modes:"");
-    gpu_dpms_nodes[0]=sysfs_mkfile(conn_dir, "dpms", live_connected?"On\n":"Off\n");
-    sysfs_mkfile(conn_dir, "uevent",
-                 "DEVTYPE=drm_connector\nSUBSYSTEM=drm\nHOTPLUG=1\n"
-                 "CONNECTOR=HDMI-A-1\n");
-    sysfs_symlink(conn_dir, "subsystem", "../../../../../../class/drm");
-    sysfs_symlink(conn_dir, "device", "../../..");
-    uint32_t live_heads=virtio_gpu_scanout_count();if(live_heads>VIRTIO_GPU_MAX_SCANOUTS)live_heads=VIRTIO_GPU_MAX_SCANOUTS;
-    for(uint32_t head=1;head<live_heads;head++){char nbuf[12],cname[40];u64_to_dec(head+1,nbuf);strcpy(cname,"card0-HDMI-A-");strcat(cname,nbuf);vfs_node_t *cdir=sysfs_mkdir(card0_dir,cname);char hmodes[512];bool hconnected=false;virtio_gpu_scanout_summary(head,&hconnected,hmodes,sizeof(hmodes));gpu_status_nodes[head]=sysfs_mkfile(cdir,"status",hconnected?"connected\n":"disconnected\n");gpu_enabled_nodes[head]=sysfs_mkfile(cdir,"enabled",hconnected?"enabled\n":"disabled\n");gpu_modes_nodes[head]=sysfs_mkfile(cdir,"modes",hconnected?hmodes:"");gpu_dpms_nodes[head]=sysfs_mkfile(cdir,"dpms",hconnected?"On\n":"Off\n");char hue[128];strcpy(hue,"DEVTYPE=drm_connector\nSUBSYSTEM=drm\nHOTPLUG=1\nCONNECTOR=HDMI-A-");strcat(hue,nbuf);strcat(hue,"\n");sysfs_mkfile(cdir,"uevent",hue);sysfs_symlink(cdir,"subsystem","../../../../../../class/drm");sysfs_symlink(cdir,"device","../../..");char target[160];strcpy(target,"../../devices/pci0000:00/");strcat(target,pci_addr);strcat(target,"/drm/card0/");strcat(target,cname);sysfs_symlink(drm_class,cname,target);}
-    // subsystem symlink inside card0 → points back to /sys/class/drm
-    // wlroots walks up the tree using this to identify the subsystem.
-    // Relative from /sys/devices/pci0000:00/<addr>/drm/card0/ to
-    // /sys/class/drm/
-    sysfs_symlink(card0_dir, "subsystem", "../../../../../class/drm");
-    sysfs_symlink(card0_dir, "device", "../..");
-
-    // Keep the intermediate drm/ and pci0000:00/ directories as plain sysfs
-    // containers. Giving either a uevent file makes libudev treat it as a
-    // device, but neither has a subsystem; Xorg then dereferences a NULL
-    // subsystem while walking from card0 to its PCI parent.
-    char gpu_uevent[128];
-    snprintf(gpu_uevent, sizeof(gpu_uevent),
-             "DRIVER=virtio-pci\nPCI_ID=%04x:%04x\nPCI_SLOT_NAME=%s\nSUBSYSTEM=pci\n",
-             native_pci ? native_pci->vendor_id : 0x1234,
-             native_pci ? native_pci->device_id : 0x1111, pci_addr);
-    sysfs_mkfile(gpu_dev, "uevent", gpu_uevent);
-    sysfs_symlink(gpu_dev, "subsystem", "../../../bus/pci");
-
-    // Mesa reads vendor/device/class from /sys/dev/char/226:0/device/vendor
-    // etc. The path resolves: 226:0 -> card0_dir, then "device" -> gpu_dev.
-    // gpu_dev is a freshly created node (separate from sysfs_populate_pci's
-    // node), so we must add vendor/device/class/irq files here explicitly.
-    {
-      uint32_t vid = 0x1234, did = 0x1111, cls = 0x030000;
-      uint32_t sub_vid = 0, sub_did = 0;
-      uint32_t pci_cnt = pci_get_device_count();
-      for (uint32_t ii = 0; ii < pci_cnt; ii++) {
-        struct pci_device *gpd = asc_pci_get_device(ii);
-        if (gpd && gpd == native_pci) {
-          vid = gpd->vendor_id;
-          did = gpd->device_id;
-          cls = ((uint32_t)gpd->class_code << 16) |
-                ((uint32_t)gpd->subclass << 8) | gpd->prog_if;
-          /* libdrm's drmGetDevice2()/drmParsePciIds() reads all four IDs;
-           * without subsystem_vendor/device Mesa cannot identify the GPU
-           * and silently falls back to llvmpipe (Phase 6 C7). */
-          uint32_t sub = pci_config_read32(gpd->bus, gpd->slot, gpd->func,
-                                           0x2c);
-          sub_vid = sub & 0xffff;
-          sub_did = sub >> 16;
-          break;
-        }
-      }
-      char ssvbuf[10], ssdbuf[10];
-      ssvbuf[0] = '0';
-      ssvbuf[1] = 'x';
-      u32_to_hex(sub_vid, ssvbuf + 2, 4);
-      ssvbuf[6] = '\n';
-      ssvbuf[7] = '\0';
-      ssdbuf[0] = '0';
-      ssdbuf[1] = 'x';
-      u32_to_hex(sub_did, ssdbuf + 2, 4);
-      ssdbuf[6] = '\n';
-      ssdbuf[7] = '\0';
-      char vbuf[10], dbuf[10], cbuf[12];
-      vbuf[0] = '0';
-      vbuf[1] = 'x';
-      u32_to_hex(vid, vbuf + 2, 4);
-      vbuf[6] = '\n';
-      vbuf[7] = '\0';
-      dbuf[0] = '0';
-      dbuf[1] = 'x';
-      u32_to_hex(did, dbuf + 2, 4);
-      dbuf[6] = '\n';
-      dbuf[7] = '\0';
-      cbuf[0] = '0';
-      cbuf[1] = 'x';
-      u32_to_hex(cls, cbuf + 2, 6);
-      cbuf[8] = '\n';
-      cbuf[9] = '\0';
-      sysfs_mkfile(gpu_dev, "vendor", vbuf);
-      sysfs_mkfile(gpu_dev, "device", dbuf);
-      sysfs_mkfile(gpu_dev, "subsystem_vendor", ssvbuf);
-      sysfs_mkfile(gpu_dev, "subsystem_device", ssdbuf);
-      sysfs_mkfile(gpu_dev, "class", cbuf);
-      sysfs_mkfile(gpu_dev, "irq", "11\n");
-      sysfs_mkfile(gpu_dev, "enable", "1\n");
-    }
-
-    // Store GPU DEVPATH for netlink fake uevents
-    strcpy(sysfs_gpu_devpath, "/devices/pci0000:00/");
-    strcat(sysfs_gpu_devpath, pci_addr);
-    strcat(sysfs_gpu_devpath, "/drm/card0");
-    strcpy(sysfs_gpu_connector_devpath, sysfs_gpu_devpath);
-    strcat(sysfs_gpu_connector_devpath, "/card0-HDMI-A-1");
-
-
-    // Add devices/ directory under drm_class so that
-    // /sys/subsystem/drm/devices/ enumeration finds card0
-    vfs_node_t *drm_devices_dir = sysfs_mkdir(drm_class, "devices");
-    if (drm_devices_dir) {
-      // Relative from /sys/class/drm/devices/ → /sys/devices/pci0000:00/...
-      // wlroots does readlink() then resolves relative to symlink parent
-      char card0_rel[128];
-      strcpy(card0_rel, "../../../devices/pci0000:00/");
-      strcat(card0_rel, pci_addr);
-      strcat(card0_rel, "/drm/card0");
-      sysfs_symlink(drm_devices_dir, "card0", card0_rel);
-
-      char conn_rel[160];
-      strcpy(conn_rel, "../../../devices/pci0000:00/");
-      strcat(conn_rel, pci_addr);
-      strcat(conn_rel, "/drm/card0/card0-HDMI-A-1");
-      sysfs_symlink(drm_devices_dir, "card0-HDMI-A-1", conn_rel);
-
-    }
-  }
+  // /sys/class/drm (populated for LinuxKPI minors during initcalls, and for
+  // native ascentdrm in sysfs_register_ascentdrm() once card numbering is known).
+  drm_class_root = sysfs_mkdir(class_dir, "drm");
+  drm_class_devices_root = drm_class_root ? sysfs_mkdir(drm_class_root, "devices") : NULL;
+  sysfs_devices_root = devices_dir;
 
   // /sys/devices/virtual/input/input0/event0
   vfs_node_t *virtual_dir = sysfs_mkdir(devices_dir, "virtual");
@@ -1505,11 +1356,6 @@ void sysfs_init(void) {
   }
   vfs_node_t *char_dir = sysfs_mkdir(dev_dir, "char");
   sysfs_dev_char_root = char_dir;
-  {
-    char dev_target[160];
-    snprintf(dev_target, sizeof(dev_target), "../..%s", sysfs_gpu_devpath);
-    sysfs_symlink(char_dir, "226:0", dev_target);
-  }
 
   // Input char devices: /sys/dev/char/13:64 -> symlink to virtual device
   // Relative from /sys/dev/char/13:64 :
@@ -1865,6 +1711,165 @@ void asc_sysfs_drm_minor_remove(void *class_dir, const char *name,
   asc_sysfs_remove(devices, name);
   asc_sysfs_remove(class_dir, name);
   asc_sysfs_remove(parent, name);
+}
+
+void sysfs_register_ascentdrm(int card_minor) {
+  if (!drm_class_root || !sysfs_devices_root || !sysfs_dev_char_root ||
+      card_minor < 0)
+    return;
+
+  char card_name[16];
+  char conn_name[32];
+  char dev_num[24];
+  char dev_file[24];
+  char uevent_buf[128];
+  snprintf(card_name, sizeof(card_name), "card%d", card_minor);
+  snprintf(conn_name, sizeof(conn_name), "%s-HDMI-A-1", card_name);
+  snprintf(dev_num, sizeof(dev_num), "226:%d", card_minor);
+  snprintf(dev_file, sizeof(dev_file), "226:%d\n", card_minor);
+  snprintf(uevent_buf, sizeof(uevent_buf),
+           "MAJOR=226\nMINOR=%d\nDEVNAME=dri/%s\n"
+           "DEVTYPE=drm_minor\nSUBSYSTEM=drm\n",
+           card_minor, card_name);
+
+  const struct pci_device *native_pci = sysfs_display_pci(false);
+  char pci_addr[20];
+  sysfs_display_address(pci_addr, sizeof(pci_addr), native_pci);
+
+  char sl_target[128];
+  snprintf(sl_target, sizeof(sl_target), "../../devices/pci0000:00/%s/drm/%s",
+           pci_addr, card_name);
+  sysfs_symlink(drm_class_root, card_name, sl_target);
+
+  char conn_sl_target[160];
+  snprintf(conn_sl_target, sizeof(conn_sl_target),
+           "../../devices/pci0000:00/%s/drm/%s/%s", pci_addr, card_name,
+           conn_name);
+  sysfs_symlink(drm_class_root, conn_name, conn_sl_target);
+
+  vfs_node_t *pci_seg = sysfs_mkdir(sysfs_devices_root, "pci0000:00");
+  vfs_node_t *gpu_dev = sysfs_mkdir(pci_seg, pci_addr);
+  vfs_node_t *drm_dev = sysfs_mkdir(gpu_dev, "drm");
+  vfs_node_t *card_dir = sysfs_mkdir(drm_dev, card_name);
+  sysfs_mkfile(card_dir, "dev", dev_file);
+  sysfs_mkfile(card_dir, "uevent", uevent_buf);
+
+  vfs_node_t *conn_dir = sysfs_mkdir(card_dir, conn_name);
+  char live_modes[512];
+  bool live_connected = false;
+  strcpy(live_modes, "1280x800\n");
+  virtio_gpu_scanout_summary(0, &live_connected, live_modes,
+                             sizeof(live_modes));
+  gpu_status_nodes[0] = sysfs_mkfile(
+      conn_dir, "status", live_connected ? "connected\n" : "disconnected\n");
+  gpu_enabled_nodes[0] = sysfs_mkfile(
+      conn_dir, "enabled", live_connected ? "enabled\n" : "disabled\n");
+  gpu_modes_nodes[0] =
+      sysfs_mkfile(conn_dir, "modes", live_connected ? live_modes : "");
+  gpu_dpms_nodes[0] =
+      sysfs_mkfile(conn_dir, "dpms", live_connected ? "On\n" : "Off\n");
+  sysfs_mkfile(conn_dir, "uevent",
+               "DEVTYPE=drm_connector\nSUBSYSTEM=drm\nHOTPLUG=1\n"
+               "CONNECTOR=HDMI-A-1\n");
+  sysfs_symlink(conn_dir, "subsystem", "../../../../../../class/drm");
+  sysfs_symlink(conn_dir, "device", "../../..");
+
+  uint32_t live_heads = virtio_gpu_scanout_count();
+  if (live_heads > VIRTIO_GPU_MAX_SCANOUTS)
+    live_heads = VIRTIO_GPU_MAX_SCANOUTS;
+  for (uint32_t head = 1; head < live_heads; head++) {
+    char nbuf[12], cname[40];
+    u64_to_dec(head + 1, nbuf);
+    snprintf(cname, sizeof(cname), "%s-HDMI-A-%s", card_name, nbuf);
+    vfs_node_t *cdir = sysfs_mkdir(card_dir, cname);
+    char hmodes[512];
+    bool hconnected = false;
+    virtio_gpu_scanout_summary(head, &hconnected, hmodes, sizeof(hmodes));
+    gpu_status_nodes[head] = sysfs_mkfile(
+        cdir, "status", hconnected ? "connected\n" : "disconnected\n");
+    gpu_enabled_nodes[head] = sysfs_mkfile(
+        cdir, "enabled", hconnected ? "enabled\n" : "disabled\n");
+    gpu_modes_nodes[head] =
+        sysfs_mkfile(cdir, "modes", hconnected ? hmodes : "");
+    gpu_dpms_nodes[head] =
+        sysfs_mkfile(cdir, "dpms", hconnected ? "On\n" : "Off\n");
+    char hue[128];
+    snprintf(hue, sizeof(hue),
+             "DEVTYPE=drm_connector\nSUBSYSTEM=drm\nHOTPLUG=1\n"
+             "CONNECTOR=HDMI-A-%s\n",
+             nbuf);
+    sysfs_mkfile(cdir, "uevent", hue);
+    sysfs_symlink(cdir, "subsystem", "../../../../../../class/drm");
+    sysfs_symlink(cdir, "device", "../../..");
+    char target[160];
+    snprintf(target, sizeof(target), "../../devices/pci0000:00/%s/drm/%s/%s",
+             pci_addr, card_name, cname);
+    sysfs_symlink(drm_class_root, cname, target);
+  }
+
+  sysfs_symlink(card_dir, "subsystem", "../../../../../class/drm");
+  sysfs_symlink(card_dir, "device", "../..");
+
+  char gpu_uevent[128];
+  snprintf(gpu_uevent, sizeof(gpu_uevent),
+           "DRIVER=virtio-pci\nPCI_ID=%04x:%04x\nPCI_SLOT_NAME=%s\n"
+           "SUBSYSTEM=pci\n",
+           native_pci ? native_pci->vendor_id : 0x1234,
+           native_pci ? native_pci->device_id : 0x1111, pci_addr);
+  sysfs_mkfile(gpu_dev, "uevent", gpu_uevent);
+  sysfs_symlink(gpu_dev, "subsystem", "../../../bus/pci");
+
+  {
+    uint32_t vid = 0x1234, did = 0x1111, cls = 0x030000;
+    uint32_t sub_vid = 0, sub_did = 0;
+    uint32_t pci_cnt = pci_get_device_count();
+    for (uint32_t ii = 0; ii < pci_cnt; ii++) {
+      struct pci_device *gpd = asc_pci_get_device(ii);
+      if (gpd && gpd == native_pci) {
+        vid = gpd->vendor_id;
+        did = gpd->device_id;
+        cls = ((uint32_t)gpd->class_code << 16) |
+              ((uint32_t)gpd->subclass << 8) | gpd->prog_if;
+        uint32_t sub = pci_config_read32(gpd->bus, gpd->slot, gpd->func, 0x2c);
+        sub_vid = sub & 0xffff;
+        sub_did = sub >> 16;
+        break;
+      }
+    }
+    char ssvbuf[10], ssdbuf[10], vbuf[10], dbuf[10], cbuf[12];
+    ssvbuf[0] = '0'; ssvbuf[1] = 'x'; u32_to_hex(sub_vid, ssvbuf + 2, 4); ssvbuf[6] = '\n'; ssvbuf[7] = '\0';
+    ssdbuf[0] = '0'; ssdbuf[1] = 'x'; u32_to_hex(sub_did, ssdbuf + 2, 4); ssdbuf[6] = '\n'; ssdbuf[7] = '\0';
+    vbuf[0] = '0'; vbuf[1] = 'x'; u32_to_hex(vid, vbuf + 2, 4); vbuf[6] = '\n'; vbuf[7] = '\0';
+    dbuf[0] = '0'; dbuf[1] = 'x'; u32_to_hex(did, dbuf + 2, 4); dbuf[6] = '\n'; dbuf[7] = '\0';
+    cbuf[0] = '0'; cbuf[1] = 'x'; u32_to_hex(cls, cbuf + 2, 6); cbuf[8] = '\n'; cbuf[9] = '\0';
+    sysfs_mkfile(gpu_dev, "vendor", vbuf);
+    sysfs_mkfile(gpu_dev, "device", dbuf);
+    sysfs_mkfile(gpu_dev, "subsystem_vendor", ssvbuf);
+    sysfs_mkfile(gpu_dev, "subsystem_device", ssdbuf);
+    sysfs_mkfile(gpu_dev, "class", cbuf);
+    sysfs_mkfile(gpu_dev, "irq", "11\n");
+    sysfs_mkfile(gpu_dev, "enable", "1\n");
+  }
+
+  snprintf(sysfs_gpu_devpath, sizeof(sysfs_gpu_devpath),
+           "/devices/pci0000:00/%s/drm/%s", pci_addr, card_name);
+  snprintf(sysfs_gpu_connector_devpath, sizeof(sysfs_gpu_connector_devpath),
+           "%s/%s", sysfs_gpu_devpath, conn_name);
+
+  if (drm_class_devices_root) {
+    char card_rel[128], conn_rel[160];
+    snprintf(card_rel, sizeof(card_rel), "../../../devices/pci0000:00/%s/drm/%s",
+             pci_addr, card_name);
+    sysfs_symlink(drm_class_devices_root, card_name, card_rel);
+    snprintf(conn_rel, sizeof(conn_rel),
+             "../../../devices/pci0000:00/%s/drm/%s/%s", pci_addr, card_name,
+             conn_name);
+    sysfs_symlink(drm_class_devices_root, conn_name, conn_rel);
+  }
+
+  char dev_target[160];
+  snprintf(dev_target, sizeof(dev_target), "../..%s", sysfs_gpu_devpath);
+  sysfs_symlink(sysfs_dev_char_root, dev_num, dev_target);
 }
 
 static bool sysfs_child_exists(vfs_node_t *dir, const char *name) {

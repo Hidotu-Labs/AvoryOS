@@ -395,9 +395,7 @@ uint64_t lapic_timer_get_boot_tsc(void) {
 }
 
 
-void lapic_timer_arm_at(uint64_t deadline_ms) {
-    if ((!use_tsc_deadline && !ticks_per_ms) || !lapic_is_ready()) return;
-    struct cpu_info *cpu = cpu_get_current();
+static void lapic_timer_arm_local(struct cpu_info *cpu, uint64_t deadline_ms) {
     if (cpu) cpu->timer_deadline_ms = deadline_ms;
     if (use_tsc_deadline) {
         uint64_t khz = tsc_get_freq_khz();
@@ -413,7 +411,19 @@ void lapic_timer_arm_at(uint64_t deadline_ms) {
     lapic_write(LAPIC_TIMER_INIT, deadline_to_initial_count(deadline_ms));
 }
 
+void lapic_timer_arm_at(uint64_t deadline_ms) {
+    if ((!use_tsc_deadline && !ticks_per_ms) || !lapic_is_ready()) return;
+    hal_irq_state_t flags = hal_irq_save();
+    lapic_timer_arm_local(cpu_get_current(), deadline_ms);
+    hal_irq_restore(flags);
+}
+
 void lapic_timer_rearm_if_earlier(uint64_t deadline_ms) {
+    if ((!use_tsc_deadline && !ticks_per_ms) || !lapic_is_ready()) return;
+    /* Keep the comparison, CPU-local bookkeeping, and APIC write together.
+     * A timer interrupt can rearm or migrate this thread at any of those
+     * points if it interrupts the update. */
+    hal_irq_state_t flags = hal_irq_save();
     struct cpu_info *cpu = cpu_get_current();
     /* A recorded deadline already in the past means its interrupt was lost
      * (or is about to land and clear it): treat the timer as unarmed.  Without
@@ -424,7 +434,8 @@ void lapic_timer_rearm_if_earlier(uint64_t deadline_ms) {
     if (!cpu || cpu->timer_deadline_ms == 0 ||
         deadline_ms < cpu->timer_deadline_ms ||
         cpu->timer_deadline_ms <= monotonic_ms())
-        lapic_timer_arm_at(deadline_ms);
+        lapic_timer_arm_local(cpu, deadline_ms);
+    hal_irq_restore(flags);
 }
 
 void lapic_timer_sleep(uint32_t ms) {

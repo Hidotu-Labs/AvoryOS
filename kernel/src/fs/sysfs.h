@@ -6,6 +6,7 @@
 struct vfs_node;
 struct block_device;
 void sysfs_init(void);
+void sysfs_register_ascentdrm(int card_minor);
 // Block hot-plug: publish a disk/partition with an "add" uevent, or remove it
 // with a "remove" uevent.  No-ops before sysfs_init() has built /sys/block.
 void sysfs_block_device_added(struct block_device *bd);

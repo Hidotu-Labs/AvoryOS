@@ -381,6 +381,7 @@ static void ep_rescan_items(eventpoll_t *ep) {
     for (int b = 0; b < batch_len; b++) {
       epitem_t *rb = rescan_batch[b];
       if (ep_check_events(rb)) {
+#ifdef EPOLL_DEBUG_MISSED_WAKE
         /* Ready, yet no notification queued it: a producer missed its wake.
          * Name it so the dropping path can be found. */
         static volatile uint32_t missed_logs;
@@ -394,6 +395,7 @@ static void ep_rescan_items(eventpoll_t *ep) {
                 (unsigned)__atomic_load_n(&rb->registered_events,
                                           __ATOMIC_RELAXED));
         }
+#endif
         ep_add_to_ready_list(ep, rb);
       }
       epitem_unpin((unsigned)b);
@@ -518,6 +520,7 @@ int epoll_ctl_mod(eventpoll_t *ep, int fd, struct epoll_event *event) {
   __atomic_store_n(&epi->exclusive, (event->events & EPOLLEXCLUSIVE) != 0, __ATOMIC_RELEASE);
   __atomic_store_n(&epi->registered_events, event->events, __ATOMIC_RELEASE);
   __atomic_store_n(&epi->oneshot_disabled, false, __ATOMIC_RELEASE);
+  epi->ctl_seq++;
   __atomic_fetch_add(&epi->notify_seq, 1, __ATOMIC_ACQ_REL);
   __atomic_fetch_add(&ep->generation, 1, __ATOMIC_RELEASE);
   spinlock_release(&ep->lock);
@@ -599,10 +602,33 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
       polled_events[i] = ep_check_events_mask(candidates[i], watch_masks[i]);
     }
 
-    // Reconcile each poll with notifications that arrived while it was unlocked.
-    // Amortize ep->lock across the entire batch to eliminate repeated lock roundtrips.
+    /* Reserve the events while copying. A bad output buffer must not
+     * consume an edge or disarm a one-shot watch. Copying can fault and
+     * sleep, so leave the candidates in_scan and drop ep->lock. */
     struct epoll_event event_batch[64];
+    uint64_t delivery_mask = 0;
+    uint64_t ctl_sequences[64];
     int batch_count = 0;
+    if (cand_count > 0) {
+      spinlock_acquire(&ep->lock);
+      for (int i = 0; i < cand_count; i++) {
+        epitem_t *epi = candidates[i];
+        uint32_t ready = polled_events[i] &
+                          (watch_masks[i] | EPOLLERR | EPOLLHUP);
+        if (!ready || epi->removed || !epi->in_scan || epi->oneshot_disabled ||
+            scan_sequences[i] != __atomic_load_n(&epi->notify_seq, __ATOMIC_ACQUIRE))
+          continue;
+        delivery_mask |= 1ULL << i;
+        ctl_sequences[i] = epi->ctl_seq;
+        event_batch[batch_count] = epi->event;
+        event_batch[batch_count++].events = ready;
+      }
+      spinlock_release(&ep->lock);
+    }
+
+    bool copy_failed = batch_count > 0 &&
+        copy_to_user(&events[returned], event_batch,
+                     batch_count * sizeof(struct epoll_event));
 
     if (cand_count > 0) {
       bool was_empty = false;
@@ -623,44 +649,25 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
           continue;
         }
 
-        bool requeue =
-            scan_sequences[i] != epi->notify_seq;
-        uint32_t current_events = polled_events[i] &
-            (watch_masks[i] | EPOLLERR | EPOLLHUP);
-        bool deliver = !requeue &&
-            !epi->oneshot_disabled &&
-            current_events != 0;
-        bool level_requeue = deliver &&
-            !(epi->event.events & (EPOLLET | EPOLLONESHOT));
-        bool keep_ready = requeue || level_requeue;
+        bool selected = (delivery_mask & (1ULL << i)) != 0;
+        bool delivered = selected && !copy_failed &&
+                         ctl_sequences[i] == epi->ctl_seq;
+        bool keep_ready = (selected && !delivered) ||
+            scan_sequences[i] != __atomic_load_n(&epi->notify_seq, __ATOMIC_ACQUIRE);
 
         epi->in_scan = false;
 
-        if (requeue) {
-          // A producer raced with the poll. Keep the candidate queued for a
-          // fresh poll instead of delivering a stale/partial readiness result.
+        if (delivered && epi->oneshot) {
+          __atomic_store_n(&epi->oneshot_disabled, true, __ATOMIC_RELEASE);
+          __atomic_store_n(&epi->registered_events, 0, __ATOMIC_RELEASE);
+          keep_ready = false;
+        } else if (delivered) {
+          keep_ready |= !(epi->event.events & EPOLLET);
+        }
+
+        if (keep_ready) {
           list_add_tail(&epi->rdllink, &ep->rdllist);
           ep->rdllist_count++;
-        } else if (deliver && batch_count < maxevents) {
-          event_batch[batch_count] = epi->event;
-          event_batch[batch_count].events = current_events;
-          batch_count++;
-
-          if (epi->event.events & EPOLLET) {
-            epi->last_events = current_events &
-                               (EPOLLIN | EPOLLOUT | EPOLLRDNORM | EPOLLWRNORM);
-            epi->on_ready_list = false;
-            INIT_LIST_HEAD(&epi->rdllink);
-          } else if (epi->oneshot) {
-            epi->oneshot_disabled = true;
-            epi->registered_events = 0;
-            epi->on_ready_list = false;
-            INIT_LIST_HEAD(&epi->rdllink);
-          } else {
-            // Level-triggered readiness stays queued for the next wait.
-            list_add_tail(&epi->rdllink, &ep->rdllist);
-            ep->rdllist_count++;
-          }
         } else {
           epi->on_ready_list = false;
           INIT_LIST_HEAD(&epi->rdllink);
@@ -684,22 +691,11 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
       }
     }
 
-    // Copy the collected events to user space in a single operation.
-    if (batch_count > 0) {
-      if (copy_to_user(&events[returned], event_batch,
-                       batch_count * sizeof(struct epoll_event))) {
-        returned = -14; // -EFAULT
-        for (int j = 0; j < cand_count; j++)
-          epitem_unpin(j);
-        break;
-      }
-      returned += batch_count;
-    }
-
     for (int i = 0; i < cand_count; i++) {
       epitem_unpin(i);
     }
 
+    returned = copy_failed ? -14 : returned + batch_count;
     if (returned != 0)
       break;
 

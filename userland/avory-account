@@ -28,7 +28,7 @@ useradd)
     [ -z "$uid" ] || set -- "$@" -u "$uid"
     [ -z "$primary" ] || set -- "$@" -G "$primary"
     [ "$create_home" -eq 1 ] || set -- "$@" -H
-    /usr/sbin/adduser "$@" "$name"
+    /usr/bin/busybox adduser "$@" "$name"
     sed -i -E "s/^($name):[^:]*:/\1:!:/" /etc/passwd
     # Keep existing account credentials when adding a new user.
     if [ "$create_home" -eq 1 ]; then
@@ -36,25 +36,25 @@ useradd)
         chown -R "$name" "$home"; chmod 0700 "$home"
     fi
     oldifs=$IFS; IFS=,
-    for group in $groups; do [ -z "$group" ] || /usr/sbin/addgroup "$name" "$group"; done
+    for group in $groups; do [ -z "$group" ] || /usr/bin/busybox addgroup "$name" "$group"; done
     IFS=$oldifs
     ;;
 userdel)
     remove=0
     [ "${1:-}" != "-r" ] || { remove=1; shift; }
     [ $# -eq 1 ] || usage
-    [ "$remove" -eq 0 ] && exec /usr/sbin/deluser "$1"
-    exec /usr/sbin/deluser --remove-home "$1"
+    [ "$remove" -eq 0 ] && exec /usr/bin/busybox deluser "$1"
+    exec /usr/bin/busybox deluser --remove-home "$1"
     ;;
 groupadd)
     gid=
     if [ "${1:-}" = "-g" ]; then [ $# -ge 3 ] || usage; gid=$2; shift 2; fi
     [ $# -eq 1 ] || usage
-    [ -z "$gid" ] && exec /usr/sbin/addgroup "$1"
-    exec /usr/sbin/addgroup -g "$gid" "$1"
+    [ -z "$gid" ] && exec /usr/bin/busybox addgroup "$1"
+    exec /usr/bin/busybox addgroup -g "$gid" "$1"
     ;;
 groupdel)
-    [ $# -eq 1 ] || usage; exec /usr/sbin/delgroup "$1"
+    [ $# -eq 1 ] || usage; exec /usr/bin/busybox delgroup "$1"
     ;;
 usermod)
     append=0; groups=; lock=; shell=; home=
@@ -73,7 +73,7 @@ usermod)
     [ $# -eq 1 ] || usage; name=$1
     [ "$append" -eq 1 ] || [ -z "$groups" ] || { echo "usermod: replacing group lists is not supported" >&2; exit 2; }
     oldifs=$IFS; IFS=,
-    for group in $groups; do [ -z "$group" ] || /usr/sbin/addgroup "$name" "$group"; done
+    for group in $groups; do [ -z "$group" ] || /usr/bin/busybox addgroup "$name" "$group"; done
     IFS=$oldifs
     [ -z "$lock" ] || { [ "$lock" -eq 1 ] && passwd -l "$name" || passwd -u "$name"; }
     [ -z "$shell" ] || sed -i -E "s#^($name:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:).*#\1$shell#" /etc/passwd

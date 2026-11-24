@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Reject Raphael passthrough after host suspend; perform no device writes."""
+"""Reject Raphael passthrough after unsafe host events; perform no device writes."""
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import time
 
@@ -64,6 +65,24 @@ def check_raphael_resume(command, sysroot=Path('/sys'), clock=time.clock_gettime
             'suspended_seconds': sleep_gap, 'resumed_host_trial': bool(resumed and allow_resumed)}
 
 
+def check_raphael_host_reset(run=subprocess.run):
+    # Read this boot's kernel messages: the reset reason is printed at boot,
+    # even when the previous journal stopped too early to record the fault.
+    try:
+        result = run(
+            ['journalctl', '-b', '-k', '--no-pager', '-o', 'cat',
+             '--grep=Previous system reset reason.*data fabric sync flood'],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if result.returncode == 0 and result.stdout.strip():
+        raise RuntimeError(
+            'Raphael VFIO launch blocked: this boot reports an AMD Data Fabric '
+            f'sync flood from the previous reset. {result.stdout.strip()}'
+        )
+
+
 def main():
     command = sys.argv[1:]
     if command[:1] == ['--']:
@@ -71,7 +90,9 @@ def main():
     if not command:
         sys.exit('a command after -- is required')
     try:
-        check_raphael_resume(command)
+        evidence = check_raphael_resume(command)
+        if evidence['raphael_devices']:
+            check_raphael_host_reset()
     except RuntimeError as error:
         sys.exit(str(error))
     os.execvpe(command[0], command, os.environ)

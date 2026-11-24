@@ -448,7 +448,7 @@ extern "C" fn blk_read(ctx: *mut c_void, lba: u64, count: u32, buf: *mut c_void)
     let Some(slot) = slot_of(ctx) else {
         return -1;
     };
-    status(slot.io(|dev| {
+    let r = slot.io(|dev| {
         let len = dev.span_bytes(count).ok_or(ScsiError::Range)?;
         if buf.is_null() {
             return Err(ScsiError::Range);
@@ -457,14 +457,18 @@ extern "C" fn blk_read(ctx: *mut c_void, lba: u64, count: u32, buf: *mut c_void)
         // the duration of this call.
         let dst = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), len) };
         dev.read(lba, count, dst)
-    }))
+    });
+    if let Err(e) = &r {
+        crate::klog!("usb storage: read failed lba={} count={} err={:?}\n", lba, count, e);
+    }
+    status(r)
 }
 
 extern "C" fn blk_write(ctx: *mut c_void, lba: u64, count: u32, buf: *const c_void) -> c_int {
     let Some(slot) = slot_of(ctx) else {
         return -1;
     };
-    status(slot.io(|dev| {
+    let r = slot.io(|dev| {
         let len = dev.span_bytes(count).ok_or(ScsiError::Range)?;
         if buf.is_null() {
             return Err(ScsiError::Range);
@@ -472,14 +476,22 @@ extern "C" fn blk_write(ctx: *mut c_void, lba: u64, count: u32, buf: *const c_vo
         // SAFETY: as in blk_read; the block layer keeps `count` sectors valid.
         let src = unsafe { core::slice::from_raw_parts(buf.cast::<u8>(), len) };
         dev.write(lba, count, src)
-    }))
+    });
+    if let Err(e) = &r {
+        crate::klog!("usb storage: write failed lba={} count={} err={:?}\n", lba, count, e);
+    }
+    status(r)
 }
 
 extern "C" fn blk_flush(ctx: *mut c_void) -> c_int {
     let Some(slot) = slot_of(ctx) else {
         return -1;
     };
-    status(slot.io(|dev| dev.flush()))
+    let r = slot.io(|dev| dev.flush());
+    if let Err(e) = &r {
+        crate::klog!("usb storage: flush failed err={:?}\n", e);
+    }
+    status(r)
 }
 
 struct SenseText(u32);

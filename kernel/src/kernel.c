@@ -774,6 +774,25 @@ void kmain_high_half(void) {
   // up as root keeps it for good, every rejected candidate drops it.
   struct block_device *boot_dev = NULL;
 
+  // Live media supplies disk.img as ram0. Its first partition is the live
+  // root, even when an attached disk has an existing AvoryOS root partition.
+  struct block_device *ramdisk = block_get_by_name("ram0");
+  if (ramdisk) {
+    boot_dev = block_find_partition(ramdisk, 1);
+    if (boot_dev &&
+        (ext4_mount_root(boot_dev) == 0 || ext2_mount_root(boot_dev) == 0)) {
+      block_put(ramdisk);
+      goto mount_success;
+    }
+    block_put(boot_dev);
+
+    // Also accept a module containing a filesystem without a partition table.
+    boot_dev = ramdisk;
+    if (ext4_mount_root(boot_dev) == 0 || ext2_mount_root(boot_dev) == 0)
+      goto mount_success;
+    block_put(boot_dev);
+  }
+
   // 1. Smart discovery: partition typed as Linux root or labeled rootfs/AvoryOS-Root
   boot_dev = block_find_by_type(PART_TYPE_LINUX_ROOT);
   if (!boot_dev)
@@ -915,7 +934,6 @@ mount_success:
    * It is skipped, and logs why, on a plain virtio-gpu. */
   if (boot_selftests_enabled() && virtio_gpu_is_initialized())
     (void)virtio_gpu_venus_wire_selftest();
-  ascentdrm_register_vfs();
   fb_detect_drm_backend();
 
   /* `drm_selftest=1` verifies the DIRTYFB damage planner (rect union and the
@@ -993,6 +1011,8 @@ mount_success:
    * The suites exercise those drivers, so the order matters. */
   linuxkpi_param_init();
   linuxkpi_run_initcalls();
+  ascentdrm_register_vfs();
+  sysfs_register_ascentdrm(ascentdrm_get_card_minor());
   ascentdrm_register_render_vfs();
   /* The Phase 1 suites sleep too; they get their own kthread instead of the
    * idle context kmain_high_half runs in. */
@@ -1002,6 +1022,9 @@ mount_success:
    * (spawns its own kthread). */
   extern void rcu_bench_maybe_run(void);
   rcu_bench_maybe_run();
+#else
+  ascentdrm_register_vfs();
+  sysfs_register_ascentdrm(ascentdrm_get_card_minor());
 #endif
 
 mount_fail:

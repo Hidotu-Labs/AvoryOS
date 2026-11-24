@@ -19,7 +19,7 @@ $(GLIBC_STAMP): $(GLIBC_TOOLCHAIN_STAMP)
 	$(MAKE) -C $(ROOT_DIR) setup-rootfs
 
 .PHONY: all gpu-diagnostics
-all: avory-login.elf avory-installer.elf hello_glibc.elf booter.elf reboot.elf shutdown.elf kilo.elf ls.elf lspci.elf lsblk.elf readelf.elf pong.elf raycast.elf asplay.elf dns_lookup.elf kria.elf drm_identify.elf
+all: avory-login.elf avory-installer.elf axon.elf hello_glibc.elf booter.elf reboot.elf shutdown.elf kilo.elf ls.elf lspci.elf lsblk.elf readelf.elf pong.elf raycast.elf asplay.elf dns_lookup.elf kria.elf drm_identify.elf
 
 # Pinned UnixBench components plus native RAM/startup/metadata workloads.
 BENCH_SRC := benchmarks/unixbench
@@ -57,6 +57,18 @@ INSTALLER_HDRS := installer/installer.h installer/tui.h installer/disks.h instal
 avory-installer.elf: $(INSTALLER_SRCS) $(INSTALLER_HDRS) $(GLIBC_STAMP)
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -Iinstaller \
 		$(INSTALLER_SRCS) -o avory-installer.elf
+
+AXON_SRC_DIR := $(ROOT_DIR)/build/axon-src
+axon.elf: $(GLIBC_STAMP)
+	$(GLIBC_CC) -std=c11 -O2 -D_GNU_SOURCE -fno-stack-protector \
+		--sysroot=$(GLIBC_SYSROOT) -Wl,-T,$(ROOT_DIR)/config/userland-link.ld \
+		-I$(AXON_SRC_DIR)/include -I$(AXON_SRC_DIR)/src \
+		$(AXON_SRC_DIR)/src/main.c $(AXON_SRC_DIR)/src/config.c \
+		$(wildcard $(AXON_SRC_DIR)/src/cli/*.c $(AXON_SRC_DIR)/src/package/*.c \
+		$(AXON_SRC_DIR)/src/repository/*.c $(AXON_SRC_DIR)/src/database/*.c \
+		$(AXON_SRC_DIR)/src/resolver/*.c $(AXON_SRC_DIR)/src/transaction/*.c \
+		$(AXON_SRC_DIR)/src/security/*.c $(AXON_SRC_DIR)/src/runtime/*.c) \
+		-larchive -lcurl -o $@
 
 nvme_init.elf: nvme_init.c $(GLIBC_STAMP)
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -static nvme_init.c -o nvme_init.elf

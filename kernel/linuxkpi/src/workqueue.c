@@ -15,9 +15,11 @@
 #include <linuxkpi/service.h>
 
 #define KPI_WQ_MAX_WORKERS 4
-/* Serializes the work->wq publication with disable/cancel callers. Lock order
- * is submission lock then queue lock; workers take only the queue lock. */
+enum { WORK_IDLE, WORK_QUEUED, WORK_DELAYED };
+/* Serializes work ownership across queues. Lock order is submission lock
+ * then queue lock. */
 static DEFINE_SPINLOCK(work_submit_lock);
+static LIST_HEAD(work_executions);
 static unsigned long workqueue_live_count;
 unsigned long linuxkpi_workqueue_live_count(void) {
   return __atomic_load_n(&workqueue_live_count, __ATOMIC_ACQUIRE);
@@ -45,6 +47,14 @@ struct wq_worker {
   int idx;
 };
 
+/* Worker-owned records stay valid even if a callback frees its work item. */
+struct wq_execution {
+  struct list_head link;
+  struct work_struct *work;
+  work_func_t func;
+  struct workqueue_struct *wq;
+};
+
 struct workqueue_struct *system_wq;
 struct workqueue_struct *system_long_wq;
 struct workqueue_struct *system_unbound_wq;
@@ -64,10 +74,11 @@ static bool kpi_work_running(struct workqueue_struct *wq,
 }
 
 static int worker_fn(void *arg) {
-  unsigned long flags;
+  unsigned long flags, submit_flags;
   struct wq_worker *wa = arg;
   struct workqueue_struct *wq = wa->wq;
   int idx = wa->idx;
+  struct wq_execution execution = {.wq = wq};
   kfree(wa);
 
   for (;;) {
@@ -109,6 +120,7 @@ static int worker_fn(void *arg) {
      * the requeued item concurrently. Never move entries to an unlocked batch:
      * cancellation must own the queue lock when unlinking them. */
     struct work_struct *work = NULL;
+    spin_lock_irqsave(&work_submit_lock, submit_flags);
     spin_lock_irqsave(&wq->lock, flags);
     struct work_struct *candidate;
     list_for_each_entry(candidate, &wq->pending, entry) {
@@ -116,24 +128,31 @@ static int worker_fn(void *arg) {
         work = candidate;
         list_del_init(&work->entry);
         wq->current_work[idx] = work;
-        __atomic_store_n(&work->pending, 0, __ATOMIC_RELEASE);
+        execution.work = work;
+        execution.func = work->func;
+        list_add(&execution.link, &work_executions);
+        WRITE_ONCE(work->pending, WORK_IDLE);
         break;
       }
     }
     spin_unlock_irqrestore(&wq->lock, flags);
+    spin_unlock_irqrestore(&work_submit_lock, submit_flags);
     if (!work) {
       /* Every queued item is still executing on another worker. */
       msleep(1);
       continue;
     }
 
-    work->func(work);
+    execution.func(work);
 
+    spin_lock_irqsave(&work_submit_lock, submit_flags);
     spin_lock_irqsave(&wq->lock, flags);
     /* work may already be freed. Only clear the worker's side record. */
+    list_del(&execution.link);
     wq->current_work[idx] = NULL;
     wq->active--;
     spin_unlock_irqrestore(&wq->lock, flags);
+    spin_unlock_irqrestore(&work_submit_lock, submit_flags);
 
     __kpi_wake_up(&wq->flush_wait, 0, 0);
     __kpi_wake_up(&wq->more_work, 1, 0);
@@ -201,28 +220,44 @@ static void wq_ensure_worker(struct workqueue_struct *wq) {
   spin_unlock_irqrestore(&wq->lock, flags);
 }
 
-static bool __queue_work(struct workqueue_struct *wq, struct work_struct *work) {
-  unsigned long submit_flags, queue_flags;
-  spin_lock_irqsave(&work_submit_lock, submit_flags);
-  spin_lock_irqsave(&wq->lock, queue_flags);
-
-  if (work->pending || __atomic_load_n(&work->disabled, __ATOMIC_ACQUIRE)) {
-    spin_unlock_irqrestore(&wq->lock, queue_flags);
-    spin_unlock_irqrestore(&work_submit_lock, submit_flags);
-    return false;
+static struct workqueue_struct *executing_queue(struct work_struct *work) {
+  struct wq_execution *execution;
+  list_for_each_entry(execution, &work_executions, link) {
+    if (execution->work == work && execution->func == work->func)
+      return execution->wq;
   }
+  return NULL;
+}
 
-  work->pending = 1;
+/* Called with work_submit_lock held and IRQs disabled. */
+static void enqueue_work(struct workqueue_struct *wq, struct work_struct *work) {
+  spin_lock(&wq->lock);
   work->wq = wq;
+  WRITE_ONCE(work->pending, WORK_QUEUED);
   wq->active++;
   wq->gen++;
   list_add_tail(&work->entry, &wq->pending);
+  spin_unlock(&wq->lock);
+}
 
-  spin_unlock_irqrestore(&wq->lock, queue_flags);
-  spin_unlock_irqrestore(&work_submit_lock, submit_flags);
-
+static void kick_workqueue(struct workqueue_struct *wq) {
   __kpi_wake_up(&wq->more_work, 1, 0);
   wq_ensure_worker(wq);
+}
+
+static bool __queue_work(struct workqueue_struct *wq, struct work_struct *work) {
+  unsigned long flags;
+  spin_lock_irqsave(&work_submit_lock, flags);
+  if (work->pending != WORK_IDLE || READ_ONCE(work->disabled)) {
+    spin_unlock_irqrestore(&work_submit_lock, flags);
+    return false;
+  }
+  struct workqueue_struct *running = executing_queue(work);
+  if (running)
+    wq = running;
+  enqueue_work(wq, work);
+  spin_unlock_irqrestore(&work_submit_lock, flags);
+  kick_workqueue(wq);
   return true;
 }
 
@@ -246,31 +281,22 @@ bool schedule_work_on(int cpu, struct work_struct *work) {
 }
 
 bool flush_work(struct work_struct *work) {
-  struct workqueue_struct *wq = work->wq;
   unsigned long flags;
-  bool busy;
-  if (!wq)
-    return false;
+  bool busy, waited = false;
   do {
-    spin_lock_irqsave(&wq->lock, flags);
-    busy = work->pending || kpi_work_running(wq, work);
-    spin_unlock_irqrestore(&wq->lock, flags);
-    if (busy)
+    spin_lock_irqsave(&work_submit_lock, flags);
+    busy = work->pending == WORK_QUEUED || executing_queue(work);
+    spin_unlock_irqrestore(&work_submit_lock, flags);
+    if (busy) {
+      waited = true;
       msleep(1);
+    }
   } while (busy);
-  return true;
+  return waited;
 }
 
 void flush_workqueue(struct workqueue_struct *wq) {
   wait_event(wq->flush_wait, wq->active == 0);
-}
-
-/* A delayed invocation still armed on its timer must execute now before
- * flush returns. Merely flushing work misses the entire timer phase. */
-bool flush_delayed_work(struct delayed_work *dwork) {
-  if (del_timer_sync(&dwork->timer))
-    __queue_work(dwork->work.wq ? dwork->work.wq : system_wq, &dwork->work);
-  return flush_work(&dwork->work);
 }
 
 void drain_workqueue(struct workqueue_struct *wq) {
@@ -280,27 +306,32 @@ void drain_workqueue(struct workqueue_struct *wq) {
   flush_workqueue(wq);
 }
 
+/* Called with work_submit_lock held. Only a queue-owned item has a link. */
+static bool dequeue_work(struct work_struct *work) {
+  if (work->pending != WORK_QUEUED)
+    return false;
+  struct workqueue_struct *wq = work->wq;
+
+  spin_lock(&wq->lock);
+  list_del_init(&work->entry);
+  WRITE_ONCE(work->pending, WORK_IDLE);
+  wq->active--;
+  spin_unlock(&wq->lock);
+  __kpi_wake_up(&wq->flush_wait, 0, 0);
+  return true;
+}
+
 bool cancel_work_sync(struct work_struct *work) {
   unsigned long flags;
-  struct workqueue_struct *wq = work->wq;
   bool cancelled = false, running;
-
-  if (!wq)
-    return false;
   /* The owner excludes external producers. Recheck under the queue lock
    * after each running instance: the callback may have queued another run
    * while cancellation was waiting. Never leave that pending node behind. */
   do {
-    spin_lock_irqsave(&wq->lock, flags);
-    if (work->pending) {
-      list_del_init(&work->entry);
-      work->pending = 0;
-      wq->active--;
-      cancelled = true;
-    }
-    running = kpi_work_running(wq, work);
-    spin_unlock_irqrestore(&wq->lock, flags);
-    __kpi_wake_up(&wq->flush_wait, 0, 0);
+    spin_lock_irqsave(&work_submit_lock, flags);
+    cancelled |= dequeue_work(work);
+    running = executing_queue(work) != NULL;
+    spin_unlock_irqrestore(&work_submit_lock, flags);
     if (running)
       msleep(1);
   } while (running);
@@ -311,23 +342,10 @@ bool disable_work(struct work_struct *work) {
   if (!work)
     return false;
   unsigned long flags;
-  bool cancelled = false;
   spin_lock_irqsave(&work_submit_lock, flags);
   __atomic_fetch_add(&work->disabled, 1, __ATOMIC_ACQ_REL);
-  struct workqueue_struct *wq = work->wq;
-  if (wq) {
-    spin_lock(&wq->lock);
-    if (work->pending) {
-      list_del_init(&work->entry);
-      work->pending = 0;
-      wq->active--;
-      cancelled = true;
-    }
-    spin_unlock(&wq->lock);
-  }
+  bool cancelled = dequeue_work(work);
   spin_unlock_irqrestore(&work_submit_lock, flags);
-  if (cancelled && wq)
-    __kpi_wake_up(&wq->flush_wait, 0, 0);
   return cancelled;
 }
 
@@ -353,24 +371,73 @@ bool enable_work(struct work_struct *work) {
 
 /* ── delayed work ───────────────────────────────────────────────────────── */
 
+/* Promote a timer-owned item while holding work_submit_lock. */
+static struct workqueue_struct *promote_delayed_work(struct work_struct *work) {
+  if (READ_ONCE(work->disabled)) {
+    WRITE_ONCE(work->pending, WORK_IDLE);
+    return NULL;
+  }
+  struct workqueue_struct *wq = executing_queue(work);
+  if (!wq)
+    wq = work->wq;
+  enqueue_work(wq, work);
+  return wq;
+}
+
 void delayed_work_timer_fn(struct timer_list *timer) {
   struct delayed_work *dwork =
       container_of(timer, struct delayed_work, timer);
-  struct workqueue_struct *wq = dwork->work.wq ? dwork->work.wq : system_wq;
+  struct workqueue_struct *wq = NULL;
+  unsigned long flags;
 
-  __queue_work(wq, &dwork->work);
+  spin_lock_irqsave(&work_submit_lock, flags);
+  /* A modifier can rearm this timer after it was taken off the wheel but
+   * before this callback acquired the lock. The newer deadline owns it. */
+  if (!dwork->canceling && dwork->work.pending == WORK_DELAYED &&
+      !timer_pending(timer))
+    wq = promote_delayed_work(&dwork->work);
+  spin_unlock_irqrestore(&work_submit_lock, flags);
+  if (wq)
+    kick_workqueue(wq);
+}
+
+static bool submit_delayed_work(struct workqueue_struct *wq,
+                                struct delayed_work *dwork,
+                                unsigned long delay, bool modify) {
+  struct work_struct *work = &dwork->work;
+  unsigned long flags;
+
+  spin_lock_irqsave(&work_submit_lock, flags);
+  bool was_pending = work->pending != WORK_IDLE;
+  if (dwork->canceling || READ_ONCE(work->disabled) ||
+      (!modify && was_pending)) {
+    spin_unlock_irqrestore(&work_submit_lock, flags);
+    return false;
+  }
+  if (work->pending == WORK_DELAYED)
+    del_timer(&dwork->timer);
+  else
+    dequeue_work(work);
+
+  if (delay) {
+    work->wq = wq;
+    WRITE_ONCE(work->pending, WORK_DELAYED);
+    mod_timer(&dwork->timer, jiffies + delay);
+  } else {
+    struct workqueue_struct *running = executing_queue(work);
+    if (running)
+      wq = running;
+    enqueue_work(wq, work);
+  }
+  spin_unlock_irqrestore(&work_submit_lock, flags);
+  if (!delay)
+    kick_workqueue(wq);
+  return modify ? was_pending : true;
 }
 
 bool queue_delayed_work(struct workqueue_struct *wq,
                         struct delayed_work *dwork, unsigned long delay) {
-  if (__atomic_load_n(&dwork->canceling, __ATOMIC_ACQUIRE))
-    return false;
-  if (delay == 0)
-    return __queue_work(wq, &dwork->work);
-
-  dwork->work.wq = wq;
-  mod_timer(&dwork->timer, jiffies + delay);
-  return true;
+  return submit_delayed_work(wq, dwork, delay, false);
 }
 
 bool schedule_delayed_work(struct delayed_work *dwork, unsigned long delay) {
@@ -385,47 +452,62 @@ bool schedule_delayed_work_on(int cpu, struct delayed_work *dwork,
 
 bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *dwork,
                       unsigned long delay) {
-  if (__atomic_load_n(&dwork->canceling, __ATOMIC_ACQUIRE))
-    return false;
-  if (delay == 0) {
-    del_timer(&dwork->timer);
-    return __queue_work(wq, &dwork->work);
-  }
+  return submit_delayed_work(wq, dwork, delay, true);
+}
 
-  dwork->work.wq = wq;
-  mod_timer(&dwork->timer, jiffies + delay);
-  return true;
+bool flush_delayed_work(struct delayed_work *dwork) {
+  unsigned long flags;
+  struct workqueue_struct *wq = NULL;
+
+  spin_lock_irqsave(&work_submit_lock, flags);
+  if (!dwork->canceling && dwork->work.pending == WORK_DELAYED) {
+    del_timer(&dwork->timer);
+    wq = promote_delayed_work(&dwork->work);
+  }
+  spin_unlock_irqrestore(&work_submit_lock, flags);
+  if (wq)
+    kick_workqueue(wq);
+  /* A timer callback superseded by a rearm can still be returning. */
+  linuxkpi_timer_wait_running(&dwork->timer);
+  return flush_work(&dwork->work) || wq != NULL;
 }
 
 bool cancel_delayed_work(struct delayed_work *dwork) {
-  bool pending = del_timer(&dwork->timer) != 0;
-  struct work_struct *work = &dwork->work;
-  struct workqueue_struct *wq = work->wq;
   unsigned long flags;
-  if (wq) {
-    spin_lock_irqsave(&wq->lock, flags);
-    if (work->pending) {
-      list_del_init(&work->entry);
-      work->pending = 0;
-      wq->active--;
-      pending = true;
-    }
-    spin_unlock_irqrestore(&wq->lock, flags);
-    __kpi_wake_up(&wq->flush_wait, 0, 0);
+  struct work_struct *work = &dwork->work;
+
+  spin_lock_irqsave(&work_submit_lock, flags);
+  bool cancelled = dequeue_work(work);
+  if (work->pending == WORK_DELAYED && del_timer(&dwork->timer)) {
+    WRITE_ONCE(work->pending, WORK_IDLE);
+    cancelled = true;
   }
-  return pending;
+  spin_unlock_irqrestore(&work_submit_lock, flags);
+  return cancelled;
 }
 
 bool cancel_delayed_work_sync(struct delayed_work *dwork) {
-  /* The owner excludes external producers, but the running callback may
-   * rearm itself. Block both queue/mod paths until timer and work drain.
-   * Waiting on work alone after deleting the timer leaves that rearm live. */
-  __atomic_store_n(&dwork->canceling, 1, __ATOMIC_RELEASE);
-  int ret = del_timer_sync(&dwork->timer);
+  unsigned long flags;
+  struct work_struct *work = &dwork->work;
 
-  bool pending = cancel_work_sync(&dwork->work);
-  __atomic_store_n(&dwork->canceling, 0, __ATOMIC_RELEASE);
-  return ret != 0 || pending;
+  /* Close submissions before draining the timer. The callback may try to
+   * rearm itself, and the timer callback also takes the submission lock. */
+  spin_lock_irqsave(&work_submit_lock, flags);
+  dwork->canceling++;
+  spin_unlock_irqrestore(&work_submit_lock, flags);
+
+  del_timer_sync(&dwork->timer);
+  spin_lock_irqsave(&work_submit_lock, flags);
+  bool cancelled = work->pending == WORK_DELAYED;
+  if (cancelled)
+    WRITE_ONCE(work->pending, WORK_IDLE);
+  spin_unlock_irqrestore(&work_submit_lock, flags);
+
+  cancelled |= cancel_work_sync(work);
+  spin_lock_irqsave(&work_submit_lock, flags);
+  dwork->canceling--;
+  spin_unlock_irqrestore(&work_submit_lock, flags);
+  return cancelled;
 }
 
 /* ── allocation ─────────────────────────────────────────────────────────── */

@@ -382,7 +382,7 @@ uint64_t sys_fork(struct syscall_regs *regs) {
     child->supplementary_group_count = parent->supplementary_group_count;
     memcpy(child->supplementary_groups, parent->supplementary_groups,
            sizeof(child->supplementary_groups));
-    child->ctty = parent->ctty; // Inherit controlling terminal
+    child->ctty = (parent->ctty && vfs_node_is_alive(parent->ctty)) ? parent->ctty : NULL; // Inherit controlling terminal
 
     // Inherit comm name — forked child keeps the parent's name until exec
     memcpy(child->comm, parent->comm, sizeof(child->comm));
@@ -882,7 +882,7 @@ uint64_t sys_vfork(struct syscall_regs *regs) {
   child->supplementary_group_count = parent->supplementary_group_count;
   memcpy(child->supplementary_groups, parent->supplementary_groups,
          sizeof(child->supplementary_groups));
-  child->ctty = parent->ctty;
+  child->ctty = (parent->ctty && vfs_node_is_alive(parent->ctty)) ? parent->ctty : NULL;
   memcpy(child->comm, parent->comm, sizeof(child->comm));
   memcpy(child->exe_path, parent->exe_path, sizeof(child->exe_path));
   uname_policy_on_fork(child, parent);

@@ -13,8 +13,8 @@
  *          Phase 2 file bridge (linuxkpi_file_*) into the same fops.
  *   close: fput() runs ->release (drm_release) and drops the inode.
  *
- * The native card0 node belongs to ascentdrm and is deliberately not
- * registered here; imported primaries start at card1. */
+ * The first imported KMS driver (e.g. amdgpu, nouveau) can claim card0, and
+ * native ascentdrm takes the next free primary minor afterward. */
 
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
@@ -23,6 +23,7 @@
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/fs.h>
+#include <linux/kdev_t.h>
 #include <linux/mount.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -126,6 +127,45 @@ static int drm_split_devnode_path(const char *path, char *dir, size_t dirsz,
   return 0;
 }
 
+extern void *linuxkpi_original___devm_drm_dev_alloc(
+    struct device *parent, const struct drm_driver *driver, size_t size,
+    size_t offset);
+
+void *__devm_drm_dev_alloc(struct device *parent,
+                           const struct drm_driver *driver, size_t size,
+                           size_t offset) {
+  void *obj = linuxkpi_original___devm_drm_dev_alloc(parent, driver, size, offset);
+  if (IS_ERR_OR_NULL(obj) || !driver || (driver->driver_features & DRIVER_MODESET))
+    return obj;
+
+  /* Render-only devices (such as vgem) do not drive displays; keep primary
+   * minors 0..63 free so the first real GPU takes /dev/dri/card0. */
+  struct drm_device *drm = (struct drm_device *)((char *)obj + offset);
+  if (drm->primary && drm->primary->index < 64) {
+    u32 ext = 0;
+    unsigned int old_idx = drm->primary->index;
+    if (xa_alloc(&drm_minors_xa, &ext, NULL, XA_LIMIT(192, 255), GFP_KERNEL) == 0) {
+      xa_erase(&drm_minors_xa, old_idx);
+      drm->primary->index = (int)ext;
+      if (drm->primary->kdev) {
+        drm->primary->kdev->devt = MKDEV(226, ext);
+        dev_set_name(drm->primary->kdev, "card%u", ext);
+      }
+    }
+  }
+  return obj;
+}
+
+int linuxkpi_ascentdrm_primary_reserve(void) {
+  u32 minor = 0;
+  int ret = xa_alloc(&drm_minors_xa, &minor, NULL, XA_LIMIT(0, 63), GFP_KERNEL);
+  return ret < 0 ? ret : (int)minor;
+}
+
+void linuxkpi_ascentdrm_primary_release(unsigned int minor) {
+  xa_erase(&drm_minors_xa, minor);
+}
+
 int linuxkpi_drm_devnode_register(struct device *dev, const char *path) {
   char dir[32];
   char name[64];
@@ -137,9 +177,9 @@ int linuxkpi_drm_devnode_register(struct device *dev, const char *path) {
   if (ret)
     return ret;
 
-  /* Native ascentdrm owns /dev/dri/card0.  Imported DRM devices still get
-   * their render node and any later primary (card1, card2, ...). */
-  if (strcmp(dir, "dri") == 0 && strcmp(name, "card0") == 0)
+  /* Relocated render-only dummy primaries stay internal (renderD* only). */
+  if (strcmp(dir, "dri") == 0 && strncmp(name, "card", 4) == 0 &&
+      MINOR(dev->devt) >= 192)
     return 0;
 
   ret = asc_vfs_register_devnode_at(dir, name, (uint32_t)dev->devt,
@@ -157,7 +197,8 @@ void linuxkpi_drm_devnode_unregister(const char *path) {
 
   if (drm_split_devnode_path(path, dir, sizeof(dir), name, sizeof(name)))
     return;
-  if (strcmp(dir, "dri") == 0 && strcmp(name, "card0") == 0)
+  if (strcmp(dir, "dri") == 0 && strncmp(name, "card", 4) == 0 &&
+      strncmp(name, "card19", 6) == 0)
     return;
 
   asc_vfs_unregister_devnode_at(dir, name);

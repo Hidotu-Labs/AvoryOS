@@ -415,7 +415,6 @@ run-amd-gpu: GTK_SHOW_CURSOR = off
 # guest shutdown before closing passthrough PRIME sessions.
 GTK_WINDOW_CLOSE ?= on
 run-amd-gpu: DISPLAY_OPT = -display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=$(GTK_SHOW_CURSOR),window-close=$(GTK_WINDOW_CLOSE)
-run-amd-gpu: VFIO_LAUNCHER =
 run-amd-gpu: RUN_NIC_ADDR = 08.0
 run-amd-gpu: VFIO_EXTRA = -device edu -chardev socket,id=prime-diag,path=build/logs/p6-amd-gpu-serial.sock,server=on,wait=off,logfile=build/logs/p6-amd-gpu.log,logappend=on $(RUN_NET_FLAGS)
 run-amd-gpu: QEMUFLAGS = -vga none -device virtio-vga,addr=06.0,xres=1280,yres=800
@@ -445,7 +444,11 @@ MINIMAL_DISK := build/minimal/disk.img
 MINIMAL_STAMP := build/minimal/rootfs/.avoryos-minimal
 
 $(MINIMAL_STAMP): scripts/build-minimal.sh scripts/axon-common.sh \
-		scripts/minimal-rootfs-packages.txt config/axon/mirrorlist
+		scripts/configure-pacman.sh scripts/minimal-rootfs-packages.txt \
+		config/axon/mirrorlist config/init/udhcpc.script initrd/drm-pick.sh \
+		scripts/tests/capture-glx-stall.sh \
+		userland/drm_identify.c $(GLIBC_TOOLCHAIN_STAMP) \
+		$(wildcard userland/installer/*.c userland/installer/*.h)
 	chmod +x scripts/build-minimal.sh
 	./scripts/build-minimal.sh rootfs
 
@@ -459,7 +462,7 @@ $(MINIMAL_DISK): $(MINIMAL_STAMP) scripts/build-minimal.sh
 minimal-disk: $(MINIMAL_DISK)
 
 $(MINIMAL_ISO): kernel limine/limine $(MINIMAL_DISK) limine-minimal.conf create_dist_usb.sh
-	DISK_IMG=$(MINIMAL_DISK) LIMINE_CONF=limine-minimal.conf \
+	AVORYOS_DISK_SLACK_MB=256 DISK_IMG=$(MINIMAL_DISK) LIMINE_CONF=limine-minimal.conf \
 		./create_dist_usb.sh $(MINIMAL_ISO)
 
 .PHONY: minimal-iso
@@ -468,10 +471,11 @@ minimal-iso: $(MINIMAL_ISO)
 .PHONY: run-minimal
 run-minimal: edk2-ovmf $(MINIMAL_ISO)
 	qemu-system-$(ARCH) \
-		-M q35,pcspk-audiodev=snd0 \
+		-M q35 \
 		-drive if=pflash,unit=0,format=raw,file=edk2-ovmf/ovmf-code-$(ARCH).fd,readonly=on \
 		-cdrom $(MINIMAL_ISO) \
 		-serial stdio \
+		$(RUN_ACCEL_FLAGS) \
 		$(RUN_NET_FLAGS) \
 		-device qemu-xhci,id=xhci \
 		-device usb-kbd,bus=xhci.0 \
@@ -493,6 +497,7 @@ USERLAND_DISK_APPS := \
 	userland/bench_vfs.elf \
 	userland/asplay.elf \
 	userland/avory-installer.elf \
+	userland/axon.elf \
 	userland/avory-login.elf \
 	userland/booter.elf \
 	userland/classicube.elf \
@@ -701,6 +706,11 @@ disk.img: disk-full-force
 		echo "cd /"; \
 		echo "mkdir tmp"; \
 		echo "mkdir bin"; \
+		echo "mkdir usr"; \
+		echo "mkdir usr/bin"; \
+		echo "mkdir usr/sbin"; \
+		echo "mkdir etc"; \
+		echo "mkdir etc/axon"; \
 		echo "mkdir .config"; \
 		echo "mkdir .cache"; \
 		echo "rm bin/startx.sh"; \
@@ -713,6 +723,9 @@ disk.img: disk-full-force
 		echo "write userland/avory-installer.elf usr/sbin/avory-installer"; \
 		echo "rm bin/install-avoryos"; \
 		echo "symlink bin/install-avoryos /usr/sbin/avory-installer"; \
+		echo "rm usr/bin/axon"; \
+		echo "write userland/axon.elf usr/bin/axon"; \
+		if [ -f build/axon-src/axon.conf ]; then echo "rm etc/axon/axon.conf"; echo "write build/axon-src/axon.conf etc/axon/axon.conf"; fi; \
 		echo "rm bin/false"; \
 		echo "symlink bin/false /usr/bin/false"; \
 		echo "rm bin/true"; \
@@ -939,6 +952,8 @@ disk.img: disk-full-force
 		[ -f build/arch/rootfs/var/lib/avoryos/uname-linux ] || install -D -m 0644 config/init/uname-linux build/arch/rootfs/var/lib/avoryos/uname-linux; \
 		install -m 0755 config/weston/avory-weston-session.sh build/arch/rootfs/usr/bin/avory-weston-session; \
 		install -m 0644 config/weston/weston.desktop build/arch/rootfs/usr/share/wayland-sessions/weston.desktop; \
+		[ -f userland/axon.elf ] && install -D -m 0755 userland/axon.elf build/arch/rootfs/usr/bin/axon || true; \
+		[ -f build/axon-src/axon.conf ] && install -D -m 0644 build/axon-src/axon.conf build/arch/rootfs/etc/axon/axon.conf || true; \
 		./scripts/configure-accounts.sh build/arch/rootfs; \
 		bash scripts/configure-pacman.sh build/arch/rootfs; \
 		./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs /; \
@@ -1052,6 +1067,7 @@ disk.img: disk-full-force
 		echo "set_inode_field bin/avory-login mode 0100755"; \
 		echo "set_inode_field bin/avory-installer mode 0100755"; \
 		echo "set_inode_field usr/sbin/avory-installer mode 0100755"; \
+		echo "set_inode_field usr/bin/axon mode 0100755"; \
 		echo "set_inode_field bin/test_cred mode 0100755"; \
 		echo "set_inode_field bin/test_accounts mode 0100755"; \
 		echo "set_inode_field bin/test_hugepages mode 0100755"; \
@@ -1141,7 +1157,7 @@ setup: $(ARCH_STAMP)
 
 .PHONY: kernel
 kernel: setup
-	@if ! grep -qx 'tag=v6.18.42' kernel/linux/.pin 2>/dev/null || ! grep -qx 'commit=856a9b51680cbbed1ace1207b29e424a616cff48' kernel/linux/.pin 2>/dev/null; then scripts/linux-import.sh; fi
+	@if ! sed -n '/^tag=/p; /^commit=/p' kernel/linux/.pin 2>/dev/null | cmp -s - scripts/linux/baseline.txt; then scripts/linux-import.sh; fi
 	@BUILD_TAG=$$(python3 scripts/kernel-build-tag.py); \
 		$(MAKE) -C kernel KPI_NOUVEAU=1 BUILD_NAME='$(BUILD_NAME)' \
 		BUILD_VERSION='$(BUILD_VERSION)' BUILD_TAG="$$BUILD_TAG"

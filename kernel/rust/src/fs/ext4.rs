@@ -9,6 +9,8 @@ const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 const EXT4_FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
 const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
 const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
+const EXT4_FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0200;
+const EXT4_FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
 
 const EXT4_FEATURE_COMPAT_HAS_JOURNAL: u32 = 0x0004;
 
@@ -55,7 +57,9 @@ pub fn check_feature_flags(
     let supported_incompat = EXT4_FEATURE_INCOMPAT_FILETYPE
         | EXT4_FEATURE_INCOMPAT_RECOVER
         | EXT4_FEATURE_INCOMPAT_EXTENTS
-        | EXT4_FEATURE_INCOMPAT_64BIT;
+        | EXT4_FEATURE_INCOMPAT_64BIT
+        | EXT4_FEATURE_INCOMPAT_FLEX_BG
+        | EXT4_FEATURE_INCOMPAT_CSUM_SEED;
     if (incompat & !supported_incompat) != 0 {
         return None;
     }
@@ -77,7 +81,8 @@ pub fn check_feature_flags(
     let supported_ro_compat = EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER
         | EXT4_FEATURE_RO_COMPAT_LARGE_FILE
         | EXT4_FEATURE_RO_COMPAT_BTREE_DIR;
-    Some((ro_compat & !supported_ro_compat) != 0)
+    let force_ro = (incompat & (EXT4_FEATURE_INCOMPAT_FLEX_BG | EXT4_FEATURE_INCOMPAT_CSUM_SEED)) != 0;
+    Some(force_ro || (ro_compat & !supported_ro_compat) != 0)
 }
 
 pub fn validate_extent_header(node: &[u8], max_depth: u16) -> Option<(u16, u16)> {
@@ -252,6 +257,18 @@ mod tests {
         // Unknown ro_compat -> read_only = true
         assert_eq!(
             check_feature_flags(2, 64, 0, incompat, 0x8000, true),
+            Some(true)
+        );
+        // Standard Linux mkfs.ext4 incompat flags (flex_bg + csum_seed) -> read_only = true
+        assert_eq!(
+            check_feature_flags(
+                2,
+                64,
+                EXT4_FEATURE_COMPAT_HAS_JOURNAL,
+                incompat | EXT4_FEATURE_INCOMPAT_FLEX_BG | EXT4_FEATURE_INCOMPAT_CSUM_SEED,
+                0x0001,
+                true
+            ),
             Some(true)
         );
         // Invalid 64-bit desc_size

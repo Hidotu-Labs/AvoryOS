@@ -22,6 +22,8 @@
  * active PML4, because DRM ioctls copy arguments with copy_from_user(). */
 
 #include <drm/drm.h>
+#include <drm/drm_client.h>
+#include <drm/drm_client_event.h>
 #include <drm/drm_device.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_file.h>
@@ -184,9 +186,9 @@ static int p4b_ioctl(void *node, unsigned int request) {
   return asc_vfs_kernel_ioctl(node, request, P4B_VA);
 }
 
-/* Open card1..card6, read DRM_IOCTL_VERSION.name and return the bochs one. */
+/* Open card0..card6, read DRM_IOCTL_VERSION.name and return the bochs one. */
 static void *p4b_find_bochs(int *minor_out) {
-  for (int minor = 1; minor <= 6; minor++) {
+  for (int minor = 0; minor <= 6; minor++) {
     char path[32];
     char name[32];
     struct p4b_scratch s;
@@ -585,6 +587,19 @@ void linuxkpi_test_phase4_bochs(void) {
     struct file *f = asc_vfs_node_device(node);
     struct drm_file *df = f ? f->private_data : NULL;
     struct drm_device *ddev = df ? df->minor->dev : NULL;
+
+    if (ddev && ddev->master && !list_empty(&ddev->clientlist)) {
+      struct drm_client_dev *client =
+          list_first_entry(&ddev->clientlist, struct drm_client_dev, list);
+
+      drm_client_dev_hotplug(ddev);
+      if (client->hotplug_failed)
+        p4b_fail("console hotplug while userspace is DRM master", -EBUSY);
+      else
+        p4b_ok("console hotplug while userspace is DRM master");
+    } else {
+      p4b_fail("console hotplug test requires a client and DRM master", 0);
+    }
 
     /* drm_dev_init() stores the parent device directly (dev->dev =
      * get_device(parent)), so the DRM device's `dev` is the PCI device. */

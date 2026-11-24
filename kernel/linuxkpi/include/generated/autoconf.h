@@ -86,6 +86,11 @@
 #define CONFIG_DRM_VGEM 1
 #define CONFIG_DRM_VKMS 1
 #define CONFIG_DRM_SIMPLEDRM 1
+/* Bridge Linux drm_client_setup() callers (e.g. amdgpu, bochs) to AvoryOS's
+ * native fb_global console while keeping full Linux fbdev/fbcon emulation off. */
+#ifndef CONFIG_DRM_CLIENT_SETUP
+#define CONFIG_DRM_CLIENT_SETUP 1
+#endif
 #define CONFIG_CRC32 1
 
 /* Allocators used by imported library code. */

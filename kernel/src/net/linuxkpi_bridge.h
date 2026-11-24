@@ -85,7 +85,6 @@ int lkpi_net_bridge_register(struct lkpi_net_bridge *, const char *name,
                              const struct lkpi_net_bridge_ops *, void *context);
 int lkpi_net_bridge_unregister(struct lkpi_net_bridge *);
 void lkpi_net_bridge_tx_wake(struct lkpi_net_bridge *);
-bool lkpi_net_bridge_receive(struct lkpi_net_bridge *, struct lkpi_skb *);
 bool lkpi_net_bridge_add_napi(struct lkpi_net_bridge *, struct lkpi_napi *);
 
 #endif

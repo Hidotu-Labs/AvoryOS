@@ -78,6 +78,80 @@ if [ ! -f "$SRC" ]; then
     echo "xorg-profile: $PROFILE (unchanged)"
     exit 0
 fi
+if [ "$PROFILE" = amdgpu ] && [ -x "${AVORY_DRM_IDENTIFY:-/bin/drm-identify}" ]; then
+    inv="$("${AVORY_DRM_IDENTIFY:-/bin/drm-identify}" 2>/dev/null || true)"
+    amd_line="$(printf '%s\n' "$inv" | awk '$2=="amdgpu" {print; exit}')"
+    disp_card="$(printf '%s\n' "$inv" | awk '($2=="ascentdrm" || $2=="virtio_gpu") && $4==1 {print $1; exit}')"
+    if [ -n "$amd_line" ]; then
+        set -- $amd_line
+        amd_card="$1"
+        amd_conn="${4:-0}"
+        if [ "$amd_conn" = "1" ] && ! printf '%s\n' "$inv" | awk '$2=="virtio_gpu" {found=1} END {exit !found}'; then
+            prepared="$(mktemp)" || exit 0
+            trap 'rm -f "$prepared"' EXIT HUP INT TERM
+            cat > "$prepared" <<EOF
+Section "OutputClass"
+    Identifier "AMDPrimary"
+    MatchDriver "amdgpu"
+    Driver "modesetting"
+    Option "PrimaryGPU" "true"
+EndSection
+
+Section "ServerLayout"
+    Identifier "AvoryLayout"
+    Screen 0 "Screen0" 0 0
+    InputDevice "Keyboard0" "CoreKeyboard"
+    InputDevice "Mouse0" "CorePointer"
+    Option "AutoAddDevices" "false"
+    Option "AutoAddGPU" "true"
+    Option "AutoBindGPU" "true"
+EndSection
+
+Section "Device"
+    Identifier "RenderGPU"
+    Driver "modesetting"
+    Option "kmsdev" "${amd_card}"
+    Option "AccelMethod" "glamor"
+    Option "SWcursor" "false"
+EndSection
+
+Section "Screen"
+    Identifier "Screen0"
+    Device "RenderGPU"
+    DefaultDepth 24
+EndSection
+
+Section "InputDevice"
+    Identifier "Keyboard0"
+    Driver "evdev"
+    Option "Device" "/dev/input/event0"
+    Option "CoreKeyboard" "true"
+EndSection
+
+Section "InputDevice"
+    Identifier "Mouse0"
+    Driver "evdev"
+    Option "Device" "/dev/input/event1"
+    Option "CorePointer" "true"
+EndSection
+EOF
+            SRC="$prepared"
+        elif [ -n "$disp_card" ]; then
+            prepared="$(mktemp)" || exit 0
+            trap 'rm -f "$prepared"' EXIT HUP INT TERM
+            if awk -v ac="$amd_card" -v dc="$disp_card" '
+                /Identifier "RenderGPU"/ { in_r=1; in_v=0 }
+                /Identifier "VirtualDisplay"/ { in_v=1; in_r=0 }
+                /EndSection/ { in_r=0; in_v=0 }
+                in_r && /Option "kmsdev"/ { sub(/\/dev\/dri\/card[0-9]+/, ac) }
+                in_v && /Option "kmsdev"/ { sub(/\/dev\/dri\/card[0-9]+/, dc) }
+                { print }
+            ' "$SRC" > "$prepared"; then
+                SRC="$prepared"
+            fi
+        fi
+    fi
+fi
 if { [ "$PROFILE" = native ] || [ "$PROFILE" = virgl ]; } && [ -x /bin/drm-pick.sh ]; then
     selected="$(/bin/drm-pick.sh --display 2>/dev/null || true)"
     case "$selected" in

@@ -59,7 +59,8 @@ static void fill_sin(struct sockaddr_in *out, uint32_t ip, uint16_t port) {
 
 static int inet_create(socket_t *sock, int protocol) {
     if (sock->type != SOCK_DGRAM && sock->type != SOCK_RAW && sock->type != SOCK_STREAM) return -93;
-    if (sock->type == SOCK_RAW && protocol != 0 && protocol != IPPROTO_ICMP) return -93;
+    if (sock->type == SOCK_RAW && protocol != 0 && protocol != IPPROTO_ICMP &&
+        protocol != IPPROTO_RAW) return -93;
     inet_sock_t *isk = kmalloc(sizeof(inet_sock_t));
     if (!isk) return -12;
     memset(isk, 0, sizeof(*isk));

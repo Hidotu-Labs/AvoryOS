@@ -207,6 +207,7 @@ struct sockaddr_ll {
 #define IPPROTO_UDP  17
 #define IPPROTO_IPV6 41
 #define IPPROTO_ICMPV6 58
+#define IPPROTO_RAW  255
 #define SOL_IPV6 41
 #define IPV6_V6ONLY 26
 

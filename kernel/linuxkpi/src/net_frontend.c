@@ -28,6 +28,7 @@ struct frontend_netdev {
   struct linuxkpi_native_net *native;
   bool used;
   bool active;
+  unsigned int rx_tap_users;
 };
 struct frontend_napi {
   struct napi_struct *napi;
@@ -40,6 +41,7 @@ struct frontend_napi {
 
 static struct frontend_netdev netdevs[FRONTEND_NETDEVS];
 static struct frontend_napi napis[FRONTEND_NAPI_SLOTS];
+/* Driver IRQ handlers can schedule NAPI or wake TX on this CPU. */
 static DEFINE_SPINLOCK(frontend_lock);
 static DEFINE_MUTEX(frontend_rtnl_lock);
 static unsigned int frontend_tx_active;
@@ -82,20 +84,22 @@ static struct frontend_napi *find_napi_locked(struct napi_struct *napi) {
 }
 
 static struct frontend_napi *frontend_napi_get(struct napi_struct *napi) {
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_napi *entry = find_napi_locked(napi);
   if (entry)
     __atomic_add_fetch(&entry->references, 1, __ATOMIC_RELAXED);
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   return entry;
 }
 
 static void frontend_napi_put(struct frontend_napi *entry) {
   if (!entry)
     return;
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   __atomic_sub_fetch(&entry->references, 1, __ATOMIC_RELEASE);
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
 }
 
 /* Imported drivers can enable features during PCI probe. Reconcile their
@@ -133,12 +137,13 @@ static void frontend_stop(void *context) {
   /* A driver may omit napi_disable in ndo_stop. Synchronize every registered
    * poll context before native unregister drains RX references. */
   for (unsigned i = 0; i < FRONTEND_NAPI_SLOTS; i++) {
-    spin_lock(&frontend_lock);
+    unsigned long irq_flags;
+    spin_lock_irqsave(&frontend_lock, irq_flags);
     struct frontend_napi *n = napis[i].used && !napis[i].removing &&
                               napis[i].dev == dev ? &napis[i] : NULL;
     if (n)
       __atomic_add_fetch(&n->references, 1, __ATOMIC_RELAXED);
-    spin_unlock(&frontend_lock);
+    spin_unlock_irqrestore(&frontend_lock, irq_flags);
     if (n)
       linuxkpi_native_napi_disable(n->native);
     frontend_napi_put(n);
@@ -212,10 +217,11 @@ static const struct linuxkpi_native_net_ops frontend_net_ops = {
 };
 
 bool linuxkpi_netdev_is_bound(struct net_device *dev) {
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_netdev *entry = find_netdev_locked(dev);
   bool bound = entry != NULL;
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   return bound;
 }
 
@@ -224,35 +230,38 @@ bool linuxkpi_netdev_is_bound(struct net_device *dev) {
 static int register_fault;
 
 void linuxkpi_netdev_fail_next_register(int err) {
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   register_fault = err;
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
 }
 
 unsigned linuxkpi_netdev_registered_count(void) {
   unsigned count = 0;
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   for (unsigned i = 0; i < FRONTEND_NETDEVS; i++)
     count += netdevs[i].used;
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   return count;
 }
 
 int register_netdev(struct net_device *dev) {
   if (!dev || !dev->dev_addr || dev->addr_len != ETH_ALEN)
     return -EINVAL;
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   int fault = register_fault;
   register_fault = 0;
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   if (fault) {
     pr_info("[KERNEL] LinuxKPI: injected register_netdev failure %d\n", fault);
     return fault;
   }
-  spin_lock(&frontend_lock);
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_netdev *entry = find_netdev_locked(dev);
   if (entry) {
-    spin_unlock(&frontend_lock);
+    spin_unlock_irqrestore(&frontend_lock, irq_flags);
     return -EEXIST;
   }
   for (unsigned i = 0; i < FRONTEND_NETDEVS; i++) {
@@ -264,7 +273,7 @@ int register_netdev(struct net_device *dev) {
       break;
     }
   }
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   if (!entry)
     return -ENOSPC;
 
@@ -275,9 +284,9 @@ int register_netdev(struct net_device *dev) {
   if (dev->netdev_ops && dev->netdev_ops->ndo_init) {
     int ret = dev->netdev_ops->ndo_init(dev);
     if (ret) {
-      spin_lock(&frontend_lock);
+      spin_lock_irqsave(&frontend_lock, irq_flags);
       memset(entry, 0, sizeof(*entry));
-      spin_unlock(&frontend_lock);
+      spin_unlock_irqrestore(&frontend_lock, irq_flags);
       return ret;
     }
   }
@@ -285,53 +294,56 @@ int register_netdev(struct net_device *dev) {
   if (ret) {
     if (dev->netdev_ops && dev->netdev_ops->ndo_uninit)
       dev->netdev_ops->ndo_uninit(dev);
-    spin_lock(&frontend_lock);
+    spin_lock_irqsave(&frontend_lock, irq_flags);
     memset(entry, 0, sizeof(*entry));
-    spin_unlock(&frontend_lock);
+    spin_unlock_irqrestore(&frontend_lock, irq_flags);
     return ret;
   }
-  spin_lock(&frontend_lock);
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   entry->active = true;
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   struct linuxkpi_native_net *native = linuxkpi_native_net_register(
       requested_name, dev->dev_addr, (unsigned short)dev->mtu,
       &frontend_net_ops, entry);
   if (!native) {
     if (dev->netdev_ops && dev->netdev_ops->ndo_uninit)
       dev->netdev_ops->ndo_uninit(dev);
-    spin_lock(&frontend_lock);
+    spin_lock_irqsave(&frontend_lock, irq_flags);
     memset(entry, 0, sizeof(*entry));
-    spin_unlock(&frontend_lock);
+    spin_unlock_irqrestore(&frontend_lock, irq_flags);
     return -ENODEV;
   }
-  spin_lock(&frontend_lock);
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   entry->native = native;
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   linuxkpi_native_net_get_name(native, dev->name);
   dev->dev.init_name = dev->name;
   return 0;
 }
 
 void unregister_netdev(struct net_device *dev) {
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_netdev *entry = find_netdev_locked(dev);
   struct linuxkpi_native_net *native = entry ? entry->native : NULL;
   if (entry)
     entry->active = false;
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   if (!entry)
     return;
+  while (__atomic_load_n(&entry->rx_tap_users, __ATOMIC_ACQUIRE))
+    msleep(1);
   if (linuxkpi_native_net_unregister(native) != 0) {
-    spin_lock(&frontend_lock);
+    spin_lock_irqsave(&frontend_lock, irq_flags);
     entry->active = true;
-    spin_unlock(&frontend_lock);
+    spin_unlock_irqrestore(&frontend_lock, irq_flags);
     return;
   }
   if (dev->netdev_ops && dev->netdev_ops->ndo_uninit)
     dev->netdev_ops->ndo_uninit(dev);
-  spin_lock(&frontend_lock);
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   memset(entry, 0, sizeof(*entry));
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
 }
 
 void netif_carrier_on(struct net_device *dev) {
@@ -348,12 +360,13 @@ void netif_tx_wake_queue(struct netdev_queue *queue) {
   if (!queue)
     return;
   clear_bit(__QUEUE_STATE_DRV_XOFF, &queue->state);
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_netdev *entry = find_netdev_locked(queue->dev);
   struct linuxkpi_native_net *native = entry ? entry->native : NULL;
   if (native)
     linuxkpi_native_net_tx_wake(native);
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
 }
 
 void linuxkpi_netdev_test_stats(struct net_device *dev,
@@ -361,29 +374,39 @@ void linuxkpi_netdev_test_stats(struct net_device *dev,
                                 unsigned long long *tx_packets,
                                 unsigned long long *rx_dropped,
                                 unsigned long long *tx_dropped) {
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_netdev *entry = find_netdev_locked(dev);
   if (entry)
     linuxkpi_native_net_stats(entry->native, rx_packets, tx_packets,
                               rx_dropped, tx_dropped);
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
 }
 
 void linuxkpi_netdev_test_set_rx_tap(struct net_device *dev,
                                      linuxkpi_test_rx_tap_fn tap,
                                      void *context) {
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_netdev *entry = find_netdev_locked(dev);
-  if (entry)
-    linuxkpi_native_net_set_rx_tap(entry->native, tap, context);
-  spin_unlock(&frontend_lock);
+  struct linuxkpi_native_net *native = entry ? entry->native : NULL;
+  if (native)
+    __atomic_add_fetch(&entry->rx_tap_users, 1, __ATOMIC_RELAXED);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
+  if (native) {
+    /* Changing the tap can wait for an RX worker. Keep the device pinned
+     * while allowing interrupts and the worker to make progress. */
+    linuxkpi_native_net_set_rx_tap(native, tap, context);
+    __atomic_sub_fetch(&entry->rx_tap_users, 1, __ATOMIC_RELEASE);
+  }
 }
 
 unsigned linuxkpi_netdev_test_references(struct net_device *dev) {
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_netdev *entry = find_netdev_locked(dev);
   unsigned references = entry ? linuxkpi_native_net_references(entry->native) : 0;
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   return references;
 }
 
@@ -392,11 +415,12 @@ int dev_queue_xmit(struct sk_buff *skb) {
     kfree_skb(skb);
     return -EINVAL;
   }
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_netdev *entry = find_netdev_locked(skb->dev);
   int ret = entry ? linuxkpi_native_net_transmit(
                         entry->native, skb->data, skb->len) : -ENODEV;
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   kfree_skb(skb);
   return ret;
 }
@@ -410,7 +434,6 @@ void netif_tx_stop_all_queues(struct net_device *dev) {
 
 static int frontend_poll(void *context, int budget) {
   struct frontend_napi *entry = context;
-  clear_bit(NAPI_STATE_MISSED, &entry->napi->state);
   return entry->napi->poll(entry->napi, budget);
 }
 
@@ -420,7 +443,8 @@ void netif_napi_add_weight_locked(struct net_device *dev,
                                   int weight) {
   if (!dev || !napi || !poll || weight <= 0)
     return;
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_napi *entry = find_napi_locked(napi);
   if (!entry) {
     for (unsigned i = 0; i < FRONTEND_NAPI_SLOTS; i++)
@@ -432,7 +456,7 @@ void netif_napi_add_weight_locked(struct net_device *dev,
       }
   }
   if (!entry) {
-    spin_unlock(&frontend_lock);
+    spin_unlock_irqrestore(&frontend_lock, irq_flags);
     return;
   }
   entry->napi = napi;
@@ -440,38 +464,39 @@ void netif_napi_add_weight_locked(struct net_device *dev,
   napi->dev = dev;
   napi->poll = poll;
   napi->weight = weight;
-  napi->state = 0;
+  napi->state = BIT(NAPI_STATE_DISABLE);
   INIT_LIST_HEAD(&napi->poll_list);
   INIT_LIST_HEAD(&napi->dev_list);
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   struct linuxkpi_native_napi *native = linuxkpi_native_napi_create(
       frontend_poll, entry, (unsigned)weight);
-  spin_lock(&frontend_lock);
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   bool attached = entry->used && entry->napi == napi && !entry->removing;
   if (attached)
     entry->native = native;
   if (!native)
     memset(entry, 0, sizeof(*entry));
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   if (native && !attached)
     linuxkpi_native_napi_destroy(native);
 }
 
 void __netif_napi_del_locked(struct napi_struct *napi) {
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_napi *entry = find_napi_locked(napi);
   if (entry)
     entry->removing = true;
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   while (entry && __atomic_load_n(&entry->references, __ATOMIC_ACQUIRE) != 0)
     __asm__ volatile("pause" ::: "memory");
   struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
   if (native)
     linuxkpi_native_napi_destroy(native);
   if (entry) {
-    spin_lock(&frontend_lock);
+    spin_lock_irqsave(&frontend_lock, irq_flags);
     memset(entry, 0, sizeof(*entry));
-    spin_unlock(&frontend_lock);
+    spin_unlock_irqrestore(&frontend_lock, irq_flags);
   }
   if (napi) {
     clear_bit(NAPI_STATE_SCHED, &napi->state);
@@ -481,60 +506,72 @@ void __netif_napi_del_locked(struct napi_struct *napi) {
 }
 
 bool napi_schedule_prep(struct napi_struct *napi) {
-  if (!napi || test_bit(NAPI_STATE_DISABLE, &napi->state))
+  if (!napi)
     return false;
-  if (test_and_set_bit(NAPI_STATE_SCHED, &napi->state)) {
-    struct frontend_napi *entry = frontend_napi_get(napi);
-    struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
-    if (native) {
-      set_bit(NAPI_STATE_MISSED, &napi->state);
-      linuxkpi_native_napi_schedule(native);
+  unsigned long irq_flags;
+  bool start = false;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
+  struct frontend_napi *entry = find_napi_locked(napi);
+  if (entry && entry->native && !test_bit(NAPI_STATE_DISABLE, &napi->state)) {
+    start = !test_and_set_bit(NAPI_STATE_SCHED, &napi->state);
+    if (!start) {
+      /* The first producer may still be masking its hardware IRQ before
+       * calling __napi_schedule(). Only an active poll needs a repoll. */
+      linuxkpi_native_napi_mark_missed(entry->native);
     }
-    frontend_napi_put(entry);
-    return false;
   }
-  return true;
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
+  return start;
 }
 
 static void frontend_napi_schedule(struct napi_struct *napi) {
-  struct frontend_napi *entry = frontend_napi_get(napi);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
+  struct frontend_napi *entry = find_napi_locked(napi);
   struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
-  if (!native || linuxkpi_native_napi_schedule(native) != 0)
+  if (!native || test_bit(NAPI_STATE_DISABLE, &napi->state) ||
+      linuxkpi_native_napi_schedule(native) != 0)
     clear_bit(NAPI_STATE_SCHED, &napi->state);
-  frontend_napi_put(entry);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
 }
 
 void __napi_schedule(struct napi_struct *napi) { frontend_napi_schedule(napi); }
 void __napi_schedule_irqoff(struct napi_struct *napi) { frontend_napi_schedule(napi); }
 
 bool napi_complete_done(struct napi_struct *napi, int work_done) {
-  struct frontend_napi *entry = frontend_napi_get(napi);
-  struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
-  bool complete = native &&
-      linuxkpi_native_napi_complete(native, work_done) != 0;
-  bool missed = test_and_clear_bit(NAPI_STATE_MISSED, &napi->state);
-  if (complete && !missed)
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
+  struct frontend_napi *entry = find_napi_locked(napi);
+  bool complete = entry && entry->native &&
+      !test_bit(NAPI_STATE_DISABLE, &napi->state) &&
+      linuxkpi_native_napi_complete(entry->native, work_done);
+  if (complete)
     clear_bit(NAPI_STATE_SCHED, &napi->state);
-  frontend_napi_put(entry);
-  return complete && !missed;
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
+  return complete;
 }
 
 void napi_enable(struct napi_struct *napi) {
   if (!napi)
     return;
-  struct frontend_napi *entry = frontend_napi_get(napi);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
+  struct frontend_napi *entry = find_napi_locked(napi);
   struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
   if (native) {
-    clear_bit(NAPI_STATE_DISABLE, &napi->state);
     linuxkpi_native_napi_enable(native);
+    clear_bit(NAPI_STATE_DISABLE, &napi->state);
   }
-  frontend_napi_put(entry);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
 }
 
 void napi_disable(struct napi_struct *napi) {
   if (!napi)
     return;
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   set_bit(NAPI_STATE_DISABLE, &napi->state);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   struct frontend_napi *entry = frontend_napi_get(napi);
   struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
   if (native)
@@ -556,10 +593,11 @@ int netif_receive_skb(struct sk_buff *skb) {
   if (!skb)
     return -EINVAL;
   struct net_device *dev = skb->dev;
-  spin_lock(&frontend_lock);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_netdev *entry = find_netdev_locked(dev);
   if (!entry) {
-    spin_unlock(&frontend_lock);
+    spin_unlock_irqrestore(&frontend_lock, irq_flags);
     kfree_skb(skb);
     return -ENODEV;
   }
@@ -567,13 +605,13 @@ int netif_receive_skb(struct sk_buff *skb) {
                                                    : skb->data;
   unsigned char *tail = skb_tail_pointer(skb);
   if (tail < mac) {
-    spin_unlock(&frontend_lock);
+    spin_unlock_irqrestore(&frontend_lock, irq_flags);
     kfree_skb(skb);
     return -EINVAL;
   }
   unsigned long frame_len = (unsigned long)(tail - mac);
   int ret = linuxkpi_native_net_rx(entry->native, mac, frame_len);
-  spin_unlock(&frontend_lock);
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
   kfree_skb(skb);
   return ret;
 }

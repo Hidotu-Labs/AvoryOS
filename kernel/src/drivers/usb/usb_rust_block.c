@@ -11,6 +11,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "arch/uaccess.h"
 #include "drivers/storage/block.h"
 #include "lib/string.h"
 #include "mm/heap.h"
@@ -57,10 +58,30 @@ static int usb_rust_block_read(struct block_device *dev, uint64_t lba,
   struct usb_rust_disk *d = disk_of(dev);
   if (!d || !buf || !usb_rust_range_ok(dev, lba, count))
     return -1;
-  if (!usb_rust_disk_enter(d, dev))
+  uint32_t ss = dev->sector_size ? dev->sector_size : 512;
+  uint64_t bytes = (uint64_t)count * ss;
+  if (bytes > 0xFFFFFFFFULL)
     return -1;
-  int ret = d->ops->read(d->ctx, lba, count, buf);
+
+  void *kbuf = buf;
+  bool bounce = is_user_ptr((uint64_t)buf);
+  if (bounce) {
+    kbuf = kmalloc((size_t)bytes);
+    if (!kbuf)
+      return -1;
+  }
+
+  if (!usb_rust_disk_enter(d, dev)) {
+    if (bounce)
+      kfree(kbuf);
+    return -1;
+  }
+  int ret = d->ops->read(d->ctx, lba, count, kbuf);
   usb_rust_disk_leave(d);
+  if (ret == 0 && bounce && copy_to_user(buf, kbuf, (size_t)bytes) != 0)
+    ret = -1;
+  if (bounce)
+    kfree(kbuf);
   if (ret == 0)
     block_stat_read(dev, count);
   return ret;
@@ -71,10 +92,31 @@ static int usb_rust_block_write(struct block_device *dev, uint64_t lba,
   struct usb_rust_disk *d = disk_of(dev);
   if (!d || d->read_only || !buf || !usb_rust_range_ok(dev, lba, count))
     return -1;
-  if (!usb_rust_disk_enter(d, dev))
+  uint32_t ss = dev->sector_size ? dev->sector_size : 512;
+  uint64_t bytes = (uint64_t)count * ss;
+  if (bytes > 0xFFFFFFFFULL)
     return -1;
-  int ret = d->ops->write(d->ctx, lba, count, buf);
+
+  const void *kbuf = buf;
+  void *alloc = NULL;
+  if (is_user_ptr((uint64_t)buf)) {
+    alloc = kmalloc((size_t)bytes);
+    if (!alloc)
+      return -1;
+    if (copy_from_user(alloc, buf, (size_t)bytes) != 0) {
+      kfree(alloc);
+      return -1;
+    }
+    kbuf = alloc;
+  }
+
+  if (!usb_rust_disk_enter(d, dev)) {
+    kfree(alloc);
+    return -1;
+  }
+  int ret = d->ops->write(d->ctx, lba, count, kbuf);
   usb_rust_disk_leave(d);
+  kfree(alloc);
   if (ret == 0)
     block_stat_write(dev, count);
   return ret;

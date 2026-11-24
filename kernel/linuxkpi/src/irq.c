@@ -16,9 +16,12 @@
  *     the threaded context). */
 
 #include <linux/delay.h>
+#include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/interrupt.h>
 #include <linux/irqdomain.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -370,41 +373,82 @@ void irq_update_affinity_hint(unsigned int irq, const struct cpumask *m) {
 
 /* ── IRQ domains (amdgpu_irq.c) ───────────────────────────────────────────
  *
- * AvoryOS has no irq_domain core; amdgpu creates one for its ACP interrupt
- * sources (disabled here) and maps hwirq -> virq.  Stock <linux/irqdomain.h>
- * provides irq_domain_add_linear()/irq_create_mapping() as inlines over the
- * externs implemented here.  No real domain is created: mapping falls back to
- * the hwirq number.  Real support is only needed if the ACP/domain path is
- * ever enabled (docs/linuxkpi-gaps.md P6 C2). */
+ * AvoryOS has no full irq_domain subsystem; drivers like amdgpu (cz_ih /
+ * cik_ih / iceland_ih / tonga_ih) still require irq_domain_create_linear() /
+ * __irq_domain_add() to return a non-NULL domain handle during early_init.
+ * Allocate a lightweight struct irq_domain bookkeeping object (without a
+ * revmap table) so domain creation, .map() callbacks, and removal succeed. */
+static struct irq_domain *kpi_irq_domain_alloc(struct fwnode_handle *fwnode,
+                                               irq_hw_number_t hwirq_max,
+                                               const struct irq_domain_ops *ops,
+                                               void *host_data) {
+  struct irq_domain *d = kzalloc(sizeof(*d), GFP_KERNEL);
+  if (!d)
+    return NULL;
+
+  INIT_LIST_HEAD(&d->link);
+  mutex_init(&d->mutex);
+  d->root = d;
+  d->fwnode = fwnode;
+  d->ops = ops;
+  d->host_data = host_data;
+  d->hwirq_max = hwirq_max;
+  return d;
+}
+
 struct irq_domain *__irq_domain_add(struct fwnode_handle *fwnode,
                                     unsigned int size,
                                     irq_hw_number_t hwirq_max, int direct_max,
                                     const struct irq_domain_ops *ops,
                                     void *host_data) {
-  (void)fwnode;
   (void)size;
-  (void)hwirq_max;
   (void)direct_max;
-  (void)ops;
-  (void)host_data;
-  return NULL;
+  return kpi_irq_domain_alloc(fwnode, hwirq_max, ops, host_data);
 }
 
-void irq_domain_remove(struct irq_domain *domain) { (void)domain; }
+void irq_domain_remove(struct irq_domain *domain) {
+  if (!domain)
+    return;
+  if (domain->exit)
+    domain->exit(domain);
+  kfree(domain);
+}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-/* Same unsupported-domain result as the old __irq_domain_add API. */
 struct irq_domain *irq_domain_instantiate(const struct irq_domain_info *info) {
-  (void)info;
-  return NULL;
+  struct irq_domain *d;
+
+  if (!info)
+    return ERR_PTR(-EINVAL);
+
+  d = kpi_irq_domain_alloc(info->fwnode, info->hwirq_max, info->ops,
+                           info->host_data);
+  if (!d)
+    return ERR_PTR(-ENOMEM);
+
+  d->name = info->name_suffix;
+  d->bus_token = info->bus_token;
+  d->dev = info->dev;
+  d->flags = info->domain_flags;
+  d->exit = info->exit;
+
+  if (info->init) {
+    int ret = info->init(d);
+    if (ret) {
+      kfree(d);
+      return ERR_PTR(ret);
+    }
+  }
+  return d;
 }
 #endif
 
 unsigned int irq_create_mapping_affinity(struct irq_domain *domain,
                                          irq_hw_number_t hwirq,
                                          const struct irq_affinity_desc *affinity) {
-  (void)domain;
   (void)affinity;
+  if (domain && domain->ops && domain->ops->map)
+    (void)domain->ops->map(domain, (unsigned int)hwirq, hwirq);
   return (unsigned int)hwirq;
 }
 

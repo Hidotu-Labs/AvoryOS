@@ -279,9 +279,40 @@ __attribute__((no_stack_protector)) struct cpu_info *cpu_get_bsp(void) {
   return &cpus[0];
 }
 
-static inline uint32_t get_initial_apic_id(void) {
-  uint32_t ebx;
-  __asm__ volatile("cpuid" : "=b"(ebx) : "a"(1) : "ecx", "edx");
+static inline uint32_t get_bsp_apic_id(void) {
+  uint64_t apic_base = rdmsr(0x1B);
+  if (apic_base & (1ULL << 11)) {
+    if (apic_base & (1ULL << 10))
+      return (uint32_t)rdmsr(0x802);
+    uint64_t phys = apic_base & 0xFFFFF000ULL;
+    if (phys == 0)
+      phys = acpi_get_lapic_base();
+    if (phys == 0)
+      phys = 0xFEE00000ULL;
+    volatile uint32_t *lapic_mmio =
+        (volatile uint32_t *)(phys + pmm_get_hhdm_offset());
+    return lapic_mmio[LAPIC_ID / 4] >> 24;
+  }
+
+  uint32_t max_leaf = 0, eax = 0, ebx = 0, ecx = 0, edx = 0;
+  __asm__ volatile("cpuid"
+                   : "=a"(max_leaf), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                   : "a"(0), "c"(0));
+  if (max_leaf >= 0x1F) {
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0x1F), "c"(0));
+    if ((ebx & 0xFFFFU) != 0)
+      return edx;
+  }
+  if (max_leaf >= 0x0B) {
+    __asm__ volatile("cpuid"
+                     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                     : "a"(0x0B), "c"(0));
+    if ((ebx & 0xFFFFU) != 0)
+      return edx;
+  }
+  __asm__ volatile("cpuid" : "=b"(ebx) : "a"(1), "c"(0) : "edx");
   return ebx >> 24;
 }
 
@@ -297,9 +328,10 @@ __attribute__((no_stack_protector)) void ap_main(struct cpu_info *bootstrap) {
   gdt_load_ap(bootstrap ? bootstrap->cpu_id : 0);
 
   /* S3 INIT/SIPI resets AP MSRs while the BSP's GS fast path remains
-   * published. Install this AP's base and restore MTRRs before logging or any
-   * GS-based lookup. */
+   * published. Install this AP's base and IDT before restoring MTRRs, logging,
+   * or touching LAPIC/x2APIC MSRs so early faults never triple-fault. */
   cpu_set_gs_base(bootstrap);
+  idt_load();
   cpu_restore_s3_mtrrs();
   klog_puts("AP IN MAIN!\n");
   DBG("[AP] entered long mode\n");
@@ -327,8 +359,7 @@ __attribute__((no_stack_protector)) void ap_main(struct cpu_info *bootstrap) {
   __atomic_store_n(&ap_shared_init_lock, 0, __ATOMIC_RELEASE);
   DBG("[AP] cpu %u: lapic ok\n", current->cpu_id);
 
-  // 3. Load the IDT for this core (reuse the BSP's already-built table)
-  idt_load();
+  // 3. Initialize FPU on this core
   fpu_init_cpu();
 
   // 3.5. Program this core's SYSCALL/SYSRET MSRs.  They are per-CPU: without
@@ -418,25 +449,25 @@ void cpu_init(void) {
   }
 
   // Copy APIC IDs from the ACPI module into our per-CPU array
-  const uint8_t *apic_ids = acpi_get_cpu_apic_ids();
-  uint32_t bsp_apic_id = get_initial_apic_id();
+  const uint32_t *apic_ids = acpi_get_cpu_apic_ids();
+  uint32_t bsp_apic_id = get_bsp_apic_id();
 
   // Step 2: Populate cpu_info for each discovered CPU
   // Place BSP at index 0, APs at 1..N
-  uint32_t bsp_index = 0;
+  bool bsp_found = false;
   uint32_t ap_index = 1;
 
   for (uint32_t i = 0; i < cpu_count; i++) {
-    uint8_t id = apic_ids[i];
+    uint32_t id = apic_ids[i];
 
-    if (id == bsp_apic_id) {
+    if (!bsp_found && id == bsp_apic_id) {
       cpus[0].cpu_id = 0;
       cpus[0].apic_id = id;
       cpus[0].status = CPU_STATUS_BSP;
       cpus[0].self = &cpus[0];
-      (void)bsp_index;
-    } else {
-      if (ap_index < cpu_count) {
+      bsp_found = true;
+    } else if (id != bsp_apic_id) {
+      if (ap_index < MAX_CPUS) {
         cpus[ap_index].cpu_id = ap_index;
         cpus[ap_index].apic_id = id;
         cpus[ap_index].status = CPU_STATUS_OFFLINE;
@@ -445,6 +476,17 @@ void cpu_init(void) {
       }
     }
   }
+
+  if (!bsp_found) {
+    console_puts(KLOG_CLR_YELLOW
+                 "[ WARN ]" KLOG_CLR_RESET
+                 " BSP APIC ID not found in MADT; forcing CPU 0 as BSP.\n");
+    cpus[0].cpu_id = 0;
+    cpus[0].apic_id = bsp_apic_id;
+    cpus[0].status = CPU_STATUS_BSP;
+    cpus[0].self = &cpus[0];
+  }
+  cpu_count = ap_index;
 
   // Register all discovered CPUs with NUMA subsystem
   for (uint32_t i = 0; i < cpu_count; i++) {
@@ -585,13 +627,21 @@ static bool ap_wait_all_online(uint32_t timeout_ms) {
   }
 }
 
+static inline bool cpu_is_ap_target(uint32_t i) {
+  return cpus[i].status != CPU_STATUS_BSP &&
+         cpus[i].apic_id != cpus[0].apic_id &&
+         cpus[i].stack_top != 0;
+}
+
 // Put an AP back into wait-for-SIPI state after a timed-out batch startup.
 static void ap_park(uint32_t apic_id) {
   lapic_write_icr(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_ASSERT);
   (void)ap_wait_icr_idle(1000);
   ap_delay_us(10000);
-  lapic_write_icr(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_DEASSERT);
-  (void)ap_wait_icr_idle(1000);
+  if (!lapic_is_x2apic()) {
+    lapic_write_icr(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_DEASSERT);
+    (void)ap_wait_icr_idle(1000);
+  }
 }
 
 void cpu_init_aps(void) {
@@ -657,7 +707,7 @@ void cpu_init_aps(void) {
 
     uint32_t record_count = 0;
     for (uint32_t i = 1; i < cpu_count; i++) {
-      if (cpus[i].status == CPU_STATUS_BSP || cpus[i].stack_top == 0)
+      if (!cpu_is_ap_target(i))
         continue;
       records[record_count++] = (struct trampoline_ap_record){
           .apic_id = cpus[i].apic_id,
@@ -676,7 +726,7 @@ void cpu_init_aps(void) {
     // INIT is asserted for every AP first. The one mandatory 10 ms wait then
     // covers the whole machine, rather than being repeated for each AP.
     for (uint32_t i = 1; i < cpu_count; i++) {
-      if (cpus[i].status == CPU_STATUS_BSP || cpus[i].stack_top == 0)
+      if (!cpu_is_ap_target(i))
         continue;
       DBG("[SMP] AP %u (APIC 0x%x): batched INIT assert\n", cpus[i].cpu_id,
           cpus[i].apic_id);
@@ -687,19 +737,23 @@ void cpu_init_aps(void) {
     }
     ap_delay_us(10000);
 
-    for (uint32_t i = 1; i < cpu_count; i++) {
-      if (cpus[i].status == CPU_STATUS_BSP || cpus[i].stack_top == 0)
-        continue;
-      lapic_write_icr(cpus[i].apic_id,
-                      LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_DEASSERT);
-      if (!ap_wait_icr_idle(1000))
-        DBG("[SMP] AP %u: INIT deassert delivery status stuck busy\n",
-            cpus[i].cpu_id);
+    // INIT Level De-assert is only valid in xAPIC mode; Intel SDM §12.12.9
+    // prohibits it in x2APIC mode.
+    if (!lapic_is_x2apic()) {
+      for (uint32_t i = 1; i < cpu_count; i++) {
+        if (!cpu_is_ap_target(i))
+          continue;
+        lapic_write_icr(cpus[i].apic_id,
+                        LAPIC_ICR_INIT | LAPIC_ICR_LEVEL | LAPIC_ICR_DEASSERT);
+        if (!ap_wait_icr_idle(1000))
+          DBG("[SMP] AP %u: INIT deassert delivery status stuck busy\n",
+              cpus[i].cpu_id);
+      }
+      ap_delay_us(200);
     }
-    ap_delay_us(200);
 
     for (uint32_t i = 1; i < cpu_count; i++) {
-      if (cpus[i].status == CPU_STATUS_BSP || cpus[i].stack_top == 0)
+      if (!cpu_is_ap_target(i))
         continue;
       lapic_write_icr(cpus[i].apic_id,
                       LAPIC_ICR_STARTUP | LAPIC_ICR_EDGE | vector);
@@ -710,7 +764,7 @@ void cpu_init_aps(void) {
     ap_delay_us(200);
 
     for (uint32_t i = 1; i < cpu_count; i++) {
-      if (cpus[i].status == CPU_STATUS_BSP || cpus[i].stack_top == 0)
+      if (!cpu_is_ap_target(i))
         continue;
       lapic_write_icr(cpus[i].apic_id,
                       LAPIC_ICR_STARTUP | LAPIC_ICR_EDGE | vector);
@@ -728,7 +782,8 @@ void cpu_init_aps(void) {
     uint32_t failed = 0;
 
     for (uint32_t i = 1; i < cpu_count; i++) {
-      if (cpus[i].status == CPU_STATUS_BSP)
+      if (cpus[i].status == CPU_STATUS_BSP ||
+          cpus[i].apic_id == cpus[0].apic_id)
         continue;
       if (ap_is_online(&cpus[i])) {
         online++;

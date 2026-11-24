@@ -24,7 +24,7 @@ const SA_READ_CAPACITY16: u8 = 0x10;
 
 const INQUIRY_LEN: usize = 36;
 const SENSE_LEN: usize = 18;
-const MODE_SENSE_LEN: usize = 192;
+const MODE_SENSE_LEN: usize = 4;
 /// Mode page 0x3F: all pages, so the header carries the write-protect bit.
 const MODE_PAGE_ALL: u8 = 0x3F;
 const WRITE_PROTECT_BIT: u8 = 0x80;

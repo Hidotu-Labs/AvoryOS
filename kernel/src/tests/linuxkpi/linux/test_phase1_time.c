@@ -45,6 +45,74 @@ static bool test_timer_list(void) {
   return timer_fired == 1;
 }
 
+static unsigned long slow_timer_done, next_timer_ran;
+
+static void test_slow_timer_cb(struct timer_list *timer) {
+  (void)timer;
+  msleep(300);
+  WRITE_ONCE(slow_timer_done, jiffies);
+}
+
+static void test_next_timer_cb(struct timer_list *timer) {
+  (void)timer;
+  WRITE_ONCE(next_timer_ran, jiffies);
+}
+
+static bool test_timer_resample(void) {
+  struct timer_list slow, next;
+  WRITE_ONCE(slow_timer_done, 0);
+  WRITE_ONCE(next_timer_ran, 0);
+  timer_setup(&slow, test_slow_timer_cb, 0);
+  timer_setup(&next, test_next_timer_cb, 0);
+  unsigned long start = jiffies;
+  mod_timer(&next, start + 200);
+  mod_timer(&slow, start + 20);
+
+  for (int i = 0; i < 500 && !READ_ONCE(next_timer_ran); i++)
+    msleep(1);
+  del_timer_sync(&slow);
+  del_timer_sync(&next);
+  unsigned long finished = READ_ONCE(slow_timer_done);
+  unsigned long ran = READ_ONCE(next_timer_ran);
+  return finished && ran && ran - finished < 100;
+}
+
+static bool test_timer_inactive_mod(void) {
+  struct timer_list timer;
+  timer_setup(&timer, test_timer_cb, 0);
+  unsigned long expires = jiffies + 1000;
+
+  mod_timer(&timer, expires);
+  bool removed = del_timer(&timer) == 1;
+  bool modified = mod_timer_pending(&timer, expires) != 0;
+  bool rearmed = timer_pending(&timer);
+  del_timer_sync(&timer);
+  return removed && !modified && !rearmed;
+}
+
+static bool test_timer_shutdown(void) {
+  struct timer_list timer;
+  timer_setup(&timer, test_timer_cb, 0);
+  unsigned long expires = jiffies + 1000;
+
+  mod_timer(&timer, expires);
+  bool removed = timer_shutdown_sync(&timer) == 1;
+  mod_timer(&timer, expires);
+  add_timer(&timer);
+  bool rearmed = timer_pending(&timer);
+  del_timer_sync(&timer);
+  return removed && !rearmed;
+}
+
+static DEFINE_TIMER(static_timer, test_timer_cb);
+
+static bool test_static_timer(void) {
+  if (timer_pending(&static_timer))
+    return false;
+  mod_timer(&static_timer, jiffies + 1000);
+  return del_timer_sync(&static_timer) == 1;
+}
+
 /* ── hrtimer ────────────────────────────────────────────────────────────── */
 
 static volatile int hrtimer_fired;
@@ -67,6 +135,24 @@ static bool test_hrtimer(void) {
 
   hrtimer_cancel(&timer);
   return hrtimer_fired == 1;
+}
+
+static bool test_hrtimer_forward(void) {
+  struct hrtimer timer;
+  hrtimer_init(&timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+  timer.function = test_hrtimer_cb;
+  ktime_t expires = ktime_get() + ms_to_ktime(2000);
+  ktime_t interval = ms_to_ktime(10);
+  hrtimer_start(&timer, expires, HRTIMER_MODE_ABS);
+  u64 while_queued = hrtimer_forward(&timer, expires, interval);
+  bool unchanged = hrtimer_get_expires(&timer) == expires;
+  hrtimer_cancel(&timer);
+
+  hrtimer_set_expires(&timer, expires);
+  u64 early = hrtimer_forward(&timer, expires - interval, interval);
+  u64 elapsed = hrtimer_forward(&timer, expires + interval, interval);
+  return !while_queued && unchanged && !early && elapsed == 2 &&
+         hrtimer_get_expires(&timer) == expires + 2 * interval;
 }
 
 /* ── completion across a kernel thread ──────────────────────────────────── */
@@ -295,6 +381,89 @@ static bool test_workqueue(void) {
   return delayed_ran == 1;
 }
 
+static bool test_delayed_work_ownership(void) {
+  struct delayed_work dwork;
+  struct workqueue_struct *a = alloc_ordered_workqueue("kpi-delay-a", 0);
+  struct workqueue_struct *b = alloc_ordered_workqueue("kpi-delay-b", 0);
+  bool correct = false;
+
+  if (a && b) {
+    INIT_DELAYED_WORK(&dwork, test_delayed_fn);
+    delayed_ran = 0;
+    bool first = queue_delayed_work(a, &dwork, msecs_to_jiffies(30000));
+    bool timer_pending = delayed_work_pending(&dwork);
+    bool duplicate = queue_delayed_work(b, &dwork, msecs_to_jiffies(30000));
+    bool kept_owner = dwork.work.wq == a;
+    bool modified = mod_delayed_work(b, &dwork, 0);
+    flush_delayed_work(&dwork);
+    correct = first && timer_pending && !duplicate && kept_owner &&
+              modified && delayed_ran == 1 && !delayed_work_pending(&dwork);
+    cancel_delayed_work_sync(&dwork);
+  }
+  if (b)
+    destroy_workqueue(b);
+  if (a)
+    destroy_workqueue(a);
+  return correct;
+}
+
+static bool test_delayed_work_cancel(void) {
+  struct delayed_work dwork;
+  INIT_DELAYED_WORK(&dwork, test_delayed_fn);
+  delayed_ran = 0;
+
+  bool was_pending = mod_delayed_work(system_wq, &dwork, msecs_to_jiffies(30000));
+  bool armed = delayed_work_pending(&dwork);
+  bool cancelled = cancel_delayed_work_sync(&dwork);
+  bool idle = !delayed_work_pending(&dwork) && !timer_pending(&dwork.timer);
+  bool reusable = queue_delayed_work(system_wq, &dwork, 0);
+  flush_work(&dwork.work);
+  return !was_pending && armed && cancelled && idle && reusable && delayed_ran == 1;
+}
+
+static struct completion first_work_entered, release_first_work;
+static atomic_t cross_queue_runs;
+
+static void test_cross_queue_fn(struct work_struct *work) {
+  (void)work;
+  if (atomic_inc_return(&cross_queue_runs) == 1) {
+    complete(&first_work_entered);
+    wait_for_completion(&release_first_work);
+  }
+}
+
+static bool test_workqueue_cross_queue(void) {
+  struct work_struct work, marker;
+  struct workqueue_struct *a = alloc_ordered_workqueue("kpi-test-a", 0);
+  struct workqueue_struct *b = alloc_ordered_workqueue("kpi-test-b", 0);
+  bool serialized = false;
+
+  if (a && b) {
+    init_completion(&first_work_entered);
+    init_completion(&release_first_work);
+    atomic_set(&cross_queue_runs, 0);
+    INIT_WORK(&work, test_cross_queue_fn);
+    INIT_WORK(&marker, test_work_fn);
+    if (queue_work(a, &work) &&
+        wait_for_completion_timeout(&first_work_entered, msecs_to_jiffies(2000)) &&
+        queue_work(b, &work) && queue_work(b, &marker)) {
+      /* B is ordered. If the second call actually ran there, it must
+       * finish before the marker, while A's first invocation is held. */
+      flush_work(&marker);
+      serialized = atomic_read(&cross_queue_runs) == 1;
+    }
+    complete(&release_first_work);
+    flush_workqueue(a);
+    flush_workqueue(b);
+    serialized = serialized && atomic_read(&cross_queue_runs) == 2;
+  }
+  if (b)
+    destroy_workqueue(b);
+  if (a)
+    destroy_workqueue(a);
+  return serialized;
+}
+
 /* ── RCU ────────────────────────────────────────────────────────────────── */
 
 static volatile int rcu_fired;
@@ -400,12 +569,20 @@ void linuxkpi_test_phase1_time(void) {
   } tests[] = {
       {"jiffies/msleep", test_jiffies},
       {"timer_list", test_timer_list},
+      {"timer sleep resampled after callback", test_timer_resample},
+      {"inactive timer modification", test_timer_inactive_mod},
+      {"timer shutdown blocks rearm", test_timer_shutdown},
+      {"static timer lifecycle", test_static_timer},
       {"hrtimer", test_hrtimer},
+      {"hrtimer forward preserves queued expiry", test_hrtimer_forward},
       {"completion", test_completion},
       {"completion credits", test_completion_credits},
       {"wait_event", test_wait_event},
       {"mutex", test_mutex},
       {"workqueue", test_workqueue},
+      {"delayed work ownership", test_delayed_work_ownership},
+      {"delayed work cancellation", test_delayed_work_cancel},
+      {"cross-queue work serialization", test_workqueue_cross_queue},
       {"rcu", test_rcu},
       {"rcu lifetime", test_rcu_lifetime},
   };

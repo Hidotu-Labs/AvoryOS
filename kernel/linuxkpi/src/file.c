@@ -608,9 +608,13 @@ unsigned int linuxkpi_file_write(void *node, unsigned int offset,
   (void)offset;
   if (!file || !file->f_op || !file->f_op->write)
     return 0;
+  if (asc_vfs_node_nonblocking(node))
+    file->f_flags |= O_NONBLOCK;
+  else
+    file->f_flags &= ~O_NONBLOCK;
   ret = file->f_op->write(file, (const char __user *)buffer, size,
                           &file->f_pos);
-  return ret < 0 ? 0 : (unsigned int)ret;
+  return (unsigned int)ret;
 }
 
 /* ── mmap bridge ────────────────────────────────────────────────────────── */

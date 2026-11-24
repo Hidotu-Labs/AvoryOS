@@ -20,8 +20,10 @@
 #include <linux/ioport.h>
 #include <linux/jump_label.h>
 #include <linux/kernel.h>
+#include <linux/list.h>
 #include <linux/llist.h>
 #include <linux/math64.h>
+#include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/sprintf.h>
@@ -220,24 +222,39 @@ __attribute__((weak)) bool llist_add_batch(struct llist_node *new_first,
 
 /* ── backlight / hwmon (P6 C2) ────────────────────────────────────────────
  *
- * amdgpu registers a backlight (non-ACPI path) and an hwmon device.  Neither
- * subsystem is implemented: the backlight register fails with -ENODEV so DM's
- * backlight setup is skipped, and hwmon registration fails the same way
- * (amdgpu_pm tolerates a missing device).  Recorded in the gap log. */
+ * amdgpu_dm requires a registered backlight_device handle so it restores
+ * panel brightness after eDP modesets (otherwise amdgpu_dm_atomic_commit_tail
+ * skips amdgpu_dm_backlight_set_level and leaves laptop eDP panels dark).
+ * Provide a lightweight in-memory backlight_device without sysfs UI.
+ * hwmon registration still returns -ENODEV (amdgpu_pm tolerates a missing
+ * hwmon device). */
 
 struct backlight_device *
 backlight_device_register(const char *name, struct device *dev, void *devdata,
                           const struct backlight_ops *ops,
                           const struct backlight_properties *props) {
-  (void)name;
-  (void)dev;
-  (void)devdata;
-  (void)ops;
-  (void)props;
-  return ERR_PTR(-ENODEV);
+  struct backlight_device *bd;
+
+  bd = kzalloc(sizeof(*bd), GFP_KERNEL);
+  if (!bd)
+    return ERR_PTR(-ENOMEM);
+
+  if (props)
+    bd->props = *props;
+  mutex_init(&bd->update_lock);
+  mutex_init(&bd->ops_lock);
+  INIT_LIST_HEAD(&bd->entry);
+  bd->ops = ops;
+  bd->dev.parent = dev;
+  bd->dev.init_name = name;
+  dev_set_drvdata(&bd->dev, devdata);
+  return bd;
 }
 
-void backlight_device_unregister(struct backlight_device *bd) { (void)bd; }
+void backlight_device_unregister(struct backlight_device *bd) {
+  if (bd && !IS_ERR(bd))
+    kfree(bd);
+}
 
 struct device *hwmon_device_register_with_groups(
     struct device *dev, const char *name, void *drvdata,

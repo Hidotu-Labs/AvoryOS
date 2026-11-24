@@ -9,6 +9,7 @@
 #include "fs/mount_namespace.h"
 #include "console/klog.h"
 #include "apic/lapic_timer.h"
+#include "apic/lapic.h"
 #include "drivers/storage/block.h"
 #include "drivers/gpu/drm/drm.h"
 #include "drivers/gpu/virtio_gpu/virtio_gpu.h"
@@ -230,6 +231,13 @@ static uint32_t procfs_zram_read(vfs_node_t *node, uint32_t offset, uint32_t siz
     if (z.enabled) len += snprintf(buf + len, sizeof(buf) - len,
       "/dev/zram0\t\tpartition\t%llu\t\t%llu\t\t100\n",
       (unsigned long long)(z.capacity_pages * 4), (unsigned long long)(z.stored_pages * 4));
+    char dname[32];
+    uint64_t dtotal = 0, dused = 0;
+    if (zram_get_disk_swap(dname, sizeof(dname), &dtotal, &dused)) {
+      len += snprintf(buf + len, sizeof(buf) - len,
+        "/dev/%s\t\tpartition\t%llu\t\t%llu\t\t-2\n",
+        dname, (unsigned long long)dtotal, (unsigned long long)dused);
+    }
   } else {
     len = snprintf(buf, sizeof(buf),
       "enabled %u\ncapacity_pages %llu\nstored_pages %llu\ncompressed_bytes %llu\n"
@@ -1111,6 +1119,12 @@ static uint32_t procfs_interrupts_read(vfs_node_t *node, uint32_t offset,
     if (vector < 48) {
       pos += snprintf(text + pos, capacity - (size_t)pos, "  IRQ %u\n",
                       vector - 32);
+    } else if (vector == LAPIC_TIMER_VECTOR) {
+      pos += snprintf(text + pos, capacity - (size_t)pos, "  LAPIC timer\n");
+    } else if (vector == IPI_VECTOR_RESCHEDULE) {
+      pos += snprintf(text + pos, capacity - (size_t)pos, "  reschedule IPI\n");
+    } else if (vector == IPI_VECTOR_TLB_SHOOTDOWN) {
+      pos += snprintf(text + pos, capacity - (size_t)pos, "  TLB shootdown IPI\n");
     } else {
       pos += snprintf(text + pos, capacity - (size_t)pos, "  vector %u\n",
                       vector);
@@ -1296,7 +1310,8 @@ uint32_t procfs_filesystems_read(vfs_node_t *node, uint32_t offset,
       "\text2\n"
       "\text3\n"
       "\text4\n"
-      "\tvfat\n";
+      "\tvfat\n"
+      "\texfat\n";
 
   uint32_t len = (uint32_t)strlen(fs);
   node->length = len;

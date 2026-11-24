@@ -232,8 +232,14 @@ static bool fixture_cycle(unsigned cycle, bool full) {
     linuxkpi_netdev_test_set_rx_tap(fixture.dev, r2_rx_tap, &fixture);
     fixture.rx_pending = 70;
     fixture.schedule_during_poll_once = 1;
-    bool scheduled = napi_schedule(&fixture.napi);
-    r2_check(scheduled, "NAPI schedules through deferred worker");
+    bool claimed = napi_schedule_prep(&fixture.napi);
+    bool duplicate = napi_schedule_prep(&fixture.napi);
+    r2_check(claimed && !duplicate, "only the first IRQ claims NAPI");
+    /* A hardware IRQ handler can mask the source between prep and enqueue. */
+    msleep(30);
+    r2_check(__atomic_load_n(&fixture.poll_calls, __ATOMIC_ACQUIRE) == 0,
+             "second IRQ cannot enqueue a poll before the first does");
+    __napi_schedule(&fixture.napi);
     bool polled = wait_at_least(&fixture.poll_calls, 3);
     unsigned long long rx = wait_rx(fixture.dev, 70);
     r2_check(polled && rx == 70, "budgeted NAPI delivers 70 linear frames");
@@ -265,6 +271,13 @@ static bool fixture_cycle(unsigned cycle, bool full) {
     netif_wake_queue(fixture.dev);
     bool drained = wait_at_least(&fixture.tx_accepted, 129);
     r2_check(drained, "queue wake drains retained TX frames");
+    unsigned long long tx_packets = 0;
+    for (unsigned int i = 0; i < 500 && tx_packets < 129; i++) {
+      linuxkpi_netdev_test_stats(fixture.dev, NULL, &tx_packets, NULL, NULL);
+      if (tx_packets < 129)
+        msleep(1);
+    }
+    r2_check(tx_packets == 129, "TX statistics count accepted frames once");
     r2_check(__atomic_load_n(&fixture.tx_bytes_match, __ATOMIC_ACQUIRE),
              "TX bytes preserved across BUSY retry and queueing");
 

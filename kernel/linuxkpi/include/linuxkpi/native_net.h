@@ -48,6 +48,7 @@ struct linuxkpi_native_napi *linuxkpi_native_napi_create(
     linuxkpi_native_poll_fn, void *context, unsigned weight);
 int linuxkpi_native_napi_enable(struct linuxkpi_native_napi *);
 int linuxkpi_native_napi_schedule(struct linuxkpi_native_napi *);
+void linuxkpi_native_napi_mark_missed(struct linuxkpi_native_napi *);
 int linuxkpi_native_napi_complete(struct linuxkpi_native_napi *, int work_done);
 void linuxkpi_native_napi_disable(struct linuxkpi_native_napi *);
 void linuxkpi_native_napi_destroy(struct linuxkpi_native_napi *);

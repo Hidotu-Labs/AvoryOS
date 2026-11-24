@@ -45,11 +45,16 @@ AvoryOS features a native, curses-inspired TTY installation wizard written in C 
 The installer can be launched in multiple ways:
 
 ### 1. From Limine Bootloader Menu
-Select the boot menu entry:
+Boot a self-contained image built with `make minimal-iso` or
+`make avoryos-dist.iso`, then select the boot menu entry:
 ```
 /Install AvoryOS (TTY Installer)
 ```
-This boots directly into the installer wizard.
+The live system runs from the ISO's embedded disk image, so an internal SATA
+disk with an existing AvoryOS installation can be selected as a target. The
+installer protects any disk that backs the running root filesystem. The
+`avoryos-x86_64.iso` development image uses a separate drive for its root
+filesystem.
 
 ### 2. At the Console Login Prompt
 At the `login:` prompt on `tty1`, type:

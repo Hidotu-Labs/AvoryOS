@@ -22,6 +22,9 @@
 static LIST_HEAD(timer_wheel);
 static LIST_HEAD(hrtimer_wheel);
 static DEFINE_SPINLOCK(timer_lock);
+/* Callbacks may free the containing object. The timer worker tracks an
+ * executing timer by address without accessing it after the callback. */
+static struct timer_list *running_timer;
 static struct wait_queue_head timer_wait;
 static struct wait_queue_head timer_done_wq;
 static struct kpi_service timer_svc;
@@ -31,7 +34,8 @@ static void timer_signal_change(void) {
 }
 
 int timer_pending(const struct timer_list *timer) {
-  return !list_empty(&timer->entry);
+  struct list_head *next = READ_ONCE(timer->entry.next);
+  return next && next != &timer->entry;
 }
 
 static void __timer_enqueue_locked(struct timer_list *timer) {
@@ -51,8 +55,11 @@ void add_timer(struct timer_list *timer) {
   unsigned long flags;
 
   spin_lock_irqsave(&timer_lock, flags);
-  if (!timer_pending(timer))
-    __timer_enqueue_locked(timer);
+  if (!timer->function || timer_pending(timer)) {
+    spin_unlock_irqrestore(&timer_lock, flags);
+    return;
+  }
+  __timer_enqueue_locked(timer);
   spin_unlock_irqrestore(&timer_lock, flags);
 
   timer_signal_change();
@@ -63,12 +70,17 @@ void add_timer_on(struct timer_list *timer, int cpu) {
   add_timer(timer);
 }
 
-int mod_timer(struct timer_list *timer, unsigned long expires) {
+static int timer_modify(struct timer_list *timer, unsigned long expires,
+                        bool pending_only) {
   unsigned long flags;
   int pending;
 
   spin_lock_irqsave(&timer_lock, flags);
   pending = timer_pending(timer);
+  if (!timer->function || (pending_only && !pending)) {
+    spin_unlock_irqrestore(&timer_lock, flags);
+    return 0;
+  }
   if (pending)
     list_del_init(&timer->entry);
   timer->expires = expires;
@@ -79,8 +91,12 @@ int mod_timer(struct timer_list *timer, unsigned long expires) {
   return pending;
 }
 
+int mod_timer(struct timer_list *timer, unsigned long expires) {
+  return timer_modify(timer, expires, false);
+}
+
 int mod_timer_pending(struct timer_list *timer, unsigned long expires) {
-  return mod_timer(timer, expires);
+  return timer_modify(timer, expires, true);
 }
 
 int del_timer(struct timer_list *timer) {
@@ -96,7 +112,7 @@ int del_timer(struct timer_list *timer) {
   return pending;
 }
 
-int del_timer_sync(struct timer_list *timer) {
+static int timer_delete_sync_common(struct timer_list *timer, bool shutdown) {
   unsigned long flags;
   int ret = 0;
   bool running;
@@ -106,7 +122,9 @@ int del_timer_sync(struct timer_list *timer) {
       list_del_init(&timer->entry);
       ret = 1;
     }
-    running = timer->running;
+    if (shutdown)
+      timer->function = NULL;
+    running = running_timer == timer;
     spin_unlock_irqrestore(&timer_lock, flags);
     if (running)
       msleep(1);
@@ -114,7 +132,25 @@ int del_timer_sync(struct timer_list *timer) {
   return ret;
 }
 
-int timer_shutdown_sync(struct timer_list *timer) { return del_timer_sync(timer); }
+int del_timer_sync(struct timer_list *timer) {
+  return timer_delete_sync_common(timer, false);
+}
+
+int timer_shutdown_sync(struct timer_list *timer) {
+  return timer_delete_sync_common(timer, true);
+}
+
+void linuxkpi_timer_wait_running(struct timer_list *timer) {
+  unsigned long flags;
+  bool running;
+  do {
+    spin_lock_irqsave(&timer_lock, flags);
+    running = running_timer == timer;
+    spin_unlock_irqrestore(&timer_lock, flags);
+    if (running)
+      msleep(1);
+  } while (running);
+}
 
 unsigned long round_jiffies(unsigned long j) { return j; }
 unsigned long round_jiffies_relative(unsigned long j) { return j; }
@@ -253,21 +289,20 @@ void hrtimer_set_expires_range_ns(struct hrtimer *timer, ktime_t time,
 }
 
 u64 hrtimer_forward(struct hrtimer *timer, ktime_t now, ktime_t interval) {
-  u64 orun = 1;
-
   if (interval <= 0)
     return 0;
 
-  if (now + interval >= timer->node.expires) {
-    ktime_t delta = now - timer->node.expires;
-    if (delta >= 0) {
-      u64 n = (u64)(delta / interval) + 1;
-      timer->node.expires += (ktime_t)(n * interval);
-      orun = n;
-    }
+  unsigned long flags;
+  u64 overruns = 0;
+  spin_lock_irqsave(&timer_lock, flags);
+  /* A concurrent start may already have put the timer back in the
+   * sorted wheel. Only advance an unqueued expiry. */
+  if (!timer->queued && now >= timer->node.expires) {
+    overruns = (u64)((now - timer->node.expires) / interval) + 1;
+    timer->node.expires += (ktime_t)(overruns * interval);
   }
-
-  return orun;
+  spin_unlock_irqrestore(&timer_lock, flags);
+  return overruns;
 }
 
 /* ── the timer thread ───────────────────────────────────────────────────── */
@@ -283,7 +318,6 @@ static int timer_kthread(void *arg) {
 
     linuxkpi_jiffies_sync();
 
-    unsigned int gen = kpi_service_gen(&timer_svc);
     unsigned long now = jiffies;
     ktime_t now_ns = ktime_get();
 
@@ -307,24 +341,6 @@ static int timer_kthread(void *arg) {
       list_move_tail(&h->node.node, &expired_hrtimers);
     }
 
-    unsigned long wait_ms = 0;
-    if (!list_empty(&timer_wheel)) {
-      struct timer_list *t =
-          list_first_entry(&timer_wheel, struct timer_list, entry);
-      wait_ms = time_after(t->expires, now) ? t->expires - now : 1;
-    }
-    if (!list_empty(&hrtimer_wheel)) {
-      struct hrtimer *h =
-          list_first_entry(&hrtimer_wheel, struct hrtimer, node.node);
-      if (h->node.expires > now_ns) {
-        u64 delta_ns = (u64)(h->node.expires - now_ns);
-        unsigned long ms = (unsigned long)((delta_ns + 999999ULL) / 1000000ULL);
-        if (!wait_ms || ms < wait_ms)
-          wait_ms = ms;
-      } else {
-        wait_ms = 1;
-      }
-    }
     spin_unlock_irqrestore(&timer_lock, flags);
 
     for (;;) {
@@ -337,11 +353,12 @@ static int timer_kthread(void *arg) {
           list_first_entry(&expired_timers, struct timer_list, entry);
       list_del_init(&t->entry);
 
-      __atomic_store_n(&t->running, 1, __ATOMIC_RELEASE);
+      void (*callback)(struct timer_list *) = t->function;
+      running_timer = t;
       spin_unlock_irqrestore(&timer_lock, flags);
-      t->function(t);
+      callback(t);
       spin_lock_irqsave(&timer_lock, flags);
-      __atomic_store_n(&t->running, 0, __ATOMIC_RELEASE);
+      running_timer = NULL;
       spin_unlock_irqrestore(&timer_lock, flags);
       __kpi_wake_up(&timer_done_wq, 0, 0);
     }
@@ -364,8 +381,6 @@ static int timer_kthread(void *arg) {
 
       if (restart == HRTIMER_RESTART) {
         ktime_t when = h->node.expires;
-        bool requeue = false;
-
         if (h->cancel_pending) {
           /* hrtimer_cancel() ran in atomic context while this callback was
            * in flight; do not restart. */
@@ -377,16 +392,45 @@ static int timer_kthread(void *arg) {
           h->node.expires = when;
           __hrtimer_enqueue_locked(h);
           h->queued = 1;
-          requeue = true;
         }
-        if (requeue)
-          timer_signal_change();
       }
 
       __atomic_store_n(&h->running, 0, __ATOMIC_RELEASE);
       spin_unlock_irqrestore(&timer_lock, flags);
       __kpi_wake_up(&timer_done_wq, 0, 0);
     }
+
+    /* Callbacks can take longer than the next timer's original remaining
+     * delay. Sample the queues and clock again before deciding to sleep. */
+    linuxkpi_jiffies_sync();
+    spin_lock_irqsave(&timer_lock, flags);
+    unsigned int gen = kpi_service_gen(&timer_svc);
+    now = jiffies;
+    now_ns = ktime_get();
+    unsigned long wait_ms = 0;
+    bool ready = false;
+    if (!list_empty(&timer_wheel)) {
+      struct timer_list *t =
+          list_first_entry(&timer_wheel, struct timer_list, entry);
+      ready = !time_after(t->expires, now);
+      if (!ready)
+        wait_ms = t->expires - now;
+    }
+    if (!list_empty(&hrtimer_wheel)) {
+      struct hrtimer *h =
+          list_first_entry(&hrtimer_wheel, struct hrtimer, node.node);
+      if (h->node.expires <= now_ns) {
+        ready = true;
+      } else {
+        u64 delta_ns = (u64)(h->node.expires - now_ns);
+        unsigned long ms = (unsigned long)((delta_ns - 1) / 1000000ULL + 1);
+        if (!wait_ms || ms < wait_ms)
+          wait_ms = ms;
+      }
+    }
+    spin_unlock_irqrestore(&timer_lock, flags);
+    if (ready)
+      continue;
 
     if (wait_ms == 0) {
       /* Nothing queued: idle out and let the next mod_timer() respawn us. */

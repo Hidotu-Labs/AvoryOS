@@ -54,13 +54,13 @@
 #define RCR_ACCEPT_BROADCAST (1u << 3)
 #define RCR_WRAP (1u << 7)
 #define RCR_MAX_DMA (7u << 8)
-#define RCR_RBLEN_32K (2u << 11)
+#define RCR_RBLEN_64K (3u << 11)
 #define RCR_NO_THRESHOLD (7u << 13)
 #define TCR_MAX_DMA (7u << 8)
 #define TCR_IFG96 (3u << 24)
 
-#define RX_RING_SIZE 32768u
-#define RX_PAGES 10u
+#define RX_RING_SIZE 65536u
+#define RX_PAGES 18u
 #define TX_PAGES 2u
 #define TX_COUNT 4u
 #define TX_BUFFER_SIZE 2048u
@@ -81,8 +81,8 @@ static bool pm_suspended;
 static bool pm_was_running;
 static bool pm_saved_bus_master;
 static volatile uint32_t pm_activity;
-#define SERVICE_INTERVAL_MS 100u
-#define RX_POLL_BUDGET 16u
+#define SERVICE_INTERVAL_MS 20u
+#define RX_POLL_BUDGET 64u
 
 static bool rtl8139_service(bool poll_rx);
 static bool rtl8139_service_inner(bool poll_rx);
@@ -302,6 +302,7 @@ static bool rtl8139_service_inner(bool poll_rx) {
   int loop_limit = 32;
   bool more_rx = false;
   bool rx_seen = false;
+  bool overflow_seen = false;
   while (loop_limit-- > 0) {
     uint16_t status = inw(io + RTL_ISR);
     if (!status || status == 0xffff || !(status & INT_KNOWN))
@@ -311,8 +312,10 @@ static bool rtl8139_service_inner(bool poll_rx) {
     if (status & INT_RX_MASK) {
       rx_seen = true;
     }
-    if (status & INT_RX_OVERFLOW)
+    if (status & INT_RX_OVERFLOW) {
       dev->stats.rx_overflows++;
+      overflow_seen = true;
+    }
     if (status & INT_RX_ERROR) {
       dev->stats.rx_errors++;
       spinlock_acquire(&rx_lock);
@@ -328,10 +331,16 @@ static bool rtl8139_service_inner(bool poll_rx) {
   /* Ring state is authoritative even if the RX cause was lost. */
   bool ring_nonempty = rx_ring_nonempty(io);
   if (rx_seen || ring_nonempty) {
-    unsigned rounds = poll_rx ? 1 : (4096u / RX_POLL_BUDGET);
+    unsigned rounds = (poll_rx && !overflow_seen) ? 1 : (4096u / RX_POLL_BUDGET);
     do {
       more_rx = drain_rx();
     } while (more_rx && --rounds);
+    if (overflow_seen && more_rx) {
+      spinlock_acquire(&rx_lock);
+      recover_rx_overflow();
+      spinlock_release(&rx_lock);
+      more_rx = false;
+    }
   }
   spinlock_acquire(&tx_lock);
   reclaim_tx_locked();
@@ -374,7 +383,7 @@ bool rtl8139_phase3_init(void) {
   rx_offset = 0;
   outl(io + RTL_RCR, RCR_ACCEPT_PHYSICAL | RCR_ACCEPT_MULTICAST |
                          RCR_ACCEPT_BROADCAST | RCR_WRAP |
-                         RCR_RBLEN_32K |
+                         RCR_RBLEN_64K |
                          RCR_MAX_DMA | RCR_NO_THRESHOLD);
   outw(io + RTL_CAPR, rtl8139_capr(rx_offset));
   outw(io + RTL_ISR, 0xffff);
@@ -464,7 +473,7 @@ int rtl8139_pm_resume(void) {
            (uint32_t)(uint64_t)rtl8139_tx_phys() + i * TX_BUFFER_SIZE);
     outl(io + RTL_TCR, TCR_IFG96 | TCR_MAX_DMA);
     outl(io + RTL_RCR, RCR_ACCEPT_PHYSICAL | RCR_ACCEPT_MULTICAST |
-                           RCR_ACCEPT_BROADCAST | RCR_WRAP | RCR_RBLEN_32K |
+                           RCR_ACCEPT_BROADCAST | RCR_WRAP | RCR_RBLEN_64K |
                            RCR_MAX_DMA | RCR_NO_THRESHOLD);
     memset(tx_busy, 0, sizeof(tx_busy));
     tx_next = 0;

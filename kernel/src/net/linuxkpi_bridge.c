@@ -152,7 +152,7 @@ bool lkpi_napi_schedule(struct lkpi_napi *napi) {
   }
   if (napi->scheduled) {
     spinlock_release(&napi->lock);
-    return false;
+    return true;
   }
   napi->scheduled = true;
   bool queued = net_deferred_work_schedule(&napi->work);
@@ -166,7 +166,8 @@ bool lkpi_napi_complete_done(struct lkpi_napi *napi, int work_done) {
   if (!napi)
     return false;
   spinlock_acquire(&napi->lock);
-  bool complete = napi->running && napi->enabled && work_done >= 0 &&
+  bool complete = napi->running && napi->enabled && !napi->missed &&
+                  work_done >= 0 &&
                   (unsigned)work_done < napi->weight;
   if (complete)
     napi->completed = true;
@@ -224,6 +225,7 @@ static bool bridge_tx_work(struct net_deferred_work *work) {
     return false;
   }
   struct lkpi_skb *skb = tx_queue_pop_locked(bridge);
+  size_t length = skb->len;
   bridge->tx_inflight = true;
   uint64_t wake_generation = bridge->tx_wake_generation;
   spinlock_release(&bridge->tx_lock);
@@ -246,7 +248,10 @@ static bool bridge_tx_work(struct net_deferred_work *work) {
   }
   bool more = opened && bridge->tx_head != NULL;
   spinlock_release(&bridge->tx_lock);
-  if (result != LKPI_TX_ACCEPTED) {
+  if (result == LKPI_TX_ACCEPTED) {
+    __atomic_add_fetch(&bridge->native.stats.tx_packets, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&bridge->native.stats.tx_bytes, length, __ATOMIC_RELAXED);
+  } else {
     __atomic_add_fetch(&bridge->native.stats.tx_errors, 1, __ATOMIC_RELAXED);
     lkpi_kfree_skb(skb);
   }
@@ -404,22 +409,6 @@ void lkpi_net_bridge_tx_wake(struct lkpi_net_bridge *bridge) {
     net_deferred_work_schedule(&bridge->tx_work);
 }
 
-bool lkpi_net_bridge_receive(struct lkpi_net_bridge *bridge,
-                             struct lkpi_skb *skb) {
-  if (!bridge || !skb) {
-    lkpi_kfree_skb(skb);
-    return false;
-  }
-  const uint8_t *frame = skb->mac_header ? skb->mac_header : skb->data;
-  size_t length = (size_t)(skb->tail - frame);
-  bool open = __atomic_load_n(&bridge->opened, __ATOMIC_ACQUIRE);
-  bool accepted = open && net_rx_submit_irq(&bridge->native, frame, length);
-  if (!accepted)
-    __atomic_add_fetch(&bridge->native.stats.rx_dropped, 1, __ATOMIC_RELAXED);
-  lkpi_kfree_skb(skb);
-  return accepted;
-}
-
 bool lkpi_net_bridge_add_napi(struct lkpi_net_bridge *bridge,
                               struct lkpi_napi *napi) {
   if (!bridge || !napi ||
@@ -536,16 +525,14 @@ int linuxkpi_native_net_rx(struct linuxkpi_native_net *net, const void *data,
                            unsigned long length) {
   if (!net || !data || !length || length > NET_FRAME_MAX)
     return -1;
-  struct lkpi_skb *skb = lkpi_alloc_skb((size_t)length, 0);
-  if (!skb)
-    return -12;
-  void *dst = lkpi_skb_put(skb, (size_t)length);
-  if (!dst) {
-    lkpi_kfree_skb(skb);
-    return -12;
-  }
-  memcpy(dst, data, (size_t)length);
-  return lkpi_net_bridge_receive(&net->bridge, skb) ? 0 : -1;
+  struct lkpi_net_bridge *bridge = &net->bridge;
+  /* The receive queue copies the frame before returning. The caller still
+   * owns its skb here, so no intermediate allocation or copy is needed. */
+  if (__atomic_load_n(&bridge->opened, __ATOMIC_ACQUIRE) &&
+      net_rx_submit_irq(&bridge->native, data, length))
+    return 0;
+  __atomic_add_fetch(&bridge->native.stats.rx_dropped, 1, __ATOMIC_RELAXED);
+  return -1;
 }
 
 int linuxkpi_native_net_transmit(struct linuxkpi_native_net *net,
@@ -634,6 +621,16 @@ int linuxkpi_native_napi_enable(struct linuxkpi_native_napi *native) {
 
 int linuxkpi_native_napi_schedule(struct linuxkpi_native_napi *native) {
   return native && lkpi_napi_schedule(&native->napi) ? 0 : -1;
+}
+
+void linuxkpi_native_napi_mark_missed(struct linuxkpi_native_napi *native) {
+  if (!native)
+    return;
+  struct lkpi_napi *napi = &native->napi;
+  spinlock_acquire(&napi->lock);
+  if (napi->running && napi->enabled)
+    napi->missed = true;
+  spinlock_release(&napi->lock);
 }
 
 int linuxkpi_native_napi_complete(struct linuxkpi_native_napi *native,

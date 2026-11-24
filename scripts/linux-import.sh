@@ -127,8 +127,7 @@ if [ "$TAG" = "$DEFAULT_TAG" ] && [ "$COMMIT" != "$DEFAULT_COMMIT" ]; then
     die "baseline tag resolved to $COMMIT, expected $DEFAULT_COMMIT"
 fi
 log "commit: $COMMIT"
-if [ "$TAG" = v6.18.42 ]; then
-    [ "$COMMIT" = 856a9b51680cbbed1ace1207b29e424a616cff48 ] || die "6.18.42 source pin mismatch"
+if [[ "$TAG" == v6.18.* ]]; then
     NOUVEAU_SERIES=1
 fi
 

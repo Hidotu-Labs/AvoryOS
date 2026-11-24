@@ -57,6 +57,7 @@ static uint32_t block_vfs_rw(struct vfs_node *node, uint64_t offset,
 
   uint8_t *bounce = NULL;
   uint32_t done = 0;
+  int err_code = 0;
   while (done < size) {
     uint64_t pos = offset + done;
     uint64_t sector = pos / ss;
@@ -67,28 +68,40 @@ static uint32_t block_vfs_rw(struct vfs_node *node, uint64_t offset,
       uint32_t count = left / ss;
       int err = write ? dev->write_sectors(dev, sector, count, buffer + done)
                       : dev->read_sectors(dev, sector, count, buffer + done);
-      if (err)
+      if (err) {
+        err_code = -5; // -EIO
         break;
+      }
       done += count * ss;
       continue;
     }
 
-    if (!bounce && !(bounce = kmalloc(ss)))
+    if (!bounce && !(bounce = kmalloc(ss))) {
+      err_code = -12; // -ENOMEM
       break;
+    }
     uint32_t chunk = ss - in < left ? ss - in : left;
-    if (dev->read_sectors(dev, sector, 1, bounce))
+    if (dev->read_sectors(dev, sector, 1, bounce)) {
+      err_code = -5; // -EIO
       break;
+    }
     if (write) {
-      if (block_copy_in(bounce + in, buffer + done, chunk) ||
-          dev->write_sectors(dev, sector, 1, bounce))
+      if (block_copy_in(bounce + in, buffer + done, chunk)) {
+        err_code = -14; // -EFAULT
         break;
+      }
+      if (dev->write_sectors(dev, sector, 1, bounce)) {
+        err_code = -5; // -EIO
+        break;
+      }
     } else if (block_copy_out(buffer + done, bounce + in, chunk)) {
+      err_code = -14; // -EFAULT
       break;
     }
     done += chunk;
   }
   kfree(bounce);
-  return done;
+  return done > 0 ? done : (uint32_t)err_code;
 }
 
 static uint32_t block_vfs_read(struct vfs_node *node, uint32_t offset,
@@ -436,8 +449,7 @@ bool block_is_partition(const struct block_device *dev) {
 }
 
 /* Partition `pno` of `disk`, referenced, or NULL. */
-static struct block_device *block_find_partition(struct block_device *disk,
-                                                 int pno) {
+struct block_device *block_find_partition(struct block_device *disk, int pno) {
   struct block_device *found = NULL;
   spinlock_acquire(&block_table_lock);
   for (int i = 0; i < num_devices && !found; i++) {

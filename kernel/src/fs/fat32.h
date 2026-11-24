@@ -131,9 +131,12 @@ typedef struct {
   uint32_t fat_start_sector;    // First sector of FAT
   uint32_t fat_size_sectors;    // Size of one FAT in sectors
   uint32_t data_start_sector;   // First sector of data area
-  uint32_t root_cluster;        // Root directory cluster
+  uint32_t root_cluster;        // Root directory cluster (FAT32) or 0 (FAT12/16)
+  uint32_t root_dir_start;      // First sector of fixed root directory (FAT12/16)
+  uint32_t root_dir_sectors;    // Number of sectors in fixed root directory
   uint32_t total_clusters;      // Total data clusters
   uint32_t cluster_count;       // Number of clusters
+  uint8_t fat_type;             // 12, 16, or 32
   vfs_node_t *root_node;        // VFS node for root directory
   /* One for the mount plus one per node made by fat32_make_vfs_node() and
    * not yet released.  The last fat32_mount_put() frees the state.  While

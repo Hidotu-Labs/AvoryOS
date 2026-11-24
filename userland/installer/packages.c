@@ -22,7 +22,7 @@ static const char *const base_pkgs[] = {
     "file", "nano", "htop", "fastfetch", "pciutils", "curl", "dosfstools", "mtools", "limine",
     "ca-certificates", "openssl", "tzdata", "dbus", "seatd", "polkit",
     "systemd", "accountsservice", "networkmanager", "wpa_supplicant",
-    "pacman", "archlinux-keyring", "python",
+    "pacman", "archlinux-keyring", "libarchive", "python",
     "alsa-lib", "alsa-plugins", "pipewire", "pipewire-pulse",
     "pipewire-alsa", "wireplumber",
     "gcc", "binutils", "make", "pkgconf",
@@ -33,7 +33,7 @@ static const char *const base_pkgs[] = {
 static const char *const xorg_pkgs[] = {
     "xorg-server", "xorg-xinit", "xorg-xauth", "xorg-xrandr",
     "xorg-setxkbmap", "xorg-xkbcomp", "xkeyboard-config",
-    "xf86-input-libinput", "xf86-input-evdev", "mesa", "libdrm",
+    "xf86-input-libinput", "xf86-input-evdev", "mesa", "mesa-utils", "vulkan-radeon", "libdrm",
     "xorg-fonts-misc", "ttf-dejavu", "noto-fonts", "xdg-utils",
     "xdg-user-dirs", "sddm",
     NULL
@@ -54,7 +54,7 @@ static const char *const xfce_pkgs[] = {
     NULL
 };
 
-static const char *const icewm_pkgs[] = {"icewm", "alacritty", NULL};
+static const char *const icewm_pkgs[] = {"icewm", "alacritty", "xterm", NULL};
 
 /* Top-level trees scanned for files no package owns. */
 static const char *const walk_roots[] = {
@@ -634,6 +634,7 @@ int pkgsel_copy(const pkgsel_t *sel, install_progress_fn cb, void *ctx,
             rc = copy_tree(&cc, rel);
         }
         if (rc == 0) rc = copy_tree(&cc, "var/lib/pacman/sync");
+        if (rc == 0) rc = copy_tree(&cc, "var/lib/axon/sync");
     }
 
     for (int i = 0; rc == 0 && walk_roots[i]; i++) {
