@@ -86,7 +86,9 @@ endif
 #                             lost wakeup, so the periodic lines were noise.  Long
 #                             parks are still listed inside a real hang report.
 #   make LOCKDIAG_SELFTEST=1  render one full report at boot on a healthy machine
-ifeq ($(LOCKDIAG),0)
+ifeq ($(LOCKDIAG),1)
+override CPPFLAGS += -DLOCKDIAG=1
+else ifeq ($(LOCKDIAG),0)
 override CPPFLAGS += -DLOCKDIAG=0
 endif
 
@@ -330,6 +332,7 @@ ifneq ($(linux-obj-y),)
     endif
     ifeq ($(KPI_NOUVEAU),1)
     obj-$(ARCH)/linux/drivers/gpu/drm/nouveau/nouveau_sched.c.o: override LINUX_CPPFLAGS += -Ddma_fence_wait_timeout=linuxkpi_nouveau_bind_wait_timeout
+    obj-$(ARCH)/linux/drivers/gpu/drm/nouveau/nouveau_fence.c.o: override LINUX_CPPFLAGS += -Dnouveau_fence_wait=linuxkpi_original_nouveau_fence_wait
     obj-$(ARCH)/linux/drivers/gpu/drm/nouveau/nvkm/engine/device/pci.c.o: override LINUX_CPPFLAGS += -Dnvkm_device_pci_new=linuxkpi_original_nvkm_device_pci_new
     obj-$(ARCH)/linuxkpi/src/nouveau_probe_unwind.c.o: override LINUX_CPPFLAGS += -DAVORYOS_NOUVEAU_COMPAT -Ilinux/drivers/gpu/drm/nouveau/include/nvkm -Ilinux/drivers/gpu/drm/nouveau/include
     obj-$(ARCH)/src/tests/linuxkpi/linux/test_nouveau_firmware_failures.c.o: override LINUX_CPPFLAGS += -DAVORYOS_NOUVEAU_COMPAT -Ilinux/drivers/gpu/drm/nouveau/include/nvkm -Ilinux/drivers/gpu/drm/nouveau/include -Ilinux/drivers/gpu/drm/nouveau/nvkm/subdev/gsp

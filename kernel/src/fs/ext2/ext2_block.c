@@ -753,6 +753,15 @@ int ext2_read_inode(ext2_mount_t *mnt, uint32_t inode_num,
   if (inode_num == 0)
     return -1;
 
+  uint32_t slot = inode_num & (EXT2_ICACHE_SLOTS - 1);
+  spinlock_acquire(&mnt->icache_lock);
+  if (mnt->icache[slot].valid && mnt->icache[slot].inode_num == inode_num) {
+    memcpy(out, &mnt->icache[slot].inode, sizeof(ext2_inode_t));
+    spinlock_release(&mnt->icache_lock);
+    return 0;
+  }
+  spinlock_release(&mnt->icache_lock);
+
   uint32_t group  = (inode_num - 1) / mnt->inodes_per_group;
   uint32_t index  = (inode_num - 1) % mnt->inodes_per_group;
 
@@ -778,6 +787,12 @@ int ext2_read_inode(ext2_mount_t *mnt, uint32_t inode_num,
 
   memcpy(out, block_buf + offset_within_block, sizeof(ext2_inode_t));
   if (heap_used) kfree(block_buf);
+
+  spinlock_acquire(&mnt->icache_lock);
+  mnt->icache[slot].inode_num = inode_num;
+  mnt->icache[slot].valid = true;
+  memcpy(&mnt->icache[slot].inode, out, sizeof(ext2_inode_t));
+  spinlock_release(&mnt->icache_lock);
   return 0;
 }
 
@@ -812,6 +827,20 @@ static int ext2_write_inode_in_transaction(ext2_mount_t *mnt, uint32_t inode_num
   memcpy(block_buf + offset_within_block, inode, sizeof(ext2_inode_t));
   err = ext3_journal_block(mnt, inode_table_block + block_offset, block_buf);
   if (heap_used) kfree(block_buf);
+  if (err == 0) {
+    uint32_t slot = inode_num & (EXT2_ICACHE_SLOTS - 1);
+    spinlock_acquire(&mnt->icache_lock);
+    mnt->icache[slot].inode_num = inode_num;
+    mnt->icache[slot].valid = true;
+    memcpy(&mnt->icache[slot].inode, inode, sizeof(ext2_inode_t));
+    spinlock_release(&mnt->icache_lock);
+
+    uint32_t eslot = inode_num & (EXT4_ECACHE_SLOTS - 1);
+    spinlock_acquire(&mnt->ecache_lock);
+    if (mnt->ecache[eslot].valid && mnt->ecache[eslot].inode_num == inode_num)
+      mnt->ecache[eslot].valid = false;
+    spinlock_release(&mnt->ecache_lock);
+  }
   return err;
 }
 

@@ -6,6 +6,7 @@
 #include <linux/etherdevice.h>
 #include <linux/errno.h>
 #include <linux/gfp.h>
+#include <linux/hrtimer.h>
 #include <linux/netdevice.h>
 #include <linux/ethtool.h>
 #include <linux/rtnetlink.h>
@@ -16,6 +17,7 @@
 #include <linux/string.h>
 
 #include <linuxkpi/native_net.h>
+#include <linuxkpi/native_sched.h>
 #include <linuxkpi/frontend_net.h>
 
 extern void linuxkpi_guid_bytes(void *buffer, size_t len);
@@ -29,6 +31,7 @@ struct frontend_netdev {
   bool used;
   bool active;
   unsigned int rx_tap_users;
+  unsigned int rx_inflight;
 };
 struct frontend_napi {
   struct napi_struct *napi;
@@ -37,6 +40,14 @@ struct frontend_napi {
   bool used;
   bool removing;
   unsigned references;
+  void *poll_thread;
+  struct frontend_netdev *rx_batch_netdev;
+  struct linuxkpi_native_net *rx_batch_native;
+  struct sk_buff *rx_batch_skbs[LINUXKPI_NATIVE_RX_BATCH_MAX];
+  struct linuxkpi_native_rx_frame rx_batch_frames[LINUXKPI_NATIVE_RX_BATCH_MAX];
+  unsigned int rx_batch_count;
+  struct hrtimer defer_timer;
+  unsigned int defer_hard_irqs_count;
 };
 
 static struct frontend_netdev netdevs[FRONTEND_NETDEVS];
@@ -79,6 +90,17 @@ static struct frontend_netdev *find_netdev_locked(struct net_device *dev) {
 static struct frontend_napi *find_napi_locked(struct napi_struct *napi) {
   for (unsigned i = 0; i < FRONTEND_NAPI_SLOTS; i++)
     if (napis[i].used && !napis[i].removing && napis[i].napi == napi)
+      return &napis[i];
+  return NULL;
+}
+
+static struct frontend_napi *find_polling_napi_locked(struct net_device *dev,
+                                                      void *thread) {
+  if (!dev || !thread)
+    return NULL;
+  for (unsigned i = 0; i < FRONTEND_NAPI_SLOTS; i++)
+    if (napis[i].used && !napis[i].removing && napis[i].dev == dev &&
+        __atomic_load_n(&napis[i].poll_thread, __ATOMIC_ACQUIRE) == thread)
       return &napis[i];
   return NULL;
 }
@@ -331,7 +353,8 @@ void unregister_netdev(struct net_device *dev) {
   spin_unlock_irqrestore(&frontend_lock, irq_flags);
   if (!entry)
     return;
-  while (__atomic_load_n(&entry->rx_tap_users, __ATOMIC_ACQUIRE))
+  while (__atomic_load_n(&entry->rx_tap_users, __ATOMIC_ACQUIRE) ||
+         __atomic_load_n(&entry->rx_inflight, __ATOMIC_ACQUIRE))
     msleep(1);
   if (linuxkpi_native_net_unregister(native) != 0) {
     spin_lock_irqsave(&frontend_lock, irq_flags);
@@ -432,9 +455,47 @@ void netif_tx_stop_all_queues(struct net_device *dev) {
     set_bit(__QUEUE_STATE_DRV_XOFF, &dev->_tx[i].state);
 }
 
+static void frontend_napi_flush_rx(struct frontend_napi *entry) {
+  if (!entry || !entry->rx_batch_count)
+    return;
+  unsigned int count = entry->rx_batch_count;
+  struct frontend_netdev *netdev = entry->rx_batch_netdev;
+  struct linuxkpi_native_net *native = entry->rx_batch_native;
+  entry->rx_batch_count = 0;
+  entry->rx_batch_netdev = NULL;
+  entry->rx_batch_native = NULL;
+  if (native)
+    (void)linuxkpi_native_net_rx_batch(native, entry->rx_batch_frames, count);
+  for (unsigned int i = 0; i < count; i++) {
+    kfree_skb(entry->rx_batch_skbs[i]);
+    entry->rx_batch_skbs[i] = NULL;
+  }
+  if (netdev)
+    __atomic_sub_fetch(&netdev->rx_inflight, 1, __ATOMIC_RELEASE);
+}
+
+static enum hrtimer_restart frontend_napi_defer_cb(struct hrtimer *timer) {
+  struct frontend_napi *entry =
+      container_of(timer, struct frontend_napi, defer_timer);
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
+  if (entry->used && !entry->removing && entry->native && entry->napi &&
+      !test_bit(NAPI_STATE_DISABLE, &entry->napi->state)) {
+    if (linuxkpi_native_napi_schedule(entry->native) != 0)
+      clear_bit(NAPI_STATE_SCHED, &entry->napi->state);
+  }
+  spin_unlock_irqrestore(&frontend_lock, irq_flags);
+  return HRTIMER_NORESTART;
+}
+
 static int frontend_poll(void *context, int budget) {
   struct frontend_napi *entry = context;
-  return entry->napi->poll(entry->napi, budget);
+  __atomic_store_n(&entry->poll_thread, linuxkpi_current_thread(),
+                   __ATOMIC_RELEASE);
+  int work = entry->napi->poll(entry->napi, budget);
+  frontend_napi_flush_rx(entry);
+  __atomic_store_n(&entry->poll_thread, NULL, __ATOMIC_RELEASE);
+  return work;
 }
 
 void netif_napi_add_weight_locked(struct net_device *dev,
@@ -461,6 +522,9 @@ void netif_napi_add_weight_locked(struct net_device *dev,
   }
   entry->napi = napi;
   entry->dev = dev;
+  entry->defer_hard_irqs_count = 0;
+  hrtimer_init(&entry->defer_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+  entry->defer_timer.function = frontend_napi_defer_cb;
   napi->dev = dev;
   napi->poll = poll;
   napi->weight = weight;
@@ -490,6 +554,10 @@ void __netif_napi_del_locked(struct napi_struct *napi) {
   spin_unlock_irqrestore(&frontend_lock, irq_flags);
   while (entry && __atomic_load_n(&entry->references, __ATOMIC_ACQUIRE) != 0)
     __asm__ volatile("pause" ::: "memory");
+  if (entry) {
+    hrtimer_cancel(&entry->defer_timer);
+    entry->defer_hard_irqs_count = 0;
+  }
   struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
   if (native)
     linuxkpi_native_napi_destroy(native);
@@ -542,6 +610,25 @@ bool napi_complete_done(struct napi_struct *napi, int work_done) {
   unsigned long irq_flags;
   spin_lock_irqsave(&frontend_lock, irq_flags);
   struct frontend_napi *entry = find_napi_locked(napi);
+  unsigned int max_defer = (entry && entry->dev && entry->dev->gro_flush_timeout)
+                               ? entry->dev->napi_defer_hard_irqs : 0;
+  if (entry && entry->native && !test_bit(NAPI_STATE_DISABLE, &napi->state) &&
+      max_defer > 0) {
+    if (work_done > 0)
+      entry->defer_hard_irqs_count = max_defer;
+    if (entry->defer_hard_irqs_count > 0 &&
+        linuxkpi_native_napi_defer(entry->native, work_done)) {
+      entry->defer_hard_irqs_count--;
+      __atomic_add_fetch(&entry->references, 1, __ATOMIC_RELAXED);
+      spin_unlock_irqrestore(&frontend_lock, irq_flags);
+      hrtimer_start(&entry->defer_timer, ns_to_ktime(1000000ULL),
+                    HRTIMER_MODE_REL);
+      if (test_bit(NAPI_STATE_DISABLE, &napi->state))
+        hrtimer_cancel(&entry->defer_timer);
+      frontend_napi_put(entry);
+      return false;
+    }
+  }
   bool complete = entry && entry->native &&
       !test_bit(NAPI_STATE_DISABLE, &napi->state) &&
       linuxkpi_native_napi_complete(entry->native, work_done);
@@ -573,9 +660,15 @@ void napi_disable(struct napi_struct *napi) {
   set_bit(NAPI_STATE_DISABLE, &napi->state);
   spin_unlock_irqrestore(&frontend_lock, irq_flags);
   struct frontend_napi *entry = frontend_napi_get(napi);
+  if (entry) {
+    hrtimer_cancel(&entry->defer_timer);
+    entry->defer_hard_irqs_count = 0;
+  }
   struct linuxkpi_native_napi *native = entry ? entry->native : NULL;
   if (native)
     linuxkpi_native_napi_disable(native);
+  if (entry)
+    hrtimer_cancel(&entry->defer_timer);
   clear_bit(NAPI_STATE_SCHED, &napi->state);
   clear_bit(NAPI_STATE_MISSED, &napi->state);
   frontend_napi_put(entry);
@@ -593,25 +686,61 @@ int netif_receive_skb(struct sk_buff *skb) {
   if (!skb)
     return -EINVAL;
   struct net_device *dev = skb->dev;
-  unsigned long irq_flags;
-  spin_lock_irqsave(&frontend_lock, irq_flags);
-  struct frontend_netdev *entry = find_netdev_locked(dev);
-  if (!entry) {
-    spin_unlock_irqrestore(&frontend_lock, irq_flags);
-    kfree_skb(skb);
-    return -ENODEV;
-  }
   unsigned char *mac = skb_mac_header_was_set(skb) ? skb_mac_header(skb)
                                                    : skb->data;
   unsigned char *tail = skb_tail_pointer(skb);
   if (tail < mac) {
-    spin_unlock_irqrestore(&frontend_lock, irq_flags);
     kfree_skb(skb);
     return -EINVAL;
   }
   unsigned long frame_len = (unsigned long)(tail - mac);
-  int ret = linuxkpi_native_net_rx(entry->native, mac, frame_len);
+
+  void *self = linuxkpi_current_thread();
+  unsigned long irq_flags;
+  spin_lock_irqsave(&frontend_lock, irq_flags);
+  struct frontend_netdev *entry = find_netdev_locked(dev);
+  struct linuxkpi_native_net *native = entry ? entry->native : NULL;
+  if (!entry || !native) {
+    spin_unlock_irqrestore(&frontend_lock, irq_flags);
+    kfree_skb(skb);
+    return -ENODEV;
+  }
+  struct frontend_napi *napi_entry = find_polling_napi_locked(dev, self);
+  if (napi_entry) {
+    if (napi_entry->rx_batch_count == 0) {
+      napi_entry->rx_batch_netdev = entry;
+      napi_entry->rx_batch_native = native;
+      __atomic_add_fetch(&entry->rx_inflight, 1, __ATOMIC_ACQUIRE);
+    } else if (napi_entry->rx_batch_netdev != entry) {
+      spin_unlock_irqrestore(&frontend_lock, irq_flags);
+      frontend_napi_flush_rx(napi_entry);
+      spin_lock_irqsave(&frontend_lock, irq_flags);
+      entry = find_netdev_locked(dev);
+      native = entry ? entry->native : NULL;
+      if (!entry || !native) {
+        spin_unlock_irqrestore(&frontend_lock, irq_flags);
+        kfree_skb(skb);
+        return -ENODEV;
+      }
+      napi_entry->rx_batch_netdev = entry;
+      napi_entry->rx_batch_native = native;
+      __atomic_add_fetch(&entry->rx_inflight, 1, __ATOMIC_ACQUIRE);
+    }
+    unsigned int idx = napi_entry->rx_batch_count++;
+    napi_entry->rx_batch_skbs[idx] = skb;
+    napi_entry->rx_batch_frames[idx].data = mac;
+    napi_entry->rx_batch_frames[idx].length = frame_len;
+    bool full = napi_entry->rx_batch_count == LINUXKPI_NATIVE_RX_BATCH_MAX;
+    spin_unlock_irqrestore(&frontend_lock, irq_flags);
+    if (full)
+      frontend_napi_flush_rx(napi_entry);
+    return 0;
+  }
+  __atomic_add_fetch(&entry->rx_inflight, 1, __ATOMIC_ACQUIRE);
   spin_unlock_irqrestore(&frontend_lock, irq_flags);
+
+  int ret = linuxkpi_native_net_rx(native, mac, frame_len);
+  __atomic_sub_fetch(&entry->rx_inflight, 1, __ATOMIC_RELEASE);
   kfree_skb(skb);
   return ret;
 }
@@ -727,7 +856,7 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t priority, int flags,
     kfree(skb);
     return NULL;
   }
-  memset(skb->head, 0, total);
+  memset(skb->head + aligned, 0, sizeof(struct skb_shared_info));
   skb->data = skb->head;
   skb->tail = 0;
   skb->end = (sk_buff_data_t)aligned;

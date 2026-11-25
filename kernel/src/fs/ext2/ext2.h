@@ -261,6 +261,22 @@ typedef struct ext2_bc_entry {
   struct ext2_bc_entry *lru_prev, *lru_next;
 } ext2_bc_entry_t;
 #define EXT2_DIRTY_BGD_MAX 64
+#define EXT2_ICACHE_SLOTS 256
+#define EXT4_ECACHE_SLOTS 256
+
+typedef struct {
+  uint32_t inode_num;
+  bool valid;
+  ext2_inode_t inode;
+} ext2_icache_entry_t;
+
+typedef struct {
+  uint32_t inode_num;
+  uint32_t lblock;
+  uint32_t len;
+  uint64_t pblock;
+  bool valid;
+} ext4_ecache_entry_t;
 
 typedef struct ext2_mount {
   struct block_device *dev;
@@ -293,6 +309,10 @@ typedef struct ext2_mount {
     uint32_t writes_inflight;
   } bc_seq[EXT2_SEQ_BUCKETS];
   spinlock_t cache_lock;
+  ext2_icache_entry_t icache[EXT2_ICACHE_SLOTS];
+  spinlock_t icache_lock;
+  ext4_ecache_entry_t ecache[EXT4_ECACHE_SLOTS];
+  spinlock_t ecache_lock;
   ext2_inflight_write_t *inflight_writes;
   struct ext2_mount *next;
   /* Group-descriptor table and superblock counters are mutated in memory by

@@ -298,6 +298,7 @@ void pmm_zero_pool_stats(uint64_t *hits, uint64_t *misses,
  * corruption looks like, and zero the frame so the consumer still gets what it
  * asked for. Reading a frame that was filled with non-temporal stores costs a
  * DRAM round trip, which is why this samples instead of checking every pop. */
+#ifdef PMM_ZERO_POOL_VERIFY
 static void zero_pool_verify(void *page) {
   static uint32_t tick;
   static uint32_t reports;
@@ -321,6 +322,9 @@ static void zero_pool_verify(void *page) {
     return;
   }
 }
+#else
+static inline void zero_pool_verify(void *page) { (void)page; }
+#endif
 
 void *pmm_alloc_zeroed_page(void) {
   hal_irq_state_t flags = hal_irq_save();

@@ -137,7 +137,9 @@ uint32_t ext4_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_
     if (size > file_size - offset) size = file_size - offset;
 
     uint32_t bytes_read = 0;
-    uint8_t *block_buf = kmalloc(mnt->block_size);
+    uint8_t stack_buf[4096];
+    bool heap_used = (mnt->block_size > sizeof(stack_buf));
+    uint8_t *block_buf = heap_used ? kmalloc(mnt->block_size) : stack_buf;
     if (!block_buf) {
         static uint32_t alloc_errs;
         if (__atomic_add_fetch(&alloc_errs, 1, __ATOMIC_RELAXED) <= 8)
@@ -153,7 +155,7 @@ uint32_t ext4_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_
         uint32_t lblock = cur / mnt->block_size;
         uint32_t off_in = cur % mnt->block_size;
         uint32_t run_blocks = 1;
-        uint64_t disk_block = ext4_get_extent_run(mnt, &inode, lblock, &run_blocks);
+        uint64_t disk_block = ext4_get_extent_run_cached(mnt, &inode, node->inode, lblock, &run_blocks);
 
         if (disk_block == 0) {
             uint32_t hole_bytes = (run_blocks * mnt->block_size) - off_in;
@@ -233,7 +235,8 @@ uint32_t ext4_read_impl(vfs_node_t *node, uint32_t offset, uint32_t size, uint8_
         }
     }
 
-    kfree(block_buf);
+    if (heap_used)
+        kfree(block_buf);
     return bytes_read ? bytes_read : (error ? (uint32_t)-error : 0);
 }
 

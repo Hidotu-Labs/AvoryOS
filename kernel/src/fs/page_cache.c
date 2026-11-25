@@ -489,12 +489,35 @@ retry:
     }
   }
   void *frame = pmm_alloc_page();
-  if (!frame)
+  if (!frame) {
+    pmm_pcp_drain_all();
+    frame = pmm_alloc_page();
+  }
+  if (!frame) {
+    static uint32_t frame_oom_failures;
+    uint32_t count =
+        __atomic_add_fetch(&frame_oom_failures, 1, __ATOMIC_RELAXED);
+    if (vfs_should_log_failure(count)) {
+      klogf("[VFS] page fill OOM (frame) node='%s' off=%u free=%llu pcp=%llu\n",
+            node->name, offset,
+            (unsigned long long)pmm_get_free_pages(),
+            (unsigned long long)pmm_get_free_pages_including_pcp());
+    }
     return NULL;
+  }
 
   offset &= ~(PAGE_SIZE - 1);
   vfs_page_t *candidate = kmalloc(sizeof(*candidate));
   if (!candidate) {
+    static uint32_t meta_oom_failures;
+    uint32_t count =
+        __atomic_add_fetch(&meta_oom_failures, 1, __ATOMIC_RELAXED);
+    if (vfs_should_log_failure(count)) {
+      klogf("[VFS] page fill OOM (meta) node='%s' off=%u free=%llu pcp=%llu\n",
+            node->name, offset,
+            (unsigned long long)pmm_get_free_pages(),
+            (unsigned long long)pmm_get_free_pages_including_pcp());
+    }
     pmm_free_page(frame);
     return NULL;
   }
@@ -526,8 +549,18 @@ retry:
   if (!creator) {
     kfree(candidate);
     pmm_free_page(frame);
-    if (!page)
+    if (!page) {
+      static uint32_t tree_oom_failures;
+      uint32_t count =
+          __atomic_add_fetch(&tree_oom_failures, 1, __ATOMIC_RELAXED);
+      if (vfs_should_log_failure(count)) {
+        klogf("[VFS] page fill OOM (radix) node='%s' off=%u free=%llu pcp=%llu\n",
+              node->name, offset,
+              (unsigned long long)pmm_get_free_pages(),
+              (unsigned long long)pmm_get_free_pages_including_pcp());
+      }
       return NULL;
+    }
     uint64_t wait_start = lapic_timer_get_ms();
     while (1) {
       spinlock_acquire(&node->pages_lock);
@@ -761,8 +794,9 @@ static uint32_t vfs_cache_fill_pages(vfs_node_t *node, uint32_t offset,
 uint32_t vfs_cache_readahead(vfs_node_t *node, uint32_t offset, uint32_t max_bytes) {
   if (!node || !node->read || !max_bytes || offset >= node->length)
     return 0;
-  /* Leave the last 8 MiB for demand reads, page tables and writeback. */
-  if (pmm_get_free_pages_including_pcp() < 2048)
+  /* Leave the last 8 MiB in the buddy allocator for demand reads, page tables
+   * and writeback (ignore pages pinned in remote CPUs' PCPs). */
+  if (pmm_get_free_pages() < 2048)
     return 0;
   cache_touch(node);
 
@@ -1226,8 +1260,9 @@ uint32_t vfs_cache_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   uint32_t ra_window = 0;
   if ((node->flags & FS_TYPE_MASK) == FS_FILE && node->read) {
     spinlock_acquire(&node->pages_lock);
-    if (offset == node->ra_prev_offset) {
-      /* Sequential access detected: scale up readahead window */
+    if (offset == node->ra_prev_offset ||
+        (offset == 0 && node->length > PAGE_SIZE)) {
+      /* Sequential access (or cold read from offset 0): scale up readahead */
       node->ra_seq_hits++;
       if (node->ra_window == 0)
         node->ra_window = 16 * 1024; /* initial 16 KB (4 pages) */

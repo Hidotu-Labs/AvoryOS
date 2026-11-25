@@ -935,6 +935,10 @@ bool tlb_flush_deferred_drain(void) {
 static void do_shootdown(uint64_t addr, uint16_t pcid, uint64_t pml4_base,
                         uint64_t caller_ip) {
     uint32_t cpu_count = cpu_get_count();
+    if (cpu_count <= 1) {
+        local_flush_for(addr, pcid, pml4_base);
+        return;
+    }
     /* A caller with interrupts masked cannot wait for acknowledgements.  A
      * target that is itself in an interrupt-masked section (the page-fault
      * gate enters with IF=0 and its handler runs under it) cannot receive the

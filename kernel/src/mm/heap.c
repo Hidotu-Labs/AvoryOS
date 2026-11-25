@@ -52,7 +52,8 @@ void kfree(void *ptr) {
     return;
 
   void *caller = __builtin_return_address(0);
-  heap_trace_record(ptr, caller);
+  if (__builtin_expect(heap_slab_dbg_on, 0))
+    heap_trace_record(ptr, caller);
 
   if ((uint64_t)(uintptr_t)ptr >= HEAP_VMAP_BASE &&
       (uint64_t)(uintptr_t)ptr < HEAP_VMAP_END) {

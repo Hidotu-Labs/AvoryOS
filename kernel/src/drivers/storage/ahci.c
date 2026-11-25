@@ -6,6 +6,7 @@
 #include "console/console.h"
 #include "console/klog.h"
 #include "drivers/pci/pci.h"
+#include "drivers/pci/pci_irq.h"
 #include "drivers/storage/block.h"
 #include "lib/string.h"
 #include "lib/tsc.h"
@@ -14,6 +15,7 @@
 #include "mm/vmm.h"
 #include "sched/sched.h"
 #include "sched/wait.h"
+#include "smp/cpu.h"
 #include "drivers/manager/device.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -82,6 +84,9 @@ static ahci_hba_mem_t *hba;
 static struct ahci_drive ahci_drives[32];
 static int ahci_drive_count = 0;
 static bool ahci_irq_active = false;
+static struct pci_irq ahci_pci_irq;
+static volatile uint64_t ahci_irq_count = 0;
+static volatile uint32_t ahci_missed_irq_warned = 0;
 static uint16_t ahci_pm_saved_command;
 static bool ahci_pm_suspended;
 
@@ -277,6 +282,8 @@ static void ahci_irq_handler(struct registers *regs) {
   if (!hba_is)
     return;
 
+  __atomic_add_fetch(&ahci_irq_count, 1, __ATOMIC_RELAXED);
+
   for (int i = 0; i < 32; i++) {
     if (!(hba_is & (1u << i)))
       continue;
@@ -405,6 +412,7 @@ static int ahci_wait_slot(struct ahci_drive *drive, int slot,
   wait_queue_entry_t wqe = { .thread = self, .next = NULL };
   uint64_t deadline = lapic_timer_get_ms() + timeout_ms;
   int result = AHCI_WAIT_ERROR;
+  bool slept = false;
 
   /* Blocking is only safe with interrupts enabled.  A caller that already
    * holds a spinlock runs with IF=0, and sleeping there would stall delivery
@@ -432,6 +440,14 @@ static int ahci_wait_slot(struct ahci_drive *drive, int slot,
 
     /* CI polling also covers a missing/misrouted interrupt. */
     if (!(port->ci & bit)) {
+      if (slept && ahci_irq_active &&
+          __atomic_load_n(&ahci_irq_count, __ATOMIC_RELAXED) == 0 &&
+          __atomic_add_fetch(&ahci_missed_irq_warned, 1, __ATOMIC_RELAXED) ==
+              16) {
+        klogf("[WARN] AHCI: completion IRQ not arriving (mode=%u); using 1ms "
+              "polled fallback\n",
+              (unsigned)ahci_pci_irq.mode);
+      }
       bool err =
           (port->is & (AHCI_PXIS_TFES | AHCI_PXIS_HBDS | AHCI_PXIS_HBFS |
                        AHCI_PXIS_IFS | AHCI_PXIS_INFS | AHCI_PXIS_OFS)) ||
@@ -475,7 +491,8 @@ static int ahci_wait_slot(struct ahci_drive *drive, int slot,
       wait_queue_remove(&drive->slot_wq[slot], &wqe);
       continue;
     }
-    self->wakeup_ticks = lapic_timer_get_ticks() + 10;
+    slept = true;
+    self->wakeup_ticks = lapic_timer_get_ticks() + 1;
     sched_yield();
     self->wakeup_ticks = 0;
     self->state = THREAD_RUNNING;
@@ -932,11 +949,20 @@ static int ahci_probe(struct device *dev) {
     pci_config_write16(pci_dev->bus, pci_dev->slot, pci_dev->func, 0x04,
                        (uint16_t)((cmd | (1u << 2)) & ~(1u << 10)));
 
-    if (pci_dev->irq_line != 0 &&
-        irq_install_handler(pci_dev->irq_line, ahci_irq_handler, 0x000F)) {
+    struct cpu_info *bsp = cpu_get_bsp();
+    uint8_t dest_apic = bsp ? (uint8_t)bsp->apic_id : 0;
+    isr_t handler = ahci_irq_handler;
+    uint32_t irq_modes = PCI_IRQ_MODE_MSI;
+    if (pci_dev->irq_line != 0)
+      irq_modes |= PCI_IRQ_MODE_INTX;
+    if (pci_irq_request_modes(pci_dev, &ahci_pci_irq, &handler, 1, dest_apic,
+                              irq_modes)) {
       hba->is = hba->is;     /* clear stale port interrupt bits */
       hba->ghc |= (1u << 1); /* GHC.IE: enable HBA interrupts */
       ahci_irq_active = true;
+      klogf("[OK] AHCI: interrupts enabled (%s, vector=%u, line=%u)\n",
+            ahci_pci_irq.mode == PCI_IRQ_MSI ? "MSI" : "INTx",
+            (unsigned)ahci_pci_irq.vectors[0], (unsigned)pci_dev->irq_line);
     } else {
       console_puts(KLOG_CLR_YELLOW "[ WARN ]" KLOG_CLR_RESET
                    " AHCI: IRQ unavailable, using polled completion\n");

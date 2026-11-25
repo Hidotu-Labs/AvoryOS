@@ -91,6 +91,7 @@ static bool napi_deferred_run(struct net_deferred_work *work) {
   napi->scheduled = false;
   napi->running = true;
   napi->completed = false;
+  napi->deferred = false;
   napi->missed = false;
   lkpi_napi_poll_t poll = napi->poll;
   int budget = (int)napi->weight;
@@ -102,7 +103,8 @@ static bool napi_deferred_run(struct net_deferred_work *work) {
   napi->running = false;
   bool again = napi->enabled &&
       (napi->missed || work_done >= budget ||
-       (work_done < budget && !napi->completed && work_done > 0));
+       (work_done < budget && !napi->completed && !napi->deferred &&
+        work_done > 0));
   if (!napi->enabled) {
     napi->scheduled = false;
     napi->missed = false;
@@ -112,6 +114,7 @@ static bool napi_deferred_run(struct net_deferred_work *work) {
     napi->scheduled = false;
   }
   napi->completed = false;
+  napi->deferred = false;
   napi->missed = false;
   spinlock_release(&napi->lock);
   return again;
@@ -175,6 +178,19 @@ bool lkpi_napi_complete_done(struct lkpi_napi *napi, int work_done) {
   return complete;
 }
 
+bool lkpi_napi_defer(struct lkpi_napi *napi, int work_done) {
+  if (!napi)
+    return false;
+  spinlock_acquire(&napi->lock);
+  bool defer = napi->running && napi->enabled && !napi->missed &&
+               work_done >= 0 &&
+               (unsigned)work_done < napi->weight;
+  if (defer)
+    napi->deferred = true;
+  spinlock_release(&napi->lock);
+  return defer;
+}
+
 void lkpi_napi_disable(struct lkpi_napi *napi) {
   if (!napi)
     return;
@@ -217,43 +233,48 @@ static struct lkpi_skb *tx_queue_pop_locked(struct lkpi_net_bridge *bridge) {
 static bool bridge_tx_work(struct net_deferred_work *work) {
   struct lkpi_net_bridge *bridge = (struct lkpi_net_bridge *)((char *)work -
       offsetof(struct lkpi_net_bridge, tx_work));
-  spinlock_acquire(&bridge->tx_lock);
-  if (!__atomic_load_n(&bridge->opened, __ATOMIC_ACQUIRE) ||
-      bridge->tx_blocked || bridge->tx_inflight ||
-      !bridge->tx_head) {
+  bool more = false;
+  for (unsigned int sent = 0; sent < 32; sent++) {
+    spinlock_acquire(&bridge->tx_lock);
+    if (!__atomic_load_n(&bridge->opened, __ATOMIC_ACQUIRE) ||
+        bridge->tx_blocked || bridge->tx_inflight ||
+        !bridge->tx_head) {
+      spinlock_release(&bridge->tx_lock);
+      return false;
+    }
+    struct lkpi_skb *skb = tx_queue_pop_locked(bridge);
+    size_t length = skb->len;
+    bridge->tx_inflight = true;
+    uint64_t wake_generation = bridge->tx_wake_generation;
     spinlock_release(&bridge->tx_lock);
-    return false;
-  }
-  struct lkpi_skb *skb = tx_queue_pop_locked(bridge);
-  size_t length = skb->len;
-  bridge->tx_inflight = true;
-  uint64_t wake_generation = bridge->tx_wake_generation;
-  spinlock_release(&bridge->tx_lock);
 
-  enum lkpi_tx_result result = bridge->ops->transmit(bridge->context, skb);
+    enum lkpi_tx_result result = bridge->ops->transmit(bridge->context, skb);
 
-  spinlock_acquire(&bridge->tx_lock);
-  bridge->tx_inflight = false;
-  bool opened = __atomic_load_n(&bridge->opened, __ATOMIC_ACQUIRE);
-  if (result == LKPI_TX_BUSY && opened) {
-    skb->next = bridge->tx_head;
-    bridge->tx_head = skb;
-    if (!bridge->tx_tail)
-      bridge->tx_tail = skb;
-    bridge->tx_queued++;
-    bool woken = bridge->tx_wake_generation != wake_generation;
-    bridge->tx_blocked = !woken;
+    spinlock_acquire(&bridge->tx_lock);
+    bridge->tx_inflight = false;
+    bool opened = __atomic_load_n(&bridge->opened, __ATOMIC_ACQUIRE);
+    if (result == LKPI_TX_BUSY && opened) {
+      skb->next = bridge->tx_head;
+      bridge->tx_head = skb;
+      if (!bridge->tx_tail)
+        bridge->tx_tail = skb;
+      bridge->tx_queued++;
+      bool woken = bridge->tx_wake_generation != wake_generation;
+      bridge->tx_blocked = !woken;
+      spinlock_release(&bridge->tx_lock);
+      return woken;
+    }
+    more = opened && bridge->tx_head != NULL;
     spinlock_release(&bridge->tx_lock);
-    return woken;
-  }
-  bool more = opened && bridge->tx_head != NULL;
-  spinlock_release(&bridge->tx_lock);
-  if (result == LKPI_TX_ACCEPTED) {
-    __atomic_add_fetch(&bridge->native.stats.tx_packets, 1, __ATOMIC_RELAXED);
-    __atomic_add_fetch(&bridge->native.stats.tx_bytes, length, __ATOMIC_RELAXED);
-  } else {
-    __atomic_add_fetch(&bridge->native.stats.tx_errors, 1, __ATOMIC_RELAXED);
-    lkpi_kfree_skb(skb);
+    if (result == LKPI_TX_ACCEPTED) {
+      __atomic_add_fetch(&bridge->native.stats.tx_packets, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&bridge->native.stats.tx_bytes, length, __ATOMIC_RELAXED);
+    } else {
+      __atomic_add_fetch(&bridge->native.stats.tx_errors, 1, __ATOMIC_RELAXED);
+      lkpi_kfree_skb(skb);
+    }
+    if (!more)
+      return false;
   }
   return more;
 }
@@ -535,6 +556,41 @@ int linuxkpi_native_net_rx(struct linuxkpi_native_net *net, const void *data,
   return -1;
 }
 
+unsigned long linuxkpi_native_net_rx_batch(
+    struct linuxkpi_native_net *net,
+    const struct linuxkpi_native_rx_frame *frames, unsigned long count) {
+  if (!net || !frames || !count)
+    return 0;
+  struct lkpi_net_bridge *bridge = &net->bridge;
+  if (!__atomic_load_n(&bridge->opened, __ATOMIC_ACQUIRE)) {
+    __atomic_add_fetch(&bridge->native.stats.rx_dropped, count,
+                       __ATOMIC_RELAXED);
+    return 0;
+  }
+  unsigned long total_accepted = 0;
+  unsigned long offset = 0;
+  /* Match net/core.c's NET_RX_BATCH_MAX (64) per batch submission. */
+  while (offset < count) {
+    unsigned long chunk = count - offset;
+    if (chunk > LINUXKPI_NATIVE_RX_BATCH_MAX)
+      chunk = LINUXKPI_NATIVE_RX_BATCH_MAX;
+    struct net_rx_frame native_frames[LINUXKPI_NATIVE_RX_BATCH_MAX];
+    for (unsigned long i = 0; i < chunk; i++) {
+      native_frames[i].data = frames[offset + i].data;
+      native_frames[i].length = (size_t)frames[offset + i].length;
+    }
+    size_t accepted = net_rx_submit_batch_irq(&bridge->native, native_frames,
+                                              (size_t)chunk);
+    if (accepted < chunk) {
+      __atomic_add_fetch(&bridge->native.stats.rx_dropped,
+                         chunk - (unsigned long)accepted, __ATOMIC_RELAXED);
+    }
+    total_accepted += (unsigned long)accepted;
+    offset += chunk;
+  }
+  return total_accepted;
+}
+
 int linuxkpi_native_net_transmit(struct linuxkpi_native_net *net,
                                  const void *data, unsigned long length) {
   if (!net || !data || !length)
@@ -636,6 +692,11 @@ void linuxkpi_native_napi_mark_missed(struct linuxkpi_native_napi *native) {
 int linuxkpi_native_napi_complete(struct linuxkpi_native_napi *native,
                                   int work_done) {
   return native && lkpi_napi_complete_done(&native->napi, work_done);
+}
+
+int linuxkpi_native_napi_defer(struct linuxkpi_native_napi *native,
+                               int work_done) {
+  return native && lkpi_napi_defer(&native->napi, work_done);
 }
 
 void linuxkpi_native_napi_disable(struct linuxkpi_native_napi *native) {

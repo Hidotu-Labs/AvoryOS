@@ -25,6 +25,13 @@ typedef int (*linuxkpi_native_poll_fn)(void *, int budget);
 typedef void (*linuxkpi_native_rx_tap_fn)(void *, const void *,
                                           unsigned long length);
 
+#define LINUXKPI_NATIVE_RX_BATCH_MAX 64
+
+struct linuxkpi_native_rx_frame {
+  const void *data;
+  unsigned long length;
+};
+
 struct linuxkpi_native_net *linuxkpi_native_net_register(
     const char *name, const unsigned char mac[6], unsigned short mtu,
     const struct linuxkpi_native_net_ops *, void *context);
@@ -32,6 +39,9 @@ int linuxkpi_native_net_unregister(struct linuxkpi_native_net *);
 int linuxkpi_native_net_get_name(struct linuxkpi_native_net *, char out[16]);
 int linuxkpi_native_net_rx(struct linuxkpi_native_net *, const void *,
                            unsigned long length);
+unsigned long linuxkpi_native_net_rx_batch(
+    struct linuxkpi_native_net *, const struct linuxkpi_native_rx_frame *,
+    unsigned long count);
 int linuxkpi_native_net_transmit(struct linuxkpi_native_net *, const void *,
                                  unsigned long length);
 void linuxkpi_native_net_tx_wake(struct linuxkpi_native_net *);
@@ -50,6 +60,7 @@ int linuxkpi_native_napi_enable(struct linuxkpi_native_napi *);
 int linuxkpi_native_napi_schedule(struct linuxkpi_native_napi *);
 void linuxkpi_native_napi_mark_missed(struct linuxkpi_native_napi *);
 int linuxkpi_native_napi_complete(struct linuxkpi_native_napi *, int work_done);
+int linuxkpi_native_napi_defer(struct linuxkpi_native_napi *, int work_done);
 void linuxkpi_native_napi_disable(struct linuxkpi_native_napi *);
 void linuxkpi_native_napi_destroy(struct linuxkpi_native_napi *);
 

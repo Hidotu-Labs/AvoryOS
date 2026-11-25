@@ -35,6 +35,42 @@ extern int rust_ext4_lookup_extent_node(const uint8_t *node, size_t node_bytes,
                                         struct rust_ext4_extent_lookup *out);
 #endif
 
+uint64_t ext4_get_extent_run_cached(ext2_mount_t *mnt, ext2_inode_t *inode,
+                                    uint32_t inode_num, uint32_t logical_block,
+                                    uint32_t *out_run_len) {
+    if (!mnt || !inode || inode_num == 0)
+        return ext4_get_extent_run(mnt, inode, logical_block, out_run_len);
+
+    uint32_t slot = inode_num & (EXT4_ECACHE_SLOTS - 1);
+    spinlock_acquire(&mnt->ecache_lock);
+    ext4_ecache_entry_t e = mnt->ecache[slot];
+    spinlock_release(&mnt->ecache_lock);
+
+    if (e.valid && e.inode_num == inode_num &&
+        logical_block >= e.lblock && logical_block - e.lblock < e.len) {
+        uint32_t off = logical_block - e.lblock;
+        if (out_run_len)
+            *out_run_len = e.len - off;
+        return e.pblock ? (e.pblock + off) : 0;
+    }
+
+    uint32_t run_len = 1;
+    uint64_t pblock = ext4_get_extent_run(mnt, inode, logical_block, &run_len);
+    if (out_run_len)
+        *out_run_len = run_len;
+
+    if (run_len > 0) {
+        spinlock_acquire(&mnt->ecache_lock);
+        mnt->ecache[slot].inode_num = inode_num;
+        mnt->ecache[slot].lblock = logical_block;
+        mnt->ecache[slot].len = run_len;
+        mnt->ecache[slot].pblock = pblock;
+        mnt->ecache[slot].valid = true;
+        spinlock_release(&mnt->ecache_lock);
+    }
+    return pblock;
+}
+
 uint64_t ext4_get_extent_run(ext2_mount_t *mnt, ext2_inode_t *inode,
                              uint32_t logical_block, uint32_t *out_run_len) {
     if (out_run_len)

@@ -40,12 +40,14 @@ struct lkpi_napi {
   bool running;
   bool missed;
   bool completed;
+  bool deferred;
 };
 
 void lkpi_napi_init(struct lkpi_napi *, lkpi_napi_poll_t, void *, unsigned weight);
 void lkpi_napi_enable(struct lkpi_napi *);
 bool lkpi_napi_schedule(struct lkpi_napi *);
 bool lkpi_napi_complete_done(struct lkpi_napi *, int work_done);
+bool lkpi_napi_defer(struct lkpi_napi *, int work_done);
 void lkpi_napi_disable(struct lkpi_napi *);
 
 struct lkpi_net_bridge;

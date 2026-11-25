@@ -43,9 +43,11 @@
 
 // VMA structure - internally represents an AVL Interval Tree Node
 struct vma {
-  uint64_t start;   // Start virtual address (page-aligned)
-  uint64_t end;     // End virtual address (page-aligned, exclusive)
-  uint64_t max_end; // Subtree Tracking for Interval overlap queries
+  uint64_t start;     // Start virtual address (page-aligned)
+  uint64_t end;       // End virtual address (page-aligned, exclusive)
+  uint64_t min_start; // Subtree minimum start for O(log N) gap queries
+  uint64_t max_end;   // Subtree Tracking for Interval overlap queries
+  uint64_t max_gap;   // Maximum internal gap between adjacent VMAs in subtree
   uint64_t prot;    // Protection flags (PROT_READ, PROT_WRITE, PROT_EXEC)
   uint64_t flags;   // Mapping flags (MAP_SHARED, MAP_PRIVATE, MAP_ANONYMOUS)
   uint64_t offset;    // File offset (for file-backed mappings)
@@ -182,6 +184,10 @@ uint64_t vma_find_gap(struct vma_list *list, uint64_t length,
 // Dynamically condense adjacent matching boundary limits sequentially into
 // monolithic mappings natively.
 void vma_merge_adjacent(struct vma_list *list);
+
+// Merge adjacent compatible VMAs touching [start, end) without flattening the
+// entire AVL tree.
+void vma_merge_range(struct vma_list *list, uint64_t start, uint64_t end);
 
 // Clone VMA list for fork (shared mappings stay shared, private get copied).
 // Returns false and destroys any partial destination on allocation failure.

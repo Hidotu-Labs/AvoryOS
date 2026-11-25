@@ -12,6 +12,7 @@
  * Implementation: linuxkpi/src/device.c. */
 
 #include <asm/device.h>
+#include <linux/atomic.h>
 #include <linux/cache.h>
 #include <linux/cleanup.h>
 #include <linux/device/class.h>
@@ -30,6 +31,8 @@
 #include <linux/sysfs.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
 
 struct device_node;
 struct class;
@@ -46,6 +49,7 @@ struct device_driver;
 struct bus_type {
   const char *name;
   const struct attribute_group **dev_groups;
+  const struct dev_pm_ops *pm;
   int (*match)(struct device *, const struct device_driver *);
   int (*uevent)(const struct device *, struct kobj_uevent_env *);
 };
@@ -59,13 +63,32 @@ struct device_dma_parameters {
   unsigned long segment_boundary_mask;
 };
 
-/* The system has no suspend/wakeup core (CONFIG_PM_SLEEP is off), but the
- * upstream PM-wakeup inline contract still records capability and enablement
- * bits on each device. Keep exactly the state read by pm_wakeup.h's disabled
- * branch; event delivery remains the upstream no-PM no-op. */
+/* Per-device runtime PM and wakeup state (CONFIG_PM enabled; CONFIG_PM_SLEEP
+ * stays off).  Fields match the upstream <linux/pm_runtime.h> inline contract
+ * and linuxkpi/src/pm_runtime.c state machine. */
 struct dev_pm_info {
+  spinlock_t lock;
+  atomic_t usage_count;
+  unsigned int disable_depth;
+  enum rpm_status runtime_status;
+  enum rpm_status last_status;
+  enum rpm_request request;
+  int runtime_error;
+  int autosuspend_delay;
+  u64 last_busy;
+  u64 accounting_timestamp;
+  u64 suspended_ns;
   bool can_wakeup : 1;
   bool should_wakeup : 1;
+  bool ignore_children : 1;
+  bool no_callbacks : 1;
+  bool irq_safe : 1;
+  bool runtime_auto : 1;
+  bool use_autosuspend : 1;
+  bool pm_initialized : 1;
+  struct work_struct work;
+  struct delayed_work autosuspend_work;
+  wait_queue_head_t wait_queue;
 };
 
 /* pm_message_t and struct dev_pm_ops come from the <linux/pm.h> overlay;
@@ -106,6 +129,7 @@ struct device {
   u64 coherent_dma_mask; /* coherent allocation addressing limit           */
   struct device_dma_parameters dma_parms;
   struct dev_pm_info power;
+  struct dev_pm_domain *pm_domain;
   bool removable; /* dev_is_removable() consumers (stock device.h) */
   struct list_head devres_head;
   spinlock_t devres_lock;
@@ -251,6 +275,7 @@ void *dev_get_drvdata(const struct device *dev);
 void dev_set_drvdata(struct device *dev, void *data);
 
 void device_initialize(struct device *dev);
+void pm_runtime_init(struct device *dev);
 int device_register(struct device *dev);
 void device_unregister(struct device *dev);
 int device_add(struct device *dev);
@@ -275,7 +300,16 @@ int __kpi_dev_printk(const char *level, const struct device *dev,
 #define dev_warn(dev, fmt, ...) dev_printk(KERN_WARNING, dev, fmt, ##__VA_ARGS__)
 #define dev_notice(dev, fmt, ...) dev_printk(KERN_NOTICE, dev, fmt, ##__VA_ARGS__)
 #define dev_info(dev, fmt, ...) dev_printk(KERN_INFO, dev, fmt, ##__VA_ARGS__)
+#ifdef DEBUG
 #define dev_dbg(dev, fmt, ...) dev_printk(KERN_DEBUG, dev, fmt, ##__VA_ARGS__)
+#else
+#define dev_dbg(dev, fmt, ...)                                                 \
+  ({                                                                           \
+    if (0)                                                                     \
+      dev_printk(KERN_DEBUG, dev, fmt, ##__VA_ARGS__);                         \
+    0;                                                                         \
+  })
+#endif
 
 /* ── classes / device creation ──────────────────────────────────────────── */
 

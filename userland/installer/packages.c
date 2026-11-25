@@ -22,7 +22,7 @@ static const char *const base_pkgs[] = {
     "file", "nano", "htop", "fastfetch", "pciutils", "curl", "dosfstools", "mtools", "limine",
     "ca-certificates", "openssl", "tzdata", "dbus", "seatd", "polkit",
     "systemd", "accountsservice", "networkmanager", "wpa_supplicant",
-    "pacman", "archlinux-keyring", "libarchive", "python",
+    "pacman", "archlinux-keyring", "libarchive", "python", "ascension-kernel",
     "alsa-lib", "alsa-plugins", "pipewire", "pipewire-pulse",
     "pipewire-alsa", "wireplumber",
     "gcc", "binutils", "make", "pkgconf",

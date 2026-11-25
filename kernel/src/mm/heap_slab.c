@@ -441,7 +441,8 @@ void *heap_slab_alloc_at(size_t size, void *caller) {
   if (__builtin_expect(cache_idx < 0, 0))
     return NULL;
 
-  heap_site_record(cache_idx, caller);
+  if (__builtin_expect(heap_slab_dbg_on, 0))
+    heap_site_record(cache_idx, caller);
 
   /* Fast path: Per-CPU local magazine for small objects (<= 256 bytes) */
   if (cache_idx < HEAP_PCPU_CLASSES && heap_initialized) {

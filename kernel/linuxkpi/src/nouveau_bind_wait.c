@@ -50,3 +50,19 @@ signed long linuxkpi_nouveau_bind_wait_timeout(struct dma_fence *fence,
   }
   return result;
 }
+
+struct nouveau_fence;
+extern int linuxkpi_original_nouveau_fence_wait(struct nouveau_fence *fence,
+                                                bool lazy, bool intr)
+    __attribute__((weak));
+
+int nouveau_fence_wait(struct nouveau_fence *fence, bool lazy, bool intr);
+int nouveau_fence_wait(struct nouveau_fence *fence, bool lazy, bool intr) {
+  (void)lazy;
+  if (!linuxkpi_original_nouveau_fence_wait)
+    return -EINVAL;
+  /* Force lazy (sleeping) fence wait so non-lazy callers do not burn
+   * 100% kernel CPU in nouveau_fence_wait_busy(). Already-signaled fences
+   * still return immediately via dma_fence_is_signaled(). */
+  return linuxkpi_original_nouveau_fence_wait(fence, true, intr);
+}

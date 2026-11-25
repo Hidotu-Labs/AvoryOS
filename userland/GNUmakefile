@@ -58,7 +58,7 @@ avory-installer.elf: $(INSTALLER_SRCS) $(INSTALLER_HDRS) $(GLIBC_STAMP)
 	$(GLIBC_CC) $(GLIBC_USER_CFLAGS) -Iinstaller \
 		$(INSTALLER_SRCS) -o avory-installer.elf
 
-AXON_SRC_DIR := $(ROOT_DIR)/build/axon-src
+AXON_SRC_DIR ?= $(ROOT_DIR)/build/axon-src
 axon.elf: $(GLIBC_STAMP)
 	$(GLIBC_CC) -std=c11 -O2 -D_GNU_SOURCE -fno-stack-protector \
 		--sysroot=$(GLIBC_SYSROOT) -Wl,-T,$(ROOT_DIR)/config/userland-link.ld \

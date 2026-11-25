@@ -152,23 +152,32 @@ static int p5d_probe(struct pci_dev *pdev, const struct pci_device_id *id) {
   p5d_probes++;
   p5d_probed = pdev;
 
-  /* Stock pm_runtime.h no-ops must compile and link against the overlay. */
+  /* Runtime PM calls must compile, link, and maintain balanced state. */
   pm_runtime_enable(&pdev->dev);
   pm_runtime_get_sync(&pdev->dev);
   pm_runtime_mark_last_busy(&pdev->dev);
   pm_runtime_put_autosuspend(&pdev->dev);
   pm_runtime_put_sync(&pdev->dev);
   pm_runtime_disable(&pdev->dev);
+  pm_runtime_enable(&pdev->dev);
 
-  /* The compatibility layer must not pretend an unsupported physical PM
-   * transition succeeded. The original test expected inert bookkeeping. */
-  if (pci_set_power_state(pdev, PCI_D3hot) == -ENOTSUPP &&
-      pdev->current_state == observed &&
-      pci_set_power_state(pdev, observed) == 0 &&
-      pci_choose_state(pdev, msg) == PCI_D0 &&
-      pci_wake_from_d3(pdev, true) == -ENOTSUPP &&
-      pci_wake_from_d3(pdev, false) == 0)
-    p5d_power_ok = 1;
+  /* Devices without a PCI PM capability reject D-state changes; devices with
+   * one transition to D3hot and back to the observed state cleanly. */
+  {
+    int pwr_ret = pci_set_power_state(pdev, PCI_D3hot);
+    bool transition_ok =
+        (!pdev->pm_cap && pwr_ret == -ENOTSUPP &&
+         pdev->current_state == observed) ||
+        (pdev->pm_cap && pwr_ret == 0 && pdev->current_state == PCI_D3hot &&
+         pci_set_power_state(pdev, observed) == 0 &&
+         pdev->current_state == observed);
+    if (transition_ok &&
+        pci_set_power_state(pdev, observed) == 0 &&
+        pci_choose_state(pdev, msg) == PCI_D0 &&
+        pci_wake_from_d3(pdev, true) == -ENOTSUPP &&
+        pci_wake_from_d3(pdev, false) == 0)
+      p5d_power_ok = 1;
+  }
   return 0;
 }
 

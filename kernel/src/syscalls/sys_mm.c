@@ -953,7 +953,7 @@ uint64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t a2, uint64_t a3,
     vma_remove_collect(&current->mm->vmas, addr, end, &drops);
     more = drops.more;
     if (!more)
-      vma_merge_adjacent(&current->mm->vmas);
+      vma_merge_range(&current->mm->vmas, addr, end);
     spinlock_release(&current->mm->lock);
     vma_drop_list_release(&drops);
   } while (more);
@@ -1214,7 +1214,7 @@ static uint64_t sys_mprotect_common(uint64_t addr, uint64_t len, uint64_t prot,
       // Publish each bounded range's VMA permissions while the same mm lock
       // still excludes concurrent faults and mapping changes.
       vma_mprotect_pkey(&current->mm->vmas, batch_start, batch_end, prot, pkey);
-      vma_merge_adjacent(&current->mm->vmas);
+      vma_merge_range(&current->mm->vmas, batch_start, batch_end);
     }
 
     // Deferred requests live in a per-CPU queue. Pin this thread across the
@@ -1687,6 +1687,50 @@ static uint64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice,
   if (advice == MADV_FREE) return 0;
   if (advice == MADV_PAGEOUT) {
     zram_pageout(current->mm, current->cr3, addr, end);
+    return 0;
+  }
+  if (advice == MADV_WILLNEED) {
+    struct {
+      vfs_node_t *node;
+      uint32_t offset;
+      uint32_t length;
+    } prefetch[16];
+    uint64_t page = addr & ~(PAGE_SIZE - 1ULL);
+    while (page < end) {
+      int count = 0;
+      spinlock_acquire(&current->mm->lock);
+      while (page < end && count < 16) {
+        struct vma *v = vma_find(&current->mm->vmas, page);
+        if (!v) {
+          page += PAGE_SIZE;
+          continue;
+        }
+        uint64_t seg_end = (v->end < end) ? v->end : end;
+        if (!(v->flags & MAP_ANONYMOUS) && v->file_node) {
+          vfs_node_t *fn = (vfs_node_t *)v->file_node;
+          if ((fn->flags & FS_TYPE_MASK) == FS_FILE && fn->read) {
+            uint64_t file_off = v->offset + (page - v->start);
+            uint64_t file_len = seg_end - page;
+            if (file_off < 0xFFFFFFFFULL && file_len > 0) {
+              if (file_len > 256 * 1024)
+                file_len = 256 * 1024;
+              vfs_open(fn);
+              prefetch[count].node = fn;
+              prefetch[count].offset = (uint32_t)file_off;
+              prefetch[count].length = (uint32_t)file_len;
+              count++;
+            }
+          }
+        }
+        page = seg_end;
+      }
+      spinlock_release(&current->mm->lock);
+      for (int i = 0; i < count; i++) {
+        vfs_cache_prefetch_async(prefetch[i].node, prefetch[i].offset,
+                                 prefetch[i].length);
+        vfs_close(prefetch[i].node);
+      }
+    }
     return 0;
   }
   spinlock_acquire(&current->mm->lock);

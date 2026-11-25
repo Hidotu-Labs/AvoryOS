@@ -206,6 +206,21 @@ for user_config in \
     cp -f "$XFWM4_CONFIG_DIR/xfwm4.xml" "$user_config/xfwm4.xml"
 done
 
+# BusyBox init does not run systemd --user, so DBUS_SESSION_BUS_ADDRESS is unset
+# when SDDM starts an X11 session. Arch's dbus-launch is built without X11
+# support and fails when xfce4-session tries to autolaunch it, causing
+# "Unable to contact settings server". Ensure SDDM Xsession and XFCE xinitrc
+# start a D-Bus session via dbus-run-session when no bus is present.
+SDDM_XSESSION="${ROOTFS_DIR}/usr/share/sddm/scripts/Xsession"
+if [ -f "$SDDM_XSESSION" ] && ! grep -q "dbus-run-session" "$SDDM_XSESSION"; then
+    sed -i 's|^[[:space:]]*exec \$@$|    if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] \&\& command -v dbus-run-session >/dev/null 2>\&1; then\n        exec dbus-run-session -- $@\n    fi\n    exec $@|' "$SDDM_XSESSION"
+fi
+
+XFCE_XINITRC="${ROOTFS_DIR}/etc/xdg/xfce4/xinitrc"
+if [ -f "$XFCE_XINITRC" ] && ! grep -q "dbus-run-session" "$XFCE_XINITRC"; then
+    sed -i 's|^[[:space:]]*exec \${XFCE4_SESSION_COMPOSITOR:-xfce4-session}$|  if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] \&\& command -v dbus-run-session >/dev/null 2>\&1; then\n    exec dbus-run-session -- ${XFCE4_SESSION_COMPOSITOR:-xfce4-session}\n  fi\n  exec ${XFCE4_SESSION_COMPOSITOR:-xfce4-session}|' "$XFCE_XINITRC"
+fi
+
 # Symlink Mesa DRI drivers into /usr/lib/dri for default loader discovery
 if [ -d "${ROOTFS_DIR}/usr/lib/xorg/modules/dri" ]; then
     mkdir -p "${ROOTFS_DIR}/usr/lib/dri"

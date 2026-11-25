@@ -35,6 +35,8 @@
 #include <linux/list.h>
 #include <linux/moduleparam.h>
 #include <linux/pci.h>
+#include <linux/pm.h>
+#include <linux/pm_runtime.h>
 #include <linux/version.h>
 #ifndef PCI_IRQ_LEGACY
 #define PCI_IRQ_LEGACY PCI_IRQ_INTX
@@ -49,11 +51,14 @@
 
 /* ── bus / root scaffolding ─────────────────────────────────────────────── */
 
+static const struct dev_pm_ops pci_dev_pm_ops;
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 const
 #endif
 struct bus_type pci_bus_type = {
     .name = "pci",
+    .pm = &pci_dev_pm_ops,
 };
 
 static struct pci_bus kpi_root_bus;
@@ -484,6 +489,9 @@ static struct pci_dev *kpi_pci_dev_new(void *handle) {
     pcie_capability_read_word(pdev, PCI_EXP_FLAGS, &flags);
     pdev->pcie_flags_reg = flags;
   }
+  pm_runtime_set_active(&pdev->dev);
+  pm_runtime_forbid(&pdev->dev);
+  pm_runtime_enable(&pdev->dev);
   list_add_tail(&pdev->bus_list, &pdev->bus->devices);
   return pdev;
 }
@@ -667,6 +675,7 @@ static void kpi_pci_probe_device(struct pci_driver *drv,
   }
   if (check_cleanup)
     kpi_probe_usage(pdev, &before);
+  pm_runtime_get_sync(&pdev->dev);
   ret = drv->probe(pdev, id);
   if (!strcmp(drv->name, "nouveau"))
     klogf("[NOUVEAU] probe end %s result=%d\n", pci_name(pdev), ret);
@@ -675,6 +684,7 @@ static void kpi_pci_probe_device(struct pci_driver *drv,
     kpi_amdgpu_probe_result = ret;
   }
   if (ret) {
+    pm_runtime_put_noidle(&pdev->dev);
     klogf("[KERNEL] LinuxKPI: pci %s probe %s failed: %d\n", drv->name,
           pci_name(pdev), ret);
     /* Permanent PCI wrappers never reach device_unregister(). Match the
@@ -1073,14 +1083,35 @@ int pci_reenable_device(struct pci_dev *dev) {
 
 /* ── power management (inert bookkeeping, Phase 5 C5) ───────────────────── */
 
-/* No platform/PCI PM transition implementation exists. Keep the observed
- * state intact and reject requests that would require touching hardware. */
+/* Transition PCI device power state via the PCI PM capability (D0 <-> D3hot).
+ * PCI_D3cold falls back to PCI_D3hot until ACPI _PR3 power resources exist. */
 int pci_set_power_state(struct pci_dev *dev, pci_power_t state) {
+  u16 pmcsr;
+  pci_power_t hw_state;
+
   if (!dev || state < PCI_D0 || state > PCI_D3cold)
     return -EINVAL;
   if (state == dev->current_state)
     return 0;
-  return -ENOTSUPP;
+  if (!dev->pm_cap)
+    return -ENOTSUPP;
+
+  hw_state = (state == PCI_D3cold) ? PCI_D3hot : state;
+  if (pci_read_config_word(dev, dev->pm_cap + PCI_PM_CTRL, &pmcsr) ||
+      pmcsr == 0xffff)
+    return -EIO;
+
+  pmcsr = (u16)((pmcsr & ~PCI_PM_CTRL_STATE_MASK) |
+                ((u16)hw_state & PCI_PM_CTRL_STATE_MASK));
+  if (pci_write_config_word(dev, dev->pm_cap + PCI_PM_CTRL, pmcsr))
+    return -EIO;
+
+  if (hw_state == PCI_D3hot || dev->current_state == PCI_D3hot ||
+      dev->current_state == PCI_D3cold)
+    msleep(10);
+
+  dev->current_state = hw_state;
+  return 0;
 }
 
 pci_power_t pci_choose_state(struct pci_dev *dev, pm_message_t state) {
@@ -2252,7 +2283,82 @@ int pci_enable_atomic_ops_to_root(struct pci_dev *dev, u32 cap_mask) {
 
 void pci_ignore_hotplug(struct pci_dev *dev) { (void)dev; }
 
-void pci_restore_msi_state(struct pci_dev *dev) { (void)dev; }
+void pci_restore_msi_state(struct pci_dev *dev) {
+  struct kpi_pci_saved_caps *caps;
+  struct pci_saved_state *state;
+
+  if (!dev || !dev->msi_enabled)
+    return;
+  caps = kpi_pci_saved_caps(dev);
+  if (!caps)
+    return;
+  state = &caps->state;
+  if (state->msi_cap) {
+    int cap = state->msi_cap;
+    bool wide = state->msi_flags & PCI_MSI_FLAGS_64BIT;
+    pci_write_config_word(dev, cap + PCI_MSI_FLAGS,
+                          state->msi_flags & ~PCI_MSI_FLAGS_ENABLE);
+    pci_write_config_dword(dev, cap + PCI_MSI_ADDRESS_LO, state->msi_address);
+    if (wide)
+      pci_write_config_dword(dev, cap + PCI_MSI_ADDRESS_HI,
+                             state->msi_address_hi);
+    pci_write_config_word(dev, cap + (wide ? PCI_MSI_DATA_64 : PCI_MSI_DATA_32),
+                          state->msi_data);
+    if (state->msi_flags & PCI_MSI_FLAGS_MASKBIT)
+      pci_write_config_dword(
+          dev, cap + (wide ? PCI_MSI_MASK_64 : PCI_MSI_MASK_32),
+          state->msi_mask);
+    pci_write_config_word(dev, cap + PCI_MSI_FLAGS, state->msi_flags);
+  }
+}
+
+static int pci_pm_runtime_suspend(struct device *dev) {
+  struct pci_dev *pdev = to_pci_dev(dev);
+  const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+  int error;
+
+  if (!pm || !pm->runtime_suspend)
+    return -ENOSYS;
+
+  error = pm->runtime_suspend(dev);
+  if (error)
+    return error;
+
+  if (!pdev->state_saved)
+    (void)pci_save_state(pdev);
+  if (pdev->pm_cap && pdev->current_state == PCI_D0)
+    (void)pci_set_power_state(pdev, PCI_D3hot);
+  return 0;
+}
+
+static int pci_pm_runtime_resume(struct device *dev) {
+  struct pci_dev *pdev = to_pci_dev(dev);
+  const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+
+  if (pdev->pm_cap && pdev->current_state != PCI_D0)
+    (void)pci_set_power_state(pdev, PCI_D0);
+  if (pdev->state_saved)
+    pci_restore_state(pdev);
+  pci_restore_msi_state(pdev);
+
+  if (!pm || !pm->runtime_resume)
+    return -ENOSYS;
+  return pm->runtime_resume(dev);
+}
+
+static int pci_pm_runtime_idle(struct device *dev) {
+  const struct dev_pm_ops *pm = dev->driver ? dev->driver->pm : NULL;
+
+  if (pm && pm->runtime_idle)
+    return pm->runtime_idle(dev);
+  return 0;
+}
+
+static const struct dev_pm_ops pci_dev_pm_ops = {
+    .runtime_suspend = pci_pm_runtime_suspend,
+    .runtime_resume = pci_pm_runtime_resume,
+    .runtime_idle = pci_pm_runtime_idle,
+};
 
 struct resource *pci_bus_resource_n(const struct pci_bus *bus, int n) {
   (void)bus;

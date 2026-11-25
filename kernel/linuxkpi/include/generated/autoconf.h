@@ -11,7 +11,7 @@
  *
  * Deliberately absent:
  *   CONFIG_MODULES          no module loader; everything is linked in
- *   CONFIG_PM*              no runtime/system power management yet
+ *   CONFIG_PM_SLEEP         no system suspend/hibernation yet
  *   CONFIG_ACPI             native ACPI only has MADT/FADT/MCFG/HPET
  *   CONFIG_IOMMU_SUPPORT    DMA is identity-mapped on x86 for now
  *   CONFIG_DEBUG_FS         no debugfs yet
@@ -76,6 +76,7 @@
 /* Buses and drivers. */
 #define CONFIG_PCI 1
 #define CONFIG_PCI_MSI 1
+#define CONFIG_PM 1
 
 /* Graphics (Phase 3+). */
 #define CONFIG_DRM 1

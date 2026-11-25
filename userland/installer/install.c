@@ -239,6 +239,38 @@ void install_unmount_target(void) {
     umount2(TARGET_MOUNT, 2);
 }
 
+static void set_account_password(const char *user, const char *password,
+                                 install_progress_fn cb, int pct,
+                                 const char *stage, void *ctx) {
+    char pw_in[128];
+    snprintf(pw_in, sizeof(pw_in), "%s:%s\n", user, password);
+
+    const char *chroot_chpw[] = {"chroot", TARGET_MOUNT, "/usr/bin/chpasswd", NULL};
+    if (run_cmd_logged(chroot_chpw, pw_in, cb, pct, stage, ctx) == 0) {
+        return;
+    }
+
+    const char *root_chpw[] = {"chpasswd", "--root", TARGET_MOUNT, NULL};
+    if (run_cmd_logged(root_chpw, pw_in, cb, pct, stage, ctx) == 0) {
+        return;
+    }
+
+    /* Fallback when PAM/chpasswd fails in the live chroot: hash with openssl
+     * and update /etc/shadow + /etc/passwd directly. */
+    const char *cmd =
+        "u=\"$1\"; p=\"$2\"; "
+        "h=$(printf '%s\\n' \"$p\" | /usr/bin/openssl passwd -6 -stdin 2>/dev/null) || exit 1; "
+        "sed -i -E \"s|^(${u}):[^:]*:|\\1:x:|\" /etc/passwd; "
+        "if [ -f /etc/shadow ] && grep -q \"^${u}:\" /etc/shadow; then "
+        "  awk -F: -v OFS=: -v u=\"$u\" -v h=\"$h\" '$1==u{$2=h} {print}' /etc/shadow > /etc/shadow.tmp && "
+        "  chmod 0000 /etc/shadow.tmp && mv /etc/shadow.tmp /etc/shadow; "
+        "else "
+        "  printf '%s:%s:19000:0:99999:7:::\\n' \"$u\" \"$h\" >> /etc/shadow; "
+        "fi";
+    const char *fallback_argv[] = {"chroot", TARGET_MOUNT, "/bin/sh", "-c", cmd, "sh", user, password, NULL};
+    run_cmd_logged(fallback_argv, NULL, cb, pct, stage, ctx);
+}
+
 void install_enter_chroot(void) {
     ensure_dir(TARGET_MOUNT "/dev", 0755);
     ensure_dir(TARGET_MOUNT "/proc", 0755);
@@ -282,7 +314,18 @@ static int write_xinitrc(const char *path, const char *xinit_cmd, const char *xk
     if (xkb_layout && xkb_layout[0]) {
         fprintf(f, "command -v setxkbmap >/dev/null 2>&1 && setxkbmap %s 2>/dev/null || true\n", xkb_layout);
     }
-    fprintf(f, "%s\n", xinit_cmd);
+    fputs("_xfce_log=\"/tmp/xfce4-session-$(id -u).log\"\n"
+          "if [ -n \"${DBUS_SESSION_BUS_ADDRESS:-}\" ] && command -v dbus-update-activation-environment >/dev/null 2>&1; then\n"
+          "    dbus-update-activation-environment --all 2>/dev/null || true\n"
+          "fi\n", f);
+    if (strcmp(xinit_cmd, "exec startxfce4") == 0) {
+        fputs("if [ -z \"${DBUS_SESSION_BUS_ADDRESS:-}\" ] && command -v dbus-run-session >/dev/null 2>&1; then\n"
+              "    exec dbus-run-session -- startxfce4 >>\"$_xfce_log\" 2>&1\n"
+              "fi\n"
+              "exec startxfce4 >>\"$_xfce_log\" 2>&1\n", f);
+    } else {
+        fprintf(f, "%s\n", xinit_cmd);
+    }
     fclose(f);
     chmod(path, 0755);
     return 0;
@@ -555,18 +598,67 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
         {TARGET_MOUNT "/boot/limine/limine-bios.sys", "::/boot/limine/limine-bios.sys", have_bios_stage},
         {TARGET_MOUNT "/boot/limine/boo.png", "::/boot/limine/boo.png", have_wallpaper},
     };
+    bool esp_ok = true;
     const char *mmd_dirs[] = {"::/EFI", "::/EFI/BOOT", "::/EFI/avoryos", "::/boot", "::/boot/limine", NULL};
     for (int d_i = 0; mmd_dirs[d_i]; d_i++) {
         const char *mmd_argv[] = {"env", "MTOOLS_SKIP_CHECK=1", "mmd", "-D", "s", "-i", esp_dev,
                                   mmd_dirs[d_i], NULL};
-        run_cmd_logged(mmd_argv, NULL, cb, 82, "Creating ESP directories...", ctx);
+        if (run_cmd_logged(mmd_argv, NULL, cb, 82, "Creating ESP directories...", ctx) != 0) {
+            /* mmd -D s can still fail if the directory already exists with special
+             * attributes or if mtools rejects the device geometry; verify with mdir. */
+            char mdir_chk[256];
+            const char *mdir_argv[] = {"env", "MTOOLS_SKIP_CHECK=1", "mdir", "-b", "-i", esp_dev,
+                                       mmd_dirs[d_i], NULL};
+            if (run_cmd_capture(mdir_argv, mdir_chk, sizeof(mdir_chk)) != 0) {
+                esp_ok = false;
+                break;
+            }
+        }
     }
-    for (size_t i = 0; i < sizeof(esp_files) / sizeof(esp_files[0]); i++) {
-        if (!esp_files[i].want) continue;
-        const char *mcopy_argv[] = {"env", "MTOOLS_SKIP_CHECK=1", "mcopy", "-o", "-i", esp_dev,
-                                    esp_files[i].src, esp_files[i].dst, NULL};
-        if (run_cmd_logged(mcopy_argv, NULL, cb, 83, "Writing ESP...", ctx) != 0) {
-            snprintf(err_buf, err_sz, "Failed to write %s to the ESP", esp_files[i].dst);
+    if (esp_ok) {
+        for (size_t i = 0; i < sizeof(esp_files) / sizeof(esp_files[0]); i++) {
+            if (!esp_files[i].want) continue;
+            const char *mcopy_argv[] = {"env", "MTOOLS_SKIP_CHECK=1", "mcopy", "-o", "-i", esp_dev,
+                                        esp_files[i].src, esp_files[i].dst, NULL};
+            if (run_cmd_logged(mcopy_argv, NULL, cb, 83, "Writing ESP...", ctx) != 0) {
+                esp_ok = false;
+                break;
+            }
+        }
+    }
+    if (!esp_ok) {
+        install_log("mtools ESP write failed; falling back to mounting ESP...");
+        ensure_dir(TARGET_MOUNT "/boot/efi", 0755);
+        const char *mnt_esp[] = {"mount", "-t", "vfat", esp_dev, TARGET_MOUNT "/boot/efi", NULL};
+        if (mount(esp_dev, TARGET_MOUNT "/boot/efi", "vfat", 0, NULL) != 0 &&
+            run_cmd_logged(mnt_esp, NULL, cb, 83, "Mounting ESP fallback...", ctx) != 0) {
+            snprintf(err_buf, err_sz, "Failed to write ESP (%s)", esp_dev);
+            install_unmount_target();
+            return -1;
+        }
+        bool vfat_ok = true;
+        for (size_t i = 0; i < sizeof(esp_files) / sizeof(esp_files[0]); i++) {
+            if (!esp_files[i].want) continue;
+            char dst_path[512];
+            snprintf(dst_path, sizeof(dst_path), TARGET_MOUNT "/boot/efi%s", esp_files[i].dst + 2);
+            char *slash = strrchr(dst_path, '/');
+            if (slash) {
+                *slash = '\0';
+                ensure_dir(dst_path, 0755);
+                *slash = '/';
+            }
+            if (copy_file(esp_files[i].src, dst_path, 0644) != 0) {
+                snprintf(err_buf, err_sz, "Failed to write %s to the ESP", esp_files[i].dst);
+                vfat_ok = false;
+                break;
+            }
+        }
+        sync();
+        if (umount(TARGET_MOUNT "/boot/efi") != 0) {
+            const char *um_esp[] = {"umount", TARGET_MOUNT "/boot/efi", NULL};
+            run_cmd_logged(um_esp, NULL, cb, 83, "Unmounting ESP...", ctx);
+        }
+        if (!vfat_ok) {
             install_unmount_target();
             return -1;
         }
@@ -637,9 +729,7 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
         }
 
         fprintf(fstab,
-                "# The ESP is maintained with mtools; the kernel's FAT32 writes are\n"
-                "# not yet safe for it, so it is not mounted at boot.\n"
-                "%-42s %-10s vfat   noauto       0 0\n"
+                "%-42s %-10s vfat   defaults     0 0\n"
                 "%-42s %-10s proc   defaults     0 0\n"
                 "%-42s %-10s sysfs  defaults     0 0\n",
                 esp_spec, "/boot/efi",
@@ -707,10 +797,7 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
     /* Passwords & user account */
     if (cb) cb(92, "Configuring root and user accounts...", NULL, ctx);
     if (cfg->root_password[0]) {
-        char pw_in[128];
-        snprintf(pw_in, sizeof(pw_in), "root:%s\n", cfg->root_password);
-        const char *chpw[] = {"chpasswd", "--root", TARGET_MOUNT, NULL};
-        run_cmd_logged(chpw, pw_in, cb, 93, "Setting root password...", ctx);
+        set_account_password("root", cfg->root_password, cb, 93, "Setting root password...", ctx);
     }
 
     if (cfg->username[0]) {
@@ -727,6 +814,10 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
         }
 
         const char *comment = cfg->fullname[0] ? cfg->fullname : cfg->username;
+        /* Use useradd -M (home dir is created and populated from /etc/skel
+         * below) to avoid useradd's internal skel copy hitting EBADF; fall back
+         * to direct /etc/passwd, /etc/group, /etc/shadow creation if useradd
+         * fails in the live chroot. */
         const char *uadd[] = {
             "chroot", TARGET_MOUNT, "/bin/sh", "-c",
             "if id -u \"$2\" >/dev/null 2>&1; then exit 0; fi; "
@@ -737,17 +828,34 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
             "  grep -q \"^${g}:\" /etc/group 2>/dev/null && grps=\"${grps:+$grps,}$g\"; "
             "done; "
             "if [ -n \"$grps\" ]; then "
-            "  /usr/bin/useradd -m -s /bin/bash -c \"$1\" -G \"$grps\" \"$2\" || { "
-            "    rm -f /etc/.pwd.lock /etc/passwd.lock /etc/shadow.lock "
-            "    /etc/group.lock /etc/gshadow.lock /etc/subuid.lock /etc/subgid.lock; "
-            "    id -u \"$2\" >/dev/null 2>&1 || /usr/bin/useradd -M -s /bin/bash -c \"$1\" -G \"$grps\" \"$2\"; "
-            "  }; "
+            "  /usr/bin/useradd -M -s /bin/bash -c \"$1\" -G \"$grps\" \"$2\" || true; "
             "else "
-            "  /usr/bin/useradd -m -s /bin/bash -c \"$1\" \"$2\" || { "
-            "    rm -f /etc/.pwd.lock /etc/passwd.lock /etc/shadow.lock "
-            "    /etc/group.lock /etc/gshadow.lock /etc/subuid.lock /etc/subgid.lock; "
-            "    id -u \"$2\" >/dev/null 2>&1 || /usr/bin/useradd -M -s /bin/bash -c \"$1\" \"$2\"; "
-            "  }; "
+            "  /usr/bin/useradd -M -s /bin/bash -c \"$1\" \"$2\" || true; "
+            "fi; "
+            "if ! id -u \"$2\" >/dev/null 2>&1; then "
+            "  rm -f /etc/.pwd.lock /etc/passwd.lock /etc/shadow.lock "
+            "  /etc/group.lock /etc/gshadow.lock /etc/subuid.lock /etc/subgid.lock; "
+            "  uid=1000; "
+            "  while awk -F: -v u=\"$uid\" '$3==u{found=1} END{exit !found}' /etc/passwd 2>/dev/null; do "
+            "    uid=$((uid + 1)); "
+            "  done; "
+            "  gid=\"$uid\"; "
+            "  if ! grep -q \"^$2:\" /etc/group 2>/dev/null; then "
+            "    printf '%s:x:%s:\\n' \"$2\" \"$gid\" >> /etc/group; "
+            "  else "
+            "    gid=$(awk -F: -v g=\"$2\" '$1==g{print $3; exit}' /etc/group); "
+            "  fi; "
+            "  printf '%s:x:%s:%s:%s:/home/%s:/bin/bash\\n' \"$2\" \"$uid\" \"$gid\" \"$1\" \"$2\" >> /etc/passwd; "
+            "  if [ -f /etc/shadow ] && ! grep -q \"^$2:\" /etc/shadow 2>/dev/null; then "
+            "    printf '%s:!:19000:0:99999:7:::\\n' \"$2\" >> /etc/shadow; "
+            "  fi; "
+            "  for g in wheel audio video input; do "
+            "    if grep -q \"^${g}:\" /etc/group 2>/dev/null; then "
+            "      awk -F: -v OFS=: -v g=\"$g\" -v u=\"$2\" "
+            "        '$1==g{if($4==\"\")$4=u; else if((\",\"$4\",\")!~(\",\"u\",\"))$4=$4\",\"u} {print}' "
+            "        /etc/group > /etc/group.tmp && mv /etc/group.tmp /etc/group; "
+            "    fi; "
+            "  done; "
             "fi; "
             "id -u \"$2\" >/dev/null 2>&1",
             "sh", comment, cfg->username,
@@ -788,10 +896,7 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
             const char *prep_argv[] = {"chroot", TARGET_MOUNT, "/bin/sh", "-c", pw_prep, NULL};
             run_cmd_logged(prep_argv, NULL, cb, 96, "Preparing user password...", ctx);
 
-            char pw_in[128];
-            snprintf(pw_in, sizeof(pw_in), "%s:%s\n", cfg->username, cfg->user_password);
-            const char *chpw[] = {"chpasswd", "--root", TARGET_MOUNT, NULL};
-            run_cmd_logged(chpw, pw_in, cb, 96, "Setting user password...", ctx);
+            set_account_password(cfg->username, cfg->user_password, cb, 96, "Setting user password...", ctx);
         } else {
             char pw_cmd[256];
             snprintf(pw_cmd, sizeof(pw_cmd),
@@ -877,7 +982,8 @@ int install_system(const installer_cfg_t *cfg, const disk_t *disk,
             }
         }
     } else if (cfg->desktop == DE_CONSOLE &&
-               access(TARGET_MOUNT "/usr/local/bin/startx-icewm", F_OK) == 0) {
+               (access(TARGET_MOUNT "/usr/local/bin/startx-xfce4", F_OK) == 0 ||
+                access(TARGET_MOUNT "/usr/local/bin/startx-icewm", F_OK) == 0)) {
         FILE *inittab = fopen(TARGET_MOUNT "/etc/inittab", "w");
         if (inittab) {
             const char *tty1_cmd = access(TARGET_MOUNT "/bin/avory-login", X_OK) == 0

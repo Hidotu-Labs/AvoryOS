@@ -81,6 +81,7 @@ static void update_node(struct vma *n) {
   if (!n)
     return;
   n->height = 1 + MAX(get_height(n->left), get_height(n->right));
+  n->min_start = n->left ? n->left->min_start : n->start;
   n->max_end = n->end;
   uint64_t max_left = get_max_end(n->left);
   uint64_t max_right = get_max_end(n->right);
@@ -88,6 +89,27 @@ static void update_node(struct vma *n) {
     n->max_end = max_left;
   if (max_right > n->max_end)
     n->max_end = max_right;
+
+  uint64_t gap = 0;
+  if (n->left) {
+    if (n->left->max_gap > gap)
+      gap = n->left->max_gap;
+    if (n->start > n->left->max_end) {
+      uint64_t lg = n->start - n->left->max_end;
+      if (lg > gap)
+        gap = lg;
+    }
+  }
+  if (n->right) {
+    if (n->right->max_gap > gap)
+      gap = n->right->max_gap;
+    if (n->right->min_start > n->end) {
+      uint64_t rg = n->right->min_start - n->end;
+      if (rg > gap)
+        gap = rg;
+    }
+  }
+  n->max_gap = gap;
 }
 
 static struct vma *right_rotate(struct vma *y) {
@@ -298,7 +320,9 @@ int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
 
   new_node->start = start;
   new_node->end = end;
+  new_node->min_start = start;
   new_node->max_end = end;
+  new_node->max_gap = 0;
   new_node->prot = prot;
   new_node->flags = flags;
   new_node->offset = offset;
@@ -467,6 +491,12 @@ int vma_mprotect_pkey(struct vma_list *list, uint64_t start, uint64_t end,
 
     uint64_t m_start = MAX(v->start, start);
     uint64_t m_end = MIN(v->end, end);
+    uint8_t target_pkey = (pkey >= 0) ? (uint8_t)(pkey & 0xF) : v->pkey;
+
+    if (v->prot == new_prot && v->pkey == target_pkey) {
+      curr = m_end;
+      continue;
+    }
 
     // Save attributes
     uint64_t flags = v->flags;
@@ -475,7 +505,6 @@ int vma_mprotect_pkey(struct vma_list *list, uint64_t start, uint64_t end,
     uint64_t orig_file_size = v->file_size;
     void *vma_file_node = v->file_node;
     uint64_t original_start = v->start;
-    uint8_t target_pkey = (pkey >= 0) ? (uint8_t)(pkey & 0xF) : v->pkey;
     /* Keep the Linux wrapper alive across the remove/re-add: a full-range
      * mprotect drops the last node reference inside vma_remove(), and the
      * re-added node must inherit the wrapper (upstream neither closes the
@@ -788,6 +817,47 @@ static void inorder_gather(struct vma *node, struct vma **array, int *index) {
 // Falls back to kmalloc only when a process has more VMAs than this.
 #define VMA_STACK_CAP 64
 
+static uint64_t vma_find_gap_rec(struct vma *node, uint64_t length,
+                                 uint64_t limit_addr, uint64_t *current) {
+  if (!node)
+    return 0;
+
+  uint64_t cur = *current;
+  if (cur >= limit_addr || length > limit_addr - cur)
+    return 0;
+  if (node->max_end <= cur || node->min_start >= limit_addr)
+    return 0;
+
+  /* If there is a valid gap strictly before this subtree's minimum start,
+   * it is the leftmost possible fit. */
+  if (node->min_start > cur && node->min_start - cur >= length)
+    return cur;
+
+  /* If no internal gap in this subtree can fit `length`, skip descending:
+   * the subtree only advances `current` to max(current, node->max_end). */
+  if (node->max_gap < length) {
+    if (node->max_end > cur)
+      *current = node->max_end;
+    return 0;
+  }
+
+  uint64_t found = vma_find_gap_rec(node->left, length, limit_addr, current);
+  if (found != 0)
+    return found;
+
+  cur = *current;
+  if (cur >= limit_addr || length > limit_addr - cur)
+    return 0;
+
+  if (node->start > cur && node->start - cur >= length)
+    return cur;
+
+  if (node->end > cur)
+    *current = node->end;
+
+  return vma_find_gap_rec(node->right, length, limit_addr, current);
+}
+
 uint64_t vma_find_gap(struct vma_list *list, uint64_t length,
                       uint64_t base_addr, uint64_t limit_addr) {
   /* Every returned gap, including an interior gap, must fit the caller's
@@ -801,46 +871,8 @@ uint64_t vma_find_gap(struct vma_list *list, uint64_t length,
     return 0;
   }
 
-  // Fast path: use a stack-local array for the common case.
-  // Avoids a kmalloc/kfree round-trip on every mmap syscall when the
-  // process has fewer than VMA_STACK_CAP mappings.
-  struct vma *stack_arr[VMA_STACK_CAP];
-  struct vma **arr;
-  bool heap_used = false;
-
-  if (list->count <= VMA_STACK_CAP) {
-    arr = stack_arr;
-  } else {
-    arr = kmalloc(sizeof(struct vma *) * list->count);
-    if (!arr)
-      return 0;
-    heap_used = true;
-  }
-
-  int idx = 0;
-  inorder_gather(list->root, arr, &idx);
-
-  uint64_t current  = base_addr;
-  uint64_t gap_start = 0;
-
-  for (int i = 0; i < idx; i++) {
-    if (arr[i]->end <= current)
-      continue;
-
-    if (arr[i]->start > current) {
-      uint64_t gap = arr[i]->start - current;
-      if (gap >= length && current < limit_addr &&
-          length <= limit_addr - current) {
-        gap_start = current;
-        break;
-      }
-    }
-    current = MAX(current, arr[i]->end);
-  }
-
-  if (heap_used)
-    kfree(arr);
-
+  uint64_t current = base_addr;
+  uint64_t gap_start = vma_find_gap_rec(list->root, length, limit_addr, &current);
   if (gap_start != 0)
     return gap_start;
 
@@ -865,6 +897,105 @@ static struct vma *vma_build_balanced(struct vma **nodes, int first, int end) {
   return v;
 }
 
+static inline bool vma_can_merge(const struct vma *prev, const struct vma *cur) {
+  return prev->end == cur->start &&
+         prev->prot == cur->prot && prev->flags == cur->flags &&
+         prev->pkey == cur->pkey &&
+         prev->numa_policy == cur->numa_policy &&
+         prev->numa_nodemask == cur->numa_nodemask &&
+         prev->numa_preferred_node == cur->numa_preferred_node &&
+         !prev->file_node && !cur->file_node &&
+         prev->linux_vma == cur->linux_vma &&
+         !((prev->flags | cur->flags) & (MAP_GROWSDOWN | MAP_SYSV_SHM));
+}
+
+static struct vma *vma_find_lt(struct vma *root, uint64_t key) {
+  struct vma *prev = NULL;
+  struct vma *n = root;
+  while (n) {
+    if (n->start < key) {
+      prev = n;
+      n = n->right;
+    } else {
+      n = n->left;
+    }
+  }
+  return prev;
+}
+
+static struct vma *vma_next(struct vma *root, uint64_t key) {
+  struct vma *succ = NULL;
+  struct vma *n = root;
+  while (n) {
+    if (n->start > key) {
+      succ = n;
+      n = n->left;
+    } else {
+      n = n->right;
+    }
+  }
+  return succ;
+}
+
+static struct vma *vma_find_exact(struct vma *root, uint64_t key) {
+  struct vma *n = root;
+  while (n) {
+    if (key < n->start)
+      n = n->left;
+    else if (key > n->start)
+      n = n->right;
+    else
+      return n;
+  }
+  return NULL;
+}
+
+static void vma_recompute_path(struct vma *node, uint64_t start) {
+  if (!node)
+    return;
+  if (start < node->start)
+    vma_recompute_path(node->left, start);
+  else if (start > node->start)
+    vma_recompute_path(node->right, start);
+  update_node(node);
+}
+
+void vma_merge_range(struct vma_list *list, uint64_t start, uint64_t end) {
+  if (!list || list->count < 2 || start >= end || !list->root)
+    return;
+
+  struct vma *prev = vma_find_lt(list->root, start);
+  if (!prev)
+    prev = min_value_node(list->root);
+
+  while (prev) {
+    if (prev->start > end)
+      break;
+    struct vma *cur = vma_next(list->root, prev->start);
+    if (!cur)
+      break;
+    if (vma_can_merge(prev, cur)) {
+      vma_cache_flush(list);
+      uint64_t prev_start = prev->start;
+      uint64_t cur_start = cur->start;
+      uint64_t cur_end = cur->end;
+      bool deleted = false;
+      list->root = delete_node(list->root, cur_start, &deleted);
+      if (deleted)
+        list->count--;
+      prev = vma_find_exact(list->root, prev_start);
+      if (!prev)
+        break;
+      prev->end = cur_end;
+      vma_recompute_path(list->root, prev_start);
+    } else {
+      if (cur->start > end)
+        break;
+      prev = cur;
+    }
+  }
+}
+
 void vma_merge_adjacent(struct vma_list *list) {
   if (list->count < 2)
     return;
@@ -885,17 +1016,7 @@ void vma_merge_adjacent(struct vma_list *list) {
   for (int i = 1; i < count; i++) {
     struct vma *prev = arr[kept - 1];
     struct vma *cur = arr[i];
-    bool can_merge = prev->end == cur->start &&
-                     prev->prot == cur->prot && prev->flags == cur->flags &&
-                     prev->pkey == cur->pkey &&
-                     prev->numa_policy == cur->numa_policy &&
-                     prev->numa_nodemask == cur->numa_nodemask &&
-                     prev->numa_preferred_node == cur->numa_preferred_node &&
-                     !prev->file_node && !cur->file_node &&
-                     prev->linux_vma == cur->linux_vma &&
-                     !((prev->flags | cur->flags) &
-                       (MAP_GROWSDOWN | MAP_SYSV_SHM));
-    if (can_merge) {
+    if (vma_can_merge(prev, cur)) {
       prev->end = cur->end;
       vma_drop_linux_ref(cur);
       vma_node_free(cur);

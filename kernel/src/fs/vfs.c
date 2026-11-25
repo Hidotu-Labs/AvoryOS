@@ -113,8 +113,32 @@ typedef struct vfs_mount_entry {
 
 static vfs_mount_entry_t *vfs_mount_list = NULL;
 static spinlock_t vfs_mount_lock = SPINLOCK_INIT;
+static uint64_t vfs_mount_ino_mask = 0;
+
+static inline uint64_t vfs_mount_hash_bit(uint64_t inode, const void *device) {
+  uint64_t h = (inode * 0x9e3779b97f4a7c15ULL) ^
+               ((uint64_t)(uintptr_t)device * 0xbf58476d1ce4e5b9ULL);
+  return 1ULL << ((h ^ (h >> 32)) & 63u);
+}
+
+/* Must be called with vfs_mount_lock held after mutating vfs_mount_list. */
+static void vfs_mount_mask_recompute(void) {
+  uint64_t mask = 0;
+  for (vfs_mount_entry_t *m = vfs_mount_list; m; m = m->next) {
+    if (!m->mountpoint)
+      continue;
+    const vfs_node_t *id = m->saved ? m->saved : m->mountpoint;
+    mask |= vfs_mount_hash_bit(id->inode, id->device);
+  }
+  __atomic_store_n(&vfs_mount_ino_mask, mask, __ATOMIC_RELEASE);
+}
+
 /* Pin the selected root under the mount lock before detach can drop it. */
 static vfs_node_t *vfs_follow_mount(vfs_node_t *node) {
+  uint64_t mask = __atomic_load_n(&vfs_mount_ino_mask, __ATOMIC_ACQUIRE);
+  if (!(mask & vfs_mount_hash_bit(node->inode, node->device)))
+    return NULL;
+
   vfs_node_t *result = NULL;
   spinlock_acquire(&vfs_mount_lock);
   for (vfs_mount_entry_t *m = vfs_mount_list; m; m = m->next) {
@@ -382,14 +406,16 @@ static vfs_node_t *vfs_dentry_lookup_fast(vfs_node_t *parent, const char *name,
     else if (state == 2) {
       if (hit_entry) {
         uint32_t cur_lru = __atomic_load_n(&bucket->lru_seq, __ATOMIC_RELAXED);
-        if (__atomic_load_n(&hit_entry->last_used, __ATOMIC_RELAXED) != cur_lru)
+        uint32_t last = __atomic_load_n(&hit_entry->last_used, __ATOMIC_RELAXED);
+        if ((uint32_t)(cur_lru - last) >= 64u)
           __atomic_store_n(&hit_entry->last_used, cur_lru, __ATOMIC_RELAXED);
       }
       action = 2;
     } else if (vfs_node_tryref(result)) {
       if (hit_entry) {
         uint32_t cur_lru = __atomic_load_n(&bucket->lru_seq, __ATOMIC_RELAXED);
-        if (__atomic_load_n(&hit_entry->last_used, __ATOMIC_RELAXED) != cur_lru)
+        uint32_t last = __atomic_load_n(&hit_entry->last_used, __ATOMIC_RELAXED);
+        if ((uint32_t)(cur_lru - last) >= 64u)
           __atomic_store_n(&hit_entry->last_used, cur_lru, __ATOMIC_RELAXED);
       }
       action = 3;
@@ -2373,6 +2399,7 @@ int vfs_mount_ex(vfs_node_t *mountpoint, vfs_node_t *target,
     mountpoint->flags |= FS_MOUNTPOINT | FS_PERSISTENT;
     mountpoint->ptr = target;
   }
+  vfs_mount_mask_recompute();
   spinlock_release(&vfs_mount_lock);
   vfs_dentry_invalidate(NULL, NULL);
   return 0;
@@ -2420,6 +2447,7 @@ int vfs_initial_unmount(vfs_node_t *root, unsigned flags) {
     if (!m->point_was_persistent) m->mountpoint->flags &= ~FS_PERSISTENT;
   }
   root->flags &= ~FS_PERSISTENT;
+  vfs_mount_mask_recompute();
   spinlock_release(&vfs_mount_lock);
   vfs_dentry_invalidate(NULL, NULL);
   if (m->mountpoint != root)
@@ -2538,6 +2566,7 @@ int vfs_inplace_unmount(vfs_node_t *point, unsigned flags) {
     spinlock_release(&vfs_mount_lock); return -16;
   }
   *p = m->next;
+  vfs_mount_mask_recompute();
 
   /* Release the fs state while root->device still names it, then copy back
    * the pre-mount image.  Runtime state (refcount, locks, page cache, parent
@@ -2613,6 +2642,7 @@ int vfs_mount_inplace(vfs_node_t *node, vfs_node_t *saved,
         m->fs_free = fs_free;
         m->fs_busy = fs_busy;
         saved = NULL;
+        vfs_mount_mask_recompute();
         break;
       }
     }

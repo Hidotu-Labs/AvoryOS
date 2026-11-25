@@ -11,7 +11,7 @@
 #include "sched/wait.h"
 #include "smp/cpu.h"
 
-#define NET_PACKET_HOT_CAPACITY 64
+#define NET_PACKET_HOT_CAPACITY 512
 #define NET_RX_BATCH_MAX 64
 /* RX buffers come directly from PMM: unlike kmalloc's OOM fallback, this
  * never invokes filesystem/cache reclaim from a NIC interrupt. One page owns
@@ -174,6 +174,7 @@ static void net_worker(void) {
   for (;;) {
     size_t count = 0;
     struct net_deferred_work *work = NULL;
+    unsigned int rounds = 0;
     for (;;) {
       spinlock_acquire(&lock);
       if (count > 0) {
@@ -236,6 +237,19 @@ static void net_worker(void) {
         spinlock_release(&lock);
         if (requeued)
           wait_queue_wake_one(&worker_wait);
+      }
+      rounds++;
+      if (rounds >= 4 ||
+          __atomic_load_n(&self->need_resched, __ATOMIC_ACQUIRE)) {
+        if (count > 0) {
+          spinlock_acquire(&lock);
+          for (size_t i = 0; i < count; i++)
+            release_rx_packet_locked(batch[i]);
+          spinlock_release(&lock);
+          count = 0;
+        }
+        rounds = 0;
+        sched_yield();
       }
     }
 
@@ -379,7 +393,7 @@ size_t net_rx_submit_batch_irq(struct net_device *dev,
 
   if (dropped && report_pressure)
     klog_puts("[NET] rx dropped: memory pressure\n");
-  if (accepted_count && was_empty)
+  if (accepted_count && was_empty && accepted_count > 32)
     wait_queue_wake_all(&worker_wait);
   else if (accepted_count)
     wait_queue_wake_one(&worker_wait);
@@ -659,7 +673,7 @@ void net_core_start_worker(void) {
       return;
     }
     strcpy(worker->comm, "net-worker");
-    sched_set_priority(worker, 0, -20);
+    sched_set_priority(worker, 0, -2);
     sched_enqueue_thread(worker, target);
     klog_puts("[NET] rx worker assigned cpu=");
     klog_uint64(target->cpu_id);
@@ -754,7 +768,6 @@ bool net_deferred_work_schedule(struct net_deferred_work *work) {
   work->queued = true;
   work->cancelled = false;
   work->next = NULL;
-  bool was_empty = work_head == NULL && queue_head == NULL;
   if (work_tail)
     work_tail->next = work;
   else
@@ -762,10 +775,7 @@ bool net_deferred_work_schedule(struct net_deferred_work *work) {
   work_tail = work;
   work_depth++;
   spinlock_release(&lock);
-  if (was_empty)
-    wait_queue_wake_all(&worker_wait);
-  else
-    wait_queue_wake_one(&worker_wait);
+  wait_queue_wake_one(&worker_wait);
   return true;
 }
 

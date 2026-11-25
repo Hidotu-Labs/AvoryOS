@@ -434,7 +434,7 @@ avoryos-dist.iso: limine/limine kernel disk.img limine.conf create_dist_usb.sh
 	./create_dist_usb.sh avoryos-dist.iso
 
 # ── Minimal ISO ─────────────────────────────────────────────────────────────
-# bash + GNU coreutils + Xorg + IceWM + BusyBox init/D-Bus + xterm, without the full
+# bash + GNU coreutils + Xorg + XFCE4 + BusyBox init/D-Bus, without the full
 # desktop stack.  scripts/build-minimal.sh assembles an independent rootfs and
 # disk image under build/minimal/; create_dist_usb.sh packages it as a
 # self-contained ISO (the disk image is embedded as a Limine module, exactly
@@ -461,7 +461,9 @@ $(MINIMAL_DISK): $(MINIMAL_STAMP) scripts/build-minimal.sh
 .PHONY: minimal-disk
 minimal-disk: $(MINIMAL_DISK)
 
-$(MINIMAL_ISO): kernel limine/limine $(MINIMAL_DISK) limine-minimal.conf create_dist_usb.sh
+MINIMAL_KERNEL_DEP := $(if $(wildcard kernel/bin-$(ARCH)/kernel),kernel/bin-$(ARCH)/kernel,kernel)
+
+$(MINIMAL_ISO): $(MINIMAL_KERNEL_DEP) limine/limine $(MINIMAL_DISK) limine-minimal.conf create_dist_usb.sh
 	AVORYOS_DISK_SLACK_MB=256 DISK_IMG=$(MINIMAL_DISK) LIMINE_CONF=limine-minimal.conf \
 		./create_dist_usb.sh $(MINIMAL_ISO)
 
@@ -956,6 +958,16 @@ disk.img: disk-full-force
 		[ -f build/axon-src/axon.conf ] && install -D -m 0644 build/axon-src/axon.conf build/arch/rootfs/etc/axon/axon.conf || true; \
 		./scripts/configure-accounts.sh build/arch/rootfs; \
 		bash scripts/configure-pacman.sh build/arch/rootfs; \
+		mkdir -p build/arch/rootfs/var/lib/pacman/local; \
+		[ -f build/arch/rootfs/var/lib/pacman/local/ALPM_DB_VERSION ] || printf '9\n' > build/arch/rootfs/var/lib/pacman/local/ALPM_DB_VERSION; \
+		rm -rf build/arch/rootfs/var/lib/pacman/local/ascension-kernel-*; \
+		_ktag=$$(awk '{print $$2; exit}' build/kernel-build-tag 2>/dev/null || true); \
+		[ -n "$$_ktag" ] || _ktag=0; \
+		_kver="$(subst -,.,$(BUILD_VERSION)).0.$$_ktag-1"; \
+		_kdate=$$(date +%s); \
+		mkdir -p "build/arch/rootfs/var/lib/pacman/local/ascension-kernel-$$_kver"; \
+		printf '%%NAME%%\nascension-kernel\n\n%%VERSION%%\n%s\n\n%%DESC%%\nAvoryOS Ascension kernel image\n\n%%ARCH%%\nx86_64\n\n%%INSTALLDATE%%\n%s\n\n%%REASON%%\n0\n\n' "$$_kver" "$$_kdate" > "build/arch/rootfs/var/lib/pacman/local/ascension-kernel-$$_kver/desc"; \
+		printf '%%FILES%%\n' > "build/arch/rootfs/var/lib/pacman/local/ascension-kernel-$$_kver/files"; \
 		./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs /; \
 		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs/usr/include usr/include; \
 		EXCLUDE_IMAGE_STATIC="" ./scripts/populate-ext2-dir.sh ./part.img build/arch/rootfs/usr/lib/gcc/x86_64-pc-linux-gnu usr/lib/gcc/x86_64-pc-linux-gnu; \

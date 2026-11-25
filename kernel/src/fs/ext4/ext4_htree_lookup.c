@@ -44,11 +44,16 @@ int ext4_htree_find_entry(
         return -1;
     }
 
-    uint8_t *root_buffer = kmalloc(mount->block_size);
-    uint8_t *leaf_buffer = kmalloc(mount->block_size);
+    uint8_t root_stack[4096];
+    uint8_t leaf_stack[4096];
+    bool heap_used = (mount->block_size > sizeof(root_stack));
+    uint8_t *root_buffer = heap_used ? kmalloc(mount->block_size) : root_stack;
+    uint8_t *leaf_buffer = heap_used ? kmalloc(mount->block_size) : leaf_stack;
     if (!root_buffer || !leaf_buffer) {
-        if (root_buffer) kfree(root_buffer);
-        if (leaf_buffer) kfree(leaf_buffer);
+        if (heap_used) {
+            if (root_buffer) kfree(root_buffer);
+            if (leaf_buffer) kfree(leaf_buffer);
+        }
         return -1;
     }
 
@@ -253,7 +258,9 @@ int ext4_htree_find_entry(
     }
 
 cleanup:
-    kfree(root_buffer);
-    kfree(leaf_buffer);
+    if (heap_used) {
+        kfree(root_buffer);
+        kfree(leaf_buffer);
+    }
     return found_inode;
 }

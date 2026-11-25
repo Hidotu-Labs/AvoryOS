@@ -520,6 +520,7 @@ void thread_update_fastpath_state(struct thread *t) {
 static uint64_t sysprof_count[MAX_SYSCALL];
 static uint64_t sysprof_cycles[MAX_SYSCALL];
 
+#ifdef SYSCALL_PROF
 static inline void sysprof_account(struct thread *t, uint64_t num, uint64_t t0) {
   uint64_t dt = rdtsc() - t0;
   __atomic_add_fetch(&sysprof_count[num], 1, __ATOMIC_RELAXED);
@@ -534,6 +535,7 @@ static inline void sysprof_account(struct thread *t, uint64_t num, uint64_t t0) 
     }
   }
 }
+#endif
 
 void syscall_prof_reset(void) {
   for (uint32_t i = 0; i < MAX_SYSCALL; i++) {
@@ -712,9 +714,13 @@ void syscall_dispatcher(struct syscall_regs *regs) {
 #if SYSCALL_LOG
     log_syscall_entry(regs, t);
 #endif
+#ifdef SYSCALL_PROF
     uint64_t sp_t0 = rdtsc();
     regs->rax = raw_handler(regs);
     sysprof_account(t, syscall_num, sp_t0);
+#else
+    regs->rax = raw_handler(regs);
+#endif
 #if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
     log_syscall_error(syscall_num, t, (int64_t)regs->rax);
 #endif
@@ -773,10 +779,15 @@ void syscall_dispatcher(struct syscall_regs *regs) {
   log_syscall_entry(regs, t);
 #endif
 
+#ifdef SYSCALL_PROF
   uint64_t sp_t0 = rdtsc();
   regs->rax =
       handler(regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8, regs->r9);
   sysprof_account(t, syscall_num, sp_t0);
+#else
+  regs->rax =
+      handler(regs->rdi, regs->rsi, regs->rdx, regs->r10, regs->r8, regs->r9);
+#endif
 #if SYSCALL_LOG == 2 || SYSCALL_LOG == 3
   log_syscall_error(syscall_num, t, (int64_t)regs->rax);
 #endif

@@ -142,6 +142,8 @@ typedef struct {
    * not yet released.  The last fat32_mount_put() frees the state.  While
    * mounted, refs - 1 is the in-place umount busy count (fat32_live_nodes). */
   uint32_t refs;
+  uint32_t next_free_hint;
+  bool fsinfo_invalidated;
 } fat32_mount_t;
 
 /* Native x86_64 VFAT directory ioctl ABI. Names are lengths, not record sizes. */

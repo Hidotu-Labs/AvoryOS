@@ -555,6 +555,7 @@ static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
  * cheap enough to stay on in every build. */
 int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
                           struct registers *regs) {
+#ifdef MM_FAULT_PROF
   struct thread *current = sched_get_current();
   struct mm_struct *mm = current ? current->mm : NULL;
   uint64_t t0 = rdtsc();
@@ -568,6 +569,9 @@ int vmm_handle_page_fault(uint64_t cr2, uint64_t error_code,
     __atomic_add_fetch(&mm->fault_class_cycles[cls], dt, __ATOMIC_RELAXED);
   }
   return rc;
+#else
+  return vmm_handle_page_fault_inner(cr2, error_code, regs);
+#endif
 }
 
 static int vmm_handle_page_fault_inner(uint64_t cr2, uint64_t error_code,
@@ -1460,8 +1464,7 @@ retry_cow:
         cached = vfs_cache_get_or_create(node, file_offset);
         vfs_exec_profile_note_cold(node, file_offset, current->exe_path, cold_n);
       }
-      if (!cached && user_mode &&
-          pmm_get_free_pages_including_pcp() < VMM_FAULT_WATERMARK_PAGES) {
+      for (int attempt = 0; !cached && user_mode && attempt < 2; attempt++) {
         vmm_fault_reclaim_on_failure();
         cached = vfs_cache_get_or_create(node, file_offset);
       }
@@ -1470,9 +1473,11 @@ retry_cow:
       if (!cached || !cached->frame_phys) {
         if (cached)
           vfs_cache_put(node, cached);
-        klogf("[VMM] File cache read failure for VMA [%016llx-%016llx] off=%u\n",
+        klogf("[VMM] File cache read failure for VMA [%016llx-%016llx] off=%u free=%llu pcp=%llu\n",
               (unsigned long long)vma_start, (unsigned long long)vma_end,
-              file_offset);
+              file_offset,
+              (unsigned long long)pmm_get_free_pages(),
+              (unsigned long long)pmm_get_free_pages_including_pcp());
         return PF_REJECT("private file mapping: page cache could not supply the "
                          "page", file_offset, page_offset);
       }
@@ -1538,8 +1543,7 @@ retry_cow:
         cached = vfs_cache_get_or_create(node, file_offset);
         vfs_exec_profile_note_cold(node, file_offset, current->exe_path, cold_n);
       }
-      if (!cached && user_mode &&
-          pmm_get_free_pages_including_pcp() < VMM_FAULT_WATERMARK_PAGES) {
+      for (int attempt = 0; !cached && user_mode && attempt < 2; attempt++) {
         vmm_fault_reclaim_on_failure();
         cached = vfs_cache_get_or_create(node, file_offset);
       }
@@ -1554,14 +1558,16 @@ retry_cow:
       } else {
         if (cached)
           vfs_cache_put(node, cached);
-        klogf("[VMM] File cache read failure for ro VMA [%016llx-%016llx] off=%u page_off=%llu eff_size=%llu vma_off=%llu file='%s' comm='%s' tid=%u rip=%016llx\n",
+        klogf("[VMM] File cache read failure for ro VMA [%016llx-%016llx] off=%u page_off=%llu eff_size=%llu vma_off=%llu file='%s' comm='%s' tid=%u rip=%016llx free=%llu pcp=%llu\n",
               (unsigned long long)vma_start, (unsigned long long)vma_end, file_offset,
               (unsigned long long)page_offset, (unsigned long long)eff_file_size,
               (unsigned long long)vma_offset,
               (node && node->name[0]) ? node->name : "?",
               (current && current->comm[0]) ? current->comm : "?",
               current ? current->tid : 0,
-              (unsigned long long)(regs ? regs->rip : 0));
+              (unsigned long long)(regs ? regs->rip : 0),
+              (unsigned long long)pmm_get_free_pages(),
+              (unsigned long long)pmm_get_free_pages_including_pcp());
         return PF_REJECT("shared/read-only file mapping: page cache could not "
                          "supply the page", file_offset, page_offset);
       }

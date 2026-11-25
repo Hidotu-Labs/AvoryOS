@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the minimal AvoryOS root filesystem and disk image with Axon packages:
-# Bash/Coreutils, Xorg, IceWM, D-Bus and xterm.
+# Bash/Coreutils, Xorg, XFCE4, and D-Bus.
 #
 # The regular setup-rootfs target builds the full desktop rootfs. This script
 # keeps an independent minimal rootfs under build/minimal/.
@@ -63,6 +63,15 @@ install_avory_tools() {
     if [ -f "${AXON_SOURCE_DIR}/axon.conf" ]; then
         install -m 0644 "${AXON_SOURCE_DIR}/axon.conf" "${ROOTFS_DIR}/etc/axon/axon.conf"
     fi
+    _ktag="$(awk '{print $2; exit}' "${ROOT_DIR}/build/kernel-build-tag" 2>/dev/null || true)"
+    _kver="${BUILD_VERSION:-3.0.0}"; _kver="${_kver//-/.}.0.${_ktag:-0}-1"
+    _kdate="$(date +%s)"
+    mkdir -p "${ROOTFS_DIR}/var/lib/pacman/local"
+    [ -f "${ROOTFS_DIR}/var/lib/pacman/local/ALPM_DB_VERSION" ] || printf '9\n' > "${ROOTFS_DIR}/var/lib/pacman/local/ALPM_DB_VERSION"
+    rm -rf "${ROOTFS_DIR}/var/lib/pacman/local/ascension-kernel-"*
+    mkdir -p "${ROOTFS_DIR}/var/lib/pacman/local/ascension-kernel-${_kver}"
+    printf '%%NAME%%\nascension-kernel\n\n%%VERSION%%\n%s\n\n%%DESC%%\nAvoryOS Ascension kernel image\n\n%%ARCH%%\nx86_64\n\n%%INSTALLDATE%%\n%s\n\n%%REASON%%\n0\n\n' "$_kver" "$_kdate" > "${ROOTFS_DIR}/var/lib/pacman/local/ascension-kernel-${_kver}/desc"
+    printf '%%FILES%%\n' > "${ROOTFS_DIR}/var/lib/pacman/local/ascension-kernel-${_kver}/files"
 
     log "Building AvoryOS TTY installer for AvoryOS Minimal..."
     rm -f "${ROOTFS_DIR}/usr/bin/avory-installer" "${ROOTFS_DIR}/usr/bin/install-avoryos"
@@ -105,21 +114,45 @@ configure_rootfs() {
         "${ROOTFS_DIR}/proc" \
         "${ROOTFS_DIR}/sys" \
         "${ROOTFS_DIR}/tmp" \
-        "${ROOTFS_DIR}/root/.icewm" \
         "${ROOTFS_DIR}/run/dbus" \
         "${ROOTFS_DIR}/run/user/0" \
         "${ROOTFS_DIR}/usr/local/bin" \
         "${ROOTFS_DIR}/var/lib/dbus" \
         "${ROOTFS_DIR}/var/log"
 
-    # D-Bus system service account (the full rootfs adds this in
-    # configure-accounts.sh; the minimal image does not use that setup).
+    # D-Bus system service accounts (Arch's system bus uses "dbus", legacy uses "messagebus").
+    if ! grep -q '^dbus:' "${ROOTFS_DIR}/etc/group"; then
+        echo 'dbus:x:81:' >> "${ROOTFS_DIR}/etc/group"
+    fi
+    if ! grep -q '^dbus:' "${ROOTFS_DIR}/etc/passwd"; then
+        echo 'dbus:!:81:81:System Message Bus:/:/usr/bin/nologin' \
+            >> "${ROOTFS_DIR}/etc/passwd"
+    fi
     if ! grep -q '^messagebus:' "${ROOTFS_DIR}/etc/group"; then
         echo 'messagebus:x:86:' >> "${ROOTFS_DIR}/etc/group"
     fi
     if ! grep -q '^messagebus:' "${ROOTFS_DIR}/etc/passwd"; then
         echo 'messagebus:!:86:86:D-Bus Message Bus User:/var/run/dbus:/bin/false' \
             >> "${ROOTFS_DIR}/etc/passwd"
+    fi
+    if [ -f "${ROOTFS_DIR}/usr/lib/dbus-daemon-launch-helper" ]; then
+        chmod 4755 "${ROOTFS_DIR}/usr/lib/dbus-daemon-launch-helper"
+    fi
+
+    # Polkit service account (required by populate-ext2-dir.py when polkit is installed).
+    if [ -d "${ROOTFS_DIR}/etc/polkit-1/rules.d" ] && [ -r "${ROOTFS_DIR}/usr/lib/sysusers.d/polkit.conf" ]; then
+        _pk_gid=$(awk '$1 == "g" && $2 == "polkitd" { print $3; exit }' "${ROOTFS_DIR}/usr/lib/sysusers.d/polkit.conf")
+        _pk_spec=$(awk '$1 == "u!" && $2 == "polkitd" { print $3; exit }' "${ROOTFS_DIR}/usr/lib/sysusers.d/polkit.conf")
+        _pk_uid=${_pk_spec%%:*}
+        if [ -n "$_pk_gid" ] && [ -n "$_pk_uid" ]; then
+            if ! grep -q '^polkitd:' "${ROOTFS_DIR}/etc/group"; then
+                printf 'polkitd:x:%s:\n' "$_pk_gid" >> "${ROOTFS_DIR}/etc/group"
+            fi
+            if ! grep -q '^polkitd:' "${ROOTFS_DIR}/etc/passwd"; then
+                printf 'polkitd:!:%s:%s:User for polkitd:/:/usr/bin/nologin\n' \
+                    "$_pk_uid" "$_pk_gid" >> "${ROOTFS_DIR}/etc/passwd"
+            fi
+        fi
     fi
 
     # Root logs in with bash; the console is a bash session either way.
@@ -222,11 +255,23 @@ fi
 
 driver="$(printf '%s\n' "$inv" | awk -v c="$card" '$1==c {print $2; exit}')"
 render="$(printf '%s\n' "$inv" | awk -v c="$card" '$1==c {print $5; exit}')"
+dev_id="$(cat "/sys/class/drm/${card##*/}/device/device" 2>/dev/null | tr 'A-Z' 'a-z')"
+
+legacy_vi=0
+case "$dev_id" in
+    0x98e4|0x9870|0x9874|0x9875|0x9876|0x9877)
+        if ! grep -qw 'avory_force_glamor=1' /proc/cmdline 2>/dev/null; then
+            legacy_vi=1
+        fi
+        ;;
+esac
 
 accel="none"
 swcursor="true"
 pageflip=""
-if [ "$driver" = "amdgpu" ] && [ -n "$render" ] && [ "$render" != "-" ] &&
+if [ "$driver" = "amdgpu" ] && [ "$legacy_vi" -eq 1 ]; then
+    pageflip='    Option      "PageFlip" "true"'
+elif [ "$driver" = "amdgpu" ] && [ -n "$render" ] && [ "$render" != "-" ] &&
    [ ! -f /etc/avory-no-glamor ] && ! grep -qw 'avory_no_glamor=1' /proc/cmdline 2>/dev/null; then
     accel="glamor"
     swcursor="false"
@@ -301,7 +346,11 @@ for device in /sys/class/drm/card*/device; do
 done
 echo "=== klog ==="
 if [ -r /proc/klog ]; then
-    tail -c 65536 /proc/klog 2>/dev/null | grep -iE "VFCT|ACPI|VBIOS|amdgpu|drm|firmware|failed|SIGSEGV|ldconfig" | tail -n 35
+    tail -c 65536 /proc/klog 2>/dev/null | grep -v 'execve failed' | grep -iE "VFCT|ACPI|VBIOS|amdgpu|drm|firmware|ring|fence|timeout|vblank|flip|irq|msi|stoney|smu|failed|SIGSEGV|ldconfig" | tail -n 35
+fi
+echo "=== interrupts ==="
+if [ -r /proc/interrupts ]; then
+    head -n 30 /proc/interrupts 2>/dev/null || true
 fi
 echo "=== Xorg.0.log ==="
 if [ -r /var/log/Xorg.0.log ]; then
@@ -310,6 +359,8 @@ fi
 if [ -r /var/log/Xorg.0.log.glamor ]; then
     echo "=== Xorg.0.log.glamor (EE) ==="
     grep -E "\(EE\)|glamor|amdgpu|DRI" /var/log/Xorg.0.log.glamor 2>/dev/null | tail -n 20
+    echo "=== Xorg.0.log.glamor (tail) ==="
+    tail -n 15 /var/log/Xorg.0.log.glamor 2>/dev/null || true
 fi
 echo "=== cpu / ps ==="
 head -n 5 /proc/stat 2>/dev/null || true
@@ -359,8 +410,8 @@ EOF
 ::sysinit:/usr/local/bin/avory-net-init
 ::sysinit:/usr/local/bin/avory-xorg-init
 
-# Xorg + IceWM on tty1 (the only tty the AvoryOS kernel exposes)
-tty1::respawn:/usr/local/bin/startx-icewm
+# Xorg + XFCE4 on tty1 (the only tty the AvoryOS kernel exposes)
+tty1::respawn:/usr/local/bin/startx-xfce4
 
 # Shutdown & reboot
 ::shutdown:/bin/umount -a -r
@@ -385,10 +436,11 @@ exec "/sbin/${mode}"
 EOF
     chmod 0755 "${ROOTFS_DIR}/sbin/shutdown"
 
-    # X session launcher: start the system bus, then give IceWM a session bus.
-    cat > "${ROOTFS_DIR}/usr/local/bin/startx-icewm" <<'EOF'
+    # X session launcher: start the system bus, then give XFCE4 a session bus.
+    rm -f "${ROOTFS_DIR}/usr/local/bin/startx-icewm"
+    cat > "${ROOTFS_DIR}/usr/local/bin/startx-xfce4" <<'EOF'
 #!/bin/sh
-# AvoryOS Minimal: start Xorg + IceWM on tty1.  busybox init respawns this
+# AvoryOS Minimal: start Xorg + XFCE4 on tty1.  busybox init respawns this
 # script whenever the X session exits, so the desktop comes back by itself.
 export HOME=/root
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -415,32 +467,39 @@ rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
 [ -x /usr/local/bin/avory-xorg-init ] && /usr/local/bin/avory-xorg-init || true
 
 CONF=/etc/X11/xorg.conf.d/10-modesetting.conf
-dbus-run-session -- startx
+t0=$(date +%s 2>/dev/null || echo 0)
+startx
 rc=$?
-if [ "$rc" -ne 0 ] && [ -f "$CONF" ] && grep -q '"glamor"' "$CONF"; then
+t1=$(date +%s 2>/dev/null || echo 0)
+elapsed=$((t1 - t0))
+if { [ "$rc" -ne 0 ] || [ "$elapsed" -lt 35 ]; } && [ -f "$CONF" ] && grep -q '"glamor"' "$CONF"; then
     [ -f /var/log/Xorg.0.log ] && cp -f /var/log/Xorg.0.log /var/log/Xorg.0.log.glamor
     sed -e 's/"glamor"/"none"/g' \
         -e 's/"SWcursor"[[:space:]]*"false"/"SWcursor"    "true"/g' \
         -e '/"PageFlip"/d' \
         "$CONF" > "${CONF}.tmp" && mv -f "${CONF}.tmp" "$CONF"
     rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
-    dbus-run-session -- startx
+    t0=$(date +%s 2>/dev/null || echo 0)
+    startx
     rc=$?
+    t1=$(date +%s 2>/dev/null || echo 0)
+    elapsed=$((t1 - t0))
 fi
-if [ "$rc" -ne 0 ]; then
-    echo "=== Xorg failed (rc=$rc); stopping respawn ==="
+if [ "$rc" -ne 0 ] || [ "$elapsed" -lt 35 ]; then
+    echo "=== Xorg/XFCE4 failed (rc=$rc elapsed=${elapsed}s); stopping respawn ==="
     command -v drm-identify >/dev/null 2>&1 && drm-identify 2>&1 || true
+    [ -r /tmp/xfce4-session-0.log ] && tail -n 25 /tmp/xfce4-session-0.log
     [ -r /var/log/Xorg.0.log ] && grep -E '\(EE\)|\(WW\)|modeset|amdgpu|glamor|Fatal' /var/log/Xorg.0.log | tail -n 25
-    echo "=== Dropping to rescue shell on tty1 (run startx-icewm to retry) ==="
+    echo "=== Dropping to rescue shell on tty1 (run startx-xfce4 to retry) ==="
     exec /bin/bash -l
 fi
 exit "$rc"
 EOF
-    chmod 0755 "${ROOTFS_DIR}/usr/local/bin/startx-icewm"
+    chmod 0755 "${ROOTFS_DIR}/usr/local/bin/startx-xfce4"
 
     cat > "${ROOTFS_DIR}/root/.xinitrc" <<'EOF'
 #!/bin/sh
-# AvoryOS Minimal X11 session: IceWM.
+# AvoryOS Minimal X11 session: XFCE4.
 # Root's home is "/" on AvoryOS: join the XDG defaults through "${HOME%/}"
 # so the session never exports //.cache-style paths (WebKitGTK rejects those
 # sandbox roots; Epiphany aborts on the resulting critical).
@@ -454,115 +513,40 @@ unset _avory_home
 if [ -f /etc/X11/xinit/Xresources ]; then
     xrdb -merge /etc/X11/xinit/Xresources 2>/dev/null || true
 fi
-if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+_xfce_log="/tmp/xfce4-session-$(id -u).log"
+if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-update-activation-environment >/dev/null 2>&1; then
     dbus-update-activation-environment --all 2>/dev/null || true
 fi
-exec icewm
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session -- startxfce4 >>"$_xfce_log" 2>&1
+fi
+exec startxfce4 >>"$_xfce_log" 2>&1
 EOF
     chmod 0755 "${ROOTFS_DIR}/root/.xinitrc"
+
+    mkdir -p "${ROOTFS_DIR}/etc/xdg/xfce4/xfconf/xfce-perchannel-xml" \
+             "${ROOTFS_DIR}/root/.config/xfce4/xfconf/xfce-perchannel-xml"
+    cat > "${ROOTFS_DIR}/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfwm4" version="1.0">
+  <property name="general" type="empty">
+    <property name="use_compositing" type="bool" value="false"/>
+    <property name="vblank_mode" type="string" value="off"/>
+  </property>
+</channel>
+EOF
+    cp -f "${ROOTFS_DIR}/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" \
+          "${ROOTFS_DIR}/root/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
 
     if [ -f "${ROOTFS_DIR}/etc/X11/xinit/xserverrc" ]; then
         chmod 0755 "${ROOTFS_DIR}/etc/X11/xinit/xserverrc"
     fi
+    if [ -f "${ROOTFS_DIR}/etc/xdg/xfce4/xinitrc" ] && ! grep -q "dbus-run-session" "${ROOTFS_DIR}/etc/xdg/xfce4/xinitrc"; then
+        sed -i 's|^[[:space:]]*exec \${XFCE4_SESSION_COMPOSITOR:-xfce4-session}$|  if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] \&\& command -v dbus-run-session >/dev/null 2>\&1; then\n    exec dbus-run-session -- ${XFCE4_SESSION_COMPOSITOR:-xfce4-session}\n  fi\n  exec ${XFCE4_SESSION_COMPOSITOR:-xfce4-session}|' "${ROOTFS_DIR}/etc/xdg/xfce4/xinitrc"
+    fi
 
-    cat > "${ROOTFS_DIR}/usr/local/bin/icewm-dynamic-menu" <<'EOF'
-#!/bin/sh
-# Dynamically generate IceWM menu entries from installed .desktop files.
-set --
-for f in /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop; do
-    [ -f "$f" ] && set -- "$@" "$f"
-done
-[ $# -eq 0 ] && exit 0
-exec awk '
-function trim(s) {
-    gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", s)
-    return s
-}
-function escape_q(s) {
-    gsub(/"/, "\\\"", s)
-    return s
-}
-function map_cat(cats,    c) {
-    c = ";" cats ";"
-    if (c ~ /;Network;|;WebBrowser;|;Email;/) return "Internet"
-    if (c ~ /;AudioVideo;|;Audio;|;Video;|;Player;/) return "Multimedia"
-    if (c ~ /;Graphics;|;2DGraphics;|;3DGraphics;/) return "Graphics"
-    if (c ~ /;Development;|;IDE;/) return "Development"
-    if (c ~ /;Office;|;TextEditor;/) return "Office"
-    if (c ~ /;Game;/) return "Games"
-    if (c ~ /;System;|;Settings;|;Monitor;/) return "System"
-    if (c ~ /;Utility;|;Accessory;|;TerminalEmulator;|;FileManager;/) return "Utilities"
-    return "Other"
-}
-function flush_entry() {
-    if (in_desktop && !nodisplay && type == "Application" && name != "" && exec_cmd != "") {
-        gsub(/%[uUfFick]/, "", exec_cmd)
-        exec_cmd = trim(exec_cmd)
-        if (exec_cmd != "") {
-            if (term == "true") exec_cmd = "xterm -e " exec_cmd
-            if (icon == "") icon = "application-x-executable"
-            cat = map_cat(cats)
-            line = "  prog \"" escape_q(name) "\" " icon " " exec_cmd
-            items[cat] = items[cat] line "\n"
-        }
-    }
-    in_desktop = 0; nodisplay = 0; type = ""; name = ""; icon = ""; exec_cmd = ""; cats = ""; term = ""
-}
-BEGIN {
-    in_desktop = 0
-}
-FNR == 1 {
-    flush_entry()
-}
-/^\[Desktop Entry\]/ {
-    flush_entry()
-    in_desktop = 1
-    next
-}
-/^\[/ {
-    if (in_desktop) flush_entry()
-    next
-}
-in_desktop {
-    pos = index($0, "=")
-    if (pos == 0) next
-    key = trim(substr($0, 1, pos - 1))
-    val = trim(substr($0, pos + 1))
-    if (key == "Type") type = val
-    else if (key == "Name" && name == "") name = val
-    else if (key == "Icon" && icon == "") icon = val
-    else if (key == "Exec" && exec_cmd == "") exec_cmd = val
-    else if (key == "Categories") cats = val
-    else if (key == "Terminal") term = tolower(val)
-    else if ((key == "NoDisplay" || key == "Hidden") && tolower(val) == "true") nodisplay = 1
-}
-END {
-    flush_entry()
-    order[1] = "Internet";    icons["Internet"] = "applications-internet"
-    order[2] = "Utilities";   icons["Utilities"] = "applications-accessories"
-    order[3] = "System";      icons["System"] = "applications-system"
-    order[4] = "Office";      icons["Office"] = "applications-office"
-    order[5] = "Graphics";    icons["Graphics"] = "applications-graphics"
-    order[6] = "Multimedia";  icons["Multimedia"] = "applications-multimedia"
-    order[7] = "Development"; icons["Development"] = "applications-development"
-    order[8] = "Games";       icons["Games"] = "applications-games"
-    order[9] = "Other";       icons["Other"] = "applications-other"
-    for (i = 1; i <= 9; i++) {
-        c = order[i]
-        if (items[c] != "") {
-            printf "menu \"%s\" %s {\n%s}\n", c, icons[c], items[c]
-        }
-    }
-}
-' "$@" 2>/dev/null
-EOF
-    chmod 0755 "${ROOTFS_DIR}/usr/local/bin/icewm-dynamic-menu"
-
-    cat > "${ROOTFS_DIR}/root/.icewm/menu" <<'EOF'
-menuprog "Applications" folder /usr/local/bin/icewm-dynamic-menu
-separator
-restart "Restart IceWM" icewm icewm
-EOF
+    rm -f "${ROOTFS_DIR}/usr/local/bin/icewm-dynamic-menu"
+    rm -rf "${ROOTFS_DIR}/root/.icewm"
 
     # Xorg on AvoryOS: the kernel's native DRM is card0, input comes from the
     # kernel evdev nodes.  Same configuration the regular rootfs uses.
@@ -608,7 +592,7 @@ ID=avoryos
 ID_LIKE=arch
 VERSION="1.0 (Minimal)"
 VERSION_ID=1.0-minimal
-PRETTY_NAME="AvoryOS Minimal (bash + Xorg + IceWM)"
+PRETTY_NAME="AvoryOS Minimal (bash + Xorg + XFCE4)"
 HOME_URL="https://github.com/Hidotu-Labs/AvoryOS"
 EOF
     rm -f "${ROOTFS_DIR}/etc/os-release"
@@ -616,12 +600,41 @@ EOF
 }
 
 build_caches() {
+    if [ -d "${ROOTFS_DIR}/usr/share/fonts" ]; then
+        # ext4 128-byte inodes and populate-ext2-dir.py store whole-second
+        # mtimes; zero nanoseconds before fc-cache so cached dir timestamps
+        # match inside the packed image.
+        python3 -c '
+import os, sys
+root = sys.argv[1]
+for dirpath, _, _ in os.walk(root, topdown=False):
+    st = os.stat(dirpath)
+    os.utime(dirpath, (int(st.st_atime), int(st.st_mtime)))
+' "${ROOTFS_DIR}/usr/share/fonts"
+    fi
     if [ -x "${ROOTFS_DIR}/usr/bin/fc-cache" ]; then
         log "Building fontconfig caches..."
         target_run /usr/bin/fc-cache -f 2>/dev/null || true
     fi
     if [ -x "${ROOTFS_DIR}/usr/bin/gdk-pixbuf-query-loaders" ]; then
         target_run /usr/bin/gdk-pixbuf-query-loaders --update-cache 2>/dev/null || true
+    fi
+    if [ -d "${ROOTFS_DIR}/usr/share/glib-2.0/schemas" ]; then
+        log "Compiling GLib schemas..."
+        if [ -x "${ROOTFS_DIR}/usr/bin/glib-compile-schemas" ] &&
+           target_run /usr/bin/glib-compile-schemas /usr/share/glib-2.0/schemas 2>/dev/null; then
+            :
+        elif command -v glib-compile-schemas >/dev/null 2>&1; then
+            glib-compile-schemas "${ROOTFS_DIR}/usr/share/glib-2.0/schemas" 2>/dev/null || true
+        fi
+    fi
+    if [ -d "${ROOTFS_DIR}/usr/share/applications" ]; then
+        if [ -x "${ROOTFS_DIR}/usr/bin/update-desktop-database" ] &&
+           target_run /usr/bin/update-desktop-database /usr/share/applications 2>/dev/null; then
+            :
+        elif command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database "${ROOTFS_DIR}/usr/share/applications" 2>/dev/null || true
+        fi
     fi
 }
 

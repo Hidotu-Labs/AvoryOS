@@ -151,6 +151,7 @@ bool lockdiag_self_holds_vmm_lock(uint32_t self_id);
  * wait_queue_* critical sections and where it entered, so a core spinning on a
  * queue's lock can be told who it is waiting for (including "that thread is a
  * zombie that will never release it"). */
+#if LOCKDIAG
 void lockdiag_wq_take(const void *wq, uint64_t ip);
 void lockdiag_wq_drop(const void *wq);
 
@@ -164,6 +165,16 @@ void lockdiag_wq_drop(const void *wq);
     lockdiag_wq_drop((const void *)(wq));                                      \
     spinlock_release(&(wq)->lock);                                             \
   } while (0)
+#else
+static inline void lockdiag_wq_take(const void *wq, uint64_t ip) {
+  (void)wq;
+  (void)ip;
+}
+static inline void lockdiag_wq_drop(const void *wq) { (void)wq; }
+
+#define LOCKDIAG_WQ_LOCK(wq) spinlock_acquire(&(wq)->lock)
+#define LOCKDIAG_WQ_UNLOCK(wq) spinlock_release(&(wq)->lock)
+#endif
 
 /* --- contended-acquire tracking -----------------------------------------
  * A core found spinning with interrupts masked gives no clue about *which*
@@ -171,6 +182,7 @@ void lockdiag_wq_drop(const void *wq);
  * asked for it and when the wait started, in a per-CPU slot written once per
  * contended acquire (never per spin iteration).  A core that dies spinning
  * leaves its slot set, so the report can say exactly what it was waiting on. */
+#if LOCKDIAG
 void lockdiag_spin_begin(const void *lock, uint64_t ip);
 void lockdiag_spin_end(const void *lock);
 bool lockdiag_get_spin_wait(uint32_t cpu_id, uint64_t *lock_out, uint64_t *ip_out, uint64_t *since_tsc_out);
@@ -179,6 +191,24 @@ bool lockdiag_get_spin_wait(uint32_t cpu_id, uint64_t *lock_out, uint64_t *ip_ou
   lockdiag_spin_begin((const void *)(lock),                                    \
                       (uint64_t)__builtin_return_address(0))
 #define LOCKDIAG_SPIN_END(lock) lockdiag_spin_end((const void *)(lock))
+#else
+static inline void lockdiag_spin_begin(const void *lock, uint64_t ip) {
+  (void)lock;
+  (void)ip;
+}
+static inline void lockdiag_spin_end(const void *lock) { (void)lock; }
+static inline bool lockdiag_get_spin_wait(uint32_t cpu_id, uint64_t *lock_out,
+                                          uint64_t *ip_out,
+                                          uint64_t *since_tsc_out) {
+  (void)cpu_id;
+  (void)lock_out;
+  (void)ip_out;
+  (void)since_tsc_out;
+  return false;
+}
+#define LOCKDIAG_SPIN_BEGIN(lock) ((void)(lock))
+#define LOCKDIAG_SPIN_END(lock) ((void)(lock))
+#endif
 
 /* --- detector ----------------------------------------------------------- */
 

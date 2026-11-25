@@ -54,6 +54,7 @@ void device_set_node(struct device *dev, struct fwnode_handle *fwnode) {
 void device_initialize(struct device *dev) {
   dev->power.can_wakeup = false;
   dev->power.should_wakeup = false;
+  pm_runtime_init(dev);
   INIT_LIST_HEAD(&dev->devres_head);
   spin_lock_init(&dev->devres_lock);
   INIT_LIST_HEAD(&dev->kpi_list);

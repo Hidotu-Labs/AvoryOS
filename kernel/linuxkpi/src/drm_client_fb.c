@@ -316,8 +316,12 @@ _Bool linuxkpi_drm_console_owns_scanout(void) {
   unsigned long flags;
   bool owns;
 
+  /* Once a LinuxKPI DRM console client has taken over scanout, fb_draw.c must
+   * never fall back to the legacy GOP front buffer (which can alias reclaimed
+   * VRAM). Actual console blits are still gated on kpi_drm_console_can_blit()
+   * inside linuxkpi_drm_console_blit_rect(). */
   spin_lock_irqsave(&kpi_console_lock, flags);
-  owns = kpi_drm_console_can_blit(kpi_console_client);
+  owns = (kpi_console_client != NULL && kpi_console_client->active);
   spin_unlock_irqrestore(&kpi_console_lock, flags);
   return owns;
 }
