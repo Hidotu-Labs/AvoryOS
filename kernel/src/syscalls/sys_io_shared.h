@@ -58,7 +58,8 @@ static inline bool fd_is_valid_node(const vfs_node_t *node) {
 
 /* Pin a published descriptor before leaving the file-table lock. Blocking
  * handlers may run after another thread closes or replaces the fd. */
-static inline vfs_node_t *fd_node_get(struct thread *t, uint64_t fd) {
+static inline vfs_node_t *fd_node_get_with_flags(struct thread *t, uint64_t fd,
+                                                 uint32_t *flags) {
   if (!t || !t->files || fd >= MAX_FDS)
     return NULL;
   spinlock_acquire(&t->files->lock);
@@ -67,12 +68,19 @@ static inline vfs_node_t *fd_node_get(struct thread *t, uint64_t fd) {
     return NULL;
   }
   vfs_node_t *node = t->fds[fd];
-  if (fd_is_valid_node(node))
+  if (fd_is_valid_node(node)) {
     vfs_node_ref(node);
-  else
+    if (flags)
+      *flags = t->fd_flags[fd];
+  } else {
     node = NULL;
+  }
   spinlock_release(&t->files->lock);
   return node;
+}
+
+static inline vfs_node_t *fd_node_get(struct thread *t, uint64_t fd) {
+  return fd_node_get_with_flags(t, fd, NULL);
 }
 
 static inline void fd_node_put(vfs_node_t **node) {

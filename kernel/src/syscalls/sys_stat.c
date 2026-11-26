@@ -79,9 +79,9 @@ void fill_kstat(struct kstat *ks, vfs_node_t *node) {
             ks->st_dev = (uint64_t)block_device_userspace_rdev(bd);
     }
 
-    ks->st_size    = (int64_t)node->length;
+    ks->st_size    = (int64_t)vfs_size(node);
     ks->st_blksize = 4096;
-    ks->st_blocks  = (ks->st_size + 511) / 512;
+    ks->st_blocks  = ks->st_size / 512 + (ks->st_size % 512 != 0);
 
     ks->st_atim_sec  = (int64_t)node->atime;
     ks->st_atim_nsec = 0;
@@ -345,7 +345,7 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags,
     }
     kstx.stx_mode   = (uint16_t)mode;
     kstx.stx_ino    = node->inode;
-    kstx.stx_size   = node->length;
+    kstx.stx_size   = vfs_size(node);
     kstx.stx_blocks = (kstx.stx_size + 511) / 512;
     kstx.stx_atime.tv_sec = (int64_t)node->atime;
     kstx.stx_mtime.tv_sec = (int64_t)node->mtime;

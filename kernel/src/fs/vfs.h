@@ -176,6 +176,14 @@ typedef uint32_t (*read_type_t)(struct vfs_node *, uint32_t, uint32_t,
                                 uint8_t *);
 typedef uint32_t (*write_type_t)(struct vfs_node *, uint32_t, uint32_t,
                                  uint8_t *);
+/* Wide offsets for backends that do not use the 32-bit native page cache. */
+struct vfs_io64 {
+  uint64_t (*size)(struct vfs_node *);
+  uint32_t (*read)(struct vfs_node *, uint64_t, uint32_t, uint8_t *);
+  uint32_t (*write)(struct vfs_node *, uint64_t, uint32_t, uint8_t *);
+  uint32_t (*append)(struct vfs_node *, uint32_t, uint8_t *, uint64_t *);
+  int (*truncate)(struct vfs_node *, uint64_t);
+};
 typedef void (*open_type_t)(struct vfs_node *);
 typedef void (*close_type_t)(struct vfs_node *);
 typedef struct vfs_node *(*open_instance_type_t)(struct vfs_node *);
@@ -251,6 +259,7 @@ typedef struct vfs_node {
 
   read_type_t read;
   write_type_t write;
+  const struct vfs_io64 *io64;
   /* Optional append operation. Returns the actual end position on success;
    * disk backends select persistent EOF under their transaction ownership. */
   uint32_t (*append)(struct vfs_node *, uint32_t, uint8_t *, uint32_t *);
@@ -369,12 +378,13 @@ bool vfs_access(vfs_node_t *node, uint32_t requested);
 bool vfs_may_remove(vfs_node_t *parent, vfs_node_t *target);
 
 // Standard API wrapper functions
-uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
+uint64_t vfs_size(vfs_node_t *node);
+uint32_t vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size,
                   uint8_t *buffer);
-uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
+uint32_t vfs_write(vfs_node_t *node, uint64_t offset, uint32_t size,
                    uint8_t *buffer);
 uint32_t vfs_append(vfs_node_t *node, uint32_t size, uint8_t *buffer,
-                    uint32_t *end_offset);
+                    uint64_t *end_offset);
 void vfs_open(vfs_node_t *node);
 void vfs_close(vfs_node_t *node);
 
@@ -440,7 +450,7 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
                      vfs_node_t *new_parent, char *new_name);
 int vfs_chmod(vfs_node_t *node, uint16_t permission);
 int vfs_chown(vfs_node_t *node, uint32_t uid, uint32_t gid);
-int vfs_truncate(vfs_node_t *node, uint32_t size);
+int vfs_truncate(vfs_node_t *node, uint64_t size);
 int vfs_fallocate(vfs_node_t *node, int mode, uint32_t offset, uint32_t len);
 int vfs_mknod(vfs_node_t *node, char *name, uint16_t permission, uint32_t flags,
               void *device);
