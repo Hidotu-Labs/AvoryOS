@@ -807,7 +807,7 @@ __attribute__((optimize("O3"))) static void sched_schedule(bool voluntary_yield)
     __atomic_store_n(&next_t->on_cpu, true, __ATOMIC_RELEASE);
     __atomic_store_n(&cpu->switching_from, prev, __ATOMIC_RELEASE);
     fpu_on_context_switch();
-    __atomic_store_n(&cpu->current_thread, next_t, __ATOMIC_RELEASE);
+    __atomic_store_n(&cpu->current_thread, next_t, __ATOMIC_SEQ_CST);
 
     cpu->stack_top = (next_t->stack_base + next_t->stack_size) & ~0xFULL;
     tss_set_rsp0(cpu->stack_top);

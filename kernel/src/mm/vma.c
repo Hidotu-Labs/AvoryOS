@@ -238,6 +238,7 @@ static struct vma *delete_node(struct vma *node, uint64_t start,
       node->numa_policy = temp->numa_policy;
       node->numa_nodemask = temp->numa_nodemask;
       node->numa_preferred_node = temp->numa_preferred_node;
+      node->pkey = temp->pkey;
 
       // Delete the inorder successor
       node->right = delete_node(node->right, temp->start, deleted);
@@ -331,6 +332,7 @@ int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
   new_node->file_node = file_node;
   vma_file_ref(file_node);
   new_node->linux_vma = NULL;
+  new_node->pkey = 0;
   new_node->numa_policy = 0;
   new_node->numa_nodemask = 0;
   new_node->numa_preferred_node = 0;
@@ -377,6 +379,15 @@ void vma_drop_list_release(struct vma_drop_list *drops) {
   drops->more = false;
 }
 
+static inline void vma_set_pkey(struct vma_list *list, uint64_t start,
+                                uint8_t pkey) {
+  if (pkey == 0)
+    return;
+  struct vma *s = vma_find(list, start);
+  if (s)
+    s->pkey = pkey;
+}
+
 bool vma_remove_collect(struct vma_list *list, uint64_t start, uint64_t end,
                         struct vma_drop_list *drops) {
   TSC_BEGIN(vma_remove);
@@ -400,6 +411,7 @@ bool vma_remove_collect(struct vma_list *list, uint64_t start, uint64_t end,
     uint64_t v_end = v->end;
     uint64_t prot = v->prot;
     uint64_t flags = v->flags;
+    uint8_t orig_pkey = v->pkey;
     int fd = v->fd;
     uint64_t offset = v->offset;
     uint64_t orig_file_size = v->file_size;
@@ -426,9 +438,11 @@ bool vma_remove_collect(struct vma_list *list, uint64_t start, uint64_t end,
       uint64_t len2 = v_end - end;
       uint64_t sub2 = (orig_file_size > rel2) ? MIN(orig_file_size - rel2, len2) : 0;
 
-      vma_add(list, v_start, start, prot, flags, fd, offset, vma_file_node, sub1);
+      if (vma_add(list, v_start, start, prot, flags, fd, offset, vma_file_node, sub1) == 0)
+        vma_set_pkey(list, v_start, orig_pkey);
       vma_attach_linux(list, v_start, vma_linux_vma);
-      vma_add(list, end, v_end, prot, flags, fd, offset + rel2, vma_file_node, sub2);
+      if (vma_add(list, end, v_end, prot, flags, fd, offset + rel2, vma_file_node, sub2) == 0)
+        vma_set_pkey(list, end, orig_pkey);
       vma_attach_linux(list, end, vma_linux_vma);
     }
     // Case 3: Unmap from start - shrinking start boundary forward
@@ -438,7 +452,8 @@ bool vma_remove_collect(struct vma_list *list, uint64_t start, uint64_t end,
       uint64_t len = v_end - end;
       uint64_t sub = (orig_file_size > rel) ? MIN(orig_file_size - rel, len) : 0;
 
-      vma_add(list, end, v_end, prot, flags, fd, offset + rel, vma_file_node, sub);
+      if (vma_add(list, end, v_end, prot, flags, fd, offset + rel, vma_file_node, sub) == 0)
+        vma_set_pkey(list, end, orig_pkey);
       vma_attach_linux(list, end, vma_linux_vma);
     }
     // Case 4: Unmap from end - shrinking end boundary backward
@@ -447,7 +462,8 @@ bool vma_remove_collect(struct vma_list *list, uint64_t start, uint64_t end,
       uint64_t len = start - v_start;
       uint64_t sub = MIN(orig_file_size, len);
 
-      vma_add(list, v_start, start, prot, flags, fd, offset, vma_file_node, sub);
+      if (vma_add(list, v_start, start, prot, flags, fd, offset, vma_file_node, sub) == 0)
+        vma_set_pkey(list, v_start, orig_pkey);
       vma_attach_linux(list, v_start, vma_linux_vma);
     }
 
@@ -785,6 +801,7 @@ static bool clone_recursive(struct vma_list *dst, struct vma *node) {
   vma_attach_linux(dst, node->start, node->linux_vma);
   struct vma *cloned = vma_find(dst, node->start);
   if (cloned) {
+    cloned->pkey = node->pkey;
     cloned->numa_policy = node->numa_policy;
     cloned->numa_nodemask = node->numa_nodemask;
     cloned->numa_preferred_node = node->numa_preferred_node;

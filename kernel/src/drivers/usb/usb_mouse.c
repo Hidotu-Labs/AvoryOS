@@ -770,9 +770,7 @@ static bool usb_mouse_parse_report(struct usb_mouse_state *ms,
     }
   } else if (ms->boot_capable && len <= 4 &&
              !hid_report_matches(&ms->layout, buf, len)) {
-    struct hid_mouse_layout boot;
-    hid_build_boot_layout(&boot, ms->max_packet);
-    ms->layout = boot;
+    hid_build_boot_layout(&ms->layout, ms->max_packet);
     ms->using_boot = true;
     ms->boot_layout = true;
     klog_puts("[USB-MOUSE] Short reports: using boot layout\n");

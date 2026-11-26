@@ -22,7 +22,7 @@ override IMAGE_NAME := avoryos-$(ARCH)
 # Public release identity embedded in the kernel. BUILD_TAG is generated and
 # persisted for each distinct kernel source state by scripts/kernel-build-tag.py.
 BUILD_NAME ?= Ascension
-BUILD_VERSION ?= 3.0.0
+BUILD_VERSION ?= 3.0.1
 
 # Boot the existing writable disk without traversing its rebuild prerequisites.
 # A missing disk is built normally; use `make disk.img` to refresh it explicitly.
@@ -957,10 +957,10 @@ disk.img: disk-full-force
 		[ -f userland/axon.elf ] && install -D -m 0755 userland/axon.elf build/arch/rootfs/usr/bin/axon || true; \
 		[ -f build/axon-src/axon.conf ] && install -D -m 0644 build/axon-src/axon.conf build/arch/rootfs/etc/axon/axon.conf || true; \
 		./scripts/configure-accounts.sh build/arch/rootfs; \
+		rm -rf build/arch/rootfs/var/lib/pacman/local/ascension-kernel-*; \
 		bash scripts/configure-pacman.sh build/arch/rootfs; \
 		mkdir -p build/arch/rootfs/var/lib/pacman/local; \
 		[ -f build/arch/rootfs/var/lib/pacman/local/ALPM_DB_VERSION ] || printf '9\n' > build/arch/rootfs/var/lib/pacman/local/ALPM_DB_VERSION; \
-		rm -rf build/arch/rootfs/var/lib/pacman/local/ascension-kernel-*; \
 		_ktag=$$(awk '{print $$2; exit}' build/kernel-build-tag 2>/dev/null || true); \
 		[ -n "$$_ktag" ] || _ktag=0; \
 		_kver="$(subst -,.,$(BUILD_VERSION)).0.$$_ktag-1"; \

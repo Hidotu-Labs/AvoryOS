@@ -265,8 +265,9 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
   uint64_t aligned_size = PAGE_ALIGN_UP(seg->size);
 
   // Determine attach address
-  uint64_t vaddr;
-  if (shmaddr != 0) {
+  uint64_t vaddr = 0;
+  bool find_gap = (shmaddr == 0);
+  if (!find_gap) {
     // User-specified address
     if (shmaddr & (PAGE_SIZE - 1)) {
       if (shmflg & SHM_RND) {
@@ -277,41 +278,59 @@ int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg,
       }
     }
     vaddr = shmaddr;
-  } else {
-    // Auto-select address from SHM mmap region
-    if (t->mm) {
-      vaddr = vma_find_gap(&t->mm->vmas, aligned_size,
-                           t->mm->compat32 ? 0x50000000ULL : SHM_MMAP_REGION_BASE,
-                           t->mm->compat32 ? 0xb0000000ULL : SHM_MMAP_REGION_LIMIT);
-    } else {
-      vaddr = 0;
-    }
-    if (vaddr == 0) {
-      spinlock_release(&shm_lock);
-      return -12; // ENOMEM
-    }
   }
 
-  // Register VMA as MAP_SHARED | MAP_SYSV_SHM.
-  // Physical pages are populated on demand in the page fault handler.
-  // We record seg->shmid in vma->offset so shmdt and page fault can look it up.
-  uint64_t prot = 0x1; // PROT_READ
-  if (!(shmflg & SHM_RDONLY))
-    prot |= 0x2; // PROT_WRITE
-
-  if (t->mm) {
-    if (vma_add(&t->mm->vmas, vaddr, vaddr + aligned_size, prot,
-                MAP_SHARED | MAP_SYSV_SHM, -1, (uint64_t)seg->shmid, NULL, 0) != 0) {
-      spinlock_release(&shm_lock);
-      return -12; // ENOMEM
-    }
-  }
-
+  uint32_t seg_id = seg->shmid;
+  uint32_t ns_id = seg->namespace_id;
   seg->nattch++;
   seg->attach_time = shm_now();
   seg->last_pid = t->tid;
-
   spinlock_release(&shm_lock);
+
+  // Register VMA as MAP_SHARED | MAP_SYSV_SHM under t->mm->lock without
+  // nesting shm_lock and mm->lock (matches vmm_fault.c lock discipline).
+  // Physical pages are populated on demand in the page fault handler.
+  bool vma_ok = false;
+  if (t->mm) {
+    uint64_t prot = 0x1; // PROT_READ
+    if (!(shmflg & SHM_RDONLY))
+      prot |= 0x2; // PROT_WRITE
+
+    spinlock_acquire(&t->mm->lock);
+    if (find_gap) {
+      vaddr = vma_find_gap(&t->mm->vmas, aligned_size,
+                           t->mm->compat32 ? 0x50000000ULL : SHM_MMAP_REGION_BASE,
+                           t->mm->compat32 ? 0xb0000000ULL : SHM_MMAP_REGION_LIMIT);
+    }
+    if (vaddr != 0) {
+      vma_ok = (vma_add(&t->mm->vmas, vaddr, vaddr + aligned_size, prot,
+                        MAP_SHARED | MAP_SYSV_SHM, -1, (uint64_t)seg_id,
+                        NULL, 0) == 0);
+    }
+    spinlock_release(&t->mm->lock);
+  }
+
+  if (!vma_ok) {
+    spinlock_acquire(&shm_lock);
+    struct shm_segment *revert = NULL;
+    for (int i = 0; i < SHM_MAX_SEGMENTS; i++) {
+      if (shm_table[i].active &&
+          shm_table[i].namespace_id == ns_id &&
+          shm_table[i].shmid == seg_id) {
+        revert = &shm_table[i];
+        break;
+      }
+    }
+    if (revert) {
+      if (revert->nattch > 0)
+        revert->nattch--;
+      if (revert->marked_destroy && revert->nattch == 0)
+        shm_destroy_segment(revert);
+    }
+    spinlock_release(&shm_lock);
+    return -12; // ENOMEM
+  }
+
   return (int64_t)vaddr;
 }
 
@@ -354,6 +373,7 @@ uint64_t shm_get_or_alloc_page(uint32_t shmid, uint32_t page_idx) {
 }
 
 // sys_shmdt
+#define SHMDT_BATCH_PAGES 32
 
 int64_t sys_shmdt(uint64_t shmaddr, uint64_t a1, uint64_t a2, uint64_t a3,
                   uint64_t a4, uint64_t a5) {
@@ -369,52 +389,75 @@ int64_t sys_shmdt(uint64_t shmaddr, uint64_t a1, uint64_t a2, uint64_t a3,
   struct thread *t = sched_get_current();
   if (!t)
     return -1;
+  if (!t->mm)
+    return -22;
 
-  // Find the VMA for this address
-  struct vma *v = NULL;
-  if (t->mm) {
-    v = vma_find(&t->mm->vmas, shmaddr);
-  }
+  // Step 1: Validate and disarm the VMA under mm->lock so concurrent faults
+  // cannot reinstall PTEs, concurrent shmdt cannot double-detach, and mmap/
+  // shmat cannot reuse the VA range while teardown runs in bounded batches.
+  spinlock_acquire(&t->mm->lock);
+  struct vma *v = vma_find(&t->mm->vmas, shmaddr);
 
   /* An attach must be detached at its original address.  Requiring the
    * internal SHM marker also prevents shmdt from consuming an unrelated
    * MAP_SHARED mapping. */
-  if (!v || v->start != shmaddr || !(v->flags & MAP_SYSV_SHM))
+  if (!v || v->start != shmaddr || !(v->flags & MAP_SYSV_SHM)) {
+    spinlock_release(&t->mm->lock);
     return -22; // EINVAL
+  }
 
   uint64_t size = v->end - v->start;
   uint32_t num_pages = (uint32_t)(size / PAGE_SIZE);
   uint32_t shmid = (uint32_t)v->offset;
+  v->prot = PROT_NONE;
+  v->flags &= ~MAP_SYSV_SHM;
+  spinlock_release(&t->mm->lock);
 
+  // Step 2: Unmap PTEs in bounded batches and drain remote TLB shootdowns with
+  // IRQs enabled before dropping PMM page references.
+  TSC_BEGIN(shmdt_unmap);
+  uint64_t *pml4 = vmm_get_active_pml4();
+  for (uint32_t i = 0; i < num_pages; i += SHMDT_BATCH_PAGES) {
+    uint64_t batch_phys[SHMDT_BATCH_PAGES];
+    uint32_t batch_cnt = 0;
+    uint32_t batch_end = i + SHMDT_BATCH_PAGES;
+    if (batch_end > num_pages)
+      batch_end = num_pages;
+
+    spinlock_acquire(&t->mm->lock);
+    for (uint32_t j = i; j < batch_end; j++) {
+      uint64_t va = shmaddr + (uint64_t)j * PAGE_SIZE;
+      uint64_t phys = vmm_virt_to_phys(pml4, va);
+      if (phys) {
+        vmm_unmap_page(pml4, va);
+        batch_phys[batch_cnt++] = phys & 0x000FFFFFFFFFF000ULL;
+      }
+    }
+    spinlock_release(&t->mm->lock);
+
+    vmm_drain_deferred_work();
+    for (uint32_t j = 0; j < batch_cnt; j++) {
+      pmm_decref((void *)batch_phys[j]);
+    }
+  }
+
+  // Step 3: Remove the VMA under mm->lock now that all PTEs are gone.
+  spinlock_acquire(&t->mm->lock);
+  vma_remove(&t->mm->vmas, shmaddr, shmaddr + size);
+  spinlock_release(&t->mm->lock);
+  TSC_END(shmdt_unmap);
+
+  // Step 4: Update segment accounting and destroy if marked and unattached.
   spinlock_acquire(&shm_lock);
-
-  // Find which segment this belongs to by segment ID
   struct shm_segment *seg = NULL;
   for (int i = 0; i < SHM_MAX_SEGMENTS; i++) {
-    if (shm_table[i].active && shm_table[i].shmid == shmid) {
+    if (shm_table[i].active &&
+        shm_table[i].namespace_id == ipc_namespace_id(t) &&
+        shm_table[i].shmid == shmid) {
       seg = &shm_table[i];
       break;
     }
   }
-
-  // Unmap pages and decrement refcounts
-  TSC_BEGIN(shmdt_unmap);
-  uint64_t *pml4 = vmm_get_active_pml4();
-  for (uint32_t i = 0; i < num_pages; i++) {
-    uint64_t va = shmaddr + i * PAGE_SIZE;
-    uint64_t phys = vmm_virt_to_phys(pml4, va);
-    if (phys) {
-      phys &= 0x000FFFFFFFFFF000ULL;
-      vmm_unmap_page(pml4, va);
-      pmm_decref((void *)phys);
-    }
-  }
-
-  // Remove VMA
-  if (t->mm) {
-    vma_remove(&t->mm->vmas, shmaddr, shmaddr + size);
-  }
-  TSC_END(shmdt_unmap);
 
   if (seg) {
     if (seg->nattch > 0)

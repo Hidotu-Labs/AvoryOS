@@ -35,7 +35,7 @@ CPPFLAGS :=
 
 # Release identity is supplied by the repository's top-level make invocation.
 BUILD_NAME ?= Ascension
-BUILD_VERSION ?= 3.0.0
+BUILD_VERSION ?= 3.0.1
 BUILD_TAG ?= dev
 override CPPFLAGS += -DAVORY_BUILD_NAME='"$(BUILD_NAME)"' \
 	-DAVORY_BUILD_VERSION='"$(BUILD_VERSION)"' \

@@ -305,7 +305,8 @@ static int write_xinitrc(const char *path, const char *xinit_cmd, const char *xk
         "export XDG_CACHE_HOME=\"${XDG_CACHE_HOME:-${_avory_home}/.cache}\"\n"
         "export XDG_DATA_HOME=\"${XDG_DATA_HOME:-${_avory_home}/.local/share}\"\n"
         "export XDG_STATE_HOME=\"${XDG_STATE_HOME:-${_avory_home}/.local/state}\"\n"
-        "unset _avory_home\n";
+        "unset _avory_home\n"
+        "export GLYCIN_DISABLE_SANDBOX=i-know-the-risks\n";
 
     FILE *f = fopen(path, "w");
     if (!f) return -1;

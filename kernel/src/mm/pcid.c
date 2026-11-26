@@ -73,24 +73,17 @@ void pcid_free(uint16_t pcid) {
   if (pcid == PCID_KERNEL || pcid > PCID_MAX)
     return;
 
-  spinlock_acquire(&pcid_lock);
-  size_t word = pcid / 64;
-  size_t bit = pcid % 64;
-  pcid_bitmap[word] &= ~(1ULL << bit);
-  if (pcid < next_hint)
-    next_hint = pcid;
-  spinlock_release(&pcid_lock);
-
   /*
    * Releasing a PCID must leave no core able to reuse it with stale
    * translations, because pcid_alloc() hands ids straight back out.
    *
-   * Clearing each CPU's bookkeeping bit is what achieves that: the scheduler
-   * only reloads CR3 with CR3_NOFLUSH when the bit is set (sched/sched.c), so
-   * the next switch into a recycled PCID is a flushing load.  Note that
+   * Clearing each CPU's bookkeeping bit BEFORE returning the id to the
+   * allocator achieves that: the scheduler only reloads CR3 with
+   * CR3_NOFLUSH when the bit is set (sched/sched.c), so the next switch
+   * into a recycled PCID is a flushing load.  Note that
    * pcid_flush_context() below can only ever reach this core - INVPCID is a
-   * local instruction - so the bitmap clears, not the INVPCID, are what make
-   * remote reuse safe.
+   * local instruction - so clearing the per-CPU bits before releasing the id
+   * is what makes remote reuse safe.
    */
   uint32_t count = cpu_get_count();
   for (uint32_t i = 0; i < count; i++) {
@@ -104,6 +97,14 @@ void pcid_free(uint16_t pcid) {
   if (cpu_has_invpcid()) {
     pcid_flush_context(pcid);
   }
+
+  spinlock_acquire(&pcid_lock);
+  size_t word = pcid / 64;
+  size_t bit = pcid % 64;
+  pcid_bitmap[word] &= ~(1ULL << bit);
+  if (pcid < next_hint)
+    next_hint = pcid;
+  spinlock_release(&pcid_lock);
 }
 
 /*
@@ -144,7 +145,11 @@ void cpu_pcid_invalidate(struct cpu_info *cpu, uint16_t pcid) {
 void cpu_pcid_invalidate_all(struct cpu_info *cpu) {
   if (!cpu)
     return;
-  memset(cpu->active_pcids_bmp, 0, sizeof(cpu->active_pcids_bmp));
+  size_t words =
+      sizeof(cpu->active_pcids_bmp) / sizeof(cpu->active_pcids_bmp[0]);
+  for (size_t i = 0; i < words; i++) {
+    __atomic_store_n(&cpu->active_pcids_bmp[i], 0ULL, __ATOMIC_SEQ_CST);
+  }
 }
 
 void pcid_flush_context(uint16_t pcid) {

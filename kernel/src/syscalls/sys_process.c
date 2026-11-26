@@ -685,15 +685,15 @@ static uint64_t sys_uname(uint64_t buf_ptr, uint64_t a1, uint64_t a2,
   uts_namespace_read(sched_get_current(), buf->nodename, buf->domainname);
   strcpy(buf->release, AVORY_BUILD_VERSION);
 
-  static char cached_version[80] = "";
+  static char cached_version[65] = "";
   static uint64_t cached_ms = 0;
   uint64_t now_ms = lapic_timer_get_ms();
   if (!cached_version[0] || now_ms - cached_ms >= 1000) {
     char datetime[32];
     rtc_format_datetime(rtc_get_timestamp(), datetime, sizeof(datetime));
-    strcpy(cached_version, AVORY_BUILD_NAME " " AVORY_BUILD_VERSION
-                             " build " AVORY_BUILD_TAG " ");
-    strcat(cached_version, datetime);
+    snprintf(cached_version, sizeof(cached_version),
+             "%s %s %s kernel update works %s",
+             AVORY_BUILD_NAME, AVORY_BUILD_VERSION, AVORY_BUILD_TAG, datetime);
     cached_ms = now_ms;
   }
   strcpy(buf->version, cached_version);

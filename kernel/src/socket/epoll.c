@@ -310,12 +310,14 @@ static void ep_chain_wake(eventpoll_t *ep) {
 static void ep_add_to_ready_list(eventpoll_t *ep, epitem_t *epi) {
   /* Advance before the fast path so a concurrent unlocked readiness poll can
    * detect this notification even if the item still appears queued. */
-  __atomic_fetch_add(&epi->notify_seq, 1, __ATOMIC_ACQ_REL);
+  __atomic_fetch_add(&epi->notify_seq, 1, __ATOMIC_SEQ_CST);
 
   // An in-flight item is not on the shared ready list and cannot be skipped.
-  if (__atomic_load_n(&epi->on_ready_list, __ATOMIC_ACQUIRE) &&
-      !__atomic_load_n(&epi->in_scan, __ATOMIC_ACQUIRE) &&
-      __atomic_load_n(&ep->wq.head, __ATOMIC_RELAXED) == NULL) {
+  // Check !in_scan before on_ready_list so TSO load ordering pairs with
+  // epoll_wait_impl() clearing on_ready_list before clearing in_scan.
+  if (!__atomic_load_n(&epi->in_scan, __ATOMIC_ACQUIRE) &&
+      __atomic_load_n(&epi->on_ready_list, __ATOMIC_ACQUIRE) &&
+      __atomic_load_n(&ep->wq.head, __ATOMIC_ACQUIRE) == NULL) {
     return;
   }
 
@@ -615,8 +617,7 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
         epitem_t *epi = candidates[i];
         uint32_t ready = polled_events[i] &
                           (watch_masks[i] | EPOLLERR | EPOLLHUP);
-        if (!ready || epi->removed || !epi->in_scan || epi->oneshot_disabled ||
-            scan_sequences[i] != __atomic_load_n(&epi->notify_seq, __ATOMIC_ACQUIRE))
+        if (!ready || epi->removed || !epi->in_scan || epi->oneshot_disabled)
           continue;
         delivery_mask |= 1ULL << i;
         ctl_sequences[i] = epi->ctl_seq;
@@ -655,8 +656,6 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
         bool keep_ready = (selected && !delivered) ||
             scan_sequences[i] != __atomic_load_n(&epi->notify_seq, __ATOMIC_ACQUIRE);
 
-        epi->in_scan = false;
-
         if (delivered && epi->oneshot) {
           __atomic_store_n(&epi->oneshot_disabled, true, __ATOMIC_RELEASE);
           __atomic_store_n(&epi->registered_events, 0, __ATOMIC_RELEASE);
@@ -668,9 +667,11 @@ int epoll_wait_impl(eventpoll_t *ep, struct epoll_event *events, int maxevents,
         if (keep_ready) {
           list_add_tail(&epi->rdllink, &ep->rdllist);
           ep->rdllist_count++;
+          __atomic_store_n(&epi->in_scan, false, __ATOMIC_RELEASE);
         } else {
-          epi->on_ready_list = false;
+          __atomic_store_n(&epi->on_ready_list, false, __ATOMIC_RELEASE);
           INIT_LIST_HEAD(&epi->rdllink);
+          __atomic_store_n(&epi->in_scan, false, __ATOMIC_RELEASE);
         }
 
         if (keep_ready) {

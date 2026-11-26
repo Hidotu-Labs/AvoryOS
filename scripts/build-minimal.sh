@@ -445,6 +445,7 @@ EOF
 export HOME=/root
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export TERM=linux
+export GLYCIN_DISABLE_SANDBOX=i-know-the-risks
 
 export XDG_RUNTIME_DIR=/run/user/0
 mkdir -p "$XDG_RUNTIME_DIR"
@@ -510,6 +511,7 @@ export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${_avory_home}/.cache}"
 export XDG_DATA_HOME="${XDG_DATA_HOME:-${_avory_home}/.local/share}"
 export XDG_STATE_HOME="${XDG_STATE_HOME:-${_avory_home}/.local/state}"
 unset _avory_home
+export GLYCIN_DISABLE_SANDBOX=i-know-the-risks
 if [ -f /etc/X11/xinit/Xresources ]; then
     xrdb -merge /etc/X11/xinit/Xresources 2>/dev/null || true
 fi
@@ -597,6 +599,19 @@ HOME_URL="https://github.com/Hidotu-Labs/AvoryOS"
 EOF
     rm -f "${ROOTFS_DIR}/etc/os-release"
     ln -sfn ../usr/lib/os-release "${ROOTFS_DIR}/etc/os-release"
+
+    # Non-root/unprivileged bubblewrap cannot yet set up user-namespace UID maps
+    # on AvoryOS; without this fallback, Glycin image loaders hang inside bwrap
+    # and block GTK3 apps (including Thunar).
+    touch "${ROOTFS_DIR}/etc/environment"
+    if ! grep -q '^GLYCIN_DISABLE_SANDBOX=' "${ROOTFS_DIR}/etc/environment"; then
+        printf '\nGLYCIN_DISABLE_SANDBOX=i-know-the-risks\n' >> "${ROOTFS_DIR}/etc/environment"
+    fi
+    mkdir -p "${ROOTFS_DIR}/etc/profile.d"
+    cat > "${ROOTFS_DIR}/etc/profile.d/avory-glycin.sh" <<'EOF'
+export GLYCIN_DISABLE_SANDBOX=i-know-the-risks
+EOF
+    chmod 0644 "${ROOTFS_DIR}/etc/profile.d/avory-glycin.sh"
 }
 
 build_caches() {

@@ -148,9 +148,20 @@ static bool cpu_needs_shootdown(struct cpu_info *cpu, struct cpu_info *self,
     struct thread *published =
         __atomic_load_n(&cpu->current_thread, __ATOMIC_ACQUIRE);
     if (published && published == cpu->idle_thread) {
-        if (cpu_has_pcid() && pcid != PCID_KERNEL && pcid <= PCID_MAX)
-            cpu_pcid_invalidate(cpu, (uint16_t)pcid);
+      if (cpu_has_pcid()) {
+        if (pcid != PCID_KERNEL && pcid <= PCID_MAX)
+          cpu_pcid_invalidate(cpu, (uint16_t)pcid);
+        else
+          cpu_pcid_invalidate_all(cpu);
+        /* Dekker check against sched_schedule()'s SEQ_CST current_thread
+         * publish so an idle->user transition cannot read a stale cached bit
+         * and load CR3_NOFLUSH after we skipped the IPI. */
+        published = __atomic_load_n(&cpu->current_thread, __ATOMIC_ACQUIRE);
+        if (published == cpu->idle_thread)
+          return false;
+      } else {
         return false;
+      }
     }
 
     /* queue_lock pairs the full current_thread/CR3 check with scheduler
@@ -174,9 +185,13 @@ static bool cpu_needs_shootdown(struct cpu_info *cpu, struct cpu_info *self,
     if (cpu_has_pcid()) {
         if (!has_user_mm) {
             /* PCID 0 is loaded with flushing semantics on every CR3 switch;
-             * other tags need their cached bit cleared before they run again. */
-            if (pcid != PCID_KERNEL)
+             * other tags need their cached bit cleared before they run again.
+             * When pcid == PCID_KERNEL (unknown tag), invalidate all cached
+             * user PCIDs so any subsequent user CR3 load flushes. */
+            if (pcid != PCID_KERNEL && pcid <= PCID_MAX)
                 cpu_pcid_invalidate(cpu, (uint16_t)pcid);
+            else
+                cpu_pcid_invalidate_all(cpu);
             spinlock_release(&cpu->queue_lock);
             return false;
         }
