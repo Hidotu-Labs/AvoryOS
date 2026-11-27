@@ -451,7 +451,7 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
     if (parent_owned) vfs_close(parent);
     if (base_owned) vfs_close(base_owned);
     TSC_END(unlink_op);
-    return result == 0 ? 0 : (uint64_t)-2;
+    return result > 0 || result == -1 ? (uint64_t)-2 : (uint64_t)result;
 }
 
 static uint64_t sys_unlink(uint64_t pathname_ptr, uint64_t a1, uint64_t a2,
@@ -1654,9 +1654,17 @@ static int vfs_set_node_times(vfs_node_t *node, uint32_t atime, uint32_t mtime) 
 
     extern int ext2_statfs_impl(vfs_node_t *, struct statfs_buf *);
     extern int ext4_statfs_impl(vfs_node_t *, struct statfs_buf *);
-    if (node->statfs && (node->statfs == ext2_statfs_impl || node->statfs == ext4_statfs_impl)) {
-        extern int ext2_utime_impl(vfs_node_t *node, uint32_t atime, uint32_t mtime);
-        ext2_utime_impl(node, atime, mtime);
+    extern int exfat_statfs_impl(vfs_node_t *, struct statfs_buf *);
+    if (node->statfs) {
+        if (node->statfs == ext2_statfs_impl || node->statfs == ext4_statfs_impl) {
+            extern int ext2_utime_impl(vfs_node_t *node, uint32_t atime, uint32_t mtime);
+            ext2_utime_impl(node, atime, mtime);
+        } else if (node->statfs == exfat_statfs_impl) {
+            extern int exfat_utime_impl(vfs_node_t *node, uint32_t atime, uint32_t mtime);
+            int rc = exfat_utime_impl(node, atime, mtime);
+            if (rc < 0)
+                return rc;
+        }
     }
     return 0;
 }

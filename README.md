@@ -82,6 +82,20 @@ make minimal-iso
 make run-minimal
 ```
 
+## exFAT
+
+Mount a clean exFAT volume with `mount -t exfat /dev/<device> /mnt`. The
+driver supports file and directory creation, resizing, moving and removal,
+Unicode lookups using the volume's upcase table, and files larger than 4 GiB.
+Use `-o ro` for a read-only mount or `-o overwrite` for writes confined to
+existing initialized data. TexFAT volumes can be mounted read-only. The VFS
+currently limits a path component to 127 UTF-8 bytes and file-backed mappings
+to offsets within its 32-bit page cache.
+
+Run `python3 scripts/tests/test_exfat_read_boot.py` after building the ISO and
+OVMF. The tests use QEMU, a static musl compiler and `exfatprogs` to exercise
+the driver and check the resulting images with `fsck.exfat`.
+
 ## Project layout
 
 - `kernel/` — kernel source and LinuxKPI compatibility code

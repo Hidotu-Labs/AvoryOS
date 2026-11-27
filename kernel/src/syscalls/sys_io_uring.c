@@ -19,6 +19,7 @@
 #include "sys_io_shared.h"
 #include "../apic/lapic_timer.h"
 #include "../console/klog.h"
+#include "../fs/mount_namespace.h"
 #include "../fs/ramfs.h"
 #include "../lib/string.h"
 #include "../mm/heap.h"
@@ -438,14 +439,15 @@ static int32_t ioring_vfs_io_user(vfs_node_t *node, uint64_t off,
                                   bool write) {
   if (len == 0)
     return 0;
-  if (off > UINT32_MAX)
+  uint64_t max_offset = vfs_backing_node(node)->io64 ? INT64_MAX : UINT32_MAX;
+  if (off > max_offset)
     return -22;
   if (!is_user_range((const void *)user_addr, len))
     return -14;
   if (asc_vfs_node_is_linux_file(node)) {
     uint32_t chunk = len > 0x7ffff000U ? 0x7ffff000U : len;
-    return write ? (int32_t)vfs_write(node, (uint32_t)off, chunk, (uint8_t *)user_addr)
-                 : (int32_t)vfs_read(node, (uint32_t)off, chunk, (uint8_t *)user_addr);
+    return write ? (int32_t)vfs_write(node, off, chunk, (uint8_t *)user_addr)
+                 : (int32_t)vfs_read(node, off, chunk, (uint8_t *)user_addr);
   }
 
   uint8_t stack_buf[256];
@@ -463,7 +465,7 @@ static int32_t ioring_vfs_io_user(vfs_node_t *node, uint64_t off,
   uint32_t done = 0;
   int32_t err = 0;
   while (done < len) {
-    if (off + done > UINT32_MAX) {
+    if (off + done > max_offset) {
       err = -22;
       break;
     }
@@ -475,7 +477,7 @@ static int32_t ioring_vfs_io_user(vfs_node_t *node, uint64_t off,
         err = -14;
         break;
       }
-      int32_t r = (int32_t)vfs_write(node, (uint32_t)(off + done), chunk, kbuf);
+      int32_t r = (int32_t)vfs_write(node, off + done, chunk, kbuf);
       if (r <= 0) {
         err = r;
         break;
@@ -484,7 +486,7 @@ static int32_t ioring_vfs_io_user(vfs_node_t *node, uint64_t off,
       if ((uint32_t)r < chunk)
         break;
     } else {
-      int32_t r = (int32_t)vfs_read(node, (uint32_t)(off + done), chunk, kbuf);
+      int32_t r = (int32_t)vfs_read(node, off + done, chunk, kbuf);
       if (r <= 0) {
         err = r;
         break;

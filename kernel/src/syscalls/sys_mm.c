@@ -202,6 +202,11 @@ static void teardown_release_collected(uint64_t *phys, uint16_t *npages,
   }
 }
 
+static void teardown_mark_dirty(vfs_node_t **nodes, uint32_t *offs, int n) {
+  for (int i = 0; i < n; i++)
+    vfs_cache_mark_dirty(nodes[i], offs[i]);
+}
+
 // Locked, batched teardown. Caller holds t->mm->lock (VMA tree stable).
 static void teardown_range_locked(uint64_t *pml4, struct thread *t,
                                   uint64_t base, uint64_t len,
@@ -212,6 +217,9 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
   uint64_t fphys[TEARDOWN_COLLECT];
   uint16_t fnpages[TEARDOWN_COLLECT];
   int nf = 0;
+  vfs_node_t *dnodes[TEARDOWN_COLLECT];
+  uint32_t doffs[TEARDOWN_COLLECT];
+  int nd = 0;
 
   // Empty-table sweep ledger: at most one sweep per touched PT.
   uint64_t sweep_pt = ~(uint64_t)0; // va>>21 key of the open PT
@@ -221,7 +229,7 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
   // VMA ownership cache: one lookup per interval instead of two per page.
   struct vma *cv = NULL;
   uint64_t cv_end = base;
-  bool ours = false, pagecache = false;
+  bool ours = false, pagecache = false, shared_pc = false;
 
   vmm_lock_acquire_for(pml4, base);
   // Flush collected frames + sweep the open PT. Drops and re-takes vmm_lock
@@ -234,19 +242,23 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
         ours = ((cv->flags & MAP_PRIVATE) &&
                 ((cv->flags & MAP_ANONYMOUS) || (cv->fd == -1 && !cv->file_node)));
         pagecache = vma_has_file_page_refs(cv) || (cv->flags & MAP_PRIVATE);
+        shared_pc = ((cv->flags & (MAP_PAGECACHE | MAP_SHARED)) ==
+                     (MAP_PAGECACHE | MAP_SHARED)) &&
+                    cv->file_node != NULL;
       } else {
         // Gap: unmap without freeing; re-evaluate on the next page. Gaps
         // are rare in teardown ranges, so one lookup per gap page is fine.
         cv_end = va + PAGE_SIZE;
         ours = false;
         pagecache = false;
+        shared_pc = false;
       }
     }
 
     /* MADV_DONTNEED cannot discard pages protected by mlock or MAP_LOCKED.
      * Keep their PTEs and backing references intact. munmap still tears them
      * down normally because it passes preserve_locked=false. */
-    uint64_t *leaf_entry = preserve_locked
+    uint64_t *leaf_entry = (preserve_locked || shared_pc)
                                ? vmm_get_leaf_entry_ptr(pml4, va)
                                : NULL;
     if (preserve_locked &&
@@ -256,9 +268,28 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
       continue;
     }
 
+    vfs_node_t *dirty_node = NULL;
+    uint32_t dirty_off = 0;
+    if (shared_pc && leaf_entry && (*leaf_entry & PAGE_FLAG_PRESENT) &&
+        !(*leaf_entry & PAGE_FLAG_PS) && (*leaf_entry & PAGE_FLAG_D)) {
+      vfs_node_t *backing = vfs_backing_node((vfs_node_t *)cv->file_node);
+      if (backing && vfs_node_is_alive(backing)) {
+        uint64_t foff = cv->offset + (va - cv->start);
+        if (foff <= UINT32_MAX) {
+          dirty_node = backing;
+          dirty_off = (uint32_t)foff;
+        }
+      }
+    }
+
     uint64_t frame = 0;
     vmm_unmap_kind_t kind = vmm_unmap_page_locked(pml4, va, &frame);
     if (kind == VMM_UNMAP_4K) {
+      if (dirty_node) {
+        dnodes[nd] = dirty_node;
+        doffs[nd] = dirty_off;
+        nd++;
+      }
       uint64_t ptk = va >> 21;
       if (ptk != sweep_pt) {
         if (pt_dirty)
@@ -308,6 +339,8 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
         }
         sweep_pt = ~(uint64_t)0;
         vmm_lock_release();
+        teardown_mark_dirty(dnodes, doffs, nd);
+        nd = 0;
         teardown_release_collected(fphys, fnpages, nf);
         nf = 0;
         vmm_drain_deferred_work();
@@ -323,13 +356,15 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
       }
     }
 
-    if (nf >= TEARDOWN_COLLECT) {
+    if (nf >= TEARDOWN_COLLECT || nd >= TEARDOWN_COLLECT) {
       if (pt_dirty) {
         vmm_free_empty_tables(pml4, sweep_rep);
         pt_dirty = false;
       }
       sweep_pt = ~(uint64_t)0;
       vmm_lock_release();
+      teardown_mark_dirty(dnodes, doffs, nd);
+      nd = 0;
       teardown_release_collected(fphys, fnpages, nf);
       nf = 0;
       vmm_drain_deferred_work();
@@ -343,6 +378,7 @@ static void teardown_range_locked(uint64_t *pml4, struct thread *t,
     vmm_free_empty_tables(pml4, sweep_rep);
   vmm_lock_release();
 
+  teardown_mark_dirty(dnodes, doffs, nd);
   teardown_release_collected(fphys, fnpages, nf);
   // Release page-table frames parked by the sweep above.
   vmm_drain_deferred_work();
@@ -399,6 +435,35 @@ static void teardown_range(uint64_t *pml4, struct thread *t, uint64_t base,
     }
 #undef HUGE_2MB
 
+
+    vfs_node_t *dirty_node = NULL;
+    uint32_t dirty_off = 0;
+    if (t && t->mm) {
+      spinlock_acquire(&t->mm->lock);
+      struct vma *v = vma_find(&t->mm->vmas, va);
+      if (v && ((v->flags & (MAP_PAGECACHE | MAP_SHARED)) ==
+                (MAP_PAGECACHE | MAP_SHARED)) &&
+          v->file_node) {
+        uint64_t foff = v->offset + (va - v->start);
+        vfs_node_t *backing = vfs_backing_node((vfs_node_t *)v->file_node);
+        if (foff <= UINT32_MAX && backing && vfs_node_is_alive(backing)) {
+          vmm_lock_acquire_for(pml4, va);
+          uint64_t *leaf = vmm_get_leaf_entry_ptr(pml4, va);
+          if (leaf && (*leaf & PAGE_FLAG_PRESENT) &&
+              !(*leaf & PAGE_FLAG_PS) && (*leaf & PAGE_FLAG_D)) {
+            vfs_node_ref(backing);
+            dirty_node = backing;
+            dirty_off = (uint32_t)foff;
+          }
+          vmm_lock_release();
+        }
+      }
+      spinlock_release(&t->mm->lock);
+    }
+    if (dirty_node) {
+      vfs_cache_mark_dirty(dirty_node, dirty_off);
+      vfs_close(dirty_node);
+    }
 
     // Only free frames we own: anonymous private mappings, plus page-cache
     // file frames (pmm_free_page() is a decref for those).
@@ -728,8 +793,9 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
 
   // File-backed mapping
   if (!(flags & MAP_ANONYMOUS) && (int64_t)fd != -1) {
+    uint32_t file_flags = 0;
     vfs_node_t *node __attribute__((cleanup(fd_node_put))) =
-        fd_node_get(current_thread, fd);
+        fd_node_get_with_flags(current_thread, fd, &file_flags);
     if (!node) {
       if (gap_reserved)
         mmap_gap_release(current_thread->mm, vaddr, aligned_len);
@@ -737,7 +803,9 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
     }
 
     uint64_t permissions = 0;
-    if ((flags & 3) == MAP_SHARED && vfs_mount_readonly(node))
+    bool wide = vfs_backing_node(node)->io64 != NULL;
+    if ((flags & MAP_SHARED) && (vfs_mount_readonly(node) ||
+        (wide && (file_flags & O_ACCMODE) != O_RDWR)))
       permissions |= MAP_DENY_SHARED_WRITE;
     if (vfs_mount_flags(node) & 8) permissions |= MAP_DENY_EXEC;
     if (((prot & PROT_WRITE) && (permissions & MAP_DENY_SHARED_WRITE)) ||
@@ -838,6 +906,13 @@ uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags,
       if (gap_reserved)
         mmap_gap_release(current_thread->mm, vaddr, aligned_len);
       return E_INVAL;
+    }
+    /* Native file mappings are backed by a 32-bit page cache. */
+    if (wide &&
+        (offset > UINT32_MAX || aligned_len > UINT32_MAX - offset)) {
+      if (gap_reserved)
+        mmap_gap_release(current_thread->mm, vaddr, aligned_len);
+      return (uint64_t)-75; /* EOVERFLOW */
     }
     if (!current_thread->mm)
       return E_NOMEM;
@@ -1361,8 +1436,15 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
   if (!current)
     return E_INVAL;
 
+  if (old_size > USER_ADDR_MAX || new_size > USER_ADDR_MAX)
+    return E_NOMEM;
+
   uint64_t aligned_old = PAGE_ALIGN_UP(old_size);
   uint64_t aligned_new = PAGE_ALIGN_UP(new_size);
+  if (!aligned_old || !aligned_new || aligned_old > USER_ADDR_MAX ||
+      aligned_new > USER_ADDR_MAX ||
+      old_addr > USER_ADDR_MAX - (aligned_old > aligned_new ? aligned_old : aligned_new))
+    return E_NOMEM;
   uint64_t *pml4 = vmm_get_active_pml4();
 
   spinlock_acquire(&current->mm->lock);
@@ -1377,6 +1459,27 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
     if (linuxkpi_vma_no_expand && linuxkpi_vma_no_expand(orig_vma->linux_vma)) {
       spinlock_release(&current->mm->lock);
       return E_INVAL;
+    }
+  }
+  if (!orig_vma || orig_vma->start > old_addr ||
+      aligned_old > orig_vma->end - old_addr) {
+    spinlock_release(&current->mm->lock);
+    return E_INVAL;
+  }
+
+  uint64_t prot = orig_vma->prot;
+  uint64_t vma_flags = orig_vma->flags;
+  int vma_fd = orig_vma->fd;
+  uint64_t vma_offset = orig_vma->offset + (old_addr - orig_vma->start);
+  vfs_node_t *vma_file = (vfs_node_t *)orig_vma->file_node;
+  uint64_t orig_file_size = orig_vma->file_size;
+  if (aligned_new > aligned_old && vma_file && (vma_flags & MAP_PAGECACHE)) {
+    vfs_node_t *backing = vfs_backing_node(vma_file);
+    bool wide = backing && backing->io64 != NULL;
+    if (wide &&
+        (vma_offset > UINT32_MAX || aligned_new > UINT32_MAX - vma_offset)) {
+      spinlock_release(&current->mm->lock);
+      return (uint64_t)-75; /* EOVERFLOW */
     }
   }
 
@@ -1413,17 +1516,6 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
     }
   }
 
-  // The original VMA was looked up above for the VM_DONTEXPAND check; the
-  // shrink path returned already, so it is still valid here.
-  if (!orig_vma) {
-    spinlock_release(&current->mm->lock);
-    return E_INVAL;
-  }
-  uint64_t prot = orig_vma->prot;
-  uint64_t vma_flags = orig_vma->flags;
-  int vma_fd = orig_vma->fd;
-  uint64_t vma_offset = orig_vma->offset;
-  vfs_node_t *vma_file = (vfs_node_t *)orig_vma->file_node;
   uint64_t page_flags = build_page_flags(prot);
 
   /* A Linux f_op->mmap() call leaves its bridge wrapper pending on this
@@ -1458,7 +1550,7 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
       vma_remove(&current->mm->vmas, old_addr, old_addr + aligned_old);
       int add_ret =
           vma_add(&current->mm->vmas, old_addr, old_addr + aligned_new, prot,
-                  vma_flags, vma_fd, vma_offset, vma_file, 0);
+                  vma_flags, vma_fd, vma_offset, vma_file, orig_file_size);
       if (add_ret == 0 && new_lvma) {
         if (linuxkpi_vma_rebase)
           linuxkpi_vma_rebase(new_lvma, old_addr, old_addr + aligned_new,
@@ -1475,6 +1567,28 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
 
       spinlock_release(&current->mm->lock);
       return old_addr;
+    }
+
+    if (vma_file && (vma_flags & MAP_PAGECACHE)) {
+      /* Page-cache file mappings demand-fault their backing pages; extend the
+       * VMA while preserving file_node, fd, and file offset. */
+      vfs_node_ref(vma_file);
+      void *keep_lvma = orig_vma->linux_vma;
+      vma_linux_get(keep_lvma);
+      vma_remove(&current->mm->vmas, old_addr, old_addr + aligned_old);
+      int add_ret =
+          vma_add(&current->mm->vmas, old_addr, old_addr + aligned_new, prot,
+                  vma_flags, vma_fd, vma_offset, vma_file, orig_file_size);
+      if (add_ret == 0 && keep_lvma) {
+        if (linuxkpi_vma_rebase)
+          linuxkpi_vma_rebase(keep_lvma, old_addr, old_addr + aligned_new,
+                              vma_offset);
+        vma_attach_linux(&current->mm->vmas, old_addr, keep_lvma);
+      }
+      vma_linux_put(keep_lvma);
+      vfs_close(vma_file);
+      spinlock_release(&current->mm->lock);
+      return add_ret < 0 ? E_NOMEM : old_addr;
     }
 
     // Allocate and map the new pages.
@@ -1516,7 +1630,7 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
 
   uint64_t new_addr = vma_find_gap(&current->mm->vmas, aligned_new,
                                    MMAP_REGION_BASE, MMAP_REGION_LIMIT);
-  if (new_addr == 0 || new_addr + aligned_new > MMAP_REGION_LIMIT) {
+  if (new_addr == 0 || aligned_new > MMAP_REGION_LIMIT - new_addr) {
     spinlock_release(&current->mm->lock);
     return E_NOMEM;
   }
@@ -1544,7 +1658,7 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
     vma_remove(&current->mm->vmas, old_addr, old_addr + aligned_old);
     int add_ret =
         vma_add(&current->mm->vmas, new_addr, new_addr + aligned_new, prot,
-                vma_flags, vma_fd, vma_offset, vma_file, 0);
+                vma_flags, vma_fd, vma_offset, vma_file, orig_file_size);
     if (add_ret == 0 && new_lvma) {
       if (linuxkpi_vma_rebase)
         linuxkpi_vma_rebase(new_lvma, new_addr, new_addr + aligned_new,
@@ -1565,39 +1679,108 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
     return new_addr;
   }
 
-  // Allocate and map new pages.
-  for (uint64_t i = 0; i < aligned_new / PAGE_SIZE; i++) {
-    void *phys = pmm_alloc();
-    if (!phys) {
+  if ((vma_flags & MAP_SHARED) && vma_file && (vma_flags & MAP_PAGECACHE)) {
+    vfs_node_ref(vma_file);
+    void *keep_lvma = orig_vma->linux_vma;
+    vma_linux_get(keep_lvma);
+    teardown_range(pml4, current, old_addr, aligned_old, true,
+                   "mremap file move");
+    vma_remove(&current->mm->vmas, old_addr, old_addr + aligned_old);
+    int add_ret =
+        vma_add(&current->mm->vmas, new_addr, new_addr + aligned_new, prot,
+                vma_flags, vma_fd, vma_offset, vma_file, orig_file_size);
+    if (add_ret == 0 && keep_lvma) {
+      if (linuxkpi_vma_rebase)
+        linuxkpi_vma_rebase(keep_lvma, new_addr, new_addr + aligned_new,
+                            vma_offset);
+      vma_attach_linux(&current->mm->vmas, new_addr, keep_lvma);
+    }
+    vma_linux_put(keep_lvma);
+    vfs_close(vma_file);
+    if (add_ret < 0) {
       spinlock_release(&current->mm->lock);
       return E_NOMEM;
     }
-    if (!vmm_map_page(pml4, new_addr + i * PAGE_SIZE, (uint64_t)phys,
-                      page_flags)) {
-      pmm_free(phys);
-      spinlock_release(&current->mm->lock);
-      return E_NOMEM;
-    }
-    void *kva = (void *)((uint64_t)phys + HHDM_OFFSET);
-    memset(kva, 0, PAGE_SIZE);
+    current->mm->mmap_next_addr =
+        MAX(current->mm->mmap_next_addr, new_addr + aligned_new);
+    spinlock_release(&current->mm->lock);
+    return new_addr;
   }
 
-  // Copy old data to new location (page by page through HHDM).
-  for (uint64_t off = 0; off < aligned_old; off += PAGE_SIZE) {
-    uint64_t old_phys = vmm_virt_to_phys(pml4, old_addr + off);
-    uint64_t new_phys = vmm_virt_to_phys(pml4, new_addr + off);
-    if (!old_phys && new_phys) {
-      int swapped = zram_copy_swapped(pml4, old_addr + off,
-                        (void *)(PAGE_ALIGN_DOWN(new_phys) + HHDM_OFFSET));
-      if (swapped < 0) {
+  bool private_pc = vma_file && (vma_flags & MAP_PAGECACHE);
+  if (private_pc) {
+    /* Copy only already-faulted or swapped pages from [0, aligned_old);
+     * unfaulted holes and grown tail pages demand-fault from vma_file. */
+    for (uint64_t off = 0; off < aligned_old; off += PAGE_SIZE) {
+      uint64_t old_phys = vmm_virt_to_phys(pml4, old_addr + off);
+      vmm_lock_acquire_for(pml4, old_addr + off);
+      uint64_t *old_leaf = vmm_get_leaf_entry_ptr(pml4, old_addr + off);
+      bool has_pte = old_leaf && (*old_leaf != 0);
+      vmm_lock_release();
+      if (!old_phys && !has_pte)
+        continue;
+      void *phys = pmm_alloc();
+      if (!phys) {
+        teardown_range(pml4, current, new_addr, off, true, "mremap oom");
+        spinlock_release(&current->mm->lock);
+        return E_NOMEM;
+      }
+      void *kva = (void *)((uint64_t)phys + HHDM_OFFSET);
+      memset(kva, 0, PAGE_SIZE);
+      if (old_phys) {
+        void *src = (void *)(PAGE_ALIGN_DOWN(old_phys) + HHDM_OFFSET);
+        memcpy(kva, src, PAGE_SIZE);
+      } else {
+        int swapped = zram_copy_swapped(pml4, old_addr + off, kva);
+        if (swapped < 0) {
+          pmm_free(phys);
+          teardown_range(pml4, current, new_addr, off, true, "mremap oom");
+          spinlock_release(&current->mm->lock);
+          return E_NOMEM;
+        }
+      }
+      if (!vmm_map_page(pml4, new_addr + off, (uint64_t)phys, page_flags)) {
+        pmm_free(phys);
+        teardown_range(pml4, current, new_addr, off, true, "mremap oom");
         spinlock_release(&current->mm->lock);
         return E_NOMEM;
       }
     }
-    if (old_phys && new_phys) {
-      void *src = (void *)(PAGE_ALIGN_DOWN(old_phys) + HHDM_OFFSET);
-      void *dst = (void *)(PAGE_ALIGN_DOWN(new_phys) + HHDM_OFFSET);
-      memcpy(dst, src, PAGE_SIZE);
+  } else {
+    // Allocate and map new pages.
+    for (uint64_t i = 0; i < aligned_new / PAGE_SIZE; i++) {
+      void *phys = pmm_alloc();
+      if (!phys) {
+        spinlock_release(&current->mm->lock);
+        return E_NOMEM;
+      }
+      if (!vmm_map_page(pml4, new_addr + i * PAGE_SIZE, (uint64_t)phys,
+                        page_flags)) {
+        pmm_free(phys);
+        spinlock_release(&current->mm->lock);
+        return E_NOMEM;
+      }
+      void *kva = (void *)((uint64_t)phys + HHDM_OFFSET);
+      memset(kva, 0, PAGE_SIZE);
+    }
+
+    // Copy old data to new location (page by page through HHDM).
+    for (uint64_t off = 0; off < aligned_old; off += PAGE_SIZE) {
+      uint64_t old_phys = vmm_virt_to_phys(pml4, old_addr + off);
+      uint64_t new_phys = vmm_virt_to_phys(pml4, new_addr + off);
+      if (!old_phys && new_phys) {
+        int swapped = zram_copy_swapped(pml4, old_addr + off,
+                          (void *)(PAGE_ALIGN_DOWN(new_phys) + HHDM_OFFSET));
+        if (swapped < 0) {
+          spinlock_release(&current->mm->lock);
+          return E_NOMEM;
+        }
+      }
+      if (old_phys && new_phys) {
+        void *src = (void *)(PAGE_ALIGN_DOWN(old_phys) + HHDM_OFFSET);
+        void *dst = (void *)(PAGE_ALIGN_DOWN(new_phys) + HHDM_OFFSET);
+        memcpy(dst, src, PAGE_SIZE);
+      }
     }
   }
 
@@ -1622,12 +1805,25 @@ static uint64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
   // Tear down old mapping, keeping any bridge wrapper for the new node.
   void *keep_lvma = orig_vma->linux_vma;
   vma_linux_get(keep_lvma);
+  if (private_pc)
+    vfs_node_ref(vma_file);
   teardown_range(pml4, current, old_addr, aligned_old, true, "mremap move");
   vma_remove(&current->mm->vmas, old_addr, old_addr + aligned_old);
 
   // Register new VMA and hand it the preserved wrapper.
-  vma_add(&current->mm->vmas, new_addr, new_addr + aligned_new, prot, vma_flags,
-          -1, 0, NULL, 0);
+  int add_ret =
+      private_pc
+          ? vma_add(&current->mm->vmas, new_addr, new_addr + aligned_new, prot,
+                    vma_flags, vma_fd, vma_offset, vma_file, orig_file_size)
+          : vma_add(&current->mm->vmas, new_addr, new_addr + aligned_new, prot,
+                    vma_flags, -1, 0, NULL, 0);
+  if (private_pc)
+    vfs_close(vma_file);
+  if (add_ret < 0) {
+    vma_linux_put(keep_lvma);
+    spinlock_release(&current->mm->lock);
+    return E_NOMEM;
+  }
   if (keep_lvma && linuxkpi_vma_rebase)
     linuxkpi_vma_rebase(keep_lvma, new_addr, new_addr + aligned_new,
                         vma_offset);
@@ -1880,8 +2076,97 @@ static uint64_t sys_msync(uint64_t addr, uint64_t len, uint64_t flags,
   if (!is_user_pointer(addr) || addr + len < addr || !is_user_pointer(addr + len))
     return (uint64_t)-14; // EFAULT
 
-  // In AvoryOS all allocated user pages reside in-core physical memory
-  // with a unified page cache. Synchronous flush is a no-op.
+  struct thread *thread = sched_get_current();
+  if (thread && thread->mm) {
+    uint64_t end = addr + len;
+    uint64_t cur = addr;
+    uint64_t *pml4 = vmm_get_active_pml4();
+    while (cur < end) {
+      spinlock_acquire(&thread->mm->lock);
+      struct vma *area = vma_find_overlap(&thread->mm->vmas, cur, end);
+      if (!area) {
+        spinlock_release(&thread->mm->lock);
+        break;
+      }
+      uint64_t vma_start = area->start;
+      uint64_t vma_end = area->end;
+      uint64_t vma_flags = area->flags;
+      uint64_t vma_offset = area->offset;
+      vfs_node_t *node = (vfs_node_t *)area->file_node;
+      bool shared_pc =
+          node && ((vma_flags & (MAP_SHARED | MAP_PAGECACHE)) ==
+                   (MAP_SHARED | MAP_PAGECACHE));
+      bool need_sync =
+          node && (vma_flags & MAP_SHARED) &&
+          (shared_pc || vfs_backing_node(node)->io64);
+      if (need_sync)
+        vfs_node_ref(node);
+      else
+        node = NULL;
+      uint64_t seg_start = cur > vma_start ? PAGE_ALIGN_DOWN(cur) : vma_start;
+      uint64_t seg_end = end < vma_end ? end : vma_end;
+      spinlock_release(&thread->mm->lock);
+
+      if (node && shared_pc && pml4) {
+#define MSYNC_BATCH 64
+        uint32_t doffs[MSYNC_BATCH];
+        uint64_t va = seg_start;
+        while (va < seg_end) {
+          int nd = 0;
+          int flushed = 0;
+          uint64_t touched_va = 0;
+          spinlock_acquire(&thread->mm->lock);
+          struct vma *cur_vma = vma_find(&thread->mm->vmas, va);
+          if (!cur_vma || cur_vma->file_node != node ||
+              cur_vma->start != vma_start || cur_vma->offset != vma_offset ||
+              !(cur_vma->flags & MAP_SHARED)) {
+            spinlock_release(&thread->mm->lock);
+            break;
+          }
+          uint64_t stop = cur_vma->end < seg_end ? cur_vma->end : seg_end;
+          vmm_lock_acquire_for(pml4, va);
+          while (va < stop && nd < MSYNC_BATCH) {
+            uint64_t *leaf = vmm_get_leaf_entry_ptr(pml4, va);
+            if (leaf && (*leaf & PAGE_FLAG_PRESENT) &&
+                !(*leaf & PAGE_FLAG_PS) && (*leaf & PAGE_FLAG_D)) {
+              uint64_t foff = vma_offset + (va - vma_start);
+              if (foff <= UINT32_MAX) {
+                __atomic_fetch_and(leaf, ~(uint64_t)PAGE_FLAG_D, __ATOMIC_ACQ_REL);
+                doffs[nd++] = (uint32_t)foff;
+                touched_va = va;
+                flushed++;
+              }
+            }
+            va += PAGE_SIZE;
+          }
+          __kpi_preempt_disable();
+          if (flushed == 1)
+            tlb_flush_deferred(touched_va, (uint64_t)pml4);
+          else if (flushed > 1)
+            tlb_flush_deferred_context((uint64_t)pml4);
+          vmm_lock_release();
+          spinlock_release(&thread->mm->lock);
+          if (flushed > 0)
+            (void)tlb_flush_deferred_drain();
+          __kpi_preempt_enable();
+
+          vfs_node_t *backing = vfs_backing_node(node);
+          for (int i = 0; i < nd; i++)
+            vfs_cache_mark_dirty(backing, doffs[i]);
+        }
+#undef MSYNC_BATCH
+      }
+
+      if (node) {
+        if (sync_mode == MS_SYNC)
+          vfs_cache_sync(vfs_backing_node(node));
+        vfs_close(node);
+      }
+      cur = seg_end;
+      if (cur <= seg_start)
+        cur = vma_end;
+    }
+  }
   return 0;
 }
 

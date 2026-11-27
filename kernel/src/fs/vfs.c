@@ -1211,10 +1211,26 @@ void vfs_dentry_invalidate_created(vfs_node_t *parent, const char *name) {
 }
 
 
-uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
+uint64_t vfs_size(vfs_node_t *node) {
+  node = vfs_backing_node(node);
+  return node ? (node->io64 ? node->io64->size(node) : node->length) : 0;
+}
+
+uint32_t vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size,
                   uint8_t *buffer) {
   if (!node)
     return 0;
+
+  vfs_node_t *backing = node->view_backing ? vfs_backing_node(node) : node;
+  if (backing->io64 && backing->io64->read) {
+    uint64_t pc_limit = backing->io64->size(backing) > UINT32_MAX
+                            ? 0xFFFFF000ULL
+                            : (uint64_t)UINT32_MAX + 1ULL;
+    if ((backing->flags & FS_PAGE_CACHE) && offset < pc_limit &&
+        size <= pc_limit - offset)
+      return vfs_cache_read(backing, (uint32_t)offset, size, buffer);
+    return backing->io64->read(backing, offset, size, buffer);
+  }
 
   if ((node->flags & (FS_TYPE_MASK | FS_PAGE_CACHE)) ==
       (FS_FILE | FS_PAGE_CACHE))
@@ -1226,7 +1242,7 @@ uint32_t vfs_read(vfs_node_t *node, uint32_t offset, uint32_t size,
   return 0;
 }
 
-uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
+uint32_t vfs_write(vfs_node_t *node, uint64_t offset, uint32_t size,
                    uint8_t *buffer) {
   if (!node)
     return (uint32_t)-9; // EBADF
@@ -1242,6 +1258,10 @@ uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
 
   if ((node->flags & FS_TYPE_MASK) == FS_DIRECTORY)
     return (uint32_t)-21; // EISDIR
+
+  vfs_node_t *backing = node->view_backing ? vfs_backing_node(node) : node;
+  if (backing->io64 && backing->io64->write)
+    return backing->io64->write(backing, offset, size, buffer);
 
   if (node->write) {
     uint32_t written = node->write(node, offset, size, buffer);
@@ -1259,7 +1279,7 @@ uint32_t vfs_write(vfs_node_t *node, uint32_t offset, uint32_t size,
 /* Keep namespace read-only policy and normal write/cache processing in effect.
  * An append callback must call vfs_write after choosing its protected EOF. */
 uint32_t vfs_append(vfs_node_t *node, uint32_t size, uint8_t *buffer,
-                    uint32_t *end_offset) {
+                    uint64_t *end_offset) {
   if (!node || !end_offset)
     return (uint32_t)-9;
   if (!size)
@@ -1271,8 +1291,15 @@ uint32_t vfs_append(vfs_node_t *node, uint32_t size, uint8_t *buffer,
     node->length = node->view_backing->length;
     return written;
   }
-  if (node->append)
-    return node->append(node, size, buffer, end_offset);
+  if (node->io64 && node->io64->append)
+    return node->io64->append(node, size, buffer, end_offset);
+  if (node->append) {
+    uint32_t end = 0;
+    uint32_t written = node->append(node, size, buffer, &end);
+    if (written && written <= size)
+      *end_offset = end;
+    return written;
+  }
 
   uint32_t offset = node->length;
   if (size > UINT32_MAX - offset)
@@ -1736,8 +1763,15 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
    * Pointer inequality does not imply a cross-directory move. Compare the
    * backend, mount and inode before falling back to cross-directory support. */
   extern int ext2_rename_impl(vfs_node_t *, char *, char *);
-  if (old_parent->rename == ext2_rename_impl &&
-      new_parent->rename == ext2_rename_impl && old_parent->device &&
+  extern int exfat_rename_impl(vfs_node_t *, char *, char *);
+  vfs_node_t *old_backing = vfs_backing_node(old_parent);
+  vfs_node_t *new_backing = vfs_backing_node(new_parent);
+  bool exfat = old_backing->rename == exfat_rename_impl &&
+               new_backing->rename == exfat_rename_impl;
+  if (exfat && old_parent->mount_id != new_parent->mount_id)
+    return -18;
+  if ((exfat || (old_parent->rename == ext2_rename_impl &&
+                 new_parent->rename == ext2_rename_impl)) && old_parent->device &&
       old_parent->device == new_parent->device &&
       old_parent->inode == new_parent->inode) {
     vfs_readdir_generation_advance(new_parent);
@@ -1748,10 +1782,11 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
     vfs_dentry_invalidate(new_parent, new_name);
     return rc;
   }
-  if (old_parent->rename == ext2_rename_impl &&
-      new_parent->rename == ext2_rename_impl && old_parent->device &&
+  if ((exfat || (old_parent->rename == ext2_rename_impl &&
+                 new_parent->rename == ext2_rename_impl)) && old_parent->device &&
       old_parent->device == new_parent->device) {
     extern int ext2_rename_cross(vfs_node_t *, char *, vfs_node_t *, char *);
+    extern int exfat_rename_cross(vfs_node_t *, char *, vfs_node_t *, char *);
     /* Pin the cached objects before invalidation, just as vfs_rename does.
      * Looking them up afterwards creates fresh inode aliases and can reclaim
      * the replacement while the original object still has open descriptors. */
@@ -1761,7 +1796,8 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
     vfs_dentry_invalidate(new_parent, new_name);
     vfs_readdir_generation_advance(old_parent);
     vfs_readdir_generation_advance(new_parent);
-    int rc = ext2_rename_cross(old_parent, old_name, new_parent, new_name);
+    int rc = exfat ? exfat_rename_cross(old_backing, old_name, new_backing, new_name)
+                   : ext2_rename_cross(old_parent, old_name, new_parent, new_name);
     if (!rc) {
       vfs_dir_changed(old_parent);
       vfs_dir_changed(new_parent);
@@ -1810,6 +1846,11 @@ int vfs_rename_cross(vfs_node_t *old_parent, char *old_name,
 }
 
 int vfs_chmod(vfs_node_t *node, uint16_t permission) {
+  extern int exfat_chmod_impl(vfs_node_t *node, uint16_t permission);
+  if (node && vfs_backing_node(node) &&
+      vfs_backing_node(node)->chmod == exfat_chmod_impl) {
+    return node->chmod ? node->chmod(node, permission) : -1;
+  }
   if (vfs_mount_readonly(node))
     return -30;
   if (node && node->chmod) {
@@ -1844,9 +1885,14 @@ int vfs_mknod(vfs_node_t *node, char *name, uint16_t permission, uint32_t flags,
   return -1;
 }
 
-int vfs_truncate(vfs_node_t *node, uint32_t size) {
+int vfs_truncate(vfs_node_t *node, uint64_t size) {
   if (vfs_mount_readonly(node))
     return -30;
+  vfs_node_t *backing = node && node->view_backing ? vfs_backing_node(node) : node;
+  if (backing && backing->io64 && backing->io64->truncate)
+    return backing->io64->truncate(backing, size);
+  if (size > UINT32_MAX)
+    return -27;
   if (node && node->truncate) {
     int result = node->truncate(node, size);
     if (!result && ((node->flags & FS_PAGE_CACHE) || node->mmap_shared_only))

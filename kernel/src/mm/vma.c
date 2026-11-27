@@ -308,6 +308,14 @@ int vma_add(struct vma_list *list, uint64_t start, uint64_t end, uint64_t prot,
             uint64_t flags, int fd, uint64_t offset, void *file_node,
             uint64_t file_size) {
   TSC_BEGIN(vma_add);
+  if (!list || start >= end) {
+    TSC_END(vma_add);
+    return -1;
+  }
+  if (file_node && offset > ~(uint64_t)0 - (end - start)) {
+    TSC_END(vma_add);
+    return -1;
+  }
   if (vma_find_overlap(list, start, end)) {
     TSC_END(vma_add);
     return -1; // Overlapping regions rejected

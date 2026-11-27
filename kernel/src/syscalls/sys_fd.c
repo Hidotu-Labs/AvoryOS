@@ -1337,14 +1337,13 @@ static void trace_userspace_debug_write(struct thread *t, int fd,
   }
 }
 
-/* vfs_read/vfs_write take 32-bit offsets; raw block devices get the full
- * 64-bit file offset so I/O past 4 GiB does not wrap. */
+/* Raw block-device nodes have a separate transfer interface. */
 static uint32_t fd_vfs_read(vfs_node_t *node, uint64_t offset, uint32_t size,
                             uint8_t *buf) {
   uint32_t done;
   if (block_node_rw64(node, offset, size, buf, false, &done))
     return done;
-  return vfs_read(node, (uint32_t)offset, size, buf);
+  return vfs_read(node, offset, size, buf);
 }
 
 static uint32_t fd_vfs_write(vfs_node_t *node, uint64_t offset, uint32_t size,
@@ -1352,7 +1351,7 @@ static uint32_t fd_vfs_write(vfs_node_t *node, uint64_t offset, uint32_t size,
   uint32_t done;
   if (block_node_rw64(node, offset, size, buf, true, &done))
     return done;
-  return vfs_write(node, (uint32_t)offset, size, buf);
+  return vfs_write(node, offset, size, buf);
 }
 
 #define FD_BOUNCE_STACK_MAX 4096
@@ -1412,7 +1411,7 @@ static int64_t fd_read_to_user(vfs_node_t *node, uint64_t offset, size_t count,
 
 static int64_t fd_write_from_user_node(vfs_node_t *node, uint64_t offset,
                                        size_t count, const uint8_t *user_buf,
-                                       bool append, uint32_t *end_offset_out) {
+                                       bool append, uint64_t *end_offset_out) {
   if (count == 0)
     return 0;
   if (asc_vfs_node_is_linux_file(node)) {
@@ -1438,7 +1437,7 @@ static int64_t fd_write_from_user_node(vfs_node_t *node, uint64_t offset,
 
   size_t total = 0;
   int64_t err = 0;
-  uint32_t end_off = 0;
+  uint64_t end_off = 0;
   while (total < count) {
     size_t chunk = count - total;
     if (chunk > cap)
@@ -1497,7 +1496,7 @@ static int64_t fd_write(int fd, const void *buf, size_t count) {
     if (!append)
       offset = fd_offset_get(t, (uint64_t)fd);
   }
-  uint32_t end_offset = 0;
+  uint64_t end_offset = 0;
   t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
   bool from_user = is_user_range(buf, count);
   int32_t bytes_written = from_user
@@ -1644,7 +1643,7 @@ static uint64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count,
   if (!node)
     return (uint64_t)-9;
   /* Linux also honors O_APPEND for pwrite, without changing f_pos. */
-  uint32_t end_offset;
+  uint64_t end_offset;
   bool append = (flags & O_APPEND) && (node->flags & FS_TYPE_MASK) == FS_FILE;
   t->current_io_flags = (uint32_t)flags | IO_FLAGS_VALID;
   int64_t bytes_written = fd_write_from_user_node(
@@ -2149,7 +2148,7 @@ static uint64_t sys_pwritev(uint64_t fd, uint64_t iov_u, uint64_t iovcnt,
       fd_release_iov(iov, stack_iov);
       return (uint64_t)-14;
     }
-    uint32_t end_offset;
+    uint64_t end_offset;
     bool append = (flags & O_APPEND) && (node->flags & FS_TYPE_MASK) == FS_FILE;
     int32_t bytes_written = (int32_t)fd_write_from_user_node(
         node, offset + total, len, (const uint8_t *)base, append, &end_offset);
@@ -2188,14 +2187,14 @@ static uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd,
   vfs_node_t *out_node = t->fds[out_fd];
   vfs_node_t *in_node = t->fds[in_fd];
 
-  uint32_t offset;
+  uint64_t offset;
   if (offset_ptr) {
     uint64_t user_offset;
     if (!vmm_is_user_addr_range_valid(offset_ptr, sizeof(user_offset)) ||
         copy_from_user(&user_offset, (const void *)offset_ptr,
                        sizeof(user_offset)))
       return (uint64_t)-14;
-    offset = (uint32_t)user_offset;
+    offset = user_offset;
   } else {
     offset = fd_offset_get(t, in_fd);
   }
@@ -2206,7 +2205,7 @@ static uint64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd,
   if (!buffer)
     return (uint64_t)-12;
 
-  uint32_t total_sent = 0;
+  uint64_t total_sent = 0;
   while (total_sent < count) {
     uint32_t to_read =
         (count - total_sent > buf_cap) ? (uint32_t)buf_cap : (uint32_t)(count - total_sent);
@@ -2297,8 +2296,9 @@ static int64_t move_range(struct thread *t, uint64_t fd_in, uint64_t off_in_ptr,
     out_off = fd_offset_get(t, fd_out);
   }
 
-  if (in_off > 0xFFFFFFFFULL || out_off > 0xFFFFFFFFULL)
-    return -27; /* EFBIG: the VFS works in 32-bit offsets */
+  if ((in_off > UINT32_MAX && !vfs_backing_node(in_node)->io64) ||
+      (out_off > UINT32_MAX && !vfs_backing_node(out_node)->io64))
+    return -27;
 
   uint8_t stack_buf[FD_BOUNCE_STACK_MAX];
   size_t buf_cap = len > RANGE_CHUNK ? RANGE_CHUNK : (size_t)len;
@@ -2313,7 +2313,7 @@ static int64_t move_range(struct thread *t, uint64_t fd_in, uint64_t off_in_ptr,
     uint32_t want =
         (uint32_t)(remaining > buf_cap ? buf_cap : remaining);
 
-    int32_t got = (int32_t)vfs_read(in_node, (uint32_t)in_off, want, buf);
+    int32_t got = (int32_t)vfs_read(in_node, in_off, want, buf);
     if (got <= 0) {
       /* Zero is end of file, or an empty pipe with no writers left. A negative
        * value is already an errno from the read implementation (EAGAIN for a
@@ -2324,7 +2324,7 @@ static int64_t move_range(struct thread *t, uint64_t fd_in, uint64_t off_in_ptr,
     }
 
     int32_t put =
-        (int32_t)vfs_write(out_node, (uint32_t)out_off, (uint32_t)got, buf);
+        (int32_t)vfs_write(out_node, out_off, (uint32_t)got, buf);
     if (put < 0) {
       if (moved == 0)
         moved = put; /* EPIPE for a pipe nobody is reading, etc. */
@@ -2449,7 +2449,7 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
     if (whence == 1)
       base = fd_offset_get_locked(t, fd);
     else if (whence == 2)
-      base = vfs_backing_node(node)->length;
+      base = vfs_size(node);
     else if (whence != 0)
       return (uint64_t)-22;
     /* Unsigned addition avoids signed overflow for hostile offsets. */
@@ -2476,7 +2476,7 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence,
   if (whence == 1)
     base = fd_offset_get_locked(t, fd);
   else if (whence == 2)
-    base = vfs_backing_node(node)->length;
+    base = vfs_size(node);
   else if (whence != 0) {
     result = -22;
     goto out;
@@ -2675,11 +2675,7 @@ static uint64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t a2,
     vfs_close(node);
     return (uint64_t)-22;
   }
-  if (length > UINT32_MAX) {
-    vfs_close(node);
-    return (uint64_t)-27; // EFBIG: VFS sizes are currently 32-bit
-  }
-  int result = vfs_truncate(node, (uint32_t)length);
+  int result = vfs_truncate(node, length);
   vfs_close(node);
   if (result == 0)
     return 0;
@@ -2906,12 +2902,16 @@ static uint64_t sys_readahead(uint64_t fd, uint64_t offset, uint64_t count,
     return (uint64_t)-22; // EINVAL: file does not support reads
   }
 
-  /* VFS file lengths are currently 32-bit. Treat larger offsets as EOF and
-   * clamp the byte count before handing it to the page-cache read-ahead path. */
-  if (count && offset < node->length) {
+  /* Page cache keys are 32-bit offsets; for files exceeding 4 GiB, keep
+   * readahead strictly below page 0xFFFFF000 so page_cache does not treat the
+   * clamped length as EOF within that page. */
+  uint64_t pc_limit = (node->io64 && node->io64->size(node) > UINT32_MAX)
+                          ? 0xFFFFF000ULL
+                          : (uint64_t)node->length;
+  if (count && offset < pc_limit) {
     uint32_t byte_offset = (uint32_t)offset;
-    uint32_t available = node->length - byte_offset;
-    uint32_t bytes = count < available ? (uint32_t)count : available;
+    uint64_t available = pc_limit - byte_offset;
+    uint32_t bytes = count < available ? (uint32_t)count : (uint32_t)available;
     (void)vfs_cache_readahead(node, byte_offset, bytes);
   }
 
@@ -3126,7 +3126,8 @@ uint64_t cgroup2_mount_at(const char *target, const char *fstype) {
  * device pointer, so it pins the device for good. */
 static bool sys_mount_block_try(struct block_device *dev, vfs_node_t *mountpoint,
                                 vfs_node_t *saved, const char *target,
-                                const char *type) {
+                                const char *type, uint64_t flags,
+                                bool exfat_overwrite) {
     if (strcmp(type, "vfat") == 0) {
         if (fat32_mount(dev, mountpoint) != 0)
             return false;
@@ -3134,7 +3135,7 @@ static bool sys_mount_block_try(struct block_device *dev, vfs_node_t *mountpoint
         return true;
     }
     if (strcmp(type, "exfat") == 0) {
-        if (exfat_mount(dev, mountpoint) != 0)
+        if (exfat_mount(dev, mountpoint, (flags & 1) != 0, exfat_overwrite) != 0)
             return false;
         vfs_mount_inplace(mountpoint, saved, dev, dev->name, "exfat", target, NULL, exfat_unmount, exfat_live_nodes);
         return true;
@@ -3419,6 +3420,16 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
         }
     }
 
+    /* retain the earlier restricted overwrite mount mode */
+    bool exfat_overwrite = false;
+    if (fstype && !strcmp(fstype, "exfat") && data_ptr && !(flags & 1)) {
+        char option[sizeof("overwrite")];
+        long len = strncpy_from_user(option, (const void *)data_ptr, sizeof(option));
+        if (len < 0)
+            return (uint64_t)-14;
+        exfat_overwrite = len == sizeof("overwrite") - 1 &&
+                          memcmp(option, "overwrite", sizeof(option)) == 0;
+    }
     if (!source)
         return (uint64_t)-14;
 
@@ -3467,7 +3478,8 @@ static uint64_t sys_mount(uint64_t source_ptr, uint64_t target_ptr,
 
     /* The lookup reference is ours alone; mounts take their own. */
     for (; *order; order++) {
-        if (sys_mount_block_try(dev, mountpoint, saved, target, *order)) {
+        if (sys_mount_block_try(dev, mountpoint, saved, target, *order,
+                                flags, exfat_overwrite)) {
             block_put(dev);
             return 0;
         }
